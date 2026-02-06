@@ -1,0 +1,898 @@
+# Backend MVP driver: build MIR -> LIR -> relocatable obj (AArch64/x86_64 subset).
+import std/system
+import std/cmdline
+import std/seqs
+import std/strings
+import std/os
+import std/result
+import cheng/stage1/frontend_lib
+import cheng/backend/mir/mir_types
+import cheng/backend/mir/mir_builder
+import cheng/backend/mir/mir_opt
+import cheng/backend/mir/mir_opt2
+import cheng/backend/mir/mir_ssa
+import cheng/backend/isel/aarch64_isel
+import cheng/backend/isel/riscv64_isel
+import cheng/backend/isel/x86_64_isel
+import cheng/backend/regalloc/linear_scan
+import cheng/backend/obj/elf_writer
+import cheng/backend/obj/elf_writer_riscv64
+import cheng/backend/obj/elf_writer_x86_64
+import cheng/backend/obj/macho_writer
+import cheng/backend/obj/macho_writer_x86_64
+import cheng/backend/obj/coff_writer
+import cheng/backend/obj/coff_writer_x86_64
+import cheng/backend/obj/macho_linker
+import cheng/backend/obj/macho_linker_x86_64
+import cheng/backend/obj/elf_linker
+import cheng/backend/obj/elf_linker_riscv64
+import cheng/backend/obj/coff_linker
+
+fn driver_strHasPrefix(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    let n: int32 = len s
+    let m: int32 = len prefix
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    var i: int32 = 0
+    while i < m:
+        if charAt(s, i) != charAt(prefix, i):
+            return false
+        i = i + 1
+    return true
+
+fn driver_strContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len hay
+    let m: int32 = len needle
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    var i: int32 = 0
+    while i <= n - m:
+        var j: int32 = 0
+        while j < m && charAt(hay, i + j) == charAt(needle, j):
+            j = j + 1
+        if j == m:
+            return true
+        i = i + 1
+    return false
+
+fn driver_isSpaceChar(c: char): bool =
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+fn driver_strSliceEq(s: str, start: int32, endExclusive: int32, needle: str): bool =
+    if s == nil || needle == nil:
+        return false
+    if start < 0 || endExclusive < start:
+        return false
+    let n: int32 = endExclusive - start
+    if n != len needle:
+        return false
+    var i: int32 = 0
+    while i < n:
+        if charAt(s, start + i) != charAt(needle, i):
+            return false
+        i = i + 1
+    return true
+
+fn driver_flagsHasToken(flags: str, token: str): bool =
+    if flags == nil || token == nil:
+        return false
+    let n: int32 = len flags
+    var i: int32 = 0
+    while i < n:
+        while i < n && driver_isSpaceChar(charAt(flags, i)):
+            i = i + 1
+        if i >= n:
+            break
+        var j: int32 = i
+        while j < n && ! driver_isSpaceChar(charAt(flags, j)):
+            j = j + 1
+        if driver_strSliceEq(flags, i, j, token):
+            return true
+        i = j
+    return false
+
+fn driver_flagsAppendToken(flags: str, token: str): str =
+    if token == nil || len token == 0:
+        return flags
+    if driver_flagsHasToken(flags, token):
+        return flags
+    if flags == nil || len flags == 0:
+        return token
+    return flags + " " + token
+
+fn driver_strStripPrefix(s: str, prefix: str): str =
+    if ! driver_strHasPrefix(s, prefix):
+        return ""
+    let off: int32 = len prefix
+    return str(ptr_add(void*(s), off))
+
+fn driver_joinDir(dir: str, name: str): str =
+    if dir == nil || len(dir) == 0:
+        if name == nil:
+            return ""
+        return "" + name
+    return dir + "/" + name
+
+fn driver_shellQuote(s: str): str =
+    if s == nil:
+        return "\"\""
+    return "\"" + s + "\""
+
+fn driver_runCmd(command: str) =
+    let opts: uint64 = os.processOptionMask(os.poStdErrToStdOut) |
+                       os.processOptionMask(os.poUsePath) |
+                       os.processOptionMask(os.poEvalCommand)
+    let res: os.ExecCmdResult = os.execCmdEx(command, opts, "")
+    if res.exitCode != 0:
+        panic("" + res.output)
+
+fn driver_panicResult[T](res: Result[T]) =
+    let msg: str = ErrorFormat(ErrorInfoOf[T](res))
+    panic(msg)
+
+fn driver_parseInt32Default(s: str, defaultValue: int32): int32 =
+    if s == nil || len s == 0:
+        return defaultValue
+    var neg: bool = false
+    var i: int32 = 0
+    if charAt(s, 0) == '-':
+        neg = true
+        i = 1
+    if i >= len s:
+        return defaultValue
+    var v: int64 = 0
+    while i < len s:
+        let c: char = charAt(s, i)
+        if c < '0' || c > '9':
+            return defaultValue
+        v = v * 10 + int64(int32(c) - int32('0'))
+        i = i + 1
+    if neg:
+        v = 0 - v
+    return int32(v)
+
+fn driver_trimAsciiSpace(s: str): str =
+    if s == nil || len(s) == 0:
+        return ""
+    let n: int32 = len s
+    var start: int32 = 0
+    while start < n && driver_isSpaceChar(charAt(s, start)):
+        start = start + 1
+    var stop: int32 = n
+    while stop > start && driver_isSpaceChar(charAt(s, stop - 1)):
+        stop = stop - 1
+    if stop <= start:
+        return ""
+    if start == 0 && stop == n:
+        return s
+    return os.sliceStr(s, start, stop - 1)
+
+fn driver_execCmdTrimmed(command: str): str =
+    let opts: uint64 = os.processOptionMask(os.poStdErrToStdOut) |
+                       os.processOptionMask(os.poUsePath) |
+                       os.processOptionMask(os.poEvalCommand)
+    let res: os.ExecCmdResult = os.execCmdEx(command, opts, "")
+    if res.exitCode != 0:
+        return ""
+    return driver_trimAsciiSpace(res.output)
+
+fn driver_detectHostTargetAuto(): str =
+    let hostOs: str = driver_execCmdTrimmed("uname -s")
+    let hostArch: str = driver_execCmdTrimmed("uname -m")
+    if streq(hostOs, "Darwin"):
+        if streq(hostArch, "arm64") || streq(hostArch, "aarch64"):
+            return "arm64-apple-darwin"
+        if streq(hostArch, "x86_64") || streq(hostArch, "amd64"):
+            return "x86_64-apple-darwin"
+        return ""
+    if streq(hostOs, "Linux"):
+        if streq(hostArch, "arm64") || streq(hostArch, "aarch64"):
+            return "aarch64-unknown-linux-gnu"
+        if streq(hostArch, "riscv64"):
+            return "riscv64-unknown-linux-gnu"
+        if streq(hostArch, "x86_64") || streq(hostArch, "amd64"):
+            return "x86_64-unknown-linux-gnu"
+        return ""
+    if driver_strHasPrefix(hostOs, "MINGW") || driver_strHasPrefix(hostOs, "MSYS") || driver_strHasPrefix(hostOs, "CYGWIN"):
+        if streq(hostArch, "arm64") || streq(hostArch, "aarch64"):
+            return "aarch64-pc-windows-msvc"
+        if streq(hostArch, "x86_64") || streq(hostArch, "amd64"):
+            return "x86_64-pc-windows-msvc"
+        return ""
+    return ""
+
+fn driver_targetIsAndroid(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return driver_strContains(target, "android")
+
+fn driver_targetIsDarwin(target: str): bool =
+    if target == nil || len(target) == 0:
+        return true
+    return driver_strContains(target, "apple") || driver_strContains(target, "darwin") || driver_strContains(target, "ios")
+
+fn driver_targetIsWindows(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return driver_strContains(target, "windows") || driver_strContains(target, "msvc")
+
+fn driver_targetIsLinux(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    if driver_targetIsAndroid(target):
+        return false
+    return driver_strContains(target, "linux")
+
+fn driver_targetIsAarch64(target: str): bool =
+    if target == nil || len(target) == 0:
+        return true
+    return driver_strContains(target, "aarch64") || driver_strContains(target, "arm64")
+
+fn driver_targetIsX86_64(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return driver_strContains(target, "x86_64") || driver_strContains(target, "amd64")
+
+fn driver_targetIsRiscv64(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return driver_strContains(target, "riscv64")
+
+fn driver_defaultAndroidSdkRoot(): str =
+    let sdk: str = os.getEnvDefault("ANDROID_SDK_ROOT", os.getEnvDefault("ANDROID_HOME", ""))
+    if sdk != nil && len(sdk) > 0 && os.dirExists(sdk):
+        return sdk
+    let home: str = os.getEnvDefault("HOME", "")
+    if home == nil || len(home) == 0:
+        return ""
+    # Android Studio default SDK locations.
+    let mac: str = os.joinPath(home, "Library/Android/sdk")
+    if os.dirExists(mac):
+        return mac
+    let linux: str = os.joinPath(home, "Android/Sdk")
+    if os.dirExists(linux):
+        return linux
+    return ""
+
+fn driver_defaultAndroidNdkRoot(): str =
+    let ndk: str = os.getEnvDefault("ANDROID_NDK_HOME",
+                                    os.getEnvDefault("ANDROID_NDK_ROOT", ""))
+    if ndk != nil && len(ndk) > 0 && os.dirExists(ndk):
+        return ndk
+    let sdk: str = driver_defaultAndroidSdkRoot()
+    if sdk == nil || len(sdk) == 0:
+        return ""
+    let bundle: str = os.joinPath(sdk, "ndk-bundle")
+    if os.dirExists(bundle):
+        return bundle
+    let ndkBase: str = os.joinPath(sdk, "ndk")
+    if ! os.dirExists(ndkBase):
+        return ""
+    let entries: os.seq_WalkDirEntry = os.walkDir(ndkBase)
+    var bestPath: str = ""
+    var bestName: str = ""
+    var i: int32 = 0
+    while i < entries.len:
+        let e: os.WalkDirEntry = os.os_get_WalkDirEntry(entries, i)
+        if e.kind == os.pcDir:
+            let name: str = os.extractFilename(e.path)
+            if bestPath == nil || len(bestPath) == 0:
+                bestPath = e.path
+                bestName = name
+            elif mirStrCmp(name, bestName) > 0:
+                bestPath = e.path
+                bestName = name
+        i = i + 1
+    return bestPath
+
+fn driver_defaultAndroidNdkClang(api: int32): str =
+    let ndk: str = driver_defaultAndroidNdkRoot()
+    if ndk == nil || len(ndk) == 0:
+        return ""
+    let prebuiltRoot: str = os.joinPath(ndk, "toolchains/llvm/prebuilt")
+    var candidates: seq[str] = newSeq[str]()
+    addPtr[str](&candidates, "darwin-arm64")
+    addPtr[str](&candidates, "darwin-x86_64")
+    addPtr[str](&candidates, "linux-x86_64")
+    addPtr[str](&candidates, "linux-arm64")
+    addPtr[str](&candidates, "linux-aarch64")
+    addPtr[str](&candidates, "windows-x86_64")
+    addPtr[str](&candidates, "windows-x64")
+    var prebuilt: str = ""
+    var i: int32 = 0
+    while i < candidates.len:
+        let candidate: str = get[str](candidates, i)
+        let p: str = os.joinPath(prebuiltRoot, candidate)
+        if os.dirExists(p):
+            prebuilt = p
+            break
+        i = i + 1
+    if prebuilt == nil || len(prebuilt) == 0:
+        return ""
+    let binDir: str = os.joinPath(prebuilt, "bin")
+    let name: str = "aarch64-linux-android" + intToStr(api) + "-clang"
+    let path: str = os.joinPath(binDir, name)
+    if frontend_lib.stage1_fileExists(path):
+        return path
+    return ""
+
+fn driver_seqContainsStr(items: seq[str], value: str): bool =
+    var i: int32 = 0
+    while i < items.len:
+        if streq(get[str](items, i), value):
+            return true
+        i = i + 1
+    return false
+
+fn driver_seqAddUniqueStr(items: seq[str]*, value: str) =
+    if value == nil || len value == 0:
+        return
+    if driver_seqContainsStr(*items, value):
+        return
+    addPtr[str](items, value)
+
+fn driver_sortStringsStable(items: seq[str]*) =
+    var i: int32 = 1
+    while i < items->len:
+        let key: str = get[str](*items, i)
+        var j: int32 = i - 1
+        while j >= 0 && mirStrCmp(get[str](*items, j), key) > 0:
+            setPtr[str](items, j + 1, get[str](*items, j))
+            j = j - 1
+        setPtr[str](items, j + 1, key)
+        i = i + 1
+
+fn driver_collectUnitFiles(module: MirModule): seq[str] =
+    var out: seq[str] = newSeq[str]()
+    if module == nil:
+        return out
+    var i: int32 = 0
+    while i < module.funcs.len:
+        let f: MirFunc = get[MirFunc](module.funcs, i)
+        if f != nil && ! f.isExtern && f.originFile != nil && len(f.originFile) > 0:
+            driver_seqAddUniqueStr(&out, f.originFile)
+        i = i + 1
+    i = 0
+    while i < module.globals.len:
+        let g: MirGlobal = get[MirGlobal](module.globals, i)
+        if g.originFile != nil && len(g.originFile) > 0:
+            driver_seqAddUniqueStr(&out, g.originFile)
+        i = i + 1
+    driver_sortStringsStable(&out)
+    return out
+
+fn driver_cloneExternFunc(f: MirFunc): MirFunc =
+    if f == nil:
+        return nil
+    let stub: MirFunc = mirNewFunc(f.name, f.retType)
+    stub.linkName = f.linkName
+    stub.originFile = f.originFile
+    stub.isExtern = true
+    var pi: int32 = 0
+    while pi < f.params.len:
+        addPtr[MirParam](&stub.params, get[MirParam](f.params, pi))
+        pi = pi + 1
+    return stub
+
+fn driver_buildUnitModule(full: MirModule, filePath: str): MirModule =
+    let unit: MirModule = mirNewModule(full.target)
+    unit.typeAliases = full.typeAliases
+    unit.objTypes = full.objTypes
+
+    var ci: int32 = 0
+    while ci < full.cstrs.len:
+        addPtr[MirCString](&unit.cstrs, get[MirCString](full.cstrs, ci))
+        ci = ci + 1
+
+    var gi: int32 = 0
+    while gi < full.globals.len:
+        let g: MirGlobal = get[MirGlobal](full.globals, gi)
+        if streq(g.originFile, filePath):
+            addPtr[MirGlobal](&unit.globals, g)
+        gi = gi + 1
+
+    var fi: int32 = 0
+    while fi < full.funcs.len:
+        let f: MirFunc = get[MirFunc](full.funcs, fi)
+        if f != nil && streq(f.originFile, filePath) && ! f.isExtern:
+            mirAddFunc(unit, f)
+        else:
+            mirAddFunc(unit, driver_cloneExternFunc(f))
+        fi = fi + 1
+
+    mirNormalizeModule(unit)
+    return unit
+
+fn driver_moduleToLir(module: MirModule): LirModule =
+    let opt2: bool = os.getEnvDefault("CHENG_BACKEND_OPT2", "") == "1"
+    let optDefault: int32 = opt2 ? 2 : (os.getEnvDefault("CHENG_BACKEND_OPT", "") == "1" ? 1 : 0)
+    let optLevel: int32 = driver_parseInt32Default(os.getEnvDefault("CHENG_BACKEND_OPT_LEVEL", ""), optDefault)
+    if optLevel >= 2:
+        mirOptimizeModule2(module)
+    elif optLevel >= 1:
+        mirOptimizeModule(module)
+    if os.getEnvDefault("CHENG_BACKEND_SSA", "") == "1":
+        let ssaRes: Result[bool] = mirSsaLowerModule(module)
+        if ! IsOk[bool](ssaRes):
+            driver_panicResult[bool](ssaRes)
+    if os.getEnvDefault("CHENG_BACKEND_VALIDATE", "") == "1":
+        let vRes: Result[bool] = mirValidateModule(module)
+        if ! IsOk[bool](vRes):
+            driver_panicResult[bool](vRes)
+    var lirRes: Result[LirModule]
+    if driver_targetIsX86_64(module.target):
+        lirRes = x86_64LowerModule(module)
+    elif driver_targetIsRiscv64(module.target):
+        lirRes = riscv64LowerModule(module)
+    else:
+        lirRes = aarch64LowerModule(module)
+    if ! IsOk[LirModule](lirRes):
+        driver_panicResult[LirModule](lirRes)
+    let lir: LirModule = linearScanAssign(Value[LirModule](lirRes))
+    return lir
+
+fn backendMain(): int32 =
+    let count: int32 = cmdline.paramCount()
+    var inputPath: str = ""
+    var outputPath: str = ""
+    var emitMode: str = os.getEnvDefault("CHENG_BACKEND_EMIT", "obj")
+    var target: str = os.getEnvDefault("CHENG_BACKEND_TARGET", "auto")
+    var frontend: str = os.getEnvDefault("CHENG_BACKEND_FRONTEND", "mvp")
+    var ccCmd: str = os.getEnvDefault("CHENG_BACKEND_CC", "cc")
+    var ccExplicit: bool = false
+    if len(os.getEnvDefault("CHENG_BACKEND_CC", "")) > 0:
+        ccExplicit = true
+    var ldCmd: str = os.getEnvDefault("CHENG_BACKEND_LD", "")
+    var ldExplicit: bool = false
+    if len(os.getEnvDefault("CHENG_BACKEND_LD", "")) > 0:
+        ldExplicit = true
+    var cflags: str = os.getEnvDefault("CHENG_BACKEND_CFLAGS", "")
+    var ldflags: str = os.getEnvDefault("CHENG_BACKEND_LDFLAGS", "")
+    var linker: str = os.getEnvDefault("CHENG_BACKEND_LINKER", "")
+    let elfProfile: str = os.getEnvDefault("CHENG_BACKEND_ELF_PROFILE", "")
+    if linker == nil:
+        linker = ""
+    var multi: bool = os.getEnvDefault("CHENG_BACKEND_MULTI", "") == "1"
+    var multiLto: bool = os.getEnvDefault("CHENG_BACKEND_MULTI_LTO", "") == "1"
+    let androidApi: int32 = driver_parseInt32Default(os.getEnvDefault("CHENG_ANDROID_API", ""), 21)
+    var posCount: int32 = 0
+    var i: int32 = 1
+    while i <= count:
+        let arg: str = cmdline.paramStr(i)
+        if driver_strHasPrefix(arg, "--emit="):
+            emitMode = driver_strStripPrefix(arg, "--emit=")
+        elif driver_strHasPrefix(arg, "--target="):
+            target = driver_strStripPrefix(arg, "--target=")
+        elif driver_strHasPrefix(arg, "--frontend="):
+            frontend = driver_strStripPrefix(arg, "--frontend=")
+        elif driver_strHasPrefix(arg, "--cc="):
+            ccCmd = driver_strStripPrefix(arg, "--cc=")
+            ccExplicit = true
+        elif driver_strHasPrefix(arg, "--ld="):
+            ldCmd = driver_strStripPrefix(arg, "--ld=")
+            ldExplicit = true
+        elif driver_strHasPrefix(arg, "--cflags="):
+            cflags = driver_strStripPrefix(arg, "--cflags=")
+        elif driver_strHasPrefix(arg, "--ldflags="):
+            ldflags = driver_strStripPrefix(arg, "--ldflags=")
+        elif driver_strHasPrefix(arg, "--linker="):
+            linker = driver_strStripPrefix(arg, "--linker=")
+        elif arg == "--multi":
+            multi = true
+        elif posCount == 0:
+            inputPath = arg
+            posCount = 1
+        elif posCount == 1:
+            outputPath = arg
+            posCount = 2
+        i = i + 1
+    if len(inputPath) == 0:
+        inputPath = os.getEnvDefault("CHENG_BACKEND_INPUT", "")
+    if len(outputPath) == 0:
+        outputPath = os.getEnvDefault("CHENG_BACKEND_OUTPUT", "")
+    if emitMode == nil || len(emitMode) == 0:
+        emitMode = "obj"
+    if target == nil || len(target) == 0 || streq(target, "auto"):
+        target = driver_detectHostTargetAuto()
+    if target == nil || len(target) == 0:
+        panic("backend_driver: auto target detect failed; pass --target=<triple> or set CHENG_BACKEND_TARGET")
+    if !streq(emitMode, "obj") && !streq(emitMode, "exe"):
+        if streq(emitMode, "asm"):
+            panic "backend_driver: emit=asm removed; use emit=obj or emit=exe"
+        panic "backend_driver: invalid emit mode"
+
+    if streq(emitMode, "exe") && streq(elfProfile, "nolibc"):
+        if !(streq(linker, "self") &&
+             driver_targetIsAarch64(target) &&
+             driver_targetIsLinux(target) &&
+             !driver_targetIsDarwin(target) &&
+             !driver_targetIsWindows(target)):
+            panic("backend_driver: CHENG_BACKEND_ELF_PROFILE=nolibc requires self-link on linux aarch64 target: " + target)
+
+    let intBitsRaw: str = os.getEnvDefault("CHENG_INTBITS", "")
+    if intBitsRaw != nil && len(intBitsRaw) > 0:
+        let intBits: int32 = driver_parseInt32Default(intBitsRaw, -1)
+        if intBits != 32 && intBits != 64:
+            panic "backend_driver: unsupported CHENG_INTBITS (expected 32 or 64)"
+
+    if !driver_targetIsAarch64(target) && !driver_targetIsX86_64(target) && !driver_targetIsRiscv64(target):
+        panic("backend_driver: unsupported CHENG_BACKEND_TARGET (expected aarch64/arm64, x86_64, or riscv64): " + target)
+
+    if driver_targetIsAndroid(target):
+        if !ccExplicit && streq(ccCmd, "cc"):
+            let ndkCc: str = driver_defaultAndroidNdkClang(androidApi)
+            if ndkCc != nil && len(ndkCc) > 0:
+                ccCmd = ndkCc
+        if !ldExplicit && (ldCmd == nil || len(ldCmd) == 0):
+            ldCmd = ccCmd
+        if len(cflags) == 0:
+            cflags = "-fPIE"
+        if len(ldflags) == 0:
+            ldflags = "-fPIE -pie"
+        ldflags = driver_flagsAppendToken(ldflags, "-lm")
+
+    if driver_targetIsDarwin(target) && driver_targetIsX86_64(target):
+        # Ensure the system toolchain links the right arch on Apple Silicon.
+        cflags = driver_flagsAppendToken(cflags, "-arch")
+        cflags = driver_flagsAppendToken(cflags, "x86_64")
+    if ldCmd == nil || len(ldCmd) == 0:
+        ldCmd = ccCmd
+
+    var moduleRes: Result[MirModule]
+    if len(inputPath) == 0:
+        let demo: MirModule = mirDemoModule()
+        moduleRes = Ok[MirModule](demo)
+    else:
+        if streq(frontend, "stage1"):
+            moduleRes = mirBuildModuleFromFileStage1(inputPath)
+        else:
+            moduleRes = mirBuildModuleFromFile(inputPath)
+
+    if ! IsOk[MirModule](moduleRes):
+        driver_panicResult[MirModule](moduleRes)
+    let mod: MirModule = Value[MirModule](moduleRes)
+    if target != nil && len(target) > 0:
+        mod.target = target
+    if len(outputPath) == 0:
+        if len(inputPath) == 0:
+            panic "backend_driver: output path required"
+        let parts: SplitFileResult = os.splitFile(inputPath)
+        let base = driver_joinDir(parts.dir, parts.name)
+        if streq(emitMode, "obj"):
+            outputPath = base + ".o"
+        else:
+            outputPath = base
+    let outParts: SplitFileResult = os.splitFile(outputPath)
+    let outBase = driver_joinDir(outParts.dir, outParts.name)
+    let runtimeObj: str = os.getEnvDefault("CHENG_BACKEND_RUNTIME_OBJ", "")
+    let runtimeC: str = os.getEnvDefault("CHENG_BACKEND_RUNTIME_C", "src/runtime/native/system_helpers.c")
+    let noRuntimeC: bool = os.getEnvDefault("CHENG_BACKEND_NO_RUNTIME_C", "") == "1"
+    let objWriter: str = os.getEnvDefault("CHENG_BACKEND_OBJ_WRITER", "")
+    if streq(emitMode, "exe") && multi:
+        if multiLto:
+            let opt2: bool = os.getEnvDefault("CHENG_BACKEND_OPT2", "") == "1"
+            let optDefault: int32 = opt2 ? 2 : (os.getEnvDefault("CHENG_BACKEND_OPT", "") == "1" ? 1 : 0)
+            let optLevel: int32 = driver_parseInt32Default(os.getEnvDefault("CHENG_BACKEND_OPT_LEVEL", ""), optDefault)
+            if optLevel >= 2:
+                mirOptimizeModule2(mod)
+            elif optLevel >= 1:
+                mirOptimizeModule(mod)
+            mirNormalizeModule(mod)
+        let objDir: str = outBase + ".objs"
+        if ! os.dirExists(objDir):
+            os.createDir(objDir)
+        let unitFiles: seq[str] = driver_collectUnitFiles(mod)
+        if unitFiles.len == 0:
+            panic "backend_driver: no compilation units"
+        var objPaths: seq[str] = newSeq[str]()
+        var ui: int32 = 0
+        while ui < unitFiles.len:
+            let fp: str = get[str](unitFiles, ui)
+            let u: MirModule = driver_buildUnitModule(mod, fp)
+            let parts2: SplitFileResult = os.splitFile(fp)
+            let h: int64 = mirFnv1a64(fp)
+            let stem: str = parts2.name + "_" + mirU64ToHex(h)
+            let objPath: str = objDir + "/" + stem + ".o"
+            let lir: LirModule = driver_moduleToLir(u)
+            var objRes: Result[seq[uint8]]
+            if driver_targetIsX86_64(target):
+                var objWriter2: str = objWriter
+                if objWriter2 == nil || len(objWriter2) == 0:
+                    if driver_targetIsDarwin(target):
+                        objWriter2 = "macho"
+                    elif driver_targetIsWindows(target):
+                        objWriter2 = "coff"
+                    else:
+                        objWriter2 = "elf"
+                if streq(objWriter2, "macho"):
+                    if !driver_targetIsDarwin(target):
+                        panic("backend_driver: x86_64 macho writer requires darwin target: " + target)
+                    objRes = machoWriteX86_64RelocatableObj(lir)
+                elif streq(objWriter2, "elf"):
+                    if driver_targetIsDarwin(target) || driver_targetIsWindows(target):
+                        panic("backend_driver: x86_64 elf writer requires non-darwin, non-windows target: " + target)
+                    objRes = elfWriteX86_64RelocatableObj(lir)
+                elif streq(objWriter2, "coff"):
+                    if !driver_targetIsWindows(target):
+                        panic("backend_driver: x86_64 coff writer requires windows target: " + target)
+                    objRes = coffWriteX86_64RelocatableObj(lir)
+                else:
+                    panic("backend_driver: unsupported CHENG_BACKEND_OBJ_WRITER for x86_64: " + objWriter2)
+            elif driver_targetIsRiscv64(target):
+                if streq(objWriter, "elf") || objWriter == nil || len(objWriter) == 0:
+                    if driver_targetIsDarwin(target) || driver_targetIsWindows(target):
+                        panic("backend_driver: riscv64 elf writer requires non-darwin, non-windows target: " + target)
+                    objRes = elfWriteRiscv64RelocatableObj(lir)
+                else:
+                    panic("backend_driver: unsupported CHENG_BACKEND_OBJ_WRITER for riscv64: " + objWriter)
+            else:
+                if streq(objWriter, "elf"):
+                    objRes = elfWriteAarch64RelocatableObj(lir)
+                elif streq(objWriter, "macho"):
+                    objRes = machoWriteAarch64RelocatableObj(lir)
+                elif streq(objWriter, "coff"):
+                    objRes = coffWriteAarch64RelocatableObj(lir)
+                elif driver_targetIsDarwin(target):
+                    objRes = machoWriteAarch64RelocatableObj(lir)
+                elif driver_targetIsWindows(target):
+                    objRes = coffWriteAarch64RelocatableObj(lir)
+                else:
+                    objRes = elfWriteAarch64RelocatableObj(lir)
+            if ! IsOk[seq[uint8]](objRes):
+                driver_panicResult[seq[uint8]](objRes)
+            os.writeFileBytes(objPath, Value[seq[uint8]](objRes))
+            memRetain void*(objPath)
+            addPtr[str](&objPaths, objPath)
+            ui = ui + 1
+        var oi: int32 = 0
+        if streq(linker, "self") && driver_targetIsDarwin(target) && driver_targetIsAarch64(target):
+            var linkObjs: seq[str] = newSeq[str]()
+            oi = 0
+            while oi < objPaths.len:
+                addPtr[str](&linkObjs, get[str](objPaths, oi))
+                oi = oi + 1
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes: Result[bool] = machoLinkExeAarch64(linkObjs, outputPath)
+            if ! IsOk[bool](linkRes):
+                driver_panicResult[bool](linkRes)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+            if os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1") != "0":
+                driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
+        elif streq(linker, "self") && driver_targetIsDarwin(target) && driver_targetIsX86_64(target):
+            var linkObjs: seq[str] = newSeq[str]()
+            oi = 0
+            while oi < objPaths.len:
+                addPtr[str](&linkObjs, get[str](objPaths, oi))
+                oi = oi + 1
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes: Result[bool] = machoLinkExeX86_64(linkObjs, outputPath)
+            if ! IsOk[bool](linkRes):
+                driver_panicResult[bool](linkRes)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+            if os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1") != "0":
+                driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
+        elif streq(linker, "self") && driver_targetIsWindows(target) && driver_targetIsAarch64(target):
+            var linkObjs: seq[str] = newSeq[str]()
+            oi = 0
+            while oi < objPaths.len:
+                addPtr[str](&linkObjs, get[str](objPaths, oi))
+                oi = oi + 1
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes: Result[bool] = coffLinkExeAarch64(linkObjs, outputPath, target)
+            if ! IsOk[bool](linkRes):
+                driver_panicResult[bool](linkRes)
+        elif streq(linker, "self") && !driver_targetIsWindows(target) && !driver_targetIsDarwin(target) && driver_targetIsRiscv64(target):
+            var linkObjs: seq[str] = newSeq[str]()
+            oi = 0
+            while oi < objPaths.len:
+                addPtr[str](&linkObjs, get[str](objPaths, oi))
+                oi = oi + 1
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes: Result[bool] = elfLinkExeRiscv64(linkObjs, outputPath, target)
+            if ! IsOk[bool](linkRes):
+                driver_panicResult[bool](linkRes)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+        elif streq(linker, "self") && !driver_targetIsWindows(target) && driver_targetIsAarch64(target):
+            var linkObjs: seq[str] = newSeq[str]()
+            oi = 0
+            while oi < objPaths.len:
+                addPtr[str](&linkObjs, get[str](objPaths, oi))
+                oi = oi + 1
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes: Result[bool] = elfLinkExeAarch64(linkObjs, outputPath, target)
+            if ! IsOk[bool](linkRes):
+                driver_panicResult[bool](linkRes)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+        else:
+            var linkCmd: str = ldCmd
+            oi = 0
+            while oi < objPaths.len:
+                linkCmd = linkCmd + " " + driver_shellQuote(get[str](objPaths, oi))
+                oi = oi + 1
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                linkCmd = linkCmd + " " + driver_shellQuote(runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                linkCmd = linkCmd + " " + driver_shellQuote(runtimeC)
+            if len(cflags) > 0:
+                linkCmd = linkCmd + " " + cflags
+            linkCmd = linkCmd + " -o " + driver_shellQuote(outputPath)
+            if len(ldflags) > 0:
+                linkCmd = linkCmd + " " + ldflags
+            driver_runCmd(linkCmd)
+        oi = 0
+        while oi < objPaths.len:
+            memRelease void*(get[str](objPaths, oi))
+            oi = oi + 1
+        return 0
+    let objPath: str = streq(emitMode, "obj") ? outputPath : (outBase + ".o")
+    let lir: LirModule = driver_moduleToLir(mod)
+    var objRes2: Result[seq[uint8]]
+    if driver_targetIsX86_64(target):
+        var objWriter3: str = objWriter
+        if objWriter3 == nil || len(objWriter3) == 0:
+            if driver_targetIsDarwin(target):
+                objWriter3 = "macho"
+            elif driver_targetIsWindows(target):
+                objWriter3 = "coff"
+            else:
+                objWriter3 = "elf"
+        if streq(objWriter3, "macho"):
+            if !driver_targetIsDarwin(target):
+                panic("backend_driver: x86_64 macho writer requires darwin target: " + target)
+            objRes2 = machoWriteX86_64RelocatableObj(lir)
+        elif streq(objWriter3, "elf"):
+            if driver_targetIsDarwin(target) || driver_targetIsWindows(target):
+                panic("backend_driver: x86_64 elf writer requires non-darwin, non-windows target: " + target)
+            objRes2 = elfWriteX86_64RelocatableObj(lir)
+        elif streq(objWriter3, "coff"):
+            if !driver_targetIsWindows(target):
+                panic("backend_driver: x86_64 coff writer requires windows target: " + target)
+            objRes2 = coffWriteX86_64RelocatableObj(lir)
+        else:
+            panic("backend_driver: unsupported CHENG_BACKEND_OBJ_WRITER for x86_64: " + objWriter3)
+    elif driver_targetIsRiscv64(target):
+        if streq(objWriter, "elf") || objWriter == nil || len(objWriter) == 0:
+            if driver_targetIsDarwin(target) || driver_targetIsWindows(target):
+                panic("backend_driver: riscv64 elf writer requires non-darwin, non-windows target: " + target)
+            objRes2 = elfWriteRiscv64RelocatableObj(lir)
+        else:
+            panic("backend_driver: unsupported CHENG_BACKEND_OBJ_WRITER for riscv64: " + objWriter)
+    else:
+        if streq(objWriter, "elf"):
+            objRes2 = elfWriteAarch64RelocatableObj(lir)
+        elif streq(objWriter, "macho"):
+            objRes2 = machoWriteAarch64RelocatableObj(lir)
+        elif streq(objWriter, "coff"):
+            objRes2 = coffWriteAarch64RelocatableObj(lir)
+        elif driver_targetIsDarwin(target):
+            objRes2 = machoWriteAarch64RelocatableObj(lir)
+        elif driver_targetIsWindows(target):
+            objRes2 = coffWriteAarch64RelocatableObj(lir)
+        else:
+            objRes2 = elfWriteAarch64RelocatableObj(lir)
+    if ! IsOk[seq[uint8]](objRes2):
+        driver_panicResult[seq[uint8]](objRes2)
+    os.writeFileBytes(objPath, Value[seq[uint8]](objRes2))
+    if streq(emitMode, "exe"):
+        if streq(linker, "self") && driver_targetIsDarwin(target) && driver_targetIsAarch64(target):
+            var linkObjs2: seq[str] = newSeq[str]()
+            addPtr[str](&linkObjs2, objPath)
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs2, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes2: Result[bool] = machoLinkExeAarch64(linkObjs2, outputPath)
+            if ! IsOk[bool](linkRes2):
+                driver_panicResult[bool](linkRes2)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+            if os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1") != "0":
+                driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
+        elif streq(linker, "self") && driver_targetIsDarwin(target) && driver_targetIsX86_64(target):
+            var linkObjs2: seq[str] = newSeq[str]()
+            addPtr[str](&linkObjs2, objPath)
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs2, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes2: Result[bool] = machoLinkExeX86_64(linkObjs2, outputPath)
+            if ! IsOk[bool](linkRes2):
+                driver_panicResult[bool](linkRes2)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+            if os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1") != "0":
+                driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
+        elif streq(linker, "self") && driver_targetIsWindows(target) && driver_targetIsAarch64(target):
+            var linkObjs2: seq[str] = newSeq[str]()
+            addPtr[str](&linkObjs2, objPath)
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs2, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes2: Result[bool] = coffLinkExeAarch64(linkObjs2, outputPath, target)
+            if ! IsOk[bool](linkRes2):
+                driver_panicResult[bool](linkRes2)
+        elif streq(linker, "self") && !driver_targetIsWindows(target) && !driver_targetIsDarwin(target) && driver_targetIsRiscv64(target):
+            var linkObjs2: seq[str] = newSeq[str]()
+            addPtr[str](&linkObjs2, objPath)
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs2, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes2: Result[bool] = elfLinkExeRiscv64(linkObjs2, outputPath, target)
+            if ! IsOk[bool](linkRes2):
+                driver_panicResult[bool](linkRes2)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+        elif streq(linker, "self") && !driver_targetIsWindows(target) && driver_targetIsAarch64(target):
+            var linkObjs2: seq[str] = newSeq[str]()
+            addPtr[str](&linkObjs2, objPath)
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                addPtr[str](&linkObjs2, runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
+            let linkRes2: Result[bool] = elfLinkExeAarch64(linkObjs2, outputPath, target)
+            if ! IsOk[bool](linkRes2):
+                driver_panicResult[bool](linkRes2)
+            driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
+        else:
+            var linkCmd2: str = ldCmd + " " + driver_shellQuote(objPath)
+            if len(runtimeObj) > 0:
+                if ! frontend_lib.stage1_fileExists(runtimeObj):
+                    panic("backend_driver: runtime obj not found: " + runtimeObj)
+                linkCmd2 = linkCmd2 + " " + driver_shellQuote(runtimeObj)
+            elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
+                linkCmd2 = linkCmd2 + " " + driver_shellQuote(runtimeC)
+            if len(cflags) > 0:
+                linkCmd2 = linkCmd2 + " " + cflags
+            linkCmd2 = linkCmd2 + " -o " + driver_shellQuote(outputPath)
+            if len(ldflags) > 0:
+                linkCmd2 = linkCmd2 + " " + ldflags
+            driver_runCmd(linkCmd2)
+    return 0
+
+fn main(argc: int32, argv: char**): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    return backendMain()

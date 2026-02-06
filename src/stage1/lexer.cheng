@@ -1,0 +1,1084 @@
+# lexer.cheng
+# Stage1 lexer (ported from stage0/lexer).
+import std/strings
+import std/seqs
+
+@importc("cheng_mem_release")
+fn lex_memRelease(p: void*)
+@importc("cheng_mem_retain")
+fn lex_memRetain(p: void*)
+@importc("cheng_mem_scope_escape")
+fn lex_memScopeEscape(p: void*)
+import cheng/stage1/token
+import cheng/stage1/diagnostics
+
+type
+    LexResult =
+        tokens: seq[Token]
+        diagnostics: seq[Diagnostic]
+
+var
+    lexStringPool: seq[void*]
+    lexStringPoolReady: bool
+
+fn initLexStringPool() =
+    if lexStringPoolReady:
+        return
+    lexStringPool = newSeqWithCap[void*](0, 256)
+    lexStringPoolReady = true
+
+fn trackLexString(p: void*) =
+    if p == nil:
+        return
+    initLexStringPool()
+    lex_memScopeEscape p
+    lex_memRetain p
+    addPtr[void*](&lexStringPool, p)
+
+fn releaseLexStrings() =
+    if ! lexStringPoolReady:
+        return
+    var i: int32 = 0
+    while i < lexStringPool.len:
+        let p: void* = get[void*](lexStringPool, i)
+        if p != nil:
+            lex_memRelease p
+        i = i + 1
+    freeSeqPtr[void*](&lexStringPool)
+    lexStringPoolReady = false
+
+type
+    ScanResult =
+        tok: Token
+        nextPos: int32
+
+fn addLexDiag(diags: var seq[Diagnostic], filename: str, line: int32, col: int32, msg: str) =
+    var d: Diagnostic
+    d.severity = svError
+    d.filename = filename
+    d.line = line
+    d.col = col
+    d.message = msg
+    addPtr[Diagnostic](diags, d)
+
+fn isDigit(c: char): bool =
+    if c < '0':
+        return false
+    if c > '9':
+        return false
+    return true
+
+fn isAlphaAscii(c: char): bool =
+    if c >= 'a':
+        if c <= 'z':
+            return true
+    if c >= 'A':
+        if c <= 'Z':
+            return true
+    return false
+
+fn isAlphaNum(c: char): bool =
+    if isAlphaAscii c:
+        return true
+    if isDigit c:
+        return true
+    return false
+
+fn isHexDigit(c: char): bool =
+    if isDigit c:
+        return true
+    if c >= 'a':
+        if c <= 'f':
+            return true
+    if c >= 'A':
+        if c <= 'F':
+            return true
+    return false
+
+fn sliceRange(s: str, start: int32, stop: int32): str =
+    if s == nil:
+        return ""
+    var a: int32 = start
+    var b: int32 = stop
+    if a < 0:
+        a = 0
+    let n: int32 = len s
+    if b >= n:
+        b = n - 1
+    if b < a:
+        return ""
+    let count: int32 = b - a + 1
+    let p: void* = alloc(count + 1)
+    let src: void* = ptr_add(void*(s), a)
+    copyMem(p, src, count)
+    setMem(ptr_add(p, count), 0, 1)
+    return str(p)
+
+fn sliceRangeLex(s: str, start: int32, stop: int32): str =
+    let out: str = sliceRange(s, start, stop)
+    if out != nil && len out > 0:
+        trackLexString void*(out)
+    return out
+
+fn trimTrailingCR(s: str): str =
+    let n: int32 = len s
+    if n <= 0:
+        return s
+    if charAt(s, n - 1) == '\r':
+        return sliceRangeLex(s, 0, n - 2)
+    return s
+
+fn splitLines(text: str): seq[str] =
+    var out: seq[str] = newSeq[str]()
+    if text == nil:
+        return out
+    let n: int32 = len text
+    if n == 0:
+        return out
+    var start: int32 = 0
+    var i: int32 = 0
+    while i < n:
+        let c: char = charAt(text, i)
+        if c == '\n':
+            addPtr[str](&out, trimTrailingCR(sliceRangeLex(text, start, i - 1)))
+            start = i + 1
+        i = i + 1
+    if start <= n - 1:
+        addPtr[str](&out, trimTrailingCR(sliceRangeLex(text, start, n - 1)))
+    elif start == n:
+        addPtr[str](&out, "")
+    return out
+
+fn isKeyword(s: str): bool =
+    if (s ==  "module"): return true
+    if (s ==  "const"): return true
+    if (s ==  "let"): return true
+    if (s ==  "var"): return true
+    if (s ==  "type"): return true
+    if (s ==  "concept"): return true
+    if (s ==  "trait"): return true
+    if (s ==  "fn"): return true
+    if (s ==  "iterator"): return true
+    if (s ==  "macro"): return true
+    if (s ==  "template"): return true
+    if (s ==  "async"): return true
+    if (s ==  "mut"): return true
+    if (s ==  "if"): return true
+    if (s ==  "elif"): return true
+    if (s ==  "else"): return true
+    if (s ==  "for"): return true
+    if (s ==  "while"): return true
+    if (s ==  "break"): return true
+    if (s ==  "continue"): return true
+    if (s ==  "return"): return true
+    if (s ==  "yield"): return true
+    if (s ==  "defer"): return true
+    if (s ==  "await"): return true
+    if (s ==  "block"): return true
+    if (s ==  "import"): return true
+    if (s ==  "as"): return true
+    if (s ==  "in"): return true
+    if (s ==  "when"): return true
+    if (s ==  "case"): return true
+    if (s ==  "of"): return true
+    if (s ==  "where"): return true
+    if (s ==  "true"): return true
+    if (s ==  "false"): return true
+    if (s ==  "nil"): return true
+    if (s ==  "enum"): return true
+    if (s ==  "ref"): return true
+    if (s ==  "tuple"): return true
+    if (s ==  "set"): return true
+    if (s ==  "str"): return true
+    if (s ==  "is"): return true
+    if (s ==  "notin"): return true
+    return false
+
+fn isBlockStartKeyword(s: str): bool =
+    if (s ==  "if"): return true
+    if (s ==  "elif"): return true
+    if (s ==  "else"): return true
+    if (s ==  "for"): return true
+    if (s ==  "while"): return true
+    if (s ==  "case"): return true
+    if (s ==  "of"): return true
+    if (s ==  "when"): return true
+    if (s ==  "block"): return true
+    return false
+
+fn isBlockContinueKeyword(s: str): bool =
+    if (s ==  "elif"): return true
+    if (s ==  "else"): return true
+    if (s ==  "of"): return true
+    return false
+
+fn isBlockExprKeyword(s: str): bool =
+    if (s ==  "if"): return true
+    if (s ==  "fn"): return true
+    if (s ==  "iterator"): return true
+    return false
+
+fn nextLineIsIndented(lines: seq[str], startIdx: int32, baseIndent: int32): bool =
+    var idx: int32 = startIdx
+    while idx < lines.len:
+        let lineStr: str = get[str](lines, idx)
+        var pos: int32 = 0
+        while pos < len lineStr && charAt(lineStr, pos) == ' ':
+            pos = pos + 1
+        if pos >= len lineStr:
+            idx = idx + 1
+            continue
+        if charAt(lineStr, pos) == '#':
+            idx = idx + 1
+            continue
+        return pos > baseIndent
+    return false
+
+fn nextLineStartsBlockExpr(lines: seq[str], startIdx: int32): bool =
+    var idx: int32 = startIdx
+    while idx < lines.len:
+        let lineStr: str = get[str](lines, idx)
+        var pos: int32 = 0
+        while pos < len lineStr && charAt(lineStr, pos) == ' ':
+            pos = pos + 1
+        if pos >= len lineStr:
+            idx = idx + 1
+            continue
+        if charAt(lineStr, pos) == '#':
+            idx = idx + 1
+            continue
+        let ch: char = charAt(lineStr, pos)
+        if ! (isAlphaAscii ch || ch == '_'):
+            return false
+        var j: int32 = pos
+        var word: str = ""
+        while j < len lineStr:
+            let cj: char = charAt(lineStr, j)
+            if isAlphaNum cj || cj == '_':
+                word = word + charToStr cj
+                j = j + 1
+            else:
+                break
+        return isBlockExprKeyword word
+    return false
+
+fn lineStartsContinueKeyword(lineStr: str): bool =
+    var pos: int32 = 0
+    while pos < len lineStr && charAt(lineStr, pos) == ' ':
+        pos = pos + 1
+    if pos >= len lineStr:
+        return false
+    if charAt(lineStr, pos) == '#':
+        return false
+    let ch: char = charAt(lineStr, pos)
+    if ! (isAlphaAscii ch || ch == '_'):
+        return false
+    var j: int32 = pos
+    var word: str = ""
+    while j < len lineStr:
+        let cj: char = charAt(lineStr, j)
+        if isAlphaNum cj || cj == '_':
+            word = word + charToStr cj
+            j = j + 1
+        else:
+            break
+    return isBlockContinueKeyword word
+
+fn emitIndentTokens(tokens: var seq[Token], stack: var seq[int32], newIndent: int32, line: int32, filename: str, diags: var seq[Diagnostic]) =
+    var current: int32 = 0
+    if stack.len > 0:
+        let idx: int32 = stack.len - 1
+        let off32: int32 = int32(int64(idx) * sizeof int32)
+        let p: void* = ptr_add(stack.buffer, off32)
+        let pt: int32* = int32*(p)
+        current = *pt
+    if newIndent > current:
+        addPtr[int32](stack, newIndent)
+        addPtr[Token](tokens, newToken(tkIndent, "", line, 1))
+    elif newIndent < current:
+        while stack.len > 0:
+            let idx2: int32 = stack.len - 1
+            let off32b: int32 = int32(int64(idx2) * sizeof int32)
+            let p2: void* = ptr_add(stack.buffer, off32b)
+            let pt2: int32* = int32*(p2)
+            let top: int32 = *pt2
+            if top <= newIndent:
+                break
+            stack.len = stack.len - 1
+            addPtr[Token](tokens, newToken(tkDedent, "", line, 1))
+        if stack.len == 0:
+            addLexDiag(diags, filename, line, 1, "Indentation level mismatch")
+            addPtr[int32](stack, newIndent)
+            addPtr[Token](tokens, newToken(tkIndent, "", line, 1))
+        else:
+            let idx3: int32 = stack.len - 1
+            let off32c: int32 = int32(int64(idx3) * sizeof int32)
+            let p3: void* = ptr_add(stack.buffer, off32c)
+            let pt3: int32* = int32*(p3)
+            let top2: int32 = *pt3
+            if top2 != newIndent:
+                addLexDiag(diags, filename, line, 1, "Indentation level mismatch")
+                addPtr[int32](stack, newIndent)
+                addPtr[Token](tokens, newToken(tkIndent, "", line, 1))
+
+fn isContinuationToken(tok: Token): bool =
+    if tok.kind == tkSymbol:
+        if (tok.lexeme ==  "="): return true
+        if (tok.lexeme ==  "+"): return true
+        if (tok.lexeme ==  "-"): return true
+        if (tok.lexeme ==  "/"): return true
+        if (tok.lexeme ==  "%"): return true
+        if (tok.lexeme ==  "&"): return true
+        if (tok.lexeme ==  "|"): return true
+        if (tok.lexeme ==  "^"): return true
+        if (tok.lexeme ==  ","): return true
+        if (tok.lexeme ==  "."): return true
+        if (tok.lexeme ==  "->"): return true
+        if (tok.lexeme ==  ".."): return true
+        if (tok.lexeme ==  "..<"): return true
+        if (tok.lexeme ==  "=="): return true
+        if (tok.lexeme ==  "!="): return true
+        if (tok.lexeme ==  "<"): return true
+        if (tok.lexeme ==  ">"): return true
+        if (tok.lexeme ==  "<="): return true
+        if (tok.lexeme ==  ">="): return true
+        if (tok.lexeme ==  "<<"): return true
+        if (tok.lexeme ==  ">>"): return true
+        if (tok.lexeme ==  "&&"): return true
+        if (tok.lexeme ==  "||"): return true
+        return false
+    if tok.kind == tkKeyword:
+        if (tok.lexeme ==  "in"): return true
+        if (tok.lexeme ==  "notin"): return true
+        if (tok.lexeme ==  "is"): return true
+        return false
+    return false
+
+fn isDefKeyword(tok: Token): bool =
+    if tok.kind != tkKeyword:
+        return false
+    if (tok.lexeme ==  "fn"): return true
+    if (tok.lexeme ==  "iterator"): return true
+    if (tok.lexeme ==  "macro"): return true
+    if (tok.lexeme ==  "template"): return true
+    if (tok.lexeme ==  "type"): return true
+    if (tok.lexeme ==  "concept"): return true
+    if (tok.lexeme ==  "trait"): return true
+    return false
+
+fn lexNumber(content: str, start: int32, line: int32, filename: str, diags: var seq[Diagnostic]): ScanResult =
+    var result: ScanResult
+    var i: int32 = start
+    var lexeme: str = ""
+    if i + 1 < len content:
+        if charAt(content, i) == '0':
+            let c1: char = charAt(content, i + 1)
+            var isRadix: bool = false
+            if c1 == 'x':
+                isRadix = true
+            elif c1 == 'X':
+                isRadix = true
+            elif c1 == 'b':
+                isRadix = true
+            elif c1 == 'B':
+                isRadix = true
+            elif c1 == 'o':
+                isRadix = true
+            elif c1 == 'O':
+                isRadix = true
+            if isRadix:
+                lexeme = lexeme + charToStr charAt(content, i)
+                i = i + 1
+                lexeme = lexeme + charToStr charAt(content, i)
+                i = i + 1
+                while i < len content:
+                    let c: char = charAt(content, i)
+                    if isAlphaNum c:
+                        lexeme = lexeme + charToStr c
+                        i = i + 1
+                        continue
+                    if c == '_':
+                        lexeme = lexeme + charToStr c
+                        i = i + 1
+                        continue
+                    break
+                trackLexString void*(lexeme)
+                result.tok = newToken(tkNumber, lexeme, line, start + 1)
+                result.nextPos = i
+                return result
+    var hasDot: bool = false
+    while i < len content:
+        let c: char = charAt(content, i)
+        if isDigit c:
+            lexeme = lexeme + charToStr c
+            i = i + 1
+            continue
+        if c == '_':
+            lexeme = lexeme + charToStr c
+            i = i + 1
+            continue
+        if c == '.':
+            if hasDot:
+                break
+            var isRange: bool = false
+            if i + 1 < len content:
+                if charAt(content, i + 1) == '.':
+                    isRange = true
+            if isRange:
+                break
+            hasDot = true
+            lexeme = lexeme + charToStr c
+            i = i + 1
+            continue
+        break
+    trackLexString void*(lexeme)
+    result.tok = newToken(tkNumber, lexeme, line, start + 1)
+    result.nextPos = i
+    return result
+
+fn lexIdent(content: str, start: int32, line: int32): ScanResult =
+    var result: ScanResult
+    var i: int32 = start
+    var lexeme: str = ""
+    while i < len content:
+        let c: char = charAt(content, i)
+        if isAlphaNum c:
+            lexeme = lexeme + charToStr c
+            i = i + 1
+            continue
+        if c == '_':
+            lexeme = lexeme + charToStr c
+            i = i + 1
+            continue
+        break
+    trackLexString void*(lexeme)
+    var kind: TokenKind = tkIdent
+    if isKeyword lexeme:
+        kind = tkKeyword
+    result.tok = newToken(kind, lexeme, line, start + 1)
+    result.nextPos = i
+    return result
+
+fn lexChar(content: str, start: int32, line: int32, filename: str, diags: var seq[Diagnostic]): ScanResult =
+    var result: ScanResult
+    var i: int32 = start + 1
+    var lexeme: str = ""
+    while i < len content:
+        if charAt(content, i) == chr 39:
+            break
+        let c: char = charAt(content, i)
+        if c == chr 92:
+            if i + 1 < len content:
+                lexeme = lexeme + charToStr c
+                i = i + 1
+        lexeme = lexeme + charToStr charAt(content, i)
+        i = i + 1
+    if i >= len content:
+        addLexDiag(diags, filename, line, start + 1, "Unterminated character literal")
+        result.tok = newToken(tkChar, lexeme, line, start + 1)
+        result.nextPos = i
+        return result
+    var okLen: bool = false
+    if len lexeme == 1:
+        okLen = true
+    elif len lexeme == 2:
+        if charAt(lexeme, 0) == chr 92:
+            okLen = true
+    elif len lexeme == 4:
+        if charAt(lexeme, 0) == chr 92:
+            if charAt(lexeme, 1) == 'x':
+                let a: char = charAt(lexeme, 2)
+                let b: char = charAt(lexeme, 3)
+                if isHexDigit a:
+                    if isHexDigit b:
+                        okLen = true
+    if ! okLen:
+        addLexDiag(diags, filename, line, start + 1, "Character literal must contain exactly one character")
+    trackLexString void*(lexeme)
+    result.tok = newToken(tkChar, lexeme, line, start + 1)
+    result.nextPos = i + 1
+    return result
+
+fn lexString(content: str, start: int32, line: int32, filename: str, diags: var seq[Diagnostic]): ScanResult =
+    var result: ScanResult
+    var i: int32 = start
+    var prefix: char = chr 0
+    if i + 1 < len content:
+        let c0: char = charAt(content, i)
+        let c1: char = charAt(content, i + 1)
+        if c1 == '"':
+            if c0 == 'r':
+                prefix = c0
+                i = i + 1
+            elif c0 == 'f':
+                prefix = c0
+                i = i + 1
+    if i + 2 < len content:
+        if charAt(content, i) == '"':
+            if charAt(content, i + 1) == '"':
+                if charAt(content, i + 2) == '"':
+                    i = i + 3
+                    var lexeme: str = ""
+                    while i + 2 < len content:
+                        if charAt(content, i) == '"':
+                            if charAt(content, i + 1) == '"':
+                                if charAt(content, i + 2) == '"':
+                                    break
+                        lexeme = lexeme + charToStr charAt(content, i)
+                        i = i + 1
+                    if i + 2 >= len content:
+                        addLexDiag(diags, filename, line, start + 1, "Unterminated string literal")
+                        trackLexString void*(lexeme)
+                        result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
+                        result.nextPos = len content
+                        return result
+                    trackLexString void*(lexeme)
+                    result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
+                    result.nextPos = i + 3
+                    return result
+    if charAt(content, i) == '"':
+        i = i + 1
+    var lexeme: str = ""
+    while i < len content:
+        if charAt(content, i) == '"':
+            break
+        let c: char = charAt(content, i)
+        if c == chr 92:
+            if i + 1 < len content:
+                lexeme = lexeme + charToStr c
+                i = i + 1
+        lexeme = lexeme + charToStr charAt(content, i)
+        i = i + 1
+    if i >= len content:
+        addLexDiag(diags, filename, line, start + 1, "Unterminated string literal")
+        trackLexString void*(lexeme)
+        result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
+        result.nextPos = i
+        return result
+    trackLexString void*(lexeme)
+    result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
+    result.nextPos = i + 1
+    return result
+
+fn matchSymbol(lineStr: str, pos: int32): ScanResult =
+    var result: ScanResult
+    var i: int32 = pos
+    if i + 2 < len lineStr:
+        if charAt(lineStr, i) == '.':
+            if charAt(lineStr, i + 1) == '.':
+                if charAt(lineStr, i + 2) == '<':
+                    result.tok = newToken(tkSymbol, "..<", 0, 0)
+                    result.nextPos = i + 3
+                    return result
+    if i + 1 < len lineStr:
+        let c0: char = charAt(lineStr, i)
+        let c1: char = charAt(lineStr, i + 1)
+        if c0 == '=':
+            if c1 == '>':
+                result.tok = newToken(tkSymbol, "=>", 0, 0)
+                result.nextPos = i + 2
+                return result
+            if c1 == '=':
+                result.tok = newToken(tkSymbol, "==", 0, 0)
+                result.nextPos = i + 2
+                return result
+        if c0 == '-':
+            if c1 == '>':
+                result.tok = newToken(tkSymbol, "->", 0, 0)
+                result.nextPos = i + 2
+                return result
+        if c0 == '!':
+            if c1 == '=':
+                result.tok = newToken(tkSymbol, "!=", 0, 0)
+                result.nextPos = i + 2
+                return result
+        if c0 == '&':
+            if c1 == '&':
+                result.tok = newToken(tkSymbol, "&&", 0, 0)
+                result.nextPos = i + 2
+                return result
+        if c0 == '|':
+            if c1 == '|':
+                result.tok = newToken(tkSymbol, "||", 0, 0)
+                result.nextPos = i + 2
+                return result
+        if c0 == '<':
+            if c1 == '<':
+                result.tok = newToken(tkSymbol, "<<", 0, 0)
+                result.nextPos = i + 2
+                return result
+            if c1 == '=':
+                result.tok = newToken(tkSymbol, "<=", 0, 0)
+                result.nextPos = i + 2
+                return result
+        if c0 == '>':
+            if c1 == '>':
+                result.tok = newToken(tkSymbol, ">>", 0, 0)
+                result.nextPos = i + 2
+                return result
+            if c1 == '=':
+                result.tok = newToken(tkSymbol, ">=", 0, 0)
+                result.nextPos = i + 2
+                return result
+        if c0 == '.':
+            if c1 == '.':
+                result.tok = newToken(tkSymbol, "..", 0, 0)
+                result.nextPos = i + 2
+                return result
+    let c: char = charAt(lineStr, i)
+    if c == '(':
+        result.tok = newToken(tkSymbol, "(", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == ')':
+        result.tok = newToken(tkSymbol, ")", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '[':
+        result.tok = newToken(tkSymbol, "[", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == ']':
+        result.tok = newToken(tkSymbol, "]", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '{':
+        result.tok = newToken(tkSymbol, "{", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '}':
+        result.tok = newToken(tkSymbol, "}", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == ',':
+        result.tok = newToken(tkSymbol, ",", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == ':':
+        result.tok = newToken(tkSymbol, ":", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == ';':
+        result.tok = newToken(tkSymbol, ";", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '.':
+        result.tok = newToken(tkSymbol, ".", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '=':
+        result.tok = newToken(tkSymbol, "=", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '+':
+        result.tok = newToken(tkSymbol, "+", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '-':
+        result.tok = newToken(tkSymbol, "-", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '*':
+        result.tok = newToken(tkSymbol, "*", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '/':
+        result.tok = newToken(tkSymbol, "/", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '%':
+        result.tok = newToken(tkSymbol, "%", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '<':
+        result.tok = newToken(tkSymbol, "<", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '>':
+        result.tok = newToken(tkSymbol, ">", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '&':
+        result.tok = newToken(tkSymbol, "&", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '|':
+        result.tok = newToken(tkSymbol, "|", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '^':
+        result.tok = newToken(tkSymbol, "^", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '~':
+        result.tok = newToken(tkSymbol, "~", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '!':
+        result.tok = newToken(tkSymbol, "!", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '$':
+        result.tok = newToken(tkSymbol, "$", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '?':
+        result.tok = newToken(tkSymbol, "?", 0, 0)
+        result.nextPos = i + 1
+        return result
+    if c == '@':
+        result.tok = newToken(tkSymbol, "@", 0, 0)
+        result.nextPos = i + 1
+        return result
+    result.tok = newToken(tkSymbol, "", 0, 0)
+    result.nextPos = i
+    return result
+
+fn lex(content: str, filename: str = "stdin"): LexResult =
+    var tokens: seq[Token] = newSeq[Token]()
+    var diags: seq[Diagnostic] = newSeq[Diagnostic]()
+    var indentStack: seq[int32] = newSeq[int32]()
+    addPtr[int32](&indentStack, 0)
+    let lines: seq[str] = splitLines content
+    var parenDepth: int32 = 0
+    var lineContinues: bool = false
+    var defContinues: bool = false
+    var parenIndentActive: bool = false
+    var parenIndentBase: int32 = 0
+    var parenIndentParenDepth: int32 = 0
+    var parenIndentStack: seq[int32] = newSeq[int32]()
+    addPtr[int32](&parenIndentStack, 0)
+    var exprIndentPending: bool = false
+    var exprIndentActive: bool = false
+    var exprIndentBase: int32 = 0
+    var exprIndentStack: seq[int32] = newSeq[int32]()
+    addPtr[int32](&exprIndentStack, 0)
+    var typeIndentPending: bool = false
+    var typeIndentBase: int32 = 0
+    var typeIndentStack: seq[int32] = newSeq[int32]()
+
+    var lineIdx: int32 = 0
+    while lineIdx < lines.len:
+        let lineStr: str = get[str](lines, lineIdx)
+        let lineNum: int32 = lineIdx + 1
+        var pos: int32 = 0
+        var spaceCount: int32 = 0
+        while pos < len lineStr:
+            if charAt(lineStr, pos) != ' ':
+                break
+            spaceCount = spaceCount + 1
+            pos = pos + 1
+        if pos >= len lineStr:
+            lineIdx = lineIdx + 1
+            continue
+        if pos < len lineStr:
+            if charAt(lineStr, pos) == '#':
+                lineIdx = lineIdx + 1
+                continue
+        if pos < len lineStr:
+            if charAt(lineStr, pos) == '\t':
+                addLexDiag(diags, filename, lineNum, pos + 1, "Tab indentation is not allowed")
+        if exprIndentActive && spaceCount <= exprIndentBase && ! lineStartsContinueKeyword lineStr:
+            while exprIndentStack.len > 1:
+                exprIndentStack.len = exprIndentStack.len - 1
+                addPtr[Token](&tokens, newToken(tkDedent, "", lineNum, 1))
+            exprIndentActive = false
+            exprIndentBase = 0
+            exprIndentStack.len = 1
+        var parenContinuation: bool = false
+        if parenIndentActive:
+            if parenDepth > parenIndentParenDepth:
+                parenContinuation = true
+        else:
+            if parenDepth > 0:
+                parenContinuation = true
+        var continuation: bool = false
+        if lineContinues:
+            continuation = true
+        if parenContinuation:
+            continuation = true
+        var inTypeBlock: bool = false
+        if ! continuation:
+            while typeIndentStack.len > 0 && spaceCount < get[int32](typeIndentStack, typeIndentStack.len - 1):
+                typeIndentStack.len = typeIndentStack.len - 1
+            if typeIndentPending:
+                if spaceCount > typeIndentBase:
+                    addPtr[int32](&typeIndentStack, spaceCount)
+                typeIndentPending = false
+            if typeIndentStack.len > 0 && spaceCount == get[int32](typeIndentStack, typeIndentStack.len - 1):
+                inTypeBlock = true
+            if exprIndentPending:
+                exprIndentActive = true
+                exprIndentBase = spaceCount
+                exprIndentStack = newSeq[int32]()
+                addPtr[int32](&exprIndentStack, 0)
+                exprIndentPending = false
+            elif exprIndentActive:
+                var relIndent: int32 = spaceCount - exprIndentBase
+                if relIndent < 0:
+                    relIndent = 0
+                emitIndentTokens(tokens, exprIndentStack, relIndent, lineNum, filename, diags)
+            elif parenIndentActive:
+                var relIndent: int32 = spaceCount - parenIndentBase
+                if relIndent < 0:
+                    relIndent = 0
+                emitIndentTokens(tokens, parenIndentStack, relIndent, lineNum, filename, diags)
+            else:
+                emitIndentTokens(tokens, indentStack, spaceCount, lineNum, filename, diags)
+
+        var lineHasTokens: bool = false
+        var lineHasDef: bool = false
+        var lineStartsBlock: bool = false
+        var lineStartsContinuation: bool = false
+        var lineStartsCase: bool = false
+        var lineTokenCount: int32 = 0
+        var lineFirstTok: Token = newToken(tkEof, "", lineNum, 0)
+        var lastTok: Token = newToken(tkEof, "", lineNum, 0)
+        while pos < len lineStr:
+            let ch: char = charAt(lineStr, pos)
+            if ch == ' ':
+                pos = pos + 1
+                continue
+            if ch == '#':
+                break
+            var isStringStart: bool = false
+            if ch == '"':
+                isStringStart = true
+            elif ch == 'r':
+                if pos + 1 < len lineStr:
+                    if charAt(lineStr, pos + 1) == '"':
+                        isStringStart = true
+            elif ch == 'f':
+                if pos + 1 < len lineStr:
+                    if charAt(lineStr, pos + 1) == '"':
+                        isStringStart = true
+            if isStringStart:
+                let res: ScanResult = lexString(lineStr, pos, lineNum, filename, diags)
+                addPtr[Token](&tokens, res.tok)
+                if lineTokenCount == 0:
+                    lineFirstTok = res.tok
+                lineTokenCount = lineTokenCount + 1
+                pos = res.nextPos
+                if ! lineHasTokens:
+                    if res.tok.kind == tkKeyword:
+                        if isBlockStartKeyword res.tok.lexeme:
+                            lineStartsBlock = true
+                        if isBlockContinueKeyword res.tok.lexeme:
+                            lineStartsContinuation = true
+                lastTok = res.tok
+                lineHasTokens = true
+                continue
+            var isIdentStart: bool = false
+            if isAlphaAscii ch:
+                isIdentStart = true
+            elif ch == '_':
+                isIdentStart = true
+            if isIdentStart:
+                let res: ScanResult = lexIdent(lineStr, pos, lineNum)
+                addPtr[Token](&tokens, res.tok)
+                if lineTokenCount == 0:
+                    lineFirstTok = res.tok
+                lineTokenCount = lineTokenCount + 1
+                pos = res.nextPos
+                if ! lineHasTokens:
+                    if res.tok.kind == tkKeyword:
+                        if isBlockStartKeyword res.tok.lexeme:
+                            lineStartsBlock = true
+                        if isBlockContinueKeyword res.tok.lexeme:
+                            lineStartsContinuation = true
+                        if (res.tok.lexeme ==  "case"):
+                            lineStartsCase = true
+                if isDefKeyword res.tok:
+                    lineHasDef = true
+                lastTok = res.tok
+                lineHasTokens = true
+                continue
+            if isDigit ch:
+                let res: ScanResult = lexNumber(lineStr, pos, lineNum, filename, diags)
+                addPtr[Token](&tokens, res.tok)
+                if lineTokenCount == 0:
+                    lineFirstTok = res.tok
+                lineTokenCount = lineTokenCount + 1
+                pos = res.nextPos
+                if ! lineHasTokens:
+                    if res.tok.kind == tkKeyword:
+                        if isBlockStartKeyword res.tok.lexeme:
+                            lineStartsBlock = true
+                        if isBlockContinueKeyword res.tok.lexeme:
+                            lineStartsContinuation = true
+                lastTok = res.tok
+                lineHasTokens = true
+                continue
+            if ch == chr 39:
+                let res: ScanResult = lexChar(lineStr, pos, lineNum, filename, diags)
+                addPtr[Token](&tokens, res.tok)
+                if lineTokenCount == 0:
+                    lineFirstTok = res.tok
+                lineTokenCount = lineTokenCount + 1
+                pos = res.nextPos
+                if ! lineHasTokens:
+                    if res.tok.kind == tkKeyword:
+                        if isBlockStartKeyword res.tok.lexeme:
+                            lineStartsBlock = true
+                        if isBlockContinueKeyword res.tok.lexeme:
+                            lineStartsContinuation = true
+                lastTok = res.tok
+                lineHasTokens = true
+                continue
+            if ch == '`':
+                var i: int32 = pos + 1
+                var lexeme: str = ""
+                while i < len lineStr:
+                    if charAt(lineStr, i) == '`':
+                        break
+                    lexeme = lexeme + charToStr charAt(lineStr, i)
+                    i = i + 1
+                if i < len lineStr:
+                    i = i + 1
+                    trackLexString void*(lexeme)
+                    let tok: Token = newToken(tkIdent, lexeme, lineNum, pos + 1)
+                    addPtr[Token](&tokens, tok)
+                    if lineTokenCount == 0:
+                        lineFirstTok = tok
+                    lineTokenCount = lineTokenCount + 1
+                    pos = i
+                    if ! lineHasTokens:
+                        if tok.kind == tkKeyword:
+                            if isBlockStartKeyword tok.lexeme:
+                                lineStartsBlock = true
+                            if isBlockContinueKeyword tok.lexeme:
+                                lineStartsContinuation = true
+                    lastTok = tok
+                    lineHasTokens = true
+                    continue
+                addLexDiag(diags, filename, lineNum, pos + 1, "Unterminated backtick identifier")
+                pos = i
+                continue
+            let symRes: ScanResult = matchSymbol(lineStr, pos)
+            if symRes.nextPos > pos:
+                var tok: Token = symRes.tok
+                tok.line = lineNum
+                tok.col = pos + 1
+                addPtr[Token](&tokens, tok)
+                if lineTokenCount == 0:
+                    lineFirstTok = tok
+                lineTokenCount = lineTokenCount + 1
+                var isOpen: bool = false
+                if (tok.lexeme ==  "("):
+                    isOpen = true
+                elif (tok.lexeme ==  "["):
+                    isOpen = true
+                elif (tok.lexeme ==  "{"):
+                    isOpen = true
+                if isOpen:
+                    parenDepth = parenDepth + 1
+                else:
+                    var isClose: bool = false
+                    if (tok.lexeme ==  ")"):
+                        isClose = true
+                    elif (tok.lexeme ==  "]"):
+                        isClose = true
+                    elif (tok.lexeme ==  "}"):
+                        isClose = true
+                    if isClose:
+                        if parenDepth > 0:
+                            parenDepth = parenDepth - 1
+                pos = symRes.nextPos
+                lastTok = tok
+                lineHasTokens = true
+                continue
+            addLexDiag(diags, filename, lineNum, pos + 1, "Unrecognized character '" + charToStr ch + "'")
+            pos = pos + 1
+
+        if lineHasTokens:
+            if inTypeBlock:
+                lineHasDef = true
+            var defActive: bool = false
+            if lineHasDef:
+                defActive = true
+            if defContinues:
+                defActive = true
+            var opensBlock: bool = false
+            var startsBlockExpr: bool = false
+            if lastTok.kind == tkSymbol:
+                if (lastTok.lexeme ==  ":"):
+                    if lineStartsBlock:
+                        opensBlock = true
+                elif (lastTok.lexeme ==  "="):
+                    if defActive:
+                        opensBlock = true
+                    if (! defActive) && (nextLineStartsBlockExpr(lines, lineIdx + 1) || nextLineIsIndented(lines, lineIdx + 1, spaceCount)):
+                        startsBlockExpr = true
+                        opensBlock = true
+            if lineStartsCase:
+                opensBlock = true
+            var parenContinuationNow: bool = false
+            if parenIndentActive:
+                if parenDepth > parenIndentParenDepth:
+                    parenContinuationNow = true
+            else:
+                if parenDepth > 0:
+                    parenContinuationNow = true
+            var lineContinuesNow: bool = false
+            if parenContinuationNow:
+                lineContinuesNow = true
+            if isContinuationToken lastTok:
+                lineContinuesNow = true
+            if lastTok.kind == tkSymbol &&(lastTok.lexeme ==  "="):
+                lineContinuesNow = false
+            if opensBlock:
+                lineContinuesNow = false
+            if ! lineContinuesNow:
+                addPtr[Token](&tokens, newToken(tkNewline, "", lineNum, len lineStr + 1))
+            lineContinues = lineContinuesNow
+            if lineTokenCount == 1 && lineFirstTok.kind == tkKeyword && lineFirstTok.lexeme ==  "type" && ! lineContinuesNow:
+                typeIndentPending = true
+                typeIndentBase = spaceCount
+            defContinues = false
+            if defActive:
+                if lineContinuesNow:
+                    defContinues = true
+            if ! parenIndentActive:
+                if parenDepth > 0:
+                    if opensBlock:
+                        parenIndentActive = true
+                        parenIndentBase = spaceCount
+                        parenIndentParenDepth = parenDepth
+                        parenIndentStack = newSeq[int32]()
+                        addPtr[int32](&parenIndentStack, 0)
+            if startsBlockExpr:
+                exprIndentPending = true
+            if parenIndentActive:
+                if parenDepth <= parenIndentParenDepth:
+                    let relIndent: int32 = spaceCount - parenIndentBase
+                    var closeParenIndent: bool = false
+                    if relIndent <= 0:
+                        if ! lineStartsContinuation:
+                            if ! opensBlock:
+                                closeParenIndent = true
+                    if closeParenIndent:
+                        parenIndentActive = false
+                        parenIndentBase = 0
+                        parenIndentParenDepth = 0
+                        parenIndentStack.len = 1
+        lineIdx = lineIdx + 1
+
+    while exprIndentStack.len > 1:
+        exprIndentStack.len = exprIndentStack.len - 1
+        addPtr[Token](&tokens, newToken(tkDedent, "", lines.len + 1, 1))
+    while parenIndentStack.len > 1:
+        parenIndentStack.len = parenIndentStack.len - 1
+        addPtr[Token](&tokens, newToken(tkDedent, "", lines.len + 1, 1))
+    while indentStack.len > 1:
+        indentStack.len = indentStack.len - 1
+        addPtr[Token](&tokens, newToken(tkDedent, "", lines.len + 1, 1))
+    addPtr[Token](&tokens, newToken(tkEof, "", lines.len + 1, 1))
+
+    var res: LexResult
+    res.tokens = tokens
+    res.diagnostics = diags
+    return res
+
+fn lexTokens(content: str, filename: str = "stdin"): seq[Token] =
+    let res: LexResult = lex(content, filename)
+    return res.tokens

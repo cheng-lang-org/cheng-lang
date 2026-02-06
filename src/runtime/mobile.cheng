@@ -1,0 +1,214 @@
+type
+    MobilePlatform = enum
+        mpAndroid
+        mpIos
+
+    MobileRuntimeEventKind = enum
+        mreRuntimeStarted
+        mreWindowOpened
+        mreFrameTick
+        mreRuntimeStopped
+        mreLog
+        mrePointerDown
+        mrePointerUp
+        mrePointerMove
+        mrePointerScroll
+        mreKeyDown
+        mreKeyUp
+        mreTextInput
+
+    MobileRuntimeConfig =
+        platform: MobilePlatform
+        resourceRoot: str
+
+    MobileWindowDescriptor =
+        title: str
+        width: int
+        height: int
+        highDpi: bool
+
+    MobileRuntimeEvent =
+        kind: MobileRuntimeEventKind
+        windowId: int
+        pointerX: float
+        pointerY: float
+        pointerDeltaX: float
+        pointerDeltaY: float
+        pointerButton: int
+        pointerId: int
+        eventTimeMs: int64
+        keyCode: int
+        keyRepeat: bool
+        text: str
+        message: str
+
+    MobileRuntimeHandle = ref
+        config: MobileRuntimeConfig
+        nextWindowId: int
+        queued: seq[MobileRuntimeEvent]
+        logs: seq[str]
+        ticks: int
+        windows: seq[MobileWindowDescriptor]
+
+fn defaultConfig(platform: MobilePlatform): MobileRuntimeConfig =
+    var cfg: MobileRuntimeConfig
+    cfg.platform = platform
+    cfg.resourceRoot = ""
+    return cfg
+
+fn defaultWindowDescriptor(title: str): MobileWindowDescriptor =
+    var desc: MobileWindowDescriptor
+    desc.title = title
+    desc.width = 1280
+    desc.height = 720
+    desc.highDpi = true
+    return desc
+
+fn android_runtime_init(cfg: MobileRuntimeConfig): MobileRuntimeHandle =
+    var runtime: MobileRuntimeHandle
+    new(runtime)
+    runtime.config = cfg
+    runtime.nextWindowId = 1
+    runtime.queued = newSeq[MobileRuntimeEvent]()
+    runtime.logs = newSeq[str]()
+    runtime.ticks = 0
+    runtime.windows = newSeq[MobileWindowDescriptor]()
+    var ev: MobileRuntimeEvent
+    ev.kind = mreRuntimeStarted
+    addPtr(&runtime.queued, ev)
+    return runtime
+
+fn ios_runtime_init(cfg: MobileRuntimeConfig): MobileRuntimeHandle =
+    return android_runtime_init(cfg)
+
+fn android_runtime_open_window(runtime: MobileRuntimeHandle, descriptor: MobileWindowDescriptor): int =
+    if runtime == nil:
+        return 0
+    let id = runtime.nextWindowId
+    runtime.nextWindowId = runtime.nextWindowId + 1
+    addPtr(&runtime.windows, descriptor)
+    var ev: MobileRuntimeEvent
+    ev.kind = mreWindowOpened
+    ev.windowId = id
+    ev.message = descriptor.title
+    addPtr(&runtime.queued, ev)
+    return id
+
+fn ios_runtime_open_window(runtime: MobileRuntimeHandle, descriptor: MobileWindowDescriptor): int =
+    return android_runtime_open_window(runtime, descriptor)
+
+fn android_runtime_queue_event(runtime: MobileRuntimeHandle, category: str, payload: str) =
+    if runtime == nil:
+        return
+    let msg = category + ":" + payload
+    addPtr(&runtime.logs, msg)
+    var ev: MobileRuntimeEvent
+    ev.kind = mreLog
+    ev.message = msg
+    addPtr(&runtime.queued, ev)
+
+fn ios_runtime_queue_event(runtime: MobileRuntimeHandle, category: str, payload: str) =
+    android_runtime_queue_event(runtime, category, payload)
+
+fn android_runtime_queue_pointer(runtime: MobileRuntimeHandle, windowId: int, kind: MobileRuntimeEventKind, x, y: float, deltaX, deltaY: float, button: int) =
+    if runtime == nil:
+        return
+    var ev: MobileRuntimeEvent
+    ev.kind = kind
+    ev.windowId = windowId
+    ev.pointerX = x
+    ev.pointerY = y
+    ev.pointerDeltaX = deltaX
+    ev.pointerDeltaY = deltaY
+    ev.pointerButton = button
+    addPtr(&runtime.queued, ev)
+
+fn ios_runtime_queue_pointer(runtime: MobileRuntimeHandle, windowId: int, kind: MobileRuntimeEventKind, x, y: float, deltaX, deltaY: float, button: int) =
+    android_runtime_queue_pointer(runtime, windowId, kind, x, y, deltaX, deltaY, button)
+
+fn android_runtime_queue_key(runtime: MobileRuntimeHandle, windowId: int, keyCode: int, down: bool) =
+    if runtime == nil:
+        return
+    var ev: MobileRuntimeEvent
+    ev.kind = if down: mreKeyDown else: mreKeyUp
+    ev.windowId = windowId
+    ev.keyCode = keyCode
+    addPtr(&runtime.queued, ev)
+
+fn ios_runtime_queue_key(runtime: MobileRuntimeHandle, windowId: int, keyCode: int, down: bool) =
+    android_runtime_queue_key(runtime, windowId, keyCode, down)
+
+fn android_runtime_queue_text(runtime: MobileRuntimeHandle, windowId: int, text: str) =
+    if runtime == nil:
+        return
+    var ev: MobileRuntimeEvent
+    ev.kind = mreTextInput
+    ev.windowId = windowId
+    ev.text = text
+    addPtr(&runtime.queued, ev)
+
+fn ios_runtime_queue_text(runtime: MobileRuntimeHandle, windowId: int, text: str) =
+    android_runtime_queue_text(runtime, windowId, text)
+
+fn android_runtime_tick(runtime: MobileRuntimeHandle, frames: int): seq[MobileRuntimeEvent] =
+    if runtime == nil:
+        return newSeq[MobileRuntimeEvent]()
+    runtime.ticks = runtime.ticks + 1
+    var out: seq[MobileRuntimeEvent] = runtime.queued
+    runtime.queued = newSeq[MobileRuntimeEvent]()
+    var ticks = frames
+    if ticks < 1:
+        ticks = 1
+    var idx: int32 = 0
+    while idx < ticks:
+        var ev: MobileRuntimeEvent
+        ev.kind = mreFrameTick
+        addPtr(&out, ev)
+        idx = idx + 1
+    return out
+
+fn ios_runtime_tick(runtime: MobileRuntimeHandle, frames: int): seq[MobileRuntimeEvent] =
+    return android_runtime_tick(runtime, frames)
+
+fn android_runtime_summary(runtime: MobileRuntimeHandle): str =
+    if runtime == nil:
+        return "mobile-runtime(nil)"
+    var summary = "MobileRuntimeSummary("
+    var platformName: str = "unknown"
+    if runtime.config.platform == mpAndroid:
+        platformName = "android"
+    elif runtime.config.platform == mpIos:
+        platformName = "ios"
+    summary = summary + "platform=" + platformName
+    summary = summary + " windows=" + intToStr(runtime.windows.len)
+    summary = summary + " ticks=" + intToStr(int32(runtime.ticks))
+    if len(runtime.config.resourceRoot) > 0:
+        summary = summary + " resourceRoot=" + runtime.config.resourceRoot
+    if runtime.logs.len > 0:
+        summary = summary + " logs=" + intToStr(runtime.logs.len)
+    summary = summary + ")"
+    return summary
+
+fn ios_runtime_summary(runtime: MobileRuntimeHandle): str =
+    return android_runtime_summary(runtime)
+
+fn android_runtime_shutdown(runtime: MobileRuntimeHandle, reason: str) =
+    if runtime == nil:
+        return
+    var ev: MobileRuntimeEvent
+    ev.kind = mreRuntimeStopped
+    ev.message = reason
+    addPtr(&runtime.queued, ev)
+    runtime.windows = newSeq[MobileWindowDescriptor]()
+
+fn ios_runtime_shutdown(runtime: MobileRuntimeHandle, reason: str) =
+    android_runtime_shutdown(runtime, reason)
+
+fn android_runtime_trace(runtime: MobileRuntimeHandle, category: str, value: float) =
+    if runtime == nil:
+        return
+    let msg = "trace:" + category + "=" + intToStr(int32(value))
+    addPtr(&runtime.logs, msg)
+
+fn ios_runtime_trace(runtime: MobileRuntimeHandle, category: str, value: float) =
+    android_runtime_trace(runtime, category, value)

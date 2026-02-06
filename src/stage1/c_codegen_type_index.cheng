@@ -1,0 +1,2501 @@
+fn collectTypeDecls(n: Node, out: seq[Node]*) =
+    if n == nil:
+        return
+    if n.kind == nkStmtList || n.kind == nkModule:
+        var i: int32 = 0
+        while i < kidCount n:
+            collectTypeDecls(kid(n, i), out)
+            i = i + 1
+        return
+    if n.kind == nkTypeDecl:
+        addPtr[Node](out, n)
+
+fn collectFnDecls(n: Node, out: seq[Node]*) =
+    if n == nil:
+        return
+    if n.kind == nkStmtList || n.kind == nkModule:
+        var i: int32 = 0
+        while i < kidCount n:
+            collectFnDecls(kid(n, i), out)
+            i = i + 1
+        return
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+        addPtr[Node](out, n)
+
+fn collectGlobalVarDecls(n: Node, out: seq[Node]*) =
+    if n == nil:
+        return
+    if n.kind == nkStmtList || n.kind == nkModule || n.kind == nkIf || n.kind == nkWhen || n.kind == nkCase:
+        var i: int32 = 0
+        while i < kidCount n:
+            collectGlobalVarDecls(kid(n, i), out)
+            i = i + 1
+        return
+    if n.kind == nkLet || n.kind == nkVar || n.kind == nkConst:
+        addPtr[Node](out, n)
+
+fn unwrapParType(n: Node): Node =
+    var cur: Node = n
+    while cur != nil && cur.kind == nkPar && kidCount cur == 1:
+        cur = kid(cur, 0)
+    return cur
+
+fn stripVarType(n: Node): Node =
+    let cur: Node = unwrapParType n
+    if cur != nil && cur.kind == nkVarTy && kidCount cur > 0:
+        return unwrapParType kid(cur, 0)
+    return cur
+
+fn resolveBracketBaseType(baseExpr: Node): Node =
+    var baseType: Node = stripVarType(inferSimpleTypeNode baseExpr)
+    if baseType != nil && (baseType.kind == nkRefTy || baseType.kind == nkPtrTy):
+        if kidCount baseType > 0:
+            baseType = stripVarType kid(baseType, 0)
+    if baseType != nil && (baseType.kind == nkIdent || baseType.kind == nkSymbol):
+        let name: str = cgenStripSpaces baseType.ident
+        let def: Node = lookupTypeDef name
+        if def != nil:
+            baseType = stripVarType def
+    return baseType
+
+fn buildBracketInstPrefix(baseExpr: Node, rawPrefix: str): str =
+    let baseType: Node = resolveBracketBaseType baseExpr
+    if baseType == nil:
+        return cgenNormalizeInstanceBase rawPrefix
+    if ! cgenIsStringTypeNode(baseType):
+        var suffix: str = ""
+        if baseType.kind == nkBracketExpr && kidCount baseType > 1:
+            var i: int32 = 1
+            while i < kidCount baseType:
+                let key: str = cgenTypeKey kid(baseType, i)
+                if len key > 0:
+                    if len suffix > 0:
+                        suffix = suffix + "_"
+                    suffix = suffix + key
+                i = i + 1
+        else:
+            let baseKey: str = cgenTypeKey baseType
+            var idx: int32 = 0
+            while idx < len baseKey && charAt(baseKey, idx) != '_':
+                idx = idx + 1
+            if idx + 1 < len baseKey:
+                suffix = cgenSliceRange(baseKey, idx + 1, len baseKey)
+        var out: str = cgenNormalizeInstanceBase rawPrefix
+        if len suffix > 0:
+            out = out + "_"
+            out = out + suffix
+        return out
+    return ""
+
+fn callBracketPrefix(baseName: str, callNode: Node): str =
+    if !streq(baseName, "[]") && !streq(baseName, "[]="):
+        return ""
+    if callNode == nil || kidCount callNode < 2:
+        return ""
+    let baseExpr: Node = cgenCallArgValue kid(callNode, 1)
+    return buildBracketInstPrefix(baseExpr, baseName)
+
+fn cgenCallBracketPrefix(callNode: Node, baseName: str): str =
+    if !streq(baseName, "[]") && !streq(baseName, "[]="):
+        return ""
+    if callNode == nil:
+        return ""
+    var cached: bool = false
+    let idx: int32 = hashmaps.hashMapPtrIntGet(cgenCallBracketIndex, void*(callNode), &cached)
+    if cached:
+        if idx <= 0:
+            return ""
+        return get[str](cgenCallBracketValues, idx - 1)
+    let prefix: str = callBracketPrefix(baseName, callNode)
+    addPtr[str](&cgenCallBracketValues, prefix)
+    let storedIdx: int32 = cgenCallBracketValues.len
+    hashmaps.hashMapPtrIntPut(&cgenCallBracketIndex, void*(callNode), storedIdx)
+    return prefix
+
+fn typeDeclName(n: Node): str =
+    let nameNode: Node = typeDeclNameNode(n)
+    if nameNode == nil:
+        return ""
+    let rawName: str = plainName nameNode
+    return cgenStripSpaces rawName
+
+fn typeDeclDef(n: Node): Node =
+    let defNode: Node = typeDeclDefNode n
+    return unwrapParType defNode
+
+fn typeDeclRank(def: Node): int32 =
+    if def == nil:
+        return 0
+    if typeDeclRefObjectDef(def) != nil:
+        return 4
+    if def.kind == nkObjectDecl:
+        return 4
+    if def.kind == nkEnumDecl:
+        return 3
+    if cgenIsArrayTypeExpr(def):
+        return 2
+    return 1
+
+fn builtinTypeKeyFromDef(def: Node): str =
+    if def == nil:
+        return ""
+    let cur: Node = unwrapParType def
+    if cur == nil || cur.kind != nkBracketExpr || kidCount cur == 0:
+        return ""
+    let base: Node = kid(cur, 0)
+    if base == nil || (base.kind != nkIdent && base.kind != nkSymbol):
+        return ""
+    let baseName: str = cgenStripSpaces base.ident
+    if baseName != "seq" && baseName != "Table" && baseName != "__cheng_tables_Entry":
+        return ""
+    return cgenTypeKey cur
+
+fn newBuiltinTypeDecl(name: str, pos: SourcePos): Node =
+    let decl: Node = newNode(nkTypeDecl, pos)
+    addSon(decl, newIdent(name, pos))
+    let objDef: Node = newNode(nkObjectDecl, pos)
+    addSon(objDef, newNode(nkEmpty, pos))
+    addSon(objDef, newNode(nkRecList, pos))
+    addSon(decl, objDef)
+    addSon(decl, newNode(nkEmpty, pos))
+    addSon(decl, newNode(nkEmpty, pos))
+    addSon(decl, newNode(nkEmpty, pos))
+    return decl
+
+fn appendBuiltinTypeDecls(decls: seq[Node]*) =
+    if decls == nil:
+        return
+    var names: seq[str] = newSeqWithCap[str](0, decls.len)
+    var i: int32 = 0
+    while i < decls.len:
+        let td: Node = get[Node](*decls, i)
+        let name: str = typeDeclName td
+        if !strIsEmpty name:
+            addPtr[str](&names, name)
+        i = i + 1
+    i = 0
+    while i < decls.len:
+        let td2: Node = get[Node](*decls, i)
+        let def: Node = typeDeclDef td2
+        let key: str = builtinTypeKeyFromDef(def)
+        if len key > 0 && typeNameIndex(names, key) < 0:
+            let synth: Node = newBuiltinTypeDecl(key, td2.pos)
+            addPtr[Node](decls, synth)
+            addPtr[str](&names, key)
+        i = i + 1
+
+fn dedupTypeDecls(decls: seq[Node]): seq[Node] =
+    var out: seq[Node] = newSeqWithCap[Node](0, decls.len)
+    var names: seq[str] = newSeqWithCap[str](0, decls.len)
+    var i: int32 = 0
+    while i < decls.len:
+        let td: Node = get[Node](decls, i)
+        let name: str = typeDeclName td
+        if strIsEmpty name:
+            i = i + 1
+            continue
+        let idx: int32 = typeNameIndex(names, name)
+        if idx < 0:
+            addPtr[str](&names, name)
+            addPtr[Node](&out, td)
+        else:
+            let curDef: Node = typeDeclDef td
+            let existing: Node = get[Node](out, idx)
+            let curRank: int32 = typeDeclRank(curDef)
+            let existingRank: int32 = typeDeclRank(typeDeclDef existing)
+            if curRank > existingRank:
+                setPtr[Node](&out, idx, td)
+        i = i + 1
+    return out
+
+fn collectAllTypeDecls(root: Node): seq[Node] =
+    var decls: seq[Node] = newSeqWithCap[Node](0, 64)
+    collectTypeDecls(root, &decls)
+    var ai: int32 = 0
+    while ai < cgenArrayTypeDecls.len:
+        addPtr[Node](&decls, get[Node](cgenArrayTypeDecls, ai))
+        ai = ai + 1
+    var ti: int32 = 0
+    while ti < cgenTupleTypeDecls.len:
+        addPtr[Node](&decls, get[Node](cgenTupleTypeDecls, ti))
+        ti = ti + 1
+    appendBuiltinTypeDecls(&decls)
+    return decls
+
+fn collectTypeInfo(root: Node) =
+    var decls: seq[Node] = newSeqWithCap[Node](0, 64)
+    collectTypeDecls(root, &decls)
+    var i: int32 = 0
+    while i < decls.len:
+        let name: str = typeDeclName get[Node](decls, i)
+        strSeqAddUnique(&typeNames, name)
+        i = i + 1
+    i = 0
+    while i < decls.len:
+        let td: Node = get[Node](decls, i)
+        let name2: str = typeDeclName td
+        let def: Node = typeDeclDef td
+        if def != nil && !strIsEmpty(name2):
+            addTypeDef(name2, def)
+        if def != nil && (def.kind == nkRefTy || def.kind == nkPtrTy || def.kind == nkVarTy):
+            strSeqAddUnique(&refTypeNames, name2)
+        i = i + 1
+    i = 0
+    while i < decls.len:
+        let td3: Node = get[Node](decls, i)
+        let name4: str = typeDeclName td3
+        let def4: Node = typeDeclDef td3
+        var objDef: Node = nil
+        if def4 != nil && def4.kind == nkObjectDecl:
+            objDef = def4
+        else:
+            objDef = typeDeclRefObjectDef def4
+        if objDef != nil:
+            collectObjectFieldTypes(name4, objDef)
+        i = i + 1
+    var changed: bool = true
+    while changed:
+        changed = false
+        i = 0
+        while i < decls.len:
+            let td2: Node = get[Node](decls, i)
+            let name3: str = typeDeclName td2
+            if strSeqHas(&refTypeNames, name3):
+                i = i + 1
+                continue
+            let def2: Node = typeDeclDef td2
+            if def2 != nil && (def2.kind == nkIdent || def2.kind == nkSymbol):
+                let base: str = cgenIdentNameNormalized def2
+                if strSeqHas(&refTypeNames, base):
+                    strSeqAddUnique(&refTypeNames, name3)
+                    changed = true
+            i = i + 1
+
+fn cgenIsArrayTypeExpr(n: Node): bool =
+    if n == nil || n.kind != nkBracketExpr || kidCount n < 3:
+        return false
+    let base: Node = kid(n, 0)
+    if base == nil:
+        return false
+    if base.kind == nkIdent || base.kind == nkSymbol:
+        let name: str = cgenStripSpaces plainName(base)
+        return name == "array"
+    return false
+
+fn cgenCanonicalArrayArgs(arrNode0: Node, outLen: Node*, outElem: Node*): bool =
+    if outLen != nil:
+        *outLen = nil
+    if outElem != nil:
+        *outElem = nil
+    if arrNode0 == nil:
+        return false
+    var arrNode: Node = arrNode0
+    if arrNode.kind == nkCallArg && kidCount arrNode > 1:
+        arrNode = kid(arrNode, 1)
+    if !cgenIsArrayTypeExpr arrNode:
+        return false
+    if kidCount arrNode < 3:
+        return false
+    let arg1: Node = kid(arrNode, 1)
+    let arg2: Node = kid(arrNode, 2)
+    if arg1 == nil || arg2 == nil:
+        return false
+    var tmp1: int64 = 0
+    var tmp2: int64 = 0
+    let c1: bool = arg1.kind != nkEmpty && cgenConstIntValueFromExpr(arg1, &tmp1)
+    let c2: bool = arg2.kind != nkEmpty && cgenConstIntValueFromExpr(arg2, &tmp2)
+    if c1 && !c2:
+        if outLen != nil:
+            *outLen = arg1
+        if outElem != nil:
+            *outElem = arg2
+        return true
+    if c2 && !c1:
+        if outLen != nil:
+            *outLen = arg2
+        if outElem != nil:
+            *outElem = arg1
+        return true
+    if outLen != nil:
+        *outLen = arg1
+    if outElem != nil:
+        *outElem = arg2
+    return true
+
+fn cgenEnsureArrayDecl(n: Node): str =
+    if n == nil:
+        return ""
+    var arrNode: Node = n
+    if arrNode.kind == nkCallArg && kidCount arrNode > 1:
+        arrNode = kid(arrNode, 1)
+    if ! cgenIsArrayTypeExpr arrNode:
+        return ""
+    let key: str = cgenTypeKey arrNode
+    if len key == 0:
+        return ""
+    if cgenArrayTypeHas key:
+        return key
+    addPtr[str](&cgenArrayTypeKeys, key)
+    hashsets.hashSetStrAdd(&cgenArrayTypeKeySet, key)
+    var td: Node = newNode(nkTypeDecl, arrNode.pos)
+    addSon(td, newIdent(key, arrNode.pos))
+    var def: Node = newNode(nkBracketExpr, arrNode.pos)
+    addSon(def, newIdent("array", arrNode.pos))
+    var lenNode: Node = nil
+    var elemNode: Node = nil
+    if cgenCanonicalArrayArgs(arrNode, &lenNode, &elemNode) && lenNode != nil && elemNode != nil:
+        addSon(def, lenNode)
+        addSon(def, elemNode)
+    else:
+        addSon(def, kid(arrNode, 1))
+        addSon(def, kid(arrNode, 2))
+    addSon(td, def)
+    addSon(td, newNode(nkEmpty, arrNode.pos))
+    addSon(td, newNode(nkEmpty, arrNode.pos))
+    addSon(td, newNode(nkEmpty, arrNode.pos))
+    addPtr[Node](&cgenArrayTypeDecls, td)
+    strSeqAddUnique(&typeNames, key)
+    addTypeDef(key, def)
+    return key
+
+fn cgenEnsureArrayDeclFromName(name: str): str =
+    if name == nil || name == "" || !cgenHasPrefix(name, "array_"):
+        return ""
+    if cgenArrayTypeHas name:
+        return name
+    let arrNode: Node = cgenArrayTypeExprFromName(name)
+    if arrNode == nil:
+        return ""
+    var elemNode: Node = nil
+    if kidCount arrNode > 2:
+        elemNode = kid(arrNode, 2)
+    if elemNode != nil && (elemNode.kind == nkIdent || elemNode.kind == nkSymbol):
+        let elemName: str = cgenStripSpaces elemNode.ident
+        if cgenHasPrefix(elemName, "array_") && isKnownTypeName(elemName):
+            cgenEnsureArrayDeclFromName elemName
+    return cgenEnsureArrayDecl(arrNode)
+
+fn cgenEnsureTupleDecl(n: Node): str =
+    if n == nil:
+        return ""
+    var tupNode: Node = n
+    if tupNode.kind == nkCallArg && kidCount tupNode > 1:
+        tupNode = kid(tupNode, 1)
+    if tupNode.kind == nkTupleLit:
+        let inferred: Node = inferSimpleTypeNode tupNode
+        if inferred != nil:
+            tupNode = inferred
+    if tupNode == nil:
+        return ""
+    if tupNode.kind == nkIdent || tupNode.kind == nkSymbol:
+        let nm: str = cgenStripSpaces tupNode.ident
+        if !strIsEmpty nm &&(strSeqHas(&typeNames, nm) || cgenHasPrefix(nm, "tuple_")):
+            return nm
+        return ""
+    if tupNode.kind != nkTupleTy:
+        return ""
+    let key: str = cgenTypeKey tupNode
+    if len key == 0:
+        return ""
+    if cgenTupleTypeHas key:
+        return key
+    addPtr[str](&cgenTupleTypeKeys, key)
+    hashsets.hashSetStrAdd(&cgenTupleTypeKeySet, key)
+    var td: Node = newNode(nkTypeDecl, tupNode.pos)
+    addSon(td, newIdent(key, tupNode.pos))
+    var obj: Node = newNode(nkObjectDecl, tupNode.pos)
+    addSon(obj, newNode(nkEmpty, tupNode.pos))
+    var rec: Node = newNode(nkRecList, tupNode.pos)
+    var i: int32 = 0
+    while i < kidCount tupNode:
+        var elemTy: Node = kid(tupNode, i)
+        if elemTy != nil && elemTy.kind == nkIdentDefs && kidCount elemTy > 1:
+            elemTy = kid(elemTy, 1)
+        if elemTy == nil:
+            elemTy = newNode(nkEmpty, tupNode.pos)
+        var defs: Node = newNode(nkIdentDefs, tupNode.pos)
+        addSon(defs, newIdent("f" + intToStr i, tupNode.pos))
+        addSon(defs, elemTy)
+        addSon(defs, newNode(nkEmpty, tupNode.pos))
+        addSon(rec, defs)
+        i = i + 1
+    addSon(obj, rec)
+    addSon(td, obj)
+    addSon(td, newNode(nkEmpty, tupNode.pos))
+    addSon(td, newNode(nkEmpty, tupNode.pos))
+    addSon(td, newNode(nkEmpty, tupNode.pos))
+    addPtr[Node](&cgenTupleTypeDecls, td)
+    strSeqAddUnique(&typeNames, key)
+    addTypeDef(key, tupNode)
+    return key
+
+fn cgenCollectArrayTypes(n: Node) =
+    if n == nil:
+        return
+    if cgenIsArrayTypeExpr n:
+        cgenEnsureArrayDecl n
+    elif n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = cgenIdentNameNormalized n
+        if cgenHasPrefix(nm, "array_") && isKnownTypeName(nm):
+            cgenEnsureArrayDeclFromName nm
+    var i: int32 = 0
+    while i < kidCount n:
+        cgenCollectArrayTypes kid(n, i)
+        i = i + 1
+
+fn cgenCollectTupleTypes(n: Node) =
+    if n == nil:
+        return
+    if n.kind == nkTupleTy:
+        cgenEnsureTupleDecl n
+    elif n.kind == nkTupleLit:
+        let inferred: Node = inferSimpleTypeNode n
+        if inferred != nil && inferred.kind == nkTupleTy:
+            cgenEnsureTupleDecl inferred
+    var i: int32 = 0
+    while i < kidCount n:
+        cgenCollectTupleTypes kid(n, i)
+        i = i + 1
+
+fn collectFnRetTypes(root: Node) =
+    var decls: seq[Node] = newSeqWithCap[Node](0, 64)
+    collectFnDecls(root, &decls)
+    var i: int32 = 0
+    while i < decls.len:
+        let n: Node = get[Node](decls, i)
+        let nameNode: Node = kid(n, 0)
+        if nameNode != nil:
+            let nameRaw: str = plainName nameNode
+            let nameStr: str = cgenStripSpaces nameRaw
+            if !strIsEmpty(nameStr):
+                var retNode: Node = kid(n, 2)
+                if cgenFnIsAsync(n):
+                    retNode = cgenAsyncRetType(n, retNode)
+                let idx: int32 = fnRetNames.len
+                addPtr[str](&fnRetNames, nameStr)
+                addPtr[Node](&fnRetTypes, retNode)
+                hashmaps.hashMapStrIntPut(&fnRetIndex, nameStr, idx)
+        i = i + 1
+
+fn cgenRecordFnRetType(n: Node) =
+    if n == nil:
+        return
+    let nameNode: Node = kid(n, 0)
+    if nameNode == nil:
+        return
+    let nameRaw: str = plainName nameNode
+    let nameStr: str = cgenStripSpaces nameRaw
+    if strIsEmpty nameStr:
+        return
+    var retNode: Node = kid(n, 2)
+    if cgenFnIsAsync(n):
+        retNode = cgenAsyncRetType(n, retNode)
+    let idx: int32 = fnRetNames.len
+    addPtr[str](&fnRetNames, nameStr)
+    addPtr[Node](&fnRetTypes, retNode)
+    hashmaps.hashMapStrIntPut(&fnRetIndex, nameStr, idx)
+
+fn cgenRecordFnDecl(n: Node) =
+    if n == nil:
+        return
+    addPtr[Node](&cgenFnDecls, n)
+    if fnHasBody(n) && strIsEmpty(cgenGetImportC(n)):
+        addPtr[Node](&cgenFnDefDecls, n)
+    cgenRecordFnRetType n
+
+fn cgenCollectFnDeclsAndRets(root: Node) =
+    var decls: seq[Node] = newSeqWithCap[Node](0, 64)
+    collectFnDecls(root, &decls)
+    var i: int32 = 0
+    while i < decls.len:
+        let n: Node = get[Node](decls, i)
+        cgenRecordFnDecl n
+        i = i + 1
+
+fn cgenCollectPrepScan(n: Node, scanDecls: bool) =
+    if n == nil:
+        return
+    if scanDecls && (n.kind == nkFnDecl || n.kind == nkIteratorDecl):
+        cgenRecordFnDecl n
+    if n.kind == nkEnumDecl:
+        cgenCollectEnumConstInts n
+    if n.kind == nkConst:
+        let nameNode: Node = cgenVarNameNode n
+        var valNode: Node = nil
+        if kidCount n > 2:
+            valNode = kid(n, 2)
+        if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol) && valNode != nil:
+            var v: int64 = 0
+            if cgenConstIntValueFromExpr(valNode, &v):
+                cgenConstIntDefine(cgenIdentNameNormalized(nameNode), v)
+    if cgenIsArrayTypeExpr n:
+        cgenEnsureArrayDecl n
+    elif n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = cgenIdentNameNormalized n
+        if cgenHasPrefix(nm, "array_") && isKnownTypeName(nm):
+            cgenEnsureArrayDeclFromName nm
+    if n.kind == nkTupleTy:
+        cgenEnsureTupleDecl n
+    elif n.kind == nkTupleLit:
+        let inferred: Node = cgenInferSimpleTypeCached n
+        if inferred != nil && inferred.kind == nkTupleTy:
+            cgenEnsureTupleDecl inferred
+    let childScan: bool = scanDecls && (
+        n.kind == nkStmtList || n.kind == nkModule ||
+        n.kind == nkIf || n.kind == nkWhen || n.kind == nkCase ||
+        n.kind == nkIfExpr || n.kind == nkWhenExpr || n.kind == nkCaseExpr
+    )
+    var i: int32 = 0
+    while i < kidCount n:
+        cgenCollectPrepScan(kid(n, i), childScan)
+        i = i + 1
+
+fn cFnSigClear() =
+    cFnSigNames = newSeqWithCap[str](0, 64)
+    cFnSigParamOffsets = newSeqWithCap[int32](0, 64)
+    cFnSigParamCounts = newSeqWithCap[int32](0, 64)
+    cFnSigParamTypes = newSeqWithCap[void*](0, 128)
+    cFnSigParamNames = newSeqWithCap[str](0, 128)
+    cFnSigParamTypeKeys = newSeqWithCap[str](0, 128)
+    cFnSigParamBaseKeys = newSeqWithCap[str](0, 128)
+    cFnSigParamIsVarRef = newSeqWithCap[bool](0, 128)
+    cFnSigParamIsRefLike = newSeqWithCap[bool](0, 128)
+    cFnSigDefaultNodes = newSeqWithCap[void*](0, 128)
+    cFnSigRetNodes = newSeqWithCap[void*](0, 64)
+    cFnSigNodes = newSeqWithCap[void*](0, 64)
+    cFnSigMangledNames = newSeqWithCap[str](0, 64)
+    cFnSigImportcNames = newSeqWithCap[str](0, 64)
+    cFnSigImportcAggRetTypes = newSeqWithCap[void*](0, 64)
+    cFnSigKeys = newSeqWithCap[str](0, 64)
+    cFnSigKeySet = hashsets.hashSetStrInit(256)
+    cFnSigVarargs = newSeqWithCap[bool](0, 64)
+    cFnSigVarargTypes = newSeqWithCap[void*](0, 64)
+    cgenNeedsStdarg = false
+    cFnSigParamNameIndex = hashmaps.hashMapStrIntInit(512)
+    cFnSigParamNameIndexReady = false
+    cFnSigParamNameIndexEpoch = 0
+    hashmaps.hashMapStrSeqIntClear(&cFnSigNameIndex)
+    cFnSigNameIndexReady = false
+    cFnSigNameIndexEpoch = 0
+    cFnSigIndexEpoch = cFnSigIndexEpoch + 1
+    hashmaps.hashMapStrSeqIntClear(&cFnSigPrefixIndex)
+    cFnSigPrefixEpoch = 0
+    hashmaps.hashMapPtrIntClear(&cFnSigCallIndex)
+    hashmaps.hashMapPtrIntClear(&cFnSigNodeIndex)
+    hashmaps.hashMapPtrIntClear(&cgenInferTypeIndex)
+    cgenInferTypeValues = newSeqWithCap[void*](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenExprStringLikeIndex)
+    cgenExprStringLikeValues = newSeqWithCap[bool](0, 256)
+    cgenInfixSigIndex = hashmaps.hashMapPtrIntInit(256)
+    hashmaps.hashMapPtrIntClear(&cgenCallNameIndex)
+    cgenCallNameValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenIdentNameIndex)
+    cgenIdentNameValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenStripIndex)
+    cgenStripValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenMangleIndex)
+    cgenMangleValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenTypeKeyIndex)
+    cgenTypeKeyValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapStrIntClear(&cgenTypeNameResolveIndex)
+    cgenTypeNameResolveValues = newSeqWithCap[str](0, 128)
+    cgenTypeNameResolveReadyEpoch = cgenTypeNameResolveEpoch
+    hashmaps.hashMapPtrIntClear(&cgenCallBaseIndex)
+    cgenCallBaseValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenCallBracketIndex)
+    cgenCallBracketValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenFnCNameIndex)
+    cgenFnCNameValues = newSeqWithCap[str](0, 256)
+    cgenFnSigStrIndex = hashmaps.hashMapPtrIntInit(512)
+    cgenFnSigStrValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenImportCIndex)
+    cgenImportCValues = newSeqWithCap[str](0, 128)
+    hashmaps.hashMapPtrIntClear(&cgenFnVarargsIndex)
+    hashmaps.hashMapPtrIntClear(&cgenFnAsyncIndex)
+    hashmaps.hashMapPtrIntClear(&cgenFnWeakIndex)
+    hashmaps.hashMapPtrIntClear(&cgenFnVarargsSuffixIndex)
+    cgenFnVarargsSuffixValues = newSeqWithCap[str](0, 64)
+    hashmaps.hashMapPtrIntClear(&cgenPatternInlineIndex)
+    hashmaps.hashMapPtrIntClear(&cgenPatternWildcardIndex)
+    hashmaps.hashMapStrIntClear(&cgenObjectFieldOrderIndex)
+    cgenObjectFieldOrderValues = newSeqWithCap[seq[str]](0, 32)
+    hashmaps.hashMapPtrIntClear(&cgenObjectPatternIndex)
+    cgenObjectPatternNames = newSeqWithCap[seq[str]](0, 32)
+    cgenObjectPatternPats = newSeqWithCap[seq[Node]](0, 32)
+    hashmaps.hashMapPtrIntClear(&cgenObjectPatternTypeIndex)
+    cgenObjectPatternTypeValues = newSeqWithCap[str](0, 32)
+    cgenFnDefOwnerIndex = hashmaps.hashMapStrIntInit(512)
+    cgenFnDefOwnerValues = newSeqWithCap[str](0, 256)
+    cgenFnDefOwnerBuilt = false
+    cgenStripCalls = 0
+    cgenStripHits = 0
+    cgenMangleCalls = 0
+    cgenMangleHits = 0
+
+fn cgenHash64(s: str): uint64 =
+    return hashmaps.hashMapHash64Str(s)
+
+fn cgenNextPow2(n: int32): int32 =
+    return hashmaps.hashMapNextPow2(n, 8)
+
+fn cFnSigPrefixCacheReset() =
+    if cFnSigPrefixEpoch == cFnSigIndexEpoch:
+        return
+    hashmaps.hashMapStrSeqIntClear(&cFnSigPrefixIndex)
+    cFnSigPrefixEpoch = cFnSigIndexEpoch
+
+fn cFnSigNameIndexInit(cap: int32) =
+    var actual: int32 = cap
+    if actual < 8:
+        actual = 8
+    cFnSigNameIndex = hashmaps.hashMapStrSeqIntInit(actual)
+
+fn cFnSigNameIndexAdd(name: str, idx: int32) =
+    if strIsEmpty(name):
+        return
+    hashmaps.hashMapStrSeqIntAdd(&cFnSigNameIndex, name, idx)
+
+fn cFnSigNameIndexEnsure() =
+    if cFnSigNameIndexReady && cFnSigNameIndexEpoch == cFnSigIndexEpoch:
+        return
+    let cap: int32 = cgenNextPow2(cFnSigNames.len * 2)
+    cFnSigNameIndexInit(cap)
+    var i: int32 = 0
+    while i < cFnSigNames.len:
+        cFnSigNameIndexAdd(get[str](cFnSigNames, i), i)
+        i = i + 1
+    cFnSigNameIndexReady = true
+    cFnSigNameIndexEpoch = cFnSigIndexEpoch
+    cFnSigPrefixEpoch = 0
+
+fn cFnSigParamNameIndexEnsure() =
+    if cFnSigParamNameIndexReady && cFnSigParamNameIndexEpoch == cFnSigIndexEpoch:
+        return
+    let cap: int32 = cgenNextPow2(cFnSigParamNames.len * 2)
+    cFnSigParamNameIndex = hashmaps.hashMapStrIntInit(cap)
+    var sigIdx: int32 = 0
+    while sigIdx < cFnSigNames.len:
+        let off: int32 = get[int32](cFnSigParamOffsets, sigIdx)
+        let count: int32 = get[int32](cFnSigParamCounts, sigIdx)
+        var pi: int32 = 0
+        while pi < count:
+            let pname: str = get[str](cFnSigParamNames, off + pi)
+            if !strIsEmpty(pname):
+                let key: str = intToStr(sigIdx) + ":" + pname
+                hashmaps.hashMapStrIntPut(&cFnSigParamNameIndex, key, pi + 1)
+            pi = pi + 1
+        sigIdx = sigIdx + 1
+    cFnSigParamNameIndexReady = true
+    cFnSigParamNameIndexEpoch = cFnSigIndexEpoch
+
+fn cFnSigNameCandidates(name: str): seq[int32] =
+    if strIsEmpty(name):
+        return newSeqWithCap[int32](0, 0)
+    cFnSigNameIndexEnsure()
+    var found: bool = false
+    return hashmaps.hashMapStrSeqIntGet(cFnSigNameIndex, name, &found)
+
+fn cFnSigKey(name: str, paramsNode: Node, retNode: Node): str =
+    var b: ByteBuffer = initByteBuffer(128)
+    bufAddStr(&b, cgenNormalizeInstanceBase name)
+    bufAddChar(&b, '(')
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        var i: int32 = 0
+        var wrote: bool = false
+        while i < kidCount paramsNode:
+            let defs: Node = kid(paramsNode, i)
+            if defs != nil && defs.kind == nkIdentDefs:
+                let typeNode: Node = identDefsType defs
+                let nameCount: int32 = identDefsNameCount defs
+                var j: int32 = 0
+                while j < nameCount:
+                    if wrote:
+                        bufAddChar(&b, ',')
+                    bufAddStr(&b, cgenTypeKey typeNode)
+                    wrote = true
+                    j = j + 1
+            i = i + 1
+    bufAddChar(&b, ')')
+    if retNode != nil && retNode.kind != nkEmpty:
+        bufAddStr(&b, "->")
+        bufAddStr(&b, cgenTypeKey retNode)
+    return toString(&b)
+
+fn cFnSigAdd(name: str, paramsNode: Node, retNode: Node, fnNode: Node) =
+    if len name == 0:
+        return
+    var importcName: str = ""
+    var hasImportc: bool = false
+    var hasVarargsPragma: bool = false
+    if fnNode != nil:
+        importcName = cgenGetImportC(fnNode)
+        hasImportc = !strIsEmpty(importcName)
+        hasVarargsPragma = cgenFnHasVarargs(fnNode)
+    var varargsElemType: Node = nil
+    var sawVarargsType: bool = false
+    var varargsOk: bool = true
+    let off: int32 = cFnSigParamTypes.len
+    var count: int32 = 0
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        var i: int32 = 0
+        while i < kidCount paramsNode:
+            let defs: Node = kid(paramsNode, i)
+            if defs != nil && defs.kind == nkIdentDefs:
+                let typeNode: Node = identDefsType defs
+                let defNode: Node = identDefsDefault defs
+                let nameCount: int32 = identDefsNameCount defs
+                if cgenIsVarargsTypeNode typeNode:
+                    sawVarargsType = true
+                    if varargsElemType == nil:
+                        varargsElemType = cgenVarargsElemType typeNode
+                    if i + 1 < kidCount paramsNode:
+                        cgenAddError(defs.pos, "[C-Profile] not-mapped: varargs must be last parameter (FULLC.F02). hint: move varargs to last position.")
+                        varargsOk = false
+                    if nameCount != 1:
+                        cgenAddError(defs.pos, "[C-Profile] not-mapped: varargs supports single name (FULLC.F02). hint: use a single identifier for varargs.")
+                        varargsOk = false
+                    if defNode != nil && defNode.kind != nkEmpty:
+                        cgenAddError(defs.pos, "[C-Profile] not-mapped: varargs cannot have default (FULLC.F02). hint: remove default value.")
+                        varargsOk = false
+                    if kidCount(typeNode) > 2:
+                        cgenAddError(defs.pos, "[C-Profile] not-mapped: varargs supports single element type (FULLC.F02). hint: use a single element type.")
+                        varargsOk = false
+                    if varargsElemType != nil && ! cgenVarargsElemAllowed(varargsElemType):
+                        cgenAddError(defs.pos, "[C-Profile] not-mapped: varargs element type must be scalar or pointer (FULLC.F02). hint: restrict element type to scalar or pointer.")
+                        varargsOk = false
+                else:
+                    var j: int32 = 0
+                    while j < nameCount:
+                        var nameNode2: Node = kid(defs, j)
+                        if nameNode2 != nil && nameNode2.kind == nkPattern && kidCount nameNode2 > 0:
+                            nameNode2 = kid(nameNode2, 0)
+                        var pname: str = ""
+                        if nameNode2 != nil:
+                            pname = cgenStripSpaces(plainName(nameNode2))
+                        addPtr[str](&cFnSigParamNames, pname)
+                        addPtr[void*](&cFnSigParamTypes, void*(typeNode))
+                        addPtr[str](&cFnSigParamTypeKeys, cgenTypeKey(typeNode))
+                        var baseKey: str = ""
+                        var isVarRef: bool = false
+                        var isRefLike: bool = false
+                        let baseNode: Node = stripVarType typeNode
+                        if baseNode != nil:
+                            baseKey = cgenTypeKey baseNode
+                        let expCur: Node = unwrapParType typeNode
+                        if expCur != nil:
+                            if expCur.kind == nkVarTy:
+                                isVarRef = true
+                            if expCur.kind == nkPtrTy || expCur.kind == nkRefTy || expCur.kind == nkVarTy || expCur.kind == nkFnTy:
+                                isRefLike = true
+                            elif expCur.kind == nkIdent || expCur.kind == nkSymbol:
+                                isRefLike = isRefTypeName(cgenStripSpaces expCur.ident)
+                        addPtr[str](&cFnSigParamBaseKeys, baseKey)
+                        addPtr[bool](&cFnSigParamIsVarRef, isVarRef)
+                        addPtr[bool](&cFnSigParamIsRefLike, isRefLike)
+                        addPtr[void*](&cFnSigDefaultNodes, void*(defNode))
+                        count = count + 1
+                        j = j + 1
+            i = i + 1
+    var isVarargs: bool = (sawVarargsType || hasVarargsPragma)
+    if isVarargs:
+        if !hasImportc:
+            cgenAddError(fnNode.pos, "[C-Profile] not-mapped: varargs requires importc (FULLC.F02). hint: mark fn importc.")
+            varargsOk = false
+        if count <= 0:
+            cgenAddError(fnNode.pos, "[C-Profile] not-mapped: varargs requires at least one fixed parameter (FULLC.F02). hint: add at least one fixed parameter.")
+            varargsOk = false
+        if retNode != nil && retNode.kind != nkEmpty && cgenIsAggregateTypeNode(retNode):
+            cgenAddError(fnNode.pos, "[C-Profile] not-mapped: varargs with aggregate return (FULLC.F02). hint: use wrapper/out parameter.")
+            varargsOk = false
+        if !varargsOk:
+            isVarargs = false
+        else:
+            cgenNeedsStdarg = true
+    var key: str = cFnSigKey(name, paramsNode, retNode)
+    if isVarargs:
+        key = key + "_varargs"
+        if varargsElemType != nil:
+            let vkey: str = cgenTypeKey varargsElemType
+            if len vkey > 0:
+                key = key + "_" + vkey
+    if strSeqHas(&cFnSigKeys, key):
+        return
+    addPtr[str](&cFnSigKeys, key)
+    hashsets.hashSetStrAdd(&cFnSigKeySet, key)
+    addPtr[str](&cFnSigNames, name)
+    addPtr[void*](&cFnSigNodes, void*(fnNode))
+    addPtr[str](&cFnSigImportcNames, importcName)
+    var importcAgg: Node = nil
+    if hasImportc && retNode != nil && retNode.kind != nkEmpty && cgenIsAggregateTypeNode(retNode):
+        importcAgg = retNode
+    addPtr[void*](&cFnSigImportcAggRetTypes, void*(importcAgg))
+    addPtr[int32](&cFnSigParamOffsets, off)
+    addPtr[int32](&cFnSigParamCounts, count)
+    addPtr[void*](&cFnSigRetNodes, void*(retNode))
+    addPtr[bool](&cFnSigVarargs, isVarargs)
+    addPtr[void*](&cFnSigVarargTypes, void*(varargsElemType))
+    let sigIdx: int32 = cFnSigNames.len - 1
+    if fnNode != nil:
+        hashmaps.hashMapPtrIntPut(&cFnSigNodeIndex, void*(fnNode), sigIdx)
+
+fn cFnSigIndexForNode(n: Node): int32 =
+    if n == nil:
+        return -1
+    let ptr: void* = void*(n)
+    var cached: bool = false
+    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(cFnSigNodeIndex, ptr, &cached)
+    if cached:
+        return cachedIdx
+    var i: int32 = 0
+    while i < cFnSigNodes.len:
+        if get[void*](cFnSigNodes, i) == ptr:
+            hashmaps.hashMapPtrIntPut(&cFnSigNodeIndex, ptr, i)
+            return i
+        i = i + 1
+    if kidCount n < 3:
+        return -1
+    let nameRaw: str = plainName kid(n, 0)
+    if nameRaw == nil:
+        return -1
+    let name: str = cgenStripSpaces nameRaw
+    if name == "":
+        return -1
+    let paramsNode: Node = kid(n, 1)
+    let retNode: Node = kid(n, 2)
+    var key: str = cFnSigKey(name, paramsNode, retNode)
+    let suffix: str = cgenFnVarargsKeySuffix(n, paramsNode)
+    if len suffix > 0:
+        key = key + suffix
+    i = 0
+    while i < cFnSigKeys.len:
+        let k: str = get[str](cFnSigKeys, i)
+        if streq(k, key):
+            hashmaps.hashMapPtrIntPut(&cFnSigNodeIndex, ptr, i)
+            return i
+        i = i + 1
+    return -1
+
+fn cFnSigIsVarargs(sigIdx: int32): bool =
+    if sigIdx < 0 || sigIdx >= cFnSigVarargs.len:
+        return false
+    return get[bool](cFnSigVarargs, sigIdx)
+
+fn cFnSigVarargType(sigIdx: int32): Node =
+    if sigIdx < 0 || sigIdx >= cFnSigVarargTypes.len:
+        return nil
+    return Node(get[void*](cFnSigVarargTypes, sigIdx))
+
+fn cFnSigBuildUniqueName(sigIdx: int32): str =
+    if sigIdx < 0 || sigIdx >= cFnSigNames.len:
+        return ""
+    let baseRaw: str = get[str](cFnSigNames, sigIdx)
+    let base: str = cgenNormalizeInstanceBase baseRaw
+    var out: str = "C" + base + "__"
+    let off: int32 = get[int32](cFnSigParamOffsets, sigIdx)
+    let count: int32 = get[int32](cFnSigParamCounts, sigIdx)
+    if count <= 0:
+        out = out + "void"
+    var pi: int32 = 0
+    while pi < count:
+        let ptype: Node = Node(get[void*](cFnSigParamTypes, off + pi))
+        var key: str = cgenTypeKey ptype
+        if len key == 0:
+            key = "any"
+        out = out + key
+        if pi + 1 < count:
+            out = out + "_"
+        pi = pi + 1
+    let retNode: Node = Node(get[void*](cFnSigRetNodes, sigIdx))
+    var retKey: str = cgenTypeKey retNode
+    if len retKey > 0:
+        out = out + "__ret_"
+        out = out + retKey
+    if sigIdx >= 0 && sigIdx < cFnSigVarargs.len:
+        if get[bool](cFnSigVarargs, sigIdx):
+            out = out + "__varargs"
+            if sigIdx < cFnSigVarargTypes.len:
+                let vt: Node = Node(get[void*](cFnSigVarargTypes, sigIdx))
+                let vkey: str = cgenTypeKey vt
+                if len vkey > 0:
+                    out = out + "_"
+                    out = out + vkey
+    return out
+
+fn isCReservedName(name: str): bool =
+    if name == nil || name == "":
+        return false
+    if streq(name, "close"):
+        return true
+    if streq(name, "write"):
+        return true
+    if streq(name, "realloc") || streq(name, "malloc") || streq(name, "free"):
+        return true
+    if streq(name, "strlen") || streq(name, "memcmp") || streq(name, "memcpy") || streq(name, "memset"):
+        return true
+    if streq(name, "strcmp") || streq(name, "strcpy") || streq(name, "strncpy"):
+        return true
+    if streq(name, "strcat") || streq(name, "strncat"):
+        return true
+    return false
+
+fn cFnSigComputeMangledNames() =
+    cFnSigMangledNames.len = 0
+    if cFnSigNames.len == 0:
+        return
+    var i: int32 = 0
+    while i < cFnSigNames.len:
+        let nm2: str = get[str](cFnSigNames, i)
+        var count: int32 = 0
+        var j: int32 = 0
+        while j < cFnSigNames.len:
+            if get[str](cFnSigNames, j) == nm2:
+                count = count + 1
+            j = j + 1
+        var out: str = nm2
+        if count > 1 || isCReservedName(nm2):
+            out = cFnSigBuildUniqueName i
+        addPtr[str](&cFnSigMangledNames, out)
+        i = i + 1
+
+fn cFnSigName(sigIdx: int32): str =
+    if sigIdx < 0 || sigIdx >= cFnSigNames.len:
+        return ""
+    if sigIdx < cFnSigMangledNames.len:
+        let nm: str = get[str](cFnSigMangledNames, sigIdx)
+        if len nm > 0:
+            return nm
+    return get[str](cFnSigNames, sigIdx)
+
+fn cgenCollectFnSigsFromDecls(decls: seq[Node]) =
+    var i: int32 = 0
+    while i < decls.len:
+        let n: Node = get[Node](decls, i)
+        if n != nil && kidCount n >= 3:
+            let nameNode: Node = kid(n, 0)
+            let paramsNode: Node = kid(n, 1)
+            var retNode: Node = kid(n, 2)
+            let nmRaw: str = plainName nameNode
+            let nm: str = cgenStripSpaces nmRaw
+            if !strIsEmpty(nm):
+                if cgenFnIsAsync(n):
+                    retNode = cgenAsyncRetType(n, retNode)
+                cFnSigAdd(nm, paramsNode, retNode, n)
+        i = i + 1
+
+fn cgenCollectFnSigs(n: Node) =
+    if n == nil:
+        return
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+        if kidCount n >= 3:
+            let nameNode: Node = kid(n, 0)
+            let paramsNode: Node = kid(n, 1)
+            var retNode: Node = kid(n, 2)
+            let nmRaw: str = plainName nameNode
+            let nm: str = cgenStripSpaces nmRaw
+            if !strIsEmpty(nm):
+                if cgenFnIsAsync(n):
+                    retNode = cgenAsyncRetType(n, retNode)
+                cFnSigAdd(nm, paramsNode, retNode, n)
+        return
+    if cgenNodeIsExprLike n:
+        return
+    var i: int32 = 0
+    while i < kidCount n:
+        cgenCollectFnSigs kid(n, i)
+        i = i + 1
+
+fn cgenCallArgValue(n: Node): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkCallArg:
+        let kids: seq[void*] = n.kids
+        if kids.len > 1:
+            return Node(get[void*](kids, 1))
+        if kids.len > 0:
+            return Node(get[void*](kids, 0))
+    return n
+
+fn cgenCallBaseName(callNode: Node): str =
+    if callNode == nil:
+        return ""
+    var cached: bool = false
+    let idx: int32 = hashmaps.hashMapPtrIntGet(cgenCallBaseIndex, void*(callNode), &cached)
+    if cached:
+        if idx <= 0:
+            return ""
+        return get[str](cgenCallBaseValues, idx - 1)
+    if kidCount callNode == 0:
+        hashmaps.hashMapPtrIntPut(&cgenCallBaseIndex, void*(callNode), 0)
+        return ""
+    let callee: Node = kid(callNode, 0)
+    let baseName: str = callBaseOrInstName callee
+    addPtr[str](&cgenCallBaseValues, baseName)
+    let storedIdx: int32 = cgenCallBaseValues.len
+    hashmaps.hashMapPtrIntPut(&cgenCallBaseIndex, void*(callNode), storedIdx)
+    return baseName
+
+fn isDefaultMarkerArg(n: Node): bool =
+    let argVal: Node = cgenCallArgValue n
+    if argVal == nil:
+        return false
+    if argVal.kind == nkCall:
+        if kidCount argVal == 1:
+            let callee: Node = kid(argVal, 0)
+            let typeNode: Node = typeNodeFromCallee callee
+            return typeNode != nil
+        if kidCount argVal == 2:
+            let baseName: str = cgenCallBaseName argVal
+            if baseName == "default":
+                let arg0: Node = cgenCallArgValue kid(argVal, 1)
+                if cgenIsTypeExprNode arg0:
+                    return true
+        return false
+    if argVal.kind == nkBracketExpr && kidCount argVal == 2:
+        let baseNode: Node = kid(argVal, 0)
+        if baseNode != nil && (baseNode.kind == nkIdent || baseNode.kind == nkSymbol):
+            let baseName2: str = cgenStripSpaces(plainName(baseNode))
+            if baseName2 == "default":
+                return cgenIsTypeExprNode kid(argVal, 1)
+    return false
+
+fn callPosCountTrimmed(callNode: Node): int32 =
+    if callNode == nil:
+        return 0
+    var posCount: int32 = kidCount callNode - 1
+    if posCount <= 0:
+        return posCount
+    let lastArg: Node = kid(callNode, posCount)
+    if ! isDefaultMarkerArg(lastArg):
+        return posCount
+    var idx: int32 = posCount
+    while idx >= 1:
+        let argNode: Node = kid(callNode, idx)
+        if ! isDefaultMarkerArg(argNode):
+            break
+        posCount = posCount - 1
+        idx = idx - 1
+    return posCount
+
+fn cgenCallArgTypeCacheEnsure(callNode: Node, posCount: int32, types: seq[Node]*, keys: seq[str]*, baseKeys: seq[str]*) =
+    if callNode == nil || posCount <= 0:
+        return
+    if types != nil && types->len == posCount:
+        return
+    if types != nil:
+        *types = newSeqWithCap[Node](posCount, posCount)
+    if keys != nil:
+        *keys = newSeqWithCap[str](posCount, posCount)
+    if baseKeys != nil:
+        *baseKeys = newSeqWithCap[str](posCount, posCount)
+    var i: int32 = 0
+    while i < posCount:
+        let argNode: Node = cgenCallArgValue kid(callNode, i + 1)
+        let argType: Node = cgenInferSimpleTypeCached argNode
+        if types != nil:
+            setPtr[Node](types, i, argType)
+        if argType != nil:
+            if keys != nil:
+                setPtr[str](keys, i, cgenTypeKey(argType))
+            if baseKeys != nil:
+                let base: Node = stripVarType argType
+                if base != nil:
+                    setPtr[str](baseKeys, i, cgenTypeKey base)
+        i = i + 1
+
+fn unwrapCallTarget(n: Node): Node =
+    var cur: Node = n
+    var changed: bool = true
+    while cur != nil && changed:
+        changed = false
+        if cur.kind == nkPar && kidCount cur == 1:
+            cur = kid(cur, 0)
+            changed = true
+        elif cur.kind == nkPostfix && kidCount cur > 1:
+            cur = kid(cur, 1)
+            changed = true
+    return cur
+
+fn calleeBaseName(callee: Node): str =
+    let cur: Node = unwrapCallTarget callee
+    if cur == nil:
+        return ""
+    if cur.kind == nkIdent || cur.kind == nkSymbol || cur.kind == nkPostfix:
+        return cgenStripSpaces(plainName(cur))
+    if cur.kind == nkDotExpr && kidCount cur > 1:
+        let member: Node = kid(cur, 1)
+        return cgenStripSpaces(plainName(member))
+    return ""
+
+fn instNameFromBracketCallee(callee: Node): str =
+    let cur: Node = unwrapCallTarget callee
+    if cur == nil || cur.kind != nkBracketExpr || kidCount cur == 0:
+        return ""
+    let baseNode: Node = unwrapCallTarget(kid(cur, 0))
+    let rawBase: str = calleeBaseName baseNode
+    if strIsEmpty rawBase:
+        return ""
+    var out: str = cgenNormalizeInstanceBase rawBase
+    var i: int32 = 1
+    while i < kidCount cur:
+        let key: str = cgenTypeKey kid(cur, i)
+        if len key > 0:
+            out = out + "_"
+            out = out + key
+        i = i + 1
+    return out
+
+fn callBaseOrInstName(callee: Node): str =
+    let cur: Node = unwrapCallTarget callee
+    if cur != nil && cur.kind == nkBracketExpr:
+        let inst: str = instNameFromBracketCallee cur
+        if !strIsEmpty inst:
+            return inst
+    let base: str = calleeBaseName cur
+    if !strIsEmpty base:
+        return base
+    return instNameFromBracketCallee cur
+
+fn cFnSigAllowMissing(sigIdx: int32, posCount: int32): bool =
+    if sigIdx < 0 || sigIdx >= cFnSigParamCounts.len:
+        return false
+    let count: int32 = get[int32](cFnSigParamCounts, sigIdx)
+    if posCount > count:
+        return cFnSigIsVarargs sigIdx
+    let off: int32 = get[int32](cFnSigParamOffsets, sigIdx)
+    var i: int32 = posCount
+    while i < count:
+        let defNode: Node = Node(get[void*](cFnSigDefaultNodes, off + i))
+        if defNode == nil || defNode.kind == nkEmpty:
+            return false
+        i = i + 1
+    return true
+
+fn typeKeyCompatible(argKey: str, expKey: str): bool =
+    if argKey == expKey:
+        return true
+    if argKey == "int" && expKey == "int32":
+        return true
+    if argKey == "int32" && expKey == "int":
+        return true
+    if argKey == "int" && expKey == "int64":
+        return true
+    if argKey == "int32" && expKey == "int64":
+        return true
+    if argKey == "uint" && expKey == "uint32":
+        return true
+    if argKey == "uint32" && expKey == "uint":
+        return true
+    if argKey == "uint" && expKey == "uint64":
+        return true
+    if argKey == "uint32" && expKey == "uint64":
+        return true
+    if argKey == "cstring" && expKey == "str":
+        return true
+    if argKey == "str" && expKey == "cstring":
+        return true
+    if argKey == "cstring" && expKey == "string":
+        return true
+    if argKey == "string" && expKey == "cstring":
+        return true
+    if argKey == "string" && expKey == "str":
+        return true
+    if argKey == "str" && expKey == "string":
+        return true
+    return false
+
+fn cFnSigFindMatchForCall(name: str, callNode: Node): int32 =
+    if strIsEmpty(name) || callNode == nil:
+        return -1
+    let posCountFull: int32 = kidCount callNode - 1
+    var posCountTrim: int32 = -1
+    var bestIdx: int32 = -1
+    var bestScore: int32 = -1
+    var bestMissing: int32 = 0
+    let candidates: seq[int32] = cFnSigNameCandidates(name)
+    var argTypes: seq[Node] = newSeqWithCap[Node](0, 0)
+    var argKeys: seq[str] = newSeqWithCap[str](0, 0)
+    var argBaseKeys: seq[str] = newSeqWithCap[str](0, 0)
+    if posCountFull > 0:
+        cgenCallArgTypeCacheEnsure(callNode, posCountFull, &argTypes, &argKeys, &argBaseKeys)
+    var ci: int32 = 0
+    while ci < candidates.len:
+        let i: int32 = get[int32](candidates, ci)
+        let count: int32 = get[int32](cFnSigParamCounts, i)
+        let isVarargs: bool = cFnSigIsVarargs i
+        var posCount: int32 = posCountFull
+        if posCountFull > count:
+            if posCountTrim < 0:
+                posCountTrim = callPosCountTrimmed callNode
+            if posCountTrim <= count:
+                posCount = posCountTrim
+        if posCount > count && !isVarargs:
+            ci = ci + 1
+            continue
+        if ! cFnSigAllowMissing(i, posCount):
+            ci = ci + 1
+            continue
+        let off: int32 = get[int32](cFnSigParamOffsets, i)
+        var score: int32 = 0
+        var mismatch: bool = false
+        var pi: int32 = 0
+        var checkCount: int32 = posCount
+        if checkCount > count:
+            checkCount = count
+        while pi < checkCount:
+            let argType: Node = get[Node](argTypes, pi)
+            if argType != nil:
+                let argKey: str = get[str](argKeys, pi)
+                let expKey: str = get[str](cFnSigParamTypeKeys, off + pi)
+                if !strIsEmpty(argKey) && !strIsEmpty(expKey) && ! typeKeyCompatible(argKey, expKey):
+                    let argBaseKey: str = get[str](argBaseKeys, pi)
+                    let expBaseKey: str = get[str](cFnSigParamBaseKeys, off + pi)
+                    if strIsEmpty(argBaseKey) || strIsEmpty(expBaseKey) || ! typeKeyCompatible(argBaseKey, expBaseKey):
+                        mismatch = true
+                        break
+            score = score + 1
+            pi = pi + 1
+        if mismatch:
+            ci = ci + 1
+            continue
+        var missing: int32 = count - posCount
+        if missing < 0:
+            missing = 0
+        if bestIdx < 0 || score > bestScore || (score == bestScore && missing < bestMissing):
+            bestIdx = i
+            bestScore = score
+            bestMissing = missing
+        ci = ci + 1
+    if bestIdx < 0:
+        ci = 0
+        while ci < candidates.len:
+            let i: int32 = get[int32](candidates, ci)
+            let count2: int32 = get[int32](cFnSigParamCounts, i)
+            let isVarargs2: bool = cFnSigIsVarargs i
+            var posCount2: int32 = posCountFull
+            if posCountFull > count2:
+                if posCountTrim < 0:
+                    posCountTrim = callPosCountTrimmed callNode
+                if posCountTrim <= count2:
+                    posCount2 = posCountTrim
+            if posCount2 > count2 && !isVarargs2:
+                ci = ci + 1
+                continue
+            if ! cFnSigAllowMissing(i, posCount2):
+                ci = ci + 1
+                continue
+            let off: int32 = get[int32](cFnSigParamOffsets, i)
+            var mismatch2: bool = false
+            var pi: int32 = 0
+            var checkCount: int32 = posCount2
+            if checkCount > count2:
+                checkCount = count2
+            while pi < checkCount:
+                let argType: Node = get[Node](argTypes, pi)
+                if argType != nil:
+                    let argKey: str = get[str](argKeys, pi)
+                    let expKey: str = get[str](cFnSigParamTypeKeys, off + pi)
+                    if !strIsEmpty(argKey) && !strIsEmpty(expKey) && ! typeKeyCompatible(argKey, expKey):
+                        let argBaseKey: str = get[str](argBaseKeys, pi)
+                        let expBaseKey: str = get[str](cFnSigParamBaseKeys, off + pi)
+                        if strIsEmpty(argBaseKey) || strIsEmpty(expBaseKey) || ! typeKeyCompatible(argBaseKey, expBaseKey):
+                            mismatch2 = true
+                            break
+                pi = pi + 1
+            if mismatch2:
+                ci = ci + 1
+                continue
+            var missing2: int32 = count2 - posCount2
+            if missing2 < 0:
+                missing2 = 0
+            if bestIdx < 0 || missing2 < bestMissing:
+                bestIdx = i
+                bestMissing = missing2
+            ci = ci + 1
+    return bestIdx
+
+fn cFnSigNameMatchesPrefix(name: str, prefix: str): bool =
+    if strIsEmpty(name) || strIsEmpty(prefix):
+        return false
+    if streq(name, prefix):
+        return true
+    if cgenHasPrefix(name, prefix + "_"):
+        return true
+    if cgenHasPrefix(name, prefix + "__"):
+        return true
+    return false
+
+fn cFnSigPrefixCandidates(prefix: str): seq[int32] =
+    if strIsEmpty(prefix):
+        return newSeqWithCap[int32](0, 0)
+    cFnSigPrefixCacheReset()
+    var cached: bool = false
+    let hit: seq[int32] = hashmaps.hashMapStrSeqIntGet(cFnSigPrefixIndex, prefix, &cached)
+    if cached:
+        return hit
+    var out: seq[int32] = newSeqWithCap[int32](0, 8)
+    var i: int32 = 0
+    while i < cFnSigNames.len:
+        let sigName: str = get[str](cFnSigNames, i)
+        if cFnSigNameMatchesPrefix(sigName, prefix):
+            addPtr[int32](&out, i)
+        i = i + 1
+    hashmaps.hashMapStrSeqIntPutSeq(&cFnSigPrefixIndex, prefix, out)
+    return out
+
+fn cFnSigFindByPrefixName(prefix: str, callNode: Node): int32 =
+    if strIsEmpty(prefix) || callNode == nil:
+        return -1
+    let posCountFull: int32 = kidCount callNode - 1
+    var posCountTrim: int32 = -1
+    var bestIdx: int32 = -1
+    var bestMissing: int32 = 0
+    let candidates: seq[int32] = cFnSigPrefixCandidates(prefix)
+    var ci: int32 = 0
+    while ci < candidates.len:
+        let i: int32 = get[int32](candidates, ci)
+        let count: int32 = get[int32](cFnSigParamCounts, i)
+        let isVarargs: bool = cFnSigIsVarargs i
+        var posCount: int32 = posCountFull
+        if posCountFull > count:
+            if posCountTrim < 0:
+                posCountTrim = callPosCountTrimmed callNode
+            if posCountTrim <= count:
+                posCount = posCountTrim
+        if posCount > count && !isVarargs:
+            ci = ci + 1
+            continue
+        if ! cFnSigAllowMissing(i, posCount):
+            ci = ci + 1
+            continue
+        var missing: int32 = count - posCount
+        if missing < 0:
+            missing = 0
+        if bestIdx < 0 || missing < bestMissing:
+            bestIdx = i
+            bestMissing = missing
+        ci = ci + 1
+    return bestIdx
+
+fn cFnSigFindMatchForPrefix(prefix: str, callNode: Node): int32 =
+    if strIsEmpty(prefix) || callNode == nil:
+        return -1
+    let posCountFull: int32 = kidCount callNode - 1
+    var posCountTrim: int32 = -1
+    var bestIdx: int32 = -1
+    var bestScore: int32 = -1
+    var bestMissing: int32 = 0
+    let candidates: seq[int32] = cFnSigPrefixCandidates(prefix)
+    var argTypes: seq[Node] = newSeqWithCap[Node](0, 0)
+    var argKeys: seq[str] = newSeqWithCap[str](0, 0)
+    var argBaseKeys: seq[str] = newSeqWithCap[str](0, 0)
+    if posCountFull > 0:
+        cgenCallArgTypeCacheEnsure(callNode, posCountFull, &argTypes, &argKeys, &argBaseKeys)
+    var ci: int32 = 0
+    while ci < candidates.len:
+        let i: int32 = get[int32](candidates, ci)
+        let count: int32 = get[int32](cFnSigParamCounts, i)
+        let isVarargs: bool = cFnSigIsVarargs i
+        var posCount: int32 = posCountFull
+        if posCountFull > count:
+            if posCountTrim < 0:
+                posCountTrim = callPosCountTrimmed callNode
+            if posCountTrim <= count:
+                posCount = posCountTrim
+        if posCount > count && !isVarargs:
+            ci = ci + 1
+            continue
+        if ! cFnSigAllowMissing(i, posCount):
+            ci = ci + 1
+            continue
+        let off: int32 = get[int32](cFnSigParamOffsets, i)
+        var score: int32 = 0
+        var mismatch: bool = false
+        var pi: int32 = 0
+        var checkCount: int32 = posCount
+        if checkCount > count:
+            checkCount = count
+        while pi < checkCount:
+            let argType: Node = get[Node](argTypes, pi)
+            if argType != nil:
+                let argKey: str = get[str](argKeys, pi)
+                let expKey: str = get[str](cFnSigParamTypeKeys, off + pi)
+                if !strIsEmpty(argKey) && !strIsEmpty(expKey) && ! typeKeyCompatible(argKey, expKey):
+                    let argBaseKey: str = get[str](argBaseKeys, pi)
+                    let expBaseKey: str = get[str](cFnSigParamBaseKeys, off + pi)
+                    if strIsEmpty(argBaseKey) || strIsEmpty(expBaseKey) || ! typeKeyCompatible(argBaseKey, expBaseKey):
+                        mismatch = true
+                        break
+            score = score + 1
+            pi = pi + 1
+        if mismatch:
+            ci = ci + 1
+            continue
+        var missing: int32 = count - posCount
+        if missing < 0:
+            missing = 0
+        if bestIdx < 0 || score > bestScore || (score == bestScore && missing < bestMissing):
+            bestIdx = i
+            bestScore = score
+            bestMissing = missing
+        ci = ci + 1
+    if bestIdx < 0:
+        ci = 0
+        while ci < candidates.len:
+            let i: int32 = get[int32](candidates, ci)
+            let count2: int32 = get[int32](cFnSigParamCounts, i)
+            let isVarargs2: bool = cFnSigIsVarargs i
+            var posCount2: int32 = posCountFull
+            if posCountFull > count2:
+                if posCountTrim < 0:
+                    posCountTrim = callPosCountTrimmed callNode
+                if posCountTrim <= count2:
+                    posCount2 = posCountTrim
+            if posCount2 > count2 && !isVarargs2:
+                ci = ci + 1
+                continue
+            if ! cFnSigAllowMissing(i, posCount2):
+                ci = ci + 1
+                continue
+            let off: int32 = get[int32](cFnSigParamOffsets, i)
+            var mismatch2: bool = false
+            var pi: int32 = 0
+            var checkCount: int32 = posCount2
+            if checkCount > count2:
+                checkCount = count2
+            while pi < checkCount:
+                let argType: Node = get[Node](argTypes, pi)
+                if argType != nil:
+                    let argKey: str = get[str](argKeys, pi)
+                    let expKey: str = get[str](cFnSigParamTypeKeys, off + pi)
+                    if !strIsEmpty(argKey) && !strIsEmpty(expKey) && ! typeKeyCompatible(argKey, expKey):
+                        let argBaseKey: str = get[str](argBaseKeys, pi)
+                        let expBaseKey: str = get[str](cFnSigParamBaseKeys, off + pi)
+                        if strIsEmpty(argBaseKey) || strIsEmpty(expBaseKey) || ! typeKeyCompatible(argBaseKey, expBaseKey):
+                            mismatch2 = true
+                            break
+                pi = pi + 1
+            if mismatch2:
+                ci = ci + 1
+                continue
+            var missing2: int32 = count2 - posCount2
+            if missing2 < 0:
+                missing2 = 0
+            if bestIdx < 0 || missing2 < bestMissing:
+                bestIdx = i
+                bestMissing = missing2
+            ci = ci + 1
+    return bestIdx
+
+fn cFnSigFindAny(name: str): int32 =
+    if strIsEmpty name:
+        return -1
+    var i: int32 = 0
+    while i < cFnSigNames.len:
+        if streq(get[str](cFnSigNames, i), name):
+            return i
+        i = i + 1
+    return -1
+
+fn cFnSigFindBySuffix(name: str): int32 =
+    if strIsEmpty name:
+        return -1
+    let suffix: str = "__" + name
+    var i: int32 = 0
+    while i < cFnSigNames.len:
+        let sigName: str = get[str](cFnSigNames, i)
+        if hasSuffix(sigName, suffix):
+            return i
+        i = i + 1
+    return -1
+
+fn cFnSigRetTypeForCall(callNode: Node): Node =
+    if callNode == nil || kidCount callNode == 0:
+        return nil
+    let baseName: str = cgenCallBaseName callNode
+    if baseName == "":
+        return nil
+    var sigBase: str = baseName
+    let bracketPrefix: str = cgenCallBracketPrefix(callNode, baseName)
+    if !strIsEmpty(bracketPrefix):
+        sigBase = bracketPrefix
+    var sigIdx: int32 = cFnSigFindMatchForCall(sigBase, callNode)
+    if sigIdx < 0 && sigBase != baseName && strHasChar(sigBase, '_'):
+        sigIdx = cFnSigFindByPrefixName(sigBase, callNode)
+    if sigIdx < 0:
+        sigIdx = cFnSigFindMatchForPrefix(sigBase, callNode)
+    if sigIdx < 0 && sigBase != baseName:
+        sigIdx = cFnSigFindMatchForCall(baseName, callNode)
+        if sigIdx < 0:
+            sigIdx = cFnSigFindMatchForPrefix(baseName, callNode)
+    if sigIdx < 0 && !strIsEmpty baseName:
+        let ptrBase: str = baseName + "Ptr"
+        sigIdx = cFnSigFindMatchForPrefix(ptrBase, callNode)
+        if sigIdx < 0:
+            sigIdx = cFnSigFindMatchForCall(ptrBase, callNode)
+    if sigIdx >= 0 && sigIdx < cFnSigRetNodes.len:
+        let retNode: Node = Node(get[void*](cFnSigRetNodes, sigIdx))
+        return retNode
+    var retBySig: Node = lookupFnRetType sigBase
+    if retBySig != nil:
+        return retBySig
+    return lookupFnRetType baseName
+
+fn cgenFindFnSigIndexForCall(callNode: Node): int32 =
+    if callNode == nil || kidCount callNode == 0:
+        return -1
+    var cached: bool = false
+    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(cFnSigCallIndex, void*(callNode), &cached)
+    if cached:
+        return cachedIdx
+    let baseName: str = cgenCallBaseName callNode
+    if baseName == "":
+        return -1
+    var sigBase: str = baseName
+    let bracketPrefix: str = cgenCallBracketPrefix(callNode, baseName)
+    if !strIsEmpty bracketPrefix:
+        sigBase = bracketPrefix
+    var sigIdx: int32 = -1
+    if !strIsEmpty sigBase:
+        sigIdx = cFnSigFindMatchForCall(sigBase, callNode)
+    if sigIdx < 0 && !streq(sigBase, baseName) && strHasChar(sigBase, '_'):
+        sigIdx = cFnSigFindByPrefixName(sigBase, callNode)
+    if sigIdx < 0 && !strIsEmpty sigBase:
+        sigIdx = cFnSigFindMatchForPrefix(sigBase, callNode)
+    if sigIdx < 0 && !streq(sigBase, baseName) && !strIsEmpty baseName:
+        sigIdx = cFnSigFindMatchForCall(baseName, callNode)
+        if sigIdx < 0:
+            sigIdx = cFnSigFindMatchForPrefix(baseName, callNode)
+    if sigIdx < 0 && !strIsEmpty baseName:
+        let ptrBase: str = baseName + "Ptr"
+        sigIdx = cFnSigFindMatchForPrefix(ptrBase, callNode)
+        if sigIdx < 0:
+            sigIdx = cFnSigFindMatchForCall(ptrBase, callNode)
+    if sigIdx < 0:
+        let posCountFull: int32 = kidCount callNode - 1
+        var posCountTrim: int32 = posCountFull
+        if posCountFull > 0:
+            let lastArg: Node = kid(callNode, posCountFull)
+            if lastArg != nil && isDefaultMarkerArg(lastArg):
+                posCountTrim = callPosCountTrimmed callNode
+        if posCountTrim < posCountFull:
+            var anyIdx: int32 = -1
+            if !strIsEmpty sigBase:
+                anyIdx = cFnSigFindAny sigBase
+            if anyIdx < 0 && !streq(sigBase, baseName) && !strIsEmpty baseName:
+                anyIdx = cFnSigFindAny baseName
+            if anyIdx >= 0:
+                sigIdx = anyIdx
+    hashmaps.hashMapPtrIntPut(&cFnSigCallIndex, void*(callNode), sigIdx)
+    return sigIdx
+
+fn cgenInferSimpleTypeCached(n: Node): Node =
+    if n == nil:
+        return nil
+    var cached: bool = false
+    let idx: int32 = hashmaps.hashMapPtrIntGet(cgenInferTypeIndex, void*(n), &cached)
+    if cached:
+        if idx <= 0:
+            return nil
+        let stored: void* = get[void*](cgenInferTypeValues, idx - 1)
+        return Node(stored)
+    let ty: Node = inferSimpleTypeNode n
+    addPtr[void*](&cgenInferTypeValues, void*(ty))
+    let storedIdx: int32 = cgenInferTypeValues.len
+    hashmaps.hashMapPtrIntPut(&cgenInferTypeIndex, void*(n), storedIdx)
+    return ty
+
+fn cgenImportcWrapperName(impName: str): str =
+    if strIsEmpty impName:
+        return ""
+    return mangleCName("__cheng_importc_out_" + impName)
+
+fn cgenImportcVarargsWrapperName(impName: str): str =
+    if strIsEmpty impName:
+        return ""
+    return mangleCName("__cheng_importc_varargs_" + impName)
+
+fn cgenFnImportcAggRetType(fnNode: Node): Node =
+    if fnNode == nil:
+        return nil
+    let imp: str = cgenGetImportC fnNode
+    if strIsEmpty imp:
+        return nil
+    if kidCount fnNode < 3:
+        return nil
+    let retNode: Node = kid(fnNode, 2)
+    if retNode == nil || retNode.kind == nkEmpty:
+        return nil
+    if cgenIsAggregateTypeNode retNode:
+        return retNode
+    return nil
+
+fn cgenCallImportcAggRetType(callNode: Node): Node =
+    let sigIdx: int32 = cgenFindFnSigIndexForCall callNode
+    return cgenCallImportcAggRetTypeBySig(sigIdx)
+
+fn cgenCallImportcAggRetTypeBySig(sigIdx: int32): Node =
+    if sigIdx < 0 || sigIdx >= cFnSigImportcAggRetTypes.len:
+        return nil
+    return Node(get[void*](cFnSigImportcAggRetTypes, sigIdx))
+
+fn cgenCallImportcWrapperName(callNode: Node): str =
+    let sigIdx: int32 = cgenFindFnSigIndexForCall callNode
+    if sigIdx < 0 || sigIdx >= cFnSigImportcNames.len:
+        return ""
+    return cgenImportcWrapperName get[str](cFnSigImportcNames, sigIdx)
+
+fn cgenCallImportcVarargsWrapperName(callNode: Node): str =
+    let sigIdx: int32 = cgenFindFnSigIndexForCall callNode
+    if sigIdx < 0 || sigIdx >= cFnSigImportcNames.len:
+        return ""
+    if ! cFnSigIsVarargs sigIdx:
+        return ""
+    return cgenImportcVarargsWrapperName get[str](cFnSigImportcNames, sigIdx)
+
+fn cFnSigShouldEmit(n: Node): bool =
+    if n == nil || kidCount n < 3:
+        return false
+    let nameRaw: str = plainName kid(n, 0)
+    let name: str = cgenStripSpaces nameRaw
+    if name == "":
+        return false
+    let sigIdx: int32 = cFnSigIndexForNode n
+    if sigIdx >= 0:
+        return true
+    let paramsNode: Node = kid(n, 1)
+    let retNode: Node = kid(n, 2)
+    var key: str = cFnSigKey(name, paramsNode, retNode)
+    let suffix: str = cgenFnVarargsKeySuffix(n, paramsNode)
+    if len suffix > 0:
+        key = key + suffix
+    if strSeqHas(&cFnSigKeys, key):
+        return fnHasBody n
+    return true
+
+fn isKnownTypeName(name: str): bool =
+    if name == "":
+        return false
+    return strSeqHas(&typeNames, name)
+
+fn isRefTypeName(name: str): bool =
+    if name == "":
+        return false
+    return strSeqHas(&refTypeNames, name)
+
+fn cgenIsStringTypeNode(n: Node): bool =
+    if n == nil:
+        return false
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let nm: str = cgenStripSpaces cur.ident
+        return nm == "str" || nm == "cstring" || nm == "string"
+    return false
+
+fn cgenPatternIsWildcard(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        return cgenStripSpaces(n.ident) == "_"
+    return false
+
+fn cgenPatternHead(n: Node): Node =
+    var cur: Node = n
+    if cur != nil && cur.kind == nkPattern && kidCount cur > 0:
+        cur = kid(cur, 0)
+    if cur != nil && cur.kind == nkPar && kidCount cur == 1:
+        cur = kid(cur, 0)
+    return cur
+
+fn cgenPatternType(n: Node): Node =
+    if n != nil && n.kind == nkPattern && kidCount n > 1:
+        return kid(n, 1)
+    return nil
+
+fn cgenPatternIsWildcardDeep(pat: Node): bool =
+    if pat == nil:
+        return false
+    var cached: bool = false
+    let cachedVal: int32 = hashmaps.hashMapPtrIntGet(cgenPatternWildcardIndex, void*(pat), &cached)
+    if cached:
+        return cachedVal == 1
+    var result: bool = false
+    case pat.kind
+    of nkIdent, nkSymbol:
+        result = cgenStripSpaces(pat.ident) == "_"
+    of nkPattern:
+        if kidCount pat > 0:
+            result = cgenPatternIsWildcardDeep(kid(pat, 0))
+    of nkPar:
+        if kidCount pat == 1:
+            result = cgenPatternIsWildcardDeep(kid(pat, 0))
+    of nkCallArg:
+        if kidCount pat > 1:
+            result = cgenPatternIsWildcardDeep(kid(pat, 1))
+        elif kidCount pat > 0:
+            result = cgenPatternIsWildcardDeep(kid(pat, 0))
+    else:
+        result = false
+    var stored: int32 = 2
+    if result:
+        stored = 1
+    hashmaps.hashMapPtrIntPut(&cgenPatternWildcardIndex, void*(pat), stored)
+    return result
+
+fn cgenObjectPatternTypeName(pat: Node): str =
+    if pat == nil || pat.kind != nkCall || kidCount pat <= 0:
+        return ""
+    var cached: bool = false
+    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(cgenObjectPatternTypeIndex, void*(pat), &cached)
+    if cached:
+        if cachedIdx <= 0:
+            return ""
+        return get[str](cgenObjectPatternTypeValues, cachedIdx - 1)
+    let callee: Node = kid(pat, 0)
+    let name: str = cgenStripSpaces(plainName(callee))
+    if len name == 0:
+        addPtr[str](&cgenObjectPatternTypeValues, "")
+        hashmaps.hashMapPtrIntPut(&cgenObjectPatternTypeIndex, void*(pat), cgenObjectPatternTypeValues.len)
+        return ""
+    if lookupTypeDef(name) != nil:
+        addPtr[str](&cgenObjectPatternTypeValues, name)
+        hashmaps.hashMapPtrIntPut(&cgenObjectPatternTypeIndex, void*(pat), cgenObjectPatternTypeValues.len)
+        return name
+    let marker: str = "__wrap"
+    var i: int32 = 0
+    let nlen: int32 = len name
+    let mlen: int32 = len marker
+    while i + mlen <= nlen:
+        var j: int32 = 0
+        var ok: bool = true
+        while j < mlen:
+            if charAt(name, i + j) != charAt(marker, j):
+                ok = false
+                break
+            j = j + 1
+        if ok:
+            if i > 0:
+                let base: str = cgenSliceRange(name, 0, i - 1)
+                if lookupTypeDef(base) != nil:
+                    addPtr[str](&cgenObjectPatternTypeValues, base)
+                    hashmaps.hashMapPtrIntPut(&cgenObjectPatternTypeIndex, void*(pat), cgenObjectPatternTypeValues.len)
+                    return base
+            break
+        i = i + 1
+    addPtr[str](&cgenObjectPatternTypeValues, "")
+    hashmaps.hashMapPtrIntPut(&cgenObjectPatternTypeIndex, void*(pat), cgenObjectPatternTypeValues.len)
+    return ""
+
+fn cgenIsObjectPattern(pat: Node): bool =
+    return len(cgenObjectPatternTypeName(pat)) > 0
+
+fn cgenAddFieldNameUnique(out: seq[str]*, name: str) =
+    if out == nil || strIsEmpty name:
+        return
+    var i: int32 = 0
+    while i < out->len:
+        if get[str](*out, i) == name:
+            return
+        i = i + 1
+    addPtr[str](out, name)
+
+fn cgenCollectFieldNamesFromRecList(recList: Node, out: seq[str]*): bool =
+    if recList == nil || out == nil:
+        return true
+    var i: int32 = 0
+    while i < kidCount recList:
+        let entry: Node = kid(recList, i)
+        if entry != nil && entry.kind == nkIdentDefs:
+            let nameCount: int32 = identDefsNameCount entry
+            var j: int32 = 0
+            while j < nameCount:
+                var nameNode: Node = kid(entry, j)
+                if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 0:
+                    nameNode = kid(nameNode, 0)
+                if nameNode != nil:
+                    let fieldRaw: str = plainName nameNode
+                    let fieldName: str = cgenStripSpaces fieldRaw
+                    if !strIsEmpty(fieldName):
+                        cgenAddFieldNameUnique(out, fieldName)
+                j = j + 1
+        elif entry != nil && entry.kind == nkRecCase:
+            if kidCount entry > 0:
+                let defs: Node = kid(entry, 0)
+                if defs != nil && defs.kind == nkIdentDefs:
+                    let nameCount2: int32 = identDefsNameCount defs
+                    var k: int32 = 0
+                    while k < nameCount2:
+                        var nameNode2: Node = kid(defs, k)
+                        if nameNode2 != nil && nameNode2.kind == nkPattern && kidCount nameNode2 > 0:
+                            nameNode2 = kid(nameNode2, 0)
+                        if nameNode2 != nil:
+                            let fieldRaw2: str = plainName nameNode2
+                            let fieldName2: str = cgenStripSpaces fieldRaw2
+                            if !strIsEmpty(fieldName2):
+                                cgenAddFieldNameUnique(out, fieldName2)
+                        k = k + 1
+            var bi: int32 = 1
+            while bi < kidCount entry:
+                let branch: Node = kid(entry, bi)
+                var body: Node = nil
+                if branch != nil && branch.kind == nkOfBranch && kidCount branch > 1:
+                    body = kid(branch, 1)
+                elif branch != nil && branch.kind == nkElse && kidCount branch > 0:
+                    body = kid(branch, 0)
+                if body != nil && body.kind == nkRecList:
+                    if ! cgenCollectFieldNamesFromRecList(body, out):
+                        return false
+                bi = bi + 1
+        i = i + 1
+    return true
+
+fn cgenObjectFieldOrderCacheStore(typeName: str, out: seq[str]*): bool =
+    if out == nil || strIsEmpty typeName:
+        return true
+    var stored: seq[str] = newSeqWithCap[str](0, out->len)
+    var i: int32 = 0
+    while i < out->len:
+        addPtr[str](&stored, get[str](*out, i))
+        i = i + 1
+    addPtr[seq[str]](&cgenObjectFieldOrderValues, stored)
+    let storedIdx: int32 = cgenObjectFieldOrderValues.len
+    hashmaps.hashMapStrIntPut(&cgenObjectFieldOrderIndex, typeName, storedIdx)
+    return true
+
+fn cgenObjectFieldOrder(typeName: str, out: seq[str]*): bool =
+    if out == nil:
+        return false
+    out->len = 0
+    if strIsEmpty typeName:
+        return false
+    var cached: bool = false
+    let cachedIdx: int32 = hashmaps.hashMapStrIntGet(cgenObjectFieldOrderIndex, typeName, &cached)
+    if cached:
+        if cachedIdx <= 0:
+            return false
+        let cachedFields: seq[str] = get[seq[str]](cgenObjectFieldOrderValues, cachedIdx - 1)
+        var i: int32 = 0
+        while i < cachedFields.len:
+            addPtr[str](out, get[str](cachedFields, i))
+            i = i + 1
+        return true
+    var def: Node = lookupTypeDef typeName
+    if def == nil:
+        return false
+    var objDef: Node = def
+    if objDef.kind == nkRefTy || objDef.kind == nkPtrTy || objDef.kind == nkVarTy:
+        if kidCount objDef > 0:
+            objDef = unwrapParType kid(objDef, 0)
+    if objDef == nil || objDef.kind != nkObjectDecl:
+        return false
+    if kidCount objDef > 0:
+        let base: Node = kid(objDef, 0)
+        if base != nil && base.kind != nkEmpty:
+            cgenAddError(objDef.pos, "C backend does not support positional object patterns with inheritance")
+            return false
+    var recList: Node = nil
+    if kidCount objDef > 1:
+        recList = kid(objDef, 1)
+    if recList == nil:
+        return cgenObjectFieldOrderCacheStore(typeName, out)
+    if ! cgenCollectFieldNamesFromRecList(recList, out):
+        cgenAddError(objDef.pos, "C backend does not support positional object patterns with recCase")
+        return false
+    return cgenObjectFieldOrderCacheStore(typeName, out)
+
+fn cgenTupleElemTypesFromTypeInner(t: Node, seen: seq[str]*): seq[Node] =
+    var elems: seq[Node] = newSeqWithCap[Node](0, 4)
+    if t == nil:
+        return elems
+    var cur: Node = unwrapParType t
+    if cur == nil:
+        return elems
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let name: str = cgenStripSpaces cur.ident
+        if name != "":
+            if isTypeName name:
+                return elems
+            if strSeqHas(seen, name):
+                cgenAddError(cur.pos, "C backend tuple type alias cycle: " + name)
+                return elems
+            addPtr[str](seen, name)
+            let def: Node = lookupTypeDef name
+            if def != nil:
+                let out: seq[Node] = cgenTupleElemTypesFromTypeInner(def, seen)
+                seen->len = seen->len - 1
+                return out
+            seen->len = seen->len - 1
+    if cur.kind == nkTupleTy:
+        var i: int32 = 0
+        while i < kidCount cur:
+            let child: Node = kid(cur, i)
+            if child != nil && child.kind == nkIdentDefs && kidCount child > 1:
+                addPtr[Node](&elems, kid(child, 1))
+            else:
+                addPtr[Node](&elems, child)
+            i = i + 1
+    return elems
+
+fn cgenTupleElemTypesFromType(t: Node): seq[Node] =
+    var seen: seq[str] = newSeqWithCap[str](0, 4)
+    return cgenTupleElemTypesFromTypeInner(t, &seen)
+
+fn cgenIsSeqTypeNode(n: Node): bool =
+    if n == nil:
+        return false
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    if cur.kind == nkBracketExpr && kidCount cur > 0:
+        let base: Node = kid(cur, 0)
+        if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
+            return cgenStripSpaces(base.ident) == "seq"
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let key: str = cgenTypeKey cur
+        return strStartsWith(key, "seq_")
+    return false
+
+fn cgenIsSetTypeNode(n: Node): bool =
+    if n == nil:
+        return false
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    if cur.kind == nkSetTy:
+        return true
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let key: str = cgenTypeKey cur
+        return strStartsWith(key, "set_")
+    return false
+
+fn cgenIsArrayTypeNode(n: Node): bool =
+    if n == nil:
+        return false
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    if cur.kind == nkBracketExpr && kidCount cur > 2:
+        let base: Node = kid(cur, 0)
+        if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
+            return cgenStripSpaces(base.ident) == "array"
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let key: str = cgenTypeKey cur
+        return strStartsWith(key, "array_")
+    return false
+
+fn cgenSeqElemType(n: Node): Node =
+    if n == nil:
+        return nil
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return nil
+    if cur.kind == nkBracketExpr && kidCount cur > 1:
+        let base: Node = kid(cur, 0)
+        if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
+            if cgenStripSpaces(base.ident) == "seq":
+                return kid(cur, 1)
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let key: str = cgenTypeKey cur
+        if strStartsWith(key, "seq_"):
+            let tn: Node = typeNodeFromKey key
+            if tn != nil && tn.kind == nkBracketExpr && kidCount tn > 1:
+                return kid(tn, 1)
+    return nil
+
+fn cgenIsTableTypeNode(n: Node): bool =
+    if n == nil:
+        return false
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    if cur.kind == nkBracketExpr && kidCount cur > 0:
+        let base: Node = kid(cur, 0)
+        if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
+            return cgenStripSpaces(base.ident) == "Table"
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let key: str = cgenTypeKey cur
+        return strStartsWith(key, "Table_")
+    return false
+
+fn cgenTableValueType(n: Node): Node =
+    if n == nil:
+        return nil
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return nil
+    if cur.kind == nkBracketExpr && kidCount cur > 1:
+        let base: Node = kid(cur, 0)
+        if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
+            if cgenStripSpaces(base.ident) == "Table":
+                return kid(cur, 1)
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let key: str = cgenTypeKey cur
+        if strStartsWith(key, "Table_"):
+            let tn: Node = typeNodeFromKey key
+            if tn != nil && tn.kind == nkBracketExpr && kidCount tn > 1:
+                return kid(tn, 1)
+    return nil
+
+fn cgenInferIterType(n: Node): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkBracketExpr && kidCount n >= 2:
+        let baseExpr: Node = kid(n, 0)
+        let idxExpr: Node = kid(n, 1)
+        if cgenIsRangeExpr idxExpr:
+            let baseType: Node = cgenInferIterType baseExpr
+            if baseType != nil:
+                if cgenIsStringTypeNode(baseType) || exprIsStringLike(baseExpr):
+                    return baseType
+                if cgenIsSeqTypeNode baseType:
+                    return baseType
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = cgenStripSpaces n.ident
+        let t0: Node = lookupVarType nm
+        if t0 != nil && t0.kind != nkEmpty:
+            return t0
+    if n.kind == nkCall:
+        let rt: Node = cFnSigRetTypeForCall n
+        if rt != nil && rt.kind != nkEmpty:
+            return rt
+    return inferSimpleTypeNode n
+
+fn cgenNormalizeSeqLitType(seqType: Node): Node =
+    if seqType == nil || seqType.kind == nkEmpty:
+        return seqType
+    let cur: Node = unwrapParType seqType
+    if cur == nil:
+        return seqType
+    if cur.kind == nkBracketExpr && kidCount cur > 1:
+        let base: Node = kid(cur, 0)
+        let elem: Node = kid(cur, 1)
+        if base != nil &&(base.kind == nkIdent || base.kind == nkSymbol) &&
+           cgenStripSpaces(base.ident) == "seq" && elem != nil &&
+           (elem.kind == nkIdent || elem.kind == nkSymbol) &&
+           cgenStripSpaces(elem.ident) == "int":
+            var alt: Node = newNode(nkBracketExpr, seqType.pos)
+            addSon(alt, newIdent("seq", seqType.pos))
+            addSon(alt, newIdent("int32", seqType.pos))
+            if isKnownTypeName(cgenTypeKey alt):
+                return alt
+    return seqType
+
+fn cgenEnsureIterTemp(w: CWriter*, expr: Node, ty: Node): str =
+    if expr == nil:
+        return ""
+    if expr.kind == nkIdent || expr.kind == nkSymbol:
+        return cgenStripSpaces expr.ident
+    if ty == nil || ty.kind == nkEmpty:
+        cgenAddError(expr.pos, "C backend requires iterable with known type")
+        return ""
+    let tmpName: str = cgenNextTempName("iter")
+    cwIndent w
+    emitTypeName(w, ty)
+    cwWrite(w, " ")
+    cwWrite(w, tmpName)
+    cwWrite(w, " = ")
+    cgenEmitExpr(w, expr)
+    cwWrite(w, ";")
+    cwNewline w
+    if inFn:
+        addLocalVar(tmpName, ty)
+    return tmpName
+
+fn typeIsRefLike(n: Node): bool =
+    if n == nil:
+        return false
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    if cur.kind == nkRefTy || cur.kind == nkPtrTy || cur.kind == nkVarTy:
+        return true
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let nm: str = cgenStripSpaces cur.ident
+        return isRefTypeName nm
+    return false
+
+fn typeIsVarRef(n: Node): bool =
+    if n == nil:
+        return false
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    return cur.kind == nkVarTy
+
+fn cgenIsVoidTypeNode(n: Node): bool =
+    if n == nil:
+        return true
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return true
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        return cgenStripSpaces cur.ident == "void"
+    return false
+
+fn cgenIsScalarTypeName(name: str): bool =
+    if name == "":
+        return false
+    let nm: str = cgenStripSpaces name
+    if nm == "bool" || nm == "char" || nm == "byte":
+        return true
+    if nm == "int" || nm == "int8" || nm == "int16" || nm == "int32" || nm == "int64":
+        return true
+    if nm == "uint" || nm == "uint8" || nm == "uint16" || nm == "uint32" || nm == "uint64":
+        return true
+    if nm == "float" || nm == "float32" || nm == "float64":
+        return true
+    if nm == "cstring" || nm == "str" || nm == "string":
+        return true
+    if nm == "void":
+        return true
+    return false
+
+fn cgenIsAggregateTypeNode(n: Node, depth: int32 = 0): bool =
+    if n == nil:
+        return false
+    if depth > 8:
+        return true
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return false
+    if cur.kind == nkPtrTy || cur.kind == nkRefTy || cur.kind == nkVarTy || cur.kind == nkFnTy:
+        return false
+    if cur.kind == nkObjectDecl || cur.kind == nkTupleTy || cur.kind == nkTupleLit:
+        return true
+    if cur.kind == nkBracketExpr || cur.kind == nkSetTy:
+        return true
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let nm: str = cgenIdentNameNormalized cur
+        if cgenIsScalarTypeName nm:
+            return false
+        let def: Node = lookupTypeDef nm
+        if def != nil:
+            if def.kind == nkEnumDecl:
+                return false
+            return cgenIsAggregateTypeNode(def, depth + 1)
+        return true
+    return true
+
+fn cgenTypeNameResolve(tname: str): str =
+    if tname == nil || tname == "":
+        return tname
+    if cgenTypeNameResolveReadyEpoch != cgenTypeNameResolveEpoch:
+        hashmaps.hashMapStrIntClear(&cgenTypeNameResolveIndex)
+        cgenTypeNameResolveValues = newSeqWithCap[str](0, 128)
+        cgenTypeNameResolveReadyEpoch = cgenTypeNameResolveEpoch
+    var found: bool = false
+    let idx: int32 = hashmaps.hashMapStrIntGet(cgenTypeNameResolveIndex, tname, &found)
+    if found && idx > 0 && idx <= cgenTypeNameResolveValues.len:
+        return get[str](cgenTypeNameResolveValues, idx - 1)
+    var resolved: str = tname
+    if !strHasSubstr(tname, "__"):
+        var defFound: bool = false
+        hashmaps.hashMapStrIntGet(typeDefIndex, tname, &defFound)
+        if ! defFound:
+            let suffix: str = "__" + tname
+            var match: str = ""
+            var i: int32 = 0
+            while i < typeNames.len:
+                let curName: str = get[str](typeNames, i)
+                if hasSuffix(curName, suffix):
+                    if !strIsEmpty(match):
+                        match = ""
+                        break
+                    match = curName
+                i = i + 1
+            if !strIsEmpty(match):
+                resolved = match
+    addPtr[str](&cgenTypeNameResolveValues, resolved)
+    let storedIdx: int32 = cgenTypeNameResolveValues.len
+    hashmaps.hashMapStrIntPut(&cgenTypeNameResolveIndex, tname, storedIdx)
+    return resolved
+
+fn cgenTypeNameFromTypeNode(n: Node): str =
+    if n == nil:
+        return ""
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return ""
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let nm: str = cgenIdentNameNormalized cur
+        let resolved: str = cgenTypeNameResolve nm
+        if isKnownTypeName resolved:
+            return resolved
+        return nm
+    if cur.kind == nkBracketExpr:
+        return cgenTypeKey cur
+    return ""
+
+fn cgenTypeDeclPacked(td: Node): bool =
+    let pragma: Node = typeDeclPragmaNode td
+    if pragma == nil:
+        return false
+    var i: int32 = 0
+    while i < kidCount pragma:
+        let a: Node = kid(pragma, i)
+        if a != nil && a.kind == nkAnnotation && kidCount a > 0:
+            let name: str = cgenStripSpaces plainName(kid(a, 0))
+            if name == "packed":
+                return true
+        i = i + 1
+    return false
+
+fn cgenTypeDeclAlign(td: Node): int32 =
+    let pragma: Node = typeDeclPragmaNode td
+    if pragma == nil:
+        return 0
+    var out: int32 = 0
+    var i: int32 = 0
+    while i < kidCount pragma:
+        let a: Node = kid(pragma, i)
+        if a != nil && a.kind == nkAnnotation && kidCount a > 0:
+            let name: str = cgenStripSpaces plainName(kid(a, 0))
+            if name == "align":
+                if kidCount a > 1:
+                    let arg: Node = kid(a, 1)
+                    if arg != nil && arg.kind == nkIntLit:
+                        let v: int64 = arg.intVal
+                        if v > 0:
+                            out = int32(v)
+                        else:
+                            cgenAddError(arg.pos, "align expects positive integer")
+                    else:
+                        cgenAddError(a.pos, "align expects integer literal")
+                else:
+                    cgenAddError(a.pos, "align expects integer argument")
+        i = i + 1
+    return out
+
+fn lookupVarType(name: str): Node =
+    var found: bool = false
+    let idx: int32 = hashmaps.hashMapStrIntGet(localVarIndex, name, &found)
+    if found && idx >= 0 && idx < localVarTypes.len:
+        return get[Node](localVarTypes, idx)
+    let t0: Node = findTypeByName(localVarNames, localVarTypes, name)
+    if t0 != nil:
+        return t0
+    found = false
+    let gidx: int32 = hashmaps.hashMapStrIntGet(globalVarIndex, name, &found)
+    if found && gidx >= 0 && gidx < globalVarTypes.len:
+        return get[Node](globalVarTypes, gidx)
+    return findTypeByName(globalVarNames, globalVarTypes, name)
+
+fn lookupFnRetType(name: str): Node =
+    var found: bool = false
+    let idx: int32 = hashmaps.hashMapStrIntGet(fnRetIndex, name, &found)
+    if found && idx >= 0 && idx < fnRetTypes.len:
+        return get[Node](fnRetTypes, idx)
+    return findTypeByName(fnRetNames, fnRetTypes, name)
+
+fn unwrapParExpr(n: Node): Node =
+    var cur: Node = n
+    while cur != nil && cur.kind == nkPar && kidCount cur == 1:
+        cur = kid(cur, 0)
+    return cur
+
+fn dotNeedsArrow(base: Node): bool =
+    let cur: Node = unwrapParExpr base
+    if cur == nil:
+        return false
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        let nm: str = cgenStripSpaces cur.ident
+        return typeIsRefLike(lookupVarType nm)
+    if cur.kind == nkCall:
+        if kidCount cur == 0:
+            return false
+        let rt: Node = cFnSigRetTypeForCall cur
+        if rt != nil && rt.kind != nkEmpty:
+            return typeIsRefLike rt
+    return false
+
+fn arrayNeedsDeref(base: Node): bool =
+    let ty: Node = inferSimpleTypeNode base
+    return typeIsRefLike ty
+
+fn cgenEmitArrayIndex(w: CWriter*, base: Node, idx: Node) =
+    if w == nil:
+        return
+    cwWriteChar(w, '(')
+    if arrayNeedsDeref base:
+        cwWrite(w, "(*")
+        cgenEmitExpr(w, base)
+        cwWrite(w, ").data")
+    else:
+        cgenEmitExpr(w, base)
+        cwWrite(w, ".data")
+    cwWrite(w, "[")
+    cgenEmitExpr(w, idx)
+    cwWrite(w, "])")
+
+fn emitTypeNameCore(w: CWriter*, n: Node) =
+    if n == nil || n.kind == nkEmpty:
+        cwWrite(w, "void")
+        return
+    if n.kind == nkPar && kidCount n == 1:
+        emitTypeNameCore(w, kid(n, 0))
+        return
+    if n.kind == nkPtrTy || n.kind == nkRefTy || n.kind == nkVarTy:
+        if kidCount n > 0:
+            emitTypeNameCore(w, kid(n, 0))
+            cwWrite(w, "*")
+        else:
+            cwWrite(w, "void*")
+        return
+    if n.kind == nkPostfix && kidCount n > 1:
+        let opn0: Node = kid(n, 0)
+        let opn1: Node = kid(n, 1)
+        let opn0Name: str = cgenIdentNameNormalized opn0
+        if opn0Name == "*":
+            emitTypeNameCore(w, kid(n, 1))
+            cwWrite(w, "*")
+            return
+        let opn1Name: str = cgenIdentNameNormalized opn1
+        if opn1Name == "*":
+            emitTypeNameCore(w, kid(n, 0))
+            cwWrite(w, "*")
+            return
+    if n.kind == nkInfix && kidCount n >= 3:
+        let opn2: Node = kid(n, 0)
+        let opn2Name: str = cgenIdentNameNormalized opn2
+        if opn2Name == "*":
+            let rhs: Node = kid(n, 2)
+            if rhs == nil || rhs.kind == nkEmpty:
+                emitTypeNameCore(w, kid(n, 1))
+                cwWrite(w, "*")
+                return
+        let opnMid: Node = kid(n, 1)
+        let opnMidName: str = cgenIdentNameNormalized opnMid
+        if opnMidName == "*":
+            let rhsMid: Node = kid(n, 2)
+            if rhsMid == nil || rhsMid.kind == nkEmpty:
+                emitTypeNameCore(w, kid(n, 0))
+                cwWrite(w, "*")
+                return
+    if n.kind == nkSetTy:
+        cwWrite(w, "NU64")
+        return
+    if n.kind == nkTupleTy:
+        let key: str = cgenEnsureTupleDecl n
+        if !strIsEmpty key:
+            cwWrite(w, key)
+            return
+    if n.kind == nkFnTy:
+        let key: str = recordFnType n
+        if key != "":
+            cwWrite(w, key)
+            return
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let tname: str = cgenIdentNameNormalized n
+        if tname == "CHENG_C_AUTOTYPE":
+            cwWrite(w, "CHENG_C_AUTOTYPE")
+            return
+        if tname == "int8":
+            cwWrite(w, "NI8")
+            return
+        if tname == "int16":
+            cwWrite(w, "NI16")
+            return
+        if tname == "int32":
+            cwWrite(w, "NI32")
+            return
+        if tname == "int":
+            cwWrite(w, "NI")
+            return
+        if tname == "int64":
+            cwWrite(w, "NI64")
+            return
+        if tname == "uint8":
+            cwWrite(w, "NU8")
+            return
+        if tname == "uint16":
+            cwWrite(w, "NU16")
+            return
+        if tname == "uint32":
+            cwWrite(w, "NU32")
+            return
+        if tname == "uint":
+            cwWrite(w, "NU")
+            return
+        if tname == "uint64":
+            cwWrite(w, "NU64")
+            return
+        if tname == "bool":
+            cwWrite(w, "NB8")
+            return
+        if tname == "char":
+            cwWrite(w, "NC8")
+            return
+        if tname == "float" || tname == "float64":
+            cwWrite(w, "NF64")
+            return
+        if tname == "float32":
+            cwWrite(w, "NF32")
+            return
+        if tname == "cstring":
+            cwWrite(w, "const char*")
+            return
+        if tname == "str":
+            cwWrite(w, "char*")
+            return
+        if tname == "string":
+            cwWrite(w, "char*")
+            return
+        if cgenHasPrefix(tname, "set_"):
+            cwWrite(w, "NU64")
+            return
+        if tname == "void":
+            cwWrite(w, "void")
+            return
+        let resolved: str = cgenTypeNameResolve tname
+        if isKnownTypeName resolved:
+            cwWrite(w, resolved)
+            return
+        cwWrite(w, "void*")
+        return
+    if n.kind == nkBracketExpr:
+        let key: str = cgenTypeKey n
+        if len key > 0:
+            cwWrite(w, key)
+            return
+    cwWrite(w, "void*")
+
+fn emitTypeName(w: CWriter*, n: Node) =
+    if !cgenProfOn:
+        emitTypeNameCore(w, n)
+        return
+    let startNs: int64 = cheng_monotime_ns()
+    emitTypeNameCore(w, n)
+    cgenProfEmitTypeNs = cgenProfEmitTypeNs + (cheng_monotime_ns() - startNs)
+    cgenProfEmitTypeCalls = cgenProfEmitTypeCalls + 1
+
+fn typeNameToStr(n: Node): str =
+    var w: CWriter = initCWriter()
+    var wPtr: CWriter* = &w
+    emitTypeName(wPtr, n)
+    return finishC wPtr
+
+fn refStructTag(name: str): str =
+    return name + "_obj"
+
+fn typeDeclRefObjectDef(def: Node): Node =
+    if def == nil:
+        return nil
+    if def.kind == nkRefTy || def.kind == nkPtrTy || def.kind == nkVarTy:
+        if kidCount def > 0:
+            let base: Node = unwrapParType kid(def, 0)
+            if base != nil && base.kind == nkObjectDecl:
+                return base
+    return nil
+
+fn addFieldType(owner: str, fieldName: str, typeNode: Node) =
+    if owner == "" || fieldName == "" || typeNode == nil:
+        return
+    let key: str = owner + "." + fieldName
+    if strSeqHas(&fieldTypeKeys, key):
+        return
+    let idx: int32 = fieldTypeKeys.len
+    addPtr[str](&fieldTypeKeys, key)
+    hashsets.hashSetStrAdd(&fieldTypeKeySet, key)
+    addPtr[Node](&fieldTypeNodes, typeNode)
+    hashmaps.hashMapStrIntPut(&fieldTypeIndex, key, idx)

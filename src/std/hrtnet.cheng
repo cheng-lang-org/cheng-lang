@@ -1,0 +1,134 @@
+# std/hrtnet (hard-rt network rings)
+import std/hrt_ring
+
+type
+    HrtNetSlot =
+        data: void*
+        len: int32
+        flags: int32
+        reserved: int32
+    HrtNetQueue =
+        rx: hrt_ring.HrtRingView
+        tx: hrt_ring.HrtRingView
+
+fn hrtNetRingIsPowerOfTwo(x: int32): bool =
+    if x <= 0:
+        return false
+    let v: int32 = x - 1
+    return (x & v) == 0
+
+fn hrtNetRingAttach(view: var hrt_ring.HrtRingView, meta: hrt_ring.HrtRingMeta*, slots: void*): bool =
+    if meta == nil:
+        return false
+    if slots == nil:
+        return false
+    let cap: int32 = meta->cap
+    if hrtNetRingIsPowerOfTwo cap == false:
+        return false
+    view.meta = meta
+    view.slots = slots
+    return true
+
+fn hrtNetRingIsEmpty(view: hrt_ring.HrtRingView): bool =
+    if view.meta == nil:
+        return true
+    let meta: hrt_ring.HrtRingMeta* = view.meta
+    return meta->head == meta->tail
+
+fn hrtNetRingIsFull(view: hrt_ring.HrtRingView): bool =
+    if view.meta == nil:
+        return true
+    let meta: hrt_ring.HrtRingMeta* = view.meta
+    let next: int32 = (meta->tail + 1) & meta->mask
+    return next == meta->head
+
+fn hrtNetRingCount(view: hrt_ring.HrtRingView): int32 =
+    if view.meta == nil:
+        return 0
+    let meta: hrt_ring.HrtRingMeta* = view.meta
+    return (meta->tail - meta->head) & meta->mask
+
+fn hrtNetRingCapacity(view: hrt_ring.HrtRingView): int32 =
+    if view.meta == nil:
+        return 0
+    let meta: hrt_ring.HrtRingMeta* = view.meta
+    return meta->cap
+
+@importc("cheng_hrt_net_slot_ptr")
+fn cheng_hrt_net_slot_ptr(slots: void*, idx: int32): HrtNetSlot*
+
+fn hrtNetSlotPtr(slots: void*, idx: int32): HrtNetSlot* =
+    return cheng_hrt_net_slot_ptr(slots, idx)
+
+fn hrtNetBindRx(queue: HrtNetQueue*, meta: hrt_ring.HrtRingMeta*, slots: HrtNetSlot*): bool =
+    if queue == nil:
+        return false
+    return hrtNetRingAttach(queue->rx, meta, void*(slots))
+
+fn hrtNetBindTx(queue: HrtNetQueue*, meta: hrt_ring.HrtRingMeta*, slots: HrtNetSlot*): bool =
+    if queue == nil:
+        return false
+    return hrtNetRingAttach(queue->tx, meta, void*(slots))
+
+fn hrtNetRxPeek(queue: HrtNetQueue, outSlot: HrtNetSlot**): bool =
+    if outSlot == nil:
+        return false
+    let rx: hrt_ring.HrtRingView = queue.rx
+    if rx.meta == nil:
+        return false
+    if rx.slots == nil:
+        return false
+    if hrtNetRingIsEmpty rx:
+        return false
+    let meta: hrt_ring.HrtRingMeta* = rx.meta
+    let head: int32 = meta->head
+    var slot: HrtNetSlot* = hrtNetSlotPtr(rx.slots, head)
+    *outSlot = slot
+    return true
+
+fn hrtNetRxConsume(queue: var HrtNetQueue) =
+    let rx: hrt_ring.HrtRingView = queue.rx
+    if rx.meta == nil:
+        return
+    if hrtNetRingIsEmpty rx:
+        return
+    let meta: hrt_ring.HrtRingMeta* = rx.meta
+    meta->head = (meta->head + 1) & meta->mask
+
+fn hrtNetTxReserve(queue: HrtNetQueue, outSlot: HrtNetSlot**): bool =
+    if outSlot == nil:
+        return false
+    let tx: hrt_ring.HrtRingView = queue.tx
+    if tx.meta == nil:
+        return false
+    if tx.slots == nil:
+        return false
+    if hrtNetRingIsFull tx:
+        return false
+    let meta: hrt_ring.HrtRingMeta* = tx.meta
+    let tail: int32 = meta->tail
+    var slot: HrtNetSlot* = hrtNetSlotPtr(tx.slots, tail)
+    *outSlot = slot
+    return true
+
+fn hrtNetTxCommit(queue: var HrtNetQueue) =
+    let tx: hrt_ring.HrtRingView = queue.tx
+    if tx.meta == nil:
+        return
+    if hrtNetRingIsFull tx:
+        return
+    let meta: hrt_ring.HrtRingMeta* = tx.meta
+    meta->tail = (meta->tail + 1) & meta->mask
+
+fn hrtNetRxCount(queue: HrtNetQueue): int32 =
+    return hrtNetRingCount queue.rx
+
+fn hrtNetTxFree(queue: HrtNetQueue): int32 =
+    let cap: int32 = hrtNetRingCapacity queue.tx
+    if cap <= 1:
+        return 0
+    let used: int32 = hrtNetRingCount queue.tx
+    let free: int32 = (cap - 1) - used
+    if free < 0:
+        return 0
+    return free

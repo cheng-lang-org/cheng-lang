@@ -1,0 +1,400 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import std/strings
+
+type
+    RouteEntryTmp =
+        file: str
+        path: str
+        weights: seq[int32]
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng route-manifest --root:<dir> [--out:<file>] [--exts:<list>]")
+    printLine("")
+    printLine("env:")
+    printLine("  CHENG_WEB_ROUTES_ROOT   root directory to scan")
+    printLine("  CHENG_WEB_ROUTES_OUT    output file path")
+    printLine("  CHENG_WEB_ROUTES_EXTS   comma list of extensions (default .cwc,.cheng)")
+
+fn hasPrefix(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    if len(prefix) > len(s):
+        return false
+    var i: int32 = 0
+    while i < len(prefix):
+        if charAt(s, i) != charAt(prefix, i):
+            return false
+        i = i + 1
+    return true
+
+fn normalizeExt(ext: str): str =
+    if ext == nil:
+        return ""
+    var out = strutil.strip(ext)
+    if len(out) == 0:
+        return ""
+    out = strutil.toLowerAscii(out)
+    if charAt(out, 0) != '.':
+        out = "." + out
+    return out
+
+fn parseExts(raw: str, fallback: str): seq[str] =
+    let text = if raw != nil && len(raw) > 0: raw else: fallback
+    let parts = strutil.split(text, ',')
+    var out: seq[str] = newSeq[str]()
+    var i: int32 = 0
+    while i < len(parts):
+        let ext = normalizeExt(parts[i])
+        if ext != nil && len(ext) > 0:
+            out.add(ext)
+        i = i + 1
+    if len(out) == 0:
+        out.add(".cwc")
+        out.add(".cheng")
+    return out
+
+fn isIgnoredSegment(seg: str): bool =
+    if seg == nil || len(seg) == 0:
+        return false
+    return seg == ".git" || seg == "node_modules" || seg == "chengcache" || seg == "dist" || seg == "build" || seg == "out" || seg == ".cache" || seg == ".idea" || seg == ".vscode" || seg == "tmp" || seg == "tmp_build"
+
+fn shouldIgnorePath(relPath: str): bool =
+    if relPath == nil || len(relPath) == 0:
+        return false
+    let parts = strutil.split(relPath, '/')
+    var i: int32 = 0
+    while i < len(parts):
+        let subparts = strutil.split(parts[i], '\\')
+        var j: int32 = 0
+        while j < len(subparts):
+            if isIgnoredSegment(subparts[j]):
+                return true
+            j = j + 1
+        i = i + 1
+    return false
+
+fn startsWithDot(name: str): bool =
+    return name != nil && len(name) > 0 && charAt(name, 0) == '.'
+
+fn extMatches(path: str, exts: seq[str]): bool =
+    let parts = os.splitFile(path)
+    var ext = parts.ext
+    if ext == nil:
+        ext = ""
+    ext = strutil.toLowerAscii(ext)
+    var i: int32 = 0
+    while i < len(exts):
+        if ext == exts[i]:
+            return true
+        i = i + 1
+    return false
+
+fn normalizeSlashes(path: str): str =
+    if path == nil:
+        return ""
+    var out: str = ""
+    var i: int32 = 0
+    while i < len(path):
+        var c = charAt(path, i)
+        if c == '\\':
+            c = '/'
+        out = out + c
+        i = i + 1
+    return out
+
+fn isPathPrefix(path: str, prefix: str): bool =
+    if path == nil || prefix == nil:
+        return false
+    let p = normalizeSlashes(path)
+    let pre = normalizeSlashes(prefix)
+    if len(pre) == 0 || len(p) < len(pre):
+        return false
+    var i: int32 = 0
+    while i < len(pre):
+        if charAt(p, i) != charAt(pre, i):
+            return false
+        i = i + 1
+    if len(p) == len(pre):
+        return true
+    let next = charAt(p, len(pre))
+    return next == '/'
+
+fn walkRoutes(root: str, rel: str, out: seq[str]*, exts: seq[str], excludeRel: str) =
+    let dirPath = if rel == nil || len(rel) == 0: root else: os.joinPath(root, rel)
+    let items = os.walkDir(dirPath)
+    var i: int32 = 0
+    while i < items.len:
+        let entry = os.os_get_WalkDirEntry(items, i)
+        let fullPath = entry.path
+        let name = os.extractFilename(fullPath)
+        if startsWithDot(name) && name != ".github":
+            i = i + 1
+            continue
+        let nextRel = if rel == nil || len(rel) == 0: name else: rel + "/" + name
+        if shouldIgnorePath(nextRel):
+            i = i + 1
+            continue
+        if excludeRel != nil && len(excludeRel) > 0 && normalizeSlashes(nextRel) == excludeRel:
+            i = i + 1
+            continue
+        if entry.kind == os.pcDir || entry.kind == os.pcLinkToDir:
+            walkRoutes(root, nextRel, out, exts, excludeRel)
+        elif entry.kind == os.pcFile || entry.kind == os.pcLinkToFile:
+            if extMatches(name, exts):
+                out->add(nextRel)
+        i = i + 1
+
+fn stripSuffix(name: str, suffix: str): str =
+    if name == nil || suffix == nil:
+        return name
+    let nLen: int32 = len(name)
+    let sLen: int32 = len(suffix)
+    if sLen == 0 || nLen < sLen:
+        return name
+    let tail = substr(name, nLen - sLen, sLen)
+    if strutil.toLowerAscii(tail) == strutil.toLowerAscii(suffix):
+        return substr(name, 0, nLen - sLen)
+    return name
+
+fn endsWith(s: str, suffix: str): bool =
+    if s == nil || suffix == nil:
+        return false
+    let sLen: int32 = len(s)
+    let pLen: int32 = len(suffix)
+    if pLen == 0 || sLen < pLen:
+        return false
+    var i: int32 = 0
+    while i < pLen:
+        if charAt(s, sLen - pLen + i) != charAt(suffix, i):
+            return false
+        i = i + 1
+    return true
+
+fn filePathToRoute(relPath: str): str =
+    if relPath == nil || len(relPath) == 0:
+        return "/"
+    var p = normalizeSlashes(relPath)
+    p = stripSuffix(p, ".cwc")
+    p = stripSuffix(p, ".cheng")
+    if endsWith(p, "/index"):
+        p = substr(p, 0, len(p) - len("/index"))
+    elif p == "index":
+        p = ""
+    if len(p) == 0:
+        return "/"
+    if charAt(p, 0) != '/':
+        p = "/" + p
+    return p
+
+fn splitPathParts(path: str): seq[str] =
+    var out: seq[str] = newSeq[str]()
+    if path == nil:
+        return out
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= len(path):
+        if i == len(path) || charAt(path, i) == '/':
+            if i > start:
+                out.add(substr(path, start, i - start))
+            start = i + 1
+        i = i + 1
+    return out
+
+fn pathWeights(routePath: str): seq[int32] =
+    let parts = splitPathParts(routePath)
+    var out: seq[int32] = newSeq[int32]()
+    var i: int32 = 0
+    while i < len(parts):
+        let part = parts[i]
+        if hasPrefix(part, "[..."):
+            out.add(1)
+        elif hasPrefix(part, "["):
+            out.add(2)
+        else:
+            out.add(3)
+        i = i + 1
+    return out
+
+fn compareRoutes(a: RouteEntryTmp, b: RouteEntryTmp): int32 =
+    let maxLen = if len(a.weights) > len(b.weights): len(a.weights) else: len(b.weights)
+    var i: int32 = 0
+    while i < maxLen:
+        let ai = if i < len(a.weights): a.weights[i] else: 0
+        let bi = if i < len(b.weights): b.weights[i] else: 0
+        if ai != bi:
+            return bi - ai
+        i = i + 1
+    if len(a.weights) != len(b.weights):
+        return len(b.weights) - len(a.weights)
+    return cmp(a.path, b.path)
+
+fn sortRoutes(entries: var seq[RouteEntryTmp]) =
+    var i: int32 = 0
+    while i < len(entries):
+        var j: int32 = i + 1
+        while j < len(entries):
+            if compareRoutes(entries[j], entries[i]) < 0:
+                let tmp = entries[i]
+                entries[i] = entries[j]
+                entries[j] = tmp
+            j = j + 1
+        i = i + 1
+
+fn escapeString(text: str): str =
+    if text == nil:
+        return ""
+    var out: str = ""
+    var i: int32 = 0
+    while i < len(text):
+        let c = charAt(text, i)
+        if c == '\\' || c == '"':
+            out = out + "\\"
+        out = out + c
+        i = i + 1
+    return out
+
+fn renderManifest(entries: seq[RouteEntryTmp]): str =
+    var lines: seq[str] = newSeq[str]()
+    lines.add("# Generated by cheng route-manifest. DO NOT EDIT.")
+    lines.add("import cheng / web / router / router")
+    lines.add("")
+    lines.add("fn routeEntries(): seq[RouteEntry] =")
+    lines.add("    var out: seq[RouteEntry] = newSeq[RouteEntry]()")
+    lines.add("    var entry: RouteEntry")
+    var i: int32 = 0
+    while i < len(entries):
+        let entry = entries[i]
+        lines.add("    entry.id = " + intToStr(i + 1))
+        lines.add("    entry.path = \"" + escapeString(entry.path) + "\"")
+        lines.add("    entry.file = \"" + escapeString(entry.file) + "\"")
+        lines.add("    out.add(entry)")
+        i = i + 1
+    lines.add("    return out")
+    lines.add("")
+    lines.add("fn buildRoutes(): seq[Route] =")
+    lines.add("    let entries = routeEntries()")
+    lines.add("    var out: seq[Route] = newSeq[Route]()")
+    lines.add("    var i: int32 = 0")
+    lines.add("    while i < len(entries):")
+    lines.add("        let entry = entries[i]")
+    lines.add("        out.add(newRoute(entry.id, entry.path))")
+    lines.add("        i = i + 1")
+    lines.add("    return out")
+    lines.add("")
+    lines.add("fn routeFile(entries: seq[RouteEntry], id: int32): str =")
+    lines.add("    var i: int32 = 0")
+    lines.add("    while i < len(entries):")
+    lines.add("        let entry = entries[i]")
+    lines.add("        if entry.id == id:")
+    lines.add("            return entry.file")
+    lines.add("        i = i + 1")
+    lines.add("    return \"\"")
+    lines.add("")
+    return strutil.join(lines, "\n") + "\n"
+
+fn createDirAll(path: str) =
+    if path == nil || len(path) == 0:
+        return
+    if os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if parent != nil && len(parent) > 0 && parent != path && ! os.dirExists(parent):
+        createDirAll(parent)
+    if ! os.dirExists(path):
+        os.createDir(path)
+
+fn generateRouteManifest(root: str, outPath: str, exts: seq[str]): str =
+    if root == nil || len(root) == 0:
+        return "root not found"
+    if ! os.dirExists(root):
+        return "root not found: " + root
+    var excludeRel: str = ""
+    if outPath != nil && len(outPath) > 0 && isPathPrefix(outPath, root):
+        excludeRel = normalizeSlashes(os.relativePath(outPath, root))
+    var files: seq[str] = newSeq[str]()
+    walkRoutes(root, "", &files, exts, excludeRel)
+    var enriched: seq[RouteEntryTmp] = newSeq[RouteEntryTmp]()
+    var i: int32 = 0
+    while i < len(files):
+        let file = normalizeSlashes(files[i])
+        let routePath = filePathToRoute(file)
+        var entry: RouteEntryTmp
+        entry.file = file
+        entry.path = routePath
+        entry.weights = pathWeights(routePath)
+        enriched.add(entry)
+        i = i + 1
+    sortRoutes(enriched)
+    let content = renderManifest(enriched)
+    let outDir = os.parentDir(outPath)
+    if outDir != nil && len(outDir) > 0:
+        createDirAll(outDir)
+    os.writeFile(outPath, content)
+    return ""
+
+fn collectArgsFromCmdline(): seq[str] =
+    var out: seq[str] = newSeq[str]()
+    let count: int32 = cmdline.paramCount()
+    var i: int32 = 0
+    while i < count:
+        out.add(cmdline.paramStr(i + 1))
+        i = i + 1
+    return out
+
+fn runRouteManifestArgs(args: seq[str]): int32 =
+    var root: str = ""
+    var outPath: str = ""
+    var extsRaw: str = ""
+    var i: int32 = 0
+    while i < len(args):
+        let arg = args[i]
+        if arg == "--help" || arg == "-h":
+            printUsage()
+            return 0
+        if hasPrefix(arg, "--root:"):
+            root = substr(arg, len("--root:"), len(arg) - len("--root:"))
+        elif hasPrefix(arg, "--out:"):
+            outPath = substr(arg, len("--out:"), len(arg) - len("--out:"))
+        elif hasPrefix(arg, "--exts:"):
+            extsRaw = substr(arg, len("--exts:"), len(arg) - len("--exts:"))
+        else:
+            printErr("unknown arg: " + arg)
+            printUsage()
+            return 1
+        i = i + 1
+    if len(root) == 0:
+        root = os.getEnv("CHENG_WEB_ROUTES_ROOT")
+    if len(outPath) == 0:
+        outPath = os.getEnv("CHENG_WEB_ROUTES_OUT")
+    if len(extsRaw) == 0:
+        extsRaw = os.getEnv("CHENG_WEB_ROUTES_EXTS")
+    if len(root) == 0:
+        printErr("root not found, pass --root or CHENG_WEB_ROUTES_ROOT")
+        printUsage()
+        return 1
+    let rootAbs = os.absolutePath(root)
+    var outAbs = outPath
+    if len(outAbs) == 0:
+        outAbs = os.joinPath(rootAbs, "routes_manifest.cheng")
+    elif ! os.isAbsolute(outAbs):
+        outAbs = os.absolutePath(outAbs)
+    let exts = parseExts(extsRaw, ".cwc,.cheng")
+    let err = generateRouteManifest(rootAbs, outAbs, exts)
+    if err != nil && len(err) > 0:
+        printErr("route manifest failed: " + err)
+        return 1
+    printLine("route manifest ok: " + outAbs)
+    return 0
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let args = collectArgsFromCmdline()
+    return runRouteManifestArgs(args)

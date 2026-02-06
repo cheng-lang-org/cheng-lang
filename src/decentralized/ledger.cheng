@@ -1,0 +1,273 @@
+import std/os
+import cheng/runtime/json_ast as json
+import std/strings
+import cheng/decentralized/lease as dlease
+import cheng/decentralized/metering as dmeter
+import cheng/decentralized/audit as daudit
+import cheng/decentralized/audit_sampling as dsample
+import cheng/decentralized/exec_request as dexec
+import cheng/decentralized/exec_receipt as dreceipt
+import cheng/decentralized/fraud_report as dfraud
+import cheng/decentralized/storage_proof as dproof
+
+@importc("cheng_fopen")
+fn c_fopen_ledger(filename, mode: cstring): os.File
+
+fn openAppend(path: str): os.File =
+    return c_fopen_ledger(path, "a")
+
+fn appendLine(path: str, line: str): bool =
+    let f = openAppend(path)
+    if f == nil:
+        return false
+    os.writeLine(f, line)
+    os.close(f)
+    return true
+
+fn ensureParent(path: str) =
+    let dir = os.parentDir(path)
+    if dir == nil || len(dir) == 0:
+        return
+    if os.dirExists(dir):
+        return
+    os.createDir(dir)
+
+fn leaseToJson(lease: dlease.Lease, cost: dlease.LeaseCost, mode: str): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("lease")
+    if mode != nil && len(mode) > 0:
+        node["mode"] = json.newJString(mode)
+    node["lease_id"] = json.newJString(lease.leaseId)
+    node["package_id"] = json.newJString(lease.packageId)
+    node["author_id"] = json.newJString(lease.authorId)
+    node["provider_id"] = json.newJString(lease.providerId)
+    node["bytes"] = json.newJInt(lease.bytes)
+    node["duration_days"] = json.newJInt(lease.durationDays)
+    node["replicas"] = json.newJInt(lease.replicas)
+    node["price_per_gb_month"] = json.newJFloat(lease.pricePerGbMonth)
+    node["royalty_rate"] = json.newJFloat(lease.royaltyRate)
+    node["treasury_rate"] = json.newJFloat(lease.treasuryRate)
+    node["start_ts"] = json.newJString(lease.startTs)
+    node["storage_cost"] = json.newJFloat(cost.storageCost)
+    node["royalty"] = json.newJFloat(cost.royalty)
+    node["treasury"] = json.newJFloat(cost.treasury)
+    node["provider"] = json.newJFloat(cost.provider)
+    node
+
+fn computeToJson(usage: dmeter.ComputeUsage, cost: dmeter.ComputeCost, mode: str): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("compute")
+    if mode != nil && len(mode) > 0:
+        node["mode"] = json.newJString(mode)
+    node["usage_id"] = json.newJString(usage.usageId)
+    node["task_id"] = json.newJString(usage.taskId)
+    node["package_id"] = json.newJString(usage.packageId)
+    node["author_id"] = json.newJString(usage.authorId)
+    node["executor_id"] = json.newJString(usage.executorId)
+    node["cpu_ms"] = json.newJInt(usage.cpuMs)
+    node["mem_bytes"] = json.newJInt(usage.memBytes)
+    node["io_bytes"] = json.newJInt(usage.ioBytes)
+    node["gpu_ms"] = json.newJInt(usage.gpuMs)
+    node["gpu_mem_bytes"] = json.newJInt(usage.gpuMemBytes)
+    node["gpu_count"] = json.newJInt(int64(usage.gpuCount))
+    if usage.gpuType != nil && len(usage.gpuType) > 0:
+        node["gpu_type"] = json.newJString(usage.gpuType)
+    if usage.workloadKind != nil && len(usage.workloadKind) > 0:
+        node["workload_kind"] = json.newJString(usage.workloadKind)
+    node["price_cpu_ms"] = json.newJFloat(usage.priceCpuMs)
+    node["price_mem_gb"] = json.newJFloat(usage.priceMemGb)
+    node["price_io_gb"] = json.newJFloat(usage.priceIoGb)
+    node["price_gpu_ms"] = json.newJFloat(usage.priceGpuMs)
+    node["price_gpu_mem_gb"] = json.newJFloat(usage.priceGpuMemGb)
+    node["royalty_rate"] = json.newJFloat(usage.royaltyRate)
+    node["treasury_rate"] = json.newJFloat(usage.treasuryRate)
+    node["epoch"] = json.newJInt(usage.epoch)
+    node["start_ts"] = json.newJString(usage.startTs)
+    node["total"] = json.newJFloat(cost.total)
+    node["royalty"] = json.newJFloat(cost.royalty)
+    node["treasury"] = json.newJFloat(cost.treasury)
+    node["executor"] = json.newJFloat(cost.executor)
+    node
+
+fn auditToJson(ev: daudit.AuditEvent): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("audit")
+    node["audit_id"] = json.newJString(ev.auditId)
+    node["task_id"] = json.newJString(ev.taskId)
+    node["executor_id"] = json.newJString(ev.executorId)
+    node["auditor_id"] = json.newJString(ev.auditorId)
+    node["result_cid"] = json.newJString(ev.resultCid)
+    node["status"] = json.newJString(ev.status)
+    node["penalty"] = json.newJFloat(ev.penalty)
+    node["epoch"] = json.newJInt(ev.epoch)
+    node["note"] = json.newJString(ev.note)
+    node["ts"] = json.newJString(ev.ts)
+    node
+
+fn auditSampleToJson(ev: dsample.AuditSample): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("audit_sample")
+    node["sample_id"] = json.newJString(ev.sampleId)
+    node["receipt_id"] = json.newJString(ev.receiptId)
+    node["request_id"] = json.newJString(ev.requestId)
+    node["task_id"] = json.newJString(ev.taskId)
+    node["executor_id"] = json.newJString(ev.executorId)
+    node["result_cid"] = json.newJString(ev.resultCid)
+    node["status"] = json.newJString(ev.status)
+    node["auditor_id"] = json.newJString(ev.auditorId)
+    node["epoch"] = json.newJInt(ev.epoch)
+    node["rate_bps"] = json.newJInt(ev.rateBps)
+    node["seed"] = json.newJString(ev.seed)
+    node["ts"] = json.newJString(ev.ts)
+    node
+
+fn fraudReportToJson(ev: dfraud.FraudReport): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("fraud_report")
+    node["report_id"] = json.newJString(ev.reportId)
+    node["task_id"] = json.newJString(ev.taskId)
+    node["request_id"] = json.newJString(ev.requestId)
+    node["receipt_id"] = json.newJString(ev.receiptId)
+    node["executor_id"] = json.newJString(ev.executorId)
+    node["reporter_id"] = json.newJString(ev.reporterId)
+    node["reason"] = json.newJString(ev.reason)
+    node["evidence_cid"] = json.newJString(ev.evidenceCid)
+    node["severity"] = json.newJString(ev.severity)
+    node["epoch"] = json.newJInt(ev.epoch)
+    node["ts"] = json.newJString(ev.ts)
+    node
+
+fn storageProofToJson(ev: dproof.StorageProof): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("storage_proof")
+    node["proof_id"] = json.newJString(ev.proofId)
+    node["provider_id"] = json.newJString(ev.providerId)
+    if ev.packageId != nil && len(ev.packageId) > 0:
+        node["package_id"] = json.newJString(ev.packageId)
+    node["cid"] = json.newJString(ev.cidText)
+    node["bytes"] = json.newJInt(ev.bytes)
+    node["status"] = json.newJString(ev.status)
+    if ev.proofHash != nil && len(ev.proofHash) > 0:
+        node["proof_hash"] = json.newJString(ev.proofHash)
+    node["epoch"] = json.newJInt(ev.epoch)
+    if ev.note != nil && len(ev.note) > 0:
+        node["note"] = json.newJString(ev.note)
+    node["ts"] = json.newJString(ev.ts)
+    node
+
+fn execRequestToJson(req: dexec.ExecRequest, mode: str): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("exec_request")
+    if mode != nil && len(mode) > 0:
+        node["mode"] = json.newJString(mode)
+    node["request_id"] = json.newJString(req.requestId)
+    node["task_id"] = json.newJString(req.taskId)
+    node["package_id"] = json.newJString(req.packageId)
+    node["author_id"] = json.newJString(req.authorId)
+    node["requester_id"] = json.newJString(req.requesterId)
+    node["input_cid"] = json.newJString(req.inputCid)
+    node["code_cid"] = json.newJString(req.codeCid)
+    node["args_cid"] = json.newJString(req.argsCid)
+    node["max_cpu_ms"] = json.newJInt(req.maxCpuMs)
+    node["max_mem_bytes"] = json.newJInt(req.maxMemBytes)
+    node["max_io_bytes"] = json.newJInt(req.maxIoBytes)
+    node["max_gpu_ms"] = json.newJInt(req.maxGpuMs)
+    node["max_gpu_mem_bytes"] = json.newJInt(req.maxGpuMemBytes)
+    node["max_gpu_count"] = json.newJInt(int64(req.maxGpuCount))
+    if req.gpuType != nil && len(req.gpuType) > 0:
+        node["gpu_type"] = json.newJString(req.gpuType)
+    if req.workloadKind != nil && len(req.workloadKind) > 0:
+        node["workload_kind"] = json.newJString(req.workloadKind)
+    node["price_cpu_ms"] = json.newJFloat(req.priceCpuMs)
+    node["price_mem_gb"] = json.newJFloat(req.priceMemGb)
+    node["price_io_gb"] = json.newJFloat(req.priceIoGb)
+    node["price_gpu_ms"] = json.newJFloat(req.priceGpuMs)
+    node["price_gpu_mem_gb"] = json.newJFloat(req.priceGpuMemGb)
+    node["epoch"] = json.newJInt(req.epoch)
+    node["ts"] = json.newJString(req.ts)
+    node["signature"] = json.newJString(req.signature)
+    node
+
+fn execReceiptToJson(rec: dreceipt.ExecReceipt, mode: str): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("exec_receipt")
+    if mode != nil && len(mode) > 0:
+        node["mode"] = json.newJString(mode)
+    node["receipt_id"] = json.newJString(rec.receiptId)
+    node["request_id"] = json.newJString(rec.requestId)
+    node["task_id"] = json.newJString(rec.taskId)
+    node["executor_id"] = json.newJString(rec.executorId)
+    node["result_cid"] = json.newJString(rec.resultCid)
+    node["usage_id"] = json.newJString(rec.usageId)
+    node["status"] = json.newJString(rec.status)
+    node["error"] = json.newJString(rec.error)
+    node["proof_cid"] = json.newJString(rec.proofCid)
+    node["epoch"] = json.newJInt(rec.epoch)
+    node["ts"] = json.newJString(rec.ts)
+    node["signature"] = json.newJString(rec.signature)
+    node
+
+fn appendLeaseEventWithMode(ledgerPath: str, lease: dlease.Lease, cost: dlease.LeaseCost, mode: str): bool =
+    ensureParent(ledgerPath)
+    let node = leaseToJson(lease, cost, mode)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendLeaseEvent(ledgerPath: str, lease: dlease.Lease, cost: dlease.LeaseCost): bool =
+    return appendLeaseEventWithMode(ledgerPath, lease, cost, "")
+
+fn appendComputeEventWithMode(
+    ledgerPath: str,
+    usage: dmeter.ComputeUsage,
+    cost: dmeter.ComputeCost,
+    mode: str
+): bool =
+    ensureParent(ledgerPath)
+    let node = computeToJson(usage, cost, mode)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendComputeEvent(ledgerPath: str, usage: dmeter.ComputeUsage, cost: dmeter.ComputeCost): bool =
+    return appendComputeEventWithMode(ledgerPath, usage, cost, "")
+
+fn appendAuditEvent(ledgerPath: str, ev: daudit.AuditEvent): bool =
+    ensureParent(ledgerPath)
+    let node = auditToJson(ev)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendAuditSampleEvent(ledgerPath: str, ev: dsample.AuditSample): bool =
+    ensureParent(ledgerPath)
+    let node = auditSampleToJson(ev)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendFraudReportEvent(ledgerPath: str, ev: dfraud.FraudReport): bool =
+    ensureParent(ledgerPath)
+    let node = fraudReportToJson(ev)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendStorageProofEvent(ledgerPath: str, ev: dproof.StorageProof): bool =
+    ensureParent(ledgerPath)
+    let node = storageProofToJson(ev)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendExecRequestEventWithMode(ledgerPath: str, req: dexec.ExecRequest, mode: str): bool =
+    ensureParent(ledgerPath)
+    let node = execRequestToJson(req, mode)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendExecRequestEvent(ledgerPath: str, req: dexec.ExecRequest): bool =
+    return appendExecRequestEventWithMode(ledgerPath, req, "")
+
+fn appendExecReceiptEventWithMode(ledgerPath: str, rec: dreceipt.ExecReceipt, mode: str): bool =
+    ensureParent(ledgerPath)
+    let node = execReceiptToJson(rec, mode)
+    let line = json.pretty(node)
+    return appendLine(ledgerPath, line)
+
+fn appendExecReceiptEvent(ledgerPath: str, rec: dreceipt.ExecReceipt): bool =
+    return appendExecReceiptEventWithMode(ledgerPath, rec, "")

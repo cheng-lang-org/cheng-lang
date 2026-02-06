@@ -1,0 +1,369 @@
+# Minimal LIR types for backend MVP (AArch64-oriented).
+import std/seqs
+
+type
+    LirReg = enum
+        lrW0, lrW1, lrW2, lrW3, lrW4, lrW5, lrW6, lrW7, lrW8,
+        lrX0, lrX1, lrX2, lrX3, lrX4, lrX5, lrX6, lrX7, lrX8,
+        lrX16, lrX17,
+        lrX19, lrX29, lrX30,
+        lrSp,
+        lrD0, lrD1
+        # x86_64 (SysV) register set (MVP).
+        lrEax, lrEcx, lrEdx, lrEbx, lrEsi, lrEdi,
+        lrR8d, lrR9d, lrR10d, lrR11d, lrR12d, lrR13d, lrR14d, lrR15d,
+        lrRax, lrRcx, lrRdx, lrRbx, lrRsi, lrRdi, lrRbp,
+        lrR8, lrR9, lrR10, lrR11, lrR12, lrR13, lrR14, lrR15
+
+    LirCond = enum
+        lcEq, lcNe,
+        lcMi,
+        lcLt, lcLe, lcGt, lcGe,
+        lcLo, lcLs, lcHi, lcHs
+
+    LirOp = enum
+        loLabel,
+        loMovImm,
+        loMovReg,
+        loSxtw,
+        loAdrp, loAddPageOff,
+        loAdd, loSub, loMul, loSdiv, loUdiv, loMsub,
+        loAnd, loOrr, loEor, loLsl, loLsr, loAsr,
+        loCmp,
+        loBCond, loB,
+        loBl,
+        loBlr,
+        loFmovDx, loFmovXd,
+        loFaddD, loFsubD, loFmulD, loFdivD, loFnegD, loFcmpD,
+        loScvtfDx,
+        loSvc,
+        loRet,
+        loStr, loLdr,
+        loStrb, loLdrb, loLdrsb,
+        loStrh, loLdrh, loLdrsh,
+        loSubSp, loAddSp
+
+    LirInst = ref
+        op: LirOp
+        rd: LirReg
+        rn: LirReg
+        rm: LirReg
+        ra: LirReg
+        imm: int64
+        label: str
+        cond: LirCond
+
+    LirFunc = ref
+        name: str
+        insts: seq[LirInst]
+
+    LirCString =
+        label: str
+        value: str
+
+    LirGlobal =
+        name: str
+        size: int32
+        alignPow2: int32
+        init: int64
+        hasInit: bool
+
+    LirModule = ref
+        target: str
+        funcs: seq[LirFunc]
+        cstrs: seq[LirCString]
+        globals: seq[LirGlobal]
+
+fn lirNewFunc(name: str): LirFunc =
+    var f: LirFunc
+    new f
+    f.name = name
+    f.insts = newSeq[LirInst]()
+    return f
+
+fn lirAddInst(func: LirFunc, inst: LirInst) =
+    addPtr[LirInst](&func.insts, inst)
+
+fn lirNewModule(): LirModule =
+    var m: LirModule
+    new m
+    m.target = ""
+    m.funcs = newSeq[LirFunc]()
+    m.cstrs = newSeq[LirCString]()
+    m.globals = newSeq[LirGlobal]()
+    return m
+
+fn lirAddFunc(module: LirModule, func: LirFunc) =
+    addPtr[LirFunc](&module.funcs, func)
+
+fn lirAddCString(module: LirModule, label: str, value: str) =
+    if module == nil:
+        return
+    var c: LirCString
+    c.label = label
+    c.value = value
+    addPtr[LirCString](&module.cstrs, c)
+
+fn lirAddGlobal(module: LirModule, name: str, size: int32, alignPow2: int32,
+                init: int64, hasInit: bool) =
+    if module == nil:
+        return
+    var g: LirGlobal
+    g.name = name
+    g.size = size
+    g.alignPow2 = alignPow2
+    g.init = init
+    g.hasInit = hasInit
+    addPtr[LirGlobal](&module.globals, g)
+
+fn lirLabel(name: str): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loLabel
+    inst.label = name
+    return inst
+
+fn lirMovImm(reg: LirReg, imm: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loMovImm
+    inst.rd = reg
+    inst.imm = imm
+    return inst
+
+fn lirMovReg(rd: LirReg, rn: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loMovReg
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn lirSxtw(rd: LirReg, rn: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loSxtw
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn lirAdrp(rd: LirReg, label: str): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loAdrp
+    inst.rd = rd
+    inst.label = label
+    return inst
+
+fn lirAddPageOff(rd: LirReg, rn: LirReg, label: str): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loAddPageOff
+    inst.rd = rd
+    inst.rn = rn
+    inst.label = label
+    return inst
+
+fn lirBin(op: LirOp, rd: LirReg, rn: LirReg, rm: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = op
+    inst.rd = rd
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn lirMsub(rd: LirReg, rn: LirReg, rm: LirReg, ra: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loMsub
+    inst.rd = rd
+    inst.rn = rn
+    inst.rm = rm
+    inst.ra = ra
+    return inst
+
+fn lirCmp(rn: LirReg, rm: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loCmp
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn lirBCond(cond: LirCond, label: str): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loBCond
+    inst.cond = cond
+    inst.label = label
+    return inst
+
+fn lirB(label: str): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loB
+    inst.label = label
+    return inst
+
+fn lirBl(label: str): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loBl
+    inst.label = label
+    return inst
+
+fn lirBlr(reg: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loBlr
+    inst.rn = reg
+    return inst
+
+fn lirFmovDx(rd: LirReg, rn: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loFmovDx
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn lirFmovXd(rd: LirReg, rn: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loFmovXd
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn lirFbin(op: LirOp, rd: LirReg, rn: LirReg, rm: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = op
+    inst.rd = rd
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn lirFcmpD(rn: LirReg, rm: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loFcmpD
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn lirFnegD(rd: LirReg, rn: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loFnegD
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn lirScvtfDx(rd: LirReg, rn: LirReg): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loScvtfDx
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn lirSvc(imm: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loSvc
+    inst.imm = imm
+    return inst
+
+fn lirRet(): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loRet
+    return inst
+
+fn lirStrb(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loStrb
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirLdrb(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loLdrb
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirLdrsb(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loLdrsb
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirStrh(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loStrh
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirLdrh(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loLdrh
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirLdrsh(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loLdrsh
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirStr(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loStr
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirLdr(rd: LirReg, base: LirReg, offset: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loLdr
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn lirSubSp(amount: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loSubSp
+    inst.imm = amount
+    return inst
+
+fn lirAddSp(amount: int64): LirInst =
+    var inst: LirInst
+    new inst
+    inst.op = loAddSp
+    inst.imm = amount
+    return inst

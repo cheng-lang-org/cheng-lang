@@ -1,0 +1,2463 @@
+fn cgenIsNoopExprStmt(n: Node): bool =
+    if n == nil:
+        return true
+    case n.kind
+    of nkIntLit, nkFloatLit, nkBoolLit, nkNilLit, nkCharLit, nkStrLit:
+        return true
+    of nkPar:
+        if kidCount n == 1:
+            return cgenIsNoopExprStmt(kid(n, 0))
+        return true
+    else:
+        return false
+
+fn resolveCallNameImplWithSig(callNode: Node, baseName: str, sigIdx: int32): str =
+    if callNode == nil || kidCount callNode == 0:
+        return ""
+    if strIsEmpty baseName:
+        return ""
+    let imp: str = importMapGet baseName
+    if !strIsEmpty imp:
+        var sigLocal: int32 = sigIdx
+        if sigLocal < 0:
+            sigLocal = cgenFindFnSigIndexForCall callNode
+        if sigLocal >= 0 && sigLocal < cFnSigImportcNames.len:
+            if cFnSigIsVarargs sigLocal:
+                return cgenImportcVarargsWrapperName imp
+        return imp
+    var sigBase: str = baseName
+    let bracketPrefix: str = cgenCallBracketPrefix(callNode, baseName)
+    if !strIsEmpty bracketPrefix:
+        sigBase = bracketPrefix
+    var sigLocal2: int32 = sigIdx
+    if sigLocal2 < 0:
+        sigLocal2 = cgenFindFnSigIndexForCall callNode
+    if sigLocal2 >= 0 && sigLocal2 < cFnSigImportcNames.len:
+        let imp2: str = get[str](cFnSigImportcNames, sigLocal2)
+        if !strIsEmpty imp2:
+            if cFnSigIsVarargs sigLocal2:
+                return cgenImportcVarargsWrapperName imp2
+            return imp2
+        let nm: str = cFnSigName sigLocal2
+        if !strIsEmpty nm:
+            return mangleCName nm
+    if !streq(sigBase, baseName):
+        return mangleCName sigBase
+    return mangleCName baseName
+
+fn resolveCallNameImpl(callNode: Node): str =
+    if callNode == nil || kidCount callNode == 0:
+        return ""
+    let baseName: str = cgenCallBaseName callNode
+    return resolveCallNameImplWithSig(callNode, baseName, -1)
+
+fn resolveCallNameWithSig(callNode: Node, baseName: str, sigIdx: int32): str =
+    if callNode == nil:
+        return ""
+    var cached: bool = false
+    let idx: int32 = hashmaps.hashMapPtrIntGet(cgenCallNameIndex, void*(callNode), &cached)
+    if cached:
+        if idx <= 0:
+            return ""
+        return get[str](cgenCallNameValues, idx - 1)
+    let name: str = resolveCallNameImplWithSig(callNode, baseName, sigIdx)
+    addPtr[str](&cgenCallNameValues, name)
+    let storedIdx: int32 = cgenCallNameValues.len
+    hashmaps.hashMapPtrIntPut(&cgenCallNameIndex, void*(callNode), storedIdx)
+    return name
+
+fn resolveCallName(callNode: Node): str =
+    if callNode == nil:
+        return ""
+    let baseName: str = cgenCallBaseName callNode
+    return resolveCallNameWithSig(callNode, baseName, -1)
+
+fn cgenEmitArgBySig(w: CWriter*, argVal: Node, expected: Node, defNode: Node, expectedIsVarRef: bool,
+                    expectedIsRefLike: bool, expKey: str) =
+    if argVal != nil:
+        var needsAddr: bool = expectedIsVarRef
+        var needsDeref: bool = false
+        var argType: Node = nil
+        var argIsRefLike: bool = false
+        var argCore: Node = argVal
+        while argCore != nil && argCore.kind == nkPar && kidCount(argCore) == 1:
+            argCore = kid(argCore, 0)
+        if needsAddr && argCore.kind == nkPrefix && streq(prefixOp(argCore), "&"):
+            needsAddr = false
+        if argVal.kind == nkIdent || argVal.kind == nkSymbol:
+            let nm: str = cgenStripSpaces argVal.ident
+            argType = lookupVarType nm
+            if argType != nil:
+                argIsRefLike = typeIsRefLike argType
+                if needsAddr && typeIsVarRef(argType):
+                    needsAddr = false
+        if argType == nil:
+            argType = cgenInferSimpleTypeCached argVal
+            if argType != nil:
+                argIsRefLike = typeIsRefLike argType
+        # If the callee expects a `var T` (address), but the argument already has type `ptr/ref T`,
+        # then passing the pointer value is correct; taking an extra address would produce `T**`.
+        if needsAddr && argType != nil:
+            let argCur: Node = unwrapParType argType
+            if argCur != nil && (argCur.kind == nkPtrTy || argCur.kind == nkRefTy) && kidCount(argCur) > 0:
+                let expBase: Node = stripVarType expected
+                let argBase: Node = stripVarType kid(argCur, 0)
+                if expBase != nil && argBase != nil:
+                    let expBaseKey: str = cgenTypeKey expBase
+                    let argBaseKey: str = cgenTypeKey argBase
+                    if !strIsEmpty(expBaseKey) && !strIsEmpty(argBaseKey) && streq(expBaseKey, argBaseKey):
+                        needsAddr = false
+        if ! needsAddr && ! expectedIsRefLike && argType != nil && argIsRefLike:
+            var baseTy: Node = stripVarType argType
+            if baseTy != nil && (baseTy.kind == nkPtrTy || baseTy.kind == nkRefTy):
+                if kidCount baseTy > 0:
+                    baseTy = stripVarType kid(baseTy, 0)
+            if !strIsEmpty expKey:
+                let baseKey: str = cgenTypeKey baseTy
+                if !strIsEmpty(baseKey) && streq(baseKey, expKey):
+                    needsDeref = true
+        if needsAddr:
+            cwWrite(w, "(&")
+            cgenEmitExpr(w, argVal)
+            cwWrite(w, ")")
+        elif needsDeref:
+            cwWrite(w, "(*")
+            cgenEmitExpr(w, argVal)
+            cwWrite(w, ")")
+        else:
+            cgenEmitExpr(w, argVal)
+    else:
+        if defNode != nil && defNode.kind != nkEmpty:
+            cgenEmitExpr(w, defNode)
+        else:
+            cgenEmitDefaultValue(w, expected)
+
+fn cgenEmitCallArgsBySig(w: CWriter*, sigIdx: int32, callNode: Node) =
+    if w == nil || callNode == nil:
+        return
+    if sigIdx < 0 || sigIdx >= cFnSigParamCounts.len:
+        return
+    let off: int32 = get[int32](cFnSigParamOffsets, sigIdx)
+    let count: int32 = get[int32](cFnSigParamCounts, sigIdx)
+    let kids: seq[void*] = callNode.kids
+    let kidsCount: int32 = kids.len
+    let posCountFull: int32 = kidsCount - 1
+    let isVarargs: bool = cFnSigIsVarargs sigIdx
+    let varargType: Node = cFnSigVarargType sigIdx
+    var hasNamed: bool = false
+    var posCountTrim: int32 = posCountFull
+    if posCountFull > 0:
+        let lastArg: Node = Node(get[void*](kids, posCountFull))
+        if lastArg != nil && (lastArg.kind == nkCall || lastArg.kind == nkBracketExpr):
+            if isDefaultMarkerArg(lastArg):
+                posCountTrim = callPosCountTrimmed(callNode)
+    var ai0: int32 = 1
+    while ai0 < kidsCount:
+        let argNode0: Node = Node(get[void*](kids, ai0))
+        if argNode0 != nil && argNode0.kind == nkCallArg:
+            let argKids: seq[void*] = argNode0.kids
+            if argKids.len > 1:
+                hasNamed = true
+                break
+        ai0 = ai0 + 1
+    if ! hasNamed:
+        var i0: int32 = 0
+        while i0 < count:
+            let expected: Node = Node(get[void*](cFnSigParamTypes, off + i0))
+            let expectedIsVarRef: bool = get[bool](cFnSigParamIsVarRef, off + i0)
+            let expectedIsRefLike: bool = get[bool](cFnSigParamIsRefLike, off + i0)
+            let expKey: str = get[str](cFnSigParamTypeKeys, off + i0)
+            var argVal: Node = nil
+            if i0 < posCountTrim:
+                argVal = cgenCallArgValue Node(get[void*](kids, i0 + 1))
+            let defNode: Node = Node(get[void*](cFnSigDefaultNodes, off + i0))
+            cgenEmitArgBySig(w, argVal, expected, defNode, expectedIsVarRef, expectedIsRefLike, expKey)
+            if i0 + 1 < count || (isVarargs && posCountTrim > count):
+                cwWrite(w, ", ")
+            i0 = i0 + 1
+        if isVarargs && posCountTrim > count:
+            var j0: int32 = count
+            while j0 < posCountTrim:
+                let argVal2: Node = cgenCallArgValue Node(get[void*](kids, j0 + 1))
+                if varargType != nil && argVal2 != nil:
+                    let argType: Node = cgenInferSimpleTypeCached argVal2
+                    if argType != nil:
+                        let argKey: str = cgenTypeKey argType
+                        let expKey2: str = cgenTypeKey varargType
+                        if !strIsEmpty(argKey) && !strIsEmpty(expKey2) && ! typeKeyCompatible(argKey, expKey2):
+                            cgenAddError(argVal2.pos, "[C-Profile] not-mapped: varargs argument type mismatch (FULLC.F02). hint: cast to element type.")
+                    else:
+                        if ! cgenVarargsElemAllowed(varargType):
+                            cgenAddError(argVal2.pos, "[C-Profile] not-mapped: varargs argument type unsupported (FULLC.F02). hint: use scalar/pointer or cast.")
+                else:
+                    if argVal2 != nil:
+                        let argType2: Node = cgenInferSimpleTypeCached argVal2
+                        if argType2 != nil && ! cgenVarargsElemAllowed(argType2):
+                            cgenAddError(argVal2.pos, "[C-Profile] not-mapped: varargs argument type unsupported (FULLC.F02). hint: use scalar/pointer or cast.")
+                if argVal2 != nil:
+                    cgenEmitExpr(w, argVal2)
+                else:
+                    cwWrite(w, "0")
+                if j0 + 1 < posCountTrim:
+                    cwWrite(w, ", ")
+                j0 = j0 + 1
+        return
+    var argVals: seq[Node] = newSeqWithCap[Node](count, count)
+    var varargVals: seq[Node] = newSeqWithCap[Node](0, 4)
+    var posSeen: int32 = 0
+    var ai: int32 = 1
+    while ai < kidsCount:
+        let argNode: Node = Node(get[void*](kids, ai))
+        if argNode != nil && argNode.kind == nkCallArg:
+            let argKids: seq[void*] = argNode.kids
+            if argKids.len > 1:
+                let nameNode: Node = Node(get[void*](argKids, 0))
+                let valNode: Node = Node(get[void*](argKids, 1))
+                let nm: str = cgenStripSpaces(plainName(nameNode))
+                var matched: bool = false
+                if !strIsEmpty nm:
+                    var found: bool = false
+                    cFnSigParamNameIndexEnsure()
+                    let key: str = intToStr(sigIdx) + ":" + nm
+                    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(cFnSigParamNameIndex, key, &found)
+                    if found && idxPlus1 > 0:
+                        let pi: int32 = idxPlus1 - 1
+                        if get[Node](argVals, pi) != nil:
+                            cgenAddError(argNode.pos, "Duplicate named argument: " + nm)
+                        else:
+                            setPtr[Node](&argVals, pi, valNode)
+                        matched = true
+                if ! matched:
+                    cgenAddError(argNode.pos, "Named argument does not match parameter: " + nm)
+            else:
+                let argVal: Node = cgenCallArgValue argNode
+                if posSeen < count:
+                    setPtr[Node](&argVals, posSeen, argVal)
+                else:
+                    addPtr[Node](&varargVals, argVal)
+        else:
+            let argVal: Node = cgenCallArgValue argNode
+            if posSeen < count:
+                setPtr[Node](&argVals, posSeen, argVal)
+            else:
+                addPtr[Node](&varargVals, argVal)
+        posSeen = posSeen + 1
+        ai = ai + 1
+    var i: int32 = 0
+    while i < count:
+        let expected: Node = Node(get[void*](cFnSigParamTypes, off + i))
+        let expectedIsVarRef: bool = get[bool](cFnSigParamIsVarRef, off + i)
+        let expectedIsRefLike: bool = get[bool](cFnSigParamIsRefLike, off + i)
+        let expKey: str = get[str](cFnSigParamTypeKeys, off + i)
+        let argVal: Node = get[Node](argVals, i)
+        let defNode: Node = Node(get[void*](cFnSigDefaultNodes, off + i))
+        cgenEmitArgBySig(w, argVal, expected, defNode, expectedIsVarRef, expectedIsRefLike, expKey)
+        if i + 1 < count:
+            cwWrite(w, ", ")
+        i = i + 1
+    if isVarargs && posCountFull > count:
+        if count > 0 && varargVals.len > 0:
+            cwWrite(w, ", ")
+        var j: int32 = 0
+        while j < varargVals.len:
+            let argVal2: Node = get[Node](varargVals, j)
+            if varargType != nil && argVal2 != nil:
+                let argType: Node = cgenInferSimpleTypeCached argVal2
+                if argType != nil:
+                    let argKey: str = cgenTypeKey argType
+                    let expKey: str = cgenTypeKey varargType
+                    if !strIsEmpty(argKey) && !strIsEmpty(expKey) && ! typeKeyCompatible(argKey, expKey):
+                        cgenAddError(argVal2.pos, "[C-Profile] not-mapped: varargs argument type mismatch (FULLC.F02). hint: cast to element type.")
+                else:
+                    if ! cgenVarargsElemAllowed(varargType):
+                        cgenAddError(argVal2.pos, "[C-Profile] not-mapped: varargs argument type unsupported (FULLC.F02). hint: use scalar/pointer or cast.")
+            else:
+                if argVal2 != nil:
+                    let argType2: Node = cgenInferSimpleTypeCached argVal2
+                    if argType2 != nil && ! cgenVarargsElemAllowed(argType2):
+                        cgenAddError(argVal2.pos, "[C-Profile] not-mapped: varargs argument type unsupported (FULLC.F02). hint: use scalar/pointer or cast.")
+            if argVal2 != nil:
+                cgenEmitExpr(w, argVal2)
+            else:
+                cwWrite(w, "0")
+            if j + 1 < varargVals.len:
+                cwWrite(w, ", ")
+            j = j + 1
+
+fn cgenEmitImportcAggCall(w: CWriter*, callNode: Node, outName: str) =
+    if w == nil || callNode == nil || strIsEmpty outName:
+        return
+    let wrapperName: str = cgenCallImportcWrapperName callNode
+    if strIsEmpty wrapperName:
+        return
+    cwWrite(w, wrapperName)
+    cwWriteChar(w, '(')
+    let sigIdx: int32 = cgenFindFnSigIndexForCall callNode
+    var wrote: bool = false
+    if sigIdx >= 0 && sigIdx < cFnSigParamCounts.len:
+        cgenEmitCallArgsBySig(w, sigIdx, callNode)
+        wrote = (get[int32](cFnSigParamCounts, sigIdx) > 0)
+    else:
+        var i: int32 = 1
+        while i < kidCount callNode:
+            let arg: Node = kid(callNode, i)
+            if arg != nil && arg.kind == nkCallArg && kidCount arg > 1:
+                cgenEmitExpr(w, kid(arg, 1))
+            else:
+                cgenEmitExpr(w, cgenCallArgValue arg)
+            if i + 1 < kidCount callNode:
+                cwWrite(w, ", ")
+            i = i + 1
+        wrote = (kidCount callNode > 1)
+    if wrote:
+        cwWrite(w, ", ")
+    cwWrite(w, "(&")
+    cwWrite(w, cgenEscapeCIdent(outName))
+    cwWrite(w, ")")
+    cwWriteChar(w, ')')
+
+fn cgenEmitExprStmt(w: CWriter*, n: Node) =
+    if n == nil:
+        return
+    let core: Node = unwrapParExpr n
+    if core != nil && core.kind == nkDotExpr && kidCount core >= 2:
+        let base: Node = kid(core, 0)
+        let member: Node = kid(core, 1)
+        let mname: str = cgenStripSpaces(plainName(member))
+        if !strIsEmpty mname:
+            var call: Node = newNode(nkCall, n.pos)
+            call.callStyle = CallStyleParen
+            addSon(call, newIdent(mname, n.pos))
+            addSon(call, base)
+            var sigIdx: int32 = cFnSigFindMatchForCall(mname, call)
+            if sigIdx < 0:
+                sigIdx = cFnSigFindMatchForPrefix(mname, call)
+            if sigIdx >= 0:
+                cwIndent w
+                cgenEmitExpr(w, call)
+                cwWrite(w, ";")
+                cwNewline w
+                return
+    if core != nil && (core.kind == nkIdent || core.kind == nkSymbol):
+        cwIndent w
+        cwWrite(w, "(void)")
+        cgenEmitExpr(w, core)
+        cwWrite(w, ";")
+        cwNewline w
+        return
+    if core != nil && core.kind == nkCall:
+        let retType: Node = cgenCallImportcAggRetType core
+        if retType != nil:
+            let tmpName: str = cgenNextTempName("tmp")
+            cwIndent w
+            emitTypeName(w, retType)
+            cwWrite(w, " ")
+            cwWrite(w, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+            if inFn:
+                addLocalVar(tmpName, retType)
+            cwIndent w
+            cgenEmitImportcAggCall(w, core, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+            return
+    if cgenIsNoopExprStmt(n):
+        return
+    if cgenOrcEnabled():
+        let ty: Node = cgenInferSimpleTypeCached n
+        if cgenIsStringTypeNode(ty) && !cgenStrNeedsRetain(n):
+            let tmpName: str = cgenNextTempName("tmp")
+            cwIndent w
+            cwWrite(w, "char* ")
+            cwWrite(w, tmpName)
+            cwWrite(w, " = ")
+            cgenEmitExpr(w, n)
+            cwWrite(w, ";")
+            cwNewline w
+            cwIndent w
+            cwWrite(w, "cheng_mem_release((void*)")
+            cwWrite(w, tmpName)
+            cwWrite(w, ");")
+            cwNewline w
+            return
+    cwIndent w
+    cgenEmitExpr(w, n)
+    cwWrite(w, ";")
+    cwNewline w
+
+fn cgen_casePatternCore(n: Node): Node =
+    var cur: Node = n
+    if cur == nil:
+        return nil
+    if cur.kind == nkPattern && kidCount cur > 0:
+        cur = kid(cur, 0)
+    if cur != nil && cur.kind == nkPar && kidCount cur == 1:
+        cur = kid(cur, 0)
+    return cur
+
+fn cgen_casePatternIsWildcard(n: Node): bool =
+    let core: Node = cgen_casePatternCore n
+    if core == nil:
+        return true
+    if core.kind == nkIdent || core.kind == nkSymbol:
+        let nm: str = cgenStripSpaces core.ident
+        return nm == "_"
+    return false
+
+fn cgenMakeBoolLitNode(val: bool, pos: SourcePos): Node =
+    return newBoolLit(val, pos)
+
+fn cgenMakeInfixNode(op: str, lhs: Node, rhs: Node, pos: SourcePos): Node =
+    var n: Node = newNode(nkInfix, pos)
+    nodeSetIdent(n, op)
+    addSon(n, newIdent(op, pos))
+    addSon(n, lhs)
+    addSon(n, rhs)
+    return n
+
+fn cgenMakePrefixNode(op: str, rhs: Node, pos: SourcePos): Node =
+    var n: Node = newNode(nkPrefix, pos)
+    nodeSetIdent(n, op)
+    addSon(n, newIdent(op, pos))
+    addSon(n, rhs)
+    return n
+
+fn cgenMakeDotExpr(base: Node, field: str, pos: SourcePos): Node =
+    var n: Node = newNode(nkDotExpr, pos)
+    addSon(n, base)
+    addSon(n, newIdent(field, pos))
+    return n
+
+fn cgenMakeBracketExpr(base: Node, idx: Node, pos: SourcePos): Node =
+    var n: Node = newNode(nkBracketExpr, pos)
+    addSon(n, base)
+    addSon(n, idx)
+    return n
+
+fn cgenMakeCallNode(name: str, pos: SourcePos): Node =
+    var call: Node = newNode(nkCall, pos)
+    call.callStyle = CallStyleParen
+    addSon(call, newIdent(name, pos))
+    return call
+
+fn cgenMakeGenericCallee(name: str, typeArg: Node, pos: SourcePos): Node =
+    var br: Node = newNode(nkBracketExpr, pos)
+    addSon(br, newIdent(name, pos))
+    if typeArg != nil:
+        addSon(br, typeArg)
+    return br
+
+fn cgenMakeCastCall(typeNode: Node, expr: Node, pos: SourcePos): Node =
+    var call: Node = newNode(nkCall, pos)
+    call.callStyle = CallStyleParen
+    if typeNode != nil:
+        addSon(call, typeNode)
+    else:
+        addSon(call, newIdent("int32", pos))
+    addSon(call, expr)
+    return call
+
+fn cgenSetElemMaskExpr(elem: Node): Node =
+    if elem == nil:
+        return newIntLit(0, cgen_zeroPos())
+    if cgenIsRangeExpr elem:
+        let startExpr: Node = kid(elem, 1)
+        let endExpr: Node = kid(elem, 2)
+        let exclusive: bool = cgenRangeIsExclusive elem
+        var call: Node = cgenMakeCallNode("__cheng_set_range_mask", elem.pos)
+        addSon(call, startExpr)
+        addSon(call, endExpr)
+        addSon(call, cgenMakeBoolLitNode(exclusive, elem.pos))
+        return call
+    var one: Node = newIntLit(1, elem.pos)
+    return cgenMakeInfixNode("<<", one, elem, elem.pos)
+
+fn cgenBuildInCond(lhs: Node, rhs: Node, pos: SourcePos): Node =
+    if lhs == nil || rhs == nil:
+        return cgenMakeBoolLitNode(false, pos)
+    return cgenMakeInfixNode("in", lhs, rhs, pos)
+
+fn cgenEmitSeqLitAssign(w: CWriter*, name: str, nameType: Node, seqType: Node, lit: Node, pos: SourcePos) =
+    if w == nil || strIsEmpty name || lit == nil:
+        return
+    let cname: str = cgenEscapeCIdent(name)
+    let elemType: Node = cgenSeqElemType seqType
+    if elemType == nil || elemType.kind == nkEmpty:
+        cgenAddError(pos, "C backend requires seq element type for seq literal")
+        return
+    let count: int32 = kidCount lit
+    cwIndent w
+    if nameType != nil && typeIsVarRef(nameType):
+        cwWrite(w, "(*")
+        cwWrite(w, cname)
+        cwWrite(w, ")")
+    else:
+        cwWrite(w, cname)
+    cwWrite(w, " = ")
+    var initCall: Node = newNode(nkCall, pos)
+    initCall.callStyle = CallStyleParen
+    addSon(initCall, cgenMakeGenericCallee("newSeqWithCap", elemType, pos))
+    addSon(initCall, newIntLit(0, pos))
+    addSon(initCall, newIntLit(int64(count), pos))
+    cgenEmitExpr(w, initCall)
+    cwWrite(w, ";")
+    cwNewline w
+    var i: int32 = 0
+    while i < kidCount lit:
+        var elem: Node = cgenCallArgValue kid(lit, i)
+        if elem == nil:
+            elem = newIntLit(0, pos)
+        cwIndent w
+        var call: Node = newNode(nkCall, pos)
+        call.callStyle = CallStyleParen
+        addSon(call, cgenMakeGenericCallee("addPtr", elemType, pos))
+        if nameType != nil && typeIsVarRef(nameType):
+            addSon(call, newIdent(name, pos))
+        else:
+            addSon(call, cgenMakePrefixNode("&", newIdent(name, pos), pos))
+        addSon(call, elem)
+        cgenEmitExpr(w, call)
+        cwWrite(w, ";")
+        cwNewline w
+        i = i + 1
+
+fn cgenReplaceIdent(n: Node, name: str, replacement: Node): Node =
+    if n == nil:
+        return nil
+    if (n.kind == nkIdent || n.kind == nkSymbol) &&(cgenStripSpaces(n.ident) ==  name):
+        return cloneTree replacement
+    let count: int32 = kidCount n
+    if count <= 0:
+        return n
+    var out: Node = nil
+    var i: int32 = 0
+    while i < count:
+        let kidNode: Node = kid(n, i)
+        let newKid: Node = cgenReplaceIdent(kidNode, name, replacement)
+        if out != nil:
+            addSon(out, newKid)
+        else:
+            if newKid != kidNode:
+                out = newNode(n.kind, n.pos)
+                nodeSetIdent(out, n.ident)
+                nodeSetStrVal(out, n.strVal)
+                out.intVal = n.intVal
+                out.floatVal = n.floatVal
+                out.callStyle = n.callStyle
+                var j: int32 = 0
+                while j < i:
+                    addSon(out, kid(n, j))
+                    j = j + 1
+                addSon(out, newKid)
+        i = i + 1
+    if out == nil:
+        return n
+    return out
+
+fn cgenBuildSeqPatternCond(pat: Node, valueNode: Node): Node =
+    if pat == nil:
+        return nil
+    let valueType: Node = inferSimpleTypeNode valueNode
+    var elemTy: Node = cgenSeqElemType valueType
+    let isString: bool = elemTy == nil && cgenIsStringTypeNode(valueType)
+    if elemTy == nil && isString:
+        elemTy = newIdent("char", pat.pos)
+    if elemTy == nil:
+        return cgenMakeBoolLitNode(false, pat.pos)
+    let patLen: int32 = kidCount pat
+    var lenExpr: Node = nil
+    if isString:
+        var lenCall: Node = cgenMakeCallNode("len", pat.pos)
+        addSon(lenCall, valueNode)
+        lenExpr = lenCall
+    else:
+        lenExpr = cgenMakeDotExpr(valueNode, "len", pat.pos)
+    var cond: Node = cgenMakeInfixNode("==", lenExpr, newIntLit(patLen, pat.pos), pat.pos)
+    var i: int32 = 0
+    while i < patLen:
+        var elemExpr: Node = nil
+        if isString:
+            var charCall: Node = cgenMakeCallNode("charAt", pat.pos)
+            addSon(charCall, valueNode)
+            addSon(charCall, newIntLit(int64(i), pat.pos))
+            elemExpr = charCall
+        else:
+            elemExpr = cgenMakeBracketExpr(valueNode, newIntLit(int64(i), pat.pos), pat.pos)
+        let elemPat: Node = kid(pat, i)
+        let elemCond: Node = cgenBuildPatternCond(elemPat, elemExpr)
+        if elemCond != nil:
+            cond = cgenMakeInfixNode("&&", cond, elemCond, pat.pos)
+        i = i + 1
+    return cond
+
+fn cgenBuildObjectPatternCond(pat: Node, valueNode: Node): Node =
+    if pat == nil:
+        return nil
+    let typeName: str = cgenObjectPatternTypeName pat
+    if len typeName == 0:
+        return nil
+    var cond: Node = nil
+    var fieldOrder: seq[str] = newSeqWithCap[str](0, 4)
+    let allowPositional: bool = cgenObjectFieldOrder(typeName, &fieldOrder)
+    var posIdx: int32 = 0
+    let patternKids: seq[void*] = pat.kids
+    var ai: int32 = 1
+    let patternCount: int32 = patternKids.len
+    while ai < patternCount:
+        let arg: Node = Node(get[void*](patternKids, ai))
+        var fieldName: str = ""
+        var fieldPat: Node = nil
+        var isNamed: bool = false
+        if arg != nil && arg.kind == nkCallArg:
+            let argKids: seq[void*] = arg.kids
+            if argKids.len > 1:
+                fieldName = cgenStripSpaces(plainName(Node(get[void*](argKids, 0))))
+                fieldPat = Node(get[void*](argKids, 1))
+                isNamed = true
+        if !isNamed:
+            if !allowPositional:
+                cgenAddError(pat.pos, "C backend requires named fields in object patterns")
+                return cgenMakeBoolLitNode(false, pat.pos)
+            if posIdx >= fieldOrder.len:
+                cgenAddError(pat.pos, "Object pattern has too many positional fields")
+                return cgenMakeBoolLitNode(false, pat.pos)
+            fieldName = get[str](fieldOrder, posIdx)
+            fieldPat = arg
+            posIdx = posIdx + 1
+        if len fieldName > 0:
+            let fieldExpr: Node = cgenMakeDotExpr(valueNode, fieldName, pat.pos)
+            let fieldCond: Node = cgenBuildPatternCond(fieldPat, fieldExpr)
+            if fieldCond != nil:
+                if cond == nil:
+                    cond = fieldCond
+                else:
+                    cond = cgenMakeInfixNode("&&", cond, fieldCond, pat.pos)
+        ai = ai + 1
+    if cond == nil:
+        return cgenMakeBoolLitNode(true, pat.pos)
+    return cond
+
+fn cgenObjectPatternCollect(pat: Node, fieldOrder: seq[str], allowPositional: bool,
+                            namesOut: seq[str]*, patsOut: seq[Node]*, emitErrors: bool): bool =
+    if pat == nil:
+        return false
+    if namesOut != nil:
+        namesOut->len = 0
+    if patsOut != nil:
+        patsOut->len = 0
+    var cached: bool = false
+    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(cgenObjectPatternIndex, void*(pat), &cached)
+    if cached:
+        if cachedIdx <= 0:
+            return false
+        if namesOut != nil:
+            *namesOut = get[seq[str]](cgenObjectPatternNames, cachedIdx - 1)
+        if patsOut != nil:
+            *patsOut = get[seq[Node]](cgenObjectPatternPats, cachedIdx - 1)
+        return true
+    let patternKids: seq[void*] = pat.kids
+    var posIdx: int32 = 0
+    var ai: int32 = 1
+    let patternCount: int32 = patternKids.len
+    while ai < patternCount:
+        let arg: Node = Node(get[void*](patternKids, ai))
+        var fieldName: str = ""
+        var fieldPat: Node = nil
+        var isNamed: bool = false
+        if arg != nil && arg.kind == nkCallArg:
+            let argKids: seq[void*] = arg.kids
+            if argKids.len > 1:
+                fieldName = cgenStripSpaces(plainName(Node(get[void*](argKids, 0))))
+                fieldPat = Node(get[void*](argKids, 1))
+                isNamed = true
+        if !isNamed:
+            if !allowPositional:
+                if emitErrors:
+                    cgenAddError(pat.pos, "C backend requires named fields in object patterns")
+                return false
+            if posIdx >= fieldOrder.len:
+                if emitErrors:
+                    cgenAddError(pat.pos, "Object pattern has too many positional fields")
+                return false
+            fieldName = get[str](fieldOrder, posIdx)
+            fieldPat = arg
+            posIdx = posIdx + 1
+        if len fieldName > 0:
+            if namesOut != nil:
+                addPtr[str](namesOut, fieldName)
+            if patsOut != nil:
+                addPtr[Node](patsOut, fieldPat)
+        ai = ai + 1
+    if namesOut != nil && patsOut != nil:
+        addPtr[seq[str]](&cgenObjectPatternNames, *namesOut)
+        addPtr[seq[Node]](&cgenObjectPatternPats, *patsOut)
+        let storedIdx: int32 = cgenObjectPatternNames.len
+        hashmaps.hashMapPtrIntPut(&cgenObjectPatternIndex, void*(pat), storedIdx)
+    return true
+
+fn cgenBuildPatternCond(pat: Node, valueNode: Node): Node =
+    if pat == nil:
+        return nil
+    let p: Node = cgenCallArgValue pat
+    if p == nil:
+        return nil
+    case p.kind
+    of nkPattern:
+        let patternKids: seq[void*] = p.kids
+        if patternKids.len > 0:
+            return cgenBuildPatternCond(Node(get[void*](patternKids, 0)), valueNode)
+        return nil
+    of nkIdent, nkSymbol:
+        if cgenStripSpaces(p.ident) == "_":
+            return cgenMakeBoolLitNode(true, p.pos)
+        return cgenMakeInfixNode("==", valueNode, p, p.pos)
+    of nkTupleLit:
+        var cond: Node = nil
+        let pkids: seq[void*] = p.kids
+        var i: int32 = 0
+        let pcount: int32 = pkids.len
+        while i < pcount:
+            let elemPat: Node = Node(get[void*](pkids, i))
+            let fieldName: str = "f" + intToStr i
+            let fieldExpr: Node = cgenMakeDotExpr(valueNode, fieldName, p.pos)
+            let elemCond: Node = cgenBuildPatternCond(elemPat, fieldExpr)
+            if elemCond != nil:
+                if cond == nil:
+                    cond = elemCond
+                else:
+                    cond = cgenMakeInfixNode("&&", cond, elemCond, p.pos)
+            i = i + 1
+        if cond == nil:
+            return cgenMakeBoolLitNode(true, p.pos)
+        return cond
+    of nkSeqLit, nkBracket:
+        return cgenBuildSeqPatternCond(p, valueNode)
+    of nkCall:
+        let objCond: Node = cgenBuildObjectPatternCond(p, valueNode)
+        if objCond != nil:
+            return objCond
+        return cgenMakeInfixNode("==", valueNode, p, p.pos)
+    of nkInfix:
+        let pkids: seq[void*] = p.kids
+        if cgenIsRangeExpr p && pkids.len >= 3:
+            let startExpr: Node = Node(get[void*](pkids, 1))
+            let endExpr: Node = Node(get[void*](pkids, 2))
+            let exclusive: bool = cgenRangeIsExclusive p
+            let ge: Node = cgenMakeInfixNode(">=", valueNode, startExpr, p.pos)
+            var leOp: str = "<="
+            if exclusive:
+                leOp = "<"
+            let le: Node = cgenMakeInfixNode(leOp, valueNode, endExpr, p.pos)
+            return cgenMakeInfixNode("&&", ge, le, p.pos)
+        return cgenMakeInfixNode("==", valueNode, p, p.pos)
+    of nkCurly:
+        let cond: Node = cgenBuildInCond(valueNode, p, p.pos)
+        if cond != nil:
+            return cond
+        return cgenMakeBoolLitNode(false, p.pos)
+    of nkPar:
+        let parKids: seq[void*] = p.kids
+        if parKids.len == 1:
+            return cgenBuildPatternCond(Node(get[void*](parKids, 0)), valueNode)
+        return nil
+    else:
+        return cgenMakeInfixNode("==", valueNode, p, p.pos)
+
+fn cgenPatternCondCanInline(pat0: Node): bool =
+    if pat0 == nil:
+        return false
+    let p: Node = cgenCallArgValue pat0
+    if p == nil:
+        return false
+    var cached: bool = false
+    let cachedVal: int32 = hashmaps.hashMapPtrIntGet(cgenPatternInlineIndex, void*(p), &cached)
+    if cached:
+        return cachedVal == 1
+    var result: bool = false
+    case p.kind
+    of nkPattern:
+        let patternKids: seq[void*] = p.kids
+        if patternKids.len > 0:
+            result = cgenPatternCondCanInline(Node(get[void*](patternKids, 0)))
+        else:
+            result = false
+    of nkPar:
+        let parKids: seq[void*] = p.kids
+        if parKids.len == 1:
+            result = cgenPatternCondCanInline(Node(get[void*](parKids, 0)))
+        else:
+            result = false
+    of nkIdent, nkSymbol, nkIntLit, nkFloatLit, nkStrLit, nkCharLit, nkBoolLit:
+        result = true
+    of nkInfix:
+        result = cgenIsRangeExpr p
+    of nkTupleLit, nkSeqLit, nkBracket:
+        var i: int32 = 0
+        result = true
+        while i < kidCount p:
+            if !cgenPatternCondCanInline(kid(p, i)):
+                result = false
+                break
+            i = i + 1
+    of nkCall:
+        let typeName: str = cgenObjectPatternTypeName p
+        if len typeName == 0:
+            result = false
+        else:
+            var fieldOrder: seq[str] = newSeqWithCap[str](0, 4)
+            let allowPositional: bool = cgenObjectFieldOrder(typeName, &fieldOrder)
+            var names: seq[str] = newSeqWithCap[str](0, 4)
+            var pats: seq[Node] = newSeqWithCap[Node](0, 4)
+            if !cgenObjectPatternCollect(p, fieldOrder, allowPositional, &names, &pats, false):
+                result = false
+            else:
+                var i: int32 = 0
+                result = true
+                while i < pats.len:
+                    if !cgenPatternCondCanInline(get[Node](pats, i)):
+                        result = false
+                        break
+                    i = i + 1
+    of nkCurly:
+        result = true
+    else:
+        result = false
+    var stored: int32 = 2
+    if result:
+        stored = 1
+    hashmaps.hashMapPtrIntPut(&cgenPatternInlineIndex, void*(p), stored)
+    return result
+
+fn cgenEmitPatternCondInline(w: CWriter*, pat0: Node, valueNode: Node): bool =
+    if w == nil:
+        return false
+    if pat0 == nil:
+        return false
+    let p: Node = cgenCallArgValue pat0
+    if p == nil:
+        return false
+    case p.kind
+    of nkPattern:
+        let patternKids: seq[void*] = p.kids
+        if patternKids.len > 0:
+            return cgenEmitPatternCondInline(w, Node(get[void*](patternKids, 0)), valueNode)
+        return false
+    of nkPar:
+        let parKids: seq[void*] = p.kids
+        if parKids.len == 1:
+            return cgenEmitPatternCondInline(w, Node(get[void*](parKids, 0)), valueNode)
+        return false
+    of nkIdent, nkSymbol:
+        if cgenStripSpaces(p.ident) == "_":
+            cwWrite(w, "1")
+            return true
+        cgenEmitExpr(w, valueNode)
+        cwWrite(w, " == ")
+        cgenEmitExpr(w, p)
+        return true
+    of nkIntLit, nkFloatLit, nkStrLit, nkCharLit, nkBoolLit:
+        cgenEmitExpr(w, valueNode)
+        cwWrite(w, " == ")
+        cgenEmitExpr(w, p)
+        return true
+    of nkInfix:
+        if cgenIsRangeExpr p:
+            let pkids: seq[void*] = p.kids
+            if pkids.len >= 3:
+                let startExpr: Node = Node(get[void*](pkids, 1))
+                let endExpr: Node = Node(get[void*](pkids, 2))
+                let exclusive: bool = cgenRangeIsExclusive p
+                cwWriteChar(w, '(')
+                cgenEmitExpr(w, valueNode)
+                cwWrite(w, " >= ")
+                cgenEmitExpr(w, startExpr)
+                cwWrite(w, " && ")
+                cgenEmitExpr(w, valueNode)
+                if exclusive:
+                    cwWrite(w, " < ")
+                else:
+                    cwWrite(w, " <= ")
+                cgenEmitExpr(w, endExpr)
+                cwWriteChar(w, ')')
+                return true
+        return false
+    of nkTupleLit:
+        var i: int32 = 0
+        let pcount: int32 = kidCount p
+        if pcount == 0:
+            cwWrite(w, "1")
+            return true
+        var j: int32 = 0
+        while j < pcount:
+            if !cgenPatternCondCanInline(kid(p, j)):
+                return false
+            j = j + 1
+        cwWriteChar(w, '(')
+        while i < pcount:
+            let elemPat: Node = kid(p, i)
+            let fieldName: str = "f" + intToStr i
+            let fieldExpr: Node = cgenMakeDotExpr(valueNode, fieldName, p.pos)
+            if i > 0:
+                cwWrite(w, " && ")
+            if !cgenEmitPatternCondInline(w, elemPat, fieldExpr):
+                return false
+            i = i + 1
+        cwWriteChar(w, ')')
+        return true
+    of nkSeqLit, nkBracket:
+        let valueType: Node = inferSimpleTypeNode valueNode
+        var elemTy: Node = cgenSeqElemType valueType
+        let isString: bool = elemTy == nil && cgenIsStringTypeNode(valueType)
+        if elemTy == nil && !isString:
+            return false
+        let pcount: int32 = kidCount p
+        if pcount > 0:
+            var j: int32 = 0
+            while j < pcount:
+                if !cgenPatternCondCanInline(kid(p, j)):
+                    return false
+                j = j + 1
+        cwWriteChar(w, '(')
+        if isString:
+            cwWrite(w, "len(")
+            cgenEmitExpr(w, valueNode)
+            cwWrite(w, ") == ")
+            cwWrite(w, int64ToStr int64(pcount))
+        else:
+            cgenEmitExpr(w, valueNode)
+            cwWrite(w, ".len == ")
+            cwWrite(w, int64ToStr int64(pcount))
+        var i: int32 = 0
+        while i < pcount:
+            let elemPat: Node = kid(p, i)
+            var elemExpr: Node = nil
+            if isString:
+                var charCall: Node = cgenMakeCallNode("charAt", p.pos)
+                addSon(charCall, valueNode)
+                addSon(charCall, newIntLit(int64(i), p.pos))
+                elemExpr = charCall
+            else:
+                elemExpr = cgenMakeBracketExpr(valueNode, newIntLit(int64(i), p.pos), p.pos)
+            cwWrite(w, " && ")
+            if !cgenEmitPatternCondInline(w, elemPat, elemExpr):
+                return false
+            i = i + 1
+        cwWriteChar(w, ')')
+        return true
+    of nkCall:
+        let typeName: str = cgenObjectPatternTypeName p
+        if len typeName == 0:
+            return false
+        var fieldOrder: seq[str] = newSeqWithCap[str](0, 4)
+        let allowPositional: bool = cgenObjectFieldOrder(typeName, &fieldOrder)
+        var names: seq[str] = newSeqWithCap[str](0, 4)
+        var pats: seq[Node] = newSeqWithCap[Node](0, 4)
+        if !cgenObjectPatternCollect(p, fieldOrder, allowPositional, &names, &pats, true):
+            cwWrite(w, "0")
+            return true
+        if names.len == 0:
+            cwWrite(w, "1")
+            return true
+        cwWriteChar(w, '(')
+        var i: int32 = 0
+        while i < names.len:
+            let fieldName: str = get[str](names, i)
+            let fieldPat: Node = get[Node](pats, i)
+            let fieldExpr: Node = cgenMakeDotExpr(valueNode, fieldName, p.pos)
+            if i > 0:
+                cwWrite(w, " && ")
+            if !cgenEmitPatternCondInline(w, fieldPat, fieldExpr):
+                return false
+            i = i + 1
+        cwWriteChar(w, ')')
+        return true
+    of nkCurly:
+        cgenEmitInCond(w, valueNode, p, p.pos, false)
+        return true
+    else:
+        return false
+
+fn emitCasePatternCond(w: CWriter*, selector: Node, pat: Node) =
+    if cgenPatternCondCanInline(pat) && cgenEmitPatternCondInline(w, pat, selector):
+        return
+    let cond: Node = cgenBuildPatternCond(pat, selector)
+    if cond == nil:
+        cwWrite(w, "1")
+        return
+    cgenEmitCondExpr(w, cond)
+
+fn cgenEmitSimpleVarDecl(w: CWriter*, kind: NodeKind, name: str, typeNode: Node, valueExpr: Node, pos: SourcePos) =
+    if w == nil || strIsEmpty name:
+        return
+    let cname: str = cgenEscapeCIdent(name)
+    var ty: Node = typeNode
+    let hasInit: bool = valueExpr != nil && valueExpr.kind != nkEmpty
+    if ty == nil || ty.kind == nkEmpty:
+        if hasInit:
+            ty = inferSimpleTypeNode valueExpr
+            if (ty == nil || ty.kind == nkEmpty) && cgenAutoTypeEnabled():
+                ty = newIdent("CHENG_C_AUTOTYPE", pos)
+    if ty == nil || ty.kind == nkEmpty:
+        cgenAddError(pos, "C backend requires type annotation or simple literal inference")
+        ty = newIdent("int32", pos)
+    if inFn:
+        addLocalVar(name, ty)
+    cwIndent w
+    if kind == nkConst:
+        cwWrite(w, "const ")
+    emitTypeName(w, ty)
+    cwWrite(w, " ")
+    cwWrite(w, cname)
+    if hasInit:
+        let coreVal: Node = unwrapParExpr valueExpr
+        if coreVal != nil && coreVal.kind == nkCall && cgenCallImportcAggRetType(coreVal) != nil:
+            if kind == nkConst:
+                cgenAddError(pos, "const initializer must be constant in C backend v0")
+                cwWrite(w, " = ")
+                cgenEmitDefaultValue(w, ty)
+                cwWrite(w, ";")
+                cwNewline w
+                return
+            cwWrite(w, ";")
+            cwNewline w
+            cwIndent w
+            cgenEmitImportcAggCall(w, coreVal, name)
+            cwWrite(w, ";")
+            cwNewline w
+            return
+        if coreVal != nil && coreVal.kind == nkTupleLit && ty != nil && ty.kind != nkEmpty:
+            cwWrite(w, " = ")
+            cgenEmitTupleLitWithType(w, coreVal, ty)
+            cwWrite(w, ";")
+            cwNewline w
+            return
+        if coreVal != nil && coreVal.kind == nkSeqLit:
+            if kind == nkConst:
+                cgenAddError(pos, "const initializer must be constant in C backend v0")
+                cwWrite(w, " = ")
+                cgenEmitDefaultValue(w, ty)
+                cwWrite(w, ";")
+                cwNewline w
+                return
+            cwWrite(w, ";")
+            cwNewline w
+            cgenEmitSeqLitAssign(w, name, ty, ty, coreVal, pos)
+            return
+        cwWrite(w, " = ")
+        cgenEmitExpr(w, valueExpr)
+    else:
+        if kind == nkConst:
+            cgenAddError(pos, "const binding requires initializer in C backend v0")
+        cwWrite(w, " = ")
+        cgenEmitDefaultValue(w, ty)
+    cwWrite(w, ";")
+    cwNewline w
+    if cgenOrcEnabled() && cgenIsStringTypeNode(ty) && valueExpr != nil && valueExpr.kind != nkEmpty:
+        if cgenStrNeedsRetain(valueExpr):
+            cwIndent w
+            cwWrite(w, "cheng_mem_retain((void*)")
+            cwWrite(w, cname)
+            cwWrite(w, ");")
+            cwNewline w
+
+fn cgenEmitPatternAssert(w: CWriter*, cond: Node, pos: SourcePos) =
+    var actual: Node = cond
+    if actual == nil:
+        actual = cgenMakeBoolLitNode(false, pos)
+    var call: Node = cgenMakeCallNode("assert", pos)
+    addSon(call, actual)
+    addSon(call, newStrLit("pattern mismatch", pos))
+    cgenEmitExprStmt(w, call)
+
+fn cgenEmitPatternAssertInline(w: CWriter*, pat: Node, valueExpr: Node, pos: SourcePos): bool =
+    if w == nil || pat == nil || valueExpr == nil:
+        return false
+    if !cgenPatternCondCanInline(pat):
+        return false
+    cwIndent w
+    cwWrite(w, "assert(")
+    if !cgenEmitPatternCondInline(w, pat, valueExpr):
+        cwWrite(w, "0")
+    cwWrite(w, ", \"pattern mismatch\");")
+    cwNewline w
+    return true
+
+fn cgenEmitPatternBinding(w: CWriter*, kind: NodeKind, pat0: Node, valueExpr: Node, expectedType: Node) =
+    if pat0 == nil:
+        return
+    var pat: Node = cgenCallArgValue pat0
+    if pat == nil:
+        return
+    case pat.kind
+    of nkPattern:
+        let patternKids: seq[void*] = pat.kids
+        var inner: Node = nil
+        if patternKids.len > 0:
+            inner = Node(get[void*](patternKids, 0))
+        var ty: Node = expectedType
+        if patternKids.len > 1:
+            let anno: Node = Node(get[void*](patternKids, 1))
+            if anno != nil && anno.kind != nkEmpty:
+                ty = anno
+        cgenEmitPatternBinding(w, kind, inner, valueExpr, ty)
+    of nkPar:
+        let parKids: seq[void*] = pat.kids
+        if parKids.len == 1:
+            let inner: Node = Node(get[void*](parKids, 0))
+            var tupleTy: Node = expectedType
+            if tupleTy == nil || tupleTy.kind == nkEmpty:
+                tupleTy = inferSimpleTypeNode valueExpr
+            let elemTypes: seq[Node] = cgenTupleElemTypesFromType tupleTy
+            if elemTypes.len == 1:
+                var fake: Node = newNode(nkTupleLit, pat.pos)
+                addSon(fake, inner)
+                cgenEmitTuplePattern(w, kind, fake, valueExpr, elemTypes)
+                return
+            cgenEmitPatternBinding(w, kind, inner, valueExpr, expectedType)
+    of nkIdent, nkSymbol:
+        let nm: str = cgenStripSpaces pat.ident
+        if nm != "_":
+            cgenEmitSimpleVarDecl(w, kind, nm, expectedType, valueExpr, pat.pos)
+    of nkTupleLit:
+        var elemTypes: seq[Node] = cgenTupleElemTypesFromType expectedType
+        if elemTypes.len == 0:
+            let valType: Node = inferSimpleTypeNode valueExpr
+            elemTypes = cgenTupleElemTypesFromType valType
+        cgenEmitTuplePattern(w, kind, pat, valueExpr, elemTypes)
+    of nkSeqLit, nkBracket:
+        cgenEmitSeqPattern(w, kind, pat, valueExpr, expectedType)
+    of nkCall:
+        if cgenIsObjectPattern pat:
+            cgenEmitObjectPattern(w, kind, pat, valueExpr)
+        else:
+            if cgenEmitPatternAssertInline(w, pat, valueExpr, pat.pos):
+                return
+            let cond: Node = cgenMakeInfixNode("==", valueExpr, pat, pat.pos)
+            cgenEmitPatternAssert(w, cond, pat.pos)
+    of nkIntLit, nkFloatLit, nkStrLit, nkCharLit, nkBoolLit:
+        if cgenEmitPatternAssertInline(w, pat, valueExpr, pat.pos):
+            return
+        let cond2: Node = cgenMakeInfixNode("==", valueExpr, pat, pat.pos)
+        cgenEmitPatternAssert(w, cond2, pat.pos)
+    of nkInfix:
+        let patKids: seq[void*] = pat.kids
+        if cgenIsRangeExpr pat && patKids.len >= 3:
+            if cgenEmitPatternAssertInline(w, pat, valueExpr, pat.pos):
+                return
+            let startExpr: Node = Node(get[void*](patKids, 1))
+            let endExpr: Node = Node(get[void*](patKids, 2))
+            let exclusive: bool = cgenRangeIsExclusive pat
+            let ge: Node = cgenMakeInfixNode(">=", valueExpr, startExpr, pat.pos)
+            var leOp: str = "<="
+            if exclusive:
+                leOp = "<"
+            let le: Node = cgenMakeInfixNode(leOp, valueExpr, endExpr, pat.pos)
+            let cond3: Node = cgenMakeInfixNode("&&", ge, le, pat.pos)
+            cgenEmitPatternAssert(w, cond3, pat.pos)
+        else:
+            if cgenEmitPatternAssertInline(w, pat, valueExpr, pat.pos):
+                return
+            let cond4: Node = cgenMakeInfixNode("==", valueExpr, pat, pat.pos)
+            cgenEmitPatternAssert(w, cond4, pat.pos)
+    of nkCurly:
+        if cgenEmitPatternAssertInline(w, pat, valueExpr, pat.pos):
+            return
+        let cond5: Node = cgenBuildInCond(valueExpr, pat, pat.pos)
+        cgenEmitPatternAssert(w, cond5, pat.pos)
+    else:
+        if cgenEmitPatternAssertInline(w, pat, valueExpr, pat.pos):
+            return
+        let cond6: Node = cgenMakeInfixNode("==", valueExpr, pat, pat.pos)
+        cgenEmitPatternAssert(w, cond6, pat.pos)
+
+fn cgenEmitTuplePattern(w: CWriter*, kind: NodeKind, pat: Node, valueNode: Node, elemTypes: seq[Node]) =
+    if pat == nil:
+        return
+    let pkids: seq[void*] = pat.kids
+    var i: int32 = 0
+    let pcount: int32 = pkids.len
+    while i < pcount:
+        let elemPat0: Node = Node(get[void*](pkids, i))
+        let fieldName: str = "f" + intToStr i
+        let fieldExpr: Node = cgenMakeDotExpr(valueNode, fieldName, valueNode.pos)
+        var elemTy: Node = nil
+        if i < elemTypes.len:
+            elemTy = get[Node](elemTypes, i)
+        cgenEmitPatternBinding(w, kind, elemPat0, fieldExpr, elemTy)
+        i = i + 1
+
+fn cgenEmitSeqPattern(w: CWriter*, kind: NodeKind, pat: Node, valueNode: Node, expectedType: Node) =
+    if pat == nil:
+        return
+    var valType: Node = expectedType
+    if valType == nil || valType.kind == nkEmpty:
+        valType = inferSimpleTypeNode valueNode
+    var elemTy: Node = cgenSeqElemType valType
+    let isString: bool = elemTy == nil && cgenIsStringTypeNode valType
+    if elemTy == nil && isString:
+        elemTy = newIdent("char", pat.pos)
+    if elemTy == nil:
+        let cond0: Node = cgenMakeBoolLitNode(false, pat.pos)
+        cgenEmitPatternAssert(w, cond0, pat.pos)
+        return
+    let pkids: seq[void*] = pat.kids
+    let patLen: int32 = pkids.len
+    var lenExpr: Node = nil
+    if isString:
+        var lenCall: Node = cgenMakeCallNode("len", pat.pos)
+        addSon(lenCall, valueNode)
+        lenExpr = lenCall
+    else:
+        lenExpr = cgenMakeDotExpr(valueNode, "len", pat.pos)
+    let lenCond: Node = cgenMakeInfixNode("==", lenExpr, newIntLit(patLen, pat.pos), pat.pos)
+    cgenEmitPatternAssert(w, lenCond, pat.pos)
+    var i: int32 = 0
+    while i < patLen:
+        let elemPat: Node = Node(get[void*](pkids, i))
+        var elemExpr: Node = nil
+        if isString:
+            var charCall: Node = cgenMakeCallNode("charAt", pat.pos)
+            addSon(charCall, valueNode)
+            addSon(charCall, newIntLit(int64(i), pat.pos))
+            elemExpr = charCall
+        else:
+            elemExpr = cgenMakeBracketExpr(valueNode, newIntLit(int64(i), pat.pos), pat.pos)
+        cgenEmitPatternBinding(w, kind, elemPat, elemExpr, elemTy)
+        i = i + 1
+
+fn cgenEmitObjectPattern(w: CWriter*, kind: NodeKind, pat: Node, valueNode: Node) =
+    if pat == nil:
+        return
+    let typeName: str = cgenObjectPatternTypeName pat
+    if len typeName == 0:
+        return
+    var fieldOrder: seq[str] = newSeqWithCap[str](0, 4)
+    let allowPositional: bool = cgenObjectFieldOrder(typeName, &fieldOrder)
+    var posIdx: int32 = 0
+    let pkids: seq[void*] = pat.kids
+    var ai: int32 = 1
+    let pcount: int32 = pkids.len
+    while ai < pcount:
+        let arg: Node = Node(get[void*](pkids, ai))
+        var fieldName: str = ""
+        var fieldPat: Node = nil
+        var isNamed: bool = false
+        if arg != nil && arg.kind == nkCallArg:
+            let argKids: seq[void*] = arg.kids
+            if argKids.len > 1:
+                fieldName = cgenStripSpaces(plainName(Node(get[void*](argKids, 0))))
+                fieldPat = Node(get[void*](argKids, 1))
+                isNamed = true
+        if !isNamed:
+            if !allowPositional:
+                cgenAddError(pat.pos, "C backend requires named fields in object patterns")
+                return
+            if posIdx >= fieldOrder.len:
+                cgenAddError(pat.pos, "Object pattern has too many positional fields")
+                return
+            fieldName = get[str](fieldOrder, posIdx)
+            fieldPat = arg
+            posIdx = posIdx + 1
+        if len fieldName > 0:
+            let fieldExpr: Node = cgenMakeDotExpr(valueNode, fieldName, pat.pos)
+            var fieldTy: Node = lookupFieldType(typeName, fieldName)
+            cgenEmitPatternBinding(w, kind, fieldPat, fieldExpr, fieldTy)
+        ai = ai + 1
+
+fn emitCaseBranchBody(w: CWriter*, body: Node, retType: Node, forceReturn: bool) =
+    let retIsVoid: bool = (retType == nil || retType.kind == nkEmpty || cgenIsVoidTypeNode(retType))
+    if body == nil:
+        return
+    if !forceReturn || retIsVoid:
+        if body.kind == nkStmtList:
+            cgenEmitStmtList(w, body)
+        else:
+            emitStmt(w, body)
+        return
+    if body.kind == nkStmtList:
+        cgenEmitStmtListTail(w, body, 1, nil)
+        return
+    if body.kind == nkCase:
+        cgenEmitCase(w, body, retType, true)
+        return
+    if body.kind == nkIf || body.kind == nkWhen:
+        cgenEmitIfReturn(w, body)
+        return
+    if cgenIsExprNode body && !(body.kind == nkReturn):
+        emitReturnExpr(w, body)
+        return
+    emitStmt(w, body)
+
+fn cgenEmitAssignExpr(w: CWriter*, lhs: Node, rhs: Node) =
+    if lhs == nil || rhs == nil:
+        return
+    var asgn: Node = newNode(nkAsgn, rhs.pos)
+    addSon(asgn, lhs)
+    addSon(asgn, rhs)
+    emitStmt(w, asgn)
+
+fn emitBranchAssignBody(w: CWriter*, body: Node, lhs: Node) =
+    if body == nil:
+        return
+    if body.kind == nkStmtList:
+        cgenEmitStmtListTail(w, body, 2, lhs)
+        return
+    if (body.kind == nkCase):
+        cgenEmitCaseAssign(w, body, lhs)
+        return
+    if (body.kind == nkIf || body.kind == nkWhen):
+        cgenEmitIfAssign(w, body, lhs)
+        return
+    if cgenIsExprNode body && !(body.kind == nkReturn):
+        cgenEmitAssignExpr(w, lhs, body)
+        return
+    emitStmt(w, body)
+
+fn cgenEmitCase(w: CWriter*, n: Node, retType: Node, forceReturn: bool) =
+    if n == nil:
+        return
+    let nkids: seq[void*] = n.kids
+    if nkids.len == 0:
+        return
+    let selectorExpr: Node = Node(get[void*](nkids, 0))
+    let selName: str = cgenNextTempName("case")
+    var selType: Node = inferSimpleTypeNode selectorExpr
+    if selType == nil || selType.kind == nkEmpty:
+        if cgenAutoTypeEnabled():
+            selType = newIdent("CHENG_C_AUTOTYPE", n.pos)
+        else:
+            cgenAddError(n.pos, "C backend requires case selector type")
+            selType = newIdent("int32", n.pos)
+    if inFn:
+        addLocalVar(selName, selType)
+    cwIndent w
+    emitTypeName(w, selType)
+    cwWrite(w, " ")
+    cwWrite(w, selName)
+    if selectorExpr != nil && selectorExpr.kind != nkEmpty:
+        let coreSel: Node = unwrapParExpr selectorExpr
+        if coreSel != nil && coreSel.kind == nkCall && cgenCallImportcAggRetType(coreSel) != nil:
+            cwWrite(w, ";")
+            cwNewline w
+            cwIndent w
+            cgenEmitImportcAggCall(w, coreSel, selName)
+            cwWrite(w, ";")
+            cwNewline w
+        else:
+            cwWrite(w, " = ")
+            cgenEmitExpr(w, selectorExpr)
+            cwWrite(w, ";")
+            cwNewline w
+    else:
+        cwWrite(w, ";")
+        cwNewline w
+    let selIdent: Node = newIdent(selName, n.pos)
+    var i: int32 = 1
+    var first: bool = true
+    let ncount: int32 = nkids.len
+    while i < ncount:
+        let br: Node = Node(get[void*](nkids, i))
+        if br == nil:
+            i = i + 1
+            continue
+        if br.kind == nkOfBranch:
+            var body: Node = nil
+            var guard: Node = nil
+            var hasCond: bool = false
+            var typedName: Node = nil
+            var typedType: Node = nil
+            var typedCast: Node = nil
+            let brKids: seq[void*] = br.kids
+            var endIdx: int32 = brKids.len - 1
+            if endIdx >= 0:
+                body = Node(get[void*](brKids, endIdx))
+            var gi: int32 = 0
+            while gi < endIdx && guard == nil:
+                let gpart: Node = Node(get[void*](brKids, gi))
+                if gpart != nil && gpart.kind == nkGuard:
+                    let guardKids: seq[void*] = gpart.kids
+                    if guardKids.len > 0:
+                        guard = Node(get[void*](guardKids, 0))
+                gi = gi + 1
+            cwIndent w
+            if first:
+                cwWrite(w, "if (")
+            else:
+                cwWrite(w, "else if (")
+            if guard != nil:
+                cwWriteChar(w, '(')
+            var j: int32 = 0
+            while j < endIdx:
+                let part: Node = Node(get[void*](brKids, j))
+                if part == nil:
+                    j = j + 1
+                    continue
+                if part.kind == nkGuard:
+                    j = j + 1
+                    continue
+                else:
+                    if part.kind == nkPattern:
+                        let patternKids: seq[void*] = part.kids
+                        if patternKids.len > 0:
+                            let inner: Node = Node(get[void*](patternKids, 0))
+                            var tnode: Node = nil
+                            if patternKids.len > 1:
+                                tnode = Node(get[void*](patternKids, 1))
+                            if inner != nil && (inner.kind == nkIdent || inner.kind == nkSymbol):
+                                if typedName == nil && ! cgenPatternIsWildcardDeep inner:
+                                    typedName = inner
+                                    typedType = tnode
+                                    if typedType == nil || typedType.kind == nkEmpty:
+                                        typedType = selType
+                                    if typedType != nil && typedType.kind != nkEmpty:
+                                        typedCast = cgenMakeCastCall(typedType, selIdent, part.pos)
+                                    else:
+                                        typedCast = selIdent
+                                if hasCond:
+                                    cwWrite(w, " || ")
+                                cwWrite(w, "1")
+                                hasCond = true
+                            else:
+                                if cgenPatternCondCanInline(inner):
+                                    if hasCond:
+                                        cwWrite(w, " || ")
+                                    cgenEmitPatternCondInline(w, inner, selIdent)
+                                    hasCond = true
+                                else:
+                                    let condPart: Node = cgenBuildPatternCond(inner, selIdent)
+                                    if condPart != nil:
+                                        if hasCond:
+                                            cwWrite(w, " || ")
+                                        cgenEmitCondExpr(w, condPart)
+                                        hasCond = true
+                        else:
+                            let condPart2: Node = cgenBuildPatternCond(part, selIdent)
+                            if condPart2 != nil:
+                                if hasCond:
+                                    cwWrite(w, " || ")
+                                cgenEmitCondExpr(w, condPart2)
+                                hasCond = true
+                    else:
+                        if cgenPatternCondCanInline(part):
+                            if hasCond:
+                                cwWrite(w, " || ")
+                            cgenEmitPatternCondInline(w, part, selIdent)
+                            hasCond = true
+                        else:
+                            let condPart3: Node = cgenBuildPatternCond(part, selIdent)
+                            if condPart3 != nil:
+                                if hasCond:
+                                    cwWrite(w, " || ")
+                                cgenEmitCondExpr(w, condPart3)
+                                hasCond = true
+                j = j + 1
+            if !hasCond:
+                cwWrite(w, "1")
+            if guard != nil:
+                cwWriteChar(w, ')')
+                cwWrite(w, " && ")
+                var g: Node = guard
+                if typedName != nil && typedCast != nil:
+                    g = cgenReplaceIdent(g, cgenStripSpaces(typedName.ident), typedCast)
+                cgenEmitCondExpr(w, g)
+            cwWrite(w, ") {")
+            cwNewline w
+            cwIndentPush w
+            if typedName != nil && typedCast != nil && ! cgenPatternIsWildcardDeep typedName:
+                let tname: str = cgenStripSpaces typedName.ident
+                cgenEmitSimpleVarDecl(w, nkLet, tname, typedType, typedCast, typedName.pos)
+            emitCaseBranchBody(w, body, retType, forceReturn)
+            cwIndentPop w
+            cwIndent w
+            cwWrite(w, "}")
+            cwNewline w
+            first = false
+        elif br.kind == nkElse:
+            cwIndent w
+            if first:
+                cwWrite(w, "{")
+            else:
+                cwWrite(w, "else {")
+            cwNewline w
+            cwIndentPush w
+            let brKids: seq[void*] = br.kids
+            if brKids.len > 0:
+                emitCaseBranchBody(w, Node(get[void*](brKids, 0)), retType, forceReturn)
+            cwIndentPop w
+            cwIndent w
+            cwWrite(w, "}")
+            cwNewline w
+            first = false
+        i = i + 1
+
+fn cgenEmitCaseAssign(w: CWriter*, n: Node, lhs: Node) =
+    if n == nil || lhs == nil:
+        return
+    let nkids: seq[void*] = n.kids
+    if nkids.len == 0:
+        return
+    let selectorExpr: Node = Node(get[void*](nkids, 0))
+    let selName: str = cgenNextTempName("case")
+    var selType: Node = inferSimpleTypeNode selectorExpr
+    if selType == nil || selType.kind == nkEmpty:
+        if cgenAutoTypeEnabled():
+            selType = newIdent("CHENG_C_AUTOTYPE", n.pos)
+        else:
+            cgenAddError(n.pos, "C backend requires case selector type")
+            selType = newIdent("int32", n.pos)
+    if inFn:
+        addLocalVar(selName, selType)
+    cwIndent w
+    emitTypeName(w, selType)
+    cwWrite(w, " ")
+    cwWrite(w, selName)
+    if selectorExpr != nil && selectorExpr.kind != nkEmpty:
+        let coreSel: Node = unwrapParExpr selectorExpr
+        if coreSel != nil && coreSel.kind == nkCall && cgenCallImportcAggRetType(coreSel) != nil:
+            cwWrite(w, ";")
+            cwNewline w
+            cwIndent w
+            cgenEmitImportcAggCall(w, coreSel, selName)
+            cwWrite(w, ";")
+            cwNewline w
+        else:
+            cwWrite(w, " = ")
+            cgenEmitExpr(w, selectorExpr)
+            cwWrite(w, ";")
+            cwNewline w
+    else:
+        cwWrite(w, ";")
+        cwNewline w
+    let selIdent: Node = newIdent(selName, n.pos)
+    var i: int32 = 1
+    var first: bool = true
+    let ncount: int32 = nkids.len
+    while i < ncount:
+        let br: Node = Node(get[void*](nkids, i))
+        if br == nil:
+            i = i + 1
+            continue
+        if br.kind == nkOfBranch:
+            var body: Node = nil
+            var guard: Node = nil
+            var hasCond: bool = false
+            var typedName: Node = nil
+            var typedType: Node = nil
+            var typedCast: Node = nil
+            let brKids: seq[void*] = br.kids
+            var endIdx: int32 = brKids.len - 1
+            if endIdx >= 0:
+                body = Node(get[void*](brKids, endIdx))
+            var gi: int32 = 0
+            while gi < endIdx && guard == nil:
+                let gpart: Node = Node(get[void*](brKids, gi))
+                if gpart != nil && gpart.kind == nkGuard:
+                    let guardKids: seq[void*] = gpart.kids
+                    if guardKids.len > 0:
+                        guard = Node(get[void*](guardKids, 0))
+                gi = gi + 1
+            cwIndent w
+            if first:
+                cwWrite(w, "if (")
+            else:
+                cwWrite(w, "else if (")
+            if guard != nil:
+                cwWriteChar(w, '(')
+            var j: int32 = 0
+            while j < endIdx:
+                let part: Node = Node(get[void*](brKids, j))
+                if part == nil:
+                    j = j + 1
+                    continue
+                if part.kind == nkGuard:
+                    j = j + 1
+                    continue
+                else:
+                    if part.kind == nkPattern:
+                        let patternKids: seq[void*] = part.kids
+                        if patternKids.len > 0:
+                            let inner: Node = Node(get[void*](patternKids, 0))
+                            var tnode: Node = nil
+                            if patternKids.len > 1:
+                                tnode = Node(get[void*](patternKids, 1))
+                            if inner != nil && (inner.kind == nkIdent || inner.kind == nkSymbol):
+                                if typedName == nil && ! cgenPatternIsWildcardDeep inner:
+                                    typedName = inner
+                                    typedType = tnode
+                                    if typedType == nil || typedType.kind == nkEmpty:
+                                        typedType = selType
+                                    if typedType != nil && typedType.kind != nkEmpty:
+                                        typedCast = cgenMakeCastCall(typedType, selIdent, part.pos)
+                                    else:
+                                        typedCast = selIdent
+                                if hasCond:
+                                    cwWrite(w, " || ")
+                                cwWrite(w, "1")
+                                hasCond = true
+                            else:
+                                if cgenPatternCondCanInline(inner):
+                                    if hasCond:
+                                        cwWrite(w, " || ")
+                                    cgenEmitPatternCondInline(w, inner, selIdent)
+                                    hasCond = true
+                                else:
+                                    let condPart: Node = cgenBuildPatternCond(inner, selIdent)
+                                    if condPart != nil:
+                                        if hasCond:
+                                            cwWrite(w, " || ")
+                                        cgenEmitCondExpr(w, condPart)
+                                        hasCond = true
+                        else:
+                            let condPart2: Node = cgenBuildPatternCond(part, selIdent)
+                            if condPart2 != nil:
+                                if hasCond:
+                                    cwWrite(w, " || ")
+                                cgenEmitCondExpr(w, condPart2)
+                                hasCond = true
+                    else:
+                        if cgenPatternCondCanInline(part):
+                            if hasCond:
+                                cwWrite(w, " || ")
+                            cgenEmitPatternCondInline(w, part, selIdent)
+                            hasCond = true
+                        else:
+                            let condPart3: Node = cgenBuildPatternCond(part, selIdent)
+                            if condPart3 != nil:
+                                if hasCond:
+                                    cwWrite(w, " || ")
+                                cgenEmitCondExpr(w, condPart3)
+                                hasCond = true
+                j = j + 1
+            if !hasCond:
+                cwWrite(w, "1")
+            if guard != nil:
+                cwWriteChar(w, ')')
+                cwWrite(w, " && ")
+                var g: Node = guard
+                if typedName != nil && typedCast != nil:
+                    g = cgenReplaceIdent(g, cgenStripSpaces(typedName.ident), typedCast)
+                cgenEmitCondExpr(w, g)
+            cwWrite(w, ") {")
+            cwNewline w
+            cwIndentPush w
+            if typedName != nil && typedCast != nil && ! cgenPatternIsWildcardDeep typedName:
+                let tname: str = cgenStripSpaces typedName.ident
+                cgenEmitSimpleVarDecl(w, nkLet, tname, typedType, typedCast, typedName.pos)
+            emitBranchAssignBody(w, body, lhs)
+            cwIndentPop w
+            cwIndent w
+            cwWrite(w, "}")
+            cwNewline w
+            first = false
+        elif br.kind == nkElse:
+            cwIndent w
+            if first:
+                cwWrite(w, "{")
+            else:
+                cwWrite(w, "else {")
+            cwNewline w
+            cwIndentPush w
+            let brKids: seq[void*] = br.kids
+            if brKids.len > 0:
+                emitBranchAssignBody(w, Node(get[void*](brKids, 0)), lhs)
+            cwIndentPop w
+            cwIndent w
+            cwWrite(w, "}")
+            cwNewline w
+            first = false
+        i = i + 1
+
+fn cgenEmitIf(w: CWriter*, n: Node) =
+    let profOn: bool = cgenProfOn && cgenProfStmtSampleRoot == n
+    var condNs: int64 = 0
+    var bodyNs: int64 = 0
+    var i: int32 = 0
+    var first: bool = true
+    let kids: seq[void*] = n.kids
+    let count: int32 = kids.len
+    while i + 1 < count:
+        let cond: Node = Node(get[void*](kids, i))
+        let body: Node = Node(get[void*](kids, i + 1))
+        if first:
+            cwIndent w
+            cwWrite(w, "if (")
+        else:
+            cwIndent w
+            cwWrite(w, "else if (")
+        if profOn:
+            let t0: int64 = cheng_monotime_ns()
+            cgenEmitCondExpr(w, cond)
+            condNs = condNs + (cheng_monotime_ns() - t0)
+        else:
+            cgenEmitCondExpr(w, cond)
+        cwWrite(w, ") {")
+        cwNewline w
+        cwIndentPush w
+        if profOn:
+            let t1: int64 = cheng_monotime_ns()
+            cgenEmitStmtList(w, body)
+            bodyNs = bodyNs + (cheng_monotime_ns() - t1)
+        else:
+            cgenEmitStmtList(w, body)
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+        first = false
+        i = i + 2
+    if i < count:
+        let elseBody: Node = Node(get[void*](kids, i))
+        cwIndent w
+        cwWrite(w, "else {")
+        cwNewline w
+        cwIndentPush w
+        if profOn:
+            let t2: int64 = cheng_monotime_ns()
+            cgenEmitStmtList(w, elseBody)
+            bodyNs = bodyNs + (cheng_monotime_ns() - t2)
+        else:
+            cgenEmitStmtList(w, elseBody)
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+    if profOn:
+        cgenProfIfCondNs = cgenProfIfCondNs + (condNs * 32)
+        cgenProfIfBodyNs = cgenProfIfBodyNs + (bodyNs * 32)
+
+fn cgenEmitIfReturn(w: CWriter*, n: Node) =
+    let retType: Node = currentFnRetType
+    var i: int32 = 0
+    var first: bool = true
+    let kids: seq[void*] = n.kids
+    let count: int32 = kids.len
+    while i + 1 < count:
+        let cond: Node = Node(get[void*](kids, i))
+        let body: Node = Node(get[void*](kids, i + 1))
+        if first:
+            cwIndent w
+            cwWrite(w, "if (")
+        else:
+            cwIndent w
+            cwWrite(w, "else if (")
+        cgenEmitCondExpr(w, cond)
+        cwWrite(w, ") {")
+        cwNewline w
+        cwIndentPush w
+        emitCaseBranchBody(w, body, retType, true)
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+        first = false
+        i = i + 2
+    if i < count:
+        let elseBody: Node = Node(get[void*](kids, i))
+        cwIndent w
+        cwWrite(w, "else {")
+        cwNewline w
+        cwIndentPush w
+        emitCaseBranchBody(w, elseBody, retType, true)
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+
+fn cgenEmitIfAssign(w: CWriter*, n: Node, lhs: Node) =
+    var i: int32 = 0
+    var first: bool = true
+    let kids: seq[void*] = n.kids
+    let count: int32 = kids.len
+    while i + 1 < count:
+        let cond: Node = Node(get[void*](kids, i))
+        let body: Node = Node(get[void*](kids, i + 1))
+        if first:
+            cwIndent w
+            cwWrite(w, "if (")
+        else:
+            cwIndent w
+            cwWrite(w, "else if (")
+        cgenEmitCondExpr(w, cond)
+        cwWrite(w, ") {")
+        cwNewline w
+        cwIndentPush w
+        emitBranchAssignBody(w, body, lhs)
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+        first = false
+        i = i + 2
+    if i < count:
+        let elseBody: Node = Node(get[void*](kids, i))
+        cwIndent w
+        cwWrite(w, "else {")
+        cwNewline w
+        cwIndentPush w
+        emitBranchAssignBody(w, elseBody, lhs)
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+
+fn cgenEmitWhile(w: CWriter*, n: Node) =
+    let profOn: bool = cgenProfOn && cgenProfStmtSampleRoot == n
+    var condNs: int64 = 0
+    var bodyNs: int64 = 0
+    let kids: seq[void*] = n.kids
+    let count: int32 = kids.len
+    if count < 2:
+        return
+    let cond: Node = Node(get[void*](kids, 0))
+    let body: Node = Node(get[void*](kids, 1))
+    cwIndent w
+    cwWrite(w, "while (")
+    if profOn:
+        let t0: int64 = cheng_monotime_ns()
+        cgenEmitCondExpr(w, cond)
+        condNs = condNs + (cheng_monotime_ns() - t0)
+    else:
+        cgenEmitCondExpr(w, cond)
+    cwWrite(w, ") {")
+    cwNewline w
+    cwIndentPush w
+    if profOn:
+        let t1: int64 = cheng_monotime_ns()
+        cgenEmitStmtList(w, body)
+        bodyNs = bodyNs + (cheng_monotime_ns() - t1)
+    else:
+        cgenEmitStmtList(w, body)
+    cwIndentPop w
+    cwIndent w
+    cwWrite(w, "}")
+    cwNewline w
+    if profOn:
+        cgenProfWhileCondNs = cgenProfWhileCondNs + (condNs * 32)
+        cgenProfWhileBodyNs = cgenProfWhileBodyNs + (bodyNs * 32)
+
+fn cgenEmitLValueName(w: CWriter*, name: str) =
+    let t: Node = lookupVarType name
+    let cname: str = cgenEscapeCIdent(name)
+    if typeIsVarRef t:
+        cwWrite(w, "(*")
+        cwWrite(w, cname)
+        cwWrite(w, ")")
+    else:
+        cwWrite(w, cname)
+
+fn emitForRange(w: CWriter*, n: Node) =
+    if kidCount n < 3:
+        return
+    let rawPat: Node = kid(n, 0)
+    let iterExpr: Node = kid(n, 1)
+    let body: Node = kid(n, 2)
+    var patNode: Node = rawPat
+    var patType: Node = nil
+    if rawPat != nil && rawPat.kind == nkPattern:
+        if kidCount rawPat > 0:
+            patNode = kid(rawPat, 0)
+        if kidCount rawPat > 1:
+            patType = kid(rawPat, 1)
+    if patNode != nil && patNode.kind == nkPar && kidCount patNode == 1:
+        patNode = kid(patNode, 0)
+    if ! cgenIsRangeExpr iterExpr:
+        cgenAddError(iterExpr.pos, "Only for-range is supported in C backend v0")
+        return
+    let startExpr: Node = kid(iterExpr, 1)
+    let endExpr: Node = kid(iterExpr, 2)
+    let exclusive: bool = cgenRangeIsExclusive iterExpr
+    var loopName: str = ""
+    if patNode != nil && (patNode.kind == nkIdent || patNode.kind == nkSymbol):
+        loopName = cgenStripSpaces patNode.ident
+    if loopName == "":
+        loopName = "__i"
+    let loopCName: str = cgenEscapeCIdent(loopName)
+    cwIndent w
+    cwWrite(w, "for (")
+    var loopType: Node = patType
+    if loopType == nil || loopType.kind == nkEmpty:
+        loopType = newIdent("int32", n.pos)
+    if inFn:
+        addLocalVar(loopName, loopType)
+    emitTypeName(w, loopType)
+    cwWrite(w, " ")
+    cwWrite(w, loopCName)
+    cwWrite(w, " = ")
+    cgenEmitExpr(w, startExpr)
+    cwWrite(w, "; ")
+    cwWrite(w, loopCName)
+    if exclusive:
+        cwWrite(w, " < ")
+    else:
+        cwWrite(w, " <= ")
+    cgenEmitExpr(w, endExpr)
+    cwWrite(w, "; ")
+    cwWrite(w, loopCName)
+    cwWrite(w, " = ")
+    cwWrite(w, loopCName)
+    cwWrite(w, " + 1")
+    cwWrite(w, ") {")
+    cwNewline w
+    cwIndentPush w
+    cgenEmitStmtList(w, body)
+    cwIndentPop w
+    cwIndent w
+    cwWrite(w, "}")
+    cwNewline w
+
+fn emitForSeq(w: CWriter*, n: Node, patNode: Node, iterExpr: Node, iterType: Node, body: Node) =
+    let elemType: Node = cgenSeqElemType iterType
+    if elemType == nil || elemType.kind == nkEmpty:
+        cgenAddError(iterExpr.pos, "C backend requires seq element type for for-in")
+        return
+    let iterName: str = cgenEnsureIterTemp(w, iterExpr, iterType)
+    if iterName == "":
+        return
+    var idxPat: Node = nil
+    var valPat: Node = patNode
+    let headPat: Node = cgenPatternHead patNode
+    if headPat != nil && headPat.kind == nkTupleLit:
+        if kidCount headPat < 2:
+            cgenAddError(iterExpr.pos, "C backend requires (idx, value) for tuple pattern")
+            return
+        idxPat = kid(headPat, 0)
+        valPat = kid(headPat, 1)
+    let idxHead: Node = cgenPatternHead idxPat
+    var idxType: Node = cgenPatternType idxPat
+    if idxType == nil || idxType.kind == nkEmpty:
+        idxType = newIdent("int32", iterExpr.pos)
+    var idxName: str = ""
+    if idxHead != nil && ! cgenPatternIsWildcard(idxHead) && (idxHead.kind == nkIdent || idxHead.kind == nkSymbol):
+        idxName = cgenStripSpaces idxHead.ident
+    if idxName == "":
+        idxName = cgenNextTempName("i")
+    cwIndent w
+    emitTypeName(w, idxType)
+    cwWrite(w, " ")
+    cwWrite(w, idxName)
+    cwWrite(w, " = 0;")
+    cwNewline w
+    if inFn:
+        addLocalVar(idxName, idxType)
+    let valHead: Node = cgenPatternHead valPat
+    var valType: Node = cgenPatternType valPat
+    if valType == nil || valType.kind == nkEmpty:
+        valType = elemType
+    var valName: str = ""
+    if valHead != nil && ! cgenPatternIsWildcard(valHead) && (valHead.kind == nkIdent || valHead.kind == nkSymbol):
+        valName = cgenStripSpaces valHead.ident
+    if !strIsEmpty valName:
+        cwIndent w
+        emitTypeName(w, valType)
+        cwWrite(w, " ")
+        cwWrite(w, valName)
+        cwWrite(w, ";")
+        cwNewline w
+        if inFn:
+            addLocalVar(valName, valType)
+    let iterIdent: Node = newIdent(iterName, iterExpr.pos)
+    let idxIdent: Node = newIdent(idxName, iterExpr.pos)
+    var lenExpr: Node = newNode(nkDotExpr, iterExpr.pos)
+    addSon(lenExpr, iterIdent)
+    addSon(lenExpr, newIdent("len", iterExpr.pos))
+    cwIndent w
+    cwWrite(w, "while (")
+    cgenEmitExpr(w, idxIdent)
+    cwWrite(w, " < ")
+    cgenEmitExpr(w, lenExpr)
+    cwWrite(w, ") {")
+    cwNewline w
+    cwIndentPush w
+    if !strIsEmpty valName:
+        cwIndent w
+        cgenEmitLValueName(w, valName)
+        cwWrite(w, " = ")
+        var elemExpr: Node = newNode(nkBracketExpr, iterExpr.pos)
+        addSon(elemExpr, iterIdent)
+        addSon(elemExpr, idxIdent)
+        cgenEmitExpr(w, elemExpr)
+        cwWrite(w, ";")
+        cwNewline w
+    cgenEmitStmtList(w, body)
+    cwIndent w
+    cwWrite(w, idxName)
+    cwWrite(w, " = ")
+    cwWrite(w, idxName)
+    cwWrite(w, " + 1;")
+    cwNewline w
+    cwIndentPop w
+    cwIndent w
+    cwWrite(w, "}")
+    cwNewline w
+
+fn emitForString(w: CWriter*, n: Node, patNode: Node, iterExpr: Node, iterType: Node, body: Node) =
+    var iterTy: Node = iterType
+    if iterTy == nil || iterTy.kind == nkEmpty:
+        iterTy = newIdent("str", iterExpr.pos)
+    let iterName: str = cgenEnsureIterTemp(w, iterExpr, iterTy)
+    if iterName == "":
+        return
+    var idxPat: Node = nil
+    var valPat: Node = patNode
+    let headPat: Node = cgenPatternHead patNode
+    if headPat != nil && headPat.kind == nkTupleLit:
+        if kidCount headPat < 2:
+            cgenAddError(iterExpr.pos, "C backend requires (idx, value) for tuple pattern")
+            return
+        idxPat = kid(headPat, 0)
+        valPat = kid(headPat, 1)
+    let idxHead: Node = cgenPatternHead idxPat
+    var idxType: Node = cgenPatternType idxPat
+    if idxType == nil || idxType.kind == nkEmpty:
+        idxType = newIdent("int32", iterExpr.pos)
+    var idxName: str = ""
+    if idxHead != nil && ! cgenPatternIsWildcard(idxHead) && (idxHead.kind == nkIdent || idxHead.kind == nkSymbol):
+        idxName = cgenStripSpaces idxHead.ident
+    if idxName == "":
+        idxName = cgenNextTempName("i")
+    cwIndent w
+    emitTypeName(w, idxType)
+    cwWrite(w, " ")
+    cwWrite(w, idxName)
+    cwWrite(w, " = 0;")
+    cwNewline w
+    if inFn:
+        addLocalVar(idxName, idxType)
+    let valHead: Node = cgenPatternHead valPat
+    var valType: Node = cgenPatternType valPat
+    if valType == nil || valType.kind == nkEmpty:
+        valType = newIdent("char", iterExpr.pos)
+    var valName: str = ""
+    if valHead != nil && ! cgenPatternIsWildcard(valHead) && (valHead.kind == nkIdent || valHead.kind == nkSymbol):
+        valName = cgenStripSpaces valHead.ident
+    if !strIsEmpty valName:
+        cwIndent w
+        emitTypeName(w, valType)
+        cwWrite(w, " ")
+        cwWrite(w, valName)
+        cwWrite(w, ";")
+        cwNewline w
+        if inFn:
+            addLocalVar(valName, valType)
+    let iterIdent: Node = newIdent(iterName, iterExpr.pos)
+    let idxIdent: Node = newIdent(idxName, iterExpr.pos)
+    var lenCall: Node = newNode(nkCall, iterExpr.pos)
+    addSon(lenCall, newIdent("len", iterExpr.pos))
+    addSon(lenCall, iterIdent)
+    cwIndent w
+    cwWrite(w, "while (")
+    cgenEmitExpr(w, idxIdent)
+    cwWrite(w, " < ")
+    cgenEmitExpr(w, lenCall)
+    cwWrite(w, ") {")
+    cwNewline w
+    cwIndentPush w
+    if !strIsEmpty valName:
+        cwIndent w
+        cgenEmitLValueName(w, valName)
+        cwWrite(w, " = ")
+        var charCall: Node = newNode(nkCall, iterExpr.pos)
+        addSon(charCall, newIdent("charAt", iterExpr.pos))
+        addSon(charCall, iterIdent)
+        addSon(charCall, idxIdent)
+        cgenEmitExpr(w, charCall)
+        cwWrite(w, ";")
+        cwNewline w
+    cgenEmitStmtList(w, body)
+    cwIndent w
+    cwWrite(w, idxName)
+    cwWrite(w, " = ")
+    cwWrite(w, idxName)
+    cwWrite(w, " + 1;")
+    cwNewline w
+    cwIndentPop w
+    cwIndent w
+    cwWrite(w, "}")
+    cwNewline w
+
+fn emitForTable(w: CWriter*, n: Node, patNode: Node, iterExpr: Node, iterType: Node, body: Node) =
+    let valType: Node = cgenTableValueType iterType
+    if valType == nil || valType.kind == nkEmpty:
+        cgenAddError(iterExpr.pos, "C backend requires Table value type for for-in")
+        return
+    let iterName: str = cgenEnsureIterTemp(w, iterExpr, iterType)
+    if iterName == "":
+        return
+    var keyPat: Node = nil
+    var valPat: Node = nil
+    let headPat: Node = cgenPatternHead patNode
+    if headPat != nil && headPat.kind == nkTupleLit:
+        if kidCount headPat < 2 || kidCount headPat > 2:
+            cgenAddError(iterExpr.pos, "C backend requires (key, value) for table pattern")
+            return
+        keyPat = kid(headPat, 0)
+        valPat = kid(headPat, 1)
+    else:
+        keyPat = patNode
+    let keyHead: Node = cgenPatternHead keyPat
+    var keyType: Node = cgenPatternType keyPat
+    if keyType == nil || keyType.kind == nkEmpty:
+        keyType = newIdent("str", iterExpr.pos)
+    if keyPat != nil && ! cgenIsStringTypeNode(keyType) && ! cgenPatternIsWildcard(keyHead):
+        cgenAddError(iterExpr.pos, "C backend requires Table key type str")
+    if keyPat != nil && keyHead != nil && !(keyHead.kind == nkIdent || keyHead.kind == nkSymbol):
+        cgenAddError(iterExpr.pos, "C backend requires simple key pattern for Table")
+        return
+    var keyName: str = ""
+    if keyHead != nil && ! cgenPatternIsWildcard(keyHead) && (keyHead.kind == nkIdent || keyHead.kind == nkSymbol):
+        keyName = cgenStripSpaces keyHead.ident
+    if keyName == "":
+        keyName = cgenNextTempName("k")
+    let valHead: Node = cgenPatternHead valPat
+    var valType2: Node = cgenPatternType valPat
+    if valType2 == nil || valType2.kind == nkEmpty:
+        valType2 = valType
+    if valPat != nil && valHead != nil && !(valHead.kind == nkIdent || valHead.kind == nkSymbol):
+        cgenAddError(iterExpr.pos, "C backend requires simple value pattern for Table")
+        return
+    var valName: str = ""
+    if valHead != nil && ! cgenPatternIsWildcard(valHead) && (valHead.kind == nkIdent || valHead.kind == nkSymbol):
+        valName = cgenStripSpaces valHead.ident
+    if valName == "":
+        valName = cgenNextTempName("v")
+    let idxType: Node = newIdent("int32", iterExpr.pos)
+    let idxName: str = cgenNextTempName("i")
+    cwIndent w
+    emitTypeName(w, idxType)
+    cwWrite(w, " ")
+    cwWrite(w, idxName)
+    cwWrite(w, " = 0;")
+    cwNewline w
+    if inFn:
+        addLocalVar(idxName, idxType)
+    cwIndent w
+    emitTypeName(w, keyType)
+    cwWrite(w, " ")
+    cwWrite(w, keyName)
+    cwWrite(w, ";")
+    cwNewline w
+    if inFn:
+        addLocalVar(keyName, keyType)
+    cwIndent w
+    emitTypeName(w, valType2)
+    cwWrite(w, " ")
+    cwWrite(w, valName)
+    cwWrite(w, ";")
+    cwNewline w
+    if inFn:
+        addLocalVar(valName, valType2)
+    var call: Node = newNode(nkCall, iterExpr.pos)
+    call.callStyle = CallStyleParen
+    addSon(call, cgenMakeGenericCallee("TableNext", valType, iterExpr.pos))
+    addSon(call, newIdent(iterName, iterExpr.pos))
+    addSon(call, cgenMakePrefixNode("&", newIdent(idxName, iterExpr.pos), iterExpr.pos))
+    addSon(call, cgenMakePrefixNode("&", newIdent(keyName, iterExpr.pos), iterExpr.pos))
+    addSon(call, cgenMakePrefixNode("&", newIdent(valName, iterExpr.pos), iterExpr.pos))
+    cwIndent w
+    cwWrite(w, "while (")
+    cgenEmitExpr(w, call)
+    cwWrite(w, ") {")
+    cwNewline w
+    cwIndentPush w
+    cgenEmitStmtList(w, body)
+    cwIndentPop w
+    cwIndent w
+    cwWrite(w, "}")
+    cwNewline w
+
+fn emitFor(w: CWriter*, n: Node) =
+    if kidCount n < 3:
+        return
+    cwIndent w
+    cwWrite(w, "{")
+    cwNewline w
+    cwIndentPush w
+    if inFn:
+        cgenScopePush()
+    let rawPat: Node = kid(n, 0)
+    let iterExpr: Node = kid(n, 1)
+    let body: Node = kid(n, 2)
+    let patNode: Node = rawPat
+    var handled: bool = false
+    if cgenIsRangeExpr iterExpr:
+        emitForRange(w, n)
+        handled = true
+    let iterCore: Node = unwrapParExpr iterExpr
+    if ! handled && iterCore != nil && iterCore.kind == nkSeqLit:
+        var litType: Node = inferSimpleTypeNode iterCore
+        if litType == nil || litType.kind == nkEmpty:
+            cgenAddError(iterExpr.pos, "C backend requires seq type for seq literal iteration")
+        else:
+            litType = cgenNormalizeSeqLitType(litType)
+            let tmpName: str = cgenNextTempName("seq")
+            cwIndent w
+            emitTypeName(w, litType)
+            cwWrite(w, " ")
+            cwWrite(w, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+            if inFn:
+                addLocalVar(tmpName, litType)
+            cgenEmitSeqLitAssign(w, tmpName, litType, litType, iterCore, iterCore.pos)
+            let tmpIdent: Node = newIdent(tmpName, iterExpr.pos)
+            emitForSeq(w, n, patNode, tmpIdent, litType, body)
+        handled = true
+    if ! handled:
+        let iterType: Node = cgenInferIterType iterExpr
+        if cgenIsSeqTypeNode iterType:
+            emitForSeq(w, n, patNode, iterExpr, iterType, body)
+            handled = true
+        elif exprIsStringLike iterExpr || cgenIsStringTypeNode iterType:
+            emitForString(w, n, patNode, iterExpr, iterType, body)
+            handled = true
+        elif cgenIsTableTypeNode iterType:
+            emitForTable(w, n, patNode, iterExpr, iterType, body)
+            handled = true
+    if ! handled:
+        cgenAddError(iterExpr.pos, "[C-Profile] not-mapped: for-in iterator (FULLC.L06). hint: lower to index loop or TableNext.")
+    cwIndentPop w
+    if inFn:
+        cgenEmitCurrentScopeCleanup(w, "")
+        cgenScopePopWithoutEmit()
+    cwIndent w
+    cwWrite(w, "}")
+    cwNewline w
+
+fn emitVarDecl(w: CWriter*, n: Node) =
+    var rawPat: Node = nil
+    if kidCount n > 0:
+        rawPat = kid(n, 0)
+    var typeNode: Node = cgenVarTypeNode n
+    var val: Node = nil
+    if kidCount n > 2:
+        val = kid(n, 2)
+    let coreVal: Node = unwrapParExpr val
+    if rawPat == nil:
+        cgenAddError(n.pos, "C backend requires a binding pattern")
+        return
+    var parTuple: bool = false
+    if rawPat.kind == nkPar:
+        var parType: Node = typeNode
+        if (parType == nil || parType.kind == nkEmpty) && coreVal != nil:
+            parType = inferSimpleTypeNode coreVal
+        let elemTypes: seq[Node] = cgenTupleElemTypesFromType parType
+        if elemTypes.len == 1:
+            parTuple = true
+    let head: Node = cgenPatternHead rawPat
+    let isSimpleIdent: bool = head != nil && (head.kind == nkIdent || head.kind == nkSymbol)
+    var nm: str = ""
+    if isSimpleIdent:
+        nm = cgenStripSpaces head.ident
+    if isSimpleIdent && nm != "_" && !parTuple &&(rawPat.kind == nkIdent || rawPat.kind == nkSymbol || rawPat.kind == nkPattern || rawPat.kind == nkPar):
+        if coreVal != nil && cgenIsControlFlowExpr coreVal:
+            if n.kind == nkConst:
+                cgenAddError(n.pos, "const binding cannot use control-flow initializer in C backend v0")
+                return
+            if typeNode == nil || typeNode.kind == nkEmpty:
+                typeNode = inferSimpleTypeNode coreVal
+            cgenEmitSimpleVarDecl(w, n.kind, nm, typeNode, nil, n.pos)
+            let lhs: Node = newIdent(nm, n.pos)
+            if coreVal.kind == nkIf || coreVal.kind == nkWhen:
+                cgenEmitIfAssign(w, coreVal, lhs)
+            else:
+                cgenEmitCaseAssign(w, coreVal, lhs)
+            return
+        cgenEmitSimpleVarDecl(w, n.kind, nm, typeNode, val, n.pos)
+        return
+    if ! inFn:
+        cgenAddError(n.pos, "C backend requires local scope for pattern bindings")
+        return
+    if val == nil || val.kind == nkEmpty:
+        cgenAddError(n.pos, "Pattern binding requires initializer")
+        return
+    if n.kind == nkConst:
+        cgenAddError(n.pos, "C backend does not support const pattern bindings")
+        return
+    var expectedType: Node = typeNode
+    if expectedType == nil || expectedType.kind == nkEmpty:
+        expectedType = cgenPatternType rawPat
+    let tmpName: str = cgenNextTempName("pat")
+    let tmpIdent: Node = newIdent(tmpName, n.pos)
+    if coreVal != nil && cgenIsControlFlowExpr coreVal:
+        cgenEmitSimpleVarDecl(w, nkLet, tmpName, expectedType, nil, n.pos)
+        if coreVal.kind == nkIf || coreVal.kind == nkWhen:
+            cgenEmitIfAssign(w, coreVal, tmpIdent)
+        else:
+            cgenEmitCaseAssign(w, coreVal, tmpIdent)
+    else:
+        cgenEmitSimpleVarDecl(w, nkLet, tmpName, expectedType, val, n.pos)
+    cgenEmitPatternBinding(w, n.kind, rawPat, tmpIdent, expectedType)
+
+fn emitGlobalVarDecl(w: CWriter*, n: Node) =
+    if n == nil:
+        return
+    let nameNode: Node = cgenVarNameNode n
+    var typeNode: Node = cgenVarTypeNode n
+    if nameNode == nil:
+        cgenAddError(n.pos, "C backend requires simple identifier bindings")
+        return
+    let nm: str = cgenStripSpaces nameNode.ident
+    if nm == "_":
+        cgenAddError(n.pos, "C backend does not support wildcard bindings")
+        return
+    let cname: str = cgenEscapeCIdent(nm)
+    if typeNode == nil || typeNode.kind == nkEmpty:
+        if kidCount n > 2:
+            let val0: Node = kid(n, 2)
+            typeNode = inferSimpleTypeNode val0
+    if typeNode == nil || typeNode.kind == nkEmpty:
+        cgenAddError(n.pos, "C backend requires type annotation or simple literal inference")
+        typeNode = newIdent("int32", n.pos)
+    addGlobalVar(nm, typeNode)
+    cwIndent w
+    if n.kind == nkConst:
+        cwWrite(w, "const ")
+    emitTypeName(w, typeNode)
+    cwWrite(w, " ")
+    cwWrite(w, cname)
+    let hasVal: bool = (kidCount n > 2)
+    var val: Node = nil
+    if hasVal:
+        val = kid(n, 2)
+    if n.kind == nkConst:
+        if val == nil || val.kind == nkEmpty:
+            cwWrite(w, " = ")
+            cgenEmitDefaultValue(w, typeNode)
+        elif ! isConstExpr val:
+            cgenAddError(n.pos, "const initializer must be constant in C backend v0")
+            cwWrite(w, " = ")
+            cgenEmitDefaultValue(w, typeNode)
+        else:
+            cwWrite(w, " = ")
+            cgenEmitExpr(w, val)
+    else:
+        if val != nil && val.kind != nkEmpty:
+            if isConstExpr val:
+                cwWrite(w, " = ")
+                cgenEmitExpr(w, val)
+            else:
+                cwWrite(w, " = ")
+                cgenEmitDefaultValue(w, typeNode)
+                addGlobalInit(nm, val)
+    cwWrite(w, ";")
+    cwNewline w
+
+fn emitGlobalVarExternDecl(w: CWriter*, n: Node) =
+    if w == nil || n == nil:
+        return
+    var rawPat: Node = nil
+    if kidCount n > 0:
+        rawPat = kid(n, 0)
+    if rawPat == nil:
+        return
+    let head: Node = cgenPatternHead rawPat
+    if head == nil || (head.kind != nkIdent && head.kind != nkSymbol):
+        return
+    let nm: str = cgenStripSpaces head.ident
+    if strIsEmpty(nm) || streq(nm, "_"):
+        return
+    let cname: str = cgenEscapeCIdent(nm)
+    var ty: Node = cgenVarTypeNode n
+    var val: Node = nil
+    if kidCount n > 2:
+        val = kid(n, 2)
+    if ty == nil || ty.kind == nkEmpty:
+        if val != nil && val.kind != nkEmpty:
+            ty = inferSimpleTypeNode val
+    if ty == nil || ty.kind == nkEmpty:
+        return
+    addGlobalVar(nm, ty)
+    cwIndent w
+    cwWrite(w, "extern ")
+    if n.kind == nkConst:
+        cwWrite(w, "const ")
+    emitTypeName(w, ty)
+    cwWrite(w, " ")
+    cwWrite(w, cname)
+    cwWrite(w, ";")
+    cwNewline w
+
+fn emitGlobalVarDecls(w: CWriter*, root: Node, modulePath: str) =
+    var decls: seq[Node] = newSeqWithCap[Node](0, 64)
+    collectGlobalVarDecls(root, &decls)
+    var seen: seq[str] = newSeqWithCap[str](0, 64)
+    var i: int32 = 0
+    while i < decls.len:
+        let n: Node = get[Node](decls, i)
+        if n != nil:
+            if ! shouldSkipSystem(n.strVal, modulePath):
+                let nameNode: Node = cgenVarNameNode n
+                var nm: str = ""
+                if nameNode != nil:
+                    nm = cgenStripSpaces nameNode.ident
+                if !strIsEmpty(nm) && strSeqHas(&seen, nm):
+                    i = i + 1
+                    continue
+                if !strIsEmpty nm:
+                    addPtr[str](&seen, nm)
+                if strIsEmpty(modulePath):
+                    emitGlobalVarDecl(w, n)
+                else:
+                    let owns: bool = (!strIsEmpty(n.strVal) && modulePathMatches(n.strVal, modulePath)) || (strIsEmpty(n.strVal) && isSystemPath(modulePath))
+                    if owns:
+                        emitGlobalVarDecl(w, n)
+                    else:
+                        emitGlobalVarExternDecl(w, n)
+        i = i + 1
+    if decls.len > 0:
+        cwNewline w
+    # Global var decls (including extern) populate the var-type maps. Earlier passes
+    # may have cached type inference results before globals were registered, so
+    # clear per-expression caches before emitting function bodies.
+    hashmaps.hashMapPtrIntClear(&cgenInferTypeIndex)
+    cgenInferTypeValues = newSeqWithCap[void*](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenExprStringLikeIndex)
+    cgenExprStringLikeValues = newSeqWithCap[bool](0, 256)
+    hashmaps.hashMapPtrIntClear(&cFnSigCallIndex)
+    hashmaps.hashMapPtrIntClear(&cgenCallNameIndex)
+    cgenCallNameValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenCallBracketIndex)
+    cgenCallBracketValues = newSeqWithCap[str](0, 256)
+    hashmaps.hashMapPtrIntClear(&cgenInfixSigIndex)
+
+fn emitGlobalInit(w: CWriter*) =
+    if ! hasGlobalInit:
+        return
+    cwWriteLine(w, "static NB8 __cheng_globals_inited = 0;")
+    cwWriteLine(w, "static void __cheng_init_globals(void) {")
+    cwIndentPush w
+    cwWriteLine(w, "if (__cheng_globals_inited) return;")
+    cwWriteLine(w, "__cheng_globals_inited = 1;")
+    var i: int32 = 0
+    while i < globalInitNames.len:
+        let nm: str = get[str](globalInitNames, i)
+        let val: Node = get[Node](globalInitExprs, i)
+        let coreVal: Node = unwrapParExpr val
+        if coreVal != nil && coreVal.kind == nkCall && cgenCallImportcAggRetType(coreVal) != nil:
+            cwIndent w
+            cgenEmitImportcAggCall(w, coreVal, nm)
+            cwWrite(w, ";")
+            cwNewline w
+        else:
+            if coreVal != nil && coreVal.kind == nkSeqLit:
+                var gtype: Node = lookupVarType nm
+                var seqType: Node = gtype
+                if seqType == nil || seqType.kind == nkEmpty:
+                    seqType = inferSimpleTypeNode coreVal
+                if seqType == nil || seqType.kind == nkEmpty:
+                    cgenAddError(coreVal.pos, "C backend requires seq type for seq literal global init")
+                else:
+                    cgenEmitSeqLitAssign(w, nm, gtype, seqType, coreVal, coreVal.pos)
+            else:
+                cwIndent w
+                cwWrite(w, cgenEscapeCIdent(nm))
+                cwWrite(w, " = ")
+                cgenEmitExpr(w, val)
+                cwWrite(w, ";")
+                cwNewline w
+        i = i + 1
+    cwIndentPop w
+    cwWriteLine(w, "}")
+    cwNewline w
+

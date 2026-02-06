@@ -1,0 +1,759 @@
+# MIR v1 SSA pass (minimal): builds SSA-like renaming + inserts edge moves (phi elimination).
+# Notes:
+# - Keeps object-local pointer slots (MirObjLocal.slot) out of SSA, because isel initializes them by slot index.
+# - Excludes addr-taken locals (meAddr) from SSA.
+import std/seqs
+import std/strings
+import std/result
+import std/hashmaps
+import cheng/backend/mir/mir_types
+
+type
+    SsaPhiDef =
+        varId: int32
+        destSlot: int32
+
+    SsaMove =
+        destSlot: int32
+        srcSlot: int32
+
+    SsaEdgeMoves = ref
+        fromIdx: int32
+        toIdx: int32
+        fromLabel: str
+        toLabel: str
+        moves: seq[SsaMove]
+
+    SsaRenameCtx = ref
+        func: MirFunc
+        baseCount: int32
+        blockCount: int32
+        idom: seq[int32]
+        domChildren: seq[seq[int32]]
+        succs: seq[seq[int32]]
+        phiDefsByBlock: seq[seq[SsaPhiDef]]
+        isCandidate: seq[bool]
+        varTop: seq[int32]
+        stackVal: seq[int32]
+        stackPrev: seq[int32]
+        edgeMoves: seq[SsaEdgeMoves]
+
+fn ssaNewSeq2DInt(n: int32): seq[seq[int32]] =
+    var out: seq[seq[int32]] = newSeq[seq[int32]]()
+    var i: int32 = 0
+    while i < n:
+        addPtr[seq[int32]](&out, newSeq[int32]())
+        i = i + 1
+    return out
+
+fn ssaNewSeq2DPhiDef(n: int32): seq[seq[SsaPhiDef]] =
+    var out: seq[seq[SsaPhiDef]] = newSeq[seq[SsaPhiDef]]()
+    var i: int32 = 0
+    while i < n:
+        addPtr[seq[SsaPhiDef]](&out, newSeq[SsaPhiDef]())
+        i = i + 1
+    return out
+
+fn ssaSeqContainsInt(items: seq[int32], v: int32): bool =
+    var i: int32 = 0
+    while i < items.len:
+        if get[int32](items, i) == v:
+            return true
+        i = i + 1
+    return false
+
+fn ssaSeqAddUniqueInt(items: seq[int32]*, v: int32) =
+    if items == nil:
+        return
+    if ssaSeqContainsInt(*items, v):
+        return
+    addPtr[int32](items, v)
+
+fn ssa2dAddUniqueInt(items: seq[seq[int32]]*, idx: int32, v: int32) =
+    if items == nil:
+        return
+    if idx < 0 || idx >= items->len:
+        return
+    var inner: seq[int32] = get[seq[int32]](*items, idx)
+    if ! ssaSeqContainsInt(inner, v):
+        addPtr[int32](&inner, v)
+        setPtr[seq[int32]](items, idx, inner)
+
+fn ssaSortIntsStable(items: seq[int32]*): bool =
+    if items == nil || items->len <= 1:
+        return false
+    var changed: bool = false
+    var i: int32 = 1
+    while i < items->len:
+        let key: int32 = get[int32](*items, i)
+        var j: int32 = i - 1
+        while j >= 0 && get[int32](*items, j) > key:
+            setPtr[int32](items, j + 1, get[int32](*items, j))
+            j = j - 1
+            changed = true
+        setPtr[int32](items, j + 1, key)
+        i = i + 1
+    return changed
+
+fn ssaMarkAddrTaken(expr: MirExpr, addrTaken: seq[bool]*) =
+    if expr == nil || addrTaken == nil:
+        return
+    if expr.kind == meAddr:
+        let slot: int32 = expr.localIndex
+        if slot >= 0 && slot < addrTaken->len:
+            setPtr[bool](addrTaken, slot, true)
+        return
+    if expr.kind == meLoad:
+        ssaMarkAddrTaken(expr.addrExpr, addrTaken)
+        return
+    if expr.kind == meBin || expr.kind == meCmp:
+        ssaMarkAddrTaken(expr.lhs, addrTaken)
+        ssaMarkAddrTaken(expr.rhs, addrTaken)
+        return
+    if expr.kind == meCall:
+        var i: int32 = 0
+        while i < expr.args.len:
+            ssaMarkAddrTaken(get[MirExpr](expr.args, i), addrTaken)
+            i = i + 1
+        return
+    if expr.kind == meCast:
+        ssaMarkAddrTaken(expr.castExpr, addrTaken)
+        return
+    return
+
+fn ssaAllocSlot(func: MirFunc, baseSlot: int32): int32 =
+    if func == nil:
+        return -1
+    let idx: int32 = func.localTypes.len
+    var ty: MirType = mirTypeI32()
+    if baseSlot >= 0 && baseSlot < func.localTypes.len:
+        ty = get[MirType](func.localTypes, baseSlot)
+    addPtr[MirType](&func.localTypes, ty)
+    return idx
+
+fn ssaPush(varTop: seq[int32]*, stackVal: seq[int32]*, stackPrev: seq[int32]*,
+           varId: int32, value: int32) =
+    if varTop == nil || stackVal == nil || stackPrev == nil:
+        return
+    if varId < 0 || varId >= varTop->len:
+        return
+    let rec: int32 = stackVal->len
+    addPtr[int32](stackVal, value)
+    addPtr[int32](stackPrev, get[int32](*varTop, varId))
+    setPtr[int32](varTop, varId, rec)
+
+fn ssaPop(varTop: seq[int32]*, stackPrev: seq[int32], varId: int32) =
+    if varTop == nil:
+        return
+    if varId < 0 || varId >= varTop->len:
+        return
+    let rec: int32 = get[int32](*varTop, varId)
+    if rec < 0 || rec >= stackPrev.len:
+        return
+    setPtr[int32](varTop, varId, get[int32](stackPrev, rec))
+
+fn ssaCurrentSlot(varId: int32, varTop: seq[int32], stackVal: seq[int32]): int32 =
+    if varId < 0 || varId >= varTop.len:
+        return varId
+    let rec: int32 = get[int32](varTop, varId)
+    if rec < 0 || rec >= stackVal.len:
+        return varId
+    return get[int32](stackVal, rec)
+
+fn ssaRewriteExpr(expr: MirExpr, baseCount: int32, isCandidate: seq[bool],
+                  varTop: seq[int32], stackVal: seq[int32]): Result[bool] =
+    if expr == nil:
+        return Ok[bool](true)
+    if expr.kind == meLocal:
+        let base: int32 = expr.localIndex
+        if base >= 0 && base < baseCount && get[bool](isCandidate, base):
+            expr.localIndex = ssaCurrentSlot(base, varTop, stackVal)
+        return Ok[bool](true)
+    if expr.kind == meAddr:
+        return Ok[bool](true)
+    if expr.kind == meLoad:
+        return ssaRewriteExpr(expr.addrExpr, baseCount, isCandidate, varTop, stackVal)
+    if expr.kind == meGlobalAddr:
+        return Ok[bool](true)
+    if expr.kind == meBin || expr.kind == meCmp:
+        let l: Result[bool] = ssaRewriteExpr(expr.lhs, baseCount, isCandidate, varTop, stackVal)
+        if ! IsOk[bool](l):
+            return l
+        return ssaRewriteExpr(expr.rhs, baseCount, isCandidate, varTop, stackVal)
+    if expr.kind == meCall:
+        var i: int32 = 0
+        while i < expr.args.len:
+            let a: Result[bool] = ssaRewriteExpr(get[MirExpr](expr.args, i), baseCount, isCandidate,
+                                                 varTop, stackVal)
+            if ! IsOk[bool](a):
+                return a
+            i = i + 1
+        return Ok[bool](true)
+    if expr.kind == meCast:
+        return ssaRewriteExpr(expr.castExpr, baseCount, isCandidate, varTop, stackVal)
+    return Ok[bool](true)
+
+fn ssaIntersect(b1: int32, b2: int32, idom: seq[int32], rpoIndex: seq[int32]): int32 =
+    var f1: int32 = b1
+    var f2: int32 = b2
+    while f1 != f2:
+        while f1 >= 0 && f2 >= 0 && get[int32](rpoIndex, f1) > get[int32](rpoIndex, f2):
+            let n1: int32 = get[int32](idom, f1)
+            if n1 == f1:
+                break
+            f1 = n1
+        while f2 >= 0 && f1 >= 0 && get[int32](rpoIndex, f2) > get[int32](rpoIndex, f1):
+            let n2: int32 = get[int32](idom, f2)
+            if n2 == f2:
+                break
+            f2 = n2
+    return f1
+
+fn ssaEdgeLess(a: SsaEdgeMoves, b: SsaEdgeMoves): bool =
+    if a == nil || b == nil:
+        return false
+    let c: int32 = mirStrCmp(a.toLabel, b.toLabel)
+    if c < 0:
+        return true
+    if c > 0:
+        return false
+    return mirStrCmp(a.fromLabel, b.fromLabel) < 0
+
+fn ssaSortEdgesStable(edges: seq[SsaEdgeMoves]*): bool =
+    if edges == nil || edges->len <= 1:
+        return false
+    var changed: bool = false
+    var i: int32 = 1
+    while i < edges->len:
+        let key: SsaEdgeMoves = get[SsaEdgeMoves](*edges, i)
+        var j: int32 = i - 1
+        while j >= 0 && ssaEdgeLess(key, get[SsaEdgeMoves](*edges, j)):
+            setPtr[SsaEdgeMoves](edges, j + 1, get[SsaEdgeMoves](*edges, j))
+            j = j - 1
+            changed = true
+        setPtr[SsaEdgeMoves](edges, j + 1, key)
+        i = i + 1
+    return changed
+
+fn ssaRenameBlock(ctx: SsaRenameCtx, bi: int32): Result[bool] =
+    if ctx == nil:
+        return Err[bool]("mir_ssa: nil ctx")
+    let func: MirFunc = ctx.func
+    let n: int32 = ctx.blockCount
+    if func == nil || n <= 0:
+        return Ok[bool](true)
+    if bi < 0 || bi >= n:
+        return Ok[bool](true)
+    if get[int32](ctx.idom, bi) == -1:
+        return Ok[bool](true)
+    let blk: MirBlock = get[MirBlock](func.blocks, bi)
+    if blk == nil:
+        return Ok[bool](true)
+
+    var pushed: seq[int32] = newSeq[int32]()
+
+    let phis: seq[SsaPhiDef] = get[seq[SsaPhiDef]](ctx.phiDefsByBlock, bi)
+    var pi: int32 = 0
+    while pi < phis.len:
+        let pd: SsaPhiDef = get[SsaPhiDef](phis, pi)
+        ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, pd.varId, pd.destSlot)
+        addPtr[int32](&pushed, pd.varId)
+        pi = pi + 1
+
+    var si: int32 = 0
+    while si < blk.stmts.len:
+        var st: MirStmt = get[MirStmt](blk.stmts, si)
+        if st.kind == msLet || st.kind == msVar || st.kind == msAssign:
+            let rr: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
+                                                  ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rr):
+                return rr
+            let base: int32 = st.slot
+            if base >= 0 && base < ctx.baseCount && get[bool](ctx.isCandidate, base):
+                let ns: int32 = ssaAllocSlot(func, base)
+                st.slot = ns
+                ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, base, ns)
+                addPtr[int32](&pushed, base)
+            setPtr[MirStmt](&blk.stmts, si, st)
+        elif st.kind == msParam:
+            let base2: int32 = st.slot
+            if base2 >= 0 && base2 < ctx.baseCount && get[bool](ctx.isCandidate, base2):
+                let ns2: int32 = ssaAllocSlot(func, base2)
+                st.slot = ns2
+                ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, base2, ns2)
+                addPtr[int32](&pushed, base2)
+                setPtr[MirStmt](&blk.stmts, si, st)
+        elif st.kind == msStore:
+            let rrA: Result[bool] = ssaRewriteExpr(st.addrExpr, ctx.baseCount, ctx.isCandidate,
+                                                   ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rrA):
+                return rrA
+            let rrV: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
+                                                   ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rrV):
+                return rrV
+            setPtr[MirStmt](&blk.stmts, si, st)
+        else:
+            let rr2: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
+                                                   ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rr2):
+                return rr2
+            setPtr[MirStmt](&blk.stmts, si, st)
+        si = si + 1
+
+    if blk.term.kind == mtRet && blk.term.retExpr != nil:
+        let rr3: Result[bool] = ssaRewriteExpr(blk.term.retExpr, ctx.baseCount, ctx.isCandidate,
+                                               ctx.varTop, ctx.stackVal)
+        if ! IsOk[bool](rr3):
+            return rr3
+    elif blk.term.kind == mtCbr && blk.term.condExpr != nil:
+        let rr4: Result[bool] = ssaRewriteExpr(blk.term.condExpr, ctx.baseCount, ctx.isCandidate,
+                                               ctx.varTop, ctx.stackVal)
+        if ! IsOk[bool](rr4):
+            return rr4
+
+    let succList: seq[int32] = get[seq[int32]](ctx.succs, bi)
+    var sxi: int32 = 0
+    while sxi < succList.len:
+        let toIdx: int32 = get[int32](succList, sxi)
+        if toIdx >= 0 && toIdx < n:
+            let toPhis: seq[SsaPhiDef] = get[seq[SsaPhiDef]](ctx.phiDefsByBlock, toIdx)
+            if toPhis.len > 0:
+                var moves: seq[SsaMove] = newSeq[SsaMove]()
+                var mi: int32 = 0
+                while mi < toPhis.len:
+                    let pd2: SsaPhiDef = get[SsaPhiDef](toPhis, mi)
+                    var mv: SsaMove
+                    mv.destSlot = pd2.destSlot
+                    mv.srcSlot = ssaCurrentSlot(pd2.varId, ctx.varTop, ctx.stackVal)
+                    addPtr[SsaMove](&moves, mv)
+                    mi = mi + 1
+                if moves.len > 0:
+                    var em: SsaEdgeMoves
+                    new em
+                    em.fromIdx = bi
+                    em.toIdx = toIdx
+                    em.fromLabel = blk.label
+                    let toBlk: MirBlock = get[MirBlock](func.blocks, toIdx)
+                    em.toLabel = toBlk.label
+                    em.moves = moves
+                    addPtr[SsaEdgeMoves](&ctx.edgeMoves, em)
+        sxi = sxi + 1
+
+    let kids: seq[int32] = get[seq[int32]](ctx.domChildren, bi)
+    var ci: int32 = 0
+    while ci < kids.len:
+        let kres: Result[bool] = ssaRenameBlock(ctx, get[int32](kids, ci))
+        if ! IsOk[bool](kres):
+            return kres
+        ci = ci + 1
+
+    while pushed.len > 0:
+        let vid: int32 = get[int32](pushed, pushed.len - 1)
+        pushed.len = pushed.len - 1
+        ssaPop(&ctx.varTop, ctx.stackPrev, vid)
+    return Ok[bool](true)
+
+fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
+    if func == nil:
+        return Ok[bool](true)
+    if func.isExtern:
+        return Ok[bool](true)
+    let baseCount: int32 = func.localTypes.len
+    if baseCount <= 0:
+        return Ok[bool](true)
+    let n: int32 = func.blocks.len
+    if n <= 0:
+        return Ok[bool](true)
+
+    var labelMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(n * 2 + 8)
+    var bi: int32 = 0
+    while bi < n:
+        let b: MirBlock = get[MirBlock](func.blocks, bi)
+        if b == nil || b.label == nil || len(b.label) == 0:
+            return Err[bool]("mir_ssa: missing block label (" + func.name + ")")
+        hashmaps.hashMapStrIntPut(&labelMap, b.label, bi)
+        bi = bi + 1
+
+    var preds: seq[seq[int32]] = ssaNewSeq2DInt(n)
+    var succs: seq[seq[int32]] = ssaNewSeq2DInt(n)
+    bi = 0
+    while bi < n:
+        let b2: MirBlock = get[MirBlock](func.blocks, bi)
+        if b2 == nil:
+            bi = bi + 1
+            continue
+        if b2.term.kind == mtBr:
+            var found: bool = false
+            let si: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.target, &found)
+            if ! found:
+                return Err[bool]("mir_ssa: br target not found (" + func.name + ":" + b2.label + ")")
+            ssa2dAddUniqueInt(&succs, bi, si)
+            ssa2dAddUniqueInt(&preds, si, bi)
+        elif b2.term.kind == mtCbr:
+            var foundT: bool = false
+            var foundF: bool = false
+            let st: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetTrue, &foundT)
+            let sf: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetFalse, &foundF)
+            if ! foundT || ! foundF:
+                return Err[bool]("mir_ssa: cbr target not found (" + func.name + ":" + b2.label + ")")
+            ssa2dAddUniqueInt(&succs, bi, st)
+            ssa2dAddUniqueInt(&succs, bi, sf)
+            ssa2dAddUniqueInt(&preds, st, bi)
+            ssa2dAddUniqueInt(&preds, sf, bi)
+        bi = bi + 1
+
+    var foundEntry: bool = false
+    var entry: int32 = hashmaps.hashMapStrIntGet(labelMap, "entry", &foundEntry)
+    if ! foundEntry:
+        entry = 0
+
+    # Reverse postorder of reachable CFG.
+    var visited: seq[bool] = newSeq[bool]()
+    var i2: int32 = 0
+    while i2 < n:
+        addPtr[bool](&visited, false)
+        i2 = i2 + 1
+    var stackNodes: seq[int32] = newSeq[int32]()
+    var stackNext: seq[int32] = newSeq[int32]()
+    var post: seq[int32] = newSeq[int32]()
+    if entry >= 0 && entry < n:
+        setPtr[bool](&visited, entry, true)
+        addPtr[int32](&stackNodes, entry)
+        addPtr[int32](&stackNext, 0)
+    while stackNodes.len > 0:
+        let topIdx: int32 = stackNodes.len - 1
+        let v: int32 = get[int32](stackNodes, topIdx)
+        let nextI: int32 = get[int32](stackNext, topIdx)
+        let vsucc: seq[int32] = get[seq[int32]](succs, v)
+        if nextI < vsucc.len:
+            let s: int32 = get[int32](vsucc, nextI)
+            setPtr[int32](&stackNext, topIdx, nextI + 1)
+            if s >= 0 && s < n && ! get[bool](visited, s):
+                setPtr[bool](&visited, s, true)
+                addPtr[int32](&stackNodes, s)
+                addPtr[int32](&stackNext, 0)
+        else:
+            addPtr[int32](&post, v)
+            stackNodes.len = topIdx
+            stackNext.len = topIdx
+
+    var rpo: seq[int32] = newSeq[int32]()
+    i2 = post.len - 1
+    while i2 >= 0:
+        addPtr[int32](&rpo, get[int32](post, i2))
+        i2 = i2 - 1
+
+    # rpoIndex for intersect; unreachable blocks get a large index.
+    var rpoIndex: seq[int32] = newSeq[int32]()
+    i2 = 0
+    while i2 < n:
+        addPtr[int32](&rpoIndex, 1000000000)
+        i2 = i2 + 1
+    i2 = 0
+    while i2 < rpo.len:
+        setPtr[int32](&rpoIndex, get[int32](rpo, i2), i2)
+        i2 = i2 + 1
+
+    # idom via Cooper-Harvey-Kennedy.
+    var idom: seq[int32] = newSeq[int32]()
+    i2 = 0
+    while i2 < n:
+        addPtr[int32](&idom, -1)
+        i2 = i2 + 1
+    if entry >= 0 && entry < n:
+        setPtr[int32](&idom, entry, entry)
+    var changed: bool = true
+    while changed:
+        changed = false
+        i2 = 0
+        while i2 < rpo.len:
+            let b3: int32 = get[int32](rpo, i2)
+            if b3 == entry:
+                i2 = i2 + 1
+                continue
+            let ps: seq[int32] = get[seq[int32]](preds, b3)
+            var newIdom: int32 = -1
+            var pi: int32 = 0
+            while pi < ps.len:
+                let p: int32 = get[int32](ps, pi)
+                if p >= 0 && p < n && get[int32](idom, p) != -1:
+                    if newIdom == -1:
+                        newIdom = p
+                    else:
+                        newIdom = ssaIntersect(p, newIdom, idom, rpoIndex)
+                pi = pi + 1
+            if newIdom != -1 && get[int32](idom, b3) != newIdom:
+                setPtr[int32](&idom, b3, newIdom)
+                changed = true
+            i2 = i2 + 1
+
+    var domChildren: seq[seq[int32]] = ssaNewSeq2DInt(n)
+    bi = 0
+    while bi < n:
+        if bi != entry:
+            let p2: int32 = get[int32](idom, bi)
+            if p2 >= 0 && p2 < n && p2 != bi:
+                ssa2dAddUniqueInt(&domChildren, p2, bi)
+        bi = bi + 1
+
+    # Dominance frontier.
+    var df: seq[seq[int32]] = ssaNewSeq2DInt(n)
+    bi = 0
+    while bi < n:
+        let ps2: seq[int32] = get[seq[int32]](preds, bi)
+        if ps2.len >= 2:
+            var pi2: int32 = 0
+            while pi2 < ps2.len:
+                var runner: int32 = get[int32](ps2, pi2)
+                while runner >= 0 && runner < n && runner != get[int32](idom, bi):
+                    ssa2dAddUniqueInt(&df, runner, bi)
+                    let next2: int32 = get[int32](idom, runner)
+                    if next2 == runner:
+                        break
+                    runner = next2
+                pi2 = pi2 + 1
+        bi = bi + 1
+
+    # Candidate locals: exclude addr-taken + object-local pointer slots.
+    var addrTaken: seq[bool] = newSeq[bool]()
+    i2 = 0
+    while i2 < baseCount:
+        addPtr[bool](&addrTaken, false)
+        i2 = i2 + 1
+    bi = 0
+    while bi < n:
+        let bb: MirBlock = get[MirBlock](func.blocks, bi)
+        if bb != nil:
+            var si: int32 = 0
+            while si < bb.stmts.len:
+                let s2: MirStmt = get[MirStmt](bb.stmts, si)
+                if s2.kind == msLet || s2.kind == msVar || s2.kind == msAssign:
+                    ssaMarkAddrTaken(s2.expr, &addrTaken)
+                elif s2.kind == msStore:
+                    ssaMarkAddrTaken(s2.addrExpr, &addrTaken)
+                    ssaMarkAddrTaken(s2.expr, &addrTaken)
+                else:
+                    ssaMarkAddrTaken(s2.expr, &addrTaken)
+                si = si + 1
+            if bb.term.kind == mtRet:
+                ssaMarkAddrTaken(bb.term.retExpr, &addrTaken)
+            elif bb.term.kind == mtCbr:
+                ssaMarkAddrTaken(bb.term.condExpr, &addrTaken)
+        bi = bi + 1
+
+    var isCandidate: seq[bool] = newSeq[bool]()
+    i2 = 0
+    while i2 < baseCount:
+        addPtr[bool](&isCandidate, true)
+        i2 = i2 + 1
+    i2 = 0
+    while i2 < baseCount:
+        if get[bool](addrTaken, i2):
+            setPtr[bool](&isCandidate, i2, false)
+        i2 = i2 + 1
+    var oi: int32 = 0
+    while oi < func.objLocals.len:
+        let ol: MirObjLocal = get[MirObjLocal](func.objLocals, oi)
+        if ol.slot >= 0 && ol.slot < baseCount:
+            setPtr[bool](&isCandidate, ol.slot, false)
+        oi = oi + 1
+
+    # defBlocks[var] = blocks defining base slot.
+    var defBlocks: seq[seq[int32]] = ssaNewSeq2DInt(baseCount)
+    bi = 0
+    while bi < n:
+        let bb2: MirBlock = get[MirBlock](func.blocks, bi)
+        if bb2 != nil:
+            var si2: int32 = 0
+            while si2 < bb2.stmts.len:
+                let s3: MirStmt = get[MirStmt](bb2.stmts, si2)
+                if s3.kind == msLet || s3.kind == msVar || s3.kind == msAssign || s3.kind == msParam:
+                    let v: int32 = s3.slot
+                    if v >= 0 && v < baseCount && get[bool](isCandidate, v):
+                        ssa2dAddUniqueInt(&defBlocks, v, bi)
+                si2 = si2 + 1
+        bi = bi + 1
+
+    # Place phi vars by dominance frontier.
+    var phiVarsByBlock: seq[seq[int32]] = ssaNewSeq2DInt(n)
+    var vId: int32 = 0
+    while vId < baseCount:
+        if ! get[bool](isCandidate, vId):
+            vId = vId + 1
+            continue
+        let defs0: seq[int32] = get[seq[int32]](defBlocks, vId)
+        if defs0.len <= 1:
+            vId = vId + 1
+            continue
+        var isDef: seq[bool] = newSeq[bool]()
+        i2 = 0
+        while i2 < n:
+            addPtr[bool](&isDef, false)
+            i2 = i2 + 1
+        i2 = 0
+        while i2 < defs0.len:
+            let d: int32 = get[int32](defs0, i2)
+            if d >= 0 && d < n:
+                setPtr[bool](&isDef, d, true)
+            i2 = i2 + 1
+
+        var hasPhi: seq[bool] = newSeq[bool]()
+        i2 = 0
+        while i2 < n:
+            addPtr[bool](&hasPhi, false)
+            i2 = i2 + 1
+
+        var work: seq[int32] = defs0
+        while work.len > 0:
+            let b4: int32 = get[int32](work, work.len - 1)
+            work.len = work.len - 1
+            let frontier: seq[int32] = get[seq[int32]](df, b4)
+            var fi: int32 = 0
+            while fi < frontier.len:
+                let y: int32 = get[int32](frontier, fi)
+                if y >= 0 && y < n && ! get[bool](hasPhi, y):
+                    ssa2dAddUniqueInt(&phiVarsByBlock, y, vId)
+                    setPtr[bool](&hasPhi, y, true)
+                    if ! get[bool](isDef, y):
+                        addPtr[int32](&work, y)
+                fi = fi + 1
+        vId = vId + 1
+
+    # Sort phi var lists deterministically and pre-allocate phi dest slots.
+    var phiDefsByBlock: seq[seq[SsaPhiDef]] = ssaNewSeq2DPhiDef(n)
+    bi = 0
+    while bi < n:
+        var vars: seq[int32] = get[seq[int32]](phiVarsByBlock, bi)
+        ssaSortIntsStable(&vars)
+        setPtr[seq[int32]](&phiVarsByBlock, bi, vars)
+        var defsOut: seq[SsaPhiDef] = get[seq[SsaPhiDef]](phiDefsByBlock, bi)
+        var vi: int32 = 0
+        while vi < vars.len:
+            let varId2: int32 = get[int32](vars, vi)
+            let dest: int32 = ssaAllocSlot(func, varId2)
+            var pd: SsaPhiDef
+            pd.varId = varId2
+            pd.destSlot = dest
+            addPtr[SsaPhiDef](&defsOut, pd)
+            vi = vi + 1
+        setPtr[seq[SsaPhiDef]](&phiDefsByBlock, bi, defsOut)
+        bi = bi + 1
+
+    # Renaming over dominator tree; record edge moves for phi elimination.
+    var ctx: SsaRenameCtx
+    new ctx
+    ctx.func = func
+    ctx.baseCount = baseCount
+    ctx.blockCount = n
+    ctx.idom = idom
+    ctx.domChildren = domChildren
+    ctx.succs = succs
+    ctx.phiDefsByBlock = phiDefsByBlock
+    ctx.isCandidate = isCandidate
+    ctx.varTop = newSeq[int32]()
+    i2 = 0
+    while i2 < baseCount:
+        addPtr[int32](&ctx.varTop, -1)
+        i2 = i2 + 1
+    ctx.stackVal = newSeq[int32]()
+    ctx.stackPrev = newSeq[int32]()
+    i2 = 0
+    while i2 < baseCount:
+        if get[bool](isCandidate, i2):
+            ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, i2, i2)
+        i2 = i2 + 1
+    ctx.edgeMoves = newSeq[SsaEdgeMoves]()
+
+    let rrAll: Result[bool] = ssaRenameBlock(ctx, entry)
+    if ! IsOk[bool](rrAll):
+        return rrAll
+
+    ssaSortEdgesStable(&ctx.edgeMoves)
+
+    # Apply phi elimination moves with safe placement:
+    # - from has single succ: append to from
+    # - else if to has single pred: prepend to to
+    # - else split edge and insert moves in new block
+    var succCount: seq[int32] = newSeq[int32]()
+    var predCount: seq[int32] = newSeq[int32]()
+    bi = 0
+    while bi < n:
+        let succList2: seq[int32] = get[seq[int32]](succs, bi)
+        let predList2: seq[int32] = get[seq[int32]](preds, bi)
+        addPtr[int32](&succCount, succList2.len)
+        addPtr[int32](&predCount, predList2.len)
+        bi = bi + 1
+
+    var ei: int32 = 0
+    while ei < ctx.edgeMoves.len:
+        let em2: SsaEdgeMoves = get[SsaEdgeMoves](ctx.edgeMoves, ei)
+        if em2 == nil || em2.moves.len == 0:
+            ei = ei + 1
+            continue
+        let fromBlk: MirBlock = get[MirBlock](func.blocks, em2.fromIdx)
+        if fromBlk == nil:
+            ei = ei + 1
+            continue
+        let fromSucc: int32 = get[int32](succCount, em2.fromIdx)
+        let toPred: int32 = get[int32](predCount, em2.toIdx)
+        if fromSucc == 1:
+            var mi: int32 = 0
+            while mi < em2.moves.len:
+                let mv: SsaMove = get[SsaMove](em2.moves, mi)
+                addPtr[MirStmt](&fromBlk.stmts, mirStmtAssign("", mv.destSlot, mirLocal(mv.srcSlot)))
+                mi = mi + 1
+            ei = ei + 1
+            continue
+        if toPred == 1:
+            let toBlk: MirBlock = get[MirBlock](func.blocks, em2.toIdx)
+            if toBlk == nil:
+                return Err[bool]("mir_ssa: missing to block (" + func.name + ")")
+            var newStmts: seq[MirStmt] = newSeq[MirStmt]()
+            var mi2: int32 = 0
+            while mi2 < em2.moves.len:
+                let mv2: SsaMove = get[SsaMove](em2.moves, mi2)
+                addPtr[MirStmt](&newStmts, mirStmtAssign("", mv2.destSlot, mirLocal(mv2.srcSlot)))
+                mi2 = mi2 + 1
+            mi2 = 0
+            while mi2 < toBlk.stmts.len:
+                addPtr[MirStmt](&newStmts, get[MirStmt](toBlk.stmts, mi2))
+                mi2 = mi2 + 1
+            toBlk.stmts = newStmts
+            ei = ei + 1
+            continue
+
+        # Split edge.
+        let h: int64 = mirFnv1a64(func.name + ":" + em2.fromLabel + "->" + em2.toLabel)
+        var newLabel: str = "ssa_phi_edge_" + mirU64ToHex(h)
+        var stmtsOut: seq[MirStmt] = newSeq[MirStmt]()
+        var mi3: int32 = 0
+        while mi3 < em2.moves.len:
+            let mv3: SsaMove = get[SsaMove](em2.moves, mi3)
+            addPtr[MirStmt](&stmtsOut, mirStmtAssign("", mv3.destSlot, mirLocal(mv3.srcSlot)))
+            mi3 = mi3 + 1
+        let nb: MirBlock = mirBlockWithStmts(newLabel, stmtsOut, mirTermBr(em2.toLabel))
+        mirAddBlock(func, nb)
+        if fromBlk.term.kind == mtBr:
+            if streq(fromBlk.term.target, em2.toLabel):
+                fromBlk.term.target = newLabel
+        elif fromBlk.term.kind == mtCbr:
+            if streq(fromBlk.term.targetTrue, em2.toLabel):
+                fromBlk.term.targetTrue = newLabel
+            if streq(fromBlk.term.targetFalse, em2.toLabel):
+                fromBlk.term.targetFalse = newLabel
+        ei = ei + 1
+
+    return Ok[bool](true)
+
+fn mirSsaLowerModule(module: MirModule): Result[bool] =
+    if module == nil:
+        return Ok[bool](true)
+    var i: int32 = 0
+    while i < module.funcs.len:
+        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let r: Result[bool] = mirSsaLowerFunc(module, f)
+        if ! IsOk[bool](r):
+            return r
+        i = i + 1
+    return Ok[bool](true)

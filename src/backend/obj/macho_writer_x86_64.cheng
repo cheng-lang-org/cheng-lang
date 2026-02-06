@@ -1,0 +1,1128 @@
+# Mach-O 64 relocatable (.o) writer for x86_64 (MVP subset).
+import std/seqs
+import std/strings
+import std/result
+import cheng/backend/lir/lir_types
+import cheng/backend/obj/obj_buf
+
+type
+    MachoX64Reloc = ref
+        off: uint32
+        sym: str
+        rtype: uint8
+        pcrel: bool
+        rlen: uint8
+
+    MachoX64Sym = ref
+        name: str
+        nType: uint8
+        nSect: uint8
+        nDesc: uint16
+        nValue: uint64
+        nameOff: uint32
+
+    TextFixup = ref
+        dispOff: int32
+        nextOff: int32
+        label: str
+
+const
+    MH_MAGIC_64: uint32 = 0xFEEDFACF
+    CPU_TYPE_X86_64: uint32 = 0x01000007
+    CPU_SUBTYPE_X86_64_ALL: uint32 = 3
+    MH_OBJECT: uint32 = 1
+
+    LC_SEGMENT_64: uint32 = 0x19
+    LC_SYMTAB: uint32 = 0x2
+    LC_DYSYMTAB: uint32 = 0xB
+    LC_BUILD_VERSION: uint32 = 0x32
+
+    PLATFORM_MACOS: uint32 = 1
+
+    # nlist_64: n_type bits
+    N_UNDF: uint8 = 0x0
+    N_SECT: uint8 = 0xE
+    N_EXT: uint8 = 0x1
+
+    # section flags
+    S_ZEROFILL: uint32 = 0x1
+    S_CSTRING_LITERALS: uint32 = 0x2
+    S_ATTR_PURE_INSTRUCTIONS: uint32 = 0x80000000
+    S_ATTR_SOME_INSTRUCTIONS: uint32 = 0x00000400
+
+    # x86_64 relocation types (Mach-O)
+    X86_64_RELOC_UNSIGNED: uint8 = 0
+    X86_64_RELOC_SIGNED: uint8 = 1
+    X86_64_RELOC_BRANCH: uint8 = 2
+
+fn macho_strContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    var i: int32 = 0
+    while i <= n - m:
+        var j: int32 = 0
+        while j < m && charAt(hay, i + j) == charAt(needle, j):
+            j = j + 1
+        if j == m:
+            return true
+        i = i + 1
+    return false
+
+fn macho_targetIsDarwin(target: str): bool =
+    if target == nil || len(target) == 0:
+        return true
+    return macho_strContains(target, "apple") || macho_strContains(target, "darwin") || macho_strContains(target, "ios")
+
+fn machoSymPrefix(target: str): str =
+    return macho_targetIsDarwin(target) ? "_" : ""
+
+fn macho_strCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    var i: int32 = 0
+    while i < n:
+        let ca: int32 = int32(int64(charAt(a, i)) & int64(0xFF))
+        let cb: int32 = int32(int64(charAt(b, i)) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+        i = i + 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn macho_seqContainsStr(items: seq[str], value: str): bool =
+    var i: int32 = 0
+    while i < items.len:
+        if streq(get[str](items, i), value):
+            return true
+        i = i + 1
+    return false
+
+fn macho_seqAddUniqueStr(items: seq[str]*, value: str) =
+    if items == nil || value == nil || len(value) == 0:
+        return
+    if macho_seqContainsStr(*items, value):
+        return
+    addPtr[str](items, value)
+
+fn macho_sortStringsStable(items: seq[str]*) =
+    if items == nil:
+        return
+    var i: int32 = 1
+    while i < items->len:
+        let key: str = get[str](*items, i)
+        var j: int32 = i - 1
+        while j >= 0 && macho_strCmp(get[str](*items, j), key) > 0:
+            setPtr[str](items, j + 1, get[str](*items, j))
+            j = j - 1
+        setPtr[str](items, j + 1, key)
+        i = i + 1
+
+fn macho_alignUp(value: uint64, align: uint64): uint64 =
+    if align == 0:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn machoAddSym(outSyms: seq[MachoX64Sym]*, name: str, nType: uint8, nSect: uint8, nValue: uint64) =
+    var s: MachoX64Sym
+    new s
+    s.name = name
+    s.nType = nType
+    s.nSect = nSect
+    s.nDesc = uint16(0)
+    s.nValue = nValue
+    s.nameOff = 0
+    addPtr[MachoX64Sym](outSyms, s)
+
+fn machoFindSymIndex(syms: seq[MachoX64Sym], name: str): int32 =
+    if name == nil:
+        return -1
+    var i: int32 = 0
+    while i < syms.len:
+        let s: MachoX64Sym = get[MachoX64Sym](syms, i)
+        if s != nil && streq(s.name, name):
+            return i
+        i = i + 1
+    return -1
+
+fn macho_findLabelOff(labels: seq[str], offs: seq[int32], label: str): Result[int32] =
+    var i: int32 = 0
+    while i < labels.len && i < offs.len:
+        if streq(get[str](labels, i), label):
+            return Ok[int32](get[int32](offs, i))
+        i = i + 1
+    return Err[int32]("macho_writer_x86_64: missing label: " + label)
+
+fn x64Is64(reg: LirReg): bool =
+    case reg
+    of lrRax, lrRcx, lrRdx, lrRbx, lrRsi, lrRdi, lrRbp:
+        return true
+    of lrR8, lrR9, lrR10, lrR11, lrR12, lrR13, lrR14, lrR15:
+        return true
+    of lrSp:
+        return true
+    else:
+        return false
+
+fn x64XmmCode(reg: LirReg): int32 =
+    case reg
+    of lrD0: return 0
+    of lrD1: return 1
+    else: return -1
+
+fn x64RegCode(reg: LirReg): int32 =
+    case reg
+    of lrRax, lrEax: return 0
+    of lrRcx, lrEcx: return 1
+    of lrRdx, lrEdx: return 2
+    of lrRbx, lrEbx: return 3
+    of lrSp: return 4
+    of lrRbp: return 5
+    of lrRsi, lrEsi: return 6
+    of lrRdi, lrEdi: return 7
+    of lrR8, lrR8d: return 8
+    of lrR9, lrR9d: return 9
+    of lrR10, lrR10d: return 10
+    of lrR11, lrR11d: return 11
+    of lrR12, lrR12d: return 12
+    of lrR13, lrR13d: return 13
+    of lrR14, lrR14d: return 14
+    of lrR15, lrR15d: return 15
+    else:
+        return -1
+
+fn x64ModRM(mod: int32, reg: int32, rm: int32): uint8 =
+    return uint8(((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7))
+
+fn x64SIB(scale: int32, index: int32, base: int32): uint8 =
+    return uint8(((scale & 3) << 6) | ((index & 7) << 3) | (base & 7))
+
+fn x64EmitRex(out: seq[uint8]*, w: bool, rBit: bool, xBit: bool, bBit: bool, force: bool) =
+    let need: bool = force || w || rBit || xBit || bBit
+    if !need:
+        return
+    let wb: uint8 = w ? uint8(8) : uint8(0)
+    let rb: uint8 = rBit ? uint8(4) : uint8(0)
+    let xb: uint8 = xBit ? uint8(2) : uint8(0)
+    let bb: uint8 = bBit ? uint8(1) : uint8(0)
+    bufU8(out, uint8(0x40) | wb | rb | xb | bb)
+
+fn x64EmitImm32(out: seq[uint8]*, imm: int64) =
+    bufU32(out, uint32(int32(imm)))
+
+fn x64EmitImm64(out: seq[uint8]*, imm: int64) =
+    bufU64(out, uint64(imm))
+
+fn x64EmitMovRegReg(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid reg in mov"
+    let rBit: bool = (src >> 3) != 0
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x89))
+    bufU8(out, x64ModRM(3, src, dst))
+
+fn x64EmitMovXmmXmm(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # movapd rd, rn
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64XmmCode(rn)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid xmm reg in mov"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, false, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x28))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitMovqXmmReg(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # movq rd(xmm), rn(gpr)
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid reg in movq xmm, gpr"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, true, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x6E))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitMovqRegXmm(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # movq rd(gpr), rn(xmm)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64XmmCode(rn)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid reg in movq gpr, xmm"
+    let rBit: bool = (src >> 3) != 0
+    let bBit: bool = (dst >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, true, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x7E))
+    bufU8(out, x64ModRM(3, src, dst))
+
+fn x64EmitMovImm(out: seq[uint8]*, rd: LirReg, imm: int64) =
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    if dst < 0:
+        panic "macho_writer_x86_64: invalid reg in mov imm"
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, false, false, bBit, false)
+    bufU8(out, uint8(0xB8 + (dst & 7)))
+    if is64:
+        x64EmitImm64(out, imm)
+    else:
+        x64EmitImm32(out, imm)
+
+fn x64EmitBinRR(out: seq[uint8]*, opcode: uint8, rd: LirReg, rn: LirReg, rm: LirReg) =
+    if rd != rn:
+        x64EmitMovRegReg(out, rd, rn)
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rm)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid reg in bin op"
+    let rBit: bool = (src >> 3) != 0
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, opcode)
+    bufU8(out, x64ModRM(3, src, dst))
+
+fn x64EmitFbinD(out: seq[uint8]*, opcode: uint8, rd: LirReg, rn: LirReg, rm: LirReg) =
+    # addsd/subsd/mulsd/divsd: F2 0F <opcode> /r
+    if rd != rn:
+        x64EmitMovXmmXmm(out, rd, rn)
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64XmmCode(rm)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid xmm reg in fbin"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0xF2))
+    x64EmitRex(out, false, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, opcode)
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitScvtfDx(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # cvtsi2sd rd(xmm), rn(gpr)
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid reg in scvtf"
+    let is64: bool = x64Is64(rn)
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0xF2))
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x2A))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitFcmpD(out: seq[uint8]*, rn: LirReg, rm: LirReg) =
+    # ucomisd rn(xmm), rm(xmm)
+    let left: int32 = x64XmmCode(rn)
+    let right: int32 = x64XmmCode(rm)
+    if left < 0 || right < 0:
+        panic "macho_writer_x86_64: invalid xmm reg in fcmp"
+    let rBit: bool = (left >> 3) != 0
+    let bBit: bool = (right >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, false, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x2E))
+    bufU8(out, x64ModRM(3, left, right))
+
+fn x64EmitCmpRR(out: seq[uint8]*, rn: LirReg, rm: LirReg) =
+    let is64: bool = x64Is64(rn)
+    let left: int32 = x64RegCode(rn)
+    let right: int32 = x64RegCode(rm)
+    if left < 0 || right < 0:
+        panic "macho_writer_x86_64: invalid reg in cmp"
+    let rBit: bool = (right >> 3) != 0
+    let bBit: bool = (left >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x39))
+    bufU8(out, x64ModRM(3, right, left))
+
+fn x64EmitShift(out: seq[uint8]*, subop: int32, rd: LirReg, rn: LirReg) =
+    if rd != rn:
+        x64EmitMovRegReg(out, rd, rn)
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    if dst < 0:
+        panic "macho_writer_x86_64: invalid reg in shift"
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, false, false, bBit, false)
+    bufU8(out, uint8(0xD3))
+    bufU8(out, x64ModRM(3, subop, dst))
+
+fn x64EmitLeaRipRel32(out: seq[uint8]*, rd: LirReg) =
+    if !x64Is64(rd):
+        panic "macho_writer_x86_64: lea riprel requires 64-bit reg"
+    let dst: int32 = x64RegCode(rd)
+    if dst < 0:
+        panic "macho_writer_x86_64: invalid reg in lea"
+    let rBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, true, rBit, false, false, false)
+    bufU8(out, uint8(0x8D))
+    bufU8(out, x64ModRM(0, dst, 5)) # RIP-relative: mod=00, r/m=101
+    x64EmitImm32(out, 0)
+
+fn x64EmitCallRel32(out: seq[uint8]*) =
+    bufU8(out, uint8(0xE8))
+    x64EmitImm32(out, 0)
+
+fn x64EmitCallReg(out: seq[uint8]*, reg: LirReg) =
+    let r: int32 = x64RegCode(reg)
+    if r < 0:
+        panic "macho_writer_x86_64: invalid reg in call reg"
+    let bBit: bool = (r >> 3) != 0
+    x64EmitRex(out, true, false, false, bBit, false)
+    bufU8(out, uint8(0xFF))
+    bufU8(out, x64ModRM(3, 2, r))
+
+fn x64EmitJmpRel32(out: seq[uint8]*) =
+    bufU8(out, uint8(0xE9))
+    x64EmitImm32(out, 0)
+
+fn x64JccCode(cond: LirCond): uint8 =
+    case cond
+    of lcEq: return uint8(0x84) # je
+    of lcNe: return uint8(0x85) # jne
+    of lcMi: return uint8(0x88) # js
+    of lcLt: return uint8(0x8C) # jl
+    of lcLe: return uint8(0x8E) # jle
+    of lcGt: return uint8(0x8F) # jg
+    of lcGe: return uint8(0x8D) # jge
+    of lcLo: return uint8(0x82) # jb
+    of lcLs: return uint8(0x86) # jbe
+    of lcHi: return uint8(0x87) # ja
+    of lcHs: return uint8(0x83) # jae
+    else:
+        return uint8(0x84)
+
+fn x64EmitJccRel32(out: seq[uint8]*, cc: uint8) =
+    bufU8(out, uint8(0x0F))
+    bufU8(out, cc)
+    x64EmitImm32(out, 0)
+
+fn x64EmitSubRspImm32(out: seq[uint8]*, imm: int64) =
+    x64EmitRex(out, true, false, false, false, false)
+    bufU8(out, uint8(0x81))
+    bufU8(out, x64ModRM(3, 5, 4)) # /5, rsp
+    x64EmitImm32(out, imm)
+
+fn x64EmitAddRspImm32(out: seq[uint8]*, imm: int64) =
+    x64EmitRex(out, true, false, false, false, false)
+    bufU8(out, uint8(0x81))
+    bufU8(out, x64ModRM(3, 0, 4)) # /0, rsp
+    x64EmitImm32(out, imm)
+
+fn x64EmitMovsxd(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid reg in movsxd"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    x64EmitRex(out, true, rBit, false, bBit, false)
+    bufU8(out, uint8(0x63))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitImul(out: seq[uint8]*, rd: LirReg, rn: LirReg, rm: LirReg) =
+    if rd != rn:
+        x64EmitMovRegReg(out, rd, rn)
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rm)
+    if dst < 0 || src < 0:
+        panic "macho_writer_x86_64: invalid reg in imul"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0xAF))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitXorEdxEdx(out: seq[uint8]*) =
+    bufU8(out, uint8(0x31))
+    bufU8(out, uint8(0xD2))
+
+fn x64EmitCdq(out: seq[uint8]*) =
+    bufU8(out, uint8(0x99))
+
+fn x64EmitCqo(out: seq[uint8]*) =
+    x64EmitRex(out, true, false, false, false, false)
+    bufU8(out, uint8(0x99))
+
+fn x64EmitDiv(out: seq[uint8]*, isSigned: bool, is64: bool, rm: LirReg) =
+    let src: int32 = x64RegCode(rm)
+    if src < 0:
+        panic "macho_writer_x86_64: invalid reg in div"
+    let bBit: bool = (src >> 3) != 0
+    x64EmitRex(out, is64, false, false, bBit, false)
+    bufU8(out, uint8(0xF7))
+    bufU8(out, x64ModRM(3, isSigned ? 7 : 6, src))
+
+fn x64EmitMemDisp32(out: seq[uint8]*, opcode1: uint8, opcode2: uint8,
+                    w: bool, regField: int32, base: int32, disp: int64,
+                    needs0F: bool, hasOp2: bool, forceRex: bool,
+                    prefix66: bool) =
+    if prefix66:
+        bufU8(out, uint8(0x66))
+    let rBit: bool = (regField >> 3) != 0
+    let bBit: bool = (base >> 3) != 0
+    x64EmitRex(out, w, rBit, false, bBit, forceRex)
+    if needs0F:
+        bufU8(out, uint8(0x0F))
+    bufU8(out, opcode1)
+    if hasOp2:
+        bufU8(out, opcode2)
+    let baseLow: int32 = base & 7
+    if baseLow == 4:
+        bufU8(out, x64ModRM(2, regField, 4))
+        bufU8(out, x64SIB(0, 4, baseLow))
+        x64EmitImm32(out, disp)
+        return
+    bufU8(out, x64ModRM(2, regField, baseLow))
+    x64EmitImm32(out, disp)
+
+fn x64EmitStore(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let is64: bool = x64Is64(rd)
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "macho_writer_x86_64: invalid reg in store"
+    x64EmitMemDisp32(out, uint8(0x89), uint8(0), is64, reg, baseCode, offset,
+                     false, false, false, false)
+
+fn x64EmitLoad(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let is64: bool = x64Is64(rd)
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "macho_writer_x86_64: invalid reg in load"
+    x64EmitMemDisp32(out, uint8(0x8B), uint8(0), is64, reg, baseCode, offset,
+                     false, false, false, false)
+
+fn x64EmitStore8(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "macho_writer_x86_64: invalid reg in store8"
+    let forceRex: bool = (reg & 7) >= 4
+    x64EmitMemDisp32(out, uint8(0x88), uint8(0), false, reg, baseCode, offset,
+                     false, false, forceRex, false)
+
+fn x64EmitLoad8(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64, isSigned: bool) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "macho_writer_x86_64: invalid reg in load8"
+    let op: uint8 = isSigned ? uint8(0xBE) : uint8(0xB6)
+    x64EmitMemDisp32(out, op, uint8(0), false, reg, baseCode, offset,
+                     true, false, false, false)
+
+fn x64EmitStore16(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "macho_writer_x86_64: invalid reg in store16"
+    x64EmitMemDisp32(out, uint8(0x89), uint8(0), false, reg, baseCode, offset,
+                     false, false, false, true)
+
+fn x64EmitLoad16(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64, isSigned: bool) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "macho_writer_x86_64: invalid reg in load16"
+    let op: uint8 = isSigned ? uint8(0xBF) : uint8(0xB7)
+    x64EmitMemDisp32(out, op, uint8(0), false, reg, baseCode, offset,
+                     true, false, false, false)
+
+fn machoBuild(module: LirModule): Result[seq[uint8]] =
+    if module == nil:
+        return Err[seq[uint8]]("macho_writer_x86_64: nil module")
+    if ! macho_targetIsDarwin(module.target):
+        return Err[seq[uint8]]("macho_writer_x86_64: non-darwin target not supported")
+
+    let symPrefix: str = machoSymPrefix(module.target)
+
+    # Section raw data.
+    var text: seq[uint8] = newSeq[uint8]()
+    var cstring: seq[uint8] = newSeq[uint8]()
+    var data: seq[uint8] = newSeq[uint8]()
+    var bssSize: uint64 = 0
+
+    # Layout cstrings.
+    var cSymOffs: seq[uint64] = newSeq[uint64](module.cstrs.len)
+    var ci: int32 = 0
+    while ci < module.cstrs.len:
+        let c: LirCString = get[LirCString](module.cstrs, ci)
+        let off: uint64 = uint64(cstring.len)
+        setPtr[uint64](&cSymOffs, ci, off)
+        bufStr0(&cstring, c.value)
+        ci = ci + 1
+
+    # Layout globals.
+    var dataSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
+    var bssSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
+    var maxDataAlignPow2: int32 = 0
+    var maxBssAlignPow2: int32 = 0
+    var gi: int32 = 0
+    while gi < module.globals.len:
+        let g: LirGlobal = get[LirGlobal](module.globals, gi)
+        if g.alignPow2 > maxDataAlignPow2 && g.hasInit:
+            maxDataAlignPow2 = g.alignPow2
+        if g.alignPow2 > maxBssAlignPow2 && ! g.hasInit:
+            maxBssAlignPow2 = g.alignPow2
+        gi = gi + 1
+    gi = 0
+    while gi < module.globals.len:
+        let g2: LirGlobal = get[LirGlobal](module.globals, gi)
+        let align: uint64 = uint64(1) << uint64(g2.alignPow2)
+        if g2.hasInit:
+            bufAlign(&data, align)
+            setPtr[uint64](&dataSymOffs, gi, uint64(data.len))
+            if g2.size == 4:
+                bufU32(&data, uint32(int32(g2.init)))
+            else:
+                bufU64(&data, uint64(g2.init))
+        else:
+            bssSize = macho_alignUp(bssSize, align)
+            setPtr[uint64](&bssSymOffs, gi, bssSize)
+            bssSize = bssSize + uint64(g2.size)
+        gi = gi + 1
+
+    # Encode .text and collect relocations.
+    var relocs: seq[MachoX64Reloc] = newSeq[MachoX64Reloc]()
+    var funcOffs: seq[uint64] = newSeq[uint64](module.funcs.len)
+    var fi: int32 = 0
+    while fi < module.funcs.len:
+        bufAlign(&text, 4)
+        setPtr[uint64](&funcOffs, fi, uint64(text.len))
+        let f: LirFunc = get[LirFunc](module.funcs, fi)
+
+        var labels: seq[str] = newSeqWithCap[str](0, 16)
+        var labelOffs: seq[int32] = newSeqWithCap[int32](0, 16)
+        var fixups: seq[TextFixup] = newSeqWithCap[TextFixup](0, 16)
+
+        var ii: int32 = 0
+        while ii < f.insts.len:
+            let inst: LirInst = get[LirInst](f.insts, ii)
+            if inst.op == loLabel:
+                addPtr[str](&labels, inst.label)
+                addPtr[int32](&labelOffs, int32(text.len))
+                ii = ii + 1
+                continue
+            let instStart: int32 = int32(text.len)
+            case inst.op
+            of loSubSp:
+                x64EmitSubRspImm32(&text, inst.imm)
+            of loAddSp:
+                x64EmitAddRspImm32(&text, inst.imm)
+            of loMovReg:
+                x64EmitMovRegReg(&text, inst.rd, inst.rn)
+            of loMovImm:
+                x64EmitMovImm(&text, inst.rd, inst.imm)
+            of loAdrp:
+                x64EmitLeaRipRel32(&text, inst.rd)
+                var r: MachoX64Reloc
+                new r
+                r.off = uint32(instStart + 3)
+                r.sym = inst.label
+                r.rtype = X86_64_RELOC_SIGNED
+                r.pcrel = true
+                r.rlen = uint8(2)
+                addPtr[MachoX64Reloc](&relocs, r)
+            of loSxtw:
+                x64EmitMovsxd(&text, inst.rd, inst.rn)
+            of loAdd:
+                x64EmitBinRR(&text, uint8(0x01), inst.rd, inst.rn, inst.rm)
+            of loSub:
+                x64EmitBinRR(&text, uint8(0x29), inst.rd, inst.rn, inst.rm)
+            of loAnd:
+                x64EmitBinRR(&text, uint8(0x21), inst.rd, inst.rn, inst.rm)
+            of loOrr:
+                x64EmitBinRR(&text, uint8(0x09), inst.rd, inst.rn, inst.rm)
+            of loEor:
+                x64EmitBinRR(&text, uint8(0x31), inst.rd, inst.rn, inst.rm)
+            of loLsl:
+                x64EmitShift(&text, 4, inst.rd, inst.rn)
+            of loLsr:
+                x64EmitShift(&text, 5, inst.rd, inst.rn)
+            of loAsr:
+                x64EmitShift(&text, 7, inst.rd, inst.rn)
+            of loMul:
+                x64EmitImul(&text, inst.rd, inst.rn, inst.rm)
+            of loFmovDx:
+                x64EmitMovqXmmReg(&text, inst.rd, inst.rn)
+            of loFmovXd:
+                x64EmitMovqRegXmm(&text, inst.rd, inst.rn)
+            of loFaddD:
+                x64EmitFbinD(&text, uint8(0x58), inst.rd, inst.rn, inst.rm)
+            of loFsubD:
+                x64EmitFbinD(&text, uint8(0x5C), inst.rd, inst.rn, inst.rm)
+            of loFmulD:
+                x64EmitFbinD(&text, uint8(0x59), inst.rd, inst.rn, inst.rm)
+            of loFdivD:
+                x64EmitFbinD(&text, uint8(0x5E), inst.rd, inst.rn, inst.rm)
+            of loScvtfDx:
+                x64EmitScvtfDx(&text, inst.rd, inst.rn)
+            of loFcmpD:
+                x64EmitFcmpD(&text, inst.rn, inst.rm)
+            of loSdiv:
+                let is64: bool = x64Is64(inst.rd)
+                # dividend in rax/eax
+                if is64:
+                    x64EmitCqo(&text)
+                else:
+                    x64EmitCdq(&text)
+                x64EmitDiv(&text, true, is64, inst.rm)
+            of loUdiv:
+                let is64u: bool = x64Is64(inst.rd)
+                x64EmitXorEdxEdx(&text)
+                x64EmitDiv(&text, false, is64u, inst.rm)
+            of loCmp:
+                x64EmitCmpRR(&text, inst.rn, inst.rm)
+            of loB:
+                x64EmitJmpRel32(&text)
+                var f0: TextFixup
+                new f0
+                f0.dispOff = instStart + 1
+                f0.nextOff = int32(text.len)
+                f0.label = inst.label
+                addPtr[TextFixup](&fixups, f0)
+            of loBCond:
+                let cc: uint8 = x64JccCode(inst.cond)
+                x64EmitJccRel32(&text, cc)
+                var f1: TextFixup
+                new f1
+                f1.dispOff = instStart + 2
+                f1.nextOff = int32(text.len)
+                f1.label = inst.label
+                addPtr[TextFixup](&fixups, f1)
+            of loBl:
+                x64EmitCallRel32(&text)
+                var r2: MachoX64Reloc
+                new r2
+                r2.off = uint32(instStart + 1)
+                r2.sym = symPrefix + inst.label
+                r2.rtype = X86_64_RELOC_BRANCH
+                r2.pcrel = true
+                r2.rlen = uint8(2)
+                addPtr[MachoX64Reloc](&relocs, r2)
+            of loBlr:
+                x64EmitCallReg(&text, inst.rn)
+            of loRet:
+                bufU8(&text, uint8(0xC3))
+            of loStr:
+                x64EmitStore(&text, inst.rd, inst.rn, inst.imm)
+            of loLdr:
+                x64EmitLoad(&text, inst.rd, inst.rn, inst.imm)
+            of loStrb:
+                x64EmitStore8(&text, inst.rd, inst.rn, inst.imm)
+            of loLdrb:
+                x64EmitLoad8(&text, inst.rd, inst.rn, inst.imm, false)
+            of loLdrsb:
+                x64EmitLoad8(&text, inst.rd, inst.rn, inst.imm, true)
+            of loStrh:
+                x64EmitStore16(&text, inst.rd, inst.rn, inst.imm)
+            of loLdrh:
+                x64EmitLoad16(&text, inst.rd, inst.rn, inst.imm, false)
+            of loLdrsh:
+                x64EmitLoad16(&text, inst.rd, inst.rn, inst.imm, true)
+            else:
+                return Err[seq[uint8]]("macho_writer_x86_64: unsupported lir op (op=" + intToStr(int32(inst.op)) + ")")
+            ii = ii + 1
+
+        # Patch local branches.
+        var pi: int32 = 0
+        while pi < fixups.len:
+            let fx: TextFixup = get[TextFixup](fixups, pi)
+            let tRes: Result[int32] = macho_findLabelOff(labels, labelOffs, fx.label)
+            if !IsOk[int32](tRes):
+                return ErrInfo[seq[uint8]](ErrorInfoOf[int32](tRes))
+            let targetOff: int32 = Value[int32](tRes)
+            let disp: int64 = int64(targetOff) - int64(fx.nextOff)
+            if disp < int64(-2147483648) || disp > int64(2147483647):
+                return Err[seq[uint8]]("macho_writer_x86_64: branch displacement out of range")
+            bufU32At(&text, fx.dispOff, uint32(int32(disp)))
+            pi = pi + 1
+
+        fi = fi + 1
+
+    # Sections: always include __text, optionally __cstring/__data/__bss.
+    let hasCstr: bool = cstring.len > 0
+    let hasData: bool = data.len > 0
+    let hasBss: bool = bssSize > 0
+    let nsects: uint32 = uint32(1 + (hasCstr ? 1 : 0) + (hasData ? 1 : 0) + (hasBss ? 1 : 0))
+
+    # Section indices (1-based).
+    let textSectIndex: uint8 = uint8(1)
+    var cstrSectIndex: uint8 = uint8(0)
+    var dataSectIndex: uint8 = uint8(0)
+    var bssSectIndex: uint8 = uint8(0)
+    var nextIdx: uint8 = uint8(2)
+    if hasCstr:
+        cstrSectIndex = nextIdx
+        nextIdx = uint8(nextIdx + 1)
+    if hasData:
+        dataSectIndex = nextIdx
+        nextIdx = uint8(nextIdx + 1)
+    if hasBss:
+        bssSectIndex = nextIdx
+        nextIdx = uint8(nextIdx + 1)
+
+    # Section addresses in "vm space".
+    var addrCursor: uint64 = 0
+    let textAddr: uint64 = addrCursor
+    addrCursor = addrCursor + uint64(text.len)
+
+    var cstrAddr: uint64 = 0
+    if hasCstr:
+        addrCursor = macho_alignUp(addrCursor, uint64(1))
+        cstrAddr = addrCursor
+        addrCursor = addrCursor + uint64(cstring.len)
+
+    var dataAddr: uint64 = 0
+    if hasData:
+        let dataAlign: uint64 = uint64(1) << uint64(maxDataAlignPow2)
+        addrCursor = macho_alignUp(addrCursor, dataAlign)
+        dataAddr = addrCursor
+        addrCursor = addrCursor + uint64(data.len)
+
+    var bssAddr: uint64 = 0
+    if hasBss:
+        let bssAlign: uint64 = uint64(1) << uint64(maxBssAlignPow2)
+        addrCursor = macho_alignUp(addrCursor, bssAlign)
+        bssAddr = addrCursor
+        addrCursor = addrCursor + bssSize
+
+    let vmsize: uint64 = addrCursor
+
+    # Build symbol list in dyld order: locals, extdefs, undefs.
+    var syms: seq[MachoX64Sym] = newSeq[MachoX64Sym]()
+
+    # locals: cstrings
+    ci = 0
+    while ci < module.cstrs.len:
+        let c2: LirCString = get[LirCString](module.cstrs, ci)
+        if hasCstr:
+            let v: uint64 = cstrAddr + get[uint64](cSymOffs, ci)
+            machoAddSym(&syms, c2.label, N_SECT, cstrSectIndex, v)
+        ci = ci + 1
+
+    let localCount: uint32 = uint32(syms.len)
+
+    # extdefs: funcs
+    fi = 0
+    while fi < module.funcs.len:
+        let f2: LirFunc = get[LirFunc](module.funcs, fi)
+        let v2: uint64 = textAddr + get[uint64](funcOffs, fi)
+        machoAddSym(&syms, symPrefix + f2.name, uint8(N_SECT | N_EXT), textSectIndex, v2)
+        fi = fi + 1
+
+    # extdefs: data/bss globals
+    gi = 0
+    while gi < module.globals.len:
+        let g3: LirGlobal = get[LirGlobal](module.globals, gi)
+        let gSym: str = symPrefix + g3.name
+        if g3.hasInit:
+            if hasData:
+                let v3: uint64 = dataAddr + get[uint64](dataSymOffs, gi)
+                machoAddSym(&syms, gSym, uint8(N_SECT | N_EXT), dataSectIndex, v3)
+        else:
+            if hasBss:
+                let v4: uint64 = bssAddr + get[uint64](bssSymOffs, gi)
+                machoAddSym(&syms, gSym, uint8(N_SECT | N_EXT), bssSectIndex, v4)
+        gi = gi + 1
+
+    let extdefCount: uint32 = uint32(syms.len) - localCount
+
+    # undefs referenced by relocations.
+    var undefs: seq[str] = newSeq[str]()
+    var ri: int32 = 0
+    while ri < relocs.len:
+        let r0: MachoX64Reloc = get[MachoX64Reloc](relocs, ri)
+        if r0 != nil && r0.sym != nil && len(r0.sym) > 0:
+            if machoFindSymIndex(syms, r0.sym) < 0:
+                macho_seqAddUniqueStr(&undefs, r0.sym)
+        ri = ri + 1
+    macho_sortStringsStable(&undefs)
+    ri = 0
+    while ri < undefs.len:
+        machoAddSym(&syms, get[str](undefs, ri), uint8(N_UNDF | N_EXT), uint8(0), uint64(0))
+        ri = ri + 1
+
+    let undefCount: uint32 = uint32(undefs.len)
+
+    # Build string table and fill nameOff.
+    var strtab: seq[uint8] = newSeq[uint8]()
+    addPtr[uint8](&strtab, uint8(0))
+    var si: int32 = 0
+    while si < syms.len:
+        let s0: MachoX64Sym = get[MachoX64Sym](syms, si)
+        if s0 != nil && s0.name != nil && len(s0.name) > 0:
+            s0.nameOff = uint32(strtab.len)
+            bufStr0(&strtab, s0.name)
+        else:
+            s0.nameOff = 0
+        setPtr[MachoX64Sym](&syms, si, s0)
+        si = si + 1
+
+    # Offsets.
+    let headerSize: uint64 = 32
+    let segCmdSize: uint32 = uint32(72 + uint32(80) * nsects)
+    let buildCmdSize: uint32 = uint32(24)
+    let symtabCmdSize: uint32 = uint32(24)
+    let dysymCmdSize: uint32 = uint32(80)
+    let sizeofcmds: uint32 = segCmdSize + buildCmdSize + symtabCmdSize + dysymCmdSize
+    let fileoff: uint64 = headerSize + uint64(sizeofcmds)
+
+    # Compute raw section offsets (bss has offset 0).
+    var curOff: uint64 = fileoff
+    let textOff: uint64 = macho_alignUp(curOff, 4)
+    curOff = textOff + uint64(text.len)
+
+    var cstrOff: uint64 = 0
+    if hasCstr:
+        cstrOff = macho_alignUp(curOff, 1)
+        curOff = cstrOff + uint64(cstring.len)
+
+    var dataOff: uint64 = 0
+    if hasData:
+        let dataAlign2: uint64 = uint64(1) << uint64(maxDataAlignPow2)
+        dataOff = macho_alignUp(curOff, dataAlign2)
+        curOff = dataOff + uint64(data.len)
+
+    let rawEnd: uint64 = curOff
+    let filesize: uint64 = rawEnd - fileoff
+
+    # Relocations (after raw data, 8-byte aligned).
+    var textRelOff: uint32 = uint32(0)
+    var relocOff: uint64 = macho_alignUp(rawEnd, 8)
+    if relocs.len > 0:
+        textRelOff = uint32(relocOff)
+        relocOff = relocOff + uint64(relocs.len) * 8
+    let relocEnd: uint64 = relocOff
+
+    # Symbol table (16 bytes per nlist_64).
+    let symoff: uint64 = macho_alignUp(relocEnd, 8)
+    let symSize: uint64 = uint64(syms.len) * 16
+    let stroff: uint64 = symoff + symSize
+    let strsize: uint32 = uint32(strtab.len)
+
+    # Build file.
+    var out: seq[uint8] = newSeq[uint8]()
+
+    # mach_header_64
+    bufU32(&out, MH_MAGIC_64)
+    bufU32(&out, CPU_TYPE_X86_64)
+    bufU32(&out, CPU_SUBTYPE_X86_64_ALL)
+    bufU32(&out, MH_OBJECT)
+    bufU32(&out, uint32(4)) # ncmds
+    bufU32(&out, sizeofcmds)
+    bufU32(&out, uint32(0)) # flags
+    bufU32(&out, uint32(0)) # reserved
+
+    # LC_SEGMENT_64
+    bufU32(&out, LC_SEGMENT_64)
+    bufU32(&out, segCmdSize)
+    bufFixedStr(&out, "", 16) # segname
+    bufU64(&out, uint64(0))   # vmaddr
+    bufU64(&out, vmsize)
+    bufU64(&out, fileoff)
+    bufU64(&out, filesize)
+    bufU32(&out, uint32(7)) # maxprot
+    bufU32(&out, uint32(7)) # initprot
+    bufU32(&out, nsects)
+    bufU32(&out, uint32(0)) # flags
+
+    # section_64 entries (80 bytes each).
+    # __TEXT,__text
+    bufFixedStr(&out, "__text", 16)
+    bufFixedStr(&out, "__TEXT", 16)
+    bufU64(&out, textAddr)
+    bufU64(&out, uint64(text.len))
+    bufU32(&out, uint32(textOff))
+    bufU32(&out, uint32(2)) # align pow2
+    bufU32(&out, textRelOff)
+    bufU32(&out, uint32(relocs.len))
+    bufU32(&out, uint32(S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS))
+    bufU32(&out, uint32(0))
+    bufU32(&out, uint32(0))
+    bufU32(&out, uint32(0))
+
+    if hasCstr:
+        bufFixedStr(&out, "__cstring", 16)
+        bufFixedStr(&out, "__TEXT", 16)
+        bufU64(&out, cstrAddr)
+        bufU64(&out, uint64(cstring.len))
+        bufU32(&out, uint32(cstrOff))
+        bufU32(&out, uint32(0)) # align pow2
+        bufU32(&out, uint32(0)) # reloff
+        bufU32(&out, uint32(0)) # nreloc
+        bufU32(&out, S_CSTRING_LITERALS)
+        bufU32(&out, uint32(0))
+        bufU32(&out, uint32(0))
+        bufU32(&out, uint32(0))
+
+    if hasData:
+        bufFixedStr(&out, "__data", 16)
+        bufFixedStr(&out, "__DATA", 16)
+        bufU64(&out, dataAddr)
+        bufU64(&out, uint64(data.len))
+        bufU32(&out, uint32(dataOff))
+        bufU32(&out, uint32(maxDataAlignPow2))
+        bufU32(&out, uint32(0)) # reloff
+        bufU32(&out, uint32(0)) # nreloc
+        bufU32(&out, uint32(0)) # flags
+        bufU32(&out, uint32(0))
+        bufU32(&out, uint32(0))
+        bufU32(&out, uint32(0))
+
+    if hasBss:
+        bufFixedStr(&out, "__bss", 16)
+        bufFixedStr(&out, "__DATA", 16)
+        bufU64(&out, bssAddr)
+        bufU64(&out, bssSize)
+        bufU32(&out, uint32(0)) # offset (zerofill)
+        bufU32(&out, uint32(maxBssAlignPow2))
+        bufU32(&out, uint32(0))
+        bufU32(&out, uint32(0))
+        bufU32(&out, S_ZEROFILL)
+        bufU32(&out, uint32(0))
+        bufU32(&out, uint32(0))
+        bufU32(&out, uint32(0))
+
+    # LC_BUILD_VERSION (fixed for determinism)
+    bufU32(&out, LC_BUILD_VERSION)
+    bufU32(&out, buildCmdSize)
+    bufU32(&out, PLATFORM_MACOS)
+    bufU32(&out, uint32(11) << 16) # minos = 11.0
+    bufU32(&out, uint32(0))        # sdk = n/a
+    bufU32(&out, uint32(0))        # ntools
+
+    # LC_SYMTAB
+    bufU32(&out, LC_SYMTAB)
+    bufU32(&out, symtabCmdSize)
+    bufU32(&out, uint32(symoff))
+    bufU32(&out, uint32(syms.len))
+    bufU32(&out, uint32(stroff))
+    bufU32(&out, strsize)
+
+    # LC_DYSYMTAB
+    bufU32(&out, LC_DYSYMTAB)
+    bufU32(&out, dysymCmdSize)
+    bufU32(&out, uint32(0)) # ilocalsym
+    bufU32(&out, localCount)
+    bufU32(&out, localCount) # iextdefsym
+    bufU32(&out, extdefCount)
+    bufU32(&out, localCount + extdefCount) # iundefsym
+    bufU32(&out, undefCount)
+    # rest = 0
+    var z: int32 = 0
+    while z < 12:
+        bufU32(&out, uint32(0))
+        z = z + 1
+
+    if uint64(out.len) != fileoff:
+        return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (fileoff)")
+
+    # Section raw data.
+    bufAlign(&out, 4)
+    if uint64(out.len) != textOff:
+        return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (__text)")
+    bufBytes(&out, text)
+
+    if hasCstr:
+        bufAlign(&out, 1)
+        if uint64(out.len) != cstrOff:
+            return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (__cstring)")
+        bufBytes(&out, cstring)
+
+    if hasData:
+        let dataAlign3: uint64 = uint64(1) << uint64(maxDataAlignPow2)
+        bufAlign(&out, dataAlign3)
+        if uint64(out.len) != dataOff:
+            return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (__data)")
+        bufBytes(&out, data)
+
+    if uint64(out.len) != rawEnd:
+        return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (rawEnd)")
+
+    # Relocations.
+    bufAlign(&out, 8)
+    if relocs.len > 0:
+        if uint64(out.len) != uint64(textRelOff):
+            return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (reloff)")
+        ri = 0
+        while ri < relocs.len:
+            let r5: MachoX64Reloc = get[MachoX64Reloc](relocs, ri)
+            let symIdx: int32 = machoFindSymIndex(syms, r5.sym)
+            if symIdx < 0:
+                return Err[seq[uint8]]("macho_writer_x86_64: missing relocation symbol")
+            let pcrel: uint32 = r5.pcrel ? uint32(1) : uint32(0)
+            let length: uint32 = uint32(r5.rlen)
+            let ext: uint32 = uint32(1)
+            let info: uint32 = (uint32(symIdx) & uint32(0x00FFFFFF)) |
+                               (pcrel << 24) |
+                               (length << 25) |
+                               (ext << 27) |
+                               (uint32(r5.rtype) << 28)
+            bufU32(&out, uint32(r5.off))
+            bufU32(&out, info)
+            ri = ri + 1
+        if uint64(out.len) != relocEnd:
+            return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (relocEnd)")
+
+    # Symbol table.
+    bufAlign(&out, 8)
+    if uint64(out.len) != symoff:
+        return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (symoff)")
+    si = 0
+    while si < syms.len:
+        let s1: MachoX64Sym = get[MachoX64Sym](syms, si)
+        bufU32(&out, s1.nameOff)
+        bufU8(&out, s1.nType)
+        bufU8(&out, s1.nSect)
+        bufU16(&out, s1.nDesc)
+        bufU64(&out, s1.nValue)
+        si = si + 1
+
+    if uint64(out.len) != stroff:
+        return Err[seq[uint8]]("macho_writer_x86_64: internal offset mismatch (stroff)")
+    bufBytes(&out, strtab)
+
+    return Ok[seq[uint8]](out)
+
+fn machoWriteX86_64RelocatableObj(module: LirModule): Result[seq[uint8]] =
+    return machoBuild(module)

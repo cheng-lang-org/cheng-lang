@@ -1,0 +1,1267 @@
+# Minimal Mach-O AArch64 linker (Darwin/arm64): links backend-emitted `.o` into an executable.
+# Scope (v2 bootstrap):
+# - Input objects: Mach-O MH_OBJECT emitted by our backend (macho_writer.cheng).
+# - Relocations supported: ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12.
+# - Undefined symbols: supported only for BRANCH26 (functions); resolved via dyld bind info + local stubs.
+# - Output format: MH_EXECUTE + LC_DYLD_INFO_ONLY (no fixup chains); codesigned later via `codesign -s -`.
+import std/seqs
+import std/strings
+import std/bytes
+import std/hashmaps
+import std/os
+import std/result
+import cheng/backend/obj/obj_buf
+
+type
+    MachoObjReloc =
+        addr: int32
+        symIndex: int32
+        pcrel: bool
+        length: int32
+        extern: bool
+        rtype: int32
+
+    MachoObjSection = ref
+        segname: str
+        sectname: str
+        addr: uint64
+        size: uint64
+        offset: uint32
+        alignPow2: uint32
+        reloff: uint32
+        nreloc: uint32
+        flags: uint32
+        data: seq[uint8]
+        relocs: seq[MachoObjReloc]
+        isZerofill: bool
+
+    MachoObjSymbol = ref
+        name: str
+        nType: uint8
+        nSect: uint8
+        nDesc: uint16
+        nValue: uint64
+
+    MachoObjFile = ref
+        path: str
+        buf: bytes.ByteBuffer
+        sections: seq[MachoObjSection]
+        symbols: seq[MachoObjSymbol]
+
+type
+    MachoLinkLayout = ref
+        # Output raw section bytes.
+        text: seq[uint8]
+        cstring: seq[uint8]
+        data: seq[uint8]
+        bssSize: uint64
+        # External imports to bind (ordered to match pointer slots layout).
+        imports: seq[str]
+
+        # File layout (computed).
+        headerSize: uint64
+        sizeofcmds: uint32
+        textFileOff: uint64
+        cstrFileOff: uint64
+        dataFileOff: uint64
+        linkeditFileOff: uint64
+
+        textVmaddr: uint64
+        dataVmaddr: uint64
+        linkeditVmaddr: uint64
+
+        textSegSize: uint64
+        dataSegFileSize: uint64
+        dataSegVmSize: uint64
+        linkeditSegSize: uint64
+
+        # Entry point offset (LC_MAIN entryoff) relative to __TEXT (fileoff==0).
+        entryoff: uint64
+
+const
+    MACHO_PAGE_SIZE: uint64 = uint64(0x4000) # macOS arm64 page size
+
+    MH_MAGIC_64: uint32 = uint32(0xFEEDFACF)
+    CPU_TYPE_ARM64: uint32 = uint32(0x0100000C)
+    CPU_SUBTYPE_ARM64_ALL: uint32 = uint32(0)
+    MH_EXECUTE: uint32 = uint32(2)
+
+    # mach_header flags
+    MH_NOUNDEFS: uint32 = uint32(0x1)
+    MH_DYLDLINK: uint32 = uint32(0x4)
+    MH_TWOLEVEL: uint32 = uint32(0x80)
+    MH_PIE: uint32 = uint32(0x200000)
+
+    # load commands
+    LC_SEGMENT_64: uint32 = uint32(0x19)
+    LC_SYMTAB: uint32 = uint32(0x2)
+    LC_DYSYMTAB: uint32 = uint32(0xB)
+    LC_LOAD_DYLINKER: uint32 = uint32(0xE)
+    LC_UUID: uint32 = uint32(0x1B)
+    LC_BUILD_VERSION: uint32 = uint32(0x32)
+    LC_SOURCE_VERSION: uint32 = uint32(0x2A)
+    LC_MAIN: uint32 = uint32(0x80000028)
+    LC_LOAD_DYLIB: uint32 = uint32(0xC)
+    LC_DYLD_INFO_ONLY: uint32 = uint32(0x80000022)
+    LC_CODE_SIGNATURE: uint32 = uint32(0x1D)
+
+    # nlist_64
+    N_UNDF: uint8 = uint8(0x0)
+    N_SECT: uint8 = uint8(0xE)
+    N_EXT: uint8 = uint8(0x1)
+
+    # section flags
+    S_ZEROFILL: uint32 = uint32(0x1)
+    S_CSTRING_LITERALS: uint32 = uint32(0x2)
+    S_ATTR_PURE_INSTRUCTIONS: uint32 = uint32(0x80000000)
+    S_ATTR_SOME_INSTRUCTIONS: uint32 = uint32(0x00000400)
+
+    # relocation types (Mach-O AArch64)
+    ARM64_RELOC_BRANCH26: int32 = 2
+    ARM64_RELOC_PAGE21: int32 = 3
+    ARM64_RELOC_PAGEOFF12: int32 = 4
+
+    # dyld bind opcodes
+    BIND_OPCODE_DONE: uint8 = uint8(0x00)
+    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM: uint8 = uint8(0x10)
+    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: uint8 = uint8(0x40)
+    BIND_OPCODE_SET_TYPE_IMM: uint8 = uint8(0x50)
+    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: uint8 = uint8(0x70)
+    BIND_OPCODE_DO_BIND: uint8 = uint8(0x90)
+
+    BIND_TYPE_POINTER: uint8 = uint8(1)
+
+fn machoAlignUp(x: uint64, align: uint64): uint64 =
+    if align <= 1:
+        return x
+    let rem: uint64 = x % align
+    if rem == 0:
+        return x
+    return x + (align - rem)
+
+fn machoBufU32At(buf: bytes.ByteBuffer, off: int32): uint32 =
+    let v: int32 = bytes.readU32LEAt(buf, off)
+    return uint32(v)
+
+fn machoBufU16At(buf: bytes.ByteBuffer, off: int32): uint16 =
+    let v: int32 = bytes.readU16LEAt(buf, off)
+    return uint16(v & 0xFFFF)
+
+fn machoBufU8At(buf: bytes.ByteBuffer, off: int32): uint8 =
+    let v: int32 = bytes.bufByteAt(buf, off)
+    return uint8(v & 0xFF)
+
+fn machoBufU64At(buf: bytes.ByteBuffer, off: int32): uint64 =
+    let lo: uint64 = uint64(machoBufU32At(buf, off))
+    let hi: uint64 = uint64(machoBufU32At(buf, off + 4))
+    return lo | (hi << 32)
+
+fn machoReadFixedStr16(buf: bytes.ByteBuffer, off: int32): str =
+    var n: int32 = 0
+    while n < 16:
+        if bytes.bufByteAt(buf, off + n) == 0:
+            break
+        n = n + 1
+    if n <= 0:
+        return ""
+    let p: void* = alloc(n + 1)
+    var i: int32 = 0
+    while i < n:
+        let b: int32 = bytes.bufByteAt(buf, off + i)
+        let dst: int8* = int8*(ptr_add(p, i))
+        *dst = int8(b)
+        i = i + 1
+    setMem(ptr_add(p, n), 0, 1)
+    return str(p)
+
+fn machoReadCStringAt(buf: bytes.ByteBuffer, off: int32): str =
+    if off < 0 || off >= buf.len:
+        return ""
+    var n: int32 = 0
+    while off + n < buf.len:
+        if bytes.bufByteAt(buf, off + n) == 0:
+            break
+        n = n + 1
+    if n <= 0:
+        return ""
+    let p: void* = alloc(n + 1)
+    var i: int32 = 0
+    while i < n:
+        let b: int32 = bytes.bufByteAt(buf, off + i)
+        let dst: int8* = int8*(ptr_add(p, i))
+        *dst = int8(b)
+        i = i + 1
+    setMem(ptr_add(p, n), 0, 1)
+    return str(p)
+
+fn machoReadBytes(buf: bytes.ByteBuffer, off: uint64, size: uint64): seq[uint8] =
+    var out: seq[uint8] = newSeq[uint8]()
+    if size == 0:
+        return out
+    if int64(off) < 0:
+        return out
+    if off + size > uint64(buf.len):
+        return out
+    var i: uint64 = 0
+    while i < size:
+        addPtr[uint8](&out, uint8(bytes.bufByteAt(buf, int32(off + i))))
+        i = i + 1
+    return out
+
+fn machoParseObj(path: str): Result[MachoObjFile] =
+    var out: MachoObjFile
+    new out
+    out.path = path
+    out.buf = bytes.readFileBytes(path)
+    if out.buf.data == nil || out.buf.len <= 0:
+        return Err[MachoObjFile]("macho_linker: failed to read obj: " + path)
+
+    let magic: uint32 = machoBufU32At(out.buf, 0)
+    if magic != MH_MAGIC_64:
+        return Err[MachoObjFile]("macho_linker: invalid magic (expected MH_MAGIC_64): " + path)
+    let filetype: uint32 = machoBufU32At(out.buf, 12)
+    if filetype != uint32(1): # MH_OBJECT
+        return Err[MachoObjFile]("macho_linker: expected MH_OBJECT input: " + path)
+    let ncmds: int32 = int32(machoBufU32At(out.buf, 16))
+    let sizeofcmds: int32 = int32(machoBufU32At(out.buf, 20))
+    if ncmds < 0 || sizeofcmds < 0:
+        return Err[MachoObjFile]("macho_linker: invalid header: " + path)
+
+    var symoff: uint32 = 0
+    var nsyms: uint32 = 0
+    var stroff: uint32 = 0
+    var strsize: uint32 = 0
+
+    out.sections = newSeq[MachoObjSection]()
+    var cmdOff: int32 = 32
+    var ci: int32 = 0
+    while ci < ncmds:
+        if cmdOff + 8 > out.buf.len:
+            return Err[MachoObjFile]("macho_linker: truncated load commands: " + path)
+        let cmd: uint32 = machoBufU32At(out.buf, cmdOff)
+        let cmdsize: int32 = int32(machoBufU32At(out.buf, cmdOff + 4))
+        if cmdsize < 8 || cmdOff + cmdsize > out.buf.len:
+            return Err[MachoObjFile]("macho_linker: invalid load command size: " + path)
+        if cmd == LC_SEGMENT_64:
+            # segment_command_64: 72 bytes header + section_64[80]*nsects
+            if cmdsize < 72:
+                return Err[MachoObjFile]("macho_linker: invalid LC_SEGMENT_64 cmdsize: " + path)
+            let segname: str = machoReadFixedStr16(out.buf, cmdOff + 8)
+            let nsects: uint32 = machoBufU32At(out.buf, cmdOff + 64)
+            var sectOff: int32 = cmdOff + 72
+            var si: uint32 = 0
+            while si < nsects:
+                if sectOff + 80 > cmdOff + cmdsize:
+                    return Err[MachoObjFile]("macho_linker: truncated sections in segment: " + path)
+                var s: MachoObjSection
+                new s
+                s.sectname = machoReadFixedStr16(out.buf, sectOff + 0)
+                s.segname = machoReadFixedStr16(out.buf, sectOff + 16)
+                if len(s.segname) == 0:
+                    s.segname = segname
+                s.addr = machoBufU64At(out.buf, sectOff + 32)
+                s.size = machoBufU64At(out.buf, sectOff + 40)
+                s.offset = machoBufU32At(out.buf, sectOff + 48)
+                s.alignPow2 = machoBufU32At(out.buf, sectOff + 52)
+                s.reloff = machoBufU32At(out.buf, sectOff + 56)
+                s.nreloc = machoBufU32At(out.buf, sectOff + 60)
+                s.flags = machoBufU32At(out.buf, sectOff + 64)
+                s.isZerofill = (s.flags & uint32(0xFF)) == S_ZEROFILL
+                s.data = newSeq[uint8]()
+                if s.size > 0 && !s.isZerofill:
+                    s.data = machoReadBytes(out.buf, uint64(s.offset), s.size)
+                    if uint64(s.data.len) != s.size:
+                        return Err[MachoObjFile]("macho_linker: section data truncated: " + path)
+                s.relocs = newSeq[MachoObjReloc]()
+                if s.nreloc > 0:
+                    var ri: uint32 = 0
+                    var roff: uint64 = uint64(s.reloff)
+                    while ri < s.nreloc:
+                        if roff + 8 > uint64(out.buf.len):
+                            return Err[MachoObjFile]("macho_linker: relocation table truncated: " + path)
+                        let rAddr: int32 = int32(machoBufU32At(out.buf, int32(roff)))
+                        let rInfo: uint32 = machoBufU32At(out.buf, int32(roff + 4))
+                        # scattered relocations not supported in v2 bootstrap.
+                        if (uint32(rAddr) & uint32(0x80000000)) != 0:
+                            return Err[MachoObjFile]("macho_linker: scattered reloc unsupported: " + path)
+                        var r: MachoObjReloc
+                        r.addr = rAddr
+                        r.symIndex = int32(rInfo & uint32(0x00FFFFFF))
+                        r.pcrel = ((rInfo >> 24) & 1) != 0
+                        r.length = int32((rInfo >> 25) & uint32(0x3))
+                        r.extern = ((rInfo >> 27) & 1) != 0
+                        r.rtype = int32((rInfo >> 28) & uint32(0xF))
+                        addPtr[MachoObjReloc](&s.relocs, r)
+                        ri = ri + 1
+                        roff = roff + 8
+                addPtr[MachoObjSection](&out.sections, s)
+                si = si + 1
+                sectOff = sectOff + 80
+        elif cmd == LC_SYMTAB:
+            if cmdsize < 24:
+                return Err[MachoObjFile]("macho_linker: invalid LC_SYMTAB cmdsize: " + path)
+            symoff = machoBufU32At(out.buf, cmdOff + 8)
+            nsyms = machoBufU32At(out.buf, cmdOff + 12)
+            stroff = machoBufU32At(out.buf, cmdOff + 16)
+            strsize = machoBufU32At(out.buf, cmdOff + 20)
+        cmdOff = cmdOff + cmdsize
+        ci = ci + 1
+
+    if symoff == 0 || nsyms == 0 || stroff == 0:
+        return Err[MachoObjFile]("macho_linker: missing LC_SYMTAB: " + path)
+
+    out.symbols = newSeq[MachoObjSymbol]()
+    var si: uint32 = 0
+    while si < nsyms:
+        let off: uint64 = uint64(symoff) + uint64(si) * 16
+        if off + 16 > uint64(out.buf.len):
+            return Err[MachoObjFile]("macho_linker: symtab truncated: " + path)
+        let n_strx: uint32 = machoBufU32At(out.buf, int32(off))
+        let n_type: uint8 = machoBufU8At(out.buf, int32(off + 4))
+        let n_sect: uint8 = machoBufU8At(out.buf, int32(off + 5))
+        let n_desc: uint16 = machoBufU16At(out.buf, int32(off + 6))
+        let n_value: uint64 = machoBufU64At(out.buf, int32(off + 8))
+        var sym: MachoObjSymbol
+        new sym
+        sym.nType = n_type
+        sym.nSect = n_sect
+        sym.nDesc = n_desc
+        sym.nValue = n_value
+        if n_strx == 0:
+            sym.name = ""
+        else:
+            if uint64(stroff) + uint64(n_strx) >= uint64(out.buf.len):
+                sym.name = ""
+            else:
+                sym.name = machoReadCStringAt(out.buf, int32(uint64(stroff) + uint64(n_strx)))
+        addPtr[MachoObjSymbol](&out.symbols, sym)
+        si = si + 1
+
+    return Ok[MachoObjFile](out)
+
+fn machoFreeObj(obj: MachoObjFile) =
+    if obj == nil:
+        return
+    if obj.buf.data != nil:
+        dealloc obj.buf.data
+        obj.buf.data = nil
+
+fn machoWriteUleb128(out: seq[uint8]*, v0: uint64) =
+    if out == nil:
+        return
+    var v: uint64 = v0
+    while true:
+        var byte: uint8 = uint8(v & uint64(0x7F))
+        v = v >> 7
+        if v != 0:
+            byte = byte | uint8(0x80)
+        addPtr[uint8](out, byte)
+        if v == 0:
+            break
+
+fn machoWriteBindInfo(out: seq[uint8]*, segIndex: uint8, startOffInSeg: uint64, importSyms: seq[str]) =
+    if out == nil:
+        return
+    if importSyms.len <= 0:
+        addPtr[uint8](out, BIND_OPCODE_DONE)
+        return
+    # dylib ordinal 1 => libSystem.B.dylib
+    addPtr[uint8](out, uint8(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | uint8(1)))
+    addPtr[uint8](out, uint8(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER))
+    addPtr[uint8](out, uint8(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segIndex))
+    machoWriteUleb128(out, startOffInSeg)
+    var i: int32 = 0
+    while i < importSyms.len:
+        let name: str = get[str](importSyms, i)
+        addPtr[uint8](out, uint8(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | uint8(0)))
+        obj_buf.bufStr0(out, name)
+        addPtr[uint8](out, BIND_OPCODE_DO_BIND)
+        i = i + 1
+    addPtr[uint8](out, BIND_OPCODE_DONE)
+
+fn machoReadU32LEFromSeq(data: seq[uint8], off: int32): uint32 =
+    let b0: uint32 = uint32(get[uint8](data, off + 0))
+    let b1: uint32 = uint32(get[uint8](data, off + 1))
+    let b2: uint32 = uint32(get[uint8](data, off + 2))
+    let b3: uint32 = uint32(get[uint8](data, off + 3))
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn machoWriteU32LEToSeq(data: seq[uint8]*, off: int32, v: uint32) =
+    if data == nil:
+        return
+    if off < 0 || off + 4 > data->len:
+        return
+    setPtr[uint8](data, off + 0, uint8(v & uint32(0xFF)))
+    setPtr[uint8](data, off + 1, uint8((v >> 8) & uint32(0xFF)))
+    setPtr[uint8](data, off + 2, uint8((v >> 16) & uint32(0xFF)))
+    setPtr[uint8](data, off + 3, uint8((v >> 24) & uint32(0xFF)))
+
+fn machoPatchBl(word0: uint32, fromAddr: uint64, toAddr: uint64): Result[uint32] =
+    let deltaBytes: int64 = int64(toAddr) - int64(fromAddr)
+    if deltaBytes % 4 != 0:
+        return Err[uint32]("macho_linker: bl target misaligned")
+    let deltaWords: int64 = deltaBytes / 4
+    if deltaWords < -33554432 || deltaWords > 33554431:
+        return Err[uint32]("macho_linker: bl target out of range")
+    let imm26: uint32 = uint32(uint64(deltaWords) & uint64(0x03FFFFFF))
+    let word: uint32 = (word0 & uint32(0xFC000000)) | imm26
+    return Ok[uint32](word)
+
+fn machoPatchAdrp(word0: uint32, instrAddr: uint64, symAddr: uint64): Result[uint32] =
+    let instrPage: int64 = int64(instrAddr & ~uint64(0xFFF))
+    let symPage: int64 = int64(symAddr & ~uint64(0xFFF))
+    let deltaPages: int64 = (symPage - instrPage) / 4096
+    if deltaPages < -1048576 || deltaPages > 1048575:
+        return Err[uint32]("macho_linker: adrp target out of range")
+    let imm21: uint32 = uint32(uint64(deltaPages) & uint64(0x1FFFFF))
+    let immlo: uint32 = imm21 & uint32(0x3)
+    let immhi: uint32 = (imm21 >> 2) & uint32(0x7FFFF)
+    let mask: uint32 = (uint32(0x3) << 29) | (uint32(0x7FFFF) << 5)
+    let word: uint32 = (word0 & ~mask) | (immlo << 29) | (immhi << 5)
+    return Ok[uint32](word)
+
+fn machoPatchAddImm12(word0: uint32, imm12: uint32): uint32 =
+    let mask: uint32 = uint32(0xFFF) << 10
+    return (word0 & ~mask) | ((imm12 & uint32(0xFFF)) << 10)
+
+fn machoEncBr(rn: uint32): uint32 =
+    return uint32(0xD61F0000) | ((rn & uint32(31)) << 5)
+
+fn machoMakeStub(ptrSlotAddr: uint64, stubAddr: uint64): Result[seq[uint8]] =
+    # Stub:
+    #   adrp x16, ptrSlot@PAGE
+    #   ldr  x16, [x16, #ptrSlot@PAGEOFF]
+    #   br   x16
+    var out: seq[uint8] = newSeq[uint8]()
+    let adrp: uint32 = uint32(0x90000000) | uint32(16) # rd=x16, imm=0
+    let adrpPatchedRes: Result[uint32] = machoPatchAdrp(adrp, stubAddr, ptrSlotAddr)
+    if !IsOk[uint32](adrpPatchedRes):
+        return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](adrpPatchedRes))
+    obj_buf.bufU32(&out, Value[uint32](adrpPatchedRes))
+    let pageOff: uint64 = ptrSlotAddr & uint64(0xFFF)
+    # ldr x16, [x16, #imm] (8-byte scale)
+    if pageOff % 8 != 0:
+        return Err[seq[uint8]]("macho_linker: stub ptr slot not 8-byte aligned")
+    let imm12: uint32 = uint32(pageOff)
+    # base for LDR (unsigned immediate) 64-bit: 0xF9400000 | imm12<<10 | rn<<5 | rt
+    let scaled: uint32 = uint32((imm12 / 8) & uint32(0xFFF))
+    let ldr: uint32 = uint32(0xF9400000) | (scaled << 10) | (uint32(16) << 5) | uint32(16)
+    obj_buf.bufU32(&out, ldr)
+    obj_buf.bufU32(&out, machoEncBr(uint32(16)))
+    return Ok[seq[uint8]](out)
+
+fn machoFindSectionIndexByName(sections: seq[MachoObjSection], seg: str, sect: str): int32 =
+    var i: int32 = 0
+    while i < sections.len:
+        let s: MachoObjSection = get[MachoObjSection](sections, i)
+        if s != nil && streq(s.segname, seg) && streq(s.sectname, sect):
+            return i
+        i = i + 1
+    return -1
+
+fn machoSymIsUndef(sym: MachoObjSymbol): bool =
+    if sym == nil:
+        return false
+    let ty: uint8 = uint8(sym.nType & uint8(0x0E))
+    return ty == N_UNDF
+
+fn machoSymIsSect(sym: MachoObjSymbol): bool =
+    if sym == nil:
+        return false
+    let ty: uint8 = uint8(sym.nType & uint8(0x0E))
+    return ty == N_SECT
+
+fn machoSymIsExt(sym: MachoObjSymbol): bool =
+    if sym == nil:
+        return false
+    return (sym.nType & N_EXT) != 0
+
+fn machoAllowDuplicateRuntimeSymbol(name: str): bool =
+    return streq(name, "_store_int32") || streq(name, "_load_int32") ||
+        streq(name, "_store_bool") || streq(name, "_load_bool") ||
+        streq(name, "_store_ptr") || streq(name, "_load_ptr")
+
+fn machoMergeObjs(objs: seq[MachoObjFile]): Result[MachoLinkLayout] =
+    var layout: MachoLinkLayout
+    new layout
+    layout.text = newSeq[uint8]()
+    layout.cstring = newSeq[uint8]()
+    layout.data = newSeq[uint8]()
+    layout.bssSize = 0
+    layout.imports = newSeq[str]()
+
+    # First pass: merge section raw bytes and compute per-object base offsets.
+    # We only support the backend-emitted section names.
+    var objTextBase: seq[uint64] = newSeq[uint64](objs.len)
+    var objCstrBase: seq[uint64] = newSeq[uint64](objs.len)
+    var objDataBase: seq[uint64] = newSeq[uint64](objs.len)
+    var objBssBase: seq[uint64] = newSeq[uint64](objs.len)
+    var oi: int32 = 0
+    while oi < objs.len:
+        setPtr[uint64](&objTextBase, oi, uint64(0))
+        setPtr[uint64](&objCstrBase, oi, uint64(0))
+        setPtr[uint64](&objDataBase, oi, uint64(0))
+        setPtr[uint64](&objBssBase, oi, uint64(0))
+        oi = oi + 1
+
+    oi = 0
+    while oi < objs.len:
+        let obj: MachoObjFile = get[MachoObjFile](objs, oi)
+        if obj == nil:
+            oi = oi + 1
+            continue
+        # Merge __text
+        let textIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__text")
+        if textIdx >= 0:
+            setPtr[uint64](&objTextBase, oi, uint64(layout.text.len))
+            let s: MachoObjSection = get[MachoObjSection](obj.sections, textIdx)
+            obj_buf.bufBytes(&layout.text, s.data)
+            obj_buf.bufAlign(&layout.text, uint64(4))
+        else:
+            setPtr[uint64](&objTextBase, oi, uint64(layout.text.len))
+        # Merge __cstring
+        let cstrIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__cstring")
+        if cstrIdx >= 0:
+            setPtr[uint64](&objCstrBase, oi, uint64(layout.cstring.len))
+            let s2: MachoObjSection = get[MachoObjSection](obj.sections, cstrIdx)
+            obj_buf.bufBytes(&layout.cstring, s2.data)
+            obj_buf.bufAlign(&layout.cstring, uint64(1))
+        else:
+            setPtr[uint64](&objCstrBase, oi, uint64(layout.cstring.len))
+        # Merge __data
+        let dataIdx: int32 = machoFindSectionIndexByName(obj.sections, "__DATA", "__data")
+        if dataIdx >= 0:
+            setPtr[uint64](&objDataBase, oi, uint64(layout.data.len))
+            let s3: MachoObjSection = get[MachoObjSection](obj.sections, dataIdx)
+            obj_buf.bufAlign(&layout.data, uint64(8))
+            setPtr[uint64](&objDataBase, oi, uint64(layout.data.len))
+            obj_buf.bufBytes(&layout.data, s3.data)
+            obj_buf.bufAlign(&layout.data, uint64(8))
+        else:
+            setPtr[uint64](&objDataBase, oi, uint64(layout.data.len))
+        # Merge __bss (zerofill)
+        let bssIdx: int32 = machoFindSectionIndexByName(obj.sections, "__DATA", "__bss")
+        if bssIdx >= 0:
+            let s4: MachoObjSection = get[MachoObjSection](obj.sections, bssIdx)
+            setPtr[uint64](&objBssBase, oi, layout.bssSize)
+            layout.bssSize = machoAlignUp(layout.bssSize, uint64(8))
+            setPtr[uint64](&objBssBase, oi, layout.bssSize)
+            layout.bssSize = layout.bssSize + s4.size
+        else:
+            setPtr[uint64](&objBssBase, oi, layout.bssSize)
+        oi = oi + 1
+
+    # Second pass: build global symbol table (defined symbols) and gather imports.
+    var defIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
+    var defAddr: seq[uint64] = newSeq[uint64]()
+    var defName: seq[str] = newSeq[str]()
+
+    oi = 0
+    while oi < objs.len:
+        let obj: MachoObjFile = get[MachoObjFile](objs, oi)
+        if obj == nil:
+            oi = oi + 1
+            continue
+        var si: int32 = 0
+        while si < obj.symbols.len:
+            let sym: MachoObjSymbol = get[MachoObjSymbol](obj.symbols, si)
+            if sym != nil && machoSymIsSect(sym) && machoSymIsExt(sym):
+                if sym.name != nil && len(sym.name) > 0:
+                    # Compute symbol address within merged layout (still relative; final vmaddrs decided later).
+                    let sectIndex0: int32 = int32(sym.nSect) - 1
+                    if sectIndex0 >= 0 && sectIndex0 < obj.sections.len:
+                        let sect0: MachoObjSection = get[MachoObjSection](obj.sections, sectIndex0)
+                        let symOffInSect: uint64 = sym.nValue - sect0.addr
+                        var relAddr: uint64 = 0
+                        if streq(sect0.segname, "__TEXT") && streq(sect0.sectname, "__text"):
+                            relAddr = get[uint64](objTextBase, oi) + symOffInSect
+                        elif streq(sect0.segname, "__TEXT") && streq(sect0.sectname, "__cstring"):
+                            # cstring lives after text in __TEXT; we keep as separate slice and fix later.
+                            # encode relAddr in a tagged form by setting high bit; resolved later.
+                            relAddr = (uint64(1) << 63) | (get[uint64](objCstrBase, oi) + symOffInSect)
+                        elif streq(sect0.segname, "__DATA") && streq(sect0.sectname, "__data"):
+                            relAddr = (uint64(1) << 62) | (get[uint64](objDataBase, oi) + symOffInSect)
+                        elif streq(sect0.segname, "__DATA") && streq(sect0.sectname, "__bss"):
+                            relAddr = (uint64(1) << 61) | (get[uint64](objBssBase, oi) + symOffInSect)
+                        else:
+                            relAddr = get[uint64](objTextBase, oi) + symOffInSect
+
+                        var existed: bool = false
+                        hashmaps.hashMapStrIntGetOrInsert(&defIndex, sym.name, defName.len, &existed)
+                        if existed:
+                            if machoAllowDuplicateRuntimeSymbol(sym.name):
+                                var hasOld: bool = false
+                                let oldIdx: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name, &hasOld)
+                                if hasOld && oldIdx >= 0 && oldIdx < defAddr.len:
+                                    setPtr[uint64](&defAddr, oldIdx, relAddr)
+                                si = si + 1
+                                continue
+                            return Err[MachoLinkLayout]("macho_linker: duplicate symbol: " + sym.name)
+                        addPtr[str](&defName, sym.name)
+                        addPtr[uint64](&defAddr, relAddr)
+            si = si + 1
+        oi = oi + 1
+
+    # Gather undefined imports used by BR26 relocations.
+    var importNeeded: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+    oi = 0
+    while oi < objs.len:
+        let obj: MachoObjFile = get[MachoObjFile](objs, oi)
+        if obj == nil:
+            oi = oi + 1
+            continue
+        var secIdx: int32 = 0
+        while secIdx < obj.sections.len:
+            let sect: MachoObjSection = get[MachoObjSection](obj.sections, secIdx)
+            if sect != nil && sect.relocs.len > 0:
+                var ri: int32 = 0
+                while ri < sect.relocs.len:
+                    let r: MachoObjReloc = get[MachoObjReloc](sect.relocs, ri)
+                    if r.extern && r.symIndex >= 0 && r.symIndex < obj.symbols.len:
+                        let sym: MachoObjSymbol = get[MachoObjSymbol](obj.symbols, r.symIndex)
+                        if sym != nil && machoSymIsUndef(sym) && machoSymIsExt(sym):
+                            if sym.name != nil && len(sym.name) > 0:
+                                var hasDef: bool = false
+                                hashmaps.hashMapStrIntGet(defIndex, sym.name, &hasDef)
+                                if hasDef:
+                                    ri = ri + 1
+                                    continue
+                                if r.rtype == ARM64_RELOC_BRANCH26:
+                                    var existed: bool = false
+                                    hashmaps.hashMapStrIntGetOrInsert(&importNeeded, sym.name, 1, &existed)
+                                else:
+                                    return Err[MachoLinkLayout]("macho_linker: unsupported undefined reloc type for " + sym.name)
+                    ri = ri + 1
+            secIdx = secIdx + 1
+        oi = oi + 1
+
+    # Extract imports in stable order (deterministic).
+    # hashmaps.HashMapStrInt does not provide iteration; do a scan over all symbol tables for stable order.
+    var importSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+    oi = 0
+    while oi < objs.len:
+        let obj: MachoObjFile = get[MachoObjFile](objs, oi)
+        if obj == nil:
+            oi = oi + 1
+            continue
+        var si2: int32 = 0
+        while si2 < obj.symbols.len:
+            let sym2: MachoObjSymbol = get[MachoObjSymbol](obj.symbols, si2)
+            if sym2 != nil && machoSymIsUndef(sym2) && machoSymIsExt(sym2):
+                var needed: bool = false
+                hashmaps.hashMapStrIntGet(importNeeded, sym2.name, &needed)
+                if needed:
+                    var hasDef2: bool = false
+                    hashmaps.hashMapStrIntGet(defIndex, sym2.name, &hasDef2)
+                    if hasDef2:
+                        si2 = si2 + 1
+                        continue
+                    var existed2: bool = false
+                    hashmaps.hashMapStrIntGetOrInsert(&importSeen, sym2.name, 1, &existed2)
+                    if !existed2:
+                        addPtr[str](&layout.imports, sym2.name)
+            si2 = si2 + 1
+        oi = oi + 1
+
+    return Ok[MachoLinkLayout](layout)
+
+fn machoLinkExeAarch64(objPaths: seq[str], outputPath: str): Result[bool] =
+    if outputPath == nil || len(outputPath) == 0:
+        return Err[bool]("macho_linker: missing output path")
+    if objPaths.len <= 0:
+        return Err[bool]("macho_linker: no input objects")
+
+    var objs: seq[MachoObjFile] = newSeq[MachoObjFile]()
+    var i: int32 = 0
+    while i < objPaths.len:
+        let p: str = get[str](objPaths, i)
+        let pr: Result[MachoObjFile] = machoParseObj(p)
+        if !IsOk[MachoObjFile](pr):
+            return ErrInfo[bool](ErrorInfoOf[MachoObjFile](pr))
+        addPtr[MachoObjFile](&objs, Value[MachoObjFile](pr))
+        i = i + 1
+
+    let layRes: Result[MachoLinkLayout] = machoMergeObjs(objs)
+    if !IsOk[MachoLinkLayout](layRes):
+        var oi: int32 = 0
+        while oi < objs.len:
+            machoFreeObj(get[MachoObjFile](objs, oi))
+            oi = oi + 1
+        return ErrInfo[bool](ErrorInfoOf[MachoLinkLayout](layRes))
+    let layout: MachoLinkLayout = Value[MachoLinkLayout](layRes)
+
+    # Layout constants.
+    layout.headerSize = uint64(32)
+    layout.textVmaddr = uint64(0x100000000)
+    layout.textFileOff = 0
+
+    # Load commands:
+    # __PAGEZERO, __TEXT(2 sect), __DATA(2 sect), __LINKEDIT, DYLD_INFO_ONLY, SYMTAB, DYSYMTAB,
+    # LOAD_DYLINKER, UUID, BUILD_VERSION, SOURCE_VERSION, MAIN, LOAD_DYLIB
+    # Note: we intentionally do NOT emit LC_CODE_SIGNATURE; `codesign` will add it.
+    let ncmds: uint32 = uint32(13)
+    let segPagezeroSize: uint32 = uint32(72)
+    let segTextSize: uint32 = uint32(72 + 80 * 2)
+    let segDataSize: uint32 = uint32(72 + 80 * 2)
+    let segLinkeditSize: uint32 = uint32(72)
+    let dyldInfoSize: uint32 = uint32(48)
+    let symtabSize: uint32 = uint32(24)
+    let dysymSize: uint32 = uint32(80)
+    let loadDylinkerSize: uint32 = uint32(32) # "/usr/lib/dyld" padded
+    let uuidSize: uint32 = uint32(24)
+    let buildSize: uint32 = uint32(32)
+    let sourceVerSize: uint32 = uint32(16)
+    let mainSize: uint32 = uint32(24)
+    let loadDylibSize: uint32 = uint32(56) # "/usr/lib/libSystem.B.dylib" padded
+    layout.sizeofcmds = segPagezeroSize + segTextSize + segDataSize + segLinkeditSize +
+                        dyldInfoSize + symtabSize + dysymSize + loadDylinkerSize +
+                        uuidSize + buildSize + sourceVerSize + mainSize + loadDylibSize
+
+    let mergedTextLen: uint64 = uint64(layout.text.len)
+    let stubBytesLen: uint64 = uint64(layout.imports.len) * uint64(12)
+    let textLenWithStubs: uint64 = mergedTextLen + stubBytesLen
+
+    # Leave generous header padding so codesign can rewrite without shifting sections.
+    let firstSectionOff: uint64 = machoAlignUp(layout.headerSize + uint64(layout.sizeofcmds), uint64(0x1000))
+    var cursor: uint64 = firstSectionOff
+    cursor = machoAlignUp(cursor, uint64(4))
+    let textOff: uint64 = cursor
+    cursor = textOff + textLenWithStubs
+    cursor = machoAlignUp(cursor, uint64(1))
+    let cstrOff: uint64 = cursor
+    cursor = cstrOff + uint64(layout.cstring.len)
+    let textEnd: uint64 = cursor
+    layout.textSegSize = machoAlignUp(textEnd, MACHO_PAGE_SIZE)
+
+    layout.dataFileOff = layout.textSegSize
+    layout.dataVmaddr = layout.textVmaddr + layout.textSegSize
+
+    # Append import pointer slots to __data (8 bytes each).
+    let ptrSlotsOffInData: uint64 = machoAlignUp(uint64(layout.data.len), uint64(8))
+    var newData: seq[uint8] = newSeq[uint8]()
+    obj_buf.bufBytes(&newData, layout.data)
+    obj_buf.bufAlign(&newData, uint64(8))
+    var pi: int32 = 0
+    while pi < layout.imports.len:
+        obj_buf.bufU64(&newData, uint64(0))
+        pi = pi + 1
+    layout.data = newData
+    layout.dataSegFileSize = machoAlignUp(uint64(layout.data.len), MACHO_PAGE_SIZE)
+    layout.dataSegVmSize = machoAlignUp(uint64(layout.data.len) + machoAlignUp(layout.bssSize, uint64(8)), MACHO_PAGE_SIZE)
+
+    layout.linkeditFileOff = layout.dataFileOff + layout.dataSegFileSize
+    layout.linkeditVmaddr = layout.dataVmaddr + layout.dataSegVmSize
+
+    # Resolve _main for LC_MAIN entryoff.
+    var mainAddr: uint64 = 0
+    var foundMain: bool = false
+    # Compute final addresses by rebuilding a defIndex from merged objects (cheap).
+    # For now, search symbol tables directly (stable, no extra maps).
+    i = 0
+    while i < objs.len:
+        let obj: MachoObjFile = get[MachoObjFile](objs, i)
+        var si: int32 = 0
+        while si < obj.symbols.len:
+            let sym: MachoObjSymbol = get[MachoObjSymbol](obj.symbols, si)
+            if sym != nil && streq(sym.name, "_main") && machoSymIsSect(sym) && machoSymIsExt(sym):
+                let sectIndex0: int32 = int32(sym.nSect) - 1
+                if sectIndex0 >= 0 && sectIndex0 < obj.sections.len:
+                    let sect0: MachoObjSection = get[MachoObjSection](obj.sections, sectIndex0)
+                    let symOffInSect: uint64 = sym.nValue - sect0.addr
+                    if streq(sect0.segname, "__TEXT") && streq(sect0.sectname, "__text"):
+                        # find base for this object's text in merged layout by re-scanning earlier merge rules
+                        # (only used to find main; ok to recompute).
+                        var base: uint64 = 0
+                        var oi2: int32 = 0
+                        var curText: uint64 = 0
+                        while oi2 < objs.len:
+                            if oi2 == i:
+                                base = curText
+                                break
+                            let o2: MachoObjFile = get[MachoObjFile](objs, oi2)
+                            let ti2: int32 = machoFindSectionIndexByName(o2.sections, "__TEXT", "__text")
+                            if ti2 >= 0:
+                                let s2: MachoObjSection = get[MachoObjSection](o2.sections, ti2)
+                                curText = curText + uint64(s2.data.len)
+                                curText = machoAlignUp(curText, uint64(4))
+                            oi2 = oi2 + 1
+                        mainAddr = layout.textVmaddr + textOff + base + symOffInSect
+                        foundMain = true
+            si = si + 1
+        i = i + 1
+    if !foundMain:
+        var oi: int32 = 0
+        while oi < objs.len:
+            machoFreeObj(get[MachoObjFile](objs, oi))
+            oi = oi + 1
+        return Err[bool]("macho_linker: missing _main symbol (required for LC_MAIN)")
+
+    layout.entryoff = mainAddr - layout.textVmaddr
+
+    # Build stubs for imports at end of __text and patch call relocations.
+    # Stub code is placed after merged text; calls are rewritten to call stub.
+    let stubsBaseOff: uint64 = mergedTextLen
+    var stubAddrs: seq[uint64] = newSeq[uint64](layout.imports.len)
+    var ptrSlotAddrs: seq[uint64] = newSeq[uint64](layout.imports.len)
+    var importIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(layout.imports.len * 2 + 8)
+    pi = 0
+    while pi < layout.imports.len:
+        let name: str = get[str](layout.imports, pi)
+        hashmaps.hashMapStrIntPut(&importIndex, name, pi)
+        let slotOff: uint64 = ptrSlotsOffInData + uint64(pi) * 8
+        let slotAddr: uint64 = layout.dataVmaddr + slotOff
+        setPtr[uint64](&ptrSlotAddrs, pi, slotAddr)
+        let stubOff: uint64 = stubsBaseOff + uint64(pi) * 12
+        let stubAddr: uint64 = layout.textVmaddr + textOff + stubOff
+        setPtr[uint64](&stubAddrs, pi, stubAddr)
+        let stubRes: Result[seq[uint8]] = machoMakeStub(slotAddr, stubAddr)
+        if !IsOk[seq[uint8]](stubRes):
+            var oi: int32 = 0
+            while oi < objs.len:
+                machoFreeObj(get[MachoObjFile](objs, oi))
+                oi = oi + 1
+            return ErrInfo[bool](ErrorInfoOf[seq[uint8]](stubRes))
+        obj_buf.bufBytes(&layout.text, Value[seq[uint8]](stubRes))
+        pi = pi + 1
+
+    # Patch relocations (in merged text only).
+    # NOTE: We only patch relocations originating from __TEXT,__text sections.
+    var textCursorBase: uint64 = 0
+    i = 0
+    while i < objs.len:
+        let obj: MachoObjFile = get[MachoObjFile](objs, i)
+        let textIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__text")
+        if textIdx >= 0:
+            let sect: MachoObjSection = get[MachoObjSection](obj.sections, textIdx)
+            var ri: int32 = 0
+            while ri < sect.relocs.len:
+                let r: MachoObjReloc = get[MachoObjReloc](sect.relocs, ri)
+                let placeOffInText: uint64 = textCursorBase + uint64(r.addr)
+                let placeAddr: uint64 = layout.textVmaddr + textOff + placeOffInText
+                let placeOffInFileTextBytes: int32 = int32(placeOffInText)
+                if placeOffInFileTextBytes < 0 || placeOffInFileTextBytes + 4 > layout.text.len:
+                    return Err[bool]("macho_linker: reloc out of range")
+                if !r.extern:
+                    return Err[bool]("macho_linker: non-extern reloc unsupported (v2)")
+                if r.symIndex < 0 || r.symIndex >= obj.symbols.len:
+                    return Err[bool]("macho_linker: reloc symIndex out of range")
+                let sym: MachoObjSymbol = get[MachoObjSymbol](obj.symbols, r.symIndex)
+                let symName: str = (sym != nil) ? sym.name : ""
+                # Resolve symbol address if defined among inputs; otherwise treat as import (BR26 only).
+                var targetAddr: uint64 = 0
+                var isImport: bool = false
+                # First, try to resolve against defined symbols across all input objects (normal linking).
+                var resolved: bool = false
+                var oj: int32 = 0
+                var tBase: uint64 = 0
+                var cBase: uint64 = 0
+                var dBase: uint64 = 0
+                var bBase: uint64 = 0
+                while oj < objs.len && !resolved:
+                    let o2: MachoObjFile = get[MachoObjFile](objs, oj)
+                    let ti2: int32 = machoFindSectionIndexByName(o2.sections, "__TEXT", "__text")
+                    let ci2: int32 = machoFindSectionIndexByName(o2.sections, "__TEXT", "__cstring")
+                    let di2: int32 = machoFindSectionIndexByName(o2.sections, "__DATA", "__data")
+                    let bi2: int32 = machoFindSectionIndexByName(o2.sections, "__DATA", "__bss")
+                    var symi2: int32 = 0
+                    while symi2 < o2.symbols.len:
+                        let s2: MachoObjSymbol = get[MachoObjSymbol](o2.symbols, symi2)
+                        if s2 != nil && streq(s2.name, symName) && machoSymIsSect(s2):
+                            let sIdx0: int32 = int32(s2.nSect) - 1
+                            if sIdx0 >= 0 && sIdx0 < o2.sections.len:
+                                let sec2: MachoObjSection = get[MachoObjSection](o2.sections, sIdx0)
+                                let symOff: uint64 = s2.nValue - sec2.addr
+                                if streq(sec2.segname, "__TEXT") && streq(sec2.sectname, "__text"):
+                                    targetAddr = layout.textVmaddr + textOff + tBase + symOff
+                                elif streq(sec2.segname, "__TEXT") && streq(sec2.sectname, "__cstring"):
+                                    targetAddr = layout.textVmaddr + cstrOff + cBase + symOff
+                                elif streq(sec2.segname, "__DATA") && streq(sec2.sectname, "__data"):
+                                    targetAddr = layout.dataVmaddr + dBase + symOff
+                                elif streq(sec2.segname, "__DATA") && streq(sec2.sectname, "__bss"):
+                                    targetAddr = layout.dataVmaddr + uint64(layout.data.len) + bBase + symOff
+                                else:
+                                    targetAddr = layout.textVmaddr + textOff + tBase + symOff
+                                resolved = true
+                        symi2 = symi2 + 1
+                    if !resolved:
+                        if ti2 >= 0:
+                            let ts: MachoObjSection = get[MachoObjSection](o2.sections, ti2)
+                            tBase = tBase + uint64(ts.data.len)
+                            tBase = machoAlignUp(tBase, uint64(4))
+                        if ci2 >= 0:
+                            let cs: MachoObjSection = get[MachoObjSection](o2.sections, ci2)
+                            cBase = cBase + uint64(cs.data.len)
+                            cBase = machoAlignUp(cBase, uint64(1))
+                        if di2 >= 0:
+                            let ds: MachoObjSection = get[MachoObjSection](o2.sections, di2)
+                            dBase = machoAlignUp(dBase, uint64(8))
+                            dBase = dBase + uint64(ds.data.len)
+                            dBase = machoAlignUp(dBase, uint64(8))
+                        if bi2 >= 0:
+                            let bs: MachoObjSection = get[MachoObjSection](o2.sections, bi2)
+                            bBase = machoAlignUp(bBase, uint64(8))
+                            bBase = bBase + bs.size
+                    oj = oj + 1
+
+                if !resolved:
+                    # Unresolved: for undefined BR26 targets, fall back to import stub.
+                    if sym != nil && machoSymIsUndef(sym):
+                        var foundImp: bool = false
+                        let impIdx: int32 = hashmaps.hashMapStrIntGet(importIndex, symName, &foundImp)
+                        if foundImp:
+                            isImport = true
+                            targetAddr = get[uint64](stubAddrs, impIdx)
+                        else:
+                            return Err[bool]("macho_linker: unresolved symbol: " + symName)
+                    else:
+                        return Err[bool]("macho_linker: unresolved symbol: " + symName)
+
+                let word0: uint32 = machoReadU32LEFromSeq(layout.text, placeOffInFileTextBytes)
+                if r.rtype == ARM64_RELOC_BRANCH26:
+                    let patched: Result[uint32] = machoPatchBl(word0, placeAddr, targetAddr)
+                    if !IsOk[uint32](patched):
+                        return ErrInfo[bool](ErrorInfoOf[uint32](patched))
+                    machoWriteU32LEToSeq(&layout.text, placeOffInFileTextBytes, Value[uint32](patched))
+                elif r.rtype == ARM64_RELOC_PAGE21:
+                    if isImport:
+                        return Err[bool]("macho_linker: PAGE21 to undefined symbol unsupported: " + symName)
+                    let patched2: Result[uint32] = machoPatchAdrp(word0, placeAddr, targetAddr)
+                    if !IsOk[uint32](patched2):
+                        return ErrInfo[bool](ErrorInfoOf[uint32](patched2))
+                    machoWriteU32LEToSeq(&layout.text, placeOffInFileTextBytes, Value[uint32](patched2))
+                elif r.rtype == ARM64_RELOC_PAGEOFF12:
+                    if isImport:
+                        return Err[bool]("macho_linker: PAGEOFF12 to undefined symbol unsupported: " + symName)
+                    let imm12: uint32 = uint32(targetAddr & uint64(0xFFF))
+                    let patched3: uint32 = machoPatchAddImm12(word0, imm12)
+                    machoWriteU32LEToSeq(&layout.text, placeOffInFileTextBytes, patched3)
+                else:
+                    return Err[bool]("macho_linker: unsupported reloc type: " + intToStr(r.rtype))
+                ri = ri + 1
+            textCursorBase = textCursorBase + uint64(sect.data.len)
+            textCursorBase = machoAlignUp(textCursorBase, uint64(4))
+        i = i + 1
+
+    # Build dyld bind info for import pointer slots (segment index 2 => __DATA when order is PAGEZERO, TEXT, DATA, LINKEDIT).
+    var bindInfo: seq[uint8] = newSeq[uint8]()
+    if layout.imports.len > 0:
+        let bindStartOffInDataSeg: uint64 = ptrSlotsOffInData
+        machoWriteBindInfo(&bindInfo, uint8(2), bindStartOffInDataSeg, layout.imports)
+    else:
+        addPtr[uint8](&bindInfo, BIND_OPCODE_DONE)
+
+    # Build minimal symbol table (extdefs + undefs).
+    var syms: seq[MachoObjSymbol] = newSeq[MachoObjSymbol]()
+    # extdef: _main only (enough for tooling); other symbols can be added later.
+    var mainSym: MachoObjSymbol
+    new mainSym
+    mainSym.name = "_main"
+    mainSym.nType = uint8(N_SECT | N_EXT)
+    mainSym.nSect = uint8(1)
+    mainSym.nDesc = uint16(0)
+    mainSym.nValue = mainAddr
+    addPtr[MachoObjSymbol](&syms, mainSym)
+    # undefs
+    pi = 0
+    while pi < layout.imports.len:
+        var us: MachoObjSymbol
+        new us
+        us.name = get[str](layout.imports, pi)
+        us.nType = uint8(N_UNDF | N_EXT)
+        us.nSect = uint8(0)
+        us.nDesc = uint16(0)
+        us.nValue = uint64(0)
+        addPtr[MachoObjSymbol](&syms, us)
+        pi = pi + 1
+
+    # String table
+    var strtab: seq[uint8] = newSeq[uint8]()
+    addPtr[uint8](&strtab, uint8(0))
+    var symNameOffs: seq[uint32] = newSeq[uint32](syms.len)
+    var si3: int32 = 0
+    while si3 < syms.len:
+        setPtr[uint32](&symNameOffs, si3, uint32(strtab.len))
+        let symNameRec: MachoObjSymbol = get[MachoObjSymbol](syms, si3)
+        obj_buf.bufStr0(&strtab, symNameRec.name)
+        si3 = si3 + 1
+
+    # Linkedit layout: bindInfo (aligned 8), symtab, strtab.
+    var linkedit: seq[uint8] = newSeq[uint8]()
+    let bindOff: uint64 = 0
+    obj_buf.bufBytes(&linkedit, bindInfo)
+    obj_buf.bufAlign(&linkedit, uint64(8))
+    let symoff: uint64 = uint64(linkedit.len)
+    si3 = 0
+    while si3 < syms.len:
+        let s: MachoObjSymbol = get[MachoObjSymbol](syms, si3)
+        obj_buf.bufU32(&linkedit, get[uint32](symNameOffs, si3))
+        obj_buf.bufU8(&linkedit, s.nType)
+        obj_buf.bufU8(&linkedit, s.nSect)
+        obj_buf.bufU16(&linkedit, s.nDesc)
+        obj_buf.bufU64(&linkedit, s.nValue)
+        si3 = si3 + 1
+    let stroff: uint64 = uint64(linkedit.len)
+    obj_buf.bufBytes(&linkedit, strtab)
+
+    layout.linkeditSegSize = machoAlignUp(uint64(linkedit.len), MACHO_PAGE_SIZE)
+
+    # Compute final file size and prepare output buffer.
+    let fileSize: uint64 = layout.linkeditFileOff + uint64(linkedit.len)
+    var outBytes: seq[uint8] = newSeq[uint8]()
+    # Pre-size by appending zeros.
+    var zi: uint64 = 0
+    while zi < fileSize:
+        addPtr[uint8](&outBytes, uint8(0))
+        zi = zi + 1
+
+    # Write header + load commands.
+    var hdr: seq[uint8] = newSeq[uint8]()
+    # mach_header_64
+    obj_buf.bufU32(&hdr, MH_MAGIC_64)
+    obj_buf.bufU32(&hdr, CPU_TYPE_ARM64)
+    obj_buf.bufU32(&hdr, CPU_SUBTYPE_ARM64_ALL)
+    obj_buf.bufU32(&hdr, MH_EXECUTE)
+    obj_buf.bufU32(&hdr, ncmds)
+    obj_buf.bufU32(&hdr, layout.sizeofcmds)
+    obj_buf.bufU32(&hdr, MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE)
+    obj_buf.bufU32(&hdr, uint32(0)) # reserved
+
+    # LC_SEGMENT_64 __PAGEZERO
+    obj_buf.bufU32(&hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(&hdr, segPagezeroSize)
+    obj_buf.bufFixedStr(&hdr, "__PAGEZERO", 16)
+    obj_buf.bufU64(&hdr, uint64(0))
+    obj_buf.bufU64(&hdr, uint64(0x100000000))
+    obj_buf.bufU64(&hdr, uint64(0))
+    obj_buf.bufU64(&hdr, uint64(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+
+    # LC_SEGMENT_64 __TEXT (sections: __text, __cstring)
+    obj_buf.bufU32(&hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(&hdr, segTextSize)
+    obj_buf.bufFixedStr(&hdr, "__TEXT", 16)
+    obj_buf.bufU64(&hdr, layout.textVmaddr)
+    obj_buf.bufU64(&hdr, layout.textSegSize)
+    obj_buf.bufU64(&hdr, uint64(0))
+    obj_buf.bufU64(&hdr, layout.textSegSize)
+    obj_buf.bufU32(&hdr, uint32(5))
+    obj_buf.bufU32(&hdr, uint32(5))
+    obj_buf.bufU32(&hdr, uint32(2))
+    obj_buf.bufU32(&hdr, uint32(0))
+    # section __text
+    obj_buf.bufFixedStr(&hdr, "__text", 16)
+    obj_buf.bufFixedStr(&hdr, "__TEXT", 16)
+    obj_buf.bufU64(&hdr, layout.textVmaddr + textOff)
+    obj_buf.bufU64(&hdr, uint64(layout.text.len))
+    obj_buf.bufU32(&hdr, uint32(textOff))
+    obj_buf.bufU32(&hdr, uint32(2)) # align 4
+    obj_buf.bufU32(&hdr, uint32(0)) # reloff
+    obj_buf.bufU32(&hdr, uint32(0)) # nreloc
+    obj_buf.bufU32(&hdr, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    # section __cstring
+    obj_buf.bufFixedStr(&hdr, "__cstring", 16)
+    obj_buf.bufFixedStr(&hdr, "__TEXT", 16)
+    obj_buf.bufU64(&hdr, layout.textVmaddr + cstrOff)
+    obj_buf.bufU64(&hdr, uint64(layout.cstring.len))
+    obj_buf.bufU32(&hdr, uint32(cstrOff))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, S_CSTRING_LITERALS)
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+
+    # LC_SEGMENT_64 __DATA (sections: __data, __bss)
+    obj_buf.bufU32(&hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(&hdr, segDataSize)
+    obj_buf.bufFixedStr(&hdr, "__DATA", 16)
+    obj_buf.bufU64(&hdr, layout.dataVmaddr)
+    obj_buf.bufU64(&hdr, layout.dataSegVmSize)
+    obj_buf.bufU64(&hdr, layout.dataFileOff)
+    obj_buf.bufU64(&hdr, layout.dataSegFileSize)
+    obj_buf.bufU32(&hdr, uint32(3))
+    obj_buf.bufU32(&hdr, uint32(3))
+    obj_buf.bufU32(&hdr, uint32(2))
+    obj_buf.bufU32(&hdr, uint32(0))
+    # section __data
+    obj_buf.bufFixedStr(&hdr, "__data", 16)
+    obj_buf.bufFixedStr(&hdr, "__DATA", 16)
+    obj_buf.bufU64(&hdr, layout.dataVmaddr)
+    obj_buf.bufU64(&hdr, uint64(layout.data.len))
+    obj_buf.bufU32(&hdr, uint32(layout.dataFileOff))
+    obj_buf.bufU32(&hdr, uint32(3)) # align 8
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    # section __bss (zerofill)
+    let bssAddr: uint64 = layout.dataVmaddr + uint64(layout.data.len)
+    obj_buf.bufFixedStr(&hdr, "__bss", 16)
+    obj_buf.bufFixedStr(&hdr, "__DATA", 16)
+    obj_buf.bufU64(&hdr, bssAddr)
+    obj_buf.bufU64(&hdr, layout.bssSize)
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(3))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, S_ZEROFILL)
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+
+    # LC_SEGMENT_64 __LINKEDIT
+    obj_buf.bufU32(&hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(&hdr, segLinkeditSize)
+    obj_buf.bufFixedStr(&hdr, "__LINKEDIT", 16)
+    obj_buf.bufU64(&hdr, layout.linkeditVmaddr)
+    obj_buf.bufU64(&hdr, layout.linkeditSegSize)
+    obj_buf.bufU64(&hdr, layout.linkeditFileOff)
+    obj_buf.bufU64(&hdr, uint64(linkedit.len))
+    obj_buf.bufU32(&hdr, uint32(1))
+    obj_buf.bufU32(&hdr, uint32(1))
+    obj_buf.bufU32(&hdr, uint32(0))
+    obj_buf.bufU32(&hdr, uint32(0))
+
+    # LC_DYLD_INFO_ONLY (bind only)
+    obj_buf.bufU32(&hdr, LC_DYLD_INFO_ONLY)
+    obj_buf.bufU32(&hdr, dyldInfoSize)
+    obj_buf.bufU32(&hdr, uint32(0)) # rebase_off
+    obj_buf.bufU32(&hdr, uint32(0)) # rebase_size
+    obj_buf.bufU32(&hdr, uint32(layout.linkeditFileOff + bindOff)) # bind_off
+    obj_buf.bufU32(&hdr, uint32(bindInfo.len)) # bind_size
+    obj_buf.bufU32(&hdr, uint32(0)) # weak_bind_off
+    obj_buf.bufU32(&hdr, uint32(0)) # weak_bind_size
+    obj_buf.bufU32(&hdr, uint32(0)) # lazy_bind_off
+    obj_buf.bufU32(&hdr, uint32(0)) # lazy_bind_size
+    obj_buf.bufU32(&hdr, uint32(0)) # export_off
+    obj_buf.bufU32(&hdr, uint32(0)) # export_size
+
+    # LC_SYMTAB
+    obj_buf.bufU32(&hdr, LC_SYMTAB)
+    obj_buf.bufU32(&hdr, symtabSize)
+    obj_buf.bufU32(&hdr, uint32(layout.linkeditFileOff + symoff))
+    obj_buf.bufU32(&hdr, uint32(syms.len))
+    obj_buf.bufU32(&hdr, uint32(layout.linkeditFileOff + stroff))
+    obj_buf.bufU32(&hdr, uint32(strtab.len))
+
+    # LC_DYSYMTAB (locals=0, extdefs=1, undefs=imports)
+    obj_buf.bufU32(&hdr, LC_DYSYMTAB)
+    obj_buf.bufU32(&hdr, dysymSize)
+    obj_buf.bufU32(&hdr, uint32(0)) # ilocalsym
+    obj_buf.bufU32(&hdr, uint32(0)) # nlocalsym
+    obj_buf.bufU32(&hdr, uint32(0)) # iextdefsym
+    obj_buf.bufU32(&hdr, uint32(1)) # nextdefsym
+    obj_buf.bufU32(&hdr, uint32(1)) # iundefsym
+    obj_buf.bufU32(&hdr, uint32(layout.imports.len)) # nundefsym
+    obj_buf.bufU32(&hdr, uint32(0)) # tocoff
+    obj_buf.bufU32(&hdr, uint32(0)) # ntoc
+    obj_buf.bufU32(&hdr, uint32(0)) # modtaboff
+    obj_buf.bufU32(&hdr, uint32(0)) # nmodtab
+    obj_buf.bufU32(&hdr, uint32(0)) # extrefsymoff
+    obj_buf.bufU32(&hdr, uint32(0)) # nextrefsyms
+    obj_buf.bufU32(&hdr, uint32(0)) # indirectsymoff
+    obj_buf.bufU32(&hdr, uint32(0)) # nindirectsyms
+    obj_buf.bufU32(&hdr, uint32(0)) # extreloff
+    obj_buf.bufU32(&hdr, uint32(0)) # nextrel
+    obj_buf.bufU32(&hdr, uint32(0)) # locreloff
+    obj_buf.bufU32(&hdr, uint32(0)) # nlocrel
+
+    # LC_LOAD_DYLINKER
+    obj_buf.bufU32(&hdr, LC_LOAD_DYLINKER)
+    obj_buf.bufU32(&hdr, loadDylinkerSize)
+    obj_buf.bufU32(&hdr, uint32(12)) # name offset
+    obj_buf.bufStr0(&hdr, "/usr/lib/dyld")
+    while uint64(hdr.len) % 8 != 0:
+        obj_buf.bufU8(&hdr, uint8(0))
+
+    # LC_UUID (deterministic placeholder: all zeros)
+    obj_buf.bufU32(&hdr, LC_UUID)
+    obj_buf.bufU32(&hdr, uuidSize)
+    var ui: int32 = 0
+    while ui < 16:
+        obj_buf.bufU8(&hdr, uint8(0))
+        ui = ui + 1
+
+    # LC_BUILD_VERSION (platform macOS, minos 15.0, sdk 0; tool ld)
+    obj_buf.bufU32(&hdr, LC_BUILD_VERSION)
+    obj_buf.bufU32(&hdr, buildSize)
+    obj_buf.bufU32(&hdr, uint32(1)) # PLATFORM_MACOS
+    obj_buf.bufU32(&hdr, uint32(0x000F0000)) # minos 15.0
+    obj_buf.bufU32(&hdr, uint32(0)) # sdk
+    obj_buf.bufU32(&hdr, uint32(1)) # ntools
+    obj_buf.bufU32(&hdr, uint32(3)) # TOOL_LD
+    obj_buf.bufU32(&hdr, uint32(0)) # version
+
+    # LC_SOURCE_VERSION
+    obj_buf.bufU32(&hdr, LC_SOURCE_VERSION)
+    obj_buf.bufU32(&hdr, sourceVerSize)
+    obj_buf.bufU64(&hdr, uint64(0))
+
+    # LC_MAIN
+    obj_buf.bufU32(&hdr, LC_MAIN)
+    obj_buf.bufU32(&hdr, mainSize)
+    obj_buf.bufU64(&hdr, layout.entryoff)
+    obj_buf.bufU64(&hdr, uint64(0))
+
+    # LC_LOAD_DYLIB (libSystem)
+    obj_buf.bufU32(&hdr, LC_LOAD_DYLIB)
+    obj_buf.bufU32(&hdr, loadDylibSize)
+    obj_buf.bufU32(&hdr, uint32(24)) # name offset
+    obj_buf.bufU32(&hdr, uint32(2))  # timestamp
+    obj_buf.bufU32(&hdr, uint32(0))  # current version
+    obj_buf.bufU32(&hdr, uint32(0))  # compat version
+    obj_buf.bufStr0(&hdr, "/usr/lib/libSystem.B.dylib")
+    while uint64(hdr.len) % 8 != 0:
+        obj_buf.bufU8(&hdr, uint8(0))
+
+    if uint32(hdr.len) != layout.headerSize + uint64(layout.sizeofcmds):
+        # Keep file offsets stable: pad up to firstSectionOff with zeros.
+        while uint64(hdr.len) < firstSectionOff:
+            obj_buf.bufU8(&hdr, uint8(0))
+
+    # Copy header into outBytes.
+    var bi: int32 = 0
+    while bi < hdr.len:
+        setPtr[uint8](&outBytes, bi, get[uint8](hdr, bi))
+        bi = bi + 1
+
+    # Copy __TEXT section bytes.
+    var ti: int32 = 0
+    while ti < layout.text.len:
+        setPtr[uint8](&outBytes, int32(textOff) + ti, get[uint8](layout.text, ti))
+        ti = ti + 1
+    var ci2: int32 = 0
+    while ci2 < layout.cstring.len:
+        setPtr[uint8](&outBytes, int32(cstrOff) + ci2, get[uint8](layout.cstring, ci2))
+        ci2 = ci2 + 1
+
+    # Copy __DATA bytes.
+    var di: int32 = 0
+    while di < layout.data.len:
+        setPtr[uint8](&outBytes, int32(layout.dataFileOff) + di, get[uint8](layout.data, di))
+        di = di + 1
+
+    # Copy __LINKEDIT bytes.
+    var li: int32 = 0
+    while li < linkedit.len:
+        setPtr[uint8](&outBytes, int32(layout.linkeditFileOff) + li, get[uint8](linkedit, li))
+        li = li + 1
+
+    os.writeFileBytes(outputPath, outBytes)
+
+    # Free object buffers.
+    var oi: int32 = 0
+    while oi < objs.len:
+        machoFreeObj(get[MachoObjFile](objs, oi))
+        oi = oi + 1
+
+    return Ok[bool](true)

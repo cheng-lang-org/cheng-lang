@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="build/cheng_demo_compute"
+MODE="local"
+EPOCH="1"
+CLEAN="0"
+RESET_LEDGER="0"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root:*)
+      ROOT="${1#--root:}"
+      ;;
+    --mode:*)
+      MODE="${1#--mode:}"
+      ;;
+    --epoch:*)
+      EPOCH="${1#--epoch:}"
+      ;;
+    --clean)
+      CLEAN="1"
+      ;;
+    --reset-ledger)
+      RESET_LEDGER="1"
+      ;;
+    *)
+      echo "unknown arg: $1" 1>&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [ "$CLEAN" = "1" ]; then
+  rm -rf "$ROOT"
+fi
+mkdir -p "$ROOT"
+
+if [ ! -x "./cheng_storage" ]; then
+  src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage
+fi
+
+LEDGER="$ROOT/ledger.jsonl"
+if [ "$RESET_LEDGER" = "1" ] && [ -f "$LEDGER" ]; then
+  rm -f "$LEDGER"
+fi
+
+req_out="$(./cheng_storage exec --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --requester:node:app-1 \
+  --gpu_ms:120000 --gpu_mem_bytes:8589934592 --gpu_count:1 --gpu_type:A10G --workload:infer \
+  --price_gpu:0.00002 --price_gpu_mem:0.15 --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE")"
+req_id="$(printf '%s' "$req_out" | sed -n 's/^exec ok: //p')"
+if [ -z "${req_id:-}" ]; then
+  echo "demo: missing request id" 1>&2
+  exit 1
+fi
+
+usage_out="$(./cheng_storage meter --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --executor:node:exec-1 \
+  --gpu_ms:110000 --gpu_mem_bytes:7516192768 --gpu_count:1 --gpu_type:A10G --workload:infer \
+  --price_gpu:0.00002 --price_gpu_mem:0.15 --royalty:0.12 --treasury:0.03 \
+  --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE")"
+usage_id="$(printf '%s' "$usage_out" | sed -n 's/^meter ok: //p')"
+if [ -z "${usage_id:-}" ]; then
+  echo "demo: missing usage id" 1>&2
+  exit 1
+fi
+
+rec_out="$(./cheng_storage receipt --request:"$req_id" --task:job-gpu-demo --executor:node:exec-1 --status:ok \
+  --usage:"$usage_id" --result:cid://result --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE")"
+rec_id="$(printf '%s' "$rec_out" | sed -n 's/^receipt ok: //p')"
+if [ -z "${rec_id:-}" ]; then
+  echo "demo: missing receipt id" 1>&2
+  exit 1
+fi
+
+./cheng_storage sample --root:"$ROOT" --epoch:"$EPOCH" --rate:1 --seed:demo \
+  --auditor:node:auditor-1 --record --format:json >/dev/null
+
+./cheng_storage audit --task:job-gpu-demo --executor:node:exec-1 --auditor:node:auditor-1 --status:bad \
+  --penalty:0.10 --epoch:"$EPOCH" --note:demo --root:"$ROOT" --mode:"$MODE" >/dev/null
+
+./cheng_storage fraud --task:job-gpu-demo --executor:node:exec-1 --reporter:node:auditor-1 \
+  --reason:demo --epoch:"$EPOCH" --root:"$ROOT" >/dev/null
+
+echo "settle:"
+./cheng_storage settle --root:"$ROOT" --format:toml --top:5 --reconcile-csv:"$ROOT/settle_reconcile.csv"

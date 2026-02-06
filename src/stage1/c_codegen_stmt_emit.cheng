@@ -1,0 +1,1939 @@
+fn cgenTypePointeeType(n: Node): Node =
+    let cur: Node = unwrapParType n
+    if cur == nil:
+        return nil
+    if cur.kind == nkPtrTy || cur.kind == nkRefTy || cur.kind == nkVarTy:
+        if kidCount cur > 0:
+            return stripVarType kid(cur, 0)
+        return nil
+    if cur.kind == nkPostfix && kidCount cur > 1:
+        let opn0: Node = kid(cur, 0)
+        let opn1: Node = kid(cur, 1)
+        if opn0 != nil && cgenStripSpaces(opn0.ident) == "*":
+            return stripVarType opn1
+        if opn1 != nil && cgenStripSpaces(opn1.ident) == "*":
+            return stripVarType opn0
+        return nil
+    if cur.kind == nkInfix && kidCount cur >= 3:
+        let opn2: Node = kid(cur, 0)
+        if opn2 != nil && cgenStripSpaces(opn2.ident) == "*":
+            let rhs: Node = kid(cur, 2)
+            if rhs == nil || rhs.kind == nkEmpty:
+                return stripVarType kid(cur, 1)
+        let opnMid: Node = kid(cur, 1)
+        if opnMid != nil && cgenStripSpaces(opnMid.ident) == "*":
+            let rhsMid: Node = kid(cur, 2)
+            if rhsMid == nil || rhsMid.kind == nkEmpty:
+                return stripVarType kid(cur, 0)
+    return nil
+
+fn cgenInferLValueValueType(lhs: Node): Node =
+    let core: Node = unwrapParExpr lhs
+    if core == nil:
+        return nil
+    if (core.kind == nkHiddenDeref || core.kind == nkDerefExpr) && kidCount core > 0:
+        let base: Node = kid(core, 0)
+        let baseTy: Node = inferSimpleTypeNode base
+        return cgenTypePointeeType(baseTy)
+    if core.kind == nkIdent || core.kind == nkSymbol:
+        let nm: str = cgenStripSpaces core.ident
+        let t0: Node = lookupVarType nm
+        if typeIsVarRef t0:
+            return cgenTypePointeeType(t0)
+        return stripVarType t0
+    return stripVarType(inferSimpleTypeNode core)
+
+fn cgenEmitLValueExpr(w: CWriter*, lhs: Node) =
+    if w == nil:
+        return
+    if lhs != nil && (lhs.kind == nkIdent || lhs.kind == nkSymbol):
+        let lname: str = cgenStripSpaces lhs.ident
+        let ltype: Node = lookupVarType lname
+        if typeIsVarRef ltype:
+            cwWrite(w, "(*")
+            cwWrite(w, cgenEscapeCIdent(lname))
+            cwWrite(w, ")")
+            return
+    cgenEmitExpr(w, lhs)
+
+fn cgenEmitOrcAssignStr(w: CWriter*, lhs: Node, rhs: Node) =
+    if w == nil || lhs == nil || rhs == nil:
+        return
+    if !cgenOrcEnabled():
+        cwIndent w
+        cgenEmitLValueExpr(w, lhs)
+        cwWrite(w, " = ")
+        cgenEmitExpr(w, rhs)
+        cwWrite(w, ";")
+        cwNewline w
+        return
+    let rhsTmp: str = cgenNextTempName("tmp")
+    let lhsPtr: str = cgenNextTempName("lhs")
+    let oldTmp: str = cgenNextTempName("old")
+    let needsRetain: bool = cgenStrNeedsRetain(rhs)
+    cwIndent w
+    cwWrite(w, "do {")
+    cwNewline w
+    cwIndentPush w
+    cwIndent w
+    cwWrite(w, "char* ")
+    cwWrite(w, rhsTmp)
+    cwWrite(w, " = ")
+    cgenEmitExpr(w, rhs)
+    cwWrite(w, ";")
+    cwNewline w
+    if needsRetain:
+        cwIndent w
+        cwWrite(w, "cheng_mem_retain((void*)")
+        cwWrite(w, rhsTmp)
+        cwWrite(w, ");")
+        cwNewline w
+    cwIndent w
+    cwWrite(w, "char** ")
+    cwWrite(w, lhsPtr)
+    cwWrite(w, " = &")
+    cgenEmitLValueExpr(w, lhs)
+    cwWrite(w, ";")
+    cwNewline w
+    cwIndent w
+    cwWrite(w, "char* ")
+    cwWrite(w, oldTmp)
+    cwWrite(w, " = *")
+    cwWrite(w, lhsPtr)
+    cwWrite(w, ";")
+    cwNewline w
+    cwIndent w
+    cwWrite(w, "*")
+    cwWrite(w, lhsPtr)
+    cwWrite(w, " = ")
+    cwWrite(w, rhsTmp)
+    cwWrite(w, ";")
+    cwNewline w
+    cwIndent w
+    cwWrite(w, "cheng_mem_release((void*)")
+    cwWrite(w, oldTmp)
+    cwWrite(w, ");")
+    cwNewline w
+    cwIndentPop w
+    cwIndent w
+    cwWrite(w, "} while (0);")
+    cwNewline w
+
+fn cgenEmitAsyncReturnExpr(w: CWriter*, expr: Node) =
+    let asyncTy: Node = currentFnAsyncValueType
+    let retTy: Node = currentFnRetType
+    let readyFn: str = cgenAsyncReadyFuncName asyncTy
+    if strIsEmpty readyFn:
+        if expr != nil:
+            cgenAddError(expr.pos, "[C-Profile] not-mapped: async return type (FULLC.R03). hint: only int32/void awaitable in v0.")
+        elif asyncTy != nil:
+            cgenAddError(asyncTy.pos, "[C-Profile] not-mapped: async return type (FULLC.R03). hint: only int32/void awaitable in v0.")
+        elif retTy != nil:
+            cgenAddError(retTy.pos, "[C-Profile] not-mapped: async return type (FULLC.R03). hint: only int32/void awaitable in v0.")
+        cwIndent w
+        cwWrite(w, "return 0;")
+        cwNewline w
+        return
+    let valueIsVoid: bool = (asyncTy == nil || asyncTy.kind == nkEmpty ||
+                             cgenIsVoidTypeNode(asyncTy))
+    if valueIsVoid:
+        if expr != nil && expr.kind != nkEmpty:
+            cwIndent w
+            cgenEmitExpr(w, expr)
+            cwWrite(w, ";")
+            cwNewline w
+        cwIndent w
+        cwWrite(w, "return ")
+        cwWrite(w, readyFn)
+        cwWrite(w, "();")
+        cwNewline w
+        return
+    let core: Node = unwrapParExpr expr
+    if core != nil && core.kind == nkCall:
+        let retType: Node = cgenCallImportcAggRetType core
+        if retType != nil:
+            let tmpName: str = cgenNextTempName("ret")
+            cwIndent w
+            emitTypeName(w, retType)
+            cwWrite(w, " ")
+            cwWrite(w, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+            cwIndent w
+            cgenEmitImportcAggCall(w, core, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+            cwIndent w
+            cwWrite(w, "return ")
+            cwWrite(w, readyFn)
+            cwWrite(w, "(")
+            cwWrite(w, tmpName)
+            cwWrite(w, ");")
+            cwNewline w
+            return
+    cwIndent w
+    cwWrite(w, "return ")
+    cwWrite(w, readyFn)
+    cwWrite(w, "(")
+    if expr != nil && expr.kind != nkEmpty:
+        cgenEmitExpr(w, expr)
+    else:
+        cwWrite(w, "0")
+    cwWrite(w, ");")
+    cwNewline w
+
+fn emitReturnExpr(w: CWriter*, expr: Node) =
+    if currentFnIsAsync:
+        cgenEmitAsyncReturnExpr(w, expr)
+        return
+    if expr == nil || expr.kind == nkEmpty:
+        cgenEmitAllScopeCleanup(w, "")
+        cwIndent w
+        cwWrite(w, "return;")
+        cwNewline w
+        return
+    let core: Node = unwrapParExpr expr
+    var retType: Node = currentFnRetType
+    if retType == nil || retType.kind == nkEmpty:
+        retType = inferSimpleTypeNode core
+    if retType == nil || retType.kind == nkEmpty:
+        cgenAddError(expr.pos, "C backend requires return type")
+        cgenEmitAllScopeCleanup(w, "")
+        cwIndent w
+        cwWrite(w, "return 0;")
+        cwNewline w
+        return
+    let tmpName: str = cgenNextTempName("ret")
+    cwIndent w
+    emitTypeName(w, retType)
+    cwWrite(w, " ")
+    cwWrite(w, tmpName)
+    cwWrite(w, ";")
+    cwNewline w
+    if core != nil && core.kind == nkCall:
+        let aggType: Node = cgenCallImportcAggRetType core
+        if aggType != nil:
+            cwIndent w
+            cgenEmitImportcAggCall(w, core, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+        else:
+            cwIndent w
+            cwWrite(w, tmpName)
+            cwWrite(w, " = ")
+            cgenEmitExpr(w, expr)
+            cwWrite(w, ";")
+            cwNewline w
+    elif core != nil && core.kind == nkSeqLit:
+        cgenEmitSeqLitAssign(w, tmpName, retType, retType, core, core.pos)
+    else:
+        cwIndent w
+        cwWrite(w, tmpName)
+        cwWrite(w, " = ")
+        cgenEmitExpr(w, expr)
+        cwWrite(w, ";")
+        cwNewline w
+    var moveName: str = ""
+    if core != nil && (core.kind == nkIdent || core.kind == nkSymbol):
+        let nm: str = cgenStripSpaces core.ident
+        if !cgenIsParam nm:
+            var found: bool = false
+            hashmaps.hashMapStrIntGet(localVarIndex, nm, &found)
+            if found:
+                moveName = nm
+    if cgenOrcEnabled() && cgenIsStringTypeNode(retType):
+        if cgenStrNeedsRetain(expr) && !(moveName != nil && len moveName > 0):
+            cwIndent w
+            cwWrite(w, "cheng_mem_retain((void*)")
+            cwWrite(w, tmpName)
+            cwWrite(w, ");")
+            cwNewline w
+    cgenEmitAllScopeCleanup(w, moveName)
+    cwIndent w
+    cwWrite(w, "return ")
+    cwWrite(w, tmpName)
+    cwWrite(w, ";")
+    cwNewline w
+
+fn emitStmtImpl(w: CWriter*, n: Node) =
+    if n == nil || n.kind == nkEmpty:
+        return
+    case n.kind
+    of nkStmtList:
+        cgenEmitStmtList(w, n)
+    of nkLet, nkVar, nkConst:
+        emitVarDecl(w, n)
+    of nkReturn:
+        if kidCount n > 0:
+            let retExpr: Node = kid(n, 0)
+            let coreRet: Node = unwrapParExpr retExpr
+            if coreRet != nil && coreRet.kind == nkCase:
+                cgenEmitCase(w, coreRet, currentFnRetType, true)
+                return
+            if coreRet != nil && (coreRet.kind == nkIf || coreRet.kind == nkWhen):
+                cgenEmitIfReturn(w, coreRet)
+                return
+            emitReturnExpr(w, retExpr)
+        else:
+            emitReturnExpr(w, nil)
+    of nkYield:
+        cgenAddError(n.pos, "[C-Profile] not-mapped: yield (FULLC.L05). hint: rewrite to iterator state machine or remove yield.")
+        return
+    of nkDefer:
+        return
+    of nkBreak:
+        cwWriteLine(w, "break;")
+    of nkContinue:
+        cwWriteLine(w, "continue;")
+    of nkIf, nkWhen:
+        cgenEmitIf(w, n)
+    of nkCase:
+        cgenEmitCase(w, n, nil, false)
+    of nkWhile:
+        cgenEmitWhile(w, n)
+    of nkFor:
+        emitFor(w, n)
+    of nkAsgn, nkFastAsgn:
+        if kidCount n >= 2:
+            let lhs: Node = kid(n, 0)
+            let rhs: Node = kid(n, 1)
+            let coreRhs: Node = unwrapParExpr rhs
+            if coreRhs != nil && (coreRhs.kind == nkIf || coreRhs.kind == nkWhen):
+                cgenEmitIfAssign(w, coreRhs, lhs)
+                return
+            if coreRhs != nil && coreRhs.kind == nkCase:
+                cgenEmitCaseAssign(w, coreRhs, lhs)
+                return
+            if coreRhs != nil && coreRhs.kind == nkCall:
+                let retType: Node = cgenCallImportcAggRetType coreRhs
+                if retType != nil:
+                    let tmpName: str = cgenNextTempName("ret")
+                    cwIndent w
+                    emitTypeName(w, retType)
+                    cwWrite(w, " ")
+                    cwWrite(w, tmpName)
+                    cwWrite(w, ";")
+                    cwNewline w
+                    cwIndent w
+                    cgenEmitImportcAggCall(w, coreRhs, tmpName)
+                    cwWrite(w, ";")
+                    cwNewline w
+                    if lhs != nil && lhs.kind == nkBracketExpr && kidCount lhs > 1:
+                        if kidCount lhs == 2:
+                            let baseExpr: Node = kid(lhs, 0)
+                            let baseType: Node = resolveBracketBaseType baseExpr
+                            if cgenIsArrayTypeNode baseType:
+                                cwIndent w
+                                cgenEmitArrayIndex(w, baseExpr, kid(lhs, 1))
+                                cwWrite(w, " = ")
+                                cwWrite(w, tmpName)
+                                cwWrite(w, ";")
+                                cwNewline w
+                                return
+                        var call2: Node = newNode(nkCall, n.pos)
+                        call2.callStyle = CallStyleParen
+                        addSon(call2, newIdent("[]=", n.pos))
+                        var ai: int32 = 0
+                        while ai < kidCount lhs:
+                            addSon(call2, kid(lhs, ai))
+                            ai = ai + 1
+                        addSon(call2, newIdent(tmpName, n.pos))
+                        var prefix: str = "[]="
+                        var instPrefix: str = buildBracketInstPrefix(kid(lhs, 0), prefix)
+                        var sigIdx2: int32 = -1
+                        if !strIsEmpty instPrefix:
+                            if strHasChar(instPrefix, '_'):
+                                sigIdx2 = cFnSigFindByPrefixName(instPrefix, call2)
+                            if sigIdx2 < 0:
+                                sigIdx2 = cFnSigFindMatchForPrefix(instPrefix, call2)
+                            if sigIdx2 >= 0:
+                                prefix = instPrefix
+                        if sigIdx2 < 0:
+                            sigIdx2 = cFnSigFindMatchForPrefix(prefix, call2)
+                        if sigIdx2 < 0:
+                            let normPrefix: str = cgenNormalizeInstanceBase prefix
+                            if normPrefix != prefix:
+                                prefix = normPrefix
+                                sigIdx2 = cFnSigFindMatchForPrefix(prefix, call2)
+                        cwIndent w
+                        if sigIdx2 >= 0:
+                            cwWrite(w, mangleCName(cFnSigName sigIdx2))
+                        else:
+                            cwWrite(w, mangleCName(prefix))
+                        cwWriteChar(w, '(')
+                        if sigIdx2 >= 0:
+                            cgenEmitCallArgsBySig(w, sigIdx2, call2)
+                        else:
+                            var aj: int32 = 1
+                            while aj < kidCount call2:
+                                cgenEmitExpr(w, cgenCallArgValue kid(call2, aj))
+                                if aj + 1 < kidCount call2:
+                                    cwWrite(w, ", ")
+                                aj = aj + 1
+                        cwWrite(w, ");")
+                        cwNewline w
+                    else:
+                        cwIndent w
+                        if lhs != nil &&(lhs.kind == nkIdent || lhs.kind == nkSymbol):
+                            let lname: str = cgenStripSpaces lhs.ident
+                            let ltype: Node = lookupVarType lname
+                            if typeIsVarRef ltype:
+                                cwWrite(w, "(*")
+                                cwWrite(w, cgenEscapeCIdent(lname))
+                                cwWrite(w, ")")
+                            else:
+                                cgenEmitExpr(w, lhs)
+                        else:
+                            cgenEmitExpr(w, lhs)
+                        cwWrite(w, " = ")
+                        cwWrite(w, tmpName)
+                        cwWrite(w, ";")
+                        cwNewline w
+                    return
+            if coreRhs != nil && coreRhs.kind == nkTupleLit:
+                if lhs != nil &&(lhs.kind == nkIdent || lhs.kind == nkSymbol):
+                    let lname: str = cgenStripSpaces lhs.ident
+                    let ltype: Node = lookupVarType lname
+                    if ltype != nil && ltype.kind != nkEmpty:
+                        cwIndent w
+                        if typeIsVarRef ltype:
+                            cwWrite(w, "(*")
+                            cwWrite(w, cgenEscapeCIdent(lname))
+                            cwWrite(w, ")")
+                        else:
+                            cgenEmitExpr(w, lhs)
+                        cwWrite(w, " = ")
+                        cgenEmitTupleLitWithType(w, coreRhs, ltype)
+                        cwWrite(w, ";")
+                        cwNewline w
+                        return
+            if coreRhs != nil && coreRhs.kind == nkSeqLit:
+                if lhs != nil &&(lhs.kind == nkIdent || lhs.kind == nkSymbol):
+                    let lname: str = cgenStripSpaces lhs.ident
+                    var ltype: Node = lookupVarType lname
+                    var seqType: Node = ltype
+                    if seqType == nil || seqType.kind == nkEmpty:
+                        seqType = inferSimpleTypeNode coreRhs
+                    if seqType == nil || seqType.kind == nkEmpty:
+                        cgenAddError(n.pos, "C backend requires seq type for seq literal assignment")
+                        return
+                    cgenEmitSeqLitAssign(w, lname, ltype, seqType, coreRhs, coreRhs.pos)
+                    return
+                cgenAddError(n.pos, "C backend requires simple identifier for seq literal assignment")
+                return
+            if lhs != nil && lhs.kind == nkBracketExpr && kidCount lhs > 1:
+                if kidCount lhs == 2:
+                    let baseExpr: Node = kid(lhs, 0)
+                    let baseType: Node = resolveBracketBaseType baseExpr
+                    if cgenIsArrayTypeNode baseType:
+                        cwIndent w
+                        cgenEmitArrayIndex(w, baseExpr, kid(lhs, 1))
+                        cwWrite(w, " = ")
+                        cgenEmitExpr(w, rhs)
+                        cwWrite(w, ";")
+                        cwNewline w
+                        return
+                var call2: Node = newNode(nkCall, n.pos)
+                call2.callStyle = CallStyleParen
+                addSon(call2, newIdent("[]=", n.pos))
+                var ai: int32 = 0
+                while ai < kidCount lhs:
+                    addSon(call2, kid(lhs, ai))
+                    ai = ai + 1
+                addSon(call2, rhs)
+                var prefix: str = "[]="
+                var instPrefix: str = buildBracketInstPrefix(kid(lhs, 0), prefix)
+                var sigIdx2: int32 = -1
+                if !strIsEmpty instPrefix:
+                    if strHasChar(instPrefix, '_'):
+                        sigIdx2 = cFnSigFindByPrefixName(instPrefix, call2)
+                    if sigIdx2 < 0:
+                        sigIdx2 = cFnSigFindMatchForPrefix(instPrefix, call2)
+                    if sigIdx2 >= 0:
+                        prefix = instPrefix
+                if sigIdx2 < 0:
+                    sigIdx2 = cFnSigFindMatchForPrefix(prefix, call2)
+                if sigIdx2 < 0:
+                    let normPrefix: str = cgenNormalizeInstanceBase prefix
+                    if normPrefix != prefix:
+                        prefix = normPrefix
+                        sigIdx2 = cFnSigFindMatchForPrefix(prefix, call2)
+                cwIndent w
+                if sigIdx2 >= 0:
+                    cwWrite(w, mangleCName(cFnSigName sigIdx2))
+                else:
+                    cwWrite(w, mangleCName(prefix))
+                cwWriteChar(w, '(')
+                if sigIdx2 >= 0:
+                    cgenEmitCallArgsBySig(w, sigIdx2, call2)
+                else:
+                    var aj: int32 = 1
+                    while aj < kidCount call2:
+                        cgenEmitExpr(w, cgenCallArgValue kid(call2, aj))
+                        if aj + 1 < kidCount call2:
+                            cwWrite(w, ", ")
+                        aj = aj + 1
+                cwWrite(w, ");")
+                cwNewline w
+            else:
+                let lhsTy: Node = cgenInferLValueValueType lhs
+                if cgenIsStringTypeNode lhsTy:
+                    cgenEmitOrcAssignStr(w, lhs, rhs)
+                    return
+                cwIndent w
+                cgenEmitLValueExpr(w, lhs)
+                cwWrite(w, " = ")
+                cgenEmitExpr(w, rhs)
+                cwWrite(w, ";")
+                cwNewline w
+    of nkCall:
+        let retType: Node = cgenCallImportcAggRetType n
+        if retType != nil:
+            let tmpName: str = cgenNextTempName("ret")
+            cwIndent w
+            emitTypeName(w, retType)
+            cwWrite(w, " ")
+            cwWrite(w, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+            cwIndent w
+            cgenEmitImportcAggCall(w, n, tmpName)
+            cwWrite(w, ";")
+            cwNewline w
+            return
+        if kidCount n > 1:
+            let baseName: str = cgenCallBaseName n
+            if baseName == "new" && kidCount n == 2:
+                let argVal: Node = cgenCallArgValue kid(n, 1)
+                if argVal != nil:
+                    var assignDeref: bool = false
+                    if argVal.kind == nkIdent || argVal.kind == nkSymbol:
+                        let nm: str = cgenStripSpaces argVal.ident
+                        let argType: Node = lookupVarType nm
+                        if typeIsVarRef argType:
+                            assignDeref = true
+                    cwIndent w
+                    cwWrite(w, "do { void* __cheng_new_p = alloc(sizeof(")
+                    if assignDeref:
+                        cwWrite(w, "**")
+                    else:
+                        cwWrite(w, "*")
+                    cgenEmitExpr(w, argVal)
+                    cwWrite(w, ")); if (__cheng_new_p != CHENG_NIL) { zeroMem(__cheng_new_p, sizeof(")
+                    if assignDeref:
+                        cwWrite(w, "**")
+                    else:
+                        cwWrite(w, "*")
+                    cgenEmitExpr(w, argVal)
+                    cwWrite(w, ")); ")
+                    if assignDeref:
+                        cwWrite(w, "(*")
+                        cgenEmitExpr(w, argVal)
+                        cwWrite(w, ")")
+                    else:
+                        cgenEmitExpr(w, argVal)
+                    cwWrite(w, " = __cheng_new_p; } } while (0);")
+                    cwNewline w
+                    return
+        cgenEmitExprStmt(w, n)
+    else:
+        cgenEmitExprStmt(w, n)
+
+fn emitStmt(w: CWriter*, n: Node) =
+    if ! cgenProfOn:
+        emitStmtImpl(w, n)
+        return
+    cgenProfStmtCalls = cgenProfStmtCalls + 1
+    if (cgenProfStmtCalls & 31) != 0:
+        emitStmtImpl(w, n)
+        return
+    let startNs: int64 = cheng_monotime_ns()
+    let hadRoot: bool = cgenProfStmtSampleRoot != nil
+    if ! hadRoot:
+        cgenProfStmtSampleRoot = n
+    emitStmtImpl(w, n)
+    if ! hadRoot:
+        cgenProfStmtSampleRoot = nil
+    let durNs: int64 = (cheng_monotime_ns() - startNs) * 32
+    cgenProfStmtNsTotal = cgenProfStmtNsTotal + durNs
+    if n != nil:
+        case n.kind
+        of nkIf, nkWhen:
+            cgenProfStmtNsIf = cgenProfStmtNsIf + durNs
+        of nkCall:
+            cgenProfStmtNsCall = cgenProfStmtNsCall + durNs
+        of nkWhile:
+            cgenProfStmtNsWhile = cgenProfStmtNsWhile + durNs
+        of nkFor:
+            cgenProfStmtNsFor = cgenProfStmtNsFor + durNs
+        of nkCase:
+            cgenProfStmtNsCase = cgenProfStmtNsCase + durNs
+        of nkAsgn, nkFastAsgn:
+            cgenProfStmtNsAsgn = cgenProfStmtNsAsgn + durNs
+        of nkLet, nkVar, nkConst:
+            cgenProfStmtNsVar = cgenProfStmtNsVar + durNs
+        of nkReturn:
+            cgenProfStmtNsReturn = cgenProfStmtNsReturn + durNs
+        else:
+            cgenProfStmtNsOther = cgenProfStmtNsOther + durNs
+
+fn cgenEmitDeferRange(w: CWriter*, start: int32, end: int32) =
+    if w == nil:
+        return
+    if start < 0:
+        return
+    if end > cgenScopeDeferBodies.len:
+        return
+    var i: int32 = end - 1
+    while i >= start:
+        cgenEmitStmtList(w, get[Node](cgenScopeDeferBodies, i))
+        i = i - 1
+
+fn cgenEmitLocalReleaseRange(w: CWriter*, start: int32, end: int32, exceptName: str) =
+    if w == nil:
+        return
+    if start < 0:
+        return
+    if end > cgenScopeLocalNames.len:
+        return
+    var i: int32 = end - 1
+    while i >= start:
+        let nm: str = get[str](cgenScopeLocalNames, i)
+        if nm != nil && len nm > 0 && nm != "_" && !(exceptName != nil && len exceptName > 0 && nm == exceptName):
+            cwIndent w
+            cwWrite(w, "cheng_mem_release((void*)")
+            cwWrite(w, cgenEscapeCIdent(nm))
+            cwWrite(w, ");")
+            cwNewline w
+        i = i - 1
+
+fn cgenEmitScopeCleanupAtIndex(w: CWriter*, scopeIdx: int32, exceptName: str, allScopesCount: int32) =
+    if w == nil:
+        return
+    if scopeIdx < 0 || scopeIdx >= allScopesCount:
+        return
+    let localStart: int32 = get[int32](cgenScopeLocalStarts, scopeIdx)
+    let deferStart: int32 = get[int32](cgenScopeDeferStarts, scopeIdx)
+    var localEnd: int32 = cgenScopeLocalNames.len
+    var deferEnd: int32 = cgenScopeDeferBodies.len
+    if scopeIdx + 1 < allScopesCount:
+        localEnd = get[int32](cgenScopeLocalStarts, scopeIdx + 1)
+        deferEnd = get[int32](cgenScopeDeferStarts, scopeIdx + 1)
+    cgenEmitDeferRange(w, deferStart, deferEnd)
+    cgenEmitLocalReleaseRange(w, localStart, localEnd, exceptName)
+
+fn cgenEmitAllScopeCleanup(w: CWriter*, exceptName: str) =
+    if w == nil:
+        return
+    let scopes: int32 = cgenScopeDeferStarts.len
+    if scopes <= 0:
+        return
+    var i: int32 = scopes - 1
+    while i >= 0:
+        cgenEmitScopeCleanupAtIndex(w, i, exceptName, scopes)
+        i = i - 1
+
+fn cgenEmitCurrentScopeCleanup(w: CWriter*, exceptName: str) =
+    if w == nil:
+        return
+    let scopes: int32 = cgenScopeDeferStarts.len
+    if scopes <= 0:
+        return
+    let idx: int32 = scopes - 1
+    cgenEmitScopeCleanupAtIndex(w, idx, exceptName, scopes)
+
+fn cgenEmitStmtList(w: CWriter*, n: Node) =
+    cgenEmitStmtListTail(w, n, 0, nil)
+
+fn cgenEmitStmtListTail(w: CWriter*, n: Node, tailMode: int32, tailLhs: Node) =
+    if n == nil:
+        return
+    if n.kind != nkStmtList && n.kind != nkModule:
+        emitStmt(w, n)
+        return
+    let scoped: bool = inFn && n.kind == nkStmtList
+    if scoped:
+        cgenScopePush()
+    var terminated: bool = false
+    var lastIdx: int32 = -1
+    var i: int32 = 0
+    let kids: seq[void*] = n.kids
+    let count: int32 = kids.len
+    if tailMode != 0 && count > 0:
+        var li: int32 = count - 1
+        while li >= 0:
+            let cand: Node = Node(get[void*](kids, li))
+            if cand != nil && cand.kind != nkEmpty:
+                lastIdx = li
+                break
+            li = li - 1
+    while i < count:
+        let s: Node = Node(get[void*](kids, i))
+        if s == nil || s.kind == nkEmpty:
+            i = i + 1
+            continue
+        if s.kind == nkDefer:
+            if kidCount s > 0:
+                cgenScopeAddDefer(kid(s, 0))
+            i = i + 1
+            continue
+        if tailMode == 1 && i == lastIdx && s.kind != nkReturn && (cgenIsExprNode(s) || cgenIsControlFlowExpr(s)):
+            if cgenIsExprNode s:
+                emitReturnExpr(w, s)
+            else:
+                if s.kind == nkCase:
+                    cgenEmitCase(w, s, currentFnRetType, true)
+                else:
+                    cgenEmitIfReturn(w, s)
+            terminated = true
+            break
+        if tailMode == 2 && i == lastIdx && s.kind != nkReturn && (cgenIsExprNode(s) || cgenIsControlFlowExpr(s)):
+            if tailLhs != nil:
+                if cgenIsControlFlowExpr s:
+                    if s.kind == nkCase:
+                        cgenEmitCaseAssign(w, s, tailLhs)
+                    else:
+                        cgenEmitIfAssign(w, s, tailLhs)
+                else:
+                    cgenEmitAssignExpr(w, tailLhs, s)
+            else:
+                cgenEmitExprStmt(w, s)
+            break
+        if s.kind == nkReturn:
+            emitStmt(w, s)
+            terminated = true
+            break
+        if s.kind == nkBreak || s.kind == nkContinue:
+            if scoped:
+                cgenEmitCurrentScopeCleanup(w, "")
+            emitStmt(w, s)
+            terminated = true
+            break
+        emitStmt(w, s)
+        i = i + 1
+    if ! terminated:
+        if scoped:
+            cgenEmitCurrentScopeCleanup(w, "")
+    if scoped:
+        cgenScopePopWithoutEmit()
+
+fn fnHasBody(n: Node): bool =
+    if n == nil || kidCount n < 4:
+        return false
+    let bodyNode: Node = kid(n, 3)
+    if bodyNode == nil || bodyNode.kind == nkEmpty:
+        return false
+    if bodyNode.kind == nkStmtList && kidCount bodyNode == 0:
+        return false
+    return true
+
+fn fnCName(n: Node): str =
+    if n == nil || kidCount n < 1:
+        return ""
+    var cached: bool = false
+    let idx: int32 = hashmaps.hashMapPtrIntGet(cgenFnCNameIndex, void*(n), &cached)
+    if cached:
+        if idx <= 0:
+            return ""
+        return get[str](cgenFnCNameValues, idx - 1)
+    let nameNode: Node = kid(n, 0)
+    let nameStrRaw: str = plainName nameNode
+    let nameStr: str = cgenStripSpaces nameStrRaw
+    if nameStr == "":
+        hashmaps.hashMapPtrIntPut(&cgenFnCNameIndex, void*(n), 0)
+        return ""
+    if nameStr == "main":
+        addPtr[str](&cgenFnCNameValues, "main")
+        let storedIdxMain: int32 = cgenFnCNameValues.len
+        hashmaps.hashMapPtrIntPut(&cgenFnCNameIndex, void*(n), storedIdxMain)
+        return "main"
+    let imp: str = cgenGetImportC n
+    if !strIsEmpty imp:
+        addPtr[str](&cgenFnCNameValues, imp)
+        let storedIdx: int32 = cgenFnCNameValues.len
+        hashmaps.hashMapPtrIntPut(&cgenFnCNameIndex, void*(n), storedIdx)
+        return imp
+    let sigIdx: int32 = cFnSigIndexForNode n
+    var sigName: str = ""
+    if sigIdx >= 0:
+        sigName = cFnSigName sigIdx
+    if sigName == "":
+        sigName = nameStr
+    let out: str = mangleCName sigName
+    addPtr[str](&cgenFnCNameValues, out)
+    let storedIdx2: int32 = cgenFnCNameValues.len
+    hashmaps.hashMapPtrIntPut(&cgenFnCNameIndex, void*(n), storedIdx2)
+    return out
+
+fn markEmittedProto(name: str): bool =
+    if name == "":
+        return false
+    if strSeqHas(&emittedProtoNames, name):
+        return false
+    addPtr[str](&emittedProtoNames, name)
+    hashsets.hashSetStrAdd(&emittedProtoNameSet, name)
+    return true
+
+fn markEmittedDef(name: str): bool =
+    if name == "":
+        return false
+    if strSeqHas(&emittedDefNames, name):
+        return false
+    addPtr[str](&emittedDefNames, name)
+    hashsets.hashSetStrAdd(&emittedDefNameSet, name)
+    return true
+
+fn cgenEmitParamDecls(w: CWriter*, paramsNode: Node): bool =
+    var wrote: bool = false
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        var i: int32 = 0
+        while i < kidCount paramsNode:
+            let defs: Node = kid(paramsNode, i)
+            if defs != nil && defs.kind == nkIdentDefs:
+                let typeNode: Node = identDefsType defs
+                let nameCount: int32 = identDefsNameCount defs
+                var j: int32 = 0
+                while j < nameCount:
+                    if wrote:
+                        cwWrite(w, ", ")
+                    emitTypeName(w, typeNode)
+                    cwWrite(w, " ")
+                    var pnameNode: Node = kid(defs, j)
+                    if pnameNode != nil && pnameNode.kind == nkPattern && kidCount pnameNode > 0:
+                        pnameNode = kid(pnameNode, 0)
+                    let pnameRaw: str = plainName pnameNode
+                    cwWrite(w, cgenEscapeCIdent(pnameRaw))
+                    wrote = true
+                    j = j + 1
+            i = i + 1
+    return wrote
+
+fn cgenEmitFixedParamDecls(w: CWriter*, paramsNode: Node): bool =
+    var wrote: bool = false
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        var i: int32 = 0
+        while i < kidCount paramsNode:
+            let defs: Node = kid(paramsNode, i)
+            if defs != nil && defs.kind == nkIdentDefs:
+                let typeNode: Node = identDefsType defs
+                if cgenIsVarargsTypeNode typeNode:
+                    i = i + 1
+                    continue
+                let nameCount: int32 = identDefsNameCount defs
+                var j: int32 = 0
+                while j < nameCount:
+                    if wrote:
+                        cwWrite(w, ", ")
+                    emitTypeName(w, typeNode)
+                    cwWrite(w, " ")
+                    var pnameNode: Node = kid(defs, j)
+                    if pnameNode != nil && pnameNode.kind == nkPattern && kidCount pnameNode > 0:
+                        pnameNode = kid(pnameNode, 0)
+                    let pnameRaw: str = plainName pnameNode
+                    cwWrite(w, cgenEscapeCIdent(pnameRaw))
+                    wrote = true
+                    j = j + 1
+            i = i + 1
+    return wrote
+
+fn cgenCollectParamNames(paramsNode: Node, out: seq[str]*) =
+    if paramsNode == nil || out == nil:
+        return
+    if paramsNode.kind != nkFormalParams:
+        return
+    var i: int32 = 0
+    while i < kidCount paramsNode:
+        let defs: Node = kid(paramsNode, i)
+        if defs != nil && defs.kind == nkIdentDefs:
+            let nameCount: int32 = identDefsNameCount defs
+            var j: int32 = 0
+            while j < nameCount:
+                var pnameNode: Node = kid(defs, j)
+                if pnameNode != nil && pnameNode.kind == nkPattern && kidCount pnameNode > 0:
+                    pnameNode = kid(pnameNode, 0)
+                let pnameRaw: str = plainName pnameNode
+                let pname: str = cgenStripSpaces pnameRaw
+                if !strIsEmpty pname:
+                    addPtr[str](out, pname)
+                j = j + 1
+        i = i + 1
+
+fn cgenCollectFixedParamNames(paramsNode: Node, out: seq[str]*) =
+    if paramsNode == nil || out == nil:
+        return
+    if paramsNode.kind != nkFormalParams:
+        return
+    var i: int32 = 0
+    while i < kidCount paramsNode:
+        let defs: Node = kid(paramsNode, i)
+        if defs != nil && defs.kind == nkIdentDefs:
+            let typeNode: Node = identDefsType defs
+            if cgenIsVarargsTypeNode typeNode:
+                i = i + 1
+                continue
+            let nameCount: int32 = identDefsNameCount defs
+            var j: int32 = 0
+            while j < nameCount:
+                var pnameNode: Node = kid(defs, j)
+                if pnameNode != nil && pnameNode.kind == nkPattern && kidCount pnameNode > 0:
+                    pnameNode = kid(pnameNode, 0)
+                let pnameRaw: str = plainName pnameNode
+                let pname: str = cgenStripSpaces pnameRaw
+                if !strIsEmpty pname:
+                    addPtr[str](out, pname)
+                j = j + 1
+        i = i + 1
+
+fn cgenLastFixedParamName(paramsNode: Node): str =
+    var names: seq[str] = newSeqWithCap[str](0, 4)
+    cgenCollectFixedParamNames(paramsNode, &names)
+    if names.len == 0:
+        return ""
+    return get[str](names, names.len - 1)
+
+fn emitFnSignature(w: CWriter*, n: Node, isProto: bool) =
+    if ! cFnSigShouldEmit n:
+        return
+    let nameNode: Node = kid(n, 0)
+    let paramsNode: Node = kid(n, 1)
+    var retNode: Node = kid(n, 2)
+    var bodyNode: Node = nil
+    if kidCount n > 3:
+        bodyNode = kid(n, 3)
+    let imp: str = cgenGetImportC n
+    let path: str = n.strVal
+    let nameStrRaw: str = plainName nameNode
+    let nameStr: str = cgenStripSpaces nameStrRaw
+    if strIsEmpty(nameStr):
+        return
+    var cName: str = nameStr
+    var sigIdx: int32 = -1
+    var sigName: str = ""
+    if !strIsEmpty imp:
+        cName = imp
+    else:
+        sigIdx = cFnSigIndexForNode n
+        if sigIdx >= 0:
+            sigName = cFnSigName sigIdx
+        if strIsEmpty(sigName):
+            sigName = nameStr
+        cName = mangleCName sigName
+    if strIsEmpty(cName):
+        cgenAddError(n.pos, "empty cName: name='" + nameStr + "' sig='" + sigName + "'")
+        return
+    if nameStr == "main":
+        cName = "main"
+    if nameStr == "main":
+        cwWrite(w, "int ")
+        cwWrite(w, cName)
+    else:
+        let hasBody: bool = fnHasBody n
+        let staticLocal: bool = false
+        if hasBody && !staticLocal && strIsEmpty(imp) && cgenFnIsWeak(n):
+            cwWrite(w, "CHENG_C_WEAK ")
+        if staticLocal:
+            cwWrite(w, "static ")
+        if !strIsEmpty imp:
+            cwWrite(w, "N_CDECL(")
+        else:
+            cwWrite(w, "C_CHENGCALL(")
+        if retNode == nil || retNode.kind == nkEmpty:
+            if bodyNode != nil && bodyNode.kind != nkStmtList:
+                retNode = inferSimpleTypeNode bodyNode
+        if cgenFnIsAsync(n):
+            retNode = cgenAsyncRetType(n, retNode)
+        emitTypeName(w, retNode)
+        cwWrite(w, ", ")
+        cwWrite(w, cName)
+        cwWrite(w, ")")
+    cwWrite(w, "(")
+    var wrote: bool = false
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        var i: int32 = 0
+        while i < kidCount paramsNode:
+            let defs: Node = kid(paramsNode, i)
+            if defs != nil && defs.kind == nkIdentDefs:
+                let typeNode: Node = identDefsType defs
+                let nameCount: int32 = identDefsNameCount defs
+                var j: int32 = 0
+                while j < nameCount:
+                    if wrote:
+                        cwWrite(w, ", ")
+                    emitTypeName(w, typeNode)
+                    cwWrite(w, " ")
+                    var pnameNode: Node = kid(defs, j)
+                    if pnameNode != nil && pnameNode.kind == nkPattern && kidCount pnameNode > 0:
+                        pnameNode = kid(pnameNode, 0)
+                    let pnameRaw: str = plainName pnameNode
+                    cwWrite(w, cgenEscapeCIdent(pnameRaw))
+                    wrote = true
+                    j = j + 1
+            i = i + 1
+    if ! wrote:
+        cwWrite(w, "void")
+    cwWrite(w, ")")
+    if isProto:
+        cwWrite(w, ";")
+        cwNewline w
+
+fn cgenFnSignatureStr(n: Node): str =
+    if n == nil:
+        return ""
+    var cached: bool = false
+    let idx: int32 = hashmaps.hashMapPtrIntGet(cgenFnSigStrIndex, void*(n), &cached)
+    if cached:
+        if idx <= 0:
+            return ""
+        return get[str](cgenFnSigStrValues, idx - 1)
+    var w: CWriter = initCWriterWithCap(256)
+    emitFnSignature(&w, n, false)
+    let sig: str = toString(&w.buf)
+    addPtr[str](&cgenFnSigStrValues, sig)
+    let storedIdx: int32 = cgenFnSigStrValues.len
+    hashmaps.hashMapPtrIntPut(&cgenFnSigStrIndex, void*(n), storedIdx)
+    return sig
+
+fn emitImportcAggWrapper(w: CWriter*, n: Node) =
+    let retNode: Node = cgenFnImportcAggRetType n
+    if retNode == nil:
+        return
+    let imp: str = cgenGetImportC n
+    if strIsEmpty imp:
+        return
+    let wrapperName: str = cgenImportcWrapperName imp
+    if strIsEmpty wrapperName:
+        return
+    if markEmittedProto(imp):
+        cwIndent w
+        emitFnSignature(w, n, true)
+    if markEmittedProto(wrapperName):
+        cwIndent w
+        cwWrite(w, "static inline void ")
+        cwWrite(w, wrapperName)
+        cwWrite(w, "(")
+        let paramsNode: Node = kid(n, 1)
+        let wrote: bool = cgenEmitParamDecls(w, paramsNode)
+        if wrote:
+            cwWrite(w, ", ")
+        emitTypeName(w, retNode)
+        cwWrite(w, " * __out")
+        cwWrite(w, ") {")
+        cwNewline w
+        cwIndentPush w
+        cwIndent w
+        cwWrite(w, "if (__out != CHENG_NIL) { ")
+        cwWrite(w, "*__out = ")
+        cwWrite(w, imp)
+        cwWrite(w, "(")
+        var paramNames: seq[str] = newSeqWithCap[str](0, 4)
+        cgenCollectParamNames(paramsNode, &paramNames)
+        var i: int32 = 0
+        while i < paramNames.len:
+            cwWrite(w, get[str](paramNames, i))
+            if i + 1 < paramNames.len:
+                cwWrite(w, ", ")
+            i = i + 1
+        cwWrite(w, "); }")
+        cwNewline w
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+
+fn emitImportcVarargsWrapper(w: CWriter*, n: Node) =
+    if n == nil:
+        return
+    let sigIdx: int32 = cFnSigIndexForNode n
+    if sigIdx < 0 || ! cFnSigIsVarargs sigIdx:
+        return
+    let imp: str = cgenGetImportC n
+    if strIsEmpty imp:
+        return
+    let wrapperName: str = cgenImportcVarargsWrapperName imp
+    if strIsEmpty wrapperName:
+        return
+    let paramsNode: Node = kid(n, 1)
+    var retNode: Node = kid(n, 2)
+    if retNode == nil:
+        retNode = newNode(nkEmpty, n.pos)
+    let lastFixed: str = cgenLastFixedParamName paramsNode
+    if strIsEmpty lastFixed:
+        cgenAddError(n.pos, "[C-Profile] not-mapped: varargs requires at least one fixed parameter (FULLC.F02). hint: add at least one fixed parameter.")
+        return
+    if markEmittedProto(imp):
+        cwIndent w
+        cwWrite(w, "N_CDECL(")
+        emitTypeName(w, retNode)
+        cwWrite(w, ", ")
+        cwWrite(w, imp)
+        cwWrite(w, ")(")
+        let wroteFixed: bool = cgenEmitFixedParamDecls(w, paramsNode)
+        if wroteFixed:
+            cwWrite(w, ", ")
+        cwWrite(w, "va_list __ap")
+        cwWrite(w, ");")
+        cwNewline w
+    if markEmittedProto(wrapperName):
+        cwIndent w
+        cwWrite(w, "static inline ")
+        emitTypeName(w, retNode)
+        cwWrite(w, " ")
+        cwWrite(w, wrapperName)
+        cwWrite(w, "(")
+        let wroteFixed2: bool = cgenEmitFixedParamDecls(w, paramsNode)
+        if wroteFixed2:
+            cwWrite(w, ", ")
+        cwWrite(w, "...) {")
+        cwNewline w
+        cwIndentPush w
+        cwIndent w
+        cwWrite(w, "va_list __ap;")
+        cwNewline w
+        cwIndent w
+        cwWrite(w, "va_start(__ap, ")
+        cwWrite(w, lastFixed)
+        cwWrite(w, ");")
+        cwNewline w
+        var fixedNames: seq[str] = newSeqWithCap[str](0, 4)
+        cgenCollectFixedParamNames(paramsNode, &fixedNames)
+        let retIsVoid: bool = (retNode == nil || retNode.kind == nkEmpty || cgenIsVoidTypeNode(retNode))
+        cwIndent w
+        if retIsVoid:
+            cwWrite(w, imp)
+            cwWrite(w, "(")
+        else:
+            emitTypeName(w, retNode)
+            cwWrite(w, " __res = ")
+            cwWrite(w, imp)
+            cwWrite(w, "(")
+        var i: int32 = 0
+        while i < fixedNames.len:
+            cwWrite(w, cgenEscapeCIdent(get[str](fixedNames, i)))
+            if i + 1 < fixedNames.len:
+                cwWrite(w, ", ")
+            i = i + 1
+        if fixedNames.len > 0:
+            cwWrite(w, ", ")
+        cwWrite(w, "__ap")
+        cwWrite(w, ");")
+        cwNewline w
+        cwIndent w
+        cwWrite(w, "va_end(__ap);")
+        cwNewline w
+        if ! retIsVoid:
+            cwIndent w
+            cwWrite(w, "return __res;")
+            cwNewline w
+        cwIndentPop w
+        cwIndent w
+        cwWrite(w, "}")
+        cwNewline w
+
+fn emitFnBody(w: CWriter*, n: Node) =
+    let kids: seq[void*] = n.kids
+    if kids.len < 4:
+        return
+    let nameNode: Node = Node(get[void*](kids, 0))
+    let nameStrRaw: str = plainName nameNode
+    let nameStr: str = cgenStripSpaces nameStrRaw
+    let paramsNode: Node = Node(get[void*](kids, 1))
+    let retNode: Node = Node(get[void*](kids, 2))
+    let bodyNode: Node = Node(get[void*](kids, 3))
+    let isAsync: bool = cgenFnIsAsync(n)
+    var asyncRetNode: Node = retNode
+    if isAsync:
+        asyncRetNode = cgenAsyncRetType(n, retNode)
+    let retIsVoid: bool = (asyncRetNode == nil || asyncRetNode.kind == nkEmpty || cgenIsVoidTypeNode(asyncRetNode))
+    let prevRet: Node = currentFnRetType
+    let prevAsync: bool = currentFnIsAsync
+    let prevAsyncVal: Node = currentFnAsyncValueType
+    currentFnRetType = asyncRetNode
+    currentFnIsAsync = isAsync
+    currentFnAsyncValueType = retNode
+    cwWrite(w, " {")
+    cwNewline w
+    cwIndentPush w
+    resetLocalVars()
+    cgenScopeReset()
+    cgenParamReset()
+    inFn = true
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        var pi: int32 = 0
+        let pkids: seq[void*] = paramsNode.kids
+        let pcount: int32 = pkids.len
+        while pi < pcount:
+            let defs: Node = Node(get[void*](pkids, pi))
+            if defs != nil && defs.kind == nkIdentDefs:
+                let ptype: Node = identDefsType defs
+                let nameCount: int32 = identDefsNameCount defs
+                var pj: int32 = 0
+                while pj < nameCount:
+                    var pnameNode: Node = kid(defs, pj)
+                    if pnameNode != nil && pnameNode.kind == nkPattern && kidCount pnameNode > 0:
+                        pnameNode = kid(pnameNode, 0)
+                    let pnameRaw: str = plainName pnameNode
+                    let pname: str = cgenStripSpaces pnameRaw
+                    cgenParamAdd pname
+                    addLocalVar(pname, ptype)
+                    pj = pj + 1
+            pi = pi + 1
+    if hasGlobalInit && !streq(nameStr, "__cheng_init_globals"):
+        cwIndent w
+        cwWrite(w, "__cheng_init_globals();")
+        cwNewline w
+    if nameStr == "main" &&(retNode == nil || retNode.kind == nkEmpty):
+        if bodyNode != nil:
+            if bodyNode.kind == nkStmtList:
+                cgenEmitStmtList(w, bodyNode)
+            else:
+                cgenEmitExprStmt(w, bodyNode)
+        cwWriteLine(w, "return 0;")
+    else:
+        if bodyNode == nil:
+            cwWriteLine(w, "return;")
+        elif bodyNode.kind == nkStmtList:
+            var tailMode: int32 = 0
+            if !retIsVoid:
+                tailMode = 1
+            cgenEmitStmtListTail(w, bodyNode, tailMode, nil)
+        else:
+            if (bodyNode.kind == nkCase) && !retIsVoid:
+                cgenEmitCase(w, bodyNode, asyncRetNode, true)
+            elif (bodyNode.kind == nkIf || bodyNode.kind == nkWhen) && !retIsVoid:
+                cgenEmitIfReturn(w, bodyNode)
+            elif retIsVoid:
+                emitStmt(w, bodyNode)
+            else:
+                emitReturnExpr(w, bodyNode)
+    currentFnRetType = prevRet
+    currentFnIsAsync = prevAsync
+    currentFnAsyncValueType = prevAsyncVal
+    cwIndentPop w
+    inFn = false
+    cwWriteLine(w, "}")
+
+fn emitFnDef(w: CWriter*, n: Node, modulePath: str) =
+    if n == nil:
+        return
+    let nkids: seq[void*] = n.kids
+    if nkids.len < 4:
+        return
+    let cName: str = fnCName n
+    if ! markEmittedDef(cName):
+        return
+    cwIndent w
+    if cgenProfOn:
+        let nameNode: Node = Node(get[void*](nkids, 0))
+        let nameRaw: str = plainName nameNode
+        let nameStr: str = cgenStripSpaces nameRaw
+        var t0: int64 = cheng_monotime_ns()
+        let sigStr: str = cgenFnSignatureStr n
+        cwWrite(w, sigStr)
+        let sigNs: int64 = cheng_monotime_ns() - t0
+        cgenProfFnSig = cgenProfFnSig + sigNs
+        t0 = cheng_monotime_ns()
+        emitFnBody(w, n)
+        let bodyNs: int64 = cheng_monotime_ns() - t0
+        cgenProfFnBody = cgenProfFnBody + bodyNs
+        cgenProfUpdateFnTop(nameStr, sigNs + bodyNs)
+    else:
+        let sigStr: str = cgenFnSignatureStr n
+        cwWrite(w, sigStr)
+        emitFnBody(w, n)
+
+fn emitPrototypes(w: CWriter*, root: Node, modulePath: str) =
+    let useCache: bool = cgenFnProtoDecls.len > 0
+    var i: int32 = 0
+    if useCache:
+        let count: int32 = cgenFnProtoDecls.len
+        while i < count:
+            let n: Node = get[Node](cgenFnProtoDecls, i)
+            if n != nil:
+                let sigIdx: int32 = cFnSigIndexForNode n
+                if sigIdx >= 0 && cFnSigIsVarargs(sigIdx) && ! strIsEmpty(cgenGetImportC(n)):
+                    emitImportcVarargsWrapper(w, n)
+                    i = i + 1
+                    continue
+                if cgenFnImportcAggRetType(n) != nil:
+                    emitImportcAggWrapper(w, n)
+                    i = i + 1
+                    continue
+                let cName: str = fnCName n
+                if markEmittedProto(cName):
+                    cwIndent w
+                    if cgenProfOn:
+                        let t0: int64 = cheng_monotime_ns()
+                        let sigStr: str = cgenFnSignatureStr n
+                        cwWrite(w, sigStr)
+                        cwWrite(w, ";")
+                        cwNewline w
+                        cgenProfProtoSigNs = cgenProfProtoSigNs + (cheng_monotime_ns() - t0)
+                        cgenProfProtoCount = cgenProfProtoCount + 1
+                    else:
+                        let sigStr: str = cgenFnSignatureStr n
+                        cwWrite(w, sigStr)
+                        cwWrite(w, ";")
+                        cwNewline w
+            i = i + 1
+    else:
+        let rk: seq[void*] = root.kids
+        let count: int32 = rk.len
+        while i < count:
+            let n: Node = Node(get[void*](rk, i))
+            if n != nil && (n.kind == nkFnDecl || n.kind == nkIteratorDecl):
+                if shouldSkipSystem(n.strVal, modulePath):
+                    i = i + 1
+                    continue
+                if ! cFnSigShouldEmit n:
+                    i = i + 1
+                    continue
+                let sigIdx: int32 = cFnSigIndexForNode n
+                if sigIdx >= 0 && cFnSigIsVarargs(sigIdx) && ! strIsEmpty(cgenGetImportC(n)):
+                    emitImportcVarargsWrapper(w, n)
+                    i = i + 1
+                    continue
+                if cgenFnImportcAggRetType(n) != nil:
+                    emitImportcAggWrapper(w, n)
+                    i = i + 1
+                    continue
+                let cName: str = fnCName n
+                if markEmittedProto(cName):
+                    cwIndent w
+                    if cgenProfOn:
+                        let t0: int64 = cheng_monotime_ns()
+                        let sigStr: str = cgenFnSignatureStr n
+                        cwWrite(w, sigStr)
+                        cwWrite(w, ";")
+                        cwNewline w
+                        cgenProfProtoSigNs = cgenProfProtoSigNs + (cheng_monotime_ns() - t0)
+                        cgenProfProtoCount = cgenProfProtoCount + 1
+                    else:
+                        let sigStr: str = cgenFnSignatureStr n
+                        cwWrite(w, sigStr)
+                        cwWrite(w, ";")
+                        cwNewline w
+            i = i + 1
+    cwNewline w
+
+fn emitShiftHelpers(w: CWriter*) =
+    cwWriteLine(w, "#ifndef CHENG_SHIFT_HELPERS")
+    cwWriteLine(w, "#define CHENG_SHIFT_HELPERS 1")
+    cwWriteLine(w, "static inline NI8 cheng_shl_i8(NI8 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 7u);")
+    cwWriteLine(w, "  NU8 ua = (NU8)a;")
+    cwWriteLine(w, "  NU8 res = (NU8)(ua << k);")
+    cwWriteLine(w, "  NI8 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI8 cheng_ashr_i8(NI8 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 7u);")
+    cwWriteLine(w, "  if (k == 0) return a;")
+    cwWriteLine(w, "  NU8 ua = (NU8)a;")
+    cwWriteLine(w, "  NU8 res = (NU8)(ua >> k);")
+    cwWriteLine(w, "  if ((ua & (NU8)0x80u) != 0) {")
+    cwWriteLine(w, "    res = (NU8)(res | (NU8)((NU8)0xFFu << (8u - k)));")
+    cwWriteLine(w, "  }")
+    cwWriteLine(w, "  NI8 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU8 cheng_shl_u8(NU8 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 7u);")
+    cwWriteLine(w, "  return (NU8)(a << k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU8 cheng_lshr_u8(NU8 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 7u);")
+    cwWriteLine(w, "  return (NU8)(a >> k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI16 cheng_shl_i16(NI16 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 15u);")
+    cwWriteLine(w, "  NU16 ua = (NU16)a;")
+    cwWriteLine(w, "  NU16 res = (NU16)(ua << k);")
+    cwWriteLine(w, "  NI16 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI16 cheng_ashr_i16(NI16 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 15u);")
+    cwWriteLine(w, "  if (k == 0) return a;")
+    cwWriteLine(w, "  NU16 ua = (NU16)a;")
+    cwWriteLine(w, "  NU16 res = (NU16)(ua >> k);")
+    cwWriteLine(w, "  if ((ua & (NU16)0x8000u) != 0) {")
+    cwWriteLine(w, "    res = (NU16)(res | (NU16)((NU16)0xFFFFu << (16u - k)));")
+    cwWriteLine(w, "  }")
+    cwWriteLine(w, "  NI16 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU16 cheng_shl_u16(NU16 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 15u);")
+    cwWriteLine(w, "  return (NU16)(a << k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU16 cheng_lshr_u16(NU16 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 15u);")
+    cwWriteLine(w, "  return (NU16)(a >> k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI32 cheng_shl_i32(NI32 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 31u);")
+    cwWriteLine(w, "  NU32 ua = (NU32)a;")
+    cwWriteLine(w, "  NU32 res = (NU32)(ua << k);")
+    cwWriteLine(w, "  NI32 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI32 cheng_ashr_i32(NI32 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 31u);")
+    cwWriteLine(w, "  if (k == 0) return a;")
+    cwWriteLine(w, "  NU32 ua = (NU32)a;")
+    cwWriteLine(w, "  NU32 res = (NU32)(ua >> k);")
+    cwWriteLine(w, "  if ((ua & (NU32)0x80000000u) != 0) {")
+    cwWriteLine(w, "    res = (NU32)(res | (NU32)((NU32)0xFFFFFFFFu << (32u - k)));")
+    cwWriteLine(w, "  }")
+    cwWriteLine(w, "  NI32 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU32 cheng_shl_u32(NU32 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 31u);")
+    cwWriteLine(w, "  return (NU32)(a << k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU32 cheng_lshr_u32(NU32 a, NU64 shift) {")
+    cwWriteLine(w, "  NU32 k = (NU32)(shift & 31u);")
+    cwWriteLine(w, "  return (NU32)(a >> k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI64 cheng_shl_i64(NI64 a, NU64 shift) {")
+    cwWriteLine(w, "  NU64 k = (NU64)(shift & 63u);")
+    cwWriteLine(w, "  NU64 ua = (NU64)a;")
+    cwWriteLine(w, "  NU64 res = (NU64)(ua << k);")
+    cwWriteLine(w, "  NI64 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI64 cheng_ashr_i64(NI64 a, NU64 shift) {")
+    cwWriteLine(w, "  NU64 k = (NU64)(shift & 63u);")
+    cwWriteLine(w, "  if (k == 0) return a;")
+    cwWriteLine(w, "  NU64 ua = (NU64)a;")
+    cwWriteLine(w, "  NU64 res = (NU64)(ua >> k);")
+    cwWriteLine(w, "  if ((ua & (NU64)0x8000000000000000ULL) != 0) {")
+    cwWriteLine(w, "    res = (NU64)(res | (NU64)((NU64)0xFFFFFFFFFFFFFFFFULL << (64u - k)));")
+    cwWriteLine(w, "  }")
+    cwWriteLine(w, "  NI64 out;")
+    cwWriteLine(w, "  memcpy(&out, &res, sizeof(out));")
+    cwWriteLine(w, "  return out;")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU64 cheng_shl_u64(NU64 a, NU64 shift) {")
+    cwWriteLine(w, "  NU64 k = (NU64)(shift & 63u);")
+    cwWriteLine(w, "  return (NU64)(a << k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU64 cheng_lshr_u64(NU64 a, NU64 shift) {")
+    cwWriteLine(w, "  NU64 k = (NU64)(shift & 63u);")
+    cwWriteLine(w, "  return (NU64)(a >> k);")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI cheng_shl_ni(NI a, NU64 shift) {")
+    cwWriteLine(w, "#if CHENG_INTBITS == 64")
+    cwWriteLine(w, "  return (NI)cheng_shl_i64((NI64)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 32")
+    cwWriteLine(w, "  return (NI)cheng_shl_i32((NI32)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 16")
+    cwWriteLine(w, "  return (NI)cheng_shl_i16((NI16)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 8")
+    cwWriteLine(w, "  return (NI)cheng_shl_i8((NI8)a, shift);")
+    cwWriteLine(w, "#else")
+    cwWriteLine(w, "#error \"invalid CHENG_INTBITS\"")
+    cwWriteLine(w, "#endif")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NI cheng_ashr_ni(NI a, NU64 shift) {")
+    cwWriteLine(w, "#if CHENG_INTBITS == 64")
+    cwWriteLine(w, "  return (NI)cheng_ashr_i64((NI64)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 32")
+    cwWriteLine(w, "  return (NI)cheng_ashr_i32((NI32)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 16")
+    cwWriteLine(w, "  return (NI)cheng_ashr_i16((NI16)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 8")
+    cwWriteLine(w, "  return (NI)cheng_ashr_i8((NI8)a, shift);")
+    cwWriteLine(w, "#else")
+    cwWriteLine(w, "#error \"invalid CHENG_INTBITS\"")
+    cwWriteLine(w, "#endif")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU cheng_shl_nu(NU a, NU64 shift) {")
+    cwWriteLine(w, "#if CHENG_INTBITS == 64")
+    cwWriteLine(w, "  return (NU)cheng_shl_u64((NU64)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 32")
+    cwWriteLine(w, "  return (NU)cheng_shl_u32((NU32)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 16")
+    cwWriteLine(w, "  return (NU)cheng_shl_u16((NU16)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 8")
+    cwWriteLine(w, "  return (NU)cheng_shl_u8((NU8)a, shift);")
+    cwWriteLine(w, "#else")
+    cwWriteLine(w, "#error \"invalid CHENG_INTBITS\"")
+    cwWriteLine(w, "#endif")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "static inline NU cheng_lshr_nu(NU a, NU64 shift) {")
+    cwWriteLine(w, "#if CHENG_INTBITS == 64")
+    cwWriteLine(w, "  return (NU)cheng_lshr_u64((NU64)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 32")
+    cwWriteLine(w, "  return (NU)cheng_lshr_u32((NU32)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 16")
+    cwWriteLine(w, "  return (NU)cheng_lshr_u16((NU16)a, shift);")
+    cwWriteLine(w, "#elif CHENG_INTBITS == 8")
+    cwWriteLine(w, "  return (NU)cheng_lshr_u8((NU8)a, shift);")
+    cwWriteLine(w, "#else")
+    cwWriteLine(w, "#error \"invalid CHENG_INTBITS\"")
+    cwWriteLine(w, "#endif")
+    cwWriteLine(w, "}")
+    cwWriteLine(w, "#endif")
+    cwNewline w
+
+fn emitCToFile(root: Node, outPath: str, modulePath: str = ""): bool =
+    if root == nil || len outPath == 0:
+        return false
+    let profOn: bool = cgenProfileEnabled()
+    var profStart: int64 = 0
+    var profMark: int64 = 0
+    var profPrep: int64 = 0
+    var profHeader: int64 = 0
+    var profTypeFwd: int64 = 0
+    var profTypeDecl: int64 = 0
+    var profGlobals: int64 = 0
+    var profProtos: int64 = 0
+    var profInit: int64 = 0
+    var profFnDefs: int64 = 0
+    var profFinish: int64 = 0
+    var profPrepTypeInfo: int64 = 0
+    var profPrepScan: int64 = 0
+    var profPrepFnSigs: int64 = 0
+    var profPrepMangle: int64 = 0
+    var profPrepProtoFilter: int64 = 0
+    var profPrepDefFilter: int64 = 0
+    var profPrepImportC: int64 = 0
+    if profOn:
+        profStart = cheng_monotime_ns()
+        profMark = profStart
+    cgenProfOn = profOn
+    if profOn:
+        cgenProfFnSig = 0
+        cgenProfFnBody = 0
+        cgenProfStmtCalls = 0
+        cgenProfStmtNsTotal = 0
+        cgenProfStmtNsIf = 0
+        cgenProfStmtNsCall = 0
+        cgenProfStmtNsWhile = 0
+        cgenProfStmtNsFor = 0
+        cgenProfStmtNsCase = 0
+        cgenProfStmtNsAsgn = 0
+        cgenProfStmtNsVar = 0
+        cgenProfStmtNsReturn = 0
+        cgenProfStmtNsOther = 0
+        cgenProfExprCalls = 0
+        cgenProfExprNsTotal = 0
+        cgenProfExprNsCall = 0
+        cgenProfExprNsInfix = 0
+        cgenProfExprNsInfixStr = 0
+        cgenProfExprNsInfixNonStr = 0
+        cgenProfExprNsIdent = 0
+        cgenProfExprNsDot = 0
+        cgenProfExprNsBracket = 0
+        cgenProfExprNsOther = 0
+        cgenProfExprSampleRoot = nil
+        cgenProfStmtSampleRoot = nil
+        cgenProfCallResolveNs = 0
+        cgenProfCallSigNs = 0
+        cgenProfCallArgsNs = 0
+        cgenProfIfCondNs = 0
+        cgenProfIfBodyNs = 0
+        cgenProfWhileCondNs = 0
+        cgenProfWhileBodyNs = 0
+        cgenProfProtoSigNs = 0
+        cgenProfProtoCount = 0
+        cgenProfEmitTypeNs = 0
+        cgenProfEmitTypeCalls = 0
+        cgenProfWriteNs = 0
+        cgenProfWriteCalls = 0
+        cgenProfWriteBytes = 0
+        cgenProfWriteCharNs = 0
+        cgenProfWriteCharCalls = 0
+        cgenProfIndentNs = 0
+        cgenProfIndentCalls = 0
+        cgenProfFlushNs = 0
+        cgenProfFlushCalls = 0
+        cgenProfFnTop1Ns = 0
+        cgenProfFnTop2Ns = 0
+        cgenProfFnTop3Ns = 0
+        cgenProfFnTop1Name = ""
+        cgenProfFnTop2Name = ""
+        cgenProfFnTop3Name = ""
+    cgenTempId = 0
+    resetTypeMaps()
+    cFnSigClear()
+    if profOn:
+        let t0: int64 = cheng_monotime_ns()
+        collectTypeInfo root
+        profPrepTypeInfo = cheng_monotime_ns() - t0
+    else:
+        collectTypeInfo root
+    cgenConstIntClear()
+    cgenArrayTypeClear()
+    cgenTupleTypeClear()
+    cgenFnDecls = newSeqWithCap[Node](0, 128)
+    cgenFnDefDecls = newSeqWithCap[Node](0, 128)
+    if profOn:
+        let t1: int64 = cheng_monotime_ns()
+        cgenCollectPrepScan(root, true)
+        profPrepScan = cheng_monotime_ns() - t1
+    else:
+        cgenCollectPrepScan(root, true)
+    if profOn:
+        let t6: int64 = cheng_monotime_ns()
+        cgenCollectFnSigsFromDecls cgenFnDecls
+        profPrepFnSigs = cheng_monotime_ns() - t6
+        let t7: int64 = cheng_monotime_ns()
+        cFnSigComputeMangledNames()
+        profPrepMangle = cheng_monotime_ns() - t7
+    else:
+        cgenCollectFnSigsFromDecls cgenFnDecls
+        cFnSigComputeMangledNames()
+    if !strIsEmpty(modulePath):
+        cgenBuildFnDefOwnerMap cgenFnDefDecls
+    cgenFnProtoDecls = newSeqWithCap[Node](0, cgenFnDecls.len)
+    if cgenFnDecls.len > 0:
+        if profOn:
+            let t8: int64 = cheng_monotime_ns()
+            var pi: int32 = 0
+            let pcount: int32 = cgenFnDecls.len
+            while pi < pcount:
+                let n: Node = get[Node](cgenFnDecls, pi)
+                if n != nil:
+                    if !shouldSkipSystem(n.strVal, modulePath) && cFnSigShouldEmit(n):
+                        addPtr[Node](&cgenFnProtoDecls, n)
+                pi = pi + 1
+            profPrepProtoFilter = cheng_monotime_ns() - t8
+        else:
+            var pi: int32 = 0
+            let pcount: int32 = cgenFnDecls.len
+            while pi < pcount:
+                let n: Node = get[Node](cgenFnDecls, pi)
+                if n != nil:
+                    if !shouldSkipSystem(n.strVal, modulePath) && cFnSigShouldEmit(n):
+                        addPtr[Node](&cgenFnProtoDecls, n)
+                pi = pi + 1
+    if cgenFnDefDecls.len > 0:
+        var emitDefs: seq[Node] = newSeqWithCap[Node](0, cgenFnDefDecls.len)
+        var fi: int32 = 0
+        let filterModule: bool = !strIsEmpty(modulePath)
+        var defStartNs: int64 = 0
+        if profOn:
+            defStartNs = cheng_monotime_ns()
+        while fi < cgenFnDefDecls.len:
+            let n: Node = get[Node](cgenFnDefDecls, fi)
+            if n != nil && cFnSigShouldEmit(n):
+                if !filterModule || modsymFnOwned(n, modulePath):
+                    addPtr[Node](&emitDefs, n)
+            fi = fi + 1
+        if profOn:
+            profPrepDefFilter = cheng_monotime_ns() - defStartNs
+        cgenFnDefDecls = emitDefs
+    emitModuleOnly = !strIsEmpty(modulePath)
+    if ! writeModuleModsym(root, modulePath):
+        return false
+    if profOn:
+        profPrep = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    var w: CWriter = initCWriterWithCap(cgenWriterCapForOut(outPath))
+    var wPtr: CWriter* = &w
+    if cgenWriterStreamForOut(outPath):
+        let outFile: File = open(outPath, fmWrite)
+        if outFile == nil:
+            return false
+        cwAttachFile(wPtr, outFile, cgenWriterFlushThreshold(outPath))
+    importMapClear()
+    if profOn:
+        let t9: int64 = cheng_monotime_ns()
+        cgenCollectImportC root
+        profPrepImportC = cheng_monotime_ns() - t9
+    else:
+        cgenCollectImportC root
+    cwWriteLine(wPtr, "#ifndef CHENG_INTBITS")
+    cwWriteLine(wPtr, "#define CHENG_INTBITS 32")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#include \"chengbase.h\"")
+    cwWriteLine(wPtr, "N_CDECL(void, cheng_mem_retain)(void* p);")
+    cwWriteLine(wPtr, "N_CDECL(void, cheng_mem_release)(void* p);")
+    cwWriteLine(wPtr, "N_CDECL(void, cheng_mem_retain_atomic)(void* p);")
+    cwWriteLine(wPtr, "N_CDECL(void, cheng_mem_release_atomic)(void* p);")
+    cwWriteLine(wPtr, "#include <stddef.h>")
+    if cgenNeedsStdarg:
+        cwWriteLine(wPtr, "#include <stdarg.h>")
+    cwWriteLine(wPtr, "#include <string.h>")
+    emitShiftHelpers(wPtr)
+    cwWriteLine(wPtr, "#ifndef CHENG_C_ALIGN_PREFIX")
+    cwWriteLine(wPtr, "#if defined(_MSC_VER)")
+    cwWriteLine(wPtr, "#define CHENG_C_ALIGN_PREFIX(x) __declspec(align(x))")
+    cwWriteLine(wPtr, "#define CHENG_C_ALIGN_SUFFIX(x)")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_BEGIN __pragma(pack(push, 1))")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_END __pragma(pack(pop))")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_SUFFIX")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_ALIGN_SUFFIX(x)")
+    cwWriteLine(wPtr, "#else")
+    cwWriteLine(wPtr, "#define CHENG_C_ALIGN_PREFIX(x)")
+    cwWriteLine(wPtr, "#define CHENG_C_ALIGN_SUFFIX(x) __attribute__((aligned(x)))")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_BEGIN")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_END")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_SUFFIX __attribute__((packed))")
+    cwWriteLine(wPtr, "#define CHENG_C_PACKED_ALIGN_SUFFIX(x) __attribute__((packed, aligned(x)))")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#ifndef CHENG_C_STATIC_ASSERT")
+    cwWriteLine(wPtr, "#if defined(__cplusplus)")
+    cwWriteLine(wPtr, "#define CHENG_C_STATIC_ASSERT(cond, msg) static_assert(cond, msg)")
+    cwWriteLine(wPtr, "#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L")
+    cwWriteLine(wPtr, "#define CHENG_C_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)")
+    cwWriteLine(wPtr, "#else")
+    cwWriteLine(wPtr, "#define CHENG_C_STATIC_ASSERT(cond, msg) typedef char cheng_static_assert_##__LINE__[(cond)?1:-1]")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#ifndef CHENG_C_ALIGN_UP")
+    cwWriteLine(wPtr, "#define CHENG_C_ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#ifndef CHENG_C_MAX")
+    cwWriteLine(wPtr, "#define CHENG_C_MAX(a, b) ((a) > (b) ? (a) : (b))")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#ifndef CHENG_C_AUTOTYPE")
+    cwWriteLine(wPtr, "#if defined(__clang__) || defined(__GNUC__)")
+    cwWriteLine(wPtr, "#define CHENG_C_AUTOTYPE __auto_type")
+    cwWriteLine(wPtr, "#else")
+    cwWriteLine(wPtr, "#define CHENG_C_AUTOTYPE int")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#ifndef CHENG_C_WEAK")
+    cwWriteLine(wPtr, "#if defined(__clang__) || defined(__GNUC__)")
+    cwWriteLine(wPtr, "#define CHENG_C_WEAK __attribute__((weak))")
+    cwWriteLine(wPtr, "#else")
+    cwWriteLine(wPtr, "#define CHENG_C_WEAK")
+    cwWriteLine(wPtr, "#endif")
+    cwWriteLine(wPtr, "#endif")
+    cwNewline wPtr
+    if profOn:
+        profHeader = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    let allTypeDecls: seq[Node] = dedupTypeDecls(collectAllTypeDecls(root))
+    emitTypeForwardDeclsFromDecls(wPtr, allTypeDecls)
+    if profOn:
+        profTypeFwd = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    collectFnTypes(root)
+    emitFnTypeDecls(wPtr)
+    emitTypeDeclsFromDecls(wPtr, allTypeDecls)
+    if profOn:
+        profTypeDecl = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    emitGlobalVarDecls(wPtr, root, modulePath)
+    if profOn:
+        profGlobals = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    emitPrototypes(wPtr, root, modulePath)
+    if profOn:
+        profProtos = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    emitGlobalInit(wPtr)
+    if profOn:
+        profInit = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    var i: int32 = 0
+    let rcount2: int32 = cgenFnDefDecls.len
+    while i < rcount2:
+        let n: Node = get[Node](cgenFnDefDecls, i)
+        if n != nil:
+            emitFnDef(wPtr, n, modulePath)
+            cwNewline wPtr
+        i = i + 1
+    if profOn:
+        profFnDefs = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+    if wPtr->file != nil:
+        cwFlush wPtr
+        close wPtr->file
+    else:
+        let payload: str = finishC wPtr
+        writeFile(outPath, payload)
+    if profOn:
+        profFinish = cheng_monotime_ns() - profMark
+        var msg: str = "[cgen] prep="
+        msg = msg + int64ToStr(profPrep / 1000000)
+        msg = msg + "ms header="
+        msg = msg + int64ToStr(profHeader / 1000000)
+        msg = msg + "ms types_fwd="
+        msg = msg + int64ToStr(profTypeFwd / 1000000)
+        msg = msg + "ms types="
+        msg = msg + int64ToStr(profTypeDecl / 1000000)
+        msg = msg + "ms globals="
+        msg = msg + int64ToStr(profGlobals / 1000000)
+        msg = msg + "ms protos="
+        msg = msg + int64ToStr(profProtos / 1000000)
+        msg = msg + "ms init="
+        msg = msg + int64ToStr(profInit / 1000000)
+        msg = msg + "ms fn_defs="
+        msg = msg + int64ToStr(profFnDefs / 1000000)
+        msg = msg + "ms fn_sig="
+        msg = msg + int64ToStr(cgenProfFnSig / 1000000)
+        msg = msg + "ms fn_body="
+        msg = msg + int64ToStr(cgenProfFnBody / 1000000)
+        msg = msg + "ms finish="
+        msg = msg + int64ToStr(profFinish / 1000000)
+        msg = msg + "ms total="
+        let totalMs: int64 =(cheng_monotime_ns() - profStart) / 1000000
+        msg = msg + int64ToStr totalMs
+        msg = msg + "ms"
+        echo msg
+        var prepMsg: str = "[cgen-prep] typeinfo="
+        prepMsg = prepMsg + int64ToStr(profPrepTypeInfo / 1000000)
+        prepMsg = prepMsg + "ms scan="
+        prepMsg = prepMsg + int64ToStr(profPrepScan / 1000000)
+        prepMsg = prepMsg + "ms fn_sigs="
+        prepMsg = prepMsg + int64ToStr(profPrepFnSigs / 1000000)
+        prepMsg = prepMsg + "ms mangle="
+        prepMsg = prepMsg + int64ToStr(profPrepMangle / 1000000)
+        prepMsg = prepMsg + "ms proto="
+        prepMsg = prepMsg + int64ToStr(profPrepProtoFilter / 1000000)
+        prepMsg = prepMsg + "ms def="
+        prepMsg = prepMsg + int64ToStr(profPrepDefFilter / 1000000)
+        prepMsg = prepMsg + "ms importc="
+        prepMsg = prepMsg + int64ToStr(profPrepImportC / 1000000)
+        prepMsg = prepMsg + "ms"
+        echo prepMsg
+        var stmtMsg: str = "[cgen-stmt] total="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsTotal / 1000000)
+        stmtMsg = stmtMsg + "ms if="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsIf / 1000000)
+        stmtMsg = stmtMsg + "ms call="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsCall / 1000000)
+        stmtMsg = stmtMsg + "ms while="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsWhile / 1000000)
+        stmtMsg = stmtMsg + "ms for="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsFor / 1000000)
+        stmtMsg = stmtMsg + "ms case="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsCase / 1000000)
+        stmtMsg = stmtMsg + "ms asgn="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsAsgn / 1000000)
+        stmtMsg = stmtMsg + "ms var="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsVar / 1000000)
+        stmtMsg = stmtMsg + "ms return="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsReturn / 1000000)
+        stmtMsg = stmtMsg + "ms other="
+        stmtMsg = stmtMsg + int64ToStr(cgenProfStmtNsOther / 1000000)
+        stmtMsg = stmtMsg + "ms"
+        echo stmtMsg
+        if cgenProfIfCondNs > 0 || cgenProfIfBodyNs > 0:
+            var ifMsg: str = "[cgen-if] cond="
+            ifMsg = ifMsg + int64ToStr(cgenProfIfCondNs / 1000000)
+            ifMsg = ifMsg + "ms body="
+            ifMsg = ifMsg + int64ToStr(cgenProfIfBodyNs / 1000000)
+            ifMsg = ifMsg + "ms"
+            echo ifMsg
+        if cgenProfWhileCondNs > 0 || cgenProfWhileBodyNs > 0:
+            var whileMsg: str = "[cgen-while] cond="
+            whileMsg = whileMsg + int64ToStr(cgenProfWhileCondNs / 1000000)
+            whileMsg = whileMsg + "ms body="
+            whileMsg = whileMsg + int64ToStr(cgenProfWhileBodyNs / 1000000)
+            whileMsg = whileMsg + "ms"
+            echo whileMsg
+        var exprMsg: str = "[cgen-expr] total="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsTotal / 1000000)
+        exprMsg = exprMsg + "ms call="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsCall / 1000000)
+        exprMsg = exprMsg + "ms infix="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsInfix / 1000000)
+        exprMsg = exprMsg + "ms infix_str="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsInfixStr / 1000000)
+        exprMsg = exprMsg + "ms infix_other="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsInfixNonStr / 1000000)
+        exprMsg = exprMsg + "ms ident="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsIdent / 1000000)
+        exprMsg = exprMsg + "ms dot="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsDot / 1000000)
+        exprMsg = exprMsg + "ms bracket="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsBracket / 1000000)
+        exprMsg = exprMsg + "ms other="
+        exprMsg = exprMsg + int64ToStr(cgenProfExprNsOther / 1000000)
+        exprMsg = exprMsg + "ms"
+        echo exprMsg
+        if cgenProfWriteNs > 0 || cgenProfWriteCalls > 0 || cgenProfFlushNs > 0:
+            var ioMsg: str = "[cgen-io] write_us="
+            ioMsg = ioMsg + int64ToStr(cgenProfWriteNs / 1000)
+            ioMsg = ioMsg + "("
+            ioMsg = ioMsg + intToStr(cgenProfWriteCalls)
+            ioMsg = ioMsg + ","
+            ioMsg = ioMsg + int64ToStr(cgenProfWriteBytes / 1024)
+            ioMsg = ioMsg + "KB) writec_us="
+            ioMsg = ioMsg + int64ToStr(cgenProfWriteCharNs / 1000)
+            ioMsg = ioMsg + "("
+            ioMsg = ioMsg + intToStr(cgenProfWriteCharCalls)
+            ioMsg = ioMsg + ") indent_us="
+            ioMsg = ioMsg + int64ToStr(cgenProfIndentNs / 1000)
+            ioMsg = ioMsg + "("
+            ioMsg = ioMsg + intToStr(cgenProfIndentCalls)
+            ioMsg = ioMsg + ") flush_us="
+            ioMsg = ioMsg + int64ToStr(cgenProfFlushNs / 1000)
+            ioMsg = ioMsg + "("
+            ioMsg = ioMsg + intToStr(cgenProfFlushCalls)
+            ioMsg = ioMsg + ")"
+            echo ioMsg
+        if cgenProfEmitTypeNs > 0 || cgenProfEmitTypeCalls > 0:
+            var typeMsg: str = "[cgen-type] emit="
+            typeMsg = typeMsg + int64ToStr(cgenProfEmitTypeNs / 1000000)
+            typeMsg = typeMsg + "ms calls="
+            typeMsg = typeMsg + intToStr(cgenProfEmitTypeCalls)
+            echo typeMsg
+        if cgenStripCalls > 0 || cgenMangleCalls > 0:
+            var cacheMsg: str = "[cgen-cache] strip="
+            cacheMsg = cacheMsg + intToStr(cgenStripHits)
+            cacheMsg = cacheMsg + "/"
+            cacheMsg = cacheMsg + intToStr(cgenStripCalls)
+            cacheMsg = cacheMsg + " mangle="
+            cacheMsg = cacheMsg + intToStr(cgenMangleHits)
+            cacheMsg = cacheMsg + "/"
+            cacheMsg = cacheMsg + intToStr(cgenMangleCalls)
+            echo cacheMsg
+        if cgenProfProtoSigNs > 0 || cgenProfProtoCount > 0:
+            var protoMsg: str = "[cgen-proto] sig="
+            protoMsg = protoMsg + int64ToStr(cgenProfProtoSigNs / 1000000)
+            protoMsg = protoMsg + "ms count="
+            protoMsg = protoMsg + intToStr(cgenProfProtoCount)
+            protoMsg = protoMsg + " avg="
+            if cgenProfProtoCount > 0:
+                protoMsg = protoMsg + int64ToStr((cgenProfProtoSigNs / cgenProfProtoCount) / 1000000)
+            else:
+                protoMsg = protoMsg + "0"
+            protoMsg = protoMsg + "ms"
+            echo protoMsg
+        if cgenProfCallResolveNs > 0 || cgenProfCallSigNs > 0 || cgenProfCallArgsNs > 0:
+            var callMsg: str = "[cgen-call] resolve="
+            callMsg = callMsg + int64ToStr(cgenProfCallResolveNs / 1000000)
+            callMsg = callMsg + "ms sig="
+            callMsg = callMsg + int64ToStr(cgenProfCallSigNs / 1000000)
+            callMsg = callMsg + "ms args="
+            callMsg = callMsg + int64ToStr(cgenProfCallArgsNs / 1000000)
+            callMsg = callMsg + "ms"
+            echo callMsg
+        if cgenProfFnTop1Ns > 0:
+            var topMsg: str = "[cgen-fn-top] "
+            topMsg = topMsg + cgenProfFnTop1Name
+            topMsg = topMsg + "="
+            topMsg = topMsg + int64ToStr(cgenProfFnTop1Ns / 1000000)
+            topMsg = topMsg + "ms"
+            if cgenProfFnTop2Ns > 0:
+                topMsg = topMsg + " "
+                topMsg = topMsg + cgenProfFnTop2Name
+                topMsg = topMsg + "="
+                topMsg = topMsg + int64ToStr(cgenProfFnTop2Ns / 1000000)
+                topMsg = topMsg + "ms"
+            if cgenProfFnTop3Ns > 0:
+                topMsg = topMsg + " "
+                topMsg = topMsg + cgenProfFnTop3Name
+                topMsg = topMsg + "="
+                topMsg = topMsg + int64ToStr(cgenProfFnTop3Ns / 1000000)
+                topMsg = topMsg + "ms"
+            echo topMsg
+    if codegenHasError:
+        return false
+    return true

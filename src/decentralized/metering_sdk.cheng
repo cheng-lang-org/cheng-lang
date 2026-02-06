@@ -1,0 +1,170 @@
+import cheng/decentralized/metering as dmeter
+import cheng/decentralized/ledger as dledger
+import cheng/decentralized/runtime as druntime
+import std/os
+import std/strings
+
+type
+    MeteringConfig =
+        ledgerPath: str
+        mode: druntime.StorageMode
+        packageId: str
+        authorId: str
+        executorId: str
+        priceCpuMs: float64
+        priceMemGb: float64
+        priceIoGb: float64
+        priceGpuMs: float64
+        priceGpuMemGb: float64
+        royaltyRate: float64
+        treasuryRate: float64
+        epoch: int32
+        gpuType: str
+        workloadKind: str
+
+    MeteringState =
+        taskId: str
+        startTs: str
+        cpuMs: int64
+        memBytes: int64
+        ioBytes: int64
+        gpuMs: int64
+        gpuMemBytes: int64
+        gpuCount: int32
+        peakMemBytes: int64
+        peakGpuMemBytes: int64
+
+    IoMeteringMode = enum
+        iomWriteOnly
+        iomReadWrite
+
+var
+    ioMeterState: MeteringState* = nil
+    ioMeterMode: IoMeteringMode = iomReadWrite
+
+fn initMetering(config: MeteringConfig, taskId: str): MeteringState =
+    var st: MeteringState
+    st.taskId = taskId
+    st.startTs = dmeter.usageStartTs()
+    return st
+
+fn meterAddCpu(state: MeteringState*, cpuMs: int64) =
+    if state == nil:
+        return
+    if cpuMs <= 0:
+        return
+    state->cpuMs = state->cpuMs + cpuMs
+
+fn meterAddMem(state: MeteringState*, memBytes: int64) =
+    if state == nil:
+        return
+    if memBytes <= 0:
+        return
+    state->memBytes = state->memBytes + memBytes
+    if memBytes > state->peakMemBytes:
+        state->peakMemBytes = memBytes
+
+fn meterAddIo(state: MeteringState*, ioBytes: int64) =
+    if state == nil:
+        return
+    if ioBytes <= 0:
+        return
+    state->ioBytes = state->ioBytes + ioBytes
+
+fn meterAddGpu(state: MeteringState*, gpuMs: int64) =
+    if state == nil:
+        return
+    if gpuMs <= 0:
+        return
+    state->gpuMs = state->gpuMs + gpuMs
+
+fn meterAddGpuMem(state: MeteringState*, gpuMemBytes: int64) =
+    if state == nil:
+        return
+    if gpuMemBytes <= 0:
+        return
+    state->gpuMemBytes = state->gpuMemBytes + gpuMemBytes
+    if gpuMemBytes > state->peakGpuMemBytes:
+        state->peakGpuMemBytes = gpuMemBytes
+
+fn meterSetGpuCount(state: MeteringState*, gpuCount: int32) =
+    if state == nil:
+        return
+    if gpuCount <= 0:
+        return
+    state->gpuCount = gpuCount
+
+fn ioMeteringHook(op: os.IoMeterOp, bytes: int64) =
+    if ioMeterState == nil:
+        return
+    if ioMeterMode == iomWriteOnly && op != os.ioWrite:
+        return
+    meterAddIo(ioMeterState, bytes)
+
+fn installIoMeteringHook(state: MeteringState*, mode: IoMeteringMode): bool =
+    if state == nil:
+        return false
+    ioMeterState = state
+    ioMeterMode = mode
+    os.setIoMeterHook(void*(ioMeteringHook))
+    return true
+
+fn removeIoMeteringHook() =
+    os.clearIoMeterHook()
+    ioMeterState = nil
+
+fn buildUsage(config: MeteringConfig, state: MeteringState): dmeter.ComputeUsage =
+    var usage = dmeter.ComputeUsage()
+    usage.taskId = state.taskId
+    usage.packageId = config.packageId
+    usage.authorId = config.authorId
+    usage.executorId = config.executorId
+    usage.cpuMs = state.cpuMs
+    usage.memBytes = if state.peakMemBytes > 0: state.peakMemBytes else: state.memBytes
+    usage.ioBytes = state.ioBytes
+    usage.gpuMs = state.gpuMs
+    usage.gpuMemBytes = if state.peakGpuMemBytes > 0: state.peakGpuMemBytes else: state.gpuMemBytes
+    usage.gpuCount = state.gpuCount
+    usage.gpuType = config.gpuType
+    usage.workloadKind = config.workloadKind
+    usage.priceCpuMs = config.priceCpuMs
+    usage.priceMemGb = config.priceMemGb
+    usage.priceIoGb = config.priceIoGb
+    usage.priceGpuMs = config.priceGpuMs
+    usage.priceGpuMemGb = config.priceGpuMemGb
+    usage.royaltyRate = config.royaltyRate
+    usage.treasuryRate = config.treasuryRate
+    usage.epoch = config.epoch
+    usage.startTs = state.startTs
+    return dmeter.normalizeUsage(usage)
+
+fn flushMetering(config: MeteringConfig, state: MeteringState): bool =
+    let usage = buildUsage(config, state)
+    let cost = dmeter.computeUsageCost(usage)
+    return dledger.appendComputeEventWithMode(
+        config.ledgerPath,
+        usage,
+        cost,
+        druntime.storageModeText(config.mode)
+    )
+
+template withMetering(cfg: MeteringConfig, taskId: str, body: untyped): untyped =
+    var __cheng_meter_state = initMetering(cfg, taskId)
+    body
+    flushMetering(cfg, __cheng_meter_state)
+
+template withIoMetering(state: MeteringState*, mode: IoMeteringMode, body: untyped): untyped =
+    installIoMeteringHook(state, mode)
+    body
+    removeIoMeteringHook()
+
+template withMeteringIo(cfg: MeteringConfig, taskId: str, mode: IoMeteringMode, body: untyped): untyped =
+    withMetering(cfg, taskId):
+        withIoMetering(&__cheng_meter_state, mode):
+            body
+
+template withWriteMetering(cfg: MeteringConfig, taskId: str, body: untyped): untyped =
+    withMeteringIo(cfg, taskId, iomWriteOnly, body)
+
+template withReadWriteMetering(cfg: MeteringConfig, taskId: str, body: untyped): untyped =
+    withMeteringIo(cfg, taskId, iomReadWrite, body)

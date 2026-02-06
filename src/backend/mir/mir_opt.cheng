@@ -1,0 +1,274 @@
+# MIR v1 optimizer (MVP): expression-level constant folding.
+import cheng/backend/mir/mir_types
+
+fn mirOptMaxType(a: MirType, b: MirType): MirType =
+    if a.kind == mtI64 || b.kind == mtI64:
+        var out: MirType = mirTypeI64()
+        if a.kind == mtI64:
+            out.isUnsigned = a.isUnsigned
+        elif b.kind == mtI64:
+            out.isUnsigned = b.isUnsigned
+        return out
+    var out2: MirType = mirTypeI32()
+    out2.isUnsigned = a.isUnsigned || b.isUnsigned
+    return out2
+
+fn mirOptExprType(module: MirModule, func: MirFunc, expr: MirExpr, fallback: MirType): MirType =
+    if expr == nil:
+        return fallback
+    if expr.kind == meLocal:
+        if func != nil && expr.localIndex >= 0 && expr.localIndex < func.localTypes.len:
+            return get[MirType](func.localTypes, expr.localIndex)
+        return fallback
+    if expr.kind == meCall:
+        if module != nil && expr.callee != nil && len(expr.callee) > 0:
+            var i: int32 = 0
+            while i < module.funcs.len:
+                let f: MirFunc = get[MirFunc](module.funcs, i)
+                if f != nil && streq(f.name, expr.callee):
+                    return f.retType
+                i = i + 1
+        return fallback
+    if expr.kind == meBin:
+        if expr.binOp == mbShl || expr.binOp == mbShr:
+            return mirOptExprType(module, func, expr.lhs, fallback)
+        let lt: MirType = mirOptExprType(module, func, expr.lhs, fallback)
+        let rt: MirType = mirOptExprType(module, func, expr.rhs, fallback)
+        return mirOptMaxType(lt, rt)
+    if expr.kind == meCmp:
+        return mirTypeI32()
+    if expr.kind == meCast:
+        return expr.castType
+    if expr.kind == meAddr:
+        return mirTypeI64()
+    if expr.kind == meLoad:
+        if expr.loadType.kind == mtVoid:
+            return fallback
+        return expr.loadType
+    if expr.kind == meGlobalAddr:
+        return mirTypeI64()
+    return fallback
+
+fn mirOptWidth(ty: MirType): int32 =
+    if ty.kind == mtI8:
+        return 8
+    if ty.kind == mtI16:
+        return 16
+    if ty.kind == mtI32:
+        return 32
+    if ty.kind == mtI64:
+        return 64
+    return 64
+
+fn mirOptNorm(v: uint64, ty: MirType): uint64 =
+    let w: int32 = mirOptWidth(ty)
+    if w >= 64:
+        return v
+    let mask: uint64 = (uint64(1) << uint64(w)) - uint64(1)
+    return v & mask
+
+fn mirOptSignedKey(v: uint64, ty: MirType): uint64 =
+    let w: int32 = mirOptWidth(ty)
+    let sign: uint64 = uint64(1) << (w - 1)
+    return mirOptNorm(v, ty) ^ sign
+
+fn mirOptArithShr(v: uint64, sh: int32, ty: MirType): uint64 =
+    let w: int32 = mirOptWidth(ty)
+    let vv: uint64 = mirOptNorm(v, ty)
+    if sh <= 0:
+        return vv
+    if sh >= w:
+        # All bits become sign bit.
+        let sign: uint64 = uint64(1) << (w - 1)
+        return (vv & sign) != 0 ? mirOptNorm(uint64(0) - uint64(1), ty) : uint64(0)
+    let shifted: uint64 = vv >> sh
+    let sign2: uint64 = uint64(1) << (w - 1)
+    if (vv & sign2) == 0:
+        return shifted
+    let fill: uint64 = (uint64(0) - uint64(1)) << (w - sh)
+    return mirOptNorm(shifted | fill, ty)
+
+fn mirOptFoldBin(op: MirBinOp, a0: int64, b0: int64, ty: MirType, ok: bool*): int64 =
+    if ok != nil:
+        *ok = false
+    let a: uint64 = mirOptNorm(uint64(a0), ty)
+    let b: uint64 = mirOptNorm(uint64(b0), ty)
+    var out: uint64 = 0
+    case op
+    of mbAdd:
+        out = a + b
+    of mbSub:
+        out = a - b
+    of mbMul:
+        out = a * b
+    of mbAnd:
+        out = a & b
+    of mbOr:
+        out = a | b
+    of mbXor:
+        out = a ^ b
+    of mbShl:
+        let w: int32 = mirOptWidth(ty)
+        let sh: int32 = int32(b % uint64(w))
+        out = mirOptNorm(a << sh, ty)
+        if ok != nil:
+            *ok = true
+        return int64(out)
+    of mbShr:
+        let w2: int32 = mirOptWidth(ty)
+        let sh2: int32 = int32(b % uint64(w2))
+        if ty.isUnsigned:
+            out = mirOptNorm(a >> sh2, ty)
+        else:
+            out = mirOptArithShr(a, sh2, ty)
+        if ok != nil:
+            *ok = true
+        return int64(out)
+    else:
+        return 0
+    out = mirOptNorm(out, ty)
+    if ok != nil:
+        *ok = true
+    return int64(out)
+
+fn mirOptFoldCmp(op: MirCmpOp, a0: int64, b0: int64, ty: MirType): int64 =
+    let a: uint64 = mirOptNorm(uint64(a0), ty)
+    let b: uint64 = mirOptNorm(uint64(b0), ty)
+    var pass: bool = false
+    if ty.isUnsigned:
+        case op
+        of mcEq: pass = (a == b)
+        of mcNe: pass = (a != b)
+        of mcLt: pass = (a < b)
+        of mcLe: pass = (a <= b)
+        of mcGt: pass = (a > b)
+        of mcGe: pass = (a >= b)
+        else:
+            pass = false
+    else:
+        let ka: uint64 = mirOptSignedKey(a, ty)
+        let kb: uint64 = mirOptSignedKey(b, ty)
+        case op
+        of mcEq: pass = (a == b)
+        of mcNe: pass = (a != b)
+        of mcLt: pass = (ka < kb)
+        of mcLe: pass = (ka <= kb)
+        of mcGt: pass = (ka > kb)
+        of mcGe: pass = (ka >= kb)
+        else:
+            pass = false
+    return pass ? 1 : 0
+
+fn mirOptFoldCast(srcType: MirType, dstType: MirType, v0: int64): int64 =
+    let srcW: int32 = mirOptWidth(srcType)
+    let dstW: int32 = mirOptWidth(dstType)
+    let vv: uint64 = mirOptNorm(uint64(v0), srcType)
+    # Truncate or re-interpret same-width values.
+    if dstW <= srcW:
+        return int64(mirOptNorm(vv, dstType))
+    # Zero-extend.
+    if dstType.isUnsigned:
+        return int64(vv)
+    # Sign-extend.
+    if srcW >= 64:
+        return int64(vv)
+    let sign: uint64 = uint64(1) << uint64(srcW - 1)
+    if (vv & sign) == 0:
+        return int64(vv)
+    let mask: uint64 = (uint64(1) << uint64(srcW)) - uint64(1)
+    return int64(vv | (~mask))
+
+fn mirOptExpr(module: MirModule, func: MirFunc, expr: MirExpr, fallback: MirType): MirExpr =
+    if expr == nil:
+        return nil
+    if expr.kind == meConstI64 || expr.kind == meLocal || expr.kind == meAddr || expr.kind == meGlobalAddr:
+        return expr
+    if expr.kind == meLoad:
+        expr.addrExpr = mirOptExpr(module, func, expr.addrExpr, mirTypeI64())
+        return expr
+    if expr.kind == meCall:
+        var i: int32 = 0
+        while i < expr.args.len:
+            let a: MirExpr = get[MirExpr](expr.args, i)
+            let at: MirType = mirOptExprType(module, func, a, fallback)
+            setPtr[MirExpr](&expr.args, i, mirOptExpr(module, func, a, at))
+            i = i + 1
+        return expr
+    if expr.kind == meCast:
+        let srcType: MirType = mirOptExprType(module, func, expr.castExpr, fallback)
+        expr.castExpr = mirOptExpr(module, func, expr.castExpr, srcType)
+        let inner: MirExpr = expr.castExpr
+        if inner != nil && inner.kind == meConstI64:
+            let v2: int64 = mirOptFoldCast(srcType, expr.castType, inner.value)
+            return mirConstI64(v2)
+        return expr
+    if expr.kind == meBin:
+        let exprType: MirType = mirOptExprType(module, func, expr, fallback)
+        expr.lhs = mirOptExpr(module, func, expr.lhs, exprType)
+        expr.rhs = mirOptExpr(module, func, expr.rhs, exprType)
+        let lhs0: MirExpr = expr.lhs
+        let rhs0: MirExpr = expr.rhs
+        if lhs0 != nil && rhs0 != nil && lhs0.kind == meConstI64 && rhs0.kind == meConstI64:
+            var ok: bool = false
+            let v3: int64 = mirOptFoldBin(expr.binOp, lhs0.value, rhs0.value, exprType, &ok)
+            if ok:
+                return mirConstI64(v3)
+        return expr
+    if expr.kind == meCmp:
+        let lt: MirType = mirOptExprType(module, func, expr.lhs, fallback)
+        let rt: MirType = mirOptExprType(module, func, expr.rhs, fallback)
+        let cmpTy: MirType = mirOptMaxType(lt, rt)
+        expr.lhs = mirOptExpr(module, func, expr.lhs, cmpTy)
+        expr.rhs = mirOptExpr(module, func, expr.rhs, cmpTy)
+        let lhs1: MirExpr = expr.lhs
+        let rhs1: MirExpr = expr.rhs
+        if lhs1 != nil && rhs1 != nil && lhs1.kind == meConstI64 && rhs1.kind == meConstI64:
+            return mirConstI64(mirOptFoldCmp(expr.cmpOp, lhs1.value, rhs1.value, cmpTy))
+        return expr
+    return expr
+
+fn mirOptimizeFunc(module: MirModule, func: MirFunc): bool =
+    if module == nil || func == nil || func.isExtern:
+        return false
+    let fallback: MirType = func.retType
+    var bi: int32 = 0
+    while bi < func.blocks.len:
+        let b: MirBlock = get[MirBlock](func.blocks, bi)
+        if b != nil:
+            var si: int32 = 0
+            while si < b.stmts.len:
+                let s: MirStmt = get[MirStmt](b.stmts, si)
+                if s.kind == msLet || s.kind == msVar || s.kind == msAssign:
+                    var slotTy: MirType = fallback
+                    if s.slot >= 0 && s.slot < func.localTypes.len:
+                        slotTy = get[MirType](func.localTypes, s.slot)
+                    s.expr = mirOptExpr(module, func, s.expr, slotTy)
+                    setPtr[MirStmt](&b.stmts, si, s)
+                elif s.kind == msStore:
+                    s.addrExpr = mirOptExpr(module, func, s.addrExpr, mirTypeI64())
+                    s.expr = mirOptExpr(module, func, s.expr, s.storeType)
+                    setPtr[MirStmt](&b.stmts, si, s)
+                else:
+                    s.expr = mirOptExpr(module, func, s.expr, fallback)
+                    setPtr[MirStmt](&b.stmts, si, s)
+                si = si + 1
+            if b.term.kind == mtRet && b.term.retExpr != nil:
+                b.term.retExpr = mirOptExpr(module, func, b.term.retExpr, func.retType)
+                setPtr[MirBlock](&func.blocks, bi, b)
+            elif b.term.kind == mtCbr && b.term.condExpr != nil:
+                b.term.condExpr = mirOptExpr(module, func, b.term.condExpr, mirTypeI32())
+                setPtr[MirBlock](&func.blocks, bi, b)
+        bi = bi + 1
+    return true
+
+fn mirOptimizeModule(module: MirModule): bool =
+    if module == nil:
+        return false
+    var any: bool = false
+    var i: int32 = 0
+    while i < module.funcs.len:
+        let f: MirFunc = get[MirFunc](module.funcs, i)
+        if mirOptimizeFunc(module, f):
+            any = true
+        i = i + 1
+    return any

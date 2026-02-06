@@ -1,0 +1,1020 @@
+# MIR v1 types (expression-tree based, MVP).
+import std/seqs
+import std/strings
+import std/result
+
+type
+    MirTypeKind = enum
+        mtVoid, mtI8, mtI16, mtI32, mtI64
+
+    MirType =
+        kind: MirTypeKind
+        isUnsigned: bool
+
+    MirBinOp = enum
+        mbAdd, mbSub, mbMul, mbSdiv, mbSmod,
+        mbAnd, mbOr, mbXor, mbShl, mbShr
+
+    MirCmpOp = enum
+        mcEq, mcNe, mcLt, mcLe, mcGt, mcGe
+
+    MirExprKind = enum
+        meConstI64, meBin, meCmp, meLocal, meCall, meCast,
+        meAddr, meLoad, meGlobalAddr
+
+    MirExpr = ref
+        kind: MirExprKind
+        value: int64
+        binOp: MirBinOp
+        cmpOp: MirCmpOp
+        lhs: MirExpr
+        rhs: MirExpr
+        localIndex: int32
+        callee: str
+        args: seq[MirExpr]
+        castType: MirType
+        castExpr: MirExpr
+        addrExpr: MirExpr
+        loadType: MirType
+        globalName: str
+
+    MirStmtKind = enum
+        msLet, msVar, msAssign, msExpr, msParam, msStore
+
+    MirStmt =
+        kind: MirStmtKind
+        name: str
+        slot: int32
+        expr: MirExpr
+        paramIndex: int32
+        addrExpr: MirExpr
+        storeType: MirType
+
+    MirParam =
+        name: str
+        slot: int32
+        ty: MirType
+        typeKey: str
+
+    MirTermKind = enum
+        mtRet, mtBr, mtCbr
+
+    MirTerm =
+        kind: MirTermKind
+        retExpr: MirExpr
+        condExpr: MirExpr
+        target: str
+        targetTrue: str
+        targetFalse: str
+
+    MirBlock = ref
+        label: str
+        stmts: seq[MirStmt]
+        term: MirTerm
+
+    MirFunc = ref
+        name: str
+        linkName: str
+        originFile: str
+        isExtern: bool
+        retType: MirType
+        retTypeKey: str
+        params: seq[MirParam]
+        localTypes: seq[MirType]
+        objLocals: seq[MirObjLocal]
+        objFrameSize: int32
+        blocks: seq[MirBlock]
+
+    MirCString =
+        label: str
+        value: str
+
+    MirTypeAlias =
+        name: str
+        ty: MirType
+
+    MirObjField =
+        name: str
+        ty: MirType
+        offset: int32
+
+    MirObjType =
+        name: str
+        size: int32
+        alignPow2: int32
+        fields: seq[MirObjField]
+
+    # Object locals are represented as an i64 pointer slot.
+    # - frameOff >= 0: compiler-allocated stack storage (base = localsArea + frameOff)
+    # - frameOff < 0: external pointer (e.g. ref param/local)
+    MirObjLocal =
+        slot: int32
+        objTypeName: str
+        # Fully-resolved type key (e.g. `seq_int32`), used by backend-only lowering.
+        typeKey: str
+        frameOff: int32
+
+    MirGlobal =
+        name: str
+        ty: MirType
+        init: int64
+        hasInit: bool
+        originFile: str
+
+    MirModule = ref
+        target: str
+        funcs: seq[MirFunc]
+        cstrs: seq[MirCString]
+        globals: seq[MirGlobal]
+        typeAliases: seq[MirTypeAlias]
+        objTypes: seq[MirObjType]
+
+fn mirTypeI32(): MirType =
+    var t: MirType
+    t.kind = mtI32
+    t.isUnsigned = false
+    return t
+
+fn mirTypeI8(): MirType =
+    var t: MirType
+    t.kind = mtI8
+    t.isUnsigned = false
+    return t
+
+fn mirTypeU8(): MirType =
+    var t: MirType
+    t.kind = mtI8
+    t.isUnsigned = true
+    return t
+
+fn mirTypeI16(): MirType =
+    var t: MirType
+    t.kind = mtI16
+    t.isUnsigned = false
+    return t
+
+fn mirTypeU16(): MirType =
+    var t: MirType
+    t.kind = mtI16
+    t.isUnsigned = true
+    return t
+
+fn mirTypeVoid(): MirType =
+    var t: MirType
+    t.kind = mtVoid
+    t.isUnsigned = false
+    return t
+
+fn mirTypeI64(): MirType =
+    var t: MirType
+    t.kind = mtI64
+    t.isUnsigned = false
+    return t
+
+fn mirTypeU32(): MirType =
+    var t: MirType
+    t.kind = mtI32
+    t.isUnsigned = true
+    return t
+
+fn mirTypeU64(): MirType =
+    var t: MirType
+    t.kind = mtI64
+    t.isUnsigned = true
+    return t
+
+fn mirConstI64(value: int64): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meConstI64
+    e.value = value
+    return e
+
+fn mirBin(op: MirBinOp, lhs: MirExpr, rhs: MirExpr): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meBin
+    e.binOp = op
+    e.lhs = lhs
+    e.rhs = rhs
+    return e
+
+fn mirLocal(index: int32): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meLocal
+    e.localIndex = index
+    return e
+
+fn mirCall(name: str, args: seq[MirExpr]): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meCall
+    e.callee = name
+    e.args = args
+    return e
+
+fn mirCast(ty: MirType, expr: MirExpr): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meCast
+    e.castType = ty
+    e.castExpr = expr
+    return e
+
+fn mirAddr(slot: int32): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meAddr
+    e.localIndex = slot
+    return e
+
+fn mirLoad(addr: MirExpr, ty: MirType): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meLoad
+    e.addrExpr = addr
+    e.loadType = ty
+    return e
+
+fn mirGlobalAddr(name: str): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meGlobalAddr
+    e.globalName = name
+    return e
+
+fn mirCmp(op: MirCmpOp, lhs: MirExpr, rhs: MirExpr): MirExpr =
+    var e: MirExpr
+    new e
+    e.kind = meCmp
+    e.cmpOp = op
+    e.lhs = lhs
+    e.rhs = rhs
+    return e
+
+fn mirTermRet(expr: MirExpr): MirTerm =
+    var t: MirTerm
+    t.kind = mtRet
+    t.retExpr = expr
+    return t
+
+fn mirTermBr(target: str): MirTerm =
+    var t: MirTerm
+    t.kind = mtBr
+    t.target = target
+    return t
+
+fn mirTermCbr(cond: MirExpr, tLabel: str, fLabel: str): MirTerm =
+    var t: MirTerm
+    t.kind = mtCbr
+    t.condExpr = cond
+    t.targetTrue = tLabel
+    t.targetFalse = fLabel
+    return t
+
+fn mirStmtLet(name: str, slot: int32, expr: MirExpr): MirStmt =
+    var s: MirStmt
+    s.kind = msLet
+    s.name = name
+    s.slot = slot
+    s.expr = expr
+    return s
+
+fn mirStmtVar(name: str, slot: int32, expr: MirExpr): MirStmt =
+    var s: MirStmt
+    s.kind = msVar
+    s.name = name
+    s.slot = slot
+    s.expr = expr
+    return s
+
+fn mirStmtAssign(name: str, slot: int32, expr: MirExpr): MirStmt =
+    var s: MirStmt
+    s.kind = msAssign
+    s.name = name
+    s.slot = slot
+    s.expr = expr
+    return s
+
+fn mirStmtExpr(expr: MirExpr): MirStmt =
+    var s: MirStmt
+    s.kind = msExpr
+    s.expr = expr
+    return s
+
+fn mirStmtParam(name: str, slot: int32, paramIndex: int32): MirStmt =
+    var s: MirStmt
+    s.kind = msParam
+    s.name = name
+    s.slot = slot
+    s.paramIndex = paramIndex
+    return s
+
+fn mirStmtStore(addr: MirExpr, value: MirExpr, ty: MirType): MirStmt =
+    var s: MirStmt
+    s.kind = msStore
+    s.slot = -1
+    s.expr = value
+    s.addrExpr = addr
+    s.storeType = ty
+    return s
+
+fn mirBlock(label: str, term: MirTerm): MirBlock =
+    var b: MirBlock
+    new b
+    b.label = label
+    b.stmts = newSeq[MirStmt]()
+    b.term = term
+    return b
+
+fn mirBlockWithStmts(label: str, stmts: seq[MirStmt], term: MirTerm): MirBlock =
+    var b: MirBlock
+    new b
+    b.label = label
+    b.stmts = stmts
+    b.term = term
+    return b
+
+fn mirNewFunc(name: str, retType: MirType): MirFunc =
+    var f: MirFunc
+    new f
+    f.name = name
+    f.linkName = name
+    f.originFile = ""
+    f.isExtern = false
+    f.retType = retType
+    f.retTypeKey = ""
+    f.params = newSeq[MirParam]()
+    f.localTypes = newSeq[MirType]()
+    f.objLocals = newSeq[MirObjLocal]()
+    f.objFrameSize = 0
+    f.blocks = newSeq[MirBlock]()
+    return f
+
+fn mirAddBlock(func: MirFunc, block: MirBlock) =
+    addPtr[MirBlock](&func.blocks, block)
+
+fn mirSetLocalType(func: MirFunc, slot: int32, ty: MirType) =
+    var i: int32 = func.localTypes.len
+    while i <= slot:
+        addPtr[MirType](&func.localTypes, mirTypeI32())
+        i = i + 1
+    setPtr[MirType](&func.localTypes, slot, ty)
+
+fn mirAddParam(func: MirFunc, name: str, slot: int32, ty: MirType, typeKey: str = "") =
+    var p: MirParam
+    p.name = name
+    p.slot = slot
+    p.ty = ty
+    p.typeKey = typeKey
+    addPtr[MirParam](&func.params, p)
+    mirSetLocalType(func, slot, ty)
+
+fn mirNewModule(target: str): MirModule =
+    var m: MirModule
+    new m
+    m.target = target
+    m.funcs = newSeq[MirFunc]()
+    m.cstrs = newSeq[MirCString]()
+    m.globals = newSeq[MirGlobal]()
+    m.typeAliases = newSeq[MirTypeAlias]()
+    m.objTypes = newSeq[MirObjType]()
+    return m
+
+fn mirTypeSize(ty: MirType): int32 =
+    if ty.kind == mtI64:
+        return 8
+    if ty.kind == mtI32:
+        return 4
+    if ty.kind == mtI16:
+        return 2
+    if ty.kind == mtI8:
+        return 1
+    return 0
+
+fn mirTypeAlignPow2(ty: MirType): int32 =
+    if ty.kind == mtI64:
+        return 3
+    if ty.kind == mtI32:
+        return 2
+    if ty.kind == mtI16:
+        return 1
+    if ty.kind == mtI8:
+        return 0
+    return 0
+
+fn mirFindTypeAlias(module: MirModule, name: str): int32 =
+    if module == nil || name == nil:
+        return -1
+    var i: int32 = 0
+    while i < module.typeAliases.len:
+        let a: MirTypeAlias = get[MirTypeAlias](module.typeAliases, i)
+        if streq(a.name, name):
+            return i
+        i = i + 1
+    return -1
+
+fn mirTryGetTypeAlias(module: MirModule, name: str): MirType =
+    let idx: int32 = mirFindTypeAlias(module, name)
+    if idx < 0:
+        return mirTypeVoid()
+    let a: MirTypeAlias = get[MirTypeAlias](module.typeAliases, idx)
+    return a.ty
+
+fn mirAddTypeAlias(module: MirModule, name: str, ty: MirType) =
+    if module == nil || name == nil || len(name) == 0:
+        return
+    let idx: int32 = mirFindTypeAlias(module, name)
+    if idx >= 0:
+        var a2: MirTypeAlias
+        a2.name = name
+        a2.ty = ty
+        setPtr[MirTypeAlias](&module.typeAliases, idx, a2)
+        return
+    var a: MirTypeAlias
+    a.name = name
+    a.ty = ty
+    addPtr[MirTypeAlias](&module.typeAliases, a)
+
+fn mirFindObjType(module: MirModule, name: str): int32 =
+    if module == nil || name == nil:
+        return -1
+    var i: int32 = 0
+    while i < module.objTypes.len:
+        let t: MirObjType = get[MirObjType](module.objTypes, i)
+        if streq(t.name, name):
+            return i
+        i = i + 1
+    return -1
+
+fn mirHasObjType(module: MirModule, name: str): bool =
+    return mirFindObjType(module, name) >= 0
+
+fn mirGetObjType(module: MirModule, name: str): MirObjType =
+    let idx: int32 = mirFindObjType(module, name)
+    if idx < 0:
+        var t: MirObjType
+        t.name = ""
+        t.size = 0
+        t.alignPow2 = 0
+        t.fields = newSeq[MirObjField]()
+        return t
+    return get[MirObjType](module.objTypes, idx)
+
+fn mirAddObjType(module: MirModule, ty: MirObjType) =
+    if module == nil || ty.name == nil || len(ty.name) == 0:
+        return
+    let idx: int32 = mirFindObjType(module, ty.name)
+    if idx >= 0:
+        setPtr[MirObjType](&module.objTypes, idx, ty)
+        return
+    addPtr[MirObjType](&module.objTypes, ty)
+
+fn mirAddFunc(module: MirModule, func: MirFunc) =
+    addPtr[MirFunc](&module.funcs, func)
+
+fn mirAddGlobal(module: MirModule, name: str, ty: MirType, init: int64, hasInit: bool, originFile: str) =
+    if module == nil:
+        return
+    var g: MirGlobal
+    g.name = name
+    g.ty = ty
+    g.init = init
+    g.hasInit = hasInit
+    g.originFile = originFile
+    addPtr[MirGlobal](&module.globals, g)
+
+fn mirFnv1a64(s: str): int64 =
+    if s == nil:
+        return int64(0)
+    var h: uint64 = uint64(1469598103934665603)
+    var i: int32 = 0
+    while i < len(s):
+        let c: char = charAt(s, i)
+        h = h ^ uint64(int64(c) & int64(0xFF))
+        h = h * uint64(1099511628211)
+        i = i + 1
+    return int64(h)
+
+fn mirHexDigit(v: int32): char =
+    if v < 10:
+        return char(int8(48 + v))
+    return char(int8(97 + (v - 10)))
+
+fn mirU64ToHex(v: int64): str =
+    let n: int32 = 16
+    let p: void* = alloc(n + 1)
+    var i: int32 = 0
+    while i < n:
+        let shift: int32 = (n - 1 - i) * 4
+        let nib: int32 = int32((v >> shift) & int64(0xF))
+        let dst: void* = ptr_add(p, i)
+        var pc: char* = char*(dst)
+        *pc = mirHexDigit(nib)
+        i = i + 1
+    setMem(ptr_add(p, n), 0, 1)
+    return str(p)
+
+fn mirFindCStringLabel(module: MirModule, value: str): str =
+    if module == nil:
+        return ""
+    var i: int32 = 0
+    while i < module.cstrs.len:
+        let c: MirCString = get[MirCString](module.cstrs, i)
+        if streq(c.value, value):
+            return c.label
+        i = i + 1
+    return ""
+
+fn mirAddCString(module: MirModule, value: str): str =
+    if module == nil:
+        return ""
+    var v: str = value
+    if v == nil:
+        v = ""
+    let existing: str = mirFindCStringLabel(module, v)
+    if len(existing) > 0:
+        return existing
+    let h: int64 = mirFnv1a64(v)
+    let label: str = "L_cheng_str_" + mirU64ToHex(h)
+    var c: MirCString
+    c.label = label
+    c.value = v
+    addPtr[MirCString](&module.cstrs, c)
+    return label
+
+fn mirStrCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    var i: int32 = 0
+    while i < n:
+        let ca: int32 = int32(int64(charAt(a, i)) & int64(0xFF))
+        let cb: int32 = int32(int64(charAt(b, i)) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+        i = i + 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn mirNormalizeModule(module: MirModule) =
+    if module == nil:
+        return
+    # Deterministic ordering: stable insertion-sort by name/label.
+    var i: int32 = 1
+    while i < module.globals.len:
+        let key: MirGlobal = get[MirGlobal](module.globals, i)
+        var j: int32 = i - 1
+        let keyName: str = key.name
+        while j >= 0:
+            let cur: MirGlobal = get[MirGlobal](module.globals, j)
+            let curName: str = cur.name
+            if mirStrCmp(curName, keyName) <= 0:
+                break
+            setPtr[MirGlobal](&module.globals, j + 1, cur)
+            j = j - 1
+        setPtr[MirGlobal](&module.globals, j + 1, key)
+        i = i + 1
+
+    i = 1
+    while i < module.cstrs.len:
+        let key2: MirCString = get[MirCString](module.cstrs, i)
+        var j2: int32 = i - 1
+        let keyLabel: str = key2.label
+        while j2 >= 0:
+            let cur2: MirCString = get[MirCString](module.cstrs, j2)
+            let curLabel: str = cur2.label
+            if mirStrCmp(curLabel, keyLabel) <= 0:
+                break
+            setPtr[MirCString](&module.cstrs, j2 + 1, cur2)
+            j2 = j2 - 1
+        setPtr[MirCString](&module.cstrs, j2 + 1, key2)
+        i = i + 1
+
+    i = 1
+    while i < module.funcs.len:
+        let key3: MirFunc = get[MirFunc](module.funcs, i)
+        let keyName: str = key3 == nil ? "" : key3.name
+        var j3: int32 = i - 1
+        while j3 >= 0:
+            let cur: MirFunc = get[MirFunc](module.funcs, j3)
+            let curName: str = cur == nil ? "" : cur.name
+            if mirStrCmp(curName, keyName) <= 0:
+                break
+            setPtr[MirFunc](&module.funcs, j3 + 1, cur)
+            j3 = j3 - 1
+        setPtr[MirFunc](&module.funcs, j3 + 1, key3)
+        i = i + 1
+
+fn mirDemoModule(): MirModule =
+    let mod: MirModule = mirNewModule("arm64-apple-darwin")
+    let retType: MirType = mirTypeI32()
+    let f: MirFunc = mirNewFunc("main", retType)
+    let v: MirExpr = mirConstI64(0)
+    mirAddBlock(f, mirBlock("entry", mirTermRet(v)))
+    mirAddFunc(mod, f)
+    return mod
+
+fn mirFormatExpr(expr: MirExpr): str =
+    if expr == nil:
+        return "nil"
+    if expr.kind == meConstI64:
+        return intToStr(int32(expr.value))
+    if expr.kind == meBin:
+        var op: str = "?"
+        case expr.binOp
+        of mbAdd: op = "+"
+        of mbSub: op = "-"
+        of mbMul: op = "*"
+        of mbSdiv: op = "/"
+        of mbSmod: op = "%"
+        of mbAnd: op = "&"
+        of mbOr: op = "|"
+        of mbXor: op = "^"
+        of mbShl: op = "<<"
+        of mbShr: op = ">>"
+        return "(" + mirFormatExpr(expr.lhs) + " " + op + " " + mirFormatExpr(expr.rhs) + ")"
+    if expr.kind == meCmp:
+        var op2: str = "=="
+        case expr.cmpOp
+        of mcEq: op2 = "=="
+        of mcNe: op2 = "!="
+        of mcLt: op2 = "<"
+        of mcLe: op2 = "<="
+        of mcGt: op2 = ">"
+        of mcGe: op2 = ">="
+        return "(" + mirFormatExpr(expr.lhs) + " " + op2 + " " + mirFormatExpr(expr.rhs) + ")"
+    if expr.kind == meLocal:
+        return "$l" + intToStr(expr.localIndex)
+    if expr.kind == meAddr:
+        return "&$l" + intToStr(expr.localIndex)
+    if expr.kind == meLoad:
+        return "*" + mirFormatExpr(expr.addrExpr)
+    if expr.kind == meGlobalAddr:
+        return "&" + expr.globalName
+    if expr.kind == meCall:
+        var out: str = expr.callee + "("
+        var i: int32 = 0
+        while i < expr.args.len:
+            if i > 0:
+                out = out + ", "
+            out = out + mirFormatExpr(get[MirExpr](expr.args, i))
+            i = i + 1
+        return out + ")"
+    if expr.kind == meCast:
+        if expr.castType.kind == mtVoid:
+            return "void(" + mirFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI64:
+            return (expr.castType.isUnsigned ? "u64(" : "i64(") + mirFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI32:
+            return (expr.castType.isUnsigned ? "u32(" : "i32(") + mirFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI16:
+            return (expr.castType.isUnsigned ? "u16(" : "i16(") + mirFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI8:
+            return (expr.castType.isUnsigned ? "u8(" : "i8(") + mirFormatExpr(expr.castExpr) + ")"
+        return "i32(" + mirFormatExpr(expr.castExpr) + ")"
+    return "?"
+
+fn mirFormat(module: MirModule): str =
+    var out: str = ""
+    out = out + "module " + module.target + "\n"
+    var gi: int32 = 0
+    while gi < module.globals.len:
+        let g: MirGlobal = get[MirGlobal](module.globals, gi)
+        out = out + "global " + g.name + ": "
+        if g.ty.kind == mtVoid:
+            out = out + "void"
+        elif g.ty.kind == mtI64:
+            out = out + (g.ty.isUnsigned ? "u64" : "i64")
+        elif g.ty.kind == mtI32:
+            out = out + (g.ty.isUnsigned ? "u32" : "i32")
+        elif g.ty.kind == mtI16:
+            out = out + (g.ty.isUnsigned ? "u16" : "i16")
+        elif g.ty.kind == mtI8:
+            out = out + (g.ty.isUnsigned ? "u8" : "i8")
+        else:
+            out = out + "i32"
+        if g.hasInit:
+            out = out + " = " + intToStr(int32(g.init))
+        out = out + "\n"
+        gi = gi + 1
+    var i: int32 = 0
+    while i < module.funcs.len:
+        let f: MirFunc = get[MirFunc](module.funcs, i)
+        out = out + "fn " + f.name + "("
+        var pi: int32 = 0
+        while pi < f.params.len:
+            let p: MirParam = get[MirParam](f.params, pi)
+            if pi > 0:
+                out = out + ", "
+            out = out + p.name
+            pi = pi + 1
+        out = out + "): "
+        if f.retType.kind == mtVoid:
+            out = out + "void\n"
+        elif f.retType.kind == mtI64:
+            out = out + (f.retType.isUnsigned ? "u64\n" : "i64\n")
+        elif f.retType.kind == mtI32:
+            out = out + (f.retType.isUnsigned ? "u32\n" : "i32\n")
+        elif f.retType.kind == mtI16:
+            out = out + (f.retType.isUnsigned ? "u16\n" : "i16\n")
+        elif f.retType.kind == mtI8:
+            out = out + (f.retType.isUnsigned ? "u8\n" : "i8\n")
+        else:
+            out = out + "i32\n"
+        var bi: int32 = 0
+        while bi < f.blocks.len:
+            let b: MirBlock = get[MirBlock](f.blocks, bi)
+            out = out + b.label + ":\n"
+            var si: int32 = 0
+            while si < b.stmts.len:
+                let s: MirStmt = get[MirStmt](b.stmts, si)
+                if s.kind == msLet:
+                    out = out + "  let " + s.name + " = " + mirFormatExpr(s.expr) + "\n"
+                elif s.kind == msVar:
+                    out = out + "  var " + s.name + " = " + mirFormatExpr(s.expr) + "\n"
+                elif s.kind == msAssign:
+                    out = out + "  " + s.name + " = " + mirFormatExpr(s.expr) + "\n"
+                elif s.kind == msParam:
+                    out = out + "  param " + s.name + "\n"
+                elif s.kind == msStore:
+                    out = out + "  *" + mirFormatExpr(s.addrExpr) + " = " + mirFormatExpr(s.expr) + "\n"
+                else:
+                    out = out + "  expr " + mirFormatExpr(s.expr) + "\n"
+                si = si + 1
+            if b.term.kind == mtRet:
+                if b.term.retExpr == nil:
+                    out = out + "  ret\n"
+                else:
+                    out = out + "  ret " + mirFormatExpr(b.term.retExpr) + "\n"
+            elif b.term.kind == mtBr:
+                out = out + "  br " + b.term.target + "\n"
+            else:
+                out = out + "  cbr " + mirFormatExpr(b.term.condExpr) + " ? " +
+                      b.term.targetTrue + " : " + b.term.targetFalse + "\n"
+            bi = bi + 1
+        i = i + 1
+    return out
+
+fn mirValidateExpr(func: MirFunc, expr: MirExpr, ctx: str): Result[bool] =
+    if expr == nil:
+        return Err[bool]("mir_validate: nil expr (" + ctx + ")")
+    if expr.kind == meConstI64:
+        return Ok[bool](true)
+    if expr.kind == meLocal:
+        if expr.localIndex < 0:
+            return Err[bool]("mir_validate: negative local index (" + ctx + ")")
+        if func != nil && expr.localIndex >= func.localTypes.len:
+            return Err[bool]("mir_validate: local index out of range (" + ctx + ")")
+        return Ok[bool](true)
+    if expr.kind == meAddr:
+        if expr.localIndex < 0:
+            return Err[bool]("mir_validate: negative addr slot (" + ctx + ")")
+        if func != nil:
+            if expr.localIndex >= func.localTypes.len:
+                return Err[bool]("mir_validate: addr slot out of range (" + ctx + ")")
+            var oi: int32 = 0
+            while oi < func.objLocals.len:
+                let ol: MirObjLocal = get[MirObjLocal](func.objLocals, oi)
+                if ol.slot == expr.localIndex && ol.frameOff >= 0:
+                    return Err[bool]("mir_validate: meAddr on object-local slot (pointer-to-pointer) (" + ctx + ")")
+                oi = oi + 1
+        return Ok[bool](true)
+    if expr.kind == meLoad:
+        if expr.loadType.kind == mtVoid:
+            return Err[bool]("mir_validate: load void type (" + ctx + ")")
+        if expr.addrExpr == nil:
+            return Err[bool]("mir_validate: load missing addr (" + ctx + ")")
+        return mirValidateExpr(func, expr.addrExpr, ctx + "/load.addr")
+    if expr.kind == meGlobalAddr:
+        if expr.globalName == nil || len(expr.globalName) == 0:
+            return Err[bool]("mir_validate: global addr missing name (" + ctx + ")")
+        return Ok[bool](true)
+    if expr.kind == meBin || expr.kind == meCmp:
+        if expr.lhs == nil || expr.rhs == nil:
+            return Err[bool]("mir_validate: binary expr missing operand (" + ctx + ")")
+        let lres: Result[bool] = mirValidateExpr(func, expr.lhs, ctx + "/lhs")
+        if ! IsOk[bool](lres):
+            return lres
+        return mirValidateExpr(func, expr.rhs, ctx + "/rhs")
+    if expr.kind == meCall:
+        if expr.callee == nil || len(expr.callee) == 0:
+            return Err[bool]("mir_validate: call missing callee (" + ctx + ")")
+        var ai: int32 = 0
+        while ai < expr.args.len:
+            let ares: Result[bool] = mirValidateExpr(func, get[MirExpr](expr.args, ai), ctx + "/arg")
+            if ! IsOk[bool](ares):
+                return ares
+            ai = ai + 1
+        return Ok[bool](true)
+    if expr.kind == meCast:
+        if expr.castExpr == nil:
+            return Err[bool]("mir_validate: cast missing expr (" + ctx + ")")
+        return mirValidateExpr(func, expr.castExpr, ctx + "/cast")
+    return Err[bool]("mir_validate: unknown expr kind (" + ctx + ")")
+
+fn mirValidateObjType(ty: MirObjType): Result[bool] =
+    if ty.name == nil || len(ty.name) == 0:
+        return Err[bool]("mir_validate: obj type missing name")
+    if ty.size < 0:
+        return Err[bool]("mir_validate: obj type size < 0 (" + ty.name + ")")
+    if ty.size == 0 && ty.fields.len != 0:
+        return Err[bool]("mir_validate: obj type size == 0 but has fields (" + ty.name + ")")
+    if ty.alignPow2 < 0:
+        return Err[bool]("mir_validate: obj type alignPow2 < 0 (" + ty.name + ")")
+    let align: int32 = 1 << ty.alignPow2
+    if align <= 0:
+        return Err[bool]("mir_validate: obj type invalid alignPow2 (" + ty.name + ")")
+    if (ty.size % align) != 0:
+        return Err[bool]("mir_validate: obj type size not aligned (" + ty.name + ")")
+    var maxAlign: int32 = 0
+    var lastEnd: int32 = 0
+    var i: int32 = 0
+    while i < ty.fields.len:
+        let f: MirObjField = get[MirObjField](ty.fields, i)
+        if f.name == nil || len(f.name) == 0:
+            return Err[bool]("mir_validate: obj field missing name (" + ty.name + ")")
+        if f.ty.kind == mtVoid:
+            return Err[bool]("mir_validate: obj field has void type (" + ty.name + "." + f.name + ")")
+        let sz: int32 = mirTypeSize(f.ty)
+        if sz <= 0:
+            return Err[bool]("mir_validate: obj field has unsupported type (" + ty.name + "." + f.name + ")")
+        let ap2: int32 = mirTypeAlignPow2(f.ty)
+        if ap2 > maxAlign:
+            maxAlign = ap2
+        let falign: int32 = 1 << ap2
+        if falign > 0 && (f.offset % falign) != 0:
+            return Err[bool]("mir_validate: obj field misaligned (" + ty.name + "." + f.name + ")")
+        if f.offset < lastEnd:
+            return Err[bool]("mir_validate: obj field overlaps (" + ty.name + "." + f.name + ")")
+        let end: int32 = f.offset + sz
+        if end > ty.size:
+            return Err[bool]("mir_validate: obj field out of bounds (" + ty.name + "." + f.name + ")")
+        lastEnd = end
+        i = i + 1
+    if ty.alignPow2 < maxAlign:
+        return Err[bool]("mir_validate: obj type alignPow2 too small (" + ty.name + ")")
+    return Ok[bool](true)
+
+fn mirValidateFunc(module: MirModule, func: MirFunc): Result[bool] =
+    if func == nil:
+        return Err[bool]("mir_validate: nil func")
+    if func.name == nil || len(func.name) == 0:
+        return Err[bool]("mir_validate: func missing name")
+    if func.isExtern:
+        return Ok[bool](true)
+    if func.blocks.len == 0:
+        return Err[bool]("mir_validate: func has no blocks (" + func.name + ")")
+    # Labels: unique + reachable branch targets.
+    var i: int32 = 0
+    while i < func.blocks.len:
+        let b: MirBlock = get[MirBlock](func.blocks, i)
+        if b == nil:
+            return Err[bool]("mir_validate: nil block (" + func.name + ")")
+        if b.label == nil || len(b.label) == 0:
+            return Err[bool]("mir_validate: block missing label (" + func.name + ")")
+        var j: int32 = 0
+        while j < i:
+            let prev: MirBlock = get[MirBlock](func.blocks, j)
+            if prev != nil && streq(prev.label, b.label):
+                return Err[bool]("mir_validate: duplicate block label (" + func.name + ":" + b.label + ")")
+            j = j + 1
+        i = i + 1
+
+    var bi: int32 = 0
+    while bi < func.blocks.len:
+        let b2: MirBlock = get[MirBlock](func.blocks, bi)
+        if b2.term.kind == mtRet:
+            if func.retType.kind != mtVoid && b2.term.retExpr == nil:
+                return Err[bool]("mir_validate: missing ret expr (" + func.name + ":" + b2.label + ")")
+            if func.retType.kind == mtVoid && b2.term.retExpr != nil:
+                return Err[bool]("mir_validate: void ret with expr (" + func.name + ":" + b2.label + ")")
+        elif b2.term.kind == mtBr:
+            if b2.term.target == nil || len(b2.term.target) == 0:
+                return Err[bool]("mir_validate: br missing target (" + func.name + ":" + b2.label + ")")
+            var found: bool = false
+            var li: int32 = 0
+            while li < func.blocks.len:
+                let bb: MirBlock = get[MirBlock](func.blocks, li)
+                if bb != nil && streq(bb.label, b2.term.target):
+                    found = true
+                    break
+                li = li + 1
+            if ! found:
+                return Err[bool]("mir_validate: br target not found (" + func.name + ":" + b2.label + ")")
+        else:
+            if b2.term.condExpr == nil:
+                return Err[bool]("mir_validate: cbr missing cond (" + func.name + ":" + b2.label + ")")
+            if b2.term.targetTrue == nil || len(b2.term.targetTrue) == 0:
+                return Err[bool]("mir_validate: cbr missing true target (" + func.name + ":" + b2.label + ")")
+            if b2.term.targetFalse == nil || len(b2.term.targetFalse) == 0:
+                return Err[bool]("mir_validate: cbr missing false target (" + func.name + ":" + b2.label + ")")
+            var foundT: bool = false
+            var foundF: bool = false
+            var li2: int32 = 0
+            while li2 < func.blocks.len:
+                let bb2: MirBlock = get[MirBlock](func.blocks, li2)
+                if bb2 != nil && streq(bb2.label, b2.term.targetTrue):
+                    foundT = true
+                if bb2 != nil && streq(bb2.label, b2.term.targetFalse):
+                    foundF = true
+                li2 = li2 + 1
+            if ! foundT || ! foundF:
+                return Err[bool]("mir_validate: cbr target not found (" + func.name + ":" + b2.label + ")")
+        var si: int32 = 0
+        while si < b2.stmts.len:
+            let s: MirStmt = get[MirStmt](b2.stmts, si)
+            if s.kind == msLet || s.kind == msVar || s.kind == msAssign:
+                if s.slot < 0:
+                    return Err[bool]("mir_validate: stmt slot < 0 (" + func.name + ":" + b2.label + ")")
+                if s.expr == nil:
+                    return Err[bool]("mir_validate: stmt missing expr (" + func.name + ":" + b2.label + ")")
+                let eres: Result[bool] = mirValidateExpr(func, s.expr, func.name + ":" + b2.label + "/stmt")
+                if ! IsOk[bool](eres):
+                    return eres
+            elif s.kind == msParam:
+                if s.slot < 0 || s.paramIndex < 0:
+                    return Err[bool]("mir_validate: param stmt invalid (" + func.name + ":" + b2.label + ")")
+            elif s.kind == msStore:
+                if s.addrExpr == nil || s.expr == nil:
+                    return Err[bool]("mir_validate: store missing expr/addr (" + func.name + ":" + b2.label + ")")
+                if s.storeType.kind == mtVoid:
+                    return Err[bool]("mir_validate: store void type (" + func.name + ":" + b2.label + ")")
+                let ares: Result[bool] = mirValidateExpr(func, s.addrExpr, func.name + ":" + b2.label + "/store.addr")
+                if ! IsOk[bool](ares):
+                    return ares
+                let vres: Result[bool] = mirValidateExpr(func, s.expr, func.name + ":" + b2.label + "/store.value")
+                if ! IsOk[bool](vres):
+                    return vres
+            else:
+                if s.expr == nil:
+                    return Err[bool]("mir_validate: expr stmt missing expr (" + func.name + ":" + b2.label + ")")
+                let eres2: Result[bool] = mirValidateExpr(func, s.expr, func.name + ":" + b2.label + "/expr")
+                if ! IsOk[bool](eres2):
+                    return eres2
+            si = si + 1
+
+        if b2.term.kind == mtRet && b2.term.retExpr != nil:
+            let rres: Result[bool] = mirValidateExpr(func, b2.term.retExpr, func.name + ":" + b2.label + "/ret")
+            if ! IsOk[bool](rres):
+                return rres
+        if b2.term.kind == mtCbr && b2.term.condExpr != nil:
+            let cres: Result[bool] = mirValidateExpr(func, b2.term.condExpr, func.name + ":" + b2.label + "/cbr.cond")
+            if ! IsOk[bool](cres):
+                return cres
+        bi = bi + 1
+
+    # Object locals should be backed by i64 pointer slots.
+    var oi: int32 = 0
+    while oi < func.objLocals.len:
+        let ol2: MirObjLocal = get[MirObjLocal](func.objLocals, oi)
+        if ol2.slot < 0 || ol2.slot >= func.localTypes.len:
+            return Err[bool]("mir_validate: obj local slot out of range (" + func.name + ")")
+        if func.localTypes.len > 0:
+            let slotTy: MirType = get[MirType](func.localTypes, ol2.slot)
+            if slotTy.kind != mtI64:
+                let tk: str = (ol2.typeKey != nil) ? ol2.typeKey : ""
+                return Err[bool]("mir_validate: obj local slot not i64 (" + func.name +
+                                 " slot=" + intToStr(ol2.slot) +
+                                 " ty=" + mirTypeKindName(slotTy) +
+                                 " obj=" + ol2.objTypeName +
+                                 " typeKey=" + tk +
+                                 " frameOff=" + intToStr(ol2.frameOff) + ")")
+        if ol2.objTypeName == nil || len(ol2.objTypeName) == 0:
+            return Err[bool]("mir_validate: obj local missing objTypeName (" + func.name + ")")
+        if module != nil && ! mirHasObjType(module, ol2.objTypeName):
+            return Err[bool]("mir_validate: obj local objType not found (" + func.name + ":" + ol2.objTypeName + ")")
+        oi = oi + 1
+
+    return Ok[bool](true)
+
+fn mirValidateModule(module: MirModule): Result[bool] =
+    if module == nil:
+        return Err[bool]("mir_validate: nil module")
+    var oi: int32 = 0
+    while oi < module.objTypes.len:
+        let ot: MirObjType = get[MirObjType](module.objTypes, oi)
+        let ores: Result[bool] = mirValidateObjType(ot)
+        if ! IsOk[bool](ores):
+            return ores
+        oi = oi + 1
+    var fi: int32 = 0
+    while fi < module.funcs.len:
+        let f: MirFunc = get[MirFunc](module.funcs, fi)
+        let fres: Result[bool] = mirValidateFunc(module, f)
+        if ! IsOk[bool](fres):
+            return fres
+        fi = fi + 1
+    return Ok[bool](true)

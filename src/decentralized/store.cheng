@@ -1,0 +1,71 @@
+import std/os
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/file_bytes as fbytes
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import std/strings
+
+type
+    StoreConfig =
+        root: str
+        blocksDir: str
+
+fn ensureDir(path: str) =
+    if path == nil || len(path) == 0:
+        return
+    if os.dirExists(path):
+        return
+    os.createDir(path)
+
+fn initStore(root: str): StoreConfig =
+    let abs = os.absolutePath(root)
+    let blocks = os.joinPath(abs, "blocks")
+    ensureDir(abs)
+    ensureDir(blocks)
+    StoreConfig(root: abs, blocksDir: blocks)
+
+fn blockPath(store: StoreConfig, cidText: str): str =
+    return os.joinPath(store.blocksDir, cidText)
+
+fn putBytes(store: StoreConfig, data: bytes.Bytes): result.Result[dcid.Cid] =
+    let idRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+    if result.IsErr(idRes):
+        return result.Err[dcid.Cid](result.Error(idRes))
+    let id: dcid.Cid = result.Value(idRes)
+    let cidStr = dcid.cidText(id)
+    if cidStr == nil || len(cidStr) == 0:
+        return result.Err[dcid.Cid]("cid: encode failed")
+    let outPath = blockPath(store, cidStr)
+    let writeRes: result.Result[bool] = fbytes.writeFileBytes(outPath, data)
+    if result.IsErr(writeRes):
+        return result.Err[dcid.Cid](result.Error(writeRes))
+    return result.Ok[dcid.Cid](id)
+
+fn putContent(store: StoreConfig, content: str): result.Result[dcid.Cid] =
+    let data = bytes.bytesFromString(content)
+    return putBytes(store, data)
+
+fn putFile(store: StoreConfig, path: str): result.Result[dcid.Cid] =
+    let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+    if result.IsErr(dataRes):
+        return result.Err[dcid.Cid](result.Error(dataRes))
+    return putBytes(store, result.Value(dataRes))
+
+fn getBytes(store: StoreConfig, cidText: str): result.Result[bytes.Bytes] =
+    let path = blockPath(store, cidText)
+    if ! os.fileExists(path):
+        return result.Err[bytes.Bytes]("store: missing block")
+    return fbytes.readFileBytes(path)
+
+fn getContent(store: StoreConfig, cidText: str): str =
+    let dataRes: result.Result[bytes.Bytes] = getBytes(store, cidText)
+    if result.IsErr(dataRes):
+        return ""
+    return bytes.bytesToString(result.Value(dataRes))
+
+fn getToFile(store: StoreConfig, cidText: str, outPath: str): bool =
+    let dataRes: result.Result[bytes.Bytes] = getBytes(store, cidText)
+    if result.IsErr(dataRes):
+        return false
+    let writeRes: result.Result[bool] = fbytes.writeFileBytes(outPath, result.Value(dataRes))
+    return result.IsOk(writeRes)

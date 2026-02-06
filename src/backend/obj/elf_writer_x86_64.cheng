@@ -1,0 +1,1053 @@
+# ELF64 relocatable (.o) writer for x86_64 (MVP subset).
+import std/seqs
+import std/strings
+import std/result
+import cheng/backend/lir/lir_types
+import cheng/backend/obj/obj_buf
+
+type
+    ElfX64Reloc = ref
+        off: uint64
+        sym: str
+        rtype: uint32
+        addend: int64
+
+    ElfX64Sym = ref
+        name: str
+        bind: uint8
+        stType: uint8
+        shndx: uint16
+        value: uint64
+        size: uint64
+        nameOff: uint32
+
+    ElfX64TextFixup = ref
+        dispOff: int32
+        nextOff: int32
+        label: str
+
+const
+    ELFCLASS64: uint8 = 2
+    ELFDATA2LSB: uint8 = 1
+    EV_CURRENT: uint32 = 1
+    ET_REL: uint16 = 1
+    EM_X86_64: uint16 = 62
+
+    SHT_NULL: uint32 = 0
+    SHT_PROGBITS: uint32 = 1
+    SHT_SYMTAB: uint32 = 2
+    SHT_STRTAB: uint32 = 3
+    SHT_RELA: uint32 = 4
+    SHT_NOBITS: uint32 = 8
+
+    SHF_WRITE: uint64 = 0x1
+    SHF_ALLOC: uint64 = 0x2
+    SHF_EXECINSTR: uint64 = 0x4
+
+    STB_LOCAL: uint8 = 0
+    STB_GLOBAL: uint8 = 1
+
+    STT_NOTYPE: uint8 = 0
+    STT_OBJECT: uint8 = 1
+    STT_FUNC: uint8 = 2
+    STT_SECTION: uint8 = 3
+
+    # x86_64 relocation types (ELF)
+    R_X86_64_PC32: uint32 = 2
+    R_X86_64_PLT32: uint32 = 4
+
+fn elfx64_findLabelOff(labels: seq[str], offs: seq[int32], label: str): Result[int32] =
+    var i: int32 = 0
+    while i < labels.len && i < offs.len:
+        if streq(get[str](labels, i), label):
+            return Ok[int32](get[int32](offs, i))
+        i = i + 1
+    return Err[int32]("elf_writer_x86_64: missing label: " + label)
+
+fn elfx64_strContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    var i: int32 = 0
+    while i <= n - m:
+        var j: int32 = 0
+        while j < m && charAt(hay, i + j) == charAt(needle, j):
+            j = j + 1
+        if j == m:
+            return true
+        i = i + 1
+    return false
+
+fn elfx64_targetIsDarwin(target: str): bool =
+    if target == nil || len(target) == 0:
+        return true
+    return elfx64_strContains(target, "apple") || elfx64_strContains(target, "darwin") || elfx64_strContains(target, "ios")
+
+fn elfx64_strCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    var i: int32 = 0
+    while i < n:
+        let ca: int32 = int32(int64(charAt(a, i)) & int64(0xFF))
+        let cb: int32 = int32(int64(charAt(b, i)) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+        i = i + 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn elfx64_seqContainsStr(items: seq[str], value: str): bool =
+    var i: int32 = 0
+    while i < items.len:
+        if streq(get[str](items, i), value):
+            return true
+        i = i + 1
+    return false
+
+fn elfx64_seqAddUniqueStr(items: seq[str]*, value: str) =
+    if items == nil || value == nil || len(value) == 0:
+        return
+    if elfx64_seqContainsStr(*items, value):
+        return
+    addPtr[str](items, value)
+
+fn elfx64_sortStringsStable(items: seq[str]*) =
+    if items == nil:
+        return
+    var i: int32 = 1
+    while i < items->len:
+        let key: str = get[str](*items, i)
+        var j: int32 = i - 1
+        while j >= 0 && elfx64_strCmp(get[str](*items, j), key) > 0:
+            setPtr[str](items, j + 1, get[str](*items, j))
+            j = j - 1
+        setPtr[str](items, j + 1, key)
+        i = i + 1
+
+fn elfx64_alignUp(value: uint64, align: uint64): uint64 =
+    if align == 0:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn elfx64WriteShdr(out: seq[uint8]*, nameOff: uint32, shType: uint32, flags: uint64,
+                   shOffset: uint64, shSize: uint64, link: uint32, info: uint32,
+                   addralign: uint64, entsize: uint64) =
+    if out == nil:
+        return
+    bufU32(out, nameOff)
+    bufU32(out, shType)
+    bufU64(out, flags)
+    bufU64(out, uint64(0)) # sh_addr
+    bufU64(out, shOffset)
+    bufU64(out, shSize)
+    bufU32(out, link)
+    bufU32(out, info)
+    bufU64(out, addralign)
+    bufU64(out, entsize)
+
+fn elfx64AddSectionSym(outSyms: seq[ElfX64Sym]*, shndx: uint16) =
+    var s: ElfX64Sym
+    new s
+    s.name = ""
+    s.bind = STB_LOCAL
+    s.stType = STT_SECTION
+    s.shndx = shndx
+    s.value = 0
+    s.size = 0
+    s.nameOff = 0
+    addPtr[ElfX64Sym](outSyms, s)
+
+fn elfx64AddSym(outSyms: seq[ElfX64Sym]*, name: str, bind: uint8, stType: uint8,
+                shndx: uint16, value: uint64, size: uint64) =
+    var s: ElfX64Sym
+    new s
+    s.name = name
+    s.bind = bind
+    s.stType = stType
+    s.shndx = shndx
+    s.value = value
+    s.size = size
+    s.nameOff = 0
+    addPtr[ElfX64Sym](outSyms, s)
+
+fn elfx64FindSymIndex(syms: seq[ElfX64Sym], name: str): int32 =
+    if name == nil:
+        return -1
+    var i: int32 = 0
+    while i < syms.len:
+        let s: ElfX64Sym = get[ElfX64Sym](syms, i)
+        if s != nil && streq(s.name, name):
+            return i
+        i = i + 1
+    return -1
+
+fn x64Is64(reg: LirReg): bool =
+    case reg
+    of lrRax, lrRcx, lrRdx, lrRbx, lrRsi, lrRdi, lrRbp:
+        return true
+    of lrR8, lrR9, lrR10, lrR11, lrR12, lrR13, lrR14, lrR15:
+        return true
+    of lrSp:
+        return true
+    else:
+        return false
+
+fn x64XmmCode(reg: LirReg): int32 =
+    case reg
+    of lrD0: return 0
+    of lrD1: return 1
+    else: return -1
+
+fn x64RegCode(reg: LirReg): int32 =
+    case reg
+    of lrRax, lrEax: return 0
+    of lrRcx, lrEcx: return 1
+    of lrRdx, lrEdx: return 2
+    of lrRbx, lrEbx: return 3
+    of lrSp: return 4
+    of lrRbp: return 5
+    of lrRsi, lrEsi: return 6
+    of lrRdi, lrEdi: return 7
+    of lrR8, lrR8d: return 8
+    of lrR9, lrR9d: return 9
+    of lrR10, lrR10d: return 10
+    of lrR11, lrR11d: return 11
+    of lrR12, lrR12d: return 12
+    of lrR13, lrR13d: return 13
+    of lrR14, lrR14d: return 14
+    of lrR15, lrR15d: return 15
+    else:
+        return -1
+
+fn x64ModRM(mod: int32, reg: int32, rm: int32): uint8 =
+    return uint8(((mod & 3) << 6) | ((reg & 7) << 3) | (rm & 7))
+
+fn x64SIB(scale: int32, index: int32, base: int32): uint8 =
+    return uint8(((scale & 3) << 6) | ((index & 7) << 3) | (base & 7))
+
+fn x64EmitRex(out: seq[uint8]*, w: bool, rBit: bool, xBit: bool, bBit: bool, force: bool) =
+    let need: bool = force || w || rBit || xBit || bBit
+    if !need:
+        return
+    let wb: uint8 = w ? uint8(8) : uint8(0)
+    let rb: uint8 = rBit ? uint8(4) : uint8(0)
+    let xb: uint8 = xBit ? uint8(2) : uint8(0)
+    let bb: uint8 = bBit ? uint8(1) : uint8(0)
+    bufU8(out, uint8(0x40) | wb | rb | xb | bb)
+
+fn x64EmitImm32(out: seq[uint8]*, imm: int64) =
+    bufU32(out, uint32(int32(imm)))
+
+fn x64EmitImm64(out: seq[uint8]*, imm: int64) =
+    bufU64(out, uint64(imm))
+
+fn x64EmitMovRegReg(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in mov"
+    let rBit: bool = (src >> 3) != 0
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x89))
+    bufU8(out, x64ModRM(3, src, dst))
+
+fn x64EmitMovXmmXmm(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # movapd rd, rn
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64XmmCode(rn)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid xmm reg in mov"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, false, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x28))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitMovqXmmReg(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # movq rd(xmm), rn(gpr)
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in movq xmm, gpr"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, true, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x6E))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitMovqRegXmm(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # movq rd(gpr), rn(xmm)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64XmmCode(rn)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in movq gpr, xmm"
+    let rBit: bool = (src >> 3) != 0
+    let bBit: bool = (dst >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, true, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x7E))
+    bufU8(out, x64ModRM(3, src, dst))
+
+fn x64EmitMovImm(out: seq[uint8]*, rd: LirReg, imm: int64) =
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    if dst < 0:
+        panic "elf_writer_x86_64: invalid reg in mov imm"
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, false, false, bBit, false)
+    bufU8(out, uint8(0xB8 + (dst & 7)))
+    if is64:
+        x64EmitImm64(out, imm)
+    else:
+        x64EmitImm32(out, imm)
+
+fn x64EmitBinRR(out: seq[uint8]*, opcode: uint8, rd: LirReg, rn: LirReg, rm: LirReg) =
+    if rd != rn:
+        x64EmitMovRegReg(out, rd, rn)
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rm)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in bin op"
+    let rBit: bool = (src >> 3) != 0
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, opcode)
+    bufU8(out, x64ModRM(3, src, dst))
+
+fn x64EmitFbinD(out: seq[uint8]*, opcode: uint8, rd: LirReg, rn: LirReg, rm: LirReg) =
+    # addsd/subsd/mulsd/divsd: F2 0F <opcode> /r
+    if rd != rn:
+        x64EmitMovXmmXmm(out, rd, rn)
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64XmmCode(rm)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid xmm reg in fbin"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0xF2))
+    x64EmitRex(out, false, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, opcode)
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitScvtfDx(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    # cvtsi2sd rd(xmm), rn(gpr)
+    let dst: int32 = x64XmmCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in scvtf"
+    let is64: bool = x64Is64(rn)
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    bufU8(out, uint8(0xF2))
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x2A))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitFcmpD(out: seq[uint8]*, rn: LirReg, rm: LirReg) =
+    # ucomisd rn(xmm), rm(xmm)
+    let left: int32 = x64XmmCode(rn)
+    let right: int32 = x64XmmCode(rm)
+    if left < 0 || right < 0:
+        panic "elf_writer_x86_64: invalid xmm reg in fcmp"
+    let rBit: bool = (left >> 3) != 0
+    let bBit: bool = (right >> 3) != 0
+    bufU8(out, uint8(0x66))
+    x64EmitRex(out, false, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x2E))
+    bufU8(out, x64ModRM(3, left, right))
+
+fn x64EmitCmpRR(out: seq[uint8]*, rn: LirReg, rm: LirReg) =
+    let is64: bool = x64Is64(rn)
+    let reg: int32 = x64RegCode(rn)
+    let src: int32 = x64RegCode(rm)
+    if reg < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in cmp"
+    let rBit: bool = (src >> 3) != 0
+    let bBit: bool = (reg >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x39))
+    bufU8(out, x64ModRM(3, src, reg))
+
+fn x64EmitShift(out: seq[uint8]*, subop: int32, rd: LirReg, rn: LirReg) =
+    if rd != rn:
+        x64EmitMovRegReg(out, rd, rn)
+    # shl/shr/sar r/m, cl : D3 /subop
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    if dst < 0:
+        panic "elf_writer_x86_64: invalid reg in shift"
+    let bBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, false, false, bBit, false)
+    bufU8(out, uint8(0xD3))
+    bufU8(out, x64ModRM(3, subop, dst))
+
+fn x64EmitLeaRipRel32(out: seq[uint8]*, rd: LirReg) =
+    # lea r64/r32, [rip+disp32]
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    if dst < 0:
+        panic "elf_writer_x86_64: invalid reg in lea"
+    let rBit: bool = (dst >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, false, false)
+    bufU8(out, uint8(0x8D))
+    bufU8(out, x64ModRM(0, dst, 5)) # rm=101 => RIP-relative disp32
+    x64EmitImm32(out, 0)
+
+fn x64EmitCallRel32(out: seq[uint8]*) =
+    bufU8(out, uint8(0xE8))
+    x64EmitImm32(out, 0)
+
+fn x64EmitCallReg(out: seq[uint8]*, reg: LirReg) =
+    let rc: int32 = x64RegCode(reg)
+    if rc < 0:
+        panic "elf_writer_x86_64: invalid reg in call reg"
+    let bBit: bool = (rc >> 3) != 0
+    x64EmitRex(out, true, false, false, bBit, false)
+    bufU8(out, uint8(0xFF))
+    bufU8(out, x64ModRM(3, 2, rc)) # /2 call r/m64
+
+fn x64EmitJmpRel32(out: seq[uint8]*) =
+    bufU8(out, uint8(0xE9))
+    x64EmitImm32(out, 0)
+
+fn x64EmitJccRel32(out: seq[uint8]*, cc: uint8) =
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0x80) | cc)
+    x64EmitImm32(out, 0)
+
+fn x64EmitSubRspImm32(out: seq[uint8]*, imm: int64) =
+    # sub rsp, imm32: 48 81 EC imm32
+    x64EmitRex(out, true, false, false, false, false)
+    bufU8(out, uint8(0x81))
+    bufU8(out, x64ModRM(3, 5, 4)) # /5, rsp
+    x64EmitImm32(out, imm)
+
+fn x64EmitAddRspImm32(out: seq[uint8]*, imm: int64) =
+    # add rsp, imm32: 48 81 C4 imm32
+    x64EmitRex(out, true, false, false, false, false)
+    bufU8(out, uint8(0x81))
+    bufU8(out, x64ModRM(3, 0, 4)) # /0, rsp
+    x64EmitImm32(out, imm)
+
+fn x64EmitMovsxd(out: seq[uint8]*, rd: LirReg, rn: LirReg) =
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rn)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in movsxd"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    x64EmitRex(out, true, rBit, false, bBit, false)
+    bufU8(out, uint8(0x63))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitImul(out: seq[uint8]*, rd: LirReg, rn: LirReg, rm: LirReg) =
+    if rd != rn:
+        x64EmitMovRegReg(out, rd, rn)
+    let is64: bool = x64Is64(rd)
+    let dst: int32 = x64RegCode(rd)
+    let src: int32 = x64RegCode(rm)
+    if dst < 0 || src < 0:
+        panic "elf_writer_x86_64: invalid reg in imul"
+    let rBit: bool = (dst >> 3) != 0
+    let bBit: bool = (src >> 3) != 0
+    x64EmitRex(out, is64, rBit, false, bBit, false)
+    bufU8(out, uint8(0x0F))
+    bufU8(out, uint8(0xAF))
+    bufU8(out, x64ModRM(3, dst, src))
+
+fn x64EmitXorEdxEdx(out: seq[uint8]*) =
+    bufU8(out, uint8(0x31))
+    bufU8(out, uint8(0xD2))
+
+fn x64EmitCdq(out: seq[uint8]*) =
+    bufU8(out, uint8(0x99))
+
+fn x64EmitCqo(out: seq[uint8]*) =
+    x64EmitRex(out, true, false, false, false, false)
+    bufU8(out, uint8(0x99))
+
+fn x64EmitDiv(out: seq[uint8]*, isSigned: bool, is64: bool, rm: LirReg) =
+    let src: int32 = x64RegCode(rm)
+    if src < 0:
+        panic "elf_writer_x86_64: invalid reg in div"
+    let bBit: bool = (src >> 3) != 0
+    x64EmitRex(out, is64, false, false, bBit, false)
+    bufU8(out, uint8(0xF7))
+    bufU8(out, x64ModRM(3, isSigned ? 7 : 6, src))
+
+fn x64EmitMemDisp32(out: seq[uint8]*, opcode1: uint8, opcode2: uint8,
+                    w: bool, regField: int32, base: int32, disp: int64,
+                    needs0F: bool, hasOp2: bool, forceRex: bool,
+                    prefix66: bool) =
+    if prefix66:
+        bufU8(out, uint8(0x66))
+    let rBit: bool = (regField >> 3) != 0
+    let bBit: bool = (base >> 3) != 0
+    x64EmitRex(out, w, rBit, false, bBit, forceRex)
+    if needs0F:
+        bufU8(out, uint8(0x0F))
+    bufU8(out, opcode1)
+    if hasOp2:
+        bufU8(out, opcode2)
+    let baseLow: int32 = base & 7
+    if baseLow == 4:
+        bufU8(out, x64ModRM(2, regField, 4))
+        bufU8(out, x64SIB(0, 4, baseLow))
+        x64EmitImm32(out, disp)
+        return
+    bufU8(out, x64ModRM(2, regField, baseLow))
+    x64EmitImm32(out, disp)
+
+fn x64EmitStore(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let is64: bool = x64Is64(rd)
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "elf_writer_x86_64: invalid reg in store"
+    x64EmitMemDisp32(out, uint8(0x89), uint8(0), is64, reg, baseCode, offset,
+                     false, false, false, false)
+
+fn x64EmitLoad(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let is64: bool = x64Is64(rd)
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "elf_writer_x86_64: invalid reg in load"
+    x64EmitMemDisp32(out, uint8(0x8B), uint8(0), is64, reg, baseCode, offset,
+                     false, false, false, false)
+
+fn x64EmitStore8(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "elf_writer_x86_64: invalid reg in store8"
+    let forceRex: bool = (reg & 7) >= 4
+    x64EmitMemDisp32(out, uint8(0x88), uint8(0), false, reg, baseCode, offset,
+                     false, false, forceRex, false)
+
+fn x64EmitLoad8(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64, isSigned: bool) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "elf_writer_x86_64: invalid reg in load8"
+    let op: uint8 = isSigned ? uint8(0xBE) : uint8(0xB6)
+    x64EmitMemDisp32(out, op, uint8(0), false, reg, baseCode, offset,
+                     true, false, false, false)
+
+fn x64EmitStore16(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "elf_writer_x86_64: invalid reg in store16"
+    x64EmitMemDisp32(out, uint8(0x89), uint8(0), false, reg, baseCode, offset,
+                     false, false, false, true)
+
+fn x64EmitLoad16(out: seq[uint8]*, rd: LirReg, base: LirReg, offset: int64, isSigned: bool) =
+    let reg: int32 = x64RegCode(rd)
+    let baseCode: int32 = (base == lrSp) ? 4 : x64RegCode(base)
+    if reg < 0 || baseCode < 0:
+        panic "elf_writer_x86_64: invalid reg in load16"
+    let op: uint8 = isSigned ? uint8(0xBF) : uint8(0xB7)
+    x64EmitMemDisp32(out, op, uint8(0), false, reg, baseCode, offset,
+                     true, false, false, false)
+
+fn x64JccCode(cond: LirCond): uint8 =
+    case cond
+    of lcEq: return uint8(0x4) # E
+    of lcNe: return uint8(0x5) # NE
+    of lcLt: return uint8(0xC) # L (signed)
+    of lcLe: return uint8(0xE) # LE
+    of lcGt: return uint8(0xF) # G
+    of lcGe: return uint8(0xD) # GE
+    of lcLo: return uint8(0x2) # B/NAE (unsigned <)
+    of lcLs: return uint8(0x6) # BE/NA (unsigned <=)
+    of lcHi: return uint8(0x7) # A/NBE (unsigned >)
+    of lcHs: return uint8(0x3) # AE/NB (unsigned >=)
+    else:
+        return uint8(0x5)
+
+fn elfx64Build(module: LirModule): Result[seq[uint8]] =
+    if module == nil:
+        return Err[seq[uint8]]("elf_writer_x86_64: nil module")
+    if elfx64_targetIsDarwin(module.target):
+        return Err[seq[uint8]]("elf_writer_x86_64: darwin target not supported")
+
+    # Sections (fixed indices):
+    # 0: null
+    # 1: .text
+    # 2: .rodata
+    # 3: .data
+    # 4: .bss
+    # 5: .rela.text
+    # 6: .symtab
+    # 7: .strtab
+    # 8: .shstrtab
+
+    var text: seq[uint8] = newSeq[uint8]()
+    var rodata: seq[uint8] = newSeq[uint8]()
+    var data: seq[uint8] = newSeq[uint8]()
+    var bssSize: uint64 = 0
+
+    # Layout rodata (cstrings).
+    var cSymOffs: seq[uint64] = newSeq[uint64](module.cstrs.len)
+    var ci: int32 = 0
+    while ci < module.cstrs.len:
+        let c: LirCString = get[LirCString](module.cstrs, ci)
+        let off: uint64 = uint64(rodata.len)
+        setPtr[uint64](&cSymOffs, ci, off)
+        bufStr0(&rodata, c.value)
+        ci = ci + 1
+
+    # Layout globals.
+    var dataSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
+    var bssSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
+    var maxDataAlign: uint64 = 1
+    var maxBssAlign: uint64 = 1
+    var gi: int32 = 0
+    while gi < module.globals.len:
+        let g: LirGlobal = get[LirGlobal](module.globals, gi)
+        let align: uint64 = uint64(1) << uint64(g.alignPow2)
+        if g.hasInit:
+            if align > maxDataAlign:
+                maxDataAlign = align
+            bufAlign(&data, align)
+            setPtr[uint64](&dataSymOffs, gi, uint64(data.len))
+            if g.size == 4:
+                bufU32(&data, uint32(int32(g.init)))
+            else:
+                bufU64(&data, uint64(g.init))
+        else:
+            if align > maxBssAlign:
+                maxBssAlign = align
+            bssSize = elfx64_alignUp(bssSize, align)
+            setPtr[uint64](&bssSymOffs, gi, bssSize)
+            bssSize = bssSize + uint64(g.size)
+        gi = gi + 1
+
+    # Encode .text and collect relocations.
+    var relocs: seq[ElfX64Reloc] = newSeq[ElfX64Reloc]()
+    var funcOffs: seq[uint64] = newSeq[uint64](module.funcs.len)
+    var funcSizes: seq[uint64] = newSeq[uint64](module.funcs.len)
+
+    var fi: int32 = 0
+    while fi < module.funcs.len:
+        bufAlign(&text, 4)
+        let fStart: uint64 = uint64(text.len)
+        setPtr[uint64](&funcOffs, fi, fStart)
+        let f: LirFunc = get[LirFunc](module.funcs, fi)
+
+        var labels: seq[str] = newSeqWithCap[str](0, 16)
+        var labelOffs: seq[int32] = newSeqWithCap[int32](0, 16)
+        var fixups: seq[ElfX64TextFixup] = newSeqWithCap[ElfX64TextFixup](0, 16)
+
+        var ii: int32 = 0
+        while ii < f.insts.len:
+            let inst: LirInst = get[LirInst](f.insts, ii)
+            if inst.op == loLabel:
+                addPtr[str](&labels, inst.label)
+                addPtr[int32](&labelOffs, int32(text.len))
+                ii = ii + 1
+                continue
+            let instStart: int32 = int32(text.len)
+            case inst.op
+            of loSubSp:
+                x64EmitSubRspImm32(&text, inst.imm)
+            of loAddSp:
+                x64EmitAddRspImm32(&text, inst.imm)
+            of loMovReg:
+                x64EmitMovRegReg(&text, inst.rd, inst.rn)
+            of loMovImm:
+                x64EmitMovImm(&text, inst.rd, inst.imm)
+            of loAdrp:
+                x64EmitLeaRipRel32(&text, inst.rd)
+                var r: ElfX64Reloc
+                new r
+                r.off = uint64(instStart + 3)
+                r.sym = inst.label
+                r.rtype = R_X86_64_PC32
+                r.addend = -4
+                addPtr[ElfX64Reloc](&relocs, r)
+            of loSxtw:
+                x64EmitMovsxd(&text, inst.rd, inst.rn)
+            of loAdd:
+                x64EmitBinRR(&text, uint8(0x01), inst.rd, inst.rn, inst.rm)
+            of loSub:
+                x64EmitBinRR(&text, uint8(0x29), inst.rd, inst.rn, inst.rm)
+            of loAnd:
+                x64EmitBinRR(&text, uint8(0x21), inst.rd, inst.rn, inst.rm)
+            of loOrr:
+                x64EmitBinRR(&text, uint8(0x09), inst.rd, inst.rn, inst.rm)
+            of loEor:
+                x64EmitBinRR(&text, uint8(0x31), inst.rd, inst.rn, inst.rm)
+            of loLsl:
+                x64EmitShift(&text, 4, inst.rd, inst.rn)
+            of loLsr:
+                x64EmitShift(&text, 5, inst.rd, inst.rn)
+            of loAsr:
+                x64EmitShift(&text, 7, inst.rd, inst.rn)
+            of loMul:
+                x64EmitImul(&text, inst.rd, inst.rn, inst.rm)
+            of loFmovDx:
+                x64EmitMovqXmmReg(&text, inst.rd, inst.rn)
+            of loFmovXd:
+                x64EmitMovqRegXmm(&text, inst.rd, inst.rn)
+            of loFaddD:
+                x64EmitFbinD(&text, uint8(0x58), inst.rd, inst.rn, inst.rm)
+            of loFsubD:
+                x64EmitFbinD(&text, uint8(0x5C), inst.rd, inst.rn, inst.rm)
+            of loFmulD:
+                x64EmitFbinD(&text, uint8(0x59), inst.rd, inst.rn, inst.rm)
+            of loFdivD:
+                x64EmitFbinD(&text, uint8(0x5E), inst.rd, inst.rn, inst.rm)
+            of loScvtfDx:
+                x64EmitScvtfDx(&text, inst.rd, inst.rn)
+            of loFcmpD:
+                x64EmitFcmpD(&text, inst.rn, inst.rm)
+            of loSdiv:
+                let is64: bool = x64Is64(inst.rd)
+                if is64:
+                    x64EmitCqo(&text)
+                else:
+                    x64EmitCdq(&text)
+                x64EmitDiv(&text, true, is64, inst.rm)
+            of loUdiv:
+                let is64u: bool = x64Is64(inst.rd)
+                x64EmitXorEdxEdx(&text)
+                x64EmitDiv(&text, false, is64u, inst.rm)
+            of loCmp:
+                x64EmitCmpRR(&text, inst.rn, inst.rm)
+            of loB:
+                x64EmitJmpRel32(&text)
+                var f0: ElfX64TextFixup
+                new f0
+                f0.dispOff = instStart + 1
+                f0.nextOff = int32(text.len)
+                f0.label = inst.label
+                addPtr[ElfX64TextFixup](&fixups, f0)
+            of loBCond:
+                let cc: uint8 = x64JccCode(inst.cond)
+                x64EmitJccRel32(&text, cc)
+                var f1: ElfX64TextFixup
+                new f1
+                f1.dispOff = instStart + 2
+                f1.nextOff = int32(text.len)
+                f1.label = inst.label
+                addPtr[ElfX64TextFixup](&fixups, f1)
+            of loBl:
+                x64EmitCallRel32(&text)
+                var r2: ElfX64Reloc
+                new r2
+                r2.off = uint64(instStart + 1)
+                r2.sym = inst.label
+                r2.rtype = R_X86_64_PLT32
+                r2.addend = -4
+                addPtr[ElfX64Reloc](&relocs, r2)
+            of loBlr:
+                x64EmitCallReg(&text, inst.rn)
+            of loRet:
+                bufU8(&text, uint8(0xC3))
+            of loStr:
+                x64EmitStore(&text, inst.rd, inst.rn, inst.imm)
+            of loLdr:
+                x64EmitLoad(&text, inst.rd, inst.rn, inst.imm)
+            of loStrb:
+                x64EmitStore8(&text, inst.rd, inst.rn, inst.imm)
+            of loLdrb:
+                x64EmitLoad8(&text, inst.rd, inst.rn, inst.imm, false)
+            of loLdrsb:
+                x64EmitLoad8(&text, inst.rd, inst.rn, inst.imm, true)
+            of loStrh:
+                x64EmitStore16(&text, inst.rd, inst.rn, inst.imm)
+            of loLdrh:
+                x64EmitLoad16(&text, inst.rd, inst.rn, inst.imm, false)
+            of loLdrsh:
+                x64EmitLoad16(&text, inst.rd, inst.rn, inst.imm, true)
+            else:
+                return Err[seq[uint8]]("elf_writer_x86_64: unsupported lir op (op=" + intToStr(int32(inst.op)) + ")")
+            ii = ii + 1
+
+        # Patch local branches.
+        var pi: int32 = 0
+        while pi < fixups.len:
+            let fx: ElfX64TextFixup = get[ElfX64TextFixup](fixups, pi)
+            let tRes: Result[int32] = elfx64_findLabelOff(labels, labelOffs, fx.label)
+            if !IsOk[int32](tRes):
+                return ErrInfo[seq[uint8]](ErrorInfoOf[int32](tRes))
+            let targetOff: int32 = Value[int32](tRes)
+            let disp: int64 = int64(targetOff) - int64(fx.nextOff)
+            if disp < int64(-2147483648) || disp > int64(2147483647):
+                return Err[seq[uint8]]("elf_writer_x86_64: branch displacement out of range")
+            bufU32At(&text, fx.dispOff, uint32(int32(disp)))
+            pi = pi + 1
+
+        let fEnd: uint64 = uint64(text.len)
+        if fEnd >= fStart:
+            setPtr[uint64](&funcSizes, fi, fEnd - fStart)
+        else:
+            setPtr[uint64](&funcSizes, fi, uint64(0))
+
+        fi = fi + 1
+
+    # Symbols: locals, globals, undefs.
+    var syms: seq[ElfX64Sym] = newSeq[ElfX64Sym]()
+    elfx64AddSym(&syms, "", STB_LOCAL, STT_NOTYPE, uint16(0), 0, 0)
+    elfx64AddSectionSym(&syms, uint16(1))
+    elfx64AddSectionSym(&syms, uint16(2))
+    elfx64AddSectionSym(&syms, uint16(3))
+    elfx64AddSectionSym(&syms, uint16(4))
+
+    # locals: cstrings
+    ci = 0
+    while ci < module.cstrs.len:
+        let c2: LirCString = get[LirCString](module.cstrs, ci)
+        elfx64AddSym(&syms, c2.label, STB_LOCAL, STT_OBJECT, uint16(2),
+                     get[uint64](cSymOffs, ci), uint64(len(c2.value) + 1))
+        ci = ci + 1
+
+    # globals: funcs
+    fi = 0
+    while fi < module.funcs.len:
+        let f2: LirFunc = get[LirFunc](module.funcs, fi)
+        elfx64AddSym(&syms, f2.name, STB_GLOBAL, STT_FUNC, uint16(1),
+                     get[uint64](funcOffs, fi), get[uint64](funcSizes, fi))
+        fi = fi + 1
+
+    # globals: data/bss
+    gi = 0
+    while gi < module.globals.len:
+        let g2: LirGlobal = get[LirGlobal](module.globals, gi)
+        if g2.hasInit:
+            elfx64AddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(3),
+                         get[uint64](dataSymOffs, gi), uint64(g2.size))
+        else:
+            elfx64AddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(4),
+                         get[uint64](bssSymOffs, gi), uint64(g2.size))
+        gi = gi + 1
+
+    # undefs from relocations.
+    var undefs: seq[str] = newSeq[str]()
+    var ri: int32 = 0
+    while ri < relocs.len:
+        let r0: ElfX64Reloc = get[ElfX64Reloc](relocs, ri)
+        if elfx64FindSymIndex(syms, r0.sym) < 0:
+            elfx64_seqAddUniqueStr(&undefs, r0.sym)
+        ri = ri + 1
+    elfx64_sortStringsStable(&undefs)
+    ri = 0
+    while ri < undefs.len:
+        elfx64AddSym(&syms, get[str](undefs, ri), STB_GLOBAL, STT_NOTYPE, uint16(0), 0, 0)
+        ri = ri + 1
+
+    # Build .strtab (symbol names) and fill nameOff.
+    var strtab: seq[uint8] = newSeq[uint8]()
+    addPtr[uint8](&strtab, uint8(0))
+    var si: int32 = 0
+    while si < syms.len:
+        let s0: ElfX64Sym = get[ElfX64Sym](syms, si)
+        if s0 != nil && s0.name != nil && len(s0.name) > 0:
+            s0.nameOff = uint32(strtab.len)
+            bufStr0(&strtab, s0.name)
+        else:
+            s0.nameOff = 0
+        setPtr[ElfX64Sym](&syms, si, s0)
+        si = si + 1
+
+    # Count locals for symtab.sh_info (first global index).
+    var localCount: uint32 = 0
+    si = 0
+    while si < syms.len:
+        let s4: ElfX64Sym = get[ElfX64Sym](syms, si)
+        if s4 != nil && s4.bind == STB_LOCAL:
+            localCount = localCount + 1
+        si = si + 1
+
+    # Build .symtab
+    var symtab: seq[uint8] = newSeq[uint8]()
+    si = 0
+    while si < syms.len:
+        let s5: ElfX64Sym = get[ElfX64Sym](syms, si)
+        let info: uint8 = uint8((uint8(s5.bind) << 4) | uint8(s5.stType & uint8(0xF)))
+        bufU32(&symtab, s5.nameOff)
+        bufU8(&symtab, info)
+        bufU8(&symtab, uint8(0))
+        bufU16(&symtab, s5.shndx)
+        bufU64(&symtab, s5.value)
+        bufU64(&symtab, s5.size)
+        si = si + 1
+
+    # Build .rela.text
+    var relaText: seq[uint8] = newSeq[uint8]()
+    ri = 0
+    while ri < relocs.len:
+        let r4: ElfX64Reloc = get[ElfX64Reloc](relocs, ri)
+        let symIdx: int32 = elfx64FindSymIndex(syms, r4.sym)
+        if symIdx < 0:
+            return Err[seq[uint8]]("elf_writer_x86_64: missing relocation symbol")
+        let info2: uint64 = (uint64(uint32(symIdx)) << 32) | uint64(r4.rtype)
+        bufU64(&relaText, r4.off)
+        bufU64(&relaText, info2)
+        bufI64(&relaText, r4.addend)
+        ri = ri + 1
+
+    # Build .shstrtab
+    var shstrtab: seq[uint8] = newSeq[uint8]()
+    addPtr[uint8](&shstrtab, uint8(0))
+    let sh_text: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".text")
+    let sh_rodata: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".rodata")
+    let sh_data: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".data")
+    let sh_bss: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".bss")
+    let sh_rela_text: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".rela.text")
+    let sh_symtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".symtab")
+    let sh_strtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".strtab")
+    let sh_shstrtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".shstrtab")
+
+    # Section offsets.
+    var off: uint64 = 64
+    let textOff: uint64 = elfx64_alignUp(off, 4); off = textOff + uint64(text.len)
+    let rodataOff: uint64 = elfx64_alignUp(off, 1); off = rodataOff + uint64(rodata.len)
+    let dataOff: uint64 = elfx64_alignUp(off, maxDataAlign); off = dataOff + uint64(data.len)
+    let bssOff: uint64 = elfx64_alignUp(off, maxBssAlign)
+    let relaOff: uint64 = elfx64_alignUp(bssOff, 8); off = relaOff + uint64(relaText.len)
+    let symOff: uint64 = elfx64_alignUp(off, 8); off = symOff + uint64(symtab.len)
+    let strOff: uint64 = elfx64_alignUp(off, 1); off = strOff + uint64(strtab.len)
+    let shstrOff: uint64 = elfx64_alignUp(off, 1); off = shstrOff + uint64(shstrtab.len)
+    let shOff: uint64 = elfx64_alignUp(off, 8)
+
+    # Build final file.
+    var out: seq[uint8] = newSeq[uint8]()
+
+    # ELF header (64 bytes).
+    bufU8(&out, uint8(0x7F))
+    bufU8(&out, uint8('E'))
+    bufU8(&out, uint8('L'))
+    bufU8(&out, uint8('F'))
+    bufU8(&out, ELFCLASS64)
+    bufU8(&out, ELFDATA2LSB)
+    bufU8(&out, uint8(1)) # EI_VERSION
+    bufU8(&out, uint8(0)) # EI_OSABI
+    bufU8(&out, uint8(0)) # EI_ABIVERSION
+    var pad: int32 = 0
+    while pad < 7:
+        bufU8(&out, uint8(0))
+        pad = pad + 1
+    bufU16(&out, ET_REL)
+    bufU16(&out, EM_X86_64)
+    bufU32(&out, EV_CURRENT)
+    bufU64(&out, uint64(0)) # e_entry
+    bufU64(&out, uint64(0)) # e_phoff
+    bufU64(&out, shOff)     # e_shoff
+    bufU32(&out, uint32(0)) # e_flags
+    bufU16(&out, uint16(64)) # e_ehsize
+    bufU16(&out, uint16(0))  # e_phentsize
+    bufU16(&out, uint16(0))  # e_phnum
+    bufU16(&out, uint16(64)) # e_shentsize
+    bufU16(&out, uint16(9))  # e_shnum
+    bufU16(&out, uint16(8))  # e_shstrndx
+
+    # Sections data.
+    bufAlign(&out, 4)
+    if uint64(out.len) != textOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.text)")
+    bufBytes(&out, text)
+
+    bufAlign(&out, 1)
+    if uint64(out.len) != rodataOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.rodata)")
+    bufBytes(&out, rodata)
+
+    bufAlign(&out, maxDataAlign)
+    if uint64(out.len) != dataOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.data)")
+    bufBytes(&out, data)
+
+    bufAlign(&out, maxBssAlign)
+    if uint64(out.len) != bssOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.bss)")
+
+    bufAlign(&out, 8)
+    if uint64(out.len) != relaOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.rela.text)")
+    bufBytes(&out, relaText)
+
+    bufAlign(&out, 8)
+    if uint64(out.len) != symOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.symtab)")
+    bufBytes(&out, symtab)
+
+    bufAlign(&out, 1)
+    if uint64(out.len) != strOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.strtab)")
+    bufBytes(&out, strtab)
+
+    bufAlign(&out, 1)
+    if uint64(out.len) != shstrOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (.shstrtab)")
+    bufBytes(&out, shstrtab)
+
+    bufAlign(&out, 8)
+    if uint64(out.len) != shOff:
+        return Err[seq[uint8]]("elf_writer_x86_64: internal offset mismatch (shoff)")
+
+    # [0] null
+    elfx64WriteShdr(&out, uint32(0), SHT_NULL, uint64(0), uint64(0), uint64(0),
+                    uint32(0), uint32(0), uint64(0), uint64(0))
+    # [1] .text
+    elfx64WriteShdr(&out, sh_text, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, textOff, uint64(text.len),
+                    uint32(0), uint32(0), uint64(4), uint64(0))
+    # [2] .rodata
+    elfx64WriteShdr(&out, sh_rodata, SHT_PROGBITS, SHF_ALLOC, rodataOff, uint64(rodata.len),
+                    uint32(0), uint32(0), uint64(1), uint64(0))
+    # [3] .data
+    elfx64WriteShdr(&out, sh_data, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, dataOff, uint64(data.len),
+                    uint32(0), uint32(0), maxDataAlign, uint64(0))
+    # [4] .bss
+    elfx64WriteShdr(&out, sh_bss, SHT_NOBITS, SHF_ALLOC | SHF_WRITE, bssOff, bssSize,
+                    uint32(0), uint32(0), maxBssAlign, uint64(0))
+    # [5] .rela.text (link=symtab, info=.text)
+    elfx64WriteShdr(&out, sh_rela_text, SHT_RELA, uint64(0), relaOff, uint64(relaText.len),
+                    uint32(6), uint32(1), uint64(8), uint64(24))
+    # [6] .symtab (link=strtab, info=local count)
+    elfx64WriteShdr(&out, sh_symtab, SHT_SYMTAB, uint64(0), symOff, uint64(symtab.len),
+                    uint32(7), localCount, uint64(8), uint64(24))
+    # [7] .strtab
+    elfx64WriteShdr(&out, sh_strtab, SHT_STRTAB, uint64(0), strOff, uint64(strtab.len),
+                    uint32(0), uint32(0), uint64(1), uint64(0))
+    # [8] .shstrtab
+    elfx64WriteShdr(&out, sh_shstrtab, SHT_STRTAB, uint64(0), shstrOff, uint64(shstrtab.len),
+                    uint32(0), uint32(0), uint64(1), uint64(0))
+
+    return Ok[seq[uint8]](out)
+
+fn elfWriteX86_64RelocatableObj(module: LirModule): Result[seq[uint8]] =
+    return elfx64Build(module)

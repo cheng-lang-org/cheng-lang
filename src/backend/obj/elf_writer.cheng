@@ -1,0 +1,730 @@
+# ELF64 relocatable (.o) writer for AArch64 (MVP subset).
+import std/seqs
+import std/strings
+import std/result
+import cheng/backend/lir/lir_types
+import cheng/backend/obj/obj_buf
+import cheng/backend/obj/aarch64_enc
+
+type
+    ElfReloc = ref
+        off: uint64
+        sym: str
+        rtype: uint32
+        addend: int64
+
+    ElfSym = ref
+        name: str
+        bind: uint8
+        stType: uint8
+        shndx: uint16
+        value: uint64
+        size: uint64
+        nameOff: uint32
+
+const
+    ELFCLASS64: uint8 = 2
+    ELFDATA2LSB: uint8 = 1
+    EV_CURRENT: uint32 = 1
+    ET_REL: uint16 = 1
+    EM_AARCH64: uint16 = 183
+
+    SHT_NULL: uint32 = 0
+    SHT_PROGBITS: uint32 = 1
+    SHT_SYMTAB: uint32 = 2
+    SHT_STRTAB: uint32 = 3
+    SHT_RELA: uint32 = 4
+    SHT_NOBITS: uint32 = 8
+
+    SHF_WRITE: uint64 = 0x1
+    SHF_ALLOC: uint64 = 0x2
+    SHF_EXECINSTR: uint64 = 0x4
+    STB_LOCAL: uint8 = 0
+    STB_GLOBAL: uint8 = 1
+
+    STT_NOTYPE: uint8 = 0
+    STT_OBJECT: uint8 = 1
+    STT_FUNC: uint8 = 2
+    STT_SECTION: uint8 = 3
+
+    R_AARCH64_ADR_PREL_PG_HI21: uint32 = 275 # 0x113
+    R_AARCH64_ADD_ABS_LO12_NC: uint32 = 277 # 0x115
+    R_AARCH64_CALL26: uint32 = 283 # 0x11b
+
+fn elf_findLabelOff(labels: seq[str], offs: seq[int32], label: str): Result[int32] =
+    var i: int32 = 0
+    while i < labels.len && i < offs.len:
+        if streq(get[str](labels, i), label):
+            return Ok[int32](get[int32](offs, i))
+        i = i + 1
+    return Err[int32]("elf_writer: missing label: " + label)
+
+fn elf_strContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    var i: int32 = 0
+    while i <= n - m:
+        var j: int32 = 0
+        while j < m && charAt(hay, i + j) == charAt(needle, j):
+            j = j + 1
+        if j == m:
+            return true
+        i = i + 1
+    return false
+
+fn elf_targetIsDarwin(target: str): bool =
+    if target == nil || len(target) == 0:
+        return true
+    return elf_strContains(target, "apple") || elf_strContains(target, "darwin") || elf_strContains(target, "ios")
+
+fn elf_strCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    var i: int32 = 0
+    while i < n:
+        let ca: int32 = int32(int64(charAt(a, i)) & int64(0xFF))
+        let cb: int32 = int32(int64(charAt(b, i)) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+        i = i + 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn elf_seqContainsStr(items: seq[str], value: str): bool =
+    var i: int32 = 0
+    while i < items.len:
+        if streq(get[str](items, i), value):
+            return true
+        i = i + 1
+    return false
+
+fn elf_seqAddUniqueStr(items: seq[str]*, value: str) =
+    if items == nil || value == nil || len(value) == 0:
+        return
+    if elf_seqContainsStr(*items, value):
+        return
+    addPtr[str](items, value)
+
+fn elf_sortStringsStable(items: seq[str]*) =
+    if items == nil:
+        return
+    var i: int32 = 1
+    while i < items->len:
+        let key: str = get[str](*items, i)
+        var j: int32 = i - 1
+        while j >= 0 && elf_strCmp(get[str](*items, j), key) > 0:
+            setPtr[str](items, j + 1, get[str](*items, j))
+            j = j - 1
+        setPtr[str](items, j + 1, key)
+        i = i + 1
+
+fn elf_alignUp(value: uint64, align: uint64): uint64 =
+    if align == 0:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn elfWriteShdr(out: seq[uint8]*, nameOff: uint32, shType: uint32, flags: uint64,
+                shOffset: uint64, shSize: uint64, link: uint32, info: uint32,
+                addralign: uint64, entsize: uint64) =
+    if out == nil:
+        return
+    bufU32(out, nameOff)
+    bufU32(out, shType)
+    bufU64(out, flags)
+    bufU64(out, uint64(0)) # sh_addr
+    bufU64(out, shOffset)
+    bufU64(out, shSize)
+    bufU32(out, link)
+    bufU32(out, info)
+    bufU64(out, addralign)
+    bufU64(out, entsize)
+
+fn elfAddSectionSym(outSyms: seq[ElfSym]*, shndx: uint16) =
+    var s: ElfSym
+    new s
+    s.name = ""
+    s.bind = STB_LOCAL
+    s.stType = STT_SECTION
+    s.shndx = shndx
+    s.value = 0
+    s.size = 0
+    s.nameOff = 0
+    addPtr[ElfSym](outSyms, s)
+
+fn elfAddSym(outSyms: seq[ElfSym]*, name: str, bind: uint8, stType: uint8,
+             shndx: uint16, value: uint64, size: uint64) =
+    var s: ElfSym
+    new s
+    s.name = name
+    s.bind = bind
+    s.stType = stType
+    s.shndx = shndx
+    s.value = value
+    s.size = size
+    s.nameOff = 0
+    addPtr[ElfSym](outSyms, s)
+
+fn elfFindSymIndex(syms: seq[ElfSym], name: str): int32 =
+    if name == nil:
+        return -1
+    var i: int32 = 0
+    while i < syms.len:
+        let s: ElfSym = get[ElfSym](syms, i)
+        if s != nil && streq(s.name, name):
+            return i
+        i = i + 1
+    return -1
+
+fn elfBuild(module: LirModule): Result[seq[uint8]] =
+    if module == nil:
+        return Err[seq[uint8]]("elf_writer: nil module")
+    if elf_targetIsDarwin(module.target):
+        return Err[seq[uint8]]("elf_writer: darwin target not supported")
+
+    # Sections (fixed indices):
+    # 0: null
+    # 1: .text
+    # 2: .rodata
+    # 3: .data
+    # 4: .bss
+    # 5: .rela.text
+    # 6: .symtab
+    # 7: .strtab
+    # 8: .shstrtab
+
+    var text: seq[uint8] = newSeq[uint8]()
+    var rodata: seq[uint8] = newSeq[uint8]()
+    var data: seq[uint8] = newSeq[uint8]()
+    var bssSize: uint64 = 0
+
+    # Layout rodata (cstrings).
+    var cSymOffs: seq[uint64] = newSeq[uint64](module.cstrs.len)
+    var ci: int32 = 0
+    while ci < module.cstrs.len:
+        let c: LirCString = get[LirCString](module.cstrs, ci)
+        let off: uint64 = uint64(rodata.len)
+        setPtr[uint64](&cSymOffs, ci, off)
+        bufStr0(&rodata, c.value)
+        ci = ci + 1
+
+    # Layout globals.
+    var dataSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
+    var bssSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
+    var maxDataAlign: uint64 = 1
+    var maxBssAlign: uint64 = 1
+    var gi: int32 = 0
+    while gi < module.globals.len:
+        let g: LirGlobal = get[LirGlobal](module.globals, gi)
+        let align: uint64 = uint64(1) << uint64(g.alignPow2)
+        if g.hasInit:
+            if align > maxDataAlign:
+                maxDataAlign = align
+            bufAlign(&data, align)
+            setPtr[uint64](&dataSymOffs, gi, uint64(data.len))
+            if g.size == 4:
+                bufU32(&data, uint32(int32(g.init)))
+            else:
+                bufU64(&data, uint64(g.init))
+        else:
+            if align > maxBssAlign:
+                maxBssAlign = align
+            bssSize = elf_alignUp(bssSize, align)
+            setPtr[uint64](&bssSymOffs, gi, bssSize)
+            bssSize = bssSize + uint64(g.size)
+        gi = gi + 1
+
+    # Encode .text and collect relocations.
+    var relocs: seq[ElfReloc] = newSeq[ElfReloc]()
+
+    # Track function start offsets.
+    var funcOffs: seq[uint64] = newSeq[uint64](module.funcs.len)
+    var fi: int32 = 0
+    while fi < module.funcs.len:
+        bufAlign(&text, 4)
+        setPtr[uint64](&funcOffs, fi, uint64(text.len))
+        let f: LirFunc = get[LirFunc](module.funcs, fi)
+
+        # Pass 1: compute label offsets within this function (in bytes from func start).
+        var labels: seq[str] = newSeqWithCap[str](0, 16)
+        var labelOffs: seq[int32] = newSeqWithCap[int32](0, 16)
+        var scanOff: int32 = 0
+        var si: int32 = 0
+        while si < f.insts.len:
+            let inst0: LirInst = get[LirInst](f.insts, si)
+            if inst0.op == loLabel:
+                addPtr[str](&labels, inst0.label)
+                addPtr[int32](&labelOffs, scanOff)
+                si = si + 1
+                continue
+            if inst0.op == loMovImm:
+                let wc: int32 = a64MovImmWordCount(a64Is64(inst0.rd), inst0.imm)
+                scanOff = scanOff + (wc * 4)
+            else:
+                scanOff = scanOff + 4
+            si = si + 1
+
+        var ii: int32 = 0
+        var curOff: int32 = 0
+        while ii < f.insts.len:
+            let inst: LirInst = get[LirInst](f.insts, ii)
+            if inst.op == loLabel:
+                ii = ii + 1
+                continue
+            let off: uint64 = uint64(text.len)
+            var word: uint32 = 0
+            if inst.op == loSubSp:
+                if inst.imm < 0 || inst.imm > 4095:
+                    return Err[seq[uint8]]("elf_writer: sub sp immediate out of range")
+                word = a64EncSubImm(true, 31, 31, int32(inst.imm))
+            elif inst.op == loAddSp:
+                if inst.imm < 0 || inst.imm > 4095:
+                    return Err[seq[uint8]]("elf_writer: add sp immediate out of range")
+                word = a64EncAddImm(true, 31, 31, int32(inst.imm))
+            elif inst.op == loMovReg:
+                let is64: bool = a64Is64(inst.rd)
+                word = a64EncAddImm(is64, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
+            elif inst.op == loMovImm:
+                let is64: bool = a64Is64(inst.rd)
+                let rd: int32 = a64RegNum(inst.rd)
+                let v: uint64 = uint64(inst.imm)
+                # Emit movz/movk chain (0..3 halfwords).
+                word = a64EncMovz(is64, rd, int32(v & uint64(0xFFFF)), 0)
+                emitU32LE(&text, word)
+                var hw: int32 = 1
+                while hw < (is64 ? 4 : 2):
+                    let part: uint64 = (v >> uint64(hw * 16)) & uint64(0xFFFF)
+                    if part != 0:
+                        let w2: uint32 = a64EncMovk(is64, rd, int32(part), hw)
+                        emitU32LE(&text, w2)
+                    hw = hw + 1
+                ii = ii + 1
+                curOff = curOff + (a64MovImmWordCount(is64, inst.imm) * 4)
+                continue
+            elif inst.op == loAdrp:
+                word = a64EncAdrp(a64RegNum(inst.rd))
+                var r: ElfReloc
+                new r
+                r.off = off
+                r.sym = inst.label
+                r.rtype = R_AARCH64_ADR_PREL_PG_HI21
+                r.addend = 0
+                addPtr[ElfReloc](&relocs, r)
+            elif inst.op == loAddPageOff:
+                word = a64EncAddImm(true, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
+                var r2: ElfReloc
+                new r2
+                r2.off = off
+                r2.sym = inst.label
+                r2.rtype = R_AARCH64_ADD_ABS_LO12_NC
+                r2.addend = 0
+                addPtr[ElfReloc](&relocs, r2)
+            elif inst.op == loSxtw:
+                word = a64EncSxtw(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == loAdd:
+                let is64a: bool = a64Is64(inst.rd)
+                word = a64EncAddReg(is64a, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loSub:
+                let is64s2: bool = a64Is64(inst.rd)
+                word = a64EncSubReg(is64s2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loMul:
+                let is64m2: bool = a64Is64(inst.rd)
+                word = a64EncMul(is64m2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loSdiv:
+                let is64d: bool = a64Is64(inst.rd)
+                word = a64EncSdiv(is64d, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loUdiv:
+                let is64d2: bool = a64Is64(inst.rd)
+                word = a64EncUdiv(is64d2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loMsub:
+                let is64ms: bool = a64Is64(inst.rd)
+                word = a64EncMsub(is64ms, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm), a64RegNum(inst.ra))
+            elif inst.op == loAnd:
+                let is64l: bool = a64Is64(inst.rd)
+                word = a64EncAndReg(is64l, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loOrr:
+                let is64o: bool = a64Is64(inst.rd)
+                word = a64EncOrrReg(is64o, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loEor:
+                let is64e: bool = a64Is64(inst.rd)
+                word = a64EncEorReg(is64e, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loLsl:
+                let is64sh: bool = a64Is64(inst.rd)
+                word = a64EncLslv(is64sh, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loLsr:
+                let is64sh2: bool = a64Is64(inst.rd)
+                word = a64EncLsrv(is64sh2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loAsr:
+                let is64sh3: bool = a64Is64(inst.rd)
+                word = a64EncAsrv(is64sh3, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loCmp:
+                let is64c: bool = a64Is64(inst.rn)
+                word = a64EncCmpReg(is64c, a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loBCond:
+                let toffRes: Result[int32] = elf_findLabelOff(labels, labelOffs, inst.label)
+                if !IsOk[int32](toffRes):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[int32](toffRes))
+                let targetOff: int32 = Value[int32](toffRes)
+                let deltaBytes: int64 = int64(targetOff - curOff)
+                if deltaBytes % 4 != 0:
+                    return Err[seq[uint8]]("elf_writer: misaligned branch target")
+                let encRes: Result[uint32] = a64EncBCond(deltaBytes / 4, inst.cond)
+                if !IsOk[uint32](encRes):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes))
+                word = Value[uint32](encRes)
+            elif inst.op == loB:
+                let toffRes2: Result[int32] = elf_findLabelOff(labels, labelOffs, inst.label)
+                if !IsOk[int32](toffRes2):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[int32](toffRes2))
+                let targetOff2: int32 = Value[int32](toffRes2)
+                let deltaBytes2: int64 = int64(targetOff2 - curOff)
+                if deltaBytes2 % 4 != 0:
+                    return Err[seq[uint8]]("elf_writer: misaligned branch target")
+                let encRes2: Result[uint32] = a64EncBImm(deltaBytes2 / 4)
+                if !IsOk[uint32](encRes2):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes2))
+                word = Value[uint32](encRes2)
+            elif inst.op == loStr:
+                let is64s: bool = a64Is64(inst.rd)
+                let encRes: Result[uint32] = a64EncStrImm(is64s, a64RegNum(inst.rd),
+                                                          a64RegNum(inst.rn), inst.imm)
+                if ! IsOk[uint32](encRes):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes))
+                word = Value[uint32](encRes)
+            elif inst.op == loLdr:
+                let is64l: bool = a64Is64(inst.rd)
+                let encRes2: Result[uint32] = a64EncLdrImm(is64l, a64RegNum(inst.rd),
+                                                           a64RegNum(inst.rn), inst.imm)
+                if ! IsOk[uint32](encRes2):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes2))
+                word = Value[uint32](encRes2)
+            elif inst.op == loStrb:
+                let encRes3: Result[uint32] = a64EncStrbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes3):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes3))
+                word = Value[uint32](encRes3)
+            elif inst.op == loLdrb:
+                let encRes4: Result[uint32] = a64EncLdrbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes4):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes4))
+                word = Value[uint32](encRes4)
+            elif inst.op == loLdrsb:
+                let encRes5: Result[uint32] = a64EncLdrsbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes5):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes5))
+                word = Value[uint32](encRes5)
+            elif inst.op == loStrh:
+                let encRes6: Result[uint32] = a64EncStrhImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes6):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes6))
+                word = Value[uint32](encRes6)
+            elif inst.op == loLdrh:
+                let encRes7: Result[uint32] = a64EncLdrhImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes7):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes7))
+                word = Value[uint32](encRes7)
+            elif inst.op == loLdrsh:
+                let encRes8: Result[uint32] = a64EncLdrshImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes8):
+                    return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](encRes8))
+                word = Value[uint32](encRes8)
+            elif inst.op == loBl:
+                word = a64EncBl()
+                var r3: ElfReloc
+                new r3
+                r3.off = off
+                r3.sym = inst.label
+                r3.rtype = R_AARCH64_CALL26
+                r3.addend = 0
+                addPtr[ElfReloc](&relocs, r3)
+            elif inst.op == loBlr:
+                word = a64EncBlr(a64RegNum(inst.rn))
+            elif inst.op == loFmovDx:
+                word = a64EncFmovDx(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == loFmovXd:
+                word = a64EncFmovXd(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == loFcmpD:
+                word = a64EncFcmpD(a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loFaddD:
+                word = a64EncFaddD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loFsubD:
+                word = a64EncFsubD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loFmulD:
+                word = a64EncFmulD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loFdivD:
+                word = a64EncFdivD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == loFnegD:
+                word = a64EncFnegD(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == loScvtfDx:
+                word = a64EncScvtfDx(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == loSvc:
+                if inst.imm < 0 || inst.imm > 65535:
+                    return Err[seq[uint8]]("elf_writer: svc immediate out of range")
+                word = a64EncSvc(int32(inst.imm))
+            elif inst.op == loRet:
+                word = a64EncRet()
+            else:
+                return Err[seq[uint8]]("elf_writer: unsupported lir op (op=" + intToStr(int32(inst.op)) + ")")
+            emitU32LE(&text, word)
+            ii = ii + 1
+            curOff = curOff + 4
+        fi = fi + 1
+
+    # Build symbol list.
+    var syms: seq[ElfSym] = newSeq[ElfSym]()
+    # null
+    elfAddSym(&syms, "", STB_LOCAL, STT_NOTYPE, uint16(0), 0, 0)
+    # section symbols
+    elfAddSectionSym(&syms, uint16(1))
+    elfAddSectionSym(&syms, uint16(2))
+    elfAddSectionSym(&syms, uint16(3))
+    elfAddSectionSym(&syms, uint16(4))
+
+    # local rodata symbols
+    ci = 0
+    while ci < module.cstrs.len:
+        let c2: LirCString = get[LirCString](module.cstrs, ci)
+        elfAddSym(&syms, c2.label, STB_LOCAL, STT_OBJECT, uint16(2),
+                  get[uint64](cSymOffs, ci), 0)
+        ci = ci + 1
+
+    # globals: funcs
+    fi = 0
+    while fi < module.funcs.len:
+        let f2: LirFunc = get[LirFunc](module.funcs, fi)
+        elfAddSym(&syms, f2.name, STB_GLOBAL, STT_FUNC, uint16(1),
+                  get[uint64](funcOffs, fi), 0)
+        fi = fi + 1
+
+    # globals: data/bss
+    gi = 0
+    while gi < module.globals.len:
+        let g2: LirGlobal = get[LirGlobal](module.globals, gi)
+        if g2.hasInit:
+            elfAddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(3),
+                      get[uint64](dataSymOffs, gi), uint64(g2.size))
+        else:
+            elfAddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(4),
+                      get[uint64](bssSymOffs, gi), uint64(g2.size))
+        gi = gi + 1
+
+    # undefined symbols referenced by relocations.
+    var undefs: seq[str] = newSeq[str]()
+    var ri: int32 = 0
+    while ri < relocs.len:
+        let r0: ElfReloc = get[ElfReloc](relocs, ri)
+        if r0 != nil && r0.sym != nil && len(r0.sym) > 0:
+            if elfFindSymIndex(syms, r0.sym) < 0:
+                elf_seqAddUniqueStr(&undefs, r0.sym)
+        ri = ri + 1
+    elf_sortStringsStable(&undefs)
+    ri = 0
+    while ri < undefs.len:
+        elfAddSym(&syms, get[str](undefs, ri), STB_GLOBAL, STT_NOTYPE, uint16(0), 0, 0)
+        ri = ri + 1
+
+    # Build .strtab (symbol names) and fill nameOff.
+    var strtab: seq[uint8] = newSeq[uint8]()
+    addPtr[uint8](&strtab, uint8(0))
+    var si: int32 = 0
+    while si < syms.len:
+        let s3: ElfSym = get[ElfSym](syms, si)
+        if s3 != nil && s3.name != nil && len(s3.name) > 0:
+            s3.nameOff = uint32(strtab.len)
+            bufStr0(&strtab, s3.name)
+        else:
+            s3.nameOff = 0
+        setPtr[ElfSym](&syms, si, s3)
+        si = si + 1
+
+    # Count locals for symtab.sh_info (first global index).
+    var localCount: uint32 = 0
+    si = 0
+    while si < syms.len:
+        let s4: ElfSym = get[ElfSym](syms, si)
+        if s4 != nil && s4.bind == STB_LOCAL:
+            localCount = localCount + 1
+        si = si + 1
+
+    # Build .symtab
+    var symtab: seq[uint8] = newSeq[uint8]()
+    si = 0
+    while si < syms.len:
+        let s5: ElfSym = get[ElfSym](syms, si)
+        let info: uint8 = uint8((uint8(s5.bind) << 4) | uint8(s5.stType & uint8(0xF)))
+        bufU32(&symtab, s5.nameOff)
+        bufU8(&symtab, info)
+        bufU8(&symtab, uint8(0))
+        bufU16(&symtab, s5.shndx)
+        bufU64(&symtab, s5.value)
+        bufU64(&symtab, s5.size)
+        si = si + 1
+
+    # Build .rela.text
+    var relaText: seq[uint8] = newSeq[uint8]()
+    ri = 0
+    while ri < relocs.len:
+        let r4: ElfReloc = get[ElfReloc](relocs, ri)
+        let symIdx: int32 = elfFindSymIndex(syms, r4.sym)
+        if symIdx < 0:
+            return Err[seq[uint8]]("elf_writer: missing relocation symbol")
+        let info2: uint64 = (uint64(uint32(symIdx)) << 32) | uint64(r4.rtype)
+        bufU64(&relaText, r4.off)
+        bufU64(&relaText, info2)
+        bufI64(&relaText, r4.addend)
+        ri = ri + 1
+
+    # Build .shstrtab
+    var shstrtab: seq[uint8] = newSeq[uint8]()
+    addPtr[uint8](&shstrtab, uint8(0))
+    let sh_text: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".text")
+    let sh_rodata: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".rodata")
+    let sh_data: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".data")
+    let sh_bss: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".bss")
+    let sh_rela_text: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".rela.text")
+    let sh_symtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".symtab")
+    let sh_strtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".strtab")
+    let sh_shstrtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".shstrtab")
+
+    # Section offsets.
+    var off: uint64 = 64
+    let textOff: uint64 = elf_alignUp(off, 4); off = textOff + uint64(text.len)
+    let rodataOff: uint64 = elf_alignUp(off, 1); off = rodataOff + uint64(rodata.len)
+    let dataOff: uint64 = elf_alignUp(off, maxDataAlign); off = dataOff + uint64(data.len)
+    let bssOff: uint64 = elf_alignUp(off, maxBssAlign)
+    # NOBITS: does not advance file offset.
+    let relaOff: uint64 = elf_alignUp(bssOff, 8); off = relaOff + uint64(relaText.len)
+    let symOff: uint64 = elf_alignUp(off, 8); off = symOff + uint64(symtab.len)
+    let strOff: uint64 = elf_alignUp(off, 1); off = strOff + uint64(strtab.len)
+    let shstrOff: uint64 = elf_alignUp(off, 1); off = shstrOff + uint64(shstrtab.len)
+    let shOff: uint64 = elf_alignUp(off, 8)
+
+    # Build final file.
+    var out: seq[uint8] = newSeq[uint8]()
+
+    # ELF header (64 bytes).
+    bufU8(&out, uint8(0x7F))
+    bufU8(&out, uint8('E'))
+    bufU8(&out, uint8('L'))
+    bufU8(&out, uint8('F'))
+    bufU8(&out, ELFCLASS64)
+    bufU8(&out, ELFDATA2LSB)
+    bufU8(&out, uint8(1)) # EI_VERSION
+    bufU8(&out, uint8(0)) # EI_OSABI
+    bufU8(&out, uint8(0)) # EI_ABIVERSION
+    # padding (7)
+    var pad: int32 = 0
+    while pad < 7:
+        bufU8(&out, uint8(0))
+        pad = pad + 1
+    bufU16(&out, ET_REL)
+    bufU16(&out, EM_AARCH64)
+    bufU32(&out, EV_CURRENT)
+    bufU64(&out, uint64(0)) # e_entry
+    bufU64(&out, uint64(0)) # e_phoff
+    bufU64(&out, shOff)     # e_shoff
+    bufU32(&out, uint32(0)) # e_flags
+    bufU16(&out, uint16(64)) # e_ehsize
+    bufU16(&out, uint16(0))  # e_phentsize
+    bufU16(&out, uint16(0))  # e_phnum
+    bufU16(&out, uint16(64)) # e_shentsize
+    bufU16(&out, uint16(9))  # e_shnum
+    bufU16(&out, uint16(8))  # e_shstrndx
+
+    # Sections data.
+    bufAlign(&out, 4)
+    if uint64(out.len) != textOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.text)")
+    bufBytes(&out, text)
+
+    bufAlign(&out, 1)
+    if uint64(out.len) != rodataOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.rodata)")
+    bufBytes(&out, rodata)
+
+    bufAlign(&out, maxDataAlign)
+    if uint64(out.len) != dataOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.data)")
+    bufBytes(&out, data)
+
+    # .bss: no bytes, but keep alignment point.
+    bufAlign(&out, maxBssAlign)
+    if uint64(out.len) != bssOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.bss)")
+
+    bufAlign(&out, 8)
+    if uint64(out.len) != relaOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.rela.text)")
+    bufBytes(&out, relaText)
+
+    bufAlign(&out, 8)
+    if uint64(out.len) != symOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.symtab)")
+    bufBytes(&out, symtab)
+
+    bufAlign(&out, 1)
+    if uint64(out.len) != strOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.strtab)")
+    bufBytes(&out, strtab)
+
+    bufAlign(&out, 1)
+    if uint64(out.len) != shstrOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.shstrtab)")
+    bufBytes(&out, shstrtab)
+
+    bufAlign(&out, 8)
+    if uint64(out.len) != shOff:
+        return Err[seq[uint8]]("elf_writer: internal offset mismatch (shoff)")
+
+    # [0] null
+    elfWriteShdr(&out, uint32(0), SHT_NULL, uint64(0), uint64(0), uint64(0),
+                 uint32(0), uint32(0), uint64(0), uint64(0))
+    # [1] .text
+    elfWriteShdr(&out, sh_text, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, textOff, uint64(text.len),
+                 uint32(0), uint32(0), uint64(4), uint64(0))
+    # [2] .rodata
+    elfWriteShdr(&out, sh_rodata, SHT_PROGBITS, SHF_ALLOC, rodataOff, uint64(rodata.len),
+                 uint32(0), uint32(0), uint64(1), uint64(0))
+    # [3] .data
+    elfWriteShdr(&out, sh_data, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, dataOff, uint64(data.len),
+                 uint32(0), uint32(0), maxDataAlign, uint64(0))
+    # [4] .bss
+    elfWriteShdr(&out, sh_bss, SHT_NOBITS, SHF_ALLOC | SHF_WRITE, bssOff, bssSize,
+                 uint32(0), uint32(0), maxBssAlign, uint64(0))
+    # [5] .rela.text (link=symtab, info=.text)
+    elfWriteShdr(&out, sh_rela_text, SHT_RELA, uint64(0), relaOff, uint64(relaText.len),
+                 uint32(6), uint32(1), uint64(8), uint64(24))
+    # [6] .symtab (link=strtab, info=local count)
+    elfWriteShdr(&out, sh_symtab, SHT_SYMTAB, uint64(0), symOff, uint64(symtab.len),
+                 uint32(7), localCount, uint64(8), uint64(24))
+    # [7] .strtab
+    elfWriteShdr(&out, sh_strtab, SHT_STRTAB, uint64(0), strOff, uint64(strtab.len),
+                 uint32(0), uint32(0), uint64(1), uint64(0))
+    # [8] .shstrtab
+    elfWriteShdr(&out, sh_shstrtab, SHT_STRTAB, uint64(0), shstrOff, uint64(shstrtab.len),
+                 uint32(0), uint32(0), uint64(1), uint64(0))
+
+    return Ok[seq[uint8]](out)
+
+fn elfWriteAarch64RelocatableObj(module: LirModule): Result[seq[uint8]] =
+    return elfBuild(module)

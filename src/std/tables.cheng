@@ -1,0 +1,401 @@
+import std/seqs
+# Minimal Tables: linear-probing hash table (str(key))
+#
+# Constraints:
+# - Only str(keys) are supported (built-in `__cheng_tables_hashStr`).
+# - To avoid cross-module name conflicts, exported APIs use the `Table*` prefix.
+
+fn __cheng_tables_hashStr(s: str): int32 =
+    # Jenkins one-at-a-time hash (matches early lib/hashes.cheng approach).
+    var h: int32 = 0
+    var i: int32 = 0
+    let n: int32 = c_strlen s
+    while i < n:
+        var p: void* = ptr_add(s, i)
+        var p8: int8* = int8*(p)
+        h = h + int32(*p8)
+        h = h +(h << 10)
+        h = h ^(h >> 6)
+        i = i + 1
+    h = h +(h << 3)
+    h = h ^(h >> 11)
+    h = h +(h << 15)
+    return h
+
+fn __cheng_tables_hashStrHrt(s: str): int32 =
+    var h: int32 = 0
+    var i: int32 = 0
+    let n0: int32 = c_strlen s
+    var n: int32 = n0
+    if n > 256:
+        n = 256
+    @bound 256
+    while i < n:
+        var p: void* = ptr_add(s, i)
+        var p8: int8* = int8*(p)
+        var code: int32 = int32(*p8)
+        h = h + code
+        h = h +(h << 10)
+        h = h ^(h >> 6)
+        i = i + 1
+    h = h +(h << 3)
+    h = h ^(h >> 11)
+    h = h +(h << 15)
+    return h
+
+type
+    __cheng_tables_Entry[V] =
+        key: str
+        val: V
+
+type
+    Table[V] =
+        slots: seq[void*] # __cheng_tables_Entry[V]*
+        len: int32
+type
+    Table_fixed[V, N] =
+        keys: array[str, N]
+        vals: array[V, N]
+        used: array[bool, N]
+        len: int32
+type
+    Table_string = Table[str]
+
+fn __cheng_tables_roundUpPow2(x0: int32): int32 =
+    var x: int32 = x0
+    if x <= 1:
+        return 1
+    x = x - 1
+    x = x |(x >> 1)
+    x = x |(x >> 2)
+    x = x |(x >> 4)
+    x = x |(x >> 8)
+    x = x |(x >> 16)
+    x = x + 1
+    return x
+
+fn __cheng_tables_initSlots(cap0: int32): seq[void*] =
+    var cap: int32 = cap0
+    if cap < 8:
+        cap = 8
+    cap = __cheng_tables_roundUpPow2 cap
+    var slots: seq[void*] = newSeqWithCap[void*](0, cap)
+    slots.len = cap # buffer initialized to nil/0 for deterministic empty-slot checks
+    zeroMem(slots.buffer, cap * 8)
+    return slots
+
+fn __cheng_tables_fixed_cap[V, N](t: Table_fixed[V, N]): int32 =
+    var size64: int64 = sizeof t.keys
+    var elem64: int64 = sizeof str
+    var cap64: int64 = 0
+    if elem64 > 0:
+        cap64 = size64 / elem64
+    return int32(cap64)
+
+fn TableFixedInit[V, N](t: var Table_fixed[V, N]) =
+    t.len = 0
+    zeroMem(void*(&t.used), sizeof t.used)
+
+fn TableFixedLen[V, N](t: Table_fixed[V, N]): int32 =
+    return t.len
+
+fn TableFixedHas[V, N](t: Table_fixed[V, N], key: str): bool =
+    let cap: int32 = __cheng_tables_fixed_cap[V, N] t
+    if cap <= 0:
+        return false
+    var idx: int32 = (__cheng_tables_hashStrHrt key & 0x7fffffff) % cap
+    var probes: int32 = 0
+    @bound N
+    while probes < cap:
+        var offset64: int64 = int64(idx) * sizeof bool
+        var offset32: int32 = int32(offset64)
+        let usedPtr: void* = ptr_add(void*(&t.used), offset32)
+        let used: bool = load[bool] usedPtr
+        if !used:
+            return false
+        offset64 = int64(idx) * sizeof str
+        offset32 = int32(offset64)
+        let keyPtr: void* = ptr_add(void*(&t.keys), offset32)
+        let curKey: str = load[str] keyPtr
+        if c_strcmp(curKey, key) == 0:
+            return true
+        idx = idx + 1
+        if idx >= cap:
+            idx = 0
+        probes = probes + 1
+    return false
+
+fn TableFixedGet[V, N](t: Table_fixed[V, N], key: str): V =
+    let cap: int32 = __cheng_tables_fixed_cap[V, N] t
+    if cap <= 0:
+        return default[V]
+    var idx: int32 = (__cheng_tables_hashStrHrt key & 0x7fffffff) % cap
+    var probes: int32 = 0
+    @bound N
+    while probes < cap:
+        var offset64: int64 = int64(idx) * sizeof bool
+        var offset32: int32 = int32(offset64)
+        let usedPtr: void* = ptr_add(void*(&t.used), offset32)
+        let used: bool = load[bool] usedPtr
+        if !used:
+            return default[V]
+        offset64 = int64(idx) * sizeof str
+        offset32 = int32(offset64)
+        let keyPtr: void* = ptr_add(void*(&t.keys), offset32)
+        let curKey: str = load[str] keyPtr
+        if c_strcmp(curKey, key) == 0:
+            offset64 = int64(idx) * sizeof V
+            offset32 = int32(offset64)
+            let valPtr: void* = ptr_add(void*(&t.vals), offset32)
+            return load[V] valPtr
+        idx = idx + 1
+        if idx >= cap:
+            idx = 0
+        probes = probes + 1
+    return default[V]
+
+fn TableFixedTryPut[V, N](t: var Table_fixed[V, N], key: str, val: V): bool =
+    let cap: int32 = __cheng_tables_fixed_cap[V, N] t
+    if cap <= 0:
+        return false
+    var idx: int32 = (__cheng_tables_hashStrHrt key & 0x7fffffff) % cap
+    var probes: int32 = 0
+    @bound N
+    while probes < cap:
+        var offset64: int64 = int64(idx) * sizeof bool
+        var offset32: int32 = int32(offset64)
+        let usedPtr: void* = ptr_add(void*(&t.used), offset32)
+        let used: bool = load[bool] usedPtr
+        if !used:
+            store[bool](usedPtr, true)
+            offset64 = int64(idx) * sizeof str
+            offset32 = int32(offset64)
+            let keyPtr: void* = ptr_add(void*(&t.keys), offset32)
+            store[str](keyPtr, key)
+            offset64 = int64(idx) * sizeof V
+            offset32 = int32(offset64)
+            let valPtr: void* = ptr_add(void*(&t.vals), offset32)
+            store[V](valPtr, val)
+            t.len = t.len + 1
+            return true
+        offset64 = int64(idx) * sizeof str
+        offset32 = int32(offset64)
+        let keyPtr: void* = ptr_add(void*(&t.keys), offset32)
+        let curKey: str = load[str] keyPtr
+        if c_strcmp(curKey, key) == 0:
+            offset64 = int64(idx) * sizeof V
+            offset32 = int32(offset64)
+            let valPtr: void* = ptr_add(void*(&t.vals), offset32)
+            store[V](valPtr, val)
+            return true
+        idx = idx + 1
+        if idx >= cap:
+            idx = 0
+        probes = probes + 1
+    return false
+
+fn __cheng_tables_slotPtr(slots: seq[void*]*, idx: int32): void* =
+    var idx64: int64 = int64(idx)
+    var off64: int64 = idx64 * 8
+    var off32: int32 = int32(off64)
+    var p: void* = ptr_add(slots->buffer, off32)
+    return p
+
+fn __cheng_tables_slotLoad(slots: seq[void*]*, idx: int32): void* =
+    let p: void* = __cheng_tables_slotPtr(slots, idx)
+    return load_ptr p
+
+fn __cheng_tables_slotStore(slots: seq[void*]*, idx: int32, val: void*) =
+    let p: void* = __cheng_tables_slotPtr(slots, idx)
+    store_ptr(p, val)
+
+fn __cheng_tables_grow[V](t: var Table[V]) =
+    let oldSlots: seq[void*] = t.slots
+    let oldCap: int32 = oldSlots.len
+    if oldCap <= 0:
+        t.slots = __cheng_tables_initSlots 64
+        t.len = 0
+        return
+    let growCap: int32 = oldCap * 2
+    var newSlots: seq[void*] = __cheng_tables_initSlots growCap
+    let newCap: int32 = newSlots.len
+    var i: int32 = 0
+    while i < oldCap:
+        let ep: void* = __cheng_tables_slotLoad(&oldSlots, i)
+        if ep != nil:
+            let e: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(ep)
+            let keyHash: int32 = __cheng_tables_hashStr e->key
+            var idx: int32 =(keyHash & 0x7fffffff) % newCap
+            while true:
+                if __cheng_tables_slotLoad(&newSlots, idx) == nil:
+                    __cheng_tables_slotStore(&newSlots, idx, ep)
+                    break
+                idx = idx + 1
+                if idx >= newCap:
+                    idx = 0
+        i = i + 1
+    dealloc oldSlots.buffer
+    t.slots = newSlots
+
+fn TableInit[V](initialCap: int32 = 64): Table[V] =
+    var t: Table[V]
+    t.slots = __cheng_tables_initSlots initialCap
+    t.len = 0
+    return t
+
+fn TableLen[V](t: Table[V]): int32 =
+    return t.len
+
+fn TableHas[V](t: Table[V], key: str): bool =
+    let cap: int32 = t.slots.len
+    if cap <= 0:
+        return false
+    var idx: int32 =(__cheng_tables_hashStr key & 0x7fffffff) % cap
+    let start: int32 = idx
+    while true:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, idx)
+        if ep == nil:
+            return false
+        let e: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(ep)
+        if c_strcmp(e->key, key) == 0:
+            return true
+        idx = idx + 1
+        if idx >= cap:
+            idx = 0
+        if idx == start:
+            return false
+
+fn TableGet[V](t: Table[V], key: str): V =
+    let cap: int32 = t.slots.len
+    if cap <= 0:
+        return default[V]
+    var idx: int32 =(__cheng_tables_hashStr key & 0x7fffffff) % cap
+    let start: int32 = idx
+    while true:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, idx)
+        if ep == nil:
+            return default[V]
+        let e: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(ep)
+        if c_strcmp(e->key, key) == 0:
+            return e->val
+        idx = idx + 1
+        if idx >= cap:
+            idx = 0
+        if idx == start:
+            return default[V]
+
+fn TableNext[V](t: Table[V], idx: int32*, key: str*, val: V*): bool =
+    # Iterator (minimal): scan slots from *idx and return true when next non-empty entry is found.
+    # - `idx` is a cursor: caller initializes to 0; success writes back next start (i+1); failure returns false.
+    # - Iteration order depends on the current table layout (not stable), but covers all inserted keys.
+    if idx == nil || key == nil || val == nil:
+        return false
+    let cap: int32 = t.slots.len
+    var i: int32 = *idx
+    while i < cap:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, i)
+        i = i + 1
+        if ep != nil:
+            let e: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(ep)
+            *key = e->key
+            *val = e->val
+            *idx = i
+            return true
+    *idx = i
+    return false
+
+fn TablePut[V](t: var Table[V], key: str, val: V) =
+    if t.slots.len <= 0:
+        t.slots = __cheng_tables_initSlots 64
+        t.len = 0
+    # load factor 0.7: grow early to avoid long probe chains
+    if (t.len + 1) * 10 >= t.slots.len * 7:
+        __cheng_tables_grow[V] t
+    let cap: int32 = t.slots.len
+    var idx: int32 =(__cheng_tables_hashStr key & 0x7fffffff) % cap
+    while true:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, idx)
+        if ep == nil:
+            var size64: int64 = sizeof __cheng_tables_Entry[V]
+            var size32: int32 = int32(size64)
+            let mem: void* = alloc size32
+            zeroMem(mem, size32)
+            let e: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(mem)
+            e->key = key
+            e->val = val
+            __cheng_tables_slotStore(&t.slots, idx, mem)
+            t.len = t.len + 1
+            return
+        let e0: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(ep)
+        if c_strcmp(e0->key, key) == 0:
+            e0->val = val
+            return
+        idx = idx + 1
+        if idx >= cap:
+            idx = 0
+
+fn arcRetainTable[V](t: Table[V]) =
+    if t.slots.buffer != nil:
+        memRetain t.slots.buffer
+    let cap: int32 = t.slots.len
+    var i: int32 = 0
+    while i < cap:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, i)
+        if ep != nil:
+            let e: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(ep)
+            if e->key != nil:
+                memRetain void*(e->key)
+            memRetain ep
+        i = i + 1
+
+fn arcReleaseTable[V](t: Table[V]) =
+    let cap: int32 = t.slots.len
+    var i: int32 = 0
+    while i < cap:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, i)
+        if ep != nil:
+            let e: __cheng_tables_Entry[V]* = __cheng_tables_Entry[V]*(ep)
+            if e->key != nil:
+                memRelease void*(e->key)
+            memRelease ep
+        i = i + 1
+    if t.slots.buffer != nil:
+        memRelease t.slots.buffer
+
+fn arcRetainTableString(t: Table[str]) =
+    if t.slots.buffer != nil:
+        memRetain t.slots.buffer
+    let cap: int32 = t.slots.len
+    var i: int32 = 0
+    while i < cap:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, i)
+        if ep != nil:
+            let e: __cheng_tables_Entry[str]* = __cheng_tables_Entry[str]*(ep)
+            if e->key != nil:
+                memRetain void*(e->key)
+            if e->val != nil:
+                memRetain void*(e->val)
+            memRetain ep
+        i = i + 1
+
+fn arcReleaseTableString(t: Table[str]) =
+    let cap: int32 = t.slots.len
+    var i: int32 = 0
+    while i < cap:
+        let ep: void* = __cheng_tables_slotLoad(&t.slots, i)
+        if ep != nil:
+            let e: __cheng_tables_Entry[str]* = __cheng_tables_Entry[str]*(ep)
+            if e->key != nil:
+                memRelease void*(e->key)
+            if e->val != nil:
+                memRelease void*(e->val)
+            memRelease ep
+        i = i + 1
+    if t.slots.buffer != nil:
+        memRelease t.slots.buffer
+
+fn arcRetainTable_string(t: Table_string) =
+    arcRetainTableString t
+
+fn arcReleaseTable_string(t: Table_string) =
+    arcReleaseTableString t
