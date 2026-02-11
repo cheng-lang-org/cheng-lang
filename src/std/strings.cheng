@@ -1,44 +1,86 @@
 # Strings module (minimal)
 
 fn len(s: str): int32 =
+    if s == nil:
+        return 0
     return c_strlen s
 
 fn streq(a, b: str): bool =
     let ap: void* = void*(a)
     let bp: void* = void*(b)
+    if ap == bp:
+        return true
     if ap == nil:
         return bp == nil
     if bp == nil:
         return false
-    let na: int32 = c_strlen a
-    let nb: int32 = c_strlen b
-    if na != nb:
+    let ac: char* = char*(ap)
+    let bc: char* = char*(bp)
+    if *ac != *bc:
         return false
-    var i: int32 = 0
-    while i < na:
-        if charAt(a, i) != charAt(b, i):
-            return false
-        i = i + 1
-    return true
+    if *ac == char(0):
+        return true
+    # Fast path for short strings (common tokens like "(", "==", "[]").
+    let ac1: char = *(char*(ptr_add(void*(ac), 1)))
+    let bc1: char = *(char*(ptr_add(void*(bc), 1)))
+    if ac1 != bc1:
+        return false
+    if ac1 == char(0):
+        return true
+    let ac2: char = *(char*(ptr_add(void*(ac), 2)))
+    let bc2: char = *(char*(ptr_add(void*(bc), 2)))
+    if ac2 != bc2:
+        return false
+    if ac2 == char(0):
+        return true
+    let ac3: char = *(char*(ptr_add(void*(ac), 3)))
+    let bc3: char = *(char*(ptr_add(void*(bc), 3)))
+    if ac3 != bc3:
+        return false
+    if ac3 == char(0):
+        return true
+    return c_strcmp(cstring(a), cstring(b)) == 0
+
+fn strIsEmpty(s: str): bool =
+    if s == nil:
+        return true
+    return s[0] == char(0)
+
+fn strNonEmpty(s: str): bool =
+    return !strIsEmpty(s)
 
 fn hasPrefix(s: str, prefix: str): bool =
-    if prefix == nil || len(prefix) == 0:
+    if prefix == nil:
+        return true
+    let pLen: int32 = len(prefix)
+    if pLen == 0:
         return true
     if s == nil:
         return false
-    if len(s) < len(prefix):
+    let sLen: int32 = len(s)
+    if sLen < pLen:
         return false
-    var i: int32 = 0
-    while i < len(prefix):
-        if charAt(s, i) != charAt(prefix, i):
+    for i in 0..<pLen:
+        if s[i] != prefix[i]:
             return false
-        i = i + 1
     return true
 
 fn dropPrefix(s: str, prefix: str): str =
     if !hasPrefix(s, prefix):
         return s
-    return str(ptr_add(s, len(prefix)))
+    if s == nil:
+        return ""
+    let offset: int32 = len(prefix)
+    let total: int32 = len(s)
+    if offset >= total:
+        return ""
+    let count: int32 = total - offset
+    let size: int32 = count + 1
+    let p: void* = alloc size
+    let src: void* = ptr_add(void*(s), offset)
+    copyMem(p, src, count)
+    setMem(ptr_add(p, count), 0, 1)
+    return str(p)
 
 fn arcRetainString(s: str) =
     let p: void* = void*(s)
@@ -53,7 +95,7 @@ fn __cheng_str_clone(s: str): str =
     memRetain p
     return s
 
-fn `+`(s1, s2: str): str =
+fn __cheng_str_concat(s1, s2: str): str =
     let l1: int32 = len s1
     let l2: int32 = len s2
     let size: int32 = l1 + l2 + 1
@@ -67,6 +109,15 @@ fn `+`(s1, s2: str): str =
     setMem(pEnd, 0, 1)
     return str(p)
 
+fn `+`(s1, s2: str): str =
+    return __cheng_str_concat(s1, s2)
+
+fn `+`(s: str, c: char): str =
+    return __cheng_str_concat(s, charToStr(c))
+
+fn __cheng_sym_2b(s1, s2: str): str =
+    return __cheng_str_concat(s1, s2)
+
 fn `==`(a, b: str): bool =
     return streq(a, b)
 
@@ -79,17 +130,14 @@ fn charToStr(c: char): str =
     return str(p)
 
 fn `[]`(s: str, i: int32): char =
-    return charAt(s, i)
+    var p: void* = ptr_add(void*(s), i)
+    var pc: char* = char*(p)
+    return *pc
 
 fn `[]=`(s: str, i: int32, val: char) =
     var p: void* = ptr_add(void*(s), i)
     var pc: char* = char*(p)
     *pc = val
-
-fn charAt(s: str, i: int32): char =
-    var p: void* = ptr_add(void*(s), i)
-    var pc: char* = char*(p)
-    return *pc
     
 fn __cheng_slice_string(s: str, start: int32, stop: int32, exclusive: bool): str =
     if s == nil:
@@ -118,11 +166,9 @@ fn __cheng_string_contains_char(s: str, c: char): bool =
     if s == nil:
         return false
     let n: int32 = c_strlen s
-    var i: int32 = 0
-    while i < n:
-        if charAt(s, i) == c:
+    for i in 0..<n:
+        if s[i] == c:
             return true
-        i = i + 1
     return false
 fn __cheng_string_contains_str(s: str, sub: str): bool =
     if s == nil || sub == nil:
@@ -133,16 +179,37 @@ fn __cheng_string_contains_str(s: str, sub: str): bool =
         return true
     if m > n:
         return false
-    var i: int32 = 0
-    while i <= n - m:
-        var j: int32 = 0
-        while j < m && charAt(s, i + j) == charAt(sub, j):
-            j = j + 1
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(s[i + j] == sub[j]):
+                break
         if j == m:
             return true
-        i = i + 1
     return false
 
+
+fn sliceBytes(text: str, start: int32, count: int32): str =
+    if text == nil || count <= 0:
+        return ""
+    var s0: int32 = start
+    if s0 < 0:
+        s0 = 0
+    let n: int32 = len(text)
+    if s0 >= n:
+        return ""
+    var c: int32 = count
+    if s0 + c > n:
+        c = n - s0
+    if c <= 0:
+        return ""
+    let p: void* = alloc(c + 1)
+    let src: void* = ptr_add(void*(text), s0)
+    copyMem(p, src, c)
+    setMem(ptr_add(p, c), 0, 1)
+    return str(p)
+
+fn strContains(text: str, sub: str): bool =
+    return __cheng_string_contains_str(text, sub)
 fn intToStr(i: int32): str =
     if i == 0:
         return "0"
@@ -178,6 +245,63 @@ fn intToStr(i: int32): str =
         *p0 = int8('-')
     return str(p)
 
+fn uint64ToStr(x: uint64): str =
+    if x == 0:
+        return "0"
+    var n: uint64 = x
+    var digits: int32 = 0
+    var temp: uint64 = n
+    while temp > 0:
+        digits = digits + 1
+        temp = temp / 10
+    let size: int32 = digits
+    let totalSize: int32 = size + 1
+    let p: void* = alloc totalSize
+    setMem(ptr_add(p, size), 0, 1)
+    var idx: int32 = size - 1
+    while n > 0:
+        let digit: int32 = int32(n % 10)
+        let code: int32 = 48 + digit
+        var pChar: int8* = int8*(ptr_add(p, idx))
+        *pChar = int8(code)
+        n = n / 10
+        idx = idx - 1
+    return str(p)
+
+fn int64ToStr(i: int64): str =
+    if i == 0:
+        return "0"
+    if i == int64(-9223372036854775808):
+        return "-9223372036854775808"
+    var n: int64 = i
+    var neg: bool = false
+    if n < 0:
+        neg = true
+        n = 0 - n
+    var digits: int32 = 0
+    var temp: int64 = n
+    while temp > 0:
+        digits = digits + 1
+        temp = temp / 10
+    var size: int32 = digits
+    if neg:
+        size = size + 1
+    let totalSize: int32 = size + 1
+    let p: void* = alloc totalSize
+    setMem(ptr_add(p, size), 0, 1)
+    var idx: int32 = size - 1
+    while n > 0:
+        let digit: int32 = int32(n % 10)
+        let code: int32 = 48 + digit
+        var pChar: int8* = int8*(ptr_add(p, idx))
+        *pChar = int8(code)
+        n = n / 10
+        idx = idx - 1
+    if neg:
+        var p0: int8* = int8*(p)
+        *p0 = int8('-')
+    return str(p)
+
 fn `$`(s: str): str =
     return s
 
@@ -197,8 +321,7 @@ fn `$`(x: int32): str =
     return intToStr x
 
 fn `$`(x: int64): str =
-    let v: int32 = int32(x)
-    return intToStr v
+    return int64ToStr x
 
 fn `$`(x: uint): str =
     let v: int32 = int32(x)
@@ -209,8 +332,7 @@ fn `$`(x: uint32): str =
     return intToStr v
 
 fn `$`(x: uint64): str =
-    let v: int32 = int32(x)
-    return intToStr v
+    return uint64ToStr x
 
 fn `$`(x: float): str =
     let v: int32 = int32(x)
@@ -223,3 +345,12 @@ fn `$`(x: float32): str =
 fn `$`(x: float64): str =
     let v: int32 = int32(x)
     return intToStr v
+
+fn `$`(xs: T[]): str =
+    var out: str = "["
+    for i in 0..<xs.len:
+        if i > 0:
+            out = out + ","
+        out = out + $(xs[i])
+    out = out + "]"
+    return out

@@ -4,7 +4,7 @@
 - 提供 Cheng 语言原生的去中心化计算与存储能力。
 - 支持 **可选模式**：本地运行/存储免费；去中心化运行/存储按需付费。
 - 减少版本碎片：通道化依赖 + 严格语义化版本（SemVer） + 全局唯一主版本约束。
-- 建立开发者收益闭环：存储租约、计算版税（Royalty）与生态引用挖矿。
+- 建立开发者收益闭环：输出可审计计量证据并对接 `RWAD-blockchain` 结算接口。
 
 ## 非目标
 - 不追求取代以太坊或成为通用公链。
@@ -19,7 +19,7 @@
 ### 2) 去中心化模式（可选）
 - **编译产物**：基于 Merkle DAG 的内容寻址（CAS），实现分块级去重。
 - **计算**：由网络节点执行，输出结果 + 可验证回执；计算费用自动分润给包作者。
-- **结算/激励**：RWAD 驱动生态——质押发布（抗女巫/抗作恶）、引用即挖矿（优质库奖励）、稀缺存储挖矿。
+- **结算/激励**：`cheng-lang` 只输出可审计批次；积分与 RWAD 规则在 `RWAD-blockchain` 执行。
 
 ## 关键模块
 ### A0. 链上/链下边界（RWAD）
@@ -33,7 +33,7 @@
 - **通道锁定**：推荐依赖 `stable`/`lts` 通道。通道指针由 DAO 或可信方更新，结合 SemVer 兼容性检查，减少下游频繁改动 `lock` 文件。
 - **SemVer 强制**：注册中心拒绝 API 破坏性改动（通过符号 diff）进入 Patch/Minor 版本发布，强制版本号语义准确。
 - **可复现构建**：同一输入得到同一 Merkle Root；构建元数据包含完整的依赖 DAG 引用。
-- **包身份**：包作者需质押 RWAD 获取 namespace；发布需签名。
+- **包身份**：包作者 namespace 的链侧认证规则由 `RWAD-blockchain` 定义；发布需签名。
 
 ### A1. 包与包管理器实现建议（落地）
 - **统一清单**：包根目录固定 `cheng-package.toml`，lock 默认 `cheng.lock.toml`；manifest 只写依赖与通道，lock 只写可验证快照（`cid/author_id/signature/epoch`）。
@@ -42,7 +42,7 @@
 - **校验链路**：resolve -> verify(lock+registry) -> meta(build) -> buildmeta 写入产物；可选 ledger 校验，强制可审计。
 - **工具链闭环**：`cheng_pkg resolve/verify/meta` + `chengc.sh --manifest/--lock/--package` 一键完成依赖解析与构建元数据。
 - **lock 校验落地**：`cheng_pkg_source lock-verify --lock:<file> [--registry:<path>]` 校验签名/冲突/注册表一致性。
-- **闭环脚本**：`scripts/closedloop.sh` 统一跑 bootstrap + verify（可选 `CHENG_CLOSEDLOOP_LIBP2P=1` 触发 libp2p smoke；`CHENG_CLOSEDLOOP_STRICT=1` 强制完整 HRT 校验）。
+- **闭环脚本**：`scripts/closedloop.sh` 统一跑 bootstrap + verify（可选 `CHENG_CLOSEDLOOP_LIBP2P=1` 触发 libp2p smoke；`CHENG_CLOSEDLOOP_STRICT=1` 强制完整后端生产校验）。
 
 ### A1.1 源码直发（no-copy）
 - **发布模式**：包不打包，直接发布源码清单（manifest），manifest 仅包含 `path/cid/size` 与 `source_addrs`。
@@ -692,22 +692,16 @@ CHENG_PKG_MODE=p2p CHENG_PKG_PEERS=/dns4/node.example/tcp/4001 \
 - **仲裁机制**：对争议任务进行复算或抽查。
 
 ### D. 计费与分润（RWAD 生态飞轮）
-- **质押发布 (Stake-to-Publish)**：
-    - 包作者需质押 RWAD 以注册包名。
-    - **Slashing 机制**：若包被证实包含恶意代码或严重后门（经审计委员会/DAO 仲裁），质押金被罚没。
-- **计算版税 (Compute Royalties)**：
-    - 当包被用于付费计算任务时，计算费用的微小比例（如 1-5%）自动划转给依赖树中的包作者。
-- **引用即挖矿 (Ref-Count Mining)**：
-    - 季度结算：被高价值项目（高活跃/高质押）引用的基础库，根据引用深度与频次，分享生态基金池的增发奖励。鼓励编写稳健的基础设施。
-- **稀缺存储挖掘 (Storage Mining)**：
-    - 对因为冷门但必要（低副本数）的包进行存储的节点，提供动态加成的存储奖励，防止长尾数据丢失。
-- **费用拆分**：执行节点(70%) + 包作者版税(20%) + 生态基金/销毁(10%)。
+- **cheng-lang 职责**：只生产可审计事件（租约、计量、回执、审计、欺诈、存储证明）与 epoch 结算批次。
+- **RWAD-blockchain 职责**：预算、积分核算、兑换率、队列积压、惩罚与状态滚动全部在链侧执行。
+- **对接方式**：`cheng_rwad_bridge.sh export/apply` + `cheng-rwad-settlement/v1` 契约，不在本仓实现积分↔RWAD算法。
+- **策略文档归属**：经济模型、参数治理与风控规则统一维护在 `RWAD-blockchain/docs`。
 
 ### E. 链上结算与 RWAD
-- **结算单位**：RWAD（统一稳定币结算）。
-- **链上凭证**：租约/计量/回执聚合后提交结算模块，产出链上交易哈希与事件。
+- **结算单位**：RWAD（统一结算单位，不承诺固定法币面值）。
+- **接口边界**：`cheng-lang` 仅提交批次证据；链侧返回最终结算结果与下一状态。
 - **批量结算**：按 epoch 批量提交，降低链上交互成本。
-- **跨链一致性**：需要时通过桥接保持 RWAD 跨链发行/销毁可审计。
+- **跨链一致性**：由 `RWAD-blockchain` 侧桥接策略保障。
 
 ## 优点
 - **收益闭环清晰**：包作者长期获得租约/计算分润。
@@ -755,11 +749,14 @@ CHENG_PKG_MODE=p2p CHENG_PKG_PEERS=/dns4/node.example/tcp/4001 \
 
 ## 当前实现（MVP 起步）
 - 位置：`cheng/decentralized/*`（CID/租约/账本/本地存储 + libp2p P2P 入口 + 注册中心 + 计量/结算/审计 + 抽样/欺诈/信誉 + 执行请求/回执 + 计量 SDK）
-- 结算现状：账本事件仍写入 `ledger.jsonl`，需接入 RWAD 链上结算模块与批量提交管线。
+- 结算现状：账本事件仍写入 `ledger.jsonl`；`cheng-lang` 通过 `cheng_rwad_bridge.sh export/apply` 与 `RWAD-blockchain` 接口对接，不在本仓内执行积分↔RWAD兑换规则。
+- 接口契约：`export` 批次固定输出 `settlement_sha256`；`apply` 默认强校验 `result_schema/request_schema` 与批次状态。
 - 计算计量与执行请求新增 GPU 字段：`gpu_ms/gpu_mem_bytes/gpu_count/gpu_type/workload_kind` 与 GPU 价格字段，账本事件与 CLI 参数同步。
 - ledger 事件新增 `audit_sample`/`fraud_report`/`storage_proof`，用于抽样审计、作恶上报与存储证明记录。
 - CLI：
   - `src/tooling/cheng_storage.cheng`（存储 + 计量 + 结算 + 审计）
+  - `src/tooling/cheng_rwad_bridge.sh`（RWAD 接口导出/回执应用）
+  - `src/tooling/verify_rwad_interface_contract.sh`（跨仓接口契约验收）
   - `src/tooling/cheng_registry.cheng`（通道注册中心）
   - `src/tooling/cheng_pkg.cheng`（manifest 解析与 resolve/lock/verify）
 - `--mode:p2p` 已接入 cheng-libp2p bitswap 的最小读写与 `serve`，用于点对点获取区块；可选从本地块目录预热 bitswap。
@@ -770,7 +767,7 @@ CHENG_PKG_MODE=p2p CHENG_PKG_PEERS=/dns4/node.example/tcp/4001 \
 - IO shim（应用侧便捷 API）：新增 `cheng/decentralized/io_shim.cheng`，提供 `readFileAuto/writeFileAuto` 与 `ioLastError`，以及 `write*WithLease`（无 Result 样板）。
 - CLI put 对齐：`cheng_storage put` 使用 io_backend，支持租约写入时落账本，并遵循租约强制策略。
 - 新增 **租约 token 签名/校验**：`leasegen` 生成租约 token（含签名），`put --lease:<token>` 在写入前校验。
-- 新增计算闭环脚本：`src/tooling/demo_compute_settle.sh` 与 `src/tooling/verify_demo_compute_settle.sh` 覆盖 exec/meter/receipt/sample/audit/fraud/settle。
+- 新增跨仓闭环脚本：`src/tooling/demo_compute_settle.sh` 与 `src/tooling/verify_demo_compute_settle.sh` 覆盖 exec/meter/receipt/sample/audit/fraud/settle/bridge-export/bridge-apply。
 
 CLI 示例：
 ```bash
@@ -805,7 +802,7 @@ src/tooling/chengc.sh src/tooling/cheng_pkg.cheng --name:cheng_pkg
 # # demo 会同时展示 cat 与 cat --raw 的输出差异
 # # 验收脚本：sh src/tooling/verify_demo_io_lease.sh --mode:local --root:build/cheng_demo_verify
 
-# 最小计算闭环示例（exec -> meter -> receipt -> sample/audit -> settle）
+# 最小计算闭环示例（exec -> meter -> receipt -> sample/audit -> settle -> bridge-export -> bridge-apply）
 # sh src/tooling/demo_compute_settle.sh --mode:local --root:build/cheng_demo_compute
 # # 验收脚本：sh src/tooling/verify_demo_compute_settle.sh --mode:local --root:build/cheng_demo_compute_verify
 
@@ -972,6 +969,18 @@ src/tooling/chengc.sh src/tooling/cheng_pkg.cheng --name:cheng_pkg
 ./cheng_storage settle --epoch:1 --root:build/cheng_storage --out:build/cheng_storage/settlement-epoch-1.yaml --format:yaml --top:10
 ./cheng_storage settle --epoch:1 --root:build/cheng_storage --format:json --top:10 \
   --reconcile-csv:build/cheng_storage/reconcile-epoch-1.csv
+
+# 导出 RWAD 接口批次（由 RWAD-blockchain 执行积分/RWAD结算）
+sh src/tooling/cheng_rwad_bridge.sh export --epoch:1 --root:build/cheng_storage \
+  --batch-id:cheng-epoch-1 --out:build/cheng_storage/rwad-batch-epoch-1.json
+
+# 应用 RWAD-blockchain 返回结果（状态与批次一致性校验）
+sh src/tooling/cheng_rwad_bridge.sh apply --result:build/cheng_storage/rwad-result-epoch-1.json \
+  --batch:build/cheng_storage/rwad-batch-epoch-1.json \
+  --batch-id:cheng-epoch-1 --require-status:finalized --out:build/cheng_storage/rwad-ack-epoch-1.json
+
+# 接口契约验收（不依赖 cheng_storage 写路径）
+sh src/tooling/verify_rwad_interface_contract.sh --rwad-root:/Users/lbcheng/.cheng-packages/RWAD-blockchain
 
 # 结算输出包含 counts/audit_total/penalties：处罚金额会计入 treasury_total，并从 executors 扣减。
 # 结算输出包含 preview（top 列表，limit 可用 --top 控制；设为 0 可关闭）。

@@ -1,436 +1,380 @@
 # Sequence module
-# system is implicitly imported in Stage 0
-type
-    VoidPtr = void*
-    seq[T] =
-        len: int32
-        cap: int32
-        buffer: void*
-    seq_fixed[T, N] =
-        len: int32
-        cap: int32
-        buffer: void*
-        storage: array[T, N]
 
-fn seqFixedInit[T, N](seqInst: var seq[T, N]) =
-    seqInst.len = 0
-    var size64: int64 = sizeof seqInst.storage
-    var elem64: int64 = sizeof T
-    var cap64: int64 = 0
-    if elem64 > 0:
-        cap64 = size64 / elem64
-    seqInst.cap = int32(cap64)
-    seqInst.buffer = void*(&seqInst.storage)
+fn __seqNextCap(curCap: int32, needLen: int32): int32 =
+    var cap: int32 = curCap
+    if cap < 4:
+        cap = 4
+    while cap < needLen:
+        cap = cap * 2
+        if cap <= 0:
+            cap = needLen
+            break
+    return cap
 
-fn newSeqFixed[T, N](): seq[T, N] =
-    var seqInst: seq[T, N]
-    seqFixedInit[T, N] seqInst
-    return seqInst
+fn __seqBytesOf[T](count: int32): int32 =
+    if count <= 0:
+        return 0
+    let bytes64: int64 = int64(count) * sizeof T
+    return int32(bytes64)
 
-fn seqFixedLen[T, N](seqInst: seq[T, N]): int32 =
-    return seqInst.len
-
-fn seqFixedCap[T, N](seqInst: seq[T, N]): int32 =
-    return seqInst.cap
-
-fn seqFixedClear[T, N](seqInst: var seq[T, N]) =
-    seqInst.len = 0
-
-fn seqFixedTryAdd[T, N](seqInst: var seq[T, N], val: T): bool =
-    if seqInst.len >= seqInst.cap:
-        return false
-    var idx64: int64 = int64(seqInst.len)
-    var offset64: int64 = idx64 * sizeof T
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst.buffer, offset32)
-    var pt: T* = T*(p)
-    *pt = val
-    seqInst.len = seqInst.len + 1
-    return true
-
-fn seqFixedGet[T, N](seqInst: seq[T, N], i: int32): T =
-    var idx64: int64 = int64(i)
-    var offset64: int64 = idx64 * sizeof T
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst.buffer, offset32)
-    var pt: T* = T*(p)
-    return *pt
-
-fn seqFixedSet[T, N](seqInst: var seq[T, N], i: int32, val: T) =
-    var idx64: int64 = int64(i)
-    var offset64: int64 = idx64 * sizeof T
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst.buffer, offset32)
-    var pt: T* = T*(p)
-    *pt = val
-
-fn `[]`[T, N](seqInst: seq[T, N], i: int32): T =
-    return seqFixedGet[T, N](seqInst, i)
-
-fn `[]=`[T, N](seqInst: var seq[T, N], i: int32, val: T) =
-    seqFixedSet[T, N](seqInst, i, val)
-fn newSeqWithCap[T](len: int32, cap: int32): seq[T] =
-    var seqInstance: seq[T]
-    seqInstance.len = len
-    seqInstance.cap = cap
-    if cap > 0:
-        # Use cast to convert int64(size) to int32(for) alloc
-        var size64: int64 = int64(cap) * sizeof T
-        var size32: int32 = int32(size64)
-        seqInstance.buffer = alloc size32
-        if seqInstance.buffer != nil:
-            zeroMem(seqInstance.buffer, size32)
-    else:
-        seqInstance.buffer = nil
-    return seqInstance
-fn newSeqImpl[T](len: int): seq[T] =
-    var count = len
-    if count < 0:
-        count = 0
-    var cap32: int32 = int32(count)
-    var seqInstance: seq[T] = newSeqWithCap[T](cap32, cap32)
-    seqInstance.len = cap32
-    return seqInstance
-fn newSeq[T](len: int = 0): seq[T] =
-    return newSeqImpl[T] len
-fn newSeqOfCap[T](cap: int): seq[T] =
-    var count = cap
-    if count < 0:
-        count = 0
-    return newSeqWithCap[T](0, int32(count))
-fn dataPtr[T](seqInst: seq[T]): void* =
-    return seqInst.buffer
-fn setLen[T](seqInst: var seq[T], newLen: int) =
-    if newLen < 0:
+fn __seqGrowTo[T](seqInst: var T[], minCap: int32) =
+    if minCap <= 0:
         return
-    var target: int32 = int32(newLen)
-    if target > seqInst.cap:
-        let oldCap: int32 = seqInst.cap
-        var newCap: int32 = seqInst.cap
-        if newCap == 0:
-            newCap = 4
-        while newCap < target:
-            newCap = newCap * 2
-        seqInst.cap = newCap
-        var cap64: int64 = int64(newCap)
-        var size64: int64 = int64(cap64) * sizeof T
-        var size32: int32 = int32(size64)
-        seqInst.buffer = realloc(seqInst.buffer, size32)
-        if seqInst.buffer != nil && oldCap >= 0:
-            var oldSize64: int64 = int64(oldCap) * sizeof T
-            var oldSize32: int32 = int32(oldSize64)
-            if size32 > oldSize32:
-                zeroMem(ptr_add(seqInst.buffer, oldSize32), size32 - oldSize32)
-    elif target > seqInst.len && seqInst.buffer != nil:
-        var from64: int64 = int64(seqInst.len) * sizeof T
-        var from32: int32 = int32(from64)
-        var to64: int64 = int64(target) * sizeof T
-        var to32: int32 = int32(to64)
-        if to32 > from32:
-            zeroMem(ptr_add(seqInst.buffer, from32), to32 - from32)
-    seqInst.len = target
-fn len[T](seqInst: seq[T]): int32 =
-    return seqInst.len
-fn addPtr[T](seqInst: seq[T]*, val: T) =
-    if seqInst->len >= seqInst->cap:
-        let oldCap: int32 = seqInst->cap
-        var newCap: int32 = 4
-        if seqInst->cap != 0:
-            newCap = seqInst->cap * 2
-        seqInst->cap = newCap
-        var cap64: int64 = int64(newCap)
-        var size64: int64 = int64(cap64) * sizeof T
-        var size32: int32 = int32(size64)
-        seqInst->buffer = realloc(seqInst->buffer, size32)
-        if seqInst->buffer != nil && oldCap >= 0:
-            var oldSize64: int64 = int64(oldCap) * sizeof T
-            var oldSize32: int32 = int32(oldSize64)
-            if size32 > oldSize32:
-                zeroMem(ptr_add(seqInst->buffer, oldSize32), size32 - oldSize32)
-    var idx64: int64 = int64(seqInst->len)
-    var offset64: int64 = int64(idx64) * sizeof T
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst->buffer, offset32)
-    var pt: T* = T*(p)
-    *pt = val
-    seqInst->len = seqInst->len + 1
-fn add[T](seqInst: var seq[T], val: T) =
-    # Ideally call addPtr(&seqInst, val) but + is tricky here.
-    if seqInst.len >= seqInst.cap:
-        var newCap: int32 = 4
-        if seqInst.cap != 0:
-            newCap = seqInst.cap * 2
-        seqInst.cap = newCap
-        var cap64: int64 = int64(newCap)
-        var size64: int64 = int64(cap64) * sizeof T
-        var size32: int32 = int32(size64)
-        seqInst.buffer = realloc(seqInst.buffer, size32)
-    var idx64: int64 = int64(seqInst.len)
-    var offset64: int64 = int64(idx64) * sizeof T
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst.buffer, offset32)
-    var pt: T* = T*(p)
-    *pt = val
-    seqInst.len = seqInst.len + 1
-fn seqAdd[T](seqInst: var seq[T], val: T) =
-    if seqInst.len >= seqInst.cap:
-        var newCap: int32 = 4
-        if seqInst.cap != 0:
-            newCap = seqInst.cap * 2
-        seqInst.cap = newCap
-        var cap64: int64 = int64(newCap)
-        var size64: int64 = int64(cap64) * sizeof T
-        var size32: int32 = int32(size64)
-        seqInst.buffer = realloc(seqInst.buffer, size32)
-    var idx64: int64 = int64(seqInst.len)
-    var offset64: int64 = int64(idx64) * sizeof T
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst.buffer, offset32)
-    var pt: T* = T*(p)
-    *pt = val
-    seqInst.len = seqInst.len + 1
-fn get[T](seqInst: seq[T], i: int32): T =
-    var p: void* = cheng_seq_get(seqInst.buffer, seqInst.len, i, sizeof T)
-    var pt: T* = T*(p)
-    return *pt
-fn findImpl[T](seqInst: seq[T], val: T, start: int32): int32 =
-    var i = start
-    if i < 0:
-        i = 0
-    while i < seqInst.len:
-        if seqInst[i] == val:
-            return i
-        i = i + 1
-    return -1
-fn find[T](seqInst: seq[T], val: T): int32 =
-    return findImpl[T](seqInst, val, 0)
-fn find[T](seqInst: seq[T], val: T, start: int32): int32 =
-    return findImpl[T](seqInst, val, start)
-fn getPtr[T](seqInst: seq[T]*, i: int32): T =
-    var p: void* = cheng_seq_get(seqInst->buffer, seqInst->len, i, sizeof T)
-    var pt: T* = T*(p)
-    return *pt
-fn setPtr[T](seqInst: seq[T]*, i: int32, val: T) =
-    var p: void* = cheng_seq_set(seqInst->buffer, seqInst->len, i, sizeof T)
-    var pt: T* = T*(p)
-    *pt = val
-
-fn delete[T](seqInst: seq[T]*, idx: int32) =
-    if idx < 0 || idx >= seqInst->len:
+    if seqInst.buffer != nil && minCap <= seqInst.cap:
         return
-    var j: int32 = idx
-    while j + 1 < seqInst->len:
-        setPtr[T](seqInst, j, getPtr[T](seqInst, j + 1))
-        j = j + 1
-    seqInst->len = seqInst->len - 1
+    let hasBuffer: bool = seqInst.buffer != nil
+    var newCap: int32 = seqInst.cap
+    if newCap < minCap:
+        newCap = __seqNextCap(seqInst.cap, minCap)
+    if newCap <= 0:
+        newCap = __seqNextCap(0, minCap)
+    let oldBytes: int32 = hasBuffer ? __seqBytesOf[T](seqInst.cap) : 0
+    let newBytes: int32 = __seqBytesOf[T](newCap)
+    let newBuffer: void* = realloc(seqInst.buffer, newBytes)
+    if newBuffer == nil:
+        panic "cheng: out of memory"
+    seqInst.buffer = newBuffer
+    seqInst.cap = newCap
+    if newBytes > oldBytes:
+        zeroMem(ptr_add(newBuffer, oldBytes), newBytes - oldBytes)
 
-fn freeSeqPtr[T](seqInst: seq[T]*) =
+fn __seqGrowToPtr[T](seqInst: T[]*, minCap: int32) =
     if seqInst == nil:
         return
-    if seqInst->buffer != nil:
-        memRelease seqInst->buffer
-    seqInst->buffer = nil
-    seqInst->len = 0
-    seqInst->cap = 0
+    if minCap <= 0:
+        return
+    if seqInst->buffer != nil && minCap <= seqInst->cap:
+        return
+    let hasBuffer: bool = seqInst->buffer != nil
+    var newCap: int32 = seqInst->cap
+    if newCap < minCap:
+        newCap = __seqNextCap(seqInst->cap, minCap)
+    if newCap <= 0:
+        newCap = __seqNextCap(0, minCap)
+    let oldBytes: int32 = hasBuffer ? __seqBytesOf[T](seqInst->cap) : 0
+    let newBytes: int32 = __seqBytesOf[T](newCap)
+    let newBuffer: void* = realloc(seqInst->buffer, newBytes)
+    if newBuffer == nil:
+        panic "cheng: out of memory"
+    seqInst->buffer = newBuffer
+    seqInst->cap = newCap
+    if newBytes > oldBytes:
+        zeroMem(ptr_add(newBuffer, oldBytes), newBytes - oldBytes)
 
-fn freeSeq[T](seqInst: var seq[T]) =
-    freeSeqPtr[T](&seqInst)
+fn __seqZeroTail[T](seqBuffer: void*, fromLen: int32, toLen: int32) =
+    if seqBuffer == nil:
+        return
+    if toLen <= fromLen:
+        return
+    let fromBytes: int32 = __seqBytesOf[T](fromLen)
+    let toBytes: int32 = __seqBytesOf[T](toLen)
+    if toBytes > fromBytes:
+        zeroMem(ptr_add(seqBuffer, fromBytes), toBytes - fromBytes)
 
-fn reset[T](seqInst: var seq[T]) =
+fn setLen[T](seqInst: var T[], newLen: int) =
+    var target: int32 = int32(newLen)
+    if target < 0:
+        target = 0
+    if target > seqInst.cap || (target > 0 && seqInst.buffer == nil):
+        __seqGrowTo[T](seqInst, target)
+    if target > seqInst.len:
+        __seqZeroTail[T](seqInst.buffer, seqInst.len, target)
+    seqInst.len = target
+
+fn setLen[T](seqInst: var T[], newLen: int32) =
+    setLen[T](seqInst, int(newLen))
+
+fn setLen[T](seqInst: T[]*, newLen: int) =
+    if seqInst == nil:
+        return
+    var target: int32 = int32(newLen)
+    if target < 0:
+        target = 0
+    if target > seqInst->cap || (target > 0 && seqInst->buffer == nil):
+        __seqGrowToPtr[T](seqInst, target)
+    if target > seqInst->len:
+        __seqZeroTail[T](seqInst->buffer, seqInst->len, target)
+    seqInst->len = target
+
+fn setLen[T](seqInst: T[]*, newLen: int32) =
+    setLen[T](seqInst, int(newLen))
+
+fn setLenPtr[T](seqInst: var T[], newLen: int) =
+    setLen[T](seqInst, newLen)
+
+fn reserve[T](seqInst: var T[], newCap: int32) =
+    if newCap <= seqInst.cap && seqInst.buffer != nil:
+        return
+    if newCap < 0:
+        return
+    __seqGrowTo[T](seqInst, newCap)
+
+fn reserve[T](seqInst: var T[], newCap: int) =
+    reserve[T](seqInst, int32(newCap))
+
+fn reserve[T](seqInst: T[]*, newCap: int32) =
+    if seqInst == nil:
+        return
+    if newCap <= seqInst->cap && seqInst->buffer != nil:
+        return
+    if newCap < 0:
+        return
+    __seqGrowToPtr[T](seqInst, newCap)
+
+fn reserve[T](seqInst: T[]*, newCap: int) =
+    reserve[T](seqInst, int32(newCap))
+
+fn reservePtr[T](seqInst: var T[], newCap: int32) =
+    reserve[T](seqInst, newCap)
+
+fn clear[T](seqInst: var T[]) =
+    seqInst.len = 0
+
+fn resize[T](seqInst: var T[], newLen: int, capHint: int32 = 0) =
+    if capHint > 0:
+        reserve[T](seqInst, capHint)
+    setLen[T](seqInst, newLen)
+
+fn len[T](seqInst: T[]): int32 =
+    return seqInst.len
+
+fn dataPtr[T](seqInst: T[]): void* =
+    return seqInst.buffer
+
+fn add[T](seqInst: var T[], val: T) =
+    if seqInst.buffer == nil || seqInst.len >= seqInst.cap:
+        __seqGrowTo[T](seqInst, seqInst.len + 1)
+    let elemBytes: int32 = __seqBytesOf[T](seqInst.len)
+    let writePtr: T* = T*(ptr_add(seqInst.buffer, elemBytes))
+    *writePtr = val
+    seqInst.len = seqInst.len + 1
+
+fn seqAdd[T](seqInst: var T[], val: T) =
+    add[T](seqInst, val)
+
+fn addPtr[T](seqInst: var T[], val: T) =
+    add[T](seqInst, val)
+
+fn addPtr[T](seqInst: T[]*, val: T) =
+    if seqInst == nil:
+        return
+    if seqInst->buffer == nil || seqInst->len >= seqInst->cap:
+        __seqGrowToPtr[T](seqInst, seqInst->len + 1)
+    let elemBytes: int32 = __seqBytesOf[T](seqInst->len)
+    let writePtr: T* = T*(ptr_add(seqInst->buffer, elemBytes))
+    *writePtr = val
+    seqInst->len = seqInst->len + 1
+
+fn get[T](seqInst: T[], at: int32): T =
+    let readP: void* = cheng_seq_get(seqInst.buffer, seqInst.len, at, sizeof T)
+    let readT: T* = T*(readP)
+    return *readT
+
+fn findImpl[T](seqInst: T[], val: T, start: int32): int32 =
+    var index: int32 = start
+    if index < 0:
+        index = 0
+    while index < seqInst.len:
+        if get[T](seqInst, index) == val:
+            return index
+        index = index + 1
+    return -1
+
+fn find[T](seqInst: T[], val: T): int32 =
+    return findImpl[T](seqInst, val, 0)
+
+fn find[T](seqInst: T[], val: T, start: int32): int32 =
+    return findImpl[T](seqInst, val, start)
+
+fn getPtr[T](seqInst: var T[], at: int32): T =
+    let readP: void* = cheng_seq_get(seqInst.buffer, seqInst.len, at, sizeof T)
+    let readT: T* = T*(readP)
+    let out: T = *readT
+    return out
+
+fn getPtr[T](seqInst: T[]*, at: int32): T =
+    if seqInst == nil:
+        panic "cheng: nil seq pointer"
+    let readP: void* = cheng_seq_get(seqInst->buffer, seqInst->len, at, sizeof T)
+    let readT: T* = T*(readP)
+    let out: T = *readT
+    return out
+
+fn setPtr[T](seqInst: var T[], at: int32, val: T) =
+    let writeP: void* = cheng_seq_set(seqInst.buffer, seqInst.len, at, sizeof T)
+    let writeT: T* = T*(writeP)
+    *writeT = val
+
+fn setPtr[T](seqInst: T[]*, at: int32, val: T) =
+    if seqInst == nil:
+        panic "cheng: nil seq pointer"
+    let writeP: void* = cheng_seq_set(seqInst->buffer, seqInst->len, at, sizeof T)
+    let writeT: T* = T*(writeP)
+    *writeT = val
+
+fn delete[T](seqInst: var T[], at: int32) =
+    if at < 0 || at >= seqInst.len:
+        return
+    var index: int32 = at
+    while index + 1 < seqInst.len:
+        let srcBytes: int32 = __seqBytesOf[T](index + 1)
+        let dstBytes: int32 = __seqBytesOf[T](index)
+        let srcPtr: T* = T*(ptr_add(seqInst.buffer, srcBytes))
+        let dstPtr: T* = T*(ptr_add(seqInst.buffer, dstBytes))
+        *dstPtr = *srcPtr
+        index = index + 1
+    seqInst.len = seqInst.len - 1
+
+fn delete[T](seqInst: T[]*, at: int32) =
+    if seqInst == nil:
+        return
+    if at < 0 || at >= seqInst->len:
+        return
+    var index: int32 = at
+    while index + 1 < seqInst->len:
+        let srcBytes: int32 = __seqBytesOf[T](index + 1)
+        let dstBytes: int32 = __seqBytesOf[T](index)
+        let srcPtr: T* = T*(ptr_add(seqInst->buffer, srcBytes))
+        let dstPtr: T* = T*(ptr_add(seqInst->buffer, dstBytes))
+        *dstPtr = *srcPtr
+        index = index + 1
+    seqInst->len = seqInst->len - 1
+
+fn freeSeqPtr[T](seqInst: var T[]) =
     if seqInst.buffer != nil:
-        memRelease seqInst.buffer
+        memRelease(seqInst.buffer)
     seqInst.buffer = nil
     seqInst.len = 0
     seqInst.cap = 0
 
-fn arcRetainSeq[T](seqInst: seq[T]) =
-    if seqInst.buffer != nil:
-        memRetain seqInst.buffer
+fn freeSeqPtr[T](seqInst: T[]*) =
+    if seqInst == nil:
+        return
+    if seqInst->buffer != nil:
+        memRelease(seqInst->buffer)
+    seqInst->buffer = nil
+    seqInst->len = 0
+    seqInst->cap = 0
 
-fn arcReleaseSeq[T](seqInst: seq[T]) =
-    if seqInst.buffer != nil:
-        memRelease seqInst.buffer
+fn freeSeq[T](seqInst: var T[]) =
+    freeSeqPtr[T](seqInst)
 
-# Monomorphized seq for str (bootstrap).
+fn reset[T](seqInst: var T[]) =
+    freeSeqPtr[T](seqInst)
+
+fn arcRetainSeq[T](seqInst: T[]) =
+    if seqInst.buffer != nil:
+        memRetain(seqInst.buffer)
+
+fn arcReleaseSeq[T](seqInst: T[]) =
+    if seqInst.buffer != nil:
+        memRelease(seqInst.buffer)
+
+# Monomorphized legacy alias for str sequence (kept for bootstrap compatibility).
 type
-    seq_string =
-        len: int32
-        cap: int32
-        buffer: void*
-fn newSeq_string(len: int32, cap: int32): seq_string =
-    var seqInstance: seq_string
-    seqInstance.len = 0
-    seqInstance.cap = cap
-    if cap > 0:
-        var size64: int64 = int64(cap) * sizeof cstring
-        var size32: int32 = int32(size64)
-        seqInstance.buffer = alloc size32
-        if seqInstance.buffer != nil:
-            zeroMem(seqInstance.buffer, size32)
-    else:
-        seqInstance.buffer = nil
-    return seqInstance
-fn get_string(seqInst: seq_string, i: int32): str =
-    var idx64: int64 = int64(i)
-    var offset64: int64 = idx64 * sizeof cstring
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst.buffer, offset32)
-    var pt: str* = str*(p)
-    return *pt
+    seq_string = str[]
+
+fn newSeq_string(seqLen: int32, seqCap: int32): seq_string =
+    var seqInst: seq_string
+    if seqCap > 0:
+        reserve[str](seqInst, seqCap)
+    if seqLen > 0:
+        setLen[str](seqInst, seqLen)
+    return seqInst
+
+fn get_string(seqInst: seq_string, at: int32): str =
+    return get[str](seqInst, at)
+
+fn addPtr_string(seqInst: var seq_string, val: str) =
+    add[str](seqInst, val)
+
 fn addPtr_string(seqInst: seq_string*, val: str) =
-    if seqInst->len >= seqInst->cap:
-        let oldCap: int32 = seqInst->cap
-        var newCap: int32 = 4
-        if seqInst->cap != 0:
-            newCap = seqInst->cap * 2
-        seqInst->cap = newCap
-        var cap64: int64 = int64(newCap)
-        var size64: int64 = int64(cap64) * sizeof cstring
-        var size32: int32 = int32(size64)
-        seqInst->buffer = realloc(seqInst->buffer, size32)
-        if seqInst->buffer != nil && oldCap >= 0:
-            var oldSize64: int64 = int64(oldCap) * sizeof cstring
-            var oldSize32: int32 = int32(oldSize64)
-            if size32 > oldSize32:
-                zeroMem(ptr_add(seqInst->buffer, oldSize32), size32 - oldSize32)
-    var idx64: int64 = int64(seqInst->len)
-    var offset64: int64 = int64(idx64) * sizeof cstring
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst->buffer, offset32)
-    var pt: str* = str*(p)
-    *pt = val
-    seqInst->len = seqInst->len + 1
+    addPtr[str](seqInst, val)
 
-fn arcRetainSeqString(seqInst: seq[str]) =
-    if seqInst.buffer != nil:
-        memRetain seqInst.buffer
-    var i: int32 = 0
-    while i < seqInst.len:
-        let s: str = get[str](seqInst, i)
-        if s != nil:
-            memRetain void*(s)
-        i = i + 1
+fn setStringAt(seqInst: seq_string*, at: int32, val: str) =
+    setPtr[str](seqInst, at, val)
 
-fn arcReleaseSeqString(seqInst: seq[str]) =
-    var i: int32 = 0
-    while i < seqInst.len:
-        let s: str = get[str](seqInst, i)
-        if s != nil:
-            memRelease void*(s)
-        i = i + 1
-    if seqInst.buffer != nil:
-        memRelease seqInst.buffer
+fn getStringAtPtr(seqInst: seq_string*, at: int32): str =
+    return getPtr[str](seqInst, at)
 
-fn arcRetainSeq_string(seqInst: seq_string) =
-    if seqInst.buffer != nil:
-        memRetain seqInst.buffer
-    var i: int32 = 0
-    while i < seqInst.len:
-        let s: str = get_string(seqInst, i)
-        if s != nil:
-            memRetain void*(s)
-        i = i + 1
-
-fn arcReleaseSeq_string(seqInst: seq_string) =
-    var i: int32 = 0
-    while i < seqInst.len:
-        let s: str = get_string(seqInst, i)
-        if s != nil:
-            memRelease void*(s)
-        i = i + 1
-    if seqInst.buffer != nil:
-        memRelease seqInst.buffer
-# Minimal str(seq) helpers used by the IDE.
-fn setStringAt(seqInst: seq_string*, i: int32, val: str) =
-    var idx64: int64 = int64(i)
-    var offset64: int64 = idx64 * sizeof cstring
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst->buffer, offset32)
-    var pt: str* = str*(p)
-    *pt = val
-fn getStringAtPtr(seqInst: seq_string*, i: int32): str =
-    if seqInst == nil || seqInst->buffer == nil:
-        return nil
-    var idx64: int64 = int64(i)
-    var offset64: int64 = idx64 * sizeof cstring
-    var offset32: int32 = int32(offset64)
-    var p: void* = ptr_add(seqInst->buffer, offset32)
-    var pt: str* = str*(p)
-    return *pt
-fn insert(seqInst: seq_string*, val: str, idx: int32) =
-    var pos: int32 = idx
+fn insert(seqInst: seq_string*, val: str, at: int32) =
+    if seqInst == nil:
+        return
+    var pos: int32 = at
     if pos < 0:
         pos = 0
     if pos > seqInst->len:
         pos = seqInst->len
-    var oldLen: int32 = seqInst->len
-    addPtr_string(seqInst, val)
-    var j: int32 = oldLen
-    while j > pos:
-        setStringAt(seqInst, j, getStringAtPtr(seqInst, j - 1))
-        j = j - 1
-    setStringAt(seqInst, pos, val)
-fn delete(seqInst: seq_string*, idx: int32) =
-    if idx < 0 || idx >= seqInst->len:
-        return
-    var j: int32 = idx
-    while j + 1 < seqInst->len:
-        setStringAt(seqInst, j, getStringAtPtr(seqInst, j + 1))
-        j = j + 1
-    seqInst->len = seqInst->len - 1
+    let oldLen: int32 = seqInst->len
+    addPtr[str](seqInst, val)
+    var index: int32 = oldLen
+    while index > pos:
+        setPtr[str](seqInst, index, getPtr[str](seqInst, index - 1))
+        index = index - 1
+    setPtr[str](seqInst, pos, val)
+
+fn delete(seqInst: seq_string*, at: int32) =
+    delete[str](seqInst, at)
+
+fn arcRetainSeqString(seqInst: str[]) =
+    if seqInst.buffer != nil:
+        memRetain(seqInst.buffer)
+    var index: int32 = 0
+    while index < seqInst.len:
+        let value: str = get[str](seqInst, index)
+        if value != nil:
+            memRetain(void*(value))
+        index = index + 1
+
+fn arcReleaseSeqString(seqInst: str[]) =
+    var index: int32 = 0
+    while index < seqInst.len:
+        let value: str = get[str](seqInst, index)
+        if value != nil:
+            memRelease(void*(value))
+        index = index + 1
+    if seqInst.buffer != nil:
+        memRelease(seqInst.buffer)
+
+fn arcRetainSeq_string(seqInst: seq_string) =
+    arcRetainSeqString(seqInst)
+
+fn arcReleaseSeq_string(seqInst: seq_string) =
+    arcReleaseSeqString(seqInst)
+
+fn freeSeqPtr_string(seqInst: var seq_string) =
+    freeSeqPtr[str](seqInst)
 
 fn freeSeqPtr_string(seqInst: seq_string*) =
-    if seqInst == nil:
-        return
-    if seqInst->buffer != nil:
-        free seqInst->buffer
-    seqInst->buffer = nil
-    seqInst->len = 0
-    seqInst->cap = 0
-# Helper for generic pointer vector (for Node.kids)
-fn getPointer(v: seq[void*], i: int32): void* =
-    var p: void* = cheng_seq_get(v.buffer, v.len, i, sizeof VoidPtr)
-    return load_ptr p
-fn __cheng_vec_contains[T](seqInst: seq[T], val: T): bool =
-    var i: int32 = 0
-    while i < seqInst.len:
-        if seqInst[i] == val:
+    freeSeqPtr[str](seqInst)
+
+fn __cheng_vec_contains[T](seqInst: T[], val: T): bool =
+    var index: int32 = 0
+    let count: int32 = seqInst.len
+    while index < count:
+        let cur: T = get[T](seqInst, index)
+        if cur == val:
             return true
-        i = i + 1
+        index = index + 1
     return false
-fn __cheng_slice_vec[T](seqInst: seq[T], start: int32, stop: int32, exclusive: bool): seq[T] =
-    var s: int32 = start
-    var e: int32 = stop
+
+fn __cheng_slice_vec[T](seqInst: T[], start: int32, stop: int32, exclusive: bool): T[] =
+    var startIndex: int32 = start
+    var endIndex: int32 = stop
     if exclusive:
-        e = e - 1
-    if s < 0:
-        s = 0
-    if e < s || seqInst.len <= 0:
-        return newSeqWithCap[T](0, 0)
-    if s >= seqInst.len:
-        return newSeqWithCap[T](0, 0)
-    if e >= seqInst.len:
-        e = seqInst.len - 1
-    let count: int32 = e - s + 1
-    var out: seq[T] = newSeqWithCap[T](0, count)
-    var i: int32 = s
-    while i <= e:
-        if out.len >= out.cap:
-            var nextCap: int32 = 4
-            if out.cap > 0:
-                nextCap = out.cap * 2
-            reserve[T](&out, nextCap)
-        var srcIdx64: int64 = int64(i)
-        var srcOff64: int64 = srcIdx64 * sizeof T
-        var srcOff32: int32 = int32(srcOff64)
-        var srcP: void* = ptr_add(seqInst.buffer, srcOff32)
-        var srcT: T* = T*(srcP)
-        var dstIdx64: int64 = int64(out.len)
-        var dstOff64: int64 = dstIdx64 * sizeof T
-        var dstOff32: int32 = int32(dstOff64)
-        var dstP: void* = ptr_add(out.buffer, dstOff32)
-        var dstT: T* = T*(dstP)
-        *dstT = *srcT
-        out.len = out.len + 1
-        i = i + 1
+        endIndex = endIndex - 1
+    if startIndex < 0:
+        startIndex = 0
+    var out: T[]
+    if endIndex < startIndex || seqInst.len <= 0:
+        return out
+    if startIndex >= seqInst.len:
+        return out
+    if endIndex >= seqInst.len:
+        endIndex = seqInst.len - 1
+    reserve[T](out, endIndex - startIndex + 1)
+    var index: int32 = startIndex
+    while index <= endIndex:
+        add[T](out, get[T](seqInst, index))
+        index = index + 1
     return out

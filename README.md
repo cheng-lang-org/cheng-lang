@@ -1,8 +1,7 @@
 # Cheng toolchain
 
-This repository hosts the Cheng toolchain with a pure C bootstrap path.
-The toolchain no longer depends on the legacy compiler; bootstrap runs the
-direct C backend end-to-end.
+This repository hosts the Cheng toolchain with a backend-only bootstrap path.
+The toolchain no longer depends on legacy C bootstrap.
 
 ## Quick start
 
@@ -10,8 +9,8 @@ direct C backend end-to-end.
 src/tooling/bootstrap_pure.sh --fullspec
 ```
 
-This builds/refreshes `stage1_runner`, then runs the fullspec regression plus
-determinism check.
+This builds/refreshes backend selfhost `stage2` (`artifacts/backend_selfhost_self_obj/cheng.stage2`),
+then runs fullchain obj-only checks.
 
 ## Compile a program
 
@@ -19,7 +18,7 @@ determinism check.
 sh src/tooling/chengb.sh examples/hello_puts.cheng --run
 ```
 
-## ORC closedloop (direct C backend)
+## ORC closedloop (backend-only)
 
 ```bash
 CHENG_MM=orc sh src/tooling/chengc.sh examples/test_orc_closedloop.cheng --name:test_orc_closedloop
@@ -34,4 +33,4 @@ src/tooling/bootstrap_pure.sh --fullspec
 
 ## Notes
 
-- The toolchain supports both the self-developed obj backend and the direct C backend.
+- The toolchain uses backend-only obj/exe pipeline.

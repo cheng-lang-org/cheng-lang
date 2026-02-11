@@ -24,19 +24,19 @@ fn lowerTrace(msg: str) =
 
 type
     ParamList =
-        names: seq[str]
-        types: seq[Node]
-        defaults: seq[Node]
+        names: str[]
+        types: Node[]
+        defaults: Node[]
 
 type
     LowerExprResult =
         expr: Node
-        stmts: seq[Node]
+        stmts: Node[]
 
 type
     ClosureExprResult =
         expr: Node
-        stmts: seq[Node]
+        stmts: Node[]
         closureType: Node
 
 type
@@ -50,8 +50,8 @@ type
         frameName: str
         outName: str
         yieldType: Node
-        captureNames: seq[str]
-        captureTypes: seq[Node]
+        captureNames: str[]
+        captureTypes: Node[]
 
 type
     IterStmtResult =
@@ -66,49 +66,49 @@ type
         resultName: str
         driverName: str
         retType: Node
-        captureNames: seq[str]
-        captureTypes: seq[Node]
+        captureNames: str[]
+        captureTypes: Node[]
 
 type
     AsyncStmtResult =
         state: int32
         open: bool
-var lowerFnNames: seq[str] = newSeqWithCap[str](0, 64)
-var lowerFnNodes: seq[void*] = newSeqWithCap[void*](0, 64)
-var lowerTypeNames: seq[str] = newSeqWithCap[str](0, 64)
-var lowerTypeNodes: seq[void*] = newSeqWithCap[void*](0, 64)
-var lowerWrapperKeys: seq[str] = newSeqWithCap[str](0, 64)
-var lowerWrapperNames: seq[str] = newSeqWithCap[str](0, 64)
-var lowerFnIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
-var lowerTypeIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
-var lowerWrapperIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+var lowerFnNames: str[64]
+var lowerFnNodes: void*[64]
+var lowerTypeNames: str[64]
+var lowerTypeNodes: void*[64]
+var lowerWrapperKeys: str[64]
+var lowerWrapperNames: str[64]
+var lowerFnIndex: hashmaps.HashMapStrInt
+var lowerTypeIndex: hashmaps.HashMapStrInt
+var lowerWrapperIndex: hashmaps.HashMapStrInt
 
-var lowerIterNames: seq[str] = newSeqWithCap[str](0, 32)
-var lowerIterNodes: seq[void*] = newSeqWithCap[void*](0, 32)
-var lowerIterIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(128)
+var lowerIterNames: str[32]
+var lowerIterNodes: void*[32]
+var lowerIterIndex: hashmaps.HashMapStrInt
 
-var lowerValueNames: seq[str] = newSeqWithCap[str](0, 64)
-var lowerValueTypes: seq[Node] = newSeqWithCap[Node](0, 64)
-var lowerValueScopeStarts: seq[int32] = newSeqWithCap[int32](0, 16)
-var lowerValuePrevIndexPlus1: seq[int32] = newSeqWithCap[int32](0, 64)
-var lowerValueIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+var lowerValueNames: str[64]
+var lowerValueTypes: Node[64]
+var lowerValueScopeStarts: int32[16]
+var lowerValuePrevIndexPlus1: int32[64]
+var lowerValueIndex: hashmaps.HashMapStrInt
 
-var lowerClosureEnvNames: seq[str] = newSeqWithCap[str](0, 32)
-var lowerClosureBodyNames: seq[str] = newSeqWithCap[str](0, 32)
-var lowerClosureTrampNames: seq[str] = newSeqWithCap[str](0, 32)
-var lowerClosureLamPtrs: seq[void*] = newSeqWithCap[void*](0, 32)
-var lowerClosureLamEnvNames: seq[str] = newSeqWithCap[str](0, 32)
-var lowerClosureLamBodyNames: seq[str] = newSeqWithCap[str](0, 32)
-var lowerClosureLamTrampNames: seq[str] = newSeqWithCap[str](0, 32)
+var lowerClosureEnvNames: str[32]
+var lowerClosureBodyNames: str[32]
+var lowerClosureTrampNames: str[32]
+var lowerClosureLamPtrs: void*[32]
+var lowerClosureLamEnvNames: str[32]
+var lowerClosureLamBodyNames: str[32]
+var lowerClosureLamTrampNames: str[32]
 var lowerClosureCounter: int32 = 0
 var lowerClosureTempCounter: int32 = 0
-var lowerClosureDecls: seq[Node]* = nil
+var lowerClosureDecls: Node[]* = nil
 
 var lowerTempCounter: int32 = 0
 var lowerIterTempCounter: int32 = 0
-var lowerDiags: seq[Diagnostic]* = nil
+var lowerDiags: Diagnostic[]* = nil
 var lowerFilename: str = ""
-var lowerWrappers: seq[Node]* = nil
+var lowerWrappers: Node[]* = nil
 
 fn lower_zeroPos(): SourcePos =
     var pos: SourcePos
@@ -122,13 +122,13 @@ fn suffixAfter(s: str, prefix: str): str =
 fn lowerUnqualifyName(s: str): str =
     if s == nil || len s == 0:
         return ""
-    var i: int32 = len(s) - 1
-    while i >= 0:
-        if charAt(s, i) == '.':
+    let __for_start_i = len(s) - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        if s[i] == '.':
             if i + 1 < len(s):
                 return str(ptr_add(s, i + 1))
             return ""
-        i = i - 1
     return s
 
 fn lowerClearMaps() =
@@ -138,12 +138,24 @@ fn lowerClearMaps() =
     lowerTypeNodes.len = 0
     lowerWrapperKeys.len = 0
     lowerWrapperNames.len = 0
-    hashmaps.hashMapStrIntClear(&lowerFnIndex)
-    hashmaps.hashMapStrIntClear(&lowerTypeIndex)
-    hashmaps.hashMapStrIntClear(&lowerWrapperIndex)
+    if lowerFnIndex.mask == 0:
+        lowerFnIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(&lowerFnIndex)
+    if lowerTypeIndex.mask == 0:
+        lowerTypeIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(&lowerTypeIndex)
+    if lowerWrapperIndex.mask == 0:
+        lowerWrapperIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(&lowerWrapperIndex)
     lowerIterNames.len = 0
     lowerIterNodes.len = 0
-    hashmaps.hashMapStrIntClear(&lowerIterIndex)
+    if lowerIterIndex.mask == 0:
+        lowerIterIndex = hashmaps.hashMapStrIntInit(128)
+    else:
+        hashmaps.hashMapStrIntClear(&lowerIterIndex)
     lowerValueClear()
 
 fn lowerValueClear() =
@@ -151,7 +163,10 @@ fn lowerValueClear() =
     lowerValueTypes.len = 0
     lowerValueScopeStarts.len = 0
     lowerValuePrevIndexPlus1.len = 0
-    hashmaps.hashMapStrIntClear(&lowerValueIndex)
+    if lowerValueIndex.mask == 0:
+        lowerValueIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(&lowerValueIndex)
 
 fn lowerValueScopePush() =
     addPtr[int32](&lowerValueScopeStarts, lowerValueNames.len)
@@ -161,12 +176,12 @@ fn lowerValueScopePop() =
         return
     let start: int32 = get[int32](lowerValueScopeStarts, lowerValueScopeStarts.len - 1)
     lowerValueScopeStarts.len = lowerValueScopeStarts.len - 1
-    var i: int32 = lowerValueNames.len - 1
-    while i >= start:
+    let __for_start_i = lowerValueNames.len - 1
+    for __for_rev_i in 0..(__for_start_i - (start)):
+        let i = __for_start_i - __for_rev_i
         let nm: str = get[str](lowerValueNames, i)
         let prevIndexPlus1: int32 = get[int32](lowerValuePrevIndexPlus1, i)
         hashmaps.hashMapStrIntPut(&lowerValueIndex, nm, prevIndexPlus1)
-        i = i - 1
     lowerValueNames.len = start
     lowerValueTypes.len = start
     lowerValuePrevIndexPlus1.len = start
@@ -177,7 +192,7 @@ fn lowerValueAdd(name: str, ty: Node) =
     if ty == nil || ty.kind == nkEmpty:
         return
     var found: bool = false
-    let prevIndexPlus1: int32 = hashmaps.hashMapStrIntGet(lowerValueIndex, name, &found)
+    let prevIndexPlus1: int32 = hashmaps.hashMapStrIntGetEx(lowerValueIndex, name, &found)
     if found:
         addPtr[int32](&lowerValuePrevIndexPlus1, prevIndexPlus1)
     else:
@@ -191,7 +206,7 @@ fn lowerValueLookup(name: str): Node =
     if name == nil || len name == 0:
         return nil
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(lowerValueIndex, name, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(lowerValueIndex, name, &found)
     if !found || idxPlus1 <= 0:
         return nil
     let idx: int32 = idxPlus1 - 1
@@ -219,51 +234,47 @@ fn lowerMapHasIndex(index: hashmaps.HashMapStrInt*, key: str): bool =
     if key == nil || len key == 0:
         return false
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(*index, key, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(*index, key, &found)
     return found && idxPlus1 > 0
 
-fn lowerMapPutIndex(keys: seq[str]*, vals: seq[void*]*, index: hashmaps.HashMapStrInt*, key: str, val: Node) =
+fn lowerMapPutIndex(keys: str[]*, vals: ptr[]*, index: hashmaps.HashMapStrInt*, key: str, val: Node) =
     if index == nil || key == nil || len key == 0:
         return
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(*index, key, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(*index, key, &found)
     if found && idxPlus1 > 0:
         return
     addPtr[str](keys, key)
-    addPtr[void*](vals, void*(val))
+    addPtr[ptr](vals, void*(val))
     let idx: int32 = keys->len - 1
     hashmaps.hashMapStrIntPut(index, key, idx + 1)
 
-fn lowerMapGetIndex(keys: seq[str], vals: seq[void*], index: hashmaps.HashMapStrInt*, key: str): Node =
+fn lowerMapGetIndex(keys: str[], vals: ptr[], index: hashmaps.HashMapStrInt*, key: str): Node =
     if index == nil || key == nil || len key == 0:
         return nil
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(*index, key, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(*index, key, &found)
     if !found || idxPlus1 <= 0:
         return nil
     let idx: int32 = idxPlus1 - 1
     if idx < 0 || idx >= vals.len:
         return nil
-    return Node(get[void*](vals, idx))
+    return Node(get[ptr](vals, idx))
 
-fn lowerMapHas(keys: seq[str], key: str): bool =
-    var i: int32 = 0
-    while i < keys.len:
+fn lowerMapHas(keys: str[], key: str): bool =
+    for i in 0..<keys.len:
         if streq(get[str](keys, i), key):
             return true
-        i = i + 1
     return false
 
-fn lowerMapPut(keys: seq[str]*, vals: seq[void*]*, key: str, val: Node) =
+fn lowerMapPut(keys: str[]*, vals: ptr[]*, key: str, val: Node) =
     addPtr[str](keys, key)
-    addPtr[void*](vals, void*(val))
+    addPtr[ptr](vals, void*(val))
 
-fn lowerMapGet(keys: seq[str], vals: seq[void*], key: str): Node =
-    var i: int32 = 0
-    while i < keys.len:
+fn lowerMapGet(keys: str[], vals: ptr[], key: str): Node =
+    for i in 0..<keys.len:
         if streq(get[str](keys, i), key):
-            return Node(get[void*](vals, i))
-        i = i + 1
+            return Node(get[ptr](vals, i))
     return nil
 
 fn lowerClosureClear() =
@@ -280,11 +291,9 @@ fn lowerClosureClear() =
 fn lowerClosureIndex(envName: str): int32 =
     if envName == nil || len envName == 0:
         return -1
-    var i: int32 = 0
-    while i < lowerClosureEnvNames.len:
+    for i in 0..<lowerClosureEnvNames.len:
         if get[str](lowerClosureEnvNames, i) == envName:
             return i
-        i = i + 1
     return -1
 
 fn lowerClosureRegister(envName: str, bodyName: str, trampName: str) =
@@ -300,17 +309,15 @@ fn lowerClosureLamIndex(lam: Node): int32 =
     if lam == nil:
         return -1
     let ptrVal: void* = void*(lam)
-    var i: int32 = 0
-    while i < lowerClosureLamPtrs.len:
-        if get[void*](lowerClosureLamPtrs, i) == ptrVal:
+    for i in 0..<lowerClosureLamPtrs.len:
+        if get[ptr](lowerClosureLamPtrs, i) == ptrVal:
             return i
-        i = i + 1
     return -1
 
 fn lowerClosureLamRegister(lam: Node, envName: str, bodyName: str, trampName: str) =
     if lam == nil:
         return
-    addPtr[void*](&lowerClosureLamPtrs, void*(lam))
+    addPtr[ptr](&lowerClosureLamPtrs, void*(lam))
     addPtr[str](&lowerClosureLamEnvNames, envName)
     addPtr[str](&lowerClosureLamBodyNames, bodyName)
     addPtr[str](&lowerClosureLamTrampNames, trampName)
@@ -324,10 +331,8 @@ fn lowerCollectFns(n: Node) =
             let nm: str = stripSpaces(plainName(nameNode))
             if len nm > 0 && !lowerMapHasIndex(&lowerFnIndex, nm):
                 lowerMapPutIndex(&lowerFnNames, &lowerFnNodes, &lowerFnIndex, nm, n)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         lowerCollectFns kid(n, i)
-        i = i + 1
 
 fn lowerCollectTypes(n: Node) =
     if n == nil:
@@ -339,23 +344,23 @@ fn lowerCollectTypes(n: Node) =
         if len nm > 0 && defNode != nil && defNode.kind == nkObjectDecl:
             if !lowerMapHasIndex(&lowerTypeIndex, nm):
                 lowerMapPutIndex(&lowerTypeNames, &lowerTypeNodes, &lowerTypeIndex, nm, defNode)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         lowerCollectTypes kid(n, i)
-        i = i + 1
 
 fn lowerParamListFromFn(fnNode: Node): ParamList =
     var out: ParamList
-    out.names = newSeqWithCap[str](0, 4)
-    out.types = newSeqWithCap[Node](0, 4)
-    out.defaults = newSeqWithCap[Node](0, 4)
+    out.names = []
+    out.types = []
+    out.defaults = []
+    out.names.cap = 4
+    out.types.cap = 4
+    out.defaults.cap = 4
     if fnNode == nil || kidCount fnNode < 2:
         return out
     let paramsNode: Node = kid(fnNode, 1)
     if paramsNode == nil || paramsNode.kind != nkFormalParams:
         return out
-    var i: int32 = 0
-    while i < kidCount paramsNode:
+    for i in 0..<kidCount paramsNode:
         let defs: Node = kid(paramsNode, i)
         if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 0:
             let nameNode: Node = kid(defs, 0)
@@ -373,14 +378,16 @@ fn lowerParamListFromFn(fnNode: Node): ParamList =
             addPtr[str](&out.names, nm)
             addPtr[Node](&out.types, typeNode)
             addPtr[Node](&out.defaults, defNode)
-        i = i + 1
     return out
 
 fn lowerParamListFromType(typeNode: Node): ParamList =
     var out: ParamList
-    out.names = newSeqWithCap[str](0, 4)
-    out.types = newSeqWithCap[Node](0, 4)
-    out.defaults = newSeqWithCap[Node](0, 4)
+    out.names = []
+    out.types = []
+    out.defaults = []
+    out.names.cap = 4
+    out.types.cap = 4
+    out.defaults.cap = 4
     if typeNode == nil || typeNode.kind != nkObjectDecl:
         return out
     if kidCount typeNode < 2:
@@ -388,8 +395,7 @@ fn lowerParamListFromType(typeNode: Node): ParamList =
     let recList: Node = kid(typeNode, 1)
     if recList == nil:
         return out
-    var i: int32 = 0
-    while i < kidCount recList:
+    for i in 0..<kidCount recList:
         let defs: Node = kid(recList, i)
         if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 0:
             let nameNode: Node = kid(defs, 0)
@@ -407,17 +413,14 @@ fn lowerParamListFromType(typeNode: Node): ParamList =
             addPtr[str](&out.names, nm)
             addPtr[Node](&out.types, typeNode2)
             addPtr[Node](&out.defaults, defNode)
-        i = i + 1
     return out
 
-fn lowerParamIndex(names: seq[str], name: str): int32 =
+fn lowerParamIndex(names: str[], name: str): int32 =
     if name == nil || len name == 0:
         return -1
-    var i: int32 = 0
-    while i < names.len:
+    for i in 0..<names.len:
         if get[str](names, i) == name:
             return i
-        i = i + 1
     return -1
 
 fn lowerCloneShallow(n: Node): Node =
@@ -477,25 +480,21 @@ fn lowerMakeRefType(base: Node, pos: SourcePos): Node =
     addSon(rt, base)
     return rt
 
-fn lowerMakeCall(name: str, pos: SourcePos, args: seq[Node]): Node =
+fn lowerMakeCall(name: str, pos: SourcePos, args: Node[]): Node =
     var call: Node = newNode(nkCall, pos)
     call.callStyle = CallStyleParen
     addSon(call, newIdent(name, pos))
-    var i: int32 = 0
-    while i < args.len:
+    for i in 0..<args.len:
         addSon(call, get[Node](args, i))
-        i = i + 1
     return call
 
-fn lowerSeqStrHas(v: seq[str], key: str): bool =
-    var i: int32 = 0
-    while i < v.len:
+fn lowerSeqStrHas(v: str[], key: str): bool =
+    for i in 0..<v.len:
         if get[str](v, i) == key:
             return true
-        i = i + 1
     return false
 
-fn lowerSeqStrAdd(v: seq[str]*, key: str) =
+fn lowerSeqStrAdd(v: str[]*, key: str) =
     if v == nil || key == nil || len key == 0:
         return
     if lowerSeqStrHas(*v, key):
@@ -505,7 +504,10 @@ fn lowerSeqStrAdd(v: seq[str]*, key: str) =
 fn lowerClearIterMaps() =
     lowerIterNames.len = 0
     lowerIterNodes.len = 0
-    hashmaps.hashMapStrIntClear(&lowerIterIndex)
+    if lowerIterIndex.mask == 0:
+        lowerIterIndex = hashmaps.hashMapStrIntInit(128)
+    else:
+        hashmaps.hashMapStrIntClear(&lowerIterIndex)
 
 fn lowerCollectIterators(n: Node) =
     if n == nil:
@@ -516,30 +518,26 @@ fn lowerCollectIterators(n: Node) =
             let nm: str = stripSpaces(plainName(nameNode))
             if len nm > 0 && !lowerMapHasIndex(&lowerIterIndex, nm):
                 lowerMapPutIndex(&lowerIterNames, &lowerIterNodes, &lowerIterIndex, nm, n)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         lowerCollectIterators kid(n, i)
-        i = i + 1
 
 fn lowerIterLookup(name: str): Node =
     if len name == 0:
         return nil
     return lowerMapGetIndex(lowerIterNames, lowerIterNodes, &lowerIterIndex, name)
 
-fn lowerBuildWrapperName(baseName: str, order: seq[int32]): str =
+fn lowerBuildWrapperName(baseName: str, order: int32[]): str =
     var out: str = baseName + "__wrap"
     if order.len == 0:
         return out + "_none"
-    var i: int32 = 0
-    while i < order.len:
+    for i in 0..<order.len:
         out = out + "_"
         out = out + intToStr(get[int32](order, i))
-        i = i + 1
     return out
 
-fn lowerWrapperNameFor(key: str, baseName: str, order: seq[int32]): str =
+fn lowerWrapperNameFor(key: str, baseName: str, order: int32[]): str =
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(lowerWrapperIndex, key, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(lowerWrapperIndex, key, &found)
     if found && idxPlus1 > 0 && idxPlus1 <= lowerWrapperNames.len:
         return get[str](lowerWrapperNames, idxPlus1 - 1)
     let name: str = lowerBuildWrapperName(baseName, order)
@@ -555,15 +553,14 @@ fn lowerIsVoidType(n: Node): bool =
         return true
     return false
 
-fn lowerBuildWrapper(fnNode: Node, typeNode: Node, baseName: str, order: seq[int32], params: ParamList, assigned: seq[Node], pos: SourcePos): Node =
+fn lowerBuildWrapper(fnNode: Node, typeNode: Node, baseName: str, order: int32[], params: ParamList, assigned: Node[], pos: SourcePos): Node =
     var wrapper: Node = newNode(nkFnDecl, pos)
     if fnNode != nil:
         wrapper.kind = fnNode.kind
     let wrapperName: str = lowerBuildWrapperName(baseName, order)
     addSon(wrapper, newIdent(wrapperName, pos))
     var fp: Node = newNode(nkFormalParams, pos)
-    var oi: int32 = 0
-    while oi < order.len:
+    for oi in 0..<order.len:
         let pidx: int32 = get[int32](order, oi)
         if pidx >= 0 && pidx < params.names.len:
             let pname: str = get[str](params.names, pidx)
@@ -576,7 +573,6 @@ fn lowerBuildWrapper(fnNode: Node, typeNode: Node, baseName: str, order: seq[int
                 addSon(defs, newNode(nkEmpty, pos))
             addSon(defs, newNode(nkEmpty, pos))
             addSon(fp, defs)
-        oi = oi + 1
     addSon(wrapper, fp)
     var retType: Node = newNode(nkEmpty, pos)
     if fnNode != nil && kidCount fnNode > 2:
@@ -585,8 +581,7 @@ fn lowerBuildWrapper(fnNode: Node, typeNode: Node, baseName: str, order: seq[int
         retType = newIdent(baseName, pos)
     addSon(wrapper, cloneTree retType)
     var body: Node = newNode(nkStmtList, pos)
-    var pi: int32 = 0
-    while pi < params.names.len:
+    for pi in 0..<params.names.len:
         if get[Node](assigned, pi) == nil:
             let pname2: str = get[str](params.names, pi)
             let ptype2: Node = get[Node](params.types, pi)
@@ -603,14 +598,11 @@ fn lowerBuildWrapper(fnNode: Node, typeNode: Node, baseName: str, order: seq[int
                 addSon(body, letNode)
             else:
                 lowerAddError(pos, "C-profile lowering: missing default for parameter " + pname2)
-        pi = pi + 1
     var callNode: Node = newNode(nkCall, pos)
     addSon(callNode, newIdent(baseName, pos))
-    var ai: int32 = 0
-    while ai < params.names.len:
+    for ai in 0..<params.names.len:
         let aname: str = get[str](params.names, ai)
         addSon(callNode, newIdent(aname, pos))
-        ai = ai + 1
     if lowerIsVoidType(retType):
         addSon(body, callNode)
     else:
@@ -637,9 +629,6 @@ fn lowerCallTargetName(callee: Node): str =
 
 fn lowerCallParamList(name: str): ParamList =
     var out: ParamList
-    out.names = newSeqWithCap[str](0, 0)
-    out.types = newSeqWithCap[Node](0, 0)
-    out.defaults = newSeqWithCap[Node](0, 0)
     if len name == 0:
         return out
     let fnNode: Node = lowerMapGetIndex(lowerFnNames, lowerFnNodes, &lowerFnIndex, name)
@@ -651,8 +640,8 @@ fn lowerCallParamList(name: str): ParamList =
     return out
 
 fn lowerNamedExpr(n: Node): Node
-fn lowerNamedStmt(n: Node, wrappers: seq[Node]*): Node
-fn lowerNamedCall(n: Node, wrappers: seq[Node]*): Node
+fn lowerNamedStmt(n: Node, wrappers: Node[]*): Node
+fn lowerNamedCall(n: Node, wrappers: Node[]*): Node
 
 fn lowerNamedExpr(n: Node): Node =
     if n == nil:
@@ -660,9 +649,9 @@ fn lowerNamedExpr(n: Node): Node =
     case n.kind
     of nkCall:
         var changed: bool = false
-        var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var i: int32 = 0
-        while i < kidCount n:
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
             let oldChild: Node = kid(n, i)
             var child: Node = oldChild
             if i == 0:
@@ -696,14 +685,11 @@ fn lowerNamedExpr(n: Node): Node =
             if child != oldChild:
                 changed = true
             addPtr[Node](&outKids, child)
-            i = i + 1
         var outCall: Node = n
         if changed:
             outCall = lowerCloneShallow n
-            var k: int32 = 0
-            while k < outKids.len:
+            for k in 0..<outKids.len:
                 addSon(outCall, get[Node](outKids, k))
-                k = k + 1
         if lowerWrappers != nil:
             return lowerNamedCall(outCall, lowerWrappers)
         return outCall
@@ -720,9 +706,9 @@ fn lowerNamedExpr(n: Node): Node =
         return n
     of nkLambda:
         var changed: bool = false
-        var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var i: int32 = 0
-        while i < kidCount n:
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
             let oldChild: Node = kid(n, i)
             var child: Node = oldChild
             if i == 3:
@@ -732,36 +718,30 @@ fn lowerNamedExpr(n: Node): Node =
             if child != oldChild:
                 changed = true
             addPtr[Node](&outKids, child)
-            i = i + 1
         if !changed:
             return n
         var out: Node = lowerCloneShallow n
-        var k: int32 = 0
-        while k < outKids.len:
+        for k in 0..<outKids.len:
             addSon(out, get[Node](outKids, k))
-            k = k + 1
         return out
     else:
         var changed2: bool = false
-        var outKids2: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var j: int32 = 0
-        while j < kidCount n:
+        var outKids2: Node[]
+        outKids2.cap = kidCount n
+        for j in 0..<kidCount n:
             let oldChild2: Node = kid(n, j)
             let child2: Node = lowerNamedExpr(oldChild2)
             if child2 != oldChild2:
                 changed2 = true
             addPtr[Node](&outKids2, child2)
-            j = j + 1
         if !changed2:
             return n
         var out2: Node = lowerCloneShallow n
-        var k2: int32 = 0
-        while k2 < outKids2.len:
+        for k2 in 0..<outKids2.len:
             addSon(out2, get[Node](outKids2, k2))
-            k2 = k2 + 1
         return out2
 
-fn lowerNamedCall(n: Node, wrappers: seq[Node]*): Node =
+fn lowerNamedCall(n: Node, wrappers: Node[]*): Node =
     if n == nil || n.kind != nkCall:
         return n
     if kidCount n == 0:
@@ -774,16 +754,13 @@ fn lowerNamedCall(n: Node, wrappers: seq[Node]*): Node =
     if params.names.len == 0:
         return n
     let paramCount: int32 = params.names.len
-    var assigned: seq[Node] = newSeqWithCap[Node](0, paramCount)
-    var ai: int32 = 0
-    while ai < paramCount:
-        addPtr[Node](&assigned, nil)
-        ai = ai + 1
-    var order: seq[int32] = newSeqWithCap[int32](0, kidCount(n) - 1)
+    var assigned: Node[]
+    assigned.len = int(paramCount)
+    var order: int32[]
+    order.cap = kidCount(n) - 1
     var posIdx: int32 = 0
-    var argIndex: int32 = 1
     var sawNamed: bool = false
-    while argIndex < kidCount n:
+    for argIndex in 1..<kidCount n:
         let arg: Node = kid(n, argIndex)
         if arg != nil && arg.kind == nkCallArg && kidCount arg > 1:
             sawNamed = true
@@ -798,7 +775,9 @@ fn lowerNamedCall(n: Node, wrappers: seq[Node]*): Node =
             setPtr[Node](&assigned, pidx, valNode)
             addPtr[int32](&order, pidx)
         else:
-            while posIdx < paramCount && get[Node](assigned, posIdx) != nil:
+            for __for_guard_posIdx in 0..<paramCount:
+                if !(posIdx < paramCount && get[Node](assigned, posIdx) != nil):
+                    break
                 posIdx = posIdx + 1
             if posIdx >= paramCount:
                 return n
@@ -808,26 +787,21 @@ fn lowerNamedCall(n: Node, wrappers: seq[Node]*): Node =
             setPtr[Node](&assigned, posIdx, valNode2)
             addPtr[int32](&order, posIdx)
             posIdx = posIdx + 1
-        argIndex = argIndex + 1
     var hasMissing: bool = false
-    var mi: int32 = 0
-    while mi < paramCount:
+    for mi in 0..<paramCount:
         if get[Node](assigned, mi) == nil:
             let defNode: Node = get[Node](params.defaults, mi)
             if defNode != nil && defNode.kind != nkEmpty:
                 hasMissing = true
             else:
                 return n
-        mi = mi + 1
     if !sawNamed && !hasMissing:
         return n
     var key: str = baseName + "|"
-    var ki: int32 = 0
-    while ki < order.len:
+    for ki in 0..<order.len:
         if ki > 0:
             key = key + ","
         key = key + intToStr(get[int32](order, ki))
-        ki = ki + 1
     let exists: bool = lowerMapHasIndex(&lowerWrapperIndex, key)
     let wrapperName: str = lowerWrapperNameFor(key, baseName, order)
     if !exists:
@@ -838,8 +812,7 @@ fn lowerNamedCall(n: Node, wrappers: seq[Node]*): Node =
     var newCall: Node = newNode(nkCall, n.pos)
     newCall.callStyle = n.callStyle
     addSon(newCall, newIdent(wrapperName, n.pos))
-    var ai2: int32 = 1
-    while ai2 < kidCount n:
+    for ai2 in 1..<kidCount n:
         let arg2: Node = kid(n, ai2)
         if arg2 != nil && arg2.kind == nkCallArg && kidCount arg2 > 1:
             addSon(newCall, kid(arg2, 1))
@@ -847,46 +820,42 @@ fn lowerNamedCall(n: Node, wrappers: seq[Node]*): Node =
             addSon(newCall, kid(arg2, 0))
         else:
             addSon(newCall, arg2)
-        ai2 = ai2 + 1
     return newCall
 
-fn lowerNamedStmt(n: Node, wrappers: seq[Node]*): Node =
+fn lowerNamedStmt(n: Node, wrappers: Node[]*): Node =
     if n == nil:
         return nil
     case n.kind
     of nkModule, nkStmtList:
         var changed: bool = false
-        var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var i: int32 = 0
-        while i < kidCount n:
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
             let oldChild: Node = kid(n, i)
             let child: Node = lowerNamedStmt(oldChild, wrappers)
             if child != oldChild:
                 changed = true
             if child != nil:
                 addPtr[Node](&outKids, child)
-            i = i + 1
         if !changed:
             return n
         var out: Node = lowerCloneShallow n
-        var k: int32 = 0
-        while k < outKids.len:
+        for k in 0..<outKids.len:
             addSon(out, get[Node](outKids, k))
-            k = k + 1
         return out
     of nkFnDecl, nkIteratorDecl:
         var changed2: bool = false
-        var outKids2: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var i2: int32 = 0
-        while i2 < kidCount n:
+        var outKids2: Node[]
+        outKids2.cap = kidCount n
+        for i2 in 0..<kidCount n:
             let oldChild2: Node = kid(n, i2)
             var child2: Node = oldChild2
             if i2 == 1 && oldChild2 != nil && oldChild2.kind == nkFormalParams:
                 var fp: Node = oldChild2
                 var fpChanged: bool = false
-                var fpKids: seq[Node] = newSeqWithCap[Node](0, kidCount fp)
-                var pi: int32 = 0
-                while pi < kidCount fp:
+                var fpKids: Node[]
+                fpKids.cap = kidCount fp
+                for pi in 0..<kidCount fp:
                     let defs: Node = kid(fp, pi)
                     var defsOut: Node = defs
                     if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 2:
@@ -901,13 +870,10 @@ fn lowerNamedStmt(n: Node, wrappers: seq[Node]*): Node =
                             addSon(defsOut, newDef)
                             fpChanged = true
                     addPtr[Node](&fpKids, defsOut)
-                    pi = pi + 1
                 if fpChanged:
                     fp = newNode(nkFormalParams, oldChild2.pos)
-                    var pk: int32 = 0
-                    while pk < fpKids.len:
+                    for pk in 0..<fpKids.len:
                         addSon(fp, get[Node](fpKids, pk))
-                        pk = pk + 1
                     child2 = fp
                     changed2 = true
             elif i2 == 3:
@@ -919,14 +885,11 @@ fn lowerNamedStmt(n: Node, wrappers: seq[Node]*): Node =
                 if child2 != oldChild2:
                     changed2 = true
             addPtr[Node](&outKids2, child2)
-            i2 = i2 + 1
         if !changed2:
             return n
         var out2: Node = lowerCloneShallow n
-        var k2: int32 = 0
-        while k2 < outKids2.len:
+        for k2 in 0..<outKids2.len:
             addSon(out2, get[Node](outKids2, k2))
-            k2 = k2 + 1
         return out2
     else:
         return lowerNamedExpr(n)
@@ -941,27 +904,23 @@ fn lowerNamedDefault(root: Node): Node =
     if pre != nil:
         lowerCollectFns pre
         lowerCollectTypes pre
-    var wrappers: seq[Node] = newSeqWithCap[Node](0, 8)
+    var wrappers: Node[8]
     lowerWrappers = &wrappers
     var lowered: Node = lowerNamedStmt(pre, &wrappers)
     lowerWrappers = nil
     if wrappers.len == 0:
         return lowered
     var out: Node = lowerCloneShallow lowered
-    var i: int32 = 0
-    while i < kidCount lowered:
+    for i in 0..<kidCount lowered:
         addSon(out, kid(lowered, i))
-        i = i + 1
-    var wi: int32 = 0
-    while wi < wrappers.len:
+    for wi in 0..<wrappers.len:
         addSon(out, get[Node](wrappers, wi))
-        wi = wi + 1
     return out
 
 fn closureExprResult(expr: Node): ClosureExprResult =
     var out: ClosureExprResult
     out.expr = expr
-    out.stmts = newSeqWithCap[Node](0, 0)
+    out.stmts = []
     out.closureType = nil
     return out
 
@@ -995,8 +954,8 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
             outId.closureType = ty
         return outId
     of nkLambda:
-        var capNames: seq[str] = newSeqWithCap[str](0, 4)
-        var capTypes: seq[Node] = newSeqWithCap[Node](0, 4)
+        var capNames: str[4]
+        var capTypes: Node[4]
         lowerCollectCaptures(n, &capNames, &capTypes)
         if capNames.len == 0:
             let simpleName: str = "__cheng_lambda_" + intToStr(lowerClosureCounter)
@@ -1047,15 +1006,13 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
         addSon(envVar, newNode(nkEmpty, n.pos))
         var outRes: ClosureExprResult = closureExprResult(newIdent(envVarName, n.pos))
         addPtr[Node](&outRes.stmts, envVar)
-        var ci: int32 = 0
-        while ci < capNames.len:
+        for ci in 0..<capNames.len:
             let cname: str = get[str](capNames, ci)
             var asn: Node = newNode(nkAsgn, n.pos)
             addSon(asn, lowerMakeDot(envVarName, cname, n.pos))
             addSon(asn, newIdent(cname, n.pos))
             addPtr[Node](&outRes.stmts, asn)
-            ci = ci + 1
-        var addrArgs: seq[Node] = newSeqWithCap[Node](0, 1)
+        var addrArgs: Node[1]
         addPtr[Node](&addrArgs, newIdent(envVarName, n.pos))
         outRes.expr = lowerMakeCall("__addr", n.pos, addrArgs)
         var envTypeNode: Node = lowerMakePtrType(newIdent(envName, n.pos), n.pos)
@@ -1070,14 +1027,14 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
         if baseName != "":
             fnNode = lowerMapGetIndex(lowerFnNames, lowerFnNodes, &lowerFnIndex, baseName)
         if fnNode != nil && lowerFnHasImportc(fnNode):
-            var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-            var outStmts: seq[Node] = newSeqWithCap[Node](0, 0)
+            var outKids: Node[]
+            outKids.cap = kidCount n
+            var outStmts: Node[]
             let calleeRes: ClosureExprResult = lowerClosureExpr(calleeNode)
             lowerAppendStmts(&outStmts, calleeRes.stmts)
             addPtr[Node](&outKids, calleeRes.expr)
             let params: ParamList = lowerParamListFromFn(fnNode)
-            var argIndex: int32 = 1
-            while argIndex < kidCount n:
+            for argIndex in 1..<kidCount n:
                 let argNode: Node = kid(n, argIndex)
                 var argExpr: Node = argNode
                 var argNameNode: Node = nil
@@ -1107,9 +1064,7 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
                             if !hasCtxArg:
                                 lowerAddError(n.pos, "[C-Profile] not-mapped: callback without ctx argument (FULLC.F04). hint: pass ctx env argument at call site.")
                             if hasCtxArg:
-                                argIndex = argIndex + 1
                             addPtr[Node](&outKids, ctxExpr)
-                            argIndex = argIndex + 1
                             continue
                 if argNameNode != nil:
                     var outArg: Node = newNode(nkCallArg, n.pos)
@@ -1118,22 +1073,19 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
                     addPtr[Node](&outKids, outArg)
                 else:
                     addPtr[Node](&outKids, argRes.expr)
-                argIndex = argIndex + 1
             var outCall: Node = lowerCloneShallow n
-            var i0: int32 = 0
-            while i0 < outKids.len:
+            for i0 in 0..<outKids.len:
                 addSon(outCall, get[Node](outKids, i0))
-                i0 = i0 + 1
             var outResImp: ClosureExprResult = closureExprResult(outCall)
             outResImp.stmts = outStmts
             return outResImp
         let calleeRes2: ClosureExprResult = lowerClosureExpr(calleeNode)
-        var outKids2: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var outStmts2: seq[Node] = newSeqWithCap[Node](0, 0)
+        var outKids2: Node[]
+        outKids2.cap = kidCount n
+        var outStmts2: Node[]
         lowerAppendStmts(&outStmts2, calleeRes2.stmts)
         addPtr[Node](&outKids2, calleeRes2.expr)
-        var ai: int32 = 1
-        while ai < kidCount n:
+        for ai in 1..<kidCount n:
             let arg2: Node = kid(n, ai)
             var argExpr2: Node = arg2
             var argName2: Node = nil
@@ -1149,7 +1101,6 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
                 addPtr[Node](&outKids2, outArg2)
             else:
                 addPtr[Node](&outKids2, argRes2.expr)
-            ai = ai + 1
         var calleeTy: Node = calleeRes2.closureType
         let calleeExpr2: Node = calleeRes2.expr
         if calleeTy == nil && calleeExpr2 != nil && (calleeExpr2.kind == nkIdent || calleeExpr2.kind == nkSymbol):
@@ -1157,21 +1108,18 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
             calleeTy = lowerValueLookup nm2
         let bodyName2: str = lowerClosureBodyNameFromType(calleeTy)
         if bodyName2 != "":
-            var callArgs2: seq[Node] = newSeqWithCap[Node](0, kidCount n)
+            var callArgs2: Node[]
+            callArgs2.cap = kidCount n
             addPtr[Node](&callArgs2, calleeRes2.expr)
-            var bi: int32 = 1
-            while bi < outKids2.len:
+            for bi in 1..<outKids2.len:
                 addPtr[Node](&callArgs2, get[Node](outKids2, bi))
-                bi = bi + 1
             var bodyCall2: Node = lowerMakeCall(bodyName2, n.pos, callArgs2)
             var outResCall: ClosureExprResult = closureExprResult(bodyCall2)
             outResCall.stmts = outStmts2
             return outResCall
         var outCall2: Node = lowerCloneShallow n
-        var k: int32 = 0
-        while k < outKids2.len:
+        for k in 0..<outKids2.len:
             addSon(outCall2, get[Node](outKids2, k))
-            k = k + 1
         var outRes2: ClosureExprResult = closureExprResult(outCall2)
         outRes2.stmts = outStmts2
         return outRes2
@@ -1191,24 +1139,21 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
         return closureExprResult(n)
     else:
         var changed: bool = false
-        var outKids3: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var outStmts3: seq[Node] = newSeqWithCap[Node](0, 0)
-        var i3: int32 = 0
-        while i3 < kidCount n:
+        var outKids3: Node[]
+        outKids3.cap = kidCount n
+        var outStmts3: Node[]
+        for i3 in 0..<kidCount n:
             let oldChild3: Node = kid(n, i3)
             let res3: ClosureExprResult = lowerClosureExpr(oldChild3)
             lowerAppendStmts(&outStmts3, res3.stmts)
             if res3.expr != oldChild3:
                 changed = true
             addPtr[Node](&outKids3, res3.expr)
-            i3 = i3 + 1
         if !changed && outStmts3.len == 0:
             return closureExprResult(n)
         var out3: Node = lowerCloneShallow n
-        var k3: int32 = 0
-        while k3 < outKids3.len:
+        for k3 in 0..<outKids3.len:
             addSon(out3, get[Node](outKids3, k3))
-            k3 = k3 + 1
         var outRes3b: ClosureExprResult = closureExprResult(out3)
         outRes3b.stmts = outStmts3
         return outRes3b
@@ -1219,57 +1164,46 @@ fn lowerClosureStmt(n: Node): Node =
     case n.kind
     of nkModule, nkStmtList:
         lowerValueScopePush()
-        var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var i: int32 = 0
-        while i < kidCount n:
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
             let child: Node = lowerClosureStmt(kid(n, i))
             if child != nil && child.kind == nkStmtList:
-                var j: int32 = 0
-                while j < kidCount child:
+                for j in 0..<kidCount child:
                     addPtr[Node](&outKids, kid(child, j))
-                    j = j + 1
             elif child != nil:
                 addPtr[Node](&outKids, child)
-            i = i + 1
         lowerValueScopePop()
         var out: Node = lowerCloneShallow n
-        var k: int32 = 0
-        while k < outKids.len:
+        for k in 0..<outKids.len:
             addSon(out, get[Node](outKids, k))
-            k = k + 1
         return out
     of nkFnDecl, nkIteratorDecl:
         lowerValueScopePush()
         if kidCount n > 1:
             let paramsNode: Node = kid(n, 1)
             if paramsNode != nil && paramsNode.kind == nkFormalParams:
-                var pi: int32 = 0
-                while pi < kidCount paramsNode:
+                for pi in 0..<kidCount paramsNode:
                     let defs: Node = kid(paramsNode, pi)
                     if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
                         let typeNode: Node = kid(defs, 1)
-                        var pj: int32 = 0
                         let nameCount: int32 = kidCount defs - 2
-                        while pj < nameCount:
+                        for pj in 0..<nameCount:
                             let nameNode: Node = kid(defs, pj)
                             let nm: str = stripSpaces(plainName(nameNode))
                             if len nm > 0:
                                 lowerValueAdd(nm, typeNode)
-                            pj = pj + 1
-                    pi = pi + 1
         var bodyNode: Node = nil
         if kidCount n > 3:
             bodyNode = kid(n, 3)
         let newBody: Node = lowerClosureStmt(bodyNode)
         lowerValueScopePop()
         var outFn: Node = lowerCloneShallow n
-        var i2: int32 = 0
-        while i2 < kidCount n:
+        for i2 in 0..<kidCount n:
             if i2 == 3:
                 addSon(outFn, newBody)
             else:
                 addSon(outFn, kid(n, i2))
-            i2 = i2 + 1
         return outFn
     of nkLet, nkVar, nkConst:
         var nameNode: Node = nil
@@ -1296,19 +1230,17 @@ fn lowerClosureStmt(n: Node): Node =
         var list: Node = newNode(nkStmtList, n.pos)
         lowerAddStmtList(list, res.stmts)
         addSon(list, outVar)
-        var bindNames: seq[str] = newSeqWithCap[str](0, 2)
+        var bindNames: str[2]
         lowerCollectPatternNames(nameNode, &bindNames)
         if bindNames.len > 0:
             var bindType: Node = outType
             if bindType == nil || bindType.kind == nkEmpty:
                 bindType = lowerInferExprType res.expr
             if bindType != nil:
-                var bi: int32 = 0
-                while bi < bindNames.len:
+                for bi in 0..<bindNames.len:
                     let nm: str = get[str](bindNames, bi)
                     if len nm > 0:
                         lowerValueAdd(nm, bindType)
-                    bi = bi + 1
         return list
     of nkAsgn, nkFastAsgn:
         if kidCount n > 1:
@@ -1419,7 +1351,7 @@ fn lowerClosures(root: Node): Node =
     if root == nil:
         return nil
     lowerClosureClear()
-    var decls: seq[Node] = newSeqWithCap[Node](0, 8)
+    var decls: Node[8]
     lowerClosureDecls = &decls
     lowerValueClear()
     var out: Node = lowerClosureStmt(root)
@@ -1429,35 +1361,27 @@ fn lowerClosures(root: Node): Node =
     if out == nil:
         return nil
     var out2: Node = lowerCloneShallow out
-    var i: int32 = 0
-    while i < kidCount out:
+    for i in 0..<kidCount out:
         addSon(out2, kid(out, i))
-        i = i + 1
-    var j: int32 = 0
-    while j < decls.len:
+    for j in 0..<decls.len:
         addSon(out2, get[Node](decls, j))
-        j = j + 1
     return out2
 
 fn lowerExprResult(expr: Node): LowerExprResult =
     var out: LowerExprResult
     out.expr = expr
-    out.stmts = newSeqWithCap[Node](0, 0)
+    out.stmts = []
     return out
 
-fn lowerAppendStmts(dst: seq[Node]*, src: seq[Node]) =
-    var i: int32 = 0
-    while i < src.len:
+fn lowerAppendStmts(dst: Node[]*, src: Node[]) =
+    for i in 0..<src.len:
         addPtr[Node](dst, get[Node](src, i))
-        i = i + 1
 
-fn lowerAddStmtList(list: Node, src: seq[Node]) =
+fn lowerAddStmtList(list: Node, src: Node[]) =
     if list == nil:
         return
-    var i: int32 = 0
-    while i < src.len:
+    for i in 0..<src.len:
         addSon(list, get[Node](src, i))
-        i = i + 1
 
 fn lowerIsStmtKind(k: NodeKind): bool =
     if k == nkStmtList: return true
@@ -1509,10 +1433,10 @@ fn lowerNormalizeBranchAssign(lhs: Node, branch: Node): Node =
         return newNode(nkStmtList, branch.pos)
     let last: Node = kid(branch, kidCount branch - 1)
     var sl3: Node = newNode(nkStmtList, branch.pos)
-    var i: int32 = 0
-    while i + 1 < kidCount branch:
+    for i in 0..<kidCount branch:
+        if i + 1 >= kidCount branch:
+            break
         addSon(sl3, kid(branch, i))
-        i = i + 1
     if lowerIsExprNode last:
         addSon(sl3, lowerMakeAssignStmtTo(lhs, last))
     else:
@@ -1543,18 +1467,16 @@ fn lowerCaseExprAssign(n: Node, lhs: Node): Node =
     var out: Node = newNode(nkCase, n.pos)
     if kidCount n > 0:
         addSon(out, kid(n, 0))
-    var i: int32 = 1
-    while i < kidCount n:
+    for i in 1..<kidCount n:
         let br: Node = kid(n, i)
         if br == nil:
-            i = i + 1
             continue
         if br.kind == nkOfBranch:
             var brOut: Node = newNode(nkOfBranch, br.pos)
-            var bi: int32 = 0
-            while bi + 1 < kidCount br:
+            for bi in 0..<kidCount br:
+                if bi + 1 >= kidCount br:
+                    break
                 addSon(brOut, kid(br, bi))
-                bi = bi + 1
             if kidCount br > 0:
                 let body: Node = kid(br, kidCount br - 1)
                 addSon(brOut, lowerNormalizeBranchAssign(lhs, body))
@@ -1566,7 +1488,6 @@ fn lowerCaseExprAssign(n: Node, lhs: Node): Node =
             addSon(out, el)
         else:
             addSon(out, br)
-        i = i + 1
     return out
 
 fn lowerIsResultTypeNode(typeNode: Node): bool =
@@ -1608,13 +1529,11 @@ fn lowerTypeKey(n: Node): str =
         return lowerUnqualifyName(stripSpaces(n.ident))
     if n.kind == nkBracketExpr && kidCount n > 0:
         var out: str = stripSpaces(plainName(kid(n, 0)))
-        var i: int32 = 1
-        while i < kidCount n:
+        for i in 1..<kidCount n:
             let part: str = lowerTypeKey kid(n, i)
             if !strIsEmpty part:
                 out = out + "_"
                 out = out + part
-            i = i + 1
         return out
     return ""
 
@@ -1716,11 +1635,9 @@ fn asyncNodeHasAwait(n: Node): bool =
         return false
     if n.kind == nkTypeDecl || n.kind == nkObjectDecl || n.kind == nkRecList || n.kind == nkEnumDecl:
         return false
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         if asyncNodeHasAwait(kid(n, i)):
             return true
-        i = i + 1
     return false
 
 fn lowerStripParType(n: Node): Node =
@@ -1777,7 +1694,7 @@ fn lowerIsVoidPtrType(ty: Node): bool =
     let base: str = lowerPointerBaseName ty
     return base == "void"
 
-fn lowerCollectPatternNames(n: Node, out: seq[str]*) =
+fn lowerCollectPatternNames(n: Node, out: str[]*) =
     if n == nil || out == nil:
         return
     if n.kind == nkIdent || n.kind == nkSymbol:
@@ -1788,12 +1705,10 @@ fn lowerCollectPatternNames(n: Node, out: seq[str]*) =
     if n.kind == nkPattern && kidCount n > 0:
         lowerCollectPatternNames(kid(n, 0), out)
         return
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         lowerCollectPatternNames(kid(n, i), out)
-        i = i + 1
 
-fn lowerCollectLocalsInBody(n: Node, out: seq[str]*) =
+fn lowerCollectLocalsInBody(n: Node, out: str[]*) =
     if n == nil || out == nil:
         return
     if n.kind == nkLambda:
@@ -1804,32 +1719,26 @@ fn lowerCollectLocalsInBody(n: Node, out: seq[str]*) =
     elif n.kind == nkFor:
         if kidCount n > 0:
             lowerCollectPatternNames(kid(n, 0), out)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         lowerCollectLocalsInBody(kid(n, i), out)
-        i = i + 1
 
-fn lowerCollectLambdaLocals(lam: Node, out: seq[str]*) =
+fn lowerCollectLambdaLocals(lam: Node, out: str[]*) =
     if lam == nil || out == nil:
         return
     if kidCount lam > 1:
         let paramsNode: Node = kid(lam, 1)
         if paramsNode != nil && paramsNode.kind == nkFormalParams:
-            var i: int32 = 0
-            while i < kidCount paramsNode:
+            for i in 0..<kidCount paramsNode:
                 let defs: Node = kid(paramsNode, i)
                 if defs != nil && defs.kind == nkIdentDefs:
-                    var j: int32 = 0
                     let nameCount: int32 = kidCount defs - 2
-                    while j < nameCount:
+                    for j in 0..<nameCount:
                         lowerCollectPatternNames(kid(defs, j), out)
-                        j = j + 1
-                i = i + 1
     if kidCount lam > 3:
         let bodyNode: Node = kid(lam, 3)
         lowerCollectLocalsInBody(bodyNode, out)
 
-fn lowerCollectCapturesVisit(n: Node, locals: seq[str], outNames: seq[str]*, outTypes: seq[Node]*) =
+fn lowerCollectCapturesVisit(n: Node, locals: str[], outNames: str[]*, outTypes: Node[]*) =
     if n == nil || outNames == nil || outTypes == nil:
         return
     if n.kind == nkLambda:
@@ -1842,22 +1751,20 @@ fn lowerCollectCapturesVisit(n: Node, locals: seq[str], outNames: seq[str]*, out
                 addPtr[str](outNames, nm)
                 addPtr[Node](outTypes, ty)
         return
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         lowerCollectCapturesVisit(kid(n, i), locals, outNames, outTypes)
-        i = i + 1
 
-fn lowerCollectCaptures(lam: Node, outNames: seq[str]*, outTypes: seq[Node]*) =
+fn lowerCollectCaptures(lam: Node, outNames: str[]*, outTypes: Node[]*) =
     if lam == nil || outNames == nil || outTypes == nil:
         return
-    var locals: seq[str] = newSeqWithCap[str](0, 8)
+    var locals: str[8]
     lowerCollectLambdaLocals(lam, &locals)
     var body: Node = nil
     if kidCount lam > 3:
         body = kid(lam, 3)
     lowerCollectCapturesVisit(body, locals, outNames, outTypes)
 
-fn lowerRewriteCaptured(n: Node, envName: str, capNames: seq[str], locals: seq[str]): Node =
+fn lowerRewriteCaptured(n: Node, envName: str, capNames: str[], locals: str[]): Node =
     if n == nil:
         return nil
     if n.kind == nkLambda:
@@ -1868,50 +1775,42 @@ fn lowerRewriteCaptured(n: Node, envName: str, capNames: seq[str], locals: seq[s
             return lowerMakeDot(envName, nm, n.pos)
         return n
     var changed: bool = false
-    var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-    var i: int32 = 0
-    while i < kidCount n:
+    var outKids: Node[]
+    outKids.cap = kidCount n
+    for i in 0..<kidCount n:
         let oldChild: Node = kid(n, i)
         let child: Node = lowerRewriteCaptured(oldChild, envName, capNames, locals)
         if child != oldChild:
             changed = true
         addPtr[Node](&outKids, child)
-        i = i + 1
     if !changed:
         return n
     var out: Node = lowerCloneShallow n
-    var k: int32 = 0
-    while k < outKids.len:
+    for k in 0..<outKids.len:
         addSon(out, get[Node](outKids, k))
-        k = k + 1
     return out
 
-fn lowerCollectParamNames(paramsNode: Node, out: seq[str]*) =
+fn lowerCollectParamNames(paramsNode: Node, out: str[]*) =
     if paramsNode == nil || out == nil:
         return
     if paramsNode.kind != nkFormalParams:
         return
-    var i: int32 = 0
-    while i < kidCount paramsNode:
+    for i in 0..<kidCount paramsNode:
         let defs: Node = kid(paramsNode, i)
         if defs != nil && defs.kind == nkIdentDefs:
-            var j: int32 = 0
             let nameCount: int32 = kidCount defs - 2
-            while j < nameCount:
+            for j in 0..<nameCount:
                 let nameNode: Node = kid(defs, j)
                 if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 0:
                     lowerCollectPatternNames(kid(nameNode, 0), out)
                 else:
                     lowerCollectPatternNames(nameNode, out)
-                j = j + 1
-        i = i + 1
 
-fn lowerBuildEnvTypeDecl(envName: str, capNames: seq[str], capTypes: seq[Node], pos: SourcePos): Node =
+fn lowerBuildEnvTypeDecl(envName: str, capNames: str[], capTypes: Node[], pos: SourcePos): Node =
     var obj: Node = newNode(nkObjectDecl, pos)
     addSon(obj, newNode(nkEmpty, pos))
     var recList: Node = newNode(nkRecList, pos)
-    var i: int32 = 0
-    while i < capNames.len:
+    for i in 0..<capNames.len:
         let fname: str = get[str](capNames, i)
         let ftype: Node = get[Node](capTypes, i)
         var defs: Node = newNode(nkIdentDefs, pos)
@@ -1919,7 +1818,6 @@ fn lowerBuildEnvTypeDecl(envName: str, capNames: seq[str], capTypes: seq[Node], 
         addSon(defs, cloneTree ftype)
         addSon(defs, newNode(nkEmpty, pos))
         addSon(recList, defs)
-        i = i + 1
     addSon(obj, recList)
     var td: Node = newNode(nkTypeDecl, pos)
     addSon(td, newIdent(envName, pos))
@@ -1931,7 +1829,7 @@ fn lowerBuildEnvTypeDecl(envName: str, capNames: seq[str], capTypes: seq[Node], 
         nodeSetStrVal(td, lowerFilename)
     return td
 
-fn lowerBuildLambdaBodyDecl(lam: Node, envName: str, bodyName: str, capNames: seq[str], locals: seq[str], pos: SourcePos): Node =
+fn lowerBuildLambdaBodyDecl(lam: Node, envName: str, bodyName: str, capNames: str[], locals: str[], pos: SourcePos): Node =
     var paramsNode: Node = nil
     if kidCount lam > 1:
         paramsNode = kid(lam, 1)
@@ -1950,10 +1848,8 @@ fn lowerBuildLambdaBodyDecl(lam: Node, envName: str, bodyName: str, capNames: se
     var newParams: Node = newNode(nkFormalParams, pos)
     addSon(newParams, envDefs)
     if paramsNode != nil && paramsNode.kind == nkFormalParams:
-        var i: int32 = 0
-        while i < kidCount paramsNode:
+        for i in 0..<kidCount paramsNode:
             addSon(newParams, cloneTree kid(paramsNode, i))
-            i = i + 1
     var rewrittenBody: Node = lowerRewriteCaptured(bodyNode, "__env", capNames, locals)
     var decl: Node = newNode(nkFnDecl, pos)
     addSon(decl, newIdent(bodyName, pos))
@@ -1981,13 +1877,11 @@ fn lowerBuildLambdaTrampolineDecl(envName: str, bodyName: str, trampName: str, p
     var trampParams: Node = newNode(nkFormalParams, pos)
     addSon(trampParams, ctxDefs)
     if paramsNode != nil && paramsNode.kind == nkFormalParams:
-        var i: int32 = 0
-        while i < kidCount paramsNode:
+        for i in 0..<kidCount paramsNode:
             addSon(trampParams, cloneTree kid(paramsNode, i))
-            i = i + 1
     var envTypeNode: Node = newIdent(envName, pos)
     var envPtrType: Node = lowerMakePtrType(envTypeNode, pos)
-    var castArgs: seq[Node] = newSeqWithCap[Node](0, 1)
+    var castArgs: Node[1]
     addPtr[Node](&castArgs, newIdent("__ctx", pos))
     var castCall: Node = newNode(nkCall, pos)
     castCall.callStyle = CallStyleParen
@@ -1998,14 +1892,12 @@ fn lowerBuildLambdaTrampolineDecl(envName: str, bodyName: str, trampName: str, p
     addSon(envDecl, envPtrType)
     addSon(envDecl, castCall)
     addSon(envDecl, newNode(nkEmpty, pos))
-    var callArgs: seq[Node] = newSeqWithCap[Node](0, 4)
+    var callArgs: Node[4]
     addPtr[Node](&callArgs, newIdent("__env", pos))
-    var paramNames: seq[str] = newSeqWithCap[str](0, 4)
+    var paramNames: str[4]
     lowerCollectParamNames(paramsNode, &paramNames)
-    var pi: int32 = 0
-    while pi < paramNames.len:
+    for pi in 0..<paramNames.len:
         addPtr[Node](&callArgs, newIdent(get[str](paramNames, pi), pos))
-        pi = pi + 1
     var bodyCall: Node = lowerMakeCall(bodyName, pos, callArgs)
     var retStmt: Node = newNode(nkReturn, pos)
     addSon(retStmt, bodyCall)
@@ -2026,7 +1918,7 @@ fn lowerBuildLambdaTrampolineDecl(envName: str, bodyName: str, trampName: str, p
         nodeSetStrVal(decl, lowerFilename)
     return decl
 
-fn lowerEnsureClosureInfo(lam: Node, capNames: seq[str], capTypes: seq[Node]): int32 =
+fn lowerEnsureClosureInfo(lam: Node, capNames: str[], capTypes: Node[]): int32 =
     let existing: int32 = lowerClosureLamIndex lam
     if existing >= 0:
         return existing
@@ -2039,7 +1931,7 @@ fn lowerEnsureClosureInfo(lam: Node, capNames: seq[str], capTypes: seq[Node]): i
     if lowerClosureDecls != nil:
         let envDecl: Node = lowerBuildEnvTypeDecl(envName, capNames, capTypes, pos)
         addPtr[Node](lowerClosureDecls, envDecl)
-        var locals: seq[str] = newSeqWithCap[str](0, 8)
+        var locals: str[8]
         lowerCollectLambdaLocals(lam, &locals)
         let bodyDecl: Node = lowerBuildLambdaBodyDecl(lam, envName, bodyName, capNames, locals, pos)
         addPtr[Node](lowerClosureDecls, bodyDecl)
@@ -2061,14 +1953,12 @@ fn lowerFnHasImportc(fnNode: Node): bool =
     if kidCount fnNode > 5:
         let pragmas: Node = kid(fnNode, 5)
         if pragmas != nil && pragmas.kind == nkPragma:
-            var i: int32 = 0
-            while i < kidCount pragmas:
+            for i in 0..<kidCount pragmas:
                 let a: Node = kid(pragmas, i)
                 if a != nil && a.kind == nkAnnotation && kidCount a > 0:
                     let name: str = stripSpaces(plainName(kid(a, 0)))
                     if name == "importc":
                         return true
-                i = i + 1
     return false
 
 fn lowerFnIsAsync(fnNode: Node): bool =
@@ -2077,28 +1967,24 @@ fn lowerFnIsAsync(fnNode: Node): bool =
     if kidCount fnNode > 5:
         let pragmas: Node = kid(fnNode, 5)
         if pragmas != nil && pragmas.kind == nkPragma:
-            var i: int32 = 0
-            while i < kidCount pragmas:
+            for i in 0..<kidCount pragmas:
                 let a: Node = kid(pragmas, i)
                 if a != nil && a.kind == nkAnnotation && kidCount a > 0:
                     let name: str = stripSpaces(plainName(kid(a, 0)))
                     if name == "async":
                         return true
-                i = i + 1
     return false
 
 fn lowerStripAsyncPragma(pragmaNode: Node): Node =
     if pragmaNode == nil || pragmaNode.kind != nkPragma:
         return pragmaNode
     var out: Node = newNode(nkPragma, pragmaNode.pos)
-    var i: int32 = 0
-    while i < kidCount pragmaNode:
+    for i in 0..<kidCount pragmaNode:
         let a: Node = kid(pragmaNode, i)
         if a != nil && a.kind == nkAnnotation && kidCount a > 0:
             let name: str = stripSpaces(plainName(kid(a, 0)))
             if name != "async":
                 addSon(out, cloneTree a)
-        i = i + 1
     if kidCount out == 0:
         return newNode(nkEmpty, pragmaNode.pos)
     return out
@@ -2172,11 +2058,11 @@ fn lowerQExpr(n: Node, fnRetType: Node, fnReturnsResult: bool): LowerExprResult 
             return out
     if kidCount n == 0:
         return lowerExprResult(n)
-    var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-    var outStmts: seq[Node] = newSeqWithCap[Node](0, 0)
+    var outKids: Node[]
+    outKids.cap = kidCount n
+    var outStmts: Node[]
     var changed: bool = false
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         let oldChild: Node = kid(n, i)
         let res: LowerExprResult = lowerQExpr(oldChild, fnRetType, fnReturnsResult)
         lowerAppendStmts(&outStmts, res.stmts)
@@ -2184,14 +2070,11 @@ fn lowerQExpr(n: Node, fnRetType: Node, fnReturnsResult: bool): LowerExprResult 
         if child != oldChild:
             changed = true
         addPtr[Node](&outKids, child)
-        i = i + 1
     if !changed && outStmts.len == 0:
         return lowerExprResult(n)
     var outNode: Node = lowerCloneShallow n
-    var k: int32 = 0
-    while k < outKids.len:
+    for k in 0..<outKids.len:
         addSon(outNode, get[Node](outKids, k))
-        k = k + 1
     var outRes: LowerExprResult = lowerExprResult(outNode)
     outRes.stmts = outStmts
     return outRes
@@ -2202,24 +2085,19 @@ fn lowerQStmt(n: Node, fnRetType: Node, fnReturnsResult: bool): Node =
     case n.kind
     of nkModule, nkStmtList:
         lowerValueScopePush()
-        var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var i: int32 = 0
-        while i < kidCount n:
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
             let child: Node = lowerQStmt(kid(n, i), fnRetType, fnReturnsResult)
             if child != nil && child.kind == nkStmtList:
-                var j: int32 = 0
-                while j < kidCount child:
+                for j in 0..<kidCount child:
                     addPtr[Node](&outKids, kid(child, j))
-                    j = j + 1
             elif child != nil:
                 addPtr[Node](&outKids, child)
-            i = i + 1
         lowerValueScopePop()
         var out: Node = lowerCloneShallow n
-        var k: int32 = 0
-        while k < outKids.len:
+        for k in 0..<outKids.len:
             addSon(out, get[Node](outKids, k))
-            k = k + 1
         return out
     of nkFnDecl, nkIteratorDecl:
         var retNode: Node = newNode(nkEmpty, n.pos)
@@ -2230,8 +2108,7 @@ fn lowerQStmt(n: Node, fnRetType: Node, fnReturnsResult: bool): Node =
         if kidCount n > 1:
             let paramsNode: Node = kid(n, 1)
             if paramsNode != nil && paramsNode.kind == nkFormalParams:
-                var pi: int32 = 0
-                while pi < kidCount paramsNode:
+                for pi in 0..<kidCount paramsNode:
                     let defs: Node = kid(paramsNode, pi)
                     if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
                         let nameNode: Node = kid(defs, 0)
@@ -2239,20 +2116,17 @@ fn lowerQStmt(n: Node, fnRetType: Node, fnReturnsResult: bool): Node =
                         let nm: str = stripSpaces(plainName(nameNode))
                         if !strIsEmpty nm:
                             lowerValueAdd(nm, typeNode)
-                    pi = pi + 1
         var bodyNode: Node = nil
         if kidCount n > 3:
             bodyNode = kid(n, 3)
         let newBody: Node = lowerQStmt(bodyNode, retNode, retIsResult)
         lowerValueScopePop()
         var out: Node = lowerCloneShallow n
-        var i2: int32 = 0
-        while i2 < kidCount n:
+        for i2 in 0..<kidCount n:
             if i2 == 3:
                 addSon(out, newBody)
             else:
                 addSon(out, kid(n, i2))
-            i2 = i2 + 1
         return out
     of nkLet, nkVar, nkConst:
         var nameNode: Node = nil
@@ -2432,11 +2306,11 @@ fn lowerControlExpr(n: Node): LowerExprResult =
         return out
     if kidCount n == 0:
         return lowerExprResult(n)
-    var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-    var outStmts: seq[Node] = newSeqWithCap[Node](0, 0)
+    var outKids: Node[]
+    outKids.cap = kidCount n
+    var outStmts: Node[]
     var changed: bool = false
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         let oldChild: Node = kid(n, i)
         let res: LowerExprResult = lowerControlExpr(oldChild)
         lowerAppendStmts(&outStmts, res.stmts)
@@ -2444,14 +2318,11 @@ fn lowerControlExpr(n: Node): LowerExprResult =
         if child != oldChild:
             changed = true
         addPtr[Node](&outKids, child)
-        i = i + 1
     if !changed && outStmts.len == 0:
         return lowerExprResult(n)
     var outNode: Node = lowerCloneShallow n
-    var k: int32 = 0
-    while k < outKids.len:
+    for k in 0..<outKids.len:
         addSon(outNode, get[Node](outKids, k))
-        k = k + 1
     var outRes: LowerExprResult = lowerExprResult(outNode)
     outRes.stmts = outStmts
     return outRes
@@ -2512,32 +2383,26 @@ fn lowerControlStmt(n: Node): Node =
     case n.kind
     of nkModule, nkStmtList:
         lowerValueScopePush()
-        var outKids: seq[Node] = newSeqWithCap[Node](0, kidCount n)
-        var i: int32 = 0
-        while i < kidCount n:
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
             let child: Node = lowerControlStmt(kid(n, i))
             if child != nil && child.kind == nkStmtList:
-                var j: int32 = 0
-                while j < kidCount child:
+                for j in 0..<kidCount child:
                     addPtr[Node](&outKids, kid(child, j))
-                    j = j + 1
             elif child != nil:
                 addPtr[Node](&outKids, child)
-            i = i + 1
         lowerValueScopePop()
         var out: Node = lowerCloneShallow n
-        var k: int32 = 0
-        while k < outKids.len:
+        for k in 0..<outKids.len:
             addSon(out, get[Node](outKids, k))
-            k = k + 1
         return out
     of nkFnDecl, nkIteratorDecl:
         lowerValueScopePush()
         if kidCount n > 1:
             let paramsNode: Node = kid(n, 1)
             if paramsNode != nil && paramsNode.kind == nkFormalParams:
-                var pi: int32 = 0
-                while pi < kidCount paramsNode:
+                for pi in 0..<kidCount paramsNode:
                     let defs: Node = kid(paramsNode, pi)
                     if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
                         let nameNode: Node = kid(defs, 0)
@@ -2545,20 +2410,17 @@ fn lowerControlStmt(n: Node): Node =
                         let nm: str = stripSpaces(plainName(nameNode))
                         if !strIsEmpty nm:
                             lowerValueAdd(nm, typeNode)
-                    pi = pi + 1
         var bodyNode: Node = nil
         if kidCount n > 3:
             bodyNode = kid(n, 3)
         let newBody: Node = lowerControlStmt(bodyNode)
         lowerValueScopePop()
         var outFn: Node = lowerCloneShallow n
-        var i2: int32 = 0
-        while i2 < kidCount n:
+        for i2 in 0..<kidCount n:
             if i2 == 3:
                 addSon(outFn, newBody)
             else:
                 addSon(outFn, kid(n, i2))
-            i2 = i2 + 1
         return outFn
     of nkLet, nkVar, nkConst:
         var nameNode: Node = nil
@@ -2723,21 +2585,19 @@ fn iterNextTempName(prefix: str): str =
     lowerIterTempCounter = lowerIterTempCounter + 1
     return name
 
-fn iterPickInternalName(base: str, captures: seq[str]): str =
+fn iterPickInternalName(base: str, captures: str[]): str =
     var name: str = "__iter_" + base
     while iterNameIndex(captures, name) >= 0:
         name = name + "_"
     return name
 
-fn iterNameIndex(names: seq[str], name: str): int32 =
-    var i: int32 = 0
-    while i < names.len:
+fn iterNameIndex(names: str[], name: str): int32 =
+    for i in 0..<names.len:
         if get[str](names, i) == name:
             return i
-        i = i + 1
     return -1
 
-fn iterAddCapture(names: seq[str]*, types: seq[Node]*, name: str, ty: Node, pos: SourcePos) =
+fn iterAddCapture(names: str[]*, types: Node[]*, name: str, ty: Node, pos: SourcePos) =
     if name == nil || len name == 0 || name == "_":
         return
     if iterNameIndex(*names, name) >= 0:
@@ -2748,7 +2608,7 @@ fn iterAddCapture(names: seq[str]*, types: seq[Node]*, name: str, ty: Node, pos:
     else:
         addPtr[Node](types, newNode(nkEmpty, pos))
 
-fn iterLookupCaptureType(names: seq[str], types: seq[Node], name: str): Node =
+fn iterLookupCaptureType(names: str[], types: Node[], name: str): Node =
     let idx: int32 = iterNameIndex(names, name)
     if idx < 0:
         return nil
@@ -2756,7 +2616,7 @@ fn iterLookupCaptureType(names: seq[str], types: seq[Node], name: str): Node =
         return get[Node](types, idx)
     return nil
 
-fn iterInferSimpleType(n: Node, names: seq[str], types: seq[Node]): Node =
+fn iterInferSimpleType(n: Node, names: str[], types: Node[]): Node =
     if n == nil:
         return nil
     case n.kind
@@ -2849,7 +2709,7 @@ fn iterPatternIdent(pat: Node): Node =
         return cur
     return nil
 
-fn iterCollectLocals(n: Node, names: seq[str]*, types: seq[Node]*) =
+fn iterCollectLocals(n: Node, names: str[]*, types: Node[]*) =
     if n == nil:
         return
     if n.kind == nkIteratorDecl:
@@ -2883,24 +2743,20 @@ fn iterCollectLocals(n: Node, names: seq[str]*, types: seq[Node]*) =
                 typeNode = newNode(nkEmpty, n.pos)
         iterAddCapture(names, types, nm, typeNode, n.pos)
         return
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         iterCollectLocals(kid(n, i), names, types)
-        i = i + 1
 
 fn iterHasNestedDefer(n: Node, depth: int32): bool =
     if n == nil:
         return false
     if n.kind == nkDefer:
         return depth > 0
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         if iterHasNestedDefer(kid(n, i), depth + 1):
             return true
-        i = i + 1
     return false
 
-fn iterExtractTopDefers(body: Node, defers: seq[Node]*): Node =
+fn iterExtractTopDefers(body: Node, defers: Node[]*): Node =
     if body == nil:
         return body
     var list: Node = body
@@ -2908,15 +2764,13 @@ fn iterExtractTopDefers(body: Node, defers: seq[Node]*): Node =
         list = newNode(nkStmtList, body.pos)
         addSon(list, body)
     var out: Node = newNode(nkStmtList, list.pos)
-    var i: int32 = 0
-    while i < kidCount list:
+    for i in 0..<kidCount list:
         let stmt: Node = kid(list, i)
         if stmt != nil && stmt.kind == nkDefer:
             if kidCount stmt > 0:
                 addPtr[Node](defers, kid(stmt, 0))
         else:
             addSon(out, stmt)
-        i = i + 1
     if iterHasNestedDefer(out, 0):
         lowerAddError(out.pos, "C-profile iterator lowering: nested defer inside iterator is not supported")
     return out
@@ -2969,10 +2823,8 @@ fn iterRewriteTree(n: Node, ctx: IterLowerCtx): Node =
         addSon(outPost, cloneTree(kid(n, 1)))
         return outPost
     var out: Node = lowerCloneShallow(n)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         addSon(out, iterRewriteTree(kid(n, i), ctx))
-        i = i + 1
     return out
 
 fn iterNodeHasYield(n: Node): bool =
@@ -2980,25 +2832,23 @@ fn iterNodeHasYield(n: Node): bool =
         return false
     if n.kind == nkYield:
         return true
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         if iterNodeHasYield(kid(n, i)):
             return true
-        i = i + 1
     return false
 
-fn iterNewState(states: seq[Node]*, pos: SourcePos): int32 =
+fn iterNewState(states: Node[]*, pos: SourcePos): int32 =
     let id: int32 = states.len
     var list: Node = newNode(nkStmtList, pos)
     addPtr[Node](states, list)
     return id
 
-fn iterStateBody(states: seq[Node], id: int32): Node =
+fn iterStateBody(states: Node[], id: int32): Node =
     if id < 0 || id >= states.len:
         return nil
     return get[Node](states, id)
 
-fn iterStateAdd(states: seq[Node]*, id: int32, stmt: Node) =
+fn iterStateAdd(states: Node[]*, id: int32, stmt: Node) =
     let body: Node = iterStateBody(*states, id)
     if body != nil && stmt != nil:
         addSon(body, stmt)
@@ -3014,10 +2864,10 @@ fn iterMakeDeref(expr: Node, pos: SourcePos): Node =
     addSon(d, expr)
     return d
 
-fn iterLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: int32,
+fn iterLowerStmt(stmt: Node, states: Node[]*, curState: int32, nextState: int32,
     loopCtx: IterLoopCtx*, ctx: IterLowerCtx): IterStmtResult
 
-fn iterLowerStmtList(stmts: Node, states: seq[Node]*, curState: int32, nextState: int32,
+fn iterLowerStmtList(stmts: Node, states: Node[]*, curState: int32, nextState: int32,
     loopCtx: IterLoopCtx*, ctx: IterLowerCtx): IterStmtResult =
     var state: int32 = curState
     var open: bool = true
@@ -3028,15 +2878,13 @@ fn iterLowerStmtList(stmts: Node, states: seq[Node]*, curState: int32, nextState
         var tmp: Node = newNode(nkStmtList, list.pos)
         addSon(tmp, list)
         list = tmp
-    var i: int32 = 0
-    while i < kidCount list:
+    for i in 0..<kidCount list:
         if ! open:
             break
         let s: Node = kid(list, i)
         let res: IterStmtResult = iterLowerStmt(s, states, state, nextState, loopCtx, ctx)
         state = res.state
         open = res.open
-        i = i + 1
     var outRes: IterStmtResult
     if open:
         iterStateAdd(states, state, iterMakeSetState(ctx.frameName, nextState, list.pos))
@@ -3058,7 +2906,7 @@ fn iterIsExprStmt(n: Node): bool =
     else:
         return false
 
-fn iterLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: int32,
+fn iterLowerStmt(stmt: Node, states: Node[]*, curState: int32, nextState: int32,
     loopCtx: IterLoopCtx*, ctx: IterLowerCtx): IterStmtResult =
     var out: IterStmtResult
     out.state = curState
@@ -3226,15 +3074,13 @@ fn iterLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: int
         iterStateAdd(states, curState, iterRewriteTree(stmt, ctx))
     return out
 
-fn iterBuildFrameType(name: str, captures: seq[str], captureTypes: seq[Node], pos: SourcePos): Node =
+fn iterBuildFrameType(name: str, captures: str[], captureTypes: Node[], pos: SourcePos): Node =
     if streq(lowerGetEnv("CHENG_STAGE1_TRACE_ITER"), "1") && streq(name, "__cheng_lambda_2_iter"):
         echo("[lower] iter frame " + name + " captures=" + intToStr(captures.len))
-        var di: int32 = 0
-        while di < captures.len:
+        for di in 0..<captures.len:
             let nm: str = get[str](captures, di)
             let nlen: int32 = len nm
             echo("[lower] iter cap '" + nm + "' len=" + intToStr(nlen))
-            di = di + 1
     var td: Node = newNode(nkTypeDecl, pos)
     addSon(td, newIdent(name, pos))
     var obj: Node = newNode(nkObjectDecl, pos)
@@ -3245,8 +3091,7 @@ fn iterBuildFrameType(name: str, captures: seq[str], captureTypes: seq[Node], po
     addSon(stateDefs, newIdent("int32", pos))
     addSon(stateDefs, newNode(nkEmpty, pos))
     addSon(rec, stateDefs)
-    var i: int32 = 0
-    while i < captures.len:
+    for i in 0..<captures.len:
         let nm: str = get[str](captures, i)
         let ty: Node = get[Node](captureTypes, i)
         var defs: Node = newNode(nkIdentDefs, pos)
@@ -3257,7 +3102,6 @@ fn iterBuildFrameType(name: str, captures: seq[str], captureTypes: seq[Node], po
             addSon(defs, newNode(nkEmpty, pos))
         addSon(defs, newNode(nkEmpty, pos))
         addSon(rec, defs)
-        i = i + 1
     addSon(obj, rec)
     addSon(td, obj)
     addSon(td, newNode(nkEmpty, pos))
@@ -3265,7 +3109,7 @@ fn iterBuildFrameType(name: str, captures: seq[str], captureTypes: seq[Node], po
     addSon(td, newNode(nkEmpty, pos))
     return td
 
-fn iterBuildOpen(name: str, frameType: str, paramsNode: Node, paramNames: seq[str], frameVarName: str, pos: SourcePos): Node =
+fn iterBuildOpen(name: str, frameType: str, paramsNode: Node, paramNames: str[], frameVarName: str, pos: SourcePos): Node =
     var fnNode: Node = newNode(nkFnDecl, pos)
     addSon(fnNode, newIdent(name, pos))
     if paramsNode != nil:
@@ -3283,15 +3127,13 @@ fn iterBuildOpen(name: str, frameType: str, paramsNode: Node, paramNames: seq[st
     addSon(body, decl)
     var initState: Node = iterMakeSetState(frameName, 0, pos)
     addSon(body, initState)
-    var i: int32 = 0
-    while i < paramNames.len:
+    for i in 0..<paramNames.len:
         let pn: str = get[str](paramNames, i)
         if pn != nil && len pn > 0:
             var asn: Node = newNode(nkAsgn, pos)
             addSon(asn, lowerMakeDot(frameName, pn, pos))
             addSon(asn, newIdent(pn, pos))
             addSon(body, asn)
-        i = i + 1
     var retNode: Node = newNode(nkReturn, pos)
     addSon(retNode, newIdent(frameName, pos))
     addSon(body, retNode)
@@ -3319,7 +3161,7 @@ fn iterBuildNext(name: str, frameType: str, yieldType: Node, bodyNode: Node, ctx
     addSon(params, defsOut)
     addSon(fnNode, params)
     addSon(fnNode, newIdent("bool", pos))
-    var states: seq[Node] = newSeqWithCap[Node](0, 8)
+    var states: Node[8]
     let startState: int32 = iterNewState(&states, pos)
     let doneState: int32 = iterNewState(&states, pos)
     iterLowerStmtList(bodyNode, &states, startState, doneState, nil, ctx)
@@ -3328,13 +3170,11 @@ fn iterBuildNext(name: str, frameType: str, yieldType: Node, bodyNode: Node, ctx
     addSon(retFalse, lowerMakeBoolLit(false, pos))
     iterStateAdd(&states, doneState, retFalse)
     var ifNode: Node = newNode(nkIf, pos)
-    var si: int32 = 0
-    while si < states.len:
+    for si in 0..<states.len:
         let cond: Node = lowerMakeInfix("==", lowerMakeDot(ctx.frameName, "state", pos),
             lowerMakeIntLit(int64(si), pos), pos)
         addSon(ifNode, cond)
         addSon(ifNode, get[Node](states, si))
-        si = si + 1
     var elseBody: Node = newNode(nkStmtList, pos)
     addSon(elseBody, iterMakeSetState(ctx.frameName, -1, pos))
     var retFalse2: Node = newNode(nkReturn, pos)
@@ -3354,7 +3194,7 @@ fn iterBuildNext(name: str, frameType: str, yieldType: Node, bodyNode: Node, ctx
     addSon(fnNode, newNode(nkEmpty, pos))
     return fnNode
 
-fn iterBuildClose(name: str, frameType: str, defers: seq[Node], ctx: IterLowerCtx, pos: SourcePos): Node =
+fn iterBuildClose(name: str, frameType: str, defers: Node[], ctx: IterLowerCtx, pos: SourcePos): Node =
     var fnNode: Node = newNode(nkFnDecl, pos)
     addSon(fnNode, newIdent(name, pos))
     var params: Node = newNode(nkFormalParams, pos)
@@ -3366,11 +3206,11 @@ fn iterBuildClose(name: str, frameType: str, defers: seq[Node], ctx: IterLowerCt
     addSon(fnNode, params)
     addSon(fnNode, newNode(nkEmpty, pos))
     var body: Node = newNode(nkStmtList, pos)
-    var i: int32 = defers.len - 1
-    while i >= 0:
+    let __for_start_i = defers.len - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
         let d: Node = get[Node](defers, i)
         addSon(body, iterRewriteTree(d, ctx))
-        i = i - 1
     addSon(body, iterMakeSetState(ctx.frameName, -1, pos))
     addSon(fnNode, body)
     addSon(fnNode, newNode(nkEmpty, pos))
@@ -3378,7 +3218,7 @@ fn iterBuildClose(name: str, frameType: str, defers: seq[Node], ctx: IterLowerCt
     return fnNode
 
 fn iterBuildCallWrapper(baseName: str, frameType: str, openName: str, nextName: str, closeName: str,
-    paramsNode: Node, paramNames: seq[str], retType: Node, pos: SourcePos): Node =
+    paramsNode: Node, paramNames: str[], retType: Node, pos: SourcePos): Node =
     var fnNode: Node = newNode(nkFnDecl, pos)
     addSon(fnNode, newIdent(baseName, pos))
     if paramsNode != nil:
@@ -3393,11 +3233,9 @@ fn iterBuildCallWrapper(baseName: str, frameType: str, openName: str, nextName: 
     let frameVar: str = iterNextTempName("frame")
     var openCall: Node = newNode(nkCall, pos)
     addSon(openCall, newIdent(openName, pos))
-    var pi: int32 = 0
-    while pi < paramNames.len:
+    for pi in 0..<paramNames.len:
         let pn: str = get[str](paramNames, pi)
         addSon(openCall, newIdent(pn, pos))
-        pi = pi + 1
     var frameDecl: Node = newNode(nkVar, pos)
     addSon(frameDecl, newIdent(frameVar, pos))
     addSon(frameDecl, newIdent(frameType, pos))
@@ -3461,20 +3299,18 @@ fn lowerIteratorDecl(iterNode: Node): Node =
         return iterNode
     if retType == nil || retType.kind == nkEmpty:
         lowerAddError(iterNode.pos, "C-profile iterator lowering: missing yield type for iterator " + baseName)
-    var captureNames: seq[str] = newSeqWithCap[str](0, 8)
-    var captureTypes: seq[Node] = newSeqWithCap[Node](0, 8)
-    var paramNames: seq[str] = newSeqWithCap[str](0, 4)
+    var captureNames: str[8]
+    var captureTypes: Node[8]
+    var paramNames: str[4]
     if paramsNode != nil && paramsNode.kind == nkFormalParams:
-        var i: int32 = 0
-        while i < kidCount paramsNode:
+        for i in 0..<kidCount paramsNode:
             let defs: Node = kid(paramsNode, i)
             if defs != nil && defs.kind == nkIdentDefs:
                 var typeNode: Node = nil
                 if kidCount defs > 1:
                     typeNode = kid(defs, 1)
                 let nameCount: int32 = identDefsNameCount defs
-                var j: int32 = 0
-                while j < nameCount:
+                for j in 0..<nameCount:
                     var nameN: Node = kid(defs, j)
                     if nameN != nil && nameN.kind == nkPattern && kidCount nameN > 0:
                         nameN = kid(nameN, 0)
@@ -3484,10 +3320,8 @@ fn lowerIteratorDecl(iterNode: Node): Node =
                             lowerAddError(iterNode.pos, "C-profile iterator lowering: missing type for parameter " + nm)
                         iterAddCapture(&captureNames, &captureTypes, nm, typeNode, iterNode.pos)
                         addPtr[str](&paramNames, nm)
-                    j = j + 1
-            i = i + 1
     iterCollectLocals(bodyNode, &captureNames, &captureTypes)
-    var defers: seq[Node] = newSeqWithCap[Node](0, 2)
+    var defers: Node[2]
     var bodyClean: Node = iterExtractTopDefers(bodyNode, &defers)
     if bodyClean != nil && bodyClean.kind == nkStmtList && kidCount bodyClean == 1:
         let only: Node = kid(bodyClean, 0)
@@ -3543,10 +3377,8 @@ fn lowerForIterator(n: Node): Node =
     let valueVar: str = iterNextTempName("value")
     var openCall: Node = newNode(nkCall, n.pos)
     addSon(openCall, newIdent(openName, n.pos))
-    var ai: int32 = 1
-    while ai < kidCount iterExpr:
+    for ai in 1..<kidCount iterExpr:
         addSon(openCall, kid(iterExpr, ai))
-        ai = ai + 1
     var frameDecl: Node = newNode(nkVar, n.pos)
     addSon(frameDecl, newIdent(frameVar, n.pos))
     addSon(frameDecl, newIdent(frameType, n.pos))
@@ -3603,35 +3435,27 @@ fn lowerIteratorsAndFor(n: Node): Node =
         var out: Node = newNode(n.kind, n.pos)
         nodeSetIdent(out, n.ident)
         nodeSetStrVal(out, n.strVal)
-        var i: int32 = 0
-        while i < kidCount n:
+        for i in 0..<kidCount n:
             let child: Node = kid(n, i)
             let loweredChild: Node = lowerIteratorsAndFor(child)
             if loweredChild != nil && loweredChild.kind == nkStmtList && child.kind != nkStmtList:
-                var j: int32 = 0
-                while j < kidCount loweredChild:
+                for j in 0..<kidCount loweredChild:
                     addSon(out, kid(loweredChild, j))
-                    j = j + 1
             else:
                 addSon(out, loweredChild)
-            i = i + 1
         return out
     var outNode: Node = lowerCloneShallow(n)
-    var k: int32 = 0
-    while k < kidCount n:
+    for k in 0..<kidCount n:
         addSon(outNode, lowerIteratorsAndFor(kid(n, k)))
-        k = k + 1
     return outNode
 
-fn asyncNameIndex(names: seq[str], name: str): int32 =
-    var i: int32 = 0
-    while i < names.len:
+fn asyncNameIndex(names: str[], name: str): int32 =
+    for i in 0..<names.len:
         if get[str](names, i) == name:
             return i
-        i = i + 1
     return -1
 
-fn asyncAddCapture(names: seq[str]*, types: seq[Node]*, name: str, ty: Node, pos: SourcePos) =
+fn asyncAddCapture(names: str[]*, types: Node[]*, name: str, ty: Node, pos: SourcePos) =
     if name == nil || len name == 0 || name == "_":
         return
     if asyncNameIndex(*names, name) >= 0:
@@ -3642,7 +3466,7 @@ fn asyncAddCapture(names: seq[str]*, types: seq[Node]*, name: str, ty: Node, pos
     else:
         addPtr[Node](types, newNode(nkEmpty, pos))
 
-fn asyncLookupCaptureType(names: seq[str], types: seq[Node], name: str): Node =
+fn asyncLookupCaptureType(names: str[], types: Node[], name: str): Node =
     let idx: int32 = asyncNameIndex(names, name)
     if idx < 0:
         return nil
@@ -3650,16 +3474,14 @@ fn asyncLookupCaptureType(names: seq[str], types: seq[Node], name: str): Node =
         return get[Node](types, idx)
     return nil
 
-fn asyncCollectParamTypes(paramsNode: Node, names: seq[str]*, types: seq[Node]*) =
+fn asyncCollectParamTypes(paramsNode: Node, names: str[]*, types: Node[]*) =
     if paramsNode == nil || paramsNode.kind != nkFormalParams:
         return
-    var i: int32 = 0
-    while i < kidCount paramsNode:
+    for i in 0..<kidCount paramsNode:
         let defs: Node = kid(paramsNode, i)
         if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
             let typeNode: Node = kid(defs, 1)
-            var j: int32 = 0
-            while j < kidCount defs - 2:
+            for j in 0..<kidCount defs - 2:
                 let nameNode: Node = kid(defs, j)
                 let nm: str = stripSpaces(plainName(nameNode))
                 if typeNode == nil || typeNode.kind == nkEmpty:
@@ -3667,10 +3489,8 @@ fn asyncCollectParamTypes(paramsNode: Node, names: seq[str]*, types: seq[Node]*)
                     asyncAddCapture(names, types, nm, newNode(nkEmpty, defs.pos), defs.pos)
                 else:
                     asyncAddCapture(names, types, nm, cloneTree typeNode, defs.pos)
-                j = j + 1
-        i = i + 1
 
-fn asyncCollectLocals(n: Node, names: seq[str]*, types: seq[Node]*) =
+fn asyncCollectLocals(n: Node, names: str[]*, types: Node[]*) =
     if n == nil:
         return
     if n.kind == nkFnDecl || n.kind == nkIteratorDecl || n.kind == nkLambda:
@@ -3704,12 +3524,10 @@ fn asyncCollectLocals(n: Node, names: seq[str]*, types: seq[Node]*) =
                 typeNode = newNode(nkEmpty, n.pos)
         asyncAddCapture(names, types, nm, cloneTree typeNode, n.pos)
         return
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         asyncCollectLocals(kid(n, i), names, types)
-        i = i + 1
 
-fn asyncPickInternalName(base: str, captures: seq[str]): str =
+fn asyncPickInternalName(base: str, captures: str[]): str =
     var name: str = "__async_" + base
     while asyncNameIndex(captures, name) >= 0:
         name = name + "_"
@@ -3765,24 +3583,22 @@ fn asyncRewriteTree(n: Node, ctx: AsyncLowerCtx): Node =
         addSon(outPost, cloneTree(kid(n, 1)))
         return outPost
     var out: Node = lowerCloneShallow(n)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         addSon(out, asyncRewriteTree(kid(n, i), ctx))
-        i = i + 1
     return out
 
-fn asyncNewState(states: seq[Node]*, pos: SourcePos): int32 =
+fn asyncNewState(states: Node[]*, pos: SourcePos): int32 =
     let id: int32 = states.len
     var list: Node = newNode(nkStmtList, pos)
     addPtr[Node](states, list)
     return id
 
-fn asyncStateBody(states: seq[Node], id: int32): Node =
+fn asyncStateBody(states: Node[], id: int32): Node =
     if id < 0 || id >= states.len:
         return nil
     return get[Node](states, id)
 
-fn asyncStateAdd(states: seq[Node]*, id: int32, stmt: Node) =
+fn asyncStateAdd(states: Node[]*, id: int32, stmt: Node) =
     let body: Node = asyncStateBody(*states, id)
     if body != nil && stmt != nil:
         addSon(body, stmt)
@@ -3823,11 +3639,11 @@ fn asyncAwaitKindFromExpr(expr: Node): str =
                         return retKind
     return ""
 
-fn asyncLowerStmtList(stmts: Node, states: seq[Node]*, curState: int32, nextState: int32,
+fn asyncLowerStmtList(stmts: Node, states: Node[]*, curState: int32, nextState: int32,
     ctx: AsyncLowerCtx): AsyncStmtResult
 
 fn asyncBuildFrameType(name: str, stateName: str, resultName: str, awaitName: str, awaitType: Node,
-    captures: seq[str], captureTypes: seq[Node], pos: SourcePos): Node =
+    captures: str[], captureTypes: Node[], pos: SourcePos): Node =
     var td: Node = newNode(nkTypeDecl, pos)
     addSon(td, newIdent(name, pos))
     var obj: Node = newNode(nkObjectDecl, pos)
@@ -3848,8 +3664,7 @@ fn asyncBuildFrameType(name: str, stateName: str, resultName: str, awaitName: st
     addSon(awaitDefs, cloneTree awaitType)
     addSon(awaitDefs, newNode(nkEmpty, pos))
     addSon(rec, awaitDefs)
-    var i: int32 = 0
-    while i < captures.len:
+    for i in 0..<captures.len:
         let nm: str = get[str](captures, i)
         let ty: Node = get[Node](captureTypes, i)
         var defs: Node = newNode(nkIdentDefs, pos)
@@ -3860,7 +3675,6 @@ fn asyncBuildFrameType(name: str, stateName: str, resultName: str, awaitName: st
             addSon(defs, newNode(nkEmpty, pos))
         addSon(defs, newNode(nkEmpty, pos))
         addSon(rec, defs)
-        i = i + 1
     addSon(obj, rec)
     addSon(td, obj)
     addSon(td, newNode(nkEmpty, pos))
@@ -3889,7 +3703,7 @@ fn asyncBuildWrapper(fnNode: Node, frameType: str, ctx: AsyncLowerCtx, awaitKind
     addSon(frameDecl, newNode(nkEmpty, pos))
     addSon(frameDecl, newNode(nkEmpty, pos))
     addSon(body, frameDecl)
-    var newArgs: seq[Node] = newSeqWithCap[Node](0, 1)
+    var newArgs: Node[1]
     addPtr[Node](&newArgs, newIdent(frameName, pos))
     addSon(body, lowerMakeCall("new", pos, newArgs))
     addSon(body, asyncMakeSetState(frameName, ctx.stateName, 0, pos))
@@ -3897,18 +3711,17 @@ fn asyncBuildWrapper(fnNode: Node, frameType: str, ctx: AsyncLowerCtx, awaitKind
     if pendingName == "":
         lowerAddError(pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
     else:
-        var pendingCall: Node = lowerMakeCall(pendingName, pos, newSeqWithCap[Node](0, 0))
+        var emptyArgs: Node[]
+        var pendingCall: Node = lowerMakeCall(pendingName, pos, emptyArgs)
         var setResult: Node = newNode(nkAsgn, pos)
         addSon(setResult, lowerMakeDot(frameName, ctx.resultName, pos))
         addSon(setResult, pendingCall)
         addSon(body, setResult)
     if paramsNode != nil && paramsNode.kind == nkFormalParams:
-        var i: int32 = 0
-        while i < kidCount paramsNode:
+        for i in 0..<kidCount paramsNode:
             let defs: Node = kid(paramsNode, i)
             if defs != nil && defs.kind == nkIdentDefs:
-                var j: int32 = 0
-                while j < kidCount defs - 2:
+                for j in 0..<kidCount defs - 2:
                     let nameNode: Node = kid(defs, j)
                     let nm: str = stripSpaces(plainName(nameNode))
                     if nm != "" && nm != "_":
@@ -3916,13 +3729,11 @@ fn asyncBuildWrapper(fnNode: Node, frameType: str, ctx: AsyncLowerCtx, awaitKind
                         addSon(asn, lowerMakeDot(frameName, nm, pos))
                         addSon(asn, newIdent(nm, pos))
                         addSon(body, asn)
-                    j = j + 1
-            i = i + 1
-    var addrArgs: seq[Node] = newSeqWithCap[Node](0, 1)
+    var addrArgs: Node[1]
     addPtr[Node](&addrArgs, newIdent(ctx.driverName, pos))
     let addrExpr: Node = lowerMakeCall("__addr", pos, addrArgs)
     var ctxExpr: Node = lowerCastToVoidPtr(newIdent(frameName, pos), pos)
-    var spawnArgs: seq[Node] = newSeqWithCap[Node](0, 2)
+    var spawnArgs: Node[2]
     addPtr[Node](&spawnArgs, addrExpr)
     addPtr[Node](&spawnArgs, ctxExpr)
     addSon(body, lowerMakeCall("spawn", pos, spawnArgs))
@@ -3983,7 +3794,7 @@ fn asyncBuildDriver(frameType: str, ctx: AsyncLowerCtx, awaitKind: str, bodyNode
     addSon(doneCheck, condDone)
     addSon(doneCheck, doneBody)
     addSon(body, doneCheck)
-    var states: seq[Node] = newSeqWithCap[Node](0, 8)
+    var states: Node[8]
     let startState: int32 = asyncNewState(&states, pos)
     let doneState: int32 = asyncNewState(&states, pos)
     asyncLowerStmtList(bodyNode, &states, startState, doneState, ctx)
@@ -3993,7 +3804,7 @@ fn asyncBuildDriver(frameType: str, ctx: AsyncLowerCtx, awaitKind: str, bodyNode
         lowerAddError(pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
         asyncStateAdd(&states, doneState, newNode(nkReturn, pos))
     else:
-        var callArgs: seq[Node] = newSeqWithCap[Node](0, 2)
+        var callArgs: Node[2]
         addPtr[Node](&callArgs, lowerMakeDot(frameName, ctx.resultName, pos))
         if awaitKind == "i32":
             let defVal: Node = iterDefaultValueNode(ctx.retType, pos)
@@ -4002,13 +3813,11 @@ fn asyncBuildDriver(frameType: str, ctx: AsyncLowerCtx, awaitKind: str, bodyNode
         asyncStateAdd(&states, doneState, setCall)
         asyncStateAdd(&states, doneState, newNode(nkReturn, pos))
     var ifNode: Node = newNode(nkIf, pos)
-    var si: int32 = 0
-    while si < states.len:
+    for si in 0..<states.len:
         let cond: Node = lowerMakeInfix("==", lowerMakeDot(frameName, ctx.stateName, pos),
             lowerMakeIntLit(int64(si), pos), pos)
         addSon(ifNode, cond)
         addSon(ifNode, get[Node](states, si))
-        si = si + 1
     var elseBody: Node = newNode(nkStmtList, pos)
     addSon(elseBody, newNode(nkReturn, pos))
     addSon(ifNode, elseBody)
@@ -4024,7 +3833,7 @@ fn asyncBuildDriver(frameType: str, ctx: AsyncLowerCtx, awaitKind: str, bodyNode
     addSon(fnNode, newNode(nkEmpty, pos))
     return fnNode
 
-fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: int32,
+fn asyncLowerStmt(stmt: Node, states: Node[]*, curState: int32, nextState: int32,
     ctx: AsyncLowerCtx): AsyncStmtResult =
     var out: AsyncStmtResult
     out.state = curState
@@ -4077,11 +3886,11 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
             var cond: Node = lowerMakeInfix("==", statusExpr, lowerMakeIntLit(0, stmt.pos), stmt.pos)
             var pendingBody: Node = newNode(nkStmtList, stmt.pos)
             addSon(pendingBody, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState, stmt.pos))
-            var addrArgs: seq[Node] = newSeqWithCap[Node](0, 1)
+            var addrArgs: Node[1]
             addPtr[Node](&addrArgs, newIdent(ctx.driverName, stmt.pos))
             let addrExpr: Node = lowerMakeCall("__addr", stmt.pos, addrArgs)
             var ctxExpr: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
-            var spawnArgs: seq[Node] = newSeqWithCap[Node](0, 2)
+            var spawnArgs: Node[2]
             addPtr[Node](&spawnArgs, addrExpr)
             addPtr[Node](&spawnArgs, ctxExpr)
             addSon(pendingBody, lowerMakeCall("spawn", stmt.pos, spawnArgs))
@@ -4096,11 +3905,11 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
                 lowerMakeIntLit(0, stmt.pos), stmt.pos)
             var resumeBody: Node = newNode(nkStmtList, stmt.pos)
             addSon(resumeBody, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState, stmt.pos))
-            var addrArgs2: seq[Node] = newSeqWithCap[Node](0, 1)
+            var addrArgs2: Node[1]
             addPtr[Node](&addrArgs2, newIdent(ctx.driverName, stmt.pos))
             let addrExpr2: Node = lowerMakeCall("__addr", stmt.pos, addrArgs2)
             var ctxExpr2: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
-            var spawnArgs2: seq[Node] = newSeqWithCap[Node](0, 2)
+            var spawnArgs2: Node[2]
             addPtr[Node](&spawnArgs2, addrExpr2)
             addPtr[Node](&spawnArgs2, ctxExpr2)
             addSon(resumeBody, lowerMakeCall("spawn", stmt.pos, spawnArgs2))
@@ -4149,11 +3958,11 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
             var cond2: Node = lowerMakeInfix("==", statusExpr2, lowerMakeIntLit(0, stmt.pos), stmt.pos)
             var pendingBody2: Node = newNode(nkStmtList, stmt.pos)
             addSon(pendingBody2, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState2, stmt.pos))
-            var addrArgs3: seq[Node] = newSeqWithCap[Node](0, 1)
+            var addrArgs3: Node[1]
             addPtr[Node](&addrArgs3, newIdent(ctx.driverName, stmt.pos))
             let addrExpr3: Node = lowerMakeCall("__addr", stmt.pos, addrArgs3)
             var ctxExpr3: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
-            var spawnArgs3: seq[Node] = newSeqWithCap[Node](0, 2)
+            var spawnArgs3: Node[2]
             addPtr[Node](&spawnArgs3, addrExpr3)
             addPtr[Node](&spawnArgs3, ctxExpr3)
             addSon(pendingBody2, lowerMakeCall("spawn", stmt.pos, spawnArgs3))
@@ -4168,11 +3977,11 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
                 lowerMakeIntLit(0, stmt.pos), stmt.pos)
             var resumeBody2: Node = newNode(nkStmtList, stmt.pos)
             addSon(resumeBody2, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState2, stmt.pos))
-            var addrArgs4: seq[Node] = newSeqWithCap[Node](0, 1)
+            var addrArgs4: Node[1]
             addPtr[Node](&addrArgs4, newIdent(ctx.driverName, stmt.pos))
             let addrExpr4: Node = lowerMakeCall("__addr", stmt.pos, addrArgs4)
             var ctxExpr4: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
-            var spawnArgs4: seq[Node] = newSeqWithCap[Node](0, 2)
+            var spawnArgs4: Node[2]
             addPtr[Node](&spawnArgs4, addrExpr4)
             addPtr[Node](&spawnArgs4, ctxExpr4)
             addSon(resumeBody2, lowerMakeCall("spawn", stmt.pos, spawnArgs4))
@@ -4218,11 +4027,11 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
             var cond3: Node = lowerMakeInfix("==", statusExpr3, lowerMakeIntLit(0, stmt.pos), stmt.pos)
             var pendingBody3: Node = newNode(nkStmtList, stmt.pos)
             addSon(pendingBody3, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState3, stmt.pos))
-            var addrArgs5: seq[Node] = newSeqWithCap[Node](0, 1)
+            var addrArgs5: Node[1]
             addPtr[Node](&addrArgs5, newIdent(ctx.driverName, stmt.pos))
             let addrExpr5: Node = lowerMakeCall("__addr", stmt.pos, addrArgs5)
             var ctxExpr5: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
-            var spawnArgs5: seq[Node] = newSeqWithCap[Node](0, 2)
+            var spawnArgs5: Node[2]
             addPtr[Node](&spawnArgs5, addrExpr5)
             addPtr[Node](&spawnArgs5, ctxExpr5)
             addSon(pendingBody3, lowerMakeCall("spawn", stmt.pos, spawnArgs5))
@@ -4237,11 +4046,11 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
                 lowerMakeIntLit(0, stmt.pos), stmt.pos)
             var resumeBody3: Node = newNode(nkStmtList, stmt.pos)
             addSon(resumeBody3, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState3, stmt.pos))
-            var addrArgs6: seq[Node] = newSeqWithCap[Node](0, 1)
+            var addrArgs6: Node[1]
             addPtr[Node](&addrArgs6, newIdent(ctx.driverName, stmt.pos))
             let addrExpr6: Node = lowerMakeCall("__addr", stmt.pos, addrArgs6)
             var ctxExpr6: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
-            var spawnArgs6: seq[Node] = newSeqWithCap[Node](0, 2)
+            var spawnArgs6: Node[2]
             addPtr[Node](&spawnArgs6, addrExpr6)
             addPtr[Node](&spawnArgs6, ctxExpr6)
             addSon(resumeBody3, lowerMakeCall("spawn", stmt.pos, spawnArgs6))
@@ -4253,7 +4062,7 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
             if setName3 == "":
                 lowerAddError(stmt.pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
             else:
-                var callArgs3: seq[Node] = newSeqWithCap[Node](0, 2)
+                var callArgs3: Node[2]
                 addPtr[Node](&callArgs3, lowerMakeDot(ctx.frameName, ctx.resultName, stmt.pos))
                 if awaitKind3 == "i32":
                     addPtr[Node](&callArgs3, asyncAwaitValueExpr(ctx, stmt.pos))
@@ -4272,7 +4081,7 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
         if setName == "":
             lowerAddError(stmt.pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
         else:
-            var callArgs4: seq[Node] = newSeqWithCap[Node](0, 2)
+            var callArgs4: Node[2]
             addPtr[Node](&callArgs4, lowerMakeDot(ctx.frameName, ctx.resultName, stmt.pos))
             if retKind == "i32":
                 if rv != nil && rv.kind != nkEmpty:
@@ -4292,7 +4101,7 @@ fn asyncLowerStmt(stmt: Node, states: seq[Node]*, curState: int32, nextState: in
         asyncStateAdd(states, curState, asyncRewriteTree(stmt, ctx))
         return out
 
-fn asyncLowerStmtList(stmts: Node, states: seq[Node]*, curState: int32, nextState: int32,
+fn asyncLowerStmtList(stmts: Node, states: Node[]*, curState: int32, nextState: int32,
     ctx: AsyncLowerCtx): AsyncStmtResult =
     var state: int32 = curState
     var open: bool = true
@@ -4303,15 +4112,13 @@ fn asyncLowerStmtList(stmts: Node, states: seq[Node]*, curState: int32, nextStat
         var tmp: Node = newNode(nkStmtList, list.pos)
         addSon(tmp, list)
         list = tmp
-    var i: int32 = 0
-    while i < kidCount list:
+    for i in 0..<kidCount list:
         if !open:
             break
         let s: Node = kid(list, i)
         let res: AsyncStmtResult = asyncLowerStmt(s, states, state, nextState, ctx)
         state = res.state
         open = res.open
-        i = i + 1
     var outRes: AsyncStmtResult
     if open:
         asyncStateAdd(states, state, asyncMakeSetState(ctx.frameName, ctx.stateName, nextState, list.pos))
@@ -4354,8 +4161,8 @@ fn lowerAsyncDecl(fnNode: Node): Node =
         if gens != nil && gens.kind != nkEmpty:
             lowerAddError(pos, "[C-Profile] not-mapped: async generics (FULLC.L08). hint: monomorphize before async or avoid generics.")
             return fnNode
-    var captureNames: seq[str] = newSeqWithCap[str](0, 8)
-    var captureTypes: seq[Node] = newSeqWithCap[Node](0, 8)
+    var captureNames: str[8]
+    var captureTypes: Node[8]
     asyncCollectParamTypes(paramsNode, &captureNames, &captureTypes)
     asyncCollectLocals(bodyNode, &captureNames, &captureTypes)
     let frameType: str = baseName + "__async_frame"
@@ -4385,24 +4192,18 @@ fn lowerAsyncDecls(n: Node): Node =
         var out: Node = newNode(n.kind, n.pos)
         nodeSetIdent(out, n.ident)
         nodeSetStrVal(out, n.strVal)
-        var i: int32 = 0
-        while i < kidCount n:
+        for i in 0..<kidCount n:
             let child: Node = kid(n, i)
             let lowered: Node = lowerAsyncDecls(child)
             if lowered != nil && lowered.kind == nkStmtList && child.kind != nkStmtList:
-                var j: int32 = 0
-                while j < kidCount lowered:
+                for j in 0..<kidCount lowered:
                     addSon(out, kid(lowered, j))
-                    j = j + 1
             else:
                 addSon(out, lowered)
-            i = i + 1
         return out
     var outNode: Node = lowerCloneShallow(n)
-    var k: int32 = 0
-    while k < kidCount n:
+    for k in 0..<kidCount n:
         addSon(outNode, lowerAsyncDecls(kid(n, k)))
-        k = k + 1
     return outNode
 
 fn lowerAwaitExpr(n: Node): Node =
@@ -4417,14 +4218,12 @@ fn lowerAwaitExpr(n: Node): Node =
         let fnName: str = asyncAwaitName kind
         if fnName == "":
             return loweredInner
-        var args: seq[Node] = newSeqWithCap[Node](0, 1)
+        var args: Node[1]
         addPtr[Node](&args, loweredInner)
         return lowerMakeCall(fnName, n.pos, args)
     var out: Node = lowerCloneShallow(n)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         addSon(out, lowerAwaitExpr(kid(n, i)))
-        i = i + 1
     return out
 
 fn lowerAwaitStmt(n: Node): Node =
@@ -4436,10 +4235,8 @@ fn lowerAwaitStmt(n: Node): Node =
         var outList: Node = newNode(n.kind, n.pos)
         nodeSetIdent(outList, n.ident)
         nodeSetStrVal(outList, n.strVal)
-        var i: int32 = 0
-        while i < kidCount n:
+        for i in 0..<kidCount n:
             addSon(outList, lowerAwaitStmt(kid(n, i)))
-            i = i + 1
         lowerValueScopePop()
         return outList
     of nkVar, nkLet, nkConst:
@@ -4489,43 +4286,33 @@ fn lowerAwaitInSync(n: Node): Node =
         if kidCount n > 1:
             let paramsNode: Node = kid(n, 1)
             if paramsNode != nil && paramsNode.kind == nkFormalParams:
-                var i: int32 = 0
-                while i < kidCount paramsNode:
+                for i in 0..<kidCount paramsNode:
                     let defs: Node = kid(paramsNode, i)
                     if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
                         let typeNode: Node = kid(defs, 1)
-                        var j: int32 = 0
-                        while j < kidCount defs - 2:
+                        for j in 0..<kidCount defs - 2:
                             let nameNode: Node = kid(defs, j)
                             let nm: str = stripSpaces(plainName(nameNode))
                             if nm != "" && nm != "_":
                                 lowerValueAdd(nm, typeNode)
-                            j = j + 1
-                    i = i + 1
         var outFn: Node = lowerCloneShallow(n)
-        var k: int32 = 0
-        while k < kidCount n:
+        for k in 0..<kidCount n:
             if k == 3:
                 addSon(outFn, lowerAwaitStmt(kid(n, k)))
             else:
                 addSon(outFn, cloneTree(kid(n, k)))
-            k = k + 1
         lowerValueScopePop()
         return outFn
     if n.kind == nkStmtList || n.kind == nkModule:
         var out: Node = newNode(n.kind, n.pos)
         nodeSetIdent(out, n.ident)
         nodeSetStrVal(out, n.strVal)
-        var i: int32 = 0
-        while i < kidCount n:
+        for i in 0..<kidCount n:
             addSon(out, lowerAwaitInSync(kid(n, i)))
-            i = i + 1
         return out
     var outNode: Node = lowerCloneShallow(n)
-    var j: int32 = 0
-    while j < kidCount n:
+    for j in 0..<kidCount n:
         addSon(outNode, lowerAwaitInSync(kid(n, j)))
-        j = j + 1
     return outNode
 
 fn lowerValidatePattern(n: Node) =
@@ -4538,30 +4325,24 @@ fn lowerValidatePattern(n: Node) =
         return
     if core.kind == nkCurly || core.kind == nkCurlyExpr:
         lowerAddError(core.pos, "[C-Profile] not-mapped: set pattern (FULLC.L02). hint: lower to `in`/contains checks.")
-    var i: int32 = 0
-    while i < kidCount core:
+    for i in 0..<kidCount core:
         lowerValidatePattern(kid(core, i))
-        i = i + 1
 
 fn lowerValidateExpr(n: Node) =
     if n == nil:
         return
     if n.kind == nkPattern:
         lowerValidatePattern(n)
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         lowerValidateExpr(kid(n, i))
-        i = i + 1
 
 fn lowerValidateStmt(n: Node) =
     if n == nil:
         return
     case n.kind
     of nkModule, nkStmtList:
-        var i: int32 = 0
-        while i < kidCount n:
+        for i in 0..<kidCount n:
             lowerValidateStmt(kid(n, i))
-            i = i + 1
     of nkFnDecl, nkIteratorDecl, nkMacroDecl, nkTemplateDecl:
         if kidCount n > 3:
             lowerValidateStmt(kid(n, 3))
@@ -4579,18 +4360,16 @@ fn lowerValidateStmt(n: Node) =
         if kidCount n > 0:
             lowerValidateExpr(kid(n, 0))
     of nkIf, nkWhen, nkWhile, nkFor, nkCase, nkBlock, nkDefer, nkYield, nkBreak, nkContinue:
-        var j: int32 = 0
-        while j < kidCount n:
+        for j in 0..<kidCount n:
             let child: Node = kid(n, j)
             if child != nil && (child.kind == nkStmtList || child.kind == nkBlock || child.kind == nkElse || child.kind == nkOfBranch):
                 lowerValidateStmt(child)
             else:
                 lowerValidateExpr(child)
-            j = j + 1
     else:
         lowerValidateExpr(n)
 
-fn lowerCProfile(root: Node, diags: seq[Diagnostic]*): Node =
+fn lowerCProfile(root: Node, diags: Diagnostic[]*): Node =
     lowerDiags = diags
     if root != nil && root.strVal != nil:
         lowerFilename = root.strVal

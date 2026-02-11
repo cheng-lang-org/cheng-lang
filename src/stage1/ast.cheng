@@ -62,20 +62,22 @@ type
         intVal: int64
         floatVal: float64
         callStyle: int8
-        kids: seq[void*]
+        kids: ptr[]
         typeCache: Node
         typeCacheValid: bool
         managedCacheState: int8
 
 var
-    nodeArena: seq[Node]
+    nodeArena: Node[]
     nodeArenaReady: bool
     nodeArenaEnabled: bool = true
 
 fn initNodeArena() =
     if nodeArenaReady:
         return
-    nodeArena = newSeqWithCap[Node](0, 512)
+    freeSeq[Node](nodeArena)
+    nodeArena = []
+    nodeArena.cap = 512
     nodeArenaReady = true
 
 fn trackNode(n: Node) =
@@ -90,8 +92,7 @@ fn trackNode(n: Node) =
 fn releaseNodeArena() =
     if ! nodeArenaReady:
         return
-    var i: int32 = 0
-    while i < nodeArena.len:
+    for i in 0..<nodeArena.len:
         let n: Node = get[Node](nodeArena, i)
         if n != nil:
             if n.ident != nil && len n.ident > 0:
@@ -101,7 +102,6 @@ fn releaseNodeArena() =
             if n.kids.buffer != nil:
                 ast_memRelease n.kids.buffer
             ast_memRelease void*(n)
-        i = i + 1
     freeSeqPtr[Node](&nodeArena)
     nodeArenaReady = false
 
@@ -196,7 +196,7 @@ fn kid(n: Node, i: int32): Node =
         return nil
     if i >= n.kids.len:
         return nil
-    return Node(get[void*](n.kids, i))
+    return Node(get[ptr](n.kids, i))
 
 fn setKid(n: Node, i: int32, child: Node) =
     if n == nil:
@@ -212,7 +212,7 @@ fn setKid(n: Node, i: int32, child: Node) =
 fn addSon(father: Node, son: Node) =
     if father == nil:
         return
-    addPtr[void*](&father.kids, void*(son))
+    addPtr[ptr](&father.kids, void*(son))
 
 fn isEmpty(n: Node): bool =
     if n == nil:
@@ -239,6 +239,23 @@ fn plainName(n: Node): str =
             return plainName kid(n, 1)
     return ""
 
+fn identDefsNameCount(defs: Node): int32 =
+    if defs == nil || defs.kind != nkIdentDefs:
+        return 0
+    let n: int32 = kidCount defs
+    if n <= 2:
+        return n
+    return n - 2
+
+fn identDefsType(defs: Node): Node =
+    if defs == nil || defs.kind != nkIdentDefs:
+        return nil
+    let n: int32 = kidCount defs
+    if n < 2:
+        return nil
+    # IdentDefs layout: names..., type, default (type at n-2).
+    return kid(defs, n - 2)
+
 fn cloneTree(n: Node): Node =
     if n == nil:
         return nil
@@ -248,8 +265,6 @@ fn cloneTree(n: Node): Node =
     n2.intVal = n.intVal
     n2.floatVal = n.floatVal
     n2.callStyle = n.callStyle
-    var i: int32 = 0
-    while i < kidCount n:
+    for i in 0..<kidCount n:
         addSon(n2, cloneTree kid(n, i))
-        i = i + 1
     return n2

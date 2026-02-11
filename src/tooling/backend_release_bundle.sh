@@ -17,7 +17,7 @@ USAGE
 }
 
 out="artifacts/backend_prod/backend_release.tar.gz"
-name="backend_mvp_driver"
+name="cheng"
 manifest="artifacts/backend_prod/release_manifest.json"
 driver=""
 extras=""

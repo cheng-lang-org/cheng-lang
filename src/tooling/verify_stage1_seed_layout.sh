@@ -13,24 +13,43 @@ fail() {
 legacy_seed="src/stage1/frontend_bootstrap.seed.c"
 [ ! -f "$legacy_seed" ] || fail "legacy seed must not exist: $legacy_seed"
 
-seed_file="src/stage1/stage1_runner.seed.c"
-[ -f "$seed_file" ] || fail "missing required seed file: $seed_file"
-
-seed_files="$(find src/stage1 -maxdepth 1 -type f -name '*.seed.c' | LC_ALL=C sort)"
-if [ "$seed_files" != "$seed_file" ]; then
-  echo "$seed_files" 1>&2
-  fail "unexpected seed file set under src/stage1 (only $seed_file is allowed)"
+seed_driver="${CHENG_SELF_OBJ_BOOTSTRAP_STAGE0:-}"
+if [ -z "$seed_driver" ]; then
+  for cand in \
+    "artifacts/backend_seed/cheng.stage2" \
+    "artifacts/backend_selfhost_self_obj/cheng.stage2" \
+    "cheng"; do
+    if [ -x "$cand" ]; then
+      seed_driver="$cand"
+      break
+    fi
+  done
 fi
 
-max_bytes="${CHENG_STAGE1_SEED_MAX_BYTES:-20000000}"
-case "$max_bytes" in
-  ''|*[!0-9]*)
-    fail "invalid CHENG_STAGE1_SEED_MAX_BYTES: $max_bytes"
+if [ -z "$seed_driver" ]; then
+  seed_id=""
+  if [ -f "dist/releases/current_id.txt" ]; then
+    seed_id="$(cat dist/releases/current_id.txt | tr -d '\r\n')"
+  fi
+  if [ -n "$seed_id" ]; then
+    for tar_path in "dist/releases/$seed_id/backend_release.tar.gz"; do
+      if [ -f "$tar_path" ]; then
+        seed_driver="$tar_path"
+        break
+      fi
+    done
+  fi
+fi
+
+[ -n "$seed_driver" ] || fail "missing stage seed driver (set CHENG_SELF_OBJ_BOOTSTRAP_STAGE0 or prepare artifacts/backend_seed/cheng.stage2)"
+
+case "$seed_driver" in
+  *.tar.gz)
+    :
+    ;;
+  *)
+    [ -x "$seed_driver" ] || fail "seed driver is not executable: $seed_driver"
     ;;
 esac
-size_bytes="$(wc -c < "$seed_file" | tr -d '[:space:]')"
-if [ "$size_bytes" -gt "$max_bytes" ]; then
-  fail "seed file too large: $seed_file ($size_bytes bytes > $max_bytes bytes)"
-fi
 
 echo "verify_stage1_seed_layout ok"

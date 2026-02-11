@@ -19,14 +19,12 @@ fn isel_strContains(hay: str, needle: str): bool =
         return true
     if n < m:
         return false
-    var i: int32 = 0
-    while i <= n - m:
-        var j: int32 = 0
-        while j < m && charAt(hay, i + j) == charAt(needle, j):
-            j = j + 1
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
         if j == m:
             return true
-        i = i + 1
     return false
 
 fn isel_strStartsWith(s: str, prefix: str): bool =
@@ -38,11 +36,9 @@ fn isel_strStartsWith(s: str, prefix: str): bool =
         return true
     if n < m:
         return false
-    var i: int32 = 0
-    while i < m:
-        if charAt(s, i) != charAt(prefix, i):
+    for i in 0..<m:
+        if s[i] != prefix[i]:
             return false
-        i = i + 1
     return true
 
 fn iselTargetIsDarwin(target: str): bool =
@@ -73,7 +69,7 @@ fn iselVarargsElemTypeFromTypeKey(typeKey: str): Result[MirType] =
     if streq(typeKey, "varargs_uint64") || streq(typeKey, "varargs_u64"):
         return Ok[MirType](mirTypeU64())
     if streq(typeKey, "varargs_ptr") || streq(typeKey, "varargs_void*") ||
-       streq(typeKey, "varargs_cstring") || streq(typeKey, "varargs_str") || streq(typeKey, "varargs_string"):
+       streq(typeKey, "varargs_cstring") || streq(typeKey, "varargs_str"):
         return Ok[MirType](mirTypeI64())
     if streq(typeKey, "varargs_bool") || streq(typeKey, "varargs_char") ||
        streq(typeKey, "varargs_int8") || streq(typeKey, "varargs_i8") ||
@@ -96,8 +92,8 @@ fn iselIsInternalSym(name: str): bool =
 fn iselStripTargetSymPrefixOnce(target: str, name: str): str =
     if name == nil:
         return ""
-    if iselTargetIsDarwin(target) && len(name) > 0 && charAt(name, 0) == '_' :
-        if len(name) >= 2 && charAt(name, 1) == '_' :
+    if iselTargetIsDarwin(target) && len(name) > 0 && name[0] == '_' :
+        if len(name) >= 2 && name[1] == '_' :
             return name
         return "" + str(ptr_add(void*(name), 1))
     return name
@@ -199,23 +195,19 @@ fn iselRegWithType(reg: LirReg, ty: MirType): LirReg =
     else: return reg
 
 fn iselFindFunc(module: MirModule, name: str): MirFunc =
-    var i: int32 = 0
-    while i < module.funcs.len:
+    for i in 0..<module.funcs.len:
         let f: MirFunc = get[MirFunc](module.funcs, i)
         if streq(f.name, name):
             return f
-        i = i + 1
     return nil
 
 fn iselHasGlobal(module: MirModule, name: str): bool =
     if module == nil || name == nil:
         return false
-    var i: int32 = 0
-    while i < module.globals.len:
+    for i in 0..<module.globals.len:
         let g: MirGlobal = get[MirGlobal](module.globals, i)
         if streq(g.name, name):
             return true
-        i = i + 1
     return false
 
 fn iselGlobalSym(module: MirModule, name: str): str =
@@ -283,7 +275,11 @@ fn iselExprType(module: MirModule, mirFunc: MirFunc, expr: MirExpr,
     return fallback
 
 fn iselSlotOffset(slot: int32): int64 =
-    return int64(slot) * 8
+    # Standard SysV frame pointer layout:
+    #   [rbp+0]  = saved rbp
+    #   [rbp+8]  = return address
+    #   locals   = negative offsets from rbp
+    return (int64(0) - int64(slot) - 1) * 8
 
 fn iselTypeSize(ty: MirType): int32 =
     if ty.kind == mtI64:
@@ -407,8 +403,7 @@ fn iselEmitCallIndirectBuiltin(func: LirFunc, module: MirModule, mirFunc: MirFun
 
     iselEmitSubSp(func, outSize)
 
-    var ai: int32 = 0
-    while ai < realArgCount:
+    for ai in 0..<realArgCount:
         let argExpr: MirExpr = get[MirExpr](expr.args, ai + 1)
         var argType: MirType = iselArgType(callee, ai + 1, retType)
         if callee == nil:
@@ -423,15 +418,13 @@ fn iselEmitCallIndirectBuiltin(func: LirFunc, module: MirModule, mirFunc: MirFun
             return argRes
         let off: int64 = (ai < argRegCount) ? (tempBase + int64(ai) * 8) : (int64(ai - argRegCount) * 8)
         lirAddInst(func, lirStr(argDst, lrSp, off))
-        ai = ai + 1
 
     let fnRes: Result[int32] = iselEmitExpr(func, module, mirFunc, fnPtrExpr, mirTypeI64(),
                                             callReg, lrR10, lrRdx, baseReg, labelState)
     if !IsOk[int32](fnRes):
         return fnRes
 
-    var ri: int32 = 0
-    while ri < tempCount:
+    for ri in 0..<tempCount:
         var argType2: MirType = iselArgType(callee, ri + 1, retType)
         if callee == nil:
             let argExpr2: MirExpr = get[MirExpr](expr.args, ri + 1)
@@ -441,7 +434,6 @@ fn iselEmitCallIndirectBuiltin(func: LirFunc, module: MirModule, mirFunc: MirFun
             return ErrInfo[int32](ErrorInfoOf[LirReg](regRes))
         let off2: int64 = tempBase + int64(ri) * 8
         lirAddInst(func, lirLdr(Value[LirReg](regRes), lrSp, off2))
-        ri = ri + 1
 
     lirAddInst(func, lirBlr(callReg))
     iselEmitAddSp(func, outSize)
@@ -625,8 +617,7 @@ fn iselEmitExpr(func: LirFunc, module: MirModule, mirFunc: MirFunc, expr: MirExp
         outSize = iselAlignUp(outSize, 16)
 
         iselEmitSubSp(func, outSize)
-        var ai: int32 = 0
-        while ai < argCount:
+        for ai in 0..<argCount:
             let argExpr: MirExpr = get[MirExpr](expr.args, ai)
             var argType: MirType = iselArgType(callee, ai, retType)
             if hasVarargs && ai >= fixedCount:
@@ -643,9 +634,7 @@ fn iselEmitExpr(func: LirFunc, module: MirModule, mirFunc: MirFunc, expr: MirExp
                 return argRes
             let off: int64 = (ai < argRegCount) ? (tempBase + int64(ai) * 8) : (int64(ai - argRegCount) * 8)
             lirAddInst(func, lirStr(argDst, lrSp, off))
-            ai = ai + 1
-        var ri: int32 = 0
-        while ri < tempCount:
+        for ri in 0..<tempCount:
             var argType2: MirType = iselArgType(callee, ri, retType)
             if hasVarargs && ri >= fixedCount:
                 argType2 = varargsElemType
@@ -657,7 +646,6 @@ fn iselEmitExpr(func: LirFunc, module: MirModule, mirFunc: MirFunc, expr: MirExp
                 return ErrInfo[int32](ErrorInfoOf[LirReg](regRes))
             let off2: int64 = tempBase + int64(ri) * 8
             lirAddInst(func, lirLdr(Value[LirReg](regRes), lrSp, off2))
-            ri = ri + 1
         if hasVarargs:
             # SysV varargs ABI: AL = number of vector registers used (none in our subset).
             lirAddInst(func, lirMovImm(lrEax, 0))
@@ -836,7 +824,7 @@ fn iselEmitStmt(func: LirFunc, module: MirModule, stmt: MirStmt, mirFunc: MirFun
         var reg: LirReg = iselReg0(p.ty)
         if stmt.paramIndex >= 6:
             var argOff: int64 = int64(stmt.paramIndex - 6) * 8
-            let stackOff: int64 = frameSize + 16 + argOff
+            let stackOff: int64 = 16 + argOff
             lirAddInst(func, lirLdr(reg, baseReg, stackOff))
         else:
             let regRes: Result[LirReg] = iselArgReg(p.ty, stmt.paramIndex)
@@ -868,7 +856,13 @@ fn iselEmitStmt(func: LirFunc, module: MirModule, stmt: MirStmt, mirFunc: MirFun
     if stmt.kind == msExpr:
         return iselEmitExpr(func, module, mirFunc, stmt.expr, retType, dst, tmp,
                             scratch, baseReg, labelState)
-    return Err[int32]("isel: unsupported stmt")
+    let funcName: str = (mirFunc != nil && mirFunc.name != nil) ? mirFunc.name : ""
+    let stmtName: str = stmt.name != nil ? stmt.name : ""
+    let msg: str = "isel: unsupported stmt kind=" + intToStr(int32(stmt.kind)) +
+                   " slot=" + intToStr(stmt.slot) +
+                   " name=" + stmtName +
+                   " func=" + funcName
+    return Err[int32](msg)
 
 fn iselEmitCondBranch(func: LirFunc, module: MirModule, mirFunc: MirFunc, expr: MirExpr,
                       retType: MirType, tLabel: str, fLabel: str, dst: LirReg,
@@ -943,18 +937,16 @@ fn iselLowerBlock(func: LirFunc, module: MirModule, block: MirBlock, mirFunc: Mi
     if isEntry:
         iselEmitSubSp(func, 8)
         lirAddInst(func, lirStr(lrRbp, lrSp, 0))
+        lirAddInst(func, lirMovReg(baseReg, lrSp))
         if frameSize > 0:
             iselEmitSubSp(func, frameSize)
-        lirAddInst(func, lirMovReg(baseReg, lrSp))
 
-    var si: int32 = 0
-    while si < block.stmts.len:
+    for si in 0..<block.stmts.len:
         let s: MirStmt = get[MirStmt](block.stmts, si)
         let sRes: Result[int32] = iselEmitStmt(func, module, s, mirFunc, retType, retReg,
                                                tmpReg, scratchReg, baseReg, frameSize, labelState)
         if ! IsOk[int32](sRes):
             return sRes
-        si = si + 1
     let term: MirTerm = block.term
     if term.kind == mtRet:
         if retType.kind != mtVoid:
@@ -1005,8 +997,7 @@ fn x86_64LowerFunc(module: MirModule, func: MirFunc): Result[LirFunc] =
     let rem: int64 = frameSize % 16
     if rem != 0:
         frameSize = frameSize + (16 - rem)
-    var i: int32 = 0
-    while i < func.blocks.len:
+    for i in 0..<func.blocks.len:
         let b: MirBlock = get[MirBlock](func.blocks, i)
         let isEntry: bool = i == 0
         let bRes: Result[int32] = iselLowerBlock(out, module, b, func, func.retType, retReg,
@@ -1014,14 +1005,12 @@ fn x86_64LowerFunc(module: MirModule, func: MirFunc): Result[LirFunc] =
                                                  frameSize, localsSize, isEntry)
         if ! IsOk[int32](bRes):
             return ErrInfo[LirFunc](ErrorInfoOf[int32](bRes))
-        i = i + 1
     return Ok[LirFunc](out)
 
 fn x86_64LowerModule(module: MirModule): Result[LirModule] =
     var out: LirModule = lirNewModule()
     out.target = module.target
-    var gi: int32 = 0
-    while gi < module.globals.len:
+    for gi in 0..<module.globals.len:
         let g: MirGlobal = get[MirGlobal](module.globals, gi)
         let size: int32 = iselTypeSize(g.ty)
         if size <= 0:
@@ -1030,21 +1019,15 @@ fn x86_64LowerModule(module: MirModule): Result[LirModule] =
             return Err[LirModule]("isel: unsupported global type (name=" + g.name + ", kind=" + tk + ", origin=" + origin + ")")
         let alignPow2: int32 = iselTypeAlignPow2(g.ty)
         lirAddGlobal(out, g.name, size, alignPow2, g.init, g.hasInit)
-        gi = gi + 1
-    var ci: int32 = 0
-    while ci < module.cstrs.len:
+    for ci in 0..<module.cstrs.len:
         let c: MirCString = get[MirCString](module.cstrs, ci)
         lirAddCString(out, c.label, c.value)
-        ci = ci + 1
-    var i: int32 = 0
-    while i < module.funcs.len:
+    for i in 0..<module.funcs.len:
         let f: MirFunc = get[MirFunc](module.funcs, i)
         if f != nil && f.isExtern:
-            i = i + 1
             continue
         let fRes: Result[LirFunc] = x86_64LowerFunc(module, f)
         if ! IsOk[LirFunc](fRes):
             return ErrInfo[LirModule](ErrorInfoOf[LirFunc](fRes))
         lirAddFunc(out, Value[LirFunc](fRes))
-        i = i + 1
     return Ok[LirModule](out)

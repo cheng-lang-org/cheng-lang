@@ -141,33 +141,27 @@ fn load_ptr(p: void*): void* =
 fn cheng_bytes_copy(dst: void*, src: void*, n: int64) =
     if dst == nil || src == nil || n <= 0:
         return
-    var i: int64 = 0
-    while i < n:
+    for i in 0..<n:
         let b: uint8 = *(uint8*(ptr_add(src, int32(i))))
         *(uint8*(ptr_add(dst, int32(i)))) = b
-        i = i + 1
 
 fn cheng_bytes_set(dst: void*, value: int32, n: int64) =
     if dst == nil || n <= 0:
         return
     let b: uint8 = uint8(value & 0xFF)
-    var i: int64 = 0
-    while i < n:
+    for i in 0..<n:
         *(uint8*(ptr_add(dst, int32(i)))) = b
-        i = i + 1
 
 fn cheng_bytes_cmp(a: void*, b: void*, n: int64): int32 =
     if n <= 0:
         return 0
-    var i: int64 = 0
-    while i < n:
+    for i in 0..<n:
         let av: uint8 = *(uint8*(ptr_add(a, int32(i))))
         let bv: uint8 = *(uint8*(ptr_add(b, int32(i))))
         if av < bv:
             return -1
         if av > bv:
             return 1
-        i = i + 1
     return 0
 
 fn cheng_strlen(s: char*): int32 =
@@ -179,10 +173,18 @@ fn cheng_strlen(s: char*): int32 =
     return n
 
 fn cheng_strcmp(a: char*, b: char*): int32 =
+    if a == b:
+        return 0
+    var pa: char* = a
+    var pb: char* = b
+    if pa == nil:
+        pa = ""
+    if pb == nil:
+        pb = ""
     var i: int32 = 0
     while true:
-        let ca: uint8 = uint8(int32(*(char*(ptr_add(void*(a), i)))) & 0xFF)
-        let cb: uint8 = uint8(int32(*(char*(ptr_add(void*(b), i)))) & 0xFF)
+        let ca: uint8 = uint8(int32(*(char*(ptr_add(void*(pa), i)))) & 0xFF)
+        let cb: uint8 = uint8(int32(*(char*(ptr_add(void*(pb), i)))) & 0xFF)
         if ca < cb:
             return -1
         if ca > cb:
@@ -296,13 +298,15 @@ fn cheng_ptrmap_get(key: void*): ChengMemBlock* =
     if k == 0 || k == cheng_ptrmap_tomb:
         return nil
     let mask: uint64 = uint64(cheng_block_map_cap - 1)
+    let keysBase: uint64 = uint64(cheng_block_map_keys)
+    let valsBase: uint64 = uint64(cheng_block_map_vals)
     var idx: uint64 = cheng_ptr_hash(k) & mask
     while true:
-        let cur: uint64 = *(uint64*(ptr_add(void*(cheng_block_map_keys), int32(idx * 8))))
+        let cur: uint64 = *(uint64*(void*(keysBase + (idx * uint64(8)))))
         if cur == 0:
             return nil
         if cur == k:
-            return *(ChengMemBlock**(ptr_add(void*(cheng_block_map_vals), int32(idx * 8))))
+            return *(ChengMemBlock**(void*(valsBase + (idx * uint64(8)))))
         idx = (idx + 1) & mask
 
 fn cheng_ptrmap_grow() =
@@ -328,23 +332,25 @@ fn cheng_ptrmap_grow() =
         return
 
     if oldkeys != nil && oldcap > 0:
-        var i: int64 = 0
-        while i < oldcap:
-            let k: uint64 = *(uint64*(ptr_add(void*(oldkeys), int32(i * 8))))
+        let newMask: uint64 = uint64(cheng_block_map_cap - 1)
+        let keysBase: uint64 = uint64(cheng_block_map_keys)
+        let valsBase: uint64 = uint64(cheng_block_map_vals)
+        let oldKeysBase: uint64 = uint64(oldkeys)
+        let oldValsBase: uint64 = uint64(oldvals)
+        for i in 0..<oldcap:
+            let k: uint64 = *(uint64*(void*(oldKeysBase + (uint64(i) * uint64(8)))))
             if k > cheng_ptrmap_tomb:
-                let v: ChengMemBlock* = *(ChengMemBlock**(ptr_add(void*(oldvals), int32(i * 8))))
+                let v: ChengMemBlock* = *(ChengMemBlock**(void*(oldValsBase + (uint64(i) * uint64(8)))))
                 if v != nil:
-                    let mask: uint64 = uint64(cheng_block_map_cap - 1)
-                    var idx: uint64 = cheng_ptr_hash(k) & mask
+                    var idx: uint64 = cheng_ptr_hash(k) & newMask
                     while true:
-                        let cur: uint64 = *(uint64*(ptr_add(void*(cheng_block_map_keys), int32(idx * 8))))
+                        let cur: uint64 = *(uint64*(void*(keysBase + (idx * uint64(8)))))
                         if cur == 0:
-                            *(uint64*(ptr_add(void*(cheng_block_map_keys), int32(idx * 8)))) = k
-                            *(ChengMemBlock**(ptr_add(void*(cheng_block_map_vals), int32(idx * 8)))) = v
+                            *(uint64*(void*(keysBase + (idx * uint64(8))))) = k
+                            *(ChengMemBlock**(void*(valsBase + (idx * uint64(8))))) = v
                             cheng_block_map_count = cheng_block_map_count + 1
                             break
-                        idx = (idx + 1) & mask
-            i = i + 1
+                        idx = (idx + 1) & newMask
         cheng_raw_free(void*(oldkeys))
         cheng_raw_free(void*(oldvals))
 
@@ -355,7 +361,7 @@ fn cheng_ptrmap_put(key: void*, val: ChengMemBlock*) =
     if k == 0 || k == cheng_ptrmap_tomb:
         return
     if cheng_block_map_cap == 0:
-        cheng_ptrmap_init(1024)
+        cheng_ptrmap_init(65536)
         if cheng_block_map_cap == 0:
             return
 
@@ -365,12 +371,14 @@ fn cheng_ptrmap_put(key: void*, val: ChengMemBlock*) =
             return
 
     let mask: uint64 = uint64(cheng_block_map_cap - 1)
+    let keysBase: uint64 = uint64(cheng_block_map_keys)
+    let valsBase: uint64 = uint64(cheng_block_map_vals)
     var idx: uint64 = cheng_ptr_hash(k) & mask
     var firstTomb: int64 = -1
     while true:
-        let cur: uint64 = *(uint64*(ptr_add(void*(cheng_block_map_keys), int32(idx * 8))))
+        let cur: uint64 = *(uint64*(void*(keysBase + (idx * uint64(8)))))
         if cur == k:
-            *(ChengMemBlock**(ptr_add(void*(cheng_block_map_vals), int32(idx * 8)))) = val
+            *(ChengMemBlock**(void*(valsBase + (idx * uint64(8))))) = val
             return
         if cur == cheng_ptrmap_tomb && firstTomb < 0:
             firstTomb = int64(idx)
@@ -379,8 +387,8 @@ fn cheng_ptrmap_put(key: void*, val: ChengMemBlock*) =
             if firstTomb >= 0:
                 useIdx = uint64(firstTomb)
                 cheng_block_map_tombs = cheng_block_map_tombs - 1
-            *(uint64*(ptr_add(void*(cheng_block_map_keys), int32(useIdx * 8)))) = k
-            *(ChengMemBlock**(ptr_add(void*(cheng_block_map_vals), int32(useIdx * 8)))) = val
+            *(uint64*(void*(keysBase + (useIdx * uint64(8))))) = k
+            *(ChengMemBlock**(void*(valsBase + (useIdx * uint64(8))))) = val
             cheng_block_map_count = cheng_block_map_count + 1
             return
         idx = (idx + 1) & mask
@@ -392,14 +400,16 @@ fn cheng_ptrmap_del(key: void*) =
     if k == 0 || k == cheng_ptrmap_tomb:
         return
     let mask: uint64 = uint64(cheng_block_map_cap - 1)
+    let keysBase: uint64 = uint64(cheng_block_map_keys)
+    let valsBase: uint64 = uint64(cheng_block_map_vals)
     var idx: uint64 = cheng_ptr_hash(k) & mask
     while true:
-        let cur: uint64 = *(uint64*(ptr_add(void*(cheng_block_map_keys), int32(idx * 8))))
+        let cur: uint64 = *(uint64*(void*(keysBase + (idx * uint64(8)))))
         if cur == 0:
             return
         if cur == k:
-            *(uint64*(ptr_add(void*(cheng_block_map_keys), int32(idx * 8)))) = cheng_ptrmap_tomb
-            *(ChengMemBlock**(ptr_add(void*(cheng_block_map_vals), int32(idx * 8)))) = nil
+            *(uint64*(void*(keysBase + (idx * uint64(8))))) = cheng_ptrmap_tomb
+            *(ChengMemBlock**(void*(valsBase + (idx * uint64(8))))) = nil
             if cheng_block_map_count > 0:
                 cheng_block_map_count = cheng_block_map_count - 1
             cheng_block_map_tombs = cheng_block_map_tombs + 1
@@ -721,6 +731,54 @@ fn cheng_chan_i32_recv(chPtr: void*, out: int32*): int32 =
     chPtr
     out
     return 0
+
+@thread_boundary
+fn spawn(fn_ptr: void*, ctx: void*) =
+    cheng_spawn(fn_ptr, ctx)
+
+fn schedPending(): int32 =
+    return cheng_sched_pending()
+
+fn schedRunOnce(): int32 =
+    return cheng_sched_run_once()
+
+fn schedRun() =
+    cheng_sched_run()
+
+fn asyncPendingI32(): void* =
+    return cheng_async_pending_i32()
+
+fn asyncReadyI32(value: int32): void* =
+    return cheng_async_ready_i32(value)
+
+fn asyncSetI32(state: void*, value: int32) =
+    cheng_async_set_i32(state, value)
+
+fn awaitI32(state: void*): int32 =
+    return cheng_await_i32(state)
+
+fn asyncPendingVoid(): void* =
+    return cheng_async_pending_void()
+
+fn asyncReadyVoid(): void* =
+    return cheng_async_ready_void()
+
+fn asyncSetVoid(state: void*) =
+    cheng_async_set_void(state)
+
+fn awaitVoid(state: void*) =
+    cheng_await_void(state)
+
+fn chanI32New(cap: int32): void* =
+    return cheng_chan_i32_new(cap)
+
+@thread_boundary
+fn chanI32Send(ch: void*, value: int32): int32 =
+    return cheng_chan_i32_send(ch, value)
+
+@thread_boundary
+fn chanI32Recv(ch: void*, out: int32*): int32 =
+    return cheng_chan_i32_recv(ch, out)
 
 fn get_stdin(): void* = nil
 fn get_stdout(): void* = nil

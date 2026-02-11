@@ -5,12 +5,12 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -36,15 +36,31 @@ mkdir -p "$out_dir"
 fixture="tests/cheng/backend/fixtures/hello_importc_puts.cheng"
 exe_path="$out_dir/hello_importc_puts.self.coff.exe"
 
-CHENG_BACKEND_LINKER=self \
-CHENG_BACKEND_COFF_CRT_DLL=UCRTBASE.dll \
-CHENG_BACKEND_NO_RUNTIME_C=1 \
-CHENG_BACKEND_EMIT=exe \
-CHENG_BACKEND_TARGET=aarch64-pc-windows-msvc \
-CHENG_BACKEND_FRONTEND=mvp \
-CHENG_BACKEND_INPUT="$fixture" \
-CHENG_BACKEND_OUTPUT="$exe_path" \
-  "$driver" >/dev/null
+run_build() {
+  CHENG_BACKEND_LINKER=self \
+  CHENG_BACKEND_COFF_CRT_DLL=UCRTBASE.dll \
+  CHENG_BACKEND_NO_RUNTIME_C=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_INCREMENTAL=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
+  CHENG_BACKEND_EMIT=exe \
+  CHENG_BACKEND_TARGET=aarch64-pc-windows-msvc \
+  CHENG_BACKEND_FRONTEND=mvp \
+  CHENG_BACKEND_INPUT="$fixture" \
+  CHENG_BACKEND_OUTPUT="$exe_path" \
+    "$driver" >/dev/null
+}
+
+if ! run_build; then
+  status=$?
+  if [ "$status" -eq 134 ]; then
+    rm -rf "$exe_path.objs" "$exe_path.objs.lock" 2>/dev/null || true
+    run_build
+  else
+    exit "$status"
+  fi
+fi
 
 if [ ! -s "$exe_path" ]; then
   echo "[verify_backend_self_linker_coff] missing output: $exe_path" >&2

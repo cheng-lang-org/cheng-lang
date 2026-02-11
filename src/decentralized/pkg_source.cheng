@@ -38,8 +38,8 @@ type
         kind: str
         packageId: str
         createdTs: str
-        sourceAddrs: seq[str]
-        files: seq[SourceFile]
+        sourceAddrs: str[]
+        files: SourceFile[]
 
     PkgSourceConfig =
         maxRequestBytes: int32
@@ -61,21 +61,21 @@ fn normalizePathSlashes(path: str): str =
     if path == nil:
         return ""
     var out: str = ""
-    var i: int32 = 0
-    while i < len(path):
-        var ch = charAt(path, i)
+    for i in 0..<len(path):
+        var ch = path[i]
         if ch == '\\':
             ch = '/'
         out = out + charToStr(ch)
-        i = i + 1
     return out
 
 fn trimTrailingSlash(path: str): str =
     if path == nil || len(path) == 0:
         return ""
-    var end = len(path) - 1
-    while end > 0 && path[end] == '/':
-        end = end - 1
+    let __for_start_end = len(path) - 1
+    for __for_rev_end in 0..<(__for_start_end - (0)):
+        let end = __for_start_end - __for_rev_end
+        if !(path[end] == '/'):
+            break
     return path[0..end]
 
 fn relPathFromRoot(path: str, root: str): str =
@@ -92,8 +92,8 @@ fn relPathFromRoot(path: str, root: str): str =
         return ""
     return absPath[start..len(absPath) - 1]
 
-fn defaultSourceExcludes(): seq[str] =
-    var out: seq[str] = newSeqWithCap[str](0, DefaultExcludeCount)
+fn defaultSourceExcludes(): str[] =
+    var out: str[] 
     out.add(".git")
     out.add("chengcache")
     out.add(".cheng-cache")
@@ -106,15 +106,13 @@ fn defaultSourceExcludes(): seq[str] =
     out.add(".DS_Store")
     return out
 
-fn segmentExcluded(seg: str, excludes: seq[str]): bool =
+fn segmentExcluded(seg: str, excludes: str[]): bool =
     if seg == nil || len(seg) == 0:
         return false
-    var i: int32 = 0
-    while i < excludes.len:
+    for i in 0..<excludes.len:
         let ex = excludes[i]
         if ex != nil && len(ex) > 0 && seg == ex:
             return true
-        i = i + 1
     return false
 
 fn containsPathTraversal(path: str): bool =
@@ -122,42 +120,34 @@ fn containsPathTraversal(path: str): bool =
         return false
     let norm = normalizePathSlashes(path)
     let parts = strutil.split(norm, '/')
-    var i: int32 = 0
-    while i < parts.len:
+    for i in 0..<parts.len:
         if parts[i] == "..":
             return true
-        i = i + 1
     return false
 
-fn shouldExcludePath(relPath: str, excludes: seq[str]): bool =
+fn shouldExcludePath(relPath: str, excludes: str[]): bool =
     if relPath == nil || len(relPath) == 0:
         return true
     let norm = normalizePathSlashes(relPath)
     if containsPathTraversal(norm):
         return true
     let parts = strutil.split(norm, '/')
-    var i: int32 = 0
-    while i < parts.len:
+    for i in 0..<parts.len:
         let part = parts[i]
         if segmentExcluded(part, excludes):
             return true
-        i = i + 1
     return false
 
-fn sortSourceFiles(files: var seq[SourceFile]) =
-    var i: int32 = 0
-    while i < files.len:
-        var j: int32 = i + 1
-        while j < files.len:
+fn sortSourceFiles(files: var SourceFile[]) =
+    for i in 0..<files.len:
+        for j in i + 1..<files.len:
             let a = files[i]
             let b = files[j]
             if cmp(a.path, b.path) > 0:
                 files[i] = b
                 files[j] = a
-            j = j + 1
-        i = i + 1
 
-fn buildSourceManifest(root: str, packageId: str, sourceAddrs: seq[str], extraExcludes: seq[str]): result.Result[SourceManifest] =
+fn buildSourceManifest(root: str, packageId: str, sourceAddrs: str[], extraExcludes: str[]): result.Result[SourceManifest] =
     if root == nil || len(root) == 0:
         return result.Err[SourceManifest]("pkg-source: missing root")
     if packageId == nil || len(packageId) == 0:
@@ -168,27 +158,21 @@ fn buildSourceManifest(root: str, packageId: str, sourceAddrs: seq[str], extraEx
     if ! os.dirExists(absRoot):
         return result.Err[SourceManifest]("pkg-source: root not found")
     var excludes = defaultSourceExcludes()
-    var i: int32 = 0
-    while i < extraExcludes.len:
+    for i in 0..<extraExcludes.len:
         let ex = extraExcludes[i]
         if ex != nil && len(ex) > 0:
             excludes.add(ex)
-        i = i + 1
     let paths = os.walkDirRec(absRoot)
-    var files: seq[SourceFile] = newSeqWithCap[SourceFile](0, paths.len)
-    var p: int32 = 0
-    while p < paths.len:
+    var files: SourceFile[] 
+    for p in 0..<paths.len:
         let path = paths[p]
         if os.dirExists(path):
-            p = p + 1
             continue
         let rel = relPathFromRoot(path, absRoot)
         if rel == nil || len(rel) == 0:
-            p = p + 1
             continue
         let relNorm = normalizePathSlashes(rel)
         if shouldExcludePath(relNorm, excludes):
-            p = p + 1
             continue
         let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
         if result.IsErr(dataRes):
@@ -201,7 +185,6 @@ fn buildSourceManifest(root: str, packageId: str, sourceAddrs: seq[str], extraEx
         if cidText == nil || len(cidText) == 0:
             return result.Err[SourceManifest]("pkg-source: cid encode failed")
         files.add(SourceFile(path: relNorm, cidText: cidText, sizeBytes: int64(bytes.bytesLen(data))))
-        p = p + 1
     sortSourceFiles(files)
     var manifest: SourceManifest
     manifest.kind = PkgSourceManifestKind
@@ -218,23 +201,19 @@ fn manifestToJson(manifest: SourceManifest): json.JsonNode =
     if manifest.createdTs != nil && len(manifest.createdTs) > 0:
         root["created_ts"] = json.newJString(manifest.createdTs)
     let addrs = json.newJArray()
-    var i: int32 = 0
-    while i < manifest.sourceAddrs.len:
+    for i in 0..<manifest.sourceAddrs.len:
         let addr = manifest.sourceAddrs[i]
         if addr != nil && len(addr) > 0:
             addrs.add(json.newJString(addr))
-        i = i + 1
     root["source_addrs"] = addrs
     let files = json.newJArray()
-    var j: int32 = 0
-    while j < manifest.files.len:
+    for j in 0..<manifest.files.len:
         let f = manifest.files[j]
         let node = json.newJObject()
         node["path"] = json.newJString(f.path)
         node["cid"] = json.newJString(f.cidText)
         node["size"] = json.newJInt(f.sizeBytes)
         files.add(node)
-        j = j + 1
     root["files"] = files
     root
 
@@ -251,22 +230,19 @@ fn parseSourceManifestNode(root: json.JsonNode): result.Result[SourceManifest] =
     manifest.kind = kind
     manifest.packageId = jparse.getStringField(root, "package_id", "")
     manifest.createdTs = jparse.getStringField(root, "created_ts", "")
-    manifest.sourceAddrs = newSeqWithCap[str](0, 0)
+    manifest.sourceAddrs = []
     let addrs = root["source_addrs"]
     if addrs != nil && addrs.kind == json.JArray:
-        var a: int32 = 0
-        while a < addrs.a.len:
+        for a in 0..<addrs.a.len:
             let node = addrs.a[a]
             if node != nil && node.kind == json.JString:
                 let addr = node.getStr()
                 if addr != nil && len(addr) > 0:
                     manifest.sourceAddrs.add(addr)
-            a = a + 1
-    manifest.files = newSeqWithCap[SourceFile](0, 0)
+    manifest.files = []
     let files = root["files"]
     if files != nil && files.kind == json.JArray:
-        var i: int32 = 0
-        while i < files.a.len:
+        for i in 0..<files.a.len:
             let node = files.a[i]
             if node == nil || node.kind != json.JObject:
                 return result.Err[SourceManifest]("pkg-source: file entry invalid")
@@ -279,7 +255,6 @@ fn parseSourceManifestNode(root: json.JsonNode): result.Result[SourceManifest] =
             if f.cidText == nil || len(f.cidText) == 0:
                 return result.Err[SourceManifest]("pkg-source: file missing cid")
             manifest.files.add(f)
-            i = i + 1
     if manifest.packageId == nil || len(manifest.packageId) == 0:
         return result.Err[SourceManifest]("pkg-source: manifest missing package_id")
     return result.Ok[SourceManifest](manifest)
@@ -302,12 +277,10 @@ fn loadSourceManifestFile(path: str): result.Result[SourceManifest] =
 
 fn buildSourceIndex(manifest: SourceManifest): tables.Table[str] =
     var out: tables.Table[str] = tables.TableInit[str](manifest.files.len * 2 + 8)
-    var i: int32 = 0
-    while i < manifest.files.len:
+    for i in 0..<manifest.files.len:
         let f = manifest.files[i]
         if f.cidText != nil && len(f.cidText) > 0:
             tables.TablePut[str](out, f.cidText, f.path)
-        i = i + 1
     return out
 
 fn setPkgSourceContext(root: str, manifest: SourceManifest, config: PkgSourceConfig) =
@@ -441,11 +414,9 @@ fn ensureDirRecursive(path: str) =
     var cur: str = ""
     if len(abs) > 0 && abs[0] == '/':
         cur = "/"
-    var i: int32 = 0
-    while i < parts.len:
+    for i in 0..<parts.len:
         let part = parts[i]
         if part == nil || len(part) == 0:
-            i = i + 1
             continue
         if len(cur) == 0:
             cur = part
@@ -455,7 +426,6 @@ fn ensureDirRecursive(path: str) =
             cur = cur + "/" + part
         if ! os.dirExists(cur):
             os.createDir(cur)
-        i = i + 1
 
 fn readPkgSourceHeader(stream: var libp2p.Stream, maxSize: int32): result.Result[tuple[status: str, size: int64, errText: str]] =
     let headRes: result.Result[bytes.Bytes] = lpstream.readLp(stream, maxSize)
@@ -529,7 +499,7 @@ fn fetchSourceFile(host: var libp2p.Switch, peer: str, outDir: str, f: SourceFil
         return result.Err[bool]("fetch: cid mismatch")
     return result.Ok[bool](true)
 
-fn fetchPkgSource(manifest: SourceManifest, outDir: str, peers: seq[str], listenAddr: str): result.Result[int32] =
+fn fetchPkgSource(manifest: SourceManifest, outDir: str, peers: str[], listenAddr: str): result.Result[int32] =
     if outDir == nil || len(outDir) == 0:
         return result.Err[int32]("pkg-source: missing out dir")
     if peers.len == 0:
@@ -548,23 +518,19 @@ fn fetchPkgSource(manifest: SourceManifest, outDir: str, peers: seq[str], listen
         return result.Err[int32](result.Error(startRes))
     ensureDirRecursive(outDir)
     var fetched: int32 = 0
-    var i: int32 = 0
-    while i < manifest.files.len:
+    for i in 0..<manifest.files.len:
         let f = manifest.files[i]
         var ok: bool = false
-        var p: int32 = 0
-        while p < peers.len:
+        for p in 0..<peers.len:
             let peer = peers[p]
             if peer != nil && len(peer) > 0:
                 let res: result.Result[bool] = fetchSourceFile(host, peer, outDir, f, config)
                 if result.IsOk(res):
                     ok = true
                     break
-            p = p + 1
         if ! ok:
             libp2p.hostStop(host)
             return result.Err[int32]("pkg-source: fetch failed")
         fetched = fetched + 1
-        i = i + 1
     libp2p.hostStop(host)
     return result.Ok[int32](fetched)

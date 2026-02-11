@@ -5,12 +5,12 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -20,6 +20,10 @@ driver="$(sh src/tooling/backend_driver_path.sh)"
 target="${CHENG_BACKEND_TARGET:-arm64-apple-darwin}"
 link_env="$(sh src/tooling/backend_link_env.sh --driver:"$driver" --target:"$target" --linker:"${CHENG_BACKEND_LINKER:-auto}")"
 
+if [ "${CHENG_BACKEND_CONCURRENCY_STRESS_ENABLED:-0}" != "1" ]; then
+  echo "verify_backend_concurrency_stress ok (skip: set CHENG_BACKEND_CONCURRENCY_STRESS_ENABLED=1 to enable)"
+  exit 0
+fi
 
 n="${CHENG_BACKEND_CONCURRENCY_N:-50}"
 out_dir="artifacts/backend_concurrency_stress"

@@ -226,22 +226,18 @@ fn os_addPtr_WalkDirEntry(seqInst: seq_WalkDirEntry*, val: WalkDirEntry) =
 fn os_arcRetainSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
     if seqInst.buffer != nil:
         memRetain seqInst.buffer
-    var i: int32 = 0
-    while i < seqInst.len:
+    for i in 0..<seqInst.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
         let path: str = entry.path
         if path != nil:
             memRetain void*(path)
-        i = i + 1
 
 fn os_arcReleaseSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
-    var i: int32 = 0
-    while i < seqInst.len:
+    for i in 0..<seqInst.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
         let path: str = entry.path
         if path != nil:
             memRelease void*(path)
-        i = i + 1
     if seqInst.buffer != nil:
         memRelease seqInst.buffer
 
@@ -276,19 +272,20 @@ fn getEnv(key: str): str =
     return getEnvImpl(key, EmptyStr)
 fn getEnvDefault(key: str, defaultValue: str): str =
     return getEnvImpl(key, defaultValue)
-fn commandLineParams(): seq[str] =
+fn commandLineParams(): str[] =
     # Runtime args injection depends on __cheng_setCmdLine; minimal impl defaults to empty.
-    return newSeq[str]()
+    return []
 fn quoteShell(value: str): str =
-    if len value == 0:
+    if value == nil || value[0] == char(0):
         return EmptyQuotedStr
     return SingleQuoteStr + value + SingleQuoteStr
 fn joinPath(a: str, b: str): str =
-    if len a == 0:
+    if a == nil || a[0] == char(0):
         return b
-    if len b == 0:
+    if b == nil || b[0] == char(0):
         return a
-    let last: char = charAt(a, len a - 1)
+    let aLen: int32 = len a
+    let last: char = a[aLen - 1]
     if last == '/' || last == '\\':
         return a + b
     return a + SlashStr + b
@@ -315,54 +312,57 @@ fn sliceStr(text: str, start: int32, stop: int32): str =
     setMem(ptr_add(p, count), 0, 1)
     return str(p)
 fn absolutePath(path: str): str =
-    if len path == 0:
+    if path == nil || path[0] == char(0):
         return getCurrentDir()
-    let c0: char = charAt(path, 0)
+    let c0: char = path[0]
     if c0 == '/' || c0 == '\\':
         return path
-    if len path >= 2 && charAt(path, 1) == ':':
+    if path[1] == ':':
         return path
     return joinPath(getCurrentDir(), path)
 fn isAbsolute(path: str): bool =
-    if len path == 0:
+    if path == nil || path[0] == char(0):
         return false
-    let c0: char = charAt(path, 0)
+    let c0: char = path[0]
     if c0 == '/' || c0 == '\\':
         return true
-    if len path >= 2 && charAt(path, 1) == ':':
+    if path[1] == ':':
         return true
     return false
 fn parentDir(path: str): str =
     let parts: SplitFileResult = splitFile path
     return parts.dir
 fn relativePath(path: str, base: str): str =
-    if len base == 0:
+    if base == nil || base[0] == char(0):
         return path
-    if len path >= len base && sliceStr(path, 0, len base - 1) == base:
-        var idx: int32 = len base
-        if idx < len path && (charAt(path, idx) == '/' || charAt(path, idx) == '\\'):
+    let baseLen: int32 = len base
+    let pathLen: int32 = len path
+    if pathLen >= baseLen && sliceStr(path, 0, baseLen - 1) == base:
+        var idx: int32 = baseLen
+        if idx < pathLen && (path[idx] == '/' || path[idx] == '\\'):
             idx = idx + 1
-        if idx <= len path:
-            return sliceStr(path, idx, len path - 1)
+        if idx <= pathLen:
+            return sliceStr(path, idx, pathLen - 1)
     return path
 fn splitFile(path: str): SplitFileResult =
     var out: SplitFileResult
     out.dir = ""
     out.name = ""
     out.ext = ""
-    if len path == 0:
+    let pathLen: int32 = len path
+    if pathLen == 0:
         return out
     var lastSep: int32 = -1
-    var i: int32 = 0
-    while i < len path:
-        let ch: char = charAt(path, i)
+    for i in 0..<pathLen:
+        let ch: char = path[i]
         if ch == '/' || ch == '\\':
             lastSep = i
-        i = i + 1
     var lastDot: int32 = -1
-    i = len path - 1
-    while i > lastSep:
-        let ch: char = charAt(path, i)
+    i = pathLen - 1
+    let __for_start_i_1 = i
+    for __for_i_1 in 0..(__for_start_i_1 - ((lastSep) + (1))):
+        i = __for_start_i_1 - __for_i_1
+        let ch: char = path[i]
         if ch == '.':
             lastDot = i
             break
@@ -373,10 +373,10 @@ fn splitFile(path: str): SplitFileResult =
             out.dir = ""
         else:
             out.dir = sliceStr(path, 0, lastSep - 1)
-        if nameStart >= len path:
+        if nameStart >= pathLen:
             out.name = ""
         else:
-            out.name = sliceStr(path, nameStart, len path - 1)
+            out.name = sliceStr(path, nameStart, pathLen - 1)
     else:
         out.dir = ""
         out.name = path
@@ -385,7 +385,7 @@ fn splitFile(path: str): SplitFileResult =
             out.name = sliceStr(path, nameStart, lastDot - 1)
         else:
             out.name = ""
-        out.ext = sliceStr(path, lastDot, len path - 1)
+        out.ext = sliceStr(path, lastDot, pathLen - 1)
     return out
 fn getFileSize(path: str): int64 =
     path
@@ -407,30 +407,29 @@ fn makeWalkDirEntry(kind: PathComponent, path: str): WalkDirEntry =
     return out
 fn walkDir(path: str): seq_WalkDirEntry =
     var out: seq_WalkDirEntry = os_newSeq_WalkDirEntry(0, 0)
-    if len path == 0 || ! dirExists path:
+    if path == nil || path[0] == char(0) || ! dirExists path:
         return out
     let listText: str = cheng_list_dir path
-    if listText == nil || len listText == 0:
+    if listText == nil || listText[0] == char(0):
         if listText != nil:
             let listTextPtr: void* = void*(listText)
             dealloc listTextPtr
         return out
     let total: int32 = len listText
     var start: int32 = 0
-    var i: int32 = 0
-    while i <= total:
+    for i in 0..total:
         var endHit: bool = false
         if i == total:
             endHit = true
-        elif charAt(listText, i) == '\n':
+        elif listText[i] == '\n':
             endHit = true
         if endHit:
             var endIdx: int32 = i - 1
-            if endIdx >= start && charAt(listText, endIdx) == '\r':
+            if endIdx >= start && listText[endIdx] == '\r':
                 endIdx = endIdx - 1
             if endIdx >= start:
                 let name: str = sliceStr(listText, start, endIdx)
-                if len name > 0:
+                if name != nil && name[0] != char(0):
                     let fullPath: str = joinPath(path, name)
                     var kind: PathComponent = pcOther
                     if dirExists fullPath:
@@ -439,25 +438,23 @@ fn walkDir(path: str): seq_WalkDirEntry =
                         kind = pcFile
                     os_addPtr_WalkDirEntry(&out, makeWalkDirEntry(kind, fullPath))
             start = i + 1
-        i = i + 1
     let listTextPtr: void* = void*(listText)
     dealloc listTextPtr
     return out
 
-fn walkDirRecImpl(path: str, out: seq[str]*) =
+fn walkDirRecImpl(path: str, out: str[]*) =
     let items: seq_WalkDirEntry = walkDir path
-    var i: int32 = 0
-    while i < items.len:
+    for i in 0..<items.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(items, i)
         let kind: PathComponent = entry.kind
         let path: str = entry.path
         if kind == pcDir || kind == pcLinkToDir:
             walkDirRecImpl(path, out)
         elif kind == pcFile || kind == pcLinkToFile:
-            addPtr[str](out, path)
-        i = i + 1
-fn walkDirRec(path: str): seq[str] =
-    var out: seq[str] = newSeq[str]()
+            var pathOwned: str = path
+            addPtr[str](out, pathOwned)
+fn walkDirRec(path: str): str[] =
+    var out: str[]
     if len path == 0 || ! dirExists path:
         return out
     walkDirRecImpl(path, &out)
@@ -525,7 +522,7 @@ fn writeFile(path: str, content: str) =
     write(f, content)
     close f
 
-fn writeFileBytes(path: str, bytes: seq[uint8]) =
+fn writeFileBytes(path: str, bytes: uint8[]) =
     let f: File = open(path, fmWrite)
     if f == nil:
         return

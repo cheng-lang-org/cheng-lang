@@ -11,19 +11,17 @@ Usage:
 
 Notes:
   - Runs the backend .o-only bootstrap + fullchain tool smoke.
-  - Does not require ./stage1_runner nor the stage1->C backend.
+  - Backend-only CI gate (C frontend path disabled).
   - Also validates the self-linker output format for ELF/COFF (best-effort; use --strict to forbid skip).
   - Requires:
     - Darwin/arm64 host
     - `codesign` (self-link output on macOS 15+ must be signed)
-    - a seed backend driver binary (typically from dist/backend releases)
+    - a seed backend driver binary (typically from dist/releases)
 
 Defaults:
   - If no seed is provided, uses:
       dist/releases/current_id.txt -> dist/releases/<id>/backend_release.tar.gz
-      (legacy fallback: dist/backend/current_id.txt -> dist/backend/releases/<id>/backend_release.tar.gz)
-  - If dist seed is not available, falls back to building a local seed:
-      bootstrap.sh (stage1_runner) -> build_backend_driver.sh (backend_mvp_driver)
+  - Does not fall back to local artifacts seed paths automatically.
 EOF
 }
 
@@ -112,9 +110,9 @@ seed_from_tar() {
   out_dir="chengcache/backend_seed_ci_$$"
   mkdir -p "$out_dir"
   tar -xzf "$tar_path" -C "$out_dir"
-  extracted="$out_dir/backend_mvp_driver"
+  extracted="$out_dir/cheng"
   if [ ! -f "$extracted" ]; then
-    echo "[Error] seed tar missing backend_mvp_driver: $tar_path" 1>&2
+    echo "[Error] seed tar missing cheng: $tar_path" 1>&2
     exit 2
   fi
   chmod +x "$extracted" 2>/dev/null || true
@@ -128,13 +126,8 @@ if [ "$seed" = "" ]; then
     if [ "$seed_id" = "" ] && [ -f "dist/releases/current_id.txt" ]; then
       seed_id="$(cat dist/releases/current_id.txt | tr -d '\r\n')"
     fi
-    if [ "$seed_id" = "" ] && [ -f "dist/backend/current_id.txt" ]; then
-      seed_id="$(cat dist/backend/current_id.txt | tr -d '\r\n')"
-    fi
     if [ "$seed_id" != "" ]; then
-      for try_tar in \
-        "dist/releases/$seed_id/backend_release.tar.gz" \
-        "dist/backend/releases/$seed_id/backend_release.tar.gz"; do
+      for try_tar in "dist/releases/$seed_id/backend_release.tar.gz"; do
         if [ -f "$try_tar" ]; then
           seed_tar="$try_tar"
           seed="$(seed_from_tar "$seed_tar")"
@@ -146,20 +139,13 @@ if [ "$seed" = "" ]; then
 fi
 
 if [ "$seed" = "" ] && [ "$require_seed" = "1" ]; then
-  echo "[Error] missing seed: pass --seed:<path> or provide dist/releases/current_id.txt (or legacy dist/backend/current_id.txt)" 1>&2
+  echo "[Error] missing seed: pass --seed:<path> or provide dist/releases/current_id.txt" 1>&2
   exit 2
 fi
 
 if [ "$seed" = "" ]; then
-  seed="./backend_mvp_driver"
-  if [ ! -x "$seed" ]; then
-    if [ ! -x "./stage1_runner" ]; then
-      echo "== backend.ci.bootstrap_stage1_runner (seed) =="
-      sh src/tooling/bootstrap.sh --skip-determinism
-    fi
-    echo "== backend.ci.build_backend_mvp_driver (seed) =="
-    bash src/tooling/build_backend_driver.sh --name:backend_mvp_driver >/dev/null
-  fi
+  echo "[Error] missing seed: pass --seed/--seed-id/--seed-tar or provide dist/releases/current_id.txt" 1>&2
+  exit 2
 fi
 
 seed_path="$seed"
@@ -172,12 +158,12 @@ if [ ! -x "$seed_path" ]; then
   exit 2
 fi
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ] && [ "$seed_path" = "$root/backend_mvp_driver" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ] && [ "$seed_path" = "$root/cheng" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -187,7 +173,7 @@ run_step "backend.ci.selfhost_bootstrap_self_obj" env \
   CHENG_SELF_OBJ_BOOTSTRAP_STAGE0="$seed_path" \
   sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh
 
-stage2="artifacts/backend_selfhost_self_obj/backend_mvp_driver.stage2"
+stage2="artifacts/backend_selfhost_self_obj/cheng.stage2"
 if [ ! -x "$stage2" ]; then
   echo "[Error] missing stage2 backend driver: $stage2" 1>&2
   exit 1

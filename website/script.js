@@ -181,11 +181,11 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     // --- Package Manager Logic (LibP2P Simulation) ---
     const packages = [
-        { name: "cheng-http", version: "0.4.1", desc: "Hard real-time HTTP/1.1 server implementation with zero GC allocations.", tags: ["net", "hrt"], downloads: "12k", verified: true },
+        { name: "cheng-http", version: "0.4.1", desc: "Backend-focused HTTP/1.1 server implementation with zero GC allocations.", tags: ["net", "backend"], downloads: "12k", verified: true },
         { name: "cheng-ui", version: "0.8.0", desc: "Hardware accelerated immediate mode GUI for embedded and desktop.", tags: ["gui", "graphics"], downloads: "8.5k", verified: true },
         { name: "cheng-libp2p", version: "0.2.3", desc: "Native bindings for peer-to-peer networking stack.", tags: ["p2p", "net"], downloads: "5.1k", verified: true },
         { name: "cheng-crypto", version: "1.0.0", desc: "Constant-time cryptographic primitives verified by formal proofs.", tags: ["security", "math"], downloads: "15k", verified: true },
-        { name: "cheng-math-hrt", version: "0.1.0", desc: "Fixed-point arithmetic library for deterministic physics.", tags: ["math", "hrt"], downloads: "3.2k", verified: false },
+        { name: "cheng-math-fixed", version: "0.1.0", desc: "Fixed-point arithmetic library for deterministic simulation workloads.", tags: ["math", "deterministic"], downloads: "3.2k", verified: false },
         { name: "cheng-db-core", version: "0.5.2", desc: "Embedded key-value store optimized for NVMe.", tags: ["db", "storage"], downloads: "4k", verified: true },
         { name: "cheng-game-engine", version: "0.3.0", desc: "2D/3D ECS game engine boilerplate.", tags: ["game", "engine"], downloads: "2.1k", verified: false },
         { name: "cheng-gpio", version: "0.9.1", desc: "Zero-latency GPIO control for RISC-V and ARM.", tags: ["iot", "embedded"], downloads: "6.7k", verified: true },

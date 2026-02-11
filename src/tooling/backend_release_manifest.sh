@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   src/tooling/backend_release_manifest.sh [--out:<path>] [--name:<binName>]
-                                         [--driver:<path>] [--stage1-backend:<path>]
+                                         [--driver:<path>]
 
 Notes:
   - Emits a backend release manifest (JSON).
@@ -16,9 +16,8 @@ USAGE
 }
 
 out="artifacts/backend_prod/release_manifest.json"
-name="backend_mvp_driver"
+name="cheng"
 driver=""
-stage1_backend=""
 backend_ir_version="${CHENG_BACKEND_IR_VERSION:-mir-v1}"
 backend_abi_version="${CHENG_BACKEND_ABI_VERSION:-mvp-aarch64}"
 
@@ -32,9 +31,6 @@ while [ "${1:-}" != "" ]; do
       ;;
     --driver:*)
       driver="${1#--driver:}"
-      ;;
-    --stage1-backend:*)
-      stage1_backend="${1#--stage1-backend:}"
       ;;
     --help|-h)
       usage
@@ -83,19 +79,6 @@ driver_abs="$(resolve_path "$driver_path")"
 driver_sha=""
 if [ -f "$driver_abs" ]; then
   driver_sha="$(sha256_file "$driver_abs")"
-fi
-
-stage1_sha=""
-if [ -f "./stage1_runner" ]; then
-  stage1_sha="$(sha256_file "./stage1_runner")"
-fi
-
-stage1_backend_sha=""
-if [ "$stage1_backend" != "" ]; then
-  sb_abs="$(resolve_path "$stage1_backend")"
-  if [ -f "$sb_abs" ]; then
-    stage1_backend_sha="$(sha256_file "$sb_abs")"
-  fi
 fi
 
 build_id=""
@@ -156,9 +139,7 @@ cat >"$out" <<EOF_JSON
   "backend_ir_version": "$backend_ir_version",
   "backend_abi_version": "$backend_abi_version",
   "backend_driver": "$name",
-  "backend_driver_sha256": "$driver_sha",
-  "stage1_runner_sha256": "$stage1_sha",
-  "stage1_runner_backend_sha256": "$stage1_backend_sha"
+  "backend_driver_sha256": "$driver_sha"
 }
 EOF_JSON
 

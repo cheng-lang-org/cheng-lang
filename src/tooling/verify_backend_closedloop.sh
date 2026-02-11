@@ -5,12 +5,12 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -21,10 +21,8 @@ run_fullspec="${CHENG_BACKEND_RUN_FULLSPEC:-0}"
 host_os="$(uname -s 2>/dev/null || echo unknown)"
 host_arch="$(uname -m 2>/dev/null || echo unknown)"
 driver=""
-if [ -x "artifacts/backend_selfhost_self_obj/backend_mvp_driver.stage2" ]; then
-  driver="artifacts/backend_selfhost_self_obj/backend_mvp_driver.stage2"
-elif [ -x "artifacts/backend_selfhost/backend_mvp_driver.stage2" ]; then
-  driver="artifacts/backend_selfhost/backend_mvp_driver.stage2"
+if [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
+  driver="artifacts/backend_selfhost_self_obj/cheng.stage2"
 else
   driver="$(sh src/tooling/backend_driver_path.sh)"
 fi
@@ -93,6 +91,15 @@ if [ "$backend_linker" = "self" ]; then
       "$driver"
   fi
 fi
+
+run_step "backend.profile_smoke" env \
+  CHENG_BACKEND_PROFILE=1 \
+  CHENG_BACKEND_EMIT=obj \
+  CHENG_BACKEND_TARGET="$backend_target" \
+  CHENG_BACKEND_FRONTEND=mvp \
+  CHENG_BACKEND_INPUT=tests/cheng/backend/fixtures/return_add.cheng \
+  CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/profile_smoke.o \
+  "$driver"
 
 run_step "backend.targets" sh src/tooling/verify_backend_targets.sh
 run_step "backend.targets_matrix" sh src/tooling/verify_backend_targets_matrix.sh

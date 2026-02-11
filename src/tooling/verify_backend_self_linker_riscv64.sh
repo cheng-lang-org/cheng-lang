@@ -7,12 +7,12 @@ cd "$root"
 
 mm="${CHENG_MM:-orc}"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -20,10 +20,8 @@ fi
 
 # Prefer a ready stage2 driver to avoid slow local rebuilds in CI/gates.
 if [ "${CHENG_BACKEND_DRIVER:-}" = "" ]; then
-  if [ -x "artifacts/backend_selfhost_self_obj/backend_mvp_driver.stage2" ]; then
-    export CHENG_BACKEND_DRIVER="artifacts/backend_selfhost_self_obj/backend_mvp_driver.stage2"
-  elif [ -x "artifacts/backend_selfhost/backend_mvp_driver.stage2" ]; then
-    export CHENG_BACKEND_DRIVER="artifacts/backend_selfhost/backend_mvp_driver.stage2"
+  if [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
+    export CHENG_BACKEND_DRIVER="artifacts/backend_selfhost_self_obj/cheng.stage2"
   fi
 fi
 

@@ -207,10 +207,247 @@ fn execReceiptToJson(rec: dreceipt.ExecReceipt, mode: str): json.JsonNode =
     node["signature"] = json.newJString(rec.signature)
     node
 
+fn escapeJsonString(value: str): str =
+    if value == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(value):
+        let ch = value[i]
+        if ch == '\\':
+            out = out + "\\\\"
+        elif ch == '"':
+            out = out + "\\\""
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn quoteJsonString(value: str): str =
+    return "\"" + escapeJsonString(value) + "\""
+
+fn jsonPushSep(out: str): str =
+    if out != nil && out[1] != '\0':
+        return out + ","
+    return out
+
+fn jsonAddStrField(out: str, key: str, value: str): str =
+    var next = jsonPushSep(out)
+    next = next + "\""
+    next = next + key
+    next = next + "\":"
+    next = next + quoteJsonString(value)
+    return next
+
+fn jsonAddIntField(out: str, key: str, value: int64): str =
+    var next = jsonPushSep(out)
+    next = next + "\""
+    next = next + key
+    next = next + "\":"
+    next = next + $ value
+    return next
+
+fn jsonAddInt32Field(out: str, key: str, value: int32): str =
+    return jsonAddIntField(out, key, int64(value))
+
+fn jsonAddFloatField(out: str, key: str, value: float64): str =
+    var next = jsonPushSep(out)
+    next = next + "\""
+    next = next + key
+    next = next + "\":"
+    next = next + $ value
+    return next
+
+fn leaseToJsonLine(lease: dlease.Lease, cost: dlease.LeaseCost, mode: str): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "lease")
+    if mode != nil && len(mode) > 0:
+        out = jsonAddStrField(out, "mode", mode)
+    out = jsonAddStrField(out, "lease_id", lease.leaseId)
+    out = jsonAddStrField(out, "package_id", lease.packageId)
+    out = jsonAddStrField(out, "author_id", lease.authorId)
+    out = jsonAddStrField(out, "provider_id", lease.providerId)
+    out = jsonAddIntField(out, "bytes", lease.bytes)
+    out = jsonAddInt32Field(out, "duration_days", lease.durationDays)
+    out = jsonAddInt32Field(out, "replicas", lease.replicas)
+    out = jsonAddFloatField(out, "price_per_gb_month", lease.pricePerGbMonth)
+    out = jsonAddFloatField(out, "royalty_rate", lease.royaltyRate)
+    out = jsonAddFloatField(out, "treasury_rate", lease.treasuryRate)
+    out = jsonAddStrField(out, "start_ts", lease.startTs)
+    out = jsonAddFloatField(out, "storage_cost", cost.storageCost)
+    out = jsonAddFloatField(out, "royalty", cost.royalty)
+    out = jsonAddFloatField(out, "treasury", cost.treasury)
+    out = jsonAddFloatField(out, "provider", cost.provider)
+    out = out + "}"
+    return out
+
+fn computeToJsonLine(usage: dmeter.ComputeUsage, cost: dmeter.ComputeCost, mode: str): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "compute")
+    if mode != nil && len(mode) > 0:
+        out = jsonAddStrField(out, "mode", mode)
+    out = jsonAddStrField(out, "usage_id", usage.usageId)
+    out = jsonAddStrField(out, "task_id", usage.taskId)
+    out = jsonAddStrField(out, "package_id", usage.packageId)
+    out = jsonAddStrField(out, "author_id", usage.authorId)
+    out = jsonAddStrField(out, "executor_id", usage.executorId)
+    out = jsonAddIntField(out, "cpu_ms", usage.cpuMs)
+    out = jsonAddIntField(out, "mem_bytes", usage.memBytes)
+    out = jsonAddIntField(out, "io_bytes", usage.ioBytes)
+    out = jsonAddIntField(out, "gpu_ms", usage.gpuMs)
+    out = jsonAddIntField(out, "gpu_mem_bytes", usage.gpuMemBytes)
+    out = jsonAddInt32Field(out, "gpu_count", usage.gpuCount)
+    if usage.gpuType != nil && len(usage.gpuType) > 0:
+        out = jsonAddStrField(out, "gpu_type", usage.gpuType)
+    if usage.workloadKind != nil && len(usage.workloadKind) > 0:
+        out = jsonAddStrField(out, "workload_kind", usage.workloadKind)
+    out = jsonAddFloatField(out, "price_cpu_ms", usage.priceCpuMs)
+    out = jsonAddFloatField(out, "price_mem_gb", usage.priceMemGb)
+    out = jsonAddFloatField(out, "price_io_gb", usage.priceIoGb)
+    out = jsonAddFloatField(out, "price_gpu_ms", usage.priceGpuMs)
+    out = jsonAddFloatField(out, "price_gpu_mem_gb", usage.priceGpuMemGb)
+    out = jsonAddFloatField(out, "royalty_rate", usage.royaltyRate)
+    out = jsonAddFloatField(out, "treasury_rate", usage.treasuryRate)
+    out = jsonAddInt32Field(out, "epoch", usage.epoch)
+    out = jsonAddStrField(out, "start_ts", usage.startTs)
+    out = jsonAddFloatField(out, "total", cost.total)
+    out = jsonAddFloatField(out, "royalty", cost.royalty)
+    out = jsonAddFloatField(out, "treasury", cost.treasury)
+    out = jsonAddFloatField(out, "executor", cost.executor)
+    out = out + "}"
+    return out
+
+fn auditToJsonLine(ev: daudit.AuditEvent): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "audit")
+    out = jsonAddStrField(out, "audit_id", ev.auditId)
+    out = jsonAddStrField(out, "task_id", ev.taskId)
+    out = jsonAddStrField(out, "executor_id", ev.executorId)
+    out = jsonAddStrField(out, "auditor_id", ev.auditorId)
+    out = jsonAddStrField(out, "result_cid", ev.resultCid)
+    out = jsonAddStrField(out, "status", ev.status)
+    out = jsonAddFloatField(out, "penalty", ev.penalty)
+    out = jsonAddInt32Field(out, "epoch", ev.epoch)
+    out = jsonAddStrField(out, "note", ev.note)
+    out = jsonAddStrField(out, "ts", ev.ts)
+    out = out + "}"
+    return out
+
+fn auditSampleToJsonLine(ev: dsample.AuditSample): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "audit_sample")
+    out = jsonAddStrField(out, "sample_id", ev.sampleId)
+    out = jsonAddStrField(out, "receipt_id", ev.receiptId)
+    out = jsonAddStrField(out, "request_id", ev.requestId)
+    out = jsonAddStrField(out, "task_id", ev.taskId)
+    out = jsonAddStrField(out, "executor_id", ev.executorId)
+    out = jsonAddStrField(out, "result_cid", ev.resultCid)
+    out = jsonAddStrField(out, "status", ev.status)
+    out = jsonAddStrField(out, "auditor_id", ev.auditorId)
+    out = jsonAddInt32Field(out, "epoch", ev.epoch)
+    out = jsonAddInt32Field(out, "rate_bps", ev.rateBps)
+    out = jsonAddStrField(out, "seed", ev.seed)
+    out = jsonAddStrField(out, "ts", ev.ts)
+    out = out + "}"
+    return out
+
+fn fraudReportToJsonLine(ev: dfraud.FraudReport): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "fraud_report")
+    out = jsonAddStrField(out, "report_id", ev.reportId)
+    out = jsonAddStrField(out, "task_id", ev.taskId)
+    out = jsonAddStrField(out, "request_id", ev.requestId)
+    out = jsonAddStrField(out, "receipt_id", ev.receiptId)
+    out = jsonAddStrField(out, "executor_id", ev.executorId)
+    out = jsonAddStrField(out, "reporter_id", ev.reporterId)
+    out = jsonAddStrField(out, "reason", ev.reason)
+    out = jsonAddStrField(out, "evidence_cid", ev.evidenceCid)
+    out = jsonAddStrField(out, "severity", ev.severity)
+    out = jsonAddInt32Field(out, "epoch", ev.epoch)
+    out = jsonAddStrField(out, "ts", ev.ts)
+    out = out + "}"
+    return out
+
+fn storageProofToJsonLine(ev: dproof.StorageProof): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "storage_proof")
+    out = jsonAddStrField(out, "proof_id", ev.proofId)
+    out = jsonAddStrField(out, "provider_id", ev.providerId)
+    if ev.packageId != nil && len(ev.packageId) > 0:
+        out = jsonAddStrField(out, "package_id", ev.packageId)
+    out = jsonAddStrField(out, "cid", ev.cidText)
+    out = jsonAddIntField(out, "bytes", ev.bytes)
+    out = jsonAddStrField(out, "status", ev.status)
+    if ev.proofHash != nil && len(ev.proofHash) > 0:
+        out = jsonAddStrField(out, "proof_hash", ev.proofHash)
+    out = jsonAddInt32Field(out, "epoch", ev.epoch)
+    if ev.note != nil && len(ev.note) > 0:
+        out = jsonAddStrField(out, "note", ev.note)
+    out = jsonAddStrField(out, "ts", ev.ts)
+    out = out + "}"
+    return out
+
+fn execRequestToJsonLine(req: dexec.ExecRequest, mode: str): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "exec_request")
+    if mode != nil && len(mode) > 0:
+        out = jsonAddStrField(out, "mode", mode)
+    out = jsonAddStrField(out, "request_id", req.requestId)
+    out = jsonAddStrField(out, "task_id", req.taskId)
+    out = jsonAddStrField(out, "package_id", req.packageId)
+    out = jsonAddStrField(out, "author_id", req.authorId)
+    out = jsonAddStrField(out, "requester_id", req.requesterId)
+    out = jsonAddStrField(out, "input_cid", req.inputCid)
+    out = jsonAddStrField(out, "code_cid", req.codeCid)
+    out = jsonAddStrField(out, "args_cid", req.argsCid)
+    out = jsonAddIntField(out, "max_cpu_ms", req.maxCpuMs)
+    out = jsonAddIntField(out, "max_mem_bytes", req.maxMemBytes)
+    out = jsonAddIntField(out, "max_io_bytes", req.maxIoBytes)
+    out = jsonAddIntField(out, "max_gpu_ms", req.maxGpuMs)
+    out = jsonAddIntField(out, "max_gpu_mem_bytes", req.maxGpuMemBytes)
+    out = jsonAddInt32Field(out, "max_gpu_count", req.maxGpuCount)
+    if req.gpuType != nil && len(req.gpuType) > 0:
+        out = jsonAddStrField(out, "gpu_type", req.gpuType)
+    if req.workloadKind != nil && len(req.workloadKind) > 0:
+        out = jsonAddStrField(out, "workload_kind", req.workloadKind)
+    out = jsonAddFloatField(out, "price_cpu_ms", req.priceCpuMs)
+    out = jsonAddFloatField(out, "price_mem_gb", req.priceMemGb)
+    out = jsonAddFloatField(out, "price_io_gb", req.priceIoGb)
+    out = jsonAddFloatField(out, "price_gpu_ms", req.priceGpuMs)
+    out = jsonAddFloatField(out, "price_gpu_mem_gb", req.priceGpuMemGb)
+    out = jsonAddInt32Field(out, "epoch", req.epoch)
+    out = jsonAddStrField(out, "ts", req.ts)
+    out = jsonAddStrField(out, "signature", req.signature)
+    out = out + "}"
+    return out
+
+fn execReceiptToJsonLine(rec: dreceipt.ExecReceipt, mode: str): str =
+    var out: str = "{"
+    out = jsonAddStrField(out, "type", "exec_receipt")
+    if mode != nil && len(mode) > 0:
+        out = jsonAddStrField(out, "mode", mode)
+    out = jsonAddStrField(out, "receipt_id", rec.receiptId)
+    out = jsonAddStrField(out, "request_id", rec.requestId)
+    out = jsonAddStrField(out, "task_id", rec.taskId)
+    out = jsonAddStrField(out, "executor_id", rec.executorId)
+    out = jsonAddStrField(out, "result_cid", rec.resultCid)
+    out = jsonAddStrField(out, "usage_id", rec.usageId)
+    out = jsonAddStrField(out, "status", rec.status)
+    out = jsonAddStrField(out, "error", rec.error)
+    out = jsonAddStrField(out, "proof_cid", rec.proofCid)
+    out = jsonAddInt32Field(out, "epoch", rec.epoch)
+    out = jsonAddStrField(out, "ts", rec.ts)
+    out = jsonAddStrField(out, "signature", rec.signature)
+    out = out + "}"
+    return out
+
 fn appendLeaseEventWithMode(ledgerPath: str, lease: dlease.Lease, cost: dlease.LeaseCost, mode: str): bool =
     ensureParent(ledgerPath)
-    let node = leaseToJson(lease, cost, mode)
-    let line = json.pretty(node)
+    let line = leaseToJsonLine(lease, cost, mode)
     return appendLine(ledgerPath, line)
 
 fn appendLeaseEvent(ledgerPath: str, lease: dlease.Lease, cost: dlease.LeaseCost): bool =
@@ -223,8 +460,7 @@ fn appendComputeEventWithMode(
     mode: str
 ): bool =
     ensureParent(ledgerPath)
-    let node = computeToJson(usage, cost, mode)
-    let line = json.pretty(node)
+    let line = computeToJsonLine(usage, cost, mode)
     return appendLine(ledgerPath, line)
 
 fn appendComputeEvent(ledgerPath: str, usage: dmeter.ComputeUsage, cost: dmeter.ComputeCost): bool =
@@ -232,32 +468,27 @@ fn appendComputeEvent(ledgerPath: str, usage: dmeter.ComputeUsage, cost: dmeter.
 
 fn appendAuditEvent(ledgerPath: str, ev: daudit.AuditEvent): bool =
     ensureParent(ledgerPath)
-    let node = auditToJson(ev)
-    let line = json.pretty(node)
+    let line = auditToJsonLine(ev)
     return appendLine(ledgerPath, line)
 
 fn appendAuditSampleEvent(ledgerPath: str, ev: dsample.AuditSample): bool =
     ensureParent(ledgerPath)
-    let node = auditSampleToJson(ev)
-    let line = json.pretty(node)
+    let line = auditSampleToJsonLine(ev)
     return appendLine(ledgerPath, line)
 
 fn appendFraudReportEvent(ledgerPath: str, ev: dfraud.FraudReport): bool =
     ensureParent(ledgerPath)
-    let node = fraudReportToJson(ev)
-    let line = json.pretty(node)
+    let line = fraudReportToJsonLine(ev)
     return appendLine(ledgerPath, line)
 
 fn appendStorageProofEvent(ledgerPath: str, ev: dproof.StorageProof): bool =
     ensureParent(ledgerPath)
-    let node = storageProofToJson(ev)
-    let line = json.pretty(node)
+    let line = storageProofToJsonLine(ev)
     return appendLine(ledgerPath, line)
 
 fn appendExecRequestEventWithMode(ledgerPath: str, req: dexec.ExecRequest, mode: str): bool =
     ensureParent(ledgerPath)
-    let node = execRequestToJson(req, mode)
-    let line = json.pretty(node)
+    let line = execRequestToJsonLine(req, mode)
     return appendLine(ledgerPath, line)
 
 fn appendExecRequestEvent(ledgerPath: str, req: dexec.ExecRequest): bool =
@@ -265,8 +496,7 @@ fn appendExecRequestEvent(ledgerPath: str, req: dexec.ExecRequest): bool =
 
 fn appendExecReceiptEventWithMode(ledgerPath: str, rec: dreceipt.ExecReceipt, mode: str): bool =
     ensureParent(ledgerPath)
-    let node = execReceiptToJson(rec, mode)
-    let line = json.pretty(node)
+    let line = execReceiptToJsonLine(rec, mode)
     return appendLine(ledgerPath, line)
 
 fn appendExecReceiptEvent(ledgerPath: str, rec: dreceipt.ExecReceipt): bool =

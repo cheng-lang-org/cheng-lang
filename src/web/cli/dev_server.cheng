@@ -12,10 +12,10 @@ type
         root: str
         watch: str
         buildCmd: str
-        buildExts: seq[str]
+        buildExts: str[]
         manifestRoot: str
         manifestOut: str
-        manifestExts: seq[str]
+        manifestExts: str[]
         devClientScript: str
         spaFallback: bool
 
@@ -31,7 +31,7 @@ type
         lastManifestSig: uint64
         lastError: str
         lastReloadKind: str
-        lastFiles: seq[FileStamp]
+        lastFiles: FileStamp[]
 
 var
     cfg: DevConfig
@@ -69,11 +69,9 @@ fn hasPrefix(s: str, prefix: str): bool =
         return false
     if len(prefix) > len(s):
         return false
-    var i: int32 = 0
-    while i < len(prefix):
-        if charAt(s, i) != charAt(prefix, i):
+    for i in 0..<len(prefix):
+        if s[i] != prefix[i]:
             return false
-        i = i + 1
     return true
 
 fn normalizeExt(ext: str): str =
@@ -83,20 +81,18 @@ fn normalizeExt(ext: str): str =
     if len(out) == 0:
         return ""
     out = strutil.toLowerAscii(out)
-    if charAt(out, 0) != '.':
+    if out[0] != '.':
         out = "." + out
     return out
 
-fn parseExts(raw: str, fallback: str): seq[str] =
+fn parseExts(raw: str, fallback: str): str[] =
     let text = if raw != nil && len(raw) > 0: raw else: fallback
     let parts = strutil.split(text, ',')
-    var out: seq[str] = newSeq[str]()
-    var i: int32 = 0
-    while i < len(parts):
+    var out: str[] 
+    for i in 0..<len(parts):
         let ext = normalizeExt(parts[i])
         if ext != nil && len(ext) > 0:
             out.add(ext)
-        i = i + 1
     if len(out) == 0:
         out.add(".cwc")
     return out
@@ -120,31 +116,25 @@ fn shouldIgnorePath(relPath: str): bool =
     if relPath == nil || len(relPath) == 0:
         return false
     let parts = strutil.split(relPath, '/')
-    var i: int32 = 0
-    while i < len(parts):
+    for i in 0..<len(parts):
         let subparts = strutil.split(parts[i], '\\')
-        var j: int32 = 0
-        while j < len(subparts):
+        for j in 0..<len(subparts):
             if isIgnoredSegment(subparts[j]):
                 return true
-            j = j + 1
-        i = i + 1
     return false
 
 fn startsWithDot(name: str): bool =
-    return name != nil && len(name) > 0 && charAt(name, 0) == '.'
+    return name != nil && len(name) > 0 && name[0] == '.'
 
-fn extMatches(path: str, exts: seq[str]): bool =
+fn extMatches(path: str, exts: str[]): bool =
     let parts = os.splitFile(path)
     var ext = parts.ext
     if ext == nil:
         ext = ""
     ext = strutil.toLowerAscii(ext)
-    var i: int32 = 0
-    while i < len(exts):
+    for i in 0..<len(exts):
         if ext == exts[i]:
             return true
-        i = i + 1
     return false
 
 fn resolveDefaultRoot(): str =
@@ -179,10 +169,8 @@ fn hashString64(s: str): uint64 =
     if s == nil:
         return HashOffset
     var h: uint64 = HashOffset
-    var i: int32 = 0
-    while i < len(s):
-        h = hashUpdate(h, uint64(charAt(s, i)))
-        i = i + 1
+    for i in 0..<len(s):
+        h = hashUpdate(h, uint64(s[i]))
     return h
 
 fn hashPathMtime(path: str, mtimeNs: int64): uint64 =
@@ -190,21 +178,18 @@ fn hashPathMtime(path: str, mtimeNs: int64): uint64 =
     h = hashUpdate(h, uint64(mtimeNs))
     return h
 
-fn scanFileStamps(baseRoot: str, root: str, buildExts: seq[str], outAll: uint64*, outBuild: uint64*, outFiles: seq[FileStamp]*) =
+fn scanFileStamps(baseRoot: str, root: str, buildExts: str[], outAll: uint64*, outBuild: uint64*, outFiles: FileStamp[]*) =
     if root == nil || len(root) == 0 || ! os.dirExists(root):
         return
     let items = os.walkDir(root)
-    var i: int32 = 0
-    while i < items.len:
+    for i in 0..<items.len:
         let entry = os.os_get_WalkDirEntry(items, i)
         let fullPath = entry.path
         let name = os.extractFilename(fullPath)
         if startsWithDot(name) && name != ".github":
-            i = i + 1
             continue
         let rel = os.relativePath(fullPath, baseRoot)
         if shouldIgnorePath(rel):
-            i = i + 1
             continue
         if entry.kind == os.pcDir || entry.kind == os.pcLinkToDir:
             scanFileStamps(baseRoot, fullPath, buildExts, outAll, outBuild, outFiles)
@@ -218,41 +203,34 @@ fn scanFileStamps(baseRoot: str, root: str, buildExts: seq[str], outAll: uint64*
             *outAll = hashUpdate(*outAll, h)
             if extMatches(name, buildExts):
                 *outBuild = hashUpdate(*outBuild, h)
-        i = i + 1
 
 fn normalizeRel(path: str): str =
     if path == nil:
         return ""
     var out: str = ""
-    var i: int32 = 0
-    while i < len(path):
-        var c = charAt(path, i)
+    for i in 0..<len(path):
+        var c = path[i]
         if c == '\\':
             c = '/'
         out = out + c
-        i = i + 1
     return out
 
-fn scanSignatureFiltered(baseRoot: str, root: str, exts: seq[str], outSig: uint64*, excludeRel: str) =
+fn scanSignatureFiltered(baseRoot: str, root: str, exts: str[], outSig: uint64*, excludeRel: str) =
     if root == nil || len(root) == 0 || ! os.dirExists(root):
         return
     let exclude = normalizeRel(excludeRel)
     let items = os.walkDir(root)
-    var i: int32 = 0
-    while i < items.len:
+    for i in 0..<items.len:
         let entry = os.os_get_WalkDirEntry(items, i)
         let fullPath = entry.path
         let name = os.extractFilename(fullPath)
         if startsWithDot(name) && name != ".github":
-            i = i + 1
             continue
         var rel = os.relativePath(fullPath, baseRoot)
         rel = normalizeRel(rel)
         if shouldIgnorePath(rel):
-            i = i + 1
             continue
         if exclude != nil && len(exclude) > 0 && rel == exclude:
-            i = i + 1
             continue
         if entry.kind == os.pcDir || entry.kind == os.pcLinkToDir:
             scanSignatureFiltered(baseRoot, fullPath, exts, outSig, exclude)
@@ -261,7 +239,6 @@ fn scanSignatureFiltered(baseRoot: str, root: str, exts: seq[str], outSig: uint6
                 let mtime = os.fileMtimeNs(fullPath)
                 let h = hashPathMtime(rel, mtime)
                 *outSig = hashUpdate(*outSig, h)
-        i = i + 1
 
 fn manifestExcludeRel(): str =
     if cfg.manifestRoot == nil || len(cfg.manifestRoot) == 0:
@@ -275,13 +252,13 @@ fn lastIndexOfSubstr(s: str, needle: str): int32 =
         return -1
     if len(needle) > len(s):
         return -1
-    var i: int32 = len(s) - len(needle)
-    while i >= 0:
+    let __for_start_i = len(s) - len(needle)
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
         if substr(s, i, len(needle)) == needle:
             return i
         if i == 0:
             break
-        i = i - 1
     return -1
 
 fn endsWith(s: str, suffix: str): bool =
@@ -291,11 +268,9 @@ fn endsWith(s: str, suffix: str): bool =
     let pLen: int32 = len(suffix)
     if pLen == 0 || sLen < pLen:
         return false
-    var i: int32 = 0
-    while i < pLen:
-        if charAt(s, sLen - pLen + i) != charAt(suffix, i):
+    for i in 0..<pLen:
+        if s[sLen - pLen + i] != suffix[i]:
             return false
-        i = i + 1
     return true
 
 fn injectDevClient(html: str): str =
@@ -328,7 +303,7 @@ fn pathHasExtension(path: str): bool =
         return false
     var i: int32 = len(name) - 1
     while true:
-        let c = charAt(name, i)
+        let c = name[i]
         if c == '.':
             return i > 0
         if i == 0:
@@ -349,9 +324,8 @@ fn escapeJson(text: str): str =
     if text == nil:
         return ""
     var out: str = ""
-    var i: int32 = 0
-    while i < len(text):
-        let c = charAt(text, i)
+    for i in 0..<len(text):
+        let c = text[i]
         if c == '\\':
             out = out + "\\\\"
         elif c == '"':
@@ -364,30 +338,27 @@ fn escapeJson(text: str): str =
             out = out + "\\t"
         else:
             out = out + c
-        i = i + 1
     return out
 
-fn findStampIndex(stamps: seq[FileStamp], path: str): int32 =
+fn findStampIndex(stamps: FileStamp[], path: str): int32 =
     if path == nil:
         return -1
-    var i: int32 = 0
-    while i < len(stamps):
+    for i in 0..<len(stamps):
         if stamps[i].path == path:
             return i
-        i = i + 1
     return -1
 
-fn diffStamps(oldStamps: seq[FileStamp], newStamps: seq[FileStamp]): seq[str] =
-    var out: seq[str] = newSeq[str]()
-    var i: int32 = 0
-    while i < len(newStamps):
+fn diffStamps(oldStamps: FileStamp[], newStamps: FileStamp[]): str[] =
+    var out: str[] 
+    for i in 0..<len(newStamps):
         let item = newStamps[i]
         let idx = findStampIndex(oldStamps, item.path)
         if idx < 0 || oldStamps[idx].mtime != item.mtime:
             out.add(item.path)
-        i = i + 1
     i = 0
-    while i < len(oldStamps):
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<len(oldStamps):
+        i = __for_i_1
         let item = oldStamps[i]
         let idx = findStampIndex(newStamps, item.path)
         if idx < 0:
@@ -401,21 +372,18 @@ fn isIgnoredChange(path: str): bool =
     let lower = strutil.toLowerAscii(path)
     return endsWith(lower, ".map") || endsWith(lower, ".map.json")
 
-fn filterReloadChanges(changes: seq[str]): seq[str] =
-    var out: seq[str] = newSeq[str]()
-    var i: int32 = 0
-    while i < len(changes):
+fn filterReloadChanges(changes: str[]): str[] =
+    var out: str[]
+    for i in 0..<len(changes):
         let item = changes[i]
         if ! isIgnoredChange(item):
             out.add(item)
-        i = i + 1
     return out
 
-fn isCssOnly(changes: seq[str]): bool =
+fn isCssOnly(changes: str[]): bool =
     if len(changes) == 0:
         return false
-    var i: int32 = 0
-    while i < len(changes):
+    for i in 0..<len(changes):
         let parts = os.splitFile(changes[i])
         var ext = parts.ext
         if ext == nil:
@@ -423,7 +391,6 @@ fn isCssOnly(changes: seq[str]): bool =
         ext = strutil.toLowerAscii(ext)
         if ext != ".css":
             return false
-        i = i + 1
     return true
 
 fn tailString(text: str, limit: int32): str =
@@ -446,7 +413,7 @@ fn runBuild(command: str, cwd: str): str =
 fn updateDevState() =
     var allSig: uint64 = HashOffset
     var buildSig: uint64 = HashOffset
-    var files: seq[FileStamp] = newSeq[FileStamp]()
+    var files: FileStamp[] 
     scanFileStamps(cfg.watch, cfg.watch, cfg.buildExts, &allSig, &buildSig, &files)
     var manifestSig: uint64 = HashOffset
     if cfg.manifestRoot != nil && len(cfg.manifestRoot) > 0:
@@ -504,7 +471,7 @@ fn updateDevState() =
 fn refreshSignatures() =
     var allSig: uint64 = HashOffset
     var buildSig: uint64 = HashOffset
-    var files: seq[FileStamp] = newSeq[FileStamp]()
+    var files: FileStamp[] 
     scanFileStamps(cfg.watch, cfg.watch, cfg.buildExts, &allSig, &buildSig, &files)
     var manifestSig: uint64 = HashOffset
     if cfg.manifestRoot != nil && len(cfg.manifestRoot) > 0:
@@ -529,7 +496,7 @@ fn safePathFromRequest(path: str): str =
     if path == nil || len(path) == 0:
         return "index.html"
     var rel = path
-    if charAt(rel, 0) == '/':
+    if rel[0] == '/':
         rel = substr(rel, 1, len(rel) - 1)
     if len(rel) == 0:
         rel = "index.html"
@@ -586,16 +553,14 @@ fn handleDevRequest(req: HttpRequest): HttpResponse =
         return res
     return serveStatic(req)
 
-fn collectArgsFromCmdline(): seq[str] =
-    var out: seq[str] = newSeq[str]()
+fn collectArgsFromCmdline(): str[] =
+    var out: str[] 
     let count: int32 = cmdline.paramCount()
-    var i: int32 = 0
-    while i < count:
+    for i in 0..<count:
         out.add(cmdline.paramStr(i + 1))
-        i = i + 1
     return out
 
-fn initDevServerArgs(args: seq[str]): bool =
+fn initDevServerArgs(args: str[]): bool =
     if state.inited:
         return true
     var rootArg: str = ""
@@ -610,8 +575,7 @@ fn initDevServerArgs(args: seq[str]): bool =
     var routesExtsRaw: str = ""
     var spaRaw: str = ""
     var spaSet: bool = false
-    var i: int32 = 0
-    while i < len(args):
+    for i in 0..<len(args):
         let arg = args[i]
         if arg == "--help" || arg == "-h":
             printUsage()
@@ -651,7 +615,6 @@ fn initDevServerArgs(args: seq[str]): bool =
             printUsage()
             exitCode = 1
             return false
-        i = i + 1
     if rootArg == nil || len(rootArg) == 0:
         rootArg = resolveDefaultRoot()
     let root = os.absolutePath(rootArg)

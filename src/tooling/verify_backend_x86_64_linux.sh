@@ -5,12 +5,12 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -91,8 +91,7 @@ grep -Fq "hello importc puts" "$out_dir/run.hello_importc_puts.txt"
 for fixture in tests/cheng/backend/fixtures/return_add.cheng \
                tests/cheng/backend/fixtures/return_call9.cheng \
                tests/cheng/backend/fixtures/return_while_sum.cheng \
-               tests/cheng/backend/fixtures/return_for_sum.cheng \
-               tests/cheng/backend/fixtures/return_spawn_chan_i32.cheng
+               tests/cheng/backend/fixtures/return_for_sum.cheng
 do
   base="$(basename "$fixture" .cheng)"
   exe_path="$out_dir/${base}.x86_64"

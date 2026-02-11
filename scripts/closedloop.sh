@@ -30,16 +30,18 @@ if [ "${CHENG_CLOSEDLOOP_DETERMINISM:-0}" = "1" ]; then
 fi
 
 if [ "${CHENG_CLOSEDLOOP_SKIP_BOOTSTRAP:-0}" != "1" ]; then
-  run_cmd "bootstrap.fullspec" sh src/tooling/bootstrap.sh --fullspec
+  run_cmd "bootstrap.fullspec" sh src/tooling/bootstrap_pure.sh --fullspec
 fi
 
 if [ "${CHENG_CLOSEDLOOP_SKIP_VERIFY:-0}" != "1" ]; then
-  if [ "${CHENG_CLOSEDLOOP_STRICT:-0}" != "1" ]; then
-    export CHENG_HRT_ALLOW_SKIP=1
-  fi
   run_cmd "verify.core" sh ./verify.sh
   if [ "${CHENG_CLOSEDLOOP_BACKEND_PROD:-0}" = "1" ]; then
-    run_cmd "backend.prod_closure" sh src/tooling/backend_prod_closure.sh ${CHENG_CLOSEDLOOP_BACKEND_PROD_ARGS:-}
+    backend_prod_args="${CHENG_CLOSEDLOOP_BACKEND_PROD_ARGS:-}"
+    if [ "$backend_prod_args" = "" ]; then
+      backend_prod_args="--no-publish"
+    fi
+    # shellcheck disable=SC2086
+    run_cmd "backend.prod_closure" sh src/tooling/backend_prod_closure.sh $backend_prod_args
   fi
 fi
 

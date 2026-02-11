@@ -8,7 +8,7 @@ Usage:
 
 Notes:
   - Switches the current symlink to a previous published release.
-  - Default root is dist/releases (legacy dist/backend layout is still supported).
+  - Default root is dist/releases.
   - If --to is omitted, rolls back to the previous release by directory order.
 EOF
 }
@@ -40,16 +40,9 @@ done
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-legacy_releases_dir="$root_dir/releases"
 current_link="$root_dir/current"
 current_id_file="$root_dir/current_id.txt"
-current_target_prefix=""
-if [ -d "$legacy_releases_dir" ]; then
-  releases_dir="$legacy_releases_dir"
-  current_target_prefix="releases/"
-else
-  releases_dir="$root_dir"
-fi
+releases_dir="$root_dir"
 if [ ! -d "$releases_dir" ]; then
   echo "[Error] missing release root: $releases_dir" 1>&2
   exit 2
@@ -102,7 +95,7 @@ if [ ! -d "$target" ]; then
   exit 2
 fi
 
-ln -sfn "${current_target_prefix}$to" "$current_link"
+ln -sfn "$to" "$current_link"
 printf "%s\n" "$to" >"$current_id_file"
 
 echo "backend release rollback ok: $to"

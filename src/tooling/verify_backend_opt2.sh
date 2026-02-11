@@ -5,12 +5,12 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -35,6 +35,9 @@ fixture_licm="tests/cheng/backend/fixtures/return_opt2_licm_while_cond.cheng"
 exe_path="$out_dir/return_opt2_inline_dce.o2"
 env $link_env \
   CHENG_BACKEND_OPT2=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_TARGET="$target" \
   CHENG_BACKEND_INPUT="$fixture_inline" \
@@ -46,6 +49,9 @@ env $link_env \
 exe_path="$out_dir/return_opt2_cse.o2"
 env $link_env \
   CHENG_BACKEND_OPT2=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_TARGET="$target" \
   CHENG_BACKEND_INPUT="$fixture_cse" \
@@ -57,6 +63,9 @@ env $link_env \
 exe_path="$out_dir/return_opt2_sroa_deref.o2"
 env $link_env \
   CHENG_BACKEND_OPT2=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_TARGET="$target" \
   CHENG_BACKEND_INPUT="$fixture_sroa" \
@@ -68,6 +77,9 @@ env $link_env \
 exe_path="$out_dir/return_opt2_licm_while_cond.o2"
 env $link_env \
   CHENG_BACKEND_OPT2=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_TARGET="$target" \
   CHENG_BACKEND_INPUT="$fixture_licm" \

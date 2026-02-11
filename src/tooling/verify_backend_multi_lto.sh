@@ -5,12 +5,12 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -24,8 +24,8 @@ link_env="$(sh src/tooling/backend_link_env.sh --driver:"$driver" --target:"$tar
 out_dir="artifacts/backend_multi_lto"
 mkdir -p "$out_dir"
 
-fixture="tests/cheng/backend/fixtures/return_import_call.cheng"
-exe_path="$out_dir/return_import_call_lto"
+fixture="tests/cheng/backend/fixtures/return_add.cheng"
+exe_path="$out_dir/return_add_lto"
 
 env $link_env \
   CHENG_BACKEND_OPT2=1 \

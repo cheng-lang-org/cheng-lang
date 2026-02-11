@@ -13,8 +13,8 @@ Usage:
                                      [--no-sign]
                                      [--no-ssa]
                                      [--no-selfhost]
+                                     [--selfhost-fast|--selfhost-strict]
                                      [--no-fullchain]
-                                     [--fullchain-legacy]
                                      [--seed:<path>] [--seed-id:<id>] [--seed-tar:<path>] [--require-seed]
                                      [--only-self-obj-bootstrap]
                                      [--no-self-obj-writer]
@@ -27,6 +27,11 @@ Notes:
   - Runs the self-hosted backend production closure (includes best-effort target matrix checks).
   - Default includes MIR validation (CHENG_BACKEND_VALIDATE=1) and emits a release manifest.
   - Default fullchain runs in obj-only mode (no stage1->C fixed-point gate).
+  - Default is strict: any step that exits with skip code (2) fails the closure.
+  - Use `--allow-skip` to permit optional steps to skip.
+  - `--require-seed` requires explicit `--seed`/`--seed-id`/`--seed-tar`.
+  - Publish path requires explicit seed (`--seed`/`--seed-id`/`--seed-tar`).
+  - Optional fast selfhost mode: `CHENG_BACKEND_PROD_SELFHOST_MODE=fast` (or `CHENG_SELF_OBJ_BOOTSTRAP_MODE=fast`).
 EOF
 }
 
@@ -39,7 +44,6 @@ run_opt2="1"
 run_ssa="1"
 run_selfhost="1"
 run_fullchain="1"
-fullchain_legacy=""
 seed=""
 seed_id=""
 seed_tar=""
@@ -55,10 +59,14 @@ run_mm="1"
 run_self_obj_writer="1"
 run_publish="1"
 only_self_obj_bootstrap=""
-allow_skip="1"
+allow_skip=""
 manifest="artifacts/backend_prod/release_manifest.json"
 bundle="artifacts/backend_prod/backend_release.tar.gz"
 debug_explicit="0"
+selfhost_timeout="${CHENG_BACKEND_PROD_SELFHOST_TIMEOUT:-60}"
+selfhost_reuse="${CHENG_BACKEND_PROD_SELFHOST_REUSE:-${CHENG_SELF_OBJ_BOOTSTRAP_REUSE:-1}}"
+selfhost_session="${CHENG_BACKEND_PROD_SELFHOST_SESSION:-${CHENG_SELF_OBJ_BOOTSTRAP_SESSION:-prod}}"
+selfhost_mode="${CHENG_BACKEND_PROD_SELFHOST_MODE:-${CHENG_SELF_OBJ_BOOTSTRAP_MODE:-strict}}"
 
 while [ "${1:-}" != "" ]; do
   case "$1" in
@@ -91,11 +99,14 @@ while [ "${1:-}" != "" ]; do
     --no-selfhost)
       run_selfhost=""
       ;;
+    --selfhost-fast)
+      selfhost_mode="fast"
+      ;;
+    --selfhost-strict)
+      selfhost_mode="strict"
+      ;;
     --no-fullchain)
       run_fullchain=""
-      ;;
-    --fullchain-legacy)
-      fullchain_legacy="1"
       ;;
     --seed:*)
       seed="${1#--seed:}"
@@ -184,8 +195,16 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
+if [ "$selfhost_mode" != "strict" ] && [ "$selfhost_mode" != "fast" ]; then
+  echo "[Error] invalid selfhost mode: $selfhost_mode (expected strict|fast)" 1>&2
+  exit 2
+fi
+
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
+
+# Keep local backend driver for the whole closure; many sub-gates rely on it.
+export CHENG_CLEAN_CHENG_LOCAL=0
 
 if [ "$debug_explicit" = "0" ] && [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ]; then
   run_debug="1"
@@ -194,10 +213,6 @@ fi
 backend_driver_explicit="0"
 if [ "${CHENG_BACKEND_DRIVER:-}" != "" ]; then
   backend_driver_explicit="1"
-fi
-backend_driver_from_seed="0"
-if [ "$backend_driver_explicit" = "1" ] && [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-}" = "" ]; then
-  export CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL=0
 fi
 
 seed_from_tar() {
@@ -209,9 +224,9 @@ seed_from_tar() {
   out_dir="chengcache/backend_seed_prod_$$"
   mkdir -p "$out_dir"
   tar -xzf "$tar_path" -C "$out_dir"
-  extracted="$out_dir/backend_mvp_driver"
+  extracted="$out_dir/cheng"
   if [ ! -f "$extracted" ]; then
-    echo "[Error] seed tar missing backend_mvp_driver: $tar_path" 1>&2
+    echo "[Error] seed tar missing cheng: $tar_path" 1>&2
     exit 2
   fi
   chmod +x "$extracted" 2>/dev/null || true
@@ -225,34 +240,25 @@ if [ "$require_seed" = "1" ] || [ "$seed" != "" ] || [ "$seed_id" != "" ] || [ "
 fi
 
 if [ "$seed_requested" = "1" ]; then
-  if [ "$seed" = "" ]; then
-    if [ "$seed_tar" != "" ]; then
-      seed_path="$(seed_from_tar "$seed_tar")"
-    else
-      if [ "$seed_id" = "" ] && [ -f "dist/releases/current_id.txt" ]; then
-        seed_id="$(cat dist/releases/current_id.txt | tr -d '\r\n')"
-      fi
-      if [ "$seed_id" = "" ] && [ -f "dist/backend/current_id.txt" ]; then
-        seed_id="$(cat dist/backend/current_id.txt | tr -d '\r\n')"
-      fi
-      if [ "$seed_id" != "" ]; then
-        for try_tar in \
-          "dist/releases/$seed_id/backend_release.tar.gz" \
-          "dist/backend/releases/$seed_id/backend_release.tar.gz"; do
-          if [ -f "$try_tar" ]; then
-            seed_tar="$try_tar"
-            seed_path="$(seed_from_tar "$seed_tar")"
-            break
-          fi
-        done
-      fi
-    fi
-  else
+  if [ "$seed" != "" ]; then
     seed_path="$seed"
+  elif [ "$seed_tar" != "" ]; then
+    seed_path="$(seed_from_tar "$seed_tar")"
+  elif [ "$seed_id" != "" ]; then
+    try_tar="dist/releases/$seed_id/backend_release.tar.gz"
+    if [ ! -f "$try_tar" ]; then
+      echo "[Error] missing seed tar for --seed-id:$seed_id ($try_tar)" 1>&2
+      exit 2
+    fi
+    seed_tar="$try_tar"
+    seed_path="$(seed_from_tar "$seed_tar")"
+  elif [ "$require_seed" = "1" ]; then
+    echo "[Error] --require-seed requires explicit --seed/--seed-id/--seed-tar" 1>&2
+    exit 2
   fi
 
   if [ "$seed_path" = "" ] && [ "$require_seed" = "1" ]; then
-    echo "[Error] missing seed: pass --seed:<path> or provide dist/releases/current_id.txt (or legacy dist/backend/current_id.txt, --seed-id/--seed-tar)" 1>&2
+    echo "[Error] missing seed: pass --seed/--seed-id/--seed-tar" 1>&2
     exit 2
   fi
 
@@ -265,105 +271,182 @@ if [ "$seed_requested" = "1" ]; then
       echo "[Error] seed driver is not executable: $seed_path" 1>&2
       exit 2
     fi
-    if [ "$backend_driver_explicit" != "1" ] && [ "${CHENG_BACKEND_DRIVER:-}" = "" ]; then
-      export CHENG_BACKEND_DRIVER="$seed_path"
-      backend_driver_from_seed="1"
-    fi
   fi
 fi
 
-run_optional() {
+if [ "$run_publish" != "" ] && [ "$seed_path" = "" ]; then
+  echo "[Error] publish requires explicit seed: pass --seed/--seed-id/--seed-tar (or use --no-publish)" 1>&2
+  exit 2
+fi
+
+mkdir -p chengcache
+timing_file="chengcache/backend_prod_closure.timings.$$"
+: > "$timing_file"
+
+cleanup_timing_file() {
+  rm -f "$timing_file"
+}
+trap cleanup_timing_file EXIT
+
+timestamp_now() {
+  date +%s
+}
+
+record_timing() {
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$timing_file"
+}
+
+print_timing_summary() {
+  if [ ! -s "$timing_file" ]; then
+    return
+  fi
+  tab="$(printf '\t')"
+  echo "== backend_prod_closure.timing_top =="
+  sort -t "$tab" -k3,3nr "$timing_file" | head -n 12 | while IFS="$tab" read -r label status duration; do
+    [ "$label" = "" ] && continue
+    echo "  ${duration}s [$status] $label"
+  done
+}
+
+run_required() {
   label="$1"
   shift
+  start="$(timestamp_now)"
   set +e
   "$@"
   status="$?"
   set -e
+  end="$(timestamp_now)"
+  duration=$((end - start))
   if [ "$status" -eq 0 ]; then
-    :
+    record_timing "$label" "ok" "$duration"
+  else
+    record_timing "$label" "fail" "$duration"
+    exit "$status"
+  fi
+}
+
+run_optional() {
+  label="$1"
+  shift
+  start="$(timestamp_now)"
+  set +e
+  "$@"
+  status="$?"
+  set -e
+  end="$(timestamp_now)"
+  duration=$((end - start))
+  if [ "$status" -eq 0 ]; then
+    record_timing "$label" "ok" "$duration"
   elif [ "$status" -eq 2 ]; then
     if [ "$allow_skip" != "" ]; then
       echo "== $label (skip) =="
+      record_timing "$label" "skip" "$duration"
     else
       echo "[backend_prod_closure] $label requested skip, but --strict is enabled" 1>&2
+      record_timing "$label" "fail" "$duration"
       exit 1
     fi
   else
+    record_timing "$label" "fail" "$duration"
     exit "$status"
   fi
+}
+
+has_any_lld() {
+  command -v lld-link >/dev/null 2>&1 && return 0
+  command -v llvm-lld >/dev/null 2>&1 && return 0
+  command -v ld.lld >/dev/null 2>&1 && return 0
+  command -v lld >/dev/null 2>&1 && return 0
+  return 1
 }
 
 if [ "$allow_skip" = "" ]; then
   export CHENG_BACKEND_MATRIX_STRICT=1
 fi
+if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
+  export CHENG_STAGE1_STD_NO_POINTERS=1
+fi
+if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
+  export CHENG_STAGE1_STD_NO_POINTERS_STRICT=1
+fi
+
+selfhost_stage0="${seed_path:-}"
+if [ "$selfhost_stage0" = "" ] && [ "$backend_driver_explicit" = "1" ]; then
+  if [ -x "${CHENG_BACKEND_DRIVER:-}" ]; then
+    selfhost_stage0="${CHENG_BACKEND_DRIVER}"
+  fi
+fi
+if [ "$selfhost_stage0" = "" ] && [ -x "artifacts/backend_seed/cheng.stage2" ]; then
+  selfhost_stage0="artifacts/backend_seed/cheng.stage2"
+fi
+if [ "$selfhost_stage0" = "" ] && [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
+  selfhost_stage0="artifacts/backend_selfhost_self_obj/cheng.stage2"
+fi
+if [ "$selfhost_stage0" = "" ] && [ -x "artifacts/backend_selfhost_self_obj/cheng.stage1" ]; then
+  selfhost_stage0="artifacts/backend_selfhost_self_obj/cheng.stage1"
+fi
 
 if [ "$only_self_obj_bootstrap" != "" ]; then
-  if [ "$seed_path" != "" ]; then
-    run_optional "backend.selfhost_bootstrap_self_obj" env CHENG_SELF_OBJ_BOOTSTRAP_STAGE0="$seed_path" \
+  if [ "$selfhost_stage0" != "" ]; then
+    run_optional "backend.selfhost_bootstrap_self_obj" env CHENG_SELF_OBJ_BOOTSTRAP_TIMEOUT="$selfhost_timeout" CHENG_SELF_OBJ_BOOTSTRAP_REUSE="$selfhost_reuse" CHENG_SELF_OBJ_BOOTSTRAP_SESSION="$selfhost_session" CHENG_SELF_OBJ_BOOTSTRAP_MODE="$selfhost_mode" CHENG_SELF_OBJ_BOOTSTRAP_STAGE0="$selfhost_stage0" \
       sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh
   else
-    run_optional "backend.selfhost_bootstrap_self_obj" sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh
+    run_optional "backend.selfhost_bootstrap_self_obj" env CHENG_SELF_OBJ_BOOTSTRAP_TIMEOUT="$selfhost_timeout" CHENG_SELF_OBJ_BOOTSTRAP_REUSE="$selfhost_reuse" CHENG_SELF_OBJ_BOOTSTRAP_SESSION="$selfhost_session" CHENG_SELF_OBJ_BOOTSTRAP_MODE="$selfhost_mode" sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh
   fi
+  print_timing_summary
   echo "backend_prod_closure ok"
   exit 0
 fi
 
 if [ "$run_selfhost" != "" ]; then
-  if [ "$seed_path" != "" ]; then
-    run_optional "backend.selfhost_bootstrap" env CHENG_SELF_OBJ_BOOTSTRAP_STAGE0="$seed_path" \
+  if [ "$selfhost_stage0" != "" ]; then
+    run_optional "backend.selfhost_bootstrap" env CHENG_SELF_OBJ_BOOTSTRAP_TIMEOUT="$selfhost_timeout" CHENG_SELF_OBJ_BOOTSTRAP_REUSE="$selfhost_reuse" CHENG_SELF_OBJ_BOOTSTRAP_SESSION="$selfhost_session" CHENG_SELF_OBJ_BOOTSTRAP_MODE="$selfhost_mode" CHENG_SELF_OBJ_BOOTSTRAP_STAGE0="$selfhost_stage0" \
       sh src/tooling/verify_backend_selfhost_bootstrap.sh
   else
-    run_optional "backend.selfhost_bootstrap" sh src/tooling/verify_backend_selfhost_bootstrap.sh
+    run_optional "backend.selfhost_bootstrap" env CHENG_SELF_OBJ_BOOTSTRAP_TIMEOUT="$selfhost_timeout" CHENG_SELF_OBJ_BOOTSTRAP_REUSE="$selfhost_reuse" CHENG_SELF_OBJ_BOOTSTRAP_SESSION="$selfhost_session" CHENG_SELF_OBJ_BOOTSTRAP_MODE="$selfhost_mode" sh src/tooling/verify_backend_selfhost_bootstrap.sh
   fi
 fi
 
-if [ "$backend_driver_explicit" != "1" ]; then
-  stage2_self="artifacts/backend_selfhost_self_obj/backend_mvp_driver.stage2"
-  stage2_legacy="artifacts/backend_selfhost/backend_mvp_driver.stage2"
-  if [ -x "$stage2_self" ]; then
-    export CHENG_BACKEND_DRIVER="$stage2_self"
-  elif [ -x "$stage2_legacy" ]; then
-    export CHENG_BACKEND_DRIVER="$stage2_legacy"
-  fi
+if [ "${CHENG_BACKEND_DRIVER:-}" = "" ] && [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
+  export CHENG_BACKEND_DRIVER="artifacts/backend_selfhost_self_obj/cheng.stage2"
+elif [ "${CHENG_BACKEND_DRIVER:-}" = "" ] && [ -x "artifacts/backend_seed/cheng.stage2" ]; then
+  export CHENG_BACKEND_DRIVER="artifacts/backend_seed/cheng.stage2"
 fi
 
 if [ "$validate" != "" ]; then
-  CHENG_BACKEND_VALIDATE=1 sh src/tooling/verify_backend_closedloop.sh
+  run_required "backend.closedloop" env CHENG_BACKEND_VALIDATE=1 sh src/tooling/verify_backend_closedloop.sh
 else
-  sh src/tooling/verify_backend_closedloop.sh
+  run_required "backend.closedloop" sh src/tooling/verify_backend_closedloop.sh
 fi
 
 run_optional "backend.obj_fullspec_gate" env CHENG_MM=orc sh src/tooling/verify_backend_obj_fullspec_gate.sh
 
 if [ "$run_fullchain" != "" ]; then
-  if [ "$fullchain_legacy" != "" ]; then
-    run_optional "backend.fullchain_bootstrap.legacy" env CHENG_FULLCHAIN_OBJ_ONLY=0 sh src/tooling/verify_fullchain_bootstrap.sh
-  else
-    run_optional "backend.fullchain_bootstrap.obj_only" env CHENG_FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
-  fi
+  run_optional "backend.fullchain_bootstrap.obj_only" env CHENG_FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
 fi
 
 if [ "$run_det_strict" != "" ]; then
-  sh src/tooling/verify_backend_determinism_strict.sh
+  run_required "backend.determinism_strict" sh src/tooling/verify_backend_determinism_strict.sh
   run_optional "backend.obj_determinism_strict" sh src/tooling/verify_backend_obj_determinism_strict.sh
   run_optional "backend.exe_determinism_strict" sh src/tooling/verify_backend_exe_determinism_strict.sh
 fi
 
 if [ "$run_opt" != "" ]; then
-  sh src/tooling/verify_backend_opt.sh
+  run_required "backend.opt" sh src/tooling/verify_backend_opt.sh
 fi
 
 if [ "$run_opt2" != "" ]; then
-  sh src/tooling/verify_backend_opt2.sh
-  sh src/tooling/verify_backend_multi_lto.sh
+  run_required "backend.opt2" sh src/tooling/verify_backend_opt2.sh
+  run_required "backend.multi_lto" sh src/tooling/verify_backend_multi_lto.sh
 fi
 
 if [ "$run_ssa" != "" ]; then
-  sh src/tooling/verify_backend_ssa.sh
+  run_required "backend.ssa" sh src/tooling/verify_backend_ssa.sh
 fi
 
 if [ "$run_ffi" != "" ]; then
-  sh src/tooling/verify_backend_ffi_abi.sh
+  run_required "backend.ffi_abi" sh src/tooling/verify_backend_ffi_abi.sh
 fi
 
 if [ "$run_self_obj_writer" != "" ]; then
@@ -375,7 +458,12 @@ if [ "$run_self_obj_writer" != "" ]; then
   run_optional "backend.self_obj_writer.coff" sh src/tooling/verify_backend_self_obj_writer_coff.sh
   run_optional "backend.self_obj_writer.coff_determinism" sh src/tooling/verify_backend_self_obj_writer_coff_determinism.sh
   run_optional "backend.self_linker.coff" sh src/tooling/verify_backend_self_linker_coff.sh
-  run_optional "backend.coff_lld_link" sh src/tooling/verify_backend_coff_lld_link.sh
+  if has_any_lld; then
+    run_optional "backend.coff_lld_link" sh src/tooling/verify_backend_coff_lld_link.sh
+  else
+    echo "== backend.coff_lld_link (skip: missing lld-link/llvm-lld/ld.lld/lld) =="
+    record_timing "backend.coff_lld_link" "skip" "0"
+  fi
 fi
 
 if [ "$run_obj" != "" ]; then
@@ -398,21 +486,12 @@ if [ "$run_debug" != "" ]; then
   run_optional "backend.debug" sh src/tooling/verify_backend_debug.sh
 fi
 
-stage2_driver="artifacts/backend_selfhost_self_obj/backend_mvp_driver.stage2"
-if [ ! -x "$stage2_driver" ]; then
-  stage2_driver="artifacts/backend_selfhost/backend_mvp_driver.stage2"
-fi
+stage2_driver="artifacts/backend_selfhost_self_obj/cheng.stage2"
 manifest_args=""
 bundle_args=""
 if [ -x "$stage2_driver" ]; then
   manifest_args="$manifest_args --driver:$stage2_driver"
   bundle_args="$bundle_args --driver:$stage2_driver"
-fi
-
-stage1_backend="artifacts/fullchain/stage1_runner.backend"
-if [ -f "$stage1_backend" ]; then
-  manifest_args="$manifest_args --stage1-backend:$stage1_backend"
-  bundle_args="$bundle_args --extra:$stage1_backend"
 fi
 
 fullchain_bin="artifacts/fullchain/bin"
@@ -426,6 +505,7 @@ for extra in \
   "src/tooling/chengc.sh" \
   "src/tooling/detect_host_target.sh" \
   "src/tooling/backend_link_env.sh" \
+  "src/tooling/verify_backend_selfhost_bootstrap_fast.sh" \
   "src/tooling/verify_backend_obj_fullspec_gate.sh" \
   "examples/backend_obj_fullspec.cheng"; do
   if [ -f "$extra" ]; then
@@ -434,24 +514,25 @@ for extra in \
 done
 
 # shellcheck disable=SC2086
-sh src/tooling/backend_release_manifest.sh --out:"$manifest" $manifest_args
+run_required "backend.release_manifest" sh src/tooling/backend_release_manifest.sh --out:"$manifest" $manifest_args
 if [ "$run_bundle" != "" ]; then
   # shellcheck disable=SC2086
-  sh src/tooling/backend_release_bundle.sh --out:"$bundle" --manifest:"$manifest" $bundle_args
+  run_required "backend.release_bundle" sh src/tooling/backend_release_bundle.sh --out:"$bundle" --manifest:"$manifest" $bundle_args
   if [ "$run_sign" != "" ]; then
     run_optional "backend.release_sign" sh src/tooling/backend_release_sign.sh --manifest:"$manifest" --bundle:"$bundle"
     run_optional "backend.release_verify" sh src/tooling/backend_release_verify.sh --manifest:"$manifest" --bundle:"$bundle"
     if [ "$run_publish" != "" ]; then
-      sh src/tooling/backend_release_publish.sh --manifest:"$manifest" --bundle:"$bundle" --dst:"${CHENG_BACKEND_RELEASE_DST:-dist/releases}"
+      run_required "backend.release_publish" sh src/tooling/backend_release_publish.sh --manifest:"$manifest" --bundle:"$bundle" --dst:"${CHENG_BACKEND_RELEASE_DST:-dist/releases}"
     fi
   fi
 fi
 if [ "$run_stress" != "" ]; then
-  sh src/tooling/verify_backend_stress.sh
-  sh src/tooling/verify_backend_concurrency_stress.sh
+  run_required "backend.stress" sh src/tooling/verify_backend_stress.sh
+  run_required "backend.concurrency_stress" sh src/tooling/verify_backend_concurrency_stress.sh
 fi
 if [ "$run_mm" != "" ]; then
-  sh src/tooling/verify_backend_mm.sh
+  run_required "backend.mm" sh src/tooling/verify_backend_mm.sh
 fi
 
+print_timing_summary
 echo "backend_prod_closure ok"

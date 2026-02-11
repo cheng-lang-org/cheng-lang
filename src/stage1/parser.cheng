@@ -31,10 +31,10 @@ const
 # ---- ParserState ----
 type
     ParserStateObj =
-        tokens: seq[Token]
+        tokens: Token[]
         idx: int32
         filename: str
-        diags: seq[Diagnostic]*
+        diags: Diagnostic[]*
 
 fn posFrom(t: Token): SourcePos =
     var sp: SourcePos
@@ -88,7 +88,7 @@ fn advance(p: ParserStateObj*) =
         return
     p->idx = p->idx + 1
 
-fn addDiag(diags: seq[Diagnostic]*, severity: Severity, filename: str, line: int32, col: int32, message: str) =
+fn addDiag(diags: Diagnostic[]*, severity: Severity, filename: str, line: int32, col: int32, message: str) =
     if diags == nil:
         return
     var d: Diagnostic
@@ -219,17 +219,16 @@ fn isSpaceCallArgStartFor(p: ParserStateObj*, lhs: Node): bool =
 
 fn tokenSpan(t: Token): int32 =
     if t.kind == tkString:
-        var span: int32 = len t.lexeme
+        let lexLen: int32 = len t.lexeme
+        var span: int32 = lexLen
         if t.strPrefix != chr 0:
             span = span + 1
         var quoteLen: int32 = 2
-        var i: int32 = 0
-        while i < len t.lexeme:
-            let ch: char = charAt(t.lexeme, i)
+        for i in 0..<lexLen:
+            let ch: char = t.lexeme[i]
             if ch == '\n' || ch == '\r':
                 quoteLen = 6
                 break
-            i = i + 1
         span = span + quoteLen
         return span
     if t.kind == tkChar:
@@ -300,6 +299,8 @@ fn isTypeLike(n: Node): bool =
 fn isOperatorName(name: str): bool =
     if (name ==  "+") ||(name ==  "-") ||(name ==  "*") ||(name ==  "/"):
         return true
+    if (name ==  "++") ||(name ==  "--"):
+        return true
     if (name ==  "%") ||(name ==  "==") ||(name ==  "!="):
         return true
     if (name ==  "<") ||(name ==  "<=") ||(name ==  ">") ||(name ==  ">="):
@@ -339,12 +340,38 @@ fn parser_isBuiltinTypeName(name: str): bool =
         return true
     return false
 
+fn parserContainsRemovedStringType(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        return nm == "string"
+    for i in 0..<kidCount n:
+        if parserContainsRemovedStringType(kid(n, i)):
+            return true
+    return false
+
+fn parserRejectRemovedTypeAlias(p: ParserStateObj*, n: Node): Node =
+    if n == nil:
+        return nil
+    if ! parserContainsRemovedStringType(n):
+        return n
+    if p == nil || p->diags == nil:
+        return n
+    var pos: SourcePos = n.pos
+    if (pos.line <= 0 || pos.col <= 0) && p != nil:
+        pos = posFrom(current(p))
+    if p != nil:
+        addDiag(p->diags, svError, p->filename, pos.line, pos.col,
+                "type 'string' is removed; use 'str' or 'cstring'")
+    return newNode(nkError, pos)
+
 fn isBuiltinFnName(name: str): bool =
     if (name ==  "len") ||(name ==  "__addr"):
         return true
     if (name ==  "sizeof") ||(name ==  "default"):
         return true
-    if (name ==  "newSeq") ||(name ==  "addPtr") ||(name ==  "get") ||(name ==  "getPtr"):
+    if (name ==  "addPtr") ||(name ==  "get") ||(name ==  "getPtr"):
         return true
     return false
 
@@ -402,22 +429,25 @@ fn decodeStringLit(p: ParserStateObj*, t: Token): str =
     if t.strPrefix == 'r':
         return t.lexeme
     let s: str = t.lexeme
-    let outSize: int32 = len s + 1
+    let n: int32 = len s
+    let outSize: int32 = n + 1
     var out: void* = alloc outSize
     var outLen: int32 = 0
     var i: int32 = 0
-    while i < len s:
-        let c: char = charAt(s, i)
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = s[i]
         if c != '\\':
             *int8*(ptr_add(out, outLen)) = int8(c)
             outLen = outLen + 1
             i = i + 1
             continue
         i = i + 1
-        if i >= len s:
+        if i >= n:
             addParseDiag(p, t, "Unterminated string escape sequence")
             break
-        let esc: char = charAt(s, i)
+        let esc: char = s[i]
         if esc == 'n':
             *int8*(ptr_add(out, outLen)) = 10
             outLen = outLen + 1
@@ -458,8 +488,8 @@ fn decodeStringLit(p: ParserStateObj*, t: Token): str =
                 addParseDiag(p, t, "String escape \\x requires two hex digits")
                 i = i + 1
                 continue
-            let a: int32 = hexDigitVal charAt(s, i + 1)
-            let b: int32 = hexDigitVal charAt(s, i + 2)
+            let a: int32 = hexDigitVal s[i + 1]
+            let b: int32 = hexDigitVal s[i + 2]
             if a < 0 || b < 0:
                 addParseDiag(p, t, "String escape \\x requires two hex digits")
                 i = i + 1
@@ -480,8 +510,8 @@ fn decodeCharLit(p: ParserStateObj*, t: Token): str =
     let s: str = t.lexeme
     if len s == 1:
         return s
-    if len s == 2 && charAt(s, 0) == '\\':
-        let esc: char = charAt(s, 1)
+    if len s == 2 && s[0] == '\\':
+        let esc: char = s[1]
         if esc == 'n': return charToStr char(int8(10))
         if esc == 'r': return charToStr char(int8(13))
         if esc == 't': return charToStr char(int8(9))
@@ -491,9 +521,9 @@ fn decodeCharLit(p: ParserStateObj*, t: Token): str =
         if esc == 39: return charToStr char(int8(39))
         addParseDiag(p, t, "Invalid character escape")
         return charToStr esc
-    if len s == 4 && charAt(s, 0) == '\\' && charAt(s, 1) == 'x':
-        let a: int32 = hexDigitVal charAt(s, 2)
-        let b: int32 = hexDigitVal charAt(s, 3)
+    if len s == 4 && s[0] == '\\' && s[1] == 'x':
+        let a: int32 = hexDigitVal s[2]
+        let b: int32 = hexDigitVal s[3]
         if a >= 0 && b >= 0:
             return charToStr char(int8(a * 16 + b))
     addParseDiag(p, t, "Invalid character literal")
@@ -501,12 +531,11 @@ fn decodeCharLit(p: ParserStateObj*, t: Token): str =
 
 fn stripUnderscore(s: str): str =
     var out: str = ""
-    var i: int32 = 0
-    while i < len s:
-        let c: char = charAt(s, i)
+    let n: int32 = len s
+    for i in 0..<n:
+        let c: char = s[i]
         if c != '_':
             out = out + charToStr c
-        i = i + 1
     return out
 
 fn parser_splitFile(path: str): SplitFileResult =
@@ -514,13 +543,13 @@ fn parser_splitFile(path: str): SplitFileResult =
     if path == nil || len path == 0:
         return res
     var lastSep: int32 = -1
-    var i: int32 = len path - 1
-    while i >= 0:
-        let c: char = charAt(path, i)
+    let __for_start_i = len path - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        let c: char = path[i]
         if c == '/' || c == chr 92:
             lastSep = i
             break
-        i = i - 1
     var name: str = ""
     if lastSep >= 0:
         if lastSep == 0:
@@ -534,12 +563,12 @@ fn parser_splitFile(path: str): SplitFileResult =
         name = path
     res.name = name
     var lastDot: int32 = -1
-    i = len name - 1
-    while i >= 0:
-        if charAt(name, i) == '.':
+    let __for_start_i2 = len name - 1
+    for __for_rev_i2 in 0..(__for_start_i2 - (0)):
+        let i = __for_start_i2 - __for_rev_i2
+        if name[i] == '.':
             lastDot = i
             break
-        i = i - 1
     if lastDot > 0:
         res.ext = sliceRange(name, lastDot, len name - 1)
         res.name = sliceRange(name, 0, lastDot - 1)
@@ -552,9 +581,13 @@ fn stripSpaces(s: str): str =
         return ""
     var a: int32 = 0
     var b: int32 = len s - 1
-    while a <= b && charAt(s, a) == ' ':
+    for _ in a..<(b + 1):
+        if a > b || s[a] != ' ':
+            break
         a = a + 1
-    while b >= a && charAt(s, b) == ' ':
+    for _ in a..<(b + 1):
+        if b < a || s[b] != ' ':
+            break
         b = b - 1
     if b < a:
         return ""
@@ -562,12 +595,13 @@ fn stripSpaces(s: str): str =
 
 fn parseIntLiteral(s0: str): int64 =
     let s: str = stripUnderscore s0
-    if len s == 0:
+    let sLen: int32 = len s
+    if sLen == 0:
         return 0
     var base: int32 = 10
     var start: int32 = 0
-    if len s >= 2 && charAt(s, 0) == '0':
-        let c1: char = charAt(s, 1)
+    if sLen >= 2 && s[0] == '0':
+        let c1: char = s[1]
         if c1 == 'x' || c1 == 'X':
             base = 16
             start = 2
@@ -579,12 +613,14 @@ fn parseIntLiteral(s0: str): int64 =
             start = 2
     var neg: bool = false
     var i: int32 = start
-    if i < len s && charAt(s, i) == '-':
+    if i < sLen && s[i] == '-':
         neg = true
         i = i + 1
     var v: int64 = 0
-    while i < len s:
-        let c: char = charAt(s, i)
+    for __for_guard_i in 0..<sLen:
+        if !(i < sLen):
+            break
+        let c: char = s[i]
         var d: int32 = -1
         if c >= '0' && c <= '9': d = int32(c) - int32('0')
         elif c >= 'a' && c <= 'f': d = 10 +(int32(c) - int32('a'))
@@ -601,6 +637,7 @@ fn parseIntLiteral(s0: str): int64 =
 fn parseExpression(p: ParserStateObj*, minPrec: int32): Node
 fn parseSuite(p: ParserStateObj*): Node
 fn parseTypeExpr(p: ParserStateObj*): Node
+fn parseTypeBracketArg(p: ParserStateObj*): Node
 fn parseStatement(p: ParserStateObj*): Node
 fn parseLambda(p: ParserStateObj*, kw: str): Node
 
@@ -645,8 +682,9 @@ fn parseTypeParams(p: ParserStateObj*): Node =
         break
     return params
 
-fn parseAnnotations(p: ParserStateObj*): seq[Node] =
-    var out: seq[Node] = newSeqWithCap[Node](0, 4)
+fn parseAnnotations(p: ParserStateObj*): Node[] =
+    var out: Node[] = []
+    out.cap = 4
     while matchSymbol(p, "@"):
         let pos: SourcePos = posFrom(current(p))
         let name: Node = parseIdent(p, false)
@@ -665,8 +703,9 @@ fn parseAnnotations(p: ParserStateObj*): seq[Node] =
         skipNewlines p
     return out
 
-fn parseInlineAnnotations(p: ParserStateObj*): seq[Node] =
-    var out: seq[Node] = newSeqWithCap[Node](0, 2)
+fn parseInlineAnnotations(p: ParserStateObj*): Node[] =
+    var out: Node[] = []
+    out.cap = 2
     while matchSymbol(p, "@"):
         let pos: SourcePos = posFrom(current(p))
         let name: Node = parseIdent(p, false)
@@ -702,12 +741,11 @@ fn parseNumberLit(p: ParserStateObj*): Node =
     let t: Token = current p
     advance p
     var hasDot: bool = false
-    var i: int32 = 0
-    while i < len t.lexeme:
-        if charAt(t.lexeme, i) == '.':
+    let lexLen: int32 = len t.lexeme
+    for i in 0..<lexLen:
+        if t.lexeme[i] == '.':
             hasDot = true
             break
-        i = i + 1
     if hasDot:
         var n: Node = newNode(nkFloatLit, posFrom(t))
         nodeSetStrVal(n, stripUnderscore t.lexeme)
@@ -723,6 +761,55 @@ fn parseIfExprBranch(p: ParserStateObj*): Node =
     var sl: Node = newNode(nkStmtList, expr.pos)
     addSon(sl, expr)
     return sl
+
+fn parseListLitOrCompAfterOpenBracket(p: ParserStateObj*, startTok: Token): Node =
+    # Parses:
+    # - list literal:        `[a, b, c]`  -> nkSeqLit
+    # - list comprehension:  `[expr for pat in iter [if cond]]` -> nkComprehension
+    # Assumes `[` is already consumed.
+    var seqn: Node = newNode(nkSeqLit, posFrom(startTok))
+    if matchSymbol(p, "]"):
+        return seqn
+
+    let first: Node = parseExpression(p, PrecNone)
+    if matchKeyword(p, "for"):
+        let firstPat: Node = parsePattern p
+        var pat: Node = firstPat
+        if matchSymbol(p, ","):
+            var tup: Node = newNode(nkTupleLit, posFrom startTok)
+            addSon(tup, firstPat)
+            while true:
+                let morePat: Node = parsePattern p
+                addSon(tup, morePat)
+                if ! matchSymbol(p, ","):
+                    break
+            pat = tup
+        if ! matchKeyword(p, "in"):
+            addParseDiag(p, current p, "Expected 'in'")
+        let iterExpr: Node = parseExpression(p, PrecNone)
+        var condExpr: Node = emptyNode(posFrom(current(p)))
+        if matchKeyword(p, "if"):
+            condExpr = parseExpression(p, PrecNone)
+        if matchSymbol(p, ","):
+            addParseDiag(p, current p, "List comprehension cannot contain ','; use '[a, b]' for list literal")
+            while !(curKind(p) == tkSymbol && (curLexeme(p) == "]")) && curKind(p) != tkEof:
+                advance p
+        expectSymbol(p, "]", "Expected ']'")
+        var cn: Node = newNode(nkComprehension, posFrom startTok)
+        addSon(cn, pat)
+        addSon(cn, iterExpr)
+        addSon(cn, condExpr)
+        addSon(cn, first)
+        return cn
+
+    addSon(seqn, first)
+    while matchSymbol(p, ","):
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
+            break
+        let e0: Node = parseExpression(p, PrecNone)
+        addSon(seqn, e0)
+    expectSymbol(p, "]", "Expected ']'")
+    return seqn
 
 fn parseAtom(p: ParserStateObj*): Node =
     let t: Token = current p
@@ -784,6 +871,7 @@ fn parseAtom(p: ParserStateObj*): Node =
             var cn: Node = newNode(nkComprehension, posFrom(t))
             addSon(cn, pat)
             addSon(cn, iterExpr)
+            addSon(cn, emptyNode(posFrom(current(p))))
             addSon(cn, bodyExpr)
             return cn
         if (t.lexeme ==  "true"):
@@ -807,28 +895,23 @@ fn parseAtom(p: ParserStateObj*): Node =
     if t.kind == tkChar:
         return parseCharLit p
     if t.kind == tkSymbol &&(t.lexeme ==  "@"):
+        # `@[...]` seq literal is removed; keep parse recovery for better diagnostics.
+        let atTok: Token = t
         advance p
-        expectSymbol(p, "[", "Expected '['")
-        var elems0: seq[Node] = newSeqWithCap[Node](0, 4)
-        if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  "]")):
-            while true:
-                let e0: Node = parseExpression(p, PrecNone)
-                addPtr[Node](&elems0, e0)
-                if ! matchSymbol(p, ","):
-                    break
-        expectSymbol(p, "]", "Expected ']'")
-        var seqn: Node = newNode(nkSeqLit, posFrom(t))
-        var si: int32 = 0
-        while si < elems0.len:
-            addSon(seqn, get[Node](elems0, si))
-            si = si + 1
-        return seqn
+        let brTok: Token = current p
+        if brTok.kind == tkSymbol &&(brTok.lexeme ==  "["):
+            advance p
+            addParseDiag(p, atTok, "Seq literal '@[ ... ]' is removed; use '[ ... ]'")
+            return parseListLitOrCompAfterOpenBracket(p, brTok)
+        addParseDiag(p, atTok, "Unexpected token")
+        return newNode(nkError, posFrom(atTok))
     if t.kind == tkSymbol &&(t.lexeme ==  "("):
         advance p
         if matchSymbol(p, ")"):
             return newNode(nkPar, posFrom(t))
         var first: Node = parseCallArg p
-        var elems: seq[Node] = newSeqWithCap[Node](0, 4)
+        var elems: Node[] = []
+        elems.cap = 4
         addPtr[Node](&elems, first)
         var isTuple: bool = false
         if first != nil && first.kind == nkCallArg:
@@ -846,10 +929,8 @@ fn parseAtom(p: ParserStateObj*): Node =
             expectSymbol(p, ")", "Expected ')'")
             if isTuple:
                 var tup: Node = newNode(nkTupleLit, posFrom(t))
-                var i2: int32 = 0
-                while i2 < elems.len:
+                for i2 in 0..<elems.len:
                     addSon(tup, get[Node](elems, i2))
-                    i2 = i2 + 1
                 return tup
             var par0: Node = newNode(nkPar, posFrom(t))
             addSon(par0, first)
@@ -857,33 +938,19 @@ fn parseAtom(p: ParserStateObj*): Node =
         expectSymbol(p, ")", "Expected ')'")
         if isTuple:
             var tup2: Node = newNode(nkTupleLit, posFrom(t))
-            var j2: int32 = 0
-            while j2 < elems.len:
+            for j2 in 0..<elems.len:
                 addSon(tup2, get[Node](elems, j2))
-                j2 = j2 + 1
             return tup2
         var par: Node = newNode(nkPar, posFrom(t))
         addSon(par, first)
         return par
     if t.kind == tkSymbol &&(t.lexeme ==  "["):
         advance p
-        var elems2: seq[Node] = newSeqWithCap[Node](0, 4)
-        if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  "]")):
-            while true:
-                let e2: Node = parseExpression(p, PrecNone)
-                addPtr[Node](&elems2, e2)
-                if ! matchSymbol(p, ","):
-                    break
-        expectSymbol(p, "]", "Expected ']'")
-        var br: Node = newNode(nkBracket, posFrom(t))
-        var i3: int32 = 0
-        while i3 < elems2.len:
-            addSon(br, get[Node](elems2, i3))
-            i3 = i3 + 1
-        return br
+        return parseListLitOrCompAfterOpenBracket(p, t)
     if t.kind == tkSymbol &&(t.lexeme ==  "{"):
         advance p
-        var elems3: seq[Node] = newSeqWithCap[Node](0, 4)
+        var elems3: Node[] = []
+        elems3.cap = 4
         if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  "}")):
             while true:
                 let e3: Node = parseExpression(p, PrecNone)
@@ -892,10 +959,8 @@ fn parseAtom(p: ParserStateObj*): Node =
                     break
         expectSymbol(p, "}", "Expected '}'")
         var cur: Node = newNode(nkCurly, posFrom(t))
-        var i4: int32 = 0
-        while i4 < elems3.len:
+        for i4 in 0..<elems3.len:
             addSon(cur, get[Node](elems3, i4))
-            i4 = i4 + 1
         return cur
     addParseDiag(p, t, "Unexpected token")
     advance p
@@ -909,7 +974,7 @@ fn parseCStyleCast(p: ParserStateObj*): Node =
     if ! isLikelyTypeTokenStart t1:
         return nil
     let idx0: int32 = p->idx
-    let diags0: seq[Diagnostic]* = p->diags
+    let diags0: Diagnostic[]* = p->diags
     var diagLen0: int32 = 0
     if diags0 != nil:
         diagLen0 = diags0->len
@@ -964,18 +1029,17 @@ fn isCStyleCastFollowToken(t: Token): bool =
 fn isLikelyTypeIdent(name: str): bool =
     if name == nil || len name == 0:
         return false
+    let nameLen: int32 = len name
     if parser_isBuiltinTypeName name:
         return true
-    let c0: char = charAt(name, 0)
+    let c0: char = name[0]
     if c0 >= 'A' && c0 <= 'Z':
         return true
-    var i: int32 = 1
-    while i < len name:
-        let prev: char = charAt(name, i - 1)
-        let c: char = charAt(name, i)
+    for i in 1..<nameLen:
+        let prev: char = name[i - 1]
+        let c: char = name[i]
         if prev == '_' && c >= 'A' && c <= 'Z':
             return true
-        i = i + 1
     return false
 
 fn isLikelyTypeExpr(n: Node): bool =
@@ -1031,7 +1095,7 @@ fn isLikelyTypeTokenStart(t: Token): bool =
 
 fn parseTypeCallCallee(p: ParserStateObj*): Node =
     let idx0: int32 = p->idx
-    let diags0: seq[Diagnostic]* = p->diags
+    let diags0: Diagnostic[]* = p->diags
     var diagLen0: int32 = 0
     if diags0 != nil:
         diagLen0 = diags0->len
@@ -1044,13 +1108,6 @@ fn parseTypeCallCallee(p: ParserStateObj*): Node =
             diags0->len = diagLen0
         return nil
     if typeNode != nil:
-        if curKind(p) == tkSymbol &&(curLexeme(p) ==  "*"):
-            while curKind(p) == tkSymbol &&(curLexeme(p) ==  "*"):
-                let star: Token = current p
-                advance p
-                var pt: Node = newNode(nkPtrTy, posFrom(star))
-                addSon(pt, typeNode)
-                typeNode = pt
         let t: Token = current p
         if t.kind == tkSymbol &&(t.lexeme ==  "("):
             if typeNode.kind == nkIdent || typeNode.kind == nkSymbol:
@@ -1068,7 +1125,7 @@ fn parseTypeCallCallee(p: ParserStateObj*): Node =
 
 fn parseTypeSpaceCallee(p: ParserStateObj*): Node =
     let idx0: int32 = p->idx
-    let diags0: seq[Diagnostic]* = p->diags
+    let diags0: Diagnostic[]* = p->diags
     var diagLen0: int32 = 0
     if diags0 != nil:
         diagLen0 = diags0->len
@@ -1104,14 +1161,12 @@ fn maybeParseTypePtrBase(p: ParserStateObj*, base: Node): Node =
     let after: Token = peek(p, offset)
     if after.kind != tkSymbol || !streq(after.lexeme, "("):
         return base
-    var i: int32 = 0
-    while i < offset:
+    for i in 0..<offset:
         let star: Token = current p
         var pt: Node = newNode(nkPtrTy, posFrom(star))
         addSon(pt, base)
         base = pt
         advance p
-        i = i + 1
     return base
 
 fn parsePrefix(p: ParserStateObj*): Node =
@@ -1141,7 +1196,7 @@ fn parsePrefix(p: ParserStateObj*): Node =
         addSon(call0, makeIdent("__addr", posFrom(t)))
         addSon(call0, rhs1)
         return call0
-    if t.kind == tkSymbol &&((t.lexeme ==  "+") ||(t.lexeme ==  "-") ||(t.lexeme ==  "!") ||(t.lexeme ==  "~") ||(t.lexeme ==  "$") ||(t.lexeme ==  "^") ||(t.lexeme ==  "%")):
+    if t.kind == tkSymbol &&((t.lexeme ==  "+") ||(t.lexeme ==  "-") ||(t.lexeme ==  "++") ||(t.lexeme ==  "--") ||(t.lexeme ==  "!") ||(t.lexeme ==  "~") ||(t.lexeme ==  "$") ||(t.lexeme ==  "^") ||(t.lexeme ==  "%")):
         advance p
         let op: Node = makeIdent(t.lexeme, posFrom(t))
         let rhs: Node = parseExpression(p, PrecPrefix)
@@ -1216,7 +1271,8 @@ fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
                 break
             let isDiscard: bool = node != nil && node.kind == nkIdent && plainName node == "discard"
             advance p
-            var args: seq[Node] = newSeqWithCap[Node](0, 2)
+            var args: Node[] = []
+            args.cap = 2
             if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  ")")):
                 while true:
                     let arg: Node = parseCallArg p
@@ -1237,10 +1293,8 @@ fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
                 var call: Node = newNode(nkCall, posFrom(t))
                 call.callStyle = CallStyleParen
                 addSon(call, node)
-                var ai: int32 = 0
-                while ai < args.len:
+                for ai in 0..<args.len:
                     addSon(call, get[Node](args, ai))
-                    ai = ai + 1
                 node = call
             continue
         if t.kind == tkSymbol &&(t.lexeme ==  "["):
@@ -1248,6 +1302,13 @@ fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
             var br: Node = newNode(nkBracketExpr, posFrom(t))
             addSon(br, node)
             if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
+                # In expression context, `p[]` used to be a pointer deref and is removed.
+                # However, type args in generic calls are parsed as expressions too, so allow
+                # `T[]` there when the lhs is a type-like expression.
+                if isLikelyTypeExpr node:
+                    advance p
+                    node = br
+                    continue
                 addParseDiag(p, current p, "Empty subscript dereference is not supported; use *p")
                 advance p
                 node = newNode(nkError, posFrom(t))
@@ -1261,6 +1322,15 @@ fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
                     break
             expectSymbol(p, "]", "Expected ']'")
             node = br
+            continue
+        if t.kind == tkSymbol &&((t.lexeme ==  "++") ||(t.lexeme ==  "--")):
+            if ! tokenAttached p:
+                break
+            advance p
+            var pn2: Node = newNode(nkPostfix, posFrom(t))
+            addSon(pn2, makeIdent(t.lexeme, posFrom(t)))
+            addSon(pn2, node)
+            node = pn2
             continue
         if t.kind == tkSymbol &&(t.lexeme ==  "?") && ! isTernaryQuestion p:
             advance p
@@ -1276,6 +1346,12 @@ fn parseTypePostfix(p: ParserStateObj*, lhs: Node): Node =
     var node: Node = lhs
     while true:
         let t: Token = current p
+        if t.kind == tkSymbol &&(t.lexeme ==  "*"):
+            advance p
+            var pt: Node = newNode(nkPtrTy, posFrom(t))
+            addSon(pt, node)
+            node = pt
+            continue
         if t.kind == tkSymbol &&(t.lexeme ==  "."):
             advance p
             let member: Node = parseIdent(p, false)
@@ -1289,24 +1365,18 @@ fn parseTypePostfix(p: ParserStateObj*, lhs: Node): Node =
             var br: Node = newNode(nkBracketExpr, posFrom(t))
             addSon(br, node)
             if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
-                addParseDiag(p, current p, "Expected type parameters")
                 advance p
-                node = newNode(nkError, posFrom(t))
+                node = br
                 continue
             while true:
-                let arg: Node = parseTypeExpr p
+                # Allow expressions in type brackets so `T[n + 4]` can be parsed
+                # without requiring parentheses.
+                let arg: Node = parseTypeBracketArg p
                 addSon(br, arg)
                 if matchSymbol(p, ",") || matchSymbol(p, ";"):
                     continue
                 break
             expectSymbol(p, "]", "Expected ']'")
-            # Public fixed-cap syntax is `seq[T, N]`; internally keep `seq_fixed` for compatibility.
-            if kidCount(br) > 2:
-                let base: Node = kid(br, 0)
-                if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
-                    let baseName: str = stripSpaces(plainName(base))
-                    if baseName == "seq":
-                        setKid(br, 0, newIdent("seq_fixed", base.pos))
             node = br
             continue
         if t.kind == tkSymbol &&(t.lexeme ==  "?"):
@@ -1318,6 +1388,21 @@ fn parseTypePostfix(p: ParserStateObj*, lhs: Node): Node =
             continue
         break
     return node
+
+fn parseTypeBracketArg(p: ParserStateObj*): Node =
+    # Type brackets are used for:
+    # - Generic instantiation: `Foo[T]`, `Bar[T, U]`
+    # - Container sugar: `T[]`, `T[N]` (N is an int expression)
+    #
+    # Keep special type keywords parsed by the type grammar so function/tuple/set
+    # type nodes are produced. Otherwise, use the expression parser to accept
+    # infix operators inside `[...]` (e.g. `T[n + 4]`).
+    let t: Token = current p
+    if t.kind == tkKeyword &&
+       ((t.lexeme ==  "fn") ||(t.lexeme ==  "tuple") ||(t.lexeme ==  "set") ||(t.lexeme ==  "enum") ||
+        (t.lexeme ==  "ref") ||(t.lexeme ==  "var")):
+        return parseTypeExpr p
+    return parseExpression(p, PrecNone)
 
 fn parseSpaceAtom(p: ParserStateObj*): Node =
     let typeCallee: Node = parseTypeCallCallee p
@@ -1345,15 +1430,15 @@ fn maybeParseSpaceTypePtrCall(p: ParserStateObj*, arg: Node): Node =
     if after.kind != tkSymbol || !streq(after.lexeme, "("):
         return arg
     var base: Node = arg
-    var i: int32 = 0
-    while i < offset:
+    for i in 0..<offset:
         let star: Token = peek(p, i)
         var pt: Node = newNode(nkPtrTy, posFrom(star))
         addSon(pt, base)
         base = pt
-        i = i + 1
     i = 0
-    while i < offset:
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<offset:
+        i = __for_i_1
         advance p
         i = i + 1
     return parsePostfix(p, base)
@@ -1493,7 +1578,7 @@ fn isCaseEntrySeparator(p: ParserStateObj*): bool =
 
 fn parseCaseEntry(p: ParserStateObj*): Node =
     let idx0: int32 = p->idx
-    let diags0: seq[Diagnostic]* = p->diags
+    let diags0: Diagnostic[]* = p->diags
     var diagLen0: int32 = 0
     if diags0 != nil:
         diagLen0 = diags0->len
@@ -1528,7 +1613,8 @@ fn parseFormalParams(p: ParserStateObj*): Node =
         skipParamTrivia p
         if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
             break
-        var names: seq[Node] = newSeqWithCap[Node](0, 2)
+        var names: Node[] = []
+        names.cap = 2
         addPtr[Node](&names, parseIdent(p, false))
         while matchSymbol(p, ","):
             addPtr[Node](&names, parseIdent(p, false))
@@ -1538,15 +1624,13 @@ fn parseFormalParams(p: ParserStateObj*): Node =
         var pdefault: Node = emptyNode(posFrom(current(p)))
         if matchSymbol(p, "="):
             pdefault = parseExpression(p, PrecNone)
-        var i: int32 = 0
-        while i < names.len:
+        for i in 0..<names.len:
             let n0: Node = get[Node](names, i)
             var defs: Node = newNode(nkIdentDefs, n0.pos)
             addSon(defs, n0)
             addSon(defs, ptype)
             addSon(defs, pdefault)
             addSon(fp, defs)
-            i = i + 1
         skipParamTrivia p
         if matchSymbol(p, ",") || matchSymbol(p, ";"):
             continue
@@ -1559,7 +1643,8 @@ fn parseFormalParams(p: ParserStateObj*): Node =
     return fp
 
 fn parseRecordField(p: ParserStateObj*, recList: Node) =
-    var names: seq[Node] = newSeqWithCap[Node](0, 2)
+    var names: Node[] = []
+    names.cap = 2
     addPtr[Node](&names, parseIdent(p, false))
     while matchSymbol(p, ","):
         addPtr[Node](&names, parseIdent(p, false))
@@ -1569,15 +1654,13 @@ fn parseRecordField(p: ParserStateObj*, recList: Node) =
         fType = parseTypeExpr p
     if matchSymbol(p, "="):
         fDefault = parseExpression(p, PrecNone)
-    var i: int32 = 0
-    while i < names.len:
+    for i in 0..<names.len:
         let nm: Node = get[Node](names, i)
         var defs: Node = newNode(nkIdentDefs, nm.pos)
         addSon(defs, nm)
         addSon(defs, fType)
         addSon(defs, fDefault)
         addSon(recList, defs)
-        i = i + 1
 
 fn parseRecordBody(p: ParserStateObj*, pos: SourcePos): Node =
     var recList: Node = newNode(nkRecList, pos)
@@ -1671,7 +1754,8 @@ fn parseEnumType(p: ParserStateObj*, pos: SourcePos): Node =
         if match(p, tkIndent):
             skipStmtSeps p
             while curKind(p) != tkDedent && curKind(p) != tkEof:
-                var names: seq[Node] = newSeqWithCap[Node](0, 4)
+                var names: Node[] = []
+                names.cap = 4
                 addPtr[Node](&names, parseIdent(p, false))
                 while matchSymbol(p, ","):
                     if curKind(p) == tkNewline || curKind(p) == tkDedent || curKind(p) == tkEof:
@@ -1680,14 +1764,12 @@ fn parseEnumType(p: ParserStateObj*, pos: SourcePos): Node =
                 var val: Node = emptyNode(posFrom(current(p)))
                 if matchSymbol(p, "="):
                     val = parseExpression(p, PrecNone)
-                var ni: int32 = 0
-                while ni < names.len:
+                for ni in 0..<names.len:
                     let name: Node = get[Node](names, ni)
                     var f: Node = newNode(nkEnumFieldDecl, name.pos)
                     addSon(f, name)
                     addSon(f, val)
                     addSon(en, f)
-                    ni = ni + 1
                 skipStmtSeps p
             expect(p, tkDedent, "Expected dedent")
     return en
@@ -1703,7 +1785,7 @@ fn parseTypeExpr(p: ParserStateObj*): Node =
         var pt: Node = newNode(nkFnTy, posFrom(t))
         addSon(pt, fp)
         addSon(pt, ret)
-        return pt
+        return parserRejectRemovedTypeAlias(p, pt)
     if t.kind == tkKeyword &&(t.lexeme ==  "tuple"):
         advance p
         expectSymbol(p, "[", "Expected '['")
@@ -1728,7 +1810,7 @@ fn parseTypeExpr(p: ParserStateObj*): Node =
                     break
                 addParseDiag(p, current p, "Expected ']'")
                 break
-        return tt
+        return parserRejectRemovedTypeAlias(p, tt)
     if t.kind == tkKeyword &&(t.lexeme ==  "set"):
         advance p
         expectSymbol(p, "[", "Expected '['")
@@ -1736,10 +1818,11 @@ fn parseTypeExpr(p: ParserStateObj*): Node =
         expectSymbol(p, "]", "Expected ']'")
         var st: Node = newNode(nkSetTy, posFrom(t))
         addSon(st, elemTy)
-        return st
+        return parserRejectRemovedTypeAlias(p, st)
     if t.kind == tkKeyword &&(t.lexeme ==  "enum"):
         advance p
-        return parseEnumType(p, posFrom(t))
+        let en: Node = parseEnumType(p, posFrom(t))
+        return parserRejectRemovedTypeAlias(p, en)
     if t.kind == tkKeyword &&(t.lexeme ==  "ref"):
         advance p
         var rt: Node = newNode(nkRefTy, posFrom(t))
@@ -1750,26 +1833,22 @@ fn parseTypeExpr(p: ParserStateObj*): Node =
         else:
             target = parseTypeExpr p
         addSon(rt, target)
-        return rt
+        return parserRejectRemovedTypeAlias(p, rt)
     if t.kind == tkKeyword &&(t.lexeme ==  "var"):
         advance p
         let baseVar: Node = parseTypeExpr p
         if baseVar != nil && baseVar.kind == nkPtrTy:
             addParseDiag(p, t, "var is not allowed on pointer types; T* is read/write by default")
-            return baseVar
+            return parserRejectRemovedTypeAlias(p, baseVar)
         if plainName baseVar == "pointer":
             addParseDiag(p, t, "pointer is removed; use void*")
-            return baseVar
+            return parserRejectRemovedTypeAlias(p, baseVar)
         var vt: Node = newNode(nkVarTy, posFrom(t))
         addSon(vt, baseVar)
-        return vt
+        return parserRejectRemovedTypeAlias(p, vt)
     # default: parse expression-like type (ident / bracket expr)
     var base: Node = parseTypePostfix(p, parseAtom p)
-    while matchSymbol(p, "*"):
-        var pt3: Node = newNode(nkPtrTy, base.pos)
-        addSon(pt3, base)
-        base = pt3
-    return base
+    return parserRejectRemovedTypeAlias(p, base)
 
 # ---- Statements ----
 fn parseSuite(p: ParserStateObj*): Node =
@@ -1940,7 +2019,7 @@ fn parseBlock(p: ParserStateObj*): Node =
     addSon(bn, body)
     return bn
 
-fn parseRoutine(p: ParserStateObj*, kind: NodeKind, annots: seq[Node]): Node =
+fn parseRoutine(p: ParserStateObj*, kind: NodeKind, annots: Node[]): Node =
     let kw: Token = current p
     advance p
     var name: Node = emptyNode(posFrom(kw))
@@ -1967,23 +2046,18 @@ fn parseRoutine(p: ParserStateObj*, kind: NodeKind, annots: seq[Node]): Node =
         advance p
         wherePos = posFrom wt
         whereExpr = parseExpression(p, PrecNone)
-    let trailingAnnots: seq[Node] = parseInlineAnnotations p
-    var mergedAnnots: seq[Node] = newSeqWithCap[Node](0, annots.len + trailingAnnots.len + 1)
-    var ai0: int32 = 0
-    while ai0 < annots.len:
+    let trailingAnnots: Node[] = parseInlineAnnotations p
+    var mergedAnnots: Node[] = []
+    mergedAnnots.cap = annots.len + trailingAnnots.len + 1
+    for ai0 in 0..<annots.len:
         addPtr[Node](&mergedAnnots, get[Node](annots, ai0))
-        ai0 = ai0 + 1
-    var ai1: int32 = 0
-    while ai1 < trailingAnnots.len:
+    for ai1 in 0..<trailingAnnots.len:
         addPtr[Node](&mergedAnnots, get[Node](trailingAnnots, ai1))
-        ai1 = ai1 + 1
     var pragma: Node = emptyNode(posFrom(kw))
     if mergedAnnots.len > 0 ||(whereExpr != nil && whereExpr.kind != nkEmpty):
         pragma = newNode(nkPragma, posFrom(kw))
-        var i: int32 = 0
-        while i < mergedAnnots.len:
+        for i in 0..<mergedAnnots.len:
             addSon(pragma, get[Node](mergedAnnots, i))
-            i = i + 1
         if whereExpr != nil && whereExpr.kind != nkEmpty:
             var whereAnn: Node = newNode(nkAnnotation, wherePos)
             addSon(whereAnn, makeIdent("where", wherePos))
@@ -2025,7 +2099,7 @@ fn parseLambda(p: ParserStateObj*, kw: str): Node =
     addSon(lam, emptyNode(posFrom(startTok)))
     return lam
 
-fn parseTypeDecl(p: ParserStateObj*, annots: seq[Node]): Node =
+fn parseTypeDecl(p: ParserStateObj*, annots: Node[]): Node =
     let kw: Token = current p
     advance p
     if curKind(p) == tkNewline:
@@ -2056,10 +2130,8 @@ fn parseTypeDecl(p: ParserStateObj*, annots: seq[Node]): Node =
             var pragma: Node = emptyNode(posFrom(kw))
             if annots.len > 0:
                 pragma = newNode(nkPragma, posFrom(kw))
-                var ai: int32 = 0
-                while ai < annots.len:
+                for ai in 0..<annots.len:
                     addSon(pragma, get[Node](annots, ai))
-                    ai = ai + 1
             addSon(td, pragma)
             addSon(sl, td)
             skipStmtSeps p
@@ -2087,10 +2159,8 @@ fn parseTypeDecl(p: ParserStateObj*, annots: seq[Node]): Node =
     var pragma2: Node = emptyNode(posFrom(kw))
     if annots.len > 0:
         pragma2 = newNode(nkPragma, posFrom(kw))
-        var ai2: int32 = 0
-        while ai2 < annots.len:
+        for ai2 in 0..<annots.len:
             addSon(pragma2, get[Node](annots, ai2))
-            ai2 = ai2 + 1
     addSon(td2, pragma2)
     return td2
 
@@ -2236,17 +2306,16 @@ fn parseFromImport(p: ParserStateObj*): Node =
 
 fn parseStatement(p: ParserStateObj*): Node =
     skipStmtSeps p
-    let annots: seq[Node] = parseAnnotations p
+    let annots: Node[] = parseAnnotations p
     let t: Token = current p
     if t.kind == tkKeyword:
         if (t.lexeme ==  "async"):
             let asyncTok: Token = current p
             advance p
-            var annots2: seq[Node] = newSeqWithCap[Node](0, annots.len + 1)
-            var ai: int32 = 0
-            while ai < annots.len:
+            var annots2: Node[] = []
+            annots2.cap = annots.len + 1
+            for ai in 0..<annots.len:
                 addPtr[Node](&annots2, get[Node](annots, ai))
-                ai = ai + 1
             var asyncAnn: Node = newNode(nkAnnotation, posFrom asyncTok)
             addSon(asyncAnn, makeIdent("async", posFrom asyncTok))
             addPtr[Node](&annots2, asyncAnn)
@@ -2333,7 +2402,8 @@ fn parseStatement(p: ParserStateObj*): Node =
                 var slb: Node = newNode(nkStmtList, posFrom(t))
                 skipStmtSeps p
                 while curKind(p) != tkDedent && curKind(p) != tkEof:
-                    var namesB: seq[Node] = newSeqWithCap[Node](0, 2)
+                    var namesB: Node[] = []
+                    namesB.cap = 2
                     let name0B: Node = parsePattern p
                     addPtr[Node](&namesB, normalizeLetPattern(name0B))
                     while matchSymbol(p, ","):
@@ -2354,8 +2424,7 @@ fn parseStatement(p: ParserStateObj*): Node =
                         if lastNameB != nil && lastNameB.kind == nkPattern && kidCount lastNameB > 1:
                             liftedTypeB = kid(lastNameB, 1)
                             liftLastB = true
-                    var niB: int32 = 0
-                    while niB < namesB.len:
+                    for niB in 0..<namesB.len:
                         var nameNodeB: Node = get[Node](namesB, niB)
                         if liftLastB &&(niB == namesB.len - 1) && nameNodeB != nil && nameNodeB.kind == nkPattern && kidCount nameNodeB > 0:
                             nameNodeB = kid(nameNodeB, 0)
@@ -2365,11 +2434,11 @@ fn parseStatement(p: ParserStateObj*): Node =
                         addSon(dnB, valB)
                         addSon(dnB, pragmaB)
                         addSon(slb, dnB)
-                        niB = niB + 1
                     skipStmtSeps p
                 expect(p, tkDedent, "Expected dedent")
                 return slb
-            var names: seq[Node] = newSeqWithCap[Node](0, 2)
+            var names: Node[] = []
+            names.cap = 2
             let name0: Node = parsePattern p
             addPtr[Node](&names, normalizeLetPattern(name0))
             while matchSymbol(p, ","):
@@ -2385,10 +2454,8 @@ fn parseStatement(p: ParserStateObj*): Node =
             var pragma: Node = emptyNode posFrom(t)
             if annots.len > 0:
                 pragma = newNode(nkPragma, posFrom(t))
-                var i: int32 = 0
-                while i < annots.len:
+                for i in 0..<annots.len:
                     addSon(pragma, get[Node](annots, i))
-                    i = i + 1
             if names.len == 1:
                 var dn: Node = newNode(kind, posFrom(t))
                 addSon(dn, get[Node](names, 0))
@@ -2404,8 +2471,7 @@ fn parseStatement(p: ParserStateObj*): Node =
                     liftedType = kid(lastName, 1)
                     liftLast = true
             var sl: Node = newNode(nkStmtList, posFrom(t))
-            var ni: int32 = 0
-            while ni < names.len:
+            for ni in 0..<names.len:
                 var nameNode: Node = get[Node](names, ni)
                 if liftLast &&(ni == names.len - 1) && nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 0:
                     nameNode = kid(nameNode, 0)
@@ -2415,7 +2481,6 @@ fn parseStatement(p: ParserStateObj*): Node =
                 addSon(dn2, val)
                 addSon(dn2, pragma)
                 addSon(sl, dn2)
-                ni = ni + 1
             return sl
     # default: expression statement / assignment / command call
     let expr: Node = parseExpression(p, PrecNone)
@@ -2447,7 +2512,7 @@ fn parseStatement(p: ParserStateObj*): Node =
     return expr
 
 # ---- Module parsing ----
-fn parseModuleImpl(tokens: seq[Token], filename: str, diags: seq[Diagnostic]*): Node =
+fn parseModuleImpl(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
     var pObj: ParserStateObj* = ParserStateObj*(alloc(sizeof ParserStateObj))
     if pObj == nil:
         return nil
@@ -2480,8 +2545,8 @@ fn parseModuleImpl(tokens: seq[Token], filename: str, diags: seq[Diagnostic]*): 
     dealloc pObj
     return root
 
-fn parseModuleWithDiagnostics(tokens: seq[Token], filename: str, diags: seq[Diagnostic]*): Node =
+fn parseModuleWithDiagnostics(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
     return parseModuleImpl(tokens, filename, diags)
 
-fn parseModule(tokens: seq[Token], filename: str = "stdin"): Node =
+fn parseModule(tokens: Token[], filename: str = "stdin"): Node =
     return parseModuleImpl(tokens, filename, nil)

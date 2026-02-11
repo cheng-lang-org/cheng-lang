@@ -51,12 +51,12 @@ const
     R_RISCV_PCREL_LO12_I: uint32 = 24
     R_RISCV_CALL: uint32 = 18
 
-fn elf_findLabelOff(labels: seq[str], offs: seq[int32], label: str): Result[int32] =
-    var i: int32 = 0
-    while i < labels.len && i < offs.len:
+fn elf_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
+    for i in 0..<labels.len:
+        if ! (i < offs.len):
+            break
         if streq(get[str](labels, i), label):
             return Ok[int32](get[int32](offs, i))
-        i = i + 1
     return Err[int32]("elf_writer: missing label: " + label)
 
 fn elf_strContains(hay: str, needle: str): bool =
@@ -68,14 +68,12 @@ fn elf_strContains(hay: str, needle: str): bool =
         return true
     if n < m:
         return false
-    var i: int32 = 0
-    while i <= n - m:
-        var j: int32 = 0
-        while j < m && charAt(hay, i + j) == charAt(needle, j):
-            j = j + 1
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
         if j == m:
             return true
-        i = i + 1
     return false
 
 fn elf_targetIsDarwin(target: str): bool =
@@ -93,48 +91,45 @@ fn elf_strCmp(a: str, b: str): int32 =
     let na: int32 = len(a)
     let nb: int32 = len(b)
     let n: int32 = na < nb ? na : nb
-    var i: int32 = 0
-    while i < n:
-        let ca: int32 = int32(int64(charAt(a, i)) & int64(0xFF))
-        let cb: int32 = int32(int64(charAt(b, i)) & int64(0xFF))
+    for i in 0..<n:
+        let ca: int32 = int32(int64(a[i]) & int64(0xFF))
+        let cb: int32 = int32(int64(b[i]) & int64(0xFF))
         if ca < cb:
             return -1
         if ca > cb:
             return 1
-        i = i + 1
     if na < nb:
         return -1
     if na > nb:
         return 1
     return 0
 
-fn elf_seqContainsStr(items: seq[str], value: str): bool =
-    var i: int32 = 0
-    while i < items.len:
+fn elf_seqContainsStr(items: str[], value: str): bool =
+    for i in 0..<items.len:
         if streq(get[str](items, i), value):
             return true
-        i = i + 1
     return false
 
-fn elf_seqAddUniqueStr(items: seq[str]*, value: str) =
+fn elf_seqAddUniqueStr(items: str[]*, value: str) =
     if items == nil || value == nil || len(value) == 0:
         return
     if elf_seqContainsStr(*items, value):
         return
     addPtr[str](items, value)
 
-fn elf_sortStringsStable(items: seq[str]*) =
+fn elf_sortStringsStable(items: str[]*) =
     if items == nil:
         return
-    var i: int32 = 1
-    while i < items->len:
+    for i in 1..<items->len:
         let key: str = get[str](*items, i)
         var j: int32 = i - 1
-        while j >= 0 && elf_strCmp(get[str](*items, j), key) > 0:
+        let __for_start_j = j
+        for __for_rev_j in 0..(__for_start_j - (0)):
+            j = __for_start_j - __for_rev_j
+            if !(elf_strCmp(get[str](*items, j), key) > 0):
+                break
             setPtr[str](items, j + 1, get[str](*items, j))
-            j = j - 1
         setPtr[str](items, j + 1, key)
-        i = i + 1
 
 fn elf_alignUp(value: uint64, align: uint64): uint64 =
     if align == 0:
@@ -144,7 +139,7 @@ fn elf_alignUp(value: uint64, align: uint64): uint64 =
         return value
     return value + (align - rem)
 
-fn elfWriteShdr(out: seq[uint8]*, nameOff: uint32, shType: uint32, flags: uint64,
+fn elfWriteShdr(out: uint8[]*, nameOff: uint32, shType: uint32, flags: uint64,
                 shOffset: uint64, shSize: uint64, link: uint32, info: uint32,
                 addralign: uint64, entsize: uint64) =
     if out == nil:
@@ -160,7 +155,7 @@ fn elfWriteShdr(out: seq[uint8]*, nameOff: uint32, shType: uint32, flags: uint64
     bufU64(out, addralign)
     bufU64(out, entsize)
 
-fn elfAddSectionSym(outSyms: seq[ElfSym]*, shndx: uint16) =
+fn elfAddSectionSym(outSyms: ElfSym[]*, shndx: uint16) =
     var s: ElfSym
     new s
     s.name = ""
@@ -172,7 +167,7 @@ fn elfAddSectionSym(outSyms: seq[ElfSym]*, shndx: uint16) =
     s.nameOff = 0
     addPtr[ElfSym](outSyms, s)
 
-fn elfAddSym(outSyms: seq[ElfSym]*, name: str, bind: uint8, stType: uint8,
+fn elfAddSym(outSyms: ElfSym[]*, name: str, bind: uint8, stType: uint8,
              shndx: uint16, value: uint64, size: uint64) =
     var s: ElfSym
     new s
@@ -185,18 +180,16 @@ fn elfAddSym(outSyms: seq[ElfSym]*, name: str, bind: uint8, stType: uint8,
     s.nameOff = 0
     addPtr[ElfSym](outSyms, s)
 
-fn elfFindSymIndex(syms: seq[ElfSym], name: str): int32 =
+fn elfFindSymIndex(syms: ElfSym[], name: str): int32 =
     if name == nil:
         return -1
-    var i: int32 = 0
-    while i < syms.len:
+    for i in 0..<syms.len:
         let s: ElfSym = get[ElfSym](syms, i)
         if s != nil && streq(s.name, name):
             return i
-        i = i + 1
     return -1
 
-fn rv64ReadU32LEAtSeq(buf: seq[uint8], off: uint64): uint32 =
+fn rv64ReadU32LEAtSeq(buf: uint8[], off: uint64): uint32 =
     if off + 4 > uint64(buf.len):
         return uint32(0)
     let b0: uint32 = uint32(get[uint8](buf, int32(off + 0)))
@@ -205,7 +198,7 @@ fn rv64ReadU32LEAtSeq(buf: seq[uint8], off: uint64): uint32 =
     let b3: uint32 = uint32(get[uint8](buf, int32(off + 3)))
     return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
-fn rv64EmitLoadImm32(out: seq[uint8]*, rd: int32, v: int32) =
+fn rv64EmitLoadImm32(out: uint8[]*, rd: int32, v: int32) =
     if out == nil:
         return
     if v >= -2048 && v <= 2047:
@@ -216,7 +209,7 @@ fn rv64EmitLoadImm32(out: seq[uint8]*, rd: int32, v: int32) =
     emitU32LE(out, rv64EncLui(rd, hi20))
     emitU32LE(out, rv64EncAddi(rd, rd, lo12))
 
-fn rv64EmitLoadImm64(out: seq[uint8]*, rd: int32, v: int64) =
+fn rv64EmitLoadImm64(out: uint8[]*, rd: int32, v: int64) =
     if out == nil:
         return
     if rv64FitsSigned(v, 12):
@@ -336,7 +329,7 @@ fn rv64EncodeCondBranch(cond: LirCond, rs1In: int32, rs2In: int32, deltaBytes: i
         return Err[uint32]("elf_writer_riscv64: unsupported cond")
     return rv64EncBranch(funct3, rs1, rs2, deltaBytes)
 
-fn rv64PatchCallPairAt(text: seq[uint8]*, auipcOff: uint64, placeAddr: int64, targetAddr: int64): Result[bool] =
+fn rv64PatchCallPairAt(text: uint8[]*, auipcOff: uint64, placeAddr: int64, targetAddr: int64): Result[bool] =
     if text == nil:
         return Err[bool]("elf_writer_riscv64: nil text")
     if auipcOff + 8 > uint64(text->len):
@@ -352,11 +345,11 @@ fn rv64PatchCallPairAt(text: seq[uint8]*, auipcOff: uint64, placeAddr: int64, ta
     obj_buf.bufU32At(text, int32(auipcOff + 4), rv64PatchIImm12(w1, lo12))
     return Ok[bool](true)
 
-fn elfBuild(module: LirModule): Result[seq[uint8]] =
+fn elfBuild(module: LirModule): Result[uint8[]] =
     if module == nil:
-        return Err[seq[uint8]]("elf_writer: nil module")
+        return Err[uint8[]]("elf_writer: nil module")
     if elf_targetIsDarwin(module.target):
-        return Err[seq[uint8]]("elf_writer: darwin target not supported")
+        return Err[uint8[]]("elf_writer: darwin target not supported")
 
     # Sections (fixed indices):
     # 0: null
@@ -369,28 +362,28 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
     # 7: .strtab
     # 8: .shstrtab
 
-    var text: seq[uint8] = newSeq[uint8]()
-    var rodata: seq[uint8] = newSeq[uint8]()
-    var data: seq[uint8] = newSeq[uint8]()
+    var text: uint8[]
+    var rodata: uint8[]
+    var data: uint8[]
     var bssSize: uint64 = 0
 
     # Layout rodata (cstrings).
-    var cSymOffs: seq[uint64] = newSeq[uint64](module.cstrs.len)
-    var ci: int32 = 0
-    while ci < module.cstrs.len:
+    var cSymOffs: uint64[]
+    cSymOffs.len = int(module.cstrs.len)
+    for ci in 0..<module.cstrs.len:
         let c: LirCString = get[LirCString](module.cstrs, ci)
         let off: uint64 = uint64(rodata.len)
         setPtr[uint64](&cSymOffs, ci, off)
         bufStr0(&rodata, c.value)
-        ci = ci + 1
 
     # Layout globals.
-    var dataSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
-    var bssSymOffs: seq[uint64] = newSeq[uint64](module.globals.len)
+    var dataSymOffs: uint64[]
+    dataSymOffs.len = int(module.globals.len)
+    var bssSymOffs: uint64[]
+    bssSymOffs.len = int(module.globals.len)
     var maxDataAlign: uint64 = 1
     var maxBssAlign: uint64 = 1
-    var gi: int32 = 0
-    while gi < module.globals.len:
+    for gi in 0..<module.globals.len:
         let g: LirGlobal = get[LirGlobal](module.globals, gi)
         let align: uint64 = uint64(1) << uint64(g.alignPow2)
         if g.hasInit:
@@ -408,49 +401,42 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
             bssSize = elf_alignUp(bssSize, align)
             setPtr[uint64](&bssSymOffs, gi, bssSize)
             bssSize = bssSize + uint64(g.size)
-        gi = gi + 1
 
     # Encode .text and collect relocations.
-    var relocs: seq[ElfReloc] = newSeq[ElfReloc]()
+    var relocs: ElfReloc[]
 
     # Track function start offsets.
-    var funcOffs: seq[uint64] = newSeq[uint64](module.funcs.len)
-    var fi: int32 = 0
-    while fi < module.funcs.len:
+    var funcOffs: uint64[]
+    funcOffs.len = int(module.funcs.len)
+    for fi in 0..<module.funcs.len:
         bufAlign(&text, 4)
         setPtr[uint64](&funcOffs, fi, uint64(text.len))
         let f: LirFunc = get[LirFunc](module.funcs, fi)
 
         # Pass 1: compute label offsets within this function (in bytes from func start).
-        var labels: seq[str] = newSeqWithCap[str](0, 16)
-        var labelOffs: seq[int32] = newSeqWithCap[int32](0, 16)
+        var labels: str[16]
+        var labelOffs: int32[16]
         var scanOff: int32 = 0
         var scanLastFCmpValid: bool = false
-        var si: int32 = 0
-        while si < f.insts.len:
+        for si in 0..<f.insts.len:
             let inst0: LirInst = get[LirInst](f.insts, si)
             if inst0.op == loLabel:
                 addPtr[str](&labels, inst0.label)
                 addPtr[int32](&labelOffs, scanOff)
-                si = si + 1
                 continue
             if inst0.op == loCmp:
                 scanLastFCmpValid = false
-                si = si + 1
                 continue
             if inst0.op == loFcmpD:
                 scanLastFCmpValid = true
-                si = si + 1
                 continue
             if inst0.op == loBCond:
                 if scanLastFCmpValid:
                     scanOff = scanOff + 16
                 else:
                     scanOff = scanOff + 12
-                si = si + 1
                 continue
             scanOff = scanOff + (rv64InstWordCount(inst0) * 4)
-            si = si + 1
 
         var ii: int32 = 0
         var curOff: int32 = 0
@@ -460,7 +446,9 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
         var lastFCmpValid: bool = false
         var lastFCmpFs1: int32 = 0
         var lastFCmpFs2: int32 = 0
-        while ii < f.insts.len:
+        for __for_guard_ii in 0..<f.insts.len:
+            if !(ii < f.insts.len):
+                break
             let inst: LirInst = get[LirInst](f.insts, ii)
             if inst.op == loLabel:
                 ii = ii + 1
@@ -469,7 +457,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rs1c: int32 = rv64RegNum(inst.rn)
                 let rs2c: int32 = rv64RegNum(inst.rm)
                 if rs1c < 0 || rs2c < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid cmp reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid cmp reg")
                 lastCmpValid = true
                 lastFCmpValid = false
                 lastCmpRs1 = rs1c
@@ -503,21 +491,21 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 continue
             elif inst.op == loMovReg:
                 if rv64IsFloat(inst.rd) || rv64IsFloat(inst.rn):
-                    return Err[seq[uint8]]("elf_writer_riscv64: float move not supported")
+                    return Err[uint8[]]("elf_writer_riscv64: float move not supported")
                 let rd0: int32 = rv64RegNum(inst.rd)
                 let rn0: int32 = rv64RegNum(inst.rn)
                 if rd0 < 0 || rn0 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid mov reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid mov reg")
                 emitU32LE(&text, rv64EncAddi(rd0, rn0, 0))
                 curOff = curOff + 4
                 ii = ii + 1
                 continue
             elif inst.op == loMovImm:
                 if rv64IsFloat(inst.rd):
-                    return Err[seq[uint8]]("elf_writer_riscv64: float mov imm not supported")
+                    return Err[uint8[]]("elf_writer_riscv64: float mov imm not supported")
                 let rd1: int32 = rv64RegNum(inst.rd)
                 if rd1 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid mov imm reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid mov imm reg")
                 rv64EmitLoadImm64(&text, rd1, inst.imm)
                 curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
                 ii = ii + 1
@@ -525,7 +513,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
             elif inst.op == loAdrp:
                 let rd2: int32 = rv64RegNum(inst.rd)
                 if rd2 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid pcrel_hi reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid pcrel_hi reg")
                 emitU32LE(&text, rv64EncAuipc(rd2, 0))
                 var r: ElfReloc
                 new r
@@ -541,7 +529,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd3: int32 = rv64RegNum(inst.rd)
                 let rn3: int32 = rv64RegNum(inst.rn)
                 if rd3 < 0 || rn3 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid addpageoff reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid addpageoff reg")
                 emitU32LE(&text, rv64EncAddi(rd3, rn3, 0))
                 var r2: ElfReloc
                 new r2
@@ -557,7 +545,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd4: int32 = rv64RegNum(inst.rd)
                 let rn4: int32 = rv64RegNum(inst.rn)
                 if rd4 < 0 || rn4 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid sxtw reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid sxtw reg")
                 emitU32LE(&text, rv64EncAddiw(rd4, rn4, 0))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -567,7 +555,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn5: int32 = rv64RegNum(inst.rn)
                 let rm5: int32 = rv64RegNum(inst.rm)
                 if rd5 < 0 || rn5 < 0 || rm5 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid add reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid add reg")
                 emitU32LE(&text, rv64EncAdd(rd5, rn5, rm5))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -577,7 +565,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn6: int32 = rv64RegNum(inst.rn)
                 let rm6: int32 = rv64RegNum(inst.rm)
                 if rd6 < 0 || rn6 < 0 || rm6 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid sub reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid sub reg")
                 emitU32LE(&text, rv64EncSub(rd6, rn6, rm6))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -587,7 +575,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn7: int32 = rv64RegNum(inst.rn)
                 let rm7: int32 = rv64RegNum(inst.rm)
                 if rd7 < 0 || rn7 < 0 || rm7 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid mul reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid mul reg")
                 emitU32LE(&text, rv64EncMul(rd7, rn7, rm7))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -597,7 +585,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn8: int32 = rv64RegNum(inst.rn)
                 let rm8: int32 = rv64RegNum(inst.rm)
                 if rd8 < 0 || rn8 < 0 || rm8 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid sdiv reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid sdiv reg")
                 emitU32LE(&text, rv64EncDiv(rd8, rn8, rm8))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -607,7 +595,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn9: int32 = rv64RegNum(inst.rn)
                 let rm9: int32 = rv64RegNum(inst.rm)
                 if rd9 < 0 || rn9 < 0 || rm9 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid udiv reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid udiv reg")
                 emitU32LE(&text, rv64EncDivu(rd9, rn9, rm9))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -618,7 +606,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rm10: int32 = rv64RegNum(inst.rm)
                 let ra10: int32 = rv64RegNum(inst.ra)
                 if rd10 < 0 || rn10 < 0 || rm10 < 0 || ra10 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid msub reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid msub reg")
                 emitU32LE(&text, rv64EncMul(rv64Tmp1(), rn10, rm10))
                 emitU32LE(&text, rv64EncSub(rd10, ra10, rv64Tmp1()))
                 curOff = curOff + 8
@@ -629,7 +617,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn11: int32 = rv64RegNum(inst.rn)
                 let rm11: int32 = rv64RegNum(inst.rm)
                 if rd11 < 0 || rn11 < 0 || rm11 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid and reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid and reg")
                 emitU32LE(&text, rv64EncAnd(rd11, rn11, rm11))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -639,7 +627,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn12: int32 = rv64RegNum(inst.rn)
                 let rm12: int32 = rv64RegNum(inst.rm)
                 if rd12 < 0 || rn12 < 0 || rm12 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid or reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid or reg")
                 emitU32LE(&text, rv64EncOr(rd12, rn12, rm12))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -649,7 +637,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn13: int32 = rv64RegNum(inst.rn)
                 let rm13: int32 = rv64RegNum(inst.rm)
                 if rd13 < 0 || rn13 < 0 || rm13 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid xor reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid xor reg")
                 emitU32LE(&text, rv64EncXor(rd13, rn13, rm13))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -659,7 +647,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn14: int32 = rv64RegNum(inst.rn)
                 let rm14: int32 = rv64RegNum(inst.rm)
                 if rd14 < 0 || rn14 < 0 || rm14 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid shl reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid shl reg")
                 emitU32LE(&text, rv64EncSll(rd14, rn14, rm14))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -669,7 +657,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn15: int32 = rv64RegNum(inst.rn)
                 let rm15: int32 = rv64RegNum(inst.rm)
                 if rd15 < 0 || rn15 < 0 || rm15 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid lsr reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid lsr reg")
                 emitU32LE(&text, rv64EncSrl(rd15, rn15, rm15))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -679,7 +667,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rn16: int32 = rv64RegNum(inst.rn)
                 let rm16: int32 = rv64RegNum(inst.rm)
                 if rd16 < 0 || rn16 < 0 || rm16 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid asr reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid asr reg")
                 emitU32LE(&text, rv64EncSra(rd16, rn16, rm16))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -688,7 +676,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fd0: int32 = rv64FRegNum(inst.rd)
                 let rsx0: int32 = rv64RegNum(inst.rn)
                 if fd0 < 0 || rsx0 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fmov.d.x reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fmov.d.x reg")
                 emitU32LE(&text, rv64EncFmvDX(fd0, rsx0))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -697,7 +685,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rdx0: int32 = rv64RegNum(inst.rd)
                 let fsx0: int32 = rv64FRegNum(inst.rn)
                 if rdx0 < 0 || fsx0 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fmov.x.d reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fmov.x.d reg")
                 emitU32LE(&text, rv64EncFmvXD(rdx0, fsx0))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -707,7 +695,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fs1a: int32 = rv64FRegNum(inst.rn)
                 let fs2a: int32 = rv64FRegNum(inst.rm)
                 if fd1 < 0 || fs1a < 0 || fs2a < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fadd.d reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fadd.d reg")
                 emitU32LE(&text, rv64EncFaddD(fd1, fs1a, fs2a))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -717,7 +705,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fs1b: int32 = rv64FRegNum(inst.rn)
                 let fs2b: int32 = rv64FRegNum(inst.rm)
                 if fd2 < 0 || fs1b < 0 || fs2b < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fsub.d reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fsub.d reg")
                 emitU32LE(&text, rv64EncFsubD(fd2, fs1b, fs2b))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -727,7 +715,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fs1c: int32 = rv64FRegNum(inst.rn)
                 let fs2c: int32 = rv64FRegNum(inst.rm)
                 if fd3 < 0 || fs1c < 0 || fs2c < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fmul.d reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fmul.d reg")
                 emitU32LE(&text, rv64EncFmulD(fd3, fs1c, fs2c))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -737,7 +725,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fs1d: int32 = rv64FRegNum(inst.rn)
                 let fs2d: int32 = rv64FRegNum(inst.rm)
                 if fd4 < 0 || fs1d < 0 || fs2d < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fdiv.d reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fdiv.d reg")
                 emitU32LE(&text, rv64EncFdivD(fd4, fs1d, fs2d))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -746,7 +734,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fd5: int32 = rv64FRegNum(inst.rd)
                 let fs1e: int32 = rv64FRegNum(inst.rn)
                 if fd5 < 0 || fs1e < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fneg.d reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fneg.d reg")
                 emitU32LE(&text, rv64EncFnegD(fd5, fs1e))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -755,7 +743,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fd6: int32 = rv64FRegNum(inst.rd)
                 let rsx6: int32 = rv64RegNum(inst.rn)
                 if fd6 < 0 || rsx6 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fcvt.d.l reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fcvt.d.l reg")
                 emitU32LE(&text, rv64EncScvtfDx(fd6, rsx6))
                 curOff = curOff + 4
                 ii = ii + 1
@@ -764,7 +752,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let fsCmp0: int32 = rv64FRegNum(inst.rn)
                 let fsCmp1: int32 = rv64FRegNum(inst.rm)
                 if fsCmp0 < 0 || fsCmp1 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid fcmp.d reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fcmp.d reg")
                 lastCmpValid = false
                 lastFCmpValid = true
                 lastFCmpFs1 = fsCmp0
@@ -774,7 +762,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
             elif inst.op == loBCond:
                 let toffRes: Result[int32] = elf_findLabelOff(labels, labelOffs, inst.label)
                 if !IsOk[int32](toffRes):
-                    return ErrInfo[seq[uint8]](ErrorInfoOf[int32](toffRes))
+                    return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes))
                 let targetOff: int32 = Value[int32](toffRes)
                 if lastFCmpValid:
                     let tmpBool: int32 = rv64Tmp1()
@@ -798,47 +786,47 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                         emitU32LE(&text, rv64EncFleD(tmpBool, lastFCmpFs2, lastFCmpFs1))
                         skipCondF = lcEq
                     else:
-                        return Err[seq[uint8]]("elf_writer_riscv64: unsupported float bcond")
+                        return Err[uint8[]]("elf_writer_riscv64: unsupported float bcond")
                     let skipResF: Result[uint32] = rv64EncodeCondBranch(skipCondF, tmpBool, 0, int64(12))
                     if !IsOk[uint32](skipResF):
-                        return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](skipResF))
+                        return ErrInfo[uint8[]](ErrorInfoOf[uint32](skipResF))
                     emitU32LE(&text, Value[uint32](skipResF))
                     emitU32LE(&text, rv64EncAuipc(rv64Tmp0(), 0))
                     emitU32LE(&text, rv64EncJalr(0, rv64Tmp0(), 0))
                     let patchResF: Result[bool] = rv64PatchCallPairAt(&text, off + uint64(8), int64(curOff + 8), int64(targetOff))
                     if !IsOk[bool](patchResF):
-                        return ErrInfo[seq[uint8]](ErrorInfoOf[bool](patchResF))
+                        return ErrInfo[uint8[]](ErrorInfoOf[bool](patchResF))
                     curOff = curOff + 16
                 else:
                     if !lastCmpValid:
-                        return Err[seq[uint8]]("elf_writer_riscv64: bcond missing cmp")
+                        return Err[uint8[]]("elf_writer_riscv64: bcond missing cmp")
                     let invRes: Result[LirCond] = rv64InvertCond(inst.cond)
                     if !IsOk[LirCond](invRes):
-                        return ErrInfo[seq[uint8]](ErrorInfoOf[LirCond](invRes))
+                        return ErrInfo[uint8[]](ErrorInfoOf[LirCond](invRes))
                     let skipRes: Result[uint32] = rv64EncodeCondBranch(Value[LirCond](invRes),
                                                                        lastCmpRs1, lastCmpRs2,
                                                                        int64(12))
                     if !IsOk[uint32](skipRes):
-                        return ErrInfo[seq[uint8]](ErrorInfoOf[uint32](skipRes))
+                        return ErrInfo[uint8[]](ErrorInfoOf[uint32](skipRes))
                     emitU32LE(&text, Value[uint32](skipRes))
                     emitU32LE(&text, rv64EncAuipc(rv64Tmp0(), 0))
                     emitU32LE(&text, rv64EncJalr(0, rv64Tmp0(), 0))
                     let patchRes0: Result[bool] = rv64PatchCallPairAt(&text, off + uint64(4), int64(curOff + 4), int64(targetOff))
                     if !IsOk[bool](patchRes0):
-                        return ErrInfo[seq[uint8]](ErrorInfoOf[bool](patchRes0))
+                        return ErrInfo[uint8[]](ErrorInfoOf[bool](patchRes0))
                     curOff = curOff + 12
                 ii = ii + 1
                 continue
             elif inst.op == loB:
                 let toffRes2: Result[int32] = elf_findLabelOff(labels, labelOffs, inst.label)
                 if !IsOk[int32](toffRes2):
-                    return ErrInfo[seq[uint8]](ErrorInfoOf[int32](toffRes2))
+                    return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes2))
                 let targetOff2: int32 = Value[int32](toffRes2)
                 emitU32LE(&text, rv64EncAuipc(rv64Tmp0(), 0))
                 emitU32LE(&text, rv64EncJalr(0, rv64Tmp0(), 0))
                 let patchRes1: Result[bool] = rv64PatchCallPairAt(&text, off, int64(curOff), int64(targetOff2))
                 if !IsOk[bool](patchRes1):
-                    return ErrInfo[seq[uint8]](ErrorInfoOf[bool](patchRes1))
+                    return ErrInfo[uint8[]](ErrorInfoOf[bool](patchRes1))
                 curOff = curOff + 8
                 ii = ii + 1
                 continue
@@ -846,7 +834,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd17: int32 = rv64RegNum(inst.rd)
                 let rn17: int32 = rv64RegNum(inst.rn)
                 if rd17 < 0 || rn17 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid str reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid str reg")
                 if rv64Imm12Fits(inst.imm):
                     if rv64Is32(inst.rd):
                         emitU32LE(&text, rv64EncSw(rd17, rn17, int32(inst.imm)))
@@ -868,7 +856,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd18: int32 = rv64RegNum(inst.rd)
                 let rn18: int32 = rv64RegNum(inst.rn)
                 if rd18 < 0 || rn18 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid ldr reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldr reg")
                 if rv64Imm12Fits(inst.imm):
                     if rv64Is32(inst.rd):
                         emitU32LE(&text, rv64EncLw(rd18, rn18, int32(inst.imm)))
@@ -890,7 +878,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd19: int32 = rv64RegNum(inst.rd)
                 let rn19: int32 = rv64RegNum(inst.rn)
                 if rd19 < 0 || rn19 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid strb reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid strb reg")
                 if rv64Imm12Fits(inst.imm):
                     emitU32LE(&text, rv64EncSb(rd19, rn19, int32(inst.imm)))
                     curOff = curOff + 4
@@ -906,7 +894,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd20: int32 = rv64RegNum(inst.rd)
                 let rn20: int32 = rv64RegNum(inst.rn)
                 if rd20 < 0 || rn20 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid ldrb reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrb reg")
                 if rv64Imm12Fits(inst.imm):
                     emitU32LE(&text, rv64EncLbu(rd20, rn20, int32(inst.imm)))
                     curOff = curOff + 4
@@ -922,7 +910,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd21: int32 = rv64RegNum(inst.rd)
                 let rn21: int32 = rv64RegNum(inst.rn)
                 if rd21 < 0 || rn21 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid ldrsb reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrsb reg")
                 if rv64Imm12Fits(inst.imm):
                     emitU32LE(&text, rv64EncLb(rd21, rn21, int32(inst.imm)))
                     curOff = curOff + 4
@@ -938,7 +926,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd22: int32 = rv64RegNum(inst.rd)
                 let rn22: int32 = rv64RegNum(inst.rn)
                 if rd22 < 0 || rn22 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid strh reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid strh reg")
                 if rv64Imm12Fits(inst.imm):
                     emitU32LE(&text, rv64EncSh(rd22, rn22, int32(inst.imm)))
                     curOff = curOff + 4
@@ -954,7 +942,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd23: int32 = rv64RegNum(inst.rd)
                 let rn23: int32 = rv64RegNum(inst.rn)
                 if rd23 < 0 || rn23 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid ldrh reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrh reg")
                 if rv64Imm12Fits(inst.imm):
                     emitU32LE(&text, rv64EncLhu(rd23, rn23, int32(inst.imm)))
                     curOff = curOff + 4
@@ -970,7 +958,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
                 let rd24: int32 = rv64RegNum(inst.rd)
                 let rn24: int32 = rv64RegNum(inst.rn)
                 if rd24 < 0 || rn24 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid ldrsh reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrsh reg")
                 if rv64Imm12Fits(inst.imm):
                     emitU32LE(&text, rv64EncLh(rd24, rn24, int32(inst.imm)))
                     curOff = curOff + 4
@@ -998,24 +986,23 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
             elif inst.op == loBlr:
                 let rn25: int32 = rv64RegNum(inst.rn)
                 if rn25 < 0:
-                    return Err[seq[uint8]]("elf_writer_riscv64: invalid blr reg")
+                    return Err[uint8[]]("elf_writer_riscv64: invalid blr reg")
                 emitU32LE(&text, rv64EncJalr(1, rn25, 0))
                 curOff = curOff + 4
                 ii = ii + 1
                 continue
             elif rv64IsFloatOp(inst.op):
-                return Err[seq[uint8]]("elf_writer_riscv64: float lir op unsupported in riscv64 writer")
+                return Err[uint8[]]("elf_writer_riscv64: float lir op unsupported in riscv64 writer")
             elif inst.op == loRet:
                 emitU32LE(&text, rv64EncJalr(0, 1, 0))
                 curOff = curOff + 4
                 ii = ii + 1
                 continue
             else:
-                return Err[seq[uint8]]("elf_writer_riscv64: unsupported lir op (op=" + intToStr(int32(inst.op)) + ")")
-        fi = fi + 1
+                return Err[uint8[]]("elf_writer_riscv64: unsupported lir op (op=" + intToStr(int32(inst.op)) + ")")
 
     # Build symbol list.
-    var syms: seq[ElfSym] = newSeq[ElfSym]()
+    var syms: ElfSym[]
     # null
     elfAddSym(&syms, "", STB_LOCAL, STT_NOTYPE, uint16(0), 0, 0)
     # section symbols
@@ -1025,24 +1012,19 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
     elfAddSectionSym(&syms, uint16(4))
 
     # local rodata symbols
-    ci = 0
-    while ci < module.cstrs.len:
+    for ci in 0..<module.cstrs.len:
         let c2: LirCString = get[LirCString](module.cstrs, ci)
         elfAddSym(&syms, c2.label, STB_LOCAL, STT_OBJECT, uint16(2),
                   get[uint64](cSymOffs, ci), 0)
-        ci = ci + 1
 
     # globals: funcs
-    fi = 0
-    while fi < module.funcs.len:
+    for fi in 0..<module.funcs.len:
         let f2: LirFunc = get[LirFunc](module.funcs, fi)
         elfAddSym(&syms, f2.name, STB_GLOBAL, STT_FUNC, uint16(1),
                   get[uint64](funcOffs, fi), 0)
-        fi = fi + 1
 
     # globals: data/bss
-    gi = 0
-    while gi < module.globals.len:
+    for gi in 0..<module.globals.len:
         let g2: LirGlobal = get[LirGlobal](module.globals, gi)
         if g2.hasInit:
             elfAddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(3),
@@ -1050,28 +1032,22 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
         else:
             elfAddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(4),
                       get[uint64](bssSymOffs, gi), uint64(g2.size))
-        gi = gi + 1
 
     # undefined symbols referenced by relocations.
-    var undefs: seq[str] = newSeq[str]()
-    var ri: int32 = 0
-    while ri < relocs.len:
+    var undefs: str[]
+    for ri in 0..<relocs.len:
         let r0: ElfReloc = get[ElfReloc](relocs, ri)
         if r0 != nil && r0.sym != nil && len(r0.sym) > 0:
             if elfFindSymIndex(syms, r0.sym) < 0:
                 elf_seqAddUniqueStr(&undefs, r0.sym)
-        ri = ri + 1
     elf_sortStringsStable(&undefs)
-    ri = 0
-    while ri < undefs.len:
+    for ri in 0..<undefs.len:
         elfAddSym(&syms, get[str](undefs, ri), STB_GLOBAL, STT_NOTYPE, uint16(0), 0, 0)
-        ri = ri + 1
 
     # Build .strtab (symbol names) and fill nameOff.
-    var strtab: seq[uint8] = newSeq[uint8]()
+    var strtab: uint8[]
     addPtr[uint8](&strtab, uint8(0))
-    var si: int32 = 0
-    while si < syms.len:
+    for si in 0..<syms.len:
         let s3: ElfSym = get[ElfSym](syms, si)
         if s3 != nil && s3.name != nil && len(s3.name) > 0:
             s3.nameOff = uint32(strtab.len)
@@ -1079,21 +1055,17 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
         else:
             s3.nameOff = 0
         setPtr[ElfSym](&syms, si, s3)
-        si = si + 1
 
     # Count locals for symtab.sh_info (first global index).
     var localCount: uint32 = 0
-    si = 0
-    while si < syms.len:
+    for si in 0..<syms.len:
         let s4: ElfSym = get[ElfSym](syms, si)
         if s4 != nil && s4.bind == STB_LOCAL:
             localCount = localCount + 1
-        si = si + 1
 
     # Build .symtab
-    var symtab: seq[uint8] = newSeq[uint8]()
-    si = 0
-    while si < syms.len:
+    var symtab: uint8[]
+    for si in 0..<syms.len:
         let s5: ElfSym = get[ElfSym](syms, si)
         let info: uint8 = uint8((uint8(s5.bind) << 4) | uint8(s5.stType & uint8(0xF)))
         bufU32(&symtab, s5.nameOff)
@@ -1102,16 +1074,17 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
         bufU16(&symtab, s5.shndx)
         bufU64(&symtab, s5.value)
         bufU64(&symtab, s5.size)
-        si = si + 1
 
     # Build .rela.text
-    var relaText: seq[uint8] = newSeq[uint8]()
+    var relaText: uint8[]
     ri = 0
-    while ri < relocs.len:
+    let __for_start_ri_1 = ri
+    for __for_ri_1 in __for_start_ri_1..<relocs.len:
+        ri = __for_ri_1
         let r4: ElfReloc = get[ElfReloc](relocs, ri)
         let symIdx: int32 = elfFindSymIndex(syms, r4.sym)
         if symIdx < 0:
-            return Err[seq[uint8]]("elf_writer: missing relocation symbol")
+            return Err[uint8[]]("elf_writer: missing relocation symbol")
         let info2: uint64 = (uint64(uint32(symIdx)) << 32) | uint64(r4.rtype)
         bufU64(&relaText, r4.off)
         bufU64(&relaText, info2)
@@ -1119,7 +1092,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
         ri = ri + 1
 
     # Build .shstrtab
-    var shstrtab: seq[uint8] = newSeq[uint8]()
+    var shstrtab: uint8[]
     addPtr[uint8](&shstrtab, uint8(0))
     let sh_text: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".text")
     let sh_rodata: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".rodata")
@@ -1144,7 +1117,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
     let shOff: uint64 = elf_alignUp(off, 8)
 
     # Build final file.
-    var out: seq[uint8] = newSeq[uint8]()
+    var out: uint8[]
 
     # ELF header (64 bytes).
     bufU8(&out, uint8(0x7F))
@@ -1157,10 +1130,8 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
     bufU8(&out, uint8(0)) # EI_OSABI
     bufU8(&out, uint8(0)) # EI_ABIVERSION
     # padding (7)
-    var pad: int32 = 0
-    while pad < 7:
+    for pad in 0..<7:
         bufU8(&out, uint8(0))
-        pad = pad + 1
     bufU16(&out, ET_REL)
     bufU16(&out, EM_RISCV)
     bufU32(&out, EV_CURRENT)
@@ -1178,47 +1149,47 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
     # Sections data.
     bufAlign(&out, 4)
     if uint64(out.len) != textOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.text)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.text)")
     bufBytes(&out, text)
 
     bufAlign(&out, 1)
     if uint64(out.len) != rodataOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.rodata)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.rodata)")
     bufBytes(&out, rodata)
 
     bufAlign(&out, maxDataAlign)
     if uint64(out.len) != dataOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.data)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.data)")
     bufBytes(&out, data)
 
     # .bss: no bytes, but keep alignment point.
     bufAlign(&out, maxBssAlign)
     if uint64(out.len) != bssOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.bss)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.bss)")
 
     bufAlign(&out, 8)
     if uint64(out.len) != relaOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.rela.text)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.rela.text)")
     bufBytes(&out, relaText)
 
     bufAlign(&out, 8)
     if uint64(out.len) != symOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.symtab)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.symtab)")
     bufBytes(&out, symtab)
 
     bufAlign(&out, 1)
     if uint64(out.len) != strOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.strtab)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.strtab)")
     bufBytes(&out, strtab)
 
     bufAlign(&out, 1)
     if uint64(out.len) != shstrOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (.shstrtab)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.shstrtab)")
     bufBytes(&out, shstrtab)
 
     bufAlign(&out, 8)
     if uint64(out.len) != shOff:
-        return Err[seq[uint8]]("elf_writer: internal offset mismatch (shoff)")
+        return Err[uint8[]]("elf_writer: internal offset mismatch (shoff)")
 
     # [0] null
     elfWriteShdr(&out, uint32(0), SHT_NULL, uint64(0), uint64(0), uint64(0),
@@ -1248,7 +1219,7 @@ fn elfBuild(module: LirModule): Result[seq[uint8]] =
     elfWriteShdr(&out, sh_shstrtab, SHT_STRTAB, uint64(0), shstrOff, uint64(shstrtab.len),
                  uint32(0), uint32(0), uint64(1), uint64(0))
 
-    return Ok[seq[uint8]](out)
+    return Ok[uint8[]](out)
 
-fn elfWriteRiscv64RelocatableObj(module: LirModule): Result[seq[uint8]] =
+fn elfWriteRiscv64RelocatableObj(module: LirModule): Result[uint8[]] =
     return elfBuild(module)

@@ -96,21 +96,22 @@ typedef struct ChengPtrMap {
 
 static ChengPtrMap cheng_block_map = {NULL, NULL, 0, 0, 0};
 static const uintptr_t cheng_ptrmap_tomb = 1;
+static const size_t cheng_ptrmap_init_cap = 65536;
 
-static uintptr_t cheng_ptr_hash(uintptr_t v) {
+static inline uintptr_t cheng_ptr_hash(uintptr_t v) {
 #if UINTPTR_MAX > 0xffffffffu
+    // Fast pointer hash: ignore alignment bits, then mix with one multiply.
+    // This is cheaper than a full finalizer but distributes sequential allocs well.
+    v >>= 3;
     v ^= v >> 33;
     v *= (uintptr_t)0xff51afd7ed558ccdULL;
     v ^= v >> 33;
-    v *= (uintptr_t)0xc4ceb9fe1a85ec53ULL;
-    v ^= v >> 33;
     return v;
 #else
+    v >>= 2;
     v ^= v >> 16;
     v *= (uintptr_t)0x7feb352dU;
     v ^= v >> 15;
-    v *= (uintptr_t)0x846ca68bU;
-    v ^= v >> 16;
     return v;
 #endif
 }
@@ -141,7 +142,7 @@ static void cheng_ptrmap_grow(void) {
     size_t oldcap = cheng_block_map.cap;
     uintptr_t* oldkeys = cheng_block_map.keys;
     ChengMemBlock** oldvals = cheng_block_map.vals;
-    size_t newcap = oldcap ? oldcap * 2 : 1024;
+    size_t newcap = oldcap ? oldcap * 2 : cheng_ptrmap_init_cap;
     size_t n = 1;
     while (n < newcap) {
         n <<= 1;
@@ -159,12 +160,12 @@ static void cheng_ptrmap_grow(void) {
     cheng_block_map.count = 0;
     cheng_block_map.tombs = 0;
     if (oldkeys != NULL) {
+        size_t mask = cheng_block_map.cap - 1;
         for (size_t i = 0; i < oldcap; i++) {
             uintptr_t k = oldkeys[i];
             if (k > cheng_ptrmap_tomb) {
                 ChengMemBlock* val = oldvals[i];
                 if (val != NULL) {
-                    size_t mask = cheng_block_map.cap - 1;
                     size_t idx = (size_t)(cheng_ptr_hash(k) & mask);
                     for (;;) {
                         uintptr_t cur = cheng_block_map.keys[idx];
@@ -215,7 +216,7 @@ static void cheng_ptrmap_put(void* key, ChengMemBlock* val) {
         return;
     }
     if (cheng_block_map.cap == 0) {
-        cheng_ptrmap_init(1024);
+        cheng_ptrmap_init(cheng_ptrmap_init_cap);
         if (cheng_block_map.cap == 0) {
             return;
         }
@@ -802,6 +803,65 @@ int32_t cheng_chan_i32_recv(ChengChanI32* ch, int32_t* out) {
     return 1;
 }
 
+void spawn(void* fn_ptr, void* ctx) {
+    cheng_spawn(fn_ptr, ctx);
+}
+
+int32_t schedPending(void) {
+    return cheng_sched_pending();
+}
+
+int32_t schedRunOnce(void) {
+    return cheng_sched_run_once();
+}
+
+void schedRun(void) {
+    cheng_sched_run();
+}
+
+void* asyncPendingI32(void) {
+    return cheng_async_pending_i32();
+}
+
+void* asyncReadyI32(int32_t value) {
+    return cheng_async_ready_i32(value);
+}
+
+void asyncSetI32(void* state, int32_t value) {
+    cheng_async_set_i32((ChengAwaitI32*)state, value);
+}
+
+int32_t awaitI32(void* state) {
+    return cheng_await_i32((ChengAwaitI32*)state);
+}
+
+void* asyncPendingVoid(void) {
+    return cheng_async_pending_void();
+}
+
+void* asyncReadyVoid(void) {
+    return cheng_async_ready_void();
+}
+
+void asyncSetVoid(void* state) {
+    cheng_async_set_void((ChengAwaitVoid*)state);
+}
+
+void awaitVoid(void* state) {
+    cheng_await_void((ChengAwaitVoid*)state);
+}
+
+void* chanI32New(int32_t cap) {
+    return cheng_chan_i32_new(cap);
+}
+
+int32_t chanI32Send(void* ch, int32_t value) {
+    return cheng_chan_i32_send((ChengChanI32*)ch, value);
+}
+
+int32_t chanI32Recv(void* ch, int32_t* out) {
+    return cheng_chan_i32_recv((ChengChanI32*)ch, out);
+}
 
 #include <stdio.h>
 #include <string.h>
@@ -1020,6 +1080,42 @@ void* cheng_realloc(void* p, int32_t size) {
         size = 1;
     }
     ChengMemBlock* block = ((ChengMemBlock*)p) - 1;
+    // Copy-on-write for shared blocks (rc>1). In-place `realloc` would invalidate
+    // other aliases and can lead to heap corruption when sequences are copied
+    // and later grown.
+    if (!cheng_mm_is_disabled()) {
+        int32_t rc = cheng_mm_atomic_enabled() ? __atomic_load_n(&block->rc, __ATOMIC_RELAXED) : block->rc;
+        if (rc > 1) {
+            size_t total_new = sizeof(ChengMemBlock) + (size_t)size;
+            ChengMemBlock* fresh = (ChengMemBlock*)malloc(total_new);
+            if (!fresh) {
+                return NULL;
+            }
+            fresh->size = (size_t)size;
+            fresh->rc = 1;
+            ChengMemScope* scope = block->scope ? block->scope : cheng_mem_current();
+            cheng_mem_link(scope, fresh);
+            void* out = (void*)(fresh + 1);
+            size_t copy = block->size;
+            if (copy > (size_t)size) {
+                copy = (size_t)size;
+            }
+            if (copy > 0) {
+                memcpy(out, p, copy);
+            }
+            cheng_ptrmap_put(out, fresh);
+            if (cheng_mm_atomic_enabled()) {
+                (void)__atomic_fetch_sub(&block->rc, 1, __ATOMIC_RELEASE);
+            } else {
+                if (block->rc > 0) {
+                    block->rc -= 1;
+                }
+            }
+            cheng_mm_alloc_total += 1;
+            cheng_mm_live_total += 1;
+            return out;
+        }
+    }
     size_t total = sizeof(ChengMemBlock) + (size_t)size;
     ChengMemBlock* resized = (ChengMemBlock*)realloc(block, total);
     if (!resized) {

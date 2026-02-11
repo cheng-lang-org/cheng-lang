@@ -1,0 +1,117 @@
+# SHA-1 digest.
+
+import std/rawbytes
+import std/system
+fn sha1U32Mask(): int64 =
+    return (int64(1) << 32) - 1
+
+fn sha1U32(x: int64): int64 =
+    return x & sha1U32Mask()
+
+fn sha1U32FromBytes(b0: int32, b1: int32, b2: int32, b3: int32): int64 =
+    return (int64(b0) << 24) | (int64(b1) << 16) | (int64(b2) << 8) | int64(b3)
+
+fn sha1Rotl32(x: int64, n: int32): int64 =
+    let v: int64 = sha1U32(x)
+    return sha1U32((v << n) | (v >> (32 - n)))
+
+fn sha1GetU32BE(data: Bytes, offset: int32): int64 =
+    let b0: int64 = int64(bytesGet(data, offset))
+    let b1: int64 = int64(bytesGet(data, offset + 1))
+    let b2: int64 = int64(bytesGet(data, offset + 2))
+    let b3: int64 = int64(bytesGet(data, offset + 3))
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+fn sha1SetU32BE(data: Bytes, offset: int32, value: int64) =
+    let v: int64 = sha1U32(value)
+    bytesSet(data, offset, int32((v >> 24) & 255))
+    bytesSet(data, offset + 1, int32((v >> 16) & 255))
+    bytesSet(data, offset + 2, int32((v >> 8) & 255))
+    bytesSet(data, offset + 3, int32(v & 255))
+
+fn sha1Digest(data: Bytes): Bytes =
+    var h0: int64 = sha1U32FromBytes(0x67, 0x45, 0x23, 0x01)
+    var h1: int64 = sha1U32FromBytes(0xef, 0xcd, 0xab, 0x89)
+    var h2: int64 = sha1U32FromBytes(0x98, 0xba, 0xdc, 0xfe)
+    var h3: int64 = sha1U32FromBytes(0x10, 0x32, 0x54, 0x76)
+    var h4: int64 = sha1U32FromBytes(0xc3, 0xd2, 0xe1, 0xf0)
+
+    let inputLen: int32 = bytesLen(data)
+    var padZero: int32 = 0
+    while ((inputLen + 1 + padZero) % 64) != 56:
+        padZero = padZero + 1
+    let totalLen: int32 = inputLen + 1 + padZero + 8
+    let msg: Bytes = bytesAlloc(totalLen)
+    if inputLen > 0:
+        copyMem(msg.data, data.data, inputLen)
+    bytesSet(msg, inputLen, 0x80)
+    var bitLen: int64 = int64(inputLen) * 8
+    for i in 0..<8:
+        bytesSet(msg, totalLen - 1 - i, int32(bitLen & 255))
+        bitLen = bitLen >> 8
+
+    let wbuf: Bytes = bytesAlloc(80 * 4)
+    var offset: int32 = 0
+    while offset < totalLen:
+        for t in 0..<16:
+            let word: int64 = sha1GetU32BE(msg, offset + t * 4)
+            sha1SetU32BE(wbuf, t * 4, word)
+        t = 16
+        let __for_start_t_1 = t
+        for __for_t_1 in __for_start_t_1..<80:
+            t = __for_t_1
+            let w3: int64 = sha1GetU32BE(wbuf, (t - 3) * 4)
+            let w8: int64 = sha1GetU32BE(wbuf, (t - 8) * 4)
+            let w14: int64 = sha1GetU32BE(wbuf, (t - 14) * 4)
+            let w16: int64 = sha1GetU32BE(wbuf, (t - 16) * 4)
+            let next: int64 = sha1Rotl32(w3 ^ w8 ^ w14 ^ w16, 1)
+            sha1SetU32BE(wbuf, t * 4, next)
+            t = t + 1
+
+        var a: int64 = h0
+        var b: int64 = h1
+        var c: int64 = h2
+        var d: int64 = h3
+        var e: int64 = h4
+
+        t = 0
+        let __for_start_t_2 = t
+        for __for_t_2 in __for_start_t_2..<80:
+            t = __for_t_2
+            let wt: int64 = sha1GetU32BE(wbuf, t * 4)
+            var f: int64 = 0
+            var k: int64 = 0
+            if t < 20:
+                f = sha1U32((b & c) | (sha1U32(b ^ sha1U32Mask()) & d))
+                k = sha1U32FromBytes(0x5a, 0x82, 0x79, 0x99)
+            elif t < 40:
+                f = sha1U32(b ^ c ^ d)
+                k = sha1U32FromBytes(0x6e, 0xd9, 0xeb, 0xa1)
+            elif t < 60:
+                f = sha1U32((b & c) | (b & d) | (c & d))
+                k = sha1U32FromBytes(0x8f, 0x1b, 0xbc, 0xdc)
+            else:
+                f = sha1U32(b ^ c ^ d)
+                k = sha1U32FromBytes(0xca, 0x62, 0xc1, 0xd6)
+            let temp: int64 = sha1U32(sha1Rotl32(a, 5) + f + e + k + wt)
+            e = d
+            d = c
+            c = sha1Rotl32(b, 30)
+            b = a
+            a = temp
+            t = t + 1
+
+        h0 = sha1U32(h0 + a)
+        h1 = sha1U32(h1 + b)
+        h2 = sha1U32(h2 + c)
+        h3 = sha1U32(h3 + d)
+        h4 = sha1U32(h4 + e)
+        offset = offset + 64
+
+    let out: Bytes = bytesAlloc(20)
+    sha1SetU32BE(out, 0, h0)
+    sha1SetU32BE(out, 4, h1)
+    sha1SetU32BE(out, 8, h2)
+    sha1SetU32BE(out, 12, h3)
+    sha1SetU32BE(out, 16, h4)
+    return out

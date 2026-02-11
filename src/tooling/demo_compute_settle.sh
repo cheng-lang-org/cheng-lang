@@ -6,6 +6,9 @@ MODE="local"
 EPOCH="1"
 CLEAN="0"
 RESET_LEDGER="0"
+SETTLEMENT_BUDGET="2.0"
+RWAD_CHAIN_ROOT="${RWAD_CHAIN_ROOT:-/Users/lbcheng/.cheng-packages/RWAD-blockchain}"
+ALLOW_MISSING_RWAD="0"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -23,6 +26,15 @@ while [ $# -gt 0 ]; do
       ;;
     --reset-ledger)
       RESET_LEDGER="1"
+      ;;
+    --points-budget:*)
+      SETTLEMENT_BUDGET="${1#--points-budget:}"
+      ;;
+    --settlement-budget:*)
+      SETTLEMENT_BUDGET="${1#--settlement-budget:}"
+      ;;
+    --allow-missing-rwad)
+      ALLOW_MISSING_RWAD="1"
       ;;
     *)
       echo "unknown arg: $1" 1>&2
@@ -46,41 +58,101 @@ if [ "$RESET_LEDGER" = "1" ] && [ -f "$LEDGER" ]; then
   rm -f "$LEDGER"
 fi
 
+runtime_ok="1"
+set +e
 req_out="$(./cheng_storage exec --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --requester:node:app-1 \
   --gpu_ms:120000 --gpu_mem_bytes:8589934592 --gpu_count:1 --gpu_type:A10G --workload:infer \
-  --price_gpu:0.00002 --price_gpu_mem:0.15 --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE")"
-req_id="$(printf '%s' "$req_out" | sed -n 's/^exec ok: //p')"
-if [ -z "${req_id:-}" ]; then
-  echo "demo: missing request id" 1>&2
-  exit 1
+  --price_gpu:0.00002 --price_gpu_mem:0.15 --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE" 2>/dev/null)"
+if [ $? -ne 0 ]; then
+  runtime_ok="0"
+fi
+set -e
+
+if [ "$runtime_ok" = "1" ]; then
+  req_id="$(printf '%s' "$req_out" | sed -n 's/^exec ok: //p')"
+  if [ -z "${req_id:-}" ]; then
+    runtime_ok="0"
+  fi
 fi
 
-usage_out="$(./cheng_storage meter --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --executor:node:exec-1 \
-  --gpu_ms:110000 --gpu_mem_bytes:7516192768 --gpu_count:1 --gpu_type:A10G --workload:infer \
-  --price_gpu:0.00002 --price_gpu_mem:0.15 --royalty:0.12 --treasury:0.03 \
-  --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE")"
-usage_id="$(printf '%s' "$usage_out" | sed -n 's/^meter ok: //p')"
-if [ -z "${usage_id:-}" ]; then
-  echo "demo: missing usage id" 1>&2
-  exit 1
+if [ "$runtime_ok" = "1" ]; then
+  set +e
+  usage_out="$(./cheng_storage meter --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --executor:node:exec-1 \
+    --gpu_ms:110000 --gpu_mem_bytes:7516192768 --gpu_count:1 --gpu_type:A10G --workload:infer \
+    --price_gpu:0.00002 --price_gpu_mem:0.15 --royalty:0.12 --treasury:0.03 \
+    --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE" 2>/dev/null)"
+  if [ $? -ne 0 ]; then
+    runtime_ok="0"
+  fi
+  set -e
 fi
 
-rec_out="$(./cheng_storage receipt --request:"$req_id" --task:job-gpu-demo --executor:node:exec-1 --status:ok \
-  --usage:"$usage_id" --result:cid://result --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE")"
-rec_id="$(printf '%s' "$rec_out" | sed -n 's/^receipt ok: //p')"
-if [ -z "${rec_id:-}" ]; then
-  echo "demo: missing receipt id" 1>&2
-  exit 1
+if [ "$runtime_ok" = "1" ]; then
+  usage_id="$(printf '%s' "$usage_out" | sed -n 's/^meter ok: //p')"
+  if [ -z "${usage_id:-}" ]; then
+    runtime_ok="0"
+  fi
 fi
 
-./cheng_storage sample --root:"$ROOT" --epoch:"$EPOCH" --rate:1 --seed:demo \
-  --auditor:node:auditor-1 --record --format:json >/dev/null
+if [ "$runtime_ok" = "1" ]; then
+  set +e
+  rec_out="$(./cheng_storage receipt --request:"$req_id" --task:job-gpu-demo --executor:node:exec-1 --status:ok \
+    --usage:"$usage_id" --result:cid://result --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE" 2>/dev/null)"
+  if [ $? -ne 0 ]; then
+    runtime_ok="0"
+  fi
+  set -e
+fi
 
-./cheng_storage audit --task:job-gpu-demo --executor:node:exec-1 --auditor:node:auditor-1 --status:bad \
-  --penalty:0.10 --epoch:"$EPOCH" --note:demo --root:"$ROOT" --mode:"$MODE" >/dev/null
+if [ "$runtime_ok" = "1" ]; then
+  rec_id="$(printf '%s' "$rec_out" | sed -n 's/^receipt ok: //p')"
+  if [ -z "${rec_id:-}" ]; then
+    runtime_ok="0"
+  fi
+fi
 
-./cheng_storage fraud --task:job-gpu-demo --executor:node:exec-1 --reporter:node:auditor-1 \
-  --reason:demo --epoch:"$EPOCH" --root:"$ROOT" >/dev/null
+if [ "$runtime_ok" = "1" ]; then
+  set +e
+  ./cheng_storage sample --root:"$ROOT" --epoch:"$EPOCH" --rate:1 --seed:demo \
+    --auditor:node:auditor-1 --record --format:toml >/dev/null 2>/dev/null
+  [ $? -ne 0 ] && runtime_ok="0"
+  ./cheng_storage audit --task:job-gpu-demo --executor:node:exec-1 --auditor:node:auditor-1 --status:bad \
+    --penalty:0.10 --epoch:"$EPOCH" --note:demo --root:"$ROOT" --mode:"$MODE" >/dev/null 2>/dev/null
+  [ $? -ne 0 ] && runtime_ok="0"
+  ./cheng_storage fraud --task:job-gpu-demo --executor:node:exec-1 --reporter:node:auditor-1 \
+    --reason:demo --epoch:"$EPOCH" --root:"$ROOT" >/dev/null 2>/dev/null
+  [ $? -ne 0 ] && runtime_ok="0"
+  set -e
+fi
+
+if [ "$runtime_ok" != "1" ]; then
+  echo "warn: runtime write path unavailable, fallback to empty-ledger bridge verification" 1>&2
+  : > "$LEDGER"
+fi
 
 echo "settle:"
 ./cheng_storage settle --root:"$ROOT" --format:toml --top:5 --reconcile-csv:"$ROOT/settle_reconcile.csv"
+
+batch_id="cheng-epoch-$EPOCH"
+sh src/tooling/cheng_rwad_bridge.sh export --root:"$ROOT" --epoch:"$EPOCH" --batch-id:"$batch_id" \
+  --out:"$ROOT/rwad_batch.json" --top:0
+
+rwad_tool="$RWAD_CHAIN_ROOT/tools/rwad_cheng_points_settle.sh"
+if [ -x "$rwad_tool" ]; then
+  "$rwad_tool" --batchFile:"$ROOT/rwad_batch.json" --budget:"$SETTLEMENT_BUDGET" \
+    --stateIn:"$ROOT/rwad_points_state.json" --stateOut:"$ROOT/rwad_points_state.json" \
+    --out:"$ROOT/rwad_result.json"
+  sh src/tooling/cheng_rwad_bridge.sh apply --result:"$ROOT/rwad_result.json" \
+    --batch:"$ROOT/rwad_batch.json" \
+    --batch-id:"$batch_id" --require-status:finalized --out:"$ROOT/rwad_ack.json"
+  echo "rwad-result:"
+  cat "$ROOT/rwad_result.json"
+else
+  if [ "$ALLOW_MISSING_RWAD" = "1" ]; then
+    echo "warn: missing RWAD tool: $rwad_tool" 1>&2
+  else
+    echo "error: missing RWAD tool: $rwad_tool" 1>&2
+    echo "hint: pass --allow-missing-rwad for local-only demo mode" 1>&2
+    exit 1
+  fi
+fi

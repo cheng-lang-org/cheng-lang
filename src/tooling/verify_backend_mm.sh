@@ -22,7 +22,11 @@ run_with_timeout() {
     while (1) {
       my $res = waitpid($pid, WNOHANG);
       if ($res == $pid) {
-        exit ($? >> 8);
+        my $status = $?;
+        if (($status & 127) != 0) {
+          exit(128 + ($status & 127));
+        }
+        exit($status >> 8);
       }
       if (time >= $end) {
         kill "TERM", -$pid;
@@ -35,12 +39,12 @@ run_with_timeout() {
   ' "$seconds" "$@"
 }
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -56,6 +60,8 @@ if [ "$linker_mode" = "self" ]; then
   if [ ! -f "$runtime_obj" ] || [ "src/std/system_helpers_backend.cheng" -nt "$runtime_obj" ]; then
     env \
       CHENG_MM=orc \
+      CHENG_BACKEND_MULTI=0 \
+      CHENG_BACKEND_MULTI_FORCE=0 \
       CHENG_BACKEND_ALLOW_NO_MAIN=1 \
       CHENG_BACKEND_WHOLE_PROGRAM=1 \
       CHENG_BACKEND_EMIT=obj \
@@ -83,6 +89,9 @@ run_fixture() {
     CHENG_C_SYSTEM=system \
     CHENG_BACKEND_FRONTEND=stage1 \
     CHENG_BACKEND_VALIDATE=1 \
+    CHENG_BACKEND_MULTI=0 \
+    CHENG_BACKEND_MULTI_FORCE=0 \
+    CHENG_BACKEND_WHOLE_PROGRAM=1 \
     CHENG_BACKEND_EMIT=exe \
     CHENG_BACKEND_LINKER=self \
     CHENG_BACKEND_NO_RUNTIME_C=1 \
@@ -100,18 +109,17 @@ run_fixture() {
     if [ "$self_status" -eq 0 ]; then
       return
     fi
-    if [ "${CHENG_BACKEND_MM_SYSTEM_FALLBACK:-1}" != "1" ]; then
-      tail -n 200 "$self_log" >&2 || true
-      exit "$self_status"
-    fi
-    echo "[verify_backend_mm] self linker failed for ${base}; fallback to system linker" >&2
-    tail -n 40 "$self_log" >&2 || true
+    tail -n 200 "$self_log" >&2 || true
+    exit "$self_status"
   fi
 
   CHENG_MM=orc \
   CHENG_C_SYSTEM=system \
   CHENG_BACKEND_FRONTEND=stage1 \
   CHENG_BACKEND_VALIDATE=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_LINKER=system \
   CHENG_BACKEND_TARGET="$target" \

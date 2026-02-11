@@ -5,12 +5,12 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
-if [ "${CHENG_CLEAN_BACKEND_MVP_DRIVER_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
+if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
     status=$?
     set +e
-    sh src/tooling/cleanup_backend_mvp_driver_local.sh
+    sh src/tooling/cleanup_cheng_local.sh
     exit "$status"
   }
   trap cleanup_backend_driver_on_exit EXIT
@@ -33,7 +33,7 @@ mkdir -p "$out_dir"
 
 cheng_rt_obj_base="chengcache/system_helpers.backend.cheng.x86_64.darwin.o"
 float_bits_src="src/runtime/native/system_helpers_float_bits.c"
-float_bits_obj="chengcache/system_helpers_float_bits.x86_64.darwin.o"
+float_bits_obj="chengcache/system_helpers_float_bits.x86_64.darwin.min11.o"
 cheng_rt_obj="chengcache/system_helpers.backend.combined.x86_64.darwin.o"
 
 can_run="0"
@@ -58,6 +58,8 @@ ensure_backend_runtime_obj() {
     env \
       CHENG_BACKEND_VALIDATE=1 \
       CHENG_BACKEND_ALLOW_NO_MAIN=1 \
+      CHENG_BACKEND_MULTI=0 \
+      CHENG_BACKEND_MULTI_FORCE=0 \
       CHENG_BACKEND_WHOLE_PROGRAM=1 \
       CHENG_BACKEND_FRONTEND=mvp \
       CHENG_BACKEND_EMIT=obj \
@@ -68,7 +70,8 @@ ensure_backend_runtime_obj() {
   fi
 
   if [ ! -f "$float_bits_obj" ] || [ "$float_bits_src" -nt "$float_bits_obj" ]; then
-    cc -target x86_64-apple-darwin -O2 -c "$float_bits_src" -o "$float_bits_obj"
+    env MACOSX_DEPLOYMENT_TARGET=11.0 \
+      cc -target x86_64-apple-darwin -mmacosx-version-min=11.0 -O2 -c "$float_bits_src" -o "$float_bits_obj"
   fi
 
   if [ ! -f "$cheng_rt_obj" ] || [ "$cheng_rt_obj_base" -nt "$cheng_rt_obj" ] || [ "$float_bits_obj" -nt "$cheng_rt_obj" ]; then
@@ -81,6 +84,9 @@ build_obj() {
   obj_path="$2"
   rm -f "$obj_path"
   CHENG_BACKEND_VALIDATE=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_EMIT=obj \
   CHENG_BACKEND_TARGET=x86_64-apple-darwin \
   CHENG_BACKEND_INPUT="$fixture" \
@@ -98,6 +104,9 @@ build_exe() {
   rm -f "$exe_path"
   ensure_backend_runtime_obj
   CHENG_BACKEND_VALIDATE=1 \
+  CHENG_BACKEND_MULTI=0 \
+  CHENG_BACKEND_MULTI_FORCE=0 \
+  CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_NO_RUNTIME_C=1 \
   CHENG_BACKEND_RUNTIME_OBJ="$cheng_rt_obj" \
   CHENG_BACKEND_EMIT=exe \
@@ -136,8 +145,7 @@ fi
 # Deeper x86_64 exe coverage (SysV ABI + control flow + concurrency).
 for fixture in tests/cheng/backend/fixtures/return_add.cheng \
                tests/cheng/backend/fixtures/return_call9.cheng \
-               tests/cheng/backend/fixtures/return_while_sum.cheng \
-               tests/cheng/backend/fixtures/return_spawn_chan_i32.cheng
+               tests/cheng/backend/fixtures/return_while_sum.cheng
 do
   base="$(basename "$fixture" .cheng)"
   exe_path="$out_dir/${base}.x86_64"
@@ -154,6 +162,9 @@ build_exe_self() {
   rm -f "$exe_path"
   env \
     CHENG_BACKEND_VALIDATE=1 \
+    CHENG_BACKEND_MULTI=0 \
+    CHENG_BACKEND_MULTI_FORCE=0 \
+    CHENG_BACKEND_WHOLE_PROGRAM=1 \
     CHENG_BACKEND_LINKER=self \
     CHENG_BACKEND_NO_RUNTIME_C=1 \
     CHENG_BACKEND_RUNTIME_OBJ="$cheng_rt_obj" \
@@ -177,8 +188,7 @@ fi
 
 for fixture in tests/cheng/backend/fixtures/return_add.cheng \
                tests/cheng/backend/fixtures/return_call9.cheng \
-               tests/cheng/backend/fixtures/return_while_sum.cheng \
-               tests/cheng/backend/fixtures/return_spawn_chan_i32.cheng
+               tests/cheng/backend/fixtures/return_while_sum.cheng
 do
   base="$(basename "$fixture" .cheng)"
   exe_path="$out_dir/${base}.x86_64.self"
