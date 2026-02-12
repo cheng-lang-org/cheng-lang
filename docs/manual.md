@@ -609,6 +609,8 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - `[]` / `[a, b, c]` 是列表字面量（历史序列字面量 `@[ ... ]` 已移除）：用于构造 `T[]`（动态序列）；`T[N]` 不是定长数组，而是 `T[]` 的“初始化 reserve 容量提示”（cap hint）类型标注。**空 `[]`** 必须有类型上下文：允许用于带类型标注的绑定初始化（`let xs: T[] = []`）、赋值（`xs = []`）、`return []`、以及实参位置（参数类型已知）；禁止作为无类型上下文的独立表达式语句。
 - 空格单参调用仅用于**值/函数调用**；当 callee 解析为类型表达式或类型构造时，视为非法并提示使用 `TypeExpr(expr)`。
 - 列表生成式：`[expr for pat in iter if cond]`（`if` 可选；当前仅支持 1 个 `for` + 可选 1 个 `if`）。生成式的结果类型为 `T[]`，且 `pat` 引入的名字仅在生成式内部可见。当前后端仅支持出现在“可落地”的位置（绑定初始化/简单赋值/`return`/全局初始化）；不支持直接嵌入复杂子表达式（例如直接作为函数实参），需先绑定到临时变量再使用。
+- 计数型迭代规范：源码中形如 `var i = start; while i < end: ...; i = i + 1`、`while i <= end`、`while i > end`、`while i >= end` 的自增/自减计数循环，应统一改写为 `for in` 迭代（含 guard-for 等价写法）；`while` 保留给非计数型条件循环。
+- `for ... in ...` 的 `in` 表达式支持：range 字面值（`a..<b` / `a..b`）、数组/Table/HashMap 的字面值、常量与变量；Table/HashMap 支持 `for k, v in tableOrMap` 键值迭代。
 - 容器/数组类型语法（统一后缀）：
   - `T[]`：动态序列（运行时布局为 `len/cap/buffer`，可扩容；零值为“【】”；带类型标注省略初始化即可得到空序列，标准库不再提供 `newSeq/newSeqWithCap` 作为初始化入口）。
   - `T[N]`：动态序列（`T[]`）的“初始化 reserve 容量提示”（cap hint）。`N` 为整数表达式（可为字面量/常量/变量表达式），在运行时求值；仅影响“省略初始化表达式”的隐式默认值初始化（额外执行一次 `reserve(..., N)`），不改变类型身份与 ABI（`T[N]` 与 `T[]` 类型等价）。
@@ -734,7 +736,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 验证入口：`src/tooling/verify_backend_mvp.sh` 负责生成 `.s/.o` 并链接执行最小闭环样例。
 - 跨平台矩阵（可验收）：`src/tooling/verify_backend_targets_matrix.sh` 覆盖 darwin/ios(Mach‑O `.o`) + android/linux(ELF `.o`) + windows(COFF `.obj`)。
 - 全语义回归入口：`src/tooling/verify_backend_closedloop.sh` 会使用后端 driver（默认 `./cheng`；可用 `CHENG_BACKEND_DRIVER=<path>` 指定）编译并运行 `examples/stage1_codegen_fullspec.cheng`，要求 stdout 包含 `fullspec ok`（默认 `CHENG_MM=orc`；可用 `CHENG_BACKEND_MM=off` 显式降级排障；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；当前以 macOS ARM64 为主，非“全平台”闭环）。
-- 除平台生产闭环入口：`src/tooling/backend_prod_closure.sh`（默认启用 `CHENG_BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256）、stress 与 mm 回归；默认包含后端 selfhost（产出 stage2）与全链自举（可用 `--no-fullchain` 跳过）；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。
+- 除平台生产闭环入口：`src/tooling/backend_prod_closure.sh`（默认启用 `CHENG_BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256）、stress 与 mm 回归；默认包含后端 selfhost（产出 stage2）与全链自举（可用 `--no-fullchain` 跳过）；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。当前生产闭环仅支持 `CHENG_ABI=v2_noptr`，并在主闭环中默认执行 `backend.spawn_api_gate` 与 `backend.abi_v2_noptr` 专项门禁。
 - 全链自举门禁：`src/tooling/verify_fullchain_bootstrap.sh`（stage2→tools；obj-only fullspec + 工具 `--help` smoke）。
 - 本地发布/回滚：`src/tooling/backend_prod_publish.sh`（验收后发布到 `dist/releases`），`src/tooling/backend_release_rollback.sh`（切换 `dist/releases/current` 回滚）。
 - 语句支持：MVP 已支持 `let/var/赋值` 的栈槽降级与读取，用于闭环验证。

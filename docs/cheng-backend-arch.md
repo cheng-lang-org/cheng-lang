@@ -98,11 +98,12 @@ Cheng 源码
   - `fullspec` 回归口径：使用后端 driver（默认 `./cheng`；可用 `CHENG_BACKEND_DRIVER=<path>` 指定）编译 `examples/stage1_codegen_fullspec.cheng` → 运行并要求 stdout 包含 `fullspec ok`；默认 `CHENG_BACKEND_RUN_FULLSPEC=0`，显式设为 `1` 才启用。
   - 可选：`CHENG_ANDROID_RUN=1` 时额外跑 `verify_backend_android_run.sh`。
 - 生产闭环（除平台）：`src/tooling/backend_prod_closure.sh`（默认启用 `CHENG_BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt/opt2、multi‑lto、FFI/ABI matrix、obj/exe determinism、release manifest+bundle+sign/verify 与 mm 回归；`fullchain/stress` 为显式开关）。
+  - ABI 口径：仅支持 `CHENG_ABI=v2_noptr`；主闭环使用兼容口径（`CHENG_STAGE1_STD_NO_POINTERS=0`），严格 no-pointer 由 `backend.abi_v2_noptr` 专项门禁覆盖。
   - 默认 strict：任一子步骤 `exit 2`（skip）即失败；仅本地排障时通过 `--allow-skip` 放宽。
   - 自举：默认包含后端 selfhost（产出 stage2）；全链自举（stage2→tools）改为显式 `--fullchain`（或 `CHENG_BACKEND_RUN_FULLCHAIN=1`）。
   - 发布：默认启用 publish，且要求显式 seed（`--seed/--seed-id/--seed-tar`）；本地仅验收可用 `--no-publish`。
   - 打包：若存在 `artifacts/backend_selfhost_self_obj/cheng.stage2`，则 manifest/bundle 默认记录并打包 stage2 driver，并可附带全链产物。
-  - 驱动选择：脚本层统一通过 `src/tooling/backend_driver_path.sh`；可用 `CHENG_BACKEND_DRIVER=<path>` 指定后端 driver。
+  - 驱动选择：`CHENG_BACKEND_DRIVER` 未显式设置时，优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（其次 `cheng.stage1`、`artifacts/backend_seed/cheng.stage2`）；都不可用时才回落 `src/tooling/backend_driver_path.sh`。
   - `backend_driver_path.sh` 会先做 driver 可运行性健康检查（超时保护）；默认只使用本地 `./cheng`，缺失/过期时触发 selfhost 重建，重建失败则直接报错退出（不再自动候选 stage2 seed）。
 - `build_backend_driver.sh` 自举重建默认采用串行增量（`CHENG_BACKEND_BUILD_DRIVER_MULTI=0`；可由 `CHENG_BACKEND_BUILD_DRIVER_MULTI` / `CHENG_BACKEND_BUILD_DRIVER_INCREMENTAL` / `CHENG_BACKEND_BUILD_DRIVER_JOBS` 覆盖）。
 - 后端驱动：`src/backend/tooling/backend_driver.cheng` 支持 `--emit=obj|exe` 与 `--target=<triple|auto>`（`auto` 按当前主机平台自动选择；也可用 `CHENG_BACKEND_TARGET/CC/LD/CFLAGS/LDFLAGS` 环境变量；`--cc=` 与 `--ld=` 可分别控制 link）；目标文件由自研 `.o` writer 直接生成（不再支持 `emit=asm`）。
@@ -111,8 +112,9 @@ Cheng 源码
 
 > “生产闭环”在这里指：**从源码到可执行产物**的可复现构建 + 核心回归集的自动化验收 + 可观测性与发布流程可持续运行。
 
-当前验证状态（2026-02-06）：
+当前验证状态（2026-02-12）：
 - 本仓库已执行 `sh src/tooling/backend_prod_closure.sh`，结果 `backend_prod_closure ok`（默认口径，含 selfhost/release/mm；fullchain/stress 按需开启）。
+- `verify_backend_closedloop.sh` 默认执行 `backend.spawn_api_gate`；该 gate 使用 v2 友好 fixture（不依赖 `std/async_rt` 内部 raw pointer 实现），在 `CHENG_ABI=v2_noptr` 下直接回归。
 - 在 `CHENG_MM=orc CHENG_BACKEND_LINKER=self` 口径下，`backend_prod_closure.sh --no-publish` 已通过；闭环脚本对 `opt/opt2/multi-lto/ssa/ffi/debug/stress/concurrency` 相关 gate 已统一接入 `src/tooling/backend_link_env.sh`，避免 self-linker 运行时 `.o` 注入遗漏。
 - Linux AArch64 no-libc 口径：`src/tooling/verify_backend_nolibc_linux_aarch64.sh` 已通过 Darwin/arm64 静态门禁；运行门禁需在 Linux aarch64 主机执行。
 

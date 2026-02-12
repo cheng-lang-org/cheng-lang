@@ -34,7 +34,10 @@ if ! command -v codesign >/dev/null 2>&1; then
   exit 2
 fi
 
-stage2="${CHENG_FULLCHAIN_STAGE2:-artifacts/backend_selfhost_self_obj/cheng.stage2}"
+stage2="${CHENG_FULLCHAIN_STAGE2:-}"
+if [ "$stage2" = "" ]; then
+  stage2="$(sh src/tooling/backend_driver_path.sh)"
+fi
 if [ ! -x "$stage2" ]; then
   echo "[Error] verify_fullchain_bootstrap missing stage2 backend driver: $stage2" 1>&2
   echo "[Hint] run one of:" 1>&2

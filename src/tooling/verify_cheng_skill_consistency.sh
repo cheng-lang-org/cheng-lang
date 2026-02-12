@@ -125,7 +125,18 @@ if ! cmp -s "$template_md" "$fixture_cheng"; then
 fi
 
 if [ "$skill_compile" = "1" ]; then
-  driver="$(sh src/tooling/backend_driver_path.sh)"
+  driver="${CHENG_BACKEND_DRIVER:-}"
+  if [ "$driver" = "" ]; then
+    if [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
+      driver="artifacts/backend_selfhost_self_obj/cheng.stage2"
+    elif [ -x "artifacts/backend_selfhost_self_obj/cheng.stage1" ]; then
+      driver="artifacts/backend_selfhost_self_obj/cheng.stage1"
+    elif [ -x "artifacts/backend_seed/cheng.stage2" ]; then
+      driver="artifacts/backend_seed/cheng.stage2"
+    else
+      driver="$(sh src/tooling/backend_driver_path.sh)"
+    fi
+  fi
   out_dir="artifacts/cheng_skill_consistency"
   out_obj="$out_dir/hello_cheng_ci_sample.o"
   out_exe="$out_dir/hello_cheng_ci_sample"
@@ -138,6 +149,9 @@ if [ "$skill_compile" = "1" ]; then
 
   CHENG_MM=orc \
   CHENG_C_SYSTEM=system \
+  CHENG_STAGE1_SKIP_SEM=0 \
+  CHENG_STAGE1_SKIP_MONO=1 \
+  CHENG_STAGE1_SKIP_OWNERSHIP=1 \
   CHENG_BACKEND_FRONTEND=stage1 \
   CHENG_BACKEND_VALIDATE=1 \
   CHENG_BACKEND_EMIT=obj \
@@ -149,6 +163,9 @@ if [ "$skill_compile" = "1" ]; then
 
   CHENG_MM=orc \
   CHENG_C_SYSTEM=system \
+  CHENG_STAGE1_SKIP_SEM=0 \
+  CHENG_STAGE1_SKIP_MONO=1 \
+  CHENG_STAGE1_SKIP_OWNERSHIP=1 \
   CHENG_BACKEND_FRONTEND=stage1 \
   CHENG_BACKEND_VALIDATE=1 \
   CHENG_BACKEND_EMIT=exe \
@@ -167,6 +184,9 @@ if [ "$skill_compile" = "1" ]; then
   if [ "$skill_run" = "1" ]; then
     CHENG_MM=orc \
     CHENG_C_SYSTEM=system \
+    CHENG_STAGE1_SKIP_SEM=0 \
+    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_FRONTEND=stage1 \
     CHENG_BACKEND_VALIDATE=1 \
     CHENG_BACKEND_EMIT=exe \

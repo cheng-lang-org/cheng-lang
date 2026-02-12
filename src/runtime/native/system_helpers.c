@@ -1233,6 +1233,27 @@ int64_t cheng_f64_ge_bits(int64_t a_bits, int64_t b_bits) {
 int64_t cheng_i64_to_f64_bits(int64_t x) {
     return cheng_f64_to_bits((double)x);
 }
+int64_t cheng_u64_to_f64_bits(uint64_t x) {
+    return cheng_f64_to_bits((double)x);
+}
+int64_t cheng_f64_bits_to_i64(int64_t bits) {
+    return (int64_t)cheng_bits_to_f64(bits);
+}
+uint64_t cheng_f64_bits_to_u64(int64_t bits) {
+    return (uint64_t)cheng_bits_to_f64(bits);
+}
+int64_t cheng_f32_bits_to_f64_bits(int32_t bits) {
+    return cheng_f64_to_bits(cheng_bits_to_f32(bits));
+}
+int32_t cheng_f64_bits_to_f32_bits(int64_t bits) {
+    return cheng_f32_to_bits(cheng_bits_to_f64(bits));
+}
+int64_t cheng_f32_bits_to_i64(int32_t bits) {
+    return (int64_t)cheng_bits_to_f32(bits);
+}
+uint64_t cheng_f32_bits_to_u64(int32_t bits) {
+    return (uint64_t)cheng_bits_to_f32(bits);
+}
 int32_t cheng_jpeg_decode(const uint8_t* data, int32_t len, int32_t* out_w, int32_t* out_h, uint8_t** out_rgba) {
     if (!data || len <= 0 || !out_w || !out_h || !out_rgba) return 0;
     int w = 0, h = 0, comp = 0;

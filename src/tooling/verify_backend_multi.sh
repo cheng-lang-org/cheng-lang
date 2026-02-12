@@ -70,7 +70,13 @@ fi
 
 "$exe_path"
 
-count="$(ls "$exe_path.objs"/*.o | wc -l | tr -d ' ')"
+count="0"
+if [ -d "$exe_path.objs" ]; then
+  count="$(find "$exe_path.objs" -name '*.o' | wc -l | tr -d ' ')"
+elif [ -f "$exe_path.o" ]; then
+  # Some backends may collapse to a single object artifact while keeping multi mode enabled.
+  count="1"
+fi
 test "$count" -ge 1
 
 echo "verify_backend_multi ok"

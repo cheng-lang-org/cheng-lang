@@ -66,6 +66,68 @@ driver_sanity_ok() {
   return 1
 }
 
+driver_compile_smoke_ok() {
+  bin="$1"
+  if [ ! -x "$bin" ]; then
+    return 1
+  fi
+  smoke_src="$root/tests/cheng/backend/fixtures/return_add.cheng"
+  if [ ! -f "$smoke_src" ]; then
+    return 0
+  fi
+  smoke_target="$(sh "$root/src/tooling/detect_host_target.sh" 2>/dev/null || echo "")"
+  if [ "$smoke_target" = "" ]; then
+    return 0
+  fi
+  smoke_out="$root/chengcache/.backend_driver_path.smoke.o"
+  smoke_out_stage1="$root/chengcache/.backend_driver_path.smoke.stage1.o"
+  smoke_stage1="${CHENG_BACKEND_DRIVER_PATH_STAGE1_SMOKE:-1}"
+  mkdir -p "$root/chengcache"
+  rm -f "$smoke_out"
+  rm -f "$smoke_out_stage1"
+  set +e
+  run_with_timeout 10 env \
+    CHENG_C_SYSTEM=system \
+    CHENG_BACKEND_VALIDATE=1 \
+    CHENG_BACKEND_EMIT=obj \
+    CHENG_BACKEND_TARGET="$smoke_target" \
+    CHENG_BACKEND_FRONTEND=mvp \
+    CHENG_BACKEND_INPUT="$smoke_src" \
+    CHENG_BACKEND_OUTPUT="$smoke_out" \
+    "$bin" >/dev/null 2>&1
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    return 1
+  fi
+  if [ ! -s "$smoke_out" ]; then
+    return 1
+  fi
+  if [ "$smoke_stage1" = "1" ]; then
+    set +e
+    run_with_timeout 10 env \
+      CHENG_MM=orc \
+      CHENG_C_SYSTEM=system \
+      CHENG_BACKEND_VALIDATE=1 \
+      CHENG_STAGE1_SKIP_SEM=0 \
+      CHENG_STAGE1_SKIP_MONO=1 \
+      CHENG_STAGE1_SKIP_OWNERSHIP=1 \
+      CHENG_BACKEND_EMIT=obj \
+      CHENG_BACKEND_TARGET=auto \
+      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_INPUT="$smoke_src" \
+      CHENG_BACKEND_OUTPUT="$smoke_out_stage1" \
+      "$bin" >/dev/null 2>&1
+    status_stage1=$?
+    set -e
+    if [ "$status_stage1" -ne 0 ]; then
+      return 1
+    fi
+    [ -s "$smoke_out_stage1" ] || return 1
+  fi
+  return 0
+}
+
 acquire_rebuild_lock() {
   lock_dir="$1"
   owner_file="$lock_dir/owner.pid"
@@ -107,7 +169,7 @@ if [ "$driver" != "" ]; then
     echo "[Error] CHENG_BACKEND_DRIVER is not executable: $abs" 1>&2
     exit 1
   fi
-  if ! driver_sanity_ok "$abs"; then
+  if ! driver_sanity_ok "$abs" || ! driver_compile_smoke_ok "$abs"; then
     echo "[Error] CHENG_BACKEND_DRIVER is not runnable: $abs" 1>&2
     exit 1
   fi
@@ -132,7 +194,7 @@ abs_default="$root/cheng"
 
 # Fast path: use the local rebuilt driver if it's fresh.
 if [ -x "$abs_default" ] && ! is_stale "$abs_default"; then
-  if driver_sanity_ok "$abs_default"; then
+  if driver_sanity_ok "$abs_default" && driver_compile_smoke_ok "$abs_default"; then
     printf "%s\n" "$abs_default"
     exit 0
   fi
@@ -145,7 +207,7 @@ if [ ! -x "$abs_default" ]; then
 else
   if is_stale "$abs_default"; then
     rebuild_default="1"
-  elif ! driver_sanity_ok "$abs_default"; then
+  elif ! driver_sanity_ok "$abs_default" || ! driver_compile_smoke_ok "$abs_default"; then
     rebuild_default="1"
   fi
 fi
@@ -164,7 +226,7 @@ if [ "$rebuild_default" = "1" ]; then
   else
     if is_stale "$abs_default"; then
       rebuild_default="1"
-    elif ! driver_sanity_ok "$abs_default"; then
+    elif ! driver_sanity_ok "$abs_default" || ! driver_compile_smoke_ok "$abs_default"; then
       rebuild_default="1"
     fi
   fi
@@ -189,19 +251,25 @@ if [ "${rebuild_lock:-}" != "" ]; then
   release_rebuild_lock "$rebuild_lock"
   trap - EXIT INT TERM
 fi
-if [ -x "$abs_default" ] && driver_sanity_ok "$abs_default"; then
+if [ -x "$abs_default" ] && driver_sanity_ok "$abs_default" && driver_compile_smoke_ok "$abs_default"; then
   printf "%s\n" "$abs_default"
   exit 0
 fi
 
+for cand in \
+  "$root/artifacts/backend_seed/cheng.stage2" \
+  "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
+  "$root/artifacts/backend_selfhost_self_obj/cheng.stage1"; do
+  if [ -x "$cand" ] && driver_sanity_ok "$cand" && driver_compile_smoke_ok "$cand"; then
+    printf "%s\n" "$cand"
+    exit 0
+  fi
+done
+
 if [ ! -x "$abs_default" ]; then
   echo "[Error] missing backend driver: $abs_default" 1>&2
-  echo "  hint: run src/tooling/build_backend_driver.sh --name:cheng (selfhost only)" 1>&2
-  exit 1
+else
+  echo "[Error] backend driver exists but failed compile-smoke: $abs_default" 1>&2
 fi
-if ! driver_sanity_ok "$abs_default"; then
-  echo "[Error] backend driver exists but is not runnable: $abs_default" 1>&2
-  echo "  hint: run src/tooling/build_backend_driver.sh --name:cheng (selfhost only)" 1>&2
-  exit 1
-fi
-printf "%s\n" "$abs_default"
+echo "  hint: run src/tooling/build_backend_driver.sh --name:cheng (selfhost only)" 1>&2
+exit 1

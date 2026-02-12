@@ -1,19 +1,22 @@
 # Cheng：默认无 Raw Pointer 的内存安全 + 高性能方案（ORC + var 借用 + 安全容器 + Typed spawn）
 
-## Status（2026-02-11）
+## Status（2026-02-12）
 
 这份文档目前是“目标/设计规格 + 落地清单”，不是对现状的完全描述。对照当前仓库代码：
 
-- Stage1 已接入 ABI 门禁：`CHENG_ABI=v2_noptr` 会强制启用 std no-pointer 扫描（等价于开启 `CHENG_STAGE1_STD_NO_POINTERS=1` 且按 strict 口径禁用豁免）。
-- 兼容开关仍保留：`CHENG_STAGE1_STD_NO_POINTERS`/`CHENG_STAGE1_STD_NO_POINTERS_STRICT` 可单独控制策略；`CHENG_ABI=v1` 为历史兼容口径。
-- tooling 已提供专项回归：`src/tooling/verify_backend_abi_v2_noptr.sh`（同一 `src/std` 探针在 `v1` 可编、`v2_noptr` 必须编译期拒绝）。
-- `src/std/async_rt.cheng` 仍对外暴露 `spawn(fn_ptr: void*, ctx: void*)`，Typed spawn 方案尚未迁移完成。
+- Stage1 已接入 ABI 门禁：`CHENG_ABI=v2_noptr` 默认启用 std no-pointer 扫描；可用 `CHENG_STAGE1_STD_NO_POINTERS=0` 显式切到兼容口径（常用于闭环中的非专项 gate）。
+- 新增非 C ABI 门禁开关：`CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1` 时，非 C ABI 对接模块会禁用指针类型与指针操作（`*`/`&`/deref/`ptr_*` 等）。
+  - 若需把编译器内部实现（`src/stage1`/`src/backend`/`src/tooling`）也纳入同一门禁，可加 `CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
+- 兼容开关仍保留：`CHENG_STAGE1_STD_NO_POINTERS`/`CHENG_STAGE1_STD_NO_POINTERS_STRICT` 可单独控制 std 策略；`CHENG_ABI=v1` 仅保留在兼容/对照脚本中。
+- tooling 已提供专项回归：`src/tooling/verify_backend_abi_v2_noptr.sh`（`CHENG_BACKEND_ABI_V2_NOPTR_ONLY=1` 时走 only-v2 口径；non-C-ABI 子门禁会显式设 `CHENG_STAGE1_STD_NO_POINTERS=0` 以隔离 non-C-ABI 诊断）。
+- 默认并发接口已移除 raw spawn：`src/std/async_rt.cheng` 只保留 typed spawn，raw 入口仅在 `src/std/async_rt_legacy.cheng` 显式提供。
+- 当前 stage1+backend 口径下，`fn()` 入口调用已稳定为 `spawn(entry)`。
 - backend mvp 前端尚未与 stage1 在 raw pointer 门禁上完全对齐。
 
 建议动作：
 
 - 若目标是“全量 std 零指针”，优先从 `src/std/system.cheng`、`src/std/seqs.cheng`、`src/std/hashmaps.cheng` 的 runtime 接缝改造开始，再收紧豁免集合并保持自举回归。
-- 若近期目标是自举/性能优先，可先在 `CHENG_ABI=v1` 口径下验证性能，再并行推进 `v2_noptr` 违规模块治理。
+- 当前生产链路（`src/tooling/backend_prod_closure.sh`）仅接受 `CHENG_ABI=v2_noptr`；`v1` 不再作为生产闭环默认路径。
 
 ## Summary
 
@@ -161,3 +164,104 @@ fn __spawn_trampoline[T](raw: void*) =：cast -> 取出 entry/ctx -> dealloc -> 
 
 - 编译器内部源码（`/src/stage1/`、`/src/backend/` 等）视为“受信任代码”，不纳入默认安全模块门禁范围。
 - 现阶段 Send/Sync 规则保持既有实现；本计划优先实现“用户表面零指针 + 默认禁用”，Send/Sync 推导增强作为后续可选扩展。
+
+ Cheng 绝对零指针重构计划（ABI 断兼容版）
+
+
+  ### Summary
+
+
+  - 目标：实现“全链路源码与 IR 不出现指针类型/指针操作”，包括 std、compiler、backend、runtime。
+  - 前提已锁定：接受 ABI 断兼容，接受阶段性性能回退。
+  - 交付方式：分 4 个里程碑，先重建语义与运行时模型，再恢复性能。
+
+
+  ### Public API / Interface Changes
+
+
+  - 新增内建抽象类型：
+      - addr（地址值类型，非指针，不支持解引用/算术运算）
+      - handle[T]（受管句柄，替代 ref T 与 T* 语义）
+      - span[T]（边界化视图，替代裸缓冲区访问）
+  - 语言层禁用：
+      - T*、void*、ptr_add、load/store、显式解引用语法
+  - FFI 改造：
+      - 仅允许 extern "c" shim 层使用 C 指针（放在独立 abi_c 子系统）
+      - Cheng 主代码通过 addr/handle/span 与 shim 交互
+  - 容器 API 统一：
+      - T[]、T[N] 保留
+      - 内部实现改为句柄化内存池，不暴露地址字段
+
+
+  ### Implementation Plan
+
+
+  1. IR 与类型系统重构
+
+
+  - 在 HIR/MIR/LIR 引入 AddrKind 与 HandleKind，移除 PointerKind。
+  - 所有 load/store/gep 风格节点改为：
+      - mem_read(handle, index, size)
+      - mem_write(handle, index, value)
+      - mem_slice(handle, start, len)
+  - 代码生成阶段将 addr/handle 映射为目标机地址寄存器与偏移，不在 IR 层暴露指针类型。
+
+
+  2. Runtime 内存模型替换
+
+
+  - 新建 runtime/mem_pool：
+      - 句柄分配、回收、代际校验、边界检查
+      - realloc 改为“新块+复制+句柄重绑定”
+  - seq/table/hashmap/json/string 全部改为句柄实现：
+      - 结构体中禁止 buffer: void*，改 storage: handle[byte] + metadata。
+
+
+  3. Std 与编译器源码去指针
+
+
+  - 扫描并替换 src/std, src/stage1, src/backend 的 *、void*、ptr_*、load/store。
+  - 所有泛型容器操作统一走 []/[]= 与 .len/.cap。
+  - system.cheng 仅保留非指针抽象 API；C 指针入口全部下沉到 abi_c shim。
+
+
+  4. ABI 与工具链切换
+
+
+  - 新建 CHENG_ABI=v2_noptr。
+  - backend_driver 增加 ABI 版本门控：v1（兼容）/v2（零指针）。
+  - 生产闭环默认并强制 v2；v1 仅保留兼容对照门禁。
+
+
+  ### Test Cases & Acceptance
+
+
+  - 编译期约束
+      - 全仓 rg '\*|void\*|ptr_add|load_ptr|store_ptr' 在允许目录外必须为 0。
+      - 禁止在 src/std、src/stage1、src/backend 出现指针 AST 节点。
+  - 功能回归
+      - verify_backend_selfhost_bootstrap_self_obj.sh（v2）全绿。
+      - verify_backend_obj.sh、verify_backend_multi.sh、verify_backend_opt2.sh 全绿。
+      - 容器专项：seq/table/hashmap/json/string 全套读写、扩容、边界检查。
+  - 性能门槛（阶段性）
+      - M1/M2 允许退化；M3 开始建立基线；M4 回到现有 1.5x 以内。
+  - 自举闭环
+      - stage0 -> stage1 -> stage2 在 v2 ABI 下可重复构建且产物一致性通过。
+
+
+  ### Rollout
+
+
+  - Phase A（2-3 周）：IR 类型重构 + runtime 句柄池最小可用。
+  - Phase B（2-4 周）：std 容器与 system 去指针，v2 编译通过。
+  - Phase C（2-3 周）：backend/codegen 全链路、selfhost 跑通。
+  - Phase D（持续）：性能回补（对象池、批量 copy、逃逸优化、句柄内联缓存）。
+
+
+  ### Assumptions / Defaults
+
+
+  - 默认启用 CHENG_ABI=v2_noptr；生产闭环不再接受 v1。
+  - 允许 ABI 破坏，不保证旧产物与旧工具互通。
+  - 允许前两阶段性能显著下降，以语义闭环优先。
+  - C 指针仅存在于 abi_c shim（仓内唯一白名单目录）。

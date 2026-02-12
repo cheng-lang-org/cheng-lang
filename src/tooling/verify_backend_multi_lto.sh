@@ -40,7 +40,13 @@ env $link_env \
 
 "$exe_path"
 
-count="$(ls "$exe_path.objs"/*.o | wc -l | tr -d ' ')"
+count="0"
+if [ -d "$exe_path.objs" ]; then
+  count="$(find "$exe_path.objs" -name '*.o' | wc -l | tr -d ' ')"
+elif [ -f "$exe_path.o" ]; then
+  # Some backends materialize the post-LTO object as a single sidecar `.o`.
+  count="1"
+fi
 test "$count" -eq 1
 
 echo "verify_backend_multi_lto ok"

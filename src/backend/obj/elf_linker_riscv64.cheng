@@ -260,17 +260,18 @@ fn elfSortStringsStable(items: str[]*) =
             elfWriteStrPtr(items, j + 1, elfReadStrPtr(items, j))
         elfWriteStrPtr(items, j + 1, key)
 
-fn elfAddImport(imports: str[]*, importIndex: hashmaps.HashMapStrInt*, name: str) =
-    if imports == nil || importIndex == nil:
+fn elfAddImport(imports: str[]*, importIndex: var hashmaps.HashMapStrInt, name: str) =
+    if imports == nil:
         return
     if name == nil || len(name) == 0:
         return
-    var found: bool = false
-    hashmaps.hashMapStrIntGetPtrRaw(importIndex, name,&found)
-    if found:
+    let key: str = name + ""
+    var exists: bool = false
+    let _existing: int32 = hashmaps.hashMapStrIntGetMut(importIndex, key, exists)
+    if exists:
         return
-    hashmaps.hashMapStrIntPut(importIndex, name, imports->len)
-    elfStrSeqAddPtr(imports, name)
+    hashmaps.hashMapStrIntPut(importIndex, key, imports->len + 1)
+    elfStrSeqAddPtr(imports, key)
 
 fn elfResolveSymAddr(defs: ElfLinkDef[], defIndex: hashmaps.HashMapStrInt, objs: ElfObjFile[],
                      layouts: ElfLinkObjLayout[], objIndex: int32, sym: ElfObjSymbol,
@@ -279,7 +280,7 @@ fn elfResolveSymAddr(defs: ElfLinkDef[], defIndex: hashmaps.HashMapStrInt, objs:
         return Err[uint64]("elf_linker: nil symbol")
     if sym.shndx == SHN_UNDEF:
         var found: bool = false
-        let di0: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name, found)
+        let di0: int32 = hashmaps.hashMapStrIntGetEx(defIndex, sym.name, found)
         if found && di0 >= 0 && di0 < defs.len:
             let d0: ElfLinkDef = defs[di0]
             if d0.kind == 0:
@@ -719,7 +720,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
             if kind < 0:
                 continue
             var found: bool = false
-            hashmaps.hashMapStrIntGet(defIndex, s.name, found)
+            let _seenDef0: int32 = hashmaps.hashMapStrIntGetEx(defIndex, s.name, found)
             if found:
                 return Err[bool]("elf_linker: duplicate symbol: " + s.name)
             var d: ElfLinkDef
@@ -735,7 +736,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
             else:
                 d.off = lay.bssOff + s.value
             add(defs, d)
-            hashmaps.hashMapStrIntPut(&defIndex, s.name, defs.len - 1)
+            hashmaps.hashMapStrIntPut(defIndex, s.name, defs.len - 1)
 
 
     # Collect imports from relocations.
@@ -755,21 +756,21 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
                 continue
             if sym0.shndx == SHN_UNDEF:
                 var foundDef: bool = false
-                hashmaps.hashMapStrIntGet(defIndex, sym0.name, foundDef)
+                let _seenDef1: int32 = hashmaps.hashMapStrIntGetEx(defIndex, sym0.name, foundDef)
                 if !foundDef:
                     if r0.rtype == R_RISCV_CALL:
-                        elfAddImport(&imports, &importIndex, sym0.name)
+                        elfAddImport(&imports, importIndex, sym0.name)
                     else:
                         return Err[bool]("elf_linker: unsupported undefined reloc type for " + sym0.name)
 
     # Ensure _start can call exit.
-    elfAddImport(&imports, &importIndex, "exit")
+    elfAddImport(&imports, importIndex, "exit")
 
     elfSortStringsStable(&imports)
     # Rebuild name->index map after sorting.
     importIndex = hashmaps.hashMapStrIntInit(1024)
     for iimp in 0..<imports.len:
-        hashmaps.hashMapStrIntPut(&importIndex, imports[iimp], iimp)
+        hashmaps.hashMapStrIntPut(importIndex, imports[iimp], iimp + 1)
 
     # Append import stubs to .text (one per import).
     var stubOffs: uint64[]
@@ -976,15 +977,15 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
             var unresolved: bool = false
             if sym1 != nil && sym1.shndx == SHN_UNDEF:
                 var found: bool = false
-                hashmaps.hashMapStrIntGet(defIndex, sym1.name, found)
+                let _seenDef2: int32 = hashmaps.hashMapStrIntGetEx(defIndex, sym1.name, found)
                 if !found:
                     unresolved = true
             if unresolved:
                 if r1.rtype != R_RISCV_CALL:
                     return Err[bool]("elf_linker: unsupported undefined reloc type for " + sym1.name)
-                var impFound: bool = false
-                let idxImp: int32 = hashmaps.hashMapStrIntGetPtrRaw(importIndex, sym1.name,&impFound)
-                if !impFound || idxImp < 0 || idxImp >= imports.len:
+                let idxImpPlus1: int32 = importIndex[sym1.name]
+                let idxImp: int32 = idxImpPlus1 - 1
+                if idxImpPlus1 <= 0 || idxImp < 0 || idxImp >= imports.len:
                     return Err[bool]("elf_linker: missing import stub: " + sym1.name)
                 targetAddr = textVaddr + stubOffs[idxImp]
                 let callRes: Result[bool] = elfPatchCallPairAt(&text, placeOff, placeAddr, targetAddr)
@@ -1016,15 +1017,15 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
 
     # Patch _start stub calls.
     var foundMain: bool = false
-    let mainIdx: int32 = hashmaps.hashMapStrIntGet(defIndex, "main", foundMain)
+    let mainIdx: int32 = hashmaps.hashMapStrIntGetEx(defIndex, "main", foundMain)
     if !foundMain || mainIdx < 0 || mainIdx >= defs.len:
         return Err[bool]("elf_linker: missing main symbol (required for _start)")
     let mainDef: ElfLinkDef = defs[mainIdx]
     let mainAddr: uint64 = textVaddr + mainDef.off
 
-    var exitFound: bool = false
-    let exitImpIdx: int32 = hashmaps.hashMapStrIntGetPtrRaw(importIndex, "exit",&exitFound)
-    if !exitFound || exitImpIdx < 0 || exitImpIdx >= stubOffs.len:
+    let exitImpIdxPlus1: int32 = importIndex["exit"]
+    let exitImpIdx: int32 = exitImpIdxPlus1 - 1
+    if exitImpIdxPlus1 <= 0 || exitImpIdx < 0 || exitImpIdx >= stubOffs.len:
         return Err[bool]("elf_linker: missing exit import stub")
     let exitStubAddr: uint64 = textVaddr + stubOffs[exitImpIdx]
 

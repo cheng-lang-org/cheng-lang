@@ -267,16 +267,18 @@ fn elfSortStringsStable(items: str[]*) =
             elfWriteStrPtr(items, j + 1, elfReadStrPtr(items, j))
         elfWriteStrPtr(items, j + 1, key)
 
-fn elfAddImport(imports: str[]*, importIndex: hashmaps.HashMapStrInt*, name: str) =
-    if imports == nil || importIndex == nil:
+fn elfAddImport(imports: str[]*, importIndex: var hashmaps.HashMapStrInt, name: str) =
+    if imports == nil:
         return
     if name == nil || len(name) == 0:
         return
-    var found: bool = false
-    if hashmaps.hashMapStrIntGetPtrRaw(importIndex, name,&found) > 0 && found:
+    let key: str = name + ""
+    var exists: bool = false
+    let _existing: int32 = hashmaps.hashMapStrIntGetMut(importIndex, key, exists)
+    if exists:
         return
-    hashmaps.hashMapStrIntPut(importIndex, name, imports->len + 1)
-    elfStrSeqAddPtr(imports, name)
+    hashmaps.hashMapStrIntPut(importIndex, key, imports->len + 1)
+    elfStrSeqAddPtr(imports, key)
 
 fn elfResolveSymAddr(defs: ElfLinkDef[], defIndex: hashmaps.HashMapStrInt, objs: ElfObjFile[],
                      layouts: ElfLinkObjLayout[], objIndex: int32, sym: ElfObjSymbol,
@@ -284,7 +286,7 @@ fn elfResolveSymAddr(defs: ElfLinkDef[], defIndex: hashmaps.HashMapStrInt, objs:
     if sym == nil:
         return Err[uint64]("elf_linker: nil symbol")
     if sym.shndx == SHN_UNDEF:
-        let diPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name)
+        let diPlus1: int32 = defIndex[sym.name]
         let di0: int32 = diPlus1 - 1
         if diPlus1 > 0 && di0 >= 0 && di0 < defs.len:
             let d0: ElfLinkDef = defs[di0]
@@ -753,7 +755,7 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
                 kind = 3
             if kind < 0:
                 continue
-            if hashmaps.hashMapStrIntGet(defIndex, s.name) > 0:
+            if defIndex[s.name] > 0:
                 return Err[bool]("elf_linker: duplicate symbol: " + s.name)
             var d: ElfLinkDef
             new d
@@ -768,7 +770,7 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
             else:
                 d.off = lay.bssOff + s.value
             add(defs, d)
-            hashmaps.hashMapStrIntPut(&defIndex, s.name, defs.len)
+            hashmaps.hashMapStrIntPut(defIndex, s.name, defs.len)
 
 
     # Collect imports from relocations.
@@ -787,18 +789,18 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
             if sym0 == nil:
                 continue
             if sym0.shndx == SHN_UNDEF:
-                let defIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, sym0.name)
+                let defIdxPlus1: int32 = defIndex[sym0.name]
                 if defIdxPlus1 <= 0:
                     if noLibc:
                         return Err[bool]("elf_linker: unresolved symbol in nolibc profile: " + sym0.name)
                     elif r0.rtype == R_AARCH64_CALL26:
-                        elfAddImport(&imports, &importIndex, sym0.name)
+                        elfAddImport(&imports, importIndex, sym0.name)
                     else:
                         return Err[bool]("elf_linker: unsupported undefined reloc type for " + sym0.name)
 
     # Ensure _start can call exit (dynamic profile only).
     if !noLibc:
-        elfAddImport(&imports, &importIndex, "exit")
+        elfAddImport(&imports, importIndex, "exit")
 
     var iimp: int32 = 0
     if !noLibc:
@@ -806,7 +808,7 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
         # Rebuild name->index map after sorting.
         importIndex = hashmaps.hashMapStrIntInit(1024)
         for iimp in 0..<imports.len:
-            hashmaps.hashMapStrIntPut(&importIndex, imports[iimp], iimp + 1)
+            hashmaps.hashMapStrIntPut(importIndex, imports[iimp], iimp + 1)
 
     # Append import stubs to .text (one per import; dynamic profile only).
     var stubOffs: uint64[]
@@ -1020,7 +1022,7 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
             var targetAddr: uint64 = 0
             var unresolved: bool = false
             if sym1 != nil && sym1.shndx == SHN_UNDEF:
-                let defIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, sym1.name)
+                let defIdxPlus1: int32 = defIndex[sym1.name]
                 if defIdxPlus1 <= 0:
                     unresolved = true
             if unresolved:
@@ -1028,7 +1030,7 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
                     return Err[bool]("elf_linker: unresolved symbol in nolibc profile: " + sym1.name)
                 if r1.rtype != R_AARCH64_CALL26:
                     return Err[bool]("elf_linker: unsupported undefined reloc type for " + sym1.name)
-                let idxImpPlus1: int32 = hashmaps.hashMapStrIntGetPtr(importIndex, sym1.name)
+                let idxImpPlus1: int32 = importIndex[sym1.name]
                 let idxImp: int32 = idxImpPlus1 - 1
                 if idxImpPlus1 <= 0 || idxImp < 0 || idxImp >= imports.len:
                     return Err[bool]("elf_linker: missing import stub: " + sym1.name)
@@ -1058,7 +1060,7 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
                     return Err[bool]("elf_linker: unsupported reloc type: " + intToStr(int32(r1.rtype)))
 
     # Patch _start stub calls.
-    let mainIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, "main")
+    let mainIdxPlus1: int32 = defIndex["main"]
     let mainIdx: int32 = mainIdxPlus1 - 1
     if mainIdxPlus1 <= 0 || mainIdx < 0 || mainIdx >= defs.len:
         return Err[bool]("elf_linker: missing main symbol (required for _start)")
@@ -1067,14 +1069,14 @@ fn elfLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[bool
 
     var exitAddr: uint64 = 0
     if noLibc:
-        let exitFnIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, "cheng_exit")
+        let exitFnIdxPlus1: int32 = defIndex["cheng_exit"]
         let exitFnIdx: int32 = exitFnIdxPlus1 - 1
         if exitFnIdxPlus1 <= 0 || exitFnIdx < 0 || exitFnIdx >= defs.len:
             return Err[bool]("elf_linker: nolibc profile requires `cheng_exit` symbol")
         let exitDef: ElfLinkDef = defs[exitFnIdx]
         exitAddr = textVaddr + exitDef.off
     else:
-        let exitImpIdxPlus1: int32 = hashmaps.hashMapStrIntGetPtr(importIndex, "exit")
+        let exitImpIdxPlus1: int32 = importIndex["exit"]
         let exitImpIdx: int32 = exitImpIdxPlus1 - 1
         if exitImpIdxPlus1 <= 0 || exitImpIdx < 0 || exitImpIdx >= stubOffs.len:
             return Err[bool]("elf_linker: missing exit import stub")

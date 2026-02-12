@@ -36,6 +36,23 @@ fn hashMapNextPow2(n0: int32, minCap: int32 = 8): int32 =
         cap = cap * 2
     return cap
 
+fn hashMapAllocZeroSeq[T](cap0: int32): T[] =
+    var out: T[]
+    if cap0 <= 0:
+        return out
+    let bytes64: int64 = int64(cap0) * sizeof T
+    if bytes64 <= 0 || bytes64 > int64(2147483647):
+        panic "hashmaps: allocation overflow"
+    let bytes: int32 = int32(bytes64)
+    let buffer: void* = realloc(nil, bytes)
+    if buffer == nil:
+        panic "cheng: out of memory"
+    zeroMem(buffer, bytes)
+    out.buffer = buffer
+    out.len = cap0
+    out.cap = cap0
+    return out
+
 fn hashMapHash64StrMeta(s: str): uint64 =
     var h: uint64 = (uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
     if s == nil:
@@ -79,15 +96,18 @@ fn hashMapStrIntInit(cap0: int32 = 16): HashMapStrInt =
 
 fn hashMapStrIntInitInPlace(m: var HashMapStrInt, cap0: int32 = 16) =
     let cap: int32 = hashMapNextPow2(cap0, 8)
-    m.keys.len = cap
-    m.vals.len = cap
-    m.states.len = cap
+    let keys: str[] = hashMapAllocZeroSeq[str](cap)
+    let vals: int32[] = hashMapAllocZeroSeq[int32](cap)
+    let states: uint8[] = hashMapAllocZeroSeq[uint8](cap)
+    for i in 0..<cap:
+        keys[i] = nil
+        vals[i] = 0
+        states[i] = uint8(0)
+    m.keys = keys
+    m.vals = vals
+    m.states = states
     m.mask = uint64(cap - 1)
     m.used = 0
-    for i in 0..<cap:
-        m.keys[i] = nil
-        m.vals[i] = 0
-        m.states[i] = uint8(0)
 
 fn hashMapStrIntClear(m: var HashMapStrInt) =
     if m.keys.len <= 0:
@@ -230,56 +250,9 @@ fn hashMapStrIntGet(m: var HashMapStrInt, key: str): int32 =
 fn hashMapStrIntGet(m: var HashMapStrInt, key: str, found: var bool): int32 =
     return hashMapStrIntGetMut(m, key, found)
 
-fn hashMapStrIntGet(m: HashMapStrInt*, key: str): int32 =
-    var found: bool = false
-    return hashMapStrIntGetPtr(m, key, &found)
-
-fn hashMapStrIntGetPtr(m: HashMapStrInt, key: str): int32 =
-    return hashMapStrIntGet(m, key)
-
-fn hashMapStrIntGetPtr(m: HashMapStrInt, key: str, found: bool*): int32 =
-    var ok: bool = false
-    let val: int32 = hashMapStrIntGet(m, key, ok)
-    if found != nil:
-        *found = ok
-    return val
-
-fn hashMapStrIntGet(m: HashMapStrInt*, key: str, found: bool*): int32 =
-    if m == nil:
-        if found != nil:
-            *found = false
-        return 0
-    if key == nil || key == "" || m->mask == 0:
-        if found != nil:
-            *found = false
-        return 0
-    let slot: int32 = hashMapStrIntFindSlot(*m, key, false)
-    if slot < 0:
-        if found != nil:
-            *found = false
-        return 0
-    if found != nil:
-        *found = true
-    if slot < 0 || slot >= m->vals.len || m->vals.buffer == nil:
-        if found != nil:
-            *found = false
-        return 0
-    let byteOffset: int32 = int32(int64(slot) * sizeof int32)
-    let p: int32* = int32*(ptr_add(m->vals.buffer, byteOffset))
-    return *p
-
-fn hashMapStrIntGetPtrRaw(m: HashMapStrInt*, key: str, found: bool*): int32 =
-    return hashMapStrIntGet(m, key, found)
-
-fn hashMapStrIntGetPtr(m: HashMapStrInt*, key: str, found: bool*): int32 =
-    return hashMapStrIntGetPtrRaw(m, key, found)
-
-fn hashMapStrIntGetPtr(m: HashMapStrInt*, key: str): int32 =
-    var found: bool = false
-    return hashMapStrIntGetPtr(m, key, &found)
-
 fn `[]`(m: HashMapStrInt, key: str): int32 =
-    return hashMapStrIntGet(m, key)
+    var found: bool = false
+    return hashMapStrIntGetEx(m, key, found)
 
 fn `[]=`(m: var HashMapStrInt, key: str, val: int32) =
     hashMapStrIntPut(m, key, val)
@@ -332,15 +305,11 @@ fn hashMapStrIntGetOrInsert(m: var HashMapStrInt, key: str, newVal: int32, found
 
 fn hashMapStrSeqIntInit(cap0: int32 = 16): HashMapStrSeqInt =
     let cap: int32 = hashMapNextPow2(cap0, 8)
-    var keys: str[cap]
-    var valStart: int32[cap]
-    var valLen: int32[cap]
-    var states: uint8[cap]
+    let keys: str[] = hashMapAllocZeroSeq[str](cap)
+    var valStart: int32[] = hashMapAllocZeroSeq[int32](cap)
+    let valLen: int32[] = hashMapAllocZeroSeq[int32](cap)
+    let states: uint8[] = hashMapAllocZeroSeq[uint8](cap)
     var pool: int32[]
-    keys.len = cap
-    valStart.len = cap
-    valLen.len = cap
-    states.len = cap
     for i in 0..<cap:
         valStart[i] = -1
     return HashMapStrSeqInt(keys: keys,
@@ -540,15 +509,18 @@ fn hashMapPtrIntInit(cap0: int32 = 1024): HashMapPtrInt =
 
 fn hashMapPtrIntInitInPlace(m: var HashMapPtrInt, cap0: int32 = 1024) =
     let cap: int32 = hashMapNextPow2(cap0, 8)
-    m.keys.len = cap
-    m.vals.len = cap
-    m.states.len = cap
+    let keys: int64[] = hashMapAllocZeroSeq[int64](cap)
+    let vals: int32[] = hashMapAllocZeroSeq[int32](cap)
+    let states: uint8[] = hashMapAllocZeroSeq[uint8](cap)
+    for i in 0..<cap:
+        keys[i] = 0
+        vals[i] = 0
+        states[i] = uint8(0)
+    m.keys = keys
+    m.vals = vals
+    m.states = states
     m.mask = uint64(cap - 1)
     m.used = 0
-    for i in 0..<cap:
-        m.keys[i] = 0
-        m.vals[i] = 0
-        m.states[i] = uint8(0)
 
 fn hashMapPtrIntClear(m: var HashMapPtrInt) =
     if m.keys.len <= 0:

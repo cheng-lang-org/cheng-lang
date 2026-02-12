@@ -6,7 +6,7 @@ import std/hashmaps
 
 type
     MirTypeKind = enum
-        mtVoid, mtI8, mtI16, mtI32, mtI64
+        mtVoid, mtI8, mtI16, mtI32, mtI64, mtF32, mtF64
 
     MirType =
         kind: MirTypeKind
@@ -173,7 +173,7 @@ fn mir_buildTypeAliasIndexCache(module: MirModule) =
     for i in 0..<module.typeAliases.len:
         let a: MirTypeAlias = module.typeAliases[i]
         if a.name != nil && len(a.name) > 0:
-            hashmaps.hashMapStrIntPut(&mir_typeAliases_cache, a.name, i)
+            hashmaps.hashMapStrIntPut(mir_typeAliases_cache, a.name, i)
     mir_typeAliases_cache_len = module.typeAliases.len
     mir_typeAliases_cache_ready = true
 
@@ -188,7 +188,7 @@ fn mir_buildObjTypeIndexCache(module: MirModule) =
     for i in 0..<module.objTypes.len:
         let t: MirObjType = module.objTypes[i]
         if t.name != nil && len(t.name) > 0:
-            hashmaps.hashMapStrIntPut(&mir_objTypes_cache, t.name, i)
+            hashmaps.hashMapStrIntPut(mir_objTypes_cache, t.name, i)
     mir_objTypes_cache_len = module.objTypes.len
     mir_objTypes_cache_ready = true
 
@@ -203,7 +203,7 @@ fn mir_buildCStringIndexCache(module: MirModule) =
     for i in 0..<module.cstrs.len:
         let c: MirCString = module.cstrs[i]
         if c.value != nil:
-            hashmaps.hashMapStrIntPut(&mir_cstrs_cache, c.value, i)
+            hashmaps.hashMapStrIntPut(mir_cstrs_cache, c.value, i)
     mir_cstrs_cache_len = module.cstrs.len
     mir_cstrs_cache_ready = true
 
@@ -246,6 +246,18 @@ fn mirTypeVoid(): MirType =
 fn mirTypeI64(): MirType =
     var t: MirType
     t.kind = mtI64
+    t.isUnsigned = false
+    return t
+
+fn mirTypeF32(): MirType =
+    var t: MirType
+    t.kind = mtF32
+    t.isUnsigned = false
+    return t
+
+fn mirTypeF64(): MirType =
+    var t: MirType
+    t.kind = mtF64
     t.isUnsigned = false
     return t
 
@@ -491,8 +503,12 @@ fn mirNewModule(target: str): MirModule =
     return m
 
 fn mirTypeSize(ty: MirType): int32 =
+    if ty.kind == mtF64:
+        return 8
     if ty.kind == mtI64:
         return 8
+    if ty.kind == mtF32:
+        return 4
     if ty.kind == mtI32:
         return 4
     if ty.kind == mtI16:
@@ -502,8 +518,12 @@ fn mirTypeSize(ty: MirType): int32 =
     return 0
 
 fn mirTypeAlignPow2(ty: MirType): int32 =
+    if ty.kind == mtF64:
+        return 3
     if ty.kind == mtI64:
         return 3
+    if ty.kind == mtF32:
+        return 2
     if ty.kind == mtI32:
         return 2
     if ty.kind == mtI16:
@@ -546,7 +566,7 @@ fn mirAddTypeAlias(module: MirModule, name: str, ty: MirType) =
         a2.ty = ty
         mirWriteTypeAlias(&module.typeAliases, idx, a2)
         if mir_typeAliases_cache_ready && mir_typeAliases_cache_module == module:
-            hashmaps.hashMapStrIntPut(&mir_typeAliases_cache, name, idx)
+            hashmaps.hashMapStrIntPut(mir_typeAliases_cache, name, idx)
             mir_typeAliases_cache_len = module.typeAliases.len
         return
     let newIdx: int32 = module.typeAliases.len
@@ -555,7 +575,7 @@ fn mirAddTypeAlias(module: MirModule, name: str, ty: MirType) =
     a.ty = ty
     add(module.typeAliases, a)
     if mir_typeAliases_cache_ready && mir_typeAliases_cache_module == module:
-        hashmaps.hashMapStrIntPut(&mir_typeAliases_cache, name, newIdx)
+        hashmaps.hashMapStrIntPut(mir_typeAliases_cache, name, newIdx)
         mir_typeAliases_cache_len = module.typeAliases.len
 
 fn mirFindObjType(module: MirModule, name: str): int32 =
@@ -595,13 +615,13 @@ fn mirAddObjType(module: MirModule, ty: MirObjType) =
     if idx >= 0:
         mirWriteObjType(&module.objTypes, idx, ty)
         if mir_objTypes_cache_ready && mir_objTypes_cache_module == module:
-            hashmaps.hashMapStrIntPut(&mir_objTypes_cache, ty.name, idx)
+            hashmaps.hashMapStrIntPut(mir_objTypes_cache, ty.name, idx)
             mir_objTypes_cache_len = module.objTypes.len
         return
     let newIdx: int32 = module.objTypes.len
     add(module.objTypes, ty)
     if mir_objTypes_cache_ready && mir_objTypes_cache_module == module:
-        hashmaps.hashMapStrIntPut(&mir_objTypes_cache, ty.name, newIdx)
+        hashmaps.hashMapStrIntPut(mir_objTypes_cache, ty.name, newIdx)
         mir_objTypes_cache_len = module.objTypes.len
 
 fn mirAddFunc(module: MirModule, func: MirFunc) =
@@ -682,7 +702,7 @@ fn mirAddCString(module: MirModule, value: str): str =
     c.value = v
     add(module.cstrs, c)
     if mir_cstrs_cache_ready && mir_cstrs_cache_module == module:
-        hashmaps.hashMapStrIntPut(&mir_cstrs_cache, v, newIdx)
+        hashmaps.hashMapStrIntPut(mir_cstrs_cache, v, newIdx)
         mir_cstrs_cache_len = module.cstrs.len
     return label
 
@@ -813,6 +833,10 @@ fn mirFormatExpr(expr: MirExpr): str =
     if expr.kind == meCast:
         if expr.castType.kind == mtVoid:
             return "void(" + mirFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtF64:
+            return "f64(" + mirFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtF32:
+            return "f32(" + mirFormatExpr(expr.castExpr) + ")"
         if expr.castType.kind == mtI64:
             return (expr.castType.isUnsigned ? "u64(" : "i64(") + mirFormatExpr(expr.castExpr) + ")"
         if expr.castType.kind == mtI32:
@@ -832,6 +856,10 @@ fn mirFormat(module: MirModule): str =
         out = out + "global " + g.name + ": "
         if g.ty.kind == mtVoid:
             out = out + "void"
+        elif g.ty.kind == mtF64:
+            out = out + "f64"
+        elif g.ty.kind == mtF32:
+            out = out + "f32"
         elif g.ty.kind == mtI64:
             out = out + (g.ty.isUnsigned ? "u64" : "i64")
         elif g.ty.kind == mtI32:
@@ -856,6 +884,10 @@ fn mirFormat(module: MirModule): str =
         out = out + "): "
         if f.retType.kind == mtVoid:
             out = out + "void\n"
+        elif f.retType.kind == mtF64:
+            out = out + "f64\n"
+        elif f.retType.kind == mtF32:
+            out = out + "f32\n"
         elif f.retType.kind == mtI64:
             out = out + (f.retType.isUnsigned ? "u64\n" : "i64\n")
         elif f.retType.kind == mtI32:

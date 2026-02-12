@@ -515,9 +515,11 @@ if [ -n "$abi_effective" ]; then
 fi
 abi_std_noptr_env=""
 abi_std_noptr_strict_env=""
+abi_no_ptr_non_c_abi_env=""
 if [ "$abi_effective" = "v2_noptr" ]; then
   abi_std_noptr_env="CHENG_STAGE1_STD_NO_POINTERS=1"
   abi_std_noptr_strict_env="CHENG_STAGE1_STD_NO_POINTERS_STRICT=1"
+  abi_no_ptr_non_c_abi_env="CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1"
 fi
 
 link_env=""
@@ -532,7 +534,7 @@ backend_whole_program_env="${CHENG_BACKEND_WHOLE_PROGRAM:-1}"
 
 if [ -n "$backend_target" ]; then
   # shellcheck disable=SC2086
-  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env \
+  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env \
     CHENG_BACKEND_TARGET="$backend_target" \
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_MULTI="$backend_multi_env" \
@@ -545,7 +547,7 @@ if [ -n "$backend_target" ]; then
     "$driver"
 else
   # shellcheck disable=SC2086
-  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env \
+  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env \
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_MULTI="$backend_multi_env" \
     CHENG_BACKEND_INCREMENTAL="$backend_inc_env" \

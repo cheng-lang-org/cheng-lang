@@ -588,7 +588,7 @@ fn machoMergeObjs(objs: MachoObjFile[]): Result[MachoLinkLayout] =
                             relAddr = objTextBase[oi] + symOffInSect
 
                         let isExtDef: bool = machoSymIsExt(sym)
-                        let oldIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name)
+                        let oldIdxPlus1: int32 = defIndex[sym.name]
                         if oldIdxPlus1 > 0:
                             if ! isExtDef:
                                 # Internal/local labels may legitimately collide across objects.
@@ -599,7 +599,7 @@ fn machoMergeObjs(objs: MachoObjFile[]): Result[MachoLinkLayout] =
                                     defAddr[oldIdx] = relAddr
                                 continue
                             return Err[MachoLinkLayout]("macho_linker: duplicate symbol: " + sym.name)
-                        hashmaps.hashMapStrIntPut(&defIndex, sym.name, defName.len + 1)
+                        hashmaps.hashMapStrIntPut(defIndex, sym.name, defName.len + 1)
                         add(defName, sym.name)
                         add(defAddr, relAddr)
 
@@ -618,12 +618,12 @@ fn machoMergeObjs(objs: MachoObjFile[]): Result[MachoLinkLayout] =
                         let sym: MachoObjSymbol = obj.symbols[r.symIndex]
                         if sym != nil && machoSymIsUndef(sym) && machoSymIsExt(sym):
                             if sym.name != nil && len(sym.name) > 0:
-                                let defIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name)
+                                let defIdxPlus1: int32 = defIndex[sym.name]
                                 if defIdxPlus1 > 0:
                                     continue
                                 if r.rtype == ARM64_RELOC_BRANCH26:
-                                    if hashmaps.hashMapStrIntGet(importNeeded, sym.name) == 0:
-                                        hashmaps.hashMapStrIntPut(&importNeeded, sym.name, 1)
+                                    if importNeeded[sym.name] == 0:
+                                        hashmaps.hashMapStrIntPut(importNeeded, sym.name, 1)
                                 else:
                                     return Err[MachoLinkLayout]("macho_linker: unsupported undefined reloc type for " + sym.name)
 
@@ -637,13 +637,13 @@ fn machoMergeObjs(objs: MachoObjFile[]): Result[MachoLinkLayout] =
         for si2 in 0..<obj.symbols.len:
             let sym2: MachoObjSymbol = obj.symbols[si2]
             if sym2 != nil && machoSymIsUndef(sym2) && machoSymIsExt(sym2):
-                let neededFlag: int32 = hashmaps.hashMapStrIntGet(importNeeded, sym2.name)
+                let neededFlag: int32 = importNeeded[sym2.name]
                 if neededFlag > 0:
-                    let defIdxPlus2: int32 = hashmaps.hashMapStrIntGet(defIndex, sym2.name)
+                    let defIdxPlus2: int32 = defIndex[sym2.name]
                     if defIdxPlus2 > 0:
                         continue
-                    if hashmaps.hashMapStrIntGet(importSeen, sym2.name) == 0:
-                        hashmaps.hashMapStrIntPut(&importSeen, sym2.name, 1)
+                    if importSeen[sym2.name] == 0:
+                        hashmaps.hashMapStrIntPut(importSeen, sym2.name, 1)
                         add(layout.imports, sym2.name)
 
     layout.defIndex = defIndex
@@ -746,7 +746,7 @@ fn machoLinkExeAarch64(objPaths: str[], outputPath: str, symtabAll: bool): Resul
     layout.linkeditVmaddr = layout.dataVmaddr + layout.dataSegVmSize
 
     # Resolve _main for LC_MAIN entryoff using prebuilt definition index.
-    let mainIdxPlus1: int32 = hashmaps.hashMapStrIntGet(layout.defIndex, "_main")
+    let mainIdxPlus1: int32 = layout.defIndex["_main"]
     let mainIdx: int32 = mainIdxPlus1 - 1
     if mainIdxPlus1 <= 0 || mainIdx < 0 || mainIdx >= layout.defAddr.len:
         for oi in 0..<objs.len:
@@ -767,7 +767,7 @@ fn machoLinkExeAarch64(objPaths: str[], outputPath: str, symtabAll: bool): Resul
     var importIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(layout.imports.len * 2 + 8)
     for pi in 0..<layout.imports.len:
         let name: str = layout.imports[pi]
-        hashmaps.hashMapStrIntPut(&importIndex, name, pi + 1)
+        hashmaps.hashMapStrIntPut(importIndex, name, pi + 1)
         let slotOff: uint64 = ptrSlotsOffInData + uint64(pi) * 8
         let slotAddr: uint64 = layout.dataVmaddr + slotOff
         ptrSlotAddrs[pi] = slotAddr
@@ -806,7 +806,7 @@ fn machoLinkExeAarch64(objPaths: str[], outputPath: str, symtabAll: bool): Resul
                 var targetAddr: uint64 = 0
                 var isImport: bool = false
                 var resolved: bool = false
-                let defIdxPlus1: int32 = hashmaps.hashMapStrIntGet(layout.defIndex, symName)
+                let defIdxPlus1: int32 = layout.defIndex[symName]
                 let defIdx: int32 = defIdxPlus1 - 1
                 if defIdxPlus1 > 0 && defIdx >= 0 && defIdx < layout.defAddr.len:
                     let relTarget: uint64 = layout.defAddr[defIdx]
@@ -816,7 +816,7 @@ fn machoLinkExeAarch64(objPaths: str[], outputPath: str, symtabAll: bool): Resul
                 if !resolved:
                     # Unresolved: for undefined BR26 targets, fall back to import stub.
                     if sym != nil && machoSymIsUndef(sym):
-                        let impIdxPlus1: int32 = hashmaps.hashMapStrIntGet(importIndex, symName)
+                        let impIdxPlus1: int32 = importIndex[symName]
                         if impIdxPlus1 > 0:
                             let impIdx: int32 = impIdxPlus1 - 1
                             isImport = true
@@ -871,9 +871,9 @@ fn machoLinkExeAarch64(objPaths: str[], outputPath: str, symtabAll: bool): Resul
                 let sym4: MachoObjSymbol = obj3.symbols[si4]
                 if sym4 != nil && machoSymIsSect(sym4) && machoSymIsExt(sym4):
                     if sym4.name != nil && len(sym4.name) > 0:
-                        if hashmaps.hashMapStrIntGet(extdefSeen, sym4.name) == 0:
-                            hashmaps.hashMapStrIntPut(&extdefSeen, sym4.name, 1)
-                            let defIdxPlus4: int32 = hashmaps.hashMapStrIntGet(layout.defIndex, sym4.name)
+                        if extdefSeen[sym4.name] == 0:
+                            hashmaps.hashMapStrIntPut(extdefSeen, sym4.name, 1)
+                            let defIdxPlus4: int32 = layout.defIndex[sym4.name]
                             let defIdx4: int32 = defIdxPlus4 - 1
                             if defIdxPlus4 <= 0 || defIdx4 < 0 || defIdx4 >= layout.defAddr.len:
                                 for oiFree0 in 0..<objs.len:

@@ -123,11 +123,13 @@ fn driver_strStripPrefix(s: str, prefix: str): str =
     return str(ptr_add(void*(s), off))
 
 fn driver_joinDir(dir: str, name: str): str =
-    if driver_strIsEmpty(dir):
-        if name == nil:
+    var dirLocal: str = dir
+    var nameLocal: str = name
+    if dirLocal == nil || len(dirLocal) == 0:
+        if nameLocal == nil || len(nameLocal) == 0:
             return ""
-        return "" + name
-    return dir + "/" + name
+        return "" + nameLocal
+    return dirLocal + "/" + nameLocal
 
 fn driver_shellQuote(s: str): str =
     if s == nil:
@@ -229,17 +231,6 @@ fn driver_strEq(a: str, b: str): bool =
         if a[i] != b[i]:
             return false
     return true
-
-fn driver_allocHashMapStrInt(cap0: int32): hashmaps.HashMapStrInt* =
-    # Bootstrap note: some seed compilers fail to resolve `sizeof Mod.Type`.
-    # Use the expression form (`sizeof tmp`) to keep stage0 compatibility.
-    var tmp: hashmaps.HashMapStrInt
-    let sizeBytes: int32 = int32(sizeof tmp)
-    let p: void* = alloc sizeBytes
-    zeroMem(p, int(sizeBytes))
-    let m: hashmaps.HashMapStrInt* = hashmaps.HashMapStrInt*(p)
-    *m = hashmaps.hashMapStrIntInit(cap0)
-    return m
 
 fn driver_allocByteReader(buf: bytes.ByteBuffer): bytes.ByteReader* =
     # Bootstrap note: some seed compilers fail to resolve `sizeof Mod.Type`.
@@ -360,16 +351,17 @@ fn driver_isPathLikeExe(s: str): bool =
     return driver_strContains(s, "/") || driver_strContains(s, "\\")
 
 fn driver_resolveSelfExeForParallel(raw: str): str =
-    if driver_strIsEmpty(raw):
+    var rawLocal: str = raw
+    if rawLocal == nil || len(rawLocal) == 0:
         return ""
-    if driver_isPathLikeExe(raw):
-        let abs: str = os.absolutePath(raw)
+    if driver_isPathLikeExe(rawLocal):
+        let abs: str = os.absolutePath(rawLocal)
         if frontend_lib.stage1_fileExists(abs):
             return abs
-        if frontend_lib.stage1_fileExists(raw):
-            return raw
+        if frontend_lib.stage1_fileExists(rawLocal):
+            return rawLocal
         return ""
-    return raw
+    return rawLocal
 
 fn driver_fileStateStamp(path: str): str =
     if driver_strIsEmpty(path):
@@ -528,14 +520,14 @@ fn driver_setDepBit(depBits: DriverSeqSeqU64*, fromIdx: int32, toIdx: int32): bo
     return true
 
 fn driver_collectExprUnitDeps(expr: MirExpr, ownerUnit: int32, depBits: DriverSeqSeqU64*,
-                              fnOwners: hashmaps.HashMapStrInt*,
-                              globalOwners: hashmaps.HashMapStrInt*) =
+                              fnOwners: hashmaps.HashMapStrInt,
+                              globalOwners: hashmaps.HashMapStrInt) =
     if expr == nil:
         return
     if expr.kind == meCall:
         if driver_strNonEmpty(expr.callee):
             var foundFn: bool = false
-            let depFn: int32 = hashmaps.hashMapStrIntGetPtrRaw(fnOwners, expr.callee,&foundFn)
+            let depFn: int32 = hashmaps.hashMapStrIntGetEx(fnOwners, expr.callee, foundFn)
             if foundFn && depFn >= 0 && depFn != ownerUnit:
                 driver_setDepBit(depBits, ownerUnit, depFn)
         for ai in 0..<expr.args.len:
@@ -544,7 +536,7 @@ fn driver_collectExprUnitDeps(expr: MirExpr, ownerUnit: int32, depBits: DriverSe
     if expr.kind == meGlobalAddr:
         if driver_strNonEmpty(expr.globalName):
             var foundGlobal: bool = false
-            let depGlobal: int32 = hashmaps.hashMapStrIntGetPtrRaw(globalOwners, expr.globalName,&foundGlobal)
+            let depGlobal: int32 = hashmaps.hashMapStrIntGetEx(globalOwners, expr.globalName, foundGlobal)
             if foundGlobal && depGlobal >= 0 && depGlobal != ownerUnit:
                 driver_setDepBit(depBits, ownerUnit, depGlobal)
         return
@@ -560,8 +552,8 @@ fn driver_collectExprUnitDeps(expr: MirExpr, ownerUnit: int32, depBits: DriverSe
         return
 
 fn driver_collectFuncUnitDeps(f: MirFunc, ownerUnit: int32, depBits: DriverSeqSeqU64*,
-                              fnOwners: hashmaps.HashMapStrInt*,
-                              globalOwners: hashmaps.HashMapStrInt*) =
+                              fnOwners: hashmaps.HashMapStrInt,
+                              globalOwners: hashmaps.HashMapStrInt) =
     if f == nil:
         return
     for bi in 0..<f.blocks.len:
@@ -574,16 +566,21 @@ fn driver_collectFuncUnitDeps(f: MirFunc, ownerUnit: int32, depBits: DriverSeqSe
             driver_collectExprUnitDeps(block.term.retExpr, ownerUnit, depBits, fnOwners, globalOwners)
             driver_collectExprUnitDeps(block.term.condExpr, ownerUnit, depBits, fnOwners, globalOwners)
 
-fn driver_callNameSetAdd(names: hashmaps.HashMapStrInt*, callee: str) =
-    if names == nil || driver_strIsEmpty(callee):
+fn driver_callNameSetAdd(names: var hashmaps.HashMapStrInt, callee: str) =
+    if driver_strIsEmpty(callee):
         return
-    var found: bool = false
-    hashmaps.hashMapStrIntGetPtrRaw(names, callee,&found)
-    if ! found:
-        hashmaps.hashMapStrIntPut(names, callee, 1)
+    var snap: hashmaps.HashMapStrInt
+    snap.keys = names.keys
+    snap.vals = names.vals
+    snap.states = names.states
+    snap.mask = names.mask
+    snap.used = names.used
+    if snap[callee] != 0:
+        return
+    hashmaps.hashMapStrIntPut(names, callee, 1)
 
-fn driver_collectExprCallNames(expr: MirExpr, names: hashmaps.HashMapStrInt*) =
-    if expr == nil || names == nil:
+fn driver_collectExprCallNames(expr: MirExpr, names: var hashmaps.HashMapStrInt) =
+    if expr == nil:
         return
     if expr.kind == meCall:
         driver_callNameSetAdd(names, expr.callee)
@@ -601,8 +598,8 @@ fn driver_collectExprCallNames(expr: MirExpr, names: hashmaps.HashMapStrInt*) =
         driver_collectExprCallNames(expr.addrExpr, names)
         return
 
-fn driver_collectFuncCallNames(f: MirFunc, names: hashmaps.HashMapStrInt*) =
-    if f == nil || names == nil:
+fn driver_collectFuncCallNames(f: MirFunc, names: var hashmaps.HashMapStrInt) =
+    if f == nil:
         return
     for bi in 0..<f.blocks.len:
         let block: MirBlock = f.blocks[bi]
@@ -614,8 +611,8 @@ fn driver_collectFuncCallNames(f: MirFunc, names: hashmaps.HashMapStrInt*) =
             driver_collectExprCallNames(block.term.retExpr, names)
             driver_collectExprCallNames(block.term.condExpr, names)
 
-fn driver_collectExprGlobalNames(expr: MirExpr, names: hashmaps.HashMapStrInt*) =
-    if expr == nil || names == nil:
+fn driver_collectExprGlobalNames(expr: MirExpr, names: var hashmaps.HashMapStrInt) =
+    if expr == nil:
         return
     if expr.kind == meGlobalAddr:
         driver_callNameSetAdd(names, expr.globalName)
@@ -635,8 +632,8 @@ fn driver_collectExprGlobalNames(expr: MirExpr, names: hashmaps.HashMapStrInt*) 
         driver_collectExprGlobalNames(expr.addrExpr, names)
         return
 
-fn driver_collectFuncGlobalNames(f: MirFunc, names: hashmaps.HashMapStrInt*) =
-    if f == nil || names == nil:
+fn driver_collectFuncGlobalNames(f: MirFunc, names: var hashmaps.HashMapStrInt) =
+    if f == nil:
         return
     for bi in 0..<f.blocks.len:
         let block: MirBlock = f.blocks[bi]
@@ -657,7 +654,7 @@ fn driver_buildUnitDependencyGraph(module: MirModule, unitFiles: str[]): DriverS
     var depBits: DriverSeqSeqU64 = driver_newSeq2DU64(n, words)
     var unitIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(n * 2 + 8)
     for unitIdx in 0..<n:
-        hashmaps.hashMapStrIntPut(&unitIndex, unitFiles[unitIdx], unitIdx)
+        hashmaps.hashMapStrIntPut(unitIndex, unitFiles[unitIdx], unitIdx)
 
     var fnOwners: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(module.funcs.len * 2 + 8)
     for i in 0..<module.funcs.len:
@@ -665,12 +662,12 @@ fn driver_buildUnitDependencyGraph(module: MirModule, unitFiles: str[]): DriverS
         if f != nil && ! f.isExtern && driver_strNonEmpty(f.name):
             let ownerKey: str = driver_unitOwnerKey(f.originFile)
             var foundOwner: bool = false
-            let ownerIdx: int32 = hashmaps.hashMapStrIntGetPtrRaw(&unitIndex, ownerKey,&foundOwner)
+            let ownerIdx: int32 = hashmaps.hashMapStrIntGetEx(unitIndex, ownerKey, foundOwner)
             if foundOwner:
                 var exists: bool = false
-                hashmaps.hashMapStrIntGetPtrRaw(&fnOwners, f.name,&exists)
+                let _seenFnOwner: int32 = hashmaps.hashMapStrIntGetEx(fnOwners, f.name, exists)
                 if ! exists:
-                    hashmaps.hashMapStrIntPut(&fnOwners, f.name, ownerIdx)
+                    hashmaps.hashMapStrIntPut(fnOwners, f.name, ownerIdx)
 
     var globalOwners: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(module.globals.len * 2 + 8)
     for i in 0..<module.globals.len:
@@ -678,21 +675,21 @@ fn driver_buildUnitDependencyGraph(module: MirModule, unitFiles: str[]): DriverS
         if driver_strNonEmpty(g.name):
             let ownerKey2: str = driver_unitOwnerKey(g.originFile)
             var foundOwner2: bool = false
-            let ownerIdx2: int32 = hashmaps.hashMapStrIntGetPtrRaw(&unitIndex, ownerKey2,&foundOwner2)
+            let ownerIdx2: int32 = hashmaps.hashMapStrIntGetEx(unitIndex, ownerKey2, foundOwner2)
             if foundOwner2:
                 var exists2: bool = false
-                hashmaps.hashMapStrIntGetPtrRaw(&globalOwners, g.name,&exists2)
+                let _seenGlobalOwner: int32 = hashmaps.hashMapStrIntGetEx(globalOwners, g.name, exists2)
                 if ! exists2:
-                    hashmaps.hashMapStrIntPut(&globalOwners, g.name, ownerIdx2)
+                    hashmaps.hashMapStrIntPut(globalOwners, g.name, ownerIdx2)
 
     for i in 0..<module.funcs.len:
         let f2: MirFunc = module.funcs[i]
         if f2 != nil && ! f2.isExtern:
             let ownerKey3: str = driver_unitOwnerKey(f2.originFile)
             var foundOwner3: bool = false
-            let ownerIdx3: int32 = hashmaps.hashMapStrIntGetPtrRaw(&unitIndex, ownerKey3,&foundOwner3)
+            let ownerIdx3: int32 = hashmaps.hashMapStrIntGetEx(unitIndex, ownerKey3, foundOwner3)
             if foundOwner3:
-                driver_collectFuncUnitDeps(f2, ownerIdx3, &depBits, &fnOwners, &globalOwners)
+                driver_collectFuncUnitDeps(f2, ownerIdx3, &depBits, fnOwners, globalOwners)
     for ui in 0..<n:
         var rowOut: int32[]
         let rowBits: uint64[] = driver_getRowU64(depBits, ui)
@@ -1047,12 +1044,16 @@ fn driver_seqContainsStr(items: str[], value: str): bool =
             return true
     return false
 
-fn driver_mapAddUniqueStr(items: str[]*, seen: hashmaps.HashMapStrInt*, value: str) =
-    if items == nil || seen == nil || driver_strIsEmpty(value):
+fn driver_mapAddUniqueStr(items: var str[], seen: var hashmaps.HashMapStrInt, value: str) =
+    if driver_strIsEmpty(value):
         return
-    var exists: bool = false
-    hashmaps.hashMapStrIntGetPtrRaw(seen, value,&exists)
-    if exists:
+    var snap: hashmaps.HashMapStrInt
+    snap.keys = seen.keys
+    snap.vals = seen.vals
+    snap.states = seen.states
+    snap.mask = seen.mask
+    snap.used = seen.used
+    if snap[value] != 0:
         return
     hashmaps.hashMapStrIntPut(seen, value, 1)
     add(items, value)
@@ -1110,17 +1111,17 @@ fn driver_collectUnitFiles(module: MirModule): str[] =
         let f: MirFunc = module.funcs[i]
         if f != nil && ! f.isExtern:
             if driver_strNonEmpty(f.originFile):
-                driver_mapAddUniqueStr(&out, &seen, f.originFile)
+                driver_mapAddUniqueStr(out, seen, f.originFile)
             else:
                 hasShared = true
     for i in 0..<module.globals.len:
         let g: MirGlobal = module.globals[i]
         if driver_strNonEmpty(g.originFile):
-            driver_mapAddUniqueStr(&out, &seen, g.originFile)
+            driver_mapAddUniqueStr(out, seen, g.originFile)
         else:
             hasShared = true
     if hasShared:
-        driver_mapAddUniqueStr(&out, &seen, driver_sharedUnitFile())
+        driver_mapAddUniqueStr(out, seen, driver_sharedUnitFile())
     driver_sortStringsStable(&out)
     return out
 
@@ -1138,11 +1139,11 @@ fn driver_cloneExternFunc(f: MirFunc): MirFunc =
 type
     DriverUnitIndex = ref
         unitFiles: str[]
-        unitIndex: hashmaps.HashMapStrInt*
+        unitIndex: hashmaps.HashMapStrInt
         # Only non-extern (definition) items are indexed here.
         unitFuncIdx: DriverSeqSeqInt32
         unitGlobalIdx: DriverSeqSeqInt32
-        nameToFuncIdx: hashmaps.HashMapStrInt*
+        nameToFuncIdx: hashmaps.HashMapStrInt
 
 fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
     let dbg: bool = driver_envIsTrue("CHENG_BACKEND_DEBUG_UNIT_INDEX")
@@ -1158,13 +1159,14 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
     var out: DriverUnitIndex
     new out
     out.unitFiles = unitFiles
-    out.unitIndex = driver_allocHashMapStrInt(unitFiles.len * 2 + 8)
+    var unitIndexMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(unitFiles.len * 2 + 8)
     out.unitFuncIdx = driver_newSeq2DInt(unitFiles.len)
     out.unitGlobalIdx = driver_newSeq2DInt(unitFiles.len)
-    out.nameToFuncIdx = driver_allocHashMapStrInt((full != nil) ? (full.funcs.len * 2 + 8) : 16)
+    var nameToFuncIdxMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit((full != nil) ? (full.funcs.len * 2 + 8) : 16)
 
     for ui in 0..<unitFiles.len:
-        hashmaps.hashMapStrIntPut(out.unitIndex, unitFiles[ui], ui)
+        hashmaps.hashMapStrIntPut(unitIndexMap, unitFiles[ui], ui)
+    out.unitIndex = unitIndexMap
     if dbg:
         let f: os.File = os.get_stderr()
         os.writeLine(f, "backend_driver: unit_index map_ready")
@@ -1180,14 +1182,12 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
         if dbg:
             let fptr: int64 = int64(uint64(void*(f)))
             let nptr: int64 = int64(uint64(void*(fname)))
-            let mptr: int64 = int64(uint64(void*(out.nameToFuncIdx)))
             let fdbg: os.File = os.get_stderr()
             os.writeLine(fdbg, "backend_driver: unit_index func i=" + intToStr(fi) +
                                " f_nil=" + driver_bool01(f == nil) +
                                " name_nil=" + driver_bool01(fname == nil) +
                                " f_ptr=0x" + mirU64ToHex(fptr) +
-                               " name_ptr=0x" + mirU64ToHex(nptr) +
-                               " map_ptr=0x" + mirU64ToHex(mptr))
+                               " name_ptr=0x" + mirU64ToHex(nptr))
             os.c_fflush fdbg
         if fname != nil:
             if dbg:
@@ -1201,57 +1201,56 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
                 os.c_fflush fdbg3
         if fname != nil && fnameLen > 0:
             var exists: bool = false
-            if out.nameToFuncIdx != nil:
-                if dbg:
-                    let m0: hashmaps.HashMapStrInt* = out.nameToFuncIdx
-                    let mask0: int64 = (m0 != nil) ? int64(m0->mask) : int64(0)
-                    let used0: int32 = (m0 != nil) ? m0->used : -1
-                    let keysLen0: int32 = (m0 != nil) ? m0->keys.len : -1
-                    let keysCap0: int32 = (m0 != nil) ? m0->keys.cap : -1
-                    let valsLen0: int32 = (m0 != nil) ? m0->vals.len : -1
-                    let valsCap0: int32 = (m0 != nil) ? m0->vals.cap : -1
-                    let keysBuf0: int64 = (m0 != nil) ? int64(uint64(void*(m0->keys.buffer))) : int64(0)
-                    let valsBuf0: int64 = (m0 != nil) ? int64(uint64(void*(m0->vals.buffer))) : int64(0)
-                    let fdbg3b: os.File = os.get_stderr()
-                    os.writeLine(fdbg3b, "backend_driver: unit_index func i=" + intToStr(fi) +
-                                         " name_to_func mask=0x" + mirU64ToHex(mask0) +
-                                         " used=" + intToStr(used0) +
-                                         " keys.len=" + intToStr(keysLen0) +
-                                         " keys.cap=" + intToStr(keysCap0) +
-                                         " keys.buf=0x" + mirU64ToHex(keysBuf0) +
-                                         " vals.len=" + intToStr(valsLen0) +
-                                         " vals.cap=" + intToStr(valsCap0) +
-                                         " vals.buf=0x" + mirU64ToHex(valsBuf0))
-                    os.c_fflush fdbg3b
-                    if m0 != nil:
-                        for ki0 in 0..<4:
-                            if !(ki0 < m0->keys.len):
-                                break
-                            let keys0: str[] = m0->keys
-                            let cur0: str = keys0[ki0]
-                            let curp0: int64 = int64(uint64(void*(cur0)))
-                            let fdbgKeys: os.File = os.get_stderr()
-                            os.writeLine(fdbgKeys, "backend_driver: unit_index func i=" + intToStr(fi) +
-                                                   " name_to_func keys[" + intToStr(ki0) + "]=0x" + mirU64ToHex(curp0))
-                            os.c_fflush fdbgKeys
-                    let fdbg4: os.File = os.get_stderr()
-                    os.writeLine(fdbg4, "backend_driver: unit_index func i=" + intToStr(fi) + " probe_get_literal_start")
-                    os.c_fflush fdbg4
-                    var probeFound: bool = false
-                    hashmaps.hashMapStrIntGetPtrRaw(out.nameToFuncIdx, "k1",&probeFound)
-                    let fdbg5: os.File = os.get_stderr()
-                    os.writeLine(fdbg5, "backend_driver: unit_index func i=" + intToStr(fi) + " probe_get_literal_ok")
-                    os.c_fflush fdbg5
-                    let fdbg6: os.File = os.get_stderr()
-                    os.writeLine(fdbg6, "backend_driver: unit_index func i=" + intToStr(fi) + " get_name_start")
-                    os.c_fflush fdbg6
-                hashmaps.hashMapStrIntGetPtrRaw(out.nameToFuncIdx, fname,&exists)
-                if dbg:
-                    let fdbg7: os.File = os.get_stderr()
-                    os.writeLine(fdbg7, "backend_driver: unit_index func i=" + intToStr(fi) + " get_name_ok exists=" + driver_bool01(exists))
-                    os.c_fflush fdbg7
+            if dbg:
+                let m0: hashmaps.HashMapStrInt = nameToFuncIdxMap
+                let mask0: int64 = int64(m0.mask)
+                let used0: int32 = m0.used
+                let keysLen0: int32 = m0.keys.len
+                let keysCap0: int32 = m0.keys.cap
+                let valsLen0: int32 = m0.vals.len
+                let valsCap0: int32 = m0.vals.cap
+                let keysBuf0: int64 = int64(uint64(void*(m0.keys.buffer)))
+                let valsBuf0: int64 = int64(uint64(void*(m0.vals.buffer)))
+                let fdbg3b: os.File = os.get_stderr()
+                os.writeLine(fdbg3b, "backend_driver: unit_index func i=" + intToStr(fi) +
+                                     " name_to_func mask=0x" + mirU64ToHex(mask0) +
+                                     " used=" + intToStr(used0) +
+                                     " keys.len=" + intToStr(keysLen0) +
+                                     " keys.cap=" + intToStr(keysCap0) +
+                                     " keys.buf=0x" + mirU64ToHex(keysBuf0) +
+                                     " vals.len=" + intToStr(valsLen0) +
+                                     " vals.cap=" + intToStr(valsCap0) +
+                                     " vals.buf=0x" + mirU64ToHex(valsBuf0))
+                os.c_fflush fdbg3b
+                for ki0 in 0..<4:
+                    if !(ki0 < m0.keys.len):
+                        break
+                    let keys0: str[] = m0.keys
+                    let cur0: str = keys0[ki0]
+                    let curp0: int64 = int64(uint64(void*(cur0)))
+                    let fdbgKeys: os.File = os.get_stderr()
+                    os.writeLine(fdbgKeys, "backend_driver: unit_index func i=" + intToStr(fi) +
+                                               " name_to_func keys[" + intToStr(ki0) + "]=0x" + mirU64ToHex(curp0))
+                    os.c_fflush fdbgKeys
+                let fdbg4: os.File = os.get_stderr()
+                os.writeLine(fdbg4, "backend_driver: unit_index func i=" + intToStr(fi) + " probe_get_literal_start")
+                os.c_fflush fdbg4
+                var probeFound: bool = false
+                let _probeVal: int32 = hashmaps.hashMapStrIntGetEx(nameToFuncIdxMap, "k1", probeFound)
+                let fdbg5: os.File = os.get_stderr()
+                os.writeLine(fdbg5, "backend_driver: unit_index func i=" + intToStr(fi) + " probe_get_literal_ok")
+                os.c_fflush fdbg5
+                let fdbg6: os.File = os.get_stderr()
+                os.writeLine(fdbg6, "backend_driver: unit_index func i=" + intToStr(fi) + " get_name_start")
+                os.c_fflush fdbg6
+            let _seenNameToFunc: int32 = hashmaps.hashMapStrIntGetEx(nameToFuncIdxMap, fname, exists)
+            if dbg:
+                let fdbg7: os.File = os.get_stderr()
+                os.writeLine(fdbg7, "backend_driver: unit_index func i=" + intToStr(fi) + " get_name_ok exists=" + driver_bool01(exists))
+                os.c_fflush fdbg7
             if ! exists:
-                hashmaps.hashMapStrIntPut(out.nameToFuncIdx, fname, fi)
+                hashmaps.hashMapStrIntPut(nameToFuncIdxMap, fname, fi)
+    out.nameToFuncIdx = nameToFuncIdxMap
     if dbg:
         let f: os.File = os.get_stderr()
         os.writeLine(f, "backend_driver: unit_index name_to_func_ready")
@@ -1261,9 +1260,7 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
         let g: MirGlobal = full.globals[gi]
         let ownerKey: str = driver_unitOwnerKey(g.originFile)
         var foundOwner: bool = false
-        var ownerIdx: int32 = -1
-        if out.unitIndex != nil:
-            ownerIdx = hashmaps.hashMapStrIntGetPtrRaw(out.unitIndex, ownerKey,&foundOwner)
+        let ownerIdx: int32 = hashmaps.hashMapStrIntGetEx(unitIndexMap, ownerKey, foundOwner)
         if foundOwner && ownerIdx >= 0 && ownerIdx < out.unitGlobalIdx.len:
             var row: int32[] = driver_getRowInt32(out.unitGlobalIdx, ownerIdx)
             add(row, gi)
@@ -1278,9 +1275,7 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
         if f2 != nil && !f2.isExtern:
             let ownerKey2: str = driver_unitOwnerKey(f2.originFile)
             var foundOwner2: bool = false
-            var ownerIdx2: int32 = -1
-            if out.unitIndex != nil:
-                ownerIdx2 = hashmaps.hashMapStrIntGetPtrRaw(out.unitIndex, ownerKey2,&foundOwner2)
+            let ownerIdx2: int32 = hashmaps.hashMapStrIntGetEx(unitIndexMap, ownerKey2, foundOwner2)
             if foundOwner2 && ownerIdx2 >= 0 && ownerIdx2 < out.unitFuncIdx.len:
                 var row2: int32[] = driver_getRowInt32(out.unitFuncIdx, ownerIdx2)
                 add(row2, fi)
@@ -1299,21 +1294,22 @@ type
         unitFiles: str[]
         unitFuncIdx: DriverSeqSeqInt32
         unitGlobalIdx: DriverSeqSeqInt32
-        nameToFuncIdx: hashmaps.HashMapStrInt*
+        nameToFuncIdx: hashmaps.HashMapStrInt
 
 type
     DriverCacheStrTab = ref
         items: str[]
-        index: hashmaps.HashMapStrInt*
+        index: hashmaps.HashMapStrInt
 
 fn driver_cacheStrTabInit(cap0: int32): DriverCacheStrTab =
     var tab: DriverCacheStrTab
     new tab
     tab.items = []
-    tab.index = driver_allocHashMapStrInt((cap0 > 0) ? cap0 : 16)
+    var indexMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit((cap0 > 0) ? cap0 : 16)
     # Index 0 is always empty string.
     add(tab.items, "")
-    hashmaps.hashMapStrIntPut(tab.index, "", 0)
+    hashmaps.hashMapStrIntPut(indexMap, "", 0)
+    tab.index = indexMap
     return tab
 
 fn driver_cacheStrTabIndex(tab: DriverCacheStrTab, s: str): int32 =
@@ -1322,14 +1318,14 @@ fn driver_cacheStrTabIndex(tab: DriverCacheStrTab, s: str): int32 =
     if driver_strIsEmpty(s):
         return 0
     var found: bool = false
-    var idx: int32 = 0
-    if tab.index != nil:
-        idx = hashmaps.hashMapStrIntGetPtrRaw(tab.index, s,&found)
+    var indexMap: hashmaps.HashMapStrInt = tab.index
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(indexMap, s, found)
     if found:
         return idx
     let newIdx: int32 = tab.items.len
     add(tab.items, s)
-    hashmaps.hashMapStrIntPut(tab.index, s, newIdx)
+    hashmaps.hashMapStrIntPut(indexMap, s, newIdx)
+    tab.index = indexMap
     return newIdx
 
 fn driver_cacheCollectExprStrings(expr: MirExpr, tab: DriverCacheStrTab) =
@@ -1420,15 +1416,11 @@ fn driver_cacheCollectModuleStrings(module: MirModule, idx: DriverUnitIndex, tab
     if idx != nil:
         for ui in 0..<idx.unitFiles.len:
             driver_cacheStrTabIndex(tab, idx.unitFiles[ui])
-        if idx.nameToFuncIdx != nil:
-            # Keep stage0 bootstrap compatible by avoiding `idx.field->subfield`
-            # (stage0 seeds can misparse chained dot/arrow expressions).
-            let nameToFuncIdx: hashmaps.HashMapStrInt* = idx.nameToFuncIdx
-            let keys: str[] = nameToFuncIdx->keys
-            for si2 in 0..<keys.len:
-                let k: str = keys[si2]
-                if driver_strNonEmpty(k):
-                    driver_cacheStrTabIndex(tab, k)
+        let keys: str[] = idx.nameToFuncIdx.keys
+        for si2 in 0..<keys.len:
+            let k: str = keys[si2]
+            if driver_strNonEmpty(k):
+                driver_cacheStrTabIndex(tab, k)
 
 fn driver_bufAddU8Ptr(buf: uint8[]*, v: uint8) =
     if buf == nil:
@@ -1627,18 +1619,15 @@ fn driver_cacheBufUnitIndex(buf: uint8[]*, tab: DriverCacheStrTab, idx: DriverUn
         for k in 0..<row2.len:
             driver_cacheBufI32(buf, row2[k])
     # nameToFuncIdx pairs
-    let nameToFuncIdx: hashmaps.HashMapStrInt* = idx.nameToFuncIdx
-    if nameToFuncIdx != nil:
-        driver_cacheBufU32(buf, uint32(nameToFuncIdx->used))
-        let keys: str[] = nameToFuncIdx->keys
-        let vals: int32[] = nameToFuncIdx->vals
-        for si in 0..<keys.len:
-            let key: str = keys[si]
-            if key != nil:
-                driver_cacheBufStrIdx(buf, tab, key)
-                driver_cacheBufI32(buf, vals[si])
-    else:
-        driver_cacheBufU32(buf, 0)
+    let nameToFuncIdx: hashmaps.HashMapStrInt = idx.nameToFuncIdx
+    driver_cacheBufU32(buf, uint32(nameToFuncIdx.used))
+    let keys: str[] = nameToFuncIdx.keys
+    let vals: int32[] = nameToFuncIdx.vals
+    for si in 0..<keys.len:
+        let key: str = keys[si]
+        if key != nil:
+            driver_cacheBufStrIdx(buf, tab, key)
+            driver_cacheBufI32(buf, vals[si])
 
 fn driver_writeModuleCache(path: str, module: MirModule, idx: DriverUnitIndex,
                            compileStampHash: int64, unitStateHashes: int64[]): bool =
@@ -1931,7 +1920,7 @@ fn driver_cacheReadUnitIndex(cr: DriverCacheReader*, strings: str[], module: Mir
             add(row2, driver_cacheReadI32(cr))
         driver_addRowInt32(unitGlobalIdx, row2)
     let pairs: int32 = int32(driver_cacheReadU32(cr))
-    var nameToFuncIdx: hashmaps.HashMapStrInt* = driver_allocHashMapStrInt(pairs * 2 + 8)
+    var nameToFuncIdx: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(pairs * 2 + 8)
     for pi in 0..<pairs:
         let k: str = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
         let v: int32 = driver_cacheReadI32(cr)
@@ -1940,9 +1929,10 @@ fn driver_cacheReadUnitIndex(cr: DriverCacheReader*, strings: str[], module: Mir
     var out: DriverUnitIndex
     new out
     out.unitFiles = unitFiles
-    out.unitIndex = driver_allocHashMapStrInt(unitFiles.len * 2 + 8)
+    var unitIndexMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(unitFiles.len * 2 + 8)
     for i in 0..<unitFiles.len:
-        hashmaps.hashMapStrIntPut(out.unitIndex, unitFiles[i], i)
+        hashmaps.hashMapStrIntPut(unitIndexMap, unitFiles[i], i)
+    out.unitIndex = unitIndexMap
     out.unitFuncIdx = unitFuncIdx
     out.unitGlobalIdx = unitGlobalIdx
     out.nameToFuncIdx = nameToFuncIdx
@@ -2024,9 +2014,10 @@ fn driver_moduleCacheToUnitIndex(cache: DriverModuleCache): DriverUnitIndex =
     var out: DriverUnitIndex
     new out
     out.unitFiles = cache.unitFiles
-    out.unitIndex = driver_allocHashMapStrInt(cache.unitFiles.len * 2 + 8)
+    var unitIndexMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(cache.unitFiles.len * 2 + 8)
     for i in 0..<cache.unitFiles.len:
-        hashmaps.hashMapStrIntPut(out.unitIndex, cache.unitFiles[i], i)
+        hashmaps.hashMapStrIntPut(unitIndexMap, cache.unitFiles[i], i)
+    out.unitIndex = unitIndexMap
     out.unitFuncIdx = cache.unitFuncIdx
     out.unitGlobalIdx = cache.unitGlobalIdx
     out.nameToFuncIdx = cache.nameToFuncIdx
@@ -2058,14 +2049,14 @@ fn driver_buildUnitModuleFromIndex(full: MirModule, filePath: str, unitIdx: int3
             let f: MirFunc = full.funcs[fIdx]
             if f != nil && !f.isExtern:
                 mirAddFunc(unit, f)
-                driver_collectFuncCallNames(f, &neededExternNames)
-                driver_collectFuncGlobalNames(f, &neededGlobalNames)
+                driver_collectFuncCallNames(f, neededExternNames)
+                driver_collectFuncGlobalNames(f, neededGlobalNames)
 
     for ci in 0..<full.cstrs.len:
         let c: MirCString = full.cstrs[ci]
         var useCstr: bool = false
         if driver_strNonEmpty(c.label):
-            hashmaps.hashMapStrIntGetPtrRaw(&neededGlobalNames, c.label,&useCstr)
+            let _seenCstr0: int32 = hashmaps.hashMapStrIntGetEx(neededGlobalNames, c.label, useCstr)
         if useCstr:
             add(unit.cstrs, c)
 
@@ -2076,9 +2067,7 @@ fn driver_buildUnitModuleFromIndex(full: MirModule, filePath: str, unitIdx: int3
         let callee: str = neededExternNames.keys[si]
         if driver_strNonEmpty(callee):
             var foundSrc: bool = false
-            var srcIdx: int32 = -1
-            if idx.nameToFuncIdx != nil:
-                srcIdx = hashmaps.hashMapStrIntGetPtrRaw(idx.nameToFuncIdx, callee,&foundSrc)
+            let srcIdx: int32 = hashmaps.hashMapStrIntGetEx(idx.nameToFuncIdx, callee, foundSrc)
             if foundSrc && srcIdx >= 0 && srcIdx < needExternByIdx.len:
                 let srcFunc: MirFunc = full.funcs[srcIdx]
                 if srcFunc != nil:
@@ -2124,22 +2113,22 @@ fn driver_buildUnitModule(full: MirModule, filePath: str): MirModule =
         if f != nil:
             if driver_strNonEmpty(f.name):
                 var nameExists: bool = false
-                hashmaps.hashMapStrIntGetPtrRaw(&nameToFuncIdx, f.name,&nameExists)
+                let _seenFuncName: int32 = hashmaps.hashMapStrIntGetEx(nameToFuncIdx, f.name, nameExists)
                 if ! nameExists:
-                    hashmaps.hashMapStrIntPut(&nameToFuncIdx, f.name, fi)
+                    hashmaps.hashMapStrIntPut(nameToFuncIdx, f.name, fi)
             if ! f.isExtern:
                 let ownFunc: bool = (f.originFile == filePath)
                 let sharedFunc: bool = includeShared && (driver_strIsEmpty(f.originFile))
                 if ownFunc || sharedFunc:
                     mirAddFunc(unit, f)
-                    driver_collectFuncCallNames(f, &neededExternNames)
-                    driver_collectFuncGlobalNames(f, &neededGlobalNames)
+                    driver_collectFuncCallNames(f, neededExternNames)
+                    driver_collectFuncGlobalNames(f, neededGlobalNames)
 
     for ci in 0..<full.cstrs.len:
         let c: MirCString = full.cstrs[ci]
         var useCstr: bool = false
         if driver_strNonEmpty(c.label):
-            hashmaps.hashMapStrIntGetPtrRaw(&neededGlobalNames, c.label,&useCstr)
+            let _seenCstr1: int32 = hashmaps.hashMapStrIntGetEx(neededGlobalNames, c.label, useCstr)
         if useCstr:
             add(unit.cstrs, c)
 
@@ -2149,7 +2138,7 @@ fn driver_buildUnitModule(full: MirModule, filePath: str): MirModule =
         let callee: str = neededExternNames.keys[si]
         if driver_strNonEmpty(callee):
             var foundSrc: bool = false
-            let srcIdx: int32 = hashmaps.hashMapStrIntGetPtrRaw(&nameToFuncIdx, callee,&foundSrc)
+            let srcIdx: int32 = hashmaps.hashMapStrIntGetEx(nameToFuncIdx, callee, foundSrc)
             if foundSrc && srcIdx >= 0 && srcIdx < needExternByIdx.len:
                 let srcFunc: MirFunc = full.funcs[srcIdx]
                 if srcFunc != nil:
@@ -2195,7 +2184,7 @@ fn driver_promoteDeclOnlyExternFuncs(module: MirModule): int32 =
     for fi in 0..<module.funcs.len:
         let funcWithBody: MirFunc = module.funcs[fi]
         if funcWithBody != nil && !funcWithBody.isExtern && funcWithBody.blocks.len > 0:
-            driver_collectFuncCallNames(funcWithBody, &calledByBody)
+            driver_collectFuncCallNames(funcWithBody, calledByBody)
     var patched: int32 = 0
     for i in 0..<module.funcs.len:
         let f: MirFunc = module.funcs[i]
@@ -2203,7 +2192,7 @@ fn driver_promoteDeclOnlyExternFuncs(module: MirModule): int32 =
             continue
         var called: bool = false
         if driver_strNonEmpty(f.name):
-            hashmaps.hashMapStrIntGetPtrRaw(&calledByBody, f.name,&called)
+            let _seenCalledByBody: int32 = hashmaps.hashMapStrIntGetEx(calledByBody, f.name, called)
         if debugPromote && !f.isExtern && f.blocks.len == 0:
             os.writeLine(dbg, "backend_driver: decl-only candidate name=" + f.name +
                           " link=" + (f.linkName == nil ? "" : f.linkName) +
@@ -2428,9 +2417,7 @@ fn driver_runParallelUnitBatchesFork(full: MirModule, unitIndex: DriverUnitIndex
                         let fp: str = pendingUnits[idx]
                         let objPath: str = pendingObjs[idx]
                         var found: bool = false
-                        var unitIdx: int32 = -1
-                        if unitIndex.unitIndex != nil:
-                            unitIdx = hashmaps.hashMapStrIntGetPtrRaw(unitIndex.unitIndex, fp,&found)
+                        let unitIdx: int32 = hashmaps.hashMapStrIntGetEx(unitIndex.unitIndex, fp, found)
                         if !found:
                             panic("backend_driver: unit file not found in module: " + fp)
                         let u: MirModule = driver_buildUnitModuleFromIndex(full, fp, unitIdx, unitIndex)
@@ -2897,11 +2884,11 @@ fn main(argc: int32, argv: str*): int32 =
         var m: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(16)
         os.writeLine(f, "selftest: hashmap.put")
         os.c_fflush f
-        hashmaps.hashMapStrIntPut(&m, "k1", 7)
+        hashmaps.hashMapStrIntPut(m, "k1", 7)
         os.writeLine(f, "selftest: hashmap.get")
         os.c_fflush f
         var found: bool = false
-        let v: int32 = hashmaps.hashMapStrIntGetPtrRaw(&m, "k1",&found)
+        let v: int32 = hashmaps.hashMapStrIntGetEx(m, "k1", found)
         if !found || v != 7:
             panic "selftest: hashmap failed"
 
@@ -2922,16 +2909,14 @@ fn main(argc: int32, argv: str*): int32 =
         if r1.len != 0:
             panic "selftest: seq<seq<int32>> row alias"
 
-        os.writeLine(f, "selftest: allocHashMapStrInt")
+        os.writeLine(f, "selftest: hashmap.value_copy")
         os.c_fflush f
-        let mp: hashmaps.HashMapStrInt* = driver_allocHashMapStrInt(16)
-        if mp == nil:
-            panic "selftest: allocHashMapStrInt returned nil"
+        var mp: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(16)
         hashmaps.hashMapStrIntPut(mp, "k1", 7)
         var found2: bool = false
-        let v2: int32 = hashmaps.hashMapStrIntGetPtrRaw(mp, "k1",&found2)
+        let v2: int32 = hashmaps.hashMapStrIntGetEx(mp, "k1", found2)
         if !found2 || v2 != 7:
-            panic "selftest: allocHashMapStrInt failed"
+            panic "selftest: hashmap.value_copy failed"
 
         os.writeLine(f, "selftest: ok")
         os.c_fflush f

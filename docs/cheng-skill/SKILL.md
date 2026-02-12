@@ -6,8 +6,8 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 # Cheng 编程（稳定版）
 
 ## 维护元数据
-- `last_verified_date`: `2026-02-10`
-- `last_verified_commit`: `a4d11ef`
+- `last_verified_date`: `2026-02-12`
+- `last_verified_commit`: `workspace-local`
 - `upstream_spec`: `docs/cheng-formal-spec.md`
 
 ## 权威优先级（冲突处理）
@@ -41,11 +41,20 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - 序列初始化：标准库不再提供 `newSeq/newSeqWithCap` 作为初始化入口；使用带类型标注省略初始化（零值）+ `reserve/setLen` 等 API。
 - 隐式泛型（语法糖）：例程声明可省略 `[T]`，由签名中的单字母大写类型名（`T/U/K/V`）自动引入类型参数；仍为编译期单态化静态分发。调用侧优先写 `f(x)`，推断失败再显式写 `f[T](x)`。
 - 列表生成式：`[expr for pat in iter if cond]`（`if` 可选，编译期 lowering 为循环追加）。
+- 计数型迭代规范：源码中形如 `var i = start; while i < end: ...; i = i + 1`、`while i <= end`、`while i > end`、`while i >= end` 的自增/自减计数循环，应统一改写为 `for in` 迭代（含 guard-for 等价写法）；`while` 保留给非计数型条件循环。
+- `for ... in ...` 的 `in` 表达式支持：range 字面值（`a..<b` / `a..b`）、数组/Table/HashMap 的字面值、常量与变量；Table/HashMap 支持 `for k, v in tableOrMap` 键值迭代。
 - 带类型标注可省略初始化并走隐式默认值；`default[T]` 仅用于表达式/返回/实参位置。
 - 隐式默认值速记：`bool=false`，整数/枚举=0，浮点=0.0，`char='\0'`，`str/cstring=""`，指针/`ref`/`var`/`void*`=`nil`，复合类型为 zero-init。
 - 符号重载分发是**编译期静态分发**：按静态类型/泛型实例化选定目标；不做运行时动态分派。
 - 下标赋值优先级：`a[b] = v` 优先匹配 ``[]=``；读取 `a[b]` 走 ``[]``（或内建容器 lowering）。
 - 当前常用容器的 `[]/[]=`（`str`、`T[]`、`T[N]`、`HashMap`、`JsonNode`、`Table` 等）要求编译期可确定分派目标（静态分发，且带边界检查）。
+
+## 后端生产链路（2026-02）
+- 生产闭环入口 `src/tooling/backend_prod_closure.sh` 仅接受 `CHENG_ABI=v2_noptr`。
+- 主闭环默认使用兼容口径（`CHENG_STAGE1_STD_NO_POINTERS=0`）；严格 no-pointer 由 `backend.abi_v2_noptr` 专项门禁覆盖。
+- `verify_backend_abi_v2_noptr.sh` 支持 `CHENG_BACKEND_ABI_V2_NOPTR_ONLY=1`（only-v2）；其 non-C-ABI 子门禁会显式设 `CHENG_STAGE1_STD_NO_POINTERS=0` 以隔离诊断。
+- `verify_backend_closedloop.sh` 默认执行 `backend.spawn_api_gate`（v2 友好 fixture，默认 API 禁 raw spawn、legacy 显式入口可用）。
+- `CHENG_BACKEND_DRIVER` 未显式设置时，`backend_prod_closure.sh` 优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（其次 `cheng.stage1`、`artifacts/backend_seed/cheng.stage2`），再回落 `backend_driver_path.sh`。
 
 ## 任务流（修正）
 

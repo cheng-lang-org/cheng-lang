@@ -200,6 +200,7 @@ fi
 if [ "$abi_effective" = "v2_noptr" ]; then
   envs="$envs CHENG_STAGE1_STD_NO_POINTERS=1"
   envs="$envs CHENG_STAGE1_STD_NO_POINTERS_STRICT=1"
+  envs="$envs CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1"
 fi
 if [ "$pkg_roots" != "" ]; then
   envs="$envs CHENG_PKG_ROOTS=$pkg_roots"

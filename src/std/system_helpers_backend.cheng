@@ -723,14 +723,226 @@ fn streq(a: str, b: str): bool =
             return false
     return true
 
+fn cheng_u64MaskLoBits(n: int32): uint64 =
+    if n <= 0:
+        return uint64(0)
+    if n >= 64:
+        return uint64(0) - uint64(1)
+    return (uint64(1) << uint64(n)) - uint64(1)
+
+fn cheng_u64RoundShiftRight(v: uint64, shift: int32): uint64 =
+    if shift <= 0:
+        if shift == 0:
+            return v
+        let leftShift: int32 = -shift
+        if leftShift >= 64:
+            return uint64(0)
+        return v << uint64(leftShift)
+    if shift >= 64:
+        return uint64(0)
+    let base: uint64 = v >> uint64(shift)
+    let half: uint64 = uint64(1) << uint64(shift - 1)
+    let lowMask: uint64 = cheng_u64MaskLoBits(shift)
+    let low: uint64 = v & lowMask
+    if low > half:
+        return base + uint64(1)
+    if low == half && (base & uint64(1)) == uint64(1):
+        return base + uint64(1)
+    return base
+
+fn cheng_f32_bits_to_f64_bits(bits: int32): int64 =
+    let ubits: uint64 = uint64(uint32(bits))
+    let sign: uint64 = (ubits >> uint64(31)) & uint64(1)
+    let exp32: int32 = int32((ubits >> uint64(23)) & uint64(0xff))
+    let frac32: uint64 = ubits & uint64(0x7fffff)
+    if exp32 == 255:
+        let frac64NaN: uint64 = frac32 << uint64(29)
+        return int64((sign << uint64(63)) | (uint64(0x7ff) << uint64(52)) | frac64NaN)
+    if exp32 == 0:
+        if frac32 == 0:
+            return int64(sign << uint64(63))
+        var mant: uint64 = frac32
+        var exp: int32 = -126
+        while (mant & uint64(0x800000)) == 0:
+            mant = mant << uint64(1)
+            exp = exp - 1
+        mant = mant & uint64(0x7fffff)
+        let exp64Sub: uint64 = uint64(exp + 1023)
+        let frac64Sub: uint64 = mant << uint64(29)
+        return int64((sign << uint64(63)) | (exp64Sub << uint64(52)) | frac64Sub)
+    let exp64: uint64 = uint64(exp32 - 127 + 1023)
+    let frac64: uint64 = frac32 << uint64(29)
+    return int64((sign << uint64(63)) | (exp64 << uint64(52)) | frac64)
+
+fn cheng_f64_bits_to_f32_bits(bits: int64): int32 =
+    let ubits: uint64 = uint64(bits)
+    let sign: uint64 = (ubits >> uint64(63)) & uint64(1)
+    let exp64: int32 = int32((ubits >> uint64(52)) & uint64(0x7ff))
+    let frac64: uint64 = ubits & uint64(0x000fffffffffffff)
+    let signOut: uint64 = sign << uint64(31)
+
+    if exp64 == int32(0x7ff):
+        if frac64 == 0:
+            return int32(signOut | (uint64(0xff) << uint64(23)))
+        var fracNaN: uint64 = frac64 >> uint64(29)
+        if fracNaN == 0:
+            fracNaN = uint64(1)
+        return int32(signOut | (uint64(0xff) << uint64(23)) | (fracNaN & uint64(0x7fffff)))
+
+    var exp: int32 = 0
+    var mant: uint64 = frac64
+    if exp64 == 0:
+        if mant == 0:
+            return int32(signOut)
+        exp = -1022
+        while (mant & (uint64(1) << uint64(52))) == 0:
+            mant = mant << uint64(1)
+            exp = exp - 1
+        mant = mant & uint64(0x000fffffffffffff)
+    else:
+        exp = exp64 - 1023
+
+    var exp32: int32 = exp + 127
+    let sig53: uint64 = (uint64(1) << uint64(52)) | mant
+
+    if exp32 >= 255:
+        return int32(signOut | (uint64(0xff) << uint64(23)))
+
+    if exp32 <= 0:
+        if exp32 < -23:
+            return int32(signOut)
+        let shiftSub: int32 = (1 - exp32) + 29
+        let fracSub: uint64 = cheng_u64RoundShiftRight(sig53, shiftSub)
+        if fracSub >= (uint64(1) << uint64(23)):
+            return int32(signOut | (uint64(1) << uint64(23)))
+        return int32(signOut | (fracSub & uint64(0x7fffff)))
+
+    var sig24: uint64 = cheng_u64RoundShiftRight(sig53, 29)
+    if sig24 >= (uint64(1) << uint64(24)):
+        sig24 = sig24 >> uint64(1)
+        exp32 = exp32 + 1
+        if exp32 >= 255:
+            return int32(signOut | (uint64(0xff) << uint64(23)))
+
+    let fracOut: uint64 = sig24 & uint64(0x7fffff)
+    return int32(signOut | (uint64(exp32) << uint64(23)) | fracOut)
+
 fn cheng_bits_to_f32(bits: int32): float64 =
-    var v32: float32
-    *int32*(&v32) = bits
-    return float64(v32)
+    return cheng_bits_to_f64(cheng_f32_bits_to_f64_bits(bits))
 
 fn cheng_f32_to_bits(value: float64): int32 =
-    var v32: float32 = float32(value)
-    return *int32*(&v32)
+    return cheng_f64_bits_to_f32_bits(cheng_f64_to_bits(value))
+
+fn cheng_bits_to_f64(bits: int64): float64 =
+    var v64: float64
+    *int64*(&v64) = bits
+    return v64
+
+fn cheng_f64_to_bits(value: float64): int64 =
+    var v64: float64 = value
+    return *int64*(&v64)
+
+fn cheng_u64Clz(x0: uint64): int32 =
+    if x0 == 0:
+        return 64
+    var x: uint64 = x0
+    var n: int32 = 0
+    while (x & (uint64(1) << uint64(63))) == 0:
+        x = x << uint64(1)
+        n = n + 1
+    return n
+
+fn cheng_u64_to_f64_bits(x: uint64): int64 =
+    if x == 0:
+        return 0
+    let msb: int32 = 63 - cheng_u64Clz(x)
+    var expBits: uint64 = uint64(msb + 1023)
+    var sig: uint64 = 0
+    if msb <= 52:
+        sig = x << uint64(52 - msb)
+    else:
+        let shift: int32 = msb - 52
+        let base: uint64 = x >> uint64(shift)
+        let remMask: uint64 = cheng_u64MaskLoBits(shift)
+        let rem: uint64 = x & remMask
+        var rounded: uint64 = base
+        if shift > 0:
+            let half: uint64 = uint64(1) << uint64(shift - 1)
+            if rem > half || (rem == half && (base & uint64(1)) == uint64(1)):
+                rounded = rounded + uint64(1)
+        if rounded >= (uint64(1) << uint64(53)):
+            rounded = rounded >> uint64(1)
+            expBits = expBits + uint64(1)
+        sig = rounded
+    let frac: uint64 = sig & uint64(0x000fffffffffffff)
+    return int64((expBits << uint64(52)) | frac)
+
+fn cheng_f64_bits_to_i64(bits: int64): int64 =
+    let ubits: uint64 = uint64(bits)
+    let sign: uint64 = (ubits >> uint64(63)) & uint64(1)
+    let expRaw: int32 = int32((ubits >> uint64(52)) & uint64(0x7ff))
+    let frac: uint64 = ubits & uint64(0x000fffffffffffff)
+    let minIu: uint64 = uint64(1) << uint64(63)
+    let maxIu: uint64 = minIu - uint64(1)
+
+    if expRaw == int32(0x7ff):
+        return sign == 0 ? int64(maxIu) : int64(minIu)
+    if expRaw == 0:
+        return 0
+
+    let exp: int32 = expRaw - 1023
+    if exp < 0:
+        return 0
+    if sign == 0 && exp > 62:
+        return int64(maxIu)
+    if sign != 0 && exp > 63:
+        return int64(minIu)
+
+    let sig: uint64 = (uint64(1) << uint64(52)) | frac
+    var mag: uint64 = 0
+    if exp >= 52:
+        mag = sig << uint64(exp - 52)
+    else:
+        mag = sig >> uint64(52 - exp)
+
+    if sign == 0:
+        if mag > maxIu:
+            return int64(maxIu)
+        return int64(mag)
+
+    if mag >= minIu:
+        return int64(minIu)
+    return int64(uint64(0) - mag)
+
+fn cheng_f64_bits_to_u64(bits: int64): uint64 =
+    let ubits: uint64 = uint64(bits)
+    let sign: uint64 = (ubits >> uint64(63)) & uint64(1)
+    let expRaw: int32 = int32((ubits >> uint64(52)) & uint64(0x7ff))
+    let frac: uint64 = ubits & uint64(0x000fffffffffffff)
+
+    if expRaw == int32(0x7ff):
+        return uint64(0)
+    if sign != 0:
+        return uint64(0)
+    if expRaw == 0:
+        return uint64(0)
+
+    let exp: int32 = expRaw - 1023
+    if exp < 0:
+        return uint64(0)
+    if exp > 63:
+        return uint64(0) - uint64(1)
+
+    let sig: uint64 = (uint64(1) << uint64(52)) | frac
+    if exp >= 52:
+        return sig << uint64(exp - 52)
+    return sig >> uint64(52 - exp)
+
+fn cheng_f32_bits_to_i64(bits: int32): int64 =
+    return cheng_f64_bits_to_i64(cheng_f32_bits_to_f64_bits(bits))
+
+fn cheng_f32_bits_to_u64(bits: int32): uint64 =
+    return cheng_f64_bits_to_u64(cheng_f32_bits_to_f64_bits(bits))
 
 fn cheng_jpeg_decode(data: void*, len: int32, out_w: void*, out_h: void*): void* =
     if out_w != nil:
@@ -921,10 +1133,6 @@ fn cheng_chan_i32_recv(chPtr: void*, out: int32*): int32 =
     ch->head = (ch->head + 1) % ch->cap
     ch->count = ch->count - 1
     return 1
-
-@thread_boundary
-fn spawn(fn_ptr: void*, ctx: void*) =
-    cheng_spawn(fn_ptr, ctx)
 
 fn schedPending(): int32 =
     return cheng_sched_pending()

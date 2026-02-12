@@ -1,0 +1,205 @@
+# Backend MVP sanity test: ensure assembly contains expected symbols.
+import cheng/stdlib/bootstrap/system
+import cheng/stdlib/bootstrap/core/result
+import cheng/backend/mir/mir_types
+import cheng/backend/mir/mir_builder
+import cheng/backend/isel/aarch64_isel
+import cheng/backend/regalloc/linear_scan
+import cheng/backend/emit/asm_emitter
+
+fn backendContains(s: str, sub: str): bool =
+    let n: int32 = len(s)
+    let m: int32 = len(sub)
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(charAt(s, i + j) == charAt(sub, j)):
+                break
+        if j == m:
+            return true
+    return false
+
+fn buildAsm(srcPath: str): str =
+    let moduleRes: Result[MirModule] = mirBuildModuleFromFile(srcPath)
+    if ! IsOk[MirModule](moduleRes):
+        panic ErrorInfoOf[MirModule](moduleRes)
+    let lirRes: Result[LirModule] = aarch64LowerModule(Value[MirModule](moduleRes))
+    if ! IsOk[LirModule](lirRes):
+        panic ErrorInfoOf[LirModule](lirRes)
+    let lir: LirModule = linearScanAssign(Value[LirModule](lirRes))
+    let asmRes: Result[str] = emitAarch64(lir)
+    if ! IsOk[str](asmRes):
+        panic ErrorInfoOf[str](asmRes)
+    return Value[str](asmRes)
+
+fn main(): int32 =
+    let asmAdd: str = buildAsm("tests/cheng/backend/fixtures/return_add.cheng")
+    assert(backendContains(asmAdd, "_main:"), "backend_mvp: missing main label")
+    assert(backendContains(asmAdd, "add w0"), "backend_mvp: missing add")
+    assert(backendContains(asmAdd, "sub w0"), "backend_mvp: missing sub")
+    assert(backendContains(asmAdd, "ret"), "backend_mvp: missing ret")
+
+    let asmIf: str = buildAsm("tests/cheng/backend/fixtures/return_if.cheng")
+    assert(backendContains(asmIf, "cmp w0"), "backend_mvp: missing cmp")
+    assert(backendContains(asmIf, "b."), "backend_mvp: missing conditional branch")
+    assert(backendContains(asmIf, "ret"), "backend_mvp: missing ret")
+
+    let asmTernaryNested: str = buildAsm("tests/cheng/backend/fixtures/return_ternary_nested.cheng")
+    assert(backendContains(asmTernaryNested, "if_then"), "backend_mvp: missing nested ternary if")
+    assert(backendContains(asmTernaryNested, "ret"), "backend_mvp: missing ret")
+
+    let asmIfStmt: str = buildAsm("tests/cheng/backend/fixtures/return_if_stmt.cheng")
+    assert(backendContains(asmIfStmt, "if_then"), "backend_mvp: missing if_then label")
+    assert(backendContains(asmIfStmt, "if_else"), "backend_mvp: missing if_else label")
+    assert(backendContains(asmIfStmt, "ret"), "backend_mvp: missing ret")
+
+    let asmIfElif: str = buildAsm("tests/cheng/backend/fixtures/return_if_elif.cheng")
+    assert(backendContains(asmIfElif, "if_cond"), "backend_mvp: missing elif cond label")
+    assert(backendContains(asmIfElif, "if_else"), "backend_mvp: missing elif else label")
+    assert(backendContains(asmIfElif, "ret"), "backend_mvp: missing ret")
+
+    let asmAndIf: str = buildAsm("tests/cheng/backend/fixtures/return_and_if.cheng")
+    assert(backendContains(asmAndIf, "and_rhs"), "backend_mvp: missing and short-circuit label")
+    assert(backendContains(asmAndIf, "ret"), "backend_mvp: missing ret")
+
+    let asmOrIf: str = buildAsm("tests/cheng/backend/fixtures/return_or_if.cheng")
+    assert(backendContains(asmOrIf, "or_rhs"), "backend_mvp: missing or short-circuit label")
+    assert(backendContains(asmOrIf, "ret"), "backend_mvp: missing ret")
+
+    let asmAndExpr: str = buildAsm("tests/cheng/backend/fixtures/return_and_expr.cheng")
+    assert(backendContains(asmAndExpr, "bool_true"), "backend_mvp: missing bool_true label")
+    assert(backendContains(asmAndExpr, "ret"), "backend_mvp: missing ret")
+
+    let asmOrExpr: str = buildAsm("tests/cheng/backend/fixtures/return_or_expr.cheng")
+    assert(backendContains(asmOrExpr, "bool_false"), "backend_mvp: missing bool_false label")
+    assert(backendContains(asmOrExpr, "ret"), "backend_mvp: missing ret")
+
+    let asmAndAssign: str = buildAsm("tests/cheng/backend/fixtures/return_and_assign.cheng")
+    assert(backendContains(asmAndAssign, "bool_true"), "backend_mvp: missing bool_true label")
+    assert(backendContains(asmAndAssign, "ret"), "backend_mvp: missing ret")
+
+    let asmOrLet: str = buildAsm("tests/cheng/backend/fixtures/return_or_let.cheng")
+    assert(backendContains(asmOrLet, "bool_false"), "backend_mvp: missing bool_false label")
+    assert(backendContains(asmOrLet, "ret"), "backend_mvp: missing ret")
+
+    let asmAndNested: str = buildAsm("tests/cheng/backend/fixtures/return_and_nested.cheng")
+    assert(backendContains(asmAndNested, "and_rhs"), "backend_mvp: missing nested and short-circuit label")
+    assert(backendContains(asmAndNested, "ret"), "backend_mvp: missing ret")
+
+    let asmLet: str = buildAsm("tests/cheng/backend/fixtures/return_let.cheng")
+    assert(backendContains(asmLet, "str w"), "backend_mvp: missing store for let")
+    assert(backendContains(asmLet, "ldr w"), "backend_mvp: missing load for let")
+    assert(backendContains(asmLet, "ret"), "backend_mvp: missing ret")
+
+    let asmAssign: str = buildAsm("tests/cheng/backend/fixtures/return_assign.cheng")
+    assert(backendContains(asmAssign, "str w"), "backend_mvp: missing store for assign")
+    assert(backendContains(asmAssign, "ldr w"), "backend_mvp: missing load for assign")
+    assert(backendContains(asmAssign, "ret"), "backend_mvp: missing ret")
+
+    let asmDeref: str = buildAsm("tests/cheng/backend/fixtures/return_deref.cheng")
+    assert(backendContains(asmDeref, "ldr w"), "backend_mvp: missing deref load")
+    assert(backendContains(asmDeref, "ret"), "backend_mvp: missing ret")
+
+    let asmStoreDeref: str = buildAsm("tests/cheng/backend/fixtures/return_store_deref.cheng")
+    assert(backendContains(asmStoreDeref, "str w"), "backend_mvp: missing deref store")
+    assert(backendContains(asmStoreDeref, "ret"), "backend_mvp: missing ret")
+
+    let asmImportCall: str = buildAsm("tests/cheng/backend/fixtures/return_import_call.cheng")
+    assert(backendContains(asmImportCall, "_add:"), "backend_mvp: missing imported add label")
+    assert(backendContains(asmImportCall, "bl _add"), "backend_mvp: missing imported call")
+    assert(backendContains(asmImportCall, "ret"), "backend_mvp: missing ret")
+
+    let asmPuts: str = buildAsm("tests/cheng/backend/fixtures/hello_puts.cheng")
+    assert(backendContains(asmPuts, "bl _puts"), "backend_mvp: missing puts call")
+    assert(backendContains(asmPuts, ".cstring"), "backend_mvp: missing cstring section")
+    assert(backendContains(asmPuts, "adrp x0"), "backend_mvp: missing global addr adrp")
+    assert(backendContains(asmPuts, "PAGEOFF"), "backend_mvp: missing global addr pageoff")
+    assert(backendContains(asmPuts, "ret"), "backend_mvp: missing ret")
+
+    let asmImportcPuts: str = buildAsm("tests/cheng/backend/fixtures/hello_importc_puts.cheng")
+    assert(backendContains(asmImportcPuts, "bl _puts"), "backend_mvp: missing importc puts call")
+    assert(!backendContains(asmImportcPuts, "bl _cPuts"), "backend_mvp: importc did not rewrite call")
+    assert(backendContains(asmImportcPuts, "ret"), "backend_mvp: missing ret")
+
+    let asmCall: str = buildAsm("tests/cheng/backend/fixtures/return_call.cheng")
+    assert(backendContains(asmCall, "_add:"), "backend_mvp: missing add label")
+    assert(backendContains(asmCall, "bl _add"), "backend_mvp: missing call")
+    assert(backendContains(asmCall, "ret"), "backend_mvp: missing ret")
+
+    let asmCall5: str = buildAsm("tests/cheng/backend/fixtures/return_call5.cheng")
+    assert(backendContains(asmCall5, "_sum5:"), "backend_mvp: missing sum5 label")
+    assert(backendContains(asmCall5, "bl _sum5"), "backend_mvp: missing call5")
+    assert(backendContains(asmCall5, "mov x16, sp"), "backend_mvp: missing arg base")
+    assert(backendContains(asmCall5, "ret"), "backend_mvp: missing ret")
+
+    let asmCall8: str = buildAsm("tests/cheng/backend/fixtures/return_call8.cheng")
+    assert(backendContains(asmCall8, "_sum8:"), "backend_mvp: missing sum8 label")
+    assert(backendContains(asmCall8, "bl _sum8"), "backend_mvp: missing call8")
+    assert(backendContains(asmCall8, "ret"), "backend_mvp: missing ret")
+
+    let asmCall9: str = buildAsm("tests/cheng/backend/fixtures/return_call9.cheng")
+    assert(backendContains(asmCall9, "_sum9:"), "backend_mvp: missing sum9 label")
+    assert(backendContains(asmCall9, "bl _sum9"), "backend_mvp: missing call9")
+    assert(backendContains(asmCall9, "mov x16, sp"), "backend_mvp: missing arg base")
+    assert(backendContains(asmCall9, "ret"), "backend_mvp: missing ret")
+
+    let asmCallI64: str = buildAsm("tests/cheng/backend/fixtures/return_call_i64.cheng")
+    assert(backendContains(asmCallI64, "_add64:"), "backend_mvp: missing add64 label")
+    assert(backendContains(asmCallI64, "bl _add64"), "backend_mvp: missing call64")
+    assert(backendContains(asmCallI64, "x0"), "backend_mvp: missing x0 usage")
+    assert(backendContains(asmCallI64, "ret"), "backend_mvp: missing ret")
+
+    let asmCallMixed: str = buildAsm("tests/cheng/backend/fixtures/return_call_mixed.cheng")
+    assert(backendContains(asmCallMixed, "_widen:"), "backend_mvp: missing widen label")
+    assert(backendContains(asmCallMixed, "bl _widen"), "backend_mvp: missing call mixed")
+    assert(backendContains(asmCallMixed, "sxtw"), "backend_mvp: missing widen cast")
+    assert(backendContains(asmCallMixed, "ret"), "backend_mvp: missing ret")
+
+    let asmCastI64: str = buildAsm("tests/cheng/backend/fixtures/return_cast_i64.cheng")
+    assert(backendContains(asmCastI64, "sxtw"), "backend_mvp: missing sxtw cast")
+    assert(backendContains(asmCastI64, "ret"), "backend_mvp: missing ret")
+
+    let asmCastI32: str = buildAsm("tests/cheng/backend/fixtures/return_cast_i32.cheng")
+    assert(backendContains(asmCastI32, "w0"), "backend_mvp: missing w0 usage")
+    assert(backendContains(asmCastI32, "ret"), "backend_mvp: missing ret")
+
+    let asmBitwise: str = buildAsm("tests/cheng/backend/fixtures/return_bitwise.cheng")
+    assert(backendContains(asmBitwise, "orr"), "backend_mvp: missing orr")
+    assert(backendContains(asmBitwise, "eor"), "backend_mvp: missing eor")
+    assert(backendContains(asmBitwise, "ret"), "backend_mvp: missing ret")
+
+    let asmShift: str = buildAsm("tests/cheng/backend/fixtures/return_shift.cheng")
+    assert(backendContains(asmShift, "lsl"), "backend_mvp: missing lsl")
+    assert(backendContains(asmShift, "asr"), "backend_mvp: missing asr")
+    assert(backendContains(asmShift, "ret"), "backend_mvp: missing ret")
+
+    let asmNot: str = buildAsm("tests/cheng/backend/fixtures/return_not.cheng")
+    assert(backendContains(asmNot, "eor"), "backend_mvp: missing xor for ~")
+    assert(backendContains(asmNot, "cmp"), "backend_mvp: missing cmp for !")
+    assert(backendContains(asmNot, "ret"), "backend_mvp: missing ret")
+
+    let asmWhile: str = buildAsm("tests/cheng/backend/fixtures/return_while_sum.cheng")
+    assert(backendContains(asmWhile, "while_cond"), "backend_mvp: missing while cond label")
+    assert(backendContains(asmWhile, "while_body"), "backend_mvp: missing while body label")
+    assert(backendContains(asmWhile, "ret"), "backend_mvp: missing ret")
+
+    let asmWhileBreak: str = buildAsm("tests/cheng/backend/fixtures/return_while_break.cheng")
+    assert(backendContains(asmWhileBreak, "while_end"), "backend_mvp: missing while end label")
+    assert(backendContains(asmWhileBreak, "ret"), "backend_mvp: missing ret")
+
+    let asmWhileContinue: str = buildAsm("tests/cheng/backend/fixtures/return_while_continue.cheng")
+    assert(backendContains(asmWhileContinue, "while_cond"), "backend_mvp: missing while cond")
+    assert(backendContains(asmWhileContinue, "ret"), "backend_mvp: missing ret")
+
+    let asmFor: str = buildAsm("tests/cheng/backend/fixtures/return_for_sum.cheng")
+    assert(backendContains(asmFor, "for_cond"), "backend_mvp: missing for cond label")
+    assert(backendContains(asmFor, "for_body"), "backend_mvp: missing for body label")
+    assert(backendContains(asmFor, "ret"), "backend_mvp: missing ret")
+
+    let asmI64: str = buildAsm("tests/cheng/backend/fixtures/return_i64.cheng")
+    assert(backendContains(asmI64, "x0"), "backend_mvp: missing x0 usage")
+    assert(backendContains(asmI64, "ret"), "backend_mvp: missing ret")
+    return 0

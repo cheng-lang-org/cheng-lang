@@ -376,16 +376,19 @@ has_any_lld() {
 if [ "$allow_skip" = "" ]; then
   export CHENG_BACKEND_MATRIX_STRICT=1
 fi
-if [ "${CHENG_ABI:-}" = "" ]; then
-  export CHENG_ABI=v2_noptr
+if [ "${CHENG_ABI:-}" != "" ] && [ "${CHENG_ABI}" != "v2_noptr" ]; then
+  echo "[backend_prod_closure] only CHENG_ABI=v2_noptr is supported (got: ${CHENG_ABI})" 1>&2
+  exit 2
 fi
-if [ "${CHENG_ABI}" = "v2_noptr" ]; then
-  if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
-    export CHENG_STAGE1_STD_NO_POINTERS=1
-  fi
-  if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
-    export CHENG_STAGE1_STD_NO_POINTERS_STRICT=1
-  fi
+export CHENG_ABI=v2_noptr
+if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
+  export CHENG_STAGE1_STD_NO_POINTERS=0
+fi
+if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
+  export CHENG_STAGE1_STD_NO_POINTERS_STRICT=0
+fi
+if [ "${CHENG_STAGE1_NO_POINTERS_NON_C_ABI:-}" = "" ]; then
+  export CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0
 fi
 
 selfhost_stage0="${seed_path:-}"
@@ -425,19 +428,25 @@ if [ "$run_selfhost" != "" ]; then
   fi
 fi
 
-if [ "${CHENG_BACKEND_DRIVER:-}" = "" ] && [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
-  export CHENG_BACKEND_DRIVER="artifacts/backend_selfhost_self_obj/cheng.stage2"
-elif [ "${CHENG_BACKEND_DRIVER:-}" = "" ] && [ -x "artifacts/backend_seed/cheng.stage2" ]; then
-  export CHENG_BACKEND_DRIVER="artifacts/backend_seed/cheng.stage2"
+if [ "${CHENG_BACKEND_DRIVER:-}" = "" ]; then
+  if [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
+    export CHENG_BACKEND_DRIVER="artifacts/backend_selfhost_self_obj/cheng.stage2"
+  elif [ -x "artifacts/backend_selfhost_self_obj/cheng.stage1" ]; then
+    export CHENG_BACKEND_DRIVER="artifacts/backend_selfhost_self_obj/cheng.stage1"
+  elif [ -x "artifacts/backend_seed/cheng.stage2" ]; then
+    export CHENG_BACKEND_DRIVER="artifacts/backend_seed/cheng.stage2"
+  else
+    export CHENG_BACKEND_DRIVER="$(sh src/tooling/backend_driver_path.sh)"
+  fi
 fi
 
 if [ "$validate" != "" ]; then
-  run_required "backend.closedloop" env CHENG_BACKEND_VALIDATE=1 sh src/tooling/verify_backend_closedloop.sh
+  run_required "backend.closedloop" env CHENG_ABI=v2_noptr CHENG_STAGE1_STD_NO_POINTERS=0 CHENG_STAGE1_STD_NO_POINTERS_STRICT=0 CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 CHENG_BACKEND_VALIDATE=1 sh src/tooling/verify_backend_closedloop.sh
 else
-  run_required "backend.closedloop" sh src/tooling/verify_backend_closedloop.sh
+  run_required "backend.closedloop" env CHENG_ABI=v2_noptr CHENG_STAGE1_STD_NO_POINTERS=0 CHENG_STAGE1_STD_NO_POINTERS_STRICT=0 CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 sh src/tooling/verify_backend_closedloop.sh
 fi
 
-run_required "backend.abi_v2_noptr" sh src/tooling/verify_backend_abi_v2_noptr.sh
+run_required "backend.abi_v2_noptr" env CHENG_ABI=v2_noptr CHENG_STAGE1_STD_NO_POINTERS=1 CHENG_STAGE1_STD_NO_POINTERS_STRICT=1 CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1 CHENG_BACKEND_ABI_V2_NOPTR_ONLY=1 sh src/tooling/verify_backend_abi_v2_noptr.sh
 
 run_optional "backend.obj_fullspec_gate" env CHENG_MM=orc sh src/tooling/verify_backend_obj_fullspec_gate.sh
 

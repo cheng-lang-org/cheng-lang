@@ -26,6 +26,10 @@ fn mirOptWriteBlock(seqInst: MirBlock[]*, idx: int32, val: MirBlock) =
     *p = val
 
 fn mirOptMaxType(a: MirType, b: MirType): MirType =
+    if a.kind == mtF64 || b.kind == mtF64:
+        return mirTypeF64()
+    if a.kind == mtF32 || b.kind == mtF32:
+        return mirTypeF32()
     if a.kind == mtI64 || b.kind == mtI64:
         var out: MirType = mirTypeI64()
         if a.kind == mtI64:
@@ -72,6 +76,10 @@ fn mirOptExprType(module: MirModule, func: MirFunc, expr: MirExpr, fallback: Mir
     return fallback
 
 fn mirOptWidth(ty: MirType): int32 =
+    if ty.kind == mtF32:
+        return 32
+    if ty.kind == mtF64:
+        return 64
     if ty.kind == mtI8:
         return 8
     if ty.kind == mtI16:
@@ -200,6 +208,13 @@ fn mirOptFoldCast(srcType: MirType, dstType: MirType, v0: int64): int64 =
     let mask: uint64 = (uint64(1) << uint64(srcW)) - uint64(1)
     return int64(vv | (~mask))
 
+fn mirOptCastHasFloat(srcType: MirType, dstType: MirType): bool =
+    if srcType.kind == mtF32 || srcType.kind == mtF64:
+        return true
+    if dstType.kind == mtF32 || dstType.kind == mtF64:
+        return true
+    return false
+
 fn mirOptExpr(module: MirModule, func: MirFunc, expr: MirExpr, fallback: MirType): MirExpr =
     if expr == nil:
         return nil
@@ -219,6 +234,10 @@ fn mirOptExpr(module: MirModule, func: MirFunc, expr: MirExpr, fallback: MirType
         expr.castExpr = mirOptExpr(module, func, expr.castExpr, srcType)
         let inner: MirExpr = expr.castExpr
         if inner != nil && inner.kind == meConstI64:
+            # Numeric float casts in Cheng are lowered via runtime helpers in MIR builder.
+            # Folding them as bit-width trunc/extend is semantically wrong, so keep the cast.
+            if mirOptCastHasFloat(srcType, expr.castType):
+                return expr
             let v2: int64 = mirOptFoldCast(srcType, expr.castType, inner.value)
             return mirConstI64(v2)
         return expr

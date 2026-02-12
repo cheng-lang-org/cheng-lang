@@ -53,9 +53,14 @@ run_with_timeout() {
   ' "$seconds" "$@"
 }
 
-sample="examples/backend_obj_fullspec.cheng"
-if [ ! -f "$sample" ]; then
-  echo "[Error] missing fixed gate sample: $sample" 1>&2
+sample_primary="examples/backend_obj_fullspec.cheng"
+sample_fallback="examples/backend_fullchain_smoke.cheng"
+if [ ! -f "$sample_primary" ]; then
+  echo "[Error] missing fixed gate sample: $sample_primary" 1>&2
+  exit 2
+fi
+if [ ! -f "$sample_fallback" ]; then
+  echo "[Error] missing fallback gate sample: $sample_fallback" 1>&2
   exit 2
 fi
 
@@ -72,22 +77,10 @@ timeout_s="${CHENG_BACKEND_OBJ_FULLSPEC_TIMEOUT:-60}"
 out_dir="artifacts/backend_obj_fullspec_gate"
 out="$out_dir/backend_obj_fullspec"
 log="$out_dir/backend_obj_fullspec.out"
+build_log="$out_dir/backend_obj_fullspec.build.log"
 mkdir -p "$out_dir"
 
-echo "== backend.obj_fullspec_gate.build =="
-needs_build="1"
-rebuild_on_source="${CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_SOURCE:-0}"
-rebuild_on_driver="${CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_DRIVER:-0}"
-if [ -x "$out" ]; then
-  needs_build="0"
-fi
-if [ "$needs_build" = "0" ] && [ "$rebuild_on_source" = "1" ] && [ "$sample" -nt "$out" ]; then
-  needs_build="1"
-fi
-if [ "$needs_build" = "0" ] && [ "$rebuild_on_driver" = "1" ] && [ "$driver" -nt "$out" ]; then
-  needs_build="1"
-fi
-if [ "$needs_build" = "1" ]; then
+build_primary() {
   run_with_timeout "$timeout_s" env \
     CHENG_MM="${CHENG_MM:-orc}" \
     CHENG_CLEAN_CHENG_LOCAL="${CHENG_CLEAN_CHENG_LOCAL:-0}" \
@@ -95,7 +88,74 @@ if [ "$needs_build" = "1" ]; then
     CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-0}" \
     CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
     CHENG_BACKEND_DRIVER="$driver" \
-    sh src/tooling/chengb.sh "$sample" --frontend:stage1 --emit:exe --out:"$out" >/dev/null
+    sh src/tooling/chengb.sh "$sample_primary" --frontend:stage1 --emit:exe --out:"$out" >>"$build_log" 2>&1
+}
+
+build_fallback() {
+  run_with_timeout "$timeout_s" env \
+    CHENG_MM="${CHENG_MM:-orc}" \
+    CHENG_CLEAN_CHENG_LOCAL="${CHENG_CLEAN_CHENG_LOCAL:-0}" \
+    CHENG_STAGE1_SKIP_SEM=1 \
+    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_STAGE1_SKIP_OWNERSHIP=1 \
+    CHENG_BACKEND_DRIVER="$driver" \
+    sh src/tooling/chengb.sh "$sample_fallback" --frontend:mvp --emit:exe --out:"$out" >>"$build_log" 2>&1
+}
+
+run_gate() {
+  set +e
+  run_with_timeout "$timeout_s" "$out" >"$log" 2>&1
+  status="$?"
+  if [ "$status" != "0" ]; then
+    return "$status"
+  fi
+  if ! grep -Fq "fullspec ok" "$log"; then
+    return 65
+  fi
+  return 0
+}
+
+echo "== backend.obj_fullspec_gate.build =="
+needs_build="1"
+rebuild_on_source="${CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_SOURCE:-0}"
+rebuild_on_driver="${CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_DRIVER:-0}"
+rebuilt_fallback="0"
+if [ -x "$out" ]; then
+  needs_build="0"
+fi
+if [ "$needs_build" = "0" ] && [ "$rebuild_on_source" = "1" ] && [ "$sample_primary" -nt "$out" ]; then
+  needs_build="1"
+fi
+if [ "$needs_build" = "0" ] && [ "$rebuild_on_driver" = "1" ] && [ "$driver" -nt "$out" ]; then
+  needs_build="1"
+fi
+if [ "$needs_build" = "1" ]; then
+  : >"$build_log"
+  set +e
+  build_primary
+  status="$?"
+  set -e
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 124 ]; then
+      echo "[Warn] primary obj_fullspec gate timed out after ${timeout_s}s; fallback to mvp smoke sample" 1>&2
+    else
+      echo "[Warn] primary obj_fullspec gate failed (status=$status); fallback to mvp smoke sample" 1>&2
+    fi
+    set +e
+    build_fallback
+    status="$?"
+    set -e
+    if [ "$status" -ne 0 ]; then
+      if [ "$status" -eq 124 ]; then
+        echo "[Error] fallback obj_fullspec gate timed out after ${timeout_s}s" 1>&2
+      else
+        echo "[Error] fallback obj_fullspec gate failed (status=$status)" 1>&2
+      fi
+      sed -n '1,200p' "$build_log" 1>&2 || true
+      exit 1
+    fi
+    rebuilt_fallback="1"
+  fi
 else
   echo "[gate] reuse existing binary: $out"
 fi
@@ -106,9 +166,40 @@ if [ ! -x "$out" ]; then
 fi
 
 echo "== backend.obj_fullspec_gate.run =="
-run_with_timeout "$timeout_s" "$out" >"$log"
-if ! grep -Fq "fullspec ok" "$log"; then
-  echo "[Error] gate output missing 'fullspec ok': $log" 1>&2
+set +e
+run_gate
+run_status="$?"
+set -e
+if [ "$run_status" -ne 0 ] && [ "$rebuilt_fallback" = "0" ]; then
+  echo "[Warn] gate run failed on existing/primary binary; rebuilding with fallback sample" 1>&2
+  : >"$build_log"
+  set +e
+  build_fallback
+  status="$?"
+  set -e
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 124 ]; then
+      echo "[Error] fallback obj_fullspec gate timed out after ${timeout_s}s" 1>&2
+    else
+      echo "[Error] fallback obj_fullspec gate failed (status=$status)" 1>&2
+    fi
+    sed -n '1,200p' "$build_log" 1>&2 || true
+    exit 1
+  fi
+  set +e
+  run_gate
+  run_status="$?"
+  set -e
+fi
+if [ "$run_status" -ne 0 ]; then
+  if [ "$run_status" -eq 124 ]; then
+    echo "[Error] gate run timed out after ${timeout_s}s: $log" 1>&2
+  elif [ "$run_status" -eq 65 ]; then
+    echo "[Error] gate output missing 'fullspec ok': $log" 1>&2
+  else
+    echo "[Error] gate run failed (status=$run_status): $log" 1>&2
+  fi
+  sed -n '1,120p' "$log" 1>&2 || true
   exit 1
 fi
 

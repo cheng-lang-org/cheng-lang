@@ -20,12 +20,7 @@ strict="${CHENG_BACKEND_MATRIX_STRICT:-0}"
 run_fullspec="${CHENG_BACKEND_RUN_FULLSPEC:-0}"
 host_os="$(uname -s 2>/dev/null || echo unknown)"
 host_arch="$(uname -m 2>/dev/null || echo unknown)"
-driver=""
-if [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
-  driver="artifacts/backend_selfhost_self_obj/cheng.stage2"
-else
-  driver="$(sh src/tooling/backend_driver_path.sh)"
-fi
+driver="$(sh src/tooling/backend_driver_path.sh)"
 export CHENG_BACKEND_DRIVER="$driver"
 backend_mm="${CHENG_BACKEND_MM:-${CHENG_MM:-orc}}"
 backend_linker="${CHENG_BACKEND_LINKER:-self}"
@@ -104,6 +99,7 @@ run_step "backend.profile_smoke" env \
 run_step "backend.targets" sh src/tooling/verify_backend_targets.sh
 run_step "backend.targets_matrix" sh src/tooling/verify_backend_targets_matrix.sh
 run_step "backend.runtime_abi" sh src/tooling/verify_backend_runtime_abi.sh
+run_step "backend.spawn_api_gate" sh src/tooling/verify_backend_spawn_api_gate.sh
 run_step "backend.std_layout_sync" sh src/tooling/verify_std_layout_sync.sh
 run_step "backend.stage1_seed_layout" sh src/tooling/verify_stage1_seed_layout.sh
 run_step "backend.std_import_surface" sh src/tooling/verify_std_import_surface.sh

@@ -84,6 +84,13 @@ int64_t cheng_f64_le_bits(int64_t a_bits, int64_t b_bits);
 int64_t cheng_f64_gt_bits(int64_t a_bits, int64_t b_bits);
 int64_t cheng_f64_ge_bits(int64_t a_bits, int64_t b_bits);
 int64_t cheng_i64_to_f64_bits(int64_t x);
+int64_t cheng_u64_to_f64_bits(uint64_t x);
+int64_t cheng_f64_bits_to_i64(int64_t bits);
+uint64_t cheng_f64_bits_to_u64(int64_t bits);
+int64_t cheng_f32_bits_to_f64_bits(int32_t bits);
+int32_t cheng_f64_bits_to_f32_bits(int64_t bits);
+int64_t cheng_f32_bits_to_i64(int32_t bits);
+uint64_t cheng_f32_bits_to_u64(int32_t bits);
 int32_t cheng_jpeg_decode(const uint8_t* data, int32_t len, int32_t* out_w, int32_t* out_h, uint8_t** out_rgba);
 void cheng_jpeg_free(void* p);
 

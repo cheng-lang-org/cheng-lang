@@ -422,29 +422,30 @@ fn coffSymRvaLocal(obj: CoffObjFile, lay: CoffLinkObjLayout, sym: CoffObjSymbol,
         return Ok[uint64](bssRva + lay.bssOff + uint64(sym.value))
     return Err[uint64]("coff_linker: unsupported symbol section: " + sym.name)
 
-fn coffDefAdd(defs: CoffLinkDef[]*, defIndex: hashmaps.HashMapStrInt*, name: str, rva: uint64): Result[bool] =
-    if defs == nil || defIndex == nil:
+fn coffDefAdd(defs: CoffLinkDef[]*, defIndex: var hashmaps.HashMapStrInt, name: str, rva: uint64): Result[bool] =
+    if defs == nil:
         return Err[bool]("coff_linker: internal nil defs")
     if name == nil || len(name) == 0:
         return Ok[bool](true)
-    var found: bool = false
-    hashmaps.hashMapStrIntGetPtrRaw(defIndex, name,&found)
-    if found:
+    let key: str = name + ""
+    var exists: bool = false
+    let _existing: int32 = hashmaps.hashMapStrIntGetMut(defIndex, key, exists)
+    if exists:
         return Err[bool]("coff_linker: duplicate symbol: " + name)
     var d: CoffLinkDef
     new d
-    d.name = name
+    d.name = key
     d.rva = rva
-    hashmaps.hashMapStrIntPut(defIndex, name, defs->len)
+    hashmaps.hashMapStrIntPut(defIndex, key, defs->len + 1)
     add(defs, d)
     return Ok[bool](true)
 
 fn coffDefLookup(defs: CoffLinkDef[], defIndex: hashmaps.HashMapStrInt, name: str): Result[uint64] =
     if name == nil || len(name) == 0:
         return Err[uint64]("coff_linker: missing symbol name")
-    var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGetPtrRaw(defIndex, name,&found)
-    if !found || idx < 0 || idx >= defs.len:
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, name)
+    let idx: int32 = idxPlus1 - 1
+    if idxPlus1 <= 0 || idx < 0 || idx >= defs.len:
         return Err[uint64]("coff_linker: unresolved symbol: " + name)
     let d: CoffLinkDef = defs[idx]
     if d == nil:
@@ -487,9 +488,9 @@ fn coffBuildIdataImports(idataRva: uint32, imports: CoffImport[], outImportDirSi
         let imp: CoffImport = imports[ii]
         if imp != nil && imp.dll != nil && len(imp.dll) > 0:
             var found: bool = false
-            hashmaps.hashMapStrIntGet(dllIndex, imp.dll, found)
+            let _seenDll: int32 = hashmaps.hashMapStrIntGetEx(dllIndex, imp.dll, found)
             if !found:
-                hashmaps.hashMapStrIntPut(&dllIndex, imp.dll, dllNames.len)
+                hashmaps.hashMapStrIntPut(dllIndex, imp.dll, dllNames.len)
                 add(dllNames, imp.dll)
     coffSortStrs(dllNames)
 
@@ -694,9 +695,9 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
             let s0: CoffObjSymbol = o0.symbols[si0]
             if s0 != nil && s0.sect != 0 && s0.storage == IMAGE_SYM_CLASS_EXTERNAL && s0.name != nil && len(s0.name) > 0:
                 var found: bool = false
-                hashmaps.hashMapStrIntGet(defNames, s0.name, found)
+                let _seenDef0: int32 = hashmaps.hashMapStrIntGetEx(defNames, s0.name, found)
                 if !found:
-                    hashmaps.hashMapStrIntPut(&defNames, s0.name, 1)
+                    hashmaps.hashMapStrIntPut(defNames, s0.name, 1)
 
     # Collect required imports: undefined BRANCH26 targets.
     var importNames: str[]
@@ -712,21 +713,21 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
             let sym0: CoffObjSymbol = o1.symbols[int32(r0.symIndex)]
             if sym0 != nil && sym0.sect == 0 && sym0.name != nil && len(sym0.name) > 0:
                 var foundDef: bool = false
-                hashmaps.hashMapStrIntGet(defNames, sym0.name, foundDef)
+                let _seenDef1: int32 = hashmaps.hashMapStrIntGetEx(defNames, sym0.name, foundDef)
                 if !foundDef:
                     if r0.rtype != IMAGE_REL_ARM64_BRANCH26:
                         return Err[bool]("coff_linker: unsupported undefined reloc for import: " + sym0.name + " type=" + intToStr(int32(r0.rtype)))
                     var foundImp: bool = false
-                    hashmaps.hashMapStrIntGet(importSet, sym0.name, foundImp)
+                    let _seenImp0: int32 = hashmaps.hashMapStrIntGetEx(importSet, sym0.name, foundImp)
                     if !foundImp:
-                        hashmaps.hashMapStrIntPut(&importSet, sym0.name, 1)
+                        hashmaps.hashMapStrIntPut(importSet, sym0.name, 1)
                         add(importNames, sym0.name)
 
     # Always import ExitProcess for the entry.
     var hasExit: bool = false
-    hashmaps.hashMapStrIntGet(importSet, "ExitProcess", hasExit)
+    let _seenExit: int32 = hashmaps.hashMapStrIntGetEx(importSet, "ExitProcess", hasExit)
     if !hasExit:
-        hashmaps.hashMapStrIntPut(&importSet, "ExitProcess", 1)
+        hashmaps.hashMapStrIntPut(importSet, "ExitProcess", 1)
         add(importNames, "ExitProcess")
 
     coffSortStrs(importNames)
@@ -752,7 +753,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
         obj_buf.bufU32(&text, aarch64_enc.a64EncAdrp(16))
         obj_buf.bufU32(&text, ldrEnc)
         obj_buf.bufU32(&text, coffEncBr(17))
-        hashmaps.hashMapStrIntPut(&importIndex, name, imports.len)
+        hashmaps.hashMapStrIntPut(importIndex, name, imports.len)
         add(imports, imp)
 
     let hasRdata: bool = rdata.len > 0
@@ -791,7 +792,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
                 let addrRes: Result[uint64] = coffSymRvaLocal(o2, lay2, s, textRva, rdataRva, dataRva, bssRva)
                 if !IsOk[uint64](addrRes):
                     return Err[bool](ErrorInfoOf[uint64](addrRes))
-                let putRes: Result[bool] = coffDefAdd(&defs, &defIndex, s.name, Value[uint64](addrRes))
+                let putRes: Result[bool] = coffDefAdd(&defs, defIndex, s.name, Value[uint64](addrRes))
                 if !IsOk[bool](putRes):
                     return Err[bool](ErrorInfoOf[bool](putRes))
 
@@ -815,16 +816,16 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
                     return Err[bool](ErrorInfoOf[uint64](addrRes2))
                 targetRva = Value[uint64](addrRes2)
             else:
-                var foundDef: bool = false
-                let defIdx: int32 = hashmaps.hashMapStrIntGetPtrRaw(defIndex, sym.name,&foundDef)
-                if foundDef && defIdx >= 0 && defIdx < defs.len:
+                let defIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name)
+                let defIdx: int32 = defIdxPlus1 - 1
+                if defIdxPlus1 > 0 && defIdx >= 0 && defIdx < defs.len:
                     let d: CoffLinkDef = defs[defIdx]
                     if d == nil:
                         return Err[bool]("coff_linker: unresolved symbol: " + sym.name)
                     targetRva = d.rva
                 else:
                     var foundImp: bool = false
-                    let impIdx: int32 = hashmaps.hashMapStrIntGet(importIndex, sym.name, foundImp)
+                    let impIdx: int32 = hashmaps.hashMapStrIntGetEx(importIndex, sym.name, foundImp)
                     if !foundImp || impIdx < 0 || impIdx >= imports.len:
                         return Err[bool]("coff_linker: unresolved symbol: " + sym.name)
                     if r0.rtype != IMAGE_REL_ARM64_BRANCH26:
@@ -857,7 +858,7 @@ fn coffLinkExeAarch64(objPaths: str[], outputPath: str, target: str): Result[boo
         return Err[bool]("coff_linker: missing main symbol (required for entry)")
     let mainRva: uint64 = Value[uint64](mainRvaRes)
     var foundExitImp: bool = false
-    let exitImpIdx: int32 = hashmaps.hashMapStrIntGet(importIndex, "ExitProcess", foundExitImp)
+    let exitImpIdx: int32 = hashmaps.hashMapStrIntGetEx(importIndex, "ExitProcess", foundExitImp)
     if !foundExitImp || exitImpIdx < 0 || exitImpIdx >= imports.len:
         return Err[bool]("coff_linker: internal missing ExitProcess import stub")
     let exitImp: CoffImport = imports[exitImpIdx]

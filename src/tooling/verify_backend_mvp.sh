@@ -72,8 +72,6 @@ do
   "$exe_path"
 done
 
-echo "verify_backend_mvp ok"
-
 for fixture in tests/cheng/backend/fixtures/return_add.cheng \
                tests/cheng/backend/fixtures/hello_puts.cheng \
                tests/cheng/backend/fixtures/hello_importc_puts.cheng \
@@ -82,7 +80,12 @@ for fixture in tests/cheng/backend/fixtures/return_add.cheng \
                tests/cheng/backend/fixtures/return_while_sum.cheng \
                tests/cheng/backend/fixtures/return_for_sum.cheng \
                tests/cheng/backend/fixtures/return_deref.cheng \
-               tests/cheng/backend/fixtures/return_store_deref.cheng
+               tests/cheng/backend/fixtures/return_store_deref.cheng \
+               tests/cheng/backend/fixtures/return_float64_ops.cheng \
+               tests/cheng/backend/fixtures/return_float32_roundtrip.cheng \
+               tests/cheng/backend/fixtures/return_float_mixed_int_cast.cheng \
+               tests/cheng/backend/fixtures/return_float_compare_cast.cheng \
+               tests/cheng/backend/fixtures/return_float32_arith_chain.cheng
 do
   base="$(basename "$fixture" .cheng)"
   exe_path="$out_dir/${base}"
@@ -111,3 +114,5 @@ do
   fi
   "$exe_path"
 done
+
+echo "verify_backend_mvp ok"

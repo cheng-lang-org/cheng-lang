@@ -61,6 +61,8 @@ sh src/tooling/backend_driver_path.sh
 # 使用 selfhost stage2（用于全链自举/发布）
 export CHENG_BACKEND_DRIVER=artifacts/backend_selfhost_self_obj/cheng.stage2
 ```
+说明：
+- `backend_driver_path.sh` 的可运行性 smoke 默认包含 `mvp + stage1` 两条最小编译路径；可用 `CHENG_BACKEND_DRIVER_PATH_STAGE1_SMOKE=0` 临时关闭 stage1 smoke（仅排障建议）。
 
 后端链接环境助手（脚本统一注入 self-linker 运行时 `.o`）：
 ```bash
@@ -105,9 +107,13 @@ CHENG_FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
   - 启用后按主机核数并行构建（`CHENG_FULLCHAIN_TOOL_JOBS`，`0`=auto）。
   - `verify_backend_selfhost_bootstrap_self_obj.sh` 支持 `CHENG_SELF_OBJ_BOOTSTRAP_TIMEOUT=<seconds>`（默认 60）防止 stage1/stage2 自举编译长时间卡死。
 - `verify_backend_selfhost_bootstrap_self_obj.sh` 默认启用 `CHENG_ABI=v2_noptr`（可显式覆盖）。
-- `CHENG_ABI=v2_noptr` 会在 stage1 语义层启用 std no-pointer 门禁；兼容开关 `CHENG_STAGE1_STD_NO_POINTERS`/`CHENG_STAGE1_STD_NO_POINTERS_STRICT` 仍可单独设置。
+- `CHENG_ABI=v2_noptr` 默认会在 stage1 语义层启用 std no-pointer 门禁；可用 `CHENG_STAGE1_STD_NO_POINTERS=0` 显式关闭（兼容口径），或用 `CHENG_STAGE1_STD_NO_POINTERS=1`/`CHENG_STAGE1_STD_NO_POINTERS_STRICT=1` 强制严格门禁。
+- 新增 `CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1`：在非 C ABI 对接模块禁用 `*`/`&`/deref/`ptr_*` 等指针语法与操作（C ABI 桥接模块豁免）。
+  - 若要连 `src/stage1`/`src/backend`/`src/tooling` 内部编译器实现也强制门禁，可再设 `CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
 - `v2_noptr` 的策略由 `verify_backend_abi_v2_noptr.sh` 负向样例门禁保证：`src/std` 路径下的指针类型必须在编译期被拒绝。
-- `chengb.sh`/`chengc.sh` 在 `CHENG_ABI=v2_noptr` 时会自动注入 `CHENG_STAGE1_STD_NO_POINTERS=1` 与 `CHENG_STAGE1_STD_NO_POINTERS_STRICT=1`，确保旧版 stage2 driver 也遵循同一策略。
+- `verify_backend_abi_v2_noptr.sh` 可通过 `CHENG_BACKEND_ABI_V2_NOPTR_ONLY=1` 切到 only-v2 口径（跳过 `v1` 探针，仅校验 `v2_noptr` 及 non-C-ABI 门禁）。
+- `verify_backend_abi_v2_noptr.sh` 在 only-v2 的 non-C-ABI 子门禁下，会显式设置 `CHENG_STAGE1_STD_NO_POINTERS=0` 以隔离并验证 non-C-ABI 诊断本身。
+- `chengb.sh`/`chengc.sh` 在 `CHENG_ABI=v2_noptr` 时会自动注入 `CHENG_STAGE1_STD_NO_POINTERS=1`、`CHENG_STAGE1_STD_NO_POINTERS_STRICT=1`、`CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1`，确保旧版 stage2 driver 也遵循同一策略。
   - stage0 选择顺序：`CHENG_SELF_OBJ_BOOTSTRAP_STAGE0`（显式） -> 可执行 `CHENG_BACKEND_DRIVER` -> `artifacts/backend_selfhost_self_obj/cheng.stage2` -> `artifacts/backend_selfhost_self_obj/cheng.stage1` -> `artifacts/backend_seed/cheng.stage2` -> 可运行 `./cheng`（缺失或不可运行时才重建）。seed 仅用于“首次/无自举产物”的兜底。
   - 自举模式：`CHENG_SELF_OBJ_BOOTSTRAP_MODE=strict|fast`（默认 `strict`）。`strict` 默认校验 `stage1->stage2` 固定点；若首次不收敛，会自动追加 `stage3` 并以 `stage2->stage3` 固定点作为收敛门禁。`fast` 只编译 stage1 并同步为 stage2（开发加速，跳过 fixed-point 校验）。
   - 自举编译默认开启多单元增量：`CHENG_SELF_OBJ_BOOTSTRAP_MULTI=1`、`CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL=1`、`CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE=1`；`CHENG_SELF_OBJ_BOOTSTRAP_JOBS` 默认 `0`（auto，按主机核数并行）。
@@ -139,8 +145,10 @@ sh src/tooling/backend_prod_closure.sh --stress
 说明：
 - `backend_prod_closure.sh` 默认不跑 fullchain/stress；可用 `--fullchain` / `CHENG_BACKEND_RUN_FULLCHAIN=1` 和 `--stress` / `CHENG_BACKEND_RUN_STRESS=1` 显式开启。
 - `backend_prod_closure.sh` 默认 strict：任一步骤 `exit 2`（skip）会直接失败；仅本地排障时再显式加 `--allow-skip`。
-- `backend_prod_closure.sh` 默认启用 `CHENG_ABI=v2_noptr`（显式设置 `CHENG_ABI` 可覆盖）。
+- `backend_prod_closure.sh` 现在仅支持 `CHENG_ABI=v2_noptr`（若外部传入非 `v2_noptr` 会直接报错退出）；主闭环以 `v2_noptr` 兼容口径执行（`CHENG_STAGE1_STD_NO_POINTERS=0`），并通过 `backend.abi_v2_noptr` 步骤单独执行严格 no-pointer 门禁。
 - `backend_prod_closure.sh` 默认包含 `backend.abi_v2_noptr` 专项门禁（`src/tooling/verify_backend_abi_v2_noptr.sh`）。
+- `backend_prod_closure.sh` 在 `CHENG_BACKEND_DRIVER` 未显式设置时，优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（其次 `cheng.stage1`、`artifacts/backend_seed/cheng.stage2`），仅在都不可用时才回落 `backend_driver_path.sh` 重建。
+- `verify_backend_closedloop.sh` 默认执行 `backend.spawn_api_gate`（`src/tooling/verify_backend_spawn_api_gate.sh`）；该 gate 已切换到不依赖 `std/async_rt` 指针实现的 fixture，因此在 `CHENG_ABI=v2_noptr` 下也可直接回归。
 - `verify_backend_obj_fullspec_gate.sh` 默认复用已有 `artifacts/backend_obj_fullspec_gate/backend_obj_fullspec`（避免重复冷编译超时）；如需强制重编可设 `CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_SOURCE=1` 或 `CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_DRIVER=1`。
 - `backend_prod_closure.sh` 默认将自举阶段单次编译超时设为 `60s`（`CHENG_BACKEND_PROD_SELFHOST_TIMEOUT`），用于及早暴露性能回退。
 - `backend_prod_closure.sh` 默认自举模式为 `strict`；可用 `CHENG_BACKEND_PROD_SELFHOST_MODE=fast` 临时切到单阶段自举加速本地迭代（发布/CI 建议保持 strict）。
@@ -203,9 +211,17 @@ CHENG_MM=orc sh src/tooling/verify_backend_self_linker_riscv64.sh
 ```
 说明：
 - `verify_backend_closedloop.sh` 默认 `CHENG_BACKEND_RUN_FULLSPEC=0`（不跑 fullspec）；显式设为 `1` 才开启 fullspec 编译+运行门禁。
+- `verify_backend_closedloop.sh` 已纳入 `backend.spawn_api_gate`，对应脚本为 `src/tooling/verify_backend_spawn_api_gate.sh`（默认 API 禁 raw spawn、legacy 显式入口可用；当前 `fn()` 入口正向口径为 `spawn(entry)`）。
 - 当前 `CHENG_BACKEND_RUN_FULLSPEC=1` 仍属于追踪口径（已知可能出现 `mir_builder: main not found`）；默认生产闭环口径不依赖该步骤。
 - `verify_backend_mm.sh` 默认只跑 `mm_live_balance`；容器回归 `mm_container_balance` 需显式 `CHENG_BACKEND_MM_CONTAINER=1`。
 - `verify_backend_self_linker_riscv64.sh` 默认口径为 `CHENG_MM=orc`，并优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（若存在）以避免 gate 内重建 driver 触发超时。
+
+MIR float 回归（MVP）：
+```bash
+sh src/tooling/verify_backend_mvp.sh
+```
+说明：
+- `verify_backend_mvp.sh` 当前覆盖 `return_float64_ops`、`return_float32_roundtrip`、`return_float_mixed_int_cast`、`return_float_compare_cast`、`return_float32_arith_chain`；当前口径已验证 `f64/f32` 算术、比较与 `f64/f32 <-> int` 基础 cast 语义（向零截断）。
 
 Linux AArch64 no-libc 独立验收（不接入默认 verify）：
 ```bash
@@ -230,6 +246,7 @@ sh src/tooling/verify_std_import_surface.sh
 说明：
 - 校验 `src/stage1`、`src/backend`、`src/tooling`、`src/decentralized`、`src/web` 下的 Cheng 源码不再直接导入 `cheng/stdlib/bootstrap/*`。
 - 约束统一入口为 `std/*`；`src/stdlib/bootstrap` 已移除，不作为可用 import 路径。
+- 同时门禁禁止显式泛型 `reserve[T](...)` 调用；统一使用 `reserve(xs, n)` 或 `xs.cap = n`。
 
 标准库目录同步门禁：
 ```bash
@@ -255,6 +272,7 @@ sh src/tooling/verify_cheng_skill_consistency.sh
 说明：
 - 扫描 `docs/cheng-skill/` 与 `~/.codex/skills/cheng语言` 的关键文件漂移，并检查禁用语法。
 - 默认执行最小编译+运行抽样；可用 `CHENG_SKILL_COMPILE=0` 只做文档检查。
+- 编译抽样默认优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（其次 `cheng.stage1`、`artifacts/backend_seed/cheng.stage2`），并使用稳定 stage1 口径（`CHENG_STAGE1_SKIP_MONO=1`、`CHENG_STAGE1_SKIP_OWNERSHIP=1`）。
 - `verify.sh` 默认执行该门禁；可用 `CHENG_VERIFY_SKILL=0` 临时跳过。
 
 ## 包管理闭环

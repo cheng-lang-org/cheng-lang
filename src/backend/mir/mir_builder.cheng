@@ -24,6 +24,27 @@ fn cheng_parse_f64_bits(s: str): int64
 @importc("cheng_i64_to_f64_bits")
 fn cheng_i64_to_f64_bits(x: int64): int64
 
+@importc("cheng_u64_to_f64_bits")
+fn cheng_u64_to_f64_bits(x: uint64): int64
+
+@importc("cheng_f64_bits_to_i64")
+fn cheng_f64_bits_to_i64(bits: int64): int64
+
+@importc("cheng_f64_bits_to_u64")
+fn cheng_f64_bits_to_u64(bits: int64): uint64
+
+@importc("cheng_f32_bits_to_f64_bits")
+fn cheng_f32_bits_to_f64_bits(bits: int32): int64
+
+@importc("cheng_f64_bits_to_f32_bits")
+fn cheng_f64_bits_to_f32_bits(bits: int64): int32
+
+@importc("cheng_f32_bits_to_i64")
+fn cheng_f32_bits_to_i64(bits: int32): int64
+
+@importc("cheng_f32_bits_to_u64")
+fn cheng_f32_bits_to_u64(bits: int32): uint64
+
 type
     LocalEnv = ref
         names: str[]
@@ -101,6 +122,125 @@ fn mirIsOne(raw: str): bool =
 fn mirIsOrcMode(mm: str): bool =
     return mm != nil && len(mm) == 3 &&
            mm[0] == char('o') && mm[1] == char('r') && mm[2] == char('c')
+
+fn mirEnsurePolicyDiag(diags: var Diagnostic[], filePath: str, msg: str) =
+    if hasError(diags):
+        return
+    var d: Diagnostic
+    d.severity = svError
+    d.filename = filePath
+    d.line = 1
+    d.col = 1
+    d.message = msg
+    add(diags, d)
+
+fn mirFileLikelyHasPointerSyntax(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    let content: str = stage1_readFile(path)
+    if content == nil || len(content) == 0:
+        return false
+    if strContains(content, "ptr_add(") || strContains(content, "load_ptr(") || strContains(content, "store_ptr("):
+        return true
+    if strContains(content, "alloc(") || strContains(content, "dealloc("):
+        return true
+    if strContains(content, "ptr[") || strContains(content, "ref["):
+        return true
+    var colonSeen: bool = false
+    var sawAssign: bool = false
+    for i in 0..<len(content):
+        let ch: char = content[i]
+        if ch == '\n' || ch == '\r':
+            colonSeen = false
+            sawAssign = false
+            continue
+        if ch == ':':
+            colonSeen = true
+            sawAssign = false
+            continue
+        if ch == '=':
+            sawAssign = true
+            continue
+        if ch == '*' && colonSeen && !sawAssign:
+            return true
+    return false
+
+fn mirHasDefaultSpawnCall(content: str): bool =
+    if content == nil || len(content) < 6:
+        return false
+    let n: int32 = len(content)
+    for i in 0..(n - 6):
+        if content[i] == 's' &&
+           content[i + 1] == 'p' &&
+           content[i + 2] == 'a' &&
+           content[i + 3] == 'w' &&
+           content[i + 4] == 'n' &&
+           content[i + 5] == '(':
+            if i > 0 && content[i - 1] == '.':
+                continue
+            return true
+    return false
+
+fn mirFileLikelyUsesRawSpawn(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    let content: str = stage1_readFile(path)
+    if content == nil || len(content) == 0:
+        return false
+    if !mirHasDefaultSpawnCall(content):
+        return false
+    if strContains(content, "void*") || strContains(content, "void *"):
+        return true
+    if strContains(content, "fn_ptr") || strContains(content, "fnPtr"):
+        return true
+    return false
+
+fn mirPathLooksStdModule(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    if strContains(path, "src/std/") || strContains(path, "src\\std\\"):
+        return true
+    return false
+
+fn mirStdNoPointerEnabled(): bool =
+    let stdNoPtrEnv: str = getEnv "CHENG_STAGE1_STD_NO_POINTERS"
+    if mirIsOne(stdNoPtrEnv):
+        return true
+    if stdNoPtrEnv == "0":
+        return false
+    let abiEnv: str = getEnv "CHENG_ABI"
+    return abiEnv == "v2_noptr"
+
+fn mirStage1StdNoPointerPrecheck(root: Node, inPath: str, diags: var Diagnostic[]): bool =
+    if !mirStdNoPointerEnabled():
+        return false
+    var ctx: SemCtx
+    initSemCtxInPlace(ctx)
+    ctx.diags = diags
+    ctx.filename = inPath
+    var hits: int32 = semCheckStdNoPointerPolicy(ctx, root)
+    if hits <= 0 && mirPathLooksStdModule(inPath) && mirFileLikelyHasPointerSyntax(inPath):
+        hits = 1
+    diags = ctx.diags
+    if hits > 0:
+        mirEnsurePolicyDiag(diags, inPath, "std policy: pointer types are forbidden in standard library")
+    return hits > 0
+
+fn mirStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Diagnostic[]): bool =
+    let nonCAbiNoPtrEnv: str = getEnv "CHENG_STAGE1_NO_POINTERS_NON_C_ABI"
+    if !mirIsOne(nonCAbiNoPtrEnv):
+        return false
+    var ctx: SemCtx
+    initSemCtxInPlace(ctx)
+    ctx.diags = diags
+    ctx.filename = inPath
+    var hits: int32 = semCheckNoPointerNonCAbiPolicy(ctx, root)
+    if hits <= 0 && mirFileLikelyHasPointerSyntax(inPath):
+        hits = 1
+    diags = ctx.diags
+    if hits > 0:
+        mirEnsurePolicyDiag(diags, inPath, "no-pointer policy: pointer types are forbidden outside C ABI modules")
+    return hits > 0
 
 fn mirCalleeCandidatesReset() =
     mirCalleeCandidates = hashmaps.hashMapStrSeqIntInit(2048)
@@ -233,7 +373,7 @@ fn mirInlineObjFieldTypePut(parentType: str, fieldName: str, objTypeName: str) =
         return
     let newIdx: int32 = mirInlineObjFieldTypeNames.len
     add(mirInlineObjFieldTypeNames, objTypeName)
-    hashmaps.hashMapStrIntPut(&mirInlineObjFieldTypeIndex, key, newIdx)
+    hashmaps.hashMapStrIntPut(mirInlineObjFieldTypeIndex, key, newIdx)
 
 fn mirInlineObjFieldTypeGet(parentType: str, fieldName: str): str =
     if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || !mirInlineObjFieldTypeReady:
@@ -259,7 +399,7 @@ fn mirObjFieldTypeKeyPut(parentType: str, fieldName: str, fieldTypeKey: str) =
         return
     let newIdx: int32 = mirObjFieldTypeKeyNames.len
     add(mirObjFieldTypeKeyNames, fieldTypeKey)
-    hashmaps.hashMapStrIntPut(&mirObjFieldTypeKeyIndex, key, newIdx)
+    hashmaps.hashMapStrIntPut(mirObjFieldTypeKeyIndex, key, newIdx)
 
 fn mirObjFieldTypeKeyGet(parentType: str, fieldName: str): str =
     if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || !mirObjFieldTypeKeyReady:
@@ -283,9 +423,9 @@ fn mirTupleFieldIndexPut(tupleKey: str, fieldName: str, idx0: int32) =
         # Structural tuple types may share the same key without field labels. If a label maps to
         # different indices, treat it as ambiguous.
         if existing != idx0 && existing != -2:
-            hashmaps.hashMapStrIntPut(&mirTupleFieldIndex, key, -2)
+            hashmaps.hashMapStrIntPut(mirTupleFieldIndex, key, -2)
         return
-    hashmaps.hashMapStrIntPut(&mirTupleFieldIndex, key, idx0)
+    hashmaps.hashMapStrIntPut(mirTupleFieldIndex, key, idx0)
 
 fn mirTupleFieldIndexGet(tupleKey: str, fieldName: str): int32 =
     if tupleKey == nil || len(tupleKey) == 0 || fieldName == nil || len(fieldName) == 0 || !mirTupleFieldIndexReady:
@@ -310,7 +450,7 @@ fn mirGlobalObjTypePut(name: str, objTypeName: str) =
         return
     let newIdx: int32 = mirGlobalObjTypeNames.len
     add(mirGlobalObjTypeNames, objTypeName)
-    hashmaps.hashMapStrIntPut(&mirGlobalObjTypeIndex, name, newIdx)
+    hashmaps.hashMapStrIntPut(mirGlobalObjTypeIndex, name, newIdx)
 
 fn mirGlobalObjTypeGet(name: str): str =
     if name == nil || len(name) == 0 || !mirGlobalObjTypeReady:
@@ -337,7 +477,7 @@ fn mirGlobalTypeKeyPut(name: str, typeKey0: str) =
         return
     let newIdx: int32 = mirGlobalTypeKeyNames.len
     add(mirGlobalTypeKeyNames, typeKey)
-    hashmaps.hashMapStrIntPut(&mirGlobalTypeKeyIndex, name, newIdx)
+    hashmaps.hashMapStrIntPut(mirGlobalTypeKeyIndex, name, newIdx)
 
 fn mirGlobalTypeKeyGet(name: str): str =
     if name == nil || len(name) == 0 || !mirGlobalTypeKeyReady:
@@ -367,7 +507,7 @@ fn mirObjAliasPut(aliasName0: str, targetName0: str) =
         return
     let newIdx: int32 = mirObjAliasNames.len
     add(mirObjAliasNames, targetName)
-    hashmaps.hashMapStrIntPut(&mirObjAliasIndex, aliasName, newIdx)
+    hashmaps.hashMapStrIntPut(mirObjAliasIndex, aliasName, newIdx)
 
 fn mirObjAliasGet(aliasName0: str): str =
     if aliasName0 == nil || len(aliasName0) == 0 || !mirObjAliasReady:
@@ -537,7 +677,7 @@ fn mirComputeDuplicateFnBases(root: Node, overloaded: hashsets.HashSetStr* = nil
         let cur0: int32 = hashmaps.hashMapStrIntGet(counts, rawName, found)
         let cur: int32 = found ? cur0 : 0
         let next: int32 = cur + 1
-        hashmaps.hashMapStrIntPut(&counts, rawName, next)
+        hashmaps.hashMapStrIntPut(counts, rawName, next)
         if next > 1:
             hashsets.hashSetStrAdd(dup, rawName)
     return dup
@@ -595,7 +735,7 @@ fn mirComputeDuplicateGlobalNames(root: Node): hashsets.HashSetStr =
         let cur0: int32 = hashmaps.hashMapStrIntGet(counts, rawName, found)
         let cur: int32 = found ? cur0 : 0
         let next: int32 = cur + 1
-        hashmaps.hashMapStrIntPut(&counts, rawName, next)
+        hashmaps.hashMapStrIntPut(counts, rawName, next)
         if next > 1:
             hashsets.hashSetStrAdd(dup, rawName)
     return dup
@@ -852,7 +992,7 @@ fn localEnvPopScope(env: LocalEnv) =
             let nm: str = mbRead(env.names, slot)
             let prev: int32 = mbRead(env.prevSlots, slot)
             let restore: int32 = (prev >= 0) ? (prev + 1) : 0
-            hashmaps.hashMapStrIntPut(&env.nameIndex, nm, restore)
+            hashmaps.hashMapStrIntPut(env.nameIndex, nm, restore)
     for i in mark..<env.active.len:
         mbWriteBool(&env.active, i, false)
 
@@ -889,7 +1029,7 @@ fn localAdd(env: LocalEnv, name: str, ty: MirType): int32 =
     add(env.callTargets, "")
     add(env.active, true)
     add(env.prevSlots, prevSlot)
-    hashmaps.hashMapStrIntPut(&env.nameIndex, nm, env.names.len)
+    hashmaps.hashMapStrIntPut(env.nameIndex, nm, env.names.len)
     return env.names.len - 1
 
 fn localType(env: LocalEnv, idx: int32): MirType =
@@ -1486,6 +1626,28 @@ fn mirIndexFnDecls(root: Node, outMap: hashmaps.HashMapStrSeqInt*, outNodes: Nod
                     if base2 != nil && len(base2) > 0 && !(base2 == nm):
                         hashmaps.hashMapStrSeqIntAdd(outMap, base2, idx)
 
+fn mirReachDeclIdxs(index: hashmaps.HashMapStrSeqInt, nodes: Node[], name: str, foundOut: bool* = nil): int32[] =
+    var found: bool = false
+    let idxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, name, &found)
+    if found && idxs.len > 0:
+        if foundOut != nil:
+            *foundOut = true
+        return idxs
+    var out: int32[]
+    for i in 0..<nodes.len:
+        let declNode: Node = nodes[i]
+        if declNode == nil || kidCount(declNode) <= 0:
+            continue
+        let declNameNode: Node = kid(declNode, 0)
+        if declNameNode == nil || (declNameNode.kind != nkIdent && declNameNode.kind != nkSymbol):
+            continue
+        let declName: str = backendStripSpaces(plainName(declNameNode))
+        if declName == name:
+            add(out, i)
+    if foundOut != nil:
+        *foundOut = out.len > 0
+    return out
+
 fn mirComputeReachableFns(module: MirModule, root: Node): hashsets.HashSetStr =
     let rootKids0: int32 = kidCount(root)
     let rootKids: int32 = (rootKids0 > 0) ? rootKids0 : 1
@@ -1518,7 +1680,7 @@ fn mirComputeReachableFns(module: MirModule, root: Node): hashsets.HashSetStr =
             for ci in 0..<callees.len:
                 let nm: str = callees[ci]
                 var inProgram: bool = false
-                let calleeIdxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, nm, &inProgram)
+                let calleeIdxs: int32[] = mirReachDeclIdxs(index, nodes, nm, &inProgram)
                 if inProgram && calleeIdxs.len > 0:
                     for ki in 0..<calleeIdxs.len:
                         let k: int32 = calleeIdxs[ki]
@@ -1549,7 +1711,7 @@ fn mirComputeReachableFns(module: MirModule, root: Node): hashsets.HashSetStr =
             for ci in 0..<callees.len:
                 let nm: str = callees[ci]
                 var inProgram: bool = false
-                let calleeIdxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, nm, &inProgram)
+                let calleeIdxs: int32[] = mirReachDeclIdxs(index, nodes, nm, &inProgram)
                 if inProgram && calleeIdxs.len > 0:
                     for ki in 0..<calleeIdxs.len:
                         let k: int32 = calleeIdxs[ki]
@@ -1633,7 +1795,7 @@ fn mirComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
         if !found:
             let idx: int32 = sigs.len
             add(sigs, sigId)
-            hashmaps.hashMapStrIntPut(&firstSigIdx, baseId, idx)
+            hashmaps.hashMapStrIntPut(firstSigIdx, baseId, idx)
             continue
         if prevIdx >= 0 && prevIdx < sigs.len:
             let prevSig: str = sigs[prevIdx]
@@ -1835,6 +1997,10 @@ fn nodeIsTypeArgInCall(b: BlockBuilder, n: Node): bool =
 fn mirTypeKindName(t: MirType): str =
     if t.kind == mtVoid:
         return "void"
+    if t.kind == mtF64:
+        return "f64"
+    if t.kind == mtF32:
+        return "f32"
     if t.kind == mtI64:
         return t.isUnsigned ? "u64" : "i64"
     if t.kind == mtI32:
@@ -2073,9 +2239,9 @@ fn mirTypeFromNode(n: Node): MirType =
     if name == "tuple" || mirStrStartsWith(name, "tuple_"):
         return mirTypeI64()
     if name == "float64" || name == "float":
-        return mirTypeI64()
+        return mirTypeF64()
     if name == "float32":
-        return mirTypeI32()
+        return mirTypeF32()
     if name == "bool":
         return mirTypeU8()
     if name == "char":
@@ -2121,9 +2287,9 @@ fn mirTypeFromTypeKeyName(key0: str): MirType =
     if key == "void":
         return mirTypeVoid()
     if key == "float64" || key == "float":
-        return mirTypeI64()
+        return mirTypeF64()
     if key == "float32":
-        return mirTypeI32()
+        return mirTypeF32()
     if key == "bool" || key == "char":
         return mirTypeU8()
     if key == "int8" || key == "i8":
@@ -2196,6 +2362,10 @@ fn mirSizeOfTypeNode(module: MirModule, typeNode: Node): Result[int32] =
             return Ok[int32](0)
         if module != nil:
             let aliasTy: MirType = mirTryGetTypeAlias(module, nm)
+            if aliasTy.kind == mtF64:
+                return Ok[int32](8)
+            if aliasTy.kind == mtF32:
+                return Ok[int32](4)
             if aliasTy.kind == mtI64:
                 return Ok[int32](8)
             if aliasTy.kind == mtI32:
@@ -2257,7 +2427,7 @@ fn inferExprType(env: LocalEnv, n: Node, fallback: MirType): MirType =
     if node.kind == nkStrLit:
         return mirTypeI64()
     if node.kind == nkFloatLit:
-        return mirTypeI64()
+        return mirTypeF64()
     if node.kind == nkCharLit:
         return mirTypeU8()
     if node.kind == nkBoolLit:
@@ -2290,6 +2460,10 @@ fn inferExprType(env: LocalEnv, n: Node, fallback: MirType): MirType =
         let rt: MirType = inferExprType(env, kid(node, 2), fallback)
         if op == "<<" || op == ">>":
             return lt
+        if lt.kind == mtF64 || rt.kind == mtF64:
+            return mirTypeF64()
+        if lt.kind == mtF32 || rt.kind == mtF32:
+            return mirTypeF32()
         if lt.kind == mtI64 || rt.kind == mtI64:
             var out: MirType = mirTypeI64()
             out.isUnsigned = (lt.kind == mtI64 && lt.isUnsigned) || (rt.kind == mtI64 && rt.isUnsigned)
@@ -2310,7 +2484,7 @@ fn mir_buildGlobalIndexCache(module: MirModule) =
     for i in 0..<module.globals.len:
         let g: MirGlobal = module.globals[i]
         if g.name != nil && len(g.name) > 0:
-            hashmaps.hashMapStrIntPut(&mir_globalIndex_cache, g.name, i)
+            hashmaps.hashMapStrIntPut(mir_globalIndex_cache, g.name, i)
     mir_globalIndex_cache_len = module.globals.len
     mir_globalIndex_cache_ready = true
 
@@ -2332,7 +2506,7 @@ fn mir_ensureGlobalIndexCache(module: MirModule) =
         for i in mir_globalIndex_cache_len..<module.globals.len:
             let g: MirGlobal = module.globals[i]
             if g.name != nil && len(g.name) > 0:
-                hashmaps.hashMapStrIntPut(&mir_globalIndex_cache, g.name, i)
+                hashmaps.hashMapStrIntPut(mir_globalIndex_cache, g.name, i)
         mir_globalIndex_cache_len = module.globals.len
 
 fn moduleGlobalIndex(module: MirModule, name: str): int32 =
@@ -2372,6 +2546,8 @@ fn inferExprTypeWithGlobals(env: LocalEnv, module: MirModule, func: MirFunc, n: 
         return fallback
     if node.kind == nkStrLit:
         return mirTypeI64()
+    if node.kind == nkFloatLit:
+        return mirTypeF64()
     if node.kind == nkCall:
         let name: str = mirCallNameForReachability(module, node)
         if name != nil && len(name) > 0 && module != nil:
@@ -4099,6 +4275,15 @@ fn isFloat64Key(key0: str): bool =
     let key: str = backendStripSpaces(key0)
     return (key == "float64") || (key == "float")
 
+fn isFloat32Key(key0: str): bool =
+    if key0 == nil:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return key == "float32"
+
+fn isIntegralMirType(ty: MirType): bool =
+    return ty.kind == mtI8 || ty.kind == mtI16 || ty.kind == mtI32 || ty.kind == mtI64
+
 fn isStringKey(key0: str): bool =
     if key0 == nil:
         return false
@@ -4283,7 +4468,10 @@ fn lowerToF64Bits(b: BlockBuilder, n0: Node): Result[MirExpr] =
         if len(key) == 0:
             key = exprTypeKeyShallow(b, kid(n, 2))
     if isFloat64Key(key):
-        return lowerExprValue(b, n, mirTypeI64())
+        let valRes2: Result[MirExpr] = lowerExprValue(b, n, mirTypeF64())
+        if ! IsOk[MirExpr](valRes2):
+            return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](valRes2))
+        return Ok[MirExpr](mirCast(mirTypeI64(), Value[MirExpr](valRes2)))
     if n.kind == nkPrefix && kidCount(n) > 1:
         let opNode: Node = kid(n, 0)
         let op: str = backendOpName(opNode)
@@ -4295,7 +4483,10 @@ fn lowerToF64Bits(b: BlockBuilder, n0: Node): Result[MirExpr] =
                 if len(rhsKey) == 0:
                     rhsKey = exprTypeKeyShallow(b, kid(rhs, 2))
             if isFloat64Key(rhsKey):
-                return lowerExprValue(b, n, mirTypeI64())
+                let valRes3: Result[MirExpr] = lowerExprValue(b, n, mirTypeF64())
+                if ! IsOk[MirExpr](valRes3):
+                    return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](valRes3))
+                return Ok[MirExpr](mirCast(mirTypeI64(), Value[MirExpr](valRes3)))
     if n.kind == nkIntLit:
         return Ok[MirExpr](mirConstI64(cheng_i64_to_f64_bits(n.intVal)))
     let valRes: Result[MirExpr] = lowerExprValue(b, n, mirTypeI64())
@@ -4303,11 +4494,91 @@ fn lowerToF64Bits(b: BlockBuilder, n0: Node): Result[MirExpr] =
         return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](valRes))
     var val: MirExpr = Value[MirExpr](valRes)
     let vty: MirType = inferExprTypeWithGlobals(b.env, b.module, b.func, n, mirTypeI32())
-    if vty.kind == mtI32:
+    if vty.kind == mtI32 || vty.kind == mtF32:
         val = mirCast(mirTypeI64(), val)
     var args: MirExpr[]
     add(args, val)
     return Ok[MirExpr](mirCall("cheng_i64_to_f64_bits", args))
+
+fn lowerToF32Bits(b: BlockBuilder, n0: Node): Result[MirExpr] =
+    if b == nil:
+        return Err[MirExpr]("mir_builder: float32 op missing builder")
+    var n: Node = n0
+    while n != nil && n.kind == nkPar && kidCount(n) > 0:
+        n = kid(n, 0)
+    if n == nil:
+        return Err[MirExpr]("mir_builder: float32 op expects operand")
+    if n.kind == nkFloatLit:
+        var bits64: int64 = 0
+        if n.strVal != nil && len(n.strVal) > 0:
+            bits64 = cheng_parse_f64_bits(n.strVal)
+        var argsLit: MirExpr[]
+        add(argsLit, mirConstI64(bits64))
+        return Ok[MirExpr](mirCall("cheng_f64_bits_to_f32_bits", argsLit))
+    if n.kind == nkCall && kidCount(n) > 0:
+        let calleeNode: Node = kid(n, 0)
+        let calleeName: str = backendStripSpaces(plainName(calleeNode))
+        if calleeName == "float32":
+            let vRes0: Result[MirExpr] = lowerExprValue(b, n, mirTypeF32())
+            if !IsOk[MirExpr](vRes0):
+                return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](vRes0))
+            return Ok[MirExpr](mirCast(mirTypeI32(), Value[MirExpr](vRes0)))
+        if calleeName == "float64" || calleeName == "float":
+            let bits64ResCall: Result[MirExpr] = lowerToF64Bits(b, n)
+            if !IsOk[MirExpr](bits64ResCall):
+                return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](bits64ResCall))
+            var argsCall: MirExpr[]
+            add(argsCall, Value[MirExpr](bits64ResCall))
+            return Ok[MirExpr](mirCall("cheng_f64_bits_to_f32_bits", argsCall))
+
+    var key: str = exprTypeKeyShallow(b, n)
+    if len(key) == 0 && n.kind == nkInfix && kidCount(n) >= 3:
+        key = exprTypeKeyShallow(b, kid(n, 1))
+        if len(key) == 0:
+            key = exprTypeKeyShallow(b, kid(n, 2))
+    if isFloat32Key(key):
+        let vRes: Result[MirExpr] = lowerExprValue(b, n, mirTypeF32())
+        if !IsOk[MirExpr](vRes):
+            return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](vRes))
+        return Ok[MirExpr](mirCast(mirTypeI32(), Value[MirExpr](vRes)))
+    if isFloat64Key(key):
+        let bits64Res0: Result[MirExpr] = lowerToF64Bits(b, n)
+        if !IsOk[MirExpr](bits64Res0):
+            return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](bits64Res0))
+        var args64_0: MirExpr[]
+        add(args64_0, Value[MirExpr](bits64Res0))
+        return Ok[MirExpr](mirCall("cheng_f64_bits_to_f32_bits", args64_0))
+    if n.kind == nkIntLit:
+        var argsInt: MirExpr[]
+        add(argsInt, mirConstI64(cheng_i64_to_f64_bits(n.intVal)))
+        return Ok[MirExpr](mirCall("cheng_f64_bits_to_f32_bits", argsInt))
+
+    let vty: MirType = inferExprTypeWithGlobals(b.env, b.module, b.func, n, mirTypeI32())
+    if vty.kind == mtF32:
+        let vRes2: Result[MirExpr] = lowerExprValue(b, n, mirTypeF32())
+        if !IsOk[MirExpr](vRes2):
+            return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](vRes2))
+        return Ok[MirExpr](mirCast(mirTypeI32(), Value[MirExpr](vRes2)))
+    if vty.kind == mtF64:
+        let bits64Res1: Result[MirExpr] = lowerToF64Bits(b, n)
+        if !IsOk[MirExpr](bits64Res1):
+            return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](bits64Res1))
+        var args64_1: MirExpr[]
+        add(args64_1, Value[MirExpr](bits64Res1))
+        return Ok[MirExpr](mirCall("cheng_f64_bits_to_f32_bits", args64_1))
+
+    let valRes: Result[MirExpr] = lowerExprValue(b, n, mirTypeI64())
+    if !IsOk[MirExpr](valRes):
+        return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](valRes))
+    var val: MirExpr = Value[MirExpr](valRes)
+    if vty.kind == mtI32:
+        val = mirCast(mirTypeI64(), val)
+    let intToF64Helper: str = vty.isUnsigned ? "cheng_u64_to_f64_bits" : "cheng_i64_to_f64_bits"
+    var upArgs: MirExpr[]
+    add(upArgs, val)
+    var downArgs: MirExpr[]
+    add(downArgs, mirCall(intToF64Helper, upArgs))
+    return Ok[MirExpr](mirCall("cheng_f64_bits_to_f32_bits", downArgs))
 
 fn lowerObjConstructorCall(b: BlockBuilder, callNode: Node, objTypeName: str): Result[MirExpr] =
     if b == nil || b.module == nil || b.func == nil:
@@ -4565,7 +4836,7 @@ fn lowerExprPtrValue(b: BlockBuilder, n: Node): Result[MirExpr] =
     if node == nil:
         return Err[MirExpr]("mir_builder: nil ptr expr")
     if node.kind == nkIdent || node.kind == nkSymbol:
-        let nm: str = plainName(node)
+        let nm: str = backendStripSpaces(plainName(node))
         let idx: int32 = localIndex(b.env, nm)
         if idx >= 0:
             let key0: str = localTypeKey(b.env, idx)
@@ -4580,6 +4851,31 @@ fn lowerExprPtrValue(b: BlockBuilder, n: Node): Result[MirExpr] =
                         return Ok[MirExpr](mirLoad(mirLocal(idx), mirTypeI64()))
                     return Ok[MirExpr](mirLocal(idx))
     return lowerExprValue(b, node, mirTypeI64())
+
+fn lowerSpawnEntryArg(b: BlockBuilder, argNode0: Node): Result[MirExpr] =
+    if b == nil:
+        return Err[MirExpr]("mir_builder: spawn entry missing builder")
+    var argNode: Node = argNode0
+    while argNode != nil && argNode.kind == nkPar && kidCount(argNode) > 0:
+        argNode = kid(argNode, 0)
+    if argNode == nil || argNode.kind == nkNilLit:
+        return Ok[MirExpr](mirConstI64(0))
+    let baseRes: Result[MirExpr] = lowerExprValue(b, argNode, mirTypeI64())
+    if IsOk[MirExpr](baseRes):
+        return baseRes
+    if argNode.kind == nkIdent || argNode.kind == nkSymbol:
+        let msg: str = Error(baseRes)
+        if msg != nil && mirStrStartsWith(msg, "mir_builder: unknown local/global: "):
+            let nm: str = backendStripSpaces(plainName(argNode))
+            if nm != nil && len(nm) > 0:
+                var sym: str = nm
+                if mirDupFnBasesHas(nm) && b.func != nil:
+                    let f0: MirFunc = b.func
+                    let m0: str = mirMaybeMangleDupFnBase(nm, f0.originFile)
+                    if m0 != nil && len(m0) > 0:
+                        sym = m0
+                return Ok[MirExpr](mirGlobalAddr(sym))
+    return baseRes
 
 fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] =
     if n == nil:
@@ -4630,9 +4926,9 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
         return Ok[MirExpr](mirGlobalAddr(label))
     if node.kind == nkFloatLit:
         if node.strVal != nil && len(node.strVal) > 0:
-            return Ok[MirExpr](mirConstI64(cheng_parse_f64_bits(node.strVal)))
+            return Ok[MirExpr](mirCast(mirTypeF64(), mirConstI64(cheng_parse_f64_bits(node.strVal))))
         # Some stages may synthesize float literals without a raw string; default to 0.0 bits.
-        return Ok[MirExpr](mirConstI64(0))
+        return Ok[MirExpr](mirCast(mirTypeF64(), mirConstI64(0)))
     if node.kind == nkDotExpr:
         # Dot-call sugar (no-paren) for a zero-arg receiver method.
         # Example: `seq.reset` is lowered as `freeSeq[T](seq)` (where T is inferred from `seq[T]`).
@@ -5417,6 +5713,13 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
             let f0: MirFunc = b.func
             fnName = f0.name
             fp = f0.originFile
+        if (getEnv "CHENG_BACKEND_DEBUG_UNKNOWN_NAME" == "1"):
+            var wantNm: str = mirTypeKindName(wantType)
+            var tcKey: str = ""
+            if node.typeCacheValid && node.typeCache != nil:
+                tcKey = typeKey(node.typeCache)
+            echo("[backend] debugUnknownName: ident='" + nm + "' want=" + wantNm +
+                 " typeCacheKey='" + tcKey + "' fn=" + fnName)
         let line: str = intToStr(node.pos.line)
         let col: str = intToStr(node.pos.col)
         let msg: str = "mir_builder: unknown local/global: " + nm +
@@ -6003,10 +6306,85 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                     castArg = kid(argNode0, 1)
                 elif kidCount(argNode0) > 0:
                     castArg = kid(argNode0, 0)
+            let castType: MirType = mirTypeFromNodeWithModule(b.module, calleeNode)
+            let srcTy: MirType = inferExprTypeWithGlobals(b.env, b.module, b.func, castArg, mirTypeI32())
+            let srcKey: str = exprTypeKeyShallow(b, castArg)
+            var srcIsF64: bool = srcTy.kind == mtF64 || isFloat64Key(srcKey)
+            var srcIsF32: bool = srcTy.kind == mtF32 || isFloat32Key(srcKey)
+            if (!srcIsF64 && !srcIsF32) && castArg != nil && castArg.kind == nkCall && kidCount(castArg) > 0:
+                let srcCallee: Node = kid(castArg, 0)
+                let srcCalleeName: str = backendStripSpaces(plainName(srcCallee))
+                if srcCalleeName == "float64" || srcCalleeName == "float":
+                    srcIsF64 = true
+                elif srcCalleeName == "float32":
+                    srcIsF32 = true
+            let srcIsIntegral: bool = isIntegralMirType(srcTy)
+            let dstIsIntegral: bool = isIntegralMirType(castType)
+
+            if dstIsIntegral && (srcIsF64 || srcIsF32):
+                let srcWantTy: MirType = srcIsF64 ? mirTypeF64() : mirTypeF32()
+                let srcRes0: Result[MirExpr] = lowerExprValue(b, castArg, srcWantTy)
+                if !IsOk[MirExpr](srcRes0):
+                    return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](srcRes0))
+                let srcExpr0: MirExpr = Value[MirExpr](srcRes0)
+                let bitsExpr: MirExpr = srcIsF64 ? mirCast(mirTypeI64(), srcExpr0) : mirCast(mirTypeI32(), srcExpr0)
+                var helper0: str = ""
+                if srcIsF64:
+                    helper0 = castType.isUnsigned ? "cheng_f64_bits_to_u64" : "cheng_f64_bits_to_i64"
+                else:
+                    helper0 = castType.isUnsigned ? "cheng_f32_bits_to_u64" : "cheng_f32_bits_to_i64"
+                var args0: MirExpr[]
+                add(args0, bitsExpr)
+                let wideInt: MirExpr = mirCall(helper0, args0)
+                return Ok[MirExpr](mirCast(castType, wideInt))
+
+            if castType.kind == mtF64 && (srcIsIntegral || srcIsF32):
+                if srcIsIntegral:
+                    let srcWantTy: MirType = (srcTy.kind == mtI64) ? mirTypeI64() : mirTypeI32()
+                    let srcRes1: Result[MirExpr] = lowerExprValue(b, castArg, srcWantTy)
+                    if !IsOk[MirExpr](srcRes1):
+                        return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](srcRes1))
+                    var srcWide: MirExpr = Value[MirExpr](srcRes1)
+                    if srcTy.kind != mtI64:
+                        srcWide = mirCast(mirTypeI64(), srcWide)
+                    let helper1: str = srcTy.isUnsigned ? "cheng_u64_to_f64_bits" : "cheng_i64_to_f64_bits"
+                    var args1: MirExpr[]
+                    add(args1, srcWide)
+                    return Ok[MirExpr](mirCast(mirTypeF64(), mirCall(helper1, args1)))
+                let srcRes2: Result[MirExpr] = lowerExprValue(b, castArg, mirTypeF32())
+                if !IsOk[MirExpr](srcRes2):
+                    return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](srcRes2))
+                let srcBits32: MirExpr = mirCast(mirTypeI32(), Value[MirExpr](srcRes2))
+                var args2: MirExpr[]
+                add(args2, srcBits32)
+                return Ok[MirExpr](mirCast(mirTypeF64(), mirCall("cheng_f32_bits_to_f64_bits", args2)))
+
+            if castType.kind == mtF32 && (srcIsIntegral || srcIsF64):
+                var f64BitsExpr: MirExpr
+                if srcIsIntegral:
+                    let srcWantTy: MirType = (srcTy.kind == mtI64) ? mirTypeI64() : mirTypeI32()
+                    let srcRes3: Result[MirExpr] = lowerExprValue(b, castArg, srcWantTy)
+                    if !IsOk[MirExpr](srcRes3):
+                        return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](srcRes3))
+                    var srcWide2: MirExpr = Value[MirExpr](srcRes3)
+                    if srcTy.kind != mtI64:
+                        srcWide2 = mirCast(mirTypeI64(), srcWide2)
+                    let helper2: str = srcTy.isUnsigned ? "cheng_u64_to_f64_bits" : "cheng_i64_to_f64_bits"
+                    var args3: MirExpr[]
+                    add(args3, srcWide2)
+                    f64BitsExpr = mirCall(helper2, args3)
+                else:
+                    let srcRes4: Result[MirExpr] = lowerExprValue(b, castArg, mirTypeF64())
+                    if !IsOk[MirExpr](srcRes4):
+                        return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](srcRes4))
+                    f64BitsExpr = mirCast(mirTypeI64(), Value[MirExpr](srcRes4))
+                var args4: MirExpr[]
+                add(args4, f64BitsExpr)
+                return Ok[MirExpr](mirCast(mirTypeF32(), mirCall("cheng_f64_bits_to_f32_bits", args4)))
+
             let castRes: Result[MirExpr] = lowerExprValue(b, castArg, wantType)
             if ! IsOk[MirExpr](castRes):
                 return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](castRes))
-            let castType: MirType = mirTypeFromNodeWithModule(b.module, calleeNode)
             return Ok[MirExpr](mirCast(castType, Value[MirExpr](castRes)))
         var callName0: str = name
         if typeArgs.len > 0:
@@ -6536,6 +6914,12 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
         var args: MirExpr[]
         for ai2 in 0..<argNodes.len:
             let argNode: Node = argNodes[ai2]
+            let dbgSpawn: bool = (getEnv "CHENG_BACKEND_DEBUG_SPAWN" == "1")
+            if dbgSpawn && name == "spawn":
+                var kindStr: str = "nil"
+                if argNode != nil:
+                    kindStr = intToStr(int32(argNode.kind))
+                echo("[backend] debugSpawn: arg#" + intToStr(ai2 + 1) + " kind=nk#" + kindStr)
             var wantVarAddr: bool = false
             var pi2: int32 = ai2
             if calleeFunc != nil && calleeFunc.params.len > 0:
@@ -6564,6 +6948,11 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                 if !IsOk[MirExpr](addrRes):
                     return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](addrRes))
                 add(args, Value[MirExpr](addrRes))
+            elif (ai2 == 0) && (name == "spawn"):
+                let fnRes: Result[MirExpr] = lowerSpawnEntryArg(b, argNode)
+                if !IsOk[MirExpr](fnRes):
+                    return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](fnRes))
+                add(args, Value[MirExpr](fnRes))
             else:
                 # Call argument lowering should not depend on the call's return type.
                 let argRes: Result[MirExpr] = lowerExprValue(b, argNode, mirTypeI64())
@@ -6606,7 +6995,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                     return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](rhsBitsRes))
                 var args: MirExpr[]
                 add(args, Value[MirExpr](rhsBitsRes))
-                return Ok[MirExpr](mirCall("cheng_f64_neg_bits", args))
+                return Ok[MirExpr](mirCast(mirTypeF64(), mirCall("cheng_f64_neg_bits", args)))
             let rhsRes: Result[MirExpr] = lowerExprValue(b, rhs, wantType)
             if ! IsOk[MirExpr](rhsRes):
                 return rhsRes
@@ -6676,7 +7065,61 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
             kInfix = exprTypeKeyShallow(b, lhsNode)
         if len(kInfix) == 0:
             kInfix = exprTypeKeyShallow(b, rhsNode)
-        if isFloat64Key(kInfix):
+        let lhsInferTy: MirType = inferExprTypeWithGlobals(b.env, b.module, b.func, lhsNode, mirTypeI32())
+        let rhsInferTy: MirType = inferExprTypeWithGlobals(b.env, b.module, b.func, rhsNode, mirTypeI32())
+        let inferF64: bool = lhsInferTy.kind == mtF64 || rhsInferTy.kind == mtF64
+        let inferF32: bool = lhsInferTy.kind == mtF32 || rhsInferTy.kind == mtF32
+        if (isFloat32Key(kInfix) || (inferF32 && !inferF64)):
+            let lhsBits32Res: Result[MirExpr] = lowerToF32Bits(b, lhsNode)
+            if !IsOk[MirExpr](lhsBits32Res):
+                return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](lhsBits32Res))
+            let rhsBits32Res: Result[MirExpr] = lowerToF32Bits(b, rhsNode)
+            if !IsOk[MirExpr](rhsBits32Res):
+                return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](rhsBits32Res))
+            let lhsBits32: MirExpr = Value[MirExpr](lhsBits32Res)
+            let rhsBits32: MirExpr = Value[MirExpr](rhsBits32Res)
+            if op == "==":
+                return Ok[MirExpr](mirCmp(mcEq, lhsBits32, rhsBits32))
+            if op == "!=":
+                return Ok[MirExpr](mirCmp(mcNe, lhsBits32, rhsBits32))
+
+            var lhsUpArgs: MirExpr[]
+            add(lhsUpArgs, lhsBits32)
+            let lhsBits64: MirExpr = mirCall("cheng_f32_bits_to_f64_bits", lhsUpArgs)
+            var rhsUpArgs: MirExpr[]
+            add(rhsUpArgs, rhsBits32)
+            let rhsBits64: MirExpr = mirCall("cheng_f32_bits_to_f64_bits", rhsUpArgs)
+            var args32: MirExpr[]
+            add(args32, lhsBits64)
+            add(args32, rhsBits64)
+            if op == "+":
+                var downArgs0: MirExpr[]
+                add(downArgs0, mirCall("cheng_f64_add_bits", args32))
+                return Ok[MirExpr](mirCast(mirTypeF32(), mirCall("cheng_f64_bits_to_f32_bits", downArgs0)))
+            if op == "-":
+                var downArgs1: MirExpr[]
+                add(downArgs1, mirCall("cheng_f64_sub_bits", args32))
+                return Ok[MirExpr](mirCast(mirTypeF32(), mirCall("cheng_f64_bits_to_f32_bits", downArgs1)))
+            if op == "*":
+                var downArgs2: MirExpr[]
+                add(downArgs2, mirCall("cheng_f64_mul_bits", args32))
+                return Ok[MirExpr](mirCast(mirTypeF32(), mirCall("cheng_f64_bits_to_f32_bits", downArgs2)))
+            if op == "/":
+                var downArgs3: MirExpr[]
+                add(downArgs3, mirCall("cheng_f64_div_bits", args32))
+                return Ok[MirExpr](mirCast(mirTypeF32(), mirCall("cheng_f64_bits_to_f32_bits", downArgs3)))
+            if op == "<":
+                return Ok[MirExpr](mirCall("cheng_f64_lt_bits", args32))
+            if op == "<=":
+                return Ok[MirExpr](mirCall("cheng_f64_le_bits", args32))
+            if op == ">":
+                return Ok[MirExpr](mirCall("cheng_f64_gt_bits", args32))
+            if op == ">=":
+                return Ok[MirExpr](mirCall("cheng_f64_ge_bits", args32))
+            let lineF32: str = intToStr(node.pos.line)
+            let colF32: str = intToStr(node.pos.col)
+            return Err[MirExpr]("mir_builder: unsupported float32 infix op '" + op + "' @" + lineF32 + ":" + colF32)
+        if isFloat64Key(kInfix) || inferF64:
             let lhsBitsRes: Result[MirExpr] = lowerToF64Bits(b, lhsNode)
             if ! IsOk[MirExpr](lhsBitsRes):
                 return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](lhsBitsRes))
@@ -6693,13 +7136,13 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
             add(args2, lhsBits)
             add(args2, rhsBits)
             if op == "+":
-                return Ok[MirExpr](mirCall("cheng_f64_add_bits", args2))
+                return Ok[MirExpr](mirCast(mirTypeF64(), mirCall("cheng_f64_add_bits", args2)))
             if op == "-":
-                return Ok[MirExpr](mirCall("cheng_f64_sub_bits", args2))
+                return Ok[MirExpr](mirCast(mirTypeF64(), mirCall("cheng_f64_sub_bits", args2)))
             if op == "*":
-                return Ok[MirExpr](mirCall("cheng_f64_mul_bits", args2))
+                return Ok[MirExpr](mirCast(mirTypeF64(), mirCall("cheng_f64_mul_bits", args2)))
             if op == "/":
-                return Ok[MirExpr](mirCall("cheng_f64_div_bits", args2))
+                return Ok[MirExpr](mirCast(mirTypeF64(), mirCall("cheng_f64_div_bits", args2)))
             if op == "<":
                 return Ok[MirExpr](mirCall("cheng_f64_lt_bits", args2))
             if op == "<=":
@@ -11010,7 +11453,7 @@ fn mir_buildFuncIndexCache(mod: MirModule) =
     for i in 0..<mod.funcs.len:
         let f: MirFunc = mod.funcs[i]
         if f != nil && f.name != nil && len(f.name) > 0:
-            hashmaps.hashMapStrIntPut(&mir_funcIndex_cache, f.name, i)
+            hashmaps.hashMapStrIntPut(mir_funcIndex_cache, f.name, i)
     mir_funcIndex_cache_len = mod.funcs.len
     mir_funcIndex_cache_ready = true
 
@@ -11032,7 +11475,7 @@ fn mir_ensureFuncIndexCache(mod: MirModule) =
         for i in mir_funcIndex_cache_len..<mod.funcs.len:
             let f: MirFunc = mod.funcs[i]
             if f != nil && f.name != nil && len(f.name) > 0:
-                hashmaps.hashMapStrIntPut(&mir_funcIndex_cache, f.name, i)
+                hashmaps.hashMapStrIntPut(mir_funcIndex_cache, f.name, i)
         mir_funcIndex_cache_len = mod.funcs.len
 
 fn moduleFuncIndex(mod: MirModule, name: str): int32 =
@@ -11083,7 +11526,8 @@ fn moduleHasFuncByBase(mod: MirModule, base0: str): bool =
     let instPrefix: str = baseSym + "_"
     for i in 0..<mod.funcs.len:
         let f: MirFunc = mod.funcs[i]
-        if f != nil && (mirStrStartsWith(f.name, prefix) ||
+        if f != nil && ((f.name == base0) ||
+                        mirStrStartsWith(f.name, prefix) ||
                         mirStrStartsWith(f.name, dupPrefix) ||
                         mirStrStartsWith(f.name, instPrefix)):
             return true
@@ -11135,7 +11579,8 @@ fn moduleFindFuncByBaseUnique(mod: MirModule, base0: str): MirFunc =
     var found: MirFunc = nil
     for i in 0..<mod.funcs.len:
         let f: MirFunc = mod.funcs[i]
-        if f != nil && (mirStrStartsWith(f.name, prefix) ||
+        if f != nil && ((f.name == base0) ||
+                        mirStrStartsWith(f.name, prefix) ||
                         mirStrStartsWith(f.name, dupPrefix) ||
                         mirStrStartsWith(f.name, instPrefix)):
             if found != nil:
@@ -11380,6 +11825,10 @@ fn mirInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
             return t.isUnsigned ? "uint64" : "int64"
         if t.kind == mtI32:
             return t.isUnsigned ? "uint32" : "int32"
+        if t.kind == mtF64:
+            return "float64"
+        if t.kind == mtF32:
+            return "float32"
     return ""
 
 fn mirInferCallRetKeyHint(callNode: Node): str =
@@ -12537,7 +12986,7 @@ fn mirBuildModuleFromFile(path: str): Result[MirModule] =
         if seen:
             continue
         add(files, filePath)
-        hashmaps.hashMapStrIntPut(&fileIndex, filePath, files.len - 1)
+        hashmaps.hashMapStrIntPut(fileIndex, filePath, files.len - 1)
         if ! frontend_lib.stage1_fileExists(filePath):
             return Err[MirModule]("mir_builder: import file not found")
         let content: str = frontend_lib.stage1_readFile(filePath)
@@ -12840,6 +13289,10 @@ fn mirConsumeTopLevelFromRoot(mod: MirModule, ctx: MirBuildCtx, root: Node, file
                     keyOut = declType.isUnsigned ? "uint64" : "int64"
                 elif declType.kind == mtI32:
                     keyOut = declType.isUnsigned ? "uint32" : "int32"
+                elif declType.kind == mtF64:
+                    keyOut = "float64"
+                elif declType.kind == mtF32:
+                    keyOut = "float32"
                 elif declType.kind == mtI16:
                     keyOut = declType.isUnsigned ? "uint16" : "int16"
                 elif declType.kind == mtI8:
@@ -13366,6 +13819,21 @@ fn mirBuildModuleFromFileStage1(inPath: str): Result[MirModule] =
         profLoad = cheng_monotime_ns() - profMark
         profMark = cheng_monotime_ns()
 
+    if mirStage1StdNoPointerPrecheck(root0, inPath, diags):
+        if hasError diags:
+            printDiagnostics diags
+        else:
+            echo "std policy: pointer types are forbidden in standard library"
+        return Err[MirModule]("mir_builder: stage1 errors")
+    if mirStage1NoPointerNonCAbiPrecheck(root0, inPath, diags):
+        if hasError diags:
+            printDiagnostics diags
+        else:
+            echo "no-pointer policy: pointer types are forbidden outside C ABI modules"
+        return Err[MirModule]("mir_builder: stage1 errors")
+    if mirFileLikelyUsesRawSpawn(inPath):
+        echo "spawn raw function pointer is forbidden in default API; use std/async_rt_legacy.spawn"
+        return Err[MirModule]("mir_builder: stage1 errors")
     type_syntax_lowering.lowerTypeSyntax(root0, &diags, inPath)
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: type_syntax_done")
@@ -13391,7 +13859,7 @@ fn mirBuildModuleFromFileStage1(inPath: str): Result[MirModule] =
         if dbgPipe:
             os.writeLine(dbgFile, "[backend] stage1: semantics_precheck")
             os.c_fflush dbgFile
-        checkSemantics(root0, &diags, ownDiags, mmIsOrc && strictOn0)
+        checkSemantics(root0, diags, ownDiags, mmIsOrc && strictOn0)
         if profOn:
             profSem = cheng_monotime_ns() - profMark
             profMark = cheng_monotime_ns()

@@ -108,18 +108,24 @@ fn iselCondFromCmp(op: MirCmpOp, isUnsigned: bool): LirCond =
     of mcGe: return isUnsigned ? lcHs : lcGe
     return lcEq
 
+fn iselTypeIs64(ty: MirType): bool =
+    return ty.kind == mtI64 || ty.kind == mtF64
+
+fn iselTypeIs32(ty: MirType): bool =
+    return ty.kind == mtI32 || ty.kind == mtF32
+
 fn iselReg0(ty: MirType): LirReg =
-    if ty.kind == mtI64:
+    if iselTypeIs64(ty):
         return lrRax
     return lrEax
 
 fn iselReg1(ty: MirType): LirReg =
-    if ty.kind == mtI64:
+    if iselTypeIs64(ty):
         return lrRcx
     return lrEcx
 
 fn iselReg2(ty: MirType): LirReg =
-    if ty.kind == mtI64:
+    if iselTypeIs64(ty):
         return lrRdx
     return lrEdx
 
@@ -127,7 +133,7 @@ fn iselRetReg(retType: MirType): LirReg =
     return iselReg0(retType)
 
 fn iselArgReg(retType: MirType, index: int32): Result[LirReg] =
-    if retType.kind == mtI64:
+    if iselTypeIs64(retType):
         case index
         of 0: return Ok[LirReg](lrRdi)
         of 1: return Ok[LirReg](lrRsi)
@@ -160,7 +166,7 @@ fn iselAlignUp(v: int64, align: int64): int64 =
     return v + (align - m)
 
 fn iselRegWithType(reg: LirReg, ty: MirType): LirReg =
-    if ty.kind == mtI64:
+    if iselTypeIs64(ty):
         case reg
         of lrEax, lrRax: return lrRax
         of lrEcx, lrRcx: return lrRcx
@@ -232,6 +238,10 @@ fn iselLocalType(mirFunc: MirFunc, index: int32, fallback: MirType): MirType =
     return fallback
 
 fn iselMaxType(a: MirType, b: MirType): MirType =
+    if a.kind == mtF64 || b.kind == mtF64:
+        return mirTypeF64()
+    if a.kind == mtF32 || b.kind == mtF32:
+        return mirTypeF32()
     if a.kind == mtI64 || b.kind == mtI64:
         var out: MirType = mirTypeI64()
         if a.kind == mtI64:
@@ -282,8 +292,12 @@ fn iselSlotOffset(slot: int32): int64 =
     return (int64(0) - int64(slot) - 1) * 8
 
 fn iselTypeSize(ty: MirType): int32 =
+    if ty.kind == mtF64:
+        return 8
     if ty.kind == mtI64:
         return 8
+    if ty.kind == mtF32:
+        return 4
     if ty.kind == mtI32:
         return 4
     if ty.kind == mtI16:
@@ -293,8 +307,12 @@ fn iselTypeSize(ty: MirType): int32 =
     return 0
 
 fn iselTypeAlignPow2(ty: MirType): int32 =
+    if ty.kind == mtF64:
+        return 3
     if ty.kind == mtI64:
         return 3
+    if ty.kind == mtF32:
+        return 2
     if ty.kind == mtI32:
         return 2
     if ty.kind == mtI16:
@@ -407,7 +425,7 @@ fn iselEmitCallIndirectBuiltin(func: LirFunc, module: MirModule, mirFunc: MirFun
         let argExpr: MirExpr = expr.args[ai + 1]
         var argType: MirType = iselArgType(callee, ai + 1, retType)
         if callee == nil:
-            argType = iselExprType(module, mirFunc, argExpr, retType)
+            argType = iselExprType(module, mirFunc, argExpr, mirTypeI64())
         let argDst: LirReg = iselReg0(argType)
         let argTmp: LirReg = iselReg1(argType)
         let argScratch: LirReg = iselReg2(argType)
@@ -428,7 +446,7 @@ fn iselEmitCallIndirectBuiltin(func: LirFunc, module: MirModule, mirFunc: MirFun
         var argType2: MirType = iselArgType(callee, ri + 1, retType)
         if callee == nil:
             let argExpr2: MirExpr = expr.args[ri + 1]
-            argType2 = iselExprType(module, mirFunc, argExpr2, retType)
+            argType2 = iselExprType(module, mirFunc, argExpr2, mirTypeI64())
         let regRes: Result[LirReg] = iselArgReg(argType2, ri)
         if ! IsOk[LirReg](regRes):
             return ErrInfo[int32](ErrorInfoOf[LirReg](regRes))
@@ -623,7 +641,7 @@ fn iselEmitExpr(func: LirFunc, module: MirModule, mirFunc: MirFunc, expr: MirExp
             if hasVarargs && ai >= fixedCount:
                 argType = varargsElemType
             if callee == nil:
-                argType = iselExprType(module, mirFunc, argExpr, retType)
+                argType = iselExprType(module, mirFunc, argExpr, mirTypeI64())
             let argDst: LirReg = iselReg0(argType)
             let argTmp: LirReg = iselReg1(argType)
             let argScratch: LirReg = iselReg2(argType)
@@ -640,7 +658,7 @@ fn iselEmitExpr(func: LirFunc, module: MirModule, mirFunc: MirFunc, expr: MirExp
                 argType2 = varargsElemType
             if callee == nil:
                 let argExpr2: MirExpr = expr.args[ri]
-                argType2 = iselExprType(module, mirFunc, argExpr2, retType)
+                argType2 = iselExprType(module, mirFunc, argExpr2, mirTypeI64())
             let regRes: Result[LirReg] = iselArgReg(argType2, ri)
             if ! IsOk[LirReg](regRes):
                 return ErrInfo[int32](ErrorInfoOf[LirReg](regRes))
@@ -670,18 +688,31 @@ fn iselEmitExpr(func: LirFunc, module: MirModule, mirFunc: MirFunc, expr: MirExp
             return srcRes
         let castType: MirType = expr.castType
         let outReg: LirReg = iselRegWithType(dst, castType)
+        let castIs64: bool = iselTypeIs64(castType)
+        let srcIs64: bool = iselTypeIs64(srcType)
         if castType.kind == srcType.kind:
             if outReg != srcDst:
                 lirAddInst(func, lirMovReg(outReg, srcDst))
             return Ok[int32](0)
-        if castType.kind != mtI64 && srcType.kind != mtI64:
+        if castIs64 && srcIs64:
             if outReg != srcDst:
                 lirAddInst(func, lirMovReg(outReg, srcDst))
             return Ok[int32](0)
-        if castType.kind == mtI64 && srcType.kind != mtI64:
+        if !castIs64 && !srcIs64:
+            if outReg != srcDst:
+                lirAddInst(func, lirMovReg(outReg, srcDst))
+            return Ok[int32](0)
+        if castType.kind == mtI64 && !srcIs64:
             lirAddInst(func, lirSxtw(outReg, iselRegWithType(srcDst, mirTypeI32())))
             return Ok[int32](0)
-        if castType.kind != mtI64 && srcType.kind == mtI64:
+        if castType.kind == mtF64 && !srcIs64:
+            lirAddInst(func, lirSxtw(outReg, iselRegWithType(srcDst, mirTypeI32())))
+            return Ok[int32](0)
+        if castType.kind != mtI64 && castType.kind != mtF64 && srcType.kind == mtI64:
+            let truncSrc: LirReg = iselRegWithType(srcDst, mirTypeI32())
+            lirAddInst(func, lirMovReg(outReg, truncSrc))
+            return Ok[int32](0)
+        if castType.kind != mtI64 && castType.kind != mtF64 && srcType.kind == mtF64:
             let truncSrc: LirReg = iselRegWithType(srcDst, mirTypeI32())
             lirAddInst(func, lirMovReg(outReg, truncSrc))
             return Ok[int32](0)
