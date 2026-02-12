@@ -5,8 +5,10 @@ usage() {
   cat <<'EOF'
 Usage:
   src/tooling/verify_stage1_fullspec.sh [--file:<path>] [--name:<bin>] [--jobs:<N>]
-                                        [--backend:<obj>] [--target:<triple>] [--linker:<self>]
-                                        [--mm:<orc|off>] [--skip-run] [--allow-skip]
+                                        [--backend:<obj>] [--frontend:<stage1|mvp>]
+                                        [--target:<triple>] [--linker:<self>]
+                                        [--mm:<orc|off>] [--timeout:<sec>] [--multi:<0|1>]
+                                        [--skip-run] [--allow-skip]
                                         [--log:<path>]
 
 Notes:
@@ -22,8 +24,11 @@ mm=""
 skip_run=""
 allow_skip=""
 backend="${CHENG_STAGE1_FULLSPEC_BACKEND:-obj}"
+frontend="${CHENG_STAGE1_FULLSPEC_FRONTEND:-stage1}"
 target="${CHENG_STAGE1_FULLSPEC_TARGET:-}"
 linker="${CHENG_STAGE1_FULLSPEC_LINKER:-}"
+timeout_s="${CHENG_STAGE1_FULLSPEC_TIMEOUT:-60}"
+multi="${CHENG_STAGE1_FULLSPEC_MULTI:-1}"
 log="chengcache/stage1_fullspec.out"
 
 while [ "${1:-}" != "" ]; do
@@ -40,6 +45,9 @@ while [ "${1:-}" != "" ]; do
     --backend:*)
       backend="${1#--backend:}"
       ;;
+    --frontend:*)
+      frontend="${1#--frontend:}"
+      ;;
     --target:*)
       target="${1#--target:}"
       ;;
@@ -48,6 +56,12 @@ while [ "${1:-}" != "" ]; do
       ;;
     --mm:*)
       mm="${1#--mm:}"
+      ;;
+    --timeout:*)
+      timeout_s="${1#--timeout:}"
+      ;;
+    --multi:*)
+      multi="${1#--multi:}"
       ;;
     --skip-run)
       skip_run="1"
@@ -88,6 +102,14 @@ if [ "$backend" != "obj" ]; then
   echo "[Error] invalid --backend:$backend (only obj is supported)" 1>&2
   exit 2
 fi
+case "$frontend" in
+  stage1|mvp)
+    ;;
+  *)
+    echo "[Error] invalid --frontend:$frontend (expected stage1|mvp)" 1>&2
+    exit 2
+    ;;
+esac
 
 if [ "$name" = "" ]; then
   base="$(basename "$file")"
@@ -99,16 +121,68 @@ if [ "$mm" != "" ]; then
   envs="CHENG_MM=$mm"
 fi
 
-job_arg=""
-if [ "$jobs" != "" ]; then
-  job_arg="--jobs:$jobs"
+if [ "$jobs" = "" ]; then
+  jobs="${CHENG_STAGE1_FULLSPEC_JOBS:-}"
 fi
+
+if [ "$multi" != "0" ]; then
+  multi="1"
+fi
+multi_force="${CHENG_STAGE1_FULLSPEC_MULTI_FORCE:-$multi}"
+jobs_env=""
+if [ "$jobs" != "" ]; then
+  jobs_env="CHENG_BACKEND_JOBS=$jobs"
+fi
+
+run_with_timeout() {
+  seconds="$1"
+  shift
+  perl -e '
+    use POSIX qw(setsid WNOHANG);
+    my $timeout = shift;
+    my $pid = fork();
+    if (!defined $pid) { exit 127; }
+    if ($pid == 0) {
+      setsid();
+      exec @ARGV;
+      exit 127;
+    }
+    my $end = time + $timeout;
+    while (1) {
+      my $res = waitpid($pid, WNOHANG);
+      if ($res == $pid) {
+        my $status = $?;
+        if (($status & 127) != 0) {
+          exit(128 + ($status & 127));
+        }
+        exit($status >> 8);
+      }
+      if (time >= $end) {
+        kill "TERM", -$pid;
+        select(undef, undef, undef, 0.5);
+        kill "KILL", -$pid;
+        exit 124;
+      }
+      select(undef, undef, undef, 0.1);
+    }
+  ' "$seconds" "$@"
+}
 
 run_cmd() {
   cmd_label="$1"
   shift
   echo "== $cmd_label =="
-  "$@"
+  set +e
+  run_with_timeout "$timeout_s" "$@"
+  status=$?
+  set -e
+  if [ "$status" = "124" ]; then
+    echo "[Error] $cmd_label timed out after ${timeout_s}s" 1>&2
+    exit 124
+  fi
+  if [ "$status" != "0" ]; then
+    exit "$status"
+  fi
 }
 
 host_os="$(uname -s 2>/dev/null || echo unknown)"
@@ -159,9 +233,10 @@ if [ ! -f "$runtime_src" ]; then
 fi
 mkdir -p chengcache
 if [ ! -f "$runtime_obj" ] || [ "$runtime_src" -nt "$runtime_obj" ]; then
-  run_cmd "build.stage1_fullspec.runtime_obj" env \
-    CHENG_BACKEND_MULTI=0 \
-    CHENG_BACKEND_MULTI_FORCE=0 \
+  # shellcheck disable=SC2086
+  run_cmd "build.stage1_fullspec.runtime_obj" env $jobs_env \
+    CHENG_BACKEND_MULTI="$multi" \
+    CHENG_BACKEND_MULTI_FORCE="$multi_force" \
     CHENG_BACKEND_ALLOW_NO_MAIN=1 \
     CHENG_BACKEND_WHOLE_PROGRAM=1 \
     CHENG_BACKEND_EMIT=obj \
@@ -177,15 +252,15 @@ if [ ! -s "$runtime_obj" ]; then
 fi
 
 # shellcheck disable=SC2086
-run_cmd "build.stage1_fullspec.obj" env $envs \
-  CHENG_BACKEND_MULTI=0 \
-  CHENG_BACKEND_MULTI_FORCE=0 \
+run_cmd "build.stage1_fullspec.obj" env $envs $jobs_env \
+  CHENG_BACKEND_MULTI="$multi" \
+  CHENG_BACKEND_MULTI_FORCE="$multi_force" \
   CHENG_BACKEND_LINKER=self \
   CHENG_BACKEND_WHOLE_PROGRAM=1 \
   CHENG_BACKEND_NO_RUNTIME_C=1 \
   CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
   CHENG_BACKEND_VALIDATE=1 \
-  CHENG_BACKEND_FRONTEND=stage1 \
+  CHENG_BACKEND_FRONTEND="$frontend" \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_TARGET="$target" \
   CHENG_BACKEND_INPUT="$file" \
@@ -203,9 +278,16 @@ if [ ! -x "$root/$name" ]; then
 fi
 
 mkdir -p "$(dirname "$log")"
-output="$(env $envs "$root/$name" 2>&1)"
+# shellcheck disable=SC2086
+set +e
+output="$(run_with_timeout "$timeout_s" env $envs "$root/$name" 2>&1)"
 status=$?
+set -e
 printf "%s\n" "$output" >"$log"
+if [ "$status" = "124" ]; then
+  echo "[Error] stage1 fullspec run timed out after ${timeout_s}s (see $log)" 1>&2
+  exit 124
+fi
 if [ "$status" != "0" ]; then
   echo "[Error] stage1 fullspec failed (exit $status, see $log)" 1>&2
   exit 2

@@ -73,14 +73,21 @@ fn hashMapStrEq(cur: str, key: str): bool =
     return true
 
 fn hashMapStrIntInit(cap0: int32 = 16): HashMapStrInt =
+    var m: HashMapStrInt
+    hashMapStrIntInitInPlace(m, cap0)
+    return m
+
+fn hashMapStrIntInitInPlace(m: var HashMapStrInt, cap0: int32 = 16) =
     let cap: int32 = hashMapNextPow2(cap0, 8)
-    var keys: str[cap]
-    var vals: int32[cap]
-    var states: uint8[cap]
-    keys.len = cap
-    vals.len = cap
-    states.len = cap
-    return HashMapStrInt(keys: keys, vals: vals, states: states, mask: uint64(cap - 1), used: 0)
+    m.keys.len = cap
+    m.vals.len = cap
+    m.states.len = cap
+    m.mask = uint64(cap - 1)
+    m.used = 0
+    for i in 0..<cap:
+        m.keys[i] = nil
+        m.vals[i] = 0
+        m.states[i] = uint8(0)
 
 fn hashMapStrIntClear(m: var HashMapStrInt) =
     if m.keys.len <= 0:
@@ -104,12 +111,12 @@ fn hashMapStrIntFindSlot(m: HashMapStrInt, key: str, allowInsert: bool): int32 =
     let __for_start_scanned_1 = scanned
     for __for_scanned_1 in __for_start_scanned_1..mask:
         scanned = __for_scanned_1
-        let st: uint8 = get[uint8](states, probe)
+        let st: uint8 = states[probe]
         if st == uint8(0):
             if allowInsert:
                 return probe
             return -1
-        let cur: str = get[str](keys, probe)
+        let cur: str = keys[probe]
         if hashMapStrEq(cur, key):
             return probe
         probe = (probe + 1) & mask
@@ -146,7 +153,7 @@ fn hashMapStrIntGrow(m: var HashMapStrInt) =
     if newCap <= 0:
         newCap = 16
     let nextCap: int32 = hashMapNextPow2(newCap, 8)
-    m = hashMapStrIntInit(nextCap)
+    hashMapStrIntInitInPlace(m, nextCap)
 
     for i in 0..<oldCap:
         if oldStates[i] == uint8(1):
@@ -163,7 +170,7 @@ fn hashMapStrIntPut(m: var HashMapStrInt, key: str, val: int32) =
     if key == nil || key == "":
         return
     if m.mask == 0:
-        m = hashMapStrIntInit(16)
+        hashMapStrIntInitInPlace(m, 16)
     if (m.used + 1) * 10 >= m.keys.len * 7:
         hashMapStrIntGrow(m)
     let slot: int32 = hashMapStrIntFindSlotMut(m, key, true)
@@ -175,39 +182,101 @@ fn hashMapStrIntPut(m: var HashMapStrInt, key: str, val: int32) =
     m.keys[slot] = key
     m.vals[slot] = val
 
-fn hashMapStrIntGetEx(m: HashMapStrInt, key: str, found: bool*): int32 =
+fn hashMapStrIntGetEx(m: HashMapStrInt, key: str, found: var bool): int32 =
     if key == nil || key == "" || m.mask == 0:
-        if found != nil:
-            *found = false
+        found = false
         return 0
     let slot: int32 = hashMapStrIntFindSlot(m, key, false)
     if slot < 0:
-        if found != nil:
-            *found = false
+        found = false
         return 0
-    if found != nil:
-        *found = true
+    found = true
     return m.vals[slot]
 
-fn hashMapStrIntGet(m: HashMapStrInt, key: str, found: bool* = nil): int32 =
+fn hashMapStrIntGet(m: HashMapStrInt, key: str): int32 =
+    var found: bool = false
     return hashMapStrIntGetEx(m, key, found)
 
-fn hashMapStrIntGetMut(m: var HashMapStrInt, key: str, found: bool* = nil): int32 =
+fn hashMapStrIntGet(m: HashMapStrInt, key: str, found: var bool): int32 =
     if key == nil || key == "" || m.mask == 0:
+        found = false
+        return 0
+    let slot: int32 = hashMapStrIntFindSlot(m, key, false)
+    if slot < 0:
+        found = false
+        return 0
+    found = true
+    return m.vals[slot]
+
+fn hashMapStrIntGetMut(m: var HashMapStrInt, key: str): int32 =
+    var found: bool = false
+    return hashMapStrIntGetMut(m, key, found)
+
+fn hashMapStrIntGetMut(m: var HashMapStrInt, key: str, found: var bool): int32 =
+    if key == nil || key == "" || m.mask == 0:
+        found = false
+        return 0
+    let slot: int32 = hashMapStrIntFindSlotMut(m, key, false)
+    if slot < 0:
+        found = false
+        return 0
+    found = true
+    return m.vals[slot]
+
+fn hashMapStrIntGet(m: var HashMapStrInt, key: str): int32 =
+    var found: bool = false
+    return hashMapStrIntGetMut(m, key, found)
+
+fn hashMapStrIntGet(m: var HashMapStrInt, key: str, found: var bool): int32 =
+    return hashMapStrIntGetMut(m, key, found)
+
+fn hashMapStrIntGet(m: HashMapStrInt*, key: str): int32 =
+    var found: bool = false
+    return hashMapStrIntGetPtr(m, key, &found)
+
+fn hashMapStrIntGetPtr(m: HashMapStrInt, key: str): int32 =
+    return hashMapStrIntGet(m, key)
+
+fn hashMapStrIntGetPtr(m: HashMapStrInt, key: str, found: bool*): int32 =
+    var ok: bool = false
+    let val: int32 = hashMapStrIntGet(m, key, ok)
+    if found != nil:
+        *found = ok
+    return val
+
+fn hashMapStrIntGet(m: HashMapStrInt*, key: str, found: bool*): int32 =
+    if m == nil:
         if found != nil:
             *found = false
         return 0
-    let slot: int32 = hashMapStrIntFindSlotMut(m, key, false)
+    if key == nil || key == "" || m->mask == 0:
+        if found != nil:
+            *found = false
+        return 0
+    let slot: int32 = hashMapStrIntFindSlot(*m, key, false)
     if slot < 0:
         if found != nil:
             *found = false
         return 0
     if found != nil:
         *found = true
-    return m.vals[slot]
+    if slot < 0 || slot >= m->vals.len || m->vals.buffer == nil:
+        if found != nil:
+            *found = false
+        return 0
+    let byteOffset: int32 = int32(int64(slot) * sizeof int32)
+    let p: int32* = int32*(ptr_add(m->vals.buffer, byteOffset))
+    return *p
 
-fn hashMapStrIntGetPtr(m: var HashMapStrInt, key: str, found: bool* = nil): int32 =
-    return hashMapStrIntGetMut(m, key, found)
+fn hashMapStrIntGetPtrRaw(m: HashMapStrInt*, key: str, found: bool*): int32 =
+    return hashMapStrIntGet(m, key, found)
+
+fn hashMapStrIntGetPtr(m: HashMapStrInt*, key: str, found: bool*): int32 =
+    return hashMapStrIntGetPtrRaw(m, key, found)
+
+fn hashMapStrIntGetPtr(m: HashMapStrInt*, key: str): int32 =
+    var found: bool = false
+    return hashMapStrIntGetPtr(m, key, &found)
 
 fn `[]`(m: HashMapStrInt, key: str): int32 =
     return hashMapStrIntGet(m, key)
@@ -215,19 +284,17 @@ fn `[]`(m: HashMapStrInt, key: str): int32 =
 fn `[]=`(m: var HashMapStrInt, key: str, val: int32) =
     hashMapStrIntPut(m, key, val)
 
-fn hashMapStrIntGetOrInsertEx(m: var HashMapStrInt, key: str, newVal: int32, found: bool*): int32 =
+fn hashMapStrIntGetOrInsertEx(m: var HashMapStrInt, key: str, newVal: int32, found: var bool): int32 =
     if key == nil || key == "":
-        if found != nil:
-            *found = false
+        found = false
         return newVal
     if m.mask == 0:
-        m = hashMapStrIntInit(16)
+        hashMapStrIntInitInPlace(m, 16)
     if (m.used + 1) * 10 >= m.keys.len * 7:
         hashMapStrIntGrow(m)
     let slot: int32 = hashMapStrIntFindSlotMut(m, key, true)
     if slot < 0:
-        if found != nil:
-            *found = false
+        found = false
         return newVal
     let existed: bool = (m.states[slot] == uint8(1))
     if !existed:
@@ -235,12 +302,33 @@ fn hashMapStrIntGetOrInsertEx(m: var HashMapStrInt, key: str, newVal: int32, fou
         m.states[slot] = uint8(1)
         m.keys[slot] = key
         m.vals[slot] = newVal
-    if found != nil:
-        *found = existed
+    found = existed
     return m.vals[slot]
 
-fn hashMapStrIntGetOrInsert(m: var HashMapStrInt, key: str, newVal: int32, found: bool* = nil): int32 =
+fn hashMapStrIntGetOrInsert(m: var HashMapStrInt, key: str, newVal: int32): int32 =
+    var found: bool = false
     return hashMapStrIntGetOrInsertEx(m, key, newVal, found)
+
+fn hashMapStrIntGetOrInsert(m: var HashMapStrInt, key: str, newVal: int32, found: var bool): int32 =
+    if key == nil || key == "":
+        found = false
+        return newVal
+    if m.mask == 0:
+        hashMapStrIntInitInPlace(m, 16)
+    if (m.used + 1) * 10 >= m.keys.len * 7:
+        hashMapStrIntGrow(m)
+    let slot: int32 = hashMapStrIntFindSlotMut(m, key, true)
+    if slot < 0:
+        found = false
+        return newVal
+    let existed: bool = (m.states[slot] == uint8(1))
+    if !existed:
+        m.used = m.used + 1
+        m.states[slot] = uint8(1)
+        m.keys[slot] = key
+        m.vals[slot] = newVal
+    found = existed
+    return m.vals[slot]
 
 fn hashMapStrSeqIntInit(cap0: int32 = 16): HashMapStrSeqInt =
     let cap: int32 = hashMapNextPow2(cap0, 8)
@@ -288,12 +376,12 @@ fn hashMapStrSeqIntFindSlot(m: HashMapStrSeqInt, key: str, allowInsert: bool): i
     let __for_start_scanned_3 = scanned
     for __for_scanned_3 in __for_start_scanned_3..mask:
         scanned = __for_scanned_3
-        let st: uint8 = get[uint8](states, probe)
+        let st: uint8 = states[probe]
         if st == uint8(0):
             if allowInsert:
                 return probe
             return -1
-        let cur: str = get[str](keys, probe)
+        let cur: str = keys[probe]
         if hashMapStrEq(cur, key):
             return probe
         probe = (probe + 1) & mask
@@ -331,7 +419,7 @@ fn hashMapStrSeqIntStoreSeqAt(m: var HashMapStrSeqInt, slot: int32, val: int32[]
     m.valStart[slot] = start
     m.valLen[slot] = val.len
     for i in 0..<val.len:
-        add[int32](m.pool, val[i])
+        add(m.pool, val[i])
 
 fn hashMapStrSeqIntBuildSeq(m: HashMapStrSeqInt, slot: int32): int32[] =
     var out: int32[]
@@ -341,9 +429,9 @@ fn hashMapStrSeqIntBuildSeq(m: HashMapStrSeqInt, slot: int32): int32[] =
     let n: int32 = m.valLen[slot]
     if start < 0 || n <= 0:
         return out
-    reserve[int32](out, n)
+    out.cap = n
     for i in 0..<n:
-        add[int32](out, m.pool[start + i])
+        add(out, m.pool[start + i])
     return out
 
 fn hashMapStrSeqIntGrow(m: var HashMapStrSeqInt) =
@@ -374,7 +462,7 @@ fn hashMapStrSeqIntGrow(m: var HashMapStrSeqInt) =
                     nextMap.valStart[slot] = nextMap.pool.len
                     nextMap.valLen[slot] = n
                     for vi in 0..<n:
-                        add[int32](nextMap.pool, oldPool[start + vi])
+                        add(nextMap.pool, oldPool[start + vi])
                 else:
                     nextMap.valStart[slot] = -1
                     nextMap.valLen[slot] = 0
@@ -412,15 +500,15 @@ fn hashMapStrSeqIntAdd(m: var HashMapStrSeqInt, key: str, value: int32) =
         m.keys[slot] = key
         m.valStart[slot] = m.pool.len
         m.valLen[slot] = 1
-        add[int32](m.pool, value)
+        add(m.pool, value)
         return
     let oldStart: int32 = m.valStart[slot]
     let oldLen: int32 = m.valLen[slot]
     let newStart: int32 = m.pool.len
     if oldStart >= 0 && oldLen > 0:
         for i in 0..<oldLen:
-            add[int32](m.pool, m.pool[oldStart + i])
-    add[int32](m.pool, value)
+            add(m.pool, m.pool[oldStart + i])
+    add(m.pool, value)
     m.valStart[slot] = newStart
     m.valLen[slot] = oldLen + 1
 
@@ -446,14 +534,21 @@ fn `[]=`(m: var HashMapStrSeqInt, key: str, val: int32[]) =
     hashMapStrSeqIntPutSeq(m, key, val)
 
 fn hashMapPtrIntInit(cap0: int32 = 1024): HashMapPtrInt =
+    var m: HashMapPtrInt
+    hashMapPtrIntInitInPlace(m, cap0)
+    return m
+
+fn hashMapPtrIntInitInPlace(m: var HashMapPtrInt, cap0: int32 = 1024) =
     let cap: int32 = hashMapNextPow2(cap0, 8)
-    var keys: int64[cap]
-    var vals: int32[cap]
-    var states: uint8[cap]
-    keys.len = cap
-    vals.len = cap
-    states.len = cap
-    return HashMapPtrInt(keys: keys, vals: vals, states: states, mask: uint64(cap - 1), used: 0)
+    m.keys.len = cap
+    m.vals.len = cap
+    m.states.len = cap
+    m.mask = uint64(cap - 1)
+    m.used = 0
+    for i in 0..<cap:
+        m.keys[i] = 0
+        m.vals[i] = 0
+        m.states[i] = uint8(0)
 
 fn hashMapPtrIntClear(m: var HashMapPtrInt) =
     if m.keys.len <= 0:
@@ -477,12 +572,12 @@ fn hashMapPtrIntFindSlot(m: HashMapPtrInt, key: int64, allowInsert: bool): int32
     let __for_start_scanned_5 = scanned
     for __for_scanned_5 in __for_start_scanned_5..mask:
         scanned = __for_scanned_5
-        let st: uint8 = get[uint8](states, probe)
+        let st: uint8 = states[probe]
         if st == uint8(0):
             if allowInsert:
                 return probe
             return -1
-        if get[int64](keys, probe) == key:
+        if keys[probe] == key:
             return probe
         probe = (probe + 1) & mask
         scanned = scanned + 1
@@ -518,7 +613,7 @@ fn hashMapPtrIntGrow(m: var HashMapPtrInt) =
     if newCap <= 0:
         newCap = 1024
     let nextCap: int32 = hashMapNextPow2(newCap, 8)
-    m = hashMapPtrIntInit(nextCap)
+    hashMapPtrIntInitInPlace(m, nextCap)
 
     for i in 0..<oldCap:
         if oldStates[i] == uint8(1):
@@ -535,7 +630,7 @@ fn hashMapPtrIntPut(m: var HashMapPtrInt, key: int64, val: int32) =
     if key == 0:
         return
     if m.mask == 0:
-        m = hashMapPtrIntInit(1024)
+        hashMapPtrIntInitInPlace(m, 1024)
     if (m.used + 1) * 10 >= m.keys.len * 7:
         hashMapPtrIntGrow(m)
     let slot: int32 = hashMapPtrIntFindSlotMut(m, key, true)
@@ -582,7 +677,7 @@ fn hashCountStrOrdered(items: str[], orderOut: var str[], countsOut: var HashMap
         var cap: int32 = items.len * 2
         if cap < 16:
             cap = 16
-        countsOut = hashMapStrIntInit(cap)
+        hashMapStrIntInitInPlace(countsOut, cap)
     else:
         hashMapStrIntClear(countsOut)
     orderOut.len = 0
@@ -595,7 +690,7 @@ fn hashCountStrOrdered(items: str[], orderOut: var str[], countsOut: var HashMap
                 hashMapStrIntPut(countsOut, key, cnt + 1)
             else:
                 hashMapStrIntPut(countsOut, key, 1)
-                add[str](orderOut, key)
+                add(orderOut, key)
 
 fn hashIndexStrFirst(items: str[], indexOut: var HashMapStrInt) =
     var needCap: int32 = items.len * 2
@@ -603,7 +698,7 @@ fn hashIndexStrFirst(items: str[], indexOut: var HashMapStrInt) =
         needCap = 16
     let capPow2: int32 = hashMapNextPow2(needCap, 8)
     if indexOut.mask == 0 || indexOut.keys.len < capPow2:
-        indexOut = hashMapStrIntInit(capPow2)
+        hashMapStrIntInitInPlace(indexOut, capPow2)
     else:
         hashMapStrIntClear(indexOut)
     for i in 0..<items.len:

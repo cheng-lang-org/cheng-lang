@@ -22,7 +22,7 @@ fn lowerAddError(diags: Diagnostic[]*, filename: str, pos: SourcePos, msg: str) 
     d.line = pos.line
     d.col = pos.col
     d.message = msg
-    addPtr[Diagnostic](diags, d)
+    add(diags, d)
 
 fn ctorNameFromNode(n: Node): str =
     if n == nil:
@@ -45,8 +45,16 @@ fn lowerIsCompatOverlayFile(filename: str): bool =
         return true
     return false
 
-fn collectTypeConstructors(root: Node, out: hashsets.HashSetStr*) =
-    if root == nil || out == nil:
+fn lowerIsSynthesizedBracketCtor(br: Node, base: Node): bool =
+    if br == nil || base == nil:
+        return false
+    # `T[]` lowering rewrites to `seq[T]` with ctor ident position copied from
+    # bracket position (`[` token). Source-written `seq[T]` keeps ctor at `seq`,
+    # so base.pos differs from bracket pos.
+    return base.pos.line == br.pos.line && base.pos.col == br.pos.col
+
+fn collectTypeConstructors(root: Node, out: var hashsets.HashSetStr) =
+    if root == nil:
         return
     # Builtin / special generic constructors.
     hashsets.hashSetStrAdd(out, "seq")
@@ -57,9 +65,9 @@ fn collectTypeConstructors(root: Node, out: hashsets.HashSetStr*) =
     hashsets.hashSetStrAdd(out, "varargs")
 
     var queue: Node[]
-    addPtr[Node](&queue, root)
+    add(queue, root)
     while queue.len > 0:
-        let n: Node = get[Node](queue, queue.len - 1)
+        let n: Node = queue[queue.len - 1]
         queue.len = queue.len - 1
         if n == nil:
             continue
@@ -85,7 +93,7 @@ fn collectTypeConstructors(root: Node, out: hashsets.HashSetStr*) =
                             if nm2 != nil && len(nm2) > 0:
                                 hashsets.hashSetStrAdd(out, nm2)
         for i in 0..<kidCount(n):
-            addPtr[Node](&queue, kid(n, i))
+            add(queue, kid(n, i))
 
 fn lowerTypeExpr(ty0: Node, ctors: hashsets.HashSetStr, diags: Diagnostic[]*, filename: str): Node =
     if ty0 == nil:
@@ -178,18 +186,19 @@ fn lowerTypeExpr(ty0: Node, ctors: hashsets.HashSetStr, diags: Diagnostic[]*, fi
         if count > 1:
             let base0: Node = kid(ty, 0)
             let ctor0: str = ctorNameFromNode(base0)
-            if !allowLegacyCtorSyntax && (streq(ctor0, "seq") || streq(ctor0, "openArray")):
+            let fromSugar: bool = lowerIsSynthesizedBracketCtor(ty, base0)
+            if !allowLegacyCtorSyntax && !fromSugar && ((ctor0 == "seq") || (ctor0 == "openArray")):
                 lowerAddError(diags, filename, ty.pos,
                               "Legacy type syntax is removed; use 'T[]' instead of '" + ctor0 + "[T]'")
             # NOTE: `array[...]` surface syntax is removed. `T[N]` sugar means a
             # dynamic seq with implicit reserve at init.
-            elif !allowLegacyCtorSyntax && streq(ctor0, "Table_fixed"):
+            elif !allowLegacyCtorSyntax && (ctor0 == "Table_fixed"):
                 lowerAddError(diags, filename, ty.pos,
                               "Legacy type syntax 'Table_fixed[V, N]' is removed; use 'Table[V]' and pass capacity to TableInit(...)")
-            elif !allowLegacyCtorSyntax && streq(ctor0, "array"):
+            elif !allowLegacyCtorSyntax && (ctor0 == "array"):
                 lowerAddError(diags, filename, ty.pos,
                               "Legacy type syntax 'array[N, T]' is removed; use 'T[N]' instead")
-            elif !allowLegacyCtorSyntax && streq(ctor0, "Table") && count != 2:
+            elif !allowLegacyCtorSyntax && (ctor0 == "Table") && count != 2:
                 lowerAddError(diags, filename, ty.pos,
                               "Legacy type syntax 'Table[V, N]' is removed; use 'Table[V]' and pass capacity to TableInit(...)")
         if count == 1:
@@ -274,9 +283,9 @@ fn collectKnownTypeNames(root: Node, out: hashsets.HashSetStr*) =
     if root == nil || out == nil:
         return
     var queue: Node[]
-    addPtr[Node](&queue, root)
+    add(queue, root)
     while queue.len > 0:
-        let n: Node = get[Node](queue, queue.len - 1)
+        let n: Node = queue[queue.len - 1]
         queue.len = queue.len - 1
         if n == nil:
             continue
@@ -288,15 +297,15 @@ fn collectKnownTypeNames(root: Node, out: hashsets.HashSetStr*) =
                     if nm != nil && len(nm) > 0:
                         hashsets.hashSetStrAdd(out, nm)
         for i in 0..<kidCount(n):
-            addPtr[Node](&queue, kid(n, i))
+            add(queue, kid(n, i))
 
 fn collectImplicitTypeParamsFromTypeNode(ty: Node, knownTypes: hashsets.HashSetStr, seen: hashsets.HashSetStr*, out: str[]*) =
     if ty == nil || seen == nil || out == nil:
         return
     var queue: Node[]
-    addPtr[Node](&queue, ty)
+    add(queue, ty)
     while queue.len > 0:
-        let n: Node = get[Node](queue, queue.len - 1)
+        let n: Node = queue[queue.len - 1]
         queue.len = queue.len - 1
         if n == nil:
             continue
@@ -309,10 +318,10 @@ fn collectImplicitTypeParamsFromTypeNode(ty: Node, knownTypes: hashsets.HashSetS
                ! hashsets.hashSetStrHas(knownTypes, nm) &&
                ! hashsets.hashSetStrHas(*seen, nm):
                 hashsets.hashSetStrAdd(seen, nm)
-                addPtr[str](out, nm)
+                add(out, nm)
             continue
         for i in 0..<kidCount(n):
-            addPtr[Node](&queue, kid(n, i))
+            add(queue, kid(n, i))
 
 fn inferImplicitTypeParamsForRoutine(routineNode: Node, knownTypes: hashsets.HashSetStr) =
     if routineNode == nil:
@@ -339,7 +348,7 @@ fn inferImplicitTypeParamsForRoutine(routineNode: Node, knownTypes: hashsets.Has
         return
     var outGp: Node = newNode(nkGenericParams, routineNode.pos)
     for j in 0..<names.len:
-        let nm: str = get[str](names, j)
+        let nm: str = names[j]
         var defn: Node = newNode(nkIdentDefs, routineNode.pos)
         addSon(defn, newIdent(nm, routineNode.pos))
         addSon(defn, emptyNode(routineNode.pos))
@@ -352,14 +361,14 @@ fn lowerTypeSyntax(root: Node, diags: Diagnostic[]*, filename: str) =
     if root == nil:
         return
     var ctors: hashsets.HashSetStr = hashsets.hashSetStrInit(128)
-    collectTypeConstructors(root, &ctors)
+    collectTypeConstructors(root, ctors)
     var knownTypes: hashsets.HashSetStr = hashsets.hashSetStrInit(128)
     collectKnownTypeNames(root, &knownTypes)
 
     var queue: Node[]
-    addPtr[Node](&queue, root)
+    add(queue, root)
     while queue.len > 0:
-        let n: Node = get[Node](queue, queue.len - 1)
+        let n: Node = queue[queue.len - 1]
         queue.len = queue.len - 1
         if n == nil:
             continue
@@ -405,4 +414,4 @@ fn lowerTypeSyntax(root: Node, diags: Diagnostic[]*, filename: str) =
             if n.kind != nkLambda:
                 inferImplicitTypeParamsForRoutine(n, knownTypes)
         for i in 0..<kidCount(n):
-            addPtr[Node](&queue, kid(n, i))
+            add(queue, kid(n, i))

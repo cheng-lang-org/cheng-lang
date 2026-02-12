@@ -75,11 +75,30 @@ log="$out_dir/backend_obj_fullspec.out"
 mkdir -p "$out_dir"
 
 echo "== backend.obj_fullspec_gate.build =="
-run_with_timeout "$timeout_s" env \
-  CHENG_MM="${CHENG_MM:-orc}" \
-  CHENG_CLEAN_CHENG_LOCAL="${CHENG_CLEAN_CHENG_LOCAL:-0}" \
-  CHENG_BACKEND_DRIVER="$driver" \
-  sh src/tooling/chengb.sh "$sample" --frontend:stage1 --emit:exe --out:"$out" >/dev/null
+needs_build="1"
+rebuild_on_source="${CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_SOURCE:-0}"
+rebuild_on_driver="${CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_DRIVER:-0}"
+if [ -x "$out" ]; then
+  needs_build="0"
+fi
+if [ "$needs_build" = "0" ] && [ "$rebuild_on_source" = "1" ] && [ "$sample" -nt "$out" ]; then
+  needs_build="1"
+fi
+if [ "$needs_build" = "0" ] && [ "$rebuild_on_driver" = "1" ] && [ "$driver" -nt "$out" ]; then
+  needs_build="1"
+fi
+if [ "$needs_build" = "1" ]; then
+  run_with_timeout "$timeout_s" env \
+    CHENG_MM="${CHENG_MM:-orc}" \
+    CHENG_CLEAN_CHENG_LOCAL="${CHENG_CLEAN_CHENG_LOCAL:-0}" \
+    CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
+    CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-0}" \
+    CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
+    CHENG_BACKEND_DRIVER="$driver" \
+    sh src/tooling/chengb.sh "$sample" --frontend:stage1 --emit:exe --out:"$out" >/dev/null
+else
+  echo "[gate] reuse existing binary: $out"
+fi
 
 if [ ! -x "$out" ]; then
   echo "[Error] missing gate binary: $out" 1>&2

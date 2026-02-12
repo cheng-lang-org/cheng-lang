@@ -17,12 +17,12 @@ const
     ownSampleMask: int32 = 31
 
 var ownershipEnabledFlag: bool = false
-var ownershipNodes: ptr[256]
-var ownershipFlags: int32[256]
-var ownershipExprClasses: int32[256]
-var ownershipEscapeClasses: int32[256]
-var ownershipMustRetain: int32[256]
-var ownershipMoveNames: str[256]
+var ownershipNodes: ptr[]
+var ownershipFlags: int32[]
+var ownershipExprClasses: int32[]
+var ownershipEscapeClasses: int32[]
+var ownershipMustRetain: int32[]
+var ownershipMoveNames: str[]
 var ownDeepEnabled: bool = false
 var ownershipLastNode: void* = nil
 var ownershipLastIndex: int32 = -1
@@ -34,13 +34,13 @@ var ownLocalMapVals: int32[]
 var ownLocalMapUsed: int32 = 0
 var ownLocalMapLive: int32 = 0
 
-var ownScopeStarts: int32[16]
-var ownScopeNames: str[128]
-var ownGlobalNames: str[128]
+var ownScopeStarts: int32[]
+var ownScopeNames: str[]
+var ownGlobalNames: str[]
 var ownFnDepth: int32 = 0
 var ownLoopDepth: int32 = 0
-var ownLoopCondStarts: int32[16]
-var ownLoopCondNames: str[64]
+var ownLoopCondStarts: int32[]
+var ownLoopCondNames: str[]
 var ownProfOn: bool = false
 var ownProfCollectIdentNs: int64 = 0
 var ownProfCollectIdentCalls: int32 = 0
@@ -65,6 +65,91 @@ var ownProfMarkKindNs: int64[ownNodeKindCount]
 var ownProfMarkKindCalls: int32[ownNodeKindCount]
 var ownProfAnalyzeKindNs: int64[ownNodeKindCount]
 var ownProfAnalyzeKindCalls: int32[ownNodeKindCount]
+
+fn ownSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "ownership: seq index out of bounds"
+    let off64: int64 = int64(idx) * int64(elemSize)
+    return ptr_add(buffer, int32(off64))
+
+fn ownReadPtr(seqInst: ptr[], i: int32): ptr =
+    let p: ptr* = ptr*(ownSeqElemPtr(seqInst.buffer, seqInst.len, i, sizeof ptr))
+    return *p
+
+fn ownWritePtr(seqInst: ptr[]*, i: int32, val: ptr) =
+    if seqInst == nil:
+        panic "ownership: nil seq pointer"
+    let p: ptr* = ptr*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof ptr))
+    *p = val
+
+fn ownReadI32(seqInst: int32[], i: int32): int32 =
+    let p: int32* = int32*(ownSeqElemPtr(seqInst.buffer, seqInst.len, i, sizeof int32))
+    return *p
+
+fn ownReadI32Ptr(seqInst: int32[]*, i: int32): int32 =
+    if seqInst == nil:
+        panic "ownership: nil seq pointer"
+    let p: int32* = int32*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof int32))
+    return *p
+
+fn ownWriteI32(seqInst: int32[]*, i: int32, val: int32) =
+    if seqInst == nil:
+        panic "ownership: nil seq pointer"
+    let p: int32* = int32*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof int32))
+    *p = val
+
+fn ownReadI64(seqInst: int64[], i: int32): int64 =
+    let p: int64* = int64*(ownSeqElemPtr(seqInst.buffer, seqInst.len, i, sizeof int64))
+    return *p
+
+fn ownReadI64Ptr(seqInst: int64[]*, i: int32): int64 =
+    if seqInst == nil:
+        panic "ownership: nil seq pointer"
+    let p: int64* = int64*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof int64))
+    return *p
+
+fn ownWriteI64(seqInst: int64[]*, i: int32, val: int64) =
+    if seqInst == nil:
+        panic "ownership: nil seq pointer"
+    let p: int64* = int64*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof int64))
+    *p = val
+
+fn ownReadStr(seqInst: str[], i: int32): str =
+    let p: str* = str*(ownSeqElemPtr(seqInst.buffer, seqInst.len, i, sizeof str))
+    return *p
+
+fn ownReadStrPtr(seqInst: str[]*, i: int32): str =
+    if seqInst == nil:
+        panic "ownership: nil seq pointer"
+    let p: str* = str*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof str))
+    return *p
+
+fn ownWriteStr(seqInst: str[]*, i: int32, val: str) =
+    if seqInst == nil:
+        panic "ownership: nil seq pointer"
+    let p: str* = str*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof str))
+    *p = val
+
+fn ownFreePtrSeq(seqInst: var ptr[]) =
+    if seqInst.buffer != nil:
+        memRelease(seqInst.buffer)
+    seqInst.buffer = nil
+    seqInst.len = 0
+    seqInst.cap = 0
+
+fn ownFreeI32Seq(seqInst: var int32[]) =
+    if seqInst.buffer != nil:
+        memRelease(seqInst.buffer)
+    seqInst.buffer = nil
+    seqInst.len = 0
+    seqInst.cap = 0
+
+fn ownFreeStrSeq(seqInst: var str[]) =
+    if seqInst.buffer != nil:
+        memRelease(seqInst.buffer)
+    seqInst.buffer = nil
+    seqInst.len = 0
+    seqInst.cap = 0
 
 fn ownershipClear() =
     # Defensive reset: avoid releasing potentially-invalid stale buffers.
@@ -151,7 +236,7 @@ fn ownershipEnabled(): bool =
 
 fn ownershipDeepEnabledFromEnv(): bool =
     let raw: str = getEnv "CHENG_STAGE1_OWNERSHIP_DEEP"
-    if streq(raw, "1") || streq(raw, "true") || streq(raw, "yes"):
+    if (raw == "1") || (raw == "true") || (raw == "yes"):
         return true
     return false
 
@@ -201,14 +286,14 @@ fn ownIndexMapInsert(p: void*, val: int32) =
     let mask: int32 = cap - 1
     var idx: int32 = ownIndexMapHash p & mask
     while true:
-        let key: void* = get[ptr](ownIndexMapKeys, idx)
+        let key: void* = void*(ownReadPtr(ownIndexMapKeys, idx))
         if key == nil:
-            setPtr[ptr](&ownIndexMapKeys, idx, p)
-            setPtr[int32](&ownIndexMapVals, idx, val + 1)
+            ownWritePtr(&ownIndexMapKeys, idx, ptr(p))
+            ownWriteI32(&ownIndexMapVals, idx, val + 1)
             ownIndexMapCount = ownIndexMapCount + 1
             return
         if key == p:
-            setPtr[int32](&ownIndexMapVals, idx, val + 1)
+            ownWriteI32(&ownIndexMapVals, idx, val + 1)
             return
         idx = idx + 1
         if idx >= cap:
@@ -234,13 +319,13 @@ fn ownIndexMapGrow() =
         zeroMem(ownIndexMapVals.buffer, newCap * 4)
     ownIndexMapCount = 0
     for i in 0..<oldCap:
-        let key: void* = get[ptr](oldKeys, i)
+        let key: void* = void*(ownReadPtr(oldKeys, i))
         if key != nil:
-            let val: int32 = get[int32](oldVals, i)
+            let val: int32 = ownReadI32(oldVals, i)
             if val != 0:
                 ownIndexMapInsert(key, val - 1)
-    freeSeqPtr[ptr](&oldKeys)
-    freeSeqPtr[int32](&oldVals)
+    ownFreePtrSeq(oldKeys)
+    ownFreeI32Seq(oldVals)
 
 fn ownIndexMapGet(p: void*): int32 =
     if p == nil || ownIndexMapKeys.len == 0:
@@ -250,11 +335,11 @@ fn ownIndexMapGet(p: void*): int32 =
     var idx: int32 = ownIndexMapHash p & mask
     let start: int32 = idx
     while true:
-        let key: void* = get[ptr](ownIndexMapKeys, idx)
+        let key: void* = void*(ownReadPtr(ownIndexMapKeys, idx))
         if key == nil:
             return -1
         if key == p:
-            let val: int32 = get[int32](ownIndexMapVals, idx)
+            let val: int32 = ownReadI32(ownIndexMapVals, idx)
             if val == 0:
                 return -1
             return val - 1
@@ -333,7 +418,7 @@ fn ownLocalMapFindSlot(name: str, allowInsert: bool): int32 =
     let start: int32 = idx
     var tomb: int32 = -1
     while true:
-        let key: void* = get[ptr](ownLocalMapKeys, idx)
+        let key: void* = void*(ownReadPtr(ownLocalMapKeys, idx))
         if key == nil:
             if allowInsert && tomb >= 0:
                 return tomb
@@ -342,7 +427,7 @@ fn ownLocalMapFindSlot(name: str, allowInsert: bool): int32 =
             return -1
         if c_strcmp(str(key), name) == 0:
             return idx
-        if allowInsert && tomb < 0 && get[int32](ownLocalMapVals, idx) == 0:
+        if allowInsert && tomb < 0 && ownReadI32(ownLocalMapVals, idx) == 0:
             tomb = idx
         idx = idx + 1
         if idx >= cap:
@@ -373,18 +458,18 @@ fn ownLocalMapGrow() =
     ownLocalMapUsed = 0
     ownLocalMapLive = 0
     for i in 0..<oldCap:
-        let key: void* = get[ptr](oldKeys, i)
+        let key: void* = void*(ownReadPtr(oldKeys, i))
         if key != nil:
-            let val: int32 = get[int32](oldVals, i)
+            let val: int32 = ownReadI32(oldVals, i)
             if val > 0:
                 let slot: int32 = ownLocalMapFindSlot(str(key), true)
                 if slot >= 0:
-                    setPtr[ptr](&ownLocalMapKeys, slot, key)
-                    setPtr[int32](&ownLocalMapVals, slot, val)
+                    ownWritePtr(&ownLocalMapKeys, slot, ptr(key))
+                    ownWriteI32(&ownLocalMapVals, slot, val)
                     ownLocalMapUsed = ownLocalMapUsed + 1
                     ownLocalMapLive = ownLocalMapLive + 1
-    freeSeqPtr[ptr](&oldKeys)
-    freeSeqPtr[int32](&oldVals)
+    ownFreePtrSeq(oldKeys)
+    ownFreeI32Seq(oldVals)
 
 fn ownLocalMapHas(name: str): bool =
     if name == nil || len name == 0:
@@ -392,7 +477,7 @@ fn ownLocalMapHas(name: str): bool =
     let idx: int32 = ownLocalMapFindSlot(name, false)
     if idx < 0:
         return false
-    return get[int32](ownLocalMapVals, idx) > 0
+    return ownReadI32(ownLocalMapVals, idx) > 0
 
 fn ownLocalMapInc(name: str) =
     if name == nil:
@@ -404,18 +489,18 @@ fn ownLocalMapInc(name: str) =
     let slot: int32 = ownLocalMapFindSlot(name, true)
     if slot < 0:
         return
-    if get[ptr](ownLocalMapKeys, slot) == nil:
-        setPtr[ptr](&ownLocalMapKeys, slot, void*(name))
-        setPtr[int32](&ownLocalMapVals, slot, 1)
+    if ownReadPtr(ownLocalMapKeys, slot) == nil:
+        ownWritePtr(&ownLocalMapKeys, slot, ptr(name))
+        ownWriteI32(&ownLocalMapVals, slot, 1)
         ownLocalMapUsed = ownLocalMapUsed + 1
         ownLocalMapLive = ownLocalMapLive + 1
         return
-    let cur: int32 = get[int32](ownLocalMapVals, slot)
+    let cur: int32 = ownReadI32(ownLocalMapVals, slot)
     if cur <= 0:
-        setPtr[int32](&ownLocalMapVals, slot, 1)
+        ownWriteI32(&ownLocalMapVals, slot, 1)
         ownLocalMapLive = ownLocalMapLive + 1
     else:
-        setPtr[int32](&ownLocalMapVals, slot, cur + 1)
+        ownWriteI32(&ownLocalMapVals, slot, cur + 1)
 
 fn ownLocalMapDec(name: str) =
     if name == nil || len name == 0:
@@ -425,14 +510,14 @@ fn ownLocalMapDec(name: str) =
     let slot: int32 = ownLocalMapFindSlot(name, false)
     if slot < 0:
         return
-    let cur: int32 = get[int32](ownLocalMapVals, slot)
+    let cur: int32 = ownReadI32(ownLocalMapVals, slot)
     if cur <= 0:
         return
     if cur == 1:
-        setPtr[int32](&ownLocalMapVals, slot, 0)
+        ownWriteI32(&ownLocalMapVals, slot, 0)
         ownLocalMapLive = ownLocalMapLive - 1
         return
-    setPtr[int32](&ownLocalMapVals, slot, cur - 1)
+    ownWriteI32(&ownLocalMapVals, slot, cur - 1)
 
 fn ownStripSpaces(s: str): str =
     if s == nil:
@@ -615,10 +700,10 @@ fn ownProfRecordKind(nsSeq: int64[]*, callsSeq: int32[]*, kind: NodeKind, deltaN
     if idx < 0 || idx >= nsSeq->len:
         return
     let scaled: int64 = deltaNs * int64(mul)
-    let curNs: int64 = get[int64](*nsSeq, idx)
-    setPtr[int64](nsSeq, idx, curNs + scaled)
-    let curCalls: int32 = get[int32](*callsSeq, idx)
-    setPtr[int32](callsSeq, idx, curCalls + mul)
+    let curNs: int64 = ownReadI64Ptr(nsSeq, idx)
+    ownWriteI64(nsSeq, idx, curNs + scaled)
+    let curCalls: int32 = ownReadI32Ptr(callsSeq, idx)
+    ownWriteI32(callsSeq, idx, curCalls + mul)
 
 fn ownProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
     var top1Idx: int32 = -1
@@ -631,7 +716,7 @@ fn ownProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
         let kind: NodeKind = NodeKind(idx)
         if ownProfSkipKind(kind):
             continue
-        let ns: int64 = get[int64](nsSeq, idx)
+        let ns: int64 = ownReadI64(nsSeq, idx)
         if ns > top1Ns:
             top3Ns = top2Ns
             top3Idx = top2Idx
@@ -650,15 +735,15 @@ fn ownProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
     var msg: str = label
     if top1Idx >= 0 && top1Ns > 0:
         let ms1: int32 = int32(top1Ns / 1000000)
-        let c1: int32 = get[int32](callsSeq, top1Idx)
+        let c1: int32 = ownReadI32(callsSeq, top1Idx)
         msg = msg + " " + ownProfKindLabel(top1Idx) + "=" + intToStr(ms1) + "ms(" + intToStr(c1) + ")"
     if top2Idx >= 0 && top2Ns > 0:
         let ms2: int32 = int32(top2Ns / 1000000)
-        let c2: int32 = get[int32](callsSeq, top2Idx)
+        let c2: int32 = ownReadI32(callsSeq, top2Idx)
         msg = msg + " " + ownProfKindLabel(top2Idx) + "=" + intToStr(ms2) + "ms(" + intToStr(c2) + ")"
     if top3Idx >= 0 && top3Ns > 0:
         let ms3: int32 = int32(top3Ns / 1000000)
-        let c3: int32 = get[int32](callsSeq, top3Idx)
+        let c3: int32 = ownReadI32(callsSeq, top3Idx)
         msg = msg + " " + ownProfKindLabel(top3Idx) + "=" + intToStr(ms3) + "ms(" + intToStr(c3) + ")"
     return msg
 
@@ -746,7 +831,7 @@ fn ownSeenMapFindSlot(seenKeys: str[], name: str, allowInsert: bool): int32 =
     var idx: int32 = ownSeenHash(name) & mask
     let start: int32 = idx
     while true:
-        let key: str = get[str](seenKeys, idx)
+        let key: str = ownReadStr(seenKeys, idx)
         if key == nil || len key == 0:
             if allowInsert:
                 return idx
@@ -789,17 +874,17 @@ fn ownSeenMapGrow(seen: OwnSeenSet*) =
     slotsGrow.cap = newCap
     seen->slots = slotsGrow
     for i in 0..<oldList.len:
-        let key: str = get[str](oldList, i)
+        let key: str = ownReadStr(oldList, i)
         if key != nil:
             let slot: int32 = ownSeenMapFindSlot(seen->keys, key, true)
             if slot >= 0:
-                setPtr[str](&seen->keys, slot, key)
+                ownWriteStr(&seen->keys, slot, key)
                 seen->used = seen->used + 1
-                addPtr[str](&seen->list, key)
-                addPtr[int32](&seen->slots, slot)
-    freeSeqPtr[str](&oldKeys)
-    freeSeqPtr[str](&oldList)
-    freeSeqPtr[int32](&oldSlots)
+                add(seen->list, key)
+                add(seen->slots, slot)
+    ownFreeStrSeq(oldKeys)
+    ownFreeStrSeq(oldList)
+    ownFreeI32Seq(oldSlots)
 
 fn ownSeenHasNorm(seen: OwnSeenSet, norm: str): bool =
     if norm == nil || len norm == 0:
@@ -837,12 +922,12 @@ fn ownSeenAddNorm(seen: OwnSeenSet*, norm: str) =
     let slot: int32 = ownSeenMapFindSlot(seen->keys, norm, true)
     if slot < 0:
         return
-    let cur: str = get[str](seen->keys, slot)
+    let cur: str = ownReadStr(seen->keys, slot)
     if cur == nil || len cur == 0:
-        setPtr[str](&seen->keys, slot, norm)
+        ownWriteStr(&seen->keys, slot, norm)
         seen->used = seen->used + 1
-        addPtr[str](&seen->list, norm)
-        addPtr[int32](&seen->slots, slot)
+        add(seen->list, norm)
+        add(seen->slots, slot)
     if sample:
         ownProfSeenAddNs = ownProfSeenAddNs + ((cheng_monotime_ns() - startNs) * 32)
 
@@ -855,18 +940,18 @@ fn ownSeenAdd(seen: OwnSeenSet*, name: str) =
 fn ownSeenMapFree(seen: OwnSeenSet*) =
     if seen == nil:
         return
-    freeSeqPtr[str](&seen->keys)
-    freeSeqPtr[str](&seen->list)
-    freeSeqPtr[int32](&seen->slots)
+    ownFreeStrSeq(seen->keys)
+    ownFreeStrSeq(seen->list)
+    ownFreeI32Seq(seen->slots)
     seen->used = 0
 
 fn ownSeenMapReset(seen: OwnSeenSet*) =
     if seen == nil:
         return
     for i in 0..<seen->slots.len:
-        let slot: int32 = get[int32](seen->slots, i)
+        let slot: int32 = ownReadI32(seen->slots, i)
         if slot >= 0 && slot < seen->keys.len:
-            setPtr[str](&seen->keys, slot, "")
+            ownWriteStr(&seen->keys, slot, "")
     seen->used = 0
     if seen->list.len > 0:
         seen->list.len = 0
@@ -1019,21 +1104,21 @@ fn ownStmtListHasIdentInDeferBeforeProfiled(list: Node, endIdx: int32, name: str
 
 fn ownLoopCondPush(n: Node) =
     let start: int32 = ownLoopCondNames.len
-    addPtr[int32](&ownLoopCondStarts, start)
+    add(ownLoopCondStarts, start)
     if n == nil:
         return
     var condSeen: OwnSeenSet
     ownCollectIdentNamesProfiled(n, &condSeen)
     for i in 0..<condSeen.list.len:
-        let nm: str = get[str](condSeen.list, i)
+        let nm: str = ownReadStr(condSeen.list, i)
         if nm != nil && len nm > 0:
-            addPtr[str](&ownLoopCondNames, nm)
+            add(ownLoopCondNames, nm)
     ownSeenMapFree(&condSeen)
 
 fn ownLoopCondPop() =
     if ownLoopCondStarts.len <= 0:
         return
-    let start: int32 = get[int32](ownLoopCondStarts, ownLoopCondStarts.len - 1)
+    let start: int32 = ownReadI32(ownLoopCondStarts, ownLoopCondStarts.len - 1)
     ownLoopCondStarts.len = ownLoopCondStarts.len - 1
     if ownLoopCondNames.len > start:
         ownLoopCondNames.len = start
@@ -1043,9 +1128,9 @@ fn ownLoopCondAddToSet(keys: OwnSeenSet*) =
         return
     if ownLoopCondStarts.len <= 0:
         return
-    let start: int32 = get[int32](ownLoopCondStarts, ownLoopCondStarts.len - 1)
+    let start: int32 = ownReadI32(ownLoopCondStarts, ownLoopCondStarts.len - 1)
     for i in start..<ownLoopCondNames.len:
-        let nm: str = get[str](ownLoopCondNames, i)
+        let nm: str = ownReadStr(ownLoopCondNames, i)
         if nm != nil && len nm > 0:
             ownSeenAddNorm(keys, nm)
 
@@ -1091,12 +1176,12 @@ fn ownCollectLoopCarried(list: Node, outSeen: OwnSeenSet*) =
         if lhs != nil && useNode == nil:
             ownCollectIdentNamesProfiled(lhs, &useKeys)
         for ui in 0..<useKeys.list.len:
-            let nm: str = get[str](useKeys.list, ui)
+            let nm: str = ownReadStr(useKeys.list, ui)
             if nm != nil && len nm > 0:
                 if ! ownSeenHasNorm(defsSeen, nm) && ! ownSeenHasNorm(lhsNames, nm):
                     ownSeenAddNorm(outSeen, nm)
         for di in 0..<lhsNames.list.len:
-            let nm2: str = get[str](lhsNames.list, di)
+            let nm2: str = ownReadStr(lhsNames.list, di)
             if nm2 != nil && len nm2 > 0:
                 ownSeenAddNorm(&defsSeen, nm2)
     ownSeenMapFree(&defsSeen)
@@ -1115,7 +1200,7 @@ fn ownSeenMergeFrom(keys: OwnSeenSet*, outerKeys: OwnSeenSet*) =
     if keys == nil || outerKeys == nil:
         return
     for i in 0..<outerKeys->list.len:
-        let nm: str = get[str](outerKeys->list, i)
+        let nm: str = ownReadStr(outerKeys->list, i)
         if nm != nil && len nm > 0:
             ownSeenAddNorm(keys, nm)
 
@@ -1170,9 +1255,9 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
                     if child != nil && child.kind == nkStmtList:
                         ownershipMarkMovesInStmtListWithOuter(child, &seenKeys)
                 if ownLoopCondStarts.len > 0:
-                    let condStart: int32 = get[int32](ownLoopCondStarts, ownLoopCondStarts.len - 1)
+                    let condStart: int32 = ownReadI32(ownLoopCondStarts, ownLoopCondStarts.len - 1)
                     for cj in condStart..<ownLoopCondNames.len:
-                        let nm: str = get[str](ownLoopCondNames, cj)
+                        let nm: str = ownReadStr(ownLoopCondNames, cj)
                         if nm != nil && len nm > 0:
                             ownSeenAddNorm(&seenKeys, nm)
                 ownLoopDepth = ownLoopDepth - 1
@@ -1257,12 +1342,12 @@ fn ownershipEnsure(n: Node): int32 =
         ownershipLastNode = p
         ownershipLastIndex = idx
         return idx
-    addPtr[ptr](&ownershipNodes, void*(n))
-    addPtr[int32](&ownershipFlags, 0)
-    addPtr[int32](&ownershipExprClasses, int32(oecUnknown))
-    addPtr[int32](&ownershipEscapeClasses, int32(oescUnknown))
-    addPtr[int32](&ownershipMustRetain, 0)
-    addPtr[str](&ownershipMoveNames, "")
+    add(ownershipNodes, void*(n))
+    add(ownershipFlags, int32(0))
+    add(ownershipExprClasses, int32(oecUnknown))
+    add(ownershipEscapeClasses, int32(oescUnknown))
+    add(ownershipMustRetain, int32(0))
+    add(ownershipMoveNames, "")
     let newIdx: int32 = ownershipNodes.len - 1
     ownIndexMapPut(void*(n), newIdx)
     ownershipLastNode = p
@@ -1273,30 +1358,30 @@ fn ownershipSetExprClass(n: Node, cls: OwnershipExprClass) =
     let idx: int32 = ownershipEnsure n
     if idx < 0:
         return
-    setPtr[int32](&ownershipExprClasses, idx, int32(cls))
+    ownWriteI32(&ownershipExprClasses, idx, int32(cls))
     if cls == oecBorrowed:
-        setPtr[int32](&ownershipMustRetain, idx, 1)
+        ownWriteI32(&ownershipMustRetain, idx, 1)
 
 fn ownershipExprClass(n: Node): OwnershipExprClass =
     let idx: int32 = ownershipIndex n
     if idx < 0:
         return oecUnknown
-    return OwnershipExprClass(get[int32](ownershipExprClasses, idx))
+    return OwnershipExprClass(ownReadI32(ownershipExprClasses, idx))
 
 fn ownershipSetMustRetain(n: Node, val: bool) =
     let idx: int32 = ownershipEnsure n
     if idx < 0:
         return
     if val:
-        setPtr[int32](&ownershipMustRetain, idx, 1)
+        ownWriteI32(&ownershipMustRetain, idx, 1)
     else:
-        setPtr[int32](&ownershipMustRetain, idx, 0)
+        ownWriteI32(&ownershipMustRetain, idx, 0)
 
 fn ownershipMustRetainFlag(n: Node): bool =
     let idx: int32 = ownershipIndex n
     if idx < 0:
         return false
-    return get[int32](ownershipMustRetain, idx) != 0
+    return ownReadI32(ownershipMustRetain, idx) != 0
 
 fn ownershipEscapePriority(esc: OwnershipEscapeClass): int32 =
     case esc
@@ -1309,15 +1394,15 @@ fn ownershipSetEscapeClass(n: Node, esc: OwnershipEscapeClass) =
     let idx: int32 = ownershipEnsure n
     if idx < 0:
         return
-    let cur: OwnershipEscapeClass = OwnershipEscapeClass(get[int32](ownershipEscapeClasses, idx))
+    let cur: OwnershipEscapeClass = OwnershipEscapeClass(ownReadI32(ownershipEscapeClasses, idx))
     if ownershipEscapePriority esc > ownershipEscapePriority cur:
-        setPtr[int32](&ownershipEscapeClasses, idx, int32(esc))
+        ownWriteI32(&ownershipEscapeClasses, idx, int32(esc))
 
 fn ownershipEscapeClass(n: Node): OwnershipEscapeClass =
     let idx: int32 = ownershipIndex n
     if idx < 0:
         return oescUnknown
-    return OwnershipEscapeClass(get[int32](ownershipEscapeClasses, idx))
+    return OwnershipEscapeClass(ownReadI32(ownershipEscapeClasses, idx))
 
 fn ownershipAddFlag(n: Node, flag: int32) =
     if n == nil:
@@ -1325,8 +1410,8 @@ fn ownershipAddFlag(n: Node, flag: int32) =
     let idx: int32 = ownershipEnsure n
     if idx < 0:
         return
-    let cur: int32 = get[int32](ownershipFlags, idx)
-    setPtr[int32](&ownershipFlags, idx, cur | flag)
+    let cur: int32 = ownReadI32(ownershipFlags, idx)
+    ownWriteI32(&ownershipFlags, idx, cur | flag)
 
 fn ownershipHasFlag(n: Node, flag: int32): bool =
     if n == nil:
@@ -1334,14 +1419,14 @@ fn ownershipHasFlag(n: Node, flag: int32): bool =
     let idx: int32 = ownershipIndex n
     if idx < 0:
         return false
-    let cur: int32 = get[int32](ownershipFlags, idx)
+    let cur: int32 = ownReadI32(ownershipFlags, idx)
     return (cur & flag) != 0
 
 fn ownershipSetMoveName(n: Node, name: str) =
     let idx: int32 = ownershipEnsure n
     if idx < 0:
         return
-    setPtr[str](&ownershipMoveNames, idx, name)
+    ownWriteStr(&ownershipMoveNames, idx, name)
 
 fn ownershipMoveName(n: Node): str =
     if ! ownershipEnabledFlag:
@@ -1352,7 +1437,7 @@ fn ownershipMoveName(n: Node): str =
     let idx: int32 = ownershipIndex id
     if idx < 0:
         return ""
-    return get[str](ownershipMoveNames, idx)
+    return ownReadStr(ownershipMoveNames, idx)
 
 fn ownershipIsMove(n: Node): bool =
     if ! ownershipEnabledFlag:
@@ -1368,10 +1453,6 @@ fn ownershipIsBorrowedCallName(name: str): bool =
     if name ==  "get":
         return true
     if hasPrefix(name, "get_"):
-        return true
-    if name ==  "getPtr":
-        return true
-    if hasPrefix(name, "getPtr_"):
         return true
     if name ==  "getPointer":
         return true
@@ -1451,16 +1532,16 @@ fn ownershipClassifyExpr(n: Node): OwnershipExprClass =
 
 fn ownScopePush() =
     let start: int32 = ownScopeNames.len
-    addPtr[int32](&ownScopeStarts, start)
+    add(ownScopeStarts, start)
 
 fn ownScopePop() =
     if ownScopeStarts.len <= 0:
         return
-    let start: int32 = get[int32](ownScopeStarts, ownScopeStarts.len - 1)
+    let start: int32 = ownReadI32(ownScopeStarts, ownScopeStarts.len - 1)
     ownScopeStarts.len = ownScopeStarts.len - 1
     while ownScopeNames.len > start:
         let lastIdx: int32 = ownScopeNames.len - 1
-        let name: str = get[str](ownScopeNames, lastIdx)
+        let name: str = ownReadStr(ownScopeNames, lastIdx)
         ownLocalMapDec name
         ownScopeNames.len = lastIdx
 
@@ -1475,7 +1556,7 @@ fn ownIsLocal(name: str): bool =
     let __for_start_i = ownScopeNames.len - 1
     for __for_rev_i in 0..(__for_start_i - (0)):
         let i = __for_start_i - __for_rev_i
-        if (get[str](ownScopeNames, i) ==  norm):
+        if (ownReadStr(ownScopeNames, i) ==  norm):
             return true
     return false
 
@@ -1484,7 +1565,7 @@ fn ownIsGlobal(name: str): bool =
     if len norm == 0:
         return false
     for i in 0..<ownGlobalNames.len:
-        if (get[str](ownGlobalNames, i) ==  norm):
+        if (ownReadStr(ownGlobalNames, i) ==  norm):
             return true
     return false
 
@@ -1492,7 +1573,7 @@ fn ownDefineLocal(name: str) =
     let norm: str = ownStripSpaces name
     if len norm == 0 || norm ==  "_":
         return
-    addPtr[str](&ownScopeNames, norm)
+    add(ownScopeNames, norm)
     ownLocalMapInc norm
 
 fn ownDefineGlobal(name: str) =
@@ -1500,15 +1581,15 @@ fn ownDefineGlobal(name: str) =
     if len norm == 0 || norm ==  "_":
         return
     for i in 0..<ownGlobalNames.len:
-        if (get[str](ownGlobalNames, i) ==  norm):
+        if (ownReadStr(ownGlobalNames, i) ==  norm):
             return
-    addPtr[str](&ownGlobalNames, norm)
+    add(ownGlobalNames, norm)
 
 fn ownDefineLValueNames(lhs: Node, isGlobal: bool) =
     var seenKeys: OwnSeenSet
     ownCollectLValueNames(lhs, &seenKeys)
     for i in 0..<seenKeys.list.len:
-        let nm: str = get[str](seenKeys.list, i)
+        let nm: str = ownReadStr(seenKeys.list, i)
         if nm != nil && len nm > 0:
             if isGlobal:
                 ownDefineGlobal nm
@@ -1522,7 +1603,7 @@ fn ownLValueHasGlobal(lhs: Node): bool =
     var seenKeys: OwnSeenSet
     ownCollectLValueNames(lhs, &seenKeys)
     for i in 0..<seenKeys.list.len:
-        let nm: str = get[str](seenKeys.list, i)
+        let nm: str = ownReadStr(seenKeys.list, i)
         if nm != nil && len nm > 0:
             if ! ownIsLocal nm:
                 ownSeenMapFree(&seenKeys)
@@ -1696,7 +1777,7 @@ fn ownershipAnalyze(root: Node) =
     if ! ownershipEnabledFlag:
         return
     ownDeepEnabled = ownershipDeepEnabledFromEnv()
-    let profOn: bool = streq(getEnv "CHENG_STAGE1_PROFILE", "1")
+    let profOn: bool = (getEnv "CHENG_STAGE1_PROFILE" == "1")
     ownProfOn = profOn
     if ownProfOn:
         ownProfCollectIdentNs = 0

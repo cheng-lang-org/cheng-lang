@@ -101,6 +101,36 @@ var monoFirstParamMatchKeys: str[]
 var monoFirstParamMatchNodes: ptr[]
 var monoFirstParamMatchIndex: hashmaps.HashMapStrInt
 
+fn add(dst: var int32[], val: int32) =
+    add[int32](dst, val)
+
+fn add(dst: int32[]*, val: int32) =
+    add[int32](dst, val)
+
+fn add(dst: var int8[], val: int8) =
+    add[int8](dst, val)
+
+fn add(dst: int8[]*, val: int8) =
+    add[int8](dst, val)
+
+fn add(dst: var str[], val: str) =
+    add[str](dst, val)
+
+fn add(dst: str[]*, val: str) =
+    add[str](dst, val)
+
+fn add(dst: var Node[], val: Node) =
+    add[Node](dst, val)
+
+fn add(dst: Node[]*, val: Node) =
+    add[Node](dst, val)
+
+fn add(dst: var Diagnostic[], val: Diagnostic) =
+    add[Diagnostic](dst, val)
+
+fn add(dst: Diagnostic[]*, val: Diagnostic) =
+    add[Diagnostic](dst, val)
+
 fn monoEnsureInitMaps() =
     # Avoid stage0 seed global-init codegen bugs by initializing maps lazily.
     if genericTypeIndex.mask == 0:
@@ -175,12 +205,26 @@ fn monoZeroHashMapStrInt(): hashmaps.HashMapStrInt =
 @importc("getenv")
 fn mono_getenv(name: cstring): str
 
+fn monoStrEq(a: str, b: str): bool =
+    if a == nil || b == nil:
+        return a == nil && b == nil
+    let n: int32 = len a
+    if n != len b:
+        return false
+    for i in 0..<n:
+        if a[i] != b[i]:
+            return false
+    return true
+
+fn monoStrNe(a: str, b: str): bool =
+    return !monoStrEq(a, b)
+
 fn monoProfileEnabled(): bool =
     let v0: str = mono_getenv("CHENG_STAGE1_MONO_PROFILE")
-    if streq(v0, "1"):
+    if monoStrEq(v0, "1"):
         return true
     let v1: str = mono_getenv("CHENG_STAGE1_PROFILE")
-    return streq(v1, "1")
+    return monoStrEq(v1, "1")
 
 fn monoProfResetKinds() =
     monoProfExprKindNs.len = 0
@@ -223,10 +267,14 @@ fn monoProfRecordExprKind(kind: NodeKind, deltaNs: int64) =
     let idx: int32 = int32(kind)
     if idx < 0 || idx >= monoProfExprKindNs.len:
         return
-    let prevNs: int64 = get[int64](monoProfExprKindNs, idx)
-    setPtr[int64](&monoProfExprKindNs, idx, prevNs + deltaNs)
-    let prevCalls: int32 = get[int32](monoProfExprKindCalls, idx)
-    setPtr[int32](&monoProfExprKindCalls, idx, prevCalls + 1)
+    var nsSeq: int64[] = monoProfExprKindNs
+    let prevNs: int64 = get(monoProfExprKindNs, idx)
+    nsSeq[idx] = prevNs + deltaNs
+    monoProfExprKindNs = nsSeq
+    var callsSeq: int32[] = monoProfExprKindCalls
+    let prevCalls: int32 = get(monoProfExprKindCalls, idx)
+    callsSeq[idx] = prevCalls + 1
+    monoProfExprKindCalls = callsSeq
 
 fn monoProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
     var top1Ns: int64 = 0
@@ -239,7 +287,7 @@ fn monoProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
     var top2Calls: int32 = 0
     var top3Calls: int32 = 0
     for i in 0..<nsSeq.len:
-        let v: int64 = get[int64](nsSeq, i)
+        let v: int64 = get(nsSeq, i)
         if v > top1Ns:
             top3Ns = top2Ns
             top3Idx = top2Idx
@@ -249,18 +297,18 @@ fn monoProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
             top2Calls = top1Calls
             top1Ns = v
             top1Idx = i
-            top1Calls = get[int32](callsSeq, i)
+            top1Calls = get(callsSeq, i)
         elif v > top2Ns:
             top3Ns = top2Ns
             top3Idx = top2Idx
             top3Calls = top2Calls
             top2Ns = v
             top2Idx = i
-            top2Calls = get[int32](callsSeq, i)
+            top2Calls = get(callsSeq, i)
         elif v > top3Ns:
             top3Ns = v
             top3Idx = i
-            top3Calls = get[int32](callsSeq, i)
+            top3Calls = get(callsSeq, i)
     if top1Ns <= 0:
         return ""
     var msg: str = label
@@ -280,16 +328,16 @@ fn genericFnHas(name: str): bool =
     if len name == 0:
         return false
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGetEx(genericFnIndex, name, &found)
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(genericFnIndex, name, found)
     return found && idx >= 0
 
 fn genericFnGet(name: str): Node =
     if len name == 0:
         return nil
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGetEx(genericFnIndex, name, &found)
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(genericFnIndex, name, found)
     if found && idx >= 0 && idx < genericFnNodes.len:
-        return Node(get[ptr](genericFnNodes, idx))
+        return Node(get(genericFnNodes, idx))
     return nil
 
 fn genericFnAdd(name: str, node: Node) =
@@ -321,10 +369,10 @@ fn monoGenericFnFirstParamIsSeq(fnNode: Node): bool =
         return false
     if ty.kind == nkBracketExpr && kidCount(ty) > 0:
         let base: str = monoStripSpaces(plainName(kid(ty, 0)))
-        return base == "seq" || base == "seq_fixed"
+        return monoStrEq(base, "seq") || monoStrEq(base, "seq_fixed")
     if ty.kind == nkIdent || ty.kind == nkSymbol:
         let key: str = monoStripSpaces(plainName(ty))
-        return key == "seq" || key == "seq_fixed" || monoStartsWith(key, "seq_") || monoStartsWith(key, "seq_fixed_")
+        return monoStrEq(key, "seq") || monoStrEq(key, "seq_fixed") || monoStartsWith(key, "seq_") || monoStartsWith(key, "seq_fixed_")
     return false
 
 
@@ -354,7 +402,7 @@ fn collectGenericDecls(n: Node) =
                     if len nm2 > 0:
                         if ! genericFnHas(nm2):
                             genericFnAdd(nm2, n)
-                        elif nm2 == "len":
+                        elif monoStrEq(nm2, "len"):
                             let prev: Node = genericFnGet(nm2)
                             if prev != nil && !monoGenericFnFirstParamIsSeq(prev) && monoGenericFnFirstParamIsSeq(n):
                                 genericFnAdd(nm2, n)
@@ -387,36 +435,36 @@ fn monoValueClear() =
     hashmaps.hashMapStrIntClear(&monoValueIndex)
 
 fn monoValueScopePush() =
-    addPtr[int32](&monoValueScopeStarts, monoValueNames.len)
+    add(monoValueScopeStarts, monoValueNames.len)
 
 fn monoValueScopePop() =
     if monoValueScopeStarts.len <= 0:
         return
-    let start: int32 = get[int32](monoValueScopeStarts, monoValueScopeStarts.len - 1)
+    let start: int32 = get(monoValueScopeStarts, monoValueScopeStarts.len - 1)
     monoValueScopeStarts.len = monoValueScopeStarts.len - 1
     let __for_start_i = monoValueNames.len - 1
     for __for_rev_i in 0..(__for_start_i - (start)):
         let i = __for_start_i - __for_rev_i
-        let nm: str = get[str](monoValueNames, i)
-        let prevIndexPlus1: int32 = get[int32](monoValuePrevIndexPlus1, i)
+        let nm: str = get(monoValueNames, i)
+        let prevIndexPlus1: int32 = get(monoValuePrevIndexPlus1, i)
         hashmaps.hashMapStrIntPut(&monoValueIndex, nm, prevIndexPlus1)
     monoValueNames.len = start
     monoValueTypes.len = start
     monoValuePrevIndexPlus1.len = start
 
 fn monoValueAdd(name: str, ty: Node) =
-    if name == nil || len name == 0 || name == "_":
+    if name == nil || len name == 0 || monoStrEq(name, "_"):
         return
     if ty == nil || ty.kind == nkEmpty:
         return
     var found: bool = false
-    let prevIndexPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoValueIndex, name, &found)
+    let prevIndexPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoValueIndex, name, found)
     if found:
-        addPtr[int32](&monoValuePrevIndexPlus1, prevIndexPlus1)
+        add(monoValuePrevIndexPlus1, prevIndexPlus1)
     else:
-        addPtr[int32](&monoValuePrevIndexPlus1, 0)
-    addPtr[str](&monoValueNames, name)
-    addPtr[Node](&monoValueTypes, ty)
+        add(monoValuePrevIndexPlus1, int32(0))
+    add(monoValueNames, name)
+    add(monoValueTypes, ty)
     let idx: int32 = monoValueNames.len - 1
     hashmaps.hashMapStrIntPut(&monoValueIndex, name, idx + 1)
 
@@ -424,13 +472,13 @@ fn monoValueLookup(name: str): Node =
     if name == nil || len name == 0:
         return nil
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoValueIndex, name, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoValueIndex, name, found)
     if ! found || idxPlus1 <= 0:
         return nil
     let idx: int32 = idxPlus1 - 1
     if idx < 0 || idx >= monoValueTypes.len:
         return nil
-    return get[Node](monoValueTypes, idx)
+    return get(monoValueTypes, idx)
 
 fn monoNormalizeType(ty: Node): Node =
     if ty == nil:
@@ -474,11 +522,11 @@ fn monoAddFieldType(owner: str, fieldName: str, typeNode: Node) =
         return
     let key: str = owner + "." + fieldName
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoFieldIndex, key, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoFieldIndex, key, found)
     if found && idxPlus1 > 0:
         return
-    addPtr[str](&monoFieldKeys, key)
-    addPtr[Node](&monoFieldTypes, typeNode)
+    add(monoFieldKeys, key)
+    add(monoFieldTypes, typeNode)
     let idx: int32 = monoFieldKeys.len - 1
     hashmaps.hashMapStrIntPut(&monoFieldIndex, key, idx + 1)
 
@@ -487,9 +535,9 @@ fn monoLookupFieldType(owner: str, fieldName: str): Node =
         return nil
     let key: str = owner + "." + fieldName
     var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoFieldIndex, key, &found)
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoFieldIndex, key, found)
     if found && idxPlus1 > 0 && idxPlus1 <= monoFieldTypes.len:
-        return get[Node](monoFieldTypes, idxPlus1 - 1)
+        return get(monoFieldTypes, idxPlus1 - 1)
     return nil
 
 fn monoTypeDeclObjectDef(def: Node): Node =
@@ -615,7 +663,7 @@ fn monoLookupExprType(n: Node): Node =
             let baseTy: Node = monoStripPtrRefVar(monoNormalizeType(baseTy0))
             if baseTy != nil && baseTy.kind == nkBracketExpr && kidCount baseTy > 1:
                 let baseName: str = monoStripSpaces(plainName(kid(baseTy, 0)))
-                if baseName == "seq" || baseName == "seq_fixed":
+                if monoStrEq(baseName, "seq") || monoStrEq(baseName, "seq_fixed"):
                     return monoNormalizeType(kid(baseTy, 1))
     if n.kind == nkCall && kidCount n > 0:
         let head: Node = kid(n, 0)
@@ -681,16 +729,16 @@ fn monoFnSetAdd(v: str[]*, name: str, index: hashmaps.HashMapStrInt* = nil) =
         return
     if index != nil:
         var found: bool = false
-        let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(*index, name, &found)
+        let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(*index, name, found)
         if found && idxPlus1 > 0:
             return
-        addPtr[str](v, name)
+        add(v, name)
         let idx: int32 = v->len - 1
         hashmaps.hashMapStrIntPut(index, name, idx + 1)
         return
     if monoSeqStrHas(*v, name):
         return
-    addPtr[str](v, name)
+    add(v, name)
 
 fn monoFnRetAdd(name: str, ty: Node) =
     if name == nil || len name == 0:
@@ -698,7 +746,7 @@ fn monoFnRetAdd(name: str, ty: Node) =
     if ty == nil || ty.kind == nkEmpty:
         return
     var found: bool = false
-    let prevIdx: int32 = hashmaps.hashMapStrIntGetEx(monoFnRetIndex, name, &found)
+    let prevIdx: int32 = hashmaps.hashMapStrIntGetEx(monoFnRetIndex, name, found)
     if found:
         if prevIdx >= 0:
             hashmaps.hashMapStrIntPut(&monoFnRetIndex, name, -1)
@@ -711,13 +759,13 @@ fn monoFnHasArity(name: str, arity: int32): bool =
     if arity == 0:
         if monoZeroArgFnIndex.mask != 0:
             var found: bool = false
-            let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoZeroArgFnIndex, name, &found)
+            let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoZeroArgFnIndex, name, found)
             return found && idxPlus1 > 0
         return monoSeqStrHas(monoZeroArgFnNames, name)
     if arity == 1:
         if monoOneArgFnIndex.mask != 0:
             var found: bool = false
-            let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoOneArgFnIndex, name, &found)
+            let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(monoOneArgFnIndex, name, found)
             return found && idxPlus1 > 0
         return monoSeqStrHas(monoOneArgFnNames, name)
     return false
@@ -727,8 +775,8 @@ fn monoFnParamAdd(name: str, ty: Node) =
         return
     if ty == nil || ty.kind == nkEmpty:
         return
-    addPtr[str](&monoOneArgFnParamNames, name)
-    addPtr[Node](&monoOneArgFnParamTypes, ty)
+    add(monoOneArgFnParamNames, name)
+    add(monoOneArgFnParamTypes, ty)
 
 fn monoStripVarType(ty: Node): Node =
     if ty != nil && ty.kind == nkVarTy && kidCount ty > 0:
@@ -865,25 +913,25 @@ fn monoDummyPos(): SourcePos =
     return pos
 
 fn monoIsBuiltinTypeKey(key: str): bool =
-    if key == "int" || key == "int8" || key == "int16" || key == "int32" || key == "int64":
+    if monoStrEq(key, "int") || monoStrEq(key, "int8") || monoStrEq(key, "int16") || monoStrEq(key, "int32") || monoStrEq(key, "int64"):
         return true
-    if key == "uint" || key == "uint8" || key == "uint16" || key == "uint32" || key == "uint64":
+    if monoStrEq(key, "uint") || monoStrEq(key, "uint8") || monoStrEq(key, "uint16") || monoStrEq(key, "uint32") || monoStrEq(key, "uint64"):
         return true
-    if key == "bool" || key == "char":
+    if monoStrEq(key, "bool") || monoStrEq(key, "char"):
         return true
-    if key == "float" || key == "float32" || key == "float64":
+    if monoStrEq(key, "float") || monoStrEq(key, "float32") || monoStrEq(key, "float64"):
         return true
-    if key == "str" || key == "cstring":
+    if monoStrEq(key, "str") || monoStrEq(key, "cstring"):
         return true
-    if key == "void":
+    if monoStrEq(key, "void"):
         return true
     return false
 
 fn monoIsValidTypeKey(key: str): bool =
-    if key == "":
+    if monoStrEq(key, ""):
         return false
     var found: bool = false
-    let cached: int32 = hashmaps.hashMapStrIntGetEx(monoTypeKeyValidIndex, key, &found)
+    let cached: int32 = hashmaps.hashMapStrIntGetEx(monoTypeKeyValidIndex, key, found)
     if found:
         return cached != 0
     var ok: bool = false
@@ -914,12 +962,12 @@ fn monoIsValidTypeKey(key: str): bool =
     return ok
 
 fn monoTypeNodeFromKey(key: str): Node =
-    if key == "":
+    if monoStrEq(key, ""):
         return nil
     var found: bool = false
-    let cachedIdx: int32 = hashmaps.hashMapStrIntGetEx(monoTypeNodeIndex, key, &found)
+    let cachedIdx: int32 = hashmaps.hashMapStrIntGetEx(monoTypeNodeIndex, key, found)
     if found && cachedIdx >= 0 && cachedIdx < monoTypeNodeValues.len:
-        return get[Node](monoTypeNodeValues, cachedIdx)
+        return get(monoTypeNodeValues, cachedIdx)
     let pos: SourcePos = monoDummyPos()
     var out: Node = nil
     if monoStartsWith(key, "ptr_"):
@@ -970,7 +1018,7 @@ fn monoTypeNodeFromKey(key: str): Node =
     else:
         out = newIdent(key, pos)
     if out != nil:
-        addPtr[Node](&monoTypeNodeValues, out)
+        add(monoTypeNodeValues, out)
         let outIdx: int32 = monoTypeNodeValues.len - 1
         hashmaps.hashMapStrIntPut(&monoTypeNodeIndex, key, outIdx)
     return out
@@ -1017,7 +1065,7 @@ fn monoMaybeInstantiateMangledFnName(n: Node, rootStmts: Node[]*) =
                             let arg0: Node = monoTypeNodeFromKey(rest)
                             if arg0 != nil:
                                 var args: Node[1]
-                                addPtr[Node](&args, arg0)
+                                add(args, arg0)
                                 instantiateFn(base, args, rootStmts)
         return
     for i in firstIdx..<nameLen:
@@ -1040,7 +1088,7 @@ fn monoMaybeInstantiateMangledFnName(n: Node, rootStmts: Node[]*) =
                                 let arg0: Node = monoTypeNodeFromKey(rest)
                                 if arg0 != nil:
                                     var args: Node[1]
-                                    addPtr[Node](&args, arg0)
+                                    add(args, arg0)
                                     instantiateFn(base, args, rootStmts)
 
 fn monoFnOneArgMatches(name: str, baseTy: Node): bool =
@@ -1049,8 +1097,8 @@ fn monoFnOneArgMatches(name: str, baseTy: Node): bool =
     let __for_start_i = monoOneArgFnParamNames.len - 1
     for __for_rev_i in 0..(__for_start_i - (0)):
         let i = __for_start_i - __for_rev_i
-        if get[str](monoOneArgFnParamNames, i) == name:
-            let paramTy: Node = get[Node](monoOneArgFnParamTypes, i)
+        if monoStrEq(get(monoOneArgFnParamNames, i), name):
+            let paramTy: Node = get(monoOneArgFnParamTypes, i)
             if monoTypeMatches(paramTy, baseTy):
                 return true
     return false
@@ -1087,7 +1135,7 @@ fn monoInferGenericArgsFromCall(fnNode: Node, callNode: Node, outArgs: Node[]*):
         if argNode != nil && argNode.kind == nkCallArg && kidCount argNode > 1:
             argNode = kid(argNode, 1)
         var actualTy: Node = monoLookupExprType argNode
-        let paramTy: Node = get[Node](paramTypes, paramIndex)
+        let paramTy: Node = get(paramTypes, paramIndex)
         if actualTy != nil && paramTy != nil:
             var actualAdj: Node = actualTy
             if actualAdj != nil && (actualAdj.kind == nkIdent || actualAdj.kind == nkSymbol):
@@ -1221,9 +1269,9 @@ fn monoCallHeadIsCharAt(head: Node): bool =
     if head == nil:
         return false
     if head.kind == nkIdent || head.kind == nkSymbol:
-        return streq(monoStripSpaces(plainName(head)), "charAt")
+        return monoStrEq(monoStripSpaces(plainName(head)), "charAt")
     if head.kind == nkDotExpr && kidCount(head) > 1:
-        return streq(monoStripSpaces(plainName(kid(head, 1))), "charAt")
+        return monoStrEq(monoStripSpaces(plainName(kid(head, 1))), "charAt")
     return false
 
 fn monoIsIntLitZero(n: Node): bool =
@@ -1233,7 +1281,7 @@ fn monoExprMentionsIdent(n: Node, name: str): bool =
     if n == nil || name == nil || len name == 0:
         return false
     if n.kind == nkIdent || n.kind == nkSymbol:
-        return monoStripSpaces(plainName(n)) == name
+        return monoStrEq(monoStripSpaces(plainName(n)), name)
     for i in 0..<kidCount n:
         if monoExprMentionsIdent(kid(n, i), name):
             return true
@@ -1262,7 +1310,7 @@ fn monoSeqElemTypeFromExpr(n: Node): Node =
     if ty.kind != nkBracketExpr:
         return nil
     let baseName: str = monoBracketBaseName ty
-    if baseName != "seq" && baseName != "seq_fixed":
+    if monoStrNe(baseName, "seq") && monoStrNe(baseName, "seq_fixed"):
         # Defensive fallback for old/new parser boundary shapes:
         # - `T[]` may surface as `nkBracketExpr(T)`
         # - `T[N]` may surface as `nkBracketExpr(T, N)`
@@ -1290,12 +1338,12 @@ fn monoMaybeLowerSeqLenCapAssign(stmt: Node, lhs: Node, rhs: Node, rootStmts: No
     if base == nil || member == nil:
         return nil
     let memberName: str = monoStripSpaces(plainName(member))
-    if memberName != "len" && memberName != "cap":
+    if monoStrNe(memberName, "len") && monoStrNe(memberName, "cap"):
         return nil
     # Keep `_` placeholder untouched when it appears as a direct base.
     if base.kind == nkIdent || base.kind == nkSymbol:
         let baseName: str = monoStripSpaces(plainName(base))
-        if baseName == nil || len baseName == 0 || baseName == "_":
+        if baseName == nil || len baseName == 0 || monoStrEq(baseName, "_"):
             return nil
         # Don't rewrite self-referential mutations like `xs.len = xs.len - 1`.
         if monoExprMentionsIdent(rhs, baseName):
@@ -1311,8 +1359,8 @@ fn monoMaybeLowerSeqLenCapAssign(stmt: Node, lhs: Node, rhs: Node, rootStmts: No
     if elemTy == nil || elemTy.kind == nkEmpty:
         return nil
     var instArgs: Node[1]
-    addPtr[Node](&instArgs, elemTy)
-    let calleeBase: str = if memberName == "len": "setLen" else: "reserve"
+    add(instArgs, elemTy)
+    let calleeBase: str = monoStrEq(memberName, "len") ? "setLen" : "reserve"
     instantiateFn(calleeBase, instArgs, rootStmts)
     let instName: str = instMapGetOrTrack(mangleInstance(calleeBase, instArgs))
     if instName == nil || len instName == 0:
@@ -1351,25 +1399,25 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
         if kidCount n > 0:
             var changedCall: bool = false
             var outKidsCall: Node[4]
-            addPtr[Node](&outKidsCall, kid(n, 0))
+            add(outKidsCall, kid(n, 0))
             for ci in 1..<kidCount n:
                 let oldArg: Node = kid(n, ci)
                 let newArg: Node = lowerImplicitCallsExpr(oldArg, rootStmts)
                 if newArg != oldArg:
                     changedCall = true
                 if newArg != nil:
-                    addPtr[Node](&outKidsCall, newArg)
+                    add(outKidsCall, newArg)
             if outKidsCall.len == 3 && monoCallHeadIsCharAt(kid(n, 0)):
                 var bracketCall: Node = newNode(nkCall, n.pos)
                 addSon(bracketCall, newIdent("[]", n.pos))
-                addSon(bracketCall, get[Node](outKidsCall, 1))
-                addSon(bracketCall, get[Node](outKidsCall, 2))
+                addSon(bracketCall, get(outKidsCall, 1))
+                addSon(bracketCall, get(outKidsCall, 2))
                 return bracketCall
             if ! changedCall:
                 return n
             var outCall: Node = cloneNodeShallow n
             for ck in 0..<outKidsCall.len:
-                addSon(outCall, get[Node](outKidsCall, ck))
+                addSon(outCall, get(outKidsCall, ck))
             return outCall
         return n
     of nkDotExpr:
@@ -1382,7 +1430,7 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
                 # `T[]`/`T[N]` container headers expose `.len`/`.cap` as structural
                 # fields. Do not rewrite them into UFCS-style calls (which can
                 # introduce missing symbol instantiations during bootstrap).
-                if memberName == "len" || memberName == "cap":
+                if monoStrEq(memberName, "len") || monoStrEq(memberName, "cap"):
                     let elemTy: Node = monoSeqElemTypeFromExpr base2
                     if elemTy != nil && elemTy.kind != nkEmpty:
                         if base2 != base:
@@ -1470,13 +1518,13 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
             if childL != oldChildL:
                 changedL = true
             if childL != nil:
-                addPtr[Node](&outKidsL, childL)
+                add(outKidsL, childL)
         monoValueScopePop()
         if ! changedL:
             return n
         var outL: Node = cloneNodeShallow n
         for lk in 0..<outKidsL.len:
-            addSon(outL, get[Node](outKidsL, lk))
+            addSon(outL, get(outKidsL, lk))
         return outL
     of nkComprehension:
         var changedC: bool = false
@@ -1489,12 +1537,12 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
             if childC != oldChildC:
                 changedC = true
             if childC != nil:
-                addPtr[Node](&outKidsC, childC)
+                add(outKidsC, childC)
         if ! changedC:
             return n
         var outC: Node = cloneNodeShallow n
         for ck in 0..<outKidsC.len:
-            addSon(outC, get[Node](outKidsC, ck))
+            addSon(outC, get(outKidsC, ck))
         return outC
     else:
         var changed: bool = false
@@ -1505,12 +1553,12 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
             if child != oldChild:
                 changed = true
             if child != nil:
-                addPtr[Node](&outKids, child)
+                add(outKids, child)
         if ! changed:
             return n
         var out: Node = cloneNodeShallow n
         for k in 0..<outKids.len:
-            addSon(out, get[Node](outKids, k))
+            addSon(out, get(outKids, k))
         return out
 
 fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
@@ -1527,13 +1575,13 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             if child != oldChild:
                 changed = true
             if child != nil:
-                addPtr[Node](&outKids, child)
+                add(outKids, child)
         monoValueScopePop()
         if ! changed:
             return n
         var out: Node = cloneNodeShallow n
         for k in 0..<outKids.len:
-            addSon(out, get[Node](outKids, k))
+            addSon(out, get(outKids, k))
         return out
     of nkFnDecl, nkIteratorDecl:
         monoValueScopePush()
@@ -1548,13 +1596,13 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
                 child2 = lowerImplicitCallsStmt(oldChild2, rootStmts)
             if child2 != oldChild2:
                 changed2 = true
-            addPtr[Node](&outKids2, child2)
+            add(outKids2, child2)
         monoValueScopePop()
         if ! changed2:
             return n
         var out2: Node = cloneNodeShallow n
         for k2 in 0..<outKids2.len:
-            addSon(out2, get[Node](outKids2, k2))
+            addSon(out2, get(outKids2, k2))
         return out2
     of nkVar, nkLet, nkConst:
         var nameNode: Node = nil
@@ -1635,20 +1683,20 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let body2: Node = lowerImplicitCallsStmt(body, rootStmts)
             if cond2 != cond || body2 != body:
                 changed3 = true
-            addPtr[Node](&outKids3, cond2)
-            addPtr[Node](&outKids3, body2)
+            add(outKids3, cond2)
+            add(outKids3, body2)
             i3 = i3 + 2
         if i3 < kidCount n:
             let tail: Node = kid(n, i3)
             let tail2: Node = lowerImplicitCallsStmt(tail, rootStmts)
             if tail2 != tail:
                 changed3 = true
-            addPtr[Node](&outKids3, tail2)
+            add(outKids3, tail2)
         if ! changed3:
             return n
         var out6: Node = cloneNodeShallow n
         for k3 in 0..<outKids3.len:
-            addSon(out6, get[Node](outKids3, k3))
+            addSon(out6, get(outKids3, k3))
         return out6
     of nkWhile:
         if kidCount n > 1:
@@ -1685,7 +1733,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let sel2: Node = lowerImplicitCallsExpr(sel, rootStmts)
             if sel2 != sel:
                 changed4 = true
-            addPtr[Node](&outKids4, sel2)
+            add(outKids4, sel2)
             ci = 1
         let __for_start_ci_1 = ci
         for __for_ci_1 in __for_start_ci_1..<kidCount n:
@@ -1694,13 +1742,13 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let br2: Node = lowerImplicitCallsStmt(br, rootStmts)
             if br2 != br:
                 changed4 = true
-            addPtr[Node](&outKids4, br2)
+            add(outKids4, br2)
             ci = ci + 1
         if ! changed4:
             return n
         var out9: Node = cloneNodeShallow n
         for k4 in 0..<outKids4.len:
-            addSon(out9, get[Node](outKids4, k4))
+            addSon(out9, get(outKids4, k4))
         return out9
     of nkOfBranch:
         var changed5: bool = false
@@ -1718,12 +1766,12 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
                 ch2 = lowerImplicitCallsStmt(ch, rootStmts)
             if ch2 != ch:
                 changed5 = true
-            addPtr[Node](&outKids5, ch2)
+            add(outKids5, ch2)
         if ! changed5:
             return n
         var out10: Node = cloneNodeShallow n
         for k5 in 0..<outKids5.len:
-            addSon(out10, get[Node](outKids5, k5))
+            addSon(out10, get(outKids5, k5))
         return out10
     of nkElse:
         if kidCount n > 0:
@@ -1766,8 +1814,8 @@ fn mapPutStrPtr(keys: str[]*, vals: ptr[]*, key: str, val: Node) =
     defer:
         if profOn:
             mapPutNs = mapPutNs + (cheng_monotime_ns() - startNs)
-    addPtr[str](keys, key)
-    addPtr[ptr](vals, void*(val))
+    add(keys, key)
+    add(vals, void*(val))
 
 fn mapPutStrPtrIndex(index: hashmaps.HashMapStrInt*, keys: str[]*, vals: ptr[]*, key: str, val: Node) =
     let profOn: bool = monoProfileActive
@@ -1778,8 +1826,8 @@ fn mapPutStrPtrIndex(index: hashmaps.HashMapStrInt*, keys: str[]*, vals: ptr[]*,
     defer:
         if profOn:
             mapPutNs = mapPutNs + (cheng_monotime_ns() - startNs)
-    addPtr[str](keys, key)
-    addPtr[ptr](vals, void*(val))
+    add(keys, key)
+    add(vals, void*(val))
     let idx: int32 = keys->len - 1
     hashmaps.hashMapStrIntPut(index, key, idx)
 
@@ -1793,8 +1841,8 @@ fn mapGetStrPtr(keys: str[], vals: ptr[], key: str): Node =
         if profOn:
             mapGetNs = mapGetNs + (cheng_monotime_ns() - startNs)
     for i in 0..<keys.len:
-        if (get[str](keys, i) ==  key):
-            return Node(get[ptr](vals, i))
+        if monoStrEq(get(keys, i), key):
+            return Node(get(vals, i))
     return nil
 
 fn mapGetStrPtrIndex(index: hashmaps.HashMapStrInt, vals: ptr[], key: str): Node =
@@ -1809,9 +1857,9 @@ fn mapGetStrPtrIndex(index: hashmaps.HashMapStrInt, vals: ptr[], key: str): Node
         if profOn:
             mapGetNs = mapGetNs + (cheng_monotime_ns() - startNs)
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGetEx(index, key, &found)
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(index, key, found)
     if found && idx >= 0 && idx < vals.len:
-        return Node(get[ptr](vals, idx))
+        return Node(get(vals, idx))
     return nil
 
 fn mapHasStrPtr(keys: str[], key: str): bool =
@@ -1824,7 +1872,7 @@ fn mapHasStrPtr(keys: str[], key: str): bool =
         if profOn:
             mapHasNs = mapHasNs + (cheng_monotime_ns() - startNs)
     for i in 0..<keys.len:
-        if (get[str](keys, i) ==  key):
+        if monoStrEq(get(keys, i), key):
             return true
     return false
 
@@ -1840,74 +1888,74 @@ fn mapHasStrPtrIndex(index: hashmaps.HashMapStrInt, key: str): bool =
         if profOn:
             mapHasNs = mapHasNs + (cheng_monotime_ns() - startNs)
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGetEx(index, key, &found)
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(index, key, found)
     return found && idx >= 0
 
 fn traitDispatchKey(selfTy: Node, methodName: str): str =
     let sk: str = typeKey selfTy
-    if sk == "" || methodName == "":
+    if monoStrEq(sk, "") || monoStrEq(methodName, ""):
         return ""
     return sk + "|" + methodName
 
 fn traitDispatchAdd(selfTy: Node, methodName: str, vtblName: str, initName: str, pos: SourcePos) =
     let key: str = traitDispatchKey(selfTy, methodName)
-    if key == "":
+    if monoStrEq(key, ""):
         return
     for i in 0..<traitDispatchKeys.len:
-        if get[str](traitDispatchKeys, i) == key:
-            let prev: str = get[str](traitDispatchVtableNames, i)
-            if prev != vtblName:
+        if monoStrEq(get(traitDispatchKeys, i), key):
+            let prev: str = get(traitDispatchVtableNames, i)
+            if monoStrNe(prev, vtblName):
                 addWhereDiag(pos, "trait dispatch conflict for " + methodName + ": " + prev + " vs " + vtblName)
             return
-    addPtr[str](&traitDispatchKeys, key)
-    addPtr[str](&traitDispatchVtableNames, vtblName)
-    addPtr[str](&traitDispatchInitNames, initName)
+    add(traitDispatchKeys, key)
+    add(traitDispatchVtableNames, vtblName)
+    add(traitDispatchInitNames, initName)
 
 fn traitDispatchLookup(selfTy: Node, methodName: str): int32 =
     let key: str = traitDispatchKey(selfTy, methodName)
-    if key == "":
+    if monoStrEq(key, ""):
         return -1
     for i in 0..<traitDispatchKeys.len:
-        if get[str](traitDispatchKeys, i) == key:
+        if monoStrEq(get(traitDispatchKeys, i), key):
             return i
     return -1
 
 fn traitVtableKey(traitName: str, selfTy: Node, traitArgs: Node[]): str =
-    if traitName == "":
+    if monoStrEq(traitName, ""):
         return ""
     var key: str = traitName + "|" + typeKey selfTy
     for i in 0..<traitArgs.len:
-        let part: str = typeKey get[Node](traitArgs, i)
-        if part != "":
+        let part: str = typeKey get(traitArgs, i)
+        if monoStrNe(part, ""):
             key = key + "|" + part
     return key
 
 fn traitVtableName(traitName: str, selfTy: Node, traitArgs: Node[]): str =
     var out: str = traitName + "__vtbl"
     let sk: str = typeKey selfTy
-    if sk != "":
+    if monoStrNe(sk, ""):
         out = out + "_" + sk
     for i in 0..<traitArgs.len:
-        let part: str = typeKey get[Node](traitArgs, i)
-        if part != "":
+        let part: str = typeKey get(traitArgs, i)
+        if monoStrNe(part, ""):
             out = out + "_" + part
     return out
 
 fn traitVtableInitName(vtblName: str): str =
-    if vtblName == "":
+    if monoStrEq(vtblName, ""):
         return ""
     return vtblName + "__init"
 
 fn monoSeqStrHas(v: str[], key: str): bool =
     for i in 0..<v.len:
-        if (get[str](v, i) ==  key):
+        if monoStrEq(get(v, i), key):
             return true
     return false
 
 fn monoSeqStrHasIndexed(v: str[], index: hashmaps.HashMapStrInt*, key: str): bool =
     if index != nil && index->mask != 0:
         var found: bool = false
-        let pos: int32 = hashmaps.hashMapStrIntGetEx(*index, key, &found)
+        let pos: int32 = hashmaps.hashMapStrIntGetEx(*index, key, found)
         if found && pos >= 0 && pos < v.len:
             return true
         return false
@@ -1916,7 +1964,7 @@ fn monoSeqStrHasIndexed(v: str[], index: hashmaps.HashMapStrInt*, key: str): boo
 fn monoSeqStrAdd(v: str[]*, key: str) =
     if monoSeqStrHas(*v, key):
         return
-    addPtr[str](v, key)
+    add(v, key)
 
 fn instHash64(s: str): uint64 =
     var h: uint64 =(uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
@@ -1973,10 +2021,10 @@ fn instMapHas(key: str): bool =
     let mask: uint64 = uint64(instMapKeys.cap) - 1
     var idx: uint64 = instHash64 key & mask
     while true:
-        let slot: str = get[str](instMapKeys, int32(idx))
+        let slot: str = get(instMapKeys, int32(idx))
         if slot == nil:
             return false
-        if streq(slot, key):
+        if monoStrEq(slot, key):
             return true
         idx =(idx + 1) & mask
 
@@ -1988,10 +2036,10 @@ fn instMapGet(key: str): str =
     let mask: uint64 = uint64(instMapKeys.cap) - 1
     var idx: uint64 = instHash64 key & mask
     while true:
-        let slot: str = get[str](instMapKeys, int32(idx))
+        let slot: str = get(instMapKeys, int32(idx))
         if slot == nil:
             return nil
-        if streq(slot, key):
+        if monoStrEq(slot, key):
             return slot
         idx =(idx + 1) & mask
 
@@ -2011,19 +2059,19 @@ fn instMapAdd(key: str) =
         let oldKeys: str[] = instMapKeys
         instMapInit(instMapKeys.cap * 2)
         for i in 0..<oldKeys.len:
-            let k: str = get[str](oldKeys, i)
+            let k: str = get(oldKeys, i)
             if k != nil:
                 instMapAdd k
         return
     let mask: uint64 = uint64(instMapKeys.cap) - 1
     var idx: uint64 = instHash64 key & mask
     while true:
-        let slot: str = get[str](instMapKeys, int32(idx))
+        let slot: str = get(instMapKeys, int32(idx))
         if slot == nil:
             instMapSet(int32(idx), key)
             instMapCount = instMapCount + 1
             return
-        if streq(slot, key):
+        if monoStrEq(slot, key):
             return
         idx =(idx + 1) & mask
 
@@ -2033,7 +2081,7 @@ fn monoStripSpaces(s: str): str =
     var cached: bool = false
     let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoStripIndex, void*(s), &cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoStripValues.len:
-        return get[str](monoStripValues, cachedIdx - 1)
+        return get(monoStripValues, cachedIdx - 1)
     let profOn: bool = monoProfileActive
     var startNs: int64 = 0
     if profOn:
@@ -2046,7 +2094,7 @@ fn monoStripSpaces(s: str): str =
     if n <= 0:
         let emptyRes: str = ""
         trackLexString void*(emptyRes)
-        addPtr[str](&monoStripValues, emptyRes)
+        add(monoStripValues, emptyRes)
         let storedIdx: int32 = monoStripValues.len
         hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx)
         return emptyRes
@@ -2063,13 +2111,13 @@ fn monoStripSpaces(s: str): str =
     if b < a:
         let emptyRes2: str = ""
         trackLexString void*(emptyRes2)
-        addPtr[str](&monoStripValues, emptyRes2)
+        add(monoStripValues, emptyRes2)
         let storedIdx2: int32 = monoStripValues.len
         hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx2)
         return emptyRes2
     if a == 0 && b == n - 1:
         trackLexString void*(s)
-        addPtr[str](&monoStripValues, s)
+        add(monoStripValues, s)
         let storedIdx3: int32 = monoStripValues.len
         hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx3)
         return s
@@ -2080,7 +2128,7 @@ fn monoStripSpaces(s: str): str =
     setMem(ptr_add(p, count), 0, 1)
     let res: str = str(p)
     trackLexString p
-    addPtr[str](&monoStripValues, res)
+    add(monoStripValues, res)
     let storedIdx4: int32 = monoStripValues.len
     hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx4)
     return res
@@ -2106,9 +2154,9 @@ fn lambdaDeclKind(lam: Node): NodeKind =
     if lam == nil:
         return nkFnDecl
     let kw: str = monoStripSpaces lam.ident
-    if (kw ==  "iterator"):
+    if monoStrEq(kw, "iterator"):
         return nkIteratorDecl
-    if (kw ==  "fn"):
+    if monoStrEq(kw, "fn"):
         return nkFnDecl
     return nkFnDecl
 
@@ -2184,7 +2232,7 @@ fn monoLambdaHasCapture(lam: Node): bool =
     var cached: bool = false
     let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoLambdaCaptureIndex, void*(lam), &cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoLambdaCaptureValues.len:
-        return get[int8](monoLambdaCaptureValues, cachedIdx - 1) != 0
+        return get(monoLambdaCaptureValues, cachedIdx - 1) != 0
     var locals: str[8]
     monoCollectLambdaLocals(lam, &locals)
     var found: bool = false
@@ -2200,7 +2248,7 @@ fn monoLambdaHasCapture(lam: Node): bool =
     var capVal: int8 = 0
     if found:
         capVal = 1
-    addPtr[int8](&monoLambdaCaptureValues, capVal)
+    add(monoLambdaCaptureValues, capVal)
     let storedIdx: int32 = monoLambdaCaptureValues.len
     hashmaps.hashMapPtrIntPut(&monoLambdaCaptureIndex, void*(lam), storedIdx)
     return found
@@ -2214,7 +2262,7 @@ fn addWhereDiag(pos: SourcePos, msg: str) =
     d.line = pos.line
     d.col = pos.col
     d.message = msg
-    addPtr[Diagnostic](currentDiags, d)
+    add(currentDiags, d)
 
 fn collectGenericParamNames(generics: Node, outNames: str[]*) =
     if generics == nil || generics.kind != nkGenericParams:
@@ -2224,7 +2272,7 @@ fn collectGenericParamNames(generics: Node, outNames: str[]*) =
         if defn != nil && defn.kind == nkIdentDefs && kidCount defn > 0:
             let nm: str = monoStripSpaces(plainName(kid(defn, 0)))
             if len nm > 0:
-                addPtr[str](outNames, nm)
+                add(outNames, nm)
 
 fn monoBuildIndex(names: str[], outIndex: hashmaps.HashMapStrInt*): hashmaps.HashMapStrInt* =
     if outIndex == nil:
@@ -2237,12 +2285,12 @@ fn monoBuildIndex(names: str[], outIndex: hashmaps.HashMapStrInt*): hashmaps.Has
 fn mapGetStrNode(keys: str[], vals: Node[], key: str, index: hashmaps.HashMapStrInt* = nil): Node =
     if index != nil && index->mask != 0:
         var found: bool = false
-        let pos: int32 = hashmaps.hashMapStrIntGetEx(*index, key, &found)
+        let pos: int32 = hashmaps.hashMapStrIntGetEx(*index, key, found)
         if found && pos >= 0 && pos < vals.len:
-            return get[Node](vals, pos)
+            return get(vals, pos)
     for i in 0..<keys.len:
-        if (get[str](keys, i) ==  key):
-            return get[Node](vals, i)
+        if monoStrEq(get(keys, i), key):
+            return get(vals, i)
     return nil
 
 fn bindTypeVars(genericTy: Node, actualTy: Node, paramNames: str[], outNames: str[]*, outTypes: Node[]*) =
@@ -2260,8 +2308,8 @@ fn bindTypeVars(genericTy: Node, actualTy: Node, paramNames: str[], outNames: st
         let nm: str = monoStripSpaces(plainName(genericTy))
         if len nm > 0 && monoSeqStrHas(paramNames, nm):
             if ! monoSeqStrHas(*outNames, nm):
-                addPtr[str](outNames, nm)
-                addPtr[Node](outTypes, actualTy)
+                add(outNames, nm)
+                add(outTypes, actualTy)
             return
     if genericTy.kind == nkBracketExpr && actualTy.kind == nkBracketExpr:
         for i in 0..<kidCount genericTy:
@@ -2315,7 +2363,7 @@ fn buildTypeArgsFromMap(generics: Node, mapNames: str[], mapTypes: Node[], outAr
                 if defaultVal != nil && defaultVal.kind != nkEmpty:
                     mapped = replaceTypeVars(defaultVal, mapNames, mapTypes, idx)
             if mapped != nil:
-                addPtr[Node](outArgs, mapped)
+                add(outArgs, mapped)
             else:
                 ok = false
     return ok
@@ -2437,11 +2485,11 @@ fn typeKeyCore(n: Node): str =
                     if d != nil && d.kind == nkIdentDefs && kidCount d > 1:
                         let k: str = typeKey kid(d, 1)
                         if len k > 0:
-                            addPtr[str](&parts, k)
+                            add(parts, k)
         var sig: str = "fn"
         for pi in 0..<parts.len:
             sig = sig + "_"
-            sig = sig + get[str](parts, pi)
+            sig = sig + get(parts, pi)
         if kidCount n > 1:
             let retKey: str = typeKey kid(n, 1)
             if len retKey > 0:
@@ -2453,11 +2501,11 @@ fn typeKeyCore(n: Node): str =
         for i2 in 0..<kidCount n:
             let k2: str = typeKey kid(n, i2)
             if len k2 > 0:
-                addPtr[str](&parts2, k2)
+                add(parts2, k2)
         var out2: str = "tuple"
         for j2 in 0..<parts2.len:
             out2 = out2 + "_"
-            out2 = out2 + get[str](parts2, j2)
+            out2 = out2 + get(parts2, j2)
         return out2
     of nkBracketExpr:
         if kidCount n > 0:
@@ -2465,7 +2513,7 @@ fn typeKeyCore(n: Node): str =
             var baseKey: str = typeKey base
             # `seq_fixed[T, N]` is treated as `seq[T]` for type identity.
             # The `N` parameter is an initialization hint (reserve cap), not a distinct type.
-            if baseKey == "seq_fixed":
+            if monoStrEq(baseKey, "seq_fixed"):
                 baseKey = "seq"
                 if kidCount n > 1:
                     let elemKey: str = typeKey kid(n, 1)
@@ -2476,11 +2524,11 @@ fn typeKeyCore(n: Node): str =
             for i3 in 1..<kidCount n:
                 let k3: str = typeKey kid(n, i3)
                 if len k3 > 0:
-                    addPtr[str](&parts3, k3)
+                    add(parts3, k3)
             var out3: str = baseKey
             for j3 in 0..<parts3.len:
                 out3 = out3 + "_"
-                out3 = out3 + get[str](parts3, j3)
+                out3 = out3 + get(parts3, j3)
             return out3
     else:
         if len n.ident > 0:
@@ -2494,10 +2542,10 @@ fn typeKey(n: Node): str =
     var cached: bool = false
     let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoTypeKeyIndex, void*(n), &cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoTypeKeyValues.len:
-        return get[str](monoTypeKeyValues, cachedIdx - 1)
+        return get(monoTypeKeyValues, cachedIdx - 1)
     let res: str = typeKeyCore(n)
     trackLexString void*(res)
-    addPtr[str](&monoTypeKeyValues, res)
+    add(monoTypeKeyValues, res)
     let storedIdx: int32 = monoTypeKeyValues.len
     hashmaps.hashMapPtrIntPut(&monoTypeKeyIndex, void*(n), storedIdx)
     return res
@@ -2522,7 +2570,7 @@ fn constraintArgs(n: Node, mapNames: str[], mapTypes: Node[], outArgs: Node[]*, 
         for i in 1..<kidCount n:
             let raw: Node = kid(n, i)
             let resolved: Node = replaceTypeVars(raw, mapNames, mapTypes, idx)
-            addPtr[Node](outArgs, resolved)
+            add(outArgs, resolved)
 
 fn traitBodyNode(traitNode: Node): Node =
     if traitNode != nil && kidCount traitNode > 2:
@@ -2541,7 +2589,7 @@ fn collectTraitMethods(traitNode: Node, out: Node[]*) =
     for i in 0..<kidCount body:
         let n: Node = kid(body, i)
         if n != nil && (n.kind == nkFnDecl || n.kind == nkIteratorDecl):
-            addPtr[Node](out, n)
+            add(out, n)
 
 fn fnParamTypes(fnNode: Node, out: Node[]*) =
     if fnNode == nil || kidCount fnNode < 2:
@@ -2553,7 +2601,7 @@ fn fnParamTypes(fnNode: Node, out: Node[]*) =
         let defs: Node = kid(params, i)
         if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
             let ty: Node = kid(defs, 1)
-            addPtr[Node](out, ty)
+            add(out, ty)
 
 fn fnSigMatches(fnNode: Node, expParams: Node[], expRet: Node): bool =
     if fnNode == nil:
@@ -2563,9 +2611,9 @@ fn fnSigMatches(fnNode: Node, expParams: Node[], expRet: Node): bool =
     if params.len != expParams.len:
         return false
     for i in 0..<expParams.len:
-        let a: str = typeKey(monoNormalizeType(get[Node](params, i)))
-        let b: str = typeKey(monoNormalizeType(get[Node](expParams, i)))
-        if a == "" || b == "" || a != b:
+        let a: str = typeKey(monoNormalizeType(get(params, i)))
+        let b: str = typeKey(monoNormalizeType(get(expParams, i)))
+        if monoStrEq(a, "") || monoStrEq(b, "") || monoStrNe(a, b):
             return false
     var retNode: Node = newNode(nkEmpty, fnNode.pos)
     if kidCount fnNode > 2:
@@ -2574,14 +2622,14 @@ fn fnSigMatches(fnNode: Node, expParams: Node[], expRet: Node): bool =
         return retNode == nil || retNode.kind == nkEmpty
     let rk: str = typeKey(monoNormalizeType(retNode))
     let ek: str = typeKey(monoNormalizeType(expRet))
-    return rk != "" && rk == ek
+    return monoStrNe(rk, "") && monoStrEq(rk, ek)
 
 fn findFnImplIn(n: Node, name: str, expParams: Node[], expRet: Node): Node =
     if n == nil:
         return nil
     if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
         let nameNode: Node = kid(n, 0)
-        if nameNode != nil && monoStripSpaces(plainName(nameNode)) == name:
+        if nameNode != nil && monoStrEq(monoStripSpaces(plainName(nameNode)), name):
             if fnSigMatches(n, expParams, expRet):
                 return n
     for i in 0..<kidCount n:
@@ -2596,7 +2644,7 @@ fn findFnImpl(name: str, expParams: Node[], expRet: Node, rootStmts: Node[]*): N
         return found
     if rootStmts != nil:
         for i in 0..<rootStmts->len:
-            let n: Node = get[Node](*rootStmts, i)
+            let n: Node = get(*rootStmts, i)
             let found2: Node = findFnImplIn(n, name, expParams, expRet)
             if found2 != nil:
                 return found2
@@ -2607,7 +2655,7 @@ fn monoFindFnByFirstParamMatchIn(n: Node, name: str, baseTy: Node, paramCount: i
         return nil
     if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
         let nameNode: Node = kid(n, 0)
-        if nameNode != nil && monoStripSpaces(plainName(nameNode)) == name:
+        if nameNode != nil && monoStrEq(monoStripSpaces(plainName(nameNode)), name):
             var gens: Node = nil
             if kidCount n > 4:
                 gens = kid(n, 4)
@@ -2628,17 +2676,17 @@ fn monoFirstParamMatchCacheKey(name: str, baseTy: Node, paramCount: int32): str 
     if name == nil || len name == 0:
         return ""
     let tk: str = typeKey(monoNormalizeType(baseTy))
-    if tk == "":
+    if monoStrEq(tk, ""):
         return ""
     return name + "|" + tk + "|" + intToStr(int64(paramCount))
 
 fn monoFindFnByFirstParamMatch(name: str, baseTy: Node, paramCount: int32, rootStmts: Node[]*): Node =
     let cacheKey: str = monoFirstParamMatchCacheKey(name, baseTy, paramCount)
-    if cacheKey != "":
+    if monoStrNe(cacheKey, ""):
         var cached: bool = false
-        let cachedIdx: int32 = hashmaps.hashMapStrIntGetEx(monoFirstParamMatchIndex, cacheKey, &cached)
+        let cachedIdx: int32 = hashmaps.hashMapStrIntGetEx(monoFirstParamMatchIndex, cacheKey, cached)
         if cached && cachedIdx >= 0 && cachedIdx < monoFirstParamMatchNodes.len:
-            let cachedNode: Node = Node(get[ptr](monoFirstParamMatchNodes, cachedIdx))
+            let cachedNode: Node = Node(get(monoFirstParamMatchNodes, cachedIdx))
             if cachedNode != nil:
                 return cachedNode
         else:
@@ -2653,7 +2701,7 @@ fn monoFindFnByFirstParamMatch(name: str, baseTy: Node, paramCount: int32, rootS
             return found
     if rootStmts != nil:
         for i in 0..<rootStmts->len:
-            let n: Node = get[Node](*rootStmts, i)
+            let n: Node = get(*rootStmts, i)
             let found2: Node = monoFindFnByFirstParamMatchIn(n, name, baseTy, paramCount)
             if found2 != nil:
                 return found2
@@ -2690,38 +2738,38 @@ fn traitMethodFnType(methodNode: Node, substNames: str[], substTypes: Node[], su
 
 fn ensureTraitVtable(traitNode: Node, traitName: str, selfTy: Node, traitArgs: Node[], rootStmts: Node[]*): str =
     let key: str = traitVtableKey(traitName, selfTy, traitArgs)
-    if key == "":
+    if monoStrEq(key, ""):
         return ""
     for i in 0..<traitVtableKeys.len:
-        if get[str](traitVtableKeys, i) == key:
-            return get[str](traitVtableNames, i)
+        if monoStrEq(get(traitVtableKeys, i), key):
+            return get(traitVtableNames, i)
     let vtblName: str = traitVtableName(traitName, selfTy, traitArgs)
     let initName: str = traitVtableInitName(vtblName)
-    addPtr[str](&traitVtableKeys, key)
-    addPtr[str](&traitVtableNames, vtblName)
-    addPtr[str](&traitVtableInitNames, initName)
+    add(traitVtableKeys, key)
+    add(traitVtableNames, vtblName)
+    add(traitVtableInitNames, initName)
     if rootStmts == nil:
         return vtblName
     var methodDecls: Node[4]
     collectTraitMethods(traitNode, &methodDecls)
     var substNames: str[4]
     var substTypes: Node[4]
-    addPtr[str](&substNames, "Self")
-    addPtr[Node](&substTypes, selfTy)
+    add(substNames, "Self")
+    add(substTypes, selfTy)
     var genNames: str[4]
     collectGenericParamNames(traitGenericsNode(traitNode), &genNames)
     for gi in 0..<genNames.len:
         if ! (gi < traitArgs.len):
             break
-        addPtr[str](&substNames, get[str](genNames, gi))
-        addPtr[Node](&substTypes, get[Node](traitArgs, gi))
+        add(substNames, get(genNames, gi))
+        add(substTypes, get(traitArgs, gi))
     var substIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     let substIdx: hashmaps.HashMapStrInt* = monoBuildIndex(substNames, &substIndex)
     var recList: Node = newNode(nkRecList, traitNode.pos)
     for mi in 0..<methodDecls.len:
-        let m: Node = get[Node](methodDecls, mi)
+        let m: Node = get(methodDecls, mi)
         let mname: str = monoStripSpaces(plainName(kid(m, 0)))
-        if mname != "":
+        if monoStrNe(mname, ""):
             var defs: Node = newNode(nkIdentDefs, m.pos)
             addSon(defs, newIdent(mname, m.pos))
             addSon(defs, traitMethodFnType(m, substNames, substTypes, substIdx))
@@ -2737,7 +2785,7 @@ fn ensureTraitVtable(traitNode: Node, traitName: str, selfTy: Node, traitArgs: N
     addSon(decl, newNode(nkEmpty, traitNode.pos))
     addSon(decl, newNode(nkEmpty, traitNode.pos))
     addSon(decl, newNode(nkEmpty, traitNode.pos))
-    addPtr[Node](rootStmts, decl)
+    add(rootStmts, decl)
     var initFn: Node = newNode(nkFnDecl, traitNode.pos)
     nodeSetStrVal(initFn, traitNode.strVal)
     addSon(initFn, newIdent(initName, traitNode.pos))
@@ -2756,9 +2804,9 @@ fn ensureTraitVtable(traitNode: Node, traitName: str, selfTy: Node, traitArgs: N
     addSon(vdecl, newNode(nkEmpty, traitNode.pos))
     addSon(body, vdecl)
     for mi2 in 0..<methodDecls.len:
-        let m2: Node = get[Node](methodDecls, mi2)
+        let m2: Node = get(methodDecls, mi2)
         let mname2: str = monoStripSpaces(plainName(kid(m2, 0)))
-        if mname2 != "":
+        if monoStrNe(mname2, ""):
             var asg: Node = newNode(nkAsgn, m2.pos)
             var lhs: Node = newNode(nkDotExpr, m2.pos)
             addSon(lhs, newIdent(varName, m2.pos))
@@ -2772,7 +2820,7 @@ fn ensureTraitVtable(traitNode: Node, traitName: str, selfTy: Node, traitArgs: N
     addSon(initFn, body)
     addSon(initFn, newNode(nkEmpty, traitNode.pos))
     addSon(initFn, newNode(nkEmpty, traitNode.pos))
-    addPtr[Node](rootStmts, initFn)
+    add(rootStmts, initFn)
     return vtblName
 
 fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], rootStmts: Node[]*, mapIndex: hashmaps.HashMapStrInt* = nil) =
@@ -2788,7 +2836,7 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
             let nameNode: Node = kid(defn, 0)
             let paramName: str = monoStripSpaces(plainName(nameNode))
             let constraint: Node = kid(defn, 1)
-            if paramName != "" && constraint != nil && constraint.kind != nkEmpty:
+            if monoStrNe(paramName, "") && constraint != nil && constraint.kind != nkEmpty:
                 let actualTy: Node = mapGetStrNode(mapNames, mapTypes, paramName, idx)
                 if actualTy != nil:
                     let baseName: str = constraintBaseName(constraint)
@@ -2817,21 +2865,21 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
                         collectTraitMethods(traitNode, &methodDecls)
                         var substNames: str[4]
                         var substTypes: Node[4]
-                        addPtr[str](&substNames, "Self")
-                        addPtr[Node](&substTypes, actualTy)
+                        add(substNames, "Self")
+                        add(substTypes, actualTy)
                         var genNames: str[4]
                         collectGenericParamNames(genNode, &genNames)
                         for gi in 0..<genNames.len:
                             if ! (gi < fullArgs.len):
                                 break
-                            addPtr[str](&substNames, get[str](genNames, gi))
-                            addPtr[Node](&substTypes, get[Node](fullArgs, gi))
+                            add(substNames, get(genNames, gi))
+                            add(substTypes, get(fullArgs, gi))
                         var substIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
                         let substIdx: hashmaps.HashMapStrInt* = monoBuildIndex(substNames, &substIndex)
                         for mi in 0..<methodDecls.len:
-                            let m: Node = get[Node](methodDecls, mi)
+                            let m: Node = get(methodDecls, mi)
                             let mname: str = monoStripSpaces(plainName(kid(m, 0)))
-                            if mname != "":
+                            if monoStrNe(mname, ""):
                                 var expParams: Node[4]
                                 if kidCount m > 1:
                                     let params: Node = kid(m, 1)
@@ -2840,7 +2888,7 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
                                             let defs: Node = kid(params, pi)
                                             if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
                                                 let tyNode: Node = replaceTypeVars(kid(defs, 1), substNames, substTypes, substIdx)
-                                                addPtr[Node](&expParams, tyNode)
+                                                add(expParams, tyNode)
                                 var expRet: Node = newNode(nkEmpty, m.pos)
                                 if kidCount m > 2:
                                     expRet = replaceTypeVars(kid(m, 2), substNames, substTypes, substIdx)
@@ -2857,24 +2905,24 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
 
 fn mangleInstance(name: str, typeArgs: Node[]): str =
     var base: str = name
-    if (base ==  "[]"):
+    if monoStrEq(base, "[]"):
         base = "bracket"
-    elif (base ==  "[]="):
+    elif monoStrEq(base, "[]="):
         base = "bracketEq"
-    elif (base ==  ".."):
+    elif monoStrEq(base, ".."):
         base = "dotdot"
-    elif (base ==  "..<"):
+    elif monoStrEq(base, "..<"):
         base = "dotdotless"
-    elif (base ==  "=>"):
+    elif monoStrEq(base, "=>"):
         base = "arrow"
-    elif (base ==  "."):
+    elif monoStrEq(base, "."):
         base = "dot"
     var keys: str[4]
     var total: int32 = len base
     for i in 0..<typeArgs.len:
-        let key: str = typeKey get[Node](typeArgs, i)
+        let key: str = typeKey get(typeArgs, i)
         if len key > 0:
-            addPtr[str](&keys, key)
+            add(keys, key)
             total = total + 1 + len key
     if keys.len == 0:
         return base
@@ -2884,7 +2932,7 @@ fn mangleInstance(name: str, typeArgs: Node[]): str =
     for j in 0..<keys.len:
         setMem(ptr_add(p, off), int32('_'), 1)
         off = off + 1
-        let k: str = get[str](keys, j)
+        let k: str = get(keys, j)
         let kn: int32 = len k
         if kn > 0:
             copyMem(ptr_add(p, off), void*(k), kn)
@@ -2910,7 +2958,7 @@ fn inferLitType(n: Node): Node =
         return newIdent("str", n.pos)
     of nkIdent, nkSymbol:
         let nm: str = monoStripSpaces n.ident
-        if (nm ==  "true") || (nm ==  "false"):
+        if monoStrEq(nm, "true") || monoStrEq(nm, "false"):
             return newIdent("bool", n.pos)
         return nil
     of nkCallArg:
@@ -2939,13 +2987,13 @@ fn replaceTypeVars(n: Node, names: str[], types: Node[], index: hashmaps.HashMap
         let nm: str = monoStripSpaces n.ident
         if index != nil && index->mask != 0:
             var found: bool = false
-            let pos: int32 = hashmaps.hashMapStrIntGetEx(*index, nm, &found)
+            let pos: int32 = hashmaps.hashMapStrIntGetEx(*index, nm, found)
             if found && pos >= 0 && pos < types.len:
-                return cloneTree get[Node](types, pos)
+                return cloneTree get(types, pos)
         else:
             for i in 0..<names.len:
-                if (get[str](names, i) ==  nm):
-                    return cloneTree get[Node](types, i)
+                if monoStrEq(get(names, i), nm):
+                    return cloneTree get(types, i)
         return n
     let kc: int32 = kidCount n
     if kc <= 0:
@@ -2961,9 +3009,9 @@ fn replaceTypeVars(n: Node, names: str[], types: Node[], index: hashmaps.HashMap
             for back in 0..<j:
                 let prev: Node = kid(n, back)
                 if prev != nil:
-                    addPtr[Node](&outKids, prev)
+                    add(outKids, prev)
         if changed && child != nil:
-            addPtr[Node](&outKids, child)
+            add(outKids, child)
     if ! changed:
         return n
     var out: Node = newNode(n.kind, n.pos)
@@ -2973,7 +3021,7 @@ fn replaceTypeVars(n: Node, names: str[], types: Node[], index: hashmaps.HashMap
     out.floatVal = n.floatVal
     out.callStyle = n.callStyle
     for k in 0..<outKids.len:
-        addSon(out, get[Node](outKids, k))
+        addSon(out, get(outKids, k))
     return out
 
 fn whereTypeKey(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.HashMapStrInt* = nil): str =
@@ -3005,13 +3053,13 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.Has
     case expr.kind
     of nkBoolLit:
         let v: str = monoStripSpaces expr.ident
-        if (v ==  "true"): return 1
-        if (v ==  "false"): return 0
+        if monoStrEq(v, "true"): return 1
+        if monoStrEq(v, "false"): return 0
         return -1
     of nkIdent, nkSymbol:
         let v2: str = monoStripSpaces expr.ident
-        if (v2 ==  "true"): return 1
-        if (v2 ==  "false"): return 0
+        if monoStrEq(v2, "true"): return 1
+        if monoStrEq(v2, "false"): return 0
         return -1
     of nkPar:
         if kidCount expr == 1:
@@ -3020,7 +3068,7 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.Has
     of nkPrefix:
         if kidCount expr > 1:
             let opn: Node = kid(expr, 0)
-            if opn != nil && (monoStripSpaces opn.ident ==  "!"):
+            if opn != nil && monoStrEq(monoStripSpaces(opn.ident), "!"):
                 let inner: int32 = evalWhereExpr(kid(expr, 1), names, types, idx)
                 if inner < 0:
                     return -1
@@ -3034,7 +3082,7 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.Has
             var op: str = ""
             if opn2 != nil:
                 op = monoStripSpaces opn2.ident
-            if (op ==  "&&"):
+            if monoStrEq(op, "&&"):
                 let lhs: int32 = evalWhereExpr(kid(expr, 1), names, types, idx)
                 let rhs: int32 = evalWhereExpr(kid(expr, 2), names, types, idx)
                 if lhs == 0 || rhs == 0:
@@ -3042,7 +3090,7 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.Has
                 if lhs < 0 || rhs < 0:
                     return -1
                 return 1
-            if (op ==  "||"):
+            if monoStrEq(op, "||"):
                 let lhs2: int32 = evalWhereExpr(kid(expr, 1), names, types, idx)
                 let rhs2: int32 = evalWhereExpr(kid(expr, 2), names, types, idx)
                 if lhs2 == 1 || rhs2 == 1:
@@ -3050,13 +3098,13 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.Has
                 if lhs2 < 0 || rhs2 < 0:
                     return -1
                 return 0
-            if (op ==  "is") || (op ==  "isnot"):
+            if monoStrEq(op, "is") || monoStrEq(op, "isnot"):
                 let lk: str = whereTypeKey(kid(expr, 1), names, types, idx)
                 let rk: str = whereTypeKey(kid(expr, 2), names, types, idx)
                 if len lk == 0 || len rk == 0:
                     return -1
-                let eq: bool =(lk ==  rk)
-                if (op ==  "is"):
+                let eq: bool = monoStrEq(lk, rk)
+                if monoStrEq(op, "is"):
                     if eq:
                         return 1
                     return 0
@@ -3086,7 +3134,7 @@ fn findGenericFnDecl(n: Node, name: str): Node =
         if kidCount n > 4:
             let gens: Node = kid(n, 4)
             if gens != nil && gens.kind == nkGenericParams && kidCount gens > 0:
-                if getName(kid(n, 0)) == name:
+                if monoStrEq(getName(kid(n, 0)), name):
                     return n
     for i in 0..<kidCount n:
         let found: Node = findGenericFnDecl(kid(n, i), name)
@@ -3102,15 +3150,15 @@ fn isComparableType(n: Node): bool =
         return true
     if n.kind == nkIdent || n.kind == nkSymbol:
         let name: str = monoStripSpaces(plainName(n))
-        if (name ==  "int") ||(name ==  "int8") ||(name ==  "int16") ||(name ==  "int32") ||(name ==  "int64"):
+        if monoStrEq(name, "int") || monoStrEq(name, "int8") || monoStrEq(name, "int16") || monoStrEq(name, "int32") || monoStrEq(name, "int64"):
             return true
-        if (name ==  "uint") ||(name ==  "uint8") ||(name ==  "uint16") ||(name ==  "uint32") ||(name ==  "uint64"):
+        if monoStrEq(name, "uint") || monoStrEq(name, "uint8") || monoStrEq(name, "uint16") || monoStrEq(name, "uint32") || monoStrEq(name, "uint64"):
             return true
-        if (name ==  "float") ||(name ==  "float32") ||(name ==  "float64"):
+        if monoStrEq(name, "float") || monoStrEq(name, "float32") || monoStrEq(name, "float64"):
             return true
-        if (name ==  "bool") ||(name ==  "char") ||(name ==  "byte"):
+        if monoStrEq(name, "bool") || monoStrEq(name, "char") || monoStrEq(name, "byte"):
             return true
-        if (name ==  "str") ||(name ==  "cstring"):
+        if monoStrEq(name, "str") || monoStrEq(name, "cstring"):
             return true
     return false
 
@@ -3125,14 +3173,14 @@ fn collectTypeArgMap(generics: Node, args: Node[], outNames: str[]*, outTypes: N
             if len name > 0:
                 var mapped: Node = nil
                 if i < args.len:
-                    mapped = get[Node](args, i)
+                    mapped = get(args, i)
                 elif kidCount defn > 2:
                     let defaultVal: Node = kid(defn, 2)
                     if defaultVal != nil && defaultVal.kind != nkEmpty:
                         mapped = replaceTypeVars(defaultVal, *outNames, *outTypes)
                 if mapped != nil:
-                    addPtr[str](outNames, name)
-                    addPtr[Node](outTypes, mapped)
+                    add(outNames, name)
+                    add(outTypes, mapped)
 
 fn buildFullTypeArgs(generics: Node, mapNames: str[], mapTypes: Node[], fallbackArgs: Node[], outArgs: Node[]*, mapIndex: hashmaps.HashMapStrInt* = nil) =
     var localIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
@@ -3143,7 +3191,7 @@ fn buildFullTypeArgs(generics: Node, mapNames: str[], mapTypes: Node[], fallback
         if buildTypeArgsFromMap(generics, mapNames, mapTypes, outArgs, idx):
             return
     for i in 0..<fallbackArgs.len:
-        addPtr[Node](outArgs, get[Node](fallbackArgs, i))
+        add(outArgs, get(fallbackArgs, i))
 
 fn instantiateType(name: str, typeArgs: Node[], rootStmts: Node[]*) =
     let profOn: bool = monoProfileActive
@@ -3177,7 +3225,7 @@ fn instantiateType(name: str, typeArgs: Node[], rootStmts: Node[]*) =
         var instTy: Node = newNode(nkBracketExpr, genNode.pos)
         addSon(instTy, newIdent(name, genNode.pos))
         for ti in 0..<instArgs.len:
-            addSon(instTy, cloneTree get[Node](instArgs, ti))
+            addSon(instTy, cloneTree get(instArgs, ti))
         mapPutStrPtrIndex(&instTypeIndex, &instTypeNames, &instTypeNodes, instName, instTy)
     var whereExpr: Node = nil
     if kidCount genNode > 3:
@@ -3207,21 +3255,20 @@ fn instantiateType(name: str, typeArgs: Node[], rootStmts: Node[]*) =
         addSon(decl, cloneTree pragmaNode)
     else:
         addSon(decl, newNode(nkEmpty, genNode.pos))
-    addPtr[Node](rootStmts, decl)
-    if (name ==  "seq") ||(name ==  "seq"):
+    add(rootStmts, decl)
+    if monoStrEq(name, "seq"):
         instantiateFn("setLen", instArgs, rootStmts)
         instantiateFn("reserve", instArgs, rootStmts)
-        instantiateFn("addPtr", instArgs, rootStmts)
+        instantiateFn("add", instArgs, rootStmts)
         instantiateFn("get", instArgs, rootStmts)
-        instantiateFn("getPtr", instArgs, rootStmts)
         instantiateFn("[]", instArgs, rootStmts)
         instantiateFn("[]=", instArgs, rootStmts)
         instantiateFn("arcRetainSeq", instArgs, rootStmts)
         instantiateFn("arcReleaseSeq", instArgs, rootStmts)
-        if instArgs.len > 0 && isComparableType get[Node](instArgs, 0):
+        if instArgs.len > 0 && isComparableType get(instArgs, 0):
             instantiateFn("__cheng_vec_contains", instArgs, rootStmts)
         instantiateFn("__cheng_slice_vec", instArgs, rootStmts)
-    elif (name ==  "Table"):
+    elif monoStrEq(name, "Table"):
         instantiateFn("TableNext", instArgs, rootStmts)
         instantiateFn("TableHas", instArgs, rootStmts)
         instantiateFn("TableGet", instArgs, rootStmts)
@@ -3266,7 +3313,7 @@ fn instantiateFn(name: str, typeArgs: Node[], rootStmts: Node[]*) =
             let ann: Node = kid(pragmaNode, wi)
             if ann != nil && ann.kind == nkAnnotation && kidCount ann > 0:
                 let aname: str = monoStripSpaces(plainName(kid(ann, 0)))
-                if (aname ==  "where") && kidCount ann > 1:
+                if monoStrEq(aname, "where") && kidCount ann > 1:
                     let whereExpr2: Node = kid(ann, 1)
                     if whereExpr2 != nil && whereExpr2.kind != nkEmpty:
                         let res2: int32 = evalWhereExpr(whereExpr2, mapNames, mapTypes, idx)
@@ -3305,7 +3352,7 @@ fn instantiateFn(name: str, typeArgs: Node[], rootStmts: Node[]*) =
         addSon(decl, cloneTree pragmaNode)
     else:
         addSon(decl, newNode(nkEmpty, genNode.pos))
-    addPtr[Node](rootStmts, decl)
+    add(rootStmts, decl)
 
 fn instantiateLambda(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
     if lam == nil:
@@ -3351,7 +3398,7 @@ fn instantiateLambda(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
     addSon(decl, newBody)
     addSon(decl, newNode(nkEmpty, lam.pos))
     addSon(decl, newNode(nkEmpty, lam.pos))
-    addPtr[Node](rootStmts, decl)
+    add(rootStmts, decl)
     return newIdent(instName, lam.pos)
 
 fn lambdaFnType(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
@@ -3399,8 +3446,8 @@ fn transformCallTemplate(name: str, templNode: Node, callNode: Node, rootStmts: 
             for ni in 0..<kidCount defs - 2:
                 let nameNode: Node = kid(defs, ni)
                 if argIdx < kidCount callNode:
-                    addPtr[str](&mapNames, monoStripSpaces(plainName(nameNode)))
-                    addPtr[Node](&mapTypes, kid(callNode, argIdx))
+                    add(mapNames, monoStripSpaces(plainName(nameNode)))
+                    add(mapTypes, kid(callNode, argIdx))
                     argIdx = argIdx + 1
     let expanded: Node = replaceTypeVars(bodyNode, mapNames, mapTypes)
     let transformed: Node = transform(expanded, rootStmts)
@@ -3493,7 +3540,7 @@ fn isDefiniteTypeCallee(n: Node): bool =
         return false
     of nkIdent, nkSymbol:
         let nm: str = monoStripSpaces(plainName(n))
-        if nm == "":
+        if monoStrEq(nm, ""):
             return false
         if monoIsBuiltinTypeKey(nm):
             return true
@@ -3514,7 +3561,7 @@ fn isDefiniteTypeCallee(n: Node): bool =
         if kidCount n == 0:
             return false
         let baseName: str = typeBaseName kid(n, 0)
-        if baseName == "":
+        if monoStrEq(baseName, ""):
             return false
         if monoIsBuiltinTypeKey(baseName):
             return true
@@ -3531,7 +3578,7 @@ fn bracketCallToExpr(n: Node): Node =
     if head == nil:
         return nil
     let hname: str = monoStripSpaces(plainName(head))
-    if !streq(hname, "bracket") && !streq(hname, "[]"):
+    if monoStrNe(hname, "bracket") && monoStrNe(hname, "[]"):
         return nil
     var br: Node = newNode(nkBracketExpr, n.pos)
     for i in 1..<kidCount n:
@@ -3560,7 +3607,7 @@ fn transformIdentDefs(n: Node, rootStmts: Node[]*, defaultsAreTypes: bool): Node
         if child != oldChild:
             changed = true
         if child != nil:
-            addPtr[Node](&outKids, child)
+            add(outKids, child)
     if ! changed:
         return n
     var out: Node = newNode(n.kind, n.pos)
@@ -3569,7 +3616,7 @@ fn transformIdentDefs(n: Node, rootStmts: Node[]*, defaultsAreTypes: bool): Node
     out.intVal = n.intVal
     out.floatVal = n.floatVal
     for j in 0..<outKids.len:
-        addSon(out, get[Node](outKids, j))
+        addSon(out, get(outKids, j))
     return out
 
 fn transformGenericParams(n: Node, rootStmts: Node[]*): Node =
@@ -3587,7 +3634,7 @@ fn transformGenericParams(n: Node, rootStmts: Node[]*): Node =
         if child != oldChild:
             changed = true
         if child != nil:
-            addPtr[Node](&outKids, child)
+            add(outKids, child)
     if ! changed:
         return n
     var out: Node = newNode(n.kind, n.pos)
@@ -3596,7 +3643,7 @@ fn transformGenericParams(n: Node, rootStmts: Node[]*): Node =
     out.intVal = n.intVal
     out.floatVal = n.floatVal
     for j in 0..<outKids.len:
-        addSon(out, get[Node](outKids, j))
+        addSon(out, get(outKids, j))
     return out
 
 fn transformFallback(n: Node, rootStmts: Node[]*, inTypeContext: bool): Node =
@@ -3622,9 +3669,9 @@ fn transformFallback(n: Node, rootStmts: Node[]*, inTypeContext: bool): Node =
             for back in 0..<k:
                 let prev: Node = kid(n, back)
                 if prev != nil:
-                    addPtr[Node](&outKids, prev)
+                    add(outKids, prev)
         if changed && child != nil:
-            addPtr[Node](&outKids, child)
+            add(outKids, child)
     if ! changed:
         return n
     var out: Node = newNode(n.kind, n.pos)
@@ -3633,7 +3680,7 @@ fn transformFallback(n: Node, rootStmts: Node[]*, inTypeContext: bool): Node =
     out.intVal = n.intVal
     out.floatVal = n.floatVal
     for ki in 0..<outKids.len:
-        addSon(out, get[Node](outKids, ki))
+        addSon(out, get(outKids, ki))
     return out
 
 fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
@@ -3666,7 +3713,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
             if child0 != oldChild0:
                 changed = true
             if child0 != nil:
-                addPtr[Node](&outKids0, child0)
+                add(outKids0, child0)
         monoValueScopePop()
         if ! changed:
             return n
@@ -3676,7 +3723,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         out0.intVal = n.intVal
         out0.floatVal = n.floatVal
         for k0 in 0..<outKids0.len:
-            addSon(out0, get[Node](outKids0, k0))
+            addSon(out0, get(outKids0, k0))
         return out0
     of nkTypeDecl:
         var profStartTypeDecl: int64 = 0
@@ -3710,7 +3757,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
             if child != oldChild:
                 changed = true
             if child != nil:
-                addPtr[Node](&outKids, child)
+                add(outKids, child)
         if ! changed:
             return n
         var out: Node = newNode(n.kind, n.pos)
@@ -3719,7 +3766,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         out.intVal = n.intVal
         out.floatVal = n.floatVal
         for ki in 0..<outKids.len:
-            addSon(out, get[Node](outKids, ki))
+            addSon(out, get(outKids, ki))
         return out
     of nkFnDecl, nkIteratorDecl:
         var profStartFnDecl: int64 = 0
@@ -3759,7 +3806,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 child2 = oldChild2
             if child2 != oldChild2:
                 changed = true
-            addPtr[Node](&outKids2, child2)
+            add(outKids2, child2)
         monoValueScopePop()
         if ! changed:
             return n
@@ -3769,7 +3816,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         out2.intVal = n.intVal
         out2.floatVal = n.floatVal
         for ki2 in 0..<outKids2.len:
-            addSon(out2, get[Node](outKids2, ki2))
+            addSon(out2, get(outKids2, ki2))
         return out2
     of nkGenericParams:
         return transformGenericParams(n, rootStmts)
@@ -3848,7 +3895,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                                         picked = retTy
                                 if picked != nil:
                                     var args2: Node[1]
-                                    addPtr[Node](&args2, picked)
+                                    add(args2, picked)
                                     newVal = instantiateLambda(lam, args2, rootStmts)
                                     lamArgs = args2
                                     lamArgsReady = true
@@ -3907,7 +3954,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 for ai in 1..<kidCount n:
                     let arg0: Node = transform(kid(n, ai), rootStmts, false)
                     if arg0 != nil:
-                        addPtr[Node](&args0, arg0)
+                        add(args0, arg0)
                 return instantiateLambda(lam2, args0, rootStmts)
             if head != nil && (head.kind == nkIdent || head.kind == nkSymbol || head.kind == nkDotExpr):
                 var name: str = ""
@@ -3920,7 +3967,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                     if inTypeContext && mapHasStrPtrIndex(genericTypeIndex, name):
                         var args: Node[4]
                         for i in 1..<kidCount n:
-                            addPtr[Node](&args, kid(n, i))
+                            add(args, kid(n, i))
                         var genNode: Node = mapGetStrPtrIndex(genericTypeIndex, genericTypeNodes, name)
                         var generics: Node = nil
                         if genNode != nil && kidCount genNode > 2:
@@ -3940,7 +3987,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                     if genNode2 != nil:
                         var args2: Node[4]
                         for j in 1..<kidCount n:
-                            addPtr[Node](&args2, kid(n, j))
+                            add(args2, kid(n, j))
                         var generics2: Node = nil
                         if kidCount genNode2 > 4:
                             generics2 = kid(genNode2, 4)
@@ -3955,7 +4002,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
     of nkPrefix:
         if kidCount n > 1:
             let opNode: Node = kid(n, 0)
-            if opNode != nil && getName(opNode) == "$":
+            if opNode != nil && monoStrEq(getName(opNode), "$"):
                 let argNode: Node = kid(n, 1)
                 let callNode: Node = newNode(nkCall, n.pos)
                 callNode.typeCache = n.typeCache
@@ -3994,14 +4041,14 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                     childL = transform(oldChildL, rootStmts, false)
                 if childL == nil:
                     childL = oldChildL
-                addPtr[Node](&outKidsL, childL)
+                add(outKidsL, childL)
             var outL: Node = newNode(n.kind, n.pos)
             nodeSetIdent(outL, n.ident)
             nodeSetStrVal(outL, n.strVal)
             outL.intVal = n.intVal
             outL.floatVal = n.floatVal
             for lk in 0..<outKidsL.len:
-                addSon(outL, get[Node](outKidsL, lk))
+                addSon(outL, get(outKidsL, lk))
             return outL
         return instantiateLambda(n, default[Node[]], rootStmts)
     of nkCall:
@@ -4035,7 +4082,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                     if childC != oldChildC:
                         callChanged = true
                     if childC != nil:
-                        addPtr[Node](&outKidsCall, childC)
+                        add(outKidsCall, childC)
                 if ! callChanged:
                     return n
                 var outCall: Node = newNode(n.kind, n.pos)
@@ -4044,7 +4091,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 outCall.intVal = n.intVal
                 outCall.floatVal = n.floatVal
                 for cj in 0..<outKidsCall.len:
-                    addSon(outCall, get[Node](outKidsCall, cj))
+                    addSon(outCall, get(outKidsCall, cj))
                 return outCall
             if headFromBracket:
                 var callChanged2: bool = true
@@ -4061,7 +4108,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                     if child2 != oldChild2:
                         callChanged2 = true
                     if child2 != nil:
-                        addPtr[Node](&outKidsCall2, child2)
+                        add(outKidsCall2, child2)
                 if ! callChanged2:
                     return n
                 var outCall2: Node = newNode(n.kind, n.pos)
@@ -4070,7 +4117,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 outCall2.intVal = n.intVal
                 outCall2.floatVal = n.floatVal
                 for cj2 in 0..<outKidsCall2.len:
-                    addSon(outCall2, get[Node](outKidsCall2, cj2))
+                    addSon(outCall2, get(outKidsCall2, cj2))
                 return outCall2
             if head2 != nil && head2.kind == nkDotExpr && kidCount head2 > 1:
                 let base2: Node = kid(head2, 0)
@@ -4080,7 +4127,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                     let baseTy2: Node = monoLookupExprType base2
                     let dispatchIdx: int32 = traitDispatchLookup(baseTy2, nm2)
                     if dispatchIdx >= 0:
-                        let initName: str = get[str](traitDispatchInitNames, dispatchIdx)
+                        let initName: str = get(traitDispatchInitNames, dispatchIdx)
                         var vtCall: Node = newNode(nkCall, n.pos)
                         addSon(vtCall, newIdent(initName, n.pos))
                         var dotCall: Node = newNode(nkDotExpr, n.pos)
@@ -4154,7 +4201,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                             return outCall3
             if head2 != nil && (head2.kind == nkIdent || head2.kind == nkSymbol):
                 let nm: str = monoStripSpaces(plainName(head2))
-                if nm == "len" && kidCount n == 2:
+                if monoStrEq(nm, "len") && kidCount n == 2:
                     var argNodeL: Node = kid(n, 1)
                     if argNodeL != nil && argNodeL.kind == nkCallArg && kidCount argNodeL > 1:
                         argNodeL = kid(argNodeL, 1)
@@ -4171,7 +4218,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                                 argTy = parsedL
                     if !seqLikeL && argTy != nil && argTy.kind == nkBracketExpr:
                         let baseNameL: str = monoBracketBaseName argTy
-                        if baseNameL == "seq" || baseNameL == "seq_fixed":
+                        if monoStrEq(baseNameL, "seq") || monoStrEq(baseNameL, "seq_fixed"):
                             seqLikeL = true
                     if seqLikeL:
                         var outDot: Node = newNode(nkDotExpr, n.pos)
@@ -4219,7 +4266,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
             elemTy = inferLitType kid(n, si)
         if elemTy != nil:
             var args3: Node[1]
-            addPtr[Node](&args3, elemTy)
+            add(args3, elemTy)
             instantiateType("seq", args3, rootStmts)
         return transformFallback(n, rootStmts, inTypeContext)
     else:
@@ -4357,7 +4404,7 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
         let raw: Node = kid(root, i)
         let t: Node = transform(raw, &newStmts)
         if t != nil && t.kind != nkEmpty:
-            addPtr[Node](&bodyStmts, t)
+            add(bodyStmts, t)
     var out: Node = newNode(root.kind, root.pos)
     nodeSetIdent(out, root.ident)
     nodeSetStrVal(out, root.strVal)
@@ -4365,9 +4412,9 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
     out.floatVal = root.floatVal
     out.callStyle = root.callStyle
     for j in 0..<newStmts.len:
-        addSon(out, get[Node](newStmts, j))
+        addSon(out, get(newStmts, j))
     for k in 0..<bodyStmts.len:
-        addSon(out, get[Node](bodyStmts, k))
+        addSon(out, get(bodyStmts, k))
     if monoProfOn:
         monoProfTransform = cheng_monotime_ns() - monoProfMark
         monoProfMark = cheng_monotime_ns()
@@ -4379,7 +4426,7 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
     if implicitStmts.len > 0:
         var merged: Node = cloneNodeShallow lowered
         for mi in 0..<implicitStmts.len:
-            addSon(merged, get[Node](implicitStmts, mi))
+            addSon(merged, get(implicitStmts, mi))
         for mk in 0..<kidCount lowered:
             addSon(merged, kid(lowered, mk))
         out = merged

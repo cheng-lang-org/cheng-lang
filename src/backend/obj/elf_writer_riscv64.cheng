@@ -55,8 +55,8 @@ fn elf_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
     for i in 0..<labels.len:
         if ! (i < offs.len):
             break
-        if streq(get[str](labels, i), label):
-            return Ok[int32](get[int32](offs, i))
+        if (labels[i] == label):
+            return Ok[int32](offs[i])
     return Err[int32]("elf_writer: missing label: " + label)
 
 fn elf_strContains(hay: str, needle: str): bool =
@@ -106,30 +106,58 @@ fn elf_strCmp(a: str, b: str): int32 =
 
 fn elf_seqContainsStr(items: str[], value: str): bool =
     for i in 0..<items.len:
-        if streq(get[str](items, i), value):
+        if (items[i] == value):
             return true
     return false
+
+fn elfSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "elf_writer_riscv64: seq index out of bounds"
+    let off64: int64 = int64(idx) * int64(elemSize)
+    return ptr_add(buffer, int32(off64))
+
+fn elfReadStrPtr(items: str[]*, idx: int32): str =
+    if items == nil:
+        panic "elf_writer_riscv64: nil seq pointer"
+    let p: str* = str*(elfSeqElemPtr(items->buffer, items->len, idx, sizeof str))
+    return *p
+
+fn elfWriteStrPtr(items: str[]*, idx: int32, val: str) =
+    if items == nil:
+        panic "elf_writer_riscv64: nil seq pointer"
+    let p: str* = str*(elfSeqElemPtr(items->buffer, items->len, idx, sizeof str))
+    *p = val
+
+fn elfAddStrPtr(items: str[]*, value: str) =
+    if items == nil:
+        return
+    add(items, value)
+
+fn elfAddSymPtr(outSyms: ElfSym[]*, s: ElfSym) =
+    if outSyms == nil:
+        return
+    add(outSyms, s)
 
 fn elf_seqAddUniqueStr(items: str[]*, value: str) =
     if items == nil || value == nil || len(value) == 0:
         return
     if elf_seqContainsStr(*items, value):
         return
-    addPtr[str](items, value)
+    elfAddStrPtr(items, value)
 
 fn elf_sortStringsStable(items: str[]*) =
     if items == nil:
         return
     for i in 1..<items->len:
-        let key: str = get[str](*items, i)
+        let key: str = elfReadStrPtr(items, i)
         var j: int32 = i - 1
         let __for_start_j = j
         for __for_rev_j in 0..(__for_start_j - (0)):
             j = __for_start_j - __for_rev_j
-            if !(elf_strCmp(get[str](*items, j), key) > 0):
+            if !(elf_strCmp(elfReadStrPtr(items, j), key) > 0):
                 break
-            setPtr[str](items, j + 1, get[str](*items, j))
-        setPtr[str](items, j + 1, key)
+            elfWriteStrPtr(items, j + 1, elfReadStrPtr(items, j))
+        elfWriteStrPtr(items, j + 1, key)
 
 fn elf_alignUp(value: uint64, align: uint64): uint64 =
     if align == 0:
@@ -165,7 +193,7 @@ fn elfAddSectionSym(outSyms: ElfSym[]*, shndx: uint16) =
     s.value = 0
     s.size = 0
     s.nameOff = 0
-    addPtr[ElfSym](outSyms, s)
+    elfAddSymPtr(outSyms, s)
 
 fn elfAddSym(outSyms: ElfSym[]*, name: str, bind: uint8, stType: uint8,
              shndx: uint16, value: uint64, size: uint64) =
@@ -178,24 +206,24 @@ fn elfAddSym(outSyms: ElfSym[]*, name: str, bind: uint8, stType: uint8,
     s.value = value
     s.size = size
     s.nameOff = 0
-    addPtr[ElfSym](outSyms, s)
+    elfAddSymPtr(outSyms, s)
 
 fn elfFindSymIndex(syms: ElfSym[], name: str): int32 =
     if name == nil:
         return -1
     for i in 0..<syms.len:
-        let s: ElfSym = get[ElfSym](syms, i)
-        if s != nil && streq(s.name, name):
+        let s: ElfSym = syms[i]
+        if s != nil && (s.name == name):
             return i
     return -1
 
 fn rv64ReadU32LEAtSeq(buf: uint8[], off: uint64): uint32 =
     if off + 4 > uint64(buf.len):
         return uint32(0)
-    let b0: uint32 = uint32(get[uint8](buf, int32(off + 0)))
-    let b1: uint32 = uint32(get[uint8](buf, int32(off + 1)))
-    let b2: uint32 = uint32(get[uint8](buf, int32(off + 2)))
-    let b3: uint32 = uint32(get[uint8](buf, int32(off + 3)))
+    let b0: uint32 = uint32(buf[int32(off + 0)])
+    let b1: uint32 = uint32(buf[int32(off + 1)])
+    let b2: uint32 = uint32(buf[int32(off + 2)])
+    let b3: uint32 = uint32(buf[int32(off + 3)])
     return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
 fn rv64EmitLoadImm32(out: uint8[]*, rd: int32, v: int32) =
@@ -371,9 +399,9 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
     var cSymOffs: uint64[]
     cSymOffs.len = int(module.cstrs.len)
     for ci in 0..<module.cstrs.len:
-        let c: LirCString = get[LirCString](module.cstrs, ci)
+        let c: LirCString = module.cstrs[ci]
         let off: uint64 = uint64(rodata.len)
-        setPtr[uint64](&cSymOffs, ci, off)
+        cSymOffs[ci] = off
         bufStr0(&rodata, c.value)
 
     # Layout globals.
@@ -384,13 +412,13 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
     var maxDataAlign: uint64 = 1
     var maxBssAlign: uint64 = 1
     for gi in 0..<module.globals.len:
-        let g: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g: LirGlobal = module.globals[gi]
         let align: uint64 = uint64(1) << uint64(g.alignPow2)
         if g.hasInit:
             if align > maxDataAlign:
                 maxDataAlign = align
             bufAlign(&data, align)
-            setPtr[uint64](&dataSymOffs, gi, uint64(data.len))
+            dataSymOffs[gi] = uint64(data.len)
             if g.size == 4:
                 bufU32(&data, uint32(int32(g.init)))
             else:
@@ -399,7 +427,7 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
             if align > maxBssAlign:
                 maxBssAlign = align
             bssSize = elf_alignUp(bssSize, align)
-            setPtr[uint64](&bssSymOffs, gi, bssSize)
+            bssSymOffs[gi] = bssSize
             bssSize = bssSize + uint64(g.size)
 
     # Encode .text and collect relocations.
@@ -410,8 +438,8 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
     funcOffs.len = int(module.funcs.len)
     for fi in 0..<module.funcs.len:
         bufAlign(&text, 4)
-        setPtr[uint64](&funcOffs, fi, uint64(text.len))
-        let f: LirFunc = get[LirFunc](module.funcs, fi)
+        funcOffs[fi] = uint64(text.len)
+        let f: LirFunc = module.funcs[fi]
 
         # Pass 1: compute label offsets within this function (in bytes from func start).
         var labels: str[16]
@@ -419,10 +447,10 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
         var scanOff: int32 = 0
         var scanLastFCmpValid: bool = false
         for si in 0..<f.insts.len:
-            let inst0: LirInst = get[LirInst](f.insts, si)
+            let inst0: LirInst = f.insts[si]
             if inst0.op == loLabel:
-                addPtr[str](&labels, inst0.label)
-                addPtr[int32](&labelOffs, scanOff)
+                add(labels, inst0.label)
+                add(labelOffs, scanOff)
                 continue
             if inst0.op == loCmp:
                 scanLastFCmpValid = false
@@ -449,7 +477,7 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
         for __for_guard_ii in 0..<f.insts.len:
             if !(ii < f.insts.len):
                 break
-            let inst: LirInst = get[LirInst](f.insts, ii)
+            let inst: LirInst = f.insts[ii]
             if inst.op == loLabel:
                 ii = ii + 1
                 continue
@@ -521,7 +549,7 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
                 r.sym = inst.label
                 r.rtype = R_RISCV_PCREL_HI20
                 r.addend = 0
-                addPtr[ElfReloc](&relocs, r)
+                add(relocs, r)
                 curOff = curOff + 4
                 ii = ii + 1
                 continue
@@ -537,7 +565,7 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
                 r2.sym = inst.label
                 r2.rtype = R_RISCV_PCREL_LO12_I
                 r2.addend = 0
-                addPtr[ElfReloc](&relocs, r2)
+                add(relocs, r2)
                 curOff = curOff + 4
                 ii = ii + 1
                 continue
@@ -979,7 +1007,7 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
                 r3.sym = inst.label
                 r3.rtype = R_RISCV_CALL
                 r3.addend = 0
-                addPtr[ElfReloc](&relocs, r3)
+                add(relocs, r3)
                 curOff = curOff + 8
                 ii = ii + 1
                 continue
@@ -1013,60 +1041,61 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
 
     # local rodata symbols
     for ci in 0..<module.cstrs.len:
-        let c2: LirCString = get[LirCString](module.cstrs, ci)
+        let c2: LirCString = module.cstrs[ci]
         elfAddSym(&syms, c2.label, STB_LOCAL, STT_OBJECT, uint16(2),
-                  get[uint64](cSymOffs, ci), 0)
+                  cSymOffs[ci], 0)
 
     # globals: funcs
     for fi in 0..<module.funcs.len:
-        let f2: LirFunc = get[LirFunc](module.funcs, fi)
+        let f2: LirFunc = module.funcs[fi]
         elfAddSym(&syms, f2.name, STB_GLOBAL, STT_FUNC, uint16(1),
-                  get[uint64](funcOffs, fi), 0)
+                  funcOffs[fi], 0)
 
     # globals: data/bss
     for gi in 0..<module.globals.len:
-        let g2: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g2: LirGlobal = module.globals[gi]
         if g2.hasInit:
             elfAddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(3),
-                      get[uint64](dataSymOffs, gi), uint64(g2.size))
+                      dataSymOffs[gi], uint64(g2.size))
         else:
             elfAddSym(&syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(4),
-                      get[uint64](bssSymOffs, gi), uint64(g2.size))
+                      bssSymOffs[gi], uint64(g2.size))
 
     # undefined symbols referenced by relocations.
     var undefs: str[]
     for ri in 0..<relocs.len:
-        let r0: ElfReloc = get[ElfReloc](relocs, ri)
+        let r0: ElfReloc = relocs[ri]
         if r0 != nil && r0.sym != nil && len(r0.sym) > 0:
             if elfFindSymIndex(syms, r0.sym) < 0:
                 elf_seqAddUniqueStr(&undefs, r0.sym)
     elf_sortStringsStable(&undefs)
     for ri in 0..<undefs.len:
-        elfAddSym(&syms, get[str](undefs, ri), STB_GLOBAL, STT_NOTYPE, uint16(0), 0, 0)
+        elfAddSym(&syms, undefs[ri], STB_GLOBAL, STT_NOTYPE, uint16(0), 0, 0)
 
     # Build .strtab (symbol names) and fill nameOff.
     var strtab: uint8[]
-    addPtr[uint8](&strtab, uint8(0))
+    add(strtab, uint8(0))
     for si in 0..<syms.len:
-        let s3: ElfSym = get[ElfSym](syms, si)
-        if s3 != nil && s3.name != nil && len(s3.name) > 0:
-            s3.nameOff = uint32(strtab.len)
-            bufStr0(&strtab, s3.name)
-        else:
-            s3.nameOff = 0
-        setPtr[ElfSym](&syms, si, s3)
+        let s3: ElfSym = syms[si]
+        if s3 != nil:
+            if s3.name != nil && len(s3.name) > 0:
+                s3.nameOff = uint32(strtab.len)
+                bufStr0(&strtab, s3.name)
+            else:
+                s3.nameOff = 0
+            syms[si] = s3
 
     # Count locals for symtab.sh_info (first global index).
     var localCount: uint32 = 0
     for si in 0..<syms.len:
-        let s4: ElfSym = get[ElfSym](syms, si)
+        let s4: ElfSym = syms[si]
         if s4 != nil && s4.bind == STB_LOCAL:
             localCount = localCount + 1
 
     # Build .symtab
     var symtab: uint8[]
     for si in 0..<syms.len:
-        let s5: ElfSym = get[ElfSym](syms, si)
+        let s5: ElfSym = syms[si]
         let info: uint8 = uint8((uint8(s5.bind) << 4) | uint8(s5.stType & uint8(0xF)))
         bufU32(&symtab, s5.nameOff)
         bufU8(&symtab, info)
@@ -1081,7 +1110,7 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
     let __for_start_ri_1 = ri
     for __for_ri_1 in __for_start_ri_1..<relocs.len:
         ri = __for_ri_1
-        let r4: ElfReloc = get[ElfReloc](relocs, ri)
+        let r4: ElfReloc = relocs[ri]
         let symIdx: int32 = elfFindSymIndex(syms, r4.sym)
         if symIdx < 0:
             return Err[uint8[]]("elf_writer: missing relocation symbol")
@@ -1093,27 +1122,42 @@ fn elfBuild(module: LirModule): Result[uint8[]] =
 
     # Build .shstrtab
     var shstrtab: uint8[]
-    addPtr[uint8](&shstrtab, uint8(0))
-    let sh_text: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".text")
-    let sh_rodata: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".rodata")
-    let sh_data: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".data")
-    let sh_bss: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".bss")
-    let sh_rela_text: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".rela.text")
-    let sh_symtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".symtab")
-    let sh_strtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".strtab")
-    let sh_shstrtab: uint32 = uint32(shstrtab.len); bufStr0(&shstrtab, ".shstrtab")
+    add(shstrtab, uint8(0))
+    let sh_text: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".text")
+    let sh_rodata: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".rodata")
+    let sh_data: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".data")
+    let sh_bss: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".bss")
+    let sh_rela_text: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".rela.text")
+    let sh_symtab: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".symtab")
+    let sh_strtab: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".strtab")
+    let sh_shstrtab: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".shstrtab")
 
     # Section offsets.
     var off: uint64 = 64
-    let textOff: uint64 = elf_alignUp(off, 4); off = textOff + uint64(text.len)
-    let rodataOff: uint64 = elf_alignUp(off, 1); off = rodataOff + uint64(rodata.len)
-    let dataOff: uint64 = elf_alignUp(off, maxDataAlign); off = dataOff + uint64(data.len)
+    let textOff: uint64 = elf_alignUp(off, 4)
+    off = textOff + uint64(text.len)
+    let rodataOff: uint64 = elf_alignUp(off, 1)
+    off = rodataOff + uint64(rodata.len)
+    let dataOff: uint64 = elf_alignUp(off, maxDataAlign)
+    off = dataOff + uint64(data.len)
     let bssOff: uint64 = elf_alignUp(off, maxBssAlign)
     # NOBITS: does not advance file offset.
-    let relaOff: uint64 = elf_alignUp(bssOff, 8); off = relaOff + uint64(relaText.len)
-    let symOff: uint64 = elf_alignUp(off, 8); off = symOff + uint64(symtab.len)
-    let strOff: uint64 = elf_alignUp(off, 1); off = strOff + uint64(strtab.len)
-    let shstrOff: uint64 = elf_alignUp(off, 1); off = shstrOff + uint64(shstrtab.len)
+    let relaOff: uint64 = elf_alignUp(bssOff, 8)
+    off = relaOff + uint64(relaText.len)
+    let symOff: uint64 = elf_alignUp(off, 8)
+    off = symOff + uint64(symtab.len)
+    let strOff: uint64 = elf_alignUp(off, 1)
+    off = strOff + uint64(strtab.len)
+    let shstrOff: uint64 = elf_alignUp(off, 1)
+    off = shstrOff + uint64(shstrtab.len)
     let shOff: uint64 = elf_alignUp(off, 8)
 
     # Build final file.

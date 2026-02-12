@@ -54,7 +54,7 @@ fn ssaNewSeq2DPhiDef(n: int32): SsaPhiDef[][] =
 
 fn ssaSeqContainsInt(items: int32[], v: int32): bool =
     for i in 0..<items.len:
-        if get[int32](items, i) == v:
+        if items[i] == v:
             return true
     return false
 
@@ -63,33 +63,33 @@ fn ssaSeqAddUniqueInt(items: int32[]*, v: int32) =
         return
     if ssaSeqContainsInt(*items, v):
         return
-    addPtr[int32](items, v)
+    add(items, v)
 
 fn ssa2dAddUniqueInt(items: int32[][]*, idx: int32, v: int32) =
     if items == nil:
         return
     if idx < 0 || idx >= items->len:
         return
-    var inner: int32[] = get[int32[]](*items, idx)
+    var inner: int32[] = (*items)[idx]
     if ! ssaSeqContainsInt(inner, v):
-        addPtr[int32](&inner, v)
-        setPtr[int32[]](items, idx, inner)
+        add(inner, v)
+        items[idx] = inner
 
 fn ssaSortIntsStable(items: int32[]*): bool =
     if items == nil || items->len <= 1:
         return false
     var changed: bool = false
     for i in 1..<items->len:
-        let key: int32 = get[int32](*items, i)
+        let key: int32 = (*items)[i]
         var j: int32 = i - 1
         let __for_start_j = j
         for __for_rev_j in 0..(__for_start_j - (0)):
             j = __for_start_j - __for_rev_j
-            if !(get[int32](*items, j) > key):
+            if !((*items)[j] > key):
                 break
-            setPtr[int32](items, j + 1, get[int32](*items, j))
+            items[j + 1] = (*items)[j]
             changed = true
-        setPtr[int32](items, j + 1, key)
+        items[j + 1] = key
     return changed
 
 fn ssaMarkAddrTaken(expr: MirExpr, addrTaken: bool[]*) =
@@ -98,7 +98,7 @@ fn ssaMarkAddrTaken(expr: MirExpr, addrTaken: bool[]*) =
     if expr.kind == meAddr:
         let slot: int32 = expr.localIndex
         if slot >= 0 && slot < addrTaken->len:
-            setPtr[bool](addrTaken, slot, true)
+            addrTaken[slot] = true
         return
     if expr.kind == meLoad:
         ssaMarkAddrTaken(expr.addrExpr, addrTaken)
@@ -109,7 +109,7 @@ fn ssaMarkAddrTaken(expr: MirExpr, addrTaken: bool[]*) =
         return
     if expr.kind == meCall:
         for i in 0..<expr.args.len:
-            ssaMarkAddrTaken(get[MirExpr](expr.args, i), addrTaken)
+            ssaMarkAddrTaken(expr.args[i], addrTaken)
         return
     if expr.kind == meCast:
         ssaMarkAddrTaken(expr.castExpr, addrTaken)
@@ -122,8 +122,8 @@ fn ssaAllocSlot(func: MirFunc, baseSlot: int32): int32 =
     let idx: int32 = func.localTypes.len
     var ty: MirType = mirTypeI32()
     if baseSlot >= 0 && baseSlot < func.localTypes.len:
-        ty = get[MirType](func.localTypes, baseSlot)
-    addPtr[MirType](&func.localTypes, ty)
+        ty = func.localTypes[baseSlot]
+    add(func.localTypes, ty)
     return idx
 
 fn ssaPush(varTop: int32[]*, stackVal: int32[]*, stackPrev: int32[]*,
@@ -133,27 +133,27 @@ fn ssaPush(varTop: int32[]*, stackVal: int32[]*, stackPrev: int32[]*,
     if varId < 0 || varId >= varTop->len:
         return
     let rec: int32 = stackVal->len
-    addPtr[int32](stackVal, value)
-    addPtr[int32](stackPrev, get[int32](*varTop, varId))
-    setPtr[int32](varTop, varId, rec)
+    add(stackVal, value)
+    add(stackPrev, (*varTop)[varId])
+    varTop[varId] = rec
 
 fn ssaPop(varTop: int32[]*, stackPrev: int32[], varId: int32) =
     if varTop == nil:
         return
     if varId < 0 || varId >= varTop->len:
         return
-    let rec: int32 = get[int32](*varTop, varId)
+    let rec: int32 = (*varTop)[varId]
     if rec < 0 || rec >= stackPrev.len:
         return
-    setPtr[int32](varTop, varId, get[int32](stackPrev, rec))
+    varTop[varId] = stackPrev[rec]
 
 fn ssaCurrentSlot(varId: int32, varTop: int32[], stackVal: int32[]): int32 =
     if varId < 0 || varId >= varTop.len:
         return varId
-    let rec: int32 = get[int32](varTop, varId)
+    let rec: int32 = varTop[varId]
     if rec < 0 || rec >= stackVal.len:
         return varId
-    return get[int32](stackVal, rec)
+    return stackVal[rec]
 
 fn ssaRewriteExpr(expr: MirExpr, baseCount: int32, isCandidate: bool[],
                   varTop: int32[], stackVal: int32[]): Result[bool] =
@@ -161,7 +161,7 @@ fn ssaRewriteExpr(expr: MirExpr, baseCount: int32, isCandidate: bool[],
         return Ok[bool](true)
     if expr.kind == meLocal:
         let base: int32 = expr.localIndex
-        if base >= 0 && base < baseCount && get[bool](isCandidate, base):
+        if base >= 0 && base < baseCount && isCandidate[base]:
             expr.localIndex = ssaCurrentSlot(base, varTop, stackVal)
         return Ok[bool](true)
     if expr.kind == meAddr:
@@ -177,7 +177,7 @@ fn ssaRewriteExpr(expr: MirExpr, baseCount: int32, isCandidate: bool[],
         return ssaRewriteExpr(expr.rhs, baseCount, isCandidate, varTop, stackVal)
     if expr.kind == meCall:
         for i in 0..<expr.args.len:
-            let a: Result[bool] = ssaRewriteExpr(get[MirExpr](expr.args, i), baseCount, isCandidate,
+            let a: Result[bool] = ssaRewriteExpr(expr.args[i], baseCount, isCandidate,
                                                  varTop, stackVal)
             if ! IsOk[bool](a):
                 return a
@@ -190,13 +190,13 @@ fn ssaIntersect(b1: int32, b2: int32, idom: int32[], rpoIndex: int32[]): int32 =
     var f1: int32 = b1
     var f2: int32 = b2
     while f1 != f2:
-        while f1 >= 0 && f2 >= 0 && get[int32](rpoIndex, f1) > get[int32](rpoIndex, f2):
-            let n1: int32 = get[int32](idom, f1)
+        while f1 >= 0 && f2 >= 0 && rpoIndex[f1] > rpoIndex[f2]:
+            let n1: int32 = idom[f1]
             if n1 == f1:
                 break
             f1 = n1
-        while f2 >= 0 && f1 >= 0 && get[int32](rpoIndex, f2) > get[int32](rpoIndex, f1):
-            let n2: int32 = get[int32](idom, f2)
+        while f2 >= 0 && f1 >= 0 && rpoIndex[f2] > rpoIndex[f1]:
+            let n2: int32 = idom[f2]
             if n2 == f2:
                 break
             f2 = n2
@@ -217,16 +217,16 @@ fn ssaSortEdgesStable(edges: SsaEdgeMoves[]*): bool =
         return false
     var changed: bool = false
     for i in 1..<edges->len:
-        let key: SsaEdgeMoves = get[SsaEdgeMoves](*edges, i)
+        let key: SsaEdgeMoves = (*edges)[i]
         var j: int32 = i - 1
         let __for_start_j = j
         for __for_rev_j in 0..(__for_start_j - (0)):
             j = __for_start_j - __for_rev_j
-            if !(ssaEdgeLess(key, get[SsaEdgeMoves](*edges, j))):
+            if !(ssaEdgeLess(key, (*edges)[j])):
                 break
-            setPtr[SsaEdgeMoves](edges, j + 1, get[SsaEdgeMoves](*edges, j))
+            edges[j + 1] = (*edges)[j]
             changed = true
-        setPtr[SsaEdgeMoves](edges, j + 1, key)
+        edges[j + 1] = key
     return changed
 
 fn ssaRenameBlock(ctx: SsaRenameCtx, bi: int32): Result[bool] =
@@ -238,42 +238,42 @@ fn ssaRenameBlock(ctx: SsaRenameCtx, bi: int32): Result[bool] =
         return Ok[bool](true)
     if bi < 0 || bi >= n:
         return Ok[bool](true)
-    if get[int32](ctx.idom, bi) == -1:
+    if (&ctx.idom)[bi] == -1:
         return Ok[bool](true)
-    let blk: MirBlock = get[MirBlock](func.blocks, bi)
+    let blk: MirBlock = func.blocks[bi]
     if blk == nil:
         return Ok[bool](true)
 
     var pushed: int32[]
 
-    let phis: SsaPhiDef[] = get[SsaPhiDef[]](ctx.phiDefsByBlock, bi)
+    let phis: SsaPhiDef[] = ctx.phiDefsByBlock[bi]
     for pi in 0..<phis.len:
-        let pd: SsaPhiDef = get[SsaPhiDef](phis, pi)
+        let pd: SsaPhiDef = phis[pi]
         ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, pd.varId, pd.destSlot)
-        addPtr[int32](&pushed, pd.varId)
+        add(pushed, pd.varId)
 
     for si in 0..<blk.stmts.len:
-        var st: MirStmt = get[MirStmt](blk.stmts, si)
+        var st: MirStmt = blk.stmts[si]
         if st.kind == msLet || st.kind == msVar || st.kind == msAssign:
             let rr: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
                                                   ctx.varTop, ctx.stackVal)
             if ! IsOk[bool](rr):
                 return rr
             let base: int32 = st.slot
-            if base >= 0 && base < ctx.baseCount && get[bool](ctx.isCandidate, base):
+            if base >= 0 && base < ctx.baseCount && ctx.isCandidate[base]:
                 let ns: int32 = ssaAllocSlot(func, base)
                 st.slot = ns
                 ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, base, ns)
-                addPtr[int32](&pushed, base)
-            setPtr[MirStmt](&blk.stmts, si, st)
+                add(pushed, base)
+            (&blk.stmts)[si] = st
         elif st.kind == msParam:
             let base2: int32 = st.slot
-            if base2 >= 0 && base2 < ctx.baseCount && get[bool](ctx.isCandidate, base2):
+            if base2 >= 0 && base2 < ctx.baseCount && ctx.isCandidate[base2]:
                 let ns2: int32 = ssaAllocSlot(func, base2)
                 st.slot = ns2
                 ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, base2, ns2)
-                addPtr[int32](&pushed, base2)
-                setPtr[MirStmt](&blk.stmts, si, st)
+                add(pushed, base2)
+                (&blk.stmts)[si] = st
         elif st.kind == msStore:
             let rrA: Result[bool] = ssaRewriteExpr(st.addrExpr, ctx.baseCount, ctx.isCandidate,
                                                    ctx.varTop, ctx.stackVal)
@@ -283,13 +283,13 @@ fn ssaRenameBlock(ctx: SsaRenameCtx, bi: int32): Result[bool] =
                                                    ctx.varTop, ctx.stackVal)
             if ! IsOk[bool](rrV):
                 return rrV
-            setPtr[MirStmt](&blk.stmts, si, st)
+            (&blk.stmts)[si] = st
         else:
             let rr2: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
                                                    ctx.varTop, ctx.stackVal)
             if ! IsOk[bool](rr2):
                 return rr2
-            setPtr[MirStmt](&blk.stmts, si, st)
+            (&blk.stmts)[si] = st
 
     if blk.term.kind == mtRet && blk.term.retExpr != nil:
         let rr3: Result[bool] = ssaRewriteExpr(blk.term.retExpr, ctx.baseCount, ctx.isCandidate,
@@ -302,38 +302,38 @@ fn ssaRenameBlock(ctx: SsaRenameCtx, bi: int32): Result[bool] =
         if ! IsOk[bool](rr4):
             return rr4
 
-    let succList: int32[] = get[int32[]](ctx.succs, bi)
+    let succList: int32[] = ctx.succs[bi]
     for sxi in 0..<succList.len:
-        let toIdx: int32 = get[int32](succList, sxi)
+        let toIdx: int32 = succList[sxi]
         if toIdx >= 0 && toIdx < n:
-            let toPhis: SsaPhiDef[] = get[SsaPhiDef[]](ctx.phiDefsByBlock, toIdx)
+            let toPhis: SsaPhiDef[] = ctx.phiDefsByBlock[toIdx]
             if toPhis.len > 0:
                 var moves: SsaMove[]
                 for mi in 0..<toPhis.len:
-                    let pd2: SsaPhiDef = get[SsaPhiDef](toPhis, mi)
+                    let pd2: SsaPhiDef = toPhis[mi]
                     var mv: SsaMove
                     mv.destSlot = pd2.destSlot
                     mv.srcSlot = ssaCurrentSlot(pd2.varId, ctx.varTop, ctx.stackVal)
-                    addPtr[SsaMove](&moves, mv)
+                    add(moves, mv)
                 if moves.len > 0:
                     var em: SsaEdgeMoves
                     new em
                     em.fromIdx = bi
                     em.toIdx = toIdx
                     em.fromLabel = blk.label
-                    let toBlk: MirBlock = get[MirBlock](func.blocks, toIdx)
+                    let toBlk: MirBlock = func.blocks[toIdx]
                     em.toLabel = toBlk.label
                     em.moves = moves
-                    addPtr[SsaEdgeMoves](&ctx.edgeMoves, em)
+                    add(ctx.edgeMoves, em)
 
-    let kids: int32[] = get[int32[]](ctx.domChildren, bi)
+    let kids: int32[] = ctx.domChildren[bi]
     for ci in 0..<kids.len:
-        let kres: Result[bool] = ssaRenameBlock(ctx, get[int32](kids, ci))
+        let kres: Result[bool] = ssaRenameBlock(ctx, kids[ci])
         if ! IsOk[bool](kres):
             return kres
 
     while pushed.len > 0:
-        let vid: int32 = get[int32](pushed, pushed.len - 1)
+        let vid: int32 = pushed[pushed.len - 1]
         pushed.len = pushed.len - 1
         ssaPop(&ctx.varTop, ctx.stackPrev, vid)
     return Ok[bool](true)
@@ -352,7 +352,7 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
 
     var labelMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(n * 2 + 8)
     for bi in 0..<n:
-        let b: MirBlock = get[MirBlock](func.blocks, bi)
+        let b: MirBlock = func.blocks[bi]
         if b == nil || b.label == nil || len(b.label) == 0:
             return Err[bool]("mir_ssa: missing block label (" + func.name + ")")
         hashmaps.hashMapStrIntPut(&labelMap, b.label, bi)
@@ -360,12 +360,12 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     var preds: int32[][] = ssaNewSeq2DInt(n)
     var succs: int32[][] = ssaNewSeq2DInt(n)
     for bi in 0..<n:
-        let b2: MirBlock = get[MirBlock](func.blocks, bi)
+        let b2: MirBlock = func.blocks[bi]
         if b2 == nil:
             continue
         if b2.term.kind == mtBr:
             var found: bool = false
-            let si: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.target, &found)
+            let si: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.target, found)
             if ! found:
                 return Err[bool]("mir_ssa: br target not found (" + func.name + ":" + b2.label + ")")
             ssa2dAddUniqueInt(&succs, bi, si)
@@ -373,8 +373,8 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
         elif b2.term.kind == mtCbr:
             var foundT: bool = false
             var foundF: bool = false
-            let st: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetTrue, &foundT)
-            let sf: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetFalse, &foundF)
+            let st: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetTrue, foundT)
+            let sf: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetFalse, foundF)
             if ! foundT || ! foundF:
                 return Err[bool]("mir_ssa: cbr target not found (" + func.name + ":" + b2.label + ")")
             ssa2dAddUniqueInt(&succs, bi, st)
@@ -383,35 +383,35 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
             ssa2dAddUniqueInt(&preds, sf, bi)
 
     var foundEntry: bool = false
-    var entry: int32 = hashmaps.hashMapStrIntGet(labelMap, "entry", &foundEntry)
+    var entry: int32 = hashmaps.hashMapStrIntGet(labelMap, "entry", foundEntry)
     if ! foundEntry:
         entry = 0
 
     # Reverse postorder of reachable CFG.
     var visited: bool[]
     for i2 in 0..<n:
-        addPtr[bool](&visited, false)
+        add(visited, false)
     var stackNodes: int32[]
     var stackNext: int32[]
     var post: int32[]
     if entry >= 0 && entry < n:
-        setPtr[bool](&visited, entry, true)
-        addPtr[int32](&stackNodes, entry)
-        addPtr[int32](&stackNext, 0)
+        visited[entry] = true
+        add(stackNodes, entry)
+        add(stackNext, int32(0))
     while stackNodes.len > 0:
         let topIdx: int32 = stackNodes.len - 1
-        let v: int32 = get[int32](stackNodes, topIdx)
-        let nextI: int32 = get[int32](stackNext, topIdx)
-        let vsucc: int32[] = get[int32[]](succs, v)
+        let v: int32 = stackNodes[topIdx]
+        let nextI: int32 = stackNext[topIdx]
+        let vsucc: int32[] = succs[v]
         if nextI < vsucc.len:
-            let s: int32 = get[int32](vsucc, nextI)
-            setPtr[int32](&stackNext, topIdx, nextI + 1)
-            if s >= 0 && s < n && ! get[bool](visited, s):
-                setPtr[bool](&visited, s, true)
-                addPtr[int32](&stackNodes, s)
-                addPtr[int32](&stackNext, 0)
+            let s: int32 = vsucc[nextI]
+            stackNext[topIdx] = nextI + 1
+            if s >= 0 && s < n && ! visited[s]:
+                visited[s] = true
+                add(stackNodes, s)
+                add(stackNext, int32(0))
         else:
-            addPtr[int32](&post, v)
+            add(post, v)
             stackNodes.len = topIdx
             stackNext.len = topIdx
 
@@ -420,7 +420,7 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_i2_1 = i2
     for __for_i2_1 in 0..(__for_start_i2_1 - (0)):
         i2 = __for_start_i2_1 - __for_i2_1
-        addPtr[int32](&rpo, get[int32](post, i2))
+        add(rpo, post[i2])
         i2 = i2 - 1
 
     # rpoIndex for intersect; unreachable blocks get a large index.
@@ -429,13 +429,13 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_i2_2 = i2
     for __for_i2_2 in __for_start_i2_2..<n:
         i2 = __for_i2_2
-        addPtr[int32](&rpoIndex, 1000000000)
+        add(rpoIndex, 1000000000)
         i2 = i2 + 1
     i2 = 0
     let __for_start_i2_3 = i2
     for __for_i2_3 in __for_start_i2_3..<rpo.len:
         i2 = __for_i2_3
-        setPtr[int32](&rpoIndex, get[int32](rpo, i2), i2)
+        rpoIndex[rpo[i2]] = i2
         i2 = i2 + 1
 
     # idom via Cooper-Harvey-Kennedy.
@@ -444,10 +444,10 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_i2_4 = i2
     for __for_i2_4 in __for_start_i2_4..<n:
         i2 = __for_i2_4
-        addPtr[int32](&idom, -1)
+        add(idom, -1)
         i2 = i2 + 1
     if entry >= 0 && entry < n:
-        setPtr[int32](&idom, entry, entry)
+        idom[entry] = entry
     var changed: bool = true
     while changed:
         changed = false
@@ -455,21 +455,21 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
         let __for_start_i2_5 = i2
         for __for_i2_5 in __for_start_i2_5..<rpo.len:
             i2 = __for_i2_5
-            let b3: int32 = get[int32](rpo, i2)
+            let b3: int32 = rpo[i2]
             if b3 == entry:
                 i2 = i2 + 1
                 continue
-            let ps: int32[] = get[int32[]](preds, b3)
+            let ps: int32[] = preds[b3]
             var newIdom: int32 = -1
             for pi in 0..<ps.len:
-                let p: int32 = get[int32](ps, pi)
-                if p >= 0 && p < n && get[int32](idom, p) != -1:
+                let p: int32 = ps[pi]
+                if p >= 0 && p < n && idom[p] != -1:
                     if newIdom == -1:
                         newIdom = p
                     else:
                         newIdom = ssaIntersect(p, newIdom, idom, rpoIndex)
-            if newIdom != -1 && get[int32](idom, b3) != newIdom:
-                setPtr[int32](&idom, b3, newIdom)
+            if newIdom != -1 && idom[b3] != newIdom:
+                idom[b3] = newIdom
                 changed = true
             i2 = i2 + 1
 
@@ -479,7 +479,7 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     for __for_bi_6 in __for_start_bi_6..<n:
         bi = __for_bi_6
         if bi != entry:
-            let p2: int32 = get[int32](idom, bi)
+            let p2: int32 = idom[bi]
             if p2 >= 0 && p2 < n && p2 != bi:
                 ssa2dAddUniqueInt(&domChildren, p2, bi)
         bi = bi + 1
@@ -490,13 +490,13 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_bi_7 = bi
     for __for_bi_7 in __for_start_bi_7..<n:
         bi = __for_bi_7
-        let ps2: int32[] = get[int32[]](preds, bi)
+        let ps2: int32[] = preds[bi]
         if ps2.len >= 2:
             for pi2 in 0..<ps2.len:
-                var runner: int32 = get[int32](ps2, pi2)
-                while runner >= 0 && runner < n && runner != get[int32](idom, bi):
+                var runner: int32 = ps2[pi2]
+                while runner >= 0 && runner < n && runner != idom[bi]:
                     ssa2dAddUniqueInt(&df, runner, bi)
-                    let next2: int32 = get[int32](idom, runner)
+                    let next2: int32 = idom[runner]
                     if next2 == runner:
                         break
                     runner = next2
@@ -508,16 +508,16 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_i2_8 = i2
     for __for_i2_8 in __for_start_i2_8..<baseCount:
         i2 = __for_i2_8
-        addPtr[bool](&addrTaken, false)
+        add(addrTaken, false)
         i2 = i2 + 1
     bi = 0
     let __for_start_bi_9 = bi
     for __for_bi_9 in __for_start_bi_9..<n:
         bi = __for_bi_9
-        let bb: MirBlock = get[MirBlock](func.blocks, bi)
+        let bb: MirBlock = func.blocks[bi]
         if bb != nil:
             for si in 0..<bb.stmts.len:
-                let s2: MirStmt = get[MirStmt](bb.stmts, si)
+                let s2: MirStmt = bb.stmts[si]
                 if s2.kind == msLet || s2.kind == msVar || s2.kind == msAssign:
                     ssaMarkAddrTaken(s2.expr, &addrTaken)
                 elif s2.kind == msStore:
@@ -536,19 +536,19 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_i2_10 = i2
     for __for_i2_10 in __for_start_i2_10..<baseCount:
         i2 = __for_i2_10
-        addPtr[bool](&isCandidate, true)
+        add(isCandidate, true)
         i2 = i2 + 1
     i2 = 0
     let __for_start_i2_11 = i2
     for __for_i2_11 in __for_start_i2_11..<baseCount:
         i2 = __for_i2_11
-        if get[bool](addrTaken, i2):
-            setPtr[bool](&isCandidate, i2, false)
+        if addrTaken[i2]:
+            isCandidate[i2] = false
         i2 = i2 + 1
     for oi in 0..<func.objLocals.len:
-        let ol: MirObjLocal = get[MirObjLocal](func.objLocals, oi)
+        let ol: MirObjLocal = func.objLocals[oi]
         if ol.slot >= 0 && ol.slot < baseCount:
-            setPtr[bool](&isCandidate, ol.slot, false)
+            isCandidate[ol.slot] = false
 
     # defBlocks[var] = blocks defining base slot.
     var defBlocks: int32[][] = ssaNewSeq2DInt(baseCount)
@@ -556,22 +556,22 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_bi_12 = bi
     for __for_bi_12 in __for_start_bi_12..<n:
         bi = __for_bi_12
-        let bb2: MirBlock = get[MirBlock](func.blocks, bi)
+        let bb2: MirBlock = func.blocks[bi]
         if bb2 != nil:
             for si2 in 0..<bb2.stmts.len:
-                let s3: MirStmt = get[MirStmt](bb2.stmts, si2)
+                let s3: MirStmt = bb2.stmts[si2]
                 if s3.kind == msLet || s3.kind == msVar || s3.kind == msAssign || s3.kind == msParam:
                     let v: int32 = s3.slot
-                    if v >= 0 && v < baseCount && get[bool](isCandidate, v):
+                    if v >= 0 && v < baseCount && isCandidate[v]:
                         ssa2dAddUniqueInt(&defBlocks, v, bi)
         bi = bi + 1
 
     # Place phi vars by dominance frontier.
     var phiVarsByBlock: int32[][] = ssaNewSeq2DInt(n)
     for vId in 0..<baseCount:
-        if ! get[bool](isCandidate, vId):
+        if ! isCandidate[vId]:
             continue
-        let defs0: int32[] = get[int32[]](defBlocks, vId)
+        let defs0: int32[] = defBlocks[vId]
         if defs0.len <= 1:
             continue
         var isDef: bool[]
@@ -579,15 +579,15 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
         let __for_start_i2_13 = i2
         for __for_i2_13 in __for_start_i2_13..<n:
             i2 = __for_i2_13
-            addPtr[bool](&isDef, false)
+            add(isDef, false)
             i2 = i2 + 1
         i2 = 0
         let __for_start_i2_14 = i2
         for __for_i2_14 in __for_start_i2_14..<defs0.len:
             i2 = __for_i2_14
-            let d: int32 = get[int32](defs0, i2)
+            let d: int32 = defs0[i2]
             if d >= 0 && d < n:
-                setPtr[bool](&isDef, d, true)
+                isDef[d] = true
             i2 = i2 + 1
 
         var hasPhi: bool[]
@@ -595,21 +595,21 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
         let __for_start_i2_15 = i2
         for __for_i2_15 in __for_start_i2_15..<n:
             i2 = __for_i2_15
-            addPtr[bool](&hasPhi, false)
+            add(hasPhi, false)
             i2 = i2 + 1
 
         var work: int32[] = defs0
         while work.len > 0:
-            let b4: int32 = get[int32](work, work.len - 1)
+            let b4: int32 = work[work.len - 1]
             work.len = work.len - 1
-            let frontier: int32[] = get[int32[]](df, b4)
+            let frontier: int32[] = df[b4]
             for fi in 0..<frontier.len:
-                let y: int32 = get[int32](frontier, fi)
-                if y >= 0 && y < n && ! get[bool](hasPhi, y):
+                let y: int32 = frontier[fi]
+                if y >= 0 && y < n && ! hasPhi[y]:
                     ssa2dAddUniqueInt(&phiVarsByBlock, y, vId)
-                    setPtr[bool](&hasPhi, y, true)
-                    if ! get[bool](isDef, y):
-                        addPtr[int32](&work, y)
+                    hasPhi[y] = true
+                    if ! isDef[y]:
+                        add(work, y)
 
     # Sort phi var lists deterministically and pre-allocate phi dest slots.
     var phiDefsByBlock: SsaPhiDef[][] = ssaNewSeq2DPhiDef(n)
@@ -617,18 +617,18 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_bi_16 = bi
     for __for_bi_16 in __for_start_bi_16..<n:
         bi = __for_bi_16
-        var vars: int32[] = get[int32[]](phiVarsByBlock, bi)
+        var vars: int32[] = phiVarsByBlock[bi]
         ssaSortIntsStable(&vars)
-        setPtr[int32[]](&phiVarsByBlock, bi, vars)
-        var defsOut: SsaPhiDef[] = get[SsaPhiDef[]](phiDefsByBlock, bi)
+        phiVarsByBlock[bi] = vars
+        var defsOut: SsaPhiDef[] = phiDefsByBlock[bi]
         for vi in 0..<vars.len:
-            let varId2: int32 = get[int32](vars, vi)
+            let varId2: int32 = vars[vi]
             let dest: int32 = ssaAllocSlot(func, varId2)
             var pd: SsaPhiDef
             pd.varId = varId2
             pd.destSlot = dest
-            addPtr[SsaPhiDef](&defsOut, pd)
-        setPtr[SsaPhiDef[]](&phiDefsByBlock, bi, defsOut)
+            add(defsOut, pd)
+        phiDefsByBlock[bi] = defsOut
         bi = bi + 1
 
     # Renaming over dominator tree; record edge moves for phi elimination.
@@ -646,13 +646,13 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_i2_17 = i2
     for __for_i2_17 in __for_start_i2_17..<baseCount:
         i2 = __for_i2_17
-        addPtr[int32](&ctx.varTop, -1)
+        add(ctx.varTop, -1)
         i2 = i2 + 1
     i2 = 0
     let __for_start_i2_18 = i2
     for __for_i2_18 in __for_start_i2_18..<baseCount:
         i2 = __for_i2_18
-        if get[bool](isCandidate, i2):
+        if isCandidate[i2]:
             ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, i2, i2)
         i2 = i2 + 1
 
@@ -672,39 +672,39 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
     let __for_start_bi_19 = bi
     for __for_bi_19 in __for_start_bi_19..<n:
         bi = __for_bi_19
-        let succList2: int32[] = get[int32[]](succs, bi)
-        let predList2: int32[] = get[int32[]](preds, bi)
-        addPtr[int32](&succCount, succList2.len)
-        addPtr[int32](&predCount, predList2.len)
+        let succList2: int32[] = succs[bi]
+        let predList2: int32[] = preds[bi]
+        add(succCount, succList2.len)
+        add(predCount, predList2.len)
         bi = bi + 1
 
     for ei in 0..<ctx.edgeMoves.len:
-        let em2: SsaEdgeMoves = get[SsaEdgeMoves](ctx.edgeMoves, ei)
+        let em2: SsaEdgeMoves = ctx.edgeMoves[ei]
         if em2 == nil || em2.moves.len == 0:
             continue
-        let fromBlk: MirBlock = get[MirBlock](func.blocks, em2.fromIdx)
+        let fromBlk: MirBlock = func.blocks[em2.fromIdx]
         if fromBlk == nil:
             continue
-        let fromSucc: int32 = get[int32](succCount, em2.fromIdx)
-        let toPred: int32 = get[int32](predCount, em2.toIdx)
+        let fromSucc: int32 = succCount[em2.fromIdx]
+        let toPred: int32 = predCount[em2.toIdx]
         if fromSucc == 1:
             for mi in 0..<em2.moves.len:
-                let mv: SsaMove = get[SsaMove](em2.moves, mi)
-                addPtr[MirStmt](&fromBlk.stmts, mirStmtAssign("", mv.destSlot, mirLocal(mv.srcSlot)))
+                let mv: SsaMove = em2.moves[mi]
+                add(fromBlk.stmts, mirStmtAssign("", mv.destSlot, mirLocal(mv.srcSlot)))
             continue
         if toPred == 1:
-            let toBlk: MirBlock = get[MirBlock](func.blocks, em2.toIdx)
+            let toBlk: MirBlock = func.blocks[em2.toIdx]
             if toBlk == nil:
                 return Err[bool]("mir_ssa: missing to block (" + func.name + ")")
             var newStmts: MirStmt[]
             for mi2 in 0..<em2.moves.len:
-                let mv2: SsaMove = get[SsaMove](em2.moves, mi2)
-                addPtr[MirStmt](&newStmts, mirStmtAssign("", mv2.destSlot, mirLocal(mv2.srcSlot)))
+                let mv2: SsaMove = em2.moves[mi2]
+                add(newStmts, mirStmtAssign("", mv2.destSlot, mirLocal(mv2.srcSlot)))
             mi2 = 0
             let __for_start_mi2_20 = mi2
             for __for_mi2_20 in __for_start_mi2_20..<toBlk.stmts.len:
                 mi2 = __for_mi2_20
-                addPtr[MirStmt](&newStmts, get[MirStmt](toBlk.stmts, mi2))
+                add(newStmts, toBlk.stmts[mi2])
                 mi2 = mi2 + 1
             toBlk.stmts = newStmts
             continue
@@ -714,17 +714,17 @@ fn mirSsaLowerFunc(module: MirModule, func: MirFunc): Result[bool] =
         var newLabel: str = "ssa_phi_edge_" + mirU64ToHex(h)
         var stmtsOut: MirStmt[]
         for mi3 in 0..<em2.moves.len:
-            let mv3: SsaMove = get[SsaMove](em2.moves, mi3)
-            addPtr[MirStmt](&stmtsOut, mirStmtAssign("", mv3.destSlot, mirLocal(mv3.srcSlot)))
+            let mv3: SsaMove = em2.moves[mi3]
+            add(stmtsOut, mirStmtAssign("", mv3.destSlot, mirLocal(mv3.srcSlot)))
         let nb: MirBlock = mirBlockWithStmts(newLabel, stmtsOut, mirTermBr(em2.toLabel))
         mirAddBlock(func, nb)
         if fromBlk.term.kind == mtBr:
-            if streq(fromBlk.term.target, em2.toLabel):
+            if (fromBlk.term.target == em2.toLabel):
                 fromBlk.term.target = newLabel
         elif fromBlk.term.kind == mtCbr:
-            if streq(fromBlk.term.targetTrue, em2.toLabel):
+            if (fromBlk.term.targetTrue == em2.toLabel):
                 fromBlk.term.targetTrue = newLabel
-            if streq(fromBlk.term.targetFalse, em2.toLabel):
+            if (fromBlk.term.targetFalse == em2.toLabel):
                 fromBlk.term.targetFalse = newLabel
 
     return Ok[bool](true)
@@ -733,7 +733,7 @@ fn mirSsaLowerModule(module: MirModule): Result[bool] =
     if module == nil:
         return Ok[bool](true)
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let f: MirFunc = module.funcs[i]
         let r: Result[bool] = mirSsaLowerFunc(module, f)
         if ! IsOk[bool](r):
             return r

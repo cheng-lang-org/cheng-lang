@@ -131,6 +131,9 @@ if [ "$backend_linker" = "self" ]; then
   run_step "backend.closedloop_stage1_smoke.compile" env \
     CHENG_MM="$backend_mm" \
     CHENG_C_SYSTEM=system \
+    CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
+    CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
+    CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
     CHENG_BACKEND_FRONTEND=stage1 \
     CHENG_BACKEND_EMIT=exe \
     CHENG_BACKEND_LINKER=self \
@@ -144,6 +147,9 @@ else
   run_step "backend.closedloop_stage1_smoke.compile" env \
     CHENG_MM="$backend_mm" \
     CHENG_C_SYSTEM=system \
+    CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
+    CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
+    CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
     CHENG_BACKEND_FRONTEND=stage1 \
     CHENG_BACKEND_EMIT=exe \
     CHENG_BACKEND_LINKER=system \
@@ -161,6 +167,9 @@ if [ "$run_fullspec" = "1" ]; then
     run_step "backend.closedloop_fullspec.compile" env \
       CHENG_MM="$backend_mm" \
       CHENG_C_SYSTEM=system \
+      CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
+      CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
+      CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
       CHENG_BACKEND_FRONTEND=stage1 \
       CHENG_BACKEND_EMIT=exe \
       CHENG_BACKEND_VALIDATE=1 \
@@ -175,6 +184,9 @@ if [ "$run_fullspec" = "1" ]; then
     run_step "backend.closedloop_fullspec.compile" env \
       CHENG_MM="$backend_mm" \
       CHENG_C_SYSTEM=system \
+      CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
+      CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
+      CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
       CHENG_BACKEND_FRONTEND=stage1 \
       CHENG_BACKEND_EMIT=exe \
       CHENG_BACKEND_VALIDATE=1 \

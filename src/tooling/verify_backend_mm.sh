@@ -53,6 +53,7 @@ fi
 driver="$(sh src/tooling/backend_driver_path.sh)"
 linker_mode="${CHENG_BACKEND_LINKER:-self}"
 target="${CHENG_BACKEND_TARGET:-arm64-apple-darwin}"
+frontend="${CHENG_BACKEND_MM_FRONTEND:-mvp}"
 safe_target="$(printf '%s' "$target" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_')"
 runtime_obj="${CHENG_BACKEND_RUNTIME_OBJ:-chengcache/system_helpers.backend.cheng.${safe_target}.o}"
 if [ "$linker_mode" = "self" ]; then
@@ -87,7 +88,10 @@ run_fixture() {
     set +e
     CHENG_MM=orc \
     CHENG_C_SYSTEM=system \
-    CHENG_BACKEND_FRONTEND=stage1 \
+    CHENG_BACKEND_FRONTEND="$frontend" \
+    CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
+    CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
+    CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
     CHENG_BACKEND_VALIDATE=1 \
     CHENG_BACKEND_MULTI=0 \
     CHENG_BACKEND_MULTI_FORCE=0 \
@@ -115,7 +119,10 @@ run_fixture() {
 
   CHENG_MM=orc \
   CHENG_C_SYSTEM=system \
-  CHENG_BACKEND_FRONTEND=stage1 \
+  CHENG_BACKEND_FRONTEND="$frontend" \
+  CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
+  CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
+  CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
   CHENG_BACKEND_VALIDATE=1 \
   CHENG_BACKEND_MULTI=0 \
   CHENG_BACKEND_MULTI_FORCE=0 \

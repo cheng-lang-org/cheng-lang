@@ -56,7 +56,10 @@ fn eofTok(): Token =
 
 fn current(p: ParserStateObj*): Token =
     if p != nil && p->idx < p->tokens.len:
-        return get[Token](p->tokens, p->idx)
+        if p->tokens.buffer != nil:
+            let off64: int64 = int64(p->idx) * sizeof Token
+            let tokPtr: Token* = Token*(ptr_add(p->tokens.buffer, int32(off64)))
+            return *tokPtr
     return eofTok()
 
 fn peek(p: ParserStateObj*, ahead: int32): Token =
@@ -64,7 +67,10 @@ fn peek(p: ParserStateObj*, ahead: int32): Token =
         return eofTok()
     let i: int32 = p->idx + ahead
     if i >= 0 && i < p->tokens.len:
-        return get[Token](p->tokens, i)
+        if p->tokens.buffer != nil:
+            let off64: int64 = int64(i) * sizeof Token
+            let tokPtr: Token* = Token*(ptr_add(p->tokens.buffer, int32(off64)))
+            return *tokPtr
     return eofTok()
 
 fn curKind(p: ParserStateObj*): TokenKind =
@@ -97,7 +103,7 @@ fn addDiag(diags: Diagnostic[]*, severity: Severity, filename: str, line: int32,
     d.line = line
     d.col = col
     d.message = message
-    addPtr[Diagnostic](diags, d)
+    add(diags, d)
 
 fn addParseDiag(p: ParserStateObj*, t: Token, message: str) =
     if p == nil:
@@ -371,7 +377,7 @@ fn isBuiltinFnName(name: str): bool =
         return true
     if (name ==  "sizeof") ||(name ==  "default"):
         return true
-    if (name ==  "addPtr") ||(name ==  "get") ||(name ==  "getPtr"):
+    if (name ==  "add") ||(name ==  "get"):
         return true
     return false
 
@@ -699,7 +705,7 @@ fn parseAnnotations(p: ParserStateObj*): Node[] =
                 if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
                     continue
                 break
-        addPtr[Node](&out, ann)
+        add(out, ann)
         skipNewlines p
     return out
 
@@ -720,7 +726,7 @@ fn parseInlineAnnotations(p: ParserStateObj*): Node[] =
                 if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
                     continue
                 break
-        addPtr[Node](&out, ann)
+        add(out, ann)
     return out
 
 fn parseStringLit(p: ParserStateObj*): Node =
@@ -912,7 +918,7 @@ fn parseAtom(p: ParserStateObj*): Node =
         var first: Node = parseCallArg p
         var elems: Node[] = []
         elems.cap = 4
-        addPtr[Node](&elems, first)
+        add(elems, first)
         var isTuple: bool = false
         if first != nil && first.kind == nkCallArg:
             isTuple = true
@@ -921,7 +927,7 @@ fn parseAtom(p: ParserStateObj*): Node =
             if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  ")")):
                 while true:
                     let e: Node = parseCallArg p
-                    addPtr[Node](&elems, e)
+                    add(elems, e)
                     if ! matchSymbol(p, ","):
                         break
                     if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
@@ -930,7 +936,7 @@ fn parseAtom(p: ParserStateObj*): Node =
             if isTuple:
                 var tup: Node = newNode(nkTupleLit, posFrom(t))
                 for i2 in 0..<elems.len:
-                    addSon(tup, get[Node](elems, i2))
+                    addSon(tup, elems[i2])
                 return tup
             var par0: Node = newNode(nkPar, posFrom(t))
             addSon(par0, first)
@@ -939,7 +945,7 @@ fn parseAtom(p: ParserStateObj*): Node =
         if isTuple:
             var tup2: Node = newNode(nkTupleLit, posFrom(t))
             for j2 in 0..<elems.len:
-                addSon(tup2, get[Node](elems, j2))
+                addSon(tup2, elems[j2])
             return tup2
         var par: Node = newNode(nkPar, posFrom(t))
         addSon(par, first)
@@ -954,13 +960,13 @@ fn parseAtom(p: ParserStateObj*): Node =
         if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  "}")):
             while true:
                 let e3: Node = parseExpression(p, PrecNone)
-                addPtr[Node](&elems3, e3)
+                add(elems3, e3)
                 if ! matchSymbol(p, ","):
                     break
         expectSymbol(p, "}", "Expected '}'")
         var cur: Node = newNode(nkCurly, posFrom(t))
         for i4 in 0..<elems3.len:
-            addSon(cur, get[Node](elems3, i4))
+            addSon(cur, elems3[i4])
         return cur
     addParseDiag(p, t, "Unexpected token")
     advance p
@@ -1153,13 +1159,13 @@ fn maybeParseTypePtrBase(p: ParserStateObj*, base: Node): Node =
     var offset: int32 = 0
     while true:
         let tok: Token = peek(p, offset)
-        if tok.kind != tkSymbol || !streq(tok.lexeme, "*"):
+        if tok.kind != tkSymbol || !(tok.lexeme == "*"):
             break
         offset = offset + 1
     if offset == 0:
         return base
     let after: Token = peek(p, offset)
-    if after.kind != tkSymbol || !streq(after.lexeme, "("):
+    if after.kind != tkSymbol || !(after.lexeme == "("):
         return base
     for i in 0..<offset:
         let star: Token = current p
@@ -1276,7 +1282,7 @@ fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
             if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  ")")):
                 while true:
                     let arg: Node = parseCallArg p
-                    addPtr[Node](&args, arg)
+                    add(args, arg)
                     if ! matchSymbol(p, ","):
                         break
             expectSymbol(p, ")", "Expected ')'")
@@ -1286,7 +1292,7 @@ fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
                 addDiag(p->diags, svError, p->filename, node.pos.line, node.pos.col,
                         "discard syntax is removed; use a plain expression statement")
                 if args.len > 0:
-                    node = get[Node](args, 0)
+                    node = args[0]
                 else:
                     node = newNode(nkEmpty, posFrom(t))
             else:
@@ -1294,7 +1300,7 @@ fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
                 call.callStyle = CallStyleParen
                 addSon(call, node)
                 for ai in 0..<args.len:
-                    addSon(call, get[Node](args, ai))
+                    addSon(call, args[ai])
                 node = call
             continue
         if t.kind == tkSymbol &&(t.lexeme ==  "["):
@@ -1421,13 +1427,13 @@ fn maybeParseSpaceTypePtrCall(p: ParserStateObj*, arg: Node): Node =
     var offset: int32 = 0
     while true:
         let tok: Token = peek(p, offset)
-        if tok.kind != tkSymbol || !streq(tok.lexeme, "*"):
+        if tok.kind != tkSymbol || !(tok.lexeme == "*"):
             break
         offset = offset + 1
     if offset == 0:
         return arg
     let after: Token = peek(p, offset)
-    if after.kind != tkSymbol || !streq(after.lexeme, "("):
+    if after.kind != tkSymbol || !(after.lexeme == "("):
         return arg
     var base: Node = arg
     for i in 0..<offset:
@@ -1615,9 +1621,9 @@ fn parseFormalParams(p: ParserStateObj*): Node =
             break
         var names: Node[] = []
         names.cap = 2
-        addPtr[Node](&names, parseIdent(p, false))
+        add(names, parseIdent(p, false))
         while matchSymbol(p, ","):
-            addPtr[Node](&names, parseIdent(p, false))
+            add(names, parseIdent(p, false))
         var ptype: Node = emptyNode(posFrom(current(p)))
         if matchSymbol(p, ":"):
             ptype = parseTypeExpr p
@@ -1625,7 +1631,7 @@ fn parseFormalParams(p: ParserStateObj*): Node =
         if matchSymbol(p, "="):
             pdefault = parseExpression(p, PrecNone)
         for i in 0..<names.len:
-            let n0: Node = get[Node](names, i)
+            let n0: Node = names[i]
             var defs: Node = newNode(nkIdentDefs, n0.pos)
             addSon(defs, n0)
             addSon(defs, ptype)
@@ -1645,9 +1651,9 @@ fn parseFormalParams(p: ParserStateObj*): Node =
 fn parseRecordField(p: ParserStateObj*, recList: Node) =
     var names: Node[] = []
     names.cap = 2
-    addPtr[Node](&names, parseIdent(p, false))
+    add(names, parseIdent(p, false))
     while matchSymbol(p, ","):
-        addPtr[Node](&names, parseIdent(p, false))
+        add(names, parseIdent(p, false))
     var fType: Node = emptyNode(posFrom(current(p)))
     var fDefault: Node = emptyNode(posFrom(current(p)))
     if matchSymbol(p, ":"):
@@ -1655,7 +1661,7 @@ fn parseRecordField(p: ParserStateObj*, recList: Node) =
     if matchSymbol(p, "="):
         fDefault = parseExpression(p, PrecNone)
     for i in 0..<names.len:
-        let nm: Node = get[Node](names, i)
+        let nm: Node = names[i]
         var defs: Node = newNode(nkIdentDefs, nm.pos)
         addSon(defs, nm)
         addSon(defs, fType)
@@ -1756,16 +1762,16 @@ fn parseEnumType(p: ParserStateObj*, pos: SourcePos): Node =
             while curKind(p) != tkDedent && curKind(p) != tkEof:
                 var names: Node[] = []
                 names.cap = 4
-                addPtr[Node](&names, parseIdent(p, false))
+                add(names, parseIdent(p, false))
                 while matchSymbol(p, ","):
                     if curKind(p) == tkNewline || curKind(p) == tkDedent || curKind(p) == tkEof:
                         break
-                    addPtr[Node](&names, parseIdent(p, false))
+                    add(names, parseIdent(p, false))
                 var val: Node = emptyNode(posFrom(current(p)))
                 if matchSymbol(p, "="):
                     val = parseExpression(p, PrecNone)
                 for ni in 0..<names.len:
-                    let name: Node = get[Node](names, ni)
+                    let name: Node = names[ni]
                     var f: Node = newNode(nkEnumFieldDecl, name.pos)
                     addSon(f, name)
                     addSon(f, val)
@@ -2050,14 +2056,14 @@ fn parseRoutine(p: ParserStateObj*, kind: NodeKind, annots: Node[]): Node =
     var mergedAnnots: Node[] = []
     mergedAnnots.cap = annots.len + trailingAnnots.len + 1
     for ai0 in 0..<annots.len:
-        addPtr[Node](&mergedAnnots, get[Node](annots, ai0))
+        add(mergedAnnots, annots[ai0])
     for ai1 in 0..<trailingAnnots.len:
-        addPtr[Node](&mergedAnnots, get[Node](trailingAnnots, ai1))
+        add(mergedAnnots, trailingAnnots[ai1])
     var pragma: Node = emptyNode(posFrom(kw))
     if mergedAnnots.len > 0 ||(whereExpr != nil && whereExpr.kind != nkEmpty):
         pragma = newNode(nkPragma, posFrom(kw))
         for i in 0..<mergedAnnots.len:
-            addSon(pragma, get[Node](mergedAnnots, i))
+            addSon(pragma, mergedAnnots[i])
         if whereExpr != nil && whereExpr.kind != nkEmpty:
             var whereAnn: Node = newNode(nkAnnotation, wherePos)
             addSon(whereAnn, makeIdent("where", wherePos))
@@ -2131,7 +2137,7 @@ fn parseTypeDecl(p: ParserStateObj*, annots: Node[]): Node =
             if annots.len > 0:
                 pragma = newNode(nkPragma, posFrom(kw))
                 for ai in 0..<annots.len:
-                    addSon(pragma, get[Node](annots, ai))
+                    addSon(pragma, annots[ai])
             addSon(td, pragma)
             addSon(sl, td)
             skipStmtSeps p
@@ -2160,7 +2166,7 @@ fn parseTypeDecl(p: ParserStateObj*, annots: Node[]): Node =
     if annots.len > 0:
         pragma2 = newNode(nkPragma, posFrom(kw))
         for ai2 in 0..<annots.len:
-            addSon(pragma2, get[Node](annots, ai2))
+            addSon(pragma2, annots[ai2])
     addSon(td2, pragma2)
     return td2
 
@@ -2315,10 +2321,10 @@ fn parseStatement(p: ParserStateObj*): Node =
             var annots2: Node[] = []
             annots2.cap = annots.len + 1
             for ai in 0..<annots.len:
-                addPtr[Node](&annots2, get[Node](annots, ai))
+                add(annots2, annots[ai])
             var asyncAnn: Node = newNode(nkAnnotation, posFrom asyncTok)
             addSon(asyncAnn, makeIdent("async", posFrom asyncTok))
-            addPtr[Node](&annots2, asyncAnn)
+            add(annots2, asyncAnn)
             if curKind(p) == tkKeyword:
                 if curLexeme(p) ==  "fn":
                     return parseRoutine(p, nkFnDecl, annots2)
@@ -2405,10 +2411,10 @@ fn parseStatement(p: ParserStateObj*): Node =
                     var namesB: Node[] = []
                     namesB.cap = 2
                     let name0B: Node = parsePattern p
-                    addPtr[Node](&namesB, normalizeLetPattern(name0B))
+                    add(namesB, normalizeLetPattern(name0B))
                     while matchSymbol(p, ","):
                         let nameXB: Node = parsePattern p
-                        addPtr[Node](&namesB, normalizeLetPattern(nameXB))
+                        add(namesB, normalizeLetPattern(nameXB))
                     var typB: Node = emptyNode posFrom(t)
                     var valB: Node = emptyNode posFrom(t)
                     if matchSymbol(p, ":"):
@@ -2420,12 +2426,12 @@ fn parseStatement(p: ParserStateObj*): Node =
                     var liftedTypeB: Node = typB
                     var liftLastB: bool = false
                     if (typB == nil || typB.kind == nkEmpty) && namesB.len > 1:
-                        let lastNameB: Node = get[Node](namesB, namesB.len - 1)
+                        let lastNameB: Node = namesB[namesB.len - 1]
                         if lastNameB != nil && lastNameB.kind == nkPattern && kidCount lastNameB > 1:
                             liftedTypeB = kid(lastNameB, 1)
                             liftLastB = true
                     for niB in 0..<namesB.len:
-                        var nameNodeB: Node = get[Node](namesB, niB)
+                        var nameNodeB: Node = namesB[niB]
                         if liftLastB &&(niB == namesB.len - 1) && nameNodeB != nil && nameNodeB.kind == nkPattern && kidCount nameNodeB > 0:
                             nameNodeB = kid(nameNodeB, 0)
                         var dnB: Node = newNode(kind, posFrom(t))
@@ -2440,10 +2446,10 @@ fn parseStatement(p: ParserStateObj*): Node =
             var names: Node[] = []
             names.cap = 2
             let name0: Node = parsePattern p
-            addPtr[Node](&names, normalizeLetPattern(name0))
+            add(names, normalizeLetPattern(name0))
             while matchSymbol(p, ","):
                 let nameX: Node = parsePattern p
-                addPtr[Node](&names, normalizeLetPattern(nameX))
+                add(names, normalizeLetPattern(nameX))
             var typ: Node = emptyNode posFrom(t)
             var val: Node = emptyNode posFrom(t)
             if matchSymbol(p, ":"):
@@ -2455,10 +2461,10 @@ fn parseStatement(p: ParserStateObj*): Node =
             if annots.len > 0:
                 pragma = newNode(nkPragma, posFrom(t))
                 for i in 0..<annots.len:
-                    addSon(pragma, get[Node](annots, i))
+                    addSon(pragma, annots[i])
             if names.len == 1:
                 var dn: Node = newNode(kind, posFrom(t))
-                addSon(dn, get[Node](names, 0))
+                addSon(dn, names[0])
                 addSon(dn, typ)
                 addSon(dn, val)
                 addSon(dn, pragma)
@@ -2466,13 +2472,13 @@ fn parseStatement(p: ParserStateObj*): Node =
             var liftedType: Node = typ
             var liftLast: bool = false
             if (typ == nil || typ.kind == nkEmpty) && names.len > 1:
-                let lastName: Node = get[Node](names, names.len - 1)
+                let lastName: Node = names[names.len - 1]
                 if lastName != nil && lastName.kind == nkPattern && kidCount lastName > 1:
                     liftedType = kid(lastName, 1)
                     liftLast = true
             var sl: Node = newNode(nkStmtList, posFrom(t))
             for ni in 0..<names.len:
-                var nameNode: Node = get[Node](names, ni)
+                var nameNode: Node = names[ni]
                 if liftLast &&(ni == names.len - 1) && nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 0:
                     nameNode = kid(nameNode, 0)
                 var dn2: Node = newNode(kind, posFrom(t))

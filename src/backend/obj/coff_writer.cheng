@@ -50,8 +50,8 @@ fn coff_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
     for i in 0..<labels.len:
         if ! (i < offs.len):
             break
-        if streq(get[str](labels, i), label):
-            return Ok[int32](get[int32](offs, i))
+        if (labels[i] == label):
+            return Ok[int32](offs[i])
     return Err[int32]("coff_writer: missing label: " + label)
 
 fn coff_strContains(hay: str, needle: str): bool =
@@ -101,30 +101,58 @@ fn coff_strCmp(a: str, b: str): int32 =
 
 fn coff_seqContainsStr(items: str[], value: str): bool =
     for i in 0..<items.len:
-        if streq(get[str](items, i), value):
+        if (items[i] == value):
             return true
     return false
+
+fn coffSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "coff_writer: seq index out of bounds"
+    let off64: int64 = int64(idx) * int64(elemSize)
+    return ptr_add(buffer, int32(off64))
+
+fn coffReadStrPtr(items: str[]*, idx: int32): str =
+    if items == nil:
+        panic "coff_writer: nil seq pointer"
+    let p: str* = str*(coffSeqElemPtr(items->buffer, items->len, idx, sizeof str))
+    return *p
+
+fn coffWriteStrPtr(items: str[]*, idx: int32, val: str) =
+    if items == nil:
+        panic "coff_writer: nil seq pointer"
+    let p: str* = str*(coffSeqElemPtr(items->buffer, items->len, idx, sizeof str))
+    *p = val
+
+fn coffAddStrPtr(items: str[]*, value: str) =
+    if items == nil:
+        return
+    add(items, value)
+
+fn coffAddSymPtr(outSyms: CoffSym[]*, s: CoffSym) =
+    if outSyms == nil:
+        return
+    add(outSyms, s)
 
 fn coff_seqAddUniqueStr(items: str[]*, value: str) =
     if items == nil || value == nil || len(value) == 0:
         return
     if coff_seqContainsStr(*items, value):
         return
-    addPtr[str](items, value)
+    coffAddStrPtr(items, value)
 
 fn coff_sortStringsStable(items: str[]*) =
     if items == nil:
         return
     for i in 1..<items->len:
-        let key: str = get[str](*items, i)
+        let key: str = coffReadStrPtr(items, i)
         var j: int32 = i - 1
         let __for_start_j = j
         for __for_rev_j in 0..(__for_start_j - (0)):
             j = __for_start_j - __for_rev_j
-            if !(coff_strCmp(get[str](*items, j), key) > 0):
+            if !(coff_strCmp(coffReadStrPtr(items, j), key) > 0):
                 break
-            setPtr[str](items, j + 1, get[str](*items, j))
-        setPtr[str](items, j + 1, key)
+            coffWriteStrPtr(items, j + 1, coffReadStrPtr(items, j))
+        coffWriteStrPtr(items, j + 1, key)
 
 fn alignUp32(value: uint32, align: uint32): uint32 =
     if align == 0:
@@ -144,14 +172,14 @@ fn coffAddSym(outSyms: CoffSym[]*, name: str, value: uint32, sect: int32,
     s.stype = stype
     s.storage = storage
     s.nameOff = 0
-    addPtr[CoffSym](outSyms, s)
+    coffAddSymPtr(outSyms, s)
 
 fn coffFindSymIndex(syms: CoffSym[], name: str): int32 =
     if name == nil:
         return -1
     for i in 0..<syms.len:
-        let s: CoffSym = get[CoffSym](syms, i)
-        if s != nil && streq(s.name, name):
+        let s: CoffSym = syms[i]
+        if s != nil && (s.name == name):
             return i
     return -1
 
@@ -182,9 +210,9 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
     var cSymOffs: uint32[]
     cSymOffs.len = int(module.cstrs.len)
     for ci in 0..<module.cstrs.len:
-        let c: LirCString = get[LirCString](module.cstrs, ci)
+        let c: LirCString = module.cstrs[ci]
         let off: uint32 = uint32(rdata.len)
-        setPtr[uint32](&cSymOffs, ci, off)
+        cSymOffs[ci] = off
         bufStr0(&rdata, c.value)
 
     # Layout globals (.data/.bss).
@@ -195,17 +223,17 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
     var maxDataAlignPow2: int32 = 0
     var maxBssAlignPow2: int32 = 0
     for gi in 0..<module.globals.len:
-        let g: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g: LirGlobal = module.globals[gi]
         if g.alignPow2 > maxDataAlignPow2 && g.hasInit:
             maxDataAlignPow2 = g.alignPow2
         if g.alignPow2 > maxBssAlignPow2 && ! g.hasInit:
             maxBssAlignPow2 = g.alignPow2
     for gi in 0..<module.globals.len:
-        let g2: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g2: LirGlobal = module.globals[gi]
         let align: uint64 = uint64(1) << uint64(g2.alignPow2)
         if g2.hasInit:
             bufAlign(&data, align)
-            setPtr[uint32](&dataSymOffs, gi, uint32(data.len))
+            dataSymOffs[gi] = uint32(data.len)
             if g2.size == 4:
                 bufU32(&data, uint32(int32(g2.init)))
             else:
@@ -216,7 +244,7 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
                 bufU32(&data, hi)
         else:
             bssSize = alignUp32(bssSize, uint32(align))
-            setPtr[uint32](&bssSymOffs, gi, bssSize)
+            bssSymOffs[gi] = bssSize
             bssSize = bssSize + uint32(g2.size)
 
     # Encode .text and collect relocations.
@@ -225,18 +253,18 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
     funcOffs.len = int(module.funcs.len)
     for fi in 0..<module.funcs.len:
         bufAlign(&text, 4)
-        setPtr[uint32](&funcOffs, fi, uint32(text.len))
-        let f: LirFunc = get[LirFunc](module.funcs, fi)
+        funcOffs[fi] = uint32(text.len)
+        let f: LirFunc = module.funcs[fi]
 
         # Pass 1: compute label offsets within this function (in bytes from func start).
         var labels: str[16]
         var labelOffs: int32[16]
         var scanOff: int32 = 0
         for si in 0..<f.insts.len:
-            let inst0: LirInst = get[LirInst](f.insts, si)
+            let inst0: LirInst = f.insts[si]
             if inst0.op == loLabel:
-                addPtr[str](&labels, inst0.label)
-                addPtr[int32](&labelOffs, scanOff)
+                add(labels, inst0.label)
+                add(labelOffs, scanOff)
                 continue
             if inst0.op == loMovImm:
                 let wc: int32 = a64MovImmWordCount(a64Is64(inst0.rd), inst0.imm)
@@ -249,7 +277,7 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
         for __for_guard_ii in 0..<f.insts.len:
             if !(ii < f.insts.len):
                 break
-            let inst: LirInst = get[LirInst](f.insts, ii)
+            let inst: LirInst = f.insts[ii]
             if inst.op == loLabel:
                 ii = ii + 1
                 continue
@@ -287,7 +315,7 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
                 r.off = off
                 r.sym = inst.label
                 r.rtype = IMAGE_REL_ARM64_PAGEBASE_REL21
-                addPtr[CoffReloc](&relocs, r)
+                add(relocs, r)
             elif inst.op == loAddPageOff:
                 word = a64EncAddImm(true, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
                 var r2: CoffReloc
@@ -295,7 +323,7 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
                 r2.off = off
                 r2.sym = inst.label
                 r2.rtype = IMAGE_REL_ARM64_PAGEOFFSET_12A
-                addPtr[CoffReloc](&relocs, r2)
+                add(relocs, r2)
             elif inst.op == loSxtw:
                 word = a64EncSxtw(a64RegNum(inst.rd), a64RegNum(inst.rn))
             elif inst.op == loAdd:
@@ -412,7 +440,7 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
                 r3.off = off
                 r3.sym = inst.label
                 r3.rtype = IMAGE_REL_ARM64_BRANCH26
-                addPtr[CoffReloc](&relocs, r3)
+                add(relocs, r3)
             elif inst.op == loBlr:
                 word = a64EncBlr(a64RegNum(inst.rn))
             elif inst.op == loFmovDx:
@@ -467,50 +495,50 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
     # locals: cstrings
     if hasRdata:
         for ci in 0..<module.cstrs.len:
-            let c2: LirCString = get[LirCString](module.cstrs, ci)
-            coffAddSym(&syms, c2.label, get[uint32](cSymOffs, ci), rdataIndex,
+            let c2: LirCString = module.cstrs[ci]
+            coffAddSym(&syms, c2.label, cSymOffs[ci], rdataIndex,
                        uint16(0), IMAGE_SYM_CLASS_STATIC)
 
     let localCount: int32 = syms.len
 
     # extdefs: funcs
     for fi in 0..<module.funcs.len:
-        let f2: LirFunc = get[LirFunc](module.funcs, fi)
-        coffAddSym(&syms, f2.name, get[uint32](funcOffs, fi), textIndex,
+        let f2: LirFunc = module.funcs[fi]
+        coffAddSym(&syms, f2.name, funcOffs[fi], textIndex,
                    IMAGE_SYM_TYPE_FUNCTION, IMAGE_SYM_CLASS_EXTERNAL)
 
     # extdefs: globals
     for gi in 0..<module.globals.len:
-        let g3: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g3: LirGlobal = module.globals[gi]
         if g3.hasInit:
             if hasData:
-                coffAddSym(&syms, g3.name, get[uint32](dataSymOffs, gi), dataIndex,
+                coffAddSym(&syms, g3.name, dataSymOffs[gi], dataIndex,
                            uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
         else:
             if hasBss:
-                coffAddSym(&syms, g3.name, get[uint32](bssSymOffs, gi), bssIndex,
+                coffAddSym(&syms, g3.name, bssSymOffs[gi], bssIndex,
                            uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
 
     # undefs referenced by relocations.
     var undefs: str[]
     for ri in 0..<relocs.len:
-        let r0: CoffReloc = get[CoffReloc](relocs, ri)
+        let r0: CoffReloc = relocs[ri]
         if r0 != nil && r0.sym != nil && len(r0.sym) > 0:
             if coffFindSymIndex(syms, r0.sym) < 0:
                 coff_seqAddUniqueStr(&undefs, r0.sym)
     coff_sortStringsStable(&undefs)
     for ri in 0..<undefs.len:
-        coffAddSym(&syms, get[str](undefs, ri), uint32(0), 0, uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
+        coffAddSym(&syms, undefs[ri], uint32(0), 0, uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
 
     # Build string table for long symbol names.
     var strtab: uint8[]
     bufU32(&strtab, uint32(0)) # placeholder size
     for si in 0..<syms.len:
-        let s0: CoffSym = get[CoffSym](syms, si)
+        let s0: CoffSym = syms[si]
         if s0 != nil && s0.name != nil && len(s0.name) > 8:
             s0.nameOff = uint32(strtab.len)
             bufStr0(&strtab, s0.name)
-            setPtr[CoffSym](&syms, si, s0)
+            syms[si] = s0
     bufU32At(&strtab, 0, uint32(strtab.len))
 
     # Section headers and file layout.
@@ -645,7 +673,7 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
         if uint32(out.len) != textRelPtr:
             return Err[uint8[]]("coff_writer: internal offset mismatch (.text relocs)")
         for ri in 0..<relocs.len:
-            let r5: CoffReloc = get[CoffReloc](relocs, ri)
+            let r5: CoffReloc = relocs[ri]
             let symIdx: int32 = coffFindSymIndex(syms, r5.sym)
             if symIdx < 0:
                 return Err[uint8[]]("coff_writer: missing relocation symbol")
@@ -658,7 +686,7 @@ fn coffBuild(module: LirModule): Result[uint8[]] =
 
     # Symbol table.
     for si in 0..<syms.len:
-        let s2: CoffSym = get[CoffSym](syms, si)
+        let s2: CoffSym = syms[si]
         if s2.nameOff != 0:
             bufU32(&out, uint32(0))
             bufU32(&out, s2.nameOff)

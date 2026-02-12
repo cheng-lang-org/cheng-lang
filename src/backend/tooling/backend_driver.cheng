@@ -174,17 +174,39 @@ fn driver_parseBoolDefault(raw: str, defaultValue: bool): bool =
     let s: str = lowerAscii(driver_trimAsciiSpace(raw))
     if driver_strIsEmpty(s):
         return defaultValue
-    if streq(s, "1") || streq(s, "true") || streq(s, "yes") || streq(s, "on"):
+    if driver_strEq(s, "1"):
         return true
-    if streq(s, "0") || streq(s, "false") || streq(s, "no") || streq(s, "off"):
+    if driver_strEq(s, "true"):
+        return true
+    if driver_strEq(s, "yes"):
+        return true
+    if driver_strEq(s, "on"):
+        return true
+    if driver_strEq(s, "0"):
+        return false
+    if driver_strEq(s, "false"):
+        return false
+    if driver_strEq(s, "no"):
+        return false
+    if driver_strEq(s, "off"):
         return false
     return defaultValue
 
 fn driver_parseLinkerSymtabAll(raw: str): bool =
     let s: str = lowerAscii(driver_trimAsciiSpace(raw))
-    if driver_strIsEmpty(s) || streq(s, "0") || streq(s, "minimal") || streq(s, "min"):
+    if driver_strIsEmpty(s):
         return false
-    if streq(s, "1") || streq(s, "all") || streq(s, "full"):
+    if driver_strEq(s, "0"):
+        return false
+    if driver_strEq(s, "minimal"):
+        return false
+    if driver_strEq(s, "min"):
+        return false
+    if driver_strEq(s, "1"):
+        return true
+    if driver_strEq(s, "all"):
+        return true
+    if driver_strEq(s, "full"):
         return true
     panic("backend_driver: invalid CHENG_BACKEND_LINKER_SYMTAB (expected minimal|all): " + raw)
 
@@ -193,6 +215,20 @@ fn driver_envBoolDefault(name: str, defaultValue: bool): bool =
 
 fn driver_envIsTrue(name: str): bool =
     return driver_envBoolDefault(name, false)
+
+fn driver_strEq(a: str, b: str): bool =
+    if a == nil && b == nil:
+        return true
+    if a == nil || b == nil:
+        return false
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    if na != nb:
+        return false
+    for i in 0..<na:
+        if a[i] != b[i]:
+            return false
+    return true
 
 fn driver_allocHashMapStrInt(cap0: int32): hashmaps.HashMapStrInt* =
     # Bootstrap note: some seed compilers fail to resolve `sizeof Mod.Type`.
@@ -281,24 +317,24 @@ fn driver_execCmdTrimmed(command: str): str =
 fn driver_detectHostTargetAuto(): str =
     let hostOs: str = driver_execCmdTrimmed("uname -s")
     let hostArch: str = driver_execCmdTrimmed("uname -m")
-    if streq(hostOs, "Darwin"):
-        if streq(hostArch, "arm64") || streq(hostArch, "aarch64"):
+    if driver_strEq(hostOs, "Darwin"):
+        if driver_strEq(hostArch, "arm64") || driver_strEq(hostArch, "aarch64"):
             return "arm64-apple-darwin"
-        if streq(hostArch, "x86_64") || streq(hostArch, "amd64"):
+        if driver_strEq(hostArch, "x86_64") || driver_strEq(hostArch, "amd64"):
             return "x86_64-apple-darwin"
         return ""
-    if streq(hostOs, "Linux"):
-        if streq(hostArch, "arm64") || streq(hostArch, "aarch64"):
+    if driver_strEq(hostOs, "Linux"):
+        if driver_strEq(hostArch, "arm64") || driver_strEq(hostArch, "aarch64"):
             return "aarch64-unknown-linux-gnu"
-        if streq(hostArch, "riscv64"):
+        if driver_strEq(hostArch, "riscv64"):
             return "riscv64-unknown-linux-gnu"
-        if streq(hostArch, "x86_64") || streq(hostArch, "amd64"):
+        if driver_strEq(hostArch, "x86_64") || driver_strEq(hostArch, "amd64"):
             return "x86_64-unknown-linux-gnu"
         return ""
     if driver_strHasPrefix(hostOs, "MINGW") || driver_strHasPrefix(hostOs, "MSYS") || driver_strHasPrefix(hostOs, "CYGWIN"):
-        if streq(hostArch, "arm64") || streq(hostArch, "aarch64"):
+        if driver_strEq(hostArch, "arm64") || driver_strEq(hostArch, "aarch64"):
             return "aarch64-pc-windows-msvc"
-        if streq(hostArch, "x86_64") || streq(hostArch, "amd64"):
+        if driver_strEq(hostArch, "x86_64") || driver_strEq(hostArch, "amd64"):
             return "x86_64-pc-windows-msvc"
         return ""
     return ""
@@ -338,7 +374,7 @@ fn driver_resolveSelfExeForParallel(raw: str): str =
 fn driver_fileStateStamp(path: str): str =
     if driver_strIsEmpty(path):
         return "file=<empty>\n"
-    if streq(path, "<shared>"):
+    if driver_strEq(path, "<shared>"):
         return "shared_unit=" + path + "\n"
     if ! frontend_lib.stage1_fileExists(path):
         return "missing=" + path + "\n"
@@ -351,7 +387,7 @@ fn driver_fileStateStamp(path: str): str =
 fn driver_buildModuleSourcesStamp(unitFiles: str[]): str =
     var out: str = ""
     for i in 0..<unitFiles.len:
-        out = out + driver_fileStateStamp(get[str](unitFiles, i))
+        out = out + driver_fileStateStamp(unitFiles[i])
     return out
 
 fn driver_hashCombine64(seed: int64, value: int64): int64 =
@@ -361,8 +397,8 @@ fn driver_hashCombine64(seed: int64, value: int64): int64 =
 fn driver_buildUnitFileStateHashes(unitFiles: str[]): int64[] =
     var out: int64[]
     for i in 0..<unitFiles.len:
-        let stamp: str = driver_fileStateStamp(get[str](unitFiles, i))
-        addPtr[int64](&out, mirFnv1a64(stamp))
+        let stamp: str = driver_fileStateStamp(unitFiles[i])
+        add(out, mirFnv1a64(stamp))
     return out
 
 fn driver_selfCompilerStamp(): str =
@@ -381,7 +417,7 @@ fn driver_selfCompilerStamp(): str =
 
 fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, inputPath: str,
                                allowNoMain: bool, wholeProgram: bool,
-                               skipGlobalInit: bool, multiLto: bool, compilerStamp: str): str =
+                               skipGlobalInit: bool, multiLto: bool, abi: str, compilerStamp: str): str =
     let opt2Raw: str = os.getEnvDefault("CHENG_BACKEND_OPT2", "")
     let optRaw: str = os.getEnvDefault("CHENG_BACKEND_OPT", "")
     let optLevelRaw: str = os.getEnvDefault("CHENG_BACKEND_OPT_LEVEL", "")
@@ -391,6 +427,8 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
     let mmRaw: str = os.getEnvDefault("CHENG_MM", "")
     let mmStrictRaw: str = os.getEnvDefault("CHENG_MM_STRICT", "")
     let noRealRaw: str = os.getEnvDefault("CHENG_BACKEND_NO_REAL", "")
+    let stdNoPtrRaw: str = os.getEnvDefault("CHENG_STAGE1_STD_NO_POINTERS", "")
+    let stdNoPtrStrictRaw: str = os.getEnvDefault("CHENG_STAGE1_STD_NO_POINTERS_STRICT", "")
     return "target=" + target + "\n" +
            "frontend=" + frontend + "\n" +
            "obj_writer=" + objWriter + "\n" +
@@ -399,6 +437,7 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
            "whole_program=" + driver_bool01(wholeProgram) + "\n" +
            "skip_global_init=" + driver_bool01(skipGlobalInit) + "\n" +
            "multi_lto=" + driver_bool01(multiLto) + "\n" +
+           "abi=" + abi + "\n" +
            "opt2=" + opt2Raw + "\n" +
            "opt=" + optRaw + "\n" +
            "opt_level=" + optLevelRaw + "\n" +
@@ -407,6 +446,8 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
            "intbits=" + intBitsRaw + "\n" +
            "mm=" + mmRaw + "\n" +
            "mm_strict=" + mmStrictRaw + "\n" +
+           "std_no_pointers=" + stdNoPtrRaw + "\n" +
+           "std_no_pointers_strict=" + stdNoPtrStrictRaw + "\n" +
            "no_real=" + noRealRaw + "\n" +
            compilerStamp
 
@@ -432,22 +473,26 @@ type
     DriverSeqSeqU64 = DriverSeqU64[]
 
 fn driver_addRowInt32(rows: var DriverSeqSeqInt32, row: int32[]) =
-    addPtr[DriverSeqInt32](rows, row)
+    add(rows, row)
 
 fn driver_addRowU64(rows: var DriverSeqSeqU64, row: uint64[]) =
-    addPtr[DriverSeqU64](rows, row)
+    add(rows, row)
 
 fn driver_getRowInt32(rows: DriverSeqSeqInt32, i: int32): int32[] =
-    return get[DriverSeqInt32](rows, i)
+    let slot: int32[]* = int32[]*(ptr_add(rows.buffer, i * sizeof int32[]))
+    return *slot
 
 fn driver_setRowInt32(rows: var DriverSeqSeqInt32, i: int32, row: int32[]) =
-    setPtr[DriverSeqInt32](&rows, i, row)
+    let slot: int32[]* = int32[]*(ptr_add(rows.buffer, i * sizeof int32[]))
+    *slot = row
 
 fn driver_getRowU64(rows: DriverSeqSeqU64, i: int32): uint64[] =
-    return get[DriverSeqU64](rows, i)
+    let slot: uint64[]* = uint64[]*(ptr_add(rows.buffer, i * sizeof uint64[]))
+    return *slot
 
 fn driver_setRowU64(rows: var DriverSeqSeqU64, i: int32, row: uint64[]) =
-    setPtr[DriverSeqU64](&rows, i, row)
+    let slot: uint64[]* = uint64[]*(ptr_add(rows.buffer, i * sizeof uint64[]))
+    *slot = row
 
 fn driver_newSeq2DInt(n: int32): DriverSeqSeqInt32 =
     var out: DriverSeqSeqInt32
@@ -475,11 +520,11 @@ fn driver_setDepBit(depBits: DriverSeqSeqU64*, fromIdx: int32, toIdx: int32): bo
         return false
     let bit: int32 = toIdx % 64
     let mask: uint64 = uint64(1) << uint64(bit)
-    let cur: uint64 = get[uint64](row, wordIdx)
+    let cur: uint64 = row[wordIdx]
     if (cur & mask) != uint64(0):
         return false
-    setPtr[uint64](&row, wordIdx, cur | mask)
-    setPtr[DriverSeqU64](depBits, fromIdx, row)
+    row[wordIdx] = cur | mask
+    driver_setRowU64(*depBits, fromIdx, row)
     return true
 
 fn driver_collectExprUnitDeps(expr: MirExpr, ownerUnit: int32, depBits: DriverSeqSeqU64*,
@@ -490,16 +535,16 @@ fn driver_collectExprUnitDeps(expr: MirExpr, ownerUnit: int32, depBits: DriverSe
     if expr.kind == meCall:
         if driver_strNonEmpty(expr.callee):
             var foundFn: bool = false
-            let depFn: int32 = hashmaps.hashMapStrIntGetPtr(fnOwners, expr.callee, &foundFn)
+            let depFn: int32 = hashmaps.hashMapStrIntGetPtrRaw(fnOwners, expr.callee,&foundFn)
             if foundFn && depFn >= 0 && depFn != ownerUnit:
                 driver_setDepBit(depBits, ownerUnit, depFn)
         for ai in 0..<expr.args.len:
-            driver_collectExprUnitDeps(get[MirExpr](expr.args, ai), ownerUnit, depBits, fnOwners, globalOwners)
+            driver_collectExprUnitDeps(expr.args[ai], ownerUnit, depBits, fnOwners, globalOwners)
         return
     if expr.kind == meGlobalAddr:
         if driver_strNonEmpty(expr.globalName):
             var foundGlobal: bool = false
-            let depGlobal: int32 = hashmaps.hashMapStrIntGetPtr(globalOwners, expr.globalName, &foundGlobal)
+            let depGlobal: int32 = hashmaps.hashMapStrIntGetPtrRaw(globalOwners, expr.globalName,&foundGlobal)
             if foundGlobal && depGlobal >= 0 && depGlobal != ownerUnit:
                 driver_setDepBit(depBits, ownerUnit, depGlobal)
         return
@@ -520,10 +565,10 @@ fn driver_collectFuncUnitDeps(f: MirFunc, ownerUnit: int32, depBits: DriverSeqSe
     if f == nil:
         return
     for bi in 0..<f.blocks.len:
-        let block: MirBlock = get[MirBlock](f.blocks, bi)
+        let block: MirBlock = f.blocks[bi]
         if block != nil:
             for si in 0..<block.stmts.len:
-                let st: MirStmt = get[MirStmt](block.stmts, si)
+                let st: MirStmt = block.stmts[si]
                 driver_collectExprUnitDeps(st.expr, ownerUnit, depBits, fnOwners, globalOwners)
                 driver_collectExprUnitDeps(st.addrExpr, ownerUnit, depBits, fnOwners, globalOwners)
             driver_collectExprUnitDeps(block.term.retExpr, ownerUnit, depBits, fnOwners, globalOwners)
@@ -533,7 +578,7 @@ fn driver_callNameSetAdd(names: hashmaps.HashMapStrInt*, callee: str) =
     if names == nil || driver_strIsEmpty(callee):
         return
     var found: bool = false
-    hashmaps.hashMapStrIntGetPtr(names, callee, &found)
+    hashmaps.hashMapStrIntGetPtrRaw(names, callee,&found)
     if ! found:
         hashmaps.hashMapStrIntPut(names, callee, 1)
 
@@ -543,7 +588,7 @@ fn driver_collectExprCallNames(expr: MirExpr, names: hashmaps.HashMapStrInt*) =
     if expr.kind == meCall:
         driver_callNameSetAdd(names, expr.callee)
         for ai in 0..<expr.args.len:
-            driver_collectExprCallNames(get[MirExpr](expr.args, ai), names)
+            driver_collectExprCallNames(expr.args[ai], names)
         return
     if expr.kind == meBin || expr.kind == meCmp:
         driver_collectExprCallNames(expr.lhs, names)
@@ -560,10 +605,10 @@ fn driver_collectFuncCallNames(f: MirFunc, names: hashmaps.HashMapStrInt*) =
     if f == nil || names == nil:
         return
     for bi in 0..<f.blocks.len:
-        let block: MirBlock = get[MirBlock](f.blocks, bi)
+        let block: MirBlock = f.blocks[bi]
         if block != nil:
             for si in 0..<block.stmts.len:
-                let st: MirStmt = get[MirStmt](block.stmts, si)
+                let st: MirStmt = block.stmts[si]
                 driver_collectExprCallNames(st.expr, names)
                 driver_collectExprCallNames(st.addrExpr, names)
             driver_collectExprCallNames(block.term.retExpr, names)
@@ -577,7 +622,7 @@ fn driver_collectExprGlobalNames(expr: MirExpr, names: hashmaps.HashMapStrInt*) 
         return
     if expr.kind == meCall:
         for ai in 0..<expr.args.len:
-            driver_collectExprGlobalNames(get[MirExpr](expr.args, ai), names)
+            driver_collectExprGlobalNames(expr.args[ai], names)
         return
     if expr.kind == meBin || expr.kind == meCmp:
         driver_collectExprGlobalNames(expr.lhs, names)
@@ -594,10 +639,10 @@ fn driver_collectFuncGlobalNames(f: MirFunc, names: hashmaps.HashMapStrInt*) =
     if f == nil || names == nil:
         return
     for bi in 0..<f.blocks.len:
-        let block: MirBlock = get[MirBlock](f.blocks, bi)
+        let block: MirBlock = f.blocks[bi]
         if block != nil:
             for si in 0..<block.stmts.len:
-                let st: MirStmt = get[MirStmt](block.stmts, si)
+                let st: MirStmt = block.stmts[si]
                 driver_collectExprGlobalNames(st.expr, names)
                 driver_collectExprGlobalNames(st.addrExpr, names)
             driver_collectExprGlobalNames(block.term.retExpr, names)
@@ -612,47 +657,47 @@ fn driver_buildUnitDependencyGraph(module: MirModule, unitFiles: str[]): DriverS
     var depBits: DriverSeqSeqU64 = driver_newSeq2DU64(n, words)
     var unitIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(n * 2 + 8)
     for unitIdx in 0..<n:
-        hashmaps.hashMapStrIntPut(&unitIndex, get[str](unitFiles, unitIdx), unitIdx)
+        hashmaps.hashMapStrIntPut(&unitIndex, unitFiles[unitIdx], unitIdx)
 
     var fnOwners: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(module.funcs.len * 2 + 8)
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let f: MirFunc = module.funcs[i]
         if f != nil && ! f.isExtern && driver_strNonEmpty(f.name):
             let ownerKey: str = driver_unitOwnerKey(f.originFile)
             var foundOwner: bool = false
-            let ownerIdx: int32 = hashmaps.hashMapStrIntGetPtr(&unitIndex, ownerKey, &foundOwner)
+            let ownerIdx: int32 = hashmaps.hashMapStrIntGetPtrRaw(&unitIndex, ownerKey,&foundOwner)
             if foundOwner:
                 var exists: bool = false
-                hashmaps.hashMapStrIntGetPtr(&fnOwners, f.name, &exists)
+                hashmaps.hashMapStrIntGetPtrRaw(&fnOwners, f.name,&exists)
                 if ! exists:
                     hashmaps.hashMapStrIntPut(&fnOwners, f.name, ownerIdx)
 
     var globalOwners: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(module.globals.len * 2 + 8)
     for i in 0..<module.globals.len:
-        let g: MirGlobal = get[MirGlobal](module.globals, i)
+        let g: MirGlobal = module.globals[i]
         if driver_strNonEmpty(g.name):
             let ownerKey2: str = driver_unitOwnerKey(g.originFile)
             var foundOwner2: bool = false
-            let ownerIdx2: int32 = hashmaps.hashMapStrIntGetPtr(&unitIndex, ownerKey2, &foundOwner2)
+            let ownerIdx2: int32 = hashmaps.hashMapStrIntGetPtrRaw(&unitIndex, ownerKey2,&foundOwner2)
             if foundOwner2:
                 var exists2: bool = false
-                hashmaps.hashMapStrIntGetPtr(&globalOwners, g.name, &exists2)
+                hashmaps.hashMapStrIntGetPtrRaw(&globalOwners, g.name,&exists2)
                 if ! exists2:
                     hashmaps.hashMapStrIntPut(&globalOwners, g.name, ownerIdx2)
 
     for i in 0..<module.funcs.len:
-        let f2: MirFunc = get[MirFunc](module.funcs, i)
+        let f2: MirFunc = module.funcs[i]
         if f2 != nil && ! f2.isExtern:
             let ownerKey3: str = driver_unitOwnerKey(f2.originFile)
             var foundOwner3: bool = false
-            let ownerIdx3: int32 = hashmaps.hashMapStrIntGetPtr(&unitIndex, ownerKey3, &foundOwner3)
+            let ownerIdx3: int32 = hashmaps.hashMapStrIntGetPtrRaw(&unitIndex, ownerKey3,&foundOwner3)
             if foundOwner3:
                 driver_collectFuncUnitDeps(f2, ownerIdx3, &depBits, &fnOwners, &globalOwners)
     for ui in 0..<n:
         var rowOut: int32[]
         let rowBits: uint64[] = driver_getRowU64(depBits, ui)
         for wi in 0..<rowBits.len:
-            let word: uint64 = get[uint64](rowBits, wi)
+            let word: uint64 = rowBits[wi]
             if word != uint64(0):
                 for bi in 0..<64:
                     let idx: int32 = wi * 64 + bi
@@ -660,14 +705,14 @@ fn driver_buildUnitDependencyGraph(module: MirModule, unitFiles: str[]): DriverS
                         break
                     let mask: uint64 = uint64(1) << uint64(bi)
                     if (word & mask) != uint64(0):
-                        addPtr[int32](&rowOut, idx)
+                        add(rowOut, idx)
         driver_setRowInt32(deps, ui, rowOut)
     return deps
 
 fn driver_buildUnitListStamp(unitFiles: str[]): str =
     var out: str = ""
     for i in 0..<unitFiles.len:
-        out = out + get[str](unitFiles, i) + "\n"
+        out = out + unitFiles[i] + "\n"
     return out
 
 fn driver_fnv1a64Update(h0: uint64, s0: str): uint64 =
@@ -688,7 +733,7 @@ fn driver_fnv1a64UpdateChar(h0: uint64, c: char): uint64 =
 fn driver_hashUnitList(unitFiles: str[]): int64 =
     var h: uint64 = uint64(1469598103934665603)
     for i in 0..<unitFiles.len:
-        h = driver_fnv1a64Update(h, get[str](unitFiles, i))
+        h = driver_fnv1a64Update(h, unitFiles[i])
         h = driver_fnv1a64UpdateChar(h, '\n')
     return int64(h)
 
@@ -704,48 +749,50 @@ fn driver_buildUnitDepClosureBits(unitDeps: DriverSeqSeqInt32, unitCount: int32)
         if ui >= 0 && ui < unitDeps.len:
             let rowDeps: int32[] = driver_getRowInt32(unitDeps, ui)
             for di in 0..<rowDeps.len:
-                let depIdx: int32 = get[int32](rowDeps, di)
+                let depIdx: int32 = rowDeps[di]
                 if depIdx >= 0 && depIdx < unitCount:
                     driver_setDepBit(&closure, ui, depIdx)
                     var revRow: int32[] = driver_getRowInt32(revDeps, depIdx)
-                    addPtr[int32](&revRow, ui)
+                    add(revRow, ui)
                     driver_setRowInt32(revDeps, depIdx, revRow)
 
-    var queue: int32[unitCount]
-    var queued: bool[unitCount]
+    var queue: int32[]
+    queue.cap = unitCount
+    var queued: bool[]
+    queued.cap = unitCount
     for ui in 0..<unitCount:
-        addPtr[int32](&queue, ui)
-        addPtr[bool](&queued, true)
+        add(queue, ui)
+        add(queued, true)
     for qi in 0..<queue.len:
-        let node: int32 = get[int32](queue, qi)
+        let node: int32 = queue[qi]
         if node < 0 || node >= unitCount:
             continue
-        setPtr[bool](&queued, node, false)
+        queued[node] = false
         let nodeBits: uint64[] = driver_getRowU64(closure, node)
         let parents: int32[] = driver_getRowInt32(revDeps, node)
         for pi in 0..<parents.len:
-            let parentIdx: int32 = get[int32](parents, pi)
+            let parentIdx: int32 = parents[pi]
             if parentIdx >= 0 && parentIdx < unitCount:
                 var parentBits: uint64[] = driver_getRowU64(closure, parentIdx)
                 var changed: bool = false
                 for wi in 0..<words:
-                    let cur: uint64 = get[uint64](parentBits, wi)
-                    let merged: uint64 = cur | get[uint64](nodeBits, wi)
+                    let cur: uint64 = parentBits[wi]
+                    let merged: uint64 = cur | nodeBits[wi]
                     if merged != cur:
-                        setPtr[uint64](&parentBits, wi, merged)
+                        parentBits[wi] = merged
                         changed = true
                 if changed:
                     driver_setRowU64(closure, parentIdx, parentBits)
-                    if ! get[bool](queued, parentIdx):
-                        addPtr[int32](&queue, parentIdx)
-                        setPtr[bool](&queued, parentIdx, true)
+                    if ! queued[parentIdx]:
+                        add(queue, parentIdx)
+                        queued[parentIdx] = true
     return closure
 
 fn driver_buildUnitDepClosureStamp(unitIdx: int32, unitFiles: str[], unitClosureBits: DriverSeqSeqU64,
                                    unitStateHashes: int64[], compileStampHash: int64): str =
     if unitIdx < 0 || unitIdx >= unitFiles.len:
         return ""
-    let unitFile: str = get[str](unitFiles, unitIdx)
+    let unitFile: str = unitFiles[unitIdx]
     var hash: int64 = driver_hashCombine64(compileStampHash, mirFnv1a64(unitFile))
     if unitIdx < 0 || unitIdx >= unitClosureBits.len:
         let fallbackHash: int64 = mirFnv1a64(driver_fileStateStamp(unitFile))
@@ -754,7 +801,7 @@ fn driver_buildUnitDepClosureStamp(unitIdx: int32, unitFiles: str[], unitClosure
     let n: int32 = unitFiles.len
     let rowBits: uint64[] = driver_getRowU64(unitClosureBits, unitIdx)
     for wi in 0..<rowBits.len:
-        let word: uint64 = get[uint64](rowBits, wi)
+        let word: uint64 = rowBits[wi]
         if word != uint64(0):
             for bi in 0..<64:
                 let idx: int32 = wi * 64 + bi
@@ -763,10 +810,10 @@ fn driver_buildUnitDepClosureStamp(unitIdx: int32, unitFiles: str[], unitClosure
                 let mask: uint64 = uint64(1) << uint64(bi)
                 if (word & mask) != uint64(0):
                     if idx >= 0 && idx < unitStateHashes.len:
-                        hash = driver_hashCombine64(hash, get[int64](unitStateHashes, idx))
+                        hash = driver_hashCombine64(hash, unitStateHashes[idx])
                     elif idx >= 0 && idx < unitFiles.len:
                         hash = driver_hashCombine64(hash,
-                                                    mirFnv1a64(driver_fileStateStamp(get[str](unitFiles, idx))))
+                                                    mirFnv1a64(driver_fileStateStamp(unitFiles[idx])))
     return "unit=" + unitFile + "\nclosure_hash=" + mirU64ToHex(hash) + "\n"
 
 fn driver_parallelWorkerCount(pendingUnitsLen: int32, jobs: int32): int32 =
@@ -800,11 +847,11 @@ fn driver_runParallelUnitBatches(selfExe: str, inputPath: str, target: str, fron
     let workerCount: int32 = driver_parallelWorkerCount(pendingUnits.len, jobs)
     var batchLines: str[]
     for wi in 0..<workerCount:
-        addPtr[str](&batchLines, "")
+        add(batchLines, "")
     for pi in 0..<pendingUnits.len:
         let bucket: int32 = pi % workerCount
-        let line: str = get[str](pendingObjs, pi) + "\t" + get[str](pendingUnits, pi) + "\n"
-        setPtr[str](&batchLines, bucket, get[str](batchLines, bucket) + line)
+        let line: str = pendingObjs[pi] + "\t" + pendingUnits[pi] + "\n"
+        batchLines[bucket] = batchLines[bucket] + line
 
     let allowNoMainArg: str = allowNoMain ? " --allow-no-main" : " --no-allow-no-main"
     let wholeProgramArg: str = wholeProgram ? " --whole-program" : " --no-whole-program"
@@ -814,7 +861,7 @@ fn driver_runParallelUnitBatches(selfExe: str, inputPath: str, target: str, fron
     var runCmd: str = "set -eu\n" +
                       "pids=\"\"\n"
     for wi in 0..<workerCount:
-        let rows: str = get[str](batchLines, wi)
+        let rows: str = batchLines[wi]
         if driver_strNonEmpty(rows):
             let batchPath: str = objDir + "/.build.batch." + intToStr(wi) + ".tsv"
             os.writeFile(batchPath, rows)
@@ -971,16 +1018,16 @@ fn driver_defaultAndroidNdkClang(api: int32): str =
         return ""
     let prebuiltRoot: str = os.joinPath(ndk, "toolchains/llvm/prebuilt")
     var candidates: str[]
-    addPtr[str](&candidates, "darwin-arm64")
-    addPtr[str](&candidates, "darwin-x86_64")
-    addPtr[str](&candidates, "linux-x86_64")
-    addPtr[str](&candidates, "linux-arm64")
-    addPtr[str](&candidates, "linux-aarch64")
-    addPtr[str](&candidates, "windows-x86_64")
-    addPtr[str](&candidates, "windows-x64")
+    add(candidates, "darwin-arm64")
+    add(candidates, "darwin-x86_64")
+    add(candidates, "linux-x86_64")
+    add(candidates, "linux-arm64")
+    add(candidates, "linux-aarch64")
+    add(candidates, "windows-x86_64")
+    add(candidates, "windows-x64")
     var prebuilt: str = ""
     for i in 0..<candidates.len:
-        let candidate: str = get[str](candidates, i)
+        let candidate: str = candidates[i]
         let p: str = os.joinPath(prebuiltRoot, candidate)
         if os.dirExists(p):
             prebuilt = p
@@ -996,7 +1043,7 @@ fn driver_defaultAndroidNdkClang(api: int32): str =
 
 fn driver_seqContainsStr(items: str[], value: str): bool =
     for i in 0..<items.len:
-        if streq(get[str](items, i), value):
+        if (items[i] == value):
             return true
     return false
 
@@ -1004,23 +1051,43 @@ fn driver_mapAddUniqueStr(items: str[]*, seen: hashmaps.HashMapStrInt*, value: s
     if items == nil || seen == nil || driver_strIsEmpty(value):
         return
     var exists: bool = false
-    hashmaps.hashMapStrIntGetPtr(seen, value, &exists)
+    hashmaps.hashMapStrIntGetPtrRaw(seen, value,&exists)
     if exists:
         return
     hashmaps.hashMapStrIntPut(seen, value, 1)
-    addPtr[str](items, value)
+    add(items, value)
+
+fn driverSeqStrElemPtr(buffer: void*, len0: int32, idx: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "backend_driver: seq index out of bounds"
+    let off64: int64 = int64(idx) * sizeof str
+    return ptr_add(buffer, int32(off64))
+
+fn driverReadStrPtr(items: str[]*, idx: int32): str =
+    if items == nil:
+        panic "backend_driver: nil seq pointer"
+    let p: str* = str*(driverSeqStrElemPtr(items->buffer, items->len, idx))
+    return *p
+
+fn driverWriteStrPtr(items: str[]*, idx: int32, val: str) =
+    if items == nil:
+        panic "backend_driver: nil seq pointer"
+    let p: str* = str*(driverSeqStrElemPtr(items->buffer, items->len, idx))
+    *p = val
 
 fn driver_sortStringsStable(items: str[]*) =
+    if items == nil:
+        return
     for i in 1..<items->len:
-        let key: str = get[str](*items, i)
+        let key: str = driverReadStrPtr(items, i)
         var j: int32 = i - 1
         let __for_start_j = j
         for __for_rev_j in 0..(__for_start_j - (0)):
             j = __for_start_j - __for_rev_j
-            if !(mirStrCmp(get[str](*items, j), key) > 0):
+            if !(mirStrCmp(driverReadStrPtr(items, j), key) > 0):
                 break
-            setPtr[str](items, j + 1, get[str](*items, j))
-        setPtr[str](items, j + 1, key)
+            driverWriteStrPtr(items, j + 1, driverReadStrPtr(items, j))
+        driverWriteStrPtr(items, j + 1, key)
 
 fn driver_sharedUnitFile(): str =
     return "<shared>"
@@ -1031,7 +1098,7 @@ fn driver_unitOwnerKey(originFile: str): str =
     return driver_sharedUnitFile()
 
 fn driver_isSharedUnitFile(filePath: str): bool =
-    return streq(filePath, driver_sharedUnitFile())
+    return (filePath == driver_sharedUnitFile())
 
 fn driver_collectUnitFiles(module: MirModule): str[] =
     var out: str[]
@@ -1040,14 +1107,14 @@ fn driver_collectUnitFiles(module: MirModule): str[] =
     var seen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(module.funcs.len + module.globals.len + 16)
     var hasShared: bool = false
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let f: MirFunc = module.funcs[i]
         if f != nil && ! f.isExtern:
             if driver_strNonEmpty(f.originFile):
                 driver_mapAddUniqueStr(&out, &seen, f.originFile)
             else:
                 hasShared = true
     for i in 0..<module.globals.len:
-        let g: MirGlobal = get[MirGlobal](module.globals, i)
+        let g: MirGlobal = module.globals[i]
         if driver_strNonEmpty(g.originFile):
             driver_mapAddUniqueStr(&out, &seen, g.originFile)
         else:
@@ -1065,7 +1132,7 @@ fn driver_cloneExternFunc(f: MirFunc): MirFunc =
     stub.originFile = f.originFile
     stub.isExtern = true
     for pi in 0..<f.params.len:
-        addPtr[MirParam](&stub.params, get[MirParam](f.params, pi))
+        add(stub.params, f.params[pi])
     return stub
 
 type
@@ -1097,7 +1164,7 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
     out.nameToFuncIdx = driver_allocHashMapStrInt((full != nil) ? (full.funcs.len * 2 + 8) : 16)
 
     for ui in 0..<unitFiles.len:
-        hashmaps.hashMapStrIntPut(out.unitIndex, get[str](unitFiles, ui), ui)
+        hashmaps.hashMapStrIntPut(out.unitIndex, unitFiles[ui], ui)
     if dbg:
         let f: os.File = os.get_stderr()
         os.writeLine(f, "backend_driver: unit_index map_ready")
@@ -1107,7 +1174,7 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
         return out
 
     for fi in 0..<full.funcs.len:
-        let f: MirFunc = get[MirFunc](full.funcs, fi)
+        let f: MirFunc = full.funcs[fi]
         let fname: str = (f != nil) ? f.name : nil
         var fnameLen: int32 = 0
         if dbg:
@@ -1160,7 +1227,8 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
                         for ki0 in 0..<4:
                             if !(ki0 < m0->keys.len):
                                 break
-                            let cur0: str = get[str](m0->keys, ki0)
+                            let keys0: str[] = m0->keys
+                            let cur0: str = keys0[ki0]
                             let curp0: int64 = int64(uint64(void*(cur0)))
                             let fdbgKeys: os.File = os.get_stderr()
                             os.writeLine(fdbgKeys, "backend_driver: unit_index func i=" + intToStr(fi) +
@@ -1170,14 +1238,14 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
                     os.writeLine(fdbg4, "backend_driver: unit_index func i=" + intToStr(fi) + " probe_get_literal_start")
                     os.c_fflush fdbg4
                     var probeFound: bool = false
-                    hashmaps.hashMapStrIntGetPtr(out.nameToFuncIdx, "k1", &probeFound)
+                    hashmaps.hashMapStrIntGetPtrRaw(out.nameToFuncIdx, "k1",&probeFound)
                     let fdbg5: os.File = os.get_stderr()
                     os.writeLine(fdbg5, "backend_driver: unit_index func i=" + intToStr(fi) + " probe_get_literal_ok")
                     os.c_fflush fdbg5
                     let fdbg6: os.File = os.get_stderr()
                     os.writeLine(fdbg6, "backend_driver: unit_index func i=" + intToStr(fi) + " get_name_start")
                     os.c_fflush fdbg6
-                hashmaps.hashMapStrIntGetPtr(out.nameToFuncIdx, fname, &exists)
+                hashmaps.hashMapStrIntGetPtrRaw(out.nameToFuncIdx, fname,&exists)
                 if dbg:
                     let fdbg7: os.File = os.get_stderr()
                     os.writeLine(fdbg7, "backend_driver: unit_index func i=" + intToStr(fi) + " get_name_ok exists=" + driver_bool01(exists))
@@ -1190,13 +1258,15 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
         os.c_fflush f
 
     for gi in 0..<full.globals.len:
-        let g: MirGlobal = get[MirGlobal](full.globals, gi)
+        let g: MirGlobal = full.globals[gi]
         let ownerKey: str = driver_unitOwnerKey(g.originFile)
         var foundOwner: bool = false
-        let ownerIdx: int32 = (out.unitIndex != nil) ? hashmaps.hashMapStrIntGetPtr(out.unitIndex, ownerKey, &foundOwner) : -1
+        var ownerIdx: int32 = -1
+        if out.unitIndex != nil:
+            ownerIdx = hashmaps.hashMapStrIntGetPtrRaw(out.unitIndex, ownerKey,&foundOwner)
         if foundOwner && ownerIdx >= 0 && ownerIdx < out.unitGlobalIdx.len:
             var row: int32[] = driver_getRowInt32(out.unitGlobalIdx, ownerIdx)
-            addPtr[int32](&row, gi)
+            add(row, gi)
             driver_setRowInt32(out.unitGlobalIdx, ownerIdx, row)
     if dbg:
         let f: os.File = os.get_stderr()
@@ -1204,14 +1274,16 @@ fn driver_buildUnitIndex(full: MirModule, unitFiles: str[]): DriverUnitIndex =
         os.c_fflush f
 
     for fi in 0..<full.funcs.len:
-        let f2: MirFunc = get[MirFunc](full.funcs, fi)
+        let f2: MirFunc = full.funcs[fi]
         if f2 != nil && !f2.isExtern:
             let ownerKey2: str = driver_unitOwnerKey(f2.originFile)
             var foundOwner2: bool = false
-            let ownerIdx2: int32 = (out.unitIndex != nil) ? hashmaps.hashMapStrIntGetPtr(out.unitIndex, ownerKey2, &foundOwner2) : -1
+            var ownerIdx2: int32 = -1
+            if out.unitIndex != nil:
+                ownerIdx2 = hashmaps.hashMapStrIntGetPtrRaw(out.unitIndex, ownerKey2,&foundOwner2)
             if foundOwner2 && ownerIdx2 >= 0 && ownerIdx2 < out.unitFuncIdx.len:
                 var row2: int32[] = driver_getRowInt32(out.unitFuncIdx, ownerIdx2)
-                addPtr[int32](&row2, fi)
+                add(row2, fi)
                 driver_setRowInt32(out.unitFuncIdx, ownerIdx2, row2)
     if dbg:
         let f: os.File = os.get_stderr()
@@ -1240,7 +1312,7 @@ fn driver_cacheStrTabInit(cap0: int32): DriverCacheStrTab =
     tab.items = []
     tab.index = driver_allocHashMapStrInt((cap0 > 0) ? cap0 : 16)
     # Index 0 is always empty string.
-    addPtr[str](&tab.items, "")
+    add(tab.items, "")
     hashmaps.hashMapStrIntPut(tab.index, "", 0)
     return tab
 
@@ -1250,11 +1322,13 @@ fn driver_cacheStrTabIndex(tab: DriverCacheStrTab, s: str): int32 =
     if driver_strIsEmpty(s):
         return 0
     var found: bool = false
-    let idx: int32 = (tab.index != nil) ? hashmaps.hashMapStrIntGetPtr(tab.index, s, &found) : 0
+    var idx: int32 = 0
+    if tab.index != nil:
+        idx = hashmaps.hashMapStrIntGetPtrRaw(tab.index, s,&found)
     if found:
         return idx
     let newIdx: int32 = tab.items.len
-    addPtr[str](&tab.items, s)
+    add(tab.items, s)
     hashmaps.hashMapStrIntPut(tab.index, s, newIdx)
     return newIdx
 
@@ -1274,7 +1348,7 @@ fn driver_cacheCollectExprStrings(expr: MirExpr, tab: DriverCacheStrTab) =
     if expr.addrExpr != nil:
         driver_cacheCollectExprStrings(expr.addrExpr, tab)
     for i in 0..<expr.args.len:
-        let a: MirExpr = get[MirExpr](expr.args, i)
+        let a: MirExpr = expr.args[i]
         if a != nil:
             driver_cacheCollectExprStrings(a, tab)
 
@@ -1300,19 +1374,19 @@ fn driver_cacheCollectFuncStrings(f: MirFunc, tab: DriverCacheStrTab) =
     driver_cacheStrTabIndex(tab, f.originFile)
     driver_cacheStrTabIndex(tab, f.retTypeKey)
     for pi in 0..<f.params.len:
-        let p: MirParam = get[MirParam](f.params, pi)
+        let p: MirParam = f.params[pi]
         driver_cacheStrTabIndex(tab, p.name)
         driver_cacheStrTabIndex(tab, p.typeKey)
     for oi in 0..<f.objLocals.len:
-        let ol: MirObjLocal = get[MirObjLocal](f.objLocals, oi)
+        let ol: MirObjLocal = f.objLocals[oi]
         driver_cacheStrTabIndex(tab, ol.objTypeName)
         driver_cacheStrTabIndex(tab, ol.typeKey)
     for bi in 0..<f.blocks.len:
-        let b: MirBlock = get[MirBlock](f.blocks, bi)
+        let b: MirBlock = f.blocks[bi]
         if b != nil:
             driver_cacheStrTabIndex(tab, b.label)
             for si in 0..<b.stmts.len:
-                let s: MirStmt = get[MirStmt](b.stmts, si)
+                let s: MirStmt = b.stmts[si]
                 driver_cacheStrTabIndex(tab, s.name)
                 if s.expr != nil:
                     driver_cacheCollectExprStrings(s.expr, tab)
@@ -1325,41 +1399,46 @@ fn driver_cacheCollectModuleStrings(module: MirModule, idx: DriverUnitIndex, tab
         return
     driver_cacheStrTabIndex(tab, module.target)
     for fi in 0..<module.funcs.len:
-        driver_cacheCollectFuncStrings(get[MirFunc](module.funcs, fi), tab)
+        driver_cacheCollectFuncStrings(module.funcs[fi], tab)
     for ci in 0..<module.cstrs.len:
-        let c: MirCString = get[MirCString](module.cstrs, ci)
+        let c: MirCString = module.cstrs[ci]
         driver_cacheStrTabIndex(tab, c.label)
         driver_cacheStrTabIndex(tab, c.value)
     for gi in 0..<module.globals.len:
-        let g: MirGlobal = get[MirGlobal](module.globals, gi)
+        let g: MirGlobal = module.globals[gi]
         driver_cacheStrTabIndex(tab, g.name)
         driver_cacheStrTabIndex(tab, g.originFile)
     for ai in 0..<module.typeAliases.len:
-        let a: MirTypeAlias = get[MirTypeAlias](module.typeAliases, ai)
+        let a: MirTypeAlias = module.typeAliases[ai]
         driver_cacheStrTabIndex(tab, a.name)
     for ti in 0..<module.objTypes.len:
-        let ot: MirObjType = get[MirObjType](module.objTypes, ti)
+        let ot: MirObjType = module.objTypes[ti]
         driver_cacheStrTabIndex(tab, ot.name)
         for fi2 in 0..<ot.fields.len:
-            let f2: MirObjField = get[MirObjField](ot.fields, fi2)
+            let f2: MirObjField = ot.fields[fi2]
             driver_cacheStrTabIndex(tab, f2.name)
     if idx != nil:
         for ui in 0..<idx.unitFiles.len:
-            driver_cacheStrTabIndex(tab, get[str](idx.unitFiles, ui))
+            driver_cacheStrTabIndex(tab, idx.unitFiles[ui])
         if idx.nameToFuncIdx != nil:
             # Keep stage0 bootstrap compatible by avoiding `idx.field->subfield`
             # (stage0 seeds can misparse chained dot/arrow expressions).
             let nameToFuncIdx: hashmaps.HashMapStrInt* = idx.nameToFuncIdx
             let keys: str[] = nameToFuncIdx->keys
             for si2 in 0..<keys.len:
-                let k: str = get[str](keys, si2)
+                let k: str = keys[si2]
                 if driver_strNonEmpty(k):
                     driver_cacheStrTabIndex(tab, k)
+
+fn driver_bufAddU8Ptr(buf: uint8[]*, v: uint8) =
+    if buf == nil:
+        return
+    add(buf, v)
 
 fn driver_cacheBufU8(buf: uint8[]*, v: int32) =
     if buf == nil:
         return
-    addPtr[uint8](buf, uint8(v & 255))
+    driver_bufAddU8Ptr(buf, uint8(v & 255))
 
 fn driver_cacheBufU32(buf: uint8[]*, v: uint32) =
     driver_cacheBufU8(buf, int32(v & uint32(255)))
@@ -1385,9 +1464,9 @@ fn driver_cacheAppendBytes(buf: uint8[]*, data: void*, count: int32) =
         return
     let oldLen: int32 = buf->len
     buf->cap = oldLen + count
+    buf->len = oldLen + count
     if buf->buffer == nil:
         panic "backend_driver: out of memory while building module cache"
-    buf->len = oldLen + count
     copyMem(ptr_add(buf->buffer, oldLen), data, count)
 
 fn driver_cacheBufStrBytes(buf: uint8[]*, s: str) =
@@ -1419,7 +1498,7 @@ fn driver_cacheBufExpr(buf: uint8[]*, tab: DriverCacheStrTab, expr: MirExpr) =
     driver_cacheBufStrIdx(buf, tab, expr.callee)
     driver_cacheBufU32(buf, uint32(expr.args.len))
     for ai in 0..<expr.args.len:
-        driver_cacheBufExpr(buf, tab, get[MirExpr](expr.args, ai))
+        driver_cacheBufExpr(buf, tab, expr.args[ai])
     driver_cacheBufType(buf, expr.castType)
     driver_cacheBufExpr(buf, tab, expr.castExpr)
     driver_cacheBufExpr(buf, tab, expr.addrExpr)
@@ -1451,7 +1530,7 @@ fn driver_cacheBufBlock(buf: uint8[]*, tab: DriverCacheStrTab, block: MirBlock) 
     driver_cacheBufStrIdx(buf, tab, block.label)
     driver_cacheBufU32(buf, uint32(block.stmts.len))
     for si in 0..<block.stmts.len:
-        driver_cacheBufStmt(buf, tab, get[MirStmt](block.stmts, si))
+        driver_cacheBufStmt(buf, tab, block.stmts[si])
     driver_cacheBufTerm(buf, tab, block.term)
 
 fn driver_cacheBufFunc(buf: uint8[]*, tab: DriverCacheStrTab, f: MirFunc) =
@@ -1467,17 +1546,17 @@ fn driver_cacheBufFunc(buf: uint8[]*, tab: DriverCacheStrTab, f: MirFunc) =
     driver_cacheBufStrIdx(buf, tab, f.retTypeKey)
     driver_cacheBufU32(buf, uint32(f.params.len))
     for pi in 0..<f.params.len:
-        let p: MirParam = get[MirParam](f.params, pi)
+        let p: MirParam = f.params[pi]
         driver_cacheBufStrIdx(buf, tab, p.name)
         driver_cacheBufI32(buf, p.slot)
         driver_cacheBufType(buf, p.ty)
         driver_cacheBufStrIdx(buf, tab, p.typeKey)
     driver_cacheBufU32(buf, uint32(f.localTypes.len))
     for li in 0..<f.localTypes.len:
-        driver_cacheBufType(buf, get[MirType](f.localTypes, li))
+        driver_cacheBufType(buf, f.localTypes[li])
     driver_cacheBufU32(buf, uint32(f.objLocals.len))
     for oi in 0..<f.objLocals.len:
-        let ol: MirObjLocal = get[MirObjLocal](f.objLocals, oi)
+        let ol: MirObjLocal = f.objLocals[oi]
         driver_cacheBufI32(buf, ol.slot)
         driver_cacheBufStrIdx(buf, tab, ol.objTypeName)
         driver_cacheBufStrIdx(buf, tab, ol.typeKey)
@@ -1485,7 +1564,7 @@ fn driver_cacheBufFunc(buf: uint8[]*, tab: DriverCacheStrTab, f: MirFunc) =
     driver_cacheBufI32(buf, f.objFrameSize)
     driver_cacheBufU32(buf, uint32(f.blocks.len))
     for bi in 0..<f.blocks.len:
-        driver_cacheBufBlock(buf, tab, get[MirBlock](f.blocks, bi))
+        driver_cacheBufBlock(buf, tab, f.blocks[bi])
 
 fn driver_cacheBufModule(buf: uint8[]*, tab: DriverCacheStrTab, module: MirModule) =
     if module == nil:
@@ -1495,15 +1574,15 @@ fn driver_cacheBufModule(buf: uint8[]*, tab: DriverCacheStrTab, module: MirModul
     driver_cacheBufStrIdx(buf, tab, module.target)
     driver_cacheBufU32(buf, uint32(module.funcs.len))
     for fi in 0..<module.funcs.len:
-        driver_cacheBufFunc(buf, tab, get[MirFunc](module.funcs, fi))
+        driver_cacheBufFunc(buf, tab, module.funcs[fi])
     driver_cacheBufU32(buf, uint32(module.cstrs.len))
     for ci in 0..<module.cstrs.len:
-        let c: MirCString = get[MirCString](module.cstrs, ci)
+        let c: MirCString = module.cstrs[ci]
         driver_cacheBufStrIdx(buf, tab, c.label)
         driver_cacheBufStrIdx(buf, tab, c.value)
     driver_cacheBufU32(buf, uint32(module.globals.len))
     for gi in 0..<module.globals.len:
-        let g: MirGlobal = get[MirGlobal](module.globals, gi)
+        let g: MirGlobal = module.globals[gi]
         driver_cacheBufStrIdx(buf, tab, g.name)
         driver_cacheBufType(buf, g.ty)
         driver_cacheBufI64(buf, g.init)
@@ -1511,18 +1590,18 @@ fn driver_cacheBufModule(buf: uint8[]*, tab: DriverCacheStrTab, module: MirModul
         driver_cacheBufStrIdx(buf, tab, g.originFile)
     driver_cacheBufU32(buf, uint32(module.typeAliases.len))
     for ai in 0..<module.typeAliases.len:
-        let a: MirTypeAlias = get[MirTypeAlias](module.typeAliases, ai)
+        let a: MirTypeAlias = module.typeAliases[ai]
         driver_cacheBufStrIdx(buf, tab, a.name)
         driver_cacheBufType(buf, a.ty)
     driver_cacheBufU32(buf, uint32(module.objTypes.len))
     for ti in 0..<module.objTypes.len:
-        let ot: MirObjType = get[MirObjType](module.objTypes, ti)
+        let ot: MirObjType = module.objTypes[ti]
         driver_cacheBufStrIdx(buf, tab, ot.name)
         driver_cacheBufI32(buf, ot.size)
         driver_cacheBufI32(buf, ot.alignPow2)
         driver_cacheBufU32(buf, uint32(ot.fields.len))
         for fi2 in 0..<ot.fields.len:
-            let f2: MirObjField = get[MirObjField](ot.fields, fi2)
+            let f2: MirObjField = ot.fields[fi2]
             driver_cacheBufStrIdx(buf, tab, f2.name)
             driver_cacheBufType(buf, f2.ty)
             driver_cacheBufI32(buf, f2.offset)
@@ -1534,19 +1613,19 @@ fn driver_cacheBufUnitIndex(buf: uint8[]*, tab: DriverCacheStrTab, idx: DriverUn
     driver_cacheBufU8(buf, 1)
     driver_cacheBufU32(buf, uint32(idx.unitFiles.len))
     for ui in 0..<idx.unitFiles.len:
-        driver_cacheBufStrIdx(buf, tab, get[str](idx.unitFiles, ui))
+        driver_cacheBufStrIdx(buf, tab, idx.unitFiles[ui])
     driver_cacheBufU32(buf, uint32(idx.unitFuncIdx.len))
     for ui in 0..<idx.unitFuncIdx.len:
         let row: int32[] = driver_getRowInt32(idx.unitFuncIdx, ui)
         driver_cacheBufU32(buf, uint32(row.len))
         for j in 0..<row.len:
-            driver_cacheBufI32(buf, get[int32](row, j))
+            driver_cacheBufI32(buf, row[j])
     driver_cacheBufU32(buf, uint32(idx.unitGlobalIdx.len))
     for ui in 0..<idx.unitGlobalIdx.len:
         let row2: int32[] = driver_getRowInt32(idx.unitGlobalIdx, ui)
         driver_cacheBufU32(buf, uint32(row2.len))
         for k in 0..<row2.len:
-            driver_cacheBufI32(buf, get[int32](row2, k))
+            driver_cacheBufI32(buf, row2[k])
     # nameToFuncIdx pairs
     let nameToFuncIdx: hashmaps.HashMapStrInt* = idx.nameToFuncIdx
     if nameToFuncIdx != nil:
@@ -1554,10 +1633,10 @@ fn driver_cacheBufUnitIndex(buf: uint8[]*, tab: DriverCacheStrTab, idx: DriverUn
         let keys: str[] = nameToFuncIdx->keys
         let vals: int32[] = nameToFuncIdx->vals
         for si in 0..<keys.len:
-            let key: str = get[str](keys, si)
+            let key: str = keys[si]
             if key != nil:
                 driver_cacheBufStrIdx(buf, tab, key)
-                driver_cacheBufI32(buf, get[int32](vals, si))
+                driver_cacheBufI32(buf, vals[si])
     else:
         driver_cacheBufU32(buf, 0)
 
@@ -1576,15 +1655,15 @@ fn driver_writeModuleCache(path: str, module: MirModule, idx: DriverUnitIndex,
     driver_cacheBufI64(&out, compileStampHash)
     driver_cacheBufU32(&out, uint32(idx.unitFiles.len))
     for ui in 0..<idx.unitFiles.len:
-        let fp: str = get[str](idx.unitFiles, ui)
+        let fp: str = idx.unitFiles[ui]
         driver_cacheBufStrBytes(&out, fp)
         if ui >= 0 && ui < unitStateHashes.len:
-            driver_cacheBufI64(&out, get[int64](unitStateHashes, ui))
+            driver_cacheBufI64(&out, unitStateHashes[ui])
         else:
             driver_cacheBufI64(&out, mirFnv1a64(driver_fileStateStamp(fp)))
     driver_cacheBufU32(&out, uint32(tab.items.len))
     for si in 0..<tab.items.len:
-        driver_cacheBufStrBytes(&out, get[str](tab.items, si))
+        driver_cacheBufStrBytes(&out, tab.items[si])
     driver_cacheBufModule(&out, tab, module)
     driver_cacheBufUnitIndex(&out, tab, idx)
     os.writeFileBytes(path, out)
@@ -1668,7 +1747,7 @@ fn driver_cacheReadStringTable(cr: DriverCacheReader*): str[] =
     for i in 0..<count:
         let n: int32 = int32(driver_cacheReadU32(cr))
         let s: str = driver_cacheReadStringBytes(cr, n)
-        setPtr[str](&out, i, s)
+        out[i] = s
     return out
 
 fn driver_cacheGetStr(strings: str[], idx: int32): str =
@@ -1676,7 +1755,7 @@ fn driver_cacheGetStr(strings: str[], idx: int32): str =
         return ""
     if idx < 0 || idx >= strings.len:
         return ""
-    return get[str](strings, idx)
+    return strings[idx]
 
 fn driver_cacheReadType(cr: DriverCacheReader*): MirType =
     var t: MirType
@@ -1700,7 +1779,7 @@ fn driver_cacheReadExpr(cr: DriverCacheReader*, strings: str[]): MirExpr =
     let argc: int32 = int32(driver_cacheReadU32(cr))
     e.args = []
     for i in 0..<argc:
-        addPtr[MirExpr](&e.args, driver_cacheReadExpr(cr, strings))
+        add(e.args, driver_cacheReadExpr(cr, strings))
     e.castType = driver_cacheReadType(cr)
     e.castExpr = driver_cacheReadExpr(cr, strings)
     e.addrExpr = driver_cacheReadExpr(cr, strings)
@@ -1738,7 +1817,7 @@ fn driver_cacheReadBlock(cr: DriverCacheReader*, strings: str[]): MirBlock =
     let n: int32 = int32(driver_cacheReadU32(cr))
     b.stmts = []
     for i in 0..<n:
-        addPtr[MirStmt](&b.stmts, driver_cacheReadStmt(cr, strings))
+        add(b.stmts, driver_cacheReadStmt(cr, strings))
     b.term = driver_cacheReadTerm(cr, strings)
     return b
 
@@ -1761,11 +1840,11 @@ fn driver_cacheReadFunc(cr: DriverCacheReader*, strings: str[]): MirFunc =
         p.slot = driver_cacheReadI32(cr)
         p.ty = driver_cacheReadType(cr)
         p.typeKey = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
-        addPtr[MirParam](&f.params, p)
+        add(f.params, p)
     let ln: int32 = int32(driver_cacheReadU32(cr))
     f.localTypes = []
     for li in 0..<ln:
-        addPtr[MirType](&f.localTypes, driver_cacheReadType(cr))
+        add(f.localTypes, driver_cacheReadType(cr))
     let on: int32 = int32(driver_cacheReadU32(cr))
     f.objLocals = []
     for oi in 0..<on:
@@ -1774,12 +1853,12 @@ fn driver_cacheReadFunc(cr: DriverCacheReader*, strings: str[]): MirFunc =
         ol.objTypeName = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
         ol.typeKey = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
         ol.frameOff = driver_cacheReadI32(cr)
-        addPtr[MirObjLocal](&f.objLocals, ol)
+        add(f.objLocals, ol)
     f.objFrameSize = driver_cacheReadI32(cr)
     let bn: int32 = int32(driver_cacheReadU32(cr))
     f.blocks = []
     for bi in 0..<bn:
-        addPtr[MirBlock](&f.blocks, driver_cacheReadBlock(cr, strings))
+        add(f.blocks, driver_cacheReadBlock(cr, strings))
     return f
 
 fn driver_cacheReadModule(cr: DriverCacheReader*, strings: str[]): MirModule =
@@ -1789,13 +1868,13 @@ fn driver_cacheReadModule(cr: DriverCacheReader*, strings: str[]): MirModule =
     let module: MirModule = mirNewModule(target)
     let fnCount: int32 = int32(driver_cacheReadU32(cr))
     for i in 0..<fnCount:
-        addPtr[MirFunc](&module.funcs, driver_cacheReadFunc(cr, strings))
+        add(module.funcs, driver_cacheReadFunc(cr, strings))
     let cCount: int32 = int32(driver_cacheReadU32(cr))
     for ci in 0..<cCount:
         var c: MirCString
         c.label = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
         c.value = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
-        addPtr[MirCString](&module.cstrs, c)
+        add(module.cstrs, c)
     let gCount: int32 = int32(driver_cacheReadU32(cr))
     for gi in 0..<gCount:
         var g: MirGlobal
@@ -1804,13 +1883,13 @@ fn driver_cacheReadModule(cr: DriverCacheReader*, strings: str[]): MirModule =
         g.init = driver_cacheReadI64(cr)
         g.hasInit = driver_cacheReadBool(cr)
         g.originFile = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
-        addPtr[MirGlobal](&module.globals, g)
+        add(module.globals, g)
     let aCount: int32 = int32(driver_cacheReadU32(cr))
     for ai in 0..<aCount:
         var a: MirTypeAlias
         a.name = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
         a.ty = driver_cacheReadType(cr)
-        addPtr[MirTypeAlias](&module.typeAliases, a)
+        add(module.typeAliases, a)
     let tCount: int32 = int32(driver_cacheReadU32(cr))
     for ti in 0..<tCount:
         var ot: MirObjType
@@ -1824,8 +1903,8 @@ fn driver_cacheReadModule(cr: DriverCacheReader*, strings: str[]): MirModule =
             f2.name = driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr)))
             f2.ty = driver_cacheReadType(cr)
             f2.offset = driver_cacheReadI32(cr)
-            addPtr[MirObjField](&ot.fields, f2)
-        addPtr[MirObjType](&module.objTypes, ot)
+            add(ot.fields, f2)
+        add(module.objTypes, ot)
     return module
 
 fn driver_cacheReadUnitIndex(cr: DriverCacheReader*, strings: str[], module: MirModule): DriverUnitIndex =
@@ -1834,14 +1913,14 @@ fn driver_cacheReadUnitIndex(cr: DriverCacheReader*, strings: str[], module: Mir
     let fileCount: int32 = int32(driver_cacheReadU32(cr))
     var unitFiles: str[]
     for i in 0..<fileCount:
-        addPtr[str](&unitFiles, driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr))))
+        add(unitFiles, driver_cacheGetStr(strings, int32(driver_cacheReadU32(cr))))
     let funcRows: int32 = int32(driver_cacheReadU32(cr))
     var unitFuncIdx: DriverSeqSeqInt32
     for fi in 0..<funcRows:
         let n: int32 = int32(driver_cacheReadU32(cr))
         var row: int32[]
         for j in 0..<n:
-            addPtr[int32](&row, driver_cacheReadI32(cr))
+            add(row, driver_cacheReadI32(cr))
         driver_addRowInt32(unitFuncIdx, row)
     let globalRows: int32 = int32(driver_cacheReadU32(cr))
     var unitGlobalIdx: DriverSeqSeqInt32
@@ -1849,7 +1928,7 @@ fn driver_cacheReadUnitIndex(cr: DriverCacheReader*, strings: str[], module: Mir
         let n2: int32 = int32(driver_cacheReadU32(cr))
         var row2: int32[]
         for j2 in 0..<n2:
-            addPtr[int32](&row2, driver_cacheReadI32(cr))
+            add(row2, driver_cacheReadI32(cr))
         driver_addRowInt32(unitGlobalIdx, row2)
     let pairs: int32 = int32(driver_cacheReadU32(cr))
     var nameToFuncIdx: hashmaps.HashMapStrInt* = driver_allocHashMapStrInt(pairs * 2 + 8)
@@ -1863,7 +1942,7 @@ fn driver_cacheReadUnitIndex(cr: DriverCacheReader*, strings: str[], module: Mir
     out.unitFiles = unitFiles
     out.unitIndex = driver_allocHashMapStrInt(unitFiles.len * 2 + 8)
     for i in 0..<unitFiles.len:
-        hashmaps.hashMapStrIntPut(out.unitIndex, get[str](unitFiles, i), i)
+        hashmaps.hashMapStrIntPut(out.unitIndex, unitFiles[i], i)
     out.unitFuncIdx = unitFuncIdx
     out.unitGlobalIdx = unitGlobalIdx
     out.nameToFuncIdx = nameToFuncIdx
@@ -1904,8 +1983,8 @@ fn driver_loadModuleCache(path: str, expectedCompileStampHash: int64): Result[Dr
         let n: int32 = int32(driver_cacheReadU32(&cr))
         let fp: str = driver_cacheReadStringBytes(&cr, n)
         let h: int64 = driver_cacheReadI64(&cr)
-        addPtr[str](&headerUnitFiles, fp)
-        addPtr[int64](&headerUnitHashes, h)
+        add(headerUnitFiles, fp)
+        add(headerUnitHashes, h)
         ui = ui + 1
     if cr.ok && headerUnitFiles.len > 0:
         let curHashes: int64[] = driver_buildUnitFileStateHashes(headerUnitFiles)
@@ -1918,7 +1997,7 @@ fn driver_loadModuleCache(path: str, expectedCompileStampHash: int64): Result[Dr
             let __for_start_ui_1 = ui
             for __for_ui_1 in __for_start_ui_1..<curHashes.len:
                 ui = __for_ui_1
-                if get[int64](curHashes, ui) != get[int64](headerUnitHashes, ui):
+                if curHashes[ui] != headerUnitHashes[ui]:
                     if fileBytes.data != nil:
                         dealloc fileBytes.data
                     return Err[DriverModuleCache]("stale module cache (sources): " + path)
@@ -1947,7 +2026,7 @@ fn driver_moduleCacheToUnitIndex(cache: DriverModuleCache): DriverUnitIndex =
     out.unitFiles = cache.unitFiles
     out.unitIndex = driver_allocHashMapStrInt(cache.unitFiles.len * 2 + 8)
     for i in 0..<cache.unitFiles.len:
-        hashmaps.hashMapStrIntPut(out.unitIndex, get[str](cache.unitFiles, i), i)
+        hashmaps.hashMapStrIntPut(out.unitIndex, cache.unitFiles[i], i)
     out.unitFuncIdx = cache.unitFuncIdx
     out.unitGlobalIdx = cache.unitGlobalIdx
     out.nameToFuncIdx = cache.nameToFuncIdx
@@ -1962,9 +2041,9 @@ fn driver_buildUnitModuleFromIndex(full: MirModule, filePath: str, unitIdx: int3
     if idx != nil && unitIdx >= 0 && unitIdx < idx.unitGlobalIdx.len:
         let globalsIdx: int32[] = driver_getRowInt32(idx.unitGlobalIdx, unitIdx)
         for gi in 0..<globalsIdx.len:
-            let gIdx: int32 = get[int32](globalsIdx, gi)
+            let gIdx: int32 = globalsIdx[gi]
             if gIdx >= 0 && gIdx < full.globals.len:
-                addPtr[MirGlobal](&unit.globals, get[MirGlobal](full.globals, gIdx))
+                add(unit.globals, full.globals[gIdx])
 
     var funcsIdx: int32[]
     if idx != nil && unitIdx >= 0 && unitIdx < idx.unitFuncIdx.len:
@@ -1974,48 +2053,50 @@ fn driver_buildUnitModuleFromIndex(full: MirModule, filePath: str, unitIdx: int3
     var neededGlobalNames: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(funcsIdx.len * 8 + 16)
 
     for fi in 0..<funcsIdx.len:
-        let fIdx: int32 = get[int32](funcsIdx, fi)
+        let fIdx: int32 = funcsIdx[fi]
         if fIdx >= 0 && fIdx < full.funcs.len:
-            let f: MirFunc = get[MirFunc](full.funcs, fIdx)
+            let f: MirFunc = full.funcs[fIdx]
             if f != nil && !f.isExtern:
                 mirAddFunc(unit, f)
                 driver_collectFuncCallNames(f, &neededExternNames)
                 driver_collectFuncGlobalNames(f, &neededGlobalNames)
 
     for ci in 0..<full.cstrs.len:
-        let c: MirCString = get[MirCString](full.cstrs, ci)
+        let c: MirCString = full.cstrs[ci]
         var useCstr: bool = false
         if driver_strNonEmpty(c.label):
-            hashmaps.hashMapStrIntGetPtr(&neededGlobalNames, c.label, &useCstr)
+            hashmaps.hashMapStrIntGetPtrRaw(&neededGlobalNames, c.label,&useCstr)
         if useCstr:
-            addPtr[MirCString](&unit.cstrs, c)
+            add(unit.cstrs, c)
 
     var needExternByIdx: bool[full.funcs.len]
     needExternByIdx.len = full.funcs.len
     var si: int32 = 0
     while idx != nil && si < neededExternNames.keys.len:
-        let callee: str = get[str](neededExternNames.keys, si)
+        let callee: str = neededExternNames.keys[si]
         if driver_strNonEmpty(callee):
             var foundSrc: bool = false
-            let srcIdx: int32 = (idx.nameToFuncIdx != nil) ? hashmaps.hashMapStrIntGetPtr(idx.nameToFuncIdx, callee, &foundSrc) : -1
+            var srcIdx: int32 = -1
+            if idx.nameToFuncIdx != nil:
+                srcIdx = hashmaps.hashMapStrIntGetPtrRaw(idx.nameToFuncIdx, callee,&foundSrc)
             if foundSrc && srcIdx >= 0 && srcIdx < needExternByIdx.len:
-                let srcFunc: MirFunc = get[MirFunc](full.funcs, srcIdx)
+                let srcFunc: MirFunc = full.funcs[srcIdx]
                 if srcFunc != nil:
                     if srcFunc.isExtern:
-                        setPtr[bool](&needExternByIdx, srcIdx, true)
+                        needExternByIdx[srcIdx] = true
                     else:
-                        let ownSrc: bool = streq(srcFunc.originFile, filePath)
+                        let ownSrc: bool = (srcFunc.originFile == filePath)
                         let sharedSrc: bool = includeShared && (driver_strIsEmpty(srcFunc.originFile))
                         if ! (ownSrc || sharedSrc):
-                            setPtr[bool](&needExternByIdx, srcIdx, true)
+                            needExternByIdx[srcIdx] = true
         si = si + 1
 
     fi = 0
     let __for_start_fi_2 = fi
     for __for_fi_2 in __for_start_fi_2..<needExternByIdx.len:
         fi = __for_fi_2
-        if get[bool](needExternByIdx, fi):
-            let srcFunc2: MirFunc = get[MirFunc](full.funcs, fi)
+        if needExternByIdx[fi]:
+            let srcFunc2: MirFunc = full.funcs[fi]
             if srcFunc2 != nil:
                 mirAddFunc(unit, driver_cloneExternFunc(srcFunc2))
         fi = fi + 1
@@ -2032,22 +2113,22 @@ fn driver_buildUnitModule(full: MirModule, filePath: str): MirModule =
     var nameToFuncIdx: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(full.funcs.len * 2 + 8)
 
     for gi in 0..<full.globals.len:
-        let g: MirGlobal = get[MirGlobal](full.globals, gi)
-        let ownGlobal: bool = streq(g.originFile, filePath)
+        let g: MirGlobal = full.globals[gi]
+        let ownGlobal: bool = (g.originFile == filePath)
         let sharedGlobal: bool = includeShared && (driver_strIsEmpty(g.originFile))
         if ownGlobal || sharedGlobal:
-            addPtr[MirGlobal](&unit.globals, g)
+            add(unit.globals, g)
 
     for fi in 0..<full.funcs.len:
-        let f: MirFunc = get[MirFunc](full.funcs, fi)
+        let f: MirFunc = full.funcs[fi]
         if f != nil:
             if driver_strNonEmpty(f.name):
                 var nameExists: bool = false
-                hashmaps.hashMapStrIntGetPtr(&nameToFuncIdx, f.name, &nameExists)
+                hashmaps.hashMapStrIntGetPtrRaw(&nameToFuncIdx, f.name,&nameExists)
                 if ! nameExists:
                     hashmaps.hashMapStrIntPut(&nameToFuncIdx, f.name, fi)
             if ! f.isExtern:
-                let ownFunc: bool = streq(f.originFile, filePath)
+                let ownFunc: bool = (f.originFile == filePath)
                 let sharedFunc: bool = includeShared && (driver_strIsEmpty(f.originFile))
                 if ownFunc || sharedFunc:
                     mirAddFunc(unit, f)
@@ -2055,34 +2136,34 @@ fn driver_buildUnitModule(full: MirModule, filePath: str): MirModule =
                     driver_collectFuncGlobalNames(f, &neededGlobalNames)
 
     for ci in 0..<full.cstrs.len:
-        let c: MirCString = get[MirCString](full.cstrs, ci)
+        let c: MirCString = full.cstrs[ci]
         var useCstr: bool = false
         if driver_strNonEmpty(c.label):
-            hashmaps.hashMapStrIntGetPtr(&neededGlobalNames, c.label, &useCstr)
+            hashmaps.hashMapStrIntGetPtrRaw(&neededGlobalNames, c.label,&useCstr)
         if useCstr:
-            addPtr[MirCString](&unit.cstrs, c)
+            add(unit.cstrs, c)
 
     var needExternByIdx: bool[full.funcs.len]
     needExternByIdx.len = full.funcs.len
     for si in 0..<neededExternNames.keys.len:
-        let callee: str = get[str](neededExternNames.keys, si)
+        let callee: str = neededExternNames.keys[si]
         if driver_strNonEmpty(callee):
             var foundSrc: bool = false
-            let srcIdx: int32 = hashmaps.hashMapStrIntGetPtr(&nameToFuncIdx, callee, &foundSrc)
+            let srcIdx: int32 = hashmaps.hashMapStrIntGetPtrRaw(&nameToFuncIdx, callee,&foundSrc)
             if foundSrc && srcIdx >= 0 && srcIdx < needExternByIdx.len:
-                let srcFunc: MirFunc = get[MirFunc](full.funcs, srcIdx)
+                let srcFunc: MirFunc = full.funcs[srcIdx]
                 if srcFunc != nil:
                     if srcFunc.isExtern:
-                        setPtr[bool](&needExternByIdx, srcIdx, true)
+                        needExternByIdx[srcIdx] = true
                     else:
-                        let ownSrc: bool = streq(srcFunc.originFile, filePath)
+                        let ownSrc: bool = (srcFunc.originFile == filePath)
                         let sharedSrc: bool = includeShared && (driver_strIsEmpty(srcFunc.originFile))
                         if ! (ownSrc || sharedSrc):
-                            setPtr[bool](&needExternByIdx, srcIdx, true)
+                            needExternByIdx[srcIdx] = true
 
     for fi2 in 0..<needExternByIdx.len:
-        if get[bool](needExternByIdx, fi2):
-            let srcFunc2: MirFunc = get[MirFunc](full.funcs, fi2)
+        if needExternByIdx[fi2]:
+            let srcFunc2: MirFunc = full.funcs[fi2]
             if srcFunc2 != nil:
                 mirAddFunc(unit, driver_cloneExternFunc(srcFunc2))
 
@@ -2099,9 +2180,9 @@ fn driver_isDeclOnlyExternName(name: str): bool =
        driver_strHasPrefix(name, "chan") ||
        driver_strHasPrefix(name, "sched"):
         return true
-    if streq(name, "__addr") || streq(name, "_addr"):
+    if driver_strEq(name, "__addr") || driver_strEq(name, "_addr"):
         return true
-    if streq(name, "get_stderr") || streq(name, "get_stdout") || streq(name, "get_stdin"):
+    if driver_strEq(name, "get_stderr") || driver_strEq(name, "get_stdout") || driver_strEq(name, "get_stdin"):
         return true
     return false
 
@@ -2112,17 +2193,17 @@ fn driver_promoteDeclOnlyExternFuncs(module: MirModule): int32 =
     let dbg: os.File = os.get_stderr()
     var calledByBody: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(module.funcs.len * 4 + 8)
     for fi in 0..<module.funcs.len:
-        let funcWithBody: MirFunc = get[MirFunc](module.funcs, fi)
+        let funcWithBody: MirFunc = module.funcs[fi]
         if funcWithBody != nil && !funcWithBody.isExtern && funcWithBody.blocks.len > 0:
             driver_collectFuncCallNames(funcWithBody, &calledByBody)
     var patched: int32 = 0
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let f: MirFunc = module.funcs[i]
         if f == nil:
             continue
         var called: bool = false
         if driver_strNonEmpty(f.name):
-            hashmaps.hashMapStrIntGetPtr(&calledByBody, f.name, &called)
+            hashmaps.hashMapStrIntGetPtrRaw(&calledByBody, f.name,&called)
         if debugPromote && !f.isExtern && f.blocks.len == 0:
             os.writeLine(dbg, "backend_driver: decl-only candidate name=" + f.name +
                           " link=" + (f.linkName == nil ? "" : f.linkName) +
@@ -2136,8 +2217,8 @@ fn driver_promoteDeclOnlyExternFuncs(module: MirModule): int32 =
     return patched
 
 fn driver_moduleToLir(module: MirModule): LirModule =
-    let opt2: bool = os.getEnvDefault("CHENG_BACKEND_OPT2", "") == "1"
-    let optDefault: int32 = opt2 ? 2 : (os.getEnvDefault("CHENG_BACKEND_OPT", "") == "1" ? 1 : 0)
+    let opt2: bool = driver_strEq(os.getEnvDefault("CHENG_BACKEND_OPT2", ""), "1")
+    let optDefault: int32 = opt2 ? 2 : (driver_strEq(os.getEnvDefault("CHENG_BACKEND_OPT", ""), "1") ? 1 : 0)
     let optLevel: int32 = driver_parseInt32Default(os.getEnvDefault("CHENG_BACKEND_OPT_LEVEL", ""), optDefault)
     if optLevel >= 1:
         mirOptimizeModule(module)
@@ -2145,7 +2226,7 @@ fn driver_moduleToLir(module: MirModule): LirModule =
     if patchedExternDecls > 0 && driver_envIsTrue("CHENG_BACKEND_VALIDATE_DEBUG"):
         let f: os.File = os.get_stderr()
         os.writeLine(f, "backend_driver: promoted decl-only funcs to extern: " + intToStr(patchedExternDecls))
-    if os.getEnvDefault("CHENG_BACKEND_VALIDATE", "") == "1":
+    if driver_strEq(os.getEnvDefault("CHENG_BACKEND_VALIDATE", ""), "1"):
         let vRes: Result[bool] = mirValidateModule(module)
         if ! IsOk[bool](vRes):
             driver_panicResult[bool](vRes)
@@ -2162,8 +2243,20 @@ fn driver_moduleToLir(module: MirModule): LirModule =
     return lir
 
 fn driver_emitObjFromLir(lir: LirModule, target: str, objWriter: str): Result[uint8[]] =
+    let dbgEmitPipe2: bool = driver_envIsTrue("CHENG_BACKEND_DEBUG_EMIT_PIPE")
+    var dbgFile2: os.File = nil
+    if dbgEmitPipe2:
+        dbgFile2 = os.get_stderr()
+        os.writeLine(dbgFile2, "[backend] emit_obj: enter")
+        os.c_fflush dbgFile2
     var objRes: Result[uint8[]]
+    if dbgEmitPipe2:
+        os.writeLine(dbgFile2, "[backend] emit_obj: check_target")
+        os.c_fflush dbgFile2
     if driver_targetIsX86_64(target):
+        if dbgEmitPipe2:
+            os.writeLine(dbgFile2, "[backend] emit_obj: target=x86_64")
+            os.c_fflush dbgFile2
         var writer: str = objWriter
         if driver_strIsEmpty(writer):
             if driver_targetIsDarwin(target):
@@ -2172,40 +2265,76 @@ fn driver_emitObjFromLir(lir: LirModule, target: str, objWriter: str): Result[ui
                 writer = "coff"
             else:
                 writer = "elf"
-        if streq(writer, "macho"):
+        if driver_strEq(writer, "macho"):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: x86 writer=macho")
+                os.c_fflush dbgFile2
             if !driver_targetIsDarwin(target):
                 panic("backend_driver: x86_64 macho writer requires darwin target: " + target)
             objRes = machoWriteX86_64RelocatableObj(lir)
-        elif streq(writer, "elf"):
+        elif driver_strEq(writer, "elf"):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: x86 writer=elf")
+                os.c_fflush dbgFile2
             if driver_targetIsDarwin(target) || driver_targetIsWindows(target):
                 panic("backend_driver: x86_64 elf writer requires non-darwin, non-windows target: " + target)
             objRes = elfWriteX86_64RelocatableObj(lir)
-        elif streq(writer, "coff"):
+        elif driver_strEq(writer, "coff"):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: x86 writer=coff")
+                os.c_fflush dbgFile2
             if !driver_targetIsWindows(target):
                 panic("backend_driver: x86_64 coff writer requires windows target: " + target)
             objRes = coffWriteX86_64RelocatableObj(lir)
         else:
             panic("backend_driver: unsupported CHENG_BACKEND_OBJ_WRITER for x86_64: " + writer)
     elif driver_targetIsRiscv64(target):
-        if streq(objWriter, "elf") || driver_strIsEmpty(objWriter):
+        if dbgEmitPipe2:
+            os.writeLine(dbgFile2, "[backend] emit_obj: target=riscv64")
+            os.c_fflush dbgFile2
+        if driver_strEq(objWriter, "elf") || driver_strIsEmpty(objWriter):
             if driver_targetIsDarwin(target) || driver_targetIsWindows(target):
                 panic("backend_driver: riscv64 elf writer requires non-darwin, non-windows target: " + target)
             objRes = elfWriteRiscv64RelocatableObj(lir)
         else:
             panic("backend_driver: unsupported CHENG_BACKEND_OBJ_WRITER for riscv64: " + objWriter)
     else:
-        if streq(objWriter, "elf"):
+        if dbgEmitPipe2:
+            os.writeLine(dbgFile2, "[backend] emit_obj: target=aarch64-like")
+            os.c_fflush dbgFile2
+        if driver_strEq(objWriter, "elf"):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: aarch64 writer=elf")
+                os.c_fflush dbgFile2
             objRes = elfWriteAarch64RelocatableObj(lir)
-        elif streq(objWriter, "macho"):
+        elif driver_strEq(objWriter, "macho"):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: aarch64 writer=macho")
+                os.c_fflush dbgFile2
             objRes = machoWriteAarch64RelocatableObj(lir)
-        elif streq(objWriter, "coff"):
+        elif driver_strEq(objWriter, "coff"):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: aarch64 writer=coff")
+                os.c_fflush dbgFile2
             objRes = coffWriteAarch64RelocatableObj(lir)
         elif driver_targetIsDarwin(target):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: aarch64 auto=macho")
+                os.c_fflush dbgFile2
             objRes = machoWriteAarch64RelocatableObj(lir)
         elif driver_targetIsWindows(target):
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: aarch64 auto=coff")
+                os.c_fflush dbgFile2
             objRes = coffWriteAarch64RelocatableObj(lir)
         else:
+            if dbgEmitPipe2:
+                os.writeLine(dbgFile2, "[backend] emit_obj: aarch64 auto=elf")
+                os.c_fflush dbgFile2
             objRes = elfWriteAarch64RelocatableObj(lir)
+    if dbgEmitPipe2:
+        os.writeLine(dbgFile2, "[backend] emit_obj: leave")
+        os.c_fflush dbgFile2
     return objRes
 
 fn driver_ensureParentDir(path: str) =
@@ -2221,11 +2350,51 @@ fn driver_ensureParentDir(path: str) =
 
 fn driver_emitObjFromModule(module: MirModule, target: str, objWriter: str, outPath: str) =
     driver_ensureParentDir(outPath)
+    let dbgEmitPipe: bool = driver_envIsTrue("CHENG_BACKEND_DEBUG_EMIT_PIPE")
+    var dbgFile: os.File = nil
+    if dbgEmitPipe:
+        dbgFile = os.get_stderr()
+        os.writeLine(dbgFile, "[backend] emit: lir_start")
+        os.c_fflush dbgFile
     let lir: LirModule = driver_moduleToLir(module)
+    if dbgEmitPipe:
+        os.writeLine(dbgFile, "[backend] emit: lir_done")
+        os.c_fflush dbgFile
+        os.writeLine(dbgFile, "[backend] emit: obj_start")
+        os.c_fflush dbgFile
     let objRes: Result[uint8[]] = driver_emitObjFromLir(lir, target, objWriter)
+    if dbgEmitPipe:
+        os.writeLine(dbgFile, "[backend] emit: obj_done")
+        os.c_fflush dbgFile
     if ! IsOk[uint8[]](objRes):
         driver_panicResult[uint8[]](objRes)
+    let dbgObjMagic: bool = driver_envIsTrue("CHENG_BACKEND_DEBUG_OBJ_MAGIC")
+    if dbgObjMagic:
+        let dbgObj: uint8[] = Value[uint8[]](objRes)
+        let fDbgObj: os.File = os.get_stderr()
+        var b0: int32 = -1
+        var b1: int32 = -1
+        var b2: int32 = -1
+        var b3: int32 = -1
+        if dbgObj.len > 0:
+            b0 = int32(dbgObj[0])
+        if dbgObj.len > 1:
+            b1 = int32(dbgObj[1])
+        if dbgObj.len > 2:
+            b2 = int32(dbgObj[2])
+        if dbgObj.len > 3:
+            b3 = int32(dbgObj[3])
+        os.writeLine(fDbgObj, "backend_driver: obj_magic len=" + intToStr(dbgObj.len) +
+                     " b0=" + intToStr(b0) + " b1=" + intToStr(b1) +
+                     " b2=" + intToStr(b2) + " b3=" + intToStr(b3))
+        os.c_fflush fDbgObj
+    if dbgEmitPipe:
+        os.writeLine(dbgFile, "[backend] emit: write_start")
+        os.c_fflush dbgFile
     os.writeFileBytes(outPath, Value[uint8[]](objRes))
+    if dbgEmitPipe:
+        os.writeLine(dbgFile, "[backend] emit: write_done")
+        os.c_fflush dbgFile
     if ! frontend_lib.stage1_fileExists(outPath):
         panic("backend_driver: failed to write object file: " + outPath)
 
@@ -2244,7 +2413,7 @@ fn driver_runParallelUnitBatchesFork(full: MirModule, unitIndex: DriverUnitIndex
     for pi in 0..<pendingUnits.len:
         let bucket: int32 = pi % workerCount
         var row: int32[] = driver_getRowInt32(buckets, bucket)
-        addPtr[int32](&row, pi)
+        add(row, pi)
         driver_setRowInt32(buckets, bucket, row)
 
     var pids: int64[]
@@ -2254,12 +2423,14 @@ fn driver_runParallelUnitBatchesFork(full: MirModule, unitIndex: DriverUnitIndex
             let pid: int64 = driver_c_fork()
             if pid == 0:
                 for ri in 0..<row2.len:
-                    let idx: int32 = get[int32](row2, ri)
+                    let idx: int32 = row2[ri]
                     if idx >= 0 && idx < pendingUnits.len && idx < pendingObjs.len:
-                        let fp: str = get[str](pendingUnits, idx)
-                        let objPath: str = get[str](pendingObjs, idx)
+                        let fp: str = pendingUnits[idx]
+                        let objPath: str = pendingObjs[idx]
                         var found: bool = false
-                        let unitIdx: int32 = (unitIndex.unitIndex != nil) ? hashmaps.hashMapStrIntGetPtr(unitIndex.unitIndex, fp, &found) : -1
+                        var unitIdx: int32 = -1
+                        if unitIndex.unitIndex != nil:
+                            unitIdx = hashmaps.hashMapStrIntGetPtrRaw(unitIndex.unitIndex, fp,&found)
                         if !found:
                             panic("backend_driver: unit file not found in module: " + fp)
                         let u: MirModule = driver_buildUnitModuleFromIndex(full, fp, unitIdx, unitIndex)
@@ -2268,11 +2439,11 @@ fn driver_runParallelUnitBatchesFork(full: MirModule, unitIndex: DriverUnitIndex
                 system.exit 0
             if pid < 0:
                 panic "backend_driver: fork failed"
-            addPtr[int64](&pids, pid)
+            add(pids, pid)
 
     var status: int32 = 0
     for pi2 in 0..<pids.len:
-        let pid2: int64 = get[int64](pids, pi2)
+        let pid2: int64 = pids[pi2]
         status = 0
         let waited: int64 = driver_c_waitpid(pid2, &status, 0)
         if waited != pid2:
@@ -2288,15 +2459,15 @@ fn driver_moduleHasOwnSymbols(module: MirModule, filePath: str): bool =
         return false
     let includeShared: bool = driver_isSharedUnitFile(filePath)
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let f: MirFunc = module.funcs[i]
         if f != nil && !f.isExtern:
-            if streq(f.originFile, filePath):
+            if (f.originFile == filePath):
                 return true
             if includeShared && (driver_strIsEmpty(f.originFile)):
                 return true
     for i in 0..<module.globals.len:
-        let g: MirGlobal = get[MirGlobal](module.globals, i)
-        if streq(g.originFile, filePath):
+        let g: MirGlobal = module.globals[i]
+        if (g.originFile == filePath):
             return true
         if includeShared && (driver_strIsEmpty(g.originFile)):
             return true
@@ -2317,12 +2488,12 @@ fn driver_resolveUnitFileFromList(unitFiles: str[], requested: str): str =
     let reqTail: str = "/" + requested
     var found: str = ""
     for i in 0..<unitFiles.len:
-        let cand: str = get[str](unitFiles, i)
-        if streq(cand, requested):
+        let cand: str = unitFiles[i]
+        if (cand == requested):
             return cand
         if driver_strHasSuffix(cand, reqTail):
             return cand
-        if streq(os.extractFilename(cand), reqBase):
+        if (os.extractFilename(cand) == reqBase):
             if driver_strIsEmpty(found):
                 found = cand
             else:
@@ -2336,14 +2507,14 @@ fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtab
                          outputPath: str, runtimeObj: str, runtimeC: str, noRuntimeC: bool) =
     if objPaths.len == 0:
         panic "backend_driver: no object files to link"
-    if streq(linker, "self"):
+    if driver_strEq(linker, "self"):
         var linkObjs: str[]
         for i in 0..<objPaths.len:
-            addPtr[str](&linkObjs, get[str](objPaths, i))
+            add(linkObjs, objPaths[i])
         if len(runtimeObj) > 0:
             if ! frontend_lib.stage1_fileExists(runtimeObj):
                 panic("backend_driver: runtime obj not found: " + runtimeObj)
-            addPtr[str](&linkObjs, runtimeObj)
+            add(linkObjs, runtimeObj)
         elif ! noRuntimeC && frontend_lib.stage1_fileExists(runtimeC):
             panic("backend_driver: self linker requires CHENG_BACKEND_RUNTIME_OBJ (runtime C unsupported): " + runtimeC)
         if driver_targetIsDarwin(target) && driver_targetIsAarch64(target):
@@ -2351,7 +2522,7 @@ fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtab
             if ! IsOk[bool](linkRes):
                 driver_panicResult[bool](linkRes)
             driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
-            if os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1") != "0":
+            if !driver_strEq(os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1"), "0"):
                 driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
             return
         if driver_targetIsDarwin(target) && driver_targetIsX86_64(target):
@@ -2359,7 +2530,7 @@ fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtab
             if ! IsOk[bool](linkRes):
                 driver_panicResult[bool](linkRes)
             driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
-            if os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1") != "0":
+            if !driver_strEq(os.getEnvDefault("CHENG_BACKEND_CODESIGN", "1"), "0"):
                 driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
             return
         if driver_targetIsWindows(target) && driver_targetIsAarch64(target):
@@ -2383,7 +2554,7 @@ fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtab
 
     var linkCmd: str = ldCmd
     for i2 in 0..<objPaths.len:
-        linkCmd = linkCmd + " " + driver_shellQuote(get[str](objPaths, i2))
+        linkCmd = linkCmd + " " + driver_shellQuote(objPaths[i2])
     if len(runtimeObj) > 0:
         if ! frontend_lib.stage1_fileExists(runtimeObj):
             panic("backend_driver: runtime obj not found: " + runtimeObj)
@@ -2415,7 +2586,7 @@ fn driver_loadObjectList(path: str): str[] =
                 let line: str = driver_trimAsciiSpace(lineRaw)
                 if driver_strNonEmpty(line):
                     if line[0] != '#':
-                        addPtr[str](&out, line)
+                        add(out, line)
             start = i + 1
     return out
 
@@ -2451,8 +2622,8 @@ fn driver_loadUnitBatchPairs(path: str): str[] =
                         let unitPath: str = driver_trimAsciiSpace(unitRaw)
                         if driver_strIsEmpty(objPath) || driver_strIsEmpty(unitPath):
                             panic("backend_driver: invalid batch line (empty obj/unit): " + line)
-                        addPtr[str](&out, objPath)
-                        addPtr[str](&out, unitPath)
+                        add(out, objPath)
+                        add(out, unitPath)
             start = i + 1
     return out
 
@@ -2510,6 +2681,11 @@ fn backendMain(): int32 =
     var runtimeC: str = os.getEnvDefault("CHENG_BACKEND_RUNTIME_C", "src/runtime/native/system_helpers.c")
     var noRuntimeC: bool = driver_envBoolDefault("CHENG_BACKEND_NO_RUNTIME_C", false)
     var androidApi: int32 = driver_parseInt32Default(os.getEnvDefault("CHENG_ANDROID_API", ""), 21)
+    var abi: str = lowerAscii(driver_trimAsciiSpace(os.getEnvDefault("CHENG_ABI", "")))
+    if driver_strIsEmpty(abi):
+        abi = "v1"
+    elif !driver_strEq(abi, "v1") && !driver_strEq(abi, "v2_noptr"):
+        panic("backend_driver: unsupported CHENG_ABI (expected v1 or v2_noptr): " + abi)
     if len(inputPath) == 0:
         inputPath = os.getEnvDefault("CHENG_BACKEND_INPUT", "")
     if len(outputPath) == 0:
@@ -2517,15 +2693,15 @@ fn backendMain(): int32 =
     driver_profileStep(profile, "parse_args")
     if driver_strIsEmpty(emitMode):
         emitMode = "obj"
-    if driver_strIsEmpty(target) || streq(target, "auto"):
+    if driver_strIsEmpty(target) || driver_strEq(target, "auto"):
         target = driver_detectHostTargetAuto()
     if driver_strIsEmpty(target):
         panic("backend_driver: auto target detect failed; pass --target=<triple> or set CHENG_BACKEND_TARGET")
-    if !streq(emitMode, "obj") && !streq(emitMode, "exe"):
+    if !driver_strEq(emitMode, "obj") && !driver_strEq(emitMode, "exe"):
         panic "backend_driver: invalid emit mode"
 
-    if streq(emitMode, "exe") && streq(elfProfile, "nolibc"):
-        if !(streq(linker, "self") &&
+    if driver_strEq(emitMode, "exe") && driver_strEq(elfProfile, "nolibc"):
+        if !(driver_strEq(linker, "self") &&
              driver_targetIsAarch64(target) &&
              driver_targetIsLinux(target) &&
              !driver_targetIsDarwin(target) &&
@@ -2542,7 +2718,7 @@ fn backendMain(): int32 =
         panic("backend_driver: unsupported CHENG_BACKEND_TARGET (expected aarch64/arm64, x86_64, or riscv64): " + target)
 
     if driver_targetIsAndroid(target):
-        if !ccExplicit && streq(ccCmd, "cc"):
+        if !ccExplicit && driver_strEq(ccCmd, "cc"):
             let ndkCc: str = driver_defaultAndroidNdkClang(androidApi)
             if driver_strNonEmpty(ndkCc):
                 ccCmd = ndkCc
@@ -2571,12 +2747,12 @@ fn backendMain(): int32 =
     # Fork-parallel avoids subprocesses rebuilding the full module. When fork
     # is disabled/unavailable, default to enabling module-cache so parallel
     # workers can reuse the parent-built module instead of rebuilding it.
-    let forkDefault: bool = streq(frontend, "stage1")
+    let forkDefault: bool = driver_strEq(frontend, "stage1")
     let allowForkParallel0: bool = driver_envBoolDefault("CHENG_BACKEND_MULTI_FORK", forkDefault)
 
     let compileStamp0: str = driver_buildObjCompileStamp(target, frontend, objWriter, inputPath,
                                                          allowNoMain, wholeProgram,
-                                                         skipGlobalInit, multiLto, driver_selfCompilerStamp())
+                                                         skipGlobalInit, multiLto, abi, driver_selfCompilerStamp())
     let compileStampHash0: int64 = mirFnv1a64(compileStamp0)
 
     if len(outputPath) == 0:
@@ -2584,21 +2760,21 @@ fn backendMain(): int32 =
             panic "backend_driver: output path required"
         let parts: SplitFileResult = os.splitFile(inputPath)
         let base = driver_joinDir(parts.dir, parts.name)
-        if streq(emitMode, "obj"):
+        if driver_strEq(emitMode, "obj"):
             outputPath = base + ".o"
         else:
             outputPath = base
     let outParts: SplitFileResult = os.splitFile(outputPath)
     let outBase = driver_joinDir(outParts.dir, outParts.name)
 
-    let moduleCacheDefault0: bool = streq(frontend, "stage1") || !allowForkParallel0
+    let moduleCacheDefault0: bool = driver_strEq(frontend, "stage1") || !allowForkParallel0
     let moduleCacheEnabled0: bool = driver_envBoolDefault("CHENG_BACKEND_MULTI_MODULE_CACHE", moduleCacheDefault0)
     if driver_strIsEmpty(moduleCachePath) && moduleCacheEnabled0 &&
-       streq(emitMode, "exe") && multi:
+       driver_strEq(emitMode, "exe") && multi:
         moduleCachePath = outBase + ".objs/.build.module.cache"
 
     if driver_strNonEmpty(linkObjsFile):
-        if ! streq(emitMode, "exe"):
+        if !driver_strEq(emitMode, "exe"):
             panic "backend_driver: CHENG_BACKEND_LINK_OBJS requires emit=exe"
         let objPathsFromList: str[] = driver_loadObjectList(linkObjsFile)
         if objPathsFromList.len == 0:
@@ -2631,7 +2807,7 @@ fn backendMain(): int32 =
         let demo: MirModule = mirDemoModule()
         moduleRes = Ok[MirModule](demo)
     else:
-        if streq(frontend, "stage1"):
+        if driver_strEq(frontend, "stage1"):
             moduleRes = mirBuildModuleFromFileStage1(inputPath)
         else:
             moduleRes = mirBuildModuleFromFile(inputPath)
@@ -2652,14 +2828,14 @@ fn backendMain(): int32 =
     if driver_strNonEmpty(unitFile):
         panic "backend_driver: CHENG_BACKEND_UNIT_FILE is disabled in bootstrap-compatible mode"
 
-    if streq(emitMode, "exe") && multi:
+    if driver_strEq(emitMode, "exe") && multi:
         multi = false
-    let objPath: str = streq(emitMode, "obj") ? outputPath : (outBase + ".o")
+    let objPath: str = driver_strEq(emitMode, "obj") ? outputPath : (outBase + ".o")
     driver_emitObjFromModule(mod, target, objWriter, objPath)
     driver_profileStep(profile, "single.emit_obj")
-    if streq(emitMode, "exe"):
+    if driver_strEq(emitMode, "exe"):
         var linkObjs2: str[]
-        addPtr[str](&linkObjs2, objPath)
+        add(linkObjs2, objPath)
         driver_linkExeObjects(linkObjs2, target, linker, linkerSymtabAll, ldCmd, cflags, ldflags,
                               outputPath, runtimeObj, runtimeC, noRuntimeC)
         driver_profileStep(profile, "single.link")
@@ -2669,23 +2845,50 @@ fn main(argc: int32, argv: str*): int32 =
     cmdline.__cheng_setCmdLine(argc, void*(argv))
     # Debug: stage0-compat built stage1 may crash in early runtime paths; allow a minimal
     # allocator/seq smoke to isolate miscompiles.
-    if os.getEnvDefault("CHENG_BACKEND_SELFTEST", "") == "1":
+    if driver_strEq(os.getEnvDefault("CHENG_BACKEND_SELFTEST", ""), "1"):
         let f: os.File = os.get_stderr()
         os.writeLine(f, "selftest: seq<int32>")
         os.c_fflush f
         var xs: int32[]
-        addPtr[int32](&xs, 1)
-        addPtr[int32](&xs, 2)
-        if xs.len != 2 || get[int32](xs, 0) != 1 || get[int32](xs, 1) != 2:
+        add(xs, 1)
+        add(xs, 2)
+        if xs.len != 2 || xs[0] != 1 || xs[1] != 2:
             panic "selftest: seq<int32> failed"
 
         os.writeLine(f, "selftest: seq<str>")
         os.c_fflush f
         var ss: str[]
-        addPtr[str](&ss, "a")
-        addPtr[str](&ss, "b")
-        if ss.len != 2 || !streq(get[str](ss, 0), "a") || !streq(get[str](ss, 1), "b"):
+        add(ss, "a")
+        add(ss, "b")
+        if ss.len != 2 || !driver_strEq(ss[0], "a") || !driver_strEq(ss[1], "b"):
             panic "selftest: seq<str> failed"
+
+        os.writeLine(f, "selftest: seq<uint8>")
+        os.c_fflush f
+        var bs: uint8[]
+        add(bs, uint8(0xCF))
+        add(bs, uint8(0xFA))
+        if bs.len != 2 || int32(bs[0]) != 207 || int32(bs[1]) != 250:
+            panic "selftest: seq<uint8> failed"
+
+        os.writeLine(f, "selftest: result<seq<uint8>>")
+        os.c_fflush f
+        let rb: Result[uint8[]] = Ok[uint8[]](bs)
+        if !IsOk[uint8[]](rb):
+            panic "selftest: result<seq<uint8>> not ok"
+        let rv: uint8[] = Value[uint8[]](rb)
+        if rv.len != 2 || int32(rv[0]) != 207 || int32(rv[1]) != 250:
+            panic "selftest: result<seq<uint8>> value copy failed"
+
+        os.writeLine(f, "selftest: seq<ptr>")
+        os.c_fflush f
+        var ps: ptr[]
+        let marker: str = "ptr_ok"
+        add(ps, void*(marker))
+        if ps.len != 1:
+            panic "selftest: seq<ptr> len failed"
+        if str(ps[0]) != "ptr_ok":
+            panic "selftest: seq<ptr> value failed"
 
         os.writeLine(f, "selftest: hashmap<str,int32>")
         os.c_fflush f
@@ -2698,7 +2901,7 @@ fn main(argc: int32, argv: str*): int32 =
         os.writeLine(f, "selftest: hashmap.get")
         os.c_fflush f
         var found: bool = false
-        let v: int32 = hashmaps.hashMapStrIntGetPtr(&m, "k1", &found)
+        let v: int32 = hashmaps.hashMapStrIntGetPtrRaw(&m, "k1",&found)
         if !found || v != 7:
             panic "selftest: hashmap failed"
 
@@ -2708,12 +2911,12 @@ fn main(argc: int32, argv: str*): int32 =
         if rows.len != 3:
             panic "selftest: seq<seq<int32>> init failed"
         var r0: int32[] = driver_getRowInt32(rows, 0)
-        addPtr[int32](&r0, 9)
+        add(r0, 9)
         driver_setRowInt32(rows, 0, r0)
         # Ensure nested-seq stores retain the inner buffer (no UAF after clearing the local copy).
         r0 = []
         let r0b: int32[] = driver_getRowInt32(rows, 0)
-        if r0b.len != 1 || get[int32](r0b, 0) != 9:
+        if r0b.len != 1 || r0b[0] != 9:
             panic "selftest: seq<seq<int32>> update failed"
         let r1: int32[] = driver_getRowInt32(rows, 1)
         if r1.len != 0:
@@ -2726,7 +2929,7 @@ fn main(argc: int32, argv: str*): int32 =
             panic "selftest: allocHashMapStrInt returned nil"
         hashmaps.hashMapStrIntPut(mp, "k1", 7)
         var found2: bool = false
-        let v2: int32 = hashmaps.hashMapStrIntGetPtr(mp, "k1", &found2)
+        let v2: int32 = hashmaps.hashMapStrIntGetPtrRaw(mp, "k1",&found2)
         if !found2 || v2 != 7:
             panic "selftest: allocHashMapStrInt failed"
 

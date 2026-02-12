@@ -3,6 +3,7 @@ import std/seqs
 import std/strings
 import std/hashmaps
 import std/result
+import std/os
 import cheng/backend/lir/lir_types
 import cheng/backend/obj/obj_buf
 import cheng/backend/obj/aarch64_enc
@@ -99,32 +100,72 @@ fn macho_strCmp(a: str, b: str): int32 =
         return 1
     return 0
 
+fn macho_strEq(a: str, b: str): bool =
+    return macho_strCmp(a, b) == 0
+
+fn machoDebugEnabled(): bool =
+    return macho_strEq(os.getEnvDefault("CHENG_BACKEND_DEBUG_MACHO", ""), "1")
+
+fn machoDebug(msg: str) =
+    if machoDebugEnabled():
+        echo msg
+
 fn macho_seqContainsStr(items: str[], value: str): bool =
     for i in 0..<items.len:
-        if streq(get[str](items, i), value):
+        if macho_strEq(items[i], value):
             return true
     return false
+
+fn machoSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "macho_writer: seq index out of bounds"
+    let off64: int64 = int64(idx) * int64(elemSize)
+    return ptr_add(buffer, int32(off64))
+
+fn machoReadStrPtr(items: str[]*, idx: int32): str =
+    if items == nil:
+        panic "macho_writer: nil seq pointer"
+    let p: str* = str*(machoSeqElemPtr(items->buffer, items->len, idx, sizeof str))
+    return *p
+
+fn machoWriteStrPtr(items: str[]*, idx: int32, val: str) =
+    if items == nil:
+        panic "macho_writer: nil seq pointer"
+    let p: str* = str*(machoSeqElemPtr(items->buffer, items->len, idx, sizeof str))
+    *p = val
+
+fn machoAddStrPtr(items: str[]*, value: str) =
+    if items == nil:
+        return
+    add(items, value)
+
+fn machoSeqInitEmpty[T](items: T[]*) =
+    if items == nil:
+        return
+    items->buffer = nil
+    items->len = 0
+    items->cap = 0
 
 fn macho_seqAddUniqueStr(items: str[]*, value: str) =
     if items == nil || value == nil || len(value) == 0:
         return
     if macho_seqContainsStr(*items, value):
         return
-    addPtr[str](items, value)
+    machoAddStrPtr(items, value)
 
 fn macho_sortStringsStable(items: str[]*) =
     if items == nil:
         return
     for i in 1..<items->len:
-        let key: str = get[str](*items, i)
+        let key: str = machoReadStrPtr(items, i)
         var j: int32 = i - 1
         let __for_start_j = j
         for __for_rev_j in 0..(__for_start_j - (0)):
             j = __for_start_j - __for_rev_j
-            if !(macho_strCmp(get[str](*items, j), key) > 0):
+            if !(macho_strCmp(machoReadStrPtr(items, j), key) > 0):
                 break
-            setPtr[str](items, j + 1, get[str](*items, j))
-        setPtr[str](items, j + 1, key)
+            machoWriteStrPtr(items, j + 1, machoReadStrPtr(items, j))
+        machoWriteStrPtr(items, j + 1, key)
 
 fn macho_alignUp(value: uint64, align: uint64): uint64 =
     if align == 0:
@@ -134,7 +175,7 @@ fn macho_alignUp(value: uint64, align: uint64): uint64 =
         return value
     return value + (align - rem)
 
-fn machoAddSym(outSyms: MachoSym[]*, name: str, nType: uint8, nSect: uint8, nValue: uint64) =
+fn machoAddSym(outSyms: MachoSym[], name: str, nType: uint8, nSect: uint8, nValue: uint64): MachoSym[] =
     var s: MachoSym
     new s
     s.name = name
@@ -143,21 +184,22 @@ fn machoAddSym(outSyms: MachoSym[]*, name: str, nType: uint8, nSect: uint8, nVal
     s.nDesc = uint16(0)
     s.nValue = nValue
     s.nameOff = 0
-    addPtr[MachoSym](outSyms, s)
+    add(outSyms, s)
+    return outSyms
 
 fn machoFindSymIndex(syms: MachoSym[], name: str): int32 =
     if name == nil:
         return -1
     for i in 0..<syms.len:
-        let s: MachoSym = get[MachoSym](syms, i)
-        if s != nil && streq(s.name, name):
+        let s: MachoSym = syms[i]
+        if s != nil && macho_strEq(s.name, name):
             return i
     return -1
 
 fn machoBuildSymIndexMap(syms: MachoSym[]): hashmaps.HashMapStrInt =
     var out: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(syms.len * 2 + 1)
     for i in 0..<syms.len:
-        let s: MachoSym = get[MachoSym](syms, i)
+        let s: MachoSym = syms[i]
         if s != nil && s.name != nil && s.name[0] != char(0):
             hashmaps.hashMapStrIntPut(&out, s.name, i)
     return out
@@ -166,15 +208,17 @@ fn macho_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
     for i in 0..<labels.len:
         if ! (i < offs.len):
             break
-        if streq(get[str](labels, i), label):
-            return Ok[int32](get[int32](offs, i))
+        if macho_strEq(labels[i], label):
+            return Ok[int32](offs[i])
     return Err[int32]("macho_writer: missing label: " + label)
 
 fn machoBuild(module: LirModule): Result[uint8[]] =
+    machoDebug("[macho] build:start")
     if module == nil:
         return Err[uint8[]]("macho_writer: nil module")
     if ! macho_targetIsDarwin(module.target):
         return Err[uint8[]]("macho_writer: non-darwin target not supported")
+    machoDebug("[macho] build:target_ok")
 
     let symPrefix: str = machoSymPrefix(module.target)
 
@@ -182,63 +226,73 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
     var text: uint8[]
     var cstring: uint8[]
     var data: uint8[]
+    machoSeqInitEmpty[uint8](&text)
+    machoSeqInitEmpty[uint8](&cstring)
+    machoSeqInitEmpty[uint8](&data)
     var bssSize: uint64 = 0
 
     # Layout cstrings.
     var cSymOffs: uint64[]
+    machoSeqInitEmpty[uint64](&cSymOffs)
     cSymOffs.len = int(module.cstrs.len)
     for ci in 0..<module.cstrs.len:
-        let c: LirCString = get[LirCString](module.cstrs, ci)
+        let c: LirCString = module.cstrs[ci]
         let off: uint64 = uint64(cstring.len)
-        setPtr[uint64](&cSymOffs, ci, off)
+        cSymOffs[ci] = off
         bufStr0(&cstring, c.value)
+    machoDebug("[macho] build:cstrings_done")
 
     # Layout globals.
     var dataSymOffs: uint64[]
+    machoSeqInitEmpty[uint64](&dataSymOffs)
     dataSymOffs.len = int(module.globals.len)
     var bssSymOffs: uint64[]
+    machoSeqInitEmpty[uint64](&bssSymOffs)
     bssSymOffs.len = int(module.globals.len)
     var maxDataAlignPow2: int32 = 0
     var maxBssAlignPow2: int32 = 0
     for gi in 0..<module.globals.len:
-        let g: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g: LirGlobal = module.globals[gi]
         if g.alignPow2 > maxDataAlignPow2 && g.hasInit:
             maxDataAlignPow2 = g.alignPow2
         if g.alignPow2 > maxBssAlignPow2 && ! g.hasInit:
             maxBssAlignPow2 = g.alignPow2
     for gi in 0..<module.globals.len:
-        let g2: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g2: LirGlobal = module.globals[gi]
         let align: uint64 = uint64(1) << uint64(g2.alignPow2)
         if g2.hasInit:
             bufAlign(&data, align)
-            setPtr[uint64](&dataSymOffs, gi, uint64(data.len))
+            dataSymOffs[gi] = uint64(data.len)
             if g2.size == 4:
                 bufU32(&data, uint32(int32(g2.init)))
             else:
                 bufU64(&data, uint64(g2.init))
         else:
             bssSize = macho_alignUp(bssSize, align)
-            setPtr[uint64](&bssSymOffs, gi, bssSize)
+            bssSymOffs[gi] = bssSize
             bssSize = bssSize + uint64(g2.size)
+    machoDebug("[macho] build:globals_done")
 
     # Encode .text and collect relocations.
     var relocs: MachoReloc[]
     var funcOffs: uint64[]
+    machoSeqInitEmpty[MachoReloc](&relocs)
+    machoSeqInitEmpty[uint64](&funcOffs)
     funcOffs.len = int(module.funcs.len)
     for fi in 0..<module.funcs.len:
         bufAlign(&text, 4)
-        setPtr[uint64](&funcOffs, fi, uint64(text.len))
-        let f: LirFunc = get[LirFunc](module.funcs, fi)
+        funcOffs[fi] = uint64(text.len)
+        let f: LirFunc = module.funcs[fi]
 
         # Pass 1: compute label offsets within this function (in bytes from func start).
         var labels: str[16]
         var labelOffs: int32[16]
         var scanOff: int32 = 0
         for si in 0..<f.insts.len:
-            let inst0: LirInst = get[LirInst](f.insts, si)
+            let inst0: LirInst = f.insts[si]
             if inst0.op == loLabel:
-                addPtr[str](&labels, inst0.label)
-                addPtr[int32](&labelOffs, scanOff)
+                add(labels, inst0.label)
+                add(labelOffs, scanOff)
                 continue
             if inst0.op == loMovImm:
                 let wc: int32 = a64MovImmWordCount(a64Is64(inst0.rd), inst0.imm)
@@ -251,7 +305,7 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
         for __for_guard_ii in 0..<f.insts.len:
             if !(ii < f.insts.len):
                 break
-            let inst: LirInst = get[LirInst](f.insts, ii)
+            let inst: LirInst = f.insts[ii]
             if inst.op == loLabel:
                 ii = ii + 1
                 continue
@@ -290,7 +344,7 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
                 r.sym = inst.label
                 r.rtype = ARM64_RELOC_PAGE21
                 r.pcrel = true
-                addPtr[MachoReloc](&relocs, r)
+                add(relocs, r)
             elif inst.op == loAddPageOff:
                 word = a64EncAddImm(true, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
                 var r2: MachoReloc
@@ -299,7 +353,7 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
                 r2.sym = inst.label
                 r2.rtype = ARM64_RELOC_PAGEOFF12
                 r2.pcrel = false
-                addPtr[MachoReloc](&relocs, r2)
+                add(relocs, r2)
             elif inst.op == loSxtw:
                 word = a64EncSxtw(a64RegNum(inst.rd), a64RegNum(inst.rn))
             elif inst.op == loAdd:
@@ -417,7 +471,7 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
                 r3.sym = symPrefix + inst.label
                 r3.rtype = ARM64_RELOC_BRANCH26
                 r3.pcrel = true
-                addPtr[MachoReloc](&relocs, r3)
+                add(relocs, r3)
             elif inst.op == loBlr:
                 word = a64EncBlr(a64RegNum(inst.rn))
             elif inst.op == loFmovDx:
@@ -445,6 +499,22 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
             emitU32LE(&text, word)
             ii = ii + 1
             curOff = curOff + 4
+    machoDebug("[macho] build:text_done")
+    if machoDebugEnabled():
+        echo "[macho] module.funcs.len="
+        echo intToStr(module.funcs.len)
+        for fi2 in 0..<module.funcs.len:
+            let fdbg: LirFunc = module.funcs[fi2]
+            if fdbg != nil && fdbg.name != nil:
+                echo "[macho] func:"
+                echo fdbg.name
+        echo "[macho] module.cstrs.len="
+        echo intToStr(module.cstrs.len)
+        for ci2 in 0..<module.cstrs.len:
+            let cdbg: LirCString = module.cstrs[ci2]
+            if cdbg.label != nil:
+                echo "[macho] cstr:"
+                echo cdbg.label
 
     # Sections: always include __text, optionally __cstring/__data/__bss.
     let hasCstr: bool = cstring.len > 0
@@ -497,67 +567,73 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
 
     # Build symbol list in dyld order: locals, extdefs, undefs.
     var syms: MachoSym[]
+    machoSeqInitEmpty[MachoSym](&syms)
 
     # locals: cstrings
     for ci in 0..<module.cstrs.len:
-        let c2: LirCString = get[LirCString](module.cstrs, ci)
+        let c2: LirCString = module.cstrs[ci]
         if hasCstr:
-            let v: uint64 = cstrAddr + get[uint64](cSymOffs, ci)
-            machoAddSym(&syms, c2.label, N_SECT, cstrSectIndex, v)
+            let v: uint64 = cstrAddr + cSymOffs[ci]
+            syms = machoAddSym(syms, c2.label, N_SECT, cstrSectIndex, v)
 
     let localCount: uint32 = uint32(syms.len)
 
     # extdefs: funcs
     for fi in 0..<module.funcs.len:
-        let f2: LirFunc = get[LirFunc](module.funcs, fi)
-        let v2: uint64 = textAddr + get[uint64](funcOffs, fi)
-        machoAddSym(&syms, symPrefix + f2.name, uint8(N_SECT | N_EXT), textSectIndex, v2)
+        let f2: LirFunc = module.funcs[fi]
+        let v2: uint64 = textAddr + funcOffs[fi]
+        syms = machoAddSym(syms, symPrefix + f2.name, uint8(N_SECT | N_EXT), textSectIndex, v2)
 
     # extdefs: data/bss globals
     for gi in 0..<module.globals.len:
-        let g3: LirGlobal = get[LirGlobal](module.globals, gi)
+        let g3: LirGlobal = module.globals[gi]
         let gSym: str = symPrefix + g3.name
         if g3.hasInit:
             if hasData:
-                let v3: uint64 = dataAddr + get[uint64](dataSymOffs, gi)
-                machoAddSym(&syms, gSym, uint8(N_SECT | N_EXT), dataSectIndex, v3)
+                let v3: uint64 = dataAddr + dataSymOffs[gi]
+                syms = machoAddSym(syms, gSym, uint8(N_SECT | N_EXT), dataSectIndex, v3)
         else:
             if hasBss:
-                let v4: uint64 = bssAddr + get[uint64](bssSymOffs, gi)
-                machoAddSym(&syms, gSym, uint8(N_SECT | N_EXT), bssSectIndex, v4)
+                let v4: uint64 = bssAddr + bssSymOffs[gi]
+                syms = machoAddSym(syms, gSym, uint8(N_SECT | N_EXT), bssSectIndex, v4)
 
     let extdefCount: uint32 = uint32(syms.len) - localCount
 
-    var symIndex: hashmaps.HashMapStrInt = machoBuildSymIndexMap(syms)
-
     # undefs referenced by relocations.
     var undefs: str[]
+    machoSeqInitEmpty[str](&undefs)
     for ri in 0..<relocs.len:
-        let r0: MachoReloc = get[MachoReloc](relocs, ri)
+        let r0: MachoReloc = relocs[ri]
         if r0 != nil && r0.sym != nil && r0.sym[0] != char(0):
-            var found: bool = false
-            hashmaps.hashMapStrIntGet(symIndex, r0.sym, &found)
-            if ! found:
-                macho_seqAddUniqueStr(&undefs, r0.sym)
+            if machoFindSymIndex(syms, r0.sym) < 0 && !macho_seqContainsStr(undefs, r0.sym):
+                add(undefs, r0.sym)
+    machoDebug("[macho] build:undef_scan_done")
     macho_sortStringsStable(&undefs)
+    machoDebug("[macho] build:undef_sort_done")
     for ri in 0..<undefs.len:
-        let name: str = get[str](undefs, ri)
-        machoAddSym(&syms, name, uint8(N_UNDF | N_EXT), uint8(0), uint64(0))
-        hashmaps.hashMapStrIntPut(&symIndex, name, syms.len - 1)
+        if machoDebugEnabled():
+            echo "[macho] undef:"
+            echo undefs[ri]
+    for ri in 0..<undefs.len:
+        let name: str = undefs[ri]
+        syms = machoAddSym(syms, name, uint8(N_UNDF | N_EXT), uint8(0), uint64(0))
+    machoDebug("[macho] build:symbols_done")
 
     let undefCount: uint32 = uint32(undefs.len)
 
     # Build string table and fill nameOff.
     var strtab: uint8[]
-    addPtr[uint8](&strtab, uint8(0))
+    machoSeqInitEmpty[uint8](&strtab)
+    add(strtab, uint8(0))
     for si in 0..<syms.len:
-        let s0: MachoSym = get[MachoSym](syms, si)
-        if s0 != nil && s0.name != nil && len(s0.name) > 0:
-            s0.nameOff = uint32(strtab.len)
-            bufStr0(&strtab, s0.name)
-        else:
-            s0.nameOff = 0
-        setPtr[MachoSym](&syms, si, s0)
+        let s0: MachoSym = syms[si]
+        if s0 != nil:
+            if s0.name != nil && len(s0.name) > 0:
+                s0.nameOff = uint32(strtab.len)
+                bufStr0(&strtab, s0.name)
+            else:
+                s0.nameOff = 0
+            syms[si] = s0
 
     # Offsets.
     let headerSize: uint64 = 32
@@ -603,6 +679,8 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
 
     # Build file.
     var out: uint8[]
+    machoSeqInitEmpty[uint8](&out)
+    machoDebug("[macho] build:file_layout_done")
 
     # mach_header_64
     bufU32(&out, MH_MAGIC_64)
@@ -744,11 +822,20 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
         if uint64(out.len) != uint64(textRelOff):
             return Err[uint8[]]("macho_writer: internal offset mismatch (reloff)")
         for ri in 0..<relocs.len:
-            let r5: MachoReloc = get[MachoReloc](relocs, ri)
-            var found: bool = false
-            let symIdx: int32 = hashmaps.hashMapStrIntGet(symIndex, r5.sym, &found)
-            if !found || symIdx < 0:
-                return Err[uint8[]]("macho_writer: missing relocation symbol")
+            let r5: MachoReloc = relocs[ri]
+            let symIdx: int32 = machoFindSymIndex(syms, r5.sym)
+            if symIdx < 0:
+                if machoDebugEnabled():
+                    echo "[macho] missing reloc sym:"
+                    echo r5.sym
+                    echo "[macho] syms.len="
+                    echo intToStr(syms.len)
+                    for si2 in 0..<syms.len:
+                        let sdbg: MachoSym = syms[si2]
+                        if sdbg != nil && sdbg.name != nil:
+                            echo "[macho] sym:"
+                            echo sdbg.name
+                return Err[uint8[]]("macho_writer: missing relocation symbol: " + r5.sym)
             let pcrel: uint32 = r5.pcrel ? uint32(1) : uint32(0)
             let length: uint32 = uint32(2) # long (4 bytes)
             let ext: uint32 = uint32(1)
@@ -767,7 +854,7 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
     if uint64(out.len) != symoff:
         return Err[uint8[]]("macho_writer: internal offset mismatch (symoff)")
     for si in 0..<syms.len:
-        let s1: MachoSym = get[MachoSym](syms, si)
+        let s1: MachoSym = syms[si]
         bufU32(&out, s1.nameOff)
         bufU8(&out, s1.nType)
         bufU8(&out, s1.nSect)
@@ -777,6 +864,7 @@ fn machoBuild(module: LirModule): Result[uint8[]] =
     if uint64(out.len) != stroff:
         return Err[uint8[]]("macho_writer: internal offset mismatch (stroff)")
     bufBytes(&out, strtab)
+    machoDebug("[macho] build:done")
 
     return Ok[uint8[]](out)
 

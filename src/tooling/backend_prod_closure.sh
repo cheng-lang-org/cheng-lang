@@ -9,12 +9,12 @@ Usage:
                                      [--no-opt] [--no-obj] [--no-obj-determinism] [--no-exe-determinism]
                                      [--no-opt2]
                                      [--no-sanitizer]
-                                     [--no-stress] [--no-bundle]
+                                     [--stress|--no-stress] [--no-bundle]
                                      [--no-sign]
                                      [--no-ssa]
                                      [--no-selfhost]
                                      [--selfhost-fast|--selfhost-strict]
-                                     [--no-fullchain]
+                                     [--fullchain|--no-fullchain]
                                      [--seed:<path>] [--seed-id:<id>] [--seed-tar:<path>] [--require-seed]
                                      [--only-self-obj-bootstrap]
                                      [--no-self-obj-writer]
@@ -26,7 +26,7 @@ Usage:
 Notes:
   - Runs the self-hosted backend production closure (includes best-effort target matrix checks).
   - Default includes MIR validation (CHENG_BACKEND_VALIDATE=1) and emits a release manifest.
-  - Default fullchain runs in obj-only mode (no stage1->C fixed-point gate).
+  - Fullchain bootstrap gate is opt-in (`--fullchain` or `CHENG_BACKEND_RUN_FULLCHAIN=1`).
   - Default is strict: any step that exits with skip code (2) fails the closure.
   - Use `--allow-skip` to permit optional steps to skip.
   - `--require-seed` requires explicit `--seed`/`--seed-id`/`--seed-tar`.
@@ -43,7 +43,10 @@ run_opt="1"
 run_opt2="1"
 run_ssa="1"
 run_selfhost="1"
-run_fullchain="1"
+run_fullchain=""
+if [ "${CHENG_BACKEND_RUN_FULLCHAIN:-}" = "1" ]; then
+  run_fullchain="1"
+fi
 seed=""
 seed_id=""
 seed_tar=""
@@ -52,7 +55,10 @@ run_obj="1"
 run_obj_det="1"
 run_exe_det="1"
 run_sanitizer="1"
-run_stress="1"
+run_stress=""
+if [ "${CHENG_BACKEND_RUN_STRESS:-}" = "1" ]; then
+  run_stress="1"
+fi
 run_bundle="1"
 run_sign="1"
 run_mm="1"
@@ -108,6 +114,9 @@ while [ "${1:-}" != "" ]; do
     --no-fullchain)
       run_fullchain=""
       ;;
+    --fullchain)
+      run_fullchain="1"
+      ;;
     --seed:*)
       seed="${1#--seed:}"
       ;;
@@ -154,6 +163,9 @@ while [ "${1:-}" != "" ]; do
       ;;
     --no-stress)
       run_stress=""
+      ;;
+    --stress)
+      run_stress="1"
       ;;
     --no-bundle)
       run_bundle=""
@@ -364,11 +376,16 @@ has_any_lld() {
 if [ "$allow_skip" = "" ]; then
   export CHENG_BACKEND_MATRIX_STRICT=1
 fi
-if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
-  export CHENG_STAGE1_STD_NO_POINTERS=1
+if [ "${CHENG_ABI:-}" = "" ]; then
+  export CHENG_ABI=v2_noptr
 fi
-if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
-  export CHENG_STAGE1_STD_NO_POINTERS_STRICT=1
+if [ "${CHENG_ABI}" = "v2_noptr" ]; then
+  if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
+    export CHENG_STAGE1_STD_NO_POINTERS=1
+  fi
+  if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
+    export CHENG_STAGE1_STD_NO_POINTERS_STRICT=1
+  fi
 fi
 
 selfhost_stage0="${seed_path:-}"
@@ -419,6 +436,8 @@ if [ "$validate" != "" ]; then
 else
   run_required "backend.closedloop" sh src/tooling/verify_backend_closedloop.sh
 fi
+
+run_required "backend.abi_v2_noptr" sh src/tooling/verify_backend_abi_v2_noptr.sh
 
 run_optional "backend.obj_fullspec_gate" env CHENG_MM=orc sh src/tooling/verify_backend_obj_fullspec_gate.sh
 

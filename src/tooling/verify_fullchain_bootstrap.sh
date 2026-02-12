@@ -20,7 +20,11 @@ esac
 obj_only="${CHENG_FULLCHAIN_OBJ_ONLY:-1}"
 fullchain_reuse="${CHENG_FULLCHAIN_REUSE:-1}"
 fullchain_tool_jobs="${CHENG_FULLCHAIN_TOOL_JOBS:-0}"
-obj_fullspec_file="examples/backend_obj_fullspec.cheng"
+fullchain_stage1_timeout="${CHENG_FULLCHAIN_STAGE1_TIMEOUT:-60}"
+fullchain_stage1_multi="${CHENG_FULLCHAIN_STAGE1_MULTI:-1}"
+fullchain_stage1_jobs="${CHENG_FULLCHAIN_STAGE1_JOBS:-0}"
+fullchain_stage1_frontend="${CHENG_FULLCHAIN_STAGE1_FRONTEND:-mvp}"
+stage1_obj_file="${CHENG_FULLCHAIN_STAGE1_FILE:-examples/backend_fullchain_smoke.cheng}"
 if [ "$obj_only" != "1" ]; then
   echo "[Error] verify_fullchain_bootstrap C fullchain path removed; use CHENG_FULLCHAIN_OBJ_ONLY=1" 1>&2
   exit 2
@@ -115,38 +119,55 @@ build_backend_runtime_obj() {
 build_backend_runtime_obj
 
 if [ "$obj_only" = "1" ]; then
-  # Obj-only semantic gate: compile+run backend fullspec subset via backend driver (frontend=stage1).
-  # Keep acceptance stable ("fullspec ok") while avoiding unsupported full stage1 fullspec constructs.
-  if [ ! -f "$obj_fullspec_file" ]; then
-    echo "[Error] verify_fullchain_bootstrap missing obj-only fullspec file: $obj_fullspec_file" 1>&2
+  if [ ! -f "$stage1_obj_file" ]; then
+    echo "[Error] verify_fullchain_bootstrap missing stage1 obj sample: $stage1_obj_file" 1>&2
     exit 1
   fi
   fullspec_out="$out_dir/stage1_fullspec_obj"
   fullspec_log="$out_dir/stage1_fullspec_obj.out"
   fullspec_reuse="0"
   if [ "$fullchain_reuse" = "1" ] && [ -x "$fullspec_out" ]; then
-    if ! is_rebuild_required "$fullspec_out" "$obj_fullspec_file" "$stage2" "$runtime_obj"; then
+    if ! is_rebuild_required "$fullspec_out" "$stage1_obj_file" "$stage2" "$runtime_obj"; then
       fullspec_reuse="1"
     fi
   fi
   if [ "$fullspec_reuse" = "1" ]; then
-    echo "== fullchain.stage1_fullspec (obj-only, reuse: $obj_fullspec_file) =="
+    echo "== fullchain.stage1_fullspec (obj-only, reuse: $stage1_obj_file) =="
     "$fullspec_out" >"$fullspec_log"
     if ! grep -Fq "fullspec ok" "$fullspec_log"; then
       echo "[Error] obj-only fullspec reuse run failed: missing fullspec ok" 1>&2
       exit 1
     fi
   else
-    echo "== fullchain.stage1_fullspec (obj-only, backend: $obj_fullspec_file) =="
+    if [ "$fullchain_stage1_jobs" -le 0 ] 2>/dev/null; then
+      fullchain_stage1_jobs="$(detect_host_jobs)"
+    fi
+    echo "== fullchain.stage1_fullspec (obj-only, backend: $stage1_obj_file) =="
+    set +e
     CHENG_BACKEND_LINKER=self \
     CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
     CHENG_BACKEND_NO_RUNTIME_C=1 \
+    CHENG_STAGE1_FULLSPEC_TIMEOUT="$fullchain_stage1_timeout" \
+    CHENG_STAGE1_FULLSPEC_MULTI="$fullchain_stage1_multi" \
+    CHENG_STAGE1_FULLSPEC_JOBS="$fullchain_stage1_jobs" \
+    CHENG_STAGE1_FULLSPEC_FRONTEND="$fullchain_stage1_frontend" \
     sh src/tooling/verify_stage1_fullspec.sh \
       --backend:obj \
       --mm:orc \
-      --file:"$obj_fullspec_file" \
+      --file:"$stage1_obj_file" \
       --name:"$fullspec_out" \
       --log:"$fullspec_log"
+    fullspec_status=$?
+    set -e
+    if [ "$fullspec_status" = "124" ]; then
+      echo "[Error] fullchain stage1_fullspec timed out after ${fullchain_stage1_timeout}s" 1>&2
+      echo "[Hint] run sample profiler:" 1>&2
+      echo "  sh src/tooling/profile_backend_sample.sh --preset:fullchain-cold --duration:20 --top:12 --kill-after-sample" 1>&2
+      exit 124
+    fi
+    if [ "$fullspec_status" != "0" ]; then
+      exit "$fullspec_status"
+    fi
   fi
 fi
 

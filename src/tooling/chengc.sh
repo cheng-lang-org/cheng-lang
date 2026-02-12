@@ -10,6 +10,7 @@ Usage:
                         [--lock-format:<toml|yaml|json>] [--meta-out:<path>]
                         [--buildmeta:<path>]
                         [--backend:obj] [--emit-obj] [--obj-out:<path>]
+                        [--abi:<v1|v2_noptr>]
                         [--linker:<self>]
                         [--target:<triple>]
                         [--pkg-cache:<dir>] [--skip-pkg] [--verify] [--ledger:<path>]
@@ -87,6 +88,7 @@ obj_out=""
 backend=""
 linker=""
 target_arg=""
+abi=""
 
 while [ "${1:-}" != "" ]; do
   case "$1" in
@@ -106,6 +108,7 @@ while [ "${1:-}" != "" ]; do
       backend="obj"
       ;;
     --obj-out:*) obj_out="${1#--obj-out:}" ;;
+    --abi:*) abi="${1#--abi:}" ;;
     --linker:*) linker="${1#--linker:}" ;;
     --target:*) target_arg="${1#--target:}" ;;
     --pkg-cache:*) pkg_cache="${1#--pkg-cache:}" ;;
@@ -125,6 +128,14 @@ while [ "${1:-}" != "" ]; do
   esac
   shift || true
 done
+
+case "$abi" in
+  ""|v1|v2_noptr) ;;
+  *)
+    echo "[Error] invalid --abi:$abi (expected v1|v2_noptr)" 1>&2
+    exit 2
+    ;;
+esac
 
 if [ "$mm" = "" ] && [ -z "${CHENG_MM:-}" ]; then
   mm="orc"
@@ -494,6 +505,21 @@ if [ -n "$backend_runtime_obj" ]; then
   runtime_env="CHENG_BACKEND_RUNTIME_OBJ=$backend_runtime_obj"
 fi
 
+abi_env=""
+abi_effective="$abi"
+if [ -z "$abi_effective" ]; then
+  abi_effective="${CHENG_ABI:-}"
+fi
+if [ -n "$abi_effective" ]; then
+  abi_env="CHENG_ABI=$abi_effective"
+fi
+abi_std_noptr_env=""
+abi_std_noptr_strict_env=""
+if [ "$abi_effective" = "v2_noptr" ]; then
+  abi_std_noptr_env="CHENG_STAGE1_STD_NO_POINTERS=1"
+  abi_std_noptr_strict_env="CHENG_STAGE1_STD_NO_POINTERS_STRICT=1"
+fi
+
 link_env=""
 if [ "$backend_linker" = "self" ] && [ "$backend_emit" = "exe" ]; then
   backend_no_runtime_c="${CHENG_BACKEND_NO_RUNTIME_C:-1}"
@@ -506,7 +532,7 @@ backend_whole_program_env="${CHENG_BACKEND_WHOLE_PROGRAM:-1}"
 
 if [ -n "$backend_target" ]; then
   # shellcheck disable=SC2086
-  env $runtime_env $link_env \
+  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env \
     CHENG_BACKEND_TARGET="$backend_target" \
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_MULTI="$backend_multi_env" \
@@ -519,7 +545,7 @@ if [ -n "$backend_target" ]; then
     "$driver"
 else
   # shellcheck disable=SC2086
-  env $runtime_env $link_env \
+  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env \
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_MULTI="$backend_multi_env" \
     CHENG_BACKEND_INCREMENTAL="$backend_inc_env" \

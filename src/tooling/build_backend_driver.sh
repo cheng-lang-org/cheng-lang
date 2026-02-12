@@ -189,7 +189,19 @@ driver_multi="${CHENG_BACKEND_BUILD_DRIVER_MULTI:-0}"
 driver_multi_force="${CHENG_BACKEND_BUILD_DRIVER_MULTI_FORCE:-0}"
 driver_incremental="${CHENG_BACKEND_BUILD_DRIVER_INCREMENTAL:-1}"
 driver_jobs="${CHENG_BACKEND_BUILD_DRIVER_JOBS:-0}"
+build_timeout="${CHENG_BACKEND_BUILD_DRIVER_TIMEOUT:-60}"
 mm="${CHENG_BACKEND_BUILD_DRIVER_MM:-${CHENG_MM:-orc}}"
+# Stage1 frontend currently keeps semantics/mono/ownership behind explicit
+# toggles in production scripts to avoid seed-compiler crashes on this path.
+if [ "${CHENG_STAGE1_SKIP_SEM:-}" = "" ]; then
+  export CHENG_STAGE1_SKIP_SEM=0
+fi
+if [ "${CHENG_STAGE1_SKIP_MONO:-}" = "" ]; then
+  export CHENG_STAGE1_SKIP_MONO=0
+fi
+if [ "${CHENG_STAGE1_SKIP_OWNERSHIP:-}" = "" ]; then
+  export CHENG_STAGE1_SKIP_OWNERSHIP=1
+fi
 
 mkdir -p chengcache
 runtime_src="src/std/system_helpers_backend.cheng"
@@ -203,7 +215,7 @@ ensure_stage0_compat() {
 
 if [ ! -f "$runtime_obj_abs" ] || [ "$runtime_src" -nt "$runtime_obj_abs" ]; then
   set +e
-  env \
+  run_with_timeout "$build_timeout" env \
     CHENG_MM="$mm" \
     CHENG_C_SYSTEM=0 \
     CHENG_BACKEND_MULTI="$driver_multi" \
@@ -221,8 +233,12 @@ if [ ! -f "$runtime_obj_abs" ] || [ "$runtime_src" -nt "$runtime_obj_abs" ]; the
   status=$?
   set -e
   if [ "$status" -ne 0 ] || [ ! -s "$runtime_obj_abs" ]; then
+    if [ "$status" -eq 124 ]; then
+      echo "[Error] build_backend_driver runtime obj compile timed out (${build_timeout}s)" 1>&2
+    fi
     ensure_stage0_compat
-    (cd "$compat_root" && env \
+    set +e
+    (cd "$compat_root" && run_with_timeout "$build_timeout" env \
       CHENG_MM="$mm" \
       CHENG_C_SYSTEM=0 \
       CHENG_BACKEND_MULTI="$driver_multi" \
@@ -236,10 +252,16 @@ if [ ! -f "$runtime_obj_abs" ] || [ "$runtime_src" -nt "$runtime_obj_abs" ]; the
       CHENG_BACKEND_FRONTEND=stage1 \
       CHENG_BACKEND_INPUT="$runtime_src" \
       CHENG_BACKEND_OUTPUT="$runtime_obj_abs" \
-      "$stage0" >/dev/null 2>&1) || {
+      "$stage0" >/dev/null 2>&1)
+    compat_status=$?
+    set -e
+    if [ "$compat_status" -ne 0 ] || [ ! -s "$runtime_obj_abs" ]; then
+      if [ "$compat_status" -eq 124 ]; then
+        echo "[Error] build_backend_driver runtime obj compile timed out in stage0-compat (${build_timeout}s)" 1>&2
+      fi
       echo "[Error] build_backend_driver failed to build backend runtime obj (stage0=$stage0)" 1>&2
       exit 1
-    }
+    fi
   fi
 fi
 
@@ -249,7 +271,7 @@ tmp_obj_abs="$root/$tmp_bin.o"
 rm -f "$tmp_bin_abs" "$tmp_obj_abs"
 
 set +e
-env \
+run_with_timeout "$build_timeout" env \
   CHENG_MM="$mm" \
   CHENG_BACKEND_MULTI="$driver_multi" \
   CHENG_BACKEND_MULTI_FORCE="$driver_multi_force" \
@@ -272,7 +294,7 @@ if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ]; then
   # Some seed drivers may crash in multi-worker mode; retry once in serial mode.
   rm -f "$tmp_bin_abs" "$tmp_obj_abs"
   set +e
-  env \
+  run_with_timeout "$build_timeout" env \
     CHENG_MM="$mm" \
     CHENG_BACKEND_MULTI=0 \
     CHENG_BACKEND_MULTI_FORCE=0 \
@@ -308,7 +330,7 @@ rm -f "$tmp_bin_abs" "$tmp_obj_abs"
 ensure_stage0_compat
 
 set +e
-(cd "$compat_root" && env \
+(cd "$compat_root" && run_with_timeout "$build_timeout" env \
   CHENG_MM="$mm" \
   CHENG_BACKEND_MULTI="$driver_multi" \
   CHENG_BACKEND_MULTI_FORCE="$driver_multi_force" \
@@ -330,7 +352,7 @@ set -e
 if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ]; then
   rm -f "$tmp_bin_abs" "$tmp_obj_abs"
   set +e
-  (cd "$compat_root" && env \
+  (cd "$compat_root" && run_with_timeout "$build_timeout" env \
     CHENG_MM="$mm" \
     CHENG_BACKEND_MULTI=0 \
     CHENG_BACKEND_MULTI_FORCE=0 \
@@ -360,6 +382,9 @@ if [ "$status" -eq 0 ] && [ -x "$tmp_bin_abs" ] && driver_sanity_ok "$tmp_bin_ab
 fi
 
 rm -f "$tmp_bin_abs" "$tmp_obj_abs"
+if [ "$status" -eq 124 ]; then
+  echo "[Error] build_backend_driver timed out (${build_timeout}s per compile attempt)" 1>&2
+fi
 echo "[Error] build_backend_driver selfhost_self_link failed (native and stage0-compat; stage0=$stage0)" 1>&2
 echo "  hint: verify stage0 is runnable and can compile src/backend/tooling/backend_driver.cheng" 1>&2
 exit 1

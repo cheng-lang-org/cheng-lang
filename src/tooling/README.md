@@ -18,6 +18,7 @@ sh src/tooling/chengc.sh examples/stage1_codegen_fullspec.cheng --jobs:8
 - 后端中间产物位于 `chengcache/<name>.o`（`--emit-obj` 时输出可通过 `--obj-out` 指定）。
 - 可通过 `--name:<exeName>` 改输出二进制名。
 - 可选 `--mm:<orc|off>`（或 `--orc/--off`）设置内存模型；默认 `orc`。
+- 可选 `--abi:<v1|v2_noptr>`（等价于设置 `CHENG_ABI`）；默认沿用环境变量，未设置时为 `v1`。
 - 包管理器接入：可选传入 `--manifest/--lock/--registry`，会生成构建元数据 `chengcache/<name>.buildmeta.toml`。
 - 可选 `--pkg-cache:<dir>` 指定包缓存目录（默认 `chengcache/packages`，或 `CHENG_PKG_CACHE` 环境变量）。
 - 当 lock 存在时会拉取依赖包并设置 `CHENG_PKG_ROOTS` 供 `cheng/<pkg>/...` 域名导入使用；生产包根以 `src/` 为模块根（`cheng/<pkg>/<path>` -> `<pkgroot>/src/<path>.cheng`）。`CHENG_PKG_ROOTS` 可指向包根列表或容器根（如 `~/.cheng-packages`，解析会优先尝试 `cheng-<pkg>`）。
@@ -103,9 +104,10 @@ CHENG_FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
   - 工具构建要求 `CHENG_MM=orc`，不再自动回退 `CHENG_MM=off`。
   - 启用后按主机核数并行构建（`CHENG_FULLCHAIN_TOOL_JOBS`，`0`=auto）。
   - `verify_backend_selfhost_bootstrap_self_obj.sh` 支持 `CHENG_SELF_OBJ_BOOTSTRAP_TIMEOUT=<seconds>`（默认 60）防止 stage1/stage2 自举编译长时间卡死。
-  - `verify_backend_selfhost_bootstrap_self_obj.sh` 默认启用 `CHENG_STAGE1_STD_NO_POINTERS=1` 与 `CHENG_STAGE1_STD_NO_POINTERS_STRICT=1`（显式环境变量可覆盖）。
-  - `CHENG_STAGE1_STD_NO_POINTERS=1` 会启用 stage1 的 std no-pointer 门禁；默认采用“分层豁免”口径（低层 runtime/内存模型依赖模块豁免，确保生产链路可闭环）。
-  - 可额外设置 `CHENG_STAGE1_STD_NO_POINTERS_STRICT=1` 开启审计口径（禁用新增迁移豁免；当前仍保留 runtime-core 模块豁免，避免破坏自举/发布链路）。
+- `verify_backend_selfhost_bootstrap_self_obj.sh` 默认启用 `CHENG_ABI=v2_noptr`（可显式覆盖）。
+- `CHENG_ABI=v2_noptr` 会在 stage1 语义层启用 std no-pointer 门禁；兼容开关 `CHENG_STAGE1_STD_NO_POINTERS`/`CHENG_STAGE1_STD_NO_POINTERS_STRICT` 仍可单独设置。
+- `v2_noptr` 的策略由 `verify_backend_abi_v2_noptr.sh` 负向样例门禁保证：`src/std` 路径下的指针类型必须在编译期被拒绝。
+- `chengb.sh`/`chengc.sh` 在 `CHENG_ABI=v2_noptr` 时会自动注入 `CHENG_STAGE1_STD_NO_POINTERS=1` 与 `CHENG_STAGE1_STD_NO_POINTERS_STRICT=1`，确保旧版 stage2 driver 也遵循同一策略。
   - stage0 选择顺序：`CHENG_SELF_OBJ_BOOTSTRAP_STAGE0`（显式） -> 可执行 `CHENG_BACKEND_DRIVER` -> `artifacts/backend_selfhost_self_obj/cheng.stage2` -> `artifacts/backend_selfhost_self_obj/cheng.stage1` -> `artifacts/backend_seed/cheng.stage2` -> 可运行 `./cheng`（缺失或不可运行时才重建）。seed 仅用于“首次/无自举产物”的兜底。
   - 自举模式：`CHENG_SELF_OBJ_BOOTSTRAP_MODE=strict|fast`（默认 `strict`）。`strict` 默认校验 `stage1->stage2` 固定点；若首次不收敛，会自动追加 `stage3` 并以 `stage2->stage3` 固定点作为收敛门禁。`fast` 只编译 stage1 并同步为 stage2（开发加速，跳过 fixed-point 校验）。
   - 自举编译默认开启多单元增量：`CHENG_SELF_OBJ_BOOTSTRAP_MULTI=1`、`CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL=1`、`CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE=1`；`CHENG_SELF_OBJ_BOOTSTRAP_JOBS` 默认 `0`（auto，按主机核数并行）。
@@ -113,9 +115,11 @@ CHENG_FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
   - 执行结束会输出 `backend.selfhost_self_obj.timing`（lock/stage1/stage2/smoke/total 秒数），用于快速定位慢阶段。
   - 可在问题排查时显式关闭：`CHENG_SELF_OBJ_BOOTSTRAP_MULTI=0 CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL=0`。
   - 2026-02-08 同机冷态实测：`fast` 约 `17s`，`strict` 约 `24-27s`；`backend_prod_closure.sh --only-self-obj-bootstrap --selfhost-strict` 在 `60s` 约束内通过。
-  - 2026-02-06：已修复一类“无输出超时”根因（`src/std/strings.cheng` 的 `streq` 对 `nil` 比较递归调用自身）；该问题会让 selfhost 阶段卡住直到超时。
+  - 2026-02-06：已修复一类“无输出超时”根因（`src/std/strings.cheng` 的字符串 `==` 对 `nil` 比较递归调用自身）；该问题会让 selfhost 阶段卡住直到超时。
   - 修复后若 selfhost 失败，将优先以可诊断错误退出（而非长时间超时卡住）。
-- `CHENG_FULLCHAIN_OBJ_ONLY=1` 默认使用 `examples/backend_obj_fullspec.cheng` 作为 obj-only 门禁样例（要求输出 `fullspec ok`）；可用 `CHENG_FULLCHAIN_OBJ_FULLSPEC_FILE=<path>` 覆盖。
+- `CHENG_FULLCHAIN_OBJ_ONLY=1` 默认使用 `examples/backend_fullchain_smoke.cheng` 作为 obj-only 样例（要求输出 `fullspec ok`）；可用 `CHENG_FULLCHAIN_STAGE1_FILE=<path>` 覆盖。
+- fullchain stage1 样例编译默认走 `CHENG_FULLCHAIN_STAGE1_FRONTEND=mvp`（60s 口径更稳定）；需要强制 stage1 前端时可设 `CHENG_FULLCHAIN_STAGE1_FRONTEND=stage1`。
+- fullchain stage1 样例编译默认超时 `60s`（`CHENG_FULLCHAIN_STAGE1_TIMEOUT`），并支持 `CHENG_FULLCHAIN_STAGE1_MULTI` / `CHENG_FULLCHAIN_STAGE1_JOBS` 调整并行参数。
 
 CI/生产（macOS arm64）使用 dist seed 跑“后端自举 + fullchain smoke”：
 ```bash
@@ -126,15 +130,18 @@ sh src/tooling/verify_backend_ci_obj_only.sh
 - 若 dist seed 不存在，会直接失败并提示补充 seed（可用 `--require-seed` 强制严格模式）。
 - 不会自动使用 `artifacts/backend_seed/cheng.stage2` 或 `artifacts/backend_selfhost_self_obj/cheng.stage2`。
 
-后端生产闭环（默认包含全链；可跳过）：
+后端生产闭环（默认快速口径；fullchain/stress 按需开启）：
 ```bash
 sh src/tooling/backend_prod_closure.sh
-sh src/tooling/backend_prod_closure.sh --no-fullchain
+sh src/tooling/backend_prod_closure.sh --fullchain
+sh src/tooling/backend_prod_closure.sh --stress
 ```
 说明：
-- `backend_prod_closure.sh` 默认以 `CHENG_FULLCHAIN_OBJ_ONLY=1` 跑 fullchain。
+- `backend_prod_closure.sh` 默认不跑 fullchain/stress；可用 `--fullchain` / `CHENG_BACKEND_RUN_FULLCHAIN=1` 和 `--stress` / `CHENG_BACKEND_RUN_STRESS=1` 显式开启。
 - `backend_prod_closure.sh` 默认 strict：任一步骤 `exit 2`（skip）会直接失败；仅本地排障时再显式加 `--allow-skip`。
-- `backend_prod_closure.sh` 默认启用 `CHENG_STAGE1_STD_NO_POINTERS=1` 与 `CHENG_STAGE1_STD_NO_POINTERS_STRICT=1`（显式设置环境变量可覆盖）。
+- `backend_prod_closure.sh` 默认启用 `CHENG_ABI=v2_noptr`（显式设置 `CHENG_ABI` 可覆盖）。
+- `backend_prod_closure.sh` 默认包含 `backend.abi_v2_noptr` 专项门禁（`src/tooling/verify_backend_abi_v2_noptr.sh`）。
+- `verify_backend_obj_fullspec_gate.sh` 默认复用已有 `artifacts/backend_obj_fullspec_gate/backend_obj_fullspec`（避免重复冷编译超时）；如需强制重编可设 `CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_SOURCE=1` 或 `CHENG_BACKEND_OBJ_FULLSPEC_REBUILD_ON_DRIVER=1`。
 - `backend_prod_closure.sh` 默认将自举阶段单次编译超时设为 `60s`（`CHENG_BACKEND_PROD_SELFHOST_TIMEOUT`），用于及早暴露性能回退。
 - `backend_prod_closure.sh` 默认自举模式为 `strict`；可用 `CHENG_BACKEND_PROD_SELFHOST_MODE=fast` 临时切到单阶段自举加速本地迭代（发布/CI 建议保持 strict）。
 - `backend_prod_closure.sh` 提供显式参数 `--selfhost-fast` / `--selfhost-strict`（优先级高于环境变量）。
@@ -149,8 +156,11 @@ sh src/tooling/backend_prod_closure.sh --no-fullchain
 - 发布（默认开启）要求显式 seed：需传 `--seed/--seed-id/--seed-tar`；仅做本地闭环可加 `--no-publish`。
 - `scripts/closedloop.sh` 在 `CHENG_CLOSEDLOOP_PROD=1` 下默认以 `--no-publish` 运行 `backend_prod_closure.sh`；若需要发布门禁，请显式设置 `CHENG_CLOSEDLOOP_BACKEND_PROD_ARGS` 传入 seed 参数。
 - `build_backend_driver.sh` 自举重建默认采用串行增量（`CHENG_BACKEND_BUILD_DRIVER_MULTI=0`）；可用 `CHENG_BACKEND_BUILD_DRIVER_MULTI` / `CHENG_BACKEND_BUILD_DRIVER_INCREMENTAL` / `CHENG_BACKEND_BUILD_DRIVER_JOBS` 覆盖。
-- 在 `CHENG_MM=orc CHENG_BACKEND_LINKER=self` 口径下，`opt/opt2/multi-lto/ssa/debug/stress` gate 已统一固定串行口径（`CHENG_BACKEND_MULTI=0`、`CHENG_BACKEND_MULTI_FORCE=0`、`CHENG_BACKEND_WHOLE_PROGRAM=1`）以保证稳定可复现。
+- `build_backend_driver.sh` 默认单次编译尝试超时 `60s`（`CHENG_BACKEND_BUILD_DRIVER_TIMEOUT`），超时会明确报错并退出，避免长时间卡住。
+- 在 `CHENG_MM=orc CHENG_BACKEND_LINKER=self` 口径下，`opt/opt2/multi-lto/ssa/debug`（以及可选 `stress`）gate 已统一固定串行口径（`CHENG_BACKEND_MULTI=0`、`CHENG_BACKEND_MULTI_FORCE=0`、`CHENG_BACKEND_WHOLE_PROGRAM=1`）以保证稳定可复现。
 - `verify_backend_concurrency_stress.sh` 默认跳过（`CHENG_BACKEND_CONCURRENCY_STRESS_ENABLED=0`）；需要并发压力回归时显式设置 `CHENG_BACKEND_CONCURRENCY_STRESS_ENABLED=1`。
+- `verify_backend_stress.sh` 默认使用 stage1 smoke（`hello_puts`）循环运行（`CHENG_BACKEND_STRESS_N`，默认 10），并对编译与单次运行施加 `60s` 超时（`CHENG_BACKEND_STRESS_TIMEOUT`）。
+- `verify_backend_concurrency_stress.sh` 在启用后（`CHENG_BACKEND_CONCURRENCY_STRESS_ENABLED=1`）对编译与单次运行施加 `60s` 超时（`CHENG_BACKEND_CONCURRENCY_TIMEOUT`）。
 - `verify_backend_ffi_abi.sh` 在 `CHENG_BACKEND_LINKER=self` 口径应直接通过，不依赖脚本内额外兜底逻辑。
 
 后端热点定位（sample，可执行版）：
@@ -173,7 +183,7 @@ sh src/tooling/profile_backend_sample.sh --duration:12 --attach-substr:cheng.sta
 - `CHENG_BACKEND_PROFILE=1` 可启用后端内建分段计时：编译时在 stderr 输出 `backend_profile\t<label>\tstep_ms=...\ttotal_ms=...`，用于补足 sample 无符号时的慢阶段定位。
 - `CHENG_STAGE1_PROFILE=1` 可启用 stage1 前端分段计时：在 stdout 输出 `[stage1] profile: lex=... load=... sem=... mono=... ownership=... total=...`，并附带 `[sem]/[mono]/[ownership]` 的细分统计，用于把 `backend_profile build_module` 拆到更具体阶段。
 - `CHENG_MIR_PROFILE=1` 可启用 MIR 构建（`mirBuildModuleFromRoot`）内部分段计时：在 stderr 输出 `mir_profile\t<label>\tstep_ms=...\ttotal_ms=...`，用于把 `backend_profile build_module` 进一步拆解到 `lower_top_level/fixups/...`。
-- `sample` 若显示热点集中在 `strlen` 与 `get/hashMap`，优先检查 `src/std/strings.cheng`、`src/std/seqs.cheng`、`src/std/hashmaps.cheng` 以及 `src/backend/tooling/backend_driver.cheng`、`src/backend/mir/mir_builder.cheng` 的字符串判空冷路径实现（当前已落地 `streq` 的 `c_strcmp` 快路径、`hashMapStrEqKnownLen` 的 `cmpMem+NUL` 比较，以及 `driver_strIsEmpty/mirStrIsEmpty` 判空快路径）。
+- `sample` 若显示热点集中在 `strlen` 与 `get/hashMap`，优先检查 `src/std/strings.cheng`、`src/std/seqs.cheng`、`src/std/hashmaps.cheng` 以及 `src/backend/tooling/backend_driver.cheng`、`src/backend/mir/mir_builder.cheng` 的字符串判空冷路径实现（当前已落地字符串 `==` 的 `c_strcmp` 快路径、`hashMapStrEqKnownLen` 的 `cmpMem+NUL` 比较，以及 `driver_strIsEmpty/mirStrIsEmpty` 判空快路径）。
 - 2026-02-07 同口径 20s 采样：`_platform_strlen` top-stack 计数约 `6555 -> 5990`。
 - 2026-02-08：修复 stage1 `loadTokenCache` 热路径反复 `strlen`（`sliceRangePlainKnownLen`），同口径下 `_platform_strlen` 不再主导 top-stack。
 - 2026-02-08：Mach-O obj writer 将 `machoFindSymIndex` 由线性扫描改为 hash 索引，单模块 `emit=obj` 的 `single.emit_obj` 常见从 `~12s` 降到 `~3.6s`（以 `backend_driver.cheng` 编译为例）。
@@ -183,7 +193,7 @@ sh src/tooling/profile_backend_sample.sh --duration:12 --attach-substr:cheng.sta
 - 2026-02-08：`backendStripSpaces` 增加“无空白直接返回”快路径（避免大量 `strip` 分配），`backend_driver.cheng` 单模块 `emit=obj` 口径下 `build_module` 常见 `~11.3s -> ~10.4s`，端到端 `~14.4s -> ~13.3s`（以 `CHENG_BACKEND_PROFILE/CHENG_STAGE1_PROFILE/CHENG_MIR_PROFILE` 输出为准）。
 - 2026-02-09：修复 `profile_backend_sample` 的 attach 等待策略：当命中 root 自身或目标不 fork 子进程时不再长时间等待，避免 target 结束后采到 zombie 导致 `sample` 失败（exit=255）。
 - 2026-02-09：`src/std/system_helpers_backend.cheng` 的 `cheng_ptr_hash` 忽略对齐位并减少一次乘法，降低 `cheng_ptr_hash/cheng_ptrmap_put` 热路径开销。
-- 2026-02-09：`src/backend/mir/mir_types.cheng` 为 `typeAliases/objTypes/cstrs` 引入 `HashMapStrInt` 索引缓存（>=32 时启用），减少 `streq` 线性扫描；同机 `backend_driver.cheng` 单模块 `emit=obj` 常见 `~13.5s -> ~13.0s`（以 `/usr/bin/time` 为准）。
+- 2026-02-09：`src/backend/mir/mir_types.cheng` 为 `typeAliases/objTypes/cstrs` 引入 `HashMapStrInt` 索引缓存（>=32 时启用），减少字符串等号比较的线性扫描；同机 `backend_driver.cheng` 单模块 `emit=obj` 常见 `~13.5s -> ~13.0s`（以 `/usr/bin/time` 为准）。
 
 后端闭环验收（统一 ORC + self linker）：
 ```bash

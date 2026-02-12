@@ -1,6 +1,30 @@
 # MIR v1 optimizer (MVP): expression-level constant folding.
 import cheng/backend/mir/mir_types
 
+fn mirOptSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "mir_opt: seq index out of bounds"
+    let off64: int64 = int64(idx) * int64(elemSize)
+    return ptr_add(buffer, int32(off64))
+
+fn mirOptWriteExpr(seqInst: MirExpr[]*, idx: int32, val: MirExpr) =
+    if seqInst == nil:
+        panic "mir_opt: nil seq pointer"
+    let p: MirExpr* = MirExpr*(mirOptSeqElemPtr(seqInst->buffer, seqInst->len, idx, sizeof MirExpr))
+    *p = val
+
+fn mirOptWriteStmt(seqInst: MirStmt[]*, idx: int32, val: MirStmt) =
+    if seqInst == nil:
+        panic "mir_opt: nil seq pointer"
+    let p: MirStmt* = MirStmt*(mirOptSeqElemPtr(seqInst->buffer, seqInst->len, idx, sizeof MirStmt))
+    *p = val
+
+fn mirOptWriteBlock(seqInst: MirBlock[]*, idx: int32, val: MirBlock) =
+    if seqInst == nil:
+        panic "mir_opt: nil seq pointer"
+    let p: MirBlock* = MirBlock*(mirOptSeqElemPtr(seqInst->buffer, seqInst->len, idx, sizeof MirBlock))
+    *p = val
+
 fn mirOptMaxType(a: MirType, b: MirType): MirType =
     if a.kind == mtI64 || b.kind == mtI64:
         var out: MirType = mirTypeI64()
@@ -18,13 +42,13 @@ fn mirOptExprType(module: MirModule, func: MirFunc, expr: MirExpr, fallback: Mir
         return fallback
     if expr.kind == meLocal:
         if func != nil && expr.localIndex >= 0 && expr.localIndex < func.localTypes.len:
-            return get[MirType](func.localTypes, expr.localIndex)
+            return func.localTypes[expr.localIndex]
         return fallback
     if expr.kind == meCall:
         if module != nil && expr.callee != nil && len(expr.callee) > 0:
             for i in 0..<module.funcs.len:
-                let f: MirFunc = get[MirFunc](module.funcs, i)
-                if f != nil && streq(f.name, expr.callee):
+                let f: MirFunc = module.funcs[i]
+                if f != nil && (f.name == expr.callee):
                     return f.retType
         return fallback
     if expr.kind == meBin:
@@ -186,9 +210,9 @@ fn mirOptExpr(module: MirModule, func: MirFunc, expr: MirExpr, fallback: MirType
         return expr
     if expr.kind == meCall:
         for i in 0..<expr.args.len:
-            let a: MirExpr = get[MirExpr](expr.args, i)
+            let a: MirExpr = expr.args[i]
             let at: MirType = mirOptExprType(module, func, a, fallback)
-            setPtr[MirExpr](&expr.args, i, mirOptExpr(module, func, a, at))
+            mirOptWriteExpr(&expr.args, i, mirOptExpr(module, func, a, at))
         return expr
     if expr.kind == meCast:
         let srcType: MirType = mirOptExprType(module, func, expr.castExpr, fallback)
@@ -228,29 +252,29 @@ fn mirOptimizeFunc(module: MirModule, func: MirFunc): bool =
         return false
     let fallback: MirType = func.retType
     for bi in 0..<func.blocks.len:
-        let b: MirBlock = get[MirBlock](func.blocks, bi)
+        let b: MirBlock = func.blocks[bi]
         if b != nil:
             for si in 0..<b.stmts.len:
-                let s: MirStmt = get[MirStmt](b.stmts, si)
+                let s: MirStmt = b.stmts[si]
                 if s.kind == msLet || s.kind == msVar || s.kind == msAssign:
                     var slotTy: MirType = fallback
                     if s.slot >= 0 && s.slot < func.localTypes.len:
-                        slotTy = get[MirType](func.localTypes, s.slot)
+                        slotTy = func.localTypes[s.slot]
                     s.expr = mirOptExpr(module, func, s.expr, slotTy)
-                    setPtr[MirStmt](&b.stmts, si, s)
+                    mirOptWriteStmt(&b.stmts, si, s)
                 elif s.kind == msStore:
                     s.addrExpr = mirOptExpr(module, func, s.addrExpr, mirTypeI64())
                     s.expr = mirOptExpr(module, func, s.expr, s.storeType)
-                    setPtr[MirStmt](&b.stmts, si, s)
+                    mirOptWriteStmt(&b.stmts, si, s)
                 else:
                     s.expr = mirOptExpr(module, func, s.expr, fallback)
-                    setPtr[MirStmt](&b.stmts, si, s)
+                    mirOptWriteStmt(&b.stmts, si, s)
             if b.term.kind == mtRet && b.term.retExpr != nil:
                 b.term.retExpr = mirOptExpr(module, func, b.term.retExpr, func.retType)
-                setPtr[MirBlock](&func.blocks, bi, b)
+                mirOptWriteBlock(&func.blocks, bi, b)
             elif b.term.kind == mtCbr && b.term.condExpr != nil:
                 b.term.condExpr = mirOptExpr(module, func, b.term.condExpr, mirTypeI32())
-                setPtr[MirBlock](&func.blocks, bi, b)
+                mirOptWriteBlock(&func.blocks, bi, b)
     return true
 
 fn mirOptimizeModule(module: MirModule): bool =
@@ -258,7 +282,7 @@ fn mirOptimizeModule(module: MirModule): bool =
         return false
     var any: bool = false
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let f: MirFunc = module.funcs[i]
         if mirOptimizeFunc(module, f):
             any = true
     return any

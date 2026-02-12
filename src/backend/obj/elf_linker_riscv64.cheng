@@ -154,7 +154,7 @@ fn elfReadBytes(buf: bytes.ByteBuffer, off: uint64, size: uint64): uint8[] =
     if off + size > uint64(buf.len):
         return out
     for i in 0..<size:
-        addPtr[uint8](&out, uint8(bytes.bufByteAt(buf, int32(off + i))))
+        add(out, uint8(bytes.bufByteAt(buf, int32(off + i))))
     return out
 
 fn elfReadCStringAt(buf: bytes.ByteBuffer, strOff: uint64, strSize: uint64, off: uint32): str =
@@ -223,19 +223,42 @@ fn elfTargetIsAndroid(target: str): bool =
         return false
     return elfStrContains(target, "android")
 
+fn elfStrSeqElemPtr(buffer: void*, len0: int32, idx: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "elf_linker_riscv64: seq index out of bounds"
+    let off64: int64 = int64(idx) * sizeof str
+    return ptr_add(buffer, int32(off64))
+
+fn elfReadStrPtr(items: str[]*, idx: int32): str =
+    if items == nil:
+        panic "elf_linker_riscv64: nil seq pointer"
+    let p: str* = str*(elfStrSeqElemPtr(items->buffer, items->len, idx))
+    return *p
+
+fn elfWriteStrPtr(items: str[]*, idx: int32, val: str) =
+    if items == nil:
+        panic "elf_linker_riscv64: nil seq pointer"
+    let p: str* = str*(elfStrSeqElemPtr(items->buffer, items->len, idx))
+    *p = val
+
+fn elfStrSeqAddPtr(items: str[]*, value: str) =
+    if items == nil:
+        return
+    add(items, value)
+
 fn elfSortStringsStable(items: str[]*) =
     if items == nil:
         return
     for i in 1..<items->len:
-        let key: str = get[str](*items, i)
+        let key: str = elfReadStrPtr(items, i)
         var j: int32 = i - 1
         let __for_start_j = j
         for __for_rev_j in 0..(__for_start_j - (0)):
             j = __for_start_j - __for_rev_j
-            if !(elfStrCmp(get[str](*items, j), key) > 0):
+            if !(elfStrCmp(elfReadStrPtr(items, j), key) > 0):
                 break
-            setPtr[str](items, j + 1, get[str](*items, j))
-        setPtr[str](items, j + 1, key)
+            elfWriteStrPtr(items, j + 1, elfReadStrPtr(items, j))
+        elfWriteStrPtr(items, j + 1, key)
 
 fn elfAddImport(imports: str[]*, importIndex: hashmaps.HashMapStrInt*, name: str) =
     if imports == nil || importIndex == nil:
@@ -243,11 +266,11 @@ fn elfAddImport(imports: str[]*, importIndex: hashmaps.HashMapStrInt*, name: str
     if name == nil || len(name) == 0:
         return
     var found: bool = false
-    hashmaps.hashMapStrIntGet(*importIndex, name, &found)
+    hashmaps.hashMapStrIntGetPtrRaw(importIndex, name,&found)
     if found:
         return
     hashmaps.hashMapStrIntPut(importIndex, name, imports->len)
-    addPtr[str](imports, name)
+    elfStrSeqAddPtr(imports, name)
 
 fn elfResolveSymAddr(defs: ElfLinkDef[], defIndex: hashmaps.HashMapStrInt, objs: ElfObjFile[],
                      layouts: ElfLinkObjLayout[], objIndex: int32, sym: ElfObjSymbol,
@@ -256,9 +279,9 @@ fn elfResolveSymAddr(defs: ElfLinkDef[], defIndex: hashmaps.HashMapStrInt, objs:
         return Err[uint64]("elf_linker: nil symbol")
     if sym.shndx == SHN_UNDEF:
         var found: bool = false
-        let di0: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name, &found)
+        let di0: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name, found)
         if found && di0 >= 0 && di0 < defs.len:
-            let d0: ElfLinkDef = get[ElfLinkDef](defs, di0)
+            let d0: ElfLinkDef = defs[di0]
             if d0.kind == 0:
                 return Ok[uint64](textVaddr + d0.off)
             if d0.kind == 1:
@@ -268,8 +291,8 @@ fn elfResolveSymAddr(defs: ElfLinkDef[], defIndex: hashmaps.HashMapStrInt, objs:
             return Ok[uint64](bssBase + d0.off)
         return Err[uint64]("elf_linker: unresolved symbol: " + sym.name)
 
-    let o: ElfObjFile = get[ElfObjFile](objs, objIndex)
-    let lay: ElfLinkObjLayout = get[ElfLinkObjLayout](layouts, objIndex)
+    let o: ElfObjFile = objs[objIndex]
+    let lay: ElfLinkObjLayout = layouts[objIndex]
     if sym.shndx == o.textShndx:
         return Ok[uint64](textVaddr + lay.textOff + sym.value)
     if sym.shndx == o.rodataShndx:
@@ -385,27 +408,27 @@ fn elfReadRelObj(path: str): Result[ElfObjFile] =
         let shEnt: uint64 = elfBufU64At(out.buf, int32(shOff + 56))
 
         let nm: str = elfReadCStringAt(out.buf, shstrDataOff, shstrSize, nameOff)
-        if streq(nm, ".text"):
+        if (nm == ".text"):
             out.textShndx = si
             out.textAlign = (shAlign == 0) ? 1 : shAlign
             out.text = elfReadBytes(out.buf, shDataOff, shSize)
-        elif streq(nm, ".rodata"):
+        elif (nm == ".rodata"):
             out.rodataShndx = si
             out.rodataAlign = (shAlign == 0) ? 1 : shAlign
             out.rodata = elfReadBytes(out.buf, shDataOff, shSize)
-        elif streq(nm, ".data"):
+        elif (nm == ".data"):
             out.dataShndx = si
             out.dataAlign = (shAlign == 0) ? 1 : shAlign
             out.data = elfReadBytes(out.buf, shDataOff, shSize)
-        elif streq(nm, ".bss"):
+        elif (nm == ".bss"):
             out.bssShndx = si
             out.bssAlign = (shAlign == 0) ? 1 : shAlign
             out.bssSize = shSize
-        elif streq(nm, ".symtab") && shType == SHT_SYMTAB:
+        elif (nm == ".symtab") && shType == SHT_SYMTAB:
             symtabShndx = si
-        elif streq(nm, ".strtab") && shType == SHT_STRTAB:
+        elif (nm == ".strtab") && shType == SHT_STRTAB:
             strtabShndx = si
-        elif streq(nm, ".rela.text") && shType == SHT_RELA:
+        elif (nm == ".rela.text") && shType == SHT_RELA:
             relaTextShndx = si
             # Validate it targets .text (best-effort).
             if shInfo != 0 && uint16(shInfo) != out.textShndx:
@@ -473,7 +496,7 @@ fn elfReadRelObj(path: str): Result[ElfObjFile] =
         s.shndx = stShndx
         s.value = stValue
         s.size = stSize
-        addPtr[ElfObjSymbol](&out.symbols, s)
+        add(out.symbols, s)
 
     # Read .rela.text relocations.
     if relaTextShndx != 0:
@@ -501,16 +524,16 @@ fn elfReadRelObj(path: str): Result[ElfObjFile] =
             r.symIndex = uint32(rInfo >> 32)
             r.rtype = uint32(rInfo & uint64(0xFFFFFFFF))
             r.addend = int64(rAddendU)
-            addPtr[ElfObjReloc](&out.relocsText, r)
+            add(out.relocsText, r)
     return Ok[ElfObjFile](out)
 
 fn elfReadU32LEAtSeq(buf: uint8[], off: uint64): uint32 =
     if off + 4 > uint64(buf.len):
         return uint32(0)
-    let b0: uint32 = uint32(get[uint8](buf, int32(off + 0)))
-    let b1: uint32 = uint32(get[uint8](buf, int32(off + 1)))
-    let b2: uint32 = uint32(get[uint8](buf, int32(off + 2)))
-    let b3: uint32 = uint32(get[uint8](buf, int32(off + 3)))
+    let b0: uint32 = uint32(buf[int32(off + 0)])
+    let b1: uint32 = uint32(buf[int32(off + 1)])
+    let b2: uint32 = uint32(buf[int32(off + 2)])
+    let b3: uint32 = uint32(buf[int32(off + 3)])
     return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
 fn elfPatchPcRelHi20At(text: uint8[]*, off: uint64, placeAddr: uint64, targetAddr: uint64): Result[bool] =
@@ -597,11 +620,11 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     # Load and parse objects.
     var objs: ElfObjFile[]
     for li in 0..<objPaths.len:
-        let p: str = get[str](objPaths, li)
+        let p: str = objPaths[li]
         let res: Result[ElfObjFile] = elfReadRelObj(p)
         if !IsOk[ElfObjFile](res):
             return Err[bool](ErrorInfoOf[ElfObjFile](res))
-        addPtr[ElfObjFile](&objs, Value[ElfObjFile](res))
+        add(objs, Value[ElfObjFile](res))
 
     # Decide interpreter and DT_NEEDED defaults.
     let interpDefault: str = elfTargetIsAndroid(target) ? "/system/bin/linker64" : "/lib/ld-linux-riscv64-lp64d.so.1"
@@ -618,7 +641,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
                 if i > start:
                     let part: str = elfTrimSpaces(elfStrSlice(neededCsv, start, i))
                     if part != nil && len(part) > 0:
-                        addPtr[str](&needed, part)
+                        add(needed, part)
                 start = i + 1
 
     # Build combined sections.
@@ -651,7 +674,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     var defIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
 
     for li in 0..<objs.len:
-        let o: ElfObjFile = get[ElfObjFile](objs, li)
+        let o: ElfObjFile = objs[li]
         var lay: ElfLinkObjLayout
         new lay
 
@@ -673,11 +696,11 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
         lay.bssOff = bssSize
         bssSize = bssSize + o.bssSize
 
-        setPtr[ElfLinkObjLayout](&layouts, li, lay)
+        layouts[li] = lay
 
         # Add global definitions.
         for si2 in 0..<o.symbols.len:
-            let s: ElfObjSymbol = get[ElfObjSymbol](o.symbols, si2)
+            let s: ElfObjSymbol = o.symbols[si2]
             if s == nil || s.name == nil || len(s.name) == 0:
                 continue
             if s.bind != STB_GLOBAL:
@@ -696,7 +719,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
             if kind < 0:
                 continue
             var found: bool = false
-            hashmaps.hashMapStrIntGet(defIndex, s.name, &found)
+            hashmaps.hashMapStrIntGet(defIndex, s.name, found)
             if found:
                 return Err[bool]("elf_linker: duplicate symbol: " + s.name)
             var d: ElfLinkDef
@@ -711,7 +734,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
                 d.off = lay.dataOff + s.value
             else:
                 d.off = lay.bssOff + s.value
-            addPtr[ElfLinkDef](&defs, d)
+            add(defs, d)
             hashmaps.hashMapStrIntPut(&defIndex, s.name, defs.len - 1)
 
 
@@ -720,19 +743,19 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     var importIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
 
     for li in 0..<objs.len:
-        let o2: ElfObjFile = get[ElfObjFile](objs, li)
+        let o2: ElfObjFile = objs[li]
         for ri2 in 0..<o2.relocsText.len:
-            let r0: ElfObjReloc = get[ElfObjReloc](o2.relocsText, ri2)
+            let r0: ElfObjReloc = o2.relocsText[ri2]
             if r0 == nil:
                 continue
             if r0.symIndex >= uint32(o2.symbols.len):
                 return Err[bool]("elf_linker: reloc symIndex out of range")
-            let sym0: ElfObjSymbol = get[ElfObjSymbol](o2.symbols, int32(r0.symIndex))
+            let sym0: ElfObjSymbol = o2.symbols[int32(r0.symIndex)]
             if sym0 == nil:
                 continue
             if sym0.shndx == SHN_UNDEF:
                 var foundDef: bool = false
-                hashmaps.hashMapStrIntGet(defIndex, sym0.name, &foundDef)
+                hashmaps.hashMapStrIntGet(defIndex, sym0.name, foundDef)
                 if !foundDef:
                     if r0.rtype == R_RISCV_CALL:
                         elfAddImport(&imports, &importIndex, sym0.name)
@@ -746,7 +769,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     # Rebuild name->index map after sorting.
     importIndex = hashmaps.hashMapStrIntInit(1024)
     for iimp in 0..<imports.len:
-        hashmaps.hashMapStrIntPut(&importIndex, get[str](imports, iimp), iimp)
+        hashmaps.hashMapStrIntPut(&importIndex, imports[iimp], iimp)
 
     # Append import stubs to .text (one per import).
     var stubOffs: uint64[]
@@ -756,7 +779,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     for iimp in 0..<imports.len:
         obj_buf.bufAlign(&text, 4)
         let off0: uint64 = uint64(text.len)
-        setPtr[uint64](&stubOffs, iimp, off0)
+        stubOffs[iimp] = off0
         # auipc t0, hi20(got); ld t1, lo12(t0); jalr x0, t1, 0
         obj_buf.bufU32(&text, rv64EncAuipc(5, 0))
         obj_buf.bufU32(&text, rv64EncLd(6, 5, 0))
@@ -780,7 +803,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     obj_buf.bufAlign(&dataSeg, 8)
     let gotOff: uint64 = uint64(dataSeg.len)
     for gi2 in 0..<imports.len * 8:
-        addPtr[uint8](&dataSeg, uint8(0))
+        add(dataSeg, uint8(0))
 
     obj_buf.bufAlign(&dataSeg, 8)
     let dynstrOff: uint64 = uint64(dataSeg.len)
@@ -792,14 +815,14 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
         neededOffs.cap = needed.len
         neededOffs.len = needed.len
     for ni in 0..<needed.len:
-        setPtr[uint32](&neededOffs, ni, elfDynStrAdd(&dynstr, get[str](needed, ni)))
+        neededOffs[ni] = elfDynStrAdd(&dynstr, needed[ni])
     # Symbol names.
     var symNameOffs: uint32[]
     if imports.len > 0:
         symNameOffs.cap = imports.len
         symNameOffs.len = imports.len
     for iimp in 0..<imports.len:
-        setPtr[uint32](&symNameOffs, iimp, elfDynStrAdd(&dynstr, get[str](imports, iimp)))
+        symNameOffs[iimp] = elfDynStrAdd(&dynstr, imports[iimp])
 
     obj_buf.bufBytes(&dataSeg, dynstr)
     let dynstrSize: uint64 = uint64(dynstr.len)
@@ -813,9 +836,9 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
         if si3 == 0:
             # all zeros
             for z in 0..<24:
-                addPtr[uint8](&dynsym, uint8(0))
+                add(dynsym, uint8(0))
         else:
-            let nameOff2: uint32 = get[uint32](symNameOffs, si3 - 1)
+            let nameOff2: uint32 = symNameOffs[si3 - 1]
             obj_buf.bufU32(&dynsym, nameOff2)
             obj_buf.bufU8(&dynsym, uint8((STB_GLOBAL << 4) | STT_FUNC))
             obj_buf.bufU8(&dynsym, uint8(0))
@@ -841,7 +864,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
         obj_buf.bufU32(&hashTab, uint32(0))
     # Fill buckets/chains for symbols 1..nchain-1.
     for sidx in 1..<nchain:
-        let nm2: str = get[str](imports, int32(sidx - 1))
+        let nm2: str = imports[int32(sidx - 1)]
         let h: uint32 = elfHashSysV(nm2)
         let b: uint32 = (nbucket > 0) ? (h % nbucket) : 0
         let bucketsOff: uint64 = 8 + uint64(b) * 4
@@ -889,7 +912,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     for __for_ni_2 in __for_start_ni_2..<needed.len:
         ni = __for_ni_2
         obj_buf.bufI64(&dynamic, DT_NEEDED)
-        obj_buf.bufU64(&dynamic, uint64(get[uint32](neededOffs, ni)))
+        obj_buf.bufU64(&dynamic, uint64(neededOffs[ni]))
         ni = ni + 1
     # DT_HASH / STRTAB / SYMTAB
     obj_buf.bufI64(&dynamic, DT_HASH)
@@ -924,7 +947,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
 
     # Patch stubs to reference GOT slots.
     for iimp in 0..<imports.len:
-        let stubOff: uint64 = get[uint64](stubOffs, iimp)
+        let stubOff: uint64 = stubOffs[iimp]
         let stubAddr: uint64 = textVaddr + stubOff
         let gotSlotAddr2: uint64 = dataVaddr + gotOff + uint64(iimp) * 8
         # auipc at stubOff, ld at stubOff+4.
@@ -938,32 +961,32 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     # Helper: resolve symbol to vaddr (best-effort).
     # Patch relocations.
     for li in 0..<objs.len:
-        let o4: ElfObjFile = get[ElfObjFile](objs, li)
-        let lay4: ElfLinkObjLayout = get[ElfLinkObjLayout](layouts, li)
+        let o4: ElfObjFile = objs[li]
+        let lay4: ElfLinkObjLayout = layouts[li]
         for ri3 in 0..<o4.relocsText.len:
-            let r1: ElfObjReloc = get[ElfObjReloc](o4.relocsText, ri3)
+            let r1: ElfObjReloc = o4.relocsText[ri3]
             if r1 == nil:
                 continue
             if r1.symIndex >= uint32(o4.symbols.len):
                 return Err[bool]("elf_linker: reloc symIndex out of range")
-            let sym1: ElfObjSymbol = get[ElfObjSymbol](o4.symbols, int32(r1.symIndex))
+            let sym1: ElfObjSymbol = o4.symbols[int32(r1.symIndex)]
             let placeOff: uint64 = lay4.textOff + r1.off
             let placeAddr: uint64 = textVaddr + placeOff
             var targetAddr: uint64 = 0
             var unresolved: bool = false
             if sym1 != nil && sym1.shndx == SHN_UNDEF:
                 var found: bool = false
-                hashmaps.hashMapStrIntGet(defIndex, sym1.name, &found)
+                hashmaps.hashMapStrIntGet(defIndex, sym1.name, found)
                 if !found:
                     unresolved = true
             if unresolved:
                 if r1.rtype != R_RISCV_CALL:
                     return Err[bool]("elf_linker: unsupported undefined reloc type for " + sym1.name)
                 var impFound: bool = false
-                let idxImp: int32 = hashmaps.hashMapStrIntGet(importIndex, sym1.name, &impFound)
+                let idxImp: int32 = hashmaps.hashMapStrIntGetPtrRaw(importIndex, sym1.name,&impFound)
                 if !impFound || idxImp < 0 || idxImp >= imports.len:
                     return Err[bool]("elf_linker: missing import stub: " + sym1.name)
-                targetAddr = textVaddr + get[uint64](stubOffs, idxImp)
+                targetAddr = textVaddr + stubOffs[idxImp]
                 let callRes: Result[bool] = elfPatchCallPairAt(&text, placeOff, placeAddr, targetAddr)
                 if !IsOk[bool](callRes):
                     return Err[bool](ErrorInfoOf[bool](callRes))
@@ -993,17 +1016,17 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
 
     # Patch _start stub calls.
     var foundMain: bool = false
-    let mainIdx: int32 = hashmaps.hashMapStrIntGet(defIndex, "main", &foundMain)
+    let mainIdx: int32 = hashmaps.hashMapStrIntGet(defIndex, "main", foundMain)
     if !foundMain || mainIdx < 0 || mainIdx >= defs.len:
         return Err[bool]("elf_linker: missing main symbol (required for _start)")
-    let mainDef: ElfLinkDef = get[ElfLinkDef](defs, mainIdx)
+    let mainDef: ElfLinkDef = defs[mainIdx]
     let mainAddr: uint64 = textVaddr + mainDef.off
 
     var exitFound: bool = false
-    let exitImpIdx: int32 = hashmaps.hashMapStrIntGet(importIndex, "exit", &exitFound)
+    let exitImpIdx: int32 = hashmaps.hashMapStrIntGetPtrRaw(importIndex, "exit",&exitFound)
     if !exitFound || exitImpIdx < 0 || exitImpIdx >= stubOffs.len:
         return Err[bool]("elf_linker: missing exit import stub")
-    let exitStubAddr: uint64 = textVaddr + get[uint64](stubOffs, exitImpIdx)
+    let exitStubAddr: uint64 = textVaddr + stubOffs[exitImpIdx]
 
     let startAddr: uint64 = textVaddr + uint64(0)
     let call0: Result[bool] = elfPatchCallPairAt(&text, uint64(0), startAddr + 0, mainAddr)
@@ -1023,7 +1046,7 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     # Build output bytes (zero-filled).
     var outBytes: uint8[]
     for zi in 0..<fileSize:
-        addPtr[uint8](&outBytes, uint8(0))
+        add(outBytes, uint8(0))
 
     # Write ELF header + program headers.
     var hdr: uint8[]
@@ -1072,21 +1095,21 @@ fn elfLinkExeRiscv64(objPaths: str[], outputPath: str, target: str): Result[bool
     for hi in 0..<hdr.len:
         if ! (hi < outBytes.len):
             break
-        setPtr[uint8](&outBytes, hi, get[uint8](hdr, hi))
+        outBytes[hi] = hdr[hi]
 
     # Write interp string.
     for ip in 0..<len(interp):
         let c: uint8 = uint8(int32(int64(interp[ip]) & int64(0xFF)))
-        setPtr[uint8](&outBytes, int32(interpOff) + ip, c)
-    setPtr[uint8](&outBytes, int32(interpOff) + ip, uint8(0))
+        outBytes[int32(interpOff) + ip] = c
+    outBytes[int32(interpOff) + ip] = uint8(0)
 
     # Write text, rodata, data segment.
     for ti in 0..<uint64(text.len):
-        setPtr[uint8](&outBytes, int32(textFileOff + ti), get[uint8](text, int32(ti)))
+        outBytes[int32(textFileOff + ti)] = text[int32(ti)]
     for ri4 in 0..<uint64(rodata.len):
-        setPtr[uint8](&outBytes, int32(rodataFileOff + ri4), get[uint8](rodata, int32(ri4)))
+        outBytes[int32(rodataFileOff + ri4)] = rodata[int32(ri4)]
     for di4 in 0..<uint64(dataSeg.len):
-        setPtr[uint8](&outBytes, int32(dataFileOff + di4), get[uint8](dataSeg, int32(di4)))
+        outBytes[int32(dataFileOff + di4)] = dataSeg[int32(di4)]
 
     os.writeFileBytes(outputPath, outBytes)
     return Ok[bool](true)

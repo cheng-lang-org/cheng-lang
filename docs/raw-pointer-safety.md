@@ -4,15 +4,16 @@
 
 这份文档目前是“目标/设计规格 + 落地清单”，不是对现状的完全描述。对照当前仓库代码：
 
-- Stage1 已落地 std no-pointer 门禁：`CHENG_STAGE1_STD_NO_POINTERS=1` 会执行扫描；`CHENG_STAGE1_STD_NO_POINTERS_STRICT=1` 会禁用新增迁移豁免（当前仍保留 runtime-core 豁免）。
-- 生产闭环当前使用“分层豁免”口径：为保障自举与发布链路，低层 runtime/内存模型依赖的 std 模块暂不纳入该门禁。
+- Stage1 已接入 ABI 门禁：`CHENG_ABI=v2_noptr` 会强制启用 std no-pointer 扫描（等价于开启 `CHENG_STAGE1_STD_NO_POINTERS=1` 且按 strict 口径禁用豁免）。
+- 兼容开关仍保留：`CHENG_STAGE1_STD_NO_POINTERS`/`CHENG_STAGE1_STD_NO_POINTERS_STRICT` 可单独控制策略；`CHENG_ABI=v1` 为历史兼容口径。
+- tooling 已提供专项回归：`src/tooling/verify_backend_abi_v2_noptr.sh`（同一 `src/std` 探针在 `v1` 可编、`v2_noptr` 必须编译期拒绝）。
 - `src/std/async_rt.cheng` 仍对外暴露 `spawn(fn_ptr: void*, ctx: void*)`，Typed spawn 方案尚未迁移完成。
 - backend mvp 前端尚未与 stage1 在 raw pointer 门禁上完全对齐。
 
 建议动作：
 
 - 若目标是“全量 std 零指针”，优先从 `src/std/system.cheng`、`src/std/seqs.cheng`、`src/std/hashmaps.cheng` 的 runtime 接缝改造开始，再收紧豁免集合并保持自举回归。
-- 若近期目标是自举/性能优先，可继续沿用当前分层豁免口径，并按模块逐步消减豁免名单。
+- 若近期目标是自举/性能优先，可先在 `CHENG_ABI=v1` 口径下验证性能，再并行推进 `v2_noptr` 违规模块治理。
 
 ## Summary
 

@@ -7,6 +7,7 @@ Usage:
   src/tooling/chengb.sh <file.cheng>
     [--emit:<obj|exe>] [--target:<triple|auto>] [--out:<path>]
     [--frontend:<mvp|stage1>]
+    [--abi:<v1|v2_noptr>]
     [--linker:<self>]
     [--multi]
     [--pkg-roots:<p1[:p2:...]>]
@@ -61,6 +62,7 @@ linker=""
 multi="0"
 pkg_roots=""
 run="0"
+abi=""
 
 while [ "${1:-}" != "" ]; do
   case "$1" in
@@ -72,6 +74,9 @@ while [ "${1:-}" != "" ]; do
       ;;
     --frontend:*)
       frontend="${1#--frontend:}"
+      ;;
+    --abi:*)
+      abi="${1#--abi:}"
       ;;
     --out:*)
       out="${1#--out:}"
@@ -109,6 +114,14 @@ case "$frontend" in
   mvp|stage1) ;;
   *)
     echo "[Error] invalid --frontend:$frontend (expected mvp|stage1)" 1>&2
+    exit 2
+    ;;
+esac
+
+case "$abi" in
+  ""|v1|v2_noptr) ;;
+  *)
+    echo "[Error] invalid --abi:$abi (expected v1|v2_noptr)" 1>&2
     exit 2
     ;;
 esac
@@ -177,6 +190,17 @@ else
   envs="$envs CHENG_BACKEND_MULTI=0"
   envs="$envs CHENG_BACKEND_MULTI_FORCE=0"
 fi
+if [ "$abi" != "" ]; then
+  envs="$envs CHENG_ABI=$abi"
+fi
+abi_effective="$abi"
+if [ "$abi_effective" = "" ]; then
+  abi_effective="${CHENG_ABI:-}"
+fi
+if [ "$abi_effective" = "v2_noptr" ]; then
+  envs="$envs CHENG_STAGE1_STD_NO_POINTERS=1"
+  envs="$envs CHENG_STAGE1_STD_NO_POINTERS_STRICT=1"
+fi
 if [ "$pkg_roots" != "" ]; then
   envs="$envs CHENG_PKG_ROOTS=$pkg_roots"
 fi
@@ -197,24 +221,25 @@ if [ "$emit" = "exe" ] && [ "$linker" = "self" ]; then
     echo "[Error] missing backend runtime source: $runtime_src" 1>&2
     exit 2
   fi
-	if [ ! -f "$runtime_obj" ] || [ "$runtime_src" -nt "$runtime_obj" ]; then
-	  env \
-	    CHENG_C_SYSTEM=0 \
-	    CHENG_BACKEND_ALLOW_NO_MAIN=1 \
-	    CHENG_BACKEND_WHOLE_PROGRAM=1 \
-	    CHENG_BACKEND_EMIT=obj \
-	    CHENG_BACKEND_TARGET="$target" \
-	    CHENG_BACKEND_FRONTEND=stage1 \
-	      CHENG_BACKEND_INPUT="$runtime_src" \
-	      CHENG_BACKEND_OUTPUT="$runtime_obj" \
-	      "$driver" >/dev/null
-	  fi
+  if [ ! -f "$runtime_obj" ] || [ "$runtime_src" -nt "$runtime_obj" ]; then
+    env \
+      CHENG_C_SYSTEM=0 \
+      CHENG_BACKEND_ALLOW_NO_MAIN=1 \
+      CHENG_BACKEND_WHOLE_PROGRAM=1 \
+      CHENG_BACKEND_EMIT=obj \
+      CHENG_BACKEND_TARGET="$target" \
+      CHENG_BACKEND_FRONTEND=mvp \
+      CHENG_BACKEND_INPUT="$runtime_src" \
+      CHENG_BACKEND_OUTPUT="$runtime_obj" \
+      "$driver" >/dev/null
+  fi
   envs="$envs CHENG_BACKEND_LINKER=self"
   envs="$envs CHENG_BACKEND_NO_RUNTIME_C=1"
   envs="$envs CHENG_BACKEND_RUNTIME_OBJ=$runtime_obj"
 fi
 
-echo "[chengb] build: $in -> $out ($target, $emit)" >&2
+abi_log="${abi_effective:-v1}"
+echo "[chengb] build: $in -> $out ($target, $emit, abi=$abi_log)" >&2
 # shellcheck disable=SC2086
 env $envs "$driver" >/dev/null
 if [ "$emit" = "exe" ]; then

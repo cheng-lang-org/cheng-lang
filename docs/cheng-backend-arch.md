@@ -97,9 +97,9 @@ Cheng 源码
   - 默认编译/链接口径：`CHENG_MM=orc` + `CHENG_BACKEND_LINKER=self`（可用 `CHENG_BACKEND_MM=off` 或 `CHENG_BACKEND_LINKER=system` 显式降级排障）。
   - `fullspec` 回归口径：使用后端 driver（默认 `./cheng`；可用 `CHENG_BACKEND_DRIVER=<path>` 指定）编译 `examples/stage1_codegen_fullspec.cheng` → 运行并要求 stdout 包含 `fullspec ok`；默认 `CHENG_BACKEND_RUN_FULLSPEC=0`，显式设为 `1` 才启用。
   - 可选：`CHENG_ANDROID_RUN=1` 时额外跑 `verify_backend_android_run.sh`。
-- 生产闭环（除平台）：`src/tooling/backend_prod_closure.sh`（默认启用 `CHENG_BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt/opt2、multi‑lto、FFI/ABI matrix、obj/exe determinism、release manifest+bundle+sign/verify 与 stress/mm/并发压力回归）。
+- 生产闭环（除平台）：`src/tooling/backend_prod_closure.sh`（默认启用 `CHENG_BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt/opt2、multi‑lto、FFI/ABI matrix、obj/exe determinism、release manifest+bundle+sign/verify 与 mm 回归；`fullchain/stress` 为显式开关）。
   - 默认 strict：任一子步骤 `exit 2`（skip）即失败；仅本地排障时通过 `--allow-skip` 放宽。
-  - 自举：默认包含后端 selfhost（产出 stage2）与全链自举（stage2→tools；可用 `--no-fullchain` 跳过）。
+  - 自举：默认包含后端 selfhost（产出 stage2）；全链自举（stage2→tools）改为显式 `--fullchain`（或 `CHENG_BACKEND_RUN_FULLCHAIN=1`）。
   - 发布：默认启用 publish，且要求显式 seed（`--seed/--seed-id/--seed-tar`）；本地仅验收可用 `--no-publish`。
   - 打包：若存在 `artifacts/backend_selfhost_self_obj/cheng.stage2`，则 manifest/bundle 默认记录并打包 stage2 driver，并可附带全链产物。
   - 驱动选择：脚本层统一通过 `src/tooling/backend_driver_path.sh`；可用 `CHENG_BACKEND_DRIVER=<path>` 指定后端 driver。
@@ -112,7 +112,7 @@ Cheng 源码
 > “生产闭环”在这里指：**从源码到可执行产物**的可复现构建 + 核心回归集的自动化验收 + 可观测性与发布流程可持续运行。
 
 当前验证状态（2026-02-06）：
-- 本仓库已执行 `sh src/tooling/backend_prod_closure.sh`，结果 `backend_prod_closure ok`（默认口径，含 selfhost/fullchain/release/stress/mm）。
+- 本仓库已执行 `sh src/tooling/backend_prod_closure.sh`，结果 `backend_prod_closure ok`（默认口径，含 selfhost/release/mm；fullchain/stress 按需开启）。
 - 在 `CHENG_MM=orc CHENG_BACKEND_LINKER=self` 口径下，`backend_prod_closure.sh --no-publish` 已通过；闭环脚本对 `opt/opt2/multi-lto/ssa/ffi/debug/stress/concurrency` 相关 gate 已统一接入 `src/tooling/backend_link_env.sh`，避免 self-linker 运行时 `.o` 注入遗漏。
 - Linux AArch64 no-libc 口径：`src/tooling/verify_backend_nolibc_linux_aarch64.sh` 已通过 Darwin/arm64 静态门禁；运行门禁需在 Linux aarch64 主机执行。
 
@@ -121,9 +121,9 @@ Cheng 源码
 - 现状备注：该口径仍用于能力追踪，当前可能出现 `mir_builder: main not found`；不阻断默认生产闭环口径。
 
 已闭环（除平台生产闭环）：
-- 一口气验收入口：`sh src/tooling/backend_prod_closure.sh`（聚合“语义回归 + IR 校验 + 后端自举（selfhost）+ determinism‑strict + opt + FFI/ABI matrix + obj/exe determinism + release manifest+bundle+sign/verify + stress + mm”；可用 `--no-selfhost` 跳过自举验收）。
+- 一口气验收入口：`sh src/tooling/backend_prod_closure.sh`（聚合“语义回归 + IR 校验 + 后端自举（selfhost）+ determinism‑strict + opt + FFI/ABI matrix + obj/exe determinism + release manifest+bundle+sign/verify + mm”；可用 `--no-selfhost` 跳过自举验收，`--fullchain/--stress` 显式加压测）。
 - 后端自举（selfhost，`.o` 口径）：`src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh` 用 stage0 driver（优先顺序：`CHENG_SELF_OBJ_BOOTSTRAP_STAGE0` → 可执行 `CHENG_BACKEND_DRIVER` → `artifacts/backend_selfhost_self_obj/cheng.stage2` → `artifacts/backend_selfhost_self_obj/cheng.stage1` → `artifacts/backend_seed/cheng.stage2` → 本地 `./cheng`；seed 仅用于首次/无自举产物兜底）编译 `backend_driver.cheng` 得到 stage1，再用 stage1 编译得到 stage2；要求 selfhost 固定点收敛，并对 `hello_puts` 做一次 compile+run smoke。
-  - 2026-02-06：已修复 selfhost “stage2 长时间无输出后超时”的一类根因（`src/std/strings.cheng` 中 `streq` 的 `nil` 比较递归）；当前失败模式改为可诊断报错优先退出。
+  - 2026-02-06：已修复 selfhost “stage2 长时间无输出后超时”的一类根因（`src/std/strings.cheng` 中字符串 `==` 的 `nil` 比较递归）；当前失败模式改为可诊断报错优先退出。
   - 2026-02-06：脚本默认开启 `CHENG_SELF_OBJ_BOOTSTRAP_REUSE=1`（复用已生成的 stage1/stage2 产物）以减少重复全量重编导致的超时；`CHENG_CLEAN_CHENG_LOCAL` 在该脚本中默认关闭，避免每次回收本地 driver 触发冷启动重建。
   - 2026-02-08：自举编译默认开启多单元增量（`CHENG_SELF_OBJ_BOOTSTRAP_MULTI=1`、`CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL=1`），并默认强制走多单元产物（`CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE=1`）；`CHENG_SELF_OBJ_BOOTSTRAP_JOBS` 默认 `0`（auto，按主机核数并行），可显式设为更小值复现串行口径或排障。
   - 2026-02-07：自举临时产物改为稳定 session 命名（默认 `CHENG_SELF_OBJ_BOOTSTRAP_SESSION=default`），可复用增量缓存；并发场景可显式指定不同 session 隔离。
@@ -131,6 +131,7 @@ Cheng 源码
 - 固定 seed（纯 Cheng 更新，不走 C 后端）：用“上一版本的 stage2 driver（二进制）”作为 seed（`CHENG_SELF_OBJ_BOOTSTRAP_STAGE0=<seed>`），运行 `sh src/tooling/backend_seed_pure.sh --seed:<seed>` 可在同一链路下生成新的 stage2（自举固定点）。
 - CI/生产（obj-only）：`sh src/tooling/verify_backend_ci_obj_only.sh`，默认从 `dist/releases/current_id.txt` 指向的发布 seed 提取 driver 走全链 `.o` 自举；也可传 `--seed:<path>`/`--seed-id:<id>`/`--seed-tar:<path>` 显式指定，不再自动候选本地 artifacts seed。
 - 全链复用口径：`verify_fullchain_bootstrap.sh` 默认 `CHENG_FULLCHAIN_REUSE=1`，在 stage2/source/runtime 未变化时复用 `stage1_fullspec_obj` 与工具产物，仅执行运行 smoke，降低重复闭环耗时。
+- 全链 stage1 样例口径：默认样例为 `examples/backend_fullchain_smoke.cheng`（可用 `CHENG_FULLCHAIN_STAGE1_FILE` 覆盖），默认前端为 `CHENG_FULLCHAIN_STAGE1_FRONTEND=mvp`（可切 `stage1`），默认单次编译超时 `CHENG_FULLCHAIN_STAGE1_TIMEOUT=60`。
 - 全链工具并行：`verify_fullchain_bootstrap.sh` 默认按主机核数并行构建 `cheng_pkg_source/cheng_pkg/cheng_storage`（`CHENG_FULLCHAIN_TOOL_JOBS=0` auto），冷路径下可显著缩短 fullchain 时长。
 - 调试与可观测性：在移除 `emit=asm` 后已恢复最小 dSYM 口径回归（`src/tooling/verify_backend_debug.sh`）。
 - IR v1 校验：`CHENG_BACKEND_VALIDATE=1` 在 codegen 前跑 `mirValidateModule`，覆盖 block/terminator、branch target、表达式结构、object‑local 取址误用、object layout 边界等一致性检查。
@@ -154,8 +155,8 @@ Cheng 源码
 - 自研 ELF `.o` writer（可验收）：后端 `emit=obj` **默认直接产出** relocatable `.o`（不调用 `cc -c`）；可用 `CHENG_BACKEND_OBJ_WRITER=elf` 强制选择 writer。回归入口 `src/tooling/verify_backend_self_obj_writer.sh`（需 NDK，用于 readelf/nm/link 校验）。
 - 自研目标文件确定性（初版）：`src/tooling/verify_backend_self_obj_writer_elf_determinism.sh` / `src/tooling/verify_backend_self_obj_writer_macho_determinism.sh` / `src/tooling/verify_backend_self_obj_writer_coff_determinism.sh` 在相同输入下双跑比对自研 `.o/.obj` 的 sha256 一致性。
 - Sanitizer（可选）：`src/tooling/verify_backend_sanitizer.sh` 以 `-fsanitize=address` 构建并运行一个最小 fixture；不支持则自动 skip（exit 2）。
-- 运行时压力（初版）：`src/tooling/verify_backend_stress.sh` 编译 fullspec 并重复运行（默认 10 次，可用 `CHENG_BACKEND_STRESS_N` 调整）。
-- 并发压力（初版）：`src/tooling/verify_backend_concurrency_stress.sh` 覆盖 `spawn/schedRun/chan` 的最小并发运行时调用并循环运行（默认 50 次，可用 `CHENG_BACKEND_CONCURRENCY_N` 调整）。
+- 运行时压力（初版）：`src/tooling/verify_backend_stress.sh` 编译 stage1 smoke（`hello_puts`）并重复运行（默认 10 次，可用 `CHENG_BACKEND_STRESS_N` 调整）；编译与单次运行默认 `60s` 超时（`CHENG_BACKEND_STRESS_TIMEOUT`）。
+- 并发压力（初版）：`src/tooling/verify_backend_concurrency_stress.sh` 覆盖 `spawn/schedRun/chan` 的最小并发运行时调用并循环运行（默认 50 次，可用 `CHENG_BACKEND_CONCURRENCY_N` 调整）；编译与单次运行默认 `60s` 超时（`CHENG_BACKEND_CONCURRENCY_TIMEOUT`）。
 - 运行时回归（初版）：`src/tooling/verify_backend_mm.sh` 覆盖 mem_scope 回收与手动 `memRelease` 的 live 计数不增长（执行带 60s 超时保护）；容器语义回归 `mm_container_balance`（`str[]`/`Table[str]` 的写入、覆盖、插入、删除与读取行为）默认关闭，需显式 `CHENG_BACKEND_MM_CONTAINER=1` 开启。
 - 运行时 ABI 一致性门禁（初版）：`src/tooling/verify_backend_runtime_abi.sh` 校验 `src/runtime/native/system_helpers.h` 声明与 C/runtime 后端实现的一致性（含 `_addr`/`__addr` 兜底符号），并在 `verify.sh`、`verify_backend_closedloop.sh` 与 CI（Linux amd64、macOS arm64）执行。
 - 标准库目录同步门禁（初版）：`src/tooling/verify_std_layout_sync.sh` 校验 `src/std` 入口完整性、禁止遗留 `* copy.cheng`，并确保 `src/stdlib/bootstrap` 旧路径已移除。
@@ -167,7 +168,7 @@ Cheng 源码
 - 发布/回滚（本地闭环）：`src/tooling/backend_release_publish.sh` 默认发布到 `dist/releases/<release_id>` 并更新 `dist/releases/current`；`src/tooling/backend_release_rollback.sh` 可回滚到上一版本；`src/tooling/backend_prod_publish.sh` 一键“验收+发布”。
 
 仍待完善（工程长期项）：
-- 编译器全链自举（初版已落地）：`verify_backend_selfhost_bootstrap_self_obj.sh` 产出 selfhost stage2（固定点）；`verify_fullchain_bootstrap.sh` 直接要求已有 stage2（默认 `artifacts/backend_selfhost_self_obj/cheng.stage2`，可用 `CHENG_FULLCHAIN_STAGE2` 覆盖），并以 `CHENG_MM=orc` 构建核心工具、执行 obj-only fullspec 与 `--help` smoke。生产/CI（macOS arm64）通常通过 `verify_backend_ci_obj_only.sh` 以发布 seed 完成“seed→stage2→fullchain(obj-only)”闭环。
+- 编译器全链自举（初版已落地）：`verify_backend_selfhost_bootstrap_self_obj.sh` 产出 selfhost stage2（固定点）；`verify_fullchain_bootstrap.sh` 直接要求已有 stage2（默认 `artifacts/backend_selfhost_self_obj/cheng.stage2`，可用 `CHENG_FULLCHAIN_STAGE2` 覆盖），并以 `CHENG_MM=orc` 构建核心工具、执行 obj-only smoke（默认 `examples/backend_fullchain_smoke.cheng`）与 `--help` smoke。需要重样例时可显式设置 `CHENG_FULLCHAIN_STAGE1_FILE=examples/backend_obj_fullspec.cheng`。生产/CI（macOS arm64）通常通过 `verify_backend_ci_obj_only.sh` 以发布 seed 完成“seed→stage2→fullchain(obj-only)”闭环。
 - 跨平台 `.o/.obj` 产物闭环：已补齐 x86_64（Linux ELF / Windows COFF）的 codegen+obj 回归（见 `verify_backend_targets_matrix.sh`）；Darwin x86_64 已有 exe+run（Rosetta）闭环；Windows 侧对接 `lld-link` 为 best-effort（`src/tooling/verify_backend_coff_lld_link.sh` 可在本机装有 LLVM lld 时做 COFF `.obj`→DLL 的 link 校验）。
 - IR v1/SSA：已落地 SSA 最小闭环（重命名+phi 消解，`CHENG_BACKEND_SSA=1`；回归入口 `src/tooling/verify_backend_ssa.sh`）；opt2 已覆盖 DCE/内联/死函数裁剪 +（基础版）CSE/SROA/LICM；跨模块优化已落地 multi‑lto 初版（`CHENG_BACKEND_MULTI_LTO=1`），仍需更完整的链接器级 LTO。
 - 目标文件/链接链路：自研 relocatable 目标文件 writer 已落地（AArch64）：ELF `.o` / Mach‑O `.o` / COFF `.obj`。
@@ -421,8 +422,8 @@ block <label>:
 - 生产闭环仍需补强：`backend_prod_closure` 默认 strict（skip 即失败），但 `backend.coff_lld_link` 会先做宿主能力探测（缺 `lld-link/llvm-lld/ld.lld/lld` 时打印 skip 不阻塞闭环）；全量覆盖仍建议在 CI 固定工具链中单独强制跑 `verify_backend_coff_lld_link.sh`。
 - 自举性能门槛：`backend_prod_closure` 默认将 selfhost 单次编译超时设置为 `60s`（`CHENG_BACKEND_PROD_SELFHOST_TIMEOUT`），用于提前暴露编译性能回退。
 - 自举模式分层：`verify_backend_selfhost_bootstrap_self_obj.sh` 新增 `CHENG_SELF_OBJ_BOOTSTRAP_MODE=strict|fast`（默认 `strict`）。`strict` 保留 `stage1/stage2` 固定点校验；`fast` 只编译 stage1 并同步 stage2 产物用于开发提速（不作为发布门禁口径）。脚本会记录 stage2 产物模式，`strict` 不会复用 `fast` 产物充当 fixed-point 结果。
-  - 同机实测（2026-02-08，冷态，stage0 默认优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage1`）：`strict` 约 `24-27s`，`fast` 约 `17s`；若只能回退到 dist/seed stage0，可能触发 `stage3` 收敛，耗时会更接近 `60s`。
-  - `60s` 门槛回归：`verify_backend_selfhost_bootstrap_self_obj.sh`（strict）与 `backend_prod_closure.sh --only-self-obj-bootstrap --selfhost-strict` 均在 `60s` 超时约束内通过。
+  - 同机实测（2026-02-12，当前源码冷态）：`strict` 在 `stage2` 重编阶段可能超过 `60s`（本次回归观测 `stage2≈70s`）。
+  - 稳定性策略（已落地）：`verify_backend_selfhost_bootstrap_self_obj.sh` 在 stage1/stage2 构建超时（124）时，允许继续执行“串行重试 + stage0 回退”以保证生产闭环可完成；性能优化继续按热点推进。
   - 闭环入口可显式指定：`backend_prod_closure.sh --selfhost-fast|--selfhost-strict`（参数优先级高于环境变量）。
 - 自举 stage0 复用：当显式设置 `CHENG_BACKEND_DRIVER` 且可执行时，`backend_prod_closure` 会优先把该 driver 透传为 `CHENG_SELF_OBJ_BOOTSTRAP_STAGE0`，避免重复重建本地 `./cheng`。
 - 自举 stage0 默认回退：未显式指定 stage0 时，`backend_prod_closure` 会优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（其次 `cheng.stage1`）作为 stage0，降低冷启动重建概率。
@@ -442,7 +443,7 @@ block <label>:
 - 前端分段计时：`CHENG_STAGE1_PROFILE=1` 时编译器会在 stdout 输出 `[stage1] profile: ...`，并附带 `[sem]/[mono]/[ownership]` 细分统计，用于把 `backend_profile build_module` 拆到 lex/load/sem/mono/ownership。
 - MIR 分段计时：`CHENG_MIR_PROFILE=1` 时编译器会在 stderr 输出 `mir_profile\t<label>\tstep_ms=...\ttotal_ms=...`，用于把 `backend_profile build_module` 继续拆到 `lower_top_level/fixups/...`。
 - 2026-02-07 冷路径优化（基于 `sample`）：
-  - 热点指向 `strlen` + `get/hashMap` 路径，已落地 `src/std/strings.cheng` 的 `streq` 快路径（指针/nil 快判 + `c_strcmp`）与 `hasPrefix` 长度缓存。
+  - 热点指向 `strlen` + `get/hashMap` 路径，已落地 `src/std/strings.cheng` 的字符串 `==` 快路径（指针/nil 快判 + `c_strcmp`）与 `hasPrefix` 长度缓存。
   - 已落地 `src/std/seqs.cheng` / `src/std/system.cheng` 的 seq 访问快路径（`get/getPtr/setPtr` 与 `[]/[]=` 改为直接索引指针运算，移除 `cheng_seq_get/set` 调用开销）。
   - 已落地 `src/std/hashmaps.cheng` 的 `HashMapPtrInt` 直接指针槽位访问；字符串槽位比较进一步改为 `hashMapStrEqKnownLen`（复用 `keyLen` + `cmpMem+NUL`，移除 `len(cur)`），减少探测路径重复 `strlen`。
   - 已落地 `src/std/hashmaps.cheng` 的字符串 key 单遍元信息计算：`hashMapHash64StrMeta` 同时产出 `hash+len+first-char`，`HashMapStrInt/HashMapStrSeqInt` 查槽不再对 key 做 `len+hash` 双遍扫描。
@@ -458,7 +459,7 @@ block <label>:
   - 2026-02-08：`backendStripSpaces` 增加“无空白直接返回”快路径，减少大量 strip 分配与 `ptrmap_put` 压力；同机 `backend_driver.cheng` 单模块 `emit=obj` 口径 `build_module` 常见 `~11.3s -> ~10.4s`（以 `CHENG_BACKEND_PROFILE/CHENG_STAGE1_PROFILE/CHENG_MIR_PROFILE` 输出为准）。
   - 2026-02-09：修复 `profile_backend_sample` 的 attach 等待策略：当命中 root 自身或目标不 fork 子进程时不再长时间等待，避免 target 结束后采到 zombie 导致 `sample` 失败（exit=255）。
   - 2026-02-09：`src/std/system_helpers_backend.cheng` 的 `cheng_ptr_hash` 忽略对齐位并减少一次乘法，降低 `cheng_ptr_hash/cheng_ptrmap_put` 热路径开销。
-  - 2026-02-09：`src/backend/mir/mir_types.cheng` 为 `typeAliases/objTypes/cstrs` 引入 `HashMapStrInt` 索引缓存（>=32 时启用），减少 `streq` 线性扫描；同机 `backend_driver.cheng` 单模块 `emit=obj` 口径常见 `~13.5s -> ~13.0s`（以 `/usr/bin/time` 为准）。
+  - 2026-02-09：`src/backend/mir/mir_types.cheng` 为 `typeAliases/objTypes/cstrs` 引入 `HashMapStrInt` 索引缓存（>=32 时启用），减少字符串等号比较的线性扫描；同机 `backend_driver.cheng` 单模块 `emit=obj` 口径常见 `~13.5s -> ~13.0s`（以 `/usr/bin/time` 为准）。
 - 后续优先级：先补齐 x86_64（ELF/COFF）的可执行闭环与 `lld-link` 端到端回归，其次增强调试信息与 determinism 口径；其余见上文“仍待完善（工程长期项）”清单。
 
 

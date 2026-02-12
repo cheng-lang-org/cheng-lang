@@ -5,6 +5,40 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
+run_with_timeout() {
+  seconds="$1"
+  shift
+  perl -e '
+    use POSIX qw(setsid WNOHANG);
+    my $timeout = shift;
+    my $pid = fork();
+    if (!defined $pid) { exit 127; }
+    if ($pid == 0) {
+      setsid();
+      exec @ARGV;
+      exit 127;
+    }
+    my $end = time + $timeout;
+    while (1) {
+      my $res = waitpid($pid, WNOHANG);
+      if ($res == $pid) {
+        my $status = $?;
+        if (($status & 127) != 0) {
+          exit(128 + ($status & 127));
+        }
+        exit($status >> 8);
+      }
+      if (time >= $end) {
+        kill "TERM", -$pid;
+        select(undef, undef, undef, 0.5);
+        kill "KILL", -$pid;
+        exit 124;
+      }
+      select(undef, undef, undef, 0.1);
+    }
+  ' "$seconds" "$@"
+}
+
 if [ "${CHENG_CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${CHENG_TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export CHENG_TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
@@ -26,23 +60,45 @@ if [ "${CHENG_BACKEND_CONCURRENCY_STRESS_ENABLED:-0}" != "1" ]; then
 fi
 
 n="${CHENG_BACKEND_CONCURRENCY_N:-50}"
+timeout_s="${CHENG_BACKEND_CONCURRENCY_TIMEOUT:-60}"
 out_dir="artifacts/backend_concurrency_stress"
 mkdir -p "$out_dir"
 
 fixture="tests/cheng/backend/fixtures/return_spawn_chan_i32.cheng"
 exe_path="$out_dir/spawn_chan"
 
-env $link_env \
+# shellcheck disable=SC2086
+set +e
+run_with_timeout "$timeout_s" env $link_env \
   CHENG_MM=orc \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_TARGET="$target" \
   CHENG_BACKEND_INPUT="$fixture" \
   CHENG_BACKEND_OUTPUT="$exe_path" \
   "$driver"
+status=$?
+set -e
+if [ "$status" = "124" ]; then
+  echo "[Error] verify_backend_concurrency_stress compile timed out after ${timeout_s}s" 1>&2
+  exit 124
+fi
+if [ "$status" != "0" ]; then
+  exit "$status"
+fi
 
 i=0
 while [ "$i" -lt "$n" ]; do
-  "$exe_path"
+  set +e
+  run_with_timeout "$timeout_s" "$exe_path"
+  status=$?
+  set -e
+  if [ "$status" = "124" ]; then
+    echo "[Error] verify_backend_concurrency_stress run timed out after ${timeout_s}s (iter=$i)" 1>&2
+    exit 124
+  fi
+  if [ "$status" != "0" ]; then
+    exit "$status"
+  fi
   i=$((i + 1))
 done
 

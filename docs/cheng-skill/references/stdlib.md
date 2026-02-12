@@ -34,7 +34,7 @@ import cheng/libp2p/[crypto,transport,swarm]
 - 编译器 `stage1/mvp` 主链路对 `string` 类型名会直接报错（提示改用 `str`/`cstring`）。
 - 隐式默认初始化时，`str/cstring` 默认值为 `""`（空串）。
 - 运行时与 FFI 边界可能出现 `nil` 字符串值；边界代码建议同时考虑 `nil` 与空串。
-- `std/strings` 提供 `len/streq/[]/[]=/strIsEmpty/strNonEmpty` 等基础能力。
+- `std/strings` 提供 `len/==/[]/[]=/strIsEmpty/strNonEmpty` 等基础能力。
 - `charAt` 不再作为标准库接口；历史代码中的 `charAt(s, i)` 在编译期静态改写为 `s[i]`。
 - 容器语法：动态序列 `T[]`、定长数组 `T[N]`；序列字面量仅 `[]` / `[a, b]`；旧 `seq[T]`/`array[T,N]`/`@[]` 已移除。
 

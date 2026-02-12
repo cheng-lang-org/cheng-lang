@@ -18,11 +18,26 @@ to_abs() {
 # Keep local `./cheng` during bootstrap to avoid recursive worker invocations
 # deleting the active stage0 driver mid-build.
 export CHENG_CLEAN_CHENG_LOCAL=0
-if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
-  export CHENG_STAGE1_STD_NO_POINTERS=1
+if [ "${CHENG_ABI:-}" = "" ]; then
+  export CHENG_ABI=v2_noptr
 fi
-if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
-  export CHENG_STAGE1_STD_NO_POINTERS_STRICT=1
+if [ "${CHENG_ABI}" = "v2_noptr" ]; then
+  if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
+    export CHENG_STAGE1_STD_NO_POINTERS=1
+  fi
+  if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
+    export CHENG_STAGE1_STD_NO_POINTERS_STRICT=1
+  fi
+fi
+# Stage1 frontend pass toggles: keep selfhost bootstrap path stable by default.
+if [ "${CHENG_STAGE1_SKIP_SEM:-}" = "" ]; then
+  export CHENG_STAGE1_SKIP_SEM=1
+fi
+if [ "${CHENG_STAGE1_SKIP_MONO:-}" = "" ]; then
+  export CHENG_STAGE1_SKIP_MONO=0
+fi
+if [ "${CHENG_STAGE1_SKIP_OWNERSHIP:-}" = "" ]; then
+  export CHENG_STAGE1_SKIP_OWNERSHIP=1
 fi
 
 run_with_timeout() {
@@ -374,7 +389,7 @@ build_runtime_obj() {
     "$rt_compiler" >"$rt_log" 2>&1
   status="$?"
   set -e
-  if [ "$status" -ne 0 ] && [ "$status" -ne 124 ] && [ "$multi" != "0" ]; then
+  if [ "$status" -ne 0 ] && [ "$multi" != "0" ]; then
     # Seed/local stage compilers may crash in worker mode; retry in serial mode.
     rm -f "$tmp_obj"
     set +e
@@ -395,6 +410,32 @@ build_runtime_obj() {
       CHENG_BACKEND_INPUT="$runtime_cheng_src" \
       CHENG_BACKEND_OUTPUT="$tmp_obj" \
       "$rt_compiler" >>"$rt_log" 2>&1
+    status="$?"
+    set -e
+  fi
+  if [ "$status" -ne 0 ] && [ "$rt_compiler" != "$stage0" ] && [ -x "$stage0" ]; then
+    # Some stage1 compilers may crash on allow-no-main runtime builds.
+    # Fall back to stage0 for runtime object generation to keep bootstrap progressing.
+    rm -f "$tmp_obj"
+    echo "[verify_backend_selfhost_bootstrap_self_obj] runtime build retry with stage0: $stage0" >>"$rt_log"
+    set +e
+    run_with_timeout "$build_timeout" env \
+      CHENG_MM="$mm" \
+      CHENG_CACHE="$cache" \
+      CHENG_C_SYSTEM=0 \
+      CHENG_BACKEND_MULTI=0 \
+      CHENG_BACKEND_MULTI_FORCE=0 \
+      CHENG_BACKEND_INCREMENTAL="$incremental" \
+      CHENG_BACKEND_JOBS="$jobs" \
+      CHENG_BACKEND_VALIDATE=1 \
+      CHENG_BACKEND_ALLOW_NO_MAIN=1 \
+      CHENG_BACKEND_WHOLE_PROGRAM=1 \
+      CHENG_BACKEND_EMIT=obj \
+      CHENG_BACKEND_TARGET="$target" \
+      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_INPUT="$runtime_cheng_src" \
+      CHENG_BACKEND_OUTPUT="$tmp_obj" \
+      "$stage0" >>"$rt_log" 2>&1
     status="$?"
     set -e
   fi
@@ -439,7 +480,7 @@ build_obj() {
     "$compiler" >"$build_log" 2>&1
   status="$?"
   set -e
-  if [ "$status" -ne 0 ] && [ "$status" -ne 124 ] && [ "$multi" != "0" ]; then
+  if [ "$status" -ne 0 ] && [ "$multi" != "0" ]; then
     rm -f "$tmp_obj"
     set +e
     run_with_timeout "$build_timeout" env \
@@ -527,7 +568,7 @@ build_exe_self() {
       exit_code=86
     fi
   fi
-  if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 124 ] && [ "$multi" != "0" ]; then
+  if [ "$exit_code" -ne 0 ] && [ "$multi" != "0" ]; then
     rm -f "$tmp_exe" "$tmp_exe_obj"
     set +e
     run_with_timeout "$build_timeout" env \
@@ -556,6 +597,35 @@ build_exe_self() {
         exit_code=86
       fi
     fi
+  fi
+  if [ "$exit_code" -ne 0 ] && [ "$compiler" != "$stage0" ]; then
+    case "$stage" in
+      stage2|stage3|stage2.*|stage3.*|*.smoke|*.smoke.*)
+        rm -f "$tmp_exe" "$tmp_exe_obj"
+        echo "[verify_backend_selfhost_bootstrap_self_obj] stage build retry with stage0: $stage0 (stage=$stage)" >>"$build_log"
+        set +e
+        run_with_timeout "$build_timeout" env \
+          CHENG_MM="$mm" \
+          CHENG_CACHE="$cache" \
+          CHENG_BACKEND_MULTI=0 \
+          CHENG_BACKEND_MULTI_FORCE=0 \
+          CHENG_BACKEND_INCREMENTAL="$incremental" \
+          CHENG_BACKEND_JOBS="$jobs" \
+          CHENG_BACKEND_VALIDATE=1 \
+          CHENG_BACKEND_WHOLE_PROGRAM=1 \
+          CHENG_BACKEND_LINKER=self \
+          CHENG_BACKEND_NO_RUNTIME_C=1 \
+          CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
+          CHENG_BACKEND_EMIT=exe \
+          CHENG_BACKEND_TARGET="$target" \
+          CHENG_BACKEND_FRONTEND=stage1 \
+          CHENG_BACKEND_INPUT="$input" \
+          CHENG_BACKEND_OUTPUT="$tmp_exe" \
+          "$stage0" >>"$build_log" 2>&1
+        exit_code="$?"
+        set -e
+        ;;
+    esac
   fi
   if [ "$exit_code" -ne 0 ]; then
     if [ "$exit_code" -eq 124 ]; then

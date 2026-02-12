@@ -12,23 +12,23 @@ fn bitvecNew(n: int32): int32[] =
 fn bitvecHas(bits: int32[], idx: int32): bool =
     if idx < 0 || idx >= bits.len:
         return false
-    return get[int32](bits, idx) != 0
+    return bits[idx] != 0
 
 fn bitvecSet(bits: int32[]*, idx: int32) =
     if bits == nil || idx < 0 || idx >= bits->len:
         return
-    setPtr[int32](bits, idx, 1)
+    bits[idx] = 1
 
 fn bitvecClear(bits: int32[]*, idx: int32) =
     if bits == nil || idx < 0 || idx >= bits->len:
         return
-    setPtr[int32](bits, idx, 0)
+    bits[idx] = 0
 
 fn bitvecCopy(bits: int32[]): int32[] =
     var out: int32[]
     out.len = int(bits.len)
     for i in 0..<bits.len:
-        setPtr[int32](&out, i, get[int32](bits, i))
+        out[i] = bits[i]
     return out
 
 fn bitvecOrInto(dst: int32[]*, src: int32[]): bool =
@@ -37,10 +37,10 @@ fn bitvecOrInto(dst: int32[]*, src: int32[]): bool =
     var any: bool = false
     let n: int32 = dst->len
     for i in 0..<n:
-        let a: int32 = get[int32](*dst, i)
-        let b: int32 = get[int32](src, i)
+        let a: int32 = (*dst)[i]
+        let b: int32 = src[i]
         if a == 0 && b != 0:
-            setPtr[int32](dst, i, 1)
+            dst[i] = 1
             any = true
     return any
 
@@ -48,7 +48,7 @@ fn bitvecEq(a: int32[], b: int32[]): bool =
     if a.len != b.len:
         return false
     for i in 0..<a.len:
-        if get[int32](a, i) != get[int32](b, i):
+        if a[i] != b[i]:
             return false
     return true
 
@@ -56,7 +56,7 @@ fn bitvecFill(bits: int32[]*, value: int32) =
     if bits == nil:
         return
     for i in 0..<bits->len:
-        setPtr[int32](bits, i, value)
+        bits[i] = value
 
 fn bitvecAndInto(dst: int32[]*, src: int32[]): bool =
     if dst == nil:
@@ -64,10 +64,10 @@ fn bitvecAndInto(dst: int32[]*, src: int32[]): bool =
     var any: bool = false
     let n: int32 = dst->len
     for i in 0..<n:
-        let a: int32 = get[int32](*dst, i)
-        let b: int32 = get[int32](src, i)
+        let a: int32 = (*dst)[i]
+        let b: int32 = src[i]
         if a != 0 && b == 0:
-            setPtr[int32](dst, i, 0)
+            dst[i] = 0
             any = true
     return any
 
@@ -158,7 +158,7 @@ fn mirCseTypeKey(ty: MirType): str =
 fn mirCseSlotVer(slotVer: int32[], slot: int32): int32 =
     if slot < 0 || slot >= slotVer.len:
         return 0
-    return get[int32](slotVer, slot)
+    return slotVer[slot]
 
 fn mirCseExprKey(module: MirModule, func: MirFunc, expr: MirExpr, fallback: MirType, slotVer: int32[]): str =
     if expr == nil:
@@ -208,9 +208,9 @@ fn mirCseRewriteExpr(module: MirModule, func: MirFunc, expr: MirExpr, fallback: 
         expr.addrExpr = mirCseRewriteExpr(module, func, expr.addrExpr, mirTypeI64(), slotVer, exprToSlot, changed)
     of meCall:
         for i in 0..<expr.args.len:
-            let a: MirExpr = get[MirExpr](expr.args, i)
+            let a: MirExpr = expr.args[i]
             let at: MirType = mirOptExprType(module, func, a, fallback)
-            setPtr[MirExpr](&expr.args, i, mirCseRewriteExpr(module, func, a, at, slotVer, exprToSlot, changed))
+            (&expr.args)[i] = mirCseRewriteExpr(module, func, a, at, slotVer, exprToSlot, changed)
     else:
         return expr
 
@@ -220,7 +220,7 @@ fn mirCseRewriteExpr(module: MirModule, func: MirFunc, expr: MirExpr, fallback: 
             let packed: int64 = tables.TableGet[int64](*exprToSlot, key)
             let slot: int32 = mirUnpackSlot(packed)
             let ver: int32 = mirUnpackVer(packed)
-            if slot >= 0 && slot < slotVer.len && get[int32](slotVer, slot) == ver:
+            if slot >= 0 && slot < slotVer.len && slotVer[slot] == ver:
                 if changed != nil:
                     *changed = true
                 return mirLocal(slot)
@@ -234,17 +234,17 @@ fn mirFuncCse(func: MirFunc, module: MirModule): bool =
         return false
     var any: bool = false
     for bi in 0..<func.blocks.len:
-        let b: MirBlock = get[MirBlock](func.blocks, bi)
+        let b: MirBlock = func.blocks[bi]
         if b != nil:
             var slotVer: int32[]
             slotVer.len = int(slotCount)
             var exprToSlot: tables.Table[int64]
             for si in 0..<b.stmts.len:
-                var s: MirStmt = get[MirStmt](b.stmts, si)
+                var s: MirStmt = b.stmts[si]
                 if s.kind == msLet || s.kind == msVar || s.kind == msAssign:
                     var slotTy: MirType = mirTypeI32()
                     if s.slot >= 0 && s.slot < slotCount:
-                        slotTy = get[MirType](func.localTypes, s.slot)
+                        slotTy = func.localTypes[s.slot]
                     if s.expr != nil:
                         var ch: bool = false
                         s.expr = mirCseRewriteExpr(module, func, s.expr, slotTy, slotVer, &exprToSlot, &ch)
@@ -254,13 +254,13 @@ fn mirFuncCse(func: MirFunc, module: MirModule): bool =
                     if s.slot >= 0 && s.slot < slotCount && s.expr != nil && mirExprIsPure(s.expr):
                         key = mirCseExprKey(module, func, s.expr, slotTy, slotVer)
                     if s.slot >= 0 && s.slot < slotCount:
-                        setPtr[int32](&slotVer, s.slot, get[int32](slotVer, s.slot) + 1)
+                        slotVer[s.slot] = slotVer[s.slot] + 1
                         if key != nil && len(key) > 0:
-                            tables.TablePut[int64](exprToSlot, key, mirPackSlotVer(s.slot, get[int32](slotVer, s.slot)))
-                    setPtr[MirStmt](&b.stmts, si, s)
+                            tables.TablePut[int64](exprToSlot, key, mirPackSlotVer(s.slot, slotVer[s.slot]))
+                    (&b.stmts)[si] = s
                 elif s.kind == msParam:
                     if s.slot >= 0 && s.slot < slotCount:
-                        setPtr[int32](&slotVer, s.slot, get[int32](slotVer, s.slot) + 1)
+                        slotVer[s.slot] = slotVer[s.slot] + 1
                 elif s.kind == msStore:
                     if s.addrExpr != nil:
                         var ch2: bool = false
@@ -272,27 +272,27 @@ fn mirFuncCse(func: MirFunc, module: MirModule): bool =
                         s.expr = mirCseRewriteExpr(module, func, s.expr, s.storeType, slotVer, &exprToSlot, &ch3)
                         if ch3:
                             any = true
-                    setPtr[MirStmt](&b.stmts, si, s)
+                    (&b.stmts)[si] = s
                 else:
                     if s.expr != nil:
                         var ch4: bool = false
                         s.expr = mirCseRewriteExpr(module, func, s.expr, func.retType, slotVer, &exprToSlot, &ch4)
                         if ch4:
                             any = true
-                        setPtr[MirStmt](&b.stmts, si, s)
+                        (&b.stmts)[si] = s
 
             if b.term.kind == mtRet && b.term.retExpr != nil:
                 var ch5: bool = false
                 b.term.retExpr = mirCseRewriteExpr(module, func, b.term.retExpr, func.retType, slotVer, &exprToSlot, &ch5)
                 if ch5:
                     any = true
-                setPtr[MirBlock](&func.blocks, bi, b)
+                (&func.blocks)[bi] = b
             elif b.term.kind == mtCbr && b.term.condExpr != nil:
                 var ch6: bool = false
                 b.term.condExpr = mirCseRewriteExpr(module, func, b.term.condExpr, mirTypeI32(), slotVer, &exprToSlot, &ch6)
                 if ch6:
                     any = true
-                setPtr[MirBlock](&func.blocks, bi, b)
+                (&func.blocks)[bi] = b
     return any
 
 fn mirSroaMarkExpr(expr: MirExpr, usedAsLoadAddr: bool[]*, usedOther: bool[]*,
@@ -303,26 +303,26 @@ fn mirSroaMarkExpr(expr: MirExpr, usedAsLoadAddr: bool[]*, usedOther: bool[]*,
     of meLocal:
         let slot: int32 = expr.localIndex
         if slot >= 0 && usedOther != nil && slot < usedOther->len:
-            setPtr[bool](usedOther, slot, true)
+            usedOther[slot] = true
         return
     of meAddr:
         let base: int32 = expr.localIndex
         if addrTakenCount != nil && base >= 0 && base < addrTakenCount->len:
-            setPtr[int32](addrTakenCount, base, get[int32](*addrTakenCount, base) + 1)
+            addrTakenCount[base] = (*addrTakenCount)[base] + 1
         return
     of meLoad:
         let addr: MirExpr = expr.addrExpr
         if addr != nil && addr.kind == meLocal:
             let p: int32 = addr.localIndex
             if usedAsLoadAddr != nil && p >= 0 && p < usedAsLoadAddr->len:
-                setPtr[bool](usedAsLoadAddr, p, true)
+                usedAsLoadAddr[p] = true
             if loadTy != nil && p >= 0 && p < loadTy->len:
-                let existing: MirType = get[MirType](*loadTy, p)
+                let existing: MirType = (*loadTy)[p]
                 if existing.kind == mtVoid:
-                    setPtr[MirType](loadTy, p, expr.loadType)
+                    loadTy[p] = expr.loadType
                 elif !mirTypeEq(existing, expr.loadType):
                     var bad: MirType = mirTypeVoid()
-                    setPtr[MirType](loadTy, p, bad)
+                    loadTy[p] = bad
             return
         mirSroaMarkExpr(addr, usedAsLoadAddr, usedOther, addrTakenCount, loadTy)
         return
@@ -335,7 +335,7 @@ fn mirSroaMarkExpr(expr: MirExpr, usedAsLoadAddr: bool[]*, usedOther: bool[]*,
         return
     of meCall:
         for i in 0..<expr.args.len:
-            mirSroaMarkExpr(get[MirExpr](expr.args, i), usedAsLoadAddr, usedOther, addrTakenCount, loadTy)
+            mirSroaMarkExpr(expr.args[i], usedAsLoadAddr, usedOther, addrTakenCount, loadTy)
         return
     else:
         return
@@ -349,9 +349,9 @@ fn mirSroaRewriteExpr(expr: MirExpr, ptrToBase: int32[], func: MirFunc): MirExpr
         if addr != nil && addr.kind == meLocal:
             let p: int32 = addr.localIndex
             if p >= 0 && p < ptrToBase.len:
-                let base: int32 = get[int32](ptrToBase, p)
+                let base: int32 = ptrToBase[p]
                 if base >= 0 && func != nil && base < func.localTypes.len:
-                    let baseTy: MirType = get[MirType](func.localTypes, base)
+                    let baseTy: MirType = func.localTypes[base]
                     if mirTypeEq(baseTy, expr.loadType):
                         return mirLocal(base)
         expr.addrExpr = mirSroaRewriteExpr(addr, ptrToBase, func)
@@ -365,7 +365,7 @@ fn mirSroaRewriteExpr(expr: MirExpr, ptrToBase: int32[], func: MirFunc): MirExpr
         return expr
     of meCall:
         for i in 0..<expr.args.len:
-            setPtr[MirExpr](&expr.args, i, mirSroaRewriteExpr(get[MirExpr](expr.args, i), ptrToBase, func))
+            (&expr.args)[i] = mirSroaRewriteExpr(expr.args[i], ptrToBase, func)
         return expr
     else:
         return expr
@@ -383,7 +383,7 @@ fn mirFuncSroa(func: MirFunc): bool =
     ptrBase.cap = slotCount
     ptrBase.len = slotCount
     for i0 in 0..<slotCount:
-        setPtr[int32](&ptrBase, i0, -1)
+        ptrBase[i0] = -1
     var usedAsLoadAddr: bool[]
     usedAsLoadAddr.cap = slotCount
     usedAsLoadAddr.len = slotCount
@@ -404,27 +404,27 @@ fn mirFuncSroa(func: MirFunc): bool =
     storeTy.len = slotCount
 
     for bi in 0..<func.blocks.len:
-        let b: MirBlock = get[MirBlock](func.blocks, bi)
+        let b: MirBlock = func.blocks[bi]
         if b != nil:
             for si in 0..<b.stmts.len:
-                let s: MirStmt = get[MirStmt](b.stmts, si)
+                let s: MirStmt = b.stmts[si]
                 if s.kind == msLet || s.kind == msVar || s.kind == msAssign || s.kind == msParam:
                     if s.slot >= 0 && s.slot < slotCount:
-                        setPtr[int32](&defCount, s.slot, get[int32](defCount, s.slot) + 1)
+                        defCount[s.slot] = defCount[s.slot] + 1
                         if s.kind == msParam:
-                            setPtr[int32](&ptrBase, s.slot, -2)
+                            ptrBase[s.slot] = -2
                         else:
                             let e: MirExpr = s.expr
                             if e != nil && e.kind == meAddr:
                                 let base: int32 = e.localIndex
-                                let prev: int32 = get[int32](ptrBase, s.slot)
+                                let prev: int32 = ptrBase[s.slot]
                                 if prev == -1 || prev == base:
-                                    setPtr[int32](&ptrBase, s.slot, base)
+                                    ptrBase[s.slot] = base
                                 else:
-                                    setPtr[int32](&ptrBase, s.slot, -2)
+                                    ptrBase[s.slot] = -2
                             else:
-                                if get[int32](ptrBase, s.slot) != -1:
-                                    setPtr[int32](&ptrBase, s.slot, -2)
+                                if ptrBase[s.slot] != -1:
+                                    ptrBase[s.slot] = -2
                     mirSroaMarkExpr(s.expr, &usedAsLoadAddr, &usedOther, &addrTakenCount, &loadTy)
                     mirSroaMarkExpr(s.addrExpr, &usedAsLoadAddr, &usedOther, &addrTakenCount, &loadTy)
                 elif s.kind == msStore:
@@ -432,13 +432,13 @@ fn mirFuncSroa(func: MirFunc): bool =
                     if addr != nil && addr.kind == meLocal:
                         let p: int32 = addr.localIndex
                         if p >= 0 && p < slotCount:
-                            setPtr[bool](&usedAsStoreAddr, p, true)
-                            let existing: MirType = get[MirType](storeTy, p)
+                            usedAsStoreAddr[p] = true
+                            let existing: MirType = storeTy[p]
                             if existing.kind == mtVoid:
-                                setPtr[MirType](&storeTy, p, s.storeType)
+                                storeTy[p] = s.storeType
                             elif !mirTypeEq(existing, s.storeType):
                                 var bad: MirType = mirTypeVoid()
-                                setPtr[MirType](&storeTy, p, bad)
+                                storeTy[p] = bad
                     else:
                         mirSroaMarkExpr(addr, &usedAsLoadAddr, &usedOther, &addrTakenCount, &loadTy)
                     mirSroaMarkExpr(s.expr, &usedAsLoadAddr, &usedOther, &addrTakenCount, &loadTy)
@@ -454,37 +454,37 @@ fn mirFuncSroa(func: MirFunc): bool =
     var ptrToBase: int32[]
     ptrToBase.len = int(slotCount)
     for pi in 0..<slotCount:
-        setPtr[int32](&ptrToBase, pi, -1)
+        ptrToBase[pi] = -1
 
     var any: bool = false
     for pi in 0..<slotCount:
-        let dc: int32 = get[int32](defCount, pi)
-        let base: int32 = get[int32](ptrBase, pi)
+        let dc: int32 = defCount[pi]
+        let base: int32 = ptrBase[pi]
         if dc == 1 && base >= 0 && base < slotCount &&
-           !get[bool](usedOther, pi) &&
-           get[int32](addrTakenCount, base) == 1:
-            let baseTy: MirType = get[MirType](func.localTypes, base)
-            let lt: MirType = get[MirType](loadTy, pi)
-            let st: MirType = get[MirType](storeTy, pi)
+           !usedOther[pi] &&
+           addrTakenCount[base] == 1:
+            let baseTy: MirType = func.localTypes[base]
+            let lt: MirType = loadTy[pi]
+            let st: MirType = storeTy[pi]
             var ok: bool = true
-            if get[bool](usedAsLoadAddr, pi):
+            if usedAsLoadAddr[pi]:
                 ok = ok && lt.kind != mtVoid && mirTypeEq(lt, baseTy)
-            if get[bool](usedAsStoreAddr, pi):
+            if usedAsStoreAddr[pi]:
                 ok = ok && st.kind != mtVoid && mirTypeEq(st, baseTy)
             if ok:
-                setPtr[int32](&ptrToBase, pi, base)
+                ptrToBase[pi] = base
 
     for bi in 0..<func.blocks.len:
-        let b2: MirBlock = get[MirBlock](func.blocks, bi)
+        let b2: MirBlock = func.blocks[bi]
         if b2 != nil:
             for si2 in 0..<b2.stmts.len:
-                var s2: MirStmt = get[MirStmt](b2.stmts, si2)
+                var s2: MirStmt = b2.stmts[si2]
                 if s2.kind == msStore:
                     let addr2: MirExpr = s2.addrExpr
                     if addr2 != nil && addr2.kind == meLocal:
                         let p2: int32 = addr2.localIndex
                         if p2 >= 0 && p2 < slotCount:
-                            let base2: int32 = get[int32](ptrToBase, p2)
+                            let base2: int32 = ptrToBase[p2]
                             if base2 >= 0:
                                 s2.kind = msAssign
                                 s2.slot = base2
@@ -497,13 +497,13 @@ fn mirFuncSroa(func: MirFunc): bool =
                     s2.expr = newExpr
                 if s2.addrExpr != nil:
                     s2.addrExpr = mirSroaRewriteExpr(s2.addrExpr, ptrToBase, func)
-                setPtr[MirStmt](&b2.stmts, si2, s2)
+                (&b2.stmts)[si2] = s2
             if b2.term.kind == mtRet && b2.term.retExpr != nil:
                 b2.term.retExpr = mirSroaRewriteExpr(b2.term.retExpr, ptrToBase, func)
-                setPtr[MirBlock](&func.blocks, bi, b2)
+                (&func.blocks)[bi] = b2
             elif b2.term.kind == mtCbr && b2.term.condExpr != nil:
                 b2.term.condExpr = mirSroaRewriteExpr(b2.term.condExpr, ptrToBase, func)
-                setPtr[MirBlock](&func.blocks, bi, b2)
+                (&func.blocks)[bi] = b2
     return any
 
 fn mirLicmExprInvariant(expr: MirExpr, modified: int32[], slotCount: int32): bool =
@@ -514,7 +514,7 @@ fn mirLicmExprInvariant(expr: MirExpr, modified: int32[], slotCount: int32): boo
     var used: int32[] = bitvecNew(slotCount)
     mirExprMarkSlots(expr, &used)
     for u in 0..<slotCount:
-        if get[int32](used, u) != 0 && bitvecHas(modified, u):
+        if used[u] != 0 && bitvecHas(modified, u):
             return false
     return true
 
@@ -532,7 +532,7 @@ fn mirLicmRewriteExpr(expr: MirExpr, func: MirFunc, modified: int32[], slotCount
             *licmId = *licmId + 1
         let name: str = "__licm_" + mirU64ToHex(int64(id))
         if outHoisted != nil:
-            addPtr[MirStmt](outHoisted, mirStmtLet(name, slot, expr))
+            add(outHoisted, mirStmtLet(name, slot, expr))
         return mirLocal(slot)
     case expr.kind
     of meBin, meCmp:
@@ -564,35 +564,35 @@ fn mirFuncLicm(func: MirFunc): bool =
     preds.cap = nBlocks
     preds.len = nBlocks
     for i in 0..<nBlocks:
-        setPtr[int32](&succA, i, -1)
-        setPtr[int32](&succB, i, -1)
+        succA[i] = -1
+        succB[i] = -1
         var p: int32[]
-        setPtr[int32[]](&preds, i, p)
+        preds[i] = p
 
     for bi in 0..<nBlocks:
-        let b: MirBlock = get[MirBlock](func.blocks, bi)
+        let b: MirBlock = func.blocks[bi]
         if b != nil:
             let t: MirTerm = b.term
             if t.kind == mtBr:
                 let a: int32 = mirFuncFindBlockIndex(func, t.target)
-                setPtr[int32](&succA, bi, a)
+                succA[bi] = a
             elif t.kind == mtCbr:
                 let a2: int32 = mirFuncFindBlockIndex(func, t.targetTrue)
                 let b2: int32 = mirFuncFindBlockIndex(func, t.targetFalse)
-                setPtr[int32](&succA, bi, a2)
-                setPtr[int32](&succB, bi, b2)
+                succA[bi] = a2
+                succB[bi] = b2
 
     for bi in 0..<nBlocks:
-        let s1: int32 = get[int32](succA, bi)
-        let s2: int32 = get[int32](succB, bi)
+        let s1: int32 = succA[bi]
+        let s2: int32 = succB[bi]
         if s1 >= 0 && s1 < nBlocks:
-            var pvec: int32[] = get[int32[]](preds, s1)
-            addPtr[int32](&pvec, bi)
-            setPtr[int32[]](&preds, s1, pvec)
+            var pvec: int32[] = preds[s1]
+            add(pvec, bi)
+            preds[s1] = pvec
         if s2 >= 0 && s2 < nBlocks:
-            var pvec2: int32[] = get[int32[]](preds, s2)
-            addPtr[int32](&pvec2, bi)
-            setPtr[int32[]](&preds, s2, pvec2)
+            var pvec2: int32[] = preds[s2]
+            add(pvec2, bi)
+            preds[s2] = pvec2
 
     var dom: int32[][]
     dom.cap = nBlocks
@@ -603,24 +603,24 @@ fn mirFuncLicm(func: MirFunc): bool =
             bitvecSet(&bits, 0)
         else:
             bitvecFill(&bits, 1)
-        setPtr[int32[]](&dom, bi, bits)
+        dom[bi] = bits
 
     while true:
         var changed: bool = false
         for bi in 1..<nBlocks:
-            let pList: int32[] = get[int32[]](preds, bi)
+            let pList: int32[] = preds[bi]
             var newBits: int32[] = bitvecNew(nBlocks)
             if pList.len == 0:
                 bitvecSet(&newBits, bi)
             else:
                 bitvecFill(&newBits, 1)
                 for pi in 0..<pList.len:
-                    let p: int32 = get[int32](pList, pi)
+                    let p: int32 = pList[pi]
                     if p >= 0 && p < nBlocks:
-                        bitvecAndInto(&newBits, get[int32[]](dom, p))
+                        bitvecAndInto(&newBits, dom[p])
                 bitvecSet(&newBits, bi)
-            if ! bitvecEq(newBits, get[int32[]](dom, bi)):
-                setPtr[int32[]](&dom, bi, newBits)
+            if ! bitvecEq(newBits, dom[bi]):
+                dom[bi] = newBits
                 changed = true
         if !changed:
             break
@@ -629,36 +629,36 @@ fn mirFuncLicm(func: MirFunc): bool =
     var licmId: int32 = 0
 
     for bi in 0..<nBlocks:
-        let a3: int32 = get[int32](succA, bi)
-        let b3: int32 = get[int32](succB, bi)
+        let a3: int32 = succA[bi]
+        let b3: int32 = succB[bi]
         for si in 0..<2:
             let hdr: int32 = (si == 0 ? a3 : b3)
             if hdr < 0 || hdr >= nBlocks:
                 continue
             if bitvecHas(processedHeader, hdr):
                 continue
-            if !bitvecHas(get[int32[]](dom, bi), hdr):
+            if !bitvecHas(dom[bi], hdr):
                 continue
             var loopBits: int32[] = bitvecNew(nBlocks)
             bitvecSet(&loopBits, hdr)
             bitvecSet(&loopBits, bi)
             var stack: int32[]
-            addPtr[int32](&stack, bi)
+            add(stack, bi)
             while stack.len > 0:
-                let n: int32 = get[int32](stack, stack.len - 1)
-                delete[int32](&stack, stack.len - 1)
-                let pList2: int32[] = get[int32[]](preds, n)
+                let n: int32 = stack[stack.len - 1]
+                delete(&stack, stack.len - 1)
+                let pList2: int32[] = preds[n]
                 for pi2 in 0..<pList2.len:
-                    let p2: int32 = get[int32](pList2, pi2)
+                    let p2: int32 = pList2[pi2]
                     if p2 >= 0 && p2 < nBlocks && !bitvecHas(loopBits, p2):
                         bitvecSet(&loopBits, p2)
                         if p2 != hdr:
-                            addPtr[int32](&stack, p2)
+                            add(stack, p2)
 
-            let hdrPreds: int32[] = get[int32[]](preds, hdr)
+            let hdrPreds: int32[] = preds[hdr]
             var pre: int32 = -1
             for pi3 in 0..<hdrPreds.len:
-                let p3: int32 = get[int32](hdrPreds, pi3)
+                let p3: int32 = hdrPreds[pi3]
                 if p3 >= 0 && p3 < nBlocks && !bitvecHas(loopBits, p3):
                     if pre == -1:
                         pre = p3
@@ -667,11 +667,11 @@ fn mirFuncLicm(func: MirFunc): bool =
                         break
             if pre < 0 || pre >= nBlocks:
                 continue
-            let preBlock: MirBlock = get[MirBlock](func.blocks, pre)
-            let hdrBlock: MirBlock = get[MirBlock](func.blocks, hdr)
+            let preBlock: MirBlock = func.blocks[pre]
+            let hdrBlock: MirBlock = func.blocks[hdr]
             if preBlock == nil || hdrBlock == nil:
                 continue
-            if preBlock.term.kind != mtBr || !streq(preBlock.term.target, hdrBlock.label):
+            if preBlock.term.kind != mtBr || !(preBlock.term.target == hdrBlock.label):
                 continue
 
             var defCounts: int32[]
@@ -679,42 +679,42 @@ fn mirFuncLicm(func: MirFunc): bool =
             var modified: int32[] = bitvecNew(slotCount)
             for li in 0..<nBlocks:
                 if bitvecHas(loopBits, li):
-                    let lb: MirBlock = get[MirBlock](func.blocks, li)
+                    let lb: MirBlock = func.blocks[li]
                     if lb != nil:
                         for lsi in 0..<lb.stmts.len:
-                            let st: MirStmt = get[MirStmt](lb.stmts, lsi)
+                            let st: MirStmt = lb.stmts[lsi]
                             if (st.kind == msLet || st.kind == msVar || st.kind == msAssign || st.kind == msParam) &&
                                st.slot >= 0 && st.slot < slotCount:
                                 bitvecSet(&modified, st.slot)
-                                setPtr[int32](&defCounts, st.slot, get[int32](defCounts, st.slot) + 1)
+                                defCounts[st.slot] = defCounts[st.slot] + 1
 
             var hoisted: MirStmt[]
             var newHdrStmts: MirStmt[hdrBlock.stmts.len]
             for hsi in 0..<hdrBlock.stmts.len:
-                let st2: MirStmt = get[MirStmt](hdrBlock.stmts, hsi)
+                let st2: MirStmt = hdrBlock.stmts[hsi]
                 var canHoist: bool = false
                 if (st2.kind == msLet || st2.kind == msVar || st2.kind == msAssign) &&
                    st2.slot >= 0 && st2.slot < slotCount &&
-                   get[int32](defCounts, st2.slot) == 1 &&
+                   defCounts[st2.slot] == 1 &&
                    st2.expr != nil && mirExprIsPure(st2.expr):
                     var used: int32[] = bitvecNew(slotCount)
                     mirExprMarkSlots(st2.expr, &used)
                     canHoist = true
                     for u in 0..<slotCount:
-                        if get[int32](used, u) != 0 && bitvecHas(modified, u):
+                        if used[u] != 0 && bitvecHas(modified, u):
                             canHoist = false
                             break
                 if canHoist:
-                    addPtr[MirStmt](&hoisted, st2)
+                    add(hoisted, st2)
                     any = true
                 else:
-                    addPtr[MirStmt](&newHdrStmts, st2)
+                    add(newHdrStmts, st2)
 
             var modifiedEff: int32[] = modified
             if hoisted.len > 0:
                 modifiedEff = bitvecCopy(modified)
                 for hi in 0..<hoisted.len:
-                    let hs: MirStmt = get[MirStmt](hoisted, hi)
+                    let hs: MirStmt = hoisted[hi]
                     if hs.slot >= 0 && hs.slot < slotCount:
                         bitvecClear(&modifiedEff, hs.slot)
 
@@ -727,15 +727,15 @@ fn mirFuncLicm(func: MirFunc): bool =
             if hoisted.len > 0 || condHoisted.len > 0:
                 var preNew: MirStmt[]
                 for psi in 0..<preBlock.stmts.len:
-                    addPtr[MirStmt](&preNew, get[MirStmt](preBlock.stmts, psi))
+                    add(preNew, preBlock.stmts[psi])
                 for psi in 0..<hoisted.len:
-                    addPtr[MirStmt](&preNew, get[MirStmt](hoisted, psi))
+                    add(preNew, hoisted[psi])
                 for psi in 0..<condHoisted.len:
-                    addPtr[MirStmt](&preNew, get[MirStmt](condHoisted, psi))
+                    add(preNew, condHoisted[psi])
                 preBlock.stmts = preNew
                 hdrBlock.stmts = newHdrStmts
-                setPtr[MirBlock](&func.blocks, pre, preBlock)
-                setPtr[MirBlock](&func.blocks, hdr, hdrBlock)
+                (&func.blocks)[pre] = preBlock
+                (&func.blocks)[hdr] = hdrBlock
             bitvecSet(&processedHeader, hdr)
     return any
 
@@ -743,8 +743,8 @@ fn mirFuncFindBlockIndex(func: MirFunc, label: str): int32 =
     if func == nil || label == nil:
         return -1
     for i in 0..<func.blocks.len:
-        let b: MirBlock = get[MirBlock](func.blocks, i)
-        if b != nil && streq(b.label, label):
+        let b: MirBlock = func.blocks[i]
+        if b != nil && (b.label == label):
             return i
     return -1
 
@@ -770,16 +770,16 @@ fn mirFuncDceStmts(func: MirFunc): bool =
     succB.len = int(nBlocks)
 
     for bi in 0..<nBlocks:
-        setPtr[int32](&succA, bi, -1)
-        setPtr[int32](&succB, bi, -1)
+        succA[bi] = -1
+        succB[bi] = -1
 
-        let block: MirBlock = get[MirBlock](func.blocks, bi)
+        let block: MirBlock = func.blocks[bi]
         var ub: int32[] = bitvecNew(slotCount)
         var db: int32[] = bitvecNew(slotCount)
         var defined: int32[] = bitvecNew(slotCount)
         if block != nil:
             for si in 0..<block.stmts.len:
-                let s: MirStmt = get[MirStmt](block.stmts, si)
+                let s: MirStmt = block.stmts[si]
                 if s.expr != nil:
                     mirExprMarkSlotsUseBeforeDef(s.expr, &ub, defined)
                 if s.addrExpr != nil:
@@ -797,14 +797,14 @@ fn mirFuncDceStmts(func: MirFunc): bool =
 
             if t.kind == mtBr:
                 let a: int32 = mirFuncFindBlockIndex(func, t.target)
-                setPtr[int32](&succA, bi, a)
+                succA[bi] = a
             elif t.kind == mtCbr:
                 let a2: int32 = mirFuncFindBlockIndex(func, t.targetTrue)
                 let b2: int32 = mirFuncFindBlockIndex(func, t.targetFalse)
-                setPtr[int32](&succA, bi, a2)
-                setPtr[int32](&succB, bi, b2)
-        setPtr[int32[]](&useBits, bi, ub)
-        setPtr[int32[]](&defBits, bi, db)
+                succA[bi] = a2
+                succB[bi] = b2
+        useBits[bi] = ub
+        defBits[bi] = db
 
     var liveIn: int32[][]
     liveIn.cap = nBlocks
@@ -813,37 +813,37 @@ fn mirFuncDceStmts(func: MirFunc): bool =
     liveOut.cap = nBlocks
     liveOut.len = nBlocks
     for bi in 0..<nBlocks:
-        setPtr[int32[]](&liveIn, bi, bitvecNew(slotCount))
-        setPtr[int32[]](&liveOut, bi, bitvecNew(slotCount))
+        liveIn[bi] = bitvecNew(slotCount)
+        liveOut[bi] = bitvecNew(slotCount)
 
     var changedAny: bool = false
     while true:
         var changed: bool = false
         for bi in 0..<nBlocks:
             var outBits: int32[] = bitvecNew(slotCount)
-            let s1: int32 = get[int32](succA, bi)
-            let s2: int32 = get[int32](succB, bi)
+            let s1: int32 = succA[bi]
+            let s2: int32 = succB[bi]
             if s1 >= 0 && s1 < nBlocks:
-                bitvecOrInto(&outBits, get[int32[]](liveIn, s1))
+                bitvecOrInto(&outBits, liveIn[s1])
             if s2 >= 0 && s2 < nBlocks:
-                bitvecOrInto(&outBits, get[int32[]](liveIn, s2))
+                bitvecOrInto(&outBits, liveIn[s2])
 
             var outMinusDef: int32[] = bitvecCopy(outBits)
-            let db2: int32[] = get[int32[]](defBits, bi)
+            let db2: int32[] = defBits[bi]
             for si2 in 0..<slotCount:
-                if get[int32](db2, si2) != 0:
-                    setPtr[int32](&outMinusDef, si2, 0)
+                if db2[si2] != 0:
+                    outMinusDef[si2] = 0
 
-            var inBits: int32[] = bitvecCopy(get[int32[]](useBits, bi))
+            var inBits: int32[] = bitvecCopy(useBits[bi])
             bitvecOrInto(&inBits, outMinusDef)
 
-            let prevOut: int32[] = get[int32[]](liveOut, bi)
-            let prevIn: int32[] = get[int32[]](liveIn, bi)
+            let prevOut: int32[] = liveOut[bi]
+            let prevIn: int32[] = liveIn[bi]
             if ! bitvecEq(prevOut, outBits):
-                setPtr[int32[]](&liveOut, bi, outBits)
+                liveOut[bi] = outBits
                 changed = true
             if ! bitvecEq(prevIn, inBits):
-                setPtr[int32[]](&liveIn, bi, inBits)
+                liveIn[bi] = inBits
                 changed = true
         if ! changed:
             break
@@ -851,9 +851,9 @@ fn mirFuncDceStmts(func: MirFunc): bool =
 
     var anyDce: bool = false
     for bi in 0..<nBlocks:
-        let block2: MirBlock = get[MirBlock](func.blocks, bi)
+        let block2: MirBlock = func.blocks[bi]
         if block2 != nil && block2.stmts.len > 0:
-            var live: int32[] = bitvecCopy(get[int32[]](liveOut, bi))
+            var live: int32[] = bitvecCopy(liveOut[bi])
             let t2: MirTerm = block2.term
             if t2.kind == mtRet && t2.retExpr != nil:
                 mirExprMarkSlots(t2.retExpr, &live)
@@ -863,13 +863,13 @@ fn mirFuncDceStmts(func: MirFunc): bool =
             let __for_start_si3 = block2.stmts.len - 1
             for __for_rev_si3 in 0..(__for_start_si3 - (0)):
                 let si3 = __for_start_si3 - __for_rev_si3
-                let s3: MirStmt = get[MirStmt](block2.stmts, si3)
+                let s3: MirStmt = block2.stmts[si3]
                 var isDef: bool = (s3.kind == msLet || s3.kind == msVar || s3.kind == msAssign || s3.kind == msParam)
                 if isDef && s3.slot >= 0 && s3.slot < slotCount && ! bitvecHas(live, s3.slot) &&
                    mirExprIsPure(s3.expr):
                     anyDce = true
                 else:
-                    addPtr[MirStmt](&rev, s3)
+                    add(rev, s3)
                     if isDef && s3.slot >= 0 && s3.slot < slotCount:
                         bitvecClear(&live, s3.slot)
                     if s3.expr != nil:
@@ -882,9 +882,9 @@ fn mirFuncDceStmts(func: MirFunc): bool =
             let __for_start_ri = rev.len - 1
             for __for_rev_ri in 0..(__for_start_ri - (0)):
                 let ri = __for_start_ri - __for_rev_ri
-                addPtr[MirStmt](&newStmts, get[MirStmt](rev, ri))
+                add(newStmts, rev[ri])
             block2.stmts = newStmts
-            setPtr[MirBlock](&func.blocks, bi, block2)
+            (&func.blocks)[bi] = block2
     if anyDce:
         return true
     return changedAny
@@ -894,8 +894,8 @@ fn mirModuleFindFunc(module: MirModule, name: str): MirFunc =
         return nil
     var fallback: MirFunc = nil
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
-        if f != nil && streq(f.name, name):
+        let f: MirFunc = module.funcs[i]
+        if f != nil && (f.name == name):
             if !f.isExtern || f.blocks.len > 0:
                 return f
             if fallback == nil:
@@ -910,7 +910,7 @@ fn mirCanInlineExpr(expr: MirExpr, paramSlots: int32[]): bool =
         return true
     of meLocal:
         for i in 0..<paramSlots.len:
-            if get[int32](paramSlots, i) == expr.localIndex:
+            if paramSlots[i] == expr.localIndex:
                 return true
         return false
     of meBin, meCmp:
@@ -922,7 +922,7 @@ fn mirCanInlineExpr(expr: MirExpr, paramSlots: int32[]): bool =
 
 fn mirArgsAreSafe(args: MirExpr[]): bool =
     for i in 0..<args.len:
-        let a: MirExpr = get[MirExpr](args, i)
+        let a: MirExpr = args[i]
         if a == nil:
             return false
         if a.kind != meConstI64 && a.kind != meLocal:
@@ -954,7 +954,7 @@ fn mirCloneExpr(expr: MirExpr): MirExpr =
     if expr.args.len > 0:
         out.args.cap = expr.args.len
         for i in 0..<expr.args.len:
-            addPtr[MirExpr](&out.args, mirCloneExpr(get[MirExpr](expr.args, i)))
+            add(out.args, mirCloneExpr(expr.args[i]))
     return out
 
 fn mirCloneExprSubst(expr: MirExpr, paramSlots: int32[], args: MirExpr[]): MirExpr =
@@ -964,8 +964,8 @@ fn mirCloneExprSubst(expr: MirExpr, paramSlots: int32[], args: MirExpr[]): MirEx
         for i in 0..<paramSlots.len:
             if ! (i < args.len):
                 break
-            if get[int32](paramSlots, i) == expr.localIndex:
-                return mirCloneExpr(get[MirExpr](args, i))
+            if paramSlots[i] == expr.localIndex:
+                return mirCloneExpr(args[i])
     var out: MirExpr
     new out
     out.kind = expr.kind
@@ -988,7 +988,7 @@ fn mirCloneExprSubst(expr: MirExpr, paramSlots: int32[], args: MirExpr[]): MirEx
     if expr.args.len > 0:
         out.args.cap = expr.args.len
         for j in 0..<expr.args.len:
-            addPtr[MirExpr](&out.args, mirCloneExprSubst(get[MirExpr](expr.args, j), paramSlots, args))
+            add(out.args, mirCloneExprSubst(expr.args[j], paramSlots, args))
     return out
 
 fn mirInlineExpr(module: MirModule, curFunc: MirFunc, expr: MirExpr, changed: bool*): MirExpr =
@@ -1007,24 +1007,24 @@ fn mirInlineExpr(module: MirModule, curFunc: MirFunc, expr: MirExpr, changed: bo
         return expr
     of meCall:
         for ai in 0..<expr.args.len:
-            setPtr[MirExpr](&expr.args, ai, mirInlineExpr(module, curFunc, get[MirExpr](expr.args, ai), changed))
+            (&expr.args)[ai] = mirInlineExpr(module, curFunc, expr.args[ai], changed)
         if module == nil || curFunc == nil:
             return expr
-        if streq(expr.callee, curFunc.name):
+        if (expr.callee == curFunc.name):
             return expr
         let callee: MirFunc = mirModuleFindFunc(module, expr.callee)
         if callee == nil || callee.isExtern:
             return expr
         if callee.blocks.len != 1:
             return expr
-        let b: MirBlock = get[MirBlock](callee.blocks, 0)
+        let b: MirBlock = callee.blocks[0]
         if b == nil || b.term.kind != mtRet || b.term.retExpr == nil:
             return expr
         # Only inline pure return expressions that depend solely on params.
         var paramSlots: int32[callee.params.len]
         for pi in 0..<callee.params.len:
-            let p: MirParam = get[MirParam](callee.params, pi)
-            addPtr[int32](&paramSlots, p.slot)
+            let p: MirParam = callee.params[pi]
+            add(paramSlots, p.slot)
         if ! mirCanInlineExpr(b.term.retExpr, paramSlots):
             return expr
         if expr.args.len != paramSlots.len:
@@ -1043,14 +1043,14 @@ fn mirInlineModuleOnce(module: MirModule): bool =
         return false
     var any: bool = false
     for fi in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, fi)
+        let f: MirFunc = module.funcs[fi]
         if f == nil || f.isExtern:
             continue
         for bi in 0..<f.blocks.len:
-            let b: MirBlock = get[MirBlock](f.blocks, bi)
+            let b: MirBlock = f.blocks[bi]
             if b != nil:
                 for si in 0..<b.stmts.len:
-                    var s: MirStmt = get[MirStmt](b.stmts, si)
+                    var s: MirStmt = b.stmts[si]
                     if s.expr != nil:
                         var ch: bool = false
                         s.expr = mirInlineExpr(module, f, s.expr, &ch)
@@ -1061,19 +1061,19 @@ fn mirInlineModuleOnce(module: MirModule): bool =
                         s.addrExpr = mirInlineExpr(module, f, s.addrExpr, &ch2)
                         if ch2:
                             any = true
-                    setPtr[MirStmt](&b.stmts, si, s)
+                    (&b.stmts)[si] = s
                 if b.term.kind == mtRet && b.term.retExpr != nil:
                     var ch3: bool = false
                     b.term.retExpr = mirInlineExpr(module, f, b.term.retExpr, &ch3)
                     if ch3:
                         any = true
-                    setPtr[MirBlock](&f.blocks, bi, b)
+                    (&f.blocks)[bi] = b
                 elif b.term.kind == mtCbr && b.term.condExpr != nil:
                     var ch4: bool = false
                     b.term.condExpr = mirInlineExpr(module, f, b.term.condExpr, &ch4)
                     if ch4:
                         any = true
-                    setPtr[MirBlock](&f.blocks, bi, b)
+                    (&f.blocks)[bi] = b
     return any
 
 fn mirCollectCallsFromExpr(expr: MirExpr, outNames: str[]*) =
@@ -1081,9 +1081,9 @@ fn mirCollectCallsFromExpr(expr: MirExpr, outNames: str[]*) =
         return
     case expr.kind
     of meCall:
-        addPtr[str](outNames, expr.callee)
+        add(outNames, expr.callee)
         for i in 0..<expr.args.len:
-            mirCollectCallsFromExpr(get[MirExpr](expr.args, i), outNames)
+            mirCollectCallsFromExpr(expr.args[i], outNames)
         return
     of meBin, meCmp:
         mirCollectCallsFromExpr(expr.lhs, outNames)
@@ -1102,18 +1102,18 @@ fn mirPruneUnreachableFuncs(module: MirModule): bool =
     if module == nil:
         return false
     var reachable: str[64]
-    addPtr[str](&reachable, "main")
+    add(reachable, "main")
     for qi in 0..<reachable.len:
-        let name: str = get[str](reachable, qi)
+        let name: str = reachable[qi]
         let f: MirFunc = mirModuleFindFunc(module, name)
         if f == nil:
             continue
         var calls: str[16]
         for bi in 0..<f.blocks.len:
-            let b: MirBlock = get[MirBlock](f.blocks, bi)
+            let b: MirBlock = f.blocks[bi]
             if b != nil:
                 for si in 0..<b.stmts.len:
-                    let s: MirStmt = get[MirStmt](b.stmts, si)
+                    let s: MirStmt = b.stmts[si]
                     mirCollectCallsFromExpr(s.expr, &calls)
                     mirCollectCallsFromExpr(s.addrExpr, &calls)
                 if b.term.kind == mtRet:
@@ -1121,28 +1121,28 @@ fn mirPruneUnreachableFuncs(module: MirModule): bool =
                 elif b.term.kind == mtCbr:
                     mirCollectCallsFromExpr(b.term.condExpr, &calls)
         for ci in 0..<calls.len:
-            let callee: str = get[str](calls, ci)
+            let callee: str = calls[ci]
             var exists: bool = false
             for ri in 0..<reachable.len:
-                if streq(get[str](reachable, ri), callee):
+                if (reachable[ri] == callee):
                     exists = true
                     break
             if !exists:
-                addPtr[str](&reachable, callee)
+                add(reachable, callee)
 
     var changed: bool = false
     let __for_start_fi = module.funcs.len - 1
     for __for_rev_fi in 0..(__for_start_fi - (0)):
         let fi = __for_start_fi - __for_rev_fi
-        let f2: MirFunc = get[MirFunc](module.funcs, fi)
+        let f2: MirFunc = module.funcs[fi]
         var keep: bool = false
         if f2 != nil:
             for ri2 in 0..<reachable.len:
-                if streq(get[str](reachable, ri2), f2.name):
+                if (reachable[ri2] == f2.name):
                     keep = true
                     break
         if !keep:
-            delete[MirFunc](&module.funcs, fi)
+            delete(&module.funcs, fi)
             changed = true
     return changed
 
@@ -1157,15 +1157,15 @@ fn mirOptimizeModule2(module: MirModule): bool =
     if mirOptimizeModule(module):
         any = true
     for i0 in 0..<module.funcs.len:
-        let f0: MirFunc = get[MirFunc](module.funcs, i0)
+        let f0: MirFunc = module.funcs[i0]
         if mirFuncSroa(f0):
             any = true
     for i1 in 0..<module.funcs.len:
-        let f1: MirFunc = get[MirFunc](module.funcs, i1)
+        let f1: MirFunc = module.funcs[i1]
         if mirFuncCse(f1, module):
             any = true
     for i2 in 0..<module.funcs.len:
-        let f2: MirFunc = get[MirFunc](module.funcs, i2)
+        let f2: MirFunc = module.funcs[i2]
         if mirFuncLicm(f2):
             any = true
     if mirOptimizeModule(module):
@@ -1173,7 +1173,7 @@ fn mirOptimizeModule2(module: MirModule): bool =
     if mirPruneUnreachableFuncs(module):
         any = true
     for i in 0..<module.funcs.len:
-        let f: MirFunc = get[MirFunc](module.funcs, i)
+        let f: MirFunc = module.funcs[i]
         if mirFuncDceStmts(f):
             any = true
     return any
