@@ -116,8 +116,35 @@ var
 fn backendSkipGlobalInit(): bool =
     return envIsTrue "CHENG_BACKEND_SKIP_GLOBAL_INIT"
 
+fn backendAllowNoMainByEmit(): bool =
+    let emitMode: str = lowerAscii(backendStripSpaces(os.getEnvDefault("CHENG_BACKEND_EMIT", "")))
+    if emitMode == "obj" || emitMode == "object" || emitMode == "o":
+        return true
+    let outPath: str = backendStripSpaces(os.getEnvDefault("CHENG_BACKEND_OUTPUT", ""))
+    if outPath != nil && len(outPath) >= 2 && outPath[len(outPath) - 2] == '.' && outPath[len(outPath) - 1] == 'o':
+        return true
+    if outPath != nil && len(outPath) >= 4 &&
+       outPath[len(outPath) - 4] == '.' &&
+       (outPath[len(outPath) - 3] == 'o' || outPath[len(outPath) - 3] == 'O') &&
+       (outPath[len(outPath) - 2] == 'b' || outPath[len(outPath) - 2] == 'B') &&
+       (outPath[len(outPath) - 1] == 'j' || outPath[len(outPath) - 1] == 'J'):
+        return true
+    return false
+
 fn mirIsOne(raw: str): bool =
     return raw != nil && len(raw) == 1 && raw[0] == char('1')
+
+fn mirGenericModeNormalized(): str =
+    let raw0: str = lowerAscii(backendStripSpaces(getEnv "CHENG_GENERIC_MODE"))
+    if raw0 == nil || len(raw0) == 0:
+        return "hybrid"
+    return raw0
+
+fn mirShouldSkipMonoPass(): bool =
+    let mode: str = mirGenericModeNormalized()
+    if mode == "dict" || mode == "dictionary":
+        return true
+    return false
 
 fn mirIsOrcMode(mm: str): bool =
     return mm != nil && len(mm) == 3 &&
@@ -176,8 +203,13 @@ fn mirHasDefaultSpawnCall(content: str): bool =
            content[i + 3] == 'w' &&
            content[i + 4] == 'n' &&
            content[i + 5] == '(':
-            if i > 0 && content[i - 1] == '.':
-                continue
+            if i > 0:
+                let prev: char = content[i - 1]
+                if prev == '.' || prev == '_' ||
+                   (prev >= 'a' && prev <= 'z') ||
+                   (prev >= 'A' && prev <= 'Z') ||
+                   (prev >= '0' && prev <= '9'):
+                    continue
             return true
     return false
 
@@ -219,7 +251,12 @@ fn mirStage1StdNoPointerPrecheck(root: Node, inPath: str, diags: var Diagnostic[
     ctx.diags = diags
     ctx.filename = inPath
     var hits: int32 = semCheckStdNoPointerPolicy(ctx, root)
-    if hits <= 0 && mirPathLooksStdModule(inPath) && mirFileLikelyHasPointerSyntax(inPath):
+    # Heuristic fallback must honor std policy exemptions; otherwise internal
+    # bridge modules (explicitly exempt) are rejected in strict bootstrap.
+    if hits <= 0 &&
+       mirPathLooksStdModule(inPath) &&
+       !semIsStdPointerPolicyExempt(inPath) &&
+       mirFileLikelyHasPointerSyntax(inPath):
         hits = 1
     diags = ctx.diags
     if hits > 0:
@@ -235,7 +272,12 @@ fn mirStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Diagnos
     ctx.diags = diags
     ctx.filename = inPath
     var hits: int32 = semCheckNoPointerNonCAbiPolicy(ctx, root)
-    if hits <= 0 && mirFileLikelyHasPointerSyntax(inPath):
+    # Heuristic fallback must use the same scope gate as semantic checks.
+    # Otherwise compiler-internal modules are flagged even when
+    # CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0.
+    if hits <= 0 &&
+       semPointerPolicyShouldCheckNonCAbi(inPath) &&
+       mirFileLikelyHasPointerSyntax(inPath):
         hits = 1
     diags = ctx.diags
     if hits > 0:
@@ -359,14 +401,56 @@ fn mirObjAliasesReset() =
     mirObjAliasNames.cap = 256
     mirObjAliasReady = true
 
+fn mirHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
+    if key == nil || len(key) == 0 || m.mask == 0:
+        found = false
+        return -1
+    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
+        found = false
+        return -1
+    var mask: int32 = int32(m.mask)
+    if mask < 0:
+        found = false
+        return -1
+    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
+        let cap0: int32 = m.states.len
+        if m.keys.len < cap0 || m.vals.len < cap0:
+            found = false
+            return -1
+        mask = cap0 - 1
+    if mask < 0:
+        found = false
+        return -1
+    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
+    var scanned: int32 = 0
+    let __for_start_scanned_compat = scanned
+    for __for_scanned_compat in __for_start_scanned_compat..mask:
+        scanned = __for_scanned_compat
+        let st: uint8 = m.states[probe]
+        if st == uint8(0):
+            found = false
+            return -1
+        if hashmaps.hashMapStrEq(m.keys[probe], key):
+            found = true
+            return m.vals[probe]
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    found = false
+    return -1
+
 fn mirInlineObjFieldTypePut(parentType: str, fieldName: str, objTypeName: str) =
     if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || objTypeName == nil || len(objTypeName) == 0:
         return
+    if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parentType == "ProtoBuffer" && fieldName == "out":
+        echo("[backend] debugOverloadDot: put inline field parent='ProtoBuffer' field='out' objType='" + objTypeName + "'")
     if !mirInlineObjFieldTypeReady:
         mirInlineObjFieldTypesReset()
     let key: str = parentType + "::" + fieldName
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirInlineObjFieldTypeIndex, key, found)
+    let idx: int32 = mirHashMapStrIntGetCompat(mirInlineObjFieldTypeIndex, key, found)
+    if idx >= 0 && idx < mirInlineObjFieldTypeNames.len:
+        mbWriteStr(&mirInlineObjFieldTypeNames, idx, objTypeName)
+        return
     if found:
         if idx >= 0 && idx < mirInlineObjFieldTypeNames.len:
             mbWriteStr(&mirInlineObjFieldTypeNames, idx, objTypeName)
@@ -380,8 +464,8 @@ fn mirInlineObjFieldTypeGet(parentType: str, fieldName: str): str =
         return ""
     let key: str = parentType + "::" + fieldName
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirInlineObjFieldTypeIndex, key, found)
-    if !found || idx < 0 || idx >= mirInlineObjFieldTypeNames.len:
+    let idx: int32 = mirHashMapStrIntGetCompat(mirInlineObjFieldTypeIndex, key, found)
+    if idx < 0 || idx >= mirInlineObjFieldTypeNames.len:
         return ""
     return mbRead(mirInlineObjFieldTypeNames, idx)
 
@@ -392,7 +476,10 @@ fn mirObjFieldTypeKeyPut(parentType: str, fieldName: str, fieldTypeKey: str) =
         mirObjFieldTypeKeysReset()
     let key: str = parentType + "::" + fieldName
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirObjFieldTypeKeyIndex, key, found)
+    let idx: int32 = mirHashMapStrIntGetCompat(mirObjFieldTypeKeyIndex, key, found)
+    if idx >= 0 && idx < mirObjFieldTypeKeyNames.len:
+        mbWriteStr(&mirObjFieldTypeKeyNames, idx, fieldTypeKey)
+        return
     if found:
         if idx >= 0 && idx < mirObjFieldTypeKeyNames.len:
             mbWriteStr(&mirObjFieldTypeKeyNames, idx, fieldTypeKey)
@@ -406,8 +493,12 @@ fn mirObjFieldTypeKeyGet(parentType: str, fieldName: str): str =
         return ""
     let key: str = parentType + "::" + fieldName
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirObjFieldTypeKeyIndex, key, found)
-    if !found || idx < 0 || idx >= mirObjFieldTypeKeyNames.len:
+    let idx: int32 = mirHashMapStrIntGetCompat(mirObjFieldTypeKeyIndex, key, found)
+    if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parentType == "ProtoBuffer" && fieldName == "out":
+        let foundCompat: bool = idx >= 0
+        echo("[backend] debugOverloadDot: keyGetCompat key='" + key + "' found=" + (foundCompat ? "1" : "0") +
+             " idx=" + intToStr(idx) + " namesLen=" + intToStr(mirObjFieldTypeKeyNames.len))
+    if idx < 0 || idx >= mirObjFieldTypeKeyNames.len:
         return ""
     return mbRead(mirObjFieldTypeKeyNames, idx)
 
@@ -418,8 +509,8 @@ fn mirTupleFieldIndexPut(tupleKey: str, fieldName: str, idx0: int32) =
         mirTupleFieldIndicesReset()
     let key: str = tupleKey + "::" + fieldName
     var found: bool = false
-    let existing: int32 = hashmaps.hashMapStrIntGet(mirTupleFieldIndex, key, found)
-    if found:
+    let existing: int32 = mirHashMapStrIntGetCompat(mirTupleFieldIndex, key, found)
+    if existing >= 0:
         # Structural tuple types may share the same key without field labels. If a label maps to
         # different indices, treat it as ambiguous.
         if existing != idx0 && existing != -2:
@@ -432,8 +523,8 @@ fn mirTupleFieldIndexGet(tupleKey: str, fieldName: str): int32 =
         return -1
     let key: str = tupleKey + "::" + fieldName
     var found: bool = false
-    let v: int32 = hashmaps.hashMapStrIntGet(mirTupleFieldIndex, key, found)
-    if !found:
+    let v: int32 = mirHashMapStrIntGetCompat(mirTupleFieldIndex, key, found)
+    if v < 0:
         return -1
     return v
 
@@ -443,7 +534,10 @@ fn mirGlobalObjTypePut(name: str, objTypeName: str) =
     if !mirGlobalObjTypeReady:
         mirGlobalObjTypesReset()
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirGlobalObjTypeIndex, name, found)
+    let idx: int32 = mirHashMapStrIntGetCompat(mirGlobalObjTypeIndex, name, found)
+    if idx >= 0 && idx < mirGlobalObjTypeNames.len:
+        mbWriteStr(&mirGlobalObjTypeNames, idx, objTypeName)
+        return
     if found:
         if idx >= 0 && idx < mirGlobalObjTypeNames.len:
             mbWriteStr(&mirGlobalObjTypeNames, idx, objTypeName)
@@ -456,8 +550,8 @@ fn mirGlobalObjTypeGet(name: str): str =
     if name == nil || len(name) == 0 || !mirGlobalObjTypeReady:
         return ""
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirGlobalObjTypeIndex, name, found)
-    if !found || idx < 0 || idx >= mirGlobalObjTypeNames.len:
+    let idx: int32 = mirHashMapStrIntGetCompat(mirGlobalObjTypeIndex, name, found)
+    if idx < 0 || idx >= mirGlobalObjTypeNames.len:
         return ""
     return mbRead(mirGlobalObjTypeNames, idx)
 
@@ -470,7 +564,10 @@ fn mirGlobalTypeKeyPut(name: str, typeKey0: str) =
     if typeKey == nil || len(typeKey) == 0:
         return
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirGlobalTypeKeyIndex, name, found)
+    let idx: int32 = mirHashMapStrIntGetCompat(mirGlobalTypeKeyIndex, name, found)
+    if idx >= 0 && idx < mirGlobalTypeKeyNames.len:
+        mbWriteStr(&mirGlobalTypeKeyNames, idx, typeKey)
+        return
     if found:
         if idx >= 0 && idx < mirGlobalTypeKeyNames.len:
             mbWriteStr(&mirGlobalTypeKeyNames, idx, typeKey)
@@ -483,8 +580,8 @@ fn mirGlobalTypeKeyGet(name: str): str =
     if name == nil || len(name) == 0 || !mirGlobalTypeKeyReady:
         return ""
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirGlobalTypeKeyIndex, name, found)
-    if !found || idx < 0 || idx >= mirGlobalTypeKeyNames.len:
+    let idx: int32 = mirHashMapStrIntGetCompat(mirGlobalTypeKeyIndex, name, found)
+    if idx < 0 || idx >= mirGlobalTypeKeyNames.len:
         return ""
     return mbRead(mirGlobalTypeKeyNames, idx)
 
@@ -500,7 +597,10 @@ fn mirObjAliasPut(aliasName0: str, targetName0: str) =
     if (aliasName == targetName):
         return
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirObjAliasIndex, aliasName, found)
+    let idx: int32 = mirHashMapStrIntGetCompat(mirObjAliasIndex, aliasName, found)
+    if idx >= 0 && idx < mirObjAliasNames.len:
+        mbWriteStr(&mirObjAliasNames, idx, targetName)
+        return
     if found:
         if idx >= 0 && idx < mirObjAliasNames.len:
             mbWriteStr(&mirObjAliasNames, idx, targetName)
@@ -516,8 +616,8 @@ fn mirObjAliasGet(aliasName0: str): str =
     if aliasName == nil || len(aliasName) == 0:
         return ""
     var found: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGet(mirObjAliasIndex, aliasName, found)
-    if !found || idx < 0 || idx >= mirObjAliasNames.len:
+    let idx: int32 = mirHashMapStrIntGetCompat(mirObjAliasIndex, aliasName, found)
+    if idx < 0 || idx >= mirObjAliasNames.len:
         return ""
     return mbRead(mirObjAliasNames, idx)
 
@@ -644,8 +744,9 @@ fn mirComputeDuplicateFnBases(root: Node, overloaded: hashsets.HashSetStr* = nil
     var dup: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
     if root == nil:
         return dup
-    var counts: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
-    var queue: Node[1024]
+    var seenNames: str[]
+    var seenCounts: int32[]
+    var queue: Node[]
     add(queue, root)
     while queue.len > 0:
         let n: Node = mbRead(queue, queue.len - 1)
@@ -673,13 +774,19 @@ fn mirComputeDuplicateFnBases(root: Node, overloaded: hashsets.HashSetStr* = nil
             continue
         if overloaded != nil && hashsets.hashSetStrHas(*overloaded, rawName):
             continue
-        var found: bool = false
-        let cur0: int32 = hashmaps.hashMapStrIntGet(counts, rawName, found)
-        let cur: int32 = found ? cur0 : 0
-        let next: int32 = cur + 1
-        hashmaps.hashMapStrIntPut(counts, rawName, next)
-        if next > 1:
-            hashsets.hashSetStrAdd(dup, rawName)
+        var idx: int32 = -1
+        for ci in 0..<seenNames.len:
+            if seenNames[ci] == rawName:
+                idx = ci
+                break
+        if idx < 0:
+            add(seenNames, rawName)
+            add(seenCounts, 1)
+        else:
+            let next: int32 = seenCounts[idx] + 1
+            seenCounts[idx] = next
+            if next > 1:
+                hashsets.hashSetStrAdd(dup, rawName)
     return dup
 
 fn mirDupGlobalNamesReset() =
@@ -706,8 +813,9 @@ fn mirComputeDuplicateGlobalNames(root: Node): hashsets.HashSetStr =
     var dup: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
     if root == nil:
         return dup
-    var counts: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
-    var queue: Node[1024]
+    var seenNames: str[]
+    var seenCounts: int32[]
+    var queue: Node[]
     add(queue, root)
     while queue.len > 0:
         let n: Node = mbRead(queue, queue.len - 1)
@@ -731,13 +839,19 @@ fn mirComputeDuplicateGlobalNames(root: Node): hashsets.HashSetStr =
         let rawName: str = backendStripSpaces(plainName(nameNode))
         if rawName == nil || len(rawName) == 0:
             continue
-        var found: bool = false
-        let cur0: int32 = hashmaps.hashMapStrIntGet(counts, rawName, found)
-        let cur: int32 = found ? cur0 : 0
-        let next: int32 = cur + 1
-        hashmaps.hashMapStrIntPut(counts, rawName, next)
-        if next > 1:
-            hashsets.hashSetStrAdd(dup, rawName)
+        var idx: int32 = -1
+        for ci in 0..<seenNames.len:
+            if seenNames[ci] == rawName:
+                idx = ci
+                break
+        if idx < 0:
+            add(seenNames, rawName)
+            add(seenCounts, 1)
+        else:
+            let next: int32 = seenCounts[idx] + 1
+            seenCounts[idx] = next
+            if next > 1:
+                hashsets.hashSetStrAdd(dup, rawName)
     return dup
 
 fn blockBuilderNew(env: LocalEnv, module: MirModule, func: MirFunc): BlockBuilder =
@@ -1195,6 +1309,12 @@ fn typeNodeObjTypeName(module: MirModule, typeNode: Node): str =
         # stdlib `tables.Table[V]` has a stable layout; instantiations share builtin `Table`.
         if mirStrStartsWith(nm, "Table_") && mirHasObjType(module, "Table"):
             return "Table"
+        if mirStrStartsWith(nm, "SeqUninit_") && ensureSeqUninitObjType(module, nm):
+            return nm
+        if mirStrStartsWith(nm, "Option_") && ensureOptionObjType(module, nm):
+            return nm
+        if mirStrStartsWith(nm, "Result_") && ensureResultObjType(module, nm):
+            return nm
         if mirStrStartsWith(nm, "__cheng_tables_Entry_"):
             if ensureTablesEntryObjType(module, nm):
                 return nm
@@ -1219,6 +1339,12 @@ fn typeNodeObjTypeName(module: MirModule, typeNode: Node): str =
                 if (nm3 == "array"):
                     if ensureArrayObjTypeFromTypeExpr(module, typeNode, instName):
                         return instName
+                if (nm3 == "SeqUninit") && ensureSeqUninitObjType(module, instName):
+                    return instName
+                if (nm3 == "Option") && ensureOptionObjType(module, instName):
+                    return instName
+                if (nm3 == "Result") && ensureResultObjType(module, instName):
+                    return instName
                 if mirHasObjType(module, instName):
                     return instName
                 if (nm3 == "__cheng_tables_Entry") && ensureTablesEntryObjType(module, instName):
@@ -1267,6 +1393,12 @@ fn typeNodeIsObjValue(module: MirModule, typeNode: Node): bool =
             return true
         if mirStrStartsWith(nm, "Table_") && mirHasObjType(module, "Table"):
             return true
+        if mirStrStartsWith(nm, "SeqUninit_") && ensureSeqUninitObjType(module, nm):
+            return true
+        if mirStrStartsWith(nm, "Option_") && ensureOptionObjType(module, nm):
+            return true
+        if mirStrStartsWith(nm, "Result_") && ensureResultObjType(module, nm):
+            return true
         if mirStrStartsWith(nm, "__cheng_tables_Entry_"):
             return ensureTablesEntryObjType(module, nm)
         return false
@@ -1288,6 +1420,12 @@ fn typeNodeIsObjValue(module: MirModule, typeNode: Node): bool =
             if instArgs.len > 0:
                 let instName: str = mangleInstance(nm2, instArgs)
                 if (nm2 == "array") && ensureArrayObjTypeFromTypeExpr(module, typeNode, instName):
+                    return true
+                if (nm2 == "SeqUninit") && ensureSeqUninitObjType(module, instName):
+                    return true
+                if (nm2 == "Option") && ensureOptionObjType(module, instName):
+                    return true
+                if (nm2 == "Result") && ensureResultObjType(module, instName):
                     return true
                 if mirHasObjType(module, instName):
                     return true
@@ -1324,32 +1462,64 @@ fn ensureBuiltinObjTypes(module: MirModule) =
         mirAddObjType(module, ot)
     if ! mirHasObjType(module, "Table"):
         # stdlib `tables.Table[V]` (generic) has a stable layout independent of V:
-        #   slots: seq[void*]  (inlined as slots.len/cap/buffer)
+        #   keys: seq[str]      (inlined as keys.len/cap/buffer)
+        #   vals: seq[V]        (inlined as vals.len/cap/buffer)
+        #   states: seq[uint8]  (inlined as states.len/cap/buffer)
         #   len: int32
         var fields2: MirObjField[]
         var f0: MirObjField
-        f0.name = "slots.len"
+        f0.name = "keys.len"
         f0.ty = mirTypeI32()
         f0.offset = 0
         add(fields2, f0)
         var f1: MirObjField
-        f1.name = "slots.cap"
+        f1.name = "keys.cap"
         f1.ty = mirTypeI32()
         f1.offset = 4
         add(fields2, f1)
         var f2: MirObjField
-        f2.name = "slots.buffer"
+        f2.name = "keys.buffer"
         f2.ty = mirTypeI64()
         f2.offset = 8
         add(fields2, f2)
         var f3: MirObjField
-        f3.name = "len"
+        f3.name = "vals.len"
         f3.ty = mirTypeI32()
         f3.offset = 16
         add(fields2, f3)
+        var f4: MirObjField
+        f4.name = "vals.cap"
+        f4.ty = mirTypeI32()
+        f4.offset = 20
+        add(fields2, f4)
+        var f5: MirObjField
+        f5.name = "vals.buffer"
+        f5.ty = mirTypeI64()
+        f5.offset = 24
+        add(fields2, f5)
+        var f6: MirObjField
+        f6.name = "states.len"
+        f6.ty = mirTypeI32()
+        f6.offset = 32
+        add(fields2, f6)
+        var f7: MirObjField
+        f7.name = "states.cap"
+        f7.ty = mirTypeI32()
+        f7.offset = 36
+        add(fields2, f7)
+        var f8: MirObjField
+        f8.name = "states.buffer"
+        f8.ty = mirTypeI64()
+        f8.offset = 40
+        add(fields2, f8)
+        var f9: MirObjField
+        f9.name = "len"
+        f9.ty = mirTypeI32()
+        f9.offset = 48
+        add(fields2, f9)
         var ot2: MirObjType
         ot2.name = "Table"
-        ot2.size = 24
+        ot2.size = 56
         ot2.alignPow2 = 3
         ot2.fields = fields2
         mirAddObjType(module, ot2)
@@ -1398,6 +1568,178 @@ fn ensureTablesEntryObjType(module: MirModule, entryName: str): bool =
     mirAddObjType(module, ot)
     return true
 
+fn ensureOptionObjType(module: MirModule, optionName: str): bool =
+    if module == nil || optionName == nil || len(optionName) == 0:
+        return false
+    if mirHasObjType(module, optionName):
+        return true
+    let prefix: str = "Option_"
+    if !mirStrStartsWith(optionName, prefix):
+        return false
+    let valKey: str = str(ptr_add(void*(optionName), len(prefix)))
+    if valKey == nil || len(valKey) == 0:
+        return false
+    if !isBuiltinTypeName(valKey) && !mirHasObjType(module, valKey):
+        let aliasTyCheck: MirType = mirTryGetTypeAlias(module, valKey)
+        if aliasTyCheck.kind == mtVoid:
+            return false
+    var fields: MirObjField[]
+    var f0: MirObjField
+    f0.name = "has"
+    f0.ty = mirTypeU8()
+    f0.offset = 0
+    add(fields, f0)
+    var maxAlignPow2: int32 = 0
+    var offset: int32 = 1
+    if mirHasObjType(module, valKey):
+        let inner: MirObjType = mirGetObjType(module, valKey)
+        if inner.size <= 0 || inner.fields.len == 0:
+            return false
+        let alignPow2: int32 = inner.alignPow2
+        if alignPow2 > maxAlignPow2:
+            maxAlignPow2 = alignPow2
+        offset = alignUpPow2(offset, alignPow2)
+        for fi in 0..<inner.fields.len:
+            let innerF: MirObjField = inner.fields[fi]
+            var f: MirObjField
+            f.name = "value." + innerF.name
+            f.ty = innerF.ty
+            f.offset = offset + innerF.offset
+            add(fields, f)
+        offset = offset + inner.size
+        mirInlineObjFieldTypePut(optionName, "value", valKey)
+    else:
+        let pos: SourcePos = zeroPos()
+        let valTypeNode: Node = newIdent(valKey, pos)
+        let valTy: MirType = mirTypeFromNodeWithModule(module, valTypeNode)
+        let valSize: int32 = mirTypeSize(valTy)
+        if valSize <= 0:
+            return false
+        let valAlignPow2: int32 = mirTypeAlignPow2(valTy)
+        if valAlignPow2 > maxAlignPow2:
+            maxAlignPow2 = valAlignPow2
+        offset = alignUpPow2(offset, valAlignPow2)
+        var f1: MirObjField
+        f1.name = "value"
+        f1.ty = valTy
+        f1.offset = offset
+        add(fields, f1)
+        offset = offset + valSize
+    var ot: MirObjType
+    ot.name = optionName
+    ot.alignPow2 = maxAlignPow2
+    ot.size = alignUpPow2(offset, maxAlignPow2)
+    ot.fields = fields
+    mirAddObjType(module, ot)
+    return true
+
+fn ensureResultObjType(module: MirModule, resultName: str): bool =
+    if module == nil || resultName == nil || len(resultName) == 0:
+        return false
+    if mirHasObjType(module, resultName):
+        return true
+    let prefix: str = "Result_"
+    if !mirStrStartsWith(resultName, prefix):
+        return false
+    let valKey: str = str(ptr_add(void*(resultName), len(prefix)))
+    if valKey == nil || len(valKey) == 0:
+        return false
+
+    var errObjName: str = "ErrorInfo"
+    if !mirHasObjType(module, errObjName):
+        let errCanon: str = mirObjAliasCanon(errObjName)
+        if errCanon != nil && len(errCanon) > 0 && mirHasObjType(module, errCanon):
+            errObjName = errCanon
+    if !mirHasObjType(module, errObjName):
+        return false
+    let errObj: MirObjType = mirGetObjType(module, errObjName)
+    if errObj.size <= 0 || errObj.fields.len == 0:
+        return false
+
+    var fields: MirObjField[]
+    var maxAlignPow2: int32 = 0
+    var offset: int32 = 0
+
+    var f0: MirObjField
+    f0.name = "ok"
+    f0.ty = mirTypeU8()
+    f0.offset = 0
+    add(fields, f0)
+    let okAlign: int32 = mirTypeAlignPow2(f0.ty)
+    if okAlign > maxAlignPow2:
+        maxAlignPow2 = okAlign
+    offset = 1
+
+    var valObjName: str = ""
+    if mirHasObjType(module, valKey):
+        valObjName = valKey
+    else:
+        let valCanon: str = mirObjAliasCanon(valKey)
+        if valCanon != nil && len(valCanon) > 0 && mirHasObjType(module, valCanon):
+            valObjName = valCanon
+    let valAliasTy: MirType = mirTryGetTypeAlias(module, valKey)
+    let inlineValObj: bool = valObjName != nil && len(valObjName) > 0 && valAliasTy.kind == mtVoid
+    mirObjFieldTypeKeyPut(resultName, "value", valKey)
+    if inlineValObj:
+        let inner: MirObjType = mirGetObjType(module, valObjName)
+        if inner.size <= 0 || inner.fields.len == 0:
+            return false
+        let alignPow2: int32 = inner.alignPow2
+        if alignPow2 > maxAlignPow2:
+            maxAlignPow2 = alignPow2
+        offset = alignUpPow2(offset, alignPow2)
+        for fi in 0..<inner.fields.len:
+            let innerF: MirObjField = inner.fields[fi]
+            var f: MirObjField
+            f.name = "value." + innerF.name
+            f.ty = innerF.ty
+            f.offset = offset + innerF.offset
+            add(fields, f)
+        offset = offset + inner.size
+        mirInlineObjFieldTypePut(resultName, "value", valObjName)
+    else:
+        var valTy: MirType
+        if valAliasTy.kind != mtVoid:
+            valTy = valAliasTy
+        else:
+            valTy = mirTypeFromTypeKeyName(valKey)
+        let valSize: int32 = mirTypeSize(valTy)
+        if valSize <= 0:
+            return false
+        let valAlignPow2: int32 = mirTypeAlignPow2(valTy)
+        if valAlignPow2 > maxAlignPow2:
+            maxAlignPow2 = valAlignPow2
+        offset = alignUpPow2(offset, valAlignPow2)
+        var f1: MirObjField
+        f1.name = "value"
+        f1.ty = valTy
+        f1.offset = offset
+        add(fields, f1)
+        offset = offset + valSize
+
+    mirObjFieldTypeKeyPut(resultName, "err", errObjName)
+    let errAlignPow2: int32 = errObj.alignPow2
+    if errAlignPow2 > maxAlignPow2:
+        maxAlignPow2 = errAlignPow2
+    offset = alignUpPow2(offset, errAlignPow2)
+    for ei in 0..<errObj.fields.len:
+        let errF: MirObjField = errObj.fields[ei]
+        var ef: MirObjField
+        ef.name = "err." + errF.name
+        ef.ty = errF.ty
+        ef.offset = offset + errF.offset
+        add(fields, ef)
+    offset = offset + errObj.size
+    mirInlineObjFieldTypePut(resultName, "err", errObjName)
+
+    var ot: MirObjType
+    ot.name = resultName
+    ot.alignPow2 = maxAlignPow2
+    ot.size = alignUpPow2(offset, maxAlignPow2)
+    ot.fields = fields
+    mirAddObjType(module, ot)
+    return true
+
 fn tryResolveArrayCount(module: MirModule, n0: Node): int32 =
     if module == nil || n0 == nil:
         return -1
@@ -1416,6 +1758,105 @@ fn tryResolveArrayCount(module: MirModule, n0: Node): int32 =
             if g.hasInit:
                 return int32(g.init)
     return -1
+
+fn ensureArrayObjTypeFromElemKey(module: MirModule, arrName: str, elemKey0: str, count: int32): bool =
+    if module == nil || arrName == nil || len(arrName) == 0 || elemKey0 == nil || len(elemKey0) == 0 || count <= 0:
+        return false
+    if mirHasObjType(module, arrName):
+        return true
+    let elemKey: str = backendStripSpaces(elemKey0)
+    if elemKey == nil || len(elemKey) == 0:
+        return false
+    let elemObjName: str = mirObjTypeFromTypeKey(module, elemKey)
+    var elemTy: MirType = mirTypeFromTypeKeyName(elemKey)
+    if elemObjName != nil && len(elemObjName) > 0:
+        if !mirHasObjType(module, elemObjName):
+            return false
+        elemTy = mirTypeI64()
+    else:
+        let aliasTy: MirType = mirTryGetTypeAlias(module, elemKey)
+        if !isBuiltinTypeName(elemKey) && aliasTy.kind == mtVoid:
+            return false
+        if aliasTy.kind != mtVoid:
+            elemTy = aliasTy
+    let elemSize: int32 = mirTypeSize(elemTy)
+    if elemSize <= 0:
+        return false
+    let elemAlignPow2: int32 = mirTypeAlignPow2(elemTy)
+    let stride: int32 = alignUpPow2(elemSize, elemAlignPow2)
+    if stride <= 0:
+        return false
+    var fields: MirObjField[]
+    var off: int32 = 0
+    for i in 0..<count:
+        var f: MirObjField
+        f.name = "e" + intToStr(i)
+        f.ty = elemTy
+        f.offset = off
+        add(fields, f)
+        off = off + stride
+    var ot: MirObjType
+    ot.name = arrName
+    ot.alignPow2 = elemAlignPow2
+    ot.size = alignUpPow2(off, elemAlignPow2)
+    ot.fields = fields
+    mirAddObjType(module, ot)
+    return true
+
+fn ensureSeqUninitObjType(module: MirModule, seqName0: str): bool =
+    if module == nil || seqName0 == nil || len(seqName0) == 0:
+        return false
+    let seqName: str = backendStripSpaces(seqName0)
+    if seqName == nil || len(seqName) == 0 || !mirStrStartsWith(seqName, "SeqUninit_"):
+        return false
+    if mirHasObjType(module, seqName):
+        return true
+    let elemKey: str = str(ptr_add(void*(seqName), 10))
+    if elemKey == nil || len(elemKey) == 0:
+        return false
+    let seqCap: int32 = 256
+    let itemsObjName: str = "array_" + intToStr(seqCap) + "_" + elemKey
+    if !ensureArrayObjTypeFromElemKey(module, itemsObjName, elemKey, seqCap):
+        return false
+    let itemsObj: MirObjType = mirGetObjType(module, itemsObjName)
+    if itemsObj.name == nil || len(itemsObj.name) == 0 || itemsObj.size <= 0:
+        return false
+
+    var fields: MirObjField[]
+    var maxAlignPow2: int32 = 0
+
+    let countTy: MirType = mirTypeI32()
+    let countAlignPow2: int32 = mirTypeAlignPow2(countTy)
+    var countField: MirObjField
+    countField.name = "count"
+    countField.ty = countTy
+    countField.offset = 0
+    add(fields, countField)
+    mirObjFieldTypeKeyPut(seqName, "count", "int32")
+    if countAlignPow2 > maxAlignPow2:
+        maxAlignPow2 = countAlignPow2
+
+    let itemsAlignPow2: int32 = itemsObj.alignPow2
+    if itemsAlignPow2 > maxAlignPow2:
+        maxAlignPow2 = itemsAlignPow2
+    let itemsBaseOff: int32 = alignUpPow2(4, itemsAlignPow2)
+    for fi in 0..<itemsObj.fields.len:
+        let innerF: MirObjField = itemsObj.fields[fi]
+        var f: MirObjField
+        f.name = "items." + innerF.name
+        f.ty = innerF.ty
+        f.offset = itemsBaseOff + innerF.offset
+        add(fields, f)
+    mirObjFieldTypeKeyPut(seqName, "items", itemsObjName)
+    mirInlineObjFieldTypePut(seqName, "items", itemsObjName)
+
+    var ot: MirObjType
+    ot.name = seqName
+    ot.alignPow2 = maxAlignPow2
+    ot.size = alignUpPow2(itemsBaseOff + itemsObj.size, maxAlignPow2)
+    ot.fields = fields
+    mirAddObjType(module, ot)
+    return true
 
 fn ensureArrayObjTypeFromTypeExpr(module: MirModule, arrType: Node, arrName: str): bool =
     if module == nil || arrType == nil || arrName == nil || len(arrName) == 0:
@@ -1750,8 +2191,8 @@ fn mirComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
     # but different signatures. The MIR module requires globally-unique function symbols,
     # so we precompute which base names are overloaded.
     var overloaded: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
-    var firstSigIdx: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
-    var sigs: str[256]
+    var seenNames: str[]
+    var firstSigs: str[]
 
     var queue: Node[256]
     add(queue, root)
@@ -1773,6 +2214,8 @@ fn mirComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
             continue
         let rawName: str = backendStripSpaces(plainName(nameNode))
         let baseId: str = rawName
+        if baseId == nil || len(baseId) == 0:
+            continue
 
         let paramsNode: Node = kid(n, 1)
         var paramKeys: str[]
@@ -1790,15 +2233,17 @@ fn mirComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
             retKey = typeKey(retNode)
         let sigId: str = mirFuncSigId(retKey, paramKeys)
 
-        var found: bool = false
-        let prevIdx: int32 = hashmaps.hashMapStrIntGet(firstSigIdx, baseId, found)
-        if !found:
-            let idx: int32 = sigs.len
-            add(sigs, sigId)
-            hashmaps.hashMapStrIntPut(firstSigIdx, baseId, idx)
+        var prevIdx: int32 = -1
+        for si in 0..<seenNames.len:
+            if seenNames[si] == baseId:
+                prevIdx = si
+                break
+        if prevIdx < 0:
+            add(seenNames, baseId)
+            add(firstSigs, sigId)
             continue
-        if prevIdx >= 0 && prevIdx < sigs.len:
-            let prevSig: str = sigs[prevIdx]
+        if prevIdx < firstSigs.len:
+            let prevSig: str = firstSigs[prevIdx]
             if !(prevSig == sigId):
                 hashsets.hashSetStrAdd(overloaded, baseId)
     return overloaded
@@ -1808,9 +2253,9 @@ fn mirMaybeEnqueueMissingRoutine(mod: MirModule, declIndex: hashmaps.HashMapStrI
     if mod == nil || seen == nil || queue == nil || name0 == nil || len(name0) == 0:
         return
     trackLexString void*(name0)
-    var inProgram: bool = false
-    hashmaps.hashMapStrIntGet(declIndex, name0, inProgram)
-    if !inProgram:
+    var foundDecl: bool = false
+    let _declIdx: int32 = mirHashMapStrIntGetCompat(declIndex, name0, foundDecl)
+    if !foundDecl || _declIdx < 0:
         return
     if moduleHasFunc(mod, name0):
         return
@@ -1939,7 +2384,7 @@ fn mirBuildMissingRoutinesFromMir(mod: MirModule, root: Node, overloaded: hashse
         if hashsets.hashSetStrHas(existingFuncs, nm):
             continue
         var found: bool = false
-        let idx: int32 = hashmaps.hashMapStrIntGet(declIndex, nm, found)
+        let idx: int32 = mirHashMapStrIntGetCompat(declIndex, nm, found)
         if !found || idx < 0 || idx >= declNodes.len:
             continue
         let n: Node = declNodes[idx]
@@ -2324,6 +2769,13 @@ fn mirTypeFromTypeKeyName(key0: str): MirType =
         return mirTypeU64()
     return mirTypeI64()
 
+fn mirLooksLikeTypeParamName(name0: str): bool =
+    let name: str = backendStripSpaces(name0)
+    if name == nil || len(name) != 1:
+        return false
+    let c: char = name[0]
+    return c >= 'A' && c <= 'Z'
+
 fn mirSizeOfTypeNode(module: MirModule, typeNode: Node): Result[int32] =
     if typeNode == nil || typeNode.kind == nkEmpty:
         return Err[int32]("mir_builder: sizeof expects a type/expression")
@@ -2377,6 +2829,10 @@ fn mirSizeOfTypeNode(module: MirModule, typeNode: Node): Result[int32] =
         if module != nil && mirHasObjType(module, nm):
             let ot2: MirObjType = mirGetObjType(module, nm)
             return Ok[int32](ot2.size)
+        # Skip-mono gate compiles keep some generic helpers uninstantiated.
+        # Treat single-letter generic params (`T`/`V`/`K`) as pointer-sized.
+        if mirShouldSkipMonoPass() && mirLooksLikeTypeParamName(nm):
+            return Ok[int32](8)
         let line2: str = intToStr(typeNode.pos.line)
         let col2: str = intToStr(typeNode.pos.col)
         return Err[int32]("mir_builder: sizeof unknown type '" + nm + "' @" + line2 + ":" + col2)
@@ -2516,16 +2972,16 @@ fn moduleGlobalIndex(module: MirModule, name: str): int32 =
         mir_ensureGlobalIndexCache(module)
         if mir_globalIndex_cache_ready && mir_globalIndex_cache_module == module:
             var found: bool = false
-            let idx: int32 = hashmaps.hashMapStrIntGet(mir_globalIndex_cache, name, found)
-            if !found:
-                return -1
-            if idx >= 0 && idx < module.globals.len:
+            let idx: int32 = mirHashMapStrIntGetCompat(mir_globalIndex_cache, name, found)
+            if found && idx >= 0 && idx < module.globals.len:
                 let g0: MirGlobal = module.globals[idx]
                 if (g0.name == name):
                     return idx
     for i in 0..<module.globals.len:
         let g: MirGlobal = module.globals[i]
         if (g.name == name):
+            if mir_globalIndex_cache_ready && mir_globalIndex_cache_module == module:
+                hashmaps.hashMapStrIntPut(mir_globalIndex_cache, name, i)
             return i
     return -1
 
@@ -2646,12 +3102,107 @@ fn emitObjDefaultInit(b: BlockBuilder, slot: int32, objTypeName: str): Result[bo
         if f.offset != 0:
             addr = mirBin(mbAdd, basePtr, mirConstI64(int64(f.offset)))
         add(b.currentStmts, mirStmtStore(addr, mirConstI64(0), f.ty))
+    let seqFixedRes: Result[bool] = emitObjInlineSeqFixedReserveInitToPtr(b, mirLocal(slot), objTypeName, ot)
+    if !IsOk[bool](seqFixedRes):
+        return ErrInfo[bool](ErrorInfoOf[bool](seqFixedRes))
     return Ok[bool](false)
 
 type
     SeqFixedInit =
         elemType: Node
         capExpr: Node
+
+fn seqFixedParseCapDigits(raw0: str): int32 =
+    let raw: str = backendStripSpaces(raw0)
+    if raw == nil || len(raw) == 0:
+        return -1
+    var cap: int32 = 0
+    for i in 0..<len(raw):
+        let c: char = raw[i]
+        if c < '0' || c > '9':
+            return -1
+        cap = cap * 10 + int32(c) - int32('0')
+    return cap
+
+fn seqFixedInitInfoFromTypeKey(typeKey0: str): SeqFixedInit =
+    var out: SeqFixedInit
+    let typeKey: str = backendStripSpaces(typeKey0)
+    if typeKey == nil || len(typeKey) == 0 || !mirStrStartsWith(typeKey, "seq_fixed_"):
+        return out
+    let tail: str = str(ptr_add(void*(typeKey), 10))
+    if tail == nil || len(tail) == 0:
+        return out
+    var split: int32 = -1
+    let __for_start_i = len(tail) - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        if tail[i] == '_':
+            split = i
+            break
+    if split <= 0 || split >= len(tail) - 1:
+        return out
+    let elemKey: str = mirStrTake(tail, split)
+    let capTok: str = str(ptr_add(void*(tail), split + 1))
+    if elemKey == nil || len(elemKey) == 0 || capTok == nil || len(capTok) == 0:
+        return out
+    let pos: SourcePos = zeroPos()
+    out.elemType = newIdent(elemKey, pos)
+    let capDigits: int32 = seqFixedParseCapDigits(capTok)
+    if capDigits > 0:
+        out.capExpr = newIntLit(int64(capDigits), pos)
+    else:
+        out.capExpr = newIdent(capTok, pos)
+    return out
+
+fn emitObjInlineSeqFixedReserveInitToPtr(b: BlockBuilder, dstBasePtr: MirExpr, objTypeName: str, ot: MirObjType): Result[bool] =
+    if b == nil || b.module == nil:
+        return Err[bool]("mir_builder: object inline seq_fixed init missing builder/module")
+    var seenBases: str[]
+    for fi in 0..<ot.fields.len:
+        let f: MirObjField = ot.fields[fi]
+        let dotAt: int32 = mirStrIndexOf(f.name, ".")
+        if dotAt <= 0:
+            continue
+        let baseName: str = mirStrTake(f.name, dotAt)
+        if baseName == nil || len(baseName) == 0:
+            continue
+        var seen: bool = false
+        for si in 0..<seenBases.len:
+            if seenBases[si] == baseName:
+                seen = true
+                break
+        if seen:
+            continue
+        add(seenBases, baseName)
+
+        let typeKey: str = backendStripSpaces(mirObjFieldTypeKeyGet(objTypeName, baseName))
+        if (getEnv "CHENG_BACKEND_DEBUG_SEQFIXED_INIT" == "1") && objTypeName == "PeerAttributes":
+            echo("[backend] debugSeqFixedInit: obj=" + objTypeName +
+                 " base=" + baseName + " key='" + typeKey + "'")
+        let sfi: SeqFixedInit = seqFixedInitInfoFromTypeKey(typeKey)
+        if sfi.elemType == nil || sfi.capExpr == nil:
+            continue
+
+        var baseOff: int32 = -1
+        let lenField: str = baseName + ".len"
+        for ofi in 0..<ot.fields.len:
+            let of: MirObjField = ot.fields[ofi]
+            if of.name == lenField:
+                baseOff = of.offset
+                break
+        if baseOff < 0:
+            continue
+
+        var seqBase: MirExpr = dstBasePtr
+        if baseOff != 0:
+            seqBase = mirBin(mbAdd, dstBasePtr, mirConstI64(int64(baseOff)))
+        let seqInitRes: Result[bool] = emitSeqFixedReserveInitToPtr(b, seqBase, sfi)
+        if !IsOk[bool](seqInitRes):
+            if (getEnv "CHENG_BACKEND_DEBUG_SEQFIXED_INIT" == "1"):
+                echo("[backend] debugSeqFixedInit: skip obj=" + objTypeName +
+                     " base=" + baseName + " reason='emitSeqFixedReserveInitToPtr failed'")
+            continue
+    return Ok[bool](false)
 
 fn seqFixedInitInfo(typeNode0: Node): SeqFixedInit =
     var out: SeqFixedInit
@@ -2759,6 +3310,9 @@ fn emitObjDefaultInitPtrs(b: BlockBuilder, dstBasePtr: MirExpr, objTypeName: str
         if f.offset != 0:
             addr = mirBin(mbAdd, dstBasePtr, mirConstI64(int64(f.offset)))
         add(b.currentStmts, mirStmtStore(addr, mirConstI64(0), f.ty))
+    let seqFixedRes: Result[bool] = emitObjInlineSeqFixedReserveInitToPtr(b, dstBasePtr, objTypeName, ot)
+    if !IsOk[bool](seqFixedRes):
+        return ErrInfo[bool](ErrorInfoOf[bool](seqFixedRes))
     return Ok[bool](false)
 
 fn emitObjCopyPtrs(b: BlockBuilder, dstBasePtr: MirExpr, objTypeName: str, srcBasePtr: MirExpr): Result[bool] =
@@ -2960,12 +3514,47 @@ fn emitSeqComprehensionToPtr(b: BlockBuilder, dstName: str, dstBasePtr: MirExpr,
 
 fn inferInlineObjFieldTypeName(module: MirModule, parent: MirObjType, fieldName: str, baseOff: int32): str =
     # Match a nested/inlined field by layout against known object types.
-    # Example: `Table.slots.*` matches builtin `seq` (len/cap/buffer) at baseOff.
+    # Example: `Table.keys.*`/`Table.vals.*`/`Table.states.*` matches
+    # builtin `seq` (len/cap/buffer) at baseOff.
     if module == nil || fieldName == nil || len(fieldName) == 0 || baseOff < 0:
         return ""
     let mapped: str = mirInlineObjFieldTypeGet(parent.name, fieldName)
     if len(mapped) > 0:
+        if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parent.name == "ProtoBuffer" && fieldName == "out":
+            echo("[backend] debugOverloadDot: inferInline mapped parent='ProtoBuffer' field='out' mapped='" + mapped + "'")
         return mapped
+    # Prefer declared field type keys over structural matching to avoid
+    # aliasing to an unrelated object type with the same flattened layout.
+    let declaredKey: str = mirObjFieldTypeKeyGet(parent.name, fieldName)
+    if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parent.name == "ProtoBuffer" && fieldName == "out":
+        let lookupKeyDbg: str = parent.name + "::" + fieldName
+        var scanFound: bool = false
+        if mirObjFieldTypeKeyIndex.keys.len > 0:
+            for si in 0..<mirObjFieldTypeKeyIndex.keys.len:
+                if mirObjFieldTypeKeyIndex.states[si] != uint8(1):
+                    continue
+                let kk: str = mirObjFieldTypeKeyIndex.keys[si]
+                if kk == lookupKeyDbg:
+                    scanFound = true
+                    let vi: int32 = mirObjFieldTypeKeyIndex.vals[si]
+                    var vv: str = ""
+                    if vi >= 0 && vi < mirObjFieldTypeKeyNames.len:
+                        vv = mbRead(mirObjFieldTypeKeyNames, vi)
+                    echo("[backend] debugOverloadDot: scan fieldKeyMap key='" + lookupKeyDbg + "' slot=" +
+                         intToStr(si) + " valIdx=" + intToStr(vi) + " val='" + vv + "'")
+                    break
+        if !scanFound:
+            echo("[backend] debugOverloadDot: scan fieldKeyMap key='" + lookupKeyDbg + "' missing")
+        echo("[backend] debugOverloadDot: lookupKey len=" + intToStr(len(lookupKeyDbg)) +
+             " parentLen=" + intToStr(len(parent.name)) + " fieldLen=" + intToStr(len(fieldName)))
+        echo("[backend] debugOverloadDot: inferInline declaredKey parent='ProtoBuffer' field='out' key='" + declaredKey + "'")
+    if declaredKey != nil && len(declaredKey) > 0:
+        let declaredObj: str = mirObjTypeFromTypeKey(module, declaredKey)
+        if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parent.name == "ProtoBuffer" && fieldName == "out":
+            echo("[backend] debugOverloadDot: inferInline declaredObj parent='ProtoBuffer' field='out' obj='" + declaredObj + "'")
+        if declaredObj != nil && len(declaredObj) > 0:
+            mirInlineObjFieldTypePut(parent.name, fieldName, declaredObj)
+            return declaredObj
     let prefix: str = fieldName + "."
     for ti in 0..<module.objTypes.len:
         let cand: MirObjType = module.objTypes[ti]
@@ -2989,6 +3578,184 @@ fn inferInlineObjFieldTypeName(module: MirModule, parent: MirObjType, fieldName:
             return cand.name
     return ""
 
+fn mirObjTypeFromTypeKey(module: MirModule, typeKey0: str): str =
+    if module == nil || typeKey0 == nil || len(typeKey0) == 0:
+        return ""
+    var key: str = mirTypeKeyStripIterWrappers(typeKey0)
+    if key == nil || len(key) == 0:
+        return ""
+    let canon: str = mirObjAliasCanon(key)
+    if canon != nil && len(canon) > 0:
+        key = canon
+    if mirHasObjType(module, key):
+        return key
+    if mirStrStartsWith(key, "Option_") && ensureOptionObjType(module, key):
+        return key
+    if mirStrStartsWith(key, "Result_") && ensureResultObjType(module, key):
+        return key
+    if mirStrStartsWith(key, "__cheng_tables_Entry_") && ensureTablesEntryObjType(module, key):
+        return key
+    let layout0: str = mirPtrBaseObjTypeName(module, key)
+    if layout0 != nil && len(layout0) > 0:
+        return layout0
+    let base: str = mirTypeKeyBaseName(key)
+    if base != nil && len(base) > 0 && !(base == key):
+        var baseName: str = base
+        let baseCanon: str = mirObjAliasCanon(baseName)
+        if baseCanon != nil && len(baseCanon) > 0:
+            baseName = baseCanon
+        if mirHasObjType(module, baseName):
+            return baseName
+        if mirStrStartsWith(baseName, "Option_") && ensureOptionObjType(module, baseName):
+            return baseName
+        if mirStrStartsWith(baseName, "Result_") && ensureResultObjType(module, baseName):
+            return baseName
+        if mirStrStartsWith(baseName, "__cheng_tables_Entry_") && ensureTablesEntryObjType(module, baseName):
+            return baseName
+        let layout1: str = mirPtrBaseObjTypeName(module, baseName)
+        if layout1 != nil && len(layout1) > 0:
+            return layout1
+    return ""
+
+fn mirInferValueCallInnerKey(b: BlockBuilder, callNode: Node): str =
+    if b == nil || callNode == nil || callNode.kind != nkCall || kidCount(callNode) <= 1:
+        return ""
+    let dbgValueInner: bool = (getEnv "CHENG_BACKEND_DEBUG_VALUE_CALLSITE" == "1")
+    let calleeName0: str = mirCallCalleeName(callNode)
+    let valueLikeCall0: bool = (calleeName0 == "Value") ||
+        mirStrStartsWith(calleeName0, "Value_") ||
+        mirStrStartsWith(calleeName0, "Value__")
+    if dbgValueInner:
+        let line0: str = intToStr(callNode.pos.line)
+        let col0: str = intToStr(callNode.pos.col)
+        echo("[backend] debugValueInner: callee='" + calleeName0 + "' valueLike=" +
+             (valueLikeCall0 ? "1" : "0") + " @" + line0 + ":" + col0)
+    # Relaxed fallback: some stage1 paths keep callee names qualified/mangled.
+    # For unary calls whose first arg is `Result_*`, still recover the inner value key.
+    if !valueLikeCall0 && kidCount(callNode) != 2:
+        return ""
+    var arg0: Node = kid(callNode, 1)
+    if arg0 != nil && arg0.kind == nkCallArg && kidCount(arg0) > 1:
+        arg0 = kid(arg0, 1)
+    var argKey0: str = caseInferExprTypeKey(b, arg0)
+    if argKey0 == nil || len(argKey0) == 0:
+        argKey0 = mirInferNodeTypeKeyForOverload(b, arg0)
+    if (argKey0 == nil || len(argKey0) == 0) && arg0 != nil &&
+       arg0.typeCacheValid && arg0.typeCache != nil:
+        argKey0 = typeKey(arg0.typeCache)
+        if argKey0 == nil || len(argKey0) == 0:
+            argKey0 = mirTypeKeyFromNodeLoose(arg0.typeCache)
+    if (argKey0 == nil || len(argKey0) == 0) && arg0 != nil && (arg0.kind == nkIdent || arg0.kind == nkSymbol):
+        let nm0: str = backendStripSpaces(plainName(arg0))
+        let slot0: int32 = localIndex(b.env, nm0)
+        if slot0 >= 0:
+            argKey0 = localTypeKey(b.env, slot0)
+        if (argKey0 == nil || len(argKey0) == 0) && b.module != nil:
+            argKey0 = mirGlobalTypeKeyByBaseUnique(b.module, nm0)
+    if argKey0 != nil && len(argKey0) > 0:
+        if mirStrStartsWith(argKey0, "var_ref_"):
+            argKey0 = str(ptr_add(void*(argKey0), 8))
+        elif mirStrStartsWith(argKey0, "var_"):
+            argKey0 = str(ptr_add(void*(argKey0), 4))
+        if mirStrStartsWith(argKey0, "ref_"):
+            argKey0 = str(ptr_add(void*(argKey0), 4))
+        if mirStrStartsWith(argKey0, "ptr_"):
+            argKey0 = str(ptr_add(void*(argKey0), 4))
+    if argKey0 != nil && mirStrStartsWith(argKey0, "Result_"):
+        let valKey0: str = str(ptr_add(void*(argKey0), 7))
+        if dbgValueInner:
+            echo("[backend] debugValueInner: argKey='" + argKey0 + "' valKey='" + valKey0 + "'")
+        if valKey0 != nil && len(valKey0) > 0:
+            return valKey0
+    if b.module != nil && argKey0 != nil && len(argKey0) > 0:
+        let objName0: str = mirObjTypeFromTypeKey(b.module, argKey0)
+        if objName0 != nil && len(objName0) > 0:
+            let valueKey0: str = mirObjFieldTypeKeyGet(objName0, "value")
+            if valueKey0 != nil && len(valueKey0) > 0:
+                return valueKey0
+    return ""
+
+fn mirResolveGlobalObjTypeName(b: BlockBuilder, baseName0: str): str =
+    if b == nil || b.module == nil || baseName0 == nil || len(baseName0) == 0:
+        return ""
+    let mod0: MirModule = b.module
+    let debugDot: bool = (getEnv "CHENG_BACKEND_DEBUG_DOT" == "1")
+    let baseName: str = backendStripSpaces(baseName0)
+    if baseName == nil || len(baseName) == 0:
+        return ""
+    let obj0: str = mirGlobalObjTypeGet(baseName)
+    if obj0 != nil && len(obj0) > 0:
+        return obj0
+    let key0: str = mirGlobalTypeKeyGet(baseName)
+    let obj1: str = mirObjTypeFromTypeKey(mod0, key0)
+    if obj1 != nil && len(obj1) > 0:
+        return obj1
+    let gi0: int32 = moduleGlobalIndex(mod0, baseName)
+    if debugDot:
+        echo("[backend] debugDot: globalObjProbe base='" + baseName + "' obj0='" + obj0 +
+             "' key0='" + key0 + "' obj1='" + obj1 + "' gi0=" + intToStr(gi0))
+    let globals0: MirGlobal[] = mod0.globals
+    if gi0 >= 0 && gi0 < globals0.len:
+        let g0: MirGlobal = globals0[gi0]
+        let gObj0: str = mirGlobalObjTypeGet(g0.name)
+        if gObj0 != nil && len(gObj0) > 0:
+            return gObj0
+        let gKey0: str = mirGlobalTypeKeyGet(g0.name)
+        let gObj1: str = mirObjTypeFromTypeKey(mod0, gKey0)
+        if debugDot:
+            echo("[backend] debugDot: globalObjProbe exact g.name='" + g0.name +
+                 "' gObj0='" + gObj0 + "' gKey0='" + gKey0 + "' gObj1='" + gObj1 +
+                 "' g.origin='" + g0.originFile + "' g.ty=nk#" + intToStr(int32(g0.ty.kind)) + "'")
+        if gObj1 != nil && len(gObj1) > 0:
+            return gObj1
+    if b.func != nil && mirDupGlobalNamesHas(baseName):
+        let f0: MirFunc = b.func
+        let sym0: str = mirMaybeMangleDupGlobalName(baseName, f0.originFile)
+        if debugDot:
+            echo("[backend] debugDot: globalObjProbe dup base='" + baseName + "' sym0='" + sym0 + "'")
+        if sym0 != nil && len(sym0) > 0 && !(sym0 == baseName):
+            let mObj0: str = mirGlobalObjTypeGet(sym0)
+            if mObj0 != nil && len(mObj0) > 0:
+                return mObj0
+            let mKey0: str = mirGlobalTypeKeyGet(sym0)
+            let mObj1: str = mirObjTypeFromTypeKey(mod0, mKey0)
+            if debugDot:
+                echo("[backend] debugDot: globalObjProbe dup sym0='" + sym0 +
+                     "' mObj0='" + mObj0 + "' mKey0='" + mKey0 + "' mObj1='" + mObj1 + "'")
+            if mObj1 != nil && len(mObj1) > 0:
+                return mObj1
+            let mGi0: int32 = moduleGlobalIndex(mod0, sym0)
+            if mGi0 >= 0 && mGi0 < globals0.len:
+                let mg0: MirGlobal = globals0[mGi0]
+                let mgObj0: str = mirGlobalObjTypeGet(mg0.name)
+                if mgObj0 != nil && len(mgObj0) > 0:
+                    return mgObj0
+                let mgKey0: str = mirGlobalTypeKeyGet(mg0.name)
+                let mgObj1: str = mirObjTypeFromTypeKey(mod0, mgKey0)
+                if debugDot:
+                    echo("[backend] debugDot: globalObjProbe dup-index mg.name='" + mg0.name +
+                         "' mgObj0='" + mgObj0 + "' mgKey0='" + mgKey0 + "' mgObj1='" + mgObj1 + "'")
+                if mgObj1 != nil && len(mgObj1) > 0:
+                    return mgObj1
+    let uniqGi: int32 = moduleFindGlobalIndexByBaseUnique(mod0, baseName)
+    if uniqGi >= 0 && uniqGi < globals0.len:
+        let ug: MirGlobal = globals0[uniqGi]
+        let uObj0: str = mirGlobalObjTypeGet(ug.name)
+        if uObj0 != nil && len(uObj0) > 0:
+            return uObj0
+        let uKey0: str = mirGlobalTypeKeyGet(ug.name)
+        let uObj1: str = mirObjTypeFromTypeKey(mod0, uKey0)
+        if uObj1 != nil && len(uObj1) > 0:
+            return uObj1
+    let uniqKey: str = mirGlobalTypeKeyByBaseUnique(mod0, baseName)
+    let uniqObj: str = mirObjTypeFromTypeKey(mod0, uniqKey)
+    if debugDot:
+        echo("[backend] debugDot: globalObjProbe uniq base='" + baseName +
+             "' uniqGi=" + intToStr(uniqGi) + " uniqKey='" + uniqKey + "' uniqObj='" + uniqObj + "'")
+    if uniqObj != nil && len(uniqObj) > 0:
+        return uniqObj
+    return ""
+
 fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
     if b == nil || dotNode == nil || dotNode.kind != nkDotExpr || kidCount(dotNode) < 2:
         return Err[DotAccess]("mir_builder: invalid dot expr")
@@ -3003,7 +3770,7 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
     var baseName: str = ""
     var objTypeName: str = ""
     if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
-        baseName = plainName(base)
+        baseName = backendStripSpaces(plainName(base))
         let slot: int32 = localIndex(b.env, baseName)
         if slot >= 0:
             objTypeName = funcObjTypeName(b.func, slot)
@@ -3019,6 +3786,10 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
                 elif mirStrStartsWith(key, "var_"):
                     key = str(ptr_add(void*(key), 4))
                 if key != nil && len(key) > 0:
+                    let objFromKey0: str = mirObjTypeFromTypeKey(b.module, key)
+                    if objFromKey0 != nil && len(objFromKey0) > 0:
+                        objTypeName = objFromKey0
+                        basePtrRes = Ok[MirExpr](mirLocal(slot))
                     let canon: str = mirObjAliasCanon(key)
                     if canon != nil && len(canon) > 0:
                         key = canon
@@ -3093,7 +3864,8 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
             if len(objTypeName) == 0:
                 var key0: str = ""
                 if base0 != nil && (base0.kind == nkIdent || base0.kind == nkSymbol):
-                    let slot0: int32 = localIndex(b.env, plainName(base0))
+                    let slot0Name: str = backendStripSpaces(plainName(base0))
+                    let slot0: int32 = localIndex(b.env, slot0Name)
                     if slot0 >= 0:
                         key0 = localTypeKey(b.env, slot0)
                 if key0 == nil || len(key0) == 0:
@@ -3105,9 +3877,37 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
                         if da0.fieldTy.kind == mtVoid && da0.objTypeName != nil && len(da0.objTypeName) > 0:
                             key0 = da0.objTypeName
                 if (key0 == nil || len(key0) == 0) && base0 != nil && (base0.kind == nkIdent || base0.kind == nkSymbol):
-                    let gObj0: str = mirGlobalObjTypeGet(plainName(base0))
+                    let base0Name: str = backendStripSpaces(plainName(base0))
+                    let gObj0: str = mirResolveGlobalObjTypeName(b, base0Name)
                     if len(gObj0) > 0:
                         key0 = gObj0
+                if base0 != nil && key0 != nil && len(key0) > 0 && (key0 == "seq" || key0 == "Table"):
+                    let refinedKey: str = caseInferExprTypeKey(b, base0)
+                    if refinedKey != nil && len(refinedKey) > 0 && !(refinedKey == key0):
+                        key0 = refinedKey
+                if len(objTypeName) == 0 && base0 != nil && base0.kind == nkDotExpr && kidCount(base0) > 1 &&
+                   key0 != nil && len(key0) > 0 && (key0 == "seq" || key0 == "Table"):
+                    let parentNode0: Node = kid(base0, 0)
+                    let memberNode0: Node = kid(base0, 1)
+                    let memberName0: str = backendStripSpaces(plainName(memberNode0))
+                    var parentKey0: str = caseInferExprTypeKey(b, parentNode0)
+                    if parentKey0 != nil && len(parentKey0) > 0:
+                        if mirStrStartsWith(parentKey0, "ref_"):
+                            parentKey0 = str(ptr_add(void*(parentKey0), 4))
+                        elif mirStrStartsWith(parentKey0, "var_ref_"):
+                            parentKey0 = str(ptr_add(void*(parentKey0), 8))
+                        elif mirStrStartsWith(parentKey0, "var_"):
+                            parentKey0 = str(ptr_add(void*(parentKey0), 4))
+                        if mirStrStartsWith(parentKey0, "ptr_"):
+                            parentKey0 = str(ptr_add(void*(parentKey0), 4))
+                    var parentObj0: str = mirObjTypeFromTypeKey(b.module, parentKey0)
+                    if len(parentObj0) == 0 && parentNode0 != nil && (parentNode0.kind == nkIdent || parentNode0.kind == nkSymbol):
+                        let parentName0: str = backendStripSpaces(plainName(parentNode0))
+                        parentObj0 = mirResolveGlobalObjTypeName(b, parentName0)
+                    if len(parentObj0) > 0 && memberName0 != nil && len(memberName0) > 0:
+                        let fieldKey1: str = backendStripSpaces(mirObjFieldTypeKeyGet(parentObj0, memberName0))
+                        if fieldKey1 != nil && len(fieldKey1) > 0:
+                            key0 = fieldKey1
                 if key0 != nil && len(key0) > 0:
                     var key: str = key0
                     if mirStrStartsWith(key, "ref_"):
@@ -3119,9 +3919,20 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
                     if mirStrStartsWith(key, "ptr_"):
                         key = str(ptr_add(void*(key), 4))
                     if key != nil && len(key) > 0:
+                        let keyCanon0: str = mirObjAliasCanon(key)
+                        if keyCanon0 != nil && len(keyCanon0) > 0:
+                            key = keyCanon0
+                        if mirHasObjType(b.module, key):
+                            objTypeName = key
                         if mirStrStartsWith(key, "seq_"):
-                            let elemKey: str = str(ptr_add(void*(key), 4))
+                            var elemKey: str = str(ptr_add(void*(key), 4))
                             if elemKey != nil && len(elemKey) > 0:
+                                if mirStrStartsWith(elemKey, "var_ref_"):
+                                    elemKey = str(ptr_add(void*(elemKey), 8))
+                                elif mirStrStartsWith(elemKey, "var_"):
+                                    elemKey = str(ptr_add(void*(elemKey), 4))
+                                if mirStrStartsWith(elemKey, "ref_") || mirStrStartsWith(elemKey, "ptr_"):
+                                    elemKey = str(ptr_add(void*(elemKey), 4))
                                 if mirHasObjType(b.module, elemKey):
                                     objTypeName = elemKey
                                 elif mirStrStartsWith(elemKey, "seq_") && mirHasObjType(b.module, "seq"):
@@ -3160,7 +3971,7 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
                     echo("[backend] debugDot: bracket-dot missing objTypeName key0='" + key0 +
                         "' base0Kind=nk#" + intToStr(bKind) + " @" + lineD + ":" + colD)
         if baseName != nil && len(baseName) > 0:
-            let gObj: str = mirGlobalObjTypeGet(baseName)
+            let gObj: str = mirResolveGlobalObjTypeName(b, baseName)
             if len(gObj) > 0:
                 objTypeName = gObj
         if base != nil && base.kind == nkDotExpr:
@@ -3175,6 +3986,8 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
             objTypeName = typeNodeObjTypeName(b.module, base.typeCache)
         if len(objTypeName) == 0 && base != nil && base.kind == nkCall && b.module != nil:
             let callName: str = mirCallNameForReachability(b.module, base)
+            if debugDot:
+                echo("[backend] debugDot: call-dot callName='" + callName + "'")
             if callName != nil && len(callName) > 0:
                 var callee0: MirFunc = moduleFindFunc(b.module, callName)
                 if callee0 == nil:
@@ -3190,6 +4003,25 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
                     if mirStrStartsWith(key, "ptr_"):
                         key = str(ptr_add(void*(key), 4))
                     objTypeName = mirPtrBaseObjTypeName(b.module, key)
+                    if debugDot:
+                        echo("[backend] debugDot: call-dot callee retTypeKey='" + callee0.retTypeKey +
+                             "' objTypeFromRet='" + objTypeName + "'")
+            if len(objTypeName) == 0 && kidCount(base) > 1:
+                let valKey0: str = mirInferValueCallInnerKey(b, base)
+                if debugDot:
+                    echo("[backend] debugDot: call-dot valKey='" + valKey0 + "'")
+                if valKey0 != nil && len(valKey0) > 0:
+                    objTypeName = mirObjTypeFromTypeKey(b.module, valKey0)
+                    if debugDot:
+                        echo("[backend] debugDot: call-dot objTypeFromVal='" + objTypeName + "'")
+            if len(objTypeName) == 0:
+                let callKey2: str = caseInferExprTypeKey(b, base)
+                if debugDot:
+                    echo("[backend] debugDot: call-dot callExprKey='" + callKey2 + "'")
+                if callKey2 != nil && len(callKey2) > 0:
+                    objTypeName = mirObjTypeFromTypeKey(b.module, callKey2)
+                    if debugDot:
+                        echo("[backend] debugDot: call-dot objTypeFromExprKey='" + objTypeName + "'")
         if len(objTypeName) == 0 && base != nil && (base.kind == nkHiddenDeref || base.kind == nkDerefExpr) &&
            kidCount(base) > 0:
             let inner: Node = kid(base, 0)
@@ -3242,8 +4074,9 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
                 bKind2 = int32(base.kind)
             let okPtr: bool = IsOk[MirExpr](basePtrRes)
             let okPtrStr: str = okPtr ? "1" : "0"
+            let modNil: str = (b == nil || b.module == nil) ? "1" : "0"
             echo("[backend] debugDot: dotFail objTypeName='" + objTypeName + "' baseKind=nk#" +
-                intToStr(bKind2) + " basePtrOk=" + okPtrStr)
+                intToStr(bKind2) + " basePtrOk=" + okPtrStr + " moduleNil=" + modNil)
             if baseName != nil && len(baseName) > 0 && b != nil && b.env != nil:
                 let dbgSlot: int32 = localIndex(b.env, baseName)
                 var dbgMsg: str = "[backend] debugDot: baseName='" + baseName + "' slot=" + intToStr(dbgSlot)
@@ -3262,6 +4095,21 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
                         "' localTypeKey='" + lKey + "' localTypeKeyStrip='" + lKey0 + "'"
                     let hasObj: bool = lKey0 != nil && len(lKey0) > 0 && mirHasObjType(b.module, lKey0)
                     dbgMsg = dbgMsg + " hasObj=" + (hasObj ? "1" : "0")
+                    if !hasObj && b.module != nil && lKey0 != nil && len(lKey0) > 0:
+                        let modDbg: MirModule = b.module
+                        let objsDbg: MirObjType[] = modDbg.objTypes
+                        let pref0: str = lKey0 + "_"
+                        var shown0: int32 = 0
+                        for oi0 in 0..<objsDbg.len:
+                            let ot0: MirObjType = objsDbg[oi0]
+                            if ot0.name == nil || len(ot0.name) == 0:
+                                continue
+                            if ot0.name == lKey0 || mirStrStartsWith(ot0.name, pref0):
+                                echo("[backend] debugDot: localKeyCandidate key='" + lKey0 +
+                                     "' cand='" + ot0.name + "'")
+                                shown0 = shown0 + 1
+                                if shown0 >= 6:
+                                    break
                 echo dbgMsg
                 let altName: str = baseName + "Res"
                 let altSlot: int32 = localIndex(b.env, altName)
@@ -3417,6 +4265,59 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: MirExpr): Resu
     for ai in 1..<kidCount(callNode):
         let raw: Node = kid(callNode, ai)
         add(valueNodes, raw)
+
+    if name == "Value" && valueNodes.len == 1 && b.module != nil:
+        var srcNode0: Node = valueNodes[0]
+        if srcNode0 != nil && srcNode0.kind == nkCallArg:
+            if kidCount(srcNode0) > 1:
+                srcNode0 = kid(srcNode0, 1)
+            elif kidCount(srcNode0) > 0:
+                srcNode0 = kid(srcNode0, 0)
+        if srcNode0 != nil:
+            let srcRes0: Result[MirExpr] = lowerExprValue(b, srcNode0, mirTypeI64())
+            if IsOk[MirExpr](srcRes0):
+                var srcPtr0: MirExpr = Value[MirExpr](srcRes0)
+                var srcKey0: str = mirInferNodeTypeKeyForOverload(b, srcNode0)
+                if mirStrStartsWith(srcKey0, "ref_"):
+                    srcKey0 = str(ptr_add(void*(srcKey0), 4))
+                elif mirStrStartsWith(srcKey0, "var_ref_"):
+                    srcKey0 = str(ptr_add(void*(srcKey0), 8))
+                elif mirStrStartsWith(srcKey0, "var_"):
+                    srcKey0 = str(ptr_add(void*(srcKey0), 4))
+                if mirStrStartsWith(srcKey0, "ptr_"):
+                    srcKey0 = str(ptr_add(void*(srcKey0), 4))
+                var valueOff0: int32 = -1
+                let srcObj0: str = mirObjTypeFromTypeKey(b.module, srcKey0)
+                if srcObj0 != nil && len(srcObj0) > 0 && mirHasObjType(b.module, srcObj0):
+                    let srcOt0: MirObjType = mirGetObjType(b.module, srcObj0)
+                    for sfi in 0..<srcOt0.fields.len:
+                        let sf0: MirObjField = srcOt0.fields[sfi]
+                        if (sf0.name == "value") || mirStrStartsWith(sf0.name, "value."):
+                            if valueOff0 < 0 || sf0.offset < valueOff0:
+                                valueOff0 = sf0.offset
+                if valueOff0 < 0 && mirStrStartsWith(srcKey0, "Result_"):
+                    valueOff0 = 0
+                if valueOff0 > 0:
+                    srcPtr0 = mirBin(mbAdd, srcPtr0, mirConstI64(int64(valueOff0)))
+                var dstObj0: str = ""
+                if callNode.typeCacheValid && callNode.typeCache != nil:
+                    dstObj0 = typeNodeObjTypeName(b.module, callNode.typeCache)
+                if (dstObj0 == nil || len(dstObj0) == 0) && b != nil && b.func != nil &&
+                   lead != nil && lead.kind == meLocal:
+                    let leadSlot0: int32 = lead.localIndex
+                    if leadSlot0 >= 0 && funcFindObjLocal(b.func, leadSlot0) >= 0:
+                        dstObj0 = funcObjTypeName(b.func, leadSlot0)
+                if dstObj0 != nil && len(dstObj0) > 0:
+                    let copyRes0: Result[bool] = emitObjCopyPtrs(b, lead, dstObj0, srcPtr0)
+                    if !IsOk[bool](copyRes0):
+                        return ErrInfo[MirExpr](ErrorInfoOf[bool](copyRes0))
+                    if getEnv "CHENG_BACKEND_DEBUG_VALUE_LOWER" == "1":
+                        var fnDbg1: str = ""
+                        if b != nil && b.func != nil:
+                            let fDbg1: MirFunc = b.func
+                            fnDbg1 = fDbg1.name
+                        echo("[backend] debugValueLower: fn=" + fnDbg1 + " dstObj=" + dstObj0)
+                    return Ok[MirExpr](lead)
 
     var callName: str = name
     if typeArgs.len > 0:
@@ -3605,8 +4506,11 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: MirExpr): Resu
                 if off != 0:
                     dstAddr = mirBin(mbAdd, lead, mirConstI64(int64(off)))
                 var argNode: Node = valueNodes[gi]
-                if argNode != nil && argNode.kind == nkCallArg && kidCount(argNode) > 1:
-                    argNode = kid(argNode, 1)
+                if argNode != nil && argNode.kind == nkCallArg:
+                    if kidCount(argNode) > 1:
+                        argNode = kid(argNode, 1)
+                    elif kidCount(argNode) > 0:
+                        argNode = kid(argNode, 0)
                 if !isComposite:
                     let tyG: MirType = groupTypes[gi]
                     let valResG: Result[MirExpr] = lowerExprValue(b, argNode, tyG)
@@ -3641,8 +4545,11 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: MirExpr): Resu
         for fi3 in 0..<argCount:
             let f3: MirObjField = ot2.fields[fi3]
             var valNode2: Node = valueNodes[fi3]
-            if valNode2 != nil && valNode2.kind == nkCallArg && kidCount(valNode2) > 1:
-                valNode2 = kid(valNode2, 1)
+            if valNode2 != nil && valNode2.kind == nkCallArg:
+                if kidCount(valNode2) > 1:
+                    valNode2 = kid(valNode2, 1)
+                elif kidCount(valNode2) > 0:
+                    valNode2 = kid(valNode2, 0)
             let valRes2: Result[MirExpr] = lowerExprValue(b, valNode2, f3.ty)
             if !IsOk[MirExpr](valRes2):
                 return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](valRes2))
@@ -3655,8 +4562,11 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: MirExpr): Resu
     var argNodes: Node[]
     for vi2 in 0..<valueNodes.len:
         var argNode2: Node = valueNodes[vi2]
-        if argNode2 != nil && argNode2.kind == nkCallArg && kidCount(argNode2) > 1:
-            argNode2 = kid(argNode2, 1)
+        if argNode2 != nil && argNode2.kind == nkCallArg:
+            if kidCount(argNode2) > 1:
+                argNode2 = kid(argNode2, 1)
+            elif kidCount(argNode2) > 0:
+                argNode2 = kid(argNode2, 0)
         add(argNodes, argNode2)
 
     # Some stage1 paths can rewrite `base[idx]` into `[](base, idx)`.
@@ -3849,6 +4759,55 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: MirExpr): Resu
             if !IsOk[MirExpr](argRes2):
                 return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](argRes2))
             add(args, Value[MirExpr](argRes2))
+    let valueLikeCall0: bool = (callInternal == "Value") || (callName == "Value") ||
+        (calleeFunc != nil && calleeFunc.linkName != nil && (calleeFunc.linkName == "Value"))
+    if valueLikeCall0 && args.len >= 2 && b.module != nil:
+        var srcPtr1: MirExpr = args[1]
+        if argNodes.len > 0 && argNodes[0] != nil:
+            var srcKey1: str = mirInferNodeTypeKeyForOverload(b, argNodes[0])
+            if mirStrStartsWith(srcKey1, "ref_"):
+                srcKey1 = str(ptr_add(void*(srcKey1), 4))
+            elif mirStrStartsWith(srcKey1, "var_ref_"):
+                srcKey1 = str(ptr_add(void*(srcKey1), 8))
+            elif mirStrStartsWith(srcKey1, "var_"):
+                srcKey1 = str(ptr_add(void*(srcKey1), 4))
+            if mirStrStartsWith(srcKey1, "ptr_"):
+                srcKey1 = str(ptr_add(void*(srcKey1), 4))
+            var valueOff1: int32 = -1
+            let srcObj1: str = mirObjTypeFromTypeKey(b.module, srcKey1)
+            if srcObj1 != nil && len(srcObj1) > 0 && mirHasObjType(b.module, srcObj1):
+                let srcOt1: MirObjType = mirGetObjType(b.module, srcObj1)
+                for sfi1 in 0..<srcOt1.fields.len:
+                    let sf1: MirObjField = srcOt1.fields[sfi1]
+                    if (sf1.name == "value") || mirStrStartsWith(sf1.name, "value."):
+                        if valueOff1 < 0 || sf1.offset < valueOff1:
+                            valueOff1 = sf1.offset
+            if valueOff1 < 0 && mirStrStartsWith(srcKey1, "Result_"):
+                valueOff1 = 0
+            if valueOff1 > 0:
+                srcPtr1 = mirBin(mbAdd, srcPtr1, mirConstI64(int64(valueOff1)))
+        var dstObj1: str = ""
+        if callNode.typeCacheValid && callNode.typeCache != nil:
+            dstObj1 = typeNodeObjTypeName(b.module, callNode.typeCache)
+        if (dstObj1 == nil || len(dstObj1) == 0) && b != nil && b.func != nil &&
+           lead != nil && lead.kind == meLocal:
+            let leadSlot1: int32 = lead.localIndex
+            if leadSlot1 >= 0 && funcFindObjLocal(b.func, leadSlot1) >= 0:
+                dstObj1 = funcObjTypeName(b.func, leadSlot1)
+        if dstObj1 != nil && len(dstObj1) > 0:
+            let copyRes1: Result[bool] = emitObjCopyPtrs(b, lead, dstObj1, srcPtr1)
+            if !IsOk[bool](copyRes1):
+                return ErrInfo[MirExpr](ErrorInfoOf[bool](copyRes1))
+            return Ok[MirExpr](lead)
+        add(b.currentStmts, mirStmtStore(lead, mirLoad(srcPtr1, mirTypeI64()), mirTypeI64()))
+        return Ok[MirExpr](lead)
+    if callInternal == "Value" && getEnv "CHENG_BACKEND_DEBUG_VALUE_CALLSITE" == "1":
+        var fnDbg2: str = ""
+        if b != nil && b.func != nil:
+            let fDbg2: MirFunc = b.func
+            fnDbg2 = fDbg2.name
+        echo("[backend] debugValueCallsite: fn=" + fnDbg2 +
+             " name='" + name + "' callName='" + callName + "' argc=" + intToStr(argNodes.len))
     add(b.currentStmts, mirStmtExpr(mirCall(callInternal, args)))
     return Ok[MirExpr](lead)
 
@@ -4298,7 +5257,7 @@ fn exprTypeKeyShallow(b: BlockBuilder, n0: Node): str =
         n = kid(n, 0)
     if n == nil:
         return ""
-    if n.typeCacheValid && n.typeCache != nil:
+    if n.kind != nkDotExpr && n.typeCacheValid && n.typeCache != nil:
         return typeKey n.typeCache
     if n.kind == nkDotExpr && kidCount(n) > 1:
         let base: Node = kid(n, 0)
@@ -4641,7 +5600,22 @@ fn lowerObjConstructorCall(b: BlockBuilder, callNode: Node, objTypeName: str): R
         if !hasPrefix:
             let line: str = intToStr(keyNode.pos.line)
             let col: str = intToStr(keyNode.pos.col)
+            if (getEnv "CHENG_BACKEND_DEBUG_OBJCTOR" == "1"):
+                let calleeDbg: str = backendStripSpaces(plainName(kid(callNode, 0)))
+                echo("[backend] debugObjCtorUnknown: objType='" + objTypeName + "' field='" + fieldName +
+                     "' callee='" + calleeDbg + "' @" + line + ":" + col)
             return Err[MirExpr]("mir_builder: unknown object field '" + fieldName + "' @" + line + ":" + col)
+
+        var dstObjName: str = mirInlineObjFieldTypeGet(objTypeName, fieldName)
+        let fieldKey0: str = backendStripSpaces(mirObjFieldTypeKeyGet(objTypeName, fieldName))
+        if fieldKey0 != nil && len(fieldKey0) > 0:
+            dstObjName = mirObjTypeFromTypeKey(b.module, fieldKey0)
+            if len(dstObjName) == 0 && mirHasObjType(b.module, fieldKey0):
+                dstObjName = fieldKey0
+            if len(dstObjName) == 0:
+                let fieldCanon: str = mirObjAliasCanon(fieldKey0)
+                if fieldCanon != nil && len(fieldCanon) > 0 && mirHasObjType(b.module, fieldCanon):
+                    dstObjName = fieldCanon
 
         var srcObjName: str = ""
         if valNode != nil && valNode.typeCacheValid && valNode.typeCache != nil:
@@ -4654,15 +5628,37 @@ fn lowerObjConstructorCall(b: BlockBuilder, callNode: Node, objTypeName: str): R
         if len(srcObjName) == 0 && valNode != nil && b != nil && b.module != nil:
             let key0: str = caseInferExprTypeKey(b, valNode)
             if key0 != nil && len(key0) > 0:
-                let tn0: Node = newIdent(key0, valNode.pos)
-                srcObjName = typeNodeObjTypeName(b.module, tn0)
-        if (getEnv "CHENG_BACKEND_DEBUG_NESTED_CTOR" == "1") && (objTypeName == "GossipsubContext") && (fieldName == "params"):
+                srcObjName = mirObjTypeFromTypeKey(b.module, key0)
+                if len(srcObjName) == 0:
+                    let tn0: Node = newIdent(key0, valNode.pos)
+                    srcObjName = typeNodeObjTypeName(b.module, tn0)
+        if len(srcObjName) == 0 && valNode != nil && b != nil && b.module != nil:
+            let key1: str = mirInferNodeTypeKeyForOverload(b, valNode)
+            if key1 != nil && len(key1) > 0:
+                srcObjName = mirObjTypeFromTypeKey(b.module, key1)
+        if len(srcObjName) == 0 && valNode != nil && valNode.kind == nkCall && kidCount(valNode) > 1 && b != nil && b.module != nil:
+            let valKey0: str = mirInferValueCallInnerKey(b, valNode)
+            if valKey0 != nil && len(valKey0) > 0:
+                srcObjName = mirObjTypeFromTypeKey(b.module, valKey0)
+        if len(srcObjName) == 0 && len(dstObjName) > 0:
+            srcObjName = dstObjName
+        if (getEnv "CHENG_BACKEND_DEBUG_NESTED_CTOR" == "1") &&
+           (((objTypeName == "GossipsubContext") && (fieldName == "params")) ||
+            ((objTypeName == "Cid") && (fieldName == "codec"))):
             let kDbg: str = (valNode != nil) ? caseInferExprTypeKey(b, valNode) : ""
             let vkDbg: str = (valNode != nil) ? intToStr(int32(valNode.kind)) : "nil"
+            let kDbg2: str = (valNode != nil) ? mirInferNodeTypeKeyForOverload(b, valNode) : ""
+            let oDbg2: str = (kDbg2 != nil && len(kDbg2) > 0) ? mirObjTypeFromTypeKey(b.module, kDbg2) : ""
             echo("[backend] debugNestedCtor: ctor=" + objTypeName + " field=" + fieldName +
                  " valKind=nk#" + vkDbg + " key='" + kDbg + "' srcObjName='" + srcObjName + "'")
+            echo("[backend] debugNestedCtor: ctor=" + objTypeName + " field=" + fieldName +
+                 " inferKey='" + kDbg2 + "' inferObj='" + oDbg2 + "'")
         if len(srcObjName) == 0:
-            return Err[MirExpr]("mir_builder: object constructor field '" + fieldName + "' expects object value")
+            let fkDbg: str = backendStripSpaces(mirObjFieldTypeKeyGet(objTypeName, fieldName))
+            let vkDbg2: str = (valNode != nil) ? intToStr(int32(valNode.kind)) : "nil"
+            return Err[MirExpr]("mir_builder: object constructor field '" + fieldName + "' expects object value" +
+                                " (obj=" + objTypeName + " fieldKey=" + fkDbg +
+                                " inlineObj=" + dstObjName + " valKind=nk#" + vkDbg2 + ")")
         let srcRes: Result[MirExpr] = lowerExprValue(b, valNode, mirTypeI64())
         if ! IsOk[MirExpr](srcRes):
             return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](srcRes))
@@ -4883,6 +5879,8 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
     var node: Node = n
     while node != nil && node.kind == nkPar && kidCount(node) > 0:
         node = kid(node, 0)
+    while node != nil && node.kind == nkCallArg && kidCount(node) > 0:
+        node = kid(node, kidCount(node) - 1)
     if node == nil:
         return Err[MirExpr]("mir_builder: nil expr")
     if node.kind == nkHiddenDeref || node.kind == nkDerefExpr:
@@ -5696,15 +6694,28 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
             let g: MirGlobal = mod.globals[gi]
             return Ok[MirExpr](mirLoad(mirGlobalAddr(g.name), g.ty))
         var fnRefName: str = nm
-        if !moduleHasFuncByBase(mod, fnRefName) && mirDupFnBasesHas(nm) && b.func != nil:
+        if mirDupFnBasesHas(nm) && b.func != nil:
             let f2: MirFunc = b.func
-            fnRefName = mirMaybeMangleDupFnBase(nm, f2.originFile)
+            let mangledRef: str = mirMaybeMangleDupFnBase(nm, f2.originFile)
+            if mangledRef != nil && len(mangledRef) > 0 && moduleHasFuncByBase(mod, mangledRef):
+                fnRefName = mangledRef
         if moduleHasFuncByBase(mod, fnRefName):
-            let f1: MirFunc = moduleFindFuncByBaseUnique(mod, fnRefName)
+            var callerFile: str = ""
+            if b != nil && b.func != nil:
+                let fCur: MirFunc = b.func
+                callerFile = fCur.originFile
+            let f1: MirFunc = moduleFindFuncByBasePreferOrigin(mod, fnRefName, callerFile)
             if f1 == nil:
                 let line0: str = intToStr(node.pos.line)
                 let col0: str = intToStr(node.pos.col)
-                return Err[MirExpr]("mir_builder: ambiguous function reference: " + fnRefName + " @" + line0 + ":" + col0)
+                var fnDbg: str = ""
+                var fpDbg: str = ""
+                if b != nil && b.func != nil:
+                    let fDbg: MirFunc = b.func
+                    fnDbg = fDbg.name
+                    fpDbg = fDbg.originFile
+                return Err[MirExpr]("mir_builder: ambiguous function reference: " + fnRefName + " @" + line0 + ":" + col0 +
+                                    " (fn=" + fnDbg + " " + fpDbg + ")")
             let sym: str = (f1.linkName != nil && len(f1.linkName) > 0) ? f1.linkName : f1.name
             return Ok[MirExpr](mirGlobalAddr(sym))
         var fnName: str = ""
@@ -6281,11 +7292,22 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                 return Ok[MirExpr](mirGlobalAddr(nm))
             # Fall back to treating it as a function symbol (e.g. async wrapper takes `__addr(driver)`).
             if moduleHasFuncByBase(b.module, nm):
-                let f1: MirFunc = moduleFindFuncByBaseUnique(b.module, nm)
+                var callerFile2: str = ""
+                if b != nil && b.func != nil:
+                    let fCur2: MirFunc = b.func
+                    callerFile2 = fCur2.originFile
+                let f1: MirFunc = moduleFindFuncByBasePreferOrigin(b.module, nm, callerFile2)
                 if f1 == nil:
                     let line0: str = intToStr(argNode0.pos.line)
                     let col0: str = intToStr(argNode0.pos.col)
-                    return Err[MirExpr]("mir_builder: ambiguous function reference: " + nm + " @" + line0 + ":" + col0)
+                    var fnDbg2: str = ""
+                    var fpDbg2: str = ""
+                    if b != nil && b.func != nil:
+                        let fDbg2: MirFunc = b.func
+                        fnDbg2 = fDbg2.name
+                        fpDbg2 = fDbg2.originFile
+                    return Err[MirExpr]("mir_builder: ambiguous function reference: " + nm + " @" + line0 + ":" + col0 +
+                                        " (fn=" + fnDbg2 + " " + fpDbg2 + ")")
                 let sym: str = (f1.linkName != nil && len(f1.linkName) > 0) ? f1.linkName : f1.name
                 return Ok[MirExpr](mirGlobalAddr(sym))
             return Ok[MirExpr](mirGlobalAddr(nm))
@@ -6429,6 +7451,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                             if kn0 != nil && (kn0.kind == nkIdent || kn0.kind == nkSymbol):
                                 extra0 = extra0 + " key=" + plainName(kn0)
                     echo("[backend] debug:  kid#" + intToStr(di0) + " kind=" + k0 + extra0)
+            var hasNamedArgs: bool = false
             var hasFieldNamedArgs: bool = false
             for nai in 1..<kidCount(node):
                 let an: Node = kid(node, nai)
@@ -6437,9 +7460,11 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                     if keyNode != nil && (keyNode.kind == nkIdent || keyNode.kind == nkSymbol):
                         let keyName: str = plainName(keyNode)
                         if len(keyName) > 0 && !(keyName == "_"):
+                            hasNamedArgs = true
+                            let keyPrefix: str = keyName + "."
                             for fi in 0..<ot0.fields.len:
                                 let f: MirObjField = ot0.fields[fi]
-                                if (f.name == keyName):
+                                if (f.name == keyName) || mirStrStartsWith(f.name, keyPrefix):
                                     hasFieldNamedArgs = true
                                     break
                             if hasFieldNamedArgs:
@@ -6448,7 +7473,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
             # Treat the 1-arg form as a cast/reinterpretation by default. Allow a single-field
             # object constructor only when the argument key matches the lone field.
             if kidCount(node) == 2:
-                if hasFieldNamedArgs && ot0.fields.len == 1:
+                if hasNamedArgs:
                     return lowerObjConstructorCall(b, node, callName0)
                 var aliasTy: MirType = mirTryGetTypeAlias(b.module, callName0)
                 if aliasTy.kind == mtVoid:
@@ -6464,7 +7489,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                 if ! IsOk[MirExpr](castRes):
                     return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](castRes))
                 return Ok[MirExpr](mirCast(aliasTy, Value[MirExpr](castRes)))
-            if hasFieldNamedArgs:
+            if hasNamedArgs:
                 return lowerObjConstructorCall(b, node, callName0)
             return lowerObjConstructorCallPositional(b, node, callName0)
         # Some stage1 wrappers (e.g. `Foo__wrap_*`) construct object values via the implicit `__ret`.
@@ -6483,9 +7508,12 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                         return ErrInfo[MirExpr](ErrorInfoOf[bool](allocRes))
                     return lowerCallWithLeadingArg(b, node, mirLocal(tmpSlot))
         # Object-return calls use an implicit leading `__ret` pointer argument.
-        if node.typeCacheValid && node.typeCache != nil:
+        if node.typeCacheValid && node.typeCache != nil &&
+           !(callName0 == "Value" && kidCount(node) == 2):
             let retObjName: str = typeNodeObjTypeName(b.module, node.typeCache)
             if len(retObjName) > 0 && typeNodeIsObjValue(b.module, node.typeCache):
+                if getEnv "CHENG_BACKEND_DEBUG_OBJRET_CALL" == "1":
+                    echo("[backend] debugObjRetCall: callName0='" + callName0 + "' retObj='" + retObjName + "'")
                 let tmpName: str = blockBuilderNextTemp(b, "__callret")
                 let tmpSlot: int32 = localAdd(b.env, tmpName, mirTypeI64())
                 mirSetLocalType(b.func, tmpSlot, mirTypeI64())
@@ -6613,8 +7641,8 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                 addSon(brNode, argNodes[1])
                 return lowerExprValue(b, brNode, wantType)
 
-        # Structural Result[T] builtins: prefer field-based lowering over missing monomorphized helpers.
-        if b.module != nil && typeArgs.len == 0 && argNodes.len == 1:
+        # Structural Result-like builtins: prefer field-based lowering over missing monomorphized helpers.
+        if b.module != nil && argNodes.len == 1:
             let arg0: Node = argNodes[0]
             if arg0 != nil:
                 var arg0Key: str = mirInferNodeTypeKeyForOverload(b, arg0)
@@ -6626,7 +7654,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                     arg0Key = str(ptr_add(void*(arg0Key), 4))
                 if mirStrStartsWith(arg0Key, "ptr_"):
                     arg0Key = str(ptr_add(void*(arg0Key), 4))
-                if ((arg0Key == "Result") || mirStrStartsWith(arg0Key, "Result_")) && mirHasObjType(b.module, arg0Key):
+                if mirHasObjType(b.module, arg0Key):
                     let ot0: MirObjType = mirGetObjType(b.module, arg0Key)
                     var hasOk: bool = false
                     var hasValue: bool = false
@@ -6641,47 +7669,103 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                             hasErr = true
                         if hasOk && hasValue && hasErr:
                             break
+                    var resultLike: bool = hasValue &&
+                        (hasOk || hasErr || arg0Key == "Result" || mirStrStartsWith(arg0Key, "Result_"))
+                    if resultLike:
+                        if name == "Value":
+                            let dotNode0: Node = newNode(nkDotExpr, node.pos)
+                            addSon(dotNode0, arg0)
+                            addSon(dotNode0, newIdent("value", node.pos))
+                            return lowerExprValue(b, dotNode0, wantType)
+                        if name == "ErrorInfoOf" && hasErr:
+                            let dotNode1: Node = newNode(nkDotExpr, node.pos)
+                            addSon(dotNode1, arg0)
+                            addSon(dotNode1, newIdent("err", node.pos))
+                            return lowerExprValue(b, dotNode1, wantType)
+                        if name == "IsOk" && hasOk:
+                            let dotNode2: Node = newNode(nkDotExpr, node.pos)
+                            addSon(dotNode2, arg0)
+                            addSon(dotNode2, newIdent("ok", node.pos))
+                            return lowerExprValue(b, dotNode2, wantType)
+                        if name == "IsErr" && hasOk:
+                            let dotNode3: Node = newNode(nkDotExpr, node.pos)
+                            addSon(dotNode3, arg0)
+                            addSon(dotNode3, newIdent("ok", node.pos))
+                            let notNode: Node = newNode(nkPrefix, node.pos)
+                            addSon(notNode, newIdent("!", node.pos))
+                            addSon(notNode, dotNode3)
+                            return lowerExprValue(b, notNode, wantType)
+                        if name == "Error" && hasErr && moduleHasFuncByBase(b.module, "Lp2pErrorMessage"):
+                            let dotNode4: Node = newNode(nkDotExpr, node.pos)
+                            addSon(dotNode4, arg0)
+                            addSon(dotNode4, newIdent("err", node.pos))
+                            let errCall: Node = newNode(nkCall, node.pos)
+                            addSon(errCall, newIdent("Lp2pErrorMessage", node.pos))
+                            addSon(errCall, dotNode4)
+                            return lowerExprValue(b, errCall, wantType)
 
-                    if name == "Value" && hasValue:
-                        let dotNode0: Node = newNode(nkDotExpr, node.pos)
-                        addSon(dotNode0, arg0)
-                        addSon(dotNode0, newIdent("value", node.pos))
-                        return lowerExprValue(b, dotNode0, wantType)
-                    if name == "ErrorInfoOf" && hasErr:
-                        let dotNode1: Node = newNode(nkDotExpr, node.pos)
-                        addSon(dotNode1, arg0)
-                        addSon(dotNode1, newIdent("err", node.pos))
-                        return lowerExprValue(b, dotNode1, wantType)
-                    if name == "IsOk" && hasOk:
-                        let dotNode2: Node = newNode(nkDotExpr, node.pos)
-                        addSon(dotNode2, arg0)
-                        addSon(dotNode2, newIdent("ok", node.pos))
-                        return lowerExprValue(b, dotNode2, wantType)
-                    if name == "IsErr" && hasOk:
-                        let dotNode3: Node = newNode(nkDotExpr, node.pos)
-                        addSon(dotNode3, arg0)
-                        addSon(dotNode3, newIdent("ok", node.pos))
-                        let notNode: Node = newNode(nkPrefix, node.pos)
-                        addSon(notNode, newIdent("!", node.pos))
-                        addSon(notNode, dotNode3)
-                        return lowerExprValue(b, notNode, wantType)
-                    if name == "Error" && hasErr && moduleHasFuncByBase(b.module, "Lp2pErrorMessage"):
-                        let dotNode4: Node = newNode(nkDotExpr, node.pos)
-                        addSon(dotNode4, arg0)
-                        addSon(dotNode4, newIdent("err", node.pos))
-                        let errCall: Node = newNode(nkCall, node.pos)
-                        addSon(errCall, newIdent("Lp2pErrorMessage", node.pos))
-                        addSon(errCall, dotNode4)
-                        return lowerExprValue(b, errCall, wantType)
-
-        # Legacy: rewrite `Value(x)` to `x.value` when the helper is missing.
-        if b.module != nil && typeArgs.len == 0 && name == "Value" && argNodes.len == 1 && !moduleHasFuncByBase(b.module, "Value"):
+        # Legacy fallback: lower unresolved `Value(x)` from Result-like object layout.
+        if b.module != nil && name == "Value" && argNodes.len == 1:
             let baseNode: Node = argNodes[0]
             if baseNode != nil:
-                let dotNode0: Node = newNode(nkDotExpr, node.pos)
-                addSon(dotNode0, baseNode)
-                addSon(dotNode0, newIdent("value", node.pos))
-                return lowerExprValue(b, dotNode0, wantType)
+                var baseKey: str = mirInferNodeTypeKeyForOverload(b, baseNode)
+                if mirStrStartsWith(baseKey, "ref_"):
+                    baseKey = str(ptr_add(void*(baseKey), 4))
+                elif mirStrStartsWith(baseKey, "var_ref_"):
+                    baseKey = str(ptr_add(void*(baseKey), 8))
+                elif mirStrStartsWith(baseKey, "var_"):
+                    baseKey = str(ptr_add(void*(baseKey), 4))
+                if mirStrStartsWith(baseKey, "ptr_"):
+                    baseKey = str(ptr_add(void*(baseKey), 4))
+                let objName1: str = mirObjTypeFromTypeKey(b.module, baseKey)
+                var hasOk1: bool = false
+                var hasErr1: bool = false
+                var valueOff1: int32 = -1
+                var valueTy1: MirType = mirTypeVoid()
+                var valueKey1: str = ""
+                if objName1 != nil && len(objName1) > 0 && mirHasObjType(b.module, objName1):
+                    let ot1: MirObjType = mirGetObjType(b.module, objName1)
+                    for fi1 in 0..<ot1.fields.len:
+                        let f1: MirObjField = ot1.fields[fi1]
+                        if (f1.name == "ok"):
+                            hasOk1 = true
+                        elif (f1.name == "err") || mirStrStartsWith(f1.name, "err."):
+                            hasErr1 = true
+                        elif ((f1.name == "value") || mirStrStartsWith(f1.name, "value.")) && valueOff1 < 0:
+                            valueOff1 = f1.offset
+                            valueTy1 = f1.ty
+                            valueKey1 = mirObjFieldTypeKeyGet(objName1, "value")
+                if valueOff1 < 0 && mirStrStartsWith(baseKey, "Result_"):
+                    valueOff1 = 0
+                    hasErr1 = true
+                    let baseValKey1: str = str(ptr_add(void*(baseKey), 7))
+                    if baseValKey1 != nil && len(baseValKey1) > 0:
+                        valueKey1 = baseValKey1
+                var resultLike1: bool = false
+                if valueOff1 >= 0:
+                    if hasOk1 || hasErr1:
+                        resultLike1 = true
+                    elif objName1 == "Result" || mirStrStartsWith(objName1, "Result_") || mirStrStartsWith(baseKey, "Result_"):
+                        resultLike1 = true
+                if resultLike1:
+                    let baseRes1: Result[MirExpr] = lowerExprValue(b, baseNode, mirTypeI64())
+                    if IsOk[MirExpr](baseRes1):
+                        let basePtr1: MirExpr = Value[MirExpr](baseRes1)
+                        var valueAddr1: MirExpr = basePtr1
+                        if valueOff1 != 0:
+                            valueAddr1 = mirBin(mbAdd, basePtr1, mirConstI64(int64(valueOff1)))
+                        var outTy1: MirType = wantType
+                        if outTy1.kind == mtVoid && valueTy1.kind != mtVoid:
+                            outTy1 = valueTy1
+                        if outTy1.kind == mtVoid && valueKey1 != nil && len(valueKey1) > 0:
+                            outTy1 = mirTypeFromNodeWithModule(b.module, newIdent(valueKey1, node.pos))
+                        if outTy1.kind == mtVoid:
+                            let innerKey1: str = mirInferValueCallInnerKey(b, node)
+                            if innerKey1 != nil && len(innerKey1) > 0:
+                                outTy1 = mirTypeFromNodeWithModule(b.module, newIdent(innerKey1, node.pos))
+                        if outTy1.kind == mtVoid:
+                            outTy1 = mirTypeI64()
+                        return Ok[MirExpr](mirLoad(valueAddr1, outTy1))
 
         # Indirect call: callee is a function pointer expression (stored in a local/field).
         if b.module != nil:
@@ -6764,7 +7848,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                 return Ok[MirExpr](mirCall(indName, indArgs))
 
         let modSig: MirModule = b.module
-        if modSig != nil:
+        if modSig != nil && !(name == "Value" && argNodes.len == 1):
             let hintSig: str = mirInferCallRetKeyHint(node)
             let calleeSig: MirFunc = mirResolveCalleeFuncBestEffort(b, callName0, argNodes, hintSig)
             if calleeSig != nil && calleeSig.params.len > 0:
@@ -6910,8 +7994,54 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                     return ErrInfo[MirExpr](ErrorInfoOf[MirFunc](calleeRes))
                 calleeFunc = Value[MirFunc](calleeRes)
                 callInternal = calleeFunc.name
+        if name == "Value" && argNodes.len == 1:
+            let valueArg0: Node = argNodes[0]
+            if valueArg0 != nil:
+                let valueBaseRes: Result[MirExpr] = lowerExprValue(b, valueArg0, mirTypeI64())
+                if IsOk[MirExpr](valueBaseRes):
+                    var valueAddr0: MirExpr = Value[MirExpr](valueBaseRes)
+                    if mod2 != nil:
+                        var valueArgKey0: str = mirInferNodeTypeKeyForOverload(b, valueArg0)
+                        if mirStrStartsWith(valueArgKey0, "ref_"):
+                            valueArgKey0 = str(ptr_add(void*(valueArgKey0), 4))
+                        elif mirStrStartsWith(valueArgKey0, "var_ref_"):
+                            valueArgKey0 = str(ptr_add(void*(valueArgKey0), 8))
+                        elif mirStrStartsWith(valueArgKey0, "var_"):
+                            valueArgKey0 = str(ptr_add(void*(valueArgKey0), 4))
+                        if mirStrStartsWith(valueArgKey0, "ptr_"):
+                            valueArgKey0 = str(ptr_add(void*(valueArgKey0), 4))
+                        let valueObj0: str = mirObjTypeFromTypeKey(mod2, valueArgKey0)
+                        if valueObj0 != nil && len(valueObj0) > 0 && mirHasObjType(mod2, valueObj0):
+                            let valueOt0: MirObjType = mirGetObjType(mod2, valueObj0)
+                            var valueOff0: int32 = -1
+                            for vfi in 0..<valueOt0.fields.len:
+                                let vf0: MirObjField = valueOt0.fields[vfi]
+                                if (vf0.name == "value") || mirStrStartsWith(vf0.name, "value."):
+                                    valueOff0 = vf0.offset
+                                    break
+                            if valueOff0 > 0:
+                                valueAddr0 = mirBin(mbAdd, valueAddr0, mirConstI64(int64(valueOff0)))
+                    var valueOutTy0: MirType = wantType
+                    if valueOutTy0.kind == mtVoid && mod2 != nil:
+                        let valueInnerKey0: str = mirInferValueCallInnerKey(b, node)
+                        if valueInnerKey0 != nil && len(valueInnerKey0) > 0:
+                            valueOutTy0 = mirTypeFromNodeWithModule(mod2, newIdent(valueInnerKey0, node.pos))
+                    if valueOutTy0.kind == mtVoid:
+                        valueOutTy0 = mirTypeI64()
+                    if getEnv "CHENG_BACKEND_DEBUG_VALUE_LOWER" == "1":
+                        var fnDbg0: str = ""
+                        if b != nil && b.func != nil:
+                            let fDbg0: MirFunc = b.func
+                            fnDbg0 = fDbg0.name
+                        echo("[backend] debugValueLower: fn=" + fnDbg0 + " valueOutTy=" + mirTypeKindName(valueOutTy0))
+                    return Ok[MirExpr](mirLoad(valueAddr0, valueOutTy0))
 
         var args: MirExpr[]
+        let dbgVarCallRaw: str = getEnv "CHENG_BACKEND_DEBUG_VARCALL"
+        var dbgVarCall: bool = (dbgVarCallRaw == "1")
+        let dbgVarCallName: str = getEnv "CHENG_BACKEND_DEBUG_VARCALL_NAME"
+        if dbgVarCall && dbgVarCallName != nil && len(dbgVarCallName) > 0:
+            dbgVarCall = (callName == dbgVarCallName)
         for ai2 in 0..<argNodes.len:
             let argNode: Node = argNodes[ai2]
             let dbgSpawn: bool = (getEnv "CHENG_BACKEND_DEBUG_SPAWN" == "1")
@@ -6922,12 +8052,14 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                 echo("[backend] debugSpawn: arg#" + intToStr(ai2 + 1) + " kind=nk#" + kindStr)
             var wantVarAddr: bool = false
             var pi2: int32 = ai2
+            var dbgParamKey: str = ""
             if calleeFunc != nil && calleeFunc.params.len > 0:
                 let pFirst: MirParam = calleeFunc.params[0]
                 if (pFirst.name == "__ret"):
                     pi2 = ai2 + 1
             if calleeFunc != nil && pi2 >= 0 && pi2 < calleeFunc.params.len:
                 let p0: MirParam = calleeFunc.params[pi2]
+                dbgParamKey = p0.typeKey
                 if mirStrStartsWith(p0.typeKey, "var_"):
                     let baseKey: str = str(ptr_add(void*(p0.typeKey), 4))
                     if baseKey == nil || len(baseKey) == 0 || mod2 == nil:
@@ -6943,6 +8075,15 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                         wantVarAddr = true
                 elif (p0.typeKey == "var"):
                     wantVarAddr = true
+            if dbgVarCall:
+                var calleeDbg: str = ""
+                if calleeFunc != nil:
+                    calleeDbg = calleeFunc.name
+                echo("[backend] debugVarCall: call=" + callName +
+                     " callee=" + calleeDbg +
+                     " argIdx=" + intToStr(ai2) +
+                     " paramKey=" + dbgParamKey +
+                     " wantVarAddr=" + (wantVarAddr ? "1" : "0"))
             if wantVarAddr:
                 let addrRes: Result[MirExpr] = lowerVarArgAddr(b, argNode)
                 if !IsOk[MirExpr](addrRes):
@@ -6959,6 +8100,41 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                 if !IsOk[MirExpr](argRes):
                     return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](argRes))
                 add(args, Value[MirExpr](argRes))
+        let valueLikeCall1: bool = (callInternal == "Value") || (callName == "Value") ||
+            (calleeFunc != nil && calleeFunc.linkName != nil && (calleeFunc.linkName == "Value"))
+        if valueLikeCall1 && args.len >= 1:
+            var valueAddr1: MirExpr = args[0]
+            if mod2 != nil && argNodes.len > 0 && argNodes[0] != nil:
+                var valueArgKey1: str = mirInferNodeTypeKeyForOverload(b, argNodes[0])
+                if mirStrStartsWith(valueArgKey1, "ref_"):
+                    valueArgKey1 = str(ptr_add(void*(valueArgKey1), 4))
+                elif mirStrStartsWith(valueArgKey1, "var_ref_"):
+                    valueArgKey1 = str(ptr_add(void*(valueArgKey1), 8))
+                elif mirStrStartsWith(valueArgKey1, "var_"):
+                    valueArgKey1 = str(ptr_add(void*(valueArgKey1), 4))
+                if mirStrStartsWith(valueArgKey1, "ptr_"):
+                    valueArgKey1 = str(ptr_add(void*(valueArgKey1), 4))
+                var valueOff1: int32 = -1
+                let valueObj1: str = mirObjTypeFromTypeKey(mod2, valueArgKey1)
+                if valueObj1 != nil && len(valueObj1) > 0 && mirHasObjType(mod2, valueObj1):
+                    let valueOt1: MirObjType = mirGetObjType(mod2, valueObj1)
+                    for vfi1 in 0..<valueOt1.fields.len:
+                        let vf1: MirObjField = valueOt1.fields[vfi1]
+                        if (vf1.name == "value") || mirStrStartsWith(vf1.name, "value."):
+                            if valueOff1 < 0 || vf1.offset < valueOff1:
+                                valueOff1 = vf1.offset
+                if valueOff1 < 0 && mirStrStartsWith(valueArgKey1, "Result_"):
+                    valueOff1 = 0
+                if valueOff1 > 0:
+                    valueAddr1 = mirBin(mbAdd, valueAddr1, mirConstI64(int64(valueOff1)))
+            var outTy1: MirType = wantType
+            if outTy1.kind == mtVoid && mod2 != nil:
+                let innerKey2: str = mirInferValueCallInnerKey(b, node)
+                if innerKey2 != nil && len(innerKey2) > 0:
+                    outTy1 = mirTypeFromNodeWithModule(mod2, newIdent(innerKey2, node.pos))
+            if outTy1.kind == mtVoid:
+                outTy1 = mirTypeI64()
+            return Ok[MirExpr](mirLoad(valueAddr1, outTy1))
         return Ok[MirExpr](mirCall(callInternal, args))
     if node.kind == nkPrefix && kidCount(node) > 1:
         let opNode: Node = kid(node, 0)
@@ -7219,6 +8395,10 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
 fn mirBuildExpr(env: LocalEnv, n: Node): Result[MirExpr] =
     if n == nil:
         return Err[MirExpr]("mir_builder: nil expr")
+    if n.kind == nkCallArg:
+        if kidCount(n) > 0:
+            return mirBuildExpr(env, kid(n, kidCount(n) - 1))
+        return Err[MirExpr]("mir_builder: invalid call arg expr")
     if n.kind == nkIntLit:
         return Ok[MirExpr](mirConstI64(n.intVal))
     if n.kind == nkFloatLit:
@@ -7696,6 +8876,30 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
         if dstOl.frameOff < 0:
             # Pointer-like locals (e.g. `T*`, `ref T`) are tracked as objLocals for layout info,
             # but they do not own object storage. Assign them like scalar pointer slots.
+            let slotKeyPtr: str = localTypeKey(b.env, slot)
+            if slotKeyPtr != nil && len(slotKeyPtr) > 0 && mirStrStartsWith(slotKeyPtr, "var_") &&
+               !mirStrStartsWith(slotKeyPtr, "var_ref_"):
+                let dstPtrVar: MirExpr = mirLocal(slot)
+                if exprNode == nil || exprNode.kind == nkEmpty:
+                    let initVarRes: Result[bool] = emitObjDefaultInitPtrs(b, dstPtrVar, objTypeName)
+                    if !IsOk[bool](initVarRes):
+                        return ErrInfo[bool](ErrorInfoOf[bool](initVarRes))
+                    return Ok[bool](false)
+                var nodeVarPtr: Node = exprNode
+                while nodeVarPtr != nil && nodeVarPtr.kind == nkPar && kidCount(nodeVarPtr) > 0:
+                    nodeVarPtr = kid(nodeVarPtr, 0)
+                if nodeVarPtr != nil && nodeVarPtr.kind == nkCall:
+                    let callVarRes: Result[MirExpr] = lowerCallWithLeadingArg(b, nodeVarPtr, dstPtrVar)
+                    if !IsOk[MirExpr](callVarRes):
+                        return ErrInfo[bool](ErrorInfoOf[MirExpr](callVarRes))
+                    return Ok[bool](false)
+                let srcVarPtrRes: Result[MirExpr] = lowerExprValue(b, exprNode, mirTypeI64())
+                if !IsOk[MirExpr](srcVarPtrRes):
+                    return ErrInfo[bool](ErrorInfoOf[MirExpr](srcVarPtrRes))
+                let copyVarPtrRes: Result[bool] = emitObjCopyPtrs(b, dstPtrVar, objTypeName, Value[MirExpr](srcVarPtrRes))
+                if !IsOk[bool](copyVarPtrRes):
+                    return ErrInfo[bool](ErrorInfoOf[bool](copyVarPtrRes))
+                return Ok[bool](false)
             if exprNode == nil || exprNode.kind == nkEmpty:
                 add(b.currentStmts, mirStmtAssign(name, slot, mirConstI64(0)))
                 return Ok[bool](false)
@@ -7794,7 +8998,7 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
             let srcRes: Result[MirExpr] = lowerExprValue(b, node, mirTypeI64())
             if !IsOk[MirExpr](srcRes):
                 return ErrInfo[bool](ErrorInfoOf[MirExpr](srcRes))
-            let tmpName: str = blockBuilderNextTemp(b, "__obj_src")
+            let tmpName: str = "__obj_src"
             let tmpSlot: int32 = localAdd(b.env, tmpName, mirTypeI64())
             mirSetLocalType(b.func, tmpSlot, mirTypeI64())
             add(b.currentStmts, mirStmtLet(tmpName, tmpSlot, Value[MirExpr](srcRes)))
@@ -7873,7 +9077,7 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
                 let srcRes: Result[MirExpr] = lowerExprValue(b, node, mirTypeI64())
                 if !IsOk[MirExpr](srcRes):
                     return ErrInfo[bool](ErrorInfoOf[MirExpr](srcRes))
-                let tmpName: str = blockBuilderNextTemp(b, "__obj_src")
+                let tmpName: str = "__obj_src"
                 let tmpSlot: int32 = localAdd(b.env, tmpName, mirTypeI64())
                 mirSetLocalType(b.func, tmpSlot, mirTypeI64())
                 add(b.currentStmts, mirStmtLet(tmpName, tmpSlot, Value[MirExpr](srcRes)))
@@ -7885,7 +9089,7 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
             let srcRes: Result[MirExpr] = lowerExprValue(b, node, mirTypeI64())
             if !IsOk[MirExpr](srcRes):
                 return ErrInfo[bool](ErrorInfoOf[MirExpr](srcRes))
-            let tmpName: str = blockBuilderNextTemp(b, "__obj_src")
+            let tmpName: str = "__obj_src"
             let tmpSlot: int32 = localAdd(b.env, tmpName, mirTypeI64())
             mirSetLocalType(b.func, tmpSlot, mirTypeI64())
             add(b.currentStmts, mirStmtLet(tmpName, tmpSlot, Value[MirExpr](srcRes)))
@@ -7897,7 +9101,7 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
             let srcRes4: Result[MirExpr] = lowerExprValue(b, node, mirTypeI64())
             if !IsOk[MirExpr](srcRes4):
                 return ErrInfo[bool](ErrorInfoOf[MirExpr](srcRes4))
-            let tmpName4: str = blockBuilderNextTemp(b, "__obj_src")
+            let tmpName4: str = "__obj_src"
             let tmpSlot4: int32 = localAdd(b.env, tmpName4, mirTypeI64())
             mirSetLocalType(b.func, tmpSlot4, mirTypeI64())
             add(b.currentStmts, mirStmtLet(tmpName4, tmpSlot4, Value[MirExpr](srcRes4)))
@@ -7931,6 +9135,75 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
                          " (obj=" + objTypeName + " rhsKind=nk#" + k +
                          " tcObj=" + tcObj + " tcKind=nk#" + tcKind +
                          " fn=" + fnName + " " + fp + ":" + line + ":" + col + ")")
+    let slotKey0: str = localTypeKey(b.env, slot)
+    if slotKey0 != nil && len(slotKey0) > 0 &&
+       (mirStrStartsWith(slotKey0, "var_") || mirStrStartsWith(slotKey0, "var_ref_") || (slotKey0 == "var")):
+        var baseKey0: str = slotKey0
+        if mirStrStartsWith(baseKey0, "var_ref_"):
+            baseKey0 = str(ptr_add(void*(baseKey0), 8))
+        elif mirStrStartsWith(baseKey0, "var_"):
+            baseKey0 = str(ptr_add(void*(baseKey0), 4))
+        var storeThroughAddr: bool = true
+        if baseKey0 != nil && len(baseKey0) > 0 && b.module != nil:
+            if mirHasObjType(b.module, baseKey0):
+                let aliasTy0: MirType = mirTryGetTypeAlias(b.module, baseKey0)
+                storeThroughAddr = aliasTy0.kind != mtVoid
+            elif mirStrStartsWith(baseKey0, "seq_") && mirHasObjType(b.module, "seq"):
+                storeThroughAddr = false
+        if storeThroughAddr:
+            var storeTy0: MirType = mirTypeI64()
+            if baseKey0 != nil && len(baseKey0) > 0:
+                if mirStrStartsWith(baseKey0, "ptr_") || mirStrStartsWith(baseKey0, "ref_") ||
+                   mirStrStartsWith(baseKey0, "var_") || mirStrStartsWith(baseKey0, "var_ref_") ||
+                   (baseKey0 == "ptr") || (baseKey0 == "ref") || (baseKey0 == "var"):
+                    storeTy0 = mirTypeI64()
+                else:
+                    storeTy0 = mirTypeFromTypeKeyName(baseKey0)
+                    if storeTy0.kind == mtVoid:
+                        storeTy0 = mirTypeI64()
+            if exprNode == nil || exprNode.kind == nkEmpty:
+                add(b.currentStmts, mirStmtStore(mirLocal(slot), mirConstI64(0), storeTy0))
+                return Ok[bool](false)
+            let rhsVarRes: Result[MirExpr] = lowerExprValue(b, exprNode, storeTy0)
+            if !IsOk[MirExpr](rhsVarRes):
+                return ErrInfo[bool](ErrorInfoOf[MirExpr](rhsVarRes))
+            add(b.currentStmts, mirStmtStore(mirLocal(slot), Value[MirExpr](rhsVarRes), storeTy0))
+            return Ok[bool](false)
+        # Object-value `var` assignment must write through the pointed storage.
+        # Rebinding the local pointer slot drops the caller-visible update.
+        var dstObjType: str = ""
+        if baseKey0 != nil && len(baseKey0) > 0 && b.module != nil:
+            dstObjType = mirObjTypeFromTypeKey(b.module, baseKey0)
+            if (dstObjType == nil || len(dstObjType) == 0) &&
+               (baseKey0 == "seq" || mirStrStartsWith(baseKey0, "seq_") || mirStrStartsWith(baseKey0, "seq_fixed_")) &&
+               mirHasObjType(b.module, "seq"):
+                dstObjType = "seq"
+            if (dstObjType == nil || len(dstObjType) == 0) &&
+               (baseKey0 == "Table" || mirStrStartsWith(baseKey0, "Table_")) &&
+               mirHasObjType(b.module, "Table"):
+                dstObjType = "Table"
+        if dstObjType != nil && len(dstObjType) > 0:
+            let dstPtr0: MirExpr = mirLocal(slot)
+            if exprNode == nil || exprNode.kind == nkEmpty:
+                let initRes0: Result[bool] = emitObjDefaultInitPtrs(b, dstPtr0, dstObjType)
+                if !IsOk[bool](initRes0):
+                    return ErrInfo[bool](ErrorInfoOf[bool](initRes0))
+                return Ok[bool](false)
+            var nodeVar0: Node = exprNode
+            while nodeVar0 != nil && nodeVar0.kind == nkPar && kidCount(nodeVar0) > 0:
+                nodeVar0 = kid(nodeVar0, 0)
+            if nodeVar0 != nil && nodeVar0.kind == nkCall:
+                let callRes0: Result[MirExpr] = lowerCallWithLeadingArg(b, nodeVar0, dstPtr0)
+                if !IsOk[MirExpr](callRes0):
+                    return ErrInfo[bool](ErrorInfoOf[MirExpr](callRes0))
+                return Ok[bool](false)
+            let srcVarRes: Result[MirExpr] = lowerExprValue(b, exprNode, mirTypeI64())
+            if !IsOk[MirExpr](srcVarRes):
+                return ErrInfo[bool](ErrorInfoOf[MirExpr](srcVarRes))
+            let copyVarRes: Result[bool] = emitObjCopyPtrs(b, dstPtr0, dstObjType, Value[MirExpr](srcVarRes))
+            if !IsOk[bool](copyVarRes):
+                return ErrInfo[bool](ErrorInfoOf[bool](copyVarRes))
+            return Ok[bool](false)
     if exprNode == nil || exprNode.kind == nkEmpty:
         add(b.currentStmts, mirStmtAssign(name, slot, mirConstI64(0)))
         return Ok[bool](false)
@@ -8322,7 +9595,7 @@ fn lowerForStmt(b: BlockBuilder, forNode: Node): Result[bool] =
         add(b.currentStmts, mirStmtLet(iterTmpName, iterTmpSlot, Value[MirExpr](iterRes)))
         let iterPtr: MirExpr = mirLocal(iterTmpSlot)
 
-        # Inline table iteration (minimal): scan slots and yield non-nil entries.
+        # Inline table iteration: scan `states` and yield matching `keys`/`vals`.
         var tblObjName: str = ""
         if b.module != nil:
             tblObjName = mirPtrBaseObjTypeName(b.module, iterKey)
@@ -8343,28 +9616,46 @@ fn lowerForStmt(b: BlockBuilder, forNode: Node): Result[bool] =
         if b.module == nil || tblObjName == nil || len(tblObjName) == 0 || ! mirHasObjType(b.module, tblObjName):
             return Err[bool]("mir_builder: unknown Table object type")
         let tblOt: MirObjType = mirGetObjType(b.module, tblObjName)
-        var slotsLenOff: int32 = -1
-        var slotsBufOff: int32 = -1
+        var keysLenOff: int32 = -1
+        var keysBufOff: int32 = -1
+        var valsBufOff: int32 = -1
+        var statesBufOff: int32 = -1
         for fi2 in 0..<tblOt.fields.len:
             let f: MirObjField = tblOt.fields[fi2]
-            if (f.name == "slots.len"):
-                slotsLenOff = f.offset
-            elif (f.name == "slots.buffer"):
-                slotsBufOff = f.offset
-        if slotsLenOff < 0 || slotsBufOff < 0:
-            return Err[bool]("mir_builder: Table slots layout mismatch")
+            if (f.name == "keys.len"):
+                keysLenOff = f.offset
+            elif (f.name == "keys.buffer"):
+                keysBufOff = f.offset
+            elif (f.name == "vals.buffer"):
+                valsBufOff = f.offset
+            elif (f.name == "states.buffer"):
+                statesBufOff = f.offset
+        if keysLenOff < 0 || keysBufOff < 0 || valsBufOff < 0 || statesBufOff < 0:
+            return Err[bool]("mir_builder: Table layout mismatch")
 
         let capName: str = blockBuilderNextTemp(b, "__tbl_cap")
         let capSlot: int32 = localAdd(b.env, capName, mirTypeI32())
         mirSetLocalType(b.func, capSlot, mirTypeI32())
-        let capAddr: MirExpr = (slotsLenOff == 0) ? iterPtr : mirBin(mbAdd, iterPtr, mirConstI64(int64(slotsLenOff)))
+        let capAddr: MirExpr = (keysLenOff == 0) ? iterPtr : mirBin(mbAdd, iterPtr, mirConstI64(int64(keysLenOff)))
         add(b.currentStmts, mirStmtLet(capName, capSlot, mirLoad(capAddr, mirTypeI32())))
 
-        let bufName: str = blockBuilderNextTemp(b, "__tbl_buf")
-        let bufSlot: int32 = localAdd(b.env, bufName, mirTypeI64())
-        mirSetLocalType(b.func, bufSlot, mirTypeI64())
-        let bufAddr: MirExpr = (slotsBufOff == 0) ? iterPtr : mirBin(mbAdd, iterPtr, mirConstI64(int64(slotsBufOff)))
-        add(b.currentStmts, mirStmtLet(bufName, bufSlot, mirLoad(bufAddr, mirTypeI64())))
+        let keysBufName: str = blockBuilderNextTemp(b, "__tbl_kbuf")
+        let keysBufSlot: int32 = localAdd(b.env, keysBufName, mirTypeI64())
+        mirSetLocalType(b.func, keysBufSlot, mirTypeI64())
+        let keysBufAddr: MirExpr = (keysBufOff == 0) ? iterPtr : mirBin(mbAdd, iterPtr, mirConstI64(int64(keysBufOff)))
+        add(b.currentStmts, mirStmtLet(keysBufName, keysBufSlot, mirLoad(keysBufAddr, mirTypeI64())))
+
+        let valsBufName: str = blockBuilderNextTemp(b, "__tbl_vbuf")
+        let valsBufSlot: int32 = localAdd(b.env, valsBufName, mirTypeI64())
+        mirSetLocalType(b.func, valsBufSlot, mirTypeI64())
+        let valsBufAddr: MirExpr = (valsBufOff == 0) ? iterPtr : mirBin(mbAdd, iterPtr, mirConstI64(int64(valsBufOff)))
+        add(b.currentStmts, mirStmtLet(valsBufName, valsBufSlot, mirLoad(valsBufAddr, mirTypeI64())))
+
+        let statesBufName: str = blockBuilderNextTemp(b, "__tbl_sbuf")
+        let statesBufSlot: int32 = localAdd(b.env, statesBufName, mirTypeI64())
+        mirSetLocalType(b.func, statesBufSlot, mirTypeI64())
+        let statesBufAddr: MirExpr = (statesBufOff == 0) ? iterPtr : mirBin(mbAdd, iterPtr, mirConstI64(int64(statesBufOff)))
+        add(b.currentStmts, mirStmtLet(statesBufName, statesBufSlot, mirLoad(statesBufAddr, mirTypeI64())))
 
         let keyName: str = patNames[0]
         let keySlot: int32 = localAdd(b.env, keyName, mirTypeI64())
@@ -8375,14 +9666,21 @@ fn lowerForStmt(b: BlockBuilder, forNode: Node): Result[bool] =
         var valName: str = ""
         var valSlot: int32 = -1
         var valTy: MirType = mirTypeI64()
+        var valSize: int32 = 8
         if patNames.len == 2:
             hasVal = true
             valName = patNames[1]
             var valKey: str = mirTypeKeyTableValKey(iterKey)
             if (valKey == nil || len(valKey) == 0) && iterExpr != nil && iterExpr.typeCacheValid && iterExpr.typeCache != nil:
                 valKey = mirTypeKeyTableValKey(typeKey(iterExpr.typeCache))
-            let valTypeNode: Node = newIdent(valKey, forNode.pos)
-            valTy = mirTypeFromNodeWithModule(b.module, valTypeNode)
+            if valKey != nil && len(valKey) > 0:
+                let valTypeNode: Node = newIdent(valKey, forNode.pos)
+                let valTy2: MirType = mirTypeFromNodeWithModule(b.module, valTypeNode)
+                if valTy2.kind != mtVoid:
+                    valTy = valTy2
+                    let valSize2: int32 = mirTypeSize(valTy)
+                    if valSize2 > 0:
+                        valSize = valSize2
             valSlot = localAdd(b.env, valName, valTy)
             mirSetLocalType(b.func, valSlot, valTy)
             add(b.currentStmts, mirStmtVar(valName, valSlot, mirConstI64(0)))
@@ -8392,24 +9690,10 @@ fn lowerForStmt(b: BlockBuilder, forNode: Node): Result[bool] =
         mirSetLocalType(b.func, idxSlot, mirTypeI32())
         add(b.currentStmts, mirStmtVar(idxName, idxSlot, mirConstI64(0)))
 
-        let epName: str = blockBuilderNextTemp(b, "__tbl_ep")
-        let epSlot: int32 = localAdd(b.env, epName, mirTypeI64())
-        mirSetLocalType(b.func, epSlot, mirTypeI64())
-        add(b.currentStmts, mirStmtVar(epName, epSlot, mirConstI64(0)))
-
-        # Entry layout: try to query obj type, otherwise assume `{ key: str, val: V }`.
-        var keyOff: int32 = 0
-        var valOff: int32 = 8
-        let valKey2: str = mirTypeKeyTableValKey(iterKey)
-        let entryName: str = "__cheng_tables_Entry_" + valKey2
-        if b.module != nil && mirHasObjType(b.module, entryName):
-            let eot: MirObjType = mirGetObjType(b.module, entryName)
-            for i3 in 0..<eot.fields.len:
-                let f: MirObjField = eot.fields[i3]
-                if (f.name == "key"):
-                    keyOff = f.offset
-                elif (f.name == "val"):
-                    valOff = f.offset
+        let curIdxName: str = blockBuilderNextTemp(b, "__tbl_cur_i")
+        let curIdxSlot: int32 = localAdd(b.env, curIdxName, mirTypeI32())
+        mirSetLocalType(b.func, curIdxSlot, mirTypeI32())
+        add(b.currentStmts, mirStmtVar(curIdxName, curIdxSlot, mirConstI64(0)))
 
         let scanLabel: str = blockBuilderNextLabel(b, "for_scan")
         let loadLabel: str = blockBuilderNextLabel(b, "for_load")
@@ -8422,26 +9706,23 @@ fn lowerForStmt(b: BlockBuilder, forNode: Node): Result[bool] =
         blockBuilderFinish(b, mirTermCbr(scanCond, loadLabel, endLabel))
 
         blockBuilderStart(b, loadLabel)
-        let idx64: MirExpr = mirCast(mirTypeI64(), mirLocal(idxSlot))
-        let off: MirExpr = mirBin(mbMul, idx64, mirConstI64(8))
-        let addr: MirExpr = mirBin(mbAdd, mirLocal(bufSlot), off)
-        let epVal: MirExpr = mirLoad(addr, mirTypeI64())
-        add(b.currentStmts, mirStmtAssign(epName, epSlot, epVal))
+        add(b.currentStmts, mirStmtAssign(curIdxName, curIdxSlot, mirLocal(idxSlot)))
+        let curIdx64: MirExpr = mirCast(mirTypeI64(), mirLocal(curIdxSlot))
+        let stAddr: MirExpr = mirBin(mbAdd, mirLocal(statesBufSlot), curIdx64)
+        let stVal: MirExpr = mirLoad(stAddr, mirTypeU8())
         let incExpr: MirExpr = mirBin(mbAdd, mirLocal(idxSlot), mirConstI64(1))
         add(b.currentStmts, mirStmtAssign(idxName, idxSlot, incExpr))
-        let hasEntry: MirExpr = mirCmp(mcNe, mirLocal(epSlot), mirConstI64(0))
-        blockBuilderFinish(b, mirTermCbr(hasEntry, bodyLabel, scanLabel))
+        let isUsed: MirExpr = mirCmp(mcNe, stVal, mirConstI64(0))
+        blockBuilderFinish(b, mirTermCbr(isUsed, bodyLabel, scanLabel))
 
         blockBuilderStart(b, bodyLabel)
-        var keyAddr2: MirExpr = mirLocal(epSlot)
-        if keyOff != 0:
-            keyAddr2 = mirBin(mbAdd, mirLocal(epSlot), mirConstI64(int64(keyOff)))
+        let keyOff2: MirExpr = mirBin(mbMul, curIdx64, mirConstI64(8))
+        let keyAddr2: MirExpr = mirBin(mbAdd, mirLocal(keysBufSlot), keyOff2)
         let keyVal: MirExpr = mirLoad(keyAddr2, mirTypeI64())
         add(b.currentStmts, mirStmtAssign(keyName, keySlot, keyVal))
         if hasVal:
-            var valAddr2: MirExpr = mirLocal(epSlot)
-            if valOff != 0:
-                valAddr2 = mirBin(mbAdd, mirLocal(epSlot), mirConstI64(int64(valOff)))
+            let valOff2: MirExpr = mirBin(mbMul, curIdx64, mirConstI64(int64(valSize)))
+            let valAddr2: MirExpr = mirBin(mbAdd, mirLocal(valsBufSlot), valOff2)
             let valVal: MirExpr = mirLoad(valAddr2, valTy)
             add(b.currentStmts, mirStmtAssign(valName, valSlot, valVal))
 
@@ -8831,6 +10112,10 @@ fn caseInferExprTypeKey(b: BlockBuilder, n0: Node): str =
                         fieldKey = mirObjFieldTypeKeyGet(pk, "value")
                 if len(fieldKey) > 0:
                     outKey = fieldKey
+        if len(outKey) == 0 && (callName == "Value"):
+            let innerKey: str = mirInferValueCallInnerKey(b, n)
+            if innerKey != nil && len(innerKey) > 0:
+                outKey = innerKey
         if (getEnv "CHENG_BACKEND_DEBUG_TYPEKEY_CALL" == "1") && (callName == "Value"):
             var a0k: str = ""
             if argNodes.len > 0:
@@ -10158,7 +11443,8 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
             return Err[bool]("mir_builder: let/var expects identifier @" + line + ":" + col)
         nameNode = nameCore
         let name: str = plainName(nameNode)
-        if (getEnv "CHENG_BACKEND_DEBUG_LET" == "1") && (backendStripSpaces(name) == "snapRes"):
+        if (getEnv "CHENG_BACKEND_DEBUG_LET" == "1") &&
+           ((backendStripSpaces(name) == "snapRes") || (backendStripSpaces(name) == "tlv")):
             var fnNm: str = ""
             var fp: str = ""
             if b != nil && b.func != nil:
@@ -10186,6 +11472,10 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                 isObjValue = typeNodeIsObjValue(b.module, initCore0.typeCache)
             if len(objTypeName) == 0 && initCore0 != nil:
                 var initKey: str = caseInferExprTypeKey(b, initCore0)
+                if initKey == nil || len(initKey) == 0:
+                    initKey = mirInferNodeTypeKeyForOverload(b, initCore0)
+                if (initKey == nil || len(initKey) == 0) && initCore0.kind == nkCall:
+                    initKey = mirInferValueCallInnerKey(b, initCore0)
                 if initKey != nil && len(initKey) > 0:
                     var key3: str = initKey
                     if mirStrStartsWith(key3, "ref_"):
@@ -10200,19 +11490,13 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                         let canon3: str = mirObjAliasCanon(key3)
                         if canon3 != nil && len(canon3) > 0:
                             key3 = canon3
-                        if mirHasObjType(b.module, key3):
-                            objTypeName = key3
+                        let objFromKey3: str = mirObjTypeFromTypeKey(b.module, key3)
+                        if objFromKey3 != nil && len(objFromKey3) > 0:
+                            objTypeName = objFromKey3
                             let aliasTy2: MirType = mirTryGetTypeAlias(b.module, key3)
                             isObjValue = aliasTy2.kind == mtVoid
-                        elif mirStrStartsWith(key3, "seq_") && mirHasObjType(b.module, "seq"):
-                            objTypeName = "seq"
-                            isObjValue = true
-                        elif mirStrStartsWith(key3, "seq_fixed_") && mirHasObjType(b.module, "seq"):
-                            objTypeName = "seq"
-                            isObjValue = true
-                        elif mirStrStartsWith(key3, "Table_") && mirHasObjType(b.module, "Table"):
-                            objTypeName = "Table"
-                            isObjValue = true
+                            if objTypeName == "seq" || objTypeName == "Table":
+                                isObjValue = true
         if len(objTypeName) > 0:
             declType = mirTypeI64()
         let slot: int32 = localAdd(b.env, name, declType)
@@ -10228,6 +11512,10 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                 declKey = mirTypeKeyFromNodeLoose(initCoreKey.typeCache)
             if declKey == nil || len(declKey) == 0:
                 declKey = caseInferExprTypeKey(b, initCoreKey)
+            if declKey == nil || len(declKey) == 0:
+                declKey = mirInferNodeTypeKeyForOverload(b, initCoreKey)
+            if (declKey == nil || len(declKey) == 0) && initCoreKey != nil && initCoreKey.kind == nkCall:
+                declKey = mirInferValueCallInnerKey(b, initCoreKey)
             if declKey != nil && len(declKey) > 0:
                 # Normalize away `var/ref` wrappers; keep `ptr_` when present.
                 if mirStrStartsWith(declKey, "ref_"):
@@ -10238,6 +11526,17 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                     declKey = str(ptr_add(void*(declKey), 4))
         if declKey != nil && len(declKey) > 0:
             localSetTypeKey(b.env, slot, declKey)
+        if (getEnv "CHENG_BACKEND_DEBUG_LET" == "1") && (backendStripSpaces(name) == "tlv"):
+            var fnNm2: str = ""
+            if b != nil && b.func != nil:
+                let fDbg2: MirFunc = b.func
+                fnNm2 = fDbg2.name
+            let caseKeyDbg: str = caseInferExprTypeKey(b, init)
+            let inferKeyDbg: str = mirInferNodeTypeKeyForOverload(b, init)
+            echo("[backend] debugLetInfer: fn=" + fnNm2 + " name='" + name +
+                 "' declTy=nk#" + intToStr(int32(declType.kind)) +
+                 " objTypeName='" + objTypeName + "' isObjValue=" + (isObjValue ? "1" : "0") +
+                 " declKey='" + declKey + "' caseKey='" + caseKeyDbg + "' inferKey='" + inferKeyDbg + "'")
         if len(objTypeName) > 0:
             if isObjValue:
                 let allocRes: Result[bool] = allocObjValueLocal(b, slot, objTypeName)
@@ -10486,6 +11785,58 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                             stride = int64(d)
                     let off: MirExpr = (stride == 1) ? idx64 : mirBin(mbMul, idx64, mirConstI64(stride))
                     let addr: MirExpr = mirBin(mbAdd, basePtr, off)
+                    # `array[T]` currently uses pointer slots when `T` is an object value.
+                    # Store via owned backing memory to avoid dangling stack pointers from
+                    # assignments like `arr[i] = localObj`.
+                    var elemObjName: str = ""
+                    if rhs != nil && (rhs.kind == nkIdent || rhs.kind == nkSymbol):
+                        let srcNm0: str = plainName(rhs)
+                        let srcSlot0: int32 = localIndex(b.env, srcNm0)
+                        if srcSlot0 >= 0 && funcFindObjLocal(b.func, srcSlot0) >= 0:
+                            elemObjName = funcObjTypeName(b.func, srcSlot0)
+                    if (elemObjName == nil || len(elemObjName) == 0) &&
+                       rhs != nil && rhs.typeCacheValid && rhs.typeCache != nil:
+                        elemObjName = typeNodeObjTypeName(b.module, rhs.typeCache)
+                    if elemObjName == nil || len(elemObjName) == 0:
+                        var rhsKey0: str = caseInferExprTypeKey(b, rhs)
+                        if rhsKey0 == nil || len(rhsKey0) == 0:
+                            rhsKey0 = exprTypeKeyShallow(b, rhs)
+                        if rhsKey0 != nil && len(rhsKey0) > 0:
+                            if mirStrStartsWith(rhsKey0, "var_ref_"):
+                                rhsKey0 = str(ptr_add(void*(rhsKey0), 8))
+                            elif mirStrStartsWith(rhsKey0, "var_") || mirStrStartsWith(rhsKey0, "ref_"):
+                                rhsKey0 = str(ptr_add(void*(rhsKey0), 4))
+                            if mirStrStartsWith(rhsKey0, "ptr_"):
+                                rhsKey0 = str(ptr_add(void*(rhsKey0), 4))
+                            elemObjName = mirObjTypeFromTypeKey(b.module, rhsKey0)
+                    if elemObjName != nil && len(elemObjName) > 0 && mirHasObjType(b.module, elemObjName):
+                        let srcRes0: Result[MirExpr] = lowerExprValue(b, rhs, mirTypeI64())
+                        if !IsOk[MirExpr](srcRes0):
+                            return ErrInfo[bool](ErrorInfoOf[MirExpr](srcRes0))
+                        let otElem: MirObjType = mirGetObjType(b.module, elemObjName)
+                        if otElem.size <= 0:
+                            return Err[bool]("mir_builder: array object element has invalid size: " + elemObjName)
+                        let oldPtr: MirExpr = mirLoad(addr, mirTypeI64())
+                        var allocArgs: MirExpr[]
+                        add(allocArgs, oldPtr)
+                        add(allocArgs, mirConstI64(int64(otElem.size)))
+                        let newPtrName: str = blockBuilderNextTemp(b, "__arr_obj_ptr")
+                        let newPtrSlot: int32 = localAdd(b.env, newPtrName, mirTypeI64())
+                        mirSetLocalType(b.func, newPtrSlot, mirTypeI64())
+                        add(b.currentStmts, mirStmtLet(newPtrName, newPtrSlot, mirCall("realloc", allocArgs)))
+                        let newPtr: MirExpr = mirLocal(newPtrSlot)
+                        add(b.currentStmts, mirStmtStore(addr, newPtr, mirTypeI64()))
+                        let copyLabel: str = blockBuilderNextLabel(b, "arr_obj_copy")
+                        let joinLabel: str = blockBuilderNextLabel(b, "arr_obj_join")
+                        let hasPtr: MirExpr = mirCmp(mcNe, newPtr, mirConstI64(0))
+                        blockBuilderFinish(b, mirTermCbr(hasPtr, copyLabel, joinLabel))
+                        blockBuilderStart(b, copyLabel)
+                        let copyResObj: Result[bool] = emitObjCopyPtrs(b, newPtr, elemObjName, Value[MirExpr](srcRes0))
+                        if !IsOk[bool](copyResObj):
+                            return ErrInfo[bool](ErrorInfoOf[bool](copyResObj))
+                        blockBuilderFinish(b, mirTermBr(joinLabel))
+                        blockBuilderStart(b, joinLabel)
+                        return Ok[bool](false)
                     let valRes: Result[MirExpr] = lowerExprValue(b, rhs, elemTy)
                     if !IsOk[MirExpr](valRes):
                         return ErrInfo[bool](ErrorInfoOf[MirExpr](valRes))
@@ -10524,38 +11875,15 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                     add(b.currentStmts, mirStmtLet(seqName, seqSlot, Value[MirExpr](baseRes3)))
                     let seqPtr: MirExpr = mirLocal(seqSlot)
 
-                    var lenOff: int32 = 0
-                    var bufOff: int32 = 8
-                    if mirHasObjType(b.module, "seq"):
-                        let seqOt: MirObjType = mirGetObjType(b.module, "seq")
-                        var lenFound: bool = false
-                        var bufFound: bool = false
-                        for fi in 0..<seqOt.fields.len:
-                            let f: MirObjField = seqOt.fields[fi]
-                            if (f.name == "len"):
-                                lenOff = f.offset
-                                lenFound = true
-                            elif (f.name == "buffer"):
-                                bufOff = f.offset
-                                bufFound = true
-                        if !lenFound || !bufFound:
-                            return Err[bool]("mir_builder: seq layout mismatch")
-
-                    let lenAddr: MirExpr = (lenOff == 0) ? seqPtr : mirBin(mbAdd, seqPtr, mirConstI64(int64(lenOff)))
-                    let bufAddr: MirExpr = (bufOff == 0) ? seqPtr : mirBin(mbAdd, seqPtr, mirConstI64(int64(bufOff)))
-                    let lenVal: MirExpr = mirLoad(lenAddr, mirTypeI32())
-                    let bufVal: MirExpr = mirLoad(bufAddr, mirTypeI64())
-
                     let idxRes3: Result[MirExpr] = lowerExprValue(b, idx0, mirTypeI32())
                     if !IsOk[MirExpr](idxRes3):
                         return ErrInfo[bool](ErrorInfoOf[MirExpr](idxRes3))
                     let elemSize32: MirExpr = mirCast(mirTypeI32(), mirConstI64(int64(elemSize)))
                     var args3: MirExpr[]
-                    add(args3, bufVal)
-                    add(args3, lenVal)
+                    add(args3, seqPtr)
                     add(args3, Value[MirExpr](idxRes3))
                     add(args3, elemSize32)
-                    let ptrExpr: MirExpr = mirCall("cheng_seq_set", args3)
+                    let ptrExpr: MirExpr = mirCall("cheng_seq_set_grow", args3)
                     if (elemKey == "bool"):
                         let valResB: Result[MirExpr] = lowerExprValue(b, rhs, mirTypeI32())
                         if !IsOk[MirExpr](valResB):
@@ -10726,19 +12054,44 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
             let line: str = (lhs != nil) ? intToStr(lhs.pos.line) : "0"
             let col: str = (lhs != nil) ? intToStr(lhs.pos.col) : "0"
             return Err[bool]("mir_builder: assignment expects identifier (lhs nk#" + k + " @" + line + ":" + col + ")")
-        let name2: str = plainName(lhs)
+        let name2: str = backendStripSpaces(plainName(lhs))
         let slot2: int32 = localIndex(b.env, name2)
         if slot2 < 0:
-            let gi: int32 = moduleGlobalIndex(b.module, name2)
+            let mod: MirModule = b.module
+            var gName: str = name2
+            var gi: int32 = moduleGlobalIndex(mod, gName)
+            if gi < 0 && b.func != nil && mirDupGlobalNamesHas(name2):
+                let f2: MirFunc = b.func
+                let g2: str = mirMaybeMangleDupGlobalName(name2, f2.originFile)
+                if g2 != nil && len(g2) > 0:
+                    gName = g2
+                    gi = moduleGlobalIndex(mod, gName)
+            if gi < 0 && mirDupGlobalNamesHas(name2):
+                let gi2: int32 = moduleFindGlobalIndexByBaseUnique(mod, name2)
+                if gi2 >= 0 && gi2 < mod.globals.len:
+                    let g2: MirGlobal = mod.globals[gi2]
+                    if g2.name != nil && len(g2.name) > 0:
+                        gName = g2.name
+                        gi = gi2
+            if gi < 0 && mirStrStartsWith(name2, "__cheng_"):
+                var declTy: MirType = inferExprTypeWithGlobals(b.env, mod, b.func, rhs, mirTypeI32())
+                if declTy.kind == mtVoid:
+                    declTy = mirTypeI32()
+                var originFile2: str = ""
+                if b.func != nil:
+                    let f2: MirFunc = b.func
+                    originFile2 = f2.originFile
+                mirAddGlobal(mod, name2, declTy, 0, false, originFile2)
+                gName = name2
+                gi = moduleGlobalIndex(mod, gName)
             if gi < 0:
                 let line: str = (lhs != nil) ? intToStr(lhs.pos.line) : "0"
                 let col: str = (lhs != nil) ? intToStr(lhs.pos.col) : "0"
                 return Err[bool]("mir_builder: assignment to unknown local/global: " + name2 + " @" + line + ":" + col)
-            let mod: MirModule = b.module
             let g: MirGlobal = mod.globals[gi]
-            let gObj: str = mirGlobalObjTypeGet(name2)
+            let gObj: str = mirGlobalObjTypeGet(gName)
             if len(gObj) > 0:
-                let dstPtr: MirExpr = mirLoad(mirGlobalAddr(name2), mirTypeI64())
+                let dstPtr: MirExpr = mirLoad(mirGlobalAddr(gName), mirTypeI64())
                 if isControlExpr(rhs):
                     let tmpName: str = blockBuilderNextTemp(b, "__global_obj_assign")
                     let tmpSlot: int32 = localAdd(b.env, tmpName, mirTypeI64())
@@ -10776,12 +12129,12 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                 let tmpRes: Result[bool] = lowerAssignValue(b, rhs, tmpName, tmpSlot)
                 if !IsOk[bool](tmpRes):
                     return ErrInfo[bool](ErrorInfoOf[bool](tmpRes))
-                add(b.currentStmts, mirStmtStore(mirGlobalAddr(name2), mirLocal(tmpSlot), g.ty))
+                add(b.currentStmts, mirStmtStore(mirGlobalAddr(gName), mirLocal(tmpSlot), g.ty))
                 return Ok[bool](false)
             let valRes: Result[MirExpr] = lowerExprValue(b, rhs, g.ty)
             if ! IsOk[MirExpr](valRes):
                 return ErrInfo[bool](ErrorInfoOf[MirExpr](valRes))
-            add(b.currentStmts, mirStmtStore(mirGlobalAddr(name2), Value[MirExpr](valRes), g.ty))
+            add(b.currentStmts, mirStmtStore(mirGlobalAddr(gName), Value[MirExpr](valRes), g.ty))
             return Ok[bool](false)
 
         # For object-value locals, allow a user-defined `=` overload (compile-time resolved).
@@ -11485,7 +12838,7 @@ fn moduleFuncIndex(mod: MirModule, name: str): int32 =
         mir_ensureFuncIndexCache(mod)
         if mir_funcIndex_cache_ready && mir_funcIndex_cache_module == mod:
             var found: bool = false
-            let idx: int32 = hashmaps.hashMapStrIntGet(mir_funcIndex_cache, name, found)
+            let idx: int32 = mirHashMapStrIntGetCompat(mir_funcIndex_cache, name, found)
             if !found:
                 return -1
             if idx >= 0 && idx < mod.funcs.len:
@@ -11587,6 +12940,34 @@ fn moduleFindFuncByBaseUnique(mod: MirModule, base0: str): MirFunc =
                 return nil
             found = f
     return found
+
+fn moduleFindFuncByBasePreferOrigin(mod: MirModule, base0: str, originFile0: str): MirFunc =
+    if mod == nil || base0 == nil || len(base0) == 0:
+        return nil
+    let originFile: str = (originFile0 != nil) ? originFile0 : ""
+    if originFile != nil && len(originFile) > 0:
+        let direct: MirFunc = moduleFindFunc(mod, base0)
+        if direct != nil && direct.originFile == originFile:
+            return direct
+        let baseSym: str = backendSanitizeLinkName(base0)
+        let prefix: str = baseSym + mirFuncSigMarker()
+        let dupPrefix: str = baseSym + "__cheng_mod_"
+        let instPrefix: str = baseSym + "_"
+        var found: MirFunc = nil
+        for i in 0..<mod.funcs.len:
+            let f: MirFunc = mod.funcs[i]
+            if f == nil || f.originFile != originFile:
+                continue
+            if (f.name == base0) || mirStrStartsWith(f.name, prefix) ||
+               mirStrStartsWith(f.name, dupPrefix) || mirStrStartsWith(f.name, instPrefix):
+                if found != nil:
+                    if found.name == f.name:
+                        continue
+                    return nil
+                found = f
+        if found != nil:
+            return found
+    return moduleFindFuncByBaseUnique(mod, base0)
 
 fn mirInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
     if b == nil:
@@ -11764,6 +13145,7 @@ fn mirInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
                                mirStrStartsWith(suffix, "Table_"):
                                 return suffix
     if n.kind == nkDotExpr && b.module != nil && b.func != nil:
+        let dbgOverDot: bool = (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1")
         # Composite (inlined) object field access: `obj.field` may not exist as a single field in the
         # lowered layout (it becomes `field.subfield` entries). Try to recover the field object type
         # key for overload resolution (e.g. `bytesGet(frame.payload, i)` where `payload` is Bytes).
@@ -11774,6 +13156,12 @@ fn mirInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
                field0 != nil && (field0.kind == nkIdent || field0.kind == nkSymbol):
                 let baseName0: str = plainName(base0)
                 let slot1: int32 = localIndex(b.env, baseName0)
+                if dbgOverDot:
+                    let lk0: str = (slot1 >= 0) ? localTypeKey(b.env, slot1) : ""
+                    let fok0: str = (slot1 >= 0) ? funcObjTypeKey(b.func, slot1) : ""
+                    let fon0: str = (slot1 >= 0) ? funcObjTypeName(b.func, slot1) : ""
+                    echo("[backend] debugOverloadDot: base='" + baseName0 + "' slot=" + intToStr(slot1) +
+                         " localKey='" + lk0 + "' funcObjKey='" + fok0 + "' funcObjName='" + fon0 + "'")
                 if slot1 >= 0:
                     let parentObj: str = funcObjTypeName(b.func, slot1)
                     if len(parentObj) > 0:
@@ -11789,6 +13177,9 @@ fn mirInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
                         if baseOff >= 0:
                             let objKey0: str = inferInlineObjFieldTypeName(b.module, ot0, fieldName0, baseOff)
                             if objKey0 != nil && len(objKey0) > 0:
+                                if dbgOverDot:
+                                    echo("[backend] debugOverloadDot: direct parentObj='" + parentObj +
+                                         "' field='" + fieldName0 + "' objKey='" + objKey0 + "'")
                                 return objKey0
             if field0 != nil && (field0.kind == nkIdent || field0.kind == nkSymbol):
                 let fieldName1: str = backendStripSpaces(plainName(field0))
@@ -11804,6 +13195,9 @@ fn mirInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
                     if mirStrStartsWith(key, "ptr_"):
                         key = str(ptr_add(void*(key), 4))
                     let parentObj2: str = mirPtrBaseObjTypeName(b.module, key)
+                    if dbgOverDot:
+                        echo("[backend] debugOverloadDot: fallback field='" + fieldName1 + "' baseKey='" + baseKey1 +
+                             "' stripped='" + key + "' parentObj2='" + parentObj2 + "'")
                     if parentObj2 != nil && len(parentObj2) > 0:
                         let ot1: MirObjType = mirGetObjType(b.module, parentObj2)
                         let prefix1: str = fieldName1 + "."
@@ -11816,8 +13210,12 @@ fn mirInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
                         if baseOff1 >= 0:
                             let objKey1: str = inferInlineObjFieldTypeName(b.module, ot1, fieldName1, baseOff1)
                             if objKey1 != nil && len(objKey1) > 0:
+                                if dbgOverDot:
+                                    echo("[backend] debugOverloadDot: fallback resolved objKey='" + objKey1 + "'")
                                 return objKey1
         let dk: str = caseInferExprTypeKey(b, n)
+        if dbgOverDot:
+            echo("[backend] debugOverloadDot: caseInfer key='" + dk + "'")
         if dk != nil && len(dk) > 0:
             return dk
         let t: MirType = inferExprTypeWithGlobals(b.env, b.module, b.func, n, mirTypeI32())
@@ -11951,6 +13349,7 @@ fn mirResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: Node
             if cand != nil && (cand.name == baseName):
                 return cand
     var argKeys: str[argNodes.len]
+    argKeys.len = 0
     for ai in 0..<argNodes.len:
         add(argKeys, mirInferNodeTypeKeyForOverload(b, argNodes[ai]))
     var debugResolve: bool = (getEnv "CHENG_BACKEND_DEBUG_RESOLVE" == "1")
@@ -11962,10 +13361,44 @@ fn mirResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: Node
             # Default to a small noisy builtin when no name filter is provided.
             debugResolve = (baseName == "Value")
     if debugResolve:
+        var dbgFn: str = ""
+        var dbgFile: str = ""
+        if b != nil && b.func != nil:
+            let dbgFunc0: MirFunc = b.func
+            dbgFn = dbgFunc0.name
+            dbgFile = dbgFunc0.originFile
+        var dbgArgPos: str = ""
+        if argNodes.len > 0 && argNodes[0] != nil:
+            let an0: Node = argNodes[0]
+            dbgArgPos = intToStr(an0.pos.line) + ":" + intToStr(an0.pos.col)
         echo("[backend] debugResolve: base='" + baseName + "' retHint='" + retKeyHint + "'")
+        echo("[backend] debugResolve: fn='" + dbgFn + "' file='" + dbgFile + "' arg0Pos='" + dbgArgPos + "'")
         echo("[backend] debugResolve: argc=" + intToStr(argKeys.len))
         if argKeys.len > 0:
             echo("[backend] debugResolve: arg0Key='" + argKeys[0] + "'")
+        if argNodes.len > 0 && argNodes[0] != nil:
+            let an0: Node = argNodes[0]
+            var anName: str = backendStripSpaces(plainName(an0))
+            if anName == nil:
+                anName = ""
+            var anTypeKey: str = ""
+            if an0.typeCacheValid && an0.typeCache != nil:
+                anTypeKey = typeKey(an0.typeCache)
+            echo("[backend] debugResolve: arg0 kind=nk#" + intToStr(int32(an0.kind)) +
+                 " name='" + anName + "' typeKey='" + anTypeKey + "' kids=" + intToStr(kidCount(an0)))
+            if an0.kind == nkCallArg && kidCount(an0) > 0:
+                let anKid0: Node = kid(an0, 0)
+                var anKid0Name: str = backendStripSpaces(plainName(anKid0))
+                if anKid0Name == nil:
+                    anKid0Name = ""
+                var anKid0TypeKey: str = ""
+                if anKid0 != nil && anKid0.typeCacheValid && anKid0.typeCache != nil:
+                    anKid0TypeKey = typeKey(anKid0.typeCache)
+                var anKid0Kind: int32 = -1
+                if anKid0 != nil:
+                    anKid0Kind = int32(anKid0.kind)
+                echo("[backend] debugResolve: arg0.k0 kind=nk#" + intToStr(anKid0Kind) +
+                     " name='" + anKid0Name + "' typeKey='" + anKid0TypeKey + "'")
         if argKeys.len > 1:
             echo("[backend] debugResolve: arg1Key='" + argKeys[1] + "'")
     var dbgCandCount: int32 = 0
@@ -12006,12 +13439,28 @@ fn mirResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: Node
             ambiguous = false
             ties.len = 0
         elif sc == bestScore:
+            if best != nil && best.name == cand.name && best.originFile == cand.originFile:
+                continue
             if !ambiguous:
                 ambiguous = true
                 if best != nil:
                     add(ties, best)
-            add(ties, cand)
+            var seenTie: bool = false
+            for ti0 in 0..<ties.len:
+                let t0: MirFunc = ties[ti0]
+                if t0 != nil && t0.name == cand.name && t0.originFile == cand.originFile:
+                    seenTie = true
+                    break
+            if !seenTie:
+                add(ties, cand)
     if ambiguous:
+        var hasUnknownArg: bool = false
+        for ai0 in 0..<argKeys.len:
+            if argKeys[ai0] == nil || len(argKeys[ai0]) == 0:
+                hasUnknownArg = true
+                break
+        if hasUnknownArg && ties.len > 0:
+            return ties[0]
         if b.func != nil && mirDupFnBasesHas(baseName):
             let fTmp: MirFunc = b.func
             let prefer: str = mirMaybeMangleDupFnBase(baseName, fTmp.originFile)
@@ -12434,6 +13883,10 @@ fn isBuiltinTypeName(name: str): bool =
         return true
     if name == "seq" || mirStrStartsWith(name, "seq_"):
         return true
+    if name == "seq_fixed" || mirStrStartsWith(name, "seq_fixed_"):
+        return true
+    if name == "Table" || mirStrStartsWith(name, "Table_"):
+        return true
     if mirStrStartsWith(name, "set_"):
         return true
     return false
@@ -12461,8 +13914,22 @@ fn mirConsumeTypeDecl(mod: MirModule, td: Node): Result[bool] =
         echo("[backend] debug: typeDecl Node defKind=nk#" + dk0 + " defCoreKind=nk#" + dk1 + " isRefLike=" + rf)
     if (getEnv "CHENG_BACKEND_DEBUG_TYPES" == "1") && (name == "seq_string"):
         let k: int32 = int32(defNode.kind)
-        let line: str = "[backend] debug: typeDecl seq_string defKind=" + intToStr(k)
+        var line: str = "[backend] debug: typeDecl seq_string defKind=" + intToStr(k)
+        if defNode != nil && defNode.kind == nkBracketExpr:
+            line = line + " kids=" + intToStr(kidCount(defNode))
+            if kidCount(defNode) > 0:
+                line = line + " base=" + backendStripSpaces(plainName(kid(defNode, 0)))
+        line = line + " hasSeq=" + (mirHasObjType(mod, "seq") ? "1" : "0")
         echo line
+    if (getEnv "CHENG_BACKEND_DEBUG_TYPES" == "1") && (name == "Table_string"):
+        let k2: int32 = int32(defNode.kind)
+        var line2: str = "[backend] debug: typeDecl Table_string defKind=" + intToStr(k2)
+        if defNode != nil && defNode.kind == nkBracketExpr:
+            line2 = line2 + " kids=" + intToStr(kidCount(defNode))
+            if kidCount(defNode) > 0:
+                line2 = line2 + " base=" + backendStripSpaces(plainName(kid(defNode, 0)))
+        line2 = line2 + " hasTable=" + (mirHasObjType(mod, "Table") ? "1" : "0")
+        echo line2
     if moduleHasFunc(mod, name) || moduleHasGlobal(mod, name):
         return Err[bool]("mir_builder: type name conflicts with global")
     let existingObj: int32 = mirFindObjType(mod, name)
@@ -12528,6 +13995,11 @@ fn mirConsumeTypeDecl(mod: MirModule, td: Node): Result[bool] =
                 return Err[bool]("mir_builder: record field default not supported in backend")
             let rawFieldName: str = plainName(fieldNameNode)
             let fieldName: str = backendStripSpaces(rawFieldName)
+            if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && name == "ProtoBuffer" && fieldName == "out":
+                let fNodeName0: str = backendStripSpaces(plainName(fieldTypeNode))
+                let fNodeKey0: str = typeKey(fieldTypeNode)
+                echo("[backend] debugOverloadDot: consumeTypeDecl type='ProtoBuffer' field='out' nodeKind=nk#" +
+                     intToStr(int32(fieldTypeNode.kind)) + " plain='" + fNodeName0 + "' typeKey='" + fNodeKey0 + "'")
             if traceTypes && (name == "__cheng_lambda_2_iter"):
                 var firstCode: int32 = -1
                 if rawFieldName != nil && len(rawFieldName) > 0:
@@ -12541,9 +14013,25 @@ fn mirConsumeTypeDecl(mod: MirModule, td: Node): Result[bool] =
                 fieldTypeKey = typeKey(fieldTypeNode)
             if len(fieldTypeKey) == 0:
                 fieldTypeKey = backendStripSpaces(plainName(fieldTypeNode))
+            let sfiField: SeqFixedInit = seqFixedInitInfo(fieldTypeNode)
+            if sfiField.elemType != nil && sfiField.capExpr != nil:
+                # Keep explicit `seq_fixed[T,N]` key for init-time reserve hints.
+                let explicitKey: str = typeKey(fieldTypeNode)
+                if explicitKey != nil && len(explicitKey) > 0:
+                    fieldTypeKey = explicitKey
+            if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && name == "ProtoBuffer" && fieldName == "out":
+                echo("[backend] debugOverloadDot: computed fieldTypeKey type='ProtoBuffer' field='out' key='" + fieldTypeKey +
+                     "' len=" + intToStr(len(fieldTypeKey)))
             if len(fieldTypeKey) > 0:
+                if (getEnv "CHENG_BACKEND_DEBUG_OVERLOAD_DOT" == "1") && name == "ProtoBuffer" && fieldName == "out":
+                    echo("[backend] debugOverloadDot: put fieldTypeKey type='ProtoBuffer' field='out' key='" + fieldTypeKey + "'")
                 mirObjFieldTypeKeyPut(name, fieldName, fieldTypeKey)
             let objFieldType: str = typeNodeObjTypeName(mod, fieldTypeNode)
+            if (getEnv "CHENG_BACKEND_DEBUG_TYPES" == "1") && (name == "EcKeyPair"):
+                let isObjFieldValDbg: bool = typeNodeIsObjValue(mod, fieldTypeNode)
+                echo("[backend] debugTypes: type=" + name + " field=" + fieldName +
+                     " fieldTypeKey='" + fieldTypeKey + "' objFieldType='" + objFieldType +
+                     "' isObjValue=" + (isObjFieldValDbg ? "1" : "0"))
             if len(objFieldType) > 0 && typeNodeIsObjValue(mod, fieldTypeNode) && mirHasObjType(mod, objFieldType):
                 mirInlineObjFieldTypePut(name, fieldName, objFieldType)
                 let inner: MirObjType = mirGetObjType(mod, objFieldType)
@@ -12576,9 +14064,10 @@ fn mirConsumeTypeDecl(mod: MirModule, td: Node): Result[bool] =
                 if len(depName) > 0 && !isBuiltinTypeName(depName):
                     let depAlias: MirType = mirTryGetTypeAlias(mod, depName)
                     if !mirHasObjType(mod, depName) && depAlias.kind == mtVoid:
-                        if (getEnv "CHENG_BACKEND_DEBUG_TYPES" == "1"):
-                            echo("[backend] debug: pending type " + name + " depends on " + depName)
-                        return Ok[bool](true)
+                        if !(mirStrStartsWith(depName, "SeqUninit_") && ensureSeqUninitObjType(mod, depName)):
+                            if (getEnv "CHENG_BACKEND_DEBUG_TYPES" == "1"):
+                                echo("[backend] debug: pending type " + name + " depends on " + depName)
+                            return Ok[bool](true)
             let fieldTy: MirType = mirTypeFromNodeWithModule(mod, fieldTypeNode)
             let fieldSize: int32 = mirTypeSize(fieldTy)
             if fieldSize <= 0:
@@ -12797,28 +14286,138 @@ fn mirPredeclareGlobalsForTypes(mod: MirModule, root: Node) =
         var initCore: Node = init
         while initCore != nil && initCore.kind == nkPar && kidCount(initCore) > 0:
             initCore = kid(initCore, 0)
-        if initCore == nil || initCore.kind == nkEmpty:
-            continue
         var hasInit: bool = false
         var initVal: int64 = 0
-        if initCore.kind == nkIntLit:
-            hasInit = true
-            initVal = initCore.intVal
-        elif initCore.kind == nkBoolLit:
-            hasInit = true
-            let v: str = backendStripSpaces(initCore.ident)
-            initVal = (v == "true") ? 1 : 0
-        elif initCore.kind == nkNilLit:
-            hasInit = true
-            initVal = 0
-        if !hasInit:
-            continue
+        if initCore != nil && initCore.kind != nkEmpty:
+            if initCore.kind == nkIntLit:
+                hasInit = true
+                initVal = initCore.intVal
+            elif initCore.kind == nkBoolLit:
+                hasInit = true
+                let v: str = backendStripSpaces(initCore.ident)
+                initVal = (v == "true") ? 1 : 0
+            elif initCore.kind == nkNilLit:
+                hasInit = true
+                initVal = 0
         var declTy: MirType = mirTypeFromNodeWithModule(mod, typeNode)
         if declTy.kind == mtVoid:
-            declTy = mirTypeI64()
-        mirAddGlobal(mod, name, declTy, initVal, true, preFile)
+            if hasInit:
+                if initCore != nil && initCore.kind == nkBoolLit:
+                    declTy = mirTypeU8()
+                elif initCore != nil && initCore.kind == nkNilLit:
+                    declTy = mirTypeI64()
+                else:
+                    declTy = mirTypeI32()
+            else:
+                declTy = mirTypeI64()
+        mirAddGlobal(mod, name, declTy, initVal, hasInit, preFile)
         if typeNode != nil && typeNode.kind != nkEmpty:
             mirGlobalTypeKeyPut(name, typeKey(typeNode))
+
+fn mirPredeclareGlobalsForLowering(mod: MirModule, root: Node) =
+    if mod == nil || root == nil:
+        return
+    let preFile: str = "<predeclared>"
+    var queue: Node[]
+    add(queue, root)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil || n.kind == nkEmpty:
+            continue
+        if n.kind == nkStmtList || n.kind == nkModule:
+            for i in 0..<kidCount(n):
+                add(queue, kid(n, i))
+            continue
+        if n.kind != nkConst && n.kind != nkLet && n.kind != nkVar:
+            continue
+        var pat: Node = nil
+        if kidCount(n) > 0:
+            pat = kid(n, 0)
+        var init: Node = nil
+        if kidCount(n) > 2:
+            init = kid(n, 2)
+        var nameNode: Node = pat
+        var typeNode: Node = nil
+        if kidCount(n) > 1:
+            typeNode = kid(n, 1)
+        if pat != nil && pat.kind == nkPattern && kidCount(pat) > 0:
+            nameNode = kid(pat, 0)
+            if kidCount(pat) > 1:
+                typeNode = kid(pat, 1)
+        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
+            continue
+        let rawName: str = backendStripSpaces(plainName(nameNode))
+        if rawName == nil || len(rawName) == 0:
+            continue
+        let debugDot: bool = (getEnv "CHENG_BACKEND_DEBUG_DOT" == "1")
+        let filePath: str = (n.strVal != nil && len(n.strVal) > 0) ? n.strVal : preFile
+        if debugDot && rawName == "baseIdentity":
+            var typeKindDbg: str = "nil"
+            if typeNode != nil:
+                typeKindDbg = intToStr(int32(typeNode.kind))
+            echo("[backend] debugDot: predeclareLowering rawName='" + rawName +
+                 "' file='" + filePath + "' typeKind=nk#" + typeKindDbg + "'")
+        let name: str = mirMaybeMangleDupGlobalName(rawName, filePath)
+        if moduleHasFunc(mod, name) || moduleHasGlobal(mod, name) ||
+           mirFindTypeAlias(mod, name) >= 0 || mirFindObjType(mod, name) >= 0:
+            continue
+
+        var declType: MirType = mirTypeFromNodeWithModule(mod, typeNode)
+        var objTypeName: str = ""
+        var objTypeNode: Node = typeNode
+        if (objTypeNode == nil || objTypeNode.kind == nkEmpty) && init != nil && init.kind != nkEmpty &&
+           init.typeCacheValid && init.typeCache != nil:
+            objTypeNode = init.typeCache
+        if objTypeNode != nil && objTypeNode.kind != nkEmpty:
+            objTypeName = typeNodeObjTypeName(mod, objTypeNode)
+        let isObj: bool = len(objTypeName) > 0 && objTypeNode != nil && typeNodeIsObjValue(mod, objTypeNode)
+        if debugDot && rawName == "baseIdentity":
+            let objNodeKindDbg: str = (objTypeNode != nil) ? intToStr(int32(objTypeNode.kind)) : "nil"
+            echo("[backend] debugDot: predeclareLowering name='" + name +
+                 "' objTypeName='" + objTypeName + "' isObj=" + (isObj ? "1" : "0") +
+                 " objNodeKind=nk#" + objNodeKindDbg + "'")
+        if isObj:
+            mirGlobalObjTypePut(name, objTypeName)
+            declType = mirTypeI64()
+        elif typeNode == nil || typeNode.kind == nkEmpty:
+            declType = inferExprTypeWithGlobals(nil, mod, nil, init, declType)
+        if declType.kind == mtVoid:
+            declType = mirTypeI64()
+        if !isObj && (declType.kind == mtI8 || declType.kind == mtI16):
+            let wasUnsigned: bool = declType.isUnsigned
+            declType = mirTypeI32()
+            declType.isUnsigned = wasUnsigned
+
+        var initCore: Node = init
+        while initCore != nil && initCore.kind == nkPar && kidCount(initCore) > 0:
+            initCore = kid(initCore, 0)
+        var hasInit: bool = false
+        var initVal: int64 = 0
+        if !isObj && initCore != nil && initCore.kind != nkEmpty:
+            if initCore.kind == nkIntLit:
+                hasInit = true
+                initVal = initCore.intVal
+            elif initCore.kind == nkBoolLit:
+                hasInit = true
+                let v: str = backendStripSpaces(initCore.ident)
+                initVal = (v == "true") ? 1 : 0
+            elif initCore.kind == nkNilLit:
+                hasInit = true
+                initVal = 0
+        mirAddGlobal(mod, name, declType, initVal, hasInit, preFile)
+
+        var keyOut: str = ""
+        if objTypeNode != nil && objTypeNode.kind != nkEmpty:
+            keyOut = typeKey(objTypeNode)
+            if keyOut == nil || len(keyOut) == 0:
+                keyOut = mirTypeKeyFromNodeLoose(objTypeNode)
+        elif typeNode != nil && typeNode.kind != nkEmpty:
+            keyOut = typeKey(typeNode)
+            if keyOut == nil || len(keyOut) == 0:
+                keyOut = mirTypeKeyFromNodeLoose(typeNode)
+        if keyOut != nil && len(keyOut) > 0:
+            mirGlobalTypeKeyPut(name, keyOut)
 
 fn ctxAddGlobalInit(ctx: MirBuildCtx, name: str, ty: MirType, objTypeName: str, initNode: Node, filePath: str,
                     seqFixedElemType: Node = nil, seqFixedCapExpr: Node = nil) =
@@ -12959,6 +14558,8 @@ fn mirBuildModuleFromFile(path: str): Result[MirModule] =
     mirObjFieldTypeKeysReset()
     mirTupleFieldIndicesReset()
     mirObjAliasesReset()
+    mirDupFnBasesReset()
+    mirDupGlobalNamesReset()
     let mod: MirModule = mirNewModule("arm64-apple-darwin")
     ensureBuiltinObjTypes(mod)
     var ctx: MirBuildCtx
@@ -12977,13 +14578,16 @@ fn mirBuildModuleFromFile(path: str): Result[MirModule] =
     var fileImportLen: int32[]
     var fileImportPool: str[]
     var fileIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(128)
+    var dupGlobalNameIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(2048)
+    var dupGlobalNames: str[]
+    var dupGlobalCounts: int32[]
     for qi in 0..<queue.len:
         let filePath: str = queue[qi]
         if filePath == nil || len(filePath) == 0:
             return Err[MirModule]("mir_builder: empty file path")
         var seen: bool = false
-        hashmaps.hashMapStrIntGet(fileIndex, filePath, seen)
-        if seen:
+        let seenIdx: int32 = mirHashMapStrIntGetCompat(fileIndex, filePath, seen)
+        if seen && seenIdx >= 0:
             continue
         add(files, filePath)
         hashmaps.hashMapStrIntPut(fileIndex, filePath, files.len - 1)
@@ -12995,6 +14599,40 @@ fn mirBuildModuleFromFile(path: str): Result[MirModule] =
             releaseNodeArena()
             return Err[MirModule]("mir_builder: stage1 errors")
         let rawImports: str[] = collectImportPaths(root)
+        var declScanQueue: Node[]
+        add(declScanQueue, root)
+        while declScanQueue.len > 0:
+            let n0: Node = declScanQueue[declScanQueue.len - 1]
+            declScanQueue.len = declScanQueue.len - 1
+            if n0 == nil || n0.kind == nkEmpty:
+                continue
+            if n0.kind == nkStmtList || n0.kind == nkModule:
+                for ni in 0..<kidCount(n0):
+                    add(declScanQueue, kid(n0, ni))
+                continue
+            if n0.kind != nkVar && n0.kind != nkLet && n0.kind != nkConst:
+                continue
+            var pat0: Node = nil
+            if kidCount(n0) > 0:
+                pat0 = kid(n0, 0)
+            var nameNode0: Node = pat0
+            if pat0 != nil && pat0.kind == nkPattern && kidCount(pat0) > 0:
+                nameNode0 = kid(pat0, 0)
+            if nameNode0 == nil || (nameNode0.kind != nkIdent && nameNode0.kind != nkSymbol):
+                continue
+            let globalName0: str = backendStripSpaces(plainName(nameNode0))
+            if globalName0 == nil || len(globalName0) == 0:
+                continue
+            var foundDupG: bool = false
+            let rawG: int32 = mirHashMapStrIntGetCompat(dupGlobalNameIndex, globalName0, foundDupG)
+            let gIdx0: int32 = rawG - 1
+            if foundDupG && rawG > 0 && gIdx0 >= 0 && gIdx0 < dupGlobalCounts.len:
+                dupGlobalCounts[gIdx0] = dupGlobalCounts[gIdx0] + 1
+            else:
+                let newG: int32 = dupGlobalNames.len
+                add(dupGlobalNames, globalName0)
+                add(dupGlobalCounts, 1)
+                hashmaps.hashMapStrIntPut(dupGlobalNameIndex, globalName0, newG + 1)
         var imports: str[]
         for ii0 in 0..<rawImports.len:
             let impPath: str = rawImports[ii0]
@@ -13011,6 +14649,10 @@ fn mirBuildModuleFromFile(path: str): Result[MirModule] =
         releaseNodeArena()
         for ii in 0..<imports.len:
             add(queue, imports[ii])
+
+    for gi in 0..<dupGlobalNames.len:
+        if dupGlobalCounts[gi] > 1:
+            hashsets.hashSetStrAdd(mirDupGlobalNames, dupGlobalNames[gi])
 
     # Pass 1b: consume type declarations in import order (imports before importers).
     # This avoids spurious "unresolved type dependencies" when a file's type decls
@@ -13029,7 +14671,7 @@ fn mirBuildModuleFromFile(path: str): Result[MirModule] =
         for ji in 0..<impLen:
             let impPath: str = fileImportPool[impStart + ji]
             var found: bool = false
-            let impIdx: int32 = hashmaps.hashMapStrIntGet(fileIndex, impPath, found)
+            let impIdx: int32 = mirHashMapStrIntGetCompat(fileIndex, impPath, found)
             if found && impIdx >= 0 && impIdx < files.len && impIdx != fi0:
                 indeg[fi0] = indeg[fi0] + 1
                 let edgeIdx: int32 = depTo.len
@@ -13123,7 +14765,7 @@ fn mirBuildModuleFromFile(path: str): Result[MirModule] =
                 releaseNodeArena()
                 return ErrInfo[MirModule](ErrorInfoOf[bool](res))
         releaseNodeArena()
-    let allowNoMain: bool = envIsTrue "CHENG_BACKEND_ALLOW_NO_MAIN"
+    let allowNoMain: bool = envIsTrue "CHENG_BACKEND_ALLOW_NO_MAIN" || backendAllowNoMainByEmit()
     if ! ctx.foundMain && !allowNoMain:
         return Err[MirModule]("mir_builder: main not found")
 
@@ -13169,8 +14811,15 @@ fn mirConsumeTopLevelFromRoot(mod: MirModule, ctx: MirBuildCtx, root: Node, file
                 typeNode = kid(pat, 1)
         if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
             return Err[bool]("mir_builder: global expects identifier")
-        let rawName: str = plainName(nameNode)
+        let rawName: str = backendStripSpaces(plainName(nameNode))
         let name: str = mirMaybeMangleDupGlobalName(rawName, filePath)
+        let debugDot: bool = (getEnv "CHENG_BACKEND_DEBUG_DOT" == "1")
+        if debugDot && rawName == "baseIdentity":
+            var typeKindDbg: str = "nil"
+            if typeNode != nil:
+                typeKindDbg = intToStr(int32(typeNode.kind))
+            echo("[backend] debugDot: consumeGlobal rawName='" + rawName +
+                 "' file='" + filePath + "' typeKind=nk#" + typeKindDbg + "'")
         let existingGi: int32 = moduleGlobalIndex(mod, name)
         var allowDupGlobal: bool = false
         if existingGi >= 0:
@@ -13185,8 +14834,17 @@ fn mirConsumeTopLevelFromRoot(mod: MirModule, ctx: MirBuildCtx, root: Node, file
         if objTypeNode != nil && objTypeNode.kind != nkEmpty:
             objTypeName = typeNodeObjTypeName(mod, objTypeNode)
         let isObj: bool = len(objTypeName) > 0 && objTypeNode != nil && typeNodeIsObjValue(mod, objTypeNode)
+        if debugDot && rawName == "baseIdentity":
+            let objNodeKindDbg: str = (objTypeNode != nil) ? intToStr(int32(objTypeNode.kind)) : "nil"
+            echo("[backend] debugDot: consumeGlobal name='" + name +
+                 "' objTypeName='" + objTypeName + "' isObj=" + (isObj ? "1" : "0") +
+                 " objNodeKind=nk#" + objNodeKindDbg + "'")
         if isObj:
             mirGlobalObjTypePut(name, objTypeName)
+            if debugDot && rawName == "baseIdentity":
+                let chkObj: str = mirGlobalObjTypeGet(name)
+                echo("[backend] debugDot: consumeGlobal putObj name='" + name + "' objTypeName='" +
+                     objTypeName + "' chkObj='" + chkObj + "'")
         if isObj:
             declType = mirTypeI64()
         elif typeNode == nil || typeNode.kind == nkEmpty:
@@ -13268,8 +14926,12 @@ fn mirConsumeTopLevelFromRoot(mod: MirModule, ctx: MirBuildCtx, root: Node, file
         var keyOut: str = ""
         if objTypeNode != nil && objTypeNode.kind != nkEmpty:
             keyOut = typeKey(objTypeNode)
+            if keyOut == nil || len(keyOut) == 0:
+                keyOut = mirTypeKeyFromNodeLoose(objTypeNode)
         if len(keyOut) == 0 && typeNode != nil && typeNode.kind != nkEmpty:
             keyOut = typeKey(typeNode)
+            if keyOut == nil || len(keyOut) == 0:
+                keyOut = mirTypeKeyFromNodeLoose(typeNode)
         if len(keyOut) == 0 && init != nil && init.kind != nkEmpty:
             var initKeyNode: Node = init
             while initKeyNode != nil && initKeyNode.kind == nkPar && kidCount(initKeyNode) > 0:
@@ -13299,6 +14961,10 @@ fn mirConsumeTopLevelFromRoot(mod: MirModule, ctx: MirBuildCtx, root: Node, file
                     keyOut = declType.isUnsigned ? "uint8" : "int8"
         if keyOut != nil && len(keyOut) > 0:
             mirGlobalTypeKeyPut(name, keyOut)
+            if debugDot && rawName == "baseIdentity":
+                let chkKey: str = mirGlobalTypeKeyGet(name)
+                echo("[backend] debugDot: consumeGlobal putKey name='" + name +
+                     "' keyOut='" + keyOut + "' chkKey='" + chkKey + "'")
         if ctx != nil && ctx.traceEnabled:
             ctx.traceGlobalCount = ctx.traceGlobalCount + 1
             if (ctx.traceGlobalCount % 200) == 0:
@@ -13319,29 +14985,32 @@ fn mirConsumeTopLevelFromRoot(mod: MirModule, ctx: MirBuildCtx, root: Node, file
         let f: MirFunc = Value[MirFunc](fRes)
         if f == nil:
             return Ok[bool](false)
+        # Predeclare pass inserts header-only entries first. Always try
+        # same-file replacement before duplicate-name checks so stale caches
+        # cannot leave body-less declarations in the final module.
+        var sameFileIdx: int32 = -1
+        for di in 0..<mod.funcs.len:
+            let ex: MirFunc = mod.funcs[di]
+            if ex != nil && (ex.name == f.name) && (ex.originFile == f.originFile):
+                sameFileIdx = di
+                break
+        if sameFileIdx >= 0:
+            let ex2: MirFunc = mod.funcs[sameFileIdx]
+            if ex2 == nil || ex2.blocks.len == 0:
+                mbWriteFunc(&mod.funcs, sameFileIdx, f)
+                if (f.name == "main"):
+                    if ctx != nil && ctx.foundMain:
+                        return Err[bool]("mir_builder: multiple main functions")
+                    if ctx != nil:
+                        ctx.foundMain = true
+                if ctx != nil && ctx.traceEnabled:
+                    ctx.traceFnCount = ctx.traceFnCount + 1
+                    if (ctx.traceFnCount % 50) == 0:
+                        stage1Trace("backend: mir funcs=" + intToStr(ctx.traceFnCount) + " last=" + f.name)
+                return Ok[bool](true)
+            return Err[bool]("mir_builder: duplicate function name: " + f.name)
         if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
            mirFindTypeAlias(mod, f.name) >= 0 || mirFindObjType(mod, f.name) >= 0:
-            var sameFileIdx: int32 = -1
-            for di in 0..<mod.funcs.len:
-                let ex: MirFunc = mod.funcs[di]
-                if ex != nil && (ex.name == f.name) && (ex.originFile == f.originFile):
-                    sameFileIdx = di
-                    break
-            if sameFileIdx >= 0:
-                let ex2: MirFunc = mod.funcs[sameFileIdx]
-                if ex2 != nil && !ex2.isExtern && ex2.blocks.len == 0:
-                    mbWriteFunc(&mod.funcs, sameFileIdx, f)
-                    if (f.name == "main"):
-                        if ctx != nil && ctx.foundMain:
-                            return Err[bool]("mir_builder: multiple main functions")
-                        if ctx != nil:
-                            ctx.foundMain = true
-                    if ctx != nil && ctx.traceEnabled:
-                        ctx.traceFnCount = ctx.traceFnCount + 1
-                        if (ctx.traceFnCount % 50) == 0:
-                            stage1Trace("backend: mir funcs=" + intToStr(ctx.traceFnCount) + " last=" + f.name)
-                    return Ok[bool](true)
-                return Ok[bool](false)
             return Err[bool]("mir_builder: duplicate function name: " + f.name)
         if (f.name == "main"):
             if ctx != nil && ctx.foundMain:
@@ -13479,11 +15148,33 @@ fn mirBuildGlobalInitFunc(mod: MirModule, ctx: MirBuildCtx): Result[MirFunc] =
 fn mirInjectGlobalInitCall(mod: MirModule, initName: str) =
     if mod == nil || initName == nil || len(initName) == 0:
         return
+    let dbgGlobalInit: bool = (getEnv "CHENG_BACKEND_DEBUG_GLOBAL_INIT" == "1")
     for i in 0..<mod.funcs.len:
         let f: MirFunc = mod.funcs[i]
-        if f != nil && !f.isExtern && (f.name == "main") && f.blocks.len > 0:
+        let nameNorm: str = backendStripSpaces((f != nil) ? f.name : "")
+        let linkNorm: str = backendStripSpaces((f != nil) ? f.linkName : "")
+        let nameIsMain: bool = (nameNorm != nil && len(nameNorm) == 4 &&
+                                nameNorm[0] == 'm' && nameNorm[1] == 'a' &&
+                                nameNorm[2] == 'i' && nameNorm[3] == 'n')
+        let linkIsMain: bool = (linkNorm != nil && len(linkNorm) == 4 &&
+                                linkNorm[0] == 'm' && linkNorm[1] == 'a' &&
+                                linkNorm[2] == 'i' && linkNorm[3] == 'n')
+        if dbgGlobalInit && f != nil &&
+           (mirStrIndexOf(f.name, "main") >= 0 ||
+            (f.linkName != nil && mirStrIndexOf(f.linkName, "main") >= 0)):
+            echo("[backend] debugGlobalInit: cand name='" + f.name +
+                 "' link='" + f.linkName +
+                 "' extern=" + (f.isExtern ? "1" : "0") +
+                 " blocks=" + intToStr(f.blocks.len) +
+                 " nameIsMain=" + (nameIsMain ? "1" : "0") +
+                 " linkIsMain=" + (linkIsMain ? "1" : "0"))
+        if f != nil && !f.isExtern &&
+           (nameIsMain || linkIsMain) &&
+           f.blocks.len > 0:
             let entry: MirBlock = f.blocks[0]
             if entry == nil:
+                if dbgGlobalInit:
+                    echo("[backend] debugGlobalInit: main entry nil")
                 return
 
             # Insert after initial parameter loads so argc/argv survive the init call.
@@ -13497,6 +15188,8 @@ fn mirInjectGlobalInitCall(mod: MirModule, initName: str) =
                 if s0.kind == msExpr:
                     let e0: MirExpr = s0.expr
                     if e0 != nil && e0.kind == meCall && (e0.callee == initName):
+                        if dbgGlobalInit:
+                            echo("[backend] debugGlobalInit: already inserted at=" + intToStr(insertAt))
                         return
 
             var args: MirExpr[]
@@ -13510,13 +15203,19 @@ fn mirInjectGlobalInitCall(mod: MirModule, initName: str) =
             if insertAt == entry.stmts.len:
                 add(out, stmt)
             entry.stmts = out
+            if dbgGlobalInit:
+                echo("[backend] debugGlobalInit: inserted at=" + intToStr(insertAt) +
+                     " total=" + intToStr(entry.stmts.len))
             return
+    if dbgGlobalInit:
+        echo("[backend] debugGlobalInit: main not found")
 
 fn mirBuildModuleFromRoot(root: Node): Result[MirModule] =
     if root == nil:
         return Err[MirModule]("mir_builder: empty root")
     let prof: MirProfileState = mirProfileInit()
     let dbgLower: bool = (os.getEnvDefault("CHENG_BACKEND_DEBUG_MIR_LOWER", "") == "1")
+    let dbgSummary: bool = (os.getEnvDefault("CHENG_BACKEND_DEBUG_MODULE_SUMMARY", "") == "1")
     mirGlobalObjTypesReset()
     mirGlobalTypeKeysReset()
     mirInlineObjFieldTypesReset()
@@ -13542,15 +15241,24 @@ fn mirBuildModuleFromRoot(root: Node): Result[MirModule] =
     mirProfileStep(prof, "dups")
     ctx.globalInits = []
     ensureBuiltinObjTypes(mod)
+    if (getEnv "CHENG_BACKEND_DEBUG_TYPES" == "1"):
+        let hs: str = mirHasObjType(mod, "seq") ? "1" : "0"
+        let ht: str = mirHasObjType(mod, "Table") ? "1" : "0"
+        echo("[backend] debug: builtin_obj_after_ensure seq=" + hs + " table=" + ht)
     mirPredeclareGlobalsForTypes(mod, root)
     mirProfileStep(prof, "predeclare_globals_for_types")
     let tdRes: Result[bool] = mirConsumeTypeDecls(mod, root)
     if ! IsOk[bool](tdRes):
         return ErrInfo[MirModule](ErrorInfoOf[bool](tdRes))
     mirProfileStep(prof, "consume_type_decls")
+    mirPredeclareGlobalsForLowering(mod, root)
+    mirProfileStep(prof, "predeclare_globals_for_lowering")
     var reachable: hashsets.HashSetStr
     var reachablePtr: hashsets.HashSetStr* = nil
-    if !envIsTrue "CHENG_BACKEND_WHOLE_PROGRAM":
+    let wholeProgramRaw: str = lowerAscii(backendStripSpaces(os.getEnvDefault("CHENG_BACKEND_WHOLE_PROGRAM", "1")))
+    let wholeProgram: bool = !(wholeProgramRaw == "0" || wholeProgramRaw == "false" ||
+                               wholeProgramRaw == "no" || wholeProgramRaw == "off")
+    if !wholeProgram:
         reachable = mirComputeReachableFns(mod, root)
         reachablePtr = &reachable
     mirProfileStep(prof, "reachable")
@@ -13569,6 +15277,10 @@ fn mirBuildModuleFromRoot(root: Node): Result[MirModule] =
         if !IsOk[bool](res):
             return ErrInfo[MirModule](ErrorInfoOf[bool](res))
     mirProfileStep(prof, "predeclare_top_level")
+    if dbgSummary:
+        echo("[mir] predeclare funcs=" + intToStr(mod.funcs.len) +
+             " globals=" + intToStr(mod.globals.len) +
+             " cstrs=" + intToStr(mod.cstrs.len))
     lastFilePath = root.strVal
     for i in 0..<kidCount(root):
         let n: Node = kid(root, i)
@@ -13604,12 +15316,36 @@ fn mirBuildModuleFromRoot(root: Node): Result[MirModule] =
             stage1Trace("backend: mir lower " + intToStr(i + 1) + "/" + intToStr(rootKidCount) + " file=" + filePath)
         let res: Result[bool] = mirConsumeTopLevelFromRoot(mod, ctx, root, filePath, n, reachablePtr, &ctx.overloadedFnBases)
         if ! IsOk[bool](res):
-            return ErrInfo[MirModule](ErrorInfoOf[bool](res))
+            let info0: ErrorInfo = ErrorInfoOf[bool](res)
+            let msg0: str = ErrorFormat(info0)
+            if msg0 == nil || len(msg0) == 0 || msg0 == "error":
+                var kindDbg: int32 = -1
+                var nameDbg: str = ""
+                var lineDbg: str = "0"
+                var colDbg: str = "0"
+                if n != nil:
+                    kindDbg = int32(n.kind)
+                    lineDbg = intToStr(n.pos.line)
+                    colDbg = intToStr(n.pos.col)
+                    if kidCount(n) > 0:
+                        let nameNodeDbg: Node = kid(n, 0)
+                        if nameNodeDbg != nil && (nameNodeDbg.kind == nkIdent || nameNodeDbg.kind == nkSymbol):
+                            nameDbg = backendStripSpaces(plainName(nameNodeDbg))
+                return Err[MirModule]("mir_builder: lower top-level failed file=" + filePath +
+                    " idx=" + intToStr(i + 1) + "/" + intToStr(rootKidCount) +
+                    " kind=nk#" + intToStr(kindDbg) +
+                    " name=" + nameDbg +
+                    " @" + lineDbg + ":" + colDbg)
+            return ErrInfo[MirModule](info0)
     mirProfileStep(prof, "lower_top_level")
+    if dbgSummary:
+        echo("[mir] lower funcs=" + intToStr(mod.funcs.len) +
+             " globals=" + intToStr(mod.globals.len) +
+             " cstrs=" + intToStr(mod.cstrs.len))
     if ctx.traceEnabled:
         stage1Trace("backend: mir lower done funcs=" + intToStr(ctx.traceFnCount) +
             " globals=" + intToStr(ctx.traceGlobalCount) + " inits=" + intToStr(ctx.globalInits.len))
-    let allowNoMain: bool = envIsTrue "CHENG_BACKEND_ALLOW_NO_MAIN"
+    let allowNoMain: bool = envIsTrue "CHENG_BACKEND_ALLOW_NO_MAIN" || backendAllowNoMainByEmit()
     if ! ctx.foundMain && !allowNoMain:
         return Err[MirModule]("mir_builder: main not found")
 
@@ -13625,6 +15361,10 @@ fn mirBuildModuleFromRoot(root: Node): Result[MirModule] =
         if ctx.traceEnabled:
             stage1Trace("backend: mir global_init build done")
     mirProfileStep(prof, "global_init")
+    if dbgSummary:
+        echo("[mir] global_init funcs=" + intToStr(mod.funcs.len) +
+             " globals=" + intToStr(mod.globals.len) +
+             " cstrs=" + intToStr(mod.cstrs.len))
 
     if ctx.traceEnabled:
         stage1Trace("backend: mir fixups start")
@@ -13635,7 +15375,15 @@ fn mirBuildModuleFromRoot(root: Node): Result[MirModule] =
         stage1Trace("backend: mir fixups done")
         stage1Trace("backend: mir normalize start")
     mirProfileStep(prof, "fixups")
+    if dbgSummary:
+        echo("[mir] fixups funcs=" + intToStr(mod.funcs.len) +
+             " globals=" + intToStr(mod.globals.len) +
+             " cstrs=" + intToStr(mod.cstrs.len))
     mirNormalizeModule(mod)
+    if dbgSummary:
+        echo("[mir] normalize funcs=" + intToStr(mod.funcs.len) +
+             " globals=" + intToStr(mod.globals.len) +
+             " cstrs=" + intToStr(mod.cstrs.len))
     if ctx.traceEnabled:
         stage1Trace("backend: mir normalize done")
     mirProfileStep(prof, "normalize")
@@ -13847,7 +15595,7 @@ fn mirBuildModuleFromFileStage1(inPath: str): Result[MirModule] =
         stage1Trace("import: mm_strict=" + (strictOn0 ? "1" : "0"))
         stage1Trace("import: own_diags=" + (ownDiags ? "1" : "0"))
     let skipSem: bool = mirIsOne(getEnv "CHENG_STAGE1_SKIP_SEM")
-    let skipMono: bool = mirIsOne(getEnv "CHENG_STAGE1_SKIP_MONO")
+    let skipMono: bool = mirShouldSkipMonoPass()
     let mmIsOrc: bool = mirIsOrcMode(mm0)
     if ! skipSem:
         if dbgPipe:
@@ -13891,6 +15639,38 @@ fn mirBuildModuleFromFileStage1(inPath: str): Result[MirModule] =
         if dbgPipe:
             os.writeLine(dbgFile, "[backend] stage1: mono_skipped")
             os.c_fflush dbgFile
+    if dbgPipe:
+        let errFlag: bool = hasError(diags)
+        os.writeLine(dbgFile, "[backend] stage1: mono_diag_count=" + intToStr(diags.len) +
+                     " has_error=" + (errFlag ? "1" : "0"))
+        if diags.len > 0:
+            let d0: Diagnostic = diags[0]
+            os.writeLine(dbgFile, "[backend] stage1: mono_diag0 sev=" + intToStr(int32(d0.severity)) +
+                         " file='" + d0.filename +
+                         "' line=" + intToStr(d0.line) +
+                         " col=" + intToStr(d0.col) +
+                         " msg='" + d0.message + "'")
+        if root != nil && ! errFlag:
+            var seenMonoNames: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(512)
+            var dupMonoNames: int32 = 0
+            for di in 0..<kidCount(root):
+                let dn: Node = kid(root, di)
+                if dn == nil || (dn.kind != nkFnDecl && dn.kind != nkIteratorDecl):
+                    continue
+                if kidCount(dn) <= 0:
+                    continue
+                let dname: str = backendStripSpaces(plainName(kid(dn, 0)))
+                if dname == nil || len(dname) == 0:
+                    continue
+                var foundCnt: bool = false
+                let rawCnt: int32 = mirHashMapStrIntGetCompat(seenMonoNames, dname, foundCnt)
+                let nextCnt: int32 = (foundCnt ? rawCnt : 0) + 1
+                hashmaps.hashMapStrIntPut(seenMonoNames, dname, nextCnt)
+                if foundCnt && rawCnt == 1 && dupMonoNames < 12:
+                    os.writeLine(dbgFile, "[backend] stage1: mono_dup_fn '" + dname + "'")
+                    dupMonoNames = dupMonoNames + 1
+            os.writeLine(dbgFile, "[backend] stage1: mono_dup_fn_count=" + intToStr(dupMonoNames))
+        os.c_fflush dbgFile
     if hasError diags:
         printDiagnostics diags
         return Err[MirModule]("mir_builder: stage1 errors")
@@ -13906,6 +15686,24 @@ fn mirBuildModuleFromFileStage1(inPath: str): Result[MirModule] =
     if hasError diags:
         printDiagnostics diags
         return Err[MirModule]("mir_builder: c-profile lowering failed")
+    let monoAfterCProfile: bool = !envIsTrue "CHENG_STAGE1_SKIP_MONO_AFTER_CPROFILE"
+    if !skipMono && monoAfterCProfile:
+        # c_profile lowering can introduce new generic helper callsites
+        # (e.g. Result/Option helpers). Run a second mono pass to ensure
+        # all late-introduced generic calls are fully instantiated.
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: mono_after_cprofile_start")
+            os.c_fflush dbgFile
+        root = monomorphize(root, &diags)
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: mono_after_cprofile_done")
+            os.c_fflush dbgFile
+        if hasError diags:
+            printDiagnostics diags
+            return Err[MirModule]("mir_builder: stage1 errors")
+    elif dbgPipe && !skipMono:
+        os.writeLine(dbgFile, "[backend] stage1: mono_after_cprofile_skipped")
+        os.c_fflush dbgFile
 
     let arcOn: bool = arcEnabled()
     let skipOwnership: bool = envIsTrue "CHENG_STAGE1_SKIP_OWNERSHIP"
@@ -13949,4 +15747,10 @@ fn mirBuildModuleFromFileStage1(inPath: str): Result[MirModule] =
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: mir_build_start")
         os.c_fflush dbgFile
-    return mirBuildModuleFromRoot(root)
+    let mirRes: Result[MirModule] = mirBuildModuleFromRoot(root)
+    if !IsOk[MirModule](mirRes):
+        let info0: ErrorInfo = ErrorInfoOf[MirModule](mirRes)
+        let msg0: str = ErrorFormat(info0)
+        if msg0 == nil || len(msg0) == 0 || msg0 == "error":
+            return Err[MirModule]("mir_builder: stage1 mir build failed (empty error) input=" + inPath)
+    return mirRes

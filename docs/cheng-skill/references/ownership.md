@@ -3,7 +3,7 @@
 主要来源：`docs/cheng-formal-spec.md`（第 0 章）。
 
 ## 运行时模型
-- 默认内存模型为 ORC（引用计数），`CHENG_MM=orc|off`（默认 `orc`）。
+- 默认并固定内存模型为 ORC（引用计数），`CHENG_MM=orc`。
 - 严格模式默认启用：`CHENG_MM_STRICT=0` 关闭，`CHENG_MM_STRICT=1` 强制开启。
 - 严格模式只读 ownership 标注，不回退启发式。
 - `memRetain/memRelease` 仅改 refcount；refcount==0 立即释放并移除。

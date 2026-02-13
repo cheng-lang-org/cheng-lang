@@ -100,6 +100,47 @@ supports_ed25519() {
   [ "$status" -eq 0 ]
 }
 
+supports_ed25519_sign() {
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/cheng_release_sign.XXXXXX" 2>/dev/null || true)"
+  if [ "$tmp_dir" = "" ] || [ ! -d "$tmp_dir" ]; then
+    return 1
+  fi
+  tmp_key="$tmp_dir/ed25519_priv.pem"
+  tmp_pub="$tmp_dir/ed25519_pub.pem"
+  tmp_msg="$tmp_dir/msg.txt"
+  tmp_sig="$tmp_dir/msg.sig"
+  printf "cheng-release-sign-smoke\n" >"$tmp_msg"
+  set +e
+  openssl genpkey -algorithm ed25519 -out "$tmp_key" >/dev/null 2>&1
+  s0=$?
+  if [ "$s0" -eq 0 ]; then
+    openssl pkey -in "$tmp_key" -pubout -out "$tmp_pub" >/dev/null 2>&1
+    s1=$?
+  else
+    s1=1
+  fi
+  if [ "$s0" -eq 0 ] && [ "$s1" -eq 0 ]; then
+    openssl pkeyutl -sign -inkey "$tmp_key" -in "$tmp_msg" -out "$tmp_sig" >/dev/null 2>&1
+    s2=$?
+  else
+    s2=1
+  fi
+  if [ "$s2" -eq 0 ]; then
+    openssl pkeyutl -verify -pubin -inkey "$tmp_pub" -sigfile "$tmp_sig" -in "$tmp_msg" >/dev/null 2>&1
+    s3=$?
+  else
+    s3=1
+  fi
+  set -e
+  rm -rf "$tmp_dir" >/dev/null 2>&1 || true
+  [ "$s0" -eq 0 ] && [ "$s1" -eq 0 ] && [ "$s2" -eq 0 ] && [ "$s3" -eq 0 ]
+}
+
+explicit_sign_material="0"
+if [ "$key" != "" ] || [ "$pub" != "" ]; then
+  explicit_sign_material="1"
+fi
+
 if [ "$out_dir" = "" ]; then
   out_dir="$(dirname "$manifest")"
 fi
@@ -109,14 +150,25 @@ algo_file="$out_dir/signing_algo.txt"
 if [ "$algo" = "" ] && [ -f "$algo_file" ]; then
   algo="$(head -n 1 "$algo_file" | tr -d '\r\n' || true)"
 fi
+ed25519_ready="0"
+if supports_ed25519 && supports_ed25519_sign; then
+  ed25519_ready="1"
+fi
 if [ "$algo" = "" ]; then
-  if supports_ed25519; then
+  if [ "$ed25519_ready" = "1" ]; then
     algo="ed25519"
   else
     algo="rsa-sha256"
   fi
 fi
-printf "%s\n" "$algo" >"$algo_file"
+if [ "$algo" = "ed25519" ] && [ "$ed25519_ready" != "1" ]; then
+  if [ "$explicit_sign_material" = "1" ]; then
+    echo "[Error] openssl cannot sign Ed25519 on this host (explicit key/pub provided)" 1>&2
+    exit 1
+  fi
+  echo "[backend_release_sign] warn: Ed25519 sign unsupported on this host, fallback to rsa-sha256" 1>&2
+  algo="rsa-sha256"
+fi
 
 if [ "$key" = "" ] && [ "$pub" = "" ]; then
   if [ "$algo" = "ed25519" ]; then
@@ -139,6 +191,7 @@ fi
 if [ ! -f "$pub" ]; then
   openssl pkey -in "$key" -pubout -out "$pub" >/dev/null
 fi
+printf "%s\n" "$algo" >"$algo_file"
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -161,8 +214,32 @@ sha_manifest="$out_dir/$man_base.sha256"
 sha_bundle="$out_dir/$bun_base.sha256"
 
 if [ "$algo" = "ed25519" ]; then
-  openssl pkeyutl -sign -inkey "$key" -in "$manifest" -out "$sig_manifest" >/dev/null
-  openssl pkeyutl -sign -inkey "$key" -in "$bundle" -out "$sig_bundle" >/dev/null
+  set +e
+  openssl pkeyutl -sign -inkey "$key" -in "$manifest" -out "$sig_manifest" >/dev/null 2>&1
+  sign_m_status=$?
+  openssl pkeyutl -sign -inkey "$key" -in "$bundle" -out "$sig_bundle" >/dev/null 2>&1
+  sign_b_status=$?
+  set -e
+  if [ "$sign_m_status" -ne 0 ] || [ "$sign_b_status" -ne 0 ]; then
+    if [ "$explicit_sign_material" = "1" ]; then
+      echo "[Error] Ed25519 signing failed with explicit key/pub" 1>&2
+      exit 1
+    fi
+    echo "[backend_release_sign] warn: Ed25519 signing failed, fallback to rsa-sha256" 1>&2
+    algo="rsa-sha256"
+    key="$out_dir/signing_rsa_priv.pem"
+    pub="$out_dir/signing_rsa_pub.pem"
+    if [ ! -f "$key" ]; then
+      openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$key" >/dev/null
+      chmod 600 "$key" >/dev/null 2>&1 || true
+    fi
+    if [ ! -f "$pub" ]; then
+      openssl pkey -in "$key" -pubout -out "$pub" >/dev/null
+    fi
+    printf "%s\n" "$algo" >"$algo_file"
+    openssl dgst -sha256 -sign "$key" -out "$sig_manifest" "$manifest" >/dev/null
+    openssl dgst -sha256 -sign "$key" -out "$sig_bundle" "$bundle" >/dev/null
+  fi
 else
   openssl dgst -sha256 -sign "$key" -out "$sig_manifest" "$manifest" >/dev/null
   openssl dgst -sha256 -sign "$key" -out "$sig_bundle" "$bundle" >/dev/null

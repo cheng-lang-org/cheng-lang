@@ -4,6 +4,28 @@ set -euo pipefail
 ROOT="build/cheng_demo_compute_verify"
 MODE="local"
 EPOCH="1"
+repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+
+resolve_chengc_bin() {
+  local name="$1"
+  case "$name" in
+    /*|*/*)
+      printf '%s\n' "$name"
+      return
+      ;;
+  esac
+  case "${CHENGC_NAME_IN_ROOT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      printf '%s/%s\n' "$repo_root" "$name"
+      ;;
+    *)
+      printf '%s/artifacts/chengc/%s\n' "$repo_root" "$name"
+      ;;
+  esac
+}
+
+storage_bin="$(resolve_chengc_bin cheng_storage)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -27,7 +49,7 @@ done
 DEMO_ARGS=(--root:"$ROOT" --mode:"$MODE" --epoch:"$EPOCH" --clean --reset-ledger)
 sh src/tooling/demo_compute_settle.sh "${DEMO_ARGS[@]}" >/dev/null
 
-settle="$(./cheng_storage settle --root:"$ROOT" --format:toml --top:1)"
+settle="$("$storage_bin" settle --root:"$ROOT" --format:toml --top:1)"
 printf '%s' "$settle" | grep -Fq "compute_total" || { echo "verify: missing compute_total" 1>&2; exit 1; }
 printf '%s' "$settle" | grep -Fq "audit_total" || { echo "verify: missing audit_total" 1>&2; exit 1; }
 printf '%s' "$settle" | grep -Fq "exec_request" || { echo "verify: missing exec_request count" 1>&2; exit 1; }

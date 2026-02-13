@@ -2,11 +2,9 @@ import cmdline
 import std/os
 import std/strutils as strutil
 import cheng/runtime/json_ast as json
-import cheng/decentralized/pkg_source as dsrc
+import cheng/decentralized/pkg_source_local as dsrc
 import cheng/decentralized/pkg_manifest as dman
-import cheng/decentralized/io_backend as diob
-import cheng/decentralized/registry as dreg
-import cheng/libp2p/utils/bytes as bytes
+import cheng/decentralized/registry_local as dreg
 import cheng/libp2p/utils/result as result
 import std/strings
 import std/seqs
@@ -52,11 +50,9 @@ fn printUsage() =
     printLine("           [--exclude:<name>] [--out:<file>]")
     printLine("  publish  --src:<dir> --package:<id> --author:<id> --channel:<edge|stable|lts> --epoch:<n>")
     printLine("           --priv:<key> [--registry:<path>] [--source-addr:<addr>] [--manifest-out:<file>]")
-    printLine("           [--root:<dir>] [--mode:local|p2p] [--storage-listen:<addr>] [--peer:<addr>]")
-    printLine("  serve    --src:<dir> --manifest:<file|cid> --listen:<addr> [--max:<n>]")
-    printLine("           [--root:<dir>] [--mode:local|p2p] [--storage-listen:<addr>] [--peer:<addr>]")
-    printLine("  fetch    --manifest:<file|cid> --out:<dir> [--source-peer:<addr>] [--listen:<addr>]")
-    printLine("           [--root:<dir>] [--mode:local|p2p] [--storage-listen:<addr>] [--peer:<addr>]")
+    printLine("           [--root:<dir>] [--mode:local]")
+    printLine("  serve    (moved to p2p toolchain; unsupported in local-only core binary)")
+    printLine("  fetch    --manifest:<file|cid> --out:<dir> [--root:<dir>] [--mode:local]")
     printLine("  lock-verify --lock:<file> [--registry:<path>]")
 
 fn parseInt(text: str): int32 =
@@ -139,18 +135,6 @@ fn parseArgs(): Args =
             res.maxStreams = parseInt(str(ptr_add(arg, len("--max:"))))
     return res
 
-fn joinPeers(peers: str[]): str =
-    if peers.len == 0:
-        return ""
-    var out: str = ""
-    for i in 0..<peers.len:
-        let p = peers[i]
-        if p != nil && len(p) > 0:
-            if len(out) > 0:
-                out = out + ","
-            out = out + p
-    return out
-
 fn writeOutput(path: str, text: str) =
     if path != nil && len(path) > 0:
         let dir = os.parentDir(path)
@@ -160,19 +144,12 @@ fn writeOutput(path: str, text: str) =
     else:
         printLine(text)
 
-fn readManifestFromRef(args: Args): (&result.Result)[dsrc.SourceManifest] =
+fn readManifestFromRef(args: Args): result.Result[dsrc.SourceManifest] =
     if args.manifestRef == nil || len(args.manifestRef) == 0:
         return result.Err[dsrc.SourceManifest]("pkg-source: missing manifest")
     if os.fileExists(args.manifestRef):
         return dsrc.loadSourceManifestFile(args.manifestRef)
-    var refText: str = args.manifestRef
-    if ! strutil.startsWith(refText, "cid://") && ! strutil.startsWith(refText, "cid:"):
-        refText = "cid://" + refText
-    let backend = diob.initIoBackend(args.root, "", args.mode, args.storageListenAddr, joinPeers(args.storagePeers))
-    let textRes: (&result.Result)[str] = diob.readText(backend, refText)
-    if result.IsErr(textRes):
-        return result.Err[dsrc.SourceManifest](result.Error(textRes))
-    return dsrc.parseSourceManifestText(result.Value(textRes))
+    return dsrc.loadSourceManifestFromStore(args.root, args.manifestRef)
 
 fn cmdManifest(args: Args): int32 =
     if args.src == nil || len(args.src) == 0:
@@ -181,7 +158,7 @@ fn cmdManifest(args: Args): int32 =
     if args.packageId == nil || len(args.packageId) == 0:
         printErr("manifest: missing --package")
         return 1
-    let manRes: (&result.Result)[dsrc.SourceManifest] =
+    let manRes: result.Result[dsrc.SourceManifest] =
         dsrc.buildSourceManifest(args.src, args.packageId, args.sourceAddrs, args.excludes)
     if result.IsErr(manRes):
         printErr("manifest: build failed")
@@ -206,7 +183,10 @@ fn cmdPublish(args: Args): int32 =
     if args.privKeyText == nil || len(args.privKeyText) == 0:
         printErr("publish: missing --priv")
         return 1
-    let manRes: (&result.Result)[dsrc.SourceManifest] =
+    if args.mode != nil && len(args.mode) > 0 && args.mode != "local":
+        printErr("publish: only --mode:local is supported in core binary")
+        return 2
+    let manRes: result.Result[dsrc.SourceManifest] =
         dsrc.buildSourceManifest(args.src, args.packageId, args.sourceAddrs, args.excludes)
     if result.IsErr(manRes):
         printErr("publish: build manifest failed")
@@ -215,16 +195,11 @@ fn cmdPublish(args: Args): int32 =
     let text = dsrc.manifestToText(manifest)
     if args.manifestOut != nil && len(args.manifestOut) > 0:
         writeOutput(args.manifestOut, text)
-    let backend = diob.initIoBackend(args.root, "", args.mode, args.storageListenAddr, joinPeers(args.storagePeers))
-    let storeRes: (&result.Result)[str] = diob.storeBytes(backend, bytes.bytesFromString(text))
+    let storeRes: result.Result[str] = dsrc.storeManifestToStore(args.root, text)
     if result.IsErr(storeRes):
         printErr("publish: store manifest failed")
         return 1
-    var cidText = result.Value(storeRes)
-    if strutil.startsWith(cidText, "cid://"):
-        cidText = str(ptr_add(cidText, len("cid://")))
-    elif strutil.startsWith(cidText, "cid:"):
-        cidText = str(ptr_add(cidText, len("cid:")))
+    let cidText = result.Value(storeRes)
     if cidText == nil || len(cidText) == 0:
         printErr("publish: missing manifest cid")
         return 1
@@ -235,7 +210,7 @@ fn cmdPublish(args: Args): int32 =
     snap.epoch = args.epoch
     snap.cidText = cidText
     snap.format = "source"
-    let pubRes: (&result.Result)[dreg.PackageSnapshot] = dreg.publishSnapshot(args.registryPath, snap, args.privKeyText)
+    let pubRes: result.Result[dreg.PackageSnapshot] = dreg.publishSnapshot(args.registryPath, snap, args.privKeyText)
     if result.IsErr(pubRes):
         printErr("publish: registry publish failed")
         return 1
@@ -244,24 +219,8 @@ fn cmdPublish(args: Args): int32 =
     return 0
 
 fn cmdServe(args: Args): int32 =
-    if args.src == nil || len(args.src) == 0:
-        printErr("serve: missing --src")
-        return 1
-    if args.manifestRef == nil || len(args.manifestRef) == 0:
-        printErr("serve: missing --manifest")
-        return 1
-    if args.listenAddr == nil || len(args.listenAddr) == 0:
-        printErr("serve: missing --listen")
-        return 1
-    let manRes = readManifestFromRef(args)
-    if result.IsErr(manRes):
-        printErr("serve: load manifest failed")
-        return 1
-    let serveRes = dsrc.servePkgSource(result.Value(manRes), args.src, args.listenAddr, args.maxStreams)
-    if result.IsErr(serveRes):
-        printErr("serve: failed")
-        return 1
-    return 0
+    printErr("serve: moved to p2p toolchain; unsupported in local-only core binary")
+    return 2
 
 fn cmdFetch(args: Args): int32 =
     if args.manifestRef == nil || len(args.manifestRef) == 0:
@@ -270,15 +229,15 @@ fn cmdFetch(args: Args): int32 =
     if args.outPath == nil || len(args.outPath) == 0:
         printErr("fetch: missing --out")
         return 1
+    if args.mode != nil && len(args.mode) > 0 && args.mode != "local":
+        printErr("fetch: only --mode:local is supported in core binary")
+        return 2
     let manRes = readManifestFromRef(args)
     if result.IsErr(manRes):
         printErr("fetch: load manifest failed")
         return 1
     let manifest = result.Value(manRes)
-    var peers: str[] = manifest.sourceAddrs
-    if args.sourcePeers.len > 0:
-        peers = args.sourcePeers
-    let fetchRes = dsrc.fetchPkgSource(manifest, args.outPath, peers, args.listenAddr)
+    let fetchRes = dsrc.fetchPkgSourceLocal(manifest, args.root, args.outPath)
     if result.IsErr(fetchRes):
         printErr("fetch: failed")
         return 1
@@ -288,7 +247,7 @@ fn cmdLockVerify(args: Args): int32 =
     if args.lockPath == nil || len(args.lockPath) == 0:
         printErr("lock-verify: missing --lock")
         return 1
-    let lockRes: (&result.Result)[dman.PackageLock] = dman.loadLockFile(args.lockPath)
+    let lockRes: result.Result[dman.PackageLock] = dman.loadLockFile(args.lockPath)
     if result.IsErr(lockRes):
         printErr(result.Error(lockRes))
         return 1
@@ -310,7 +269,7 @@ fn cmdLockVerify(args: Args): int32 =
 
 fn main(argc: int32, argv: str*): int32 =
     cmdline.__cheng_setCmdLine(argc, void*(argv))
-    let args = parseArgs()
+    let args: Args = parseArgs()
     if ! args.ok:
         printUsage()
         if args.error != nil && len(args.error) > 0:

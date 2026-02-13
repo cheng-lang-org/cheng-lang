@@ -51,10 +51,14 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 
 ## 后端生产链路（2026-02）
 - 生产闭环入口 `src/tooling/backend_prod_closure.sh` 仅接受 `CHENG_ABI=v2_noptr`。
-- 主闭环默认使用兼容口径（`CHENG_STAGE1_STD_NO_POINTERS=0`）；严格 no-pointer 由 `backend.abi_v2_noptr` 专项门禁覆盖。
+- 主闭环默认 no-pointer 兼容口径（`CHENG_STAGE1_STD_NO_POINTERS=1`、`CHENG_STAGE1_STD_NO_POINTERS_STRICT=0`、`CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1`、`CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`），strict `std` 门禁由 `verify_backend_abi_v2_noptr.sh` 专项覆盖。
 - `verify_backend_abi_v2_noptr.sh` 支持 `CHENG_BACKEND_ABI_V2_NOPTR_ONLY=1`（only-v2）；其 non-C-ABI 子门禁会显式设 `CHENG_STAGE1_STD_NO_POINTERS=0` 以隔离诊断。
 - `verify_backend_closedloop.sh` 默认执行 `backend.spawn_api_gate`（v2 友好 fixture，默认 API 禁 raw spawn、legacy 显式入口可用）。
 - `CHENG_BACKEND_DRIVER` 未显式设置时，`backend_prod_closure.sh` 优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（其次 `cheng.stage1`、`artifacts/backend_seed/cheng.stage2`），再回落 `backend_driver_path.sh`。
+- `backend_prod_closure.sh` 的 stage0 探针与 selfhost 口径对齐（`CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0`、`CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`、`CHENG_STAGE1_SKIP_SEM=1`、`CHENG_GENERIC_MODE=hybrid`、`CHENG_GENERIC_SPEC_BUDGET=0`、`CHENG_STAGE1_SKIP_OWNERSHIP=1`），避免误选不稳定 stage0。
+- `backend_prod_closure.sh` 在 `CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1` 下默认不把主门禁切到 selfhost driver（保持 stable driver）；可用 `CHENG_BACKEND_MAIN_ALLOW_SELFHOST_DRIVER=1` 强制切换。
+- `backend_prod_closure.sh` 的 selfhost 自举步骤默认会显式设置 `CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`；non-C-ABI no-pointer 收敛由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁负责。
+- `backend.abi_v2_noptr` 在 `backend_prod_closure.sh` 中默认优先使用 selfhost `cheng.stage1`（其次 `cheng.stage2`，最后当前 `CHENG_BACKEND_DRIVER`）；可用 `CHENG_BACKEND_ABI_V2_DRIVER` 显式覆盖。
 
 ## 任务流（修正）
 

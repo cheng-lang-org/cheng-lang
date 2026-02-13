@@ -12,20 +12,23 @@ Builds backend driver via self-link rebuild only:
   2) no seed/tar copy path
 
 Output:
-  ./<binName> (default: cheng)
+  <binName> (default: artifacts/backend_driver/cheng)
 
 Env:
   CHENG_BACKEND_BUILD_DRIVER_LINKER=self   (required; default self)
   CHENG_BACKEND_BUILD_DRIVER_SELFHOST=1    (default 1)
   CHENG_BACKEND_BUILD_DRIVER_STAGE0=<path> (optional stage driver override)
-  CHENG_BACKEND_BUILD_DRIVER_MULTI=0       (default 0; stable selfhost path)
+  CHENG_BACKEND_BUILD_DRIVER_MULTI=1       (default 1; parallel incremental)
   CHENG_BACKEND_BUILD_DRIVER_MULTI_FORCE=0 (default 0)
   CHENG_BACKEND_BUILD_DRIVER_INCREMENTAL=1 (default 1)
   CHENG_BACKEND_BUILD_DRIVER_JOBS=0        (default 0=auto)
+  CHENG_BACKEND_IR=uir                     (default uir)
+  CHENG_GENERIC_MODE=dict                  (default dict)
+  CHENG_GENERIC_SPEC_BUDGET=0              (default 0)
 EOF
 }
 
-name="cheng"
+name="${CHENG_BACKEND_LOCAL_DRIVER_REL:-artifacts/backend_driver/cheng}"
 while [ "${1:-}" != "" ]; do
   case "$1" in
     --help|-h)
@@ -98,9 +101,24 @@ run_with_timeout() {
         exit($status >> 8);
       }
       if (time >= $end) {
+        # First try process-group kill, then direct pid kill as fallback.
+        # Some seed drivers may leave descendants outside expected pgid.
         kill "TERM", -$pid;
-        select(undef, undef, undef, 0.5);
+        kill "TERM", $pid;
+        my $grace_end = time + 1;
+        while (time < $grace_end) {
+          my $r = waitpid($pid, WNOHANG);
+          if ($r == $pid) {
+            my $status = $?;
+            if (($status & 127) != 0) {
+              exit(128 + ($status & 127));
+            }
+            exit($status >> 8);
+          }
+          select(undef, undef, undef, 0.1);
+        }
         kill "KILL", -$pid;
+        kill "KILL", $pid;
         exit 124;
       }
       select(undef, undef, undef, 0.1);
@@ -128,6 +146,36 @@ driver_sanity_ok() {
   return 1
 }
 
+driver_stage1_smoke_ok() {
+  bin="$1"
+  if [ ! -x "$bin" ]; then
+    return 1
+  fi
+  smoke_src="$root/tests/cheng/backend/fixtures/return_add.cheng"
+  if [ ! -f "$smoke_src" ]; then
+    return 0
+  fi
+  smoke_out="$root/chengcache/.build_backend_driver.stage1_smoke.o"
+  rm -f "$smoke_out"
+  set +e
+  run_with_timeout 15 env \
+    CHENG_MM=orc \
+    CHENG_BACKEND_VALIDATE=0 \
+    CHENG_BACKEND_EMIT=obj \
+    CHENG_BACKEND_TARGET="$target" \
+    CHENG_BACKEND_FRONTEND=stage1 \
+    CHENG_BACKEND_INPUT="$smoke_src" \
+    CHENG_BACKEND_OUTPUT="$smoke_out" \
+    "$bin" >/dev/null 2>&1
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    return 1
+  fi
+  [ -s "$smoke_out" ] || return 1
+  return 0
+}
+
 to_abs() {
   p="$1"
   case "$p" in
@@ -151,6 +199,10 @@ fi
 
 if [ "$stage0" = "" ]; then
   for cand in \
+    "$root/artifacts/backend_driver/cheng" \
+    "$root/dist/releases/current/cheng" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng_stage0_prod" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng_stage0_default" \
     "$root/artifacts/backend_seed/cheng.stage2" \
     "$root/cheng" \
     "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
@@ -185,19 +237,27 @@ if [ "$selfhost" = "0" ]; then
   exit 2
 fi
 
-driver_multi="${CHENG_BACKEND_BUILD_DRIVER_MULTI:-0}"
+driver_multi="${CHENG_BACKEND_BUILD_DRIVER_MULTI:-1}"
 driver_multi_force="${CHENG_BACKEND_BUILD_DRIVER_MULTI_FORCE:-0}"
 driver_incremental="${CHENG_BACKEND_BUILD_DRIVER_INCREMENTAL:-1}"
 driver_jobs="${CHENG_BACKEND_BUILD_DRIVER_JOBS:-0}"
 build_timeout="${CHENG_BACKEND_BUILD_DRIVER_TIMEOUT:-60}"
 mm="${CHENG_BACKEND_BUILD_DRIVER_MM:-${CHENG_MM:-orc}}"
+allow_stage0_fallback="${CHENG_BACKEND_BUILD_DRIVER_ALLOW_STAGE0_FALLBACK:-1}"
+if [ "${CHENG_BACKEND_IR:-}" = "" ]; then
+  export CHENG_BACKEND_IR=uir
+fi
+if [ "${CHENG_GENERIC_MODE:-}" = "" ]; then
+  # Fast/default path: skip stage1 monomorphize in bootstrap builds.
+  export CHENG_GENERIC_MODE=dict
+fi
+if [ "${CHENG_GENERIC_SPEC_BUDGET:-}" = "" ]; then
+  export CHENG_GENERIC_SPEC_BUDGET=0
+fi
 # Stage1 frontend currently keeps semantics/mono/ownership behind explicit
 # toggles in production scripts to avoid seed-compiler crashes on this path.
 if [ "${CHENG_STAGE1_SKIP_SEM:-}" = "" ]; then
   export CHENG_STAGE1_SKIP_SEM=0
-fi
-if [ "${CHENG_STAGE1_SKIP_MONO:-}" = "" ]; then
-  export CHENG_STAGE1_SKIP_MONO=0
 fi
 if [ "${CHENG_STAGE1_SKIP_OWNERSHIP:-}" = "" ]; then
   export CHENG_STAGE1_SKIP_OWNERSHIP=1
@@ -226,7 +286,7 @@ if [ ! -f "$runtime_obj_abs" ] || [ "$runtime_src" -nt "$runtime_obj_abs" ]; the
     CHENG_BACKEND_WHOLE_PROGRAM=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \
-    CHENG_BACKEND_FRONTEND=stage1 \
+    CHENG_BACKEND_FRONTEND=mvp \
     CHENG_BACKEND_INPUT="$runtime_src" \
     CHENG_BACKEND_OUTPUT="$runtime_obj_abs" \
     "$stage0" >/dev/null 2>&1
@@ -249,7 +309,7 @@ if [ ! -f "$runtime_obj_abs" ] || [ "$runtime_src" -nt "$runtime_obj_abs" ]; the
       CHENG_BACKEND_WHOLE_PROGRAM=1 \
       CHENG_BACKEND_EMIT=obj \
       CHENG_BACKEND_TARGET="$target" \
-      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_FRONTEND=mvp \
       CHENG_BACKEND_INPUT="$runtime_src" \
       CHENG_BACKEND_OUTPUT="$runtime_obj_abs" \
       "$stage0" >/dev/null 2>&1)
@@ -266,8 +326,28 @@ if [ ! -f "$runtime_obj_abs" ] || [ "$runtime_src" -nt "$runtime_obj_abs" ]; the
 fi
 
 tmp_bin="${name}.tmp"
-tmp_bin_abs="$root/$tmp_bin"
-tmp_obj_abs="$root/$tmp_bin.o"
+case "$tmp_bin" in
+  /*)
+    tmp_bin_abs="$tmp_bin"
+    ;;
+  *)
+    tmp_bin_abs="$root/$tmp_bin"
+    ;;
+esac
+tmp_obj_abs="$tmp_bin_abs.o"
+case "$name" in
+  /*)
+    name_abs="$name"
+    ;;
+  *)
+    name_abs="$root/$name"
+    ;;
+esac
+name_obj_abs="${name_abs}.o"
+name_dir="$(dirname "$name_abs")"
+if [ "$name_dir" != "" ] && [ ! -d "$name_dir" ]; then
+  mkdir -p "$name_dir"
+fi
 rm -f "$tmp_bin_abs" "$tmp_obj_abs"
 
 set +e
@@ -290,7 +370,7 @@ run_with_timeout "$build_timeout" env \
   "$stage0" >/dev/null 2>&1
 status=$?
 set -e
-if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ]; then
+if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ] && [ "$status" -ne 124 ]; then
   # Some seed drivers may crash in multi-worker mode; retry once in serial mode.
   rm -f "$tmp_bin_abs" "$tmp_obj_abs"
   set +e
@@ -315,15 +395,35 @@ if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ]; then
   set -e
 fi
 if [ "$status" -eq 0 ] && [ -x "$tmp_bin_abs" ] && driver_sanity_ok "$tmp_bin_abs"; then
-  mv "$tmp_bin_abs" "$name"
-  if [ -s "$tmp_obj_abs" ]; then
-    mv "$tmp_obj_abs" "$name.o"
+  if driver_stage1_smoke_ok "$tmp_bin_abs"; then
+    mv "$tmp_bin_abs" "$name_abs"
+    if [ -s "$tmp_obj_abs" ]; then
+      mv "$tmp_obj_abs" "$name_obj_abs"
+    fi
+    echo "build_backend_driver ok (selfhost_self_link)"
+    exit 0
   fi
-  echo "build_backend_driver ok (selfhost_self_link)"
-  exit 0
+  if [ "$allow_stage0_fallback" = "1" ] && driver_sanity_ok "$stage0" && driver_stage1_smoke_ok "$stage0"; then
+    rm -f "$tmp_bin_abs" "$tmp_obj_abs"
+    cp "$stage0" "$name_abs"
+    chmod +x "$name_abs" || true
+    echo "build_backend_driver warn: selfhost binary failed stage1 smoke; fallback to stage0"
+    exit 0
+  fi
+  rm -f "$tmp_bin_abs" "$tmp_obj_abs"
+  echo "[Error] build_backend_driver produced non-runnable stage1 binary (selfhost path)" 1>&2
+  exit 1
 fi
 
 rm -f "$tmp_bin_abs" "$tmp_obj_abs"
+
+if [ "$status" -eq 124 ] && [ "$allow_stage0_fallback" = "1" ] &&
+   driver_sanity_ok "$stage0" && driver_stage1_smoke_ok "$stage0"; then
+  cp "$stage0" "$name_abs"
+  chmod +x "$name_abs" || true
+  echo "build_backend_driver warn: selfhost compile timed out; fallback to stage0"
+  exit 0
+fi
 
 # Stage0 seed drivers may not understand newer syntax (`T[]`, merged imports). Keep `src/` in the
 # new syntax, but fall back to a stage0-compat overlay when bootstrapping from older seeds.
@@ -349,7 +449,7 @@ set +e
   "$stage0" >/dev/null 2>&1)
 status=$?
 set -e
-if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ]; then
+if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ] && [ "$status" -ne 124 ]; then
   rm -f "$tmp_bin_abs" "$tmp_obj_abs"
   set +e
   (cd "$compat_root" && run_with_timeout "$build_timeout" env \
@@ -373,15 +473,37 @@ if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ]; then
   set -e
 fi
 if [ "$status" -eq 0 ] && [ -x "$tmp_bin_abs" ] && driver_sanity_ok "$tmp_bin_abs"; then
-  mv "$tmp_bin_abs" "$name"
-  if [ -s "$tmp_obj_abs" ]; then
-    mv "$tmp_obj_abs" "$name.o"
+  if driver_stage1_smoke_ok "$tmp_bin_abs"; then
+    mv "$tmp_bin_abs" "$name_abs"
+    if [ -s "$tmp_obj_abs" ]; then
+      mv "$tmp_obj_abs" "$name_obj_abs"
+    fi
+    echo "build_backend_driver ok (selfhost_self_link, stage0-compat)"
+    exit 0
   fi
-  echo "build_backend_driver ok (selfhost_self_link, stage0-compat)"
-  exit 0
+  if [ "$allow_stage0_fallback" = "1" ] && driver_sanity_ok "$stage0" && driver_stage1_smoke_ok "$stage0"; then
+    rm -f "$tmp_bin_abs" "$tmp_obj_abs"
+    cp "$stage0" "$name_abs"
+    chmod +x "$name_abs" || true
+    echo "build_backend_driver warn: stage0-compat selfhost binary failed stage1 smoke; fallback to stage0"
+    exit 0
+  fi
+  rm -f "$tmp_bin_abs" "$tmp_obj_abs"
+  echo "[Error] build_backend_driver produced non-runnable stage1 binary (stage0-compat path)" 1>&2
+  exit 1
 fi
 
 rm -f "$tmp_bin_abs" "$tmp_obj_abs"
+if [ "$allow_stage0_fallback" = "1" ] && driver_sanity_ok "$stage0" && driver_stage1_smoke_ok "$stage0"; then
+  cp "$stage0" "$name_abs"
+  chmod +x "$name_abs" || true
+  if [ "$status" -eq 124 ]; then
+    echo "build_backend_driver warn: stage0-compat selfhost compile timed out; fallback to stage0"
+  else
+    echo "build_backend_driver warn: stage0-compat selfhost compile failed; fallback to stage0"
+  fi
+  exit 0
+fi
 if [ "$status" -eq 124 ]; then
   echo "[Error] build_backend_driver timed out (${build_timeout}s per compile attempt)" 1>&2
 fi

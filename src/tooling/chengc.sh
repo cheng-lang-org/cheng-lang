@@ -15,13 +15,19 @@ Usage:
                         [--target:<triple>]
                         [--pkg-cache:<dir>] [--skip-pkg] [--verify] [--ledger:<path>]
                         [--source-listen:<addr>] [--source-peer:<addr>]
-                        [--mm:<orc|off>] [--orc|--off]
+                        [--mm:<orc>] [--orc]
+                        [--emit:<obj|exe>] [--frontend:<mvp|stage1>]
+                        [--out:<path>] [--multi] [--pkg-roots:<p1[:p2:...]>]
+                        [--run]
 
 Notes:
   - Backend-only entrypoint (obj/exe).
   - Default `CHENG_MM=orc`.
+  - Executable output for bare `--name:<bin>` defaults to `artifacts/chengc/<bin>`
+    (set `CHENGC_NAME_IN_ROOT=1` to keep legacy root output).
   - `--jobs:<N>` forwards to `CHENG_BACKEND_JOBS`.
   - `--backend:obj` is the only supported backend.
+  - Legacy `chengb.sh` flags are accepted for compatibility.
 USAGE
 }
 
@@ -58,6 +64,30 @@ cleanup_backend_exe_sidecar() (
   fi
 )
 
+is_true_flag() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+resolve_named_exe_out() {
+  name_in="$1"
+  case "$name_in" in
+    /*|*/*)
+      printf '%s\n' "$name_in"
+      return
+      ;;
+  esac
+  if is_true_flag "${CHENGC_NAME_IN_ROOT:-0}"; then
+    printf '%s\n' "$name_in"
+    return
+  fi
+  printf 'artifacts/chengc/%s\n' "$name_in"
+}
+
 if [ "${1:-}" = "" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   usage
   exit 0
@@ -89,6 +119,13 @@ backend=""
 linker=""
 target_arg=""
 abi=""
+legacy_emit=""
+legacy_frontend=""
+legacy_out=""
+legacy_multi=""
+legacy_pkg_roots=""
+legacy_run=""
+pkg_tool="${CHENG_PKG_TOOL:-chengcache/tools/cheng_pkg}"
 
 while [ "${1:-}" != "" ]; do
   case "$1" in
@@ -111,6 +148,12 @@ while [ "${1:-}" != "" ]; do
     --abi:*) abi="${1#--abi:}" ;;
     --linker:*) linker="${1#--linker:}" ;;
     --target:*) target_arg="${1#--target:}" ;;
+    --emit:*) legacy_emit="${1#--emit:}" ;;
+    --frontend:*) legacy_frontend="${1#--frontend:}" ;;
+    --out:*) legacy_out="${1#--out:}" ;;
+    --multi) legacy_multi="1" ;;
+    --pkg-roots:*) legacy_pkg_roots="${1#--pkg-roots:}" ;;
+    --run) legacy_run="1" ;;
     --pkg-cache:*) pkg_cache="${1#--pkg-cache:}" ;;
     --skip-pkg) skip_pkg="1" ;;
     --verify) verify_meta="1" ;;
@@ -118,7 +161,6 @@ while [ "${1:-}" != "" ]; do
     --source-listen:*) source_listen="${1#--source-listen:}" ;;
     --source-peer:*) source_peer_args="$source_peer_args --source-peer:${1#--source-peer:}" ;;
     --orc) mm="orc" ;;
-    --off) mm="off" ;;
     --mm:*) mm="${1#--mm:}" ;;
     *)
       echo "[Error] unknown arg: $1" 1>&2
@@ -137,12 +179,44 @@ case "$abi" in
     ;;
 esac
 
-if [ "$mm" = "" ] && [ -z "${CHENG_MM:-}" ]; then
-  mm="orc"
+case "$legacy_emit" in
+  ""|obj|exe) ;;
+  *)
+    echo "[Error] invalid --emit:$legacy_emit (expected obj|exe)" 1>&2
+    exit 2
+    ;;
+esac
+
+case "$legacy_frontend" in
+  ""|mvp|stage1) ;;
+  *)
+    echo "[Error] invalid --frontend:$legacy_frontend (expected mvp|stage1)" 1>&2
+    exit 2
+    ;;
+esac
+
+if [ "$legacy_emit" = "exe" ] && [ "$emit_obj" != "" ]; then
+  echo "[Error] conflicting emit flags: --emit:exe with --emit-obj/--obj-out" 1>&2
+  exit 2
 fi
-if [ -n "$mm" ]; then
-  export CHENG_MM="$mm"
+if [ "$legacy_emit" = "obj" ]; then
+  emit_obj="1"
+  backend="obj"
 fi
+
+if [ "$mm" = "" ]; then
+  mm="${CHENG_MM:-orc}"
+fi
+case "$mm" in
+  ""|orc)
+    mm="orc"
+    ;;
+  *)
+    echo "[Error] invalid --mm:$mm (only orc is supported)" 1>&2
+    exit 2
+    ;;
+esac
+export CHENG_MM="$mm"
 
 if [ "$jobs" = "" ]; then
   jobs="$(detect_jobs)"
@@ -156,6 +230,18 @@ fi
 if [ "$name" = "" ]; then
   base="$(basename "$in")"
   name="${base%.cheng}"
+fi
+exe_out_path="$(resolve_named_exe_out "$name")"
+buildmeta_output="$exe_out_path"
+if [ "$emit_obj" != "" ]; then
+  if [ "$obj_out" != "" ]; then
+    buildmeta_output="$obj_out"
+  else
+    buildmeta_output="chengcache/${name}.o"
+  fi
+fi
+if [ "$legacy_out" != "" ]; then
+  buildmeta_output="$legacy_out"
 fi
 
 if [ "$backend" = "" ]; then
@@ -214,15 +300,19 @@ toml_int() {
 }
 
 ensure_pkg_tool() {
-  if [ -x "./cheng_pkg" ] && [ "src/tooling/cheng_pkg.cheng" -ot "./cheng_pkg" ]; then
+  if [ -x "$pkg_tool" ] && [ "src/tooling/cheng_pkg.cheng" -ot "$pkg_tool" ]; then
     return
   fi
+  pkg_tool_dir="$(dirname "$pkg_tool")"
+  if [ "$pkg_tool_dir" != "" ] && [ ! -d "$pkg_tool_dir" ]; then
+    mkdir -p "$pkg_tool_dir"
+  fi
   echo "[pkg] build cheng_pkg"
-  if ! sh src/tooling/chengb.sh src/tooling/cheng_pkg.cheng --frontend:stage1 --emit:exe --out:./cheng_pkg >/dev/null; then
+  if ! sh src/tooling/chengc.sh src/tooling/cheng_pkg.cheng --frontend:stage1 --emit:exe --out:"$pkg_tool" --skip-pkg >/dev/null; then
     echo "[Error] failed to build cheng_pkg via backend obj/exe pipeline" 1>&2
     exit 2
   fi
-  if [ ! -x "./cheng_pkg" ]; then
+  if [ ! -x "$pkg_tool" ]; then
     echo "[Error] missing cheng_pkg executable after build" 1>&2
     exit 2
   fi
@@ -243,7 +333,7 @@ if [ "$manifest" != "" ] && [ "$skip_pkg" = "" ]; then
     lock="chengcache/${name}.lock.${lock_format}"
   fi
   echo "[pkg] resolve lock: $lock"
-  ./cheng_pkg resolve --manifest:"$manifest" --registry:"$registry" --out:"$lock" --format:"$lock_format"
+  "$pkg_tool" resolve --manifest:"$manifest" --registry:"$registry" --out:"$lock" --format:"$lock_format"
 fi
 
 if [ "$lock" != "" ] && [ "$skip_pkg" = "" ]; then
@@ -252,7 +342,7 @@ if [ "$lock" != "" ] && [ "$skip_pkg" = "" ]; then
     exit 2
   fi
   echo "[pkg] verify lock"
-  ./cheng_pkg verify --lock:"$lock" --registry:"$registry"
+  "$pkg_tool" verify --lock:"$lock" --registry:"$registry"
 
   if [ -f "src/tooling/cheng_pkg_fetch.sh" ]; then
     source_listen_arg=""
@@ -277,7 +367,7 @@ if [ "$lock" != "" ] && [ "$package_id" != "" ] && [ "$skip_pkg" = "" ]; then
     meta_out="chengcache/${name}.pkgmeta.toml"
   fi
   echo "[pkg] build meta: $meta_out"
-  ./cheng_pkg meta --lock:"$lock" --package:"$package_id" --channel:"$channel" --registry:"$registry" --out:"$meta_out" --format:"toml"
+  "$pkg_tool" meta --lock:"$lock" --package:"$package_id" --channel:"$channel" --registry:"$registry" --out:"$meta_out" --format:"toml"
 fi
 
 if [ "$skip_pkg" != "" ]; then
@@ -300,11 +390,18 @@ if [ "$skip_pkg" != "" ]; then
   fi
 fi
 
+if [ "$legacy_pkg_roots" != "" ]; then
+  export CHENG_PKG_ROOTS="$legacy_pkg_roots"
+fi
+
 if [ "$buildmeta" = "" ] && { [ "$lock" != "" ] || [ "$meta_out" != "" ]; }; then
   buildmeta="chengcache/${name}.buildmeta.toml"
 fi
 
 frontend="${CHENG_BACKEND_FRONTEND:-stage1}"
+if [ "$legacy_frontend" != "" ]; then
+  frontend="$legacy_frontend"
+fi
 
 if [ "$buildmeta" != "" ]; then
   buildmeta_dir="$(dirname "$buildmeta")"
@@ -329,7 +426,7 @@ if [ "$buildmeta" != "" ]; then
     echo "[build]"
     echo "source = \"$in\""
     echo "frontend = \"$frontend\""
-    echo "output = \"$name\""
+    echo "output = \"$buildmeta_output\""
     echo "created_ts = \"$ts\""
     if [ "$manifest" != "" ]; then
       echo "manifest = \"$manifest\""
@@ -424,6 +521,8 @@ driver_can_run() {
 
 if [ -n "${CHENG_BACKEND_DRIVER:-}" ]; then
   driver="$CHENG_BACKEND_DRIVER"
+elif [ "${CHENG_BACKEND_DRIVER_DIRECT:-1}" != "0" ] && [ -x "./artifacts/backend_driver/cheng" ] && driver_can_run "./artifacts/backend_driver/cheng"; then
+  driver="./artifacts/backend_driver/cheng"
 elif [ "${CHENG_BACKEND_DRIVER_DIRECT:-1}" != "0" ] && [ -x "./cheng" ] && driver_can_run "./cheng"; then
   driver="./cheng"
 else
@@ -431,7 +530,7 @@ else
 fi
 
 backend_emit="exe"
-out_path="$name"
+out_path="$exe_out_path"
 if [ "$emit_obj" != "" ]; then
   backend_emit="obj"
   if [ "$obj_out" != "" ]; then
@@ -439,10 +538,13 @@ if [ "$emit_obj" != "" ]; then
   else
     out_path="chengcache/${name}.o"
   fi
-  out_dir="$(dirname "$out_path")"
-  if [ "$out_dir" != "" ] && [ ! -d "$out_dir" ]; then
-    mkdir -p "$out_dir"
-  fi
+fi
+if [ "$legacy_out" != "" ]; then
+  out_path="$legacy_out"
+fi
+out_dir="$(dirname "$out_path")"
+if [ "$out_dir" != "" ] && [ ! -d "$out_dir" ]; then
+  mkdir -p "$out_dir"
 fi
 
 backend_target="${CHENG_BACKEND_TARGET:-}"
@@ -516,10 +618,12 @@ fi
 abi_std_noptr_env=""
 abi_std_noptr_strict_env=""
 abi_no_ptr_non_c_abi_env=""
+abi_no_ptr_non_c_abi_internal_env=""
 if [ "$abi_effective" = "v2_noptr" ]; then
   abi_std_noptr_env="CHENG_STAGE1_STD_NO_POINTERS=1"
-  abi_std_noptr_strict_env="CHENG_STAGE1_STD_NO_POINTERS_STRICT=1"
+  abi_std_noptr_strict_env="CHENG_STAGE1_STD_NO_POINTERS_STRICT=0"
   abi_no_ptr_non_c_abi_env="CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1"
+  abi_no_ptr_non_c_abi_internal_env="CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1"
 fi
 
 link_env=""
@@ -531,10 +635,13 @@ fi
 backend_multi_env="${CHENG_BACKEND_MULTI:-0}"
 backend_inc_env="${CHENG_BACKEND_INCREMENTAL:-1}"
 backend_whole_program_env="${CHENG_BACKEND_WHOLE_PROGRAM:-1}"
+if [ "$legacy_multi" = "1" ]; then
+  backend_multi_env="1"
+fi
 
 if [ -n "$backend_target" ]; then
   # shellcheck disable=SC2086
-  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env \
+  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env $abi_no_ptr_non_c_abi_internal_env \
     CHENG_BACKEND_TARGET="$backend_target" \
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_MULTI="$backend_multi_env" \
@@ -547,7 +654,7 @@ if [ -n "$backend_target" ]; then
     "$driver"
 else
   # shellcheck disable=SC2086
-  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env \
+  env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env $abi_no_ptr_non_c_abi_internal_env \
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_MULTI="$backend_multi_env" \
     CHENG_BACKEND_INCREMENTAL="$backend_inc_env" \
@@ -566,5 +673,37 @@ fi
 if [ "$backend_emit" = "obj" ]; then
   echo "chengc obj ok: $out_path"
 else
-  echo "chengc obj ok: ./$name"
+  echo "chengc exe ok: $out_path"
 fi
+
+if [ "$legacy_run" != "1" ] || [ "$backend_emit" != "exe" ]; then
+  exit 0
+fi
+
+case "$backend_target" in
+  *android*)
+    if ! command -v adb >/dev/null 2>&1; then
+      echo "[chengc] missing tool: adb (required for --run on android targets)" 1>&2
+      exit 2
+    fi
+    serial="${ANDROID_SERIAL:-}"
+    if [ -z "$serial" ]; then
+      serial="$(adb devices | awk 'NR>1 && $2 == "device" {print $1; exit}')"
+    fi
+    if [ -z "$serial" ]; then
+      echo "[chengc] no Android device/emulator detected (adb devices)" 1>&2
+      exit 2
+    fi
+    remote_dir="/data/local/tmp/chengc"
+    remote_path="$remote_dir/$(basename "$out_path")"
+    adb -s "$serial" shell "mkdir -p '$remote_dir'" >/dev/null
+    adb -s "$serial" push "$out_path" "$remote_path" >/dev/null
+    adb -s "$serial" shell "chmod 755 '$remote_path'" >/dev/null
+    echo "[chengc] run(android): $remote_path ($serial)" >&2
+    adb -s "$serial" shell "$remote_path"
+    exit $?
+    ;;
+esac
+
+echo "[chengc] run(host): $out_path" >&2
+"$out_path"

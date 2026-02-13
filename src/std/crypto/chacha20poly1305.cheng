@@ -56,6 +56,13 @@ fn loadU32LE(data: Bytes, offset: int32): int64 =
     let b3: int64 = int64(bytesGet(data, offset + 3))
     return chachaU32(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
 
+fn loadU32LE(data: var Bytes, offset: int32): int64 =
+    let b0: int64 = int64(bytesGet(data, offset))
+    let b1: int64 = int64(bytesGet(data, offset + 1))
+    let b2: int64 = int64(bytesGet(data, offset + 2))
+    let b3: int64 = int64(bytesGet(data, offset + 3))
+    return chachaU32(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
 fn storeU32LE(data: Bytes, offset: int32, value: int64) =
     let v: int64 = chachaU32(value)
     bytesSet(data, offset, int32(v & 0xff))
@@ -63,12 +70,23 @@ fn storeU32LE(data: Bytes, offset: int32, value: int64) =
     bytesSet(data, offset + 2, int32((v >> 16) & 0xff))
     bytesSet(data, offset + 3, int32((v >> 24) & 0xff))
 
-fn chachaQuarterRound(state: var int64[chaChaStateWords], a: int32, b: int32,
+fn storeU32LE(data: var Bytes, offset: int32, value: int64) =
+    let v: int64 = chachaU32(value)
+    bytesSet(data, offset, int32(v & 0xff))
+    bytesSet(data, offset + 1, int32((v >> 8) & 0xff))
+    bytesSet(data, offset + 2, int32((v >> 16) & 0xff))
+    bytesSet(data, offset + 3, int32((v >> 24) & 0xff))
+
+fn chachaQuarterRound(state: var Bytes, a: int32, b: int32,
                       c: int32, d: int32) =
-    var av: int64 = state[a]
-    var bv: int64 = state[b]
-    var cv: int64 = state[c]
-    var dv: int64 = state[d]
+    let ao: int32 = a * 4
+    let bo: int32 = b * 4
+    let co: int32 = c * 4
+    let dof: int32 = d * 4
+    var av: int64 = loadU32LE(state, ao)
+    var bv: int64 = loadU32LE(state, bo)
+    var cv: int64 = loadU32LE(state, co)
+    var dv: int64 = loadU32LE(state, dof)
     av = chachaU32(av + bv)
     dv = rotl32(dv ^ av, 16)
     cv = chachaU32(cv + dv)
@@ -77,30 +95,26 @@ fn chachaQuarterRound(state: var int64[chaChaStateWords], a: int32, b: int32,
     dv = rotl32(dv ^ av, 8)
     cv = chachaU32(cv + dv)
     bv = rotl32(bv ^ cv, 7)
-    state[a] = av
-    state[b] = bv
-    state[c] = cv
-    state[d] = dv
+    storeU32LE(state, ao, av)
+    storeU32LE(state, bo, bv)
+    storeU32LE(state, co, cv)
+    storeU32LE(state, dof, dv)
 
 fn chacha20Block(key: Bytes, counter: int32, nonce: Bytes): Bytes =
-    var state: int64[chaChaStateWords]
-    state[0] = int64(0x61707865)
-    state[1] = int64(0x3320646e)
-    state[2] = int64(0x79622d32)
-    state[3] = int64(0x6b206574)
+    let state: Bytes = bytesAlloc(64)
+    storeU32LE(state, 0, int64(0x61707865))
+    storeU32LE(state, 4, int64(0x3320646e))
+    storeU32LE(state, 8, int64(0x79622d32))
+    storeU32LE(state, 12, int64(0x6b206574))
     for i in 0..<8:
-        state[4 + i] = loadU32LE(key, i * 4)
-    state[12] = chachaU32(counter)
-    state[13] = loadU32LE(nonce, 0)
-    state[14] = loadU32LE(nonce, 4)
-    state[15] = loadU32LE(nonce, 8)
-    var working: int64[chaChaStateWords]
-    i = 0
-    let __for_start_i_1 = i
-    for __for_i_1 in __for_start_i_1..<chaChaStateWords:
-        i = __for_i_1
-        working[i] = state[i]
-        i = i + 1
+        storeU32LE(state, (4 + i) * 4, loadU32LE(key, i * 4))
+    storeU32LE(state, 48, chachaU32(counter))
+    storeU32LE(state, 52, loadU32LE(nonce, 0))
+    storeU32LE(state, 56, loadU32LE(nonce, 4))
+    storeU32LE(state, 60, loadU32LE(nonce, 8))
+    let working: Bytes = bytesAlloc(64)
+    for j in 0..<64:
+        bytesSet(working, j, bytesGet(state, j))
     for rounds in 0..<10:
         chachaQuarterRound(working, 0, 4, 8, 12)
         chachaQuarterRound(working, 1, 5, 9, 13)
@@ -111,13 +125,9 @@ fn chacha20Block(key: Bytes, counter: int32, nonce: Bytes): Bytes =
         chachaQuarterRound(working, 2, 7, 8, 13)
         chachaQuarterRound(working, 3, 4, 9, 14)
     let out: Bytes = bytesAlloc(64)
-    i = 0
-    let __for_start_i_2 = i
-    for __for_i_2 in __for_start_i_2..<chaChaStateWords:
-        i = __for_i_2
-        let v: int64 = chachaU32(working[i] + state[i])
+    for i in 0..<chaChaStateWords:
+        let v: int64 = chachaU32(loadU32LE(working, i * 4) + loadU32LE(state, i * 4))
         storeU32LE(out, i * 4, v)
-        i = i + 1
     return out
 
 fn chacha20Xor(data: Bytes, key: Bytes, nonce: Bytes, counter: int32): Result[bool] =

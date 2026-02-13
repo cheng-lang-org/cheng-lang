@@ -10,6 +10,29 @@ CLEAN="0"
 RESET_LEDGER="0"
 FAIL_WITHOUT_LEASE="0"
 REGEN_LEASE="0"
+repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+
+resolve_chengc_bin() {
+  local name="$1"
+  case "$name" in
+    /*|*/*)
+      printf '%s\n' "$name"
+      return
+      ;;
+  esac
+  case "${CHENGC_NAME_IN_ROOT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      printf '%s/%s\n' "$repo_root" "$name"
+      ;;
+    *)
+      printf '%s/artifacts/chengc/%s\n' "$repo_root" "$name"
+      ;;
+  esac
+}
+
+storage_bin="$(resolve_chengc_bin cheng_storage)"
+registry_bin="$(resolve_chengc_bin cheng_registry)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,17 +75,17 @@ if [ "$CLEAN" = "1" ]; then
 fi
 mkdir -p "$ROOT"
 
-if [ ! -x "./cheng_storage" ]; then
+if [ ! -x "$storage_bin" ]; then
   src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage
 fi
 
-if [ ! -x "./cheng_registry" ]; then
+if [ ! -x "$registry_bin" ]; then
   src/tooling/chengc.sh src/tooling/cheng_registry.cheng --name:cheng_registry
 fi
 
 KEY_JSON="$ROOT/keypair.json"
 if [ ! -f "$KEY_JSON" ]; then
-  ./cheng_registry keygen --out:"$KEY_JSON"
+  "$registry_bin" keygen --out:"$KEY_JSON"
 fi
 
 LEDGER="$ROOT/ledger.jsonl"
@@ -77,7 +100,7 @@ fi
 
 LEASE_TOKEN="$ROOT/lease-token.json"
 if [ "$REGEN_LEASE" = "1" ] || [ ! -f "$LEASE_TOKEN" ]; then
-  ./cheng_storage leasegen --package:pkg://demo/text --author:node:alice --provider:node:store-1 \
+  "$storage_bin" leasegen --package:pkg://demo/text --author:node:alice --provider:node:store-1 \
     --bytes:1048576 --days:30 --replicas:1 --price:0.25 --royalty:0.12 --treasury:0.03 \
     --priv:"$priv" --out:"$LEASE_TOKEN"
 fi
@@ -108,7 +131,7 @@ fi
 if [ "$FAIL_WITHOUT_LEASE" = "1" ]; then
   echo "expect failure without lease:"
   set +e
-  ./cheng_storage put-text --text:"no lease" "${PUT_ARGS[@]}"
+  "$storage_bin" put-text --text:"no lease" "${PUT_ARGS[@]}"
   rc=$?
   set -e
   if [ "$rc" -eq 0 ]; then
@@ -117,17 +140,17 @@ if [ "$FAIL_WITHOUT_LEASE" = "1" ]; then
   fi
 fi
 
-cid="$(./cheng_storage put-text --text:"hello lease" --lease:"$LEASE_TOKEN" "${PUT_ARGS[@]}")"
+cid="$("$storage_bin" put-text --text:"hello lease" --lease:"$LEASE_TOKEN" "${PUT_ARGS[@]}")"
 echo "cid: $cid"
 
 echo "cat:"
-./cheng_storage cat --cid:"$cid" "${PUT_ARGS[@]}"
+"$storage_bin" cat --cid:"$cid" "${PUT_ARGS[@]}"
 
 echo "cat raw:"
-./cheng_storage cat --cid:"$cid" --raw "${PUT_ARGS[@]}"
+"$storage_bin" cat --cid:"$cid" --raw "${PUT_ARGS[@]}"
 
 echo "settle:"
 echo "note: payouts are under payouts.authors/providers"
-./cheng_storage settle --root:"$ROOT" --format:toml --top:5
+"$storage_bin" settle --root:"$ROOT" --format:toml --top:5
 echo "settle (yaml):"
-./cheng_storage settle --root:"$ROOT" --format:yaml --top:5
+"$storage_bin" settle --root:"$ROOT" --format:yaml --top:5

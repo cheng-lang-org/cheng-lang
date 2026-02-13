@@ -3,7 +3,7 @@ import std/times
 import std/strutils as strutil
 import cheng/runtime/json_ast as json
 import cheng/decentralized/json_parse as jparse
-import cheng/decentralized/registry as dreg
+import cheng/decentralized/registry_local as dreg
 import cheng/libp2p/utils/result as result
 import std/strings
 import std/seqs
@@ -180,7 +180,7 @@ fn splitYamlKeyValue(line: str, key: var str, value: var str): bool =
             return key != nil && len(key) > 0
     return false
 
-fn parseTomlStringValue(raw: str): (&result.Result)[str] =
+fn parseTomlStringValue(raw: str): result.Result[str] =
     let text = strutil.strip(raw)
     if text == nil || len(text) < 2:
         return result.Err[str]("toml: expected str")
@@ -214,7 +214,7 @@ fn parseTomlStringValue(raw: str): (&result.Result)[str] =
             i = i + 1
     return result.Ok[str](out)
 
-fn parseYamlStringValue(raw: str): (&result.Result)[str] =
+fn parseYamlStringValue(raw: str): result.Result[str] =
     let text = strutil.strip(raw)
     if text == nil || len(text) == 0:
         return result.Ok[str]("")
@@ -222,7 +222,7 @@ fn parseYamlStringValue(raw: str): (&result.Result)[str] =
         return parseTomlStringValue(text)
     return result.Ok[str](text)
 
-fn parseTomlIntValue(raw: str): (&result.Result)[int64] =
+fn parseTomlIntValue(raw: str): result.Result[int64] =
     let text = strutil.strip(raw)
     if text == nil || len(text) == 0:
         return result.Err[int64]("toml: expected int")
@@ -275,7 +275,7 @@ fn quoteTomlString(value: str): str =
 fn quoteYamlString(value: str): str =
     return "\"" + escapeQuotedString(value) + "\""
 
-fn parseDependencyJson(node: json.JsonNode): (&result.Result)[DependencySpec] =
+fn parseDependencyJson(node: json.JsonNode): result.Result[DependencySpec] =
     if node == nil || node.kind != json.JObject:
         return result.Err[DependencySpec]("manifest: invalid dependency entry")
     var dep: DependencySpec
@@ -285,7 +285,7 @@ fn parseDependencyJson(node: json.JsonNode): (&result.Result)[DependencySpec] =
         return result.Err[DependencySpec]("manifest: dependency missing package_id")
     return result.Ok[DependencySpec](dep)
 
-fn parseManifestJson(content: str): (&result.Result)[PackageManifest] =
+fn parseManifestJson(content: str): result.Result[PackageManifest] =
     let parsed: jparse.ParseResult = jparse.parseJsonSafe(content)
     if ! parsed.ok:
         return result.Err[PackageManifest](parsed.error)
@@ -300,13 +300,13 @@ fn parseManifestJson(content: str): (&result.Result)[PackageManifest] =
     let depsNode = root["dependencies"]
     if depsNode != nil && depsNode.kind == json.JArray:
         for i in 0..<depsNode.a.len:
-            let depRes: (&result.Result)[DependencySpec] = parseDependencyJson(depsNode.a[i])
+            let depRes: result.Result[DependencySpec] = parseDependencyJson(depsNode.a[i])
             if result.IsErr(depRes):
                 return result.Err[PackageManifest](result.Error(depRes))
             out.dependencies.add(result.Value(depRes))
     return result.Ok[PackageManifest](out)
 
-fn finalizeManifestDep(dep: DependencySpec, out: var PackageManifest): (&result.Result)[bool] =
+fn finalizeManifestDep(dep: DependencySpec, out: var PackageManifest): result.Result[bool] =
     if dep.packageId == nil || len(dep.packageId) == 0:
         return result.Err[bool]("manifest: dependency missing package_id")
     var norm = dep
@@ -314,7 +314,7 @@ fn finalizeManifestDep(dep: DependencySpec, out: var PackageManifest): (&result.
     out.dependencies.add(norm)
     return result.Ok[bool](true)
 
-fn parseManifestToml(content: str): (&result.Result)[PackageManifest] =
+fn parseManifestToml(content: str): result.Result[PackageManifest] =
     var out: PackageManifest
     out.dependencies = initDependencies()
     var current: DependencySpec
@@ -326,7 +326,7 @@ fn parseManifestToml(content: str): (&result.Result)[PackageManifest] =
             continue
         if line == "[[dependencies]]":
             if inDep:
-                let finRes: (&result.Result)[bool] = finalizeManifestDep(current, out)
+                let finRes: result.Result[bool] = finalizeManifestDep(current, out)
                 if result.IsErr(finRes):
                     return result.Err[PackageManifest](result.Error(finRes))
             current = DependencySpec()
@@ -360,14 +360,14 @@ fn parseManifestToml(content: str): (&result.Result)[PackageManifest] =
             else:
                 return result.Err[PackageManifest]("manifest: unknown key")
     if inDep:
-        let finRes: (&result.Result)[bool] = finalizeManifestDep(current, out)
+        let finRes: result.Result[bool] = finalizeManifestDep(current, out)
         if result.IsErr(finRes):
             return result.Err[PackageManifest](result.Error(finRes))
     if out.packageId == nil || len(out.packageId) == 0:
         return result.Err[PackageManifest]("manifest: missing package_id")
     return result.Ok[PackageManifest](out)
 
-fn parseManifestYaml(content: str): (&result.Result)[PackageManifest] =
+fn parseManifestYaml(content: str): result.Result[PackageManifest] =
     var out: PackageManifest
     out.dependencies = initDependencies()
     var current: DependencySpec
@@ -395,7 +395,7 @@ fn parseManifestYaml(content: str): (&result.Result)[PackageManifest] =
         if inDeps:
             if strutil.startsWith(line, "-"):
                 if hasCurrent:
-                    let finRes: (&result.Result)[bool] = finalizeManifestDep(current, out)
+                    let finRes: result.Result[bool] = finalizeManifestDep(current, out)
                     if result.IsErr(finRes):
                         return result.Err[PackageManifest](result.Error(finRes))
                 current = DependencySpec()
@@ -440,7 +440,7 @@ fn parseManifestYaml(content: str): (&result.Result)[PackageManifest] =
         else:
             return result.Err[PackageManifest]("manifest: unknown key")
     if hasCurrent:
-        let finRes: (&result.Result)[bool] = finalizeManifestDep(current, out)
+        let finRes: result.Result[bool] = finalizeManifestDep(current, out)
         if result.IsErr(finRes):
             return result.Err[PackageManifest](result.Error(finRes))
     if out.packageId == nil || len(out.packageId) == 0:
@@ -469,7 +469,7 @@ fn manifestToYaml(manifest: PackageManifest): str =
         out = out + "    channel: " + quoteYamlString(channel) + "\n"
     return out
 
-fn loadManifestFile(path: str): (&result.Result)[PackageManifest] =
+fn loadManifestFile(path: str): result.Result[PackageManifest] =
     if path == nil || len(path) == 0:
         return result.Err[PackageManifest]("manifest: missing path")
     if ! os.fileExists(path):
@@ -514,7 +514,7 @@ fn collectDependencyConflicts(lock: PackageLock): DependencyConflict[] =
             let other = lock.dependencies[j]
             if other.packageId == dep.packageId:
                 if ! sameLockedVersion(dep, other) && ! conflictReported(out, dep.packageId):
-                    out.add(DependencyConflict(
+                    add[DependencyConflict](out, DependencyConflict(
                         packageId: dep.packageId,
                         channelA: other.channel,
                         epochA: other.epoch,
@@ -560,7 +560,7 @@ fn dependencyConflictsToText(conflicts: DependencyConflict[]): str =
             out = out + "]"
     return out
 
-fn resolveManifest(manifest: PackageManifest, registryPath: str): (&result.Result)[PackageLock] =
+fn resolveManifest(manifest: PackageManifest, registryPath: str): result.Result[PackageLock] =
     if registryPath == nil || len registryPath == 0:
         return result.Err[PackageLock] "resolve: missing registry path"
     var lock: PackageLock
@@ -572,7 +572,7 @@ fn resolveManifest(manifest: PackageManifest, registryPath: str): (&result.Resul
         if hasLockedDependency(lock.dependencies, dep.packageId):
             let errMsg: str = "resolve: single-version conflict: " + dep.packageId
             return result.Err[PackageLock] errMsg
-        let snapRes: (&result.Result)[dreg.PackageSnapshot] =
+        let snapRes: result.Result[dreg.PackageSnapshot] =
             dreg.resolveSnapshot(registryPath, dep.packageId, dep.channel)
         if result.IsErr snapRes:
             let errMsg: str = result.Error snapRes
@@ -655,7 +655,7 @@ fn lockToYaml(lock: PackageLock): str =
             out = out + "    signature: " + quoteYamlString(dep.sigText) + "\n"
     return out
 
-fn parseLockNode(root: json.JsonNode): (&result.Result)[PackageLock] =
+fn parseLockNode(root: json.JsonNode): result.Result[PackageLock] =
     if root == nil || root.kind != json.JObject:
         return result.Err[PackageLock]("lock: expected object")
     var lock: PackageLock
@@ -686,13 +686,13 @@ fn parseLockNode(root: json.JsonNode): (&result.Result)[PackageLock] =
             lock.dependencies.add(dep)
     return result.Ok[PackageLock](lock)
 
-fn parseLockJson(content: str): (&result.Result)[PackageLock] =
+fn parseLockJson(content: str): result.Result[PackageLock] =
     let parsed: jparse.ParseResult = jparse.parseJsonSafe(content)
     if ! parsed.ok:
         return result.Err[PackageLock](parsed.error)
     return parseLockNode(parsed.value)
 
-fn finalizeLockDep(dep: LockedDependency, lock: var PackageLock): (&result.Result)[bool] =
+fn finalizeLockDep(dep: LockedDependency, lock: var PackageLock): result.Result[bool] =
     if dep.packageId == nil || len(dep.packageId) == 0:
         return result.Err[bool]("lock: dependency missing package_id")
     if dep.cidText == nil || len(dep.cidText) == 0:
@@ -703,7 +703,7 @@ fn finalizeLockDep(dep: LockedDependency, lock: var PackageLock): (&result.Resul
     lock.dependencies.add(norm)
     return result.Ok[bool](true)
 
-fn parseLockToml(content: str): (&result.Result)[PackageLock] =
+fn parseLockToml(content: str): result.Result[PackageLock] =
     var lock: PackageLock
     lock.dependencies = initLockedDependencies()
     var current: LockedDependency
@@ -715,7 +715,7 @@ fn parseLockToml(content: str): (&result.Result)[PackageLock] =
             continue
         if line == "[[dependencies]]":
             if inDep:
-                let finRes: (&result.Result)[bool] = finalizeLockDep(current, lock)
+                let finRes: result.Result[bool] = finalizeLockDep(current, lock)
                 if result.IsErr(finRes):
                     return result.Err[PackageLock](result.Error(finRes))
             current = LockedDependency()
@@ -784,14 +784,14 @@ fn parseLockToml(content: str): (&result.Result)[PackageLock] =
             else:
                 return result.Err[PackageLock]("lock: unknown key")
     if inDep:
-        let finRes: (&result.Result)[bool] = finalizeLockDep(current, lock)
+        let finRes: result.Result[bool] = finalizeLockDep(current, lock)
         if result.IsErr(finRes):
             return result.Err[PackageLock](result.Error(finRes))
     if lock.packageId == nil || len(lock.packageId) == 0:
         return result.Err[PackageLock]("lock: missing package_id")
     return result.Ok[PackageLock](lock)
 
-fn parseLockYaml(content: str): (&result.Result)[PackageLock] =
+fn parseLockYaml(content: str): result.Result[PackageLock] =
     var lock: PackageLock
     lock.dependencies = initLockedDependencies()
     var current: LockedDependency
@@ -827,7 +827,7 @@ fn parseLockYaml(content: str): (&result.Result)[PackageLock] =
         if inDeps:
             if strutil.startsWith(line, "-"):
                 if hasCurrent:
-                    let finRes: (&result.Result)[bool] = finalizeLockDep(current, lock)
+                    let finRes: result.Result[bool] = finalizeLockDep(current, lock)
                     if result.IsErr(finRes):
                         return result.Err[PackageLock](result.Error(finRes))
                 current = LockedDependency()
@@ -930,19 +930,19 @@ fn parseLockYaml(content: str): (&result.Result)[PackageLock] =
                 else:
                     return result.Err[PackageLock]("lock: unknown dependency key")
     if hasCurrent:
-        let finRes: (&result.Result)[bool] = finalizeLockDep(current, lock)
+        let finRes: result.Result[bool] = finalizeLockDep(current, lock)
         if result.IsErr(finRes):
             return result.Err[PackageLock](result.Error(finRes))
     if lock.packageId == nil || len(lock.packageId) == 0:
         return result.Err[PackageLock]("lock: missing package_id")
     return result.Ok[PackageLock](lock)
 
-fn parseLock(content: str): (&result.Result)[PackageLock] =
+fn parseLock(content: str): result.Result[PackageLock] =
     if isJsonContent(content):
         return parseLockJson(content)
     return parseLockToml(content)
 
-fn loadLockFile(path: str): (&result.Result)[PackageLock] =
+fn loadLockFile(path: str): result.Result[PackageLock] =
     if path == nil || len(path) == 0:
         return result.Err[PackageLock]("lock: missing path")
     if ! os.fileExists(path):
@@ -980,7 +980,7 @@ fn verifyLockAgainstRegistry(lock: PackageLock, registryPath: str): bool =
         return false
     for i in 0..<lock.dependencies.len:
         let dep = lock.dependencies[i]
-        let snapRes: (&result.Result)[dreg.PackageSnapshot] =
+        let snapRes: result.Result[dreg.PackageSnapshot] =
             dreg.resolveSnapshot(registryPath, dep.packageId, dep.channel)
         if result.IsErr(snapRes):
             return false

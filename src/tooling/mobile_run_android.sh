@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  src/tooling/mobile_run_android.sh <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--mm:<orc|off>] [--orc|--off]
+  src/tooling/mobile_run_android.sh <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--mm:<orc>] [--orc]
 
 Builds the Android Studio template (NDK) and runs it on a connected device:
   - export .cheng -> Android project
@@ -44,9 +44,6 @@ while [ "${1:-}" != "" ]; do
     --orc)
       mm="orc"
       ;;
-    --off)
-      mm="off"
-      ;;
     --mm:*)
       mm="${1#--mm:}"
       ;;
@@ -58,6 +55,11 @@ while [ "${1:-}" != "" ]; do
   esac
   shift || true
 done
+
+if [ "$mm" != "" ] && [ "$mm" != "orc" ]; then
+  echo "[Error] invalid --mm:$mm (only orc is supported)" 1>&2
+  exit 2
+fi
 
 if [ ! -f "$in" ]; then
   echo "[Error] file not found: $in" 1>&2
@@ -154,4 +156,3 @@ adb -s "$serial" shell am force-stop "$pkg" >/dev/null 2>&1 || true
 adb -s "$serial" shell am start -n "$activity" >/dev/null
 
 echo "mobile_run_android ok"
-

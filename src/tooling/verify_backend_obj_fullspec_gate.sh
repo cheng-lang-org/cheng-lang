@@ -74,6 +74,12 @@ if [ ! -x "$driver" ]; then
 fi
 
 timeout_s="${CHENG_BACKEND_OBJ_FULLSPEC_TIMEOUT:-60}"
+gate_skip_sem="${CHENG_STAGE1_SKIP_SEM:-1}"
+gate_skip_ownership="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}"
+gate_generic_mode="${CHENG_GENERIC_MODE:-hybrid}"
+gate_generic_budget="${CHENG_GENERIC_SPEC_BUDGET:-0}"
+fallback_generic_mode="${CHENG_BACKEND_OBJ_FULLSPEC_FALLBACK_GENERIC_MODE:-dict}"
+fallback_generic_budget="${CHENG_BACKEND_OBJ_FULLSPEC_FALLBACK_GENERIC_SPEC_BUDGET:-0}"
 out_dir="artifacts/backend_obj_fullspec_gate"
 out="$out_dir/backend_obj_fullspec"
 log="$out_dir/backend_obj_fullspec.out"
@@ -84,11 +90,12 @@ build_primary() {
   run_with_timeout "$timeout_s" env \
     CHENG_MM="${CHENG_MM:-orc}" \
     CHENG_CLEAN_CHENG_LOCAL="${CHENG_CLEAN_CHENG_LOCAL:-0}" \
-    CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
-    CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-0}" \
-    CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
+    CHENG_STAGE1_SKIP_SEM="$gate_skip_sem" \
+    CHENG_GENERIC_MODE="$gate_generic_mode" \
+    CHENG_GENERIC_SPEC_BUDGET="$gate_generic_budget" \
+    CHENG_STAGE1_SKIP_OWNERSHIP="$gate_skip_ownership" \
     CHENG_BACKEND_DRIVER="$driver" \
-    sh src/tooling/chengb.sh "$sample_primary" --frontend:stage1 --emit:exe --out:"$out" >>"$build_log" 2>&1
+    sh src/tooling/chengc.sh "$sample_primary" --frontend:stage1 --emit:exe --out:"$out" >>"$build_log" 2>&1
 }
 
 build_fallback() {
@@ -96,10 +103,11 @@ build_fallback() {
     CHENG_MM="${CHENG_MM:-orc}" \
     CHENG_CLEAN_CHENG_LOCAL="${CHENG_CLEAN_CHENG_LOCAL:-0}" \
     CHENG_STAGE1_SKIP_SEM=1 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE="$fallback_generic_mode" \
+    CHENG_GENERIC_SPEC_BUDGET="$fallback_generic_budget" \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_DRIVER="$driver" \
-    sh src/tooling/chengb.sh "$sample_fallback" --frontend:mvp --emit:exe --out:"$out" >>"$build_log" 2>&1
+    sh src/tooling/chengc.sh "$sample_fallback" --frontend:mvp --emit:exe --out:"$out" >>"$build_log" 2>&1
 }
 
 run_gate() {

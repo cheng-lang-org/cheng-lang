@@ -17,6 +17,24 @@ EOF
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHENGC="$ROOT/src/tooling/chengc.sh"
 
+resolve_chengc_bin() {
+  name="$1"
+  case "$name" in
+    /*|*/*)
+      printf '%s\n' "$name"
+      return
+      ;;
+  esac
+  case "${CHENGC_NAME_IN_ROOT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      printf '%s/%s\n' "$ROOT" "$name"
+      ;;
+    *)
+      printf '%s/artifacts/chengc/%s\n' "$ROOT" "$name"
+      ;;
+  esac
+}
+
 src=""
 package_id=""
 author_id=""
@@ -118,8 +136,12 @@ if [ ! -x "$CHENGC" ]; then
   exit 2
 fi
 
+pkg_source_bin="$(resolve_chengc_bin cheng_pkg_source)"
+storage_bin="$(resolve_chengc_bin cheng_storage)"
+registry_bin="$(resolve_chengc_bin cheng_registry)"
+
 if [ "$format" = "source" ]; then
-  if [ ! -x "$ROOT/cheng_pkg_source" ] || [ "$ROOT/src/tooling/cheng_pkg_source.cheng" -nt "$ROOT/cheng_pkg_source" ]; then
+  if [ ! -x "$pkg_source_bin" ] || [ "$ROOT/src/tooling/cheng_pkg_source.cheng" -nt "$pkg_source_bin" ]; then
     (cd "$ROOT" && sh src/tooling/chengc.sh src/tooling/cheng_pkg_source.cheng --name:cheng_pkg_source)
   fi
   manifest_arg=""
@@ -130,7 +152,7 @@ if [ "$format" = "source" ]; then
   if [ "$listen_addr" != "" ]; then
     listen_arg="--storage-listen:$listen_addr"
   fi
-  "$ROOT/cheng_pkg_source" publish --src:"$src" --package:"$package_id" --author:"$author_id" --channel:"$channel" \
+  "$pkg_source_bin" publish --src:"$src" --package:"$package_id" --author:"$author_id" --channel:"$channel" \
     --epoch:"$epoch" --priv:"$priv_key" --registry:"$registry_path" --root:"$storage_root" --mode:"$mode" \
     $listen_arg $peer_args $source_addrs $manifest_arg
   exit 0
@@ -147,10 +169,10 @@ fi
 
 sh "$ROOT/src/tooling/cheng_pkg_pack.sh" --src:"$src" --out:"$artifact"
 
-if [ ! -x "$ROOT/cheng_storage" ] || [ "$ROOT/src/tooling/cheng_storage.cheng" -nt "$ROOT/cheng_storage" ]; then
+if [ ! -x "$storage_bin" ] || [ "$ROOT/src/tooling/cheng_storage.cheng" -nt "$storage_bin" ]; then
   (cd "$ROOT" && sh src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage)
 fi
-if [ ! -x "$ROOT/cheng_registry" ] || [ "$ROOT/src/tooling/cheng_registry.cheng" -nt "$ROOT/cheng_registry" ]; then
+if [ ! -x "$registry_bin" ] || [ "$ROOT/src/tooling/cheng_registry.cheng" -nt "$registry_bin" ]; then
   (cd "$ROOT" && sh src/tooling/chengc.sh src/tooling/cheng_registry.cheng --name:cheng_registry)
 fi
 
@@ -159,13 +181,13 @@ if [ "$listen_addr" != "" ]; then
   listen_arg="--listen:$listen_addr"
 fi
 
-cid="$("$ROOT/cheng_storage" put --file:"$artifact" --root:"$storage_root" --mode:"$mode" $listen_arg $peer_args | tail -n 1)"
+cid="$("$storage_bin" put --file:"$artifact" --root:"$storage_root" --mode:"$mode" $listen_arg $peer_args | tail -n 1)"
 if [ "$cid" = "" ]; then
   echo "[Error] missing cid from cheng_storage" 1>&2
   exit 2
 fi
 
-"$ROOT/cheng_registry" publish --package:"$package_id" --author:"$author_id" --channel:"$channel" --epoch:"$epoch" \
+"$registry_bin" publish --package:"$package_id" --author:"$author_id" --channel:"$channel" --epoch:"$epoch" \
   --cid:"$cid" --priv:"$priv_key" --format:tar --registry:"$registry_path"
 
 echo "[pkg] published $package_id@$channel epoch=$epoch cid=$cid"

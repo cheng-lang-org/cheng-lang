@@ -79,6 +79,14 @@ log_non_c_abi="$out_dir/abi_v2_noptr_non_c_abi_probe.log"
 mkdir -p "$out_dir"
 timeout_s="${CHENG_BACKEND_ABI_V2_NOPTR_TIMEOUT:-60}"
 only_v2="${CHENG_BACKEND_ABI_V2_NOPTR_ONLY:-0}"
+if [ "${CHENG_GENERIC_MODE:-}" = "" ]; then
+  export CHENG_GENERIC_MODE=hybrid
+fi
+if [ "${CHENG_GENERIC_SPEC_BUDGET:-}" = "" ]; then
+  export CHENG_GENERIC_SPEC_BUDGET=0
+fi
+gate_generic_mode="${CHENG_BACKEND_ABI_V2_NOPTR_GENERIC_MODE:-dict}"
+gate_generic_budget="${CHENG_BACKEND_ABI_V2_NOPTR_GENERIC_SPEC_BUDGET:-0}"
 
 cleanup_probe() {
   rm -f "$probe"
@@ -109,7 +117,8 @@ else
     CHENG_STAGE1_STD_NO_POINTERS_STRICT=0 \
     CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
     CHENG_STAGE1_SKIP_SEM=0 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE="$gate_generic_mode" \
+    CHENG_GENERIC_SPEC_BUDGET="$gate_generic_budget" \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \
@@ -132,7 +141,8 @@ else
       CHENG_STAGE1_STD_NO_POINTERS_STRICT=0 \
       CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
       CHENG_STAGE1_SKIP_SEM=0 \
-      CHENG_STAGE1_SKIP_MONO=1 \
+      CHENG_GENERIC_MODE="$gate_generic_mode" \
+      CHENG_GENERIC_SPEC_BUDGET="$gate_generic_budget" \
       CHENG_STAGE1_SKIP_OWNERSHIP=1 \
       CHENG_BACKEND_EMIT=obj \
       CHENG_BACKEND_TARGET="$target" \
@@ -162,7 +172,8 @@ run_with_timeout "$timeout_s" env \
   CHENG_STAGE1_STD_NO_POINTERS_STRICT=1 \
   CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1 \
   CHENG_STAGE1_SKIP_SEM=0 \
-  CHENG_STAGE1_SKIP_MONO=1 \
+  CHENG_GENERIC_MODE="$gate_generic_mode" \
+  CHENG_GENERIC_SPEC_BUDGET="$gate_generic_budget" \
   CHENG_STAGE1_SKIP_OWNERSHIP=1 \
   CHENG_BACKEND_EMIT=obj \
   CHENG_BACKEND_TARGET="$target" \
@@ -206,7 +217,8 @@ if [ "$only_v2" = "1" ]; then
     CHENG_STAGE1_STD_NO_POINTERS_STRICT=0 \
     CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1 \
     CHENG_STAGE1_SKIP_SEM=0 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE="$gate_generic_mode" \
+    CHENG_GENERIC_SPEC_BUDGET="$gate_generic_budget" \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \
@@ -224,7 +236,8 @@ else
     CHENG_STAGE1_STD_NO_POINTERS_STRICT=0 \
     CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
     CHENG_STAGE1_SKIP_SEM=0 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE="$gate_generic_mode" \
+    CHENG_GENERIC_SPEC_BUDGET="$gate_generic_budget" \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \
@@ -241,7 +254,8 @@ else
     CHENG_STAGE1_STD_NO_POINTERS_STRICT=0 \
     CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1 \
     CHENG_STAGE1_SKIP_SEM=0 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE="$gate_generic_mode" \
+    CHENG_GENERIC_SPEC_BUDGET="$gate_generic_budget" \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \

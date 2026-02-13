@@ -4,7 +4,7 @@ set -eu
 usage() {
   cat <<'EOF'
 Usage:
-  src/tooling/package_ide.sh [--out:<dir>] [--name:<prog>] [--compiler:auto|stage1] [--no-archive] [--mm:<orc|off>] [--orc|--off]
+  src/tooling/package_ide.sh [--out:<dir>] [--name:<prog>] [--compiler:auto|stage1] [--no-archive] [--mm:<orc>] [--orc]
 
 Notes:
   - Build the native GUI IDE and generate a distribution directory.
@@ -38,9 +38,6 @@ while [ "${1:-}" != "" ]; do
     --orc)
       mm="orc"
       ;;
-    --off)
-      mm="off"
-      ;;
     --mm:*)
       mm="${1#--mm:}"
       ;;
@@ -52,6 +49,11 @@ while [ "${1:-}" != "" ]; do
   esac
   shift || true
 done
+
+if [ "$mm" != "" ] && [ "$mm" != "orc" ]; then
+  echo "[Error] invalid --mm:$mm (only orc is supported)" 1>&2
+  exit 2
+fi
 
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 root="$(CDPATH= cd -- "$here/../.." && pwd)"

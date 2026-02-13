@@ -12,6 +12,8 @@ Usage:
 Notes:
   - Runs the backend .o-only bootstrap + fullchain tool smoke.
   - Backend-only CI gate (C frontend path disabled).
+  - Includes selfhost performance regression gate (`verify_backend_selfhost_perf_regression.sh`).
+  - Selfhost perf limits default to `src/tooling/selfhost_perf_baseline.env` (override via `CHENG_SELFHOST_PERF_BASELINE` / `CHENG_SELFHOST_PERF_MAX_*`).
   - Also validates the self-linker output format for ELF/COFF (best-effort; use --strict to forbid skip).
   - Requires:
     - Darwin/arm64 host
@@ -172,6 +174,12 @@ fi
 run_step "backend.ci.selfhost_bootstrap_self_obj" env \
   CHENG_SELF_OBJ_BOOTSTRAP_STAGE0="$seed_path" \
   sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh
+
+perf_session="${CHENG_SELFHOST_PERF_SESSION:-${CHENG_SELF_OBJ_BOOTSTRAP_SESSION:-default}}"
+run_step "backend.ci.selfhost_perf_regression" env \
+  CHENG_SELFHOST_PERF_SESSION="$perf_session" \
+  CHENG_SELFHOST_PERF_AUTO_BUILD=0 \
+  sh src/tooling/verify_backend_selfhost_perf_regression.sh
 
 stage2="artifacts/backend_selfhost_self_obj/cheng.stage2"
 if [ ! -x "$stage2" ]; then

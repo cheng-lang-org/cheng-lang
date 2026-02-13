@@ -16,6 +16,24 @@ EOF
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHENGC="$ROOT/src/tooling/chengc.sh"
 
+resolve_chengc_bin() {
+  name="$1"
+  case "$name" in
+    /*|*/*)
+      printf '%s\n' "$name"
+      return
+      ;;
+  esac
+  case "${CHENGC_NAME_IN_ROOT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      printf '%s/%s\n' "$ROOT" "$name"
+      ;;
+    *)
+      printf '%s/artifacts/chengc/%s\n' "$ROOT" "$name"
+      ;;
+  esac
+}
+
 lock=""
 cache_root="${CHENG_PKG_CACHE:-chengcache/packages}"
 storage_root="${CHENG_PKG_STORAGE_ROOT:-build/cheng_storage}"
@@ -90,7 +108,10 @@ if [ ! -x "$CHENGC" ]; then
   exit 2
 fi
 
-if [ ! -x "$ROOT/cheng_storage" ] || [ "$ROOT/src/tooling/cheng_storage.cheng" -nt "$ROOT/cheng_storage" ]; then
+storage_bin="$(resolve_chengc_bin cheng_storage)"
+pkg_source_bin="$(resolve_chengc_bin cheng_pkg_source)"
+
+if [ ! -x "$storage_bin" ] || [ "$ROOT/src/tooling/cheng_storage.cheng" -nt "$storage_bin" ]; then
   (cd "$ROOT" && sh src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage)
 fi
 
@@ -201,10 +222,10 @@ for entry in $deps; do
   fi
   mkdir -p "$pkg_dir"
   if [ "$fmt" = "source" ]; then
-    if [ ! -x "$ROOT/cheng_pkg_source" ] || [ "$ROOT/src/tooling/cheng_pkg_source.cheng" -nt "$ROOT/cheng_pkg_source" ]; then
+    if [ ! -x "$pkg_source_bin" ] || [ "$ROOT/src/tooling/cheng_pkg_source.cheng" -nt "$pkg_source_bin" ]; then
       (cd "$ROOT" && sh src/tooling/chengc.sh src/tooling/cheng_pkg_source.cheng --name:cheng_pkg_source)
     fi
-    "$ROOT/cheng_pkg_source" fetch --manifest:"$cid_dir" --out:"$pkg_dir" --root:"$storage_root" --mode:"$mode" \
+    "$pkg_source_bin" fetch --manifest:"$cid_dir" --out:"$pkg_dir" --root:"$storage_root" --mode:"$mode" \
       $storage_listen_arg $peer_args $source_listen_arg $source_peer_args
   else
     if ! command -v tar >/dev/null 2>&1; then
@@ -212,7 +233,7 @@ for entry in $deps; do
       exit 2
     fi
     tmp="$(mktemp "$pkg_dir/pkg.XXXXXX.tar.gz")"
-    "$ROOT/cheng_storage" get --cid:"$cid_dir" --out:"$tmp" --root:"$storage_root" --mode:"$mode" $listen_arg $peer_args
+    "$storage_bin" get --cid:"$cid_dir" --out:"$tmp" --root:"$storage_root" --mode:"$mode" $listen_arg $peer_args
     tar -xzf "$tmp" -C "$pkg_dir"
     rm -f "$tmp"
   fi

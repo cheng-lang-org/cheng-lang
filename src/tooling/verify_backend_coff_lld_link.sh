@@ -56,10 +56,26 @@ elif command -v lld >/dev/null 2>&1; then
   lld_kind="lld"
   lld_cmd="lld -flavor link"
 else
-  echo "[verify_backend_coff_lld_link] missing lld-link/llvm-lld/ld.lld/lld (install LLVM to enable)" >&2
-  exit 2
+  lld_kind="missing"
 fi
 
+check_obj() {
+  obj="$1"
+  machine="$2"
+  stem="$3"
+  if [ ! -s "$obj" ]; then
+    echo "[verify_backend_coff_lld_link] missing output: $obj" >&2
+    exit 1
+  fi
+  "$objdump" -h "$obj" > "$out_dir/${stem}.objdump.h.txt"
+  grep -q "$machine" "$out_dir/${stem}.objdump.h.txt"
+  grep -q "\\.text" "$out_dir/${stem}.objdump.h.txt"
+  "$objdump" -t "$obj" > "$out_dir/${stem}.objdump.t.txt" || true
+  grep -q "main" "$out_dir/${stem}.objdump.t.txt" || {
+    echo "[verify_backend_coff_lld_link] missing symbol main in object: $obj" >&2
+    exit 1
+  }
+}
 
 out_dir="artifacts/backend_coff_lld_link"
 mkdir -p "$out_dir"
@@ -77,9 +93,20 @@ CHENG_BACKEND_INPUT="$fixture" \
 CHENG_BACKEND_OUTPUT="$obj_path" \
 "$driver"
 
-if [ ! -s "$obj_path" ]; then
-  echo "[verify_backend_coff_lld_link] missing output: $obj_path" >&2
-  exit 1
+check_obj "$obj_path" "coff-arm64" "return_add.self.coff.arm64.obj"
+
+CHENG_BACKEND_EMIT=obj \
+CHENG_BACKEND_OBJ_WRITER=coff \
+CHENG_BACKEND_TARGET=x86_64-pc-windows-msvc \
+CHENG_BACKEND_INPUT="$fixture" \
+CHENG_BACKEND_OUTPUT="$obj_path_x64" \
+"$driver"
+
+check_obj "$obj_path_x64" "coff-x86-64" "return_add.self.coff.x86_64.obj"
+
+if [ "$lld_kind" = "missing" ]; then
+  echo "verify_backend_coff_lld_link ok (lld=missing, mode=obj-only)"
+  exit 0
 fi
 
 # Link a DLL without CRT/system libs (best-effort); exports `main` for symbol presence checks.
@@ -101,18 +128,6 @@ grep -q "main" "$out_dir/return_add.self.coff.dll.objdump.t.txt" || {
   echo "[verify_backend_coff_lld_link] missing symbol main in dll (lld=$lld_kind)" >&2
   exit 1
 }
-
-CHENG_BACKEND_EMIT=obj \
-CHENG_BACKEND_OBJ_WRITER=coff \
-CHENG_BACKEND_TARGET=x86_64-pc-windows-msvc \
-CHENG_BACKEND_INPUT="$fixture" \
-CHENG_BACKEND_OUTPUT="$obj_path_x64" \
-"$driver"
-
-if [ ! -s "$obj_path_x64" ]; then
-  echo "[verify_backend_coff_lld_link] missing output: $obj_path_x64" >&2
-  exit 1
-fi
 
 if [ -f "$dll_path_x64" ]; then mv "$dll_path_x64" "$dll_path_x64.prev.$$" 2>/dev/null || true; fi
 if [ -f "$dll_path_x64.lib" ]; then mv "$dll_path_x64.lib" "$dll_path_x64.lib.prev.$$" 2>/dev/null || true; fi

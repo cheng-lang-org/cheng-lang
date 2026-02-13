@@ -6,14 +6,14 @@ usage() {
 Usage:
   src/tooling/verify_stage1_fullspec.sh [--file:<path>] [--name:<bin>] [--jobs:<N>]
                                         [--backend:<obj>] [--frontend:<stage1|mvp>]
-                                        [--target:<triple>] [--linker:<self>]
-                                        [--mm:<orc|off>] [--timeout:<sec>] [--multi:<0|1>]
+                                        [--target:<triple>] [--linker:<self|system|auto>]
+                                        [--mm:<orc>] [--timeout:<sec>] [--multi:<0|1>]
                                         [--skip-run] [--allow-skip]
                                         [--log:<path>]
 
 Notes:
   - Builds and runs the stage1 fullspec sample (expects output: "fullspec ok").
-  - Only backend obj/self-link path is supported (C fullspec path removed).
+  - Backend obj path supports `self`/`system` linker modes (`auto` defaults to host-compatible mode).
 EOF
 }
 
@@ -116,10 +116,14 @@ if [ "$name" = "" ]; then
   name="${base%.cheng}"
 fi
 
-envs=""
-if [ "$mm" != "" ]; then
-  envs="CHENG_MM=$mm"
+if [ "$mm" = "" ]; then
+  mm="${CHENG_MM:-orc}"
 fi
+if [ "$mm" != "orc" ]; then
+  echo "[Error] invalid --mm:$mm (only orc is supported)" 1>&2
+  exit 2
+fi
+envs="CHENG_MM=orc"
 
 if [ "$jobs" = "" ]; then
   jobs="${CHENG_STAGE1_FULLSPEC_JOBS:-}"
@@ -207,15 +211,19 @@ if [ "$target" = "" ]; then
   esac
 fi
 
-if [ "$linker" = "" ]; then
-  linker="self"
+if [ "$linker" = "" ] || [ "$linker" = "auto" ]; then
+  if [ "${CHENG_BACKEND_LINKER:-}" = "system" ]; then
+    linker="system"
+  else
+    linker="self"
+  fi
 fi
-if [ "$linker" != "self" ]; then
-  echo "[Error] invalid --linker:$linker (only self is supported)" 1>&2
+if [ "$linker" != "self" ] && [ "$linker" != "system" ]; then
+  echo "[Error] invalid --linker:$linker (expected self|system|auto)" 1>&2
   exit 2
 fi
 
-if [ "$host_os" = "Darwin" ] && ! command -v codesign >/dev/null 2>&1; then
+if [ "$linker" = "self" ] && [ "$host_os" = "Darwin" ] && ! command -v codesign >/dev/null 2>&1; then
   if [ "$allow_skip" != "" ]; then
     echo "[skip] stage1 fullspec obj: missing codesign" 1>&2
     exit 0
@@ -227,45 +235,65 @@ fi
 driver="$(sh src/tooling/backend_driver_path.sh)"
 runtime_src="src/std/system_helpers_backend.cheng"
 runtime_obj="chengcache/system_helpers.backend.cheng.o"
-if [ ! -f "$runtime_src" ]; then
-  echo "[Error] missing backend runtime source: $runtime_src" 1>&2
-  exit 2
-fi
-mkdir -p chengcache
-if [ ! -f "$runtime_obj" ] || [ "$runtime_src" -nt "$runtime_obj" ]; then
-  # shellcheck disable=SC2086
-  run_cmd "build.stage1_fullspec.runtime_obj" env $jobs_env \
-    CHENG_BACKEND_MULTI="$multi" \
-    CHENG_BACKEND_MULTI_FORCE="$multi_force" \
-    CHENG_BACKEND_ALLOW_NO_MAIN=1 \
-    CHENG_BACKEND_WHOLE_PROGRAM=1 \
-    CHENG_BACKEND_EMIT=obj \
-    CHENG_BACKEND_TARGET="$target" \
-    CHENG_BACKEND_FRONTEND=mvp \
-    CHENG_BACKEND_INPUT="$runtime_src" \
-    CHENG_BACKEND_OUTPUT="$runtime_obj" \
-    "$driver"
-fi
-if [ ! -s "$runtime_obj" ]; then
-  echo "[Error] missing backend runtime obj: $runtime_obj" 1>&2
-  exit 2
+if [ "$linker" = "self" ]; then
+  if [ ! -f "$runtime_src" ]; then
+    echo "[Error] missing backend runtime source: $runtime_src" 1>&2
+    exit 2
+  fi
+  mkdir -p chengcache
+  if [ ! -f "$runtime_obj" ] || [ "$runtime_src" -nt "$runtime_obj" ]; then
+    # shellcheck disable=SC2086
+    run_cmd "build.stage1_fullspec.runtime_obj" env $jobs_env \
+      CHENG_BACKEND_MULTI="$multi" \
+      CHENG_BACKEND_MULTI_FORCE="$multi_force" \
+      CHENG_BACKEND_ALLOW_NO_MAIN=1 \
+      CHENG_BACKEND_WHOLE_PROGRAM=1 \
+      CHENG_BACKEND_EMIT=obj \
+      CHENG_BACKEND_TARGET="$target" \
+      CHENG_BACKEND_FRONTEND=mvp \
+      CHENG_BACKEND_INPUT="$runtime_src" \
+      CHENG_BACKEND_OUTPUT="$runtime_obj" \
+      "$driver"
+  fi
+  if [ ! -s "$runtime_obj" ]; then
+    echo "[Error] missing backend runtime obj: $runtime_obj" 1>&2
+    exit 2
+  fi
 fi
 
-# shellcheck disable=SC2086
-run_cmd "build.stage1_fullspec.obj" env $envs $jobs_env \
-  CHENG_BACKEND_MULTI="$multi" \
-  CHENG_BACKEND_MULTI_FORCE="$multi_force" \
-  CHENG_BACKEND_LINKER=self \
-  CHENG_BACKEND_WHOLE_PROGRAM=1 \
-  CHENG_BACKEND_NO_RUNTIME_C=1 \
-  CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
-  CHENG_BACKEND_VALIDATE=1 \
-  CHENG_BACKEND_FRONTEND="$frontend" \
-  CHENG_BACKEND_EMIT=exe \
-  CHENG_BACKEND_TARGET="$target" \
-  CHENG_BACKEND_INPUT="$file" \
-  CHENG_BACKEND_OUTPUT="$root/$name" \
-  "$driver"
+if [ "$linker" = "self" ]; then
+  # shellcheck disable=SC2086
+  run_cmd "build.stage1_fullspec.obj" env $envs $jobs_env \
+    CHENG_BACKEND_MULTI="$multi" \
+    CHENG_BACKEND_MULTI_FORCE="$multi_force" \
+    CHENG_BACKEND_LINKER=self \
+    CHENG_BACKEND_WHOLE_PROGRAM=1 \
+    CHENG_BACKEND_NO_RUNTIME_C=1 \
+    CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
+    CHENG_BACKEND_VALIDATE=1 \
+    CHENG_BACKEND_FRONTEND="$frontend" \
+    CHENG_BACKEND_EMIT=exe \
+    CHENG_BACKEND_TARGET="$target" \
+    CHENG_BACKEND_INPUT="$file" \
+    CHENG_BACKEND_OUTPUT="$root/$name" \
+    "$driver"
+else
+  # shellcheck disable=SC2086
+  run_cmd "build.stage1_fullspec.obj" env $envs $jobs_env \
+    CHENG_BACKEND_MULTI="$multi" \
+    CHENG_BACKEND_MULTI_FORCE="$multi_force" \
+    CHENG_BACKEND_LINKER=system \
+    CHENG_BACKEND_WHOLE_PROGRAM=1 \
+    CHENG_BACKEND_NO_RUNTIME_C=0 \
+    CHENG_BACKEND_RUNTIME_OBJ= \
+    CHENG_BACKEND_VALIDATE=1 \
+    CHENG_BACKEND_FRONTEND="$frontend" \
+    CHENG_BACKEND_EMIT=exe \
+    CHENG_BACKEND_TARGET="$target" \
+    CHENG_BACKEND_INPUT="$file" \
+    CHENG_BACKEND_OUTPUT="$root/$name" \
+    "$driver"
+fi
 
 if [ "$skip_run" != "" ]; then
   echo "stage1 fullspec build ok: $name"

@@ -13,6 +13,40 @@ commands:
 EOF
 }
 
+REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+resolve_chengc_bin() {
+  local name="$1"
+  case "$name" in
+    /*|*/*)
+      printf '%s\n' "$name"
+      return
+      ;;
+  esac
+  case "${CHENGC_NAME_IN_ROOT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      printf '%s/%s\n' "$REPO_ROOT" "$name"
+      ;;
+    *)
+      printf '%s/artifacts/chengc/%s\n' "$REPO_ROOT" "$name"
+      ;;
+  esac
+}
+
+cheng_storage_bin="${CHENG_STORAGE_BIN:-$(resolve_chengc_bin cheng_storage)}"
+
+ensure_cheng_storage_bin() {
+  if [ -x "$cheng_storage_bin" ] && [ "$REPO_ROOT/src/tooling/cheng_storage.cheng" -ot "$cheng_storage_bin" ]; then
+    return 0
+  fi
+  (cd "$REPO_ROOT" && sh src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage >/dev/null)
+  if [ ! -x "$cheng_storage_bin" ]; then
+    echo "export: missing cheng_storage binary: $cheng_storage_bin" 1>&2
+    return 1
+  fi
+  return 0
+}
+
 json_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -88,7 +122,8 @@ cmd_export() {
 
   local tmp
   tmp="$(mktemp)"
-  ./cheng_storage settle --epoch:"$epoch" --ledger:"$ledger" --root:"$root" --format:json --top:"$top" --out:"$tmp"
+  ensure_cheng_storage_bin || return 1
+  "$cheng_storage_bin" settle --epoch:"$epoch" --ledger:"$ledger" --root:"$root" --format:json --top:"$top" --out:"$tmp"
   local settlement_sha256
   settlement_sha256="$(sha256_file "$tmp")"
   if [ -z "$settlement_sha256" ]; then

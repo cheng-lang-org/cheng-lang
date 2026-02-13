@@ -1,6 +1,7 @@
 # Stage1 frontend (internal pipeline + fallback).
 import std/os
 import std/strings
+import std/seqs
 import std/hashmaps
 import std/hashsets
 import std/monotimes
@@ -642,7 +643,7 @@ fn loadTokenCache(path: str, size: int64, mtime: int64): TokenCacheResult =
                     add(out, tok)
                 for pi in 0..<parts.len:
                     releaseString parts[pi]
-                freeSeq(parts)
+                freeSeq[str](parts)
         releaseString line
         if ! ok:
             break
@@ -651,7 +652,6 @@ fn loadTokenCache(path: str, size: int64, mtime: int64): TokenCacheResult =
         for ti in 0..<out.len:
             let tok: Token = out[ti]
             releaseString tok.lexeme
-        freeSeq(out)
         return res
     res.hit = true
     res.tokens = out
@@ -817,7 +817,7 @@ fn normalizePath(path: str): str =
             out = out + "/"
         out = out + seg
         releaseString seg
-    freeSeq(parts)
+    freeSeq[str](parts)
     if len out == 0 && len prefix > 0:
         return prefix
     return out
@@ -1416,6 +1416,26 @@ fn resolveImportPath(path: str, baseDir: str, rootDir: str): str =
             if len resolved > 0:
                 return resolved
         return ""
+    if hasPrefix(full, "core/"):
+        let rest: str = sliceRange(full, 5, len full - 1)
+        var corePath0: str = joinPath(joinPath(rootDir, "src/core"), rest)
+        if ! endsWith(corePath0, ".cheng"):
+            corePath0 = corePath0 + ".cheng"
+        if stage1_fileExists corePath0:
+            let resolved: str = normalizeImportPathChecked(corePath0, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
+    if hasPrefix(full, "system/"):
+        let rest: str = sliceRange(full, 7, len full - 1)
+        var systemPath0: str = joinPath(joinPath(rootDir, "src/system"), rest)
+        if ! endsWith(systemPath0, ".cheng"):
+            systemPath0 = systemPath0 + ".cheng"
+        if stage1_fileExists systemPath0:
+            let resolved: str = normalizeImportPathChecked(systemPath0, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
     if hasPrefix(full, "cheng/stdlib/bootstrap/"):
         var legacyBase: str = joinPath(rootDir, "src/std")
         var legacyRest: str = sliceRange(full, 23, len full - 1)
@@ -1710,8 +1730,8 @@ fn loadModuleRecursive(path: str, rootDir: str, visited: StrSetList*, diags: Dia
         if lexDiags.len == 0:
             writeTokenCache(path, size, mtime, tokens)
     let mroot: Node = parseModuleWithDiagnostics(tokens, path, diags)
-    freeSeq(tokens)
-    freeSeq(lexDiags)
+    freeSeq[Token](tokens)
+    freeSeq[Diagnostic](lexDiags)
     if mroot == nil:
         return out
     tagModuleChildren(mroot, path)
@@ -1798,7 +1818,7 @@ fn appendDiagnostics(dst: Diagnostic[]*, src: Diagnostic[]) =
     for i in 0..<src.len:
         add(dst, src[i])
 
-fn hasError(diags: Diagnostic[]): bool =
+fn hasError(diags: var Diagnostic[]): bool =
     for i in 0..<diags.len:
         let d: Diagnostic = diags[i]
         if d.severity == svError:
@@ -1860,8 +1880,8 @@ fn loadSystemModule(userFile: str, diags: Diagnostic[]*): Node =
             writeTokenCache(sysPath, size, mtime, tokens)
     dumpTokens(sysPath, tokens)
     let sysRoot: Node = parseModuleWithDiagnostics(tokens, sysPath, diags)
-    freeSeq(tokens)
-    freeSeq(lexDiags)
+    freeSeq[Token](tokens)
+    freeSeq[Diagnostic](lexDiags)
     return sysRoot
 
 fn parseModuleForDeps(path: str, diags: Diagnostic[]*): Node =
@@ -1893,8 +1913,8 @@ fn parseModuleForDeps(path: str, diags: Diagnostic[]*): Node =
         if lexDiags.len == 0:
             writeTokenCache(path, size, mtime, tokens)
     let root: Node = parseModuleWithDiagnostics(tokens, path, diags)
-    freeSeq(tokens)
-    freeSeq(lexDiags)
+    freeSeq[Token](tokens)
+    freeSeq[Diagnostic](lexDiags)
     return root
 
 fn mergeModules(sysRoot: Node, userRoot: Node): Node =

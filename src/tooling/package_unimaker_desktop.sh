@@ -6,7 +6,7 @@ usage() {
 Usage:
   src/tooling/package_unimaker_desktop.sh [--out:<dir>] [--name:<prog>] [--compiler:auto|stage1]
                                            [--ide-compiler:auto|stage1] [--ide-bin:<path>] [--skip-ide]
-                                           [--no-archive] [--mm:<orc|off>] [--orc|--off]
+                                           [--no-archive] [--mm:<orc>] [--orc]
 
 Notes:
   - Build Unimaker Desktop and generate a distribution directory.
@@ -53,9 +53,6 @@ while [ "${1:-}" != "" ]; do
     --orc)
       mm="orc"
       ;;
-    --off)
-      mm="off"
-      ;;
     --mm:*)
       mm="${1#--mm:}"
       ;;
@@ -67,6 +64,11 @@ while [ "${1:-}" != "" ]; do
   esac
   shift || true
 done
+
+if [ "$mm" != "" ] && [ "$mm" != "orc" ]; then
+  echo "[Error] invalid --mm:$mm (only orc is supported)" 1>&2
+  exit 2
+fi
 
 here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 root="$(CDPATH= cd -- "$here/../.." && pwd)"

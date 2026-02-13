@@ -22,7 +22,7 @@ sh src/tooling/chengb.sh examples/hello_puts.cheng --run
 
 ```bash
 CHENG_MM=orc sh src/tooling/chengc.sh examples/test_orc_closedloop.cheng --name:test_orc_closedloop
-CHENG_MM=orc ./test_orc_closedloop
+CHENG_MM=orc ./artifacts/chengc/test_orc_closedloop
 ```
 
 ## Pure Cheng bootstrap

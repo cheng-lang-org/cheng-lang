@@ -6,6 +6,28 @@ MODE="local"
 LISTEN=""
 PEER=""
 REQUIRE_LEASE="0"
+repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+
+resolve_chengc_bin() {
+  local name="$1"
+  case "$name" in
+    /*|*/*)
+      printf '%s\n' "$name"
+      return
+      ;;
+  esac
+  case "${CHENGC_NAME_IN_ROOT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      printf '%s/%s\n' "$repo_root" "$name"
+      ;;
+    *)
+      printf '%s/artifacts/chengc/%s\n' "$repo_root" "$name"
+      ;;
+  esac
+}
+
+storage_bin="$(resolve_chengc_bin cheng_storage)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -45,7 +67,7 @@ fi
 
 sh src/tooling/demo_io_lease.sh "${DEMO_ARGS[@]}" >/dev/null
 
-settle="$(./cheng_storage settle --root:"$ROOT" --format:toml --top:1)"
+settle="$("$storage_bin" settle --root:"$ROOT" --format:toml --top:1)"
 printf '%s' "$settle" | grep -Fq "[payouts.authors]" || { echo "verify: missing payouts.authors" 1>&2; exit 1; }
 printf '%s' "$settle" | grep -Fq "[payouts.providers]" || { echo "verify: missing payouts.providers" 1>&2; exit 1; }
 printf '%s' "$settle" | grep -Fq "storage_total" || { echo "verify: missing storage_total" 1>&2; exit 1; }

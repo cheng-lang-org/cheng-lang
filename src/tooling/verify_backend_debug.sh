@@ -42,16 +42,37 @@ build_and_check_dsym() {
   exe="$2"
   dsym="$exe.dSYM"
   link_env="$(sh src/tooling/backend_link_env.sh --driver:"$driver" --target:"$target" --linker:"${CHENG_BACKEND_LINKER:-auto}")"
+  multi="${CHENG_BACKEND_MULTI:-0}"
+  multi_force="${CHENG_BACKEND_MULTI_FORCE:-$multi}"
 
   rm -rf "$exe" "$dsym"
 
+  set +e
   env $link_env \
+    CHENG_BACKEND_MULTI="$multi" \
+    CHENG_BACKEND_MULTI_FORCE="$multi_force" \
     CHENG_BACKEND_VALIDATE=1 \
     CHENG_BACKEND_EMIT=exe \
     CHENG_BACKEND_TARGET="$target" \
     CHENG_BACKEND_INPUT="$fixture" \
     CHENG_BACKEND_OUTPUT="$exe" \
     "$driver"
+  status="$?"
+  set -e
+  if [ "$status" -ne 0 ] && [ "$multi" != "0" ]; then
+    echo "[Warn] verify_backend_debug parallel compile failed, retry serial (target=$target)" 1>&2
+    env $link_env \
+      CHENG_BACKEND_MULTI=0 \
+      CHENG_BACKEND_MULTI_FORCE=0 \
+      CHENG_BACKEND_VALIDATE=1 \
+      CHENG_BACKEND_EMIT=exe \
+      CHENG_BACKEND_TARGET="$target" \
+      CHENG_BACKEND_INPUT="$fixture" \
+      CHENG_BACKEND_OUTPUT="$exe" \
+      "$driver"
+  elif [ "$status" -ne 0 ]; then
+    exit "$status"
+  fi
 
   if [ ! -x "$exe" ]; then
     echo "[Error] missing exe output: $exe" 1>&2

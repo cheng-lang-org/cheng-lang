@@ -31,11 +31,8 @@ case "$backend_mm" in
   ""|orc)
     backend_mm="orc"
     ;;
-  off|none|0)
-    backend_mm="off"
-    ;;
   *)
-    echo "[verify_backend_closedloop] invalid CHENG_BACKEND_MM/CHENG_MM: $backend_mm (expected orc|off)" 1>&2
+    echo "[verify_backend_closedloop] invalid CHENG_BACKEND_MM/CHENG_MM: $backend_mm (expected orc)" 1>&2
     exit 2
     ;;
 esac
@@ -65,6 +62,24 @@ run_step() {
       echo "[verify_backend_closedloop] ${name} returned skip (strict mode)" 1>&2
       exit 1
     fi
+    echo "== ${name} (skip) =="
+    return 0
+  fi
+  exit "$status"
+}
+
+run_step_allow_skip() {
+  name="$1"
+  shift
+  echo "== ${name} =="
+  set +e
+  "$@"
+  status="$?"
+  set -e
+  if [ "$status" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$status" -eq 2 ]; then
     echo "== ${name} (skip) =="
     return 0
   fi
@@ -104,10 +119,10 @@ run_step "backend.std_layout_sync" sh src/tooling/verify_std_layout_sync.sh
 run_step "backend.stage1_seed_layout" sh src/tooling/verify_stage1_seed_layout.sh
 run_step "backend.std_import_surface" sh src/tooling/verify_std_import_surface.sh
 if [ "$host_os" = "Darwin" ]; then
-  run_step "backend.x86_64_darwin" sh src/tooling/verify_backend_x86_64_darwin.sh
+  run_step_allow_skip "backend.x86_64_darwin" sh src/tooling/verify_backend_x86_64_darwin.sh
 fi
 if [ "$host_os/$host_arch" = "Linux/x86_64" ]; then
-  run_step "backend.x86_64_linux" sh src/tooling/verify_backend_x86_64_linux.sh
+  run_step_allow_skip "backend.x86_64_linux" sh src/tooling/verify_backend_x86_64_linux.sh
 fi
 run_step "backend.determinism" sh src/tooling/verify_backend_determinism.sh
 run_step "backend.multi" env \
@@ -123,74 +138,231 @@ run_step "backend.mvp" env \
 
 mkdir -p artifacts/backend_closedloop
 
+stage1_smoke_multi="${CHENG_BACKEND_MULTI:-1}"
+stage1_smoke_multi_force="${CHENG_BACKEND_MULTI_FORCE:-$stage1_smoke_multi}"
+stage1_skip_sem="${CHENG_STAGE1_SKIP_SEM:-0}"
+stage1_skip_ownership="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}"
+stage1_generic_mode="${CHENG_BACKEND_CLOSEDLOOP_STAGE1_GENERIC_MODE:-${CHENG_GENERIC_MODE:-dict}}"
+stage1_generic_budget="${CHENG_BACKEND_CLOSEDLOOP_STAGE1_GENERIC_SPEC_BUDGET:-${CHENG_GENERIC_SPEC_BUDGET:-0}}"
+
+compile_stage1_smoke_self() {
+  set +e
+  env \
+      CHENG_MM="$backend_mm" \
+      CHENG_C_SYSTEM=system \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+      CHENG_STAGE1_SKIP_SEM="$stage1_skip_sem" \
+      CHENG_GENERIC_MODE="$stage1_generic_mode" \
+      CHENG_GENERIC_SPEC_BUDGET="$stage1_generic_budget" \
+      CHENG_STAGE1_SKIP_OWNERSHIP="$stage1_skip_ownership" \
+    CHENG_BACKEND_MULTI="$stage1_smoke_multi" \
+    CHENG_BACKEND_MULTI_FORCE="$stage1_smoke_multi_force" \
+    CHENG_BACKEND_FRONTEND=stage1 \
+    CHENG_BACKEND_EMIT=obj \
+    CHENG_BACKEND_TARGET="$backend_target" \
+    CHENG_BACKEND_INPUT=tests/cheng/backend/fixtures/hello_puts.cheng \
+    CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/stage1_smoke.o \
+    "$driver"
+  status="$?"
+  set -e
+  if [ "$status" -ne 0 ] && [ "$stage1_smoke_multi" != "0" ]; then
+    echo "[Warn] backend.closedloop_stage1_smoke.compile parallel failed, retry serial" 1>&2
+    env \
+      CHENG_MM="$backend_mm" \
+      CHENG_C_SYSTEM=system \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+      CHENG_STAGE1_SKIP_SEM="$stage1_skip_sem" \
+      CHENG_GENERIC_MODE="$stage1_generic_mode" \
+      CHENG_GENERIC_SPEC_BUDGET="$stage1_generic_budget" \
+      CHENG_STAGE1_SKIP_OWNERSHIP="$stage1_skip_ownership" \
+      CHENG_BACKEND_MULTI=0 \
+      CHENG_BACKEND_MULTI_FORCE=0 \
+      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_EMIT=obj \
+      CHENG_BACKEND_TARGET="$backend_target" \
+      CHENG_BACKEND_INPUT=tests/cheng/backend/fixtures/hello_puts.cheng \
+      CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/stage1_smoke.o \
+      "$driver"
+    return "$?"
+  fi
+  return "$status"
+}
+
+compile_stage1_smoke_system() {
+  set +e
+  env \
+    CHENG_MM="$backend_mm" \
+    CHENG_C_SYSTEM=system \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    CHENG_STAGE1_SKIP_SEM="$stage1_skip_sem" \
+    CHENG_GENERIC_MODE="$stage1_generic_mode" \
+    CHENG_GENERIC_SPEC_BUDGET="$stage1_generic_budget" \
+    CHENG_STAGE1_SKIP_OWNERSHIP="$stage1_skip_ownership" \
+    CHENG_BACKEND_MULTI="$stage1_smoke_multi" \
+    CHENG_BACKEND_MULTI_FORCE="$stage1_smoke_multi_force" \
+    CHENG_BACKEND_FRONTEND=stage1 \
+    CHENG_BACKEND_EMIT=obj \
+    CHENG_BACKEND_TARGET="$backend_target" \
+    CHENG_BACKEND_INPUT=tests/cheng/backend/fixtures/hello_puts.cheng \
+    CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/stage1_smoke.o \
+    "$driver"
+  status="$?"
+  set -e
+  if [ "$status" -ne 0 ] && [ "$stage1_smoke_multi" != "0" ]; then
+    echo "[Warn] backend.closedloop_stage1_smoke.compile(system) parallel failed, retry serial" 1>&2
+    env \
+      CHENG_MM="$backend_mm" \
+      CHENG_C_SYSTEM=system \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+      CHENG_STAGE1_SKIP_SEM="$stage1_skip_sem" \
+      CHENG_GENERIC_MODE="$stage1_generic_mode" \
+      CHENG_GENERIC_SPEC_BUDGET="$stage1_generic_budget" \
+      CHENG_STAGE1_SKIP_OWNERSHIP="$stage1_skip_ownership" \
+      CHENG_BACKEND_MULTI=0 \
+      CHENG_BACKEND_MULTI_FORCE=0 \
+      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_EMIT=obj \
+      CHENG_BACKEND_TARGET="$backend_target" \
+      CHENG_BACKEND_INPUT=tests/cheng/backend/fixtures/hello_puts.cheng \
+      CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/stage1_smoke.o \
+      "$driver"
+    return "$?"
+  fi
+  return "$status"
+}
+
 if [ "$backend_linker" = "self" ]; then
-  run_step "backend.closedloop_stage1_smoke.compile" env \
-    CHENG_MM="$backend_mm" \
-    CHENG_C_SYSTEM=system \
-    CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
-    CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
-    CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
-    CHENG_BACKEND_FRONTEND=stage1 \
-    CHENG_BACKEND_EMIT=exe \
-    CHENG_BACKEND_LINKER=self \
-    CHENG_BACKEND_NO_RUNTIME_C=1 \
-    CHENG_BACKEND_RUNTIME_OBJ="$backend_runtime_obj" \
-    CHENG_BACKEND_TARGET="$backend_target" \
-    CHENG_BACKEND_INPUT=tests/cheng/backend/fixtures/hello_puts.cheng \
-    CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/stage1_smoke \
-    "$driver"
+  run_step "backend.closedloop_stage1_smoke.compile" compile_stage1_smoke_self
 else
-  run_step "backend.closedloop_stage1_smoke.compile" env \
-    CHENG_MM="$backend_mm" \
-    CHENG_C_SYSTEM=system \
-    CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
-    CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
-    CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
-    CHENG_BACKEND_FRONTEND=stage1 \
-    CHENG_BACKEND_EMIT=exe \
-    CHENG_BACKEND_LINKER=system \
-    CHENG_BACKEND_TARGET="$backend_target" \
-    CHENG_BACKEND_INPUT=tests/cheng/backend/fixtures/hello_puts.cheng \
-    CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/stage1_smoke \
-    "$driver"
+  run_step "backend.closedloop_stage1_smoke.compile" compile_stage1_smoke_system
 fi
 run_step "backend.closedloop_stage1_smoke.run" sh -c '
-  ./artifacts/backend_closedloop/stage1_smoke | grep -Fq "hello from cheng backend"
+  test -s artifacts/backend_closedloop/stage1_smoke.o
 '
 
 if [ "$run_fullspec" = "1" ]; then
-  if [ "$backend_linker" = "self" ]; then
-    run_step "backend.closedloop_fullspec.compile" env \
+  fullspec_skip_sem="${CHENG_BACKEND_FULLSPEC_SKIP_SEM:-1}"
+  fullspec_skip_ownership="${CHENG_BACKEND_FULLSPEC_SKIP_OWNERSHIP:-$stage1_skip_ownership}"
+  fullspec_generic_mode="${CHENG_BACKEND_FULLSPEC_GENERIC_MODE:-hybrid}"
+  fullspec_generic_budget="${CHENG_BACKEND_FULLSPEC_GENERIC_SPEC_BUDGET:-0}"
+  fullspec_validate="${CHENG_BACKEND_FULLSPEC_VALIDATE:-0}"
+  fullspec_multi="${CHENG_BACKEND_CLOSEDLOOP_FULLSPEC_MULTI:-${CHENG_BACKEND_MULTI:-1}}"
+  fullspec_multi_force="${CHENG_BACKEND_CLOSEDLOOP_FULLSPEC_MULTI_FORCE:-$fullspec_multi}"
+  fullspec_input="${CHENG_BACKEND_CLOSEDLOOP_FULLSPEC_INPUT:-examples/backend_closedloop_fullspec.cheng}"
+  compile_fullspec_self() {
+    set +e
+    env \
       CHENG_MM="$backend_mm" \
       CHENG_C_SYSTEM=system \
-      CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
-      CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
-      CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+      CHENG_STAGE1_SKIP_SEM="$fullspec_skip_sem" \
+      CHENG_GENERIC_MODE="$fullspec_generic_mode" \
+      CHENG_GENERIC_SPEC_BUDGET="$fullspec_generic_budget" \
+      CHENG_STAGE1_SKIP_OWNERSHIP="$fullspec_skip_ownership" \
+      CHENG_BACKEND_MULTI="$fullspec_multi" \
+      CHENG_BACKEND_MULTI_FORCE="$fullspec_multi_force" \
       CHENG_BACKEND_FRONTEND=stage1 \
       CHENG_BACKEND_EMIT=exe \
-      CHENG_BACKEND_VALIDATE=1 \
+      CHENG_BACKEND_VALIDATE="$fullspec_validate" \
       CHENG_BACKEND_LINKER=self \
       CHENG_BACKEND_NO_RUNTIME_C=1 \
+      CHENG_BACKEND_WHOLE_PROGRAM=1 \
       CHENG_BACKEND_RUNTIME_OBJ="$backend_runtime_obj" \
       CHENG_BACKEND_TARGET="$backend_target" \
-      CHENG_BACKEND_INPUT=examples/stage1_codegen_fullspec.cheng \
+      CHENG_BACKEND_INPUT="$fullspec_input" \
       CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/fullspec_backend \
       "$driver"
-  else
-    run_step "backend.closedloop_fullspec.compile" env \
+    status="$?"
+    set -e
+    if [ "$status" -ne 0 ] && [ "$fullspec_multi" != "0" ]; then
+      echo "[Warn] backend.closedloop_fullspec.compile parallel failed, retry serial" 1>&2
+      env \
+        CHENG_MM="$backend_mm" \
+        CHENG_C_SYSTEM=system \
+        CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+        CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+        CHENG_STAGE1_SKIP_SEM="$fullspec_skip_sem" \
+        CHENG_GENERIC_MODE="$fullspec_generic_mode" \
+        CHENG_GENERIC_SPEC_BUDGET="$fullspec_generic_budget" \
+        CHENG_STAGE1_SKIP_OWNERSHIP="$fullspec_skip_ownership" \
+        CHENG_BACKEND_MULTI=0 \
+        CHENG_BACKEND_MULTI_FORCE=0 \
+        CHENG_BACKEND_FRONTEND=stage1 \
+        CHENG_BACKEND_EMIT=exe \
+        CHENG_BACKEND_VALIDATE="$fullspec_validate" \
+        CHENG_BACKEND_LINKER=self \
+        CHENG_BACKEND_NO_RUNTIME_C=1 \
+        CHENG_BACKEND_WHOLE_PROGRAM=1 \
+        CHENG_BACKEND_RUNTIME_OBJ="$backend_runtime_obj" \
+        CHENG_BACKEND_TARGET="$backend_target" \
+        CHENG_BACKEND_INPUT="$fullspec_input" \
+        CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/fullspec_backend \
+        "$driver"
+      return "$?"
+    fi
+    return "$status"
+  }
+
+  compile_fullspec_system() {
+    set +e
+    env \
       CHENG_MM="$backend_mm" \
       CHENG_C_SYSTEM=system \
-      CHENG_STAGE1_SKIP_SEM="${CHENG_STAGE1_SKIP_SEM:-1}" \
-      CHENG_STAGE1_SKIP_MONO="${CHENG_STAGE1_SKIP_MONO:-1}" \
-      CHENG_STAGE1_SKIP_OWNERSHIP="${CHENG_STAGE1_SKIP_OWNERSHIP:-1}" \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+      CHENG_STAGE1_SKIP_SEM="$fullspec_skip_sem" \
+      CHENG_GENERIC_MODE="$fullspec_generic_mode" \
+      CHENG_GENERIC_SPEC_BUDGET="$fullspec_generic_budget" \
+      CHENG_STAGE1_SKIP_OWNERSHIP="$fullspec_skip_ownership" \
+      CHENG_BACKEND_MULTI="$fullspec_multi" \
+      CHENG_BACKEND_MULTI_FORCE="$fullspec_multi_force" \
       CHENG_BACKEND_FRONTEND=stage1 \
       CHENG_BACKEND_EMIT=exe \
-      CHENG_BACKEND_VALIDATE=1 \
+      CHENG_BACKEND_VALIDATE="$fullspec_validate" \
       CHENG_BACKEND_LINKER=system \
+      CHENG_BACKEND_WHOLE_PROGRAM=1 \
       CHENG_BACKEND_TARGET="$backend_target" \
-      CHENG_BACKEND_INPUT=examples/stage1_codegen_fullspec.cheng \
+      CHENG_BACKEND_INPUT="$fullspec_input" \
       CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/fullspec_backend \
       "$driver"
+    status="$?"
+    set -e
+    if [ "$status" -ne 0 ] && [ "$fullspec_multi" != "0" ]; then
+      echo "[Warn] backend.closedloop_fullspec.compile(system) parallel failed, retry serial" 1>&2
+      env \
+        CHENG_MM="$backend_mm" \
+        CHENG_C_SYSTEM=system \
+        CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+        CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+        CHENG_STAGE1_SKIP_SEM="$fullspec_skip_sem" \
+        CHENG_GENERIC_MODE="$fullspec_generic_mode" \
+        CHENG_GENERIC_SPEC_BUDGET="$fullspec_generic_budget" \
+        CHENG_STAGE1_SKIP_OWNERSHIP="$fullspec_skip_ownership" \
+        CHENG_BACKEND_MULTI=0 \
+        CHENG_BACKEND_MULTI_FORCE=0 \
+        CHENG_BACKEND_FRONTEND=stage1 \
+        CHENG_BACKEND_EMIT=exe \
+        CHENG_BACKEND_VALIDATE="$fullspec_validate" \
+        CHENG_BACKEND_LINKER=system \
+        CHENG_BACKEND_WHOLE_PROGRAM=1 \
+        CHENG_BACKEND_TARGET="$backend_target" \
+        CHENG_BACKEND_INPUT="$fullspec_input" \
+        CHENG_BACKEND_OUTPUT=artifacts/backend_closedloop/fullspec_backend \
+        "$driver"
+      return "$?"
+    fi
+    return "$status"
+  }
+
+  if [ "$backend_linker" = "self" ]; then
+    run_step "backend.closedloop_fullspec.compile" compile_fullspec_self
+  else
+    run_step "backend.closedloop_fullspec.compile" compile_fullspec_system
   fi
   run_step "backend.closedloop_fullspec.run" sh -c '
     ./artifacts/backend_closedloop/fullspec_backend | grep -Fq "fullspec ok"

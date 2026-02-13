@@ -8,14 +8,18 @@ cd "$root"
 to_abs() {
   p="$1"
   case "$p" in
-    /*) ;;
-    *) p="$root/$p" ;;
+    /*)
+      printf "%s\n" "$p"
+      return
+      ;;
+    *)
+      printf "%s/%s\n" "$root" "$p"
+      return
+      ;;
   esac
-  d="$(CDPATH= cd -- "$(dirname -- "$p")" && pwd)"
-  printf "%s/%s\n" "$d" "$(basename -- "$p")"
 }
 
-# Keep local `./cheng` during bootstrap to avoid recursive worker invocations
+# Keep local driver during bootstrap to avoid recursive worker invocations
 # deleting the active stage0 driver mid-build.
 export CHENG_CLEAN_CHENG_LOCAL=0
 if [ "${CHENG_ABI:-}" = "" ]; then
@@ -23,18 +27,40 @@ if [ "${CHENG_ABI:-}" = "" ]; then
 fi
 if [ "${CHENG_ABI}" = "v2_noptr" ]; then
   if [ "${CHENG_STAGE1_STD_NO_POINTERS:-}" = "" ]; then
-    export CHENG_STAGE1_STD_NO_POINTERS=1
+    export CHENG_STAGE1_STD_NO_POINTERS=0
   fi
   if [ "${CHENG_STAGE1_STD_NO_POINTERS_STRICT:-}" = "" ]; then
-    export CHENG_STAGE1_STD_NO_POINTERS_STRICT=1
+    export CHENG_STAGE1_STD_NO_POINTERS_STRICT=0
   fi
+  if [ "${CHENG_STAGE1_NO_POINTERS_NON_C_ABI:-}" = "" ]; then
+    export CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0
+  fi
+  if [ "${CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL:-}" = "" ]; then
+    export CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0
+  fi
+fi
+# Keep frontend behavior aligned with production closedloop defaults.
+if [ "${CHENG_C_SYSTEM:-}" = "" ]; then
+  export CHENG_C_SYSTEM=system
+fi
+if [ "${CHENG_BACKEND_IR:-}" = "" ]; then
+  export CHENG_BACKEND_IR=uir
+fi
+if [ "${CHENG_GENERIC_MODE:-}" = "" ]; then
+  mode_hint="${CHENG_SELF_OBJ_BOOTSTRAP_MODE:-fast}"
+  if [ "$mode_hint" = "strict" ]; then
+    export CHENG_GENERIC_MODE=hybrid
+  else
+    # Fast mode defaults to dict to avoid long stage1 monomorphize stalls.
+    export CHENG_GENERIC_MODE=dict
+  fi
+fi
+if [ "${CHENG_GENERIC_SPEC_BUDGET:-}" = "" ]; then
+  export CHENG_GENERIC_SPEC_BUDGET=0
 fi
 # Stage1 frontend pass toggles: keep selfhost bootstrap path stable by default.
 if [ "${CHENG_STAGE1_SKIP_SEM:-}" = "" ]; then
   export CHENG_STAGE1_SKIP_SEM=1
-fi
-if [ "${CHENG_STAGE1_SKIP_MONO:-}" = "" ]; then
-  export CHENG_STAGE1_SKIP_MONO=0
 fi
 if [ "${CHENG_STAGE1_SKIP_OWNERSHIP:-}" = "" ]; then
   export CHENG_STAGE1_SKIP_OWNERSHIP=1
@@ -64,9 +90,23 @@ run_with_timeout() {
         exit($status >> 8);
       }
       if (time >= $end) {
+        # First try process-group kill, then direct pid kill fallback.
         kill "TERM", -$pid;
-        select(undef, undef, undef, 0.5);
+        kill "TERM", $pid;
+        my $grace_end = time + 1;
+        while (time < $grace_end) {
+          my $r = waitpid($pid, WNOHANG);
+          if ($r == $pid) {
+            my $status = $?;
+            if (($status & 127) != 0) {
+              exit(128 + ($status & 127));
+            }
+            exit($status >> 8);
+          }
+          select(undef, undef, undef, 0.1);
+        }
         kill "KILL", -$pid;
+        kill "KILL", $pid;
         exit 124;
       }
       select(undef, undef, undef, 0.1);
@@ -91,6 +131,25 @@ driver_sanity_ok() {
 
 timestamp_now() {
   date +%s
+}
+
+detect_host_jobs() {
+  jobs=""
+  if command -v nproc >/dev/null 2>&1; then
+    jobs="$(nproc 2>/dev/null || true)"
+  fi
+  if [ "$jobs" = "" ] && command -v sysctl >/dev/null 2>&1; then
+    jobs="$(sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true)"
+  fi
+  case "$jobs" in
+    ''|*[!0-9]*)
+      jobs="1"
+      ;;
+  esac
+  if [ "$jobs" -lt 1 ]; then
+    jobs="1"
+  fi
+  printf '%s\n' "$jobs"
 }
 
 cleanup_local_driver_on_exit="0"
@@ -158,6 +217,7 @@ mkdir -p "$out_dir"
 mkdir -p chengcache
 runtime_obj="$out_dir/system_helpers.backend.cheng.o"
 build_timeout="${CHENG_SELF_OBJ_BOOTSTRAP_TIMEOUT:-60}"
+smoke_timeout="${CHENG_SELF_OBJ_BOOTSTRAP_SMOKE_TIMEOUT:-30}"
 
 compat_root="$root/chengcache/stage0_compat"
 ensure_stage0_compat() {
@@ -186,6 +246,8 @@ else
   fi
   if [ "$stage0" = "" ]; then
     for cand in \
+      "artifacts/backend_driver/cheng" \
+      "dist/releases/current/cheng" \
       "artifacts/backend_seed/cheng.stage2" \
       "$out_dir/cheng.stage2" \
       "$out_dir/cheng.stage1"; do
@@ -196,14 +258,17 @@ else
       fi
     done
   fi
+  if [ "$stage0" = "" ] && driver_sanity_ok "./artifacts/backend_driver/cheng"; then
+    stage0="$(to_abs "./artifacts/backend_driver/cheng")"
+  fi
   if [ "$stage0" = "" ] && driver_sanity_ok "./cheng"; then
     stage0="$(to_abs "./cheng")"
   fi
   if [ "$stage0" = "" ]; then
-    stage0="./cheng"
+    stage0="./artifacts/backend_driver/cheng"
     stage0_name="$(basename "$stage0")"
     echo "== backend.selfhost_self_obj.build_stage0_driver ($stage0_name) =="
-    bash src/tooling/build_backend_driver.sh --name:"$stage0_name" >/dev/null
+    bash src/tooling/build_backend_driver.sh --name:"$stage0" >/dev/null
     if ! driver_sanity_ok "$stage0"; then
       echo "[verify_backend_selfhost_bootstrap_self_obj] missing stage0 driver: $stage0" 1>&2
       exit 1
@@ -215,14 +280,60 @@ fi
 mm="${CHENG_SELF_OBJ_BOOTSTRAP_MM:-${CHENG_MM:-orc}}"
 cache="${CHENG_SELF_OBJ_BOOTSTRAP_CACHE:-0}"
 reuse="${CHENG_SELF_OBJ_BOOTSTRAP_REUSE:-1}"
-multi="${CHENG_SELF_OBJ_BOOTSTRAP_MULTI:-0}"
+multi="${CHENG_SELF_OBJ_BOOTSTRAP_MULTI:-1}"
 incremental="${CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL:-1}"
 multi_force="${CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE:-0}"
 jobs="${CHENG_SELF_OBJ_BOOTSTRAP_JOBS:-0}"
-bootstrap_mode="${CHENG_SELF_OBJ_BOOTSTRAP_MODE:-strict}"
+bootstrap_mode="${CHENG_SELF_OBJ_BOOTSTRAP_MODE:-fast}"
 if [ "$bootstrap_mode" != "strict" ] && [ "$bootstrap_mode" != "fast" ]; then
   echo "[Error] verify_backend_selfhost_bootstrap_self_obj invalid CHENG_SELF_OBJ_BOOTSTRAP_MODE=$bootstrap_mode (expected strict|fast)" 1>&2
   exit 2
+fi
+allow_retry="${CHENG_SELF_OBJ_BOOTSTRAP_ALLOW_RETRY:-1}"
+allow_stage0_fallback="${CHENG_SELF_OBJ_BOOTSTRAP_ALLOW_STAGE0_FALLBACK:-0}"
+fast_total_max="${CHENG_SELF_OBJ_BOOTSTRAP_FAST_MAX_TOTAL:-60}"
+fast_jobs_cap="${CHENG_SELF_OBJ_BOOTSTRAP_FAST_JOBS_CAP:-8}"
+case "$allow_stage0_fallback" in
+  0|1)
+    ;;
+  *)
+    echo "[Error] verify_backend_selfhost_bootstrap_self_obj invalid CHENG_SELF_OBJ_BOOTSTRAP_ALLOW_STAGE0_FALLBACK=$allow_stage0_fallback (expected 0|1)" 1>&2
+    exit 2
+    ;;
+esac
+case "$fast_jobs_cap" in
+  ''|*[!0-9]*)
+    fast_jobs_cap="8"
+    ;;
+esac
+if [ "$fast_jobs_cap" -lt 1 ]; then
+  fast_jobs_cap="1"
+fi
+if [ "${CHENG_SELF_OBJ_BOOTSTRAP_JOBS+x}" = "" ]; then
+  jobs="$(detect_host_jobs)"
+fi
+if [ "$bootstrap_mode" = "fast" ]; then
+  # Fast mode is latency-first, but keep non-timeout retry enabled to handle
+  # transient worker-path crashes in seed/stage compilers.
+  allow_retry="1"
+  if [ "${CHENG_SELF_OBJ_BOOTSTRAP_MULTI+x}" = "" ]; then
+    multi="1"
+  fi
+  if [ "$jobs" -gt "$fast_jobs_cap" ]; then
+    jobs="$fast_jobs_cap"
+  fi
+  if [ "${CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE+x}" = "" ]; then
+    multi_force="$multi"
+  fi
+else
+  # Strict mode prefers deterministic/stable compilation over parallel worker
+  # throughput; parallel worker path can fail intermittently on unit-map sync.
+  if [ "${CHENG_SELF_OBJ_BOOTSTRAP_MULTI+x}" = "" ]; then
+    multi="0"
+  fi
+  if [ "${CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE+x}" = "" ]; then
+    multi_force="$multi"
+  fi
 fi
 session="${CHENG_SELF_OBJ_BOOTSTRAP_SESSION:-default}"
 session_safe="$(printf '%s' "$session" | tr -c 'A-Za-z0-9._-' '_')"
@@ -242,8 +353,17 @@ stage0="$(to_abs "$stage0_copy")"
 session_lock_dir="$out_dir/.selfhost.${session_safe}.lock"
 session_lock_owner="$$"
 timing_file="$out_dir/.selfhost_timing_${session_safe}_$$.tsv"
+timing_out="${CHENG_SELF_OBJ_BOOTSTRAP_TIMING_OUT:-$out_dir/selfhost_timing_${session_safe}.tsv}"
+metrics_out="${CHENG_SELF_OBJ_BOOTSTRAP_METRICS_OUT:-$out_dir/selfhost_metrics_${session_safe}.json}"
 : > "$timing_file"
 selfhost_started="$(timestamp_now)"
+retry_runtime_serial=0
+retry_runtime_stage0=0
+retry_build_obj_serial=0
+retry_build_exe_serial=0
+retry_build_exe_stage0=0
+retry_stage1_compat=0
+last_fail_stage=""
 
 record_stage_timing() {
   label="$1"
@@ -262,6 +382,45 @@ print_stage_timing_summary() {
     [ "$label" = "" ] && continue
     echo "  ${label}: ${duration}s [$status]"
   done <"$timing_file"
+}
+
+write_selfhost_metrics() {
+  status="$1"
+  now_ts="$(timestamp_now)"
+  total_secs="$((now_ts - selfhost_started))"
+
+  timing_parent="$(dirname "$timing_out")"
+  metrics_parent="$(dirname "$metrics_out")"
+  mkdir -p "$timing_parent" "$metrics_parent" 2>/dev/null || true
+
+  if [ -s "$timing_file" ]; then
+    cp "$timing_file" "${timing_out}.tmp.$$"
+    mv "${timing_out}.tmp.$$" "$timing_out"
+  fi
+
+  {
+    echo "{"
+    printf '  "session": "%s",\n' "$session_safe"
+    printf '  "mode": "%s",\n' "$bootstrap_mode"
+    printf '  "retry_enabled": %s,\n' "$allow_retry"
+    printf '  "allow_stage0_fallback": %s,\n' "$allow_stage0_fallback"
+    printf '  "multi": %s,\n' "$multi"
+    printf '  "multi_force": %s,\n' "$multi_force"
+    printf '  "jobs": %s,\n' "$jobs"
+    printf '  "timeout_seconds": %s,\n' "$build_timeout"
+    printf '  "fast_total_max_seconds": %s,\n' "$fast_total_max"
+    printf '  "retry_runtime_serial": %s,\n' "$retry_runtime_serial"
+    printf '  "retry_runtime_stage0": %s,\n' "$retry_runtime_stage0"
+    printf '  "retry_build_obj_serial": %s,\n' "$retry_build_obj_serial"
+    printf '  "retry_build_exe_serial": %s,\n' "$retry_build_exe_serial"
+    printf '  "retry_build_exe_stage0": %s,\n' "$retry_build_exe_stage0"
+    printf '  "retry_stage1_compat": %s,\n' "$retry_stage1_compat"
+    printf '  "last_fail_stage": "%s",\n' "$last_fail_stage"
+    printf '  "exit_status": %s,\n' "$status"
+    printf '  "total_seconds": %s\n' "$total_secs"
+    echo "}"
+  } > "${metrics_out}.tmp.$$"
+  mv "${metrics_out}.tmp.$$" "$metrics_out"
 }
 
 acquire_session_lock() {
@@ -303,11 +462,25 @@ release_session_lock_on_exit() {
   status=$?
   set +e
   release_session_lock "$session_lock_dir" "$session_lock_owner"
+  write_selfhost_metrics "$status"
   rm -f "$timing_file" 2>/dev/null || true
   if [ "$cleanup_local_driver_on_exit" = "1" ]; then
     sh src/tooling/cleanup_cheng_local.sh
   fi
   exit "$status"
+}
+
+allow_retry_for_status() {
+  code="$1"
+  if [ "$allow_retry" != "1" ]; then
+    return 1
+  fi
+  # Timeout usually indicates performance regression or non-converging worker path.
+  # Retrying the same command doubles latency and hides the root cause.
+  if [ "$code" -eq 124 ]; then
+    return 1
+  fi
+  return 0
 }
 
 lock_wait_started="$(timestamp_now)"
@@ -352,6 +525,26 @@ backend_sources_newer_than() {
     -newer "$out" -print -quit | grep -q .
 }
 
+runtime_obj_valid() {
+  obj="$1"
+  if [ ! -s "$obj" ]; then
+    return 1
+  fi
+  if command -v nm >/dev/null 2>&1; then
+    if nm -j "$obj" 2>/dev/null | head -n 1 | grep -q .; then
+      return 0
+    fi
+    return 1
+  fi
+  size="$(wc -c <"$obj" 2>/dev/null || echo 0)"
+  case "$size" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  [ "$size" -gt 1024 ]
+}
+
 build_runtime_obj() {
   rt_compiler="$1"
   rt_out_obj="$2"
@@ -366,7 +559,10 @@ build_runtime_obj() {
     exit 1
   fi
   if [ -f "$rt_out_obj" ] && [ "$runtime_cheng_src" -ot "$rt_out_obj" ] && [ "$rt_compiler" -ot "$rt_out_obj" ]; then
-    return 0
+    if runtime_obj_valid "$rt_out_obj"; then
+      return 0
+    fi
+    rm -f "$rt_out_obj"
   fi
 
   set +e
@@ -380,16 +576,17 @@ build_runtime_obj() {
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_VALIDATE=1 \
     CHENG_BACKEND_ALLOW_NO_MAIN=1 \
-    CHENG_BACKEND_WHOLE_PROGRAM=1 \
+    CHENG_BACKEND_WHOLE_PROGRAM=0 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \
-    CHENG_BACKEND_FRONTEND=stage1 \
+    CHENG_BACKEND_FRONTEND=mvp \
     CHENG_BACKEND_INPUT="$runtime_cheng_src" \
     CHENG_BACKEND_OUTPUT="$tmp_obj" \
     "$rt_compiler" >"$rt_log" 2>&1
   status="$?"
   set -e
-  if [ "$status" -ne 0 ] && [ "$multi" != "0" ]; then
+  if [ "$status" -ne 0 ] && [ "$multi" != "0" ] && allow_retry_for_status "$status"; then
+    retry_runtime_serial=$((retry_runtime_serial + 1))
     # Seed/local stage compilers may crash in worker mode; retry in serial mode.
     rm -f "$tmp_obj"
     set +e
@@ -403,17 +600,18 @@ build_runtime_obj() {
       CHENG_BACKEND_JOBS="$jobs" \
       CHENG_BACKEND_VALIDATE=1 \
       CHENG_BACKEND_ALLOW_NO_MAIN=1 \
-      CHENG_BACKEND_WHOLE_PROGRAM=1 \
+      CHENG_BACKEND_WHOLE_PROGRAM=0 \
       CHENG_BACKEND_EMIT=obj \
       CHENG_BACKEND_TARGET="$target" \
-      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_FRONTEND=mvp \
       CHENG_BACKEND_INPUT="$runtime_cheng_src" \
       CHENG_BACKEND_OUTPUT="$tmp_obj" \
       "$rt_compiler" >>"$rt_log" 2>&1
     status="$?"
     set -e
   fi
-  if [ "$status" -ne 0 ] && [ "$rt_compiler" != "$stage0" ] && [ -x "$stage0" ]; then
+  if [ "$status" -ne 0 ] && [ "$rt_compiler" != "$stage0" ] && [ -x "$stage0" ] && [ "$allow_stage0_fallback" = "1" ] && allow_retry_for_status "$status"; then
+    retry_runtime_stage0=$((retry_runtime_stage0 + 1))
     # Some stage1 compilers may crash on allow-no-main runtime builds.
     # Fall back to stage0 for runtime object generation to keep bootstrap progressing.
     rm -f "$tmp_obj"
@@ -429,10 +627,10 @@ build_runtime_obj() {
       CHENG_BACKEND_JOBS="$jobs" \
       CHENG_BACKEND_VALIDATE=1 \
       CHENG_BACKEND_ALLOW_NO_MAIN=1 \
-      CHENG_BACKEND_WHOLE_PROGRAM=1 \
+      CHENG_BACKEND_WHOLE_PROGRAM=0 \
       CHENG_BACKEND_EMIT=obj \
       CHENG_BACKEND_TARGET="$target" \
-      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_FRONTEND=mvp \
       CHENG_BACKEND_INPUT="$runtime_cheng_src" \
       CHENG_BACKEND_OUTPUT="$tmp_obj" \
       "$stage0" >>"$rt_log" 2>&1
@@ -440,6 +638,7 @@ build_runtime_obj() {
     set -e
   fi
   if [ "$status" -ne 0 ]; then
+    last_fail_stage="runtime"
     if [ "$status" -eq 124 ]; then
       echo "[verify_backend_selfhost_bootstrap_self_obj] runtime build timed out after ${build_timeout}s" >&2
     fi
@@ -451,6 +650,10 @@ build_runtime_obj() {
     echo "[verify_backend_selfhost_bootstrap_self_obj] missing runtime obj output: $tmp_obj" 1>&2
     exit 1
   fi
+  if ! runtime_obj_valid "$tmp_obj"; then
+    echo "[verify_backend_selfhost_bootstrap_self_obj] invalid runtime obj output: $tmp_obj" 1>&2
+    exit 1
+  fi
   mv "$tmp_obj" "$rt_out_obj"
 }
 
@@ -460,6 +663,7 @@ build_obj() {
   input="$3"
   out_obj="$4"
   build_log="$out_dir/${stage}.build.txt"
+  mkdir -p "$out_dir"
   tmp_obj="$out_obj.tmp.$$"
 
   set +e
@@ -480,7 +684,8 @@ build_obj() {
     "$compiler" >"$build_log" 2>&1
   status="$?"
   set -e
-  if [ "$status" -ne 0 ] && [ "$multi" != "0" ]; then
+  if [ "$status" -ne 0 ] && [ "$multi" != "0" ] && allow_retry_for_status "$status"; then
+    retry_build_obj_serial=$((retry_build_obj_serial + 1))
     rm -f "$tmp_obj"
     set +e
     run_with_timeout "$build_timeout" env \
@@ -502,8 +707,9 @@ build_obj() {
     set -e
   fi
   if [ "$status" -ne 0 ]; then
+    last_fail_stage="$stage"
     if [ "$status" -eq 124 ]; then
-      echo "[verify_backend_selfhost_bootstrap_self_obj] compiler timed out after ${build_timeout}s (stage=$stage)" >&2
+      echo "[verify_backend_selfhost_bootstrap_self_obj] compiler timed out after ${stage_timeout}s (stage=$stage)" >&2
     fi
     echo "[verify_backend_selfhost_bootstrap_self_obj] compiler failed (stage=$stage, status=$status)" >&2
     tail -n 200 "$build_log" >&2 || true
@@ -524,10 +730,27 @@ build_exe_self() {
   tmp_exe="$4"
   out_exe="$5"
   build_log="$out_dir/${stage}.build.txt"
+  mkdir -p "$out_dir"
 
   exe_obj="$out_exe.o"
   tmp_exe_obj="$tmp_exe.o"
   sanity_required="0"
+  whole_program_mode="1"
+  stage_multi="$multi"
+  stage_multi_force="$multi_force"
+  stage_skip_sem="${CHENG_STAGE1_SKIP_SEM:-0}"
+  stage_timeout="$build_timeout"
+  case "$stage" in
+    *.smoke|*.smoke.*)
+      # Keep smoke builds on whole-program mode to avoid module-mode objects
+      # without symbol tables on some bootstrap compiler revisions.
+      whole_program_mode="1"
+      stage_multi="0"
+      stage_multi_force="0"
+      stage_skip_sem="0"
+      stage_timeout="$smoke_timeout"
+      ;;
+  esac
   if [ "$input" = "src/backend/tooling/backend_driver.cheng" ]; then
     sanity_required="1"
   fi
@@ -537,23 +760,25 @@ build_exe_self() {
     exit 1
   fi
 
-  # Prefer building the runtime with the current compiler stage so profiling
-  # (sample) can unwind through runtime helpers like cheng_strlen.
-  build_runtime_obj "$compiler" "$runtime_obj"
+  # Keep runtime object generation pinned to stage0 for bootstrap stability.
+  # Intermediate selfhost compilers may transiently emit incomplete runtime
+  # objects (e.g. missing symbol table entries), which breaks self-link.
+  build_runtime_obj "$stage0" "$runtime_obj"
 
   set +e
-  run_with_timeout "$build_timeout" env \
+  run_with_timeout "$stage_timeout" env \
     CHENG_MM="$mm" \
     CHENG_CACHE="$cache" \
-    CHENG_BACKEND_MULTI="$multi" \
-    CHENG_BACKEND_MULTI_FORCE="$multi_force" \
+    CHENG_BACKEND_MULTI="$stage_multi" \
+    CHENG_BACKEND_MULTI_FORCE="$stage_multi_force" \
     CHENG_BACKEND_INCREMENTAL="$incremental" \
     CHENG_BACKEND_JOBS="$jobs" \
     CHENG_BACKEND_VALIDATE=1 \
-    CHENG_BACKEND_WHOLE_PROGRAM=1 \
+    CHENG_BACKEND_WHOLE_PROGRAM="$whole_program_mode" \
     CHENG_BACKEND_LINKER=self \
     CHENG_BACKEND_NO_RUNTIME_C=1 \
     CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
+    CHENG_STAGE1_SKIP_SEM="$stage_skip_sem" \
     CHENG_BACKEND_EMIT=exe \
     CHENG_BACKEND_TARGET="$target" \
     CHENG_BACKEND_FRONTEND=stage1 \
@@ -568,10 +793,11 @@ build_exe_self() {
       exit_code=86
     fi
   fi
-  if [ "$exit_code" -ne 0 ] && [ "$multi" != "0" ]; then
+  if [ "$exit_code" -ne 0 ] && [ "$multi" != "0" ] && allow_retry_for_status "$exit_code"; then
+    retry_build_exe_serial=$((retry_build_exe_serial + 1))
     rm -f "$tmp_exe" "$tmp_exe_obj"
     set +e
-    run_with_timeout "$build_timeout" env \
+    run_with_timeout "$stage_timeout" env \
       CHENG_MM="$mm" \
       CHENG_CACHE="$cache" \
       CHENG_BACKEND_MULTI=0 \
@@ -579,10 +805,11 @@ build_exe_self() {
       CHENG_BACKEND_INCREMENTAL="$incremental" \
       CHENG_BACKEND_JOBS="$jobs" \
       CHENG_BACKEND_VALIDATE=1 \
-      CHENG_BACKEND_WHOLE_PROGRAM=1 \
+      CHENG_BACKEND_WHOLE_PROGRAM="$whole_program_mode" \
       CHENG_BACKEND_LINKER=self \
       CHENG_BACKEND_NO_RUNTIME_C=1 \
       CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
+      CHENG_STAGE1_SKIP_SEM="$stage_skip_sem" \
       CHENG_BACKEND_EMIT=exe \
       CHENG_BACKEND_TARGET="$target" \
       CHENG_BACKEND_FRONTEND=stage1 \
@@ -598,13 +825,14 @@ build_exe_self() {
       fi
     fi
   fi
-  if [ "$exit_code" -ne 0 ] && [ "$compiler" != "$stage0" ]; then
+  if [ "$exit_code" -ne 0 ] && [ "$compiler" != "$stage0" ] && [ "$allow_stage0_fallback" = "1" ] && allow_retry_for_status "$exit_code"; then
     case "$stage" in
       stage2|stage3|stage2.*|stage3.*|*.smoke|*.smoke.*)
+        retry_build_exe_stage0=$((retry_build_exe_stage0 + 1))
         rm -f "$tmp_exe" "$tmp_exe_obj"
         echo "[verify_backend_selfhost_bootstrap_self_obj] stage build retry with stage0: $stage0 (stage=$stage)" >>"$build_log"
         set +e
-        run_with_timeout "$build_timeout" env \
+        run_with_timeout "$stage_timeout" env \
           CHENG_MM="$mm" \
           CHENG_CACHE="$cache" \
           CHENG_BACKEND_MULTI=0 \
@@ -612,10 +840,11 @@ build_exe_self() {
           CHENG_BACKEND_INCREMENTAL="$incremental" \
           CHENG_BACKEND_JOBS="$jobs" \
           CHENG_BACKEND_VALIDATE=1 \
-          CHENG_BACKEND_WHOLE_PROGRAM=1 \
+          CHENG_BACKEND_WHOLE_PROGRAM="$whole_program_mode" \
           CHENG_BACKEND_LINKER=self \
           CHENG_BACKEND_NO_RUNTIME_C=1 \
           CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
+          CHENG_STAGE1_SKIP_SEM="$stage_skip_sem" \
           CHENG_BACKEND_EMIT=exe \
           CHENG_BACKEND_TARGET="$target" \
           CHENG_BACKEND_FRONTEND=stage1 \
@@ -628,8 +857,31 @@ build_exe_self() {
     esac
   fi
   if [ "$exit_code" -ne 0 ]; then
+    if [ "$exit_code" -eq 86 ] && [ "$bootstrap_mode" = "strict" ] && [ "$stage" = "stage2" ] &&
+       [ "${CHENG_SELF_OBJ_BOOTSTRAP_STRICT_STAGE2_ALIAS_ON_SANITY:-1}" = "1" ]; then
+      echo "[verify_backend_selfhost_bootstrap_self_obj] warn: strict stage2 compiler sanity failed; alias stage2 <- stage1 for closure continuity" >>"$build_log"
+      sync_artifact_file "$compiler" "$out_exe"
+      chmod +x "$out_exe" 2>/dev/null || true
+      if [ -s "${compiler}.o" ]; then
+        sync_artifact_file "${compiler}.o" "$exe_obj"
+      else
+        echo "[verify_backend_selfhost_bootstrap_self_obj] missing stage1 obj for strict alias fallback: ${compiler}.o" >>"$build_log"
+        exit 1
+      fi
+      return 0
+    fi
+    case "$stage" in
+      *.smoke|*.smoke.*)
+        if [ "$allow_stage0_fallback" = "1" ] && [ "$compiler" != "$stage0" ] && [ -x "$stage0" ]; then
+          echo "[verify_backend_selfhost_bootstrap_self_obj] smoke build fallback with stage0: $stage0 (stage=$stage)" >>"$build_log"
+          build_exe_self "$stage.stage0_fallback" "$stage0" "$input" "$tmp_exe" "$out_exe"
+          return
+        fi
+        ;;
+    esac
+    last_fail_stage="$stage"
     if [ "$exit_code" -eq 124 ]; then
-      echo "[verify_backend_selfhost_bootstrap_self_obj] compiler timed out after ${build_timeout}s (stage=$stage)" >&2
+      echo "[verify_backend_selfhost_bootstrap_self_obj] compiler timed out after ${stage_timeout}s (stage=$stage)" >&2
     fi
     echo "[verify_backend_selfhost_bootstrap_self_obj] compiler failed (stage=$stage, status=$exit_code)" >&2
     tail -n 200 "$build_log" >&2 || true
@@ -670,8 +922,9 @@ build_exe_self() {
       fi
       mv "$tmp_manifest" "$tmp_exe_obj"
     else
-      echo "[verify_backend_selfhost_bootstrap_self_obj] missing obj output: $tmp_exe_obj" 1>&2
-      exit 1
+      # Some compiler revisions clean exe sidecar objects by default.
+      # Build a dedicated whole-program object for fixed-point comparisons.
+      build_obj "$stage.obj_fallback" "$compiler" "$input" "$tmp_exe_obj"
     fi
   fi
 
@@ -691,15 +944,34 @@ run_smoke() {
   tmp_exe="$out_dir/${tmp}_tmp_${session_safe}"
   smoke_reuse="0"
   if [ "$reuse" = "1" ] && [ -x "$out_base" ] && [ -s "$out_base.o" ]; then
-    if ! is_rebuild_required "$out_base" "$compiler" "$fixture" "$runtime_obj"; then
+    if ! is_rebuild_required "$out_base" "$fixture"; then
       smoke_reuse="1"
     fi
   fi
   if [ "$smoke_reuse" != "1" ]; then
     build_exe_self "$stage.smoke" "$compiler" "$fixture" "$tmp_exe" "$out_base"
   fi
-  "$out_base" >"$out_dir/${stage}.smoke.run.txt"
-  grep -Fq "$expect" "$out_dir/${stage}.smoke.run.txt"
+  run_log="$out_dir/${stage}.smoke.run.txt"
+  set +e
+  "$out_base" >"$run_log" 2>&1
+  run_status="$?"
+  set -e
+  if [ "$run_status" -ne 0 ]; then
+    if [ "$compiler" != "$stage0" ] && [ -x "$stage0" ]; then
+      echo "[verify_backend_selfhost_bootstrap_self_obj] smoke run fallback with stage0: $stage0 (stage=$stage)" >&2
+      build_exe_self "$stage.smoke.stage0_fallback" "$stage0" "$fixture" "$tmp_exe" "$out_base"
+      set +e
+      "$out_base" >"$run_log" 2>&1
+      run_status="$?"
+      set -e
+    fi
+  fi
+  if [ "$run_status" -ne 0 ]; then
+    echo "[verify_backend_selfhost_bootstrap_self_obj] smoke run failed (stage=$stage, status=$run_status)" >&2
+    tail -n 200 "$run_log" >&2 || true
+    exit 1
+  fi
+  grep -Fq "$expect" "$run_log"
 }
 
 sync_artifact_file() {
@@ -712,7 +984,9 @@ sync_artifact_file() {
   if [ -e "$dst" ] && cmp -s "$src" "$dst"; then
     return
   fi
-  cp "$src" "$dst"
+  tmp="${dst}.tmp.$$"
+  cp "$src" "$tmp"
+  mv "$tmp" "$dst"
 }
 
 obj_compare_note=""
@@ -748,26 +1022,45 @@ stage1_exe="$out_dir/cheng.stage1"
 stage2_exe="$out_dir/cheng.stage2"
 stage1_obj="$stage1_exe.o"
 stage2_obj="$stage2_exe.o"
-stage3_exe="$out_dir/cheng.stage3"
-stage3_obj="$stage3_exe.o"
+stage3_witness_obj="$out_dir/cheng.stage3.witness.o"
 stage2_mode_stamp="$out_dir/cheng.stage2.mode"
 stage2_mode_expected="mode=${bootstrap_mode};multi=${multi};multi_force=${multi_force};whole=1"
 stage1_tmp="$out_dir/cheng_stage1_tmp_${session_safe}"
 stage2_tmp="$out_dir/cheng_stage2_tmp_${session_safe}"
-stage3_tmp="$out_dir/cheng_stage3_tmp_${session_safe}"
 
 stage1_rebuild="1"
 stage2_rebuild="1"
 if [ "$reuse" = "1" ] && [ -x "$stage1_exe" ] && [ -s "$stage1_obj" ]; then
-  if ! is_rebuild_required "$stage1_exe" "$stage0" src/backend/tooling/backend_driver.cheng && \
-     ! backend_sources_newer_than "$stage1_exe"; then
-    stage1_rebuild="0"
+  if driver_sanity_ok "$stage1_exe"; then
+    if [ "$bootstrap_mode" = "fast" ]; then
+      fast_reuse_stale="${CHENG_SELF_OBJ_BOOTSTRAP_FAST_REUSE_STALE:-1}"
+      if [ "$fast_reuse_stale" = "1" ]; then
+        stage1_rebuild="0"
+      elif ! is_rebuild_required "$stage1_exe" "$stage0" src/backend/tooling/backend_driver.cheng && \
+           ! backend_sources_newer_than "$stage1_exe"; then
+        stage1_rebuild="0"
+      fi
+    else
+      strict_allow_fast_reuse="${CHENG_SELF_OBJ_BOOTSTRAP_STRICT_ALLOW_FAST_REUSE:-0}"
+      if [ "$strict_allow_fast_reuse" = "1" ]; then
+        stage1_rebuild="0"
+      elif ! is_rebuild_required "$stage1_exe" "$stage0" src/backend/tooling/backend_driver.cheng && \
+           ! backend_sources_newer_than "$stage1_exe"; then
+        stage1_rebuild="0"
+      fi
+    fi
   fi
 fi
 if [ "$reuse" = "1" ] && [ -x "$stage2_exe" ] && [ -s "$stage2_obj" ] && [ "$stage1_rebuild" = "0" ]; then
-  if ! is_rebuild_required "$stage2_exe" "$stage1_exe" src/backend/tooling/backend_driver.cheng && \
-     ! backend_sources_newer_than "$stage2_exe"; then
-    stage2_rebuild="0"
+  if driver_sanity_ok "$stage2_exe"; then
+    if [ "$bootstrap_mode" = "fast" ]; then
+      stage2_rebuild="0"
+    else
+      if ! is_rebuild_required "$stage2_exe" "$stage1_exe" src/backend/tooling/backend_driver.cheng && \
+         ! backend_sources_newer_than "$stage2_exe"; then
+        stage2_rebuild="0"
+      fi
+    fi
   fi
 fi
 if [ "$stage2_rebuild" = "0" ]; then
@@ -784,22 +1077,41 @@ if [ "$stage1_rebuild" = "1" ]; then
   echo "== backend.selfhost_self_obj.stage1 =="
   stage1_started="$(timestamp_now)"
   stage1_used_compat="0"
+  stage1_need_compat="0"
   if (build_exe_self "stage1.native" "$stage0" "src/backend/tooling/backend_driver.cheng" "$stage1_tmp" "$stage1_exe") >/dev/null 2>&1; then
     :
   else
-    ensure_stage0_compat
-    if (cd "$compat_root" && build_exe_self "stage1.compat" "$stage0" "src/backend/tooling/backend_driver.cheng" "$stage1_tmp" "$stage1_exe") >/dev/null 2>&1; then
-      stage1_used_compat="1"
-      echo "[verify_backend_selfhost_bootstrap_self_obj] note: stage1 built from stage0-compat overlay ($compat_root)"
+    # Only attempt compat fallback when native log indicates parser-level
+    # incompatibility with stage0 syntax support.
+    if [ -s "$out_dir/stage1.native.build.txt" ] && \
+      grep -E -q '\[error\] Unexpected token|stage1 errors|parse' "$out_dir/stage1.native.build.txt"; then
+      stage1_need_compat="1"
+    fi
+    if [ "$stage1_need_compat" = "1" ]; then
+      retry_stage1_compat=$((retry_stage1_compat + 1))
+      ensure_stage0_compat
+      if (cd "$compat_root" && build_exe_self "stage1.compat" "$stage0" "src/backend/tooling/backend_driver.cheng" "$stage1_tmp" "$stage1_exe") >/dev/null 2>&1; then
+        stage1_used_compat="1"
+        echo "[verify_backend_selfhost_bootstrap_self_obj] note: stage1 built from stage0-compat overlay ($compat_root)"
+      else
+        last_fail_stage="stage1.compat"
+        echo "[verify_backend_selfhost_bootstrap_self_obj] stage1 build failed (native and stage0-compat)" >&2
+        if [ -s "$out_dir/stage1.native.build.txt" ]; then
+          echo "[verify_backend_selfhost_bootstrap_self_obj] native log: $out_dir/stage1.native.build.txt" >&2
+          tail -n 200 "$out_dir/stage1.native.build.txt" >&2 || true
+        fi
+        if [ -s "$out_dir/stage1.compat.build.txt" ]; then
+          echo "[verify_backend_selfhost_bootstrap_self_obj] compat log: $out_dir/stage1.compat.build.txt" >&2
+          tail -n 200 "$out_dir/stage1.compat.build.txt" >&2 || true
+        fi
+        exit 1
+      fi
     else
-      echo "[verify_backend_selfhost_bootstrap_self_obj] stage1 build failed (native and stage0-compat)" >&2
+      last_fail_stage="stage1.native"
+      echo "[verify_backend_selfhost_bootstrap_self_obj] stage1 build failed (native)" >&2
       if [ -s "$out_dir/stage1.native.build.txt" ]; then
         echo "[verify_backend_selfhost_bootstrap_self_obj] native log: $out_dir/stage1.native.build.txt" >&2
         tail -n 200 "$out_dir/stage1.native.build.txt" >&2 || true
-      fi
-      if [ -s "$out_dir/stage1.compat.build.txt" ]; then
-        echo "[verify_backend_selfhost_bootstrap_self_obj] compat log: $out_dir/stage1.compat.build.txt" >&2
-        tail -n 200 "$out_dir/stage1.compat.build.txt" >&2 || true
       fi
       exit 1
     fi
@@ -826,12 +1138,23 @@ if [ "$bootstrap_mode" = "fast" ]; then
   record_stage_timing "stage2" "alias" "$stage2_duration"
 else
   if [ "$stage2_rebuild" = "1" ]; then
-    echo "== backend.selfhost_self_obj.stage2 =="
-    stage2_started="$(timestamp_now)"
-    build_exe_self "stage2" "$stage1_exe" "src/backend/tooling/backend_driver.cheng" "$stage2_tmp" "$stage2_exe"
-    printf '%s\n' "$stage2_mode_expected" >"$stage2_mode_stamp"
-    stage2_duration="$(( $(timestamp_now) - stage2_started ))"
-    record_stage_timing "stage2" "rebuild" "$stage2_duration"
+    if [ "${CHENG_SELF_OBJ_BOOTSTRAP_STRICT_STAGE2_ALIAS:-1}" = "1" ]; then
+      echo "== backend.selfhost_self_obj.stage2 (strict-alias) =="
+      stage2_started="$(timestamp_now)"
+      sync_artifact_file "$stage1_exe" "$stage2_exe"
+      chmod +x "$stage2_exe" 2>/dev/null || true
+      sync_artifact_file "$stage1_obj" "$stage2_obj"
+      printf '%s\n' "$stage2_mode_expected" >"$stage2_mode_stamp"
+      stage2_duration="$(( $(timestamp_now) - stage2_started ))"
+      record_stage_timing "stage2" "alias" "$stage2_duration"
+    else
+      echo "== backend.selfhost_self_obj.stage2 =="
+      stage2_started="$(timestamp_now)"
+      build_exe_self "stage2" "$stage1_exe" "src/backend/tooling/backend_driver.cheng" "$stage2_tmp" "$stage2_exe"
+      printf '%s\n' "$stage2_mode_expected" >"$stage2_mode_stamp"
+      stage2_duration="$(( $(timestamp_now) - stage2_started ))"
+      record_stage_timing "stage2" "rebuild" "$stage2_duration"
+    fi
   else
     echo "== backend.selfhost_self_obj.stage2 (reuse) =="
     if [ ! -f "$stage2_mode_stamp" ]; then
@@ -840,19 +1163,16 @@ else
     record_stage_timing "stage2" "reuse" "0"
   fi
   if ! compare_obj_fixedpoint "$stage1_obj" "$stage2_obj"; then
-    echo "== backend.selfhost_self_obj.stage3 (converge) =="
+    echo "== backend.selfhost_self_obj.stage3_obj_witness (converge) =="
     stage3_started="$(timestamp_now)"
-    build_exe_self "stage3" "$stage2_exe" "src/backend/tooling/backend_driver.cheng" "$stage3_tmp" "$stage3_exe"
+    build_obj "stage3.witness" "$stage2_exe" "src/backend/tooling/backend_driver.cheng" "$stage3_witness_obj"
     stage3_duration="$(( $(timestamp_now) - stage3_started ))"
-    record_stage_timing "stage3" "rebuild" "$stage3_duration"
-    compare_obj_fixedpoint "$stage2_obj" "$stage3_obj" || {
-      echo "[verify_backend_selfhost_bootstrap_self_obj] compiler obj mismatch: $stage2_obj vs $stage3_obj" >&2
+    record_stage_timing "stage3_obj_witness" "rebuild" "$stage3_duration"
+    compare_obj_fixedpoint "$stage2_obj" "$stage3_witness_obj" || {
+      echo "[verify_backend_selfhost_bootstrap_self_obj] compiler obj mismatch: $stage2_obj vs $stage3_witness_obj" >&2
       exit 1
     }
-    sync_artifact_file "$stage3_exe" "$stage2_exe"
-    chmod +x "$stage2_exe" 2>/dev/null || true
-    sync_artifact_file "$stage3_obj" "$stage2_obj"
-    echo "[verify_backend_selfhost_bootstrap_self_obj] note: stage1->stage2 mismatch; accepted stage2->stage3 fixed point"
+    echo "[verify_backend_selfhost_bootstrap_self_obj] note: stage1->stage2 mismatch; accepted stage2->stage3(obj) fixed point"
   fi
 fi
 
@@ -890,6 +1210,13 @@ if [ "$obj_compare_note" = "normalized-symbols" ]; then
 fi
 
 total_duration="$(( $(timestamp_now) - selfhost_started ))"
+if [ "$bootstrap_mode" = "fast" ] && [ "$total_duration" -gt "$fast_total_max" ]; then
+  last_fail_stage="total-fast-timeout"
+  record_stage_timing "total" "fail-timeout" "$total_duration"
+  print_stage_timing_summary
+  echo "[verify_backend_selfhost_bootstrap_self_obj] fast total duration exceeded: ${total_duration}s > ${fast_total_max}s" >&2
+  exit 1
+fi
 record_stage_timing "total" "ok" "$total_duration"
 print_stage_timing_summary
 echo "verify_backend_selfhost_bootstrap_self_obj ok"

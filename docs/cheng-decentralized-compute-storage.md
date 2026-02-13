@@ -46,7 +46,7 @@
 
 ### A1.1 源码直发（no-copy）
 - **发布模式**：包不打包，直接发布源码清单（manifest），manifest 仅包含 `path/cid/size` 与 `source_addrs`。
-- **只读接口**：包作者运行 `cheng_pkg_source serve`，以 libp2p 协议 `/cheng/pkg-source/1.0.0` 提供只读拉取。
+- **只读接口**：`cheng_pkg_source serve` 的 p2p 服务能力已从 core binary 移出，需使用 p2p 专项工具链；core binary 当前仅保留 local-only manifest/publish/fetch。
 - **锁文件标记**：`format = "source"` 表示依赖为源码直发；未标记默认 `tar`。
 - **客户端拉取**：`cheng_pkg_fetch.sh` 遇到 `format=source` 使用 `cheng_pkg_source fetch` 拉取源码到 `chengcache/packages/<cid>/`。
 - **no-copy 的边界**：no-copy 代表“发布与分发策略”，而非物理上只有一份副本；可用访问控制/加密或远程执行保证不可分发。
@@ -573,8 +573,8 @@ sh src/tooling/cheng_pkg_publish.sh --src:/Users/lbcheng/.cheng-packages/cheng-l
 
 源码只读服务：
 ```bash
-./cheng_pkg_source serve --src:/Users/lbcheng/.cheng-packages/cheng-libp2p --manifest:<manifest-cid> \
-  --listen:/ip4/127.0.0.1/tcp/4005
+# 注：`cheng_pkg_source serve` 已移出 core binary（local-only），
+# 该示例需使用 p2p 专项工具链对应的 source serve 命令。
 ```
 
 2) 解析依赖并生成 lock：

@@ -10,7 +10,7 @@
 
 ### 0.1 ORC/Ownership 闭环规则
 
-- 内存模型开关：`CHENG_MM=orc|off`（默认 `orc`）；ORC **默认严格模式**（只读 ownership 标注，不回退启发式），可用 `CHENG_MM_STRICT=0` 关闭或 `CHENG_MM_STRICT=1` 强制开启。
+- 内存模型开关：`CHENG_MM=orc`（固定）；ORC **默认严格模式**（只读 ownership 标注，不回退启发式），可用 `CHENG_MM_STRICT=0` 关闭或 `CHENG_MM_STRICT=1` 强制开启。
 - Ownership v1 输出：
   - `exprClass`：`Owned`（新值/构造/非借用调用）、`Borrowed`（ident/field/index/借用视图调用）、`Unmanaged`（数值/布尔/空值等）。
   - `moveHint`：`MoveFromIdent(name)`（同一语句列表内 last-use move；**同一作用域存在任意 `defer` 引用该 ident 时不标记 move**；pattern/复杂 LHS 走保守路径；**若 RHS 标识符在外层语句列表后续仍使用（如 if/loop 之后）则不标记 move**；循环体内仅对非 loop‑carried 标识符启用 move，loop‑carried 包括循环条件/迭代表达式使用的标识符与迭代内“先用后定义”的标识符）。
@@ -55,7 +55,7 @@
 - 可复现构建：固定编译器版本与依赖；产物随附 build hash、`CHENG_MM` 配置与 backend driver 版本信息。
 - CI gating：全量跑 `bootstrap.sh --fullspec`/`bootstrap_pure.sh --fullspec`；ORC/escape 回归用例必须通过且计数一致。
 - 发布包组成：`cheng`（backend driver）、`cheng.stage2` seed、`cheng-formal-spec.md` 对应版本号与验收 hash。
-- 回滚策略：严格模式默认启用；异常时允许 `CHENG_MM=off` 退化；保留 `CHENG_MM_DIAG` 作为线上诊断开关。
+- 回滚策略：严格模式默认启用；不再支持 `CHENG_MM=off` 退化；保留 `CHENG_MM_DIAG` 作为线上诊断开关。
 - 生产观测：按需启用 retain/release/escape 计数与日志；发布后进行计数基线对比与异常告警。
 
 #### 0.1.4 构建与缓存一致性（生产约束）
@@ -735,7 +735,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - MVP 现状：MIR 采用表达式树 + `ret/br/cbr` 终结指令，LIR 覆盖 AArch64 基本算术/比较/分支/栈操作；`mod` 以 `sdiv+msub` 降级。
 - 验证入口：`src/tooling/verify_backend_mvp.sh` 负责生成 `.s/.o` 并链接执行最小闭环样例。
 - 跨平台矩阵（可验收）：`src/tooling/verify_backend_targets_matrix.sh` 覆盖 darwin/ios(Mach‑O `.o`) + android/linux(ELF `.o`) + windows(COFF `.obj`)。
-- 全语义回归入口：`src/tooling/verify_backend_closedloop.sh` 会使用后端 driver（默认 `./cheng`；可用 `CHENG_BACKEND_DRIVER=<path>` 指定）编译并运行 `examples/stage1_codegen_fullspec.cheng`，要求 stdout 包含 `fullspec ok`（默认 `CHENG_MM=orc`；可用 `CHENG_BACKEND_MM=off` 显式降级排障；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；当前以 macOS ARM64 为主，非“全平台”闭环）。
+- 全语义回归入口：`src/tooling/verify_backend_closedloop.sh` 会使用后端 driver（默认 `artifacts/backend_driver/cheng`，兼容回退 `./cheng`；可用 `CHENG_BACKEND_DRIVER=<path>` 指定）编译并运行 `examples/stage1_codegen_fullspec.cheng`，要求 stdout 包含 `fullspec ok`（默认并固定 `CHENG_MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；当前以 macOS ARM64 为主，非“全平台”闭环）。
 - 除平台生产闭环入口：`src/tooling/backend_prod_closure.sh`（默认启用 `CHENG_BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256）、stress 与 mm 回归；默认包含后端 selfhost（产出 stage2）与全链自举（可用 `--no-fullchain` 跳过）；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。当前生产闭环仅支持 `CHENG_ABI=v2_noptr`，并在主闭环中默认执行 `backend.spawn_api_gate` 与 `backend.abi_v2_noptr` 专项门禁。
 - 全链自举门禁：`src/tooling/verify_fullchain_bootstrap.sh`（stage2→tools；obj-only fullspec + 工具 `--help` smoke）。
 - 本地发布/回滚：`src/tooling/backend_prod_publish.sh`（验收后发布到 `dist/releases`），`src/tooling/backend_release_rollback.sh`（切换 `dist/releases/current` 回滚）。

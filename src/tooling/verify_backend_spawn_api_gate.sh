@@ -98,8 +98,11 @@ compile_ok() {
   set +e
   run_with_timeout "$timeout_s" env \
     CHENG_MM=orc \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
     CHENG_STAGE1_SKIP_SEM=0 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE=dict \
+    CHENG_GENERIC_SPEC_BUDGET=0 \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \
@@ -133,8 +136,11 @@ compile_fail() {
   set +e
   run_with_timeout "$timeout_s" env \
     CHENG_MM=orc \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
     CHENG_STAGE1_SKIP_SEM=0 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE=dict \
+    CHENG_GENERIC_SPEC_BUDGET=0 \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$target" \

@@ -341,7 +341,7 @@ fn semReadNode(seqInst: Node[], idx: int32): Node =
         return nil
     return seqInst[idx]
 
-fn semNodeVisited(nodes: Node[], target: Node): bool =
+fn semNodeVisited(nodes: var Node[], target: Node): bool =
     if target == nil:
         return false
     for i in 0..<nodes.len:
@@ -585,7 +585,7 @@ fn semIsStdPointerPolicyExempt(path: str): bool =
     if path == nil || len path == 0:
         return false
     let strictStdNoPointer: bool = semStrEq(getEnv "CHENG_STAGE1_STD_NO_POINTERS_STRICT", "1")
-    if strictStdNoPointer || semShouldEnforceStdNoPointer():
+    if strictStdNoPointer:
         return false
     if strContains(path, "src/std/system_helpers_backend.cheng"):
         return true
@@ -718,10 +718,9 @@ fn semPointerPolicyShouldCheckNonCAbi(path: str): bool =
         return false
     if semIsGeneratedModule(path):
         return false
-    # Transitional exemption: compiler implementation still contains internal
-    # pointer-heavy paths and is migrated incrementally.
-    # Set CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1 to enforce on stage1/backend/tooling too.
-    let strictInternal: bool = semStrEq(getEnv "CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL", "1")
+    # Default enforces internal modules too; set =0 only for temporary bootstrap compatibility.
+    let strictInternalRaw: str = getEnv "CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL"
+    let strictInternal: bool = !semStrEq(strictInternalRaw, "0")
     if !strictInternal && semIsCompilerInternalModulePath(path):
         return false
     if semIsCAbiBridgeModulePath(path):
@@ -1075,7 +1074,7 @@ fn semExprIsSend(ctx: var SemCtx, n: Node): bool =
                 res = false
                 break
     of nkCall:
-        let callInfo: tuple[name: str, base: Node] = semCallInfoNormalized(n)
+        let callInfo: SemCallInfo = semCallInfoNormalized(n)
         let callName: str = callInfo.name
         if callName != "":
             if semIsSendCtorCallName(callName):
@@ -1152,14 +1151,29 @@ fn semIsBorrowEscapeNameNormalized(ctx: var SemCtx, nm: str): bool =
     let idx: int32 = hashmaps.hashMapStrIntGetEx(ctx.borrowEscapeIndex, nm, found)
     return found && idx > 0
 
+fn semNameHasQualifiedTail(nm: str, tail: str): bool =
+    if nm == "" || tail == "":
+        return false
+    let n: int32 = len(nm)
+    let t: int32 = len(tail)
+    if n <= t:
+        return false
+    let dotIdx: int32 = n - t - 1
+    if dotIdx < 0 || nm[dotIdx] != '.':
+        return false
+    for i in 0..<t:
+        if nm[n - t + i] != tail[i]:
+            return false
+    return true
+
 fn semIsThreadBoundaryRequiredNameNormalized(nm: str): bool =
     if nm == "":
         return false
-    if nm ==  "spawn":
+    if nm ==  "spawn" || semNameHasQualifiedTail(nm, "spawn"):
         return true
-    if nm ==  "chanI32Send":
+    if nm ==  "chanI32Send" || semNameHasQualifiedTail(nm, "chanI32Send"):
         return true
-    if nm ==  "chanI32Recv":
+    if nm ==  "chanI32Recv" || semNameHasQualifiedTail(nm, "chanI32Recv"):
         return true
     return false
 
@@ -1696,6 +1710,11 @@ fn semBorrowMarkPatternWithOrigin(ctx: var SemCtx, pat: Node, origin: str) =
             semBorrowMarkPatternWithOrigin(ctx, kid(pat, 0), origin)
     else:
         return
+
+type SemCallInfo = object
+    name: str
+    base: Node
+
 fn semCallBaseName(n: Node): str =
     if n == nil || n.kind != nkCall || kidCount n == 0:
         return ""
@@ -1707,11 +1726,11 @@ fn semCallBaseName(n: Node): str =
 fn semCallName(n: Node): str =
     if n == nil || n.kind != nkCall || kidCount n == 0:
         return ""
-    let info: tuple[name: str, base: Node] = semCallInfoNormalized(n)
+    let info: SemCallInfo = semCallInfoNormalized(n)
     return info.name
 
-fn semCallInfoNormalized(n: Node): tuple[name: str, base: Node] =
-    var info: tuple[name: str, base: Node]
+fn semCallInfoNormalized(n: Node): SemCallInfo =
+    var info: SemCallInfo
     info.name = ""
     info.base = nil
     if n == nil || n.kind != nkCall || kidCount n == 0:
@@ -1826,7 +1845,7 @@ fn semCheckStdNoPointerPolicy(ctx: var SemCtx, root: Node): int32 =
             elif n.kind == nkHiddenDeref || n.kind == nkDerefExpr:
                 msg = "std policy: pointer dereference is forbidden in standard library"
             elif n.kind == nkCall:
-                let callInfo: tuple[name: str, base: Node] = semCallInfoNormalized(n)
+                let callInfo: SemCallInfo = semCallInfoNormalized(n)
                 let callName: str = callInfo.name
                 if semIsStdPointerOpCallNameNormalized(callName):
                     msg = "std policy: pointer operation is forbidden in standard library: " + callName
@@ -1877,14 +1896,14 @@ fn semCheckNoPointerNonCAbiPolicy(ctx: var SemCtx, root: Node): int32 =
         var policyFile: str = fileName
         if !semLooksLikeModulePath(policyFile):
             policyFile = ctx.filename
-        if semStrEq(policyFile, ctx.filename) && semPointerPolicyShouldCheckNonCAbi(policyFile):
+        if semPointerPolicyShouldCheckNonCAbi(policyFile):
             var msg: str = ""
             if semIsPtrLikeTypeNode(n):
                 msg = "no-pointer policy: pointer types are forbidden outside C ABI modules"
             elif n.kind == nkHiddenDeref || n.kind == nkDerefExpr:
                 msg = "no-pointer policy: pointer dereference is forbidden outside C ABI modules"
             elif n.kind == nkCall:
-                let callInfo: tuple[name: str, base: Node] = semCallInfoNormalized(n)
+                let callInfo: SemCallInfo = semCallInfoNormalized(n)
                 let callName: str = callInfo.name
                 if semIsStdPointerOpCallNameNormalized(callName):
                     msg = "no-pointer policy: pointer operation is forbidden outside C ABI modules: " + callName
@@ -2451,7 +2470,7 @@ fn semExprIsSpawnEntry(ctx: var SemCtx, n0: Node): bool =
                 return semFnSigFindNormalized(ctx, innerName) >= 0
             return false
     if n.kind == nkCall:
-        let callInfo: tuple[name: str, base: Node] = semCallInfoNormalized(n)
+        let callInfo: SemCallInfo = semCallInfoNormalized(n)
         if callInfo.name == "__addr" && kidCount(n) > 1:
             let inner2: Node = semCallArgValue(kid(n, 1))
             if inner2 != nil && (inner2.kind == nkIdent || inner2.kind == nkSymbol):
@@ -2483,14 +2502,20 @@ fn semCallArgHasName(argNode: Node): bool =
     return semCallArgNameNormalized(argNode) != ""
 
 fn semThreadBoundarySkipArg(name: str, argNode: Node, posIdx: int32): bool =
-    if name != "spawn" || argNode == nil:
+    if !semIsThreadBoundaryRequiredNameNormalized(name) || argNode == nil:
         return false
+    if !(name == "spawn" || semNameHasQualifiedTail(name, "spawn")):
+        return false
+    # Spawn entry is always the first logical argument even if parser lowering
+    # materializes it as a call-arg node with a synthetic name slot.
+    if posIdx == 0:
+        return true
     if semCallArgHasName(argNode):
         let argNameNm: str = semCallArgNameNormalized(argNode)
         if argNameNm == "entry":
             return true
         return false
-    return posIdx == 0
+    return false
 
 fn semCheckThreadBoundaryCall(ctx: var SemCtx, callNode: Node, callName: str, baseArg: Node) =
     if callNode == nil || callNode.kind != nkCall:
@@ -3143,14 +3168,14 @@ fn semAnalyzeExprWithCtx(ctx: var SemCtx, expr: Node, allowEmptySeq: bool) =
         var baseArg: Node = nil
         if profKindOn:
             let nameStartNs: int64 = cheng_monotime_ns()
-            let callInfo: tuple[name: str, base: Node] = semCallInfoNormalized(expr)
+            let callInfo: SemCallInfo = semCallInfoNormalized(expr)
             callName = callInfo.name
             baseArg = callInfo.base
             let nameDelta: int64 = cheng_monotime_ns() - nameStartNs
             semProfCallNameNs = semProfCallNameNs + (nameDelta * int64(semProfExprSampleMul))
             semProfCallNameCalls = semProfCallNameCalls + semProfExprSampleMul
         else:
-            let callInfo: tuple[name: str, base: Node] = semCallInfoNormalized(expr)
+            let callInfo: SemCallInfo = semCallInfoNormalized(expr)
             callName = callInfo.name
             baseArg = callInfo.base
         if callName == "cast":

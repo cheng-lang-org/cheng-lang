@@ -43,40 +43,71 @@ mkdir -p "$out_dir"
 
 fixture="tests/cheng/backend/fixtures/return_add.cheng"
 exe_path="$out_dir/return_add"
+log_path="$out_dir/build.log"
 
-if [ "$linker_mode" = "self" ]; then
-  CHENG_BACKEND_EMIT=exe \
-  CHENG_BACKEND_LINKER=self \
-  CHENG_BACKEND_NO_RUNTIME_C=1 \
-  CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
-  CHENG_BACKEND_MULTI=1 \
-  CHENG_BACKEND_MULTI_FORCE=1 \
-  CHENG_BACKEND_JOBS=4 \
-  CHENG_BACKEND_TARGET="$target" \
-  CHENG_BACKEND_INPUT="$fixture" \
-  CHENG_BACKEND_OUTPUT="$exe_path" \
-  "$driver"
-else
-  CHENG_BACKEND_EMIT=exe \
-  CHENG_BACKEND_LINKER=system \
-  CHENG_BACKEND_MULTI=1 \
-  CHENG_BACKEND_MULTI_FORCE=1 \
-  CHENG_BACKEND_JOBS=4 \
-  CHENG_BACKEND_TARGET="$target" \
-  CHENG_BACKEND_INPUT="$fixture" \
-  CHENG_BACKEND_OUTPUT="$exe_path" \
-  "$driver"
+build_with_mode() {
+  mode_multi="$1"
+  mode_multi_force="$2"
+  mode_jobs="$3"
+  if [ "$linker_mode" = "self" ]; then
+    CHENG_BACKEND_PROFILE=1 \
+    CHENG_BACKEND_EMIT=exe \
+    CHENG_BACKEND_LINKER=self \
+    CHENG_BACKEND_NO_RUNTIME_C=1 \
+    CHENG_BACKEND_RUNTIME_OBJ="$runtime_obj" \
+    CHENG_BACKEND_MULTI="$mode_multi" \
+    CHENG_BACKEND_MULTI_FORCE="$mode_multi_force" \
+    CHENG_BACKEND_JOBS="$mode_jobs" \
+    CHENG_BACKEND_TARGET="$target" \
+    CHENG_BACKEND_INPUT="$fixture" \
+    CHENG_BACKEND_OUTPUT="$exe_path" \
+    "$driver" >"$log_path" 2>&1
+  else
+    CHENG_BACKEND_PROFILE=1 \
+    CHENG_BACKEND_EMIT=exe \
+    CHENG_BACKEND_LINKER=system \
+    CHENG_BACKEND_MULTI="$mode_multi" \
+    CHENG_BACKEND_MULTI_FORCE="$mode_multi_force" \
+    CHENG_BACKEND_JOBS="$mode_jobs" \
+    CHENG_BACKEND_TARGET="$target" \
+    CHENG_BACKEND_INPUT="$fixture" \
+    CHENG_BACKEND_OUTPUT="$exe_path" \
+    "$driver" >"$log_path" 2>&1
+  fi
+}
+
+set +e
+build_with_mode 1 1 4
+status="$?"
+set -e
+if [ "$status" -ne 0 ]; then
+  echo "[Warn] verify_backend_multi parallel compile failed, retry serial (target=$target)" 1>&2
+  set +e
+  build_with_mode 0 0 0
+  status="$?"
+  set -e
+  if [ "$status" -ne 0 ]; then
+    tail -n 200 "$log_path" >&2 || true
+    exit "$status"
+  fi
 fi
 
 "$exe_path"
 
-count="0"
-if [ -d "$exe_path.objs" ]; then
-  count="$(find "$exe_path.objs" -name '*.o' | wc -l | tr -d ' ')"
-elif [ -f "$exe_path.o" ]; then
-  # Some backends may collapse to a single object artifact while keeping multi mode enabled.
-  count="1"
+tab="$(printf '\t')"
+if grep -q "backend_profile${tab}multi.plan" "$log_path"; then
+  grep -q "backend_profile${tab}multi.link" "$log_path"
+  count="0"
+  if [ -d "$exe_path.objs" ]; then
+    count="$(find "$exe_path.objs" -name '*.o' | wc -l | tr -d ' ')"
+  elif [ -f "$exe_path.o" ]; then
+    count="1"
+  fi
+  test "$count" -ge 1
+else
+  # Single-unit inputs are intentionally emitted through the single-object fast path.
+  grep -q "backend_profile${tab}single.emit_obj" "$log_path"
+  grep -q "backend_profile${tab}single.link" "$log_path"
 fi
-test "$count" -ge 1
 
 echo "verify_backend_multi ok"

@@ -47,6 +47,11 @@ type
         rc: int32
         _pad: int32
 
+    ChengSeqHeader =
+        len: int32
+        cap: int32
+        buffer: void*
+
     ChengAwaitI32 =
         status: int32
         value: int32
@@ -675,6 +680,38 @@ fn cheng_seq_get(buffer: void*, len: int32, idx: int32, elemSize: int32): void* 
 
 fn cheng_seq_set(buffer: void*, len: int32, idx: int32, elemSize: int32): void* =
     return cheng_index_ptr(buffer, len, idx, elemSize)
+
+fn cheng_seq_set_grow(seqPtr: void*, idx: int32, elemSize: int32): void* =
+    if seqPtr == nil || elemSize <= 0:
+        return cheng_index_ptr(nil, 0, idx, elemSize)
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(seqPtr)
+    if idx < 0:
+        return cheng_index_ptr(seqHdr->buffer, seqHdr->len, idx, elemSize)
+    let needLen: int32 = idx + 1
+    if needLen > seqHdr->cap || seqHdr->buffer == nil:
+        var newCap: int32 = seqHdr->cap
+        if newCap < 4:
+            newCap = 4
+        while newCap < needLen:
+            let doubled: int32 = newCap * 2
+            if doubled <= 0:
+                newCap = needLen
+                break
+            newCap = doubled
+        let oldCap: int32 = seqHdr->cap
+        let bytes: int64 = int64(newCap) * int64(elemSize)
+        let newBuf: void* = cheng_realloc(seqHdr->buffer, int32(bytes))
+        if newBuf == nil:
+            return cheng_index_ptr(seqHdr->buffer, seqHdr->len, idx, elemSize)
+        if newCap > oldCap:
+            let off: int64 = int64(oldCap) * int64(elemSize)
+            let zeroBytes: int64 = (int64(newCap) - int64(oldCap)) * int64(elemSize)
+            cheng_bytes_set(ptr_add(newBuf, int32(off)), 0, zeroBytes)
+        seqHdr->buffer = newBuf
+        seqHdr->cap = newCap
+    if needLen > seqHdr->len:
+        seqHdr->len = needLen
+    return cheng_index_ptr(seqHdr->buffer, seqHdr->len, idx, elemSize)
 
 fn cheng_slice_get(ptr: void*, len: int32, idx: int32, elemSize: int32): void* =
     return cheng_index_ptr(ptr, len, idx, elemSize)

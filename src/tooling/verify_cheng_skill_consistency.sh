@@ -15,6 +15,7 @@ fixture_cheng="tests/cheng/skill/hello_cheng_ci_sample.cheng"
 run_fixture_cheng="tests/cheng/backend/fixtures/return_add.cheng"
 skill_compile="${CHENG_SKILL_COMPILE:-1}"
 skill_run="${CHENG_SKILL_RUN:-1}"
+skill_frontend="${CHENG_SKILL_FRONTEND:-mvp}"
 
 fail() {
   echo "[verify_cheng_skill_consistency] $1" 1>&2
@@ -90,6 +91,14 @@ if [ "$skill_compile" = "1" ] && [ "$skill_run" = "1" ]; then
   require_file "$run_fixture_cheng"
 fi
 
+case "$skill_frontend" in
+  mvp|stage1)
+    ;;
+  *)
+    fail "invalid CHENG_SKILL_FRONTEND=$skill_frontend (expected mvp|stage1)"
+    ;;
+esac
+
 if ! grep -qE '^1\. .*cheng-formal-spec\.md' "$skill_md"; then
   fail "authority order missing formal spec as #1 in $skill_md"
 fi
@@ -150,9 +159,10 @@ if [ "$skill_compile" = "1" ]; then
   CHENG_MM=orc \
   CHENG_C_SYSTEM=system \
   CHENG_STAGE1_SKIP_SEM=0 \
-  CHENG_STAGE1_SKIP_MONO=1 \
+  CHENG_GENERIC_MODE=dict \
+  CHENG_GENERIC_SPEC_BUDGET=0 \
   CHENG_STAGE1_SKIP_OWNERSHIP=1 \
-  CHENG_BACKEND_FRONTEND=stage1 \
+  CHENG_BACKEND_FRONTEND="$skill_frontend" \
   CHENG_BACKEND_VALIDATE=1 \
   CHENG_BACKEND_EMIT=obj \
   CHENG_BACKEND_INPUT="$fixture_cheng" \
@@ -164,9 +174,10 @@ if [ "$skill_compile" = "1" ]; then
   CHENG_MM=orc \
   CHENG_C_SYSTEM=system \
   CHENG_STAGE1_SKIP_SEM=0 \
-  CHENG_STAGE1_SKIP_MONO=1 \
+  CHENG_GENERIC_MODE=dict \
+  CHENG_GENERIC_SPEC_BUDGET=0 \
   CHENG_STAGE1_SKIP_OWNERSHIP=1 \
-  CHENG_BACKEND_FRONTEND=stage1 \
+  CHENG_BACKEND_FRONTEND="$skill_frontend" \
   CHENG_BACKEND_VALIDATE=1 \
   CHENG_BACKEND_EMIT=exe \
   CHENG_BACKEND_INPUT="$fixture_cheng" \
@@ -185,9 +196,10 @@ if [ "$skill_compile" = "1" ]; then
     CHENG_MM=orc \
     CHENG_C_SYSTEM=system \
     CHENG_STAGE1_SKIP_SEM=0 \
-    CHENG_STAGE1_SKIP_MONO=1 \
+    CHENG_GENERIC_MODE=dict \
+    CHENG_GENERIC_SPEC_BUDGET=0 \
     CHENG_STAGE1_SKIP_OWNERSHIP=1 \
-    CHENG_BACKEND_FRONTEND=stage1 \
+    CHENG_BACKEND_FRONTEND="$skill_frontend" \
     CHENG_BACKEND_VALIDATE=1 \
     CHENG_BACKEND_EMIT=exe \
     CHENG_BACKEND_INPUT="$run_fixture_cheng" \

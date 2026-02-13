@@ -9,6 +9,28 @@ RESET_LEDGER="0"
 SETTLEMENT_BUDGET="2.0"
 RWAD_CHAIN_ROOT="${RWAD_CHAIN_ROOT:-/Users/lbcheng/.cheng-packages/RWAD-blockchain}"
 ALLOW_MISSING_RWAD="0"
+repo_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+
+resolve_chengc_bin() {
+  local name="$1"
+  case "$name" in
+    /*|*/*)
+      printf '%s\n' "$name"
+      return
+      ;;
+  esac
+  case "${CHENGC_NAME_IN_ROOT:-0}" in
+    1|true|TRUE|yes|YES|on|ON)
+      printf '%s/%s\n' "$repo_root" "$name"
+      ;;
+    *)
+      printf '%s/artifacts/chengc/%s\n' "$repo_root" "$name"
+      ;;
+  esac
+}
+
+storage_bin="$(resolve_chengc_bin cheng_storage)"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -49,7 +71,7 @@ if [ "$CLEAN" = "1" ]; then
 fi
 mkdir -p "$ROOT"
 
-if [ ! -x "./cheng_storage" ]; then
+if [ ! -x "$storage_bin" ]; then
   src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage
 fi
 
@@ -60,7 +82,7 @@ fi
 
 runtime_ok="1"
 set +e
-req_out="$(./cheng_storage exec --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --requester:node:app-1 \
+req_out="$("$storage_bin" exec --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --requester:node:app-1 \
   --gpu_ms:120000 --gpu_mem_bytes:8589934592 --gpu_count:1 --gpu_type:A10G --workload:infer \
   --price_gpu:0.00002 --price_gpu_mem:0.15 --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE" 2>/dev/null)"
 if [ $? -ne 0 ]; then
@@ -77,7 +99,7 @@ fi
 
 if [ "$runtime_ok" = "1" ]; then
   set +e
-  usage_out="$(./cheng_storage meter --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --executor:node:exec-1 \
+  usage_out="$("$storage_bin" meter --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --executor:node:exec-1 \
     --gpu_ms:110000 --gpu_mem_bytes:7516192768 --gpu_count:1 --gpu_type:A10G --workload:infer \
     --price_gpu:0.00002 --price_gpu_mem:0.15 --royalty:0.12 --treasury:0.03 \
     --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE" 2>/dev/null)"
@@ -96,7 +118,7 @@ fi
 
 if [ "$runtime_ok" = "1" ]; then
   set +e
-  rec_out="$(./cheng_storage receipt --request:"$req_id" --task:job-gpu-demo --executor:node:exec-1 --status:ok \
+  rec_out="$("$storage_bin" receipt --request:"$req_id" --task:job-gpu-demo --executor:node:exec-1 --status:ok \
     --usage:"$usage_id" --result:cid://result --epoch:"$EPOCH" --root:"$ROOT" --mode:"$MODE" 2>/dev/null)"
   if [ $? -ne 0 ]; then
     runtime_ok="0"
@@ -113,13 +135,13 @@ fi
 
 if [ "$runtime_ok" = "1" ]; then
   set +e
-  ./cheng_storage sample --root:"$ROOT" --epoch:"$EPOCH" --rate:1 --seed:demo \
+  "$storage_bin" sample --root:"$ROOT" --epoch:"$EPOCH" --rate:1 --seed:demo \
     --auditor:node:auditor-1 --record --format:toml >/dev/null 2>/dev/null
   [ $? -ne 0 ] && runtime_ok="0"
-  ./cheng_storage audit --task:job-gpu-demo --executor:node:exec-1 --auditor:node:auditor-1 --status:bad \
+  "$storage_bin" audit --task:job-gpu-demo --executor:node:exec-1 --auditor:node:auditor-1 --status:bad \
     --penalty:0.10 --epoch:"$EPOCH" --note:demo --root:"$ROOT" --mode:"$MODE" >/dev/null 2>/dev/null
   [ $? -ne 0 ] && runtime_ok="0"
-  ./cheng_storage fraud --task:job-gpu-demo --executor:node:exec-1 --reporter:node:auditor-1 \
+  "$storage_bin" fraud --task:job-gpu-demo --executor:node:exec-1 --reporter:node:auditor-1 \
     --reason:demo --epoch:"$EPOCH" --root:"$ROOT" >/dev/null 2>/dev/null
   [ $? -ne 0 ] && runtime_ok="0"
   set -e
@@ -131,7 +153,7 @@ if [ "$runtime_ok" != "1" ]; then
 fi
 
 echo "settle:"
-./cheng_storage settle --root:"$ROOT" --format:toml --top:5 --reconcile-csv:"$ROOT/settle_reconcile.csv"
+"$storage_bin" settle --root:"$ROOT" --format:toml --top:5 --reconcile-csv:"$ROOT/settle_reconcile.csv"
 
 batch_id="cheng-epoch-$EPOCH"
 sh src/tooling/cheng_rwad_bridge.sh export --root:"$ROOT" --epoch:"$EPOCH" --batch-id:"$batch_id" \

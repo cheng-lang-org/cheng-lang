@@ -6,7 +6,7 @@
 
 - Stage1 已接入 ABI 门禁：`CHENG_ABI=v2_noptr` 默认启用 std no-pointer 扫描；可用 `CHENG_STAGE1_STD_NO_POINTERS=0` 显式切到兼容口径（常用于闭环中的非专项 gate）。
 - 新增非 C ABI 门禁开关：`CHENG_STAGE1_NO_POINTERS_NON_C_ABI=1` 时，非 C ABI 对接模块会禁用指针类型与指针操作（`*`/`&`/deref/`ptr_*` 等）。
-  - 若需把编译器内部实现（`src/stage1`/`src/backend`/`src/tooling`）也纳入同一门禁，可加 `CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
+- `CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL` 默认按开启处理（仅显式设为 `0` 时放宽），因此编译器内部实现（`src/stage1`/`src/backend`/`src/tooling`）默认也纳入同一门禁。
 - 兼容开关仍保留：`CHENG_STAGE1_STD_NO_POINTERS`/`CHENG_STAGE1_STD_NO_POINTERS_STRICT` 可单独控制 std 策略；`CHENG_ABI=v1` 仅保留在兼容/对照脚本中。
 - tooling 已提供专项回归：`src/tooling/verify_backend_abi_v2_noptr.sh`（`CHENG_BACKEND_ABI_V2_NOPTR_ONLY=1` 时走 only-v2 口径；non-C-ABI 子门禁会显式设 `CHENG_STAGE1_STD_NO_POINTERS=0` 以隔离 non-C-ABI 诊断）。
 - 默认并发接口已移除 raw spawn：`src/std/async_rt.cheng` 只保留 typed spawn，raw 入口仅在 `src/std/async_rt_legacy.cheng` 显式提供。

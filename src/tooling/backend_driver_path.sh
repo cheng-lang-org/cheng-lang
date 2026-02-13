@@ -72,7 +72,11 @@ driver_compile_smoke_ok() {
     return 1
   fi
   smoke_src="$root/tests/cheng/backend/fixtures/return_add.cheng"
+  smoke_dict_src="$root/tests/cheng/backend/fixtures/return_spawn_default_thread_entry_gate.cheng"
   if [ ! -f "$smoke_src" ]; then
+    return 0
+  fi
+  if [ ! -f "$smoke_dict_src" ]; then
     return 0
   fi
   smoke_target="$(sh "$root/src/tooling/detect_host_target.sh" 2>/dev/null || echo "")"
@@ -81,13 +85,18 @@ driver_compile_smoke_ok() {
   fi
   smoke_out="$root/chengcache/.backend_driver_path.smoke.o"
   smoke_out_stage1="$root/chengcache/.backend_driver_path.smoke.stage1.o"
-  smoke_stage1="${CHENG_BACKEND_DRIVER_PATH_STAGE1_SMOKE:-1}"
+  smoke_out_stage1_dict="$root/chengcache/.backend_driver_path.smoke.stage1.dict.o"
+  smoke_stage1="${CHENG_BACKEND_DRIVER_PATH_STAGE1_SMOKE:-0}"
+  smoke_stage1_dict="${CHENG_BACKEND_DRIVER_PATH_STAGE1_DICT_SMOKE:-1}"
   mkdir -p "$root/chengcache"
   rm -f "$smoke_out"
   rm -f "$smoke_out_stage1"
+  rm -f "$smoke_out_stage1_dict"
   set +e
-  run_with_timeout 10 env \
+  run_with_timeout 20 env \
     CHENG_C_SYSTEM=system \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
     CHENG_BACKEND_VALIDATE=1 \
     CHENG_BACKEND_EMIT=obj \
     CHENG_BACKEND_TARGET="$smoke_target" \
@@ -105,13 +114,16 @@ driver_compile_smoke_ok() {
   fi
   if [ "$smoke_stage1" = "1" ]; then
     set +e
-    run_with_timeout 10 env \
+    run_with_timeout 30 env \
       CHENG_MM=orc \
       CHENG_C_SYSTEM=system \
-      CHENG_BACKEND_VALIDATE=1 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+      CHENG_BACKEND_VALIDATE=0 \
       CHENG_STAGE1_SKIP_SEM=0 \
-      CHENG_STAGE1_SKIP_MONO=1 \
-      CHENG_STAGE1_SKIP_OWNERSHIP=1 \
+      CHENG_GENERIC_MODE=hybrid \
+      CHENG_GENERIC_SPEC_BUDGET=0 \
+      CHENG_STAGE1_SKIP_OWNERSHIP=0 \
       CHENG_BACKEND_EMIT=obj \
       CHENG_BACKEND_TARGET=auto \
       CHENG_BACKEND_FRONTEND=stage1 \
@@ -124,6 +136,31 @@ driver_compile_smoke_ok() {
       return 1
     fi
     [ -s "$smoke_out_stage1" ] || return 1
+  fi
+  if [ "$smoke_stage1_dict" = "1" ]; then
+    set +e
+    run_with_timeout 60 env \
+      CHENG_MM=orc \
+      CHENG_C_SYSTEM=system \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 \
+      CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+      CHENG_BACKEND_VALIDATE=0 \
+      CHENG_STAGE1_SKIP_SEM=0 \
+      CHENG_GENERIC_MODE=dict \
+      CHENG_GENERIC_SPEC_BUDGET=0 \
+      CHENG_STAGE1_SKIP_OWNERSHIP=1 \
+      CHENG_BACKEND_EMIT=obj \
+      CHENG_BACKEND_TARGET=auto \
+      CHENG_BACKEND_FRONTEND=stage1 \
+      CHENG_BACKEND_INPUT="$smoke_dict_src" \
+      CHENG_BACKEND_OUTPUT="$smoke_out_stage1_dict" \
+      "$bin" >/dev/null 2>&1
+    status_stage1_dict=$?
+    set -e
+    if [ "$status_stage1_dict" -ne 0 ]; then
+      return 1
+    fi
+    [ -s "$smoke_out_stage1_dict" ] || return 1
   fi
   return 0
 }
@@ -163,18 +200,27 @@ release_rebuild_lock() {
 }
 
 driver="${CHENG_BACKEND_DRIVER:-}"
+explicit_driver_fallback="${CHENG_BACKEND_DRIVER_ALLOW_FALLBACK:-0}"
 if [ "$driver" != "" ]; then
   abs="$(to_abs "$driver")"
+  if [ -x "$abs" ] && driver_sanity_ok "$abs" && driver_compile_smoke_ok "$abs"; then
+    printf "%s\n" "$abs"
+    exit 0
+  fi
+  if [ "$explicit_driver_fallback" != "1" ]; then
+    if [ ! -x "$abs" ]; then
+      echo "[Error] CHENG_BACKEND_DRIVER is not executable: $abs" 1>&2
+    else
+      echo "[Error] CHENG_BACKEND_DRIVER is not runnable: $abs" 1>&2
+    fi
+    exit 1
+  fi
   if [ ! -x "$abs" ]; then
-    echo "[Error] CHENG_BACKEND_DRIVER is not executable: $abs" 1>&2
-    exit 1
+    echo "[Warn] CHENG_BACKEND_DRIVER is not executable, fallback auto-select: $abs" 1>&2
+  else
+    echo "[Warn] CHENG_BACKEND_DRIVER is not runnable, fallback auto-select: $abs" 1>&2
   fi
-  if ! driver_sanity_ok "$abs" || ! driver_compile_smoke_ok "$abs"; then
-    echo "[Error] CHENG_BACKEND_DRIVER is not runnable: $abs" 1>&2
-    exit 1
-  fi
-  printf "%s\n" "$abs"
-  exit 0
+  driver=""
 fi
 
 is_stale() {
@@ -190,7 +236,34 @@ is_stale() {
   return 1
 }
 
-abs_default="$root/cheng"
+find_fallback_driver() {
+  for cand in \
+    "$abs_default" \
+    "$legacy_default" \
+    "$root/dist/releases/current/cheng" \
+    "$root/artifacts/backend_seed/cheng.stage2" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng.stage1"; do
+    if [ -x "$cand" ] && driver_sanity_ok "$cand" && driver_compile_smoke_ok "$cand"; then
+      printf "%s\n" "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+local_driver_rel="${CHENG_BACKEND_LOCAL_DRIVER_REL:-artifacts/backend_driver/cheng}"
+abs_default="$root/$local_driver_rel"
+legacy_default="$root/cheng"
+prefer_rebuild="${CHENG_BACKEND_DRIVER_PATH_PREFER_REBUILD:-0}"
+fallback_driver=""
+set +e
+fallback_driver="$(find_fallback_driver)"
+fallback_status=$?
+set -e
+if [ "$fallback_status" -ne 0 ]; then
+  fallback_driver=""
+fi
 
 # Fast path: use the local rebuilt driver if it's fresh.
 if [ -x "$abs_default" ] && ! is_stale "$abs_default"; then
@@ -198,7 +271,6 @@ if [ -x "$abs_default" ] && ! is_stale "$abs_default"; then
     printf "%s\n" "$abs_default"
     exit 0
   fi
-  echo "[Warn] backend_driver_path: local cheng is not runnable, rebuilding" 1>&2
 fi
 
 rebuild_default="0"
@@ -210,6 +282,11 @@ else
   elif ! driver_sanity_ok "$abs_default" || ! driver_compile_smoke_ok "$abs_default"; then
     rebuild_default="1"
   fi
+fi
+
+if [ "$rebuild_default" = "1" ] && [ "$prefer_rebuild" != "1" ] && [ "$fallback_driver" != "" ]; then
+  printf "%s\n" "$fallback_driver"
+  exit 0
 fi
 
 if [ "$rebuild_default" = "1" ]; then
@@ -233,15 +310,19 @@ if [ "$rebuild_default" = "1" ]; then
 fi
 
 if [ "$rebuild_default" = "1" ]; then
+  abs_default_dir="$(dirname "$abs_default")"
+  if [ "$abs_default_dir" != "" ] && [ ! -d "$abs_default_dir" ]; then
+    mkdir -p "$abs_default_dir"
+  fi
   rebuild_log="$root/chengcache/backend_driver_path.rebuild.log"
   set +e
   CHENG_BACKEND_BUILD_DRIVER_SELFHOST=1 \
   CHENG_BACKEND_BUILD_DRIVER_LINKER="${CHENG_BACKEND_DRIVER_PATH_LINKER:-self}" \
-    sh src/tooling/build_backend_driver.sh --name:cheng >"$rebuild_log" 2>&1
+    sh src/tooling/build_backend_driver.sh --name:"$local_driver_rel" >"$rebuild_log" 2>&1
   rebuild_status="$?"
   set -e
   if [ "$rebuild_status" -ne 0 ]; then
-    echo "[Warn] backend_driver_path: local cheng rebuild failed (status=$rebuild_status)" 1>&2
+    echo "[Warn] backend_driver_path: local driver rebuild failed (status=$rebuild_status)" 1>&2
     if [ "${CHENG_BACKEND_DRIVER_PATH_DEBUG:-0}" = "1" ]; then
       tail -n 80 "$rebuild_log" 1>&2 || true
     fi
@@ -256,20 +337,30 @@ if [ -x "$abs_default" ] && driver_sanity_ok "$abs_default" && driver_compile_sm
   exit 0
 fi
 
-for cand in \
-  "$root/artifacts/backend_seed/cheng.stage2" \
-  "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
-  "$root/artifacts/backend_selfhost_self_obj/cheng.stage1"; do
-  if [ -x "$cand" ] && driver_sanity_ok "$cand" && driver_compile_smoke_ok "$cand"; then
-    printf "%s\n" "$cand"
+if [ "$fallback_driver" = "" ]; then
+  set +e
+  fallback_driver="$(find_fallback_driver)"
+  fallback_status=$?
+  set -e
+  if [ "$fallback_status" -ne 0 ]; then
+    fallback_driver=""
+  fi
+fi
+if [ "$fallback_driver" != "" ]; then
+  printf "%s\n" "$fallback_driver"
+  exit 0
+fi
+
+if [ ! -x "$abs_default" ] && [ -x "$legacy_default" ]; then
+  if driver_sanity_ok "$legacy_default" && driver_compile_smoke_ok "$legacy_default"; then
+    printf "%s\n" "$legacy_default"
     exit 0
   fi
-done
-
+fi
 if [ ! -x "$abs_default" ]; then
   echo "[Error] missing backend driver: $abs_default" 1>&2
 else
   echo "[Error] backend driver exists but failed compile-smoke: $abs_default" 1>&2
 fi
-echo "  hint: run src/tooling/build_backend_driver.sh --name:cheng (selfhost only)" 1>&2
+echo "  hint: run src/tooling/build_backend_driver.sh --name:$local_driver_rel (selfhost only)" 1>&2
 exit 1

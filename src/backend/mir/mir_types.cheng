@@ -162,6 +162,43 @@ var
     mir_cstrs_cache_len: int32
     mir_cstrs_cache_ready: bool
 
+fn mirHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
+    if key == nil || len(key) == 0 || m.mask == 0:
+        found = false
+        return -1
+    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
+        found = false
+        return -1
+    var mask: int32 = int32(m.mask)
+    if mask < 0:
+        found = false
+        return -1
+    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
+        let cap0: int32 = m.states.len
+        if m.keys.len < cap0 || m.vals.len < cap0:
+            found = false
+            return -1
+        mask = cap0 - 1
+    if mask < 0:
+        found = false
+        return -1
+    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
+    var scanned: int32 = 0
+    let __for_start_scanned_compat = scanned
+    for __for_scanned_compat in __for_start_scanned_compat..mask:
+        scanned = __for_scanned_compat
+        let st: uint8 = m.states[probe]
+        if st == uint8(0):
+            found = false
+            return -1
+        if hashmaps.hashMapStrEq(m.keys[probe], key):
+            found = true
+            return m.vals[probe]
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    found = false
+    return -1
+
 fn mir_buildTypeAliasIndexCache(module: MirModule) =
     if module == nil:
         mir_typeAliases_cache_module = nil
@@ -173,7 +210,7 @@ fn mir_buildTypeAliasIndexCache(module: MirModule) =
     for i in 0..<module.typeAliases.len:
         let a: MirTypeAlias = module.typeAliases[i]
         if a.name != nil && len(a.name) > 0:
-            hashmaps.hashMapStrIntPut(mir_typeAliases_cache, a.name, i)
+            hashmaps.hashMapStrIntPut(mir_typeAliases_cache, a.name, i + 1)
     mir_typeAliases_cache_len = module.typeAliases.len
     mir_typeAliases_cache_ready = true
 
@@ -188,7 +225,7 @@ fn mir_buildObjTypeIndexCache(module: MirModule) =
     for i in 0..<module.objTypes.len:
         let t: MirObjType = module.objTypes[i]
         if t.name != nil && len(t.name) > 0:
-            hashmaps.hashMapStrIntPut(mir_objTypes_cache, t.name, i)
+            hashmaps.hashMapStrIntPut(mir_objTypes_cache, t.name, i + 1)
     mir_objTypes_cache_len = module.objTypes.len
     mir_objTypes_cache_ready = true
 
@@ -203,7 +240,7 @@ fn mir_buildCStringIndexCache(module: MirModule) =
     for i in 0..<module.cstrs.len:
         let c: MirCString = module.cstrs[i]
         if c.value != nil:
-            hashmaps.hashMapStrIntPut(mir_cstrs_cache, c.value, i)
+            hashmaps.hashMapStrIntPut(mir_cstrs_cache, c.value, i + 1)
     mir_cstrs_cache_len = module.cstrs.len
     mir_cstrs_cache_ready = true
 
@@ -540,12 +577,16 @@ fn mirFindTypeAlias(module: MirModule, name: str): int32 =
            mir_typeAliases_cache_len != module.typeAliases.len:
             mir_buildTypeAliasIndexCache(module)
         if mir_typeAliases_cache_ready && mir_typeAliases_cache_module == module:
-            var found: bool = false
-            let idx: int32 = hashmaps.hashMapStrIntGet(mir_typeAliases_cache, name, found)
-            return found ? idx : -1
+            var foundAlias: bool = false
+            let raw: int32 = mirHashMapStrIntGetCompat(mir_typeAliases_cache, name, foundAlias)
+            let idx: int32 = raw - 1
+            if foundAlias && raw > 0:
+                return idx
     for i in 0..<module.typeAliases.len:
         let a: MirTypeAlias = module.typeAliases[i]
         if (a.name == name):
+            if mir_typeAliases_cache_ready && mir_typeAliases_cache_module == module:
+                hashmaps.hashMapStrIntPut(mir_typeAliases_cache, name, i + 1)
             return i
     return -1
 
@@ -566,7 +607,7 @@ fn mirAddTypeAlias(module: MirModule, name: str, ty: MirType) =
         a2.ty = ty
         mirWriteTypeAlias(&module.typeAliases, idx, a2)
         if mir_typeAliases_cache_ready && mir_typeAliases_cache_module == module:
-            hashmaps.hashMapStrIntPut(mir_typeAliases_cache, name, idx)
+            hashmaps.hashMapStrIntPut(mir_typeAliases_cache, name, idx + 1)
             mir_typeAliases_cache_len = module.typeAliases.len
         return
     let newIdx: int32 = module.typeAliases.len
@@ -575,7 +616,7 @@ fn mirAddTypeAlias(module: MirModule, name: str, ty: MirType) =
     a.ty = ty
     add(module.typeAliases, a)
     if mir_typeAliases_cache_ready && mir_typeAliases_cache_module == module:
-        hashmaps.hashMapStrIntPut(mir_typeAliases_cache, name, newIdx)
+        hashmaps.hashMapStrIntPut(mir_typeAliases_cache, name, newIdx + 1)
         mir_typeAliases_cache_len = module.typeAliases.len
 
 fn mirFindObjType(module: MirModule, name: str): int32 =
@@ -586,12 +627,16 @@ fn mirFindObjType(module: MirModule, name: str): int32 =
            mir_objTypes_cache_len != module.objTypes.len:
             mir_buildObjTypeIndexCache(module)
         if mir_objTypes_cache_ready && mir_objTypes_cache_module == module:
-            var found: bool = false
-            let idx: int32 = hashmaps.hashMapStrIntGet(mir_objTypes_cache, name, found)
-            return found ? idx : -1
+            var foundObj: bool = false
+            let raw: int32 = mirHashMapStrIntGetCompat(mir_objTypes_cache, name, foundObj)
+            let idx: int32 = raw - 1
+            if foundObj && raw > 0:
+                return idx
     for i in 0..<module.objTypes.len:
         let t: MirObjType = module.objTypes[i]
         if (t.name == name):
+            if mir_objTypes_cache_ready && mir_objTypes_cache_module == module:
+                hashmaps.hashMapStrIntPut(mir_objTypes_cache, name, i + 1)
             return i
     return -1
 
@@ -615,13 +660,13 @@ fn mirAddObjType(module: MirModule, ty: MirObjType) =
     if idx >= 0:
         mirWriteObjType(&module.objTypes, idx, ty)
         if mir_objTypes_cache_ready && mir_objTypes_cache_module == module:
-            hashmaps.hashMapStrIntPut(mir_objTypes_cache, ty.name, idx)
+            hashmaps.hashMapStrIntPut(mir_objTypes_cache, ty.name, idx + 1)
             mir_objTypes_cache_len = module.objTypes.len
         return
     let newIdx: int32 = module.objTypes.len
     add(module.objTypes, ty)
     if mir_objTypes_cache_ready && mir_objTypes_cache_module == module:
-        hashmaps.hashMapStrIntPut(mir_objTypes_cache, ty.name, newIdx)
+        hashmaps.hashMapStrIntPut(mir_objTypes_cache, ty.name, newIdx + 1)
         mir_objTypes_cache_len = module.objTypes.len
 
 fn mirAddFunc(module: MirModule, func: MirFunc) =
@@ -674,11 +719,11 @@ fn mirFindCStringLabel(module: MirModule, value: str): str =
            mir_cstrs_cache_len != module.cstrs.len:
             mir_buildCStringIndexCache(module)
         if mir_cstrs_cache_ready && mir_cstrs_cache_module == module:
-            var found: bool = false
-            let idx: int32 = hashmaps.hashMapStrIntGet(mir_cstrs_cache, v, found)
-            if found && idx >= 0 && idx < module.cstrs.len:
+            var foundCstr: bool = false
+            let raw: int32 = mirHashMapStrIntGetCompat(mir_cstrs_cache, v, foundCstr)
+            let idx: int32 = raw - 1
+            if foundCstr && raw > 0 && idx >= 0 && idx < module.cstrs.len:
                 return module.cstrs[idx].label
-            return ""
     for i in 0..<module.cstrs.len:
         let c: MirCString = module.cstrs[i]
         if (c.value == v):
@@ -702,7 +747,7 @@ fn mirAddCString(module: MirModule, value: str): str =
     c.value = v
     add(module.cstrs, c)
     if mir_cstrs_cache_ready && mir_cstrs_cache_module == module:
-        hashmaps.hashMapStrIntPut(mir_cstrs_cache, v, newIdx)
+        hashmaps.hashMapStrIntPut(mir_cstrs_cache, v, newIdx + 1)
         mir_cstrs_cache_len = module.cstrs.len
     return label
 

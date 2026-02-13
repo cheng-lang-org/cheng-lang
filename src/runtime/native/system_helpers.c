@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #if !defined(_WIN32)
 int32_t SystemFunction036(void* buf, int32_t len) {
@@ -569,11 +573,61 @@ void cheng_exit(int32_t code) { exit(code); }
 void cheng_bounds_check(int32_t len, int32_t idx) {
     if (idx < 0 || idx >= len) {
         fprintf(stderr, "[cheng] bounds check failed: idx=%d len=%d\n", idx, len);
+#if defined(__ANDROID__)
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            "ChengRuntime",
+            "bounds check failed: idx=%d len=%d",
+            idx,
+            len
+        );
+#endif
         cheng_exit(1);
     }
 }
 
-static void* cheng_index_ptr(void* base, int32_t len, int32_t idx, int32_t elem_size) {
+static void cheng_log_bounds_site(int32_t len, int32_t idx, int32_t elem_size, void* caller) {
+#if defined(__ANDROID__)
+    Dl_info info;
+    if (dladdr(caller, &info) != 0) {
+        uintptr_t pc = (uintptr_t)caller;
+        uintptr_t base = (uintptr_t)info.dli_fbase;
+        uintptr_t offset = pc >= base ? (pc - base) : 0;
+        __android_log_print(
+            ANDROID_LOG_ERROR,
+            "ChengRuntime",
+            "bounds fail idx=%d len=%d elem=%d caller=%p module=%s symbol=%s offset=0x%zx",
+            idx,
+            len,
+            elem_size,
+            caller,
+            info.dli_fname ? info.dli_fname : "?",
+            info.dli_sname ? info.dli_sname : "?",
+            (size_t)offset
+        );
+        return;
+    }
+    __android_log_print(
+        ANDROID_LOG_ERROR,
+        "ChengRuntime",
+        "bounds fail idx=%d len=%d elem=%d caller=%p dladdr=none",
+        idx,
+        len,
+        elem_size,
+        caller
+    );
+#else
+    (void)len;
+    (void)idx;
+    (void)elem_size;
+    (void)caller;
+#endif
+}
+
+static void* cheng_index_ptr(void* base, int32_t len, int32_t idx, int32_t elem_size, void* caller) {
+    if (idx < 0 || idx >= len) {
+        cheng_log_bounds_site(len, idx, elem_size, caller);
+    }
     cheng_bounds_check(len, idx);
     if (!base || elem_size <= 0) {
         return base;
@@ -583,19 +637,71 @@ static void* cheng_index_ptr(void* base, int32_t len, int32_t idx, int32_t elem_
 }
 
 void* cheng_seq_get(void* buffer, int32_t len, int32_t idx, int32_t elem_size) {
-    return cheng_index_ptr(buffer, len, idx, elem_size);
+    return cheng_index_ptr(buffer, len, idx, elem_size, __builtin_return_address(0));
 }
 
 void* cheng_seq_set(void* buffer, int32_t len, int32_t idx, int32_t elem_size) {
-    return cheng_index_ptr(buffer, len, idx, elem_size);
+    return cheng_index_ptr(buffer, len, idx, elem_size, __builtin_return_address(0));
+}
+
+typedef struct ChengSeqHeader {
+    int32_t len;
+    int32_t cap;
+    void* buffer;
+} ChengSeqHeader;
+
+void* cheng_seq_set_grow(void* seq_ptr, int32_t idx, int32_t elem_size) {
+    ChengSeqHeader* seq = (ChengSeqHeader*)seq_ptr;
+    if (!seq || elem_size <= 0) {
+        return cheng_index_ptr(NULL, 0, idx, elem_size, __builtin_return_address(0));
+    }
+    if (idx < 0) {
+        return cheng_index_ptr(seq->buffer, seq->len, idx, elem_size, __builtin_return_address(0));
+    }
+
+    int32_t need = idx + 1;
+    if (need > seq->cap || seq->buffer == NULL) {
+        int32_t new_cap = seq->cap;
+        if (new_cap < 4) {
+            new_cap = 4;
+        }
+        while (new_cap < need) {
+            int32_t doubled = new_cap * 2;
+            if (doubled <= 0) {
+                new_cap = need;
+                break;
+            }
+            new_cap = doubled;
+        }
+
+        int32_t old_cap = seq->cap;
+        size_t bytes = (size_t)new_cap * (size_t)elem_size;
+        void* new_buf = realloc(seq->buffer, bytes);
+        if (!new_buf) {
+            return cheng_index_ptr(seq->buffer, seq->len, idx, elem_size, __builtin_return_address(0));
+        }
+
+        if (new_cap > old_cap) {
+            size_t old_bytes = (size_t)old_cap * (size_t)elem_size;
+            size_t grow_bytes = (size_t)(new_cap - old_cap) * (size_t)elem_size;
+            memset((uint8_t*)new_buf + old_bytes, 0, grow_bytes);
+        }
+        seq->buffer = new_buf;
+        seq->cap = new_cap;
+    }
+
+    if (need > seq->len) {
+        seq->len = need;
+    }
+    return cheng_index_ptr(seq->buffer, seq->len, idx, elem_size, __builtin_return_address(0));
 }
 
 void* cheng_slice_get(void* ptr, int32_t len, int32_t idx, int32_t elem_size) {
-    return cheng_index_ptr(ptr, len, idx, elem_size);
+    return cheng_index_ptr(ptr, len, idx, elem_size, __builtin_return_address(0));
 }
 
 void* cheng_slice_set(void* ptr, int32_t len, int32_t idx, int32_t elem_size) {
-    return cheng_index_ptr(ptr, len, idx, elem_size);
+    return cheng_index_ptr(ptr, len, idx, elem_size, __builtin_return_address(0));
 }
 
 typedef void (*ChengTaskFn)(void*);
@@ -1145,8 +1251,14 @@ void* cheng_realloc(void* p, int32_t size) {
 int32_t cheng_strlen(char* s) { return (int32_t)strlen(s ? s : ""); }
 void* cheng_memcpy(void* dest, void* src, int64_t n) { return memcpy(dest, src, (size_t)n); }
 void* cheng_memset(void* dest, int32_t val, int64_t n) { return memset(dest, val, (size_t)n); }
+void* cheng_memcpy_ffi(void* dest, void* src, int64_t n) { return cheng_memcpy(dest, src, n); }
+void* cheng_memset_ffi(void* dest, int32_t val, int64_t n) { return cheng_memset(dest, val, n); }
+__attribute__((weak)) void* alloc(int32_t size) { return cheng_malloc(size); }
+void copyMem(void* dest, void* src, int32_t size) { (void)cheng_memcpy(dest, src, (int64_t)size); }
+__attribute__((weak)) void setMem(void* dest, int32_t val, int32_t size) { (void)cheng_memset(dest, val, (int64_t)size); }
 int32_t cheng_memcmp(void* a, void* b, int64_t n) { return memcmp(a, b, (size_t)n); }
 int32_t cheng_strcmp(const char* a, const char* b) { return strcmp(a ? a : "", b ? b : ""); }
+int32_t streq(const char* a, const char* b) { return cheng_strcmp(a, b) == 0 ? 1 : 0; }
 double cheng_bits_to_f32(int32_t bits) {
     union {
         uint32_t u;

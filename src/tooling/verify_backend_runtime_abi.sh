@@ -27,7 +27,8 @@ extract_header_symbols() {
 }
 
 extract_c_defined_symbols() {
-  rg -N --no-filename '^[[:space:]]*[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\([^;]*\)[[:space:]]*\{' "$@" \
+  rg -N --no-filename '^[[:space:]]*(__attribute__\(\([^)]*\)\)[[:space:]]*)*[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\([^;]*\)[[:space:]]*\{' "$@" \
+    | sed -E 's/^[[:space:]]*(__attribute__\(\([^)]*\)\)[[:space:]]*)*//' \
     | sed -E 's/^[[:space:]]*[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/' \
     | sort -u
 }
@@ -74,6 +75,7 @@ if [ -s "$missing_in_c" ]; then
 fi
 
 cat > "$allowed_backend_missing" <<'EOF'
+alloc
 cheng_bits_to_f32
 cheng_bits_to_f64
 cheng_errno
@@ -86,12 +88,16 @@ cheng_f64_sub_bits
 cheng_f64_to_bits
 cheng_jpeg_decode
 cheng_jpeg_free
+cheng_memcpy_ffi
+cheng_memset_ffi
 cheng_read_file
 cheng_slice_get
 cheng_slice_set
 cheng_strerror
 cheng_tcp_listener
 cheng_write_file
+copyMem
+setMem
 sys_memset
 EOF
 sort -u "$allowed_backend_missing" -o "$allowed_backend_missing"
