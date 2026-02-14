@@ -80,6 +80,7 @@ debug_explicit="0"
 selfhost_timeout="${CHENG_BACKEND_PROD_SELFHOST_TIMEOUT:-60}"
 selfhost_gate_timeout="${CHENG_BACKEND_PROD_GATE_TIMEOUT:-60}"
 selfhost_strict_noreuse_gate_timeout="${CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_GATE_TIMEOUT:-75}"
+selfhost_strict_noreuse_probe_timeout="${CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_PROBE_TIMEOUT:-$selfhost_timeout}"
 selfhost_reuse="${CHENG_BACKEND_PROD_SELFHOST_REUSE:-${CHENG_SELF_OBJ_BOOTSTRAP_REUSE:-1}}"
 selfhost_session="${CHENG_BACKEND_PROD_SELFHOST_SESSION:-${CHENG_SELF_OBJ_BOOTSTRAP_SESSION:-prod}}"
 selfhost_mode="${CHENG_BACKEND_PROD_SELFHOST_MODE:-${CHENG_SELF_OBJ_BOOTSTRAP_MODE:-fast}}"
@@ -764,14 +765,35 @@ if [ "$run_selfhost" != "" ]; then
     fi
   fi
   if [ "$run_selfhost_strict_noreuse_probe" = "1" ]; then
+    strict_probe_timeout="$selfhost_strict_noreuse_probe_timeout"
+    gate_timeout_numeric="1"
+    probe_timeout_numeric="1"
+    case "$selfhost_strict_noreuse_gate_timeout" in
+      ''|*[!0-9]*)
+        gate_timeout_numeric="0"
+        ;;
+    esac
+    case "$strict_probe_timeout" in
+      ''|*[!0-9]*)
+        probe_timeout_numeric="0"
+        ;;
+    esac
+    if [ "$gate_timeout_numeric" = "1" ] && [ "$probe_timeout_numeric" = "1" ]; then
+      if [ "$selfhost_strict_noreuse_gate_timeout" -gt 0 ] && [ "$strict_probe_timeout" -ge "$selfhost_strict_noreuse_gate_timeout" ]; then
+        strict_probe_timeout=$((selfhost_strict_noreuse_gate_timeout - 5))
+        if [ "$strict_probe_timeout" -lt 1 ]; then
+          strict_probe_timeout=1
+        fi
+      fi
+    fi
     strict_probe_session_base="${CHENG_BACKEND_PROD_SELFHOST_STRICT_SESSION:-$selfhost_session}"
     strict_probe_session="${CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_SESSION:-${strict_probe_session_base}.noreuse}"
     strict_probe_require="${CHENG_BACKEND_SELFHOST_STRICT_NOREUSE_PROBE_REQUIRE:-0}"
     strict_probe_allow_stage0_fallback="${CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_ALLOW_STAGE0_FALLBACK:-0}"
     if [ "$selfhost_stage0" != "" ]; then
-      run_required_timeout "backend.selfhost_strict_noreuse_probe" "$selfhost_strict_noreuse_gate_timeout" env CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 CHENG_SELFHOST_STRICT_PROBE_SESSION="$strict_probe_session" CHENG_SELFHOST_STRICT_PROBE_TIMEOUT="$selfhost_timeout" CHENG_SELFHOST_STRICT_PROBE_REQUIRE="$strict_probe_require" CHENG_SELFHOST_STRICT_PROBE_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_ALLOW_STAGE0_FALLBACK="$strict_probe_allow_stage0_fallback" CHENG_SELFHOST_STRICT_PROBE_STAGE0="$selfhost_stage0" sh src/tooling/verify_backend_selfhost_strict_noreuse_probe.sh
+      run_required_timeout "backend.selfhost_strict_noreuse_probe" "$selfhost_strict_noreuse_gate_timeout" env CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 CHENG_SELFHOST_STRICT_PROBE_SESSION="$strict_probe_session" CHENG_SELFHOST_STRICT_PROBE_TIMEOUT="$strict_probe_timeout" CHENG_SELFHOST_STRICT_PROBE_REQUIRE="$strict_probe_require" CHENG_SELFHOST_STRICT_PROBE_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_ALLOW_STAGE0_FALLBACK="$strict_probe_allow_stage0_fallback" CHENG_SELFHOST_STRICT_PROBE_STAGE0="$selfhost_stage0" sh src/tooling/verify_backend_selfhost_strict_noreuse_probe.sh
     else
-      run_required_timeout "backend.selfhost_strict_noreuse_probe" "$selfhost_strict_noreuse_gate_timeout" env CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 CHENG_SELFHOST_STRICT_PROBE_SESSION="$strict_probe_session" CHENG_SELFHOST_STRICT_PROBE_TIMEOUT="$selfhost_timeout" CHENG_SELFHOST_STRICT_PROBE_REQUIRE="$strict_probe_require" CHENG_SELFHOST_STRICT_PROBE_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_ALLOW_STAGE0_FALLBACK="$strict_probe_allow_stage0_fallback" sh src/tooling/verify_backend_selfhost_strict_noreuse_probe.sh
+      run_required_timeout "backend.selfhost_strict_noreuse_probe" "$selfhost_strict_noreuse_gate_timeout" env CHENG_STAGE1_NO_POINTERS_NON_C_ABI=0 CHENG_STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 CHENG_SELFHOST_STRICT_PROBE_SESSION="$strict_probe_session" CHENG_SELFHOST_STRICT_PROBE_TIMEOUT="$strict_probe_timeout" CHENG_SELFHOST_STRICT_PROBE_REQUIRE="$strict_probe_require" CHENG_SELFHOST_STRICT_PROBE_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE=0 CHENG_SELFHOST_STRICT_PROBE_ALLOW_STAGE0_FALLBACK="$strict_probe_allow_stage0_fallback" sh src/tooling/verify_backend_selfhost_strict_noreuse_probe.sh
     fi
   fi
 fi

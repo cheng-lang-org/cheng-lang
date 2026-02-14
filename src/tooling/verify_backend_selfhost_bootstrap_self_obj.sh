@@ -337,6 +337,10 @@ else
 fi
 session="${CHENG_SELF_OBJ_BOOTSTRAP_SESSION:-default}"
 session_safe="$(printf '%s' "$session" | tr -c 'A-Za-z0-9._-' '_')"
+# File/output-safe token: avoid dots in temp output base names.
+# Some compiler revisions derive sidecar names by truncating on dots, which can
+# cause cross-session collisions (e.g. `a.b` and `a.c` both mapping to `a.*`).
+session_file_safe="$(printf '%s' "$session_safe" | tr '.' '_')"
 stage0_copy="$out_dir/cheng_stage0_${session_safe}"
 refresh_stage0_copy="0"
 if [ ! -f "$stage0_copy" ]; then
@@ -460,14 +464,26 @@ release_session_lock() {
 
 release_session_lock_on_exit() {
   status=$?
+  exit_code="$status"
   set +e
+  total_status="fail"
+  if [ "$exit_code" -eq 124 ]; then
+    total_status="fail-timeout"
+  fi
+  if [ "$exit_code" -eq 0 ]; then
+    total_status="ok"
+  fi
+  if ! awk -F '\t' '$1=="total" { found=1 } END { exit(found ? 0 : 1) }' "$timing_file" 2>/dev/null; then
+    total_duration="$(( $(timestamp_now) - selfhost_started ))"
+    record_stage_timing "total" "$total_status" "$total_duration"
+  fi
   release_session_lock "$session_lock_dir" "$session_lock_owner"
-  write_selfhost_metrics "$status"
+  write_selfhost_metrics "$exit_code"
   rm -f "$timing_file" 2>/dev/null || true
   if [ "$cleanup_local_driver_on_exit" = "1" ]; then
     sh src/tooling/cleanup_cheng_local.sh
   fi
-  exit "$status"
+  exit "$exit_code"
 }
 
 allow_retry_for_status() {
@@ -1025,8 +1041,8 @@ stage2_obj="$stage2_exe.o"
 stage3_witness_obj="$out_dir/cheng.stage3.witness.o"
 stage2_mode_stamp="$out_dir/cheng.stage2.mode"
 stage2_mode_expected="mode=${bootstrap_mode};multi=${multi};multi_force=${multi_force};whole=1"
-stage1_tmp="$out_dir/cheng_stage1_tmp_${session_safe}"
-stage2_tmp="$out_dir/cheng_stage2_tmp_${session_safe}"
+stage1_tmp="$out_dir/cheng_stage1_tmp_${session_file_safe}"
+stage2_tmp="$out_dir/cheng_stage2_tmp_${session_file_safe}"
 
 stage1_rebuild="1"
 stage2_rebuild="1"
@@ -1084,7 +1100,7 @@ if [ "$stage1_rebuild" = "1" ]; then
     # Only attempt compat fallback when native log indicates parser-level
     # incompatibility with stage0 syntax support.
     if [ -s "$out_dir/stage1.native.build.txt" ] && \
-      grep -E -q '\[error\] Unexpected token|stage1 errors|parse' "$out_dir/stage1.native.build.txt"; then
+      grep -E -q '\[error\] Unexpected token|stage1 errors|parse error|parser error' "$out_dir/stage1.native.build.txt"; then
       stage1_need_compat="1"
     fi
     if [ "$stage1_need_compat" = "1" ]; then
@@ -1104,6 +1120,8 @@ if [ "$stage1_rebuild" = "1" ]; then
           echo "[verify_backend_selfhost_bootstrap_self_obj] compat log: $out_dir/stage1.compat.build.txt" >&2
           tail -n 200 "$out_dir/stage1.compat.build.txt" >&2 || true
         fi
+        stage1_duration="$(( $(timestamp_now) - stage1_started ))"
+        record_stage_timing "stage1" "fail" "$stage1_duration"
         exit 1
       fi
     else
@@ -1113,6 +1131,8 @@ if [ "$stage1_rebuild" = "1" ]; then
         echo "[verify_backend_selfhost_bootstrap_self_obj] native log: $out_dir/stage1.native.build.txt" >&2
         tail -n 200 "$out_dir/stage1.native.build.txt" >&2 || true
       fi
+      stage1_duration="$(( $(timestamp_now) - stage1_started ))"
+      record_stage_timing "stage1" "fail" "$stage1_duration"
       exit 1
     fi
   fi

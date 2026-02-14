@@ -17,8 +17,14 @@ Env:
   CHENG_SELFHOST_STRICT_PROBE_ALLOW_STAGE0_FALLBACK=<0|1>   default: 0
   CHENG_SELFHOST_STRICT_PROBE_SKIP_SEM=<0|1>             default: 1
   CHENG_SELFHOST_STRICT_PROBE_SKIP_OWNERSHIP=<0|1>       default: 1
+  CHENG_SELFHOST_STRICT_PROBE_SKIP_CPROFILE=<0|1>        default: 1
   CHENG_SELFHOST_STRICT_PROBE_GENERIC_MODE=<mode>        default: hybrid
   CHENG_SELFHOST_STRICT_PROBE_GENERIC_SPEC_BUDGET=<N>    default: 0
+  CHENG_SELFHOST_STRICT_PROBE_MULTI=<0|1>                default: 0
+  CHENG_SELFHOST_STRICT_PROBE_MULTI_FORCE=<0|1>          default: 0
+  CHENG_SELFHOST_STRICT_PROBE_JOBS=<N>                   default: 0 (auto)
+  CHENG_SELFHOST_STRICT_PROBE_INCREMENTAL=<0|1>          default: 1
+  CHENG_SELFHOST_STRICT_PROBE_ALLOW_RETRY=<0|1>          default: 0
   CHENG_SELFHOST_STRICT_PROBE_TIMING=<path>              optional timing file override
 
 Notes:
@@ -66,8 +72,14 @@ strict_allow_fast_reuse="${CHENG_SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE:-
 allow_stage0_fallback="${CHENG_SELFHOST_STRICT_PROBE_ALLOW_STAGE0_FALLBACK:-0}"
 skip_sem="${CHENG_SELFHOST_STRICT_PROBE_SKIP_SEM:-1}"
 skip_own="${CHENG_SELFHOST_STRICT_PROBE_SKIP_OWNERSHIP:-1}"
+skip_cprofile="${CHENG_SELFHOST_STRICT_PROBE_SKIP_CPROFILE:-1}"
 generic_mode="${CHENG_SELFHOST_STRICT_PROBE_GENERIC_MODE:-hybrid}"
 generic_budget="${CHENG_SELFHOST_STRICT_PROBE_GENERIC_SPEC_BUDGET:-0}"
+probe_multi="${CHENG_SELFHOST_STRICT_PROBE_MULTI:-0}"
+probe_multi_force="${CHENG_SELFHOST_STRICT_PROBE_MULTI_FORCE:-0}"
+probe_jobs="${CHENG_SELFHOST_STRICT_PROBE_JOBS:-0}"
+probe_incremental="${CHENG_SELFHOST_STRICT_PROBE_INCREMENTAL:-1}"
+probe_allow_retry="${CHENG_SELFHOST_STRICT_PROBE_ALLOW_RETRY:-0}"
 timing_file="${CHENG_SELFHOST_STRICT_PROBE_TIMING:-artifacts/backend_selfhost_self_obj/selfhost_timing_${session_safe}.tsv}"
 
 echo "== backend.selfhost_strict_noreuse_probe =="
@@ -84,8 +96,14 @@ if [ "$stage0" != "" ]; then
     CHENG_BACKEND_BUILD_DRIVER_ALLOW_STAGE0_FALLBACK="$allow_stage0_fallback" \
     CHENG_STAGE1_SKIP_SEM="$skip_sem" \
     CHENG_STAGE1_SKIP_OWNERSHIP="$skip_own" \
+    CHENG_STAGE1_SKIP_CPROFILE="$skip_cprofile" \
     CHENG_GENERIC_MODE="$generic_mode" \
     CHENG_GENERIC_SPEC_BUDGET="$generic_budget" \
+    CHENG_SELF_OBJ_BOOTSTRAP_MULTI="$probe_multi" \
+    CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE="$probe_multi_force" \
+    CHENG_SELF_OBJ_BOOTSTRAP_JOBS="$probe_jobs" \
+    CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL="$probe_incremental" \
+    CHENG_SELF_OBJ_BOOTSTRAP_ALLOW_RETRY="$probe_allow_retry" \
     CHENG_SELF_OBJ_BOOTSTRAP_STAGE0="$stage0" \
     sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh
   rc="$?"
@@ -101,8 +119,14 @@ else
     CHENG_BACKEND_BUILD_DRIVER_ALLOW_STAGE0_FALLBACK="$allow_stage0_fallback" \
     CHENG_STAGE1_SKIP_SEM="$skip_sem" \
     CHENG_STAGE1_SKIP_OWNERSHIP="$skip_own" \
+    CHENG_STAGE1_SKIP_CPROFILE="$skip_cprofile" \
     CHENG_GENERIC_MODE="$generic_mode" \
     CHENG_GENERIC_SPEC_BUDGET="$generic_budget" \
+    CHENG_SELF_OBJ_BOOTSTRAP_MULTI="$probe_multi" \
+    CHENG_SELF_OBJ_BOOTSTRAP_MULTI_FORCE="$probe_multi_force" \
+    CHENG_SELF_OBJ_BOOTSTRAP_JOBS="$probe_jobs" \
+    CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL="$probe_incremental" \
+    CHENG_SELF_OBJ_BOOTSTRAP_ALLOW_RETRY="$probe_allow_retry" \
     sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh
   rc="$?"
   set -e

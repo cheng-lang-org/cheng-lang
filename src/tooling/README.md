@@ -128,8 +128,9 @@ CHENG_FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
   - 超时策略：编译返回 `124`（timeout）时默认不再做同参重试，避免单阶段耗时翻倍掩盖性能回退；如需允许 stage0 兜底重编，可显式设置 `CHENG_SELF_OBJ_BOOTSTRAP_ALLOW_STAGE0_FALLBACK=1`（默认 `0`）。
   - `emit=exe` 若未产出 sidecar `.o`/`.objs`，selfhost 门禁会自动追加一次 `emit=obj` 生成对比对象，保证 fixed-point / smoke 对象比较口径稳定。
   - stage1 语法兼容：`fast` 模式仅在 `stage1.native` 日志命中解析类错误时才触发 `stage1.compat` overlay；timeout/非语法错误默认直接失败，保持延迟可控。
+  - `stage1.compat` 触发关键字已收紧为解析错误语义（`Unexpected token` / `stage1 errors` / `parse error` / `parser error`），避免命中普通 profile 文本中的 `parse_*` 造成误触发重编。
   - 自举临时产物默认使用稳定 session（`CHENG_SELF_OBJ_BOOTSTRAP_SESSION=default`），可复用 `<out>_tmp_<session>.objs` 缓存；并行多任务可显式设置不同 session 避免互相覆盖。
-  - 执行结束会输出 `backend.selfhost_self_obj.timing`（lock/stage1/stage2/smoke/total 秒数），并落盘 `selfhost_timing_<session>.tsv` 与 `selfhost_metrics_<session>.json`（可用 `CHENG_SELF_OBJ_BOOTSTRAP_TIMING_OUT` / `CHENG_SELF_OBJ_BOOTSTRAP_METRICS_OUT` 覆盖路径）。
+  - 执行结束会输出 `backend.selfhost_self_obj.timing`（lock/stage1/stage2/smoke/total 秒数），并落盘 `selfhost_timing_<session>.tsv` 与 `selfhost_metrics_<session>.json`（可用 `CHENG_SELF_OBJ_BOOTSTRAP_TIMING_OUT` / `CHENG_SELF_OBJ_BOOTSTRAP_METRICS_OUT` 覆盖路径）；失败/超时路径也会补写 `total` 行（`fail`/`fail-timeout`）。
   - 可在问题排查时显式关闭：`CHENG_SELF_OBJ_BOOTSTRAP_MULTI=0 CHENG_SELF_OBJ_BOOTSTRAP_INCREMENTAL=0`。
   - 2026-02-08 同机冷态实测：`fast` 约 `17s`，`strict` 约 `24-27s`；`backend_prod_closure.sh --only-self-obj-bootstrap --selfhost-strict` 在 `60s` 约束内通过。
   - 2026-02-06：已修复一类“无输出超时”根因（`src/std/strings.cheng` 的字符串 `==` 对 `nil` 比较递归调用自身）；该问题会让 selfhost 阶段卡住直到超时。
@@ -184,7 +185,8 @@ sh src/tooling/backend_prod_closure.sh --stress
 - `--selfhost-strict-gate` 默认复用 fast 同一 session（避免重复冷编译）；可用 `CHENG_BACKEND_PROD_SELFHOST_STRICT_SESSION=<name>` 指定独立 strict session。
 - `--selfhost-strict-gate` 默认启用 `CHENG_BACKEND_PROD_SELFHOST_STRICT_ALLOW_FAST_REUSE=1`：strict 口径优先复用 fast 生成的 `stage1/stage2` 产物，避免因源码时间戳触发重复冷编译超时；设为 `0` 可恢复 strict 重编口径。
 - `backend_prod_closure.sh` 支持可选 `--selfhost-strict-noreuse-probe`（或 `CHENG_BACKEND_RUN_SELFHOST_STRICT_NOREUSE_PROBE=1`）追加 strict 冷路径探针（固定 `reuse=0`、`strict_allow_fast_reuse=0`，默认软探针）。
-- strict no-reuse 探针默认不阻断主链：可通过 `CHENG_BACKEND_SELFHOST_STRICT_NOREUSE_PROBE_REQUIRE=1` 改为阻断；可用 `CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_SESSION`、`CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_ALLOW_STAGE0_FALLBACK` 覆盖会话与回退策略；探针 gate 超时独立于通用 gate（`CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_GATE_TIMEOUT`，默认 `75s`）。
+- strict no-reuse 探针默认不阻断主链：可通过 `CHENG_BACKEND_SELFHOST_STRICT_NOREUSE_PROBE_REQUIRE=1` 改为阻断；可用 `CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_SESSION`、`CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_ALLOW_STAGE0_FALLBACK` 覆盖会话与回退策略；探针 gate 超时独立于通用 gate（`CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_GATE_TIMEOUT`，默认 `75s`），内部探针超时可单独设 `CHENG_BACKEND_PROD_SELFHOST_STRICT_NOREUSE_PROBE_TIMEOUT`，并会自动夹到 `< gate timeout` 以避免软探针被外层 gate 误判为硬失败。
+- `verify_backend_selfhost_strict_noreuse_probe.sh` 默认使用 `CHENG_SELFHOST_STRICT_PROBE_GENERIC_MODE=hybrid`、`CHENG_SELFHOST_STRICT_PROBE_SKIP_CPROFILE=1`、`CHENG_SELFHOST_STRICT_PROBE_MULTI=0`、`CHENG_SELFHOST_STRICT_PROBE_MULTI_FORCE=0`、`CHENG_SELFHOST_STRICT_PROBE_ALLOW_RETRY=0`；`dict` 路径当前用于探索性诊断，可能生成不可运行的自举编译器产物。
 - 若已显式设置 `CHENG_BACKEND_DRIVER` 且可执行，`backend_prod_closure.sh` 会优先将其作为 selfhost stage0，避免额外重建本地 driver。
 - 若未显式提供 stage0，`backend_prod_closure.sh` 会按“可编译 smoke 探测”优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`，其次 `cheng.stage1`，再其次 `dist/releases/current/cheng` / `artifacts/backend_seed/cheng.stage2`；探测失败（如可执行但编译崩溃）会自动跳过并回退到 `backend_driver_path.sh`。
 - stage0 探针默认走 `CHENG_BACKEND_PROD_STAGE0_PROBE_MODE=path`（仅复用 `backend_driver_path.sh` 的可运行 smoke，不再额外重编 `backend_driver.cheng`）；可切到 `light`（mvp 小样例）或 `full`（历史重型探针）排查问题。
@@ -288,6 +290,10 @@ sh src/tooling/verify_libp2p_frontier.sh
 - frontier 默认开启超时摘要（`CHENG_FRONTIER_TIMEOUT_DIAG_SUMMARY=1`，`CHENG_FRONTIER_TIMEOUT_DIAG_SUMMARY_TOP=12`）。
 - 日志与 summary 位于 `chengcache/libp2p_frontier/logs/`。
 - 运行验收（仅 Linux aarch64 主机）：执行 `hello_puts/return_add/mm_live_balance` smoke。
+- 跨仓口径说明：
+  - `verify_libp2p_frontier.sh` 默认 `dict`，因为 `hybrid` 在 `mdns_smoke/msquic_transport_smoke` 上易触发 60s 超时，`dict` 更稳定。
+  - `cheng-libp2p/scripts/verify.sh` 目前分层为 `stable/full`：`stable` 固定 `dict + emit=obj + 60s` 的 compile-only gate，`full` 仅作为 exe 闭环探针（可能因 dict helper 链接闭合缺口失败）。
+  - 长期目标仍是统一到 `dict + exe+run`；在 helper 闭合修复完成前，脚本应真实反映能力边界，不做伪闭环。
 
 运行时 ABI 一致性门禁：
 ```bash

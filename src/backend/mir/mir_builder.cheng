@@ -140,10 +140,30 @@ fn mirGenericModeNormalized(): str =
         return "hybrid"
     return raw0
 
+fn mirDictHelperClosureEnabled(): bool =
+    let mode: str = mirGenericModeNormalized()
+    return mode == "dict" || mode == "dictionary"
+
 fn mirShouldSkipMonoPass(): bool =
     let mode: str = mirGenericModeNormalized()
     if mode == "dict" || mode == "dictionary":
-        return true
+        # Dict mode keeps mono off by default for compile-time stability; helper
+        # closure happens in MIR lowering. Local env can opt back into mono.
+        let forceMonoDict: bool = envIsTrue "CHENG_STAGE1_FORCE_MONO_DICT"
+        let skipDictRaw: str = backendStripSpaces(getEnv "CHENG_STAGE1_SKIP_MONO_DICT")
+        var skipDict: bool = true
+        if skipDictRaw != nil && len(skipDictRaw) > 0:
+            skipDict = mirIsOne(skipDictRaw)
+        if forceMonoDict:
+            skipDict = false
+        if os.getEnvDefault("CHENG_BACKEND_DEBUG_STAGE1_PIPE", "") == "1":
+            let f: os.File = os.get_stderr()
+            os.writeLine(f, "[backend] stage1: skip_mono mode=" + mode +
+                         " skip_dict=" + (skipDict ? "1" : "0"))
+            os.c_fflush f
+        if skipDict:
+            return true
+        return false
     return false
 
 fn mirIsOrcMode(mm: str): bool =
@@ -1579,7 +1599,12 @@ fn ensureOptionObjType(module: MirModule, optionName: str): bool =
     let valKey: str = str(ptr_add(void*(optionName), len(prefix)))
     if valKey == nil || len(valKey) == 0:
         return false
-    if !isBuiltinTypeName(valKey) && !mirHasObjType(module, valKey):
+    var hasObjVal: bool = mirHasObjType(module, valKey)
+    if !hasObjVal:
+        let valCanon0: str = mirObjAliasCanon(valKey)
+        if valCanon0 != nil && len(valCanon0) > 0 && mirHasObjType(module, valCanon0):
+            hasObjVal = true
+    if !isBuiltinTypeName(valKey) && !hasObjVal:
         let aliasTyCheck: MirType = mirTryGetTypeAlias(module, valKey)
         if aliasTyCheck.kind == mtVoid:
             return false
@@ -1644,6 +1669,11 @@ fn ensureResultObjType(module: MirModule, resultName: str): bool =
     let valKey: str = str(ptr_add(void*(resultName), len(prefix)))
     if valKey == nil || len(valKey) == 0:
         return false
+    var hasObjVal: bool = mirHasObjType(module, valKey)
+    if !hasObjVal:
+        let valCanon0: str = mirObjAliasCanon(valKey)
+        if valCanon0 != nil && len(valCanon0) > 0 && mirHasObjType(module, valCanon0):
+            hasObjVal = true
 
     var errObjName: str = "ErrorInfo"
     if !mirHasObjType(module, errObjName):
@@ -1671,9 +1701,9 @@ fn ensureResultObjType(module: MirModule, resultName: str): bool =
     offset = 1
 
     var valObjName: str = ""
-    if mirHasObjType(module, valKey):
+    if hasObjVal && mirHasObjType(module, valKey):
         valObjName = valKey
-    else:
+    elif hasObjVal:
         let valCanon: str = mirObjAliasCanon(valKey)
         if valCanon != nil && len(valCanon) > 0 && mirHasObjType(module, valCanon):
             valObjName = valCanon
@@ -2547,6 +2577,38 @@ fn mirStrStartsWith(s: str, prefix: str): bool =
         if sc != pc:
             return false
         i = i + 1
+
+fn mirStripLeadingUnderscores(raw: str): str =
+    if raw == nil:
+        return ""
+    let n: int32 = len(raw)
+    if n <= 0:
+        return ""
+    var i: int32 = 0
+    while i < n && raw[i] == '_':
+        i = i + 1
+    if i <= 0:
+        return raw
+    if i >= n:
+        return ""
+    return str(ptr_add(void*(raw), i))
+
+fn mirInferCtorSuffixFromTypeCache(b: BlockBuilder, callNode: Node, objPrefix: str): str =
+    if b == nil || b.module == nil || callNode == nil || objPrefix == nil || len(objPrefix) == 0:
+        return ""
+    if callNode.typeCacheValid && callNode.typeCache != nil:
+        let tc: Node = callNode.typeCache
+        let objName0: str = typeNodeObjTypeName(b.module, tc)
+        if objName0 != nil && mirStrStartsWith(objName0, objPrefix):
+            let suffix0: str = str(ptr_add(void*(objName0), len(objPrefix)))
+            if suffix0 != nil && len(suffix0) > 0:
+                return suffix0
+        let key0: str = typeKey(tc)
+        if key0 != nil && mirStrStartsWith(key0, objPrefix):
+            let suffix1: str = str(ptr_add(void*(key0), len(objPrefix)))
+            if suffix1 != nil && len(suffix1) > 0:
+                return suffix1
+    return ""
 
 fn mirTypeKeyStripIterWrappers(typeKey0: str): str =
     var key: str = backendStripSpaces(typeKey0)
@@ -4322,6 +4384,123 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: MirExpr): Resu
     var callName: str = name
     if typeArgs.len > 0:
         callName = mangleInstance(name, typeArgs)
+    let helperCallNameL: str = mirStripLeadingUnderscores(callName)
+
+    if mirDictHelperClosureEnabled() && b.module != nil:
+        if kidCount(callNode) == 2:
+            var ctorKindL: int32 = 0
+            var resultSuffixL: str = ""
+            if mirStrStartsWith(helperCallNameL, "Ok_"):
+                ctorKindL = 1
+                resultSuffixL = str(ptr_add(void*(helperCallNameL), 3))
+            elif mirStrStartsWith(helperCallNameL, "Err_"):
+                ctorKindL = 2
+                resultSuffixL = str(ptr_add(void*(helperCallNameL), 4))
+            elif mirStrStartsWith(helperCallNameL, "ErrInfo_"):
+                ctorKindL = 3
+                resultSuffixL = str(ptr_add(void*(helperCallNameL), 8))
+            if ctorKindL <= 0:
+                if helperCallNameL == "Ok":
+                    ctorKindL = 1
+                elif helperCallNameL == "Err":
+                    ctorKindL = 2
+                elif helperCallNameL == "ErrInfo":
+                    ctorKindL = 3
+                if ctorKindL > 0:
+                    resultSuffixL = mirInferCtorSuffixFromTypeCache(b, callNode, "Result_")
+            if ctorKindL > 0 && resultSuffixL != nil && len(resultSuffixL) > 0:
+                let resultObjNameL: str = "Result_" + resultSuffixL
+                if !mirHasObjType(b.module, resultObjNameL):
+                    let _ensResultL: bool = ensureResultObjType(b.module, resultObjNameL)
+                if mirHasObjType(b.module, resultObjNameL):
+                    var payloadNodeL: Node = kid(callNode, 1)
+                    if payloadNodeL != nil && payloadNodeL.kind == nkCallArg:
+                        if kidCount(payloadNodeL) > 1:
+                            payloadNodeL = kid(payloadNodeL, 1)
+                        elif kidCount(payloadNodeL) > 0:
+                            payloadNodeL = kid(payloadNodeL, 0)
+                    var payloadExprL: Node = payloadNodeL
+                    if ctorKindL == 2:
+                        var errCtorL: Node = newNode(nkCall, callNode.pos)
+                        addSon(errCtorL, newIdent("ErrorInfo", callNode.pos))
+                        var errCodeArgL: Node = newNode(nkCallArg, callNode.pos)
+                        addSon(errCodeArgL, newIdent("code", callNode.pos))
+                        addSon(errCodeArgL, newIntLit(0, callNode.pos))
+                        addSon(errCtorL, errCodeArgL)
+                        var errMsgArgL: Node = newNode(nkCallArg, callNode.pos)
+                        addSon(errMsgArgL, newIdent("msg", callNode.pos))
+                        addSon(errMsgArgL, payloadNodeL)
+                        addSon(errCtorL, errMsgArgL)
+                        payloadExprL = errCtorL
+
+                    var ctorCallL: Node = newNode(nkCall, callNode.pos)
+                    addSon(ctorCallL, newIdent(resultObjNameL, callNode.pos))
+                    var okArgL: Node = newNode(nkCallArg, callNode.pos)
+                    addSon(okArgL, newIdent("ok", callNode.pos))
+                    if ctorKindL == 1:
+                        addSon(okArgL, newBoolLit(true, callNode.pos))
+                    else:
+                        addSon(okArgL, newBoolLit(false, callNode.pos))
+                    addSon(ctorCallL, okArgL)
+                    var payloadArgL: Node = newNode(nkCallArg, callNode.pos)
+                    if ctorKindL == 1:
+                        addSon(payloadArgL, newIdent("value", callNode.pos))
+                    else:
+                        addSon(payloadArgL, newIdent("err", callNode.pos))
+                    addSon(payloadArgL, payloadExprL)
+                    addSon(ctorCallL, payloadArgL)
+                    let ctorResL: Result[MirExpr] = lowerObjConstructorCall(b, ctorCallL, resultObjNameL)
+                    if !IsOk[MirExpr](ctorResL):
+                        return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](ctorResL))
+                    let copyResL: Result[bool] = emitObjCopyPtrs(b, lead, resultObjNameL, Value[MirExpr](ctorResL))
+                    if !IsOk[bool](copyResL):
+                        return ErrInfo[MirExpr](ErrorInfoOf[bool](copyResL))
+                    return Ok[MirExpr](lead)
+
+        var optionCtorKindL: int32 = 0
+        var optionSuffixL: str = ""
+        if kidCount(callNode) == 2 && mirStrStartsWith(helperCallNameL, "Some_"):
+            optionCtorKindL = 1
+            optionSuffixL = str(ptr_add(void*(helperCallNameL), 5))
+        elif kidCount(callNode) == 1 && mirStrStartsWith(helperCallNameL, "None_"):
+            optionCtorKindL = 2
+            optionSuffixL = str(ptr_add(void*(helperCallNameL), 5))
+        if optionCtorKindL <= 0:
+            if kidCount(callNode) == 2 && helperCallNameL == "Some":
+                optionCtorKindL = 1
+                optionSuffixL = mirInferCtorSuffixFromTypeCache(b, callNode, "Option_")
+            elif kidCount(callNode) == 1 && helperCallNameL == "None":
+                optionCtorKindL = 2
+                optionSuffixL = mirInferCtorSuffixFromTypeCache(b, callNode, "Option_")
+        if optionCtorKindL > 0 && optionSuffixL != nil && len(optionSuffixL) > 0:
+            let optionObjNameL: str = "Option_" + optionSuffixL
+            if !mirHasObjType(b.module, optionObjNameL):
+                let _ensOptionL: bool = ensureOptionObjType(b.module, optionObjNameL)
+            if mirHasObjType(b.module, optionObjNameL):
+                var ctorCallOptL: Node = newNode(nkCall, callNode.pos)
+                addSon(ctorCallOptL, newIdent(optionObjNameL, callNode.pos))
+                var hasArgOptL: Node = newNode(nkCallArg, callNode.pos)
+                addSon(hasArgOptL, newIdent("has", callNode.pos))
+                addSon(hasArgOptL, newBoolLit(optionCtorKindL == 1, callNode.pos))
+                addSon(ctorCallOptL, hasArgOptL)
+                if optionCtorKindL == 1:
+                    var payloadNodeOptL: Node = kid(callNode, 1)
+                    if payloadNodeOptL != nil && payloadNodeOptL.kind == nkCallArg:
+                        if kidCount(payloadNodeOptL) > 1:
+                            payloadNodeOptL = kid(payloadNodeOptL, 1)
+                        elif kidCount(payloadNodeOptL) > 0:
+                            payloadNodeOptL = kid(payloadNodeOptL, 0)
+                    var payloadArgOptL: Node = newNode(nkCallArg, callNode.pos)
+                    addSon(payloadArgOptL, newIdent("value", callNode.pos))
+                    addSon(payloadArgOptL, payloadNodeOptL)
+                    addSon(ctorCallOptL, payloadArgOptL)
+                let ctorResOptL: Result[MirExpr] = lowerObjConstructorCall(b, ctorCallOptL, optionObjNameL)
+                if !IsOk[MirExpr](ctorResOptL):
+                    return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](ctorResOptL))
+                let copyResOptL: Result[bool] = emitObjCopyPtrs(b, lead, optionObjNameL, Value[MirExpr](ctorResOptL))
+                if !IsOk[bool](copyResOptL):
+                    return ErrInfo[MirExpr](ErrorInfoOf[bool](copyResOptL))
+                return Ok[MirExpr](lead)
 
     if b.module != nil && mirHasObjType(b.module, callName):
         var hasNamedArgs: bool = false
@@ -7224,6 +7403,61 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                         add(b.currentStmts, mirStmtStore(slotPtr, Value[MirExpr](valRes), elemTy))
                 add(b.currentStmts, mirStmtStore(lenAddr, lenPlus1_32, mirTypeI32()))
                 return Ok[MirExpr](mirConstI64(0))
+        let helperBaseName0: str = mirStripLeadingUnderscores(name)
+        let isSetLenHelper0: bool = (helperBaseName0 == "setLen") || mirStrStartsWith(helperBaseName0, "setLen_")
+        let isReserveHelper0: bool = (helperBaseName0 == "reserve") || mirStrStartsWith(helperBaseName0, "reserve_")
+        if getEnv "CHENG_BACKEND_DEBUG_DICT_HELPER" == "1":
+            let isResultHelperDbg: bool =
+                helperBaseName0 == "Ok" || helperBaseName0 == "Err" || helperBaseName0 == "ErrInfo" ||
+                mirStrStartsWith(helperBaseName0, "Ok_") ||
+                mirStrStartsWith(helperBaseName0, "Err_") ||
+                mirStrStartsWith(helperBaseName0, "ErrInfo_")
+            let isOptionHelperDbg: bool =
+                helperBaseName0 == "Some" || helperBaseName0 == "None" ||
+                mirStrStartsWith(helperBaseName0, "Some_") ||
+                mirStrStartsWith(helperBaseName0, "None_")
+            let isSeqBytesHelperDbg: bool =
+                helperBaseName0 == "seqBytesOf" || mirStrStartsWith(helperBaseName0, "seqBytesOf_")
+            if isResultHelperDbg || isOptionHelperDbg || isSeqBytesHelperDbg || isSetLenHelper0 || isReserveHelper0:
+                echo("[backend] dict_helper_probe mode=" + mirGenericModeNormalized() +
+                     " name='" + name + "' base='" + helperBaseName0 + "' kids=" + intToStr(kidCount(node)))
+        if (isSetLenHelper0 || isReserveHelper0) && kidCount(node) == 3:
+            # Skip-mono compatibility: lower seq helpers without requiring
+            # monomorphized stdlib implementations.
+            var seqArgNode1: Node = kid(node, 1)
+            if seqArgNode1 != nil && seqArgNode1.kind == nkCallArg:
+                if kidCount(seqArgNode1) > 1:
+                    seqArgNode1 = kid(seqArgNode1, 1)
+                elif kidCount(seqArgNode1) > 0:
+                    seqArgNode1 = kid(seqArgNode1, 0)
+            var sizeArgNode1: Node = kid(node, 2)
+            if sizeArgNode1 != nil && sizeArgNode1.kind == nkCallArg:
+                if kidCount(sizeArgNode1) > 1:
+                    sizeArgNode1 = kid(sizeArgNode1, 1)
+                elif kidCount(sizeArgNode1) > 0:
+                    sizeArgNode1 = kid(sizeArgNode1, 0)
+            if seqArgNode1 == nil || sizeArgNode1 == nil:
+                return Err[MirExpr]("mir_builder: " + helperBaseName0 + " expects non-nil arguments")
+            let capLhs1: Node = newNode(nkDotExpr, node.pos)
+            addSon(capLhs1, seqArgNode1)
+            addSon(capLhs1, newIdent("cap", node.pos))
+            let capGrowRes1: Result[bool] = lowerSeqCapAssignFallback(b, capLhs1, sizeArgNode1)
+            if !IsOk[bool](capGrowRes1):
+                return ErrInfo[MirExpr](ErrorInfoOf[bool](capGrowRes1))
+            if Value[bool](capGrowRes1):
+                if isSetLenHelper0:
+                    let lenLhs1: Node = newNode(nkDotExpr, node.pos)
+                    addSon(lenLhs1, seqArgNode1)
+                    addSon(lenLhs1, newIdent("len", node.pos))
+                    let lenAccessRes1: Result[DotAccess] = lowerDotAccess(b, lenLhs1)
+                    if !IsOk[DotAccess](lenAccessRes1):
+                        return ErrInfo[MirExpr](ErrorInfoOf[DotAccess](lenAccessRes1))
+                    let lenAccess1: DotAccess = Value[DotAccess](lenAccessRes1)
+                    let lenValRes1: Result[MirExpr] = lowerExprValue(b, sizeArgNode1, lenAccess1.fieldTy)
+                    if !IsOk[MirExpr](lenValRes1):
+                        return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](lenValRes1))
+                    add(b.currentStmts, mirStmtStore(lenAccess1.addr, Value[MirExpr](lenValRes1), lenAccess1.fieldTy))
+                return Ok[MirExpr](mirConstI64(0))
         if name == "__addr":
             if kidCount(node) < 2:
                 return Err[MirExpr]("mir_builder: __addr expects one argument")
@@ -7411,6 +7645,148 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
         var callName0: str = name
         if typeArgs.len > 0:
             callName0 = mangleInstance(name, typeArgs)
+        let helperCallName0: str = mirStripLeadingUnderscores(callName0)
+
+        # Skip-mono/dict mode can leave generic helper calls unresolved.
+        # Lower helper families structurally to object constructors.
+        if mirDictHelperClosureEnabled() && b.module != nil:
+            if kidCount(node) == 2:
+                var ctorKind0: int32 = 0
+                var resultSuffix0: str = ""
+                if mirStrStartsWith(helperCallName0, "Ok_"):
+                    ctorKind0 = 1
+                    resultSuffix0 = str(ptr_add(void*(helperCallName0), 3))
+                elif mirStrStartsWith(helperCallName0, "Err_"):
+                    ctorKind0 = 2
+                    resultSuffix0 = str(ptr_add(void*(helperCallName0), 4))
+                elif mirStrStartsWith(helperCallName0, "ErrInfo_"):
+                    ctorKind0 = 3
+                    resultSuffix0 = str(ptr_add(void*(helperCallName0), 8))
+                if ctorKind0 <= 0:
+                    if helperCallName0 == "Ok":
+                        ctorKind0 = 1
+                    elif helperCallName0 == "Err":
+                        ctorKind0 = 2
+                    elif helperCallName0 == "ErrInfo":
+                        ctorKind0 = 3
+                    if ctorKind0 > 0:
+                        resultSuffix0 = mirInferCtorSuffixFromTypeCache(b, node, "Result_")
+                if ctorKind0 > 0 && resultSuffix0 != nil && len(resultSuffix0) > 0:
+                    let resultObjName0: str = "Result_" + resultSuffix0
+                    if !mirHasObjType(b.module, resultObjName0):
+                        let _ensResult0: bool = ensureResultObjType(b.module, resultObjName0)
+                    if mirHasObjType(b.module, resultObjName0):
+                        var payloadNode0: Node = kid(node, 1)
+                        if payloadNode0 != nil && payloadNode0.kind == nkCallArg:
+                            if kidCount(payloadNode0) > 1:
+                                payloadNode0 = kid(payloadNode0, 1)
+                            elif kidCount(payloadNode0) > 0:
+                                payloadNode0 = kid(payloadNode0, 0)
+                        var payloadExpr0: Node = payloadNode0
+                        if ctorKind0 == 2:
+                            # Err[T](msg) expects `err: ErrorInfo`.
+                            var errCtor0: Node = newNode(nkCall, node.pos)
+                            addSon(errCtor0, newIdent("ErrorInfo", node.pos))
+                            var errCodeArg0: Node = newNode(nkCallArg, node.pos)
+                            addSon(errCodeArg0, newIdent("code", node.pos))
+                            addSon(errCodeArg0, newIntLit(0, node.pos))
+                            addSon(errCtor0, errCodeArg0)
+                            var errMsgArg0: Node = newNode(nkCallArg, node.pos)
+                            addSon(errMsgArg0, newIdent("msg", node.pos))
+                            addSon(errMsgArg0, payloadNode0)
+                            addSon(errCtor0, errMsgArg0)
+                            payloadExpr0 = errCtor0
+
+                        var ctorCall0: Node = newNode(nkCall, node.pos)
+                        addSon(ctorCall0, newIdent(resultObjName0, node.pos))
+                        var okArg0: Node = newNode(nkCallArg, node.pos)
+                        addSon(okArg0, newIdent("ok", node.pos))
+                        if ctorKind0 == 1:
+                            addSon(okArg0, newBoolLit(true, node.pos))
+                        else:
+                            addSon(okArg0, newBoolLit(false, node.pos))
+                        addSon(ctorCall0, okArg0)
+                        var payloadArg0: Node = newNode(nkCallArg, node.pos)
+                        if ctorKind0 == 1:
+                            addSon(payloadArg0, newIdent("value", node.pos))
+                        else:
+                            addSon(payloadArg0, newIdent("err", node.pos))
+                        addSon(payloadArg0, payloadExpr0)
+                        addSon(ctorCall0, payloadArg0)
+                        return lowerObjConstructorCall(b, ctorCall0, resultObjName0)
+
+            var optionCtorKind0: int32 = 0
+            var optionSuffix0: str = ""
+            if kidCount(node) == 2 && mirStrStartsWith(helperCallName0, "Some_"):
+                optionCtorKind0 = 1
+                optionSuffix0 = str(ptr_add(void*(helperCallName0), 5))
+            elif kidCount(node) == 1 && mirStrStartsWith(helperCallName0, "None_"):
+                optionCtorKind0 = 2
+                optionSuffix0 = str(ptr_add(void*(helperCallName0), 5))
+            if optionCtorKind0 <= 0:
+                if kidCount(node) == 2 && helperCallName0 == "Some":
+                    optionCtorKind0 = 1
+                    optionSuffix0 = mirInferCtorSuffixFromTypeCache(b, node, "Option_")
+                elif kidCount(node) == 1 && helperCallName0 == "None":
+                    optionCtorKind0 = 2
+                    optionSuffix0 = mirInferCtorSuffixFromTypeCache(b, node, "Option_")
+            if optionCtorKind0 > 0 && optionSuffix0 != nil && len(optionSuffix0) > 0:
+                let optionObjName0: str = "Option_" + optionSuffix0
+                if !mirHasObjType(b.module, optionObjName0):
+                    let _ensOption0: bool = ensureOptionObjType(b.module, optionObjName0)
+                if mirHasObjType(b.module, optionObjName0):
+                    var ctorCall1: Node = newNode(nkCall, node.pos)
+                    addSon(ctorCall1, newIdent(optionObjName0, node.pos))
+                    var hasArg1: Node = newNode(nkCallArg, node.pos)
+                    addSon(hasArg1, newIdent("has", node.pos))
+                    addSon(hasArg1, newBoolLit(optionCtorKind0 == 1, node.pos))
+                    addSon(ctorCall1, hasArg1)
+                    if optionCtorKind0 == 1:
+                        var payloadNode1: Node = kid(node, 1)
+                        if payloadNode1 != nil && payloadNode1.kind == nkCallArg:
+                            if kidCount(payloadNode1) > 1:
+                                payloadNode1 = kid(payloadNode1, 1)
+                            elif kidCount(payloadNode1) > 0:
+                                payloadNode1 = kid(payloadNode1, 0)
+                        var payloadArg1: Node = newNode(nkCallArg, node.pos)
+                        addSon(payloadArg1, newIdent("value", node.pos))
+                        addSon(payloadArg1, payloadNode1)
+                        addSon(ctorCall1, payloadArg1)
+                    return lowerObjConstructorCall(b, ctorCall1, optionObjName0)
+
+        # Keep `__seqBytesOf[T](n)` available when generic helper emission is skipped.
+        if mirDictHelperClosureEnabled() && kidCount(node) == 2 &&
+           (helperCallName0 == "seqBytesOf" ||
+            mirStrStartsWith(helperCallName0, "seqBytesOf_")):
+            var elemTypeNode0: Node = nil
+            if typeArgs.len == 1:
+                elemTypeNode0 = typeArgs[0]
+            elif mirStrStartsWith(helperCallName0, "seqBytesOf_"):
+                let elemKey0: str = str(ptr_add(void*(helperCallName0), 11))
+                if elemKey0 != nil && len(elemKey0) > 0:
+                    elemTypeNode0 = newIdent(elemKey0, node.pos)
+            if elemTypeNode0 != nil && elemTypeNode0.kind != nkEmpty:
+                let elemSizeRes0: Result[int32] = mirSizeOfTypeNode(b.module, elemTypeNode0)
+                if !IsOk[int32](elemSizeRes0):
+                    return ErrInfo[MirExpr](ErrorInfoOf[int32](elemSizeRes0))
+                let elemSize0: int32 = Value[int32](elemSizeRes0)
+                if elemSize0 > 0:
+                    var countNode0: Node = kid(node, 1)
+                    if countNode0 != nil && countNode0.kind == nkCallArg:
+                        if kidCount(countNode0) > 1:
+                            countNode0 = kid(countNode0, 1)
+                        elif kidCount(countNode0) > 0:
+                            countNode0 = kid(countNode0, 0)
+                    let countRes0: Result[MirExpr] = lowerExprValue(b, countNode0, mirTypeI32())
+                    if !IsOk[MirExpr](countRes0):
+                        return ErrInfo[MirExpr](ErrorInfoOf[MirExpr](countRes0))
+                    let bytes64_0: MirExpr = mirBin(mbMul,
+                        mirCast(mirTypeI64(), Value[MirExpr](countRes0)),
+                        mirConstI64(int64(elemSize0)))
+                    let bytes32_0: MirExpr = mirCast(mirTypeI32(), bytes64_0)
+                    if wantType.kind != mtI32:
+                        return Ok[MirExpr](mirCast(wantType, bytes32_0))
+                    return Ok[MirExpr](bytes32_0)
         if kidCount(node) == 2 && b.module != nil:
             let aliasTy: MirType = mirTryGetTypeAlias(b.module, callName0)
             if aliasTy.kind != mtVoid:
@@ -7695,14 +8071,25 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: MirType): Result[MirExpr] 
                             addSon(notNode, newIdent("!", node.pos))
                             addSon(notNode, dotNode3)
                             return lowerExprValue(b, notNode, wantType)
-                        if name == "Error" && hasErr && moduleHasFuncByBase(b.module, "Lp2pErrorMessage"):
+                        if name == "Error" && hasErr:
                             let dotNode4: Node = newNode(nkDotExpr, node.pos)
                             addSon(dotNode4, arg0)
                             addSon(dotNode4, newIdent("err", node.pos))
-                            let errCall: Node = newNode(nkCall, node.pos)
-                            addSon(errCall, newIdent("Lp2pErrorMessage", node.pos))
-                            addSon(errCall, dotNode4)
-                            return lowerExprValue(b, errCall, wantType)
+                            if moduleHasFuncByBase(b.module, "ErrorMessage"):
+                                let errCall0: Node = newNode(nkCall, node.pos)
+                                addSon(errCall0, newIdent("ErrorMessage", node.pos))
+                                addSon(errCall0, dotNode4)
+                                return lowerExprValue(b, errCall0, wantType)
+                            if moduleHasFuncByBase(b.module, "Lp2pErrorMessage"):
+                                let errCall1: Node = newNode(nkCall, node.pos)
+                                addSon(errCall1, newIdent("Lp2pErrorMessage", node.pos))
+                                addSon(errCall1, dotNode4)
+                                return lowerExprValue(b, errCall1, wantType)
+                            if mirHasObjType(b.module, "ErrorInfo"):
+                                let msgNode0: Node = newNode(nkDotExpr, node.pos)
+                                addSon(msgNode0, dotNode4)
+                                addSon(msgNode0, newIdent("msg", node.pos))
+                                return lowerExprValue(b, msgNode0, wantType)
 
         # Legacy fallback: lower unresolved `Value(x)` from Result-like object layout.
         if b.module != nil && name == "Value" && argNodes.len == 1:
@@ -15675,19 +16062,25 @@ fn mirBuildModuleFromFileStage1(inPath: str): Result[MirModule] =
         printDiagnostics diags
         return Err[MirModule]("mir_builder: stage1 errors")
 
-    stage1Trace "internal: c-profile lowering"
-    if dbgPipe:
-        os.writeLine(dbgFile, "[backend] stage1: c_profile_start")
-        os.c_fflush dbgFile
-    root = lowerCProfile(root, &diags)
-    if dbgPipe:
-        os.writeLine(dbgFile, "[backend] stage1: c_profile_done")
-        os.c_fflush dbgFile
-    if hasError diags:
-        printDiagnostics diags
-        return Err[MirModule]("mir_builder: c-profile lowering failed")
+    let skipCProfile: bool = envIsTrue "CHENG_STAGE1_SKIP_CPROFILE"
+    if skipCProfile:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: c_profile_skipped")
+            os.c_fflush dbgFile
+    else:
+        stage1Trace "internal: c-profile lowering"
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: c_profile_start")
+            os.c_fflush dbgFile
+        root = lowerCProfile(root, &diags)
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: c_profile_done")
+            os.c_fflush dbgFile
+        if hasError diags:
+            printDiagnostics diags
+            return Err[MirModule]("mir_builder: c-profile lowering failed")
     let monoAfterCProfile: bool = !envIsTrue "CHENG_STAGE1_SKIP_MONO_AFTER_CPROFILE"
-    if !skipMono && monoAfterCProfile:
+    if !skipMono && !skipCProfile && monoAfterCProfile:
         # c_profile lowering can introduce new generic helper callsites
         # (e.g. Result/Option helpers). Run a second mono pass to ensure
         # all late-introduced generic calls are fully instantiated.

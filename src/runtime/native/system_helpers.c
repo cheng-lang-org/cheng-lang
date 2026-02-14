@@ -1248,7 +1248,36 @@ void* cheng_realloc(void* p, int32_t size) {
     }
     return out;
 }
-int32_t cheng_strlen(char* s) { return (int32_t)strlen(s ? s : ""); }
+static const char* cheng_safe_cstr(const char* s) {
+    if (s == NULL) {
+        return "";
+    }
+    uintptr_t raw = (uintptr_t)s;
+    if ((raw & (uintptr_t)0x1U) != (uintptr_t)0U) {
+        raw -= (uintptr_t)0x1U;
+    }
+#if defined(__ANDROID__) && UINTPTR_MAX > 0xffffffffu
+    /* Android crash guard: reject clearly invalid tagged/non-canonical pointers. */
+    uint16_t hi16 = (uint16_t)(raw >> 48);
+    bool hi_ok =
+        hi16 == (uint16_t)0x0000U ||
+        hi16 == (uint16_t)0xb400U ||
+        hi16 == (uint16_t)0xb500U ||
+        hi16 == (uint16_t)0xb600U ||
+        hi16 == (uint16_t)0xb700U;
+    bool suspicious_low_region = raw < (uintptr_t)0x7b10000000ULL;
+    bool suspicious_page_base = (raw & (uintptr_t)0xffffffffULL) == (uintptr_t)0x00000000ULL;
+    if (!hi_ok || suspicious_low_region || suspicious_page_base) {
+        return "";
+    }
+#endif
+    return (const char*)raw;
+}
+
+int32_t cheng_strlen(char* s) {
+    const char* safe = cheng_safe_cstr((const char*)s);
+    return (int32_t)strlen(safe);
+}
 void* cheng_memcpy(void* dest, void* src, int64_t n) { return memcpy(dest, src, (size_t)n); }
 void* cheng_memset(void* dest, int32_t val, int64_t n) { return memset(dest, val, (size_t)n); }
 void* cheng_memcpy_ffi(void* dest, void* src, int64_t n) { return cheng_memcpy(dest, src, n); }
@@ -1257,7 +1286,9 @@ __attribute__((weak)) void* alloc(int32_t size) { return cheng_malloc(size); }
 void copyMem(void* dest, void* src, int32_t size) { (void)cheng_memcpy(dest, src, (int64_t)size); }
 __attribute__((weak)) void setMem(void* dest, int32_t val, int32_t size) { (void)cheng_memset(dest, val, (int64_t)size); }
 int32_t cheng_memcmp(void* a, void* b, int64_t n) { return memcmp(a, b, (size_t)n); }
-int32_t cheng_strcmp(const char* a, const char* b) { return strcmp(a ? a : "", b ? b : ""); }
+int32_t cheng_strcmp(const char* a, const char* b) {
+    return strcmp(cheng_safe_cstr(a), cheng_safe_cstr(b));
+}
 int32_t streq(const char* a, const char* b) { return cheng_strcmp(a, b) == 0 ? 1 : 0; }
 double cheng_bits_to_f32(int32_t bits) {
     union {

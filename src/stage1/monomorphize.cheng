@@ -88,6 +88,7 @@ var monoMaybeNs: int64 = 0
 var monoMaybeScans: int32 = 0
 var monoDebugProgressMode: int8 = int8(-1)
 var monoDebugInstantiateMode: int8 = int8(-1)
+var monoEagerContainerInstMode: int8 = int8(-1)
 var monoLookupExprTypeCalls: int32 = 0
 var monoLookupExprTypeNs: int64 = 0
 var bindTypeVarsCalls: int32 = 0
@@ -292,6 +293,17 @@ fn monoDebugInstantiate(msg: str) =
         let f: os.File = os.get_stderr()
         os.writeLine(f, "[mono-inst] " + msg)
         os.c_fflush f
+
+fn monoEagerContainerInstEnabled(): bool =
+    if monoEagerContainerInstMode < int8(0):
+        let v0: str = mono_getenv("CHENG_STAGE1_EAGER_CONTAINER_INST")
+        # Keep eager container instantiation enabled by default.
+        # CHENG_STAGE1_EAGER_CONTAINER_INST=0 can be used for local profiling only.
+        if monoStrEq(v0, "0"):
+            monoEagerContainerInstMode = int8(0)
+        else:
+            monoEagerContainerInstMode = int8(1)
+    return monoEagerContainerInstMode == int8(1)
 
 fn monoProfResetKinds() =
     monoProfExprKindNs.len = 0
@@ -3425,26 +3437,27 @@ fn instantiateType(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =
     else:
         addSon(decl, newNode(nkEmpty, genNode.pos))
     add(rootStmts, decl)
-    if monoStrEq(name, "seq"):
-        instantiateFn("setLen", instArgs, rootStmts)
-        instantiateFn("reserve", instArgs, rootStmts)
-        instantiateFn("add", instArgs, rootStmts)
-        instantiateFn("get", instArgs, rootStmts)
-        instantiateFn("[]", instArgs, rootStmts)
-        instantiateFn("[]=", instArgs, rootStmts)
-        instantiateFn("arcRetainSeq", instArgs, rootStmts)
-        instantiateFn("arcReleaseSeq", instArgs, rootStmts)
-        if instArgs.len > 0 && isComparableType get(instArgs, 0):
-            instantiateFn("__cheng_vec_contains", instArgs, rootStmts)
-        instantiateFn("__cheng_slice_vec", instArgs, rootStmts)
-    elif monoStrEq(name, "Table"):
-        instantiateFn("TableNext", instArgs, rootStmts)
-        instantiateFn("TableHas", instArgs, rootStmts)
-        instantiateFn("TableGet", instArgs, rootStmts)
-        instantiateFn("TablePut", instArgs, rootStmts)
-        instantiateFn("TableLen", instArgs, rootStmts)
-        instantiateFn("arcRetainTable", instArgs, rootStmts)
-        instantiateFn("arcReleaseTable", instArgs, rootStmts)
+    if monoEagerContainerInstEnabled():
+        if monoStrEq(name, "seq"):
+            instantiateFn("setLen", instArgs, rootStmts)
+            instantiateFn("reserve", instArgs, rootStmts)
+            instantiateFn("add", instArgs, rootStmts)
+            instantiateFn("get", instArgs, rootStmts)
+            instantiateFn("[]", instArgs, rootStmts)
+            instantiateFn("[]=", instArgs, rootStmts)
+            instantiateFn("arcRetainSeq", instArgs, rootStmts)
+            instantiateFn("arcReleaseSeq", instArgs, rootStmts)
+            if instArgs.len > 0 && isComparableType get(instArgs, 0):
+                instantiateFn("__cheng_vec_contains", instArgs, rootStmts)
+            instantiateFn("__cheng_slice_vec", instArgs, rootStmts)
+        elif monoStrEq(name, "Table"):
+            instantiateFn("TableNext", instArgs, rootStmts)
+            instantiateFn("TableHas", instArgs, rootStmts)
+            instantiateFn("TableGet", instArgs, rootStmts)
+            instantiateFn("TablePut", instArgs, rootStmts)
+            instantiateFn("TableLen", instArgs, rootStmts)
+            instantiateFn("arcRetainTable", instArgs, rootStmts)
+            instantiateFn("arcReleaseTable", instArgs, rootStmts)
     return true
 
 fn instantiateFn(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =

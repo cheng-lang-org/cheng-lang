@@ -21,6 +21,7 @@ Env:
   CHENG_FRONTIER_GENERIC_MODE=<dict|hybrid> Generic mode for frontier probes (default: dict)
   CHENG_FRONTIER_GENERIC_SPEC_BUDGET=<n>    Generic spec budget (default: 0)
   CHENG_FRONTIER_CACHE=<path>        Cache root (default: chengcache/libp2p_frontier)
+  CHENG_CACHE_DIR=<path>             Stage1 token cache dir (default: <CHENG_CACHE>/stage1)
   CHENG_FRONTIER_SKIP_SEM=<0|1>      Stage1 skip semantics (default: 1)
   CHENG_FRONTIER_SKIP_OWNERSHIP=<0|1> Stage1 skip ownership (default: 1)
   CHENG_FRONTIER_VALIDATE=<0|1>      Backend MIR validate (default: 0)
@@ -159,6 +160,7 @@ fi
 
 FRONTIER_CACHE="${CHENG_FRONTIER_CACHE:-$CHENG_ROOT/chengcache/libp2p_frontier}"
 CHENG_CACHE="${CHENG_CACHE:-$FRONTIER_CACHE/cache}"
+CHENG_CACHE_DIR="${CHENG_CACHE_DIR:-$CHENG_CACHE/stage1}"
 OUT_DIR="$FRONTIER_CACHE/out"
 LOG_DIR="$FRONTIER_CACHE/logs"
 PROBE_TIMEOUT="${CHENG_FRONTIER_TIMEOUT:-180}"
@@ -176,7 +178,7 @@ FRONTIER_TIMEOUT_DIAG_TOOL="${CHENG_FRONTIER_TIMEOUT_DIAG_TOOL:-sample}"
 FRONTIER_TIMEOUT_DIAG_SUMMARY="${CHENG_FRONTIER_TIMEOUT_DIAG_SUMMARY:-1}"
 FRONTIER_TIMEOUT_DIAG_SUMMARY_TOP="${CHENG_FRONTIER_TIMEOUT_DIAG_SUMMARY_TOP:-12}"
 timeout_diag_last_file=""
-mkdir -p "$CHENG_CACHE" "$OUT_DIR" "$LOG_DIR"
+mkdir -p "$CHENG_CACHE" "$CHENG_CACHE_DIR" "$OUT_DIR" "$LOG_DIR"
 
 sanitize_diag_label() {
   printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '_'
@@ -257,6 +259,7 @@ add_pkg_root "$NET_ROOT"
 add_pkg_root "$OBS_ROOT"
 export CHENG_PKG_ROOTS
 export CHENG_CACHE
+export CHENG_CACHE_DIR
 
 if [ -z "${CHENG_PKG_ROOT:-}" ]; then
   parent_guess="$(dirname "$LIBP2P_ROOT")"

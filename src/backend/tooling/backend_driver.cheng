@@ -143,6 +143,12 @@ fn driver_runCmd(command: str) =
     if res.exitCode != 0:
         panic("" + res.output)
 
+fn driver_execCmd(command: str): os.ExecCmdResult =
+    let opts: uint64 = os.processOptionMask(os.poStdErrToStdOut) |
+                       os.processOptionMask(os.poUsePath) |
+                       os.processOptionMask(os.poEvalCommand)
+    return os.execCmdEx(command, opts, "")
+
 fn driver_panicResult(res: Result[T]) =
     let info: ErrorInfo = ErrorInfoOf[T](res)
     let msg: str = ErrorFormat(info)
@@ -1102,6 +1108,149 @@ fn driver_seqContainsStr(items: str[], value: str): bool =
         if (items[i] == value):
             return true
     return false
+
+fn driver_stripLeadingUnderscores(raw: str): str =
+    if driver_strIsEmpty(raw):
+        return ""
+    let n: int32 = len(raw)
+    var i: int32 = 0
+    while i < n && raw[i] == '_':
+        i = i + 1
+    if i <= 0:
+        return raw
+    if i >= n:
+        return ""
+    return str(ptr_add(void*(raw), i))
+
+fn driver_lineLastToken(line: str): str =
+    if driver_strIsEmpty(line):
+        return ""
+    let n: int32 = len(line)
+    var end: int32 = n
+    let __for_start_trim = end
+    for __for_rev_trim in 0..(__for_start_trim - (0)):
+        end = __for_start_trim - __for_rev_trim
+        if !(end > 0 && driver_isSpaceChar(line[end - 1])):
+            break
+    if end <= 0:
+        return ""
+    var start: int32 = end - 1
+    let __for_start_scan = start
+    for __for_rev_scan in 0..(__for_start_scan - (0)):
+        start = __for_start_scan - __for_rev_scan
+        if !(start > 0 && !driver_isSpaceChar(line[start - 1])):
+            break
+    if start < 0 || start >= end:
+        return ""
+    return os.sliceStr(line, start, end - 1)
+
+fn driver_normalizeDictHelperSymbol(rawSym: str): str =
+    let sym0: str = driver_trimAsciiSpace(rawSym)
+    if driver_strIsEmpty(sym0):
+        return ""
+    let sym: str = driver_stripLeadingUnderscores(sym0)
+    if driver_strIsEmpty(sym):
+        return ""
+    if driver_strEq(sym, "reserve"):
+        return "reserve"
+    if driver_strEq(sym, "setLen"):
+        return "setLen"
+    if driver_strEq(sym, "seqBytesOf"):
+        return "__seqBytesOf"
+    if driver_strHasPrefix(sym, "seqBytesOf_"):
+        return "__" + sym
+    if driver_strHasPrefix(sym, "Ok_") ||
+       driver_strHasPrefix(sym, "Err_") ||
+       driver_strHasPrefix(sym, "ErrInfo_") ||
+       driver_strHasPrefix(sym, "Some_") ||
+       driver_strHasPrefix(sym, "None_"):
+        return sym
+    return ""
+
+fn driver_collectDictHelperUndefSymbols(output: str, out: var str[], seen: var hashmaps.HashMapStrInt) =
+    if driver_strIsEmpty(output):
+        return
+    let n: int32 = len(output)
+    var start: int32 = 0
+    for i in 0..n:
+        if i == n || output[i] == '\n':
+            if i > start:
+                let lineRaw: str = os.sliceStr(output, start, i - 1)
+                let symRaw: str = driver_lineLastToken(lineRaw)
+                let sym: str = driver_normalizeDictHelperSymbol(symRaw)
+                if driver_strNonEmpty(sym):
+                    driver_mapAddUniqueStr(out, seen, sym)
+            start = i + 1
+
+fn driver_collectDictHelperDefinedSymbols(output: str, out: var str[], seen: var hashmaps.HashMapStrInt) =
+    if driver_strIsEmpty(output):
+        return
+    let n: int32 = len(output)
+    var start: int32 = 0
+    for i in 0..n:
+        if i == n || output[i] == '\n':
+            if i > start:
+                let lineRaw: str = os.sliceStr(output, start, i - 1)
+                let line: str = driver_trimAsciiSpace(lineRaw)
+                if driver_strNonEmpty(line):
+                    let isUndef: bool = driver_strHasPrefix(line, "U ") || driver_strContains(line, " U ")
+                    if !isUndef:
+                        let symRaw: str = driver_lineLastToken(line)
+                        let sym: str = driver_normalizeDictHelperSymbol(symRaw)
+                        if driver_strNonEmpty(sym):
+                            driver_mapAddUniqueStr(out, seen, sym)
+            start = i + 1
+
+fn driver_emitDictLinkClosureMissing(missing: str[]) =
+    var miss: str[] = missing
+    driver_sortStringsStable(&miss)
+    let maxShow: int32 = 20
+    var msg: str = "backend_driver: dict_link_closure_missing"
+    msg = msg + "\nhelpers="
+    let shown: int32 = (miss.len > maxShow) ? maxShow : miss.len
+    for i in 0..<shown:
+        if i > 0:
+            msg = msg + ", "
+        msg = msg + miss[i]
+    if miss.len > maxShow:
+        msg = msg + ", ... +" + intToStr(miss.len - maxShow)
+    panic(msg)
+
+fn driver_dictLinkClosurePrecheck(objPaths: str[], runtimeObj: str, genericMode: str) =
+    let gm: str = lowerAscii(driver_trimAsciiSpace(genericMode))
+    if !driver_strEq(gm, "dict") && !driver_strEq(gm, "dictionary"):
+        return
+    var undefHelpers: str[]
+    var undefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+    var defHelpers: str[]
+    var defSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+
+    for i in 0..<objPaths.len:
+        let objPath: str = objPaths[i]
+        if driver_strIsEmpty(objPath) || !frontend_lib.stage1_fileExists(objPath):
+            continue
+        let undefRes: os.ExecCmdResult = driver_execCmd("nm -u " + driver_shellQuote(objPath) + " 2>/dev/null")
+        if undefRes.exitCode == 0:
+            driver_collectDictHelperUndefSymbols(undefRes.output, undefHelpers, undefSeen)
+        let defRes: os.ExecCmdResult = driver_execCmd("nm -g " + driver_shellQuote(objPath) + " 2>/dev/null")
+        if defRes.exitCode == 0:
+            driver_collectDictHelperDefinedSymbols(defRes.output, defHelpers, defSeen)
+
+    if driver_strNonEmpty(runtimeObj) && frontend_lib.stage1_fileExists(runtimeObj):
+        let runtimeDefRes: os.ExecCmdResult = driver_execCmd("nm -g " + driver_shellQuote(runtimeObj) + " 2>/dev/null")
+        if runtimeDefRes.exitCode == 0:
+            driver_collectDictHelperDefinedSymbols(runtimeDefRes.output, defHelpers, defSeen)
+
+    var missing: str[]
+    var missingSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+    for i in 0..<undefHelpers.len:
+        let sym: str = undefHelpers[i]
+        var existsDef: bool = false
+        let _defVal: int32 = hashmaps.hashMapStrIntGetEx(defSeen, sym, existsDef)
+        if !existsDef:
+            driver_mapAddUniqueStr(missing, missingSeen, sym)
+    if missing.len > 0:
+        driver_emitDictLinkClosureMissing(missing)
 
 fn driver_mapAddUniqueStr(items: var str[], seen: var hashmaps.HashMapStrInt, value: str) =
     if driver_strIsEmpty(value):
@@ -2460,7 +2609,8 @@ fn driver_emitObjFromModule(module: MirModule, target: str, objWriter: str, outP
         panic("backend_driver: failed to write object file: " + outPath)
 
 fn driver_runParallelUnitBatchesFork(full: MirModule, unitIndex: DriverUnitIndex, target: str, objWriter: str,
-                                     pendingUnits: str[], pendingObjs: str[], jobs: int32) =
+                                     pendingUnits: str[], pendingObjs: str[],
+                                     pendingUnitIdxs: int32[], jobs: int32) =
     if full == nil || unitIndex == nil || pendingUnits.len == 0:
         return
     let workerCount: int32 = driver_parallelWorkerCount(pendingUnits.len, jobs)
@@ -2488,11 +2638,19 @@ fn driver_runParallelUnitBatchesFork(full: MirModule, unitIndex: DriverUnitIndex
                     if idx >= 0 && idx < pendingUnits.len && idx < pendingObjs.len:
                         let fp: str = pendingUnits[idx]
                         let objPath: str = pendingObjs[idx]
-                        var found: bool = false
-                        let unitIdx: int32 = hashmaps.hashMapStrIntGetEx(unitIndex.unitIndex, fp, found)
-                        if !found:
-                            panic("backend_driver: unit file not found in module: " + fp)
-                        let u: MirModule = driver_buildUnitModuleFromIndex(full, fp, unitIdx, unitIndex)
+                        var u: MirModule = nil
+                        var unitIdx: int32 = -1
+                        if idx < pendingUnitIdxs.len:
+                            unitIdx = pendingUnitIdxs[idx]
+                        if unitIdx >= 0:
+                            u = driver_buildUnitModuleFromIndex(full, fp, unitIdx, unitIndex)
+                        if u == nil:
+                            var found: bool = false
+                            let mappedIdx: int32 = hashmaps.hashMapStrIntGetEx(unitIndex.unitIndex, fp, found)
+                            if found && mappedIdx >= 0:
+                                u = driver_buildUnitModuleFromIndex(full, fp, mappedIdx, unitIndex)
+                        if u == nil:
+                            u = driver_buildUnitModule(full, fp)
                         u.target = target
                         driver_emitObjFromModule(u, target, objWriter, objPath)
                 system.exit 0
@@ -2581,9 +2739,11 @@ fn driver_resolveUnitFileFromList(unitFiles: str[], requested: str): str =
 
 fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtabAll: bool,
                          ldCmd: str, cflags: str, ldflags: str,
-                         outputPath: str, runtimeObj: str, runtimeC: str, noRuntimeC: bool) =
+                         outputPath: str, runtimeObj: str, runtimeC: str, noRuntimeC: bool,
+                         genericMode: str) =
     if objPaths.len == 0:
         panic "backend_driver: no object files to link"
+    driver_dictLinkClosurePrecheck(objPaths, runtimeObj, genericMode)
     if driver_strEq(linker, "self"):
         var linkObjs: str[]
         for i in 0..<objPaths.len:
@@ -2878,7 +3038,7 @@ fn backendMain(): int32 =
             panic("backend_driver: object list is empty: " + linkObjsFile)
         driver_profileStepBoth(profile, uirProfile, "link_objs.load_list")
         driver_linkExeObjects(objPathsFromList, target, linker, linkerSymtabAll, ldCmd, cflags, ldflags,
-                              outputPath, runtimeObj, runtimeC, noRuntimeC)
+                              outputPath, runtimeObj, runtimeC, noRuntimeC, genericMode)
         driver_profileStepBoth(profile, uirProfile, "link_objs.link")
         return 0
 
@@ -2966,6 +3126,7 @@ fn backendMain(): int32 =
         var linkObjs: str[]
         var pendingUnits: str[]
         var pendingObjs: str[]
+        var pendingUnitIdxs: int32[]
         var pendingStampPaths: str[]
         var pendingStampTexts: str[]
         for ui in 0..<unitFiles.len:
@@ -2991,6 +3152,7 @@ fn backendMain(): int32 =
             if needsBuild:
                 add(pendingUnits, unitFile)
                 add(pendingObjs, objPath)
+                add(pendingUnitIdxs, ui)
                 add(pendingStampPaths, stampPath)
                 add(pendingStampTexts, stampText)
         driver_profileStepBoth(profile, uirProfile, "multi.plan")
@@ -2998,7 +3160,8 @@ fn backendMain(): int32 =
             let workerCount: int32 = driver_parallelWorkerCount(pendingUnits.len, jobs)
             if allowForkParallel0 && workerCount > 1 && unitIndex != nil:
                 driver_runParallelUnitBatchesFork(mod, unitIndex, target, objWriter,
-                                                  pendingUnits, pendingObjs, jobs)
+                                                  pendingUnits, pendingObjs,
+                                                  pendingUnitIdxs, jobs)
             else:
                 driver_runSerialUnitBatches(mod, unitIndex, target, objWriter,
                                             pendingUnits, pendingObjs)
@@ -3010,7 +3173,7 @@ fn backendMain(): int32 =
             driver_emitObjFromModule(mod, target, objWriter, fallbackObj)
             add(linkObjs, fallbackObj)
         driver_linkExeObjects(linkObjs, target, linker, linkerSymtabAll, ldCmd, cflags, ldflags,
-                              outputPath, runtimeObj, runtimeC, noRuntimeC)
+                              outputPath, runtimeObj, runtimeC, noRuntimeC, genericMode)
         driver_profileStepBoth(profile, uirProfile, "multi.link")
         driver_releaseDirLock(lockDir, lockOwner)
         return 0
@@ -3022,7 +3185,7 @@ fn backendMain(): int32 =
         var linkObjs2: str[]
         add(linkObjs2, objPath)
         driver_linkExeObjects(linkObjs2, target, linker, linkerSymtabAll, ldCmd, cflags, ldflags,
-                              outputPath, runtimeObj, runtimeC, noRuntimeC)
+                              outputPath, runtimeObj, runtimeC, noRuntimeC, genericMode)
         driver_profileStepBoth(profile, uirProfile, "single.link")
     return 0
 
