@@ -1,0 +1,167 @@
+import std/os
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import cheng/libp2p/utils/system as sys
+import std/strings
+
+type
+    RawFile = void*
+
+@importc("cheng_fopen")
+fn c_fopen_file_bytes(filename, mode: cstring): RawFile
+@importc("cheng_fclose")
+fn c_fclose_file_bytes(f: RawFile): int32
+@importc("cheng_fread")
+fn c_fread_file_bytes(ptr: void*, size, n: int64, stream: RawFile): int32
+@importc("cheng_fwrite")
+fn c_fwrite_file_bytes(ptr: void*, size, n: int64, stream: RawFile): int32
+@importc("cheng_fseek")
+fn c_fseek_file_bytes(stream: RawFile, offset: int64, whence: int32): int32
+@importc("cheng_ftell")
+fn c_ftell_file_bytes(stream: RawFile): int64
+
+fn readFileBytes(path: str): result.Result[bytes.Bytes] =
+    if path == nil || len(path) == 0:
+        return result.Err[bytes.Bytes]("file: empty path")
+    let f: RawFile = c_fopen_file_bytes(path, "rb")
+    if f == nil:
+        return result.Err[bytes.Bytes]("file: open failed")
+    var cap: int32 = 4096
+    var lenRead: int32 = 0
+    var buf: void* = sys.alloc(cap)
+    if buf == nil:
+        c_fclose_file_bytes(f)
+        return result.Err[bytes.Bytes]("file: alloc failed")
+    while true:
+        let avail: int32 = cap - lenRead
+        if avail <= 0:
+            cap = cap * 2
+            let nextBuf: void* = sys.realloc(buf, cap)
+            if nextBuf == nil:
+                sys.dealloc(buf)
+                c_fclose_file_bytes(f)
+                return result.Err[bytes.Bytes]("file: realloc failed")
+            buf = nextBuf
+            continue
+        let dst: void* = sys.ptr_add(buf, lenRead)
+        let got: int32 = c_fread_file_bytes(dst, 1, int64(avail), f)
+        if got <= 0:
+            break
+        os.ioMeterReport(os.ioRead, int64(got))
+        lenRead = lenRead + got
+        if got < avail:
+            break
+    c_fclose_file_bytes(f)
+    if lenRead <= 0:
+        sys.dealloc(buf)
+        return result.Ok[bytes.Bytes](bytes.emptyBytes())
+    return result.Ok[bytes.Bytes](bytes.Bytes(data: buf, len: lenRead))
+
+fn writeFileBytes(path: str, data: bytes.Bytes): result.Result[bool] =
+    if path == nil || len(path) == 0:
+        return result.Err[bool]("file: empty path")
+    let f: RawFile = c_fopen_file_bytes(path, "wb")
+    if f == nil:
+        return result.Err[bool]("file: open failed")
+    let total: int32 = bytes.bytesLen(data)
+    if total > 0:
+        let wrote: int32 = c_fwrite_file_bytes(data.data, 1, int64(total), f)
+        os.ioMeterReport(os.ioWrite, int64(wrote))
+        c_fclose_file_bytes(f)
+        if wrote != total:
+            return result.Err[bool]("file: short write")
+        return result.Ok[bool](true)
+    c_fclose_file_bytes(f)
+    return result.Ok[bool](true)
+
+fn fileSizeBytes(path: str): result.Result[int64] =
+    if path == nil || len(path) == 0:
+        return result.Err[int64]("file: empty path")
+    let f: RawFile = c_fopen_file_bytes(path, "rb")
+    if f == nil:
+        return result.Err[int64]("file: open failed")
+    let seekRes: int32 = c_fseek_file_bytes(f, 0, 2)
+    if seekRes != 0:
+        c_fclose_file_bytes(f)
+        return result.Err[int64]("file: seek failed")
+    let size: int64 = c_ftell_file_bytes(f)
+    c_fclose_file_bytes(f)
+    if size < 0:
+        return result.Err[int64]("file: size failed")
+    return result.Ok[int64](size)
+
+fn readFileSlice(path: str, offset: int64, length: int32): result.Result[bytes.Bytes] =
+    if path == nil || len(path) == 0:
+        return result.Err[bytes.Bytes]("file: empty path")
+    if length <= 0:
+        return result.Ok[bytes.Bytes](bytes.emptyBytes())
+    if offset < 0:
+        return result.Err[bytes.Bytes]("file: invalid offset")
+    let f: RawFile = c_fopen_file_bytes(path, "rb")
+    if f == nil:
+        return result.Err[bytes.Bytes]("file: open failed")
+    if c_fseek_file_bytes(f, offset, 0) != 0:
+        c_fclose_file_bytes(f)
+        return result.Err[bytes.Bytes]("file: seek failed")
+    var out: bytes.Bytes = bytes.bytesAlloc(length)
+    let got: int32 = c_fread_file_bytes(out.data, 1, int64(length), f)
+    if got > 0:
+        os.ioMeterReport(os.ioRead, int64(got))
+    c_fclose_file_bytes(f)
+    if got <= 0:
+        return result.Ok[bytes.Bytes](bytes.emptyBytes())
+    out.len = got
+    return result.Ok[bytes.Bytes](out)
+
+fn writeFileSlice(path: str, offset: int64, data: bytes.Bytes): result.Result[bool] =
+    if path == nil || len(path) == 0:
+        return result.Err[bool]("file: empty path")
+    if offset < 0:
+        return result.Err[bool]("file: invalid offset")
+    let total: int32 = bytes.bytesLen(data)
+    var mode = "r+b"
+    if ! os.fileExists(path):
+        mode = "wb"
+    let f: RawFile = c_fopen_file_bytes(path, mode)
+    if f == nil:
+        return result.Err[bool]("file: open failed")
+    if c_fseek_file_bytes(f, offset, 0) != 0:
+        c_fclose_file_bytes(f)
+        return result.Err[bool]("file: seek failed")
+    if total > 0:
+        let wrote: int32 = c_fwrite_file_bytes(data.data, 1, int64(total), f)
+        os.ioMeterReport(os.ioWrite, int64(wrote))
+        c_fclose_file_bytes(f)
+        if wrote != total:
+            return result.Err[bool]("file: short write")
+        return result.Ok[bool](true)
+    c_fclose_file_bytes(f)
+    return result.Ok[bool](true)
+
+fn checksumFile(path: str): result.Result[int64] =
+    if path == nil || len(path) == 0:
+        return result.Err[int64]("file: empty path")
+    let f: RawFile = c_fopen_file_bytes(path, "rb")
+    if f == nil:
+        return result.Err[int64]("file: open failed")
+    let chunk: int32 = 65536
+    var buf: void* = sys.alloc(chunk)
+    if buf == nil:
+        c_fclose_file_bytes(f)
+        return result.Err[int64]("file: alloc failed")
+    var sum: int64 = 0
+    while true:
+        let got: int32 = c_fread_file_bytes(buf, 1, int64(chunk), f)
+        if got <= 0:
+            break
+        os.ioMeterReport(os.ioRead, int64(got))
+        for i in 0..<got:
+            let p: void* = sys.ptr_add(buf, i)
+            let p8: int8* = int8*(p)
+            var v: int32 = int32(*p8)
+            if v < 0:
+                v = v + 256
+            sum = sum + int64(v)
+    sys.dealloc(buf)
+    c_fclose_file_bytes(f)
+    return result.Ok[int64](sum)

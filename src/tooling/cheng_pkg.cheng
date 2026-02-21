@@ -1,0 +1,197 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/pkg_manifest as dpkg
+import cheng/decentralized/registry_local as dreg
+import cheng/libp2p/utils/result as result
+import std/strings
+
+type
+    Args =
+        cmd: str
+        manifestPath: str
+        lockPath: str
+        registryPath: str
+        outPath: str
+        format: str
+        packageId: str
+        channel: str
+        ok: bool
+        error: str
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng_pkg <command> [args]")
+    printLine("")
+    printLine("commands:")
+    printLine("  resolve --manifest:<file> [--registry:<path>] [--out:<file>] [--format:toml|yaml|json]")
+    printLine("  verify  --lock:<file> [--registry:<path>]")
+    printLine("  meta    --lock:<file> --package:<id> --channel:<edge|stable|lts>")
+    printLine("          [--registry:<path>] [--out:<file>] [--format:toml|yaml|json]")
+
+fn parseArgs(): Args =
+    var res: Args
+    res.ok = true
+    res.format = "toml"
+    let count = cmdline.paramCount()
+    if count <= 0:
+        res.ok = false
+        res.error = "missing command"
+        return res
+    res.cmd = cmdline.paramStr(1)
+    if res.cmd == "resolve" || res.cmd == "meta":
+        res.registryPath = "build/cheng_registry/registry.jsonl"
+    for i in 2..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--manifest:"):
+            res.manifestPath = strings.dropPrefix(arg, "--manifest:")
+        elif strutil.startsWith(arg, "--lock:"):
+            res.lockPath = strings.dropPrefix(arg, "--lock:")
+        elif strutil.startsWith(arg, "--package:"):
+            res.packageId = strings.dropPrefix(arg, "--package:")
+        elif strutil.startsWith(arg, "--channel:"):
+            res.channel = strings.dropPrefix(arg, "--channel:")
+        elif strutil.startsWith(arg, "--registry:"):
+            res.registryPath = strings.dropPrefix(arg, "--registry:")
+        elif strutil.startsWith(arg, "--out:"):
+            res.outPath = strings.dropPrefix(arg, "--out:")
+        elif strutil.startsWith(arg, "--format:"):
+            res.format = strutil.toLowerAscii(strings.dropPrefix(arg, "--format:"))
+    return res
+
+fn writeOutputText(outPath: str, text: str) =
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+
+fn cmdResolve(args: Args): int32 =
+    if args.manifestPath == nil || len(args.manifestPath) == 0:
+        printErr("resolve: missing --manifest")
+        return 1
+    if args.registryPath == nil || len(args.registryPath) == 0:
+        printErr("resolve: missing --registry")
+        return 1
+    let manifestRes: result.Result[dpkg.PackageManifest] = dpkg.loadManifestFile(args.manifestPath)
+    if result.IsErr(manifestRes):
+        printErr("resolve: load manifest failed")
+        return 1
+    let lockRes: result.Result[dpkg.PackageLock] =
+        dpkg.resolveManifest(result.Value(manifestRes), args.registryPath)
+    if result.IsErr(lockRes):
+        printErr("resolve: failed")
+        return 1
+    let lock = result.Value(lockRes)
+    if args.format == "json":
+        let node = dpkg.lockToJson(lock)
+        let text = json.pretty(node)
+        writeOutputText(args.outPath, text)
+        return 0
+    if args.format == "yaml" || args.format == "yml":
+        let text = dpkg.lockToYaml(lock)
+        writeOutputText(args.outPath, text)
+        return 0
+    if args.format == "toml" || args.format == "":
+        let text = dpkg.lockToToml(lock)
+        writeOutputText(args.outPath, text)
+        return 0
+    printErr("resolve: unknown format")
+    return 1
+
+fn cmdVerify(args: Args): int32 =
+    if args.lockPath == nil || len(args.lockPath) == 0:
+        printErr("verify: missing --lock")
+        return 1
+    let lockRes: result.Result[dpkg.PackageLock] = dpkg.loadLockFile(args.lockPath)
+    if result.IsErr(lockRes):
+        printErr("verify: load lock failed")
+        return 1
+    let lock = result.Value(lockRes)
+    let conflicts = dpkg.collectDependencyConflicts(lock)
+    if conflicts.len > 0:
+        printErr("verify: single-version conflict")
+        let report = dpkg.dependencyConflictsToText(conflicts)
+        if report != nil && len(report) > 0:
+            printErr(report)
+        return 1
+    if ! dpkg.verifyLock(lock):
+        printErr("verify: signature failed")
+        return 1
+    if args.registryPath != nil && len(args.registryPath) > 0:
+        if ! dpkg.verifyLockAgainstRegistry(lock, args.registryPath):
+            printErr("verify: registry mismatch")
+            return 1
+    printLine("ok")
+    return 0
+
+fn cmdMeta(args: Args): int32 =
+    if args.lockPath == nil || len(args.lockPath) == 0:
+        printErr("meta: missing --lock")
+        return 1
+    if args.packageId == nil || len(args.packageId) == 0:
+        printErr("meta: missing --package")
+        return 1
+    if args.channel == nil || len(args.channel) == 0:
+        printErr("meta: missing --channel")
+        return 1
+    if args.registryPath == nil || len(args.registryPath) == 0:
+        printErr("meta: missing --registry")
+        return 1
+    let lockRes: result.Result[dpkg.PackageLock] = dpkg.loadLockFile(args.lockPath)
+    if result.IsErr(lockRes):
+        printErr("meta: load lock failed")
+        return 1
+    let lock = result.Value(lockRes)
+    if lock.packageId != nil && len(lock.packageId) > 0 && lock.packageId != args.packageId:
+        printErr("meta: package mismatch")
+        return 1
+    let snapRes: result.Result[dreg.PackageSnapshot] =
+        dreg.resolveSnapshot(args.registryPath, args.packageId, args.channel)
+    if result.IsErr(snapRes):
+        printErr("meta: snapshot not found")
+        return 1
+    let meta = dpkg.buildMetaFromLock(lock, result.Value(snapRes))
+    if args.format == "json":
+        let node = dpkg.metaToJson(meta)
+        let text = json.pretty(node)
+        writeOutputText(args.outPath, text)
+        return 0
+    if args.format == "yaml" || args.format == "yml":
+        let text = dpkg.metaToYaml(meta)
+        writeOutputText(args.outPath, text)
+        return 0
+    if args.format == "toml" || args.format == "":
+        let text = dpkg.metaToToml(meta)
+        writeOutputText(args.outPath, text)
+        return 0
+    printErr("meta: unknown format")
+    return 1
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let args: Args = parseArgs()
+    if ! args.ok:
+        printUsage()
+        if args.error != nil && len(args.error) > 0:
+            printErr(args.error)
+        return 1
+    if args.cmd == "--help" || args.cmd == "-h" || args.cmd == "help":
+        printUsage()
+        return 0
+    if args.cmd == "resolve":
+        return cmdResolve(args)
+    if args.cmd == "verify":
+        return cmdVerify(args)
+    if args.cmd == "meta":
+        return cmdMeta(args)
+    printUsage()
+    return 1

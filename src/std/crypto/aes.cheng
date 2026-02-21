@@ -1,0 +1,177 @@
+# AES block cipher(128/256-bit, encryption only).
+
+import std/result
+import std/rawbytes
+import std/crypto/gf256
+const
+    aesBlockSize = 16
+    aesKey128Size = 16
+    aesKey256Size = 32
+    aesMaxRounds = 14
+    aesSboxLen = 256
+    aesRconLen = 10
+    aesMaxWordCount = 60
+
+fn aesRotl8(v: int32, shift: int32): int32 =
+    let s: int32 = shift & 7
+    let x: int32 = v & 0xFF
+    return ((x << s) | (x >> (8 - s))) & 0xFF
+
+fn aesInitSbox(): Bytes =
+    let out: Bytes = bytesAlloc(aesSboxLen)
+    for i in 0..<aesSboxLen:
+        var inv: int32 = 0
+        if i != 0:
+            let invRes: Result[int32] = gf256Inv(i)
+            if IsOk(invRes):
+                inv = Value(invRes)
+        let x: int32 = inv & 0xFF
+        let s: int32 = 0x63 ^ x ^ aesRotl8(x, 1) ^ aesRotl8(x, 2) ^ aesRotl8(x, 3) ^ aesRotl8(x, 4)
+        bytesSet(out, i, s)
+    return out
+
+fn aesInitRcon(): Bytes =
+    let out: Bytes = bytesAlloc(aesRconLen)
+    var v: int32 = 1
+    for i in 0..<aesRconLen:
+        bytesSet(out, i, v)
+        v = gf256Mul(v, 2)
+    return out
+
+var AesSbox: Bytes = aesInitSbox()
+var AesRcon: Bytes = aesInitRcon()
+
+type
+    AesRoundKeys =
+        rounds: int32
+        data: Bytes
+
+fn aesSubByte(v: int32): int32 =
+    return bytesGet(AesSbox, v & 0xff)
+
+fn aesRotWord(word: int64): int64 =
+    let b0: int64 = (word >> 24) & 0xff
+    let b1: int64 = (word >> 16) & 0xff
+    let b2: int64 = (word >> 8) & 0xff
+    let b3: int64 = word & 0xff
+    return (b1 << 24) | (b2 << 16) | (b3 << 8) | b0
+
+fn aesSubWord(word: int64): int64 =
+    let b0: int64 = aesSubByte(int32((word >> 24) & 0xff))
+    let b1: int64 = aesSubByte(int32((word >> 16) & 0xff))
+    let b2: int64 = aesSubByte(int32((word >> 8) & 0xff))
+    let b3: int64 = aesSubByte(int32(word & 0xff))
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+fn aesKeyExpand(key: Bytes): Result[AesRoundKeys] =
+    let keyLen: int32 = bytesLen(key)
+    var nk: int32 = 0
+    var nr: int32 = 0
+    if keyLen == aesKey128Size:
+        nk = 4
+        nr = 10
+    elif keyLen == aesKey256Size:
+        nk = 8
+        nr = 14
+    else:
+        return Err[AesRoundKeys]("aes: invalid key length")
+    let wLen: int32 = 4 * (nr + 1)
+    var w: int64[aesMaxWordCount]
+    for i in 0..<nk:
+        let b0: int64 = int64(bytesGet(key, i * 4))
+        let b1: int64 = int64(bytesGet(key, i * 4 + 1))
+        let b2: int64 = int64(bytesGet(key, i * 4 + 2))
+        let b3: int64 = int64(bytesGet(key, i * 4 + 3))
+        w[i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    i = nk
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<wLen:
+        i = __for_i_1
+        var temp: int64 = w[i - 1]
+        if (i % nk) == 0:
+            let r: int64 = int64(bytesGet(AesRcon, (i / nk) - 1)) << 24
+            temp = aesSubWord(aesRotWord(temp)) ^ r
+        elif nk > 6 && (i % nk) == 4:
+            temp = aesSubWord(temp)
+        w[i] = w[i - nk] ^ temp
+        i = i + 1
+    let outLen: int32 = (nr + 1) * aesBlockSize
+    let out: Bytes = bytesAlloc(outLen)
+    i = 0
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<wLen:
+        i = __for_i_2
+        let word: int64 = w[i]
+        bytesSet(out, i * 4, int32((word >> 24) & 0xff))
+        bytesSet(out, i * 4 + 1, int32((word >> 16) & 0xff))
+        bytesSet(out, i * 4 + 2, int32((word >> 8) & 0xff))
+        bytesSet(out, i * 4 + 3, int32(word & 0xff))
+        i = i + 1
+    return Ok[AesRoundKeys](AesRoundKeys(rounds: nr, data: out))
+
+fn aesAddRoundKey(state: var Bytes, roundKeys: Bytes, round: int32) =
+    var i: int32 = 0
+    let offset: int32 = round * aesBlockSize
+    let __for_start_i_3 = i
+    for __for_i_3 in __for_start_i_3..<aesBlockSize:
+        i = __for_i_3
+        let v: int32 = bytesGet(state, i) ^ bytesGet(roundKeys, offset + i)
+        bytesSet(state, i, v)
+        i = i + 1
+
+fn aesSubBytes(state: var Bytes) =
+    for i in 0..<aesBlockSize:
+        bytesSet(state, i, aesSubByte(bytesGet(state, i)))
+
+fn aesShiftRows(state: var Bytes) =
+    let tmp: Bytes = bytesAlloc(aesBlockSize)
+    bytesSet(tmp, 0, bytesGet(state, 0))
+    bytesSet(tmp, 1, bytesGet(state, 5))
+    bytesSet(tmp, 2, bytesGet(state, 10))
+    bytesSet(tmp, 3, bytesGet(state, 15))
+    bytesSet(tmp, 4, bytesGet(state, 4))
+    bytesSet(tmp, 5, bytesGet(state, 9))
+    bytesSet(tmp, 6, bytesGet(state, 14))
+    bytesSet(tmp, 7, bytesGet(state, 3))
+    bytesSet(tmp, 8, bytesGet(state, 8))
+    bytesSet(tmp, 9, bytesGet(state, 13))
+    bytesSet(tmp, 10, bytesGet(state, 2))
+    bytesSet(tmp, 11, bytesGet(state, 7))
+    bytesSet(tmp, 12, bytesGet(state, 12))
+    bytesSet(tmp, 13, bytesGet(state, 1))
+    bytesSet(tmp, 14, bytesGet(state, 6))
+    bytesSet(tmp, 15, bytesGet(state, 11))
+    state = tmp
+
+fn aesMixColumns(state: var Bytes) =
+    for col in 0..<4:
+        let idx: int32 = col * 4
+        let a0: int32 = bytesGet(state, idx)
+        let a1: int32 = bytesGet(state, idx + 1)
+        let a2: int32 = bytesGet(state, idx + 2)
+        let a3: int32 = bytesGet(state, idx + 3)
+        let b0: int32 = gf256Mul(a0, 2) ^ gf256Mul(a1, 3) ^ a2 ^ a3
+        let b1: int32 = a0 ^ gf256Mul(a1, 2) ^ gf256Mul(a2, 3) ^ a3
+        let b2: int32 = a0 ^ a1 ^ gf256Mul(a2, 2) ^ gf256Mul(a3, 3)
+        let b3: int32 = gf256Mul(a0, 3) ^ a1 ^ a2 ^ gf256Mul(a3, 2)
+        bytesSet(state, idx, b0)
+        bytesSet(state, idx + 1, b1)
+        bytesSet(state, idx + 2, b2)
+        bytesSet(state, idx + 3, b3)
+
+fn aesEncryptBlock(keys: AesRoundKeys, block: Bytes): Result[Bytes] =
+    if bytesLen(block) != aesBlockSize:
+        return Err[Bytes]("aes: invalid block size")
+    if bytesLen(keys.data) != (keys.rounds + 1) * aesBlockSize:
+        return Err[Bytes]("aes: round keys invalid")
+    var state: Bytes = bytesSlice(block, 0, aesBlockSize)
+    aesAddRoundKey(state, keys.data, 0)
+    for round in 1..<keys.rounds:
+        aesSubBytes(state)
+        aesShiftRows(state)
+        aesMixColumns(state)
+        aesAddRoundKey(state, keys.data, round)
+    aesSubBytes(state)
+    aesShiftRows(state)
+    aesAddRoundKey(state, keys.data, keys.rounds)
+    return Ok[Bytes](state)

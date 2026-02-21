@@ -1,0 +1,318 @@
+import cheng/web/std/web_url
+import std/strings
+
+type
+    RouteSegmentKind = enum
+        rsStatic
+        rsParam
+        rsSplat
+
+    RouteSegment =
+        kind: RouteSegmentKind
+        token: str
+
+    RoutePattern =
+        raw: str
+        segments: RouteSegment[]
+
+    RouteParam =
+        key: str
+        value: str
+
+    RouteParams =
+        items: RouteParam[]
+
+    QueryParam =
+        key: str
+        value: str
+
+    QueryParams =
+        items: QueryParam[]
+
+    RouteEntry =
+        id: int32
+        path: str
+        file: str
+
+    RoutePathInfo =
+        raw: str
+        path: str
+        query: str
+        hash: str
+        queryParams: QueryParams
+
+    Route =
+        id: int32
+        pattern: RoutePattern
+
+    RouteMatch =
+        ok: bool
+        id: int32
+        params: RouteParams
+
+fn startsWithAt(s: str, prefix: str, start: int32): bool =
+    if s == nil || prefix == nil:
+        return false
+    if start < 0 || len(prefix) == 0:
+        return false
+    if start + len(prefix) > len(s):
+        return false
+    for i in 0..<len(prefix):
+        if s[start + i] != prefix[i]:
+            return false
+    return true
+
+fn endsWith(s: str, suffix: str): bool =
+    if s == nil || suffix == nil:
+        return false
+    let sLen: int32 = len(s)
+    let pLen: int32 = len(suffix)
+    if pLen == 0 || sLen < pLen:
+        return false
+    for i in 0..<pLen:
+        if s[sLen - pLen + i] != suffix[i]:
+            return false
+    return true
+
+fn stripSuffix(name: str, suffix: str): str =
+    if ! endsWith(name, suffix):
+        return name
+    return substr(name, 0, len(name) - len(suffix))
+
+fn stripQueryHash(path: str): str =
+    if path == nil:
+        return ""
+    var endIdx: int32 = len(path)
+    for i in 0..<len(path):
+        let c: char = path[i]
+        if c == '?' || c == '#':
+            endIdx = i
+            break
+    if endIdx == len(path):
+        return path
+    return substr(path, 0, endIdx)
+
+fn parsePathInfo(raw: str): RoutePathInfo =
+    var out: RoutePathInfo
+    var src: str = raw
+    if src == nil || len(src) == 0:
+        src = "/"
+    out.raw = src
+    var queryIdx: int32 = -1
+    var hashIdx: int32 = -1
+    for i in 0..<len(src):
+        let c: char = src[i]
+        if c == '?' && queryIdx < 0 && hashIdx < 0:
+            queryIdx = i
+        elif c == '#' && hashIdx < 0:
+            hashIdx = i
+            break
+    if queryIdx >= 0:
+        let endIdx = if hashIdx >= 0: hashIdx else: len(src)
+        out.query = substr(src, queryIdx + 1, endIdx - queryIdx - 1)
+    if hashIdx >= 0:
+        out.hash = substr(src, hashIdx + 1, len(src) - hashIdx - 1)
+    var pathEnd: int32 = len(src)
+    if queryIdx >= 0 && queryIdx < pathEnd:
+        pathEnd = queryIdx
+    if hashIdx >= 0 && hashIdx < pathEnd:
+        pathEnd = hashIdx
+    if pathEnd <= 0:
+        out.path = "/"
+    else:
+        out.path = cleanPath(substr(src, 0, pathEnd))
+    out.queryParams = parseQueryParams(out.query)
+    return out
+
+fn cleanPath(path: str): str =
+    let stripped = stripQueryHash(path)
+    if stripped == nil || len(stripped) == 0:
+        return "/"
+    return stripped
+
+fn indexOfChar(s: str, target: char, start: int32): int32 =
+    if s == nil:
+        return -1
+    for i in start..<len(s):
+        if s[i] == target:
+            return i
+    return -1
+
+fn addQueryParam(params: var QueryParams, key: str, value: str) =
+    if key == nil || len(key) == 0:
+        return
+    var item: QueryParam
+    item.key = key
+    item.value = value
+    params.items.add(item)
+
+fn parseQueryParams(query: str): QueryParams =
+    var out: QueryParams
+    out.items = []
+    if query == nil || len(query) == 0:
+        return out
+    var start: int32 = 0
+    for i in 0..len(query):
+        if i == len(query) || query[i] == '&':
+            let size: int32 = i - start
+            if size > 0:
+                let eq = indexOfChar(query, '=', start)
+                if eq >= 0 && eq < i:
+                    let rawKey = substr(query, start, eq - start)
+                    let rawValue = substr(query, eq + 1, i - eq - 1)
+                    let key = urlDecodeComponent(rawKey)
+                    let value = urlDecodeComponent(rawValue)
+                    addQueryParam(out, key, value)
+                else:
+                    let rawKey = substr(query, start, size)
+                    let key = urlDecodeComponent(rawKey)
+                    addQueryParam(out, key, "")
+            start = i + 1
+    return out
+
+fn queryGet(params: QueryParams, key: str): str =
+    if key == nil:
+        return ""
+    for i in 0..<len(params.items):
+        let item = params.items[i]
+        if item.key == key:
+            return item.value
+    return ""
+
+fn splitPath(path: str): str[] =
+    let clean = cleanPath(path)
+    var out: str[] 
+    for start in 0..<len(clean):
+        if !(clean[start] == '/'):
+            break
+    for i in start..len(clean):
+        if i == len(clean) || clean[i] == '/':
+            let size: int32 = i - start
+            if size > 0:
+                out.add(substr(clean, start, size))
+            start = i + 1
+    return out
+
+fn joinSegments(segs: str[], start: int32, stop: int32): str =
+    if start >= stop:
+        return ""
+    var out: str = ""
+    for i in start..<stop:
+        if len(out) > 0:
+            out = out + "/"
+        out = out + segs[i]
+    return out
+
+fn parseSegment(seg: str): RouteSegment =
+    var out: RouteSegment
+    out.kind = rsStatic
+    out.token = seg
+    if seg == nil || len(seg) == 0:
+        return out
+    if seg == "*":
+        out.kind = rsSplat
+        out.token = "splat"
+        return out
+    if seg[0] == '[' && seg[len(seg) - 1] == ']':
+        let inner = substr(seg, 1, len(seg) - 2)
+        if startsWithAt(inner, "...", 0):
+            out.kind = rsSplat
+            out.token = substr(inner, 3, len(inner) - 3)
+            if len(out.token) == 0:
+                out.token = "rest"
+        else:
+            out.kind = rsParam
+            out.token = inner
+        return out
+    return out
+
+fn parseRoutePattern(raw: str): RoutePattern =
+    var out: RoutePattern
+    out.raw = raw
+    out.segments = []
+    let parts = splitPath(raw)
+    for i in 0..<len(parts):
+        out.segments.add(parseSegment(parts[i]))
+    return out
+
+fn newRoute(id: int32, raw: str): Route =
+    var out: Route
+    out.id = id
+    out.pattern = parseRoutePattern(raw)
+    return out
+
+fn addParam(params: var RouteParams, key: str, value: str) =
+    var p: RouteParam
+    p.key = key
+    p.value = value
+    params.items.add(p)
+
+fn paramGet(params: RouteParams, key: str): str =
+    for i in 0..<len(params.items):
+        let item = params.items[i]
+        if item.key == key:
+            return item.value
+    return ""
+
+fn matchPattern(pattern: RoutePattern, path: str): RouteMatch =
+    var out: RouteMatch
+    out.ok = false
+    out.id = -1
+    out.params.items = []
+    let segs = pattern.segments
+    let parts = splitPath(path)
+    var i: int32 = 0
+    var j: int32 = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<len(segs):
+        i = __for_i_1
+        let seg = segs[i]
+        if seg.kind == rsSplat:
+            let rest = joinSegments(parts, j, len(parts))
+            addParam(out.params, seg.token, rest)
+            j = len(parts)
+            i = len(segs)
+            break
+        if j >= len(parts):
+            return out
+        if seg.kind == rsStatic:
+            if parts[j] != seg.token:
+                return out
+        elif seg.kind == rsParam:
+            addParam(out.params, seg.token, parts[j])
+        i = i + 1
+        j = j + 1
+    if j != len(parts):
+        return out
+    out.ok = true
+    return out
+
+fn matchRoutes(routes: Route[], path: str): RouteMatch =
+    for i in 0..<len(routes):
+        var res = matchPattern(routes[i].pattern, path)
+        if res.ok:
+            res.id = routes[i].id
+            return res
+    var miss: RouteMatch
+    miss.ok = false
+    miss.id = -1
+    miss.params.items = []
+    return miss
+
+fn filePathToRoute(path: str): str =
+    if path == nil || len(path) == 0:
+        return "/"
+    var p = path
+    if startsWithAt(p, "./", 0):
+        p = substr(p, 2, len(p) - 2)
+    p = stripSuffix(p, ".cwc")
+    p = stripSuffix(p, ".cheng")
+    if endsWith(p, "/index"):
+        p = substr(p, 0, len(p) - len("/index"))
+    elif p == "index":
+        p = ""
+    if len(p) == 0:
+        return "/"
+    if p[0] != '/':
+        p = "/" + p
+    return p

@@ -1,0 +1,180 @@
+import std/os
+import std/times
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import cheng/libp2p/crypto/sha256 as sha256
+import cheng/libp2p/utils/bytes as bytes
+import std/strings
+import std/seqs
+
+type
+    AuditSample =
+        sampleId: str
+        receiptId: str
+        requestId: str
+        taskId: str
+        executorId: str
+        resultCid: str
+        status: str
+        auditorId: str
+        epoch: int32
+        rateBps: int32
+        seed: str
+        ts: str
+
+fn auditSampleTs(): str =
+    return times.now().format("unix")
+
+fn buildAuditSampleId(ev: AuditSample): str =
+    let payload = ev.receiptId + "|" + ev.requestId + "|" + ev.taskId + "|" +
+        ev.executorId + "|" + ev.auditorId + "|" + intToStr(ev.epoch) + "|" + ev.ts
+    return "sample-" + intToStr(int32(len(payload)))
+
+fn normalizeAuditSample(ev: AuditSample): AuditSample =
+    var out = ev
+    if out.auditorId == nil || len(out.auditorId) == 0:
+        out.auditorId = "system"
+    if out.ts == nil || len(out.ts) == 0:
+        out.ts = auditSampleTs()
+    if out.sampleId == nil || len(out.sampleId) == 0:
+        out.sampleId = buildAuditSampleId(out)
+    return out
+
+fn rateToBps(rate: float64): int32 =
+    var bps: int32 = int32(rate * 10000.0 + 0.5)
+    if bps < 0:
+        bps = 0
+    if bps > 10000:
+        bps = 10000
+    return bps
+
+fn hashScore(text: str): int32 =
+    let data = bytes.bytesFromString(text)
+    let digest = sha256.sha256Digest(data)
+    let b0: int32 = bytes.bytesGet(digest, 0)
+    let b1: int32 = bytes.bytesGet(digest, 1)
+    let b2: int32 = bytes.bytesGet(digest, 2)
+    let b3: int32 = bytes.bytesGet(digest, 3)
+    let value: int64 = (int64(b0) << 24) | (int64(b1) << 16) |
+        (int64(b2) << 8) | int64(b3)
+    return int32(value % 10000)
+
+fn shouldSample(receiptId: str, rateBps: int32, seed: str): bool =
+    if rateBps <= 0:
+        return false
+    if rateBps >= 10000:
+        return true
+    let text = receiptId + "|" + seed
+    let score = hashScore(text)
+    return score < rateBps
+
+fn sampleReceipts(
+    ledgerPath: str,
+    epochFilter: int32,
+    rate: float64,
+    seed: str,
+    auditorId: str
+): AuditSample[] =
+    var out: AuditSample[] 
+    if ledgerPath == nil || len(ledgerPath) == 0:
+        return out
+    if ! os.fileExists(ledgerPath):
+        return out
+    let content = os.readFile(ledgerPath)
+    if content == nil || len(content) == 0:
+        return out
+    epochFilter
+    rate
+    seed
+    auditorId
+    return out
+
+fn escapeQuotedString(value: str): str =
+    if value == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(value):
+        let ch = value[i]
+        if ch == '"':
+            out = out + "\\\""
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn quoteTomlString(value: str): str =
+    return "\"" + escapeQuotedString(value) + "\""
+
+fn quoteYamlString(value: str): str =
+    return "\"" + escapeQuotedString(value) + "\""
+
+fn samplesToJson(samples: AuditSample[]): json.JsonNode =
+    let root = json.newJObject()
+    root["count"] = json.newJInt(samples.len)
+    let arr = json.newJArray()
+    for i in 0..<samples.len:
+        let node = json.newJObject()
+        node["sample_id"] = json.newJString(samples[i].sampleId)
+        node["receipt_id"] = json.newJString(samples[i].receiptId)
+        node["request_id"] = json.newJString(samples[i].requestId)
+        node["task_id"] = json.newJString(samples[i].taskId)
+        node["executor_id"] = json.newJString(samples[i].executorId)
+        node["result_cid"] = json.newJString(samples[i].resultCid)
+        node["status"] = json.newJString(samples[i].status)
+        node["auditor_id"] = json.newJString(samples[i].auditorId)
+        node["epoch"] = json.newJInt(samples[i].epoch)
+        node["rate_bps"] = json.newJInt(samples[i].rateBps)
+        node["seed"] = json.newJString(samples[i].seed)
+        node["ts"] = json.newJString(samples[i].ts)
+        arr.add(node)
+    root["samples"] = arr
+    return root
+
+fn samplesToToml(samples: AuditSample[]): str =
+    var out: str = "count = " + intToStr(samples.len) + "\n"
+    for i in 0..<samples.len:
+        out = out + "\n[[samples]]\n"
+        out = out + "sample_id = " + quoteTomlString(samples[i].sampleId) + "\n"
+        out = out + "receipt_id = " + quoteTomlString(samples[i].receiptId) + "\n"
+        out = out + "request_id = " + quoteTomlString(samples[i].requestId) + "\n"
+        out = out + "task_id = " + quoteTomlString(samples[i].taskId) + "\n"
+        out = out + "executor_id = " + quoteTomlString(samples[i].executorId) + "\n"
+        out = out + "result_cid = " + quoteTomlString(samples[i].resultCid) + "\n"
+        out = out + "status = " + quoteTomlString(samples[i].status) + "\n"
+        out = out + "auditor_id = " + quoteTomlString(samples[i].auditorId) + "\n"
+        out = out + "epoch = " + intToStr(samples[i].epoch) + "\n"
+        out = out + "rate_bps = " + intToStr(samples[i].rateBps) + "\n"
+        if samples[i].seed != nil && len(samples[i].seed) > 0:
+            out = out + "seed = " + quoteTomlString(samples[i].seed) + "\n"
+        out = out + "ts = " + quoteTomlString(samples[i].ts) + "\n"
+    return out
+
+fn samplesToYaml(samples: AuditSample[]): str =
+    var out: str = "count: " + intToStr(samples.len) + "\n"
+    if samples.len == 0:
+        out = out + "samples: []\n"
+        return out
+    out = out + "samples:\n"
+    for i in 0..<samples.len:
+        out = out + "  - sample_id: " + quoteYamlString(samples[i].sampleId) + "\n"
+        out = out + "    receipt_id: " + quoteYamlString(samples[i].receiptId) + "\n"
+        out = out + "    request_id: " + quoteYamlString(samples[i].requestId) + "\n"
+        out = out + "    task_id: " + quoteYamlString(samples[i].taskId) + "\n"
+        out = out + "    executor_id: " + quoteYamlString(samples[i].executorId) + "\n"
+        out = out + "    result_cid: " + quoteYamlString(samples[i].resultCid) + "\n"
+        out = out + "    status: " + quoteYamlString(samples[i].status) + "\n"
+        out = out + "    auditor_id: " + quoteYamlString(samples[i].auditorId) + "\n"
+        out = out + "    epoch: " + intToStr(samples[i].epoch) + "\n"
+        out = out + "    rate_bps: " + intToStr(samples[i].rateBps) + "\n"
+        if samples[i].seed != nil && len(samples[i].seed) > 0:
+            out = out + "    seed: " + quoteYamlString(samples[i].seed) + "\n"
+        out = out + "    ts: " + quoteYamlString(samples[i].ts) + "\n"
+    return out

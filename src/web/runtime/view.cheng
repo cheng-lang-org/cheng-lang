@@ -1,0 +1,221 @@
+import cheng/web/std/web_dom
+import cheng/web/runtime/events
+import cheng/web/runtime/signals as sig
+
+type
+    EventBinding =
+        node: WebNode
+        name: str
+        handler: WebHandler
+
+    BlockBinding =
+        node: WebNode
+        name: str
+        handler: WebHandler
+
+    View = ref
+        root: WebNode
+        nodes: WebNode[]
+        bindings: EventBinding[]
+        blocks: NodeBlock[]
+        effects: sig.Effect[]
+
+    NodeBlock = ref
+        parent: WebNode
+        anchor: WebNode
+        nodes: WebNode[]
+        handlers: BlockBinding[]
+        effects: sig.Effect[]
+        children: NodeBlock[]
+
+fn newView(root: WebNode): View =
+    var v: View
+    new(v)
+    v.root = root
+    v.nodes = []
+    v.bindings = []
+    v.blocks = []
+    v.effects = []
+    return v
+
+fn newNodeBlock(parent: WebNode, anchor: WebNode): NodeBlock =
+    var b: NodeBlock
+    new(b)
+    b.parent = parent
+    b.anchor = anchor
+    b.nodes = []
+    b.handlers = []
+    b.effects = []
+    b.children = []
+    return b
+
+fn viewRoot(v: View): WebNode =
+    if v == nil:
+        return 0
+    if v.root == 0:
+        v.root = domGetRoot()
+    return v.root
+
+fn trackNode(v: View, node: WebNode) =
+    if v == nil || node == 0:
+        return
+    v.nodes.add(node)
+
+fn createElement(v: View, tag: str): WebNode =
+    let node = domCreateElement(tag)
+    trackNode(v, node)
+    return node
+
+fn createText(v: View, text: str): WebNode =
+    let node = domCreateText(text)
+    trackNode(v, node)
+    return node
+
+fn appendNode(v: View, parent: WebNode, node: WebNode) =
+    if node == 0:
+        return
+    let target = if parent == 0: viewRoot(v) else: parent
+    domInsert(target, node, 0)
+
+fn removeNode(v: View, node: WebNode) =
+    v
+    if node == 0:
+        return
+    domRemove(node)
+
+fn setText(v: View, node: WebNode, text: str) =
+    v
+    domTextSet(node, text)
+
+fn setAttr(v: View, node: WebNode, name: str, value: str) =
+    v
+    domSetAttr(node, name, value)
+
+fn setStyle(v: View, node: WebNode, name: str, value: str) =
+    v
+    domSetStyle(node, name, value)
+
+fn setProp(v: View, node: WebNode, name: str, value: str) =
+    v
+    domSetProp(node, name, value)
+
+fn onEvent(v: View, node: WebNode, name: str, handler: WebEventHandler): WebHandler =
+    if v == nil:
+        return 0
+    let id = registerDomEvent(node, name, handler)
+    if id == 0:
+        return 0
+    var binding: EventBinding
+    binding.node = node
+    binding.name = name
+    binding.handler = id
+    v.bindings.add(binding)
+    return id
+
+fn trackBlock(v: View, block: NodeBlock) =
+    if v == nil || block == nil:
+        return
+    v.blocks.add(block)
+
+fn trackEffect(v: View, eff: sig.Effect) =
+    if v == nil || eff == nil:
+        return
+    v.effects.add(eff)
+
+fn blockTrackHandler(block: NodeBlock, node: WebNode, name: str, handlerId: WebHandler) =
+    if block == nil || handlerId == 0:
+        return
+    var entry: BlockBinding
+    entry.node = node
+    entry.name = name
+    entry.handler = handlerId
+    block.handlers.add(entry)
+
+fn blockTrackEffect(block: NodeBlock, eff: sig.Effect) =
+    if block == nil || eff == nil:
+        return
+    block.effects.add(eff)
+
+fn blockTrackChild(block: NodeBlock, child: NodeBlock) =
+    if block == nil || child == nil:
+        return
+    block.children.add(child)
+
+fn blockOnEvent(block: NodeBlock, node: WebNode, name: str, handler: WebEventHandler): WebHandler =
+    if block == nil:
+        return 0
+    let id = registerDomEvent(node, name, handler)
+    if id == 0:
+        return 0
+    blockTrackHandler(block, node, name, id)
+    return id
+
+fn offEvent(v: View, node: WebNode, name: str, handlerId: WebHandler) =
+    if v == nil || handlerId == 0:
+        return
+    unregisterDomEvent(node, name, handlerId)
+    for i in 0..<len(v.bindings):
+        let entry = v.bindings[i]
+        if entry.handler == handlerId:
+            let last: int = len(v.bindings) - 1
+            (&v.bindings)[i] = v.bindings[last]
+            v.bindings.setLen(last)
+            break
+
+fn clearBindings(v: View) =
+    if v == nil:
+        return
+    for i in 0..<len(v.bindings):
+        let entry = v.bindings[i]
+        unregisterDomEvent(entry.node, entry.name, entry.handler)
+    v.bindings.setLen(0)
+    i = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<len(v.effects):
+        i = __for_i_1
+        sig.dispose(v.effects[i])
+        i = i + 1
+    v.effects.setLen(0)
+    i = 0
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<len(v.blocks):
+        i = __for_i_2
+        blockClear(v, v.blocks[i])
+        i = i + 1
+    v.blocks.setLen(0)
+
+fn blockAppend(v: View, block: NodeBlock, node: WebNode) =
+    if block == nil || node == 0:
+        return
+    let target = if block.parent == 0: viewRoot(v) else: block.parent
+    domInsert(target, node, block.anchor)
+    block.nodes.add(node)
+
+fn blockClear(v: View, block: NodeBlock) =
+    if block == nil:
+        return
+    for i in 0..<len(block.children):
+        blockClear(v, block.children[i])
+    block.children.setLen(0)
+    i = 0
+    let __for_start_i_3 = i
+    for __for_i_3 in __for_start_i_3..<len(block.effects):
+        i = __for_i_3
+        sig.dispose(block.effects[i])
+        i = i + 1
+    block.effects.setLen(0)
+    i = 0
+    let __for_start_i_4 = i
+    for __for_i_4 in __for_start_i_4..<len(block.handlers):
+        i = __for_i_4
+        let entry = block.handlers[i]
+        unregisterDomEvent(entry.node, entry.name, entry.handler)
+        i = i + 1
+    block.handlers.setLen(0)
+    i = 0
+    let __for_start_i_5 = i
+    for __for_i_5 in __for_start_i_5..<len(block.nodes):
+        i = __for_i_5
+        removeNode(v, block.nodes[i])
+        i = i + 1
+    block.nodes.setLen(0)

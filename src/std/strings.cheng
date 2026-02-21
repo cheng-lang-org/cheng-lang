@@ -1,0 +1,368 @@
+# Strings module (minimal)
+
+fn len(s: str): int32 =
+    if ptrToU64(void*(s)) == uint64(0):
+        return 0
+    return c_strlen s
+
+fn __cheng_str_eq(a, b: str): bool =
+    let ap: void* = void*(a)
+    let bp: void* = void*(b)
+    if ap == bp:
+        return true
+    if ptrToU64(ap) == uint64(0):
+        return ptrToU64(bp) == uint64(0)
+    if ptrToU64(bp) == uint64(0):
+        return false
+    let ac: char* = char*(ap)
+    let bc: char* = char*(bp)
+    if *ac != *bc:
+        return false
+    if *ac == char(0):
+        return true
+    # Fast path for short strings (common tokens like "(", "==", "[]").
+    let ac1: char = *(char*(ptr_add(void*(ac), 1)))
+    let bc1: char = *(char*(ptr_add(void*(bc), 1)))
+    if ac1 != bc1:
+        return false
+    if ac1 == char(0):
+        return true
+    let ac2: char = *(char*(ptr_add(void*(ac), 2)))
+    let bc2: char = *(char*(ptr_add(void*(bc), 2)))
+    if ac2 != bc2:
+        return false
+    if ac2 == char(0):
+        return true
+    let ac3: char = *(char*(ptr_add(void*(ac), 3)))
+    let bc3: char = *(char*(ptr_add(void*(bc), 3)))
+    if ac3 != bc3:
+        return false
+    if ac3 == char(0):
+        return true
+    return c_strcmp(cstring(a), cstring(b)) == 0
+
+fn streq(a, b: str): bool =
+    return __cheng_str_eq(a, b)
+
+fn `==`(a, b: str): bool =
+    return __cheng_str_eq(a, b)
+
+fn strIsEmpty(s: str): bool =
+    if ptrToU64(void*(s)) == uint64(0):
+        return true
+    return s[0] == char(0)
+
+fn strNonEmpty(s: str): bool =
+    return !strIsEmpty(s)
+
+fn hasPrefix(s: str, prefix: str): bool =
+    if ptrToU64(void*(prefix)) == uint64(0):
+        return true
+    let pLen: int32 = len(prefix)
+    if pLen == 0:
+        return true
+    if ptrToU64(void*(s)) == uint64(0):
+        return false
+    let sLen: int32 = len(s)
+    if sLen < pLen:
+        return false
+    for i in 0..<pLen:
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn dropPrefix(s: str, prefix: str): str =
+    if !hasPrefix(s, prefix):
+        return s
+    if ptrToU64(void*(s)) == uint64(0):
+        return ""
+    let offset: int32 = len(prefix)
+    let total: int32 = len(s)
+    if offset >= total:
+        return ""
+    let count: int32 = total - offset
+    let size: int32 = count + 1
+    let p: void* = alloc size
+    let src: void* = ptr_add(void*(s), offset)
+    copyMem(p, src, count)
+    setMem(ptr_add(p, count), 0, 1)
+    return str(p)
+
+fn arcRetainString(s: str) =
+    let p: void* = void*(s)
+    memRetain p
+
+fn arcReleaseString(s: str) =
+    let p: void* = void*(s)
+    memRelease p
+
+fn __cheng_str_clone(s: str): str =
+    let p: void* = void*(s)
+    memRetain p
+    return s
+
+fn __cheng_str_concat(s1, s2: str): str =
+    let l1: int32 = len s1
+    let l2: int32 = len s2
+    let size: int32 = l1 + l2 + 1
+    let p: void* = alloc size
+    if l1 > 0:
+        copyMem(p, s1, l1)
+    if l2 > 0:
+        let p2: void* = ptr_add(p, l1)
+        copyMem(p2, s2, l2)
+    let pEnd: void* = ptr_add(p, l1 + l2)
+    setMem(pEnd, 0, 1)
+    return str(p)
+
+fn __cheng_str_from_bytes(data: uint8[], len: int32): str =
+    if ptrToU64(void*(data)) == uint64(0) || len <= 0 || data.len < len:
+        return ""
+    let p: void* = alloc(len + 1)
+    if len > 0:
+        copyMem(p, void*(data.buffer), len)
+    setMem(ptr_add(p, len), 0, 1)
+    return str(p)
+
+fn `+`(s1, s2: str): str =
+    return __cheng_str_concat(s1, s2)
+
+fn `+`(s: str, c: char): str =
+    return __cheng_str_concat(s, charToStr(c))
+
+fn __cheng_sym_2b(s1, s2: str): str =
+    return __cheng_str_concat(s1, s2)
+
+fn charToStr(c: char): str =
+    let p: void* = alloc 2
+    var p8: int8* = int8*(p)
+    *p8 = int8(c)
+    let pNext: void* = ptr_add(p, 1)
+    setMem(pNext, 0, 1)
+    return str(p)
+
+fn `[]`(s: str, i: int32): char =
+    var p: void* = ptr_add(void*(s), i)
+    var pc: char* = char*(p)
+    return *pc
+
+fn `[]=`(s: str, i: int32, val: char) =
+    var p: void* = ptr_add(void*(s), i)
+    var pc: char* = char*(p)
+    *pc = val
+    
+fn __cheng_slice_string(s: str, start: int32, stop: int32, exclusive: bool): str =
+    if ptrToU64(void*(s)) == uint64(0):
+        return ""
+    var s0: int32 = start
+    var e: int32 = stop
+    if exclusive:
+        e = e - 1
+    if s0 < 0:
+        s0 = 0
+    if e < s0:
+        return ""
+    let n: int32 = c_strlen s
+    if s0 >= n:
+        return ""
+    if e >= n:
+        e = n - 1
+    let count: int32 = e - s0 + 1
+    let size: int32 = count + 1
+    let p: void* = alloc size
+    let src: void* = ptr_add(void*(s), s0)
+    copyMem(p, src, count)
+    setMem(ptr_add(p, count), 0, 1)
+    return str(p)
+fn __cheng_string_contains_char(s: str, c: char): bool =
+    if ptrToU64(void*(s)) == uint64(0):
+        return false
+    let n: int32 = c_strlen s
+    for i in 0..<n:
+        if s[i] == c:
+            return true
+    return false
+fn __cheng_string_contains_str(s: str, sub: str): bool =
+    if ptrToU64(void*(s)) == uint64(0) || ptrToU64(void*(sub)) == uint64(0):
+        return false
+    let n: int32 = c_strlen s
+    let m: int32 = c_strlen sub
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(s[i + j] == sub[j]):
+                break
+        if j == m:
+            return true
+    return false
+
+
+fn sliceBytes(text: str, start: int32, count: int32): str =
+    if ptrToU64(void*(text)) == uint64(0) || count <= 0:
+        return ""
+    var s0: int32 = start
+    if s0 < 0:
+        s0 = 0
+    let n: int32 = len(text)
+    if s0 >= n:
+        return ""
+    var c: int32 = count
+    if s0 + c > n:
+        c = n - s0
+    if c <= 0:
+        return ""
+    let p: void* = alloc(c + 1)
+    let src: void* = ptr_add(void*(text), s0)
+    copyMem(p, src, c)
+    setMem(ptr_add(p, c), 0, 1)
+    return str(p)
+
+fn strContains(text: str, sub: str): bool =
+    return __cheng_string_contains_str(text, sub)
+fn intToStr(i: int32): str =
+    if i == 0:
+        return "0"
+    if i == -2147483648:
+        return "-2147483648"
+    var n: int32 = i
+    var neg: bool = false
+    if n < 0:
+        neg = true
+        n = 0 - n
+    var digits: int32 = 0
+    var temp: int32 = n
+    while temp > 0:
+        digits = digits + 1
+        temp = temp / 10
+    var size: int32 = digits
+    if neg:
+        size = size + 1
+    let totalSize: int32 = size + 1
+    let p: void* = alloc totalSize
+    let pEnd: void* = ptr_add(p, size)
+    setMem(pEnd, 0, 1)
+    var idx: int32 = size - 1
+    while n > 0:
+        let digit: int32 = n % 10
+        let code: int32 = 48 + digit
+        var pChar: int8* = int8*(ptr_add(p, idx))
+        *pChar = int8(code)
+        n = n / 10
+        idx = idx - 1
+    if neg:
+        var p0: int8* = int8*(p)
+        *p0 = int8('-')
+    return str(p)
+
+fn uint64ToStr(x: uint64): str =
+    if x == 0:
+        return "0"
+    var n: uint64 = x
+    var digits: int32 = 0
+    var temp: uint64 = n
+    while temp > 0:
+        digits = digits + 1
+        temp = temp / 10
+    let size: int32 = digits
+    let totalSize: int32 = size + 1
+    let p: void* = alloc totalSize
+    setMem(ptr_add(p, size), 0, 1)
+    var idx: int32 = size - 1
+    while n > 0:
+        let digit: int32 = int32(n % 10)
+        let code: int32 = 48 + digit
+        var pChar: int8* = int8*(ptr_add(p, idx))
+        *pChar = int8(code)
+        n = n / 10
+        idx = idx - 1
+    return str(p)
+
+fn int64ToStr(i: int64): str =
+    if i == 0:
+        return "0"
+    if i == int64(-9223372036854775808):
+        return "-9223372036854775808"
+    var n: int64 = i
+    var neg: bool = false
+    if n < 0:
+        neg = true
+        n = 0 - n
+    var digits: int32 = 0
+    var temp: int64 = n
+    while temp > 0:
+        digits = digits + 1
+        temp = temp / 10
+    var size: int32 = digits
+    if neg:
+        size = size + 1
+    let totalSize: int32 = size + 1
+    let p: void* = alloc totalSize
+    setMem(ptr_add(p, size), 0, 1)
+    var idx: int32 = size - 1
+    while n > 0:
+        let digit: int32 = int32(n % 10)
+        let code: int32 = 48 + digit
+        var pChar: int8* = int8*(ptr_add(p, idx))
+        *pChar = int8(code)
+        n = n / 10
+        idx = idx - 1
+    if neg:
+        var p0: int8* = int8*(p)
+        *p0 = int8('-')
+    return str(p)
+
+fn `$`(s: str): str =
+    return s
+
+fn `$`(b: bool): str =
+    if b:
+        return "true"
+    return "false"
+
+fn `$`(c: char): str =
+    return charToStr c
+
+fn `$`(x: int): str =
+    let v: int32 = int32(x)
+    return intToStr v
+
+fn `$`(x: int32): str =
+    return intToStr x
+
+fn `$`(x: int64): str =
+    return int64ToStr x
+
+fn `$`(x: uint): str =
+    let v: int32 = int32(x)
+    return intToStr v
+
+fn `$`(x: uint32): str =
+    let v: int32 = int32(x)
+    return intToStr v
+
+fn `$`(x: uint64): str =
+    return uint64ToStr x
+
+fn `$`(x: float): str =
+    let v: int32 = int32(x)
+    return intToStr v
+
+fn `$`(x: float32): str =
+    let v: int32 = int32(x)
+    return intToStr v
+
+fn `$`(x: float64): str =
+    let v: int32 = int32(x)
+    return intToStr v
+
+fn `$`(xs: T[]): str =
+    var out: str = "["
+    for i in 0..<xs.len:
+        if i > 0:
+            out = out + ","
+        out = out + $(xs[i])
+    out = out + "]"
+    return out

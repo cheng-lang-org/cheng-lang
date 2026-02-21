@@ -1,0 +1,79 @@
+import cheng/decentralized/store as dstore
+import cheng/decentralized/ledger as dledger
+import cheng/decentralized/lease as dlease
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/p2p as dp2p
+import cheng/libp2p/utils/stringlist as stringlist
+import cheng/libp2p/utils/result as result
+import cheng/libp2p/utils/bytes as bytes
+import std/strings
+
+type
+    StorageMode = enum
+        smLocal
+        smP2p
+
+    StorageRuntime =
+        mode: StorageMode
+        store: dstore.StoreConfig
+        ledgerPath: str
+        listenAddr: str
+        peers: stringlist.StringList
+
+fn parseStorageMode(text: str): StorageMode =
+    if text == nil || len(text) == 0:
+        return smLocal
+    if text == "p2p":
+        return smP2p
+    return smLocal
+
+fn storageModeText(mode: StorageMode): str =
+    if mode == smP2p:
+        return "p2p"
+    return "local"
+
+fn initStorageWithP2P(
+    mode: StorageMode,
+    root: str,
+    ledgerPath: str,
+    listenAddr: str,
+    peers: stringlist.StringList
+): StorageRuntime =
+    let store = dstore.initStore(root)
+    StorageRuntime(mode: mode, store: store, ledgerPath: ledgerPath, listenAddr: listenAddr, peers: peers)
+
+fn initStorage(mode: StorageMode, root: str, ledgerPath: str): StorageRuntime =
+    return initStorageWithP2P(mode, root, ledgerPath, "", stringlist.initStringList())
+
+fn putFile(rt: StorageRuntime, path: str): result.Result[dcid.Cid] =
+    if rt.mode == smP2p:
+        let cfg = dp2p.initP2PConfig(rt.listenAddr, rt.peers)
+        return dp2p.putFile(rt.store, cfg, path)
+    return dstore.putFile(rt.store, path)
+
+fn putBytes(rt: StorageRuntime, data: bytes.Bytes): result.Result[dcid.Cid] =
+    if rt.mode == smP2p:
+        let cfg = dp2p.initP2PConfig(rt.listenAddr, rt.peers)
+        return dp2p.putBytes(rt.store, cfg, data)
+    return dstore.putBytes(rt.store, data)
+
+fn getBytes(rt: StorageRuntime, cidText: str): result.Result[bytes.Bytes] =
+    if rt.mode == smP2p:
+        let cfg = dp2p.initP2PConfig(rt.listenAddr, rt.peers)
+        return dp2p.getBytes(rt.store, cfg, cidText)
+    return dstore.getBytes(rt.store, cidText)
+
+fn getToFile(rt: StorageRuntime, cidText: str, outPath: str): bool =
+    if rt.mode == smP2p:
+        let cfg = dp2p.initP2PConfig(rt.listenAddr, rt.peers)
+        return dp2p.getToFile(rt.store, cfg, cidText, outPath)
+    return dstore.getToFile(rt.store, cidText, outPath)
+
+fn appendLease(rt: StorageRuntime, lease: dlease.Lease, cost: dlease.LeaseCost): bool =
+    return dledger.appendLeaseEventWithMode(rt.ledgerPath, lease, cost, storageModeText(rt.mode))
+
+fn serve(rt: StorageRuntime, maxStreams: int32): result.Result[int32] =
+    if rt.mode != smP2p:
+        return result.Err[int32]("storage: serve requires p2p mode")
+    let cfg = dp2p.initP2PConfig(rt.listenAddr, rt.peers)
+    return dp2p.serve(rt.store, cfg, maxStreams)

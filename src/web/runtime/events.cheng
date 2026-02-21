@@ -1,0 +1,305 @@
+import cheng/web/runtime/abi
+import cheng/web/runtime/memory
+import cheng/web/std/web_dom
+import cheng/web/std/web_time
+import std/json as stdjson
+
+type
+    WebEvent =
+        raw: str
+        eventType: str
+        data: stdjson.JsonNode
+
+    WebEventHandler = fn (event: WebEvent)
+
+    WebHandlerEntry =
+        callback: WebEventHandler
+        once: bool
+
+    TimerBinding =
+        timerId: WebTimer
+        handlerId: WebHandler
+
+var
+    handlers: WebHandlerEntry[] 
+    freeHandlers: int32[] 
+    timerBindings: TimerBinding[] 
+
+fn handlerIndex(id: WebHandler): int =
+    return int(id) - 1
+
+fn allocHandlerId(): WebHandler =
+    if len(freeHandlers) > 0:
+        let idx: int = len(freeHandlers) - 1
+        let id: WebHandler = freeHandlers[idx]
+        freeHandlers.setLen(idx)
+        return id
+    var entry: WebHandlerEntry
+    handlers.add(entry)
+    return WebHandler(len(handlers))
+
+fn releaseHandler(id: WebHandler) =
+    let idx: int = handlerIndex(id)
+    if idx < 0 || idx >= len(handlers):
+        return
+    if handlers[idx].callback == nil:
+        return
+    handlers[idx].callback = nil
+    handlers[idx].once = false
+    freeHandlers.add(id)
+
+fn isWhitespace(c: char): bool =
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+
+fn skipWhitespace(s: str, start: int32): int32 =
+    for i in start..<len(s):
+        if ! isWhitespace(s[i]):
+            break
+    return i
+
+fn indexOfSubstr(s: str, needle: str, start: int32): int32 =
+    let nLen: int32 = len(needle)
+    if nLen == 0:
+        return start
+    let sLen: int32 = len(s)
+    if start < 0 || start >= sLen:
+        return -1
+    if nLen > sLen:
+        return -1
+    var i: int32 = start
+    let limit: int32 = sLen - nLen
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..limit:
+        i = __for_i_1
+        var j: int32 = 0
+        var matched: bool = true
+        let __for_guard_start_j_1 = j
+        for __for_guard_j_1 in __for_guard_start_j_1..<nLen:
+            if ! (j < nLen):
+                break
+            if s[i + j] != needle[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return i
+        i = i + 1
+    return -1
+
+fn keyToken(key: str): str =
+    return "\"" + key + "\""
+
+fn decodeEscape(c: char): char =
+    if c == 'n':
+        return '\n'
+    if c == 'r':
+        return '\r'
+    if c == 't':
+        return '\t'
+    if c == 'b':
+        return '\b'
+    if c == 'f':
+        return '\f'
+    if c == '"' || c == '\\' || c == '/':
+        return c
+    return c
+
+fn readJsonString(s: str, start: int32): str =
+    let sLen: int32 = len(s)
+    if start < 0 || start >= sLen:
+        return ""
+    let buf: void* = alloc(sLen - start + 1)
+    var outLen: int32 = 0
+    var i: int32 = start
+    var escaped: bool = false
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<sLen:
+        i = __for_i_2
+        let c: char = s[i]
+        if escaped:
+            var outChar: char = decodeEscape(c)
+            if c == 'u':
+                outChar = '?'
+                if i + 4 < sLen:
+                    i = i + 4
+            var p: int8* = int8*(ptr_add(buf, outLen))
+            *p = int8(outChar)
+            outLen = outLen + 1
+            escaped = false
+        else:
+            if c == '\\':
+                escaped = true
+            elif c == '"':
+                break
+            else:
+                var p: int8* = int8*(ptr_add(buf, outLen))
+                *p = int8(c)
+                outLen = outLen + 1
+        i = i + 1
+    setMem(ptr_add(buf, outLen), 0, 1)
+    return str(buf)
+
+fn extractJsonString(payload: str, key: str): str =
+    if payload == nil || key == nil:
+        return ""
+    let token = keyToken(key)
+    let idx: int32 = indexOfSubstr(payload, token, 0)
+    if idx < 0:
+        return ""
+    for i in idx + len(token)..<len(payload):
+        if !(payload[i] != ':'):
+            break
+    if i >= len(payload):
+        return ""
+    i = skipWhitespace(payload, i + 1)
+    if i >= len(payload):
+        return ""
+    if payload[i] != '"':
+        return ""
+    return readJsonString(payload, i + 1)
+
+fn extractJsonBool(payload: str, key: str): bool =
+    if payload == nil || key == nil:
+        return false
+    let token = keyToken(key)
+    let idx: int32 = indexOfSubstr(payload, token, 0)
+    if idx < 0:
+        return false
+    for i in idx + len(token)..<len(payload):
+        if !(payload[i] != ':'):
+            break
+    if i >= len(payload):
+        return false
+    i = skipWhitespace(payload, i + 1)
+    if i + 3 < len(payload):
+        if payload[i] == 't' && payload[i + 1] == 'r' && payload[i + 2] == 'u' && payload[i + 3] == 'e':
+            return true
+    return false
+
+fn parseEvent(payload: str): WebEvent =
+    var ev: WebEvent
+    ev.raw = payload
+    if payload == nil || len(payload) == 0:
+        return ev
+    let res = stdjson.parseJsonSafe(payload)
+    if res.success:
+        ev.data = res.value
+        if res.value != nil && res.value.kind == stdjson.JObject:
+            ev.eventType = res.value["type"].getStr()
+    if ev.eventType == nil || len(ev.eventType) == 0:
+        ev.eventType = extractJsonString(payload, "type")
+    return ev
+
+fn eventType(ev: WebEvent): str =
+    if ev.eventType != nil && len(ev.eventType) > 0:
+        return ev.eventType
+    return extractJsonString(ev.raw, "type")
+
+fn eventKey(ev: WebEvent): str =
+    if ev.data != nil && ev.data.kind == stdjson.JObject && ev.data.hasKey("key"):
+        return ev.data["key"].getStr()
+    return extractJsonString(ev.raw, "key")
+
+fn eventCode(ev: WebEvent): str =
+    if ev.data != nil && ev.data.kind == stdjson.JObject && ev.data.hasKey("code"):
+        return ev.data["code"].getStr()
+    return extractJsonString(ev.raw, "code")
+
+fn eventValue(ev: WebEvent): str =
+    if ev.data != nil && ev.data.kind == stdjson.JObject && ev.data.hasKey("value"):
+        return ev.data["value"].getStr()
+    return extractJsonString(ev.raw, "value")
+
+fn eventChecked(ev: WebEvent): bool =
+    if ev.data != nil && ev.data.kind == stdjson.JObject && ev.data.hasKey("checked"):
+        return ev.data["checked"].getBool()
+    return extractJsonBool(ev.raw, "checked")
+
+fn eventPath(ev: WebEvent): str =
+    if ev.data != nil && ev.data.kind == stdjson.JObject && ev.data.hasKey("path"):
+        return ev.data["path"].getStr()
+    return extractJsonString(ev.raw, "path")
+
+fn removeTimerBindingByHandler(handlerId: WebHandler) =
+    for i in 0..<len(timerBindings):
+        if timerBindings[i].handlerId == handlerId:
+            let last: int = len(timerBindings) - 1
+            timerBindings[i] = timerBindings[last]
+            timerBindings.setLen(last)
+            return
+
+fn removeTimerBindingByTimer(timerId: WebTimer) =
+    for i in 0..<len(timerBindings):
+        if timerBindings[i].timerId == timerId:
+            let handlerId = timerBindings[i].handlerId
+            let last: int = len(timerBindings) - 1
+            timerBindings[i] = timerBindings[last]
+            timerBindings.setLen(last)
+            releaseHandler(handlerId)
+            return
+
+fn dispatchHandler(handlerId: WebHandler, payload: str) =
+    let idx: int = handlerIndex(handlerId)
+    if idx < 0 || idx >= len(handlers):
+        return
+    let entry = handlers[idx]
+    if entry.callback == nil:
+        return
+    let ev = parseEvent(payload)
+    entry.callback(ev)
+    if entry.once:
+        releaseHandler(handlerId)
+        removeTimerBindingByHandler(handlerId)
+
+fn registerHandler(callback: WebEventHandler, once: bool): WebHandler =
+    if callback == nil:
+        return 0
+    let id = allocHandlerId()
+    let idx: int = handlerIndex(id)
+    if idx < 0 || idx >= len(handlers):
+        return 0
+    handlers[idx].callback = callback
+    handlers[idx].once = once
+    return id
+
+fn unregisterHandler(handlerId: WebHandler) =
+    if handlerId == 0:
+        return
+    releaseHandler(handlerId)
+    removeTimerBindingByHandler(handlerId)
+
+fn registerDomEvent(node: WebNode, name: str, handler: WebEventHandler): WebHandler =
+    if node == 0 || name == nil:
+        return 0
+    let id = registerHandler(handler, false)
+    if id == 0:
+        return 0
+    domAddEvent(node, name, id)
+    return id
+
+fn unregisterDomEvent(node: WebNode, name: str, handlerId: WebHandler) =
+    if node == 0 || handlerId == 0 || name == nil:
+        return
+    domRemoveEvent(node, name, handlerId)
+    releaseHandler(handlerId)
+
+fn setTimeout(ms: int32, handler: WebEventHandler): WebTimer =
+    let id = registerHandler(handler, true)
+    if id == 0:
+        return 0
+    let timerId = webSetTimeout(id, ms)
+    var binding: TimerBinding
+    binding.timerId = timerId
+    binding.handlerId = id
+    timerBindings.add(binding)
+    return timerId
+
+fn clearTimeout(timerId: WebTimer) =
+    if timerId == 0:
+        return
+    webClearTimeout(timerId)
+    removeTimerBindingByTimer(timerId)
+
+fn host_event_dispatch(handlerId: int32, eventPtr: void*, eventLen: int32) =
+    let payload = readString(eventPtr, eventLen)
+    dispatchHandler(handlerId, payload)

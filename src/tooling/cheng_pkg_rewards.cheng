@@ -1,0 +1,664 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import std/tables as tables
+import cheng/runtime/json_ast as json
+import std/strings
+
+const
+    BytesPerGb = 1024.0 * 1024.0 * 1024.0
+    DaysPerMonth = 30.0
+    Ln2 = 0.6931471805599453
+
+type
+    Args =
+        input: str
+        out: str
+        pretty: bool
+        ok: bool
+        showHelp: bool
+        error: str
+
+    Params =
+        pricePerGbMonth: float64
+        hasPrice: bool
+        royaltyRate: float64
+        royaltyCapRate: float64
+        treasuryRate: float64
+        usagePool: float64
+        usageWeight: str
+        defaultDurationDays: float64
+        defaultReplicas: float64
+
+    PackageInfo =
+        authorId: str
+        qualityFactor: float64
+        royaltyRate: float64
+        hasRoyalty: bool
+
+    PackageStats =
+        authorId: str
+        storageRoyalty: float64
+        usageBonus: float64
+        usageUnits: float64
+        usageScore: float64
+
+    Totals =
+        storageCost: float64
+        royaltyTotal: float64
+        treasuryTotal: float64
+
+    JsonParser =
+        text: str
+        pos: int32
+        length: int32
+        error: str
+
+    ParseResult =
+        ok: bool
+        value: json.JsonNode
+        error: str
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng_pkg_rewards --input:<file> [--out:<file>] [--pretty]")
+
+fn parseArgs(): Args =
+    var res: Args
+    res.ok = true
+    var i: int32 = 1
+    let count: int32 = cmdline.paramCount()
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..count:
+        i = __for_i_1
+        let arg = cmdline.paramStr(i)
+        if arg == "--help" || arg == "-h":
+            res.ok = false
+            res.showHelp = true
+            return res
+        if arg == "--pretty":
+            res.pretty = true
+        elif strutil.startsWith(arg, "--input:"):
+            res.input = arg["--input:".len..^ 1]
+        elif strutil.startsWith(arg, "--out:"):
+            res.out = arg["--out:".len..^ 1]
+        elif arg == "--input":
+            if i + 1 > count:
+                res.ok = false
+                res.error = "--input requires a value"
+                return res
+            res.input = cmdline.paramStr(i + 1)
+            i = i + 1
+        elif arg == "--out":
+            if i + 1 > count:
+                res.ok = false
+                res.error = "--out requires a value"
+                return res
+            res.out = cmdline.paramStr(i + 1)
+            i = i + 1
+        else:
+            res.ok = false
+            res.error = "unknown arg: " + arg
+            return res
+        i = i + 1
+    if res.input == nil || len(res.input) == 0:
+        res.ok = false
+        res.error = "missing --input"
+    res
+
+fn parserInit(text: str): JsonParser =
+    JsonParser(text: text, pos: 0, length: len(text), error: "")
+
+fn parserFail(p: var JsonParser, msg: str) =
+    if p.error == nil || len(p.error) == 0:
+        p.error = msg
+
+fn parserPeek(p: var JsonParser): char =
+    if p.pos >= p.length:
+        return '\0'
+    return p.text[p.pos]
+
+fn parserNext(p: var JsonParser): char =
+    if p.pos >= p.length:
+        return '\0'
+    let ch = p.text[p.pos]
+    p.pos = p.pos + 1
+    ch
+
+fn skipWhitespace(p: var JsonParser) =
+    while p.pos < p.length:
+        let ch = p.text[p.pos]
+        if ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t':
+            p.pos = p.pos + 1
+        else:
+            break
+
+fn isDigit(ch: char): bool =
+    ch >= '0' && ch <= '9'
+
+fn parseValue(p: var JsonParser): json.JsonNode
+
+fn parseString(p: var JsonParser): str =
+    if parserPeek(p) != '"':
+        parserFail(p, "expected '\"'")
+        return ""
+    parserNext(p)
+    var out: str = ""
+    while p.pos < p.length:
+        let ch = parserNext(p)
+        if ch == '"':
+            return out
+        if ch == '\\':
+            if p.pos >= p.length:
+                parserFail(p, "unterminated str escape")
+                return out
+            let esc = parserNext(p)
+            if esc == '"':
+                out = out + charToStr('"')
+            elif esc == '\\':
+                out = out + charToStr('\\')
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + charToStr(esc)
+        else:
+            out = out + charToStr(ch)
+    parserFail(p, "unterminated str")
+    out
+
+fn parseNumber(p: var JsonParser): json.JsonNode =
+    var sign: int64 = 1
+    let first = parserPeek(p)
+    if first == '-':
+        sign = -1
+        parserNext(p)
+    var intPart: int64 = 0
+    var digitCount: int32 = 0
+    while isDigit(parserPeek(p)):
+        let ch = parserNext(p)
+        intPart = intPart * 10 + int64(ch) - int64('0')
+        digitCount = digitCount + 1
+    var hasFrac = false
+    var fracPart: float64 = 0.0
+    var fracDiv: float64 = 1.0
+    if parserPeek(p) == '.':
+        hasFrac = true
+        parserNext(p)
+        while isDigit(parserPeek(p)):
+            let ch = parserNext(p)
+            fracPart = fracPart * 10.0 + float64(int32(ch) - int32('0'))
+            fracDiv = fracDiv * 10.0
+            digitCount = digitCount + 1
+    if digitCount == 0:
+        parserFail(p, "invalid number")
+        return json.newJFloat(0.0)
+    var hasExp = false
+    var expSign: int32 = 1
+    var expVal: int32 = 0
+    if parserPeek(p) == 'e' || parserPeek(p) == 'E':
+        hasExp = true
+        parserNext(p)
+        if parserPeek(p) == '+':
+            parserNext(p)
+        elif parserPeek(p) == '-':
+            expSign = -1
+            parserNext(p)
+        if ! isDigit(parserPeek(p)):
+            parserFail(p, "invalid exponent")
+            return json.newJFloat(0.0)
+        while isDigit(parserPeek(p)):
+            let ch = parserNext(p)
+            expVal = expVal * 10 + (int32(ch) - int32('0'))
+    if ! hasFrac && ! hasExp:
+        return json.newJInt(intPart * sign)
+    var num = float64(intPart) + (fracPart / fracDiv)
+    if sign < 0:
+        num = -num
+    if hasExp:
+        var pow10: float64 = 1.0
+        let __for_start_count = expVal
+        for __for_rev_count in 0..<(__for_start_count - (0)):
+            let count = __for_start_count - __for_rev_count
+            if expSign >= 0:
+                pow10 = pow10 * 10.0
+            else:
+                pow10 = pow10 / 10.0
+        num = num * pow10
+    json.newJFloat(num)
+
+fn parseArray(p: var JsonParser): json.JsonNode =
+    let node = json.newJArray()
+    parserNext(p)
+    skipWhitespace(p)
+    if parserPeek(p) == ']':
+        parserNext(p)
+        return node
+    while true:
+        skipWhitespace(p)
+        let value = parseValue(p)
+        node.add(value)
+        skipWhitespace(p)
+        let ch = parserPeek(p)
+        if ch == ',':
+            parserNext(p)
+            continue
+        if ch == ']':
+            parserNext(p)
+            break
+        parserFail(p, "expected ',' or ']'")
+        break
+    node
+
+fn parseObject(p: var JsonParser): json.JsonNode =
+    let node = json.newJObject()
+    parserNext(p)
+    skipWhitespace(p)
+    if parserPeek(p) == '}':
+        parserNext(p)
+        return node
+    while true:
+        skipWhitespace(p)
+        if parserPeek(p) != '"':
+            parserFail(p, "expected object key")
+            return node
+        let key = parseString(p)
+        skipWhitespace(p)
+        if parserPeek(p) != ':':
+            parserFail(p, "expected ':'")
+            return node
+        parserNext(p)
+        skipWhitespace(p)
+        let value = parseValue(p)
+        node[key] = value
+        skipWhitespace(p)
+        let ch = parserPeek(p)
+        if ch == ',':
+            parserNext(p)
+            continue
+        if ch == '}':
+            parserNext(p)
+            break
+        parserFail(p, "expected ',' or '}'")
+        break
+    node
+
+fn consumeLiteral(p: var JsonParser, lit: str): bool =
+    for i in 0..<len(lit):
+        if p.pos + i >= p.length:
+            return false
+        if p.text[p.pos + i] != lit[i]:
+            return false
+    p.pos = p.pos + len(lit)
+    true
+
+fn parseValue(p: var JsonParser): json.JsonNode =
+    skipWhitespace(p)
+    let ch = parserPeek(p)
+    if ch == '"':
+        return json.newJString(parseString(p))
+    if ch == '{':
+        return parseObject(p)
+    if ch == '[':
+        return parseArray(p)
+    if ch == 't':
+        if consumeLiteral(p, "true"):
+            return json.newJBool(true)
+        parserFail(p, "invalid literal")
+        return json.newJBool(false)
+    if ch == 'f':
+        if consumeLiteral(p, "false"):
+            return json.newJBool(false)
+        parserFail(p, "invalid literal")
+        return json.newJBool(false)
+    if ch == 'n':
+        if consumeLiteral(p, "null"):
+            return json.newJNull()
+        parserFail(p, "invalid literal")
+        return json.newJNull()
+    if ch == '-' || isDigit(ch):
+        return parseNumber(p)
+    parserFail(p, "unexpected token")
+    json.newJNull()
+
+fn parseJsonSafe(content: str): ParseResult =
+    var parser = parserInit(content)
+    let value = parseValue(parser)
+    skipWhitespace(parser)
+    var res: ParseResult
+    if parser.error != nil && len(parser.error) > 0:
+        res.ok = false
+        res.value = json.newJNull()
+        res.error = parser.error
+        return res
+    if parser.pos < parser.length:
+        res.ok = false
+        res.value = json.newJNull()
+        res.error = "trailing data"
+        return res
+    res.ok = true
+    res.value = value
+    res.error = ""
+    res
+
+fn hasField(node: json.JsonNode, key: str): bool =
+    if node == nil || node.kind != json.JObject:
+        return false
+    return node.hasKey(key)
+
+fn getStringField(node: json.JsonNode, key: str, fallback: str): str =
+    if hasField(node, key):
+        return node[key].getStr()
+    return fallback
+
+fn getFloatField(node: json.JsonNode, key: str, fallback: float64): float64 =
+    if hasField(node, key):
+        return node[key].getFloat()
+    return fallback
+
+fn clamp(value: float64, low: float64, high: float64): float64 =
+    if value < low:
+        return low
+    if value > high:
+        return high
+    value
+
+fn logApprox(x: float64): float64 =
+    if x <= 0.0:
+        return 0.0
+    var y = x
+    var k: int32 = 0
+    while y > 2.0:
+        y = y / 2.0
+        k = k + 1
+    while y < 1.0:
+        y = y * 2.0
+        k = k - 1
+    let t = (y - 1.0) / (y + 1.0)
+    let t2 = t * t
+    var term = t
+    var sum = 0.0
+    var n: int32 = 1
+    while n <= 9:
+        sum = sum + term / float64(n)
+        term = term * t2
+        n = n + 2
+    return 2.0 * sum + float64(k) * Ln2
+
+fn log1p(x: float64): float64 =
+    return logApprox(1.0 + x)
+
+fn sqrtApprox(x: float64): float64 =
+    if x <= 0.0:
+        return 0.0
+    var guess = x
+    if guess < 1.0:
+        guess = 1.0
+    for i in 0..<8:
+        guess = 0.5 * (guess + (x / guess))
+    guess
+
+fn usageScore(units: float64, mode: str): float64 =
+    if mode == "log":
+        return log1p(units)
+    if mode == "sqrt":
+        return sqrtApprox(units)
+    units
+
+fn addAmount(t: var tables.Table[str, float64], key: str, amount: float64) =
+    if key == nil || len(key) == 0:
+        return
+    let current = tables.getOrDefault(t, key, 0.0)
+    t[key] = current + amount
+
+fn sumTable(t: tables.Table[str, float64]): float64 =
+    var total = 0.0
+    var idx: int32 = 0
+    var key: str
+    var val: float64
+    while tables.TableNext(t, idx, key, val, idx):
+        total = total + val
+    total
+
+fn loadParams(node: json.JsonNode): Params =
+    var params: Params
+    params.hasPrice = hasField(node, "price_per_gb_month")
+    params.pricePerGbMonth = getFloatField(node, "price_per_gb_month", 0.0)
+    params.royaltyRate = getFloatField(node, "royalty_rate", 0.0)
+    params.royaltyCapRate = getFloatField(node, "royalty_cap_rate", 0.20)
+    params.treasuryRate = getFloatField(node, "treasury_rate", 0.0)
+    params.usagePool = getFloatField(node, "usage_pool", 0.0)
+    params.usageWeight = strutil.toLowerAscii(getStringField(node, "usage_weight", "linear"))
+    params.defaultDurationDays = getFloatField(node, "default_duration_days", 30.0)
+    params.defaultReplicas = getFloatField(node, "default_replicas", 1.0)
+    params
+
+fn loadPackages(node: json.JsonNode): (&tables.Table)[str, PackageInfo] =
+    var out = tables.initTable[str, PackageInfo]()
+    if node == nil || node.kind != json.JArray:
+        return out
+    for i in 0..<len(node.a):
+        let pkg = node.a[i]
+        let packageId = getStringField(pkg, "package_id", "")
+        if packageId == nil || len(packageId) == 0:
+            continue
+        var info: PackageInfo
+        info.authorId = getStringField(pkg, "author_id", "")
+        info.qualityFactor = getFloatField(pkg, "quality_factor", 1.0)
+        if hasField(pkg, "royalty_rate"):
+            info.royaltyRate = getFloatField(pkg, "royalty_rate", 0.0)
+            info.hasRoyalty = true
+        out[packageId] = info
+    out
+
+fn updatePackageStats(stats: var tables.Table[str, PackageStats], packageId: str, authorId: str, storageRoyalty: float64, usageBonus: float64, usageUnits: float64, usageScoreValue: float64) =
+    if packageId == nil || len(packageId) == 0:
+        return
+    if tables.hasKey(stats, packageId) == false:
+        var entry: PackageStats
+        entry.authorId = authorId
+        stats[packageId] = entry
+    if stats[packageId].authorId == nil || len(stats[packageId].authorId) == 0:
+        stats[packageId].authorId = authorId
+    stats[packageId].storageRoyalty = stats[packageId].storageRoyalty + storageRoyalty
+    stats[packageId].usageBonus = stats[packageId].usageBonus + usageBonus
+    stats[packageId].usageUnits = stats[packageId].usageUnits + usageUnits
+    stats[packageId].usageScore = stats[packageId].usageScore + usageScoreValue
+
+fn tableToJson(t: tables.Table[str, float64]): json.JsonNode =
+    let node = json.newJObject()
+    var idx: int32 = 0
+    var key: str
+    var val: float64
+    while tables.TableNext(t, idx, key, val, idx):
+        node[key] = json.newJFloat(val)
+    node
+
+fn packagesToJson(t: tables.Table[str, PackageStats]): json.JsonNode =
+    let node = json.newJObject()
+    var idx: int32 = 0
+    var key: str
+    var val: PackageStats
+    while tables.TableNext(t, idx, key, val, idx):
+        let pkg = json.newJObject()
+        pkg["author_id"] = json.newJString(val.authorId)
+        pkg["storage_royalty"] = json.newJFloat(val.storageRoyalty)
+        pkg["usage_bonus"] = json.newJFloat(val.usageBonus)
+        pkg["usage_units"] = json.newJFloat(val.usageUnits)
+        pkg["usage_score"] = json.newJFloat(val.usageScore)
+        node[key] = pkg
+    node
+
+fn buildOutput(epochNode: json.JsonNode, totals: Totals, usagePool: float64, authorPayouts: tables.Table[str, float64], storagePayouts: tables.Table[str, float64], packageStats: tables.Table[str, PackageStats]): json.JsonNode =
+    let root = json.newJObject()
+    if epochNode != nil && epochNode.kind != json.JNull:
+        root["epoch"] = epochNode
+    else:
+        root["epoch"] = json.newJString("")
+    let totalsNode = json.newJObject()
+    let payoutTotal = sumTable(authorPayouts) + sumTable(storagePayouts) + totals.treasuryTotal
+    totalsNode["storage_cost"] = json.newJFloat(totals.storageCost)
+    totalsNode["royalty_total"] = json.newJFloat(totals.royaltyTotal)
+    totalsNode["treasury_total"] = json.newJFloat(totals.treasuryTotal)
+    totalsNode["usage_pool"] = json.newJFloat(usagePool)
+    totalsNode["payout_total"] = json.newJFloat(payoutTotal)
+    let payoutsNode = json.newJObject()
+    payoutsNode["authors"] = tableToJson(authorPayouts)
+    payoutsNode["storage_providers"] = tableToJson(storagePayouts)
+    payoutsNode["treasury"] = json.newJFloat(totals.treasuryTotal)
+    root["totals"] = totalsNode
+    root["payouts"] = payoutsNode
+    root["packages"] = packagesToJson(packageStats)
+    root
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let args = parseArgs()
+    if args.showHelp:
+        printUsage()
+        return 0
+    if args.ok == false:
+        if args.error != nil && len(args.error) > 0:
+            printErr(args.error)
+        printUsage()
+        return 1
+    let content = os.readFile(args.input)
+    let parsed = parseJsonSafe(content)
+    if ! parsed.ok:
+        printErr("parse error: " + parsed.error)
+        return 1
+    let root = parsed.value
+    if root == nil || root.kind != json.JObject:
+        printErr("input json must be an object")
+        return 1
+    let params = loadParams(root["params"])
+    let packages = loadPackages(root["packages"])
+    let leasesNode = root["leases"]
+    let usageNode = root["usage"]
+    var totals: Totals
+    var authorPayouts = tables.initTable[str, float64]()
+    var storagePayouts = tables.initTable[str, float64]()
+    var packageStats = tables.initTable[str, PackageStats]()
+    var errors: str[] 
+
+    if leasesNode != nil && leasesNode.kind == json.JArray:
+        for i in 0..<len(leasesNode.a):
+            let lease = leasesNode.a[i]
+            let packageId = getStringField(lease, "package_id", "")
+            if packageId == nil || len(packageId) == 0:
+                errors.add("lease missing package_id")
+                continue
+            let providerId = getStringField(lease, "storage_provider_id", "")
+            if providerId == nil || len(providerId) == 0:
+                errors.add("lease missing storage_provider_id: " + packageId)
+                continue
+            if hasField(lease, "bytes") == false:
+                errors.add("lease missing bytes: " + packageId)
+                continue
+            let bytesCount = getFloatField(lease, "bytes", 0.0)
+            var authorId = getStringField(lease, "author_id", "")
+            if (authorId == nil || len(authorId) == 0) && tables.hasKey(packages, packageId):
+                authorId = packages[packageId].authorId
+            if authorId == nil || len(authorId) == 0:
+                errors.add("lease missing author_id for " + packageId)
+                continue
+            var durationDays = getFloatField(lease, "duration_days", params.defaultDurationDays)
+            if durationDays <= 0.0:
+                durationDays = params.defaultDurationDays
+            var replicas = getFloatField(lease, "replicas", params.defaultReplicas)
+            if replicas <= 0.0:
+                replicas = params.defaultReplicas
+            var pricePerGbMonth = 0.0
+            if hasField(lease, "price_per_gb_month"):
+                pricePerGbMonth = getFloatField(lease, "price_per_gb_month", 0.0)
+            elif params.hasPrice:
+                pricePerGbMonth = params.pricePerGbMonth
+            else:
+                errors.add("lease missing price_per_gb_month: " + packageId)
+                continue
+            let gbMonths = (bytesCount / BytesPerGb) * (durationDays / DaysPerMonth) * replicas
+            let storageCost = gbMonths * pricePerGbMonth
+            var royaltyRate = params.royaltyRate
+            if tables.hasKey(packages, packageId) && packages[packageId].hasRoyalty:
+                royaltyRate = packages[packageId].royaltyRate
+            if hasField(lease, "royalty_rate"):
+                royaltyRate = getFloatField(lease, "royalty_rate", royaltyRate)
+            royaltyRate = clamp(royaltyRate, 0.0, params.royaltyCapRate)
+            var treasuryRate = params.treasuryRate
+            if hasField(lease, "treasury_rate"):
+                treasuryRate = getFloatField(lease, "treasury_rate", treasuryRate)
+            let totalRate = royaltyRate + treasuryRate
+            if totalRate > 1.0:
+                errors.add("lease rates exceed 1.0 for " + packageId)
+                continue
+            let royaltyFee = storageCost * royaltyRate
+            let treasuryFee = storageCost * treasuryRate
+            let providerFee = storageCost - royaltyFee - treasuryFee
+            if providerFee < 0.0:
+                errors.add("lease negative provider fee for " + packageId)
+                continue
+            totals.storageCost = totals.storageCost + storageCost
+            totals.royaltyTotal = totals.royaltyTotal + royaltyFee
+            totals.treasuryTotal = totals.treasuryTotal + treasuryFee
+            addAmount(authorPayouts, authorId, royaltyFee)
+            addAmount(storagePayouts, providerId, providerFee)
+            updatePackageStats(packageStats, packageId, authorId, royaltyFee, 0.0, 0.0, 0.0)
+
+    var usagePool = params.usagePool
+    if usagePool > 0.0 && usageNode != nil && usageNode.kind == json.JArray:
+        var scores = tables.initTable[str, float64]()
+        var totalScore = 0.0
+        for i in 0..<len(usageNode.a):
+            let entry = usageNode.a[i]
+            let packageId = getStringField(entry, "package_id", "")
+            let units = getFloatField(entry, "units", 0.0)
+            if packageId == nil || len(packageId) == 0 || units <= 0.0:
+                continue
+            var quality = 1.0
+            if tables.hasKey(packages, packageId):
+                let q = packages[packageId].qualityFactor
+                if q > 0.0:
+                    quality = q
+            let score = usageScore(units, params.usageWeight) * quality
+            addAmount(scores, packageId, score)
+            totalScore = totalScore + score
+            var authorId = ""
+            if tables.hasKey(packages, packageId):
+                authorId = packages[packageId].authorId
+            updatePackageStats(packageStats, packageId, authorId, 0.0, 0.0, units, score)
+        if totalScore > 0.0:
+            var idx: int32 = 0
+            var key: str
+            var val: float64
+            while tables.TableNext(scores, idx, key, val, idx):
+                if tables.hasKey(packages, key) == false:
+                    continue
+                let authorId = packages[key].authorId
+                if authorId == nil || len(authorId) == 0:
+                    continue
+                let share = usagePool * (val / totalScore)
+                addAmount(authorPayouts, authorId, share)
+                updatePackageStats(packageStats, key, authorId, 0.0, share, 0.0, 0.0)
+        else:
+            usagePool = 0.0
+
+    if errors.len > 0:
+        for i in 0..<len(errors):
+            printErr("error: " + errors[i])
+        return 1
+
+    let outputNode = buildOutput(root["epoch"], totals, usagePool, authorPayouts, storagePayouts, packageStats)
+    let outputText = if args.pretty: json.toPretty(outputNode) else: json.pretty(outputNode)
+    if args.out != nil && len(args.out) > 0:
+        os.writeFile(args.out, outputText + "\n")
+    else:
+        printLine(outputText)
+    return 0

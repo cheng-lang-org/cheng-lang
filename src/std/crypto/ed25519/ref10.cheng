@@ -1,0 +1,1762 @@
+# Ed25519 ref10 core(minimal, no base precomp).
+
+import std/rawbytes
+import std/result
+import std/strings
+import std/crypto/sha512
+import std/system
+const
+    feLen: int32 = 10
+    bytes32Len: int32 = 32
+
+type
+    Fe = int64[]
+
+    GeP2 =
+        x: Fe
+        y: Fe
+        z: Fe
+
+    GeP3 =
+        x: Fe
+        y: Fe
+        z: Fe
+        t: Fe
+
+    GeP1P1 =
+        x: Fe
+        y: Fe
+        z: Fe
+        t: Fe
+
+fn newFe(): Fe =
+    var out: int64[]
+    out.cap = feLen
+    out.len = feLen
+    return out
+
+fn ensureFeLen(h: var Fe) =
+    # NOTE: avoid std/seqs.len[T] (currently lowers to a recursive call on some backends).
+    # IMPORTANT: avoid `h = newFe()` for `var` params; it can miscompile on some backends.
+    # `cap` is allowed to be > feLen (allocator rounding); only enforce >= feLen.
+    if h.len != feLen || h.cap < feLen || h.buffer == nil:
+        let tmp: Fe = newFe()
+        h.len = tmp.len
+        h.cap = tmp.cap
+        h.buffer = tmp.buffer
+
+fn feGet(f: var Fe, i: int32): int64 =
+    ensureFeLen(f)
+    if i < 0 || i >= feLen:
+        panic "ref10: fe index out of bounds"
+    var idx64: int64 = int64(i)
+    var offset64: int64 = idx64 * sizeof int64
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(f.buffer, offset32)
+    var pt: int64* = int64*(p)
+    return *pt
+
+fn feSet(f: var Fe, i: int32, val: int64) =
+    ensureFeLen(f)
+    if i < 0 || i >= feLen:
+        return
+    var idx64: int64 = int64(i)
+    var offset64: int64 = idx64 * sizeof int64
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(f.buffer, offset32)
+    var pt: int64* = int64*(p)
+    *pt = val
+
+fn initCurveOrder(): Bytes =
+    let out: Bytes = bytesAlloc(bytes32Len)
+    bytesSet(out, 0, 0xED)
+    bytesSet(out, 1, 0xD3)
+    bytesSet(out, 2, 0xF5)
+    bytesSet(out, 3, 0x5C)
+    bytesSet(out, 4, 0x1A)
+    bytesSet(out, 5, 0x63)
+    bytesSet(out, 6, 0x12)
+    bytesSet(out, 7, 0x58)
+    bytesSet(out, 8, 0xD6)
+    bytesSet(out, 9, 0x9C)
+    bytesSet(out, 10, 0xF7)
+    bytesSet(out, 11, 0xA2)
+    bytesSet(out, 12, 0xDE)
+    bytesSet(out, 13, 0xF9)
+    bytesSet(out, 14, 0xDE)
+    bytesSet(out, 15, 0x14)
+    bytesSet(out, 16, 0x00)
+    bytesSet(out, 17, 0x00)
+    bytesSet(out, 18, 0x00)
+    bytesSet(out, 19, 0x00)
+    bytesSet(out, 20, 0x00)
+    bytesSet(out, 21, 0x00)
+    bytesSet(out, 22, 0x00)
+    bytesSet(out, 23, 0x00)
+    bytesSet(out, 24, 0x00)
+    bytesSet(out, 25, 0x00)
+    bytesSet(out, 26, 0x00)
+    bytesSet(out, 27, 0x00)
+    bytesSet(out, 28, 0x00)
+    bytesSet(out, 29, 0x00)
+    bytesSet(out, 30, 0x00)
+    bytesSet(out, 31, 0x10)
+    return out
+
+fn initBasePointBytes(): Bytes =
+    let out: Bytes = bytesAlloc(bytes32Len)
+    bytesSet(out, 0, 88)
+    bytesSet(out, 1, 102)
+    bytesSet(out, 2, 102)
+    bytesSet(out, 3, 102)
+    bytesSet(out, 4, 102)
+    bytesSet(out, 5, 102)
+    bytesSet(out, 6, 102)
+    bytesSet(out, 7, 102)
+    bytesSet(out, 8, 102)
+    bytesSet(out, 9, 102)
+    bytesSet(out, 10, 102)
+    bytesSet(out, 11, 102)
+    bytesSet(out, 12, 102)
+    bytesSet(out, 13, 102)
+    bytesSet(out, 14, 102)
+    bytesSet(out, 15, 102)
+    bytesSet(out, 16, 102)
+    bytesSet(out, 17, 102)
+    bytesSet(out, 18, 102)
+    bytesSet(out, 19, 102)
+    bytesSet(out, 20, 102)
+    bytesSet(out, 21, 102)
+    bytesSet(out, 22, 102)
+    bytesSet(out, 23, 102)
+    bytesSet(out, 24, 102)
+    bytesSet(out, 25, 102)
+    bytesSet(out, 26, 102)
+    bytesSet(out, 27, 102)
+    bytesSet(out, 28, 102)
+    bytesSet(out, 29, 102)
+    bytesSet(out, 30, 102)
+    bytesSet(out, 31, 102)
+    return out
+
+fn initDConst(out: var Fe) =
+    ensureFeLen(out)
+    feSet(out, 0, -10913610)
+    feSet(out, 1, 13857413)
+    feSet(out, 2, -15372611)
+    feSet(out, 3, 6949391)
+    feSet(out, 4, 114729)
+    feSet(out, 5, -8787816)
+    feSet(out, 6, -6275908)
+    feSet(out, 7, -3247719)
+    feSet(out, 8, -18696448)
+    feSet(out, 9, -12055116)
+
+fn initD2Const(out: var Fe) =
+    ensureFeLen(out)
+    feSet(out, 0, -21827239)
+    feSet(out, 1, -5839606)
+    feSet(out, 2, -30745221)
+    feSet(out, 3, 13898782)
+    feSet(out, 4, 229458)
+    feSet(out, 5, 15978800)
+    feSet(out, 6, -12551817)
+    feSet(out, 7, -6495438)
+    feSet(out, 8, 29715968)
+    feSet(out, 9, 9444199)
+
+fn initSqrtM1(out: var Fe) =
+    ensureFeLen(out)
+    feSet(out, 0, -32595792)
+    feSet(out, 1, -7943725)
+    feSet(out, 2, 9377950)
+    feSet(out, 3, 3500415)
+    feSet(out, 4, 12389472)
+    feSet(out, 5, -272473)
+    feSet(out, 6, -25146209)
+    feSet(out, 7, -2005654)
+    feSet(out, 8, 326686)
+    feSet(out, 9, 11406482)
+
+var CurveOrder: Bytes = initCurveOrder()
+var BasePointBytes: Bytes = initBasePointBytes()
+var DConst: Fe
+var D2Const: Fe
+var SqrtM1: Fe
+initDConst(DConst)
+initD2Const(D2Const)
+initSqrtM1(SqrtM1)
+
+fn ashr64(x: int64, n: int32): int64 =
+    return x >> n
+
+fn ashr32(x: int32, n: int32): int32 =
+    return x >> n
+
+fn fe0(h: var Fe) =
+    ensureFeLen(h)
+    for i in 0..<10:
+        feSet(h, i, 0)
+
+fn fe1(h: var Fe) =
+    fe0(h)
+    feSet(h, 0, 1)
+
+fn feCopy(h: var Fe, f: Fe) =
+    ensureFeLen(h)
+    for i in 0..<10:
+        feSet(h, i, feGet(f, i))
+
+fn feAdd(h: var Fe, f, g: Fe) =
+    ensureFeLen(h)
+    for i in 0..<10:
+        feSet(h, i, feGet(f, i) + feGet(g, i))
+
+fn feSub(h: var Fe, f, g: Fe) =
+    ensureFeLen(h)
+    for i in 0..<10:
+        feSet(h, i, feGet(f, i) - feGet(g, i))
+
+fn feNeg(h: var Fe, f: Fe) =
+    ensureFeLen(h)
+    for i in 0..<10:
+        feSet(h, i, -feGet(f, i))
+
+fn feCmov(f: var Fe, g: Fe, b: int32) =
+    ensureFeLen(f)
+    var i: int32 = 0
+    var mask: int64 = -int64(b)
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<10:
+        i = __for_i_1
+        let x: int64 = (feGet(f, i) ^ feGet(g, i)) & mask
+        feSet(f, i, feGet(f, i) ^ x)
+        i = i + 1
+
+fn load3(data: Bytes, offset: int32): int64 =
+    let b0: int64 = int64(bytesGet(data, offset))
+    let b1: int64 = int64(bytesGet(data, offset + 1))
+    let b2: int64 = int64(bytesGet(data, offset + 2))
+    return b0 | (b1 << 8) | (b2 << 16)
+
+fn load4(data: Bytes, offset: int32): int64 =
+    let b0: int64 = int64(bytesGet(data, offset))
+    let b1: int64 = int64(bytesGet(data, offset + 1))
+    let b2: int64 = int64(bytesGet(data, offset + 2))
+    let b3: int64 = int64(bytesGet(data, offset + 3))
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn feFromBytes(h: var Fe, s: Bytes) =
+    ensureFeLen(h)
+    var h0: int64 = load4(s, 0)
+    var h1: int64 = load3(s, 4) << 6
+    var h2: int64 = load3(s, 7) << 5
+    var h3: int64 = load3(s, 10) << 3
+    var h4: int64 = load3(s, 13) << 2
+    var h5: int64 = load4(s, 16)
+    var h6: int64 = load3(s, 20) << 7
+    var h7: int64 = load3(s, 23) << 5
+    var h8: int64 = load3(s, 26) << 4
+    var h9: int64 = (load3(s, 29) & 8388607) << 2
+
+    var c0: int64
+    var c1: int64
+    var c2: int64
+    var c3: int64
+    var c4: int64
+    var c5: int64
+    var c6: int64
+    var c7: int64
+    var c8: int64
+    var c9: int64
+
+    c9 = ashr64(h9 + (1 << 24), 25)
+    h0 = h0 + c9 * 19
+    h9 = h9 - (c9 << 25)
+    c1 = ashr64(h1 + (1 << 24), 25)
+    h2 = h2 + c1
+    h1 = h1 - (c1 << 25)
+    c3 = ashr64(h3 + (1 << 24), 25)
+    h4 = h4 + c3
+    h3 = h3 - (c3 << 25)
+    c5 = ashr64(h5 + (1 << 24), 25)
+    h6 = h6 + c5
+    h5 = h5 - (c5 << 25)
+    c7 = ashr64(h7 + (1 << 24), 25)
+    h8 = h8 + c7
+    h7 = h7 - (c7 << 25)
+
+    c0 = ashr64(h0 + (1 << 25), 26)
+    h1 = h1 + c0
+    h0 = h0 - (c0 << 26)
+    c2 = ashr64(h2 + (1 << 25), 26)
+    h3 = h3 + c2
+    h2 = h2 - (c2 << 26)
+    c4 = ashr64(h4 + (1 << 25), 26)
+    h5 = h5 + c4
+    h4 = h4 - (c4 << 26)
+    c6 = ashr64(h6 + (1 << 25), 26)
+    h7 = h7 + c6
+    h6 = h6 - (c6 << 26)
+    c8 = ashr64(h8 + (1 << 25), 26)
+    h9 = h9 + c8
+    h8 = h8 - (c8 << 26)
+
+    feSet(h, 0, h0)
+    feSet(h, 1, h1)
+    feSet(h, 2, h2)
+    feSet(h, 3, h3)
+    feSet(h, 4, h4)
+    feSet(h, 5, h5)
+    feSet(h, 6, h6)
+    feSet(h, 7, h7)
+    feSet(h, 8, h8)
+    feSet(h, 9, h9)
+
+fn feToBytes(h: Fe): Bytes =
+    var h0: int64 = feGet(h, 0)
+    var h1: int64 = feGet(h, 1)
+    var h2: int64 = feGet(h, 2)
+    var h3: int64 = feGet(h, 3)
+    var h4: int64 = feGet(h, 4)
+    var h5: int64 = feGet(h, 5)
+    var h6: int64 = feGet(h, 6)
+    var h7: int64 = feGet(h, 7)
+    var h8: int64 = feGet(h, 8)
+    var h9: int64 = feGet(h, 9)
+    var q: int64
+
+    q = ashr64((19 * h9 + (1 << 24)), 25)
+    q = ashr64(h0 + q, 26)
+    q = ashr64(h1 + q, 25)
+    q = ashr64(h2 + q, 26)
+    q = ashr64(h3 + q, 25)
+    q = ashr64(h4 + q, 26)
+    q = ashr64(h5 + q, 25)
+    q = ashr64(h6 + q, 26)
+    q = ashr64(h7 + q, 25)
+    q = ashr64(h8 + q, 26)
+    q = ashr64(h9 + q, 25)
+
+    h0 = h0 + 19 * q
+
+    var c0: int64 = ashr64(h0, 26)
+    h1 = h1 + c0
+    h0 = h0 - (c0 << 26)
+    var c1: int64 = ashr64(h1, 25)
+    h2 = h2 + c1
+    h1 = h1 - (c1 << 25)
+    var c2: int64 = ashr64(h2, 26)
+    h3 = h3 + c2
+    h2 = h2 - (c2 << 26)
+    var c3: int64 = ashr64(h3, 25)
+    h4 = h4 + c3
+    h3 = h3 - (c3 << 25)
+    var c4: int64 = ashr64(h4, 26)
+    h5 = h5 + c4
+    h4 = h4 - (c4 << 26)
+    var c5: int64 = ashr64(h5, 25)
+    h6 = h6 + c5
+    h5 = h5 - (c5 << 25)
+    var c6: int64 = ashr64(h6, 26)
+    h7 = h7 + c6
+    h6 = h6 - (c6 << 26)
+    var c7: int64 = ashr64(h7, 25)
+    h8 = h8 + c7
+    h7 = h7 - (c7 << 25)
+    var c8: int64 = ashr64(h8, 26)
+    h9 = h9 + c8
+    h8 = h8 - (c8 << 26)
+    var c9: int64 = ashr64(h9, 25)
+    h9 = h9 - (c9 << 25)
+
+    let out: Bytes = bytesAlloc(32)
+    bytesSet(out, 0, int32(ashr64(h0, 0) & 255))
+    bytesSet(out, 1, int32(ashr64(h0, 8) & 255))
+    bytesSet(out, 2, int32(ashr64(h0, 16) & 255))
+    bytesSet(out, 3, int32((ashr64(h0, 24) | (h1 << 2)) & 255))
+    bytesSet(out, 4, int32(ashr64(h1, 6) & 255))
+    bytesSet(out, 5, int32(ashr64(h1, 14) & 255))
+    bytesSet(out, 6, int32((ashr64(h1, 22) | (h2 << 3)) & 255))
+    bytesSet(out, 7, int32(ashr64(h2, 5) & 255))
+    bytesSet(out, 8, int32(ashr64(h2, 13) & 255))
+    bytesSet(out, 9, int32((ashr64(h2, 21) | (h3 << 5)) & 255))
+    bytesSet(out, 10, int32(ashr64(h3, 3) & 255))
+    bytesSet(out, 11, int32(ashr64(h3, 11) & 255))
+    bytesSet(out, 12, int32((ashr64(h3, 19) | (h4 << 6)) & 255))
+    bytesSet(out, 13, int32(ashr64(h4, 2) & 255))
+    bytesSet(out, 14, int32(ashr64(h4, 10) & 255))
+    bytesSet(out, 15, int32(ashr64(h4, 18) & 255))
+    bytesSet(out, 16, int32(ashr64(h5, 0) & 255))
+    bytesSet(out, 17, int32(ashr64(h5, 8) & 255))
+    bytesSet(out, 18, int32(ashr64(h5, 16) & 255))
+    bytesSet(out, 19, int32((ashr64(h5, 24) | (h6 << 1)) & 255))
+    bytesSet(out, 20, int32(ashr64(h6, 7) & 255))
+    bytesSet(out, 21, int32(ashr64(h6, 15) & 255))
+    bytesSet(out, 22, int32((ashr64(h6, 23) | (h7 << 3)) & 255))
+    bytesSet(out, 23, int32(ashr64(h7, 5) & 255))
+    bytesSet(out, 24, int32(ashr64(h7, 13) & 255))
+    bytesSet(out, 25, int32((ashr64(h7, 21) | (h8 << 4)) & 255))
+    bytesSet(out, 26, int32(ashr64(h8, 4) & 255))
+    bytesSet(out, 27, int32(ashr64(h8, 12) & 255))
+    bytesSet(out, 28, int32((ashr64(h8, 20) | (h9 << 6)) & 255))
+    bytesSet(out, 29, int32(ashr64(h9, 2) & 255))
+    bytesSet(out, 30, int32(ashr64(h9, 10) & 255))
+    bytesSet(out, 31, int32(ashr64(h9, 18) & 255))
+    return out
+
+fn feMul(h: var Fe, f, g: Fe) =
+    ensureFeLen(h)
+    var f0: int64 = feGet(f, 0)
+    var f1: int64 = feGet(f, 1)
+    var f2: int64 = feGet(f, 2)
+    var f3: int64 = feGet(f, 3)
+    var f4: int64 = feGet(f, 4)
+    var f5: int64 = feGet(f, 5)
+    var f6: int64 = feGet(f, 6)
+    var f7: int64 = feGet(f, 7)
+    var f8: int64 = feGet(f, 8)
+    var f9: int64 = feGet(f, 9)
+    var g0: int64 = feGet(g, 0)
+    var g1: int64 = feGet(g, 1)
+    var g2: int64 = feGet(g, 2)
+    var g3: int64 = feGet(g, 3)
+    var g4: int64 = feGet(g, 4)
+    var g5: int64 = feGet(g, 5)
+    var g6: int64 = feGet(g, 6)
+    var g7: int64 = feGet(g, 7)
+    var g8: int64 = feGet(g, 8)
+    var g9: int64 = feGet(g, 9)
+    var g1_19: int64 = 19 * g1
+    var g2_19: int64 = 19 * g2
+    var g3_19: int64 = 19 * g3
+    var g4_19: int64 = 19 * g4
+    var g5_19: int64 = 19 * g5
+    var g6_19: int64 = 19 * g6
+    var g7_19: int64 = 19 * g7
+    var g8_19: int64 = 19 * g8
+    var g9_19: int64 = 19 * g9
+    var f1_2: int64 = 2 * f1
+    var f3_2: int64 = 2 * f3
+    var f5_2: int64 = 2 * f5
+    var f7_2: int64 = 2 * f7
+    var f9_2: int64 = 2 * f9
+    var f0g0: int64 = f0 * g0
+    var f0g1: int64 = f0 * g1
+    var f0g2: int64 = f0 * g2
+    var f0g3: int64 = f0 * g3
+    var f0g4: int64 = f0 * g4
+    var f0g5: int64 = f0 * g5
+    var f0g6: int64 = f0 * g6
+    var f0g7: int64 = f0 * g7
+    var f0g8: int64 = f0 * g8
+    var f0g9: int64 = f0 * g9
+    var f1g0: int64 = f1 * g0
+    var f1g1_2: int64 = f1_2 * g1
+    var f1g2: int64 = f1 * g2
+    var f1g3_2: int64 = f1_2 * g3
+    var f1g4: int64 = f1 * g4
+    var f1g5_2: int64 = f1_2 * g5
+    var f1g6: int64 = f1 * g6
+    var f1g7_2: int64 = f1_2 * g7
+    var f1g8: int64 = f1 * g8
+    var f1g9_38: int64 = f1_2 * g9_19
+    var f2g0: int64 = f2 * g0
+    var f2g1: int64 = f2 * g1
+    var f2g2: int64 = f2 * g2
+    var f2g3: int64 = f2 * g3
+    var f2g4: int64 = f2 * g4
+    var f2g5: int64 = f2 * g5
+    var f2g6: int64 = f2 * g6
+    var f2g7: int64 = f2 * g7
+    var f2g8_19: int64 = f2 * g8_19
+    var f2g9_19: int64 = f2 * g9_19
+    var f3g0: int64 = f3 * g0
+    var f3g1_2: int64 = f3_2 * g1
+    var f3g2: int64 = f3 * g2
+    var f3g3_2: int64 = f3_2 * g3
+    var f3g4: int64 = f3 * g4
+    var f3g5_2: int64 = f3_2 * g5
+    var f3g6: int64 = f3 * g6
+    var f3g7_38: int64 = f3_2 * g7_19
+    var f3g8_19: int64 = f3 * g8_19
+    var f3g9_38: int64 = f3_2 * g9_19
+    var f4g0: int64 = f4 * g0
+    var f4g1: int64 = f4 * g1
+    var f4g2: int64 = f4 * g2
+    var f4g3: int64 = f4 * g3
+    var f4g4: int64 = f4 * g4
+    var f4g5: int64 = f4 * g5
+    var f4g6_19: int64 = f4 * g6_19
+    var f4g7_19: int64 = f4 * g7_19
+    var f4g8_19: int64 = f4 * g8_19
+    var f4g9_19: int64 = f4 * g9_19
+    var f5g0: int64 = f5 * g0
+    var f5g1_2: int64 = f5_2 * g1
+    var f5g2: int64 = f5 * g2
+    var f5g3_2: int64 = f5_2 * g3
+    var f5g4: int64 = f5 * g4
+    var f5g5_38: int64 = f5_2 * g5_19
+    var f5g6_19: int64 = f5 * g6_19
+    var f5g7_38: int64 = f5_2 * g7_19
+    var f5g8_19: int64 = f5 * g8_19
+    var f5g9_38: int64 = f5_2 * g9_19
+    var f6g0: int64 = f6 * g0
+    var f6g1: int64 = f6 * g1
+    var f6g2: int64 = f6 * g2
+    var f6g3: int64 = f6 * g3
+    var f6g4_19: int64 = f6 * g4_19
+    var f6g5_19: int64 = f6 * g5_19
+    var f6g6_19: int64 = f6 * g6_19
+    var f6g7_19: int64 = f6 * g7_19
+    var f6g8_19: int64 = f6 * g8_19
+    var f6g9_19: int64 = f6 * g9_19
+    var f7g0: int64 = f7 * g0
+    var f7g1_2: int64 = f7_2 * g1
+    var f7g2: int64 = f7 * g2
+    var f7g3_38: int64 = f7_2 * g3_19
+    var f7g4_19: int64 = f7 * g4_19
+    var f7g5_38: int64 = f7_2 * g5_19
+    var f7g6_19: int64 = f7 * g6_19
+    var f7g7_38: int64 = f7_2 * g7_19
+    var f7g8_19: int64 = f7 * g8_19
+    var f7g9_38: int64 = f7_2 * g9_19
+    var f8g0: int64 = f8 * g0
+    var f8g1: int64 = f8 * g1
+    var f8g2_19: int64 = f8 * g2_19
+    var f8g3_19: int64 = f8 * g3_19
+    var f8g4_19: int64 = f8 * g4_19
+    var f8g5_19: int64 = f8 * g5_19
+    var f8g6_19: int64 = f8 * g6_19
+    var f8g7_19: int64 = f8 * g7_19
+    var f8g8_19: int64 = f8 * g8_19
+    var f8g9_19: int64 = f8 * g9_19
+    var f9g0: int64 = f9 * g0
+    var f9g1_38: int64 = f9_2 * g1_19
+    var f9g2_19: int64 = f9 * g2_19
+    var f9g3_38: int64 = f9_2 * g3_19
+    var f9g4_19: int64 = f9 * g4_19
+    var f9g5_38: int64 = f9_2 * g5_19
+    var f9g6_19: int64 = f9 * g6_19
+    var f9g7_38: int64 = f9_2 * g7_19
+    var f9g8_19: int64 = f9 * g8_19
+    var f9g9_38: int64 = f9_2 * g9_19
+
+    var h0: int64 = f0g0 + f1g9_38 + f2g8_19 + f3g7_38 + f4g6_19 + f5g5_38 + f6g4_19 + f7g3_38 + f8g2_19 + f9g1_38
+    var h1: int64 = f0g1 + f1g0 + f2g9_19 + f3g8_19 + f4g7_19 + f5g6_19 + f6g5_19 + f7g4_19 + f8g3_19 + f9g2_19
+    var h2: int64 = f0g2 + f1g1_2 + f2g0 + f3g9_38 + f4g8_19 + f5g7_38 + f6g6_19 + f7g5_38 + f8g4_19 + f9g3_38
+    var h3: int64 = f0g3 + f1g2 + f2g1 + f3g0 + f4g9_19 + f5g8_19 + f6g7_19 + f7g6_19 + f8g5_19 + f9g4_19
+    var h4: int64 = f0g4 + f1g3_2 + f2g2 + f3g1_2 + f4g0 + f5g9_38 + f6g8_19 + f7g7_38 + f8g6_19 + f9g5_38
+    var h5: int64 = f0g5 + f1g4 + f2g3 + f3g2 + f4g1 + f5g0 + f6g9_19 + f7g8_19 + f8g7_19 + f9g6_19
+    var h6: int64 = f0g6 + f1g5_2 + f2g4 + f3g3_2 + f4g2 + f5g1_2 + f6g0 + f7g9_38 + f8g8_19 + f9g7_38
+    var h7: int64 = f0g7 + f1g6 + f2g5 + f3g4 + f4g3 + f5g2 + f6g1 + f7g0 + f8g9_19 + f9g8_19
+    var h8: int64 = f0g8 + f1g7_2 + f2g6 + f3g5_2 + f4g4 + f5g3_2 + f6g2 + f7g1_2 + f8g0 + f9g9_38
+    var h9: int64 = f0g9 + f1g8 + f2g7 + f3g6 + f4g5 + f5g4 + f6g3 + f7g2 + f8g1 + f9g0
+
+    var carry0: int64 = ashr64(h0 + (1 << 25), 26)
+    h1 = h1 + carry0
+    h0 = h0 - (carry0 << 26)
+    var carry1: int64 = ashr64(h1 + (1 << 24), 25)
+    h2 = h2 + carry1
+    h1 = h1 - (carry1 << 25)
+    var carry2: int64 = ashr64(h2 + (1 << 25), 26)
+    h3 = h3 + carry2
+    h2 = h2 - (carry2 << 26)
+    var carry3: int64 = ashr64(h3 + (1 << 24), 25)
+    h4 = h4 + carry3
+    h3 = h3 - (carry3 << 25)
+    var carry4: int64 = ashr64(h4 + (1 << 25), 26)
+    h5 = h5 + carry4
+    h4 = h4 - (carry4 << 26)
+    var carry5: int64 = ashr64(h5 + (1 << 24), 25)
+    h6 = h6 + carry5
+    h5 = h5 - (carry5 << 25)
+    var carry6: int64 = ashr64(h6 + (1 << 25), 26)
+    h7 = h7 + carry6
+    h6 = h6 - (carry6 << 26)
+    var carry7: int64 = ashr64(h7 + (1 << 24), 25)
+    h8 = h8 + carry7
+    h7 = h7 - (carry7 << 25)
+    var carry8: int64 = ashr64(h8 + (1 << 25), 26)
+    h9 = h9 + carry8
+    h8 = h8 - (carry8 << 26)
+    var carry9: int64 = ashr64(h9 + (1 << 24), 25)
+    h0 = h0 + carry9 * 19
+    h9 = h9 - (carry9 << 25)
+    carry0 = ashr64(h0 + (1 << 25), 26)
+    h1 = h1 + carry0
+    h0 = h0 - (carry0 << 26)
+
+    feSet(h, 0, h0)
+    feSet(h, 1, h1)
+    feSet(h, 2, h2)
+    feSet(h, 3, h3)
+    feSet(h, 4, h4)
+    feSet(h, 5, h5)
+    feSet(h, 6, h6)
+    feSet(h, 7, h7)
+    feSet(h, 8, h8)
+    feSet(h, 9, h9)
+
+fn feSq(h: var Fe, f: Fe) =
+    ensureFeLen(h)
+    feMul(h, f, f)
+
+fn feSq2(h: var Fe, f: Fe) =
+    ensureFeLen(h)
+    var t: Fe
+    feSq(t, f)
+    for i in 0..<10:
+        feSet(h, i, 2 * feGet(t, i))
+
+fn feMul121666(h: var Fe, f: Fe) =
+    ensureFeLen(h)
+    var f0: int64 = feGet(f, 0)
+    var f1: int64 = feGet(f, 1)
+    var f2: int64 = feGet(f, 2)
+    var f3: int64 = feGet(f, 3)
+    var f4: int64 = feGet(f, 4)
+    var f5: int64 = feGet(f, 5)
+    var f6: int64 = feGet(f, 6)
+    var f7: int64 = feGet(f, 7)
+    var f8: int64 = feGet(f, 8)
+    var f9: int64 = feGet(f, 9)
+
+    var h0: int64 = f0 * 121666
+    var h1: int64 = f1 * 121666
+    var h2: int64 = f2 * 121666
+    var h3: int64 = f3 * 121666
+    var h4: int64 = f4 * 121666
+    var h5: int64 = f5 * 121666
+    var h6: int64 = f6 * 121666
+    var h7: int64 = f7 * 121666
+    var h8: int64 = f8 * 121666
+    var h9: int64 = f9 * 121666
+
+    var carry0: int64 = ashr64(h0 + (1 << 25), 26)
+    h1 = h1 + carry0
+    h0 = h0 - (carry0 << 26)
+    var carry1: int64 = ashr64(h1 + (1 << 24), 25)
+    h2 = h2 + carry1
+    h1 = h1 - (carry1 << 25)
+    var carry2: int64 = ashr64(h2 + (1 << 25), 26)
+    h3 = h3 + carry2
+    h2 = h2 - (carry2 << 26)
+    var carry3: int64 = ashr64(h3 + (1 << 24), 25)
+    h4 = h4 + carry3
+    h3 = h3 - (carry3 << 25)
+    var carry4: int64 = ashr64(h4 + (1 << 25), 26)
+    h5 = h5 + carry4
+    h4 = h4 - (carry4 << 26)
+    var carry5: int64 = ashr64(h5 + (1 << 24), 25)
+    h6 = h6 + carry5
+    h5 = h5 - (carry5 << 25)
+    var carry6: int64 = ashr64(h6 + (1 << 25), 26)
+    h7 = h7 + carry6
+    h6 = h6 - (carry6 << 26)
+    var carry7: int64 = ashr64(h7 + (1 << 24), 25)
+    h8 = h8 + carry7
+    h7 = h7 - (carry7 << 25)
+    var carry8: int64 = ashr64(h8 + (1 << 25), 26)
+    h9 = h9 + carry8
+    h8 = h8 - (carry8 << 26)
+    var carry9: int64 = ashr64(h9 + (1 << 24), 25)
+    h0 = h0 + carry9 * 19
+    h9 = h9 - (carry9 << 25)
+    carry0 = ashr64(h0 + (1 << 25), 26)
+    h1 = h1 + carry0
+    h0 = h0 - (carry0 << 26)
+
+    feSet(h, 0, h0)
+    feSet(h, 1, h1)
+    feSet(h, 2, h2)
+    feSet(h, 3, h3)
+    feSet(h, 4, h4)
+    feSet(h, 5, h5)
+    feSet(h, 6, h6)
+    feSet(h, 7, h7)
+    feSet(h, 8, h8)
+    feSet(h, 9, h9)
+
+fn feIsNegative(f: Fe): int32 =
+    let b: Bytes = feToBytes(f)
+    return bytesGet(b, 0) & 1
+
+fn feIsNonZero(f: Fe): int32 =
+    let b: Bytes = feToBytes(f)
+    var acc: int32 = 0
+    for i in 0..<bytesLen(b):
+        acc = acc | bytesGet(b, i)
+    return acc
+
+fn fePow22523(outFe: var Fe, z: Fe) =
+    ensureFeLen(outFe)
+    var t0: Fe
+    var t1: Fe
+    var t2: Fe
+    feSq(t0, z)
+    feSq(t1, t0)
+    feSq(t1, t1)
+    feMul(t1, z, t1)
+    feMul(t0, t0, t1)
+    feSq(t0, t0)
+    feMul(t0, t1, t0)
+    feSq(t1, t0)
+    for i in 1..<5:
+        feSq(t1, t1)
+    feMul(t0, t1, t0)
+    feSq(t1, t0)
+    i = 1
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<10:
+        i = __for_i_2
+        feSq(t1, t1)
+        i = i + 1
+    feMul(t1, t1, t0)
+    feSq(t2, t1)
+    i = 1
+    let __for_start_i_3 = i
+    for __for_i_3 in __for_start_i_3..<20:
+        i = __for_i_3
+        feSq(t2, t2)
+        i = i + 1
+    feMul(t1, t2, t1)
+    feSq(t1, t1)
+    i = 1
+    let __for_start_i_4 = i
+    for __for_i_4 in __for_start_i_4..<10:
+        i = __for_i_4
+        feSq(t1, t1)
+        i = i + 1
+    feMul(t0, t1, t0)
+    feSq(t1, t0)
+    i = 1
+    let __for_start_i_5 = i
+    for __for_i_5 in __for_start_i_5..<50:
+        i = __for_i_5
+        feSq(t1, t1)
+        i = i + 1
+    feMul(t1, t1, t0)
+    feSq(t2, t1)
+    i = 1
+    let __for_start_i_6 = i
+    for __for_i_6 in __for_start_i_6..<100:
+        i = __for_i_6
+        feSq(t2, t2)
+        i = i + 1
+    feMul(t1, t2, t1)
+    feSq(t1, t1)
+    i = 1
+    let __for_start_i_7 = i
+    for __for_i_7 in __for_start_i_7..<50:
+        i = __for_i_7
+        feSq(t1, t1)
+        i = i + 1
+    feMul(t0, t1, t0)
+    feSq(t0, t0)
+    i = 1
+    let __for_start_i_8 = i
+    for __for_i_8 in __for_start_i_8..<2:
+        i = __for_i_8
+        feSq(t0, t0)
+        i = i + 1
+    feMul(outFe, t0, z)
+
+fn feInvert(outFe: var Fe, z: Fe) =
+    ensureFeLen(outFe)
+    var t0: Fe
+    var t1: Fe
+    var t2: Fe
+    var t3: Fe
+    feSq(t0, z)
+    feSq(t1, t0)
+    feSq(t1, t1)
+    feMul(t1, z, t1)
+    feMul(t0, t0, t1)
+    feSq(t2, t0)
+    feMul(t1, t1, t2)
+    feSq(t2, t1)
+    for i in 1..<5:
+        feSq(t2, t2)
+    feMul(t1, t2, t1)
+    feSq(t2, t1)
+    i = 1
+    let __for_start_i_9 = i
+    for __for_i_9 in __for_start_i_9..<10:
+        i = __for_i_9
+        feSq(t2, t2)
+        i = i + 1
+    feMul(t2, t2, t1)
+    feSq(t3, t2)
+    i = 1
+    let __for_start_i_10 = i
+    for __for_i_10 in __for_start_i_10..<20:
+        i = __for_i_10
+        feSq(t3, t3)
+        i = i + 1
+    feMul(t2, t3, t2)
+    feSq(t2, t2)
+    i = 1
+    let __for_start_i_11 = i
+    for __for_i_11 in __for_start_i_11..<10:
+        i = __for_i_11
+        feSq(t2, t2)
+        i = i + 1
+    feMul(t1, t2, t1)
+    feSq(t2, t1)
+    i = 1
+    let __for_start_i_12 = i
+    for __for_i_12 in __for_start_i_12..<50:
+        i = __for_i_12
+        feSq(t2, t2)
+        i = i + 1
+    feMul(t2, t2, t1)
+    feSq(t3, t2)
+    i = 1
+    let __for_start_i_13 = i
+    for __for_i_13 in __for_start_i_13..<100:
+        i = __for_i_13
+        feSq(t3, t3)
+        i = i + 1
+    feMul(t2, t3, t2)
+    feSq(t2, t2)
+    i = 1
+    let __for_start_i_14 = i
+    for __for_i_14 in __for_start_i_14..<50:
+        i = __for_i_14
+        feSq(t2, t2)
+        i = i + 1
+    feMul(t1, t2, t1)
+    feSq(t1, t1)
+    i = 1
+    let __for_start_i_15 = i
+    for __for_i_15 in __for_start_i_15..<5:
+        i = __for_i_15
+        feSq(t1, t1)
+        i = i + 1
+    feMul(outFe, t1, t0)
+
+fn geP3ToBytes(h: GeP3): Bytes =
+    var recip: Fe
+    var x: Fe
+    var y: Fe
+    feInvert(recip, h.z)
+    feMul(x, h.x, recip)
+    feMul(y, h.y, recip)
+    let s: Bytes = feToBytes(y)
+    let sign: int32 = feIsNegative(x)
+    let last: int32 = bytesGet(s, 31)
+    bytesSet(s, 31, last ^ (sign << 7))
+    return s
+
+fn geFromBytesNegateVartime(h: var GeP3, s: Bytes): bool =
+    var u: Fe
+    var v: Fe
+    var v3: Fe
+    var vxx: Fe
+    var check: Fe
+    feFromBytes(h.y, s)
+    fe1(h.z)
+    feSq(u, h.y)
+    feMul(v, u, DConst)
+    feSub(u, u, h.z)
+    feAdd(v, v, h.z)
+    feSq(v3, v)
+    feMul(v3, v3, v)
+    feSq(h.x, v3)
+    feMul(h.x, h.x, v)
+    feMul(h.x, h.x, u)
+
+    fePow22523(h.x, h.x)
+    feMul(h.x, h.x, v3)
+    feMul(h.x, h.x, u)
+
+    feSq(vxx, h.x)
+    feMul(vxx, vxx, v)
+    feSub(check, vxx, u)
+    if feIsNonZero(check) != 0:
+        feAdd(check, vxx, u)
+        if feIsNonZero(check) != 0:
+            return false
+        feMul(h.x, h.x, SqrtM1)
+
+    if feIsNegative(h.x) == (bytesGet(s, 31) >> 7):
+        feNeg(h.x, h.x)
+
+    feMul(h.t, h.x, h.y)
+    return true
+
+fn geDouble(r: var GeP3, p: GeP3) =
+    var a: Fe
+    var b: Fe
+    var c: Fe
+    var d: Fe
+    var e: Fe
+    var f: Fe
+    var g: Fe
+    var h: Fe
+    feSq(a, p.x)
+    feSq(b, p.y)
+    feSq2(c, p.z)
+    feNeg(d, a)
+    feAdd(e, p.x, p.y)
+    feSq(e, e)
+    feSub(e, e, a)
+    feSub(e, e, b)
+    feAdd(g, d, b)
+    feSub(f, g, c)
+    feSub(h, d, b)
+    feMul(r.x, e, f)
+    feMul(r.y, g, h)
+    feMul(r.t, e, h)
+    feMul(r.z, f, g)
+
+fn geAdd(r: var GeP3, p: GeP3, q: GeP3) =
+    var a: Fe
+    var b: Fe
+    var c: Fe
+    var d: Fe
+    var e: Fe
+    var f: Fe
+    var g: Fe
+    var h: Fe
+    var t1: Fe
+    var t2: Fe
+    feSub(t1, p.y, p.x)
+    feSub(t2, q.y, q.x)
+    feMul(a, t1, t2)
+    feAdd(t1, p.y, p.x)
+    feAdd(t2, q.y, q.x)
+    feMul(b, t1, t2)
+    feMul(c, p.t, q.t)
+    feMul(c, c, D2Const)
+    feMul(d, p.z, q.z)
+    feAdd(d, d, d)
+    feSub(e, b, a)
+    feSub(f, d, c)
+    feAdd(g, d, c)
+    feAdd(h, b, a)
+    feMul(r.x, e, f)
+    feMul(r.y, g, h)
+    feMul(r.t, e, h)
+    feMul(r.z, f, g)
+
+fn geScalarMult(r: var GeP3, a: Bytes, p: GeP3) =
+    var res: GeP3
+    fe0(res.x)
+    fe1(res.y)
+    fe1(res.z)
+    fe0(res.t)
+
+    let __for_start_i = 255
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        geDouble(res, res)
+        let byteIdx: int32 = i / 8
+        let bitIdx: int32 = i % 8
+        let bit: int32 = (bytesGet(a, byteIdx) >> bitIdx) & 1
+        if bit == 1:
+            geAdd(res, res, p)
+    r = res
+
+fn geScalarMultBase(r: var GeP3, a: Bytes) =
+    let baseBytes: Bytes = BasePointBytes
+    var base: GeP3
+    if ! geFromBytesNegateVartime(base, baseBytes):
+        fe0(r.x)
+        fe1(r.y)
+        fe1(r.z)
+        fe0(r.t)
+        return
+    geScalarMult(r, a, base)
+
+fn verify32(x: Bytes, y: Bytes): int32 =
+    var d: int32 = 0
+    for i in 0..<32:
+        d = d | (bytesGet(x, i) ^ bytesGet(y, i))
+    return d
+
+fn checkScalar(s: Bytes): bool =
+    if bytesLen(s) != 32:
+        return false
+    var nonzero: bool = false
+    for i in 0..<32:
+        if bytesGet(s, i) != 0:
+            nonzero = true
+            break
+    if ! nonzero:
+        return false
+    i = 31
+    let __for_start_i_16 = i
+    for __for_i_16 in 0..(__for_start_i_16 - (0)):
+        i = __for_start_i_16 - __for_i_16
+        let sv: int32 = bytesGet(s, i)
+        let cv: int32 = bytesGet(CurveOrder, i)
+        if sv < cv:
+            return true
+        if sv > cv:
+            return false
+        i = i - 1
+    return false
+
+fn scReduce(inBytes: Bytes): Bytes =
+    var s0: int64 = 2097151 & load3(inBytes, 0)
+    var s1: int64 = 2097151 & (load4(inBytes, 2) >> 5)
+    var s2: int64 = 2097151 & (load3(inBytes, 5) >> 2)
+    var s3: int64 = 2097151 & (load4(inBytes, 7) >> 7)
+    var s4: int64 = 2097151 & (load4(inBytes, 10) >> 4)
+    var s5: int64 = 2097151 & (load3(inBytes, 13) >> 1)
+    var s6: int64 = 2097151 & (load4(inBytes, 15) >> 6)
+    var s7: int64 = 2097151 & (load3(inBytes, 18) >> 3)
+    var s8: int64 = 2097151 & load3(inBytes, 21)
+    var s9: int64 = 2097151 & (load4(inBytes, 23) >> 5)
+    var s10: int64 = 2097151 & (load3(inBytes, 26) >> 2)
+    var s11: int64 = 2097151 & (load4(inBytes, 28) >> 7)
+    var s12: int64 = 2097151 & (load4(inBytes, 31) >> 4)
+    var s13: int64 = 2097151 & (load3(inBytes, 34) >> 1)
+    var s14: int64 = 2097151 & (load4(inBytes, 36) >> 6)
+    var s15: int64 = 2097151 & (load3(inBytes, 39) >> 3)
+    var s16: int64 = 2097151 & load3(inBytes, 42)
+    var s17: int64 = 2097151 & (load4(inBytes, 44) >> 5)
+    var s18: int64 = 2097151 & (load3(inBytes, 47) >> 2)
+    var s19: int64 = 2097151 & (load4(inBytes, 49) >> 7)
+    var s20: int64 = 2097151 & (load4(inBytes, 52) >> 4)
+    var s21: int64 = 2097151 & (load3(inBytes, 55) >> 1)
+    var s22: int64 = 2097151 & (load4(inBytes, 57) >> 6)
+    var s23: int64 = load4(inBytes, 60) >> 3
+
+    var carry0: int64
+    var carry1: int64
+    var carry2: int64
+    var carry3: int64
+    var carry4: int64
+    var carry5: int64
+    var carry6: int64
+    var carry7: int64
+    var carry8: int64
+    var carry9: int64
+    var carry10: int64
+    var carry11: int64
+    var carry12: int64
+    var carry13: int64
+    var carry14: int64
+    var carry15: int64
+    var carry16: int64
+
+    s11 = s11 + s23 * 666643
+    s12 = s12 + s23 * 470296
+    s13 = s13 + s23 * 654183
+    s14 = s14 - s23 * 997805
+    s15 = s15 + s23 * 136657
+    s16 = s16 - s23 * 683901
+    s23 = 0
+
+    s10 = s10 + s22 * 666643
+    s11 = s11 + s22 * 470296
+    s12 = s12 + s22 * 654183
+    s13 = s13 - s22 * 997805
+    s14 = s14 + s22 * 136657
+    s15 = s15 - s22 * 683901
+    s22 = 0
+
+    s9 = s9 + s21 * 666643
+    s10 = s10 + s21 * 470296
+    s11 = s11 + s21 * 654183
+    s12 = s12 - s21 * 997805
+    s13 = s13 + s21 * 136657
+    s14 = s14 - s21 * 683901
+    s21 = 0
+
+    s8 = s8 + s20 * 666643
+    s9 = s9 + s20 * 470296
+    s10 = s10 + s20 * 654183
+    s11 = s11 - s20 * 997805
+    s12 = s12 + s20 * 136657
+    s13 = s13 - s20 * 683901
+    s20 = 0
+
+    s7 = s7 + s19 * 666643
+    s8 = s8 + s19 * 470296
+    s9 = s9 + s19 * 654183
+    s10 = s10 - s19 * 997805
+    s11 = s11 + s19 * 136657
+    s12 = s12 - s19 * 683901
+    s19 = 0
+
+    s6 = s6 + s18 * 666643
+    s7 = s7 + s18 * 470296
+    s8 = s8 + s18 * 654183
+    s9 = s9 - s18 * 997805
+    s10 = s10 + s18 * 136657
+    s11 = s11 - s18 * 683901
+    s18 = 0
+
+    carry6 = ashr64(s6 + (1 << 20), 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry8 = ashr64(s8 + (1 << 20), 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry10 = ashr64(s10 + (1 << 20), 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+    carry12 = ashr64(s12 + (1 << 20), 21)
+    s13 = s13 + carry12
+    s12 = s12 - (carry12 << 21)
+    carry14 = ashr64(s14 + (1 << 20), 21)
+    s15 = s15 + carry14
+    s14 = s14 - (carry14 << 21)
+    carry16 = ashr64(s16 + (1 << 20), 21)
+    s17 = s17 + carry16
+    s16 = s16 - (carry16 << 21)
+
+    carry7 = ashr64(s7 + (1 << 20), 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry9 = ashr64(s9 + (1 << 20), 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry11 = ashr64(s11 + (1 << 20), 21)
+    s12 = s12 + carry11
+    s11 = s11 - (carry11 << 21)
+    carry13 = ashr64(s13 + (1 << 20), 21)
+    s14 = s14 + carry13
+    s13 = s13 - (carry13 << 21)
+    carry15 = ashr64(s15 + (1 << 20), 21)
+    s16 = s16 + carry15
+    s15 = s15 - (carry15 << 21)
+
+    s5 = s5 + s17 * 666643
+    s6 = s6 + s17 * 470296
+    s7 = s7 + s17 * 654183
+    s8 = s8 - s17 * 997805
+    s9 = s9 + s17 * 136657
+    s10 = s10 - s17 * 683901
+    s17 = 0
+
+    s4 = s4 + s16 * 666643
+    s5 = s5 + s16 * 470296
+    s6 = s6 + s16 * 654183
+    s7 = s7 - s16 * 997805
+    s8 = s8 + s16 * 136657
+    s9 = s9 - s16 * 683901
+    s16 = 0
+
+    s3 = s3 + s15 * 666643
+    s4 = s4 + s15 * 470296
+    s5 = s5 + s15 * 654183
+    s6 = s6 - s15 * 997805
+    s7 = s7 + s15 * 136657
+    s8 = s8 - s15 * 683901
+    s15 = 0
+
+    s2 = s2 + s14 * 666643
+    s3 = s3 + s14 * 470296
+    s4 = s4 + s14 * 654183
+    s5 = s5 - s14 * 997805
+    s6 = s6 + s14 * 136657
+    s7 = s7 - s14 * 683901
+    s14 = 0
+
+    s1 = s1 + s13 * 666643
+    s2 = s2 + s13 * 470296
+    s3 = s3 + s13 * 654183
+    s4 = s4 - s13 * 997805
+    s5 = s5 + s13 * 136657
+    s6 = s6 - s13 * 683901
+    s13 = 0
+
+    s0 = s0 + s12 * 666643
+    s1 = s1 + s12 * 470296
+    s2 = s2 + s12 * 654183
+    s3 = s3 - s12 * 997805
+    s4 = s4 + s12 * 136657
+    s5 = s5 - s12 * 683901
+    s12 = 0
+
+    carry0 = ashr64(s0 + (1 << 20), 21)
+    s1 = s1 + carry0
+    s0 = s0 - (carry0 << 21)
+    carry2 = ashr64(s2 + (1 << 20), 21)
+    s3 = s3 + carry2
+    s2 = s2 - (carry2 << 21)
+    carry4 = ashr64(s4 + (1 << 20), 21)
+    s5 = s5 + carry4
+    s4 = s4 - (carry4 << 21)
+    carry6 = ashr64(s6 + (1 << 20), 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry8 = ashr64(s8 + (1 << 20), 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry10 = ashr64(s10 + (1 << 20), 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+
+    carry1 = ashr64(s1 + (1 << 20), 21)
+    s2 = s2 + carry1
+    s1 = s1 - (carry1 << 21)
+    carry3 = ashr64(s3 + (1 << 20), 21)
+    s4 = s4 + carry3
+    s3 = s3 - (carry3 << 21)
+    carry5 = ashr64(s5 + (1 << 20), 21)
+    s6 = s6 + carry5
+    s5 = s5 - (carry5 << 21)
+    carry7 = ashr64(s7 + (1 << 20), 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry9 = ashr64(s9 + (1 << 20), 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry11 = ashr64(s11 + (1 << 20), 21)
+    s12 = s12 + carry11
+    s11 = s11 - (carry11 << 21)
+
+    s0 = s0 + s12 * 666643
+    s1 = s1 + s12 * 470296
+    s2 = s2 + s12 * 654183
+    s3 = s3 - s12 * 997805
+    s4 = s4 + s12 * 136657
+    s5 = s5 - s12 * 683901
+    s12 = 0
+
+    carry0 = ashr64(s0, 21)
+    s1 = s1 + carry0
+    s0 = s0 - (carry0 << 21)
+    carry1 = ashr64(s1, 21)
+    s2 = s2 + carry1
+    s1 = s1 - (carry1 << 21)
+    carry2 = ashr64(s2, 21)
+    s3 = s3 + carry2
+    s2 = s2 - (carry2 << 21)
+    carry3 = ashr64(s3, 21)
+    s4 = s4 + carry3
+    s3 = s3 - (carry3 << 21)
+    carry4 = ashr64(s4, 21)
+    s5 = s5 + carry4
+    s4 = s4 - (carry4 << 21)
+    carry5 = ashr64(s5, 21)
+    s6 = s6 + carry5
+    s5 = s5 - (carry5 << 21)
+    carry6 = ashr64(s6, 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry7 = ashr64(s7, 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry8 = ashr64(s8, 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry9 = ashr64(s9, 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry10 = ashr64(s10, 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+    carry11 = ashr64(s11, 21)
+    s12 = s12 + carry11
+    s11 = s11 - (carry11 << 21)
+
+    s0 = s0 + s12 * 666643
+    s1 = s1 + s12 * 470296
+    s2 = s2 + s12 * 654183
+    s3 = s3 - s12 * 997805
+    s4 = s4 + s12 * 136657
+    s5 = s5 - s12 * 683901
+    s12 = 0
+
+    carry0 = ashr64(s0, 21)
+    s1 = s1 + carry0
+    s0 = s0 - (carry0 << 21)
+    carry1 = ashr64(s1, 21)
+    s2 = s2 + carry1
+    s1 = s1 - (carry1 << 21)
+    carry2 = ashr64(s2, 21)
+    s3 = s3 + carry2
+    s2 = s2 - (carry2 << 21)
+    carry3 = ashr64(s3, 21)
+    s4 = s4 + carry3
+    s3 = s3 - (carry3 << 21)
+    carry4 = ashr64(s4, 21)
+    s5 = s5 + carry4
+    s4 = s4 - (carry4 << 21)
+    carry5 = ashr64(s5, 21)
+    s6 = s6 + carry5
+    s5 = s5 - (carry5 << 21)
+    carry6 = ashr64(s6, 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry7 = ashr64(s7, 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry8 = ashr64(s8, 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry9 = ashr64(s9, 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry10 = ashr64(s10, 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+
+    let out: Bytes = bytesAlloc(32)
+    bytesSet(out, 0, int32(ashr64(s0, 0)))
+    bytesSet(out, 1, int32(ashr64(s0, 8)))
+    bytesSet(out, 2, int32(ashr64(s0, 16) | (s1 << 5)))
+    bytesSet(out, 3, int32(ashr64(s1, 3)))
+    bytesSet(out, 4, int32(ashr64(s1, 11)))
+    bytesSet(out, 5, int32(ashr64(s1, 19) | (s2 << 2)))
+    bytesSet(out, 6, int32(ashr64(s2, 6)))
+    bytesSet(out, 7, int32(ashr64(s2, 14) | (s3 << 7)))
+    bytesSet(out, 8, int32(ashr64(s3, 1)))
+    bytesSet(out, 9, int32(ashr64(s3, 9)))
+    bytesSet(out, 10, int32(ashr64(s3, 17) | (s4 << 4)))
+    bytesSet(out, 11, int32(ashr64(s4, 4)))
+    bytesSet(out, 12, int32(ashr64(s4, 12)))
+    bytesSet(out, 13, int32(ashr64(s4, 20) | (s5 << 1)))
+    bytesSet(out, 14, int32(ashr64(s5, 7)))
+    bytesSet(out, 15, int32(ashr64(s5, 15) | (s6 << 6)))
+    bytesSet(out, 16, int32(ashr64(s6, 2)))
+    bytesSet(out, 17, int32(ashr64(s6, 10)))
+    bytesSet(out, 18, int32(ashr64(s6, 18) | (s7 << 3)))
+    bytesSet(out, 19, int32(ashr64(s7, 5)))
+    bytesSet(out, 20, int32(ashr64(s7, 13)))
+    bytesSet(out, 21, int32(ashr64(s8, 0)))
+    bytesSet(out, 22, int32(ashr64(s8, 8)))
+    bytesSet(out, 23, int32(ashr64(s8, 16) | (s9 << 5)))
+    bytesSet(out, 24, int32(ashr64(s9, 3)))
+    bytesSet(out, 25, int32(ashr64(s9, 11)))
+    bytesSet(out, 26, int32(ashr64(s9, 19) | (s10 << 2)))
+    bytesSet(out, 27, int32(ashr64(s10, 6)))
+    bytesSet(out, 28, int32(ashr64(s10, 14) | (s11 << 7)))
+    bytesSet(out, 29, int32(ashr64(s11, 1)))
+    bytesSet(out, 30, int32(ashr64(s11, 9)))
+    bytesSet(out, 31, int32(ashr64(s11, 17)))
+    return out
+
+fn scMulAdd(a: Bytes, b: Bytes, c: Bytes): Bytes =
+    var a0: int64 = 2097151 & load3(a, 0)
+    var a1: int64 = 2097151 & (load4(a, 2) >> 5)
+    var a2: int64 = 2097151 & (load3(a, 5) >> 2)
+    var a3: int64 = 2097151 & (load4(a, 7) >> 7)
+    var a4: int64 = 2097151 & (load4(a, 10) >> 4)
+    var a5: int64 = 2097151 & (load3(a, 13) >> 1)
+    var a6: int64 = 2097151 & (load4(a, 15) >> 6)
+    var a7: int64 = 2097151 & (load3(a, 18) >> 3)
+    var a8: int64 = 2097151 & load3(a, 21)
+    var a9: int64 = 2097151 & (load4(a, 23) >> 5)
+    var a10: int64 = 2097151 & (load3(a, 26) >> 2)
+    var a11: int64 = load4(a, 28) >> 7
+
+    var b0: int64 = 2097151 & load3(b, 0)
+    var b1: int64 = 2097151 & (load4(b, 2) >> 5)
+    var b2: int64 = 2097151 & (load3(b, 5) >> 2)
+    var b3: int64 = 2097151 & (load4(b, 7) >> 7)
+    var b4: int64 = 2097151 & (load4(b, 10) >> 4)
+    var b5: int64 = 2097151 & (load3(b, 13) >> 1)
+    var b6: int64 = 2097151 & (load4(b, 15) >> 6)
+    var b7: int64 = 2097151 & (load3(b, 18) >> 3)
+    var b8: int64 = 2097151 & load3(b, 21)
+    var b9: int64 = 2097151 & (load4(b, 23) >> 5)
+    var b10: int64 = 2097151 & (load3(b, 26) >> 2)
+    var b11: int64 = load4(b, 28) >> 7
+
+    var c0: int64 = 2097151 & load3(c, 0)
+    var c1: int64 = 2097151 & (load4(c, 2) >> 5)
+    var c2: int64 = 2097151 & (load3(c, 5) >> 2)
+    var c3: int64 = 2097151 & (load4(c, 7) >> 7)
+    var c4: int64 = 2097151 & (load4(c, 10) >> 4)
+    var c5: int64 = 2097151 & (load3(c, 13) >> 1)
+    var c6: int64 = 2097151 & (load4(c, 15) >> 6)
+    var c7: int64 = 2097151 & (load3(c, 18) >> 3)
+    var c8: int64 = 2097151 & load3(c, 21)
+    var c9: int64 = 2097151 & (load4(c, 23) >> 5)
+    var c10: int64 = 2097151 & (load3(c, 26) >> 2)
+    var c11: int64 = load4(c, 28) >> 7
+
+    var s0: int64 = c0 + a0 * b0
+    var s1: int64 = c1 + a0 * b1 + a1 * b0
+    var s2: int64 = c2 + a0 * b2 + a1 * b1 + a2 * b0
+    var s3: int64 = c3 + a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0
+    var s4: int64 = c4 + a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0
+    var s5: int64 = c5 + a0 * b5 + a1 * b4 + a2 * b3 + a3 * b2 + a4 * b1 + a5 * b0
+    var s6: int64 = c6 + a0 * b6 + a1 * b5 + a2 * b4 + a3 * b3 + a4 * b2 + a5 * b1 + a6 * b0
+    var s7: int64 = c7 + a0 * b7 + a1 * b6 + a2 * b5 + a3 * b4 + a4 * b3 + a5 * b2 + a6 * b1 + a7 * b0
+    var s8: int64 = c8 + a0 * b8 + a1 * b7 + a2 * b6 + a3 * b5 + a4 * b4 + a5 * b3 + a6 * b2 + a7 * b1 + a8 * b0
+    var s9: int64 = c9 + a0 * b9 + a1 * b8 + a2 * b7 + a3 * b6 + a4 * b5 + a5 * b4 + a6 * b3 + a7 * b2 + a8 * b1 + a9 * b0
+    var s10: int64 = c10 + a0 * b10 + a1 * b9 + a2 * b8 + a3 * b7 + a4 * b6 + a5 * b5 + a6 * b4 + a7 * b3 + a8 * b2 + a9 * b1 + a10 * b0
+    var s11: int64 = c11 + a0 * b11 + a1 * b10 + a2 * b9 + a3 * b8 + a4 * b7 + a5 * b6 + a6 * b5 + a7 * b4 + a8 * b3 + a9 * b2 + a10 * b1 + a11 * b0
+    var s12: int64 = a1 * b11 + a2 * b10 + a3 * b9 + a4 * b8 + a5 * b7 + a6 * b6 + a7 * b5 + a8 * b4 + a9 * b3 + a10 * b2 + a11 * b1
+    var s13: int64 = a2 * b11 + a3 * b10 + a4 * b9 + a5 * b8 + a6 * b7 + a7 * b6 + a8 * b5 + a9 * b4 + a10 * b3 + a11 * b2
+    var s14: int64 = a3 * b11 + a4 * b10 + a5 * b9 + a6 * b8 + a7 * b7 + a8 * b6 + a9 * b5 + a10 * b4 + a11 * b3
+    var s15: int64 = a4 * b11 + a5 * b10 + a6 * b9 + a7 * b8 + a8 * b7 + a9 * b6 + a10 * b5 + a11 * b4
+    var s16: int64 = a5 * b11 + a6 * b10 + a7 * b9 + a8 * b8 + a9 * b7 + a10 * b6 + a11 * b5
+    var s17: int64 = a6 * b11 + a7 * b10 + a8 * b9 + a9 * b8 + a10 * b7 + a11 * b6
+    var s18: int64 = a7 * b11 + a8 * b10 + a9 * b9 + a10 * b8 + a11 * b7
+    var s19: int64 = a8 * b11 + a9 * b10 + a10 * b9 + a11 * b8
+    var s20: int64 = a9 * b11 + a10 * b10 + a11 * b9
+    var s21: int64 = a10 * b11 + a11 * b10
+    var s22: int64 = a11 * b11
+    var s23: int64 = 0
+
+    var carry0: int64 = ashr64(s0 + (1 << 20), 21)
+    s1 = s1 + carry0
+    s0 = s0 - (carry0 << 21)
+    var carry2: int64 = ashr64(s2 + (1 << 20), 21)
+    s3 = s3 + carry2
+    s2 = s2 - (carry2 << 21)
+    var carry4: int64 = ashr64(s4 + (1 << 20), 21)
+    s5 = s5 + carry4
+    s4 = s4 - (carry4 << 21)
+    var carry6: int64 = ashr64(s6 + (1 << 20), 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    var carry8: int64 = ashr64(s8 + (1 << 20), 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    var carry10: int64 = ashr64(s10 + (1 << 20), 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+    var carry12: int64 = ashr64(s12 + (1 << 20), 21)
+    s13 = s13 + carry12
+    s12 = s12 - (carry12 << 21)
+    var carry14: int64 = ashr64(s14 + (1 << 20), 21)
+    s15 = s15 + carry14
+    s14 = s14 - (carry14 << 21)
+    var carry16: int64 = ashr64(s16 + (1 << 20), 21)
+    s17 = s17 + carry16
+    s16 = s16 - (carry16 << 21)
+    var carry18: int64 = ashr64(s18 + (1 << 20), 21)
+    s19 = s19 + carry18
+    s18 = s18 - (carry18 << 21)
+    var carry20: int64 = ashr64(s20 + (1 << 20), 21)
+    s21 = s21 + carry20
+    s20 = s20 - (carry20 << 21)
+    var carry22: int64 = ashr64(s22 + (1 << 20), 21)
+    s23 = s23 + carry22
+    s22 = s22 - (carry22 << 21)
+
+    var carry1: int64 = ashr64(s1 + (1 << 20), 21)
+    s2 = s2 + carry1
+    s1 = s1 - (carry1 << 21)
+    var carry3: int64 = ashr64(s3 + (1 << 20), 21)
+    s4 = s4 + carry3
+    s3 = s3 - (carry3 << 21)
+    var carry5: int64 = ashr64(s5 + (1 << 20), 21)
+    s6 = s6 + carry5
+    s5 = s5 - (carry5 << 21)
+    var carry7: int64 = ashr64(s7 + (1 << 20), 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    var carry9: int64 = ashr64(s9 + (1 << 20), 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    var carry11: int64 = ashr64(s11 + (1 << 20), 21)
+    s12 = s12 + carry11
+    s11 = s11 - (carry11 << 21)
+    var carry13: int64 = ashr64(s13 + (1 << 20), 21)
+    s14 = s14 + carry13
+    s13 = s13 - (carry13 << 21)
+    var carry15: int64 = ashr64(s15 + (1 << 20), 21)
+    s16 = s16 + carry15
+    s15 = s15 - (carry15 << 21)
+    var carry17: int64 = ashr64(s17 + (1 << 20), 21)
+    s18 = s18 + carry17
+    s17 = s17 - (carry17 << 21)
+    var carry19: int64 = ashr64(s19 + (1 << 20), 21)
+    s20 = s20 + carry19
+    s19 = s19 - (carry19 << 21)
+    var carry21: int64 = ashr64(s21 + (1 << 20), 21)
+    s22 = s22 + carry21
+    s21 = s21 - (carry21 << 21)
+
+    s11 = s11 + s23 * 666643
+    s12 = s12 + s23 * 470296
+    s13 = s13 + s23 * 654183
+    s14 = s14 - s23 * 997805
+    s15 = s15 + s23 * 136657
+    s16 = s16 - s23 * 683901
+    s23 = 0
+
+    s10 = s10 + s22 * 666643
+    s11 = s11 + s22 * 470296
+    s12 = s12 + s22 * 654183
+    s13 = s13 - s22 * 997805
+    s14 = s14 + s22 * 136657
+    s15 = s15 - s22 * 683901
+    s22 = 0
+
+    s9 = s9 + s21 * 666643
+    s10 = s10 + s21 * 470296
+    s11 = s11 + s21 * 654183
+    s12 = s12 - s21 * 997805
+    s13 = s13 + s21 * 136657
+    s14 = s14 - s21 * 683901
+    s21 = 0
+
+    s8 = s8 + s20 * 666643
+    s9 = s9 + s20 * 470296
+    s10 = s10 + s20 * 654183
+    s11 = s11 - s20 * 997805
+    s12 = s12 + s20 * 136657
+    s13 = s13 - s20 * 683901
+    s20 = 0
+
+    s7 = s7 + s19 * 666643
+    s8 = s8 + s19 * 470296
+    s9 = s9 + s19 * 654183
+    s10 = s10 - s19 * 997805
+    s11 = s11 + s19 * 136657
+    s12 = s12 - s19 * 683901
+    s19 = 0
+
+    s6 = s6 + s18 * 666643
+    s7 = s7 + s18 * 470296
+    s8 = s8 + s18 * 654183
+    s9 = s9 - s18 * 997805
+    s10 = s10 + s18 * 136657
+    s11 = s11 - s18 * 683901
+    s18 = 0
+
+    carry6 = ashr64(s6 + (1 << 20), 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry8 = ashr64(s8 + (1 << 20), 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry10 = ashr64(s10 + (1 << 20), 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+    carry12 = ashr64(s12 + (1 << 20), 21)
+    s13 = s13 + carry12
+    s12 = s12 - (carry12 << 21)
+    carry14 = ashr64(s14 + (1 << 20), 21)
+    s15 = s15 + carry14
+    s14 = s14 - (carry14 << 21)
+    carry16 = ashr64(s16 + (1 << 20), 21)
+    s17 = s17 + carry16
+    s16 = s16 - (carry16 << 21)
+
+    carry7 = ashr64(s7 + (1 << 20), 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry9 = ashr64(s9 + (1 << 20), 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry11 = ashr64(s11 + (1 << 20), 21)
+    s12 = s12 + carry11
+    s11 = s11 - (carry11 << 21)
+    carry13 = ashr64(s13 + (1 << 20), 21)
+    s14 = s14 + carry13
+    s13 = s13 - (carry13 << 21)
+    carry15 = ashr64(s15 + (1 << 20), 21)
+    s16 = s16 + carry15
+    s15 = s15 - (carry15 << 21)
+
+    s5 = s5 + s17 * 666643
+    s6 = s6 + s17 * 470296
+    s7 = s7 + s17 * 654183
+    s8 = s8 - s17 * 997805
+    s9 = s9 + s17 * 136657
+    s10 = s10 - s17 * 683901
+    s17 = 0
+
+    s4 = s4 + s16 * 666643
+    s5 = s5 + s16 * 470296
+    s6 = s6 + s16 * 654183
+    s7 = s7 - s16 * 997805
+    s8 = s8 + s16 * 136657
+    s9 = s9 - s16 * 683901
+    s16 = 0
+
+    s3 = s3 + s15 * 666643
+    s4 = s4 + s15 * 470296
+    s5 = s5 + s15 * 654183
+    s6 = s6 - s15 * 997805
+    s7 = s7 + s15 * 136657
+    s8 = s8 - s15 * 683901
+    s15 = 0
+
+    s2 = s2 + s14 * 666643
+    s3 = s3 + s14 * 470296
+    s4 = s4 + s14 * 654183
+    s5 = s5 - s14 * 997805
+    s6 = s6 + s14 * 136657
+    s7 = s7 - s14 * 683901
+    s14 = 0
+
+    s1 = s1 + s13 * 666643
+    s2 = s2 + s13 * 470296
+    s3 = s3 + s13 * 654183
+    s4 = s4 - s13 * 997805
+    s5 = s5 + s13 * 136657
+    s6 = s6 - s13 * 683901
+    s13 = 0
+
+    s0 = s0 + s12 * 666643
+    s1 = s1 + s12 * 470296
+    s2 = s2 + s12 * 654183
+    s3 = s3 - s12 * 997805
+    s4 = s4 + s12 * 136657
+    s5 = s5 - s12 * 683901
+    s12 = 0
+
+    carry0 = ashr64(s0 + (1 << 20), 21)
+    s1 = s1 + carry0
+    s0 = s0 - (carry0 << 21)
+    carry2 = ashr64(s2 + (1 << 20), 21)
+    s3 = s3 + carry2
+    s2 = s2 - (carry2 << 21)
+    carry4 = ashr64(s4 + (1 << 20), 21)
+    s5 = s5 + carry4
+    s4 = s4 - (carry4 << 21)
+    carry6 = ashr64(s6 + (1 << 20), 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry8 = ashr64(s8 + (1 << 20), 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry10 = ashr64(s10 + (1 << 20), 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+
+    carry1 = ashr64(s1 + (1 << 20), 21)
+    s2 = s2 + carry1
+    s1 = s1 - (carry1 << 21)
+    carry3 = ashr64(s3 + (1 << 20), 21)
+    s4 = s4 + carry3
+    s3 = s3 - (carry3 << 21)
+    carry5 = ashr64(s5 + (1 << 20), 21)
+    s6 = s6 + carry5
+    s5 = s5 - (carry5 << 21)
+    carry7 = ashr64(s7 + (1 << 20), 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry9 = ashr64(s9 + (1 << 20), 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry11 = ashr64(s11 + (1 << 20), 21)
+    s12 = s12 + carry11
+    s11 = s11 - (carry11 << 21)
+
+    s0 = s0 + s12 * 666643
+    s1 = s1 + s12 * 470296
+    s2 = s2 + s12 * 654183
+    s3 = s3 - s12 * 997805
+    s4 = s4 + s12 * 136657
+    s5 = s5 - s12 * 683901
+    s12 = 0
+
+    carry0 = ashr64(s0, 21)
+    s1 = s1 + carry0
+    s0 = s0 - (carry0 << 21)
+    carry1 = ashr64(s1, 21)
+    s2 = s2 + carry1
+    s1 = s1 - (carry1 << 21)
+    carry2 = ashr64(s2, 21)
+    s3 = s3 + carry2
+    s2 = s2 - (carry2 << 21)
+    carry3 = ashr64(s3, 21)
+    s4 = s4 + carry3
+    s3 = s3 - (carry3 << 21)
+    carry4 = ashr64(s4, 21)
+    s5 = s5 + carry4
+    s4 = s4 - (carry4 << 21)
+    carry5 = ashr64(s5, 21)
+    s6 = s6 + carry5
+    s5 = s5 - (carry5 << 21)
+    carry6 = ashr64(s6, 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry7 = ashr64(s7, 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry8 = ashr64(s8, 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry9 = ashr64(s9, 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry10 = ashr64(s10, 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+    carry11 = ashr64(s11, 21)
+    s12 = s12 + carry11
+    s11 = s11 - (carry11 << 21)
+
+    s0 = s0 + s12 * 666643
+    s1 = s1 + s12 * 470296
+    s2 = s2 + s12 * 654183
+    s3 = s3 - s12 * 997805
+    s4 = s4 + s12 * 136657
+    s5 = s5 - s12 * 683901
+    s12 = 0
+
+    carry0 = ashr64(s0, 21)
+    s1 = s1 + carry0
+    s0 = s0 - (carry0 << 21)
+    carry1 = ashr64(s1, 21)
+    s2 = s2 + carry1
+    s1 = s1 - (carry1 << 21)
+    carry2 = ashr64(s2, 21)
+    s3 = s3 + carry2
+    s2 = s2 - (carry2 << 21)
+    carry3 = ashr64(s3, 21)
+    s4 = s4 + carry3
+    s3 = s3 - (carry3 << 21)
+    carry4 = ashr64(s4, 21)
+    s5 = s5 + carry4
+    s4 = s4 - (carry4 << 21)
+    carry5 = ashr64(s5, 21)
+    s6 = s6 + carry5
+    s5 = s5 - (carry5 << 21)
+    carry6 = ashr64(s6, 21)
+    s7 = s7 + carry6
+    s6 = s6 - (carry6 << 21)
+    carry7 = ashr64(s7, 21)
+    s8 = s8 + carry7
+    s7 = s7 - (carry7 << 21)
+    carry8 = ashr64(s8, 21)
+    s9 = s9 + carry8
+    s8 = s8 - (carry8 << 21)
+    carry9 = ashr64(s9, 21)
+    s10 = s10 + carry9
+    s9 = s9 - (carry9 << 21)
+    carry10 = ashr64(s10, 21)
+    s11 = s11 + carry10
+    s10 = s10 - (carry10 << 21)
+
+    let out: Bytes = bytesAlloc(32)
+    bytesSet(out, 0, int32(ashr64(s0, 0)))
+    bytesSet(out, 1, int32(ashr64(s0, 8)))
+    bytesSet(out, 2, int32(ashr64(s0, 16) | (s1 << 5)))
+    bytesSet(out, 3, int32(ashr64(s1, 3)))
+    bytesSet(out, 4, int32(ashr64(s1, 11)))
+    bytesSet(out, 5, int32(ashr64(s1, 19) | (s2 << 2)))
+    bytesSet(out, 6, int32(ashr64(s2, 6)))
+    bytesSet(out, 7, int32(ashr64(s2, 14) | (s3 << 7)))
+    bytesSet(out, 8, int32(ashr64(s3, 1)))
+    bytesSet(out, 9, int32(ashr64(s3, 9)))
+    bytesSet(out, 10, int32(ashr64(s3, 17) | (s4 << 4)))
+    bytesSet(out, 11, int32(ashr64(s4, 4)))
+    bytesSet(out, 12, int32(ashr64(s4, 12)))
+    bytesSet(out, 13, int32(ashr64(s4, 20) | (s5 << 1)))
+    bytesSet(out, 14, int32(ashr64(s5, 7)))
+    bytesSet(out, 15, int32(ashr64(s5, 15) | (s6 << 6)))
+    bytesSet(out, 16, int32(ashr64(s6, 2)))
+    bytesSet(out, 17, int32(ashr64(s6, 10)))
+    bytesSet(out, 18, int32(ashr64(s6, 18) | (s7 << 3)))
+    bytesSet(out, 19, int32(ashr64(s7, 5)))
+    bytesSet(out, 20, int32(ashr64(s7, 13)))
+    bytesSet(out, 21, int32(ashr64(s8, 0)))
+    bytesSet(out, 22, int32(ashr64(s8, 8)))
+    bytesSet(out, 23, int32(ashr64(s8, 16) | (s9 << 5)))
+    bytesSet(out, 24, int32(ashr64(s9, 3)))
+    bytesSet(out, 25, int32(ashr64(s9, 11)))
+    bytesSet(out, 26, int32(ashr64(s9, 19) | (s10 << 2)))
+    bytesSet(out, 27, int32(ashr64(s10, 6)))
+    bytesSet(out, 28, int32(ashr64(s10, 14) | (s11 << 7)))
+    bytesSet(out, 29, int32(ashr64(s11, 1)))
+    bytesSet(out, 30, int32(ashr64(s11, 9)))
+    bytesSet(out, 31, int32(ashr64(s11, 17)))
+    return out

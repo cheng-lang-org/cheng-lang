@@ -1,0 +1,258 @@
+import cheng/web/runtime/abi
+import cheng/web/runtime/app
+import cheng/web/runtime/view
+import cheng/web/runtime/router
+import cheng/web/runtime/events
+import cheng/web/router/router as rtr
+import cheng/web/examples/routes_manifest
+
+const
+    DefaultUserId: str = "42"
+    DefaultDocs: str = "intro/getting-started"
+    DefaultDocsQuery: str = "from=nav"
+
+type
+    AppState =
+        view: View
+        root: WebNode
+        routerState: RouterState
+        outlet: RouterOutlet
+        registry: RouteRegistry
+        entries: rtr.RouteEntry[]
+        routes: rtr.Route[]
+
+    PageState =
+        view: View
+        container: WebNode
+        bodyText: WebNode
+
+var
+    appState: AppState
+    homeState: PageState
+    aboutState: PageState
+    userState: PageState
+    docsState: PageState
+
+fn resultText(data: RouteLoadResult): str =
+    if data.pending:
+        return "Loading..."
+    if ! data.ok:
+        return "Error: " + data.error
+    if data.data == nil || len(data.data) == 0:
+        return "No data"
+    return data.data
+
+fn scheduleLoad(ctx: RouteLoadContext, label: str, delayMs: int32): RouteLoadResult =
+    if ctx.result == nil:
+        return loadOk(label)
+    let handler = fn (ev: WebEvent) =
+        ev
+        routeSetResult(ctx, loadOk(label))
+    setTimeout(delayMs, handler)
+    return loadPending()
+
+fn mountPage(state: var PageState, root: WebNode, title: str, body: str): int32 =
+    state.view = newView(root)
+    state.container = createElement(state.view, "section")
+    setAttr(state.view, state.container, "class", "route-card")
+
+    let heading = createElement(state.view, "h2")
+    let headingText = createText(state.view, title)
+    appendNode(state.view, heading, headingText)
+    appendNode(state.view, state.container, heading)
+
+    let paragraph = createElement(state.view, "p")
+    state.bodyText = createText(state.view, body)
+    appendNode(state.view, paragraph, state.bodyText)
+    appendNode(state.view, state.container, paragraph)
+
+    appendNode(state.view, root, state.container)
+    return 1
+
+fn updatePage(state: var PageState, body: str) =
+    if state.view == nil || state.bodyText == 0:
+        return
+    setText(state.view, state.bodyText, body)
+
+fn unmountPage(state: var PageState) =
+    if state.view != nil:
+        clearBindings(state.view)
+        removeNode(state.view, state.container)
+    state.view = nil
+    state.container = 0
+    state.bodyText = 0
+
+fn userBody(params: rtr.RouteParams, data: RouteLoadResult): str =
+    var id = rtr.paramGet(params, "id")
+    if len(id) == 0:
+        id = "unknown"
+    let info = resultText(data)
+    return "User id: " + id + " | " + info
+
+fn docsBody(params: rtr.RouteParams, data: RouteLoadResult): str =
+    var slug = rtr.paramGet(params, "slug")
+    if len(slug) == 0:
+        slug = "index"
+    let info = resultText(data)
+    return "Docs: " + slug + " | " + info
+
+fn homeLoad(ctx: RouteLoadContext): RouteLoadResult =
+    ctx
+    return loadOk("home payload ok")
+
+fn aboutLoad(ctx: RouteLoadContext): RouteLoadResult =
+    ctx
+    return loadOk("about payload ok")
+
+fn userLoad(ctx: RouteLoadContext): RouteLoadResult =
+    var id = rtr.paramGet(ctx.params, "id")
+    if len(id) == 0:
+        id = "unknown"
+    return scheduleLoad(ctx, "loaded user " + id, 220)
+
+fn docsLoad(ctx: RouteLoadContext): RouteLoadResult =
+    var slug = rtr.paramGet(ctx.params, "slug")
+    if len(slug) == 0:
+        slug = "index"
+    var from = rtr.queryGet(ctx.queryParams, "from")
+    if len(from) > 0:
+        return scheduleLoad(ctx, "loaded docs " + slug + " from " + from, 360)
+    return scheduleLoad(ctx, "loaded docs " + slug, 360)
+
+fn homeMount(root: WebNode, params: rtr.RouteParams, data: RouteLoadResult): int32 =
+    params
+    let body = "Welcome to the Cheng router demo. " + resultText(data)
+    return mountPage(homeState, root, "Home", body)
+
+fn homeUpdate(handle: int32, params: rtr.RouteParams, data: RouteLoadResult) =
+    handle
+    params
+    updatePage(homeState, "Welcome to the Cheng router demo. " + resultText(data))
+
+fn homeUnmount(handle: int32) =
+    handle
+    unmountPage(homeState)
+
+fn aboutMount(root: WebNode, params: rtr.RouteParams, data: RouteLoadResult): int32 =
+    params
+    let body = "File-based routes map to runtime components. " + resultText(data)
+    return mountPage(aboutState, root, "About", body)
+
+fn aboutUpdate(handle: int32, params: rtr.RouteParams, data: RouteLoadResult) =
+    handle
+    params
+    updatePage(aboutState, "File-based routes map to runtime components. " + resultText(data))
+
+fn aboutUnmount(handle: int32) =
+    handle
+    unmountPage(aboutState)
+
+fn userMount(root: WebNode, params: rtr.RouteParams, data: RouteLoadResult): int32 =
+    return mountPage(userState, root, "User", userBody(params, data))
+
+fn userUpdate(handle: int32, params: rtr.RouteParams, data: RouteLoadResult) =
+    handle
+    updatePage(userState, userBody(params, data))
+
+fn userUnmount(handle: int32) =
+    handle
+    unmountPage(userState)
+
+fn docsMount(root: WebNode, params: rtr.RouteParams, data: RouteLoadResult): int32 =
+    return mountPage(docsState, root, "Docs", docsBody(params, data))
+
+fn docsUpdate(handle: int32, params: rtr.RouteParams, data: RouteLoadResult) =
+    handle
+    updatePage(docsState, docsBody(params, data))
+
+fn docsUnmount(handle: int32) =
+    handle
+    unmountPage(docsState)
+
+fn onNavHome(ev: WebEvent) =
+    ev
+    routerNavigate(appState.routerState, "/")
+
+fn onNavAbout(ev: WebEvent) =
+    ev
+    routerNavigate(appState.routerState, "/about")
+
+fn onNavUser(ev: WebEvent) =
+    ev
+    routerNavigate(appState.routerState, "/users/" + DefaultUserId)
+
+fn onNavDocs(ev: WebEvent) =
+    ev
+    routerNavigate(appState.routerState, "/docs/" + DefaultDocs + "?" + DefaultDocsQuery)
+
+fn addNavButton(v: View, parent: WebNode, label: str, handler: WebEventHandler) =
+    let btn = createElement(v, "button")
+    setAttr(v, btn, "class", "nav-btn")
+    let txt = createText(v, label)
+    appendNode(v, btn, txt)
+    appendNode(v, parent, btn)
+    onEvent(v, btn, "click", handler)
+
+fn appInit() =
+    0
+fn appMount(root: WebNode): int32 =
+    appState.view = newView(root)
+    appState.root = createElement(appState.view, "div")
+    setAttr(appState.view, appState.root, "class", "router-demo")
+    appendNode(appState.view, 0, appState.root)
+
+    let header = createElement(appState.view, "header")
+    setAttr(appState.view, header, "class", "router-header")
+    appendNode(appState.view, appState.root, header)
+
+    let title = createElement(appState.view, "h1")
+    let titleText = createText(appState.view, "Cheng Router Demo")
+    appendNode(appState.view, title, titleText)
+    appendNode(appState.view, header, title)
+
+    let nav = createElement(appState.view, "nav")
+    setAttr(appState.view, nav, "class", "router-nav")
+    appendNode(appState.view, header, nav)
+
+    addNavButton(appState.view, nav, "Home", onNavHome)
+    addNavButton(appState.view, nav, "About", onNavAbout)
+    addNavButton(appState.view, nav, "User 42", onNavUser)
+    addNavButton(appState.view, nav, "Docs", onNavDocs)
+
+    let main = createElement(appState.view, "main")
+    setAttr(appState.view, main, "class", "router-outlet")
+    appendNode(appState.view, appState.root, main)
+
+    appState.entries = routes_manifest.routeEntries()
+    appState.routes = routes_manifest.buildRoutes()
+    appState.routerState = newRouter(appState.routes)
+    appState.registry = newRouteRegistry()
+    registerRouteByPathFull(appState.registry, appState.entries, "/", homeLoad, homeMount, homeUpdate, homeUnmount)
+    registerRouteByPathFull(appState.registry, appState.entries, "/about", aboutLoad, aboutMount, aboutUpdate, aboutUnmount)
+    registerRouteByPathFull(appState.registry, appState.entries, "/users/[id]", userLoad, userMount, userUpdate, userUnmount)
+    registerRouteByPathFull(appState.registry, appState.entries, "/docs/[...slug]", docsLoad, docsMount, docsUpdate, docsUnmount)
+
+    let compEntries = buildRouteEntries(appState.entries, appState.registry)
+    appState.outlet = newRouterOutlet(main, appState.routerState, compEntries)
+    return 1
+
+fn appUpdate(handle: int32) =
+    handle
+
+fn appUnmount(handle: int32) =
+    handle
+    if appState.outlet != nil:
+        disposeRouterOutlet(appState.outlet)
+        appState.outlet = nil
+    if appState.routerState != nil:
+        disposeRouter(appState.routerState)
+        appState.routerState = nil
+    if appState.view != nil:
+        clearBindings(appState.view)
+        removeNode(appState.view, appState.root)
+    appState.root = 0
+
+fn register() =
+    registerApp(appInit, appMount, appUpdate, appUnmount)
+
+register()

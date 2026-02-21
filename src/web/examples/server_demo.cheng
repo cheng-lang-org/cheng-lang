@@ -1,0 +1,56 @@
+import cheng/web/std/server
+import cheng/web/router/router as rtr
+
+var
+    demoRouter: ServerRouter
+    demoAssets: StaticAssets
+    demoHandler: ServerHandler
+
+fn helloHandler(req: HttpRequest, params: rtr.RouteParams): HttpResponse =
+    var name = rtr.paramGet(params, "name")
+    if len(name) == 0:
+        name = "world"
+    let query = requestQueryParams(req)
+    let lang = urlQueryGet(query, "lang")
+    var suffix = ""
+    if len(lang) > 0:
+        suffix = " (" + lang + ")"
+    return textResponse("Hello " + name + suffix)
+
+fn pingHandler(req: HttpRequest, params: rtr.RouteParams): HttpResponse =
+    req
+    params
+    return jsonResponse("{\"ok\":true}")
+
+fn logMiddleware(req: HttpRequest, next: ServerHandler): HttpResponse =
+    var res = next(req)
+    headerSet(res.headers, "X-Demo", "1")
+    return res
+
+fn setupDemo() =
+    demoRouter = newServerRouter()
+    addRoute(demoRouter, hmGet, "/hello/[name]", helloHandler)
+    addRoute(demoRouter, hmGet, "/api/ping", pingHandler)
+
+    demoAssets = newStaticAssets()
+    addAsset(demoAssets, "/health.txt", "text/plain; charset=utf-8", "ok")
+
+    let routerHandler = fn (req: HttpRequest): HttpResponse =
+        return routeRequest(demoRouter, req)
+
+    var chain: ServerMiddleware[] 
+    chain.add(logMiddleware)
+    let appHandler = applyMiddleware(routerHandler, chain)
+    let staticHandler = serveAssets(demoAssets)
+
+    demoHandler = fn (req: HttpRequest): HttpResponse =
+        var res = appHandler(req)
+        if res.status == 404:
+            res = staticHandler(req)
+        return res
+
+fn demoRequest(url: str): HttpResponse =
+    if demoHandler == nil:
+        setupDemo()
+    let req = requestFromUrl(hmGet, url)
+    return demoHandler(req)

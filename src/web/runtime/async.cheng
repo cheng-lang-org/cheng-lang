@@ -1,0 +1,126 @@
+import cheng/web/runtime/events
+import cheng/web/runtime/signals as sig
+import cheng/web/std/web_fetch
+
+type
+    AwaitText =
+        status: int32
+        value: str
+        error: str
+
+    AsyncTask = ref
+        active: bool
+        cancelFlag: sig.Signal[bool]
+
+fn awaitTextPending(): AwaitText =
+    var out: AwaitText
+    out.status = 0
+    out.value = ""
+    out.error = ""
+    return out
+
+fn awaitTextOk(value: str, status: int32 = 1): AwaitText =
+    var out: AwaitText
+    out.status = status
+    out.value = value
+    out.error = ""
+    return out
+
+fn awaitTextError(message: str): AwaitText =
+    var out: AwaitText
+    out.status = -1
+    out.value = ""
+    out.error = message
+    return out
+
+fn asyncTask(): AsyncTask =
+    var task: AsyncTask
+    new(task)
+    task.active = true
+    task.cancelFlag = sig.signal[bool](false)
+    return task
+
+fn asyncCancel(task: AsyncTask) =
+    if task == nil || ! task.active:
+        return
+    task.active = false
+    sig.set(task.cancelFlag, true)
+
+fn asyncCancelled(task: AsyncTask): bool =
+    if task == nil || ! task.active:
+        return true
+    return sig.get(task.cancelFlag)
+
+fn awaitTextSignal(): (&sig.Signal)[AwaitText] =
+    return sig.signal[AwaitText](awaitTextPending())
+
+fn awaitSetPending(target: sig.Signal[AwaitText]) =
+    if target == nil:
+        return
+    sig.set(target, awaitTextPending())
+
+fn awaitSetOk(target: sig.Signal[AwaitText], value: str) =
+    if target == nil:
+        return
+    sig.set(target, awaitTextOk(value))
+
+fn awaitSetError(target: sig.Signal[AwaitText], message: str) =
+    if target == nil:
+        return
+    sig.set(target, awaitTextError(message))
+
+fn awaitFetchText(url: str, pollMs: int32 = 16): (&sig.Signal)[AwaitText] =
+    let state = sig.signal[AwaitText](awaitTextPending())
+    let id = fetchStart(url)
+    if id <= 0:
+        sig.set(state, awaitTextError("fetch start failed"))
+        return state
+    var poll: WebEventHandler
+    poll = fn (ev: WebEvent) =
+        ev
+        let status = fetchStatus(id)
+        if status == 0:
+            setTimeout(pollMs, poll)
+            return
+        if status < 0:
+            sig.set(state, awaitTextError("fetch error"))
+            return
+        let body = fetchReadAll(id, 65536)
+        sig.set(state, awaitTextOk(body, status))
+    setTimeout(0, poll)
+    return state
+
+fn awaitFetchTextTask(url: str, pollMs: int32 = 16): (sig.Signal[AwaitText], AsyncTask) =
+    let task = asyncTask()
+    let state = sig.signal[AwaitText](awaitTextPending())
+    let id = fetchStart(url)
+    if id <= 0:
+        sig.set(state, awaitTextError("fetch start failed"))
+        return (state, task)
+    var poll: WebEventHandler
+    poll = fn (ev: WebEvent) =
+        ev
+        if asyncCancelled(task):
+            return
+        let status = fetchStatus(id)
+        if status == 0:
+            setTimeout(pollMs, poll)
+            return
+        if status < 0:
+            sig.set(state, awaitTextError("fetch error"))
+            return
+        let body = fetchReadAll(id, 65536)
+        sig.set(state, awaitTextOk(body, status))
+    setTimeout(0, poll)
+    return (state, task)
+
+fn awaitDelayTask(ms: int32): (sig.Signal[AwaitText], AsyncTask) =
+    let task = asyncTask()
+    let state = sig.signal[AwaitText](awaitTextPending())
+    let handler = fn (ev: WebEvent) =
+        ev
+        if asyncCancelled(task):
+            return
+        sig.set(state, awaitTextOk("ok"))
+    setTimeout(ms, handler)
+    return (state, task)

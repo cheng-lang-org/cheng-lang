@@ -1,0 +1,71 @@
+# Memory manager(minimal).
+
+import std/result
+const
+    memoryMaxInt64Value = 9223372036854775807
+
+type
+    MemoryConfig =
+        enabled: bool
+        limitBytes: int64
+
+    MemoryStats =
+        usedBytes: int64
+        peakBytes: int64
+
+    MemoryManager =
+        config: MemoryConfig
+        stats: MemoryStats
+
+var
+    memoryManager: MemoryManager = MemoryManager(
+        config: MemoryConfig(enabled: true, limitBytes: 0),
+        stats: MemoryStats(usedBytes: 0, peakBytes: 0)
+    )
+
+fn initMemoryConfig(): MemoryConfig =
+    MemoryConfig(enabled: true, limitBytes: 0)
+
+fn setMemoryConfig(config: MemoryConfig) =
+    memoryManager.config = config
+
+fn memoryEnabled(): bool =
+    memoryManager.config.enabled
+
+fn resetMemoryStats() =
+    memoryManager.stats = MemoryStats(usedBytes: 0, peakBytes: 0)
+
+fn memoryUsed(): int64 =
+    memoryManager.stats.usedBytes
+
+fn memoryPeak(): int64 =
+    memoryManager.stats.peakBytes
+
+fn addNoOverflow(current: int64, delta: int64): Result[int64] =
+    if delta < 0:
+        return Err[int64]("memory: negative bytes")
+    if delta > 0 && current > memoryMaxInt64Value - delta:
+        return Err[int64]("memory: overflow")
+    return Ok[int64](current + delta)
+
+fn reserveMemory(bytes: int64): Result[bool] =
+    if ! memoryEnabled():
+        return Ok[bool](false)
+    let nextRes: Result[int64] = addNoOverflow(memoryManager.stats.usedBytes, bytes)
+    if IsErr(nextRes):
+        return Err[bool](Error(nextRes))
+    let next: int64 = Value(nextRes)
+    if memoryManager.config.limitBytes > 0 && next > memoryManager.config.limitBytes:
+        return Err[bool]("memory: limit exceeded")
+    memoryManager.stats.usedBytes = next
+    if next > memoryManager.stats.peakBytes:
+        memoryManager.stats.peakBytes = next
+    return Ok[bool](true)
+
+fn releaseMemory(bytes: int64): Result[bool] =
+    if bytes < 0:
+        return Err[bool]("memory: negative bytes")
+    if bytes > memoryManager.stats.usedBytes:
+        return Err[bool]("memory: release exceeds usage")
+    memoryManager.stats.usedBytes = memoryManager.stats.usedBytes - bytes
+    return Ok[bool](true)

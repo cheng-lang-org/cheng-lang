@@ -1,0 +1,271 @@
+import std/os
+import std/times
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/file_bytes as fbytes
+import cheng/libp2p/crypto/crypto as crypto
+import cheng/libp2p/multibase as multibase
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import std/strings
+
+type
+    PackageSnapshot =
+        packageId: str
+        authorId: str
+        channel: str
+        epoch: int32
+        cidText: str
+        format: str
+        pubKeyText: str
+        sigText: str
+        createdTs: str
+
+fn isChannelSupported(ch: str): bool =
+    if ch == nil:
+        return false
+    if ch == "edge" || ch == "stable" || ch == "lts":
+        return true
+    return false
+
+fn snapshotTs(): str =
+    return times.now().format("unix")
+
+fn snapshotPayload(s: PackageSnapshot): str =
+    var out = s.packageId + "|" + s.authorId + "|" + s.channel + "|" +
+        intToStr(s.epoch) + "|" + s.cidText
+    if s.format != nil && len(s.format) > 0:
+        out = out + "|" + s.format
+    return out
+
+fn normalizeSnapshotFormat(fmt: str): str =
+    if fmt == nil || len(fmt) == 0:
+        return ""
+    return strutil.toLowerAscii(strutil.strip(fmt))
+
+fn isSnapshotFormatSupported(fmt: str): bool =
+    if fmt == nil || len(fmt) == 0:
+        return true
+    if fmt == "tar" || fmt == "source":
+        return true
+    return false
+
+fn encodeKeyText(key: crypto.PublicKey): result.Result[str] =
+    let encRes: result.Result[bytes.Bytes] = crypto.encodePublicKey(key)
+    if result.IsErr(encRes):
+        return result.Err[str](result.Error(encRes))
+    return multibase.encodeMultibase(multibase.baseBase64Url, result.Value(encRes))
+
+fn encodePrivKeyText(key: crypto.PrivateKey): result.Result[str] =
+    let encRes: result.Result[bytes.Bytes] = crypto.encodePrivateKey(key)
+    if result.IsErr(encRes):
+        return result.Err[str](result.Error(encRes))
+    return multibase.encodeMultibase(multibase.baseBase64Url, result.Value(encRes))
+
+fn decodePublicKeyText(text: str): result.Result[crypto.PublicKey] =
+    let rawRes: result.Result[bytes.Bytes] = multibase.decodeMultibase(text)
+    if result.IsErr(rawRes):
+        return result.Err[crypto.PublicKey](result.Error(rawRes))
+    return crypto.decodePublicKey(result.Value(rawRes))
+
+fn decodePrivateKeyText(text: str): result.Result[crypto.PrivateKey] =
+    let rawRes: result.Result[bytes.Bytes] = multibase.decodeMultibase(text)
+    if result.IsErr(rawRes):
+        return result.Err[crypto.PrivateKey](result.Error(rawRes))
+    return crypto.decodePrivateKey(result.Value(rawRes))
+
+fn encodeSignatureText(sig: crypto.Signature): result.Result[str] =
+    let raw: bytes.Bytes = crypto.encodeSignature(sig)
+    return multibase.encodeMultibase(multibase.baseBase64Url, raw)
+
+fn decodeSignatureText(keyType: crypto.KeyType, text: str): result.Result[crypto.Signature] =
+    let rawRes: result.Result[bytes.Bytes] = multibase.decodeMultibase(text)
+    if result.IsErr(rawRes):
+        return result.Err[crypto.Signature](result.Error(rawRes))
+    return result.Ok[crypto.Signature](crypto.decodeSignature(keyType, result.Value(rawRes)))
+
+fn generateKeyPairText(): result.Result[tuple[pub: str, priv: str]] =
+    let kpRes: result.Result[crypto.KeyPair] = crypto.generateKeyPair()
+    if result.IsErr(kpRes):
+        return result.Err[tuple[pub: str, priv: str]](result.Error(kpRes))
+    let kp: crypto.KeyPair = result.Value(kpRes)
+    let pubRes: result.Result[str] = encodeKeyText(kp.publicKey)
+    if result.IsErr(pubRes):
+        return result.Err[tuple[pub: str, priv: str]](result.Error(pubRes))
+    let privRes: result.Result[str] = encodePrivKeyText(kp.privateKey)
+    if result.IsErr(privRes):
+        return result.Err[tuple[pub: str, priv: str]](result.Error(privRes))
+    return result.Ok[tuple[pub: str, priv: str]]((result.Value(pubRes), result.Value(privRes)))
+
+fn signSnapshot(s: PackageSnapshot, privText: str): result.Result[PackageSnapshot] =
+    let privRes: result.Result[crypto.PrivateKey] = decodePrivateKeyText(privText)
+    if result.IsErr(privRes):
+        return result.Err[PackageSnapshot](result.Error(privRes))
+    let priv: crypto.PrivateKey = result.Value(privRes)
+    let msg: bytes.Bytes = bytes.bytesFromString(snapshotPayload(s))
+    let sigRes: result.Result[crypto.Signature] = crypto.sign(priv, msg)
+    if result.IsErr(sigRes):
+        return result.Err[PackageSnapshot](result.Error(sigRes))
+    let pubRes: result.Result[crypto.PublicKey] = crypto.publicKeyFromPrivateKey(priv)
+    if result.IsErr(pubRes):
+        return result.Err[PackageSnapshot](result.Error(pubRes))
+    let pubTextRes: result.Result[str] = encodeKeyText(result.Value(pubRes))
+    if result.IsErr(pubTextRes):
+        return result.Err[PackageSnapshot](result.Error(pubTextRes))
+    let sigTextRes: result.Result[str] = encodeSignatureText(result.Value(sigRes))
+    if result.IsErr(sigTextRes):
+        return result.Err[PackageSnapshot](result.Error(sigTextRes))
+    var out: PackageSnapshot = s
+    out.pubKeyText = result.Value(pubTextRes)
+    out.sigText = result.Value(sigTextRes)
+    return result.Ok[PackageSnapshot](out)
+
+fn verifySnapshot(s: PackageSnapshot): bool =
+    if s.pubKeyText == nil || len(s.pubKeyText) == 0:
+        return false
+    if s.sigText == nil || len(s.sigText) == 0:
+        return false
+    let pubRes: result.Result[crypto.PublicKey] = decodePublicKeyText(s.pubKeyText)
+    if result.IsErr(pubRes):
+        return false
+    let pub: crypto.PublicKey = result.Value(pubRes)
+    let sigRes: result.Result[crypto.Signature] = decodeSignatureText(pub.keyType, s.sigText)
+    if result.IsErr(sigRes):
+        return false
+    let msg: bytes.Bytes = bytes.bytesFromString(snapshotPayload(s))
+    return crypto.verify(pub, msg, result.Value(sigRes))
+
+fn snapshotToJson(s: PackageSnapshot): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("publish")
+    node["package_id"] = json.newJString(s.packageId)
+    node["author_id"] = json.newJString(s.authorId)
+    node["channel"] = json.newJString(s.channel)
+    node["epoch"] = json.newJInt(s.epoch)
+    node["cid"] = json.newJString(s.cidText)
+    if s.format != nil && len(s.format) > 0:
+        node["format"] = json.newJString(s.format)
+    if s.pubKeyText != nil && len(s.pubKeyText) > 0:
+        node["pub_key"] = json.newJString(s.pubKeyText)
+    if s.sigText != nil && len(s.sigText) > 0:
+        node["signature"] = json.newJString(s.sigText)
+    if s.createdTs != nil && len(s.createdTs) > 0:
+        node["created_ts"] = json.newJString(s.createdTs)
+    node
+
+fn parseSnapshot(node: json.JsonNode): PackageSnapshot =
+    var s: PackageSnapshot
+    s.packageId = jparse.getStringField(node, "package_id", "")
+    s.authorId = jparse.getStringField(node, "author_id", "")
+    s.channel = jparse.getStringField(node, "channel", "")
+    s.epoch = int32(jparse.getIntField(node, "epoch", 0))
+    s.cidText = jparse.getStringField(node, "cid", "")
+    s.format = normalizeSnapshotFormat(jparse.getStringField(node, "format", ""))
+    s.pubKeyText = jparse.getStringField(node, "pub_key", "")
+    s.sigText = jparse.getStringField(node, "signature", "")
+    s.createdTs = jparse.getStringField(node, "created_ts", "")
+    s
+
+fn ensureParent(path: str) =
+    let dir = os.parentDir(path)
+    if dir == nil || len(dir) == 0:
+        return
+    if os.dirExists(dir):
+        return
+    os.createDir(dir)
+
+@importc("cheng_fopen")
+fn c_fopen_registry(filename, mode: cstring): os.File
+
+fn openAppend(path: str): os.File =
+    return c_fopen_registry(path, "a")
+
+fn appendLine(path: str, line: str): bool =
+    let f = openAppend(path)
+    if f == nil:
+        return false
+    os.writeLine(f, line)
+    os.close(f)
+    return true
+
+fn publishSnapshot(registryPath: str, s: PackageSnapshot, privText: str): result.Result[PackageSnapshot] =
+    if ! isChannelSupported(s.channel):
+        return result.Err[PackageSnapshot]("registry: invalid channel")
+    let normFormat = normalizeSnapshotFormat(s.format)
+    if ! isSnapshotFormatSupported(normFormat):
+        return result.Err[PackageSnapshot]("registry: invalid format")
+    if s.packageId == nil || len(s.packageId) == 0:
+        return result.Err[PackageSnapshot]("registry: missing package_id")
+    if s.authorId == nil || len(s.authorId) == 0:
+        return result.Err[PackageSnapshot]("registry: missing author_id")
+    if s.cidText == nil || len(s.cidText) == 0:
+        return result.Err[PackageSnapshot]("registry: missing cid")
+    let cidRes: result.Result[dcid.Cid] = dcid.parseCidText(s.cidText)
+    if result.IsErr(cidRes):
+        return result.Err[PackageSnapshot](result.Error(cidRes))
+    var out: PackageSnapshot = s
+    out.format = normFormat
+    if out.createdTs == nil || len(out.createdTs) == 0:
+        out.createdTs = snapshotTs()
+    let signedRes: result.Result[PackageSnapshot] = signSnapshot(out, privText)
+    if result.IsErr(signedRes):
+        return result.Err[PackageSnapshot](result.Error(signedRes))
+    out = result.Value(signedRes)
+    let node = snapshotToJson(out)
+    let line = json.pretty(node)
+    ensureParent(registryPath)
+    if ! appendLine(registryPath, line):
+        return result.Err[PackageSnapshot]("registry: write failed")
+    return result.Ok[PackageSnapshot](out)
+
+fn resolveSnapshot(registryPath: str, packageId: str, channel: str): result.Result[PackageSnapshot] =
+    if registryPath == nil || len(registryPath) == 0:
+        return result.Err[PackageSnapshot]("registry: missing path")
+    if ! os.fileExists(registryPath):
+        return result.Err[PackageSnapshot]("registry: missing file")
+    let content = os.readFile(registryPath)
+    if content == nil || len(content) == 0:
+        return result.Err[PackageSnapshot]("registry: empty")
+    let lines = strutil.split(content, '\n')
+    var best: PackageSnapshot
+    var hasBest: bool = false
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let node: json.JsonNode = parsed.value
+        let kind = jparse.getStringField(node, "type", "")
+        if kind != "publish":
+            continue
+        let snap = parseSnapshot(node)
+        if snap.packageId != packageId || snap.channel != channel:
+            continue
+        if ! hasBest || snap.epoch >= best.epoch:
+            best = snap
+            hasBest = true
+    if ! hasBest:
+        return result.Err[PackageSnapshot]("registry: not found")
+    return result.Ok[PackageSnapshot](best)
+
+fn buildSnapshotFromFile(packageId: str, authorId: str, channel: str, epoch: int32, path: str): result.Result[PackageSnapshot] =
+    let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+    if result.IsErr(dataRes):
+        return result.Err[PackageSnapshot](result.Error(dataRes))
+    let cidRes: result.Result[dcid.Cid] = dcid.cidFromBytes(result.Value(dataRes))
+    if result.IsErr(cidRes):
+        return result.Err[PackageSnapshot](result.Error(cidRes))
+    var s: PackageSnapshot
+    s.packageId = packageId
+    s.authorId = authorId
+    s.channel = channel
+    s.epoch = epoch
+    s.cidText = dcid.cidText(result.Value(cidRes))
+    s.format = "tar"
+    if s.cidText == nil || len(s.cidText) == 0:
+        return result.Err[PackageSnapshot]("registry: cid encode failed")
+    return result.Ok[PackageSnapshot](s)

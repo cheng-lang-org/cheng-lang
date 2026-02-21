@@ -1,0 +1,338 @@
+import cheng/runtime/[mobile,mobile_app]
+
+@importc("usleep")
+fn c_usleep(usec: uint32): int32
+
+when defined(android) || defined(mobile_host):
+    @importc("cheng_mobile_host_android_width")
+    fn cheng_mobile_host_android_width(): int32
+    @importc("cheng_mobile_host_android_height")
+    fn cheng_mobile_host_android_height(): int32
+else:
+    fn cheng_mobile_host_android_width(): int32 =
+        return 0
+    fn cheng_mobile_host_android_height(): int32 =
+        return 0
+
+var gPixels: void* = nil
+var gWidth: int32 = 0
+var gHeight: int32 = 0
+var gStride: int32 = 0
+
+var gSurfaceW: int32 = 0
+var gSurfaceH: int32 = 0
+var gScaleX: float64 = 1.0
+var gScaleY: float64 = 1.0
+
+var gActiveTab: int32 = 0 # 0=home,1=explore,2=+,3=inbox,4=me
+var gScrollY: float64 = 0.0
+var gScrollMax: float64 = 0.0
+
+var gPointerDown: bool = false
+var gPointerDownInNav: bool = false
+var gLastX: float64 = 0.0
+var gLastY: float64 = 0.0
+
+fn argb(a, r, g, b: int32): uint32 =
+    return (uint32(a) << 24) | (uint32(r) << 16) | (uint32(g) << 8) | uint32(b)
+
+fn clampI32(v, lo, hi: int32): int32 =
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+fn clampF64(v, lo, hi: float64): float64 =
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+fn ensurePixels(width, height: int32) =
+    if width <= 0 || height <= 0:
+        return
+    if gPixels != nil && gWidth == width && gHeight == height:
+        return
+    if gPixels != nil:
+        dealloc(gPixels)
+        gPixels = nil
+    gWidth = width
+    gHeight = height
+    gStride = width * 4
+    let size: int32 = gStride * gHeight
+    gPixels = alloc(size)
+    zeroMem(gPixels, size)
+
+fn refreshSurfaceScale() =
+    let hw: int32 = cheng_mobile_host_android_width()
+    let hh: int32 = cheng_mobile_host_android_height()
+    if hw <= 0 || hh <= 0:
+        return
+    if hw == gSurfaceW && hh == gSurfaceH:
+        return
+    gSurfaceW = hw
+    gSurfaceH = hh
+    # Render to a capped internal resolution; scale input coords accordingly.
+    var w: int32 = hw
+    var h: int32 = hh
+    let capW: int32 = 720
+    if w > capW:
+        let scale: float64 = float64(capW) / float64(w)
+        w = capW
+        h = int32(float64(h) * scale)
+    if h < 320:
+        h = 320
+    if w < 240:
+        w = 240
+    ensurePixels(w, h)
+    gScaleX = float64(gWidth) / float64(gSurfaceW)
+    gScaleY = float64(gHeight) / float64(gSurfaceH)
+
+fn fillRect(pixels: void*, width, height, strideBytes, x, y, w, h: int32, color: uint32) =
+    if pixels == nil:
+        return
+    if w <= 0 || h <= 0:
+        return
+    var x0: int32 = x
+    var y0: int32 = y
+    var x1: int32 = x + w
+    var y1: int32 = y + h
+    if x0 < 0:
+        x0 = 0
+    if y0 < 0:
+        y0 = 0
+    if x1 > width:
+        x1 = width
+    if y1 > height:
+        y1 = height
+    if x0 >= x1 || y0 >= y1:
+        return
+    let count: int32 = x1 - x0
+    for yy in y0..<y1:
+        let row: void* = ptr_add(pixels, yy * strideBytes + x0 * 4)
+        for xx in 0..<count:
+            let cell: void* = ptr_add(row, xx * 4)
+            store[uint32](cell, color)
+
+fn clear(color: uint32) =
+    fillRect(gPixels, gWidth, gHeight, gStride, 0, 0, gWidth, gHeight, color)
+
+fn drawNavBar() =
+    let navH: int32 = 92
+    let y0: int32 = gHeight - navH
+    let bg: uint32 = argb(255, 255, 255, 255)
+    let line: uint32 = argb(255, 235, 235, 235)
+    fillRect(gPixels, gWidth, gHeight, gStride, 0, y0, gWidth, navH, bg)
+    fillRect(gPixels, gWidth, gHeight, gStride, 0, y0, gWidth, 2, line)
+    let itemW: int32 = gWidth / 5
+    let accent: uint32 = argb(255, 255, 36, 66)  # Xiaohongshu-ish red
+    let muted: uint32 = argb(255, 120, 120, 120)
+    for i in 0..<5:
+        let cx: int32 = i * itemW + itemW / 2
+        let cy: int32 = y0 + navH / 2
+        let isActive: bool = i == gActiveTab
+        let col: uint32 = if isActive: accent else: muted
+        # Simple icon placeholders.
+        if i == 2:
+            # "+" in the middle.
+            fillRect(gPixels, gWidth, gHeight, gStride, cx - 22, cy - 22, 44, 44, accent)
+            fillRect(gPixels, gWidth, gHeight, gStride, cx - 14, cy - 2, 28, 4, bg)
+            fillRect(gPixels, gWidth, gHeight, gStride, cx - 2, cy - 14, 4, 28, bg)
+        else:
+            fillRect(gPixels, gWidth, gHeight, gStride, cx - 18, cy - 18, 36, 36, col)
+
+fn drawTopBar() =
+    let topH: int32 = 96
+    let bg: uint32 = argb(255, 255, 255, 255)
+    let line: uint32 = argb(255, 235, 235, 235)
+    fillRect(gPixels, gWidth, gHeight, gStride, 0, 0, gWidth, topH, bg)
+    fillRect(gPixels, gWidth, gHeight, gStride, 0, topH - 2, gWidth, 2, line)
+    # Logo (red square) + search bar placeholder.
+    let accent: uint32 = argb(255, 255, 36, 66)
+    let pad: int32 = 16
+    fillRect(gPixels, gWidth, gHeight, gStride, pad, 22, 52, 52, accent)
+    let searchBg: uint32 = argb(255, 245, 245, 245)
+    let sx: int32 = pad + 52 + 12
+    fillRect(gPixels, gWidth, gHeight, gStride, sx, 26, 320, 44, searchBg)
+
+fn drawHomeFeed() =
+    let topH: int32 = 96
+    let navH: int32 = 92
+    let pad: int32 = 14
+    let gap: int32 = 12
+    let feedTop: int32 = topH + pad
+    let feedBottom: int32 = gHeight - navH - pad
+    let feedH: int32 = feedBottom - feedTop
+    if feedH <= 0:
+        return
+
+    let colW: int32 = (gWidth - pad * 2 - gap) / 2
+    let xLeft: int32 = pad
+    let xRight: int32 = pad + colW + gap
+
+    var yL: int32 = feedTop
+    var yR: int32 = feedTop
+    var i: int32 = 0
+    let cardBg: uint32 = argb(255, 255, 255, 255)
+    let textLine: uint32 = argb(255, 220, 220, 220)
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<28:
+        i = __for_i_1
+        var h: int32 = 220
+        let mod: int32 = i % 5
+        if mod == 0:
+            h = 260
+        elif mod == 1:
+            h = 300
+        elif mod == 2:
+            h = 240
+        elif mod == 3:
+            h = 340
+        else:
+            h = 280
+        var x: int32 = xLeft
+        var y: int32 = yL
+        if yR < yL:
+            x = xRight
+            y = yR
+        let drawY: int32 = y - int32(gScrollY)
+        if drawY + h >= feedTop - 32 && drawY <= feedBottom + 32:
+            # Card container.
+            fillRect(gPixels, gWidth, gHeight, gStride, x, drawY, colW, h, cardBg)
+            # Image placeholder (top ~70%).
+            let imgH: int32 = (h * 7) / 10
+            let r: int32 = 180 + (i * 23) % 60
+            let g: int32 = 150 + (i * 17) % 60
+            let b: int32 = 160 + (i * 19) % 60
+            fillRect(gPixels, gWidth, gHeight, gStride, x, drawY, colW, imgH, argb(255, r, g, b))
+            # Caption lines placeholder.
+            let tx: int32 = x + 12
+            let ty: int32 = drawY + imgH + 12
+            fillRect(gPixels, gWidth, gHeight, gStride, tx, ty, colW - 24, 8, textLine)
+            fillRect(gPixels, gWidth, gHeight, gStride, tx, ty + 16, (colW * 2) / 3, 8, textLine)
+            # Avatar + like pill.
+            fillRect(gPixels, gWidth, gHeight, gStride, tx, drawY + h - 28, 18, 18, argb(255, 200, 60, 80))
+            fillRect(gPixels, gWidth, gHeight, gStride, x + colW - 56, drawY + h - 28, 44, 18, argb(255, 245, 245, 245))
+        if x == xLeft:
+            yL = yL + h + gap
+        else:
+            yR = yR + h + gap
+        i = i + 1
+    let contentH: int32 = (yL > yR ? yL : yR) - feedTop
+    let maxScroll: int32 = contentH - feedH
+    if maxScroll > 0:
+        gScrollMax = float64(maxScroll)
+        gScrollY = clampF64(gScrollY, 0.0, gScrollMax)
+    else:
+        gScrollMax = 0.0
+        gScrollY = 0.0
+
+fn drawOtherTab(titleColor: uint32) =
+    let topH: int32 = 96
+    let navH: int32 = 92
+    let pad: int32 = 24
+    let y0: int32 = topH + pad
+    let h: int32 = gHeight - navH - y0 - pad
+    if h <= 0:
+        return
+    fillRect(gPixels, gWidth, gHeight, gStride, pad, y0, gWidth - pad * 2, h, argb(255, 255, 255, 255))
+    fillRect(gPixels, gWidth, gHeight, gStride, pad + 24, y0 + 24, gWidth - pad * 2 - 48, 12, titleColor)
+
+fn drawUiFrame() =
+    let bg: uint32 = argb(255, 247, 247, 247)
+    clear(bg)
+    drawTopBar()
+    if gActiveTab == 0:
+        drawHomeFeed()
+    elif gActiveTab == 1:
+        drawOtherTab(argb(255, 80, 140, 255))
+    elif gActiveTab == 2:
+        drawOtherTab(argb(255, 255, 36, 66))
+    elif gActiveTab == 3:
+        drawOtherTab(argb(255, 80, 200, 160))
+    else:
+        drawOtherTab(argb(255, 140, 140, 140))
+    drawNavBar()
+
+fn mapX(x: float64): float64 =
+    return x * gScaleX
+
+fn mapY(y: float64): float64 =
+    return y * gScaleY
+
+fn onPointerDown(x, y: float64) =
+    gPointerDown = true
+    gLastX = x
+    gLastY = y
+    let navH: int32 = 92
+    let inNav: bool = y >= float64(gHeight - navH)
+    gPointerDownInNav = inNav
+    if inNav:
+        let itemW: float64 = float64(gWidth) / 5.0
+        var idx: int32 = int32(x / itemW)
+        idx = clampI32(idx, 0, 4)
+        gActiveTab = idx
+        if gActiveTab != 0:
+            gScrollY = 0.0
+            gScrollMax = 0.0
+
+fn onPointerMove(x, y, dx, dy: float64) =
+    gLastX = x
+    gLastY = y
+    if !gPointerDown:
+        return
+    if gPointerDownInNav:
+        return
+    if gActiveTab != 0:
+        return
+    # Drag-to-scroll.
+    gScrollY = gScrollY - dy
+    gScrollY = clampF64(gScrollY, 0.0, gScrollMax)
+
+fn onPointerUp() =
+    gPointerDown = false
+    gPointerDownInNav = false
+
+fn handleEvent(ev: MobileRuntimeEvent) =
+    if ev.kind == mrePointerDown:
+        onPointerDown(mapX(ev.pointerX), mapY(ev.pointerY))
+    elif ev.kind == mrePointerMove:
+        onPointerMove(mapX(ev.pointerX), mapY(ev.pointerY), mapX(ev.pointerDeltaX), mapY(ev.pointerDeltaY))
+    elif ev.kind == mrePointerUp:
+        onPointerUp()
+    elif ev.kind == mrePointerScroll:
+        # Mouse/trackpad scroll.
+        if gActiveTab == 0:
+            gScrollY = gScrollY - mapY(ev.pointerDeltaY) * 18.0
+            gScrollY = clampF64(gScrollY, 0.0, gScrollMax)
+
+fn main(): int32 =
+    var cfg: MobileAppConfig = defaultMobileAppConfig(mpAndroid)
+    cfg.title = "Cheng XHS Demo"
+    # Use a portrait-ish default; will adapt to real surface size.
+    cfg.width = 540
+    cfg.height = 960
+    refreshSurfaceScale()
+    if gWidth <= 0 || gHeight <= 0:
+        ensurePixels(cfg.width, cfg.height)
+        gSurfaceW = cfg.width
+        gSurfaceH = cfg.height
+        gScaleX = 1.0
+        gScaleY = 1.0
+
+    let hostCfg: MobileHostConfig = toMobileHostConfig(cfg)
+    cheng_mobile_host_init(&hostCfg)
+    cheng_mobile_host_open_window(&hostCfg)
+    # Render loop: drain events, draw, present. (Runs on a background thread in Android.)
+    while true:
+        refreshSurfaceScale()
+        var ev: MobileRuntimeEvent
+        while cheng_mobile_host_poll_event(&ev) != 0:
+            handleEvent(ev)
+        if gPixels != nil:
+            drawUiFrame()
+            mobileHostPresentPixels(gPixels, gWidth, gHeight, gStride)
+        c_usleep(16000)
+    return 0

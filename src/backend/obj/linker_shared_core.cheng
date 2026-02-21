@@ -1,0 +1,80 @@
+# Shared linker helpers for Darwin/Linux self-linkers.
+# Keep this module small and dependency-free so stage0/stage1 can reuse it.
+import std/os
+
+@importc("cheng_file_exists")
+fn linkerCore_file_exists(path: cstring): int32
+
+fn linkerCoreAlignUp(value: uint64, align: uint64): uint64 =
+    if align <= 1:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn linkerCoreStrContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
+        if j == m:
+            return true
+    return false
+
+fn linkerCoreTargetIsAndroid(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return linkerCoreStrContains(target, "android")
+
+fn linkerCoreTargetIsLinux(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    if linkerCoreTargetIsAndroid(target):
+        return false
+    return linkerCoreStrContains(target, "linux")
+
+fn linkerCoreTargetIsDarwin(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return linkerCoreStrContains(target, "darwin") || linkerCoreStrContains(target, "apple")
+
+fn linkerCoreBuildTmpOutputPath(outputPath: str): str =
+    if outputPath == nil || len(outputPath) == 0:
+        return ""
+    return outputPath + ".tmp"
+
+fn linkerCorePathExists(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    return linkerCore_file_exists(path) != 0
+
+fn linkerCoreWriteFileAtomic(outputPath: str, outBytes: uint8[]): bool =
+    if outputPath == nil || len(outputPath) == 0:
+        return false
+    let tmpPath: str = linkerCoreBuildTmpOutputPath(outputPath)
+    if tmpPath == nil || len(tmpPath) == 0:
+        return false
+    # ATOM-08 输出事务：tmp + rename 发布最终产物，避免半写文件暴露给下游。
+    if linkerCorePathExists(tmpPath):
+        os.removeFile(tmpPath)
+    os.writeFileBytes(tmpPath, outBytes)
+    if !linkerCorePathExists(tmpPath):
+        return false
+    if os.renameFile(tmpPath, outputPath):
+        return true
+    # Windows rename may fail when destination exists; fallback remove+rename.
+    if linkerCorePathExists(outputPath):
+        os.removeFile(outputPath)
+        if os.renameFile(tmpPath, outputPath):
+            return true
+    os.removeFile(tmpPath)
+    return false

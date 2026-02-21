@@ -1,0 +1,163 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import std/strings
+
+fn tooling_printOut(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn tooling_printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn tooling_strNonEmpty(text: str): bool =
+    return text != nil && len(text) > 0
+
+fn tooling_strEndsWith(text: str, suffix: str): bool =
+    if !tooling_strNonEmpty(text) || !tooling_strNonEmpty(suffix):
+        return false
+    let n: int32 = len(text)
+    let m: int32 = len(suffix)
+    if m > n:
+        return false
+    for i in 0..<m:
+        if text[n - m + i] != suffix[i]:
+            return false
+    return true
+
+fn tooling_stripShSuffix(name: str): str =
+    if !tooling_strEndsWith(name, ".sh"):
+        return name
+    let n: int32 = len(name)
+    if n <= 3:
+        return ""
+    return strings.sliceBytes(name, 0, n - 3)
+
+fn tooling_isSafeScriptName(name: str): bool =
+    if !tooling_strNonEmpty(name):
+        return false
+    if strutil.contains(name, ".."):
+        return false
+    for i in 0..<len(name):
+        let ch: char = name[i]
+        let isAlphaLower: bool = ch >= 'a' && ch <= 'z'
+        let isAlphaUpper: bool = ch >= 'A' && ch <= 'Z'
+        let isDigit: bool = ch >= '0' && ch <= '9'
+        if isAlphaLower || isAlphaUpper || isDigit || ch == '_' || ch == '-' || ch == '.':
+            continue
+        return false
+    return true
+
+fn tooling_shellQuote(raw: str): str =
+    if raw == nil:
+        return "\"\""
+    var escaped: str = strutil.replace(raw, "\\", "\\\\")
+    escaped = strutil.replace(escaped, "\"", "\\\"")
+    return "\"" + escaped + "\""
+
+fn tooling_root(): str =
+    let envRoot: str = strutil.strip(os.getEnvDefault("TOOLING_ROOT", ""))
+    if tooling_strNonEmpty(envRoot):
+        return envRoot
+    return os.getCurrentDir()
+
+fn tooling_scriptDir(root: str): str =
+    return os.joinPath(root, "src/tooling")
+
+fn tooling_resolveScriptPath(root: str, rawName: str): str =
+    var name: str = strutil.strip(rawName)
+    if !tooling_strNonEmpty(name):
+        return ""
+    if strutil.startsWith(name, "src/tooling/"):
+        name = strings.dropPrefix(name, "src/tooling/")
+    name = tooling_stripShSuffix(name)
+    if !tooling_isSafeScriptName(name):
+        return ""
+    let path: str = os.joinPath(tooling_scriptDir(root), name + ".sh")
+    if !os.fileExists(path):
+        return ""
+    return path
+
+fn tooling_printUsage() =
+    tooling_printOut("usage: cheng_tooling <command> [args]")
+    tooling_printOut("")
+    tooling_printOut("commands:")
+    tooling_printOut("  list")
+    tooling_printOut("      list all src/tooling/*.sh scripts as runnable command IDs")
+    tooling_printOut("  run <script> [args...]")
+    tooling_printOut("      run script by name, for example: run backend_prod_closure --help")
+    tooling_printOut("  <script> [args...]")
+    tooling_printOut("      shorthand for `run <script> [args...]`")
+    tooling_printOut("")
+    tooling_printOut("notes:")
+    tooling_printOut("  - script can be `name` or `name.sh` or `src/tooling/name.sh`.")
+    tooling_printOut("  - all args after script are passed through as-is.")
+
+fn tooling_list(root: str): int32 =
+    let dir: str = tooling_scriptDir(root)
+    if !os.dirExists(dir):
+        tooling_printErr("cheng_tooling: tooling dir not found: " + dir)
+        return 1
+    let entries: os.seq_WalkDirEntry = os.walkDir(dir)
+    var out: str[] = []
+    for i in 0..<entries.len:
+        let entry: os.WalkDirEntry = os.os_get_WalkDirEntry(entries, i)
+        let path: str = os.walkDirEntryPath(entry)
+        let fileName: str = os.extractFilename(path)
+        if !tooling_strEndsWith(fileName, ".sh"):
+            continue
+        let name: str = tooling_stripShSuffix(fileName)
+        if tooling_isSafeScriptName(name):
+            add(out, name)
+    if out.len == 0:
+        tooling_printErr("cheng_tooling: no tooling scripts found under: " + dir)
+        return 1
+    for i in 0..<out.len:
+        tooling_printOut(out[i])
+    return 0
+
+fn tooling_runScript(root: str, scriptPath: str, argStart: int32): int32 =
+    var command: str = "sh " + tooling_shellQuote(scriptPath)
+    let count: int32 = cmdline.paramCount()
+    if argStart <= count:
+        for i in argStart..count:
+            command = command + " " + tooling_shellQuote(cmdline.paramStr(i))
+    let opts: uint64 = uint64(7)
+    let result: os.ExecCmdResult = os.execCmdEx(command, opts, root)
+    let output: str = os.execCmdResultOutput(result)
+    if tooling_strNonEmpty(output):
+        os.write(os.get_stdout(), output)
+    return os.execCmdResultExitCode(result)
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let count: int32 = cmdline.paramCount()
+    if count <= 0:
+        tooling_printUsage()
+        return 1
+    let root: str = tooling_root()
+    let first: str = cmdline.paramStr(1)
+    if first == "help" || first == "--help" || first == "-h":
+        tooling_printUsage()
+        return 0
+    if first == "list":
+        return tooling_list(root)
+
+    var scriptArg: str = ""
+    var argStart: int32 = 0
+    if first == "run":
+        if count < 2:
+            tooling_printErr("cheng_tooling: missing script name for `run`")
+            tooling_printUsage()
+            return 1
+        scriptArg = cmdline.paramStr(2)
+        argStart = 3
+    else:
+        scriptArg = first
+        argStart = 2
+
+    let scriptPath: str = tooling_resolveScriptPath(root, scriptArg)
+    if !tooling_strNonEmpty(scriptPath):
+        tooling_printErr("cheng_tooling: unknown tooling script: " + scriptArg)
+        tooling_printErr("cheng_tooling: run `cheng_tooling list` to inspect available script IDs")
+        return 1
+    return tooling_runScript(root, scriptPath, argStart)

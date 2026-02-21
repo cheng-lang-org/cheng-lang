@@ -1,0 +1,163 @@
+# ZeroQueue for efficient chunked byte buffering(fixed-size).
+
+import std/result
+import std/rawbytes
+
+const
+    maxZeroQueueChunks = 256
+
+type
+    Chunk =
+        data: Bytes
+        size: int32
+        start: int32
+
+    ZeroQueue =
+        count: int32
+        head: int32
+        tail: int32
+        chunks: Chunk[maxZeroQueueChunks]
+
+fn initZeroQueue(): ZeroQueue =
+    return ZeroQueue(count: 0, head: 0, tail: 0)
+
+fn chunkLen(c: Chunk): int32 =
+    let remaining: int32 = c.size - c.start
+    if remaining < 0:
+        return 0
+    return remaining
+
+fn zeroQueueIsEmpty(q: var ZeroQueue): bool =
+    return q.count <= 0
+
+fn isFull(q: var ZeroQueue): bool =
+    return q.count >= maxZeroQueueChunks
+
+fn clear(q: var ZeroQueue) =
+    q.count = 0
+    q.head = 0
+    q.tail = 0
+
+fn frontChunkLen(q: var ZeroQueue): int32 =
+    if q.count <= 0:
+        return 0
+    return chunkLen(q.chunks[q.head])
+
+fn zeroQueueLen(q: var ZeroQueue): int64 =
+    var total: int64 = 0
+    var idx: int32 = q.head
+    for i in 0..<q.count:
+        total = total + int64(chunkLen(q.chunks[idx]))
+        idx = (idx + 1) % maxZeroQueueChunks
+    return total
+
+fn bytesClone(b: Bytes): Bytes =
+    let n: int32 = bytesLen(b)
+    if n <= 0:
+        return emptyBytes()
+    let out: Bytes = bytesAlloc(n)
+    for i in 0..<n:
+        bytesSet(out, i, bytesGet(b, i))
+    return out
+
+fn push(q: var ZeroQueue, b: Bytes): Result[bool] =
+    let size: int32 = bytesLen(b)
+    if size <= 0:
+        return Ok[bool](false)
+    if b.data == nil:
+        return Err[bool]("zeroqueue: nil data")
+    if isFull(q):
+        return Err[bool]("zeroqueue: full count=" + $q.count)
+    q.chunks[q.tail] = Chunk(data: b, size: size, start: 0)
+    q.tail = (q.tail + 1) % maxZeroQueueChunks
+    q.count = q.count + 1
+    return Ok[bool](true)
+
+fn pushCopy(q: var ZeroQueue, b: Bytes): Result[bool] =
+    let size: int32 = bytesLen(b)
+    if size <= 0:
+        return Ok[bool](false)
+    if b.data == nil:
+        return Err[bool]("zeroqueue: nil data")
+    if isFull(q):
+        return Err[bool]("zeroqueue: full count=" + $q.count)
+    q.chunks[q.tail] = Chunk(data: bytesClone(b), size: size, start: 0)
+    q.tail = (q.tail + 1) % maxZeroQueueChunks
+    q.count = q.count + 1
+    return Ok[bool](true)
+
+fn popChunk(q: var ZeroQueue, count: int32): Result[Chunk] =
+    if zeroQueueIsEmpty(q):
+        return Err[Chunk]("zeroqueue: empty")
+    if count <= 0:
+        return Err[Chunk]("zeroqueue: invalid count")
+    let idx: int32 = q.head
+    let slot: Chunk = q.chunks[idx]
+    let available: int32 = chunkLen(slot)
+    if available <= count:
+        q.head = (q.head + 1) % maxZeroQueueChunks
+        q.count = q.count - 1
+        return Ok[Chunk](slot)
+    let start0: int32 = slot.start
+    q.chunks[idx].start = start0 + count
+    return Ok[Chunk](Chunk(data: slot.data, size: start0 + count, start: start0))
+
+fn popChunkSeq(q: var ZeroQueue, count: int32): Bytes =
+    if zeroQueueIsEmpty(q):
+        return emptyBytes()
+    let chunkRes: Result[Chunk] = popChunk(q, count)
+    if IsErr(chunkRes):
+        return emptyBytes()
+    let chunk: Chunk = Value(chunkRes)
+    let size: int32 = chunkLen(chunk)
+    if size <= 0:
+        return emptyBytes()
+    return bytesSlice(chunk.data, chunk.start, size)
+
+fn popChunkView(q: var ZeroQueue, count: int32): Result[Bytes] =
+    let chunkRes: Result[Chunk] = popChunk(q, count)
+    if IsErr(chunkRes):
+        return Err[Bytes](Error(chunkRes))
+    let chunk: Chunk = Value(chunkRes)
+    let size: int32 = chunkLen(chunk)
+    if size <= 0:
+        return Ok[Bytes](emptyBytes())
+    return Ok[Bytes](bytesSliceView(chunk.data, chunk.start, size))
+
+fn consumeTo(q: var ZeroQueue, nbytes: int32): Bytes =
+    if nbytes <= 0:
+        return emptyBytes()
+    let out: Bytes = bytesAlloc(nbytes)
+    var consumed: int32 = 0
+    while consumed < nbytes && !zeroQueueIsEmpty(q):
+        let chunkRes: Result[Chunk] = popChunk(q, nbytes - consumed)
+        if IsErr(chunkRes):
+            break
+        let chunk: Chunk = Value(chunkRes)
+        let size: int32 = chunkLen(chunk)
+        if size <= 0:
+            continue
+        for i in 0..<size:
+            bytesSet(out, consumed + i, bytesGet(chunk.data, chunk.start + i))
+        consumed = consumed + size
+    if consumed <= 0:
+        return emptyBytes()
+    if consumed == nbytes:
+        return out
+    return bytesSliceView(out, 0, consumed)
+
+fn popBytes(q: var ZeroQueue, count: int32): Result[Bytes] =
+    if count <= 0:
+        return Ok[Bytes](emptyBytes())
+    if zeroQueueIsEmpty(q):
+        return Ok[Bytes](emptyBytes())
+    let headLen: int32 = frontChunkLen(q)
+    if headLen >= count:
+        return popChunkView(q, count)
+    let avail64: int64 = zeroQueueLen(q)
+    if avail64 <= 0:
+        return Ok[Bytes](emptyBytes())
+    var target: int32 = count
+    if avail64 < int64(count):
+        target = int32(avail64)
+    return Ok[Bytes](consumeTo(q, target))

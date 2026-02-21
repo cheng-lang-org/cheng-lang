@@ -1,0 +1,160 @@
+import std/os
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/store as dstore
+import cheng/decentralized/file_bytes as fbytes
+import cheng/libp2p/main as libp2p
+import cheng/libp2p/protocols/bitswap/bitswap as bitswap
+import cheng/libp2p/protocols/bitswap/client as bsclient
+import cheng/libp2p/muxers/muxer as muxer
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import cheng/libp2p/utils/stringlist as stringlist
+import std/strings
+
+type
+    P2PConfig =
+        listenAddr: str
+        peers: stringlist.StringList
+        warmStore: bool
+
+fn initP2PConfig(listenAddr: str, peers: stringlist.StringList): P2PConfig =
+    P2PConfig(listenAddr: listenAddr, peers: peers, warmStore: true)
+
+fn newHost(cfg: P2PConfig): result.Result[libp2p.Switch] =
+    if cfg.listenAddr == nil || len(cfg.listenAddr) == 0:
+        return libp2p.newHost()
+    return libp2p.newHostWithAddressText(cfg.listenAddr)
+
+fn startHost(cfg: P2PConfig): result.Result[libp2p.Switch] =
+    let hostRes: result.Result[libp2p.Switch] = newHost(cfg)
+    if result.IsErr(hostRes):
+        return result.Err[libp2p.Switch](result.Error(hostRes))
+    var host: libp2p.Switch = result.Value(hostRes)
+    let startRes: result.Result[bool] = libp2p.hostStart(host)
+    if result.IsErr(startRes):
+        return result.Err[libp2p.Switch](result.Error(startRes))
+    return result.Ok[libp2p.Switch](host)
+
+fn warmBitswapStore(store: dstore.StoreConfig): result.Result[int32] =
+    if store.blocksDir == nil || len(store.blocksDir) == 0:
+        return result.Ok[int32](0)
+    if ! os.dirExists(store.blocksDir):
+        return result.Ok[int32](0)
+    let paths = os.walkDirRec(store.blocksDir)
+    var loaded: int32 = 0
+    for i in 0..<paths.len:
+        let path = paths[i]
+        if os.dirExists(path):
+            continue
+        let name = os.extractFilename(path)
+        if name == nil || len(name) == 0:
+            continue
+        let cidRes: result.Result[dcid.Cid] = dcid.parseCidText(name)
+        if result.IsErr(cidRes):
+            continue
+        let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+        if result.IsErr(dataRes):
+            continue
+        bitswap.bitswapPutBlock(result.Value(cidRes), result.Value(dataRes))
+        loaded = loaded + 1
+    return result.Ok[int32](loaded)
+
+fn putBytes(store: dstore.StoreConfig, cfg: P2PConfig, data: bytes.Bytes): result.Result[dcid.Cid] =
+    cfg
+    return dstore.putBytes(store, data)
+
+fn putFile(store: dstore.StoreConfig, cfg: P2PConfig, path: str): result.Result[dcid.Cid] =
+    cfg
+    let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+    if result.IsErr(dataRes):
+        return result.Err[dcid.Cid](result.Error(dataRes))
+    return dstore.putBytes(store, result.Value(dataRes))
+
+fn fetchFromPeer(host: var libp2p.Switch, addrText: str, cid: dcid.Cid): result.Result[bytes.Bytes] =
+    let streamRes: result.Result[libp2p.Stream] =
+        libp2p.hostOpenProtocolStreamToAddressText(host, addrText, bitswap.bitswapCodec)
+    if result.IsErr(streamRes):
+        return result.Err[bytes.Bytes](result.Error(streamRes))
+    var stream: libp2p.Stream = result.Value(streamRes)
+    let dataRes: result.Result[bytes.Bytes] = bsclient.bitswapRequestBlock(stream, cid)
+    muxer.closeStream(stream)
+    if result.IsErr(dataRes):
+        return result.Err[bytes.Bytes](result.Error(dataRes))
+    return dataRes
+
+fn getToFile(store: dstore.StoreConfig, cfg: P2PConfig, cidText: str, outPath: str): bool =
+    let localRes: result.Result[bytes.Bytes] = dstore.getBytes(store, cidText)
+    if result.IsOk(localRes):
+        let writeRes: result.Result[bool] = fbytes.writeFileBytes(outPath, result.Value(localRes))
+        return result.IsOk(writeRes)
+    let cidRes: result.Result[dcid.Cid] = dcid.parseCidText(cidText)
+    if result.IsErr(cidRes):
+        return false
+    if stringlist.stringListIsEmpty(cfg.peers):
+        return false
+    let hostRes: result.Result[libp2p.Switch] = startHost(cfg)
+    if result.IsErr(hostRes):
+        return false
+    var host: libp2p.Switch = result.Value(hostRes)
+    let cid: dcid.Cid = result.Value(cidRes)
+    for i in 0..<cfg.peers.count:
+        let addrText = cfg.peers.items[i]
+        let dataRes: result.Result[bytes.Bytes] = fetchFromPeer(host, addrText, cid)
+        if result.IsOk(dataRes):
+            let data: bytes.Bytes = result.Value(dataRes)
+            let verifyRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+            if result.IsOk(verifyRes) && dcid.cidEqual(result.Value(verifyRes), cid):
+                dstore.putBytes(store, data)
+                let writeRes: result.Result[bool] = fbytes.writeFileBytes(outPath, data)
+                libp2p.hostStop(host)
+                return result.IsOk(writeRes)
+    libp2p.hostStop(host)
+    return false
+
+fn getBytes(store: dstore.StoreConfig, cfg: P2PConfig, cidText: str): result.Result[bytes.Bytes] =
+    let localRes: result.Result[bytes.Bytes] = dstore.getBytes(store, cidText)
+    if result.IsOk(localRes):
+        return localRes
+    let cidRes: result.Result[dcid.Cid] = dcid.parseCidText(cidText)
+    if result.IsErr(cidRes):
+        return result.Err[bytes.Bytes]("p2p: invalid cid")
+    if stringlist.stringListIsEmpty(cfg.peers):
+        return result.Err[bytes.Bytes]("p2p: missing peers")
+    let hostRes: result.Result[libp2p.Switch] = startHost(cfg)
+    if result.IsErr(hostRes):
+        return result.Err[bytes.Bytes](result.Error(hostRes))
+    var host: libp2p.Switch = result.Value(hostRes)
+    let cid: dcid.Cid = result.Value(cidRes)
+    for i in 0..<cfg.peers.count:
+        let addrText = cfg.peers.items[i]
+        let dataRes: result.Result[bytes.Bytes] = fetchFromPeer(host, addrText, cid)
+        if result.IsOk(dataRes):
+            let data: bytes.Bytes = result.Value(dataRes)
+            let verifyRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+            if result.IsOk(verifyRes) && dcid.cidEqual(result.Value(verifyRes), cid):
+                dstore.putBytes(store, data)
+                libp2p.hostStop(host)
+                return result.Ok[bytes.Bytes](data)
+    libp2p.hostStop(host)
+    return result.Err[bytes.Bytes]("p2p: block not found")
+
+fn serve(store: dstore.StoreConfig, cfg: P2PConfig, maxStreams: int32): result.Result[int32] =
+    let hostRes: result.Result[libp2p.Switch] = startHost(cfg)
+    if result.IsErr(hostRes):
+        return result.Err[int32](result.Error(hostRes))
+    var host: libp2p.Switch = result.Value(hostRes)
+    if cfg.warmStore:
+        warmBitswapStore(store)
+    var handled: int32 = 0
+    while maxStreams <= 0 || handled < maxStreams:
+        let streamRes: result.Result[libp2p.Stream] = libp2p.hostAcceptStream(host)
+        if result.IsErr(streamRes):
+            if maxStreams > 0:
+                break
+            continue
+        var stream: libp2p.Stream = result.Value(streamRes)
+        libp2p.hostRunProtocolOnStream(host, stream)
+        muxer.closeStream(stream)
+        handled = handled + 1
+    libp2p.hostStop(host)
+    return result.Ok[int32](handled)

@@ -1,0 +1,820 @@
+# MIR v1 SSA pass (minimal): builds SSA-like renaming + inserts edge moves (phi elimination).
+# Notes:
+# - Keeps object-local pointer slots (UirCoreObjLocal.slot) out of SSA, because isel initializes them by slot index.
+# - Excludes addr-taken locals (meAddr) from SSA.
+import std/seqs
+import std/strings
+import std/result
+import std/hashmaps
+import cheng/backend/uir/uir_internal/uir_core_types
+
+type
+    SsaPhiDef =
+        varId: int32
+        destSlot: int32
+
+    SsaRowInt32 = ref
+        values: int32[]
+    SsaGridInt32 = SsaRowInt32[]
+
+    SsaRowPhiDefs = ref
+        values: SsaPhiDef[]
+    SsaGridPhiDefs = SsaRowPhiDefs[]
+
+    SsaMove =
+        destSlot: int32
+        srcSlot: int32
+
+    SsaEdgeMoves = ref
+        fromIdx: int32
+        toIdx: int32
+        fromLabel: str
+        toLabel: str
+        moves: SsaMove[]
+
+    SsaRenameCtx = ref
+        func: UirCoreFunc
+        baseCount: int32
+        blockCount: int32
+        idom: int32[]
+        domChildren: SsaGridInt32
+        succs: SsaGridInt32
+        phiDefsByBlock: SsaGridPhiDefs
+        isCandidate: bool[]
+        varTop: int32[]
+        stackVal: int32[]
+        stackPrev: int32[]
+        edgeMoves: SsaEdgeMoves[]
+
+fn ssaNewSeq2DInt(n: int32): SsaGridInt32 =
+    var out: SsaGridInt32
+    if n > 0:
+        out.cap = n
+        for i in 0..<n:
+            var row: SsaRowInt32
+            new row
+            row.values = []
+            add(out, row)
+    return out
+
+fn ssaNewSeq2DPhiDef(n: int32): SsaGridPhiDefs =
+    var out: SsaGridPhiDefs
+    if n > 0:
+        out.cap = n
+        for i in 0..<n:
+            var row: SsaRowPhiDefs
+            new row
+            row.values = []
+            add(out, row)
+    return out
+
+fn ssaReadRowIntSlot(items: SsaGridInt32, idx: int32): SsaRowInt32 =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    let off: int32 = idx * int32(sizeof SsaRowInt32)
+    let p: SsaRowInt32* = SsaRowInt32*(ptr_add(items.buffer, off))
+    return *p
+
+fn ssaWriteRowIntSlot(items: SsaGridInt32*, idx: int32, row: SsaRowInt32) =
+    if items == nil || idx < 0 || idx >= items->len || items->buffer == nil:
+        return
+    let off: int32 = idx * int32(sizeof SsaRowInt32)
+    let p: SsaRowInt32* = SsaRowInt32*(ptr_add(items->buffer, off))
+    *p = row
+
+fn ssaReadRowPhiSlot(items: SsaGridPhiDefs, idx: int32): SsaRowPhiDefs =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    let off: int32 = idx * int32(sizeof SsaRowPhiDefs)
+    let p: SsaRowPhiDefs* = SsaRowPhiDefs*(ptr_add(items.buffer, off))
+    return *p
+
+fn ssaWriteRowPhiSlot(items: SsaGridPhiDefs*, idx: int32, row: SsaRowPhiDefs) =
+    if items == nil || idx < 0 || idx >= items->len || items->buffer == nil:
+        return
+    let off: int32 = idx * int32(sizeof SsaRowPhiDefs)
+    let p: SsaRowPhiDefs* = SsaRowPhiDefs*(ptr_add(items->buffer, off))
+    *p = row
+
+fn ssaGridIntRow(items: SsaGridInt32, idx: int32): int32[] =
+    var empty: int32[]
+    if idx < 0 || idx >= items.len:
+        return empty
+    let row: SsaRowInt32 = ssaReadRowIntSlot(items, idx)
+    if row == nil:
+        return empty
+    return row.values
+
+fn ssaGridIntSetRow(items: SsaGridInt32*, idx: int32, values: int32[]) =
+    if items == nil || idx < 0 || idx >= items->len:
+        return
+    var row: SsaRowInt32 = ssaReadRowIntSlot(*items, idx)
+    if row == nil:
+        new row
+        ssaWriteRowIntSlot(items, idx, row)
+    row.values = values
+
+fn ssaGridPhiRow(items: SsaGridPhiDefs, idx: int32): SsaPhiDef[] =
+    var empty: SsaPhiDef[]
+    if idx < 0 || idx >= items.len:
+        return empty
+    let row: SsaRowPhiDefs = ssaReadRowPhiSlot(items, idx)
+    if row == nil:
+        return empty
+    return row.values
+
+fn ssaGridPhiSetRow(items: SsaGridPhiDefs*, idx: int32, values: SsaPhiDef[]) =
+    if items == nil || idx < 0 || idx >= items->len:
+        return
+    var row: SsaRowPhiDefs = ssaReadRowPhiSlot(*items, idx)
+    if row == nil:
+        new row
+        ssaWriteRowPhiSlot(items, idx, row)
+    row.values = values
+
+fn ssaSeqContainsInt(items: int32[], v: int32): bool =
+    for i in 0..<items.len:
+        if items[i] == v:
+            return true
+    return false
+
+fn ssaSeqAddUniqueInt(items: int32[]*, v: int32) =
+    if items == nil:
+        return
+    if ssaSeqContainsInt(*items, v):
+        return
+    add(items, v)
+
+fn ssa2dAddUniqueInt(items: SsaGridInt32*, idx: int32, v: int32) =
+    if items == nil:
+        return
+    if idx < 0 || idx >= items->len:
+        return
+    var inner: int32[] = ssaGridIntRow(*items, idx)
+    if ! ssaSeqContainsInt(inner, v):
+        add(inner, v)
+        ssaGridIntSetRow(items, idx, inner)
+
+fn ssaSortIntsStable(items: int32[]*): bool =
+    if items == nil || items->len <= 1:
+        return false
+    var changed: bool = false
+    for i in 1..<items->len:
+        let key: int32 = items[i]
+        var j: int32 = i - 1
+        let __for_start_j = j
+        for __for_rev_j in 0..(__for_start_j - (0)):
+            j = __for_start_j - __for_rev_j
+            if !(items[j] > key):
+                break
+            items[j + 1] = items[j]
+            changed = true
+        items[j + 1] = key
+    return changed
+
+fn ssaMarkAddrTaken(expr: UirCoreExpr, addrTaken: bool[]*) =
+    if expr == nil || addrTaken == nil:
+        return
+    if expr.kind == meAddr:
+        let slot: int32 = expr.localIndex
+        if slot >= 0 && slot < addrTaken->len:
+            addrTaken[slot] = true
+        return
+    if expr.kind == meLoad:
+        ssaMarkAddrTaken(expr.addrExpr, addrTaken)
+        return
+    if expr.kind == meBin || expr.kind == meCmp:
+        ssaMarkAddrTaken(expr.lhs, addrTaken)
+        ssaMarkAddrTaken(expr.rhs, addrTaken)
+        return
+    if expr.kind == meCall:
+        for i in 0..<expr.args.len:
+            ssaMarkAddrTaken(expr.args[i], addrTaken)
+        return
+    if expr.kind == meCast:
+        ssaMarkAddrTaken(expr.castExpr, addrTaken)
+        return
+    return
+
+fn ssaAllocSlot(func: UirCoreFunc, baseSlot: int32): int32 =
+    if func == nil:
+        return -1
+    let idx: int32 = func.localTypes.len
+    var ty: UirCoreType = uirCoreTypeI32()
+    if baseSlot >= 0 && baseSlot < func.localTypes.len:
+        ty = func.localTypes[baseSlot]
+    add(func.localTypes, ty)
+    return idx
+
+fn ssaPush(varTop: int32[]*, stackVal: int32[]*, stackPrev: int32[]*,
+           varId: int32, value: int32) =
+    if varTop == nil || stackVal == nil || stackPrev == nil:
+        return
+    if varId < 0 || varId >= varTop->len:
+        return
+    let rec: int32 = stackVal->len
+    add(stackVal, value)
+    add(stackPrev, varTop[varId])
+    varTop[varId] = rec
+
+fn ssaPop(varTop: int32[]*, stackPrev: int32[], varId: int32) =
+    if varTop == nil:
+        return
+    if varId < 0 || varId >= varTop->len:
+        return
+    let rec: int32 = varTop[varId]
+    if rec < 0 || rec >= stackPrev.len:
+        return
+    varTop[varId] = stackPrev[rec]
+
+fn ssaCurrentSlot(varId: int32, varTop: int32[], stackVal: int32[]): int32 =
+    if varId < 0 || varId >= varTop.len:
+        return varId
+    let rec: int32 = varTop[varId]
+    if rec < 0 || rec >= stackVal.len:
+        return varId
+    return stackVal[rec]
+
+fn ssaRewriteExpr(expr: UirCoreExpr, baseCount: int32, isCandidate: bool[],
+                  varTop: int32[], stackVal: int32[]): Result[bool] =
+    if expr == nil:
+        return Ok[bool](true)
+    if expr.kind == meLocal:
+        let base: int32 = expr.localIndex
+        if base >= 0 && base < baseCount && isCandidate[base]:
+            expr.localIndex = ssaCurrentSlot(base, varTop, stackVal)
+        return Ok[bool](true)
+    if expr.kind == meAddr:
+        return Ok[bool](true)
+    if expr.kind == meLoad:
+        return ssaRewriteExpr(expr.addrExpr, baseCount, isCandidate, varTop, stackVal)
+    if expr.kind == meGlobalAddr:
+        return Ok[bool](true)
+    if expr.kind == meBin || expr.kind == meCmp:
+        let l: Result[bool] = ssaRewriteExpr(expr.lhs, baseCount, isCandidate, varTop, stackVal)
+        if ! IsOk[bool](l):
+            return l
+        return ssaRewriteExpr(expr.rhs, baseCount, isCandidate, varTop, stackVal)
+    if expr.kind == meCall:
+        for i in 0..<expr.args.len:
+            let a: Result[bool] = ssaRewriteExpr(expr.args[i], baseCount, isCandidate,
+                                                 varTop, stackVal)
+            if ! IsOk[bool](a):
+                return a
+        return Ok[bool](true)
+    if expr.kind == meCast:
+        return ssaRewriteExpr(expr.castExpr, baseCount, isCandidate, varTop, stackVal)
+    return Ok[bool](true)
+
+fn ssaIntersect(b1: int32, b2: int32, idom: int32[], rpoIndex: int32[]): int32 =
+    var f1: int32 = b1
+    var f2: int32 = b2
+    while f1 != f2:
+        while f1 >= 0 && f2 >= 0 && rpoIndex[f1] > rpoIndex[f2]:
+            let n1: int32 = idom[f1]
+            if n1 == f1:
+                break
+            f1 = n1
+        while f2 >= 0 && f1 >= 0 && rpoIndex[f2] > rpoIndex[f1]:
+            let n2: int32 = idom[f2]
+            if n2 == f2:
+                break
+            f2 = n2
+    return f1
+
+fn ssaEdgeLess(a: SsaEdgeMoves, b: SsaEdgeMoves): bool =
+    if a == nil || b == nil:
+        return false
+    let c: int32 = uirCoreStrCmp(a.toLabel, b.toLabel)
+    if c < 0:
+        return true
+    if c > 0:
+        return false
+    return uirCoreStrCmp(a.fromLabel, b.fromLabel) < 0
+
+fn ssaSortEdgesStable(edges: SsaEdgeMoves[]*): bool =
+    if edges == nil || edges->len <= 1:
+        return false
+    var changed: bool = false
+    for i in 1..<edges->len:
+        let key: SsaEdgeMoves = edges[i]
+        var j: int32 = i - 1
+        let __for_start_j = j
+        for __for_rev_j in 0..(__for_start_j - (0)):
+            j = __for_start_j - __for_rev_j
+            if !(ssaEdgeLess(key, edges[j])):
+                break
+            edges[j + 1] = edges[j]
+            changed = true
+        edges[j + 1] = key
+    return changed
+
+fn ssaRenameBlock(ctx: SsaRenameCtx, bi: int32): Result[bool] =
+    if ctx == nil:
+        return Err[bool]("uirCore_ssa: nil ctx")
+    let func: UirCoreFunc = ctx.func
+    let n: int32 = ctx.blockCount
+    if func == nil || n <= 0:
+        return Ok[bool](true)
+    if bi < 0 || bi >= n:
+        return Ok[bool](true)
+    if ctx.idom[bi] == -1:
+        return Ok[bool](true)
+    let blk: UirCoreBlock = func.blocks[bi]
+    if blk == nil:
+        return Ok[bool](true)
+
+    var pushed: int32[]
+
+    let phis: SsaPhiDef[] = ssaGridPhiRow(ctx.phiDefsByBlock, bi)
+    for pi in 0..<phis.len:
+        let pd: SsaPhiDef = phis[pi]
+        ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, pd.varId, pd.destSlot)
+        add(pushed, pd.varId)
+
+    for si in 0..<blk.stmts.len:
+        var st: UirCoreStmt = blk.stmts[si]
+        if st.kind == msLet || st.kind == msVar || st.kind == msAssign:
+            let rr: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
+                                                  ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rr):
+                return rr
+            let base: int32 = st.slot
+            if base >= 0 && base < ctx.baseCount && ctx.isCandidate[base]:
+                let ns: int32 = ssaAllocSlot(func, base)
+                st.slot = ns
+                ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, base, ns)
+                add(pushed, base)
+            blk.stmts[si] = st
+        elif st.kind == msParam:
+            let base2: int32 = st.slot
+            if base2 >= 0 && base2 < ctx.baseCount && ctx.isCandidate[base2]:
+                let ns2: int32 = ssaAllocSlot(func, base2)
+                st.slot = ns2
+                ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, base2, ns2)
+                add(pushed, base2)
+                blk.stmts[si] = st
+        elif st.kind == msStore:
+            let rrA: Result[bool] = ssaRewriteExpr(st.addrExpr, ctx.baseCount, ctx.isCandidate,
+                                                   ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rrA):
+                return rrA
+            let rrV: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
+                                                   ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rrV):
+                return rrV
+            blk.stmts[si] = st
+        else:
+            let rr2: Result[bool] = ssaRewriteExpr(st.expr, ctx.baseCount, ctx.isCandidate,
+                                                   ctx.varTop, ctx.stackVal)
+            if ! IsOk[bool](rr2):
+                return rr2
+            blk.stmts[si] = st
+
+    if blk.term.kind == mtRet && blk.term.retExpr != nil:
+        let rr3: Result[bool] = ssaRewriteExpr(blk.term.retExpr, ctx.baseCount, ctx.isCandidate,
+                                               ctx.varTop, ctx.stackVal)
+        if ! IsOk[bool](rr3):
+            return rr3
+    elif blk.term.kind == mtCbr && blk.term.condExpr != nil:
+        let rr4: Result[bool] = ssaRewriteExpr(blk.term.condExpr, ctx.baseCount, ctx.isCandidate,
+                                               ctx.varTop, ctx.stackVal)
+        if ! IsOk[bool](rr4):
+            return rr4
+
+    let succList: int32[] = ssaGridIntRow(ctx.succs, bi)
+    for sxi in 0..<succList.len:
+        let toIdx: int32 = succList[sxi]
+        if toIdx >= 0 && toIdx < n:
+            let toPhis: SsaPhiDef[] = ssaGridPhiRow(ctx.phiDefsByBlock, toIdx)
+            if toPhis.len > 0:
+                var moves: SsaMove[]
+                for mi in 0..<toPhis.len:
+                    let pd2: SsaPhiDef = toPhis[mi]
+                    var mv: SsaMove
+                    mv.destSlot = pd2.destSlot
+                    mv.srcSlot = ssaCurrentSlot(pd2.varId, ctx.varTop, ctx.stackVal)
+                    add(moves, mv)
+                if moves.len > 0:
+                    var em: SsaEdgeMoves
+                    new em
+                    em.fromIdx = bi
+                    em.toIdx = toIdx
+                    em.fromLabel = blk.label
+                    let toBlk: UirCoreBlock = func.blocks[toIdx]
+                    em.toLabel = toBlk.label
+                    em.moves = moves
+                    add(ctx.edgeMoves, em)
+
+    let kids: int32[] = ssaGridIntRow(ctx.domChildren, bi)
+    for ci in 0..<kids.len:
+        let kres: Result[bool] = ssaRenameBlock(ctx, kids[ci])
+        if ! IsOk[bool](kres):
+            return kres
+
+    while pushed.len > 0:
+        let vid: int32 = pushed[pushed.len - 1]
+        pushed.len = pushed.len - 1
+        ssaPop(&ctx.varTop, ctx.stackPrev, vid)
+    return Ok[bool](true)
+
+fn uirCoreSsaLowerFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
+    if func == nil:
+        return Ok[bool](true)
+    if func.isExtern:
+        return Ok[bool](true)
+    let baseCount: int32 = func.localTypes.len
+    if baseCount <= 0:
+        return Ok[bool](true)
+    let n: int32 = func.blocks.len
+    if n <= 0:
+        return Ok[bool](true)
+
+    var labelMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(n * 2 + 8)
+    for bi in 0..<n:
+        let b: UirCoreBlock = func.blocks[bi]
+        if b == nil || b.label == nil || len(b.label) == 0:
+            return Err[bool]("uirCore_ssa: missing block label (" + func.name + ")")
+        hashmaps.hashMapStrIntPut(labelMap, b.label, bi)
+
+    var preds: SsaGridInt32 = ssaNewSeq2DInt(n)
+    var succs: SsaGridInt32 = ssaNewSeq2DInt(n)
+    for bi in 0..<n:
+        let b2: UirCoreBlock = func.blocks[bi]
+        if b2 == nil:
+            continue
+        if b2.term.kind == mtBr:
+            var found: bool = false
+            let si: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.target, found)
+            if ! found:
+                return Err[bool]("uirCore_ssa: br target not found (" + func.name + ":" + b2.label + ")")
+            ssa2dAddUniqueInt(&succs, bi, si)
+            ssa2dAddUniqueInt(&preds, si, bi)
+        elif b2.term.kind == mtCbr:
+            var foundT: bool = false
+            var foundF: bool = false
+            let st: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetTrue, foundT)
+            let sf: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetFalse, foundF)
+            if ! foundT || ! foundF:
+                return Err[bool]("uirCore_ssa: cbr target not found (" + func.name + ":" + b2.label + ")")
+            ssa2dAddUniqueInt(&succs, bi, st)
+            ssa2dAddUniqueInt(&succs, bi, sf)
+            ssa2dAddUniqueInt(&preds, st, bi)
+            ssa2dAddUniqueInt(&preds, sf, bi)
+
+    var foundEntry: bool = false
+    var entry: int32 = hashmaps.hashMapStrIntGet(labelMap, "entry", foundEntry)
+    if ! foundEntry:
+        entry = 0
+
+    # Reverse postorder of reachable CFG.
+    var visited: bool[]
+    for i2 in 0..<n:
+        add(visited, false)
+    var stackNodes: int32[]
+    var stackNext: int32[]
+    var post: int32[]
+    if entry >= 0 && entry < n:
+        visited[entry] = true
+        add(stackNodes, entry)
+        add(stackNext, int32(0))
+    while stackNodes.len > 0:
+        let topIdx: int32 = stackNodes.len - 1
+        let v: int32 = stackNodes[topIdx]
+        let nextI: int32 = stackNext[topIdx]
+        let vsucc: int32[] = ssaGridIntRow(succs, v)
+        if nextI < vsucc.len:
+            let s: int32 = vsucc[nextI]
+            stackNext[topIdx] = nextI + 1
+            if s >= 0 && s < n && ! visited[s]:
+                visited[s] = true
+                add(stackNodes, s)
+                add(stackNext, int32(0))
+        else:
+            add(post, v)
+            stackNodes.len = topIdx
+            stackNext.len = topIdx
+
+    var rpo: int32[]
+    i2 = post.len - 1
+    let __for_start_i2_1 = i2
+    for __for_i2_1 in 0..(__for_start_i2_1 - (0)):
+        i2 = __for_start_i2_1 - __for_i2_1
+        add(rpo, post[i2])
+        i2 = i2 - 1
+
+    # rpoIndex for intersect; unreachable blocks get a large index.
+    var rpoIndex: int32[]
+    i2 = 0
+    let __for_start_i2_2 = i2
+    for __for_i2_2 in __for_start_i2_2..<n:
+        i2 = __for_i2_2
+        add(rpoIndex, 1000000000)
+        i2 = i2 + 1
+    i2 = 0
+    let __for_start_i2_3 = i2
+    for __for_i2_3 in __for_start_i2_3..<rpo.len:
+        i2 = __for_i2_3
+        rpoIndex[rpo[i2]] = i2
+        i2 = i2 + 1
+
+    # idom via Cooper-Harvey-Kennedy.
+    var idom: int32[]
+    i2 = 0
+    let __for_start_i2_4 = i2
+    for __for_i2_4 in __for_start_i2_4..<n:
+        i2 = __for_i2_4
+        add(idom, -1)
+        i2 = i2 + 1
+    if entry >= 0 && entry < n:
+        idom[entry] = entry
+    var changed: bool = true
+    while changed:
+        changed = false
+        i2 = 0
+        let __for_start_i2_5 = i2
+        for __for_i2_5 in __for_start_i2_5..<rpo.len:
+            i2 = __for_i2_5
+            let b3: int32 = rpo[i2]
+            if b3 == entry:
+                i2 = i2 + 1
+                continue
+            let ps: int32[] = ssaGridIntRow(preds, b3)
+            var newIdom: int32 = -1
+            for pi in 0..<ps.len:
+                let p: int32 = ps[pi]
+                if p >= 0 && p < n && idom[p] != -1:
+                    if newIdom == -1:
+                        newIdom = p
+                    else:
+                        newIdom = ssaIntersect(p, newIdom, idom, rpoIndex)
+            if newIdom != -1 && idom[b3] != newIdom:
+                idom[b3] = newIdom
+                changed = true
+            i2 = i2 + 1
+
+    var domChildren: SsaGridInt32 = ssaNewSeq2DInt(n)
+    bi = 0
+    let __for_start_bi_6 = bi
+    for __for_bi_6 in __for_start_bi_6..<n:
+        bi = __for_bi_6
+        if bi != entry:
+            let p2: int32 = idom[bi]
+            if p2 >= 0 && p2 < n && p2 != bi:
+                ssa2dAddUniqueInt(&domChildren, p2, bi)
+        bi = bi + 1
+
+    # Dominance frontier.
+    var df: SsaGridInt32 = ssaNewSeq2DInt(n)
+    bi = 0
+    let __for_start_bi_7 = bi
+    for __for_bi_7 in __for_start_bi_7..<n:
+        bi = __for_bi_7
+        let ps2: int32[] = ssaGridIntRow(preds, bi)
+        if ps2.len >= 2:
+            for pi2 in 0..<ps2.len:
+                var runner: int32 = ps2[pi2]
+                while runner >= 0 && runner < n && runner != idom[bi]:
+                    ssa2dAddUniqueInt(&df, runner, bi)
+                    let next2: int32 = idom[runner]
+                    if next2 == runner:
+                        break
+                    runner = next2
+        bi = bi + 1
+
+    # Candidate locals: exclude addr-taken + object-local pointer slots.
+    var addrTaken: bool[]
+    i2 = 0
+    let __for_start_i2_8 = i2
+    for __for_i2_8 in __for_start_i2_8..<baseCount:
+        i2 = __for_i2_8
+        add(addrTaken, false)
+        i2 = i2 + 1
+    bi = 0
+    let __for_start_bi_9 = bi
+    for __for_bi_9 in __for_start_bi_9..<n:
+        bi = __for_bi_9
+        let bb: UirCoreBlock = func.blocks[bi]
+        if bb != nil:
+            for si in 0..<bb.stmts.len:
+                let s2: UirCoreStmt = bb.stmts[si]
+                if s2.kind == msLet || s2.kind == msVar || s2.kind == msAssign:
+                    ssaMarkAddrTaken(s2.expr, &addrTaken)
+                elif s2.kind == msStore:
+                    ssaMarkAddrTaken(s2.addrExpr, &addrTaken)
+                    ssaMarkAddrTaken(s2.expr, &addrTaken)
+                else:
+                    ssaMarkAddrTaken(s2.expr, &addrTaken)
+            if bb.term.kind == mtRet:
+                ssaMarkAddrTaken(bb.term.retExpr, &addrTaken)
+            elif bb.term.kind == mtCbr:
+                ssaMarkAddrTaken(bb.term.condExpr, &addrTaken)
+        bi = bi + 1
+
+    var isCandidate: bool[]
+    i2 = 0
+    let __for_start_i2_10 = i2
+    for __for_i2_10 in __for_start_i2_10..<baseCount:
+        i2 = __for_i2_10
+        add(isCandidate, true)
+        i2 = i2 + 1
+    i2 = 0
+    let __for_start_i2_11 = i2
+    for __for_i2_11 in __for_start_i2_11..<baseCount:
+        i2 = __for_i2_11
+        if addrTaken[i2]:
+            isCandidate[i2] = false
+        i2 = i2 + 1
+    for oi in 0..<func.objLocals.len:
+        let ol: UirCoreObjLocal = func.objLocals[oi]
+        if ol.slot >= 0 && ol.slot < baseCount:
+            isCandidate[ol.slot] = false
+
+    # defBlocks[var] = blocks defining base slot.
+    var defBlocks: SsaGridInt32 = ssaNewSeq2DInt(baseCount)
+    bi = 0
+    let __for_start_bi_12 = bi
+    for __for_bi_12 in __for_start_bi_12..<n:
+        bi = __for_bi_12
+        let bb2: UirCoreBlock = func.blocks[bi]
+        if bb2 != nil:
+            for si2 in 0..<bb2.stmts.len:
+                let s3: UirCoreStmt = bb2.stmts[si2]
+                if s3.kind == msLet || s3.kind == msVar || s3.kind == msAssign || s3.kind == msParam:
+                    let v: int32 = s3.slot
+                    if v >= 0 && v < baseCount && isCandidate[v]:
+                        ssa2dAddUniqueInt(&defBlocks, v, bi)
+        bi = bi + 1
+
+    # Place phi vars by dominance frontier.
+    var phiVarsByBlock: SsaGridInt32 = ssaNewSeq2DInt(n)
+    for vId in 0..<baseCount:
+        if ! isCandidate[vId]:
+            continue
+        let defs0: int32[] = ssaGridIntRow(defBlocks, vId)
+        if defs0.len <= 1:
+            continue
+        var isDef: bool[]
+        i2 = 0
+        let __for_start_i2_13 = i2
+        for __for_i2_13 in __for_start_i2_13..<n:
+            i2 = __for_i2_13
+            add(isDef, false)
+            i2 = i2 + 1
+        i2 = 0
+        let __for_start_i2_14 = i2
+        for __for_i2_14 in __for_start_i2_14..<defs0.len:
+            i2 = __for_i2_14
+            let d: int32 = defs0[i2]
+            if d >= 0 && d < n:
+                isDef[d] = true
+            i2 = i2 + 1
+
+        var hasPhi: bool[]
+        i2 = 0
+        let __for_start_i2_15 = i2
+        for __for_i2_15 in __for_start_i2_15..<n:
+            i2 = __for_i2_15
+            add(hasPhi, false)
+            i2 = i2 + 1
+
+        var work: int32[] = defs0
+        while work.len > 0:
+            let b4: int32 = work[work.len - 1]
+            work.len = work.len - 1
+            let frontier: int32[] = ssaGridIntRow(df, b4)
+            for fi in 0..<frontier.len:
+                let y: int32 = frontier[fi]
+                if y >= 0 && y < n && ! hasPhi[y]:
+                    ssa2dAddUniqueInt(&phiVarsByBlock, y, vId)
+                    hasPhi[y] = true
+                    if ! isDef[y]:
+                        add(work, y)
+
+    # Sort phi var lists deterministically and pre-allocate phi dest slots.
+    var phiDefsByBlock: SsaGridPhiDefs = ssaNewSeq2DPhiDef(n)
+    bi = 0
+    let __for_start_bi_16 = bi
+    for __for_bi_16 in __for_start_bi_16..<n:
+        bi = __for_bi_16
+        var vars: int32[] = ssaGridIntRow(phiVarsByBlock, bi)
+        ssaSortIntsStable(&vars)
+        ssaGridIntSetRow(&phiVarsByBlock, bi, vars)
+        var defsOut: SsaPhiDef[] = ssaGridPhiRow(phiDefsByBlock, bi)
+        for vi in 0..<vars.len:
+            let varId2: int32 = vars[vi]
+            let dest: int32 = ssaAllocSlot(func, varId2)
+            var pd: SsaPhiDef
+            pd.varId = varId2
+            pd.destSlot = dest
+            add(defsOut, pd)
+        ssaGridPhiSetRow(&phiDefsByBlock, bi, defsOut)
+        bi = bi + 1
+
+    # Renaming over dominator tree; record edge moves for phi elimination.
+    var ctx: SsaRenameCtx
+    new ctx
+    ctx.func = func
+    ctx.baseCount = baseCount
+    ctx.blockCount = n
+    ctx.idom = idom
+    ctx.domChildren = domChildren
+    ctx.succs = succs
+    ctx.phiDefsByBlock = phiDefsByBlock
+    ctx.isCandidate = isCandidate
+    i2 = 0
+    let __for_start_i2_17 = i2
+    for __for_i2_17 in __for_start_i2_17..<baseCount:
+        i2 = __for_i2_17
+        add(ctx.varTop, -1)
+        i2 = i2 + 1
+    i2 = 0
+    let __for_start_i2_18 = i2
+    for __for_i2_18 in __for_start_i2_18..<baseCount:
+        i2 = __for_i2_18
+        if isCandidate[i2]:
+            ssaPush(&ctx.varTop, &ctx.stackVal, &ctx.stackPrev, i2, i2)
+        i2 = i2 + 1
+
+    let rrAll: Result[bool] = ssaRenameBlock(ctx, entry)
+    if ! IsOk[bool](rrAll):
+        return rrAll
+
+    ssaSortEdgesStable(&ctx.edgeMoves)
+
+    # Apply phi elimination moves with safe placement:
+    # - from has single succ: append to from
+    # - else if to has single pred: prepend to to
+    # - else split edge and insert moves in new block
+    var succCount: int32[]
+    var predCount: int32[]
+    bi = 0
+    let __for_start_bi_19 = bi
+    for __for_bi_19 in __for_start_bi_19..<n:
+        bi = __for_bi_19
+        let succList2: int32[] = ssaGridIntRow(succs, bi)
+        let predList2: int32[] = ssaGridIntRow(preds, bi)
+        add(succCount, succList2.len)
+        add(predCount, predList2.len)
+        bi = bi + 1
+
+    for ei in 0..<ctx.edgeMoves.len:
+        let em2: SsaEdgeMoves = ctx.edgeMoves[ei]
+        if em2 == nil || em2.moves.len == 0:
+            continue
+        let fromBlk: UirCoreBlock = func.blocks[em2.fromIdx]
+        if fromBlk == nil:
+            continue
+        let fromSucc: int32 = succCount[em2.fromIdx]
+        let toPred: int32 = predCount[em2.toIdx]
+        if fromSucc == 1:
+            for mi in 0..<em2.moves.len:
+                let mv: SsaMove = em2.moves[mi]
+                add(fromBlk.stmts, uirCoreStmtAssign("", mv.destSlot, uirCoreLocal(mv.srcSlot)))
+            continue
+        if toPred == 1:
+            let toBlk: UirCoreBlock = func.blocks[em2.toIdx]
+            if toBlk == nil:
+                return Err[bool]("uirCore_ssa: missing to block (" + func.name + ")")
+            var newStmts: UirCoreStmt[]
+            for mi2 in 0..<em2.moves.len:
+                let mv2: SsaMove = em2.moves[mi2]
+                add(newStmts, uirCoreStmtAssign("", mv2.destSlot, uirCoreLocal(mv2.srcSlot)))
+            mi2 = 0
+            let __for_start_mi2_20 = mi2
+            for __for_mi2_20 in __for_start_mi2_20..<toBlk.stmts.len:
+                mi2 = __for_mi2_20
+                add(newStmts, toBlk.stmts[mi2])
+                mi2 = mi2 + 1
+            toBlk.stmts = newStmts
+            continue
+
+        # Split edge.
+        let h: int64 = uirCoreFnv1a64(func.name + ":" + em2.fromLabel + "->" + em2.toLabel)
+        var newLabel: str = "ssa_phi_edge_" + uirCoreU64ToHex(h)
+        var stmtsOut: UirCoreStmt[]
+        for mi3 in 0..<em2.moves.len:
+            let mv3: SsaMove = em2.moves[mi3]
+            add(stmtsOut, uirCoreStmtAssign("", mv3.destSlot, uirCoreLocal(mv3.srcSlot)))
+        let nb: UirCoreBlock = uirCoreBlockWithStmts(newLabel, stmtsOut, uirCoreTermBr(em2.toLabel))
+        uirCoreAddBlock(func, nb)
+        if fromBlk.term.kind == mtBr:
+            if (fromBlk.term.target == em2.toLabel):
+                fromBlk.term.target = uirCoreOwnStr(newLabel)
+        elif fromBlk.term.kind == mtCbr:
+            if (fromBlk.term.targetTrue == em2.toLabel):
+                fromBlk.term.targetTrue = uirCoreOwnStr(newLabel)
+            if (fromBlk.term.targetFalse == em2.toLabel):
+                fromBlk.term.targetFalse = uirCoreOwnStr(newLabel)
+
+    return Ok[bool](true)
+
+fn uirCoreSsaLowerModule(module: UirCoreModule): Result[bool] =
+    if module == nil:
+        return Ok[bool](true)
+    for i in 0..<module.funcs.len:
+        let f: UirCoreFunc = module.funcs[i]
+        let r: Result[bool] = uirCoreSsaLowerFunc(module, f)
+        if ! IsOk[bool](r):
+            return r
+    return Ok[bool](true)

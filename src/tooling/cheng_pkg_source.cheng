@@ -1,0 +1,292 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/pkg_source_local as dsrc
+import cheng/decentralized/pkg_manifest as dman
+import cheng/decentralized/registry_local as dreg
+import cheng/libp2p/utils/result as result
+import std/strings
+import std/seqs
+
+
+type
+    Args =
+        cmd: str
+        src: str
+        manifestRef: str
+        packageId: str
+        authorId: str
+        channel: str
+        epoch: int32
+        privKeyText: str
+        registryPath: str
+        outPath: str
+        manifestOut: str
+        lockPath: str
+        root: str
+        mode: str
+        listenAddr: str
+        maxStreams: int32
+        excludes: str[]
+        sourceAddrs: str[]
+        sourcePeers: str[]
+        storageListenAddr: str
+        storagePeers: str[]
+        ok: bool
+        error: str
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng_pkg_source <command> [args]")
+    printLine("")
+    printLine("commands:")
+    printLine("  manifest --src:<dir> --package:<id> [--source-addr:<addr>]")
+    printLine("           [--exclude:<name>] [--out:<file>]")
+    printLine("  publish  --src:<dir> --package:<id> --author:<id> --channel:<edge|stable|lts> --epoch:<n>")
+    printLine("           --priv:<key> [--registry:<path>] [--source-addr:<addr>] [--manifest-out:<file>]")
+    printLine("           [--root:<dir>] [--mode:local]")
+    printLine("  serve    (moved to p2p toolchain; unsupported in local-only core binary)")
+    printLine("  fetch    --manifest:<file|cid> --out:<dir> [--root:<dir>] [--mode:local]")
+    printLine("  lock-verify --lock:<file> [--registry:<path>]")
+
+fn parseInt(text: str): int32 =
+    if text == nil || len(text) == 0:
+        return 0
+    var i: int32 = 0
+    var sign: int32 = 1
+    if text[0] == '-':
+        sign = -1
+        i = 1
+    var value: int32 = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<len(text):
+        i = __for_i_1
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            break
+        value = value * 10 + (int32(ch) - int32('0'))
+        i = i + 1
+    return value * sign
+
+fn parseArgs(): Args =
+    var res: Args
+    res.ok = true
+    res.registryPath = "build/cheng_registry/registry.jsonl"
+    res.root = "build/cheng_storage"
+    res.mode = "local"
+    res.maxStreams = 0
+    res.excludes = []
+    res.sourceAddrs = []
+    res.sourcePeers = []
+    res.storagePeers = []
+    let count = cmdline.paramCount()
+    if count <= 0:
+        res.ok = false
+        res.error = "missing command"
+        return res
+    res.cmd = cmdline.paramStr(1)
+    for i in 2..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--src:"):
+            res.src = str(ptr_add(arg, len("--src:")))
+        elif strutil.startsWith(arg, "--manifest:"):
+            res.manifestRef = str(ptr_add(arg, len("--manifest:")))
+        elif strutil.startsWith(arg, "--package:"):
+            res.packageId = str(ptr_add(arg, len("--package:")))
+        elif strutil.startsWith(arg, "--author:"):
+            res.authorId = str(ptr_add(arg, len("--author:")))
+        elif strutil.startsWith(arg, "--channel:"):
+            res.channel = str(ptr_add(arg, len("--channel:")))
+        elif strutil.startsWith(arg, "--epoch:"):
+            res.epoch = parseInt(str(ptr_add(arg, len("--epoch:"))))
+        elif strutil.startsWith(arg, "--priv:"):
+            res.privKeyText = str(ptr_add(arg, len("--priv:")))
+        elif strutil.startsWith(arg, "--registry:"):
+            res.registryPath = str(ptr_add(arg, len("--registry:")))
+        elif strutil.startsWith(arg, "--out:"):
+            res.outPath = str(ptr_add(arg, len("--out:")))
+        elif strutil.startsWith(arg, "--manifest-out:"):
+            res.manifestOut = str(ptr_add(arg, len("--manifest-out:")))
+        elif strutil.startsWith(arg, "--lock:"):
+            res.lockPath = str(ptr_add(arg, len("--lock:")))
+        elif strutil.startsWith(arg, "--exclude:"):
+            res.excludes.add(str(ptr_add(arg, len("--exclude:"))))
+        elif strutil.startsWith(arg, "--source-addr:"):
+            res.sourceAddrs.add(str(ptr_add(arg, len("--source-addr:"))))
+        elif strutil.startsWith(arg, "--source-peer:"):
+            res.sourcePeers.add(str(ptr_add(arg, len("--source-peer:"))))
+        elif strutil.startsWith(arg, "--root:"):
+            res.root = str(ptr_add(arg, len("--root:")))
+        elif strutil.startsWith(arg, "--mode:"):
+            res.mode = str(ptr_add(arg, len("--mode:")))
+        elif strutil.startsWith(arg, "--listen:"):
+            res.listenAddr = str(ptr_add(arg, len("--listen:")))
+        elif strutil.startsWith(arg, "--storage-listen:"):
+            res.storageListenAddr = str(ptr_add(arg, len("--storage-listen:")))
+        elif strutil.startsWith(arg, "--peer:"):
+            res.storagePeers.add(str(ptr_add(arg, len("--peer:"))))
+        elif strutil.startsWith(arg, "--max:"):
+            res.maxStreams = parseInt(str(ptr_add(arg, len("--max:"))))
+    return res
+
+fn writeOutput(path: str, text: str) =
+    if path != nil && len(path) > 0:
+        let dir = os.parentDir(path)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(path, text)
+    else:
+        printLine(text)
+
+fn readManifestFromRef(args: Args): result.Result[dsrc.SourceManifest] =
+    if args.manifestRef == nil || len(args.manifestRef) == 0:
+        return result.Err[dsrc.SourceManifest]("pkg-source: missing manifest")
+    if os.fileExists(args.manifestRef):
+        return dsrc.loadSourceManifestFile(args.manifestRef)
+    return dsrc.loadSourceManifestFromStore(args.root, args.manifestRef)
+
+fn cmdManifest(args: Args): int32 =
+    if args.src == nil || len(args.src) == 0:
+        printErr("manifest: missing --src")
+        return 1
+    if args.packageId == nil || len(args.packageId) == 0:
+        printErr("manifest: missing --package")
+        return 1
+    let manRes: result.Result[dsrc.SourceManifest] =
+        dsrc.buildSourceManifest(args.src, args.packageId, args.sourceAddrs, args.excludes)
+    if result.IsErr(manRes):
+        printErr("manifest: build failed")
+        return 1
+    let text = dsrc.manifestToText(result.Value(manRes))
+    writeOutput(args.outPath, text)
+    return 0
+
+fn cmdPublish(args: Args): int32 =
+    if args.src == nil || len(args.src) == 0:
+        printErr("publish: missing --src")
+        return 1
+    if args.packageId == nil || len(args.packageId) == 0:
+        printErr("publish: missing --package")
+        return 1
+    if args.authorId == nil || len(args.authorId) == 0:
+        printErr("publish: missing --author")
+        return 1
+    if args.channel == nil || len(args.channel) == 0:
+        printErr("publish: missing --channel")
+        return 1
+    if args.privKeyText == nil || len(args.privKeyText) == 0:
+        printErr("publish: missing --priv")
+        return 1
+    if args.mode != nil && len(args.mode) > 0 && args.mode != "local":
+        printErr("publish: only --mode:local is supported in core binary")
+        return 2
+    let manRes: result.Result[dsrc.SourceManifest] =
+        dsrc.buildSourceManifest(args.src, args.packageId, args.sourceAddrs, args.excludes)
+    if result.IsErr(manRes):
+        printErr("publish: build manifest failed")
+        return 1
+    let manifest = result.Value(manRes)
+    let text = dsrc.manifestToText(manifest)
+    if args.manifestOut != nil && len(args.manifestOut) > 0:
+        writeOutput(args.manifestOut, text)
+    let storeRes: result.Result[str] = dsrc.storeManifestToStore(args.root, text)
+    if result.IsErr(storeRes):
+        printErr("publish: store manifest failed")
+        return 1
+    let cidText = result.Value(storeRes)
+    if cidText == nil || len(cidText) == 0:
+        printErr("publish: missing manifest cid")
+        return 1
+    var snap: dreg.PackageSnapshot
+    snap.packageId = args.packageId
+    snap.authorId = args.authorId
+    snap.channel = args.channel
+    snap.epoch = args.epoch
+    snap.cidText = cidText
+    snap.format = "source"
+    let pubRes: result.Result[dreg.PackageSnapshot] = dreg.publishSnapshot(args.registryPath, snap, args.privKeyText)
+    if result.IsErr(pubRes):
+        printErr("publish: registry publish failed")
+        return 1
+    let node = dreg.snapshotToJson(result.Value(pubRes))
+    writeOutput(args.outPath, json.pretty(node))
+    return 0
+
+fn cmdServe(args: Args): int32 =
+    printErr("serve: moved to p2p toolchain; unsupported in local-only core binary")
+    return 2
+
+fn cmdFetch(args: Args): int32 =
+    if args.manifestRef == nil || len(args.manifestRef) == 0:
+        printErr("fetch: missing --manifest")
+        return 1
+    if args.outPath == nil || len(args.outPath) == 0:
+        printErr("fetch: missing --out")
+        return 1
+    if args.mode != nil && len(args.mode) > 0 && args.mode != "local":
+        printErr("fetch: only --mode:local is supported in core binary")
+        return 2
+    let manRes = readManifestFromRef(args)
+    if result.IsErr(manRes):
+        printErr("fetch: load manifest failed")
+        return 1
+    let manifest = result.Value(manRes)
+    let fetchRes = dsrc.fetchPkgSourceLocal(manifest, args.root, args.outPath)
+    if result.IsErr(fetchRes):
+        printErr("fetch: failed")
+        return 1
+    return 0
+
+fn cmdLockVerify(args: Args): int32 =
+    if args.lockPath == nil || len(args.lockPath) == 0:
+        printErr("lock-verify: missing --lock")
+        return 1
+    let lockRes: result.Result[dman.PackageLock] = dman.loadLockFile(args.lockPath)
+    if result.IsErr(lockRes):
+        printErr(result.Error(lockRes))
+        return 1
+    let lock = result.Value(lockRes)
+    let conflicts = dman.collectDependencyConflicts(lock)
+    if conflicts.len > 0:
+        printErr("lock-verify: dependency conflicts detected")
+        printErr(dman.dependencyConflictsToText(conflicts))
+        return 1
+    if ! dman.verifyLock(lock):
+        printErr("lock-verify: signature verification failed")
+        return 1
+    if args.registryPath != nil && len(args.registryPath) > 0:
+        if ! dman.verifyLockAgainstRegistry(lock, args.registryPath):
+            printErr("lock-verify: registry mismatch")
+            return 1
+    printLine("lock ok")
+    return 0
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let args: Args = parseArgs()
+    if ! args.ok:
+        printUsage()
+        if args.error != nil && len(args.error) > 0:
+            printErr(args.error)
+        return 1
+    if args.cmd == "--help" || args.cmd == "-h" || args.cmd == "help":
+        printUsage()
+        return 0
+    if args.cmd == "manifest":
+        return cmdManifest(args)
+    if args.cmd == "publish":
+        return cmdPublish(args)
+    if args.cmd == "serve":
+        return cmdServe(args)
+    if args.cmd == "fetch":
+        return cmdFetch(args)
+    if args.cmd == "lock-verify":
+        return cmdLockVerify(args)
+    printUsage()
+    return 1

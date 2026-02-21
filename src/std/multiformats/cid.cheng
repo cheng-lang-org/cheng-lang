@@ -1,0 +1,136 @@
+# CID parsing/encoding(minimal v0/v1).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/strings
+import std/varint
+import std/multiformats/multibase
+import std/multiformats/multicodec
+import std/multiformats/multihash
+type
+    Cid =
+        version: int32
+        codec: MultiCodec
+        multihash: MultiHash
+
+fn isCidContentCodec(codec: MultiCodec): bool =
+    if codec.code == codecRaw.code: return true
+    if codec.code == codecDagPb.code: return true
+    if codec.code == codecDagCbor.code: return true
+    if codec.code == codecDagJson.code: return true
+    if codec.code == codecLibp2pKey.code: return true
+    if codec.code == codecGitRaw.code: return true
+    if codec.code == codecEthBlock.code: return true
+    if codec.code == codecEthBlockList.code: return true
+    if codec.code == codecEthTxTrie.code: return true
+    if codec.code == codecEthTx.code: return true
+    if codec.code == codecEthTxReceiptTrie.code: return true
+    if codec.code == codecEthTxReceipt.code: return true
+    if codec.code == codecEthStateTrie.code: return true
+    if codec.code == codecEthAccountSnapshot.code: return true
+    if codec.code == codecEthStorageTrie.code: return true
+    if codec.code == codecBitcoinBlock.code: return true
+    if codec.code == codecBitcoinTx.code: return true
+    if codec.code == codecZcashBlock.code: return true
+    if codec.code == codecZcashTx.code: return true
+    if codec.code == codecStellarBlock.code: return true
+    if codec.code == codecStellarTx.code: return true
+    if codec.code == codecDecredBlock.code: return true
+    if codec.code == codecDecredTx.code: return true
+    if codec.code == codecDashBlock.code: return true
+    if codec.code == codecDashTx.code: return true
+    if codec.code == codecTorrentInfo.code: return true
+    if codec.code == codecTorrentFile.code: return true
+    if codec.code == codecEd25519Pub.code: return true
+    return false
+
+fn decodeCidV0(data: Bytes): Result[Cid] =
+    let mhRes: Result[MultiHash] = decodeMultihash(data)
+    if IsErr(mhRes):
+        return Err[Cid](Error(mhRes))
+    let mh: MultiHash = Value(mhRes)
+    if bytesLen(encodeMultihash(mh)) != bytesLen(data):
+        return Err[Cid]("cidv0: trailing bytes")
+    if mh.code != codecSha2_256.code || mh.length != 32:
+        return Err[Cid]("cidv0: expected sha2-256/32")
+    return Ok[Cid](Cid(version: 0, codec: codecDagPb, multihash: mh))
+
+fn decodeCidV1(data: Bytes): Result[Cid] =
+    let verRes: Result[VarintDecoded] = decodeUVarint(data, 0)
+    if IsErr(verRes):
+        return Err[Cid](Error(verRes))
+    let verDec: VarintDecoded = Value(verRes)
+    if verDec.value != 1:
+        return Err[Cid]("cidv1: invalid version")
+    let codecRes: Result[VarintDecoded] = decodeUVarint(data, verDec.next)
+    if IsErr(codecRes):
+        return Err[Cid](Error(codecRes))
+    let codecDec: VarintDecoded = Value(codecRes)
+    let codecLookup: Result[MultiCodec] = codecByCode(codecDec.value)
+    if IsErr(codecLookup):
+        return Err[Cid](Error(codecLookup))
+    if ! isCidContentCodec(Value(codecLookup)):
+        return Err[Cid]("cidv1: unsupported codec")
+    let start: int32 = codecDec.next
+    let mhBytes: Bytes = bytesSlice(data, start, bytesLen(data) - start)
+    let mhRes: Result[MultiHash] = decodeMultihash(mhBytes)
+    if IsErr(mhRes):
+        return Err[Cid](Error(mhRes))
+    let mh: MultiHash = Value(mhRes)
+    if bytesLen(encodeMultihash(mh)) != bytesLen(mhBytes):
+        return Err[Cid]("cidv1: trailing bytes")
+    return Ok[Cid](Cid(version: 1, codec: Value(codecLookup), multihash: mh))
+
+fn parseCid(text: str): Result[Cid] =
+    if len(text) <= 0:
+        return Err[Cid]("cid: empty")
+    if len(text) >= 2 && text[0] == 'Q' && text[1] == 'm':
+        let b58Res: Result[Bytes] = decodeBase58(text)
+        if IsErr(b58Res):
+            return Err[Cid](Error(b58Res))
+        return decodeCidV0(Value(b58Res))
+    let mbRes: Result[Bytes] = decodeMultibase(text)
+    if IsOk(mbRes):
+        let cidRes: Result[Cid] = decodeCidV1(Value(mbRes))
+        if IsOk(cidRes):
+            return cidRes
+    let b58Res: Result[Bytes] = decodeBase58(text)
+    if IsErr(b58Res):
+        return Err[Cid]("cid: invalid encoding")
+    return decodeCidV0(Value(b58Res))
+
+fn cidFromBytes(data: Bytes): Result[Cid] =
+    if bytesLen(data) <= 0:
+        return Err[Cid]("cid: empty")
+    let verRes: Result[VarintDecoded] = decodeUVarint(data, 0)
+    if IsOk(verRes) && Value(verRes).value == 1:
+        return decodeCidV1(data)
+    return decodeCidV0(data)
+
+fn cidToBytes(cid: Cid): Result[Bytes] =
+    if cid.version == 0:
+        return Ok[Bytes](encodeMultihash(cid.multihash))
+    if cid.version != 1:
+        return Err[Bytes]("cid: unsupported version")
+    if ! isCidContentCodec(cid.codec):
+        return Err[Bytes]("cid: unsupported codec")
+    let verBytes: Bytes = encodeUVarint(1)
+    let codecBytes: Bytes = encodeUVarint(cid.codec.code)
+    let mhBytes: Bytes = encodeMultihash(cid.multihash)
+    var buf: ByteBuffer = newByteBuffer()
+    appendBytes(buf, verBytes)
+    appendBytes(buf, codecBytes)
+    appendBytes(buf, mhBytes)
+    return Ok[Bytes](toBytes(buf))
+
+fn cidToString(cid: Cid, base: MultiBaseCodec): Result[str] =
+    if cid.version == 0:
+        if cid.multihash.code != codecSha2_256.code || cid.multihash.length != 32:
+            return Err[str]("cidv0: expected sha2-256/32")
+        let mhBytes: Bytes = encodeMultihash(cid.multihash)
+        return Ok[str](encodeBase58(mhBytes))
+    let bytesRes: Result[Bytes] = cidToBytes(cid)
+    if IsErr(bytesRes):
+        return Err[str](Error(bytesRes))
+    return encodeMultibase(base, Value(bytesRes))

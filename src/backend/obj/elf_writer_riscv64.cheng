@@ -1,0 +1,1262 @@
+# ELF64 relocatable (.o) writer for RISC-V64 (MVP subset).
+import std/seqs
+import std/strings
+import std/result
+import cheng/backend/machine/machine_types
+import cheng/backend/obj/obj_buf
+import cheng/backend/obj/riscv64_enc
+
+type
+    ElfReloc = ref
+        off: uint64
+        sym: str
+        rtype: uint32
+        addend: int64
+
+    ElfSym = ref
+        name: str
+        bind: uint8
+        stType: uint8
+        shndx: uint16
+        value: uint64
+        size: uint64
+        nameOff: uint32
+
+const
+    RV64_ELFCLASS64: uint8 = 2
+    RV64_ELFDATA2LSB: uint8 = 1
+    RV64_EV_CURRENT: uint32 = 1
+    RV64_ET_REL: uint16 = 1
+    EM_RISCV: uint16 = 243
+
+    RV64_SHT_NULL: uint32 = 0
+    RV64_SHT_PROGBITS: uint32 = 1
+    RV64_SHT_SYMTAB: uint32 = 2
+    RV64_SHT_STRTAB: uint32 = 3
+    RV64_SHT_RELA: uint32 = 4
+    RV64_SHT_NOBITS: uint32 = 8
+
+    RV64_SHF_WRITE: uint64 = 0x1
+    RV64_SHF_ALLOC: uint64 = 0x2
+    RV64_SHF_EXECINSTR: uint64 = 0x4
+    RV64_STB_LOCAL: uint8 = 0
+    RV64_STB_GLOBAL: uint8 = 1
+
+    RV64_STT_NOTYPE: uint8 = 0
+    RV64_STT_OBJECT: uint8 = 1
+    RV64_STT_FUNC: uint8 = 2
+    RV64_STT_SECTION: uint8 = 3
+
+    R_RISCV_PCREL_HI20: uint32 = 23
+    R_RISCV_PCREL_LO12_I: uint32 = 24
+    R_RISCV_CALL: uint32 = 18
+
+fn rv64_elfFindLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
+    for i in 0..<labels.len:
+        if ! (i < offs.len):
+            break
+        if (labels[i] == label):
+            return Ok[int32](offs[i])
+    return Err[int32]("elf_writer: missing label: " + label)
+
+fn rv64_elfStrContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
+        if j == m:
+            return true
+    return false
+
+fn rv64_elfTargetIsDarwin(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return rv64_elfStrContains(target, "apple") || rv64_elfStrContains(target, "darwin") || rv64_elfStrContains(target, "ios")
+
+fn rv64_elfStrCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    for i in 0..<n:
+        let ca: int32 = int32(int64(a[i]) & int64(0xFF))
+        let cb: int32 = int32(int64(b[i]) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn rv64_elfSeqContainsStr(items: str[], value: str): bool =
+    for i in 0..<items.len:
+        if (items[i] == value):
+            return true
+    return false
+
+
+fn rv64_elfReadStrPtr(items: var str[], idx: int32): str =
+    if items == nil:
+        panic "elf_writer_riscv64: nil seq pointer"
+    return items[int(idx)]
+
+fn rv64_elfWriteStrPtr(items: var str[], idx: int32, val: str) =
+    if items == nil:
+        panic "elf_writer_riscv64: nil seq pointer"
+    items[int(idx)] = val
+
+fn rv64_elfAddStrPtr(items: var str[], value: str) =
+    if items == nil:
+        return
+    add(items, value)
+
+fn rv64_elfAddSymPtr(outSyms: var ElfSym[], s: ElfSym) =
+    if outSyms == nil:
+        return
+    add(outSyms, s)
+
+fn rv64_elfSeqAddUniqueStr(items: var str[], value: str) =
+    if items == nil || value == nil || len(value) == 0:
+        return
+    if rv64_elfSeqContainsStr(items, value):
+        return
+    rv64_elfAddStrPtr(items, value)
+
+fn rv64_elfSortStringsStable(items: var str[]) =
+    if items == nil:
+        return
+    for i in 1..<items.len:
+        let key: str = rv64_elfReadStrPtr(items, i)
+        var j: int32 = i - 1
+        let __for_start_j = j
+        for __for_rev_j in 0..(__for_start_j - (0)):
+            j = __for_start_j - __for_rev_j
+            if !(rv64_elfStrCmp(rv64_elfReadStrPtr(items, j), key) > 0):
+                break
+            rv64_elfWriteStrPtr(items, j + 1, rv64_elfReadStrPtr(items, j))
+        rv64_elfWriteStrPtr(items, j + 1, key)
+
+fn rv64_elfAlignUp(value: uint64, align: uint64): uint64 =
+    if align == 0:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn rv64_elfWriteShdr(out: var uint8[], nameOff: uint32, shType: uint32, flags: uint64,
+                shOffset: uint64, shSize: uint64, link: uint32, info: uint32,
+                addralign: uint64, entsize: uint64) =
+    if out == nil:
+        return
+    bufU32(out, nameOff)
+    bufU32(out, shType)
+    bufU64(out, flags)
+    bufU64(out, uint64(0)) # sh_addr
+    bufU64(out, shOffset)
+    bufU64(out, shSize)
+    bufU32(out, link)
+    bufU32(out, info)
+    bufU64(out, addralign)
+    bufU64(out, entsize)
+
+fn rv64_elfAddSectionSym(outSyms: var ElfSym[], shndx: uint16) =
+    var s: ElfSym
+    new s
+    s.name = ""
+    s.bind = RV64_STB_LOCAL
+    s.stType = RV64_STT_SECTION
+    s.shndx = shndx
+    s.value = 0
+    s.size = 0
+    s.nameOff = 0
+    rv64_elfAddSymPtr(outSyms, s)
+
+fn rv64_elfAddSym(outSyms: var ElfSym[], name: str, bind: uint8, stType: uint8,
+             shndx: uint16, value: uint64, size: uint64) =
+    var s: ElfSym
+    new s
+    s.name = name
+    s.bind = bind
+    s.stType = stType
+    s.shndx = shndx
+    s.value = value
+    s.size = size
+    s.nameOff = 0
+    rv64_elfAddSymPtr(outSyms, s)
+
+fn rv64_elfFindSymIndex(syms: ElfSym[], name: str): int32 =
+    if name == nil:
+        return -1
+    for i in 0..<syms.len:
+        let s: ElfSym = syms[i]
+        if s != nil && (s.name == name):
+            return i
+    return -1
+
+fn rv64ReadU32LEAtSeq(buf: uint8[], off: uint64): uint32 =
+    if off + 4 > uint64(buf.len):
+        return uint32(0)
+    let b0: uint32 = uint32(buf[int32(off + 0)])
+    let b1: uint32 = uint32(buf[int32(off + 1)])
+    let b2: uint32 = uint32(buf[int32(off + 2)])
+    let b3: uint32 = uint32(buf[int32(off + 3)])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn rv64EmitLoadImm32(out: var uint8[], rd: int32, v: int32) =
+    if out == nil:
+        return
+    if v >= -2048 && v <= 2047:
+        emitU32LE(out, rv64EncAddi(rd, 0, v))
+        return
+    let hi20: int32 = rv64CalcHi20(int64(v))
+    let lo12: int32 = rv64CalcLo12(int64(v), hi20)
+    emitU32LE(out, rv64EncLui(rd, hi20))
+    emitU32LE(out, rv64EncAddi(rd, rd, lo12))
+
+fn rv64EmitLoadImm64(out: var uint8[], rd: int32, v: int64) =
+    if out == nil:
+        return
+    if rv64FitsSigned(v, 12):
+        emitU32LE(out, rv64EncAddi(rd, 0, int32(v)))
+        return
+    if rv64FitsSigned(v, 32):
+        rv64EmitLoadImm32(out, rd, int32(v))
+        return
+    let tmp: int32 = rv64Tmp1()
+    let uv: uint64 = uint64(v)
+    let hi: int32 = int32((uv >> uint64(32)) & uint64(0xFFFFFFFF))
+    let lo: int32 = int32(uv & uint64(0xFFFFFFFF))
+    rv64EmitLoadImm32(out, rd, hi)
+    emitU32LE(out, rv64EncSlli(rd, rd, 32))
+    rv64EmitLoadImm32(out, tmp, lo)
+    emitU32LE(out, rv64EncSlli(tmp, tmp, 32))
+    emitU32LE(out, rv64EncSrli(tmp, tmp, 32))
+    emitU32LE(out, rv64EncOr(rd, rd, tmp))
+
+fn rv64Imm12Fits(v: int64): bool =
+    return v >= -2048 && v <= 2047
+
+fn rv64IsMemOp(op: MachineOp): bool =
+    case op
+    of machineOpStr, machineOpLdr, machineOpStrb, machineOpLdrb, machineOpLdrsb, machineOpStrh, machineOpLdrh, machineOpLdrsh:
+        return true
+    else:
+        return false
+
+fn rv64IsFloatOp(op: MachineOp): bool =
+    case op
+    of machineOpFmovDx, machineOpFmovXd, machineOpFcmpD, machineOpFaddD, machineOpFsubD, machineOpFmulD, machineOpFdivD, machineOpFnegD, machineOpScvtfDx:
+        return true
+    else:
+        return false
+
+fn rv64InstWordCount(inst: MachineInst): int32 =
+    if inst == nil:
+        return 0
+    if inst.op == machineOpLabel || inst.op == machineOpCmp || inst.op == machineOpFcmpD:
+        return 0
+    if inst.op == machineOpMovImm:
+        return rv64LoadImm64Count(inst.imm)
+    if inst.op == machineOpBl || inst.op == machineOpB:
+        return 2
+    if inst.op == machineOpBCond:
+        return 3
+    if inst.op == machineOpMsub:
+        return 2
+    if inst.op == machineOpSubSp || inst.op == machineOpAddSp:
+        if inst.imm <= 0:
+            return 0
+        if rv64Imm12Fits(inst.imm):
+            return 1
+        return rv64LoadImm64Count(inst.imm) + 1
+    if rv64IsMemOp(inst.op):
+        if rv64Imm12Fits(inst.imm):
+            return 1
+        return rv64LoadImm64Count(inst.imm) + 2
+    return 1
+
+fn rv64InvertCond(cond: MachineCond): Result[MachineCond] =
+    case cond
+    of machineCondEq: return Ok[MachineCond](machineCondNe)
+    of machineCondNe: return Ok[MachineCond](machineCondEq)
+    of machineCondLt: return Ok[MachineCond](machineCondGe)
+    of machineCondLe: return Ok[MachineCond](machineCondGt)
+    of machineCondGt: return Ok[MachineCond](machineCondLe)
+    of machineCondGe: return Ok[MachineCond](machineCondLt)
+    of machineCondLo: return Ok[MachineCond](machineCondHs)
+    of machineCondLs: return Ok[MachineCond](machineCondHi)
+    of machineCondHi: return Ok[MachineCond](machineCondLs)
+    of machineCondHs: return Ok[MachineCond](machineCondLo)
+    return Err[MachineCond]("elf_writer_riscv64: unsupported invert cond")
+
+fn rv64EncodeCondBranch(cond: MachineCond, rs1In: int32, rs2In: int32, deltaBytes: int64): Result[uint32] =
+    var rs1: int32 = rs1In
+    var rs2: int32 = rs2In
+    var funct3: uint32 = uint32(0)
+    case cond
+    of machineCondEq:
+        funct3 = uint32(0)
+    of machineCondNe:
+        funct3 = uint32(1)
+    of machineCondLt:
+        funct3 = uint32(4)
+    of machineCondLe:
+        funct3 = uint32(5)
+        let t: int32 = rs1
+        rs1 = rs2
+        rs2 = t
+    of machineCondGt:
+        funct3 = uint32(4)
+        let t2: int32 = rs1
+        rs1 = rs2
+        rs2 = t2
+    of machineCondGe:
+        funct3 = uint32(5)
+    of machineCondLo:
+        funct3 = uint32(6)
+    of machineCondLs:
+        funct3 = uint32(7)
+        let t3: int32 = rs1
+        rs1 = rs2
+        rs2 = t3
+    of machineCondHi:
+        funct3 = uint32(6)
+        let t4: int32 = rs1
+        rs1 = rs2
+        rs2 = t4
+    of machineCondHs:
+        funct3 = uint32(7)
+    of machineCondMi:
+        funct3 = uint32(4)
+        rs2 = 0
+    else:
+        return Err[uint32]("elf_writer_riscv64: unsupported cond")
+    return rv64EncBranch(funct3, rs1, rs2, deltaBytes)
+
+fn rv64PatchCallPairAt(text: var uint8[], auipcOff: uint64, placeAddr: int64, targetAddr: int64): Result[bool] =
+    if text == nil:
+        return Err[bool]("elf_writer_riscv64: nil text")
+    if auipcOff + 8 > uint64(text.len):
+        return Err[bool]("elf_writer_riscv64: call patch out of range")
+    let delta: int64 = targetAddr - placeAddr
+    let hi20: int32 = rv64CalcHi20(delta)
+    let lo12: int32 = rv64CalcLo12(delta, hi20)
+    if lo12 < -2048 || lo12 > 2047:
+        return Err[bool]("elf_writer_riscv64: call lo12 out of range")
+    let w0: uint32 = rv64ReadU32LEAtSeq(text, auipcOff)
+    let w1: uint32 = rv64ReadU32LEAtSeq(text, auipcOff + 4)
+    obj_buf.bufU32At(text, int32(auipcOff), rv64PatchUImm20(w0, hi20))
+    obj_buf.bufU32At(text, int32(auipcOff + 4), rv64PatchIImm12(w1, lo12))
+    return Ok[bool](true)
+
+fn rv64_elfBuild(module: MachineModule): Result[uint8[]] =
+    if module == nil:
+        return Err[uint8[]]("elf_writer: nil module")
+    if rv64_elfTargetIsDarwin(module.target):
+        return Err[uint8[]]("elf_writer: darwin target not supported")
+
+    # Sections (fixed indices):
+    # 0: null
+    # 1: .text
+    # 2: .rodata
+    # 3: .data
+    # 4: .bss
+    # 5: .rela.text
+    # 6: .symtab
+    # 7: .strtab
+    # 8: .shstrtab
+
+    var text: uint8[]
+    var rodata: uint8[]
+    var data: uint8[]
+    var bssSize: uint64 = 0
+
+    # Layout rodata (cstrings).
+    var cSymOffs: uint64[]
+    cSymOffs.len = int(module.cstrs.len)
+    for ci in 0..<module.cstrs.len:
+        let c: MachineCString = module.cstrs[ci]
+        let off: uint64 = uint64(rodata.len)
+        cSymOffs[ci] = off
+        bufStr0(&rodata, c.value)
+
+    # Layout globals.
+    var dataSymOffs: uint64[]
+    dataSymOffs.len = int(module.globals.len)
+    var bssSymOffs: uint64[]
+    bssSymOffs.len = int(module.globals.len)
+    var maxDataAlign: uint64 = 1
+    var maxBssAlign: uint64 = 1
+    for gi in 0..<module.globals.len:
+        let g: MachineGlobal = module.globals[gi]
+        let align: uint64 = uint64(1) << uint64(g.alignPow2)
+        if g.hasInit:
+            if align > maxDataAlign:
+                maxDataAlign = align
+            bufAlign(&data, align)
+            dataSymOffs[gi] = uint64(data.len)
+            if g.size == 4:
+                bufU32(&data, uint32(int32(g.init)))
+            else:
+                bufU64(&data, uint64(g.init))
+        else:
+            if align > maxBssAlign:
+                maxBssAlign = align
+            bssSize = rv64_elfAlignUp(bssSize, align)
+            bssSymOffs[gi] = bssSize
+            bssSize = bssSize + uint64(g.size)
+
+    # Encode .text and collect relocations.
+    var relocs: ElfReloc[]
+
+    # Track function start offsets.
+    var funcOffs: uint64[]
+    funcOffs.len = int(module.funcs.len)
+    for fi in 0..<module.funcs.len:
+        bufAlign(text, 4)
+        funcOffs[fi] = uint64(text.len)
+        let f: MachineFunc = module.funcs[fi]
+
+        # Pass 1: compute label offsets within this function (in bytes from func start).
+        var labels: str[16]
+        var labelOffs: int32[16]
+        var scanOff: int32 = 0
+        var scanLastFCmpValid: bool = false
+        for si in 0..<f.insts.len:
+            let inst0: MachineInst = f.insts[si]
+            if inst0.op == machineOpLabel:
+                add(labels, inst0.label)
+                add(labelOffs, scanOff)
+                continue
+            if inst0.op == machineOpCmp:
+                scanLastFCmpValid = false
+                continue
+            if inst0.op == machineOpFcmpD:
+                scanLastFCmpValid = true
+                continue
+            if inst0.op == machineOpBCond:
+                if scanLastFCmpValid:
+                    scanOff = scanOff + 16
+                else:
+                    scanOff = scanOff + 12
+                continue
+            scanOff = scanOff + (rv64InstWordCount(inst0) * 4)
+
+        var ii: int32 = 0
+        var curOff: int32 = 0
+        var lastCmpValid: bool = false
+        var lastCmpRs1: int32 = 0
+        var lastCmpRs2: int32 = 0
+        var lastFCmpValid: bool = false
+        var lastFCmpFs1: int32 = 0
+        var lastFCmpFs2: int32 = 0
+        for __for_guard_ii in 0..<f.insts.len:
+            if !(ii < f.insts.len):
+                break
+            let inst: MachineInst = f.insts[ii]
+            if inst.op == machineOpLabel:
+                ii = ii + 1
+                continue
+            if inst.op == machineOpCmp:
+                let rs1c: int32 = rv64RegNum(inst.rn)
+                let rs2c: int32 = rv64RegNum(inst.rm)
+                if rs1c < 0 || rs2c < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid cmp reg")
+                lastCmpValid = true
+                lastFCmpValid = false
+                lastCmpRs1 = rs1c
+                lastCmpRs2 = rs2c
+                ii = ii + 1
+                continue
+            let off: uint64 = uint64(text.len)
+            if inst.op == machineOpSubSp:
+                if inst.imm > 0:
+                    if rv64Imm12Fits(inst.imm):
+                        emitU32LE(text, rv64EncAddi(2, 2, int32(0 - inst.imm)))
+                        curOff = curOff + 4
+                    else:
+                        rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                        curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                        emitU32LE(text, rv64EncSub(2, 2, rv64Tmp1()))
+                        curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpAddSp:
+                if inst.imm > 0:
+                    if rv64Imm12Fits(inst.imm):
+                        emitU32LE(text, rv64EncAddi(2, 2, int32(inst.imm)))
+                        curOff = curOff + 4
+                    else:
+                        rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                        curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                        emitU32LE(text, rv64EncAdd(2, 2, rv64Tmp1()))
+                        curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpMovReg:
+                if rv64IsFloat(inst.rd) || rv64IsFloat(inst.rn):
+                    return Err[uint8[]]("elf_writer_riscv64: float move not supported")
+                let rd0: int32 = rv64RegNum(inst.rd)
+                let rn0: int32 = rv64RegNum(inst.rn)
+                if rd0 < 0 || rn0 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid mov reg")
+                emitU32LE(text, rv64EncAddi(rd0, rn0, 0))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpMovImm:
+                if rv64IsFloat(inst.rd):
+                    return Err[uint8[]]("elf_writer_riscv64: float mov imm not supported")
+                let rd1: int32 = rv64RegNum(inst.rd)
+                if rd1 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid mov imm reg")
+                rv64EmitLoadImm64(text, rd1, inst.imm)
+                curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpAdrp:
+                let rd2: int32 = rv64RegNum(inst.rd)
+                if rd2 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid pcrel_hi reg")
+                emitU32LE(text, rv64EncAuipc(rd2, 0))
+                var r: ElfReloc
+                new r
+                r.off = off
+                r.sym = inst.label
+                r.rtype = R_RISCV_PCREL_HI20
+                r.addend = 0
+                add(relocs, r)
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpAddPageOff:
+                let rd3: int32 = rv64RegNum(inst.rd)
+                let rn3: int32 = rv64RegNum(inst.rn)
+                if rd3 < 0 || rn3 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid addpageoff reg")
+                emitU32LE(text, rv64EncAddi(rd3, rn3, 0))
+                var r2: ElfReloc
+                new r2
+                r2.off = off
+                r2.sym = inst.label
+                r2.rtype = R_RISCV_PCREL_LO12_I
+                r2.addend = 0
+                add(relocs, r2)
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpSxtw:
+                let rd4: int32 = rv64RegNum(inst.rd)
+                let rn4: int32 = rv64RegNum(inst.rn)
+                if rd4 < 0 || rn4 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid sxtw reg")
+                emitU32LE(text, rv64EncAddiw(rd4, rn4, 0))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpAdd:
+                let rd5: int32 = rv64RegNum(inst.rd)
+                let rn5: int32 = rv64RegNum(inst.rn)
+                let rm5: int32 = rv64RegNum(inst.rm)
+                if rd5 < 0 || rn5 < 0 || rm5 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid add reg")
+                emitU32LE(text, rv64EncAdd(rd5, rn5, rm5))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpSub:
+                let rd6: int32 = rv64RegNum(inst.rd)
+                let rn6: int32 = rv64RegNum(inst.rn)
+                let rm6: int32 = rv64RegNum(inst.rm)
+                if rd6 < 0 || rn6 < 0 || rm6 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid sub reg")
+                emitU32LE(text, rv64EncSub(rd6, rn6, rm6))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpMul:
+                let rd7: int32 = rv64RegNum(inst.rd)
+                let rn7: int32 = rv64RegNum(inst.rn)
+                let rm7: int32 = rv64RegNum(inst.rm)
+                if rd7 < 0 || rn7 < 0 || rm7 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid mul reg")
+                emitU32LE(text, rv64EncMul(rd7, rn7, rm7))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpSdiv:
+                let rd8: int32 = rv64RegNum(inst.rd)
+                let rn8: int32 = rv64RegNum(inst.rn)
+                let rm8: int32 = rv64RegNum(inst.rm)
+                if rd8 < 0 || rn8 < 0 || rm8 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid sdiv reg")
+                emitU32LE(text, rv64EncDiv(rd8, rn8, rm8))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpUdiv:
+                let rd9: int32 = rv64RegNum(inst.rd)
+                let rn9: int32 = rv64RegNum(inst.rn)
+                let rm9: int32 = rv64RegNum(inst.rm)
+                if rd9 < 0 || rn9 < 0 || rm9 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid udiv reg")
+                emitU32LE(text, rv64EncDivu(rd9, rn9, rm9))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpMsub:
+                let rd10: int32 = rv64RegNum(inst.rd)
+                let rn10: int32 = rv64RegNum(inst.rn)
+                let rm10: int32 = rv64RegNum(inst.rm)
+                let ra10: int32 = rv64RegNum(inst.ra)
+                if rd10 < 0 || rn10 < 0 || rm10 < 0 || ra10 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid msub reg")
+                emitU32LE(text, rv64EncMul(rv64Tmp1(), rn10, rm10))
+                emitU32LE(text, rv64EncSub(rd10, ra10, rv64Tmp1()))
+                curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpAnd:
+                let rd11: int32 = rv64RegNum(inst.rd)
+                let rn11: int32 = rv64RegNum(inst.rn)
+                let rm11: int32 = rv64RegNum(inst.rm)
+                if rd11 < 0 || rn11 < 0 || rm11 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid and reg")
+                emitU32LE(text, rv64EncAnd(rd11, rn11, rm11))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpOrr:
+                let rd12: int32 = rv64RegNum(inst.rd)
+                let rn12: int32 = rv64RegNum(inst.rn)
+                let rm12: int32 = rv64RegNum(inst.rm)
+                if rd12 < 0 || rn12 < 0 || rm12 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid or reg")
+                emitU32LE(text, rv64EncOr(rd12, rn12, rm12))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpEor:
+                let rd13: int32 = rv64RegNum(inst.rd)
+                let rn13: int32 = rv64RegNum(inst.rn)
+                let rm13: int32 = rv64RegNum(inst.rm)
+                if rd13 < 0 || rn13 < 0 || rm13 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid xor reg")
+                emitU32LE(text, rv64EncXor(rd13, rn13, rm13))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpLsl:
+                let rd14: int32 = rv64RegNum(inst.rd)
+                let rn14: int32 = rv64RegNum(inst.rn)
+                let rm14: int32 = rv64RegNum(inst.rm)
+                if rd14 < 0 || rn14 < 0 || rm14 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid shl reg")
+                emitU32LE(text, rv64EncSll(rd14, rn14, rm14))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpLsr:
+                let rd15: int32 = rv64RegNum(inst.rd)
+                let rn15: int32 = rv64RegNum(inst.rn)
+                let rm15: int32 = rv64RegNum(inst.rm)
+                if rd15 < 0 || rn15 < 0 || rm15 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid lsr reg")
+                emitU32LE(text, rv64EncSrl(rd15, rn15, rm15))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpAsr:
+                let rd16: int32 = rv64RegNum(inst.rd)
+                let rn16: int32 = rv64RegNum(inst.rn)
+                let rm16: int32 = rv64RegNum(inst.rm)
+                if rd16 < 0 || rn16 < 0 || rm16 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid asr reg")
+                emitU32LE(text, rv64EncSra(rd16, rn16, rm16))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFmovDx:
+                let fd0: int32 = rv64FRegNum(inst.rd)
+                let rsx0: int32 = rv64RegNum(inst.rn)
+                if fd0 < 0 || rsx0 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fmov.d.x reg")
+                emitU32LE(text, rv64EncFmvDX(fd0, rsx0))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFmovXd:
+                let rdx0: int32 = rv64RegNum(inst.rd)
+                let fsx0: int32 = rv64FRegNum(inst.rn)
+                if rdx0 < 0 || fsx0 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fmov.x.d reg")
+                emitU32LE(text, rv64EncFmvXD(rdx0, fsx0))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFaddD:
+                let fd1: int32 = rv64FRegNum(inst.rd)
+                let fs1a: int32 = rv64FRegNum(inst.rn)
+                let fs2a: int32 = rv64FRegNum(inst.rm)
+                if fd1 < 0 || fs1a < 0 || fs2a < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fadd.d reg")
+                emitU32LE(text, rv64EncFaddD(fd1, fs1a, fs2a))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFsubD:
+                let fd2: int32 = rv64FRegNum(inst.rd)
+                let fs1b: int32 = rv64FRegNum(inst.rn)
+                let fs2b: int32 = rv64FRegNum(inst.rm)
+                if fd2 < 0 || fs1b < 0 || fs2b < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fsub.d reg")
+                emitU32LE(text, rv64EncFsubD(fd2, fs1b, fs2b))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFmulD:
+                let fd3: int32 = rv64FRegNum(inst.rd)
+                let fs1c: int32 = rv64FRegNum(inst.rn)
+                let fs2c: int32 = rv64FRegNum(inst.rm)
+                if fd3 < 0 || fs1c < 0 || fs2c < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fmul.d reg")
+                emitU32LE(text, rv64EncFmulD(fd3, fs1c, fs2c))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFdivD:
+                let fd4: int32 = rv64FRegNum(inst.rd)
+                let fs1d: int32 = rv64FRegNum(inst.rn)
+                let fs2d: int32 = rv64FRegNum(inst.rm)
+                if fd4 < 0 || fs1d < 0 || fs2d < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fdiv.d reg")
+                emitU32LE(text, rv64EncFdivD(fd4, fs1d, fs2d))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFnegD:
+                let fd5: int32 = rv64FRegNum(inst.rd)
+                let fs1e: int32 = rv64FRegNum(inst.rn)
+                if fd5 < 0 || fs1e < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fneg.d reg")
+                emitU32LE(text, rv64EncFnegD(fd5, fs1e))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpScvtfDx:
+                let fd6: int32 = rv64FRegNum(inst.rd)
+                let rsx6: int32 = rv64RegNum(inst.rn)
+                if fd6 < 0 || rsx6 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fcvt.d.l reg")
+                emitU32LE(text, rv64EncScvtfDx(fd6, rsx6))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpFcmpD:
+                let fsCmp0: int32 = rv64FRegNum(inst.rn)
+                let fsCmp1: int32 = rv64FRegNum(inst.rm)
+                if fsCmp0 < 0 || fsCmp1 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid fcmp.d reg")
+                lastCmpValid = false
+                lastFCmpValid = true
+                lastFCmpFs1 = fsCmp0
+                lastFCmpFs2 = fsCmp1
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpBCond:
+                let toffRes: Result[int32] = rv64_elfFindLabelOff(labels, labelOffs, inst.label)
+                if !IsOk[int32](toffRes):
+                    return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes))
+                let targetOff: int32 = Value[int32](toffRes)
+                if lastFCmpValid:
+                    let tmpBool: int32 = rv64Tmp1()
+                    var skipCondF: MachineCond = machineCondEq
+                    if inst.cond == machineCondEq:
+                        emitU32LE(text, rv64EncFeqD(tmpBool, lastFCmpFs1, lastFCmpFs2))
+                        skipCondF = machineCondEq
+                    elif inst.cond == machineCondNe:
+                        emitU32LE(text, rv64EncFeqD(tmpBool, lastFCmpFs1, lastFCmpFs2))
+                        skipCondF = machineCondNe
+                    elif inst.cond == machineCondLt || inst.cond == machineCondMi:
+                        emitU32LE(text, rv64EncFltD(tmpBool, lastFCmpFs1, lastFCmpFs2))
+                        skipCondF = machineCondEq
+                    elif inst.cond == machineCondLe:
+                        emitU32LE(text, rv64EncFleD(tmpBool, lastFCmpFs1, lastFCmpFs2))
+                        skipCondF = machineCondEq
+                    elif inst.cond == machineCondGt:
+                        emitU32LE(text, rv64EncFltD(tmpBool, lastFCmpFs2, lastFCmpFs1))
+                        skipCondF = machineCondEq
+                    elif inst.cond == machineCondGe:
+                        emitU32LE(text, rv64EncFleD(tmpBool, lastFCmpFs2, lastFCmpFs1))
+                        skipCondF = machineCondEq
+                    else:
+                        return Err[uint8[]]("elf_writer_riscv64: unsupported float bcond")
+                    let skipResF: Result[uint32] = rv64EncodeCondBranch(skipCondF, tmpBool, 0, int64(12))
+                    if !IsOk[uint32](skipResF):
+                        return ErrInfo[uint8[]](ErrorInfoOf[uint32](skipResF))
+                    emitU32LE(text, Value[uint32](skipResF))
+                    emitU32LE(text, rv64EncAuipc(rv64Tmp0(), 0))
+                    emitU32LE(text, rv64EncJalr(0, rv64Tmp0(), 0))
+                    let patchResF: Result[bool] = rv64PatchCallPairAt(text, off + uint64(8), int64(curOff + 8), int64(targetOff))
+                    if !IsOk[bool](patchResF):
+                        return ErrInfo[uint8[]](ErrorInfoOf[bool](patchResF))
+                    curOff = curOff + 16
+                else:
+                    if !lastCmpValid:
+                        return Err[uint8[]]("elf_writer_riscv64: bcond missing cmp")
+                    let invRes: Result[MachineCond] = rv64InvertCond(inst.cond)
+                    if !IsOk[MachineCond](invRes):
+                        return ErrInfo[uint8[]](ErrorInfoOf[MachineCond](invRes))
+                    let skipRes: Result[uint32] = rv64EncodeCondBranch(Value[MachineCond](invRes),
+                                                                       lastCmpRs1, lastCmpRs2,
+                                                                       int64(12))
+                    if !IsOk[uint32](skipRes):
+                        return ErrInfo[uint8[]](ErrorInfoOf[uint32](skipRes))
+                    emitU32LE(text, Value[uint32](skipRes))
+                    emitU32LE(text, rv64EncAuipc(rv64Tmp0(), 0))
+                    emitU32LE(text, rv64EncJalr(0, rv64Tmp0(), 0))
+                    let patchRes0: Result[bool] = rv64PatchCallPairAt(text, off + uint64(4), int64(curOff + 4), int64(targetOff))
+                    if !IsOk[bool](patchRes0):
+                        return ErrInfo[uint8[]](ErrorInfoOf[bool](patchRes0))
+                    curOff = curOff + 12
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpB:
+                let toffRes2: Result[int32] = rv64_elfFindLabelOff(labels, labelOffs, inst.label)
+                if !IsOk[int32](toffRes2):
+                    return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes2))
+                let targetOff2: int32 = Value[int32](toffRes2)
+                emitU32LE(text, rv64EncAuipc(rv64Tmp0(), 0))
+                emitU32LE(text, rv64EncJalr(0, rv64Tmp0(), 0))
+                let patchRes1: Result[bool] = rv64PatchCallPairAt(text, off, int64(curOff), int64(targetOff2))
+                if !IsOk[bool](patchRes1):
+                    return ErrInfo[uint8[]](ErrorInfoOf[bool](patchRes1))
+                curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpStr:
+                let rd17: int32 = rv64RegNum(inst.rd)
+                let rn17: int32 = rv64RegNum(inst.rn)
+                if rd17 < 0 || rn17 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid str reg")
+                if rv64Imm12Fits(inst.imm):
+                    if rv64Is32(inst.rd):
+                        emitU32LE(text, rv64EncSw(rd17, rn17, int32(inst.imm)))
+                    else:
+                        emitU32LE(text, rv64EncSd(rd17, rn17, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn17, rv64Tmp1()))
+                    if rv64Is32(inst.rd):
+                        emitU32LE(text, rv64EncSw(rd17, rv64Tmp1(), 0))
+                    else:
+                        emitU32LE(text, rv64EncSd(rd17, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpLdr:
+                let rd18: int32 = rv64RegNum(inst.rd)
+                let rn18: int32 = rv64RegNum(inst.rn)
+                if rd18 < 0 || rn18 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldr reg")
+                if rv64Imm12Fits(inst.imm):
+                    if rv64Is32(inst.rd):
+                        emitU32LE(text, rv64EncLw(rd18, rn18, int32(inst.imm)))
+                    else:
+                        emitU32LE(text, rv64EncLd(rd18, rn18, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn18, rv64Tmp1()))
+                    if rv64Is32(inst.rd):
+                        emitU32LE(text, rv64EncLw(rd18, rv64Tmp1(), 0))
+                    else:
+                        emitU32LE(text, rv64EncLd(rd18, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpStrb:
+                let rd19: int32 = rv64RegNum(inst.rd)
+                let rn19: int32 = rv64RegNum(inst.rn)
+                if rd19 < 0 || rn19 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid strb reg")
+                if rv64Imm12Fits(inst.imm):
+                    emitU32LE(text, rv64EncSb(rd19, rn19, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn19, rv64Tmp1()))
+                    emitU32LE(text, rv64EncSb(rd19, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpLdrb:
+                let rd20: int32 = rv64RegNum(inst.rd)
+                let rn20: int32 = rv64RegNum(inst.rn)
+                if rd20 < 0 || rn20 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrb reg")
+                if rv64Imm12Fits(inst.imm):
+                    emitU32LE(text, rv64EncLbu(rd20, rn20, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn20, rv64Tmp1()))
+                    emitU32LE(text, rv64EncLbu(rd20, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpLdrsb:
+                let rd21: int32 = rv64RegNum(inst.rd)
+                let rn21: int32 = rv64RegNum(inst.rn)
+                if rd21 < 0 || rn21 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrsb reg")
+                if rv64Imm12Fits(inst.imm):
+                    emitU32LE(text, rv64EncLb(rd21, rn21, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn21, rv64Tmp1()))
+                    emitU32LE(text, rv64EncLb(rd21, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpStrh:
+                let rd22: int32 = rv64RegNum(inst.rd)
+                let rn22: int32 = rv64RegNum(inst.rn)
+                if rd22 < 0 || rn22 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid strh reg")
+                if rv64Imm12Fits(inst.imm):
+                    emitU32LE(text, rv64EncSh(rd22, rn22, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn22, rv64Tmp1()))
+                    emitU32LE(text, rv64EncSh(rd22, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpLdrh:
+                let rd23: int32 = rv64RegNum(inst.rd)
+                let rn23: int32 = rv64RegNum(inst.rn)
+                if rd23 < 0 || rn23 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrh reg")
+                if rv64Imm12Fits(inst.imm):
+                    emitU32LE(text, rv64EncLhu(rd23, rn23, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn23, rv64Tmp1()))
+                    emitU32LE(text, rv64EncLhu(rd23, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpLdrsh:
+                let rd24: int32 = rv64RegNum(inst.rd)
+                let rn24: int32 = rv64RegNum(inst.rn)
+                if rd24 < 0 || rn24 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid ldrsh reg")
+                if rv64Imm12Fits(inst.imm):
+                    emitU32LE(text, rv64EncLh(rd24, rn24, int32(inst.imm)))
+                    curOff = curOff + 4
+                else:
+                    rv64EmitLoadImm64(text, rv64Tmp1(), inst.imm)
+                    curOff = curOff + rv64LoadImm64Count(inst.imm) * 4
+                    emitU32LE(text, rv64EncAdd(rv64Tmp1(), rn24, rv64Tmp1()))
+                    emitU32LE(text, rv64EncLh(rd24, rv64Tmp1(), 0))
+                    curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpBl:
+                emitU32LE(text, rv64EncAuipc(1, 0))
+                emitU32LE(text, rv64EncJalr(1, 1, 0))
+                var r3: ElfReloc
+                new r3
+                r3.off = off
+                r3.sym = inst.label
+                r3.rtype = R_RISCV_CALL
+                r3.addend = 0
+                add(relocs, r3)
+                curOff = curOff + 8
+                ii = ii + 1
+                continue
+            elif inst.op == machineOpBlr:
+                let rn25: int32 = rv64RegNum(inst.rn)
+                if rn25 < 0:
+                    return Err[uint8[]]("elf_writer_riscv64: invalid blr reg")
+                emitU32LE(text, rv64EncJalr(1, rn25, 0))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            elif rv64IsFloatOp(inst.op):
+                return Err[uint8[]]("elf_writer_riscv64: float machine op unsupported in riscv64 writer")
+            elif inst.op == machineOpRet:
+                emitU32LE(text, rv64EncJalr(0, 1, 0))
+                curOff = curOff + 4
+                ii = ii + 1
+                continue
+            else:
+                return Err[uint8[]]("elf_writer_riscv64: unsupported machine op (op=" + intToStr(int32(inst.op)) + ")")
+
+    # Build symbol list.
+    var syms: ElfSym[]
+    # null
+    rv64_elfAddSym(syms, "", RV64_STB_LOCAL, RV64_STT_NOTYPE, uint16(0), 0, 0)
+    # section symbols
+    rv64_elfAddSectionSym(syms, uint16(1))
+    rv64_elfAddSectionSym(syms, uint16(2))
+    rv64_elfAddSectionSym(syms, uint16(3))
+    rv64_elfAddSectionSym(syms, uint16(4))
+
+    # local rodata symbols
+    for ci in 0..<module.cstrs.len:
+        let c2: MachineCString = module.cstrs[ci]
+        rv64_elfAddSym(syms, c2.label, RV64_STB_LOCAL, RV64_STT_OBJECT, uint16(2),
+                  cSymOffs[ci], 0)
+
+    # globals: funcs
+    for fi in 0..<module.funcs.len:
+        let f2: MachineFunc = module.funcs[fi]
+        rv64_elfAddSym(syms, f2.name, RV64_STB_GLOBAL, RV64_STT_FUNC, uint16(1),
+                  funcOffs[fi], 0)
+
+    # globals: data/bss
+    for gi in 0..<module.globals.len:
+        let g2: MachineGlobal = module.globals[gi]
+        if g2.hasInit:
+            rv64_elfAddSym(syms, g2.name, RV64_STB_GLOBAL, RV64_STT_OBJECT, uint16(3),
+                      dataSymOffs[gi], uint64(g2.size))
+        else:
+            rv64_elfAddSym(syms, g2.name, RV64_STB_GLOBAL, RV64_STT_OBJECT, uint16(4),
+                      bssSymOffs[gi], uint64(g2.size))
+
+    # undefined symbols referenced by relocations.
+    var undefs: str[]
+    for ri in 0..<relocs.len:
+        let r0: ElfReloc = relocs[ri]
+        if r0 != nil && r0.sym != nil && len(r0.sym) > 0:
+            if rv64_elfFindSymIndex(syms, r0.sym) < 0:
+                rv64_elfSeqAddUniqueStr(&undefs, r0.sym)
+    rv64_elfSortStringsStable(&undefs)
+    for ri in 0..<undefs.len:
+        rv64_elfAddSym(syms, undefs[ri], RV64_STB_GLOBAL, RV64_STT_NOTYPE, uint16(0), 0, 0)
+
+    # Build .strtab (symbol names) and fill nameOff.
+    var strtab: uint8[]
+    add(strtab, uint8(0))
+    for si in 0..<syms.len:
+        let s3: ElfSym = syms[si]
+        if s3 != nil:
+            if s3.name != nil && len(s3.name) > 0:
+                s3.nameOff = uint32(strtab.len)
+                bufStr0(strtab, s3.name)
+            else:
+                s3.nameOff = 0
+            syms[si] = s3
+
+    # Count locals for symtab.sh_info (first global index).
+    var localCount: uint32 = 0
+    for si in 0..<syms.len:
+        let s4: ElfSym = syms[si]
+        if s4 != nil && s4.bind == RV64_STB_LOCAL:
+            localCount = localCount + 1
+
+    # Build .symtab
+    var symtab: uint8[]
+    for si in 0..<syms.len:
+        let s5: ElfSym = syms[si]
+        let info: uint8 = uint8((uint8(s5.bind) << 4) | uint8(s5.stType & uint8(0xF)))
+        bufU32(&symtab, s5.nameOff)
+        bufU8(&symtab, info)
+        bufU8(&symtab, uint8(0))
+        bufU16(&symtab, s5.shndx)
+        bufU64(&symtab, s5.value)
+        bufU64(&symtab, s5.size)
+
+    # Build .rela.text
+    var relaText: uint8[]
+    ri = 0
+    let __for_start_ri_1 = ri
+    for __for_ri_1 in __for_start_ri_1..<relocs.len:
+        ri = __for_ri_1
+        let r4: ElfReloc = relocs[ri]
+        let symIdx: int32 = rv64_elfFindSymIndex(syms, r4.sym)
+        if symIdx < 0:
+            return Err[uint8[]]("elf_writer: missing relocation symbol")
+        let info2: uint64 = (uint64(uint32(symIdx)) << 32) | uint64(r4.rtype)
+        bufU64(&relaText, r4.off)
+        bufU64(&relaText, info2)
+        bufI64(&relaText, r4.addend)
+        ri = ri + 1
+
+    # Build .shstrtab
+    var shstrtab: uint8[]
+    add(shstrtab, uint8(0))
+    let sh_text: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".text")
+    let sh_rodata: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".rodata")
+    let sh_data: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".data")
+    let sh_bss: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".bss")
+    let sh_rela_text: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".rela.text")
+    let sh_symtab: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".symtab")
+    let sh_strtab: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".strtab")
+    let sh_shstrtab: uint32 = uint32(shstrtab.len)
+    bufStr0(&shstrtab, ".shstrtab")
+
+    # Section offsets.
+    var off: uint64 = 64
+    let textOff: uint64 = rv64_elfAlignUp(off, 4)
+    off = textOff + uint64(text.len)
+    let rodataOff: uint64 = rv64_elfAlignUp(off, 1)
+    off = rodataOff + uint64(rodata.len)
+    let dataOff: uint64 = rv64_elfAlignUp(off, maxDataAlign)
+    off = dataOff + uint64(data.len)
+    let bssOff: uint64 = rv64_elfAlignUp(off, maxBssAlign)
+    # NOBITS: does not advance file offset.
+    let relaOff: uint64 = rv64_elfAlignUp(bssOff, 8)
+    off = relaOff + uint64(relaText.len)
+    let symOff: uint64 = rv64_elfAlignUp(off, 8)
+    off = symOff + uint64(symtab.len)
+    let strOff: uint64 = rv64_elfAlignUp(off, 1)
+    off = strOff + uint64(strtab.len)
+    let shstrOff: uint64 = rv64_elfAlignUp(off, 1)
+    off = shstrOff + uint64(shstrtab.len)
+    let shOff: uint64 = rv64_elfAlignUp(off, 8)
+
+    # Build final file.
+    var out: uint8[]
+
+    # ELF header (64 bytes).
+    bufU8(out, uint8(0x7F))
+    bufU8(out, uint8('E'))
+    bufU8(out, uint8('L'))
+    bufU8(out, uint8('F'))
+    bufU8(out, RV64_ELFCLASS64)
+    bufU8(out, RV64_ELFDATA2LSB)
+    bufU8(out, uint8(1)) # EI_VERSION
+    bufU8(out, uint8(0)) # EI_OSABI
+    bufU8(out, uint8(0)) # EI_ABIVERSION
+    # padding (7)
+    for pad in 0..<7:
+        bufU8(out, uint8(0))
+    bufU16(out, RV64_ET_REL)
+    bufU16(out, EM_RISCV)
+    bufU32(out, RV64_EV_CURRENT)
+    bufU64(out, uint64(0)) # e_entry
+    bufU64(out, uint64(0)) # e_phoff
+    bufU64(out, shOff)     # e_shoff
+    bufU32(out, uint32(0)) # e_flags
+    bufU16(out, uint16(64)) # e_ehsize
+    bufU16(out, uint16(0))  # e_phentsize
+    bufU16(out, uint16(0))  # e_phnum
+    bufU16(out, uint16(64)) # e_shentsize
+    bufU16(out, uint16(9))  # e_shnum
+    bufU16(out, uint16(8))  # e_shstrndx
+
+    # Sections data.
+    bufAlign(out, 4)
+    if uint64(out.len) != textOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.text)")
+    bufBytes(out, text)
+
+    bufAlign(out, 1)
+    if uint64(out.len) != rodataOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.rodata)")
+    bufBytes(out, rodata)
+
+    bufAlign(out, maxDataAlign)
+    if uint64(out.len) != dataOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.data)")
+    bufBytes(out, data)
+
+    # .bss: no bytes, but keep alignment point.
+    bufAlign(out, maxBssAlign)
+    if uint64(out.len) != bssOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.bss)")
+
+    bufAlign(out, 8)
+    if uint64(out.len) != relaOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.rela.text)")
+    bufBytes(out, relaText)
+
+    bufAlign(out, 8)
+    if uint64(out.len) != symOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.symtab)")
+    bufBytes(out, symtab)
+
+    bufAlign(out, 1)
+    if uint64(out.len) != strOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.strtab)")
+    bufBytes(out, strtab)
+
+    bufAlign(out, 1)
+    if uint64(out.len) != shstrOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (.shstrtab)")
+    bufBytes(out, shstrtab)
+
+    bufAlign(out, 8)
+    if uint64(out.len) != shOff:
+        return Err[uint8[]]("elf_writer: internal offset mismatch (shoff)")
+
+    # [0] null
+    rv64_elfWriteShdr(out, uint32(0), RV64_SHT_NULL, uint64(0), uint64(0), uint64(0),
+                 uint32(0), uint32(0), uint64(0), uint64(0))
+    # [1] .text
+    rv64_elfWriteShdr(out, sh_text, RV64_SHT_PROGBITS, RV64_SHF_ALLOC | RV64_SHF_EXECINSTR, textOff, uint64(text.len),
+                 uint32(0), uint32(0), uint64(4), uint64(0))
+    # [2] .rodata
+    rv64_elfWriteShdr(out, sh_rodata, RV64_SHT_PROGBITS, RV64_SHF_ALLOC, rodataOff, uint64(rodata.len),
+                 uint32(0), uint32(0), uint64(1), uint64(0))
+    # [3] .data
+    rv64_elfWriteShdr(out, sh_data, RV64_SHT_PROGBITS, RV64_SHF_ALLOC | RV64_SHF_WRITE, dataOff, uint64(data.len),
+                 uint32(0), uint32(0), maxDataAlign, uint64(0))
+    # [4] .bss
+    rv64_elfWriteShdr(out, sh_bss, RV64_SHT_NOBITS, RV64_SHF_ALLOC | RV64_SHF_WRITE, bssOff, bssSize,
+                 uint32(0), uint32(0), maxBssAlign, uint64(0))
+    # [5] .rela.text (link=symtab, info=.text)
+    rv64_elfWriteShdr(out, sh_rela_text, RV64_SHT_RELA, uint64(0), relaOff, uint64(relaText.len),
+                 uint32(6), uint32(1), uint64(8), uint64(24))
+    # [6] .symtab (link=strtab, info=local count)
+    rv64_elfWriteShdr(out, sh_symtab, RV64_SHT_SYMTAB, uint64(0), symOff, uint64(symtab.len),
+                 uint32(7), localCount, uint64(8), uint64(24))
+    # [7] .strtab
+    rv64_elfWriteShdr(out, sh_strtab, RV64_SHT_STRTAB, uint64(0), strOff, uint64(strtab.len),
+                 uint32(0), uint32(0), uint64(1), uint64(0))
+    # [8] .shstrtab
+    rv64_elfWriteShdr(out, sh_shstrtab, RV64_SHT_STRTAB, uint64(0), shstrOff, uint64(shstrtab.len),
+                 uint32(0), uint32(0), uint64(1), uint64(0))
+
+    return Ok[uint8[]](out)
+
+fn elfWriteRiscv64RelocatableObj(module: MachineModule): Result[uint8[]] =
+    return rv64_elfBuild(module)

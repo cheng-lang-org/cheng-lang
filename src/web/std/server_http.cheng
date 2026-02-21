@@ -1,0 +1,407 @@
+import std/strutils as strutil
+import cheng/web/std/web_url
+import std/strings
+import std/seqs
+
+type
+    HttpMethod = enum
+        hmGet
+        hmPost
+        hmPut
+        hmDelete
+        hmPatch
+        hmOptions
+        hmHead
+        hmAny
+
+    HttpHeader =
+        key: str
+        value: str
+
+    HttpHeaders =
+        items: HttpHeader[]
+
+    HttpRequest =
+        method: HttpMethod
+        path: str
+        query: str
+        headers: HttpHeaders
+        body: str
+
+    HttpResponse =
+        status: int32
+        headers: HttpHeaders
+        body: str
+
+    ServerHandler = fn (req: HttpRequest): HttpResponse
+
+fn indexOfChar(s: str, target: char, start: int32): int32 =
+    if s == nil:
+        return -1
+    for i in start..<len(s):
+        if s[i] == target:
+            return i
+    return -1
+
+fn indexOfSubstr(s: str, needle: str, start: int32): int32 =
+    if s == nil || needle == nil:
+        return -1
+    let nLen: int32 = len(needle)
+    if nLen == 0:
+        return start
+    let sLen: int32 = len(s)
+    if start < 0 || start >= sLen:
+        return -1
+    if nLen > sLen:
+        return -1
+    var i: int32 = start
+    let limit: int32 = sLen - nLen
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..limit:
+        i = __for_i_1
+        var j: int32 = 0
+        var matched: bool = true
+        let __for_guard_start_j_1 = j
+        for __for_guard_j_1 in __for_guard_start_j_1..<nLen:
+            if ! (j < nLen):
+                break
+            if s[i + j] != needle[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return i
+        i = i + 1
+    return -1
+
+fn newHeaders(): HttpHeaders =
+    var out: HttpHeaders
+    out.items = []
+    return out
+
+fn headerKeyEquals(a: str, b: str): bool =
+    if a == nil || b == nil:
+        return false
+    if len(a) != len(b):
+        return false
+    for i in 0..<len(a):
+        var ca = a[i]
+        var cb = b[i]
+        if ca >= 'A' && ca <= 'Z':
+            ca = chr(int32(ca) + 32)
+        if cb >= 'A' && cb <= 'Z':
+            cb = chr(int32(cb) + 32)
+        if ca != cb:
+            return false
+    return true
+
+fn headerGet(headers: HttpHeaders, key: str): str =
+    if key == nil:
+        return ""
+    for i in 0..<len(headers.items):
+        let item = headers.items[i]
+        if headerKeyEquals(item.key, key):
+            return item.value
+    return ""
+
+fn headerGetInt(headers: HttpHeaders, key: str, defaultValue: int32 = 0): int32 =
+    let raw = headerGet(headers, key)
+    if raw == nil || len(raw) == 0:
+        return defaultValue
+    var i: int32 = 0
+    var sign: int32 = 1
+    if raw[0] == '-':
+        sign = -1
+        i = 1
+    var value: int32 = 0
+    var had: bool = false
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<len(raw):
+        i = __for_i_2
+        let c = raw[i]
+        if c < '0' || c > '9':
+            break
+        had = true
+        value = value * 10 + (int32(c) - int32('0'))
+        i = i + 1
+    if ! had:
+        return defaultValue
+    return value * sign
+
+fn headerAdd(headers: var HttpHeaders, key: str, value: str) =
+    if key == nil || len(key) == 0:
+        return
+    var item: HttpHeader
+    item.key = key
+    item.value = value
+    headers.items.add(item)
+
+fn headerItemsSet(items: var HttpHeader[], idx: int32, value: HttpHeader) =
+    if idx < 0 || idx >= items.len:
+        return
+    let total = items.len
+    var out: HttpHeader[]
+    for i in 0..<total:
+        if i == idx:
+            add(out, value)
+        else:
+            add(out, items[i])
+    items = out
+
+fn headerSet(headers: var HttpHeaders, key: str, value: str) =
+    if key == nil || len(key) == 0:
+        return
+    for i in 0..<headers.items.len:
+        let current = headers.items[i]
+        if headerKeyEquals(current.key, key):
+            var item = current
+            item.value = value
+            headerItemsSet(headers.items, i, item)
+            return
+    headerAdd(headers, key, value)
+
+fn shrinkHeaderItems(items: var HttpHeader[], newLen: int32) =
+    if newLen <= 0:
+        items = []
+        return
+    if newLen >= items.len:
+        return
+    var out: HttpHeader[] 
+    for i in 0..<newLen:
+        add(out, items[i])
+    items = out
+
+fn headerRemove(headers: var HttpHeaders, key: str) =
+    if key == nil || len(key) == 0:
+        return
+    var i: int32 = 0
+    for __for_guard_i in 0..<headers.items.len:
+        if !(i < headers.items.len):
+            break
+        let item = headers.items[i]
+        if headerKeyEquals(item.key, key):
+            let last = headers.items.len - 1
+            headerItemsSet(headers.items, i, headers.items[last])
+            shrinkHeaderItems(headers.items, last)
+            continue
+        i = i + 1
+
+fn newRequest(method: HttpMethod, path: str): HttpRequest =
+    var req: HttpRequest
+    req.method = method
+    req.path = path
+    req.query = ""
+    req.headers = newHeaders()
+    req.body = ""
+    return req
+
+fn requestFromUrl(method: HttpMethod, url: str): HttpRequest =
+    let parts = urlParse(url)
+    var path = parts.path
+    if path == nil || len(path) == 0:
+        path = "/"
+    var req = newRequest(method, path)
+    req.query = parts.query
+    return req
+
+fn requestQueryParams(req: HttpRequest): UrlQueryParams =
+    return urlParseQuery(req.query)
+
+fn requestTarget(req: HttpRequest): str =
+    if req.query == nil || len(req.query) == 0:
+        return req.path
+    return req.path + "?" + req.query
+
+fn requestContentLength(req: HttpRequest): int32 =
+    let value = headerGetInt(req.headers, "Content-Length", -1)
+    if value >= 0:
+        return value
+    if req.body == nil:
+        return 0
+    return len(req.body)
+
+fn newResponse(status: int32, body: str): HttpResponse =
+    var res: HttpResponse
+    res.status = status
+    res.headers = newHeaders()
+    res.body = body
+    return res
+
+fn statusText(status: int32): str =
+    if status == 200:
+        return "OK"
+    if status == 201:
+        return "Created"
+    if status == 204:
+        return "No Content"
+    if status == 301:
+        return "Moved Permanently"
+    if status == 302:
+        return "Found"
+    if status == 304:
+        return "Not Modified"
+    if status == 400:
+        return "Bad Request"
+    if status == 401:
+        return "Unauthorized"
+    if status == 403:
+        return "Forbidden"
+    if status == 404:
+        return "Not Found"
+    if status == 500:
+        return "Internal Server Error"
+    return ""
+
+fn textResponse(body: str, status: int32 = 200): HttpResponse =
+    var res = newResponse(status, body)
+    headerSet(res.headers, "Content-Type", "text/plain; charset=utf-8")
+    return res
+
+fn jsonResponse(body: str, status: int32 = 200): HttpResponse =
+    var res = newResponse(status, body)
+    headerSet(res.headers, "Content-Type", "application/json; charset=utf-8")
+    return res
+
+fn notFoundResponse(): HttpResponse =
+    return textResponse("Not Found", 404)
+
+fn methodFromString(method: str): HttpMethod =
+    if method == nil:
+        return hmAny
+    let up = strutil.toUpperAscii(method)
+    if up == "GET":
+        return hmGet
+    if up == "POST":
+        return hmPost
+    if up == "PUT":
+        return hmPut
+    if up == "DELETE":
+        return hmDelete
+    if up == "PATCH":
+        return hmPatch
+    if up == "OPTIONS":
+        return hmOptions
+    if up == "HEAD":
+        return hmHead
+    return hmAny
+
+fn methodToString(method: HttpMethod): str =
+    if method == hmGet:
+        return "GET"
+    if method == hmPost:
+        return "POST"
+    if method == hmPut:
+        return "PUT"
+    if method == hmDelete:
+        return "DELETE"
+    if method == hmPatch:
+        return "PATCH"
+    if method == hmOptions:
+        return "OPTIONS"
+    if method == hmHead:
+        return "HEAD"
+    return "*"
+
+fn responseToHttp(res: HttpResponse): str =
+    var tmp = res
+    if len(headerGet(tmp.headers, "Content-Length")) == 0:
+        headerSet(tmp.headers, "Content-Length", intToStr(len(tmp.body)))
+    if len(headerGet(tmp.headers, "Connection")) == 0:
+        headerSet(tmp.headers, "Connection", "close")
+    var line = "HTTP/1.1 " + intToStr(tmp.status)
+    let reason = statusText(tmp.status)
+    if len(reason) > 0:
+        line = line + " " + reason
+    line = line + "\r\n"
+    var out = line
+    for i in 0..<len(tmp.headers.items):
+        let item = tmp.headers.items[i]
+        out = out + item.key + ": " + item.value + "\r\n"
+    out = out + "\r\n"
+    if tmp.body != nil && len(tmp.body) > 0:
+        out = out + tmp.body
+    return out
+
+
+fn parseChunkedBody(raw: str): str =
+    if raw == nil || len(raw) == 0:
+        return ""
+    var out: str = ""
+    var i: int32 = 0
+    while i < len(raw):
+        let lineEnd = indexOfSubstr(raw, "\r\n", i)
+        if lineEnd < 0:
+            break
+        let sizeLine = substr(raw, i, lineEnd - i)
+        var size: int32 = 0
+        for j in 0..<len(sizeLine):
+            let c = sizeLine[j]
+            if c == ';':
+                break
+            if c >= '0' && c <= '9':
+                size = size * 16 + (int32(c) - int32('0'))
+            elif c >= 'a' && c <= 'f':
+                size = size * 16 + (int32(c) - int32('a') + 10)
+            elif c >= 'A' && c <= 'F':
+                size = size * 16 + (int32(c) - int32('A') + 10)
+        let chunkStart = lineEnd + 2
+        if size <= 0:
+            break
+        if chunkStart + size > len(raw):
+            break
+        out = out + substr(raw, chunkStart, size)
+        i = chunkStart + size
+        if i + 1 < len(raw) && raw[i] == '\r' && raw[i + 1] == '\n':
+            i = i + 2
+    return out
+
+fn parseHttpRequest(raw: str): HttpRequest =
+    var req = newRequest(hmAny, "/")
+    if raw == nil || len(raw) == 0:
+        return req
+    let sep = "\r\n\r\n"
+    let headerEnd = indexOfSubstr(raw, sep, 0)
+    var head = raw
+    var body = ""
+    if headerEnd >= 0:
+        head = substr(raw, 0, headerEnd)
+        let bodyStart: int32 = headerEnd + len(sep)
+        if bodyStart < len(raw):
+            body = substr(raw, bodyStart, len(raw) - bodyStart)
+    req.body = body
+    var lines: str[] 
+    var start: int32 = 0
+    for i in 0..len(head):
+        if i == len(head) || head[i] == '\n':
+            var line = substr(head, start, i - start)
+            if len(line) > 0 && line[len(line) - 1] == '\r':
+                line = substr(line, 0, len(line) - 1)
+            lines.add(line)
+            start = i + 1
+    if len(lines) == 0:
+        return req
+    let first = lines[0]
+    let parts = strutil.splitWhitespace(first)
+    if len(parts) >= 2:
+        req.method = methodFromString(parts[0])
+        let target = parts[1]
+        let info = urlParse(target)
+        if info.path != nil && len(info.path) > 0:
+            req.path = info.path
+        req.query = info.query
+    var hasChunked: bool = false
+    for idx in 1..<len(lines):
+        let line = lines[idx]
+        if len(line) == 0:
+            continue
+        let colon = indexOfChar(line, ':', 0)
+        if colon > 0:
+            let key = substr(line, 0, colon)
+            var value = substr(line, colon + 1, len(line) - colon - 1)
+            value = strutil.strip(value)
+            headerAdd(req.headers, key, value)
+            if headerKeyEquals(key, "Transfer-Encoding") && strutil.contains(value, "chunked"):
+                hasChunked = true
+    if hasChunked:
+        req.body = parseChunkedBody(body)
+    return req

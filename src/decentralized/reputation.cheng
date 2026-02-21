@@ -1,0 +1,124 @@
+import std/os
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import std/strings
+
+type
+    ReputationSummary =
+        executorId: str
+        okReceiptCount: int32
+        badReceiptCount: int32
+        auditOkCount: int32
+        auditBadCount: int32
+        fraudReportCount: int32
+        score: float64
+        level: str
+
+fn scoreToLevel(score: float64): str =
+    if score >= 0.9:
+        return "excellent"
+    if score >= 0.75:
+        return "good"
+    if score >= 0.5:
+        return "warn"
+    return "bad"
+
+fn computeScore(summary: ReputationSummary): float64 =
+    var score: float64 = 1.0
+    score = score + float64(summary.okReceiptCount) * 0.001
+    score = score + float64(summary.auditOkCount) * 0.005
+    score = score - float64(summary.badReceiptCount) * 0.01
+    score = score - float64(summary.auditBadCount) * 0.05
+    score = score - float64(summary.fraudReportCount) * 0.1
+    if score < 0.0:
+        score = 0.0
+    if score > 1.0:
+        score = 1.0
+    return score
+
+fn computeReputation(ledgerPath: str, executorId: str): ReputationSummary =
+    var out: ReputationSummary
+    out.executorId = executorId
+    if ledgerPath == nil || len(ledgerPath) == 0:
+        out.score = computeScore(out)
+        out.level = scoreToLevel(out.score)
+        return out
+    if ! os.fileExists(ledgerPath):
+        out.score = computeScore(out)
+        out.level = scoreToLevel(out.score)
+        return out
+    let content = os.readFile(ledgerPath)
+    if content == nil || len(content) == 0:
+        out.score = computeScore(out)
+        out.level = scoreToLevel(out.score)
+        return out
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let node = parsed.value
+        let kind = jparse.getStringField(node, "type", "")
+        if kind == "exec_receipt":
+            let eid = jparse.getStringField(node, "executor_id", "")
+            if eid == executorId:
+                let status = jparse.getStringField(node, "status", "")
+                if status == "ok":
+                    out.okReceiptCount = out.okReceiptCount + 1
+                else:
+                    out.badReceiptCount = out.badReceiptCount + 1
+        elif kind == "audit":
+            let eid = jparse.getStringField(node, "executor_id", "")
+            if eid == executorId:
+                let status = jparse.getStringField(node, "status", "")
+                if status == "ok":
+                    out.auditOkCount = out.auditOkCount + 1
+                else:
+                    out.auditBadCount = out.auditBadCount + 1
+        elif kind == "fraud_report":
+            let eid = jparse.getStringField(node, "executor_id", "")
+            if eid == executorId:
+                out.fraudReportCount = out.fraudReportCount + 1
+    out.score = computeScore(out)
+    out.level = scoreToLevel(out.score)
+    return out
+
+fn reputationToJson(summary: ReputationSummary): json.JsonNode =
+    let root = json.newJObject()
+    root["executor_id"] = json.newJString(summary.executorId)
+    root["ok_receipt_count"] = json.newJInt(summary.okReceiptCount)
+    root["bad_receipt_count"] = json.newJInt(summary.badReceiptCount)
+    root["audit_ok_count"] = json.newJInt(summary.auditOkCount)
+    root["audit_bad_count"] = json.newJInt(summary.auditBadCount)
+    root["fraud_report_count"] = json.newJInt(summary.fraudReportCount)
+    root["score"] = json.newJFloat(summary.score)
+    root["level"] = json.newJString(summary.level)
+    return root
+
+fn reputationToToml(summary: ReputationSummary): str =
+    var out: str = ""
+    out = out + "executor_id = \"" + summary.executorId + "\"\n"
+    out = out + "ok_receipt_count = " + intToStr(summary.okReceiptCount) + "\n"
+    out = out + "bad_receipt_count = " + intToStr(summary.badReceiptCount) + "\n"
+    out = out + "audit_ok_count = " + intToStr(summary.auditOkCount) + "\n"
+    out = out + "audit_bad_count = " + intToStr(summary.auditBadCount) + "\n"
+    out = out + "fraud_report_count = " + intToStr(summary.fraudReportCount) + "\n"
+    out = out + "score = " + $ summary.score + "\n"
+    out = out + "level = \"" + summary.level + "\"\n"
+    return out
+
+fn reputationToYaml(summary: ReputationSummary): str =
+    var out: str = ""
+    out = out + "executor_id: \"" + summary.executorId + "\"\n"
+    out = out + "ok_receipt_count: " + intToStr(summary.okReceiptCount) + "\n"
+    out = out + "bad_receipt_count: " + intToStr(summary.badReceiptCount) + "\n"
+    out = out + "audit_ok_count: " + intToStr(summary.auditOkCount) + "\n"
+    out = out + "audit_bad_count: " + intToStr(summary.auditBadCount) + "\n"
+    out = out + "fraud_report_count: " + intToStr(summary.fraudReportCount) + "\n"
+    out = out + "score: " + $ summary.score + "\n"
+    out = out + "level: \"" + summary.level + "\"\n"
+    return out

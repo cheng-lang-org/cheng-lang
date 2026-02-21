@@ -1,0 +1,191 @@
+import std/os
+import std/strutils as strutil
+import cheng/web/std/server_http
+import std/strings
+
+type
+    StaticAsset =
+        path: str
+        contentType: str
+        body: str
+        etag: str
+
+    StaticAssets =
+        items: StaticAsset[]
+
+fn newStaticAssets(): StaticAssets =
+    var assets: StaticAssets
+    assets.items = []
+    return assets
+
+fn findAssetIndex(assets: StaticAssets, path: str): int32 =
+    if path == nil:
+        return -1
+    for i in 0..<len(assets.items):
+        if assets.items[i].path == path:
+            return i
+    return -1
+
+fn bodyChecksum(body: str): int32 =
+    if body == nil || len(body) == 0:
+        return 0
+    var sum: int32 = 0
+    for i in 0..<len(body):
+        sum = sum + int32(body[i])
+    return sum
+
+fn etagForBody(body: str): str =
+    let checksum = bodyChecksum(body)
+    return "W/\"" + intToStr(len(body)) + "-" + intToStr(checksum) + "\""
+
+fn etagMatches(req: HttpRequest, etag: str): bool =
+    if etag == nil || len(etag) == 0:
+        return false
+    let raw = headerGet(req.headers, "If-None-Match")
+    if raw == nil || len(raw) == 0:
+        return false
+    return strutil.contains(raw, etag)
+
+fn addAsset(assets: var StaticAssets, path: str, contentType: str, body: str) =
+    if path == nil || len(path) == 0:
+        return
+    let idx = findAssetIndex(assets, path)
+    let etag = etagForBody(body)
+    if idx >= 0:
+        assets.items[idx].contentType = contentType
+        assets.items[idx].body = body
+        assets.items[idx].etag = etag
+        return
+    var item: StaticAsset
+    item.path = path
+    item.contentType = contentType
+    item.body = body
+    item.etag = etag
+    assets.items.add(item)
+
+fn serveAssets(assets: StaticAssets): ServerHandler =
+    let handler = fn (req: HttpRequest): HttpResponse =
+        let idx = findAssetIndex(assets, req.path)
+        if idx < 0:
+            return notFoundResponse()
+        let item = assets.items[idx]
+        if etagMatches(req, item.etag):
+            var res = newResponse(304, "")
+            headerSet(res.headers, "ETag", item.etag)
+            return res
+        var res = newResponse(200, item.body)
+        if item.contentType != nil && len(item.contentType) > 0:
+            headerSet(res.headers, "Content-Type", item.contentType)
+        headerSet(res.headers, "ETag", item.etag)
+        return res
+    return handler
+
+fn endsWith(s: str, suffix: str): bool =
+    if s == nil || suffix == nil:
+        return false
+    let sLen: int32 = len(s)
+    let pLen: int32 = len(suffix)
+    if pLen == 0 || sLen < pLen:
+        return false
+    for i in 0..<pLen:
+        if s[sLen - pLen + i] != suffix[i]:
+            return false
+    return true
+
+fn guessContentType(path: str): str =
+    if endsWith(path, ".html"):
+        return "text/html; charset=utf-8"
+    if endsWith(path, ".css"):
+        return "text/css; charset=utf-8"
+    if endsWith(path, ".js"):
+        return "application/javascript; charset=utf-8"
+    if endsWith(path, ".json"):
+        return "application/json; charset=utf-8"
+    if endsWith(path, ".wasm"):
+        return "application/wasm"
+    if endsWith(path, ".svg"):
+        return "image/svg+xml"
+    if endsWith(path, ".png"):
+        return "image/png"
+    if endsWith(path, ".jpg") || endsWith(path, ".jpeg"):
+        return "image/jpeg"
+    return "application/octet-stream"
+
+fn sanitizePath(path: str): str =
+    if path == nil || len(path) == 0:
+        return "/"
+    return path
+
+fn requestWantsHtml(req: HttpRequest): bool =
+    let accept = headerGet(req.headers, "Accept")
+    if accept == nil || len(accept) == 0:
+        return false
+    let lowered = strutil.toLowerAscii(accept)
+    return strutil.contains(lowered, "text/html")
+
+fn pathHasExtension(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    let name = os.extractFilename(path)
+    if name == nil || len(name) == 0:
+        return false
+    var i: int32 = len(name) - 1
+    while true:
+        let c = name[i]
+        if c == '.':
+            return i > 0
+        if i == 0:
+            break
+        i = i - 1
+    return false
+
+fn shouldSpaFallback(req: HttpRequest, spaFallback: bool): bool =
+    if ! spaFallback:
+        return false
+    if req.method != hmGet:
+        return false
+    if pathHasExtension(req.path):
+        return false
+    return requestWantsHtml(req)
+
+fn serveDirSpa(root: str, spaFallback: bool): ServerHandler =
+    let handler = fn (req: HttpRequest): HttpResponse =
+        if root == nil || len(root) == 0:
+            return notFoundResponse()
+        var rel = sanitizePath(req.path)
+        if strutil.contains(rel, ".."):
+            return notFoundResponse()
+        if len(rel) > 0 && rel[0] == '/':
+            rel = substr(rel, 1, len(rel) - 1)
+        var full = root
+        if len(rel) > 0:
+            full = os.joinPath(root, rel)
+        let allowFallback = shouldSpaFallback(req, spaFallback)
+        let rootIndex = os.joinPath(root, "index.html")
+        if os.dirExists(full):
+            let indexFile = os.joinPath(full, "index.html")
+            if os.fileExists(indexFile):
+                full = indexFile
+            elif allowFallback && os.fileExists(rootIndex):
+                full = rootIndex
+            else:
+                return notFoundResponse()
+        elif ! os.fileExists(full):
+            if allowFallback && os.fileExists(rootIndex):
+                full = rootIndex
+            else:
+                return notFoundResponse()
+        let body = os.readFile(full)
+        let etag = etagForBody(body)
+        if etagMatches(req, etag):
+            var res = newResponse(304, "")
+            headerSet(res.headers, "ETag", etag)
+            return res
+        var res = newResponse(200, body)
+        headerSet(res.headers, "Content-Type", guessContentType(full))
+        headerSet(res.headers, "ETag", etag)
+        return res
+    return handler
+
+fn serveDir(root: str): ServerHandler =
+    return serveDirSpa(root, false)

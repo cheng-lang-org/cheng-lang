@@ -1,0 +1,626 @@
+# ECDSA helpers(NIST P-256, pure Cheng).
+
+import std/result
+import std/rawbytes
+import std/crypto/rand
+import std/crypto/sha256
+import std/crypto/hkdf
+import std/crypto/bigint
+const
+    p256ScalarSize: int32 = 32
+    p256PublicSize: int32 = 65
+    p256SignatureSize: int32 = 64
+    p256HexP = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
+    p256HexN = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+    p256HexB = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"
+    p256HexGx = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+    p256HexGy = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
+
+type
+    EcPoint =
+        x: BigInt
+        y: BigInt
+        inf: bool
+
+    EcPublicKey =
+        point: EcPoint
+
+    EcPrivateKey =
+        d: BigInt
+
+    EcKeyPair =
+        publicKey: EcPublicKey
+        privateKey: EcPrivateKey
+
+    EcSignature =
+        r: BigInt
+        s: BigInt
+
+var
+    p256InitDone: bool = false
+    p256P: BigInt
+    p256N: BigInt
+    p256A: BigInt
+    p256B: BigInt
+    p256G: EcPoint
+    p256PMinus2: BigInt
+    p256NMinus2: BigInt
+    p256NHalf: BigInt
+
+fn ecnistHexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn hexDecode(text: str): Result[Bytes] =
+    if len(text) % 2 != 0:
+        return Err[Bytes]("ecdsa: hex length must be even")
+    let out: Bytes = bytesAlloc(len(text) / 2)
+    var i: int32 = 0
+    while i < len(text):
+        let hi: int32 = ecnistHexValue(text[i])
+        let lo: int32 = ecnistHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("ecdsa: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn bytesFromByte(value: int32): Bytes =
+    let out: Bytes = bytesAlloc(1)
+    bytesSet(out, 0, value)
+    return out
+
+fn hmacSha256(key: Bytes, data: Bytes): Bytes =
+    return hmacDigest(key, data, sha256BlockSize, sha256Size, ecnistSha256DigestFn)
+
+fn ecnistSha256DigestFn(data: Bytes): Bytes =
+    return sha256Digest(data)
+
+fn bigShiftRight1(a: BigInt): BigInt =
+    var out: BigInt
+    out.count = a.count
+    let mask32: int64 = (int64(1) << 32) - 1
+    var carry: int64 = 0
+    let __for_start_i = a.count - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        var limb: int64 = int64(a.limbs[i])
+        if limb < 0:
+            limb = limb + (int64(1) << 32)
+        let shifted: int64 = (limb >> 1) | (carry << (bigIntWordBits - 1))
+        out.limbs[i] = int32(shifted & mask32)
+        carry = limb & 1
+    bigNormalize(out)
+    return out
+
+fn p256EnsureInit(): Result[bool] =
+    if p256InitDone:
+        return Ok[bool](true)
+    let pRes: Result[Bytes] = hexDecode(p256HexP)
+    if IsErr(pRes):
+        return Err[bool](Error(pRes))
+    let nRes: Result[Bytes] = hexDecode(p256HexN)
+    if IsErr(nRes):
+        return Err[bool](Error(nRes))
+    let bRes: Result[Bytes] = hexDecode(p256HexB)
+    if IsErr(bRes):
+        return Err[bool](Error(bRes))
+    let gxRes: Result[Bytes] = hexDecode(p256HexGx)
+    if IsErr(gxRes):
+        return Err[bool](Error(gxRes))
+    let gyRes: Result[Bytes] = hexDecode(p256HexGy)
+    if IsErr(gyRes):
+        return Err[bool](Error(gyRes))
+    let pBigRes: Result[BigInt] = bigFromBytes(Value(pRes))
+    if IsErr(pBigRes):
+        return Err[bool](Error(pBigRes))
+    let nBigRes: Result[BigInt] = bigFromBytes(Value(nRes))
+    if IsErr(nBigRes):
+        return Err[bool](Error(nBigRes))
+    let bBigRes: Result[BigInt] = bigFromBytes(Value(bRes))
+    if IsErr(bBigRes):
+        return Err[bool](Error(bBigRes))
+    let gxBigRes: Result[BigInt] = bigFromBytes(Value(gxRes))
+    if IsErr(gxBigRes):
+        return Err[bool](Error(gxBigRes))
+    let gyBigRes: Result[BigInt] = bigFromBytes(Value(gyRes))
+    if IsErr(gyBigRes):
+        return Err[bool](Error(gyBigRes))
+    p256P = Value(pBigRes)
+    p256N = Value(nBigRes)
+    p256B = Value(bBigRes)
+    p256G = EcPoint(x: Value(gxBigRes), y: Value(gyBigRes), inf: false)
+    let three: BigInt = bigFromInt(3)
+    let aRes: Result[BigInt] = bigSub(p256P, three)
+    if IsErr(aRes):
+        return Err[bool](Error(aRes))
+    p256A = Value(aRes)
+    let two: BigInt = bigFromInt(2)
+    let pMinus2Res: Result[BigInt] = bigSub(p256P, two)
+    if IsErr(pMinus2Res):
+        return Err[bool](Error(pMinus2Res))
+    let nMinus2Res: Result[BigInt] = bigSub(p256N, two)
+    if IsErr(nMinus2Res):
+        return Err[bool](Error(nMinus2Res))
+    p256PMinus2 = Value(pMinus2Res)
+    p256NMinus2 = Value(nMinus2Res)
+    p256NHalf = bigShiftRight1(p256N)
+    p256InitDone = true
+    return Ok[bool](true)
+
+fn bigModSub(a: BigInt, b: BigInt, m: BigInt): Result[BigInt] =
+    if bigCmp(a, b) >= 0:
+        return bigSub(a, b)
+    let diffRes: Result[BigInt] = bigSub(m, b)
+    if IsErr(diffRes):
+        return Err[BigInt](Error(diffRes))
+    let sumRes: Result[BigInt] = bigAdd(a, Value(diffRes))
+    if IsErr(sumRes):
+        return Err[BigInt](Error(sumRes))
+    var sum: BigInt = Value(sumRes)
+    if bigCmp(sum, m) >= 0:
+        let subRes: Result[BigInt] = bigSub(sum, m)
+        if IsErr(subRes):
+            return Err[BigInt](Error(subRes))
+        sum = Value(subRes)
+    return Ok[BigInt](sum)
+
+fn p256Mod(a: BigInt): Result[BigInt] =
+    return bigMod(a, p256P)
+
+fn p256ModMul(a: BigInt, b: BigInt): Result[BigInt] =
+    return bigModMul(a, b, p256P)
+
+fn p256ModAdd(a: BigInt, b: BigInt): Result[BigInt] =
+    return bigModAdd(a, b, p256P)
+
+fn p256ModSub(a: BigInt, b: BigInt): Result[BigInt] =
+    return bigModSub(a, b, p256P)
+
+fn p256ModInv(a: BigInt): Result[BigInt] =
+    if bigIsZero(a):
+        return Err[BigInt]("ecdsa: inverse of zero")
+    return bigModExp(a, p256PMinus2, p256P)
+
+fn nMod(a: BigInt): Result[BigInt] =
+    return bigMod(a, p256N)
+
+fn nModMul(a: BigInt, b: BigInt): Result[BigInt] =
+    return bigModMul(a, b, p256N)
+
+fn nModAdd(a: BigInt, b: BigInt): Result[BigInt] =
+    return bigModAdd(a, b, p256N)
+
+fn nModInv(a: BigInt): Result[BigInt] =
+    if bigIsZero(a):
+        return Err[BigInt]("ecdsa: inverse of zero")
+    return bigModExp(a, p256NMinus2, p256N)
+
+fn isInfinity(p: EcPoint): bool =
+    return p.inf
+
+fn pointInfinity(): EcPoint =
+    EcPoint(x: bigZero(), y: bigZero(), inf: true)
+
+fn pointIsOnCurve(p: EcPoint): Result[bool] =
+    if p.inf:
+        return Ok[bool](false)
+    let xModRes: Result[BigInt] = p256Mod(p.x)
+    if IsErr(xModRes):
+        return Err[bool](Error(xModRes))
+    let yModRes: Result[BigInt] = p256Mod(p.y)
+    if IsErr(yModRes):
+        return Err[bool](Error(yModRes))
+    let x: BigInt = Value(xModRes)
+    let y: BigInt = Value(yModRes)
+    let y2Res: Result[BigInt] = p256ModMul(y, y)
+    if IsErr(y2Res):
+        return Err[bool](Error(y2Res))
+    let x2Res: Result[BigInt] = p256ModMul(x, x)
+    if IsErr(x2Res):
+        return Err[bool](Error(x2Res))
+    let x3Res: Result[BigInt] = p256ModMul(Value(x2Res), x)
+    if IsErr(x3Res):
+        return Err[bool](Error(x3Res))
+    let axRes: Result[BigInt] = p256ModMul(p256A, x)
+    if IsErr(axRes):
+        return Err[bool](Error(axRes))
+    let rhs1Res: Result[BigInt] = p256ModAdd(Value(x3Res), Value(axRes))
+    if IsErr(rhs1Res):
+        return Err[bool](Error(rhs1Res))
+    let rhsRes: Result[BigInt] = p256ModAdd(Value(rhs1Res), p256B)
+    if IsErr(rhsRes):
+        return Err[bool](Error(rhsRes))
+    return Ok[bool](bigCmp(Value(y2Res), Value(rhsRes)) == 0)
+
+fn pointDouble(p: EcPoint): Result[EcPoint] =
+    if p.inf:
+        return Ok[EcPoint](p)
+    if bigIsZero(p.y):
+        return Ok[EcPoint](pointInfinity())
+    let x2Res: Result[BigInt] = p256ModMul(p.x, p.x)
+    if IsErr(x2Res):
+        return Err[EcPoint](Error(x2Res))
+    let dblRes: Result[BigInt] = p256ModAdd(Value(x2Res), Value(x2Res))
+    if IsErr(dblRes):
+        return Err[EcPoint](Error(dblRes))
+    let tripleRes: Result[BigInt] = p256ModAdd(Value(dblRes), Value(x2Res))
+    if IsErr(tripleRes):
+        return Err[EcPoint](Error(tripleRes))
+    let numRes: Result[BigInt] = p256ModAdd(Value(tripleRes), p256A)
+    if IsErr(numRes):
+        return Err[EcPoint](Error(numRes))
+    let denomRes: Result[BigInt] = p256ModAdd(p.y, p.y)
+    if IsErr(denomRes):
+        return Err[EcPoint](Error(denomRes))
+    let invRes: Result[BigInt] = p256ModInv(Value(denomRes))
+    if IsErr(invRes):
+        return Err[EcPoint](Error(invRes))
+    let lambdaRes: Result[BigInt] = p256ModMul(Value(numRes), Value(invRes))
+    if IsErr(lambdaRes):
+        return Err[EcPoint](Error(lambdaRes))
+    let lambda: BigInt = Value(lambdaRes)
+    let lambda2Res: Result[BigInt] = p256ModMul(lambda, lambda)
+    if IsErr(lambda2Res):
+        return Err[EcPoint](Error(lambda2Res))
+    let twoXRes: Result[BigInt] = p256ModAdd(p.x, p.x)
+    if IsErr(twoXRes):
+        return Err[EcPoint](Error(twoXRes))
+    let x3Res: Result[BigInt] = p256ModSub(Value(lambda2Res), Value(twoXRes))
+    if IsErr(x3Res):
+        return Err[EcPoint](Error(x3Res))
+    let x1MinusX3Res: Result[BigInt] = p256ModSub(p.x, Value(x3Res))
+    if IsErr(x1MinusX3Res):
+        return Err[EcPoint](Error(x1MinusX3Res))
+    let y3Res1: Result[BigInt] = p256ModMul(lambda, Value(x1MinusX3Res))
+    if IsErr(y3Res1):
+        return Err[EcPoint](Error(y3Res1))
+    let y3Res: Result[BigInt] = p256ModSub(Value(y3Res1), p.y)
+    if IsErr(y3Res):
+        return Err[EcPoint](Error(y3Res))
+    return Ok[EcPoint](EcPoint(x: Value(x3Res), y: Value(y3Res), inf: false))
+
+fn pointAdd(p1: EcPoint, p2: EcPoint): Result[EcPoint] =
+    if p1.inf:
+        return Ok[EcPoint](p2)
+    if p2.inf:
+        return Ok[EcPoint](p1)
+    if bigCmp(p1.x, p2.x) == 0:
+        let sumRes: Result[BigInt] = p256ModAdd(p1.y, p2.y)
+        if IsErr(sumRes):
+            return Err[EcPoint](Error(sumRes))
+        if bigIsZero(Value(sumRes)):
+            return Ok[EcPoint](pointInfinity())
+        return pointDouble(p1)
+    let dyRes: Result[BigInt] = p256ModSub(p2.y, p1.y)
+    if IsErr(dyRes):
+        return Err[EcPoint](Error(dyRes))
+    let dxRes: Result[BigInt] = p256ModSub(p2.x, p1.x)
+    if IsErr(dxRes):
+        return Err[EcPoint](Error(dxRes))
+    let invRes: Result[BigInt] = p256ModInv(Value(dxRes))
+    if IsErr(invRes):
+        return Err[EcPoint](Error(invRes))
+    let lambdaRes: Result[BigInt] = p256ModMul(Value(dyRes), Value(invRes))
+    if IsErr(lambdaRes):
+        return Err[EcPoint](Error(lambdaRes))
+    let lambda: BigInt = Value(lambdaRes)
+    let lambda2Res: Result[BigInt] = p256ModMul(lambda, lambda)
+    if IsErr(lambda2Res):
+        return Err[EcPoint](Error(lambda2Res))
+    let x3Res1: Result[BigInt] = p256ModSub(Value(lambda2Res), p1.x)
+    if IsErr(x3Res1):
+        return Err[EcPoint](Error(x3Res1))
+    let x3Res: Result[BigInt] = p256ModSub(Value(x3Res1), p2.x)
+    if IsErr(x3Res):
+        return Err[EcPoint](Error(x3Res))
+    let x1MinusX3Res: Result[BigInt] = p256ModSub(p1.x, Value(x3Res))
+    if IsErr(x1MinusX3Res):
+        return Err[EcPoint](Error(x1MinusX3Res))
+    let y3Res1: Result[BigInt] = p256ModMul(lambda, Value(x1MinusX3Res))
+    if IsErr(y3Res1):
+        return Err[EcPoint](Error(y3Res1))
+    let y3Res: Result[BigInt] = p256ModSub(Value(y3Res1), p1.y)
+    if IsErr(y3Res):
+        return Err[EcPoint](Error(y3Res))
+    return Ok[EcPoint](EcPoint(x: Value(x3Res), y: Value(y3Res), inf: false))
+
+fn pointMul(k: BigInt, p: EcPoint): Result[EcPoint] =
+    if p.inf:
+        return Ok[EcPoint](p)
+    if bigIsZero(k):
+        return Ok[EcPoint](pointInfinity())
+    var result: EcPoint = pointInfinity()
+    var addend: EcPoint = p
+    let bits: int32 = bigBitLen(k)
+    for i in 0..<bits:
+        if bigGetBit(k, i) != 0:
+            let addRes: Result[EcPoint] = pointAdd(result, addend)
+            if IsErr(addRes):
+                return Err[EcPoint](Error(addRes))
+            result = Value(addRes)
+        let dblRes: Result[EcPoint] = pointDouble(addend)
+        if IsErr(dblRes):
+            return Err[EcPoint](Error(dblRes))
+        addend = Value(dblRes)
+    return Ok[EcPoint](result)
+
+fn p256Hash(msg: Bytes): Result[BigInt] =
+    let digest: Bytes = sha256Digest(msg)
+    return bigFromBytes(digest)
+
+fn p256DeterministicK(priv: BigInt, msg: Bytes): Result[BigInt] =
+    let xBytes: Bytes = bigToBytes(priv, p256ScalarSize)
+    let h1: Bytes = sha256Digest(msg)
+    var v: Bytes = bytesAlloc(sha256Size)
+    var k: Bytes = bytesAlloc(sha256Size)
+    for i in 0..<sha256Size:
+        bytesSet(v, i, 0x01)
+        bytesSet(k, i, 0x00)
+    let zero: Bytes = bytesFromByte(0x00)
+    let one: Bytes = bytesFromByte(0x01)
+    let k1: Bytes = hmacSha256(k, bytesConcat(bytesConcat3(v, zero, xBytes), h1))
+    k = k1
+    v = hmacSha256(k, v)
+    k = hmacSha256(k, bytesConcat(bytesConcat3(v, one, xBytes), h1))
+    v = hmacSha256(k, v)
+    for attempt in 0..<64:
+        v = hmacSha256(k, v)
+        let tRes: Result[BigInt] = bigFromBytes(v)
+        if IsErr(tRes):
+            return Err[BigInt](Error(tRes))
+        let candidate: BigInt = Value(tRes)
+        if ! bigIsZero(candidate) && bigCmp(candidate, p256N) < 0:
+            return Ok[BigInt](candidate)
+        k = hmacSha256(k, bytesConcat(v, zero))
+        v = hmacSha256(k, v)
+    return Err[BigInt]("ecdsa: failed to derive nonce")
+
+fn publicKeyFromPrivateKey(priv: EcPrivateKey): Result[EcPublicKey] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcPublicKey](Error(initRes))
+    let pRes: Result[EcPoint] = pointMul(priv.d, p256G)
+    if IsErr(pRes):
+        return Err[EcPublicKey](Error(pRes))
+    let p: EcPoint = Value(pRes)
+    if p.inf:
+        return Err[EcPublicKey]("ecdsa: invalid public key")
+    return Ok[EcPublicKey](EcPublicKey(point: p))
+
+fn generateEcKeyPair(): Result[EcKeyPair] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcKeyPair](Error(initRes))
+    var attempt: int32 = 0
+    let __for_guard_start_attempt_1 = attempt
+    for __for_guard_attempt_1 in __for_guard_start_attempt_1..<100:
+        if ! (attempt < 100):
+            break
+        let privRes: Result[Bytes] = randomBytes(p256ScalarSize)
+        if IsErr(privRes):
+            return Err[EcKeyPair](Error(privRes))
+        let dRes: Result[BigInt] = bigFromBytes(Value(privRes))
+        if IsErr(dRes):
+            return Err[EcKeyPair](Error(dRes))
+        let d: BigInt = Value(dRes)
+        if bigIsZero(d) || bigCmp(d, p256N) >= 0:
+            attempt = attempt + 1
+            continue
+        let priv: EcPrivateKey = EcPrivateKey(d: d)
+        let pubRes: Result[EcPublicKey] = publicKeyFromPrivateKey(priv)
+        if IsErr(pubRes):
+            return Err[EcKeyPair](Error(pubRes))
+        return Ok[EcKeyPair](EcKeyPair(publicKey: Value(pubRes), privateKey: priv))
+    return Err[EcKeyPair]("ecdsa: failed to generate key")
+
+fn ecdsaSign(priv: EcPrivateKey, msg: Bytes): Result[EcSignature] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcSignature](Error(initRes))
+    if bigIsZero(priv.d) || bigCmp(priv.d, p256N) >= 0:
+        return Err[EcSignature]("ecdsa: invalid private key")
+    let eRes: Result[BigInt] = p256Hash(msg)
+    if IsErr(eRes):
+        return Err[EcSignature](Error(eRes))
+    let eModRes: Result[BigInt] = nMod(Value(eRes))
+    if IsErr(eModRes):
+        return Err[EcSignature](Error(eModRes))
+    let kRes: Result[BigInt] = p256DeterministicK(priv.d, msg)
+    if IsErr(kRes):
+        return Err[EcSignature](Error(kRes))
+    let k: BigInt = Value(kRes)
+    let pRes: Result[EcPoint] = pointMul(k, p256G)
+    if IsErr(pRes):
+        return Err[EcSignature](Error(pRes))
+    let rRes: Result[BigInt] = nMod(Value(pRes).x)
+    if IsErr(rRes):
+        return Err[EcSignature](Error(rRes))
+    let r: BigInt = Value(rRes)
+    if bigIsZero(r):
+        return Err[EcSignature]("ecdsa: r is zero")
+    let rdRes: Result[BigInt] = nModMul(r, priv.d)
+    if IsErr(rdRes):
+        return Err[EcSignature](Error(rdRes))
+    let sumRes: Result[BigInt] = nModAdd(Value(eModRes), Value(rdRes))
+    if IsErr(sumRes):
+        return Err[EcSignature](Error(sumRes))
+    let kInvRes: Result[BigInt] = nModInv(k)
+    if IsErr(kInvRes):
+        return Err[EcSignature](Error(kInvRes))
+    let sRes: Result[BigInt] = nModMul(Value(kInvRes), Value(sumRes))
+    if IsErr(sRes):
+        return Err[EcSignature](Error(sRes))
+    var s: BigInt = Value(sRes)
+    if bigIsZero(s):
+        return Err[EcSignature]("ecdsa: s is zero")
+    if bigCmp(s, p256NHalf) > 0:
+        let subRes: Result[BigInt] = bigSub(p256N, s)
+        if IsErr(subRes):
+            return Err[EcSignature](Error(subRes))
+        s = Value(subRes)
+    return Ok[EcSignature](EcSignature(r: r, s: s))
+
+fn ecdsaVerify(pub: EcPublicKey, msg: Bytes, sig: EcSignature): bool =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return false
+    if bigIsZero(sig.r) || bigIsZero(sig.s):
+        return false
+    if bigCmp(sig.r, p256N) >= 0 || bigCmp(sig.s, p256N) >= 0:
+        return false
+    let onCurveRes: Result[bool] = pointIsOnCurve(pub.point)
+    if IsErr(onCurveRes) || ! Value(onCurveRes):
+        return false
+    let eRes: Result[BigInt] = p256Hash(msg)
+    if IsErr(eRes):
+        return false
+    let eModRes: Result[BigInt] = nMod(Value(eRes))
+    if IsErr(eModRes):
+        return false
+    let wRes: Result[BigInt] = nModInv(sig.s)
+    if IsErr(wRes):
+        return false
+    let u1Res: Result[BigInt] = nModMul(Value(eModRes), Value(wRes))
+    if IsErr(u1Res):
+        return false
+    let u2Res: Result[BigInt] = nModMul(sig.r, Value(wRes))
+    if IsErr(u2Res):
+        return false
+    let p1Res: Result[EcPoint] = pointMul(Value(u1Res), p256G)
+    if IsErr(p1Res):
+        return false
+    let p2Res: Result[EcPoint] = pointMul(Value(u2Res), pub.point)
+    if IsErr(p2Res):
+        return false
+    let sumRes: Result[EcPoint] = pointAdd(Value(p1Res), Value(p2Res))
+    if IsErr(sumRes):
+        return false
+    let sumPoint: EcPoint = Value(sumRes)
+    if sumPoint.inf:
+        return false
+    let vRes: Result[BigInt] = nMod(sumPoint.x)
+    if IsErr(vRes):
+        return false
+    return bigCmp(Value(vRes), sig.r) == 0
+
+fn ecdsaPublicKeyToBytes(pub: EcPublicKey): Bytes =
+    let out: Bytes = bytesAlloc(p256PublicSize)
+    bytesSet(out, 0, 0x04)
+    let xBytes: Bytes = bigToBytes(pub.point.x, p256ScalarSize)
+    let yBytes: Bytes = bigToBytes(pub.point.y, p256ScalarSize)
+    copyMem(ptr_add(out.data, 1), xBytes.data, p256ScalarSize)
+    copyMem(ptr_add(out.data, 1 + p256ScalarSize), yBytes.data, p256ScalarSize)
+    return out
+
+fn ecdsaPrivateKeyToBytes(priv: EcPrivateKey): Bytes =
+    return bigToBytes(priv.d, p256ScalarSize)
+
+fn ecdsaSignatureToBytes(sig: EcSignature): Bytes =
+    let out: Bytes = bytesAlloc(p256SignatureSize)
+    let rBytes: Bytes = bigToBytes(sig.r, p256ScalarSize)
+    let sBytes: Bytes = bigToBytes(sig.s, p256ScalarSize)
+    copyMem(out.data, rBytes.data, p256ScalarSize)
+    copyMem(ptr_add(out.data, p256ScalarSize), sBytes.data, p256ScalarSize)
+    return out
+
+fn ecdsaPublicKeyFromBytes(data: Bytes): Result[EcPublicKey] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcPublicKey](Error(initRes))
+    if bytesLen(data) != p256PublicSize:
+        return Err[EcPublicKey]("ecdsa: invalid public key length")
+    if bytesGet(data, 0) != 0x04:
+        return Err[EcPublicKey]("ecdsa: invalid public key prefix")
+    let xRes: Result[BigInt] = bigFromBytes(bytesSliceView(data, 1, p256ScalarSize))
+    if IsErr(xRes):
+        return Err[EcPublicKey](Error(xRes))
+    let yRes: Result[BigInt] = bigFromBytes(bytesSliceView(data, 1 + p256ScalarSize, p256ScalarSize))
+    if IsErr(yRes):
+        return Err[EcPublicKey](Error(yRes))
+    let x: BigInt = Value(xRes)
+    let y: BigInt = Value(yRes)
+    if bigCmp(x, p256P) >= 0 || bigCmp(y, p256P) >= 0:
+        return Err[EcPublicKey]("ecdsa: point out of range")
+    let onCurveRes: Result[bool] = pointIsOnCurve(EcPoint(x: x, y: y, inf: false))
+    if IsErr(onCurveRes) || ! Value(onCurveRes):
+        return Err[EcPublicKey]("ecdsa: point ! on curve")
+    return Ok[EcPublicKey](EcPublicKey(point: EcPoint(x: x, y: y, inf: false)))
+
+fn ecdsaPrivateKeyFromBytes(data: Bytes): Result[EcPrivateKey] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcPrivateKey](Error(initRes))
+    if bytesLen(data) != p256ScalarSize:
+        return Err[EcPrivateKey]("ecdsa: invalid private key length")
+    let dRes: Result[BigInt] = bigFromBytes(data)
+    if IsErr(dRes):
+        return Err[EcPrivateKey](Error(dRes))
+    let d: BigInt = Value(dRes)
+    if bigIsZero(d) || bigCmp(d, p256N) >= 0:
+        return Err[EcPrivateKey]("ecdsa: invalid private key value")
+    return Ok[EcPrivateKey](EcPrivateKey(d: d))
+
+fn ecdsaSignatureFromBytes(data: Bytes): Result[EcSignature] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcSignature](Error(initRes))
+    if bytesLen(data) != p256SignatureSize:
+        return Err[EcSignature]("ecdsa: invalid signature length")
+    let rRes: Result[BigInt] = bigFromBytes(bytesSliceView(data, 0, p256ScalarSize))
+    if IsErr(rRes):
+        return Err[EcSignature](Error(rRes))
+    let sRes: Result[BigInt] = bigFromBytes(bytesSliceView(data, p256ScalarSize, p256ScalarSize))
+    if IsErr(sRes):
+        return Err[EcSignature](Error(sRes))
+    let r: BigInt = Value(rRes)
+    let s: BigInt = Value(sRes)
+    if bigIsZero(r) || bigIsZero(s):
+        return Err[EcSignature]("ecdsa: invalid signature value")
+    if bigCmp(r, p256N) >= 0 || bigCmp(s, p256N) >= 0:
+        return Err[EcSignature]("ecdsa: signature out of range")
+    return Ok[EcSignature](EcSignature(r: r, s: s))
+
+fn validateEcdsaPublicKeyBytes(data: Bytes): bool =
+    let res: Result[EcPublicKey] = ecdsaPublicKeyFromBytes(data)
+    return IsOk(res)
+
+fn validateEcdsaPrivateKeyBytes(data: Bytes): bool =
+    let res: Result[EcPrivateKey] = ecdsaPrivateKeyFromBytes(data)
+    return IsOk(res)
+
+fn validateEcdsaSignatureBytes(data: Bytes): bool =
+    let res: Result[EcSignature] = ecdsaSignatureFromBytes(data)
+    return IsOk(res)
+
+fn ecdsaSignBytes(privData: Bytes, msg: Bytes): Result[Bytes] =
+    let privRes: Result[EcPrivateKey] = ecdsaPrivateKeyFromBytes(privData)
+    if IsErr(privRes):
+        return Err[Bytes](Error(privRes))
+    let sigRes: Result[EcSignature] = ecdsaSign(Value(privRes), msg)
+    if IsErr(sigRes):
+        return Err[Bytes](Error(sigRes))
+    return Ok[Bytes](ecdsaSignatureToBytes(Value(sigRes)))
+
+fn ecdsaVerifyBytes(pubData: Bytes, msg: Bytes, sig: Bytes): bool =
+    let pubRes: Result[EcPublicKey] = ecdsaPublicKeyFromBytes(pubData)
+    if IsErr(pubRes):
+        return false
+    let sigRes: Result[EcSignature] = ecdsaSignatureFromBytes(sig)
+    if IsErr(sigRes):
+        return false
+    return ecdsaVerify(Value(pubRes), msg, Value(sigRes))
+
+fn ecdsaPublicKeyFromPrivateBytes(privData: Bytes): Result[Bytes] =
+    let privRes: Result[EcPrivateKey] = ecdsaPrivateKeyFromBytes(privData)
+    if IsErr(privRes):
+        return Err[Bytes](Error(privRes))
+    let pubRes: Result[EcPublicKey] = publicKeyFromPrivateKey(Value(privRes))
+    if IsErr(pubRes):
+        return Err[Bytes](Error(pubRes))
+    return Ok[Bytes](ecdsaPublicKeyToBytes(Value(pubRes)))

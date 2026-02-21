@@ -1,0 +1,233 @@
+import std/os
+import std/strutils as strutil
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/lease as dlease
+import cheng/decentralized/lease_token as dtoken
+import cheng/decentralized/ledger as dledger
+import cheng/decentralized/runtime as druntime
+import cheng/decentralized/file_bytes as fbytes
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import cheng/libp2p/utils/stringlist as stringlist
+import std/strings
+
+type
+    IoBackend =
+        runtime: druntime.StorageRuntime
+
+var
+    defaultBackendReady: bool = false
+    defaultBackend: IoBackend
+    requireLeaseReady: bool = false
+    requireLeaseEnabled: bool = false
+
+fn parsePeers(text: str): stringlist.StringList =
+    var peers = stringlist.initStringList()
+    if text == nil || len(text) == 0:
+        return peers
+    let parts = strutil.split(text, ',')
+    for i in 0..<parts.len:
+        let item = strutil.strip(parts[i])
+        if item != nil && len(item) > 0:
+            stringlist.stringListAdd(peers, item)
+    return peers
+
+fn normalizeMode(text: str): str =
+    if text == nil || len(text) == 0:
+        return "local"
+    return strutil.toLowerAscii(text)
+
+fn initIoBackend(root: str, ledgerPath: str, modeText: str,
+    listenAddr: str, peersText: str): IoBackend =
+    let mode = druntime.parseStorageMode(normalizeMode(modeText))
+    let peers = parsePeers(peersText)
+    var ledger = ledgerPath
+    if ledger == nil || len(ledger) == 0:
+        let absRoot = os.absolutePath(root)
+        ledger = os.joinPath(absRoot, "ledger.jsonl")
+    let rt = druntime.initStorageWithP2P(mode, root, ledger, listenAddr, peers)
+    return IoBackend(runtime: rt)
+
+fn initIoBackendFromEnv(): IoBackend =
+    var root = os.getEnv("IO_ROOT")
+    if root == nil || len(root) == 0:
+        root = "build/cheng_storage"
+    let ledger = os.getEnv("IO_LEDGER")
+    let modeText = os.getEnv("IO_MODE")
+    let listenAddr = os.getEnv("IO_LISTEN")
+    let peersText = os.getEnv("IO_PEERS")
+    return initIoBackend(root, ledger, modeText, listenAddr, peersText)
+
+fn defaultIoBackend(): IoBackend =
+    if ! defaultBackendReady:
+        defaultBackend = initIoBackendFromEnv()
+        defaultBackendReady = true
+    return defaultBackend
+
+fn ioRequireLeaseEnabled(): bool =
+    if requireLeaseReady:
+        return requireLeaseEnabled
+    requireLeaseReady = true
+    let raw = os.getEnv("IO_REQUIRE_LEASE")
+    if raw == nil || len(raw) == 0:
+        return requireLeaseEnabled
+    let norm = strutil.toLowerAscii(strutil.strip(raw))
+    if norm == "1" || norm == "true" || norm == "on" || norm == "yes":
+        requireLeaseEnabled = true
+    return requireLeaseEnabled
+
+fn normalizeLeaseForLedger(token: dtoken.LeaseToken): result.Result[dlease.Lease] =
+    var out = token.lease
+    if out.durationDays <= 0:
+        out.durationDays = 30
+    if out.replicas <= 0:
+        out.replicas = 1
+    if out.startTs == nil || len(out.startTs) == 0:
+        return result.Err[dlease.Lease]("lease: missing start_ts")
+    if out.leaseId == nil || len(out.leaseId) == 0:
+        out.leaseId = dlease.buildLeaseId(out)
+    return result.Ok[dlease.Lease](out)
+
+fn verifyLeaseTokenForBytes(token: dtoken.LeaseToken, sizeBytes: int64): result.Result[dlease.Lease] =
+    if ! dtoken.verifyLeaseToken(token):
+        return result.Err[dlease.Lease]("lease: verify failed")
+    if ! dtoken.leaseTokenAllowsBytes(token, sizeBytes):
+        return result.Err[dlease.Lease]("lease: bytes insufficient")
+    return normalizeLeaseForLedger(token)
+
+fn isCidPath(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    return strutil.startsWith(path, "cid://") || strutil.startsWith(path, "cid:")
+
+fn stripCidPrefix(path: str): str =
+    if strutil.startsWith(path, "cid://"):
+        return strings.dropPrefix(path, "cid://")
+    if strutil.startsWith(path, "cid:"):
+        return strings.dropPrefix(path, "cid:")
+    return path
+
+fn readBytes(backend: IoBackend, pathOrCid: str): result.Result[bytes.Bytes] =
+    if isCidPath(pathOrCid):
+        let cidText = stripCidPrefix(pathOrCid)
+        return druntime.getBytes(backend.runtime, cidText)
+    return fbytes.readFileBytes(pathOrCid)
+
+fn readText(backend: IoBackend, pathOrCid: str): result.Result[str] =
+    let dataRes: result.Result[bytes.Bytes] = readBytes(backend, pathOrCid)
+    if result.IsErr(dataRes):
+        return result.Err[str](result.Error(dataRes))
+    return result.Ok[str](bytes.bytesToString(result.Value(dataRes)))
+
+fn readTextAuto(pathOrCid: str): result.Result[str] =
+    let backend = defaultIoBackend()
+    return readText(backend, pathOrCid)
+
+fn writeBytes(backend: IoBackend, pathOrCid: str, data: bytes.Bytes): result.Result[str] =
+    if pathOrCid == nil || len(pathOrCid) == 0 || isCidPath(pathOrCid):
+        return storeBytes(backend, data)
+    let writeRes = fbytes.writeFileBytes(pathOrCid, data)
+    if result.IsErr(writeRes):
+        return result.Err[str](result.Error(writeRes))
+    return result.Ok[str](pathOrCid)
+
+fn writeText(backend: IoBackend, pathOrCid: str, content: str): result.Result[str] =
+    let data: bytes.Bytes = bytes.bytesFromString(content)
+    return writeBytes(backend, pathOrCid, data)
+
+fn writeTextAuto(pathOrCid: str, content: str): result.Result[str] =
+    let backend = defaultIoBackend()
+    return writeText(backend, pathOrCid, content)
+
+fn fetchBytes(backend: IoBackend, cidText: str): result.Result[bytes.Bytes] =
+    return druntime.getBytes(backend.runtime, cidText)
+
+fn storeBytes(backend: IoBackend, data: bytes.Bytes): result.Result[str] =
+    if backend.runtime.mode == druntime.smP2p && ioRequireLeaseEnabled():
+        return result.Err[str]("io: lease required")
+    let cidRes = druntime.putBytes(backend.runtime, data)
+    if result.IsErr(cidRes):
+        return result.Err[str](result.Error(cidRes))
+    let cidText = dcid.cidText(result.Value(cidRes))
+    let outPath = "cid://" + cidText
+    return result.Ok[str](outPath)
+
+fn storeBytesUnchecked(backend: IoBackend, data: bytes.Bytes): result.Result[str] =
+    let cidRes = druntime.putBytes(backend.runtime, data)
+    if result.IsErr(cidRes):
+        return result.Err[str](result.Error(cidRes))
+    let cidText = dcid.cidText(result.Value(cidRes))
+    let outPath = "cid://" + cidText
+    return result.Ok[str](outPath)
+
+fn storeBytesWithLease(backend: IoBackend, data: bytes.Bytes, token: dtoken.LeaseToken): result.Result[str] =
+    let sizeBytes: int64 = int64(bytes.bytesLen(data))
+    let leaseRes: result.Result[dlease.Lease] = verifyLeaseTokenForBytes(token, sizeBytes)
+    if result.IsErr(leaseRes):
+        return result.Err[str](result.Error(leaseRes))
+    let storeRes: result.Result[str] = storeBytesUnchecked(backend, data)
+    if result.IsErr(storeRes):
+        return result.Err[str](result.Error(storeRes))
+    let lease = result.Value(leaseRes)
+    let cost = dlease.computeLeaseCost(lease)
+    if ! dledger.appendLeaseEventWithMode(
+        backend.runtime.ledgerPath,
+        lease,
+        cost,
+        druntime.storageModeText(backend.runtime.mode)
+    ):
+        return result.Err[str]("lease: ledger write failed")
+    return storeRes
+
+fn storeBytesWithLeaseAuto(data: bytes.Bytes, token: dtoken.LeaseToken): result.Result[str] =
+    let backend = defaultIoBackend()
+    return storeBytesWithLease(backend, data, token)
+
+fn putFile(backend: IoBackend, path: str): result.Result[str] =
+    if backend.runtime.mode == druntime.smP2p && ioRequireLeaseEnabled():
+        return result.Err[str]("io: lease required")
+    let cidRes = druntime.putFile(backend.runtime, path)
+    if result.IsErr(cidRes):
+        return result.Err[str](result.Error(cidRes))
+    let cidText = dcid.cidText(result.Value(cidRes))
+    let outPath = "cid://" + cidText
+    return result.Ok[str](outPath)
+
+fn putFileUnchecked(backend: IoBackend, path: str): result.Result[str] =
+    let cidRes = druntime.putFile(backend.runtime, path)
+    if result.IsErr(cidRes):
+        return result.Err[str](result.Error(cidRes))
+    let cidText = dcid.cidText(result.Value(cidRes))
+    let outPath = "cid://" + cidText
+    return result.Ok[str](outPath)
+
+fn putFileWithLease(backend: IoBackend, path: str, token: dtoken.LeaseToken): result.Result[str] =
+    if path == nil || len(path) == 0:
+        return result.Err[str]("lease: missing path")
+    let sizeRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+    if result.IsErr(sizeRes):
+        return result.Err[str]("lease: failed to read file")
+    let sizeBytes: int64 = int64(bytes.bytesLen(result.Value(sizeRes)))
+    let leaseRes: result.Result[dlease.Lease] = verifyLeaseTokenForBytes(token, sizeBytes)
+    if result.IsErr(leaseRes):
+        return result.Err[str](result.Error(leaseRes))
+    let putRes: result.Result[str] = putFileUnchecked(backend, path)
+    if result.IsErr(putRes):
+        return result.Err[str](result.Error(putRes))
+    let lease = result.Value(leaseRes)
+    let cost = dlease.computeLeaseCost(lease)
+    if ! dledger.appendLeaseEventWithMode(
+        backend.runtime.ledgerPath,
+        lease,
+        cost,
+        druntime.storageModeText(backend.runtime.mode)
+    ):
+        return result.Err[str]("lease: ledger write failed")
+    return putRes
+
+fn putFileWithLeaseAuto(path: str, token: dtoken.LeaseToken): result.Result[str] =
+    let backend = defaultIoBackend()
+    return putFileWithLease(backend, path, token)
+
+fn getToFile(backend: IoBackend, cidText: str, outPath: str): bool =
+    return druntime.getToFile(backend.runtime, cidText, outPath)

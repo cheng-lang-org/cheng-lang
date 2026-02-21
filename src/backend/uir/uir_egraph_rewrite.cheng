@@ -1,0 +1,333 @@
+# UIR e-graph rewrite façade (phase-2): deterministic, conservative local rewrites.
+import cheng/backend/uir/uir_types
+import cheng/backend/uir/uir_internal/uir_core_types
+import cheng/backend/uir/uir_egraph_cost
+
+fn uirExprIsConst(expr: UirExpr, value: int64): bool =
+    if expr == nil || uirExprKindOf(expr) != meConstI64:
+        return false
+    return uirExprConstValueOf(expr) == value
+
+fn uirExprEqual(a: UirExpr, b: UirExpr): bool =
+    if a == b:
+        return true
+    if a == nil || b == nil:
+        return false
+    let ka: UirExprKind = uirExprKindOf(a)
+    let kb: UirExprKind = uirExprKindOf(b)
+    if ka != kb:
+        return false
+    if ka == meConstI64:
+        return uirExprConstValueOf(a) == uirExprConstValueOf(b)
+    if ka == meLocal:
+        return uirExprLocalIndexOf(a) == uirExprLocalIndexOf(b)
+    if ka == meAddr:
+        return uirExprLocalIndexOf(a) == uirExprLocalIndexOf(b)
+    if ka == meGlobalAddr:
+        return uirStrCmp(uirExprGlobalNameOf(a), uirExprGlobalNameOf(b)) == 0
+    if ka == meCall:
+        if uirStrCmp(uirExprCalleeOf(a), uirExprCalleeOf(b)) != 0:
+            return false
+        let n: int32 = uirExprArgsLen(a)
+        if n != uirExprArgsLen(b):
+            return false
+        for i in 0..<n:
+            if !uirExprEqual(uirExprArgAt(a, i), uirExprArgAt(b, i)):
+                return false
+        return true
+    if ka == meBin:
+        if uirExprBinOpOf(a) != uirExprBinOpOf(b):
+            return false
+        return uirExprEqual(uirExprLhsOf(a), uirExprLhsOf(b)) && uirExprEqual(uirExprRhsOf(a), uirExprRhsOf(b))
+    if ka == meCmp:
+        if uirExprCmpOpOf(a) != uirExprCmpOpOf(b):
+            return false
+        return uirExprEqual(uirExprLhsOf(a), uirExprLhsOf(b)) && uirExprEqual(uirExprRhsOf(a), uirExprRhsOf(b))
+    if ka == meCast:
+        return uirExprEqual(uirExprCastExprOf(a), uirExprCastExprOf(b))
+    if ka == meLoad:
+        return uirExprEqual(uirExprAddrExprOf(a), uirExprAddrExprOf(b))
+    return false
+
+fn uirExprNodeCount(expr: UirExpr): int32 =
+    if expr == nil:
+        return 0
+    let k: UirExprKind = uirExprKindOf(expr)
+    if k == meBin || k == meCmp:
+        return 1 + uirExprNodeCount(uirExprLhsOf(expr)) + uirExprNodeCount(uirExprRhsOf(expr))
+    if k == meCall:
+        var n: int32 = 1
+        for i in 0..<uirExprArgsLen(expr):
+            n = n + uirExprNodeCount(uirExprArgAt(expr, i))
+        return n
+    if k == meCast:
+        return 1 + uirExprNodeCount(uirExprCastExprOf(expr))
+    if k == meLoad:
+        return 1 + uirExprNodeCount(uirExprAddrExprOf(expr))
+    return 1
+
+fn uirExprLatencyCost(expr: UirExpr): int32 =
+    if expr == nil:
+        return 0
+    let k: UirExprKind = uirExprKindOf(expr)
+    if k == meBin:
+        let op: UirBinOp = uirExprBinOpOf(expr)
+        var selfCost: int32 = 1
+        if op == mbMul:
+            selfCost = 4
+        elif op == mbSdiv || op == mbSmod:
+            selfCost = 7
+        elif op == mbShl || op == mbShr:
+            selfCost = 2
+        return selfCost + uirExprLatencyCost(uirExprLhsOf(expr)) + uirExprLatencyCost(uirExprRhsOf(expr))
+    if k == meCmp:
+        return 1 + uirExprLatencyCost(uirExprLhsOf(expr)) + uirExprLatencyCost(uirExprRhsOf(expr))
+    if k == meCall:
+        var n: int32 = 8
+        for i in 0..<uirExprArgsLen(expr):
+            n = n + uirExprLatencyCost(uirExprArgAt(expr, i))
+        return n
+    if k == meCast:
+        return 1 + uirExprLatencyCost(uirExprCastExprOf(expr))
+    if k == meLoad:
+        return 3 + uirExprLatencyCost(uirExprAddrExprOf(expr))
+    return 0
+
+fn uirTryCostAccept(goal: str, iterBudget: int32, beforeExpr: UirExpr, afterExpr: UirExpr, ruleHits: int32): bool =
+    if beforeExpr == nil || afterExpr == nil:
+        return false
+    let oldNodes: int32 = uirExprNodeCount(beforeExpr)
+    let newNodes: int32 = uirExprNodeCount(afterExpr)
+    let oldCost: int32 = uirExprLatencyCost(beforeExpr)
+    let newCost: int32 = uirExprLatencyCost(afterExpr)
+    let oldScore: int32 = uirEGraphScore(goal, oldNodes, oldCost + ruleHits, iterBudget)
+    let newScore: int32 = uirEGraphScore(goal, newNodes, newCost + ruleHits + 1, iterBudget)
+    return uirEGraphCostAccept(goal, oldScore, newScore, oldNodes, newNodes)
+
+fn uirExprTryConstI64(expr: UirExpr, out: int64*): bool =
+    if expr == nil || out == nil:
+        return false
+    if uirExprKindOf(expr) != meConstI64:
+        return false
+    *out = uirExprConstValueOf(expr)
+    return true
+
+fn uirTryFoldConstIntAlgebra(op: UirBinOp, lhs: int64, rhs: int64, folded: int64*): bool =
+    if folded == nil:
+        return false
+    if op == mbAnd:
+        *folded = lhs & rhs
+        return true
+    if op == mbOr:
+        *folded = lhs | rhs
+        return true
+    if op == mbXor:
+        *folded = lhs ^ rhs
+        return true
+    if op != mbShl && op != mbShr:
+        return false
+    if rhs < 0 || rhs >= 63:
+        return false
+    let sh: int32 = int32(rhs)
+    if op == mbShl:
+        *folded = lhs << sh
+    else:
+        *folded = lhs >> sh
+    return true
+
+fn uirTryRewriteIntAlgebra(cur: UirExpr, goal: str, iterBudget: int32, changed: bool*, ruleHits: int32*): UirExpr =
+    if cur == nil || uirExprKindOf(cur) != meBin:
+        return cur
+    let op: UirBinOp = uirExprBinOpOf(cur)
+    let lhs: UirExpr = uirExprLhsOf(cur)
+    let rhs: UirExpr = uirExprRhsOf(cur)
+
+    var lhsConst: int64 = 0
+    var rhsConst: int64 = 0
+    let hasLhsConst: bool = uirExprTryConstI64(lhs, &lhsConst)
+    let hasRhsConst: bool = uirExprTryConstI64(rhs, &rhsConst)
+
+    var cand: UirExpr = nil
+    if hasLhsConst && hasRhsConst:
+        var folded: int64 = 0
+        if uirTryFoldConstIntAlgebra(op, lhsConst, rhsConst, &folded):
+            cand = uirCoreConstI64(folded)
+
+    # Integer algebra subset: absorb dominant bit patterns.
+    if cand == nil && op == mbOr && ((hasLhsConst && lhsConst == -1) || (hasRhsConst && rhsConst == -1)):
+        cand = uirCoreConstI64(-1)
+
+    # Integer algebra subset: absorption laws.
+    if cand == nil && op == mbAnd:
+        if rhs != nil && uirExprKindOf(rhs) == meBin && uirExprBinOpOf(rhs) == mbOr:
+            if uirExprEqual(lhs, uirExprLhsOf(rhs)) || uirExprEqual(lhs, uirExprRhsOf(rhs)):
+                cand = lhs
+        elif lhs != nil && uirExprKindOf(lhs) == meBin && uirExprBinOpOf(lhs) == mbOr:
+            if uirExprEqual(rhs, uirExprLhsOf(lhs)) || uirExprEqual(rhs, uirExprRhsOf(lhs)):
+                cand = rhs
+    if cand == nil && op == mbOr:
+        if rhs != nil && uirExprKindOf(rhs) == meBin && uirExprBinOpOf(rhs) == mbAnd:
+            if uirExprEqual(lhs, uirExprLhsOf(rhs)) || uirExprEqual(lhs, uirExprRhsOf(rhs)):
+                cand = lhs
+        elif lhs != nil && uirExprKindOf(lhs) == meBin && uirExprBinOpOf(lhs) == mbAnd:
+            if uirExprEqual(rhs, uirExprLhsOf(lhs)) || uirExprEqual(rhs, uirExprRhsOf(lhs)):
+                cand = rhs
+
+    if cand == nil || uirExprEqual(cand, cur):
+        return cur
+    if !uirTryCostAccept(goal, iterBudget, cur, cand, *ruleHits):
+        return cur
+    *changed = true
+    *ruleHits = *ruleHits + 1
+    return cand
+
+fn uirRewriteExpr(expr: UirExpr, goal: str, iterBudget: int32, changed: bool*, ruleHits: int32*): UirExpr =
+    if expr == nil:
+        return nil
+    var cur: UirCoreExpr = expr
+    let k: UirExprKind = uirExprKindOf(cur)
+    if k == meBin || k == meCmp:
+        cur.lhs = uirRewriteExpr(cur.lhs, goal, iterBudget, changed, ruleHits)
+        cur.rhs = uirRewriteExpr(cur.rhs, goal, iterBudget, changed, ruleHits)
+    elif k == meCall:
+        for i in 0..<cur.args.len:
+            cur.args[i] = uirRewriteExpr(cur.args[i], goal, iterBudget, changed, ruleHits)
+    elif k == meCast:
+        cur.castExpr = uirRewriteExpr(cur.castExpr, goal, iterBudget, changed, ruleHits)
+    elif k == meLoad:
+        cur.addrExpr = uirRewriteExpr(cur.addrExpr, goal, iterBudget, changed, ruleHits)
+
+    if k == meCast:
+        let inner: UirExpr = cur.castExpr
+        if inner != nil && uirExprKindOf(inner) == meCast:
+            let cand: UirExpr = uirExprCastExprOf(inner)
+            if cand != nil && !uirExprEqual(cand, cur) && uirTryCostAccept(goal, iterBudget, cur, cand, *ruleHits):
+                *changed = true
+                *ruleHits = *ruleHits + 1
+                return cand
+        return cur
+
+    if k == meCmp:
+        if uirExprEqual(cur.lhs, cur.rhs):
+            var fold: int64 = 0
+            let op: UirCmpOp = uirExprCmpOpOf(cur)
+            if op == mcEq || op == mcLe || op == mcGe:
+                fold = 1
+            let cand: UirExpr = uirCoreConstI64(fold)
+            if !uirExprEqual(cand, cur) && uirTryCostAccept(goal, iterBudget, cur, cand, *ruleHits):
+                *changed = true
+                *ruleHits = *ruleHits + 1
+                return cand
+        return cur
+
+    if k != meBin:
+        return cur
+
+    let op: UirBinOp = uirExprBinOpOf(cur)
+    let lhs: UirExpr = cur.lhs
+    let rhs: UirExpr = cur.rhs
+
+    let intAlgRewritten: UirExpr = uirTryRewriteIntAlgebra(cur, goal, iterBudget, changed, ruleHits)
+    if !uirExprEqual(intAlgRewritten, cur):
+        return intAlgRewritten
+
+    var cand: UirExpr = nil
+    if op == mbAdd:
+        if uirExprIsConst(rhs, 0):
+            cand = lhs
+        elif uirExprIsConst(lhs, 0):
+            cand = rhs
+    elif op == mbSub:
+        if uirExprIsConst(rhs, 0):
+            cand = lhs
+        elif uirExprEqual(lhs, rhs):
+            cand = uirCoreConstI64(0)
+    elif op == mbMul:
+        if uirExprIsConst(rhs, 1):
+            cand = lhs
+        elif uirExprIsConst(lhs, 1):
+            cand = rhs
+        elif uirExprIsConst(lhs, 0) || uirExprIsConst(rhs, 0):
+            cand = uirCoreConstI64(0)
+    elif op == mbSdiv:
+        if uirExprIsConst(rhs, 1):
+            cand = lhs
+    elif op == mbSmod:
+        if uirExprIsConst(rhs, 1):
+            cand = uirCoreConstI64(0)
+    elif op == mbOr:
+        if uirExprIsConst(rhs, 0):
+            cand = lhs
+        elif uirExprIsConst(lhs, 0):
+            cand = rhs
+        elif uirExprEqual(lhs, rhs):
+            cand = lhs
+    elif op == mbXor:
+        if uirExprIsConst(rhs, 0):
+            cand = lhs
+        elif uirExprIsConst(lhs, 0):
+            cand = rhs
+        elif uirExprEqual(lhs, rhs):
+            cand = uirCoreConstI64(0)
+    elif op == mbAnd:
+        if uirExprIsConst(rhs, -1):
+            cand = lhs
+        elif uirExprIsConst(lhs, -1):
+            cand = rhs
+        elif uirExprIsConst(rhs, 0) || uirExprIsConst(lhs, 0):
+            cand = uirCoreConstI64(0)
+        elif uirExprEqual(lhs, rhs):
+            cand = lhs
+    elif op == mbShl || op == mbShr:
+        if uirExprIsConst(rhs, 0):
+            cand = lhs
+
+    if cand == nil || uirExprEqual(cand, cur):
+        return cur
+    if !uirTryCostAccept(goal, iterBudget, cur, cand, *ruleHits):
+        return cur
+    *changed = true
+    *ruleHits = *ruleHits + 1
+    return cand
+
+fn uirRunEGraphRewrite(module: UirModule, iterBudget: int32, goal: str, requireProof: bool): bool =
+    if module == nil:
+        return false
+    let normalizedGoal: str = uirEGraphNormalizeGoal(goal)
+    var rounds: int32 = iterBudget
+    if rounds <= 0:
+        rounds = 1
+    if rounds > 32:
+        rounds = 32
+    var changedAny: bool = false
+    for round in 0..<rounds:
+        var roundChanged: bool = false
+        var ruleHits: int32 = 0
+        for fi in 0..<uirModuleFuncsLen(module):
+            let funcView: UirFunc = uirModuleFuncAt(module, fi)
+            if funcView == nil || uirFuncIsExtern(funcView):
+                continue
+            let func: UirCoreFunc = funcView
+            if requireProof && (!func.highUirChecked || !func.lowUirLowered):
+                continue
+            for bi in 0..<func.blocks.len:
+                let blkView: UirLowerBlock = func.blocks[bi]
+                if blkView == nil:
+                    continue
+                let blk: UirCoreBlock = blkView
+                for si in 0..<blk.stmts.len:
+                    var st: UirCoreStmt = blk.stmts[si]
+                    if st.expr != nil:
+                        st.expr = uirRewriteExpr(st.expr, normalizedGoal, rounds, &roundChanged, &ruleHits)
+                    if st.kind == msStore && st.addrExpr != nil:
+                        st.addrExpr = uirRewriteExpr(st.addrExpr, normalizedGoal, rounds, &roundChanged, &ruleHits)
+                    blk.stmts[si] = st
+                if blk.term.kind == mtRet && blk.term.retExpr != nil:
+                    blk.term.retExpr = uirRewriteExpr(blk.term.retExpr, normalizedGoal, rounds, &roundChanged, &ruleHits)
+                elif blk.term.kind == mtCbr && blk.term.condExpr != nil:
+                    blk.term.condExpr = uirRewriteExpr(blk.term.condExpr, normalizedGoal, rounds, &roundChanged, &ruleHits)
+                func.blocks[bi] = blk
+        if !roundChanged:
+            break
+        changedAny = true
+    return changedAny

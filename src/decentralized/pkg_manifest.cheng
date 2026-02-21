@@ -1,0 +1,1105 @@
+import std/os
+import std/times
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import cheng/decentralized/registry_local as dreg
+import cheng/libp2p/utils/result as result
+import std/strings
+import std/seqs
+
+type
+    DependencySpec =
+        packageId: str
+        channel: str
+
+    PackageManifest =
+        packageId: str
+        dependencies: DependencySpec[]
+
+    LockedDependency =
+        packageId: str
+        channel: str
+        epoch: int32
+        cidText: str
+        format: str
+        authorId: str
+        pubKeyText: str
+        sigText: str
+
+    PackageLock =
+        packageId: str
+        createdTs: str
+        dependencies: LockedDependency[]
+
+    PackageMeta =
+        packageId: str
+        channel: str
+        epoch: int32
+        cidText: str
+        format: str
+        authorId: str
+        pubKeyText: str
+        sigText: str
+        createdTs: str
+        dependencies: LockedDependency[]
+
+    DependencyConflict =
+        packageId: str
+        channelA: str
+        epochA: int32
+        cidA: str
+        formatA: str
+        channelB: str
+        epochB: int32
+        cidB: str
+        formatB: str
+
+fn initDependencies(): DependencySpec[] =
+    return []
+
+fn initLockedDependencies(): LockedDependency[] =
+    return []
+
+fn copyLockedDependencies(deps: LockedDependency[]): LockedDependency[] =
+    var out = initLockedDependencies()
+    for i in 0..<deps.len:
+        out.add(deps[i])
+    return out
+
+fn normalizeChannel(ch: str): str =
+    if ch == nil || len(ch) == 0:
+        return "stable"
+    return ch
+
+fn normalizeFormat(fmt: str): str =
+    if fmt == nil || len(fmt) == 0:
+        return ""
+    let lowered = strutil.toLowerAscii(strutil.strip(fmt))
+    if lowered == "tar" || lowered == "tar.gz" || lowered == "tgz":
+        return "tar"
+    if lowered == "source" || lowered == "src":
+        return "source"
+    return lowered
+
+fn manifestTs(): str =
+    return times.now().format("unix")
+
+fn firstNonWhitespaceChar(text: str): char =
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch != ' ' && ch != '\n' && ch != '\r' && ch != '\t':
+            return ch
+    return '\0'
+
+fn isJsonContent(text: str): bool =
+    let ch = firstNonWhitespaceChar(text)
+    return ch == '{' || ch == '['
+
+fn fileExtLower(path: str): str =
+    if path == nil || len(path) == 0:
+        return ""
+    var i: int32 = len(path) - 1
+    var dot: int32 = -1
+    let __for_start_i_1 = i
+    for __for_i_1 in 0..(__for_start_i_1 - (0)):
+        i = __for_start_i_1 - __for_i_1
+        let ch = path[i]
+        if ch == '.':
+            dot = i
+            break
+        if ch == '/' || ch == '\\':
+            break
+        i = i - 1
+    if dot < 0:
+        return ""
+    let ext = path[dot..len(path) - 1]
+    return strutil.toLowerAscii(ext)
+
+fn stripTomlComment(line: str): str =
+    var inString = false
+    for i in 0..<len(line):
+        let ch = line[i]
+        if ch == '"' && (i == 0 || line[i - 1] != '\\'):
+            inString = ! inString
+        elif ! inString:
+            if ch == '#' || ch == ';':
+                if i <= 0:
+                    return ""
+                return line[0..i - 1]
+            if ch == '/' && i + 1 < len(line) && line[i + 1] == '/':
+                if i <= 0:
+                    return ""
+                return line[0..i - 1]
+    return line
+
+fn stripYamlComment(line: str): str =
+    var inString = false
+    for i in 0..<len(line):
+        let ch = line[i]
+        if ch == '"' && (i == 0 || line[i - 1] != '\\'):
+            inString = ! inString
+        elif ! inString:
+            if ch == '#':
+                if i <= 0:
+                    return ""
+                return line[0..i - 1]
+    return line
+
+fn splitTomlKeyValue(line: str, key: var str, value: var str): bool =
+    var inString = false
+    for i in 0..<len(line):
+        let ch = line[i]
+        if ch == '"' && (i == 0 || line[i - 1] != '\\'):
+            inString = ! inString
+        elif ch == '=' && ! inString:
+            if i <= 0:
+                return false
+            key = strutil.strip(line[0..i - 1])
+            if i + 1 < len(line):
+                value = strutil.strip(line[i + 1..len(line) - 1])
+            else:
+                value = ""
+            return key != nil && len(key) > 0
+    return false
+
+fn splitYamlKeyValue(line: str, key: var str, value: var str): bool =
+    var inString = false
+    for i in 0..<len(line):
+        let ch = line[i]
+        if ch == '"' && (i == 0 || line[i - 1] != '\\'):
+            inString = ! inString
+        elif ch == ':' && ! inString:
+            if i <= 0:
+                return false
+            key = strutil.strip(line[0..i - 1])
+            if i + 1 < len(line):
+                value = strutil.strip(line[i + 1..len(line) - 1])
+            else:
+                value = ""
+            return key != nil && len(key) > 0
+    return false
+
+fn parseTomlStringValue(raw: str): result.Result[str] =
+    let text = strutil.strip(raw)
+    if text == nil || len(text) < 2:
+        return result.Err[str]("toml: expected str")
+    if text[0] != '"' || text[len(text) - 1] != '"':
+        return result.Err[str]("toml: expected quoted str")
+    var out: str = ""
+    var i: int32 = 1
+    let endPos = len(text) - 1
+    let __for_guard_start_i_1 = i
+    for __for_guard_i_1 in __for_guard_start_i_1..<endPos:
+        if ! (i < endPos):
+            break
+        let ch = text[i]
+        if ch == '\\' && i + 1 < endPos:
+            let esc = text[i + 1]
+            if esc == '"':
+                out = out + charToStr('"')
+            elif esc == '\\':
+                out = out + charToStr('\\')
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + charToStr(esc)
+            i = i + 2
+        else:
+            out = out + charToStr(ch)
+            i = i + 1
+    return result.Ok[str](out)
+
+fn parseYamlStringValue(raw: str): result.Result[str] =
+    let text = strutil.strip(raw)
+    if text == nil || len(text) == 0:
+        return result.Ok[str]("")
+    if text[0] == '"' && text[len(text) - 1] == '"':
+        return parseTomlStringValue(text)
+    return result.Ok[str](text)
+
+fn parseTomlIntValue(raw: str): result.Result[int64] =
+    let text = strutil.strip(raw)
+    if text == nil || len(text) == 0:
+        return result.Err[int64]("toml: expected int")
+    var i: int32 = 0
+    var sign: int64 = 1
+    if text[0] == '-':
+        sign = -1
+        i = 1
+    var value: int64 = 0
+    var hadDigit = false
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<len(text):
+        i = __for_i_2
+        let ch = text[i]
+        if ch == '_':
+            i = i + 1
+            continue
+        if ch < '0' || ch > '9':
+            return result.Err[int64]("toml: invalid int")
+        hadDigit = true
+        value = value * 10 + int64(ch) - int64('0')
+        i = i + 1
+    if ! hadDigit:
+        return result.Err[int64]("toml: invalid int")
+    return result.Ok[int64](value * sign)
+
+fn escapeQuotedString(value: str): str =
+    if value == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(value):
+        let ch = value[i]
+        if ch == '"':
+            out = out + "\\\""
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn quoteTomlString(value: str): str =
+    return "\"" + escapeQuotedString(value) + "\""
+
+fn quoteYamlString(value: str): str =
+    return "\"" + escapeQuotedString(value) + "\""
+
+fn parseDependencyJson(node: json.JsonNode): result.Result[DependencySpec] =
+    if node == nil || node.kind != json.JObject:
+        return result.Err[DependencySpec]("manifest: invalid dependency entry")
+    var dep: DependencySpec
+    dep.packageId = jparse.getStringField(node, "package_id", "")
+    dep.channel = normalizeChannel(jparse.getStringField(node, "channel", ""))
+    if dep.packageId == nil || len(dep.packageId) == 0:
+        return result.Err[DependencySpec]("manifest: dependency missing package_id")
+    return result.Ok[DependencySpec](dep)
+
+fn parseManifestJson(content: str): result.Result[PackageManifest] =
+    let parsed: jparse.ParseResult = jparse.parseJsonSafe(content)
+    if ! parsed.ok:
+        return result.Err[PackageManifest](parsed.error)
+    let root = parsed.value
+    if root == nil || root.kind != json.JObject:
+        return result.Err[PackageManifest]("manifest: expected object")
+    var out: PackageManifest
+    out.dependencies = initDependencies()
+    out.packageId = jparse.getStringField(root, "package_id", "")
+    if out.packageId == nil || len(out.packageId) == 0:
+        return result.Err[PackageManifest]("manifest: missing package_id")
+    let depsNode = root["dependencies"]
+    if depsNode != nil && depsNode.kind == json.JArray:
+        for i in 0..<depsNode.a.len:
+            let depRes: result.Result[DependencySpec] = parseDependencyJson(depsNode.a[i])
+            if result.IsErr(depRes):
+                return result.Err[PackageManifest](result.Error(depRes))
+            out.dependencies.add(result.Value(depRes))
+    return result.Ok[PackageManifest](out)
+
+fn finalizeManifestDep(dep: DependencySpec, out: var PackageManifest): result.Result[bool] =
+    if dep.packageId == nil || len(dep.packageId) == 0:
+        return result.Err[bool]("manifest: dependency missing package_id")
+    var norm = dep
+    norm.channel = normalizeChannel(dep.channel)
+    out.dependencies.add(norm)
+    return result.Ok[bool](true)
+
+fn parseManifestToml(content: str): result.Result[PackageManifest] =
+    var out: PackageManifest
+    out.dependencies = initDependencies()
+    var current: DependencySpec
+    var inDep = false
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        var line = strutil.strip(stripTomlComment(lines[i]))
+        if line == nil || len(line) == 0:
+            continue
+        if line == "[[dependencies]]":
+            if inDep:
+                let finRes: result.Result[bool] = finalizeManifestDep(current, out)
+                if result.IsErr(finRes):
+                    return result.Err[PackageManifest](result.Error(finRes))
+            current = DependencySpec()
+            inDep = true
+            continue
+        if line[0] == '[':
+            return result.Err[PackageManifest]("manifest: unsupported section")
+        var key = ""
+        var value = ""
+        if ! splitTomlKeyValue(line, key, value):
+            return result.Err[PackageManifest]("manifest: invalid line")
+        if inDep:
+            if key == "package_id":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageManifest](result.Error(valRes))
+                current.packageId = result.Value(valRes)
+            elif key == "channel":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageManifest](result.Error(valRes))
+                current.channel = result.Value(valRes)
+            else:
+                return result.Err[PackageManifest]("manifest: unknown dependency key")
+        else:
+            if key == "package_id":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageManifest](result.Error(valRes))
+                out.packageId = result.Value(valRes)
+            else:
+                return result.Err[PackageManifest]("manifest: unknown key")
+    if inDep:
+        let finRes: result.Result[bool] = finalizeManifestDep(current, out)
+        if result.IsErr(finRes):
+            return result.Err[PackageManifest](result.Error(finRes))
+    if out.packageId == nil || len(out.packageId) == 0:
+        return result.Err[PackageManifest]("manifest: missing package_id")
+    return result.Ok[PackageManifest](out)
+
+fn parseManifestYaml(content: str): result.Result[PackageManifest] =
+    var out: PackageManifest
+    out.dependencies = initDependencies()
+    var current: DependencySpec
+    var inDeps = false
+    var hasCurrent = false
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        var line = strutil.strip(stripYamlComment(lines[i]))
+        if line == nil || len(line) == 0:
+            continue
+        let indent = len(lines[i]) - len(strutil.strip(lines[i]))
+        if indent == 0 && strutil.startsWith(line, "dependencies:"):
+            inDeps = true
+            continue
+        if indent == 0 && strutil.startsWith(line, "package_id:"):
+            var key = ""
+            var value = ""
+            if ! splitYamlKeyValue(line, key, value):
+                return result.Err[PackageManifest]("manifest: invalid line")
+            let valRes = parseYamlStringValue(value)
+            if result.IsErr(valRes):
+                return result.Err[PackageManifest](result.Error(valRes))
+            out.packageId = result.Value(valRes)
+            continue
+        if inDeps:
+            if strutil.startsWith(line, "-"):
+                if hasCurrent:
+                    let finRes: result.Result[bool] = finalizeManifestDep(current, out)
+                    if result.IsErr(finRes):
+                        return result.Err[PackageManifest](result.Error(finRes))
+                current = DependencySpec()
+                hasCurrent = true
+                var rest = ""
+                if len(line) > 1:
+                    rest = strutil.strip(line[1..len(line) - 1])
+                if rest != nil && len(rest) > 0:
+                    var key = ""
+                    var value = ""
+                    if ! splitYamlKeyValue(rest, key, value):
+                        return result.Err[PackageManifest]("manifest: invalid dependency line")
+                    if key == "package_id":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageManifest](result.Error(valRes))
+                        current.packageId = result.Value(valRes)
+                    elif key == "channel":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageManifest](result.Error(valRes))
+                        current.channel = result.Value(valRes)
+                    else:
+                        return result.Err[PackageManifest]("manifest: unknown dependency key")
+            else:
+                var key = ""
+                var value = ""
+                if ! splitYamlKeyValue(line, key, value):
+                    return result.Err[PackageManifest]("manifest: invalid dependency line")
+                if key == "package_id":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageManifest](result.Error(valRes))
+                    current.packageId = result.Value(valRes)
+                elif key == "channel":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageManifest](result.Error(valRes))
+                    current.channel = result.Value(valRes)
+                else:
+                    return result.Err[PackageManifest]("manifest: unknown dependency key")
+        else:
+            return result.Err[PackageManifest]("manifest: unknown key")
+    if hasCurrent:
+        let finRes: result.Result[bool] = finalizeManifestDep(current, out)
+        if result.IsErr(finRes):
+            return result.Err[PackageManifest](result.Error(finRes))
+    if out.packageId == nil || len(out.packageId) == 0:
+        return result.Err[PackageManifest]("manifest: missing package_id")
+    return result.Ok[PackageManifest](out)
+
+fn manifestToToml(manifest: PackageManifest): str =
+    var out: str = ""
+    out = out + "package_id = " + quoteTomlString(manifest.packageId) + "\n"
+    for i in 0..<manifest.dependencies.len:
+        let dep = manifest.dependencies[i]
+        out = out + "\n[[dependencies]]\n"
+        out = out + "package_id = " + quoteTomlString(dep.packageId) + "\n"
+        let channel = normalizeChannel(dep.channel)
+        out = out + "channel = " + quoteTomlString(channel) + "\n"
+    return out
+
+fn manifestToYaml(manifest: PackageManifest): str =
+    var out: str = ""
+    out = out + "package_id: " + quoteYamlString(manifest.packageId) + "\n"
+    out = out + "dependencies:\n"
+    for i in 0..<manifest.dependencies.len:
+        let dep = manifest.dependencies[i]
+        out = out + "  - package_id: " + quoteYamlString(dep.packageId) + "\n"
+        let channel = normalizeChannel(dep.channel)
+        out = out + "    channel: " + quoteYamlString(channel) + "\n"
+    return out
+
+fn loadManifestFile(path: str): result.Result[PackageManifest] =
+    if path == nil || len(path) == 0:
+        return result.Err[PackageManifest]("manifest: missing path")
+    if ! os.fileExists(path):
+        return result.Err[PackageManifest]("manifest: file not found")
+    let content = os.readFile(path)
+    if content == nil || len(content) == 0:
+        return result.Err[PackageManifest]("manifest: empty file")
+    let ext = fileExtLower(path)
+    if ext == ".json":
+        return parseManifestJson(content)
+    if ext == ".toml":
+        return parseManifestToml(content)
+    if ext == ".yaml" || ext == ".yml":
+        return parseManifestYaml(content)
+    if isJsonContent(content):
+        return parseManifestJson(content)
+    return parseManifestToml(content)
+
+fn hasLockedDependency(deps: LockedDependency[], packageId: str): bool =
+    for i in 0..<deps.len:
+        if deps[i].packageId == packageId:
+            return true
+    return false
+
+fn sameLockedVersion(a: LockedDependency, b: LockedDependency): bool =
+    return a.channel == b.channel && a.epoch == b.epoch && a.cidText == b.cidText &&
+        a.authorId == b.authorId && normalizeFormat(a.format) == normalizeFormat(b.format)
+
+fn conflictReported(conflicts: DependencyConflict[], packageId: str): bool =
+    for i in 0..<conflicts.len:
+        if conflicts[i].packageId == packageId:
+            return true
+    return false
+
+fn collectDependencyConflicts(lock: PackageLock): DependencyConflict[] =
+    var out: DependencyConflict[] 
+    for i in 0..<lock.dependencies.len:
+        let dep = lock.dependencies[i]
+        if dep.packageId == nil || len(dep.packageId) == 0:
+            continue
+        for j in 0..<i:
+            let other = lock.dependencies[j]
+            if other.packageId == dep.packageId:
+                if ! sameLockedVersion(dep, other) && ! conflictReported(out, dep.packageId):
+                    add[DependencyConflict](out, DependencyConflict(
+                        packageId: dep.packageId,
+                        channelA: other.channel,
+                        epochA: other.epoch,
+                        cidA: other.cidText,
+                        formatA: normalizeFormat(other.format),
+                        channelB: dep.channel,
+                        epochB: dep.epoch,
+                        cidB: dep.cidText,
+                        formatB: normalizeFormat(dep.format)
+                    ))
+                break
+    return out
+
+fn dependencyConflictsToText(conflicts: DependencyConflict[]): str =
+    if conflicts.len == 0:
+        return ""
+    var out: str = ""
+    for i in 0..<conflicts.len:
+        let c = conflicts[i]
+        if len out > 0:
+            out = out + "\n"
+        out = out + "- "
+        out = out + c.packageId
+        out = out + ": "
+        out = out + normalizeChannel c.channelA
+        out = out + "@"
+        out = out + intToStr c.epochA
+        out = out + " "
+        out = out + c.cidA
+        if c.formatA != nil && len c.formatA > 0:
+            out = out + " ["
+            out = out + normalizeFormat c.formatA
+            out = out + "]"
+        out = out + " vs "
+        out = out + normalizeChannel c.channelB
+        out = out + "@"
+        out = out + intToStr c.epochB
+        out = out + " "
+        out = out + c.cidB
+        if c.formatB != nil && len c.formatB > 0:
+            out = out + " ["
+            out = out + normalizeFormat c.formatB
+            out = out + "]"
+    return out
+
+fn resolveManifest(manifest: PackageManifest, registryPath: str): result.Result[PackageLock] =
+    if registryPath == nil || len registryPath == 0:
+        return result.Err[PackageLock] "resolve: missing registry path"
+    var lock: PackageLock
+    lock.packageId = manifest.packageId
+    lock.createdTs = manifestTs()
+    lock.dependencies = initLockedDependencies()
+    for i in 0..<manifest.dependencies.len:
+        let dep = manifest.dependencies[i]
+        if hasLockedDependency(lock.dependencies, dep.packageId):
+            let errMsg: str = "resolve: single-version conflict: " + dep.packageId
+            return result.Err[PackageLock] errMsg
+        let snapRes: result.Result[dreg.PackageSnapshot] =
+            dreg.resolveSnapshot(registryPath, dep.packageId, dep.channel)
+        if result.IsErr snapRes:
+            let errMsg: str = result.Error snapRes
+            return result.Err[PackageLock] errMsg
+        let snap = result.Value snapRes
+        var locked: LockedDependency
+        locked.packageId = dep.packageId
+        locked.channel = dep.channel
+        locked.epoch = snap.epoch
+        locked.cidText = snap.cidText
+        locked.format = normalizeFormat(snap.format)
+        locked.authorId = snap.authorId
+        locked.pubKeyText = snap.pubKeyText
+        locked.sigText = snap.sigText
+        lock.dependencies.add(locked)
+    return result.Ok[PackageLock] lock
+
+fn lockToJson(lock: PackageLock): json.JsonNode =
+    let root = json.newJObject()
+    root["package_id"] = json.newJString(lock.packageId)
+    root["created_ts"] = json.newJString(lock.createdTs)
+    let deps = json.newJArray()
+    for i in 0..<lock.dependencies.len:
+        let dep = lock.dependencies[i]
+        let node = json.newJObject()
+        node["package_id"] = json.newJString(dep.packageId)
+        node["channel"] = json.newJString(dep.channel)
+        node["epoch"] = json.newJInt(dep.epoch)
+        node["cid"] = json.newJString(dep.cidText)
+        if dep.format != nil && len(dep.format) > 0:
+            node["format"] = json.newJString(normalizeFormat(dep.format))
+        node["author_id"] = json.newJString(dep.authorId)
+        if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
+            node["pub_key"] = json.newJString(dep.pubKeyText)
+        if dep.sigText != nil && len(dep.sigText) > 0:
+            node["signature"] = json.newJString(dep.sigText)
+        deps.add(node)
+    root["dependencies"] = deps
+    root
+
+fn lockToToml(lock: PackageLock): str =
+    var out: str = ""
+    out = out + "package_id = " + quoteTomlString(lock.packageId) + "\n"
+    if lock.createdTs != nil && len(lock.createdTs) > 0:
+        out = out + "created_ts = " + quoteTomlString(lock.createdTs) + "\n"
+    for i in 0..<lock.dependencies.len:
+        let dep = lock.dependencies[i]
+        out = out + "\n[[dependencies]]\n"
+        out = out + "package_id = " + quoteTomlString(dep.packageId) + "\n"
+        out = out + "channel = " + quoteTomlString(normalizeChannel(dep.channel)) + "\n"
+        out = out + "epoch = " + intToStr(dep.epoch) + "\n"
+        out = out + "cid = " + quoteTomlString(dep.cidText) + "\n"
+        if dep.format != nil && len(dep.format) > 0:
+            out = out + "format = " + quoteTomlString(normalizeFormat(dep.format)) + "\n"
+        out = out + "author_id = " + quoteTomlString(dep.authorId) + "\n"
+        if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
+            out = out + "pub_key = " + quoteTomlString(dep.pubKeyText) + "\n"
+        if dep.sigText != nil && len(dep.sigText) > 0:
+            out = out + "signature = " + quoteTomlString(dep.sigText) + "\n"
+    return out
+
+fn lockToYaml(lock: PackageLock): str =
+    var out: str = ""
+    out = out + "package_id: " + quoteYamlString(lock.packageId) + "\n"
+    if lock.createdTs != nil && len(lock.createdTs) > 0:
+        out = out + "created_ts: " + quoteYamlString(lock.createdTs) + "\n"
+    out = out + "dependencies:\n"
+    for i in 0..<lock.dependencies.len:
+        let dep = lock.dependencies[i]
+        out = out + "  - package_id: " + quoteYamlString(dep.packageId) + "\n"
+        out = out + "    channel: " + quoteYamlString(normalizeChannel(dep.channel)) + "\n"
+        out = out + "    epoch: " + intToStr(dep.epoch) + "\n"
+        out = out + "    cid: " + quoteYamlString(dep.cidText) + "\n"
+        if dep.format != nil && len(dep.format) > 0:
+            out = out + "    format: " + quoteYamlString(normalizeFormat(dep.format)) + "\n"
+        out = out + "    author_id: " + quoteYamlString(dep.authorId) + "\n"
+        if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
+            out = out + "    pub_key: " + quoteYamlString(dep.pubKeyText) + "\n"
+        if dep.sigText != nil && len(dep.sigText) > 0:
+            out = out + "    signature: " + quoteYamlString(dep.sigText) + "\n"
+    return out
+
+fn parseLockNode(root: json.JsonNode): result.Result[PackageLock] =
+    if root == nil || root.kind != json.JObject:
+        return result.Err[PackageLock]("lock: expected object")
+    var lock: PackageLock
+    lock.dependencies = initLockedDependencies()
+    lock.packageId = jparse.getStringField(root, "package_id", "")
+    lock.createdTs = jparse.getStringField(root, "created_ts", "")
+    if lock.packageId == nil || len(lock.packageId) == 0:
+        return result.Err[PackageLock]("lock: missing package_id")
+    let depsNode = root["dependencies"]
+    if depsNode != nil && depsNode.kind == json.JArray:
+        for i in 0..<depsNode.a.len:
+            let node = depsNode.a[i]
+            if node == nil || node.kind != json.JObject:
+                return result.Err[PackageLock]("lock: invalid dependency entry")
+            var dep: LockedDependency
+            dep.packageId = jparse.getStringField(node, "package_id", "")
+            dep.channel = normalizeChannel(jparse.getStringField(node, "channel", ""))
+            dep.epoch = int32(jparse.getIntField(node, "epoch", 0))
+            dep.cidText = jparse.getStringField(node, "cid", "")
+            dep.format = normalizeFormat(jparse.getStringField(node, "format", ""))
+            dep.authorId = jparse.getStringField(node, "author_id", "")
+            dep.pubKeyText = jparse.getStringField(node, "pub_key", "")
+            dep.sigText = jparse.getStringField(node, "signature", "")
+            if dep.packageId == nil || len(dep.packageId) == 0:
+                return result.Err[PackageLock]("lock: dependency missing package_id")
+            if dep.cidText == nil || len(dep.cidText) == 0:
+                return result.Err[PackageLock]("lock: dependency missing cid")
+            lock.dependencies.add(dep)
+    return result.Ok[PackageLock](lock)
+
+fn parseLockJson(content: str): result.Result[PackageLock] =
+    let parsed: jparse.ParseResult = jparse.parseJsonSafe(content)
+    if ! parsed.ok:
+        return result.Err[PackageLock](parsed.error)
+    return parseLockNode(parsed.value)
+
+fn finalizeLockDep(dep: LockedDependency, lock: var PackageLock): result.Result[bool] =
+    if dep.packageId == nil || len(dep.packageId) == 0:
+        return result.Err[bool]("lock: dependency missing package_id")
+    if dep.cidText == nil || len(dep.cidText) == 0:
+        return result.Err[bool]("lock: dependency missing cid")
+    var norm = dep
+    norm.channel = normalizeChannel(dep.channel)
+    norm.format = normalizeFormat(dep.format)
+    lock.dependencies.add(norm)
+    return result.Ok[bool](true)
+
+fn parseLockToml(content: str): result.Result[PackageLock] =
+    var lock: PackageLock
+    lock.dependencies = initLockedDependencies()
+    var current: LockedDependency
+    var inDep = false
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        var line = strutil.strip(stripTomlComment(lines[i]))
+        if line == nil || len(line) == 0:
+            continue
+        if line == "[[dependencies]]":
+            if inDep:
+                let finRes: result.Result[bool] = finalizeLockDep(current, lock)
+                if result.IsErr(finRes):
+                    return result.Err[PackageLock](result.Error(finRes))
+            current = LockedDependency()
+            inDep = true
+            continue
+        if line[0] == '[':
+            return result.Err[PackageLock]("lock: unsupported section")
+        var key = ""
+        var value = ""
+        if ! splitTomlKeyValue(line, key, value):
+            return result.Err[PackageLock]("lock: invalid line")
+        if inDep:
+            if key == "package_id":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.packageId = result.Value(valRes)
+            elif key == "channel":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.channel = result.Value(valRes)
+            elif key == "epoch":
+                let valRes = parseTomlIntValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.epoch = int32(result.Value(valRes))
+            elif key == "cid":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.cidText = result.Value(valRes)
+            elif key == "format":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.format = normalizeFormat(result.Value(valRes))
+            elif key == "author_id":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.authorId = result.Value(valRes)
+            elif key == "pub_key":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.pubKeyText = result.Value(valRes)
+            elif key == "signature":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.sigText = result.Value(valRes)
+            else:
+                return result.Err[PackageLock]("lock: unknown dependency key")
+        else:
+            if key == "package_id":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                lock.packageId = result.Value(valRes)
+            elif key == "created_ts":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                lock.createdTs = result.Value(valRes)
+            else:
+                return result.Err[PackageLock]("lock: unknown key")
+    if inDep:
+        let finRes: result.Result[bool] = finalizeLockDep(current, lock)
+        if result.IsErr(finRes):
+            return result.Err[PackageLock](result.Error(finRes))
+    if lock.packageId == nil || len(lock.packageId) == 0:
+        return result.Err[PackageLock]("lock: missing package_id")
+    return result.Ok[PackageLock](lock)
+
+fn parseLockYaml(content: str): result.Result[PackageLock] =
+    var lock: PackageLock
+    lock.dependencies = initLockedDependencies()
+    var current: LockedDependency
+    var inDeps = false
+    var hasCurrent = false
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        var line = strutil.strip(stripYamlComment(lines[i]))
+        if line == nil || len(line) == 0:
+            continue
+        let indent = len(lines[i]) - len(strutil.strip(lines[i]))
+        if indent == 0 && strutil.startsWith(line, "dependencies:"):
+            inDeps = true
+            continue
+        if indent == 0:
+            var key = ""
+            var value = ""
+            if ! splitYamlKeyValue(line, key, value):
+                return result.Err[PackageLock]("lock: invalid line")
+            if key == "package_id":
+                let valRes = parseYamlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                lock.packageId = result.Value(valRes)
+            elif key == "created_ts":
+                let valRes = parseYamlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                lock.createdTs = result.Value(valRes)
+            else:
+                return result.Err[PackageLock]("lock: unknown key")
+            continue
+        if inDeps:
+            if strutil.startsWith(line, "-"):
+                if hasCurrent:
+                    let finRes: result.Result[bool] = finalizeLockDep(current, lock)
+                    if result.IsErr(finRes):
+                        return result.Err[PackageLock](result.Error(finRes))
+                current = LockedDependency()
+                hasCurrent = true
+                var rest = ""
+                if len(line) > 1:
+                    rest = strutil.strip(line[1..len(line) - 1])
+                if rest != nil && len(rest) > 0:
+                    var key = ""
+                    var value = ""
+                    if ! splitYamlKeyValue(rest, key, value):
+                        return result.Err[PackageLock]("lock: invalid dependency line")
+                    if key == "package_id":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.packageId = result.Value(valRes)
+                    elif key == "channel":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.channel = result.Value(valRes)
+                    elif key == "epoch":
+                        let valRes = parseTomlIntValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.epoch = int32(result.Value(valRes))
+                    elif key == "cid":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.cidText = result.Value(valRes)
+                    elif key == "format":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.format = normalizeFormat(result.Value(valRes))
+                    elif key == "author_id":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.authorId = result.Value(valRes)
+                    elif key == "pub_key":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.pubKeyText = result.Value(valRes)
+                    elif key == "signature":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.sigText = result.Value(valRes)
+                    else:
+                        return result.Err[PackageLock]("lock: unknown dependency key")
+            else:
+                var key = ""
+                var value = ""
+                if ! splitYamlKeyValue(line, key, value):
+                    return result.Err[PackageLock]("lock: invalid dependency line")
+                if key == "package_id":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.packageId = result.Value(valRes)
+                elif key == "channel":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.channel = result.Value(valRes)
+                elif key == "epoch":
+                    let valRes = parseTomlIntValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.epoch = int32(result.Value(valRes))
+                elif key == "cid":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.cidText = result.Value(valRes)
+                elif key == "format":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.format = normalizeFormat(result.Value(valRes))
+                elif key == "author_id":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.authorId = result.Value(valRes)
+                elif key == "pub_key":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.pubKeyText = result.Value(valRes)
+                elif key == "signature":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.sigText = result.Value(valRes)
+                else:
+                    return result.Err[PackageLock]("lock: unknown dependency key")
+    if hasCurrent:
+        let finRes: result.Result[bool] = finalizeLockDep(current, lock)
+        if result.IsErr(finRes):
+            return result.Err[PackageLock](result.Error(finRes))
+    if lock.packageId == nil || len(lock.packageId) == 0:
+        return result.Err[PackageLock]("lock: missing package_id")
+    return result.Ok[PackageLock](lock)
+
+fn parseLock(content: str): result.Result[PackageLock] =
+    if isJsonContent(content):
+        return parseLockJson(content)
+    return parseLockToml(content)
+
+fn loadLockFile(path: str): result.Result[PackageLock] =
+    if path == nil || len(path) == 0:
+        return result.Err[PackageLock]("lock: missing path")
+    if ! os.fileExists(path):
+        return result.Err[PackageLock]("lock: file not found")
+    let content = os.readFile(path)
+    if content == nil || len(content) == 0:
+        return result.Err[PackageLock]("lock: empty file")
+    let ext = fileExtLower(path)
+    if ext == ".json":
+        return parseLockJson(content)
+    if ext == ".toml":
+        return parseLockToml(content)
+    if ext == ".yaml" || ext == ".yml":
+        return parseLockYaml(content)
+    return parseLock(content)
+
+fn verifyLock(lock: PackageLock): bool =
+    for i in 0..<lock.dependencies.len:
+        let dep = lock.dependencies[i]
+        var snap: dreg.PackageSnapshot
+        snap.packageId = dep.packageId
+        snap.channel = dep.channel
+        snap.epoch = dep.epoch
+        snap.cidText = dep.cidText
+        snap.format = normalizeFormat(dep.format)
+        snap.authorId = dep.authorId
+        snap.pubKeyText = dep.pubKeyText
+        snap.sigText = dep.sigText
+        if ! dreg.verifySnapshot(snap):
+            return false
+    return true
+
+fn verifyLockAgainstRegistry(lock: PackageLock, registryPath: str): bool =
+    if registryPath == nil || len(registryPath) == 0:
+        return false
+    for i in 0..<lock.dependencies.len:
+        let dep = lock.dependencies[i]
+        let snapRes: result.Result[dreg.PackageSnapshot] =
+            dreg.resolveSnapshot(registryPath, dep.packageId, dep.channel)
+        if result.IsErr(snapRes):
+            return false
+        let snap = result.Value(snapRes)
+        if snap.cidText != dep.cidText || snap.epoch != dep.epoch:
+            return false
+        let depFormat = normalizeFormat(dep.format)
+        let snapFormat = normalizeFormat(snap.format)
+        if (depFormat != nil && len(depFormat) > 0) || (snapFormat != nil && len(snapFormat) > 0):
+            if depFormat != snapFormat:
+                return false
+    return true
+
+fn buildMetaFromLock(lock: PackageLock, snap: dreg.PackageSnapshot): PackageMeta =
+    var meta: PackageMeta
+    meta.packageId = lock.packageId
+    meta.channel = snap.channel
+    meta.epoch = snap.epoch
+    meta.cidText = snap.cidText
+    meta.format = normalizeFormat(snap.format)
+    meta.authorId = snap.authorId
+    meta.pubKeyText = snap.pubKeyText
+    meta.sigText = snap.sigText
+    meta.createdTs = lock.createdTs
+    meta.dependencies = copyLockedDependencies(lock.dependencies)
+    return meta
+
+fn metaToJson(meta: PackageMeta): json.JsonNode =
+    let root = json.newJObject()
+    root["package_id"] = json.newJString(meta.packageId)
+    root["channel"] = json.newJString(normalizeChannel(meta.channel))
+    root["epoch"] = json.newJInt(meta.epoch)
+    root["cid"] = json.newJString(meta.cidText)
+    if meta.format != nil && len(meta.format) > 0:
+        root["format"] = json.newJString(normalizeFormat(meta.format))
+    root["author_id"] = json.newJString(meta.authorId)
+    if meta.pubKeyText != nil && len(meta.pubKeyText) > 0:
+        root["pub_key"] = json.newJString(meta.pubKeyText)
+    if meta.sigText != nil && len(meta.sigText) > 0:
+        root["signature"] = json.newJString(meta.sigText)
+    if meta.createdTs != nil && len(meta.createdTs) > 0:
+        root["created_ts"] = json.newJString(meta.createdTs)
+    let deps = json.newJArray()
+    for i in 0..<meta.dependencies.len:
+        let dep = meta.dependencies[i]
+        let node = json.newJObject()
+        node["package_id"] = json.newJString(dep.packageId)
+        node["channel"] = json.newJString(normalizeChannel(dep.channel))
+        node["epoch"] = json.newJInt(dep.epoch)
+        node["cid"] = json.newJString(dep.cidText)
+        if dep.format != nil && len(dep.format) > 0:
+            node["format"] = json.newJString(normalizeFormat(dep.format))
+        node["author_id"] = json.newJString(dep.authorId)
+        if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
+            node["pub_key"] = json.newJString(dep.pubKeyText)
+        if dep.sigText != nil && len(dep.sigText) > 0:
+            node["signature"] = json.newJString(dep.sigText)
+        deps.add(node)
+    root["dependencies"] = deps
+    root
+
+fn metaToToml(meta: PackageMeta): str =
+    var out: str = ""
+    out = out + "package_id = " + quoteTomlString(meta.packageId) + "\n"
+    out = out + "channel = " + quoteTomlString(normalizeChannel(meta.channel)) + "\n"
+    out = out + "epoch = " + intToStr(meta.epoch) + "\n"
+    out = out + "cid = " + quoteTomlString(meta.cidText) + "\n"
+    if meta.format != nil && len(meta.format) > 0:
+        out = out + "format = " + quoteTomlString(normalizeFormat(meta.format)) + "\n"
+    out = out + "author_id = " + quoteTomlString(meta.authorId) + "\n"
+    if meta.pubKeyText != nil && len(meta.pubKeyText) > 0:
+        out = out + "pub_key = " + quoteTomlString(meta.pubKeyText) + "\n"
+    if meta.sigText != nil && len(meta.sigText) > 0:
+        out = out + "signature = " + quoteTomlString(meta.sigText) + "\n"
+    if meta.createdTs != nil && len(meta.createdTs) > 0:
+        out = out + "created_ts = " + quoteTomlString(meta.createdTs) + "\n"
+    for i in 0..<meta.dependencies.len:
+        let dep = meta.dependencies[i]
+        out = out + "\n[[dependencies]]\n"
+        out = out + "package_id = " + quoteTomlString(dep.packageId) + "\n"
+        out = out + "channel = " + quoteTomlString(normalizeChannel(dep.channel)) + "\n"
+        out = out + "epoch = " + intToStr(dep.epoch) + "\n"
+        out = out + "cid = " + quoteTomlString(dep.cidText) + "\n"
+        if dep.format != nil && len(dep.format) > 0:
+            out = out + "format = " + quoteTomlString(normalizeFormat(dep.format)) + "\n"
+        out = out + "author_id = " + quoteTomlString(dep.authorId) + "\n"
+        if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
+            out = out + "pub_key = " + quoteTomlString(dep.pubKeyText) + "\n"
+        if dep.sigText != nil && len(dep.sigText) > 0:
+            out = out + "signature = " + quoteTomlString(dep.sigText) + "\n"
+    return out
+
+fn metaToYaml(meta: PackageMeta): str =
+    var out: str = ""
+    out = out + "package_id: " + quoteYamlString(meta.packageId) + "\n"
+    out = out + "channel: " + quoteYamlString(normalizeChannel(meta.channel)) + "\n"
+    out = out + "epoch: " + intToStr(meta.epoch) + "\n"
+    out = out + "cid: " + quoteYamlString(meta.cidText) + "\n"
+    if meta.format != nil && len(meta.format) > 0:
+        out = out + "format: " + quoteYamlString(normalizeFormat(meta.format)) + "\n"
+    out = out + "author_id: " + quoteYamlString(meta.authorId) + "\n"
+    if meta.pubKeyText != nil && len(meta.pubKeyText) > 0:
+        out = out + "pub_key: " + quoteYamlString(meta.pubKeyText) + "\n"
+    if meta.sigText != nil && len(meta.sigText) > 0:
+        out = out + "signature: " + quoteYamlString(meta.sigText) + "\n"
+    if meta.createdTs != nil && len(meta.createdTs) > 0:
+        out = out + "created_ts: " + quoteYamlString(meta.createdTs) + "\n"
+    out = out + "dependencies:\n"
+    for i in 0..<meta.dependencies.len:
+        let dep = meta.dependencies[i]
+        out = out + "  - package_id: " + quoteYamlString(dep.packageId) + "\n"
+        out = out + "    channel: " + quoteYamlString(normalizeChannel(dep.channel)) + "\n"
+        out = out + "    epoch: " + intToStr(dep.epoch) + "\n"
+        out = out + "    cid: " + quoteYamlString(dep.cidText) + "\n"
+        if dep.format != nil && len(dep.format) > 0:
+            out = out + "    format: " + quoteYamlString(normalizeFormat(dep.format)) + "\n"
+        out = out + "    author_id: " + quoteYamlString(dep.authorId) + "\n"
+        if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
+            out = out + "    pub_key: " + quoteYamlString(dep.pubKeyText) + "\n"
+        if dep.sigText != nil && len(dep.sigText) > 0:
+            out = out + "    signature: " + quoteYamlString(dep.sigText) + "\n"
+    return out

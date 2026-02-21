@@ -1,0 +1,2251 @@
+# Stage1 frontend (internal pipeline + fallback).
+import std/os
+import std/strings
+import std/seqs
+import std/hashmaps
+import std/hashsets
+import std/monotimes
+import cheng/stage1/lexer
+import cheng/stage1/parser
+import cheng/stage1/ast
+import cheng/stage1/type_syntax_lowering
+import cheng/stage1/semantics
+import cheng/stage1/monomorphize
+import cheng/stage1/c_profile_lowering
+import cheng/stage1/ownership
+import cheng/stage1/diagnostics
+
+fn stage1_c_getenv(name: cstring): str =
+    return os.getEnvDefault(name, "")
+fn stage1_memRelease(p: void*) =
+    memRelease(p)
+
+fn stage1_getEnv(name: str): str =
+    let v: str = stage1_c_getenv name
+    if v == nil:
+        return ""
+    return v
+
+fn lowerAscii(s: str): str =
+    if s == nil:
+        return ""
+    let n: int32 = len s
+    if n == 0:
+        return ""
+    let p: void* = alloc(n + 1)
+    for i in 0..<n:
+        let c: char = s[i]
+        var out: char = c
+        if c >= 'A' && c <= 'Z':
+            let oc: int32 = int32(c) + 32
+            out = chr oc
+        let dst: void* = ptr_add(p, i)
+        var pc: char* = char*(dst)
+        *pc = out
+    setMem(ptr_add(p, n), 0, 1)
+    return str(p)
+
+fn envIsTrue(name: str): bool =
+    let raw: str = stage1_getEnv(name)
+    if raw == nil:
+        return false
+    let n: int32 = len raw
+    if n == 0:
+        return false
+    let c0: char = raw[0]
+    if c0 == '1':
+        return n == 1
+    if c0 == 't' || c0 == 'T':
+        if n != 4:
+            return false
+        let c1: char = raw[1]
+        if c1 != 'r' && c1 != 'R':
+            return false
+        let c2: char = raw[2]
+        if c2 != 'u' && c2 != 'U':
+            return false
+        let c3: char = raw[3]
+        if c3 != 'e' && c3 != 'E':
+            return false
+        return true
+    if c0 == 'y' || c0 == 'Y':
+        if n != 3:
+            return false
+        let c1: char = raw[1]
+        if c1 != 'e' && c1 != 'E':
+            return false
+        let c2: char = raw[2]
+        if c2 != 's' && c2 != 'S':
+            return false
+        return true
+    return false
+
+fn stage1_autoSystemEnabled(): bool =
+    let raw: str = lowerAscii(stage1_getEnv("STAGE1_AUTO_SYSTEM"))
+    if raw == "":
+        return true
+    if raw == "0" || raw == "false" || raw == "no":
+        return false
+    if raw == "1" || raw == "true" || raw == "yes":
+        return true
+    return true
+
+var stage1TraceEnabledCached: int32 = -1
+var stage1TraceImportsEnabledCached: int32 = -1
+var stage1TraceFlushEnabledCached: int32 = -1
+var stage1GuiRootCached: str = nil
+var stage1GuiRootCachedReady: bool = false
+var stage1IdeRootCached: str = nil
+var stage1IdeRootCachedReady: bool = false
+var stage1PkgRootsCached: str[]
+var stage1PkgRootsCachedReady: bool = false
+var stage1PluginEnableCached: int32 = -1
+var stage1PluginPathsCachedReady: bool = false
+var stage1PluginPathsCached: str[]
+var stage1PluginMeteringCached: str = nil
+
+fn stage1TraceEnabled(): bool =
+    if stage1TraceEnabledCached >= 0:
+        return stage1TraceEnabledCached == 1
+    stage1TraceEnabledCached = envIsTrue("STAGE1_TRACE") ? 1 : 0
+    return stage1TraceEnabledCached == 1
+
+fn stage1TraceImportsEnabled(): bool =
+    if stage1TraceImportsEnabledCached >= 0:
+        return stage1TraceImportsEnabledCached == 1
+    stage1TraceImportsEnabledCached = envIsTrue("STAGE1_TRACE_IMPORTS") ? 1 : 0
+    return stage1TraceImportsEnabledCached == 1
+
+fn stage1TraceFlushEnabled(): bool =
+    if stage1TraceFlushEnabledCached >= 0:
+        return stage1TraceFlushEnabledCached == 1
+    stage1TraceFlushEnabledCached = (stage1_getEnv("STAGE1_TRACE_FLUSH") == "1") ? 1 : 0
+    return stage1TraceFlushEnabledCached == 1
+
+fn stage1GuiRoot(): str =
+    if stage1GuiRootCachedReady:
+        return stage1GuiRootCached
+    stage1GuiRootCached = stage1_getEnv("GUI_ROOT")
+    stage1GuiRootCachedReady = true
+    return stage1GuiRootCached
+
+fn stage1IdeRoot(): str =
+    if stage1IdeRootCachedReady:
+        return stage1IdeRootCached
+    stage1IdeRootCached = stage1_getEnv("IDE_ROOT")
+    stage1IdeRootCachedReady = true
+    return stage1IdeRootCached
+
+fn stage1PkgRoots(): str[] =
+    if stage1PkgRootsCachedReady:
+        return stage1PkgRootsCached
+    stage1PkgRootsCached = stage1_pkgRootsFromEnv()
+    stage1PkgRootsCachedReady = true
+    return stage1PkgRootsCached
+
+fn stage1PluginEnabled(): bool =
+    if stage1PluginEnableCached >= 0:
+        return stage1PluginEnableCached == 1
+    let raw: str = lowerAscii(stage1_getEnv("PLUGIN_ENABLE"))
+    if raw == "" || raw == "1" || raw == "true" || raw == "yes":
+        stage1PluginEnableCached = 1
+        return true
+    if raw == "0" || raw == "false" || raw == "no":
+        stage1PluginEnableCached = 0
+        return false
+    stage1PluginEnableCached = 1
+    return true
+
+fn stage1PluginPaths(): str[] =
+    if stage1PluginPathsCachedReady:
+        return stage1PluginPathsCached
+    var out: str[]
+    let legacy: str = stage1_getEnv "PLUGIN_PATH"
+    if legacy != nil && len(legacy) > 0:
+        add(out, stripSpaces(legacy))
+    let raw: str = stage1_getEnv "PLUGIN_PATHS"
+    if raw != nil && len(raw) > 0:
+        var hasCommaOrSemi: bool = false
+        for ki in 0..<len(raw):
+            let ck: char = raw[ki]
+            if ck == ',' || ck == ';':
+                hasCommaOrSemi = true
+                break
+        let useColon: bool = !hasCommaOrSemi
+        var start: int32 = 0
+        for i in 0..len(raw):
+            let c: char = (i < len(raw)) ? raw[i] : char(0)
+            if i == len(raw) || c == ',' || c == ';' || (useColon && c == ':'):
+                if i > start:
+                    let part: str = sliceRange(raw, start, i - 1)
+                    let trimmed: str = stripSpaces(part)
+                    if len(trimmed) > 0:
+                        add(out, trimmed)
+                start = i + 1
+    stage1PluginPathsCached = out
+    stage1PluginPathsCachedReady = true
+    return out
+
+fn stage1PluginActiveMetering(): str =
+    let cached: str = stage1PluginMeteringCached
+    if cached != nil:
+        return cached
+    let raw: str = stage1_getEnv "METERING_PLUGIN"
+    if raw == nil:
+        return ""
+    let trimmed: str = stripSpaces(raw)
+    stage1PluginMeteringCached = trimmed
+    return trimmed
+
+fn stage1ResolvePluginImportCandidate(candidate: str): str =
+    if candidate == nil || len(candidate) == 0:
+        return ""
+    if stage1_fileExists(candidate):
+        return normalizeImportPath candidate
+    let withExt: str = candidate
+    if !endsWith(withExt, ".cheng"):
+        withExt = candidate + ".cheng"
+    if stage1_fileExists(withExt):
+        return normalizeImportPath withExt
+    return ""
+
+fn stage1ResolvePluginImportPath(path: str): str =
+    if !stage1PluginEnabled():
+        return ""
+    if path == nil || len(path) == 0:
+        return ""
+    if !hasPrefix(path, "cheng/web/") && !hasPrefix(path, "cheng/decentralized/"):
+        return ""
+    let pluginPaths: str[] = stage1PluginPaths()
+    if pluginPaths.len == 0:
+        return ""
+    let relFromPkg: str = importPathDropChengPrefix(path)
+    var pluginRel: str = relFromPkg
+    if relFromPkg == "":
+        pluginRel = path
+    for i in 0..<pluginPaths.len:
+        let root: str = pluginPaths[i]
+        if root == nil || len(root) == 0:
+            continue
+        let candidate0: str = joinPath(root, path)
+        let hit0: str = stage1ResolvePluginImportCandidate(candidate0)
+        if len(hit0) > 0:
+            return hit0
+        let candidate1: str = joinPath(root, "src", path)
+        let hit1: str = stage1ResolvePluginImportCandidate(candidate1)
+        if len(hit1) > 0:
+            return hit1
+        let candidate2: str = joinPath(root, "cheng", path)
+        let hit2: str = stage1ResolvePluginImportCandidate(candidate2)
+        if len(hit2) > 0:
+            return hit2
+        let candidate3: str = joinPath(root, pluginRel)
+        let hit3: str = stage1ResolvePluginImportCandidate(candidate3)
+        if len(hit3) > 0:
+            return hit3
+        let candidate4: str = joinPath(root, "src", pluginRel)
+        let hit4: str = stage1ResolvePluginImportCandidate(candidate4)
+        if len(hit4) > 0:
+            return hit4
+        let candidate5: str = joinPath(root, "cheng", pluginRel)
+        let hit5: str = stage1ResolvePluginImportCandidate(candidate5)
+        if len(hit5) > 0:
+            return hit5
+    return ""
+
+fn stage1ApplyAstPluginHooks(path: str, root: Node): Node =
+    if root == nil:
+        return root
+    if !stage1PluginEnabled():
+        return root
+    return root
+
+fn stage1Trace(msg: str) =
+    if stage1TraceEnabled():
+        let line: str = "[stage1] " + msg
+        echo line
+        if stage1TraceFlushEnabled():
+            c_fflush get_stdout()
+
+fn memMode(): str =
+    let mm: str = lowerAscii(stage1_getEnv("MM"))
+    if len mm > 0:
+        if (mm == "off") || (mm == "none") || (mm == "0"):
+            return "off"
+        return "orc"
+    return "orc"
+
+fn ownershipDiagnosticsEnabled(): bool =
+    let raw: str = lowerAscii(stage1_getEnv("OWNERSHIP_DIAGS"))
+    if (raw == "1") || (raw == "true") || (raw == "yes"):
+        return true
+    if (raw == "0") || (raw == "false") || (raw == "no"):
+        return false
+    let mm: str = memMode()
+    return ! ((mm == "off") || (mm == "none") || (mm == "0"))
+
+fn ownershipHintsEnabled(): bool =
+    let raw: str = lowerAscii(stage1_getEnv("OWNERSHIP_HINTS"))
+    if (raw == "1") || (raw == "true") || (raw == "yes"):
+        return true
+    if (raw == "0") || (raw == "false") || (raw == "no"):
+        return false
+    return true
+
+fn arcEnabled(): bool =
+    let mm: str = memMode()
+    if (mm == "off") || (mm == "none") || (mm == "0"):
+        return false
+    return true
+
+fn orcStrictEnabled(): bool =
+    let raw: str = lowerAscii(stage1_getEnv("MM_STRICT"))
+    if (raw == "1") || (raw == "true") || (raw == "yes"):
+        return true
+    if (raw == "0") || (raw == "false") || (raw == "no"):
+        return false
+    let mm: str = memMode()
+    return (mm == "orc")
+
+var arcEnabledFlag: bool = true
+var orcEnabledFlag: bool = true
+var orcStrictFlag: bool = false
+
+fn setArcEnabled(enabled: bool) =
+    arcEnabledFlag = enabled
+
+fn setOrcEnabled(enabled: bool) =
+    orcEnabledFlag = enabled
+
+fn setOrcStrict(enabled: bool) =
+    orcStrictFlag = enabled
+
+let cacheHeader: str = "CHENGTOK9"
+let cacheSpecVersion: str = "2026-01-25"
+
+fn cacheCompilerVersion(): str =
+    let v: str = stage1_getEnv "COMPILER_VERSION"
+    if len v > 0:
+        return v
+    let v2: str = stage1_getEnv "STAGE1_VERSION"
+    if len v2 > 0:
+        return v2
+    let v3: str = stage1_getEnv "STAGE1_HASH"
+    if len v3 > 0:
+        return v3
+    let v4: str = stage1_getEnv "VERSION"
+    if len v4 > 0:
+        return v4
+    return "dev"
+
+fn cacheTargetPlatform(): str =
+    let t: str = stage1_getEnv "TARGET"
+    if len t > 0:
+        return t
+    let t2: str = stage1_getEnv "TARGET"
+    if len t2 > 0:
+        return t2
+    let t3: str = stage1_getEnv "HOSTTYPE"
+    if len t3 > 0:
+        return t3
+    return "unknown"
+
+fn cacheMetaLine(): str =
+    let mm: str = memMode()
+    var strictVal: str = "0"
+    if orcStrictEnabled():
+        strictVal = "1"
+    return "meta=compiler=" + cacheCompilerVersion() +
+           ";mm=" + mm +
+           ";mm_strict=" + strictVal +
+           ";target=" + cacheTargetPlatform() +
+           ";spec=" + cacheSpecVersion
+
+fn cacheEnabled(): bool =
+    let tokenCache: str = lowerAscii(stage1_getEnv("STAGE1_TOKEN_CACHE"))
+    if (tokenCache == "0") || (tokenCache == "false") || (tokenCache == "no"):
+        return false
+    return !(stage1_getEnv "CACHE" == "0")
+
+fn cacheDir(): str =
+    let env: str = stage1_getEnv "CACHE_DIR"
+    if len env > 0:
+        return env
+    return joinPath(getCurrentDir(), ".cheng-cache/stage1")
+
+fn ensureDir(path: str) =
+    if len path == 0:
+        return
+    if bos_dirExists path:
+        return
+    let parts: SplitFileResult = parser_splitFile path
+    if len parts.dir > 0 && ! bos_dirExists parts.dir:
+        makeDir parts.dir
+    makeDir path
+
+fn startsWith(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    let n: int32 = len s
+    let m: int32 = len prefix
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..<m:
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn hash64(s: str): uint64 =
+    var h: uint64 =(uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
+    if s == nil:
+        return h
+    let n: int32 = len s
+    for i in 0..<n:
+        let c: char = s[i]
+        h = h ^ uint64(c)
+        h = h * ((uint64(1099511628) * uint64(1000)) + uint64(211))
+    return h
+
+fn hexDigit(v: int32): char =
+    if v < 10:
+        let code: int32 = int32('0') + v
+        return chr code
+    let code: int32 = int32('a') + (v - 10)
+    return chr code
+
+fn u64ToHex(v: uint64): str =
+    let p: void* = alloc 17
+    for i in 0..<16:
+        let shift: int32 =(15 - i) * 4
+        let masked: uint64 =(v >> uint64(shift)) & uint64(15)
+        let digit: int32 = int32(masked)
+        let c: char = hexDigit digit
+        let dst: void* = ptr_add(p, i)
+        let pc: char* = char*(dst)
+        *pc = c
+    setMem(ptr_add(p, 16), 0, 1)
+    return str(p)
+
+fn moduleTag(path: str): str =
+    let parts: SplitFileResult = parser_splitFile path
+    var base: str = parts.name
+    if len base == 0:
+        base = "module"
+    let key: str = u64ToHex(hash64(path))
+    let tag: str = base + "-" + key
+    releaseString key
+    return tag
+
+fn stage1_int64ToStr(v: int64): str =
+    if v == 0:
+        return "0"
+    var n: int64 = v
+    var neg: bool = false
+    if n < 0:
+        neg = true
+        n = -n
+    var out: str = ""
+    while n > 0:
+        let digitVal: int64 = n % 10
+        let digit: int32 = int32(digitVal)
+        let code: int32 = int32('0') + digit
+        let digitChar: char = chr code
+        out = charToStr digitChar + out
+        n = n / 10
+    if neg:
+        out = "-" + out
+    return out
+
+fn parseInt64(s: str): int64 =
+    if s == nil:
+        return 0
+    let n: int32 = len s
+    if n == 0:
+        return 0
+    var i: int32 = 0
+    var neg: bool = false
+    if s[0] == '-':
+        neg = true
+        i = 1
+    var val: int64 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = s[i]
+        if c < '0' || c > '9':
+            break
+        val = val * 10 + int64(c) - int64('0')
+        i = i + 1
+    if neg:
+        return -val
+    return val
+
+fn tokenTraceEnabled(path: str): bool =
+    if ! envIsTrue "STAGE1_TRACE_TOKENS":
+        return false
+    let only: str = stage1_getEnv "STAGE1_TRACE_TOKENS_FILE"
+    if len only == 0:
+        return true
+    return only == path
+
+fn tokenTraceMax(): int32 =
+    let raw: str = stage1_getEnv "STAGE1_TRACE_TOKENS_MAX"
+    if len raw == 0:
+        return 120
+    let v: int64 = parseInt64 raw
+    if v <= 0:
+        return 120
+    return int32(v)
+
+fn dumpTokens(path: str, tokens: Token[]) =
+    if ! tokenTraceEnabled path:
+        return
+    let maxCount: int32 = tokenTraceMax()
+    let header: str = "TOKENS " + path
+    echo header
+    releaseString header
+    for i in 0..<tokens.len:
+        if !(i < maxCount):
+            break
+        let t: Token = tokens[i]
+        let lineStr: str = stage1_int64ToStr int64(t.line)
+        let colStr: str = stage1_int64ToStr int64(t.col)
+        let kindStr: str = kindName t.kind
+        let lexStr: str = escapeCacheField t.lexeme
+        let msg0: str = lineStr + ":" + colStr
+        let msg1: str = msg0 + " " + kindStr
+        let msg2: str = msg1 + " " + lexStr
+        echo msg2
+        releaseString lineStr
+        releaseString colStr
+        releaseString lexStr
+        releaseString msg0
+        releaseString msg1
+        releaseString msg2
+    if tokens.len > maxCount:
+        let totalStr: str = stage1_int64ToStr int64(tokens.len)
+        let tail: str = "... total=" + totalStr
+        echo tail
+        releaseString totalStr
+        releaseString tail
+
+fn escapeCacheField(s: str): str =
+    if s == nil:
+        return ""
+    let n: int32 = len s
+    if n == 0:
+        return ""
+    var outLen: int32 = 0
+    for i in 0..<n:
+        let c: char = s[i]
+        if c == '\\' || c == '\n' || c == '\r' || c == '\t':
+            outLen = outLen + 2
+        else:
+            outLen = outLen + 1
+    let p: void* = alloc(outLen + 1)
+    var oi: int32 = 0
+    for i in 0..<n:
+        let c: char = s[i]
+        if c == '\\':
+            let d0: void* = ptr_add(p, oi)
+            let d1: void* = ptr_add(p, oi + 1)
+            *char*(d0) = '\\'
+            *char*(d1) = '\\'
+            oi = oi + 2
+        elif c == '\n':
+            let d0: void* = ptr_add(p, oi)
+            let d1: void* = ptr_add(p, oi + 1)
+            *char*(d0) = '\\'
+            *char*(d1) = 'n'
+            oi = oi + 2
+        elif c == '\r':
+            let d0: void* = ptr_add(p, oi)
+            let d1: void* = ptr_add(p, oi + 1)
+            *char*(d0) = '\\'
+            *char*(d1) = 'r'
+            oi = oi + 2
+        elif c == '\t':
+            let d0: void* = ptr_add(p, oi)
+            let d1: void* = ptr_add(p, oi + 1)
+            *char*(d0) = '\\'
+            *char*(d1) = 't'
+            oi = oi + 2
+        else:
+            let d0: void* = ptr_add(p, oi)
+            *char*(d0) = c
+            oi = oi + 1
+    setMem(ptr_add(p, outLen), 0, 1)
+    return str(p)
+
+fn unescapeCacheField(s: str): str =
+    if s == nil:
+        return ""
+    let n: int32 = len s
+    if n == 0:
+        return ""
+    let p: void* = alloc(n + 1)
+    var oi: int32 = 0
+    var i: int32 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = s[i]
+        if c == '\\' && i + 1 < n:
+            let n2: char = s[i + 1]
+            if n2 == 'n':
+                *char*(ptr_add(p, oi)) = '\n'
+                oi = oi + 1
+                i = i + 2
+                continue
+            elif n2 == 'r':
+                *char*(ptr_add(p, oi)) = '\r'
+                oi = oi + 1
+                i = i + 2
+                continue
+            elif n2 == 't':
+                *char*(ptr_add(p, oi)) = '\t'
+                oi = oi + 1
+                i = i + 2
+                continue
+            elif n2 == '\\':
+                *char*(ptr_add(p, oi)) = '\\'
+                oi = oi + 1
+                i = i + 2
+                continue
+        *char*(ptr_add(p, oi)) = c
+        oi = oi + 1
+        i = i + 1
+    setMem(ptr_add(p, oi), 0, 1)
+    return str(p)
+
+fn sliceRangePlainKnownLen(s: str, n: int32, start: int32, stop: int32): str =
+    if s == nil:
+        return ""
+    var a: int32 = start
+    var b: int32 = stop
+    if a < 0:
+        a = 0
+    if b >= n:
+        b = n - 1
+    if b < a:
+        return ""
+    let count: int32 = b - a + 1
+    let p: void* = alloc(count + 1)
+    let src: void* = ptr_add(void*(s), a)
+    copyMem(p, src, count)
+    setMem(ptr_add(p, count), 0, 1)
+    return str(p)
+
+fn sliceRangePlain(s: str, start: int32, stop: int32): str =
+    if s == nil:
+        return ""
+    let n: int32 = len s
+    return sliceRangePlainKnownLen(s, n, start, stop)
+
+fn trimTrailingCRPlain(line: str): str =
+    if line == nil:
+        return ""
+    let n: int32 = len line
+    if n <= 0:
+        return line
+    if line[n - 1] == '\r':
+        let trimmed: str = sliceRangePlain(line, 0, n - 2)
+        releaseString line
+        return trimmed
+    return line
+
+fn splitTabs(line: str): str[] =
+    var parts: str[8]
+    if line == nil:
+        return parts
+    let n: int32 = len line
+    var start: int32 = 0
+    for i in 0..n:
+        if i == n || line[i] == '\t':
+            if i >= start:
+                let seg: str = sliceRangePlain(line, start, i - 1)
+                add(parts, seg)
+            start = i + 1
+    return parts
+
+fn cachePath(path: str): str =
+    let dir: str = cacheDir()
+    let key: str = u64ToHex(hash64(path))
+    let name: str = key + ".tok"
+    let out: str = joinPath(dir, name)
+    releaseString key
+    releaseString name
+    return out
+
+type
+    TokenCacheResult =
+        hit: bool
+        tokens: Token[]
+
+fn loadTokenCache(path: str, size: int64, mtime: int64): TokenCacheResult =
+    var res: TokenCacheResult
+    res.hit = false
+    if ! cacheEnabled():
+        return res
+    let cpath: str = cachePath path
+    defer:
+        releaseString cpath
+    if ! stage1_fileExists cpath:
+        return res
+    let content: str = stage1_readFile cpath
+    if content == nil || content[0] == char(0):
+        return res
+    defer:
+        releaseString content
+    var sizeVal: int64 = -1
+    var mtimeVal: int64 = -1
+    var countVal: int64 = -1
+    var out: Token[64]
+    var ok: bool = true
+    var lineNo: int32 = 0
+    let n: int32 = len content
+    var idx: int32 = 0
+    for __for_guard_idx in 0..<n:
+        if !(idx < n):
+            break
+        var lineStart: int32 = idx
+        for __for_guard_idx2 in 0..<n:
+            if !(idx < n && content[idx] != '\n'):
+                break
+            idx = idx + 1
+        var lineEnd: int32 = idx - 1
+        if idx < n && content[idx] == '\n':
+            idx = idx + 1
+        var line: str = ""
+        if lineStart <= lineEnd:
+            # Avoid O(n) strlen on the whole file for every line slice.
+            line = sliceRangePlainKnownLen(content, n, lineStart, lineEnd)
+            line = trimTrailingCRPlain line
+        if lineNo == 0:
+            if line != cacheHeader:
+                ok = false
+        elif lineNo == 1:
+            let expected: str = cacheMetaLine()
+            if line != expected:
+                ok = false
+            releaseString expected
+        elif lineNo == 2:
+            if ! startsWith(line, "size="):
+                ok = false
+            else:
+                let sizeStr: str = sliceRangePlain(line, 5, len line - 1)
+                sizeVal = parseInt64 sizeStr
+                releaseString sizeStr
+        elif lineNo == 3:
+            if ! startsWith(line, "mtime="):
+                ok = false
+            else:
+                let mtimeStr: str = sliceRangePlain(line, 6, len line - 1)
+                mtimeVal = parseInt64 mtimeStr
+                releaseString mtimeStr
+        elif lineNo == 4:
+            if ! startsWith(line, "count="):
+                ok = false
+            else:
+                let countStr: str = sliceRangePlain(line, 6, len line - 1)
+                countVal = parseInt64 countStr
+                releaseString countStr
+            if sizeVal != size || mtimeVal != mtime || countVal < 0:
+                ok = false
+        else:
+            if len line > 0:
+                let parts: str[] = splitTabs line
+                if parts.len >= 5:
+                    let kindId: int32 = int32(parseInt64(parts[0]))
+                    let lineNoTok: int32 = int32(parseInt64(parts[1]))
+                    let colNo: int32 = int32(parseInt64(parts[2]))
+                    let prefixVal: int32 = int32(parseInt64(parts[3]))
+                    let lexemeEsc: str = parts[4]
+                    let lexeme: str = unescapeCacheField lexemeEsc
+                    trackLexString void*(lexeme)
+                    var tok: Token
+                    tok.kind = TokenKind(kindId)
+                    tok.lexeme = lexeme
+                    tok.strPrefix = chr prefixVal
+                    tok.line = lineNoTok
+                    tok.col = colNo
+                    add(out, tok)
+                for pi in 0..<parts.len:
+                    releaseString parts[pi]
+                freeSeq[str](parts)
+        releaseString line
+        if ! ok:
+            break
+        lineNo = lineNo + 1
+    if ! ok || lineNo < 5 || int64(out.len) != countVal:
+        for ti in 0..<out.len:
+            let tok: Token = out[ti]
+            releaseString tok.lexeme
+        return res
+    res.hit = true
+    res.tokens = out
+    return res
+
+fn writeInt64(f: File, v: int64) =
+    if v == 0:
+        write(f, "0")
+        return
+    let s: str = stage1_int64ToStr v
+    write(f, s)
+    releaseString s
+
+fn writeTokenCache(path: str, size: int64, mtime: int64, tokens: Token[]) =
+    if ! cacheEnabled():
+        return
+    let dir: str = cacheDir()
+    ensureDir dir
+    let cpath: str = cachePath path
+    defer:
+        releaseString cpath
+    let f: File = open(cpath, fmWrite)
+    if f == nil:
+        return
+    write(f, cacheHeader)
+    write(f, "\n")
+    let meta: str = cacheMetaLine()
+    write(f, meta)
+    releaseString meta
+    write(f, "\n")
+    write(f, "size=")
+    writeInt64(f, size)
+    write(f, "\n")
+    write(f, "mtime=")
+    writeInt64(f, mtime)
+    write(f, "\n")
+    write(f, "count=")
+    writeInt64(f, int64(tokens.len))
+    write(f, "\n")
+    for i in 0..<tokens.len:
+        let t: Token = tokens[i]
+        writeInt64(f, int64(t.kind))
+        write(f, "\t")
+        writeInt64(f, int64(t.line))
+        write(f, "\t")
+        writeInt64(f, int64(t.col))
+        write(f, "\t")
+        writeInt64(f, int64(t.strPrefix))
+        write(f, "\t")
+        let esc: str = escapeCacheField t.lexeme
+        write(f, esc)
+        releaseString esc
+        write(f, "\n")
+    close f
+
+fn stage1_fileExists(path: str): bool =
+    if path == nil || path[0] == char(0):
+        return false
+    return cheng_file_exists(path) != 0
+
+fn stage1_readFile(path: str): str =
+    let f: File = openRead path
+    if f == nil:
+        return ""
+    let content: str = readAll f
+    close f
+    return content
+
+fn stage1_writeFile(path: str, content: str) =
+    let f: File = open(path, fmWrite)
+    if f == nil:
+        return
+    write(f, content)
+    close f
+
+fn releaseString(s: str) =
+    if s == nil:
+        return
+    if s[0] == char(0):
+        return
+    stage1_memRelease void*(s)
+
+fn endsWith(s: str, suffix: str): bool =
+    if s == nil || suffix == nil:
+        return false
+    let n: int32 = len s
+    let m: int32 = len suffix
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..<m:
+        if s[n - m + i] != suffix[i]:
+            return false
+    return true
+
+fn isPathSep(ch: char): bool =
+    return ch == '/' || ch == '\\'
+
+fn normalizePath(path: str): str =
+    if path == nil || len path == 0:
+        return ""
+    return absolutePath(path)
+    let total: int32 = len path
+    var prefix: str = ""
+    var start: int32 = 0
+    var absolute: bool = false
+    if total >= 2 && path[1] == ':':
+        prefix = sliceRangePlain(path, 0, 1)
+        absolute = true
+        start = 2
+        if start < total && isPathSep path[start]:
+            start = start + 1
+    elif total > 0 && isPathSep path[0]:
+        prefix = "/"
+        absolute = true
+        start = 1
+    var parts: str[8]
+    var segStart: int32 = start
+    for i in start..total:
+        if i == total:
+            if i > segStart:
+                let seg: str = sliceRangePlain(path, segStart, i - 1)
+                if (seg == "."):
+                    releaseString seg
+                elif (seg == ".."):
+                    if parts.len > 0:
+                        let last: str = parts[parts.len - 1]
+                        releaseString last
+                        parts.len = parts.len - 1
+                        releaseString seg
+                    elif ! absolute:
+                        add(parts, seg)
+                    else:
+                        releaseString seg
+                else:
+                    add(parts, seg)
+            segStart = i + 1
+        elif isPathSep path[i]:
+            if i > segStart:
+                let seg: str = sliceRangePlain(path, segStart, i - 1)
+                if (seg == "."):
+                    releaseString seg
+                elif (seg == ".."):
+                    if parts.len > 0:
+                        let last: str = parts[parts.len - 1]
+                        releaseString last
+                        parts.len = parts.len - 1
+                        releaseString seg
+                    elif ! absolute:
+                        add(parts, seg)
+                    else:
+                        releaseString seg
+                else:
+                    add(parts, seg)
+            segStart = i + 1
+    var out: str = ""
+    if len prefix > 0:
+        out = prefix
+    for j in 0..<parts.len:
+        let seg: str = parts[j]
+        if len out > 0 && out[len out - 1] != '/':
+            out = out + "/"
+        out = out + seg
+        releaseString seg
+    freeSeq[str](parts)
+    if len out == 0 && len prefix > 0:
+        return prefix
+    return out
+
+fn trimTrailingSlash(path: str): str =
+    if path == nil || len path == 0:
+        return ""
+    var end: int32 = len path
+    if end > 1:
+        for __for_guard_end in 0..<(end - 1):
+            if !(end > 1 && path[end - 1] == '/'):
+                break
+            end = end - 1
+    if end == len path:
+        return path
+    return sliceRangePlain(path, 0, end - 1)
+
+fn pathWithinRoot(root: str, path: str): bool =
+    if root == nil || len root == 0:
+        return false
+    if path == nil || len path == 0:
+        return false
+    let rootAbs0: str = normalizePath(absolutePath(root))
+    let pathAbs: str = normalizePath(absolutePath(path))
+    let rootAbs: str = trimTrailingSlash rootAbs0
+    if len rootAbs == 0 || len pathAbs == 0:
+        return false
+    if ! startsWith(pathAbs, rootAbs):
+        return false
+    if len pathAbs == len rootAbs:
+        return true
+    return pathAbs[len rootAbs] == '/'
+
+fn normalizeImportPathChecked(path: str, root: str): str =
+    let norm: str = normalizeImportPath path
+    if len norm == 0:
+        return ""
+    if len root == 0:
+        return norm
+    if pathWithinRoot(root, norm):
+        return norm
+    let guiRoot: str = stage1GuiRoot()
+    if len guiRoot > 0 && pathWithinRoot(guiRoot, norm):
+        return norm
+    let ideRoot: str = stage1IdeRoot()
+    if len ideRoot > 0 && pathWithinRoot(ideRoot, norm):
+        return norm
+    let pkgRoots: str[] = stage1PkgRoots()
+    for i in 0..<pkgRoots.len:
+        let pkgRoot: str = pkgRoots[i]
+        if len pkgRoot > 0 && pathWithinRoot(pkgRoot, norm):
+            return norm
+    return ""
+
+fn importNodePath(n: Node): str =
+    if n == nil:
+        return ""
+    case n.kind
+    of nkImportAs:
+        if kidCount n > 0:
+            return importNodePath kid(n, 0)
+        return ""
+    of nkIdent, nkSymbol:
+        return stripSpaces n.ident
+    of nkStrLit:
+        return n.strVal
+    else:
+        return ""
+
+fn collectImportNodes(root: Node, acc: Node[]*) =
+    if root == nil || acc == nil:
+        return
+    if root.kind != nkModule && root.kind != nkStmtList:
+        return
+    for i in 0..<kidCount root:
+        let n: Node = kid(root, i)
+        if n != nil && (n.kind == nkImportStmt || n.kind == nkImportGroup):
+            add(acc, n)
+
+fn collectImportPaths(n: Node, out: str[]*) =
+    if n == nil || out == nil:
+        return
+    if n.kind == nkImportGroup:
+        if kidCount n <= 0:
+            return
+        let base: str = importNodePath kid(n, 0)
+        for i in 1..<kidCount n:
+            let entry: str = importNodePath kid(n, i)
+            if len entry > 0:
+                if len base > 0:
+                    let combined: str = base + "/" + entry
+                    trackLexString void*(combined)
+                    add(out, combined)
+                else:
+                    trackLexString void*(entry)
+                    add(out, entry)
+        return
+    if n.kind == nkImportStmt:
+        for j in 0..<kidCount n:
+            let item: Node = kid(n, j)
+            if item != nil && item.kind == nkImportGroup:
+                collectImportPaths(item, out)
+            else:
+                let path: str = importNodePath item
+                if len path > 0:
+                    trackLexString void*(path)
+                    add(out, path)
+        return
+    if n.kind == nkImportAs:
+        if kidCount n > 0:
+            let path: str = importNodePath kid(n, 0)
+            if len path > 0:
+                trackLexString void*(path)
+                add(out, path)
+        return
+    let path2: str = importNodePath n
+    if len path2 > 0:
+        trackLexString void*(path2)
+        add(out, path2)
+
+fn importAliasName(n: Node): str =
+    if n == nil:
+        return ""
+    case n.kind
+    of nkImportAs:
+        if kidCount n > 1:
+            return stripSpaces(plainName(kid(n, 1)))
+        if kidCount n > 0:
+            return semImportModuleName(stripSpaces(plainName(kid(n, 0))))
+        return ""
+    of nkIdent, nkSymbol:
+        return semImportModuleName(stripSpaces(n.ident))
+    of nkStrLit:
+        return semImportModuleName(n.strVal)
+    else:
+        return ""
+
+fn importAliasValue(n: Node): str =
+    if n == nil:
+        return ""
+    if n.kind == nkImportAs:
+        return importAliasName n
+    return ""
+
+fn appendImportDep(base: str, item: Node, out: str[]*) =
+    if item == nil || out == nil:
+        return
+    let path: str = importNodePath item
+    if len path == 0:
+        return
+    var full: str = path
+    if len base > 0:
+        full = base + "/" + path
+    let alias: str = importAliasValue item
+    if len alias > 0:
+        full = full + " as "
+        full = full + alias
+    add(out, full)
+
+fn stripImportAlias(item: str): str =
+    if item == nil || len item == 0:
+        return ""
+    let n: int32 = len item
+    if n < 4:
+        return item
+    for i in 0..n - 4:
+        if item[i] ==  ' ' && item[i + 1] ==  'a' && item[i + 2] ==  's' &&
+            item[i + 3] ==  ' ':
+            if i == 0:
+                return ""
+            return sliceRange(item, 0, i - 1)
+    return item
+
+fn collectImportDeps(root: Node, out: str[]*) =
+    if root == nil || out == nil:
+        return
+    if root.kind == nkImportStmt:
+        for j in 0..<kidCount root:
+            let item: Node = kid(root, j)
+            if item != nil && item.kind == nkImportGroup:
+                if kidCount item > 0:
+                    let base: str = importNodePath kid(item, 0)
+                    for k in 1..<kidCount item:
+                        appendImportDep(base, kid(item, k), out)
+            else:
+                appendImportDep("", item, out)
+        return
+    if root.kind == nkImportGroup:
+        if kidCount root > 0:
+            let base2: str = importNodePath kid(root, 0)
+            for m in 1..<kidCount root:
+                appendImportDep(base2, kid(root, m), out)
+        return
+    for i in 0..<kidCount root:
+        collectImportDeps(kid(root, i), out)
+
+fn collectImportAliases(root: Node, out: str[]*) =
+    if root == nil || out == nil:
+        return
+    if root.kind != nkModule && root.kind != nkStmtList:
+        return
+    for i in 0..<kidCount root:
+        let n: Node = kid(root, i)
+        if n == nil:
+            continue
+        if n.kind == nkImportStmt:
+            for j in 0..<kidCount n:
+                let item: Node = kid(n, j)
+                if item != nil && item.kind == nkImportGroup:
+                    if kidCount item <= 1:
+                        let baseName: str = importAliasName kid(item, 0)
+                        if len baseName > 0:
+                            add(out, baseName)
+                    else:
+                        for k in 1..<kidCount item:
+                            let entryName: str = importAliasName kid(item, k)
+                            if len entryName > 0:
+                                add(out, entryName)
+                else:
+                    let aliasName: str = importAliasName item
+                    if len aliasName > 0:
+                        add(out, aliasName)
+        elif n.kind == nkImportGroup:
+            if kidCount n <= 1:
+                let baseName2: str = importAliasName kid(n, 0)
+                if len baseName2 > 0:
+                    add(out, baseName2)
+            else:
+                for k2 in 1..<kidCount n:
+                    let entryName2: str = importAliasName kid(n, k2)
+                    if len entryName2 > 0:
+                        add(out, entryName2)
+
+fn isModuleAlias(name: str, aliases: str[]): bool =
+    if len name == 0:
+        return false
+    for i in 0..<aliases.len:
+        if (aliases[i] ==  name):
+            return true
+    return false
+
+fn lowerModuleQualifiersCtxShadow(n: Node, aliases: str[], shadowed: str[], keepDot: bool): Node =
+    if n == nil:
+        return nil
+    var localShadowed: str[] = shadowed
+    if (n.kind == nkFnDecl || n.kind == nkIteratorDecl) && kidCount(n) > 1:
+        var fnShadowed: str[4]
+        let paramsNode: Node = kid(n, 1)
+        if paramsNode != nil && paramsNode.kind == nkFormalParams:
+            for pi in 0..<kidCount(paramsNode):
+                let defs: Node = kid(paramsNode, pi)
+                if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 0:
+                    let nameNode: Node = kid(defs, 0)
+                    if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
+                        let nm: str = stripSpaces nameNode.ident
+                        if isModuleAlias(nm, aliases) && !isModuleAlias(nm, fnShadowed):
+                            add(fnShadowed, nm)
+        localShadowed = fnShadowed
+    if n.kind == nkDotExpr && kidCount n > 1:
+        let base: Node = kid(n, 0)
+        let member: Node = kid(n, 1)
+        if ! keepDot && base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
+            let bname: str = stripSpaces base.ident
+            if isModuleAlias(bname, aliases) && !isModuleAlias(bname, localShadowed):
+                return lowerModuleQualifiersCtxShadow(member, aliases, localShadowed, keepDot)
+    for i in 0..<kidCount n:
+        let child: Node = kid(n, i)
+        var childKeep: bool = false
+        if keepDot:
+            if n.kind == nkBracketExpr:
+                childKeep = (i == 0)
+            else:
+                childKeep = true
+        elif n.kind == nkCall && i == 0:
+            childKeep = true
+        let lowered: Node = lowerModuleQualifiersCtxShadow(child, aliases, localShadowed, childKeep)
+        if lowered != child:
+            setKid(n, i, lowered)
+    return n
+
+fn lowerModuleQualifiersCtx(n: Node, aliases: str[], keepDot: bool): Node =
+    var empty: str[1]
+    return lowerModuleQualifiersCtxShadow(n, aliases, empty, keepDot)
+
+fn lowerModuleQualifiers(n: Node, aliases: str[]): Node =
+    var empty: str[1]
+    return lowerModuleQualifiersCtxShadow(n, aliases, empty, false)
+
+fn normalizeImportPath(path: str): str =
+    let abs: str = absolutePath path
+    let norm: str = normalizePath abs
+    if stage1TraceImportsEnabled():
+        stage1Trace("import: normalizeImportPath path=" + path + " abs=" + abs + " norm=" + norm)
+    return norm
+
+fn stage1_pkgRootsFromEnv(): str[] =
+    var out: str[4]
+    let single: str = stage1_getEnv "PKG_ROOT"
+    if single != nil && len single > 0:
+        add(out, single)
+    let raw: str = stage1_getEnv "PKG_ROOTS"
+    var start: int32 = 0
+    if raw != nil && len raw > 0:
+        let rawLen: int32 = len raw
+        # Accept ',' ';' and ':' separators (':' is common on Unix PATH-like lists).
+        # Only treat ':' as a separator when the list is not already using ',' or ';'
+        # to avoid breaking Windows drive letters like "C:\\" in ';'-separated lists.
+        var hasCommaOrSemi: bool = false
+        for k in 0..<rawLen:
+            let c0: char = raw[k]
+            if c0 == ',' || c0 == ';':
+                hasCommaOrSemi = true
+                break
+        let useColon: bool = !hasCommaOrSemi
+        for i in 0..rawLen:
+            if i == rawLen || raw[i] == ',' || raw[i] == ';' ||
+               (useColon && raw[i] == ':'):
+                if i > start:
+                    let part: str = sliceRange(raw, start, i - 1)
+                    let trimmed: str = stripSpaces part
+                    if len trimmed > 0:
+                        add(out, trimmed)
+                start = i + 1
+    if out.len == 0:
+        let home: str = stage1_getEnv "HOME"
+        if home != nil && len home > 0:
+            let fallback: str = joinPath(home, ".cheng-packages")
+            add(out, fallback)
+    return out
+
+fn indexOfSlash(path: str): int32 =
+    if path == nil || path[0] == char(0):
+        return -1
+    let pathLen: int32 = len path
+    for i in 0..<pathLen:
+        if path[i] == '/':
+            return i
+    return -1
+
+fn importPathDropChengPrefix(importPath: str): str =
+    if importPath == nil || len importPath == 0:
+        return ""
+    if hasPrefix(importPath, "cheng/"):
+        if len importPath <= 6:
+            return ""
+        return sliceRange(importPath, 6, len importPath - 1)
+    return importPath
+
+fn packageNameFromImport(importPath: str): str =
+    let normalized: str = importPathDropChengPrefix(importPath)
+    if normalized == nil || len normalized == 0:
+        return ""
+    let slash: int32 = indexOfSlash(normalized)
+    if slash <= 0:
+        return ""
+    let pkgName: str = sliceRange(normalized, 0, slash - 1)
+    if pkgName == "std" || pkgName == "core" || pkgName == "system" ||
+       pkgName == "ide" || pkgName == "gui":
+        return ""
+    return pkgName
+
+fn packageIdFromImport(importPath: str): str =
+    let name: str = packageNameFromImport importPath
+    if name == nil || len name == 0:
+        return ""
+    if (name == "stdlib"):
+        return ""
+    return "pkg://cheng/" + name
+
+fn pathBaseName(path: str): str =
+    if path == nil || len path == 0:
+        return ""
+    var end: int32 = len path - 1
+    let __for_start_end = end
+    for __for_rev_end in 0..(__for_start_end - (0)):
+        end = __for_start_end - __for_rev_end
+        if !(path[end] == '/'):
+            break
+    if end < 0:
+        return ""
+    var start: int32 = end
+    let __for_start_start = end
+    for __for_rev_start in 0..(__for_start_start - (0)):
+        start = __for_start_start - __for_rev_start
+        if !(path[start] != '/'):
+            break
+    return sliceRange(path, start + 1, end)
+
+fn findChar(s: str, ch: char, start: int32): int32 =
+    if s == nil || s[0] == char(0):
+        return -1
+    if start < 0:
+        start = 0
+    let sLen: int32 = len s
+    for i in start..<sLen:
+        if s[i] == ch:
+            return i
+    return -1
+
+fn parseQuotedValue(line: str): str =
+    if line == nil || len line == 0:
+        return ""
+    let first: int32 = findChar(line, '"', 0)
+    if first >= 0:
+        let second: int32 = findChar(line, '"', first + 1)
+        if second > first:
+            return sliceRange(line, first + 1, second - 1)
+    return ""
+
+fn packageIdFromManifest(manifestPath: str): str =
+    if manifestPath == nil || len manifestPath == 0:
+        return ""
+    if ! stage1_fileExists manifestPath:
+        return ""
+    let content: str = stage1_readFile manifestPath
+    if content == nil || content[0] == char(0):
+        return ""
+    let contentLen: int32 = len content
+    let key: str = "package_id"
+    var start: int32 = 0
+    for i in 0..contentLen:
+        if i == contentLen || content[i] == '\n':
+            if i > start:
+                let line: str = sliceRange(content, start, i - 1)
+                let trimmed: str = stripSpaces line
+                if startsWith(trimmed, key):
+                    if len trimmed == len key || trimmed[len key] == '=' ||
+                       trimmed[len key] == ':' || trimmed[len key] == ' ':
+                        let value: str = parseQuotedValue trimmed
+                        if len value > 0:
+                            return value
+            start = i + 1
+    return ""
+
+fn packageIdMatches(manifestPath: str, expected: str): bool =
+    if expected == nil || len expected == 0:
+        return true
+    let got: str = packageIdFromManifest manifestPath
+    if got == nil || len got == 0:
+        return false
+    return (got == expected)
+
+fn resolvePkgCandidate(root: str, rel: str): str =
+    if root == nil || rel == nil || len root == 0 || len rel == 0:
+        return ""
+    var candidate: str = joinPath(root, rel)
+    var fullCandidate: str = candidate
+    if ! endsWith(fullCandidate, ".cheng"):
+        fullCandidate = fullCandidate + ".cheng"
+    if stage1_fileExists fullCandidate:
+        let resolved: str = normalizeImportPathChecked(fullCandidate, root)
+        if len resolved > 0:
+            return resolved
+    return ""
+
+fn resolvePkgPathInRoot(root: str, rel: str): str =
+    if root == nil || rel == nil || len root == 0 || len rel == 0:
+        return ""
+    var resolved: str = resolvePkgCandidate(root, rel)
+    if len resolved > 0:
+        return resolved
+    var relSub: str = rel
+    if hasPrefix(relSub, "cheng/"):
+        if len relSub > 6:
+            relSub = sliceRange(relSub, 6, len relSub - 1)
+        else:
+            relSub = ""
+    if len relSub > 0:
+        resolved = resolvePkgCandidate(joinPath(root, "src"), relSub)
+        if len resolved > 0:
+            return resolved
+        resolved = resolvePkgCandidate(joinPath(root, "cheng"), relSub)
+        if len resolved > 0:
+            return resolved
+    return ""
+
+fn resolvePkgPathInRoot2(root: str, relInPkg: str, relForPkgRoot: str): str =
+    if root == nil || len root == 0:
+        return ""
+    if relInPkg != nil && len relInPkg > 0:
+        let resolvedSrc: str = resolvePkgCandidate(joinPath(root, "src"), relInPkg)
+        if len resolvedSrc > 0:
+            return resolvedSrc
+        let resolvedCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relInPkg)
+        if len resolvedCheng > 0:
+            return resolvedCheng
+        let resolvedRoot: str = resolvePkgCandidate(root, relInPkg)
+        if len resolvedRoot > 0:
+            return resolvedRoot
+    if relForPkgRoot != nil && len relForPkgRoot > 0:
+        let resolvedLegacySrc: str = resolvePkgCandidate(joinPath(root, "src"), relForPkgRoot)
+        if len resolvedLegacySrc > 0:
+            return resolvedLegacySrc
+        let resolvedLegacyCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relForPkgRoot)
+        if len resolvedLegacyCheng > 0:
+            return resolvedLegacyCheng
+        let resolvedLegacyRoot: str = resolvePkgCandidate(root, relForPkgRoot)
+        if len resolvedLegacyRoot > 0:
+            return resolvedLegacyRoot
+    return ""
+
+fn resolvePkgImportPath(importPath: str): str =
+    if importPath == nil || len importPath == 0:
+        return ""
+    let expectedPkgId: str = packageIdFromImport importPath
+    let importPkgName: str = packageNameFromImport importPath
+    var relForPkgRoot: str = importPathDropChengPrefix(importPath)
+    if relForPkgRoot == nil || len relForPkgRoot == 0:
+        relForPkgRoot = importPath
+    let roots: str[] = stage1PkgRoots()
+    for i in 0..<roots.len:
+        let root: str = roots[i]
+        if len root > 0:
+            let manifest: str = joinPath(root, "cheng-package.toml")
+            if stage1_fileExists manifest:
+                if ! packageIdMatches(manifest, expectedPkgId):
+                    continue
+                # Production layout: a package root contains `src/` as the module root.
+                # Example: import `ai/foo/bar` -> <pkgroot>/src/foo/bar.cheng
+                var relInPkg: str = relForPkgRoot
+                if len expectedPkgId > 0 && len importPkgName > 0:
+                    let prefix: str = importPkgName + "/"
+                    if len relInPkg > len prefix && hasPrefix(relInPkg, prefix):
+                        relInPkg = sliceRange(relInPkg, len prefix, len relInPkg - 1)
+
+                if len relInPkg > 0:
+                    let resolvedSrc: str = resolvePkgCandidate(joinPath(root, "src"), relInPkg)
+                    if len resolvedSrc > 0:
+                        return resolvedSrc
+                    let resolvedCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relInPkg)
+                    if len resolvedCheng > 0:
+                        return resolvedCheng
+                    let resolvedRoot: str = resolvePkgCandidate(root, relInPkg)
+                    if len resolvedRoot > 0:
+                        return resolvedRoot
+
+                # Fallback for legacy layouts where the package name is part of the path.
+                let resolvedLegacySrc: str = resolvePkgCandidate(joinPath(root, "src"), relForPkgRoot)
+                if len resolvedLegacySrc > 0:
+                    return resolvedLegacySrc
+                let resolvedLegacyCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relForPkgRoot)
+                if len resolvedLegacyCheng > 0:
+                    return resolvedLegacyCheng
+                let resolvedLegacyRoot: str = resolvePkgCandidate(root, relForPkgRoot)
+                if len resolvedLegacyRoot > 0:
+                    return resolvedLegacyRoot
+            else:
+                if len expectedPkgId > 0:
+                    let pkgName: str = packageNameFromImport importPath
+                    if len pkgName > 0:
+                        let prefixedRoot: str = joinPath(root, "cheng-" + pkgName)
+                        let prefixedManifest: str = joinPath(prefixedRoot, "cheng-package.toml")
+                        if stage1_fileExists prefixedManifest && packageIdMatches(prefixedManifest, expectedPkgId):
+                            var relInPkg: str = relForPkgRoot
+                            let prefix: str = pkgName + "/"
+                            if len relInPkg > len prefix && hasPrefix(relInPkg, prefix):
+                                relInPkg = sliceRange(relInPkg, len prefix, len relInPkg - 1)
+                            let resolvedPref: str = resolvePkgPathInRoot2(prefixedRoot, relInPkg, relForPkgRoot)
+                            if len resolvedPref > 0:
+                                return resolvedPref
+                        let plainRoot: str = joinPath(root, pkgName)
+                        let plainManifest: str = joinPath(plainRoot, "cheng-package.toml")
+                        if stage1_fileExists plainManifest && packageIdMatches(plainManifest, expectedPkgId):
+                            var relInPkg2: str = relForPkgRoot
+                            let prefix2: str = pkgName + "/"
+                            if len relInPkg2 > len prefix2 && hasPrefix(relInPkg2, prefix2):
+                                relInPkg2 = sliceRange(relInPkg2, len prefix2, len relInPkg2 - 1)
+                            let resolvedPlain: str = resolvePkgPathInRoot2(plainRoot, relInPkg2, relForPkgRoot)
+                            if len resolvedPlain > 0:
+                                return resolvedPlain
+                    continue
+                let slash: int32 = indexOfSlash(importPath)
+                if slash > 0 && slash < len importPath - 1:
+                    let pkgName: str = sliceRange(importPath, 0, slash - 1)
+                    let rel: str = sliceRange(importPath, slash + 1, len importPath - 1)
+                    let pkgRoot: str = joinPath(root, pkgName)
+                    let resolved: str = resolvePkgPathInRoot(pkgRoot, rel)
+                    if len resolved > 0:
+                        return resolved
+    return ""
+
+fn resolveImportPath(path: str, baseDir: str, rootDir: str): str =
+    if path == nil || len path == 0:
+        return ""
+    if stage1PluginEnabled():
+        let pluginResolved: str = stage1ResolvePluginImportPath(path)
+        if len pluginResolved > 0:
+            return pluginResolved
+    var full: str = path
+    if isAbsolute(full) || hasPrefix(full, "/") || hasPrefix(full, "./") || hasPrefix(full, "../") || hasPrefix(full, "."):
+        return ""
+    if isAbsolute full:
+        if ! endsWith(full, ".cheng"):
+            full = full + ".cheng"
+        if stage1_fileExists full:
+            let resolved: str = normalizeImportPathChecked(full, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
+    if hasPrefix(full, "std/"):
+        let rest: str = sliceRange(full, 4, len full - 1)
+        var stdPath: str = joinPath(joinPath(rootDir, "src/std"), rest)
+        if ! endsWith(stdPath, ".cheng"):
+            stdPath = stdPath + ".cheng"
+        if stage1_fileExists stdPath:
+            let resolved: str = normalizeImportPathChecked(stdPath, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
+    if hasPrefix(full, "core/"):
+        let rest: str = sliceRange(full, 5, len full - 1)
+        var corePath0: str = joinPath(joinPath(rootDir, "src/core"), rest)
+        if ! endsWith(corePath0, ".cheng"):
+            corePath0 = corePath0 + ".cheng"
+        if stage1_fileExists corePath0:
+            let resolved: str = normalizeImportPathChecked(corePath0, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
+    if hasPrefix(full, "system/"):
+        let rest: str = sliceRange(full, 7, len full - 1)
+        var systemPath0: str = joinPath(joinPath(rootDir, "src/system"), rest)
+        if ! endsWith(systemPath0, ".cheng"):
+            systemPath0 = systemPath0 + ".cheng"
+        if stage1_fileExists systemPath0:
+            let resolved: str = normalizeImportPathChecked(systemPath0, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
+    if hasPrefix(full, "cheng/stdlib/bootstrap/"):
+        var legacyBase: str = joinPath(rootDir, "src/std")
+        var legacyRest: str = sliceRange(full, 23, len full - 1)
+        if hasPrefix(full, "cheng/stdlib/bootstrap/core/"):
+            legacyBase = joinPath(rootDir, "src/core")
+            legacyRest = sliceRange(full, 28, len full - 1)
+        elif hasPrefix(full, "cheng/stdlib/bootstrap/system/"):
+            legacyBase = joinPath(rootDir, "src/system")
+            legacyRest = sliceRange(full, 30, len full - 1)
+        elif hasPrefix(full, "cheng/stdlib/bootstrap/std/"):
+            legacyBase = joinPath(rootDir, "src/std")
+            legacyRest = sliceRange(full, 27, len full - 1)
+        var legacyPath: str = joinPath(legacyBase, legacyRest)
+        if ! endsWith(legacyPath, ".cheng"):
+            legacyPath = legacyPath + ".cheng"
+        if stage1_fileExists legacyPath:
+            let resolved: str = normalizeImportPathChecked(legacyPath, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
+    if hasPrefix(full, "cheng/"):
+        let rest: str = sliceRange(full, 6, len full - 1)
+        var localCandidate: str = joinPath(joinPath(rootDir, "src"), rest)
+        var localFull: str = localCandidate
+        if ! endsWith(localFull, ".cheng"):
+            localFull = localFull + ".cheng"
+        if stage1_fileExists localFull:
+            let resolved: str = normalizeImportPathChecked(localFull, rootDir)
+            if len resolved > 0:
+                return resolved
+        let candidate: str = joinPath(rootDir, full)
+        var fullCandidate: str = candidate
+        if ! endsWith(fullCandidate, ".cheng"):
+            fullCandidate = fullCandidate + ".cheng"
+        if stage1_fileExists fullCandidate:
+            let resolved: str = normalizeImportPathChecked(fullCandidate, rootDir)
+            if len resolved > 0:
+                return resolved
+        let pkgResolved: str = resolvePkgImportPath full
+        if len pkgResolved > 0:
+            return pkgResolved
+        return ""
+    if hasPrefix(full, "gui/"):
+        let guiRoot: str = stage1_getEnv "GUI_ROOT"
+        if len guiRoot > 0:
+            let rest: str = sliceRange(full, 4, len full - 1)
+            full = joinPath(guiRoot, rest)
+            if ! endsWith(full, ".cheng"):
+                full = full + ".cheng"
+            if stage1_fileExists full:
+                let resolved: str = normalizeImportPathChecked(full, guiRoot)
+                if len resolved > 0:
+                    return resolved
+            return ""
+    if hasPrefix(full, "ide/gui/"):
+        let guiRoot: str = stage1_getEnv "GUI_ROOT"
+        if len guiRoot > 0:
+            let rest: str = sliceRange(full, 8, len full - 1)
+            full = joinPath(guiRoot, rest)
+            if ! endsWith(full, ".cheng"):
+                full = full + ".cheng"
+            if stage1_fileExists full:
+                let resolved: str = normalizeImportPathChecked(full, guiRoot)
+                if len resolved > 0:
+                    return resolved
+            return ""
+        let ideRoot: str = stage1_getEnv "IDE_ROOT"
+        if len ideRoot > 0:
+            let rest: str = sliceRange(full, 4, len full - 1)
+            full = joinPath(ideRoot, rest)
+            if ! endsWith(full, ".cheng"):
+                full = full + ".cheng"
+            if stage1_fileExists full:
+                let resolved: str = normalizeImportPathChecked(full, ideRoot)
+                if len resolved > 0:
+                    return resolved
+            return ""
+    if hasPrefix(full, "ide/"):
+        let ideRoot: str = stage1_getEnv "IDE_ROOT"
+        if len ideRoot > 0:
+            let rest: str = sliceRange(full, 4, len full - 1)
+            full = joinPath(ideRoot, rest)
+            if ! endsWith(full, ".cheng"):
+                full = full + ".cheng"
+            if stage1_fileExists full:
+                let resolved: str = normalizeImportPathChecked(full, ideRoot)
+                if len resolved > 0:
+                    return resolved
+            return ""
+        full = joinPath(rootDir, full)
+        if ! endsWith(full, ".cheng"):
+            full = full + ".cheng"
+        if stage1_fileExists full:
+            let resolved: str = normalizeImportPathChecked(full, rootDir)
+            if len resolved > 0:
+                return resolved
+        return ""
+    # Default source import root: resolve plain module paths from `<repo>/src`.
+    var srcRootPath: str = joinPath(joinPath(rootDir, "src"), full)
+    if ! endsWith(srcRootPath, ".cheng"):
+        srcRootPath = srcRootPath + ".cheng"
+    if stage1_fileExists srcRootPath:
+        let resolved: str = normalizeImportPathChecked(srcRootPath, rootDir)
+        if len resolved > 0:
+            return resolved
+    let fullNoExt: str = full
+    if ! endsWith(full, ".cheng"):
+        full = full + ".cheng"
+    if len baseDir > 0:
+        let candidate: str = joinPath(baseDir, full)
+        if stage1_fileExists candidate:
+            let resolved: str = normalizeImportPathChecked(candidate, rootDir)
+            if len resolved > 0:
+                return resolved
+        let corePath: str = joinPath(joinPath(rootDir, "src/core"), full)
+        if stage1_fileExists corePath:
+            let resolved: str = normalizeImportPathChecked(corePath, rootDir)
+            if len resolved > 0:
+                return resolved
+        let systemPath: str = joinPath(joinPath(rootDir, "src/system"), full)
+        if stage1_fileExists systemPath:
+            let resolved: str = normalizeImportPathChecked(systemPath, rootDir)
+            if len resolved > 0:
+                return resolved
+        let stdPath: str = joinPath(joinPath(rootDir, "src/std"), full)
+        if stage1_fileExists stdPath:
+            let resolved: str = normalizeImportPathChecked(stdPath, rootDir)
+            if len resolved > 0:
+                return resolved
+        if indexOfSlash(fullNoExt) >= 0:
+            let pkgResolved: str = resolvePkgImportPath fullNoExt
+            if len pkgResolved > 0:
+                return pkgResolved
+        return ""
+    let corePath2: str = joinPath(joinPath(rootDir, "src/core"), full)
+    if stage1_fileExists corePath2:
+        let resolved: str = normalizeImportPathChecked(corePath2, rootDir)
+        if len resolved > 0:
+            return resolved
+    let systemPath2: str = joinPath(joinPath(rootDir, "src/system"), full)
+    if stage1_fileExists systemPath2:
+        let resolved: str = normalizeImportPathChecked(systemPath2, rootDir)
+        if len resolved > 0:
+            return resolved
+    let stdPath2: str = joinPath(joinPath(rootDir, "src/std"), full)
+    if stage1_fileExists stdPath2:
+        let resolved: str = normalizeImportPathChecked(stdPath2, rootDir)
+        if len resolved > 0:
+            return resolved
+    if indexOfSlash(fullNoExt) >= 0:
+        let pkgResolved2: str = resolvePkgImportPath fullNoExt
+        if len pkgResolved2 > 0:
+            return pkgResolved2
+    return ""
+
+fn canonicalizeResolvedPath(resolved: str, rootDir: str): str =
+    if resolved == nil || len resolved == 0:
+        return ""
+    let srcRoot: str = joinPath(rootDir, "src")
+    let chengRoot: str = joinPath(rootDir, "cheng")
+    let srcPrefix: str = srcRoot + "/"
+    if hasPrefix(resolved, srcPrefix):
+        let rel: str = sliceRange(resolved, len srcPrefix, len resolved - 1)
+        let candidate: str = joinPath(chengRoot, rel)
+        if stage1_fileExists candidate:
+            return candidate
+    return resolved
+
+type
+    StrSetList =
+        items: str[]
+        set: hashsets.HashSetStr
+
+    ImportTrace =
+        items: str[]
+
+    NodeCache =
+        keys: str[]
+        valStart: int32[]
+        valLen: int32[]
+        pool: Node[]
+        index: hashmaps.HashMapStrInt
+
+fn strSetListInit(cap0: int32 = 16): StrSetList =
+    var s: StrSetList
+    var cap: int32 = cap0
+    if cap < 8:
+        cap = 8
+    s.items = []
+    s.items.cap = cap
+    s.set = hashsets.hashSetStrInit(cap * 2)
+    return s
+
+fn nodeCacheInit(cap0: int32 = 32): NodeCache =
+    var c: NodeCache
+    var cap: int32 = cap0
+    if cap < 8:
+        cap = 8
+    c.keys = []
+    c.keys.cap = cap
+    c.valStart = []
+    c.valStart.cap = cap
+    c.valLen = []
+    c.valLen.cap = cap
+    c.pool = []
+    c.index = hashmaps.hashMapStrIntInit(cap * 2)
+    return c
+
+fn setHasStr(v: StrSetList, key: str): bool =
+    return hashsets.hashSetStrHas(v.set, key)
+
+fn setAddStr(v: StrSetList*, key: str) =
+    if v == nil || key == nil:
+        return
+    if hashsets.hashSetStrHas(v->set, key):
+        return
+    add(v->items, key)
+    hashsets.hashSetStrAdd(v->set, key)
+
+fn importTraceFind(v: ImportTrace, path: str): int32 =
+    if path == nil || len(path) == 0:
+        return -1
+    for i in 0..<v.items.len:
+        if v.items[i] == path:
+            return i
+    return -1
+
+fn importTraceHas(v: ImportTrace, path: str): bool =
+    return importTraceFind(v, path) >= 0
+
+fn importTracePush(v: ImportTrace*, path: str) =
+    if v == nil || path == nil || len(path) == 0:
+        return
+    add(v->items, path)
+
+fn importTracePop(v: ImportTrace*) =
+    if v == nil:
+        return
+    if v->items.len <= 0:
+        return
+    v->items.len = v->items.len - 1
+
+fn importTraceCycleMessage(v: ImportTrace, path: str): str =
+    var msg: str = "Import cycle detected: "
+    let start: int32 = importTraceFind(v, path)
+    if start < 0:
+        return msg + path + " -> " + path
+    var first: bool = true
+    for i in start..<v.items.len:
+        if !first:
+            msg = msg + " -> "
+        msg = msg + v.items[i]
+        first = false
+    if !first:
+        msg = msg + " -> "
+    msg = msg + path
+    return msg
+
+fn mapGetNodes(cache: NodeCache, key: str, found: bool* = nil): Node[] =
+    var ok: bool = false
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(cache.index, key, ok)
+    if ok && idx >= 0 && idx < cache.valStart.len:
+        if found != nil:
+            *found = true
+        let start: int32 = cache.valStart[idx]
+        let n: int32 = cache.valLen[idx]
+        var out: Node[]
+        if start >= 0 && n > 0:
+            reserve(out, n)
+            for i in 0..<n:
+                add(out, cache.pool[start + i])
+        return out
+    if found != nil:
+        *found = false
+    return []
+
+fn mapSetNodes(cache: NodeCache*, key: str, val: Node[]) =
+    if cache == nil || key == nil:
+        return
+    var existed: bool = false
+    let idx: int32 = hashmaps.hashMapStrIntGetOrInsertEx(cache->index, key, cache->keys.len, existed)
+    let start: int32 = cache->pool.len
+    let n: int32 = val.len
+    for i in 0..<n:
+        add(cache->pool, val[i])
+    if existed && idx >= 0 && idx < cache->valStart.len:
+        var valStartSeq: int32[] = cache->valStart
+        var valLenSeq: int32[] = cache->valLen
+        valStartSeq[idx] = start
+        valLenSeq[idx] = n
+        cache->valStart = valStartSeq
+        cache->valLen = valLenSeq
+        return
+    let newIdx: int32 = cache->keys.len
+    add(cache->keys, key)
+    add(cache->valStart, start)
+    add(cache->valLen, n)
+    if existed || idx != newIdx:
+        hashmaps.hashMapStrIntPut(cache->index, key, newIdx)
+
+fn loadModuleRecursive(path: str, rootDir: str, visited: StrSetList*, diags: Diagnostic[]*,
+                       cache: NodeCache* = nil, trace: ImportTrace* = nil): Node[] =
+    var out: Node[8]
+    if len path == 0:
+        return out
+    if stage1TraceImportsEnabled():
+        stage1Trace("import: load " + path)
+    if trace != nil && importTraceHas(*trace, path):
+        addDiag(diags, svError, path, 1, 1, importTraceCycleMessage(*trace, path))
+        return out
+    if visited != nil && setHasStr(*visited, path):
+        return out
+    var tracePushed: bool = false
+    if trace != nil:
+        importTracePush(trace, path)
+        tracePushed = true
+    defer:
+        if tracePushed:
+            importTracePop(trace)
+    if visited != nil:
+        setAddStr(visited, path)
+    if cache != nil:
+        var cachedOk: bool = false
+        let cached: Node[] = mapGetNodes(*cache, path, &cachedOk)
+        if cachedOk:
+            return cached
+    if ! stage1_fileExists path:
+        if stage1TraceImportsEnabled():
+            stage1Trace("import: missing " + path)
+        addDiag(diags, svError, path, 1, 1, "Unable to read imported module")
+        return out
+    let size: int64 = fileSize path
+    let mtime: int64 = fileMtime path
+    var tokens: Token[]
+    var lexDiags: Diagnostic[]
+    lexDiags.buffer = nil
+    lexDiags.len = 0
+    lexDiags.cap = 0
+    let cacheRes: TokenCacheResult = loadTokenCache(path, size, mtime)
+    if cacheRes.hit:
+        tokens = cacheRes.tokens
+    else:
+        let content: str = stage1_readFile path
+        if (content == ""):
+            addDiag(diags, svError, path, 1, 1, "Unable to read imported module")
+            return out
+        let lexRes: LexResult = lex(content, path)
+        releaseString content
+        tokens = lexRes.tokens
+        lexDiags = lexRes.diagnostics
+        appendDiagnostics(diags, lexDiags)
+        if lexDiags.len == 0:
+            writeTokenCache(path, size, mtime, tokens)
+    let mroot0: Node = parseModuleWithDiagnostics(tokens, path, diags)
+    let mroot: Node = stage1ApplyAstPluginHooks(path, mroot0)
+    freeSeq[Token](tokens)
+    freeSeq[Diagnostic](lexDiags)
+    if mroot == nil:
+        return out
+    tagModuleChildren(mroot, path)
+    var aliases: str[8]
+    collectImportAliases(mroot, &aliases)
+    if aliases.len > 0:
+        lowerModuleQualifiers(mroot, aliases)
+    let split: SplitFileResult = parser_splitFile path
+    let moduleDir: str = split.dir
+    var importNodes: Node[8]
+    collectImportNodes(mroot, &importNodes)
+    for ii in 0..<importNodes.len:
+        let imp: Node = importNodes[ii]
+        var paths: str[8]
+        collectImportPaths(imp, &paths)
+        for pi in 0..<paths.len:
+            let rawPath: str = paths[pi]
+            if len rawPath > 0 && !(rawPath == "system"):
+                var resolved: str = resolveImportPath(rawPath, moduleDir, rootDir)
+                if len resolved == 0:
+                    addDiag(diags, svError, path, 1, 1, "Unable to read imported module: " + rawPath)
+                    continue
+                resolved = canonicalizeResolvedPath(resolved, rootDir)
+                if stage1TraceImportsEnabled():
+                    stage1Trace("import: " + path + " -> " + rawPath + " => " + resolved)
+                let nested: Node[] = loadModuleRecursive(resolved, rootDir, visited, diags, cache, trace)
+                for ni in 0..<nested.len:
+                    add(out, nested[ni])
+    if mroot.kind == nkModule || mroot.kind == nkStmtList:
+        for ci in 0..<kidCount mroot:
+            let child: Node = kid(mroot, ci)
+            if child != nil && child.kind != nkEmpty && child.kind != nkImportStmt && child.kind != nkImportGroup:
+                if child.strVal == nil || len child.strVal == 0:
+                    nodeSetStrVal(child, path)
+                add(out, child)
+    else:
+        if mroot.kind != nkEmpty:
+            add(out, mroot)
+    if cache != nil:
+        mapSetNodes(cache, path, out)
+    return out
+
+fn loadImports(root: Node, baseDir: str, rootDir: str, diags: Diagnostic[]*, visitedIn: StrSetList* = nil,
+               cache: NodeCache* = nil): Node[] =
+    var out: Node[8]
+    if root == nil:
+        return out
+    var localVisited: StrSetList = strSetListInit(16)
+    var visited: StrSetList* = visitedIn
+    if visited == nil:
+        visited = &localVisited
+    var trace: ImportTrace
+    trace.items = []
+    reserve(trace.items, 16)
+    var rootTracePushed: bool = false
+    if root.strVal != nil && len(root.strVal) > 0:
+        importTracePush(&trace, root.strVal)
+        rootTracePushed = true
+    defer:
+        if rootTracePushed:
+            importTracePop(&trace)
+    var importNodes: Node[8]
+    collectImportNodes(root, &importNodes)
+    for i in 0..<importNodes.len:
+        let imp: Node = importNodes[i]
+        var paths: str[8]
+        collectImportPaths(imp, &paths)
+        for pi in 0..<paths.len:
+            let rawPath: str = paths[pi]
+            if len rawPath > 0 && !(rawPath == "system"):
+                var resolved: str = resolveImportPath(rawPath, baseDir, rootDir)
+                if len resolved == 0:
+                    addDiag(diags, svError, baseDir, 1, 1, "Unable to read imported module: " + rawPath)
+                    continue
+                resolved = canonicalizeResolvedPath(resolved, rootDir)
+                if stage1TraceImportsEnabled():
+                    let owner: str = (root.strVal != nil && len(root.strVal) > 0) ? root.strVal : baseDir
+                    stage1Trace("import: " + owner + " -> " + rawPath + " => " + resolved)
+                let nested: Node[] = loadModuleRecursive(resolved, rootDir, visited, diags, cache, &trace)
+                for ni in 0..<nested.len:
+                    add(out, nested[ni])
+    return out
+
+fn copyFile(src: str, dst: str): bool =
+    let content: str = stage1_readFile src
+    if (content == ""):
+        return false
+    stage1_writeFile(dst, content)
+    return true
+
+fn appendDiagnostics(dst: Diagnostic[]*, src: Diagnostic[]) =
+    if dst == nil:
+        return
+    for i in 0..<src.len:
+        add(dst, src[i])
+
+fn hasError(diags: var Diagnostic[]): bool =
+    for i in 0..<diags.len:
+        let d: Diagnostic = diags[i]
+        if d.severity == svError:
+            return true
+    return false
+
+fn hasHint(diags: Diagnostic[]): bool =
+    for i in 0..<diags.len:
+        let d: Diagnostic = diags[i]
+        if d.severity == svHint:
+            return true
+    return false
+
+fn printDiagnostics(diags: Diagnostic[]) =
+    for i in 0..<diags.len:
+        let diagText: str = format diags[i]
+        echo diagText
+
+fn printHints(diags: Diagnostic[]) =
+    for i in 0..<diags.len:
+        let d: Diagnostic = diags[i]
+        if d.severity == svHint:
+            let diagText: str = format d
+            echo diagText
+
+fn loadSystemModule(userFile: str, diags: Diagnostic[]*): Node =
+    if !stage1_autoSystemEnabled():
+        return nil
+    var sysPath: str = "src/std/system.cheng"
+    if (userFile == sysPath):
+        return nil
+    if ! stage1_fileExists sysPath:
+        return nil
+    let size: int64 = fileSize sysPath
+    let mtime: int64 = fileMtime sysPath
+    var tokens: Token[]
+    var lexDiags: Diagnostic[]
+    lexDiags.buffer = nil
+    lexDiags.len = 0
+    lexDiags.cap = 0
+    let cacheRes: TokenCacheResult = loadTokenCache(sysPath, size, mtime)
+    if cacheRes.hit:
+        tokens = cacheRes.tokens
+    else:
+        let content: str = stage1_readFile sysPath
+        if (content == ""):
+            return nil
+        let lexRes: LexResult = lex(content, sysPath)
+        releaseString content
+        tokens = lexRes.tokens
+        lexDiags = lexRes.diagnostics
+        if diags != nil:
+            appendDiagnostics(diags, lexDiags)
+        if lexDiags.len == 0:
+            writeTokenCache(sysPath, size, mtime, tokens)
+    dumpTokens(sysPath, tokens)
+    let sysRoot0: Node = parseModuleWithDiagnostics(tokens, sysPath, diags)
+    let sysRoot: Node = stage1ApplyAstPluginHooks(sysPath, sysRoot0)
+    freeSeq[Token](tokens)
+    freeSeq[Diagnostic](lexDiags)
+    return sysRoot
+
+fn parseModuleForDeps(path: str, diags: Diagnostic[]*): Node =
+    if len path == 0:
+        return nil
+    if ! stage1_fileExists path:
+        addDiag(diags, svError, path, 1, 1, "Unable to read input file")
+        return nil
+    let size: int64 = fileSize path
+    let mtime: int64 = fileMtime path
+    var tokens: Token[]
+    var lexDiags: Diagnostic[]
+    lexDiags.buffer = nil
+    lexDiags.len = 0
+    lexDiags.cap = 0
+    let cacheRes: TokenCacheResult = loadTokenCache(path, size, mtime)
+    if cacheRes.hit:
+        tokens = cacheRes.tokens
+    else:
+        let content: str = stage1_readFile path
+        if (content == ""):
+            addDiag(diags, svError, path, 1, 1, "Unable to read input file")
+            return nil
+        let lexRes: LexResult = lex(content, path)
+        releaseString content
+        tokens = lexRes.tokens
+        lexDiags = lexRes.diagnostics
+        appendDiagnostics(diags, lexDiags)
+        if lexDiags.len == 0:
+            writeTokenCache(path, size, mtime, tokens)
+    let root0: Node = parseModuleWithDiagnostics(tokens, path, diags)
+    let root: Node = stage1ApplyAstPluginHooks(path, root0)
+    freeSeq[Token](tokens)
+    freeSeq[Diagnostic](lexDiags)
+    return root
+
+fn mergeModules(sysRoot: Node, userRoot: Node): Node =
+    if userRoot == nil:
+        return sysRoot
+    if sysRoot == nil:
+        return userRoot
+    var root: Node = newNode(nkModule, userRoot.pos)
+    nodeSetStrVal(root, userRoot.strVal)
+    nodeSetIdent(root, userRoot.ident)
+    for i in 0..<kidCount sysRoot:
+        addSon(root, kid(sysRoot, i))
+    for j in 0..<kidCount userRoot:
+        addSon(root, kid(userRoot, j))
+    return root
+
+fn tagModuleChildren(root: Node, path: str) =
+    if root == nil:
+        return
+    if path == nil || path[0] == char(0):
+        return
+    for i in 0..<kidCount root:
+        let child: Node = kid(root, i)
+        if child != nil && child.kind != nkEmpty:
+            if child.kind == nkStmtList:
+                for j in 0..<kidCount child:
+                    let stmt: Node = kid(child, j)
+                    if stmt != nil && stmt.kind != nkEmpty:
+                        if stmt.strVal == nil || len(stmt.strVal) == 0:
+                            nodeSetStrVal(stmt, path)
+            elif child.strVal == nil || len(child.strVal) == 0:
+                nodeSetStrVal(child, path)
+
+fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
+    releaseNodeArena()
+    releaseLexStrings()
+    initNodeArena()
+    initLexStringPool()
+    defer:
+        releaseNodeArena()
+        releaseLexStrings()
+    let userRoot: Node = parseModuleForDeps(inPath, diags)
+    let sysRoot: Node = loadSystemModule(inPath, diags)
+    if diags != nil && hasError(*diags):
+        return []
+    let combined: Node = mergeModules(sysRoot, userRoot)
+    var imports: str[16]
+    collectImportDeps(combined, &imports)
+    var uniqSet: StrSetList = strSetListInit(imports.len)
+    for importIndex in 0..<imports.len:
+        let imp: str = imports[importIndex]
+        if len imp > 0:
+            setAddStr(&uniqSet, imp)
+    let inParts: SplitFileResult = parser_splitFile inPath
+    if stage1_autoSystemEnabled() && !(inParts.name == "system" && inParts.ext == ".cheng"):
+        setAddStr(&uniqSet, "system")
+    var resolvedDeps: str[] = uniqSet.items
+    let resolveEnv: str = stage1_getEnv "DEPS_RESOLVE"
+    if (resolveEnv == "1") || (resolveEnv == "true") || (resolveEnv == "yes"):
+        let repoRoot: str = getCurrentDir()
+        let baseDir: str =(parser_splitFile inPath).dir
+        var resolvedSet: StrSetList = strSetListInit(uniqSet.items.len + 4)
+        var visitedModules: StrSetList = strSetListInit(uniqSet.items.len + 4)
+        var pending: str[]
+        for resolvedIndex in 0..<uniqSet.items.len:
+            let raw: str = stripImportAlias uniqSet.items[resolvedIndex]
+            var resolved: str = resolveImportPath(raw, baseDir, repoRoot)
+            if len resolved == 0:
+                resolved = raw
+            if len resolved > 0:
+                resolved = canonicalizeResolvedPath(resolved, repoRoot)
+                setAddStr(&resolvedSet, resolved)
+                if stage1_fileExists resolved && ! setHasStr(visitedModules, resolved):
+                    setAddStr(&visitedModules, resolved)
+                    add(pending, resolved)
+        while true:
+            let pendingLen: int32 = pending.len
+            if pendingLen == 0:
+                break
+            var nextPending: str[]
+            for pi in 0..<pendingLen:
+                let modPath: str = pending[pi] + ""
+                let modRoot: Node = parseModuleForDeps(modPath, diags)
+                if modRoot == nil:
+                    continue
+                let modDir: str =(parser_splitFile modPath).dir
+                var modImports: str[8]
+                collectImportDeps(modRoot, &modImports)
+                for mi in 0..<modImports.len:
+                    let rawNext: str = stripImportAlias modImports[mi]
+                    if len rawNext > 0:
+                        var resolvedNext: str = resolveImportPath(rawNext, modDir, repoRoot)
+                        if len resolvedNext == 0:
+                            resolvedNext = rawNext
+                        if len resolvedNext > 0:
+                            resolvedNext = canonicalizeResolvedPath(resolvedNext, repoRoot)
+                            setAddStr(&resolvedSet, resolvedNext)
+                            if stage1_fileExists resolvedNext && ! setHasStr(visitedModules, resolvedNext):
+                                setAddStr(&visitedModules, resolvedNext)
+                                add(nextPending, resolvedNext)
+            pending = nextPending
+        resolvedDeps = resolvedSet.items
+    return resolvedDeps
+
+fn compileToDepsList(inPath: str, outPath: str): bool =
+    if (inPath == ""):
+        panic "stage1 frontend: missing input"
+    var diags: Diagnostic[16]
+    let resolvedDeps: str[] = collectResolvedDeps(inPath, &diags)
+    if hasError diags:
+        printDiagnostics diags
+        return false
+    var payload: str = ""
+    for depIndex in 0..<resolvedDeps.len:
+        let item: str = resolvedDeps[depIndex]
+        if depIndex > 0:
+            payload = payload + "\n"
+        payload = payload + item
+    if len outPath > 0:
+        stage1_writeFile(outPath, payload)
+    else:
+        echo payload
+    return true

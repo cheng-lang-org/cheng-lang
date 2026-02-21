@@ -1,0 +1,120 @@
+# diagnostics.cheng
+# Stage1 diagnostics (ported from stage0/diagnostics).
+import std/os as bos
+import std/strings
+
+type
+    Severity = enum
+        svError, svWarning, svHint
+
+    Diagnostic =
+        severity: Severity
+        filename: str
+        line: int32
+        col: int32
+        message: str
+
+fn freeSeq_Diagnostic(seqInst: var Diagnostic[]) =
+    if seqInst.buffer != nil:
+        memRelease(seqInst.buffer)
+    seqInst.buffer = nil
+    seqInst.len = 0
+    seqInst.cap = 0
+
+fn severityLabel(sev: Severity): str =
+    var out: str = "unknown"
+    case sev
+    of svError: out = "error"
+    of svWarning: out = "warning"
+    of svHint: out = "hint"
+    else: out = "unknown"
+    return out
+
+fn diagContextEnabled(): bool =
+    let v: str = diag_c_getenv("DIAG_CONTEXT")
+    return v != nil && len(v) > 0 && v != "0"
+
+fn diag_c_getenv(name: cstring): str =
+    return bos.getEnvDefault(name, "")
+
+fn diagReadFileText(path: str): str =
+    if path == nil || len(path) == 0:
+        return ""
+    let f = bos.openRead path
+    if f == nil:
+        return ""
+    let content = bos.readAll f
+    bos.close f
+    return content
+
+fn sliceLineAt(text: str, lineNo: int32): str =
+    if text == nil || lineNo <= 0:
+        return ""
+    var start: int32 = 0
+    var endPos: int32 = 0
+    var line: int32 = 1
+    for i in 0..<len(text):
+        let ch: char = text[i]
+        if ch == '\n':
+            if line == lineNo:
+                endPos = i
+                if endPos > start && text[endPos - 1] == '\r':
+                    endPos = endPos - 1
+                if endPos <= start:
+                    return ""
+                return __cheng_slice_string(text, start, endPos, true)
+            line = line + 1
+            start = i + 1
+    if line == lineNo:
+        endPos = len text
+        if endPos > start && text[endPos - 1] == '\r':
+            endPos = endPos - 1
+        if endPos <= start:
+            return ""
+        return __cheng_slice_string(text, start, endPos, true)
+    return ""
+
+fn repeatChar(ch: char, count: int32): str =
+    if count <= 0:
+        return ""
+    var out: str = ""
+    for i in 0..<count:
+        out = out + charToStr ch
+    return out
+
+fn rawPointerReplacementAlternatives(): str =
+    return "use slice/tuple/handle/borrow bridges instead"
+
+fn rawPointerForbidMessage(base: str): str =
+    var msg: str = base
+    if msg == nil || len msg == 0:
+        msg = "raw pointer surface is forbidden"
+    return msg + "; " + rawPointerReplacementAlternatives()
+
+fn format(d: Diagnostic): str =
+    var s: str = ""
+    s = s + d.filename
+    s = s + ":"
+    s = s + intToStr d.line
+    s = s + ":"
+    s = s + intToStr d.col
+    s = s + ": ["
+    s = s + severityLabel d.severity
+    s = s + "] "
+    s = s + d.message
+    if diagContextEnabled() && d.filename != nil && len(d.filename) > 0:
+        let content: str = diagReadFileText(d.filename)
+        let lineText: str = sliceLineAt(content, d.line)
+        if lineText != nil && len(lineText) > 0:
+            s = s + "\n  "
+            s = s + lineText
+            var col: int32 = d.col
+            if col <= 0:
+                col = 1
+            let maxCol: int32 = len lineText
+            if col > maxCol + 1:
+                col = maxCol + 1
+            s = s + "\n  "
+            s = s + repeatChar(' ', col - 1)
+            s = s + "^"
+    return s

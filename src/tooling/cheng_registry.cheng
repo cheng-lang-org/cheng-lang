@@ -1,0 +1,213 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/registry as dreg
+import cheng/libp2p/utils/result as result
+import std/strings
+
+type
+    Args =
+        cmd: str
+        registryPath: str
+        packageId: str
+        authorId: str
+        channel: str
+        cidText: str
+        filePath: str
+        epoch: int32
+        privKeyText: str
+        format: str
+        outPath: str
+        ok: bool
+        error: str
+    JsonNode = json.JsonNode
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng_registry <command> [args]")
+    printLine("")
+    printLine("commands:")
+    printLine("  keygen   --out:<file>")
+    printLine("  publish  --package:<id> --author:<id> --channel:<edge|stable|lts> --epoch:<n>")
+    printLine("           (--cid:<cid> | --file:<path>) --priv:<key> [--format:<tar|source>] [--registry:<path>]")
+    printLine("  resolve  --package:<id> --channel:<edge|stable|lts> [--registry:<path>] [--out:<file>]")
+    printLine("  verify   --package:<id> --channel:<edge|stable|lts> [--registry:<path>]")
+
+fn parseInt(text: str): int32 =
+    if text == nil || len(text) == 0:
+        return 0
+    var i: int32 = 0
+    var sign: int32 = 1
+    if text[0] == '-':
+        sign = -1
+        i = 1
+    var value: int32 = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<len(text):
+        i = __for_i_1
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            break
+        value = value * 10 + (int32(ch) - int32('0'))
+        i = i + 1
+    return value * sign
+
+fn parseArgs(): Args =
+    var res: Args
+    res.ok = true
+    res.epoch = 0
+    res.registryPath = "build/cheng_registry/registry.jsonl"
+    let count = cmdline.paramCount()
+    if count <= 0:
+        res.ok = false
+        res.error = "missing command"
+        return res
+    res.cmd = cmdline.paramStr(1)
+    for i in 2..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--registry:"):
+            res.registryPath = arg["--registry:".len..^ 1]
+        elif strutil.startsWith(arg, "--package:"):
+            res.packageId = arg["--package:".len..^ 1]
+        elif strutil.startsWith(arg, "--author:"):
+            res.authorId = arg["--author:".len..^ 1]
+        elif strutil.startsWith(arg, "--channel:"):
+            res.channel = arg["--channel:".len..^ 1]
+        elif strutil.startsWith(arg, "--epoch:"):
+            res.epoch = parseInt(arg["--epoch:".len..^ 1])
+        elif strutil.startsWith(arg, "--cid:"):
+            res.cidText = arg["--cid:".len..^ 1]
+        elif strutil.startsWith(arg, "--file:"):
+            res.filePath = arg["--file:".len..^ 1]
+        elif strutil.startsWith(arg, "--priv:"):
+            res.privKeyText = arg["--priv:".len..^ 1]
+        elif strutil.startsWith(arg, "--format:"):
+            res.format = arg["--format:".len..^ 1]
+        elif strutil.startsWith(arg, "--out:"):
+            res.outPath = arg["--out:".len..^ 1]
+    res
+
+fn writeOutput(outPath: str, node: JsonNode) =
+    let text = json.pretty(node)
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+
+fn cmdKeygen(args: Args): int32 =
+    let kpRes = dreg.generateKeyPairText()
+    if result.IsErr(kpRes):
+        printErr("keygen: failed")
+        return 1
+    let kp = result.Value(kpRes)
+    let node = json.newJObject()
+    node["pub_key"] = json.newJString(kp.pub)
+    node["priv_key"] = json.newJString(kp.priv)
+    writeOutput(args.outPath, node)
+    return 0
+
+fn cmdPublish(args: Args): int32 =
+    if args.packageId == nil || len(args.packageId) == 0:
+        printErr("publish: missing --package")
+        return 1
+    if args.authorId == nil || len(args.authorId) == 0:
+        printErr("publish: missing --author")
+        return 1
+    if args.channel == nil || len(args.channel) == 0:
+        printErr("publish: missing --channel")
+        return 1
+    if args.privKeyText == nil || len(args.privKeyText) == 0:
+        printErr("publish: missing --priv")
+        return 1
+    var snap: dreg.PackageSnapshot
+    if args.filePath != nil && len(args.filePath) > 0:
+        let snapRes: result.Result[dreg.PackageSnapshot] =
+            dreg.buildSnapshotFromFile(args.packageId, args.authorId, args.channel, args.epoch, args.filePath)
+        if result.IsErr(snapRes):
+            printErr("publish: build snapshot failed")
+            return 1
+        snap = result.Value(snapRes)
+    if args.filePath == nil || len(args.filePath) == 0:
+        if args.cidText == nil || len(args.cidText) == 0:
+            printErr("publish: missing --cid or --file")
+            return 1
+        snap.packageId = args.packageId
+        snap.authorId = args.authorId
+        snap.channel = args.channel
+        snap.epoch = args.epoch
+        snap.cidText = args.cidText
+    if args.format != nil && len(args.format) > 0:
+        snap.format = args.format
+    let pubRes: result.Result[dreg.PackageSnapshot] = dreg.publishSnapshot(args.registryPath, snap, args.privKeyText)
+    if result.IsErr(pubRes):
+        printErr("publish: failed")
+        return 1
+    let node = dreg.snapshotToJson(result.Value(pubRes))
+    writeOutput(args.outPath, node)
+    return 0
+
+fn cmdResolve(args: Args): int32 =
+    if args.packageId == nil || len(args.packageId) == 0:
+        printErr("resolve: missing --package")
+        return 1
+    if args.channel == nil || len(args.channel) == 0:
+        printErr("resolve: missing --channel")
+        return 1
+    let snapRes: result.Result[dreg.PackageSnapshot] =
+        dreg.resolveSnapshot(args.registryPath, args.packageId, args.channel)
+    if result.IsErr(snapRes):
+        printErr("resolve: not found")
+        return 1
+    let node = dreg.snapshotToJson(result.Value(snapRes))
+    writeOutput(args.outPath, node)
+    return 0
+
+fn cmdVerify(args: Args): int32 =
+    if args.packageId == nil || len(args.packageId) == 0:
+        printErr("verify: missing --package")
+        return 1
+    if args.channel == nil || len(args.channel) == 0:
+        printErr("verify: missing --channel")
+        return 1
+    let snapRes: result.Result[dreg.PackageSnapshot] =
+        dreg.resolveSnapshot(args.registryPath, args.packageId, args.channel)
+    if result.IsErr(snapRes):
+        printErr("verify: not found")
+        return 1
+    let snap = result.Value(snapRes)
+    if dreg.verifySnapshot(snap):
+        printLine("ok")
+        return 0
+    printErr("verify: failed")
+    return 1
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let args: Args = parseArgs()
+    if ! args.ok:
+        printUsage()
+        if args.error != nil && len(args.error) > 0:
+            printErr(args.error)
+        return 1
+    if args.cmd == "keygen":
+        return cmdKeygen(args)
+    if args.cmd == "publish":
+        return cmdPublish(args)
+    if args.cmd == "resolve":
+        return cmdResolve(args)
+    if args.cmd == "verify":
+        return cmdVerify(args)
+    if args.cmd == "--help" || args.cmd == "-h" || args.cmd == "help":
+        printUsage()
+        return 0
+    printUsage()
+    return 1

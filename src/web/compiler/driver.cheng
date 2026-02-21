@@ -1,0 +1,384 @@
+import cheng/web/compiler/sfc_parser
+import cheng/web/compiler/template_parser
+import cheng/web/compiler/codegen
+import cheng/web/compiler/text_utils
+import std/os
+import std/strings
+
+# File helpers
+
+fn readTextFile(path: str): str =
+    let f: File = openRead(path)
+    if f == nil:
+        return ""
+    let content = readAll(f)
+    close(f)
+    return content
+
+fn writeTextFile(path: str, content: str): bool =
+    let f: File = open(path, fmWrite)
+    if f == nil:
+        return false
+    write(f, content)
+    close(f)
+    return true
+
+fn stripSuffix(name: str, suffix: str): str =
+    let nLen: int32 = len(name)
+    let sLen: int32 = len(suffix)
+    if sLen == 0 || nLen < sLen:
+        return name
+    for i in 0..<sLen:
+        if name[nLen - sLen + i] != suffix[i]:
+            return name
+    return substr(name, 0, nLen - sLen)
+
+fn defaultOutPath(inPath: str, ext: str): str =
+    return stripSuffix(inPath, ".cwc") + ext
+
+fn absI32(x: int32): int32 =
+    if x < 0:
+        return -x
+    return x
+
+fn simpleHash(s: str): int32 =
+    if s == nil:
+        return 0
+    var h: uint32 = uint32(2166136261)
+    for i in 0..<len(s):
+        h = h ^ uint32(s[i])
+        h = h * uint32(16777619)
+    return int32(h)
+
+fn scopeAttrFrom(s: str): str =
+    let id = absI32(simpleHash(s))
+    return "data-cwc-" + intToStr(id)
+
+fn indexOfChar(s: str, target: char, start: int32): int32 =
+    if s == nil:
+        return -1
+    for i in start..<len(s):
+        if s[i] == target:
+            return i
+    return -1
+
+fn findMatchingBrace(s: str, openIdx: int32): int32 =
+    if s == nil || openIdx < 0:
+        return -1
+    var depth: int32 = 0
+    for i in openIdx..<len(s):
+        let c: char = s[i]
+        if c == '{':
+            depth = depth + 1
+        elif c == '}':
+            depth = depth - 1
+            if depth == 0:
+                return i
+    return -1
+
+fn scopeSelector(selector: str, scopeAttr: str): str =
+    let trimmed = trim(selector)
+    if trimmed == nil || len(trimmed) == 0:
+        return ""
+    if trimmed[0] == '@':
+        return trimmed
+    let attr = "[" + scopeAttr + "]"
+    let pseudoIdx = indexOfChar(trimmed, ':', 0)
+    if pseudoIdx >= 0:
+        if pseudoIdx == 0:
+            return attr + trimmed
+        return substr(trimmed, 0, pseudoIdx) + attr + substr(trimmed, pseudoIdx, len(trimmed) - pseudoIdx)
+    return trimmed + attr
+
+fn scopeSelectors(selectors: str, scopeAttr: str): str =
+    if selectors == nil:
+        return ""
+    var out: str = ""
+    var start: int32 = 0
+    var depthParen: int32 = 0
+    var depthBracket: int32 = 0
+    for i in 0..<len(selectors):
+        let c: char = selectors[i]
+        if c == '(':
+            depthParen = depthParen + 1
+        elif c == ')':
+            if depthParen > 0:
+                depthParen = depthParen - 1
+        elif c == '[':
+            depthBracket = depthBracket + 1
+        elif c == ']':
+            if depthBracket > 0:
+                depthBracket = depthBracket - 1
+        elif c == ',' && depthParen == 0 && depthBracket == 0:
+            let part = substr(selectors, start, i - start)
+            let scoped = scopeSelector(part, scopeAttr)
+            if len(scoped) > 0:
+                if len(out) > 0:
+                    out = out + ", "
+                out = out + scoped
+            start = i + 1
+    let tail = substr(selectors, start, len(selectors) - start)
+    let scopedTail = scopeSelector(tail, scopeAttr)
+    if len(scopedTail) > 0:
+        if len(out) > 0:
+            out = out + ", "
+        out = out + scopedTail
+    return out
+
+fn shouldScopeAtRule(header: str): bool =
+    if header == nil:
+        return false
+    let trimmed = trim(header)
+    if trimmed == nil || len(trimmed) == 0:
+        return false
+    if startsWithAt(trimmed, "@media", 0):
+        return true
+    if startsWithAt(trimmed, "@supports", 0):
+        return true
+    return false
+
+fn scopeCss(css: str, scopeAttr: str): str =
+    if css == nil || len(css) == 0 || scopeAttr == nil || len(scopeAttr) == 0:
+        return css
+    var out: str = ""
+    var i: int32 = 0
+    while i < len(css):
+        let openIdx = indexOfChar(css, '{', i)
+        if openIdx < 0:
+            out = out + substr(css, i, len(css) - i)
+            break
+        let selectors = substr(css, i, openIdx - i)
+        let closeIdx = findMatchingBrace(css, openIdx)
+        if closeIdx < 0:
+            out = out + substr(css, i, len(css) - i)
+            break
+        let body = substr(css, openIdx + 1, closeIdx - openIdx - 1)
+        let trimmed = trim(selectors)
+        if trimmed != nil && len(trimmed) > 0 && trimmed[0] == '@':
+            if shouldScopeAtRule(trimmed):
+                out = out + selectors + "{" + scopeCss(body, scopeAttr) + "}"
+            else:
+                out = out + selectors + "{" + body + "}"
+        else:
+            out = out + scopeSelectors(selectors, scopeAttr) + "{" + body + "}"
+        i = closeIdx + 1
+    return out
+
+type
+    CompileResult =
+        ok: bool
+        error: str
+        outPath: str
+        cssPath: str
+        mapPath: str
+        cssMapPath: str
+
+type
+    LineRange =
+        startLine: int32
+        endLine: int32
+
+fn lineNumberAt(s: str, idx: int32): int32 =
+    if s == nil || len(s) == 0:
+        return 0
+    var line: int32 = 1
+    var i: int32 = 0
+    let limit = if idx < len(s): idx else: len(s)
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<limit:
+        i = __for_i_1
+        if s[i] == '\n':
+            line = line + 1
+        i = i + 1
+    return line
+
+fn countLinesText(s: str): int32 =
+    if s == nil || len(s) == 0:
+        return 0
+    var count: int32 = 1
+    for i in 0..<len(s):
+        if s[i] == '\n':
+            count = count + 1
+    return count
+
+fn findBlockRange(source: str, tag: str): LineRange =
+    var out: LineRange
+    out.startLine = 0
+    out.endLine = 0
+    if source == nil || tag == nil || len(tag) == 0:
+        return out
+    let openTag = "<" + tag
+    let closeTag = "</" + tag + ">"
+    let openIdx: int32 = indexOfSubstr(source, openTag, 0)
+    if openIdx < 0:
+        return out
+    let openEnd: int32 = indexOfSubstr(source, ">", openIdx)
+    if openEnd < 0:
+        return out
+    let contentStart: int32 = openEnd + 1
+    let closeIdx: int32 = indexOfSubstr(source, closeTag, contentStart)
+    if closeIdx < 0:
+        return out
+    out.startLine = lineNumberAt(source, contentStart)
+    var endLine: int32 = lineNumberAt(source, closeIdx)
+    if closeIdx > 0 && source[closeIdx - 1] == '\n':
+        endLine = endLine - 1
+    if endLine < out.startLine:
+        endLine = out.startLine
+    out.endLine = endLine
+    return out
+
+fn findGeneratedScriptRange(code: str): LineRange =
+    var out: LineRange
+    out.startLine = 0
+    out.endLine = 0
+    if code == nil || len(code) == 0:
+        return out
+    let startIdx: int32 = indexOfSubstr(code, "# <script>", 0)
+    if startIdx < 0:
+        return out
+    let endIdx: int32 = indexOfSubstr(code, "# </script>", startIdx)
+    if endIdx < 0:
+        return out
+    let markerLine: int32 = lineNumberAt(code, startIdx)
+    var startLine: int32 = markerLine + 1
+    var endLine: int32 = lineNumberAt(code, endIdx) - 1
+    if endLine < startLine:
+        endLine = startLine
+    out.startLine = startLine
+    out.endLine = endLine
+    return out
+
+fn findGeneratedTemplateRange(code: str): LineRange =
+    var out: LineRange
+    out.startLine = 0
+    out.endLine = 0
+    if code == nil || len(code) == 0:
+        return out
+    let mountIdx: int32 = indexOfSubstr(code, "fn appMount", 0)
+    if mountIdx < 0:
+        return out
+    let viewIdx: int32 = indexOfSubstr(code, "__cwc_view = newView(root)", mountIdx)
+    if viewIdx < 0:
+        return out
+    let handleIdx: int32 = indexOfSubstr(code, "var handle: int32 = 1", viewIdx)
+    if handleIdx < 0:
+        return out
+    var startLine: int32 = lineNumberAt(code, viewIdx) + 1
+    var endLine: int32 = lineNumberAt(code, handleIdx) - 1
+    if endLine < startLine:
+        endLine = startLine
+    out.startLine = startLine
+    out.endLine = endLine
+    return out
+
+fn escapeJson(text: str): str =
+    if text == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(text):
+        let c = text[i]
+        if c == '\\':
+            out = out + "\\\\"
+        elif c == '"':
+            out = out + "\\\""
+        elif c == '\n':
+            out = out + "\\n"
+        elif c == '\r':
+            out = out + "\\r"
+        elif c == '\t':
+            out = out + "\\t"
+        else:
+            out = out + c
+    return out
+
+fn renderMap(sourcePath: str, generatedPath: str, sections: str[]): str =
+    var out: str = ""
+    out = out + "{\n"
+    out = out + "  \"version\": 1,\n"
+    out = out + "  \"source\": \"" + escapeJson(sourcePath) + "\",\n"
+    out = out + "  \"generated\": \"" + escapeJson(generatedPath) + "\",\n"
+    out = out + "  \"sections\": [\n"
+    for i in 0..<len(sections):
+        out = out + "    " + sections[i]
+        if i + 1 < len(sections):
+            out = out + ","
+        out = out + "\n"
+    out = out + "  ]\n"
+    out = out + "}\n"
+    return out
+
+fn buildSection(name: str, sourceRange: LineRange, genRange: LineRange): str =
+    return "{\"name\":\"" + escapeJson(name) + "\"," +
+           "\"sourceLineStart\":" + intToStr(sourceRange.startLine) + "," +
+           "\"sourceLineEnd\":" + intToStr(sourceRange.endLine) + "," +
+           "\"generatedLineStart\":" + intToStr(genRange.startLine) + "," +
+           "\"generatedLineEnd\":" + intToStr(genRange.endLine) + "}"
+
+fn compileSfcFileEx(inPath: str, outPath: str, cssPath: str, mapEnabled: bool): CompileResult =
+    var res: CompileResult
+    res.ok = false
+    if inPath == nil || len(inPath) == 0:
+        res.error = "missing input"
+        return res
+    let source = readTextFile(inPath)
+    if len(source) == 0:
+        res.error = "failed to read input"
+        return res
+    let sfc = parseSfc(source)
+    if len(trim(sfc.template)) == 0:
+        res.error = "missing <template> block"
+        return res
+    var scopeAttr: str = ""
+    if sfc.styleScoped:
+        scopeAttr = scopeAttrFrom(inPath + ":" + sfc.template + ":" + sfc.style)
+    let nodes = parseTemplate(sfc.template)
+    let code = generateComponent(nodes, sfc.script, scopeAttr)
+    var outFinal = outPath
+    if outFinal == nil || len(outFinal) == 0:
+        outFinal = defaultOutPath(inPath, ".cheng")
+    if ! writeTextFile(outFinal, code):
+        res.error = "failed to write output"
+        return res
+    res.outPath = outFinal
+    let templateRange = findBlockRange(source, "template")
+    let scriptRange = findBlockRange(source, "script")
+    let styleRange = findBlockRange(source, "style")
+    if sfc.style != nil && len(trim(sfc.style)) > 0:
+        var cssFinal = cssPath
+        if cssFinal == nil || len(cssFinal) == 0:
+            cssFinal = defaultOutPath(inPath, ".css")
+        var cssOut = sfc.style
+        if sfc.styleScoped:
+            cssOut = scopeCss(sfc.style, scopeAttr)
+        if writeTextFile(cssFinal, cssOut):
+            res.cssPath = cssFinal
+            if mapEnabled:
+                let cssLines = countLinesText(cssOut)
+                var cssSections: str[] 
+                if styleRange.startLine > 0:
+                    var genRange: LineRange
+                    genRange.startLine = 1
+                    genRange.endLine = if cssLines > 0: cssLines else: 1
+                    cssSections.add(buildSection("style", styleRange, genRange))
+                let cssMapText = renderMap(inPath, cssFinal, cssSections)
+                let cssMapPath = cssFinal + ".map.json"
+                if writeTextFile(cssMapPath, cssMapText):
+                    res.cssMapPath = cssMapPath
+    res.ok = true
+    if mapEnabled:
+        let scriptGen = findGeneratedScriptRange(code)
+        let templateGen = findGeneratedTemplateRange(code)
+        var sections: str[] 
+        if scriptRange.startLine > 0 && scriptGen.startLine > 0:
+            sections.add(buildSection("script", scriptRange, scriptGen))
+        if templateRange.startLine > 0 && templateGen.startLine > 0:
+            sections.add(buildSection("template", templateRange, templateGen))
+        let mapText = renderMap(inPath, outFinal, sections)
+        let mapPath = outFinal + ".map.json"
+        if writeTextFile(mapPath, mapText):
+            res.mapPath = mapPath
+    return res
+
+fn compileSfcFile(inPath: str, outPath: str, cssPath: str): CompileResult =
+    return compileSfcFileEx(inPath, outPath, cssPath, false)

@@ -1,0 +1,1658 @@
+# MIR v1 types (expression-tree based, MVP).
+import std/seqs
+import std/strings
+import std/result
+import std/hashmaps
+
+fn uirCoreOwnStr(s: str): str =
+    if s == nil:
+        return ""
+    return "" + s
+
+type
+    UirCoreTypeKind = enum
+        mtVoid, mtI8, mtI16, mtI32, mtI64, mtF32, mtF64
+
+    UirCoreType =
+        kind: UirCoreTypeKind
+        isUnsigned: bool
+
+    UirCoreBinOp = enum
+        mbAdd, mbSub, mbMul, mbSdiv, mbSmod,
+        mbAnd, mbOr, mbXor, mbShl, mbShr
+
+    UirCoreCmpOp = enum
+        mcEq, mcNe, mcLt, mcLe, mcGt, mcGe
+
+    UirCoreExprKind = enum
+        meConstI64, meBin, meCmp, meLocal, meCall, meCast,
+        meAddr, meLoad, meGlobalAddr
+
+    UirCoreExpr = ref
+        kind: UirCoreExprKind
+        value: int64
+        binOp: UirCoreBinOp
+        cmpOp: UirCoreCmpOp
+        lhs: UirCoreExpr
+        rhs: UirCoreExpr
+        localIndex: int32
+        callee: str
+        args: UirCoreExpr[]
+        castType: UirCoreType
+        castExpr: UirCoreExpr
+        addrExpr: UirCoreExpr
+        loadType: UirCoreType
+        globalName: str
+
+    UirCoreStmtKind = enum
+        msLet, msVar, msAssign, msExpr, msParam, msStore
+
+    UirCoreStmt =
+        kind: UirCoreStmtKind
+        name: str
+        slot: int32
+        expr: UirCoreExpr
+        paramIndex: int32
+        addrExpr: UirCoreExpr
+        storeType: UirCoreType
+
+    UirCoreParam =
+        name: str
+        slot: int32
+        ty: UirCoreType
+        typeKey: str
+
+    UirCoreTermKind = enum
+        mtRet, mtBr, mtCbr
+
+    UirCoreTerm =
+        kind: UirCoreTermKind
+        retExpr: UirCoreExpr
+        condExpr: UirCoreExpr
+        target: str
+        targetTrue: str
+        targetFalse: str
+
+    UirCoreBlock = ref
+        label: str
+        stmts: UirCoreStmt[]
+        term: UirCoreTerm
+
+    UirCoreFunc = ref
+        name: str
+        linkName: str
+        originFile: str
+        isExtern: bool
+        retType: UirCoreType
+        retTypeKey: str
+        params: UirCoreParam[]
+        localTypes: UirCoreType[]
+        objLocals: UirCoreObjLocal[]
+        objFrameSize: int32
+        blocks: UirCoreBlock[]
+        # P4 phase contract: single-IR dual-phase bookkeeping.
+        phaseTag: int32
+        highUirChecked: bool
+        lowUirLowered: bool
+        phaseFallbackReason: str
+
+    UirCoreCString =
+        label: str
+        value: str
+
+    UirCoreTypeAlias =
+        name: str
+        ty: UirCoreType
+
+    UirCoreObjField =
+        name: str
+        ty: UirCoreType
+        offset: int32
+
+    UirCoreObjType =
+        name: str
+        size: int32
+        alignPow2: int32
+        fields: UirCoreObjField[]
+
+    # Object locals are represented as an i64 pointer slot.
+    # - frameOff >= 0: compiler-allocated stack storage (base = localsArea + frameOff)
+    # - frameOff < 0: external pointer (e.g. ref param/local)
+    UirCoreObjLocal =
+        slot: int32
+        objTypeName: str
+        # Fully-resolved type key (e.g. `seq_int32`), used by backend-only lowering.
+        typeKey: str
+        frameOff: int32
+
+    UirCoreGlobal =
+        name: str
+        ty: UirCoreType
+        init: int64
+        hasInit: bool
+        originFile: str
+
+    UirCoreModule = ref
+        target: str
+        funcs: UirCoreFunc[]
+        cstrs: UirCoreCString[]
+        globals: UirCoreGlobal[]
+        typeAliases: UirCoreTypeAlias[]
+        objTypes: UirCoreObjType[]
+
+fn uirCoreStmtKindName(k: UirCoreStmtKind): str =
+    case k
+    of msLet:
+        return "let"
+    of msVar:
+        return "var"
+    of msAssign:
+        return "asgn"
+    of msExpr:
+        return "expr"
+    of msParam:
+        return "param"
+    of msStore:
+        return "store"
+    return "stmt"
+
+fn uirCorePhaseHighTag(): int32 =
+    return int32(0)
+
+fn uirCorePhaseLowTag(): int32 =
+    return int32(1)
+
+fn uirCorePhaseTagName(tag: int32): str =
+    if tag == uirCorePhaseLowTag():
+        return "low"
+    return "high"
+
+var
+    uirCore_typeAliases_cache_module: UirCoreModule
+    uirCore_typeAliases_cache: hashmaps.HashMapStrInt
+    uirCore_typeAliases_cache_len: int32
+    uirCore_typeAliases_cache_ready: bool
+
+    uirCore_objTypes_cache_module: UirCoreModule
+    uirCore_objTypes_cache: hashmaps.HashMapStrInt
+    uirCore_objTypes_cache_len: int32
+    uirCore_objTypes_cache_ready: bool
+
+    uirCore_cstrs_cache_module: UirCoreModule
+    uirCore_cstrs_cache: hashmaps.HashMapStrInt
+    uirCore_cstrs_cache_len: int32
+    uirCore_cstrs_cache_ready: bool
+
+fn uirCoreHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
+    let v: int32 = hashmaps.hashMapStrIntGetEx(m, key, found)
+    if found:
+        return v
+    return -1
+
+fn uirCore_buildTypeAliasIndexCache(module: UirCoreModule) =
+    if module == nil:
+        uirCore_typeAliases_cache_module = nil
+        uirCore_typeAliases_cache_ready = false
+        uirCore_typeAliases_cache_len = 0
+        return
+    uirCore_typeAliases_cache_module = module
+    uirCore_typeAliases_cache = hashmaps.hashMapStrIntInit(module.typeAliases.len * 2 + 8)
+    for i in 0..<module.typeAliases.len:
+        let a: UirCoreTypeAlias = module.typeAliases[i]
+        if a.name != nil && len(a.name) > 0:
+            hashmaps.hashMapStrIntPut(uirCore_typeAliases_cache, a.name, i + 1)
+    uirCore_typeAliases_cache_len = module.typeAliases.len
+    uirCore_typeAliases_cache_ready = true
+
+fn uirCore_buildObjTypeIndexCache(module: UirCoreModule) =
+    if module == nil:
+        uirCore_objTypes_cache_module = nil
+        uirCore_objTypes_cache_ready = false
+        uirCore_objTypes_cache_len = 0
+        return
+    uirCore_objTypes_cache_module = module
+    uirCore_objTypes_cache = hashmaps.hashMapStrIntInit(module.objTypes.len * 2 + 8)
+    for i in 0..<module.objTypes.len:
+        let t: UirCoreObjType = module.objTypes[i]
+        if t.name != nil && len(t.name) > 0:
+            hashmaps.hashMapStrIntPut(uirCore_objTypes_cache, t.name, i + 1)
+    uirCore_objTypes_cache_len = module.objTypes.len
+    uirCore_objTypes_cache_ready = true
+
+fn uirCore_buildCStringIndexCache(module: UirCoreModule) =
+    if module == nil:
+        uirCore_cstrs_cache_module = nil
+        uirCore_cstrs_cache_ready = false
+        uirCore_cstrs_cache_len = 0
+        return
+    uirCore_cstrs_cache_module = module
+    uirCore_cstrs_cache = hashmaps.hashMapStrIntInit(module.cstrs.len * 2 + 8)
+    for i in 0..<module.cstrs.len:
+        let c: UirCoreCString = module.cstrs[i]
+        if c.value != nil:
+            hashmaps.hashMapStrIntPut(uirCore_cstrs_cache, c.value, i + 1)
+    uirCore_cstrs_cache_len = module.cstrs.len
+    uirCore_cstrs_cache_ready = true
+
+fn uirCoreTypeI32(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI32
+    t.isUnsigned = false
+    return t
+
+fn uirCoreTypeI8(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI8
+    t.isUnsigned = false
+    return t
+
+fn uirCoreTypeU8(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI8
+    t.isUnsigned = true
+    return t
+
+fn uirCoreTypeI16(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI16
+    t.isUnsigned = false
+    return t
+
+fn uirCoreTypeU16(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI16
+    t.isUnsigned = true
+    return t
+
+fn uirCoreTypeVoid(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtVoid
+    t.isUnsigned = false
+    return t
+
+fn uirCoreTypeI64(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI64
+    t.isUnsigned = false
+    return t
+
+fn uirCoreTypeF32(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtF32
+    t.isUnsigned = false
+    return t
+
+fn uirCoreTypeF64(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtF64
+    t.isUnsigned = false
+    return t
+
+fn uirCoreTypeU32(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI32
+    t.isUnsigned = true
+    return t
+
+fn uirCoreTypeU64(): UirCoreType =
+    var t: UirCoreType
+    t.kind = mtI64
+    t.isUnsigned = true
+    return t
+
+fn uirCoreConstI64(value: int64): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meConstI64
+    e.value = value
+    return e
+
+fn uirCoreBin(op: UirCoreBinOp, lhs: UirCoreExpr, rhs: UirCoreExpr): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meBin
+    e.binOp = op
+    e.lhs = lhs
+    e.rhs = rhs
+    return e
+
+fn uirCoreLocal(index: int32): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meLocal
+    e.localIndex = index
+    return e
+
+fn uirCoreCall(name: str, args: UirCoreExpr[]): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meCall
+    e.callee = uirCoreOwnStr(name)
+    e.args = args
+    return e
+
+fn uirCoreCast(ty: UirCoreType, expr: UirCoreExpr): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meCast
+    e.castType = ty
+    e.castExpr = expr
+    return e
+
+fn uirCoreAddr(slot: int32): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meAddr
+    e.localIndex = slot
+    return e
+
+fn uirCoreLoad(addr: UirCoreExpr, ty: UirCoreType): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meLoad
+    e.addrExpr = addr
+    e.loadType = ty
+    return e
+
+fn uirCoreGlobalAddr(name: str): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meGlobalAddr
+    e.globalName = uirCoreOwnStr(name)
+    return e
+
+fn uirCoreCmp(op: UirCoreCmpOp, lhs: UirCoreExpr, rhs: UirCoreExpr): UirCoreExpr =
+    var e: UirCoreExpr
+    new e
+    e.kind = meCmp
+    e.cmpOp = op
+    e.lhs = lhs
+    e.rhs = rhs
+    return e
+
+fn uirCoreTermRet(expr: UirCoreExpr): UirCoreTerm =
+    var t: UirCoreTerm
+    t.kind = mtRet
+    t.retExpr = expr
+    return t
+
+fn uirCoreTermBr(target: str): UirCoreTerm =
+    var t: UirCoreTerm
+    t.kind = mtBr
+    t.target = uirCoreOwnStr(target)
+    return t
+
+fn uirCoreTermCbr(cond: UirCoreExpr, tLabel: str, fLabel: str): UirCoreTerm =
+    var t: UirCoreTerm
+    t.kind = mtCbr
+    t.condExpr = cond
+    t.targetTrue = uirCoreOwnStr(tLabel)
+    t.targetFalse = uirCoreOwnStr(fLabel)
+    return t
+
+fn uirCoreStmtLet(name: str, slot: int32, expr: UirCoreExpr): UirCoreStmt =
+    var s: UirCoreStmt
+    s.kind = msLet
+    s.name = uirCoreOwnStr(name)
+    s.slot = slot
+    s.expr = expr
+    return s
+
+fn uirCoreStmtVar(name: str, slot: int32, expr: UirCoreExpr): UirCoreStmt =
+    var s: UirCoreStmt
+    s.kind = msVar
+    s.name = uirCoreOwnStr(name)
+    s.slot = slot
+    s.expr = expr
+    return s
+
+fn uirCoreStmtAssign(name: str, slot: int32, expr: UirCoreExpr): UirCoreStmt =
+    var s: UirCoreStmt
+    s.kind = msAssign
+    s.name = uirCoreOwnStr(name)
+    s.slot = slot
+    s.expr = expr
+    return s
+
+fn uirCoreStmtExpr(expr: UirCoreExpr): UirCoreStmt =
+    var s: UirCoreStmt
+    s.kind = msExpr
+    s.expr = expr
+    return s
+
+fn uirCoreStmtParam(name: str, slot: int32, paramIndex: int32): UirCoreStmt =
+    var s: UirCoreStmt
+    s.kind = msParam
+    s.name = uirCoreOwnStr(name)
+    s.slot = slot
+    s.paramIndex = paramIndex
+    return s
+
+fn uirCoreStmtStore(addr: UirCoreExpr, value: UirCoreExpr, ty: UirCoreType): UirCoreStmt =
+    var s: UirCoreStmt
+    s.kind = msStore
+    s.slot = -1
+    s.expr = value
+    s.addrExpr = addr
+    s.storeType = ty
+    return s
+
+fn uirCoreBlock(label: str, term: UirCoreTerm): UirCoreBlock =
+    var b: UirCoreBlock
+    new b
+    b.label = uirCoreOwnStr(label)
+    b.stmts = []
+    b.term = term
+    return b
+
+fn uirCoreBlockWithStmts(label: str, stmts: UirCoreStmt[], term: UirCoreTerm): UirCoreBlock =
+    var b: UirCoreBlock
+    new b
+    b.label = uirCoreOwnStr(label)
+    b.stmts = stmts
+    b.term = term
+    return b
+
+fn uirCoreNewFunc(name: str, retType: UirCoreType): UirCoreFunc =
+    var f: UirCoreFunc
+    new f
+    f.name = uirCoreOwnStr(name)
+    f.linkName = uirCoreOwnStr(name)
+    f.originFile = uirCoreOwnStr("")
+    f.isExtern = false
+    f.retType = retType
+    f.retTypeKey = uirCoreOwnStr("")
+    f.params = []
+    f.localTypes = []
+    f.objLocals = []
+    f.objFrameSize = 0
+    f.blocks = []
+    f.phaseTag = uirCorePhaseHighTag()
+    f.highUirChecked = false
+    f.lowUirLowered = false
+    f.phaseFallbackReason = uirCoreOwnStr("high_uir_unchecked")
+    return f
+
+fn uirCoreAddBlock(func: UirCoreFunc, block: UirCoreBlock) =
+    if func == nil || block == nil:
+        return
+    uirCoreCanonicalizeBlock(block)
+    add(func.blocks, block)
+
+fn uirCoreWriteType(seqInst: UirCoreType[]*, idx: int32, val: UirCoreType) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteTypeAlias(seqInst: UirCoreTypeAlias[]*, idx: int32, val: UirCoreTypeAlias) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteObjType(seqInst: UirCoreObjType[]*, idx: int32, val: UirCoreObjType) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteGlobal(seqInst: UirCoreGlobal[]*, idx: int32, val: UirCoreGlobal) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteCString(seqInst: UirCoreCString[]*, idx: int32, val: UirCoreCString) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteFunc(seqInst: UirCoreFunc[]*, idx: int32, val: UirCoreFunc) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteStmt(seqInst: UirCoreStmt[]*, idx: int32, val: UirCoreStmt) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteParam(seqInst: UirCoreParam[]*, idx: int32, val: UirCoreParam) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteObjLocal(seqInst: UirCoreObjLocal[]*, idx: int32, val: UirCoreObjLocal) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteObjField(seqInst: UirCoreObjField[]*, idx: int32, val: UirCoreObjField) =
+    if seqInst == nil:
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreOwnExprStrings(expr: UirCoreExpr) =
+    if expr == nil:
+        return
+    if expr.kind == meCall:
+        expr.callee = uirCoreOwnStr(expr.callee)
+        for i in 0..<expr.args.len:
+            uirCoreOwnExprStrings(expr.args[i])
+        return
+    if expr.kind == meGlobalAddr:
+        expr.globalName = uirCoreOwnStr(expr.globalName)
+        return
+    if expr.kind == meBin || expr.kind == meCmp:
+        uirCoreOwnExprStrings(expr.lhs)
+        uirCoreOwnExprStrings(expr.rhs)
+        return
+    if expr.kind == meCast:
+        uirCoreOwnExprStrings(expr.castExpr)
+        return
+    if expr.kind == meLoad:
+        uirCoreOwnExprStrings(expr.addrExpr)
+        return
+
+fn uirCoreOwnTermStrings(term: UirCoreTerm): UirCoreTerm =
+    var out: UirCoreTerm = term
+    if out.kind == mtRet:
+        uirCoreOwnExprStrings(out.retExpr)
+        return out
+    if out.kind == mtBr:
+        out.target = uirCoreOwnStr(out.target)
+        return out
+    if out.kind == mtCbr:
+        out.targetTrue = uirCoreOwnStr(out.targetTrue)
+        out.targetFalse = uirCoreOwnStr(out.targetFalse)
+        uirCoreOwnExprStrings(out.condExpr)
+        return out
+    return out
+
+fn uirCoreOwnStmtStrings(stmt: UirCoreStmt): UirCoreStmt =
+    var out: UirCoreStmt = stmt
+    out.name = uirCoreOwnStr(out.name)
+    uirCoreOwnExprStrings(out.expr)
+    uirCoreOwnExprStrings(out.addrExpr)
+    return out
+
+fn uirCoreCanonicalizeBlock(blk: UirCoreBlock) =
+    if blk == nil:
+        return
+    blk.label = uirCoreOwnStr(blk.label)
+    blk.term = uirCoreOwnTermStrings(blk.term)
+
+fn uirCoreCanonicalizeFunc(func: UirCoreFunc) =
+    if func == nil:
+        return
+    func.name = uirCoreOwnStr(func.name)
+    func.linkName = uirCoreOwnStr(func.linkName)
+    func.originFile = uirCoreOwnStr(func.originFile)
+    func.retTypeKey = uirCoreOwnStr(func.retTypeKey)
+    func.phaseFallbackReason = uirCoreOwnStr(func.phaseFallbackReason)
+    for i in 0..<func.params.len:
+        var p: UirCoreParam = func.params[i]
+        p.name = uirCoreOwnStr(p.name)
+        p.typeKey = uirCoreOwnStr(p.typeKey)
+        uirCoreWriteParam(&func.params, i, p)
+    for oi in 0..<func.objLocals.len:
+        var ol: UirCoreObjLocal = func.objLocals[oi]
+        ol.objTypeName = uirCoreOwnStr(ol.objTypeName)
+        ol.typeKey = uirCoreOwnStr(ol.typeKey)
+        uirCoreWriteObjLocal(&func.objLocals, oi, ol)
+    for bi in 0..<func.blocks.len:
+        uirCoreCanonicalizeBlock(func.blocks[bi])
+
+fn uirCoreCanonicalizeTypeAlias(aIn: UirCoreTypeAlias): UirCoreTypeAlias =
+    var out: UirCoreTypeAlias = aIn
+    out.name = uirCoreOwnStr(out.name)
+    return out
+
+fn uirCoreCanonicalizeObjType(ty: UirCoreObjType): UirCoreObjType =
+    var out: UirCoreObjType = ty
+    out.name = uirCoreOwnStr(out.name)
+    for i in 0..<out.fields.len:
+        var f: UirCoreObjField = out.fields[i]
+        f.name = uirCoreOwnStr(f.name)
+        uirCoreWriteObjField(&out.fields, i, f)
+    return out
+
+fn uirCoreSetLocalType(func: UirCoreFunc, slot: int32, ty: UirCoreType) =
+    for i in func.localTypes.len..slot:
+        add(func.localTypes, uirCoreTypeI32())
+    uirCoreWriteType(&func.localTypes, slot, ty)
+
+fn uirCoreAddParam(func: UirCoreFunc, name: str, slot: int32, ty: UirCoreType, typeKey: str = "") =
+    var p: UirCoreParam
+    p.name = uirCoreOwnStr(name)
+    p.slot = slot
+    p.ty = ty
+    p.typeKey = uirCoreOwnStr(typeKey)
+    add(func.params, p)
+    uirCoreSetLocalType(func, slot, ty)
+
+fn uirCoreNewModule(target: str): UirCoreModule =
+    var m: UirCoreModule
+    new m
+    m.target = uirCoreOwnStr(target)
+    m.funcs = []
+    m.cstrs = []
+    m.globals = []
+    m.typeAliases = []
+    m.objTypes = []
+    return m
+
+fn uirCoreTypeSize(ty: UirCoreType): int32 =
+    if ty.kind == mtF64:
+        return 8
+    if ty.kind == mtI64:
+        return 8
+    if ty.kind == mtF32:
+        return 4
+    if ty.kind == mtI32:
+        return 4
+    if ty.kind == mtI16:
+        return 2
+    if ty.kind == mtI8:
+        return 1
+    return 0
+
+fn uirCoreTypeAlignPow2(ty: UirCoreType): int32 =
+    if ty.kind == mtF64:
+        return 3
+    if ty.kind == mtI64:
+        return 3
+    if ty.kind == mtF32:
+        return 2
+    if ty.kind == mtI32:
+        return 2
+    if ty.kind == mtI16:
+        return 1
+    if ty.kind == mtI8:
+        return 0
+    return 0
+
+fn uirCoreFindTypeAlias(module: UirCoreModule, name: str): int32 =
+    if module == nil || name == nil:
+        return -1
+    if module.typeAliases.len >= 32:
+        if uirCore_typeAliases_cache_module != module || !uirCore_typeAliases_cache_ready ||
+           uirCore_typeAliases_cache_len != module.typeAliases.len:
+            uirCore_buildTypeAliasIndexCache(module)
+        if uirCore_typeAliases_cache_ready && uirCore_typeAliases_cache_module == module:
+            var foundAlias: bool = false
+            let raw: int32 = uirCoreHashMapStrIntGetCompat(uirCore_typeAliases_cache, name, foundAlias)
+            let idx: int32 = raw - 1
+            if foundAlias && raw > 0:
+                return idx
+    for i in 0..<module.typeAliases.len:
+        let a: UirCoreTypeAlias = module.typeAliases[i]
+        if (a.name == name):
+            if uirCore_typeAliases_cache_ready && uirCore_typeAliases_cache_module == module:
+                hashmaps.hashMapStrIntPut(uirCore_typeAliases_cache, a.name, i + 1)
+            return i
+    return -1
+
+fn uirCoreTryGetTypeAlias(module: UirCoreModule, name: str): UirCoreType =
+    let idx: int32 = uirCoreFindTypeAlias(module, name)
+    if idx < 0:
+        return uirCoreTypeVoid()
+    let a: UirCoreTypeAlias = module.typeAliases[idx]
+    return a.ty
+
+fn uirCoreAddTypeAlias(module: UirCoreModule, name: str, ty: UirCoreType) =
+    if module == nil || name == nil || len(name) == 0:
+        return
+    let key: str = uirCoreOwnStr(name)
+    let idx: int32 = uirCoreFindTypeAlias(module, key)
+    if idx >= 0:
+        var a2: UirCoreTypeAlias
+        a2.name = key
+        a2.ty = ty
+        a2 = uirCoreCanonicalizeTypeAlias(a2)
+        uirCoreWriteTypeAlias(&module.typeAliases, idx, a2)
+        if uirCore_typeAliases_cache_ready && uirCore_typeAliases_cache_module == module:
+            hashmaps.hashMapStrIntPut(uirCore_typeAliases_cache, a2.name, idx + 1)
+            uirCore_typeAliases_cache_len = module.typeAliases.len
+        return
+    let newIdx: int32 = module.typeAliases.len
+    var a: UirCoreTypeAlias
+    a.name = key
+    a.ty = ty
+    a = uirCoreCanonicalizeTypeAlias(a)
+    add(module.typeAliases, a)
+    if uirCore_typeAliases_cache_ready && uirCore_typeAliases_cache_module == module:
+        hashmaps.hashMapStrIntPut(uirCore_typeAliases_cache, a.name, newIdx + 1)
+        uirCore_typeAliases_cache_len = module.typeAliases.len
+
+fn uirCoreFindObjType(module: UirCoreModule, name: str): int32 =
+    if module == nil || name == nil:
+        return -1
+    if module.objTypes.len >= 32:
+        if uirCore_objTypes_cache_module != module || !uirCore_objTypes_cache_ready ||
+           uirCore_objTypes_cache_len != module.objTypes.len:
+            uirCore_buildObjTypeIndexCache(module)
+        if uirCore_objTypes_cache_ready && uirCore_objTypes_cache_module == module:
+            var foundObj: bool = false
+            let raw: int32 = uirCoreHashMapStrIntGetCompat(uirCore_objTypes_cache, name, foundObj)
+            let idx: int32 = raw - 1
+            if foundObj && raw > 0:
+                return idx
+    for i in 0..<module.objTypes.len:
+        let t: UirCoreObjType = module.objTypes[i]
+        if (t.name == name):
+            if uirCore_objTypes_cache_ready && uirCore_objTypes_cache_module == module:
+                hashmaps.hashMapStrIntPut(uirCore_objTypes_cache, t.name, i + 1)
+            return i
+    return -1
+
+fn uirCoreHasObjType(module: UirCoreModule, name: str): bool =
+    return uirCoreFindObjType(module, name) >= 0
+
+fn uirCoreGetObjType(module: UirCoreModule, name: str): UirCoreObjType =
+    let idx: int32 = uirCoreFindObjType(module, name)
+    if idx < 0:
+        var t: UirCoreObjType
+        t.name = ""
+        t.size = 0
+        t.alignPow2 = 0
+        return t
+    return module.objTypes[idx]
+
+fn uirCoreAddObjType(module: UirCoreModule, ty: UirCoreObjType) =
+    let norm: UirCoreObjType = uirCoreCanonicalizeObjType(ty)
+    if module == nil || norm.name == nil || len(norm.name) == 0:
+        return
+    let idx: int32 = uirCoreFindObjType(module, norm.name)
+    if idx >= 0:
+        uirCoreWriteObjType(&module.objTypes, idx, norm)
+        if uirCore_objTypes_cache_ready && uirCore_objTypes_cache_module == module:
+            hashmaps.hashMapStrIntPut(uirCore_objTypes_cache, norm.name, idx + 1)
+            uirCore_objTypes_cache_len = module.objTypes.len
+        return
+    let newIdx: int32 = module.objTypes.len
+    add(module.objTypes, norm)
+    if uirCore_objTypes_cache_ready && uirCore_objTypes_cache_module == module:
+        hashmaps.hashMapStrIntPut(uirCore_objTypes_cache, norm.name, newIdx + 1)
+        uirCore_objTypes_cache_len = module.objTypes.len
+
+fn uirCoreAddFunc(module: UirCoreModule, func: UirCoreFunc) =
+    if module == nil || func == nil:
+        return
+    uirCoreCanonicalizeFunc(func)
+    add(module.funcs, func)
+
+fn uirCoreAddGlobal(module: UirCoreModule, name: str, ty: UirCoreType, init: int64, hasInit: bool, originFile: str) =
+    if module == nil:
+        return
+    var g: UirCoreGlobal
+    g.name = uirCoreOwnStr(name)
+    g.ty = ty
+    g.init = init
+    g.hasInit = hasInit
+    g.originFile = uirCoreOwnStr(originFile)
+    add(module.globals, g)
+
+fn uirCoreExprKindOf(expr: UirCoreExpr): UirCoreExprKind =
+    return expr.kind
+
+fn uirCoreExprCalleeOf(expr: UirCoreExpr): str =
+    return expr.callee
+
+fn uirCoreExprLocalIndexOf(expr: UirCoreExpr): int32 =
+    return expr.localIndex
+
+fn uirCoreExprConstValueOf(expr: UirCoreExpr): int64 =
+    return expr.value
+
+fn uirCoreExprBinOpOf(expr: UirCoreExpr): UirCoreBinOp =
+    return expr.binOp
+
+fn uirCoreExprCmpOpOf(expr: UirCoreExpr): UirCoreCmpOp =
+    return expr.cmpOp
+
+fn uirCoreExprCastTypeOf(expr: UirCoreExpr): UirCoreType =
+    return expr.castType
+
+fn uirCoreExprLoadTypeOf(expr: UirCoreExpr): UirCoreType =
+    return expr.loadType
+
+fn uirCoreExprGlobalNameOf(expr: UirCoreExpr): str =
+    return expr.globalName
+
+fn uirCoreExprArgsLen(expr: UirCoreExpr): int32 =
+    return expr.args.len
+
+fn uirCoreExprArgAt(expr: UirCoreExpr, idx: int32): UirCoreExpr =
+    return expr.args[idx]
+
+fn uirCoreExprLhsOf(expr: UirCoreExpr): UirCoreExpr =
+    return expr.lhs
+
+fn uirCoreExprRhsOf(expr: UirCoreExpr): UirCoreExpr =
+    return expr.rhs
+
+fn uirCoreExprCastExprOf(expr: UirCoreExpr): UirCoreExpr =
+    return expr.castExpr
+
+fn uirCoreExprAddrExprOf(expr: UirCoreExpr): UirCoreExpr =
+    return expr.addrExpr
+
+fn uirCoreExprIsCall(expr: UirCoreExpr): bool =
+    return expr != nil && expr.kind == meCall
+
+fn uirCoreExprIsGlobalAddr(expr: UirCoreExpr): bool =
+    return expr != nil && expr.kind == meGlobalAddr
+
+fn uirCoreExprIsBinOrCmp(expr: UirCoreExpr): bool =
+    return expr != nil && (expr.kind == meBin || expr.kind == meCmp)
+
+fn uirCoreExprIsCast(expr: UirCoreExpr): bool =
+    return expr != nil && expr.kind == meCast
+
+fn uirCoreExprIsAddrOrLoad(expr: UirCoreExpr): bool =
+    return expr != nil && (expr.kind == meAddr || expr.kind == meLoad)
+
+fn uirCoreStmtExprOf(stmt: UirCoreStmt): UirCoreExpr =
+    return stmt.expr
+
+fn uirCoreStmtAddrExprOf(stmt: UirCoreStmt): UirCoreExpr =
+    return stmt.addrExpr
+
+fn uirCoreBlockStmtsLen(block: UirCoreBlock): int32 =
+    return block.stmts.len
+
+fn uirCoreBlockStmtAt(block: UirCoreBlock, idx: int32): UirCoreStmt =
+    return block.stmts[idx]
+
+fn uirCoreBlockLabelOf(block: UirCoreBlock): str =
+    return block.label
+
+fn uirCoreBlockTermOf(block: UirCoreBlock): UirCoreTerm =
+    return block.term
+
+fn uirCoreBlockRetExprOf(block: UirCoreBlock): UirCoreExpr =
+    return block.term.retExpr
+
+fn uirCoreBlockCondExprOf(block: UirCoreBlock): UirCoreExpr =
+    return block.term.condExpr
+
+fn uirCoreFuncBlocksLen(func: UirCoreFunc): int32 =
+    return func.blocks.len
+
+fn uirCoreFuncBlockAt(func: UirCoreFunc, idx: int32): UirCoreBlock =
+    return func.blocks[idx]
+
+fn uirCoreFuncIsExtern(func: UirCoreFunc): bool =
+    return func.isExtern
+
+fn uirCoreFuncNameOf(func: UirCoreFunc): str =
+    return func.name
+
+fn uirCoreFuncRetTypeOf(func: UirCoreFunc): UirCoreType =
+    return func.retType
+
+fn uirCoreFuncObjFrameSizeOf(func: UirCoreFunc): int32 =
+    return func.objFrameSize
+
+fn uirCoreFuncLinkNameOf(func: UirCoreFunc): str =
+    return func.linkName
+
+fn uirCoreFuncOriginFileOf(func: UirCoreFunc): str =
+    return func.originFile
+
+fn uirCoreFuncPhaseTagOf(func: UirCoreFunc): int32 =
+    return func.phaseTag
+
+fn uirCoreFuncPhaseNameOf(func: UirCoreFunc): str =
+    return uirCorePhaseTagName(func.phaseTag)
+
+fn uirCoreFuncHighUirCheckedOf(func: UirCoreFunc): bool =
+    return func.highUirChecked
+
+fn uirCoreFuncLowUirLoweredOf(func: UirCoreFunc): bool =
+    return func.lowUirLowered
+
+fn uirCoreFuncPhaseFallbackReasonOf(func: UirCoreFunc): str =
+    return func.phaseFallbackReason
+
+fn uirCoreFuncParamsLen(func: UirCoreFunc): int32 =
+    return func.params.len
+
+fn uirCoreFuncParamAt(func: UirCoreFunc, idx: int32): UirCoreParam =
+    return func.params[idx]
+
+fn uirCoreFuncObjLocalsLen(func: UirCoreFunc): int32 =
+    return func.objLocals.len
+
+fn uirCoreFuncObjLocalAt(func: UirCoreFunc, idx: int32): UirCoreObjLocal =
+    return func.objLocals[idx]
+
+fn uirCoreFuncLocalTypesLen(func: UirCoreFunc): int32 =
+    return func.localTypes.len
+
+fn uirCoreFuncLocalTypeAt(func: UirCoreFunc, idx: int32): UirCoreType =
+    return func.localTypes[idx]
+
+fn uirCoreFuncSetLinkName(func: UirCoreFunc, linkName: str) =
+    func.linkName = uirCoreOwnStr(linkName)
+
+fn uirCoreFuncSetOriginFile(func: UirCoreFunc, originFile: str) =
+    func.originFile = uirCoreOwnStr(originFile)
+
+fn uirCoreFuncSetExtern(func: UirCoreFunc, isExtern: bool) =
+    func.isExtern = isExtern
+
+fn uirCoreFuncSetPhaseContract(func: UirCoreFunc, phaseTag: int32,
+                               highUirChecked: bool, lowUirLowered: bool,
+                               fallbackReason: str) =
+    if func == nil:
+        return
+    func.phaseTag = phaseTag
+    func.highUirChecked = highUirChecked
+    func.lowUirLowered = lowUirLowered
+    func.phaseFallbackReason = uirCoreOwnStr(fallbackReason)
+
+fn uirCoreFuncAddParam(func: UirCoreFunc, param: UirCoreParam) =
+    var p: UirCoreParam = param
+    p.name = uirCoreOwnStr(p.name)
+    p.typeKey = uirCoreOwnStr(p.typeKey)
+    add(func.params, p)
+
+fn uirCoreModuleFuncsLen(module: UirCoreModule): int32 =
+    return module.funcs.len
+
+fn uirCoreModuleTargetOf(module: UirCoreModule): str =
+    return module.target
+
+fn uirCoreModuleFuncAt(module: UirCoreModule, idx: int32): UirCoreFunc =
+    return module.funcs[idx]
+
+fn uirCoreModuleCountHighUirCheckedFuncs(module: UirCoreModule): int32 =
+    if module == nil:
+        return 0
+    var total: int32 = 0
+    for i in 0..<module.funcs.len:
+        let f: UirCoreFunc = module.funcs[i]
+        if f == nil || f.isExtern:
+            continue
+        if f.highUirChecked:
+            total = total + 1
+    return total
+
+fn uirCoreModuleCountLowUirLoweredFuncs(module: UirCoreModule): int32 =
+    if module == nil:
+        return 0
+    var total: int32 = 0
+    for i in 0..<module.funcs.len:
+        let f: UirCoreFunc = module.funcs[i]
+        if f == nil || f.isExtern:
+            continue
+        if f.lowUirLowered:
+            total = total + 1
+    return total
+
+fn uirCoreModuleCountHighUirFallbackFuncs(module: UirCoreModule): int32 =
+    if module == nil:
+        return 0
+    var total: int32 = 0
+    for i in 0..<module.funcs.len:
+        let f: UirCoreFunc = module.funcs[i]
+        if f == nil || f.isExtern:
+            continue
+        if !f.highUirChecked && f.phaseFallbackReason != nil && len(f.phaseFallbackReason) > 0:
+            total = total + 1
+    return total
+
+fn uirCoreModuleApplyPhaseContract(module: UirCoreModule, highUirChecked: bool, fallbackReason: str) =
+    if module == nil:
+        return
+    let fallback: str = highUirChecked ? "" : fallbackReason
+    for i in 0..<module.funcs.len:
+        let f: UirCoreFunc = module.funcs[i]
+        if f == nil || f.isExtern:
+            continue
+        uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), highUirChecked, true, fallback)
+
+fn uirCoreModuleGlobalsLen(module: UirCoreModule): int32 =
+    return module.globals.len
+
+fn uirCoreModuleGlobalAt(module: UirCoreModule, idx: int32): UirCoreGlobal =
+    return module.globals[idx]
+
+fn uirCoreModuleCStringsLen(module: UirCoreModule): int32 =
+    return module.cstrs.len
+
+fn uirCoreModuleCStringAt(module: UirCoreModule, idx: int32): UirCoreCString =
+    return module.cstrs[idx]
+
+fn uirCoreCStringLabelOf(cstr: UirCoreCString): str =
+    return cstr.label
+
+fn uirCoreCStringValueOf(cstr: UirCoreCString): str =
+    return cstr.value
+
+# Concrete Result specializations needed by stage1/self-link bootstrap.
+fn Ok_UirCoreExpr(value: UirCoreExpr): Result[UirCoreExpr] =
+    var out: Result[UirCoreExpr]
+    out.ok = true
+    out.value = value
+    out.err = ErrorOk()
+    return out
+
+fn Err_UirCoreExpr(err: str): Result[UirCoreExpr] =
+    var out: Result[UirCoreExpr]
+    out.ok = false
+    out.err = ErrorNew(err)
+    return out
+
+fn ErrInfo_UirCoreExpr(err: ErrorInfo): Result[UirCoreExpr] =
+    var out: Result[UirCoreExpr]
+    out.ok = false
+    out.err = err
+    return out
+
+fn Ok_UirCoreFunc(value: UirCoreFunc): Result[UirCoreFunc] =
+    var out: Result[UirCoreFunc]
+    out.ok = true
+    out.value = value
+    out.err = ErrorOk()
+    return out
+
+fn Err_UirCoreFunc(err: str): Result[UirCoreFunc] =
+    var out: Result[UirCoreFunc]
+    out.ok = false
+    out.err = ErrorNew(err)
+    return out
+
+fn ErrInfo_UirCoreFunc(err: ErrorInfo): Result[UirCoreFunc] =
+    var out: Result[UirCoreFunc]
+    out.ok = false
+    out.err = err
+    return out
+
+fn Ok_UirCoreModule(value: UirCoreModule): Result[UirCoreModule] =
+    var out: Result[UirCoreModule]
+    out.ok = true
+    out.value = value
+    out.err = ErrorOk()
+    return out
+
+fn Err_UirCoreModule(err: str): Result[UirCoreModule] =
+    var out: Result[UirCoreModule]
+    out.ok = false
+    out.err = ErrorNew(err)
+    return out
+
+fn ErrInfo_UirCoreModule(err: ErrorInfo): Result[UirCoreModule] =
+    var out: Result[UirCoreModule]
+    out.ok = false
+    out.err = err
+    return out
+
+fn ErrorInfoOf_UirCoreModule(r: Result[UirCoreModule]): ErrorInfo =
+    return r.err
+
+fn uirCoreGlobalNameOf(global: UirCoreGlobal): str =
+    return global.name
+
+fn uirCoreGlobalOriginFileOf(global: UirCoreGlobal): str =
+    return global.originFile
+
+fn uirCoreFnv1a64(s: str): int64 =
+    if s == nil:
+        return int64(0)
+    var h: uint64 = uint64(1469598103934665603)
+    for i in 0..<len(s):
+        let c: char = s[i]
+        h = h ^ uint64(int64(c) & int64(0xFF))
+        h = h * uint64(1099511628211)
+    return int64(h)
+
+fn uirCoreHexDigit(v: int32): char =
+    if v < 10:
+        return char(int8(48 + v))
+    return char(int8(97 + (v - 10)))
+
+fn uirCoreU64ToHex(v: int64): str =
+    let n: int32 = 16
+    let p: void* = alloc(n + 1)
+    for i in 0..<n:
+        let shift: int32 = (n - 1 - i) * 4
+        let nib: int32 = int32((v >> shift) & int64(0xF))
+        let dst: void* = ptr_add(p, i)
+        var pc: char* = char*(dst)
+        *pc = uirCoreHexDigit(nib)
+    setMem(ptr_add(p, n), 0, 1)
+    return str(p)
+
+fn uirCoreFindCStringLabel(module: UirCoreModule, value: str): str =
+    if module == nil:
+        return ""
+    let v: str = (value == nil) ? "" : value
+    if module.cstrs.len >= 32:
+        if uirCore_cstrs_cache_module != module || !uirCore_cstrs_cache_ready ||
+           uirCore_cstrs_cache_len != module.cstrs.len:
+            uirCore_buildCStringIndexCache(module)
+        if uirCore_cstrs_cache_ready && uirCore_cstrs_cache_module == module:
+            var foundCstr: bool = false
+            let raw: int32 = uirCoreHashMapStrIntGetCompat(uirCore_cstrs_cache, v, foundCstr)
+            let idx: int32 = raw - 1
+            if foundCstr && raw > 0 && idx >= 0 && idx < module.cstrs.len:
+                return module.cstrs[idx].label
+    for i in 0..<module.cstrs.len:
+        let c: UirCoreCString = module.cstrs[i]
+        if (c.value == v):
+            return c.label
+    return ""
+
+fn uirCoreAddCString(module: UirCoreModule, value: str): str =
+    if module == nil:
+        return ""
+    var v: str = value
+    if v == nil:
+        v = ""
+    let existing: str = uirCoreFindCStringLabel(module, v)
+    if len(existing) > 0:
+        return existing
+    let h: int64 = uirCoreFnv1a64(v)
+    let label: str = "L_cheng_str_" + uirCoreU64ToHex(h)
+    let newIdx: int32 = module.cstrs.len
+    var c: UirCoreCString
+    c.label = uirCoreOwnStr(label)
+    c.value = uirCoreOwnStr(v)
+    add(module.cstrs, c)
+    if uirCore_cstrs_cache_ready && uirCore_cstrs_cache_module == module:
+        hashmaps.hashMapStrIntPut(uirCore_cstrs_cache, c.value, newIdx + 1)
+        uirCore_cstrs_cache_len = module.cstrs.len
+    return label
+
+fn uirCoreStrCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    for i in 0..<n:
+        let ca: int32 = int32(int64(a[i]) & int64(0xFF))
+        let cb: int32 = int32(int64(b[i]) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn uirCoreNormalizeModule(module: UirCoreModule) =
+    if module == nil:
+        return
+    # Deterministic ordering: stable insertion-sort by name/label.
+    for i in 1..<module.globals.len:
+        let key: UirCoreGlobal = module.globals[i]
+        var j: int32 = i - 1
+        let keyName: str = key.name
+        for __for_guard_j in 0..i:
+            if !(j >= 0):
+                break
+            let cur: UirCoreGlobal = module.globals[j]
+            let curName: str = cur.name
+            if uirCoreStrCmp(curName, keyName) <= 0:
+                break
+            uirCoreWriteGlobal(&module.globals, j + 1, cur)
+            j = j - 1
+        uirCoreWriteGlobal(&module.globals, j + 1, key)
+
+    for i in 1..<module.cstrs.len:
+        let key2: UirCoreCString = module.cstrs[i]
+        var j2: int32 = i - 1
+        let keyLabel: str = key2.label
+        for __for_guard_j2 in 0..i:
+            if !(j2 >= 0):
+                break
+            let cur2: UirCoreCString = module.cstrs[j2]
+            let curLabel: str = cur2.label
+            if uirCoreStrCmp(curLabel, keyLabel) <= 0:
+                break
+            uirCoreWriteCString(&module.cstrs, j2 + 1, cur2)
+            j2 = j2 - 1
+        uirCoreWriteCString(&module.cstrs, j2 + 1, key2)
+
+    for i in 1..<module.funcs.len:
+        let key3: UirCoreFunc = module.funcs[i]
+        let keyName: str = key3 == nil ? "" : key3.name
+        var j3: int32 = i - 1
+        let __for_start_j3 = j3
+        for __for_rev_j3 in 0..(__for_start_j3 - (0)):
+            j3 = __for_start_j3 - __for_rev_j3
+            let cur: UirCoreFunc = module.funcs[j3]
+            let curName: str = cur == nil ? "" : cur.name
+            if uirCoreStrCmp(curName, keyName) <= 0:
+                break
+            uirCoreWriteFunc(&module.funcs, j3 + 1, cur)
+        uirCoreWriteFunc(&module.funcs, j3 + 1, key3)
+
+fn uirCoreDemoModule(): UirCoreModule =
+    let mod: UirCoreModule = uirCoreNewModule("arm64-apple-darwin")
+    let retType: UirCoreType = uirCoreTypeI32()
+    let f: UirCoreFunc = uirCoreNewFunc("main", retType)
+    let v: UirCoreExpr = uirCoreConstI64(0)
+    uirCoreAddBlock(f, uirCoreBlock("entry", uirCoreTermRet(v)))
+    uirCoreAddFunc(mod, f)
+    return mod
+
+fn uirCoreFormatExpr(expr: UirCoreExpr): str =
+    if expr == nil:
+        return "nil"
+    if expr.kind == meConstI64:
+        return intToStr(int32(expr.value))
+    if expr.kind == meBin:
+        var op: str = "?"
+        case expr.binOp
+        of mbAdd: op = "+"
+        of mbSub: op = "-"
+        of mbMul: op = "*"
+        of mbSdiv: op = "/"
+        of mbSmod: op = "%"
+        of mbAnd: op = "&"
+        of mbOr: op = "|"
+        of mbXor: op = "^"
+        of mbShl: op = "<<"
+        of mbShr: op = ">>"
+        return "(" + uirCoreFormatExpr(expr.lhs) + " " + op + " " + uirCoreFormatExpr(expr.rhs) + ")"
+    if expr.kind == meCmp:
+        var op2: str = "=="
+        case expr.cmpOp
+        of mcEq: op2 = "=="
+        of mcNe: op2 = "!="
+        of mcLt: op2 = "<"
+        of mcLe: op2 = "<="
+        of mcGt: op2 = ">"
+        of mcGe: op2 = ">="
+        return "(" + uirCoreFormatExpr(expr.lhs) + " " + op2 + " " + uirCoreFormatExpr(expr.rhs) + ")"
+    if expr.kind == meLocal:
+        return "$l" + intToStr(expr.localIndex)
+    if expr.kind == meAddr:
+        return "&$l" + intToStr(expr.localIndex)
+    if expr.kind == meLoad:
+        return "*" + uirCoreFormatExpr(expr.addrExpr)
+    if expr.kind == meGlobalAddr:
+        return "&" + expr.globalName
+    if expr.kind == meCall:
+        var out: str = expr.callee + "("
+        for i in 0..<expr.args.len:
+            if i > 0:
+                out = out + ", "
+            out = out + uirCoreFormatExpr(expr.args[i])
+        return out + ")"
+    if expr.kind == meCast:
+        if expr.castType.kind == mtVoid:
+            return "void(" + uirCoreFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtF64:
+            return "f64(" + uirCoreFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtF32:
+            return "f32(" + uirCoreFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI64:
+            return (expr.castType.isUnsigned ? "u64(" : "i64(") + uirCoreFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI32:
+            return (expr.castType.isUnsigned ? "u32(" : "i32(") + uirCoreFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI16:
+            return (expr.castType.isUnsigned ? "u16(" : "i16(") + uirCoreFormatExpr(expr.castExpr) + ")"
+        if expr.castType.kind == mtI8:
+            return (expr.castType.isUnsigned ? "u8(" : "i8(") + uirCoreFormatExpr(expr.castExpr) + ")"
+        return "i32(" + uirCoreFormatExpr(expr.castExpr) + ")"
+    return "?"
+
+fn uirCoreFormat(module: UirCoreModule): str =
+    var out: str = ""
+    out = out + "module " + module.target + "\n"
+    for gi in 0..<module.globals.len:
+        let g: UirCoreGlobal = module.globals[gi]
+        out = out + "global " + g.name + ": "
+        if g.ty.kind == mtVoid:
+            out = out + "void"
+        elif g.ty.kind == mtF64:
+            out = out + "f64"
+        elif g.ty.kind == mtF32:
+            out = out + "f32"
+        elif g.ty.kind == mtI64:
+            out = out + (g.ty.isUnsigned ? "u64" : "i64")
+        elif g.ty.kind == mtI32:
+            out = out + (g.ty.isUnsigned ? "u32" : "i32")
+        elif g.ty.kind == mtI16:
+            out = out + (g.ty.isUnsigned ? "u16" : "i16")
+        elif g.ty.kind == mtI8:
+            out = out + (g.ty.isUnsigned ? "u8" : "i8")
+        else:
+            out = out + "i32"
+        if g.hasInit:
+            out = out + " = " + intToStr(int32(g.init))
+        out = out + "\n"
+    for i in 0..<module.funcs.len:
+        let f: UirCoreFunc = module.funcs[i]
+        out = out + "fn " + f.name + "("
+        for pi in 0..<f.params.len:
+            let p: UirCoreParam = f.params[pi]
+            if pi > 0:
+                out = out + ", "
+            out = out + p.name
+        out = out + "): "
+        if f.retType.kind == mtVoid:
+            out = out + "void\n"
+        elif f.retType.kind == mtF64:
+            out = out + "f64\n"
+        elif f.retType.kind == mtF32:
+            out = out + "f32\n"
+        elif f.retType.kind == mtI64:
+            out = out + (f.retType.isUnsigned ? "u64\n" : "i64\n")
+        elif f.retType.kind == mtI32:
+            out = out + (f.retType.isUnsigned ? "u32\n" : "i32\n")
+        elif f.retType.kind == mtI16:
+            out = out + (f.retType.isUnsigned ? "u16\n" : "i16\n")
+        elif f.retType.kind == mtI8:
+            out = out + (f.retType.isUnsigned ? "u8\n" : "i8\n")
+        else:
+            out = out + "i32\n"
+        for bi in 0..<f.blocks.len:
+            let b: UirCoreBlock = f.blocks[bi]
+            out = out + b.label + ":\n"
+            for si in 0..<b.stmts.len:
+                let s: UirCoreStmt = b.stmts[si]
+                if s.kind == msLet:
+                    out = out + "  let " + s.name + " = " + uirCoreFormatExpr(s.expr) + "\n"
+                elif s.kind == msVar:
+                    out = out + "  var " + s.name + " = " + uirCoreFormatExpr(s.expr) + "\n"
+                elif s.kind == msAssign:
+                    out = out + "  " + s.name + " = " + uirCoreFormatExpr(s.expr) + "\n"
+                elif s.kind == msParam:
+                    out = out + "  param " + s.name + "\n"
+                elif s.kind == msStore:
+                    out = out + "  *" + uirCoreFormatExpr(s.addrExpr) + " = " + uirCoreFormatExpr(s.expr) + "\n"
+                else:
+                    out = out + "  expr " + uirCoreFormatExpr(s.expr) + "\n"
+            if b.term.kind == mtRet:
+                if b.term.retExpr == nil:
+                    out = out + "  ret\n"
+                else:
+                    out = out + "  ret " + uirCoreFormatExpr(b.term.retExpr) + "\n"
+            elif b.term.kind == mtBr:
+                out = out + "  br " + b.term.target + "\n"
+            else:
+                out = out + "  cbr " + uirCoreFormatExpr(b.term.condExpr) + " ? " +
+                      b.term.targetTrue + " : " + b.term.targetFalse + "\n"
+    return out
+
+fn uirCoreValidateExpr(func: UirCoreFunc, expr: UirCoreExpr, ctx: str): Result[bool] =
+    if expr == nil:
+        return Err[bool]("uirCore_validate: nil expr (" + ctx + ")")
+    if expr.kind == meConstI64:
+        return Ok[bool](true)
+    if expr.kind == meLocal:
+        if expr.localIndex < 0:
+            return Err[bool]("uirCore_validate: negative local index (" + ctx + ")")
+        if func != nil && expr.localIndex >= func.localTypes.len:
+            return Err[bool]("uirCore_validate: local index out of range (" + ctx + ")")
+        return Ok[bool](true)
+    if expr.kind == meAddr:
+        if expr.localIndex < 0:
+            return Err[bool]("uirCore_validate: negative addr slot (" + ctx + ")")
+        if func != nil:
+            if expr.localIndex >= func.localTypes.len:
+                return Err[bool]("uirCore_validate: addr slot out of range (" + ctx + ")")
+            for oi in 0..<func.objLocals.len:
+                let ol: UirCoreObjLocal = func.objLocals[oi]
+                if ol.slot == expr.localIndex && ol.frameOff >= 0:
+                    return Err[bool]("uirCore_validate: meAddr on object-local slot (pointer-to-pointer) (" + ctx + ")")
+        return Ok[bool](true)
+    if expr.kind == meLoad:
+        if expr.loadType.kind == mtVoid:
+            return Err[bool]("uirCore_validate: load void type (" + ctx + ")")
+        if expr.addrExpr == nil:
+            return Err[bool]("uirCore_validate: load missing addr (" + ctx + ")")
+        return uirCoreValidateExpr(func, expr.addrExpr, ctx + "/load.addr")
+    if expr.kind == meGlobalAddr:
+        if expr.globalName == nil || len(expr.globalName) == 0:
+            return Err[bool]("uirCore_validate: global addr missing name (" + ctx + ")")
+        return Ok[bool](true)
+    if expr.kind == meBin || expr.kind == meCmp:
+        if expr.lhs == nil || expr.rhs == nil:
+            return Err[bool]("uirCore_validate: binary expr missing operand (" + ctx + ")")
+        let lres: Result[bool] = uirCoreValidateExpr(func, expr.lhs, ctx + "/lhs")
+        if ! IsOk[bool](lres):
+            return lres
+        return uirCoreValidateExpr(func, expr.rhs, ctx + "/rhs")
+    if expr.kind == meCall:
+        if expr.callee == nil || len(expr.callee) == 0:
+            return Err[bool]("uirCore_validate: call missing callee (" + ctx + ")")
+        for ai in 0..<expr.args.len:
+            let ares: Result[bool] = uirCoreValidateExpr(func, expr.args[ai], ctx + "/arg")
+            if ! IsOk[bool](ares):
+                return ares
+        return Ok[bool](true)
+    if expr.kind == meCast:
+        if expr.castExpr == nil:
+            return Err[bool]("uirCore_validate: cast missing expr (" + ctx + ")")
+        return uirCoreValidateExpr(func, expr.castExpr, ctx + "/cast")
+    return Err[bool]("uirCore_validate: unknown expr kind (" + ctx + ")")
+
+fn uirCoreValidateObjType(ty: UirCoreObjType): Result[bool] =
+    if ty.name == nil || len(ty.name) == 0:
+        return Err[bool]("uirCore_validate: obj type missing name")
+    if ty.size < 0:
+        return Err[bool]("uirCore_validate: obj type size < 0 (" + ty.name + ")")
+    if ty.size == 0 && ty.fields.len != 0:
+        return Err[bool]("uirCore_validate: obj type size == 0 but has fields (" + ty.name + ")")
+    if ty.alignPow2 < 0:
+        return Err[bool]("uirCore_validate: obj type alignPow2 < 0 (" + ty.name + ")")
+    let align: int32 = 1 << ty.alignPow2
+    if align <= 0:
+        return Err[bool]("uirCore_validate: obj type invalid alignPow2 (" + ty.name + ")")
+    if (ty.size % align) != 0:
+        return Err[bool]("uirCore_validate: obj type size not aligned (" + ty.name + ")")
+    var maxAlign: int32 = 0
+    var lastEnd: int32 = 0
+    for i in 0..<ty.fields.len:
+        let f: UirCoreObjField = ty.fields[i]
+        if f.name == nil || len(f.name) == 0:
+            return Err[bool]("uirCore_validate: obj field missing name (" + ty.name + ")")
+        if f.ty.kind == mtVoid:
+            return Err[bool]("uirCore_validate: obj field has void type (" + ty.name + "." + f.name + ")")
+        let sz: int32 = uirCoreTypeSize(f.ty)
+        if sz <= 0:
+            return Err[bool]("uirCore_validate: obj field has unsupported type (" + ty.name + "." + f.name + ")")
+        let ap2: int32 = uirCoreTypeAlignPow2(f.ty)
+        if ap2 > maxAlign:
+            maxAlign = ap2
+        let falign: int32 = 1 << ap2
+        if falign > 0 && (f.offset % falign) != 0:
+            return Err[bool]("uirCore_validate: obj field misaligned (" + ty.name + "." + f.name + ")")
+        if f.offset < lastEnd:
+            return Err[bool]("uirCore_validate: obj field overlaps (" + ty.name + "." + f.name + ")")
+        let end: int32 = f.offset + sz
+        if end > ty.size:
+            return Err[bool]("uirCore_validate: obj field out of bounds (" + ty.name + "." + f.name + ")")
+        lastEnd = end
+    if ty.alignPow2 < maxAlign:
+        return Err[bool]("uirCore_validate: obj type alignPow2 too small (" + ty.name + ")")
+    return Ok[bool](true)
+
+fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
+    if func == nil:
+        return Err[bool]("uirCore_validate: nil func")
+    if func.name == nil || len(func.name) == 0:
+        return Err[bool]("uirCore_validate: func missing name")
+    if func.isExtern:
+        return Ok[bool](true)
+    if func.phaseTag != uirCorePhaseLowTag() && func.phaseTag != uirCorePhaseHighTag():
+        return Err[bool]("uirCore_validate: invalid phase tag (" + func.name + ")")
+    if func.lowUirLowered && func.phaseTag != uirCorePhaseLowTag():
+        return Err[bool]("uirCore_validate: low lowered func not in low phase (" + func.name + ")")
+    if func.phaseTag == uirCorePhaseLowTag() && !func.lowUirLowered:
+        return Err[bool]("uirCore_validate: low phase func missing lowered flag (" + func.name + ")")
+    let hasFallbackReason: bool = func.phaseFallbackReason != nil && len(func.phaseFallbackReason) > 0
+    if func.highUirChecked && hasFallbackReason:
+        return Err[bool]("uirCore_validate: checked high phase cannot carry fallback reason (" + func.name + ")")
+    if !func.highUirChecked && !hasFallbackReason:
+        return Err[bool]("uirCore_validate: unchecked high phase requires fallback reason (" + func.name + ")")
+    if func.blocks.len == 0:
+        return Err[bool]("uirCore_validate: func has no blocks (" + func.name + ")")
+    # Labels: unique + reachable branch targets.
+    for i in 0..<func.blocks.len:
+        let b: UirCoreBlock = func.blocks[i]
+        if b == nil:
+            return Err[bool]("uirCore_validate: nil block (" + func.name + ")")
+        if b.label == nil || len(b.label) == 0:
+            return Err[bool]("uirCore_validate: block missing label (" + func.name + ")")
+        for j in 0..<i:
+            let prev: UirCoreBlock = func.blocks[j]
+            if prev != nil && (prev.label == b.label):
+                return Err[bool]("uirCore_validate: duplicate block label (" + func.name + ":" + b.label + ")")
+
+    for bi in 0..<func.blocks.len:
+        let b2: UirCoreBlock = func.blocks[bi]
+        if b2.term.kind == mtRet:
+            if func.retType.kind != mtVoid && b2.term.retExpr == nil:
+                return Err[bool]("uirCore_validate: missing ret expr (" + func.name + ":" + b2.label + ")")
+            if func.retType.kind == mtVoid && b2.term.retExpr != nil:
+                return Err[bool]("uirCore_validate: void ret with expr (" + func.name + ":" + b2.label + ")")
+        elif b2.term.kind == mtBr:
+            if b2.term.target == nil || len(b2.term.target) == 0:
+                return Err[bool]("uirCore_validate: br missing target (" + func.name + ":" + b2.label + ")")
+            var found: bool = false
+            for li in 0..<func.blocks.len:
+                let bb: UirCoreBlock = func.blocks[li]
+                if bb != nil && (bb.label == b2.term.target):
+                    found = true
+                    break
+            if ! found:
+                return Err[bool]("uirCore_validate: br target not found (" + func.name + ":" + b2.label + ")")
+        else:
+            if b2.term.condExpr == nil:
+                return Err[bool]("uirCore_validate: cbr missing cond (" + func.name + ":" + b2.label + ")")
+            if b2.term.targetTrue == nil || len(b2.term.targetTrue) == 0:
+                return Err[bool]("uirCore_validate: cbr missing true target (" + func.name + ":" + b2.label + ")")
+            if b2.term.targetFalse == nil || len(b2.term.targetFalse) == 0:
+                return Err[bool]("uirCore_validate: cbr missing false target (" + func.name + ":" + b2.label + ")")
+            var foundT: bool = false
+            var foundF: bool = false
+            for li2 in 0..<func.blocks.len:
+                let bb2: UirCoreBlock = func.blocks[li2]
+                if bb2 != nil && (bb2.label == b2.term.targetTrue):
+                    foundT = true
+                if bb2 != nil && (bb2.label == b2.term.targetFalse):
+                    foundF = true
+            if ! foundT || ! foundF:
+                return Err[bool]("uirCore_validate: cbr target not found (" + func.name + ":" + b2.label + ")")
+        for si in 0..<b2.stmts.len:
+            let s: UirCoreStmt = b2.stmts[si]
+            if s.kind != msLet && s.kind != msVar && s.kind != msAssign &&
+               s.kind != msExpr && s.kind != msParam && s.kind != msStore:
+                return Err[bool]("uirCore_validate: invalid stmt kind (" + func.name + ":" + b2.label +
+                                 " si=" + intToStr(si) +
+                                 " kind=" + intToStr(int32(s.kind)) +
+                                 " slot=" + intToStr(s.slot) +
+                                 " stmts.len=" + intToStr(b2.stmts.len) +
+                                 ")")
+            if s.kind == msLet || s.kind == msVar || s.kind == msAssign:
+                if s.slot < 0:
+                    return Err[bool]("uirCore_validate: stmt slot < 0 (" + func.name + ":" + b2.label + ")")
+                if s.expr == nil:
+                    return Err[bool]("uirCore_validate: stmt missing expr (" + func.name + ":" + b2.label +
+                                     " si=" + intToStr(si) +
+                                     " kind=" + uirCoreStmtKindName(s.kind) +
+                                     " name=" + (s.name == nil ? "" : s.name) +
+                                     " slot=" + intToStr(s.slot) + ")")
+                let eres: Result[bool] = uirCoreValidateExpr(func, s.expr, func.name + ":" + b2.label + "/stmt")
+                if ! IsOk[bool](eres):
+                    return eres
+            elif s.kind == msParam:
+                if s.slot < 0 || s.paramIndex < 0:
+                    return Err[bool]("uirCore_validate: param stmt invalid (" + func.name + ":" + b2.label + ")")
+            elif s.kind == msStore:
+                if s.addrExpr == nil || s.expr == nil:
+                    return Err[bool]("uirCore_validate: store missing expr/addr (" + func.name + ":" + b2.label + ")")
+                if s.storeType.kind == mtVoid:
+                    return Err[bool]("uirCore_validate: store void type (" + func.name + ":" + b2.label + ")")
+                let ares: Result[bool] = uirCoreValidateExpr(func, s.addrExpr, func.name + ":" + b2.label + "/store.addr")
+                if ! IsOk[bool](ares):
+                    return ares
+                let vres: Result[bool] = uirCoreValidateExpr(func, s.expr, func.name + ":" + b2.label + "/store.value")
+                if ! IsOk[bool](vres):
+                    return vres
+            else:
+                if s.expr == nil:
+                    return Err[bool]("uirCore_validate: expr stmt missing expr (" + func.name + ":" + b2.label +
+                                     " si=" + intToStr(si) +
+                                     " kind=" + uirCoreStmtKindName(s.kind) + ")")
+                let eres2: Result[bool] = uirCoreValidateExpr(func, s.expr, func.name + ":" + b2.label + "/expr")
+                if ! IsOk[bool](eres2):
+                    return eres2
+
+        if b2.term.kind == mtRet && b2.term.retExpr != nil:
+            let rres: Result[bool] = uirCoreValidateExpr(func, b2.term.retExpr, func.name + ":" + b2.label + "/ret")
+            if ! IsOk[bool](rres):
+                return rres
+        if b2.term.kind == mtCbr && b2.term.condExpr != nil:
+            let cres: Result[bool] = uirCoreValidateExpr(func, b2.term.condExpr, func.name + ":" + b2.label + "/cbr.cond")
+            if ! IsOk[bool](cres):
+                return cres
+
+    # Object locals should be backed by i64 pointer slots.
+    for oi in 0..<func.objLocals.len:
+        let ol2: UirCoreObjLocal = func.objLocals[oi]
+        if ol2.slot < 0 || ol2.slot >= func.localTypes.len:
+            return Err[bool]("uirCore_validate: obj local slot out of range (" + func.name + ")")
+        if func.localTypes.len > 0:
+            let slotTy: UirCoreType = func.localTypes[ol2.slot]
+            if slotTy.kind != mtI64:
+                let tk: str = (ol2.typeKey != nil) ? ol2.typeKey : ""
+                return Err[bool]("uirCore_validate: obj local slot not i64 (" + func.name +
+                                 " slot=" + intToStr(ol2.slot) +
+                                 " ty=" + uirCoreTypeKindName(slotTy) +
+                                 " obj=" + ol2.objTypeName +
+                                 " typeKey=" + tk +
+                                 " frameOff=" + intToStr(ol2.frameOff) + ")")
+        if ol2.objTypeName == nil || len(ol2.objTypeName) == 0:
+            return Err[bool]("uirCore_validate: obj local missing objTypeName (" + func.name + ")")
+        if module != nil && ! uirCoreHasObjType(module, ol2.objTypeName):
+            return Err[bool]("uirCore_validate: obj local objType not found (" + func.name + ":" + ol2.objTypeName + ")")
+
+    return Ok[bool](true)
+
+fn uirCoreValidateModule(module: UirCoreModule): Result[bool] =
+    if module == nil:
+        return Err[bool]("uirCore_validate: nil module")
+    for oi in 0..<module.objTypes.len:
+        let ot: UirCoreObjType = module.objTypes[oi]
+        let ores: Result[bool] = uirCoreValidateObjType(ot)
+        if ! IsOk[bool](ores):
+            return ores
+    for fi in 0..<module.funcs.len:
+        let f: UirCoreFunc = module.funcs[fi]
+        let fres: Result[bool] = uirCoreValidateFunc(module, f)
+        if ! IsOk[bool](fres):
+            return fres
+    return Ok[bool](true)

@@ -1,0 +1,119 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import cheng/web/runtime/server_app
+import cheng/web/std/server_static
+import std/strings
+
+type
+    PreviewConfig =
+        root: str
+        spaFallback: bool
+
+var
+    cfg: PreviewConfig
+    exitCode: int32 = 0
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng preview-server [--root:<dir>] [--spa[:<bool>]]")
+    printLine("")
+    printLine("env:")
+    printLine("  WEB_ROOT   default root directory")
+    printLine("  WEB_SPA    enable SPA fallback (true/false)")
+
+fn hasPrefix(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    if len(prefix) > len(s):
+        return false
+    for i in 0..<len(prefix):
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn resolveDefaultRoot(): str =
+    let envRoot = os.getEnv("WEB_ROOT")
+    if envRoot != nil && len(envRoot) > 0:
+        return os.absolutePath(envRoot)
+    let exampleRoot = os.absolutePath("cheng/web/examples")
+    let exampleIndex = os.joinPath(exampleRoot, "index.html")
+    if os.fileExists(exampleIndex):
+        return exampleRoot
+    return os.getCurrentDir()
+
+fn parseBool(text: str, defaultValue: bool): bool =
+    if text == nil:
+        return defaultValue
+    let lowered = strutil.toLowerAscii(strutil.strip(text))
+    if lowered == "1" || lowered == "true" || lowered == "on" || lowered == "yes":
+        return true
+    if lowered == "0" || lowered == "false" || lowered == "off" || lowered == "no":
+        return false
+    return defaultValue
+
+fn collectArgsFromCmdline(): str[] =
+    var out: str[] 
+    let count: int32 = cmdline.paramCount()
+    for i in 0..<count:
+        out.add(cmdline.paramStr(i + 1))
+    return out
+
+fn initPreviewServerArgs(args: str[]): bool =
+    var rootArg: str = ""
+    var spaRaw: str = ""
+    var spaSet: bool = false
+    for i in 0..<len(args):
+        let arg = args[i]
+        if arg == "--help" || arg == "-h":
+            printUsage()
+            exitCode = 0
+            return false
+        if hasPrefix(arg, "--root:"):
+            rootArg = substr(arg, len("--root:"), len(arg) - len("--root:"))
+        elif arg == "--spa":
+            spaRaw = "true"
+            spaSet = true
+        elif hasPrefix(arg, "--spa:"):
+            spaRaw = substr(arg, len("--spa:"), len(arg) - len("--spa:"))
+            spaSet = true
+        elif hasPrefix(arg, "--host:") || hasPrefix(arg, "--port:") || hasPrefix(arg, "--max-header:") || hasPrefix(arg, "--max-body:") || hasPrefix(arg, "--timeout-ms:"):
+            # handled by native_server.c
+            arg
+        else:
+            printErr("unknown arg: " + arg)
+            printUsage()
+            exitCode = 1
+            return false
+    if rootArg == nil || len(rootArg) == 0:
+        rootArg = resolveDefaultRoot()
+    var spaValue: str = ""
+    if spaSet:
+        spaValue = spaRaw
+    else:
+        spaValue = os.getEnv("WEB_SPA")
+    let root = os.absolutePath(rootArg)
+    if ! os.dirExists(root):
+        printErr("root not found: " + root)
+        exitCode = 1
+        return false
+    cfg.root = root
+    cfg.spaFallback = parseBool(spaValue, false)
+    let handler = serveDirSpa(cfg.root, cfg.spaFallback)
+    registerServerApp(handler)
+    printLine("[preview] root: " + cfg.root)
+    if cfg.spaFallback:
+        printLine("[preview] spa fallback: on")
+    return true
+
+fn initPreviewServer(): bool =
+    let args = collectArgsFromCmdline()
+    return initPreviewServerArgs(args)
+
+fn previewServerExitCode(): int32 =
+    return exitCode

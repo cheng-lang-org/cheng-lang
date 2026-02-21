@@ -1,0 +1,417 @@
+# Type syntax lowering:
+# - Accept new surface syntax `T[]` and `T[N]` in type positions.
+# - Desugar into existing internal type constructors `seq[T]` and `seq_fixed[T, N]`.
+#
+# NOTE: This pass must run before semantics/monomorphize so downstream stages
+# see canonical `seq[...]` nodes (and internal `seq_fixed[...]` where used).
+import std/[strings, hashsets]
+import cheng/stage1/[ast, diagnostics]
+
+fn lowerStrip(s: str): str =
+    return stripSpaces s
+
+fn lowerAddError(diags: Diagnostic[]*, filename: str, pos: SourcePos, msg: str) =
+    if diags == nil:
+        return
+    var fileName0: str = filename
+    if fileName0 == nil || len(fileName0) == 0:
+        fileName0 = "stdin"
+    var d: Diagnostic
+    d.severity = svError
+    d.filename = fileName0
+    d.line = pos.line
+    d.col = pos.col
+    d.message = msg
+    add(diags, d)
+
+fn ctorNameFromNode(n: Node): str =
+    if n == nil:
+        return ""
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        return lowerStrip plainName(n)
+    if n.kind == nkDotExpr && kidCount(n) > 1:
+        # Qualified name: `a.b.Ctor` should use the member as ctor key.
+        let member: Node = kid(n, 1)
+        if member != nil && (member.kind == nkIdent || member.kind == nkSymbol):
+            return lowerStrip plainName(member)
+    return ""
+
+fn lowerIsCompatOverlayFile(filename: str): bool =
+    if filename == nil || len(filename) == 0:
+        return false
+    if strContains(filename, "/chengcache/stage0_compat/"):
+        return true
+    if strContains(filename, "\\chengcache\\stage0_compat\\"):
+        return true
+    return false
+
+fn lowerIsSynthesizedBracketCtor(br: Node, base: Node): bool =
+    if br == nil || base == nil:
+        return false
+    # `T[]` lowering rewrites to `seq[T]` with ctor ident position copied from
+    # bracket position (`[` token). Source-written `seq[T]` keeps ctor at `seq`,
+    # so base.pos differs from bracket pos.
+    return base.pos.line == br.pos.line && base.pos.col == br.pos.col
+
+fn collectTypeConstructors(root: Node, out: var hashsets.HashSetStr) =
+    if root == nil:
+        return
+    # Builtin / special generic constructors.
+    hashsets.hashSetStrAdd(out, "seq")
+    hashsets.hashSetStrAdd(out, "seq_fixed")
+    hashsets.hashSetStrAdd(out, "array")
+    hashsets.hashSetStrAdd(out, "Table")
+    hashsets.hashSetStrAdd(out, "Table_fixed")
+    hashsets.hashSetStrAdd(out, "varargs")
+
+    var queue: Node[]
+    add(queue, root)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil:
+            continue
+        if n.kind == nkTypeDecl:
+            if kidCount(n) > 2:
+                let gp: Node = kid(n, 2)
+                if gp != nil && gp.kind == nkGenericParams && kidCount(gp) > 0:
+                    if kidCount(n) > 0:
+                        let nameNode: Node = kid(n, 0)
+                        if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
+                            let nm: str = lowerStrip plainName(nameNode)
+                            if nm != nil && len(nm) > 0:
+                                hashsets.hashSetStrAdd(out, nm)
+        elif n.kind == nkConceptDecl || n.kind == nkTraitDecl:
+            # Treat generic concepts/traits as constructors for disambiguation.
+            if kidCount(n) > 1:
+                let gp2: Node = kid(n, 1)
+                if gp2 != nil && gp2.kind == nkGenericParams && kidCount(gp2) > 0:
+                    if kidCount(n) > 0:
+                        let nameNode2: Node = kid(n, 0)
+                        if nameNode2 != nil && (nameNode2.kind == nkIdent || nameNode2.kind == nkSymbol):
+                            let nm2: str = lowerStrip plainName(nameNode2)
+                            if nm2 != nil && len(nm2) > 0:
+                                hashsets.hashSetStrAdd(out, nm2)
+        for i in 0..<kidCount(n):
+            add(queue, kid(n, i))
+
+fn lowerTypeExpr(ty0: Node, ctors: hashsets.HashSetStr, diags: Diagnostic[]*, filename: str): Node =
+    if ty0 == nil:
+        return ty0
+    var ty: Node = ty0
+    while ty != nil && ty.kind == nkPar && kidCount(ty) == 1:
+        ty = kid(ty, 0)
+    if ty == nil:
+        return ty
+
+    case ty.kind
+    of nkPtrTy, nkRefTy, nkVarTy:
+        if kidCount(ty) > 0:
+            let inner: Node = lowerTypeExpr(kid(ty, 0), ctors, diags, filename)
+            if inner != kid(ty, 0):
+                setKid(ty, 0, inner)
+        return ty
+    of nkSetTy:
+        if kidCount(ty) > 0:
+            let inner2: Node = lowerTypeExpr(kid(ty, 0), ctors, diags, filename)
+            if inner2 != kid(ty, 0):
+                setKid(ty, 0, inner2)
+        return ty
+    of nkTupleTy:
+        for i in 0..<kidCount(ty):
+            let c0: Node = kid(ty, i)
+            if c0 != nil && c0.kind == nkIdentDefs:
+                if kidCount(c0) > 1:
+                    let et: Node = lowerTypeExpr(kid(c0, 1), ctors, diags, filename)
+                    if et != kid(c0, 1):
+                        setKid(c0, 1, et)
+            else:
+                let et2: Node = lowerTypeExpr(c0, ctors, diags, filename)
+                if et2 != c0:
+                    setKid(ty, i, et2)
+        return ty
+    of nkFnTy:
+        # Kids: formal params + return type.
+        if kidCount(ty) > 0:
+            # Formal params contain nkIdentDefs with type in slot 1.
+            let fp: Node = kid(ty, 0)
+            if fp != nil && fp.kind == nkFormalParams:
+                for j in 0..<kidCount(fp):
+                    let defs: Node = kid(fp, j)
+                    if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 1:
+                        let pty: Node = lowerTypeExpr(kid(defs, 1), ctors, diags, filename)
+                        if pty != kid(defs, 1):
+                            setKid(defs, 1, pty)
+        if kidCount(ty) > 1:
+            let ret: Node = lowerTypeExpr(kid(ty, 1), ctors, diags, filename)
+            if ret != kid(ty, 1):
+                setKid(ty, 1, ret)
+        return ty
+    of nkObjectDecl:
+        # Kids: base type + record list.
+        if kidCount(ty) > 0:
+            let base: Node = lowerTypeExpr(kid(ty, 0), ctors, diags, filename)
+            if base != kid(ty, 0):
+                setKid(ty, 0, base)
+        if kidCount(ty) > 1:
+            let rl: Node = kid(ty, 1)
+            if rl != nil:
+                lowerTypeExpr(rl, ctors, diags, filename)
+        return ty
+    of nkRecList:
+        for i2 in 0..<kidCount(ty):
+            let child: Node = kid(ty, i2)
+            lowerTypeExpr(child, ctors, diags, filename)
+        return ty
+    of nkRecCase:
+        for i3 in 0..<kidCount(ty):
+            let child2: Node = kid(ty, i3)
+            lowerTypeExpr(child2, ctors, diags, filename)
+        return ty
+    of nkOfBranch, nkElse:
+        for i4 in 0..<kidCount(ty):
+            let child3: Node = kid(ty, i4)
+            lowerTypeExpr(child3, ctors, diags, filename)
+        return ty
+    of nkIdentDefs:
+        # Used for record fields and tuple named fields.
+        if kidCount(ty) > 1:
+            let ft: Node = lowerTypeExpr(kid(ty, 1), ctors, diags, filename)
+            if ft != kid(ty, 1):
+                setKid(ty, 1, ft)
+        return ty
+    of nkBracketExpr:
+        let count: int32 = kidCount(ty)
+        let allowLegacyCtorSyntax: bool = lowerIsCompatOverlayFile(filename)
+        if count > 1:
+            let base0: Node = kid(ty, 0)
+            let ctor0: str = ctorNameFromNode(base0)
+            let fromSugar: bool = lowerIsSynthesizedBracketCtor(ty, base0)
+            if !allowLegacyCtorSyntax && !fromSugar && ((ctor0 == "seq") || (ctor0 == "openArray")):
+                lowerAddError(diags, filename, ty.pos,
+                              "Legacy type syntax is removed; use 'T[]' instead of '" + ctor0 + "[T]'")
+            # NOTE: `array[...]` surface syntax is removed. `T[N]` sugar means a
+            # dynamic seq with implicit reserve at init.
+            elif !allowLegacyCtorSyntax && (ctor0 == "Table_fixed"):
+                lowerAddError(diags, filename, ty.pos,
+                              "Legacy type syntax 'Table_fixed[V, N]' is removed; use 'Table[V]' and pass capacity to TableInit(...)")
+            elif !allowLegacyCtorSyntax && (ctor0 == "array"):
+                lowerAddError(diags, filename, ty.pos,
+                              "Legacy type syntax 'array[N, T]' is removed; use 'T[N]' instead")
+            elif !allowLegacyCtorSyntax && (ctor0 == "Table") && count != 2:
+                lowerAddError(diags, filename, ty.pos,
+                              "Legacy type syntax 'Table[V, N]' is removed; use 'Table[V]' and pass capacity to TableInit(...)")
+        if count == 1:
+            # `T[]` -> `seq[T]`
+            let elemTy: Node = lowerTypeExpr(kid(ty, 0), ctors, diags, filename)
+            var out: Node = newNode(nkBracketExpr, ty.pos)
+            addSon(out, newIdent("seq", ty.pos))
+            addSon(out, elemTy)
+            return out
+        if count == 2:
+            # `T[N]` vs `Foo[X]`
+            let base0: Node = kid(ty, 0)
+            let arg0: Node = kid(ty, 1)
+            let ctor: str = ctorNameFromNode(base0)
+            if ctor != nil && len(ctor) > 0 && hashsets.hashSetStrHas(ctors, ctor):
+                let base2: Node = lowerTypeExpr(base0, ctors, diags, filename)
+                let arg2: Node = lowerTypeExpr(arg0, ctors, diags, filename)
+                if base2 != base0:
+                    setKid(ty, 0, base2)
+                if arg2 != arg0:
+                    setKid(ty, 1, arg2)
+                return ty
+            # Seq cap sugar: `T[N]` -> `seq_fixed[T, N]`.
+            let elemTy2: Node = lowerTypeExpr(base0, ctors, diags, filename)
+            var out2: Node = newNode(nkBracketExpr, ty.pos)
+            addSon(out2, newIdent("seq_fixed", ty.pos))
+            addSon(out2, elemTy2)
+            addSon(out2, arg0)
+            return out2
+        # Generic instantiation with multiple args: lower kids.
+        for i5 in 0..<count:
+            let c5: Node = kid(ty, i5)
+            let c6: Node = lowerTypeExpr(c5, ctors, diags, filename)
+            if c6 != c5:
+                setKid(ty, i5, c6)
+        return ty
+    of nkDotExpr:
+        if kidCount(ty) > 0:
+            let inner3: Node = lowerTypeExpr(kid(ty, 0), ctors, diags, filename)
+            if inner3 != kid(ty, 0):
+                setKid(ty, 0, inner3)
+        return ty
+    else:
+        return ty
+
+fn lowerTypeParams(gp: Node, ctors: hashsets.HashSetStr, diags: Diagnostic[]*, filename: str) =
+    if gp == nil || gp.kind != nkGenericParams:
+        return
+    for i in 0..<kidCount(gp):
+        let defs: Node = kid(gp, i)
+        if defs != nil && defs.kind == nkIdentDefs:
+            if kidCount(defs) > 1:
+                let c: Node = lowerTypeExpr(kid(defs, 1), ctors, diags, filename)
+                if c != kid(defs, 1):
+                    setKid(defs, 1, c)
+            if kidCount(defs) > 2:
+                let d: Node = lowerTypeExpr(kid(defs, 2), ctors, diags, filename)
+                if d != kid(defs, 2):
+                    setKid(defs, 2, d)
+
+fn lowerFormalParams(fp: Node, ctors: hashsets.HashSetStr, diags: Diagnostic[]*, filename: str) =
+    if fp == nil || fp.kind != nkFormalParams:
+        return
+    for i in 0..<kidCount(fp):
+        let defs: Node = kid(fp, i)
+        if defs != nil && defs.kind == nkIdentDefs:
+            if kidCount(defs) > 1:
+                let pty: Node = lowerTypeExpr(kid(defs, 1), ctors, diags, filename)
+                if pty != kid(defs, 1):
+                    setKid(defs, 1, pty)
+
+fn isImplicitTypeParamName(nm0: str): bool =
+    if nm0 == nil:
+        return false
+    let nm: str = lowerStrip nm0
+    if nm == nil || len(nm) != 1:
+        return false
+    let c0: char = nm[0]
+    return c0 >= 'A' && c0 <= 'Z'
+
+fn collectKnownTypeNames(root: Node, out: hashsets.HashSetStr*) =
+    if root == nil || out == nil:
+        return
+    var queue: Node[]
+    add(queue, root)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil:
+            continue
+        if n.kind == nkTypeDecl || n.kind == nkConceptDecl || n.kind == nkTraitDecl:
+            if kidCount(n) > 0:
+                let nameNode: Node = kid(n, 0)
+                if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
+                    let nm: str = lowerStrip plainName(nameNode)
+                    if nm != nil && len(nm) > 0:
+                        hashsets.hashSetStrAdd(out, nm)
+        for i in 0..<kidCount(n):
+            add(queue, kid(n, i))
+
+fn collectImplicitTypeParamsFromTypeNode(ty: Node, knownTypes: hashsets.HashSetStr, seen: hashsets.HashSetStr*, out: str[]*) =
+    if ty == nil || seen == nil || out == nil:
+        return
+    var queue: Node[]
+    add(queue, ty)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil:
+            continue
+        # Do not treat qualified names (`mod.T`) as implicit type params.
+        if n.kind == nkDotExpr:
+            continue
+        if n.kind == nkIdent || n.kind == nkSymbol:
+            let nm: str = lowerStrip plainName(n)
+            if isImplicitTypeParamName(nm) &&
+               ! hashsets.hashSetStrHas(knownTypes, nm) &&
+               ! hashsets.hashSetStrHas(*seen, nm):
+                hashsets.hashSetStrAdd(seen, nm)
+                add(out, nm)
+            continue
+        for i in 0..<kidCount(n):
+            add(queue, kid(n, i))
+
+fn inferImplicitTypeParamsForRoutine(routineNode: Node, knownTypes: hashsets.HashSetStr) =
+    if routineNode == nil:
+        return
+    var gp: Node = nil
+    if kidCount(routineNode) > 4:
+        gp = kid(routineNode, 4)
+    if gp != nil && gp.kind == nkGenericParams && kidCount(gp) > 0:
+        return
+    var names: str[]
+    var seen: hashsets.HashSetStr = hashsets.hashSetStrInit(8)
+    if kidCount(routineNode) > 1:
+        let fp: Node = kid(routineNode, 1)
+        if fp != nil && fp.kind == nkFormalParams:
+            for i in 0..<kidCount(fp):
+                let defs: Node = kid(fp, i)
+                if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 1:
+                    collectImplicitTypeParamsFromTypeNode(kid(defs, 1), knownTypes, &seen, &names)
+    if kidCount(routineNode) > 2:
+        let ret: Node = kid(routineNode, 2)
+        if ret != nil && ret.kind != nkEmpty:
+            collectImplicitTypeParamsFromTypeNode(ret, knownTypes, &seen, &names)
+    if names.len == 0:
+        return
+    var outGp: Node = newNode(nkGenericParams, routineNode.pos)
+    for j in 0..<names.len:
+        let nm: str = names[j]
+        var defn: Node = newNode(nkIdentDefs, routineNode.pos)
+        addSon(defn, newIdent(nm, routineNode.pos))
+        addSon(defn, emptyNode(routineNode.pos))
+        addSon(defn, emptyNode(routineNode.pos))
+        addSon(outGp, defn)
+    if kidCount(routineNode) > 4:
+        setKid(routineNode, 4, outGp)
+
+fn lowerTypeSyntax(root: Node, diags: Diagnostic[]*, filename: str) =
+    if root == nil:
+        return
+    var ctors: hashsets.HashSetStr = hashsets.hashSetStrInit(128)
+    collectTypeConstructors(root, ctors)
+    var knownTypes: hashsets.HashSetStr = hashsets.hashSetStrInit(128)
+    collectKnownTypeNames(root, &knownTypes)
+
+    var queue: Node[]
+    add(queue, root)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil:
+            continue
+        case n.kind
+        of nkCall:
+            # Generic calls parse type args inside `callee[Ty, ...]` as expressions.
+            # Lower type sugar (`T[]`, `T[N]`) for those args so semantics/mono see
+            # canonical `seq[...]` / `array[...]` nodes.
+            if kidCount(n) > 0:
+                let callee: Node = kid(n, 0)
+                if callee != nil && callee.kind == nkBracketExpr && kidCount(callee) > 1:
+                    for ai in 1..<kidCount(callee):
+                        let arg: Node = kid(callee, ai)
+                        let lowered: Node = lowerTypeExpr(arg, ctors, diags, filename)
+                        if lowered != arg:
+                            setKid(callee, ai, lowered)
+        of nkPattern:
+            if kidCount(n) > 1:
+                let ty: Node = lowerTypeExpr(kid(n, 1), ctors, diags, filename)
+                if ty != kid(n, 1):
+                    setKid(n, 1, ty)
+        of nkLet, nkVar, nkConst:
+            if kidCount(n) > 1:
+                let ty2: Node = lowerTypeExpr(kid(n, 1), ctors, diags, filename)
+                if ty2 != kid(n, 1):
+                    setKid(n, 1, ty2)
+        of nkTypeDecl:
+            if kidCount(n) > 1:
+                let def: Node = lowerTypeExpr(kid(n, 1), ctors, diags, filename)
+                if def != kid(n, 1):
+                    setKid(n, 1, def)
+            if kidCount(n) > 2:
+                lowerTypeParams(kid(n, 2), ctors, diags, filename)
+        of nkFnDecl, nkIteratorDecl, nkTemplateDecl, nkMacroDecl, nkLambda:
+            if kidCount(n) > 1:
+                lowerFormalParams(kid(n, 1), ctors, diags, filename)
+            if kidCount(n) > 2:
+                let ret: Node = lowerTypeExpr(kid(n, 2), ctors, diags, filename)
+                if ret != kid(n, 2):
+                    setKid(n, 2, ret)
+            if kidCount(n) > 4:
+                lowerTypeParams(kid(n, 4), ctors, diags, filename)
+            if n.kind != nkLambda:
+                inferImplicitTypeParamsForRoutine(n, knownTypes)
+        for i in 0..<kidCount(n):
+            add(queue, kid(n, i))

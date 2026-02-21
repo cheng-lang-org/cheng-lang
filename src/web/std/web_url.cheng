@@ -1,0 +1,241 @@
+import std/strings
+
+type
+    UrlParts =
+        raw: str
+        scheme: str
+        authority: str
+        host: str
+        port: str
+        path: str
+        query: str
+        hash: str
+
+    UrlQueryParam =
+        key: str
+        value: str
+
+    UrlQueryParams =
+        items: UrlQueryParam[]
+
+fn isDigit(c: char): bool =
+    return c >= '0' && c <= '9'
+
+fn hexValue(c: char): int32 =
+    let o = int32(c)
+    if o >= int32('0') && o <= int32('9'):
+        return o - int32('0')
+    if o >= int32('a') && o <= int32('f'):
+        return o - int32('a') + 10
+    if o >= int32('A') && o <= int32('F'):
+        return o - int32('A') + 10
+    return -1
+
+fn toHexDigit(value: int32): char =
+    let v = value % 16
+    if v < 10:
+        return chr(int32('0') + v)
+    return chr(int32('A') + (v - 10))
+
+fn isUnreserved(c: char): bool =
+    if c >= 'a' && c <= 'z':
+        return true
+    if c >= 'A' && c <= 'Z':
+        return true
+    if c >= '0' && c <= '9':
+        return true
+    if c == '-' || c == '_' || c == '.' || c == '~':
+        return true
+    return false
+
+fn indexOfChar(s: str, target: char, start: int32): int32 =
+    if s == nil:
+        return -1
+    for i in start..<len(s):
+        if s[i] == target:
+            return i
+    return -1
+
+fn substr(text: str, start: int32, count: int32): str =
+    if text == nil:
+        return ""
+    if count <= 0:
+        return ""
+    let stop = start + count - 1
+    return __cheng_slice_string(text, start, stop, false)
+
+fn urlDecodeComponent(text: str): str =
+    if text == nil || len(text) == 0:
+        return ""
+    var out: str = ""
+    var i: int32 = 0
+    for __for_guard_i in 0..<len(text):
+        if !(i < len(text)):
+            break
+        let c = text[i]
+        if c == '+':
+            out = out + " "
+        elif c == '%' && i + 2 < len(text):
+            let hi = hexValue(text[i + 1])
+            let lo = hexValue(text[i + 2])
+            if hi >= 0 && lo >= 0:
+                out = out + $ chr(hi * 16 + lo)
+                i = i + 2
+            else:
+                out = out + $ c
+        else:
+            out = out + $ c
+        i = i + 1
+    return out
+
+fn urlEncodeComponent(text: str): str =
+    if text == nil || len(text) == 0:
+        return ""
+    var out: str = ""
+    for i in 0..<len(text):
+        let c = text[i]
+        if c == ' ':
+            out = out + "+"
+        elif isUnreserved(c):
+            out = out + $ c
+        else:
+            var code: int32 = int32(c)
+            if code < 0:
+                code = code + 256
+            out = out + "%"
+            out = out + $ toHexDigit(code >> 4)
+            out = out + $ toHexDigit(code & 15)
+    return out
+
+fn addQueryParam(params: var UrlQueryParams, key: str, value: str) =
+    if key == nil || len(key) == 0:
+        return
+    var item: UrlQueryParam
+    item.key = key
+    item.value = value
+    params.items.add(item)
+
+fn urlParseQuery(query: str): UrlQueryParams =
+    var out: UrlQueryParams
+    out.items = []
+    if query == nil || len(query) == 0:
+        return out
+    var start: int32 = 0
+    for i in 0..len(query):
+        if i == len(query) || query[i] == '&':
+            let size: int32 = i - start
+            if size > 0:
+                let eq = indexOfChar(query, '=', start)
+                if eq >= 0 && eq < i:
+                    let rawKey = substr(query, start, eq - start)
+                    let rawValue = substr(query, eq + 1, i - eq - 1)
+                    let key = urlDecodeComponent(rawKey)
+                    let value = urlDecodeComponent(rawValue)
+                    addQueryParam(out, key, value)
+                else:
+                    let rawKey = substr(query, start, size)
+                    let key = urlDecodeComponent(rawKey)
+                    addQueryParam(out, key, "")
+            start = i + 1
+    return out
+
+fn urlQueryGet(params: UrlQueryParams, key: str): str =
+    if key == nil:
+        return ""
+    for i in 0..<len(params.items):
+        let item = params.items[i]
+        if item.key == key:
+            return item.value
+    return ""
+
+fn urlBuildQuery(params: UrlQueryParams): str =
+    var out: str = ""
+    for i in 0..<len(params.items):
+        if i > 0:
+            out = out + "&"
+        let item = params.items[i]
+        out = out + urlEncodeComponent(item.key)
+        out = out + "="
+        out = out + urlEncodeComponent(item.value)
+    return out
+
+fn urlParse(raw: str): UrlParts =
+    var out: UrlParts
+    var src: str = raw
+    if src == nil:
+        src = ""
+    out.raw = src
+    var schemeIdx: int32 = -1
+    var i: int32 = 0
+    while i + 2 < len(src):
+        if src[i] == ':' && src[i + 1] == '/' && src[i + 2] == '/':
+            schemeIdx = i
+            break
+        i = i + 1
+    var pos: int32 = 0
+    if schemeIdx >= 0:
+        out.scheme = substr(src, 0, schemeIdx)
+        pos = schemeIdx + 3
+        let authStart = pos
+        let __for_start_pos_1 = pos
+        for __for_pos_1 in __for_start_pos_1..<len(src):
+            pos = __for_pos_1
+            let c = src[pos]
+            if c == '/' || c == '?' || c == '#':
+                break
+            pos = pos + 1
+        if pos > authStart:
+            out.authority = substr(src, authStart, pos - authStart)
+            let auth = out.authority
+            if len(auth) > 0 && auth[0] == '[':
+                let close = indexOfChar(auth, ']', 1)
+                if close >= 0:
+                    out.host = substr(auth, 0, close + 1)
+                    if close + 1 < len(auth) && auth[close + 1] == ':':
+                        out.port = substr(auth, close + 2, len(auth) - close - 2)
+                else:
+                    out.host = auth
+            else:
+                var colon: int32 = -1
+                let __for_start_j = len(auth) - 1
+                for __for_rev_j in 0..(__for_start_j - (0)):
+                    let j = __for_start_j - __for_rev_j
+                    let c = auth[j]
+                    if c == ':':
+                        colon = j
+                        break
+                    if ! isDigit(c):
+                        break
+                if colon >= 0 && colon < len(auth) - 1:
+                    out.host = substr(auth, 0, colon)
+                    out.port = substr(auth, colon + 1, len(auth) - colon - 1)
+                else:
+                    out.host = auth
+    var queryIdx: int32 = -1
+    var hashIdx: int32 = -1
+    i = pos
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<len(src):
+        i = __for_i_2
+        let c = src[i]
+        if c == '?' && queryIdx < 0 && hashIdx < 0:
+            queryIdx = i
+        elif c == '#' && hashIdx < 0:
+            hashIdx = i
+            break
+        i = i + 1
+    if queryIdx >= 0:
+        let endIdx = if hashIdx >= 0: hashIdx else: len(src)
+        out.query = substr(src, queryIdx + 1, endIdx - queryIdx - 1)
+    if hashIdx >= 0:
+        out.hash = substr(src, hashIdx + 1, len(src) - hashIdx - 1)
+    var pathEnd: int32 = len(src)
+    if queryIdx >= 0 && queryIdx < pathEnd:
+        pathEnd = queryIdx
+    if hashIdx >= 0 && hashIdx < pathEnd:
+        pathEnd = hashIdx
+    if pathEnd > pos:
+        out.path = substr(src, pos, pathEnd - pos)
+    if len(out.path) == 0 && (schemeIdx >= 0 || len(out.authority) > 0):
+        out.path = "/"
+    return out

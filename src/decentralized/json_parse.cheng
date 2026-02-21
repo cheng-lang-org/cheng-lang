@@ -1,0 +1,303 @@
+import cheng/runtime/json_ast as json
+import std/strings
+
+type
+    JsonParser =
+        text: str
+        pos: int32
+        length: int32
+        error: str
+
+    ParseResult =
+        ok: bool
+        value: json.JsonNode
+        error: str
+
+fn parserInit(text: str): JsonParser =
+    JsonParser(text: text, pos: 0, length: len(text), error: "")
+
+fn parserFail(p: var JsonParser, msg: str) =
+    let err = p.error
+    if err == nil || len(err) == 0:
+        p.error = msg
+
+fn parserPeek(p: var JsonParser): char =
+    if p.pos >= p.length:
+        return '\0'
+    return p.text[p.pos]
+
+fn parserNext(p: var JsonParser): char =
+    if p.pos >= p.length:
+        return '\0'
+    let ch = p.text[p.pos]
+    p.pos = p.pos + 1
+    return ch
+
+fn skipWhitespace(p: var JsonParser) =
+    while p.pos < p.length:
+        let ch = p.text[p.pos]
+        if ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t':
+            p.pos = p.pos + 1
+        else:
+            break
+
+fn isDigit(ch: char): bool =
+    ch >= '0' && ch <= '9'
+
+fn parseValue(p: var JsonParser): json.JsonNode
+
+fn parseString(p: var JsonParser): str =
+    if parserPeek(p) != '"':
+        parserFail(p, "expected '\"'")
+        return ""
+    parserNext(p)
+    var out: str = ""
+    while p.pos < p.length:
+        let ch = parserNext(p)
+        if ch == '"':
+            return out
+        if ch == '\\':
+            if p.pos >= p.length:
+                parserFail(p, "unterminated str escape")
+                return out
+            let esc = parserNext(p)
+            if esc == '"':
+                out = out + charToStr('"')
+            elif esc == '\\':
+                out = out + charToStr('\\')
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + charToStr(esc)
+        else:
+            out = out + charToStr(ch)
+    parserFail(p, "unterminated str")
+    return out
+
+fn parseNumber(p: var JsonParser): json.JsonNode =
+    var sign: int64 = 1
+    let first = parserPeek(p)
+    if first == '-':
+        sign = -1
+        parserNext(p)
+    var intPart: int64 = 0
+    var digitCount: int32 = 0
+    while isDigit(parserPeek(p)):
+        let ch = parserNext(p)
+        intPart = intPart * 10 + int64(ch) - int64('0')
+        digitCount = digitCount + 1
+    var hasFrac = false
+    var fracPart: float64 = 0.0
+    var fracDiv: float64 = 1.0
+    if parserPeek(p) == '.':
+        hasFrac = true
+        parserNext(p)
+        while isDigit(parserPeek(p)):
+            let ch = parserNext(p)
+            fracPart = fracPart * 10.0 + float64(int32(ch) - int32('0'))
+            fracDiv = fracDiv * 10.0
+            digitCount = digitCount + 1
+    if digitCount == 0:
+        parserFail(p, "invalid number")
+        return json.newJFloat(0.0)
+    var hasExp = false
+    var expSign: int32 = 1
+    var expVal: int32 = 0
+    if parserPeek(p) == 'e' || parserPeek(p) == 'E':
+        hasExp = true
+        parserNext(p)
+        if parserPeek(p) == '+':
+            parserNext(p)
+        elif parserPeek(p) == '-':
+            expSign = -1
+            parserNext(p)
+        if ! isDigit(parserPeek(p)):
+            parserFail(p, "invalid exponent")
+            return json.newJFloat(0.0)
+        while isDigit(parserPeek(p)):
+            let ch = parserNext(p)
+            expVal = expVal * 10 + (int32(ch) - int32('0'))
+    if ! hasFrac && ! hasExp:
+        return json.newJInt(intPart * sign)
+    var value: float64 = float64(intPart)
+    value = value + (fracPart / fracDiv)
+    if hasExp:
+        var i: int32 = 0
+        var exp: int32 = expVal * expSign
+        if exp > 0:
+            let __for_start_i_1 = i
+            for __for_i_1 in __for_start_i_1..<exp:
+                i = __for_i_1
+                value = value * 10.0
+                i = i + 1
+        elif exp < 0:
+            exp = 0 - exp
+            let __for_start_i_2 = i
+            for __for_i_2 in __for_start_i_2..<exp:
+                i = __for_i_2
+                value = value / 10.0
+                i = i + 1
+    return json.newJFloat(value * float64(sign))
+
+fn consumeLiteral(p: var JsonParser, lit: str): bool =
+    for i in 0..<len(lit):
+        if parserPeek(p) != lit[i]:
+            return false
+        parserNext(p)
+    return true
+
+fn parseArray(p: var JsonParser): json.JsonNode =
+    if parserPeek(p) != '[':
+        parserFail(p, "expected '['")
+        return json.newJArray()
+    parserNext(p)
+    var out = json.newJArray()
+    skipWhitespace(p)
+    if parserPeek(p) == ']':
+        parserNext(p)
+        return out
+    while p.pos < p.length:
+        let item = parseValue(p)
+        out.add(item)
+        skipWhitespace(p)
+        let ch = parserPeek(p)
+        if ch == ',':
+            parserNext(p)
+            skipWhitespace(p)
+            continue
+        if ch == ']':
+            parserNext(p)
+            break
+        parserFail(p, "expected ',' or ']'")
+        break
+    return out
+
+fn parseObject(p: var JsonParser): json.JsonNode =
+    if parserPeek(p) != '{':
+        parserFail(p, "expected '{'")
+        return json.newJObject()
+    parserNext(p)
+    var out = json.newJObject()
+    skipWhitespace(p)
+    if parserPeek(p) == '}':
+        parserNext(p)
+        return out
+    while p.pos < p.length:
+        skipWhitespace(p)
+        let key = parseString(p)
+        skipWhitespace(p)
+        if parserPeek(p) != ':':
+            parserFail(p, "expected ':'")
+            break
+        parserNext(p)
+        skipWhitespace(p)
+        let value = parseValue(p)
+        json.jsonSetField(out, key, value)
+        skipWhitespace(p)
+        let ch = parserPeek(p)
+        if ch == ',':
+            parserNext(p)
+            skipWhitespace(p)
+            continue
+        if ch == '}':
+            parserNext(p)
+            break
+        parserFail(p, "expected ',' or '}'")
+        break
+    return out
+
+fn parseValue(p: var JsonParser): json.JsonNode =
+    skipWhitespace(p)
+    let ch = parserPeek(p)
+    if ch == '"':
+        return json.newJString(parseString(p))
+    if ch == '{':
+        return parseObject(p)
+    if ch == '[':
+        return parseArray(p)
+    if ch == '-' || isDigit(ch):
+        return parseNumber(p)
+    if consumeLiteral(p, "true"):
+        return json.newJBool(true)
+    if consumeLiteral(p, "false"):
+        return json.newJBool(false)
+    if consumeLiteral(p, "null"):
+        return json.newJNull()
+    parserFail(p, "unexpected token")
+    return json.newJNull()
+
+fn parseJsonSafe(content: str): ParseResult =
+    var res: ParseResult
+    if content == nil || len(content) == 0:
+        res.ok = false
+        res.error = "empty input"
+        return res
+    var p = parserInit(content)
+    let node = parseValue(p)
+    skipWhitespace(p)
+    if p.pos < p.length:
+        parserFail(p, "trailing data")
+    let err = p.error
+    if err != nil && len(err) > 0:
+        res.ok = false
+        res.error = err
+        return res
+    res.ok = true
+    res.value = node
+    return res
+
+fn hasField(node: json.JsonNode, key: str): bool =
+    if node == nil:
+        return false
+    return node.hasKey(key)
+
+fn getStringField(node: json.JsonNode, key: str, fallback: str): str =
+    if node == nil || ! node.hasKey(key):
+        return fallback
+    let value = json.jsonGetField(node, key)
+    if value == nil:
+        return fallback
+    if value.kind == json.JString:
+        let text = value.getStr()
+        if text == nil:
+            return ""
+        return "" + text
+    return fallback
+
+fn getFloatField(node: json.JsonNode, key: str, fallback: float64): float64 =
+    if node == nil || ! node.hasKey(key):
+        return fallback
+    let value = json.jsonGetField(node, key)
+    if value == nil:
+        return fallback
+    if value.kind == json.JFloat:
+        return value.getFloat()
+    if value.kind == json.JInt:
+        return float64(value.getInt())
+    return fallback
+
+fn getIntField(node: json.JsonNode, key: str, fallback: int64): int64 =
+    if node == nil || ! node.hasKey(key):
+        return fallback
+    let value = json.jsonGetField(node, key)
+    if value == nil:
+        return fallback
+    if value.kind == json.JInt:
+        return value.getInt()
+    if value.kind == json.JFloat:
+        return int64(value.getFloat())
+    return fallback
+
+fn getBoolField(node: json.JsonNode, key: str, fallback: bool): bool =
+    if node == nil || ! node.hasKey(key):
+        return fallback
+    let value = json.jsonGetField(node, key)
+    if value == nil:
+        return fallback
+    if value.kind == json.JBool:
+        return value.getBool()
+    return fallback

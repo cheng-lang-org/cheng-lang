@@ -1,0 +1,94 @@
+import std/os
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import std/strings
+
+type
+    ProviderReputationSummary =
+        providerId: str
+        proofOkCount: int32
+        proofMissingCount: int32
+        score: float64
+        level: str
+
+fn scoreToLevel(score: float64): str =
+    if score >= 0.9:
+        return "excellent"
+    if score >= 0.75:
+        return "good"
+    if score >= 0.5:
+        return "warn"
+    return "bad"
+
+fn computeScore(summary: ProviderReputationSummary): float64 =
+    let total: int32 = summary.proofOkCount + summary.proofMissingCount
+    if total <= 0:
+        return 1.0
+    let okRatio = float64(summary.proofOkCount) / float64(total)
+    return okRatio
+
+fn computeProviderReputation(ledgerPath: str, providerId: str): ProviderReputationSummary =
+    var out: ProviderReputationSummary
+    out.providerId = providerId
+    if ledgerPath == nil || len(ledgerPath) == 0:
+        out.score = computeScore(out)
+        out.level = scoreToLevel(out.score)
+        return out
+    if ! os.fileExists(ledgerPath):
+        out.score = computeScore(out)
+        out.level = scoreToLevel(out.score)
+        return out
+    let content = os.readFile(ledgerPath)
+    if content == nil || len(content) == 0:
+        out.score = computeScore(out)
+        out.level = scoreToLevel(out.score)
+        return out
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let node = parsed.value
+        let kind = jparse.getStringField(node, "type", "")
+        if kind == "storage_proof":
+            let pid = jparse.getStringField(node, "provider_id", "")
+            if pid == providerId:
+                let status = jparse.getStringField(node, "status", "")
+                if status == "missing":
+                    out.proofMissingCount = out.proofMissingCount + 1
+                else:
+                    out.proofOkCount = out.proofOkCount + 1
+    out.score = computeScore(out)
+    out.level = scoreToLevel(out.score)
+    return out
+
+fn providerReputationToJson(summary: ProviderReputationSummary): json.JsonNode =
+    let root = json.newJObject()
+    root["provider_id"] = json.newJString(summary.providerId)
+    root["proof_ok_count"] = json.newJInt(summary.proofOkCount)
+    root["proof_missing_count"] = json.newJInt(summary.proofMissingCount)
+    root["score"] = json.newJFloat(summary.score)
+    root["level"] = json.newJString(summary.level)
+    return root
+
+fn providerReputationToToml(summary: ProviderReputationSummary): str =
+    var out: str = ""
+    out = out + "provider_id = \"" + summary.providerId + "\"\n"
+    out = out + "proof_ok_count = " + intToStr(summary.proofOkCount) + "\n"
+    out = out + "proof_missing_count = " + intToStr(summary.proofMissingCount) + "\n"
+    out = out + "score = " + $ summary.score + "\n"
+    out = out + "level = \"" + summary.level + "\"\n"
+    return out
+
+fn providerReputationToYaml(summary: ProviderReputationSummary): str =
+    var out: str = ""
+    out = out + "provider_id: \"" + summary.providerId + "\"\n"
+    out = out + "proof_ok_count: " + intToStr(summary.proofOkCount) + "\n"
+    out = out + "proof_missing_count: " + intToStr(summary.proofMissingCount) + "\n"
+    out = out + "score: " + $ summary.score + "\n"
+    out = out + "level: \"" + summary.level + "\"\n"
+    return out

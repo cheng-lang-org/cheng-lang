@@ -1,0 +1,2558 @@
+# parser.cheng
+# Stage1 parser (rebuilt from stage0 parser, with Stage1 AST/diagnostics).
+import std/strings
+import std/seqs
+import std/os
+import cheng/stage1/token
+import cheng/stage1/diagnostics
+import cheng/stage1/lexer
+import cheng/stage1/ast
+
+# ---- Precedence ----
+const
+    PrecNone: int32 = 0
+    PrecTernary: int32 = 10
+    PrecOr: int32 = 20
+    PrecAnd: int32 = 30
+    PrecBitOr: int32 = 40
+    PrecBitXor: int32 = 45
+    PrecBitAnd: int32 = 50
+    PrecEquality: int32 = 60
+    PrecComparison: int32 = 65
+    PrecMembership: int32 = 70
+    PrecRange: int32 = 75
+    PrecShift: int32 = 77
+    PrecAdditive: int32 = 80
+    PrecMultiplicative: int32 = 90
+    PrecPrefix: int32 = 100
+    PrecCall: int32 = 110
+    PrecDot: int32 = 120
+
+# ---- ParserState ----
+type
+    ParserStateObj =
+        tokens: Token[]
+        idx: int32
+        filename: str
+        diags: Diagnostic[]*
+
+fn posFrom(t: Token): SourcePos =
+    var sp: SourcePos
+    sp.line = t.line
+    sp.col = t.col
+    return sp
+
+fn emptyNode(pos: SourcePos): Node =
+    return newNode(nkEmpty, pos)
+
+fn eofTok(): Token =
+    var t: Token
+    t.kind = tkEof
+    t.lexeme = ""
+    t.strPrefix = chr 0
+    t.line = 0
+    t.col = 0
+    return t
+
+fn current(p: ParserStateObj*): Token =
+    if p != nil && p->idx < p->tokens.len:
+        if p->tokens.buffer != nil:
+            let off64: int64 = int64(p->idx) * sizeof Token
+            let tokPtr: Token* = Token*(ptr_add(p->tokens.buffer, int32(off64)))
+            return *tokPtr
+    return eofTok()
+
+fn peek(p: ParserStateObj*, ahead: int32): Token =
+    if p == nil:
+        return eofTok()
+    let i: int32 = p->idx + ahead
+    if i >= 0 && i < p->tokens.len:
+        if p->tokens.buffer != nil:
+            let off64: int64 = int64(i) * sizeof Token
+            let tokPtr: Token* = Token*(ptr_add(p->tokens.buffer, int32(off64)))
+            return *tokPtr
+    return eofTok()
+
+fn curKind(p: ParserStateObj*): TokenKind =
+    let t: Token = current p
+    return t.kind
+
+fn curLexeme(p: ParserStateObj*): str =
+    let t: Token = current p
+    return t.lexeme
+
+fn peekKind(p: ParserStateObj*, ahead: int32): TokenKind =
+    let t: Token = peek(p, ahead)
+    return t.kind
+
+fn peekLexeme(p: ParserStateObj*, ahead: int32): str =
+    let t: Token = peek(p, ahead)
+    return t.lexeme
+
+fn advance(p: ParserStateObj*) =
+    if p == nil:
+        return
+    p->idx = p->idx + 1
+
+fn addDiag(diags: Diagnostic[]*, severity: Severity, filename: str, line: int32, col: int32, message: str) =
+    if diags == nil:
+        return
+    var d: Diagnostic
+    d.severity = severity
+    d.filename = filename
+    d.line = line
+    d.col = col
+    d.message = message
+    add(diags, d)
+
+fn addParseDiag(p: ParserStateObj*, t: Token, message: str) =
+    if p == nil:
+        return
+    addDiag(p->diags, svError, p->filename, t.line, t.col, message)
+
+fn match(p: ParserStateObj*, k: TokenKind): bool =
+    if curKind(p) == k:
+        advance p
+        return true
+    return false
+
+fn matchSymbol(p: ParserStateObj*, s: str): bool =
+    let t: Token = current p
+    if t.kind == tkSymbol &&(t.lexeme ==  s):
+        advance p
+        return true
+    return false
+
+fn matchKeyword(p: ParserStateObj*, kw: str): bool =
+    let t: Token = current p
+    if t.kind == tkKeyword &&(t.lexeme ==  kw):
+        advance p
+        return true
+    return false
+
+fn expect(p: ParserStateObj*, k: TokenKind, msg: str) =
+    if ! match(p, k):
+        addParseDiag(p, current p, msg)
+
+fn expectSymbol(p: ParserStateObj*, s: str, msg: str) =
+    if ! matchSymbol(p, s):
+        addParseDiag(p, current p, msg)
+
+fn skipNewlines(p: ParserStateObj*) =
+    while curKind(p) == tkNewline:
+        advance p
+
+fn skipExprLeading(p: ParserStateObj*) =
+    while curKind(p) == tkNewline:
+        advance p
+    while curKind(p) == tkIndent:
+        advance p
+
+fn skipStmtSeps(p: ParserStateObj*) =
+    while true:
+        let t: Token = current p
+        if t.kind == tkNewline:
+            advance p
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  ";"):
+            advance p
+            continue
+        break
+
+fn isLineEnd(k: TokenKind): bool =
+    return k == tkNewline || k == tkDedent || k == tkEof
+
+fn skipSpaceCallExtras(p: ParserStateObj*) =
+    while true:
+        let t: Token = current p
+        if isLineEnd t.kind:
+            break
+        if t.kind == tkSymbol &&((t.lexeme ==  ";") ||(t.lexeme ==  "}") ||(t.lexeme ==  ")") ||(t.lexeme ==  "]") ||(t.lexeme ==  ",") ||(t.lexeme ==  ":") ||(t.lexeme ==  "=")):
+            break
+        advance p
+
+fn isIdentStart(k: TokenKind): bool =
+    return k == tkIdent || k == tkKeyword
+
+fn isSpaceCallArgStart(p: ParserStateObj*): bool =
+    let t: Token = current p
+    if t.kind == tkNumber || t.kind == tkString || t.kind == tkChar:
+        return true
+    if t.kind == tkIdent:
+        return true
+    if t.kind == tkKeyword:
+        if (t.lexeme ==  "true") || (t.lexeme ==  "false") || (t.lexeme ==  "nil"):
+            return true
+        if (t.lexeme ==  "fn") ||(t.lexeme ==  "iterator"):
+            return true
+        return false
+    if t.kind == tkSymbol:
+        if (t.lexeme ==  "(") ||(t.lexeme ==  "[") ||(t.lexeme ==  "{") ||(t.lexeme ==  "@"):
+            return true
+    return false
+
+fn isTypeKeywordName(name: str): bool =
+    if parser_isBuiltinTypeName name:
+        return true
+    if (name ==  "ref") ||(name ==  "var") ||(name ==  "enum") ||(name ==  "fn") ||
+       (name ==  "tuple") ||(name ==  "set"):
+        return true
+    return false
+
+fn isSpaceCallTypeArgStart(p: ParserStateObj*): bool =
+    let t: Token = current p
+    if t.kind == tkKeyword:
+        return isTypeKeywordName t.lexeme
+    if t.kind == tkIdent:
+        return isLikelyTypeIdent t.lexeme
+    return false
+
+fn isIntrinsicTypeCallNode(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let name: str = stripSpaces(plainName(n))
+        if (name ==  "sizeof") ||(name ==  "default") ||(name ==  "alignof"):
+            return true
+    return false
+
+fn isSpaceCallArgStartFor(p: ParserStateObj*, lhs: Node): bool =
+    if isSpaceCallArgStart p:
+        return true
+    if isIntrinsicTypeCallNode lhs && isSpaceCallTypeArgStart p:
+        return true
+    return false
+
+fn tokenSpan(t: Token): int32 =
+    if t.kind == tkString:
+        let lexLen: int32 = len t.lexeme
+        var span: int32 = lexLen
+        if t.strPrefix != chr 0:
+            span = span + 1
+        var quoteLen: int32 = 2
+        for i in 0..<lexLen:
+            let ch: char = t.lexeme[i]
+            if ch == '\n' || ch == '\r':
+                quoteLen = 6
+                break
+        span = span + quoteLen
+        return span
+    if t.kind == tkChar:
+        return len t.lexeme + 2
+    return len t.lexeme
+
+fn tokenAttached(p: ParserStateObj*): bool =
+    let prev: Token = peek(p, -1)
+    let cur: Token = current p
+    if prev.line == 0 || cur.line == 0:
+        return false
+    if prev.kind == tkNewline || prev.kind == tkIndent || prev.kind == tkDedent:
+        return false
+    if prev.line != cur.line:
+        return false
+    let prevEnd: int32 = prev.col + tokenSpan prev
+    return prevEnd == cur.col
+
+fn spaceCallSameLine(p: ParserStateObj*): bool =
+    let prev: Token = peek(p, -1)
+    let cur: Token = current p
+    if prev.line == 0 || cur.line == 0:
+        return false
+    if prev.kind == tkNewline || prev.kind == tkIndent || prev.kind == tkDedent:
+        return false
+    return prev.line == cur.line
+
+fn isTernaryQuestion(p: ParserStateObj*): bool =
+    let t0: Token = current p
+    if t0.kind != tkSymbol || !(t0.lexeme ==  "?"):
+        return false
+    var depth: int32 = 0
+    var i: int32 = 1
+    while true:
+        let t: Token = peek(p, i)
+        if t.kind == tkEof || t.kind == tkDedent || t.kind == tkNewline:
+            return false
+        if t.kind == tkSymbol:
+            if (t.lexeme ==  "(") ||(t.lexeme ==  "[") ||(t.lexeme ==  "{"):
+                depth = depth + 1
+            elif (t.lexeme ==  ")") ||(t.lexeme ==  "]") ||(t.lexeme ==  "}"):
+                if depth == 0:
+                    return false
+                depth = depth - 1
+            elif (t.lexeme ==  ":"):
+                if depth == 0:
+                    return true
+            elif (t.lexeme ==  ",") ||(t.lexeme ==  ";") ||(t.lexeme ==  "="):
+                if depth == 0:
+                    return false
+        i = i + 1
+
+fn isTypeLike(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkPar:
+        if kidCount n == 0:
+            return false
+        return isTypeLike kid(n, 0)
+    if n.kind == nkIdent || n.kind == nkDotExpr || n.kind == nkBracketExpr:
+        return true
+    if n.kind == nkPtrTy || n.kind == nkRefTy || n.kind == nkVarTy || n.kind == nkTupleTy || n.kind == nkSetTy || n.kind == nkFnTy:
+        return true
+    if n.kind == nkObjectDecl || n.kind == nkEnumDecl || n.kind == nkConceptDecl || n.kind == nkTraitDecl:
+        return true
+    return false
+
+fn isOperatorName(name: str): bool =
+    if (name ==  "+") ||(name ==  "-") ||(name ==  "*") ||(name ==  "/"):
+        return true
+    if (name ==  "++") ||(name ==  "--"):
+        return true
+    if (name ==  "%") ||(name ==  "==") ||(name ==  "!="):
+        return true
+    if (name ==  "<") ||(name ==  "<=") ||(name ==  ">") ||(name ==  ">="):
+        return true
+    if (name ==  "&&") ||(name ==  "||"):
+        return true
+    if (name ==  "<<") ||(name ==  ">>"):
+        return true
+    if (name ==  "in") || (name ==  "notin") || (name ==  "is") || (name ==  "isnot"):
+        return true
+    if (name ==  "&") ||(name ==  "|") ||(name ==  "^") ||(name ==  "~"):
+        return true
+    if (name ==  "..") ||(name ==  "..<"):
+        return true
+    if (name ==  "$") ||(name ==  "!"):
+        return true
+    if (name ==  "await"):
+        return true
+    return false
+
+fn parser_isBuiltinTypeName(name: str): bool =
+    if (name ==  "int") ||(name ==  "int8") ||(name ==  "int16") ||(name ==  "int32") ||(name ==  "int64"):
+        return true
+    if (name ==  "uint") ||(name ==  "uint8") ||(name ==  "uint16") ||(name ==  "uint32") ||(name ==  "uint64"):
+        return true
+    if (name ==  "i8") ||(name ==  "u8"):
+        return true
+    if (name ==  "byte") ||(name ==  "bool") ||(name ==  "char"):
+        return true
+    if (name ==  "float") ||(name ==  "float32") ||(name ==  "float64"):
+        return true
+    if (name ==  "str") ||(name ==  "cstring") ||(name ==  "void"):
+        return true
+    if (name ==  "seq") ||(name ==  "openArray") ||(name ==  "varargs"):
+        return true
+    if (name ==  "array") ||(name ==  "tuple") ||(name ==  "set"):
+        return true
+    return false
+
+fn parserContainsRemovedStringType(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        return nm == "string"
+    for i in 0..<kidCount n:
+        if parserContainsRemovedStringType(kid(n, i)):
+            return true
+    return false
+
+fn parserRejectRemovedTypeAlias(p: ParserStateObj*, n: Node): Node =
+    if n == nil:
+        return nil
+    if ! parserContainsRemovedStringType(n):
+        return n
+    if p == nil || p->diags == nil:
+        return n
+    var pos: SourcePos = n.pos
+    if (pos.line <= 0 || pos.col <= 0) && p != nil:
+        pos = posFrom(current(p))
+    if p != nil:
+        addDiag(p->diags, svError, p->filename, pos.line, pos.col,
+                "type 'string' is removed; use 'str' or 'cstring'")
+    return newNode(nkError, pos)
+
+fn isBuiltinFnName(name: str): bool =
+    if (name ==  "len") ||(name ==  "__addr"):
+        return true
+    if (name ==  "sizeof") ||(name ==  "default"):
+        return true
+    if (name ==  "add") ||(name ==  "get"):
+        return true
+    return false
+
+fn normalizeIdent(name: str): str =
+    if name == nil:
+        return ""
+    if isOperatorName name || parser_isBuiltinTypeName name || isBuiltinFnName name:
+        return " " + name + " "
+    return name
+
+fn makeIdent(name: str, pos: SourcePos): Node =
+    return newIdent(normalizeIdent name, pos)
+
+fn opPrecedence(t: Token): int32 =
+    if t.kind == tkKeyword:
+        if (t.lexeme ==  "in") || (t.lexeme ==  "notin") || (t.lexeme ==  "is") || (t.lexeme ==  "isnot"):
+            return PrecMembership
+        return PrecNone
+    if t.kind == tkSymbol:
+        if (t.lexeme ==  "==") ||(t.lexeme ==  "!="):
+            return PrecEquality
+        if (t.lexeme ==  "<") ||(t.lexeme ==  "<=") ||(t.lexeme ==  ">") ||(t.lexeme ==  ">="):
+            return PrecComparison
+        if (t.lexeme ==  "..") ||(t.lexeme ==  "..<"):
+            return PrecRange
+        if (t.lexeme ==  "+") ||(t.lexeme ==  "-"):
+            return PrecAdditive
+        if (t.lexeme ==  "*") ||(t.lexeme ==  "/") ||(t.lexeme ==  "%"):
+            return PrecMultiplicative
+        if (t.lexeme ==  "||"):
+            return PrecOr
+        if (t.lexeme ==  "&&"):
+            return PrecAnd
+        if (t.lexeme ==  "|"):
+            return PrecBitOr
+        if (t.lexeme ==  "<<") ||(t.lexeme ==  ">>"):
+            return PrecShift
+        if (t.lexeme ==  "^"):
+            return PrecBitXor
+        if (t.lexeme ==  "&"):
+            return PrecBitAnd
+    return PrecNone
+
+# ---- Literals ----
+fn hexDigitVal(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 +(int32(c) - int32('a'))
+    if c >= 'A' && c <= 'F':
+        return 10 +(int32(c) - int32('A'))
+    return -1
+
+fn decodeStringLit(p: ParserStateObj*, t: Token): str =
+    if t.strPrefix == 'r':
+        return t.lexeme
+    let s: str = t.lexeme
+    let n: int32 = len s
+    let outSize: int32 = n + 1
+    var out: void* = alloc outSize
+    var outLen: int32 = 0
+    var i: int32 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = s[i]
+        if c != '\\':
+            *int8*(ptr_add(out, outLen)) = int8(c)
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        i = i + 1
+        if i >= n:
+            addParseDiag(p, t, "Unterminated string escape sequence")
+            break
+        let esc: char = s[i]
+        if esc == 'n':
+            *int8*(ptr_add(out, outLen)) = 10
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        if esc == 'r':
+            *int8*(ptr_add(out, outLen)) = 13
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        if esc == 't':
+            *int8*(ptr_add(out, outLen)) = 9
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        if esc == '0':
+            *int8*(ptr_add(out, outLen)) = 0
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        if esc == '\\':
+            *int8*(ptr_add(out, outLen)) = 92
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        if esc == '"':
+            *int8*(ptr_add(out, outLen)) = 34
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        if esc == 39:
+            *int8*(ptr_add(out, outLen)) = 39
+            outLen = outLen + 1
+            i = i + 1
+            continue
+        if esc == 'x':
+            if i + 2 >= len s:
+                addParseDiag(p, t, "String escape \\x requires two hex digits")
+                i = i + 1
+                continue
+            let a: int32 = hexDigitVal s[i + 1]
+            let b: int32 = hexDigitVal s[i + 2]
+            if a < 0 || b < 0:
+                addParseDiag(p, t, "String escape \\x requires two hex digits")
+                i = i + 1
+                continue
+            let v: int32 =(a * 16) + b
+            *int8*(ptr_add(out, outLen)) = int8(v)
+            outLen = outLen + 1
+            i = i + 3
+            continue
+        addParseDiag(p, t, "Invalid string escape: \\" + charToStr esc)
+        *int8*(ptr_add(out, outLen)) = int8(esc)
+        outLen = outLen + 1
+        i = i + 1
+    *int8*(ptr_add(out, outLen)) = 0
+    return str(out)
+
+fn decodeCharLit(p: ParserStateObj*, t: Token): str =
+    let s: str = t.lexeme
+    if len s == 1:
+        return s
+    if len s == 2 && s[0] == '\\':
+        let esc: char = s[1]
+        if esc == 'n': return charToStr char(int8(10))
+        if esc == 'r': return charToStr char(int8(13))
+        if esc == 't': return charToStr char(int8(9))
+        if esc == '0': return charToStr char(int8(0))
+        if esc == '\\': return charToStr char(int8(92))
+        if esc == '"': return charToStr char(int8(34))
+        if esc == 39: return charToStr char(int8(39))
+        addParseDiag(p, t, "Invalid character escape")
+        return charToStr esc
+    if len s == 4 && s[0] == '\\' && s[1] == 'x':
+        let a: int32 = hexDigitVal s[2]
+        let b: int32 = hexDigitVal s[3]
+        if a >= 0 && b >= 0:
+            return charToStr char(int8(a * 16 + b))
+    addParseDiag(p, t, "Invalid character literal")
+    return ""
+
+fn stripUnderscore(s: str): str =
+    var out: str = ""
+    let n: int32 = len s
+    for i in 0..<n:
+        let c: char = s[i]
+        if c != '_':
+            out = out + charToStr c
+    return out
+
+fn parser_splitFile(path: str): SplitFileResult =
+    var res: SplitFileResult
+    if path == nil || len path == 0:
+        return res
+    var lastSep: int32 = -1
+    let __for_start_i = len path - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        let c: char = path[i]
+        if c == '/' || c == chr 92:
+            lastSep = i
+            break
+    var name: str = ""
+    if lastSep >= 0:
+        if lastSep == 0:
+            res.dir = sliceRange(path, 0, 0)
+        else:
+            res.dir = sliceRange(path, 0, lastSep - 1)
+        if lastSep + 1 < len path:
+            name = sliceRange(path, lastSep + 1, len path - 1)
+    else:
+        res.dir = ""
+        name = path
+    res.name = name
+    var lastDot: int32 = -1
+    let __for_start_i2 = len name - 1
+    for __for_rev_i2 in 0..(__for_start_i2 - (0)):
+        let i = __for_start_i2 - __for_rev_i2
+        if name[i] == '.':
+            lastDot = i
+            break
+    if lastDot > 0:
+        res.ext = sliceRange(name, lastDot, len name - 1)
+        res.name = sliceRange(name, 0, lastDot - 1)
+    else:
+        res.ext = ""
+    return res
+
+fn stripSpaces(s: str): str =
+    if s == nil:
+        return ""
+    var a: int32 = 0
+    var b: int32 = len s - 1
+    for _ in a..<(b + 1):
+        if a > b || s[a] != ' ':
+            break
+        a = a + 1
+    for _ in a..<(b + 1):
+        if b < a || s[b] != ' ':
+            break
+        b = b - 1
+    if b < a:
+        return ""
+    return sliceRangeLex(s, a, b)
+
+fn parseIntLiteral(s0: str): int64 =
+    let s: str = stripUnderscore s0
+    let sLen: int32 = len s
+    if sLen == 0:
+        return 0
+    var base: int32 = 10
+    var start: int32 = 0
+    if sLen >= 2 && s[0] == '0':
+        let c1: char = s[1]
+        if c1 == 'x' || c1 == 'X':
+            base = 16
+            start = 2
+        elif c1 == 'b' || c1 == 'B':
+            base = 2
+            start = 2
+        elif c1 == 'o' || c1 == 'O':
+            base = 8
+            start = 2
+    var neg: bool = false
+    var i: int32 = start
+    if i < sLen && s[i] == '-':
+        neg = true
+        i = i + 1
+    var v: int64 = 0
+    for __for_guard_i in 0..<sLen:
+        if !(i < sLen):
+            break
+        let c: char = s[i]
+        var d: int32 = -1
+        if c >= '0' && c <= '9': d = int32(c) - int32('0')
+        elif c >= 'a' && c <= 'f': d = 10 +(int32(c) - int32('a'))
+        elif c >= 'A' && c <= 'F': d = 10 +(int32(c) - int32('A'))
+        if d < 0 || d >= base:
+            break
+        v = v * int64(base) + int64(d)
+        i = i + 1
+    if neg:
+        return 0 - v
+    return v
+
+# ---- Forward decls ----
+fn parseExpression(p: ParserStateObj*, minPrec: int32): Node
+fn parseSuite(p: ParserStateObj*): Node
+fn parseTypeExpr(p: ParserStateObj*): Node
+fn parseTypeBracketArg(p: ParserStateObj*): Node
+fn parseStatement(p: ParserStateObj*): Node
+fn parseLambda(p: ParserStateObj*, kw: str): Node
+
+# ---- Parsing atoms/expressions ----
+fn parseIdent(p: ParserStateObj*, allowExport: bool): Node =
+    let t: Token = current p
+    if t.kind == tkIdent || t.kind == tkKeyword:
+        advance p
+        var n: Node = makeIdent(t.lexeme, posFrom(t))
+        if allowExport && curKind(p) == tkSymbol &&(curLexeme(p) ==  "*"):
+            addParseDiag(p, current p, "Export '*' is removed; use an uppercase initial")
+            advance p
+        return n
+    addParseDiag(p, t, "Expected identifier")
+    advance p
+    return makeIdent("", posFrom(t))
+
+fn parseTypeParams(p: ParserStateObj*): Node =
+    if ! matchSymbol(p, "["):
+        return emptyNode(posFrom(current(p)))
+    var params: Node = newNode(nkGenericParams, posFrom(current(p)))
+    while true:
+        if matchSymbol(p, "]"):
+            break
+        let name: Node = parseIdent(p, true)
+        var constraint: Node = emptyNode name.pos
+        var defaultVal: Node = emptyNode name.pos
+        if matchSymbol(p, ":"):
+            constraint = parseTypeExpr p
+        if matchSymbol(p, "="):
+            defaultVal = parseTypeExpr p
+        var defn: Node = newNode(nkIdentDefs, name.pos)
+        addSon(defn, name)
+        addSon(defn, constraint)
+        addSon(defn, defaultVal)
+        addSon(params, defn)
+        if matchSymbol(p, ",") || matchSymbol(p, ";"):
+            continue
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
+            continue
+        addParseDiag(p, current p, "Expected ',' or ']'")
+        break
+    return params
+
+fn parseAnnotations(p: ParserStateObj*): Node[] =
+    var out: Node[] = []
+    out.cap = 4
+    while matchSymbol(p, "@"):
+        let pos: SourcePos = posFrom(current(p))
+        let name: Node = parseIdent(p, false)
+        var ann: Node = newNode(nkAnnotation, pos)
+        addSon(ann, name)
+        if matchSymbol(p, "("):
+            while ! matchSymbol(p, ")"):
+                let arg: Node = parseExpression(p, PrecNone)
+                addSon(ann, arg)
+                if matchSymbol(p, ","):
+                    continue
+                if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
+                    continue
+                break
+        add(out, ann)
+        skipNewlines p
+    return out
+
+fn parseInlineAnnotations(p: ParserStateObj*): Node[] =
+    var out: Node[] = []
+    out.cap = 2
+    while matchSymbol(p, "@"):
+        let pos: SourcePos = posFrom(current(p))
+        let name: Node = parseIdent(p, false)
+        var ann: Node = newNode(nkAnnotation, pos)
+        addSon(ann, name)
+        if matchSymbol(p, "("):
+            while ! matchSymbol(p, ")"):
+                let arg: Node = parseExpression(p, PrecNone)
+                addSon(ann, arg)
+                if matchSymbol(p, ","):
+                    continue
+                if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
+                    continue
+                break
+        add(out, ann)
+    return out
+
+fn parseStringLit(p: ParserStateObj*): Node =
+    let t: Token = current p
+    advance p
+    let s: str = decodeStringLit(p, t)
+    return newStrLit(s, posFrom(t))
+
+fn parseCharLit(p: ParserStateObj*): Node =
+    let t: Token = current p
+    advance p
+    let s: str = decodeCharLit(p, t)
+    var n: Node = newNode(nkCharLit, posFrom(t))
+    nodeSetStrVal(n, s)
+    return n
+
+fn parseNumberLit(p: ParserStateObj*): Node =
+    let t: Token = current p
+    advance p
+    var hasDot: bool = false
+    let lexLen: int32 = len t.lexeme
+    for i in 0..<lexLen:
+        if t.lexeme[i] == '.':
+            hasDot = true
+            break
+    if hasDot:
+        var n: Node = newNode(nkFloatLit, posFrom(t))
+        nodeSetStrVal(n, stripUnderscore t.lexeme)
+        return n
+    var n2: Node = newNode(nkIntLit, posFrom(t))
+    n2.intVal = parseIntLiteral t.lexeme
+    return n2
+
+fn parseIfExprBranch(p: ParserStateObj*): Node =
+    if curKind(p) == tkNewline:
+        return parseSuite p
+    let expr: Node = parseExpression(p, PrecNone)
+    var sl: Node = newNode(nkStmtList, expr.pos)
+    addSon(sl, expr)
+    return sl
+
+fn parseListLitOrCompAfterOpenBracket(p: ParserStateObj*, startTok: Token): Node =
+    # Parses:
+    # - list literal:        `[a, b, c]`  -> nkSeqLit
+    # - list comprehension:  `[expr for pat in iter [if cond]]` -> nkComprehension
+    # Assumes `[` is already consumed.
+    var seqn: Node = newNode(nkSeqLit, posFrom(startTok))
+    if matchSymbol(p, "]"):
+        return seqn
+
+    let first: Node = parseExpression(p, PrecNone)
+    if matchKeyword(p, "for"):
+        let firstPat: Node = parsePattern p
+        var pat: Node = firstPat
+        if matchSymbol(p, ","):
+            var tup: Node = newNode(nkTupleLit, posFrom startTok)
+            addSon(tup, firstPat)
+            while true:
+                let morePat: Node = parsePattern p
+                addSon(tup, morePat)
+                if ! matchSymbol(p, ","):
+                    break
+            pat = tup
+        if ! matchKeyword(p, "in"):
+            addParseDiag(p, current p, "Expected 'in'")
+        let iterExpr: Node = parseExpression(p, PrecNone)
+        var condExpr: Node = emptyNode(posFrom(current(p)))
+        if matchKeyword(p, "if"):
+            condExpr = parseExpression(p, PrecNone)
+        if matchSymbol(p, ","):
+            addParseDiag(p, current p, "List comprehension cannot contain ','; use '[a, b]' for list literal")
+            while !(curKind(p) == tkSymbol && (curLexeme(p) == "]")) && curKind(p) != tkEof:
+                advance p
+        expectSymbol(p, "]", "Expected ']'")
+        var cn: Node = newNode(nkComprehension, posFrom startTok)
+        addSon(cn, pat)
+        addSon(cn, iterExpr)
+        addSon(cn, condExpr)
+        addSon(cn, first)
+        return cn
+
+    addSon(seqn, first)
+    while matchSymbol(p, ","):
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
+            break
+        let e0: Node = parseExpression(p, PrecNone)
+        addSon(seqn, e0)
+    expectSymbol(p, "]", "Expected ']'")
+    return seqn
+
+fn parseAtom(p: ParserStateObj*): Node =
+    let t: Token = current p
+    if t.kind == tkKeyword &&((t.lexeme ==  "fn") ||(t.lexeme ==  "iterator")):
+        return parseLambda(p, t.lexeme)
+    if t.kind == tkIdent || t.kind == tkKeyword:
+        if (t.lexeme ==  "if"):
+            advance p
+            let cond: Node = parseExpression(p, PrecNone)
+            expectSymbol(p, ":", "Expected ':'")
+            let thenPart: Node = parseIfExprBranch p
+            var ifn: Node = newNode(nkIf, posFrom(t))
+            addSon(ifn, cond)
+            addSon(ifn, thenPart)
+            skipNewlines p
+            while matchKeyword(p, "elif"):
+                let c: Node = parseExpression(p, PrecNone)
+                expectSymbol(p, ":", "Expected ':'")
+                let b: Node = parseIfExprBranch p
+                addSon(ifn, c)
+                addSon(ifn, b)
+                skipNewlines p
+            if matchKeyword(p, "else"):
+                expectSymbol(p, ":", "Expected ':'")
+                let eb: Node = parseIfExprBranch p
+                addSon(ifn, eb)
+            return ifn
+        if (t.lexeme ==  "when"):
+            advance p
+            let cond2: Node = parseExpression(p, PrecNone)
+            expectSymbol(p, ":", "Expected ':'")
+            let thenPart2: Node = parseIfExprBranch p
+            var wn: Node = newNode(nkWhen, posFrom(t))
+            addSon(wn, cond2)
+            addSon(wn, thenPart2)
+            skipNewlines p
+            while matchKeyword(p, "elif"):
+                let c2: Node = parseExpression(p, PrecNone)
+                expectSymbol(p, ":", "Expected ':'")
+                let b2: Node = parseIfExprBranch p
+                addSon(wn, c2)
+                addSon(wn, b2)
+                skipNewlines p
+            if matchKeyword(p, "else"):
+                expectSymbol(p, ":", "Expected ':'")
+                let eb2: Node = parseIfExprBranch p
+                addSon(wn, eb2)
+            return wn
+        if (t.lexeme ==  "case"):
+            return parseCase p
+        if (t.lexeme ==  "for"):
+            advance p
+            let pat: Node = parsePattern p
+            if ! matchKeyword(p, "in"):
+                addParseDiag(p, current p, "Expected 'in'")
+            let iterExpr: Node = parseExpression(p, PrecNone)
+            expectSymbol(p, ":", "Expected ':'")
+            let bodyExpr: Node = parseExpression(p, PrecNone)
+            var cn: Node = newNode(nkComprehension, posFrom(t))
+            addSon(cn, pat)
+            addSon(cn, iterExpr)
+            addSon(cn, emptyNode(posFrom(current(p))))
+            addSon(cn, bodyExpr)
+            return cn
+        if (t.lexeme ==  "true"):
+            advance p
+            var b: Node = newNode(nkBoolLit, posFrom(t))
+            nodeSetIdent(b, " true ")
+            return b
+        if (t.lexeme ==  "false"):
+            advance p
+            var b2: Node = newNode(nkBoolLit, posFrom(t))
+            nodeSetIdent(b2, " false ")
+            return b2
+        if (t.lexeme ==  "nil"):
+            advance p
+            return newNilLit(posFrom(t))
+        return parseIdent(p, false)
+    if t.kind == tkNumber:
+        return parseNumberLit p
+    if t.kind == tkString:
+        return parseStringLit p
+    if t.kind == tkChar:
+        return parseCharLit p
+    if t.kind == tkSymbol &&(t.lexeme ==  "@"):
+        # `@[...]` seq literal is removed; keep parse recovery for better diagnostics.
+        let atTok: Token = t
+        advance p
+        let brTok: Token = current p
+        if brTok.kind == tkSymbol &&(brTok.lexeme ==  "["):
+            advance p
+            addParseDiag(p, atTok, "Seq literal '@[ ... ]' is removed; use '[ ... ]'")
+            return parseListLitOrCompAfterOpenBracket(p, brTok)
+        addParseDiag(p, atTok, "Unexpected token")
+        return newNode(nkError, posFrom(atTok))
+    if t.kind == tkSymbol &&(t.lexeme ==  "("):
+        advance p
+        if matchSymbol(p, ")"):
+            return newNode(nkPar, posFrom(t))
+        var first: Node = parseCallArg p
+        var elems: Node[] = []
+        elems.cap = 4
+        add(elems, first)
+        var isTuple: bool = false
+        if first != nil && first.kind == nkCallArg:
+            isTuple = true
+        if matchSymbol(p, ","):
+            isTuple = true
+            if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  ")")):
+                while true:
+                    let e: Node = parseCallArg p
+                    add(elems, e)
+                    if ! matchSymbol(p, ","):
+                        break
+                    if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
+                        break
+            expectSymbol(p, ")", "Expected ')'")
+            if isTuple:
+                var tup: Node = newNode(nkTupleLit, posFrom(t))
+                for i2 in 0..<elems.len:
+                    addSon(tup, elems[i2])
+                return tup
+            var par0: Node = newNode(nkPar, posFrom(t))
+            addSon(par0, first)
+            return par0
+        expectSymbol(p, ")", "Expected ')'")
+        if isTuple:
+            var tup2: Node = newNode(nkTupleLit, posFrom(t))
+            for j2 in 0..<elems.len:
+                addSon(tup2, elems[j2])
+            return tup2
+        var par: Node = newNode(nkPar, posFrom(t))
+        addSon(par, first)
+        return par
+    if t.kind == tkSymbol &&(t.lexeme ==  "["):
+        advance p
+        return parseListLitOrCompAfterOpenBracket(p, t)
+    if t.kind == tkSymbol &&(t.lexeme ==  "{"):
+        advance p
+        var elems3: Node[] = []
+        elems3.cap = 4
+        if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  "}")):
+            while true:
+                let e3: Node = parseExpression(p, PrecNone)
+                add(elems3, e3)
+                if ! matchSymbol(p, ","):
+                    break
+        expectSymbol(p, "}", "Expected '}'")
+        var cur: Node = newNode(nkCurly, posFrom(t))
+        for i4 in 0..<elems3.len:
+            addSon(cur, elems3[i4])
+        return cur
+    addParseDiag(p, t, "Unexpected token")
+    advance p
+    return newNode(nkError, posFrom(t))
+
+fn parseCStyleCast(p: ParserStateObj*): Node =
+    let t0: Token = current p
+    if t0.kind != tkSymbol || !(t0.lexeme ==  "("):
+        return nil
+    let t1: Token = peek(p, 1)
+    if ! isLikelyTypeTokenStart t1:
+        return nil
+    let idx0: int32 = p->idx
+    let diags0: Diagnostic[]* = p->diags
+    var diagLen0: int32 = 0
+    if diags0 != nil:
+        diagLen0 = diags0->len
+    advance p
+    let typeNode: Node = parseTypeExpr p
+    if typeNode != nil && matchSymbol(p, ")"):
+        if ! isLikelyTypeExpr typeNode:
+            p->idx = idx0
+            if diags0 != nil:
+                diags0->len = diagLen0
+            return nil
+        let after: Token = current p
+        let castPos: SourcePos = posFrom(t0)
+        if isCStyleCastFollowToken after:
+            if after.kind == tkSymbol &&(after.lexeme ==  "("):
+                advance p
+                let expr: Node = parseExpression(p, PrecNone)
+                expectSymbol(p, ")", "Expected ')'")
+                addParseDiag(p, t0, "C-style cast is removed; use T(x)")
+                return newNode(nkError, castPos)
+            let expr2: Node = parseExpression(p, PrecPrefix)
+            addParseDiag(p, t0, "C-style cast is removed; use T(x)")
+            return newNode(nkError, castPos)
+    p->idx = idx0
+    if diags0 != nil:
+        diags0->len = diagLen0
+    return nil
+
+fn isCStyleCastFollowToken(t: Token): bool =
+    if isLineEnd t.kind:
+        return false
+    if t.kind == tkNumber || t.kind == tkString || t.kind == tkChar || t.kind == tkIdent:
+        return true
+    if t.kind == tkKeyword:
+        if (t.lexeme ==  "true") || (t.lexeme ==  "false") || (t.lexeme ==  "nil"):
+            return true
+        if (t.lexeme ==  "fn") ||(t.lexeme ==  "iterator"):
+            return true
+        if (t.lexeme ==  "await"):
+            return true
+        if (t.lexeme ==  "ref") ||(t.lexeme ==  "var"):
+            return true
+        return false
+    if t.kind == tkSymbol:
+        if (t.lexeme ==  "(") ||(t.lexeme ==  "[") ||(t.lexeme ==  "{") ||(t.lexeme ==  "@"):
+            return true
+        if (t.lexeme ==  "+") ||(t.lexeme ==  "-") ||(t.lexeme ==  "!") ||(t.lexeme ==  "~") ||(t.lexeme ==  "*") ||(t.lexeme ==  "&"):
+            return true
+        return false
+    return false
+
+fn isLikelyTypeIdent(name: str): bool =
+    if name == nil || len name == 0:
+        return false
+    let nameLen: int32 = len name
+    if parser_isBuiltinTypeName name:
+        return true
+    let c0: char = name[0]
+    if c0 >= 'A' && c0 <= 'Z':
+        return true
+    for i in 1..<nameLen:
+        let prev: char = name[i - 1]
+        let c: char = name[i]
+        if prev == '_' && c >= 'A' && c <= 'Z':
+            return true
+    return false
+
+fn isLikelyTypeExpr(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkRefTy || n.kind == nkPtrTy || n.kind == nkVarTy || n.kind == nkTupleTy ||
+       n.kind == nkSetTy || n.kind == nkFnTy:
+        return true
+    if n.kind == nkBracketExpr:
+        if kidCount n > 0:
+            return isLikelyTypeExpr(kid(n, 0))
+        return false
+    if n.kind == nkDotExpr:
+        if kidCount n > 1:
+            let member: Node = kid(n, 1)
+            if member != nil && (member.kind == nkIdent || member.kind == nkSymbol):
+                return isLikelyTypeIdent(stripSpaces(member.ident))
+        return false
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        return isLikelyTypeIdent nm
+    return false
+
+fn isDefiniteTypeExpr(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkRefTy || n.kind == nkPtrTy || n.kind == nkVarTy || n.kind == nkTupleTy ||
+       n.kind == nkSetTy || n.kind == nkFnTy:
+        return true
+    if n.kind == nkBracketExpr:
+        if kidCount n == 0:
+            return false
+        let base: Node = kid(n, 0)
+        if base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
+            let nm: str = stripSpaces(plainName(base))
+            return parser_isBuiltinTypeName nm
+        return false
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm2: str = stripSpaces(plainName(n))
+        return parser_isBuiltinTypeName nm2
+    if n.kind == nkPar:
+        if kidCount n == 1:
+            return isDefiniteTypeExpr kid(n, 0)
+        return false
+    return false
+
+fn isLikelyTypeTokenStart(t: Token): bool =
+    if t.kind == tkKeyword:
+        return isTypeKeywordName t.lexeme
+    if t.kind == tkIdent:
+        return isLikelyTypeIdent t.lexeme
+    return false
+
+fn parseTypeCallCallee(p: ParserStateObj*): Node =
+    let idx0: int32 = p->idx
+    let diags0: Diagnostic[]* = p->diags
+    var diagLen0: int32 = 0
+    if diags0 != nil:
+        diagLen0 = diags0->len
+    if ! isLikelyTypeTokenStart(current(p)):
+        return nil
+    let typeNode: Node = parseTypeExpr p
+    if typeNode != nil && typeNode.kind == nkError:
+        p->idx = idx0
+        if diags0 != nil:
+            diags0->len = diagLen0
+        return nil
+    if typeNode != nil:
+        let t: Token = current p
+        if t.kind == tkSymbol &&(t.lexeme ==  "("):
+            if typeNode.kind == nkIdent || typeNode.kind == nkSymbol:
+                let nm: str = stripSpaces typeNode.ident
+                if isOperatorName nm:
+                    p->idx = idx0
+                    if diags0 != nil:
+                        diags0->len = diagLen0
+                    return nil
+            return typeNode
+    p->idx = idx0
+    if diags0 != nil:
+        diags0->len = diagLen0
+    return nil
+
+fn parseTypeSpaceCallee(p: ParserStateObj*): Node =
+    let idx0: int32 = p->idx
+    let diags0: Diagnostic[]* = p->diags
+    var diagLen0: int32 = 0
+    if diags0 != nil:
+        diagLen0 = diags0->len
+    if ! isLikelyTypeTokenStart(current(p)):
+        return nil
+    let typeNode: Node = parseTypeExpr p
+    if typeNode != nil && typeNode.kind == nkError:
+        p->idx = idx0
+        if diags0 != nil:
+            diags0->len = diagLen0
+        return nil
+    if typeNode != nil:
+        if isSpaceCallArgStart p && spaceCallSameLine p:
+            return typeNode
+    p->idx = idx0
+    if diags0 != nil:
+        diags0->len = diagLen0
+    return nil
+
+fn maybeParseTypePtrBase(p: ParserStateObj*, base: Node): Node =
+    if base == nil:
+        return base
+    if ! isLikelyTypeExpr base:
+        return base
+    var offset: int32 = 0
+    while true:
+        let tok: Token = peek(p, offset)
+        if tok.kind != tkSymbol || !(tok.lexeme == "*"):
+            break
+        offset = offset + 1
+    if offset == 0:
+        return base
+    let after: Token = peek(p, offset)
+    if after.kind != tkSymbol || !(after.lexeme == "("):
+        return base
+    for i in 0..<offset:
+        let star: Token = current p
+        var pt: Node = newNode(nkPtrTy, posFrom(star))
+        addSon(pt, base)
+        base = pt
+        advance p
+    return base
+
+fn parsePrefix(p: ParserStateObj*): Node =
+    let castNode: Node = parseCStyleCast p
+    if castNode != nil:
+        return castNode
+    let t0: Token = current p
+    if t0.kind == tkKeyword &&((t0.lexeme ==  "fn") ||(t0.lexeme ==  "iterator")):
+        return parseLambda(p, t0.lexeme)
+    let typeCallee: Node = parseTypeCallCallee p
+    if typeCallee != nil:
+        return typeCallee
+    let typeSpace: Node = parseTypeSpaceCallee p
+    if typeSpace != nil:
+        return typeSpace
+    let t: Token = current p
+    if t.kind == tkSymbol &&(t.lexeme ==  "*"):
+        advance p
+        let rhs0: Node = parseExpression(p, PrecPrefix)
+        var br: Node = newNode(nkBracketExpr, posFrom(t))
+        addSon(br, rhs0)
+        return br
+    if t.kind == tkSymbol &&(t.lexeme ==  "&"):
+        advance p
+        let rhs1: Node = parseExpression(p, PrecPrefix)
+        var call0: Node = newNode(nkCall, posFrom(t))
+        addSon(call0, makeIdent("__addr", posFrom(t)))
+        addSon(call0, rhs1)
+        return call0
+    if t.kind == tkSymbol &&((t.lexeme ==  "+") ||(t.lexeme ==  "-") ||(t.lexeme ==  "++") ||(t.lexeme ==  "--") ||(t.lexeme ==  "!") ||(t.lexeme ==  "~") ||(t.lexeme ==  "$") ||(t.lexeme ==  "^") ||(t.lexeme ==  "%")):
+        advance p
+        let op: Node = makeIdent(t.lexeme, posFrom(t))
+        let rhs: Node = parseExpression(p, PrecPrefix)
+        var n: Node = newNode(nkPrefix, posFrom(t))
+        nodeSetIdent(n, t.lexeme)
+        addSon(n, op)
+        addSon(n, rhs)
+        return n
+    if t.kind == tkKeyword &&(t.lexeme ==  "await"):
+        advance p
+        let op2: Node = makeIdent(t.lexeme, posFrom(t))
+        let rhs2: Node = parseExpression(p, PrecPrefix)
+        var n2: Node = newNode(nkPrefix, posFrom(t))
+        nodeSetIdent(n2, t.lexeme)
+        addSon(n2, op2)
+        addSon(n2, rhs2)
+        return n2
+    if t.kind == tkKeyword &&(t.lexeme ==  "ref"):
+        advance p
+        let base2: Node = parseExpression(p, PrecPrefix)
+        var n4: Node = newNode(nkRefTy, posFrom(t))
+        addSon(n4, base2)
+        return n4
+    if t.kind == tkKeyword &&(t.lexeme ==  "var"):
+        advance p
+        let base3: Node = parseExpression(p, PrecPrefix)
+        var n5: Node = newNode(nkVarTy, posFrom(t))
+        addSon(n5, base3)
+        return n5
+    let base: Node = parseAtom p
+    return maybeParseTypePtrBase(p, base)
+
+fn parseCallArg(p: ParserStateObj*): Node =
+    let t0: Token = current p
+    let t1: Token = peek(p, 1)
+    if (t0.kind == tkIdent || t0.kind == tkKeyword) && t1.kind == tkSymbol &&((t1.lexeme ==  ":") ||(t1.lexeme ==  "=")):
+        let name: Node = parseIdent(p, false)
+        if matchSymbol(p, ":") || matchSymbol(p, "="):
+            let val: Node = parseExpression(p, PrecNone)
+            var ca: Node = newNode(nkCallArg, name.pos)
+            addSon(ca, name)
+            addSon(ca, val)
+            return ca
+    return parseExpression(p, PrecNone)
+
+fn parsePostfix(p: ParserStateObj*, lhs: Node): Node =
+    var node: Node = lhs
+    while true:
+        let t: Token = current p
+        if t.kind == tkSymbol &&(t.lexeme ==  "."):
+            if node != nil && node.kind == nkBracketExpr && kidCount node == 1:
+                addParseDiag(p, t, rawPointerForbidMessage("Pointer member access is forbidden in no-pointer mode"))
+            advance p
+            let member: Node = parseIdent(p, false)
+            var dn: Node = newNode(nkDotExpr, posFrom(t))
+            addSon(dn, node)
+            addSon(dn, member)
+            node = dn
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  "->"):
+            advance p
+            let member2: Node = parseIdent(p, false)
+            var dr: Node = newNode(nkHiddenDeref, posFrom(t))
+            addSon(dr, node)
+            var dn2: Node = newNode(nkDotExpr, posFrom(t))
+            addSon(dn2, dr)
+            addSon(dn2, member2)
+            node = dn2
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  "("):
+            if ! tokenAttached p:
+                break
+            let isDiscard: bool = node != nil && node.kind == nkIdent && plainName node == "discard"
+            advance p
+            var args: Node[] = []
+            args.cap = 2
+            if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  ")")):
+                while true:
+                    let arg: Node = parseCallArg p
+                    add(args, arg)
+                    if ! matchSymbol(p, ","):
+                        break
+            expectSymbol(p, ")", "Expected ')'")
+            if args.len == 0 && isDefiniteTypeExpr node:
+                addParseDiag(p, t, "TypeExpr() is removed; use implicit default initialization or an explicit value")
+            if isDiscard:
+                addDiag(p->diags, svError, p->filename, node.pos.line, node.pos.col,
+                        "discard syntax is removed; use a plain expression statement")
+                if args.len > 0:
+                    node = args[0]
+                else:
+                    node = newNode(nkEmpty, posFrom(t))
+            else:
+                var call: Node = newNode(nkCall, posFrom(t))
+                call.callStyle = CallStyleParen
+                addSon(call, node)
+                for ai in 0..<args.len:
+                    addSon(call, args[ai])
+                node = call
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  "["):
+            advance p
+            var br: Node = newNode(nkBracketExpr, posFrom(t))
+            addSon(br, node)
+            if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
+                # In expression context, `p[]` used to be a pointer deref and is removed.
+                # However, type args in generic calls are parsed as expressions too, so allow
+                # `T[]` there when the lhs is a type-like expression.
+                if isLikelyTypeExpr node:
+                    advance p
+                    node = br
+                    continue
+                addParseDiag(p, current p, rawPointerForbidMessage("Empty subscript dereference is not supported in no-pointer mode"))
+                advance p
+                node = newNode(nkError, posFrom(t))
+                continue
+            if ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  "]")):
+                while true:
+                    let arg2: Node = parseCallArg p
+                    addSon(br, arg2)
+                    if matchSymbol(p, ","):
+                        continue
+                    break
+            expectSymbol(p, "]", "Expected ']'")
+            node = br
+            continue
+        if t.kind == tkSymbol &&((t.lexeme ==  "++") ||(t.lexeme ==  "--")):
+            if ! tokenAttached p:
+                break
+            advance p
+            var pn2: Node = newNode(nkPostfix, posFrom(t))
+            addSon(pn2, makeIdent(t.lexeme, posFrom(t)))
+            addSon(pn2, node)
+            node = pn2
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  "?") && ! isTernaryQuestion p:
+            advance p
+            var pn: Node = newNode(nkPostfix, posFrom(t))
+            addSon(pn, makeIdent("?", posFrom(t)))
+            addSon(pn, node)
+            node = pn
+            continue
+        break
+    return node
+
+fn parseTypePostfix(p: ParserStateObj*, lhs: Node): Node =
+    var node: Node = lhs
+    while true:
+        let t: Token = current p
+        if t.kind == tkSymbol &&(t.lexeme ==  "*"):
+            advance p
+            var pt: Node = newNode(nkPtrTy, posFrom(t))
+            addSon(pt, node)
+            node = pt
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  "."):
+            advance p
+            let member: Node = parseIdent(p, false)
+            var dn: Node = newNode(nkDotExpr, posFrom(t))
+            addSon(dn, node)
+            addSon(dn, member)
+            node = dn
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  "["):
+            advance p
+            var br: Node = newNode(nkBracketExpr, posFrom(t))
+            addSon(br, node)
+            if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
+                advance p
+                node = br
+                continue
+            while true:
+                # Allow expressions in type brackets so `T[n + 4]` can be parsed
+                # without requiring parentheses.
+                let arg: Node = parseTypeBracketArg p
+                addSon(br, arg)
+                if matchSymbol(p, ",") || matchSymbol(p, ";"):
+                    continue
+                break
+            expectSymbol(p, "]", "Expected ']'")
+            node = br
+            continue
+        if t.kind == tkSymbol &&(t.lexeme ==  "?"):
+            advance p
+            var pn: Node = newNode(nkPostfix, posFrom(t))
+            addSon(pn, makeIdent("?", posFrom(t)))
+            addSon(pn, node)
+            node = pn
+            continue
+        break
+    return node
+
+fn parseTypeBracketArg(p: ParserStateObj*): Node =
+    # Type brackets are used for:
+    # - Generic instantiation: `Foo[T]`, `Bar[T, U]`
+    # - Container sugar: `T[]`, `T[N]` (N is an int expression)
+    #
+    # Keep special type keywords parsed by the type grammar so function/tuple/set
+    # type nodes are produced. Otherwise, use the expression parser to accept
+    # infix operators inside `[...]` (e.g. `T[n + 4]`).
+    let t: Token = current p
+    if t.kind == tkKeyword &&
+       ((t.lexeme ==  "fn") ||(t.lexeme ==  "tuple") ||(t.lexeme ==  "set") ||(t.lexeme ==  "enum") ||
+        (t.lexeme ==  "ref") ||(t.lexeme ==  "var")):
+        return parseTypeExpr p
+    return parseExpression(p, PrecNone)
+
+fn parseSpaceAtom(p: ParserStateObj*): Node =
+    let typeCallee: Node = parseTypeCallCallee p
+    if typeCallee != nil:
+        return parsePostfix(p, typeCallee)
+    return parsePostfix(p, parseAtom p)
+
+fn maybeParseSpaceTypePtrCall(p: ParserStateObj*, arg: Node): Node =
+    if arg == nil:
+        return arg
+    if arg.kind != nkIdent && arg.kind != nkSymbol:
+        return arg
+    let nm: str = stripSpaces(plainName(arg))
+    if ! isLikelyTypeIdent nm:
+        return arg
+    var offset: int32 = 0
+    while true:
+        let tok: Token = peek(p, offset)
+        if tok.kind != tkSymbol || !(tok.lexeme == "*"):
+            break
+        offset = offset + 1
+    if offset == 0:
+        return arg
+    let after: Token = peek(p, offset)
+    if after.kind != tkSymbol || !(after.lexeme == "("):
+        return arg
+    var base: Node = arg
+    for i in 0..<offset:
+        let star: Token = peek(p, i)
+        var pt: Node = newNode(nkPtrTy, posFrom(star))
+        addSon(pt, base)
+        base = pt
+    i = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<offset:
+        i = __for_i_1
+        advance p
+        i = i + 1
+    return parsePostfix(p, base)
+
+fn chainSpaceCallArgs(p: ParserStateObj*, arg: Node): Node =
+    var out: Node = arg
+    while out != nil && isSpaceCallArgStart p && spaceCallSameLine p:
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  "("):
+            addParseDiag(p, current p,
+                         "Space call does not allow parenthesized argument; use 'f x' or 'f(x)' for one argument, and 'f(x, y)' for multiple arguments")
+        var nested: Node = newNode(nkCall, out.pos)
+        addSon(nested, out)
+        let nextArg: Node = parseSpaceAtom p
+        addSon(nested, nextArg)
+        nested.callStyle = CallStyleSpace
+        out = nested
+    return out
+
+fn parseExpression(p: ParserStateObj*, minPrec: int32): Node =
+    var lhs: Node = parsePostfix(p, parsePrefix p)
+    lhs = maybeParseTypePtrBase(p, lhs)
+    if lhs != nil:
+        lhs = parsePostfix(p, lhs)
+    if lhs != nil && isSpaceCallArgStartFor(p, lhs) && spaceCallSameLine p:
+        if isDefiniteTypeExpr lhs:
+            addParseDiag(p, current p, "Type conversion does not allow space call; use T(x)")
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  "("):
+            addParseDiag(p, current p,
+                         "Space call does not allow parenthesized argument; use 'f x' or 'f(x)' for one argument, and 'f(x, y)' for multiple arguments")
+            if isDefiniteTypeExpr lhs:
+                addParseDiag(p, current p, "Type conversions require parentheses; use T(x)")
+        if lhs.kind == nkIdent && plainName lhs == "discard":
+            addDiag(p->diags, svError, p->filename, lhs.pos.line, lhs.pos.col,
+                    "discard syntax is removed; use a plain expression statement")
+            let arg: Node = parseSpaceAtom p
+            arg = maybeParseSpaceTypePtrCall(p, arg)
+            if arg != nil:
+                if isSpaceCallArgStart p && spaceCallSameLine p:
+                    addParseDiag(p, current p, "Space call allows only one argument; wrap inner call in parentheses")
+                    lhs = chainSpaceCallArgs(p, arg)
+                else:
+                    lhs = arg
+        else:
+            var call: Node = newNode(nkCall, lhs.pos)
+            addSon(call, lhs)
+            let arg: Node = parseSpaceAtom p
+            arg = maybeParseSpaceTypePtrCall(p, arg)
+            if arg != nil:
+                if isSpaceCallArgStart p && spaceCallSameLine p:
+                    addParseDiag(p, current p, "Space call allows only one argument; wrap inner call in parentheses")
+                    addSon(call, chainSpaceCallArgs(p, arg))
+                else:
+                    addSon(call, arg)
+            call.callStyle = CallStyleSpace
+            lhs = call
+    while true:
+        let t: Token = current p
+        let prec: int32 = opPrecedence t
+        if prec == PrecNone || prec < minPrec:
+            break
+        if t.kind == tkNewline || t.kind == tkDedent || t.kind == tkEof:
+            break
+        if t.kind == tkSymbol &&((t.lexeme ==  ")") ||(t.lexeme ==  "]") ||(t.lexeme ==  "}") ||(t.lexeme ==  ",") ||(t.lexeme ==  ";") ||(t.lexeme ==  ":") ||(t.lexeme ==  "=")):
+            break
+        if t.kind == tkSymbol &&(t.lexeme ==  "*") && isTypeLike lhs:
+            let nxt: Token = peek(p, 1)
+            let isDelim: bool = (nxt.kind == tkSymbol &&((nxt.lexeme ==  ")") ||(nxt.lexeme ==  "]") ||(nxt.lexeme ==  ",") ||(nxt.lexeme ==  ";") ||(nxt.lexeme ==  ":") ||(nxt.lexeme ==  "="))) ||(nxt.kind == tkNewline || nxt.kind == tkDedent || nxt.kind == tkEof)
+            if isDelim:
+                advance p
+                var pt: Node = newNode(nkPtrTy, lhs.pos)
+                addSon(pt, lhs)
+                lhs = pt
+                continue
+        advance p
+        let rhs: Node = parseExpression(p, prec + 1)
+        var inf: Node = newNode(nkInfix, posFrom(t))
+        nodeSetIdent(inf, t.lexeme)
+        addSon(inf, makeIdent(t.lexeme, posFrom(t)))
+        addSon(inf, lhs)
+        addSon(inf, rhs)
+        lhs = inf
+    if lhs != nil && minPrec <= PrecTernary && isTernaryQuestion p:
+        let qt: Token = current p
+        advance p
+        let thenExpr: Node = parseExpression(p, PrecNone)
+        expectSymbol(p, ":", "Expected ':'")
+        let elseExpr: Node = parseExpression(p, PrecTernary)
+        var ifn: Node = newNode(nkIf, posFrom qt)
+        addSon(ifn, lhs)
+        addSon(ifn, thenExpr)
+        addSon(ifn, elseExpr)
+        lhs = ifn
+    return lhs
+
+fn parsePattern(p: ParserStateObj*): Node =
+    let head: Node = parseExpression(p, PrecMembership + 1)
+    var canType: bool = false
+    if head != nil:
+        if head.kind == nkIdent || head.kind == nkSymbol || head.kind == nkTupleLit:
+            canType = true
+        elif head.kind == nkPar && kidCount head == 1:
+            let inner: Node = kid(head, 0)
+            if inner != nil && (inner.kind == nkIdent || inner.kind == nkTupleLit):
+                canType = true
+    if canType && matchSymbol(p, ":"):
+        let ty: Node = parseTypeExpr p
+        var pat: Node = newNode(nkPattern, head.pos)
+        addSon(pat, head)
+        addSon(pat, ty)
+        return pat
+    return head
+
+fn normalizeLetPattern(pat0: Node): Node =
+    if pat0 == nil:
+        return pat0
+    if pat0.kind == nkPattern && kidCount pat0 > 0:
+        let head0: Node = kid(pat0, 0)
+        let head2: Node = normalizeLetPattern(head0)
+        if head2 != head0:
+            setKid(pat0, 0, head2)
+        return pat0
+    if pat0.kind == nkPar && kidCount pat0 == 1:
+        let inner0: Node = kid(pat0, 0)
+        if inner0 != nil && (inner0.kind == nkIdent || inner0.kind == nkSymbol):
+            var tup: Node = newNode(nkTupleLit, pat0.pos)
+            addSon(tup, inner0)
+            return tup
+    return pat0
+
+fn isCaseEntrySeparator(p: ParserStateObj*): bool =
+    let t: Token = current p
+    if t.kind == tkSymbol &&((t.lexeme ==  ",") ||(t.lexeme ==  ":")):
+        return true
+    if t.kind == tkKeyword &&(t.lexeme ==  "if"):
+        return true
+    return false
+
+fn parseCaseEntry(p: ParserStateObj*): Node =
+    let idx0: int32 = p->idx
+    let diags0: Diagnostic[]* = p->diags
+    var diagLen0: int32 = 0
+    if diags0 != nil:
+        diagLen0 = diags0->len
+    let ent: Node = parsePattern p
+    if ent != nil && ent.kind == nkPattern:
+        if isCaseEntrySeparator p:
+            return ent
+        p->idx = idx0
+        if diags0 != nil:
+            diags0->len = diagLen0
+        return parseExpression(p, PrecMembership + 1)
+    return ent
+
+# Skip newlines/indent/dedent inside formal params.
+fn skipParamTrivia(p: ParserStateObj*) =
+    while true:
+        let t: Token = current p
+        if t.kind == tkNewline || t.kind == tkIndent || t.kind == tkDedent:
+            advance p
+            continue
+        break
+
+# ---- Types ----
+fn parseFormalParams(p: ParserStateObj*): Node =
+    var fp: Node = newNode(nkFormalParams, posFrom(current(p)))
+    if ! matchSymbol(p, "("):
+        return fp
+    skipParamTrivia p
+    if matchSymbol(p, ")"):
+        return fp
+    while true:
+        skipParamTrivia p
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
+            break
+        var names: Node[] = []
+        names.cap = 2
+        add(names, parseIdent(p, false))
+        while matchSymbol(p, ","):
+            add(names, parseIdent(p, false))
+        var ptype: Node = emptyNode(posFrom(current(p)))
+        if matchSymbol(p, ":"):
+            ptype = parseTypeExpr p
+        var pdefault: Node = emptyNode(posFrom(current(p)))
+        if matchSymbol(p, "="):
+            pdefault = parseExpression(p, PrecNone)
+        for i in 0..<names.len:
+            let n0: Node = names[i]
+            var defs: Node = newNode(nkIdentDefs, n0.pos)
+            addSon(defs, n0)
+            addSon(defs, ptype)
+            addSon(defs, pdefault)
+            addSon(fp, defs)
+        skipParamTrivia p
+        if matchSymbol(p, ",") || matchSymbol(p, ";"):
+            continue
+        skipParamTrivia p
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  ")"):
+            break
+        addParseDiag(p, current p, "Expected ')'")
+        break
+    expectSymbol(p, ")", "Expected ')'")
+    return fp
+
+fn parseRecordField(p: ParserStateObj*, recList: Node) =
+    var names: Node[] = []
+    names.cap = 2
+    add(names, parseIdent(p, false))
+    while matchSymbol(p, ","):
+        add(names, parseIdent(p, false))
+    var fType: Node = emptyNode(posFrom(current(p)))
+    var fDefault: Node = emptyNode(posFrom(current(p)))
+    if matchSymbol(p, ":"):
+        fType = parseTypeExpr p
+    if matchSymbol(p, "="):
+        fDefault = parseExpression(p, PrecNone)
+    for i in 0..<names.len:
+        let nm: Node = names[i]
+        var defs: Node = newNode(nkIdentDefs, nm.pos)
+        addSon(defs, nm)
+        addSon(defs, fType)
+        addSon(defs, fDefault)
+        addSon(recList, defs)
+
+fn parseRecordBody(p: ParserStateObj*, pos: SourcePos): Node =
+    var recList: Node = newNode(nkRecList, pos)
+    skipNewlines p
+    if match(p, tkIndent):
+        skipStmtSeps p
+        while curKind(p) != tkDedent && curKind(p) != tkEof:
+            if curKind(p) == tkKeyword &&(curLexeme(p) ==  "case"):
+                let rc: Node = parseRecCase(p, pos)
+                addSon(recList, rc)
+            else:
+                parseRecordField(p, recList)
+            skipStmtSeps p
+        expect(p, tkDedent, "Expected dedent")
+    return recList
+
+fn parseRecCase(p: ParserStateObj*, pos: SourcePos): Node =
+    let startTok: Token = current p
+    advance p
+    let name: Node = parseIdent(p, false)
+    var fType: Node = emptyNode(posFrom(current(p)))
+    var fDefault: Node = emptyNode(posFrom(current(p)))
+    if matchSymbol(p, ":"):
+        fType = parseTypeExpr p
+    if matchSymbol(p, "="):
+        fDefault = parseExpression(p, PrecNone)
+    var defs: Node = newNode(nkIdentDefs, name.pos)
+    addSon(defs, name)
+    addSon(defs, fType)
+    addSon(defs, fDefault)
+    var recCase: Node = newNode(nkRecCase, posFrom startTok)
+    addSon(recCase, defs)
+    if curKind(p) == tkNewline:
+        skipNewlines p
+    if match(p, tkIndent):
+        skipStmtSeps p
+        while curKind(p) != tkDedent && curKind(p) != tkEof:
+            if matchKeyword(p, "of"):
+                var br: Node = newNode(nkOfBranch, posFrom startTok)
+                while true:
+                    let ent: Node = parseCaseEntry p
+                    addSon(br, ent)
+                    if matchSymbol(p, ","):
+                        continue
+                    break
+                expectSymbol(p, ":", "Expected ':'")
+                let body: Node = parseRecordBody(p, posFrom startTok)
+                addSon(br, body)
+                addSon(recCase, br)
+            elif matchKeyword(p, "else"):
+                expectSymbol(p, ":", "Expected ':'")
+                let body2: Node = parseRecordBody(p, posFrom startTok)
+                var el: Node = newNode(nkElse, posFrom startTok)
+                addSon(el, body2)
+                addSon(recCase, el)
+            else:
+                addParseDiag(p, current p, "case branch must start with of/else")
+                advance p
+            skipStmtSeps p
+        expect(p, tkDedent, "Expected dedent")
+    else:
+        addParseDiag(p, current p, "case requires an indented block")
+    return recCase
+
+fn parseObjectType(p: ParserStateObj*, pos: SourcePos): Node =
+    var base: Node = emptyNode pos
+    if matchKeyword(p, "of"):
+        base = parseTypeExpr p
+    var hasFields: bool = false
+    if matchSymbol(p, ":"):
+        hasFields = true
+    elif curKind(p) == tkNewline:
+        hasFields = true
+    var recList: Node = newNode(nkRecList, pos)
+    if hasFields:
+        recList = parseRecordBody(p, pos)
+    var obj: Node = newNode(nkObjectDecl, pos)
+    addSon(obj, base)
+    addSon(obj, recList)
+    return obj
+
+fn parseEnumType(p: ParserStateObj*, pos: SourcePos): Node =
+    var en: Node = newNode(nkEnumDecl, pos)
+    var hasFields: bool = false
+    if matchSymbol(p, ":"):
+        hasFields = true
+    elif curKind(p) == tkNewline:
+        hasFields = true
+    if hasFields:
+        skipNewlines p
+        if match(p, tkIndent):
+            skipStmtSeps p
+            while curKind(p) != tkDedent && curKind(p) != tkEof:
+                var names: Node[] = []
+                names.cap = 4
+                add(names, parseIdent(p, false))
+                while matchSymbol(p, ","):
+                    if curKind(p) == tkNewline || curKind(p) == tkDedent || curKind(p) == tkEof:
+                        break
+                    add(names, parseIdent(p, false))
+                var val: Node = emptyNode(posFrom(current(p)))
+                if matchSymbol(p, "="):
+                    val = parseExpression(p, PrecNone)
+                for ni in 0..<names.len:
+                    let name: Node = names[ni]
+                    var f: Node = newNode(nkEnumFieldDecl, name.pos)
+                    addSon(f, name)
+                    addSon(f, val)
+                    addSon(en, f)
+                skipStmtSeps p
+            expect(p, tkDedent, "Expected dedent")
+    return en
+
+fn parseTypeExpr(p: ParserStateObj*): Node =
+    let t: Token = current p
+    if t.kind == tkKeyword &&(t.lexeme ==  "fn"):
+        advance p
+        var fp: Node = parseFormalParams p
+        var ret: Node = emptyNode posFrom(t)
+        if matchSymbol(p, ":"):
+            ret = parseTypeExpr p
+        var pt: Node = newNode(nkFnTy, posFrom(t))
+        addSon(pt, fp)
+        addSon(pt, ret)
+        return parserRejectRemovedTypeAlias(p, pt)
+    if t.kind == tkKeyword &&(t.lexeme ==  "tuple"):
+        advance p
+        expectSymbol(p, "[", "Expected '['")
+        var tt: Node = newNode(nkTupleTy, posFrom(t))
+        if ! matchSymbol(p, "]"):
+            while true:
+                if isIdentStart(curKind(p)) && peekKind(p, 1) == tkSymbol && (peekLexeme(p, 1) == ":"):
+                    let nm: Node = parseIdent(p, false)
+                    expectSymbol(p, ":", "Expected ':'")
+                    let et: Node = parseTypeExpr p
+                    var defs: Node = newNode(nkIdentDefs, nm.pos)
+                    addSon(defs, nm)
+                    addSon(defs, et)
+                    addSon(defs, emptyNode nm.pos)
+                    addSon(tt, defs)
+                else:
+                    let elem: Node = parseTypeExpr p
+                    addSon(tt, elem)
+                if matchSymbol(p, ",") || matchSymbol(p, ";"):
+                    continue
+                if matchSymbol(p, "]"):
+                    break
+                addParseDiag(p, current p, "Expected ']'")
+                break
+        return parserRejectRemovedTypeAlias(p, tt)
+    if t.kind == tkKeyword &&(t.lexeme ==  "set"):
+        advance p
+        expectSymbol(p, "[", "Expected '['")
+        let elemTy: Node = parseTypeExpr p
+        expectSymbol(p, "]", "Expected ']'")
+        var st: Node = newNode(nkSetTy, posFrom(t))
+        addSon(st, elemTy)
+        return parserRejectRemovedTypeAlias(p, st)
+    if t.kind == tkKeyword &&(t.lexeme ==  "enum"):
+        advance p
+        let en: Node = parseEnumType(p, posFrom(t))
+        return parserRejectRemovedTypeAlias(p, en)
+    if t.kind == tkKeyword &&(t.lexeme ==  "ref"):
+        advance p
+        var rt: Node = newNode(nkRefTy, posFrom(t))
+        var target: Node
+        if curKind(p) == tkNewline ||
+           (curKind(p) == tkKeyword && curLexeme(p) ==  "of"):
+            target = parseObjectType(p, posFrom(t))
+        else:
+            target = parseTypeExpr p
+        addSon(rt, target)
+        return parserRejectRemovedTypeAlias(p, rt)
+    if t.kind == tkKeyword &&(t.lexeme ==  "var"):
+        advance p
+        let baseVar: Node = parseTypeExpr p
+        if baseVar != nil && baseVar.kind == nkPtrTy:
+            addParseDiag(p, t, rawPointerForbidMessage("var is not allowed on pointer types"))
+            return parserRejectRemovedTypeAlias(p, baseVar)
+        if plainName baseVar == "pointer":
+            addParseDiag(p, t, rawPointerForbidMessage("pointer alias is removed and bare void* is forbidden"))
+            return parserRejectRemovedTypeAlias(p, baseVar)
+        var vt: Node = newNode(nkVarTy, posFrom(t))
+        addSon(vt, baseVar)
+        return parserRejectRemovedTypeAlias(p, vt)
+    # default: parse expression-like type (ident / bracket expr)
+    var base: Node = parseTypePostfix(p, parseAtom p)
+    return parserRejectRemovedTypeAlias(p, base)
+
+# ---- Statements ----
+fn parseSuite(p: ParserStateObj*): Node =
+    if match(p, tkNewline):
+        skipNewlines p
+        if match(p, tkIndent):
+            var sl: Node = newNode(nkStmtList, posFrom(current(p)))
+            skipStmtSeps p
+            while curKind(p) != tkDedent && curKind(p) != tkEof:
+                let s: Node = parseStatement p
+                addSon(sl, s)
+                skipStmtSeps p
+            expect(p, tkDedent, "Expected dedent")
+            return sl
+    # single-line suite
+    let s2: Node = parseStatement p
+    var sl2: Node = newNode(nkStmtList, s2.pos)
+    addSon(sl2, s2)
+    return sl2
+
+fn parseIf(p: ParserStateObj*, isWhen: bool): Node =
+    let startTok: Token = current p
+    advance p
+    let cond: Node = parseExpression(p, PrecNone)
+    expectSymbol(p, ":", "Expected ':'")
+    let thenPart: Node = parseSuite p
+    var kind: NodeKind = nkIf
+    if isWhen:
+        kind = nkWhen
+    var ifn: Node = newNode(kind, posFrom startTok)
+    addSon(ifn, cond)
+    addSon(ifn, thenPart)
+    skipNewlines p
+    while matchKeyword(p, "elif"):
+        let c: Node = parseExpression(p, PrecNone)
+        expectSymbol(p, ":", "Expected ':'")
+        let b: Node = parseSuite p
+        addSon(ifn, c)
+        addSon(ifn, b)
+        skipNewlines p
+    if matchKeyword(p, "else"):
+        expectSymbol(p, ":", "Expected ':'")
+        let eb: Node = parseSuite p
+        addSon(ifn, eb)
+    return ifn
+
+fn parseWhile(p: ParserStateObj*): Node =
+    let startTok: Token = current p
+    advance p
+    let cond: Node = parseExpression(p, PrecNone)
+    expectSymbol(p, ":", "Expected ':'")
+    let body: Node = parseSuite p
+    var wn: Node = newNode(nkWhile, posFrom startTok)
+    addSon(wn, cond)
+    addSon(wn, body)
+    return wn
+
+fn parseFor(p: ParserStateObj*): Node =
+    let startTok: Token = current p
+    advance p
+    let firstPat: Node = parsePattern p
+    var pat: Node = firstPat
+    if matchSymbol(p, ","):
+        var tup: Node = newNode(nkTupleLit, posFrom startTok)
+        addSon(tup, firstPat)
+        while true:
+            let morePat: Node = parsePattern p
+            addSon(tup, morePat)
+            if ! matchSymbol(p, ","):
+                break
+        pat = tup
+    if ! matchKeyword(p, "in"):
+        addParseDiag(p, current p, "Expected 'in'")
+    let iterExpr: Node = parseExpression(p, PrecNone)
+    expectSymbol(p, ":", "Expected ':'")
+    let body: Node = parseSuite p
+    var forNode: Node = newNode(nkFor, posFrom startTok)
+    addSon(forNode, pat)
+    addSon(forNode, iterExpr)
+    addSon(forNode, body)
+    return forNode
+
+fn parseCase(p: ParserStateObj*): Node =
+    let startTok: Token = current p
+    advance p
+    let selector: Node = parseExpression(p, PrecNone)
+    if matchSymbol(p, ":"):
+        skipNewlines p
+    var cn: Node = newNode(nkCase, posFrom startTok)
+    addSon(cn, selector)
+    if match(p, tkIndent):
+        skipStmtSeps p
+        while curKind(p) != tkDedent && curKind(p) != tkEof:
+            if matchKeyword(p, "of"):
+                var br: Node = newNode(nkOfBranch, posFrom startTok)
+                while true:
+                    let ent: Node = parseCaseEntry p
+                    addSon(br, ent)
+                    if matchSymbol(p, ","):
+                        continue
+                    break
+                if matchKeyword(p, "if"):
+                    let gexpr: Node = parseExpression(p, PrecNone)
+                    var guard: Node = newNode(nkGuard, gexpr.pos)
+                    addSon(guard, gexpr)
+                    addSon(br, guard)
+                expectSymbol(p, ":", "Expected ':'")
+                let body: Node = parseSuite p
+                addSon(br, body)
+                addSon(cn, br)
+            elif matchKeyword(p, "else"):
+                expectSymbol(p, ":", "Expected ':'")
+                let body2: Node = parseSuite p
+                var el: Node = newNode(nkElse, posFrom startTok)
+                addSon(el, body2)
+                addSon(cn, el)
+            else:
+                addParseDiag(p, current p, "case branch must start with of/else")
+                advance p
+            skipStmtSeps p
+        expect(p, tkDedent, "Expected dedent")
+    else:
+        var parsedAny: bool = false
+        skipStmtSeps p
+        while true:
+            if matchKeyword(p, "of"):
+                parsedAny = true
+                var br2: Node = newNode(nkOfBranch, posFrom startTok)
+                while true:
+                    let ent2: Node = parseCaseEntry p
+                    addSon(br2, ent2)
+                    if matchSymbol(p, ","):
+                        continue
+                    break
+                if matchKeyword(p, "if"):
+                    let gexpr2: Node = parseExpression(p, PrecNone)
+                    var guard2: Node = newNode(nkGuard, gexpr2.pos)
+                    addSon(guard2, gexpr2)
+                    addSon(br2, guard2)
+                expectSymbol(p, ":", "Expected ':'")
+                let body3: Node = parseSuite p
+                addSon(br2, body3)
+                addSon(cn, br2)
+            elif matchKeyword(p, "else"):
+                parsedAny = true
+                expectSymbol(p, ":", "Expected ':'")
+                let body4: Node = parseSuite p
+                var el2: Node = newNode(nkElse, posFrom startTok)
+                addSon(el2, body4)
+                addSon(cn, el2)
+            else:
+                break
+            skipStmtSeps p
+        if ! parsedAny:
+            addParseDiag(p, current p, "case requires an indented block")
+    return cn
+
+fn parseBlock(p: ParserStateObj*): Node =
+    let startTok: Token = current p
+    advance p
+    var label: Node = emptyNode(posFrom(startTok))
+    if isIdentStart(curKind(p)) && ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  ":")):
+        label = parseIdent(p, false)
+    expectSymbol(p, ":", "Expected ':'")
+    let body: Node = parseSuite p
+    var bn: Node = newNode(nkBlock, posFrom startTok)
+    addSon(bn, label)
+    addSon(bn, body)
+    return bn
+
+fn parseRoutine(p: ParserStateObj*, kind: NodeKind, annots: Node[]): Node =
+    let kw: Token = current p
+    advance p
+    var name: Node = emptyNode(posFrom(kw))
+    if isIdentStart(curKind(p)):
+        name = parseIdent(p, true)
+    let generics: Node = parseTypeParams p
+    let params: Node = parseFormalParams p
+    var retType: Node = emptyNode(posFrom(kw))
+    if matchSymbol(p, ":"):
+        retType = parseTypeExpr p
+    var whereExpr: Node = emptyNode(posFrom(kw))
+    var wherePos: SourcePos = posFrom(kw)
+    if curKind(p) == tkSymbol &&(curLexeme(p) ==  "(") &&
+       peekKind(p, 1) == tkKeyword &&(peekLexeme(p, 1) ==  "where") &&
+       peekKind(p, 2) == tkSymbol &&(peekLexeme(p, 2) ==  ")"):
+        advance p
+        let wt: Token = current p
+        advance p
+        wherePos = posFrom wt
+        expectSymbol(p, ")", "Expected ')'")
+        whereExpr = parseExpression(p, PrecNone)
+    elif curKind(p) == tkKeyword &&(curLexeme(p) ==  "where"):
+        let wt: Token = current p
+        advance p
+        wherePos = posFrom wt
+        whereExpr = parseExpression(p, PrecNone)
+    let trailingAnnots: Node[] = parseInlineAnnotations p
+    var mergedAnnots: Node[] = []
+    mergedAnnots.cap = annots.len + trailingAnnots.len + 1
+    for ai0 in 0..<annots.len:
+        add(mergedAnnots, annots[ai0])
+    for ai1 in 0..<trailingAnnots.len:
+        add(mergedAnnots, trailingAnnots[ai1])
+    var pragma: Node = emptyNode(posFrom(kw))
+    if mergedAnnots.len > 0 ||(whereExpr != nil && whereExpr.kind != nkEmpty):
+        pragma = newNode(nkPragma, posFrom(kw))
+        for i in 0..<mergedAnnots.len:
+            addSon(pragma, mergedAnnots[i])
+        if whereExpr != nil && whereExpr.kind != nkEmpty:
+            var whereAnn: Node = newNode(nkAnnotation, wherePos)
+            addSon(whereAnn, makeIdent("where", wherePos))
+            addSon(whereAnn, whereExpr)
+            addSon(pragma, whereAnn)
+    var body: Node = emptyNode(posFrom(kw))
+    if matchSymbol(p, "="):
+        body = parseSuite p
+    var rn: Node = newNode(kind, posFrom(kw))
+    addSon(rn, name)
+    addSon(rn, params)
+    addSon(rn, retType)
+    addSon(rn, body)
+    addSon(rn, generics)
+    addSon(rn, pragma)
+    return rn
+
+fn parseLambda(p: ParserStateObj*, kw: str): Node =
+    let startTok: Token = current p
+    advance p
+    var name: Node = emptyNode(posFrom(startTok))
+    if isIdentStart(curKind(p)) && ! (curKind(p) == tkSymbol &&(curLexeme(p) ==  "(")):
+        name = parseIdent(p, false)
+    let generics: Node = parseTypeParams p
+    let params: Node = parseFormalParams p
+    var retType: Node = emptyNode(posFrom(startTok))
+    if matchSymbol(p, ":"):
+        retType = parseTypeExpr p
+    var body: Node = emptyNode(posFrom(startTok))
+    if matchSymbol(p, "="):
+        body = parseSuite p
+    var lam: Node = newNode(nkLambda, posFrom(startTok))
+    nodeSetIdent(lam, " " + kw + " ")
+    addSon(lam, name)
+    addSon(lam, params)
+    addSon(lam, retType)
+    addSon(lam, body)
+    addSon(lam, generics)
+    addSon(lam, emptyNode(posFrom(startTok)))
+    return lam
+
+fn parseTypeDecl(p: ParserStateObj*, annots: Node[]): Node =
+    let kw: Token = current p
+    advance p
+    if curKind(p) == tkNewline:
+        skipNewlines p
+        expect(p, tkIndent, "Expected an indented block")
+        var sl: Node = newNode(nkStmtList, posFrom(kw))
+        skipStmtSeps p
+        while curKind(p) != tkDedent && curKind(p) != tkEof:
+            let name: Node = parseIdent(p, true)
+            let generics: Node = parseTypeParams p
+            var whereExpr: Node = emptyNode name.pos
+            if matchKeyword(p, "where"):
+                whereExpr = parseExpression(p, PrecNone)
+            expectSymbol(p, "=", "Expected '='")
+            var def: Node = nil
+            if curKind(p) == tkNewline:
+                def = parseObjectType(p, name.pos)
+            elif curKind(p) == tkIdent && curLexeme(p) ==  "object":
+                advance p
+                def = parseObjectType(p, name.pos)
+            else:
+                def = parseTypeExpr p
+            var td: Node = newNode(nkTypeDecl, name.pos)
+            addSon(td, name)
+            addSon(td, def)
+            addSon(td, generics)
+            addSon(td, whereExpr)
+            var pragma: Node = emptyNode(posFrom(kw))
+            if annots.len > 0:
+                pragma = newNode(nkPragma, posFrom(kw))
+                for ai in 0..<annots.len:
+                    addSon(pragma, annots[ai])
+            addSon(td, pragma)
+            addSon(sl, td)
+            skipStmtSeps p
+        expect(p, tkDedent, "Expected dedent")
+        return sl
+    let name2: Node = parseIdent(p, true)
+    let generics2: Node = parseTypeParams p
+    var whereExpr2: Node = emptyNode name2.pos
+    if matchKeyword(p, "where"):
+        whereExpr2 = parseExpression(p, PrecNone)
+    expectSymbol(p, "=", "Expected '='")
+    var def2: Node = nil
+    if curKind(p) == tkNewline:
+        def2 = parseObjectType(p, name2.pos)
+    elif curKind(p) == tkIdent && curLexeme(p) ==  "object":
+        advance p
+        def2 = parseObjectType(p, name2.pos)
+    else:
+        def2 = parseTypeExpr p
+    var td2: Node = newNode(nkTypeDecl, name2.pos)
+    addSon(td2, name2)
+    addSon(td2, def2)
+    addSon(td2, generics2)
+    addSon(td2, whereExpr2)
+    var pragma2: Node = emptyNode(posFrom(kw))
+    if annots.len > 0:
+        pragma2 = newNode(nkPragma, posFrom(kw))
+        for ai2 in 0..<annots.len:
+            addSon(pragma2, annots[ai2])
+    addSon(td2, pragma2)
+    return td2
+
+fn parseConceptDecl(p: ParserStateObj*): Node =
+    let startTok: Token = current p
+    advance p
+    let name: Node = parseIdent(p, true)
+    let generics: Node = parseTypeParams p
+    expectSymbol(p, ":", "Expected ':'")
+    let body: Node = parseSuite p
+    var cn: Node = newNode(nkConceptDecl, posFrom startTok)
+    addSon(cn, name)
+    addSon(cn, generics)
+    addSon(cn, body)
+    return cn
+
+fn parseTraitDecl(p: ParserStateObj*): Node =
+    let startTok: Token = current p
+    advance p
+    let name: Node = parseIdent(p, true)
+    let generics: Node = parseTypeParams p
+    expectSymbol(p, ":", "Expected ':'")
+    let body: Node = parseSuite p
+    var tn: Node = newNode(nkTraitDecl, posFrom startTok)
+    addSon(tn, name)
+    addSon(tn, generics)
+    addSon(tn, body)
+    return tn
+
+fn parseImportPathPart(p: ParserStateObj*): Node =
+    var part: Node = parseIdent(p, false)
+    while true:
+        let t: Token = current p
+        if t.kind == tkSymbol && t.lexeme == "-" && isIdentStart(peekKind(p, 1)):
+            advance p
+            let tail: Node = parseIdent(p, false)
+            nodeSetIdent(part, part.ident + "-" + tail.ident)
+            continue
+        break
+    return part
+
+fn parseImportPath(p: ParserStateObj*): Node =
+    var path: Node = parseImportPathPart p
+    while true:
+        let t: Token = current p
+        if t.kind == tkSymbol &&(t.lexeme == "/" || t.lexeme == "."):
+            if t.lexeme == ".":
+                addParseDiag(p, t, "dot-separated imports are not supported; use '/'")
+            if ! isIdentStart(peekKind(p, 1)):
+                break
+            advance p
+            let part: Node = parseImportPathPart p
+            nodeSetIdent(path, path.ident + "/" + part.ident)
+            continue
+        break
+    return path
+
+fn parserAllowStringImports(): bool =
+    return false
+
+fn parseImport(p: ParserStateObj*): Node =
+    let kw: Token = current p
+    advance p
+    var stmt: Node = newNode(nkImportStmt, posFrom(kw))
+    var item: Node = nil
+    if curKind(p) == tkString:
+        let st: Token = current p
+        advance p
+        let raw: str = decodeStringLit(p, st)
+        if parserAllowStringImports():
+            var path: Node = newNode(nkIdent, posFrom(st))
+            nodeSetIdent(path, raw)
+            item = path
+        else:
+            addParseDiag(p, st, "string/path imports are not supported; use normalized module paths like 'libp2p/...' or 'std/...'")
+            item = emptyNode(posFrom(st))
+    else:
+        let startTok: Token = current p
+        if startTok.kind == tkSymbol &&(startTok.lexeme == "." || startTok.lexeme == "/"):
+            addParseDiag(p, startTok, "relative/absolute imports are not supported; use normalized module paths like 'libp2p/...' or 'std/...'")
+            item = emptyNode(posFrom(startTok))
+            while ! isLineEnd(curKind(p)):
+                if curKind(p) == tkSymbol &&((curLexeme(p) ==  ";") ||(curLexeme(p) ==  "}")):
+                    break
+                advance p
+        else:
+            let base: Node = parseImportPath p
+            if matchSymbol(p, "/") && matchSymbol(p, "["):
+                var group: Node = newNode(nkImportGroup, base.pos)
+                addSon(group, base)
+                if matchSymbol(p, "]"):
+                    addParseDiag(p, current p, "import group cannot be empty")
+                else:
+                    while true:
+                        let entry: Node = parseImportPath p
+                        addSon(group, entry)
+                        if matchSymbol(p, ","):
+                            if matchSymbol(p, "]"):
+                                break
+                            continue
+                        if matchSymbol(p, "]"):
+                            break
+                        addParseDiag(p, current p, "expected ',' or ']' in import group")
+                        while ! isLineEnd(curKind(p)):
+                            if curKind(p) == tkSymbol &&(curLexeme(p) ==  "]"):
+                                advance p
+                                break
+                            if curKind(p) == tkSymbol &&((curLexeme(p) ==  ";") ||(curLexeme(p) ==  "}")):
+                                break
+                            advance p
+                        break
+                item = group
+                if matchKeyword(p, "as"):
+                    addParseDiag(p, current p, "import group does not support alias; split into multiple imports")
+                    parseIdent(p, false)
+            elif matchKeyword(p, "as"):
+                let alias2: Node = parseIdent(p, false)
+                var as2: Node = newNode(nkImportAs, base.pos)
+                addSon(as2, base)
+                addSon(as2, alias2)
+                item = as2
+            else:
+                item = base
+    addSon(stmt, item)
+    if matchSymbol(p, ","):
+        addParseDiag(p, current p, "import supports only a single path; split into multiple lines")
+        while ! isLineEnd(curKind(p)):
+            if curKind(p) == tkSymbol &&((curLexeme(p) ==  ";") ||(curLexeme(p) ==  "}")):
+                break
+            advance p
+    return stmt
+
+fn parseFromImport(p: ParserStateObj*): Node =
+    let kw: Token = current p
+    advance p
+    addParseDiag(p, kw, "from import is not supported; use import")
+    while ! isLineEnd(curKind(p)):
+        let t: Token = current p
+        if t.kind == tkSymbol &&((t.lexeme ==  ";") ||(t.lexeme ==  "}")):
+            break
+        advance p
+    return newNode(nkEmpty, posFrom(kw))
+
+fn parseStatement(p: ParserStateObj*): Node =
+    skipStmtSeps p
+    let annots: Node[] = parseAnnotations p
+    let t: Token = current p
+    if t.kind == tkKeyword:
+        if (t.lexeme ==  "async"):
+            let asyncTok: Token = current p
+            advance p
+            var annots2: Node[] = []
+            annots2.cap = annots.len + 1
+            for ai in 0..<annots.len:
+                add(annots2, annots[ai])
+            var asyncAnn: Node = newNode(nkAnnotation, posFrom asyncTok)
+            addSon(asyncAnn, makeIdent("async", posFrom asyncTok))
+            add(annots2, asyncAnn)
+            if curKind(p) == tkKeyword:
+                if curLexeme(p) ==  "fn":
+                    return parseRoutine(p, nkFnDecl, annots2)
+                if curLexeme(p) ==  "iterator":
+                    return parseRoutine(p, nkIteratorDecl, annots2)
+            addParseDiag(p, asyncTok, "async can only modify fn/iterator")
+            return newNode(nkEmpty, posFrom asyncTok)
+        if (t.lexeme ==  "import"):
+            return parseImport p
+        if (t.lexeme ==  "module"):
+            advance p
+            if isIdentStart(curKind(p)):
+                parseIdent(p, true)
+            return newNode(nkEmpty, posFrom(t))
+        if (t.lexeme ==  "type"):
+            return parseTypeDecl(p, annots)
+        if (t.lexeme ==  "concept"):
+            return parseConceptDecl p
+        if (t.lexeme ==  "trait"):
+            return parseTraitDecl p
+        if (t.lexeme ==  "fn"):
+            return parseRoutine(p, nkFnDecl, annots)
+        if (t.lexeme ==  "iterator"):
+            return parseRoutine(p, nkIteratorDecl, annots)
+        if (t.lexeme ==  "macro"):
+            return parseRoutine(p, nkMacroDecl, annots)
+        if (t.lexeme ==  "template"):
+            return parseRoutine(p, nkTemplateDecl, annots)
+        if (t.lexeme ==  "if"):
+            return parseIf(p, false)
+        if (t.lexeme ==  "when"):
+            return parseIf(p, true)
+        if (t.lexeme ==  "while"):
+            return parseWhile p
+        if (t.lexeme ==  "for"):
+            return parseFor p
+        if (t.lexeme ==  "case"):
+            return parseCase p
+        if (t.lexeme ==  "block"):
+            return parseBlock p
+        if (t.lexeme ==  "return"):
+            advance p
+            var rn: Node = newNode(nkReturn, posFrom(t))
+            if ! isLineEnd(curKind(p)):
+                let e: Node = parseExpression(p, PrecNone)
+                addSon(rn, e)
+            else:
+                addSon(rn, emptyNode(posFrom(t)))
+            return rn
+        if (t.lexeme ==  "yield"):
+            advance p
+            var yn: Node = newNode(nkYield, posFrom(t))
+            if ! isLineEnd(curKind(p)):
+                addSon(yn, parseExpression(p, PrecNone))
+            else:
+                addSon(yn, emptyNode(posFrom(t)))
+            return yn
+        if (t.lexeme ==  "break"):
+            advance p
+            return newNode(nkBreak, posFrom(t))
+        if (t.lexeme ==  "continue"):
+            advance p
+            return newNode(nkContinue, posFrom(t))
+        if (t.lexeme ==  "defer"):
+            advance p
+            expectSymbol(p, ":", "Expected ':'")
+            let body: Node = parseSuite p
+            var dn2: Node = newNode(nkDefer, posFrom(t))
+            addSon(dn2, body)
+            return dn2
+        if (t.lexeme ==  "var") ||(t.lexeme ==  "let") || (t.lexeme ==  "const"):
+            advance p
+            var kind: NodeKind = nkConst
+            if (t.lexeme ==  "var"):
+                kind = nkVar
+            elif (t.lexeme ==  "let"):
+                kind = nkLet
+            if curKind(p) == tkNewline:
+                skipNewlines p
+                expect(p, tkIndent, "Expected an indented block")
+                var slb: Node = newNode(nkStmtList, posFrom(t))
+                skipStmtSeps p
+                while curKind(p) != tkDedent && curKind(p) != tkEof:
+                    var namesB: Node[] = []
+                    namesB.cap = 2
+                    let name0B: Node = parsePattern p
+                    add(namesB, normalizeLetPattern(name0B))
+                    while matchSymbol(p, ","):
+                        let nameXB: Node = parsePattern p
+                        add(namesB, normalizeLetPattern(nameXB))
+                    var typB: Node = emptyNode posFrom(t)
+                    var valB: Node = emptyNode posFrom(t)
+                    if matchSymbol(p, ":"):
+                        typB = parseTypeExpr p
+                    if matchSymbol(p, "="):
+                        skipExprLeading p
+                        valB = parseExpression(p, PrecNone)
+                    var pragmaB: Node = emptyNode posFrom(t)
+                    var liftedTypeB: Node = typB
+                    var liftLastB: bool = false
+                    if (typB == nil || typB.kind == nkEmpty) && namesB.len > 1:
+                        let lastNameB: Node = namesB[namesB.len - 1]
+                        if lastNameB != nil && lastNameB.kind == nkPattern && kidCount lastNameB > 1:
+                            liftedTypeB = kid(lastNameB, 1)
+                            liftLastB = true
+                    for niB in 0..<namesB.len:
+                        var nameNodeB: Node = namesB[niB]
+                        if liftLastB &&(niB == namesB.len - 1) && nameNodeB != nil && nameNodeB.kind == nkPattern && kidCount nameNodeB > 0:
+                            nameNodeB = kid(nameNodeB, 0)
+                        var dnB: Node = newNode(kind, posFrom(t))
+                        addSon(dnB, nameNodeB)
+                        addSon(dnB, liftedTypeB)
+                        addSon(dnB, valB)
+                        addSon(dnB, pragmaB)
+                        addSon(slb, dnB)
+                    skipStmtSeps p
+                expect(p, tkDedent, "Expected dedent")
+                return slb
+            var names: Node[] = []
+            names.cap = 2
+            let name0: Node = parsePattern p
+            add(names, normalizeLetPattern(name0))
+            while matchSymbol(p, ","):
+                let nameX: Node = parsePattern p
+                add(names, normalizeLetPattern(nameX))
+            var typ: Node = emptyNode posFrom(t)
+            var val: Node = emptyNode posFrom(t)
+            if matchSymbol(p, ":"):
+                typ = parseTypeExpr p
+            if matchSymbol(p, "="):
+                skipExprLeading p
+                val = parseExpression(p, PrecNone)
+            var pragma: Node = emptyNode posFrom(t)
+            if annots.len > 0:
+                pragma = newNode(nkPragma, posFrom(t))
+                for i in 0..<annots.len:
+                    addSon(pragma, annots[i])
+            if names.len == 1:
+                var dn: Node = newNode(kind, posFrom(t))
+                addSon(dn, names[0])
+                addSon(dn, typ)
+                addSon(dn, val)
+                addSon(dn, pragma)
+                return dn
+            var liftedType: Node = typ
+            var liftLast: bool = false
+            if (typ == nil || typ.kind == nkEmpty) && names.len > 1:
+                let lastName: Node = names[names.len - 1]
+                if lastName != nil && lastName.kind == nkPattern && kidCount lastName > 1:
+                    liftedType = kid(lastName, 1)
+                    liftLast = true
+            var sl: Node = newNode(nkStmtList, posFrom(t))
+            for ni in 0..<names.len:
+                var nameNode: Node = names[ni]
+                if liftLast &&(ni == names.len - 1) && nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 0:
+                    nameNode = kid(nameNode, 0)
+                var dn2: Node = newNode(kind, posFrom(t))
+                addSon(dn2, nameNode)
+                addSon(dn2, liftedType)
+                addSon(dn2, val)
+                addSon(dn2, pragma)
+                addSon(sl, dn2)
+            return sl
+    # default: expression statement / assignment / command call
+    let expr: Node = parseExpression(p, PrecNone)
+    if matchSymbol(p, "="):
+        var asn: Node = newNode(nkAsgn, expr.pos)
+        addSon(asn, expr)
+        skipExprLeading p
+        addSon(asn, parseExpression(p, PrecNone))
+        return asn
+    if expr != nil && (expr->kind == nkIdent || expr->kind == nkDotExpr || expr->kind == nkBracketExpr) &&
+       isSpaceCallArgStartFor(p, expr) && spaceCallSameLine p:
+        if curKind(p) == tkSymbol &&(curLexeme(p) ==  "("):
+                        addParseDiag(p, current p,
+                                     "Space call does not allow parenthesized argument; use 'f x' or 'f(x)' for one argument, and 'f(x, y)' for multiple arguments")
+        var call: Node = newNode(nkCall, expr.pos)
+        addSon(call, expr)
+        let arg: Node = parseSpaceAtom p
+        addSon(call, chainSpaceCallArgs(p, arg))
+        call.callStyle = CallStyleSpace
+        return call
+    if expr != nil && expr->kind == nkDotExpr && kidCount expr > 1:
+        let member: Node = kid(expr, 1)
+        if member != nil && plainName member == "inc":
+            let t2: Token = current p
+            if isLineEnd t2.kind ||(t2.kind == tkSymbol &&((t2.lexeme ==  ";") ||(t2.lexeme ==  "}"))):
+                var incCall: Node = newNode(nkCall, expr.pos)
+                addSon(incCall, expr)
+                return incCall
+    return expr
+
+# ---- Module parsing ----
+fn parseModuleImpl(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
+    var pObj: ParserStateObj* = ParserStateObj*(alloc(sizeof ParserStateObj))
+    if pObj == nil:
+        return nil
+    zeroMem(pObj, sizeof ParserStateObj)
+    pObj->tokens = tokens
+    pObj->idx = 0
+    pObj->filename = filename
+    pObj->diags = diags
+    var p: ParserStateObj* = pObj
+
+    var root: Node = newNode(nkModule, default[SourcePos])
+    nodeSetStrVal(root, filename)
+    # module name from file
+    let sf: SplitFileResult = parser_splitFile filename
+    nodeSetIdent(root, sf.name)
+
+    let baseDir: str = sf.dir
+    skipStmtSeps p
+    while curKind(p) == tkDedent:
+        advance p
+        skipStmtSeps p
+    while curKind(p) != tkEof:
+        let stmt: Node = parseStatement p
+        if stmt != nil:
+            addSon(root, stmt)
+        skipStmtSeps p
+        while curKind(p) == tkDedent:
+            advance p
+            skipStmtSeps p
+    dealloc pObj
+    return root
+
+fn parseModuleWithDiagnostics(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
+    return parseModuleImpl(tokens, filename, diags)
+
+fn parseModule(tokens: Token[], filename: str = "stdin"): Node =
+    return parseModuleImpl(tokens, filename, nil)

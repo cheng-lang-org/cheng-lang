@@ -1,0 +1,279 @@
+# ast.cheng
+# Stage1 AST definitions (ported from stage0/ast, expanded for Stage1 needs).
+import std/strings
+import std/seqs
+
+fn ast_memRetain(p: void*) =
+    memRetain(p)
+fn ast_memRelease(p: void*) =
+    memRelease(p)
+fn ast_memScopeEscape(p: void*) =
+    memScopeEscape(p)
+
+type
+    NodeKind = enum
+        nkError, nkEmpty,
+        nkModule, nkStmtList,
+        # Declarations
+        nkImportStmt, nkImportAs, nkImportGroup,
+        nkFnDecl, nkIteratorDecl, nkMacroDecl, nkTemplateDecl,
+        nkFormalParams, nkIdentDefs,
+        nkTypeDecl, nkObjectDecl, nkEnumDecl, nkEnumFieldDecl, nkConceptDecl, nkTraitDecl,
+        nkRefTy, nkPtrTy, nkVarTy, nkTupleTy, nkSetTy, nkFnTy,
+        nkRecList, nkRecCase,
+        nkGenericParams,
+        nkLet, nkVar, nkConst,
+        nkPragma, nkAnnotation,
+        # Statements
+        nkReturn, nkYield, nkBreak, nkContinue, nkDefer,
+        nkIf, nkWhen, nkWhile, nkFor, nkCase, nkBlock,
+        nkOfBranch, nkElse,
+        nkAsgn, nkFastAsgn,
+        # Expressions
+        nkCall, nkInfix, nkPrefix, nkPostfix, nkDotExpr, nkBracketExpr,
+        nkCurlyExpr, nkPar, nkTupleLit, nkSeqLit, nkTableLit,
+        nkCurly, nkBracket, nkRange, nkPattern, nkCallArg, nkGuard,
+        nkLambda, nkDo, nkIfExpr, nkWhenExpr, nkCaseExpr, nkComprehension,
+        nkHiddenDeref, nkDerefExpr,
+        # Leaves
+        nkIdent, nkSymbol,
+        nkIntLit, nkFloatLit, nkStrLit, nkCharLit, nkBoolLit, nkNilLit
+
+const
+    CallStyleSpace: int8 = 1
+    CallStyleTypeDiag: int8 = 2
+    CallStyleParen: int8 = 4
+
+type
+    SourcePos =
+        line: int32
+        col: int32
+
+fn zeroPos(): SourcePos =
+    var pos: SourcePos
+    return pos
+
+type
+    Node = ref
+        kind: NodeKind
+        pos: SourcePos
+        ident: str
+        strVal: str
+        intVal: int64
+        floatVal: float64
+        callStyle: int8
+        kids: Node[]
+        typeCache: Node
+        typeCacheValid: bool
+        managedCacheState: int8
+
+fn freeSeq_Node(seqInst: var Node[]) =
+    if seqInst.buffer != nil:
+        ast_memRelease seqInst.buffer
+    seqInst.buffer = nil
+    seqInst.len = 0
+    seqInst.cap = 0
+
+var
+    nodeArena: Node[]
+    nodeArenaReady: bool
+    nodeArenaEnabled: bool = true
+
+fn initNodeArena() =
+    if nodeArenaReady:
+        return
+    freeSeq[Node](nodeArena)
+    nodeArena = []
+    nodeArena.cap = 512
+    nodeArenaReady = true
+
+fn trackNode(n: Node) =
+    if ! nodeArenaEnabled:
+        return
+    if n == nil:
+        return
+    initNodeArena()
+    ast_memRetain void*(n)
+    add(nodeArena, n)
+
+fn releaseNodeArena() =
+    if ! nodeArenaReady:
+        return
+    for i in 0..<nodeArena.len:
+        var n: Node = nil
+        if nodeArena.buffer != nil:
+            let off64: int64 = int64(i) * sizeof Node
+            let p: Node* = Node*(ptr_add(nodeArena.buffer, int32(off64)))
+            n = *p
+        if n != nil:
+            if n.ident != nil && len n.ident > 0:
+                ast_memRelease void*(n.ident)
+            if n.strVal != nil && len n.strVal > 0:
+                ast_memRelease void*(n.strVal)
+            if n.kids.buffer != nil:
+                ast_memRelease n.kids.buffer
+            ast_memRelease void*(n)
+    freeSeq(nodeArena)
+    nodeArenaReady = false
+
+fn newNode(kind: NodeKind, pos: SourcePos): Node =
+    var n: Node
+    new n
+    n.kind = kind
+    n.pos = pos
+    n.ident = ""
+    n.strVal = ""
+    n.intVal = 0
+    n.floatVal = 0.0
+    n.callStyle = 0
+    n.kids.len = 0
+    n.kids.cap = 0
+    n.kids.buffer = nil
+    n.typeCache = nil
+    n.typeCacheValid = false
+    n.managedCacheState = 0
+    trackNode n
+    return n
+
+fn nodeSetIdent(n: Node, s: str) =
+    if n == nil:
+        return
+    if n.ident == s:
+        return
+    if n.ident != nil && len n.ident > 0:
+        ast_memRelease void*(n.ident)
+    n.ident = s
+    if s != nil && len s > 0:
+        ast_memScopeEscape void*(s)
+        ast_memRetain void*(s)
+
+fn nodeSetStrVal(n: Node, s: str) =
+    if n == nil:
+        return
+    if n.strVal == s:
+        return
+    if n.strVal != nil && len n.strVal > 0:
+        ast_memRelease void*(n.strVal)
+    n.strVal = s
+    if s != nil && len s > 0:
+        ast_memScopeEscape void*(s)
+        ast_memRetain void*(s)
+
+fn newIdent(ident: str, pos: SourcePos): Node =
+    var n: Node = newNode(nkIdent, pos)
+    nodeSetIdent(n, ident)
+    return n
+
+fn newSymbol(ident: str, pos: SourcePos): Node =
+    var n: Node = newNode(nkSymbol, pos)
+    nodeSetIdent(n, ident)
+    return n
+
+fn newIntLit(val: int64, pos: SourcePos): Node =
+    var n: Node = newNode(nkIntLit, pos)
+    n.intVal = val
+    return n
+
+fn newFloatLit(val: float64, pos: SourcePos): Node =
+    var n: Node = newNode(nkFloatLit, pos)
+    n.floatVal = val
+    return n
+
+fn newStrLit(val: str, pos: SourcePos): Node =
+    var n: Node = newNode(nkStrLit, pos)
+    nodeSetStrVal(n, val)
+    return n
+
+fn newBoolLit(val: bool, pos: SourcePos): Node =
+    var n: Node = newNode(nkBoolLit, pos)
+    if val:
+        nodeSetIdent(n, "true")
+    else:
+        nodeSetIdent(n, "false")
+    return n
+
+fn newNilLit(pos: SourcePos): Node =
+    return newNode(nkNilLit, pos)
+
+fn kidCount(n: Node): int32 =
+    if n == nil:
+        return 0
+    return n.kids.len
+
+fn kid(n: Node, i: int32): Node =
+    if n == nil:
+        return nil
+    if i < 0:
+        return nil
+    if i >= n.kids.len:
+        return nil
+    return n.kids[i]
+
+fn setKid(n: Node, i: int32, child: Node) =
+    if n == nil:
+        return
+    if i < 0:
+        return
+    if i >= n.kids.len:
+        return
+    n.kids[i] = child
+
+fn addSon(father: Node, son: Node) =
+    if father == nil:
+        return
+    add(father.kids, son)
+
+fn isEmpty(n: Node): bool =
+    if n == nil:
+        return true
+    if n.kind == nkEmpty:
+        return true
+    return false
+
+fn plainName(n: Node): str =
+    if n == nil:
+        return ""
+    if n.kind == nkPattern && kidCount n > 0:
+        return plainName kid(n, 0)
+    if n.kind == nkIdent:
+        return n.ident
+    if n.kind == nkSymbol:
+        return n.ident
+    if n.kind == nkDotExpr && kidCount n > 1:
+        return plainName kid(n, 1)
+    if n.kind == nkBracketExpr && kidCount n > 0:
+        return plainName kid(n, 0)
+    if n.kind == nkPostfix:
+        if kidCount n > 1:
+            return plainName kid(n, 1)
+    return ""
+
+fn identDefsNameCount(defs: Node): int32 =
+    if defs == nil || defs.kind != nkIdentDefs:
+        return 0
+    let n: int32 = kidCount defs
+    if n <= 2:
+        return n
+    return n - 2
+
+fn identDefsType(defs: Node): Node =
+    if defs == nil || defs.kind != nkIdentDefs:
+        return nil
+    let n: int32 = kidCount defs
+    if n < 2:
+        return nil
+    # IdentDefs layout: names..., type, default (type at n-2).
+    return kid(defs, n - 2)
+
+fn cloneTree(n: Node): Node =
+    if n == nil:
+        return nil
+    var n2: Node = newNode(n.kind, n.pos)
+    nodeSetIdent(n2, n.ident)
+    nodeSetStrVal(n2, n.strVal)
+    n2.intVal = n.intVal
+    n2.floatVal = n.floatVal
+    n2.callStyle = n.callStyle
+    for i in 0..<kidCount n:
+        addSon(n2, cloneTree kid(n, i))
+    return n2

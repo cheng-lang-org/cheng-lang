@@ -1,0 +1,100 @@
+# UIR codegen adapter (phase-1): MIR-backed UIR lowering + object emission.
+import std/result
+import std/os
+
+import cheng/backend/uir/[uir_types, uir_opt]
+import cheng/backend/uir/[uir_validate]
+import cheng/backend/machine/[machine_types, machine_select_aarch64, machine_regalloc]
+import cheng/backend/obj/[macho_writer]
+
+fn uirTargetIsDarwin(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return uirStrContains(target, "apple") || uirStrContains(target, "darwin") || uirStrContains(target, "ios")
+
+fn uirTargetIsWindows(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return uirStrContains(target, "windows") || uirStrContains(target, "msvc")
+
+fn uirTargetIsAarch64(target: str): bool =
+    if target == nil || len(target) == 0:
+        return true
+    return uirStrContains(target, "aarch64") || uirStrContains(target, "arm64")
+
+fn uirTargetIsX86_64(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return uirStrContains(target, "x86_64") || uirStrContains(target, "amd64")
+
+fn uirTargetIsRiscv64(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return uirStrContains(target, "riscv64")
+
+fn uirStrContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    for i in 0..n - m:
+        var match: bool = true
+        for j in 0..<m:
+            if hay[i + j] != needle[j]:
+                match = false
+                break
+        if match:
+            return true
+    return false
+
+fn uirModuleToMachine(module: UirModule, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
+    let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
+    if optLevel >= 1:
+        uirOptimizeModule(module, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
+    if dbgCodegen:
+        echo("[codegen] select.begin")
+    let res: Result[MachineModule] = machineSelectAarch64(module)
+    if ! IsOk[MachineModule](res):
+        return res
+    if dbgCodegen:
+        echo("[codegen] select.end")
+        echo("[codegen] regalloc.begin")
+    let allocated: MachineModule = machineAssignRegisters(res.value)
+    if dbgCodegen:
+        echo("[codegen] regalloc.end")
+    var out: Result[MachineModule]
+    out.ok = true
+    out.value = allocated
+    out.err = ErrorOk()
+    return out
+
+fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): Result[uint8[]] =
+    let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
+    if !uirTargetIsDarwin(target):
+        return Err[uint8[]]("uir_codegen: bootstrap path only supports darwin target: " + target)
+    if len(objWriter) > 0 && objWriter != "macho":
+        return Err[uint8[]]("uir_codegen: bootstrap path only supports macho writer")
+    if dbgCodegen:
+        echo("[codegen] writer.begin")
+    return machoWriteAarch64RelocatableObj(machine)
+
+fn writerIsEmptyOrInvalidRiscv(objWriter: str): bool =
+    return objWriter == nil || len(objWriter) == 0
+
+fn uirEmitObjFromModule(module: UirModule, optLevel: int32, target: str, objWriter: str,
+                         validateModule: bool,
+                         uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[uint8[]] =
+    if module == nil:
+        return Err[uint8[]]("uir_codegen: module is nil")
+    if validateModule:
+        let vRes: Result[bool] = uirValidateModule(module)
+        if ! IsOk[bool](vRes):
+            return Err[uint8[]](ErrorFormat(ErrorInfoOf[bool](vRes)))
+    let machineRes: Result[MachineModule] = uirModuleToMachine(module, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
+    if ! IsOk[MachineModule](machineRes):
+        return Err[uint8[]](ErrorFormat(ErrorInfoOf[MachineModule](machineRes)))
+    return uirEmitObjFromMachine(machineRes.value, target, objWriter)

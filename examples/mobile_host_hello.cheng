@@ -1,0 +1,77 @@
+import cheng/runtime/[mobile,mobile_app]
+
+var gPixels: void* = nil
+var gWidth: int32 = 0
+var gHeight: int32 = 0
+var gStride: int32 = 0
+var gFrame: int32 = 0
+
+fn clampByte(x: int32): uint32 =
+    let v: int32 = x and 255
+    return uint32(v)
+
+fn ensurePixels(width, height: int32) =
+    if width <= 0 or height <= 0:
+        return
+    if gPixels != nil and gWidth == width and gHeight == height:
+        return
+    if gPixels != nil:
+        dealloc(gPixels)
+        gPixels = nil
+    gWidth = width
+    gHeight = height
+    gStride = width * 4
+    let size: int32 = gStride * gHeight
+    gPixels = alloc(size)
+    zeroMem(gPixels, size)
+
+fn fillTestPattern(pixels: void*, width, height, strideBytes, frame: int32) =
+    if pixels == nil:
+        return
+    for y in 0..<height:
+        let row: void* = ptr_add(pixels, y * strideBytes)
+        for x in 0..<width:
+            let r: uint32 = clampByte(x + frame)
+            let g: uint32 = clampByte(y + frame * 2)
+            let b: uint32 = clampByte(x + y + frame * 3)
+            let a: uint32 = uint32(255)
+            let color: uint32 = (a << 24) or (r << 16) or (g << 8) or b
+            let p: uint32* = uint32*(ptr_add(row, x * 4))
+            *p = color
+
+fn onInit(runtime: MobileRuntimeHandle, windowId: int) =
+    android_runtime_queue_event(runtime, "host", "init window=" + $windowId)
+    ensurePixels(gWidth, gHeight)
+
+fn onEvent(runtime: MobileRuntimeHandle, ev: MobileRuntimeEvent) =
+    if ev.kind == mreWindowOpened:
+        android_runtime_queue_event(runtime, "host", "window opened")
+
+fn onFrame(runtime: MobileRuntimeHandle) =
+    if gPixels == nil:
+        return
+    fillTestPattern(gPixels, gWidth, gHeight, gStride, gFrame)
+    mobileHostPresentPixels(gPixels, gWidth, gHeight, gStride)
+    gFrame = gFrame + 1
+    android_runtime_trace(runtime, "frame", float64(gFrame))
+
+fn onShutdown(runtime: MobileRuntimeHandle) =
+    android_runtime_queue_event(runtime, "host", "shutdown")
+    if gPixels != nil:
+        dealloc(gPixels)
+        gPixels = nil
+
+fn main() =
+    var cfg = defaultMobileAppConfig(mpAndroid)
+    cfg.title = "Cheng Mobile Host"
+    cfg.width = 960
+    cfg.height = 540
+    gWidth = cfg.width
+    gHeight = cfg.height
+    var cb = defaultMobileAppCallbacks()
+    cb.onInit = onInit
+    cb.onEvent = onEvent
+    cb.onFrame = onFrame
+    cb.onShutdown = onShutdown
+    let summary = runMobileHostApp(cfg, cb, 600)
+    echo summary

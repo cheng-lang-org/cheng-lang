@@ -1,0 +1,73 @@
+import cheng/web/std/server_http
+import cheng/web/router/router as rtr
+import std/strings
+
+type
+    ServerRouteHandler = fn (req: HttpRequest, params: rtr.RouteParams): HttpResponse
+
+    ServerRoute =
+        id: int32
+        method: HttpMethod
+        path: str
+        pattern: rtr.RoutePattern
+        handler: ServerRouteHandler
+
+    ServerRouteMatch =
+        ok: bool
+        handler: ServerRouteHandler
+        params: rtr.RouteParams
+
+    ServerRouter = ref
+        routes: ServerRoute[]
+        nextId: int32
+
+fn newServerRouter(): ServerRouter =
+    var router: ServerRouter
+    new(router)
+    router.routes = []
+    router.nextId = 1
+    return router
+
+fn addRoute(router: ServerRouter, method: HttpMethod, path: str, handler: ServerRouteHandler) =
+    if router == nil || path == nil || len(path) == 0:
+        return
+    var entry: ServerRoute
+    entry.id = router.nextId
+    router.nextId = router.nextId + 1
+    entry.method = method
+    entry.path = path
+    entry.pattern = rtr.parseRoutePattern(path)
+    entry.handler = handler
+    router.routes.add(entry)
+
+fn addAnyRoute(router: ServerRouter, path: str, handler: ServerRouteHandler) =
+    addRoute(router, hmAny, path, handler)
+
+fn matchRoute(router: ServerRouter, method: HttpMethod, path: str): ServerRouteMatch =
+    var miss: ServerRouteMatch
+    miss.ok = false
+    miss.handler = nil
+    miss.params.items = []
+    if router == nil:
+        return miss
+    let cleanPath = rtr.cleanPath(path)
+    for i in 0..<len(router.routes):
+        let entry = router.routes[i]
+        if entry.method != hmAny && entry.method != method:
+            continue
+        let res = rtr.matchPattern(entry.pattern, cleanPath)
+        if res.ok:
+            var out: ServerRouteMatch
+            out.ok = true
+            out.handler = entry.handler
+            out.params = res.params
+            return out
+    return miss
+
+fn routeRequest(router: ServerRouter, req: HttpRequest): HttpResponse =
+    if router == nil:
+        return notFoundResponse()
+    let match = matchRoute(router, req.method, req.path)
+    if ! match.ok || match.handler == nil:
+        return notFoundResponse()
+    return match.handler(req, match.params)

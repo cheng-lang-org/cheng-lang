@@ -1,0 +1,1741 @@
+# Minimal X.509 DER parser && chain validator(pure Cheng).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/strings
+import std/stringlist
+import std/crypto/minasn1
+import std/crypto/rsa
+import std/crypto/ecnist
+const
+    x509TagUtcTime = 0x17
+    x509TagGeneralizedTime = 0x18
+    x509TagContext0 = 0xa0
+    x509TagContext3 = 0xa3
+    x509TagDnsName = 0x82
+    x509MaxChain = 8
+    x509MaxCrls = 8
+    x509MaxRevoked = 128
+    x509MonthsInYear = 12
+
+    oidRsaEncryption = "1.2.840.113549.1.1.1"
+    oidRsaPss = "1.2.840.113549.1.1.10"
+    oidMgf1 = "1.2.840.113549.1.1.8"
+    oidSha256WithRsa = "1.2.840.113549.1.1.11"
+    oidSha384WithRsa = "1.2.840.113549.1.1.12"
+    oidSha256 = "2.16.840.1.101.3.4.2.1"
+    oidSha384 = "2.16.840.1.101.3.4.2.2"
+    oidEcdsaPublicKey = "1.2.840.10045.2.1"
+    oidPrime256v1 = "1.2.840.10045.3.1.7"
+    oidEcdsaWithSha256 = "1.2.840.10045.4.3.2"
+    oidEcdsaWithSha384 = "1.2.840.10045.4.3.3"
+    oidOcspBasic = "1.3.6.1.5.5.7.48.1.1"
+    oidBasicConstraints = "2.5.29.19"
+    oidKeyUsage = "2.5.29.15"
+    oidExtKeyUsage = "2.5.29.37"
+    oidSubjectAltName = "2.5.29.17"
+    oidServerAuth = "1.3.6.1.5.5.7.3.1"
+
+    x509KeyUsageDigitalSignature = 1 << 0
+    x509KeyUsageKeyEncipherment = 1 << 2
+    x509KeyUsageKeyCertSign = 1 << 5
+
+type
+    X509SignatureKind = enum
+        X509SigUnknown = 0
+        X509SigRsaSha256 = 1
+        X509SigRsaSha384 = 2
+        X509SigEcdsaSha256 = 3
+        X509SigEcdsaSha384 = 4
+        X509SigRsaPss = 5
+
+    X509HashKind = enum
+        X509HashUnknown = 0
+        X509HashSha256 = 1
+        X509HashSha384 = 2
+
+    X509PublicKeyKind = enum
+        X509KeyUnknown = 0
+        X509KeyRsa = 1
+        X509KeyEcdsaP256 = 2
+
+    X509OidNext =
+        oid: str
+        next: int32
+
+    X509BitStringNext =
+        bytes: Bytes
+        unused: int32
+        next: int32
+
+    X509RawTlv =
+        tag: int32
+        raw: Bytes
+        value: Bytes
+        next: int32
+
+    X509HashSaltLen =
+        hash: X509HashKind
+        saltLen: int32
+
+    X509SigAlgNext =
+        sigAlg: X509SignatureKind
+        pssHash: X509HashKind
+        pssSaltLen: int32
+        next: int32
+
+    X509AlgIdParamNext =
+        oid: str
+        paramOid: str
+        next: int32
+
+    X509PublicKey =
+        kind: X509PublicKeyKind
+        rsa: RsaBigPublicKey
+        ecdsa: EcPublicKey
+
+    X509Certificate =
+        tbs: Bytes
+        signature: Bytes
+        sigAlg: X509SignatureKind
+        pssHash: X509HashKind
+        pssSaltLen: int32
+        tbsSigAlg: X509SignatureKind
+        tbsPssHash: X509HashKind
+        tbsPssSaltLen: int32
+        serial: Bytes
+        issuer: Bytes
+        subject: Bytes
+        notBefore: int64
+        notAfter: int64
+        isCa: bool
+        hasBasicConstraints: bool
+        keyUsage: int32
+        hasKeyUsage: bool
+        extKeyUsage: StringList
+        dnsNames: StringList
+        hasUnknownCritical: bool
+        publicKey: X509PublicKey
+
+    X509CertList =
+        count: int32
+        # Store pointers and allocate stable storage per slot.
+        items: X509Certificate*[x509MaxChain]
+
+    X509RevocationMode = enum
+        X509RevocationOff = 0
+        X509RevocationBestEffort = 1
+        X509RevocationStrict = 2
+
+    X509RevocationStatus = enum
+        X509RevocationGood = 0
+        X509RevocationRevoked = 1
+        X509RevocationUnknown = 2
+
+    X509Crl =
+        issuer: Bytes
+        thisUpdate: int64
+        nextUpdate: int64
+        revokedCount: int32
+        revokedSerials: Bytes[x509MaxRevoked]
+
+fn initX509PublicKey(): X509PublicKey =
+    X509PublicKey(kind: X509KeyUnknown)
+
+fn initX509Certificate(): X509Certificate =
+    X509Certificate(
+        tbs: emptyBytes(),
+        signature: emptyBytes(),
+        sigAlg: X509SigUnknown,
+        pssHash: X509HashUnknown,
+        pssSaltLen: -1,
+        tbsSigAlg: X509SigUnknown,
+        tbsPssHash: X509HashUnknown,
+        tbsPssSaltLen: -1,
+        serial: emptyBytes(),
+        issuer: emptyBytes(),
+        subject: emptyBytes(),
+        notBefore: 0,
+        notAfter: 0,
+        isCa: false,
+        hasBasicConstraints: false,
+        keyUsage: 0,
+        hasKeyUsage: false,
+        extKeyUsage: initStringList(),
+        dnsNames: initStringList(),
+        hasUnknownCritical: false,
+        publicKey: initX509PublicKey()
+    )
+
+fn initX509CertList(): X509CertList =
+    X509CertList(count: 0)
+
+fn x509CertListEnsureSlot(list: var X509CertList, idx: int32): X509Certificate* =
+    if idx < 0 || idx >= x509MaxChain:
+        return nil
+    if list.items[idx] != nil:
+        return list.items[idx]
+    let mem: void* = alloc(sizeof X509Certificate)
+    if mem == nil:
+        return nil
+    zeroMem(mem, sizeof X509Certificate)
+    list.items[idx] = X509Certificate*(mem)
+    return list.items[idx]
+
+fn initX509Crl(): X509Crl =
+    X509Crl(
+        issuer: emptyBytes(),
+        thisUpdate: 0,
+        nextUpdate: 0,
+        revokedCount: 0
+    )
+
+fn x509CertListAdd(list: var X509CertList, cert: X509Certificate): Result[bool] =
+    if list.count >= x509MaxChain:
+        return Err[bool]("x509: cert list full")
+    let slot: X509Certificate* = x509CertListEnsureSlot(list, list.count)
+    if slot == nil:
+        return Err[bool]("x509: cert list alloc failed")
+    *slot = cert
+    list.count = list.count + 1
+    return Ok[bool](true)
+
+fn x509CertListAllocSlot(list: var X509CertList): Result[int32] =
+    if list.count >= x509MaxChain:
+        return Err[int32]("x509: cert list full")
+    let idx: int32 = list.count
+    let slot: X509Certificate* = x509CertListEnsureSlot(list, idx)
+    if slot == nil:
+        return Err[int32]("x509: cert list alloc failed")
+    *slot = initX509Certificate()
+    list.count = list.count + 1
+    return Ok[int32](idx)
+
+
+fn x509CertListFindBySubject(list: X509CertList*, subject: Bytes): Result[X509Certificate*] =
+    if void*(list) == nil:
+        return Err[X509Certificate*]("x509: issuer ! found")
+    for i in 0..<list.count:
+        let p: X509Certificate* = list.items[i]
+        if p != nil && bytesEqual(p.subject, subject):
+            return Ok[X509Certificate*](p)
+    return Err[X509Certificate*]("x509: issuer ! found")
+
+fn x509CertListFindBySubjectIndex(list: X509CertList*, subject: Bytes): int32 =
+    if void*(list) == nil:
+        return -1
+    for i in 0..<list.count:
+        let p: X509Certificate* = list.items[i]
+        if p != nil && bytesEqual(p.subject, subject):
+            return i
+    return -1
+
+fn x509IntToString(value: int64): str =
+    if value == 0:
+        return "0"
+    var v: int64 = value
+    var buf: ByteBuffer = newByteBuffer()
+    while v > 0:
+        let digit: int32 = int32(v % 10)
+        appendByte(buf, int32('0') + digit)
+        v = v / 10
+    let rev: Bytes = toBytes(buf)
+    let out: Bytes = bytesAlloc(bytesLen(rev))
+    for i in 0..<bytesLen(rev):
+        let srcIdx: int32 = bytesLen(rev) - 1 - i
+        bytesSet(out, i, bytesGet(rev, srcIdx))
+    return bytesToString(out)
+
+fn x509OidToString(value: Bytes): Result[str] =
+    if bytesLen(value) <= 0:
+        return Err[str]("x509: oid empty")
+    let first: int32 = bytesGet(value, 0)
+    var arc0: int64 = 0
+    var arc1: int64 = 0
+    if first < 40:
+        arc0 = 0
+        arc1 = first
+    elif first < 80:
+        arc0 = 1
+        arc1 = first - 40
+    else:
+        arc0 = 2
+        arc1 = first - 80
+    var out: str = x509IntToString(arc0)
+    out = out + "."
+    out = out + x509IntToString(arc1)
+    var acc: int64 = 0
+    var i: int32 = 1
+    var lastByte: int32 = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<bytesLen(value):
+        i = __for_i_1
+        let b: int32 = bytesGet(value, i)
+        lastByte = b
+        # Low 7 bits are empty after shift; + is equivalent to | here.
+        acc = (acc << 7) + int64(b & 0x7f)
+        if (b & 0x80) == 0:
+            out = out + "."
+            out = out + x509IntToString(acc)
+            acc = 0
+        i = i + 1
+    if (lastByte & 0x80) != 0:
+        return Err[str]("x509: oid truncated")
+    return Ok[str](out)
+
+fn x509ReadOid(data: Bytes, offset: int32): Result[X509OidNext] =
+    let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(data, offset)
+    if IsErr(tlvRes):
+        return Err[X509OidNext](Error(tlvRes))
+    let tlv = Value(tlvRes)
+    if tlv.tag != asn1TagOid:
+        return Err[X509OidNext]("x509: expected oid")
+    let oidRes: Result[str] = x509OidToString(tlv.value)
+    if IsErr(oidRes):
+        return Err[X509OidNext](Error(oidRes))
+    let out: X509OidNext = X509OidNext(oid: Value(oidRes), next: tlv.next)
+    return Ok[X509OidNext](out)
+
+fn x509DecodeBitString(data: Bytes, offset: int32): Result[X509BitStringNext] =
+    let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(data, offset)
+    if IsErr(tlvRes):
+        return Err[X509BitStringNext](Error(tlvRes))
+    let tlv = Value(tlvRes)
+    if tlv.tag != asn1TagBitString:
+        return Err[X509BitStringNext]("x509: expected bit string")
+    if bytesLen(tlv.value) <= 0:
+        return Err[X509BitStringNext]("x509: bit string empty")
+    let unused: int32 = bytesGet(tlv.value, 0)
+    if unused < 0 || unused > 7:
+        return Err[X509BitStringNext]("x509: bit string unused bits invalid")
+    let payload: Bytes = bytesSlice(tlv.value, 1, bytesLen(tlv.value) - 1)
+    return Ok[X509BitStringNext](X509BitStringNext(bytes: payload, unused: unused, next: tlv.next))
+
+fn x509ReadRawTlv(data: Bytes, offset: int32): Result[X509RawTlv] =
+    let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(data, offset)
+    if IsErr(tlvRes):
+        return Err[X509RawTlv](Error(tlvRes))
+    let tlv = Value(tlvRes)
+    let raw: Bytes = bytesSlice(data, offset, tlv.next - offset)
+    if bytesLen(raw) <= 0:
+        var msg: str = "x509: raw tlv empty"
+        msg = msg + " tag="
+        msg = msg + x509IntToString(int64(tlv.tag))
+        msg = msg + " offset="
+        msg = msg + x509IntToString(int64(offset))
+        msg = msg + " next="
+        msg = msg + x509IntToString(int64(tlv.next))
+        msg = msg + " dataLen="
+        msg = msg + x509IntToString(int64(bytesLen(data)))
+        return Err[X509RawTlv](msg)
+    return Ok[X509RawTlv](X509RawTlv(tag: tlv.tag, raw: raw, value: tlv.value, next: tlv.next))
+
+fn x509SigAlgFromOid(oid: str): X509SignatureKind =
+    if (oid == oidSha256WithRsa):
+        return X509SigRsaSha256
+    if (oid == oidSha384WithRsa):
+        return X509SigRsaSha384
+    if (oid == oidEcdsaWithSha256):
+        return X509SigEcdsaSha256
+    if (oid == oidEcdsaWithSha384):
+        return X509SigEcdsaSha384
+    if (oid == oidRsaPss):
+        return X509SigRsaPss
+    return X509SigUnknown
+
+fn x509HashKindFromOid(oid: str): X509HashKind =
+    if (oid == oidSha256):
+        return X509HashSha256
+    if (oid == oidSha384):
+        return X509HashSha384
+    return X509HashUnknown
+
+fn x509HashLen(hash: X509HashKind): int32 =
+    if hash == X509HashSha256:
+        return 32
+    if hash == X509HashSha384:
+        return 48
+    return 0
+
+fn x509ParseMgf1Hash(value: Bytes): Result[X509HashKind] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(value, 0)
+    if IsErr(seqRes):
+        return Err[X509HashKind](Error(seqRes))
+    let seqValue: Bytes = Value(seqRes).value
+    var inner: int32 = 0
+    let oidRes: Result[X509OidNext] = x509ReadOid(seqValue, inner)
+    if IsErr(oidRes):
+        return Err[X509HashKind](Error(oidRes))
+    let algOid: str = Value(oidRes).oid
+    if ! (algOid == oidMgf1):
+        return Err[X509HashKind]("x509: unsupported mgf")
+    inner = Value(oidRes).next
+    if inner >= bytesLen(seqValue):
+        return Err[X509HashKind]("x509: mgf1 missing hash")
+    let hashAlgRes: Result[Asn1TagValueNext] = asn1DecodeTlv(seqValue, inner)
+    if IsErr(hashAlgRes):
+        return Err[X509HashKind](Error(hashAlgRes))
+    let hashTlv = Value(hashAlgRes)
+    if hashTlv.tag != asn1TagSequence:
+        return Err[X509HashKind]("x509: mgf1 hash alg ! sequence")
+    let hashOidRes: Result[X509OidNext] = x509ReadOid(hashTlv.value, 0)
+    if IsErr(hashOidRes):
+        return Err[X509HashKind](Error(hashOidRes))
+    let hashKind: X509HashKind = x509HashKindFromOid(Value(hashOidRes).oid)
+    if hashKind == X509HashUnknown:
+        return Err[X509HashKind]("x509: mgf1 hash unsupported")
+    return Ok[X509HashKind](hashKind)
+
+fn x509ParsePssParams(value: Bytes): Result[X509HashSaltLen] =
+    var hashKind: X509HashKind = X509HashUnknown
+    var mgfHash: X509HashKind = X509HashUnknown
+    var saltLen: int32 = -1
+    var trailerField: int64 = 1
+    var offset: int32 = 0
+    while offset < bytesLen(value):
+        let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(value, offset)
+        if IsErr(tlvRes):
+            return Err[X509HashSaltLen](Error(tlvRes))
+        let tlv = Value(tlvRes)
+        if tlv.tag == 0xa0:
+            let algRes: Result[X509OidNext] = x509ParseAlgId(tlv.value, 0)
+            if IsErr(algRes):
+                return Err[X509HashSaltLen](Error(algRes))
+            hashKind = x509HashKindFromOid(Value(algRes).oid)
+        elif tlv.tag == 0xa1:
+            let mgfRes: Result[X509HashKind] = x509ParseMgf1Hash(tlv.value)
+            if IsErr(mgfRes):
+                return Err[X509HashSaltLen](Error(mgfRes))
+            mgfHash = Value(mgfRes)
+        elif tlv.tag == 0xa2:
+            let lenRes: Result[Asn1Int64Next] = asn1DecodeInt64(tlv.value, 0)
+            if IsErr(lenRes):
+                return Err[X509HashSaltLen](Error(lenRes))
+            saltLen = int32(Value(lenRes).value)
+        elif tlv.tag == 0xa3:
+            let trailerRes: Result[Asn1Int64Next] = asn1DecodeInt64(tlv.value, 0)
+            if IsErr(trailerRes):
+                return Err[X509HashSaltLen](Error(trailerRes))
+            trailerField = Value(trailerRes).value
+        offset = tlv.next
+    if trailerField != 1:
+        return Err[X509HashSaltLen]("x509: unsupported pss trailer")
+    if hashKind == X509HashUnknown:
+        return Err[X509HashSaltLen]("x509: pss hash unsupported")
+    if mgfHash == X509HashUnknown:
+        return Err[X509HashSaltLen]("x509: pss mgf missing")
+    if mgfHash != hashKind:
+        return Err[X509HashSaltLen]("x509: pss mgf hash mismatch")
+    let hashLen: int32 = x509HashLen(hashKind)
+    if hashLen <= 0:
+        return Err[X509HashSaltLen]("x509: pss hash length invalid")
+    if saltLen < 0:
+        saltLen = hashLen
+    if saltLen != hashLen:
+        return Err[X509HashSaltLen]("x509: pss salt length unsupported")
+    return Ok[X509HashSaltLen](X509HashSaltLen(hash: hashKind, saltLen: saltLen))
+
+fn x509ParseSignatureAlgorithm(
+    data: Bytes,
+    offset: int32
+): Result[X509SigAlgNext] =
+    
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, offset)
+    if IsErr(seqRes):
+        return Err[X509SigAlgNext](Error(seqRes))
+    let seqValue: Bytes = Value(seqRes).value
+    var inner: int32 = 0
+    let oidRes: Result[X509OidNext] = x509ReadOid(seqValue, inner)
+    if IsErr(oidRes):
+        return Err[X509SigAlgNext](Error(oidRes))
+    let algOid: str = Value(oidRes).oid
+    inner = Value(oidRes).next
+    let sigAlg: X509SignatureKind = x509SigAlgFromOid(algOid)
+    var pssHash: X509HashKind = X509HashUnknown
+    var pssSaltLen: int32 = -1
+    if sigAlg == X509SigRsaPss:
+        if inner >= bytesLen(seqValue):
+            return Err[X509SigAlgNext]("x509: pss params missing")
+        let paramRes: Result[Asn1TagValueNext] = asn1DecodeTlv(seqValue, inner)
+        if IsErr(paramRes):
+            return Err[X509SigAlgNext](Error(paramRes))
+        let paramTlv = Value(paramRes)
+        if paramTlv.tag != asn1TagSequence:
+            return Err[X509SigAlgNext]("x509: pss params ! sequence")
+        let pssRes: Result[X509HashSaltLen] = x509ParsePssParams(paramTlv.value)
+        if IsErr(pssRes):
+            return Err[X509SigAlgNext](Error(pssRes))
+        pssHash = Value(pssRes).hash
+        pssSaltLen = Value(pssRes).saltLen
+    elif sigAlg == X509SigUnknown:
+        return Err[X509SigAlgNext]("x509: unsupported signature algorithm oid=" + algOid)
+    return Ok[X509SigAlgNext](
+        X509SigAlgNext(sigAlg: sigAlg, pssHash: pssHash, pssSaltLen: pssSaltLen, next: Value(seqRes).next)
+    )
+
+fn x509ParseAlgId(data: Bytes, offset: int32): Result[X509OidNext] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, offset)
+    if IsErr(seqRes):
+        return Err[X509OidNext](Error(seqRes))
+    let seqValue: Bytes = Value(seqRes).value
+    let oidRes: Result[X509OidNext] = x509ReadOid(seqValue, 0)
+    if IsErr(oidRes):
+        return Err[X509OidNext](Error(oidRes))
+    let out: X509OidNext = X509OidNext(oid: Value(oidRes).oid, next: Value(seqRes).next)
+    return Ok[X509OidNext](out)
+
+fn x509ParseAlgIdWithParam(data: Bytes, offset: int32): Result[X509AlgIdParamNext] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, offset)
+    if IsErr(seqRes):
+        return Err[X509AlgIdParamNext](Error(seqRes))
+    let seqValue: Bytes = Value(seqRes).value
+    var inner: int32 = 0
+    let oidRes: Result[X509OidNext] = x509ReadOid(seqValue, inner)
+    if IsErr(oidRes):
+        return Err[X509AlgIdParamNext](Error(oidRes))
+    inner = Value(oidRes).next
+    var paramOid: str = ""
+    if inner < bytesLen(seqValue):
+        let paramTlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(seqValue, inner)
+        if IsOk(paramTlvRes):
+            let paramTlv = Value(paramTlvRes)
+            if paramTlv.tag == asn1TagOid:
+                let paramOidRes: Result[str] = x509OidToString(paramTlv.value)
+                if IsOk(paramOidRes):
+                    paramOid = Value(paramOidRes)
+    let out: X509AlgIdParamNext = X509AlgIdParamNext(
+        oid: Value(oidRes).oid,
+        paramOid: paramOid,
+        next: Value(seqRes).next
+    )
+    return Ok[X509AlgIdParamNext](out)
+
+fn x509Digit(c: char): int32 =
+    if c < '0' || c > '9':
+        return -1
+    return int32(c) - int32('0')
+
+fn x509Parse2(text: str, pos: int32): Result[int32] =
+    let d1: int32 = x509Digit(text[pos])
+    let d2: int32 = x509Digit(text[pos + 1])
+    if d1 < 0 || d2 < 0:
+        return Err[int32]("x509: invalid time digit")
+    return Ok[int32](d1 * 10 + d2)
+
+fn x509Parse4(text: str, pos: int32): Result[int32] =
+    let a: int32 = x509Digit(text[pos])
+    let b: int32 = x509Digit(text[pos + 1])
+    let c: int32 = x509Digit(text[pos + 2])
+    let d: int32 = x509Digit(text[pos + 3])
+    if a < 0 || b < 0 || c < 0 || d < 0:
+        return Err[int32]("x509: invalid time digit")
+    return Ok[int32](((a * 10 + b) * 10 + c) * 10 + d)
+
+fn x509IsLeap(year: int32): bool =
+    if (year % 4) != 0:
+        return false
+    if (year % 100) != 0:
+        return true
+    return (year % 400) == 0
+
+fn x509DaysInMonth(year: int32, month: int32): int32 =
+    if month < 1 || month > x509MonthsInYear:
+        return 0
+    if month == 2 && x509IsLeap(year):
+        return 29
+    case month:
+        of 1: return 31
+        of 2: return 28
+        of 3: return 31
+        of 4: return 30
+        of 5: return 31
+        of 6: return 30
+        of 7: return 31
+        of 8: return 31
+        of 9: return 30
+        of 10: return 31
+        of 11: return 30
+        of 12: return 31
+        else: return 0
+
+fn x509DaysBeforeYear(year: int32): int64 =
+    var y: int32 = 1970
+    var days: int64 = 0
+    let __for_start_y_2 = y
+    for __for_y_2 in __for_start_y_2..<year:
+        y = __for_y_2
+        let yearDays: int64 = if x509IsLeap(y): 366 else: 365
+        days = days + yearDays
+        y = y + 1
+    return days
+
+fn x509DaysBeforeMonth(year: int32, month: int32): int32 =
+    var m: int32 = 1
+    var days: int32 = 0
+    let __for_start_m_3 = m
+    for __for_m_3 in __for_start_m_3..<month:
+        m = __for_m_3
+        days = days + x509DaysInMonth(year, m)
+        m = m + 1
+    return days
+
+fn x509ToEpoch(year: int32, month: int32, day: int32, hour: int32, minute: int32, second: int32): Result[int64] =
+    if year < 1970:
+        return Err[int64]("x509: time before epoch")
+    if month < 1 || month > 12:
+        return Err[int64]("x509: invalid time month")
+    let maxDay: int32 = x509DaysInMonth(year, month)
+    if day < 1 || day > maxDay:
+        return Err[int64]("x509: invalid time day")
+    if hour < 0 || hour > 23:
+        return Err[int64]("x509: invalid time hour")
+    if minute < 0 || minute > 59:
+        return Err[int64]("x509: invalid time minute")
+    if second < 0 || second > 59:
+        return Err[int64]("x509: invalid time second")
+    let days: int64 = x509DaysBeforeYear(year) + int64(x509DaysBeforeMonth(year, month) + (day - 1))
+    let total: int64 = days * 86400 + int64(hour * 3600 + minute * 60 + second)
+    return Ok[int64](total)
+
+fn x509ParseTimeBytes(data: Bytes, tag: int32): Result[int64] =
+    let text: str = bytesToString(data)
+    if len(text) <= 0:
+        return Err[int64]("x509: empty time")
+    if text[len(text) - 1] != 'Z':
+        return Err[int64]("x509: time missing Z")
+    if tag == x509TagUtcTime:
+        if len(text) != 11 && len(text) != 13:
+            return Err[int64]("x509: utc time length")
+        let yearRes: Result[int32] = x509Parse2(text, 0)
+        if IsErr(yearRes):
+            return Err[int64](Error(yearRes))
+        let yy: int32 = Value(yearRes)
+        let year: int32 = if yy >= 50: 1900 + yy else: 2000 + yy
+        let monRes: Result[int32] = x509Parse2(text, 2)
+        if IsErr(monRes):
+            return Err[int64](Error(monRes))
+        let dayRes: Result[int32] = x509Parse2(text, 4)
+        if IsErr(dayRes):
+            return Err[int64](Error(dayRes))
+        let hourRes: Result[int32] = x509Parse2(text, 6)
+        if IsErr(hourRes):
+            return Err[int64](Error(hourRes))
+        let minRes: Result[int32] = x509Parse2(text, 8)
+        if IsErr(minRes):
+            return Err[int64](Error(minRes))
+        var sec: int32 = 0
+        if len(text) == 13:
+            let secRes: Result[int32] = x509Parse2(text, 10)
+            if IsErr(secRes):
+                return Err[int64](Error(secRes))
+            sec = Value(secRes)
+        return x509ToEpoch(year, Value(monRes), Value(dayRes), Value(hourRes), Value(minRes), sec)
+    if tag == x509TagGeneralizedTime:
+        if len(text) != 13 && len(text) != 15:
+            return Err[int64]("x509: generalized time length")
+        let yearRes: Result[int32] = x509Parse4(text, 0)
+        if IsErr(yearRes):
+            return Err[int64](Error(yearRes))
+        let monRes: Result[int32] = x509Parse2(text, 4)
+        if IsErr(monRes):
+            return Err[int64](Error(monRes))
+        let dayRes: Result[int32] = x509Parse2(text, 6)
+        if IsErr(dayRes):
+            return Err[int64](Error(dayRes))
+        let hourRes: Result[int32] = x509Parse2(text, 8)
+        if IsErr(hourRes):
+            return Err[int64](Error(hourRes))
+        let minRes: Result[int32] = x509Parse2(text, 10)
+        if IsErr(minRes):
+            return Err[int64](Error(minRes))
+        var sec: int32 = 0
+        if len(text) == 15:
+            let secRes: Result[int32] = x509Parse2(text, 12)
+            if IsErr(secRes):
+                return Err[int64](Error(secRes))
+            sec = Value(secRes)
+        return x509ToEpoch(Value(yearRes), Value(monRes), Value(dayRes), Value(hourRes), Value(minRes), sec)
+    return Err[int64]("x509: unsupported time tag")
+
+fn x509ParseTime(data: Bytes, offset: int32): Result[Asn1Int64Next] =
+    let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(data, offset)
+    if IsErr(tlvRes):
+        return Err[Asn1Int64Next](Error(tlvRes))
+    let tlv = Value(tlvRes)
+    if tlv.tag != x509TagUtcTime && tlv.tag != x509TagGeneralizedTime:
+        return Err[Asn1Int64Next]("x509: invalid time tag")
+    let timeRes: Result[int64] = x509ParseTimeBytes(tlv.value, tlv.tag)
+    if IsErr(timeRes):
+        return Err[Asn1Int64Next](Error(timeRes))
+    return Ok[Asn1Int64Next](Asn1Int64Next(value: Value(timeRes), next: tlv.next))
+
+fn x509ParseKeyUsage(value: Bytes): Result[int32] =
+    if bytesLen(value) <= 0:
+        return Err[int32]("x509: keyusage empty")
+    let unused: int32 = bytesGet(value, 0)
+    if unused < 0 || unused > 7:
+        return Err[int32]("x509: keyusage unused bits invalid")
+    let totalBits: int32 = (bytesLen(value) - 1) * 8 - unused
+    var mask: int32 = 0
+    var bitIndex: int32 = 0
+    for i in 1..<bytesLen(value):
+        let b: int32 = bytesGet(value, i)
+        for j in 0..<8:
+            if !(bitIndex < totalBits):
+                break
+            let bitSet: bool = (b & (1 << (7 - j))) != 0
+            if bitSet && bitIndex < 31:
+                mask = mask | (1 << bitIndex)
+            bitIndex = bitIndex + 1
+    return Ok[int32](mask)
+
+fn x509ParseSpki(spkiValue: Bytes): Result[X509PublicKey] =
+    var offset: int32 = 0
+    let algRes: Result[X509AlgIdParamNext] = x509ParseAlgIdWithParam(spkiValue, offset)
+    if IsErr(algRes):
+        return Err[X509PublicKey](Error(algRes))
+    let alg = Value(algRes)
+    offset = alg.next
+    let spkRes: Result[X509BitStringNext] = x509DecodeBitString(spkiValue, offset)
+    if IsErr(spkRes):
+        return Err[X509PublicKey](Error(spkRes))
+    let spkBytes: Bytes = Value(spkRes).bytes
+    if (alg.oid == oidRsaEncryption):
+        let rsaRes: Result[RsaBigPublicKey] = rsaBigPublicKeyFromBytes(spkBytes)
+        if IsErr(rsaRes):
+            return Err[X509PublicKey](Error(rsaRes))
+        return Ok[X509PublicKey](X509PublicKey(kind: X509KeyRsa, rsa: Value(rsaRes)))
+    if (alg.oid == oidEcdsaPublicKey):
+        if ! (alg.paramOid == oidPrime256v1):
+            return Err[X509PublicKey]("x509: unsupported ec curve")
+        let pubRes: Result[EcPublicKey] = ecdsaPublicKeyFromBytes(spkBytes)
+        if IsErr(pubRes):
+            return Err[X509PublicKey](Error(pubRes))
+        return Ok[X509PublicKey](X509PublicKey(kind: X509KeyEcdsaP256, ecdsa: Value(pubRes)))
+    return Err[X509PublicKey]("x509: unsupported public key")
+
+fn x509ParseExtensions(data: Bytes, cert: var X509Certificate): Result[bool] =
+    var offset: int32 = 0
+    while offset < bytesLen(data):
+        let extRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, offset)
+        if IsErr(extRes):
+            return Err[bool](Error(extRes))
+        let extValue: Bytes = Value(extRes).value
+        offset = Value(extRes).next
+        var inner: int32 = 0
+        let oidRes: Result[X509OidNext] = x509ReadOid(extValue, inner)
+        if IsErr(oidRes):
+            return Err[bool](Error(oidRes))
+        let oid: str = Value(oidRes).oid
+        inner = Value(oidRes).next
+        var critical: bool = false
+        if inner < bytesLen(extValue):
+            let critRes: Result[Asn1TagValueNext] = asn1DecodeTlv(extValue, inner)
+            if IsOk(critRes):
+                let critTlv = Value(critRes)
+                if critTlv.tag == asn1TagBoolean:
+                    if bytesLen(critTlv.value) == 1 && bytesGet(critTlv.value, 0) != 0:
+                        critical = true
+                    inner = critTlv.next
+        let valRes: Result[Asn1TagValueNext] = asn1DecodeTlv(extValue, inner)
+        if IsErr(valRes):
+            return Err[bool](Error(valRes))
+        let valTlv = Value(valRes)
+        if valTlv.tag != asn1TagOctetString:
+            return Err[bool]("x509: extension value ! octet string")
+        let extData: Bytes = valTlv.value
+        if (oid == oidBasicConstraints):
+            cert.hasBasicConstraints = true
+            let bcSeqRes: Result[Asn1ValueNext] = asn1DecodeSequence(extData, 0)
+            if IsErr(bcSeqRes):
+                return Err[bool](Error(bcSeqRes))
+            let bcValue: Bytes = Value(bcSeqRes).value
+            if bytesLen(bcValue) > 0:
+                let bcFirstRes: Result[Asn1TagValueNext] = asn1DecodeTlv(bcValue, 0)
+                if IsErr(bcFirstRes):
+                    return Err[bool](Error(bcFirstRes))
+                let bcFirst = Value(bcFirstRes)
+                if bcFirst.tag == asn1TagBoolean && bytesLen(bcFirst.value) == 1:
+                    cert.isCa = bytesGet(bcFirst.value, 0) != 0
+        elif (oid == oidKeyUsage):
+            cert.hasKeyUsage = true
+            let kuRes: Result[Asn1TagValueNext] = asn1DecodeTlv(extData, 0)
+            if IsErr(kuRes):
+                return Err[bool](Error(kuRes))
+            let kuTlv = Value(kuRes)
+            if kuTlv.tag != asn1TagBitString:
+                return Err[bool]("x509: keyusage ! bit string")
+            let maskRes: Result[int32] = x509ParseKeyUsage(kuTlv.value)
+            if IsErr(maskRes):
+                return Err[bool](Error(maskRes))
+            cert.keyUsage = Value(maskRes)
+        elif (oid == oidExtKeyUsage):
+            let ekuSeqRes: Result[Asn1ValueNext] = asn1DecodeSequence(extData, 0)
+            if IsErr(ekuSeqRes):
+                return Err[bool](Error(ekuSeqRes))
+            let ekuValue: Bytes = Value(ekuSeqRes).value
+            var ekuOff: int32 = 0
+            while ekuOff < bytesLen(ekuValue):
+                let ekuOidRes: Result[X509OidNext] = x509ReadOid(ekuValue, ekuOff)
+                if IsErr(ekuOidRes):
+                    return Err[bool](Error(ekuOidRes))
+                let addRes: Result[bool] = stringListAdd(cert.extKeyUsage, Value(ekuOidRes).oid)
+                if IsErr(addRes):
+                    return Err[bool](Error(addRes))
+                ekuOff = Value(ekuOidRes).next
+        elif (oid == oidSubjectAltName):
+            let sanSeqRes: Result[Asn1ValueNext] = asn1DecodeSequence(extData, 0)
+            if IsErr(sanSeqRes):
+                return Err[bool](Error(sanSeqRes))
+            let sanValue: Bytes = Value(sanSeqRes).value
+            var sanOff: int32 = 0
+            while sanOff < bytesLen(sanValue):
+                let gnRes: Result[Asn1TagValueNext] = asn1DecodeTlv(sanValue, sanOff)
+                if IsErr(gnRes):
+                    return Err[bool](Error(gnRes))
+                let gn = Value(gnRes)
+                if gn.tag == x509TagDnsName:
+                    let name: str = bytesToString(gn.value)
+                    let addRes: Result[bool] = stringListAdd(cert.dnsNames, name)
+                    if IsErr(addRes):
+                        return Err[bool](Error(addRes))
+                sanOff = gn.next
+        else:
+            if critical:
+                cert.hasUnknownCritical = true
+    return Ok[bool](true)
+
+fn x509ParseTbs(tbsValue: Bytes, cert: var X509Certificate): Result[bool] =
+    var offset: int32 = 0
+    if offset < bytesLen(tbsValue) && bytesGet(tbsValue, offset) == x509TagContext0:
+        let verRes: Result[Asn1TagValueNext] = asn1DecodeTlv(tbsValue, offset)
+        if IsErr(verRes):
+            return Err[bool](Error(verRes))
+        offset = Value(verRes).next
+    let serialRes: Result[Asn1ValueNext] = asn1DecodeInteger(tbsValue, offset)
+    if IsErr(serialRes):
+        return Err[bool](Error(serialRes))
+    cert.serial.data = Value(serialRes).value.data
+    cert.serial.len = Value(serialRes).value.len
+    offset = Value(serialRes).next
+    let sigRes: Result[X509SigAlgNext] = x509ParseSignatureAlgorithm(tbsValue, offset)
+    if IsErr(sigRes):
+        return Err[bool](Error(sigRes))
+    cert.tbsSigAlg = Value(sigRes).sigAlg
+    cert.tbsPssHash = Value(sigRes).pssHash
+    cert.tbsPssSaltLen = Value(sigRes).pssSaltLen
+    offset = Value(sigRes).next
+    let issuerRes: Result[X509RawTlv] = x509ReadRawTlv(tbsValue, offset)
+    if IsErr(issuerRes):
+        return Err[bool](Error(issuerRes))
+    let issuerTlv = Value(issuerRes)
+    if issuerTlv.tag != asn1TagSequence:
+        return Err[bool]("x509: issuer ! sequence")
+    cert.issuer.data = issuerTlv.raw.data
+    cert.issuer.len = issuerTlv.raw.len
+    offset = issuerTlv.next
+    let validRes: Result[Asn1ValueNext] = asn1DecodeSequence(tbsValue, offset)
+    if IsErr(validRes):
+        return Err[bool](Error(validRes))
+    let validValue: Bytes = Value(validRes).value
+    var vOff: int32 = 0
+    let notBeforeRes: Result[Asn1Int64Next] = x509ParseTime(validValue, vOff)
+    if IsErr(notBeforeRes):
+        return Err[bool](Error(notBeforeRes))
+    vOff = Value(notBeforeRes).next
+    let notAfterRes: Result[Asn1Int64Next] = x509ParseTime(validValue, vOff)
+    if IsErr(notAfterRes):
+        return Err[bool](Error(notAfterRes))
+    cert.notBefore = Value(notBeforeRes).value
+    cert.notAfter = Value(notAfterRes).value
+    offset = Value(validRes).next
+    let subjectRes: Result[X509RawTlv] = x509ReadRawTlv(tbsValue, offset)
+    if IsErr(subjectRes):
+        return Err[bool](Error(subjectRes))
+    let subjectTlv = Value(subjectRes)
+    if subjectTlv.tag != asn1TagSequence:
+        return Err[bool]("x509: subject ! sequence")
+    cert.subject.data = subjectTlv.raw.data
+    cert.subject.len = subjectTlv.raw.len
+    offset = subjectTlv.next
+    let spkiRes: Result[Asn1ValueNext] = asn1DecodeSequence(tbsValue, offset)
+    if IsErr(spkiRes):
+        return Err[bool](Error(spkiRes))
+    let spkiValue: Bytes = Value(spkiRes).value
+    let keyRes: Result[X509PublicKey] = x509ParseSpki(spkiValue)
+    if IsErr(keyRes):
+        return Err[bool](Error(keyRes))
+    cert.publicKey = Value(keyRes)
+    offset = Value(spkiRes).next
+    while offset < bytesLen(tbsValue):
+        let extraRes: Result[Asn1TagValueNext] = asn1DecodeTlv(tbsValue, offset)
+        if IsErr(extraRes):
+            return Err[bool](Error(extraRes))
+        let extra = Value(extraRes)
+        if extra.tag == x509TagContext3:
+            let extSeqRes: Result[Asn1ValueNext] = asn1DecodeSequence(extra.value, 0)
+            if IsErr(extSeqRes):
+                return Err[bool](Error(extSeqRes))
+            let extRes: Result[bool] = x509ParseExtensions(Value(extSeqRes).value, cert)
+            if IsErr(extRes):
+                return Err[bool](Error(extRes))
+        offset = extra.next
+    return Ok[bool](true)
+
+fn x509ParseCertificate(data: Bytes): Result[X509Certificate] =
+    let certRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, 0)
+    if IsErr(certRes):
+        return Err[X509Certificate](Error(certRes))
+    let certValue: Bytes = Value(certRes).value
+    var offset: int32 = 0
+    let tbsRes: Result[X509RawTlv] = x509ReadRawTlv(certValue, offset)
+    if IsErr(tbsRes):
+        return Err[X509Certificate](Error(tbsRes))
+    let tbs = Value(tbsRes)
+    if tbs.tag != asn1TagSequence:
+        return Err[X509Certificate]("x509: tbs ! sequence")
+    offset = tbs.next
+    let sigAlgRes: Result[X509SigAlgNext] = x509ParseSignatureAlgorithm(certValue, offset)
+    if IsErr(sigAlgRes):
+        return Err[X509Certificate](Error(sigAlgRes))
+    offset = Value(sigAlgRes).next
+    let sigRes: Result[X509BitStringNext] = x509DecodeBitString(certValue, offset)
+    if IsErr(sigRes):
+        return Err[X509Certificate](Error(sigRes))
+    var cert: X509Certificate = initX509Certificate()
+    cert.tbs.data = tbs.raw.data
+    cert.tbs.len = tbs.raw.len
+    cert.signature.data = Value(sigRes).bytes.data
+    cert.signature.len = Value(sigRes).bytes.len
+    cert.sigAlg = Value(sigAlgRes).sigAlg
+    cert.pssHash = Value(sigAlgRes).pssHash
+    cert.pssSaltLen = Value(sigAlgRes).pssSaltLen
+    let tbsParseRes: Result[bool] = x509ParseTbs(tbs.value, cert)
+    if IsErr(tbsParseRes):
+        return Err[X509Certificate](Error(tbsParseRes))
+    if cert.publicKey.kind == X509KeyUnknown:
+        return Err[X509Certificate]("x509: public key missing")
+    if cert.sigAlg == X509SigUnknown:
+        return Err[X509Certificate]("x509: signature algorithm unsupported")
+    if cert.tbsSigAlg != X509SigUnknown && cert.tbsSigAlg != cert.sigAlg:
+        return Err[X509Certificate]("x509: signature algorithm mismatch")
+    if cert.sigAlg == X509SigRsaPss:
+        if cert.tbsPssHash != X509HashUnknown && cert.tbsPssHash != cert.pssHash:
+            return Err[X509Certificate]("x509: pss hash mismatch")
+        if cert.tbsPssSaltLen >= 0 && cert.tbsPssSaltLen != cert.pssSaltLen:
+            return Err[X509Certificate]("x509: pss salt length mismatch")
+    return Ok[X509Certificate](cert)
+
+fn x509ParseCertificateInto(out: var X509Certificate, der: Bytes): Result[bool] =
+    # NOTE: Avoid assigning to the `var` parameter itself here.
+    # Some backends treat `out = ...` as rebinding a local alias, which can drop
+    # writes to the caller-provided certificate object.
+    let certRes: Result[Asn1ValueNext] = asn1DecodeSequence(der, 0)
+    if IsErr(certRes):
+        return Err[bool](Error(certRes))
+    let certValue: Bytes = Value(certRes).value
+    var offset: int32 = 0
+    let tbsRes: Result[X509RawTlv] = x509ReadRawTlv(certValue, offset)
+    if IsErr(tbsRes):
+        return Err[bool](Error(tbsRes))
+    let tbs = Value(tbsRes)
+    if tbs.tag != asn1TagSequence:
+        return Err[bool]("x509: tbs ! sequence")
+    offset = tbs.next
+    let sigAlgRes: Result[X509SigAlgNext] = x509ParseSignatureAlgorithm(certValue, offset)
+    if IsErr(sigAlgRes):
+        return Err[bool](Error(sigAlgRes))
+    offset = Value(sigAlgRes).next
+    let sigRes: Result[X509BitStringNext] = x509DecodeBitString(certValue, offset)
+    if IsErr(sigRes):
+        return Err[bool](Error(sigRes))
+    out.tbs.data = tbs.raw.data
+    out.tbs.len = tbs.raw.len
+    out.signature.data = Value(sigRes).bytes.data
+    out.signature.len = Value(sigRes).bytes.len
+    out.sigAlg = Value(sigAlgRes).sigAlg
+    out.pssHash = Value(sigAlgRes).pssHash
+    out.pssSaltLen = Value(sigAlgRes).pssSaltLen
+    let tbsParseRes: Result[bool] = x509ParseTbs(tbs.value, out)
+    if IsErr(tbsParseRes):
+        return Err[bool](Error(tbsParseRes))
+    if out.publicKey.kind == X509KeyUnknown:
+        return Err[bool]("x509: public key missing")
+    if out.sigAlg == X509SigUnknown:
+        return Err[bool]("x509: signature algorithm unsupported")
+    if out.tbsSigAlg != X509SigUnknown && out.tbsSigAlg != out.sigAlg:
+        return Err[bool]("x509: signature algorithm mismatch")
+    if out.sigAlg == X509SigRsaPss:
+        if out.tbsPssHash != X509HashUnknown && out.tbsPssHash != out.pssHash:
+            return Err[bool]("x509: pss hash mismatch")
+        if out.tbsPssSaltLen >= 0 && out.tbsPssSaltLen != out.pssSaltLen:
+            return Err[bool]("x509: pss salt length mismatch")
+    return Ok[bool](true)
+
+fn x509CertListAddDer(list: var X509CertList, der: Bytes): Result[bool] =
+    if list.count >= x509MaxChain:
+        return Err[bool]("x509: cert list full")
+    let idx: int32 = list.count
+    let slot: X509Certificate* = x509CertListEnsureSlot(list, idx)
+    if slot == nil:
+        return Err[bool]("x509: cert list alloc failed")
+    let parseRes: Result[bool] = x509ParseCertificateInto(*slot, der)
+    if IsErr(parseRes):
+        return Err[bool](Error(parseRes))
+    list.count = list.count + 1
+    return Ok[bool](true)
+
+fn x509LeftPad(data: Bytes, length: int32): Result[Bytes] =
+    if bytesLen(data) > length:
+        return Err[Bytes]("x509: integer too large")
+    let out: Bytes = bytesAlloc(length)
+    let offset: int32 = length - bytesLen(data)
+    if bytesLen(data) > 0:
+        copyMem(ptr_add(out.data, offset), data.data, bytesLen(data))
+    return Ok[Bytes](out)
+
+fn x509DecodeEcdsaSignature(sig: Bytes): Result[Bytes] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(sig, 0)
+    if IsErr(seqRes):
+        return Err[Bytes](Error(seqRes))
+    let seqValue: Bytes = Value(seqRes).value
+    let rRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, 0)
+    if IsErr(rRes):
+        return Err[Bytes](Error(rRes))
+    let sRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, Value(rRes).next)
+    if IsErr(sRes):
+        return Err[Bytes](Error(sRes))
+    let rPadRes: Result[Bytes] = x509LeftPad(Value(rRes).value, 32)
+    if IsErr(rPadRes):
+        return Err[Bytes](Error(rPadRes))
+    let sPadRes: Result[Bytes] = x509LeftPad(Value(sRes).value, 32)
+    if IsErr(sPadRes):
+        return Err[Bytes](Error(sPadRes))
+    let out: Bytes = bytesAlloc(64)
+    copyMem(out.data, Value(rPadRes).data, 32)
+    copyMem(ptr_add(out.data, 32), Value(sPadRes).data, 32)
+    return Ok[Bytes](out)
+
+fn x509VerifySignature(cert: X509Certificate*, issuer: X509Certificate*): Result[bool] =
+    if void*(cert) == nil || void*(issuer) == nil:
+        return Err[bool]("x509: invalid signature args")
+    if cert.sigAlg == X509SigUnknown:
+        return Err[bool]("x509: unsupported signature algorithm kind=unknown")
+    if cert.sigAlg == X509SigRsaSha256 || cert.sigAlg == X509SigRsaSha384:
+        if issuer.publicKey.kind != X509KeyRsa:
+            return Err[bool]("x509: rsa signature with non-rsa issuer")
+        let useSha384: bool = cert.sigAlg == X509SigRsaSha384
+        # Workaround: avoid taking the address of a nested composite field directly.
+        var pub: RsaBigPublicKey = RsaBigPublicKey(
+            n: issuer.publicKey.rsa.n,
+            e: issuer.publicKey.rsa.e,
+            modBits: issuer.publicKey.rsa.modBits,
+            modLen: issuer.publicKey.rsa.modLen
+        )
+        let ok: bool = rsaVerifyPkcs1(pub, cert.tbs, cert.signature, useSha384)
+        return Ok[bool](ok)
+    if cert.sigAlg == X509SigRsaPss:
+        if issuer.publicKey.kind != X509KeyRsa:
+            return Err[bool]("x509: rsa pss with non-rsa issuer")
+        if cert.pssHash != X509HashSha256 && cert.pssHash != X509HashSha384:
+            return Err[bool]("x509: rsa pss hash unsupported")
+        let useSha384: bool = cert.pssHash == X509HashSha384
+        var pub: RsaBigPublicKey = RsaBigPublicKey(
+            n: issuer.publicKey.rsa.n,
+            e: issuer.publicKey.rsa.e,
+            modBits: issuer.publicKey.rsa.modBits,
+            modLen: issuer.publicKey.rsa.modLen
+        )
+        let ok: bool = rsaVerifyPss(pub, cert.tbs, cert.signature, useSha384)
+        return Ok[bool](ok)
+    if cert.sigAlg == X509SigEcdsaSha256:
+        if issuer.publicKey.kind != X509KeyEcdsaP256:
+            return Err[bool]("x509: ecdsa signature with non-ecdsa issuer")
+        let sigRes: Result[Bytes] = x509DecodeEcdsaSignature(cert.signature)
+        if IsErr(sigRes):
+            return Err[bool](Error(sigRes))
+        let ok: bool = ecdsaVerifyBytes(ecdsaPublicKeyToBytes(issuer.publicKey.ecdsa), cert.tbs, Value(sigRes))
+        return Ok[bool](ok)
+    if cert.sigAlg == X509SigEcdsaSha384:
+        return Err[bool]("x509: ecdsa sha384 unsupported")
+    return Err[bool]("x509: unsupported signature algorithm kind=" + x509IntToString(int64(cert.sigAlg)))
+
+fn x509VerifyValidity(cert: X509Certificate*, now: int64): Result[bool] =
+    if void*(cert) == nil:
+        return Err[bool]("x509: invalid validity args")
+    if cert.notBefore > 0 && now < cert.notBefore:
+        return Err[bool]("x509: ! yet valid")
+    if cert.notAfter > 0 && now > cert.notAfter:
+        return Err[bool]("x509: expired")
+    return Ok[bool](true)
+
+fn x509VerifyLeafConstraints(cert: X509Certificate*): Result[bool] =
+    if void*(cert) == nil:
+        return Err[bool]("x509: invalid constraints args")
+    if cert.hasUnknownCritical:
+        return Err[bool]("x509: unknown critical extension")
+    if cert.hasBasicConstraints && cert.isCa:
+        return Err[bool]("x509: leaf marked as ca")
+    if cert.hasKeyUsage && (cert.keyUsage & x509KeyUsageDigitalSignature) == 0:
+        return Err[bool]("x509: leaf missing digitalSignature")
+    if stringListCount(cert.extKeyUsage) > 0 && ! stringListContains(cert.extKeyUsage, oidServerAuth):
+        return Err[bool]("x509: leaf missing serverAuth eku")
+    return Ok[bool](true)
+
+fn x509VerifyCaConstraints(cert: X509Certificate*): Result[bool] =
+    if void*(cert) == nil:
+        return Err[bool]("x509: invalid ca constraints args")
+    if cert.hasUnknownCritical:
+        return Err[bool]("x509: ca has unknown critical extension")
+    if ! cert.hasBasicConstraints || ! cert.isCa:
+        return Err[bool]("x509: ca basicConstraints missing")
+    if cert.hasKeyUsage && (cert.keyUsage & x509KeyUsageKeyCertSign) == 0:
+        return Err[bool]("x509: ca missing keyCertSign")
+    return Ok[bool](true)
+
+fn x509IsSelfSigned(cert: X509Certificate*): bool =
+    if void*(cert) == nil:
+        return false
+    return bytesEqual(cert.issuer, cert.subject)
+
+fn x509VerifySelfSigned(cert: X509Certificate*): Result[bool] =
+    if void*(cert) == nil:
+        return Err[bool]("x509: invalid self-signed args")
+    if ! x509IsSelfSigned(cert):
+        return Err[bool]("x509: ! self-signed")
+    let sigRes: Result[bool] = x509VerifySignature(cert, cert)
+    if IsErr(sigRes):
+        return Err[bool](Error(sigRes))
+    if ! Value(sigRes):
+        return Err[bool]("x509: self-signature invalid")
+    return Ok[bool](true)
+
+fn x509VerifyChain(leaf: X509Certificate*, intermediates: X509CertList*, roots: X509CertList*, now: int64): Result[bool] =
+    if void*(intermediates) == nil || void*(roots) == nil:
+        return Err[bool]("x509: verify chain invalid args")
+    if void*(leaf) == nil:
+        return Err[bool]("x509: verify chain invalid leaf")
+    let leafTimeRes: Result[bool] = x509VerifyValidity(leaf, now)
+    if IsErr(leafTimeRes):
+        return Err[bool](Error(leafTimeRes))
+    let leafRes: Result[bool] = x509VerifyLeafConstraints(leaf)
+    if IsErr(leafRes):
+        return Err[bool](Error(leafRes))
+    var current: X509Certificate* = leaf
+    var depth: int32 = 0
+    let __for_guard_start_depth_1 = depth
+    for __for_guard_depth_1 in __for_guard_start_depth_1..<x509MaxChain:
+        if ! (depth < x509MaxChain):
+            break
+        if x509IsSelfSigned(current):
+            let anchorIdx: int32 = x509CertListFindBySubjectIndex(roots, current.subject)
+            if anchorIdx < 0:
+                return Err[bool]("x509: self-signed ! trusted")
+            let selfRes: Result[bool] = x509VerifySelfSigned(current)
+            if IsErr(selfRes):
+                return Err[bool]("x509: self-signed signature: " + Error(selfRes))
+            return Ok[bool](true)
+        let issuerIdx: int32 = x509CertListFindBySubjectIndex(intermediates, current.issuer)
+        if issuerIdx >= 0:
+            let issuerPtr: X509Certificate* = intermediates.items[issuerIdx]
+            if issuerPtr == nil:
+                return Err[bool]("x509: issuer ! found")
+            let caRes: Result[bool] = x509VerifyCaConstraints(issuerPtr)
+            if IsErr(caRes):
+                return Err[bool](Error(caRes))
+            let caTimeRes: Result[bool] = x509VerifyValidity(issuerPtr, now)
+            if IsErr(caTimeRes):
+                return Err[bool](Error(caTimeRes))
+            let sigRes: Result[bool] = x509VerifySignature(current, issuerPtr)
+            if IsErr(sigRes):
+                return Err[bool]("x509: chain signature: " + Error(sigRes))
+            if ! Value(sigRes):
+                if current.sigAlg == X509SigRsaSha256 || current.sigAlg == X509SigRsaSha384:
+                    let useSha384: bool = current.sigAlg == X509SigRsaSha384
+                    var pub: RsaBigPublicKey = RsaBigPublicKey(
+                        n: issuerPtr.publicKey.rsa.n,
+                        e: issuerPtr.publicKey.rsa.e,
+                        modBits: issuerPtr.publicKey.rsa.modBits,
+                        modLen: issuerPtr.publicKey.rsa.modLen
+                    )
+                    let diagRes: Result[bool] = rsaVerifyPkcs1Diag(
+                        pub,
+                        current.tbs,
+                        current.signature,
+                        useSha384
+                    )
+                    if IsErr(diagRes):
+                        return Err[bool]("x509: signature invalid: " + Error(diagRes))
+                return Err[bool]("x509: signature invalid")
+            current = issuerPtr
+            depth = depth + 1
+            continue
+        let rootIdx: int32 = x509CertListFindBySubjectIndex(roots, current.issuer)
+        if rootIdx >= 0:
+            let rootPtr: X509Certificate* = roots.items[rootIdx]
+            if rootPtr == nil:
+                return Err[bool]("x509: issuer ! found")
+            let caRes: Result[bool] = x509VerifyCaConstraints(rootPtr)
+            if IsErr(caRes):
+                return Err[bool](Error(caRes))
+            let caTimeRes: Result[bool] = x509VerifyValidity(rootPtr, now)
+            if IsErr(caTimeRes):
+                return Err[bool](Error(caTimeRes))
+            let sigRes: Result[bool] = x509VerifySignature(current, rootPtr)
+            if IsErr(sigRes):
+                return Err[bool]("x509: root signature: " + Error(sigRes))
+            if ! Value(sigRes):
+                if current.sigAlg == X509SigRsaSha256 || current.sigAlg == X509SigRsaSha384:
+                    let useSha384: bool = current.sigAlg == X509SigRsaSha384
+                    var pub: RsaBigPublicKey = RsaBigPublicKey(
+                        n: rootPtr.publicKey.rsa.n,
+                        e: rootPtr.publicKey.rsa.e,
+                        modBits: rootPtr.publicKey.rsa.modBits,
+                        modLen: rootPtr.publicKey.rsa.modLen
+                    )
+                    let diagRes: Result[bool] = rsaVerifyPkcs1Diag(
+                        pub,
+                        current.tbs,
+                        current.signature,
+                        useSha384
+                    )
+                    if IsErr(diagRes):
+                        return Err[bool]("x509: signature invalid: " + Error(diagRes))
+                return Err[bool]("x509: signature invalid")
+            let selfRes: Result[bool] = x509VerifySelfSigned(rootPtr)
+            if IsErr(selfRes):
+                return Err[bool]("x509: root self-signed: " + Error(selfRes))
+            return Ok[bool](true)
+        return Err[bool]("x509: issuer ! found")
+    return Err[bool]("x509: chain too deep")
+
+fn x509LowerAscii(text: str): str =
+    if len(text) <= 0:
+        return ""
+    let out: Bytes = bytesAlloc(len(text))
+    for i in 0..<len(text):
+        let c: char = text[i]
+        var v: int32 = int32(c)
+        if v >= int32('A') && v <= int32('Z'):
+            v = v + (int32('a') - int32('A'))
+        bytesSet(out, i, v)
+    return bytesToString(out)
+
+fn x509TrimTrailingDot(text: str): str =
+    if len(text) <= 0:
+        return text
+    if text[len(text) - 1] != '.':
+        return text
+    return sliceBytes(text, 0, len(text) - 1)
+
+fn x509EndsWith(text: str, suffix: str): bool =
+    let tlen: int32 = len(text)
+    let slen: int32 = len(suffix)
+    if slen <= 0:
+        return true
+    if tlen < slen:
+        return false
+    for i in 0..<slen:
+        if text[tlen - slen + i] != suffix[i]:
+            return false
+    return true
+
+fn x509MatchDnsName(host: str, pattern: str): bool =
+    if len(pattern) <= 0:
+        return false
+    if len(pattern) > 2 && pattern[0] == '*' && pattern[1] == '.':
+        let suffix: str = sliceBytes(pattern, 2, len(pattern) - 2)
+        if ! x509EndsWith(host, suffix):
+            return false
+        let prefixLen: int32 = len(host) - len(suffix)
+        if prefixLen <= 1:
+            return false
+        if host[prefixLen - 1] != '.':
+            return false
+        for i in 0..<prefixLen - 1:
+            if host[i] == '.':
+                return false
+        return true
+    return (host == pattern)
+
+fn x509VerifyHostname(cert: X509Certificate*, host: str): bool =
+    if void*(cert) == nil:
+        return false
+    let normalized: str = x509TrimTrailingDot(x509LowerAscii(host))
+    if len(normalized) <= 0:
+        return false
+    if stringListCount(cert.dnsNames) <= 0:
+        return false
+    for i in 0..<cert.dnsNames.count:
+        let entry: str = x509TrimTrailingDot(x509LowerAscii(cert.dnsNames.items[i]))
+        if x509MatchDnsName(normalized, entry):
+            return true
+    return false
+
+fn x509HashDigest(kind: X509HashKind, data: Bytes): Result[Bytes] =
+    if kind == X509HashSha256:
+        return Ok[Bytes](sha256Digest(data))
+    if kind == X509HashSha384:
+        return Ok[Bytes](sha384Digest(data))
+    return Err[Bytes]("x509: unsupported hash")
+
+fn x509PublicKeyBytes(pub: X509PublicKey): Result[Bytes] =
+    if pub.kind == X509KeyRsa:
+        let nBytes: Bytes = bigToBytes(pub.rsa.n, 1)
+        let eBytes: Bytes = bigToBytes(pub.rsa.e, 1)
+        let nEnc: Bytes = asn1EncodeInteger(nBytes)
+        let eEnc: Bytes = asn1EncodeInteger(eBytes)
+        return Ok[Bytes](asn1EncodeSequence(bytesConcat(nEnc, eEnc)))
+    if pub.kind == X509KeyEcdsaP256:
+        return Ok[Bytes](ecdsaPublicKeyToBytes(pub.ecdsa))
+    return Err[Bytes]("x509: unsupported public key")
+
+fn x509VerifySignatureBytes(
+    sigAlg: X509SignatureKind,
+    pssHash: X509HashKind,
+    issuer: X509Certificate*,
+    msg: Bytes,
+    sig: Bytes
+): Result[bool] =
+    
+    if void*(issuer) == nil:
+        return Err[bool]("x509: invalid signature issuer")
+    if sigAlg == X509SigRsaSha256 || sigAlg == X509SigRsaSha384:
+        if issuer.publicKey.kind != X509KeyRsa:
+            return Err[bool]("x509: rsa signature with non-rsa issuer")
+        let useSha384: bool = sigAlg == X509SigRsaSha384
+        var pub: RsaBigPublicKey = RsaBigPublicKey(
+            n: issuer.publicKey.rsa.n,
+            e: issuer.publicKey.rsa.e,
+            modBits: issuer.publicKey.rsa.modBits,
+            modLen: issuer.publicKey.rsa.modLen
+        )
+        return Ok[bool](rsaVerifyPkcs1(pub, msg, sig, useSha384))
+    if sigAlg == X509SigRsaPss:
+        if issuer.publicKey.kind != X509KeyRsa:
+            return Err[bool]("x509: rsa pss with non-rsa issuer")
+        if pssHash != X509HashSha256 && pssHash != X509HashSha384:
+            return Err[bool]("x509: rsa pss hash unsupported")
+        let useSha384: bool = pssHash == X509HashSha384
+        var pub: RsaBigPublicKey = RsaBigPublicKey(
+            n: issuer.publicKey.rsa.n,
+            e: issuer.publicKey.rsa.e,
+            modBits: issuer.publicKey.rsa.modBits,
+            modLen: issuer.publicKey.rsa.modLen
+        )
+        return Ok[bool](rsaVerifyPss(pub, msg, sig, useSha384))
+    if sigAlg == X509SigEcdsaSha256:
+        if issuer.publicKey.kind != X509KeyEcdsaP256:
+            return Err[bool]("x509: ecdsa signature with non-ecdsa issuer")
+        let sigRes: Result[Bytes] = x509DecodeEcdsaSignature(sig)
+        if IsErr(sigRes):
+            return Err[bool](Error(sigRes))
+        return Ok[bool](ecdsaVerifyBytes(ecdsaPublicKeyToBytes(issuer.publicKey.ecdsa), msg, Value(sigRes)))
+    if sigAlg == X509SigEcdsaSha384:
+        return Err[bool]("x509: ecdsa sha384 unsupported")
+    return Err[bool]("x509: unsupported signature algorithm kind=" + x509IntToString(int64(sigAlg)))
+
+fn x509DecodeEnumerated(data: Bytes, offset: int32): Result[Asn1Int64Next] =
+    let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(data, offset)
+    if IsErr(tlvRes):
+        return Err[Asn1Int64Next](Error(tlvRes))
+    let tlv = Value(tlvRes)
+    if tlv.tag != 0x0a:
+        return Err[Asn1Int64Next]("x509: expected enumerated")
+    let vRes: Result[int64] = bytesToInt64(tlv.value)
+    if IsErr(vRes):
+        return Err[Asn1Int64Next](Error(vRes))
+    return Ok[Asn1Int64Next](Asn1Int64Next(value: Value(vRes), next: tlv.next))
+
+fn x509CrlIsRevoked(crl: X509Crl, serial: Bytes): bool =
+    if bytesLen(serial) <= 0:
+        return false
+    for i in 0..<crl.revokedCount:
+        if bytesEqual(crl.revokedSerials[i], serial):
+            return true
+    return false
+
+fn x509ParseCrlTbs(tbsValue: Bytes): Result[X509Crl] =
+    var crl: X509Crl = initX509Crl()
+    var offset: int32 = 0
+    if offset < bytesLen(tbsValue) && bytesGet(tbsValue, offset) == 0xa0:
+        let verRes: Result[Asn1TagValueNext] = asn1DecodeTlv(tbsValue, offset)
+        if IsErr(verRes):
+            return Err[X509Crl](Error(verRes))
+        offset = Value(verRes).next
+    let sigRes: Result[X509SigAlgNext] = x509ParseSignatureAlgorithm(tbsValue, offset)
+    if IsErr(sigRes):
+        return Err[X509Crl](Error(sigRes))
+    offset = Value(sigRes).next
+    let issuerRes: Result[X509RawTlv] = x509ReadRawTlv(tbsValue, offset)
+    if IsErr(issuerRes):
+        return Err[X509Crl](Error(issuerRes))
+    let issuerTlv = Value(issuerRes)
+    if issuerTlv.tag != asn1TagSequence:
+        return Err[X509Crl]("x509: crl issuer ! sequence")
+    crl.issuer = issuerTlv.raw
+    offset = issuerTlv.next
+    let thisRes: Result[Asn1Int64Next] = x509ParseTime(tbsValue, offset)
+    if IsErr(thisRes):
+        return Err[X509Crl](Error(thisRes))
+    crl.thisUpdate = Value(thisRes).value
+    offset = Value(thisRes).next
+    if offset < bytesLen(tbsValue):
+        let tag: int32 = bytesGet(tbsValue, offset)
+        if tag == x509TagUtcTime || tag == x509TagGeneralizedTime:
+            let nextRes: Result[Asn1Int64Next] = x509ParseTime(tbsValue, offset)
+            if IsErr(nextRes):
+                return Err[X509Crl](Error(nextRes))
+            crl.nextUpdate = Value(nextRes).value
+            offset = Value(nextRes).next
+    if offset < bytesLen(tbsValue) && bytesGet(tbsValue, offset) == asn1TagSequence:
+        let listRes: Result[Asn1ValueNext] = asn1DecodeSequence(tbsValue, offset)
+        if IsErr(listRes):
+            return Err[X509Crl](Error(listRes))
+        let listValue: Bytes = Value(listRes).value
+        var listOff: int32 = 0
+        while listOff < bytesLen(listValue):
+            let entryRes: Result[Asn1ValueNext] = asn1DecodeSequence(listValue, listOff)
+            if IsErr(entryRes):
+                return Err[X509Crl](Error(entryRes))
+            let entryValue: Bytes = Value(entryRes).value
+            var entryOff: int32 = 0
+            let serialRes: Result[Asn1ValueNext] = asn1DecodeInteger(entryValue, entryOff)
+            if IsErr(serialRes):
+                return Err[X509Crl](Error(serialRes))
+            entryOff = Value(serialRes).next
+            let dateRes: Result[Asn1Int64Next] = x509ParseTime(entryValue, entryOff)
+            if IsErr(dateRes):
+                return Err[X509Crl](Error(dateRes))
+            entryOff = Value(dateRes).next
+            if crl.revokedCount >= x509MaxRevoked:
+                return Err[X509Crl]("x509: crl revoked list full")
+            crl.revokedSerials[crl.revokedCount] = Value(serialRes).value
+            crl.revokedCount = crl.revokedCount + 1
+            listOff = Value(entryRes).next
+    return Ok[X509Crl](crl)
+
+fn x509VerifyCrl(der: Bytes, issuer: X509Certificate*, now: int64): Result[X509Crl] =
+    if void*(issuer) == nil:
+        return Err[X509Crl]("x509: crl invalid issuer")
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(der, 0)
+    if IsErr(seqRes):
+        return Err[X509Crl](Error(seqRes))
+    let seqValue: Bytes = Value(seqRes).value
+    var offset: int32 = 0
+    let tbsRes: Result[X509RawTlv] = x509ReadRawTlv(seqValue, offset)
+    if IsErr(tbsRes):
+        return Err[X509Crl](Error(tbsRes))
+    offset = Value(tbsRes).next
+    let sigAlgRes: Result[X509SigAlgNext] = x509ParseSignatureAlgorithm(seqValue, offset)
+    if IsErr(sigAlgRes):
+        return Err[X509Crl](Error(sigAlgRes))
+    offset = Value(sigAlgRes).next
+    let sigRes: Result[X509BitStringNext] = x509DecodeBitString(seqValue, offset)
+    if IsErr(sigRes):
+        return Err[X509Crl](Error(sigRes))
+    let crlRes: Result[X509Crl] = x509ParseCrlTbs(Value(tbsRes).value)
+    if IsErr(crlRes):
+        return Err[X509Crl](Error(crlRes))
+    var crl: X509Crl = Value(crlRes)
+    if bytesLen(crl.issuer) <= 0 || ! bytesEqual(crl.issuer, issuer.subject):
+        return Err[X509Crl]("x509: crl issuer mismatch")
+    if now > 0:
+        if crl.thisUpdate > 0 && now < crl.thisUpdate:
+            return Err[X509Crl]("x509: crl ! yet valid")
+        if crl.nextUpdate > 0 && now > crl.nextUpdate:
+            return Err[X509Crl]("x509: crl expired")
+    let verifyRes: Result[bool] = x509VerifySignatureBytes(Value(sigAlgRes).sigAlg, Value(sigAlgRes).pssHash, issuer, Value(tbsRes).raw, Value(sigRes).bytes)
+    if IsErr(verifyRes):
+        return Err[X509Crl](Error(verifyRes))
+    if ! Value(verifyRes):
+        return Err[X509Crl]("x509: crl signature invalid")
+    return Ok[X509Crl](crl)
+
+fn x509VerifyOcspResponse(
+    ocsp: Bytes,
+    leaf: X509Certificate*,
+    issuer: X509Certificate*,
+    now: int64
+): Result[X509RevocationStatus] =
+    
+    if void*(leaf) == nil || void*(issuer) == nil:
+        return Err[X509RevocationStatus]("x509: ocsp invalid args")
+    if bytesLen(ocsp) <= 0:
+        return Err[X509RevocationStatus]("x509: ocsp empty")
+    let respRes: Result[Asn1ValueNext] = asn1DecodeSequence(ocsp, 0)
+    if IsErr(respRes):
+        return Err[X509RevocationStatus](Error(respRes))
+    let respValue: Bytes = Value(respRes).value
+    var offset: int32 = 0
+    let statusRes: Result[Asn1Int64Next] = x509DecodeEnumerated(respValue, offset)
+    if IsErr(statusRes):
+        return Err[X509RevocationStatus](Error(statusRes))
+    let statusCode: int64 = Value(statusRes).value
+    offset = Value(statusRes).next
+    if statusCode != 0:
+        return Err[X509RevocationStatus]("x509: ocsp response status")
+    if offset >= bytesLen(respValue):
+        return Err[X509RevocationStatus]("x509: ocsp response bytes missing")
+    let bytesRes: Result[Asn1TagValueNext] = asn1DecodeTlv(respValue, offset)
+    if IsErr(bytesRes):
+        return Err[X509RevocationStatus](Error(bytesRes))
+    let bytesTlv = Value(bytesRes)
+    if bytesTlv.tag != 0xa0:
+        return Err[X509RevocationStatus]("x509: ocsp response bytes invalid")
+    let rbSeqRes: Result[Asn1ValueNext] = asn1DecodeSequence(bytesTlv.value, 0)
+    if IsErr(rbSeqRes):
+        return Err[X509RevocationStatus](Error(rbSeqRes))
+    let rbValue: Bytes = Value(rbSeqRes).value
+    var rbOff: int32 = 0
+    let typeRes: Result[X509OidNext] = x509ReadOid(rbValue, rbOff)
+    if IsErr(typeRes):
+        return Err[X509RevocationStatus](Error(typeRes))
+    if ! (Value(typeRes).oid == oidOcspBasic):
+        return Err[X509RevocationStatus]("x509: ocsp response type unsupported")
+    rbOff = Value(typeRes).next
+    let respOctetRes: Result[Asn1TagValueNext] = asn1DecodeTlv(rbValue, rbOff)
+    if IsErr(respOctetRes):
+        return Err[X509RevocationStatus](Error(respOctetRes))
+    if Value(respOctetRes).tag != asn1TagOctetString:
+        return Err[X509RevocationStatus]("x509: ocsp response ! octet string")
+    let basicDer: Bytes = Value(respOctetRes).value
+    let basicSeqRes: Result[Asn1ValueNext] = asn1DecodeSequence(basicDer, 0)
+    if IsErr(basicSeqRes):
+        return Err[X509RevocationStatus](Error(basicSeqRes))
+    let basicValue: Bytes = Value(basicSeqRes).value
+    var bOff: int32 = 0
+    let tbsRes: Result[X509RawTlv] = x509ReadRawTlv(basicValue, bOff)
+    if IsErr(tbsRes):
+        return Err[X509RevocationStatus](Error(tbsRes))
+    bOff = Value(tbsRes).next
+    let sigAlgRes: Result[X509SigAlgNext] = x509ParseSignatureAlgorithm(basicValue, bOff)
+    if IsErr(sigAlgRes):
+        return Err[X509RevocationStatus](Error(sigAlgRes))
+    bOff = Value(sigAlgRes).next
+    let sigRes: Result[X509BitStringNext] = x509DecodeBitString(basicValue, bOff)
+    if IsErr(sigRes):
+        return Err[X509RevocationStatus](Error(sigRes))
+    let verifyRes: Result[bool] = x509VerifySignatureBytes(Value(sigAlgRes).sigAlg, Value(sigAlgRes).pssHash, issuer, Value(tbsRes).raw, Value(sigRes).bytes)
+    if IsErr(verifyRes):
+        return Err[X509RevocationStatus](Error(verifyRes))
+    if ! Value(verifyRes):
+        return Err[X509RevocationStatus]("x509: ocsp signature invalid")
+    let tbsValue: Bytes = Value(tbsRes).value
+    var rdOff: int32 = 0
+    if rdOff < bytesLen(tbsValue) && bytesGet(tbsValue, rdOff) == 0xa0:
+        let verRes: Result[Asn1TagValueNext] = asn1DecodeTlv(tbsValue, rdOff)
+        if IsErr(verRes):
+            return Err[X509RevocationStatus](Error(verRes))
+        rdOff = Value(verRes).next
+    let responderRes: Result[Asn1TagValueNext] = asn1DecodeTlv(tbsValue, rdOff)
+    if IsErr(responderRes):
+        return Err[X509RevocationStatus](Error(responderRes))
+    rdOff = Value(responderRes).next
+    let producedRes: Result[Asn1Int64Next] = x509ParseTime(tbsValue, rdOff)
+    if IsErr(producedRes):
+        return Err[X509RevocationStatus](Error(producedRes))
+    rdOff = Value(producedRes).next
+    let responsesRes: Result[Asn1ValueNext] = asn1DecodeSequence(tbsValue, rdOff)
+    if IsErr(responsesRes):
+        return Err[X509RevocationStatus](Error(responsesRes))
+    let responsesValue: Bytes = Value(responsesRes).value
+    if bytesLen(responsesValue) <= 0:
+        return Err[X509RevocationStatus]("x509: ocsp response list empty")
+    let singleRes: Result[Asn1ValueNext] = asn1DecodeSequence(responsesValue, 0)
+    if IsErr(singleRes):
+        return Err[X509RevocationStatus](Error(singleRes))
+    let singleValue: Bytes = Value(singleRes).value
+    var sOff: int32 = 0
+    let certIdRes: Result[Asn1ValueNext] = asn1DecodeSequence(singleValue, sOff)
+    if IsErr(certIdRes):
+        return Err[X509RevocationStatus](Error(certIdRes))
+    sOff = Value(certIdRes).next
+    let certIdValue: Bytes = Value(certIdRes).value
+    var cOff: int32 = 0
+    let hashAlgRes: Result[X509OidNext] = x509ParseAlgId(certIdValue, cOff)
+    if IsErr(hashAlgRes):
+        return Err[X509RevocationStatus](Error(hashAlgRes))
+    let hashKind: X509HashKind = x509HashKindFromOid(Value(hashAlgRes).oid)
+    if hashKind == X509HashUnknown:
+        return Err[X509RevocationStatus]("x509: ocsp hash unsupported")
+    cOff = Value(hashAlgRes).next
+    let nameHashRes: Result[Asn1TagValueNext] = asn1DecodeTlv(certIdValue, cOff)
+    if IsErr(nameHashRes):
+        return Err[X509RevocationStatus](Error(nameHashRes))
+    if Value(nameHashRes).tag != asn1TagOctetString:
+        return Err[X509RevocationStatus]("x509: ocsp name hash invalid")
+    let nameHash: Bytes = Value(nameHashRes).value
+    cOff = Value(nameHashRes).next
+    let keyHashRes: Result[Asn1TagValueNext] = asn1DecodeTlv(certIdValue, cOff)
+    if IsErr(keyHashRes):
+        return Err[X509RevocationStatus](Error(keyHashRes))
+    if Value(keyHashRes).tag != asn1TagOctetString:
+        return Err[X509RevocationStatus]("x509: ocsp key hash invalid")
+    let keyHash: Bytes = Value(keyHashRes).value
+    cOff = Value(keyHashRes).next
+    let serialRes: Result[Asn1ValueNext] = asn1DecodeInteger(certIdValue, cOff)
+    if IsErr(serialRes):
+        return Err[X509RevocationStatus](Error(serialRes))
+    let serial: Bytes = Value(serialRes).value
+    let expectNameRes: Result[Bytes] = x509HashDigest(hashKind, issuer.subject)
+    if IsErr(expectNameRes):
+        return Err[X509RevocationStatus](Error(expectNameRes))
+    if ! bytesEqual(Value(expectNameRes), nameHash):
+        return Err[X509RevocationStatus]("x509: ocsp issuer name hash mismatch")
+    let keyBytesRes: Result[Bytes] = x509PublicKeyBytes(issuer.publicKey)
+    if IsErr(keyBytesRes):
+        return Err[X509RevocationStatus](Error(keyBytesRes))
+    let expectKeyRes: Result[Bytes] = x509HashDigest(hashKind, Value(keyBytesRes))
+    if IsErr(expectKeyRes):
+        return Err[X509RevocationStatus](Error(expectKeyRes))
+    if ! bytesEqual(Value(expectKeyRes), keyHash):
+        return Err[X509RevocationStatus]("x509: ocsp issuer key hash mismatch")
+    if bytesLen(leaf.serial) <= 0:
+        return Err[X509RevocationStatus]("x509: ocsp leaf serial missing")
+    if ! bytesEqual(leaf.serial, serial):
+        return Err[X509RevocationStatus]("x509: ocsp serial mismatch")
+    let statusTlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(singleValue, sOff)
+    if IsErr(statusTlvRes):
+        return Err[X509RevocationStatus](Error(statusTlvRes))
+    let statusTag: int32 = Value(statusTlvRes).tag
+    sOff = Value(statusTlvRes).next
+    var status: X509RevocationStatus = X509RevocationUnknown
+    if statusTag == 0x80:
+        status = X509RevocationGood
+    elif statusTag == 0xa1 || statusTag == 0x81:
+        status = X509RevocationRevoked
+    elif statusTag == 0x82:
+        status = X509RevocationUnknown
+    else:
+        return Err[X509RevocationStatus]("x509: ocsp status invalid")
+    let thisRes: Result[Asn1Int64Next] = x509ParseTime(singleValue, sOff)
+    if IsErr(thisRes):
+        return Err[X509RevocationStatus](Error(thisRes))
+    let thisUpdate: int64 = Value(thisRes).value
+    sOff = Value(thisRes).next
+    var nextUpdate: int64 = 0
+    if sOff < bytesLen(singleValue) && bytesGet(singleValue, sOff) == 0xa0:
+        let nextRes: Result[Asn1TagValueNext] = asn1DecodeTlv(singleValue, sOff)
+        if IsErr(nextRes):
+            return Err[X509RevocationStatus](Error(nextRes))
+        let innerRes: Result[Asn1Int64Next] = x509ParseTime(Value(nextRes).value, 0)
+        if IsErr(innerRes):
+            return Err[X509RevocationStatus](Error(innerRes))
+        nextUpdate = Value(innerRes).value
+        sOff = Value(nextRes).next
+    if now > 0:
+        if thisUpdate > 0 && now < thisUpdate:
+            return Err[X509RevocationStatus]("x509: ocsp ! yet valid")
+        if nextUpdate > 0 && now > nextUpdate:
+            return Err[X509RevocationStatus]("x509: ocsp expired")
+    return Ok[X509RevocationStatus](status)
+
+fn x509FindIssuer(
+    leaf: X509Certificate*,
+    intermediates: X509CertList*,
+    roots: X509CertList*
+): Result[X509Certificate*] =
+    
+    if void*(leaf) == nil || void*(intermediates) == nil || void*(roots) == nil:
+        return Err[X509Certificate*]("x509: issuer ! found")
+    if bytesLen(leaf.issuer) <= 0:
+        return Err[X509Certificate*]("x509: issuer missing")
+    let interRes: Result[X509Certificate*] = x509CertListFindBySubject(intermediates, leaf.issuer)
+    if IsOk(interRes):
+        return interRes
+    return x509CertListFindBySubject(roots, leaf.issuer)
+
+fn x509FindIssuerIndex(
+    leaf: X509Certificate*,
+    intermediates: X509CertList*,
+    roots: X509CertList*
+): Result[int32] =
+    
+    if void*(leaf) == nil || void*(intermediates) == nil || void*(roots) == nil:
+        return Err[int32]("x509: issuer ! found")
+    if bytesLen(leaf.issuer) <= 0:
+        return Err[int32]("x509: issuer missing")
+    let interIdx: int32 = x509CertListFindBySubjectIndex(intermediates, leaf.issuer)
+    if interIdx >= 0:
+        return Ok[int32](interIdx)
+    let rootIdx: int32 = x509CertListFindBySubjectIndex(roots, leaf.issuer)
+    if rootIdx >= 0:
+        return Ok[int32](-1 - rootIdx)
+    return Err[int32]("x509: issuer ! found")
+
+fn x509VerifyRevocationWithIssuer(
+    leaf: X509Certificate*,
+    issuer: X509Certificate*,
+    ocsp: Bytes,
+    crls: Bytes[x509MaxCrls],
+    crlCount: int32,
+    now: int64,
+    mode: X509RevocationMode
+): Result[bool] =
+    
+    var checked: bool = false
+    if bytesLen(ocsp) > 0:
+        let ocspRes: Result[X509RevocationStatus] = x509VerifyOcspResponse(ocsp, leaf, issuer, now)
+        if IsErr(ocspRes):
+            if mode == X509RevocationStrict:
+                return Err[bool](Error(ocspRes))
+        else:
+            checked = true
+            let status: X509RevocationStatus = Value(ocspRes)
+            if status == X509RevocationRevoked:
+                return Err[bool]("x509: ocsp revoked")
+            if status == X509RevocationUnknown:
+                if mode == X509RevocationStrict:
+                    return Err[bool]("x509: ocsp unknown")
+                return Ok[bool](true)
+            return Ok[bool](true)
+    if crlCount > 0:
+        for i in 0..<crlCount:
+            let crlBytes: Bytes = crls[i]
+            if bytesLen(crlBytes) > 0:
+                let crlRes: Result[X509Crl] = x509VerifyCrl(crlBytes, issuer, now)
+                if IsErr(crlRes):
+                    if mode == X509RevocationStrict:
+                        return Err[bool](Error(crlRes))
+                else:
+                    checked = true
+                    if x509CrlIsRevoked(Value(crlRes), leaf.serial):
+                        return Err[bool]("x509: crl revoked")
+                    return Ok[bool](true)
+    if ! checked && mode == X509RevocationStrict:
+        return Err[bool]("x509: revocation data missing")
+    return Ok[bool](true)
+
+fn x509VerifyRevocation(
+    leaf: X509Certificate*,
+    intermediates: X509CertList*,
+    roots: X509CertList*,
+    ocsp: Bytes,
+    crls: Bytes[x509MaxCrls],
+    crlCount: int32,
+    now: int64,
+    mode: X509RevocationMode
+): Result[bool] =
+    
+    if mode == X509RevocationOff:
+        return Ok[bool](true)
+    if void*(leaf) == nil || void*(intermediates) == nil || void*(roots) == nil:
+        return Err[bool]("x509: revocation invalid args")
+    let issuerIdxRes: Result[int32] = x509FindIssuerIndex(leaf, intermediates, roots)
+    if IsErr(issuerIdxRes):
+        if mode == X509RevocationStrict:
+            return Err[bool](Error(issuerIdxRes))
+        return Ok[bool](true)
+    let issuerIdx: int32 = Value(issuerIdxRes)
+    if issuerIdx >= 0:
+        let issuerPtr: X509Certificate* = intermediates.items[issuerIdx]
+        if issuerPtr == nil:
+            return Err[bool]("x509: issuer ! found")
+        return x509VerifyRevocationWithIssuer(leaf, issuerPtr, ocsp, crls, crlCount, now, mode)
+    let rootIdx: int32 = -issuerIdx - 1
+    let rootPtr: X509Certificate* = roots.items[rootIdx]
+    if rootPtr == nil:
+        return Err[bool]("x509: issuer ! found")
+    return x509VerifyRevocationWithIssuer(leaf, rootPtr, ocsp, crls, crlCount, now, mode)

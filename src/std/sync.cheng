@@ -1,0 +1,142 @@
+# std/sync (minimal, pure Cheng)
+
+type
+    Arc[T] = ref
+        value: T
+
+type
+    Mutex[T] = ref
+        lock: int32
+        value: T
+
+type
+    RwLock[T] = ref
+        state: int32
+        value: T
+
+type
+    Atomic[T] = ref
+        value: int32
+
+fn arcNew(value: T): Arc[T] =
+    var a: Arc[T] = new[Arc[T]]()
+    if a != nil:
+        a.value = value
+    return a
+    
+fn share_mt(value: T): Arc[T] =
+    return arcNew value
+
+fn arcClone(a: Arc[T]): Arc[T] =
+    if a != nil:
+        memRetainAtomic a
+    return a
+
+fn arcGet(a: Arc[T]): T* =
+    if a == nil:
+        return nil
+    return &a.value
+
+fn arcUseCount(a: Arc[T]): int32 =
+    if a == nil:
+        return 0
+    return memRefCountAtomic a
+
+fn mutexNew(value: T): Mutex[T] =
+    var m: Mutex[T] = new[Mutex[T]]()
+    if m != nil:
+        m.lock = 0
+        m.value = value
+    return m
+
+fn mutexTryLock(m: Mutex[T]): T* =
+    if m == nil:
+        return nil
+    if atomicCasI32(&m.lock, 0, 1) != 0:
+        return &m.value
+    return nil
+
+fn mutexLock(m: Mutex[T]): T* =
+    if m == nil:
+        return nil
+    while atomicCasI32(&m.lock, 0, 1) == 0:
+        0
+        return &m.value
+
+fn mutexUnlock(m: Mutex[T]) =
+    if m == nil:
+        return
+    atomicStoreI32(&m.lock, 0)
+
+fn rwLockNew(value: T): RwLock[T] =
+    var l: RwLock[T] = new[RwLock[T]]()
+    if l != nil:
+        l.state = 0
+        l.value = value
+    return l
+
+fn rwLockTryRead(l: RwLock[T]): T* =
+    if l == nil:
+        return nil
+    let cur: int32 = atomicLoadI32 &l.state
+    if cur >= 0 && atomicCasI32(&l.state, cur, cur + 1) != 0:
+        return &l.value
+    return nil
+
+fn rwLockRead(l: RwLock[T]): T* =
+    if l == nil:
+        return nil
+    while true:
+        let cur: int32 = atomicLoadI32 &l.state
+        if cur >= 0 && atomicCasI32(&l.state, cur, cur + 1) != 0:
+            return &l.value
+        0
+fn rwLockReadUnlock(l: RwLock[T]) =
+    if l == nil:
+        return
+    var cur: int32 = atomicLoadI32 &l.state
+    while cur > 0:
+        if atomicCasI32(&l.state, cur, cur - 1) != 0:
+            return
+        cur = atomicLoadI32 &l.state
+
+fn rwLockTryWrite(l: RwLock[T]): T* =
+    if l == nil:
+        return nil
+    if atomicCasI32(&l.state, 0, -1) != 0:
+        return &l.value
+    return nil
+
+fn rwLockWrite(l: RwLock[T]): T* =
+    if l == nil:
+        return nil
+    while atomicCasI32(&l.state, 0, -1) == 0:
+        0
+        return &l.value
+
+fn rwLockWriteUnlock(l: RwLock[T]) =
+    if l == nil:
+        return
+    atomicStoreI32(&l.state, 0)
+
+fn atomicNew(value: T): Atomic[T] =
+    var a: Atomic[T] = new[Atomic[T]]()
+    if a != nil:
+        a.value = int32(value)
+    return a
+
+fn atomicLoad(a: Atomic[T]): T =
+    if a == nil:
+        return T(0)
+    let v: int32 = atomicLoadI32 &a.value
+    return T(v)
+
+fn atomicStore(a: Atomic[T], value: T) =
+    if a == nil:
+        return
+    atomicStoreI32(&a.value, int32(value))
+
+fn atomicCas(a: Atomic[T], expect: T, desired: T): bool =
+    if a == nil:
+        return false
+    return atomicCasI32(&a.value, int32(expect), int32(desired)) != 0

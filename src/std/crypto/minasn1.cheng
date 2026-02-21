@@ -1,0 +1,235 @@
+# Minimal ASN.1 DER helpers(length + primitive TLV).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/strings
+type
+    Asn1LengthNext =
+        length: int32
+        next: int32
+
+    Asn1TagValueNext =
+        tag: int32
+        value: Bytes
+        next: int32
+
+    Asn1ValueNext =
+        value: Bytes
+        next: int32
+
+    Asn1Int64Next =
+        value: int64
+        next: int32
+
+const
+    asn1TagBoolean = 0x01
+    asn1TagInteger = 0x02
+    asn1TagBitString = 0x03
+    asn1TagOctetString = 0x04
+    asn1TagNull = 0x05
+    asn1TagOid = 0x06
+    asn1TagSequence = 0x30
+
+fn asn1IntToString(value: int32): str =
+    if value == 0:
+        return "0"
+    var v: int32 = value
+    var neg: bool = false
+    if v < 0:
+        neg = true
+        v = -v
+    var out: str = ""
+    while v > 0:
+        let digit: int32 = v % 10
+        let ch: char = char(int32('0') + digit)
+        out = charToStr(ch) + out
+        v = v / 10
+    if neg:
+        out = "-" + out
+    return out
+
+fn int64ToBytes(value: int64): Bytes =
+    if value <= 0:
+        let out: Bytes = bytesAlloc(1)
+        bytesSet(out, 0, 0)
+        return out
+    var tmp: int64 = value
+    var count: int32 = 0
+    while tmp > 0:
+        count = count + 1
+        tmp = tmp >> 8
+    let out: Bytes = bytesAlloc(count)
+    var i: int32 = count - 1
+    var v: int64 = value
+    let __for_start_i_1 = i
+    for __for_i_1 in 0..(__for_start_i_1 - (0)):
+        i = __for_start_i_1 - __for_i_1
+        bytesSet(out, i, int32(v & 255))
+        v = v >> 8
+        i = i - 1
+    return out
+
+fn bytesToInt64(data: Bytes): Result[int64] =
+    let n: int32 = bytesLen(data)
+    if n <= 0:
+        return Ok[int64](0)
+    if n > 8:
+        return Err[int64]("asn1: integer too large")
+    var value: int64 = 0
+    for i in 0..<n:
+        # High bits are shifted out; low 8 bits are empty, so + is equivalent to | here.
+        value = (value << 8) + int64(bytesGet(data, i))
+    return Ok[int64](value)
+
+fn asn1EncodeLength(length: int32): Bytes =
+    if length < 0:
+        return emptyBytes()
+    if length < 0x80:
+        let out: Bytes = bytesAlloc(1)
+        bytesSet(out, 0, length)
+        return out
+    var tmp: int32 = length
+    var count: int32 = 0
+    while tmp > 0:
+        count = count + 1
+        tmp = tmp >> 8
+    let out: Bytes = bytesAlloc(1 + count)
+    bytesSet(out, 0, 0x80 + count)
+    for i in 0..<count:
+        let shift: int32 = (count - 1 - i) * 8
+        bytesSet(out, 1 + i, int32((length >> shift) & 255))
+    return out
+
+fn asn1EncodeTlv(tag: int32, value: Bytes): Bytes =
+    let lenBytes: Bytes = asn1EncodeLength(bytesLen(value))
+    let out: Bytes = bytesAlloc(1 + bytesLen(lenBytes) + bytesLen(value))
+    bytesSet(out, 0, tag)
+    if bytesLen(lenBytes) > 0:
+        copyMem(ptr_add(out.data, 1), lenBytes.data, bytesLen(lenBytes))
+    if bytesLen(value) > 0:
+        copyMem(ptr_add(out.data, 1 + bytesLen(lenBytes)), value.data, bytesLen(value))
+    return out
+
+fn trimLeadingZeros(value: Bytes): Bytes =
+    for i in 0..<bytesLen(value):
+        if !(bytesGet(value, i) == 0):
+            break
+    if i >= bytesLen(value):
+        let out: Bytes = bytesAlloc(1)
+        bytesSet(out, 0, 0)
+        return out
+    return bytesSlice(value, i, bytesLen(value) - i)
+
+fn asn1EncodeInteger(value: Bytes): Bytes =
+    let trimmed: Bytes = trimLeadingZeros(value)
+    let tlen: int32 = bytesLen(trimmed)
+    if tlen <= 0:
+        return asn1EncodeTlv(asn1TagInteger, emptyBytes())
+    let needsPrefix: bool = bytesGet(trimmed, 0) >= 0x80
+    if ! needsPrefix:
+        return asn1EncodeTlv(asn1TagInteger, trimmed)
+    let prefixed: Bytes = bytesAlloc(tlen + 1)
+    bytesSet(prefixed, 0, 0)
+    copyMem(ptr_add(prefixed.data, 1), trimmed.data, tlen)
+    return asn1EncodeTlv(asn1TagInteger, prefixed)
+
+fn asn1EncodeInt64(value: int64): Bytes =
+    return asn1EncodeInteger(int64ToBytes(value))
+
+fn asn1EncodeOctetString(value: Bytes): Bytes =
+    return asn1EncodeTlv(asn1TagOctetString, value)
+
+fn asn1EncodeBitString(value: Bytes): Bytes =
+    let payload: Bytes = bytesAlloc(bytesLen(value) + 1)
+    bytesSet(payload, 0, 0)
+    if bytesLen(value) > 0:
+        copyMem(ptr_add(payload.data, 1), value.data, bytesLen(value))
+    return asn1EncodeTlv(asn1TagBitString, payload)
+
+fn asn1EncodeNull(): Bytes =
+    let out: Bytes = bytesAlloc(2)
+    bytesSet(out, 0, asn1TagNull)
+    bytesSet(out, 1, 0)
+    return out
+
+fn asn1EncodeOid(value: Bytes): Bytes =
+    return asn1EncodeTlv(asn1TagOid, value)
+
+fn asn1EncodeSequence(value: Bytes): Bytes =
+    return asn1EncodeTlv(asn1TagSequence, value)
+
+fn asn1DecodeLength(data: Bytes, offset: int32): Result[Asn1LengthNext] =
+    if offset < 0 || offset >= bytesLen(data):
+        return Err[Asn1LengthNext]("asn1: length overrun")
+    let first: int32 = bytesGet(data, offset)
+    if first < 0x80:
+        return Ok[Asn1LengthNext](Asn1LengthNext(length: first, next: offset + 1))
+    let count: int32 = first & 0x7F
+    if count <= 0:
+        return Err[Asn1LengthNext]("asn1: indefinite length")
+    if offset + 1 + count > bytesLen(data):
+        return Err[Asn1LengthNext]("asn1: length overrun")
+    var length: int64 = 0
+    for i in 0..<count:
+        # High bits are shifted out; low 8 bits are empty, so + is equivalent to | here.
+        length = (length << 8) + int64(bytesGet(data, offset + 1 + i))
+    if length > 0x7fffffff:
+        var msg: str = "asn1: length overflow"
+        msg = msg + " offset="
+        msg = msg + asn1IntToString(offset)
+        let prev: int32 = if offset > 0: bytesGet(data, offset - 1) else: -1
+        msg = msg + " prev="
+        msg = msg + asn1IntToString(prev)
+        msg = msg + " first="
+        msg = msg + asn1IntToString(first)
+        msg = msg + " count="
+        msg = msg + asn1IntToString(count)
+        return Err[Asn1LengthNext](msg)
+    return Ok[Asn1LengthNext](Asn1LengthNext(length: int32(length), next: offset + 1 + count))
+
+fn asn1DecodeTlv(data: Bytes, offset: int32): Result[Asn1TagValueNext] =
+    if offset < 0 || offset >= bytesLen(data):
+        return Err[Asn1TagValueNext]("asn1: tag overrun")
+    let tag: int32 = bytesGet(data, offset)
+    let lenRes: Result[Asn1LengthNext] = asn1DecodeLength(data, offset + 1)
+    if IsErr(lenRes):
+        return Err[Asn1TagValueNext](Error(lenRes))
+    let length: int32 = Value(lenRes).length
+    let start: int32 = Value(lenRes).next
+    let endPos: int32 = start + length
+    if start < 0 || endPos > bytesLen(data):
+        return Err[Asn1TagValueNext]("asn1: value overrun")
+    let value: Bytes = bytesSliceView(data, start, length)
+    return Ok[Asn1TagValueNext](Asn1TagValueNext(tag: tag, value: value, next: endPos))
+
+fn asn1DecodeSequence(data: Bytes, offset: int32): Result[Asn1ValueNext] =
+    let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(data, offset)
+    if IsErr(tlvRes):
+        return Err[Asn1ValueNext](Error(tlvRes))
+    let tlv = Value(tlvRes)
+    if tlv.tag != asn1TagSequence:
+        return Err[Asn1ValueNext]("asn1: expected sequence")
+    return Ok[Asn1ValueNext](Asn1ValueNext(value: tlv.value, next: tlv.next))
+
+fn asn1DecodeInteger(data: Bytes, offset: int32): Result[Asn1ValueNext] =
+    let tlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(data, offset)
+    if IsErr(tlvRes):
+        return Err[Asn1ValueNext](Error(tlvRes))
+    let tlv = Value(tlvRes)
+    if tlv.tag != asn1TagInteger:
+        return Err[Asn1ValueNext]("asn1: expected integer")
+    var value: Bytes = tlv.value
+    if bytesLen(value) > 1 && bytesGet(value, 0) == 0:
+        value = bytesSlice(value, 1, bytesLen(value) - 1)
+    return Ok[Asn1ValueNext](Asn1ValueNext(value: value, next: tlv.next))
+
+fn asn1DecodeInt64(data: Bytes, offset: int32): Result[Asn1Int64Next] =
+    let intRes: Result[Asn1ValueNext] = asn1DecodeInteger(data, offset)
+    if IsErr(intRes):
+        return Err[Asn1Int64Next](Error(intRes))
+    let intBytes: Bytes = Value(intRes).value
+    let vRes: Result[int64] = bytesToInt64(intBytes)
+    if IsErr(vRes):
+        return Err[Asn1Int64Next](Error(vRes))
+    return Ok[Asn1Int64Next](Asn1Int64Next(value: Value(vRes), next: Value(intRes).next))

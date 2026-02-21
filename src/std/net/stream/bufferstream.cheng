@@ -1,0 +1,75 @@
+# In-memory stream buffer(minimal, synchronous).
+
+import std/result
+import std/rawbytes
+import std/net/utils/zeroqueue
+import std/net/resourcemanager
+type
+    BufferStream =
+        queue: ZeroQueue
+        closed: bool
+        accountedBytes: int64
+
+fn newBufferStream(): BufferStream =
+    BufferStream(queue: initZeroQueue(), closed: false, accountedBytes: 0)
+
+fn available(s: BufferStream): int32 =
+    let total: int64 = zeroQueueLen(s.queue)
+    if total <= 0:
+        return 0
+    if total > 2147483647:
+        return 2147483647
+    return int32(total)
+
+fn isClosed(s: BufferStream): bool =
+    s.closed
+
+fn write(s: var BufferStream, data: Bytes): Result[int32] =
+    if s.closed:
+        return Err[int32]("bufferstream: closed")
+    let addLen: int32 = bytesLen(data)
+    if addLen <= 0:
+        return Ok[int32](0)
+    let reserveRes: Result[bool] = resourceReserveMemoryBytes(int64(addLen))
+    if IsErr(reserveRes):
+        return Err[int32](Error(reserveRes))
+    let reserved: bool = Value(reserveRes)
+    if reserved:
+        s.accountedBytes = s.accountedBytes + int64(addLen)
+    let pushRes: Result[bool] = pushCopy(s.queue, data)
+    if IsErr(pushRes):
+        if reserved:
+            resourceReleaseMemoryBytes(int64(addLen))
+            s.accountedBytes = s.accountedBytes - int64(addLen)
+        return Err[int32](Error(pushRes))
+    return Ok[int32](addLen)
+
+fn read(s: var BufferStream, count: int32): Result[Bytes] =
+    if s.closed:
+        return Err[Bytes]("bufferstream: closed")
+    if count <= 0:
+        return Ok[Bytes](emptyBytes())
+    let avail: int32 = available(s)
+    if avail <= 0:
+        return Ok[Bytes](emptyBytes())
+    let n: int32 = if count < avail: count else: avail
+    let popRes: Result[Bytes] = popBytes(s.queue, n)
+    if IsErr(popRes):
+        return Err[Bytes](Error(popRes))
+    let got: int32 = bytesLen(Value(popRes))
+    if got > 0 && s.accountedBytes > 0:
+        var releaseBytes: int64 = int64(got)
+        if releaseBytes > s.accountedBytes:
+            releaseBytes = s.accountedBytes
+        let relRes: Result[bool] = resourceReleaseMemoryBytes(releaseBytes)
+        if IsErr(relRes):
+            return Err[Bytes](Error(relRes))
+        s.accountedBytes = s.accountedBytes - releaseBytes
+    return popRes
+
+fn closeBufferStream(s: var BufferStream) =
+    s.closed = true
+    if s.accountedBytes > 0:
+        resourceReleaseMemoryBytes(s.accountedBytes)
+        s.accountedBytes = 0
+    clear(s.queue)

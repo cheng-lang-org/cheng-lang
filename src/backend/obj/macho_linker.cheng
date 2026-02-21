@@ -1,0 +1,1853 @@
+# Minimal Mach-O AArch64 linker (Darwin/arm64): links backend-emitted `.o` into an executable.
+# Scope (v2 bootstrap):
+# - Input objects: Mach-O MH_OBJECT emitted by our backend (macho_writer.cheng).
+# - Relocations supported: ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, ARM64_RELOC_PAGEOFF12,
+#   ARM64_RELOC_GOT_LOAD_PAGE21, ARM64_RELOC_GOT_LOAD_PAGEOFF12.
+# - Undefined symbols: supported for BRANCH26 and ADRP/PAGEOFF pairs; resolved via dyld bind info + local stubs.
+# - Output format: MH_EXECUTE + LC_DYLD_INFO_ONLY (no fixup chains); codesigned later via `codesign -s -`.
+import std/seqs
+import std/strings
+import std/bytes
+import std/hashmaps
+import std/os
+import std/result
+import cheng/backend/obj/obj_buf
+import cheng/backend/obj/linker_shared_core
+
+type
+    MachoObjReloc =
+        addr: int32
+        symIndex: int32
+        pcrel: bool
+        length: int32
+        extern: bool
+        rtype: int32
+
+    MachoObjSection = ref
+        segname: str
+        sectname: str
+        addr: uint64
+        size: uint64
+        offset: uint32
+        alignPow2: uint32
+        reloff: uint32
+        nreloc: uint32
+        flags: uint32
+        data: uint8[]
+        relocs: MachoObjReloc[]
+        isZerofill: bool
+
+    MachoObjSymbol = ref
+        name: str
+        nType: uint8
+        nSect: uint8
+        nDesc: uint16
+        nValue: uint64
+
+    MachoObjFile = ref
+        path: str
+        buf: bytes.ByteBuffer
+        sections: MachoObjSection[]
+        symbols: MachoObjSymbol[]
+
+type
+    MachoLinkLayout = ref
+        # Output raw section bytes.
+        text: uint8[]
+        cstring: uint8[]
+        data: uint8[]
+        bssSize: uint64
+        # External imports to bind (ordered to match pointer slots layout).
+        imports: str[]
+        # Defined symbol table from input objects.
+        defIndex: hashmaps.HashMapStrInt
+        # Tagged relative addresses:
+        #   plain               => __TEXT,__text offset
+        #   MACHO_REL_CSTRING   => __TEXT,__cstring offset
+        #   MACHO_REL_DATA      => __DATA,__data offset
+        #   MACHO_REL_BSS       => __DATA,__bss offset
+        defAddr: uint64[]
+
+        # File layout (computed).
+        headerSize: uint64
+        sizeofcmds: uint32
+        textFileOff: uint64
+        cstrFileOff: uint64
+        dataFileOff: uint64
+        linkeditFileOff: uint64
+
+        textVmaddr: uint64
+        dataVmaddr: uint64
+        linkeditVmaddr: uint64
+
+        textSegSize: uint64
+        dataSegFileSize: uint64
+        dataSegVmSize: uint64
+        linkeditSegSize: uint64
+
+        # Entry point offset (LC_MAIN entryoff) relative to __TEXT (fileoff==0).
+        entryoff: uint64
+
+    MachoCStringSynthIndex = ref
+        byLabel: hashmaps.HashMapStrInt
+        values: str[]
+
+fn Ok_MachoObjFile(value: MachoObjFile): Result[MachoObjFile] =
+    var out: Result[MachoObjFile]
+    out.ok = true
+    out.value = value
+    out.err = ErrorOk()
+    return out
+
+fn Err_MachoObjFile(err: str): Result[MachoObjFile] =
+    var out: Result[MachoObjFile]
+    out.ok = false
+    out.err = ErrorNew(err)
+    return out
+
+fn Ok_MachoLinkLayout(value: MachoLinkLayout): Result[MachoLinkLayout] =
+    var out: Result[MachoLinkLayout]
+    out.ok = true
+    out.value = value
+    out.err = ErrorOk()
+    return out
+
+fn Err_MachoLinkLayout(err: str): Result[MachoLinkLayout] =
+    var out: Result[MachoLinkLayout]
+    out.ok = false
+    out.err = ErrorNew(err)
+    return out
+
+fn ErrInfo_MachoLinkLayout(err: ErrorInfo): Result[MachoLinkLayout] =
+    var out: Result[MachoLinkLayout]
+    out.ok = false
+    out.err = err
+    return out
+
+const
+    MACHO_PAGE_SIZE: uint64 = uint64(0x4000) # macOS arm64 page size
+    MACHO_REL_CSTRING: uint64 = uint64(0x8000000000000000)
+    MACHO_REL_DATA: uint64 = uint64(0x4000000000000000)
+    MACHO_REL_BSS: uint64 = uint64(0x2000000000000000)
+
+    MH_MAGIC_64: uint32 = uint32(0xFEEDFACF)
+    CPU_TYPE_ARM64: uint32 = uint32(0x0100000C)
+    CPU_SUBTYPE_ARM64_ALL: uint32 = uint32(0)
+    MH_EXECUTE: uint32 = uint32(2)
+
+    # mach_header flags
+    MH_NOUNDEFS: uint32 = uint32(0x1)
+    MH_DYLDLINK: uint32 = uint32(0x4)
+    MH_TWOLEVEL: uint32 = uint32(0x80)
+    MH_PIE: uint32 = uint32(0x200000)
+
+    # load commands
+    LC_SEGMENT_64: uint32 = uint32(0x19)
+    LC_SYMTAB: uint32 = uint32(0x2)
+    LC_DYSYMTAB: uint32 = uint32(0xB)
+    LC_LOAD_DYLINKER: uint32 = uint32(0xE)
+    LC_UUID: uint32 = uint32(0x1B)
+    LC_BUILD_VERSION: uint32 = uint32(0x32)
+    LC_SOURCE_VERSION: uint32 = uint32(0x2A)
+    LC_MAIN: uint32 = uint32(0x80000028)
+    LC_LOAD_DYLIB: uint32 = uint32(0xC)
+    LC_DYLD_INFO_ONLY: uint32 = uint32(0x80000022)
+    LC_CODE_SIGNATURE: uint32 = uint32(0x1D)
+
+    # nlist_64
+    N_UNDF: uint8 = uint8(0x0)
+    N_SECT: uint8 = uint8(0xE)
+    N_EXT: uint8 = uint8(0x1)
+
+    # section flags
+    S_ZEROFILL: uint32 = uint32(0x1)
+    S_CSTRING_LITERALS: uint32 = uint32(0x2)
+    S_ATTR_PURE_INSTRUCTIONS: uint32 = uint32(0x80000000)
+    S_ATTR_SOME_INSTRUCTIONS: uint32 = uint32(0x00000400)
+
+    # relocation types (Mach-O AArch64)
+    ARM64_RELOC_BRANCH26: int32 = 2
+    ARM64_RELOC_PAGE21: int32 = 3
+    ARM64_RELOC_PAGEOFF12: int32 = 4
+    ARM64_RELOC_GOT_LOAD_PAGE21: int32 = 5
+    ARM64_RELOC_GOT_LOAD_PAGEOFF12: int32 = 6
+
+    # dyld bind opcodes
+    BIND_OPCODE_DONE: uint8 = uint8(0x00)
+    BIND_OPCODE_SET_DYLIB_ORDINAL_IMM: uint8 = uint8(0x10)
+    BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: uint8 = uint8(0x40)
+    BIND_OPCODE_SET_TYPE_IMM: uint8 = uint8(0x50)
+    BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: uint8 = uint8(0x70)
+    BIND_OPCODE_DO_BIND: uint8 = uint8(0x90)
+
+    BIND_TYPE_POINTER: uint8 = uint8(1)
+
+fn machoAlignUp(x: uint64, align: uint64): uint64 =
+    return linkerCoreAlignUp(x, align)
+
+fn machoStrHasPrefix(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    let ns: int32 = len(s)
+    let np: int32 = len(prefix)
+    if np == 0:
+        return true
+    if ns < np:
+        return false
+    for i in 0..<np:
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn machoStrHasSuffix(s: str, suffix: str): bool =
+    if s == nil || suffix == nil:
+        return false
+    let ns: int32 = len(s)
+    let np: int32 = len(suffix)
+    if np == 0:
+        return true
+    if ns < np:
+        return false
+    let start: int32 = ns - np
+    for i in 0..<np:
+        if s[start + i] != suffix[i]:
+            return false
+    return true
+
+fn machoStrCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    for i in 0..<n:
+        let ca: int32 = int32(int64(a[i]) & int64(0xFF))
+        let cb: int32 = int32(int64(b[i]) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn machoSortStrings(xs: var str[]) =
+    if xs.len <= 1:
+        return
+    for i in 1..<xs.len:
+        let key: str = xs[i]
+        var j: int32 = i - 1
+        for __for_guard_j in 0..i:
+            if !(j >= 0):
+                break
+            if machoStrCmp(xs[j], key) <= 0:
+                break
+            xs[j + 1] = xs[j]
+            j = j - 1
+        xs[j + 1] = key
+
+fn machoHexNibble(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn machoHexDigit(v: int32): char =
+    if v < 10:
+        return char(int8(48 + v))
+    return char(int8(97 + (v - 10)))
+
+fn machoU64ToHex(v: uint64): str =
+    let n: int32 = 16
+    var out: uint8[]; out.len = int(n + 1)
+    for i in 0..<n:
+        let shift: int32 = (n - 1 - i) * 4
+        let nib: int32 = int32((v >> uint64(shift)) & uint64(0xF))
+        out[int(i)] = uint8(int8(machoHexDigit(nib)))
+    return __cheng_str_from_bytes(out, out.len - 1)
+
+fn machoFnv1a64(s: str): uint64 =
+    var h: uint64 = uint64(1469598103934665603)
+    if s == nil:
+        return h
+    for i in 0..<len(s):
+        h = h ^ uint64(int64(s[i]) & int64(0xFF))
+        h = h * uint64(1099511628211)
+    return h
+
+fn machoCStringLabelFromValue(value: str): str =
+    let v: str = (value == nil) ? "" : value
+    return "L_cheng_str_" + machoU64ToHex(machoFnv1a64(v))
+
+fn machoCanonicalCStringLabel(name: str): str =
+    if name == nil:
+        return ""
+    var base: str = name
+    if machoStrHasPrefix(base, "_L_cheng_str_"):
+        if len(base) != 29:
+            return ""
+        base = os.sliceStr(base, 1, len(base) - 1)
+    if !machoStrHasPrefix(base, "L_cheng_str_"):
+        return ""
+    if len(base) != 28:
+        return ""
+    for i in 12..<28:
+        if machoHexNibble(base[i]) < 0:
+            return ""
+    return base
+
+fn machoIsCStringLabel(name: str): bool =
+    return len(machoCanonicalCStringLabel(name)) > 0
+
+fn machoCStringSymbolAlias(rawName: str, canonical: str): str =
+    if canonical == nil || len(canonical) == 0 || rawName == nil || len(rawName) == 0:
+        return ""
+    let underscored: str = "_" + canonical
+    if rawName == canonical:
+        return underscored
+    if rawName == underscored:
+        return canonical
+    return ""
+
+fn machoAddDefSymbol(defIndex: var hashmaps.HashMapStrInt,
+                     defName: var str[],
+                     defAddr: var uint64[],
+                     name: str,
+                     relAddr: uint64) =
+    if name == nil || len(name) == 0:
+        return
+    if defIndex[name] > 0:
+        return
+    hashmaps.hashMapStrIntPut(defIndex, name, defName.len + 1)
+    add(defName, name)
+    add(defAddr, relAddr)
+
+fn machoBytesRangeToStr(data: uint8[], start: int32, endExclusive: int32): str =
+    if start < 0 || endExclusive < start || endExclusive > data.len:
+        return ""
+    let n: int32 = endExclusive - start
+    if n <= 0:
+        return ""
+    var out: uint8[]; out.len = int(n + 1)
+    for i in 0..<n:
+        out[int(i)] = uint8(int8(int32(data[start + i]) & 0xFF))
+    return __cheng_str_from_bytes(out, out.len - 1)
+
+fn machoDecodeStringLiteral(raw: str): str =
+    if raw == nil:
+        return ""
+    let n: int32 = len(raw)
+    var out: uint8[]; out.len = int(n + 1)
+    var wi: int32 = 0
+    var i: int32 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let ch: char = raw[i]
+        if ch == '\\' && i + 1 < n:
+            let esc: char = raw[i + 1]
+            if esc == 'n':
+                out[int(wi)] = uint8(int8(10))
+                wi = wi + 1
+                i = i + 2
+                continue
+            if esc == 'r':
+                out[int(wi)] = uint8(int8(13))
+                wi = wi + 1
+                i = i + 2
+                continue
+            if esc == 't':
+                out[int(wi)] = uint8(int8(9))
+                wi = wi + 1
+                i = i + 2
+                continue
+            if esc == '"':
+                out[int(wi)] = uint8(int8(34))
+                wi = wi + 1
+                i = i + 2
+                continue
+            if esc == '\\':
+                out[int(wi)] = uint8(int8(92))
+                wi = wi + 1
+                i = i + 2
+                continue
+            if esc == '0':
+                out[int(wi)] = uint8(int8(0))
+                wi = wi + 1
+                i = i + 2
+                continue
+            if esc == 'x' && i + 3 < n:
+                let hi: int32 = machoHexNibble(raw[i + 2])
+                let lo: int32 = machoHexNibble(raw[i + 3])
+                if hi >= 0 && lo >= 0:
+                    let b: int32 = (hi << 4) | lo
+                    out[int(wi)] = uint8(int8(b))
+                    wi = wi + 1
+                    i = i + 4
+                    continue
+        out[int(wi)] = uint8(int8(ch))
+        wi = wi + 1
+        i = i + 1
+    return __cheng_str_from_bytes(out, wi)
+
+fn machoSynthIndexAddLiteral(outIndex: MachoCStringSynthIndex, value: str) =
+    if outIndex == nil:
+        return
+    let label: str = machoCStringLabelFromValue(value)
+    if outIndex.byLabel[label] > 0:
+        return
+    add(outIndex.values, value)
+    hashmaps.hashMapStrIntPut(outIndex.byLabel, label, outIndex.values.len)
+
+fn machoCollectCStringLiteralsFromContent(content: str, outIndex: MachoCStringSynthIndex) =
+    if outIndex == nil || content == nil:
+        return
+    let n: int32 = len(content)
+    var i: int32 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        if content[i] != '"':
+            i = i + 1
+            continue
+        var j: int32 = i + 1
+        var closed: bool = false
+        for __for_guard_j in 0..<n:
+            if !(j < n):
+                break
+            if content[j] == '\\':
+                j = j + 2
+                continue
+            if content[j] == '"':
+                closed = true
+                break
+            j = j + 1
+        if !closed:
+            break
+        var raw: str = ""
+        if j - 1 >= i + 1:
+            raw = os.sliceStr(content, i + 1, j - 1)
+        let decoded: str = machoDecodeStringLiteral(raw)
+        machoSynthIndexAddLiteral(outIndex, decoded)
+        i = j + 1
+
+fn machoBuildCStringSynthIndex(rootPath: str): MachoCStringSynthIndex =
+    var out: MachoCStringSynthIndex
+    new out
+    out.byLabel = hashmaps.hashMapStrIntInit(4096)
+    out.values = []
+    if rootPath == nil || len(rootPath) == 0 || !os.dirExists(rootPath):
+        return out
+    var files: str[] = os.walkDirRec(rootPath)
+    machoSortStrings(files)
+    for i in 0..<files.len:
+        let p: str = files[i]
+        if !machoStrHasSuffix(p, ".cheng"):
+            continue
+        let content: str = os.readFile(p)
+        machoCollectCStringLiteralsFromContent(content, out)
+    return out
+
+fn machoBufU32At(buf: bytes.ByteBuffer, off: int32): uint32 =
+    let v: int32 = bytes.readU32LEAt(buf, off)
+    return uint32(v)
+
+fn machoBufU16At(buf: bytes.ByteBuffer, off: int32): uint16 =
+    let v: int32 = bytes.readU16LEAt(buf, off)
+    return uint16(v & 0xFFFF)
+
+fn machoBufU8At(buf: bytes.ByteBuffer, off: int32): uint8 =
+    let v: int32 = bytes.bufByteAt(buf, off)
+    return uint8(v & 0xFF)
+
+fn machoBufU64At(buf: bytes.ByteBuffer, off: int32): uint64 =
+    let lo: uint64 = uint64(machoBufU32At(buf, off))
+    let hi: uint64 = uint64(machoBufU32At(buf, off + 4))
+    return lo | (hi << 32)
+
+fn machoReadFixedStr16(buf: bytes.ByteBuffer, off: int32): str =
+    for n in 0..<16:
+        if bytes.bufByteAt(buf, off + n) == 0:
+            break
+    if n <= 0:
+        return ""
+    var out: uint8[]; out.len = int(n + 1)
+    for i in 0..<n:
+        let b: int32 = bytes.bufByteAt(buf, off + i)
+        out[int(i)] = uint8(int8(b))
+    return __cheng_str_from_bytes(out, out.len - 1)
+
+fn machoReadCStringAt(buf: bytes.ByteBuffer, off: int32): str =
+    if off < 0 || off >= buf.len:
+        return ""
+    var n: int32 = 0
+    while off + n < buf.len:
+        if bytes.bufByteAt(buf, off + n) == 0:
+            break
+        n = n + 1
+    if n <= 0:
+        return ""
+    var out: uint8[]; out.len = int(n + 1)
+    for i in 0..<n:
+        let b: int32 = bytes.bufByteAt(buf, off + i)
+        out[int(i)] = uint8(int8(b))
+    return __cheng_str_from_bytes(out, out.len - 1)
+
+fn machoReadBytes(buf: bytes.ByteBuffer, off: uint64, size: uint64): uint8[] =
+    var outEmpty: uint8[]
+    if size == 0:
+        return outEmpty
+    if int64(off) < 0:
+        return outEmpty
+    if off + size > uint64(buf.len):
+        return outEmpty
+    if size > uint64(2147483647):
+        return outEmpty
+    let n: int32 = int32(size)
+    var out: uint8[n]
+    let off32: int32 = int32(off)
+    for i in 0..<n:
+        add(out, uint8(bytes.bufByteAt(buf, off32 + i)))
+    return out
+
+fn machoByteBufFromObjBytes(objBytes: uint8[]): bytes.ByteBuffer =
+    var out: bytes.ByteBuffer
+    out.len = 0
+    out.data = nil
+    if objBytes == nil || objBytes.len <= 0:
+        return out
+    out.len = objBytes.len
+    out.data = alloc out.len
+    if out.data == nil:
+        out.len = 0
+        return out
+    for i in 0..<objBytes.len:
+        bytes.bufSetByte(out, i, int32(objBytes[i]))
+    return out
+
+fn machoParseObjFromBuf(path: str, inBuf: bytes.ByteBuffer): Result[MachoObjFile] =
+    var out: MachoObjFile
+    new out
+    out.path = path
+    out.buf = inBuf
+    if out.buf.data == nil || out.buf.len <= 0:
+        return Err[MachoObjFile]("macho_linker: failed to read obj: " + path)
+
+    let magic: uint32 = machoBufU32At(out.buf, 0)
+    if magic != MH_MAGIC_64:
+        return Err[MachoObjFile]("macho_linker: invalid magic (expected MH_MAGIC_64): " + path)
+    let filetype: uint32 = machoBufU32At(out.buf, 12)
+    if filetype != uint32(1): # MH_OBJECT
+        return Err[MachoObjFile]("macho_linker: expected MH_OBJECT input: " + path)
+    let ncmds: int32 = int32(machoBufU32At(out.buf, 16))
+    let sizeofcmds: int32 = int32(machoBufU32At(out.buf, 20))
+    if ncmds < 0 || sizeofcmds < 0:
+        return Err[MachoObjFile]("macho_linker: invalid header: " + path)
+
+    var symoff: uint32 = 0
+    var nsyms: uint32 = 0
+    var stroff: uint32 = 0
+    var strsize: uint32 = 0
+
+    out.sections = []
+    var cmdOff: int32 = 32
+    for ci in 0..<ncmds:
+        if cmdOff + 8 > out.buf.len:
+            return Err[MachoObjFile]("macho_linker: truncated load commands: " + path)
+        let cmd: uint32 = machoBufU32At(out.buf, cmdOff)
+        let cmdsize: int32 = int32(machoBufU32At(out.buf, cmdOff + 4))
+        if cmdsize < 8 || cmdOff + cmdsize > out.buf.len:
+            return Err[MachoObjFile]("macho_linker: invalid load command size: " + path)
+        if cmd == LC_SEGMENT_64:
+            # segment_command_64: 72 bytes header + section_64[80]*nsects
+            if cmdsize < 72:
+                return Err[MachoObjFile]("macho_linker: invalid LC_SEGMENT_64 cmdsize: " + path)
+            let segname: str = machoReadFixedStr16(out.buf, cmdOff + 8)
+            let nsects: uint32 = machoBufU32At(out.buf, cmdOff + 64)
+            var sectOff: int32 = cmdOff + 72
+            for si in 0..<nsects:
+                if sectOff + 80 > cmdOff + cmdsize:
+                    return Err[MachoObjFile]("macho_linker: truncated sections in segment: " + path)
+                var s: MachoObjSection
+                new s
+                s.sectname = machoReadFixedStr16(out.buf, sectOff + 0)
+                s.segname = machoReadFixedStr16(out.buf, sectOff + 16)
+                if len(s.segname) == 0:
+                    s.segname = segname
+                s.addr = machoBufU64At(out.buf, sectOff + 32)
+                s.size = machoBufU64At(out.buf, sectOff + 40)
+                s.offset = machoBufU32At(out.buf, sectOff + 48)
+                s.alignPow2 = machoBufU32At(out.buf, sectOff + 52)
+                s.reloff = machoBufU32At(out.buf, sectOff + 56)
+                s.nreloc = machoBufU32At(out.buf, sectOff + 60)
+                s.flags = machoBufU32At(out.buf, sectOff + 64)
+                s.isZerofill = (s.flags & uint32(0xFF)) == S_ZEROFILL
+                s.data = []
+                if s.size > 0 && !s.isZerofill:
+                    s.data = machoReadBytes(out.buf, uint64(s.offset), s.size)
+                    if uint64(s.data.len) != s.size:
+                        return Err[MachoObjFile]("macho_linker: section data truncated: " + path)
+                s.relocs = []
+                if s.nreloc > 0:
+                    var ri: uint32 = 0
+                    var roff: uint64 = uint64(s.reloff)
+                    for __for_guard_ri in 0..<s.nreloc:
+                        if !(ri < s.nreloc):
+                            break
+                        if roff + 8 > uint64(out.buf.len):
+                            return Err[MachoObjFile]("macho_linker: relocation table truncated: " + path)
+                        let rAddr: int32 = int32(machoBufU32At(out.buf, int32(roff)))
+                        let rInfo: uint32 = machoBufU32At(out.buf, int32(roff + 4))
+                        # scattered relocations not supported in v2 bootstrap.
+                        if (uint32(rAddr) & uint32(0x80000000)) != 0:
+                            return Err[MachoObjFile]("macho_linker: scattered reloc unsupported: " + path)
+                        var r: MachoObjReloc
+                        r.addr = rAddr
+                        r.symIndex = int32(rInfo & uint32(0x00FFFFFF))
+                        r.pcrel = ((rInfo >> 24) & 1) != 0
+                        r.length = int32((rInfo >> 25) & uint32(0x3))
+                        r.extern = ((rInfo >> 27) & 1) != 0
+                        r.rtype = int32((rInfo >> 28) & uint32(0xF))
+                        add(s.relocs, r)
+                        ri = ri + 1
+                        roff = roff + 8
+                add(out.sections, s)
+                sectOff = sectOff + 80
+        elif cmd == LC_SYMTAB:
+            if cmdsize < 24:
+                return Err[MachoObjFile]("macho_linker: invalid LC_SYMTAB cmdsize: " + path)
+            symoff = machoBufU32At(out.buf, cmdOff + 8)
+            nsyms = machoBufU32At(out.buf, cmdOff + 12)
+            stroff = machoBufU32At(out.buf, cmdOff + 16)
+            strsize = machoBufU32At(out.buf, cmdOff + 20)
+        cmdOff = cmdOff + cmdsize
+
+    if symoff == 0 || nsyms == 0 || stroff == 0:
+        return Err[MachoObjFile]("macho_linker: missing LC_SYMTAB: " + path)
+
+    out.symbols = []
+    for si in 0..<nsyms:
+        let off: uint64 = uint64(symoff) + uint64(si) * 16
+        if off + 16 > uint64(out.buf.len):
+            return Err[MachoObjFile]("macho_linker: symtab truncated: " + path)
+        let n_strx: uint32 = machoBufU32At(out.buf, int32(off))
+        let n_type: uint8 = machoBufU8At(out.buf, int32(off + 4))
+        let n_sect: uint8 = machoBufU8At(out.buf, int32(off + 5))
+        let n_desc: uint16 = machoBufU16At(out.buf, int32(off + 6))
+        let n_value: uint64 = machoBufU64At(out.buf, int32(off + 8))
+        var sym: MachoObjSymbol
+        new sym
+        sym.nType = n_type
+        sym.nSect = n_sect
+        sym.nDesc = n_desc
+        sym.nValue = n_value
+        if n_strx == 0:
+            sym.name = ""
+        else:
+            if uint64(stroff) + uint64(n_strx) >= uint64(out.buf.len):
+                sym.name = ""
+            else:
+                sym.name = machoReadCStringAt(out.buf, int32(uint64(stroff) + uint64(n_strx)))
+        add(out.symbols, sym)
+
+    return Ok[MachoObjFile](out)
+
+fn machoParseObj(path: str): Result[MachoObjFile] =
+    let inBuf: bytes.ByteBuffer = bytes.readFileBytes(path)
+    return machoParseObjFromBuf(path, inBuf)
+
+fn machoParseObjMem(pathHint: str, objBytes: uint8[]): Result[MachoObjFile] =
+    let hint: str = (pathHint != nil && len(pathHint) > 0) ? pathHint : "<main_obj_mem>"
+    let inBuf: bytes.ByteBuffer = machoByteBufFromObjBytes(objBytes)
+    return machoParseObjFromBuf(hint, inBuf)
+
+fn machoFreeObj(obj: MachoObjFile) =
+    if obj == nil:
+        return
+    if obj.buf.data != nil:
+        obj.buf.data = nil
+
+fn machoAddU8Ptr(out: var uint8[], v: uint8) =
+    if out == nil:
+        return
+    add(out, v)
+
+fn machoWriteUleb128(out: var uint8[], v0: uint64) =
+    if out == nil:
+        return
+    var v: uint64 = v0
+    while true:
+        var byte: uint8 = uint8(v & uint64(0x7F))
+        v = v >> 7
+        if v != 0:
+            byte = byte | uint8(0x80)
+        machoAddU8Ptr(out, byte)
+        if v == 0:
+            break
+
+fn machoWriteBindInfo(out: var uint8[], segIndex: uint8, startOffInSeg: uint64, importSyms: str[]) =
+    if out == nil:
+        return
+    if importSyms.len <= 0:
+        machoAddU8Ptr(out, BIND_OPCODE_DONE)
+        return
+    # dylib ordinal 1 => libSystem.B.dylib
+    machoAddU8Ptr(out, uint8(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | uint8(1)))
+    machoAddU8Ptr(out, uint8(BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER))
+    machoAddU8Ptr(out, uint8(BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segIndex))
+    machoWriteUleb128(out, startOffInSeg)
+    for i in 0..<importSyms.len:
+        let name: str = importSyms[i]
+        machoAddU8Ptr(out, uint8(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | uint8(0)))
+        obj_buf.bufStr0(out, name)
+        machoAddU8Ptr(out, BIND_OPCODE_DO_BIND)
+    machoAddU8Ptr(out, BIND_OPCODE_DONE)
+
+fn machoReadU32LEFromSeq(data: uint8[], off: int32): uint32 =
+    let b0: uint32 = uint32(data[off + 0])
+    let b1: uint32 = uint32(data[off + 1])
+    let b2: uint32 = uint32(data[off + 2])
+    let b3: uint32 = uint32(data[off + 3])
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn machoWriteU32LEToSeq(data: var uint8[], off: int32, v: uint32) =
+    if data == nil:
+        return
+    if off < 0 || off + 4 > data.len:
+        return
+    data[off + 0] = uint8(v & uint32(0xFF))
+    data[off + 1] = uint8((v >> 8) & uint32(0xFF))
+    data[off + 2] = uint8((v >> 16) & uint32(0xFF))
+    data[off + 3] = uint8((v >> 24) & uint32(0xFF))
+
+fn machoPatchBl(word0: uint32, fromAddr: uint64, toAddr: uint64): Result[uint32] =
+    let deltaBytes: int64 = int64(toAddr) - int64(fromAddr)
+    if deltaBytes % 4 != 0:
+        return Err[uint32]("macho_linker: bl target misaligned")
+    let deltaWords: int64 = deltaBytes / 4
+    if deltaWords < -33554432 || deltaWords > 33554431:
+        return Err[uint32]("macho_linker: bl target out of range")
+    let imm26: uint32 = uint32(uint64(deltaWords) & uint64(0x03FFFFFF))
+    let word: uint32 = (word0 & uint32(0xFC000000)) | imm26
+    return Ok[uint32](word)
+
+fn machoPatchAdrp(word0: uint32, instrAddr: uint64, symAddr: uint64): Result[uint32] =
+    let instrPage: int64 = int64(instrAddr & ~uint64(0xFFF))
+    let symPage: int64 = int64(symAddr & ~uint64(0xFFF))
+    let deltaPages: int64 = (symPage - instrPage) / 4096
+    if deltaPages < -1048576 || deltaPages > 1048575:
+        return Err[uint32]("macho_linker: adrp target out of range")
+    let imm21: uint32 = uint32(uint64(deltaPages) & uint64(0x1FFFFF))
+    let immlo: uint32 = imm21 & uint32(0x3)
+    let immhi: uint32 = (imm21 >> 2) & uint32(0x7FFFF)
+    let mask: uint32 = (uint32(0x3) << 29) | (uint32(0x7FFFF) << 5)
+    let word: uint32 = (word0 & ~mask) | (immlo << 29) | (immhi << 5)
+    return Ok[uint32](word)
+
+fn machoPatchAddImm12(word0: uint32, imm12: uint32): uint32 =
+    let mask: uint32 = uint32(0xFFF) << 10
+    return (word0 & ~mask) | ((imm12 & uint32(0xFFF)) << 10)
+
+fn machoIsLoadStoreUnsignedImm(word0: uint32): bool =
+    # A64 load/store unsigned-immediate class (scaled imm12).
+    return (word0 & uint32(0x3B000000)) == uint32(0x39000000)
+
+fn machoPatchPageOff12(word0: uint32, pageOff: uint64): Result[uint32] =
+    let immBytes: uint64 = pageOff & uint64(0xFFF)
+    if machoIsLoadStoreUnsignedImm(word0):
+        let sizeLog2: uint32 = (word0 >> 30) & uint32(0x3)
+        let scale: uint64 = uint64(1) << uint64(sizeLog2)
+        if scale == 0 || (immBytes % scale) != 0:
+            return Err[uint32]("macho_linker: pageoff load/store alignment mismatch")
+        let scaled: uint64 = immBytes / scale
+        if scaled > uint64(0xFFF):
+            return Err[uint32]("macho_linker: pageoff load/store imm out of range")
+        let mask: uint32 = uint32(0xFFF) << 10
+        let patched: uint32 = (word0 & ~mask) | (uint32(scaled) << 10)
+        return Ok[uint32](patched)
+    return Ok[uint32](machoPatchAddImm12(word0, uint32(immBytes)))
+
+fn machoEncBr(rn: uint32): uint32 =
+    return uint32(0xD61F0000) | ((rn & uint32(31)) << 5)
+
+fn machoMakeStub(ptrSlotAddr: uint64, stubAddr: uint64): Result[uint8[]] =
+    # Stub:
+    #   adrp x16, ptrSlot@PAGE
+    #   ldr  x16, [x16, #ptrSlot@PAGEOFF]
+    #   br   x16
+    var out: uint8[12]
+    let adrp: uint32 = uint32(0x90000000) | uint32(16) # rd=x16, imm=0
+    let adrpPatchedRes: Result[uint32] = machoPatchAdrp(adrp, stubAddr, ptrSlotAddr)
+    if !IsOk[uint32](adrpPatchedRes):
+        return ErrInfo[uint8[]](ErrorInfoOf[uint32](adrpPatchedRes))
+    obj_buf.bufU32(out, Value[uint32](adrpPatchedRes))
+    let pageOff: uint64 = ptrSlotAddr & uint64(0xFFF)
+    # ldr x16, [x16, #imm] (8-byte scale)
+    if pageOff % 8 != 0:
+        return Err[uint8[]]("macho_linker: stub ptr slot not 8-byte aligned")
+    let imm12: uint32 = uint32(pageOff)
+    # base for LDR (unsigned immediate) 64-bit: 0xF9400000 | imm12<<10 | rn<<5 | rt
+    let scaled: uint32 = uint32((imm12 / 8) & uint32(0xFFF))
+    let ldr: uint32 = uint32(0xF9400000) | (scaled << 10) | (uint32(16) << 5) | uint32(16)
+    obj_buf.bufU32(out, ldr)
+    obj_buf.bufU32(out, machoEncBr(uint32(16)))
+    return Ok[uint8[]](out)
+
+fn machoFindSectionIndexByName(sections: MachoObjSection[], seg: str, sect: str): int32 =
+    for i in 0..<sections.len:
+        let s: MachoObjSection = sections[i]
+        if s != nil && (s.segname == seg) && (s.sectname == sect):
+            return i
+    return -1
+
+fn machoSymIsUndef(sym: MachoObjSymbol): bool =
+    if sym == nil:
+        return false
+    let ty: uint8 = uint8(sym.nType & uint8(0x0E))
+    return ty == N_UNDF
+
+fn machoSymIsSect(sym: MachoObjSymbol): bool =
+    if sym == nil:
+        return false
+    let ty: uint8 = uint8(sym.nType & uint8(0x0E))
+    return ty == N_SECT
+
+fn machoSymIsExt(sym: MachoObjSymbol): bool =
+    if sym == nil:
+        return false
+    return (sym.nType & N_EXT) != 0
+
+fn machoAllowDuplicateRuntimeSymbol(name: str): bool =
+    if (name == "_store_int32") || (name == "_load_int32") ||
+       (name == "_store_bool") || (name == "_load_bool") ||
+       (name == "_store_ptr") || (name == "_load_ptr") ||
+       (name == "_ptr_add") || (name == "ptr_add") ||
+       (name == "store_ptr") || (name == "load_ptr") ||
+       (name == "_cheng_ptr_size") || (name == "cheng_ptr_size") ||
+       (name == "_cheng_ptr_to_u64") || (name == "cheng_ptr_to_u64") ||
+       (name == "_paramCount") || (name == "_paramStr") ||
+       (name == "_streq") || (name == "streq"):
+        return true
+    if machoStrHasPrefix(name, "_cheng_") || machoStrHasPrefix(name, "cheng_"):
+        return true
+    if machoStrHasPrefix(name, "___seq") || machoStrHasPrefix(name, "___cheng_sym_"):
+        return true
+    if machoStrHasPrefix(name, "___stack_chk"):
+        return true
+    return false
+
+fn machoPathMatchesCandidate(path: str, candidate: str): bool =
+    if len(path) == 0 || len(candidate) == 0:
+        return false
+    if path == candidate:
+        return true
+    if machoStrHasSuffix(path, candidate):
+        return true
+    if machoStrHasSuffix(candidate, path):
+        return true
+    return false
+
+fn machoKeepFirstDuplicateRuntimeSymbol(name: str): bool =
+    if (name == "_paramCount") || (name == "_paramStr") ||
+       (name == "_streq") || (name == "streq"):
+        return true
+    if machoStrHasPrefix(name, "_cheng_") || machoStrHasPrefix(name, "cheng_"):
+        return true
+    if (name == "_ptr_add") || (name == "ptr_add") ||
+       (name == "_store_ptr") || (name == "store_ptr") ||
+       (name == "_load_ptr") || (name == "load_ptr"):
+        return true
+    if machoStrHasPrefix(name, "___seq") || machoStrHasPrefix(name, "___cheng_sym_"):
+        return true
+    if machoStrHasPrefix(name, "___stack_chk"):
+        return true
+    return false
+
+fn machoFindRuntimeObjIndex(objs: MachoObjFile[], runtimeObj: str): int32 =
+    if runtimeObj == nil || len(runtimeObj) == 0:
+        return -1
+    for oi in 0..<objs.len:
+        let obj: MachoObjFile = objs[oi]
+        if obj == nil:
+            continue
+        if machoPathMatchesCandidate(obj.path, runtimeObj):
+            return oi
+        continue
+    if objs.len > 0:
+        return objs.len - 1
+    return -1
+
+fn machoBuildRuntimeSymbolSet(objs: MachoObjFile[], runtimeObj: str): hashmaps.HashMapStrInt =
+    var out: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
+    let runtimeObjIdx: int32 = machoFindRuntimeObjIndex(objs, runtimeObj)
+    if runtimeObjIdx < 0 || runtimeObjIdx >= objs.len:
+        return out
+    let runtimeObj: MachoObjFile = objs[runtimeObjIdx]
+    if runtimeObj == nil:
+        return out
+    for si in 0..<runtimeObj.symbols.len:
+        let sym: MachoObjSymbol = runtimeObj.symbols[si]
+        if sym != nil && machoSymIsSect(sym):
+            if sym.name != nil && len(sym.name) > 0:
+                hashmaps.hashMapStrIntPut(out, sym.name, 1)
+    return out
+
+fn machoRuntimeSymbolSetHas(set: hashmaps.HashMapStrInt, name: str): bool =
+    if len(name) == 0:
+        return false
+    return set[name] != 0
+
+fn machoSynthesizeCStringDefsFromSectionBytes(objs: MachoObjFile[],
+                                              layout: MachoLinkLayout,
+                                              defIndex: var hashmaps.HashMapStrInt,
+                                              defName: var str[],
+                                              defAddr: var uint64[]) =
+    if layout == nil:
+        return
+    let dbg: bool = os.getEnvDefault("BACKEND_DEBUG_MACHO", "") == "1"
+    var runningCstrOff: uint64 = uint64(0)
+    var added: int32 = 0
+    for oi in 0..<objs.len:
+        let obj: MachoObjFile = objs[oi]
+        if obj == nil:
+            continue
+        let cstrIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__cstring")
+        if cstrIdx < 0:
+            continue
+        let sect: MachoObjSection = obj.sections[cstrIdx]
+        let sectDataLen: int32 = sect.data.len
+        var start: int32 = 0
+        var pos: int32 = 0
+        for __for_guard_pos in 0..sectDataLen:
+            if !(pos < sectDataLen):
+                break
+            if sect.data[pos] != uint8(0):
+                pos = pos + 1
+                continue
+            let value: str = machoBytesRangeToStr(sect.data, start, pos)
+            let canonical: str = machoCStringLabelFromValue(value)
+            let relAddr: uint64 = MACHO_REL_CSTRING | (runningCstrOff + uint64(start))
+            let before: int32 = defName.len
+            machoAddDefSymbol(defIndex, defName, defAddr, canonical, relAddr)
+            let alias: str = machoCStringSymbolAlias(canonical, canonical)
+            machoAddDefSymbol(defIndex, defName, defAddr, alias, relAddr)
+            if defName.len > before:
+                added = added + 1
+            start = pos + 1
+            pos = start
+        if start < sectDataLen:
+            let valueTail: str = machoBytesRangeToStr(sect.data, start, sectDataLen)
+            let canonicalTail: str = machoCStringLabelFromValue(valueTail)
+            let relAddrTail: uint64 = MACHO_REL_CSTRING | (runningCstrOff + uint64(start))
+            let beforeTail: int32 = defName.len
+            machoAddDefSymbol(defIndex, defName, defAddr, canonicalTail, relAddrTail)
+            let aliasTail: str = machoCStringSymbolAlias(canonicalTail, canonicalTail)
+            machoAddDefSymbol(defIndex, defName, defAddr, aliasTail, relAddrTail)
+            if defName.len > beforeTail:
+                added = added + 1
+        runningCstrOff = runningCstrOff + uint64(sectDataLen)
+    if dbg && added > 0:
+        echo("macho_linker: synthesized cstring defs from __cstring bytes: " + intToStr(added))
+
+fn machoSynthesizeMissingCStringDefs(objs: MachoObjFile[], layout: MachoLinkLayout,
+                                     defIndex: var hashmaps.HashMapStrInt,
+                                     defName: var str[], defAddr: var uint64[]) =
+    if layout == nil:
+        return
+    let dbg: bool = os.getEnvDefault("BACKEND_DEBUG_MACHO", "") == "1"
+    var missing: str[]
+    var missingSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(512)
+    for oi in 0..<objs.len:
+        let obj: MachoObjFile = objs[oi]
+        if obj == nil:
+            continue
+        for secIdx in 0..<obj.sections.len:
+            let sect: MachoObjSection = obj.sections[secIdx]
+            if sect == nil || sect.relocs.len <= 0:
+                continue
+            for ri in 0..<sect.relocs.len:
+                let r: MachoObjReloc = sect.relocs[ri]
+                if !r.extern || r.symIndex < 0 || r.symIndex >= obj.symbols.len:
+                    continue
+                let sym: MachoObjSymbol = obj.symbols[r.symIndex]
+                if sym == nil || !machoSymIsUndef(sym) || !machoSymIsExt(sym):
+                    continue
+                let canonical: str = machoCanonicalCStringLabel(sym.name)
+                if len(canonical) == 0:
+                    continue
+                if defIndex[sym.name] > 0:
+                    continue
+                let canonicalIdxPlus1: int32 = defIndex[canonical]
+                if canonicalIdxPlus1 > 0:
+                    let canonicalIdx: int32 = canonicalIdxPlus1 - 1
+                    if canonicalIdx >= 0 && canonicalIdx < defAddr.len:
+                        let relAddrCanonical: uint64 = defAddr[canonicalIdx]
+                        machoAddDefSymbol(defIndex, defName, defAddr, sym.name, relAddrCanonical)
+                    continue
+                if missingSeen[sym.name] > 0:
+                    continue
+                hashmaps.hashMapStrIntPut(missingSeen, sym.name, 1)
+                add(missing, sym.name)
+    if missing.len <= 0:
+        return
+
+    let rootEnv: str = os.getEnvDefault("BACKEND_LINKER_CSTR_SRC_ROOT", "src")
+    let rootPath: str = os.dirExists(rootEnv) ? rootEnv : "."
+    if dbg:
+        echo("macho_linker: cstring synth missing_labels=" + intToStr(missing.len) + " root=" + rootPath)
+    let synth: MachoCStringSynthIndex = machoBuildCStringSynthIndex(rootPath)
+    if synth == nil:
+        return
+
+    var added: int32 = 0
+    var fallbackAdded: int32 = 0
+    var missesLogged: int32 = 0
+    for i in 0..<missing.len:
+        let rawLabel: str = missing[i]
+        if defIndex[rawLabel] > 0:
+            continue
+        let canonical: str = machoCanonicalCStringLabel(rawLabel)
+        if len(canonical) == 0:
+            continue
+        let canonicalIdxPlus1: int32 = defIndex[canonical]
+        if canonicalIdxPlus1 > 0:
+            let canonicalIdx: int32 = canonicalIdxPlus1 - 1
+            if canonicalIdx >= 0 && canonicalIdx < defAddr.len:
+                let relAddrCanonical: uint64 = defAddr[canonicalIdx]
+                machoAddDefSymbol(defIndex, defName, defAddr, rawLabel, relAddrCanonical)
+            continue
+        var foundLit: bool = false
+        let rawIdx: int32 = hashmaps.hashMapStrIntGetEx(synth.byLabel, canonical, foundLit)
+        let litIdx: int32 = rawIdx - 1
+        var value: str = ""
+        if foundLit && rawIdx > 0 && litIdx >= 0 && litIdx < synth.values.len:
+            value = synth.values[litIdx]
+        else:
+            if dbg && missesLogged < 8:
+                echo("macho_linker: cstring synth miss label=" + rawLabel + " canonical=" + canonical + "; fallback empty")
+                missesLogged = missesLogged + 1
+            fallbackAdded = fallbackAdded + 1
+        let off: uint64 = uint64(layout.cstring.len)
+        obj_buf.bufStr0(layout.cstring, value)
+        let relAddr: uint64 = MACHO_REL_CSTRING | off
+        machoAddDefSymbol(defIndex, defName, defAddr, canonical, relAddr)
+        machoAddDefSymbol(defIndex, defName, defAddr, rawLabel, relAddr)
+        let alias: str = machoCStringSymbolAlias(rawLabel, canonical)
+        machoAddDefSymbol(defIndex, defName, defAddr, alias, relAddr)
+        added = added + 1
+    if dbg:
+        echo("macho_linker: synthesized cstring defs from source literals: " + intToStr(added) + " fallback_empty=" + intToStr(fallbackAdded))
+
+fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout] =
+    var layout: MachoLinkLayout
+    new layout
+    layout.text = []
+    layout.cstring = []
+    layout.data = []
+    layout.bssSize = 0
+    layout.imports = []
+    layout.defIndex = hashmaps.hashMapStrIntInit(16)
+    layout.defAddr = []
+
+    # First pass: merge section raw bytes and compute per-object base offsets.
+    # We only support the backend-emitted section names.
+    var objTextBase: uint64[objs.len]
+    var objCstrBase: uint64[objs.len]
+    var objDataBase: uint64[objs.len]
+    var objBssBase: uint64[objs.len]
+    objTextBase.len = int(objs.len)
+    objCstrBase.len = int(objs.len)
+    objDataBase.len = int(objs.len)
+    objBssBase.len = int(objs.len)
+    for oi in 0..<objs.len:
+        objTextBase[oi] = uint64(0)
+        objCstrBase[oi] = uint64(0)
+        objDataBase[oi] = uint64(0)
+        objBssBase[oi] = uint64(0)
+
+    for oi in 0..<objs.len:
+        let obj: MachoObjFile = objs[oi]
+        if obj == nil:
+            continue
+        # Merge __text
+        let textIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__text")
+        if textIdx >= 0:
+            objTextBase[oi] = uint64(layout.text.len)
+            let s: MachoObjSection = obj.sections[textIdx]
+            obj_buf.bufBytes(layout.text, s.data)
+            obj_buf.bufAlign(layout.text, uint64(4))
+        else:
+            objTextBase[oi] = uint64(layout.text.len)
+        # Merge __cstring
+        let cstrIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__cstring")
+        if cstrIdx >= 0:
+            objCstrBase[oi] = uint64(layout.cstring.len)
+            let s2: MachoObjSection = obj.sections[cstrIdx]
+            obj_buf.bufBytes(layout.cstring, s2.data)
+            obj_buf.bufAlign(layout.cstring, uint64(1))
+        else:
+            objCstrBase[oi] = uint64(layout.cstring.len)
+        # Merge __data
+        let dataIdx: int32 = machoFindSectionIndexByName(obj.sections, "__DATA", "__data")
+        if dataIdx >= 0:
+            objDataBase[oi] = uint64(layout.data.len)
+            let s3: MachoObjSection = obj.sections[dataIdx]
+            obj_buf.bufAlign(layout.data, uint64(8))
+            objDataBase[oi] = uint64(layout.data.len)
+            obj_buf.bufBytes(layout.data, s3.data)
+            obj_buf.bufAlign(layout.data, uint64(8))
+        else:
+            objDataBase[oi] = uint64(layout.data.len)
+        # Merge __bss (zerofill)
+        let bssIdx: int32 = machoFindSectionIndexByName(obj.sections, "__DATA", "__bss")
+        if bssIdx >= 0:
+            let s4: MachoObjSection = obj.sections[bssIdx]
+            objBssBase[oi] = layout.bssSize
+            layout.bssSize = machoAlignUp(layout.bssSize, uint64(8))
+            objBssBase[oi] = layout.bssSize
+            layout.bssSize = layout.bssSize + s4.size
+        else:
+            objBssBase[oi] = layout.bssSize
+
+    # Second pass: build global symbol table (defined symbols) and gather imports.
+    var defIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
+    var defAddr: uint64[]
+    var defName: str[]
+    var defFromRuntime: bool[]
+    var defPath: str[]
+    defAddr.len = 0
+    defName.len = 0
+    defFromRuntime.len = 0
+    defPath.len = 0
+    let runtimeObjIdx: int32 = machoFindRuntimeObjIndex(objs, runtimeObj)
+    let runtimeSymbols: hashmaps.HashMapStrInt = machoBuildRuntimeSymbolSet(objs, runtimeObj)
+
+    for oi in 0..<objs.len:
+        let obj: MachoObjFile = objs[oi]
+        if obj == nil:
+            continue
+        let fromRuntimeObj: bool = runtimeObjIdx >= 0 && oi == runtimeObjIdx
+        for si in 0..<obj.symbols.len:
+            let sym: MachoObjSymbol = obj.symbols[si]
+            if sym != nil && machoSymIsSect(sym):
+                if sym.name != nil && len(sym.name) > 0:
+                    # Compute symbol address within merged layout (still relative; final vmaddrs decided later).
+                    let sectIndex0: int32 = int32(sym.nSect) - 1
+                    if sectIndex0 >= 0 && sectIndex0 < obj.sections.len:
+                        let sect0: MachoObjSection = obj.sections[sectIndex0]
+                        let symOffInSect: uint64 = sym.nValue - sect0.addr
+                        var relAddr: uint64 = 0
+                        if (sect0.segname == "__TEXT") && (sect0.sectname == "__text"):
+                            relAddr = objTextBase[oi] + symOffInSect
+                        elif (sect0.segname == "__TEXT") && (sect0.sectname == "__cstring"):
+                            relAddr = MACHO_REL_CSTRING | (objCstrBase[oi] + symOffInSect)
+                        elif (sect0.segname == "__DATA") && (sect0.sectname == "__data"):
+                            relAddr = MACHO_REL_DATA | (objDataBase[oi] + symOffInSect)
+                        elif (sect0.segname == "__DATA") && (sect0.sectname == "__bss"):
+                            relAddr = MACHO_REL_BSS | (objBssBase[oi] + symOffInSect)
+                        else:
+                            relAddr = objTextBase[oi] + symOffInSect
+
+                        let isExtDef: bool = machoSymIsExt(sym)
+                        let oldIdxPlus1: int32 = defIndex[sym.name]
+                        if oldIdxPlus1 > 0:
+                            if ! isExtDef:
+                                # Internal/local labels may legitimately collide across objects.
+                                continue
+                            let isRuntimeSymbol: bool = machoRuntimeSymbolSetHas(runtimeSymbols, sym.name)
+                            if isRuntimeSymbol:
+                                let oldIdx: int32 = oldIdxPlus1 - 1
+                                if fromRuntimeObj:
+                                    if machoKeepFirstDuplicateRuntimeSymbol(sym.name):
+                                        continue
+                                    if oldIdx >= 0 && oldIdx < defFromRuntime.len:
+                                        if !defFromRuntime[oldIdx]:
+                                            # Existing non-runtime definition wins; skip runtime definition.
+                                            continue
+                                    # Keep first runtime definition.
+                                    continue
+                                elif oldIdx >= 0 && oldIdx < defFromRuntime.len && defFromRuntime[oldIdx]:
+                                    # Replace runtime definition with explicit non-runtime definition.
+                                    defAddr[oldIdx] = relAddr
+                                    defFromRuntime[oldIdx] = false
+                                    if oldIdx >= 0 && oldIdx < defPath.len:
+                                        defPath[oldIdx] = obj.path
+                                    continue
+                                if machoKeepFirstDuplicateRuntimeSymbol(sym.name):
+                                    # For old fallback names, keep existing definition.
+                                    continue
+                                if machoAllowDuplicateRuntimeSymbol(sym.name):
+                                    continue
+                                var prevPath: str = ""
+                                if oldIdx >= 0 && oldIdx < defPath.len:
+                                    prevPath = defPath[oldIdx]
+                                return Err[MachoLinkLayout]("macho_linker: duplicate symbol: " + sym.name + " (prev=" + prevPath + ", cur=" + obj.path + ")")
+                            if machoAllowDuplicateRuntimeSymbol(sym.name):
+                                if machoKeepFirstDuplicateRuntimeSymbol(sym.name):
+                                    continue
+                                let oldIdx: int32 = oldIdxPlus1 - 1
+                                if oldIdx >= 0 && oldIdx < defAddr.len:
+                                    defAddr[oldIdx] = relAddr
+                                    if oldIdx >= 0 && oldIdx < defPath.len:
+                                        defPath[oldIdx] = obj.path
+                                continue
+                            var prevPath2: str = ""
+                            let oldIdx2: int32 = oldIdxPlus1 - 1
+                            if oldIdx2 >= 0 && oldIdx2 < defPath.len:
+                                prevPath2 = defPath[oldIdx2]
+                            return Err[MachoLinkLayout]("macho_linker: duplicate symbol: " + sym.name + " (prev=" + prevPath2 + ", cur=" + obj.path + ")")
+                        hashmaps.hashMapStrIntPut(defIndex, sym.name, defName.len + 1)
+                        add(defName, sym.name)
+                        add(defAddr, relAddr)
+                        add(defFromRuntime, fromRuntimeObj)
+                        add(defPath, obj.path)
+
+    # Stage0/seed fallback: some legacy emitters can leave L_cheng_str_* as
+    # undefined externs without emitting __cstring symbol definitions.
+    machoSynthesizeCStringDefsFromSectionBytes(objs, layout, defIndex, defName, defAddr)
+    machoSynthesizeMissingCStringDefs(objs, layout, defIndex, defName, defAddr)
+
+    # Gather undefined imports used by call/address relocations.
+    var importNeeded: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+    for oi in 0..<objs.len:
+        let obj: MachoObjFile = objs[oi]
+        if obj == nil:
+            continue
+        for secIdx in 0..<obj.sections.len:
+            let sect: MachoObjSection = obj.sections[secIdx]
+            if sect != nil && sect.relocs.len > 0:
+                for ri in 0..<sect.relocs.len:
+                    let r: MachoObjReloc = sect.relocs[ri]
+                    if r.extern && r.symIndex >= 0 && r.symIndex < obj.symbols.len:
+                        let sym: MachoObjSymbol = obj.symbols[r.symIndex]
+                        if sym != nil && machoSymIsUndef(sym) && machoSymIsExt(sym):
+                            if sym.name != nil && len(sym.name) > 0:
+                                let defIdxPlus1: int32 = defIndex[sym.name]
+                                if defIdxPlus1 > 0:
+                                    continue
+                                let canonicalCstr: str = machoCanonicalCStringLabel(sym.name)
+                                if len(canonicalCstr) > 0:
+                                    let off: uint64 = uint64(layout.cstring.len)
+                                    obj_buf.bufStr0(layout.cstring, "")
+                                    let relAddr: uint64 = MACHO_REL_CSTRING | off
+                                    machoAddDefSymbol(defIndex, defName, defAddr, canonicalCstr, relAddr)
+                                    machoAddDefSymbol(defIndex, defName, defAddr, sym.name, relAddr)
+                                    let aliasCstr: str = machoCStringSymbolAlias(sym.name, canonicalCstr)
+                                    machoAddDefSymbol(defIndex, defName, defAddr, aliasCstr, relAddr)
+                                    continue
+                                if r.rtype == ARM64_RELOC_BRANCH26 || r.rtype == ARM64_RELOC_PAGE21 ||
+                                   r.rtype == ARM64_RELOC_PAGEOFF12 || r.rtype == ARM64_RELOC_GOT_LOAD_PAGE21 ||
+                                   r.rtype == ARM64_RELOC_GOT_LOAD_PAGEOFF12:
+                                    if importNeeded[sym.name] == 0:
+                                        hashmaps.hashMapStrIntPut(importNeeded, sym.name, 1)
+                                else:
+                                    return Err[MachoLinkLayout]("macho_linker: unsupported undefined reloc type (" + intToStr(r.rtype) + ") for " + sym.name)
+
+    # Extract imports in stable order (deterministic).
+    # hashmaps.HashMapStrInt does not provide iteration; do a scan over all symbol tables for stable order.
+    var importSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
+    for oi in 0..<objs.len:
+        let obj: MachoObjFile = objs[oi]
+        if obj == nil:
+            continue
+        for si2 in 0..<obj.symbols.len:
+            let sym2: MachoObjSymbol = obj.symbols[si2]
+            if sym2 != nil && machoSymIsUndef(sym2) && machoSymIsExt(sym2):
+                let neededFlag: int32 = importNeeded[sym2.name]
+                if neededFlag > 0:
+                    let defIdxPlus2: int32 = defIndex[sym2.name]
+                    if defIdxPlus2 > 0:
+                        continue
+                    if importSeen[sym2.name] == 0:
+                        hashmaps.hashMapStrIntPut(importSeen, sym2.name, 1)
+                        add(layout.imports, sym2.name)
+
+    layout.defIndex = defIndex
+    layout.defAddr = defAddr
+
+    return Ok[MachoLinkLayout](layout)
+
+fn machoResolveTaggedAddr(layout: MachoLinkLayout, textOff: uint64, cstrOff: uint64, rel: uint64): uint64 =
+    if layout == nil:
+        return uint64(0)
+    if (rel & MACHO_REL_CSTRING) != 0:
+        return layout.textVmaddr + cstrOff + (rel & ~MACHO_REL_CSTRING)
+    if (rel & MACHO_REL_DATA) != 0:
+        return layout.dataVmaddr + (rel & ~MACHO_REL_DATA)
+    if (rel & MACHO_REL_BSS) != 0:
+        return layout.dataVmaddr + uint64(layout.data.len) + (rel & ~MACHO_REL_BSS)
+    return layout.textVmaddr + textOff + rel
+
+fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: bool,
+                           runtimeObj: str): Result[bool] =
+    if outputPath == nil || len(outputPath) == 0:
+        return Err[bool]("macho_linker: missing output path")
+    if objs.len <= 0:
+        return Err[bool]("macho_linker: no input objects")
+
+    let layRes: Result[MachoLinkLayout] = machoMergeObjs(objs, runtimeObj)
+    if !IsOk[MachoLinkLayout](layRes):
+        for oi in 0..<objs.len:
+            machoFreeObj(objs[oi])
+        return ErrInfo[bool](ErrorInfoOf[MachoLinkLayout](layRes))
+    let layout: MachoLinkLayout = Value[MachoLinkLayout](layRes)
+
+    # Layout constants.
+    layout.headerSize = uint64(32)
+    layout.textVmaddr = uint64(0x100000000)
+    layout.textFileOff = 0
+
+    # Load commands:
+    # __PAGEZERO, __TEXT(2 sect), __DATA(2 sect), __LINKEDIT, DYLD_INFO_ONLY, SYMTAB, DYSYMTAB,
+    # LOAD_DYLINKER, UUID, BUILD_VERSION, SOURCE_VERSION, MAIN, LOAD_DYLIB
+    # Note: we intentionally do NOT emit LC_CODE_SIGNATURE; `codesign` will add it.
+    let ncmds: uint32 = uint32(13)
+    let segPagezeroSize: uint32 = uint32(72)
+    let segTextSize: uint32 = uint32(72 + 80 * 2)
+    let segDataSize: uint32 = uint32(72 + 80 * 2)
+    let segLinkeditSize: uint32 = uint32(72)
+    let dyldInfoSize: uint32 = uint32(48)
+    let symtabSize: uint32 = uint32(24)
+    let dysymSize: uint32 = uint32(80)
+    let loadDylinkerSize: uint32 = uint32(32) # "/usr/lib/dyld" padded
+    let uuidSize: uint32 = uint32(24)
+    let buildSize: uint32 = uint32(32)
+    let sourceVerSize: uint32 = uint32(16)
+    let mainSize: uint32 = uint32(24)
+    let loadDylibSize: uint32 = uint32(56) # "/usr/lib/libSystem.B.dylib" padded
+    layout.sizeofcmds = segPagezeroSize + segTextSize + segDataSize + segLinkeditSize +
+                        dyldInfoSize + symtabSize + dysymSize + loadDylinkerSize +
+                        uuidSize + buildSize + sourceVerSize + mainSize + loadDylibSize
+
+    let mergedTextLen: uint64 = uint64(layout.text.len)
+    let stubBytesLen: uint64 = uint64(layout.imports.len) * uint64(12)
+    let textLenWithStubs: uint64 = mergedTextLen + stubBytesLen
+
+    # Leave generous header padding so codesign can rewrite without shifting sections.
+    let firstSectionOff: uint64 = machoAlignUp(layout.headerSize + uint64(layout.sizeofcmds), uint64(0x1000))
+    var cursor: uint64 = firstSectionOff
+    cursor = machoAlignUp(cursor, uint64(4))
+    let textOff: uint64 = cursor
+    cursor = textOff + textLenWithStubs
+    cursor = machoAlignUp(cursor, uint64(1))
+    let cstrOff: uint64 = cursor
+    cursor = cstrOff + uint64(layout.cstring.len)
+    let textEnd: uint64 = cursor
+    layout.textSegSize = machoAlignUp(textEnd, MACHO_PAGE_SIZE)
+
+    layout.dataFileOff = layout.textSegSize
+    layout.dataVmaddr = layout.textVmaddr + layout.textSegSize
+
+    # Append import pointer slots to __data (8 bytes each).
+    let ptrSlotsOffInData: uint64 = machoAlignUp(uint64(layout.data.len), uint64(8))
+    var newData: uint8[]
+    newData.cap = layout.data.len + layout.imports.len * 8 + 16
+    obj_buf.bufBytes(newData, layout.data)
+    obj_buf.bufAlign(newData, uint64(8))
+    for pi in 0..<layout.imports.len:
+        obj_buf.bufU64(newData, uint64(0))
+    layout.data = newData
+    layout.dataSegFileSize = machoAlignUp(uint64(layout.data.len), MACHO_PAGE_SIZE)
+    layout.dataSegVmSize = machoAlignUp(uint64(layout.data.len) + machoAlignUp(layout.bssSize, uint64(8)), MACHO_PAGE_SIZE)
+
+    layout.linkeditFileOff = layout.dataFileOff + layout.dataSegFileSize
+    layout.linkeditVmaddr = layout.dataVmaddr + layout.dataSegVmSize
+
+    # Resolve _main for LC_MAIN entryoff using prebuilt definition index.
+    let mainIdxPlus1: int32 = layout.defIndex["_main"]
+    let mainIdx: int32 = mainIdxPlus1 - 1
+    if mainIdxPlus1 <= 0 || mainIdx < 0 || mainIdx >= layout.defAddr.len:
+        for oi in 0..<objs.len:
+            machoFreeObj(objs[oi])
+        return Err[bool]("macho_linker: missing _main symbol (required for LC_MAIN)")
+    let mainRel: uint64 = layout.defAddr[mainIdx]
+    let mainAddr: uint64 = machoResolveTaggedAddr(layout, textOff, cstrOff, mainRel)
+
+    layout.entryoff = mainAddr - layout.textVmaddr
+
+    # Build stubs for imports at end of __text and patch call relocations.
+    # Stub code is placed after merged text; calls are rewritten to call stub.
+    let stubsBaseOff: uint64 = mergedTextLen
+    var stubAddrs: uint64[layout.imports.len]
+    var ptrSlotAddrs: uint64[layout.imports.len]
+    stubAddrs.len = int(layout.imports.len)
+    ptrSlotAddrs.len = int(layout.imports.len)
+    var importIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(layout.imports.len * 2 + 8)
+    for pi in 0..<layout.imports.len:
+        let name: str = layout.imports[pi]
+        hashmaps.hashMapStrIntPut(importIndex, name, pi + 1)
+        let slotOff: uint64 = ptrSlotsOffInData + uint64(pi) * 8
+        let slotAddr: uint64 = layout.dataVmaddr + slotOff
+        ptrSlotAddrs[pi] = slotAddr
+        let stubOff: uint64 = stubsBaseOff + uint64(pi) * 12
+        let stubAddr: uint64 = layout.textVmaddr + textOff + stubOff
+        stubAddrs[pi] = stubAddr
+        let stubRes: Result[uint8[]] = machoMakeStub(slotAddr, stubAddr)
+        if !IsOk[uint8[]](stubRes):
+            for oi in 0..<objs.len:
+                machoFreeObj(objs[oi])
+            return ErrInfo[bool](ErrorInfoOf[uint8[]](stubRes))
+        obj_buf.bufBytes(layout.text, Value[uint8[]](stubRes))
+
+    # Patch relocations (in merged text only).
+    # NOTE: We only patch relocations originating from __TEXT,__text sections.
+    var textCursorBase: uint64 = 0
+    for i in 0..<objs.len:
+        let obj: MachoObjFile = objs[i]
+        let textIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__text")
+        if textIdx >= 0:
+            let sect: MachoObjSection = obj.sections[textIdx]
+            for ri in 0..<sect.relocs.len:
+                let r: MachoObjReloc = sect.relocs[ri]
+                let placeOffInText: uint64 = textCursorBase + uint64(r.addr)
+                let placeAddr: uint64 = layout.textVmaddr + textOff + placeOffInText
+                let placeOffInFileTextBytes: int32 = int32(placeOffInText)
+                if placeOffInFileTextBytes < 0 || placeOffInFileTextBytes + 4 > layout.text.len:
+                    return Err[bool]("macho_linker: reloc out of range")
+                if !r.extern:
+                    return Err[bool]("macho_linker: non-extern reloc unsupported (v2)")
+                if r.symIndex < 0 || r.symIndex >= obj.symbols.len:
+                    return Err[bool]("macho_linker: reloc symIndex out of range")
+                let sym: MachoObjSymbol = obj.symbols[r.symIndex]
+                let symName: str = (sym != nil) ? sym.name : ""
+                # Resolve symbol address if defined among inputs; otherwise treat as import.
+                var targetAddr: uint64 = 0
+                var isImport: bool = false
+                var resolved: bool = false
+                let defIdxPlus1: int32 = layout.defIndex[symName]
+                let defIdx: int32 = defIdxPlus1 - 1
+                if defIdxPlus1 > 0 && defIdx >= 0 && defIdx < layout.defAddr.len:
+                    let relTarget: uint64 = layout.defAddr[defIdx]
+                    targetAddr = machoResolveTaggedAddr(layout, textOff, cstrOff, relTarget)
+                    resolved = true
+
+                if !resolved:
+                    # Unresolved: undefined externs fall back to import stubs.
+                    if sym != nil && machoSymIsUndef(sym):
+                        let impIdxPlus1: int32 = importIndex[symName]
+                        if impIdxPlus1 > 0:
+                            let impIdx: int32 = impIdxPlus1 - 1
+                            isImport = true
+                            if r.rtype == ARM64_RELOC_GOT_LOAD_PAGE21 || r.rtype == ARM64_RELOC_GOT_LOAD_PAGEOFF12:
+                                targetAddr = ptrSlotAddrs[impIdx]
+                            else:
+                                targetAddr = stubAddrs[impIdx]
+                        else:
+                            return Err[bool]("macho_linker: unresolved symbol: " + symName)
+                    else:
+                        return Err[bool]("macho_linker: unresolved symbol: " + symName)
+
+                let word0: uint32 = machoReadU32LEFromSeq(layout.text, placeOffInFileTextBytes)
+                if r.rtype == ARM64_RELOC_BRANCH26:
+                    let patched: Result[uint32] = machoPatchBl(word0, placeAddr, targetAddr)
+                    if !IsOk[uint32](patched):
+                        return ErrInfo[bool](ErrorInfoOf[uint32](patched))
+                    machoWriteU32LEToSeq(layout.text, placeOffInFileTextBytes, Value[uint32](patched))
+                elif r.rtype == ARM64_RELOC_PAGE21 || r.rtype == ARM64_RELOC_GOT_LOAD_PAGE21:
+                    let patched2: Result[uint32] = machoPatchAdrp(word0, placeAddr, targetAddr)
+                    if !IsOk[uint32](patched2):
+                        return ErrInfo[bool](ErrorInfoOf[uint32](patched2))
+                    machoWriteU32LEToSeq(layout.text, placeOffInFileTextBytes, Value[uint32](patched2))
+                elif r.rtype == ARM64_RELOC_PAGEOFF12 || r.rtype == ARM64_RELOC_GOT_LOAD_PAGEOFF12:
+                    let patched3Res: Result[uint32] = machoPatchPageOff12(word0, targetAddr)
+                    if !IsOk[uint32](patched3Res):
+                        return ErrInfo[bool](ErrorInfoOf[uint32](patched3Res))
+                    machoWriteU32LEToSeq(layout.text, placeOffInFileTextBytes, Value[uint32](patched3Res))
+                else:
+                    return Err[bool]("macho_linker: unsupported reloc type (" + intToStr(r.rtype) + "): " + symName)
+            textCursorBase = textCursorBase + uint64(sect.data.len)
+            textCursorBase = machoAlignUp(textCursorBase, uint64(4))
+
+    # Build dyld bind info for import pointer slots (segment index 2 => __DATA when order is PAGEZERO, TEXT, DATA, LINKEDIT).
+    var bindInfo: uint8[]
+    if layout.imports.len > 0:
+        let bindStartOffInDataSeg: uint64 = ptrSlotsOffInData
+        machoWriteBindInfo(&bindInfo, uint8(2), bindStartOffInDataSeg, layout.imports)
+    else:
+        add(bindInfo, BIND_OPCODE_DONE)
+
+    # Build symbol table (extdefs + undefs).
+    var syms: MachoObjSymbol[]
+    var extdefCount: uint32 = uint32(0)
+    if symtabAll:
+        var extdefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(1024)
+        for oi3 in 0..<objs.len:
+            let obj3: MachoObjFile = objs[oi3]
+            if obj3 == nil:
+                continue
+            for si4 in 0..<obj3.symbols.len:
+                let sym4: MachoObjSymbol = obj3.symbols[si4]
+                if sym4 != nil && machoSymIsSect(sym4) && machoSymIsExt(sym4):
+                    if sym4.name != nil && len(sym4.name) > 0:
+                        if extdefSeen[sym4.name] == 0:
+                            hashmaps.hashMapStrIntPut(extdefSeen, sym4.name, 1)
+                            let defIdxPlus4: int32 = layout.defIndex[sym4.name]
+                            let defIdx4: int32 = defIdxPlus4 - 1
+                            if defIdxPlus4 <= 0 || defIdx4 < 0 || defIdx4 >= layout.defAddr.len:
+                                for oiFree0 in 0..<objs.len:
+                                    machoFreeObj(objs[oiFree0])
+                                return Err[bool]("macho_linker: missing defined symbol for symtab: " + sym4.name)
+                            let rel4: uint64 = layout.defAddr[defIdx4]
+                            let addr4: uint64 = machoResolveTaggedAddr(layout, textOff, cstrOff, rel4)
+                            var ds: MachoObjSymbol
+                            new ds
+                            ds.name = sym4.name
+                            ds.nType = uint8(N_SECT | N_EXT)
+                            if (rel4 & MACHO_REL_CSTRING) != 0:
+                                ds.nSect = uint8(2)
+                            elif (rel4 & MACHO_REL_DATA) != 0:
+                                ds.nSect = uint8(3)
+                            elif (rel4 & MACHO_REL_BSS) != 0:
+                                ds.nSect = uint8(4)
+                            else:
+                                ds.nSect = uint8(1)
+                            ds.nDesc = uint16(0)
+                            ds.nValue = addr4
+                            add(syms, ds)
+        extdefCount = uint32(syms.len)
+    else:
+        # extdef: _main only (enough for tooling); other symbols can be added later.
+        var mainSym: MachoObjSymbol
+        new mainSym
+        mainSym.name = "_main"
+        mainSym.nType = uint8(N_SECT | N_EXT)
+        mainSym.nSect = uint8(1)
+        mainSym.nDesc = uint16(0)
+        mainSym.nValue = mainAddr
+        add(syms, mainSym)
+        extdefCount = uint32(1)
+
+    # undefs
+    for pi in 0..<layout.imports.len:
+        var us: MachoObjSymbol
+        new us
+        us.name = layout.imports[pi]
+        us.nType = uint8(N_UNDF | N_EXT)
+        us.nSect = uint8(0)
+        us.nDesc = uint16(0)
+        us.nValue = uint64(0)
+        add(syms, us)
+
+    # String table
+    var strtab: uint8[]
+    add(strtab, uint8(0))
+    var symNameOffs: uint32[syms.len]
+    symNameOffs.len = int(syms.len)
+    for si3 in 0..<syms.len:
+        symNameOffs[si3] = uint32(strtab.len)
+        let symNameRec: MachoObjSymbol = syms[si3]
+        obj_buf.bufStr0(strtab, symNameRec.name)
+
+    # Linkedit layout: bindInfo (aligned 8), symtab, strtab.
+    var linkedit: uint8[]
+    let bindOff: uint64 = 0
+    obj_buf.bufBytes(linkedit, bindInfo)
+    obj_buf.bufAlign(linkedit, uint64(8))
+    let symoff: uint64 = uint64(linkedit.len)
+    for si3 in 0..<syms.len:
+        let s: MachoObjSymbol = syms[si3]
+        obj_buf.bufU32(linkedit, symNameOffs[si3])
+        obj_buf.bufU8(linkedit, s.nType)
+        obj_buf.bufU8(linkedit, s.nSect)
+        obj_buf.bufU16(linkedit, s.nDesc)
+        obj_buf.bufU64(linkedit, s.nValue)
+    let stroff: uint64 = uint64(linkedit.len)
+    obj_buf.bufBytes(linkedit, strtab)
+
+    layout.linkeditSegSize = machoAlignUp(uint64(linkedit.len), MACHO_PAGE_SIZE)
+
+    # Compute final file size and prepare output buffer.
+    let fileSize: uint64 = layout.linkeditFileOff + uint64(linkedit.len)
+    if fileSize > uint64(2147483647):
+        return Err[bool]("macho_linker: output too large")
+    var outBytes: uint8[]
+    outBytes.len = int(int32(fileSize))
+
+    # Write header + load commands.
+    var hdr: uint8[]
+    # mach_header_64
+    obj_buf.bufU32(hdr, MH_MAGIC_64)
+    obj_buf.bufU32(hdr, CPU_TYPE_ARM64)
+    obj_buf.bufU32(hdr, CPU_SUBTYPE_ARM64_ALL)
+    obj_buf.bufU32(hdr, MH_EXECUTE)
+    obj_buf.bufU32(hdr, ncmds)
+    obj_buf.bufU32(hdr, layout.sizeofcmds)
+    obj_buf.bufU32(hdr, MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE)
+    obj_buf.bufU32(hdr, uint32(0)) # reserved
+
+    # LC_SEGMENT_64 __PAGEZERO
+    obj_buf.bufU32(hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(hdr, segPagezeroSize)
+    obj_buf.bufFixedStr(hdr, "__PAGEZERO", 16)
+    obj_buf.bufU64(hdr, uint64(0))
+    obj_buf.bufU64(hdr, uint64(0x100000000))
+    obj_buf.bufU64(hdr, uint64(0))
+    obj_buf.bufU64(hdr, uint64(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+
+    # LC_SEGMENT_64 __TEXT (sections: __text, __cstring)
+    obj_buf.bufU32(hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(hdr, segTextSize)
+    obj_buf.bufFixedStr(hdr, "__TEXT", 16)
+    obj_buf.bufU64(hdr, layout.textVmaddr)
+    obj_buf.bufU64(hdr, layout.textSegSize)
+    obj_buf.bufU64(hdr, uint64(0))
+    obj_buf.bufU64(hdr, layout.textSegSize)
+    obj_buf.bufU32(hdr, uint32(5))
+    obj_buf.bufU32(hdr, uint32(5))
+    obj_buf.bufU32(hdr, uint32(2))
+    obj_buf.bufU32(hdr, uint32(0))
+    # section __text
+    obj_buf.bufFixedStr(hdr, "__text", 16)
+    obj_buf.bufFixedStr(hdr, "__TEXT", 16)
+    obj_buf.bufU64(hdr, layout.textVmaddr + textOff)
+    obj_buf.bufU64(hdr, uint64(layout.text.len))
+    obj_buf.bufU32(hdr, uint32(textOff))
+    obj_buf.bufU32(hdr, uint32(2)) # align 4
+    obj_buf.bufU32(hdr, uint32(0)) # reloff
+    obj_buf.bufU32(hdr, uint32(0)) # nreloc
+    obj_buf.bufU32(hdr, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    # section __cstring
+    obj_buf.bufFixedStr(hdr, "__cstring", 16)
+    obj_buf.bufFixedStr(hdr, "__TEXT", 16)
+    obj_buf.bufU64(hdr, layout.textVmaddr + cstrOff)
+    obj_buf.bufU64(hdr, uint64(layout.cstring.len))
+    obj_buf.bufU32(hdr, uint32(cstrOff))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, S_CSTRING_LITERALS)
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+
+    # LC_SEGMENT_64 __DATA (sections: __data, __bss)
+    obj_buf.bufU32(hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(hdr, segDataSize)
+    obj_buf.bufFixedStr(hdr, "__DATA", 16)
+    obj_buf.bufU64(hdr, layout.dataVmaddr)
+    obj_buf.bufU64(hdr, layout.dataSegVmSize)
+    obj_buf.bufU64(hdr, layout.dataFileOff)
+    obj_buf.bufU64(hdr, layout.dataSegFileSize)
+    obj_buf.bufU32(hdr, uint32(3))
+    obj_buf.bufU32(hdr, uint32(3))
+    obj_buf.bufU32(hdr, uint32(2))
+    obj_buf.bufU32(hdr, uint32(0))
+    # section __data
+    obj_buf.bufFixedStr(hdr, "__data", 16)
+    obj_buf.bufFixedStr(hdr, "__DATA", 16)
+    obj_buf.bufU64(hdr, layout.dataVmaddr)
+    obj_buf.bufU64(hdr, uint64(layout.data.len))
+    obj_buf.bufU32(hdr, uint32(layout.dataFileOff))
+    obj_buf.bufU32(hdr, uint32(3)) # align 8
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    # section __bss (zerofill)
+    let bssAddr: uint64 = layout.dataVmaddr + uint64(layout.data.len)
+    obj_buf.bufFixedStr(hdr, "__bss", 16)
+    obj_buf.bufFixedStr(hdr, "__DATA", 16)
+    obj_buf.bufU64(hdr, bssAddr)
+    obj_buf.bufU64(hdr, layout.bssSize)
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(3))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, S_ZEROFILL)
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+
+    # LC_SEGMENT_64 __LINKEDIT
+    obj_buf.bufU32(hdr, LC_SEGMENT_64)
+    obj_buf.bufU32(hdr, segLinkeditSize)
+    obj_buf.bufFixedStr(hdr, "__LINKEDIT", 16)
+    obj_buf.bufU64(hdr, layout.linkeditVmaddr)
+    obj_buf.bufU64(hdr, layout.linkeditSegSize)
+    obj_buf.bufU64(hdr, layout.linkeditFileOff)
+    obj_buf.bufU64(hdr, uint64(linkedit.len))
+    obj_buf.bufU32(hdr, uint32(1))
+    obj_buf.bufU32(hdr, uint32(1))
+    obj_buf.bufU32(hdr, uint32(0))
+    obj_buf.bufU32(hdr, uint32(0))
+
+    # LC_DYLD_INFO_ONLY (bind only)
+    obj_buf.bufU32(hdr, LC_DYLD_INFO_ONLY)
+    obj_buf.bufU32(hdr, dyldInfoSize)
+    obj_buf.bufU32(hdr, uint32(0)) # rebase_off
+    obj_buf.bufU32(hdr, uint32(0)) # rebase_size
+    obj_buf.bufU32(hdr, uint32(layout.linkeditFileOff + bindOff)) # bind_off
+    obj_buf.bufU32(hdr, uint32(bindInfo.len)) # bind_size
+    obj_buf.bufU32(hdr, uint32(0)) # weak_bind_off
+    obj_buf.bufU32(hdr, uint32(0)) # weak_bind_size
+    obj_buf.bufU32(hdr, uint32(0)) # lazy_bind_off
+    obj_buf.bufU32(hdr, uint32(0)) # lazy_bind_size
+    obj_buf.bufU32(hdr, uint32(0)) # export_off
+    obj_buf.bufU32(hdr, uint32(0)) # export_size
+
+    # LC_SYMTAB
+    obj_buf.bufU32(hdr, LC_SYMTAB)
+    obj_buf.bufU32(hdr, symtabSize)
+    obj_buf.bufU32(hdr, uint32(layout.linkeditFileOff + symoff))
+    obj_buf.bufU32(hdr, uint32(syms.len))
+    obj_buf.bufU32(hdr, uint32(layout.linkeditFileOff + stroff))
+    obj_buf.bufU32(hdr, uint32(strtab.len))
+
+    # LC_DYSYMTAB (locals=0, extdefs=extdefCount, undefs=imports)
+    obj_buf.bufU32(hdr, LC_DYSYMTAB)
+    obj_buf.bufU32(hdr, dysymSize)
+    obj_buf.bufU32(hdr, uint32(0)) # ilocalsym
+    obj_buf.bufU32(hdr, uint32(0)) # nlocalsym
+    obj_buf.bufU32(hdr, uint32(0)) # iextdefsym
+    obj_buf.bufU32(hdr, extdefCount) # nextdefsym
+    obj_buf.bufU32(hdr, extdefCount) # iundefsym
+    obj_buf.bufU32(hdr, uint32(layout.imports.len)) # nundefsym
+    obj_buf.bufU32(hdr, uint32(0)) # tocoff
+    obj_buf.bufU32(hdr, uint32(0)) # ntoc
+    obj_buf.bufU32(hdr, uint32(0)) # modtaboff
+    obj_buf.bufU32(hdr, uint32(0)) # nmodtab
+    obj_buf.bufU32(hdr, uint32(0)) # extrefsymoff
+    obj_buf.bufU32(hdr, uint32(0)) # nextrefsyms
+    obj_buf.bufU32(hdr, uint32(0)) # indirectsymoff
+    obj_buf.bufU32(hdr, uint32(0)) # nindirectsyms
+    obj_buf.bufU32(hdr, uint32(0)) # extreloff
+    obj_buf.bufU32(hdr, uint32(0)) # nextrel
+    obj_buf.bufU32(hdr, uint32(0)) # locreloff
+    obj_buf.bufU32(hdr, uint32(0)) # nlocrel
+
+    # LC_LOAD_DYLINKER
+    obj_buf.bufU32(hdr, LC_LOAD_DYLINKER)
+    obj_buf.bufU32(hdr, loadDylinkerSize)
+    obj_buf.bufU32(hdr, uint32(12)) # name offset
+    obj_buf.bufStr0(hdr, "/usr/lib/dyld")
+    while uint64(hdr.len) % 8 != 0:
+        obj_buf.bufU8(hdr, uint8(0))
+
+    # LC_UUID (deterministic placeholder: all zeros)
+    obj_buf.bufU32(hdr, LC_UUID)
+    obj_buf.bufU32(hdr, uuidSize)
+    for ui in 0..<16:
+        obj_buf.bufU8(hdr, uint8(0))
+
+    # LC_BUILD_VERSION (platform macOS, minos 15.0, sdk 0; tool ld)
+    obj_buf.bufU32(hdr, LC_BUILD_VERSION)
+    obj_buf.bufU32(hdr, buildSize)
+    obj_buf.bufU32(hdr, uint32(1)) # PLATFORM_MACOS
+    obj_buf.bufU32(hdr, uint32(0x000F0000)) # minos 15.0
+    obj_buf.bufU32(hdr, uint32(0)) # sdk
+    obj_buf.bufU32(hdr, uint32(1)) # ntools
+    obj_buf.bufU32(hdr, uint32(3)) # TOOL_LD
+    obj_buf.bufU32(hdr, uint32(0)) # version
+
+    # LC_SOURCE_VERSION
+    obj_buf.bufU32(hdr, LC_SOURCE_VERSION)
+    obj_buf.bufU32(hdr, sourceVerSize)
+    obj_buf.bufU64(hdr, uint64(0))
+
+    # LC_MAIN
+    obj_buf.bufU32(hdr, LC_MAIN)
+    obj_buf.bufU32(hdr, mainSize)
+    obj_buf.bufU64(hdr, layout.entryoff)
+    obj_buf.bufU64(hdr, uint64(0))
+
+    # LC_LOAD_DYLIB (libSystem)
+    obj_buf.bufU32(hdr, LC_LOAD_DYLIB)
+    obj_buf.bufU32(hdr, loadDylibSize)
+    obj_buf.bufU32(hdr, uint32(24)) # name offset
+    obj_buf.bufU32(hdr, uint32(2))  # timestamp
+    obj_buf.bufU32(hdr, uint32(0))  # current version
+    obj_buf.bufU32(hdr, uint32(0))  # compat version
+    obj_buf.bufStr0(hdr, "/usr/lib/libSystem.B.dylib")
+    while uint64(hdr.len) % 8 != 0:
+        obj_buf.bufU8(hdr, uint8(0))
+
+    if uint32(hdr.len) != layout.headerSize + uint64(layout.sizeofcmds):
+        # Keep file offsets stable: pad up to firstSectionOff with zeros.
+        while uint64(hdr.len) < firstSectionOff:
+            obj_buf.bufU8(hdr, uint8(0))
+
+    # Copy header into outBytes.
+    for bi in 0..<hdr.len:
+        outBytes[bi] = hdr[bi]
+
+    # Copy __TEXT section bytes.
+    for ti in 0..<layout.text.len:
+        outBytes[int32(textOff) + ti] = layout.text[ti]
+    for ci2 in 0..<layout.cstring.len:
+        outBytes[int32(cstrOff) + ci2] = layout.cstring[ci2]
+
+    # Copy __DATA bytes.
+    for di in 0..<layout.data.len:
+        outBytes[int32(layout.dataFileOff) + di] = layout.data[di]
+
+    # Copy __LINKEDIT bytes.
+    for li in 0..<linkedit.len:
+        outBytes[int32(layout.linkeditFileOff) + li] = linkedit[li]
+
+    if !linkerCoreWriteFileAtomic(outputPath, outBytes):
+        return Err[bool]("macho_linker: failed to write output atomically: " + outputPath)
+
+    # Free object buffers.
+    for oi in 0..<objs.len:
+        machoFreeObj(objs[oi])
+
+    return Ok[bool](true)
+
+fn machoLinkExeAarch64(objPaths: str[], outputPath: str, symtabAll: bool,
+                       runtimeObj: str): Result[bool] =
+    if outputPath == nil || len(outputPath) == 0:
+        return Err[bool]("macho_linker: missing output path")
+    if objPaths.len <= 0:
+        return Err[bool]("macho_linker: no input objects")
+    var objs: MachoObjFile[]
+    objs.cap = objPaths.len
+    for i in 0..<objPaths.len:
+        let p: str = objPaths[i]
+        let pr: Result[MachoObjFile] = machoParseObj(p)
+        if !IsOk[MachoObjFile](pr):
+            for oi in 0..<objs.len:
+                machoFreeObj(objs[oi])
+            return ErrInfo[bool](ErrorInfoOf[MachoObjFile](pr))
+        add(objs, Value[MachoObjFile](pr))
+    return machoLinkExeAarch64Core(objs, outputPath, symtabAll, runtimeObj)
+
+fn machoLinkExeAarch64MainObjMem(mainObjBytes: uint8[], extraObjPaths: str[],
+                                 outputPath: str, symtabAll: bool,
+                                 runtimeObj: str): Result[bool] =
+    if outputPath == nil || len(outputPath) == 0:
+        return Err[bool]("macho_linker: missing output path")
+    if mainObjBytes == nil || mainObjBytes.len <= 0:
+        return Err[bool]("macho_linker: empty main object bytes")
+    var objs: MachoObjFile[]
+    objs.cap = extraObjPaths.len + 1
+    let mainParsed: Result[MachoObjFile] = machoParseObjMem("<main_obj_mem>", mainObjBytes)
+    if !IsOk[MachoObjFile](mainParsed):
+        return ErrInfo[bool](ErrorInfoOf[MachoObjFile](mainParsed))
+    add(objs, Value[MachoObjFile](mainParsed))
+    for i in 0..<extraObjPaths.len:
+        let p: str = extraObjPaths[i]
+        let pr: Result[MachoObjFile] = machoParseObj(p)
+        if !IsOk[MachoObjFile](pr):
+            for oi in 0..<objs.len:
+                machoFreeObj(objs[oi])
+            return ErrInfo[bool](ErrorInfoOf[MachoObjFile](pr))
+        add(objs, Value[MachoObjFile](pr))
+    return machoLinkExeAarch64Core(objs, outputPath, symtabAll, runtimeObj)

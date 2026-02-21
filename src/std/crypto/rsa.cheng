@@ -1,0 +1,745 @@
+# RSA helpers(minimal, small-int implementation).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/strings
+import std/crypto/rand
+import std/crypto/sha256
+import std/crypto/sha384
+import std/crypto/minasn1
+import std/crypto/bigint
+const
+    rsaDefaultPrimeBits = 30
+    rsaMinPrimeBits = 8
+    rsaMaxPrimeBits = 31
+    rsaDefaultE = 65537
+    rsaExponentCandidateCount = 5
+
+type
+    RsaPublicKey =
+        n: int64
+        e: int64
+
+    RsaPrivateKey =
+        n: int64
+        e: int64
+        d: int64
+        p: int64
+        q: int64
+
+    RsaKeyPair =
+        publicKey: RsaPublicKey
+        privateKey: RsaPrivateKey
+
+    RsaBigPublicKey =
+        n: BigInt
+        e: BigInt
+        modBits: int32
+        modLen: int32
+
+    RsaBigPrivateKey =
+        n: BigInt
+        d: BigInt
+        modBits: int32
+        modLen: int32
+
+fn gcd(a: int64, b: int64): int64 =
+    var x: int64 = if a < 0: -a else: a
+    var y: int64 = if b < 0: -b else: b
+    while y != 0:
+        let t: int64 = x % y
+        x = y
+        y = t
+    return x
+
+fn modInv(a: int64, modv: int64): Result[int64] =
+    var t: int64 = 0
+    var newT: int64 = 1
+    var r: int64 = modv
+    var newR: int64 = a % modv
+    while newR != 0:
+        let q: int64 = r / newR
+        let nextT: int64 = t - q * newT
+        t = newT
+        newT = nextT
+        let nextR: int64 = r - q * newR
+        r = newR
+        newR = nextR
+    if r != 1 && r != -1:
+        return Err[int64]("rsa: inverse ! found")
+    if t < 0:
+        t = t + modv
+    return Ok[int64](t)
+
+fn mulMod(a: int64, b: int64, modv: int64): int64 =
+    var res: int64 = 0
+    var x: int64 = a % modv
+    var y: int64 = b
+    while y > 0:
+        if (y & 1) != 0:
+            res = (res + x) % modv
+        x = (x << 1) % modv
+        y = y >> 1
+    return res
+
+fn powMod(base: int64, exp: int64, modv: int64): int64 =
+    var result: int64 = 1 % modv
+    var b: int64 = base % modv
+    var e: int64 = exp
+    while e > 0:
+        if (e & 1) != 0:
+            result = mulMod(result, b, modv)
+        b = mulMod(b, b, modv)
+        e = e >> 1
+    return result
+
+fn isPrime(n: int64): bool =
+    if n <= 1:
+        return false
+    if n <= 3:
+        return true
+    if (n & 1) == 0:
+        return false
+    var i: int64 = 3
+    while i * i <= n:
+        if n % i == 0:
+            return false
+        i = i + 2
+    return true
+
+fn randomInt(bits: int32): Result[int64] =
+    if bits < 2:
+        return Err[int64]("rsa: bits too small")
+    if bits > 62:
+        return Err[int64]("rsa: bits too large")
+    let byteCount: int32 = (bits + 7) / 8
+    let res: Result[Bytes] = randomBytes(byteCount)
+    if IsErr(res):
+        return Err[int64](Error(res))
+    let data: Bytes = Value(res)
+    var value: int64 = 0
+    for i in 0..<bytesLen(data):
+        value = (value << 8) | int64(bytesGet(data, i))
+    let topBit: int64 = int64(1) << (bits - 1)
+    let mask: int64 = (int64(1) << bits) - 1
+    value = value & mask
+    value = value | topBit
+    value = value | 1
+    return Ok[int64](value)
+
+fn generatePrime(bits: int32): Result[int64] =
+    for attempt in 0..<10000:
+        let res: Result[int64] = randomInt(bits)
+        if IsErr(res):
+            return Err[int64](Error(res))
+        let candidate: int64 = Value(res)
+        if isPrime(candidate):
+            return Ok[int64](candidate)
+    return Err[int64]("rsa: failed to generate prime")
+
+fn rsaExponentCandidate(idx: int32): int64 =
+    if idx == 0:
+        return rsaDefaultE
+    if idx == 1:
+        return 257
+    if idx == 2:
+        return 17
+    if idx == 3:
+        return 5
+    return 3
+
+fn pickPublicExponent(phi: int64): Result[int64] =
+    for i in 0..<rsaExponentCandidateCount:
+        let e: int64 = rsaExponentCandidate(i)
+        if e > 1 && e < phi && gcd(e, phi) == 1:
+            return Ok[int64](e)
+    return Err[int64]("rsa: no valid public exponent")
+
+fn generateRsaKeyPair(primeBits: int32): Result[RsaKeyPair] =
+    if primeBits < rsaMinPrimeBits || primeBits > rsaMaxPrimeBits:
+        return Err[RsaKeyPair]("rsa: prime bits out of range")
+    let pRes: Result[int64] = generatePrime(primeBits)
+    if IsErr(pRes):
+        return Err[RsaKeyPair](Error(pRes))
+    var p: int64 = Value(pRes)
+    var q: int64 = 0
+    for attempt in 0..<10000:
+        let qRes: Result[int64] = generatePrime(primeBits)
+        if IsErr(qRes):
+            return Err[RsaKeyPair](Error(qRes))
+        q = Value(qRes)
+        if q != p:
+            break
+    if q == 0 || q == p:
+        return Err[RsaKeyPair]("rsa: failed to generate q")
+    let n: int64 = p * q
+    let phi: int64 = (p - 1) * (q - 1)
+    let eRes: Result[int64] = pickPublicExponent(phi)
+    if IsErr(eRes):
+        return Err[RsaKeyPair](Error(eRes))
+    let e: int64 = Value(eRes)
+    let dRes: Result[int64] = modInv(e, phi)
+    if IsErr(dRes):
+        return Err[RsaKeyPair](Error(dRes))
+    let d: int64 = Value(dRes)
+    let pub: RsaPublicKey = RsaPublicKey(n: n, e: e)
+    let priv: RsaPrivateKey = RsaPrivateKey(n: n, e: e, d: d, p: p, q: q)
+    return Ok[RsaKeyPair](RsaKeyPair(publicKey: pub, privateKey: priv))
+
+fn generateRsaKeyPair(): Result[RsaKeyPair] =
+    return generateRsaKeyPair(rsaDefaultPrimeBits)
+
+fn rsaPublicKeyFromPrivate(priv: RsaPrivateKey): RsaPublicKey =
+    return RsaPublicKey(n: priv.n, e: priv.e)
+
+fn bytesToInt64Mod(data: Bytes, modv: int64): int64 =
+    if modv <= 0:
+        return 0
+    var acc: int64 = 0
+    for i in 0..<bytesLen(data):
+        acc = (acc * 256 + int64(bytesGet(data, i))) % modv
+    return acc
+
+fn rsaHexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn rsaHexDecode(text: str): Result[Bytes] =
+    if len(text) % 2 != 0:
+        return Err[Bytes]("rsa: hex length must be even")
+    let out: Bytes = bytesAlloc(len(text) / 2)
+    var i: int32 = 0
+    while i < len(text):
+        let hi: int32 = rsaHexValue(text[i])
+        let lo: int32 = rsaHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("rsa: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn rsaHashLenSha256(): int32 =
+    return 32
+
+fn rsaHashLenSha384(): int32 =
+    return 48
+
+fn rsaHashSha256(data: Bytes): Bytes =
+    return sha256Digest(data)
+
+fn rsaHashSha384(data: Bytes): Bytes =
+    return sha384Digest(data)
+
+fn rsaDigestInfoSha256(hash: Bytes): Result[Bytes] =
+    let prefixRes: Result[Bytes] = rsaHexDecode("3031300d060960864801650304020105000420")
+    if IsErr(prefixRes):
+        return Err[Bytes](Error(prefixRes))
+    return Ok[Bytes](bytesConcat(Value(prefixRes), hash))
+
+fn rsaDigestInfoSha384(hash: Bytes): Result[Bytes] =
+    let prefixRes: Result[Bytes] = rsaHexDecode("3041300d060960864801650304020205000430")
+    if IsErr(prefixRes):
+        return Err[Bytes](Error(prefixRes))
+    return Ok[Bytes](bytesConcat(Value(prefixRes), hash))
+
+fn rsaMgf1(seed: Bytes, length: int32, useSha384: bool): Bytes =
+    if length <= 0:
+        return emptyBytes()
+    var out: ByteBuffer = newByteBuffer()
+    var counter: int32 = 0
+    while byteBufferLen(out) < length:
+        let ctr: Bytes = bytesAlloc(4)
+        bytesSet(ctr, 0, int32((counter >> 24) & 255))
+        bytesSet(ctr, 1, int32((counter >> 16) & 255))
+        bytesSet(ctr, 2, int32((counter >> 8) & 255))
+        bytesSet(ctr, 3, int32(counter & 255))
+        let msg: Bytes = bytesConcat(seed, ctr)
+        var digest: Bytes
+        if useSha384:
+            digest = rsaHashSha384(msg)
+        else:
+            digest = rsaHashSha256(msg)
+        appendBytes(out, digest)
+        counter = counter + 1
+    let mask: Bytes = toBytes(out)
+    if bytesLen(mask) <= length:
+        return mask
+    return bytesSlice(mask, 0, length)
+
+fn rsaBytesXor(a: Bytes, b: Bytes): Result[Bytes] =
+    if bytesLen(a) != bytesLen(b):
+        return Err[Bytes]("rsa: ^ length mismatch")
+    let out: Bytes = bytesAlloc(bytesLen(a))
+    for i in 0..<bytesLen(a):
+        bytesSet(out, i, bytesGet(a, i) ^ bytesGet(b, i))
+    return Ok[Bytes](out)
+
+fn rsaBigPublicKeyFromBytes(data: Bytes): Result[RsaBigPublicKey] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, 0)
+    if IsErr(seqRes):
+        return Err[RsaBigPublicKey](Error(seqRes))
+    var offset: int32 = 0
+    let seqValue: Bytes = Value(seqRes).value
+    let nRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
+    if IsErr(nRes):
+        return Err[RsaBigPublicKey](Error(nRes))
+    offset = Value(nRes).next
+    let eRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
+    if IsErr(eRes):
+        return Err[RsaBigPublicKey](Error(eRes))
+    let nBytes: Bytes = Value(nRes).value
+    let eBytes: Bytes = Value(eRes).value
+    let nBigRes: Result[BigInt] = bigFromBytes(nBytes)
+    if IsErr(nBigRes):
+        return Err[RsaBigPublicKey](Error(nBigRes))
+    let eBigRes: Result[BigInt] = bigFromBytes(eBytes)
+    if IsErr(eBigRes):
+        return Err[RsaBigPublicKey](Error(eBigRes))
+    let nBig: BigInt = Value(nBigRes)
+    let eBig: BigInt = Value(eBigRes)
+    let modBits: int32 = bigBitLen(nBig)
+    let modLen: int32 = (modBits + 7) / 8
+    if modBits <= 0 || modLen <= 0:
+        return Err[RsaBigPublicKey]("rsa: invalid modulus")
+    let one: BigInt = bigFromInt(1)
+    if bigCmp(eBig, one) <= 0 || bigGetBit(eBig, 0) == 0:
+        return Err[RsaBigPublicKey]("rsa: invalid exponent")
+    if bigCmp(eBig, nBig) >= 0:
+        return Err[RsaBigPublicKey]("rsa: exponent out of range")
+    return Ok[RsaBigPublicKey](RsaBigPublicKey(n: nBig, e: eBig, modBits: modBits, modLen: modLen))
+
+fn rsaBigPrivateKeyFromBytes(data: Bytes): Result[RsaBigPrivateKey] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, 0)
+    if IsErr(seqRes):
+        return Err[RsaBigPrivateKey](Error(seqRes))
+    var offset: int32 = 0
+    let seqValue: Bytes = Value(seqRes).value
+    let vRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
+    if IsErr(vRes):
+        return Err[RsaBigPrivateKey](Error(vRes))
+    offset = Value(vRes).next
+    let nRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
+    if IsErr(nRes):
+        return Err[RsaBigPrivateKey](Error(nRes))
+    offset = Value(nRes).next
+    let eRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
+    if IsErr(eRes):
+        return Err[RsaBigPrivateKey](Error(eRes))
+    offset = Value(eRes).next
+    let dRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
+    if IsErr(dRes):
+        return Err[RsaBigPrivateKey](Error(dRes))
+    let vIntRes: Result[int64] = bytesToInt64(Value(vRes).value)
+    if IsErr(vIntRes) || Value(vIntRes) != 0:
+        return Err[RsaBigPrivateKey]("rsa: invalid private key version")
+    let nBytes: Bytes = Value(nRes).value
+    let dBytes: Bytes = Value(dRes).value
+    let nBigRes: Result[BigInt] = bigFromBytes(nBytes)
+    if IsErr(nBigRes):
+        return Err[RsaBigPrivateKey](Error(nBigRes))
+    let eBigRes: Result[BigInt] = bigFromBytes(Value(eRes).value)
+    if IsErr(eBigRes):
+        return Err[RsaBigPrivateKey](Error(eBigRes))
+    let dBigRes: Result[BigInt] = bigFromBytes(dBytes)
+    if IsErr(dBigRes):
+        return Err[RsaBigPrivateKey](Error(dBigRes))
+    let nBig: BigInt = Value(nBigRes)
+    let eBig: BigInt = Value(eBigRes)
+    let dBig: BigInt = Value(dBigRes)
+    let modBits: int32 = bigBitLen(nBig)
+    let modLen: int32 = (modBits + 7) / 8
+    if modBits <= 0 || modLen <= 0:
+        return Err[RsaBigPrivateKey]("rsa: invalid modulus")
+    let one: BigInt = bigFromInt(1)
+    if bigCmp(eBig, one) <= 0 || bigGetBit(eBig, 0) == 0:
+        return Err[RsaBigPrivateKey]("rsa: invalid exponent")
+    if bigCmp(eBig, nBig) >= 0:
+        return Err[RsaBigPrivateKey]("rsa: exponent out of range")
+    if bigCmp(dBig, one) <= 0:
+        return Err[RsaBigPrivateKey]("rsa: invalid private exponent")
+    return Ok[RsaBigPrivateKey](RsaBigPrivateKey(n: nBig, d: dBig, modBits: modBits, modLen: modLen))
+
+fn rsaBigDecrypt(pub: RsaBigPublicKey, sig: Bytes): Result[Bytes] =
+    if bytesLen(sig) <= 0:
+        return Err[Bytes]("rsa: empty signature")
+    if bytesLen(sig) > pub.modLen:
+        return Err[Bytes]("rsa: signature too long")
+    let sigRes: Result[BigInt] = bigFromBytes(sig)
+    if IsErr(sigRes):
+        return Err[Bytes](Error(sigRes))
+    let sigBig: BigInt = Value(sigRes)
+    if bigIsZero(sigBig):
+        return Err[Bytes]("rsa: signature zero")
+    if bigCmp(sigBig, pub.n) >= 0:
+        return Err[Bytes]("rsa: signature out of range")
+    let mRes: Result[BigInt] = bigModExp(sigBig, pub.e, pub.n)
+    if IsErr(mRes):
+        return Err[Bytes](Error(mRes))
+    let em: Bytes = bigToBytes(Value(mRes), pub.modLen)
+    return Ok[Bytes](em)
+
+fn rsaBigSignEm(priv: RsaBigPrivateKey*, em: Bytes): Result[Bytes] =
+    if bytesLen(em) != priv.modLen:
+        return Err[Bytes]("rsa: encoded message length mismatch")
+    let emRes: Result[BigInt] = bigFromBytes(em)
+    if IsErr(emRes):
+        return Err[Bytes](Error(emRes))
+    let emBig: BigInt = Value(emRes)
+    if bigCmp(emBig, priv.n) >= 0:
+        return Err[Bytes]("rsa: encoded message too large")
+    let sigRes: Result[BigInt] = bigModExp(emBig, priv.d, priv.n)
+    if IsErr(sigRes):
+        return Err[Bytes](Error(sigRes))
+    return Ok[Bytes](bigToBytes(Value(sigRes), priv.modLen))
+
+fn rsaBigSignPkcs1(priv: RsaBigPrivateKey*, msg: Bytes, useSha384: bool): Result[Bytes] =
+    var digest: Bytes
+    if useSha384:
+        digest = rsaHashSha384(msg)
+    else:
+        digest = rsaHashSha256(msg)
+    var diRes: Result[Bytes]
+    if useSha384:
+        diRes = rsaDigestInfoSha384(digest)
+    else:
+        diRes = rsaDigestInfoSha256(digest)
+    if IsErr(diRes):
+        return Err[Bytes](Error(diRes))
+    let t: Bytes = Value(diRes)
+    let emLen: int32 = priv.modLen
+    let tLen: int32 = bytesLen(t)
+    if emLen < tLen + 11:
+        return Err[Bytes]("rsa: pkcs1 em too short")
+    let psLen: int32 = emLen - tLen - 3
+    let em: Bytes = bytesAlloc(emLen)
+    bytesSet(em, 0, 0x00)
+    bytesSet(em, 1, 0x01)
+    for i in 0..<psLen:
+        bytesSet(em, 2 + i, 0xff)
+    bytesSet(em, 2 + psLen, 0x00)
+    copyMem(ptr_add(em.data, 3 + psLen), t.data, tLen)
+    return rsaBigSignEm(priv, em)
+
+fn rsaBigSignPss(priv: RsaBigPrivateKey*, msg: Bytes, useSha384: bool): Result[Bytes] =
+    let hLen: int32 = if useSha384: rsaHashLenSha384() else: rsaHashLenSha256()
+    let sLen: int32 = hLen
+    let emLen: int32 = priv.modLen
+    if emLen < hLen + sLen + 2:
+        return Err[Bytes]("rsa: pss em too short")
+    let saltRes: Result[Bytes] = randomBytes(sLen)
+    if IsErr(saltRes):
+        return Err[Bytes](Error(saltRes))
+    let salt: Bytes = Value(saltRes)
+    var mHash: Bytes
+    if useSha384:
+        mHash = rsaHashSha384(msg)
+    else:
+        mHash = rsaHashSha256(msg)
+    let prefix: Bytes = bytesAlloc(8)
+    let hMsg: Bytes = bytesConcat3(prefix, mHash, salt)
+    var h: Bytes
+    if useSha384:
+        h = rsaHashSha384(hMsg)
+    else:
+        h = rsaHashSha256(hMsg)
+    let psLen: int32 = emLen - sLen - hLen - 2
+    if psLen < 0:
+        return Err[Bytes]("rsa: pss ps len invalid")
+    let db: Bytes = bytesAlloc(psLen + 1 + sLen)
+    bytesSet(db, psLen, 0x01)
+    copyMem(ptr_add(db.data, psLen + 1), salt.data, sLen)
+    let dbMask: Bytes = rsaMgf1(h, emLen - hLen - 1, useSha384)
+    let maskedRes: Result[Bytes] = rsaBytesXor(db, dbMask)
+    if IsErr(maskedRes):
+        return Err[Bytes](Error(maskedRes))
+    let maskedDb: Bytes = Value(maskedRes)
+    let emBits: int32 = priv.modBits - 1
+    let unusedBits: int32 = emLen * 8 - emBits
+    if unusedBits > 0:
+        let mask: int32 = 0xff >> unusedBits
+        bytesSet(maskedDb, 0, bytesGet(maskedDb, 0) & mask)
+    let em: Bytes = bytesAlloc(emLen)
+    copyMem(em.data, maskedDb.data, emLen - hLen - 1)
+    copyMem(ptr_add(em.data, emLen - hLen - 1), h.data, hLen)
+    bytesSet(em, emLen - 1, 0xbc)
+    return rsaBigSignEm(priv, em)
+
+fn rsaVerifyPkcs1(pub: RsaBigPublicKey, msg: Bytes, sig: Bytes, useSha384: bool): bool =
+    var digest: Bytes
+    if useSha384:
+        digest = rsaHashSha384(msg)
+    else:
+        digest = rsaHashSha256(msg)
+    var diRes: Result[Bytes]
+    if useSha384:
+        diRes = rsaDigestInfoSha384(digest)
+    else:
+        diRes = rsaDigestInfoSha256(digest)
+    if IsErr(diRes):
+        return false
+    let t: Bytes = Value(diRes)
+    let emRes: Result[Bytes] = rsaBigDecrypt(pub, sig)
+    if IsErr(emRes):
+        return false
+    let em: Bytes = Value(emRes)
+    let emLen: int32 = bytesLen(em)
+    let tLen: int32 = bytesLen(t)
+    if emLen < tLen + 11:
+        return false
+    if bytesGet(em, 0) != 0x00 || bytesGet(em, 1) != 0x01:
+        return false
+    let psLen: int32 = emLen - tLen - 3
+    for i in 0..<psLen:
+        if bytesGet(em, 2 + i) != 0xff:
+            return false
+    if bytesGet(em, 2 + psLen) != 0x00:
+        return false
+    let tStart: int32 = 3 + psLen
+    let tBytes: Bytes = bytesSlice(em, tStart, tLen)
+    return bytesEqual(tBytes, t)
+
+fn rsaVerifyPkcs1Diag(pub: RsaBigPublicKey, msg: Bytes, sig: Bytes, useSha384: bool): Result[bool] =
+    var digest: Bytes
+    if useSha384:
+        digest = rsaHashSha384(msg)
+    else:
+        digest = rsaHashSha256(msg)
+    var diRes: Result[Bytes]
+    if useSha384:
+        diRes = rsaDigestInfoSha384(digest)
+    else:
+        diRes = rsaDigestInfoSha256(digest)
+    if IsErr(diRes):
+        return Err[bool]("rsa: digestinfo build failed")
+    let t: Bytes = Value(diRes)
+    let emRes: Result[Bytes] = rsaBigDecrypt(pub, sig)
+    if IsErr(emRes):
+        return Err[bool]("rsa: decrypt failed: " + Error(emRes))
+    let em: Bytes = Value(emRes)
+    let emLen: int32 = bytesLen(em)
+    let tLen: int32 = bytesLen(t)
+    if emLen < tLen + 11:
+        return Err[bool]("rsa: pkcs1 em too short")
+    if bytesGet(em, 0) != 0x00 || bytesGet(em, 1) != 0x01:
+        return Err[bool]("rsa: pkcs1 em prefix mismatch")
+    let psLen: int32 = emLen - tLen - 3
+    for i in 0..<psLen:
+        if bytesGet(em, 2 + i) != 0xff:
+            return Err[bool]("rsa: pkcs1 padding mismatch")
+    if bytesGet(em, 2 + psLen) != 0x00:
+        return Err[bool]("rsa: pkcs1 delimiter mismatch")
+    let tStart: int32 = 3 + psLen
+    let tBytes: Bytes = bytesSlice(em, tStart, tLen)
+    if ! bytesEqual(tBytes, t):
+        return Err[bool]("rsa: pkcs1 digestinfo mismatch")
+    return Ok[bool](true)
+
+fn rsaVerifyPss(pub: RsaBigPublicKey, msg: Bytes, sig: Bytes, useSha384: bool): bool =
+    let hLen: int32 = if useSha384: rsaHashLenSha384() else: rsaHashLenSha256()
+    let sLen: int32 = hLen
+    let emRes: Result[Bytes] = rsaBigDecrypt(pub, sig)
+    if IsErr(emRes):
+        return false
+    let em: Bytes = Value(emRes)
+    let emLen: int32 = bytesLen(em)
+    if emLen < hLen + sLen + 2:
+        return false
+    if bytesGet(em, emLen - 1) != 0xbc:
+        return false
+    let maskedDb: Bytes = bytesSlice(em, 0, emLen - hLen - 1)
+    let h: Bytes = bytesSlice(em, emLen - hLen - 1, hLen)
+    let dbMask: Bytes = rsaMgf1(h, emLen - hLen - 1, useSha384)
+    let dbRes: Result[Bytes] = rsaBytesXor(maskedDb, dbMask)
+    if IsErr(dbRes):
+        return false
+    let db: Bytes = Value(dbRes)
+    let emBits: int32 = pub.modBits - 1
+    let unusedBits: int32 = emLen * 8 - emBits
+    if unusedBits > 0:
+        let mask: int32 = 0xff ^((1 << (8 - unusedBits)) - 1)
+        if (bytesGet(db, 0) & mask) != 0:
+            return false
+    let psLen: int32 = emLen - hLen - sLen - 2
+    if psLen < 0:
+        return false
+    for i in 0..<psLen:
+        if bytesGet(db, i) != 0x00:
+            return false
+    if bytesGet(db, psLen) != 0x01:
+        return false
+    let salt: Bytes = bytesSlice(db, psLen + 1, sLen)
+    var mHash: Bytes
+    if useSha384:
+        mHash = rsaHashSha384(msg)
+    else:
+        mHash = rsaHashSha256(msg)
+    let prefix: Bytes = bytesAlloc(8)
+    let hMsg: Bytes = bytesConcat3(prefix, mHash, salt)
+    var h2: Bytes
+    if useSha384:
+        h2 = rsaHashSha384(hMsg)
+    else:
+        h2 = rsaHashSha256(hMsg)
+    return bytesEqual(h, h2)
+
+fn rsaSign(priv: RsaPrivateKey, msg: Bytes): Result[Bytes] =
+    if priv.n <= 0 || priv.d <= 0:
+        return Err[Bytes]("rsa: invalid private key")
+    let digest: Bytes = sha256Digest(msg)
+    let m: int64 = bytesToInt64Mod(digest, priv.n)
+    let s: int64 = powMod(m, priv.d, priv.n)
+    let sig: Bytes = int64ToBytes(s)
+    return Ok[Bytes](sig)
+
+fn rsaVerify(pub: RsaPublicKey, msg: Bytes, sig: Bytes): bool =
+    if pub.n <= 0 || pub.e <= 0:
+        return false
+    let sigValRes: Result[int64] = bytesToInt64(sig)
+    if IsErr(sigValRes):
+        return false
+    let s: int64 = Value(sigValRes)
+    let digest: Bytes = sha256Digest(msg)
+    let m: int64 = bytesToInt64Mod(digest, pub.n)
+    let v: int64 = powMod(s, pub.e, pub.n)
+    return v == m
+
+fn rsaPublicKeyToBytes(pub: RsaPublicKey): Bytes =
+    let nEnc: Bytes = asn1EncodeInt64(pub.n)
+    let eEnc: Bytes = asn1EncodeInt64(pub.e)
+    var seq: ByteBuffer = newByteBuffer()
+    appendBytes(seq, nEnc)
+    appendBytes(seq, eEnc)
+    return asn1EncodeSequence(toBytes(seq))
+
+fn rsaPrivateKeyToBytes(priv: RsaPrivateKey): Bytes =
+    let vEnc: Bytes = asn1EncodeInt64(0)
+    let nEnc: Bytes = asn1EncodeInt64(priv.n)
+    let eEnc: Bytes = asn1EncodeInt64(priv.e)
+    let dEnc: Bytes = asn1EncodeInt64(priv.d)
+    let pEnc: Bytes = asn1EncodeInt64(priv.p)
+    let qEnc: Bytes = asn1EncodeInt64(priv.q)
+    var seq: ByteBuffer = newByteBuffer()
+    appendBytes(seq, vEnc)
+    appendBytes(seq, nEnc)
+    appendBytes(seq, eEnc)
+    appendBytes(seq, dEnc)
+    appendBytes(seq, pEnc)
+    appendBytes(seq, qEnc)
+    return asn1EncodeSequence(toBytes(seq))
+
+fn rsaPublicKeyFromBytes(data: Bytes): Result[RsaPublicKey] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, 0)
+    if IsErr(seqRes):
+        return Err[RsaPublicKey](Error(seqRes))
+    var offset: int32 = 0
+    let seqValue: Bytes = Value(seqRes).value
+    let nRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(nRes):
+        return Err[RsaPublicKey](Error(nRes))
+    offset = Value(nRes).next
+    let eRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(eRes):
+        return Err[RsaPublicKey](Error(eRes))
+    let n: int64 = Value(nRes).value
+    let e: int64 = Value(eRes).value
+    if n <= 0 || e <= 0:
+        return Err[RsaPublicKey]("rsa: invalid public key")
+    return Ok[RsaPublicKey](RsaPublicKey(n: n, e: e))
+
+fn rsaPrivateKeyFromBytes(data: Bytes): Result[RsaPrivateKey] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, 0)
+    if IsErr(seqRes):
+        return Err[RsaPrivateKey](Error(seqRes))
+    var offset: int32 = 0
+    let seqValue: Bytes = Value(seqRes).value
+    let vRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(vRes):
+        return Err[RsaPrivateKey](Error(vRes))
+    offset = Value(vRes).next
+    let nRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(nRes):
+        return Err[RsaPrivateKey](Error(nRes))
+    offset = Value(nRes).next
+    let eRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(eRes):
+        return Err[RsaPrivateKey](Error(eRes))
+    offset = Value(eRes).next
+    let dRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(dRes):
+        return Err[RsaPrivateKey](Error(dRes))
+    offset = Value(dRes).next
+    let pRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(pRes):
+        return Err[RsaPrivateKey](Error(pRes))
+    offset = Value(pRes).next
+    let qRes: Result[Asn1Int64Next] = asn1DecodeInt64(seqValue, offset)
+    if IsErr(qRes):
+        return Err[RsaPrivateKey](Error(qRes))
+    let n: int64 = Value(nRes).value
+    let e: int64 = Value(eRes).value
+    let d: int64 = Value(dRes).value
+    let p: int64 = Value(pRes).value
+    let q: int64 = Value(qRes).value
+    if n <= 0 || e <= 0 || d <= 0:
+        return Err[RsaPrivateKey]("rsa: invalid private key")
+    return Ok[RsaPrivateKey](RsaPrivateKey(n: n, e: e, d: d, p: p, q: q))
+
+fn validateRsaPublicKeyBytes(data: Bytes): bool =
+    let bigRes: Result[RsaBigPublicKey] = rsaBigPublicKeyFromBytes(data)
+    if IsOk(bigRes):
+        return true
+    let res: Result[RsaPublicKey] = rsaPublicKeyFromBytes(data)
+    return IsOk(res)
+
+fn validateRsaPrivateKeyBytes(data: Bytes): bool =
+    let bigRes: Result[RsaBigPrivateKey] = rsaBigPrivateKeyFromBytes(data)
+    if IsOk(bigRes):
+        return true
+    let res: Result[RsaPrivateKey] = rsaPrivateKeyFromBytes(data)
+    return IsOk(res)
+
+fn validateRsaSignatureBytes(data: Bytes): bool =
+    return bytesLen(data) > 0
+
+fn rsaSignBytes(privData: Bytes, msg: Bytes): Result[Bytes] =
+    let bigRes: Result[RsaBigPrivateKey] = rsaBigPrivateKeyFromBytes(privData)
+    if IsOk(bigRes):
+        var priv: RsaBigPrivateKey = Value(bigRes)
+        let sigRes: Result[Bytes] = rsaBigSignPkcs1(&priv, msg, false)
+        if IsErr(sigRes):
+            return Err[Bytes](Error(sigRes))
+        return sigRes
+    let privRes: Result[RsaPrivateKey] = rsaPrivateKeyFromBytes(privData)
+    if IsErr(privRes):
+        return Err[Bytes](Error(privRes))
+    return rsaSign(Value(privRes), msg)
+
+fn rsaVerifyBytes(pubData: Bytes, msg: Bytes, sig: Bytes): bool =
+    let bigRes: Result[RsaBigPublicKey] = rsaBigPublicKeyFromBytes(pubData)
+    if IsOk(bigRes):
+        var pub: RsaBigPublicKey = Value(bigRes)
+        if rsaVerifyPkcs1(pub, msg, sig, false):
+            return true
+        if rsaVerifyPkcs1(pub, msg, sig, true):
+            return true
+        if rsaVerifyPss(pub, msg, sig, false):
+            return true
+        if rsaVerifyPss(pub, msg, sig, true):
+            return true
+    let pubRes: Result[RsaPublicKey] = rsaPublicKeyFromBytes(pubData)
+    if IsErr(pubRes):
+        return false
+    return rsaVerify(Value(pubRes), msg, sig)
+
+fn rsaPublicKeyFromPrivateBytes(privData: Bytes): Result[Bytes] =
+    let privRes: Result[RsaPrivateKey] = rsaPrivateKeyFromBytes(privData)
+    if IsErr(privRes):
+        return Err[Bytes](Error(privRes))
+    let pub: RsaPublicKey = rsaPublicKeyFromPrivate(Value(privRes))
+    return Ok[Bytes](rsaPublicKeyToBytes(pub))

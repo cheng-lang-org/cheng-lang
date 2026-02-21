@@ -1,0 +1,162 @@
+# rawbytes.cheng - raw pointer bytes helpers (binary-safe)
+#
+# 注意：这里的 Bytes 与 pkg://cheng/libp2p 的 utils/bytes 对齐，方便机械替换 import。
+
+import std/system
+import std/strings
+
+type
+    byte = int32
+    Bytes =
+        data: void*
+        len: int32
+
+fn emptyBytes(): Bytes =
+    var out: Bytes
+    out.data = nil
+    out.len = 0
+    return out
+
+fn bytesAlloc(length: int32): Bytes =
+    if length <= 0:
+        return emptyBytes()
+    let p: void* = alloc length
+    setMem(p, 0, length)
+    var out: Bytes
+    out.data = p
+    out.len = length
+    return out
+
+fn bytesFromString(s: str): Bytes =
+    if s == nil:
+        return emptyBytes()
+    var out: Bytes
+    out.data = void*(s)
+    out.len = len(s)
+    return out
+
+fn bytesToString(b: Bytes): str =
+    if b.data == nil || b.len <= 0:
+        return ""
+    let size: int32 = b.len + 1
+    let p: void* = alloc size
+    copyMem(p, b.data, b.len)
+    setMem(ptr_add(p, b.len), 0, 1)
+    return str(p)
+
+fn bytesLen(b: Bytes): int32 =
+    b.len
+
+fn bytesGet(b: Bytes, idx: int32): int32 =
+    if idx < 0 || idx >= b.len:
+        return 0
+    let p: void* = ptr_add(b.data, idx)
+    let p8: int8* = int8*(p)
+    var v: int32 = int32(*p8)
+    if v < 0:
+        v = v + 256
+    return v
+
+fn bytesGet(b: var Bytes, idx: int32): int32 =
+    if idx < 0 || idx >= b.len:
+        return 0
+    let p: void* = ptr_add(b.data, idx)
+    let p8: int8* = int8*(p)
+    var v: int32 = int32(*p8)
+    if v < 0:
+        v = v + 256
+    return v
+
+fn bytesSet(b: var Bytes, idx: int32, val: int32) =
+    if idx < 0 || idx >= b.len:
+        return
+    let p: void* = ptr_add(b.data, idx)
+    let p8: int8* = int8*(p)
+    *p8 = int8(val)
+
+fn bytesSlice(b: Bytes, start: int32, count: int32): Bytes =
+    if count <= 0 || start < 0 || start >= b.len:
+        return emptyBytes()
+    var n: int32 = count
+    if start + n > b.len:
+        n = b.len - start
+    let out: Bytes = bytesAlloc n
+    copyMem(out.data, ptr_add(b.data, start), n)
+    return out
+
+fn bytesSliceView(b: Bytes, start: int32, count: int32): Bytes =
+    if count <= 0 || start < 0 || start >= b.len:
+        return emptyBytes()
+    var n: int32 = count
+    if start + n > b.len:
+        n = b.len - start
+    if n <= 0:
+        return emptyBytes()
+    var out: Bytes
+    out.data = ptr_add(b.data, start)
+    out.len = n
+    return out
+
+fn bytesEqual(a: Bytes, b: Bytes): bool =
+    if a.len != b.len:
+        return false
+    for i in 0..<a.len:
+        if bytesGet(a, i) != bytesGet(b, i):
+            return false
+    return true
+
+fn __cheng_bytes_eq(a, b: Bytes): bool =
+    return bytesEqual(a, b)
+
+fn __cheng_bytes_neq(a, b: Bytes): bool =
+    return !bytesEqual(a, b)
+
+fn `$`(b: Bytes): str =
+    return bytesToHex b
+
+fn bytesToHex(b: Bytes): str =
+    if b.data == nil || b.len <= 0:
+        return ""
+    let outLen: int32 = b.len * 2
+    let out: Bytes = bytesAlloc outLen
+    for i in 0..<b.len:
+        let value: int32 = bytesGet(b, i)
+        let hi: int32 = value >> 4
+        let lo: int32 = value & 15
+        let hiChar: int32 = if hi < 10: int32('0') + hi else: int32('a') + (hi - 10)
+        let loChar: int32 = if lo < 10: int32('0') + lo else: int32('a') + (lo - 10)
+        bytesSet(out, i * 2, hiChar)
+        bytesSet(out, i * 2 + 1, loChar)
+    return bytesToString out
+
+fn bytesConcat(a: Bytes, b: Bytes): Bytes =
+    let aLen: int32 = bytesLen a
+    let bLen: int32 = bytesLen b
+    if aLen <= 0 && bLen <= 0:
+        return emptyBytes()
+    let outLen: int32 = aLen + bLen
+    let out: Bytes = bytesAlloc outLen
+    if aLen > 0:
+        copyMem(out.data, a.data, aLen)
+    if bLen > 0:
+        copyMem(ptr_add(out.data, aLen), b.data, bLen)
+    return out
+
+fn bytesConcat3(a: Bytes, b: Bytes, c: Bytes): Bytes =
+    let aLen: int32 = bytesLen a
+    let bLen: int32 = bytesLen b
+    let cLen: int32 = bytesLen c
+    if aLen <= 0 && bLen <= 0 && cLen <= 0:
+        return emptyBytes()
+    let outLen: int32 = aLen + bLen + cLen
+    let out: Bytes = bytesAlloc outLen
+    var offset: int32 = 0
+    if aLen > 0:
+        copyMem(out.data, a.data, aLen)
+        offset = offset + aLen
+    if bLen > 0:
+        copyMem(ptr_add(out.data, offset), b.data, bLen)
+        offset = offset + bLen
+    if cLen > 0:
+        copyMem(ptr_add(out.data, offset), c.data, cLen)
+    return out

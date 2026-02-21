@@ -1,0 +1,1241 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import std/strings
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/file_bytes as fbytes
+import cheng/decentralized/lease as dlease
+import cheng/decentralized/lease_token as dtoken
+import cheng/decentralized/ledger as dledger
+import cheng/decentralized/metering as dmeter
+import cheng/decentralized/settlement as dsettle
+import cheng/decentralized/audit as daudit
+import cheng/decentralized/exec_request as dexec
+import cheng/decentralized/exec_receipt as dreceipt
+import cheng/decentralized/runtime as druntime
+import cheng/decentralized/audit_sampling as dsample
+import cheng/decentralized/fraud_report as dfraud
+import cheng/decentralized/reputation as drep
+import cheng/decentralized/rate_limit as drate
+import cheng/decentralized/storage_proof as dproof
+import cheng/decentralized/provider_reputation as dprepute
+import cheng/decentralized/io_backend as diob
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import cheng/libp2p/utils/stringlist as stringlist
+import cheng/libp2p/crypto/sha256 as sha256
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng_storage <command> [args]")
+    printLine("")
+    printLine("commands:")
+    printLine("  init   --root:<dir> [--mode:local|p2p] [--listen:<addr>]")
+    printLine("  put    --file:<path> [--lease:<token>] [--require-lease|--no-lease]")
+    printLine("         [--root:<dir>] [--mode:local|p2p] [--listen:<addr>] [--peer:<addr>]")
+    printLine("  put-text --text:<text>|--file:<path>|--in:<path>|--stdin [--lease:<token>]")
+    printLine("           [--require-lease|--no-lease]")
+    printLine("           [--root:<dir>] [--mode:local|p2p] [--listen:<addr>] [--peer:<addr>]")
+    printLine("  get    --cid:<cid> --out:<path> [--root:<dir>] [--mode:local|p2p] [--listen:<addr>] [--peer:<addr>]")
+    printLine("  cat    --cid:<cid>|--path:<path> [--raw] [--out:<file>]")
+    printLine("         [--root:<dir>] [--mode:local|p2p] [--listen:<addr>] [--peer:<addr>]")
+    printLine("  serve  --root:<dir> --mode:p2p --listen:<addr> [--max:<n>] [--peer:<addr>]")
+    printLine("  lease  --package:<id> --author:<id> --provider:<id> --bytes:<n>|--file:<path>")
+    printLine("         [--days:<n>] [--replicas:<n>] [--price:<f>] [--royalty:<f>] [--treasury:<f>]")
+    printLine("         [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
+    printLine("  leasegen --package:<id> --author:<id> --provider:<id> --bytes:<n>|--file:<path>")
+    printLine("          --priv:<key> [--days:<n>] [--replicas:<n>] [--price:<f>] [--royalty:<f>] [--treasury:<f>]")
+    printLine("          [--out:<file>]")
+    printLine("  meter  --task:<id> --package:<id> --author:<id> --executor:<id> --cpu_ms:<n>|--gpu_ms:<n>")
+    printLine("         [--mem_bytes:<n>] [--io_bytes:<n>] [--gpu_ms:<n>] [--gpu_mem_bytes:<n>]")
+    printLine("         [--gpu_count:<n>] [--gpu_type:<text>] [--workload:<train|infer|other>]")
+    printLine("         [--price_cpu:<f>] [--price_mem:<f>] [--price_io:<f>] [--price_gpu:<f>] [--price_gpu_mem:<f>]")
+    printLine("         [--royalty:<f>] [--treasury:<f>] [--epoch:<n>] [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
+    printLine("  exec   --task:<id> --package:<id> --author:<id> --requester:<id>")
+    printLine("         [--input:<cid>] [--code:<cid>] [--args:<cid>] [--cpu_ms:<n>] [--mem_bytes:<n>] [--io_bytes:<n>]")
+    printLine("         [--gpu_ms:<n>] [--gpu_mem_bytes:<n>] [--gpu_count:<n>] [--gpu_type:<text>]")
+    printLine("         [--workload:<train|infer|other>]")
+    printLine("         [--price_cpu:<f>] [--price_mem:<f>] [--price_io:<f>] [--price_gpu:<f>] [--price_gpu_mem:<f>] [--sig:<text>]")
+    printLine("         [--epoch:<n>] [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
+    printLine("  receipt --request:<id> --task:<id> --executor:<id> --status:<ok|bad|err>")
+    printLine("          [--result:<cid>] [--usage:<id>] [--error:<text>] [--proof:<cid>] [--sig:<text>]")
+    printLine("          [--epoch:<n>] [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
+    printLine("  audit  --task:<id> --executor:<id> --auditor:<id> --status:<ok|bad>")
+    printLine("         [--result:<cid>] [--penalty:<f>] [--epoch:<n>] [--note:<text>]")
+    printLine("         [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
+    printLine("  settle --epoch:<n> [--ledger:<path>] [--root:<dir>] [--out:<file>]")
+    printLine("         [--format:toml|yaml|json] [--top:<n>] [--reconcile-csv:<file>]")
+    printLine("  sample --ledger:<path> [--epoch:<n>] [--rate:<f>] [--seed:<text>]")
+    printLine("         [--auditor:<id>] [--record] [--out:<file>] [--format:toml|yaml|json]")
+    printLine("  fraud  --task:<id> --executor:<id> --reporter:<id> [--request:<id>] [--receipt:<id>]")
+    printLine("         [--reason:<text>] [--evidence:<cid>] [--severity:<low|medium|high>]")
+    printLine("         [--epoch:<n>] [--ledger:<path>] [--root:<dir>]")
+    printLine("  ratelimit --ledger:<path> [--epoch:<n>] [--requester:<id>] [--executor:<id>]")
+    printLine("         [--max-requests:<n>] [--max-receipts:<n>] [--out:<file>] [--format:toml|yaml|json]")
+    printLine("  repute --ledger:<path> --executor:<id> [--out:<file>] [--format:toml|yaml|json]")
+    printLine("  proof --cid:<cid> --provider:<id> [--package:<id>] [--note:<text>]")
+    printLine("        [--epoch:<n>] [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
+    printLine("  store-repute --ledger:<path> --provider:<id> [--out:<file>] [--format:toml|yaml|json]")
+
+fn parseInt64(text: str): int64 =
+    if text == nil || len(text) == 0:
+        return 0
+    var i: int32 = 0
+    var sign: int64 = 1
+    if text[0] == '-':
+        sign = -1
+        i = 1
+    var value: int64 = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<len(text):
+        i = __for_i_1
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            break
+        value = value * 10 + int64(ch) - int64('0')
+        i = i + 1
+    return value * sign
+
+fn parseFloat64(text: str): float64 =
+    if text == nil || len(text) == 0:
+        return 0.0
+    var i: int32 = 0
+    var sign: float64 = 1.0
+    if text[0] == '-':
+        sign = -1.0
+        i = 1
+    var intPart: float64 = 0.0
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<len(text):
+        i = __for_i_2
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            break
+        intPart = intPart * 10.0 + float64(int32(ch) - int32('0'))
+        i = i + 1
+    var fracPart: float64 = 0.0
+    var div: float64 = 1.0
+    if i < len(text) && text[i] == '.':
+        i = i + 1
+        let __for_start_i_3 = i
+        for __for_i_3 in __for_start_i_3..<len(text):
+            i = __for_i_3
+            let ch = text[i]
+            if ch < '0' || ch > '9':
+                break
+            fracPart = fracPart * 10.0 + float64(int32(ch) - int32('0'))
+            div = div * 10.0
+            i = i + 1
+    return sign * (intPart + (fracPart / div))
+
+fn parseRootArg(argsStart: int32, count: int32): str =
+    var root = "build/cheng_storage"
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--root:"):
+            root = strings.dropPrefix(arg, "--root:")
+    return root
+
+fn parseLedgerArg(argsStart: int32, count: int32, root: str): str =
+    var ledger = os.joinPath(os.absolutePath(root), "ledger.jsonl")
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--ledger:"):
+            ledger = strings.dropPrefix(arg, "--ledger:")
+    return ledger
+
+fn parseModeArg(argsStart: int32, count: int32): druntime.StorageMode =
+    var modeText = "local"
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--mode:"):
+            modeText = strings.dropPrefix(arg, "--mode:")
+    return druntime.parseStorageMode(modeText)
+
+fn parseListenArg(argsStart: int32, count: int32): str =
+    var listen = ""
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--listen:"):
+            listen = strings.dropPrefix(arg, "--listen:")
+    return listen
+
+fn parsePeersArg(argsStart: int32, count: int32): stringlist.StringList =
+    var peers = stringlist.initStringList()
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--peer:"):
+            let addr = strings.dropPrefix(arg, "--peer:")
+            stringlist.stringListAdd(peers, addr)
+    return peers
+
+fn parseMaxArg(argsStart: int32, count: int32): int32 =
+    var maxStreams: int32 = 1
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--max:"):
+            maxStreams = int32(parseInt64(strings.dropPrefix(arg, "--max:")))
+    return maxStreams
+
+fn parseEpochArg(argsStart: int32, count: int32): int32 =
+    var epoch: int32 = -1
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--epoch:"):
+            epoch = int32(parseInt64(strings.dropPrefix(arg, "--epoch:")))
+    return epoch
+
+fn parseOutArg(argsStart: int32, count: int32): str =
+    var outPath = ""
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--out:"):
+            outPath = strings.dropPrefix(arg, "--out:")
+    return outPath
+
+fn parseReconcileCsvArg(argsStart: int32, count: int32): str =
+    var outPath = ""
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--reconcile-csv:"):
+            outPath = strings.dropPrefix(arg, "--reconcile-csv:")
+    return outPath
+
+fn parseFormatArg(argsStart: int32, count: int32, defaultFormat: str): str =
+    var format = defaultFormat
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--format:"):
+            format = strutil.toLowerAscii(strings.dropPrefix(arg, "--format:"))
+    return format
+
+fn parseTopArg(argsStart: int32, count: int32, defaultTop: int32): int32 =
+    var topN: int32 = defaultTop
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--top:"):
+            topN = int32(parseInt64(strings.dropPrefix(arg, "--top:")))
+    return topN
+
+fn stripCidPrefix(text: str): str =
+    if strutil.startsWith(text, "cid://"):
+        return strings.dropPrefix(text, "cid://")
+    if strutil.startsWith(text, "cid:"):
+        return strings.dropPrefix(text, "cid:")
+    return text
+
+fn cmdInit(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let mode = parseModeArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    printLine("storage ok: " + rt.store.root)
+    printLine("blocks: " + rt.store.blocksDir)
+    printLine("mode: " + druntime.storageModeText(mode))
+    if listenAddr != nil && len(listenAddr) > 0:
+        printLine("listen: " + listenAddr)
+    return 0
+
+fn cmdPut(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let mode = parseModeArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    var path = ""
+    var leasePath = ""
+    var requireLease = mode == druntime.smP2p
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--file:"):
+            path = strings.dropPrefix(arg, "--file:")
+        elif strutil.startsWith(arg, "--lease:"):
+            leasePath = strings.dropPrefix(arg, "--lease:")
+        elif arg == "--require-lease":
+            requireLease = true
+        elif arg == "--no-lease":
+            requireLease = false
+    if path == nil || len(path) == 0:
+        printErr("put: missing --file")
+        return 1
+    if requireLease && (leasePath == nil || len(leasePath) == 0):
+        printErr("put: missing --lease")
+        return 1
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    let backend = diob.IoBackend(runtime: rt)
+    var putRes: result.Result[str]
+    if leasePath != nil && len(leasePath) > 0:
+        let tokenRes: result.Result[dtoken.LeaseToken] = dtoken.loadLeaseTokenFile(leasePath)
+        if result.IsErr(tokenRes):
+            printErr("put: invalid lease token")
+            return 1
+        putRes = diob.putFileWithLease(backend, path, result.Value(tokenRes))
+    else:
+        putRes = diob.putFile(backend, path)
+    if result.IsErr(putRes):
+        let errText = result.Error(putRes)
+        if errText != nil && len(errText) > 0:
+            printErr("put: " + errText)
+        else:
+            printErr("put: failed to write")
+        return 1
+    let putDataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+    if result.IsErr(putDataRes):
+        printErr("put: failed to read file for cid")
+        return 1
+    let putCidRes: result.Result[dcid.Cid] = dcid.cidFromBytes(result.Value(putDataRes))
+    if result.IsErr(putCidRes):
+        printErr("put: cid encode failed")
+        return 1
+    let cidText = dcid.cidText(result.Value(putCidRes))
+    if cidText == nil || len(cidText) == 0:
+        printErr("put: cid encode failed")
+        return 1
+    printLine(cidText)
+    return 0
+
+fn cmdPutText(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let mode = parseModeArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    var text = ""
+    var filePath = ""
+    var hasText = false
+    var hasFile = false
+    var useStdin = false
+    var leasePath = ""
+    var requireLease = mode == druntime.smP2p
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--text:"):
+            text = strings.dropPrefix(arg, "--text:")
+            hasText = true
+        elif strutil.startsWith(arg, "--file:"):
+            filePath = strings.dropPrefix(arg, "--file:")
+            hasFile = true
+        elif strutil.startsWith(arg, "--in:"):
+            filePath = strings.dropPrefix(arg, "--in:")
+            hasFile = true
+        elif arg == "--stdin":
+            useStdin = true
+        elif strutil.startsWith(arg, "--lease:"):
+            leasePath = strings.dropPrefix(arg, "--lease:")
+        elif arg == "--require-lease":
+            requireLease = true
+        elif arg == "--no-lease":
+            requireLease = false
+    var sources: int32 = 0
+    if hasText:
+        sources = sources + 1
+    if hasFile:
+        sources = sources + 1
+    if useStdin:
+        sources = sources + 1
+    if sources == 0:
+        printErr("put-text: missing --text or --file/--in/--stdin")
+        return 1
+    if sources > 1:
+        printErr("put-text: choose only one input source")
+        return 1
+    if hasFile && (filePath == nil || len(filePath) == 0):
+        printErr("put-text: empty --file/--in")
+        return 1
+    if requireLease && (leasePath == nil || len(leasePath) == 0):
+        printErr("put-text: missing --lease")
+        return 1
+    var data: bytes.Bytes
+    if useStdin:
+        let content = os.readAll(os.get_stdin())
+        data = bytes.bytesFromString(content)
+    elif hasFile:
+        let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(filePath)
+        if result.IsErr(dataRes):
+            printErr("put-text: failed to read file")
+            return 1
+        data = result.Value(dataRes)
+    else:
+        data = bytes.bytesFromString(text)
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    let backend = diob.IoBackend(runtime: rt)
+    var storeRes: result.Result[str]
+    if leasePath != nil && len(leasePath) > 0:
+        let tokenRes: result.Result[dtoken.LeaseToken] = dtoken.loadLeaseTokenFile(leasePath)
+        if result.IsErr(tokenRes):
+            printErr("put-text: invalid lease token")
+            return 1
+        storeRes = diob.storeBytesWithLease(backend, data, result.Value(tokenRes))
+    else:
+        storeRes = diob.storeBytes(backend, data)
+    if result.IsErr(storeRes):
+        let errText = result.Error(storeRes)
+        if errText != nil && len(errText) > 0:
+            printErr("put-text: " + errText)
+        else:
+            printErr("put-text: failed to write")
+        return 1
+    let putCidRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+    if result.IsErr(putCidRes):
+        printErr("put-text: cid encode failed")
+        return 1
+    let cidText = dcid.cidText(result.Value(putCidRes))
+    printLine(cidText)
+    return 0
+
+fn cmdGet(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let mode = parseModeArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    var cidText = ""
+    var outPath = ""
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--cid:"):
+            cidText = strings.dropPrefix(arg, "--cid:")
+        elif strutil.startsWith(arg, "--out:"):
+            outPath = strings.dropPrefix(arg, "--out:")
+    if cidText == nil || len(cidText) == 0 || outPath == nil || len(outPath) == 0:
+        printErr("get: missing --cid or --out")
+        return 1
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    if ! druntime.getToFile(rt, cidText, outPath):
+        printErr("get: missing cid")
+        return 1
+    printLine("get ok: " + outPath)
+    return 0
+
+fn cmdCat(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let mode = parseModeArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    let outPath = parseOutArg(argsStart, count)
+    var cidText = ""
+    var pathText = ""
+    var raw = false
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--cid:"):
+            cidText = strings.dropPrefix(arg, "--cid:")
+        elif strutil.startsWith(arg, "--path:"):
+            pathText = strings.dropPrefix(arg, "--path:")
+        elif arg == "--raw":
+            raw = true
+    if (cidText == nil || len(cidText) == 0) && (pathText == nil || len(pathText) == 0):
+        printErr("cat: missing --cid or --path")
+        return 1
+    var pathOrCid = pathText
+    if pathOrCid == nil || len(pathOrCid) == 0:
+        if strutil.startsWith(cidText, "cid://") || strutil.startsWith(cidText, "cid:"):
+            pathOrCid = cidText
+        else:
+            pathOrCid = "cid://" + cidText
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    let backend = diob.IoBackend(runtime: rt)
+    let textRes: result.Result[str] = diob.readText(backend, pathOrCid)
+    if result.IsErr(textRes):
+        printErr("cat: missing content")
+        return 1
+    let text = result.Value(textRes)
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+        return 0
+    if raw:
+        os.write(os.get_stdout(), text)
+    else:
+        printLine(text)
+    return 0
+
+fn cmdServe(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let mode = parseModeArg(argsStart, count)
+    if mode != druntime.smP2p:
+        printErr("serve: requires --mode:p2p")
+        return 1
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    let maxStreams = parseMaxArg(argsStart, count)
+    if listenAddr == nil || len(listenAddr) == 0:
+        printErr("serve: missing --listen")
+        return 1
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    let serveRes: result.Result[int32] = druntime.serve(rt, maxStreams)
+    if result.IsErr(serveRes):
+        printErr("serve: failed")
+        return 1
+    printLine("serve ok: " + intToStr(result.Value(serveRes)))
+    return 0
+
+fn cmdLease(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let mode = parseModeArg(argsStart, count)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    var lease: dlease.Lease = dlease.Lease()
+    lease.durationDays = 30
+    lease.replicas = 1
+    var filePath = ""
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--package:"):
+            lease.packageId = strings.dropPrefix(arg, "--package:")
+        elif strutil.startsWith(arg, "--author:"):
+            lease.authorId = strings.dropPrefix(arg, "--author:")
+        elif strutil.startsWith(arg, "--provider:"):
+            lease.providerId = strings.dropPrefix(arg, "--provider:")
+        elif strutil.startsWith(arg, "--bytes:"):
+            lease.bytes = parseInt64(strings.dropPrefix(arg, "--bytes:"))
+        elif strutil.startsWith(arg, "--file:"):
+            filePath = strings.dropPrefix(arg, "--file:")
+        elif strutil.startsWith(arg, "--days:"):
+            lease.durationDays = int32(parseInt64(strings.dropPrefix(arg, "--days:")))
+        elif strutil.startsWith(arg, "--replicas:"):
+            lease.replicas = int32(parseInt64(strings.dropPrefix(arg, "--replicas:")))
+        elif strutil.startsWith(arg, "--price:"):
+            lease.pricePerGbMonth = parseFloat64(strings.dropPrefix(arg, "--price:"))
+        elif strutil.startsWith(arg, "--royalty:"):
+            lease.royaltyRate = parseFloat64(strings.dropPrefix(arg, "--royalty:"))
+        elif strutil.startsWith(arg, "--treasury:"):
+            lease.treasuryRate = parseFloat64(strings.dropPrefix(arg, "--treasury:"))
+    if filePath != nil && len(filePath) > 0 && lease.bytes <= 0:
+        let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(filePath)
+        if result.IsOk(dataRes):
+            lease.bytes = int64(bytes.bytesLen(result.Value(dataRes)))
+    if lease.packageId == nil || len(lease.packageId) == 0:
+        printErr("lease: missing --package")
+        return 1
+    if lease.authorId == nil || len(lease.authorId) == 0:
+        printErr("lease: missing --author")
+        return 1
+    if lease.providerId == nil || len(lease.providerId) == 0:
+        printErr("lease: missing --provider")
+        return 1
+    if lease.bytes <= 0:
+        printErr("lease: missing --bytes or --file")
+        return 1
+    lease.startTs = dlease.leaseStartTs()
+    lease = dlease.normalizeLease(lease)
+    let cost = dlease.computeLeaseCost(lease)
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    if ! druntime.appendLease(rt, lease, cost):
+        printErr("lease: failed to write ledger")
+        return 1
+    printLine("lease ok: " + lease.leaseId)
+    return 0
+
+fn cmdLeaseGen(argsStart: int32, count: int32): int32 =
+    var lease: dlease.Lease = dlease.Lease()
+    lease.durationDays = 30
+    lease.replicas = 1
+    var filePath = ""
+    var privText = ""
+    let outPath = parseOutArg(argsStart, count)
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--package:"):
+            lease.packageId = strings.dropPrefix(arg, "--package:")
+        elif strutil.startsWith(arg, "--author:"):
+            lease.authorId = strings.dropPrefix(arg, "--author:")
+        elif strutil.startsWith(arg, "--provider:"):
+            lease.providerId = strings.dropPrefix(arg, "--provider:")
+        elif strutil.startsWith(arg, "--bytes:"):
+            lease.bytes = parseInt64(strings.dropPrefix(arg, "--bytes:"))
+        elif strutil.startsWith(arg, "--file:"):
+            filePath = strings.dropPrefix(arg, "--file:")
+        elif strutil.startsWith(arg, "--days:"):
+            lease.durationDays = int32(parseInt64(strings.dropPrefix(arg, "--days:")))
+        elif strutil.startsWith(arg, "--replicas:"):
+            lease.replicas = int32(parseInt64(strings.dropPrefix(arg, "--replicas:")))
+        elif strutil.startsWith(arg, "--price:"):
+            lease.pricePerGbMonth = parseFloat64(strings.dropPrefix(arg, "--price:"))
+        elif strutil.startsWith(arg, "--royalty:"):
+            lease.royaltyRate = parseFloat64(strings.dropPrefix(arg, "--royalty:"))
+        elif strutil.startsWith(arg, "--treasury:"):
+            lease.treasuryRate = parseFloat64(strings.dropPrefix(arg, "--treasury:"))
+        elif strutil.startsWith(arg, "--priv:"):
+            privText = strings.dropPrefix(arg, "--priv:")
+    if filePath != nil && len(filePath) > 0 && lease.bytes <= 0:
+        let sizeRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(filePath)
+        if result.IsOk(sizeRes):
+            lease.bytes = int64(bytes.bytesLen(result.Value(sizeRes)))
+    if lease.packageId == nil || len(lease.packageId) == 0:
+        printErr("leasegen: missing --package")
+        return 1
+    if lease.authorId == nil || len(lease.authorId) == 0:
+        printErr("leasegen: missing --author")
+        return 1
+    if lease.providerId == nil || len(lease.providerId) == 0:
+        printErr("leasegen: missing --provider")
+        return 1
+    if lease.bytes <= 0:
+        printErr("leasegen: missing --bytes or --file")
+        return 1
+    if privText == nil || len(privText) == 0:
+        printErr("leasegen: missing --priv")
+        return 1
+    let tokenRes: result.Result[dtoken.LeaseToken] = dtoken.signLeaseToken(lease, privText)
+    if result.IsErr(tokenRes):
+        printErr("leasegen: failed to sign")
+        return 1
+    let node = dtoken.leaseTokenToJson(result.Value(tokenRes))
+    let text = json.pretty(node)
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+    return 0
+
+fn cmdMeter(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let mode = parseModeArg(argsStart, count)
+    var usage: dmeter.ComputeUsage = dmeter.ComputeUsage()
+    usage.priceCpuMs = 0.0
+    usage.priceMemGb = 0.0
+    usage.priceIoGb = 0.0
+    usage.priceGpuMs = 0.0
+    usage.priceGpuMemGb = 0.0
+    usage.royaltyRate = 0.0
+    usage.treasuryRate = 0.0
+    let epochValue = parseEpochArg(argsStart, count)
+    usage.epoch = if epochValue < 0: 0 else: epochValue
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--task:"):
+            usage.taskId = strings.dropPrefix(arg, "--task:")
+        elif strutil.startsWith(arg, "--package:"):
+            usage.packageId = strings.dropPrefix(arg, "--package:")
+        elif strutil.startsWith(arg, "--author:"):
+            usage.authorId = strings.dropPrefix(arg, "--author:")
+        elif strutil.startsWith(arg, "--executor:"):
+            usage.executorId = strings.dropPrefix(arg, "--executor:")
+        elif strutil.startsWith(arg, "--cpu_ms:"):
+            usage.cpuMs = parseInt64(strings.dropPrefix(arg, "--cpu_ms:"))
+        elif strutil.startsWith(arg, "--mem_bytes:"):
+            usage.memBytes = parseInt64(strings.dropPrefix(arg, "--mem_bytes:"))
+        elif strutil.startsWith(arg, "--io_bytes:"):
+            usage.ioBytes = parseInt64(strings.dropPrefix(arg, "--io_bytes:"))
+        elif strutil.startsWith(arg, "--gpu_ms:"):
+            usage.gpuMs = parseInt64(strings.dropPrefix(arg, "--gpu_ms:"))
+        elif strutil.startsWith(arg, "--gpu_mem_bytes:"):
+            usage.gpuMemBytes = parseInt64(strings.dropPrefix(arg, "--gpu_mem_bytes:"))
+        elif strutil.startsWith(arg, "--gpu_count:"):
+            usage.gpuCount = int32(parseInt64(strings.dropPrefix(arg, "--gpu_count:")))
+        elif strutil.startsWith(arg, "--gpu_type:"):
+            usage.gpuType = strings.dropPrefix(arg, "--gpu_type:")
+        elif strutil.startsWith(arg, "--workload:"):
+            usage.workloadKind = strings.dropPrefix(arg, "--workload:")
+        elif strutil.startsWith(arg, "--price_cpu:"):
+            usage.priceCpuMs = parseFloat64(strings.dropPrefix(arg, "--price_cpu:"))
+        elif strutil.startsWith(arg, "--price_mem:"):
+            usage.priceMemGb = parseFloat64(strings.dropPrefix(arg, "--price_mem:"))
+        elif strutil.startsWith(arg, "--price_io:"):
+            usage.priceIoGb = parseFloat64(strings.dropPrefix(arg, "--price_io:"))
+        elif strutil.startsWith(arg, "--price_gpu:"):
+            usage.priceGpuMs = parseFloat64(strings.dropPrefix(arg, "--price_gpu:"))
+        elif strutil.startsWith(arg, "--price_gpu_mem:"):
+            usage.priceGpuMemGb = parseFloat64(strings.dropPrefix(arg, "--price_gpu_mem:"))
+        elif strutil.startsWith(arg, "--royalty:"):
+            usage.royaltyRate = parseFloat64(strings.dropPrefix(arg, "--royalty:"))
+        elif strutil.startsWith(arg, "--treasury:"):
+            usage.treasuryRate = parseFloat64(strings.dropPrefix(arg, "--treasury:"))
+    if usage.taskId == nil || len(usage.taskId) == 0:
+        printErr("meter: missing --task")
+        return 1
+    if usage.packageId == nil || len(usage.packageId) == 0:
+        printErr("meter: missing --package")
+        return 1
+    if usage.authorId == nil || len(usage.authorId) == 0:
+        printErr("meter: missing --author")
+        return 1
+    if usage.executorId == nil || len(usage.executorId) == 0:
+        printErr("meter: missing --executor")
+        return 1
+    if usage.cpuMs <= 0 && usage.gpuMs <= 0:
+        printErr("meter: missing --cpu_ms or --gpu_ms")
+        return 1
+    usage.startTs = dmeter.usageStartTs()
+    usage = dmeter.normalizeUsage(usage)
+    let cost = dmeter.computeUsageCost(usage)
+    let appendOk = dledger.appendComputeEventWithMode(ledgerPath, usage, cost, druntime.storageModeText(mode))
+    if ! appendOk:
+        printErr("meter: failed to write ledger")
+        return 1
+    printLine("meter ok: " + usage.usageId)
+    return 0
+
+fn cmdExec(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let mode = parseModeArg(argsStart, count)
+    var req: dexec.ExecRequest = dexec.ExecRequest()
+    req.priceCpuMs = 0.0
+    req.priceMemGb = 0.0
+    req.priceIoGb = 0.0
+    req.priceGpuMs = 0.0
+    req.priceGpuMemGb = 0.0
+    let epochValue = parseEpochArg(argsStart, count)
+    req.epoch = if epochValue < 0: 0 else: epochValue
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--task:"):
+            req.taskId = strings.dropPrefix(arg, "--task:")
+        elif strutil.startsWith(arg, "--package:"):
+            req.packageId = strings.dropPrefix(arg, "--package:")
+        elif strutil.startsWith(arg, "--author:"):
+            req.authorId = strings.dropPrefix(arg, "--author:")
+        elif strutil.startsWith(arg, "--requester:"):
+            req.requesterId = strings.dropPrefix(arg, "--requester:")
+        elif strutil.startsWith(arg, "--input:"):
+            req.inputCid = strings.dropPrefix(arg, "--input:")
+        elif strutil.startsWith(arg, "--code:"):
+            req.codeCid = strings.dropPrefix(arg, "--code:")
+        elif strutil.startsWith(arg, "--args:"):
+            req.argsCid = strings.dropPrefix(arg, "--args:")
+        elif strutil.startsWith(arg, "--cpu_ms:"):
+            req.maxCpuMs = parseInt64(strings.dropPrefix(arg, "--cpu_ms:"))
+        elif strutil.startsWith(arg, "--mem_bytes:"):
+            req.maxMemBytes = parseInt64(strings.dropPrefix(arg, "--mem_bytes:"))
+        elif strutil.startsWith(arg, "--io_bytes:"):
+            req.maxIoBytes = parseInt64(strings.dropPrefix(arg, "--io_bytes:"))
+        elif strutil.startsWith(arg, "--gpu_ms:"):
+            req.maxGpuMs = parseInt64(strings.dropPrefix(arg, "--gpu_ms:"))
+        elif strutil.startsWith(arg, "--gpu_mem_bytes:"):
+            req.maxGpuMemBytes = parseInt64(strings.dropPrefix(arg, "--gpu_mem_bytes:"))
+        elif strutil.startsWith(arg, "--gpu_count:"):
+            req.maxGpuCount = int32(parseInt64(strings.dropPrefix(arg, "--gpu_count:")))
+        elif strutil.startsWith(arg, "--gpu_type:"):
+            req.gpuType = strings.dropPrefix(arg, "--gpu_type:")
+        elif strutil.startsWith(arg, "--workload:"):
+            req.workloadKind = strings.dropPrefix(arg, "--workload:")
+        elif strutil.startsWith(arg, "--price_cpu:"):
+            req.priceCpuMs = parseFloat64(strings.dropPrefix(arg, "--price_cpu:"))
+        elif strutil.startsWith(arg, "--price_mem:"):
+            req.priceMemGb = parseFloat64(strings.dropPrefix(arg, "--price_mem:"))
+        elif strutil.startsWith(arg, "--price_io:"):
+            req.priceIoGb = parseFloat64(strings.dropPrefix(arg, "--price_io:"))
+        elif strutil.startsWith(arg, "--price_gpu:"):
+            req.priceGpuMs = parseFloat64(strings.dropPrefix(arg, "--price_gpu:"))
+        elif strutil.startsWith(arg, "--price_gpu_mem:"):
+            req.priceGpuMemGb = parseFloat64(strings.dropPrefix(arg, "--price_gpu_mem:"))
+        elif strutil.startsWith(arg, "--sig:"):
+            req.signature = strings.dropPrefix(arg, "--sig:")
+    if req.taskId == nil || len(req.taskId) == 0:
+        printErr("exec: missing --task")
+        return 1
+    if req.packageId == nil || len(req.packageId) == 0:
+        printErr("exec: missing --package")
+        return 1
+    if req.authorId == nil || len(req.authorId) == 0:
+        printErr("exec: missing --author")
+        return 1
+    if req.requesterId == nil || len(req.requesterId) == 0:
+        printErr("exec: missing --requester")
+        return 1
+    req.ts = dexec.execRequestTs()
+    req = dexec.normalizeExecRequest(req)
+    if ! dledger.appendExecRequestEventWithMode(ledgerPath, req, druntime.storageModeText(mode)):
+        printErr("exec: failed to write ledger")
+        return 1
+    printLine("exec ok: " + req.requestId)
+    return 0
+
+fn cmdReceipt(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let mode = parseModeArg(argsStart, count)
+    var rec: dreceipt.ExecReceipt = dreceipt.ExecReceipt()
+    let epochValue = parseEpochArg(argsStart, count)
+    rec.epoch = if epochValue < 0: 0 else: epochValue
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--request:"):
+            rec.requestId = strings.dropPrefix(arg, "--request:")
+        elif strutil.startsWith(arg, "--task:"):
+            rec.taskId = strings.dropPrefix(arg, "--task:")
+        elif strutil.startsWith(arg, "--executor:"):
+            rec.executorId = strings.dropPrefix(arg, "--executor:")
+        elif strutil.startsWith(arg, "--result:"):
+            rec.resultCid = strings.dropPrefix(arg, "--result:")
+        elif strutil.startsWith(arg, "--usage:"):
+            rec.usageId = strings.dropPrefix(arg, "--usage:")
+        elif strutil.startsWith(arg, "--status:"):
+            rec.status = strings.dropPrefix(arg, "--status:")
+        elif strutil.startsWith(arg, "--error:"):
+            rec.error = strings.dropPrefix(arg, "--error:")
+        elif strutil.startsWith(arg, "--proof:"):
+            rec.proofCid = strings.dropPrefix(arg, "--proof:")
+        elif strutil.startsWith(arg, "--sig:"):
+            rec.signature = strings.dropPrefix(arg, "--sig:")
+    if rec.requestId == nil || len(rec.requestId) == 0:
+        printErr("receipt: missing --request")
+        return 1
+    if rec.taskId == nil || len(rec.taskId) == 0:
+        printErr("receipt: missing --task")
+        return 1
+    if rec.executorId == nil || len(rec.executorId) == 0:
+        printErr("receipt: missing --executor")
+        return 1
+    if rec.status == nil || len(rec.status) == 0:
+        printErr("receipt: missing --status")
+        return 1
+    rec.ts = dreceipt.execReceiptTs()
+    rec = dreceipt.normalizeExecReceipt(rec)
+    if ! dledger.appendExecReceiptEventWithMode(ledgerPath, rec, druntime.storageModeText(mode)):
+        printErr("receipt: failed to write ledger")
+        return 1
+    printLine("receipt ok: " + rec.receiptId)
+    return 0
+
+fn cmdAudit(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    parseModeArg(argsStart, count)
+    var ev: daudit.AuditEvent = daudit.AuditEvent()
+    ev.penalty = 0.0
+    let epochValue = parseEpochArg(argsStart, count)
+    ev.epoch = if epochValue < 0: 0 else: epochValue
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--task:"):
+            ev.taskId = strings.dropPrefix(arg, "--task:")
+        elif strutil.startsWith(arg, "--executor:"):
+            ev.executorId = strings.dropPrefix(arg, "--executor:")
+        elif strutil.startsWith(arg, "--auditor:"):
+            ev.auditorId = strings.dropPrefix(arg, "--auditor:")
+        elif strutil.startsWith(arg, "--status:"):
+            ev.status = strings.dropPrefix(arg, "--status:")
+        elif strutil.startsWith(arg, "--result:"):
+            ev.resultCid = strings.dropPrefix(arg, "--result:")
+        elif strutil.startsWith(arg, "--penalty:"):
+            ev.penalty = parseFloat64(strings.dropPrefix(arg, "--penalty:"))
+        elif strutil.startsWith(arg, "--note:"):
+            ev.note = strings.dropPrefix(arg, "--note:")
+    if ev.taskId == nil || len(ev.taskId) == 0:
+        printErr("audit: missing --task")
+        return 1
+    if ev.executorId == nil || len(ev.executorId) == 0:
+        printErr("audit: missing --executor")
+        return 1
+    if ev.auditorId == nil || len(ev.auditorId) == 0:
+        printErr("audit: missing --auditor")
+        return 1
+    if ev.status == nil || len(ev.status) == 0:
+        printErr("audit: missing --status")
+        return 1
+    ev.ts = daudit.auditTs()
+    ev = daudit.normalizeAudit(ev)
+    if ! dledger.appendAuditEvent(ledgerPath, ev):
+        printErr("audit: failed to write ledger")
+        return 1
+    printLine("audit ok: " + ev.auditId)
+    return 0
+
+fn cmdSettle(argsStart: int32, count: int32): int32 =
+    parseRootArg(argsStart, count)
+    parseLedgerArg(argsStart, count, "")
+    parseEpochArg(argsStart, count)
+    let outPath = parseOutArg(argsStart, count)
+    let reconcileCsvPath = parseReconcileCsvArg(argsStart, count)
+    let format = parseFormatArg(argsStart, count, "json")
+    let topN = parseTopArg(argsStart, count, 10)
+    var text: str = ""
+    if format == "toml" || format == "":
+        text = "epoch = -1\n"
+        text = text + "storage_total = 0\n"
+        text = text + "compute_total = 0\n"
+        text = text + "audit_total = 0\n"
+        text = text + "treasury_total = 0\n\n"
+        text = text + "[counts]\n"
+        text = text + "lease = 0\n"
+        text = text + "compute = 0\n"
+        text = text + "audit = 0\n"
+        text = text + "exec_request = 0\n"
+        text = text + "exec_receipt = 0\n\n"
+        text = text + "[payouts.authors]\n\n"
+        text = text + "[payouts.providers]\n\n"
+        text = text + "[payouts.executors]\n\n"
+        text = text + "[payouts.penalties]\n\n"
+        text = text + "[trust]\n"
+        text = text + "audit_sample_count = 0\n"
+        text = text + "fraud_report_count = 0\n"
+        text = text + "storage_proof_count = 0\n"
+        text = text + "storage_proof_missing_count = 0\n\n"
+        text = text + "[trust.fraud_by_executor]\n\n"
+        text = text + "[trust.storage_ok_by_provider]\n\n"
+        text = text + "[trust.storage_missing_by_provider]\n\n"
+        text = text + "[reconcile]\n"
+        text = text + "limit = " + intToStr(topN) + "\n"
+        text = text + "missing_receipt_count = 0\n"
+        text = text + "orphan_receipt_count = 0\n"
+        text = text + "missing_usage_count = 0\n"
+        text = text + "unreferenced_usage_count = 0\n"
+        text = text + "bad_receipt_count = 0\n"
+        text = text + "request_epoch_mismatch_count = 0\n"
+        text = text + "usage_epoch_mismatch_count = 0\n"
+        text = text + "missing_receipt = []\n"
+        text = text + "unreferenced_usage = []\n\n"
+        text = text + "[preview]\n"
+        text = text + "limit = " + intToStr(topN) + "\n"
+    elif format == "yaml" || format == "yml":
+        text = "epoch: -1\n"
+        text = text + "storage_total: 0\n"
+        text = text + "compute_total: 0\n"
+        text = text + "audit_total: 0\n"
+        text = text + "treasury_total: 0\n"
+        text = text + "counts:\n"
+        text = text + "  lease: 0\n"
+        text = text + "  compute: 0\n"
+        text = text + "  audit: 0\n"
+        text = text + "  exec_request: 0\n"
+        text = text + "  exec_receipt: 0\n"
+        text = text + "trust:\n"
+        text = text + "  audit_sample_count: 0\n"
+        text = text + "  fraud_report_count: 0\n"
+        text = text + "  storage_proof_count: 0\n"
+        text = text + "  storage_proof_missing_count: 0\n"
+        text = text + "reconcile:\n"
+        text = text + "  limit: " + intToStr(topN) + "\n"
+        text = text + "preview:\n"
+        text = text + "  limit: " + intToStr(topN) + "\n"
+    elif format == "json":
+        text = "{\"epoch\":-1"
+        text = text + ",\"storage_total\":0"
+        text = text + ",\"compute_total\":0"
+        text = text + ",\"audit_total\":0"
+        text = text + ",\"treasury_total\":0"
+        text = text + ",\"counts\":{\"lease\":0,\"compute\":0,\"audit\":0,\"exec_request\":0,\"exec_receipt\":0}"
+        text = text + ",\"payouts\":{\"authors\":{},\"providers\":{},\"executors\":{},\"penalties\":{}}"
+        text = text + ",\"trust\":{\"audit_sample_count\":0,\"fraud_report_count\":0,\"storage_proof_count\":0,\"storage_proof_missing_count\":0,\"fraud_by_executor\":{},\"storage_ok_by_provider\":{},\"storage_missing_by_provider\":{}}"
+        text = text + ",\"reconcile\":{\"limit\":" + intToStr(topN)
+        text = text + ",\"missing_receipt_count\":0,\"orphan_receipt_count\":0,\"missing_usage_count\":0,\"unreferenced_usage_count\":0,\"bad_receipt_count\":0,\"request_epoch_mismatch_count\":0,\"usage_epoch_mismatch_count\":0,\"missing_receipt\":[],\"unreferenced_usage\":[]}"
+        text = text + ",\"preview\":{\"limit\":" + intToStr(topN) + "}}"
+    else:
+        printErr("settle: unknown format")
+        return 1
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+    if reconcileCsvPath != nil && len(reconcileCsvPath) > 0:
+        let csvText = "kind,id,issue\n"
+        let dir = os.parentDir(reconcileCsvPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(reconcileCsvPath, csvText)
+    return 0
+
+fn cmdSample(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let epoch = parseEpochArg(argsStart, count)
+    let outPath = parseOutArg(argsStart, count)
+    let format = parseFormatArg(argsStart, count, "json")
+    var rate: float64 = 0.05
+    var seed: str = ""
+    var auditorId: str = "system"
+    var record = false
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--rate:"):
+            rate = parseFloat64(strings.dropPrefix(arg, "--rate:"))
+        elif strutil.startsWith(arg, "--seed:"):
+            seed = strings.dropPrefix(arg, "--seed:")
+        elif strutil.startsWith(arg, "--auditor:"):
+            auditorId = strings.dropPrefix(arg, "--auditor:")
+        elif arg == "--record":
+            record = true
+    let samples = dsample.sampleReceipts(ledgerPath, epoch, rate, seed, auditorId)
+    var text: str = ""
+    if format == "toml" || format == "":
+        text = dsample.samplesToToml(samples)
+    elif format == "yaml" || format == "yml":
+        text = dsample.samplesToYaml(samples)
+    elif format == "json":
+        let node = dsample.samplesToJson(samples)
+        text = json.pretty(node)
+    else:
+        printErr("sample: unknown format")
+        return 1
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+    if record:
+        for j in 0..<samples.len:
+            dledger.appendAuditSampleEvent(ledgerPath, samples[j])
+    return 0
+
+fn cmdFraud(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let epoch = parseEpochArg(argsStart, count)
+    var ev: dfraud.FraudReport
+    ev.epoch = epoch
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--task:"):
+            ev.taskId = strings.dropPrefix(arg, "--task:")
+        elif strutil.startsWith(arg, "--request:"):
+            ev.requestId = strings.dropPrefix(arg, "--request:")
+        elif strutil.startsWith(arg, "--receipt:"):
+            ev.receiptId = strings.dropPrefix(arg, "--receipt:")
+        elif strutil.startsWith(arg, "--executor:"):
+            ev.executorId = strings.dropPrefix(arg, "--executor:")
+        elif strutil.startsWith(arg, "--reporter:"):
+            ev.reporterId = strings.dropPrefix(arg, "--reporter:")
+        elif strutil.startsWith(arg, "--reason:"):
+            ev.reason = strings.dropPrefix(arg, "--reason:")
+        elif strutil.startsWith(arg, "--evidence:"):
+            ev.evidenceCid = strings.dropPrefix(arg, "--evidence:")
+        elif strutil.startsWith(arg, "--severity:"):
+            ev.severity = strings.dropPrefix(arg, "--severity:")
+    if ev.taskId == nil || len(ev.taskId) == 0:
+        printErr("fraud: missing --task")
+        return 1
+    if ev.executorId == nil || len(ev.executorId) == 0:
+        printErr("fraud: missing --executor")
+        return 1
+    if ev.reporterId == nil || len(ev.reporterId) == 0:
+        printErr("fraud: missing --reporter")
+        return 1
+    ev = dfraud.normalizeFraudReport(ev)
+    if ! dledger.appendFraudReportEvent(ledgerPath, ev):
+        printErr("fraud: failed to write ledger")
+        return 1
+    printLine("fraud ok: " + ev.reportId)
+    return 0
+
+fn cmdRateLimit(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let epoch = parseEpochArg(argsStart, count)
+    let outPath = parseOutArg(argsStart, count)
+    let format = parseFormatArg(argsStart, count, "json")
+    var requesterId: str = ""
+    var executorId: str = ""
+    var maxRequests: int32 = 0
+    var maxReceipts: int32 = 0
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--requester:"):
+            requesterId = strings.dropPrefix(arg, "--requester:")
+        elif strutil.startsWith(arg, "--executor:"):
+            executorId = strings.dropPrefix(arg, "--executor:")
+        elif strutil.startsWith(arg, "--max-requests:"):
+            maxRequests = int32(parseInt64(strings.dropPrefix(arg, "--max-requests:")))
+        elif strutil.startsWith(arg, "--max-receipts:"):
+            maxReceipts = int32(parseInt64(strings.dropPrefix(arg, "--max-receipts:")))
+    if (requesterId == nil || len(requesterId) == 0) && (executorId == nil || len(executorId) == 0):
+        printErr("ratelimit: missing --requester or --executor")
+        return 1
+    let info = drate.checkRateLimit(ledgerPath, epoch, requesterId, executorId, maxRequests, maxReceipts)
+    var text: str = ""
+    if format == "toml" || format == "":
+        text = drate.rateLimitToToml(info)
+    elif format == "yaml" || format == "yml":
+        text = drate.rateLimitToYaml(info)
+    elif format == "json":
+        let node = drate.rateLimitToJson(info)
+        text = json.pretty(node)
+    else:
+        printErr("ratelimit: unknown format")
+        return 1
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+    return 0
+
+fn cmdRepute(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let outPath = parseOutArg(argsStart, count)
+    let format = parseFormatArg(argsStart, count, "json")
+    var executorId: str = ""
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--executor:"):
+            executorId = strings.dropPrefix(arg, "--executor:")
+    if executorId == nil || len(executorId) == 0:
+        printErr("repute: missing --executor")
+        return 1
+    let summary = drep.computeReputation(ledgerPath, executorId)
+    var text: str = ""
+    if format == "toml" || format == "":
+        text = drep.reputationToToml(summary)
+    elif format == "yaml" || format == "yml":
+        text = drep.reputationToYaml(summary)
+    elif format == "json":
+        let node = drep.reputationToJson(summary)
+        text = json.pretty(node)
+    else:
+        printErr("repute: unknown format")
+        return 1
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+    return 0
+
+fn cmdProof(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let mode = parseModeArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let listenAddr = parseListenArg(argsStart, count)
+    let peers = parsePeersArg(argsStart, count)
+    let epoch = parseEpochArg(argsStart, count)
+    var cidText: str = ""
+    var ev: dproof.StorageProof
+    ev.epoch = epoch
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--cid:"):
+            cidText = strings.dropPrefix(arg, "--cid:")
+        elif strutil.startsWith(arg, "--provider:"):
+            ev.providerId = strings.dropPrefix(arg, "--provider:")
+        elif strutil.startsWith(arg, "--package:"):
+            ev.packageId = strings.dropPrefix(arg, "--package:")
+        elif strutil.startsWith(arg, "--note:"):
+            ev.note = strings.dropPrefix(arg, "--note:")
+    if cidText == nil || len(cidText) == 0:
+        printErr("proof: missing --cid")
+        return 1
+    if ev.providerId == nil || len(ev.providerId) == 0:
+        printErr("proof: missing --provider")
+        return 1
+    cidText = stripCidPrefix(cidText)
+    ev.cidText = cidText
+    let rt = druntime.initStorageWithP2P(mode, root, ledgerPath, listenAddr, peers)
+    let dataRes: result.Result[bytes.Bytes] = druntime.getBytes(rt, cidText)
+    if result.IsOk(dataRes):
+        let data = result.Value(dataRes)
+        ev.bytes = int64(bytes.bytesLen(data))
+        let digest = sha256.sha256Digest(data)
+        ev.proofHash = bytes.bytesToHex(digest)
+        ev.status = "ok"
+    else:
+        ev.status = "missing"
+    ev = dproof.normalizeStorageProof(ev)
+    if ! dledger.appendStorageProofEvent(ledgerPath, ev):
+        printErr("proof: failed to write ledger")
+        return 1
+    printLine("proof ok: " + ev.proofId)
+    return 0
+
+fn cmdStoreRepute(argsStart: int32, count: int32): int32 =
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let outPath = parseOutArg(argsStart, count)
+    let format = parseFormatArg(argsStart, count, "json")
+    var providerId: str = ""
+    for i in argsStart..count:
+        let arg = cmdline.paramStr(i)
+        if strutil.startsWith(arg, "--provider:"):
+            providerId = strings.dropPrefix(arg, "--provider:")
+    if providerId == nil || len(providerId) == 0:
+        printErr("store-repute: missing --provider")
+        return 1
+    let summary = dprepute.computeProviderReputation(ledgerPath, providerId)
+    var text: str = ""
+    if format == "toml" || format == "":
+        text = dprepute.providerReputationToToml(summary)
+    elif format == "yaml" || format == "yml":
+        text = dprepute.providerReputationToYaml(summary)
+    elif format == "json":
+        let node = dprepute.providerReputationToJson(summary)
+        text = json.pretty(node)
+    else:
+        printErr("store-repute: unknown format")
+        return 1
+    if outPath != nil && len(outPath) > 0:
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
+            os.createDir(dir)
+        os.writeFile(outPath, text)
+    else:
+        printLine(text)
+    return 0
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let count: int32 = cmdline.paramCount()
+    if count <= 0:
+        printUsage()
+        return 1
+    let cmd = cmdline.paramStr(1)
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        printUsage()
+        return 0
+    if cmd == "init":
+        return cmdInit(2, count)
+    if cmd == "put":
+        return cmdPut(2, count)
+    if cmd == "put-text":
+        return cmdPutText(2, count)
+    if cmd == "get":
+        return cmdGet(2, count)
+    if cmd == "cat":
+        return cmdCat(2, count)
+    if cmd == "serve":
+        return cmdServe(2, count)
+    if cmd == "lease":
+        return cmdLease(2, count)
+    if cmd == "leasegen":
+        return cmdLeaseGen(2, count)
+    if cmd == "meter":
+        return cmdMeter(2, count)
+    if cmd == "exec":
+        return cmdExec(2, count)
+    if cmd == "receipt":
+        return cmdReceipt(2, count)
+    if cmd == "audit":
+        return cmdAudit(2, count)
+    if cmd == "settle":
+        return cmdSettle(2, count)
+    if cmd == "sample":
+        return cmdSample(2, count)
+    if cmd == "fraud":
+        return cmdFraud(2, count)
+    if cmd == "ratelimit":
+        return cmdRateLimit(2, count)
+    if cmd == "repute":
+        return cmdRepute(2, count)
+    if cmd == "proof":
+        return cmdProof(2, count)
+    if cmd == "store-repute":
+        return cmdStoreRepute(2, count)
+    printUsage()
+    return 1

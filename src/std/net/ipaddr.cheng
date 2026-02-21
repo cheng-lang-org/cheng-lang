@@ -1,0 +1,296 @@
+# ipaddr.cheng - IP address helpers (IPv4/IPv6 parsing + formatting)
+#
+# API 对齐 pkg://cheng/libp2p 的 utils/ipaddr，便于机械替换 import。
+
+import std/result
+import std/rawbytes
+import std/strings
+import std/buffer
+
+const
+    ipAddrTmpDigitsLen = 4
+    ipAddrHextetsLen = 8
+
+type
+    IpAddr =
+        isV6: bool
+        data: Bytes
+
+fn ipAddrIsV6(addr: IpAddr): bool =
+    addr.isV6
+
+fn ipAddrIsV4(addr: IpAddr): bool =
+    !addr.isV6
+
+fn ipAddrBytes(addr: IpAddr): Bytes =
+    addr.data
+
+fn ipAddrEqual(a: IpAddr, b: IpAddr): bool =
+    if a.isV6 != b.isV6:
+        return false
+    return bytesEqual(a.data, b.data)
+
+fn ipaddrParseUIntRange(text: str, start: int32, count: int32): Result[int32] =
+    if count <= 0:
+        return Err[int32]("ipaddr: empty number")
+    var i: int32 = 0
+    var value: int32 = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<count:
+        i = __for_i_1
+        let c: char = text[start + i]
+        if c < '0' || c > '9':
+            return Err[int32]("ipaddr: invalid number")
+        value = value * 10 + (int32(c) - int32('0'))
+        i = i + 1
+    return Ok[int32](value)
+
+fn parseIPv4Bytes(text: str): Result[Bytes] =
+    var parts: int32 = 0
+    var i: int32 = 0
+    var start: int32 = 0
+    let out: Bytes = bytesAlloc(4)
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..len(text):
+        i = __for_i_2
+        if i == len(text) || text[i] == '.':
+            let count: int32 = i - start
+            let partRes: Result[int32] = ipaddrParseUIntRange(text, start, count)
+            if IsErr(partRes):
+                return Err[Bytes](Error(partRes))
+            let value: int32 = Value(partRes)
+            if value < 0 || value > 255:
+                return Err[Bytes]("ipaddr: ipv4 out of range")
+            if parts >= 4:
+                return Err[Bytes]("ipaddr: ipv4 parts")
+            bytesSet(out, parts, value)
+            parts = parts + 1
+            start = i + 1
+        i = i + 1
+    if parts != 4:
+        return Err[Bytes]("ipaddr: ipv4 parts")
+    return Ok[Bytes](out)
+
+fn ipaddrHexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + (int32(c) - int32('a'))
+    if c >= 'A' && c <= 'F':
+        return 10 + (int32(c) - int32('A'))
+    return -1
+
+fn ipaddrParseHexSegment(text: str, start: int32, count: int32): Result[int32] =
+    if count <= 0 || count > 4:
+        return Err[int32]("ipaddr: ipv6 part length")
+    var i: int32 = 0
+    var value: int32 = 0
+    let __for_start_i_3 = i
+    for __for_i_3 in __for_start_i_3..<count:
+        i = __for_i_3
+        let v: int32 = ipaddrHexValue(text[start + i])
+        if v < 0:
+            return Err[int32]("ipaddr: ipv6 invalid hex")
+        value = (value << 4) + v
+        i = i + 1
+    return Ok[int32](value)
+
+fn ipaddrWriteHextet(buf: Bytes, idx: int32, value: int32) =
+    bytesSet(buf, idx * 2, (value >> 8) & 255)
+    bytesSet(buf, idx * 2 + 1, value & 255)
+
+fn parseIPv6Bytes(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Err[Bytes]("ipaddr: ipv6 empty")
+    var head: Bytes = bytesAlloc(16)
+    var tail: Bytes = bytesAlloc(16)
+    var headCount: int32 = 0
+    var tailCount: int32 = 0
+    var seenCompress: bool = false
+    var i: int32 = 0
+    var segmentStart: int32 = 0
+    let __for_start_i_4 = i
+    for __for_i_4 in __for_start_i_4..len(text):
+        i = __for_i_4
+        let atEnd: bool = i == len(text)
+        let isColon: bool = (!atEnd) && text[i] == ':'
+        if atEnd || isColon:
+            if i == segmentStart:
+                if isColon && i + 1 < len(text) && text[i + 1] == ':':
+                    if seenCompress:
+                        return Err[Bytes]("ipaddr: ipv6 multiple ::")
+                    seenCompress = true
+                    i = i + 1
+                    segmentStart = i + 1
+                else:
+                    if atEnd && seenCompress:
+                        break
+                    return Err[Bytes]("ipaddr: ipv6 empty part")
+            else:
+                let partRes: Result[int32] = ipaddrParseHexSegment(text, segmentStart, i - segmentStart)
+                if IsErr(partRes):
+                    return Err[Bytes](Error(partRes))
+                let value: int32 = Value(partRes)
+                if !seenCompress:
+                    if headCount >= 8:
+                        return Err[Bytes]("ipaddr: ipv6 parts")
+                    ipaddrWriteHextet(head, headCount, value)
+                    headCount = headCount + 1
+                else:
+                    if tailCount >= 8:
+                        return Err[Bytes]("ipaddr: ipv6 parts")
+                    ipaddrWriteHextet(tail, tailCount, value)
+                    tailCount = tailCount + 1
+                if isColon && i + 1 < len(text) && text[i + 1] == ':':
+                    if seenCompress:
+                        return Err[Bytes]("ipaddr: ipv6 multiple ::")
+                    seenCompress = true
+                    i = i + 1
+                segmentStart = i + 1
+        i = i + 1
+    if seenCompress:
+        if headCount + tailCount > 8:
+            return Err[Bytes]("ipaddr: ipv6 parts")
+    else:
+        if headCount != 8:
+            return Err[Bytes]("ipaddr: ipv6 parts")
+    let out: Bytes = bytesAlloc(16)
+    var outIdx: int32 = 0
+    for j in 0..<headCount:
+        bytesSet(out, outIdx, bytesGet(head, j * 2))
+        bytesSet(out, outIdx + 1, bytesGet(head, j * 2 + 1))
+        outIdx = outIdx + 2
+    let zeroHextets: int32 = if seenCompress: 8 - (headCount + tailCount) else: 0
+    j = 0
+    let __for_start_j_5 = j
+    for __for_j_5 in __for_start_j_5..<zeroHextets:
+        j = __for_j_5
+        bytesSet(out, outIdx, 0)
+        bytesSet(out, outIdx + 1, 0)
+        outIdx = outIdx + 2
+        j = j + 1
+    j = 0
+    let __for_start_j_6 = j
+    for __for_j_6 in __for_start_j_6..<tailCount:
+        j = __for_j_6
+        bytesSet(out, outIdx, bytesGet(tail, j * 2))
+        bytesSet(out, outIdx + 1, bytesGet(tail, j * 2 + 1))
+        outIdx = outIdx + 2
+        j = j + 1
+    return Ok[Bytes](out)
+
+fn parseIpAddr(text: str): Result[IpAddr] =
+    if len(text) <= 0:
+        return Err[IpAddr]("ipaddr: empty")
+    if strContains(text, ":"):
+        let ipv6Res: Result[Bytes] = parseIPv6Bytes(text)
+        if IsErr(ipv6Res):
+            return Err[IpAddr](Error(ipv6Res))
+        return Ok[IpAddr](IpAddr(isV6: true, data: Value(ipv6Res)))
+    let ipv4Res: Result[Bytes] = parseIPv4Bytes(text)
+    if IsErr(ipv4Res):
+        return Err[IpAddr](Error(ipv4Res))
+    return Ok[IpAddr](IpAddr(isV6: false, data: Value(ipv4Res)))
+
+fn appendDecimal(buf: var ByteBuffer, value: int32) =
+    if value == 0:
+        appendByte(buf, int32('0'))
+        return
+    var tmp: int32[ipAddrTmpDigitsLen]
+    var count: int32 = 0
+    var v: int32 = value
+    while v > 0:
+        tmp[count] = v % 10
+        count = count + 1
+        v = v / 10
+    let __for_start_i = count - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        appendByte(buf, int32('0') + tmp[i])
+
+fn appendHexHextet(buf: var ByteBuffer, value: int32) =
+    if value == 0:
+        appendByte(buf, int32('0'))
+        return
+    var tmp: int32[ipAddrTmpDigitsLen]
+    var count: int32 = 0
+    var v: int32 = value
+    while v > 0:
+        tmp[count] = v & 15
+        count = count + 1
+        v = v >> 4
+    let __for_start_i = count - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        let digit: int32 = tmp[i]
+        if digit < 10:
+            appendByte(buf, int32('0') + digit)
+        else:
+            appendByte(buf, int32('a') + (digit - 10))
+
+fn ipAddrToString(addr: IpAddr): str =
+    if addr.data.data == nil || addr.data.len <= 0:
+        return ""
+    if !addr.isV6:
+        if bytesLen(addr.data) < 4:
+            return ""
+        var buf: ByteBuffer = newByteBuffer()
+        for i in 0..<4:
+            if i > 0:
+                appendByte(buf, int32('.'))
+            appendDecimal(buf, bytesGet(addr.data, i))
+        return bytesToString(toBytes(buf))
+    if bytesLen(addr.data) < 16:
+        return ""
+    var hextets: int32[ipAddrHextetsLen]
+    for i in 0..<8:
+        let hi: int32 = bytesGet(addr.data, i * 2)
+        let lo: int32 = bytesGet(addr.data, i * 2 + 1)
+        hextets[i] = (hi << 8) + lo
+    var bestStart: int32 = -1
+    var bestLen: int32 = 0
+    var curStart: int32 = -1
+    var curLen: int32 = 0
+    i = 0
+    let __for_start_i_7 = i
+    for __for_i_7 in __for_start_i_7..<8:
+        i = __for_i_7
+        if hextets[i] == 0:
+            if curStart < 0:
+                curStart = i
+                curLen = 1
+            else:
+                curLen = curLen + 1
+        else:
+            if curStart >= 0 && curLen > bestLen:
+                bestStart = curStart
+                bestLen = curLen
+            curStart = -1
+            curLen = 0
+        i = i + 1
+    if curStart >= 0 && curLen > bestLen:
+        bestStart = curStart
+        bestLen = curLen
+    if bestLen < 2:
+        bestStart = -1
+        bestLen = 0
+    var buf: ByteBuffer = newByteBuffer()
+    i = 0
+    let __for_guard_start_i_1 = i
+    for __for_guard_i_1 in __for_guard_start_i_1..<8:
+        if ! (i < 8):
+            break
+        if bestStart >= 0 && i == bestStart:
+            appendByte(buf, int32(':'))
+            appendByte(buf, int32(':'))
+            i = i + bestLen
+            if i >= 8:
+                break
+        else:
+            let bufBytes: Bytes = toBytes(buf)
+            if bytesLen(bufBytes) > 0 && !(bestStart >= 0 && i == bestStart):
+                if !(bytesGet(bufBytes, bytesLen(bufBytes) - 1) == int32(':')):
+                    appendByte(buf, int32(':'))
+            appendHexHextet(buf, hextets[i])
+            i = i + 1
+    return bytesToString(toBytes(buf))

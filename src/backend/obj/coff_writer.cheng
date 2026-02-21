@@ -1,0 +1,703 @@
+# COFF relocatable (.obj) writer for AArch64 (Windows) (MVP subset).
+import std/seqs
+import std/strings
+import std/result
+import cheng/backend/machine/machine_types
+import cheng/backend/obj/obj_buf
+import cheng/backend/obj/aarch64_enc
+
+type
+    CoffReloc = ref
+        off: uint32
+        sym: str
+        rtype: uint16
+
+    CoffSym = ref
+        name: str
+        value: uint32
+        sect: int32 # 1-based section index; 0 = undefined
+        stype: uint16
+        storage: uint8
+        nameOff: uint32 # 0 => short name
+
+const
+    IMAGE_FILE_MACHINE_ARM64: uint16 = 0xAA64
+
+    IMAGE_SYM_CLASS_EXTERNAL: uint8 = 2
+    IMAGE_SYM_CLASS_STATIC: uint8 = 3
+
+    IMAGE_SYM_TYPE_FUNCTION: uint16 = 0x20
+
+    IMAGE_SCN_CNT_CODE: uint32 = 0x00000020
+    IMAGE_SCN_CNT_INITIALIZED_DATA: uint32 = 0x00000040
+    IMAGE_SCN_CNT_UNINITIALIZED_DATA: uint32 = 0x00000080
+    IMAGE_SCN_MEM_EXECUTE: uint32 = 0x20000000
+    IMAGE_SCN_MEM_READ: uint32 = 0x40000000
+    IMAGE_SCN_MEM_WRITE: uint32 = 0x80000000
+
+    IMAGE_SCN_ALIGN_1BYTES: uint32 = 0x00100000
+    IMAGE_SCN_ALIGN_2BYTES: uint32 = 0x00200000
+    IMAGE_SCN_ALIGN_4BYTES: uint32 = 0x00300000
+    IMAGE_SCN_ALIGN_8BYTES: uint32 = 0x00400000
+    IMAGE_SCN_ALIGN_16BYTES: uint32 = 0x00500000
+
+    # AArch64 relocation types (COFF)
+    IMAGE_REL_ARM64_BRANCH26: uint16 = 3
+    IMAGE_REL_ARM64_PAGEBASE_REL21: uint16 = 4
+    IMAGE_REL_ARM64_PAGEOFFSET_12A: uint16 = 6
+
+fn coff_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
+    for i in 0..<labels.len:
+        if ! (i < offs.len):
+            break
+        if (labels[i] == label):
+            return Ok[int32](offs[i])
+    return Err[int32]("coff_writer: missing label: " + label)
+
+fn coff_strContains(hay: str, needle: str): bool =
+    if hay == nil || needle == nil:
+        return false
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
+        if j == m:
+            return true
+    return false
+
+fn coff_targetIsWindows(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return coff_strContains(target, "windows") || coff_strContains(target, "msvc")
+
+fn coff_strCmp(a: str, b: str): int32 =
+    if a == nil && b == nil:
+        return 0
+    if a == nil:
+        return -1
+    if b == nil:
+        return 1
+    let na: int32 = len(a)
+    let nb: int32 = len(b)
+    let n: int32 = na < nb ? na : nb
+    for i in 0..<n:
+        let ca: int32 = int32(int64(a[i]) & int64(0xFF))
+        let cb: int32 = int32(int64(b[i]) & int64(0xFF))
+        if ca < cb:
+            return -1
+        if ca > cb:
+            return 1
+    if na < nb:
+        return -1
+    if na > nb:
+        return 1
+    return 0
+
+fn coff_seqContainsStr(items: str[], value: str): bool =
+    for i in 0..<items.len:
+        if (items[i] == value):
+            return true
+    return false
+
+
+fn coffReadStrPtr(items: var str[], idx: int32): str =
+    if items == nil:
+        panic "coff_writer: nil seq pointer"
+    return items[int(idx)]
+
+fn coffWriteStrPtr(items: var str[], idx: int32, val: str) =
+    if items == nil:
+        panic "coff_writer: nil seq pointer"
+    items[int(idx)] = val
+
+fn coffAddStrPtr(items: var str[], value: str) =
+    if items == nil:
+        return
+    add(items, value)
+
+fn coffAddSymPtr(outSyms: var CoffSym[], s: CoffSym) =
+    if outSyms == nil:
+        return
+    add(outSyms, s)
+
+fn coff_seqAddUniqueStr(items: var str[], value: str) =
+    if items == nil || value == nil || len(value) == 0:
+        return
+    if coff_seqContainsStr(items, value):
+        return
+    coffAddStrPtr(items, value)
+
+fn coff_sortStringsStable(items: var str[]) =
+    if items == nil:
+        return
+    for i in 1..<items.len:
+        let key: str = coffReadStrPtr(items, i)
+        var j: int32 = i - 1
+        let __for_start_j = j
+        for __for_rev_j in 0..(__for_start_j - (0)):
+            j = __for_start_j - __for_rev_j
+            if !(coff_strCmp(coffReadStrPtr(items, j), key) > 0):
+                break
+            coffWriteStrPtr(items, j + 1, coffReadStrPtr(items, j))
+        coffWriteStrPtr(items, j + 1, key)
+
+fn alignUp32(value: uint32, align: uint32): uint32 =
+    if align == 0:
+        return value
+    let rem: uint32 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn coffAddSym(outSyms: var CoffSym[], name: str, value: uint32, sect: int32,
+              stype: uint16, storage: uint8) =
+    var s: CoffSym
+    new s
+    s.name = name
+    s.value = value
+    s.sect = sect
+    s.stype = stype
+    s.storage = storage
+    s.nameOff = 0
+    coffAddSymPtr(outSyms, s)
+
+fn coffFindSymIndex(syms: CoffSym[], name: str): int32 =
+    if name == nil:
+        return -1
+    for i in 0..<syms.len:
+        let s: CoffSym = syms[i]
+        if s != nil && (s.name == name):
+            return i
+    return -1
+
+fn coffSectionAlignFlag(pow2: int32): uint32 =
+    if pow2 <= 0:
+        return IMAGE_SCN_ALIGN_1BYTES
+    if pow2 == 1:
+        return IMAGE_SCN_ALIGN_2BYTES
+    if pow2 == 2:
+        return IMAGE_SCN_ALIGN_4BYTES
+    if pow2 == 3:
+        return IMAGE_SCN_ALIGN_8BYTES
+    return IMAGE_SCN_ALIGN_16BYTES
+
+fn coffBuild(module: MachineModule): Result[uint8[]] =
+    if module == nil:
+        return Err[uint8[]]("coff_writer: nil module")
+    if ! coff_targetIsWindows(module.target):
+        return Err[uint8[]]("coff_writer: non-windows target not supported")
+
+    # Section raw data.
+    var text: uint8[]
+    var rdata: uint8[]
+    var data: uint8[]
+    var bssSize: uint32 = 0
+
+    # Layout .rdata (cstrings).
+    var cSymOffs: uint32[]
+    cSymOffs.len = int(module.cstrs.len)
+    for ci in 0..<module.cstrs.len:
+        let c: MachineCString = module.cstrs[ci]
+        let off: uint32 = uint32(rdata.len)
+        cSymOffs[ci] = off
+        bufStr0(&rdata, c.value)
+
+    # Layout globals (.data/.bss).
+    var dataSymOffs: uint32[]
+    dataSymOffs.len = int(module.globals.len)
+    var bssSymOffs: uint32[]
+    bssSymOffs.len = int(module.globals.len)
+    var maxDataAlignPow2: int32 = 0
+    var maxBssAlignPow2: int32 = 0
+    for gi in 0..<module.globals.len:
+        let g: MachineGlobal = module.globals[gi]
+        if g.alignPow2 > maxDataAlignPow2 && g.hasInit:
+            maxDataAlignPow2 = g.alignPow2
+        if g.alignPow2 > maxBssAlignPow2 && ! g.hasInit:
+            maxBssAlignPow2 = g.alignPow2
+    for gi in 0..<module.globals.len:
+        let g2: MachineGlobal = module.globals[gi]
+        let align: uint64 = uint64(1) << uint64(g2.alignPow2)
+        if g2.hasInit:
+            bufAlign(&data, align)
+            dataSymOffs[gi] = uint32(data.len)
+            if g2.size == 4:
+                bufU32(&data, uint32(int32(g2.init)))
+            else:
+                # write 64-bit little-endian as two u32
+                let lo: uint32 = uint32(uint64(g2.init) & uint64(0xFFFFFFFF))
+                let hi: uint32 = uint32((uint64(g2.init) >> 32) & uint64(0xFFFFFFFF))
+                bufU32(&data, lo)
+                bufU32(&data, hi)
+        else:
+            bssSize = alignUp32(bssSize, uint32(align))
+            bssSymOffs[gi] = bssSize
+            bssSize = bssSize + uint32(g2.size)
+
+    # Encode .text and collect relocations.
+    var relocs: CoffReloc[]
+    var funcOffs: uint32[]
+    funcOffs.len = int(module.funcs.len)
+    for fi in 0..<module.funcs.len:
+        bufAlign(text, 4)
+        funcOffs[fi] = uint32(text.len)
+        let f: MachineFunc = module.funcs[fi]
+
+        # Pass 1: compute label offsets within this function (in bytes from func start).
+        var labels: str[16]
+        var labelOffs: int32[16]
+        var scanOff: int32 = 0
+        for si in 0..<f.insts.len:
+            let inst0: MachineInst = f.insts[si]
+            if inst0.op == machineOpLabel:
+                add(labels, inst0.label)
+                add(labelOffs, scanOff)
+                continue
+            if inst0.op == machineOpMovImm:
+                let wc: int32 = a64MovImmWordCount(a64Is64(inst0.rd), inst0.imm)
+                scanOff = scanOff + (wc * 4)
+            else:
+                scanOff = scanOff + 4
+
+        var ii: int32 = 0
+        var curOff: int32 = 0
+        for __for_guard_ii in 0..<f.insts.len:
+            if !(ii < f.insts.len):
+                break
+            let inst: MachineInst = f.insts[ii]
+            if inst.op == machineOpLabel:
+                ii = ii + 1
+                continue
+            let off: uint32 = uint32(text.len)
+            var word: uint32 = 0
+            if inst.op == machineOpSubSp:
+                if inst.imm < 0 || inst.imm > 4095:
+                    return Err[uint8[]]("coff_writer: sub sp immediate out of range")
+                word = a64EncSubImm(true, 31, 31, int32(inst.imm))
+            elif inst.op == machineOpAddSp:
+                if inst.imm < 0 || inst.imm > 4095:
+                    return Err[uint8[]]("coff_writer: add sp immediate out of range")
+                word = a64EncAddImm(true, 31, 31, int32(inst.imm))
+            elif inst.op == machineOpMovReg:
+                let is64: bool = a64Is64(inst.rd)
+                word = a64EncAddImm(is64, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
+            elif inst.op == machineOpMovImm:
+                let is64m: bool = a64Is64(inst.rd)
+                let rd: int32 = a64RegNum(inst.rd)
+                let v: uint64 = uint64(inst.imm)
+                word = a64EncMovz(is64m, rd, int32(v & uint64(0xFFFF)), 0)
+                emitU32LE(text, word)
+                for hw in 1..<(is64m ? 4 : 2):
+                    let part: uint64 = (v >> uint64(hw * 16)) & uint64(0xFFFF)
+                    if part != 0:
+                        let w2: uint32 = a64EncMovk(is64m, rd, int32(part), hw)
+                        emitU32LE(text, w2)
+                ii = ii + 1
+                curOff = curOff + (a64MovImmWordCount(is64m, inst.imm) * 4)
+                continue
+            elif inst.op == machineOpAdrp:
+                word = a64EncAdrp(a64RegNum(inst.rd))
+                var r: CoffReloc
+                new r
+                r.off = off
+                r.sym = inst.label
+                r.rtype = IMAGE_REL_ARM64_PAGEBASE_REL21
+                add(relocs, r)
+            elif inst.op == machineOpAddPageOff:
+                word = a64EncAddImm(true, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
+                var r2: CoffReloc
+                new r2
+                r2.off = off
+                r2.sym = inst.label
+                r2.rtype = IMAGE_REL_ARM64_PAGEOFFSET_12A
+                add(relocs, r2)
+            elif inst.op == machineOpSxtw:
+                word = a64EncSxtw(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == machineOpAdd:
+                let is64a: bool = a64Is64(inst.rd)
+                word = a64EncAddReg(is64a, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpSub:
+                let is64s2: bool = a64Is64(inst.rd)
+                word = a64EncSubReg(is64s2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpMul:
+                let is64m2: bool = a64Is64(inst.rd)
+                word = a64EncMul(is64m2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpSdiv:
+                let is64d: bool = a64Is64(inst.rd)
+                word = a64EncSdiv(is64d, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpUdiv:
+                let is64d2: bool = a64Is64(inst.rd)
+                word = a64EncUdiv(is64d2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpMsub:
+                let is64ms: bool = a64Is64(inst.rd)
+                word = a64EncMsub(is64ms, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm), a64RegNum(inst.ra))
+            elif inst.op == machineOpAnd:
+                let is64l: bool = a64Is64(inst.rd)
+                word = a64EncAndReg(is64l, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpOrr:
+                let is64o: bool = a64Is64(inst.rd)
+                word = a64EncOrrReg(is64o, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpEor:
+                let is64e: bool = a64Is64(inst.rd)
+                word = a64EncEorReg(is64e, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpLsl:
+                let is64sh: bool = a64Is64(inst.rd)
+                word = a64EncLslv(is64sh, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpLsr:
+                let is64sh2: bool = a64Is64(inst.rd)
+                word = a64EncLsrv(is64sh2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpAsr:
+                let is64sh3: bool = a64Is64(inst.rd)
+                word = a64EncAsrv(is64sh3, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpCmp:
+                let is64c: bool = a64Is64(inst.rn)
+                word = a64EncCmpReg(is64c, a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpBCond:
+                let toffRes: Result[int32] = coff_findLabelOff(labels, labelOffs, inst.label)
+                if !IsOk[int32](toffRes):
+                    return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes))
+                let targetOff: int32 = Value[int32](toffRes)
+                let deltaBytes: int64 = int64(targetOff - curOff)
+                if deltaBytes % 4 != 0:
+                    return Err[uint8[]]("coff_writer: misaligned branch target")
+                let encRes: Result[uint32] = a64EncBCond(deltaBytes / 4, inst.cond)
+                if !IsOk[uint32](encRes):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes))
+                word = Value[uint32](encRes)
+            elif inst.op == machineOpB:
+                let toffRes2: Result[int32] = coff_findLabelOff(labels, labelOffs, inst.label)
+                if !IsOk[int32](toffRes2):
+                    return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes2))
+                let targetOff2: int32 = Value[int32](toffRes2)
+                let deltaBytes2: int64 = int64(targetOff2 - curOff)
+                if deltaBytes2 % 4 != 0:
+                    return Err[uint8[]]("coff_writer: misaligned branch target")
+                let encRes2: Result[uint32] = a64EncBImm(deltaBytes2 / 4)
+                if !IsOk[uint32](encRes2):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes2))
+                word = Value[uint32](encRes2)
+            elif inst.op == machineOpStr:
+                let is64s: bool = a64Is64(inst.rd)
+                let encRes: Result[uint32] = a64EncStrImm(is64s, a64RegNum(inst.rd),
+                                                          a64RegNum(inst.rn), inst.imm)
+                if ! IsOk[uint32](encRes):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes))
+                word = Value[uint32](encRes)
+            elif inst.op == machineOpLdr:
+                let is64l: bool = a64Is64(inst.rd)
+                let encRes2: Result[uint32] = a64EncLdrImm(is64l, a64RegNum(inst.rd),
+                                                           a64RegNum(inst.rn), inst.imm)
+                if ! IsOk[uint32](encRes2):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes2))
+                word = Value[uint32](encRes2)
+            elif inst.op == machineOpStrb:
+                let encRes3: Result[uint32] = a64EncStrbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes3):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes3))
+                word = Value[uint32](encRes3)
+            elif inst.op == machineOpLdrb:
+                let encRes4: Result[uint32] = a64EncLdrbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes4):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes4))
+                word = Value[uint32](encRes4)
+            elif inst.op == machineOpLdrsb:
+                let encRes5: Result[uint32] = a64EncLdrsbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes5):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes5))
+                word = Value[uint32](encRes5)
+            elif inst.op == machineOpStrh:
+                let encRes6: Result[uint32] = a64EncStrhImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes6):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes6))
+                word = Value[uint32](encRes6)
+            elif inst.op == machineOpLdrh:
+                let encRes7: Result[uint32] = a64EncLdrhImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes7):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes7))
+                word = Value[uint32](encRes7)
+            elif inst.op == machineOpLdrsh:
+                let encRes8: Result[uint32] = a64EncLdrshImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+                if !IsOk[uint32](encRes8):
+                    return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes8))
+                word = Value[uint32](encRes8)
+            elif inst.op == machineOpBl:
+                word = a64EncBl()
+                var r3: CoffReloc
+                new r3
+                r3.off = off
+                r3.sym = inst.label
+                r3.rtype = IMAGE_REL_ARM64_BRANCH26
+                add(relocs, r3)
+            elif inst.op == machineOpBlr:
+                word = a64EncBlr(a64RegNum(inst.rn))
+            elif inst.op == machineOpFmovDx:
+                word = a64EncFmovDx(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == machineOpFmovXd:
+                word = a64EncFmovXd(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == machineOpFcmpD:
+                word = a64EncFcmpD(a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpFaddD:
+                word = a64EncFaddD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpFsubD:
+                word = a64EncFsubD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpFmulD:
+                word = a64EncFmulD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpFdivD:
+                word = a64EncFdivD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
+            elif inst.op == machineOpFnegD:
+                word = a64EncFnegD(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == machineOpScvtfDx:
+                word = a64EncScvtfDx(a64RegNum(inst.rd), a64RegNum(inst.rn))
+            elif inst.op == machineOpRet:
+                word = a64EncRet()
+            else:
+                return Err[uint8[]]("coff_writer: unsupported machine op (op=" + intToStr(int32(inst.op)) + ")")
+            emitU32LE(text, word)
+            ii = ii + 1
+            curOff = curOff + 4
+
+    let hasRdata: bool = rdata.len > 0
+    let hasData: bool = data.len > 0
+    let hasBss: bool = bssSize > 0
+
+    # Section indices (1-based).
+    let textIndex: int32 = 1
+    var rdataIndex: int32 = 0
+    var dataIndex: int32 = 0
+    var bssIndex: int32 = 0
+    var secCount: int32 = 1
+    if hasRdata:
+        secCount = secCount + 1
+        rdataIndex = secCount
+    if hasData:
+        secCount = secCount + 1
+        dataIndex = secCount
+    if hasBss:
+        secCount = secCount + 1
+        bssIndex = secCount
+
+    # Symbols: locals, extdefs, undefs.
+    var syms: CoffSym[]
+
+    # locals: cstrings
+    if hasRdata:
+        for ci in 0..<module.cstrs.len:
+            let c2: MachineCString = module.cstrs[ci]
+            coffAddSym(syms, c2.label, cSymOffs[ci], rdataIndex,
+                       uint16(0), IMAGE_SYM_CLASS_STATIC)
+
+    let localCount: int32 = syms.len
+
+    # extdefs: funcs
+    for fi in 0..<module.funcs.len:
+        let f2: MachineFunc = module.funcs[fi]
+        coffAddSym(syms, f2.name, funcOffs[fi], textIndex,
+                   IMAGE_SYM_TYPE_FUNCTION, IMAGE_SYM_CLASS_EXTERNAL)
+
+    # extdefs: globals
+    for gi in 0..<module.globals.len:
+        let g3: MachineGlobal = module.globals[gi]
+        if g3.hasInit:
+            if hasData:
+                coffAddSym(syms, g3.name, dataSymOffs[gi], dataIndex,
+                           uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
+        else:
+            if hasBss:
+                coffAddSym(syms, g3.name, bssSymOffs[gi], bssIndex,
+                           uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
+
+    # undefs referenced by relocations.
+    var undefs: str[]
+    for ri in 0..<relocs.len:
+        let r0: CoffReloc = relocs[ri]
+        if r0 != nil && r0.sym != nil && len(r0.sym) > 0:
+            if coffFindSymIndex(syms, r0.sym) < 0:
+                coff_seqAddUniqueStr(&undefs, r0.sym)
+    coff_sortStringsStable(&undefs)
+    for ri in 0..<undefs.len:
+        coffAddSym(syms, undefs[ri], uint32(0), 0, uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
+
+    # Build string table for long symbol names.
+    var strtab: uint8[]
+    bufU32(strtab, uint32(0)) # placeholder size
+    for si in 0..<syms.len:
+        let s0: CoffSym = syms[si]
+        if s0 != nil && s0.name != nil && len(s0.name) > 8:
+            s0.nameOff = uint32(strtab.len)
+            bufStr0(strtab, s0.name)
+            syms[si] = s0
+    bufU32At(strtab, 0, uint32(strtab.len))
+
+    # Section headers and file layout.
+    let nsects: uint16 = uint16(secCount)
+    let hdrSize: uint32 = uint32(20 + 40 * secCount)
+    var textRawPtr: uint32 = 0
+    var rdataRawPtr: uint32 = 0
+    var dataRawPtr: uint32 = 0
+
+    var cur: uint32 = alignUp32(hdrSize, 16)
+    textRawPtr = cur
+    cur = cur + uint32(text.len)
+
+    if hasRdata:
+        cur = alignUp32(cur, 16)
+        rdataRawPtr = cur
+        cur = cur + uint32(rdata.len)
+    if hasData:
+        cur = alignUp32(cur, 16)
+        dataRawPtr = cur
+        cur = cur + uint32(data.len)
+
+    # Relocations: only for .text.
+    cur = alignUp32(cur, 4)
+    var textRelPtr: uint32 = 0
+    if relocs.len > 0:
+        textRelPtr = cur
+        cur = cur + uint32(relocs.len) * 10
+
+    cur = alignUp32(cur, 4)
+    let symPtr: uint32 = cur
+    let symCount: uint32 = uint32(syms.len)
+    cur = cur + symCount * 18
+    let strPtr: uint32 = cur
+    cur = cur + uint32(strtab.len)
+
+    # Build final file.
+    var out: uint8[]
+
+    # IMAGE_FILE_HEADER (20 bytes)
+    bufU16(out, IMAGE_FILE_MACHINE_ARM64)
+    bufU16(out, nsects)
+    bufU32(out, uint32(0)) # TimeDateStamp (deterministic)
+    bufU32(out, symPtr)
+    bufU32(out, symCount)
+    bufU16(out, uint16(0)) # SizeOfOptionalHeader
+    bufU16(out, uint16(0)) # Characteristics
+
+    if uint32(out.len) != uint32(20):
+        return Err[uint8[]]("coff_writer: internal offset mismatch (file header)")
+
+    # IMAGE_SECTION_HEADER (40 bytes each).
+    # 1) .text
+    let textChars: uint32 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | IMAGE_SCN_ALIGN_16BYTES
+    bufFixedStr8(out, ".text")
+    bufU32(out, uint32(text.len)) # VirtualSize
+    bufU32(out, uint32(0))        # VirtualAddress
+    bufU32(out, uint32(text.len)) # SizeOfRawData
+    bufU32(out, textRawPtr)       # PointerToRawData
+    bufU32(out, textRelPtr)       # PointerToRelocations
+    bufU32(out, uint32(0))        # PointerToLinenumbers
+    bufU16(out, uint16(relocs.len))
+    bufU16(out, uint16(0))        # NumberOfLinenumbers
+    bufU32(out, textChars)
+
+    if hasRdata:
+        let rChars: uint32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+                             coffSectionAlignFlag(0)
+        bufFixedStr8(out, ".rdata")
+        bufU32(out, uint32(rdata.len))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(rdata.len))
+        bufU32(out, rdataRawPtr)
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+        bufU16(out, uint16(0))
+        bufU16(out, uint16(0))
+        bufU32(out, rChars)
+
+    if hasData:
+        let dChars: uint32 = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE |
+                             coffSectionAlignFlag(maxDataAlignPow2)
+        bufFixedStr8(out, ".data")
+        bufU32(out, uint32(data.len))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(data.len))
+        bufU32(out, dataRawPtr)
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+        bufU16(out, uint16(0))
+        bufU16(out, uint16(0))
+        bufU32(out, dChars)
+
+    if hasBss:
+        let bChars: uint32 = IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE |
+                             coffSectionAlignFlag(maxBssAlignPow2)
+        bufFixedStr8(out, ".bss")
+        bufU32(out, bssSize)
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0)) # SizeOfRawData
+        bufU32(out, uint32(0)) # PointerToRawData
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+        bufU16(out, uint16(0))
+        bufU16(out, uint16(0))
+        bufU32(out, bChars)
+
+    if uint32(out.len) != hdrSize:
+        return Err[uint8[]]("coff_writer: internal offset mismatch (section headers)")
+
+    # Raw section data.
+    bufAlign(out, 16)
+    if uint32(out.len) != textRawPtr:
+        return Err[uint8[]]("coff_writer: internal offset mismatch (.text)")
+    bufBytes(out, text)
+
+    if hasRdata:
+        bufAlign(out, 16)
+        if uint32(out.len) != rdataRawPtr:
+            return Err[uint8[]]("coff_writer: internal offset mismatch (.rdata)")
+        bufBytes(out, rdata)
+
+    if hasData:
+        bufAlign(out, 16)
+        if uint32(out.len) != dataRawPtr:
+            return Err[uint8[]]("coff_writer: internal offset mismatch (.data)")
+        bufBytes(out, data)
+
+    # Relocations.
+    bufAlign(out, 4)
+    if relocs.len > 0:
+        if uint32(out.len) != textRelPtr:
+            return Err[uint8[]]("coff_writer: internal offset mismatch (.text relocs)")
+        for ri in 0..<relocs.len:
+            let r5: CoffReloc = relocs[ri]
+            let symIdx: int32 = coffFindSymIndex(syms, r5.sym)
+            if symIdx < 0:
+                return Err[uint8[]]("coff_writer: missing relocation symbol")
+            bufU32(out, r5.off)
+            bufU32(out, uint32(symIdx))
+            bufU16(out, r5.rtype)
+    bufAlign(out, 4)
+    if uint32(out.len) != symPtr:
+        return Err[uint8[]]("coff_writer: internal offset mismatch (symPtr)")
+
+    # Symbol table.
+    for si in 0..<syms.len:
+        let s2: CoffSym = syms[si]
+        if s2.nameOff != 0:
+            bufU32(out, uint32(0))
+            bufU32(out, s2.nameOff)
+        else:
+            bufFixedStr8(out, s2.name)
+        bufU32(out, s2.value)
+        bufU16(out, uint16(int16(s2.sect)))
+        bufU16(out, s2.stype)
+        bufU8(out, s2.storage)
+        bufU8(out, uint8(0)) # NumberOfAuxSymbols
+
+    if uint32(out.len) != strPtr:
+        return Err[uint8[]]("coff_writer: internal offset mismatch (strPtr)")
+    bufBytes(out, strtab)
+
+    if uint32(out.len) != cur:
+        return Err[uint8[]]("coff_writer: internal offset mismatch (file end)")
+    return Ok[uint8[]](out)
+
+fn coffWriteAarch64RelocatableObj(module: MachineModule): Result[uint8[]] =
+    return coffBuild(module)

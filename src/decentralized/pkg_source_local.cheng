@@ -1,0 +1,324 @@
+import std/os
+import std/times
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/file_bytes as fbytes
+import cheng/decentralized/store as dstore
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import std/strings
+import std/seqs
+
+const
+    PkgSourceManifestKind = "cheng-pkg-source"
+
+    DefaultExcludeCount = 10
+
+type
+    SourceFile =
+        path: str
+        cidText: str
+        sizeBytes: int64
+
+    SourceManifest =
+        kind: str
+        packageId: str
+        createdTs: str
+        sourceAddrs: str[]
+        files: SourceFile[]
+
+fn normalizePathSlashes(path: str): str =
+    if path == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(path):
+        var ch = path[i]
+        if ch == '\\':
+            ch = '/'
+        out = out + charToStr(ch)
+    return out
+
+fn trimTrailingSlash(path: str): str =
+    if path == nil || len(path) == 0:
+        return ""
+    var end = len(path) - 1
+    while end >= 0:
+        if path[end] != '/':
+            break
+        end = end - 1
+    if end < 0:
+        return ""
+    return path[0..end]
+
+fn relPathFromRoot(path: str, root: str): str =
+    if path == nil || root == nil:
+        return ""
+    let absRoot = normalizePathSlashes(trimTrailingSlash(os.absolutePath(root)))
+    let absPath = normalizePathSlashes(os.absolutePath(path))
+    if ! strutil.startsWith(absPath, absRoot):
+        return normalizePathSlashes(path)
+    var start = len(absRoot)
+    if start < len(absPath) && absPath[start] == '/':
+        start = start + 1
+    if start >= len(absPath):
+        return ""
+    return absPath[start..len(absPath) - 1]
+
+fn defaultSourceExcludes(): str[] =
+    var out: str[]
+    add[str](out, ".git")
+    add[str](out, "chengcache")
+    add[str](out, ".cheng-cache")
+    add[str](out, "build")
+    add[str](out, "dist")
+    add[str](out, "out")
+    add[str](out, "tmp")
+    add[str](out, "tmp_build")
+    add[str](out, "__pycache__")
+    add[str](out, ".DS_Store")
+    return out
+
+fn segmentExcluded(seg: str, excludes: str[]): bool =
+    if seg == nil || len(seg) == 0:
+        return false
+    for i in 0..<excludes.len:
+        let ex = excludes[i]
+        if ex != nil && len(ex) > 0 && seg == ex:
+            return true
+    return false
+
+fn containsPathTraversal(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    let norm = normalizePathSlashes(path)
+    let parts = strutil.split(norm, '/')
+    for i in 0..<parts.len:
+        if parts[i] == "..":
+            return true
+    return false
+
+fn shouldExcludePath(relPath: str, excludes: str[]): bool =
+    if relPath == nil || len(relPath) == 0:
+        return true
+    let norm = normalizePathSlashes(relPath)
+    if containsPathTraversal(norm):
+        return true
+    let parts = strutil.split(norm, '/')
+    for i in 0..<parts.len:
+        let part = parts[i]
+        if segmentExcluded(part, excludes):
+            return true
+    return false
+
+fn sortSourceFiles(files: var SourceFile[]) =
+    for i in 0..<files.len:
+        for j in i + 1..<files.len:
+            let a = files[i]
+            let b = files[j]
+            if cmp(a.path, b.path) > 0:
+                files[i] = b
+                files[j] = a
+
+fn buildSourceManifest(root: str, packageId: str, sourceAddrs: str[], extraExcludes: str[]): result.Result[SourceManifest] =
+    if root == nil || len(root) == 0:
+        return result.Err[SourceManifest]("pkg-source: missing root")
+    if packageId == nil || len(packageId) == 0:
+        return result.Err[SourceManifest]("pkg-source: missing package_id")
+    let absRoot = trimTrailingSlash(os.absolutePath(root))
+    if absRoot == nil || len(absRoot) == 0:
+        return result.Err[SourceManifest]("pkg-source: invalid root")
+    if ! os.dirExists(absRoot):
+        return result.Err[SourceManifest]("pkg-source: root not found")
+    var excludes = defaultSourceExcludes()
+    for i in 0..<extraExcludes.len:
+        let ex = extraExcludes[i]
+        if ex != nil && len(ex) > 0:
+            add[str](excludes, ex)
+    let paths = os.walkDirRec(absRoot)
+    var files: SourceFile[]
+    for p in 0..<paths.len:
+        let path = paths[p]
+        if os.dirExists(path):
+            continue
+        let rel = relPathFromRoot(path, absRoot)
+        if rel == nil || len(rel) == 0:
+            continue
+        let relNorm = normalizePathSlashes(rel)
+        if shouldExcludePath(relNorm, excludes):
+            continue
+        let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+        if result.IsErr(dataRes):
+            return result.Err[SourceManifest](result.Error(dataRes))
+        let data = result.Value(dataRes)
+        let cidRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+        if result.IsErr(cidRes):
+            return result.Err[SourceManifest](result.Error(cidRes))
+        let cidText = dcid.cidText(result.Value(cidRes))
+        if cidText == nil || len(cidText) == 0:
+            return result.Err[SourceManifest]("pkg-source: cid encode failed")
+        add[SourceFile](files, SourceFile(path: relNorm, cidText: cidText, sizeBytes: int64(bytes.bytesLen(data))))
+    sortSourceFiles(files)
+    var manifest: SourceManifest
+    manifest.kind = PkgSourceManifestKind
+    manifest.packageId = packageId
+    manifest.createdTs = times.now().format("unix")
+    manifest.sourceAddrs = sourceAddrs
+    manifest.files = files
+    return result.Ok[SourceManifest](manifest)
+
+fn manifestToJson(manifest: SourceManifest): json.JsonNode =
+    let root = json.newJObject()
+    root["type"] = json.newJString(manifest.kind)
+    root["package_id"] = json.newJString(manifest.packageId)
+    if manifest.createdTs != nil && len(manifest.createdTs) > 0:
+        root["created_ts"] = json.newJString(manifest.createdTs)
+    let addrs = json.newJArray()
+    for i in 0..<manifest.sourceAddrs.len:
+        let addr = manifest.sourceAddrs[i]
+        if addr != nil && len(addr) > 0:
+            addrs.add(json.newJString(addr))
+    root["source_addrs"] = addrs
+    let files = json.newJArray()
+    for j in 0..<manifest.files.len:
+        let f = manifest.files[j]
+        let node = json.newJObject()
+        node["path"] = json.newJString(f.path)
+        node["cid"] = json.newJString(f.cidText)
+        node["size"] = json.newJInt(f.sizeBytes)
+        files.add(node)
+    root["files"] = files
+    root
+
+fn manifestToText(manifest: SourceManifest): str =
+    return json.pretty(manifestToJson(manifest))
+
+fn parseSourceManifestNode(root: json.JsonNode): result.Result[SourceManifest] =
+    if root == nil || root.kind != json.JObject:
+        return result.Err[SourceManifest]("pkg-source: manifest invalid")
+    let kind = jparse.getStringField(root, "type", "")
+    if kind != PkgSourceManifestKind:
+        return result.Err[SourceManifest]("pkg-source: manifest type mismatch")
+    var manifest: SourceManifest
+    manifest.kind = kind
+    manifest.packageId = jparse.getStringField(root, "package_id", "")
+    manifest.createdTs = jparse.getStringField(root, "created_ts", "")
+    manifest.sourceAddrs = []
+    let addrs = root["source_addrs"]
+    if addrs != nil && addrs.kind == json.JArray:
+        for a in 0..<addrs.a.len:
+            let node = addrs.a[a]
+            if node != nil && node.kind == json.JString:
+                let addr = node.getStr()
+                if addr != nil && len(addr) > 0:
+                    add[str](manifest.sourceAddrs, addr)
+    manifest.files = []
+    let files = root["files"]
+    if files != nil && files.kind == json.JArray:
+        for i in 0..<files.a.len:
+            let node = files.a[i]
+            if node == nil || node.kind != json.JObject:
+                return result.Err[SourceManifest]("pkg-source: file entry invalid")
+            var f: SourceFile
+            f.path = normalizePathSlashes(jparse.getStringField(node, "path", ""))
+            f.cidText = jparse.getStringField(node, "cid", "")
+            f.sizeBytes = jparse.getIntField(node, "size", 0)
+            if f.path == nil || len(f.path) == 0:
+                return result.Err[SourceManifest]("pkg-source: file missing path")
+            if f.cidText == nil || len(f.cidText) == 0:
+                return result.Err[SourceManifest]("pkg-source: file missing cid")
+            add[SourceFile](manifest.files, f)
+    if manifest.packageId == nil || len(manifest.packageId) == 0:
+        return result.Err[SourceManifest]("pkg-source: manifest missing package_id")
+    return result.Ok[SourceManifest](manifest)
+
+fn parseSourceManifestText(content: str): result.Result[SourceManifest] =
+    let parsed: jparse.ParseResult = jparse.parseJsonSafe(content)
+    if ! parsed.ok:
+        return result.Err[SourceManifest](parsed.error)
+    return parseSourceManifestNode(parsed.value)
+
+fn loadSourceManifestFile(path: str): result.Result[SourceManifest] =
+    if path == nil || len(path) == 0:
+        return result.Err[SourceManifest]("pkg-source: missing manifest path")
+    if ! os.fileExists(path):
+        return result.Err[SourceManifest]("pkg-source: manifest not found")
+    let content = os.readFile(path)
+    if content == nil || len(content) == 0:
+        return result.Err[SourceManifest]("pkg-source: manifest empty")
+    return parseSourceManifestText(content)
+
+fn stripCidPrefix(text: str): str =
+    if text == nil || len(text) == 0:
+        return ""
+    if strutil.startsWith(text, "cid://"):
+        return str(ptr_add(text, len("cid://")))
+    if strutil.startsWith(text, "cid:"):
+        return str(ptr_add(text, len("cid:")))
+    return text
+
+fn loadSourceManifestFromStore(root: str, cidRef: str): result.Result[SourceManifest] =
+    let cidText = stripCidPrefix(cidRef)
+    if cidText == nil || len(cidText) == 0:
+        return result.Err[SourceManifest]("pkg-source: missing manifest cid")
+    let store = dstore.initStore(root)
+    let dataRes: result.Result[bytes.Bytes] = dstore.getBytes(store, cidText)
+    if result.IsErr(dataRes):
+        return result.Err[SourceManifest](result.Error(dataRes))
+    let text = bytes.bytesToString(result.Value(dataRes))
+    return parseSourceManifestText(text)
+
+fn storeManifestToStore(root: str, text: str): result.Result[str] =
+    let store = dstore.initStore(root)
+    let cidRes: result.Result[dcid.Cid] = dstore.putContent(store, text)
+    if result.IsErr(cidRes):
+        return result.Err[str](result.Error(cidRes))
+    let cidText = dcid.cidText(result.Value(cidRes))
+    if cidText == nil || len(cidText) == 0:
+        return result.Err[str]("pkg-source: missing manifest cid")
+    return result.Ok[str](cidText)
+
+fn ensureDirPath(path: str) =
+    if path == nil || len(path) == 0:
+        return
+    if os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if parent != nil && len(parent) > 0 && parent != path && ! os.dirExists(parent):
+        ensureDirPath(parent)
+    if ! os.dirExists(path):
+        os.createDir(path)
+
+fn fetchPkgSourceLocal(manifest: SourceManifest, root: str, outDir: str): result.Result[bool] =
+    if outDir == nil || len(outDir) == 0:
+        return result.Err[bool]("pkg-source: missing out dir")
+    let store = dstore.initStore(root)
+    ensureDirPath(outDir)
+    for i in 0..<manifest.files.len:
+        let f = manifest.files[i]
+        if f.path == nil || len(f.path) == 0:
+            return result.Err[bool]("pkg-source: missing file path")
+        if containsPathTraversal(f.path):
+            return result.Err[bool]("pkg-source: invalid file path")
+        if f.cidText == nil || len(f.cidText) == 0:
+            return result.Err[bool]("pkg-source: missing file cid")
+        let dataRes: result.Result[bytes.Bytes] = dstore.getBytes(store, f.cidText)
+        if result.IsErr(dataRes):
+            return result.Err[bool](result.Error(dataRes))
+        let data = result.Value(dataRes)
+        let cidRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+        if result.IsErr(cidRes):
+            return result.Err[bool](result.Error(cidRes))
+        let gotCid = dcid.cidText(result.Value(cidRes))
+        if gotCid != f.cidText:
+            return result.Err[bool]("pkg-source: cid mismatch: " + f.path)
+        let relPath = normalizePathSlashes(f.path)
+        let outPath = os.joinPath(outDir, relPath)
+        let dir = os.parentDir(outPath)
+        if dir != nil && len(dir) > 0:
+            ensureDirPath(dir)
+        let writeRes: result.Result[bool] = fbytes.writeFileBytes(outPath, data)
+        if result.IsErr(writeRes):
+            return result.Err[bool](result.Error(writeRes))
+    return result.Ok[bool](true)

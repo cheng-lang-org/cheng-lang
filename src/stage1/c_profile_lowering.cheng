@@ -1,0 +1,4443 @@
+# c_profile_lowering.cheng
+# Stage1: C-profile lowering for named/default args and `?`.
+import std/strings
+import std/hashmaps
+import cheng/stage1/ast
+import cheng/stage1/diagnostics
+
+@importc("getenv")
+fn lower_c_getenv(name: cstring): str
+
+fn lowerGetEnv(name: str): str =
+    let v: str = lower_c_getenv name
+    if v == nil:
+        return ""
+    return v
+
+fn lowerTrace(msg: str) =
+    if (lowerGetEnv("STAGE1_TRACE_LOWER") == "1"):
+        let line: str = "[lower] " + msg
+        echo line
+        if (lowerGetEnv("STAGE1_TRACE_FLUSH") == "1"):
+            c_fflush get_stdout()
+
+type
+    ParamList =
+        names: str[]
+        types: Node[]
+        defaults: Node[]
+
+type
+    LowerExprResult =
+        expr: Node
+        stmts: Node[]
+
+type
+    ClosureExprResult =
+        expr: Node
+        stmts: Node[]
+        closureType: Node
+
+type
+    IterLoopCtx =
+        breakState: int32
+        continueState: int32
+        parent: IterLoopCtx*
+
+type
+    IterLowerCtx =
+        frameName: str
+        outName: str
+        yieldType: Node
+        captureNames: str[]
+        captureTypes: Node[]
+
+type
+    IterStmtResult =
+        state: int32
+        open: bool
+
+type
+    AsyncLowerCtx =
+        frameName: str
+        stateName: str
+        awaitName: str
+        resultName: str
+        driverName: str
+        retType: Node
+        captureNames: str[]
+        captureTypes: Node[]
+
+type
+    AsyncStmtResult =
+        state: int32
+        open: bool
+var lowerFnNames: str[64]
+var lowerFnNodes: void*[64]
+var lowerTypeNames: str[64]
+var lowerTypeNodes: void*[64]
+var lowerWrapperKeys: str[64]
+var lowerWrapperNames: str[64]
+var lowerFnIndex: hashmaps.HashMapStrInt
+var lowerTypeIndex: hashmaps.HashMapStrInt
+var lowerWrapperIndex: hashmaps.HashMapStrInt
+
+var lowerIterNames: str[32]
+var lowerIterNodes: void*[32]
+var lowerIterIndex: hashmaps.HashMapStrInt
+
+var lowerValueNames: str[64]
+var lowerValueTypes: Node[64]
+var lowerValueScopeStarts: int32[16]
+var lowerValuePrevIndexPlus1: int32[64]
+var lowerValueIndex: hashmaps.HashMapStrInt
+
+var lowerClosureEnvNames: str[32]
+var lowerClosureBodyNames: str[32]
+var lowerClosureTrampNames: str[32]
+var lowerClosureLamPtrs: ptr[32]
+var lowerClosureLamEnvNames: str[32]
+var lowerClosureLamBodyNames: str[32]
+var lowerClosureLamTrampNames: str[32]
+var lowerClosureCounter: int32 = 0
+var lowerClosureTempCounter: int32 = 0
+var lowerClosureDecls: Node[]* = nil
+
+var lowerTempCounter: int32 = 0
+var lowerIterTempCounter: int32 = 0
+var lowerDiags: Diagnostic[]* = nil
+var lowerFilename: str = ""
+var lowerWrappers: Node[]* = nil
+
+fn lower_zeroPos(): SourcePos =
+    var pos: SourcePos
+    return pos
+
+fn lowerSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void* =
+    if idx < 0 || idx >= len0:
+        panic "lowering: seq index out of bounds"
+    let off64: int64 = int64(idx) * int64(elemSize)
+    return ptr_add(buffer, int32(off64))
+
+fn lowerReadStr(seqInst: str[], idx: int32): str =
+    let p: str* = str*(lowerSeqElemPtr(seqInst.buffer, seqInst.len, idx, sizeof str))
+    return *p
+
+fn lowerReadI32(seqInst: int32[], idx: int32): int32 =
+    let p: int32* = int32*(lowerSeqElemPtr(seqInst.buffer, seqInst.len, idx, sizeof int32))
+    return *p
+
+fn lowerReadNode(seqInst: Node[], idx: int32): Node =
+    let p: Node* = Node*(lowerSeqElemPtr(seqInst.buffer, seqInst.len, idx, sizeof Node))
+    return *p
+
+fn lowerReadPtr(seqInst: ptr[], idx: int32): ptr =
+    let p: ptr* = ptr*(lowerSeqElemPtr(seqInst.buffer, seqInst.len, idx, sizeof ptr))
+    return *p
+
+fn suffixAfter(s: str, prefix: str): str =
+    if !hasPrefix(s, prefix):
+        return ""
+    return str(ptr_add(s, len prefix))
+
+fn lowerUnqualifyName(s: str): str =
+    if s == nil || len s == 0:
+        return ""
+    let __for_start_i = len(s) - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        if s[i] == '.':
+            if i + 1 < len(s):
+                return str(ptr_add(s, i + 1))
+            return ""
+    return s
+
+fn lowerClearMaps() =
+    lowerFnNames.len = 0
+    lowerFnNodes.len = 0
+    lowerTypeNames.len = 0
+    lowerTypeNodes.len = 0
+    lowerWrapperKeys.len = 0
+    lowerWrapperNames.len = 0
+    if lowerFnIndex.mask == 0:
+        lowerFnIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(lowerFnIndex)
+    if lowerTypeIndex.mask == 0:
+        lowerTypeIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(lowerTypeIndex)
+    if lowerWrapperIndex.mask == 0:
+        lowerWrapperIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(lowerWrapperIndex)
+    lowerIterNames.len = 0
+    lowerIterNodes.len = 0
+    if lowerIterIndex.mask == 0:
+        lowerIterIndex = hashmaps.hashMapStrIntInit(128)
+    else:
+        hashmaps.hashMapStrIntClear(lowerIterIndex)
+    lowerValueClear()
+
+fn lowerValueClear() =
+    lowerValueNames.len = 0
+    lowerValueTypes.len = 0
+    lowerValueScopeStarts.len = 0
+    lowerValuePrevIndexPlus1.len = 0
+    if lowerValueIndex.mask == 0:
+        lowerValueIndex = hashmaps.hashMapStrIntInit(256)
+    else:
+        hashmaps.hashMapStrIntClear(lowerValueIndex)
+
+fn lowerValueScopePush() =
+    add(lowerValueScopeStarts, lowerValueNames.len)
+
+fn lowerValueScopePop() =
+    if lowerValueScopeStarts.len <= 0:
+        return
+    let start: int32 = lowerReadI32(lowerValueScopeStarts, lowerValueScopeStarts.len - 1)
+    lowerValueScopeStarts.len = lowerValueScopeStarts.len - 1
+    let __for_start_i = lowerValueNames.len - 1
+    for __for_rev_i in 0..(__for_start_i - (start)):
+        let i = __for_start_i - __for_rev_i
+        let nm: str = lowerReadStr(lowerValueNames, i)
+        let prevIndexPlus1: int32 = lowerReadI32(lowerValuePrevIndexPlus1, i)
+        hashmaps.hashMapStrIntPut(lowerValueIndex, nm, prevIndexPlus1)
+    lowerValueNames.len = start
+    lowerValueTypes.len = start
+    lowerValuePrevIndexPlus1.len = start
+
+fn lowerValueAdd(name: str, ty: Node) =
+    if name == nil || len name == 0:
+        return
+    if ty == nil || ty.kind == nkEmpty:
+        return
+    var found: bool = false
+    let prevIndexPlus1: int32 = hashmaps.hashMapStrIntGetEx(lowerValueIndex, name, found)
+    if found:
+        add(lowerValuePrevIndexPlus1, prevIndexPlus1)
+    else:
+        add(lowerValuePrevIndexPlus1, int32(0))
+    add(lowerValueNames, name)
+    add(lowerValueTypes, ty)
+    let idx: int32 = lowerValueNames.len - 1
+    hashmaps.hashMapStrIntPut(lowerValueIndex, name, idx + 1)
+
+fn lowerValueLookup(name: str): Node =
+    if name == nil || len name == 0:
+        return nil
+    var found: bool = false
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(lowerValueIndex, name, found)
+    if !found || idxPlus1 <= 0:
+        return nil
+    let idx: int32 = idxPlus1 - 1
+    if idx < 0 || idx >= lowerValueTypes.len:
+        return nil
+    return lowerReadNode(lowerValueTypes, idx)
+
+fn lowerAddError(pos: SourcePos, msg: str) =
+    if lowerDiags == nil:
+        return
+    var fileName: str = lowerFilename
+    if fileName == "":
+        fileName = "stdin"
+    var d: Diagnostic
+    d.severity = svError
+    d.filename = fileName
+    d.line = pos.line
+    d.col = pos.col
+    d.message = msg
+    add(lowerDiags, d)
+
+fn lowerMapHasIndex(index: hashmaps.HashMapStrInt, key: str): bool =
+    if key == nil || len key == 0:
+        return false
+    var found: bool = false
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetMut(index, key, found)
+    return found && idxPlus1 > 0
+
+fn lowerMapPutIndex(keys: var str[], vals: var ptr[], index: var hashmaps.HashMapStrInt, key: str, val: Node) =
+    if key == nil || len key == 0:
+        return
+    var found: bool = false
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetMut(index, key, found)
+    if found && idxPlus1 > 0:
+        return
+    add(keys, key)
+    add(vals, void*(val))
+    let idx: int32 = keys.len - 1
+    hashmaps.hashMapStrIntPut(index, key, idx + 1)
+
+fn lowerMapGetIndex(keys: str[], vals: ptr[], index: hashmaps.HashMapStrInt, key: str): Node =
+    if key == nil || len key == 0:
+        return nil
+    var found: bool = false
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(index, key, found)
+    if !found || idxPlus1 <= 0:
+        return nil
+    let idx: int32 = idxPlus1 - 1
+    if idx < 0 || idx >= vals.len:
+        return nil
+    return Node(vals[idx])
+
+fn lowerMapHas(keys: str[], key: str): bool =
+    for i in 0..<keys.len:
+        if (keys[i] == key):
+            return true
+    return false
+
+fn lowerMapPut(keys: var str[], vals: var ptr[], key: str, val: Node) =
+    add(keys, key)
+    add(vals, void*(val))
+
+fn lowerMapGet(keys: str[], vals: ptr[], key: str): Node =
+    for i in 0..<keys.len:
+        if (keys[i] == key):
+            return Node(vals[i])
+    return nil
+
+fn lowerClosureClear() =
+    lowerClosureEnvNames.len = 0
+    lowerClosureBodyNames.len = 0
+    lowerClosureTrampNames.len = 0
+    lowerClosureLamPtrs.len = 0
+    lowerClosureLamEnvNames.len = 0
+    lowerClosureLamBodyNames.len = 0
+    lowerClosureLamTrampNames.len = 0
+    lowerClosureCounter = 0
+    lowerClosureTempCounter = 0
+
+fn lowerClosureIndex(envName: str): int32 =
+    if envName == nil || len envName == 0:
+        return -1
+    for i in 0..<lowerClosureEnvNames.len:
+        if lowerReadStr(lowerClosureEnvNames, i) == envName:
+            return i
+    return -1
+
+fn lowerClosureRegister(envName: str, bodyName: str, trampName: str) =
+    if envName == nil || len envName == 0:
+        return
+    if lowerClosureIndex(envName) >= 0:
+        return
+    add(lowerClosureEnvNames, envName)
+    add(lowerClosureBodyNames, bodyName)
+    add(lowerClosureTrampNames, trampName)
+
+fn lowerClosureLamIndex(lam: Node): int32 =
+    if lam == nil:
+        return -1
+    let ptrVal: ptr = ptr(lam)
+    for i in 0..<lowerClosureLamPtrs.len:
+        if lowerReadPtr(lowerClosureLamPtrs, i) == ptrVal:
+            return i
+    return -1
+
+fn lowerClosureLamRegister(lam: Node, envName: str, bodyName: str, trampName: str) =
+    if lam == nil:
+        return
+    add(lowerClosureLamPtrs, ptr(lam))
+    add(lowerClosureLamEnvNames, envName)
+    add(lowerClosureLamBodyNames, bodyName)
+    add(lowerClosureLamTrampNames, trampName)
+
+fn lowerCollectFns(n: Node) =
+    if n == nil:
+        return
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+        if kidCount n > 0:
+            let nameNode: Node = kid(n, 0)
+            let nm: str = stripSpaces(plainName(nameNode))
+            if len nm > 0 && !lowerMapHasIndex(lowerFnIndex, nm):
+                lowerMapPutIndex(lowerFnNames, lowerFnNodes, lowerFnIndex, nm, n)
+    for i in 0..<kidCount n:
+        lowerCollectFns kid(n, i)
+
+fn lowerCollectTypes(n: Node) =
+    if n == nil:
+        return
+    if n.kind == nkTypeDecl && kidCount n > 1:
+        let nameNode: Node = kid(n, 0)
+        let defNode: Node = kid(n, 1)
+        let nm: str = stripSpaces(plainName(nameNode))
+        if len nm > 0 && defNode != nil && defNode.kind == nkObjectDecl:
+            if !lowerMapHasIndex(lowerTypeIndex, nm):
+                lowerMapPutIndex(lowerTypeNames, lowerTypeNodes, lowerTypeIndex, nm, defNode)
+    for i in 0..<kidCount n:
+        lowerCollectTypes kid(n, i)
+
+fn lowerParamListFromFn(fnNode: Node): ParamList =
+    var out: ParamList
+    out.names = []
+    out.types = []
+    out.defaults = []
+    out.names.cap = 4
+    out.types.cap = 4
+    out.defaults.cap = 4
+    if fnNode == nil || kidCount fnNode < 2:
+        return out
+    let paramsNode: Node = kid(fnNode, 1)
+    if paramsNode == nil || paramsNode.kind != nkFormalParams:
+        return out
+    for i in 0..<kidCount paramsNode:
+        let defs: Node = kid(paramsNode, i)
+        if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 0:
+            let nameNode: Node = kid(defs, 0)
+            let nm: str = stripSpaces(plainName(nameNode))
+            var typeNode: Node = nil
+            var defNode: Node = nil
+            if kidCount defs > 1:
+                typeNode = kid(defs, 1)
+            if kidCount defs > 2:
+                defNode = kid(defs, 2)
+            if typeNode == nil:
+                typeNode = newNode(nkEmpty, defs.pos)
+            if defNode == nil:
+                defNode = newNode(nkEmpty, defs.pos)
+            add(out.names, nm)
+            add(out.types, typeNode)
+            add(out.defaults, defNode)
+    return out
+
+fn lowerParamListFromType(typeNode: Node): ParamList =
+    var out: ParamList
+    out.names = []
+    out.types = []
+    out.defaults = []
+    out.names.cap = 4
+    out.types.cap = 4
+    out.defaults.cap = 4
+    if typeNode == nil || typeNode.kind != nkObjectDecl:
+        return out
+    if kidCount typeNode < 2:
+        return out
+    let recList: Node = kid(typeNode, 1)
+    if recList == nil:
+        return out
+    for i in 0..<kidCount recList:
+        let defs: Node = kid(recList, i)
+        if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 0:
+            let nameNode: Node = kid(defs, 0)
+            let nm: str = stripSpaces(plainName(nameNode))
+            var typeNode2: Node = nil
+            var defNode: Node = nil
+            if kidCount defs > 1:
+                typeNode2 = kid(defs, 1)
+            if kidCount defs > 2:
+                defNode = kid(defs, 2)
+            if typeNode2 == nil:
+                typeNode2 = newNode(nkEmpty, defs.pos)
+            if defNode == nil:
+                defNode = newNode(nkEmpty, defs.pos)
+            add(out.names, nm)
+            add(out.types, typeNode2)
+            add(out.defaults, defNode)
+    return out
+
+fn lowerParamIndex(names: str[], name: str): int32 =
+    if name == nil || len name == 0:
+        return -1
+    for i in 0..<names.len:
+        if names[i] == name:
+            return i
+    return -1
+
+fn lowerCloneShallow(n: Node): Node =
+    if n == nil:
+        return nil
+    var out: Node = newNode(n.kind, n.pos)
+    nodeSetIdent(out, n.ident)
+    nodeSetStrVal(out, n.strVal)
+    out.intVal = n.intVal
+    out.floatVal = n.floatVal
+    out.callStyle = n.callStyle
+    return out
+
+fn lowerMakeIdent(name: str, pos: SourcePos): Node =
+    return newIdent(name, pos)
+
+fn lowerMakeDot(baseName: str, field: str, pos: SourcePos): Node =
+    var dot: Node = newNode(nkDotExpr, pos)
+    addSon(dot, newIdent(baseName, pos))
+    addSon(dot, newIdent(field, pos))
+    return dot
+
+fn lowerMakeDotExpr(base: Node, field: str, pos: SourcePos): Node =
+    var dot: Node = newNode(nkDotExpr, pos)
+    addSon(dot, base)
+    addSon(dot, newIdent(field, pos))
+    return dot
+
+fn lowerMakeInfix(op: str, lhs: Node, rhs: Node, pos: SourcePos): Node =
+    var inf: Node = newNode(nkInfix, pos)
+    addSon(inf, newIdent(op, pos))
+    addSon(inf, lhs)
+    addSon(inf, rhs)
+    return inf
+
+fn lowerMakeIntLit(val: int64, pos: SourcePos): Node =
+    return newIntLit(val, pos)
+
+fn lowerMakeBoolLit(val: bool, pos: SourcePos): Node =
+    return newBoolLit(val, pos)
+
+fn lowerMakeNilLit(pos: SourcePos): Node =
+    return newNilLit(pos)
+
+fn lowerMakeVarType(base: Node, pos: SourcePos): Node =
+    var vt: Node = newNode(nkVarTy, pos)
+    addSon(vt, base)
+    return vt
+
+fn lowerMakePtrType(base: Node, pos: SourcePos): Node =
+    var pt: Node = newNode(nkPtrTy, pos)
+    addSon(pt, base)
+    return pt
+
+fn lowerMakeRefType(base: Node, pos: SourcePos): Node =
+    var rt: Node = newNode(nkRefTy, pos)
+    addSon(rt, base)
+    return rt
+
+fn lowerMakeCall(name: str, pos: SourcePos, args: Node[]): Node =
+    var call: Node = newNode(nkCall, pos)
+    call.callStyle = CallStyleParen
+    addSon(call, newIdent(name, pos))
+    for i in 0..<args.len:
+        addSon(call, args[i])
+    return call
+
+fn lowerSeqStrHas(v: str[], key: str): bool =
+    for i in 0..<v.len:
+        if v[i] == key:
+            return true
+    return false
+
+fn lowerSeqStrAdd(v: str[]*, key: str) =
+    if v == nil || key == nil || len key == 0:
+        return
+    if lowerSeqStrHas(*v, key):
+        return
+    add(v, key)
+
+fn lowerClearIterMaps() =
+    lowerIterNames.len = 0
+    lowerIterNodes.len = 0
+    if lowerIterIndex.mask == 0:
+        lowerIterIndex = hashmaps.hashMapStrIntInit(128)
+    else:
+        hashmaps.hashMapStrIntClear(lowerIterIndex)
+
+fn lowerCollectIterators(n: Node) =
+    if n == nil:
+        return
+    if n.kind == nkIteratorDecl:
+        if kidCount n > 0:
+            let nameNode: Node = kid(n, 0)
+            let nm: str = stripSpaces(plainName(nameNode))
+            if len nm > 0 && !lowerMapHasIndex(lowerIterIndex, nm):
+                lowerMapPutIndex(lowerIterNames, lowerIterNodes, lowerIterIndex, nm, n)
+    for i in 0..<kidCount n:
+        lowerCollectIterators kid(n, i)
+
+fn lowerIterLookup(name: str): Node =
+    if len name == 0:
+        return nil
+    return lowerMapGetIndex(lowerIterNames, lowerIterNodes, lowerIterIndex, name)
+
+fn lowerBuildWrapperName(baseName: str, order: int32[]): str =
+    var out: str = baseName + "__wrap"
+    if order.len == 0:
+        return out + "_none"
+    for i in 0..<order.len:
+        out = out + "_"
+        out = out + intToStr(order[i])
+    return out
+
+fn lowerWrapperNameFor(key: str, baseName: str, order: int32[]): str =
+    var found: bool = false
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(lowerWrapperIndex, key, found)
+    if found && idxPlus1 > 0 && idxPlus1 <= lowerWrapperNames.len:
+        return lowerReadStr(lowerWrapperNames, idxPlus1 - 1)
+    let name: str = lowerBuildWrapperName(baseName, order)
+    add(lowerWrapperKeys, key)
+    add(lowerWrapperNames, name)
+    hashmaps.hashMapStrIntPut(lowerWrapperIndex, key, lowerWrapperNames.len)
+    return name
+
+fn lowerIsVoidType(n: Node): bool =
+    if n == nil || n.kind == nkEmpty:
+        return true
+    if (n.kind == nkIdent || n.kind == nkSymbol) && stripSpaces(n.ident) == "void":
+        return true
+    return false
+
+fn lowerBuildWrapper(fnNode: Node, typeNode: Node, baseName: str, order: int32[], params: ParamList, assigned: Node[], pos: SourcePos): Node =
+    var wrapper: Node = newNode(nkFnDecl, pos)
+    if fnNode != nil:
+        wrapper.kind = fnNode.kind
+    let wrapperName: str = lowerBuildWrapperName(baseName, order)
+    addSon(wrapper, newIdent(wrapperName, pos))
+    var fp: Node = newNode(nkFormalParams, pos)
+    for oi in 0..<order.len:
+        let pidx: int32 = order[oi]
+        if pidx >= 0 && pidx < params.names.len:
+            let pname: str = params.names[pidx]
+            let ptype: Node = params.types[pidx]
+            var defs: Node = newNode(nkIdentDefs, pos)
+            addSon(defs, newIdent(pname, pos))
+            if ptype != nil:
+                addSon(defs, cloneTree ptype)
+            else:
+                addSon(defs, newNode(nkEmpty, pos))
+            addSon(defs, newNode(nkEmpty, pos))
+            addSon(fp, defs)
+    addSon(wrapper, fp)
+    var retType: Node = newNode(nkEmpty, pos)
+    if fnNode != nil && kidCount fnNode > 2:
+        retType = kid(fnNode, 2)
+    elif typeNode != nil:
+        retType = newIdent(baseName, pos)
+    addSon(wrapper, cloneTree retType)
+    var body: Node = newNode(nkStmtList, pos)
+    for pi in 0..<params.names.len:
+        if assigned[pi] == nil:
+            let pname2: str = params.names[pi]
+            let ptype2: Node = params.types[pi]
+            let pdef: Node = params.defaults[pi]
+            if pdef != nil && pdef.kind != nkEmpty:
+                var letNode: Node = newNode(nkLet, pos)
+                addSon(letNode, newIdent(pname2, pos))
+                if ptype2 != nil:
+                    addSon(letNode, cloneTree ptype2)
+                else:
+                    addSon(letNode, newNode(nkEmpty, pos))
+                addSon(letNode, cloneTree pdef)
+                addSon(letNode, newNode(nkEmpty, pos))
+                addSon(body, letNode)
+            else:
+                lowerAddError(pos, "C-profile lowering: missing default for parameter " + pname2)
+    var callNode: Node = newNode(nkCall, pos)
+    addSon(callNode, newIdent(baseName, pos))
+    for ai in 0..<params.names.len:
+        let aname: str = params.names[ai]
+        addSon(callNode, newIdent(aname, pos))
+    if lowerIsVoidType(retType):
+        addSon(body, callNode)
+    else:
+        var retNode: Node = newNode(nkReturn, pos)
+        addSon(retNode, callNode)
+        addSon(body, retNode)
+    addSon(wrapper, body)
+    addSon(wrapper, newNode(nkEmpty, pos))
+    return wrapper
+
+fn lowerCallTargetName(callee: Node): str =
+    if callee == nil:
+        return ""
+    let base: Node = callee
+    if base.kind == nkPar && kidCount base == 1:
+        return lowerCallTargetName kid(base, 0)
+    if base.kind == nkIdent || base.kind == nkSymbol || base.kind == nkPostfix:
+        return lowerUnqualifyName(stripSpaces(plainName(base)))
+    if base.kind == nkDotExpr:
+        return lowerUnqualifyName(stripSpaces(plainName(base)))
+    if base.kind == nkBracketExpr && kidCount base > 0:
+        return lowerUnqualifyName(stripSpaces(plainName(kid(base, 0))))
+    return ""
+
+fn lowerCallParamList(name: str): ParamList =
+    var out: ParamList
+    if len name == 0:
+        return out
+    let fnNode: Node = lowerMapGetIndex(lowerFnNames, lowerFnNodes, lowerFnIndex, name)
+    if fnNode != nil:
+        return lowerParamListFromFn fnNode
+    let typeNode: Node = lowerMapGetIndex(lowerTypeNames, lowerTypeNodes, lowerTypeIndex, name)
+    if typeNode != nil:
+        return lowerParamListFromType typeNode
+    return out
+
+fn lowerNamedExpr(n: Node): Node
+fn lowerNamedStmt(n: Node, wrappers: Node[]*): Node
+fn lowerNamedCall(n: Node, wrappers: Node[]*): Node
+
+fn lowerNamedExpr(n: Node): Node =
+    if n == nil:
+        return nil
+    case n.kind
+    of nkCall:
+        var changed: bool = false
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
+            let oldChild: Node = kid(n, i)
+            var child: Node = oldChild
+            if i == 0:
+                child = lowerNamedExpr(oldChild)
+            else:
+                if oldChild != nil && oldChild.kind == nkCallArg:
+                    if kidCount oldChild > 1:
+                        let nameNode: Node = kid(oldChild, 0)
+                        let valNode: Node = kid(oldChild, 1)
+                        let newVal: Node = lowerNamedExpr(valNode)
+                        if newVal != valNode:
+                            var outArg: Node = newNode(nkCallArg, oldChild.pos)
+                            addSon(outArg, nameNode)
+                            addSon(outArg, newVal)
+                            child = outArg
+                        else:
+                            child = oldChild
+                    elif kidCount oldChild > 0:
+                        let valNode2: Node = kid(oldChild, 0)
+                        let newVal2: Node = lowerNamedExpr(valNode2)
+                        if newVal2 != valNode2:
+                            var outArg2: Node = newNode(nkCallArg, oldChild.pos)
+                            addSon(outArg2, newVal2)
+                            child = outArg2
+                        else:
+                            child = oldChild
+                    else:
+                        child = oldChild
+                else:
+                    child = lowerNamedExpr(oldChild)
+            if child != oldChild:
+                changed = true
+            add(outKids, child)
+        var outCall: Node = n
+        if changed:
+            outCall = lowerCloneShallow n
+            for k in 0..<outKids.len:
+                addSon(outCall, outKids[k])
+        if lowerWrappers != nil:
+            return lowerNamedCall(outCall, lowerWrappers)
+        return outCall
+    of nkCallArg:
+        if kidCount n > 1:
+            let nameNode: Node = kid(n, 0)
+            let valNode: Node = kid(n, 1)
+            let newVal: Node = lowerNamedExpr(valNode)
+            if newVal != valNode:
+                var outArg: Node = newNode(nkCallArg, n.pos)
+                addSon(outArg, nameNode)
+                addSon(outArg, newVal)
+                return outArg
+        return n
+    of nkLambda:
+        var changed: bool = false
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
+            let oldChild: Node = kid(n, i)
+            var child: Node = oldChild
+            if i == 3:
+                child = lowerNamedStmt(oldChild, nil)
+            else:
+                child = lowerNamedExpr(oldChild)
+            if child != oldChild:
+                changed = true
+            add(outKids, child)
+        if !changed:
+            return n
+        var out: Node = lowerCloneShallow n
+        for k in 0..<outKids.len:
+            addSon(out, outKids[k])
+        return out
+    else:
+        var changed2: bool = false
+        var outKids2: Node[]
+        outKids2.cap = kidCount n
+        for j in 0..<kidCount n:
+            let oldChild2: Node = kid(n, j)
+            let child2: Node = lowerNamedExpr(oldChild2)
+            if child2 != oldChild2:
+                changed2 = true
+            add(outKids2, child2)
+        if !changed2:
+            return n
+        var out2: Node = lowerCloneShallow n
+        for k2 in 0..<outKids2.len:
+            addSon(out2, outKids2[k2])
+        return out2
+
+fn lowerNamedCall(n: Node, wrappers: Node[]*): Node =
+    if n == nil || n.kind != nkCall:
+        return n
+    if kidCount n == 0:
+        return n
+    let callee: Node = kid(n, 0)
+    let baseName: str = lowerCallTargetName(callee)
+    if baseName == "":
+        return n
+    let params: ParamList = lowerCallParamList baseName
+    if params.names.len == 0:
+        return n
+    let paramCount: int32 = params.names.len
+    var assigned: Node[]
+    assigned.len = int(paramCount)
+    var order: int32[]
+    order.cap = kidCount(n) - 1
+    var posIdx: int32 = 0
+    var sawNamed: bool = false
+    for argIndex in 1..<kidCount n:
+        let arg: Node = kid(n, argIndex)
+        if arg != nil && arg.kind == nkCallArg && kidCount arg > 1:
+            sawNamed = true
+            let nameNode: Node = kid(arg, 0)
+            let valNode: Node = kid(arg, 1)
+            let argName: str = stripSpaces(plainName(nameNode))
+            let pidx: int32 = lowerParamIndex(params.names, argName)
+            if pidx < 0 || pidx >= paramCount:
+                return n
+            if assigned[pidx] != nil:
+                return n
+            assigned[pidx] = valNode
+            add(order, pidx)
+        else:
+            for __for_guard_posIdx in 0..<paramCount:
+                if !(posIdx < paramCount && assigned[posIdx] != nil):
+                    break
+                posIdx = posIdx + 1
+            if posIdx >= paramCount:
+                return n
+            var valNode2: Node = arg
+            if arg != nil && arg.kind == nkCallArg && kidCount arg > 0:
+                valNode2 = kid(arg, 0)
+            assigned[posIdx] = valNode2
+            add(order, posIdx)
+            posIdx = posIdx + 1
+    var hasMissing: bool = false
+    for mi in 0..<paramCount:
+        if assigned[mi] == nil:
+            let defNode: Node = params.defaults[mi]
+            if defNode != nil && defNode.kind != nkEmpty:
+                hasMissing = true
+            else:
+                return n
+    if !sawNamed && !hasMissing:
+        return n
+    var key: str = baseName + "|"
+    for ki in 0..<order.len:
+        if ki > 0:
+            key = key + ","
+        key = key + intToStr(order[ki])
+    let exists: bool = lowerMapHasIndex(lowerWrapperIndex, key)
+    let wrapperName: str = lowerWrapperNameFor(key, baseName, order)
+    if !exists:
+        let fnNode: Node = lowerMapGetIndex(lowerFnNames, lowerFnNodes, lowerFnIndex, baseName)
+        let typeNode: Node = lowerMapGetIndex(lowerTypeNames, lowerTypeNodes, lowerTypeIndex, baseName)
+        let wrapper: Node = lowerBuildWrapper(fnNode, typeNode, baseName, order, params, assigned, n.pos)
+        add(wrappers, wrapper)
+    var newCall: Node = newNode(nkCall, n.pos)
+    newCall.callStyle = n.callStyle
+    addSon(newCall, newIdent(wrapperName, n.pos))
+    for ai2 in 1..<kidCount n:
+        let arg2: Node = kid(n, ai2)
+        if arg2 != nil && arg2.kind == nkCallArg && kidCount arg2 > 1:
+            addSon(newCall, kid(arg2, 1))
+        elif arg2 != nil && arg2.kind == nkCallArg && kidCount arg2 > 0:
+            addSon(newCall, kid(arg2, 0))
+        else:
+            addSon(newCall, arg2)
+    return newCall
+
+fn lowerNamedStmt(n: Node, wrappers: Node[]*): Node =
+    if n == nil:
+        return nil
+    case n.kind
+    of nkModule, nkStmtList:
+        var changed: bool = false
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
+            let oldChild: Node = kid(n, i)
+            let child: Node = lowerNamedStmt(oldChild, wrappers)
+            if child != oldChild:
+                changed = true
+            if child != nil:
+                add(outKids, child)
+        if !changed:
+            return n
+        var out: Node = lowerCloneShallow n
+        for k in 0..<outKids.len:
+            addSon(out, outKids[k])
+        return out
+    of nkFnDecl, nkIteratorDecl:
+        var changed2: bool = false
+        var outKids2: Node[]
+        outKids2.cap = kidCount n
+        for i2 in 0..<kidCount n:
+            let oldChild2: Node = kid(n, i2)
+            var child2: Node = oldChild2
+            if i2 == 1 && oldChild2 != nil && oldChild2.kind == nkFormalParams:
+                var fp: Node = oldChild2
+                var fpChanged: bool = false
+                var fpKids: Node[]
+                fpKids.cap = kidCount fp
+                for pi in 0..<kidCount fp:
+                    let defs: Node = kid(fp, pi)
+                    var defsOut: Node = defs
+                    if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 2:
+                        let nameNode: Node = kid(defs, 0)
+                        let typeNode: Node = kid(defs, 1)
+                        let defNode: Node = kid(defs, 2)
+                        let newDef: Node = lowerNamedExpr(defNode)
+                        if newDef != defNode:
+                            defsOut = newNode(nkIdentDefs, defs.pos)
+                            addSon(defsOut, nameNode)
+                            addSon(defsOut, typeNode)
+                            addSon(defsOut, newDef)
+                            fpChanged = true
+                    add(fpKids, defsOut)
+                if fpChanged:
+                    fp = newNode(nkFormalParams, oldChild2.pos)
+                    for pk in 0..<fpKids.len:
+                        addSon(fp, fpKids[pk])
+                    child2 = fp
+                    changed2 = true
+            elif i2 == 3:
+                child2 = lowerNamedStmt(oldChild2, wrappers)
+                if child2 != oldChild2:
+                    changed2 = true
+            else:
+                child2 = lowerNamedExpr(oldChild2)
+                if child2 != oldChild2:
+                    changed2 = true
+            add(outKids2, child2)
+        if !changed2:
+            return n
+        var out2: Node = lowerCloneShallow n
+        for k2 in 0..<outKids2.len:
+            addSon(out2, outKids2[k2])
+        return out2
+    else:
+        return lowerNamedExpr(n)
+
+fn lowerNamedDefault(root: Node): Node =
+    if root == nil:
+        return nil
+    lowerWrappers = nil
+    var pre: Node = lowerNamedStmt(root, nil)
+    lowerWrappers = nil
+    lowerClearMaps()
+    if pre != nil:
+        lowerCollectFns pre
+        lowerCollectTypes pre
+    var wrappers: Node[8]
+    lowerWrappers = &wrappers
+    var lowered: Node = lowerNamedStmt(pre, &wrappers)
+    lowerWrappers = nil
+    if wrappers.len == 0:
+        return lowered
+    var out: Node = lowerCloneShallow lowered
+    for i in 0..<kidCount lowered:
+        addSon(out, kid(lowered, i))
+    for wi in 0..<wrappers.len:
+        addSon(out, wrappers[wi])
+    return out
+
+fn closureExprResult(expr: Node): ClosureExprResult =
+    var out: ClosureExprResult
+    out.expr = expr
+    out.stmts = []
+    out.closureType = nil
+    return out
+
+fn lowerCastToVoidPtr(expr: Node, pos: SourcePos): Node =
+    var voidType: Node = newIdent("void", pos)
+    var voidPtr: Node = lowerMakePtrType(voidType, pos)
+    var call: Node = newNode(nkCall, pos)
+    call.callStyle = CallStyleParen
+    addSon(call, voidPtr)
+    addSon(call, expr)
+    return call
+
+fn lowerClosureExpr(n: Node): ClosureExprResult =
+    if n == nil:
+        return closureExprResult(nil)
+    if n.kind == nkPar && kidCount n == 1:
+        let innerRes: ClosureExprResult = lowerClosureExpr(kid(n, 0))
+        if innerRes.expr == kid(n, 0) && innerRes.stmts.len == 0 && innerRes.closureType == nil:
+            return closureExprResult(n)
+        var par: Node = newNode(nkPar, n.pos)
+        addSon(par, innerRes.expr)
+        var outPar: ClosureExprResult = innerRes
+        outPar.expr = par
+        return outPar
+    case n.kind
+    of nkIdent, nkSymbol:
+        var outId: ClosureExprResult = closureExprResult(n)
+        let nm: str = stripSpaces(plainName(n))
+        let ty: Node = lowerValueLookup nm
+        if lowerClosureEnvNameFromType(ty) != "":
+            outId.closureType = ty
+        return outId
+    of nkLambda:
+        var capNames: str[4]
+        var capTypes: Node[4]
+        lowerCollectCaptures(n, &capNames, &capTypes)
+        if capNames.len == 0:
+            let simpleName: str = "__cheng_lambda_" + intToStr(lowerClosureCounter)
+            lowerClosureCounter = lowerClosureCounter + 1
+            var paramsNode: Node = nil
+            if kidCount n > 1:
+                paramsNode = kid(n, 1)
+            var retNode: Node = nil
+            if kidCount n > 2:
+                retNode = kid(n, 2)
+            var bodyNode: Node = nil
+            if kidCount n > 3:
+                bodyNode = kid(n, 3)
+            var decl: Node = newNode(nkFnDecl, n.pos)
+            if n != nil && n.strVal != nil && len n.strVal > 0:
+                nodeSetStrVal(decl, n.strVal)
+            elif lowerFilename != nil && len lowerFilename > 0:
+                nodeSetStrVal(decl, lowerFilename)
+            addSon(decl, newIdent(simpleName, n.pos))
+            if paramsNode != nil:
+                addSon(decl, cloneTree paramsNode)
+            else:
+                addSon(decl, newNode(nkFormalParams, n.pos))
+            if retNode != nil:
+                addSon(decl, cloneTree retNode)
+            else:
+                addSon(decl, newNode(nkEmpty, n.pos))
+            addSon(decl, cloneTree bodyNode)
+            addSon(decl, newNode(nkEmpty, n.pos))
+            addSon(decl, newNode(nkEmpty, n.pos))
+            if lowerClosureDecls != nil:
+                add(lowerClosureDecls, decl)
+            return closureExprResult(newIdent(simpleName, n.pos))
+        let infoIdx: int32 = lowerEnsureClosureInfo(n, capNames, capTypes)
+        var envName: str = ""
+        var bodyName: str = ""
+        var trampName: str = ""
+        if infoIdx >= 0:
+            envName = lowerReadStr(lowerClosureLamEnvNames, infoIdx)
+            bodyName = lowerReadStr(lowerClosureLamBodyNames, infoIdx)
+            trampName = lowerReadStr(lowerClosureLamTrampNames, infoIdx)
+        let envVarName: str = envName + "_val_" + intToStr(lowerClosureTempCounter)
+        lowerClosureTempCounter = lowerClosureTempCounter + 1
+        var envVar: Node = newNode(nkVar, n.pos)
+        addSon(envVar, newIdent(envVarName, n.pos))
+        addSon(envVar, newIdent(envName, n.pos))
+        addSon(envVar, newNode(nkEmpty, n.pos))
+        addSon(envVar, newNode(nkEmpty, n.pos))
+        var outRes: ClosureExprResult = closureExprResult(newIdent(envVarName, n.pos))
+        add(outRes.stmts, envVar)
+        for ci in 0..<capNames.len:
+            let cname: str = capNames[ci]
+            var asn: Node = newNode(nkAsgn, n.pos)
+            addSon(asn, lowerMakeDot(envVarName, cname, n.pos))
+            addSon(asn, newIdent(cname, n.pos))
+            add(outRes.stmts, asn)
+        var addrArgs: Node[1]
+        add(addrArgs, newIdent(envVarName, n.pos))
+        outRes.expr = lowerMakeCall("__addr", n.pos, addrArgs)
+        var envTypeNode: Node = lowerMakePtrType(newIdent(envName, n.pos), n.pos)
+        outRes.closureType = envTypeNode
+        return outRes
+    of nkCall:
+        if kidCount n == 0:
+            return closureExprResult(n)
+        let calleeNode: Node = kid(n, 0)
+        let baseName: str = lowerCallTargetName(calleeNode)
+        var fnNode: Node = nil
+        if baseName != "":
+            fnNode = lowerMapGetIndex(lowerFnNames, lowerFnNodes, lowerFnIndex, baseName)
+        if fnNode != nil && lowerFnHasImportc(fnNode):
+            var outKids: Node[]
+            outKids.cap = kidCount n
+            var outStmts: Node[]
+            let calleeRes: ClosureExprResult = lowerClosureExpr(calleeNode)
+            lowerAppendStmts(&outStmts, calleeRes.stmts)
+            add(outKids, calleeRes.expr)
+            let params: ParamList = lowerParamListFromFn(fnNode)
+            for argIndex in 1..<kidCount n:
+                let argNode: Node = kid(n, argIndex)
+                var argExpr: Node = argNode
+                var argNameNode: Node = nil
+                if argNode != nil && argNode.kind == nkCallArg && kidCount argNode > 1:
+                    argNameNode = kid(argNode, 0)
+                    argExpr = kid(argNode, 1)
+                let argRes: ClosureExprResult = lowerClosureExpr(argExpr)
+                lowerAppendStmts(&outStmts, argRes.stmts)
+                let paramIdx: int32 = argIndex - 1
+                var paramTy: Node = nil
+                if paramIdx >= 0 && paramIdx < params.types.len:
+                    paramTy = params.types[paramIdx]
+                if lowerIsCallbackType(paramTy):
+                    if paramIdx + 1 >= params.types.len:
+                        lowerAddError(n.pos, "[C-Profile] not-mapped: callback without ctx param (FULLC.F04). hint: add ctx param and pass closure env.")
+                    else:
+                        var closureTy: Node = argRes.closureType
+                        if closureTy == nil && argExpr != nil && (argExpr.kind == nkIdent || argExpr.kind == nkSymbol):
+                            let nm: str = stripSpaces(plainName(argExpr))
+                            closureTy = lowerValueLookup nm
+                        let trampName: str = lowerClosureTrampNameFromType(closureTy)
+                        if trampName != "":
+                            add(outKids, newIdent(trampName, n.pos))
+                            var ctxExpr: Node = argRes.expr
+                            ctxExpr = lowerCastToVoidPtr(ctxExpr, n.pos)
+                            let hasCtxArg: bool = argIndex + 1 < kidCount n
+                            if !hasCtxArg:
+                                lowerAddError(n.pos, "[C-Profile] not-mapped: callback without ctx argument (FULLC.F04). hint: pass ctx env argument at call site.")
+                            if hasCtxArg:
+                            add(outKids, ctxExpr)
+                            continue
+                if argNameNode != nil:
+                    var outArg: Node = newNode(nkCallArg, n.pos)
+                    addSon(outArg, argNameNode)
+                    addSon(outArg, argRes.expr)
+                    add(outKids, outArg)
+                else:
+                    add(outKids, argRes.expr)
+            var outCall: Node = lowerCloneShallow n
+            for i0 in 0..<outKids.len:
+                addSon(outCall, outKids[i0])
+            var outResImp: ClosureExprResult = closureExprResult(outCall)
+            outResImp.stmts = outStmts
+            return outResImp
+        let calleeRes2: ClosureExprResult = lowerClosureExpr(calleeNode)
+        var outKids2: Node[]
+        outKids2.cap = kidCount n
+        var outStmts2: Node[]
+        lowerAppendStmts(&outStmts2, calleeRes2.stmts)
+        add(outKids2, calleeRes2.expr)
+        for ai in 1..<kidCount n:
+            let arg2: Node = kid(n, ai)
+            var argExpr2: Node = arg2
+            var argName2: Node = nil
+            if arg2 != nil && arg2.kind == nkCallArg && kidCount arg2 > 1:
+                argName2 = kid(arg2, 0)
+                argExpr2 = kid(arg2, 1)
+            let argRes2: ClosureExprResult = lowerClosureExpr(argExpr2)
+            lowerAppendStmts(&outStmts2, argRes2.stmts)
+            if argName2 != nil:
+                var outArg2: Node = newNode(nkCallArg, n.pos)
+                addSon(outArg2, argName2)
+                addSon(outArg2, argRes2.expr)
+                add(outKids2, outArg2)
+            else:
+                add(outKids2, argRes2.expr)
+        var calleeTy: Node = calleeRes2.closureType
+        let calleeExpr2: Node = calleeRes2.expr
+        if calleeTy == nil && calleeExpr2 != nil && (calleeExpr2.kind == nkIdent || calleeExpr2.kind == nkSymbol):
+            let nm2: str = stripSpaces(plainName(calleeExpr2))
+            calleeTy = lowerValueLookup nm2
+        let bodyName2: str = lowerClosureBodyNameFromType(calleeTy)
+        if bodyName2 != "":
+            var callArgs2: Node[]
+            callArgs2.cap = kidCount n
+            add(callArgs2, calleeRes2.expr)
+            for bi in 1..<outKids2.len:
+                add(callArgs2, outKids2[bi])
+            var bodyCall2: Node = lowerMakeCall(bodyName2, n.pos, callArgs2)
+            var outResCall: ClosureExprResult = closureExprResult(bodyCall2)
+            outResCall.stmts = outStmts2
+            return outResCall
+        var outCall2: Node = lowerCloneShallow n
+        for k in 0..<outKids2.len:
+            addSon(outCall2, outKids2[k])
+        var outRes2: ClosureExprResult = closureExprResult(outCall2)
+        outRes2.stmts = outStmts2
+        return outRes2
+    of nkCallArg:
+        if kidCount n > 1:
+            let nameNode: Node = kid(n, 0)
+            let valNode: Node = kid(n, 1)
+            let res: ClosureExprResult = lowerClosureExpr(valNode)
+            if res.expr != valNode:
+                var outArg3: Node = newNode(nkCallArg, n.pos)
+                addSon(outArg3, nameNode)
+                addSon(outArg3, res.expr)
+                var outRes3: ClosureExprResult = res
+                outRes3.expr = outArg3
+                return outRes3
+            return res
+        return closureExprResult(n)
+    else:
+        var changed: bool = false
+        var outKids3: Node[]
+        outKids3.cap = kidCount n
+        var outStmts3: Node[]
+        for i3 in 0..<kidCount n:
+            let oldChild3: Node = kid(n, i3)
+            let res3: ClosureExprResult = lowerClosureExpr(oldChild3)
+            lowerAppendStmts(&outStmts3, res3.stmts)
+            if res3.expr != oldChild3:
+                changed = true
+            add(outKids3, res3.expr)
+        if !changed && outStmts3.len == 0:
+            return closureExprResult(n)
+        var out3: Node = lowerCloneShallow n
+        for k3 in 0..<outKids3.len:
+            addSon(out3, outKids3[k3])
+        var outRes3b: ClosureExprResult = closureExprResult(out3)
+        outRes3b.stmts = outStmts3
+        return outRes3b
+
+fn lowerClosureStmt(n: Node): Node =
+    if n == nil:
+        return nil
+    case n.kind
+    of nkModule, nkStmtList:
+        lowerValueScopePush()
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
+            let child: Node = lowerClosureStmt(kid(n, i))
+            if child != nil && child.kind == nkStmtList:
+                for j in 0..<kidCount child:
+                    add(outKids, kid(child, j))
+            elif child != nil:
+                add(outKids, child)
+        lowerValueScopePop()
+        var out: Node = lowerCloneShallow n
+        for k in 0..<outKids.len:
+            addSon(out, outKids[k])
+        return out
+    of nkFnDecl, nkIteratorDecl:
+        lowerValueScopePush()
+        if kidCount n > 1:
+            let paramsNode: Node = kid(n, 1)
+            if paramsNode != nil && paramsNode.kind == nkFormalParams:
+                for pi in 0..<kidCount paramsNode:
+                    let defs: Node = kid(paramsNode, pi)
+                    if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
+                        let typeNode: Node = kid(defs, 1)
+                        let nameCount: int32 = kidCount defs - 2
+                        for pj in 0..<nameCount:
+                            let nameNode: Node = kid(defs, pj)
+                            let nm: str = stripSpaces(plainName(nameNode))
+                            if len nm > 0:
+                                lowerValueAdd(nm, typeNode)
+        var bodyNode: Node = nil
+        if kidCount n > 3:
+            bodyNode = kid(n, 3)
+        let newBody: Node = lowerClosureStmt(bodyNode)
+        lowerValueScopePop()
+        var outFn: Node = lowerCloneShallow n
+        for i2 in 0..<kidCount n:
+            if i2 == 3:
+                addSon(outFn, newBody)
+            else:
+                addSon(outFn, kid(n, i2))
+        return outFn
+    of nkLet, nkVar, nkConst:
+        var nameNode: Node = nil
+        if kidCount n > 0:
+            nameNode = kid(n, 0)
+        var typeNode: Node = nil
+        if kidCount n > 1:
+            typeNode = kid(n, 1)
+        var valNode: Node = nil
+        if kidCount n > 2:
+            valNode = kid(n, 2)
+        var pragmaNode: Node = nil
+        if kidCount n > 3:
+            pragmaNode = kid(n, 3)
+        let res: ClosureExprResult = lowerClosureExpr(valNode)
+        var outType: Node = typeNode
+        if res.closureType != nil:
+            outType = res.closureType
+        var outVar: Node = lowerCloneShallow n
+        addSon(outVar, nameNode)
+        addSon(outVar, outType)
+        addSon(outVar, res.expr)
+        addSon(outVar, pragmaNode)
+        var list: Node = newNode(nkStmtList, n.pos)
+        lowerAddStmtList(list, res.stmts)
+        addSon(list, outVar)
+        var bindNames: str[2]
+        lowerCollectPatternNames(nameNode, &bindNames)
+        if bindNames.len > 0:
+            var bindType: Node = outType
+            if bindType == nil || bindType.kind == nkEmpty:
+                bindType = lowerInferExprType res.expr
+            if bindType != nil:
+                for bi in 0..<bindNames.len:
+                    let nm: str = bindNames[bi]
+                    if len nm > 0:
+                        lowerValueAdd(nm, bindType)
+        return list
+    of nkAsgn, nkFastAsgn:
+        if kidCount n > 1:
+            let lhs: Node = kid(n, 0)
+            let rhs: Node = kid(n, 1)
+            let res2: ClosureExprResult = lowerClosureExpr(rhs)
+            var outAsgn: Node = lowerCloneShallow n
+            addSon(outAsgn, lhs)
+            addSon(outAsgn, res2.expr)
+            var list2: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list2, res2.stmts)
+            addSon(list2, outAsgn)
+            return list2
+        return n
+    of nkReturn:
+        if kidCount n > 0:
+            let res3: ClosureExprResult = lowerClosureExpr(kid(n, 0))
+            var outRet: Node = newNode(nkReturn, n.pos)
+            addSon(outRet, res3.expr)
+            var list3: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list3, res3.stmts)
+            addSon(list3, outRet)
+            return list3
+        return n
+    of nkIf, nkWhen:
+        var elseNode: Node = nil
+        if kidCount n % 2 == 1:
+            elseNode = lowerClosureStmt(kid(n, kidCount n - 1))
+        var idx: int32 = kidCount n - 2
+        if elseNode != nil:
+            idx = kidCount n - 3
+        var curElse: Node = elseNode
+        while idx >= 0:
+            let condNode: Node = kid(n, idx)
+            let bodyNode: Node = kid(n, idx + 1)
+            let resCond: ClosureExprResult = lowerClosureExpr(condNode)
+            let newBody: Node = lowerClosureStmt(bodyNode)
+            var ifNode: Node = newNode(n.kind, n.pos)
+            addSon(ifNode, resCond.expr)
+            addSon(ifNode, newBody)
+            if curElse != nil:
+                addSon(ifNode, curElse)
+            if resCond.stmts.len > 0:
+                var list4: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(list4, resCond.stmts)
+                addSon(list4, ifNode)
+                curElse = list4
+            else:
+                curElse = ifNode
+            idx = idx - 2
+        return curElse
+    of nkWhile:
+        if kidCount n > 1:
+            let condNode2: Node = kid(n, 0)
+            let bodyNode2: Node = kid(n, 1)
+            let resCond2: ClosureExprResult = lowerClosureExpr(condNode2)
+            let newBody2: Node = lowerClosureStmt(bodyNode2)
+            if resCond2.stmts.len > 0:
+                var loopBody: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(loopBody, resCond2.stmts)
+                var notCond: Node = newNode(nkPrefix, n.pos)
+                addSon(notCond, newIdent("!", n.pos))
+                addSon(notCond, resCond2.expr)
+                var breakIf: Node = newNode(nkIf, n.pos)
+                addSon(breakIf, notCond)
+                var breakBody: Node = newNode(nkStmtList, n.pos)
+                addSon(breakBody, newNode(nkBreak, n.pos))
+                addSon(breakIf, breakBody)
+                addSon(loopBody, breakIf)
+                addSon(loopBody, newBody2)
+                var outWhile2: Node = newNode(nkWhile, n.pos)
+                addSon(outWhile2, newBoolLit(true, n.pos))
+                addSon(outWhile2, loopBody)
+                return outWhile2
+            var outWhile: Node = newNode(nkWhile, n.pos)
+            addSon(outWhile, resCond2.expr)
+            addSon(outWhile, newBody2)
+            return outWhile
+        return n
+    of nkFor:
+        if kidCount n > 2:
+            let pat: Node = kid(n, 0)
+            let iterExpr: Node = kid(n, 1)
+            let body: Node = kid(n, 2)
+            let resIter: ClosureExprResult = lowerClosureExpr(iterExpr)
+            let newBody3: Node = lowerClosureStmt(body)
+            var outFor: Node = newNode(nkFor, n.pos)
+            addSon(outFor, pat)
+            addSon(outFor, resIter.expr)
+            addSon(outFor, newBody3)
+            if resIter.stmts.len > 0:
+                var list6: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(list6, resIter.stmts)
+                addSon(list6, outFor)
+                return list6
+            return outFor
+        return n
+    else:
+        let res4: ClosureExprResult = lowerClosureExpr(n)
+        if res4.stmts.len > 0:
+            var list7: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list7, res4.stmts)
+            addSon(list7, res4.expr)
+            return list7
+        return res4.expr
+
+fn lowerClosures(root: Node): Node =
+    if root == nil:
+        return nil
+    lowerClosureClear()
+    var decls: Node[8]
+    lowerClosureDecls = &decls
+    lowerValueClear()
+    var out: Node = lowerClosureStmt(root)
+    lowerClosureDecls = nil
+    if decls.len == 0:
+        return out
+    if out == nil:
+        return nil
+    var out2: Node = lowerCloneShallow out
+    for i in 0..<kidCount out:
+        addSon(out2, kid(out, i))
+    for j in 0..<decls.len:
+        addSon(out2, decls[j])
+    return out2
+
+fn lowerExprResult(expr: Node): LowerExprResult =
+    var out: LowerExprResult
+    out.expr = expr
+    out.stmts = []
+    return out
+
+fn lowerAppendStmts(dst: Node[]*, src: Node[]) =
+    for i in 0..<src.len:
+        add(dst, src[i])
+
+fn lowerAddStmtList(list: Node, src: Node[]) =
+    if list == nil:
+        return
+    for i in 0..<src.len:
+        addSon(list, src[i])
+
+fn lowerIsStmtKind(k: NodeKind): bool =
+    if k == nkStmtList: return true
+    if k == nkReturn || k == nkYield: return true
+    if k == nkBreak || k == nkContinue: return true
+    if k == nkDefer: return true
+    if k == nkIf || k == nkWhen || k == nkWhile || k == nkFor || k == nkCase || k == nkBlock: return true
+    if k == nkAsgn || k == nkFastAsgn: return true
+    if k == nkVar || k == nkLet || k == nkConst: return true
+    if k == nkFnDecl || k == nkIteratorDecl: return true
+    if k == nkMacroDecl || k == nkTemplateDecl: return true
+    if k == nkTypeDecl || k == nkImportStmt || k == nkImportGroup: return true
+    if k == nkPragma || k == nkAnnotation: return true
+    return false
+
+fn lowerIsExprNode(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkIfExpr || n.kind == nkWhenExpr || n.kind == nkCaseExpr:
+        return true
+    if lowerIsStmtKind n.kind:
+        return false
+    return true
+
+fn lowerMakeAssignStmtTo(lhs: Node, expr: Node): Node =
+    var pos: SourcePos = lower_zeroPos()
+    if expr != nil:
+        pos = expr.pos
+    let lhsCopy: Node = cloneTree lhs
+    var rhs: Node = newNode(nkEmpty, pos)
+    if expr != nil:
+        rhs = expr
+    var asn: Node = newNode(nkAsgn, pos)
+    addSon(asn, lhsCopy)
+    addSon(asn, rhs)
+    return asn
+
+fn lowerNormalizeBranchAssign(lhs: Node, branch: Node): Node =
+    if branch == nil:
+        return newNode(nkStmtList, lower_zeroPos())
+    if branch.kind != nkStmtList:
+        var sl1: Node = newNode(nkStmtList, branch.pos)
+        if lowerIsExprNode branch:
+            addSon(sl1, lowerMakeAssignStmtTo(lhs, branch))
+        else:
+            addSon(sl1, branch)
+        return sl1
+    if kidCount branch == 0:
+        return newNode(nkStmtList, branch.pos)
+    let last: Node = kid(branch, kidCount branch - 1)
+    var sl3: Node = newNode(nkStmtList, branch.pos)
+    for i in 0..<kidCount branch:
+        if i + 1 >= kidCount branch:
+            break
+        addSon(sl3, kid(branch, i))
+    if lowerIsExprNode last:
+        addSon(sl3, lowerMakeAssignStmtTo(lhs, last))
+    else:
+        addSon(sl3, last)
+    return sl3
+
+fn lowerIfExprAssign(n: Node, lhs: Node): Node =
+    if n == nil:
+        return nil
+    var outKind: NodeKind = n.kind
+    if n.kind == nkIfExpr:
+        outKind = nkIf
+    elif n.kind == nkWhenExpr:
+        outKind = nkWhen
+    var out: Node = newNode(outKind, n.pos)
+    var i: int32 = 0
+    while i + 1 < kidCount n:
+        addSon(out, kid(n, i))
+        addSon(out, lowerNormalizeBranchAssign(lhs, kid(n, i + 1)))
+        i = i + 2
+    if i < kidCount n:
+        addSon(out, lowerNormalizeBranchAssign(lhs, kid(n, i)))
+    return out
+
+fn lowerCaseExprAssign(n: Node, lhs: Node): Node =
+    if n == nil:
+        return nil
+    var out: Node = newNode(nkCase, n.pos)
+    if kidCount n > 0:
+        addSon(out, kid(n, 0))
+    for i in 1..<kidCount n:
+        let br: Node = kid(n, i)
+        if br == nil:
+            continue
+        if br.kind == nkOfBranch:
+            var brOut: Node = newNode(nkOfBranch, br.pos)
+            for bi in 0..<kidCount br:
+                if bi + 1 >= kidCount br:
+                    break
+                addSon(brOut, kid(br, bi))
+            if kidCount br > 0:
+                let body: Node = kid(br, kidCount br - 1)
+                addSon(brOut, lowerNormalizeBranchAssign(lhs, body))
+            addSon(out, brOut)
+        elif br.kind == nkElse:
+            var el: Node = newNode(nkElse, br.pos)
+            if kidCount br > 0:
+                addSon(el, lowerNormalizeBranchAssign(lhs, kid(br, 0)))
+            addSon(out, el)
+        else:
+            addSon(out, br)
+    return out
+
+fn lowerIsResultTypeNode(typeNode: Node): bool =
+    if typeNode == nil:
+        return false
+    if typeNode.kind == nkBracketExpr && kidCount typeNode > 0:
+        let base: Node = kid(typeNode, 0)
+        if base != nil && (stripSpaces(plainName(base)) == "Result"):
+            return true
+    if typeNode.kind == nkIdent || typeNode.kind == nkSymbol:
+        let nm: str = lowerUnqualifyName(stripSpaces(typeNode.ident))
+        if nm == "Result":
+            return true
+        if hasPrefix(nm, "Result_"):
+            return true
+    return false
+
+fn lowerResultInnerType(typeNode: Node): Node =
+    if typeNode == nil:
+        return nil
+    if typeNode.kind == nkBracketExpr && kidCount typeNode > 1:
+        let base: Node = kid(typeNode, 0)
+        if base != nil && (stripSpaces(plainName(base)) == "Result"):
+            return kid(typeNode, 1)
+    if typeNode.kind == nkIdent || typeNode.kind == nkSymbol:
+        let nm: str = lowerUnqualifyName(stripSpaces(typeNode.ident))
+        if hasPrefix(nm, "Result_"):
+            let suf: str = suffixAfter(nm, "Result_")
+            if len suf > 0:
+                return newIdent(suf, typeNode.pos)
+    return nil
+
+fn lowerTypeKey(n: Node): str =
+    if n == nil:
+        return ""
+    if n.kind == nkDotExpr && kidCount n > 1:
+        return lowerTypeKey kid(n, 1)
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        return lowerUnqualifyName(stripSpaces(n.ident))
+    if n.kind == nkBracketExpr && kidCount n > 0:
+        var out: str = stripSpaces(plainName(kid(n, 0)))
+        for i in 1..<kidCount n:
+            let part: str = lowerTypeKey kid(n, i)
+            if !strIsEmpty part:
+                out = out + "_"
+                out = out + part
+        return out
+    return ""
+
+fn lowerSameType(a: Node, b: Node): bool =
+    let ak: str = lowerTypeKey a
+    let bk: str = lowerTypeKey b
+    if ak == "" || bk == "":
+        return false
+    return ak == bk
+
+fn asyncRetKind(retType: Node): str =
+    if retType == nil || retType.kind == nkEmpty:
+        return "void"
+    let key: str = lowerUnqualifyName(lowerTypeKey(retType))
+    if key == "" || key == "void":
+        return "void"
+    if key == "int" || key == "int32":
+        return "i32"
+    return ""
+
+fn asyncAwaitKindFromType(ty: Node): str =
+    if ty == nil:
+        return ""
+    let key: str = lowerUnqualifyName(lowerTypeKey(ty))
+    if key == "await_i32":
+        return "i32"
+    if key == "await_void":
+        return "void"
+    return ""
+
+fn asyncAwaitTypeForRet(retType: Node, pos: SourcePos): Node =
+    let kind: str = asyncRetKind retType
+    if kind == "void":
+        return newIdent("await_void", pos)
+    if kind == "i32":
+        return newIdent("await_i32", pos)
+    return newNode(nkEmpty, pos)
+
+fn asyncPendingName(kind: str): str =
+    if kind == "void":
+        return "asyncPendingVoid"
+    if kind == "i32":
+        return "asyncPendingI32"
+    return ""
+
+fn asyncSetName(kind: str): str =
+    if kind == "void":
+        return "asyncSetVoid"
+    if kind == "i32":
+        return "asyncSetI32"
+    return ""
+
+fn asyncAwaitName(kind: str): str =
+    if kind == "void":
+        return "awaitVoid"
+    if kind == "i32":
+        return "awaitI32"
+    return ""
+
+fn lowerInferExprType(n: Node): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkPar && kidCount n == 1:
+        return lowerInferExprType kid(n, 0)
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        return lowerValueLookup nm
+    if n.kind == nkCall && kidCount n > 0:
+        let callee: Node = kid(n, 0)
+        let baseName: str = lowerCallTargetName(callee)
+        if !strIsEmpty baseName:
+            let fnNode: Node = lowerMapGetIndex(lowerFnNames, lowerFnNodes, lowerFnIndex, baseName)
+            if fnNode != nil && kidCount fnNode > 2:
+                return kid(fnNode, 2)
+    return nil
+
+fn asyncIsAwaitExpr(n: Node): bool =
+    if n == nil || n.kind != nkPrefix:
+        return false
+    if kidCount n > 0:
+        let op: Node = kid(n, 0)
+        let name: str = stripSpaces(plainName(op))
+        return name == "await"
+    return false
+
+fn asyncAwaitOperand(n: Node): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkPrefix && kidCount n > 1:
+        return kid(n, 1)
+    return nil
+
+fn asyncNodeHasAwait(n: Node): bool =
+    if n == nil:
+        return false
+    if asyncIsAwaitExpr n:
+        return true
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl || n.kind == nkLambda:
+        return false
+    if n.kind == nkTypeDecl || n.kind == nkObjectDecl || n.kind == nkRecList || n.kind == nkEnumDecl:
+        return false
+    for i in 0..<kidCount n:
+        if asyncNodeHasAwait(kid(n, i)):
+            return true
+    return false
+
+fn lowerStripParType(n: Node): Node =
+    var cur: Node = n
+    while cur != nil && cur.kind == nkPar && kidCount cur == 1:
+        cur = kid(cur, 0)
+    return cur
+
+fn lowerPointerBaseName(ty: Node): str =
+    let cur: Node = lowerStripParType ty
+    if cur == nil:
+        return ""
+    if cur.kind == nkPtrTy && kidCount cur > 0:
+        let base: Node = kid(cur, 0)
+        return stripSpaces(plainName(base))
+    if cur.kind == nkPostfix && kidCount cur > 1:
+        let opn0: Node = kid(cur, 0)
+        let opn1: Node = kid(cur, 1)
+        if opn1 != nil && stripSpaces(opn1.ident) == "*":
+            return stripSpaces(plainName(opn0))
+    if cur.kind == nkInfix && kidCount cur >= 3:
+        let opnMid: Node = kid(cur, 1)
+        if opnMid != nil && stripSpaces(opnMid.ident) == "*":
+            return stripSpaces(plainName(kid(cur, 0)))
+    return ""
+
+fn lowerClosureEnvNameFromType(ty: Node): str =
+    let base: str = lowerPointerBaseName ty
+    if base == "":
+        return ""
+    if lowerClosureIndex(base) >= 0:
+        return base
+    return ""
+
+fn lowerClosureBodyNameFromType(ty: Node): str =
+    let envName: str = lowerClosureEnvNameFromType ty
+    if envName == "":
+        return ""
+    let idx: int32 = lowerClosureIndex envName
+    if idx >= 0 && idx < lowerClosureBodyNames.len:
+        return lowerReadStr(lowerClosureBodyNames, idx)
+    return ""
+
+fn lowerClosureTrampNameFromType(ty: Node): str =
+    let envName: str = lowerClosureEnvNameFromType ty
+    if envName == "":
+        return ""
+    let idx: int32 = lowerClosureIndex envName
+    if idx >= 0 && idx < lowerClosureTrampNames.len:
+        return lowerReadStr(lowerClosureTrampNames, idx)
+    return ""
+
+fn lowerIsVoidPtrType(ty: Node): bool =
+    let base: str = lowerPointerBaseName ty
+    return base == "void"
+
+fn lowerCollectPatternNames(n: Node, out: str[]*) =
+    if n == nil || out == nil:
+        return
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        if len nm > 0:
+            lowerSeqStrAdd(out, nm)
+        return
+    if n.kind == nkPattern && kidCount n > 0:
+        lowerCollectPatternNames(kid(n, 0), out)
+        return
+    for i in 0..<kidCount n:
+        lowerCollectPatternNames(kid(n, i), out)
+
+fn lowerCollectLocalsInBody(n: Node, out: str[]*) =
+    if n == nil || out == nil:
+        return
+    if n.kind == nkLambda:
+        return
+    if n.kind == nkLet || n.kind == nkVar || n.kind == nkConst:
+        if kidCount n > 0:
+            lowerCollectPatternNames(kid(n, 0), out)
+    elif n.kind == nkFor:
+        if kidCount n > 0:
+            lowerCollectPatternNames(kid(n, 0), out)
+    for i in 0..<kidCount n:
+        lowerCollectLocalsInBody(kid(n, i), out)
+
+fn lowerCollectLambdaLocals(lam: Node, out: str[]*) =
+    if lam == nil || out == nil:
+        return
+    if kidCount lam > 1:
+        let paramsNode: Node = kid(lam, 1)
+        if paramsNode != nil && paramsNode.kind == nkFormalParams:
+            for i in 0..<kidCount paramsNode:
+                let defs: Node = kid(paramsNode, i)
+                if defs != nil && defs.kind == nkIdentDefs:
+                    let nameCount: int32 = kidCount defs - 2
+                    for j in 0..<nameCount:
+                        lowerCollectPatternNames(kid(defs, j), out)
+    if kidCount lam > 3:
+        let bodyNode: Node = kid(lam, 3)
+        lowerCollectLocalsInBody(bodyNode, out)
+
+fn lowerCollectCapturesVisit(n: Node, locals: str[], outNames: str[]*, outTypes: Node[]*) =
+    if n == nil || outNames == nil || outTypes == nil:
+        return
+    if n.kind == nkLambda:
+        return
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        if len nm > 0 && !lowerSeqStrHas(locals, nm):
+            let ty: Node = lowerValueLookup nm
+            if ty != nil && !lowerSeqStrHas(*outNames, nm):
+                add(outNames, nm)
+                add(outTypes, ty)
+        return
+    for i in 0..<kidCount n:
+        lowerCollectCapturesVisit(kid(n, i), locals, outNames, outTypes)
+
+fn lowerCollectCaptures(lam: Node, outNames: str[]*, outTypes: Node[]*) =
+    if lam == nil || outNames == nil || outTypes == nil:
+        return
+    var locals: str[8]
+    lowerCollectLambdaLocals(lam, &locals)
+    var body: Node = nil
+    if kidCount lam > 3:
+        body = kid(lam, 3)
+    lowerCollectCapturesVisit(body, locals, outNames, outTypes)
+
+fn lowerRewriteCaptured(n: Node, envName: str, capNames: str[], locals: str[]): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkLambda:
+        return n
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        if len nm > 0 && lowerSeqStrHas(capNames, nm) && !lowerSeqStrHas(locals, nm):
+            return lowerMakeDot(envName, nm, n.pos)
+        return n
+    var changed: bool = false
+    var outKids: Node[]
+    outKids.cap = kidCount n
+    for i in 0..<kidCount n:
+        let oldChild: Node = kid(n, i)
+        let child: Node = lowerRewriteCaptured(oldChild, envName, capNames, locals)
+        if child != oldChild:
+            changed = true
+        add(outKids, child)
+    if !changed:
+        return n
+    var out: Node = lowerCloneShallow n
+    for k in 0..<outKids.len:
+        addSon(out, outKids[k])
+    return out
+
+fn lowerCollectParamNames(paramsNode: Node, out: str[]*) =
+    if paramsNode == nil || out == nil:
+        return
+    if paramsNode.kind != nkFormalParams:
+        return
+    for i in 0..<kidCount paramsNode:
+        let defs: Node = kid(paramsNode, i)
+        if defs != nil && defs.kind == nkIdentDefs:
+            let nameCount: int32 = kidCount defs - 2
+            for j in 0..<nameCount:
+                let nameNode: Node = kid(defs, j)
+                if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 0:
+                    lowerCollectPatternNames(kid(nameNode, 0), out)
+                else:
+                    lowerCollectPatternNames(nameNode, out)
+
+fn lowerBuildEnvTypeDecl(envName: str, capNames: str[], capTypes: Node[], pos: SourcePos): Node =
+    var obj: Node = newNode(nkObjectDecl, pos)
+    addSon(obj, newNode(nkEmpty, pos))
+    var recList: Node = newNode(nkRecList, pos)
+    for i in 0..<capNames.len:
+        let fname: str = capNames[i]
+        let ftype: Node = capTypes[i]
+        var defs: Node = newNode(nkIdentDefs, pos)
+        addSon(defs, newIdent(fname, pos))
+        addSon(defs, cloneTree ftype)
+        addSon(defs, newNode(nkEmpty, pos))
+        addSon(recList, defs)
+    addSon(obj, recList)
+    var td: Node = newNode(nkTypeDecl, pos)
+    addSon(td, newIdent(envName, pos))
+    addSon(td, obj)
+    addSon(td, newNode(nkEmpty, pos))
+    addSon(td, newNode(nkEmpty, pos))
+    addSon(td, newNode(nkEmpty, pos))
+    if lowerFilename != nil && len lowerFilename > 0:
+        nodeSetStrVal(td, lowerFilename)
+    return td
+
+fn lowerBuildLambdaBodyDecl(lam: Node, envName: str, bodyName: str, capNames: str[], locals: str[], pos: SourcePos): Node =
+    var paramsNode: Node = nil
+    if kidCount lam > 1:
+        paramsNode = kid(lam, 1)
+    var retNode: Node = nil
+    if kidCount lam > 2:
+        retNode = kid(lam, 2)
+    var bodyNode: Node = nil
+    if kidCount lam > 3:
+        bodyNode = kid(lam, 3)
+    var envTypeNode: Node = newIdent(envName, pos)
+    var envPtrType: Node = lowerMakePtrType(envTypeNode, pos)
+    var envDefs: Node = newNode(nkIdentDefs, pos)
+    addSon(envDefs, newIdent("__env", pos))
+    addSon(envDefs, envPtrType)
+    addSon(envDefs, newNode(nkEmpty, pos))
+    var newParams: Node = newNode(nkFormalParams, pos)
+    addSon(newParams, envDefs)
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        for i in 0..<kidCount paramsNode:
+            addSon(newParams, cloneTree kid(paramsNode, i))
+    var rewrittenBody: Node = lowerRewriteCaptured(bodyNode, "__env", capNames, locals)
+    var decl: Node = newNode(nkFnDecl, pos)
+    addSon(decl, newIdent(bodyName, pos))
+    addSon(decl, newParams)
+    if retNode != nil:
+        addSon(decl, cloneTree retNode)
+    else:
+        addSon(decl, newNode(nkEmpty, pos))
+    addSon(decl, rewrittenBody)
+    addSon(decl, newNode(nkEmpty, pos))
+    addSon(decl, newNode(nkEmpty, pos))
+    if lam != nil && lam.strVal != nil && len lam.strVal > 0:
+        nodeSetStrVal(decl, lam.strVal)
+    elif lowerFilename != nil && len lowerFilename > 0:
+        nodeSetStrVal(decl, lowerFilename)
+    return decl
+
+fn lowerBuildLambdaTrampolineDecl(envName: str, bodyName: str, trampName: str, paramsNode: Node, retNode: Node, pos: SourcePos): Node =
+    var voidType: Node = newIdent("void", pos)
+    var voidPtr: Node = lowerMakePtrType(voidType, pos)
+    var ctxDefs: Node = newNode(nkIdentDefs, pos)
+    addSon(ctxDefs, newIdent("__ctx", pos))
+    addSon(ctxDefs, voidPtr)
+    addSon(ctxDefs, newNode(nkEmpty, pos))
+    var trampParams: Node = newNode(nkFormalParams, pos)
+    addSon(trampParams, ctxDefs)
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        for i in 0..<kidCount paramsNode:
+            addSon(trampParams, cloneTree kid(paramsNode, i))
+    var envTypeNode: Node = newIdent(envName, pos)
+    var envPtrType: Node = lowerMakePtrType(envTypeNode, pos)
+    var castArgs: Node[1]
+    add(castArgs, newIdent("__ctx", pos))
+    var castCall: Node = newNode(nkCall, pos)
+    castCall.callStyle = CallStyleParen
+    addSon(castCall, envPtrType)
+    addSon(castCall, castArgs[0])
+    var envDecl: Node = newNode(nkLet, pos)
+    addSon(envDecl, newIdent("__env", pos))
+    addSon(envDecl, envPtrType)
+    addSon(envDecl, castCall)
+    addSon(envDecl, newNode(nkEmpty, pos))
+    var callArgs: Node[4]
+    add(callArgs, newIdent("__env", pos))
+    var paramNames: str[4]
+    lowerCollectParamNames(paramsNode, &paramNames)
+    for pi in 0..<paramNames.len:
+        add(callArgs, newIdent(paramNames[pi], pos))
+    var bodyCall: Node = lowerMakeCall(bodyName, pos, callArgs)
+    var retStmt: Node = newNode(nkReturn, pos)
+    addSon(retStmt, bodyCall)
+    var bodyList: Node = newNode(nkStmtList, pos)
+    addSon(bodyList, envDecl)
+    addSon(bodyList, retStmt)
+    var decl: Node = newNode(nkFnDecl, pos)
+    addSon(decl, newIdent(trampName, pos))
+    addSon(decl, trampParams)
+    if retNode != nil:
+        addSon(decl, cloneTree retNode)
+    else:
+        addSon(decl, newNode(nkEmpty, pos))
+    addSon(decl, bodyList)
+    addSon(decl, newNode(nkEmpty, pos))
+    addSon(decl, newNode(nkEmpty, pos))
+    if lowerFilename != nil && len lowerFilename > 0:
+        nodeSetStrVal(decl, lowerFilename)
+    return decl
+
+fn lowerEnsureClosureInfo(lam: Node, capNames: str[], capTypes: Node[]): int32 =
+    let existing: int32 = lowerClosureLamIndex lam
+    if existing >= 0:
+        return existing
+    let idx: int32 = lowerClosureCounter
+    lowerClosureCounter = lowerClosureCounter + 1
+    let envName: str = "__cheng_env_" + intToStr idx
+    let bodyName: str = "__cheng_lambda_" + intToStr idx
+    let trampName: str = "__cheng_trampoline_" + intToStr idx
+    let pos: SourcePos = lam.pos
+    if lowerClosureDecls != nil:
+        let envDecl: Node = lowerBuildEnvTypeDecl(envName, capNames, capTypes, pos)
+        add(lowerClosureDecls, envDecl)
+        var locals: str[8]
+        lowerCollectLambdaLocals(lam, &locals)
+        let bodyDecl: Node = lowerBuildLambdaBodyDecl(lam, envName, bodyName, capNames, locals, pos)
+        add(lowerClosureDecls, bodyDecl)
+        var paramsNode: Node = nil
+        if kidCount lam > 1:
+            paramsNode = kid(lam, 1)
+        var retNode: Node = nil
+        if kidCount lam > 2:
+            retNode = kid(lam, 2)
+        let trampDecl: Node = lowerBuildLambdaTrampolineDecl(envName, bodyName, trampName, paramsNode, retNode, pos)
+        add(lowerClosureDecls, trampDecl)
+    lowerClosureRegister(envName, bodyName, trampName)
+    lowerClosureLamRegister(lam, envName, bodyName, trampName)
+    return lowerClosureLamIndex lam
+
+fn lowerFnHasImportc(fnNode: Node): bool =
+    if fnNode == nil:
+        return false
+    if kidCount fnNode > 5:
+        let pragmas: Node = kid(fnNode, 5)
+        if pragmas != nil && pragmas.kind == nkPragma:
+            for i in 0..<kidCount pragmas:
+                let a: Node = kid(pragmas, i)
+                if a != nil && a.kind == nkAnnotation && kidCount a > 0:
+                    let name: str = stripSpaces(plainName(kid(a, 0)))
+                    if name == "importc":
+                        return true
+    return false
+
+fn lowerFnIsAsync(fnNode: Node): bool =
+    if fnNode == nil:
+        return false
+    if kidCount fnNode > 5:
+        let pragmas: Node = kid(fnNode, 5)
+        if pragmas != nil && pragmas.kind == nkPragma:
+            for i in 0..<kidCount pragmas:
+                let a: Node = kid(pragmas, i)
+                if a != nil && a.kind == nkAnnotation && kidCount a > 0:
+                    let name: str = stripSpaces(plainName(kid(a, 0)))
+                    if name == "async":
+                        return true
+    return false
+
+fn lowerStripAsyncPragma(pragmaNode: Node): Node =
+    if pragmaNode == nil || pragmaNode.kind != nkPragma:
+        return pragmaNode
+    var out: Node = newNode(nkPragma, pragmaNode.pos)
+    for i in 0..<kidCount pragmaNode:
+        let a: Node = kid(pragmaNode, i)
+        if a != nil && a.kind == nkAnnotation && kidCount a > 0:
+            let name: str = stripSpaces(plainName(kid(a, 0)))
+            if name != "async":
+                addSon(out, cloneTree a)
+    if kidCount out == 0:
+        return newNode(nkEmpty, pragmaNode.pos)
+    return out
+
+fn lowerIsCallbackType(ty: Node): bool =
+    if ty == nil:
+        return false
+    let cur: Node = lowerStripParType ty
+    if cur == nil || cur.kind != nkFnTy:
+        return false
+    if kidCount cur == 0:
+        return false
+    let params: Node = kid(cur, 0)
+    if params == nil || params.kind != nkFormalParams || kidCount params == 0:
+        return false
+    let defs: Node = kid(params, 0)
+    if defs == nil || defs.kind != nkIdentDefs || kidCount defs < 2:
+        return false
+    let paramType: Node = kid(defs, 1)
+    return lowerIsVoidPtrType paramType
+
+fn lowerQExpr(n: Node, fnRetType: Node, fnReturnsResult: bool): LowerExprResult =
+    if n == nil:
+        return lowerExprResult(nil)
+    if n.kind == nkPostfix && kidCount n > 1:
+        let opn: Node = kid(n, 0)
+        if opn != nil && stripSpaces(opn.ident) == "?":
+            let inner: Node = kid(n, 1)
+            let innerRes: LowerExprResult = lowerQExpr(inner, fnRetType, fnReturnsResult)
+            var resType: Node = lowerInferExprType innerRes.expr
+            if resType != nil && !lowerIsResultTypeNode(resType):
+                lowerAddError(n.pos, "[C-Profile] not-mapped: ? expects Result value (FULLC.L04). hint: rewrite to explicit error check.")
+                return innerRes
+            if resType == nil:
+                if fnReturnsResult && fnRetType != nil && fnRetType.kind != nkEmpty:
+                    resType = fnRetType
+                else:
+                    resType = newNode(nkEmpty, n.pos)
+            let resName: str = "__qres" + intToStr(lowerTempCounter)
+            lowerTempCounter = lowerTempCounter + 1
+            var resDecl: Node = newNode(nkVar, n.pos)
+            addSon(resDecl, newIdent(resName, n.pos))
+            addSon(resDecl, cloneTree resType)
+            addSon(resDecl, innerRes.expr)
+            addSon(resDecl, newNode(nkEmpty, n.pos))
+            var cond: Node = newNode(nkPrefix, n.pos)
+            addSon(cond, newIdent("!", n.pos))
+            addSon(cond, lowerMakeDot(resName, "ok", n.pos))
+            var ifNode: Node = newNode(nkIf, n.pos)
+            addSon(ifNode, cond)
+            var body: Node = newNode(nkStmtList, n.pos)
+            var canReturn: bool = false
+            if fnReturnsResult:
+                canReturn = true
+                if resType != nil && resType.kind != nkEmpty && fnRetType != nil && fnRetType.kind != nkEmpty:
+                    canReturn = lowerSameType(resType, fnRetType)
+            if canReturn:
+                var retNode: Node = newNode(nkReturn, n.pos)
+                addSon(retNode, newIdent(resName, n.pos))
+                addSon(body, retNode)
+            else:
+                var panicCall: Node = newNode(nkCall, n.pos)
+                addSon(panicCall, newIdent("panic", n.pos))
+                addSon(panicCall, lowerMakeDot(resName, "err", n.pos))
+                addSon(body, panicCall)
+            addSon(ifNode, body)
+            var out: LowerExprResult = lowerExprResult(lowerMakeDot(resName, "value", n.pos))
+            lowerAppendStmts(&out.stmts, innerRes.stmts)
+            add(out.stmts, resDecl)
+            add(out.stmts, ifNode)
+            return out
+    if kidCount n == 0:
+        return lowerExprResult(n)
+    var outKids: Node[]
+    outKids.cap = kidCount n
+    var outStmts: Node[]
+    var changed: bool = false
+    for i in 0..<kidCount n:
+        let oldChild: Node = kid(n, i)
+        let res: LowerExprResult = lowerQExpr(oldChild, fnRetType, fnReturnsResult)
+        lowerAppendStmts(&outStmts, res.stmts)
+        let child: Node = res.expr
+        if child != oldChild:
+            changed = true
+        add(outKids, child)
+    if !changed && outStmts.len == 0:
+        return lowerExprResult(n)
+    var outNode: Node = lowerCloneShallow n
+    for k in 0..<outKids.len:
+        addSon(outNode, outKids[k])
+    var outRes: LowerExprResult = lowerExprResult(outNode)
+    outRes.stmts = outStmts
+    return outRes
+
+fn lowerQStmt(n: Node, fnRetType: Node, fnReturnsResult: bool): Node =
+    if n == nil:
+        return nil
+    case n.kind
+    of nkModule, nkStmtList:
+        lowerValueScopePush()
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
+            let child: Node = lowerQStmt(kid(n, i), fnRetType, fnReturnsResult)
+            if child != nil && child.kind == nkStmtList:
+                for j in 0..<kidCount child:
+                    add(outKids, kid(child, j))
+            elif child != nil:
+                add(outKids, child)
+        lowerValueScopePop()
+        var out: Node = lowerCloneShallow n
+        for k in 0..<outKids.len:
+            addSon(out, outKids[k])
+        return out
+    of nkFnDecl, nkIteratorDecl:
+        var retNode: Node = newNode(nkEmpty, n.pos)
+        if kidCount n > 2:
+            retNode = kid(n, 2)
+        let retIsResult: bool = lowerIsResultTypeNode retNode
+        lowerValueScopePush()
+        if kidCount n > 1:
+            let paramsNode: Node = kid(n, 1)
+            if paramsNode != nil && paramsNode.kind == nkFormalParams:
+                for pi in 0..<kidCount paramsNode:
+                    let defs: Node = kid(paramsNode, pi)
+                    if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
+                        let nameNode: Node = kid(defs, 0)
+                        let typeNode: Node = kid(defs, 1)
+                        let nm: str = stripSpaces(plainName(nameNode))
+                        if !strIsEmpty nm:
+                            lowerValueAdd(nm, typeNode)
+        var bodyNode: Node = nil
+        if kidCount n > 3:
+            bodyNode = kid(n, 3)
+        let newBody: Node = lowerQStmt(bodyNode, retNode, retIsResult)
+        lowerValueScopePop()
+        var out: Node = lowerCloneShallow n
+        for i2 in 0..<kidCount n:
+            if i2 == 3:
+                addSon(out, newBody)
+            else:
+                addSon(out, kid(n, i2))
+        return out
+    of nkLet, nkVar, nkConst:
+        var nameNode: Node = nil
+        if kidCount n > 0:
+            nameNode = kid(n, 0)
+        var typeNode: Node = nil
+        if kidCount n > 1:
+            typeNode = kid(n, 1)
+        var valNode: Node = nil
+        if kidCount n > 2:
+            valNode = kid(n, 2)
+        var pragmaNode: Node = nil
+        if kidCount n > 3:
+            pragmaNode = kid(n, 3)
+        let res: LowerExprResult = lowerQExpr(valNode, fnRetType, fnReturnsResult)
+        var outVar: Node = lowerCloneShallow n
+        addSon(outVar, nameNode)
+        addSon(outVar, typeNode)
+        addSon(outVar, res.expr)
+        addSon(outVar, pragmaNode)
+        var list: Node = newNode(nkStmtList, n.pos)
+        lowerAddStmtList(list, res.stmts)
+        addSon(list, outVar)
+        if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
+            let nm: str = stripSpaces(plainName(nameNode))
+            if typeNode != nil && typeNode.kind != nkEmpty:
+                lowerValueAdd(nm, typeNode)
+            else:
+                let inferred: Node = lowerInferExprType res.expr
+                if inferred != nil:
+                    lowerValueAdd(nm, inferred)
+        return list
+    of nkAsgn, nkFastAsgn:
+        if kidCount n > 1:
+            let lhs: Node = kid(n, 0)
+            let rhs: Node = kid(n, 1)
+            let res: LowerExprResult = lowerQExpr(rhs, fnRetType, fnReturnsResult)
+            var outAsgn: Node = lowerCloneShallow n
+            addSon(outAsgn, lhs)
+            addSon(outAsgn, res.expr)
+            var list2: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list2, res.stmts)
+            addSon(list2, outAsgn)
+            return list2
+        return n
+    of nkReturn:
+        if kidCount n > 0:
+            let res: LowerExprResult = lowerQExpr(kid(n, 0), fnRetType, fnReturnsResult)
+            var outRet: Node = newNode(nkReturn, n.pos)
+            addSon(outRet, res.expr)
+            var list3: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list3, res.stmts)
+            addSon(list3, outRet)
+            return list3
+        return n
+    of nkIf, nkWhen:
+        var elseNode: Node = nil
+        if kidCount n % 2 == 1:
+            elseNode = lowerQStmt(kid(n, kidCount n - 1), fnRetType, fnReturnsResult)
+        var idx: int32 = kidCount n - 2
+        if elseNode != nil:
+            idx = kidCount n - 3
+        var curElse: Node = elseNode
+        while idx >= 0:
+            let condNode: Node = kid(n, idx)
+            let bodyNode: Node = kid(n, idx + 1)
+            let resCond: LowerExprResult = lowerQExpr(condNode, fnRetType, fnReturnsResult)
+            let newBody: Node = lowerQStmt(bodyNode, fnRetType, fnReturnsResult)
+            var ifNode: Node = newNode(n.kind, n.pos)
+            addSon(ifNode, resCond.expr)
+            addSon(ifNode, newBody)
+            if curElse != nil:
+                addSon(ifNode, curElse)
+            if resCond.stmts.len > 0:
+                var list4: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(list4, resCond.stmts)
+                addSon(list4, ifNode)
+                curElse = list4
+            else:
+                curElse = ifNode
+            idx = idx - 2
+        return curElse
+    of nkWhile:
+        if kidCount n > 1:
+            let condNode2: Node = kid(n, 0)
+            let bodyNode2: Node = kid(n, 1)
+            let resCond2: LowerExprResult = lowerQExpr(condNode2, fnRetType, fnReturnsResult)
+            let newBody2: Node = lowerQStmt(bodyNode2, fnRetType, fnReturnsResult)
+            if resCond2.stmts.len > 0:
+                var loopBody: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(loopBody, resCond2.stmts)
+                var notCond: Node = newNode(nkPrefix, n.pos)
+                addSon(notCond, newIdent("!", n.pos))
+                addSon(notCond, resCond2.expr)
+                var breakIf: Node = newNode(nkIf, n.pos)
+                addSon(breakIf, notCond)
+                var breakBody: Node = newNode(nkStmtList, n.pos)
+                addSon(breakBody, newNode(nkBreak, n.pos))
+                addSon(breakIf, breakBody)
+                addSon(loopBody, breakIf)
+                addSon(loopBody, newBody2)
+                var outWhile2: Node = newNode(nkWhile, n.pos)
+                addSon(outWhile2, newBoolLit(true, n.pos))
+                addSon(outWhile2, loopBody)
+                return outWhile2
+            var outWhile: Node = newNode(nkWhile, n.pos)
+            addSon(outWhile, resCond2.expr)
+            addSon(outWhile, newBody2)
+            return outWhile
+        return n
+    of nkFor:
+        if kidCount n > 2:
+            let pat: Node = kid(n, 0)
+            let iterExpr: Node = kid(n, 1)
+            let body: Node = kid(n, 2)
+            let resIter: LowerExprResult = lowerQExpr(iterExpr, fnRetType, fnReturnsResult)
+            let newBody3: Node = lowerQStmt(body, fnRetType, fnReturnsResult)
+            var outFor: Node = newNode(nkFor, n.pos)
+            addSon(outFor, pat)
+            addSon(outFor, resIter.expr)
+            addSon(outFor, newBody3)
+            if resIter.stmts.len > 0:
+                var list6: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(list6, resIter.stmts)
+                addSon(list6, outFor)
+                return list6
+            return outFor
+        return n
+    else:
+        let res2: LowerExprResult = lowerQExpr(n, fnRetType, fnReturnsResult)
+        if res2.stmts.len > 0:
+            var list7: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list7, res2.stmts)
+            addSon(list7, res2.expr)
+            return list7
+        return res2.expr
+
+fn lowerQuestion(root: Node): Node =
+    if root == nil:
+        return nil
+    lowerTempCounter = 0
+    lowerValueClear()
+    return lowerQStmt(root, newNode(nkEmpty, root.pos), false)
+
+fn lowerControlExpr(n: Node): LowerExprResult =
+    if n == nil:
+        return lowerExprResult(nil)
+    if n.kind == nkInfix && kidCount n > 2:
+        let opNode: Node = kid(n, 0)
+        if opNode != nil:
+            let op: str = stripSpaces(plainName(opNode))
+            if op == "&&" || op == "||" || op == "and" || op == "or":
+                return lowerControlShortCircuitExpr(n, op)
+    if n.kind == nkIfExpr || n.kind == nkWhenExpr || n.kind == nkCaseExpr:
+        let tmpName: str = "__cfe" + intToStr(lowerTempCounter)
+        lowerTempCounter = lowerTempCounter + 1
+        var tmpType: Node = lowerInferExprType n
+        if tmpType == nil || tmpType.kind == nkEmpty:
+            lowerAddError(n.pos, "[C-Profile] not-mapped: control-flow expression requires inferable type (FULLC.L01). hint: add type annotation or lower to if/elif with assignments.")
+            tmpType = newIdent("int32", n.pos)
+        var decl: Node = newNode(nkVar, n.pos)
+        addSon(decl, newIdent(tmpName, n.pos))
+        addSon(decl, cloneTree tmpType)
+        addSon(decl, newNode(nkEmpty, n.pos))
+        addSon(decl, newNode(nkEmpty, n.pos))
+        let lhs: Node = newIdent(tmpName, n.pos)
+        var assignStmt: Node = nil
+        if n.kind == nkCaseExpr:
+            assignStmt = lowerCaseExprAssign(n, lhs)
+        else:
+            assignStmt = lowerIfExprAssign(n, lhs)
+        assignStmt = lowerControlStmt(assignStmt)
+        var out: LowerExprResult = lowerExprResult(newIdent(tmpName, n.pos))
+        add(out.stmts, decl)
+        if assignStmt != nil:
+            add(out.stmts, assignStmt)
+        return out
+    if kidCount n == 0:
+        return lowerExprResult(n)
+    var outKids: Node[]
+    outKids.cap = kidCount n
+    var outStmts: Node[]
+    var changed: bool = false
+    for i in 0..<kidCount n:
+        let oldChild: Node = kid(n, i)
+        let res: LowerExprResult = lowerControlExpr(oldChild)
+        lowerAppendStmts(&outStmts, res.stmts)
+        let child: Node = res.expr
+        if child != oldChild:
+            changed = true
+        add(outKids, child)
+    if !changed && outStmts.len == 0:
+        return lowerExprResult(n)
+    var outNode: Node = lowerCloneShallow n
+    for k in 0..<outKids.len:
+        addSon(outNode, outKids[k])
+    var outRes: LowerExprResult = lowerExprResult(outNode)
+    outRes.stmts = outStmts
+    return outRes
+
+fn lowerControlShortCircuitExpr(n: Node, op: str): LowerExprResult =
+    if n == nil:
+        return lowerExprResult(nil)
+    if kidCount n < 3:
+        return lowerExprResult(n)
+    let lhsNode: Node = kid(n, 1)
+    let rhsNode: Node = kid(n, 2)
+    let resLhs: LowerExprResult = lowerControlExpr(lhsNode)
+    let resRhs: LowerExprResult = lowerControlExpr(rhsNode)
+    if resRhs.stmts.len == 0:
+        var changed: bool = resLhs.expr != lhsNode || resRhs.expr != rhsNode
+        if !changed && resLhs.stmts.len == 0:
+            return lowerExprResult(n)
+        var outNode: Node = lowerCloneShallow n
+        addSon(outNode, kid(n, 0))
+        addSon(outNode, resLhs.expr)
+        addSon(outNode, resRhs.expr)
+        var outRes: LowerExprResult = lowerExprResult(outNode)
+        outRes.stmts = resLhs.stmts
+        return outRes
+    let tmpName: str = "__cfe" + intToStr(lowerTempCounter)
+    lowerTempCounter = lowerTempCounter + 1
+    var decl: Node = newNode(nkVar, n.pos)
+    addSon(decl, newIdent(tmpName, n.pos))
+    addSon(decl, newIdent("bool", n.pos))
+    addSon(decl, newNode(nkEmpty, n.pos))
+    addSon(decl, newNode(nkEmpty, n.pos))
+    let lhsExpr: Node = resLhs.expr
+    var ifNode: Node = newNode(nkIf, n.pos)
+    addSon(ifNode, lhsExpr)
+    var thenBody: Node = newNode(nkStmtList, n.pos)
+    var elseBody: Node = newNode(nkStmtList, n.pos)
+    let tmpIdThen: Node = newIdent(tmpName, n.pos)
+    let tmpIdElse: Node = newIdent(tmpName, n.pos)
+    if op == "&&" || op == "and":
+        lowerAddStmtList(thenBody, resRhs.stmts)
+        addSon(thenBody, lowerMakeAssignStmtTo(tmpIdThen, resRhs.expr))
+        addSon(elseBody, lowerMakeAssignStmtTo(tmpIdElse, newBoolLit(false, n.pos)))
+    else:
+        addSon(thenBody, lowerMakeAssignStmtTo(tmpIdThen, newBoolLit(true, n.pos)))
+        lowerAddStmtList(elseBody, resRhs.stmts)
+        addSon(elseBody, lowerMakeAssignStmtTo(tmpIdElse, resRhs.expr))
+    addSon(ifNode, thenBody)
+    addSon(ifNode, elseBody)
+    var out: LowerExprResult = lowerExprResult(newIdent(tmpName, n.pos))
+    lowerAppendStmts(&out.stmts, resLhs.stmts)
+    add(out.stmts, decl)
+    add(out.stmts, ifNode)
+    return out
+
+fn lowerControlStmt(n: Node): Node =
+    if n == nil:
+        return nil
+    case n.kind
+    of nkModule, nkStmtList:
+        lowerValueScopePush()
+        var outKids: Node[]
+        outKids.cap = kidCount n
+        for i in 0..<kidCount n:
+            let child: Node = lowerControlStmt(kid(n, i))
+            if child != nil && child.kind == nkStmtList:
+                for j in 0..<kidCount child:
+                    add(outKids, kid(child, j))
+            elif child != nil:
+                add(outKids, child)
+        lowerValueScopePop()
+        var out: Node = lowerCloneShallow n
+        for k in 0..<outKids.len:
+            addSon(out, outKids[k])
+        return out
+    of nkFnDecl, nkIteratorDecl:
+        lowerValueScopePush()
+        if kidCount n > 1:
+            let paramsNode: Node = kid(n, 1)
+            if paramsNode != nil && paramsNode.kind == nkFormalParams:
+                for pi in 0..<kidCount paramsNode:
+                    let defs: Node = kid(paramsNode, pi)
+                    if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
+                        let nameNode: Node = kid(defs, 0)
+                        let typeNode: Node = kid(defs, 1)
+                        let nm: str = stripSpaces(plainName(nameNode))
+                        if !strIsEmpty nm:
+                            lowerValueAdd(nm, typeNode)
+        var bodyNode: Node = nil
+        if kidCount n > 3:
+            bodyNode = kid(n, 3)
+        let newBody: Node = lowerControlStmt(bodyNode)
+        lowerValueScopePop()
+        var outFn: Node = lowerCloneShallow n
+        for i2 in 0..<kidCount n:
+            if i2 == 3:
+                addSon(outFn, newBody)
+            else:
+                addSon(outFn, kid(n, i2))
+        return outFn
+    of nkLet, nkVar, nkConst:
+        var nameNode: Node = nil
+        if kidCount n > 0:
+            nameNode = kid(n, 0)
+        var typeNode: Node = nil
+        if kidCount n > 1:
+            typeNode = kid(n, 1)
+        var valNode: Node = nil
+        if kidCount n > 2:
+            valNode = kid(n, 2)
+        var pragmaNode: Node = nil
+        if kidCount n > 3:
+            pragmaNode = kid(n, 3)
+        let res: LowerExprResult = lowerControlExpr(valNode)
+        var outVar: Node = lowerCloneShallow n
+        addSon(outVar, nameNode)
+        addSon(outVar, typeNode)
+        addSon(outVar, res.expr)
+        addSon(outVar, pragmaNode)
+        var list: Node = newNode(nkStmtList, n.pos)
+        lowerAddStmtList(list, res.stmts)
+        addSon(list, outVar)
+        if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
+            let nm: str = stripSpaces(plainName(nameNode))
+            if typeNode != nil && typeNode.kind != nkEmpty:
+                lowerValueAdd(nm, typeNode)
+            else:
+                let inferred: Node = lowerInferExprType res.expr
+                if inferred != nil:
+                    lowerValueAdd(nm, inferred)
+        return list
+    of nkAsgn, nkFastAsgn:
+        if kidCount n > 1:
+            let lhs: Node = kid(n, 0)
+            let rhs: Node = kid(n, 1)
+            let resLhs: LowerExprResult = lowerControlExpr(lhs)
+            let resRhs: LowerExprResult = lowerControlExpr(rhs)
+            if resLhs.stmts.len > 0:
+                lowerAddError(n.pos, "[C-Profile] not-mapped: control-flow expression in lvalue (FULLC.L01). hint: split into separate statements.")
+            var outAsgn: Node = lowerCloneShallow n
+            addSon(outAsgn, resLhs.expr)
+            addSon(outAsgn, resRhs.expr)
+            var list2: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list2, resLhs.stmts)
+            lowerAddStmtList(list2, resRhs.stmts)
+            addSon(list2, outAsgn)
+            return list2
+        return n
+    of nkReturn:
+        if kidCount n > 0:
+            let res: LowerExprResult = lowerControlExpr(kid(n, 0))
+            var outRet: Node = newNode(nkReturn, n.pos)
+            addSon(outRet, res.expr)
+            var list3: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list3, res.stmts)
+            addSon(list3, outRet)
+            return list3
+        return n
+    of nkIf, nkWhen:
+        var elseNode: Node = nil
+        if kidCount n % 2 == 1:
+            elseNode = lowerControlStmt(kid(n, kidCount n - 1))
+        var idx: int32 = kidCount n - 2
+        if elseNode != nil:
+            idx = kidCount n - 3
+        var curElse: Node = elseNode
+        while idx >= 0:
+            let condNode: Node = kid(n, idx)
+            let bodyNode: Node = kid(n, idx + 1)
+            let resCond: LowerExprResult = lowerControlExpr(condNode)
+            let newBody: Node = lowerControlStmt(bodyNode)
+            var ifNode: Node = newNode(n.kind, n.pos)
+            addSon(ifNode, resCond.expr)
+            addSon(ifNode, newBody)
+            if curElse != nil:
+                addSon(ifNode, curElse)
+            if resCond.stmts.len > 0:
+                var list4: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(list4, resCond.stmts)
+                addSon(list4, ifNode)
+                curElse = list4
+            else:
+                curElse = ifNode
+            idx = idx - 2
+        return curElse
+    of nkWhile:
+        if kidCount n > 1:
+            let condNode2: Node = kid(n, 0)
+            let bodyNode2: Node = kid(n, 1)
+            let resCond2: LowerExprResult = lowerControlExpr(condNode2)
+            let newBody2: Node = lowerControlStmt(bodyNode2)
+            if resCond2.stmts.len > 0:
+                var loopBody: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(loopBody, resCond2.stmts)
+                var notCond: Node = newNode(nkPrefix, n.pos)
+                addSon(notCond, newIdent("!", n.pos))
+                addSon(notCond, resCond2.expr)
+                var breakIf: Node = newNode(nkIf, n.pos)
+                addSon(breakIf, notCond)
+                var breakBody: Node = newNode(nkStmtList, n.pos)
+                addSon(breakBody, newNode(nkBreak, n.pos))
+                addSon(breakIf, breakBody)
+                addSon(loopBody, breakIf)
+                addSon(loopBody, newBody2)
+                var outWhile2: Node = newNode(nkWhile, n.pos)
+                addSon(outWhile2, newBoolLit(true, n.pos))
+                addSon(outWhile2, loopBody)
+                return outWhile2
+            var outWhile: Node = newNode(nkWhile, n.pos)
+            addSon(outWhile, resCond2.expr)
+            addSon(outWhile, newBody2)
+            return outWhile
+        return n
+    of nkFor:
+        if kidCount n > 2:
+            let pat: Node = kid(n, 0)
+            let iterExpr: Node = kid(n, 1)
+            let body: Node = kid(n, 2)
+            let resIter: LowerExprResult = lowerControlExpr(iterExpr)
+            let newBody3: Node = lowerControlStmt(body)
+            var outFor: Node = newNode(nkFor, n.pos)
+            addSon(outFor, pat)
+            addSon(outFor, resIter.expr)
+            addSon(outFor, newBody3)
+            if resIter.stmts.len > 0:
+                var list6: Node = newNode(nkStmtList, n.pos)
+                lowerAddStmtList(list6, resIter.stmts)
+                addSon(list6, outFor)
+                return list6
+            return outFor
+        return n
+    else:
+        let res2: LowerExprResult = lowerControlExpr(n)
+        if res2.stmts.len > 0:
+            var list7: Node = newNode(nkStmtList, n.pos)
+            lowerAddStmtList(list7, res2.stmts)
+            addSon(list7, res2.expr)
+            return list7
+        return res2.expr
+
+fn lowerControlFlow(root: Node): Node =
+    if root == nil:
+        return nil
+    lowerValueClear()
+    return lowerControlStmt(root)
+
+fn iterFrameTypeName(base: str): str =
+    return base + "_iter"
+
+fn iterOpenName(base: str): str =
+    return base + "_open"
+
+fn iterNextName(base: str): str =
+    return base + "_next"
+
+fn iterCloseName(base: str): str =
+    return base + "_close"
+
+fn iterNextTempName(prefix: str): str =
+    let name: str = "__iter_" + prefix + "_" + intToStr(lowerIterTempCounter)
+    lowerIterTempCounter = lowerIterTempCounter + 1
+    return name
+
+fn iterPickInternalName(base: str, captures: str[]): str =
+    var name: str = "__iter_" + base
+    while iterNameIndex(captures, name) >= 0:
+        name = name + "_"
+    return name
+
+fn iterNameIndex(names: str[], name: str): int32 =
+    for i in 0..<names.len:
+        if names[i] == name:
+            return i
+    return -1
+
+fn iterAddCapture(names: str[]*, types: Node[]*, name: str, ty: Node, pos: SourcePos) =
+    if name == nil || len name == 0 || name == "_":
+        return
+    if iterNameIndex(*names, name) >= 0:
+        return
+    add(names, name)
+    if ty != nil:
+        add(types, ty)
+    else:
+        add(types, newNode(nkEmpty, pos))
+
+fn iterLookupCaptureType(names: str[], types: Node[], name: str): Node =
+    let idx: int32 = iterNameIndex(names, name)
+    if idx < 0:
+        return nil
+    if idx < types.len:
+        return types[idx]
+    return nil
+
+fn iterInferSimpleType(n: Node, names: str[], types: Node[]): Node =
+    if n == nil:
+        return nil
+    case n.kind
+    of nkIntLit:
+        return newIdent("int32", n.pos)
+    of nkFloatLit:
+        return newIdent("float64", n.pos)
+    of nkBoolLit:
+        return newIdent("bool", n.pos)
+    of nkCharLit:
+        return newIdent("char", n.pos)
+    of nkStrLit:
+        return newIdent("str", n.pos)
+    of nkIdent, nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        if len nm == 0:
+            return nil
+        return iterLookupCaptureType(names, types, nm)
+    of nkInfix:
+        if kidCount n >= 3:
+            let op: str = stripSpaces(plainName(kid(n, 0)))
+            let lhs: Node = kid(n, 1)
+            let rhs: Node = kid(n, 2)
+            let lt: Node = iterInferSimpleType(lhs, names, types)
+            let rt: Node = iterInferSimpleType(rhs, names, types)
+            if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=":
+                return newIdent("bool", n.pos)
+            if lt != nil && (stripSpaces(plainName(lt)) == "float64" || stripSpaces(plainName(lt)) == "float"):
+                return newIdent("float64", n.pos)
+            if rt != nil && (stripSpaces(plainName(rt)) == "float64" || stripSpaces(plainName(rt)) == "float"):
+                return newIdent("float64", n.pos)
+            if lt != nil:
+                return lt
+            if rt != nil:
+                return rt
+            if op == "+" || op == "-" || op == "*" || op == "/" || op == "%":
+                return newIdent("int32", n.pos)
+        return nil
+    of nkPrefix:
+        if kidCount n > 1:
+            return iterInferSimpleType(kid(n, 1), names, types)
+        return nil
+    of nkPar:
+        if kidCount n == 1:
+            return iterInferSimpleType(kid(n, 0), names, types)
+        return nil
+    else:
+        return nil
+
+fn iterDefaultValueNode(ty: Node, pos: SourcePos): Node =
+    if ty == nil || ty.kind == nkEmpty:
+        return newNode(nkEmpty, pos)
+    var base: Node = ty
+    if base.kind == nkPar && kidCount base == 1:
+        base = kid(base, 0)
+    if base.kind == nkVarTy || base.kind == nkPtrTy || base.kind == nkRefTy:
+        return lowerMakeNilLit(pos)
+    if base.kind == nkPostfix && kidCount base > 1:
+        let opn: Node = kid(base, 0)
+        let opn2: Node = kid(base, 1)
+        if opn != nil && stripSpaces(opn.ident) == "*":
+            return lowerMakeNilLit(pos)
+        if opn2 != nil && stripSpaces(opn2.ident) == "*":
+            return lowerMakeNilLit(pos)
+    if base.kind == nkIdent || base.kind == nkSymbol:
+        let tname: str = stripSpaces(base.ident)
+        if tname == "bool":
+            return lowerMakeBoolLit(false, pos)
+        if tname == "char":
+            return lowerMakeIntLit(0, pos)
+        if tname == "float" || tname == "float32" || tname == "float64":
+            return newFloatLit(0.0, pos)
+        if tname == "str" || tname == "cstring":
+            return lowerMakeNilLit(pos)
+        if tname == "int" || tname == "int8" || tname == "int16" || tname == "int32" || tname == "int64":
+            return lowerMakeIntLit(0, pos)
+        if tname == "uint" || tname == "uint8" || tname == "uint16" || tname == "uint32" || tname == "uint64":
+            return lowerMakeIntLit(0, pos)
+    return newNode(nkEmpty, pos)
+
+fn iterPatternIdent(pat: Node): Node =
+    if pat == nil:
+        return nil
+    var cur: Node = pat
+    if cur.kind == nkPattern && kidCount cur > 0:
+        cur = kid(cur, 0)
+    if cur.kind == nkPar && kidCount cur == 1:
+        cur = kid(cur, 0)
+    if cur.kind == nkIdent || cur.kind == nkSymbol:
+        return cur
+    return nil
+
+fn iterCollectLocals(n: Node, names: str[]*, types: Node[]*) =
+    if n == nil:
+        return
+    if n.kind == nkIteratorDecl:
+        return
+    if n.kind == nkVar || n.kind == nkLet || n.kind == nkConst:
+        var nameNode: Node = nil
+        var typeNode: Node = nil
+        var valNode: Node = nil
+        if kidCount n > 0:
+            nameNode = kid(n, 0)
+        if kidCount n > 1:
+            typeNode = kid(n, 1)
+        if kidCount n > 2:
+            valNode = kid(n, 2)
+        let innerName: Node = iterPatternIdent(nameNode)
+        if innerName == nil:
+            lowerAddError(n.pos, "C-profile iterator lowering: only simple identifier bindings are supported")
+            return
+        let nm: str = stripSpaces(plainName(innerName))
+        if nm == "_" || len nm == 0:
+            return
+        if typeNode == nil || typeNode.kind == nkEmpty:
+            if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 1:
+                let pt: Node = kid(nameNode, 1)
+                if pt != nil && pt.kind != nkEmpty:
+                    typeNode = pt
+            if (typeNode == nil || typeNode.kind == nkEmpty) && valNode != nil && valNode.kind != nkEmpty:
+                typeNode = iterInferSimpleType(valNode, *names, *types)
+            if typeNode == nil || typeNode.kind == nkEmpty:
+                lowerAddError(n.pos, "C-profile iterator lowering: missing type for local '" + nm + "'")
+                typeNode = newNode(nkEmpty, n.pos)
+        iterAddCapture(names, types, nm, typeNode, n.pos)
+        return
+    for i in 0..<kidCount n:
+        iterCollectLocals(kid(n, i), names, types)
+
+fn iterHasNestedDefer(n: Node, depth: int32): bool =
+    if n == nil:
+        return false
+    if n.kind == nkDefer:
+        return depth > 0
+    for i in 0..<kidCount n:
+        if iterHasNestedDefer(kid(n, i), depth + 1):
+            return true
+    return false
+
+fn iterExtractTopDefers(body: Node, defers: Node[]*): Node =
+    if body == nil:
+        return body
+    var list: Node = body
+    if list.kind != nkStmtList:
+        list = newNode(nkStmtList, body.pos)
+        addSon(list, body)
+    var out: Node = newNode(nkStmtList, list.pos)
+    for i in 0..<kidCount list:
+        let stmt: Node = kid(list, i)
+        if stmt != nil && stmt.kind == nkDefer:
+            if kidCount stmt > 0:
+                add(defers, kid(stmt, 0))
+        else:
+            addSon(out, stmt)
+    if iterHasNestedDefer(out, 0):
+        lowerAddError(out.pos, "C-profile iterator lowering: nested defer inside iterator is not supported")
+    return out
+
+fn iterIsCaptured(ctx: IterLowerCtx, name: str): bool =
+    if name == nil || len name == 0:
+        return false
+    if name == ctx.frameName || name == ctx.outName:
+        return false
+    return iterNameIndex(ctx.captureNames, name) >= 0
+
+fn iterRewriteTree(n: Node, ctx: IterLowerCtx): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkPattern || n.kind == nkIdentDefs || n.kind == nkFormalParams ||
+       n.kind == nkTypeDecl || n.kind == nkObjectDecl || n.kind == nkRecList || n.kind == nkEnumDecl:
+        return cloneTree n
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        if iterIsCaptured(ctx, nm):
+            return lowerMakeDot(ctx.frameName, nm, n.pos)
+        return cloneTree n
+    if n.kind == nkDotExpr && kidCount n > 0:
+        var outDot: Node = newNode(nkDotExpr, n.pos)
+        addSon(outDot, iterRewriteTree(kid(n, 0), ctx))
+        if kidCount n > 1:
+            addSon(outDot, cloneTree(kid(n, 1)))
+        return outDot
+    if n.kind == nkCallArg:
+        var outArg: Node = newNode(nkCallArg, n.pos)
+        if kidCount n > 0:
+            addSon(outArg, cloneTree(kid(n, 0)))
+        if kidCount n > 1:
+            addSon(outArg, iterRewriteTree(kid(n, 1), ctx))
+        return outArg
+    if n.kind == nkInfix && kidCount n >= 3:
+        var outInf: Node = newNode(nkInfix, n.pos)
+        addSon(outInf, cloneTree(kid(n, 0)))
+        addSon(outInf, iterRewriteTree(kid(n, 1), ctx))
+        addSon(outInf, iterRewriteTree(kid(n, 2), ctx))
+        return outInf
+    if n.kind == nkPrefix && kidCount n >= 2:
+        var outPre: Node = newNode(nkPrefix, n.pos)
+        addSon(outPre, cloneTree(kid(n, 0)))
+        addSon(outPre, iterRewriteTree(kid(n, 1), ctx))
+        return outPre
+    if n.kind == nkPostfix && kidCount n >= 2:
+        var outPost: Node = newNode(nkPostfix, n.pos)
+        addSon(outPost, iterRewriteTree(kid(n, 0), ctx))
+        addSon(outPost, cloneTree(kid(n, 1)))
+        return outPost
+    var out: Node = lowerCloneShallow(n)
+    for i in 0..<kidCount n:
+        addSon(out, iterRewriteTree(kid(n, i), ctx))
+    return out
+
+fn iterNodeHasYield(n: Node): bool =
+    if n == nil:
+        return false
+    if n.kind == nkYield:
+        return true
+    for i in 0..<kidCount n:
+        if iterNodeHasYield(kid(n, i)):
+            return true
+    return false
+
+fn iterNewState(states: Node[]*, pos: SourcePos): int32 =
+    let id: int32 = states.len
+    var list: Node = newNode(nkStmtList, pos)
+    add(states, list)
+    return id
+
+fn iterStateBody(states: Node[], id: int32): Node =
+    if id < 0 || id >= states.len:
+        return nil
+    return states[id]
+
+fn iterStateAdd(states: Node[]*, id: int32, stmt: Node) =
+    let body: Node = iterStateBody(*states, id)
+    if body != nil && stmt != nil:
+        addSon(body, stmt)
+
+fn iterMakeSetState(frameName: str, stateVal: int32, pos: SourcePos): Node =
+    var asn: Node = newNode(nkAsgn, pos)
+    addSon(asn, lowerMakeDot(frameName, "state", pos))
+    addSon(asn, lowerMakeIntLit(int64(stateVal), pos))
+    return asn
+
+fn iterMakeDeref(expr: Node, pos: SourcePos): Node =
+    var d: Node = newNode(nkHiddenDeref, pos)
+    addSon(d, expr)
+    return d
+
+fn iterLowerStmt(stmt: Node, states: Node[]*, curState: int32, nextState: int32,
+    loopCtx: IterLoopCtx*, ctx: IterLowerCtx): IterStmtResult
+
+fn iterLowerStmtList(stmts: Node, states: Node[]*, curState: int32, nextState: int32,
+    loopCtx: IterLoopCtx*, ctx: IterLowerCtx): IterStmtResult =
+    var state: int32 = curState
+    var open: bool = true
+    var list: Node = stmts
+    if list == nil:
+        list = newNode(nkStmtList, default[SourcePos])
+    if list.kind != nkStmtList:
+        var tmp: Node = newNode(nkStmtList, list.pos)
+        addSon(tmp, list)
+        list = tmp
+    for i in 0..<kidCount list:
+        if ! open:
+            break
+        let s: Node = kid(list, i)
+        let res: IterStmtResult = iterLowerStmt(s, states, state, nextState, loopCtx, ctx)
+        state = res.state
+        open = res.open
+    var outRes: IterStmtResult
+    if open:
+        iterStateAdd(states, state, iterMakeSetState(ctx.frameName, nextState, list.pos))
+        outRes.state = nextState
+        outRes.open = true
+    else:
+        outRes.state = state
+        outRes.open = false
+    return outRes
+
+fn iterIsExprStmt(n: Node): bool =
+    if n == nil:
+        return false
+    case n.kind
+    of nkIntLit, nkFloatLit, nkBoolLit, nkCharLit, nkStrLit, nkNilLit,
+       nkIdent, nkSymbol, nkInfix, nkPrefix, nkCall, nkDotExpr, nkPar,
+       nkTupleLit, nkBracket, nkBracketExpr, nkCurly:
+        return true
+    else:
+        return false
+
+fn iterLowerStmt(stmt: Node, states: Node[]*, curState: int32, nextState: int32,
+    loopCtx: IterLoopCtx*, ctx: IterLowerCtx): IterStmtResult =
+    var out: IterStmtResult
+    out.state = curState
+    out.open = true
+    if stmt == nil || stmt.kind == nkEmpty:
+        return out
+    case stmt.kind
+    of nkStmtList:
+        return iterLowerStmtList(stmt, states, curState, nextState, loopCtx, ctx)
+    of nkVar, nkLet, nkConst:
+        var nameNode: Node = nil
+        var typeNode: Node = nil
+        var valNode: Node = nil
+        if kidCount stmt > 0:
+            nameNode = kid(stmt, 0)
+        if kidCount stmt > 1:
+            typeNode = kid(stmt, 1)
+        if kidCount stmt > 2:
+            valNode = kid(stmt, 2)
+        let innerName: Node = iterPatternIdent(nameNode)
+        if innerName == nil:
+            lowerAddError(stmt.pos, "C-profile iterator lowering: only simple identifier bindings are supported")
+            return out
+        let nm: str = stripSpaces(plainName(innerName))
+        if nm == "_" || len nm == 0:
+            if valNode != nil && valNode.kind != nkEmpty:
+                iterStateAdd(states, curState, iterRewriteTree(valNode, ctx))
+            return out
+        var rhs: Node = nil
+        if valNode != nil && valNode.kind != nkEmpty:
+            rhs = iterRewriteTree(valNode, ctx)
+        else:
+            var ty: Node = typeNode
+            if ty == nil || ty.kind == nkEmpty:
+                ty = iterLookupCaptureType(ctx.captureNames, ctx.captureTypes, nm)
+            rhs = iterDefaultValueNode(ty, stmt.pos)
+            if rhs == nil || rhs.kind == nkEmpty:
+                lowerAddError(stmt.pos, "C-profile iterator lowering: missing initializer for '" + nm + "'")
+                return out
+        var asn: Node = newNode(nkAsgn, stmt.pos)
+        addSon(asn, lowerMakeDot(ctx.frameName, nm, stmt.pos))
+        addSon(asn, rhs)
+        iterStateAdd(states, curState, asn)
+        return out
+    of nkYield:
+        var resume: int32 = iterNewState(states, stmt.pos)
+        var yieldExpr: Node = nil
+        if kidCount stmt > 0:
+            yieldExpr = kid(stmt, 0)
+        if yieldExpr != nil && yieldExpr.kind != nkEmpty:
+            var asnOut: Node = newNode(nkAsgn, stmt.pos)
+            addSon(asnOut, iterMakeDeref(newIdent(ctx.outName, stmt.pos), stmt.pos))
+            addSon(asnOut, iterRewriteTree(yieldExpr, ctx))
+            iterStateAdd(states, curState, asnOut)
+        else:
+            let yieldTy: Node = ctx.yieldType
+            if yieldTy != nil && yieldTy.kind != nkEmpty && !lowerIsVoidType(yieldTy):
+                lowerAddError(stmt.pos, "C-profile iterator lowering: yield requires value")
+                var defVal: Node = iterDefaultValueNode(yieldTy, stmt.pos)
+                if defVal != nil && defVal.kind != nkEmpty:
+                    var asnOut2: Node = newNode(nkAsgn, stmt.pos)
+                    addSon(asnOut2, iterMakeDeref(newIdent(ctx.outName, stmt.pos), stmt.pos))
+                    addSon(asnOut2, defVal)
+                    iterStateAdd(states, curState, asnOut2)
+        iterStateAdd(states, curState, iterMakeSetState(ctx.frameName, resume, stmt.pos))
+        var retTrue: Node = newNode(nkReturn, stmt.pos)
+        addSon(retTrue, lowerMakeBoolLit(true, stmt.pos))
+        iterStateAdd(states, curState, retTrue)
+        out.state = resume
+        out.open = true
+        return out
+    of nkReturn:
+        if kidCount stmt > 0:
+            let rv: Node = kid(stmt, 0)
+            if rv != nil && rv.kind != nkEmpty:
+                lowerAddError(stmt.pos, "C-profile iterator lowering: return value in iterator is ignored")
+        iterStateAdd(states, curState, iterMakeSetState(ctx.frameName, -1, stmt.pos))
+        var retFalse: Node = newNode(nkReturn, stmt.pos)
+        addSon(retFalse, lowerMakeBoolLit(false, stmt.pos))
+        iterStateAdd(states, curState, retFalse)
+        out.open = false
+        return out
+    of nkBreak:
+        if loopCtx == nil:
+            lowerAddError(stmt.pos, "C-profile iterator lowering: break outside loop")
+        else:
+            iterStateAdd(states, curState, iterMakeSetState(ctx.frameName, loopCtx->breakState, stmt.pos))
+        out.open = false
+        return out
+    of nkContinue:
+        if loopCtx == nil:
+            lowerAddError(stmt.pos, "C-profile iterator lowering: continue outside loop")
+        else:
+            iterStateAdd(states, curState, iterMakeSetState(ctx.frameName, loopCtx->continueState, stmt.pos))
+        out.open = false
+        return out
+    of nkIf, nkWhen:
+        var total: int32 = kidCount stmt
+        let hasElse: bool = (total % 2 == 1)
+        let afterState: int32 = iterNewState(states, stmt.pos)
+        var ifNode: Node = newNode(stmt.kind, stmt.pos)
+        var i: int32 = 0
+        while i + 1 < total:
+            let cond: Node = kid(stmt, i)
+            let body: Node = kid(stmt, i + 1)
+            let branchState: int32 = iterNewState(states, stmt.pos)
+            var assignList: Node = newNode(nkStmtList, stmt.pos)
+            addSon(assignList, iterMakeSetState(ctx.frameName, branchState, stmt.pos))
+            addSon(ifNode, iterRewriteTree(cond, ctx))
+            addSon(ifNode, assignList)
+            iterLowerStmtList(body, states, branchState, afterState, loopCtx, ctx)
+            i = i + 2
+        if hasElse:
+            let elseBody: Node = kid(stmt, total - 1)
+            let elseState: int32 = iterNewState(states, stmt.pos)
+            var elseAssign: Node = newNode(nkStmtList, stmt.pos)
+            addSon(elseAssign, iterMakeSetState(ctx.frameName, elseState, stmt.pos))
+            addSon(ifNode, elseAssign)
+            iterLowerStmtList(elseBody, states, elseState, afterState, loopCtx, ctx)
+        else:
+            var elseAssign2: Node = newNode(nkStmtList, stmt.pos)
+            addSon(elseAssign2, iterMakeSetState(ctx.frameName, afterState, stmt.pos))
+            addSon(ifNode, elseAssign2)
+        iterStateAdd(states, curState, ifNode)
+        out.state = afterState
+        out.open = true
+        return out
+    of nkWhile:
+        var condNode: Node = nil
+        var bodyNode: Node = nil
+        if kidCount stmt > 0:
+            condNode = kid(stmt, 0)
+        if kidCount stmt > 1:
+            bodyNode = kid(stmt, 1)
+        let condState: int32 = iterNewState(states, stmt.pos)
+        let bodyState: int32 = iterNewState(states, stmt.pos)
+        let afterState: int32 = iterNewState(states, stmt.pos)
+        iterStateAdd(states, curState, iterMakeSetState(ctx.frameName, condState, stmt.pos))
+        var condIf: Node = newNode(nkIf, stmt.pos)
+        var trueList: Node = newNode(nkStmtList, stmt.pos)
+        addSon(trueList, iterMakeSetState(ctx.frameName, bodyState, stmt.pos))
+        addSon(condIf, iterRewriteTree(condNode, ctx))
+        addSon(condIf, trueList)
+        var elseList: Node = newNode(nkStmtList, stmt.pos)
+        addSon(elseList, iterMakeSetState(ctx.frameName, afterState, stmt.pos))
+        addSon(condIf, elseList)
+        iterStateAdd(states, condState, condIf)
+        var loop: IterLoopCtx
+        loop.breakState = afterState
+        loop.continueState = condState
+        loop.parent = loopCtx
+        iterLowerStmtList(bodyNode, states, bodyState, condState, &loop, ctx)
+        out.state = afterState
+        out.open = true
+        return out
+    of nkFor:
+        lowerAddError(stmt.pos, "C-profile iterator lowering: nested for is not supported in iterator body")
+        return out
+    of nkDefer:
+        return out
+    else:
+        if iterNodeHasYield(stmt):
+            lowerAddError(stmt.pos, "C-profile iterator lowering: yield inside unsupported construct")
+            return out
+        iterStateAdd(states, curState, iterRewriteTree(stmt, ctx))
+    return out
+
+fn iterBuildFrameType(name: str, captures: str[], captureTypes: Node[], pos: SourcePos): Node =
+    if (lowerGetEnv("STAGE1_TRACE_ITER") == "1") && (name == "__cheng_lambda_2_iter"):
+        echo("[lower] iter frame " + name + " captures=" + intToStr(captures.len))
+        for di in 0..<captures.len:
+            let nm: str = captures[di]
+            let nlen: int32 = len nm
+            echo("[lower] iter cap '" + nm + "' len=" + intToStr(nlen))
+    var td: Node = newNode(nkTypeDecl, pos)
+    addSon(td, newIdent(name, pos))
+    var obj: Node = newNode(nkObjectDecl, pos)
+    addSon(obj, newNode(nkEmpty, pos))
+    var rec: Node = newNode(nkRecList, pos)
+    var stateDefs: Node = newNode(nkIdentDefs, pos)
+    addSon(stateDefs, newIdent("state", pos))
+    addSon(stateDefs, newIdent("int32", pos))
+    addSon(stateDefs, newNode(nkEmpty, pos))
+    addSon(rec, stateDefs)
+    for i in 0..<captures.len:
+        let nm: str = captures[i]
+        let ty: Node = captureTypes[i]
+        var defs: Node = newNode(nkIdentDefs, pos)
+        addSon(defs, newIdent(nm, pos))
+        if ty != nil:
+            addSon(defs, cloneTree ty)
+        else:
+            addSon(defs, newNode(nkEmpty, pos))
+        addSon(defs, newNode(nkEmpty, pos))
+        addSon(rec, defs)
+    addSon(obj, rec)
+    addSon(td, obj)
+    addSon(td, newNode(nkEmpty, pos))
+    addSon(td, newNode(nkEmpty, pos))
+    addSon(td, newNode(nkEmpty, pos))
+    return td
+
+fn iterBuildOpen(name: str, frameType: str, paramsNode: Node, paramNames: str[], frameVarName: str, pos: SourcePos): Node =
+    var fnNode: Node = newNode(nkFnDecl, pos)
+    addSon(fnNode, newIdent(name, pos))
+    if paramsNode != nil:
+        addSon(fnNode, cloneTree paramsNode)
+    else:
+        addSon(fnNode, newNode(nkFormalParams, pos))
+    addSon(fnNode, newIdent(frameType, pos))
+    var body: Node = newNode(nkStmtList, pos)
+    let frameName: str = frameVarName
+    var decl: Node = newNode(nkVar, pos)
+    addSon(decl, newIdent(frameName, pos))
+    addSon(decl, newIdent(frameType, pos))
+    addSon(decl, newNode(nkEmpty, pos))
+    addSon(decl, newNode(nkEmpty, pos))
+    addSon(body, decl)
+    var initState: Node = iterMakeSetState(frameName, 0, pos)
+    addSon(body, initState)
+    for i in 0..<paramNames.len:
+        let pn: str = paramNames[i]
+        if pn != nil && len pn > 0:
+            var asn: Node = newNode(nkAsgn, pos)
+            addSon(asn, lowerMakeDot(frameName, pn, pos))
+            addSon(asn, newIdent(pn, pos))
+            addSon(body, asn)
+    var retNode: Node = newNode(nkReturn, pos)
+    addSon(retNode, newIdent(frameName, pos))
+    addSon(body, retNode)
+    addSon(fnNode, body)
+    addSon(fnNode, newNode(nkEmpty, pos))
+    addSon(fnNode, newNode(nkEmpty, pos))
+    return fnNode
+
+fn iterBuildNext(name: str, frameType: str, yieldType: Node, bodyNode: Node, ctx: IterLowerCtx, pos: SourcePos): Node =
+    var fnNode: Node = newNode(nkFnDecl, pos)
+    addSon(fnNode, newIdent(name, pos))
+    var params: Node = newNode(nkFormalParams, pos)
+    var defsFrame: Node = newNode(nkIdentDefs, pos)
+    addSon(defsFrame, newIdent(ctx.frameName, pos))
+    addSon(defsFrame, lowerMakeVarType(newIdent(frameType, pos), pos))
+    addSon(defsFrame, newNode(nkEmpty, pos))
+    addSon(params, defsFrame)
+    var defsOut: Node = newNode(nkIdentDefs, pos)
+    addSon(defsOut, newIdent(ctx.outName, pos))
+    var outTy: Node = newNode(nkEmpty, pos)
+    if yieldType != nil:
+        outTy = cloneTree(yieldType)
+    addSon(defsOut, lowerMakeVarType(outTy, pos))
+    addSon(defsOut, newNode(nkEmpty, pos))
+    addSon(params, defsOut)
+    addSon(fnNode, params)
+    addSon(fnNode, newIdent("bool", pos))
+    var states: Node[8]
+    let startState: int32 = iterNewState(&states, pos)
+    let doneState: int32 = iterNewState(&states, pos)
+    iterLowerStmtList(bodyNode, &states, startState, doneState, nil, ctx)
+    iterStateAdd(&states, doneState, iterMakeSetState(ctx.frameName, -1, pos))
+    var retFalse: Node = newNode(nkReturn, pos)
+    addSon(retFalse, lowerMakeBoolLit(false, pos))
+    iterStateAdd(&states, doneState, retFalse)
+    var ifNode: Node = newNode(nkIf, pos)
+    for si in 0..<states.len:
+        let cond: Node = lowerMakeInfix("==", lowerMakeDot(ctx.frameName, "state", pos),
+            lowerMakeIntLit(int64(si), pos), pos)
+        addSon(ifNode, cond)
+        addSon(ifNode, states[si])
+    var elseBody: Node = newNode(nkStmtList, pos)
+    addSon(elseBody, iterMakeSetState(ctx.frameName, -1, pos))
+    var retFalse2: Node = newNode(nkReturn, pos)
+    addSon(retFalse2, lowerMakeBoolLit(false, pos))
+    addSon(elseBody, retFalse2)
+    addSon(ifNode, elseBody)
+    var loopBody: Node = newNode(nkStmtList, pos)
+    addSon(loopBody, ifNode)
+    addSon(loopBody, newNode(nkContinue, pos))
+    var loop: Node = newNode(nkWhile, pos)
+    addSon(loop, lowerMakeBoolLit(true, pos))
+    addSon(loop, loopBody)
+    var body: Node = newNode(nkStmtList, pos)
+    addSon(body, loop)
+    addSon(fnNode, body)
+    addSon(fnNode, newNode(nkEmpty, pos))
+    addSon(fnNode, newNode(nkEmpty, pos))
+    return fnNode
+
+fn iterBuildClose(name: str, frameType: str, defers: Node[], ctx: IterLowerCtx, pos: SourcePos): Node =
+    var fnNode: Node = newNode(nkFnDecl, pos)
+    addSon(fnNode, newIdent(name, pos))
+    var params: Node = newNode(nkFormalParams, pos)
+    var defsFrame: Node = newNode(nkIdentDefs, pos)
+    addSon(defsFrame, newIdent(ctx.frameName, pos))
+    addSon(defsFrame, lowerMakeVarType(newIdent(frameType, pos), pos))
+    addSon(defsFrame, newNode(nkEmpty, pos))
+    addSon(params, defsFrame)
+    addSon(fnNode, params)
+    addSon(fnNode, newNode(nkEmpty, pos))
+    var body: Node = newNode(nkStmtList, pos)
+    let __for_start_i = defers.len - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        let d: Node = defers[i]
+        addSon(body, iterRewriteTree(d, ctx))
+    addSon(body, iterMakeSetState(ctx.frameName, -1, pos))
+    addSon(fnNode, body)
+    addSon(fnNode, newNode(nkEmpty, pos))
+    addSon(fnNode, newNode(nkEmpty, pos))
+    return fnNode
+
+fn iterBuildCallWrapper(baseName: str, frameType: str, openName: str, nextName: str, closeName: str,
+    paramsNode: Node, paramNames: str[], retType: Node, pos: SourcePos): Node =
+    var fnNode: Node = newNode(nkFnDecl, pos)
+    addSon(fnNode, newIdent(baseName, pos))
+    if paramsNode != nil:
+        addSon(fnNode, cloneTree paramsNode)
+    else:
+        addSon(fnNode, newNode(nkFormalParams, pos))
+    if retType != nil:
+        addSon(fnNode, cloneTree retType)
+    else:
+        addSon(fnNode, newNode(nkEmpty, pos))
+    var body: Node = newNode(nkStmtList, pos)
+    let frameVar: str = iterNextTempName("frame")
+    var openCall: Node = newNode(nkCall, pos)
+    addSon(openCall, newIdent(openName, pos))
+    for pi in 0..<paramNames.len:
+        let pn: str = paramNames[pi]
+        addSon(openCall, newIdent(pn, pos))
+    var frameDecl: Node = newNode(nkVar, pos)
+    addSon(frameDecl, newIdent(frameVar, pos))
+    addSon(frameDecl, newIdent(frameType, pos))
+    addSon(frameDecl, openCall)
+    addSon(frameDecl, newNode(nkEmpty, pos))
+    addSon(body, frameDecl)
+    let outVar: str = iterNextTempName("out")
+    var outDecl: Node = newNode(nkVar, pos)
+    addSon(outDecl, newIdent(outVar, pos))
+    if retType != nil:
+        addSon(outDecl, cloneTree retType)
+    else:
+        addSon(outDecl, newNode(nkEmpty, pos))
+    let defVal: Node = iterDefaultValueNode(retType, pos)
+    if defVal != nil && defVal.kind != nkEmpty:
+        addSon(outDecl, defVal)
+    else:
+        addSon(outDecl, newNode(nkEmpty, pos))
+    addSon(outDecl, newNode(nkEmpty, pos))
+    addSon(body, outDecl)
+    let okVar: str = iterNextTempName("ok")
+    var okDecl: Node = newNode(nkLet, pos)
+    addSon(okDecl, newIdent(okVar, pos))
+    addSon(okDecl, newIdent("bool", pos))
+    var nextCall: Node = newNode(nkCall, pos)
+    addSon(nextCall, newIdent(nextName, pos))
+    addSon(nextCall, newIdent(frameVar, pos))
+    addSon(nextCall, newIdent(outVar, pos))
+    addSon(okDecl, nextCall)
+    addSon(okDecl, newNode(nkEmpty, pos))
+    addSon(body, okDecl)
+    var closeCall: Node = newNode(nkCall, pos)
+    addSon(closeCall, newIdent(closeName, pos))
+    addSon(closeCall, newIdent(frameVar, pos))
+    addSon(body, closeCall)
+    var ifNode: Node = newNode(nkIf, pos)
+    addSon(ifNode, newIdent(okVar, pos))
+    var ifBody: Node = newNode(nkStmtList, pos)
+    var retNode: Node = newNode(nkReturn, pos)
+    addSon(retNode, newIdent(outVar, pos))
+    addSon(ifBody, retNode)
+    addSon(ifNode, ifBody)
+    addSon(body, ifNode)
+    var retDefault: Node = newNode(nkReturn, pos)
+    addSon(retDefault, newIdent(outVar, pos))
+    addSon(body, retDefault)
+    addSon(fnNode, body)
+    addSon(fnNode, newNode(nkEmpty, pos))
+    addSon(fnNode, newNode(nkEmpty, pos))
+    return fnNode
+
+fn lowerIteratorDecl(iterNode: Node): Node =
+    if iterNode == nil || kidCount iterNode < 4:
+        return iterNode
+    let nameNode: Node = kid(iterNode, 0)
+    let paramsNode: Node = kid(iterNode, 1)
+    let retType: Node = kid(iterNode, 2)
+    let bodyNode: Node = kid(iterNode, 3)
+    let baseName: str = stripSpaces(plainName(nameNode))
+    if len baseName == 0:
+        return iterNode
+    if retType == nil || retType.kind == nkEmpty:
+        lowerAddError(iterNode.pos, "C-profile iterator lowering: missing yield type for iterator " + baseName)
+    var captureNames: str[8]
+    var captureTypes: Node[8]
+    var paramNames: str[4]
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        for i in 0..<kidCount paramsNode:
+            let defs: Node = kid(paramsNode, i)
+            if defs != nil && defs.kind == nkIdentDefs:
+                var typeNode: Node = nil
+                if kidCount defs > 1:
+                    typeNode = kid(defs, 1)
+                let nameCount: int32 = identDefsNameCount defs
+                for j in 0..<nameCount:
+                    var nameN: Node = kid(defs, j)
+                    if nameN != nil && nameN.kind == nkPattern && kidCount nameN > 0:
+                        nameN = kid(nameN, 0)
+                    let nm: str = stripSpaces(plainName(nameN))
+                    if len nm > 0:
+                        if typeNode == nil || typeNode.kind == nkEmpty:
+                            lowerAddError(iterNode.pos, "C-profile iterator lowering: missing type for parameter " + nm)
+                        iterAddCapture(&captureNames, &captureTypes, nm, typeNode, iterNode.pos)
+                        add(paramNames, nm)
+    iterCollectLocals(bodyNode, &captureNames, &captureTypes)
+    var defers: Node[2]
+    var bodyClean: Node = iterExtractTopDefers(bodyNode, &defers)
+    if bodyClean != nil && bodyClean.kind == nkStmtList && kidCount bodyClean == 1:
+        let only: Node = kid(bodyClean, 0)
+        if iterIsExprStmt(only):
+            var y: Node = newNode(nkYield, only.pos)
+            addSon(y, only)
+            var newBody: Node = newNode(nkStmtList, bodyClean.pos)
+            addSon(newBody, y)
+            bodyClean = newBody
+    let frameType: str = iterFrameTypeName(baseName)
+    let openName: str = iterOpenName(baseName)
+    let nextName: str = iterNextName(baseName)
+    let closeName: str = iterCloseName(baseName)
+    var ctx: IterLowerCtx
+    ctx.frameName = iterPickInternalName("frame", captureNames)
+    ctx.outName = iterPickInternalName("out", captureNames)
+    ctx.yieldType = retType
+    ctx.captureNames = captureNames
+    ctx.captureTypes = captureTypes
+    var outList: Node = newNode(nkStmtList, iterNode.pos)
+    addSon(outList, iterBuildFrameType(frameType, captureNames, captureTypes, iterNode.pos))
+    addSon(outList, iterBuildOpen(openName, frameType, paramsNode, paramNames, ctx.frameName, iterNode.pos))
+    addSon(outList, iterBuildNext(nextName, frameType, retType, bodyClean, ctx, iterNode.pos))
+    addSon(outList, iterBuildClose(closeName, frameType, defers, ctx, iterNode.pos))
+    addSon(outList, iterBuildCallWrapper(baseName, frameType, openName, nextName, closeName, paramsNode, paramNames, retType, iterNode.pos))
+    return outList
+
+fn lowerForIterator(n: Node): Node =
+    if n == nil || kidCount n < 3:
+        return n
+    let pat: Node = kid(n, 0)
+    let iterExpr: Node = kid(n, 1)
+    let body: Node = kid(n, 2)
+    if iterExpr == nil || iterExpr.kind != nkCall || kidCount iterExpr == 0:
+        return n
+    let callee: Node = kid(iterExpr, 0)
+    let iterName: str = lowerCallTargetName(callee)
+    let iterNode: Node = lowerIterLookup(iterName)
+    if iterNode == nil:
+        return n
+    let frameType: str = iterFrameTypeName(iterName)
+    let openName: str = iterOpenName(iterName)
+    let nextName: str = iterNextName(iterName)
+    let closeName: str = iterCloseName(iterName)
+    var retType: Node = newNode(nkEmpty, n.pos)
+    if kidCount iterNode > 2:
+        retType = kid(iterNode, 2)
+    if retType == nil || retType.kind == nkEmpty:
+        lowerAddError(n.pos, "C-profile iterator lowering: missing yield type for iterator " + iterName)
+        return n
+    var outList: Node = newNode(nkStmtList, n.pos)
+    let frameVar: str = iterNextTempName("frame")
+    let valueVar: str = iterNextTempName("value")
+    var openCall: Node = newNode(nkCall, n.pos)
+    addSon(openCall, newIdent(openName, n.pos))
+    for ai in 1..<kidCount iterExpr:
+        addSon(openCall, kid(iterExpr, ai))
+    var frameDecl: Node = newNode(nkVar, n.pos)
+    addSon(frameDecl, newIdent(frameVar, n.pos))
+    addSon(frameDecl, newIdent(frameType, n.pos))
+    addSon(frameDecl, openCall)
+    addSon(frameDecl, newNode(nkEmpty, n.pos))
+    addSon(outList, frameDecl)
+    var closeCall: Node = newNode(nkCall, n.pos)
+    addSon(closeCall, newIdent(closeName, n.pos))
+    addSon(closeCall, newIdent(frameVar, n.pos))
+    var closeBody: Node = newNode(nkStmtList, n.pos)
+    addSon(closeBody, closeCall)
+    var deferNode: Node = newNode(nkDefer, n.pos)
+    addSon(deferNode, closeBody)
+    addSon(outList, deferNode)
+    var valDecl: Node = newNode(nkVar, n.pos)
+    addSon(valDecl, newIdent(valueVar, n.pos))
+    addSon(valDecl, cloneTree retType)
+    addSon(valDecl, iterDefaultValueNode(retType, n.pos))
+    addSon(valDecl, newNode(nkEmpty, n.pos))
+    addSon(outList, valDecl)
+    var nextCall: Node = newNode(nkCall, n.pos)
+    addSon(nextCall, newIdent(nextName, n.pos))
+    addSon(nextCall, newIdent(frameVar, n.pos))
+    addSon(nextCall, newIdent(valueVar, n.pos))
+    var loopBody: Node = newNode(nkStmtList, n.pos)
+    var bind: Node = newNode(nkLet, n.pos)
+    addSon(bind, cloneTree pat)
+    addSon(bind, newNode(nkEmpty, n.pos))
+    addSon(bind, newIdent(valueVar, n.pos))
+    addSon(bind, newNode(nkEmpty, n.pos))
+    addSon(loopBody, bind)
+    var loweredBody: Node = lowerIteratorsAndFor(body)
+    if loweredBody != nil && loweredBody.kind != nkStmtList:
+        var bl: Node = newNode(nkStmtList, loweredBody.pos)
+        addSon(bl, loweredBody)
+        loweredBody = bl
+    if loweredBody != nil:
+        addSon(loopBody, loweredBody)
+    var whileNode: Node = newNode(nkWhile, n.pos)
+    addSon(whileNode, nextCall)
+    addSon(whileNode, loopBody)
+    addSon(outList, whileNode)
+    return outList
+
+fn lowerIteratorsAndFor(n: Node): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkIteratorDecl:
+        return lowerIteratorDecl n
+    if n.kind == nkFor:
+        let lowered: Node = lowerForIterator n
+        return lowered
+    if n.kind == nkStmtList || n.kind == nkModule:
+        var out: Node = newNode(n.kind, n.pos)
+        nodeSetIdent(out, n.ident)
+        nodeSetStrVal(out, n.strVal)
+        for i in 0..<kidCount n:
+            let child: Node = kid(n, i)
+            let loweredChild: Node = lowerIteratorsAndFor(child)
+            if loweredChild != nil && loweredChild.kind == nkStmtList && child.kind != nkStmtList:
+                for j in 0..<kidCount loweredChild:
+                    addSon(out, kid(loweredChild, j))
+            else:
+                addSon(out, loweredChild)
+        return out
+    var outNode: Node = lowerCloneShallow(n)
+    for k in 0..<kidCount n:
+        addSon(outNode, lowerIteratorsAndFor(kid(n, k)))
+    return outNode
+
+fn asyncNameIndex(names: str[], name: str): int32 =
+    for i in 0..<names.len:
+        if names[i] == name:
+            return i
+    return -1
+
+fn asyncAddCapture(names: str[]*, types: Node[]*, name: str, ty: Node, pos: SourcePos) =
+    if name == nil || len name == 0 || name == "_":
+        return
+    if asyncNameIndex(*names, name) >= 0:
+        return
+    add(names, name)
+    if ty != nil:
+        add(types, ty)
+    else:
+        add(types, newNode(nkEmpty, pos))
+
+fn asyncLookupCaptureType(names: str[], types: Node[], name: str): Node =
+    let idx: int32 = asyncNameIndex(names, name)
+    if idx < 0:
+        return nil
+    if idx < types.len:
+        return types[idx]
+    return nil
+
+fn asyncCollectParamTypes(paramsNode: Node, names: str[]*, types: Node[]*) =
+    if paramsNode == nil || paramsNode.kind != nkFormalParams:
+        return
+    for i in 0..<kidCount paramsNode:
+        let defs: Node = kid(paramsNode, i)
+        if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
+            let typeNode: Node = kid(defs, 1)
+            for j in 0..<kidCount defs - 2:
+                let nameNode: Node = kid(defs, j)
+                let nm: str = stripSpaces(plainName(nameNode))
+                if typeNode == nil || typeNode.kind == nkEmpty:
+                    lowerAddError(defs.pos, "C-profile async lowering: missing type for parameter " + nm)
+                    asyncAddCapture(names, types, nm, newNode(nkEmpty, defs.pos), defs.pos)
+                else:
+                    asyncAddCapture(names, types, nm, cloneTree typeNode, defs.pos)
+
+fn asyncCollectLocals(n: Node, names: str[]*, types: Node[]*) =
+    if n == nil:
+        return
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl || n.kind == nkLambda:
+        return
+    if n.kind == nkVar || n.kind == nkLet || n.kind == nkConst:
+        var nameNode: Node = nil
+        var typeNode: Node = nil
+        var valNode: Node = nil
+        if kidCount n > 0:
+            nameNode = kid(n, 0)
+        if kidCount n > 1:
+            typeNode = kid(n, 1)
+        if kidCount n > 2:
+            valNode = kid(n, 2)
+        let innerName: Node = iterPatternIdent(nameNode)
+        if innerName == nil:
+            lowerAddError(n.pos, "C-profile async lowering: only simple identifier bindings are supported")
+            return
+        let nm: str = stripSpaces(plainName(innerName))
+        if nm == "_" || len nm == 0:
+            return
+        if typeNode == nil || typeNode.kind == nkEmpty:
+            if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 1:
+                let pt: Node = kid(nameNode, 1)
+                if pt != nil && pt.kind != nkEmpty:
+                    typeNode = pt
+            if (typeNode == nil || typeNode.kind == nkEmpty) && valNode != nil && valNode.kind != nkEmpty:
+                typeNode = iterInferSimpleType(valNode, *names, *types)
+            if typeNode == nil || typeNode.kind == nkEmpty:
+                lowerAddError(n.pos, "C-profile async lowering: missing type for local '" + nm + "'")
+                typeNode = newNode(nkEmpty, n.pos)
+        asyncAddCapture(names, types, nm, cloneTree typeNode, n.pos)
+        return
+    for i in 0..<kidCount n:
+        asyncCollectLocals(kid(n, i), names, types)
+
+fn asyncPickInternalName(base: str, captures: str[]): str =
+    var name: str = "__async_" + base
+    while asyncNameIndex(captures, name) >= 0:
+        name = name + "_"
+    return name
+
+fn asyncIsCaptured(ctx: AsyncLowerCtx, name: str): bool =
+    if name == nil || len name == 0:
+        return false
+    if name == ctx.frameName || name == ctx.stateName || name == ctx.awaitName || name == ctx.resultName:
+        return false
+    return asyncNameIndex(ctx.captureNames, name) >= 0
+
+fn asyncRewriteTree(n: Node, ctx: AsyncLowerCtx): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkPattern || n.kind == nkIdentDefs || n.kind == nkFormalParams ||
+       n.kind == nkTypeDecl || n.kind == nkObjectDecl || n.kind == nkRecList || n.kind == nkEnumDecl:
+        return cloneTree n
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl || n.kind == nkLambda:
+        return cloneTree n
+    if n.kind == nkIdent || n.kind == nkSymbol:
+        let nm: str = stripSpaces(plainName(n))
+        if asyncIsCaptured(ctx, nm):
+            return lowerMakeDot(ctx.frameName, nm, n.pos)
+        return cloneTree n
+    if n.kind == nkDotExpr && kidCount n > 0:
+        var outDot: Node = newNode(nkDotExpr, n.pos)
+        addSon(outDot, asyncRewriteTree(kid(n, 0), ctx))
+        if kidCount n > 1:
+            addSon(outDot, cloneTree(kid(n, 1)))
+        return outDot
+    if n.kind == nkCallArg:
+        var outArg: Node = newNode(nkCallArg, n.pos)
+        if kidCount n > 0:
+            addSon(outArg, cloneTree(kid(n, 0)))
+        if kidCount n > 1:
+            addSon(outArg, asyncRewriteTree(kid(n, 1), ctx))
+        return outArg
+    if n.kind == nkInfix && kidCount n >= 3:
+        var outInf: Node = newNode(nkInfix, n.pos)
+        addSon(outInf, cloneTree(kid(n, 0)))
+        addSon(outInf, asyncRewriteTree(kid(n, 1), ctx))
+        addSon(outInf, asyncRewriteTree(kid(n, 2), ctx))
+        return outInf
+    if n.kind == nkPrefix && kidCount n >= 2:
+        var outPre: Node = newNode(nkPrefix, n.pos)
+        addSon(outPre, cloneTree(kid(n, 0)))
+        addSon(outPre, asyncRewriteTree(kid(n, 1), ctx))
+        return outPre
+    if n.kind == nkPostfix && kidCount n >= 2:
+        var outPost: Node = newNode(nkPostfix, n.pos)
+        addSon(outPost, asyncRewriteTree(kid(n, 0), ctx))
+        addSon(outPost, cloneTree(kid(n, 1)))
+        return outPost
+    var out: Node = lowerCloneShallow(n)
+    for i in 0..<kidCount n:
+        addSon(out, asyncRewriteTree(kid(n, i), ctx))
+    return out
+
+fn asyncNewState(states: Node[]*, pos: SourcePos): int32 =
+    let id: int32 = states.len
+    var list: Node = newNode(nkStmtList, pos)
+    add(states, list)
+    return id
+
+fn asyncStateBody(states: Node[], id: int32): Node =
+    if id < 0 || id >= states.len:
+        return nil
+    return states[id]
+
+fn asyncStateAdd(states: Node[]*, id: int32, stmt: Node) =
+    let body: Node = asyncStateBody(*states, id)
+    if body != nil && stmt != nil:
+        addSon(body, stmt)
+
+fn asyncMakeSetState(frameName: str, stateName: str, stateVal: int32, pos: SourcePos): Node =
+    var asn: Node = newNode(nkAsgn, pos)
+    addSon(asn, lowerMakeDot(frameName, stateName, pos))
+    addSon(asn, lowerMakeIntLit(int64(stateVal), pos))
+    return asn
+
+fn asyncAwaitStatusExpr(ctx: AsyncLowerCtx, pos: SourcePos): Node =
+    let awaitField: Node = lowerMakeDot(ctx.frameName, ctx.awaitName, pos)
+    var derefNode: Node = iterMakeDeref(awaitField, pos)
+    return lowerMakeDotExpr(derefNode, "status", pos)
+
+fn asyncAwaitValueExpr(ctx: AsyncLowerCtx, pos: SourcePos): Node =
+    let awaitField: Node = lowerMakeDot(ctx.frameName, ctx.awaitName, pos)
+    var derefNode: Node = iterMakeDeref(awaitField, pos)
+    return lowerMakeDotExpr(derefNode, "value", pos)
+
+fn asyncAwaitKindFromExpr(expr: Node): str =
+    let ty: Node = lowerInferExprType expr
+    let kind: str = asyncAwaitKindFromType ty
+    if kind != "":
+        return kind
+    if expr != nil && expr.kind == nkCall && kidCount expr > 0:
+        let callee: Node = kid(expr, 0)
+        let baseName: str = lowerCallTargetName(callee)
+        if baseName != "":
+            let fnNode: Node = lowerMapGetIndex(lowerFnNames, lowerFnNodes, lowerFnIndex, baseName)
+            if fnNode != nil:
+                if lowerFnIsAsync(fnNode):
+                    if kidCount fnNode > 2:
+                        return asyncRetKind(kid(fnNode, 2))
+                elif kidCount fnNode > 2:
+                    let retKind: str = asyncAwaitKindFromType(kid(fnNode, 2))
+                    if retKind != "":
+                        return retKind
+    return ""
+
+fn asyncLowerStmtList(stmts: Node, states: Node[]*, curState: int32, nextState: int32,
+    ctx: AsyncLowerCtx): AsyncStmtResult
+
+fn asyncBuildFrameType(name: str, stateName: str, resultName: str, awaitName: str, awaitType: Node,
+    captures: str[], captureTypes: Node[], pos: SourcePos): Node =
+    var td: Node = newNode(nkTypeDecl, pos)
+    addSon(td, newIdent(name, pos))
+    var obj: Node = newNode(nkObjectDecl, pos)
+    addSon(obj, newNode(nkEmpty, pos))
+    var rec: Node = newNode(nkRecList, pos)
+    var stateDefs: Node = newNode(nkIdentDefs, pos)
+    addSon(stateDefs, newIdent(stateName, pos))
+    addSon(stateDefs, newIdent("int32", pos))
+    addSon(stateDefs, newNode(nkEmpty, pos))
+    addSon(rec, stateDefs)
+    var resultDefs: Node = newNode(nkIdentDefs, pos)
+    addSon(resultDefs, newIdent(resultName, pos))
+    addSon(resultDefs, cloneTree awaitType)
+    addSon(resultDefs, newNode(nkEmpty, pos))
+    addSon(rec, resultDefs)
+    var awaitDefs: Node = newNode(nkIdentDefs, pos)
+    addSon(awaitDefs, newIdent(awaitName, pos))
+    addSon(awaitDefs, cloneTree awaitType)
+    addSon(awaitDefs, newNode(nkEmpty, pos))
+    addSon(rec, awaitDefs)
+    for i in 0..<captures.len:
+        let nm: str = captures[i]
+        let ty: Node = captureTypes[i]
+        var defs: Node = newNode(nkIdentDefs, pos)
+        addSon(defs, newIdent(nm, pos))
+        if ty != nil:
+            addSon(defs, cloneTree ty)
+        else:
+            addSon(defs, newNode(nkEmpty, pos))
+        addSon(defs, newNode(nkEmpty, pos))
+        addSon(rec, defs)
+    addSon(obj, rec)
+    addSon(td, obj)
+    addSon(td, newNode(nkEmpty, pos))
+    addSon(td, newNode(nkEmpty, pos))
+    addSon(td, newNode(nkEmpty, pos))
+    return td
+
+fn asyncBuildWrapper(fnNode: Node, frameType: str, ctx: AsyncLowerCtx, awaitKind: str): Node =
+    let pos: SourcePos = fnNode.pos
+    var wrapperNode: Node = newNode(fnNode.kind, pos)
+    addSon(wrapperNode, cloneTree(kid(fnNode, 0)))
+    var paramsNode: Node = nil
+    if kidCount fnNode > 1:
+        paramsNode = kid(fnNode, 1)
+    if paramsNode != nil:
+        addSon(wrapperNode, cloneTree paramsNode)
+    else:
+        addSon(wrapperNode, newNode(nkFormalParams, pos))
+    let awaitType: Node = asyncAwaitTypeForRet(ctx.retType, pos)
+    addSon(wrapperNode, awaitType)
+    var body: Node = newNode(nkStmtList, pos)
+    let frameName: str = ctx.frameName
+    var frameDecl: Node = newNode(nkVar, pos)
+    addSon(frameDecl, newIdent(frameName, pos))
+    addSon(frameDecl, lowerMakeRefType(newIdent(frameType, pos), pos))
+    addSon(frameDecl, newNode(nkEmpty, pos))
+    addSon(frameDecl, newNode(nkEmpty, pos))
+    addSon(body, frameDecl)
+    var newArgs: Node[1]
+    add(newArgs, newIdent(frameName, pos))
+    addSon(body, lowerMakeCall("new", pos, newArgs))
+    addSon(body, asyncMakeSetState(frameName, ctx.stateName, 0, pos))
+    let pendingName: str = asyncPendingName awaitKind
+    if pendingName == "":
+        lowerAddError(pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
+    else:
+        var emptyArgs: Node[]
+        var pendingCall: Node = lowerMakeCall(pendingName, pos, emptyArgs)
+        var setResult: Node = newNode(nkAsgn, pos)
+        addSon(setResult, lowerMakeDot(frameName, ctx.resultName, pos))
+        addSon(setResult, pendingCall)
+        addSon(body, setResult)
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        for i in 0..<kidCount paramsNode:
+            let defs: Node = kid(paramsNode, i)
+            if defs != nil && defs.kind == nkIdentDefs:
+                for j in 0..<kidCount defs - 2:
+                    let nameNode: Node = kid(defs, j)
+                    let nm: str = stripSpaces(plainName(nameNode))
+                    if nm != "" && nm != "_":
+                        var asn: Node = newNode(nkAsgn, pos)
+                        addSon(asn, lowerMakeDot(frameName, nm, pos))
+                        addSon(asn, newIdent(nm, pos))
+                        addSon(body, asn)
+    var addrArgs: Node[1]
+    add(addrArgs, newIdent(ctx.driverName, pos))
+    let addrExpr: Node = lowerMakeCall("__addr", pos, addrArgs)
+    var ctxExpr: Node = lowerCastToVoidPtr(newIdent(frameName, pos), pos)
+    var spawnArgs: Node[2]
+    add(spawnArgs, addrExpr)
+    add(spawnArgs, ctxExpr)
+    addSon(body, lowerMakeCall("spawn", pos, spawnArgs))
+    var retNode: Node = newNode(nkReturn, pos)
+    addSon(retNode, lowerMakeDot(frameName, ctx.resultName, pos))
+    addSon(body, retNode)
+    addSon(wrapperNode, body)
+    if kidCount fnNode > 4:
+        addSon(wrapperNode, cloneTree(kid(fnNode, 4)))
+    else:
+        addSon(wrapperNode, newNode(nkEmpty, pos))
+    var pragmaNode: Node = nil
+    if kidCount fnNode > 5:
+        pragmaNode = kid(fnNode, 5)
+    var outPragma: Node = lowerStripAsyncPragma(pragmaNode)
+    if outPragma == nil:
+        outPragma = newNode(nkEmpty, pos)
+    addSon(wrapperNode, outPragma)
+    return wrapperNode
+
+fn asyncBuildDriver(frameType: str, ctx: AsyncLowerCtx, awaitKind: str, bodyNode: Node): Node =
+    let pos: SourcePos = bodyNode.pos
+    var fnNode: Node = newNode(nkFnDecl, pos)
+    addSon(fnNode, newIdent(ctx.driverName, pos))
+    var params: Node = newNode(nkFormalParams, pos)
+    var defsCtx: Node = newNode(nkIdentDefs, pos)
+    addSon(defsCtx, newIdent("ctx", pos))
+    var voidType: Node = newIdent("void", pos)
+    addSon(defsCtx, lowerMakePtrType(voidType, pos))
+    addSon(defsCtx, newNode(nkEmpty, pos))
+    addSon(params, defsCtx)
+    addSon(fnNode, params)
+    addSon(fnNode, newNode(nkEmpty, pos))
+    var body: Node = newNode(nkStmtList, pos)
+    let frameName: str = ctx.frameName
+    var frameDecl: Node = newNode(nkVar, pos)
+    addSon(frameDecl, newIdent(frameName, pos))
+    addSon(frameDecl, lowerMakeRefType(newIdent(frameType, pos), pos))
+    var castCall: Node = newNode(nkCall, pos)
+    castCall.callStyle = CallStyleParen
+    addSon(castCall, lowerMakeRefType(newIdent(frameType, pos), pos))
+    addSon(castCall, newIdent("ctx", pos))
+    addSon(frameDecl, castCall)
+    addSon(frameDecl, newNode(nkEmpty, pos))
+    addSon(body, frameDecl)
+    var nilCheck: Node = newNode(nkIf, pos)
+    var condNil: Node = lowerMakeInfix("==", newIdent(frameName, pos), lowerMakeNilLit(pos), pos)
+    var nilBody: Node = newNode(nkStmtList, pos)
+    addSon(nilBody, newNode(nkReturn, pos))
+    addSon(nilCheck, condNil)
+    addSon(nilCheck, nilBody)
+    addSon(body, nilCheck)
+    var doneCheck: Node = newNode(nkIf, pos)
+    let stateExpr: Node = lowerMakeDot(frameName, ctx.stateName, pos)
+    var condDone: Node = lowerMakeInfix("<", stateExpr, lowerMakeIntLit(0, pos), pos)
+    var doneBody: Node = newNode(nkStmtList, pos)
+    addSon(doneBody, newNode(nkReturn, pos))
+    addSon(doneCheck, condDone)
+    addSon(doneCheck, doneBody)
+    addSon(body, doneCheck)
+    var states: Node[8]
+    let startState: int32 = asyncNewState(&states, pos)
+    let doneState: int32 = asyncNewState(&states, pos)
+    asyncLowerStmtList(bodyNode, &states, startState, doneState, ctx)
+    let setName: str = asyncSetName awaitKind
+    asyncStateAdd(&states, doneState, asyncMakeSetState(frameName, ctx.stateName, -1, pos))
+    if setName == "":
+        lowerAddError(pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
+        asyncStateAdd(&states, doneState, newNode(nkReturn, pos))
+    else:
+        var callArgs: Node[2]
+        add(callArgs, lowerMakeDot(frameName, ctx.resultName, pos))
+        if awaitKind == "i32":
+            let defVal: Node = iterDefaultValueNode(ctx.retType, pos)
+            add(callArgs, defVal)
+        var setCall: Node = lowerMakeCall(setName, pos, callArgs)
+        asyncStateAdd(&states, doneState, setCall)
+        asyncStateAdd(&states, doneState, newNode(nkReturn, pos))
+    var ifNode: Node = newNode(nkIf, pos)
+    for si in 0..<states.len:
+        let cond: Node = lowerMakeInfix("==", lowerMakeDot(frameName, ctx.stateName, pos),
+            lowerMakeIntLit(int64(si), pos), pos)
+        addSon(ifNode, cond)
+        addSon(ifNode, states[si])
+    var elseBody: Node = newNode(nkStmtList, pos)
+    addSon(elseBody, newNode(nkReturn, pos))
+    addSon(ifNode, elseBody)
+    var loopBody: Node = newNode(nkStmtList, pos)
+    addSon(loopBody, ifNode)
+    addSon(loopBody, newNode(nkContinue, pos))
+    var loop: Node = newNode(nkWhile, pos)
+    addSon(loop, lowerMakeBoolLit(true, pos))
+    addSon(loop, loopBody)
+    addSon(body, loop)
+    addSon(fnNode, body)
+    addSon(fnNode, newNode(nkEmpty, pos))
+    addSon(fnNode, newNode(nkEmpty, pos))
+    return fnNode
+
+fn asyncLowerStmt(stmt: Node, states: Node[]*, curState: int32, nextState: int32,
+    ctx: AsyncLowerCtx): AsyncStmtResult =
+    var out: AsyncStmtResult
+    out.state = curState
+    out.open = true
+    if stmt == nil || stmt.kind == nkEmpty:
+        return out
+    case stmt.kind
+    of nkStmtList:
+        return asyncLowerStmtList(stmt, states, curState, nextState, ctx)
+    of nkVar, nkLet, nkConst:
+        var nameNode: Node = nil
+        var typeNode: Node = nil
+        var valNode: Node = nil
+        if kidCount stmt > 0:
+            nameNode = kid(stmt, 0)
+        if kidCount stmt > 1:
+            typeNode = kid(stmt, 1)
+        if kidCount stmt > 2:
+            valNode = kid(stmt, 2)
+        let innerName: Node = iterPatternIdent(nameNode)
+        if innerName == nil:
+            lowerAddError(stmt.pos, "C-profile async lowering: only simple identifier bindings are supported")
+            return out
+        let nm: str = stripSpaces(plainName(innerName))
+        if nm == "_" || len nm == 0:
+            if valNode != nil && valNode.kind != nkEmpty:
+                asyncStateAdd(states, curState, asyncRewriteTree(valNode, ctx))
+            return out
+        var rhs: Node = nil
+        if valNode != nil && valNode.kind != nkEmpty:
+            rhs = valNode
+        else:
+            rhs = iterDefaultValueNode(typeNode, stmt.pos)
+            if rhs == nil || rhs.kind == nkEmpty:
+                lowerAddError(stmt.pos, "C-profile async lowering: missing initializer for '" + nm + "'")
+                return out
+        if asyncIsAwaitExpr(rhs):
+            let awaitExpr: Node = asyncAwaitOperand(rhs)
+            let awaitKind: str = asyncAwaitKindFromExpr(awaitExpr)
+            if awaitKind == "":
+                lowerAddError(stmt.pos, "[C-Profile] not-mapped: await expects async return type (FULLC.L08). hint: mark function async or rewrite await to explicit driver.")
+                return out
+            let resumeState: int32 = asyncNewState(states, stmt.pos)
+            var asnAwait: Node = newNode(nkAsgn, stmt.pos)
+            addSon(asnAwait, lowerMakeDot(ctx.frameName, ctx.awaitName, stmt.pos))
+            addSon(asnAwait, asyncRewriteTree(awaitExpr, ctx))
+            asyncStateAdd(states, curState, asnAwait)
+            var condPending: Node = newNode(nkIf, stmt.pos)
+            let statusExpr: Node = asyncAwaitStatusExpr(ctx, stmt.pos)
+            var cond: Node = lowerMakeInfix("==", statusExpr, lowerMakeIntLit(0, stmt.pos), stmt.pos)
+            var pendingBody: Node = newNode(nkStmtList, stmt.pos)
+            addSon(pendingBody, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState, stmt.pos))
+            var addrArgs: Node[1]
+            add(addrArgs, newIdent(ctx.driverName, stmt.pos))
+            let addrExpr: Node = lowerMakeCall("__addr", stmt.pos, addrArgs)
+            var ctxExpr: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
+            var spawnArgs: Node[2]
+            add(spawnArgs, addrExpr)
+            add(spawnArgs, ctxExpr)
+            addSon(pendingBody, lowerMakeCall("spawn", stmt.pos, spawnArgs))
+            addSon(pendingBody, newNode(nkReturn, stmt.pos))
+            addSon(condPending, cond)
+            addSon(condPending, pendingBody)
+            asyncStateAdd(states, curState, condPending)
+            asyncStateAdd(states, curState, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState, stmt.pos))
+            asyncStateAdd(states, curState, newNode(nkContinue, stmt.pos))
+            var resumeIf: Node = newNode(nkIf, stmt.pos)
+            var resumeCond: Node = lowerMakeInfix("==", asyncAwaitStatusExpr(ctx, stmt.pos),
+                lowerMakeIntLit(0, stmt.pos), stmt.pos)
+            var resumeBody: Node = newNode(nkStmtList, stmt.pos)
+            addSon(resumeBody, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState, stmt.pos))
+            var addrArgs2: Node[1]
+            add(addrArgs2, newIdent(ctx.driverName, stmt.pos))
+            let addrExpr2: Node = lowerMakeCall("__addr", stmt.pos, addrArgs2)
+            var ctxExpr2: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
+            var spawnArgs2: Node[2]
+            add(spawnArgs2, addrExpr2)
+            add(spawnArgs2, ctxExpr2)
+            addSon(resumeBody, lowerMakeCall("spawn", stmt.pos, spawnArgs2))
+            addSon(resumeBody, newNode(nkReturn, stmt.pos))
+            addSon(resumeIf, resumeCond)
+            addSon(resumeIf, resumeBody)
+            asyncStateAdd(states, resumeState, resumeIf)
+            var assignVal: Node = newNode(nkAsgn, stmt.pos)
+            addSon(assignVal, lowerMakeDot(ctx.frameName, nm, stmt.pos))
+            if awaitKind == "i32":
+                addSon(assignVal, asyncAwaitValueExpr(ctx, stmt.pos))
+            else:
+                addSon(assignVal, iterDefaultValueNode(typeNode, stmt.pos))
+            asyncStateAdd(states, resumeState, assignVal)
+            out.state = resumeState
+            out.open = true
+            return out
+        if asyncNodeHasAwait(rhs):
+            lowerAddError(stmt.pos, "C-profile async lowering: await inside expression is not supported")
+            return out
+        var asn: Node = newNode(nkAsgn, stmt.pos)
+        addSon(asn, lowerMakeDot(ctx.frameName, nm, stmt.pos))
+        addSon(asn, asyncRewriteTree(rhs, ctx))
+        asyncStateAdd(states, curState, asn)
+        return out
+    of nkAsgn:
+        var lhs: Node = nil
+        var rhs2: Node = nil
+        if kidCount stmt > 0:
+            lhs = kid(stmt, 0)
+        if kidCount stmt > 1:
+            rhs2 = kid(stmt, 1)
+        if rhs2 != nil && asyncIsAwaitExpr(rhs2):
+            let awaitExpr2: Node = asyncAwaitOperand(rhs2)
+            let awaitKind2: str = asyncAwaitKindFromExpr(awaitExpr2)
+            if awaitKind2 == "":
+                lowerAddError(stmt.pos, "[C-Profile] not-mapped: await expects async return type (FULLC.L08). hint: mark function async or rewrite await to explicit driver.")
+                return out
+            let resumeState2: int32 = asyncNewState(states, stmt.pos)
+            var asnAwait2: Node = newNode(nkAsgn, stmt.pos)
+            addSon(asnAwait2, lowerMakeDot(ctx.frameName, ctx.awaitName, stmt.pos))
+            addSon(asnAwait2, asyncRewriteTree(awaitExpr2, ctx))
+            asyncStateAdd(states, curState, asnAwait2)
+            var condPending2: Node = newNode(nkIf, stmt.pos)
+            let statusExpr2: Node = asyncAwaitStatusExpr(ctx, stmt.pos)
+            var cond2: Node = lowerMakeInfix("==", statusExpr2, lowerMakeIntLit(0, stmt.pos), stmt.pos)
+            var pendingBody2: Node = newNode(nkStmtList, stmt.pos)
+            addSon(pendingBody2, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState2, stmt.pos))
+            var addrArgs3: Node[1]
+            add(addrArgs3, newIdent(ctx.driverName, stmt.pos))
+            let addrExpr3: Node = lowerMakeCall("__addr", stmt.pos, addrArgs3)
+            var ctxExpr3: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
+            var spawnArgs3: Node[2]
+            add(spawnArgs3, addrExpr3)
+            add(spawnArgs3, ctxExpr3)
+            addSon(pendingBody2, lowerMakeCall("spawn", stmt.pos, spawnArgs3))
+            addSon(pendingBody2, newNode(nkReturn, stmt.pos))
+            addSon(condPending2, cond2)
+            addSon(condPending2, pendingBody2)
+            asyncStateAdd(states, curState, condPending2)
+            asyncStateAdd(states, curState, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState2, stmt.pos))
+            asyncStateAdd(states, curState, newNode(nkContinue, stmt.pos))
+            var resumeIf2: Node = newNode(nkIf, stmt.pos)
+            var resumeCond2: Node = lowerMakeInfix("==", asyncAwaitStatusExpr(ctx, stmt.pos),
+                lowerMakeIntLit(0, stmt.pos), stmt.pos)
+            var resumeBody2: Node = newNode(nkStmtList, stmt.pos)
+            addSon(resumeBody2, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState2, stmt.pos))
+            var addrArgs4: Node[1]
+            add(addrArgs4, newIdent(ctx.driverName, stmt.pos))
+            let addrExpr4: Node = lowerMakeCall("__addr", stmt.pos, addrArgs4)
+            var ctxExpr4: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
+            var spawnArgs4: Node[2]
+            add(spawnArgs4, addrExpr4)
+            add(spawnArgs4, ctxExpr4)
+            addSon(resumeBody2, lowerMakeCall("spawn", stmt.pos, spawnArgs4))
+            addSon(resumeBody2, newNode(nkReturn, stmt.pos))
+            addSon(resumeIf2, resumeCond2)
+            addSon(resumeIf2, resumeBody2)
+            asyncStateAdd(states, resumeState2, resumeIf2)
+            var assignVal2: Node = newNode(nkAsgn, stmt.pos)
+            addSon(assignVal2, asyncRewriteTree(lhs, ctx))
+            if awaitKind2 == "i32":
+                addSon(assignVal2, asyncAwaitValueExpr(ctx, stmt.pos))
+            else:
+                addSon(assignVal2, iterDefaultValueNode(ctx.retType, stmt.pos))
+            asyncStateAdd(states, resumeState2, assignVal2)
+            out.state = resumeState2
+            out.open = true
+            return out
+        if rhs2 != nil && asyncNodeHasAwait(rhs2):
+            lowerAddError(stmt.pos, "C-profile async lowering: await inside expression is not supported")
+            return out
+        var outAsn: Node = newNode(nkAsgn, stmt.pos)
+        addSon(outAsn, asyncRewriteTree(lhs, ctx))
+        addSon(outAsn, asyncRewriteTree(rhs2, ctx))
+        asyncStateAdd(states, curState, outAsn)
+        return out
+    of nkReturn:
+        var rv: Node = nil
+        if kidCount stmt > 0:
+            rv = kid(stmt, 0)
+        if rv != nil && asyncIsAwaitExpr(rv):
+            let awaitExpr3: Node = asyncAwaitOperand(rv)
+            let awaitKind3: str = asyncAwaitKindFromExpr(awaitExpr3)
+            if awaitKind3 == "":
+                lowerAddError(stmt.pos, "[C-Profile] not-mapped: await expects async return type (FULLC.L08). hint: mark function async or rewrite await to explicit driver.")
+                return out
+            let resumeState3: int32 = asyncNewState(states, stmt.pos)
+            var asnAwait3: Node = newNode(nkAsgn, stmt.pos)
+            addSon(asnAwait3, lowerMakeDot(ctx.frameName, ctx.awaitName, stmt.pos))
+            addSon(asnAwait3, asyncRewriteTree(awaitExpr3, ctx))
+            asyncStateAdd(states, curState, asnAwait3)
+            var condPending3: Node = newNode(nkIf, stmt.pos)
+            let statusExpr3: Node = asyncAwaitStatusExpr(ctx, stmt.pos)
+            var cond3: Node = lowerMakeInfix("==", statusExpr3, lowerMakeIntLit(0, stmt.pos), stmt.pos)
+            var pendingBody3: Node = newNode(nkStmtList, stmt.pos)
+            addSon(pendingBody3, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState3, stmt.pos))
+            var addrArgs5: Node[1]
+            add(addrArgs5, newIdent(ctx.driverName, stmt.pos))
+            let addrExpr5: Node = lowerMakeCall("__addr", stmt.pos, addrArgs5)
+            var ctxExpr5: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
+            var spawnArgs5: Node[2]
+            add(spawnArgs5, addrExpr5)
+            add(spawnArgs5, ctxExpr5)
+            addSon(pendingBody3, lowerMakeCall("spawn", stmt.pos, spawnArgs5))
+            addSon(pendingBody3, newNode(nkReturn, stmt.pos))
+            addSon(condPending3, cond3)
+            addSon(condPending3, pendingBody3)
+            asyncStateAdd(states, curState, condPending3)
+            asyncStateAdd(states, curState, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState3, stmt.pos))
+            asyncStateAdd(states, curState, newNode(nkContinue, stmt.pos))
+            var resumeIf3: Node = newNode(nkIf, stmt.pos)
+            var resumeCond3: Node = lowerMakeInfix("==", asyncAwaitStatusExpr(ctx, stmt.pos),
+                lowerMakeIntLit(0, stmt.pos), stmt.pos)
+            var resumeBody3: Node = newNode(nkStmtList, stmt.pos)
+            addSon(resumeBody3, asyncMakeSetState(ctx.frameName, ctx.stateName, resumeState3, stmt.pos))
+            var addrArgs6: Node[1]
+            add(addrArgs6, newIdent(ctx.driverName, stmt.pos))
+            let addrExpr6: Node = lowerMakeCall("__addr", stmt.pos, addrArgs6)
+            var ctxExpr6: Node = lowerCastToVoidPtr(newIdent(ctx.frameName, stmt.pos), stmt.pos)
+            var spawnArgs6: Node[2]
+            add(spawnArgs6, addrExpr6)
+            add(spawnArgs6, ctxExpr6)
+            addSon(resumeBody3, lowerMakeCall("spawn", stmt.pos, spawnArgs6))
+            addSon(resumeBody3, newNode(nkReturn, stmt.pos))
+            addSon(resumeIf3, resumeCond3)
+            addSon(resumeIf3, resumeBody3)
+            asyncStateAdd(states, resumeState3, resumeIf3)
+            let setName3: str = asyncSetName awaitKind3
+            if setName3 == "":
+                lowerAddError(stmt.pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
+            else:
+                var callArgs3: Node[2]
+                add(callArgs3, lowerMakeDot(ctx.frameName, ctx.resultName, stmt.pos))
+                if awaitKind3 == "i32":
+                    add(callArgs3, asyncAwaitValueExpr(ctx, stmt.pos))
+                var setCall3: Node = lowerMakeCall(setName3, stmt.pos, callArgs3)
+                asyncStateAdd(states, resumeState3, setCall3)
+            asyncStateAdd(states, resumeState3, asyncMakeSetState(ctx.frameName, ctx.stateName, -1, stmt.pos))
+            asyncStateAdd(states, resumeState3, newNode(nkReturn, stmt.pos))
+            out.open = false
+            out.state = resumeState3
+            return out
+        if rv != nil && asyncNodeHasAwait(rv):
+            lowerAddError(stmt.pos, "C-profile async lowering: await inside expression is not supported")
+            return out
+        let retKind: str = asyncRetKind(ctx.retType)
+        let setName: str = asyncSetName retKind
+        if setName == "":
+            lowerAddError(stmt.pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
+        else:
+            var callArgs4: Node[2]
+            add(callArgs4, lowerMakeDot(ctx.frameName, ctx.resultName, stmt.pos))
+            if retKind == "i32":
+                if rv != nil && rv.kind != nkEmpty:
+                    add(callArgs4, asyncRewriteTree(rv, ctx))
+                else:
+                    add(callArgs4, iterDefaultValueNode(ctx.retType, stmt.pos))
+            var setCall4: Node = lowerMakeCall(setName, stmt.pos, callArgs4)
+            asyncStateAdd(states, curState, setCall4)
+        asyncStateAdd(states, curState, asyncMakeSetState(ctx.frameName, ctx.stateName, -1, stmt.pos))
+        asyncStateAdd(states, curState, newNode(nkReturn, stmt.pos))
+        out.open = false
+        return out
+    else:
+        if asyncNodeHasAwait(stmt):
+            lowerAddError(stmt.pos, "C-profile async lowering: await inside unsupported construct")
+            return out
+        asyncStateAdd(states, curState, asyncRewriteTree(stmt, ctx))
+        return out
+
+fn asyncLowerStmtList(stmts: Node, states: Node[]*, curState: int32, nextState: int32,
+    ctx: AsyncLowerCtx): AsyncStmtResult =
+    var state: int32 = curState
+    var open: bool = true
+    var list: Node = stmts
+    if list == nil:
+        list = newNode(nkStmtList, default[SourcePos])
+    if list.kind != nkStmtList:
+        var tmp: Node = newNode(nkStmtList, list.pos)
+        addSon(tmp, list)
+        list = tmp
+    for i in 0..<kidCount list:
+        if !open:
+            break
+        let s: Node = kid(list, i)
+        let res: AsyncStmtResult = asyncLowerStmt(s, states, state, nextState, ctx)
+        state = res.state
+        open = res.open
+    var outRes: AsyncStmtResult
+    if open:
+        asyncStateAdd(states, state, asyncMakeSetState(ctx.frameName, ctx.stateName, nextState, list.pos))
+        outRes.state = nextState
+        outRes.open = true
+    else:
+        outRes.state = state
+        outRes.open = false
+    return outRes
+
+fn lowerAsyncDecl(fnNode: Node): Node =
+    if fnNode == nil:
+        return fnNode
+    if fnNode.kind != nkFnDecl && fnNode.kind != nkIteratorDecl:
+        return fnNode
+    if !lowerFnIsAsync(fnNode):
+        return fnNode
+    let pos: SourcePos = fnNode.pos
+    let nameNode: Node = kid(fnNode, 0)
+    let baseName: str = stripSpaces(plainName(nameNode))
+    if baseName == "":
+        return fnNode
+    var retType: Node = newNode(nkEmpty, pos)
+    if kidCount fnNode > 2:
+        retType = kid(fnNode, 2)
+    let retKind: str = asyncRetKind(retType)
+    if retKind == "":
+        lowerAddError(pos, "[C-Profile] not-mapped: async return type (FULLC.L08). hint: only int32/void awaitable in v0.")
+        return fnNode
+    var paramsNode: Node = nil
+    if kidCount fnNode > 1:
+        paramsNode = kid(fnNode, 1)
+    var bodyNode: Node = nil
+    if kidCount fnNode > 3:
+        bodyNode = kid(fnNode, 3)
+    if bodyNode == nil:
+        bodyNode = newNode(nkStmtList, pos)
+    if kidCount fnNode > 4:
+        let gens: Node = kid(fnNode, 4)
+        if gens != nil && gens.kind != nkEmpty:
+            lowerAddError(pos, "[C-Profile] not-mapped: async generics (FULLC.L08). hint: monomorphize before async or avoid generics.")
+            return fnNode
+    var captureNames: str[8]
+    var captureTypes: Node[8]
+    asyncCollectParamTypes(paramsNode, &captureNames, &captureTypes)
+    asyncCollectLocals(bodyNode, &captureNames, &captureTypes)
+    let frameType: str = baseName + "__async_frame"
+    var ctx: AsyncLowerCtx
+    ctx.frameName = asyncPickInternalName("frame", captureNames)
+    ctx.stateName = asyncPickInternalName("state", captureNames)
+    ctx.awaitName = asyncPickInternalName("await", captureNames)
+    ctx.resultName = asyncPickInternalName("result", captureNames)
+    ctx.driverName = baseName + "__async_drive"
+    ctx.retType = retType
+    ctx.captureNames = captureNames
+    ctx.captureTypes = captureTypes
+    let awaitType: Node = asyncAwaitTypeForRet(retType, pos)
+    var outList: Node = newNode(nkStmtList, pos)
+    addSon(outList, asyncBuildFrameType(frameType, ctx.stateName, ctx.resultName, ctx.awaitName, awaitType,
+        captureNames, captureTypes, pos))
+    addSon(outList, asyncBuildDriver(frameType, ctx, retKind, bodyNode))
+    addSon(outList, asyncBuildWrapper(fnNode, frameType, ctx, retKind))
+    return outList
+
+fn lowerAsyncDecls(n: Node): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+        return lowerAsyncDecl n
+    if n.kind == nkStmtList || n.kind == nkModule:
+        var out: Node = newNode(n.kind, n.pos)
+        nodeSetIdent(out, n.ident)
+        nodeSetStrVal(out, n.strVal)
+        for i in 0..<kidCount n:
+            let child: Node = kid(n, i)
+            let lowered: Node = lowerAsyncDecls(child)
+            if lowered != nil && lowered.kind == nkStmtList && child.kind != nkStmtList:
+                for j in 0..<kidCount lowered:
+                    addSon(out, kid(lowered, j))
+            else:
+                addSon(out, lowered)
+        return out
+    var outNode: Node = lowerCloneShallow(n)
+    for k in 0..<kidCount n:
+        addSon(outNode, lowerAsyncDecls(kid(n, k)))
+    return outNode
+
+fn lowerAwaitExpr(n: Node): Node =
+    if n == nil:
+        return nil
+    if asyncIsAwaitExpr n:
+        let inner: Node = asyncAwaitOperand n
+        let loweredInner: Node = lowerAwaitExpr inner
+        var kind: str = asyncAwaitKindFromExpr(loweredInner)
+        if kind == "":
+            kind = "i32"
+        let fnName: str = asyncAwaitName kind
+        if fnName == "":
+            return loweredInner
+        var args: Node[1]
+        add(args, loweredInner)
+        return lowerMakeCall(fnName, n.pos, args)
+    var out: Node = lowerCloneShallow(n)
+    for i in 0..<kidCount n:
+        addSon(out, lowerAwaitExpr(kid(n, i)))
+    return out
+
+fn lowerAwaitStmt(n: Node): Node =
+    if n == nil:
+        return nil
+    case n.kind
+    of nkStmtList, nkModule:
+        lowerValueScopePush()
+        var outList: Node = newNode(n.kind, n.pos)
+        nodeSetIdent(outList, n.ident)
+        nodeSetStrVal(outList, n.strVal)
+        for i in 0..<kidCount n:
+            addSon(outList, lowerAwaitStmt(kid(n, i)))
+        lowerValueScopePop()
+        return outList
+    of nkVar, nkLet, nkConst:
+        var nameNode: Node = nil
+        var typeNode: Node = nil
+        var valNode: Node = nil
+        if kidCount n > 0:
+            nameNode = kid(n, 0)
+        if kidCount n > 1:
+            typeNode = kid(n, 1)
+        if kidCount n > 2:
+            valNode = kid(n, 2)
+        var outVar: Node = lowerCloneShallow n
+        addSon(outVar, cloneTree nameNode)
+        addSon(outVar, cloneTree typeNode)
+        if valNode != nil:
+            let newVal: Node = lowerAwaitExpr(valNode)
+            addSon(outVar, newVal)
+        else:
+            addSon(outVar, newNode(nkEmpty, n.pos))
+        var pragmaNode: Node = nil
+        if kidCount n > 3:
+            pragmaNode = kid(n, 3)
+        addSon(outVar, pragmaNode)
+        if nameNode != nil:
+            let innerName: Node = iterPatternIdent(nameNode)
+            if innerName != nil:
+                let nm: str = stripSpaces(plainName(innerName))
+                if nm != "" && nm != "_":
+                    if typeNode != nil && typeNode.kind != nkEmpty:
+                        lowerValueAdd(nm, typeNode)
+                    else:
+                        let inferred: Node = lowerInferExprType(valNode)
+                        if inferred != nil:
+                            lowerValueAdd(nm, inferred)
+        return outVar
+    else:
+        return lowerAwaitExpr(n)
+
+fn lowerAwaitInSync(n: Node): Node =
+    if n == nil:
+        return nil
+    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+        if lowerFnIsAsync(n):
+            return n
+        lowerValueScopePush()
+        if kidCount n > 1:
+            let paramsNode: Node = kid(n, 1)
+            if paramsNode != nil && paramsNode.kind == nkFormalParams:
+                for i in 0..<kidCount paramsNode:
+                    let defs: Node = kid(paramsNode, i)
+                    if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
+                        let typeNode: Node = kid(defs, 1)
+                        for j in 0..<kidCount defs - 2:
+                            let nameNode: Node = kid(defs, j)
+                            let nm: str = stripSpaces(plainName(nameNode))
+                            if nm != "" && nm != "_":
+                                lowerValueAdd(nm, typeNode)
+        var outFn: Node = lowerCloneShallow(n)
+        for k in 0..<kidCount n:
+            if k == 3:
+                addSon(outFn, lowerAwaitStmt(kid(n, k)))
+            else:
+                addSon(outFn, cloneTree(kid(n, k)))
+        lowerValueScopePop()
+        return outFn
+    if n.kind == nkStmtList || n.kind == nkModule:
+        var out: Node = newNode(n.kind, n.pos)
+        nodeSetIdent(out, n.ident)
+        nodeSetStrVal(out, n.strVal)
+        for i in 0..<kidCount n:
+            addSon(out, lowerAwaitInSync(kid(n, i)))
+        return out
+    var outNode: Node = lowerCloneShallow(n)
+    for j in 0..<kidCount n:
+        addSon(outNode, lowerAwaitInSync(kid(n, j)))
+    return outNode
+
+fn lowerValidatePattern(n: Node) =
+    if n == nil:
+        return
+    var core: Node = n
+    if n.kind == nkPattern && kidCount n > 0:
+        core = kid(n, 0)
+    if core == nil:
+        return
+    if core.kind == nkCurly || core.kind == nkCurlyExpr:
+        lowerAddError(core.pos, "[C-Profile] not-mapped: set pattern (FULLC.L02). hint: lower to `in`/contains checks.")
+    for i in 0..<kidCount core:
+        lowerValidatePattern(kid(core, i))
+
+fn lowerValidateExpr(n: Node) =
+    if n == nil:
+        return
+    if n.kind == nkPattern:
+        lowerValidatePattern(n)
+    for i in 0..<kidCount n:
+        lowerValidateExpr(kid(n, i))
+
+fn lowerValidateStmt(n: Node) =
+    if n == nil:
+        return
+    case n.kind
+    of nkModule, nkStmtList:
+        for i in 0..<kidCount n:
+            lowerValidateStmt(kid(n, i))
+    of nkFnDecl, nkIteratorDecl, nkMacroDecl, nkTemplateDecl:
+        if kidCount n > 3:
+            lowerValidateStmt(kid(n, 3))
+    of nkLet, nkVar, nkConst:
+        if kidCount n > 0:
+            lowerValidatePattern(kid(n, 0))
+        if kidCount n > 2:
+            lowerValidateExpr(kid(n, 2))
+    of nkAsgn, nkFastAsgn:
+        if kidCount n > 0:
+            lowerValidateExpr(kid(n, 0))
+        if kidCount n > 1:
+            lowerValidateExpr(kid(n, 1))
+    of nkReturn:
+        if kidCount n > 0:
+            lowerValidateExpr(kid(n, 0))
+    of nkIf, nkWhen, nkWhile, nkFor, nkCase, nkBlock, nkDefer, nkYield, nkBreak, nkContinue:
+        for j in 0..<kidCount n:
+            let child: Node = kid(n, j)
+            if child != nil && (child.kind == nkStmtList || child.kind == nkBlock || child.kind == nkElse || child.kind == nkOfBranch):
+                lowerValidateStmt(child)
+            else:
+                lowerValidateExpr(child)
+    else:
+        lowerValidateExpr(n)
+
+fn lowerCProfile(root: Node, diags: Diagnostic[]*): Node =
+    lowerDiags = diags
+    if root != nil && root.strVal != nil:
+        lowerFilename = root.strVal
+    else:
+        lowerFilename = ""
+    lowerClearMaps()
+    lowerClearIterMaps()
+    lowerIterTempCounter = 0
+    lowerTrace "named/default"
+    var out: Node = lowerNamedDefault root
+    lowerTrace "iterators collect"
+    lowerClearIterMaps()
+    if out != nil:
+        lowerCollectIterators out
+        lowerTrace "iterators lower"
+        out = lowerIteratorsAndFor out
+    lowerTrace "collect fns/types"
+    lowerClearMaps()
+    if out != nil:
+        lowerCollectFns out
+        lowerCollectTypes out
+    lowerTrace "closures"
+    out = lowerClosures out
+    lowerTrace "collect fns/types 2"
+    lowerClearMaps()
+    if out != nil:
+        lowerCollectFns out
+        lowerCollectTypes out
+    lowerTrace "async decls"
+    out = lowerAsyncDecls out
+    lowerTrace "collect fns/types 3"
+    lowerClearMaps()
+    if out != nil:
+        lowerCollectFns out
+        lowerCollectTypes out
+    lowerTrace "await in sync"
+    out = lowerAwaitInSync out
+    lowerTrace "collect fns/types 4"
+    lowerClearMaps()
+    if out != nil:
+        lowerCollectFns out
+        lowerCollectTypes out
+    lowerTrace "question"
+    out = lowerQuestion out
+    lowerTrace "control flow"
+    out = lowerControlFlow out
+    lowerTrace "validate"
+    if out != nil:
+        lowerValidateStmt(out)
+    lowerDiags = nil
+    lowerFilename = ""
+    return out

@@ -1,0 +1,527 @@
+# MultiBase(scaffold).
+
+import std/result
+import std/strings
+import std/rawbytes
+import std/buffer
+type
+    MultiBaseCodec =
+        code: str
+        name: str
+
+var
+    baseIdentity: MultiBaseCodec = MultiBaseCodec(code: "0", name: "identity")
+    baseBase16: MultiBaseCodec = MultiBaseCodec(code: "f", name: "base16")
+    baseBase16Upper: MultiBaseCodec = MultiBaseCodec(code: "F", name: "base16upper")
+    baseBase58Btc: MultiBaseCodec = MultiBaseCodec(code: "z", name: "base58btc")
+    baseBase58Flickr: MultiBaseCodec = MultiBaseCodec(code: "Z", name: "base58flickr")
+    baseBase32: MultiBaseCodec = MultiBaseCodec(code: "b", name: "base32")
+    baseBase32Upper: MultiBaseCodec = MultiBaseCodec(code: "B", name: "base32upper")
+    baseBase32Pad: MultiBaseCodec = MultiBaseCodec(code: "c", name: "base32pad")
+    baseBase32PadUpper: MultiBaseCodec = MultiBaseCodec(code: "C", name: "base32padupper")
+    baseBase32Hex: MultiBaseCodec = MultiBaseCodec(code: "v", name: "base32hex")
+    baseBase32HexUpper: MultiBaseCodec = MultiBaseCodec(code: "V", name: "base32hexupper")
+    baseBase32HexPad: MultiBaseCodec = MultiBaseCodec(code: "t", name: "base32hexpad")
+    baseBase32HexPadUpper: MultiBaseCodec = MultiBaseCodec(code: "T", name: "base32hexpadupper")
+    baseBase32Z: MultiBaseCodec = MultiBaseCodec(code: "h", name: "base32z")
+    baseBase36: MultiBaseCodec = MultiBaseCodec(code: "k", name: "base36")
+    baseBase64: MultiBaseCodec = MultiBaseCodec(code: "m", name: "base64")
+    baseBase64Pad: MultiBaseCodec = MultiBaseCodec(code: "M", name: "base64pad")
+    baseBase64Url: MultiBaseCodec = MultiBaseCodec(code: "u", name: "base64url")
+    baseBase64UrlPad: MultiBaseCodec = MultiBaseCodec(code: "U", name: "base64urlpad")
+    base16Alphabet = "0123456789abcdef"
+    base16UpperAlphabet = "0123456789ABCDEF"
+    base32Alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+    base32UpperAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    base32ZAlphabet = "ybndrfg8ejkmcpqxot1uwisza345h769"
+    base32HexAlphabet = "0123456789abcdefghijklmnopqrstuv"
+    base32HexUpperAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+    base36Alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    base58FlickrAlphabet = "123456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ"
+    base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    base64UrlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+fn base16Value(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + (int32(c) - int32('a'))
+    if c >= 'A' && c <= 'F':
+        return 10 + (int32(c) - int32('A'))
+    return -1
+
+fn base32ValueWithAlphabet(c: char, alphabet: str): int32 =
+    for i in 0..<len(alphabet):
+        if alphabet[i] == c:
+            return i
+    return -1
+
+fn base32Value(c: char): int32 =
+    return base32ValueWithAlphabet(c, base32Alphabet)
+
+fn base32zValue(c: char): int32 =
+    return base32ValueWithAlphabet(c, base32ZAlphabet)
+
+fn base36Value(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'z':
+        return 10 + (int32(c) - int32('a'))
+    if c >= 'A' && c <= 'Z':
+        return 10 + (int32(c) - int32('A'))
+    return -1
+
+fn base58ValueWithAlphabet(c: char, alphabet: str): int32 =
+    for i in 0..<len(alphabet):
+        if alphabet[i] == c:
+            return i
+    return -1
+
+fn base58Value(c: char): int32 =
+    return base58ValueWithAlphabet(c, base58Alphabet)
+
+fn base64Value(c: char, url: bool): int32 =
+    var alphabet: str = if url: base64UrlAlphabet else: base64Alphabet
+    for i in 0..<len(alphabet):
+        if alphabet[i] == c:
+            return i
+    return -1
+
+fn encodeBase16WithAlphabet(data: Bytes, alphabet: str): str =
+    if bytesLen(data) <= 0:
+        return ""
+    let out: Bytes = bytesAlloc(bytesLen(data) * 2)
+    for i in 0..<bytesLen(data):
+        let value: int32 = bytesGet(data, i)
+        let hi: int32 = value >> 4
+        let lo: int32 = value & 15
+        bytesSet(out, i * 2, int32(alphabet[hi]))
+        bytesSet(out, i * 2 + 1, int32(alphabet[lo]))
+    return bytesToString(out)
+
+fn encodeBase16(data: Bytes): str =
+    return encodeBase16WithAlphabet(data, base16Alphabet)
+
+fn encodeBase16Upper(data: Bytes): str =
+    return encodeBase16WithAlphabet(data, base16UpperAlphabet)
+
+fn decodeBase16(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("multibase: invalid base16")
+    let out: Bytes = bytesAlloc(len(text) / 2)
+    var i: int32 = 0
+    var outIdx: int32 = 0
+    while i < len(text):
+        let hi: int32 = base16Value(text[i])
+        let lo: int32 = base16Value(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("multibase: invalid base16")
+        bytesSet(out, outIdx, (hi << 4) | lo)
+        outIdx = outIdx + 1
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn encodeBase32WithAlphabet(data: Bytes, alphabet: str): str =
+    if bytesLen(data) <= 0:
+        return ""
+    var buf: ByteBuffer = newByteBuffer()
+    var acc: int64 = 0
+    var bits: int32 = 0
+    for i in 0..<bytesLen(data):
+        acc = (acc << 8) | int64(bytesGet(data, i))
+        bits = bits + 8
+        while bits >= 5:
+            let shift: int32 = bits - 5
+            let idx: int32 = int32((acc >> shift) & 31)
+            appendByte(buf, int32(alphabet[idx]))
+            bits = bits - 5
+    if bits > 0:
+        let idx: int32 = int32((acc << (5 - bits)) & 31)
+        appendByte(buf, int32(alphabet[idx]))
+    return bytesToString(toBytes(buf))
+
+fn decodeBase32WithAlphabet(text: str, alphabet: str, label: str, allowPad: bool): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    var buf: ByteBuffer = newByteBuffer()
+    var acc: int64 = 0
+    var bits: int32 = 0
+    for i in 0..<len(text):
+        let c: char = text[i]
+        if c == '=':
+            if allowPad:
+                break
+            return Err[Bytes]("multibase: invalid " + label)
+        let v: int32 = base32ValueWithAlphabet(c, alphabet)
+        if v < 0:
+            return Err[Bytes]("multibase: invalid " + label)
+        acc = (acc << 5) | int64(v)
+        bits = bits + 5
+        if bits >= 8:
+            let shift: int32 = bits - 8
+            let outByte: int32 = int32((acc >> shift) & 255)
+            appendByte(buf, outByte)
+            bits = bits - 8
+    return Ok[Bytes](toBytes(buf))
+
+fn encodeBase32(data: Bytes): str =
+    return encodeBase32WithAlphabet(data, base32Alphabet)
+
+fn decodeBase32(text: str): Result[Bytes] =
+    return decodeBase32WithAlphabet(text, base32Alphabet, "base32", false)
+
+fn encodeBase32z(data: Bytes): str =
+    return encodeBase32WithAlphabet(data, base32ZAlphabet)
+
+fn decodeBase32z(text: str): Result[Bytes] =
+    return decodeBase32WithAlphabet(text, base32ZAlphabet, "base32z", false)
+
+fn encodeBase36(data: Bytes): str =
+    if bytesLen(data) <= 0:
+        return ""
+    var zeros: int32 = 0
+    while zeros < bytesLen(data) && bytesGet(data, zeros) == 0:
+        zeros = zeros + 1
+    let size: int32 = bytesLen(data) * 2 + 1
+    let b36: Bytes = bytesAlloc(size)
+    for i in 0..<bytesLen(data):
+        var carry: int32 = bytesGet(data, i)
+        var j: int32 = size - 1
+        while j >= 0:
+            let value: int32 = bytesGet(b36, j)
+            carry = carry + value * 256
+            bytesSet(b36, j, carry % 36)
+            carry = carry / 36
+            j = j - 1
+    var start: int32 = 0
+    while start < size && bytesGet(b36, start) == 0:
+        start = start + 1
+    let outLen: int32 = zeros + (size - start)
+    let out: Bytes = bytesAlloc(outLen)
+    var outIdx: int32 = 0
+    while outIdx < zeros:
+        bytesSet(out, outIdx, int32('0'))
+        outIdx = outIdx + 1
+    for k in start..<size:
+        let digit: int32 = bytesGet(b36, k)
+        bytesSet(out, outIdx, int32(base36Alphabet[digit]))
+        outIdx = outIdx + 1
+    return bytesToString(out)
+
+fn decodeBase36(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    var zeros: int32 = 0
+    while zeros < len(text) && text[zeros] == '0':
+        zeros = zeros + 1
+    let size: int32 = len(text) + 1
+    let b256: Bytes = bytesAlloc(size)
+    for i in 0..<len(text):
+        let val: int32 = base36Value(text[i])
+        if val < 0:
+            return Err[Bytes]("multibase: invalid base36")
+        var carry: int32 = val
+        var j: int32 = size - 1
+        while j >= 0:
+            let value: int32 = bytesGet(b256, j)
+            carry = carry + value * 36
+            bytesSet(b256, j, carry % 256)
+            carry = carry / 256
+            j = j - 1
+    var start: int32 = 0
+    while start < size && bytesGet(b256, start) == 0:
+        start = start + 1
+    let outLen: int32 = zeros + (size - start)
+    let out: Bytes = bytesAlloc(outLen)
+    var outIdx: int32 = 0
+    while outIdx < zeros:
+        bytesSet(out, outIdx, 0)
+        outIdx = outIdx + 1
+    for k in start..<size:
+        bytesSet(out, outIdx, bytesGet(b256, k))
+        outIdx = outIdx + 1
+    return Ok[Bytes](out)
+
+fn encodeBase58WithAlphabet(data: Bytes, alphabet: str): str =
+    if bytesLen(data) <= 0:
+        return ""
+    var zeros: int32 = 0
+    while zeros < bytesLen(data) && bytesGet(data, zeros) == 0:
+        zeros = zeros + 1
+    let size: int32 = (bytesLen(data) * 138) / 100 + 1
+    let b58: Bytes = bytesAlloc(size)
+    for i in 0..<bytesLen(data):
+        var carry: int32 = bytesGet(data, i)
+        var j: int32 = size - 1
+        while j >= 0:
+            let value: int32 = bytesGet(b58, j)
+            carry = carry + value * 256
+            bytesSet(b58, j, carry % 58)
+            carry = carry / 58
+            j = j - 1
+    var start: int32 = 0
+    while start < size && bytesGet(b58, start) == 0:
+        start = start + 1
+    let outLen: int32 = zeros + (size - start)
+    let out: Bytes = bytesAlloc(outLen)
+    var outIdx: int32 = 0
+    let zeroChar: char = alphabet[0]
+    while outIdx < zeros:
+        bytesSet(out, outIdx, int32(zeroChar))
+        outIdx = outIdx + 1
+    for k in start..<size:
+        let digit: int32 = bytesGet(b58, k)
+        bytesSet(out, outIdx, int32(alphabet[digit]))
+        outIdx = outIdx + 1
+    return bytesToString(out)
+
+fn decodeBase58WithAlphabet(text: str, alphabet: str, label: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    var zeros: int32 = 0
+    let zeroChar: char = alphabet[0]
+    while zeros < len(text) && text[zeros] == zeroChar:
+        zeros = zeros + 1
+    let size: int32 = (len(text) * 733) / 1000 + 1
+    let b256: Bytes = bytesAlloc(size)
+    for i in 0..<len(text):
+        let val: int32 = base58ValueWithAlphabet(text[i], alphabet)
+        if val < 0:
+            return Err[Bytes]("multibase: invalid " + label)
+        var carry: int32 = val
+        var j: int32 = size - 1
+        while j >= 0:
+            let value: int32 = bytesGet(b256, j)
+            carry = carry + value * 58
+            bytesSet(b256, j, carry % 256)
+            carry = carry / 256
+            j = j - 1
+    var start: int32 = 0
+    while start < size && bytesGet(b256, start) == 0:
+        start = start + 1
+    let outLen: int32 = zeros + (size - start)
+    let out: Bytes = bytesAlloc(outLen)
+    var outIdx: int32 = 0
+    while outIdx < zeros:
+        bytesSet(out, outIdx, 0)
+        outIdx = outIdx + 1
+    for k in start..<size:
+        bytesSet(out, outIdx, bytesGet(b256, k))
+        outIdx = outIdx + 1
+    return Ok[Bytes](out)
+
+fn encodeBase58(data: Bytes): str =
+    return encodeBase58WithAlphabet(data, base58Alphabet)
+
+fn decodeBase58(text: str): Result[Bytes] =
+    return decodeBase58WithAlphabet(text, base58Alphabet, "base58")
+
+fn encodeBase58Flickr(data: Bytes): str =
+    return encodeBase58WithAlphabet(data, base58FlickrAlphabet)
+
+fn decodeBase58Flickr(text: str): Result[Bytes] =
+    return decodeBase58WithAlphabet(text, base58FlickrAlphabet, "base58flickr")
+
+fn encodeBase64(data: Bytes, url: bool): str =
+    if bytesLen(data) <= 0:
+        return ""
+    let alphabet: str = if url: base64UrlAlphabet else: base64Alphabet
+    var buf: ByteBuffer = newByteBuffer()
+    var acc: int64 = 0
+    var bits: int32 = 0
+    for i in 0..<bytesLen(data):
+        acc = (acc << 8) | int64(bytesGet(data, i))
+        bits = bits + 8
+        while bits >= 6:
+            let shift: int32 = bits - 6
+            let idx: int32 = int32((acc >> shift) & 63)
+            appendByte(buf, int32(alphabet[idx]))
+            bits = bits - 6
+    if bits > 0:
+        let idx: int32 = int32((acc << (6 - bits)) & 63)
+        appendByte(buf, int32(alphabet[idx]))
+    return bytesToString(toBytes(buf))
+
+fn decodeBase64(text: str, url: bool): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    var buf: ByteBuffer = newByteBuffer()
+    var acc: int64 = 0
+    var bits: int32 = 0
+    for i in 0..<len(text):
+        let c: char = text[i]
+        if c == '=':
+            break
+        let v: int32 = base64Value(c, url)
+        if v < 0:
+            return Err[Bytes]("multibase: invalid base64")
+        acc = (acc << 6) | int64(v)
+        bits = bits + 6
+        if bits >= 8:
+            let shift: int32 = bits - 8
+            let outByte: int32 = int32((acc >> shift) & 255)
+            appendByte(buf, outByte)
+            bits = bits - 8
+    return Ok[Bytes](toBytes(buf))
+
+fn padToMultiple(text: str, block: int32): str =
+    if block <= 0:
+        return text
+    let size: int32 = len(text)
+    if size <= 0:
+        return ""
+    let rem: int32 = size % block
+    if rem == 0:
+        return text
+    let pad: int32 = block - rem
+    var buf: ByteBuffer = newByteBuffer()
+    appendBytes(buf, bytesFromString(text))
+    for i in 0..<pad:
+        appendByte(buf, int32('='))
+    return bytesToString(toBytes(buf))
+
+fn encodeBase32Padded(data: Bytes, alphabet: str): str =
+    return padToMultiple(encodeBase32WithAlphabet(data, alphabet), 8)
+
+fn decodeBase32Padded(text: str, alphabet: str, label: str): Result[Bytes] =
+    return decodeBase32WithAlphabet(text, alphabet, label, true)
+
+fn encodeBase64Padded(data: Bytes, url: bool): str =
+    return padToMultiple(encodeBase64(data, url), 4)
+
+fn codecByName(name: str): Result[MultiBaseCodec] =
+    if name == baseIdentity.name: return Ok[MultiBaseCodec](baseIdentity)
+    if name == baseBase16.name: return Ok[MultiBaseCodec](baseBase16)
+    if name == baseBase16Upper.name: return Ok[MultiBaseCodec](baseBase16Upper)
+    if name == baseBase58Btc.name: return Ok[MultiBaseCodec](baseBase58Btc)
+    if name == baseBase58Flickr.name: return Ok[MultiBaseCodec](baseBase58Flickr)
+    if name == baseBase32.name: return Ok[MultiBaseCodec](baseBase32)
+    if name == baseBase32Upper.name: return Ok[MultiBaseCodec](baseBase32Upper)
+    if name == baseBase32Pad.name: return Ok[MultiBaseCodec](baseBase32Pad)
+    if name == baseBase32PadUpper.name: return Ok[MultiBaseCodec](baseBase32PadUpper)
+    if name == baseBase32Hex.name: return Ok[MultiBaseCodec](baseBase32Hex)
+    if name == baseBase32HexUpper.name: return Ok[MultiBaseCodec](baseBase32HexUpper)
+    if name == baseBase32HexPad.name: return Ok[MultiBaseCodec](baseBase32HexPad)
+    if name == baseBase32HexPadUpper.name: return Ok[MultiBaseCodec](baseBase32HexPadUpper)
+    if name == baseBase32Z.name: return Ok[MultiBaseCodec](baseBase32Z)
+    if name == baseBase36.name: return Ok[MultiBaseCodec](baseBase36)
+    if name == baseBase64.name: return Ok[MultiBaseCodec](baseBase64)
+    if name == baseBase64Pad.name: return Ok[MultiBaseCodec](baseBase64Pad)
+    if name == baseBase64Url.name: return Ok[MultiBaseCodec](baseBase64Url)
+    if name == baseBase64UrlPad.name: return Ok[MultiBaseCodec](baseBase64UrlPad)
+    return Err[MultiBaseCodec]("multibase: unknown codec")
+
+fn codecByCode(code: str): Result[MultiBaseCodec] =
+    if code == baseIdentity.code: return Ok[MultiBaseCodec](baseIdentity)
+    if code == baseBase16.code: return Ok[MultiBaseCodec](baseBase16)
+    if code == baseBase16Upper.code: return Ok[MultiBaseCodec](baseBase16Upper)
+    if code == baseBase58Btc.code: return Ok[MultiBaseCodec](baseBase58Btc)
+    if code == baseBase58Flickr.code: return Ok[MultiBaseCodec](baseBase58Flickr)
+    if code == baseBase32.code: return Ok[MultiBaseCodec](baseBase32)
+    if code == baseBase32Upper.code: return Ok[MultiBaseCodec](baseBase32Upper)
+    if code == baseBase32Pad.code: return Ok[MultiBaseCodec](baseBase32Pad)
+    if code == baseBase32PadUpper.code: return Ok[MultiBaseCodec](baseBase32PadUpper)
+    if code == baseBase32Hex.code: return Ok[MultiBaseCodec](baseBase32Hex)
+    if code == baseBase32HexUpper.code: return Ok[MultiBaseCodec](baseBase32HexUpper)
+    if code == baseBase32HexPad.code: return Ok[MultiBaseCodec](baseBase32HexPad)
+    if code == baseBase32HexPadUpper.code: return Ok[MultiBaseCodec](baseBase32HexPadUpper)
+    if code == baseBase32Z.code: return Ok[MultiBaseCodec](baseBase32Z)
+    if code == baseBase36.code: return Ok[MultiBaseCodec](baseBase36)
+    if code == baseBase64.code: return Ok[MultiBaseCodec](baseBase64)
+    if code == baseBase64Pad.code: return Ok[MultiBaseCodec](baseBase64Pad)
+    if code == baseBase64Url.code: return Ok[MultiBaseCodec](baseBase64Url)
+    if code == baseBase64UrlPad.code: return Ok[MultiBaseCodec](baseBase64UrlPad)
+    return Err[MultiBaseCodec]("multibase: unknown code")
+
+fn encodeMultibase(codec: MultiBaseCodec, data: Bytes): Result[str] =
+    if codec.code == baseIdentity.code:
+        return Ok[str](codec.code + bytesToString(data))
+    if codec.code == baseBase16.code:
+        return Ok[str](codec.code + encodeBase16(data))
+    if codec.code == baseBase16Upper.code:
+        return Ok[str](codec.code + encodeBase16Upper(data))
+    if codec.code == baseBase58Btc.code:
+        return Ok[str](codec.code + encodeBase58(data))
+    if codec.code == baseBase58Flickr.code:
+        return Ok[str](codec.code + encodeBase58Flickr(data))
+    if codec.code == baseBase32.code:
+        return Ok[str](codec.code + encodeBase32(data))
+    if codec.code == baseBase32Upper.code:
+        return Ok[str](codec.code + encodeBase32WithAlphabet(data, base32UpperAlphabet))
+    if codec.code == baseBase32Pad.code:
+        return Ok[str](codec.code + encodeBase32Padded(data, base32Alphabet))
+    if codec.code == baseBase32PadUpper.code:
+        return Ok[str](codec.code + encodeBase32Padded(data, base32UpperAlphabet))
+    if codec.code == baseBase32Hex.code:
+        return Ok[str](codec.code + encodeBase32WithAlphabet(data, base32HexAlphabet))
+    if codec.code == baseBase32HexUpper.code:
+        return Ok[str](codec.code + encodeBase32WithAlphabet(data, base32HexUpperAlphabet))
+    if codec.code == baseBase32HexPad.code:
+        return Ok[str](codec.code + encodeBase32Padded(data, base32HexAlphabet))
+    if codec.code == baseBase32HexPadUpper.code:
+        return Ok[str](codec.code + encodeBase32Padded(data, base32HexUpperAlphabet))
+    if codec.code == baseBase32Z.code:
+        return Ok[str](codec.code + encodeBase32z(data))
+    if codec.code == baseBase36.code:
+        return Ok[str](codec.code + encodeBase36(data))
+    if codec.code == baseBase64.code:
+        return Ok[str](codec.code + encodeBase64(data, false))
+    if codec.code == baseBase64Pad.code:
+        return Ok[str](codec.code + encodeBase64Padded(data, false))
+    if codec.code == baseBase64Url.code:
+        return Ok[str](codec.code + encodeBase64(data, true))
+    if codec.code == baseBase64UrlPad.code:
+        return Ok[str](codec.code + encodeBase64Padded(data, true))
+    return Err[str]("multibase encode ! implemented")
+
+fn decodeMultibase(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Err[Bytes]("multibase: empty input")
+    let code: str = charToStr(text[0])
+    let codecRes: Result[MultiBaseCodec] = codecByCode(code)
+    if IsErr(codecRes):
+        return Err[Bytes](Error(codecRes))
+    let codec: MultiBaseCodec = Value(codecRes)
+    if codec.code == baseIdentity.code:
+        return Ok[Bytes](bytesFromString(sliceBytes(text, 1, len(text) - 1)))
+    let payload: str = sliceBytes(text, 1, len(text) - 1)
+    if codec.code == baseBase16.code:
+        return decodeBase16(payload)
+    if codec.code == baseBase16Upper.code:
+        return decodeBase16(payload)
+    if codec.code == baseBase58Btc.code:
+        return decodeBase58(payload)
+    if codec.code == baseBase58Flickr.code:
+        return decodeBase58Flickr(payload)
+    if codec.code == baseBase32.code:
+        return decodeBase32(payload)
+    if codec.code == baseBase32Upper.code:
+        return decodeBase32WithAlphabet(payload, base32UpperAlphabet, "base32upper", false)
+    if codec.code == baseBase32Pad.code:
+        return decodeBase32Padded(payload, base32Alphabet, "base32pad")
+    if codec.code == baseBase32PadUpper.code:
+        return decodeBase32Padded(payload, base32UpperAlphabet, "base32padupper")
+    if codec.code == baseBase32Hex.code:
+        return decodeBase32WithAlphabet(payload, base32HexAlphabet, "base32hex", false)
+    if codec.code == baseBase32HexUpper.code:
+        return decodeBase32WithAlphabet(payload, base32HexUpperAlphabet, "base32hexupper", false)
+    if codec.code == baseBase32HexPad.code:
+        return decodeBase32Padded(payload, base32HexAlphabet, "base32hexpad")
+    if codec.code == baseBase32HexPadUpper.code:
+        return decodeBase32Padded(payload, base32HexUpperAlphabet, "base32hexpadupper")
+    if codec.code == baseBase32Z.code:
+        return decodeBase32z(payload)
+    if codec.code == baseBase36.code:
+        return decodeBase36(payload)
+    if codec.code == baseBase64.code:
+        return decodeBase64(payload, false)
+    if codec.code == baseBase64Pad.code:
+        return decodeBase64(payload, false)
+    if codec.code == baseBase64Url.code:
+        return decodeBase64(payload, true)
+    if codec.code == baseBase64UrlPad.code:
+        return decodeBase64(payload, true)
+    return Err[Bytes]("multibase decode ! implemented")

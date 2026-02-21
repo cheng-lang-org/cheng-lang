@@ -1,0 +1,385 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import cheng/web/compiler/driver
+import cheng/web/cli/route_manifest as rmanifest
+import std/strings
+
+type
+    BuildStats =
+        files: int32
+        css: int32
+        assets: int32
+        maps: int32
+        manifests: int32
+
+var
+    exitCode: int32 = 0
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng web build [--root:<dir>] [--out:<dir>] [--exts:<list>] [--asset-exts:<list>] [--no-assets] [--routes-root:<dir>] [--routes-out:<file>] [--routes-exts:<list>]")
+    printLine("                     (aliases: --manifest-root/--manifest-out/--manifest-exts)")
+    printLine("")
+    printLine("env:")
+    printLine("  WEB_ROOT   source root directory")
+    printLine("  WEB_OUT    output directory (default dist)")
+    printLine("  WEB_EXTS   source extensions (default .cwc)")
+    printLine("  WEB_ASSET_EXTS  asset extensions to copy (default common web assets)")
+    printLine("  WEB_SOURCEMAP  set to 1 to emit .map.json files")
+    printLine("  WEB_ROUTES_ROOT  routes root for routes_manifest.cheng")
+    printLine("  WEB_ROUTES_OUT   routes manifest output path")
+    printLine("  WEB_ROUTES_EXTS  routes scan extensions (default .cwc,.cheng)")
+    printLine("  WEB_MANIFEST_ROOT/OUT/EXTS  aliases for routes manifest")
+
+fn hasPrefix(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    if len(prefix) > len(s):
+        return false
+    for i in 0..<len(prefix):
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn normalizeExt(ext: str): str =
+    if ext == nil:
+        return ""
+    var out = strutil.strip(ext)
+    if len(out) == 0:
+        return ""
+    out = strutil.toLowerAscii(out)
+    if out[0] != '.':
+        out = "." + out
+    return out
+
+fn parseExts(raw: str, fallback: str): str[] =
+    let text = if raw != nil && len(raw) > 0: raw else: fallback
+    let parts = strutil.split(text, ',')
+    var out: str[] 
+    for i in 0..<len(parts):
+        let ext = normalizeExt(parts[i])
+        if ext != nil && len(ext) > 0:
+            out.add(ext)
+    if len(out) == 0:
+        out.add(".cwc")
+    return out
+
+fn parseAssetExts(raw: str): str[] =
+    let fallback = ".html,.css,.js,.mjs,.map,.json,.wasm,.svg,.png,.jpg,.jpeg,.gif,.ico,.txt,.woff,.woff2,.ttf,.otf"
+    let text = if raw != nil && len(raw) > 0: raw else: fallback
+    let parts = strutil.split(text, ',')
+    var out: str[] 
+    for i in 0..<len(parts):
+        let ext = normalizeExt(parts[i])
+        if ext != nil && len(ext) > 0:
+            out.add(ext)
+    return out
+
+fn isIgnoredSegment(seg: str): bool =
+    if seg == nil || len(seg) == 0:
+        return false
+    return seg == ".git" || seg == "node_modules" || seg == "chengcache" || seg == "dist" || seg == "build" || seg == "out" || seg == ".cache" || seg == ".idea" || seg == ".vscode" || seg == "tmp" || seg == "tmp_build"
+
+fn shouldIgnorePath(relPath: str): bool =
+    if relPath == nil || len(relPath) == 0:
+        return false
+    let parts = strutil.split(relPath, '/')
+    for i in 0..<len(parts):
+        let subparts = strutil.split(parts[i], '\\')
+        for j in 0..<len(subparts):
+            if isIgnoredSegment(subparts[j]):
+                return true
+    return false
+
+fn startsWithDot(name: str): bool =
+    return name != nil && len(name) > 0 && name[0] == '.'
+
+fn extMatches(path: str, exts: str[]): bool =
+    let parts = os.splitFile(path)
+    var ext = parts.ext
+    if ext == nil:
+        ext = ""
+    ext = strutil.toLowerAscii(ext)
+    for i in 0..<len(exts):
+        if ext == exts[i]:
+            return true
+    return false
+
+fn isRelUnder(rel: str, rootRel: str): bool =
+    if rel == nil || rootRel == nil || len(rootRel) == 0:
+        return false
+    if rel == rootRel:
+        return true
+    if len(rel) <= len(rootRel):
+        return false
+    let prefix = substr(rel, 0, len(rootRel))
+    if prefix != rootRel:
+        return false
+    let c = rel[len(rootRel)]
+    return c == '/' || c == '\\'
+
+fn resolveMaybeRelative(base: str, value: str): str =
+    if value == nil || len(value) == 0:
+        return ""
+    if os.isAbsolute(value):
+        return os.absolutePath(value)
+    return os.absolutePath(os.joinPath(base, value))
+
+fn createDirAll(path: str) =
+    if path == nil || len(path) == 0:
+        return
+    if os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if parent != nil && len(parent) > 0 && parent != path && ! os.dirExists(parent):
+        createDirAll(parent)
+    if ! os.dirExists(path):
+        os.createDir(path)
+
+fn walkSources(root: str, rel: str, out: str[]*, exts: str[], skipRel: str) =
+    let dirPath = if rel == nil || len(rel) == 0: root else: os.joinPath(root, rel)
+    let items = os.walkDir(dirPath)
+    for i in 0..<items.len:
+        let entry = os.os_get_WalkDirEntry(items, i)
+        let fullPath = entry.path
+        let name = os.extractFilename(fullPath)
+        if startsWithDot(name) && name != ".github":
+            continue
+        let nextRel = if rel == nil || len(rel) == 0: name else: rel + "/" + name
+        if shouldIgnorePath(nextRel) || isRelUnder(nextRel, skipRel):
+            continue
+        if entry.kind == os.pcDir || entry.kind == os.pcLinkToDir:
+            walkSources(root, nextRel, out, exts, skipRel)
+        elif entry.kind == os.pcFile || entry.kind == os.pcLinkToFile:
+            if extMatches(name, exts):
+                out->add(nextRel)
+
+fn normalizeSlashes(path: str): str =
+    if path == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(path):
+        var c = path[i]
+        if c == '\\':
+            c = '/'
+        out = out + c
+    return out
+
+fn isPathPrefix(path: str, prefix: str): bool =
+    if path == nil || prefix == nil:
+        return false
+    let p = normalizeSlashes(path)
+    let pre = normalizeSlashes(prefix)
+    if len(pre) == 0 || len(p) < len(pre):
+        return false
+    for i in 0..<len(pre):
+        if p[i] != pre[i]:
+            return false
+    if len(p) == len(pre):
+        return true
+    let next = p[len(pre)]
+    return next == '/'
+
+fn walkAssets(root: str, rel: str, out: str[]*, exts: str[], skipRel: str) =
+    let dirPath = if rel == nil || len(rel) == 0: root else: os.joinPath(root, rel)
+    let items = os.walkDir(dirPath)
+    for i in 0..<items.len:
+        let entry = os.os_get_WalkDirEntry(items, i)
+        let fullPath = entry.path
+        let name = os.extractFilename(fullPath)
+        if startsWithDot(name) && name != ".github":
+            continue
+        let nextRel = if rel == nil || len(rel) == 0: name else: rel + "/" + name
+        if shouldIgnorePath(nextRel) || isRelUnder(nextRel, skipRel):
+            continue
+        if entry.kind == os.pcDir || entry.kind == os.pcLinkToDir:
+            walkAssets(root, nextRel, out, exts, skipRel)
+        elif entry.kind == os.pcFile || entry.kind == os.pcLinkToFile:
+            if extMatches(name, exts):
+                out->add(nextRel)
+
+fn ensureOutDir(root: str, outDir: str): str =
+    if outDir == nil || len(outDir) == 0:
+        return os.joinPath(root, "dist")
+    if os.isAbsolute(outDir):
+        return outDir
+    return os.absolutePath(os.joinPath(root, outDir))
+
+fn buildProject(root: str, outDir: str, exts: str[], assetExts: str[], copyAssets: bool, mapEnabled: bool, stats: BuildStats*): str =
+    if root == nil || len(root) == 0 || ! os.dirExists(root):
+        return "root not found"
+    let outAbs = ensureOutDir(root, outDir)
+    let skipRel = if isPathPrefix(outAbs, root): os.relativePath(outAbs, root) else: ""
+    createDirAll(outAbs)
+    var files: str[] 
+    walkSources(root, "", &files, exts, skipRel)
+    for i in 0..<len(files):
+        let rel = files[i]
+        let srcAbs = os.joinPath(root, rel)
+        let parts = os.splitFile(rel)
+        let relDir = parts.dir
+        let base = parts.name
+        let outSub = if relDir != nil && len(relDir) > 0: os.joinPath(outAbs, relDir) else: outAbs
+        createDirAll(outSub)
+        let outCheng = os.joinPath(outSub, base + ".cheng")
+        let outCss = os.joinPath(outSub, base + ".css")
+        let res = driver.compileSfcFileEx(srcAbs, outCheng, outCss, mapEnabled)
+        if ! res.ok:
+            return "build failed: " + srcAbs + " -> " + res.error
+        stats->files = stats->files + 1
+        if res.cssPath != nil && len(res.cssPath) > 0:
+            stats->css = stats->css + 1
+        if res.mapPath != nil && len(res.mapPath) > 0:
+            stats->maps = stats->maps + 1
+        if res.cssMapPath != nil && len(res.cssMapPath) > 0:
+            stats->maps = stats->maps + 1
+    if copyAssets:
+        var assets: str[] 
+        walkAssets(root, "", &assets, assetExts, skipRel)
+        i = 0
+        let __for_start_i_1 = i
+        for __for_i_1 in __for_start_i_1..<len(assets):
+            i = __for_i_1
+            let rel = assets[i]
+            let srcAbs = os.joinPath(root, rel)
+            let destAbs = os.joinPath(outAbs, rel)
+            let destDir = os.parentDir(destAbs)
+            if destDir != nil && len(destDir) > 0:
+                createDirAll(destDir)
+            let content = os.readFile(srcAbs)
+            os.writeFile(destAbs, content)
+            stats->assets = stats->assets + 1
+            i = i + 1
+    return ""
+
+fn buildProjectArgs(args: str[]): bool =
+    var root: str = ""
+    var outDir: str = ""
+    var extsRaw: str = ""
+    var assetExtsRaw: str = ""
+    var routesRoot: str = ""
+    var routesOut: str = ""
+    var routesExtsRaw: str = ""
+    var manifestRoot: str = ""
+    var manifestOut: str = ""
+    var manifestExtsRaw: str = ""
+    var copyAssets: bool = true
+    var mapEnabled: bool = false
+    for i in 0..<len(args):
+        let arg = args[i]
+        if arg == "--help" || arg == "-h":
+            printUsage()
+            exitCode = 0
+            return false
+        if hasPrefix(arg, "--root:"):
+            root = substr(arg, len("--root:"), len(arg) - len("--root:"))
+        elif hasPrefix(arg, "--out:"):
+            outDir = substr(arg, len("--out:"), len(arg) - len("--out:"))
+        elif hasPrefix(arg, "--exts:"):
+            extsRaw = substr(arg, len("--exts:"), len(arg) - len("--exts:"))
+        elif hasPrefix(arg, "--asset-exts:"):
+            assetExtsRaw = substr(arg, len("--asset-exts:"), len(arg) - len("--asset-exts:"))
+        elif hasPrefix(arg, "--assets-exts:"):
+            assetExtsRaw = substr(arg, len("--assets-exts:"), len(arg) - len("--assets-exts:"))
+        elif hasPrefix(arg, "--routes-root:"):
+            routesRoot = substr(arg, len("--routes-root:"), len(arg) - len("--routes-root:"))
+        elif hasPrefix(arg, "--routes-out:"):
+            routesOut = substr(arg, len("--routes-out:"), len(arg) - len("--routes-out:"))
+        elif hasPrefix(arg, "--routes-exts:"):
+            routesExtsRaw = substr(arg, len("--routes-exts:"), len(arg) - len("--routes-exts:"))
+        elif hasPrefix(arg, "--manifest-root:"):
+            manifestRoot = substr(arg, len("--manifest-root:"), len(arg) - len("--manifest-root:"))
+        elif hasPrefix(arg, "--manifest-out:"):
+            manifestOut = substr(arg, len("--manifest-out:"), len(arg) - len("--manifest-out:"))
+        elif hasPrefix(arg, "--manifest-exts:"):
+            manifestExtsRaw = substr(arg, len("--manifest-exts:"), len(arg) - len("--manifest-exts:"))
+        elif arg == "--no-assets":
+            copyAssets = false
+        elif arg == "--map":
+            mapEnabled = true
+        else:
+            printErr("unknown arg: " + arg)
+            printUsage()
+            exitCode = 1
+            return false
+    if len(root) == 0:
+        root = os.getEnv("WEB_ROOT")
+    if len(outDir) == 0:
+        outDir = os.getEnv("WEB_OUT")
+    if len(extsRaw) == 0:
+        extsRaw = os.getEnv("WEB_EXTS")
+    if len(assetExtsRaw) == 0:
+        assetExtsRaw = os.getEnv("WEB_ASSET_EXTS")
+    if len(routesRoot) == 0:
+        routesRoot = os.getEnv("WEB_ROUTES_ROOT")
+    if len(routesOut) == 0:
+        routesOut = os.getEnv("WEB_ROUTES_OUT")
+    if len(routesExtsRaw) == 0:
+        routesExtsRaw = os.getEnv("WEB_ROUTES_EXTS")
+    if len(routesRoot) == 0:
+        routesRoot = manifestRoot
+    if len(routesOut) == 0:
+        routesOut = manifestOut
+    if len(routesExtsRaw) == 0:
+        routesExtsRaw = manifestExtsRaw
+    if len(routesRoot) == 0:
+        routesRoot = os.getEnv("WEB_MANIFEST_ROOT")
+    if len(routesOut) == 0:
+        routesOut = os.getEnv("WEB_MANIFEST_OUT")
+    if len(routesExtsRaw) == 0:
+        routesExtsRaw = os.getEnv("WEB_MANIFEST_EXTS")
+    if ! mapEnabled:
+        let envMap = os.getEnv("WEB_SOURCEMAP")
+        if envMap == "1" || envMap == "true":
+            mapEnabled = true
+    if len(root) == 0:
+        root = os.getCurrentDir()
+    let rootAbs = os.absolutePath(root)
+    let routesRootAbs = resolveMaybeRelative(rootAbs, routesRoot)
+    var routesOutAbs: str = ""
+    if len(routesRootAbs) > 0:
+        if len(routesOut) > 0:
+            routesOutAbs = resolveMaybeRelative(rootAbs, routesOut)
+        else:
+            routesOutAbs = os.joinPath(routesRootAbs, "routes_manifest.cheng")
+    let exts = parseExts(extsRaw, ".cwc")
+    let assetExts = if copyAssets: parseAssetExts(assetExtsRaw) else: []
+    var stats: BuildStats
+    let err = buildProject(rootAbs, outDir, exts, assetExts, copyAssets, mapEnabled, &stats)
+    if err != nil && len(err) > 0:
+        printErr(err)
+        exitCode = 1
+        return false
+    if len(routesRootAbs) > 0:
+        let routesExts = parseExts(routesExtsRaw, ".cwc,.cheng")
+        let manifestErr = rmanifest.generateRouteManifest(routesRootAbs, routesOutAbs, routesExts)
+        if manifestErr != nil && len(manifestErr) > 0:
+            printErr(manifestErr)
+            exitCode = 1
+            return false
+        stats.manifests = stats.manifests + 1
+    printLine("build ok: " + intToStr(stats.files) + " files, " + intToStr(stats.css) + " css, " + intToStr(stats.assets) + " assets, " + intToStr(stats.maps) + " maps, " + intToStr(stats.manifests) + " manifests")
+    return true
+
+fn buildExitCode(): int32 =
+    return exitCode
+
+fn collectArgsFromCmdline(): str[] =
+    var out: str[] 
+    let count: int32 = cmdline.paramCount()
+    for i in 0..<count:
+        out.add(cmdline.paramStr(i + 1))
+    return out
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.__cheng_setCmdLine(argc, void*(argv))
+    let args = collectArgsFromCmdline()
+    if ! buildProjectArgs(args):
+        return buildExitCode()
+    return 0

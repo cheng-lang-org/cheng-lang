@@ -1,0 +1,91 @@
+# Minimal signals runtime (sync)
+
+type
+    Effect = ref
+        callback: fn ()
+        active: bool
+
+    Signal[T] = ref
+        value: T
+        subscribers: Effect[]
+
+var currentEffect: Effect = nil
+
+fn hasEffect(list: Effect[], eff: Effect): bool =
+    for i in 0..<len(list):
+        if list[i] == eff:
+            return true
+    return false
+
+fn runEffect(e: Effect) =
+    if e == nil || ! e.active || e.callback == nil:
+        return
+    let prev = currentEffect
+    currentEffect = e
+    e.callback()
+    currentEffect = prev
+
+fn trackEffect(s: Signal[T]) =
+    if s == nil || currentEffect == nil:
+        return
+    if ! hasEffect(s.subscribers, currentEffect):
+        s.subscribers.add(currentEffect)
+
+fn signal(value: T): Signal[T] =
+    var s: Signal[T]
+    new(s)
+    s.value = value
+    s.subscribers = []
+    return s
+
+fn get(s: Signal[T]): T =
+    if s == nil:
+        var empty: T
+        return empty
+    trackEffect(s)
+    return s.value
+
+fn peek(s: Signal[T]): T =
+    if s == nil:
+        var empty: T
+        return empty
+    return s.value
+
+fn notify(s: Signal[T]) =
+    if s == nil:
+        return
+    for i in 0..<len(s.subscribers):
+        let eff = s.subscribers[i]
+        if eff != nil && eff.active:
+            runEffect(eff)
+
+fn set(s: Signal[T], value: T) =
+    if s == nil:
+        return
+    s.value = value
+    notify(s)
+
+fn effect(callback: fn ()): Effect =
+    if callback == nil:
+        return nil
+    var e: Effect
+    new(e)
+    e.callback = callback
+    e.active = true
+    runEffect(e)
+    return e
+
+fn dispose(e: Effect) =
+    if e == nil:
+        return
+    e.active = false
+    e.callback = nil
+
+fn computed(callback: fn (): T): Signal[T] =
+    if callback == nil:
+        return nil
+    let s = signal[T](callback())
+    let updater = fn () =
+        set(s, callback())
+    effect(updater)
+    return s

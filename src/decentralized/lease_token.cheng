@@ -1,0 +1,170 @@
+import std/os
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import cheng/decentralized/lease as dlease
+import cheng/libp2p/crypto/crypto as crypto
+import cheng/libp2p/multibase as multibase
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import std/strings
+
+type
+    LeaseToken =
+        lease: dlease.Lease
+        pubKeyText: str
+        sigText: str
+
+fn encodeKeyText(key: crypto.PublicKey): result.Result[str] =
+    let encRes: result.Result[bytes.Bytes] = crypto.encodePublicKey(key)
+    if result.IsErr(encRes):
+        return result.Err[str](result.Error(encRes))
+    return multibase.encodeMultibase(multibase.baseBase64Url, result.Value(encRes))
+
+fn encodePrivKeyText(key: crypto.PrivateKey): result.Result[str] =
+    let encRes: result.Result[bytes.Bytes] = crypto.encodePrivateKey(key)
+    if result.IsErr(encRes):
+        return result.Err[str](result.Error(encRes))
+    return multibase.encodeMultibase(multibase.baseBase64Url, result.Value(encRes))
+
+fn decodePublicKeyText(text: str): result.Result[crypto.PublicKey] =
+    let rawRes: result.Result[bytes.Bytes] = multibase.decodeMultibase(text)
+    if result.IsErr(rawRes):
+        return result.Err[crypto.PublicKey](result.Error(rawRes))
+    return crypto.decodePublicKey(result.Value(rawRes))
+
+fn decodePrivateKeyText(text: str): result.Result[crypto.PrivateKey] =
+    let rawRes: result.Result[bytes.Bytes] = multibase.decodeMultibase(text)
+    if result.IsErr(rawRes):
+        return result.Err[crypto.PrivateKey](result.Error(rawRes))
+    return crypto.decodePrivateKey(result.Value(rawRes))
+
+fn encodeSignatureText(sig: crypto.Signature): result.Result[str] =
+    let raw: bytes.Bytes = crypto.encodeSignature(sig)
+    return multibase.encodeMultibase(multibase.baseBase64Url, raw)
+
+fn decodeSignatureText(keyType: crypto.KeyType, text: str): result.Result[crypto.Signature] =
+    let rawRes: result.Result[bytes.Bytes] = multibase.decodeMultibase(text)
+    if result.IsErr(rawRes):
+        return result.Err[crypto.Signature](result.Error(rawRes))
+    return result.Ok[crypto.Signature](crypto.decodeSignature(keyType, result.Value(rawRes)))
+
+fn normalizeLeaseForSign(lease: dlease.Lease): dlease.Lease =
+    var out = lease
+    if out.startTs == nil || len(out.startTs) == 0:
+        out.startTs = dlease.leaseStartTs()
+    return dlease.normalizeLease(out)
+
+fn normalizeLeaseForVerify(lease: dlease.Lease): result.Result[dlease.Lease] =
+    var out = lease
+    if out.durationDays <= 0:
+        out.durationDays = 30
+    if out.replicas <= 0:
+        out.replicas = 1
+    if out.startTs == nil || len(out.startTs) == 0:
+        return result.Err[dlease.Lease]("lease: missing start_ts")
+    if out.leaseId == nil || len(out.leaseId) == 0:
+        out.leaseId = dlease.buildLeaseId(out)
+    return result.Ok[dlease.Lease](out)
+
+fn tokenPayload(lease: dlease.Lease): str =
+    return lease.leaseId + "|" + lease.packageId + "|" + lease.authorId + "|" +
+        lease.providerId + "|" + intToStr(int32(lease.bytes)) + "|" +
+        intToStr(lease.durationDays) + "|" + intToStr(lease.replicas) + "|" + lease.startTs
+
+fn signLeaseToken(lease: dlease.Lease, privText: str): result.Result[LeaseToken] =
+    let privRes: result.Result[crypto.PrivateKey] = decodePrivateKeyText(privText)
+    if result.IsErr(privRes):
+        return result.Err[LeaseToken](result.Error(privRes))
+    let priv: crypto.PrivateKey = result.Value(privRes)
+    let normalized: dlease.Lease = normalizeLeaseForSign(lease)
+    let msg: bytes.Bytes = bytes.bytesFromString(tokenPayload(normalized))
+    let sigRes: result.Result[crypto.Signature] = crypto.sign(priv, msg)
+    if result.IsErr(sigRes):
+        return result.Err[LeaseToken](result.Error(sigRes))
+    let pubRes: result.Result[crypto.PublicKey] = crypto.publicKeyFromPrivateKey(priv)
+    if result.IsErr(pubRes):
+        return result.Err[LeaseToken](result.Error(pubRes))
+    let pubTextRes: result.Result[str] = encodeKeyText(result.Value(pubRes))
+    if result.IsErr(pubTextRes):
+        return result.Err[LeaseToken](result.Error(pubTextRes))
+    let sigTextRes: result.Result[str] = encodeSignatureText(result.Value(sigRes))
+    if result.IsErr(sigTextRes):
+        return result.Err[LeaseToken](result.Error(sigTextRes))
+    var token: LeaseToken
+    token.lease = normalized
+    token.pubKeyText = result.Value(pubTextRes)
+    token.sigText = result.Value(sigTextRes)
+    return result.Ok[LeaseToken](token)
+
+fn verifyLeaseToken(token: LeaseToken): bool =
+    if token.pubKeyText == nil || len(token.pubKeyText) == 0:
+        return false
+    if token.sigText == nil || len(token.sigText) == 0:
+        return false
+    let leaseRes: result.Result[dlease.Lease] = normalizeLeaseForVerify(token.lease)
+    if result.IsErr(leaseRes):
+        return false
+    let lease = result.Value(leaseRes)
+    let pubRes: result.Result[crypto.PublicKey] = decodePublicKeyText(token.pubKeyText)
+    if result.IsErr(pubRes):
+        return false
+    let pub: crypto.PublicKey = result.Value(pubRes)
+    let sigRes: result.Result[crypto.Signature] = decodeSignatureText(pub.keyType, token.sigText)
+    if result.IsErr(sigRes):
+        return false
+    let msg: bytes.Bytes = bytes.bytesFromString(tokenPayload(lease))
+    return crypto.verify(pub, msg, result.Value(sigRes))
+
+fn leaseTokenAllowsBytes(token: LeaseToken, sizeBytes: int64): bool =
+    if token.lease.bytes <= 0:
+        return false
+    return sizeBytes <= token.lease.bytes
+
+fn leaseTokenToJson(token: LeaseToken): json.JsonNode =
+    let node = json.newJObject()
+    node["type"] = json.newJString("lease_token")
+    node["lease_id"] = json.newJString(token.lease.leaseId)
+    node["package_id"] = json.newJString(token.lease.packageId)
+    node["author_id"] = json.newJString(token.lease.authorId)
+    node["provider_id"] = json.newJString(token.lease.providerId)
+    node["bytes"] = json.newJInt(token.lease.bytes)
+    node["duration_days"] = json.newJInt(token.lease.durationDays)
+    node["replicas"] = json.newJInt(token.lease.replicas)
+    node["price_per_gb_month"] = json.newJFloat(token.lease.pricePerGbMonth)
+    node["royalty_rate"] = json.newJFloat(token.lease.royaltyRate)
+    node["treasury_rate"] = json.newJFloat(token.lease.treasuryRate)
+    node["start_ts"] = json.newJString(token.lease.startTs)
+    if token.pubKeyText != nil && len(token.pubKeyText) > 0:
+        node["pub_key"] = json.newJString(token.pubKeyText)
+    if token.sigText != nil && len(token.sigText) > 0:
+        node["signature"] = json.newJString(token.sigText)
+    node
+
+fn parseLeaseToken(node: json.JsonNode): LeaseToken =
+    var token: LeaseToken
+    token.lease.leaseId = jparse.getStringField(node, "lease_id", "")
+    token.lease.packageId = jparse.getStringField(node, "package_id", "")
+    token.lease.authorId = jparse.getStringField(node, "author_id", "")
+    token.lease.providerId = jparse.getStringField(node, "provider_id", "")
+    token.lease.bytes = jparse.getIntField(node, "bytes", 0)
+    token.lease.durationDays = int32(jparse.getIntField(node, "duration_days", 0))
+    token.lease.replicas = int32(jparse.getIntField(node, "replicas", 0))
+    token.lease.pricePerGbMonth = jparse.getFloatField(node, "price_per_gb_month", 0.0)
+    token.lease.royaltyRate = jparse.getFloatField(node, "royalty_rate", 0.0)
+    token.lease.treasuryRate = jparse.getFloatField(node, "treasury_rate", 0.0)
+    token.lease.startTs = jparse.getStringField(node, "start_ts", "")
+    token.pubKeyText = jparse.getStringField(node, "pub_key", "")
+    token.sigText = jparse.getStringField(node, "signature", "")
+    token
+
+fn loadLeaseTokenFile(path: str): result.Result[LeaseToken] =
+    if path == nil || len(path) == 0:
+        return result.Err[LeaseToken]("lease: missing path")
+    if ! os.fileExists(path):
+        return result.Err[LeaseToken]("lease: token file missing")
+    let content = os.readFile(path)
+    let parsed: jparse.ParseResult = jparse.parseJsonSafe(content)
+    if ! parsed.ok:
+        return result.Err[LeaseToken](parsed.error)
+    let token = parseLeaseToken(parsed.value)
+    return result.Ok[LeaseToken](token)

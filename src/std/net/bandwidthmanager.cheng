@@ -1,0 +1,74 @@
+# Bandwidth manager(minimal).
+
+import std/result
+const
+    bandwidthMaxInt64Value: int64 = 9223372036854775807
+
+type
+    BandwidthConfig =
+        enabled: bool
+        maxInbound: int64
+        maxOutbound: int64
+
+    BandwidthStats =
+        inboundBytes: int64
+        outboundBytes: int64
+
+    BandwidthManager =
+        config: BandwidthConfig
+        stats: BandwidthStats
+
+var
+    bandwidthManager: BandwidthManager = BandwidthManager(
+        config: BandwidthConfig(enabled: true, maxInbound: 0, maxOutbound: 0),
+        stats: BandwidthStats(inboundBytes: 0, outboundBytes: 0)
+    )
+
+fn initBandwidthConfig(): BandwidthConfig =
+    BandwidthConfig(enabled: true, maxInbound: 0, maxOutbound: 0)
+
+fn setBandwidthConfig(config: BandwidthConfig) =
+    bandwidthManager.config = config
+
+fn bandwidthEnabled(): bool =
+    bandwidthManager.config.enabled
+
+fn resetBandwidthStats() =
+    bandwidthManager.stats = BandwidthStats(inboundBytes: 0, outboundBytes: 0)
+
+fn bandwidthInboundTotal(): int64 =
+    bandwidthManager.stats.inboundBytes
+
+fn bandwidthOutboundTotal(): int64 =
+    bandwidthManager.stats.outboundBytes
+
+fn addNoOverflow(current: int64, delta: int64): Result[int64] =
+    if delta < 0:
+        return Err[int64]("bandwidth: negative bytes")
+    if delta > 0 && current > bandwidthMaxInt64Value - delta:
+        return Err[int64]("bandwidth: overflow")
+    return Ok[int64](current + delta)
+
+fn recordInbound(bytes: int64): Result[bool] =
+    if ! bandwidthEnabled():
+        return Ok[bool](false)
+    let nextRes: Result[int64] = addNoOverflow(bandwidthManager.stats.inboundBytes, bytes)
+    if IsErr(nextRes):
+        return Err[bool](Error(nextRes))
+    let next: int64 = Value(nextRes)
+    if bandwidthManager.config.maxInbound > 0 && next > bandwidthManager.config.maxInbound:
+        return Err[bool]("bandwidth: inbound limit exceeded")
+    bandwidthManager.stats.inboundBytes = next
+    return Ok[bool](true)
+
+fn recordOutbound(bytes: int64): Result[bool] =
+    if ! bandwidthEnabled():
+        return Ok[bool](false)
+    let nextRes: Result[int64] = addNoOverflow(bandwidthManager.stats.outboundBytes, bytes)
+    if IsErr(nextRes):
+        return Err[bool](Error(nextRes))
+    let next: int64 = Value(nextRes)
+    if bandwidthManager.config.maxOutbound > 0 && next > bandwidthManager.config.maxOutbound:
+        return Err[bool]("bandwidth: outbound limit exceeded")
+    bandwidthManager.stats.outboundBytes = next
+    return Ok[bool](true)

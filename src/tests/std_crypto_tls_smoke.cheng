@@ -1,0 +1,135 @@
+# std crypto/tls smoke: sha256/hkdf/aesgcm/x509 parse
+
+import std/system
+import std/result
+import std/strings
+import std/rawbytes
+import std/crypto/sha256
+import std/crypto/hkdf
+import std/crypto/aesgcm
+import std/crypto/bigint
+import std/tls/x509
+
+const
+    # Self-contained DER hex vectors (generated once; same as pkg://cheng/libp2p tests).
+    x509RootHex = "3082032130820209a00302010202140cc0a9df1a45dc9755eeae9ee5039521a08c29cc300d06092a864886f70d01010b050030183116301406035504030c0d4368656e6720526f6f74204341301e170d3236303131313032313733375a170d3336303130393032313733375a30183116301406035504030c0d4368656e6720526f6f7420434130820122300d06092a864886f70d01010105000382010f003082010a0282010100aacb28741a88fda68425ac8d834022625783fb5abc062fe223a2e1d862f125be4b0d50b2c497667c6e381e4fbeca0a8386d09652918fd890c80b177e7edac1bc3eece43d8baeb5bd10163ed83b5fe498bbd97ba35223e52ce0d45ca87a1f825123072031b93aa0899acc9c460f098b8d2fb01bddf6a737a0b7abaf9abfdf2c8f4416b583b2aa48662f169cb0e0489d9926d1a35952edfb098445b71b2e9046d9bfaf765646012594284ca27471501f9b65321e50224bb78242b44e805b1490f38368b3a41f9b2f9e72bc27f69c9509152eca4b92086a4801d809d46ae7d4cea3df051acfe52308ec3bc83412c9ee4a470d541a8d2c25510201de004c07a481050203010001a3633061300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106301d0603551d0e041604141e5bf37882efccd06bd35f1163d809623c04996d301f0603551d230418301680141e5bf37882efccd06bd35f1163d809623c04996d300d06092a864886f70d01010b0500038201010059be1bca0f8cc7e9db459e3e359de056bab501f1eb72b73b4da67de788957ddb987fab12eca5725d7d2b5a5fd05fce13d3aca9f7184fc5faeb9369d28e547188b8f7b95f665ab1ac79186100f72b8495762188998bd04baaa86ba8903b0e48b6e59fb1d37f786e6d12f184d4e8c357dbe22183041997004c59d482d4458a0be03891d552d305110b4c1ee3bfdfdbbbd83196bd06ccdb048f9514f0dd95588c25d9574043dae1d54a4ec530b093f40277dfd66d722c744c45d2e034d1ec53cdedeea907ba59ae40f3748c7b96a9e477e99d7dab6e8540274377c7862320d42f43e80edbd5d76b464b44162608a690e559973513e55f6852be241110bdd2abb3df"
+
+fn hexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn hexDecode(text: str): Result[Bytes] =
+    if len(text) % 2 != 0:
+        return Err[Bytes]("hex: length must be even")
+    let out: Bytes = bytesAlloc(len(text) / 2)
+    var i: int32 = 0
+    while i < len(text):
+        let hi: int32 = hexValue(text[i])
+        let lo: int32 = hexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("hex: invalid")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn main() =
+    # SHA-256: "abc"
+    let msg: Bytes = bytesFromString("abc")
+    let digest: Bytes = sha256Digest(msg)
+    let digestHex: str = bytesToHex(digest)
+    assert(
+        digestHex == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "std/crypto/sha256 vector"
+    )
+
+    # HKDF-SHA256: RFC 5869 test case 1 (L=42)
+    let ikm: Bytes = bytesAlloc(22)
+    for i in 0..<22:
+        bytesSet(ikm, i, 0x0b)
+    let saltRes: Result[Bytes] = hexDecode("000102030405060708090a0b0c")
+    assert(IsOk(saltRes), "std/crypto/hkdf salt decode")
+    let infoRes: Result[Bytes] = hexDecode("f0f1f2f3f4f5f6f7f8f9")
+    assert(IsOk(infoRes), "std/crypto/hkdf info decode")
+    let okmRes: Result[Bytes] = hkdfSha256(ikm, Value(saltRes), Value(infoRes), 42)
+    assert(IsOk(okmRes), "std/crypto/hkdf okm")
+    let okmHex: str = bytesToHex(Value(okmRes))
+    assert(
+        okmHex == "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865",
+        "std/crypto/hkdf vector"
+    )
+
+    # AES-GCM roundtrip
+    let keyBytesRes: Result[Bytes] = hexDecode("000102030405060708090a0b0c0d0e0f")
+    assert(IsOk(keyBytesRes), "std/crypto/aesgcm key decode")
+    let keyRes: Result[AesGcmKey] = intoAesGcmKey(Value(keyBytesRes))
+    assert(IsOk(keyRes), "std/crypto/aesgcm key")
+    let nonceBytesRes: Result[Bytes] = hexDecode("000102030405060708090a0b")
+    assert(IsOk(nonceBytesRes), "std/crypto/aesgcm nonce decode")
+    let nonceRes: Result[AesGcmNonce] = intoAesGcmNonce(Value(nonceBytesRes))
+    assert(IsOk(nonceRes), "std/crypto/aesgcm nonce")
+    let aad: Bytes = emptyBytes()
+    let pt: Bytes = bytesFromString("hello")
+    var data: Bytes = bytesSlice(pt, 0, bytesLen(pt))
+    var tag: AesGcmTag
+    let encRes: Result[bool] = aesGcmEncrypt(Value(keyRes), Value(nonceRes), tag, data, aad)
+    assert(IsOk(encRes), "std/crypto/aesgcm encrypt")
+    let decRes: Result[bool] = aesGcmDecrypt(Value(keyRes), Value(nonceRes), tag, data, aad)
+    assert(IsOk(decRes), "std/crypto/aesgcm decrypt")
+    assert(bytesEqual(data, pt), "std/crypto/aesgcm roundtrip")
+
+    # AES-GCM known vector (NIST SP 800-38D, AES-128, empty AAD, 1-block PT).
+    # K=0^128, IV=0^96, P=0^128 => C=0388...fe78, T=ab6e...bddf
+    let vecKeyBytes: Bytes = bytesAlloc(16)
+    let vecKeyRes: Result[AesGcmKey] = intoAesGcmKey(vecKeyBytes)
+    assert(IsOk(vecKeyRes), "std/crypto/aesgcm vec key")
+    let vecNonceBytes: Bytes = bytesAlloc(12)
+    let vecNonceRes: Result[AesGcmNonce] = intoAesGcmNonce(vecNonceBytes)
+    assert(IsOk(vecNonceRes), "std/crypto/aesgcm vec nonce")
+    let vecAad: Bytes = emptyBytes()
+    var vecData: Bytes = bytesAlloc(16)
+    var vecTag: AesGcmTag
+    let vecEncRes: Result[bool] = aesGcmEncrypt(Value(vecKeyRes), Value(vecNonceRes), vecTag, vecData, vecAad)
+    assert(IsOk(vecEncRes), "std/crypto/aesgcm vec encrypt")
+    assert(
+        bytesToHex(vecData) == "0388dace60b6a392f328c2b971b2fe78",
+        "std/crypto/aesgcm vec ciphertext"
+    )
+    assert(
+        bytesToHex(vecTag.data) == "ab6e47d42cec13bdf53a67b21257bddf",
+        "std/crypto/aesgcm vec tag"
+    )
+    let vecDecRes: Result[bool] = aesGcmDecrypt(Value(vecKeyRes), Value(vecNonceRes), vecTag, vecData, vecAad)
+    assert(IsOk(vecDecRes), "std/crypto/aesgcm vec decrypt")
+    let vecPtExpected: Bytes = bytesAlloc(16)
+    assert(bytesEqual(vecData, vecPtExpected), "std/crypto/aesgcm vec plaintext")
+
+    # X.509 parse smoke (no chain verify; only parsing success + basic fields)
+    let derRes: Result[Bytes] = hexDecode(x509RootHex)
+    assert(IsOk(derRes), "std/tls/x509 hex decode")
+    var cert: X509Certificate = initX509Certificate()
+    let parseRes: Result[bool] = x509ParseCertificateInto(cert, Value(derRes))
+    assert(IsOk(parseRes) && Value(parseRes), "std/tls/x509 parse ok")
+    assert(cert.sigAlg != X509SigUnknown, "std/tls/x509 sigAlg")
+    assert(cert.publicKey.kind != X509KeyUnknown, "std/tls/x509 publicKey")
+    assert(bytesLen(cert.subject) > 0, "std/tls/x509 subject")
+    assert(bytesLen(cert.issuer) > 0, "std/tls/x509 issuer")
+
+    # BigInt unsigned limb correctness: compare across the sign bit.
+    let hiRes: Result[Bytes] = hexDecode("80000000")
+    assert(IsOk(hiRes), "std/crypto/bigint hex decode hi")
+    let loRes: Result[Bytes] = hexDecode("7fffffff")
+    assert(IsOk(loRes), "std/crypto/bigint hex decode lo")
+    let hiBigRes: Result[BigInt] = bigFromBytes(Value(hiRes))
+    assert(! IsErr(hiBigRes), "std/crypto/bigint parse hi")
+    let loBigRes: Result[BigInt] = bigFromBytes(Value(loRes))
+    assert(! IsErr(loBigRes), "std/crypto/bigint parse lo")
+    assert(bigCmp(Value(hiBigRes), Value(loBigRes)) > 0, "std/crypto/bigint unsigned cmp")
+
+    # RSA exponent in the X.509 vector should be 65537 (0x010001).
+    assert(cert.publicKey.kind == X509KeyRsa, "std/tls/x509 rsa key kind")
+    assert(bigCmp(cert.publicKey.rsa.e, bigFromInt(65537)) == 0, "std/tls/x509 rsa exponent")

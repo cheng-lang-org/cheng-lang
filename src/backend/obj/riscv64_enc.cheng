@@ -1,0 +1,301 @@
+# Shared RISC-V64 instruction encoders used by object writer/linker.
+import std/result
+import cheng/backend/machine/machine_types
+
+fn rv64RegNum(reg: MachineReg): int32 =
+    # Keep numeric aliases to stay compatible with older stage0 compilers that
+    # may not expose machineRegW* names in imported surfaces.
+    let regCode: int32 = int32(reg)
+    case regCode
+    of 0, 9: return 10
+    of 1, 10: return 11
+    of 2, 11: return 12
+    of 3, 12: return 13
+    of 4, 13: return 14
+    of 5, 14: return 15
+    of 6, 15: return 16
+    of 7, 16: return 17
+    of 18: return 5
+    of 19: return 6
+    of 20: return 9
+    of 21: return 8
+    of 22: return 1
+    of 23: return 2
+    of 24: return 10
+    of 25: return 11
+    else:
+        return -1
+
+fn rv64FRegNum(reg: MachineReg): int32 =
+    let regCode: int32 = int32(reg)
+    case regCode
+    of 24: return 10
+    of 25: return 11
+    else:
+        return -1
+
+fn rv64Tmp0(): int32 =
+    return 30
+
+fn rv64Tmp1(): int32 =
+    return 31
+
+fn rv64Is64(reg: MachineReg): bool =
+    let regCode: int32 = int32(reg)
+    case regCode
+    of 9, 10, 11, 12, 13, 14, 15, 16,
+       18, 19, 20, 21, 22, 23:
+        return true
+    else:
+        return false
+
+fn rv64Is32(reg: MachineReg): bool =
+    let regCode: int32 = int32(reg)
+    case regCode
+    of 0, 1, 2, 3, 4, 5, 6, 7:
+        return true
+    else:
+        return false
+
+fn rv64IsFloat(reg: MachineReg): bool =
+    let regCode: int32 = int32(reg)
+    return regCode == 24 || regCode == 25
+
+fn rv64FitsSigned(value: int64, bits: int32): bool =
+    if bits <= 0 || bits >= 63:
+        return false
+    let minV: int64 = -(int64(1) << int64(bits - 1))
+    let maxV: int64 = (int64(1) << int64(bits - 1)) - 1
+    return value >= minV && value <= maxV
+
+fn rv64UType(opcode: uint32, rd: int32, imm20: int32): uint32 =
+    let uimm: uint32 = uint32(uint64(imm20) & uint64(0xFFFFF))
+    return (uimm << 12) | (uint32(rd & 31) << 7) | (opcode & uint32(0x7F))
+
+fn rv64IType(opcode: uint32, funct3: uint32, rd: int32, rs1: int32, imm12: int32): uint32 =
+    let uimm: uint32 = uint32(uint64(imm12) & uint64(0xFFF))
+    return (uimm << 20) |
+           (uint32(rs1 & 31) << 15) |
+           ((funct3 & uint32(7)) << 12) |
+           (uint32(rd & 31) << 7) |
+           (opcode & uint32(0x7F))
+
+fn rv64SType(opcode: uint32, funct3: uint32, rs1: int32, rs2: int32, imm12: int32): uint32 =
+    let uimm: uint32 = uint32(uint64(imm12) & uint64(0xFFF))
+    let immLo: uint32 = uimm & uint32(0x1F)
+    let immHi: uint32 = (uimm >> 5) & uint32(0x7F)
+    return (immHi << 25) |
+           (uint32(rs2 & 31) << 20) |
+           (uint32(rs1 & 31) << 15) |
+           ((funct3 & uint32(7)) << 12) |
+           (immLo << 7) |
+           (opcode & uint32(0x7F))
+
+fn rv64RType(opcode: uint32, funct3: uint32, funct7: uint32,
+             rd: int32, rs1: int32, rs2: int32): uint32 =
+    return ((funct7 & uint32(0x7F)) << 25) |
+           (uint32(rs2 & 31) << 20) |
+           (uint32(rs1 & 31) << 15) |
+           ((funct3 & uint32(7)) << 12) |
+           (uint32(rd & 31) << 7) |
+           (opcode & uint32(0x7F))
+
+fn rv64FRType(funct7: uint32, rmOrFunct3: uint32, rd: int32, rs1: int32, rs2: int32): uint32 =
+    return ((funct7 & uint32(0x7F)) << 25) |
+           (uint32(rs2 & 31) << 20) |
+           (uint32(rs1 & 31) << 15) |
+           ((rmOrFunct3 & uint32(7)) << 12) |
+           (uint32(rd & 31) << 7) |
+           uint32(0x53)
+
+fn rv64EncLui(rd: int32, imm20: int32): uint32 =
+    return rv64UType(uint32(0x37), rd, imm20)
+
+fn rv64EncAuipc(rd: int32, imm20: int32): uint32 =
+    return rv64UType(uint32(0x17), rd, imm20)
+
+fn rv64EncAddi(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x13), uint32(0), rd, rs1, imm12)
+
+fn rv64EncAddiw(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x1B), uint32(0), rd, rs1, imm12)
+
+fn rv64EncSlli(rd: int32, rs1: int32, shamt: int32): uint32 =
+    return rv64IType(uint32(0x13), uint32(1), rd, rs1, shamt)
+
+fn rv64EncSrli(rd: int32, rs1: int32, shamt: int32): uint32 =
+    return rv64IType(uint32(0x13), uint32(5), rd, rs1, shamt)
+
+fn rv64EncSrai(rd: int32, rs1: int32, shamt: int32): uint32 =
+    let imm: int32 = (0x20 << 5) | (shamt & 0x1F)
+    return rv64IType(uint32(0x13), uint32(5), rd, rs1, imm)
+
+fn rv64EncLd(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x03), uint32(3), rd, rs1, imm12)
+
+fn rv64EncLw(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x03), uint32(2), rd, rs1, imm12)
+
+fn rv64EncLb(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x03), uint32(0), rd, rs1, imm12)
+
+fn rv64EncLbu(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x03), uint32(4), rd, rs1, imm12)
+
+fn rv64EncLh(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x03), uint32(1), rd, rs1, imm12)
+
+fn rv64EncLhu(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x03), uint32(5), rd, rs1, imm12)
+
+fn rv64EncSd(rs2: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64SType(uint32(0x23), uint32(3), rs1, rs2, imm12)
+
+fn rv64EncSw(rs2: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64SType(uint32(0x23), uint32(2), rs1, rs2, imm12)
+
+fn rv64EncSb(rs2: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64SType(uint32(0x23), uint32(0), rs1, rs2, imm12)
+
+fn rv64EncSh(rs2: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64SType(uint32(0x23), uint32(1), rs1, rs2, imm12)
+
+fn rv64EncAdd(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(0), uint32(0x00), rd, rs1, rs2)
+
+fn rv64EncSub(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(0), uint32(0x20), rd, rs1, rs2)
+
+fn rv64EncAnd(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(7), uint32(0x00), rd, rs1, rs2)
+
+fn rv64EncOr(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(6), uint32(0x00), rd, rs1, rs2)
+
+fn rv64EncXor(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(4), uint32(0x00), rd, rs1, rs2)
+
+fn rv64EncSll(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(1), uint32(0x00), rd, rs1, rs2)
+
+fn rv64EncSrl(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(5), uint32(0x00), rd, rs1, rs2)
+
+fn rv64EncSra(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(5), uint32(0x20), rd, rs1, rs2)
+
+fn rv64EncMul(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(0), uint32(0x01), rd, rs1, rs2)
+
+fn rv64EncDiv(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(4), uint32(0x01), rd, rs1, rs2)
+
+fn rv64EncDivu(rd: int32, rs1: int32, rs2: int32): uint32 =
+    return rv64RType(uint32(0x33), uint32(5), uint32(0x01), rd, rs1, rs2)
+
+fn rv64EncJalr(rd: int32, rs1: int32, imm12: int32): uint32 =
+    return rv64IType(uint32(0x67), uint32(0), rd, rs1, imm12)
+
+fn rv64EncFmvDX(fd: int32, rs1: int32): uint32 =
+    # fmv.d.x fd, rs1
+    return rv64FRType(uint32(0x79), uint32(0), fd, rs1, 0)
+
+fn rv64EncFmvXD(rd: int32, fs1: int32): uint32 =
+    # fmv.x.d rd, fs1
+    return rv64FRType(uint32(0x71), uint32(0), rd, fs1, 0)
+
+fn rv64EncFaddD(fd: int32, fs1: int32, fs2: int32): uint32 =
+    return rv64FRType(uint32(0x01), uint32(0), fd, fs1, fs2)
+
+fn rv64EncFsubD(fd: int32, fs1: int32, fs2: int32): uint32 =
+    return rv64FRType(uint32(0x05), uint32(0), fd, fs1, fs2)
+
+fn rv64EncFmulD(fd: int32, fs1: int32, fs2: int32): uint32 =
+    return rv64FRType(uint32(0x09), uint32(0), fd, fs1, fs2)
+
+fn rv64EncFdivD(fd: int32, fs1: int32, fs2: int32): uint32 =
+    return rv64FRType(uint32(0x0D), uint32(0), fd, fs1, fs2)
+
+fn rv64EncFnegD(fd: int32, fs1: int32): uint32 =
+    # fsgnjn.d fd, fs1, fs1
+    return rv64FRType(uint32(0x11), uint32(1), fd, fs1, fs1)
+
+fn rv64EncScvtfDx(fd: int32, rs1: int32): uint32 =
+    # fcvt.d.l fd, rs1
+    return rv64FRType(uint32(0x69), uint32(0), fd, rs1, 2)
+
+fn rv64EncFeqD(rd: int32, fs1: int32, fs2: int32): uint32 =
+    return rv64FRType(uint32(0x51), uint32(2), rd, fs1, fs2)
+
+fn rv64EncFltD(rd: int32, fs1: int32, fs2: int32): uint32 =
+    return rv64FRType(uint32(0x51), uint32(1), rd, fs1, fs2)
+
+fn rv64EncFleD(rd: int32, fs1: int32, fs2: int32): uint32 =
+    return rv64FRType(uint32(0x51), uint32(0), rd, fs1, fs2)
+
+fn rv64EncJal(rd: int32, deltaBytes: int64): Result[uint32] =
+    if (deltaBytes & int64(1)) != 0:
+        return Err[uint32]("riscv64_enc: jal target misaligned")
+    if deltaBytes < -1048576 || deltaBytes > 1048574:
+        return Err[uint32]("riscv64_enc: jal target out of range")
+    let uimm: uint32 = uint32(uint64(deltaBytes) & uint64(0x1FFFFF))
+    let bit20: uint32 = (uimm >> 20) & uint32(1)
+    let bits10_1: uint32 = (uimm >> 1) & uint32(0x3FF)
+    let bit11: uint32 = (uimm >> 11) & uint32(1)
+    let bits19_12: uint32 = (uimm >> 12) & uint32(0xFF)
+    let word: uint32 = (bit20 << 31) |
+                       (bits10_1 << 21) |
+                       (bit11 << 20) |
+                       (bits19_12 << 12) |
+                       (uint32(rd & 31) << 7) |
+                       uint32(0x6F)
+    return Ok[uint32](word)
+
+fn rv64EncBranch(funct3: uint32, rs1: int32, rs2: int32, deltaBytes: int64): Result[uint32] =
+    if (deltaBytes & int64(1)) != 0:
+        return Err[uint32]("riscv64_enc: branch target misaligned")
+    if deltaBytes < -4096 || deltaBytes > 4094:
+        return Err[uint32]("riscv64_enc: branch target out of range")
+    let uimm: uint32 = uint32(uint64(deltaBytes) & uint64(0x1FFF))
+    let bit12: uint32 = (uimm >> 12) & uint32(1)
+    let bits10_5: uint32 = (uimm >> 5) & uint32(0x3F)
+    let bits4_1: uint32 = (uimm >> 1) & uint32(0xF)
+    let bit11: uint32 = (uimm >> 11) & uint32(1)
+    let word: uint32 = (bit12 << 31) |
+                       (bits10_5 << 25) |
+                       (uint32(rs2 & 31) << 20) |
+                       (uint32(rs1 & 31) << 15) |
+                       ((funct3 & uint32(7)) << 12) |
+                       (bits4_1 << 8) |
+                       (bit11 << 7) |
+                       uint32(0x63)
+    return Ok[uint32](word)
+
+fn rv64PatchUImm20(word: uint32, imm20: int32): uint32 =
+    let hi: uint32 = uint32(uint64(imm20) & uint64(0xFFFFF))
+    return (word & uint32(0xFFF)) | (hi << 12)
+
+fn rv64PatchIImm12(word: uint32, imm12: int32): uint32 =
+    let lo: uint32 = uint32(uint64(imm12) & uint64(0xFFF))
+    return (word & ~uint32(0xFFF << 20)) | (lo << 20)
+
+fn rv64CalcHi20(delta: int64): int32 =
+    return int32((delta + int64(0x800)) >> int64(12))
+
+fn rv64CalcLo12(delta: int64, hi20: int32): int32 =
+    return int32(delta - (int64(hi20) << int64(12)))
+
+fn rv64LoadImm32Count(v: int32): int32 =
+    if v >= -2048 && v <= 2047:
+        return 1
+    return 2
+
+fn rv64LoadImm64Count(v: int64): int32 =
+    if rv64FitsSigned(v, 12):
+        return 1
+    if rv64FitsSigned(v, 32):
+        return rv64LoadImm32Count(int32(v))
+    let u: uint64 = uint64(v)
+    let hi: int32 = int32((u >> uint64(32)) & uint64(0xFFFFFFFF))
+    let lo: int32 = int32(u & uint64(0xFFFFFFFF))
+    return rv64LoadImm32Count(hi) + 1 + rv64LoadImm32Count(lo) + 2 + 1

@@ -1,0 +1,295 @@
+# Connection abstraction(minimal, synchronous).
+
+import std/result
+import std/rawbytes
+import std/seqs
+import std/multiformats/multiaddress
+import std/net/stream/bufferstream
+import std/net/resourcemanager
+
+type
+    Direction = enum
+        Inbound = 0
+        Outbound = 1
+
+    Pipe =
+        aToB: BufferStream
+        bToA: BufferStream
+        closed: bool
+
+    Connection =
+        localAddr: MultiAddress
+        remoteAddr: MultiAddress
+        dir: Direction
+        stream: BufferStream
+        open: bool
+        pipeIdx: int32
+        pipeSide: int32
+        remotePeer: str
+        accounting: bool
+        queueReserved: bool
+        queueReservedBytes: int64
+
+    ConnectionQueue =
+        count: int32
+        head: int32
+        tail: int32
+        items: Connection[connectionQueueCapacity]
+
+    ConnectionPair =
+        outbound: Connection
+        inbound: Connection
+
+const
+    maxPipes = 128
+    connectionQueueCapacity = 64
+    connectionQueueFootprintBase = 128
+
+var
+    pipeCount: int32 = 0
+    pipeSlots: Pipe[maxPipes]
+    pipeUsed: bool[maxPipes]
+
+fn initConnectionQueue(): ConnectionQueue =
+    return ConnectionQueue(count: 0, head: 0, tail: 0)
+
+fn connectionQueueIsEmpty(q: ConnectionQueue): bool =
+    return q.count <= 0
+
+fn connectionQueueIsFull(q: ConnectionQueue): bool =
+    return q.count >= connectionQueueCapacity
+
+fn enqueueConnection(q: var ConnectionQueue, conn: Connection): Result[bool] =
+    if connectionQueueIsFull(q):
+        return Err[bool]("connectionqueue: full")
+    q.items[q.tail] = conn
+    q.tail = (q.tail + 1) % connectionQueueCapacity
+    q.count = q.count + 1
+    return Ok[bool](true)
+
+fn dequeueConnection(q: var ConnectionQueue): Result[Connection] =
+    if connectionQueueIsEmpty(q):
+        return Err[Connection]("connectionqueue: empty")
+    let conn: Connection = q.items[q.head]
+    q.head = (q.head + 1) % connectionQueueCapacity
+    q.count = q.count - 1
+    return Ok[Connection](conn)
+
+fn initPipe(): Pipe =
+    return Pipe(aToB: newBufferStream(), bToA: newBufferStream(), closed: false)
+
+fn pipeExists(idx: int32): bool =
+    if idx < 0 || idx >= maxPipes:
+        return false
+    return pipeUsed[idx]
+
+fn resetPipe(idx: int32) =
+    if idx < 0 || idx >= maxPipes:
+        return
+    pipeSlots[idx] = initPipe()
+    pipeUsed[idx] = true
+
+fn allocPipe(): Result[int32] =
+    if pipeCount < maxPipes:
+        let idx: int32 = pipeCount
+        pipeCount = pipeCount + 1
+        resetPipe(idx)
+        return Ok[int32](idx)
+    for i in 0..<maxPipes:
+        if pipeUsed[i] && pipeSlots[i].closed:
+            resetPipe(i)
+            return Ok[int32](i)
+    return Err[int32]("pipe: full")
+
+fn pipeIsClosed(idx: int32): bool =
+    if !pipeExists(idx):
+        return true
+    return pipeSlots[idx].closed
+
+fn pipeWrite(idx: int32, side: int32, data: Bytes): Result[int32] =
+    if !pipeExists(idx):
+        return Err[int32]("pipe: invalid")
+    if pipeSlots[idx].closed:
+        return Err[int32]("pipe: closed")
+    if side == 0:
+        return bufferstream.write(pipeSlots[idx].aToB, data)
+    return bufferstream.write(pipeSlots[idx].bToA, data)
+
+fn pipeRead(idx: int32, side: int32, count: int32): Result[Bytes] =
+    if !pipeExists(idx):
+        return Err[Bytes]("pipe: invalid")
+    if pipeSlots[idx].closed:
+        return Err[Bytes]("pipe: closed")
+    if side == 0:
+        return bufferstream.read(pipeSlots[idx].bToA, count)
+    return bufferstream.read(pipeSlots[idx].aToB, count)
+
+fn pipeClose(idx: int32) =
+    if !pipeExists(idx):
+        return
+    if pipeSlots[idx].closed:
+        return
+    pipeSlots[idx].closed = true
+    closeBufferStream(pipeSlots[idx].aToB)
+    closeBufferStream(pipeSlots[idx].bToA)
+
+fn newConnection(localAddr: MultiAddress, remoteAddr: MultiAddress, dir: Direction): Connection =
+    return Connection(
+        localAddr: localAddr,
+        remoteAddr: remoteAddr,
+        dir: dir,
+        stream: newBufferStream(),
+        open: true,
+        pipeIdx: -1,
+        pipeSide: 0,
+        remotePeer: "",
+        accounting: true,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+
+fn newConnectionPair(outLocal: MultiAddress, outRemote: MultiAddress, inLocal: MultiAddress, inRemote: MultiAddress): Result[ConnectionPair] =
+    let pipeRes: Result[int32] = allocPipe()
+    if IsErr(pipeRes):
+        return Err[ConnectionPair](Error(pipeRes))
+    let idx: int32 = Value(pipeRes)
+    let outbound: Connection = Connection(
+        localAddr: outLocal,
+        remoteAddr: outRemote,
+        dir: Outbound,
+        stream: newBufferStream(),
+        open: true,
+        pipeIdx: idx,
+        pipeSide: 0,
+        remotePeer: "",
+        accounting: true,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    let inbound: Connection = Connection(
+        localAddr: inLocal,
+        remoteAddr: inRemote,
+        dir: Inbound,
+        stream: newBufferStream(),
+        open: true,
+        pipeIdx: idx,
+        pipeSide: 1,
+        remotePeer: "",
+        accounting: true,
+        queueReserved: false,
+        queueReservedBytes: 0
+    )
+    return Ok[ConnectionPair](ConnectionPair(outbound: outbound, inbound: inbound))
+
+fn setConnectionAccounting(c: var Connection, enabled: bool) =
+    c.accounting = enabled
+
+fn connectionQueueFootprintBytes(conn: Connection): int64 =
+    var size: int64 = connectionQueueFootprintBase
+    size = size + int64(bytesLen(conn.localAddr.data))
+    size = size + int64(bytesLen(conn.remoteAddr.data))
+    if size < 0:
+        return 0
+    return size
+
+fn clearQueueReservation(c: var Connection) =
+    c.queueReserved = false
+    c.queueReservedBytes = 0
+
+fn recordOutbound(c: var Connection, count: int32): Result[bool] =
+    if !c.accounting:
+        return Ok[bool](false)
+    if count <= 0:
+        return Ok[bool](false)
+    return resourceRecordOutboundBytes(int64(count))
+
+fn recordInbound(c: var Connection, count: int32): Result[bool] =
+    if !c.accounting:
+        return Ok[bool](false)
+    if count <= 0:
+        return Ok[bool](false)
+    return resourceRecordInboundBytes(int64(count))
+
+fn isOpen(c: Connection): bool =
+    if !c.open:
+        return false
+    if c.pipeIdx >= 0 && pipeIsClosed(c.pipeIdx):
+        return false
+    return true
+
+fn localAddress(c: Connection): MultiAddress =
+    return c.localAddr
+
+fn remoteAddress(c: var Connection): MultiAddress =
+    return c.remoteAddr
+
+fn direction(c: Connection): Direction =
+    return c.dir
+
+fn remotePeerId(c: Connection): str =
+    return c.remotePeer
+
+fn write(c: var Connection, data: Bytes): Result[int32] =
+    if !c.open:
+        return Err[int32]("connection: closed")
+    if c.pipeIdx >= 0:
+        let writeRes: Result[int32] = pipeWrite(c.pipeIdx, c.pipeSide, data)
+        if IsErr(writeRes):
+            return writeRes
+        let count: int32 = Value(writeRes)
+        if c.accounting && count > 0:
+            let bwRes: Result[bool] = resourceRecordOutboundBytes(int64(count))
+            if IsErr(bwRes):
+                return Err[int32](Error(bwRes))
+        return writeRes
+    let writeRes: Result[int32] = bufferstream.write(c.stream, data)
+    if IsErr(writeRes):
+        return writeRes
+    let count: int32 = Value(writeRes)
+    if c.accounting && count > 0:
+        let bwRes: Result[bool] = resourceRecordOutboundBytes(int64(count))
+        if IsErr(bwRes):
+            return Err[int32](Error(bwRes))
+    return writeRes
+
+fn read(c: var Connection, count: int32): Result[Bytes] =
+    if !c.open:
+        return Err[Bytes]("connection: closed")
+    if c.pipeIdx >= 0:
+        let readRes: Result[Bytes] = pipeRead(c.pipeIdx, c.pipeSide, count)
+        if IsErr(readRes):
+            return readRes
+        let got: int32 = bytesLen(Value(readRes))
+        if c.accounting && got > 0:
+            let bwRes: Result[bool] = resourceRecordInboundBytes(int64(got))
+            if IsErr(bwRes):
+                return Err[Bytes](Error(bwRes))
+        return readRes
+    let readRes: Result[Bytes] = bufferstream.read(c.stream, count)
+    if IsErr(readRes):
+        return readRes
+    let got: int32 = bytesLen(Value(readRes))
+    if c.accounting && got > 0:
+        let bwRes: Result[bool] = resourceRecordInboundBytes(int64(got))
+        if IsErr(bwRes):
+            return Err[Bytes](Error(bwRes))
+    return readRes
+
+fn close(c: var Connection) =
+    c.open = false
+    if c.pipeIdx >= 0:
+        pipeClose(c.pipeIdx)
+    else:
+        closeBufferStream(c.stream)
+
+fn connWrite(c: var Connection, data: Bytes): Result[int32] =
+    return write(c, data)
+
+fn connRead(c: var Connection, count: int32): Result[Bytes] =
+    return read(c, count)
+
+fn connIsOpen(c: Connection): bool =
+    return isOpen(c)
+
+fn connClose(c: var Connection) =
+    close(c)

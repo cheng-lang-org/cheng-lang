@@ -1,0 +1,565 @@
+# std/os (minimal, pure Cheng)
+import cmdline
+import std/seqs
+import std/system
+import std/strings
+import std/times
+
+type
+    File = void*
+
+type
+    FileMode = enum
+        fmRead
+        fmWrite
+        fmReadWrite
+
+type
+    IoMeterOp = enum
+        ioRead
+        ioWrite
+
+type
+    IoMeterHook = void*
+
+var
+    ioMeterHasHook: bool = false
+    ioMeterHook: IoMeterHook = nil
+
+var EmptyStr: str = ""
+var SlashStr: str = "/"
+var SingleQuoteStr: str = "'"
+var EmptyQuotedStr: str = "''"
+
+@importc("cheng_fopen")
+fn cheng_fopen(filename, mode: cstring): File
+fn c_fopen(filename, mode: cstring): File =
+    return cheng_fopen(filename, mode)
+@importc("cheng_fclose")
+fn cheng_fclose(f: File): int32
+fn c_fclose(f: File): int32 =
+    return cheng_fclose(f)
+@importc("cheng_fread")
+fn cheng_fread(ptr: void*, size, n: int64, stream: File): int32
+fn c_fread(ptr: void*, size, n: int64, stream: File): int32 =
+    return cheng_fread(ptr, size, n, stream)
+@importc("cheng_fwrite")
+fn cheng_fwrite(ptr: void*, size, n: int64, stream: File): int32
+fn c_fwrite(ptr: void*, size, n: int64, stream: File): int32 =
+    return cheng_fwrite(ptr, size, n, stream)
+@importc("cheng_fflush")
+fn cheng_fflush(stream: File): int32
+fn c_fflush(stream: File): int32 =
+    return cheng_fflush(stream)
+@importc("cheng_fgetc")
+fn cheng_fgetc(stream: File): int32
+fn c_fgetc(stream: File): int32 =
+    return cheng_fgetc(stream)
+@importc("get_stdin")
+fn get_stdin(): File
+@importc("get_stdout")
+fn get_stdout(): File
+@importc("get_stderr")
+fn get_stderr(): File
+@importc("cheng_iometer_call")
+fn cheng_iometer_call(hook: void*, op: IoMeterOp, bytes: int64)
+fn c_iometer_call(hook: void*, op: IoMeterOp, bytes: int64) =
+    cheng_iometer_call(hook, op, bytes)
+@importc("cheng_file_exists")
+fn cheng_file_exists(path: cstring): int32
+@importc("cheng_dir_exists")
+fn cheng_dir_exists(path: cstring): int32
+@importc("cheng_mkdir1")
+fn cheng_mkdir1(path: cstring): int32
+@importc("cheng_file_mtime")
+fn cheng_file_mtime(path: cstring): int64
+@importc("cheng_file_size")
+fn cheng_file_size(path: cstring): int64
+@importc("cheng_getcwd")
+fn cheng_getcwd(): str
+@importc("remove")
+fn libc_remove(path: cstring): int32
+fn c_remove(path: cstring): int32 =
+    return libc_remove(path)
+@importc("getenv")
+fn libc_getenv(name: cstring): str
+fn c_getenv(name: cstring): str =
+    return libc_getenv(name)
+@importc("cheng_list_dir")
+fn cheng_list_dir(path: cstring): str
+@importc("rename")
+fn libc_rename(oldPath: cstring, newPath: cstring): int32
+fn c_rename(oldPath: cstring, newPath: cstring): int32 =
+    return libc_rename(oldPath, newPath)
+@importc("cheng_exec_cmd_ex")
+fn cheng_exec_cmd_ex(command: cstring, workingDir: cstring, mergeStderr: int32, exitCode: int64*): str
+@importc("cheng_pty_is_supported")
+fn cheng_pty_is_supported(): int32
+@importc("cheng_pty_spawn")
+fn cheng_pty_spawn(command: cstring, workingDir: cstring, outMasterFd: int32*, outPid: int64*): int32
+@importc("cheng_pipe_spawn")
+fn cheng_pipe_spawn(command: cstring, workingDir: cstring, outReadFd: int32*, outWriteFd: int32*, outPid: int64*): int32
+@importc("cheng_pty_read")
+fn cheng_pty_read(fd: int32, maxBytes: int32, outEof: int32*): str
+@importc("cheng_fd_read")
+fn cheng_fd_read(fd: int32, maxBytes: int32, outEof: int32*): str
+@importc("cheng_fd_read_wait")
+fn cheng_fd_read_wait(fd: int32, maxBytes: int32, timeoutMs: int32, outEof: int32*): str
+@importc("cheng_pty_write")
+fn cheng_pty_write(fd: int32, data: cstring, len: int32): int32
+@importc("cheng_pty_close")
+fn cheng_pty_close(fd: int32): int32
+@importc("cheng_pty_wait")
+fn cheng_pty_wait(pid: int64, outExitCode: int32*): int32
+fn c_fwrite_std(ptr: void*, size, n: int64, stream: void*): int32 =
+    return cheng_fwrite(ptr, size, n, File(stream))
+
+fn setIoMeterHook(hook: IoMeterHook) =
+    ioMeterHasHook = (hook != nil)
+    ioMeterHook = hook
+
+fn clearIoMeterHook() =
+    ioMeterHasHook = false
+    ioMeterHook = nil
+
+fn ioMeterReport(op: IoMeterOp, bytes: int64) =
+    if !ioMeterHasHook:
+        return
+    if ioMeterHook == nil:
+        return
+    c_iometer_call(ioMeterHook, op, bytes)
+
+fn openImpl(filename: str, mode: FileMode): File =
+    if mode == fmRead:
+        return c_fopen(filename, "rb")
+    if mode == fmWrite:
+        return c_fopen(filename, "wb")
+    return c_fopen(filename, "rb+")
+
+fn openRead(filename: str): File =
+    return openImpl(filename, fmRead)
+
+fn open(filename: str, mode: FileMode): File =
+    return openImpl(filename, mode)
+
+fn close(f: File) =
+    c_fclose f
+
+fn readAll(f: File): str =
+    if f == nil:
+        return ""
+    var cap: int32 = 256
+    var lenRead: int32 = 0
+    var p: void* = alloc cap
+    if p == nil:
+        return ""
+    while true:
+        var room: int32 = cap - lenRead - 1
+        if room <= 0:
+            cap = cap * 2
+            p = realloc(p, cap)
+            if p == nil:
+                return ""
+            room = cap - lenRead - 1
+            if room <= 0:
+                break
+        let dst: void* = ptr_add(p, lenRead)
+        let got: int32 = c_fread(dst, 1, room, f)
+        if got <= 0:
+            break
+        lenRead = lenRead + got
+        ioMeterReport(ioRead, int64(got))
+    setMem(ptr_add(p, lenRead), 0, 1)
+    return str(p)
+
+fn write(f: File, s: str) =
+    let wrote: int32 = c_fwrite(s, 1, len(s), f)
+    ioMeterReport(ioWrite, int64(wrote))
+
+fn writeLine(f: File, s: str) =
+    write(f, s)
+    write(f, "\n")
+
+type
+    SplitFileResult =
+        dir: str
+        name: str
+        ext: str
+type
+    PathComponent = enum
+        pcFile, pcDir, pcLinkToFile, pcLinkToDir, pcOther
+type
+    WalkDirEntry =
+        kind: PathComponent
+        path: str
+type
+    ProcessOption = enum
+        poStdErrToStdOut, poUsePath, poEvalCommand
+type
+    ExecCmdResult =
+        output: str
+        exitCode: int
+type
+    seq_WalkDirEntry =
+        len: int32
+        cap: int32
+        buffer: void*
+fn os_newSeq_WalkDirEntry(len: int32, cap: int32): seq_WalkDirEntry =
+    var seqInstance: seq_WalkDirEntry
+    seqInstance.len = 0
+    seqInstance.cap = cap
+    if cap > 0:
+        var size64: int64 = int64(cap) * sizeof WalkDirEntry
+        var size32: int32 = int32(size64)
+        seqInstance.buffer = alloc size32
+    else:
+        seqInstance.buffer = nil
+    return seqInstance
+fn os_get_WalkDirEntry(seqInst: seq_WalkDirEntry, i: int32): WalkDirEntry =
+    var idx64: int64 = int64(i)
+    var offset64: int64 = idx64 * sizeof WalkDirEntry
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(seqInst.buffer, offset32)
+    var pt: WalkDirEntry* = WalkDirEntry*(p)
+    return *pt
+fn walkDirEntryKind(entry: WalkDirEntry): PathComponent =
+    return entry.kind
+fn walkDirEntryPath(entry: WalkDirEntry): str =
+    return entry.path
+fn pathComponentDir(): PathComponent =
+    return pcDir
+fn os_addPtr_WalkDirEntry(seqInst: seq_WalkDirEntry*, val: WalkDirEntry) =
+    if seqInst->len >= seqInst->cap:
+        var newCap: int32 = 4
+        if seqInst->cap != 0:
+            newCap = seqInst->cap * 2
+        seqInst->cap = newCap
+        var cap64: int64 = int64(newCap)
+        var size64: int64 = int64(cap64) * sizeof WalkDirEntry
+        var size32: int32 = int32(size64)
+        seqInst->buffer = realloc(seqInst->buffer, size32)
+    var idx64: int64 = int64(seqInst->len)
+    var offset64: int64 = int64(idx64) * sizeof WalkDirEntry
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(seqInst->buffer, offset32)
+    var pt: WalkDirEntry* = WalkDirEntry*(p)
+    *pt = val
+    seqInst->len = seqInst->len + 1
+
+fn os_arcRetainSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
+    if seqInst.buffer != nil:
+        memRetain seqInst.buffer
+    for i in 0..<seqInst.len:
+        let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
+        let path: str = entry.path
+        if path != nil:
+            memRetain void*(path)
+
+fn os_arcReleaseSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
+    for i in 0..<seqInst.len:
+        let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
+        let path: str = entry.path
+        if path != nil:
+            memRelease void*(path)
+    if seqInst.buffer != nil:
+        memRelease seqInst.buffer
+
+fn fileExists(path: str): bool =
+    cheng_file_exists path != 0
+fn dirExists(path: str): bool =
+    cheng_dir_exists path != 0
+fn createDir(path: str) =
+    cheng_mkdir1 path
+fn bos_dirExists(path: str): bool =
+    return dirExists(path)
+fn makeDir(path: str): bool =
+    return cheng_mkdir1(path) != 0
+fn fileMtime(path: str): int64 =
+    return cheng_file_mtime(path)
+fn fileSize(path: str): int64 =
+    return cheng_file_size(path)
+fn getCurrentDir(): str =
+    cheng_getcwd()
+fn removeFile(path: str): bool =
+    c_remove path == 0
+fn renameFile(oldPath: str, newPath: str): bool =
+    c_rename(oldPath, newPath) == 0
+fn removeDir(path: str) =
+    path
+fn getEnvImpl(key: str, defaultValue: str): str =
+    let v: str = c_getenv key
+    if v == nil:
+        return defaultValue
+    return v
+fn getEnv(key: str): str =
+    return getEnvImpl(key, EmptyStr)
+fn getEnvDefault(key: str, defaultValue: str): str =
+    return getEnvImpl(key, defaultValue)
+fn commandLineParams(): str[] =
+    # Depends on `__cheng_setCmdLine(argc, argv)` in `main`.
+    let count: int32 = cmdline.paramCount()
+    var out: str[]
+    if count <= 0:
+        return out
+    for i in 1..count:
+        add(out, cmdline.paramStr(i))
+    return out
+fn quoteShell(value: str): str =
+    if value == nil || value[0] == char(0):
+        return EmptyQuotedStr
+    return SingleQuoteStr + value + SingleQuoteStr
+fn joinPath(a: str, b: str): str =
+    if a == nil || a[0] == char(0):
+        return b
+    if b == nil || b[0] == char(0):
+        return a
+    let aLen: int32 = len a
+    let last: char = a[aLen - 1]
+    if last == '/' || last == '\\':
+        return a + b
+    return a + SlashStr + b
+fn `/`(a: str, b: str): str =
+    return joinPath(a, b)
+
+fn sliceStr(text: str, start: int32, stop: int32): str =
+    if text == nil:
+        return ""
+    var s: int32 = start
+    var e: int32 = stop
+    if s < 0:
+        s = 0
+    let n: int32 = len text
+    if e < s || s >= n:
+        return ""
+    if e >= n:
+        e = n - 1
+    let count: int32 = e - s + 1
+    let allocCount: int32 = count + 1
+    let p: void* = alloc allocCount
+    let src: void* = ptr_add(void*(text), s)
+    copyMem(p, src, count)
+    setMem(ptr_add(p, count), 0, 1)
+    return str(p)
+fn absolutePath(path: str): str =
+    if path == nil || path[0] == char(0):
+        return getCurrentDir()
+    let c0: char = path[0]
+    if c0 == '/' || c0 == '\\':
+        return path
+    if path[1] == ':':
+        return path
+    return joinPath(getCurrentDir(), path)
+fn isAbsolute(path: str): bool =
+    if path == nil || path[0] == char(0):
+        return false
+    let c0: char = path[0]
+    if c0 == '/' || c0 == '\\':
+        return true
+    if path[1] == ':':
+        return true
+    return false
+fn parentDir(path: str): str =
+    let parts: SplitFileResult = splitFile path
+    return parts.dir
+fn relativePath(path: str, base: str): str =
+    if base == nil || base[0] == char(0):
+        return path
+    let baseLen: int32 = len base
+    let pathLen: int32 = len path
+    if pathLen >= baseLen && sliceStr(path, 0, baseLen - 1) == base:
+        var idx: int32 = baseLen
+        if idx < pathLen && (path[idx] == '/' || path[idx] == '\\'):
+            idx = idx + 1
+        if idx <= pathLen:
+            return sliceStr(path, idx, pathLen - 1)
+    return path
+fn splitFile(path: str): SplitFileResult =
+    var out: SplitFileResult
+    out.dir = ""
+    out.name = ""
+    out.ext = ""
+    let pathLen: int32 = len path
+    if pathLen == 0:
+        return out
+    var lastSep: int32 = -1
+    for i in 0..<pathLen:
+        let ch: char = path[i]
+        if ch == '/' || ch == '\\':
+            lastSep = i
+    var lastDot: int32 = -1
+    i = pathLen - 1
+    let __for_start_i_1 = i
+    for __for_i_1 in 0..(__for_start_i_1 - ((lastSep) + (1))):
+        i = __for_start_i_1 - __for_i_1
+        let ch: char = path[i]
+        if ch == '.':
+            lastDot = i
+            break
+        i = i - 1
+    let nameStart: int32 = lastSep + 1
+    if lastSep >= 0:
+        if lastSep <= 0:
+            out.dir = ""
+        else:
+            out.dir = sliceStr(path, 0, lastSep - 1)
+        if nameStart >= pathLen:
+            out.name = ""
+        else:
+            out.name = sliceStr(path, nameStart, pathLen - 1)
+    else:
+        out.dir = ""
+        out.name = path
+    if lastDot > lastSep && lastDot >= 0:
+        if lastDot - 1 >= nameStart:
+            out.name = sliceStr(path, nameStart, lastDot - 1)
+        else:
+            out.name = ""
+        out.ext = sliceStr(path, lastDot, pathLen - 1)
+    return out
+fn getFileSize(path: str): int64 =
+    path
+    return 0
+fn getAppDir(): str =
+    return getCurrentDir()
+fn findExe(name: str): str =
+    name
+    return ""
+fn setCurrentDir(path: str) =
+    path
+fn copyDir(src: str, dest: str) =
+    src
+    dest
+fn makeWalkDirEntry(kind: PathComponent, path: str): WalkDirEntry =
+    var out: WalkDirEntry
+    out.kind = kind
+    out.path = path
+    return out
+fn walkDir(path: str): seq_WalkDirEntry =
+    var out: seq_WalkDirEntry = os_newSeq_WalkDirEntry(0, 0)
+    if path == nil || path[0] == char(0) || ! dirExists path:
+        return out
+    let listText: str = cheng_list_dir path
+    if listText == nil || listText[0] == char(0):
+        if listText != nil:
+            let listTextPtr: void* = void*(listText)
+            dealloc listTextPtr
+        return out
+    let total: int32 = len listText
+    var start: int32 = 0
+    for i in 0..total:
+        var endHit: bool = false
+        if i == total:
+            endHit = true
+        elif listText[i] == '\n':
+            endHit = true
+        if endHit:
+            var endIdx: int32 = i - 1
+            if endIdx >= start && listText[endIdx] == '\r':
+                endIdx = endIdx - 1
+            if endIdx >= start:
+                let name: str = sliceStr(listText, start, endIdx)
+                if name != nil && name[0] != char(0):
+                    let fullPath: str = joinPath(path, name)
+                    var kind: PathComponent = pcOther
+                    if dirExists fullPath:
+                        kind = pcDir
+                    elif fileExists fullPath:
+                        kind = pcFile
+                    os_addPtr_WalkDirEntry(&out, makeWalkDirEntry(kind, fullPath))
+            start = i + 1
+    let listTextPtr: void* = void*(listText)
+    dealloc listTextPtr
+    return out
+
+fn walkDirRecImpl(path: str, out: str[]*) =
+    let items: seq_WalkDirEntry = walkDir path
+    for i in 0..<items.len:
+        let entry: WalkDirEntry = os_get_WalkDirEntry(items, i)
+        let kind: PathComponent = entry.kind
+        let path: str = entry.path
+        if kind == pcDir || kind == pcLinkToDir:
+            walkDirRecImpl(path, out)
+        elif kind == pcFile || kind == pcLinkToFile:
+            var pathOwned: str = path
+            add(out, pathOwned)
+fn walkDirRec(path: str): str[] =
+    var out: str[]
+    if len path == 0 || ! dirExists path:
+        return out
+    walkDirRecImpl(path, &out)
+    return out
+fn extractFilename(path: str): str =
+    let parts: SplitFileResult = splitFile path
+    if len parts.ext > 0:
+        let name0: str = parts.name
+        let ext0: str = parts.ext
+        return name0 + ext0
+    return parts.name
+fn getLastModificationTime(path: str): DateTime =
+    path
+    return getTime()
+fn processOptionMask(opt: ProcessOption): uint64 =
+    return uint64(1) << uint64(int64(opt))
+
+fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult =
+    var result: ExecCmdResult
+    result.output = ""
+    result.exitCode = -1
+    if len command == 0:
+        return result
+    var merge: int32 = 0
+    let mask: uint64 = processOptionMask(poStdErrToStdOut)
+    if (options & mask) != 0:
+        merge = 1
+    var exitCode: int64 = -1
+    let output: str = cheng_exec_cmd_ex(command, workingDir, merge, &exitCode)
+    if output != nil:
+        result.output = output
+    result.exitCode = exitCode
+    return result
+fn execCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
+    return execCmdExImpl(command, options, workingDir)
+fn execCmdResultExitCode(result: ExecCmdResult): int32 =
+    return result.exitCode
+fn execCmdResultOutput(result: ExecCmdResult): str =
+    return result.output
+fn ptySupported(): bool =
+    cheng_pty_is_supported() != 0
+fn ptySpawn(command: str, workingDir: str, outMasterFd: int32*, outPid: int64*): bool =
+    cheng_pty_spawn(command, workingDir, outMasterFd, outPid) != 0
+fn pipeSpawn(command: str, workingDir: str, outReadFd: int32*, outWriteFd: int32*, outPid: int64*): bool =
+    cheng_pipe_spawn(command, workingDir, outReadFd, outWriteFd, outPid) != 0
+fn ptyRead(fd: int32, maxBytes: int32, outEof: int32*): str =
+    return cheng_pty_read(fd, maxBytes, outEof)
+fn fdRead(fd: int32, maxBytes: int32, outEof: int32*): str =
+    return cheng_fd_read(fd, maxBytes, outEof)
+fn fdReadWait(fd: int32, maxBytes: int32, timeoutMs: int32, outEof: int32*): str =
+    return cheng_fd_read_wait(fd, maxBytes, timeoutMs, outEof)
+fn ptyWrite(fd: int32, data: str): int32 =
+    return cheng_pty_write(fd, data, len data)
+fn ptyClose(fd: int32) =
+    cheng_pty_close fd
+fn ptyWait(pid: int64, outExitCode: int32*): int32 =
+    return cheng_pty_wait(pid, outExitCode)
+fn readFile(path: str): str =
+    let f: File = open(path, fmRead)
+    if f == nil:
+        return ""
+    let content: str = readAll f
+    close f
+    return content
+fn writeFile(path: str, content: str) =
+    let f: File = open(path, fmWrite)
+    if f == nil:
+        return
+    write(f, content)
+    close f
+
+fn writeFileBytes(path: str, bytes: uint8[]) =
+    let f: File = open(path, fmWrite)
+    if f == nil:
+        return
+    if bytes.buffer != nil && bytes.len > 0:
+        let wrote: int32 = c_fwrite_std(bytes.buffer, 1, int64(bytes.len), void*(f))
+        ioMeterReport(ioWrite, int64(wrote))
+    close f

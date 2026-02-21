@@ -1,0 +1,956 @@
+import std/os
+import std/strutils as strutil
+import std/tables_compat as tables
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import std/strings
+import std/seqs
+
+type
+    Settlement =
+        epoch: int32
+        storageTotal: float64
+        computeTotal: float64
+        auditTotal: float64
+        treasuryTotal: float64
+        leaseCount: int32
+        computeCount: int32
+        auditCount: int32
+        auditSampleCount: int32
+        fraudReportCount: int32
+        storageProofCount: int32
+        storageProofMissingCount: int32
+        execRequestCount: int32
+        execReceiptCount: int32
+        authors: tables.Table[float64]
+        providers: tables.Table[float64]
+        executors: tables.Table[float64]
+        penalties: tables.Table[float64]
+        fraudExecutors: tables.Table[float64]
+        storageProofOkProviders: tables.Table[float64]
+        storageProofMissingProviders: tables.Table[float64]
+        requestIds: tables.Table[int32]
+        requestHasReceipt: tables.Table[int32]
+        receiptRequests: tables.Table[str]
+        receiptUsages: tables.Table[str]
+        usageIds: tables.Table[int32]
+        receiptUsageIds: tables.Table[int32]
+        receiptErrors: ReceiptStatusEntry[]
+        requestEpochs: tables.Table[int32]
+        receiptEpochs: tables.Table[int32]
+        usageEpochs: tables.Table[int32]
+
+    PayoutEntry =
+        key: str
+        value: float64
+
+    ReconcilePair =
+        id: str
+        ref: str
+
+    EpochMismatchEntry =
+        receiptId: str
+        refId: str
+        receiptEpoch: int32
+        refEpoch: int32
+
+    ReceiptStatusEntry =
+        receiptId: str
+        requestId: str
+        status: str
+        error: str
+
+    ReconcileSummary =
+        limit: int32
+        missingReceiptCount: int32
+        orphanReceiptCount: int32
+        missingUsageCount: int32
+        unrefUsageCount: int32
+        badReceiptCount: int32
+        requestEpochMismatchCount: int32
+        usageEpochMismatchCount: int32
+        missingReceipt: str[]
+        orphanReceipt: ReconcilePair[]
+        missingUsage: ReconcilePair[]
+        unrefUsage: str[]
+        badReceipt: ReceiptStatusEntry[]
+        requestEpochMismatch: EpochMismatchEntry[]
+        usageEpochMismatch: EpochMismatchEntry[]
+
+fn initSettlement(epoch: int32): Settlement =
+    Settlement(
+        epoch: epoch,
+        storageTotal: 0.0,
+        computeTotal: 0.0,
+        auditTotal: 0.0,
+        treasuryTotal: 0.0,
+        leaseCount: 0,
+        computeCount: 0,
+        auditCount: 0,
+        auditSampleCount: 0,
+        fraudReportCount: 0,
+        storageProofCount: 0,
+        storageProofMissingCount: 0,
+        execRequestCount: 0,
+        execReceiptCount: 0,
+        authors: tables.TableInit[float64](64),
+        providers: tables.TableInit[float64](64),
+        executors: tables.TableInit[float64](64),
+        penalties: tables.TableInit[float64](64),
+        fraudExecutors: tables.TableInit[float64](64),
+        storageProofOkProviders: tables.TableInit[float64](64),
+        storageProofMissingProviders: tables.TableInit[float64](64),
+        requestIds: tables.TableInit[int32](64),
+        requestHasReceipt: tables.TableInit[int32](64),
+        receiptRequests: tables.TableInit[str](64),
+        receiptUsages: tables.TableInit[str](64),
+        usageIds: tables.TableInit[int32](64),
+        receiptUsageIds: tables.TableInit[int32](64),
+        receiptErrors: [],
+        requestEpochs: tables.TableInit[int32](64),
+        receiptEpochs: tables.TableInit[int32](64),
+        usageEpochs: tables.TableInit[int32](64)
+    )
+
+fn tableAdd(t: var tables.Table[float64], key: str, value: float64) =
+    if key == nil || len(key) == 0:
+        return
+    tables.TablePut[float64](t, key + "", tables.TableGet[float64](t, key) + value)
+
+fn tableSetInt(t: var tables.Table[int32], key: str) =
+    if key == nil || len(key) == 0:
+        return
+    tables.TablePut[int32](t, key + "", 1)
+
+fn tableSetIntValue(t: var tables.Table[int32], key: str, value: int32) =
+    if key == nil || len(key) == 0:
+        return
+    tables.TablePut[int32](t, key + "", value)
+
+fn tableSetString(t: var tables.Table[str], key: str, value: str) =
+    if key == nil || len(key) == 0:
+        return
+    var value0: str = value
+    if value0 != nil:
+        value0 = value0 + ""
+    tables.TablePut[str](t, key + "", value0)
+
+fn strLess(a: str, b: str): bool =
+    if a == nil:
+        return b != nil && len(b) > 0
+    if b == nil:
+        return false
+    let la: int32 = len(a)
+    let lb: int32 = len(b)
+    var i: int32 = 0
+    let limit: int32 = if la < lb: la else: lb
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<limit:
+        i = __for_i_1
+        let ca = a[i]
+        let cb = b[i]
+        if ca < cb:
+            return true
+        if ca > cb:
+            return false
+        i = i + 1
+    return la < lb
+
+fn sortStrings(values: var str[]) =
+    for i in 0..<values.len:
+        var minIdx: int32 = i
+        for j in i + 1..<values.len:
+            if strLess(values[j], values[minIdx]):
+                minIdx = j
+        if minIdx != i:
+            let tmp = values[i]
+            values[i] = values[minIdx]
+            values[minIdx] = tmp
+
+fn pairLess(a: ReconcilePair, b: ReconcilePair): bool =
+    if strLess(a.id, b.id):
+        return true
+    if strLess(b.id, a.id):
+        return false
+    return strLess(a.ref, b.ref)
+
+fn epochMismatchLess(a: EpochMismatchEntry, b: EpochMismatchEntry): bool =
+    if strLess(a.receiptId, b.receiptId):
+        return true
+    if strLess(b.receiptId, a.receiptId):
+        return false
+    return strLess(a.refId, b.refId)
+
+fn receiptLess(a: ReceiptStatusEntry, b: ReceiptStatusEntry): bool =
+    if strLess(a.receiptId, b.receiptId):
+        return true
+    if strLess(b.receiptId, a.receiptId):
+        return false
+    if strLess(a.requestId, b.requestId):
+        return true
+    if strLess(b.requestId, a.requestId):
+        return false
+    return strLess(a.status, b.status)
+
+fn sortPairs(values: var ReconcilePair[]) =
+    for i in 0..<values.len:
+        var minIdx: int32 = i
+        for j in i + 1..<values.len:
+            if pairLess(values[j], values[minIdx]):
+                minIdx = j
+        if minIdx != i:
+            let tmp = values[i]
+            values[i] = values[minIdx]
+            values[minIdx] = tmp
+
+fn sortEpochMismatches(values: var EpochMismatchEntry[]) =
+    for i in 0..<values.len:
+        var minIdx: int32 = i
+        for j in i + 1..<values.len:
+            if epochMismatchLess(values[j], values[minIdx]):
+                minIdx = j
+        if minIdx != i:
+            let tmp = values[i]
+            values[i] = values[minIdx]
+            values[minIdx] = tmp
+
+fn sortReceipts(values: var ReceiptStatusEntry[]) =
+    for i in 0..<values.len:
+        var minIdx: int32 = i
+        for j in i + 1..<values.len:
+            if receiptLess(values[j], values[minIdx]):
+                minIdx = j
+        if minIdx != i:
+            let tmp = values[i]
+            values[i] = values[minIdx]
+            values[minIdx] = tmp
+
+
+fn collectEntries(t: tables.Table[float64]): PayoutEntry[] =
+    var out: PayoutEntry[] 
+    var idx: int32 = 0
+    var key: str = ""
+    var val: float64 = 0.0
+    while tables.TableNext[float64](t, &idx, &key, &val):
+        if key != nil && len(key) > 0 && val != 0.0:
+            add[PayoutEntry](out, PayoutEntry(key: key, value: val))
+    return out
+
+fn sortEntriesDesc(entries: var PayoutEntry[]) =
+    for i in 0..<entries.len:
+        var maxIdx: int32 = i
+        for j in i + 1..<entries.len:
+            if entries[j].value > entries[maxIdx].value:
+                maxIdx = j
+            elif entries[j].value == entries[maxIdx].value:
+                if strLess(entries[j].key, entries[maxIdx].key):
+                    maxIdx = j
+        if maxIdx != i:
+            let tmp = entries[i]
+            entries[i] = entries[maxIdx]
+            entries[maxIdx] = tmp
+
+fn applyTopLimit(entries: var PayoutEntry[], topN: int32) =
+    if topN <= 0:
+        entries.len = 0
+        return
+    if entries.len > topN:
+        entries.len = topN
+
+fn escapeQuotedString(value: str): str =
+    if value == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(value):
+        let ch = value[i]
+        if ch == '"':
+            out = out + "\\\""
+        elif ch == '\\':
+            out = out + "\\\\"
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn quoteTomlString(value: str): str =
+    return "\"" + escapeQuotedString(value) + "\""
+
+fn quoteYamlString(value: str): str =
+    return "\"" + escapeQuotedString(value) + "\""
+
+fn csvQuote(value: str): str =
+    if value == nil:
+        return ""
+    var needsQuote = false
+    for i in 0..<len(value):
+        let ch = value[i]
+        if ch == ',' || ch == '"' || ch == '\n' || ch == '\r':
+            needsQuote = true
+            break
+    if ! needsQuote:
+        return value
+    var out: str = "\""
+    i = 0
+    let __for_start_i_2 = i
+    for __for_i_2 in __for_start_i_2..<len(value):
+        i = __for_i_2
+        let ch = value[i]
+        if ch == '"':
+            out = out + "\"\""
+        else:
+            out = out + charToStr(ch)
+        i = i + 1
+    out = out + "\""
+    return out
+
+fn csvInt(value: int32): str =
+    if value < 0:
+        return ""
+    return intToStr(value)
+
+fn appendCsvRow(out: var str, kind: str, receiptId: str, requestId: str,
+    usageId: str, refId: str, receiptEpoch: int32, refEpoch: int32,
+    status: str, error: str) =
+    let receiptEpochText = csvInt(receiptEpoch)
+    let refEpochText = csvInt(refEpoch)
+    out = out + csvQuote(kind) + ","
+    out = out + csvQuote(receiptId) + ","
+    out = out + csvQuote(requestId) + ","
+    out = out + csvQuote(usageId) + ","
+    out = out + csvQuote(refId) + ","
+    out = out + csvQuote(receiptEpochText) + ","
+    out = out + csvQuote(refEpochText) + ","
+    out = out + csvQuote(status) + ","
+    out = out + csvQuote(error) + "\n"
+
+fn tableToToml(header: str, t: tables.Table[float64]): str =
+    var out: str = ""
+    out = out + "\n[" + header + "]\n"
+    var idx: int32 = 0
+    var key: str = ""
+    var val: float64 = 0.0
+    while tables.TableNext[float64](t, &idx, &key, &val):
+        if key != nil && len(key) > 0:
+            out = out + quoteTomlString(key) + " = " + $ val + "\n"
+    return out
+
+fn tableToYaml(indent: str, label: str, t: tables.Table[float64]): str =
+    var body: str = ""
+    var idx: int32 = 0
+    var key: str = ""
+    var val: float64 = 0.0
+    while tables.TableNext[float64](t, &idx, &key, &val):
+        if key != nil && len(key) > 0:
+            body = body + indent + "  " + quoteYamlString(key) + ": " + $ val + "\n"
+    if len(body) == 0:
+        return indent + label + ": {}\n"
+    return indent + label + ":\n" + body
+
+fn collectMissingReceipt(settle: Settlement): str[] =
+    var out: str[] 
+    var idx: int32 = 0
+    var key: str = ""
+    var val: int32 = 0
+    while tables.TableNext[int32](settle.requestIds, &idx, &key, &val):
+        if ! tables.TableHas[int32](settle.requestHasReceipt, key):
+            add[str](out, key)
+    return out
+
+fn collectOrphanReceipts(settle: Settlement): ReconcilePair[] =
+    var out: ReconcilePair[] 
+    var idx: int32 = 0
+    var key: str = ""
+    var val: str = ""
+    while tables.TableNext[str](settle.receiptRequests, &idx, &key, &val):
+        if ! tables.TableHas[int32](settle.requestIds, val):
+            add[ReconcilePair](out, ReconcilePair(id: key, ref: val))
+    return out
+
+fn collectMissingUsage(settle: Settlement): ReconcilePair[] =
+    var out: ReconcilePair[] 
+    var idx: int32 = 0
+    var key: str = ""
+    var val: str = ""
+    while tables.TableNext[str](settle.receiptUsages, &idx, &key, &val):
+        if val == nil || len(val) == 0:
+            continue
+        if ! tables.TableHas[int32](settle.usageIds, val):
+            add[ReconcilePair](out, ReconcilePair(id: key, ref: val))
+    return out
+
+fn collectUnrefUsage(settle: Settlement): str[] =
+    var out: str[] 
+    var idx: int32 = 0
+    var key: str = ""
+    var val: int32 = 0
+    while tables.TableNext[int32](settle.usageIds, &idx, &key, &val):
+        if ! tables.TableHas[int32](settle.receiptUsageIds, key):
+            add[str](out, key)
+    return out
+
+fn collectBadReceipts(settle: Settlement): ReceiptStatusEntry[] =
+    var out: ReceiptStatusEntry[] 
+    for i in 0..<settle.receiptErrors.len:
+        add[ReceiptStatusEntry](out, settle.receiptErrors[i])
+    return out
+
+fn collectRequestEpochMismatch(settle: Settlement): EpochMismatchEntry[] =
+    var out: EpochMismatchEntry[] 
+    var idx: int32 = 0
+    var receiptId: str = ""
+    var reqId: str = ""
+    while tables.TableNext[str](settle.receiptRequests, &idx, &receiptId, &reqId):
+        if ! tables.TableHas[int32](settle.requestEpochs, reqId):
+            continue
+        if ! tables.TableHas[int32](settle.receiptEpochs, receiptId):
+            continue
+        let reqEpoch = tables.TableGet[int32](settle.requestEpochs, reqId)
+        let recEpoch = tables.TableGet[int32](settle.receiptEpochs, receiptId)
+        if reqEpoch != recEpoch:
+            add[EpochMismatchEntry](out, EpochMismatchEntry(receiptId: receiptId, refId: reqId, receiptEpoch: recEpoch, refEpoch: reqEpoch))
+    return out
+
+fn collectUsageEpochMismatch(settle: Settlement): EpochMismatchEntry[] =
+    var out: EpochMismatchEntry[]
+    var idx: int32 = 0
+    var receiptId: str = ""
+    var usageId: str = ""
+    while tables.TableNext[str](settle.receiptUsages, &idx, &receiptId, &usageId):
+        if usageId == nil || len(usageId) == 0:
+            continue
+        if ! tables.TableHas[int32](settle.usageEpochs, usageId):
+            continue
+        if ! tables.TableHas[int32](settle.receiptEpochs, receiptId):
+            continue
+        let usageEpoch = tables.TableGet[int32](settle.usageEpochs, usageId)
+        let recEpoch = tables.TableGet[int32](settle.receiptEpochs, receiptId)
+        if usageEpoch != recEpoch:
+            add[EpochMismatchEntry](out, EpochMismatchEntry(receiptId: receiptId, refId: usageId, receiptEpoch: recEpoch, refEpoch: usageEpoch))
+    return out
+
+fn applyLimitStrings(values: var str[], limit: int32) =
+    if limit <= 0:
+        values.len = 0
+        return
+    if values.len > limit:
+        values.len = limit
+
+fn applyLimitPairs(values: var ReconcilePair[], limit: int32) =
+    if limit <= 0:
+        values.len = 0
+        return
+    if values.len > limit:
+        values.len = limit
+
+fn applyLimitReceipts(values: var ReceiptStatusEntry[], limit: int32) =
+    if limit <= 0:
+        values.len = 0
+        return
+    if values.len > limit:
+        values.len = limit
+
+fn applyLimitEpoch(values: var EpochMismatchEntry[], limit: int32) =
+    if limit <= 0:
+        values.len = 0
+        return
+    if values.len > limit:
+        values.len = limit
+
+fn buildReconcileSummary(settle: Settlement, limit: int32): ReconcileSummary =
+    var out: ReconcileSummary
+    out.limit = limit
+    out.missingReceipt = collectMissingReceipt(settle)
+    sortStrings(out.missingReceipt)
+    out.missingReceiptCount = out.missingReceipt.len
+    applyLimitStrings(out.missingReceipt, limit)
+    out.orphanReceipt = collectOrphanReceipts(settle)
+    sortPairs(out.orphanReceipt)
+    out.orphanReceiptCount = out.orphanReceipt.len
+    applyLimitPairs(out.orphanReceipt, limit)
+    out.missingUsage = collectMissingUsage(settle)
+    sortPairs(out.missingUsage)
+    out.missingUsageCount = out.missingUsage.len
+    applyLimitPairs(out.missingUsage, limit)
+    out.unrefUsage = collectUnrefUsage(settle)
+    sortStrings(out.unrefUsage)
+    out.unrefUsageCount = out.unrefUsage.len
+    applyLimitStrings(out.unrefUsage, limit)
+    out.badReceipt = collectBadReceipts(settle)
+    sortReceipts(out.badReceipt)
+    out.badReceiptCount = out.badReceipt.len
+    applyLimitReceipts(out.badReceipt, limit)
+    out.requestEpochMismatch = collectRequestEpochMismatch(settle)
+    sortEpochMismatches(out.requestEpochMismatch)
+    out.requestEpochMismatchCount = out.requestEpochMismatch.len
+    applyLimitEpoch(out.requestEpochMismatch, limit)
+    out.usageEpochMismatch = collectUsageEpochMismatch(settle)
+    sortEpochMismatches(out.usageEpochMismatch)
+    out.usageEpochMismatchCount = out.usageEpochMismatch.len
+    applyLimitEpoch(out.usageEpochMismatch, limit)
+    return out
+
+fn buildPreviewEntries(t: tables.Table[float64], topN: int32): PayoutEntry[] =
+    var entries = collectEntries(t)
+    sortEntriesDesc(entries)
+    applyTopLimit(entries, topN)
+    return entries
+
+fn entriesToJson(entries: PayoutEntry[]): json.JsonNode =
+    let arr = json.newJArray()
+    for i in 0..<entries.len:
+        let node = json.newJObject()
+        node["id"] = json.newJString(entries[i].key)
+        node["amount"] = json.newJFloat(entries[i].value)
+        arr.add(node)
+    return arr
+
+fn entriesToTomlArray(header: str, entries: PayoutEntry[]): str =
+    var out: str = ""
+    for i in 0..<entries.len:
+        out = out + "\n[[" + header + "]]\n"
+        out = out + "id = " + quoteTomlString(entries[i].key) + "\n"
+        out = out + "amount = " + $ entries[i].value + "\n"
+    return out
+
+fn entriesToYamlList(indent: str, label: str, entries: PayoutEntry[]): str =
+    if entries.len == 0:
+        return indent + label + ": []\n"
+    var out: str = indent + label + ":\n"
+    for i in 0..<entries.len:
+        out = out + indent + "  - id: " + quoteYamlString(entries[i].key) + "\n"
+        out = out + indent + "    amount: " + $ entries[i].value + "\n"
+    return out
+
+fn stringListToJson(values: str[]): json.JsonNode =
+    let arr = json.newJArray()
+    for i in 0..<values.len:
+        arr.add(json.newJString(values[i]))
+    return arr
+
+fn pairsToJson(values: ReconcilePair[]): json.JsonNode =
+    let arr = json.newJArray()
+    for i in 0..<values.len:
+        let node = json.newJObject()
+        node["id"] = json.newJString(values[i].id)
+        node["ref"] = json.newJString(values[i].ref)
+        arr.add(node)
+    return arr
+
+fn receiptsToJson(values: ReceiptStatusEntry[]): json.JsonNode =
+    let arr = json.newJArray()
+    for i in 0..<values.len:
+        let node = json.newJObject()
+        node["receipt_id"] = json.newJString(values[i].receiptId)
+        node["request_id"] = json.newJString(values[i].requestId)
+        node["status"] = json.newJString(values[i].status)
+        node["error"] = json.newJString(values[i].error)
+        arr.add(node)
+    return arr
+
+fn epochsToJson(values: EpochMismatchEntry[]): json.JsonNode =
+    let arr = json.newJArray()
+    for i in 0..<values.len:
+        let node = json.newJObject()
+        node["receipt_id"] = json.newJString(values[i].receiptId)
+        node["ref_id"] = json.newJString(values[i].refId)
+        node["receipt_epoch"] = json.newJInt(values[i].receiptEpoch)
+        node["ref_epoch"] = json.newJInt(values[i].refEpoch)
+        arr.add(node)
+    return arr
+
+fn stringListToTomlArray(values: str[]): str =
+    var out: str = "["
+    for i in 0..<values.len:
+        if i > 0:
+            out = out + ", "
+        out = out + quoteTomlString(values[i])
+    out = out + "]\n"
+    return out
+
+fn pairsToTomlArray(header: str, values: ReconcilePair[]): str =
+    var out: str = ""
+    for i in 0..<values.len:
+        out = out + "\n[[" + header + "]]\n"
+        out = out + "id = " + quoteTomlString(values[i].id) + "\n"
+        out = out + "ref = " + quoteTomlString(values[i].ref) + "\n"
+    return out
+
+fn receiptsToTomlArray(header: str, values: ReceiptStatusEntry[]): str =
+    var out: str = ""
+    for i in 0..<values.len:
+        out = out + "\n[[" + header + "]]\n"
+        out = out + "receipt_id = " + quoteTomlString(values[i].receiptId) + "\n"
+        out = out + "request_id = " + quoteTomlString(values[i].requestId) + "\n"
+        out = out + "status = " + quoteTomlString(values[i].status) + "\n"
+        if values[i].error != nil && len(values[i].error) > 0:
+            out = out + "error = " + quoteTomlString(values[i].error) + "\n"
+    return out
+
+fn epochsToTomlArray(header: str, values: EpochMismatchEntry[]): str =
+    var out: str = ""
+    for i in 0..<values.len:
+        out = out + "\n[[" + header + "]]\n"
+        out = out + "receipt_id = " + quoteTomlString(values[i].receiptId) + "\n"
+        out = out + "ref_id = " + quoteTomlString(values[i].refId) + "\n"
+        out = out + "receipt_epoch = " + intToStr(values[i].receiptEpoch) + "\n"
+        out = out + "ref_epoch = " + intToStr(values[i].refEpoch) + "\n"
+    return out
+
+fn stringListToYamlList(indent: str, label: str, values: str[]): str =
+    if values.len == 0:
+        return indent + label + ": []\n"
+    var out: str = indent + label + ":\n"
+    for i in 0..<values.len:
+        out = out + indent + "  - " + quoteYamlString(values[i]) + "\n"
+    return out
+
+fn pairsToYamlList(indent: str, label: str, values: ReconcilePair[]): str =
+    if values.len == 0:
+        return indent + label + ": []\n"
+    var out: str = indent + label + ":\n"
+    for i in 0..<values.len:
+        out = out + indent + "  - id: " + quoteYamlString(values[i].id) + "\n"
+        out = out + indent + "    ref: " + quoteYamlString(values[i].ref) + "\n"
+    return out
+
+fn receiptsToYamlList(indent: str, label: str, values: ReceiptStatusEntry[]): str =
+    if values.len == 0:
+        return indent + label + ": []\n"
+    var out: str = indent + label + ":\n"
+    for i in 0..<values.len:
+        out = out + indent + "  - receipt_id: " + quoteYamlString(values[i].receiptId) + "\n"
+        out = out + indent + "    request_id: " + quoteYamlString(values[i].requestId) + "\n"
+        out = out + indent + "    status: " + quoteYamlString(values[i].status) + "\n"
+        if values[i].error != nil && len(values[i].error) > 0:
+            out = out + indent + "    error: " + quoteYamlString(values[i].error) + "\n"
+    return out
+
+fn epochsToYamlList(indent: str, label: str, values: EpochMismatchEntry[]): str =
+    if values.len == 0:
+        return indent + label + ": []\n"
+    var out: str = indent + label + ":\n"
+    for i in 0..<values.len:
+        out = out + indent + "  - receipt_id: " + quoteYamlString(values[i].receiptId) + "\n"
+        out = out + indent + "    ref_id: " + quoteYamlString(values[i].refId) + "\n"
+        out = out + indent + "    receipt_epoch: " + intToStr(values[i].receiptEpoch) + "\n"
+        out = out + indent + "    ref_epoch: " + intToStr(values[i].refEpoch) + "\n"
+    return out
+
+fn settleLease(node: json.JsonNode, out: Settlement*) =
+    if out == nil:
+        return
+    let authorId = jparse.getStringField(node, "author_id", "")
+    let providerId = jparse.getStringField(node, "provider_id", "")
+    let royalty = jparse.getFloatField(node, "royalty", 0.0)
+    let provider = jparse.getFloatField(node, "provider", 0.0)
+    let treasury = jparse.getFloatField(node, "treasury", 0.0)
+    out->storageTotal = out->storageTotal + royalty + provider + treasury
+    out->treasuryTotal = out->treasuryTotal + treasury
+    out->leaseCount = out->leaseCount + 1
+    tableAdd(out->authors, authorId, royalty)
+    tableAdd(out->providers, providerId, provider)
+
+fn settleCompute(node: json.JsonNode, out: Settlement*) =
+    if out == nil:
+        return
+    let authorId = jparse.getStringField(node, "author_id", "")
+    let executorId = jparse.getStringField(node, "executor_id", "")
+    let royalty = jparse.getFloatField(node, "royalty", 0.0)
+    let executor = jparse.getFloatField(node, "executor", 0.0)
+    let treasury = jparse.getFloatField(node, "treasury", 0.0)
+    out->computeTotal = out->computeTotal + royalty + executor + treasury
+    out->treasuryTotal = out->treasuryTotal + treasury
+    out->computeCount = out->computeCount + 1
+    tableAdd(out->authors, authorId, royalty)
+    tableAdd(out->executors, executorId, executor)
+
+fn settleAudit(node: json.JsonNode, out: Settlement*) =
+    if out == nil:
+        return
+    let executorId = jparse.getStringField(node, "executor_id", "")
+    let status = jparse.getStringField(node, "status", "")
+    let penalty = jparse.getFloatField(node, "penalty", 0.0)
+    out->auditCount = out->auditCount + 1
+    if penalty <= 0.0:
+        return
+    if status == "ok":
+        return
+    out->auditTotal = out->auditTotal + penalty
+    out->treasuryTotal = out->treasuryTotal + penalty
+    tableAdd(out->executors, executorId, -penalty)
+    tableAdd(out->penalties, executorId, penalty)
+
+fn settleLedger(ledgerPath: str, epochFilter: int32): Settlement =
+    var out: Settlement = initSettlement(epochFilter)
+    if ledgerPath == nil || len(ledgerPath) == 0:
+        return out
+    if ! os.fileExists(ledgerPath):
+        return out
+    let content = os.readFile(ledgerPath)
+    if content == nil || len(content) == 0:
+        return out
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let node: json.JsonNode = parsed.value
+        let kind = jparse.getStringField(node, "type", "")
+        let epoch = int32(jparse.getIntField(node, "epoch", 0))
+        if epochFilter >= 0 && epoch != epochFilter:
+            continue
+        if kind == "lease":
+            settleLease(node, &out)
+        elif kind == "compute":
+            settleCompute(node, &out)
+            let usageId = jparse.getStringField(node, "usage_id", "")
+            tableSetInt(out.usageIds, usageId)
+            tableSetIntValue(out.usageEpochs, usageId, epoch)
+        elif kind == "audit":
+            settleAudit(node, &out)
+        elif kind == "audit_sample":
+            out.auditSampleCount = out.auditSampleCount + 1
+        elif kind == "fraud_report":
+            out.fraudReportCount = out.fraudReportCount + 1
+            let executorId = jparse.getStringField(node, "executor_id", "")
+            tableAdd(out.fraudExecutors, executorId, 1.0)
+        elif kind == "storage_proof":
+            out.storageProofCount = out.storageProofCount + 1
+            let providerId = jparse.getStringField(node, "provider_id", "")
+            let status = jparse.getStringField(node, "status", "")
+            if status == "missing":
+                out.storageProofMissingCount = out.storageProofMissingCount + 1
+                tableAdd(out.storageProofMissingProviders, providerId, 1.0)
+            else:
+                tableAdd(out.storageProofOkProviders, providerId, 1.0)
+        elif kind == "exec_request":
+            out.execRequestCount = out.execRequestCount + 1
+            let reqId = jparse.getStringField(node, "request_id", "")
+            tableSetInt(out.requestIds, reqId)
+            tableSetIntValue(out.requestEpochs, reqId, epoch)
+        elif kind == "exec_receipt":
+            out.execReceiptCount = out.execReceiptCount + 1
+            let recId = jparse.getStringField(node, "receipt_id", "")
+            let reqId = jparse.getStringField(node, "request_id", "")
+            let usageId = jparse.getStringField(node, "usage_id", "")
+            let status = jparse.getStringField(node, "status", "")
+            let errText = jparse.getStringField(node, "error", "")
+            tableSetInt(out.requestHasReceipt, reqId)
+            tableSetString(out.receiptRequests, recId, reqId)
+            tableSetString(out.receiptUsages, recId, usageId)
+            tableSetInt(out.receiptUsageIds, usageId)
+            tableSetIntValue(out.receiptEpochs, recId, epoch)
+            if status != "ok":
+                add[ReceiptStatusEntry](out.receiptErrors, ReceiptStatusEntry(
+                    receiptId: recId,
+                    requestId: reqId,
+                    status: status,
+                    error: errText
+                ))
+    return out
+
+fn tableToJson(t: tables.Table[float64]): json.JsonNode =
+    let out = json.newJObject()
+    var idx: int32 = 0
+    var key: str = ""
+    var val: float64 = 0.0
+    while tables.TableNext[float64](t, &idx, &key, &val):
+        out[key] = json.newJFloat(val)
+    out
+
+fn settlementToJson(settle: Settlement, previewTop: int32): json.JsonNode =
+    let root = json.newJObject()
+    root["epoch"] = json.newJInt(settle.epoch)
+    root["storage_total"] = json.newJFloat(settle.storageTotal)
+    root["compute_total"] = json.newJFloat(settle.computeTotal)
+    root["treasury_total"] = json.newJFloat(settle.treasuryTotal)
+    root["audit_total"] = json.newJFloat(settle.auditTotal)
+    let counts = json.newJObject()
+    counts["lease"] = json.newJInt(settle.leaseCount)
+    counts["compute"] = json.newJInt(settle.computeCount)
+    counts["audit"] = json.newJInt(settle.auditCount)
+    counts["exec_request"] = json.newJInt(settle.execRequestCount)
+    counts["exec_receipt"] = json.newJInt(settle.execReceiptCount)
+    root["counts"] = counts
+    let payouts = json.newJObject()
+    payouts["authors"] = tableToJson(settle.authors)
+    payouts["providers"] = tableToJson(settle.providers)
+    payouts["executors"] = tableToJson(settle.executors)
+    payouts["penalties"] = tableToJson(settle.penalties)
+    root["payouts"] = payouts
+    let trust = json.newJObject()
+    trust["audit_sample_count"] = json.newJInt(settle.auditSampleCount)
+    trust["fraud_report_count"] = json.newJInt(settle.fraudReportCount)
+    trust["storage_proof_count"] = json.newJInt(settle.storageProofCount)
+    trust["storage_proof_missing_count"] = json.newJInt(settle.storageProofMissingCount)
+    trust["fraud_by_executor"] = tableToJson(settle.fraudExecutors)
+    trust["storage_ok_by_provider"] = tableToJson(settle.storageProofOkProviders)
+    trust["storage_missing_by_provider"] = tableToJson(settle.storageProofMissingProviders)
+    root["trust"] = trust
+    let recon = buildReconcileSummary(settle, previewTop)
+    let recNode = json.newJObject()
+    recNode["limit"] = json.newJInt(recon.limit)
+    recNode["missing_receipt_count"] = json.newJInt(recon.missingReceiptCount)
+    recNode["orphan_receipt_count"] = json.newJInt(recon.orphanReceiptCount)
+    recNode["missing_usage_count"] = json.newJInt(recon.missingUsageCount)
+    recNode["unreferenced_usage_count"] = json.newJInt(recon.unrefUsageCount)
+    recNode["bad_receipt_count"] = json.newJInt(recon.badReceiptCount)
+    recNode["request_epoch_mismatch_count"] = json.newJInt(recon.requestEpochMismatchCount)
+    recNode["usage_epoch_mismatch_count"] = json.newJInt(recon.usageEpochMismatchCount)
+    recNode["missing_receipt"] = stringListToJson(recon.missingReceipt)
+    recNode["orphan_receipt"] = pairsToJson(recon.orphanReceipt)
+    recNode["missing_usage"] = pairsToJson(recon.missingUsage)
+    recNode["unreferenced_usage"] = stringListToJson(recon.unrefUsage)
+    recNode["bad_receipt"] = receiptsToJson(recon.badReceipt)
+    recNode["request_epoch_mismatch"] = epochsToJson(recon.requestEpochMismatch)
+    recNode["usage_epoch_mismatch"] = epochsToJson(recon.usageEpochMismatch)
+    root["reconcile"] = recNode
+    if previewTop > 0:
+        let preview = json.newJObject()
+        preview["limit"] = json.newJInt(previewTop)
+        preview["authors"] = entriesToJson(buildPreviewEntries(settle.authors, previewTop))
+        preview["providers"] = entriesToJson(buildPreviewEntries(settle.providers, previewTop))
+        preview["executors"] = entriesToJson(buildPreviewEntries(settle.executors, previewTop))
+        preview["penalties"] = entriesToJson(buildPreviewEntries(settle.penalties, previewTop))
+        root["preview"] = preview
+    root
+
+fn settlementToToml(settle: Settlement, previewTop: int32): str =
+    var out: str = ""
+    out = out + "epoch = " + intToStr(settle.epoch) + "\n"
+    out = out + "storage_total = " + $ settle.storageTotal + "\n"
+    out = out + "compute_total = " + $ settle.computeTotal + "\n"
+    out = out + "audit_total = " + $ settle.auditTotal + "\n"
+    out = out + "treasury_total = " + $ settle.treasuryTotal + "\n"
+    out = out + "\n[counts]\n"
+    out = out + "lease = " + intToStr(settle.leaseCount) + "\n"
+    out = out + "compute = " + intToStr(settle.computeCount) + "\n"
+    out = out + "audit = " + intToStr(settle.auditCount) + "\n"
+    out = out + "exec_request = " + intToStr(settle.execRequestCount) + "\n"
+    out = out + "exec_receipt = " + intToStr(settle.execReceiptCount) + "\n"
+    out = out + tableToToml("payouts.authors", settle.authors)
+    out = out + tableToToml("payouts.providers", settle.providers)
+    out = out + tableToToml("payouts.executors", settle.executors)
+    out = out + tableToToml("payouts.penalties", settle.penalties)
+    out = out + "\n[trust]\n"
+    out = out + "audit_sample_count = " + intToStr(settle.auditSampleCount) + "\n"
+    out = out + "fraud_report_count = " + intToStr(settle.fraudReportCount) + "\n"
+    out = out + "storage_proof_count = " + intToStr(settle.storageProofCount) + "\n"
+    out = out + "storage_proof_missing_count = " + intToStr(settle.storageProofMissingCount) + "\n"
+    out = out + tableToToml("trust.fraud_by_executor", settle.fraudExecutors)
+    out = out + tableToToml("trust.storage_ok_by_provider", settle.storageProofOkProviders)
+    out = out + tableToToml("trust.storage_missing_by_provider", settle.storageProofMissingProviders)
+    let recon = buildReconcileSummary(settle, previewTop)
+    out = out + "\n[reconcile]\n"
+    out = out + "limit = " + intToStr(recon.limit) + "\n"
+    out = out + "missing_receipt_count = " + intToStr(recon.missingReceiptCount) + "\n"
+    out = out + "orphan_receipt_count = " + intToStr(recon.orphanReceiptCount) + "\n"
+    out = out + "missing_usage_count = " + intToStr(recon.missingUsageCount) + "\n"
+    out = out + "unreferenced_usage_count = " + intToStr(recon.unrefUsageCount) + "\n"
+    out = out + "bad_receipt_count = " + intToStr(recon.badReceiptCount) + "\n"
+    out = out + "request_epoch_mismatch_count = " + intToStr(recon.requestEpochMismatchCount) + "\n"
+    out = out + "usage_epoch_mismatch_count = " + intToStr(recon.usageEpochMismatchCount) + "\n"
+    out = out + "missing_receipt = " + stringListToTomlArray(recon.missingReceipt)
+    out = out + "unreferenced_usage = " + stringListToTomlArray(recon.unrefUsage)
+    out = out + pairsToTomlArray("reconcile.orphan_receipt", recon.orphanReceipt)
+    out = out + pairsToTomlArray("reconcile.missing_usage", recon.missingUsage)
+    out = out + receiptsToTomlArray("reconcile.bad_receipt", recon.badReceipt)
+    out = out + epochsToTomlArray("reconcile.request_epoch_mismatch", recon.requestEpochMismatch)
+    out = out + epochsToTomlArray("reconcile.usage_epoch_mismatch", recon.usageEpochMismatch)
+    if previewTop > 0:
+        out = out + "\n[preview]\n"
+        out = out + "limit = " + intToStr(previewTop) + "\n"
+        out = out + entriesToTomlArray("preview.authors", buildPreviewEntries(settle.authors, previewTop))
+        out = out + entriesToTomlArray("preview.providers", buildPreviewEntries(settle.providers, previewTop))
+        out = out + entriesToTomlArray("preview.executors", buildPreviewEntries(settle.executors, previewTop))
+        out = out + entriesToTomlArray("preview.penalties", buildPreviewEntries(settle.penalties, previewTop))
+    return out
+
+fn settlementToYaml(settle: Settlement, previewTop: int32): str =
+    var out: str = ""
+    out = out + "epoch: " + intToStr(settle.epoch) + "\n"
+    out = out + "storage_total: " + $ settle.storageTotal + "\n"
+    out = out + "compute_total: " + $ settle.computeTotal + "\n"
+    out = out + "audit_total: " + $ settle.auditTotal + "\n"
+    out = out + "treasury_total: " + $ settle.treasuryTotal + "\n"
+    out = out + "counts:\n"
+    out = out + "  lease: " + intToStr(settle.leaseCount) + "\n"
+    out = out + "  compute: " + intToStr(settle.computeCount) + "\n"
+    out = out + "  audit: " + intToStr(settle.auditCount) + "\n"
+    out = out + "  exec_request: " + intToStr(settle.execRequestCount) + "\n"
+    out = out + "  exec_receipt: " + intToStr(settle.execReceiptCount) + "\n"
+    out = out + "payouts:\n"
+    out = out + tableToYaml("  ", "authors", settle.authors)
+    out = out + tableToYaml("  ", "providers", settle.providers)
+    out = out + tableToYaml("  ", "executors", settle.executors)
+    out = out + tableToYaml("  ", "penalties", settle.penalties)
+    out = out + "trust:\n"
+    out = out + "  audit_sample_count: " + intToStr(settle.auditSampleCount) + "\n"
+    out = out + "  fraud_report_count: " + intToStr(settle.fraudReportCount) + "\n"
+    out = out + "  storage_proof_count: " + intToStr(settle.storageProofCount) + "\n"
+    out = out + "  storage_proof_missing_count: " + intToStr(settle.storageProofMissingCount) + "\n"
+    out = out + tableToYaml("  ", "fraud_by_executor", settle.fraudExecutors)
+    out = out + tableToYaml("  ", "storage_ok_by_provider", settle.storageProofOkProviders)
+    out = out + tableToYaml("  ", "storage_missing_by_provider", settle.storageProofMissingProviders)
+    let recon = buildReconcileSummary(settle, previewTop)
+    out = out + "reconcile:\n"
+    out = out + "  limit: " + intToStr(recon.limit) + "\n"
+    out = out + "  missing_receipt_count: " + intToStr(recon.missingReceiptCount) + "\n"
+    out = out + "  orphan_receipt_count: " + intToStr(recon.orphanReceiptCount) + "\n"
+    out = out + "  missing_usage_count: " + intToStr(recon.missingUsageCount) + "\n"
+    out = out + "  unreferenced_usage_count: " + intToStr(recon.unrefUsageCount) + "\n"
+    out = out + "  bad_receipt_count: " + intToStr(recon.badReceiptCount) + "\n"
+    out = out + "  request_epoch_mismatch_count: " + intToStr(recon.requestEpochMismatchCount) + "\n"
+    out = out + "  usage_epoch_mismatch_count: " + intToStr(recon.usageEpochMismatchCount) + "\n"
+    out = out + stringListToYamlList("  ", "missing_receipt", recon.missingReceipt)
+    out = out + pairsToYamlList("  ", "orphan_receipt", recon.orphanReceipt)
+    out = out + pairsToYamlList("  ", "missing_usage", recon.missingUsage)
+    out = out + stringListToYamlList("  ", "unreferenced_usage", recon.unrefUsage)
+    out = out + receiptsToYamlList("  ", "bad_receipt", recon.badReceipt)
+    out = out + epochsToYamlList("  ", "request_epoch_mismatch", recon.requestEpochMismatch)
+    out = out + epochsToYamlList("  ", "usage_epoch_mismatch", recon.usageEpochMismatch)
+    if previewTop > 0:
+        out = out + "preview:\n"
+        out = out + "  limit: " + intToStr(previewTop) + "\n"
+        out = out + entriesToYamlList("  ", "authors", buildPreviewEntries(settle.authors, previewTop))
+        out = out + entriesToYamlList("  ", "providers", buildPreviewEntries(settle.providers, previewTop))
+        out = out + entriesToYamlList("  ", "executors", buildPreviewEntries(settle.executors, previewTop))
+        out = out + entriesToYamlList("  ", "penalties", buildPreviewEntries(settle.penalties, previewTop))
+    return out
+
+fn settlementReconcileCsv(settle: Settlement, limit: int32): str =
+    let recon = buildReconcileSummary(settle, limit)
+    var out: str = "kind,receipt_id,request_id,usage_id,ref_id,receipt_epoch,ref_epoch,status,error\n"
+    for i in 0..<recon.missingReceipt.len:
+        let reqId = recon.missingReceipt[i]
+        appendCsvRow(out, "missing_receipt", "", reqId, "", reqId, -1, -1, "", "")
+    for i in 0..<recon.orphanReceipt.len:
+        let pair = recon.orphanReceipt[i]
+        appendCsvRow(out, "orphan_receipt", pair.id, pair.ref, "", pair.ref, -1, -1, "", "")
+    for i in 0..<recon.missingUsage.len:
+        let pair = recon.missingUsage[i]
+        appendCsvRow(out, "missing_usage", pair.id, "", pair.ref, pair.ref, -1, -1, "", "")
+    for i in 0..<recon.unrefUsage.len:
+        let usageId = recon.unrefUsage[i]
+        appendCsvRow(out, "unreferenced_usage", "", "", usageId, usageId, -1, -1, "", "")
+    for i in 0..<recon.badReceipt.len:
+        let entry = recon.badReceipt[i]
+        appendCsvRow(out, "bad_receipt", entry.receiptId, entry.requestId, "", entry.requestId,
+            -1, -1, entry.status, entry.error)
+    for i in 0..<recon.requestEpochMismatch.len:
+        let entry = recon.requestEpochMismatch[i]
+        appendCsvRow(out, "request_epoch_mismatch", entry.receiptId, entry.refId, "", entry.refId,
+            entry.receiptEpoch, entry.refEpoch, "", "")
+    for i in 0..<recon.usageEpochMismatch.len:
+        let entry = recon.usageEpochMismatch[i]
+        appendCsvRow(out, "usage_epoch_mismatch", entry.receiptId, "", entry.refId, entry.refId,
+            entry.receiptEpoch, entry.refEpoch, "", "")
+    return out

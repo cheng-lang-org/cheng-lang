@@ -1,0 +1,201 @@
+import cheng/runtime/mobile
+
+type
+    MobileAppConfig =
+        platform: MobilePlatform
+        title: str
+        width: int
+        height: int
+        highDpi: bool
+        resourceRoot: str
+
+    MobileHostConfig =
+        platform: int32
+        resourceRoot: str
+        title: str
+        width: int32
+        height: int32
+        highDpi: int32
+
+    MobileAppCallbacks =
+        onInit: fn (runtime: MobileRuntimeHandle, windowId: int)
+        onEvent: fn (runtime: MobileRuntimeHandle, ev: MobileRuntimeEvent)
+        onFrame: fn (runtime: MobileRuntimeHandle)
+        onShutdown: fn (runtime: MobileRuntimeHandle)
+
+fn noopInit(runtime: MobileRuntimeHandle, windowId: int) =
+    runtime
+    windowId
+
+fn noopEvent(runtime: MobileRuntimeHandle, ev: MobileRuntimeEvent) =
+    runtime
+    ev
+
+fn noopFrame(runtime: MobileRuntimeHandle) =
+    runtime
+
+fn noopShutdown(runtime: MobileRuntimeHandle) =
+    runtime
+
+fn defaultMobileAppConfig(platform: MobilePlatform): MobileAppConfig =
+    var cfg: MobileAppConfig
+    cfg.platform = platform
+    cfg.title = "Cheng Mobile App"
+    cfg.width = 1280
+    cfg.height = 720
+    cfg.highDpi = true
+    cfg.resourceRoot = ""
+    let hostRoot: str = cheng_mobile_host_default_resource_root()
+    if hostRoot != nil && c_strlen(hostRoot) > 0:
+        cfg.resourceRoot = hostRoot
+    return cfg
+
+fn toMobileHostConfig(cfg: MobileAppConfig): MobileHostConfig =
+    var out: MobileHostConfig
+    out.platform = if cfg.platform == mpIos: 1 else: 0
+    out.resourceRoot = cfg.resourceRoot
+    out.title = cfg.title
+    out.width = int32(cfg.width)
+    out.height = int32(cfg.height)
+    out.highDpi = if cfg.highDpi: 1 else: 0
+    return out
+
+fn defaultMobileAppCallbacks(): MobileAppCallbacks =
+    var cb: MobileAppCallbacks
+    cb.onInit = noopInit
+    cb.onEvent = noopEvent
+    cb.onFrame = noopFrame
+    cb.onShutdown = noopShutdown
+    return cb
+
+fn mobileRuntimeInit(cfg: MobileAppConfig): MobileRuntimeHandle =
+    var runtimeCfg = defaultConfig(cfg.platform)
+    runtimeCfg.resourceRoot = cfg.resourceRoot
+    if cfg.platform == mpIos:
+        return ios_runtime_init(runtimeCfg)
+    return android_runtime_init(runtimeCfg)
+
+fn mobileRuntimeOpenWindow(runtime: MobileRuntimeHandle, cfg: MobileAppConfig): int =
+    var desc: MobileWindowDescriptor
+    desc.title = cfg.title
+    desc.width = cfg.width
+    desc.height = cfg.height
+    desc.highDpi = cfg.highDpi
+    if cfg.platform == mpIos:
+        return ios_runtime_open_window(runtime, desc)
+    return android_runtime_open_window(runtime, desc)
+
+fn mobileRuntimeTick(runtime: MobileRuntimeHandle, cfg: MobileAppConfig, frames: int): MobileRuntimeEvent[] =
+    if cfg.platform == mpIos:
+        return ios_runtime_tick(runtime, frames)
+    return android_runtime_tick(runtime, frames)
+
+fn mobileRuntimeShutdown(runtime: MobileRuntimeHandle, cfg: MobileAppConfig, reason: str) =
+    if cfg.platform == mpIos:
+        ios_runtime_shutdown(runtime, reason)
+    else:
+        android_runtime_shutdown(runtime, reason)
+
+when defined(android) || defined(ios) || defined(mobile_host):
+    @importc("cheng_mobile_host_default_resource_root")
+    fn cheng_mobile_host_default_resource_root(): str
+    @importc("cheng_mobile_host_init")
+    fn cheng_mobile_host_init(cfg: MobileHostConfig*): int32
+    @importc("cheng_mobile_host_open_window")
+    fn cheng_mobile_host_open_window(cfg: MobileHostConfig*): int32
+    @importc("cheng_mobile_host_poll_event")
+    fn cheng_mobile_host_poll_event(ev: MobileRuntimeEvent*): int32
+    @importc("cheng_mobile_host_present")
+    fn cheng_mobile_host_present(pixels: void*, width, height, strideBytes: int32)
+    @importc("cheng_mobile_host_shutdown")
+    fn cheng_mobile_host_shutdown(reason: str)
+else:
+    @weak
+    fn cheng_mobile_host_default_resource_root(): str =
+        return ""
+    @weak
+    fn cheng_mobile_host_init(cfg: MobileHostConfig*): int32 =
+        cfg
+        return 0
+    @weak
+    fn cheng_mobile_host_open_window(cfg: MobileHostConfig*): int32 =
+        cfg
+        return 0
+    @weak
+    fn cheng_mobile_host_poll_event(ev: MobileRuntimeEvent*): int32 =
+        ev
+        return 0
+    @weak
+    fn cheng_mobile_host_present(pixels: void*, width, height, strideBytes: int32) =
+        pixels
+        width
+        height
+        strideBytes
+    @weak
+    fn cheng_mobile_host_shutdown(reason: str) =
+        reason
+
+fn mobileHostPresentPixels(pixels: void*, width, height, strideBytes: int32) =
+    cheng_mobile_host_present(pixels, width, height, strideBytes)
+
+fn runMobileApp(cfg: MobileAppConfig, callbacks: MobileAppCallbacks, frames: int): str =
+    let runtime = mobileRuntimeInit(cfg)
+    let windowId: int = mobileRuntimeOpenWindow(runtime, cfg)
+    let onInitCb = callbacks.onInit
+    let onEventCb = callbacks.onEvent
+    let onFrameCb = callbacks.onFrame
+    let onShutdownCb = callbacks.onShutdown
+    if onInitCb != nil:
+        onInitCb(runtime, windowId)
+    var frameIdx: int32 = 0
+    var steps: int32 = if frames <= 0: 1 else: frames
+    let __for_start_frameIdx_1 = frameIdx
+    for __for_frameIdx_1 in __for_start_frameIdx_1..<steps:
+        frameIdx = __for_frameIdx_1
+        let events = mobileRuntimeTick(runtime, cfg, 1)
+        for idx in 0..<events.len:
+            let ev: MobileRuntimeEvent = events[idx]
+            if onEventCb != nil:
+                onEventCb(runtime, ev)
+            if ev.kind == mreFrameTick && onFrameCb != nil:
+                onFrameCb(runtime)
+        frameIdx = frameIdx + 1
+    mobileRuntimeShutdown(runtime, cfg, "exit")
+    if onShutdownCb != nil:
+        onShutdownCb(runtime)
+    if cfg.platform == mpIos:
+        return ios_runtime_summary(runtime)
+    return android_runtime_summary(runtime)
+
+fn runMobileHostApp(cfg: MobileAppConfig, callbacks: MobileAppCallbacks, frames: int): str =
+    let runtime = mobileRuntimeInit(cfg)
+    let hostCfg: MobileHostConfig = toMobileHostConfig(cfg)
+    cheng_mobile_host_init(&hostCfg)
+    let windowId: int32 = cheng_mobile_host_open_window(&hostCfg)
+    let onInitCb = callbacks.onInit
+    let onEventCb = callbacks.onEvent
+    let onFrameCb = callbacks.onFrame
+    let onShutdownCb = callbacks.onShutdown
+    if onInitCb != nil:
+        onInitCb(runtime, int(windowId))
+    var stepCount: int32 = if frames <= 0: 1 else: frames
+    for frameIdx in 0..<stepCount:
+        var ev: MobileRuntimeEvent
+        let got: int32 = cheng_mobile_host_poll_event(&ev)
+        if got != 0:
+            if onEventCb != nil:
+                onEventCb(runtime, ev)
+            if ev.kind == mreFrameTick && onFrameCb != nil:
+                onFrameCb(runtime)
+        else:
+            ev.kind = mreFrameTick
+            if onEventCb != nil:
+                onEventCb(runtime, ev)
+            if onFrameCb != nil:
+                onFrameCb(runtime)
+    cheng_mobile_host_shutdown("exit")
+    if onShutdownCb != nil:
+        onShutdownCb(runtime)
+    if cfg.platform == mpIos:
+        return ios_runtime_summary(runtime)
+    return android_runtime_summary(runtime)

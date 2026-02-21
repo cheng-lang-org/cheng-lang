@@ -1,0 +1,709 @@
+import cmdline
+import std/os
+import std/strutils as strutil
+import cheng/web/std/server_http
+import cheng/web/std/server_static as sstatic
+import cheng/web/runtime/server_app
+import cheng/web/cli/route_manifest as rmanifest
+import std/strings
+
+type
+    DevConfig =
+        root: str
+        watch: str
+        buildCmd: str
+        buildExts: str[]
+        manifestRoot: str
+        manifestOut: str
+        manifestExts: str[]
+        devClientScript: str
+        spaFallback: bool
+
+    FileStamp =
+        path: str
+        mtime: int64
+
+    DevState =
+        inited: bool
+        reloadSeq: int32
+        lastAllSig: uint64
+        lastBuildSig: uint64
+        lastManifestSig: uint64
+        lastError: str
+        lastReloadKind: str
+        lastFiles: FileStamp[]
+
+var
+    cfg: DevConfig
+    state: DevState
+    exitCode: int32 = 0
+
+const
+    HashOffset: uint64 = 1469598103934665603'u64
+    HashPrime: uint64 = 1099511628211'u64
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn printErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn printUsage() =
+    printLine("usage: cheng dev-server [--root:<dir>] [--watch:<dir>] [--build:<cmd>] [--build-exts:<list>] [--manifest-root:<dir>] [--manifest-out:<file>] [--manifest-exts:<list>] [--routes-root:<dir>] [--routes-out:<file>] [--routes-exts:<list>] [--spa[:<bool>]]")
+    printLine("")
+    printLine("env:")
+    printLine("  WEB_ROOT   default root directory")
+    printLine("  WEB_WATCH  watch directory (defaults to root)")
+    printLine("  WEB_BUILD  build command to run on change")
+    printLine("  WEB_BUILD_EXTS  comma list of extensions that trigger build (default .cwc)")
+    printLine("  WEB_MANIFEST_ROOT  routes root to generate manifest")
+    printLine("  WEB_MANIFEST_OUT   manifest output path")
+    printLine("  WEB_MANIFEST_EXTS  manifest scan extensions (default .cwc,.cheng)")
+    printLine("  WEB_ROUTES_ROOT    alias of WEB_MANIFEST_ROOT")
+    printLine("  WEB_ROUTES_OUT     alias of WEB_MANIFEST_OUT")
+    printLine("  WEB_ROUTES_EXTS    alias of WEB_MANIFEST_EXTS")
+    printLine("  WEB_SPA    enable SPA fallback (true/false)")
+
+fn hasPrefix(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    if len(prefix) > len(s):
+        return false
+    for i in 0..<len(prefix):
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn normalizeExt(ext: str): str =
+    if ext == nil:
+        return ""
+    var out = strutil.strip(ext)
+    if len(out) == 0:
+        return ""
+    out = strutil.toLowerAscii(out)
+    if out[0] != '.':
+        out = "." + out
+    return out
+
+fn parseExts(raw: str, fallback: str): str[] =
+    let text = if raw != nil && len(raw) > 0: raw else: fallback
+    let parts = strutil.split(text, ',')
+    var out: str[] 
+    for i in 0..<len(parts):
+        let ext = normalizeExt(parts[i])
+        if ext != nil && len(ext) > 0:
+            out.add(ext)
+    if len(out) == 0:
+        out.add(".cwc")
+    return out
+
+fn parseBool(text: str, defaultValue: bool): bool =
+    if text == nil:
+        return defaultValue
+    let lowered = strutil.toLowerAscii(strutil.strip(text))
+    if lowered == "1" || lowered == "true" || lowered == "on" || lowered == "yes":
+        return true
+    if lowered == "0" || lowered == "false" || lowered == "off" || lowered == "no":
+        return false
+    return defaultValue
+
+fn isIgnoredSegment(seg: str): bool =
+    if seg == nil || len(seg) == 0:
+        return false
+    return seg == ".git" || seg == "node_modules" || seg == "chengcache" || seg == "dist" || seg == "build" || seg == "out" || seg == ".cache" || seg == ".idea" || seg == ".vscode" || seg == "tmp" || seg == "tmp_build"
+
+fn shouldIgnorePath(relPath: str): bool =
+    if relPath == nil || len(relPath) == 0:
+        return false
+    let parts = strutil.split(relPath, '/')
+    for i in 0..<len(parts):
+        let subparts = strutil.split(parts[i], '\\')
+        for j in 0..<len(subparts):
+            if isIgnoredSegment(subparts[j]):
+                return true
+    return false
+
+fn startsWithDot(name: str): bool =
+    return name != nil && len(name) > 0 && name[0] == '.'
+
+fn extMatches(path: str, exts: str[]): bool =
+    let parts = os.splitFile(path)
+    var ext = parts.ext
+    if ext == nil:
+        ext = ""
+    ext = strutil.toLowerAscii(ext)
+    for i in 0..<len(exts):
+        if ext == exts[i]:
+            return true
+    return false
+
+fn resolveDefaultRoot(): str =
+    let envRoot = os.getEnv("WEB_ROOT")
+    if envRoot != nil && len(envRoot) > 0:
+        return os.absolutePath(envRoot)
+    let exampleRoot = os.absolutePath("cheng/web/examples")
+    let exampleIndex = os.joinPath(exampleRoot, "index.html")
+    if os.fileExists(exampleIndex):
+        return exampleRoot
+    return os.getCurrentDir()
+
+fn resolveWatchRoot(root: str): str =
+    let envWatch = os.getEnv("WEB_WATCH")
+    if envWatch != nil && len(envWatch) > 0:
+        return os.absolutePath(envWatch)
+    return root
+
+fn resolveMaybeRelative(base: str, value: str): str =
+    if value == nil || len(value) == 0:
+        return ""
+    if os.isAbsolute(value):
+        return os.absolutePath(value)
+    return os.absolutePath(os.joinPath(base, value))
+
+fn hashUpdate(h: uint64, v: uint64): uint64 =
+    var out = h ^ v
+    out = out * HashPrime
+    return out
+
+fn hashString64(s: str): uint64 =
+    if s == nil:
+        return HashOffset
+    var h: uint64 = HashOffset
+    for i in 0..<len(s):
+        h = hashUpdate(h, uint64(s[i]))
+    return h
+
+fn hashPathMtime(path: str, mtimeNs: int64): uint64 =
+    var h = hashString64(path)
+    h = hashUpdate(h, uint64(mtimeNs))
+    return h
+
+fn scanFileStamps(baseRoot: str, root: str, buildExts: str[], outAll: uint64*, outBuild: uint64*, outFiles: FileStamp[]*) =
+    if root == nil || len(root) == 0 || ! os.dirExists(root):
+        return
+    let items = os.walkDir(root)
+    for i in 0..<items.len:
+        let entry = os.os_get_WalkDirEntry(items, i)
+        let fullPath = entry.path
+        let name = os.extractFilename(fullPath)
+        if startsWithDot(name) && name != ".github":
+            continue
+        let rel = os.relativePath(fullPath, baseRoot)
+        if shouldIgnorePath(rel):
+            continue
+        if entry.kind == os.pcDir || entry.kind == os.pcLinkToDir:
+            scanFileStamps(baseRoot, fullPath, buildExts, outAll, outBuild, outFiles)
+        elif entry.kind == os.pcFile || entry.kind == os.pcLinkToFile:
+            let mtime = os.fileMtimeNs(fullPath)
+            var stamp: FileStamp
+            stamp.path = rel
+            stamp.mtime = mtime
+            outFiles->add(stamp)
+            let h = hashPathMtime(rel, mtime)
+            *outAll = hashUpdate(*outAll, h)
+            if extMatches(name, buildExts):
+                *outBuild = hashUpdate(*outBuild, h)
+
+fn normalizeRel(path: str): str =
+    if path == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(path):
+        var c = path[i]
+        if c == '\\':
+            c = '/'
+        out = out + c
+    return out
+
+fn scanSignatureFiltered(baseRoot: str, root: str, exts: str[], outSig: uint64*, excludeRel: str) =
+    if root == nil || len(root) == 0 || ! os.dirExists(root):
+        return
+    let exclude = normalizeRel(excludeRel)
+    let items = os.walkDir(root)
+    for i in 0..<items.len:
+        let entry = os.os_get_WalkDirEntry(items, i)
+        let fullPath = entry.path
+        let name = os.extractFilename(fullPath)
+        if startsWithDot(name) && name != ".github":
+            continue
+        var rel = os.relativePath(fullPath, baseRoot)
+        rel = normalizeRel(rel)
+        if shouldIgnorePath(rel):
+            continue
+        if exclude != nil && len(exclude) > 0 && rel == exclude:
+            continue
+        if entry.kind == os.pcDir || entry.kind == os.pcLinkToDir:
+            scanSignatureFiltered(baseRoot, fullPath, exts, outSig, exclude)
+        elif entry.kind == os.pcFile || entry.kind == os.pcLinkToFile:
+            if extMatches(name, exts):
+                let mtime = os.fileMtimeNs(fullPath)
+                let h = hashPathMtime(rel, mtime)
+                *outSig = hashUpdate(*outSig, h)
+
+fn manifestExcludeRel(): str =
+    if cfg.manifestRoot == nil || len(cfg.manifestRoot) == 0:
+        return ""
+    if cfg.manifestOut == nil || len(cfg.manifestOut) == 0:
+        return ""
+    return os.relativePath(cfg.manifestOut, cfg.manifestRoot)
+
+fn lastIndexOfSubstr(s: str, needle: str): int32 =
+    if s == nil || needle == nil || len(needle) == 0:
+        return -1
+    if len(needle) > len(s):
+        return -1
+    let __for_start_i = len(s) - len(needle)
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        if substr(s, i, len(needle)) == needle:
+            return i
+        if i == 0:
+            break
+    return -1
+
+fn endsWith(s: str, suffix: str): bool =
+    if s == nil || suffix == nil:
+        return false
+    let sLen: int32 = len(s)
+    let pLen: int32 = len(suffix)
+    if pLen == 0 || sLen < pLen:
+        return false
+    for i in 0..<pLen:
+        if s[sLen - pLen + i] != suffix[i]:
+            return false
+    return true
+
+fn injectDevClient(html: str): str =
+    let script = "\n<script type=\"module\" src=\"/__cheng_dev_client.js\"></script>\n"
+    if html == nil:
+        return script
+    if strutil.contains(html, script):
+        return html
+    let lower = strutil.toLowerAscii(html)
+    let marker = "</body>"
+    let idx = lastIndexOfSubstr(lower, marker)
+    if idx >= 0:
+        let head = substr(html, 0, idx)
+        let tail = substr(html, idx, len(html) - idx)
+        return head + script + tail
+    return html + script
+
+fn requestWantsHtml(req: HttpRequest): bool =
+    let accept = headerGet(req.headers, "Accept")
+    if accept == nil || len(accept) == 0:
+        return false
+    let lowered = strutil.toLowerAscii(accept)
+    return strutil.contains(lowered, "text/html")
+
+fn pathHasExtension(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    let name = os.extractFilename(path)
+    if name == nil || len(name) == 0:
+        return false
+    var i: int32 = len(name) - 1
+    while true:
+        let c = name[i]
+        if c == '.':
+            return i > 0
+        if i == 0:
+            break
+        i = i - 1
+    return false
+
+fn shouldSpaFallback(req: HttpRequest): bool =
+    if ! cfg.spaFallback:
+        return false
+    if req.method != hmGet:
+        return false
+    if pathHasExtension(req.path):
+        return false
+    return requestWantsHtml(req)
+
+fn escapeJson(text: str): str =
+    if text == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(text):
+        let c = text[i]
+        if c == '\\':
+            out = out + "\\\\"
+        elif c == '"':
+            out = out + "\\\""
+        elif c == '\n':
+            out = out + "\\n"
+        elif c == '\r':
+            out = out + "\\r"
+        elif c == '\t':
+            out = out + "\\t"
+        else:
+            out = out + c
+    return out
+
+fn findStampIndex(stamps: FileStamp[], path: str): int32 =
+    if path == nil:
+        return -1
+    for i in 0..<len(stamps):
+        if stamps[i].path == path:
+            return i
+    return -1
+
+fn diffStamps(oldStamps: FileStamp[], newStamps: FileStamp[]): str[] =
+    var out: str[] 
+    for i in 0..<len(newStamps):
+        let item = newStamps[i]
+        let idx = findStampIndex(oldStamps, item.path)
+        if idx < 0 || oldStamps[idx].mtime != item.mtime:
+            out.add(item.path)
+    i = 0
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<len(oldStamps):
+        i = __for_i_1
+        let item = oldStamps[i]
+        let idx = findStampIndex(newStamps, item.path)
+        if idx < 0:
+            out.add(item.path)
+        i = i + 1
+    return out
+
+fn isIgnoredChange(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    let lower = strutil.toLowerAscii(path)
+    return endsWith(lower, ".map") || endsWith(lower, ".map.json")
+
+fn filterReloadChanges(changes: str[]): str[] =
+    var out: str[]
+    for i in 0..<len(changes):
+        let item = changes[i]
+        if ! isIgnoredChange(item):
+            out.add(item)
+    return out
+
+fn isCssOnly(changes: str[]): bool =
+    if len(changes) == 0:
+        return false
+    for i in 0..<len(changes):
+        let parts = os.splitFile(changes[i])
+        var ext = parts.ext
+        if ext == nil:
+            ext = ""
+        ext = strutil.toLowerAscii(ext)
+        if ext != ".css":
+            return false
+    return true
+
+fn tailString(text: str, limit: int32): str =
+    if text == nil:
+        return ""
+    if len(text) <= limit:
+        return text
+    return substr(text, len(text) - limit, limit)
+
+fn runBuild(command: str, cwd: str): str =
+    let opts: uint64 = os.processOptionMask(os.poStdErrToStdOut)
+    let res = os.execCmdEx(command, opts, cwd)
+    if res.exitCode == 0:
+        return ""
+    let output = tailString(res.output, 8000)
+    if output != nil && len(output) > 0:
+        return output
+    return "build failed"
+
+fn updateDevState() =
+    var allSig: uint64 = HashOffset
+    var buildSig: uint64 = HashOffset
+    var files: FileStamp[] 
+    scanFileStamps(cfg.watch, cfg.watch, cfg.buildExts, &allSig, &buildSig, &files)
+    var manifestSig: uint64 = HashOffset
+    if cfg.manifestRoot != nil && len(cfg.manifestRoot) > 0:
+        scanSignatureFiltered(cfg.manifestRoot, cfg.manifestRoot, cfg.manifestExts, &manifestSig, manifestExcludeRel())
+    let changedAll = allSig != state.lastAllSig
+    let changedBuild = buildSig != state.lastBuildSig
+    let changedManifest = manifestSig != state.lastManifestSig
+    if ! (changedAll || changedBuild || changedManifest):
+        return
+    let changes = diffStamps(state.lastFiles, files)
+    let reloadChanges = filterReloadChanges(changes)
+    if len(reloadChanges) == 0 && ! changedBuild && ! changedManifest:
+        state.lastAllSig = allSig
+        state.lastBuildSig = buildSig
+        state.lastManifestSig = manifestSig
+        state.lastFiles = files
+        return
+    let cssOnly = isCssOnly(reloadChanges)
+    var reloadKind: str = "full"
+    if cssOnly && ! changedBuild && ! changedManifest:
+        reloadKind = "css"
+    var manifestError: str = ""
+    if cfg.manifestRoot != nil && len(cfg.manifestRoot) > 0 && changedManifest:
+        manifestError = rmanifest.generateRouteManifest(cfg.manifestRoot, cfg.manifestOut, cfg.manifestExts)
+        if manifestError != nil && len(manifestError) > 0:
+            state.lastError = manifestError
+            state.lastAllSig = allSig
+            state.lastBuildSig = buildSig
+            state.lastManifestSig = manifestSig
+            state.lastFiles = files
+            return
+    if cfg.buildCmd != nil && len(cfg.buildCmd) > 0:
+        if changedBuild || changedManifest:
+            let buildError = runBuild(cfg.buildCmd, cfg.root)
+            if buildError != nil && len(buildError) > 0:
+                state.lastError = buildError
+            else:
+                state.lastError = ""
+                state.reloadSeq = state.reloadSeq + 1
+                state.lastReloadKind = reloadKind
+        else:
+            # Non-build asset changes should still trigger reload, but keep build error state.
+            if state.lastError == nil || len(state.lastError) == 0:
+                state.reloadSeq = state.reloadSeq + 1
+                state.lastReloadKind = reloadKind
+    else:
+        state.lastError = ""
+        state.reloadSeq = state.reloadSeq + 1
+        state.lastReloadKind = reloadKind
+    state.lastAllSig = allSig
+    state.lastBuildSig = buildSig
+    state.lastManifestSig = manifestSig
+    state.lastFiles = files
+
+fn refreshSignatures() =
+    var allSig: uint64 = HashOffset
+    var buildSig: uint64 = HashOffset
+    var files: FileStamp[] 
+    scanFileStamps(cfg.watch, cfg.watch, cfg.buildExts, &allSig, &buildSig, &files)
+    var manifestSig: uint64 = HashOffset
+    if cfg.manifestRoot != nil && len(cfg.manifestRoot) > 0:
+        scanSignatureFiltered(cfg.manifestRoot, cfg.manifestRoot, cfg.manifestExts, &manifestSig, manifestExcludeRel())
+    state.lastAllSig = allSig
+    state.lastBuildSig = buildSig
+    state.lastManifestSig = manifestSig
+    state.lastFiles = files
+
+fn jsonPollPayload(): str =
+    let errText = if state.lastError == nil: "" else: state.lastError
+    let kindText = if state.lastReloadKind == nil || len(state.lastReloadKind) == 0: "full" else: state.lastReloadKind
+    return "{\"version\":" + intToStr(state.reloadSeq) + ",\"error\":\"" + escapeJson(errText) + "\",\"kind\":\"" + escapeJson(kindText) + "\"}"
+
+fn loadDevClientScript(): str =
+    let path = os.absolutePath("cheng/web/runtime/dev_client.js")
+    if ! os.fileExists(path):
+        return ""
+    return os.readFile(path)
+
+fn safePathFromRequest(path: str): str =
+    if path == nil || len(path) == 0:
+        return "index.html"
+    var rel = path
+    if rel[0] == '/':
+        rel = substr(rel, 1, len(rel) - 1)
+    if len(rel) == 0:
+        rel = "index.html"
+    if strutil.contains(rel, ".."):
+        return ""
+    return rel
+
+fn serveStatic(req: HttpRequest): HttpResponse =
+    var rel = safePathFromRequest(req.path)
+    if rel == nil || len(rel) == 0:
+        return notFoundResponse()
+    let rootIndex = os.joinPath(cfg.root, "index.html")
+    var full = os.joinPath(cfg.root, rel)
+    if os.dirExists(full):
+        let indexPath = os.joinPath(full, "index.html")
+        if os.fileExists(indexPath):
+            full = indexPath
+        elif shouldSpaFallback(req) && os.fileExists(rootIndex):
+            full = rootIndex
+        else:
+            return notFoundResponse()
+    elif ! os.fileExists(full):
+        if shouldSpaFallback(req) && os.fileExists(rootIndex):
+            full = rootIndex
+        else:
+            return notFoundResponse()
+    var body = os.readFile(full)
+    let contentType = sstatic.guessContentType(full)
+    let isHtml = contentType == "text/html; charset=utf-8"
+    if isHtml:
+        body = injectDevClient(body)
+    let etag = sstatic.etagForBody(body)
+    if sstatic.etagMatches(req, etag):
+        var res304 = newResponse(304, "")
+        headerSet(res304.headers, "ETag", etag)
+        return res304
+    var res = newResponse(200, body)
+    headerSet(res.headers, "Content-Type", contentType)
+    headerSet(res.headers, "ETag", etag)
+    headerSet(res.headers, "Cache-Control", "no-cache")
+    return res
+
+fn handleDevRequest(req: HttpRequest): HttpResponse =
+    if req.path == "/__cheng_dev_client.js":
+        var res = newResponse(200, cfg.devClientScript)
+        headerSet(res.headers, "Content-Type", "text/javascript; charset=utf-8")
+        headerSet(res.headers, "Cache-Control", "no-cache")
+        return res
+    if req.path == "/__cheng_dev_poll":
+        updateDevState()
+        let payload = jsonPollPayload()
+        var res = jsonResponse(payload, 200)
+        headerSet(res.headers, "Cache-Control", "no-cache")
+        return res
+    return serveStatic(req)
+
+fn collectArgsFromCmdline(): str[] =
+    var out: str[] 
+    let count: int32 = cmdline.paramCount()
+    for i in 0..<count:
+        out.add(cmdline.paramStr(i + 1))
+    return out
+
+fn initDevServerArgs(args: str[]): bool =
+    if state.inited:
+        return true
+    var rootArg: str = ""
+    var watchArg: str = ""
+    var buildCmd: str = ""
+    var buildExtsRaw: str = ""
+    var manifestRootRaw: str = ""
+    var manifestOutRaw: str = ""
+    var manifestExtsRaw: str = ""
+    var routesRootRaw: str = ""
+    var routesOutRaw: str = ""
+    var routesExtsRaw: str = ""
+    var spaRaw: str = ""
+    var spaSet: bool = false
+    for i in 0..<len(args):
+        let arg = args[i]
+        if arg == "--help" || arg == "-h":
+            printUsage()
+            exitCode = 0
+            return false
+        if hasPrefix(arg, "--root:"):
+            rootArg = substr(arg, len("--root:"), len(arg) - len("--root:"))
+        elif hasPrefix(arg, "--watch:"):
+            watchArg = substr(arg, len("--watch:"), len(arg) - len("--watch:"))
+        elif hasPrefix(arg, "--build:"):
+            buildCmd = substr(arg, len("--build:"), len(arg) - len("--build:"))
+        elif hasPrefix(arg, "--build-exts:"):
+            buildExtsRaw = substr(arg, len("--build-exts:"), len(arg) - len("--build-exts:"))
+        elif hasPrefix(arg, "--manifest-root:"):
+            manifestRootRaw = substr(arg, len("--manifest-root:"), len(arg) - len("--manifest-root:"))
+        elif hasPrefix(arg, "--manifest-out:"):
+            manifestOutRaw = substr(arg, len("--manifest-out:"), len(arg) - len("--manifest-out:"))
+        elif hasPrefix(arg, "--manifest-exts:"):
+            manifestExtsRaw = substr(arg, len("--manifest-exts:"), len(arg) - len("--manifest-exts:"))
+        elif hasPrefix(arg, "--routes-root:"):
+            routesRootRaw = substr(arg, len("--routes-root:"), len(arg) - len("--routes-root:"))
+        elif hasPrefix(arg, "--routes-out:"):
+            routesOutRaw = substr(arg, len("--routes-out:"), len(arg) - len("--routes-out:"))
+        elif hasPrefix(arg, "--routes-exts:"):
+            routesExtsRaw = substr(arg, len("--routes-exts:"), len(arg) - len("--routes-exts:"))
+        elif arg == "--spa":
+            spaRaw = "true"
+            spaSet = true
+        elif hasPrefix(arg, "--spa:"):
+            spaRaw = substr(arg, len("--spa:"), len(arg) - len("--spa:"))
+            spaSet = true
+        elif hasPrefix(arg, "--host:") || hasPrefix(arg, "--port:") || hasPrefix(arg, "--max-header:") || hasPrefix(arg, "--max-body:") || hasPrefix(arg, "--timeout-ms:"):
+            # handled by native_server.c
+            arg
+        else:
+            printErr("unknown arg: " + arg)
+            printUsage()
+            exitCode = 1
+            return false
+    if rootArg == nil || len(rootArg) == 0:
+        rootArg = resolveDefaultRoot()
+    let root = os.absolutePath(rootArg)
+    if ! os.dirExists(root):
+        printErr("root not found: " + root)
+        exitCode = 1
+        return false
+    if buildCmd == nil || len(buildCmd) == 0:
+        buildCmd = os.getEnv("WEB_BUILD")
+    let buildExtsText = if buildExtsRaw != nil && len(buildExtsRaw) > 0: buildExtsRaw else: os.getEnv("WEB_BUILD_EXTS")
+    let buildExts = parseExts(buildExtsText, ".cwc")
+    let watchRoot = if watchArg != nil && len(watchArg) > 0: resolveMaybeRelative(root, watchArg) else: resolveWatchRoot(root)
+    var spaValue: str = ""
+    if spaSet:
+        spaValue = spaRaw
+    else:
+        spaValue = os.getEnv("WEB_SPA")
+    if manifestRootRaw == nil || len(manifestRootRaw) == 0:
+        if routesRootRaw != nil && len(routesRootRaw) > 0:
+            manifestRootRaw = routesRootRaw
+        else:
+            manifestRootRaw = os.getEnv("WEB_MANIFEST_ROOT")
+            if manifestRootRaw == nil || len(manifestRootRaw) == 0:
+                manifestRootRaw = os.getEnv("WEB_ROUTES_ROOT")
+    if manifestOutRaw == nil || len(manifestOutRaw) == 0:
+        if routesOutRaw != nil && len(routesOutRaw) > 0:
+            manifestOutRaw = routesOutRaw
+        else:
+            manifestOutRaw = os.getEnv("WEB_MANIFEST_OUT")
+            if manifestOutRaw == nil || len(manifestOutRaw) == 0:
+                manifestOutRaw = os.getEnv("WEB_ROUTES_OUT")
+    if manifestExtsRaw == nil || len(manifestExtsRaw) == 0:
+        if routesExtsRaw != nil && len(routesExtsRaw) > 0:
+            manifestExtsRaw = routesExtsRaw
+        else:
+            manifestExtsRaw = os.getEnv("WEB_MANIFEST_EXTS")
+            if manifestExtsRaw == nil || len(manifestExtsRaw) == 0:
+                manifestExtsRaw = os.getEnv("WEB_ROUTES_EXTS")
+    var manifestRoot: str = ""
+    var manifestOut: str = ""
+    if manifestRootRaw != nil && len(manifestRootRaw) > 0:
+        manifestRoot = resolveMaybeRelative(root, manifestRootRaw)
+        if manifestOutRaw != nil && len(manifestOutRaw) > 0:
+            manifestOut = resolveMaybeRelative(root, manifestOutRaw)
+        else:
+            manifestOut = os.joinPath(manifestRoot, "routes_manifest.cheng")
+        if ! os.dirExists(manifestRoot):
+            printErr("[dev] manifest root not found: " + manifestRoot)
+            manifestRoot = ""
+            manifestOut = ""
+    let manifestExts = parseExts(manifestExtsRaw, ".cwc,.cheng")
+    cfg.root = root
+    cfg.watch = watchRoot
+    cfg.buildCmd = buildCmd
+    cfg.buildExts = buildExts
+    cfg.manifestRoot = manifestRoot
+    cfg.manifestOut = manifestOut
+    cfg.manifestExts = manifestExts
+    cfg.spaFallback = parseBool(spaValue, false)
+    cfg.devClientScript = loadDevClientScript()
+    state.inited = true
+    state.reloadSeq = 0
+    state.lastError = ""
+    state.lastReloadKind = "full"
+    registerServerApp(handleDevRequest)
+    printLine("[dev] root: " + cfg.root)
+    if cfg.watch != nil && len(cfg.watch) > 0:
+        printLine("[dev] watch: " + cfg.watch)
+    if cfg.buildCmd != nil && len(cfg.buildCmd) > 0:
+        printLine("[dev] build: " + cfg.buildCmd)
+    if cfg.spaFallback:
+        printLine("[dev] spa fallback: on")
+    if cfg.manifestRoot != nil && len(cfg.manifestRoot) > 0:
+        printLine("[dev] manifest root: " + cfg.manifestRoot)
+        printLine("[dev] manifest out: " + cfg.manifestOut)
+    if cfg.manifestRoot != nil && len(cfg.manifestRoot) > 0:
+        let manifestErr = rmanifest.generateRouteManifest(cfg.manifestRoot, cfg.manifestOut, cfg.manifestExts)
+        if manifestErr != nil && len(manifestErr) > 0:
+            state.lastError = manifestErr
+    if cfg.buildCmd != nil && len(cfg.buildCmd) > 0 && (state.lastError == nil || len(state.lastError) == 0):
+        let buildErr = runBuild(cfg.buildCmd, cfg.root)
+        if buildErr != nil && len(buildErr) > 0:
+            state.lastError = buildErr
+    refreshSignatures()
+    return true
+
+fn initDevServer(): bool =
+    let args = collectArgsFromCmdline()
+    return initDevServerArgs(args)
+
+fn devServerExitCode(): int32 =
+    return exitCode

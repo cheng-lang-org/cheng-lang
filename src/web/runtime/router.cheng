@@ -1,0 +1,350 @@
+import cheng/web/runtime/abi
+import cheng/web/runtime/signals as sig
+import cheng/web/runtime/events
+import cheng/web/runtime/async as async_rt
+import cheng/web/std/web_history
+import cheng/web/router/router
+import std/strings
+
+type
+    RouterState = ref
+        routes: Route[]
+        path: sig.Signal[str]
+        handlerId: WebHandler
+
+    RouteLoadContext =
+        id: int32
+        path: str
+        query: str
+        hash: str
+        params: RouteParams
+        result: sig.Signal[RouteLoadResult]
+        queryParams: QueryParams
+        task: async_rt.AsyncTask
+
+    RouteLoadResult =
+        ok: bool
+        pending: bool
+        data: str
+        error: str
+
+    RouteLoadFn = fn (ctx: RouteLoadContext): RouteLoadResult
+
+    RouteMount = fn (root: WebNode, params: RouteParams, data: RouteLoadResult): int32
+    RouteUpdate = fn (handle: int32, params: RouteParams, data: RouteLoadResult)
+    RouteUnmount = fn (handle: int32)
+
+    RouteComponentEntry =
+        id: int32
+        path: str
+        load: RouteLoadFn
+        mount: RouteMount
+        update: RouteUpdate
+        unmount: RouteUnmount
+
+    RouteRegistryEntry =
+        id: int32
+        load: RouteLoadFn
+        mount: RouteMount
+        update: RouteUpdate
+        unmount: RouteUnmount
+
+    RouteRegistry = ref
+        items: RouteRegistryEntry[]
+
+    RouterOutlet = ref
+        state: RouterState
+        root: WebNode
+        entries: RouteComponentEntry[]
+        currentId: int32
+        currentHandle: int32
+        loadSignal: sig.Signal[RouteLoadResult]
+        loadTask: async_rt.AsyncTask
+        loadEffect: sig.Effect
+        effect: sig.Effect
+
+fn normalizePath(path: str): str =
+    if path == nil || len(path) == 0:
+        return "/"
+    if path[0] != '/':
+        return "/" + path
+    return path
+
+fn loadOk(data: str): RouteLoadResult =
+    var res: RouteLoadResult
+    res.ok = true
+    res.pending = false
+    res.data = data
+    res.error = ""
+    return res
+
+fn loadError(message: str): RouteLoadResult =
+    var res: RouteLoadResult
+    res.ok = false
+    res.pending = false
+    res.data = ""
+    res.error = message
+    return res
+
+fn loadPending(): RouteLoadResult =
+    var res: RouteLoadResult
+    res.ok = false
+    res.pending = true
+    res.data = ""
+    res.error = ""
+    return res
+
+fn routeActive(ctx: RouteLoadContext): bool =
+    if ctx.task == nil:
+        return true
+    return ! async_rt.asyncCancelled(ctx.task)
+
+fn routeSetResult(ctx: RouteLoadContext, result: RouteLoadResult) =
+    if ctx.result == nil:
+        return
+    if ctx.task != nil && async_rt.asyncCancelled(ctx.task):
+        return
+    sig.set(ctx.result, result)
+
+fn buildLoadContext(state: RouterState, match: RouteMatch): RouteLoadContext =
+    var ctx: RouteLoadContext
+    ctx.id = match.id
+    ctx.result = nil
+    ctx.task = nil
+    if state == nil:
+        return ctx
+    let raw = sig.get(state.path)
+    let info = parsePathInfo(raw)
+    ctx.path = info.path
+    ctx.query = info.query
+    ctx.hash = info.hash
+    ctx.params = match.params
+    ctx.queryParams = info.queryParams
+    return ctx
+
+fn newRouter(routes: Route[]): RouterState =
+    var state: RouterState
+    new(state)
+    state.routes = routes
+    state.path = sig.signal[str]("/")
+    let handler = fn (ev: WebEvent) =
+        let raw = eventPath(ev)
+        let next = normalizePath(raw)
+        if len(next) > 0:
+            sig.set(state.path, next)
+    state.handlerId = registerHandler(handler, false)
+    webHistoryListen(state.handlerId)
+    return state
+
+fn disposeRouter(state: RouterState) =
+    if state == nil:
+        return
+    if state.handlerId != 0:
+        webHistoryUnlisten(state.handlerId)
+        unregisterHandler(state.handlerId)
+        state.handlerId = 0
+
+fn routerPathSignal(state: RouterState): (&sig.Signal)[str] =
+    if state == nil:
+        return nil
+    return state.path
+
+fn routerPath(state: RouterState): str =
+    if state == nil:
+        return ""
+    return sig.get(state.path)
+
+fn routerMatch(state: RouterState): RouteMatch =
+    if state == nil:
+        var miss: RouteMatch
+        miss.ok = false
+        miss.id = -1
+        miss.params.items = []
+        return miss
+    return matchRoutes(state.routes, sig.get(state.path))
+
+fn routerNavigate(state: RouterState, path: str) =
+    if state == nil:
+        return
+    let next = normalizePath(path)
+    webHistoryPush(next)
+    sig.set(state.path, next)
+
+fn routerReplace(state: RouterState, path: str) =
+    if state == nil:
+        return
+    let next = normalizePath(path)
+    webHistoryReplace(next)
+    sig.set(state.path, next)
+
+fn newRouteRegistry(): RouteRegistry =
+    var reg: RouteRegistry
+    new(reg)
+    reg.items = []
+    return reg
+
+fn registerRouteFull(reg: RouteRegistry, id: int32, load: RouteLoadFn, mount: RouteMount, update: RouteUpdate, unmount: RouteUnmount) =
+    if reg == nil || id <= 0:
+        return
+    var entry: RouteRegistryEntry
+    entry.id = id
+    entry.load = load
+    entry.mount = mount
+    entry.update = update
+    entry.unmount = unmount
+    reg.items.add(entry)
+
+fn registerRoute(reg: RouteRegistry, id: int32, mount: RouteMount, update: RouteUpdate, unmount: RouteUnmount) =
+    registerRouteFull(reg, id, nil, mount, update, unmount)
+
+fn findRouteId(entries: RouteEntry[], path: str): int32 =
+    if path == nil:
+        return 0
+    for i in 0..<len(entries):
+        if entries[i].path == path:
+            return entries[i].id
+    return 0
+
+fn registerRouteByPathFull(reg: RouteRegistry, entries: RouteEntry[], path: str, load: RouteLoadFn, mount: RouteMount, update: RouteUpdate, unmount: RouteUnmount) =
+    let id = findRouteId(entries, path)
+    if id <= 0:
+        return
+    registerRouteFull(reg, id, load, mount, update, unmount)
+
+fn registerRouteByPath(reg: RouteRegistry, entries: RouteEntry[], path: str, mount: RouteMount, update: RouteUpdate, unmount: RouteUnmount) =
+    registerRouteByPathFull(reg, entries, path, nil, mount, update, unmount)
+
+fn findRegistryIndex(reg: RouteRegistry, id: int32): int32 =
+    if reg == nil:
+        return -1
+    for i in 0..<len(reg.items):
+        if reg.items[i].id == id:
+            return i
+    return -1
+
+fn buildRouteEntries(entries: RouteEntry[], reg: RouteRegistry): RouteComponentEntry[] =
+    var out: RouteComponentEntry[] 
+    for i in 0..<len(entries):
+        let item = entries[i]
+        var next: RouteComponentEntry
+        next.id = item.id
+        next.path = item.path
+        let idx = findRegistryIndex(reg, item.id)
+        if idx >= 0:
+            let regEntry = reg.items[idx]
+            next.load = regEntry.load
+            next.mount = regEntry.mount
+            next.update = regEntry.update
+            next.unmount = regEntry.unmount
+        out.add(next)
+    return out
+
+fn findRouteIndex(entries: RouteComponentEntry[], id: int32): int32 =
+    for i in 0..<len(entries):
+        if entries[i].id == id:
+            return i
+    return -1
+
+fn disposeLoadEffect(outlet: RouterOutlet) =
+    if outlet == nil:
+        return
+    if outlet.loadEffect != nil:
+        sig.dispose(outlet.loadEffect)
+        outlet.loadEffect = nil
+    outlet.loadSignal = nil
+    if outlet.loadTask != nil:
+        async_rt.asyncCancel(outlet.loadTask)
+        outlet.loadTask = nil
+
+fn applyRoute(outlet: RouterOutlet, match: RouteMatch) =
+    if outlet == nil:
+        return
+    if ! match.ok:
+        if outlet.currentId != -1:
+            let idx = findRouteIndex(outlet.entries, outlet.currentId)
+            if idx >= 0:
+                let entry = outlet.entries[idx]
+                if entry.unmount != nil:
+                    entry.unmount(outlet.currentHandle)
+        disposeLoadEffect(outlet)
+        outlet.currentId = -1
+        outlet.currentHandle = 0
+        return
+    let idx = findRouteIndex(outlet.entries, match.id)
+    if idx < 0:
+        return
+    let entry = outlet.entries[idx]
+    disposeLoadEffect(outlet)
+    let loadSignal = sig.signal[RouteLoadResult](loadOk(""))
+    outlet.loadSignal = loadSignal
+    let loadTask = async_rt.asyncTask()
+    outlet.loadTask = loadTask
+    var ctx = buildLoadContext(outlet.state, match)
+    ctx.result = loadSignal
+    ctx.task = loadTask
+    var data = loadOk("")
+    if entry.load != nil:
+        data = entry.load(ctx)
+    sig.set(loadSignal, data)
+    let dataNow = sig.get(loadSignal)
+    if match.id != outlet.currentId:
+        if outlet.currentId != -1:
+            let prevIdx = findRouteIndex(outlet.entries, outlet.currentId)
+            if prevIdx >= 0:
+                let prev = outlet.entries[prevIdx]
+                if prev.unmount != nil:
+                    prev.unmount(outlet.currentHandle)
+        outlet.currentId = match.id
+        outlet.currentHandle = 0
+        if entry.mount != nil:
+            outlet.currentHandle = entry.mount(outlet.root, match.params, dataNow)
+    else:
+        if entry.update != nil:
+            entry.update(outlet.currentHandle, match.params, dataNow)
+    if entry.load != nil:
+        var first: bool = true
+        let currentId = match.id
+        let params = match.params
+        let effectFn = fn () =
+            let result = sig.get(loadSignal)
+            if first:
+                first = false
+                return
+            if outlet.currentId != currentId:
+                return
+            if entry.update != nil:
+                entry.update(outlet.currentHandle, params, result)
+        outlet.loadEffect = sig.effect(effectFn)
+
+fn newRouterOutlet(root: WebNode, state: RouterState, entries: RouteComponentEntry[]): RouterOutlet =
+    var outlet: RouterOutlet
+    new(outlet)
+    outlet.state = state
+    outlet.root = root
+    outlet.entries = entries
+    outlet.currentId = -1
+    outlet.currentHandle = 0
+    outlet.loadSignal = nil
+    outlet.loadTask = nil
+    outlet.loadEffect = nil
+    let onChange = fn () =
+        let match = routerMatch(state)
+        applyRoute(outlet, match)
+    outlet.effect = sig.effect(onChange)
+    return outlet
+
+fn disposeRouterOutlet(outlet: RouterOutlet) =
+    if outlet == nil:
+        return
+    if outlet.effect != nil:
+        sig.dispose(outlet.effect)
+        outlet.effect = nil
+    disposeLoadEffect(outlet)
+    if outlet.currentId != -1:
+        let idx = findRouteIndex(outlet.entries, outlet.currentId)
+        if idx >= 0:
+            let entry = outlet.entries[idx]
+            if entry.unmount != nil:
+                entry.unmount(outlet.currentHandle)
+    outlet.currentId = -1
+    outlet.currentHandle = 0

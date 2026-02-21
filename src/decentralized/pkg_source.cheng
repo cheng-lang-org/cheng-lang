@@ -1,0 +1,544 @@
+import std/os
+import std/times
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import cheng/decentralized/cid as dcid
+import cheng/decentralized/file_bytes as fbytes
+import cheng/libp2p/main as libp2p
+import cheng/libp2p/muxers/muxer as muxer
+import cheng/libp2p/stream/lpstream as lpstream
+import cheng/libp2p/protocols/protocol as proto
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import std/tables_compat as tables
+import std/strings
+import std/seqs
+import std/system
+
+const
+    PkgSourceManifestKind = "cheng-pkg-source"
+    PkgSourceCodec = "/cheng/pkg-source/1.0.0"
+    PkgSourceDefaultMaxRequest = 16384
+    PkgSourceDefaultChunk = 262144
+
+    PkgSourceStatusOk = "ok"
+    PkgSourceStatusNotFound = "not_found"
+    PkgSourceStatusInvalid = "invalid"
+
+    DefaultExcludeCount = 10
+
+type
+    SourceFile =
+        path: str
+        cidText: str
+        sizeBytes: int64
+
+    SourceManifest =
+        kind: str
+        packageId: str
+        createdTs: str
+        sourceAddrs: str[]
+        files: SourceFile[]
+
+    PkgSourceConfig =
+        maxRequestBytes: int32
+        maxChunkBytes: int32
+
+    PkgSourceHeader =
+        status: str
+        size: int64
+        errText: str
+
+    PkgSourceContext =
+        ready: bool
+        root: str
+        index: tables.Table[str]
+        config: PkgSourceConfig
+
+var
+    pkgSourceContext: PkgSourceContext
+
+fn initPkgSourceConfig(): PkgSourceConfig =
+    PkgSourceConfig(maxRequestBytes: PkgSourceDefaultMaxRequest, maxChunkBytes: PkgSourceDefaultChunk)
+
+fn normalizePathSlashes(path: str): str =
+    if path == nil:
+        return ""
+    var out: str = ""
+    for i in 0..<len(path):
+        var ch = path[i]
+        if ch == '\\':
+            ch = '/'
+        out = out + charToStr(ch)
+    return out
+
+fn trimTrailingSlash(path: str): str =
+    if path == nil || len(path) == 0:
+        return ""
+    var end = len(path) - 1
+    while end >= 0:
+        if path[end] != '/':
+            break
+        end = end - 1
+    if end < 0:
+        return ""
+    return path[0..end]
+
+fn relPathFromRoot(path: str, root: str): str =
+    if path == nil || root == nil:
+        return ""
+    var absRoot = normalizePathSlashes(trimTrailingSlash(os.absolutePath(root)))
+    var absPath = normalizePathSlashes(os.absolutePath(path))
+    if ! strutil.startsWith(absPath, absRoot):
+        return normalizePathSlashes(path)
+    var start = len(absRoot)
+    if start < len(absPath) && absPath[start] == '/':
+        start = start + 1
+    if start >= len(absPath):
+        return ""
+    return absPath[start..len(absPath) - 1]
+
+fn defaultSourceExcludes(): str[] =
+    var out: str[] 
+    out.add(".git")
+    out.add("chengcache")
+    out.add(".cheng-cache")
+    out.add("build")
+    out.add("dist")
+    out.add("out")
+    out.add("tmp")
+    out.add("tmp_build")
+    out.add("__pycache__")
+    out.add(".DS_Store")
+    return out
+
+fn segmentExcluded(seg: str, excludes: str[]): bool =
+    if seg == nil || len(seg) == 0:
+        return false
+    for i in 0..<excludes.len:
+        let ex = excludes[i]
+        if ex != nil && len(ex) > 0 && seg == ex:
+            return true
+    return false
+
+fn containsPathTraversal(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    let norm = normalizePathSlashes(path)
+    let parts = strutil.split(norm, '/')
+    for i in 0..<parts.len:
+        if parts[i] == "..":
+            return true
+    return false
+
+fn shouldExcludePath(relPath: str, excludes: str[]): bool =
+    if relPath == nil || len(relPath) == 0:
+        return true
+    let norm = normalizePathSlashes(relPath)
+    if containsPathTraversal(norm):
+        return true
+    let parts = strutil.split(norm, '/')
+    for i in 0..<parts.len:
+        let part = parts[i]
+        if segmentExcluded(part, excludes):
+            return true
+    return false
+
+fn sortSourceFiles(files: var SourceFile[]) =
+    for i in 0..<files.len:
+        for j in i + 1..<files.len:
+            let a = files[i]
+            let b = files[j]
+            if cmp(a.path, b.path) > 0:
+                files[i] = b
+                files[j] = a
+
+fn buildSourceManifest(root: str, packageId: str, sourceAddrs: str[], extraExcludes: str[]): result.Result[SourceManifest] =
+    if root == nil || len(root) == 0:
+        return result.Err[SourceManifest]("pkg-source: missing root")
+    if packageId == nil || len(packageId) == 0:
+        return result.Err[SourceManifest]("pkg-source: missing package_id")
+    let absRoot = trimTrailingSlash(os.absolutePath(root))
+    if absRoot == nil || len(absRoot) == 0:
+        return result.Err[SourceManifest]("pkg-source: invalid root")
+    if ! os.dirExists(absRoot):
+        return result.Err[SourceManifest]("pkg-source: root not found")
+    var excludes = defaultSourceExcludes()
+    for i in 0..<extraExcludes.len:
+        let ex = extraExcludes[i]
+        if ex != nil && len(ex) > 0:
+            excludes.add(ex)
+    let paths = os.walkDirRec(absRoot)
+    var files: SourceFile[] 
+    for p in 0..<paths.len:
+        let path = paths[p]
+        if os.dirExists(path):
+            continue
+        let rel = relPathFromRoot(path, absRoot)
+        if rel == nil || len(rel) == 0:
+            continue
+        let relNorm = normalizePathSlashes(rel)
+        if shouldExcludePath(relNorm, excludes):
+            continue
+        let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(path)
+        if result.IsErr(dataRes):
+            return result.Err[SourceManifest](result.Error(dataRes))
+        let data = result.Value(dataRes)
+        let cidRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+        if result.IsErr(cidRes):
+            return result.Err[SourceManifest](result.Error(cidRes))
+        let cidText = dcid.cidText(result.Value(cidRes))
+        if cidText == nil || len(cidText) == 0:
+            return result.Err[SourceManifest]("pkg-source: cid encode failed")
+        add[SourceFile](files, SourceFile(path: relNorm, cidText: cidText, sizeBytes: int64(bytes.bytesLen(data))))
+    sortSourceFiles(files)
+    var manifest: SourceManifest
+    manifest.kind = PkgSourceManifestKind
+    manifest.packageId = packageId
+    manifest.createdTs = times.now().format("unix")
+    manifest.sourceAddrs = sourceAddrs
+    manifest.files = files
+    return result.Ok[SourceManifest](manifest)
+
+fn manifestToJson(manifest: SourceManifest): json.JsonNode =
+    let root = json.newJObject()
+    root["type"] = json.newJString(manifest.kind)
+    root["package_id"] = json.newJString(manifest.packageId)
+    if manifest.createdTs != nil && len(manifest.createdTs) > 0:
+        root["created_ts"] = json.newJString(manifest.createdTs)
+    let addrs = json.newJArray()
+    for i in 0..<manifest.sourceAddrs.len:
+        let addr = manifest.sourceAddrs[i]
+        if addr != nil && len(addr) > 0:
+            addrs.add(json.newJString(addr))
+    root["source_addrs"] = addrs
+    let files = json.newJArray()
+    for j in 0..<manifest.files.len:
+        let f = manifest.files[j]
+        let node = json.newJObject()
+        node["path"] = json.newJString(f.path)
+        node["cid"] = json.newJString(f.cidText)
+        node["size"] = json.newJInt(f.sizeBytes)
+        files.add(node)
+    root["files"] = files
+    root
+
+fn manifestToText(manifest: SourceManifest): str =
+    return json.pretty(manifestToJson(manifest))
+
+fn parseSourceManifestNode(root: json.JsonNode): result.Result[SourceManifest] =
+    if root == nil || root.kind != json.JObject:
+        return result.Err[SourceManifest]("pkg-source: manifest invalid")
+    let kind = jparse.getStringField(root, "type", "")
+    if kind != PkgSourceManifestKind:
+        return result.Err[SourceManifest]("pkg-source: manifest type mismatch")
+    var manifest: SourceManifest
+    manifest.kind = kind
+    manifest.packageId = jparse.getStringField(root, "package_id", "")
+    manifest.createdTs = jparse.getStringField(root, "created_ts", "")
+    manifest.sourceAddrs = []
+    let addrs = root["source_addrs"]
+    if addrs != nil && addrs.kind == json.JArray:
+        for a in 0..<addrs.a.len:
+            let node = addrs.a[a]
+            if node != nil && node.kind == json.JString:
+                let addr = node.getStr()
+                if addr != nil && len(addr) > 0:
+                    manifest.sourceAddrs.add(addr)
+    manifest.files = []
+    let files = root["files"]
+    if files != nil && files.kind == json.JArray:
+        for i in 0..<files.a.len:
+            let node = files.a[i]
+            if node == nil || node.kind != json.JObject:
+                return result.Err[SourceManifest]("pkg-source: file entry invalid")
+            var f: SourceFile
+            f.path = normalizePathSlashes(jparse.getStringField(node, "path", ""))
+            f.cidText = jparse.getStringField(node, "cid", "")
+            f.sizeBytes = jparse.getIntField(node, "size", 0)
+            if f.path == nil || len(f.path) == 0:
+                return result.Err[SourceManifest]("pkg-source: file missing path")
+            if f.cidText == nil || len(f.cidText) == 0:
+                return result.Err[SourceManifest]("pkg-source: file missing cid")
+            manifest.files.add(f)
+    if manifest.packageId == nil || len(manifest.packageId) == 0:
+        return result.Err[SourceManifest]("pkg-source: manifest missing package_id")
+    return result.Ok[SourceManifest](manifest)
+
+fn parseSourceManifestText(content: str): result.Result[SourceManifest] =
+    let parsed: jparse.ParseResult = jparse.parseJsonSafe(content)
+    if ! parsed.ok:
+        return result.Err[SourceManifest](parsed.error)
+    return parseSourceManifestNode(parsed.value)
+
+fn loadSourceManifestFile(path: str): result.Result[SourceManifest] =
+    if path == nil || len(path) == 0:
+        return result.Err[SourceManifest]("pkg-source: missing manifest path")
+    if ! os.fileExists(path):
+        return result.Err[SourceManifest]("pkg-source: manifest not found")
+    let content = os.readFile(path)
+    if content == nil || len(content) == 0:
+        return result.Err[SourceManifest]("pkg-source: manifest empty")
+    return parseSourceManifestText(content)
+
+fn buildSourceIndex(manifest: SourceManifest): (&tables.Table)[str] =
+    var out: (&tables.Table)[str] = tables.TableInit[str](manifest.files.len * 2 + 8)
+    for i in 0..<manifest.files.len:
+        let f = manifest.files[i]
+        if f.cidText != nil && len(f.cidText) > 0:
+            tables.TablePut[str](out, f.cidText, f.path)
+    return out
+
+fn setPkgSourceContext(root: str, manifest: SourceManifest, config: PkgSourceConfig) =
+    pkgSourceContext.ready = false
+    pkgSourceContext.root = trimTrailingSlash(os.absolutePath(root))
+    pkgSourceContext.index = buildSourceIndex(manifest)
+    pkgSourceContext.config = config
+    pkgSourceContext.ready = true
+
+fn writePkgSourceHeader(stream: var libp2p.Stream, status: str, size: int64, errText: str): result.Result[bool] =
+    let node = json.newJObject()
+    node["status"] = json.newJString(status)
+    if size >= 0:
+        node["size"] = json.newJInt(size)
+    if errText != nil && len(errText) > 0:
+        node["error"] = json.newJString(errText)
+    let payload = json.pretty(node)
+    let writeRes: result.Result[int32] = lpstream.writeLp(stream, payload)
+    if result.IsErr(writeRes):
+        return result.Err[bool](result.Error(writeRes))
+    return result.Ok[bool](true)
+
+fn parsePkgSourceRequest(req: bytes.Bytes): result.Result[str] =
+    let text = bytes.bytesToString(req)
+    let parsed: jparse.ParseResult = jparse.parseJsonSafe(text)
+    if ! parsed.ok:
+        return result.Err[str](parsed.error)
+    let node = parsed.value
+    let cidText = jparse.getStringField(node, "cid", "")
+    if cidText == nil || len(cidText) == 0:
+        return result.Err[str]("pkg-source: missing cid")
+    return result.Ok[str](cidText)
+
+fn pkgSourceHandler(stream: var libp2p.Stream): result.Result[bool] =
+    if ! pkgSourceContext.ready:
+        return result.Err[bool]("pkg-source: missing context")
+    var reqRes: result.Result[bytes.Bytes] = lpstream.readLp(stream, pkgSourceContext.config.maxRequestBytes)
+    if result.IsErr(reqRes):
+        return result.Err[bool](result.Error(reqRes))
+    let cidRes: result.Result[str] = parsePkgSourceRequest(result.Value(reqRes))
+    reqRes = result.Err[bytes.Bytes]("")
+    if result.IsErr(cidRes):
+        writePkgSourceHeader(stream, PkgSourceStatusInvalid, -1, result.Error(cidRes))
+        return result.Ok[bool](true)
+    let cidText = result.Value(cidRes)
+    if ! tables.TableHas[str](pkgSourceContext.index, cidText):
+        writePkgSourceHeader(stream, PkgSourceStatusNotFound, -1, "not found")
+        return result.Ok[bool](true)
+    let relPath = tables.TableGet[str](pkgSourceContext.index, cidText)
+    if relPath == nil || len(relPath) == 0:
+        writePkgSourceHeader(stream, PkgSourceStatusNotFound, -1, "not found")
+        return result.Ok[bool](true)
+    if containsPathTraversal(relPath):
+        writePkgSourceHeader(stream, PkgSourceStatusInvalid, -1, "invalid path")
+        return result.Ok[bool](true)
+    let fullPath = os.joinPath(pkgSourceContext.root, relPath)
+    if ! os.fileExists(fullPath):
+        writePkgSourceHeader(stream, PkgSourceStatusNotFound, -1, "missing file")
+        return result.Ok[bool](true)
+    let dataRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(fullPath)
+    if result.IsErr(dataRes):
+        writePkgSourceHeader(stream, PkgSourceStatusInvalid, -1, "read failed")
+        return result.Ok[bool](true)
+    let data = result.Value(dataRes)
+    let checkRes: result.Result[dcid.Cid] = dcid.cidFromBytes(data)
+    if result.IsErr(checkRes):
+        writePkgSourceHeader(stream, PkgSourceStatusInvalid, -1, "cid failed")
+        return result.Ok[bool](true)
+    let checkText = dcid.cidText(result.Value(checkRes))
+    if checkText == nil || len(checkText) == 0 || checkText != cidText:
+        writePkgSourceHeader(stream, PkgSourceStatusInvalid, -1, "cid mismatch")
+        return result.Ok[bool](true)
+    let size = int64(bytes.bytesLen(data))
+    let headRes = writePkgSourceHeader(stream, PkgSourceStatusOk, size, "")
+    if result.IsErr(headRes):
+        return result.Err[bool](result.Error(headRes))
+    let chunkSize = if pkgSourceContext.config.maxChunkBytes > 0: pkgSourceContext.config.maxChunkBytes else: bytes.bytesLen(data)
+    var offset: int32 = 0
+    let total: int32 = bytes.bytesLen(data)
+    while offset < total:
+        var remaining = total - offset
+        var sizeChunk = if remaining > chunkSize: chunkSize else: remaining
+        let chunk = bytes.bytesSliceView(data, offset, sizeChunk)
+        let writeRes: result.Result[int32] = lpstream.writeLp(stream, chunk)
+        if result.IsErr(writeRes):
+            return result.Err[bool](result.Error(writeRes))
+        offset = offset + sizeChunk
+    return result.Ok[bool](true)
+
+fn pkgSourceProtocol(): proto.Protocol =
+    return proto.newProtocol(PkgSourceCodec, pkgSourceHandler)
+
+fn servePkgSource(manifest: SourceManifest, root: str, listenAddr: str, maxStreams: int32): result.Result[int32] =
+    let config = initPkgSourceConfig()
+    setPkgSourceContext(root, manifest, config)
+    var hostRes: result.Result[libp2p.Switch]
+    if listenAddr != nil && len(listenAddr) > 0:
+        hostRes = libp2p.newHostWithAddressText(listenAddr)
+    else:
+        hostRes = libp2p.newHost()
+    if result.IsErr(hostRes):
+        return result.Err[int32](result.Error(hostRes))
+    var host: libp2p.Switch = result.Value(hostRes)
+    let regRes: result.Result[bool] = libp2p.hostRegisterProtocol(host, pkgSourceProtocol())
+    if result.IsErr(regRes):
+        return result.Err[int32](result.Error(regRes))
+    let startRes: result.Result[bool] = libp2p.hostStart(host)
+    if result.IsErr(startRes):
+        return result.Err[int32](result.Error(startRes))
+    var handled: int32 = 0
+    while maxStreams <= 0 || handled < maxStreams:
+        let streamRes: result.Result[libp2p.Stream] = libp2p.hostAcceptStream(host)
+        if result.IsErr(streamRes):
+            if maxStreams > 0:
+                break
+            continue
+        var stream: libp2p.Stream = result.Value(streamRes)
+        libp2p.hostRunProtocolOnStream(host, stream)
+        muxer.closeStream(stream)
+        handled = handled + 1
+    libp2p.hostStop(host)
+    return result.Ok[int32](handled)
+
+fn ensureDirRecursive(path: str) =
+    if path == nil || len(path) == 0:
+        return
+    if os.dirExists(path):
+        return
+    let abs = normalizePathSlashes(os.absolutePath(path))
+    let parts = strutil.split(abs, '/')
+    var cur: str = ""
+    if len(abs) > 0 && abs[0] == '/':
+        cur = "/"
+    for i in 0..<parts.len:
+        let part = parts[i]
+        if part == nil || len(part) == 0:
+            continue
+        if len(cur) == 0:
+            cur = part
+        elif cur == "/":
+            cur = cur + part
+        else:
+            cur = cur + "/" + part
+        if ! os.dirExists(cur):
+            os.createDir(cur)
+
+fn readPkgSourceHeader(stream: var libp2p.Stream, maxSize: int32): result.Result[PkgSourceHeader] =
+    let headRes: result.Result[bytes.Bytes] = lpstream.readLp(stream, maxSize)
+    if result.IsErr(headRes):
+        return result.Err[PkgSourceHeader](result.Error(headRes))
+    let text = bytes.bytesToString(result.Value(headRes))
+    let parsed: jparse.ParseResult = jparse.parseJsonSafe(text)
+    if ! parsed.ok:
+        return result.Err[PkgSourceHeader](parsed.error)
+    let node = parsed.value
+    var header: PkgSourceHeader
+    header.status = jparse.getStringField(node, "status", "")
+    header.size = jparse.getIntField(node, "size", -1)
+    header.errText = jparse.getStringField(node, "error", "")
+    return result.Ok[PkgSourceHeader](header)
+
+fn fetchSourceFile(host: var libp2p.Switch, peer: str, outDir: str, f: SourceFile, config: PkgSourceConfig): result.Result[bool] =
+    if containsPathTraversal(f.path):
+        return result.Err[bool]("fetch: invalid path")
+    let streamRes: result.Result[libp2p.Stream] = libp2p.hostOpenProtocolStreamToAddressText(host, peer, PkgSourceCodec)
+    if result.IsErr(streamRes):
+        return result.Err[bool](result.Error(streamRes))
+    var stream: libp2p.Stream = result.Value(streamRes)
+    let reqNode = json.newJObject()
+    reqNode["cid"] = json.newJString(f.cidText)
+    let reqText = json.pretty(reqNode)
+    let writeRes: result.Result[int32] = lpstream.writeLp(stream, reqText)
+    if result.IsErr(writeRes):
+        muxer.closeStream(stream)
+        return result.Err[bool](result.Error(writeRes))
+    let headRes = readPkgSourceHeader(stream, config.maxRequestBytes)
+    if result.IsErr(headRes):
+        muxer.closeStream(stream)
+        return result.Err[bool](result.Error(headRes))
+    let header = result.Value(headRes)
+    if header.status != PkgSourceStatusOk:
+        muxer.closeStream(stream)
+        let errMsg = if header.errText != nil && len(header.errText) > 0: header.errText else: "fetch failed"
+        return result.Err[bool](errMsg)
+    let totalSize: int64 = header.size
+    if totalSize < 0:
+        muxer.closeStream(stream)
+        return result.Err[bool]("fetch: invalid size")
+    let outPath = os.joinPath(outDir, normalizePathSlashes(f.path))
+    let parent = os.parentDir(outPath)
+    if parent != nil && len(parent) > 0:
+        ensureDirRecursive(parent)
+    var offset: int64 = 0
+    let chunkLimit = if config.maxChunkBytes > 0: config.maxChunkBytes else: PkgSourceDefaultChunk
+    while totalSize < 0 || offset < totalSize:
+        let chunkRes: result.Result[bytes.Bytes] = lpstream.readLp(stream, chunkLimit)
+        if result.IsErr(chunkRes):
+            muxer.closeStream(stream)
+            return result.Err[bool](result.Error(chunkRes))
+        let chunk = result.Value(chunkRes)
+        let wroteRes: result.Result[bool] = fbytes.writeFileSlice(outPath, offset, chunk)
+        if result.IsErr(wroteRes):
+            muxer.closeStream(stream)
+            return result.Err[bool](result.Error(wroteRes))
+        offset = offset + int64(bytes.bytesLen(chunk))
+        if totalSize >= 0 && offset >= totalSize:
+            break
+    muxer.closeStream(stream)
+    let verifyRes: result.Result[bytes.Bytes] = fbytes.readFileBytes(outPath)
+    if result.IsErr(verifyRes):
+        return result.Err[bool](result.Error(verifyRes))
+    let cidRes: result.Result[dcid.Cid] = dcid.cidFromBytes(result.Value(verifyRes))
+    if result.IsErr(cidRes):
+        return result.Err[bool](result.Error(cidRes))
+    let cidText = dcid.cidText(result.Value(cidRes))
+    if cidText != f.cidText:
+        return result.Err[bool]("fetch: cid mismatch")
+    return result.Ok[bool](true)
+
+fn fetchPkgSource(manifest: SourceManifest, outDir: str, peers: str[], listenAddr: str): result.Result[int32] =
+    if outDir == nil || len(outDir) == 0:
+        return result.Err[int32]("pkg-source: missing out dir")
+    if peers.len == 0:
+        return result.Err[int32]("pkg-source: missing peers")
+    let config = initPkgSourceConfig()
+    var hostRes: result.Result[libp2p.Switch]
+    if listenAddr != nil && len(listenAddr) > 0:
+        hostRes = libp2p.newHostWithAddressText(listenAddr)
+    else:
+        hostRes = libp2p.newHost()
+    if result.IsErr(hostRes):
+        return result.Err[int32](result.Error(hostRes))
+    var host: libp2p.Switch = result.Value(hostRes)
+    let startRes: result.Result[bool] = libp2p.hostStart(host)
+    if result.IsErr(startRes):
+        return result.Err[int32](result.Error(startRes))
+    ensureDirRecursive(outDir)
+    var fetched: int32 = 0
+    for i in 0..<manifest.files.len:
+        let f = manifest.files[i]
+        var ok: bool = false
+        for p in 0..<peers.len:
+            let peer = peers[p]
+            if peer != nil && len(peer) > 0:
+                let res: result.Result[bool] = fetchSourceFile(host, peer, outDir, f, config)
+                if result.IsOk(res):
+                    ok = true
+                    break
+        if ! ok:
+            libp2p.hostStop(host)
+            return result.Err[int32]("pkg-source: fetch failed")
+        fetched = fetched + 1
+    libp2p.hostStop(host)
+    return result.Ok[int32](fetched)

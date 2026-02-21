@@ -1,0 +1,157 @@
+import cheng/ast
+import cheng/borrow_annotations
+import cheng/semantics/core
+
+type
+    SemResult =
+        moduleName: str
+        symbols: SemSymbolInfo[]
+        procEffects: ProcEffectInfo[]
+        typeInfos: TypeInfo[]
+        diagnostics: Diagnostic[]
+        borrowAnnotations: BorrowAnnotationBuffer
+        borrowSummary: BorrowAnnotationSummary
+        borrowModule: BorrowModule
+
+fn hasErrors(res: SemResult): bool =
+    for diag in res.diagnostics:
+        if diag.severity == ssError:
+            return true
+    return false
+
+fn effectName(eff: EffectKind): str =
+    case eff
+    of ekUnknown:
+        "unknown"
+
+fn startsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn stripLeading(text: str): str =
+    var idx: int32 = 0
+    for __for_idx in 0..<len(text):
+        if !(text[__for_idx] == ' ' || text[__for_idx] == '\t'):
+            break
+        idx = __for_idx + 1
+    if idx == 0:
+        return text
+    if idx >= len(text):
+        return ""
+    return text[idx..len(text) - 1]
+
+fn splitLines(text: str): str[] =
+    var out: str[] 
+    var start: int32 = 0
+    for i in 0..<len(text):
+        if text[i] == '\n':
+            var endIdx: int32 = i
+            if endIdx > start && text[endIdx - 1] == '\r':
+                endIdx = endIdx - 1
+            if endIdx >= start:
+                out.add(text[start..endIdx - 1])
+            else:
+                out.add("")
+            start = i + 1
+    if start <= len(text) - 1:
+        out.add(text[start..len(text) - 1])
+    elif start == len(text):
+        out.add("")
+    return out
+
+fn isIdentChar(ch: char): bool =
+    (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'
+
+fn extractFirstIdent(line: str, start: int): tuple[name: str, col: int] =
+    var i: int32 = start
+    for __for_i in i..<len(line):
+        if !(line[__for_i] == ' ' || line[__for_i] == '\t'):
+            break
+        i = __for_i + 1
+    let col: int32 = i + 1
+    var name: str = ""
+    let __for_guard_start_i_1 = i
+    for __for_guard_i_1 in __for_guard_start_i_1..<len(line):
+        if ! (i < len(line)):
+            break
+        let ch: char = line[i]
+        if isIdentChar(ch):
+            name = name + $ ch
+            i = i + 1
+        else:
+            break
+    (name: name, col: col)
+
+fn analyzeModule(module: Node, annotations: BorrowAnnotationBuffer): SemResult =
+    var res: SemResult = SemResult()
+    res.moduleName = if module != nil: module.filename else: ""
+    res.symbols = []
+    res.procEffects = []
+    res.typeInfos = []
+    res.diagnostics = []
+    res.borrowAnnotations = annotations
+    res.borrowSummary = BorrowAnnotationSummary()
+    var borrowModule: BorrowModule = BorrowModule()
+    borrowModule.nodes = []
+    res.borrowModule = borrowModule
+    if module == nil:
+        return res
+
+    let lines: str[] = splitLines(module.source)
+    for lineIdx in 0..<len(lines):
+        let raw: str = lines[lineIdx]
+        let trimmed: str = stripLeading(raw)
+        if len(trimmed) == 0:
+            continue
+        var kind: SymbolKind = skModule
+        var offset: int32 = 0
+        if startsWith(trimmed, "async fn"):
+            kind = skProc
+            offset = len("async fn")
+        elif startsWith(trimmed, "fn"):
+            kind = skProc
+            offset = len("fn")
+        elif startsWith(trimmed, "macro"):
+            kind = skMacro
+            offset = len("macro")
+        elif startsWith(trimmed, "let"):
+            kind = skLet
+            offset = len("let")
+        elif startsWith(trimmed, "var"):
+            kind = skVar
+            offset = len("var")
+        elif startsWith(trimmed, "const"):
+            kind = skConst
+            offset = len("const")
+        else:
+            continue
+
+        let ident: tuple[name: str, col: int] = extractFirstIdent(trimmed, offset)
+        let name: str = ident.name
+        if len(name) == 0:
+            continue
+        let cleanName: str = name
+        var exported: bool = false
+        if len(cleanName) > 0:
+            let head: char = cleanName[0]
+            exported = head >= 'A' && head <= 'Z'
+        var sym: SemSymbolInfo = SemSymbolInfo()
+        sym.name = cleanName
+        sym.kind = kind
+        sym.storage = "global"
+        sym.mutable = kind == skVar
+        sym.exported = exported
+        sym.isAsync = startsWith(trimmed, "async fn")
+        sym.typeName = ""
+        sym.scopePath = ""
+        var pos: SourcePos = SourcePos()
+        pos.file = if module != nil: module.filename else: ""
+        pos.line = lineIdx + 1
+        pos.col = ident.col
+        sym.pos = pos
+        res.symbols.add(sym)
+    return res

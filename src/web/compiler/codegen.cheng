@@ -1,0 +1,622 @@
+import cheng/web/compiler/template_ast
+import cheng/web/compiler/text_utils
+import std/strings
+
+# Simple str builder
+
+type
+    StrBuilder =
+        buf: void*
+        len: int32
+        cap: int32
+
+fn initBuilder(capacity: int32): StrBuilder =
+    var cap: int32 = capacity
+    if cap < 64:
+        cap = 64
+    var b: StrBuilder
+    b.cap = cap
+    b.len = 0
+    b.buf = alloc(cap + 1)
+    setMem(b.buf, 0, cap + 1)
+    return b
+
+fn ensureCap(b: StrBuilder*, additional: int32) =
+    if additional <= 0:
+        return
+    let need: int32 = b->len + additional + 1
+    if need <= b->cap:
+        return
+    var newCap: int32 = b->cap
+    while newCap < need:
+        newCap = newCap * 2
+    b->buf = realloc(b->buf, newCap + 1)
+    b->cap = newCap
+
+fn addBytes(b: StrBuilder*, src: void*, n: int32) =
+    if n <= 0:
+        return
+    ensureCap(b, n)
+    copyMem(ptr_add(b->buf, b->len), src, n)
+    b->len = b->len + n
+    setMem(ptr_add(b->buf, b->len), 0, 1)
+
+fn addStr(b: StrBuilder*, s: str) =
+    if s == nil:
+        return
+    addBytes(b, s, len(s))
+
+fn addChar(b: StrBuilder*, c: char) =
+    ensureCap(b, 1)
+    let p: int8* = int8*(ptr_add(b->buf, b->len))
+    *p = int8(c)
+    b->len = b->len + 1
+    setMem(ptr_add(b->buf, b->len), 0, 1)
+
+fn addLine(b: StrBuilder*, s: str) =
+    addStr(b, s)
+    addChar(b, '\n')
+
+fn toString(b: StrBuilder*): str =
+    return str(b->buf)
+
+fn escapeString(s: str): str =
+    if s == nil:
+        return ""
+    var b: StrBuilder = initBuilder(len(s) + 8)
+    for i in 0..<len(s):
+        let c: char = s[i]
+        if c == '"':
+            addStr(&b, "\\\"")
+        elif c == '\\':
+            addStr(&b, "\\\\")
+        elif c == '\n':
+            addStr(&b, "\\n")
+        elif c == '\r':
+            addStr(&b, "\\r")
+        elif c == '\t':
+            addStr(&b, "\\t")
+        else:
+            addChar(&b, c)
+    return toString(&b)
+
+fn indentLine(b: StrBuilder*, indent: int32) =
+    for i in 0..<indent:
+        addStr(b, "    ")
+
+fn emitLine(b: StrBuilder*, indent: int32, text: str) =
+    indentLine(b, indent)
+    addLine(b, text)
+
+fn nextVar(ctx: int32*, prefix: str): str =
+    let id: int32 = *ctx
+    *ctx = id + 1
+    return prefix + intToStr(id)
+
+fn unwrapExpr(value: str): str =
+    if value == nil:
+        return ""
+    let trimmed = trim(value)
+    if len(trimmed) >= 2 && trimmed[0] == '{' && trimmed[len(trimmed) - 1] == '}':
+        return trim(substr(trimmed, 1, len(trimmed) - 2))
+    return trimmed
+
+fn isEventAttr(name: str): bool =
+    return startsWithAt(name, "on:", 0)
+
+fn eventNameFromAttr(name: str): str =
+    if startsWithAt(name, "on:", 0):
+        return substr(name, 3, len(name) - 3)
+    return name
+
+fn isBindAttr(name: str): bool =
+    return startsWithAt(name, "bind:", 0)
+
+fn bindNameFromAttr(name: str): str =
+    if startsWithAt(name, "bind:", 0):
+        return substr(name, 5, len(name) - 5)
+    return name
+
+fn isClassDirective(name: str): bool =
+    return startsWithAt(name, "class:", 0)
+
+fn classNameFromAttr(name: str): str =
+    if startsWithAt(name, "class:", 0):
+        return substr(name, 6, len(name) - 6)
+    return name
+
+fn isStyleDirective(name: str): bool =
+    return startsWithAt(name, "style:", 0)
+
+fn styleNameFromAttr(name: str): str =
+    if startsWithAt(name, "style:", 0):
+        return substr(name, 6, len(name) - 6)
+    return name
+
+fn isIfAttrName(name: str): bool =
+    return name == "if"
+
+fn isElseIfAttrName(name: str): bool =
+    return name == "else-if"
+
+fn isElseAttrName(name: str): bool =
+    return name == "else"
+
+fn isEachAttrName(name: str): bool =
+    return name == "each"
+
+fn isKeyAttrName(name: str): bool =
+    return name == "key"
+
+fn isAwaitAttrName(name: str): bool =
+    return name == "await"
+
+fn isAwaitPendingAttrName(name: str): bool =
+    return name == "await:pending" || name == "await:loading"
+
+fn isAwaitCatchAttrName(name: str): bool =
+    return name == "await:catch" || name == "await:error"
+
+fn isControlAttr(name: str): bool =
+    return isIfAttrName(name) || isElseIfAttrName(name) || isElseAttrName(name) || isEachAttrName(name) || isKeyAttrName(name) || isAwaitAttrName(name) || isAwaitPendingAttrName(name) || isAwaitCatchAttrName(name)
+
+fn hasAttr(node: TemplateNode, name: str): bool =
+    if node == nil:
+        return false
+    for i in 0..<len(node.attrs):
+        if node.attrs[i].name == name:
+            return true
+    return false
+
+fn attrValue(node: TemplateNode, name: str): str =
+    if node == nil:
+        return ""
+    for i in 0..<len(node.attrs):
+        if node.attrs[i].name == name:
+            return node.attrs[i].value
+    return ""
+
+fn parseEachExpr(expr: str, itemOut: str*, indexOut: str*, listOut: str*): bool =
+    if expr == nil:
+        return false
+    let trimmed = trim(expr)
+    if len(trimmed) == 0:
+        return false
+    let idx = indexOfSubstr(trimmed, " in ", 0)
+    if idx >= 0:
+        let left = trim(substr(trimmed, 0, idx))
+        let list = trim(substr(trimmed, idx + 4, len(trimmed) - idx - 4))
+        if len(left) == 0 || len(list) == 0:
+            return false
+        let commaIdx = indexOfSubstr(left, ",", 0)
+        if commaIdx >= 0:
+            *itemOut = trim(substr(left, 0, commaIdx))
+            *indexOut = trim(substr(left, commaIdx + 1, len(left) - commaIdx - 1))
+        else:
+            *itemOut = left
+            *indexOut = ""
+        if len(*itemOut) == 0:
+            return false
+        *listOut = list
+        return true
+    *itemOut = "item"
+    *indexOut = ""
+    *listOut = trimmed
+    return true
+
+fn emitStaticAttr(b: StrBuilder*, indent: int32, nodeVar: str, attr: TemplateAttr) =
+    emitLine(b, indent, "setAttr(__cwc_view, " + nodeVar + ", \"" + escapeString(attr.name) + "\", \"" + escapeString(attr.value) + "\")")
+
+fn emitEventAttr(b: StrBuilder*, indent: int32, nodeVar: str, attr: TemplateAttr, blockVar: str) =
+    let evName = eventNameFromAttr(attr.name)
+    let handler = unwrapExpr(attr.value)
+    if len(handler) == 0:
+        return
+    if blockVar != nil && len(blockVar) > 0:
+        emitLine(b, indent, "blockOnEvent(" + blockVar + ", " + nodeVar + ", \"" + escapeString(evName) + "\", " + handler + ")")
+    else:
+        emitLine(b, indent, "onEvent(__cwc_view, " + nodeVar + ", \"" + escapeString(evName) + "\", " + handler + ")")
+
+fn emitBindAttr(b: StrBuilder*, indent: int32, nodeVar: str, attr: TemplateAttr, blockVar: str) =
+    let target = bindNameFromAttr(attr.name)
+    let expr = unwrapExpr(attr.value)
+    if len(expr) == 0:
+        return
+    if target == "value":
+        if blockVar != nil && len(blockVar) > 0:
+            emitLine(b, indent, "blockBindValue(" + blockVar + ", " + nodeVar + ", fn (): str = $(sig.get(" + expr + ")), fn (value: str) = sig.set(" + expr + ", value))")
+        else:
+            emitLine(b, indent, "bindValue(" + nodeVar + ", fn (): str = $(sig.get(" + expr + ")), fn (value: str) = sig.set(" + expr + ", value))")
+        return
+    if target == "checked":
+        if blockVar != nil && len(blockVar) > 0:
+            emitLine(b, indent, "blockBindChecked(" + blockVar + ", " + nodeVar + ", fn (): bool = sig.get(" + expr + "), fn (value: bool) = sig.set(" + expr + ", value))")
+        else:
+            emitLine(b, indent, "bindChecked(" + nodeVar + ", fn (): bool = sig.get(" + expr + "), fn (value: bool) = sig.set(" + expr + ", value))")
+        return
+    if target == "class":
+        if blockVar != nil && len(blockVar) > 0:
+            emitLine(b, indent, "blockBindAttr(" + blockVar + ", " + nodeVar + ", \"class\", fn (): str = $(" + expr + "))")
+        else:
+            emitLine(b, indent, "bindAttr(" + nodeVar + ", \"class\", fn (): str = $(" + expr + "))")
+        return
+    if target == "style":
+        if blockVar != nil && len(blockVar) > 0:
+            emitLine(b, indent, "blockBindAttr(" + blockVar + ", " + nodeVar + ", \"style\", fn (): str = $(" + expr + "))")
+        else:
+            emitLine(b, indent, "bindAttr(" + nodeVar + ", \"style\", fn (): str = $(" + expr + "))")
+        return
+    if blockVar != nil && len(blockVar) > 0:
+        emitLine(b, indent, "blockBindProp(" + blockVar + ", " + nodeVar + ", \"" + escapeString(target) + "\", fn (): str = $(" + expr + "))")
+    else:
+        emitLine(b, indent, "bindProp(" + nodeVar + ", \"" + escapeString(target) + "\", fn (): str = $(" + expr + "))")
+
+fn emitStyleDirective(b: StrBuilder*, indent: int32, nodeVar: str, attr: TemplateAttr, blockVar: str) =
+    let name = styleNameFromAttr(attr.name)
+    let expr = unwrapExpr(attr.value)
+    if len(expr) == 0:
+        return
+    if blockVar != nil && len(blockVar) > 0:
+        emitLine(b, indent, "blockBindStyle(" + blockVar + ", " + nodeVar + ", \"" + escapeString(name) + "\", fn (): str = $(" + expr + "))")
+    else:
+        emitLine(b, indent, "bindStyle(" + nodeVar + ", \"" + escapeString(name) + "\", fn (): str = $(" + expr + "))")
+
+fn emitClassBinding(b: StrBuilder*, indent: int32, ctx: int32*, nodeVar: str, staticClass: str, directives: TemplateAttr[], blockVar: str) =
+    if len(directives) == 0 && (staticClass == nil || len(staticClass) == 0):
+        return
+    let getterName = nextVar(ctx, "cls")
+    emitLine(b, indent, "let " + getterName + " = fn (): str =")
+    emitLine(b, indent + 1, "var out = \"\"")
+    if staticClass != nil && len(staticClass) > 0:
+        emitLine(b, indent + 1, "out = \"" + escapeString(staticClass) + "\"")
+    for i in 0..<len(directives):
+        let className = classNameFromAttr(directives[i].name)
+        let expr = unwrapExpr(directives[i].value)
+        if len(expr) > 0 && len(className) > 0:
+            emitLine(b, indent + 1, "if " + expr + ":")
+            emitLine(b, indent + 2, "if len(out) > 0:")
+            emitLine(b, indent + 3, "out = out + \" \"")
+            emitLine(b, indent + 2, "out = out + \"" + escapeString(className) + "\"")
+    emitLine(b, indent + 1, "return out")
+    if blockVar != nil && len(blockVar) > 0:
+        emitLine(b, indent, "blockBindAttr(" + blockVar + ", " + nodeVar + ", \"class\", " + getterName + ")")
+    else:
+        emitLine(b, indent, "bindAttr(" + nodeVar + ", \"class\", " + getterName + ")")
+
+fn emitNode(b: StrBuilder*, indent: int32, ctx: int32*, node: TemplateNode, parentVar: str, scopeAttr: str, appendBlockVar: str, trackBlockVar: str) =
+    if node == nil:
+        return
+    case node.kind
+    of tnElement:
+        let varName = nextVar(ctx, "n")
+        emitLine(b, indent, "let " + varName + " = createElement(__cwc_view, \"" + escapeString(node.tag) + "\")")
+        if scopeAttr != nil && len(scopeAttr) > 0:
+            emitLine(b, indent, "setAttr(__cwc_view, " + varName + ", \"" + escapeString(scopeAttr) + "\", \"\")")
+        var staticClass: str = ""
+        var hasStaticClass: bool = false
+        var staticAttrs: TemplateAttr[]
+        var eventAttrs: TemplateAttr[]
+        var bindAttrs: TemplateAttr[]
+        var classDirectives: TemplateAttr[]
+        var styleDirectives: TemplateAttr[]
+        for ai in 0..<len(node.attrs):
+            let attr = node.attrs[ai]
+            if isControlAttr(attr.name):
+                0
+            elif isEventAttr(attr.name):
+                eventAttrs.add(attr)
+            elif isBindAttr(attr.name):
+                bindAttrs.add(attr)
+            elif isClassDirective(attr.name):
+                classDirectives.add(attr)
+            elif isStyleDirective(attr.name):
+                styleDirectives.add(attr)
+            else:
+                if attr.name == "class":
+                    staticClass = attr.value
+                    hasStaticClass = true
+                else:
+                    staticAttrs.add(attr)
+        if hasStaticClass && len(classDirectives) == 0:
+            emitLine(b, indent, "setAttr(__cwc_view, " + varName + ", \"class\", \"" + escapeString(staticClass) + "\")")
+        for si in 0..<len(staticAttrs):
+            emitStaticAttr(b, indent, varName, staticAttrs[si])
+        for ei in 0..<len(eventAttrs):
+            emitEventAttr(b, indent, varName, eventAttrs[ei], trackBlockVar)
+        for bi in 0..<len(bindAttrs):
+            emitBindAttr(b, indent, varName, bindAttrs[bi], trackBlockVar)
+        for sti in 0..<len(styleDirectives):
+            emitStyleDirective(b, indent, varName, styleDirectives[sti], trackBlockVar)
+        if len(classDirectives) > 0:
+            emitClassBinding(b, indent, ctx, varName, staticClass, classDirectives, trackBlockVar)
+        emitChildren(b, indent, ctx, node.children, varName, scopeAttr, trackBlockVar)
+        if appendBlockVar != nil && len(appendBlockVar) > 0:
+            emitLine(b, indent, "blockAppend(__cwc_view, " + appendBlockVar + ", " + varName + ")")
+        else:
+            emitLine(b, indent, "appendNode(__cwc_view, " + parentVar + ", " + varName + ")")
+    of tnText:
+        if node.text == nil || len(node.text) == 0:
+            return
+        let varName = nextVar(ctx, "t")
+        emitLine(b, indent, "let " + varName + " = createText(__cwc_view, \"" + escapeString(node.text) + "\")")
+        if appendBlockVar != nil && len(appendBlockVar) > 0:
+            emitLine(b, indent, "blockAppend(__cwc_view, " + appendBlockVar + ", " + varName + ")")
+        else:
+            emitLine(b, indent, "appendNode(__cwc_view, " + parentVar + ", " + varName + ")")
+    of tnInterp:
+        let varName = nextVar(ctx, "t")
+        emitLine(b, indent, "let " + varName + " = createText(__cwc_view, \"\")")
+        if trackBlockVar != nil && len(trackBlockVar) > 0:
+            emitLine(b, indent, "blockBindText(" + trackBlockVar + ", " + varName + ", fn (): str = $(" + node.text + "))")
+        else:
+            emitLine(b, indent, "bindText(" + varName + ", fn (): str = $(" + node.text + "))")
+        if appendBlockVar != nil && len(appendBlockVar) > 0:
+            emitLine(b, indent, "blockAppend(__cwc_view, " + appendBlockVar + ", " + varName + ")")
+        else:
+            emitLine(b, indent, "appendNode(__cwc_view, " + parentVar + ", " + varName + ")")
+
+fn emitIfChain(b: StrBuilder*, indent: int32, ctx: int32*, chain: TemplateNode[], conds: str[], parentVar: str, scopeAttr: str, trackBlockVar: str) =
+    if len(chain) == 0 || len(chain) != len(conds):
+        return
+    let anchorVar = nextVar(ctx, "a")
+    emitLine(b, indent, "let " + anchorVar + " = createText(__cwc_view, \"\")")
+    emitLine(b, indent, "appendNode(__cwc_view, " + parentVar + ", " + anchorVar + ")")
+    let blockVar = nextVar(ctx, "blk")
+    emitLine(b, indent, "var " + blockVar + " = newNodeBlock(" + parentVar + ", " + anchorVar + ")")
+    if trackBlockVar != nil && len(trackBlockVar) > 0:
+        emitLine(b, indent, "blockTrackChild(" + trackBlockVar + ", " + blockVar + ")")
+    else:
+        emitLine(b, indent, "trackBlock(__cwc_view, " + blockVar + ")")
+    let stateVar = nextVar(ctx, "st")
+    emitLine(b, indent, "var " + stateVar + ": int32 = -1")
+    let effVar = nextVar(ctx, "eff")
+    emitLine(b, indent, "let " + effVar + " = sig.effect(fn () =")
+    emitLine(b, indent + 1, "var next: int32 = -1")
+    for ci in 0..<len(conds):
+        let cond = conds[ci]
+        if ci == 0:
+            emitLine(b, indent + 1, "if " + cond + ":")
+        elif cond != nil && len(cond) > 0:
+            emitLine(b, indent + 1, "elif " + cond + ":")
+        else:
+            emitLine(b, indent + 1, "else:")
+        emitLine(b, indent + 2, "next = " + intToStr(ci))
+    emitLine(b, indent + 1, "if next == " + stateVar + ":")
+    emitLine(b, indent + 2, "return")
+    emitLine(b, indent + 1, "blockClear(__cwc_view, " + blockVar + ")")
+    for bi in 0..<len(chain):
+        if bi == 0:
+            emitLine(b, indent + 1, "if next == 0:")
+        else:
+            emitLine(b, indent + 1, "elif next == " + intToStr(bi) + ":")
+        emitNode(b, indent + 2, ctx, chain[bi], parentVar, scopeAttr, blockVar, blockVar)
+    emitLine(b, indent + 1, stateVar + " = next")
+    emitLine(b, indent, ")")
+    if trackBlockVar != nil && len(trackBlockVar) > 0:
+        emitLine(b, indent, "blockTrackEffect(" + trackBlockVar + ", " + effVar + ")")
+    else:
+        emitLine(b, indent, "trackEffect(__cwc_view, " + effVar + ")")
+
+fn emitEach(b: StrBuilder*, indent: int32, ctx: int32*, node: TemplateNode, emptyNode: TemplateNode, parentVar: str, scopeAttr: str, trackBlockVar: str) =
+    let expr = unwrapExpr(attrValue(node, "each"))
+    var item: str = ""
+    var indexName: str = ""
+    var listExpr: str = ""
+    if ! parseEachExpr(expr, &item, &indexName, &listExpr):
+        emitNode(b, indent, ctx, node, parentVar, scopeAttr, "", trackBlockVar)
+        return
+    let anchorVar = nextVar(ctx, "a")
+    emitLine(b, indent, "let " + anchorVar + " = createText(__cwc_view, \"\")")
+    emitLine(b, indent, "appendNode(__cwc_view, " + parentVar + ", " + anchorVar + ")")
+    let blockVar = nextVar(ctx, "blk")
+    emitLine(b, indent, "var " + blockVar + " = newNodeBlock(" + parentVar + ", " + anchorVar + ")")
+    var emptyBlockVar: str = ""
+    if emptyNode != nil:
+        emptyBlockVar = nextVar(ctx, "blk")
+        emitLine(b, indent, "var " + emptyBlockVar + " = newNodeBlock(" + parentVar + ", " + anchorVar + ")")
+    if trackBlockVar != nil && len(trackBlockVar) > 0:
+        emitLine(b, indent, "blockTrackChild(" + trackBlockVar + ", " + blockVar + ")")
+        if emptyBlockVar != nil && len(emptyBlockVar) > 0:
+            emitLine(b, indent, "blockTrackChild(" + trackBlockVar + ", " + emptyBlockVar + ")")
+    else:
+        emitLine(b, indent, "trackBlock(__cwc_view, " + blockVar + ")")
+        if emptyBlockVar != nil && len(emptyBlockVar) > 0:
+            emitLine(b, indent, "trackBlock(__cwc_view, " + emptyBlockVar + ")")
+    let effVar = nextVar(ctx, "eff")
+    emitLine(b, indent, "let " + effVar + " = sig.effect(fn () =")
+    emitLine(b, indent + 1, "blockClear(__cwc_view, " + blockVar + ")")
+    if emptyBlockVar != nil && len(emptyBlockVar) > 0:
+        emitLine(b, indent + 1, "blockClear(__cwc_view, " + emptyBlockVar + ")")
+    emitLine(b, indent + 1, "var __cwc_each_count: int32 = 0")
+    if indexName != nil && len(indexName) > 0:
+        emitLine(b, indent + 1, "var __cwc_each_idx: int32 = 0")
+    emitLine(b, indent + 1, "for " + item + " in " + listExpr + ":")
+    if indexName != nil && len(indexName) > 0:
+        emitLine(b, indent + 2, "let " + indexName + " = __cwc_each_idx")
+    emitLine(b, indent + 2, "__cwc_each_count = __cwc_each_count + 1")
+    emitNode(b, indent + 2, ctx, node, parentVar, scopeAttr, blockVar, blockVar)
+    if indexName != nil && len(indexName) > 0:
+        emitLine(b, indent + 2, "__cwc_each_idx = __cwc_each_idx + 1")
+    if emptyBlockVar != nil && len(emptyBlockVar) > 0:
+        emitLine(b, indent + 1, "if __cwc_each_count == 0:")
+        emitNode(b, indent + 2, ctx, emptyNode, parentVar, scopeAttr, emptyBlockVar, emptyBlockVar)
+    emitLine(b, indent, ")")
+    if trackBlockVar != nil && len(trackBlockVar) > 0:
+        emitLine(b, indent, "blockTrackEffect(" + trackBlockVar + ", " + effVar + ")")
+    else:
+        emitLine(b, indent, "trackEffect(__cwc_view, " + effVar + ")")
+
+fn emitAwait(b: StrBuilder*, indent: int32, ctx: int32*, node: TemplateNode, pendingNode: TemplateNode, catchNode: TemplateNode, parentVar: str, scopeAttr: str, trackBlockVar: str) =
+    let expr = unwrapExpr(attrValue(node, "await"))
+    if len(expr) == 0:
+        emitNode(b, indent, ctx, node, parentVar, scopeAttr, "", trackBlockVar)
+        return
+    let anchorVar = nextVar(ctx, "a")
+    emitLine(b, indent, "let " + anchorVar + " = createText(__cwc_view, \"\")")
+    emitLine(b, indent, "appendNode(__cwc_view, " + parentVar + ", " + anchorVar + ")")
+    let thenBlockVar = nextVar(ctx, "blk")
+    emitLine(b, indent, "var " + thenBlockVar + " = newNodeBlock(" + parentVar + ", " + anchorVar + ")")
+    var pendingBlockVar: str = ""
+    var catchBlockVar: str = ""
+    if pendingNode != nil:
+        pendingBlockVar = nextVar(ctx, "blk")
+        emitLine(b, indent, "var " + pendingBlockVar + " = newNodeBlock(" + parentVar + ", " + anchorVar + ")")
+    if catchNode != nil:
+        catchBlockVar = nextVar(ctx, "blk")
+        emitLine(b, indent, "var " + catchBlockVar + " = newNodeBlock(" + parentVar + ", " + anchorVar + ")")
+    if trackBlockVar != nil && len(trackBlockVar) > 0:
+        emitLine(b, indent, "blockTrackChild(" + trackBlockVar + ", " + thenBlockVar + ")")
+        if pendingBlockVar != nil && len(pendingBlockVar) > 0:
+            emitLine(b, indent, "blockTrackChild(" + trackBlockVar + ", " + pendingBlockVar + ")")
+        if catchBlockVar != nil && len(catchBlockVar) > 0:
+            emitLine(b, indent, "blockTrackChild(" + trackBlockVar + ", " + catchBlockVar + ")")
+    else:
+        emitLine(b, indent, "trackBlock(__cwc_view, " + thenBlockVar + ")")
+        if pendingBlockVar != nil && len(pendingBlockVar) > 0:
+            emitLine(b, indent, "trackBlock(__cwc_view, " + pendingBlockVar + ")")
+        if catchBlockVar != nil && len(catchBlockVar) > 0:
+            emitLine(b, indent, "trackBlock(__cwc_view, " + catchBlockVar + ")")
+    let srcVar = nextVar(ctx, "aw")
+    emitLine(b, indent, "let " + srcVar + " = " + expr)
+    let effVar = nextVar(ctx, "eff")
+    emitLine(b, indent, "let " + effVar + " = sig.effect(fn () =")
+    emitLine(b, indent + 1, "blockClear(__cwc_view, " + thenBlockVar + ")")
+    if pendingBlockVar != nil && len(pendingBlockVar) > 0:
+        emitLine(b, indent + 1, "blockClear(__cwc_view, " + pendingBlockVar + ")")
+    if catchBlockVar != nil && len(catchBlockVar) > 0:
+        emitLine(b, indent + 1, "blockClear(__cwc_view, " + catchBlockVar + ")")
+    emitLine(b, indent + 1, "let __cwc_await_state = sig.get(" + srcVar + ")")
+    emitLine(b, indent + 1, "if __cwc_await_state.status == 0:")
+    if pendingNode != nil:
+        emitNode(b, indent + 2, ctx, pendingNode, parentVar, scopeAttr, pendingBlockVar, pendingBlockVar)
+    emitLine(b, indent + 1, "elif __cwc_await_state.status < 0:")
+    if catchNode != nil:
+        emitLine(b, indent + 2, "let error = __cwc_await_state.error")
+        emitNode(b, indent + 2, ctx, catchNode, parentVar, scopeAttr, catchBlockVar, catchBlockVar)
+    emitLine(b, indent + 1, "else:")
+    emitLine(b, indent + 2, "let value = __cwc_await_state.value")
+    emitNode(b, indent + 2, ctx, node, parentVar, scopeAttr, thenBlockVar, thenBlockVar)
+    emitLine(b, indent, ")")
+    if trackBlockVar != nil && len(trackBlockVar) > 0:
+        emitLine(b, indent, "blockTrackEffect(" + trackBlockVar + ", " + effVar + ")")
+    else:
+        emitLine(b, indent, "trackEffect(__cwc_view, " + effVar + ")")
+
+fn emitChildren(b: StrBuilder*, indent: int32, ctx: int32*, nodes: TemplateNode[], parentVar: str, scopeAttr: str, trackBlockVar: str) =
+    var i: int32 = 0
+    for __for_guard_i in 0..<len(nodes):
+        if !(i < len(nodes)):
+            break
+        let node = nodes[i]
+        if node != nil && hasAttr(node, "if"):
+            var chain: TemplateNode[] 
+            var conds: str[] 
+            chain.add(node)
+            conds.add(unwrapExpr(attrValue(node, "if")))
+            var j: int32 = i + 1
+            let __for_guard_start_j_1 = j
+            for __for_guard_j_1 in __for_guard_start_j_1..<len(nodes):
+                if ! (j < len(nodes)):
+                    break
+                let nextNode = nodes[j]
+                if nextNode != nil && hasAttr(nextNode, "else-if"):
+                    chain.add(nextNode)
+                    conds.add(unwrapExpr(attrValue(nextNode, "else-if")))
+                    j = j + 1
+                    continue
+                if nextNode != nil && hasAttr(nextNode, "else"):
+                    chain.add(nextNode)
+                    conds.add("")
+                    j = j + 1
+                break
+            emitIfChain(b, indent, ctx, chain, conds, parentVar, scopeAttr, trackBlockVar)
+            i = j
+            continue
+        if node != nil && hasAttr(node, "await"):
+            var pendingNode: TemplateNode = nil
+            var catchNode: TemplateNode = nil
+            var j: int32 = i + 1
+            let __for_guard_start_j_2 = j
+            for __for_guard_j_2 in __for_guard_start_j_2..<len(nodes):
+                if ! (j < len(nodes)):
+                    break
+                let nextNode = nodes[j]
+                if nextNode != nil && (hasAttr(nextNode, "await:pending") || hasAttr(nextNode, "await:loading")):
+                    pendingNode = nextNode
+                    j = j + 1
+                    continue
+                if nextNode != nil && (hasAttr(nextNode, "await:catch") || hasAttr(nextNode, "await:error")):
+                    catchNode = nextNode
+                    j = j + 1
+                    continue
+                break
+            emitAwait(b, indent, ctx, node, pendingNode, catchNode, parentVar, scopeAttr, trackBlockVar)
+            i = j
+            continue
+        if node != nil && hasAttr(node, "each"):
+            var emptyNode: TemplateNode = nil
+            if i + 1 < len(nodes):
+                let nextNode = nodes[i + 1]
+                if nextNode != nil && hasAttr(nextNode, "else") && ! hasAttr(nextNode, "if") && ! hasAttr(nextNode, "else-if") && ! hasAttr(nextNode, "each"):
+                    emptyNode = nextNode
+            emitEach(b, indent, ctx, node, emptyNode, parentVar, scopeAttr, trackBlockVar)
+            if emptyNode != nil:
+                i = i + 2
+            else:
+                i = i + 1
+            continue
+        emitNode(b, indent, ctx, node, parentVar, scopeAttr, "", trackBlockVar)
+        i = i + 1
+
+fn emitTemplate(b: StrBuilder*, nodes: TemplateNode[], indent: int32, scopeAttr: str) =
+    var counter: int32 = 0
+    emitChildren(b, indent, &counter, nodes, "0", scopeAttr, "")
+
+fn generateComponent(nodes: TemplateNode[], script: str, scopeAttr: str): str =
+    var b: StrBuilder = initBuilder(4096)
+    addLine(&b, "# Generated by cheng webc")
+    addLine(&b, "import cheng / web / runtime / abi")
+    addLine(&b, "import cheng / web / runtime / app")
+    addLine(&b, "import cheng / web / runtime / view")
+    addLine(&b, "import cheng / web / runtime / bindings")
+    addLine(&b, "import cheng / web / runtime / signals as sig")
+    addLine(&b, "import cheng / web / runtime / async as async")
+    addLine(&b, "import cheng / web / runtime / events")
+    addLine(&b, "import std / strutils")
+    addLine(&b, "")
+    if script != nil && len(trim(script)) > 0:
+        addLine(&b, "# <script>")
+        addStr(&b, script)
+        if len(script) == 0 || script[len(script) - 1] != '\n':
+            addLine(&b, "")
+        addLine(&b, "# </script>")
+        addLine(&b, "")
+    addLine(&b, "var __cwc_view: View")
+    addLine(&b, "")
+    addLine(&b, "fn appInit() =")
+    addLine(&b, "    when declared(cwc_user_init):")
+    addLine(&b, "        cwc_user_init()")
+    addLine(&b, "")
+    addLine(&b, "fn appMount(root: WebNode): int32 =")
+    addLine(&b, "    __cwc_view = newView(root)")
+    emitTemplate(&b, nodes, 1, scopeAttr)
+    addLine(&b, "    var handle: int32 = 1")
+    addLine(&b, "    when declared(cwc_user_mount):")
+    addLine(&b, "        handle = cwc_user_mount(root, __cwc_view)")
+    addLine(&b, "    return handle")
+    addLine(&b, "")
+    addLine(&b, "fn appUpdate(handle: int32) =")
+    addLine(&b, "    when declared(cwc_user_update):")
+    addLine(&b, "        cwc_user_update(handle, __cwc_view)")
+    addLine(&b, "")
+    addLine(&b, "fn appUnmount(handle: int32) =")
+    addLine(&b, "    when declared(cwc_user_unmount):")
+    addLine(&b, "        cwc_user_unmount(handle, __cwc_view)")
+    addLine(&b, "    if __cwc_view != nil:")
+    addLine(&b, "        clearBindings(__cwc_view)")
+    addLine(&b, "")
+    addLine(&b, "fn register() =")
+    addLine(&b, "    registerApp(appInit, appMount, appUpdate, appUnmount)")
+    addLine(&b, "")
+    addLine(&b, "register()")
+    return toString(&b)

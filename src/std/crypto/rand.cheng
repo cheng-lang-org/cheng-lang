@@ -1,0 +1,173 @@
+# Deterministic RNG(seed required || system entropy).
+
+import std/result
+import std/rawbytes
+import std/crypto/sha512
+import std/crypto/chacha20poly1305
+import std/os as bos
+type
+    KeyNonceCounter =
+        key: Bytes
+        nonce: Bytes
+        counter: int32
+
+const
+    randSeedSize: int32 = 64
+    randUrandomPath: str = "/dev/urandom"
+
+@ importc("SystemFunction036")
+fn c_rtl_gen_random(buf: void*, len: int32): int32
+
+var rngSeeded: bool = false
+var rngSystemAttempted: bool = false
+var rngWindowsAvailable: int32 = -1
+var rngUrandomAvailable: int32 = -1
+var rngKey: Bytes = Bytes(data: nil, len: 0)
+var rngNonce: Bytes = Bytes(data: nil, len: 0)
+var rngCounter: int32 = 0
+var rngBlock: Bytes = Bytes(data: nil, len: 0)
+var rngBlockOffset: int32 = 0
+
+fn deriveKeyNonce(seed: Bytes): Result[KeyNonceCounter] =
+    if bytesLen(seed) <= 0:
+        return Err[KeyNonceCounter]("rand: seed empty")
+    let digest: Bytes = sha512Digest(seed)
+    if bytesLen(digest) < 48:
+        return Err[KeyNonceCounter]("rand: digest too short")
+    let key: Bytes = bytesSlice(digest, 0, 32)
+    let nonce: Bytes = bytesSlice(digest, 32, 12)
+    let c0: int32 = bytesGet(digest, 44)
+    let c1: int32 = bytesGet(digest, 45)
+    let c2: int32 = bytesGet(digest, 46)
+    let c3: int32 = bytesGet(digest, 47)
+    let counter: int32 = (c0 << 24) | (c1 << 16) | (c2 << 8) | c3
+    var out: KeyNonceCounter
+    out.key = key
+    out.nonce = nonce
+    out.counter = counter
+    return Ok[KeyNonceCounter](out)
+
+fn setRandomSeed(seed: Bytes): bool =
+    if bytesLen(seed) <= 0:
+        rngSeeded = false
+        rngSystemAttempted = false
+        rngWindowsAvailable = -1
+        rngUrandomAvailable = -1
+        rngKey.data = nil
+        rngKey.len = 0
+        rngNonce.data = nil
+        rngNonce.len = 0
+        rngCounter = 0
+        rngBlock.data = nil
+        rngBlock.len = 0
+        rngBlockOffset = 0
+        return false
+    let res: Result[KeyNonceCounter] = deriveKeyNonce(seed)
+    if IsErr(res):
+        rngSeeded = false
+        rngSystemAttempted = false
+        rngWindowsAvailable = -1
+        rngUrandomAvailable = -1
+        rngKey.data = nil
+        rngKey.len = 0
+        rngNonce.data = nil
+        rngNonce.len = 0
+        rngCounter = 0
+        rngBlock.data = nil
+        rngBlock.len = 0
+        rngBlockOffset = 0
+        return false
+    let derived: KeyNonceCounter = Value(res)
+    rngKey.data = derived.key.data
+    rngKey.len = derived.key.len
+    rngNonce.data = derived.nonce.data
+    rngNonce.len = derived.nonce.len
+    rngCounter = derived.counter
+    rngBlock.data = nil
+    rngBlock.len = 0
+    rngBlockOffset = 0
+    rngSeeded = true
+    rngSystemAttempted = true
+    return true
+
+fn randomFillWindows(out: Bytes): bool =
+    if bytesLen(out) <= 0:
+        return false
+    if rngWindowsAvailable == 0:
+        return false
+    let res: int32 = c_rtl_gen_random(out.data, bytesLen(out))
+    if res != 0:
+        rngWindowsAvailable = 1
+        return true
+    rngWindowsAvailable = 0
+    return false
+
+fn randomFillUrandom(out: Bytes): bool =
+    if bytesLen(out) <= 0:
+        return false
+    if rngUrandomAvailable == 0:
+        return false
+    let f: bos.File = bos.openRead(randUrandomPath)
+    if f == nil:
+        rngUrandomAvailable = 0
+        return false
+    var total: int32 = 0
+    while total < bytesLen(out):
+        let n: int32 = bos.c_fread(ptr_add(out.data, total), 1, bytesLen(out) - total, f)
+        if n > 0:
+            total = total + n
+            continue
+        break
+    bos.close(f)
+    if total == bytesLen(out):
+        rngUrandomAvailable = 1
+        return true
+    rngUrandomAvailable = 0
+    return false
+
+fn systemRandomBytes(length: int32): Result[Bytes] =
+    if length <= 0:
+        return Ok[Bytes](Bytes(data: nil, len: 0))
+    let out: Bytes = bytesAlloc(length)
+    if randomFillWindows(out) || randomFillUrandom(out):
+        return Ok[Bytes](out)
+    return Err[Bytes]("rand: system entropy unavailable(windows/urandom)")
+
+fn randomSeedFromSystem(): Result[bool] =
+    let seedRes: Result[Bytes] = systemRandomBytes(randSeedSize)
+    if IsErr(seedRes):
+        return Err[bool](Error(seedRes))
+    if ! setRandomSeed(Value(seedRes)):
+        return Err[bool]("rand: seed ! set")
+    return Ok[bool](true)
+
+fn randomEnsureSeeded(): Result[bool] =
+    if rngSeeded:
+        return Ok[bool](true)
+    if ! rngSystemAttempted:
+        rngSystemAttempted = true
+        let seedRes: Result[bool] = randomSeedFromSystem()
+        if IsErr(seedRes):
+            return Err[bool](Error(seedRes))
+    if ! rngSeeded:
+        return Err[bool]("rand: seed ! set")
+    return Ok[bool](true)
+
+fn randomBytes(length: int32): Result[Bytes] =
+    if length <= 0:
+        return Ok[Bytes](Bytes(data: nil, len: 0))
+    let seedRes: Result[bool] = randomEnsureSeeded()
+    if IsErr(seedRes):
+        return Err[Bytes](Error(seedRes))
+    let out: Bytes = bytesAlloc(length)
+    for i in 0..<length:
+        if rngBlockOffset >= bytesLen(rngBlock):
+            let block: Bytes = chacha20Block(rngKey, rngCounter, rngNonce)
+            rngBlock.data = block.data
+            rngBlock.len = block.len
+            rngCounter = rngCounter + 1
+            rngBlockOffset = 0
+        bytesSet(out, i, bytesGet(rngBlock, rngBlockOffset))
+        rngBlockOffset = rngBlockOffset + 1
+    return Ok[Bytes](out)
+

@@ -1,0 +1,272 @@
+# Resource manager(global limits, minimal).
+
+import std/result
+import std/net/bandwidthmanager
+import std/net/memorymanager
+const
+    resourceDirInbound = 0
+    resourceDirOutbound = 1
+    maxInt32Value = 2147483647
+
+type
+    ResourceLimits =
+        enabled: bool
+        maxConns: int32
+        maxInboundConns: int32
+        maxOutboundConns: int32
+        maxStreams: int32
+        maxInboundStreams: int32
+        maxOutboundStreams: int32
+        maxMemoryBytes: int64
+        maxInboundBytes: int64
+        maxOutboundBytes: int64
+
+    ResourceStats =
+        inboundConns: int32
+        outboundConns: int32
+        inboundStreams: int32
+        outboundStreams: int32
+        totalConns: int64
+        totalStreams: int64
+        lastError: str
+
+    ResourceManager =
+        limits: ResourceLimits
+        stats: ResourceStats
+
+fn initResourceLimits(): ResourceLimits =
+    ResourceLimits(
+        enabled: true,
+        maxConns: 0,
+        maxInboundConns: 0,
+        maxOutboundConns: 0,
+        maxStreams: 0,
+        maxInboundStreams: 0,
+        maxOutboundStreams: 0,
+        maxMemoryBytes: 0,
+        maxInboundBytes: 0,
+        maxOutboundBytes: 0
+    )
+
+fn initResourceStats(): ResourceStats =
+    ResourceStats(
+        inboundConns: 0,
+        outboundConns: 0,
+        inboundStreams: 0,
+        outboundStreams: 0,
+        totalConns: 0,
+        totalStreams: 0,
+        lastError: ""
+    )
+
+var
+    resourceManager: ResourceManager = ResourceManager(
+        limits: initResourceLimits(),
+        stats: initResourceStats()
+    )
+
+fn resourceEnabled(): bool =
+    resourceManager.limits.enabled
+
+fn resourceLastError(): str =
+    resourceManager.stats.lastError
+
+fn resourceTotalConnections(): int32 =
+    resourceManager.stats.inboundConns + resourceManager.stats.outboundConns
+
+fn resourceTotalStreams(): int32 =
+    resourceManager.stats.inboundStreams + resourceManager.stats.outboundStreams
+
+fn resourceInboundConnections(): int32 =
+    resourceManager.stats.inboundConns
+
+fn resourceOutboundConnections(): int32 =
+    resourceManager.stats.outboundConns
+
+fn resourceInboundStreams(): int32 =
+    resourceManager.stats.inboundStreams
+
+fn resourceOutboundStreams(): int32 =
+    resourceManager.stats.outboundStreams
+
+fn resourceTotalConnectionReservations(): int64 =
+    resourceManager.stats.totalConns
+
+fn resourceTotalStreamReservations(): int64 =
+    resourceManager.stats.totalStreams
+
+fn resourceLimits(): ResourceLimits =
+    resourceManager.limits
+
+fn setResourceError(msg: str) =
+    resourceManager.stats.lastError = msg
+
+fn applyResourceLimits(limits: ResourceLimits) =
+    var memCfg: MemoryConfig = initMemoryConfig()
+    memCfg.enabled = limits.enabled
+    memCfg.limitBytes = limits.maxMemoryBytes
+    setMemoryConfig(memCfg)
+    var bwCfg: BandwidthConfig = initBandwidthConfig()
+    bwCfg.enabled = limits.enabled
+    bwCfg.maxInbound = limits.maxInboundBytes
+    bwCfg.maxOutbound = limits.maxOutboundBytes
+    setBandwidthConfig(bwCfg)
+
+fn setResourceLimits(limits: ResourceLimits) =
+    resourceManager.limits = limits
+    applyResourceLimits(limits)
+
+fn resetResourceStats() =
+    resourceManager.stats = initResourceStats()
+    resetMemoryStats()
+    resetBandwidthStats()
+
+fn validateDir(dir: int32): Result[bool] =
+    if dir != resourceDirInbound && dir != resourceDirOutbound:
+        let msg: str = "resourcemanager: invalid direction"
+        setResourceError(msg)
+        return Err[bool](msg)
+    return Ok[bool](true)
+
+fn checkLimit(current: int32, limit: int32): bool =
+    if limit <= 0:
+        return true
+    return current < limit
+
+fn addCount(current: int32): Result[int32] =
+    if current >= maxInt32Value:
+        let msg: str = "resourcemanager: counter overflow"
+        setResourceError(msg)
+        return Err[int32](msg)
+    return Ok[int32](current + 1)
+
+fn subCount(current: int32): Result[int32] =
+    if current <= 0:
+        let msg: str = "resourcemanager: counter underflow"
+        setResourceError(msg)
+        return Err[int32](msg)
+    return Ok[int32](current - 1)
+
+fn reserveConnection(dir: int32): Result[bool] =
+    if ! resourceEnabled():
+        return Ok[bool](false)
+    let dirRes: Result[bool] = validateDir(dir)
+    if IsErr(dirRes):
+        return Err[bool](Error(dirRes))
+    let total: int32 = resourceTotalConnections()
+    if ! checkLimit(total, resourceManager.limits.maxConns):
+        let msg: str = "resourcemanager: total connection limit exceeded"
+        setResourceError(msg)
+        return Err[bool](msg)
+    if dir == resourceDirInbound:
+        if ! checkLimit(resourceManager.stats.inboundConns, resourceManager.limits.maxInboundConns):
+            let msg: str = "resourcemanager: inbound connection limit exceeded"
+            setResourceError(msg)
+            return Err[bool](msg)
+        let nextRes: Result[int32] = addCount(resourceManager.stats.inboundConns)
+        if IsErr(nextRes):
+            return Err[bool](Error(nextRes))
+        resourceManager.stats.inboundConns = Value(nextRes)
+    else:
+        if ! checkLimit(resourceManager.stats.outboundConns, resourceManager.limits.maxOutboundConns):
+            let msg: str = "resourcemanager: outbound connection limit exceeded"
+            setResourceError(msg)
+            return Err[bool](msg)
+        let nextRes: Result[int32] = addCount(resourceManager.stats.outboundConns)
+        if IsErr(nextRes):
+            return Err[bool](Error(nextRes))
+        resourceManager.stats.outboundConns = Value(nextRes)
+    resourceManager.stats.totalConns = resourceManager.stats.totalConns + 1
+    return Ok[bool](true)
+
+fn releaseConnection(dir: int32): Result[bool] =
+    let dirRes: Result[bool] = validateDir(dir)
+    if IsErr(dirRes):
+        return Err[bool](Error(dirRes))
+    if ! resourceEnabled():
+        if dir == resourceDirInbound && resourceManager.stats.inboundConns <= 0:
+            return Ok[bool](false)
+        if dir == resourceDirOutbound && resourceManager.stats.outboundConns <= 0:
+            return Ok[bool](false)
+    if dir == resourceDirInbound:
+        let nextRes: Result[int32] = subCount(resourceManager.stats.inboundConns)
+        if IsErr(nextRes):
+            return Err[bool](Error(nextRes))
+        resourceManager.stats.inboundConns = Value(nextRes)
+        return Ok[bool](true)
+    let nextRes: Result[int32] = subCount(resourceManager.stats.outboundConns)
+    if IsErr(nextRes):
+        return Err[bool](Error(nextRes))
+    resourceManager.stats.outboundConns = Value(nextRes)
+    return Ok[bool](true)
+
+fn reserveStream(dir: int32): Result[bool] =
+    if ! resourceEnabled():
+        return Ok[bool](false)
+    let dirRes: Result[bool] = validateDir(dir)
+    if IsErr(dirRes):
+        return Err[bool](Error(dirRes))
+    let total: int32 = resourceTotalStreams()
+    if ! checkLimit(total, resourceManager.limits.maxStreams):
+        let msg: str = "resourcemanager: total stream limit exceeded"
+        setResourceError(msg)
+        return Err[bool](msg)
+    if dir == resourceDirInbound:
+        if ! checkLimit(resourceManager.stats.inboundStreams, resourceManager.limits.maxInboundStreams):
+            let msg: str = "resourcemanager: inbound stream limit exceeded"
+            setResourceError(msg)
+            return Err[bool](msg)
+        let nextRes: Result[int32] = addCount(resourceManager.stats.inboundStreams)
+        if IsErr(nextRes):
+            return Err[bool](Error(nextRes))
+        resourceManager.stats.inboundStreams = Value(nextRes)
+    else:
+        if ! checkLimit(resourceManager.stats.outboundStreams, resourceManager.limits.maxOutboundStreams):
+            let msg: str = "resourcemanager: outbound stream limit exceeded"
+            setResourceError(msg)
+            return Err[bool](msg)
+        let nextRes: Result[int32] = addCount(resourceManager.stats.outboundStreams)
+        if IsErr(nextRes):
+            return Err[bool](Error(nextRes))
+        resourceManager.stats.outboundStreams = Value(nextRes)
+    resourceManager.stats.totalStreams = resourceManager.stats.totalStreams + 1
+    return Ok[bool](true)
+
+fn releaseStream(dir: int32): Result[bool] =
+    let dirRes: Result[bool] = validateDir(dir)
+    if IsErr(dirRes):
+        return Err[bool](Error(dirRes))
+    if ! resourceEnabled():
+        if dir == resourceDirInbound && resourceManager.stats.inboundStreams <= 0:
+            return Ok[bool](false)
+        if dir == resourceDirOutbound && resourceManager.stats.outboundStreams <= 0:
+            return Ok[bool](false)
+    if dir == resourceDirInbound:
+        let nextRes: Result[int32] = subCount(resourceManager.stats.inboundStreams)
+        if IsErr(nextRes):
+            return Err[bool](Error(nextRes))
+        resourceManager.stats.inboundStreams = Value(nextRes)
+        return Ok[bool](true)
+    let nextRes: Result[int32] = subCount(resourceManager.stats.outboundStreams)
+    if IsErr(nextRes):
+        return Err[bool](Error(nextRes))
+    resourceManager.stats.outboundStreams = Value(nextRes)
+    return Ok[bool](true)
+
+fn resourceRecordInboundBytes(bytes: int64): Result[bool] =
+    if ! resourceEnabled():
+        return Ok[bool](false)
+    return recordInbound(bytes)
+
+fn resourceRecordOutboundBytes(bytes: int64): Result[bool] =
+    if ! resourceEnabled():
+        return Ok[bool](false)
+    return recordOutbound(bytes)
+
+fn resourceReserveMemoryBytes(bytes: int64): Result[bool] =
+    if ! resourceEnabled():
+        return Ok[bool](false)
+    return reserveMemory(bytes)
+
+fn resourceReleaseMemoryBytes(bytes: int64): Result[bool] =
+    return releaseMemory(bytes)

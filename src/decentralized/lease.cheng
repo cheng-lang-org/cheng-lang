@@ -1,0 +1,68 @@
+import std/times
+import std/strings
+import cheng/decentralized/cid as dcid
+import cheng/libp2p/utils/result as result
+
+const
+    BytesPerGb = 1024.0 * 1024.0 * 1024.0
+    DaysPerMonth = 30.0
+
+type
+    Lease =
+        leaseId: str
+        packageId: str
+        authorId: str
+        providerId: str
+        bytes: int64
+        durationDays: int32
+        replicas: int32
+        pricePerGbMonth: float64
+        royaltyRate: float64
+        treasuryRate: float64
+        startTs: str
+
+    LeaseCost =
+        storageCost: float64
+        royalty: float64
+        treasury: float64
+        provider: float64
+
+fn leaseStartTs(): str =
+    return times.now().format("unix")
+
+fn buildLeaseId(lease: Lease): str =
+    let payload = lease.packageId + "|" + lease.authorId + "|" + lease.providerId + "|" +
+        intToStr(int32(lease.bytes)) + "|" + intToStr(lease.durationDays) + "|" +
+        intToStr(lease.replicas) + "|" + lease.startTs
+    let cidRes: result.Result[dcid.Cid] = dcid.cidFromString(payload)
+    if result.IsErr(cidRes):
+        return "lease-" + intToStr(int32(len(payload)))
+    let cidStr = dcid.cidText(result.Value(cidRes))
+    if cidStr == nil || len(cidStr) == 0:
+        return "lease-" + intToStr(int32(len(payload)))
+    return "lease-" + cidStr
+
+fn computeLeaseCost(lease: Lease): LeaseCost =
+    var cost: LeaseCost
+    let gbMonths = (
+        (float64(lease.bytes) / (1024.0 * 1024.0 * 1024.0)) *
+        (float64(lease.durationDays) / 30.0) *
+        float64(lease.replicas)
+    )
+    cost.storageCost = gbMonths * lease.pricePerGbMonth
+    cost.royalty = cost.storageCost * lease.royaltyRate
+    cost.treasury = cost.storageCost * lease.treasuryRate
+    cost.provider = cost.storageCost - cost.royalty - cost.treasury
+    return cost
+
+fn normalizeLease(lease: Lease): Lease =
+    var out = lease
+    if out.durationDays <= 0:
+        out.durationDays = 30
+    if out.replicas <= 0:
+        out.replicas = 1
+    if out.startTs == nil || len(out.startTs) == 0:
+        out.startTs = leaseStartTs()
+    if out.leaseId == nil || len(out.leaseId) == 0:
+        out.leaseId = buildLeaseId(out)
+    return out

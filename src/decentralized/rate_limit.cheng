@@ -1,0 +1,112 @@
+import std/os
+import std/strutils as strutil
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import std/strings
+
+type
+    RateLimitResult =
+        epoch: int32
+        requesterId: str
+        executorId: str
+        requestCount: int32
+        receiptCount: int32
+        maxRequests: int32
+        maxReceipts: int32
+        allowRequest: bool
+        allowReceipt: bool
+
+fn checkRateLimit(
+    ledgerPath: str,
+    epochFilter: int32,
+    requesterId: str,
+    executorId: str,
+    maxRequests: int32,
+    maxReceipts: int32
+): RateLimitResult =
+    var out: RateLimitResult
+    out.epoch = epochFilter
+    out.requesterId = requesterId
+    out.executorId = executorId
+    out.maxRequests = maxRequests
+    out.maxReceipts = maxReceipts
+    if ledgerPath != nil && len(ledgerPath) > 0 && os.fileExists(ledgerPath):
+        let content = os.readFile(ledgerPath)
+        if content != nil && len(content) > 0:
+            let lines = strutil.split(content, '\n')
+            for i in 0..<lines.len:
+                let line = strutil.strip(lines[i])
+                if line == nil || len(line) == 0:
+                    continue
+                let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+                if ! parsed.ok:
+                    continue
+                let node = parsed.value
+                let kind = jparse.getStringField(node, "type", "")
+                let epoch = int32(jparse.getIntField(node, "epoch", 0))
+                if epochFilter >= 0 && epoch != epochFilter:
+                    continue
+                if requesterId != nil && len(requesterId) > 0 && kind == "exec_request":
+                    let rid = jparse.getStringField(node, "requester_id", "")
+                    if rid == requesterId:
+                        out.requestCount = out.requestCount + 1
+                if executorId != nil && len(executorId) > 0 && kind == "exec_receipt":
+                    let eid = jparse.getStringField(node, "executor_id", "")
+                    if eid == executorId:
+                        out.receiptCount = out.receiptCount + 1
+    if maxRequests <= 0:
+        out.allowRequest = true
+    else:
+        out.allowRequest = out.requestCount < maxRequests
+    if maxReceipts <= 0:
+        out.allowReceipt = true
+    else:
+        out.allowReceipt = out.receiptCount < maxReceipts
+    return out
+
+fn rateLimitToJson(info: RateLimitResult): json.JsonNode =
+    let root = json.newJObject()
+    root["epoch"] = json.newJInt(info.epoch)
+    root["requester_id"] = json.newJString(info.requesterId)
+    root["executor_id"] = json.newJString(info.executorId)
+    root["request_count"] = json.newJInt(info.requestCount)
+    root["receipt_count"] = json.newJInt(info.receiptCount)
+    root["max_requests"] = json.newJInt(info.maxRequests)
+    root["max_receipts"] = json.newJInt(info.maxReceipts)
+    root["allow_request"] = json.newJBool(info.allowRequest)
+    root["allow_receipt"] = json.newJBool(info.allowReceipt)
+    return root
+
+fn rateLimitToToml(info: RateLimitResult): str =
+    var out: str = ""
+    out = out + "epoch = " + intToStr(info.epoch) + "\n"
+    if info.requesterId != nil && len(info.requesterId) > 0:
+        out = out + "requester_id = \"" + info.requesterId + "\"\n"
+    if info.executorId != nil && len(info.executorId) > 0:
+        out = out + "executor_id = \"" + info.executorId + "\"\n"
+    out = out + "request_count = " + intToStr(info.requestCount) + "\n"
+    out = out + "receipt_count = " + intToStr(info.receiptCount) + "\n"
+    out = out + "max_requests = " + intToStr(info.maxRequests) + "\n"
+    out = out + "max_receipts = " + intToStr(info.maxReceipts) + "\n"
+    let allowRequestText: str = if info.allowRequest: "true" else: "false"
+    let allowReceiptText: str = if info.allowReceipt: "true" else: "false"
+    out = out + "allow_request = " + allowRequestText + "\n"
+    out = out + "allow_receipt = " + allowReceiptText + "\n"
+    return out
+
+fn rateLimitToYaml(info: RateLimitResult): str =
+    var out: str = ""
+    out = out + "epoch: " + intToStr(info.epoch) + "\n"
+    if info.requesterId != nil && len(info.requesterId) > 0:
+        out = out + "requester_id: \"" + info.requesterId + "\"\n"
+    if info.executorId != nil && len(info.executorId) > 0:
+        out = out + "executor_id: \"" + info.executorId + "\"\n"
+    out = out + "request_count: " + intToStr(info.requestCount) + "\n"
+    out = out + "receipt_count: " + intToStr(info.receiptCount) + "\n"
+    out = out + "max_requests: " + intToStr(info.maxRequests) + "\n"
+    out = out + "max_receipts: " + intToStr(info.maxReceipts) + "\n"
+    let allowRequestText: str = if info.allowRequest: "true" else: "false"
+    let allowReceiptText: str = if info.allowReceipt: "true" else: "false"
+    out = out + "allow_request: " + allowRequestText + "\n"
+    out = out + "allow_receipt: " + allowReceiptText + "\n"
+    return out

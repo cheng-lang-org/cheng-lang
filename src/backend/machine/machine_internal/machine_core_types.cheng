@@ -1,0 +1,839 @@
+# Machine core instruction types for backend MVP (AArch64/x86_64-oriented).
+import std/seqs
+import std/os
+
+type
+    MachineCoreReg = enum
+        machineCoreRegW0, machineCoreRegW1, machineCoreRegW2, machineCoreRegW3, machineCoreRegW4, machineCoreRegW5, machineCoreRegW6, machineCoreRegW7, machineCoreRegW8,
+        machineCoreRegX0, machineCoreRegX1, machineCoreRegX2, machineCoreRegX3, machineCoreRegX4, machineCoreRegX5, machineCoreRegX6, machineCoreRegX7, machineCoreRegX8,
+        machineCoreRegX16, machineCoreRegX17,
+        machineCoreRegX19, machineCoreRegX29, machineCoreRegX30,
+        machineCoreRegSp,
+        machineCoreRegD0, machineCoreRegD1
+        # x86_64 (SysV) register set (MVP).
+        machineCoreRegEax, machineCoreRegEcx, machineCoreRegEdx, machineCoreRegEbx, machineCoreRegEsi, machineCoreRegEdi,
+        machineCoreRegR8d, machineCoreRegR9d, machineCoreRegR10d, machineCoreRegR11d, machineCoreRegR12d, machineCoreRegR13d, machineCoreRegR14d, machineCoreRegR15d,
+        machineCoreRegRax, machineCoreRegRcx, machineCoreRegRdx, machineCoreRegRbx, machineCoreRegRsi, machineCoreRegRdi, machineCoreRegRbp,
+        machineCoreRegR8, machineCoreRegR9, machineCoreRegR10, machineCoreRegR11, machineCoreRegR12, machineCoreRegR13, machineCoreRegR14, machineCoreRegR15
+
+    MachineCoreCond = enum
+        machineCoreCondEq, machineCoreCondNe,
+        machineCoreCondMi,
+        machineCoreCondLt, machineCoreCondLe, machineCoreCondGt, machineCoreCondGe,
+        machineCoreCondLo, machineCoreCondLs, machineCoreCondHi, machineCoreCondHs
+
+    MachineCoreOp = enum
+        machineCoreOpLabel,
+        machineCoreOpMovImm,
+        machineCoreOpMovReg,
+        machineCoreOpSxtw,
+        machineCoreOpAdrp, machineCoreOpAddPageOff,
+        machineCoreOpAdd, machineCoreOpSub, machineCoreOpMul, machineCoreOpSdiv, machineCoreOpUdiv, machineCoreOpMsub,
+        machineCoreOpAnd, machineCoreOpOrr, machineCoreOpEor, machineCoreOpLsl, machineCoreOpLsr, machineCoreOpAsr,
+        machineCoreOpCmp,
+        machineCoreOpBCond, machineCoreOpB,
+        machineCoreOpBl,
+        machineCoreOpBlr,
+        machineCoreOpFmovDx, machineCoreOpFmovXd,
+        machineCoreOpFaddD, machineCoreOpFsubD, machineCoreOpFmulD, machineCoreOpFdivD, machineCoreOpFnegD, machineCoreOpFcmpD,
+        machineCoreOpScvtfDx,
+        machineCoreOpSvc,
+        machineCoreOpRet,
+        machineCoreOpStr, machineCoreOpLdr,
+        machineCoreOpStrb, machineCoreOpLdrb, machineCoreOpLdrsb,
+        machineCoreOpStrh, machineCoreOpLdrh, machineCoreOpLdrsh,
+        machineCoreOpSubSp, machineCoreOpAddSp
+
+    MachineCoreInst = ref
+        op: MachineCoreOp
+        rd: MachineCoreReg
+        rn: MachineCoreReg
+        rm: MachineCoreReg
+        ra: MachineCoreReg
+        imm: int64
+        label: str
+        cond: MachineCoreCond
+
+    MachineCoreFunc = ref
+        name: str
+        insts: MachineCoreInst[]
+
+    MachineCoreCString = ref
+        label: str
+        value: str
+
+    MachineCoreGlobal = ref
+        name: str
+        size: int32
+        alignPow2: int32
+        init: int64
+        hasInit: bool
+
+    MachineCoreModule = ref
+        target: str
+        funcs: MachineCoreFunc[]
+        cstrs: MachineCoreCString[]
+        globals: MachineCoreGlobal[]
+
+var
+    machineCoreDebugGlobalAddCount: int32
+    machineCoreDebugLabelCount: int32
+    machineCoreInstLimitCached: bool = false
+    machineCoreInstLimitValue: int32 = 500000
+
+fn machineCoreOwnStr(s: str): str =
+    if s == nil:
+        return ""
+    return "" + s
+
+fn machineCoreParseInt32(raw: str, defaultValue: int32): int32 =
+    if raw == nil || len(raw) == 0:
+        return defaultValue
+    let n: int32 = len(raw)
+    var i: int32 = 0
+    var neg: bool = false
+    if raw[0] == '-':
+        neg = true
+        i = 1
+    if i >= n:
+        return defaultValue
+    var v: int64 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = raw[i]
+        if c < '0' || c > '9':
+            return defaultValue
+        v = v * 10 + int64(int32(c) - int32('0'))
+        i = i + 1
+    if neg:
+        v = -v
+    return int32(v)
+
+fn machineCoreInstLimit(): int32 =
+    if machineCoreInstLimitCached:
+        return machineCoreInstLimitValue
+    machineCoreInstLimitCached = true
+    let raw: str = os.getEnvDefault("BACKEND_MACHINE_MAX_INSTS", "")
+    let parsed: int32 = machineCoreParseInt32(raw, 500000)
+    machineCoreInstLimitValue = parsed
+    return machineCoreInstLimitValue
+
+fn machineCoreResetSeqFunc(items: MachineCoreFunc[]*) =
+    if items == nil:
+        return
+    items->buffer = nil
+    items->len = 0
+    items->cap = 0
+
+fn machineCoreResetSeqInst(items: MachineCoreInst[]*) =
+    if items == nil:
+        return
+    items->buffer = nil
+    items->len = 0
+    items->cap = 0
+
+fn machineCoreResetSeqCString(items: MachineCoreCString[]*) =
+    if items == nil:
+        return
+    items->buffer = nil
+    items->len = 0
+    items->cap = 0
+
+fn machineCoreResetSeqGlobal(items: MachineCoreGlobal[]*) =
+    if items == nil:
+        return
+    items->buffer = nil
+    items->len = 0
+    items->cap = 0
+
+fn machineCoreSanitizeSeqFunc(items: MachineCoreFunc[]*) =
+    if items == nil:
+        return
+    var bad: bool = false
+    if items->len < 0 || items->cap < 0:
+        bad = true
+    elif items->len > items->cap:
+        bad = true
+    elif items->len > 1000000 || items->cap > 2000000:
+        bad = true
+    if bad:
+        machineCoreResetSeqFunc(items)
+
+fn machineCoreSanitizeSeqInst(items: MachineCoreInst[]*) =
+    if items == nil:
+        return
+    var bad: bool = false
+    if items->len < 0 || items->cap < 0:
+        bad = true
+    elif items->len > items->cap:
+        bad = true
+    elif items->len > 1000000 || items->cap > 2000000:
+        bad = true
+    if bad:
+        machineCoreResetSeqInst(items)
+
+fn machineCoreSanitizeSeqCString(items: MachineCoreCString[]*) =
+    if items == nil:
+        return
+    var bad: bool = false
+    if items->len < 0 || items->cap < 0:
+        bad = true
+    elif items->len > items->cap:
+        bad = true
+    elif items->len > 1000000 || items->cap > 2000000:
+        bad = true
+    if bad:
+        machineCoreResetSeqCString(items)
+
+fn machineCoreSanitizeSeqGlobal(items: MachineCoreGlobal[]*) =
+    if items == nil:
+        return
+    var bad: bool = false
+    if items->len < 0 || items->cap < 0:
+        bad = true
+    elif items->len > items->cap:
+        bad = true
+    elif items->len > 1000000 || items->cap > 2000000:
+        bad = true
+    if bad:
+        machineCoreResetSeqGlobal(items)
+
+fn machineCoreModuleTargetOf(module: MachineCoreModule): str =
+    return module.target
+
+fn machineCoreModuleFuncsLen(module: MachineCoreModule): int32 =
+    return module.funcs.len
+
+fn machineCoreModuleFuncAt(module: MachineCoreModule, idx: int32): MachineCoreFunc =
+    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_FUNC_AT", "") == "1":
+        let n: int32 = module == nil ? -1 : module.funcs.len
+        echo("[machine.func_at] idx=" + intToStr(idx) + " len=" + intToStr(n))
+    return module.funcs[idx]
+
+fn machineCoreModuleCstrsLen(module: MachineCoreModule): int32 =
+    return module.cstrs.len
+
+fn machineCoreModuleCStringAt(module: MachineCoreModule, idx: int32): MachineCoreCString =
+    return module.cstrs[idx]
+
+fn machineCoreModuleGlobalsLen(module: MachineCoreModule): int32 =
+    return module.globals.len
+
+fn machineCoreModuleGlobalAt(module: MachineCoreModule, idx: int32): MachineCoreGlobal =
+    return module.globals[idx]
+
+fn machineCoreFuncNameOf(func: MachineCoreFunc): str =
+    return func.name
+
+fn machineCoreFuncInstsLen(func: MachineCoreFunc): int32 =
+    return func.insts.len
+
+fn machineCoreFuncInstAt(func: MachineCoreFunc, idx: int32): MachineCoreInst =
+    return func.insts[idx]
+
+fn machineCoreCStringLabelOf(c: MachineCoreCString): str =
+    if c == nil:
+        return ""
+    return c.label
+
+fn machineCoreCStringValueOf(c: MachineCoreCString): str =
+    if c == nil:
+        return ""
+    return c.value
+
+fn machineCoreGlobalNameOf(g: MachineCoreGlobal): str =
+    if g == nil:
+        return ""
+    return g.name
+
+fn machineCoreGlobalSizeOf(g: MachineCoreGlobal): int32 =
+    if g == nil:
+        return 0
+    return g.size
+
+fn machineCoreGlobalAlignPow2Of(g: MachineCoreGlobal): int32 =
+    if g == nil:
+        return 0
+    return g.alignPow2
+
+fn machineCoreGlobalInitOf(g: MachineCoreGlobal): int64 =
+    if g == nil:
+        return 0
+    return g.init
+
+fn machineCoreGlobalHasInit(g: MachineCoreGlobal): bool =
+    if g == nil:
+        return false
+    return g.hasInit
+
+fn machineCoreInstOpOf(inst: MachineCoreInst): MachineCoreOp =
+    return inst.op
+
+fn machineCoreInstRdOf(inst: MachineCoreInst): MachineCoreReg =
+    return inst.rd
+
+fn machineCoreInstRnOf(inst: MachineCoreInst): MachineCoreReg =
+    return inst.rn
+
+fn machineCoreInstRmOf(inst: MachineCoreInst): MachineCoreReg =
+    return inst.rm
+
+fn machineCoreInstRaOf(inst: MachineCoreInst): MachineCoreReg =
+    return inst.ra
+
+fn machineCoreInstImmOf(inst: MachineCoreInst): int64 =
+    return inst.imm
+
+fn machineCoreInstLabelOf(inst: MachineCoreInst): str =
+    return inst.label
+
+fn machineCoreInstCondOf(inst: MachineCoreInst): MachineCoreCond =
+    return inst.cond
+
+fn machineCoreNewFunc(name: str): MachineCoreFunc =
+    var f: MachineCoreFunc
+    new f
+    f.name = name
+    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_NAME", "") == "1":
+        let inLen: int32 = (name == nil) ? -1 : len(name)
+        let outLen: int32 = (f.name == nil) ? -1 : len(f.name)
+        echo("[machine.newfunc] in_len=" + intToStr(inLen) +
+             " out_len=" + intToStr(outLen) +
+             " in=" + (name == nil ? "" : name) +
+             " out=" + (f.name == nil ? "" : f.name))
+    return f
+
+fn machineCoreAddInst(func: MachineCoreFunc, inst: MachineCoreInst) =
+    add(func.insts, inst)
+
+fn machineCoreNewModule(): MachineCoreModule =
+    var m: MachineCoreModule
+    new m
+    m.target = ""
+    m.funcs = []
+    m.cstrs = []
+    m.globals = []
+    return m
+
+fn machineCoreAddFunc(module: MachineCoreModule, func: MachineCoreFunc) =
+    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
+        let mlen: int32 = module == nil ? -1 : module.funcs.len
+        let fname: str = (func != nil && func.name != nil) ? func.name : ""
+        echo("[machine.add_func] before len=" + intToStr(mlen) + " name=" + fname)
+    add(module.funcs, func)
+    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
+        let mlen2: int32 = module == nil ? -1 : module.funcs.len
+        echo("[machine.add_func] after len=" + intToStr(mlen2))
+
+fn machineCoreAddCString(module: MachineCoreModule, label: str, value: str) =
+    if module == nil:
+        return
+    var c: MachineCoreCString
+    new c
+    c.label = machineCoreOwnStr(label)
+    c.value = machineCoreOwnStr(value)
+    add(module.cstrs, c)
+
+fn machineCoreAddGlobal(module: MachineCoreModule, name: str, size: int32, alignPow2: int32,
+                init: int64, hasInit: bool) =
+    if module == nil:
+        return
+    var g: MachineCoreGlobal
+    new g
+    g.name = machineCoreOwnStr(name)
+    g.size = size
+    g.alignPow2 = alignPow2
+    g.init = init
+    g.hasInit = hasInit
+    add(module.globals, g)
+
+fn machineCoreLabel(name: str): MachineCoreInst =
+    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_LABEL", "") == "1" && machineCoreDebugLabelCount < 6:
+        let nlen: int32 = (name == nil) ? -1 : len(name)
+        echo("[machine.label] len=" + intToStr(nlen) + " name=" + (name == nil ? "" : name))
+        machineCoreDebugLabelCount = machineCoreDebugLabelCount + 1
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpLabel
+    inst.label = machineCoreOwnStr(name)
+    return inst
+
+fn machineCoreMovImm(reg: MachineCoreReg, imm: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpMovImm
+    inst.rd = reg
+    inst.imm = imm
+    return inst
+
+fn machineCoreMovReg(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpMovReg
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn machineCoreSxtw(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpSxtw
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn machineCoreAdrp(rd: MachineCoreReg, label: str): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpAdrp
+    inst.rd = rd
+    inst.label = machineCoreOwnStr(label)
+    return inst
+
+fn machineCoreAddPageOff(rd: MachineCoreReg, rn: MachineCoreReg, label: str): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpAddPageOff
+    inst.rd = rd
+    inst.rn = rn
+    inst.label = machineCoreOwnStr(label)
+    return inst
+
+fn machineCoreBin(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = op
+    inst.rd = rd
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn machineCoreMsub(rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg, ra: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpMsub
+    inst.rd = rd
+    inst.rn = rn
+    inst.rm = rm
+    inst.ra = ra
+    return inst
+
+fn machineCoreCmp(rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpCmp
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn machineCoreBCond(cond: MachineCoreCond, label: str): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpBCond
+    inst.cond = cond
+    inst.label = machineCoreOwnStr(label)
+    return inst
+
+fn machineCoreB(label: str): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpB
+    inst.label = machineCoreOwnStr(label)
+    return inst
+
+fn machineCoreBl(label: str): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpBl
+    inst.label = machineCoreOwnStr(label)
+    return inst
+
+fn machineCoreBlr(reg: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpBlr
+    inst.rn = reg
+    return inst
+
+fn machineCoreFmovDx(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpFmovDx
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn machineCoreFmovXd(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpFmovXd
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn machineCoreFbin(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = op
+    inst.rd = rd
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn machineCoreFcmpD(rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpFcmpD
+    inst.rn = rn
+    inst.rm = rm
+    return inst
+
+fn machineCoreFnegD(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpFnegD
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn machineCoreScvtfDx(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpScvtfDx
+    inst.rd = rd
+    inst.rn = rn
+    return inst
+
+fn machineCoreSvc(imm: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpSvc
+    inst.imm = imm
+    return inst
+
+fn machineCoreRet(): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpRet
+    return inst
+
+fn machineCoreStrb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpStrb
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreLdrb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpLdrb
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreLdrsb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpLdrsb
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreStrh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpStrh
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreLdrh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpLdrh
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreLdrsh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpLdrsh
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreStr(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpStr
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreLdr(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpLdr
+    inst.rd = rd
+    inst.rn = base
+    inst.imm = offset
+    return inst
+
+fn machineCoreSubSp(amount: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpSubSp
+    inst.imm = amount
+    return inst
+
+fn machineCoreAddSp(amount: int64): MachineCoreInst =
+    var inst: MachineCoreInst
+    new inst
+    inst.op = machineCoreOpAddSp
+    inst.imm = amount
+    return inst
+
+const
+    # Stable machine register aliases for outer layers.
+    machineRegW0: MachineCoreReg = machineCoreRegW0
+    machineRegW1: MachineCoreReg = machineCoreRegW1
+    machineRegW2: MachineCoreReg = machineCoreRegW2
+    machineRegW3: MachineCoreReg = machineCoreRegW3
+    machineRegW4: MachineCoreReg = machineCoreRegW4
+    machineRegW5: MachineCoreReg = machineCoreRegW5
+    machineRegW6: MachineCoreReg = machineCoreRegW6
+    machineRegW7: MachineCoreReg = machineCoreRegW7
+    machineRegW8: MachineCoreReg = machineCoreRegW8
+
+    machineRegX0: MachineCoreReg = machineCoreRegX0
+    machineRegX1: MachineCoreReg = machineCoreRegX1
+    machineRegX2: MachineCoreReg = machineCoreRegX2
+    machineRegX3: MachineCoreReg = machineCoreRegX3
+    machineRegX4: MachineCoreReg = machineCoreRegX4
+    machineRegX5: MachineCoreReg = machineCoreRegX5
+    machineRegX6: MachineCoreReg = machineCoreRegX6
+    machineRegX7: MachineCoreReg = machineCoreRegX7
+    machineRegX8: MachineCoreReg = machineCoreRegX8
+    machineRegX16: MachineCoreReg = machineCoreRegX16
+    machineRegX17: MachineCoreReg = machineCoreRegX17
+    machineRegX19: MachineCoreReg = machineCoreRegX19
+    machineRegX29: MachineCoreReg = machineCoreRegX29
+    machineRegX30: MachineCoreReg = machineCoreRegX30
+    machineRegSp: MachineCoreReg = machineCoreRegSp
+
+    machineRegD0: MachineCoreReg = machineCoreRegD0
+    machineRegD1: MachineCoreReg = machineCoreRegD1
+
+    machineRegEax: MachineCoreReg = machineCoreRegEax
+    machineRegEcx: MachineCoreReg = machineCoreRegEcx
+    machineRegEdx: MachineCoreReg = machineCoreRegEdx
+    machineRegEbx: MachineCoreReg = machineCoreRegEbx
+    machineRegEsi: MachineCoreReg = machineCoreRegEsi
+    machineRegEdi: MachineCoreReg = machineCoreRegEdi
+
+    machineRegR8d: MachineCoreReg = machineCoreRegR8d
+    machineRegR9d: MachineCoreReg = machineCoreRegR9d
+    machineRegR10d: MachineCoreReg = machineCoreRegR10d
+    machineRegR11d: MachineCoreReg = machineCoreRegR11d
+    machineRegR12d: MachineCoreReg = machineCoreRegR12d
+    machineRegR13d: MachineCoreReg = machineCoreRegR13d
+    machineRegR14d: MachineCoreReg = machineCoreRegR14d
+    machineRegR15d: MachineCoreReg = machineCoreRegR15d
+
+    machineRegRax: MachineCoreReg = machineCoreRegRax
+    machineRegRcx: MachineCoreReg = machineCoreRegRcx
+    machineRegRdx: MachineCoreReg = machineCoreRegRdx
+    machineRegRbx: MachineCoreReg = machineCoreRegRbx
+    machineRegRsi: MachineCoreReg = machineCoreRegRsi
+    machineRegRdi: MachineCoreReg = machineCoreRegRdi
+    machineRegRbp: MachineCoreReg = machineCoreRegRbp
+    machineRegR8: MachineCoreReg = machineCoreRegR8
+    machineRegR9: MachineCoreReg = machineCoreRegR9
+    machineRegR10: MachineCoreReg = machineCoreRegR10
+    machineRegR11: MachineCoreReg = machineCoreRegR11
+    machineRegR12: MachineCoreReg = machineCoreRegR12
+    machineRegR13: MachineCoreReg = machineCoreRegR13
+    machineRegR14: MachineCoreReg = machineCoreRegR14
+    machineRegR15: MachineCoreReg = machineCoreRegR15
+
+    # Stable machine condition aliases for outer layers.
+    machineCondEq: MachineCoreCond = machineCoreCondEq
+    machineCondNe: MachineCoreCond = machineCoreCondNe
+    machineCondMi: MachineCoreCond = machineCoreCondMi
+    machineCondLt: MachineCoreCond = machineCoreCondLt
+    machineCondLe: MachineCoreCond = machineCoreCondLe
+    machineCondGt: MachineCoreCond = machineCoreCondGt
+    machineCondGe: MachineCoreCond = machineCoreCondGe
+    machineCondLo: MachineCoreCond = machineCoreCondLo
+    machineCondLs: MachineCoreCond = machineCoreCondLs
+    machineCondHi: MachineCoreCond = machineCoreCondHi
+    machineCondHs: MachineCoreCond = machineCoreCondHs
+
+    # Stable machine opcode aliases for outer layers.
+    machineOpLabel: MachineCoreOp = machineCoreOpLabel
+    machineOpMovImm: MachineCoreOp = machineCoreOpMovImm
+    machineOpMovReg: MachineCoreOp = machineCoreOpMovReg
+    machineOpSxtw: MachineCoreOp = machineCoreOpSxtw
+    machineOpAdrp: MachineCoreOp = machineCoreOpAdrp
+    machineOpAddPageOff: MachineCoreOp = machineCoreOpAddPageOff
+    machineOpAdd: MachineCoreOp = machineCoreOpAdd
+    machineOpSub: MachineCoreOp = machineCoreOpSub
+    machineOpMul: MachineCoreOp = machineCoreOpMul
+    machineOpSdiv: MachineCoreOp = machineCoreOpSdiv
+    machineOpUdiv: MachineCoreOp = machineCoreOpUdiv
+    machineOpMsub: MachineCoreOp = machineCoreOpMsub
+    machineOpAnd: MachineCoreOp = machineCoreOpAnd
+    machineOpOrr: MachineCoreOp = machineCoreOpOrr
+    machineOpEor: MachineCoreOp = machineCoreOpEor
+    machineOpLsl: MachineCoreOp = machineCoreOpLsl
+    machineOpLsr: MachineCoreOp = machineCoreOpLsr
+    machineOpAsr: MachineCoreOp = machineCoreOpAsr
+    machineOpCmp: MachineCoreOp = machineCoreOpCmp
+    machineOpBCond: MachineCoreOp = machineCoreOpBCond
+    machineOpB: MachineCoreOp = machineCoreOpB
+    machineOpBl: MachineCoreOp = machineCoreOpBl
+    machineOpBlr: MachineCoreOp = machineCoreOpBlr
+    machineOpFmovDx: MachineCoreOp = machineCoreOpFmovDx
+    machineOpFmovXd: MachineCoreOp = machineCoreOpFmovXd
+    machineOpFaddD: MachineCoreOp = machineCoreOpFaddD
+    machineOpFsubD: MachineCoreOp = machineCoreOpFsubD
+    machineOpFmulD: MachineCoreOp = machineCoreOpFmulD
+    machineOpFdivD: MachineCoreOp = machineCoreOpFdivD
+    machineOpFnegD: MachineCoreOp = machineCoreOpFnegD
+    machineOpFcmpD: MachineCoreOp = machineCoreOpFcmpD
+    machineOpScvtfDx: MachineCoreOp = machineCoreOpScvtfDx
+    machineOpSvc: MachineCoreOp = machineCoreOpSvc
+    machineOpRet: MachineCoreOp = machineCoreOpRet
+    machineOpStr: MachineCoreOp = machineCoreOpStr
+    machineOpLdr: MachineCoreOp = machineCoreOpLdr
+    machineOpStrb: MachineCoreOp = machineCoreOpStrb
+    machineOpLdrb: MachineCoreOp = machineCoreOpLdrb
+    machineOpLdrsb: MachineCoreOp = machineCoreOpLdrsb
+    machineOpStrh: MachineCoreOp = machineCoreOpStrh
+    machineOpLdrh: MachineCoreOp = machineCoreOpLdrh
+    machineOpLdrsh: MachineCoreOp = machineCoreOpLdrsh
+    machineOpSubSp: MachineCoreOp = machineCoreOpSubSp
+    machineOpAddSp: MachineCoreOp = machineCoreOpAddSp
+
+fn machineNewFunc(name: str): MachineCoreFunc =
+    return machineCoreNewFunc(name)
+
+fn machineAddInst(func: MachineCoreFunc, inst: MachineCoreInst) =
+    machineCoreAddInst(func, inst)
+
+fn machineNewModule(): MachineCoreModule =
+    return machineCoreNewModule()
+
+fn machineAddFunc(module: MachineCoreModule, func: MachineCoreFunc) =
+    machineCoreAddFunc(module, func)
+
+fn machineAddCString(module: MachineCoreModule, label: str, value: str) =
+    machineCoreAddCString(module, label, value)
+
+fn machineAddGlobal(module: MachineCoreModule, name: str, size: int32, alignPow2: int32,
+                    init: int64, hasInit: bool) =
+    machineCoreAddGlobal(module, name, size, alignPow2, init, hasInit)
+
+fn machineLabel(name: str): MachineCoreInst =
+    return machineCoreLabel(name)
+
+fn machineMovImm(reg: MachineCoreReg, imm: int64): MachineCoreInst =
+    return machineCoreMovImm(reg, imm)
+
+fn machineMovReg(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    return machineCoreMovReg(rd, rn)
+
+fn machineSxtw(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    return machineCoreSxtw(rd, rn)
+
+fn machineAdrp(rd: MachineCoreReg, label: str): MachineCoreInst =
+    return machineCoreAdrp(rd, label)
+
+fn machineAddPageOff(rd: MachineCoreReg, rn: MachineCoreReg, label: str): MachineCoreInst =
+    return machineCoreAddPageOff(rd, rn, label)
+
+fn machineBin(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    return machineCoreBin(op, rd, rn, rm)
+
+fn machineMsub(rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg, ra: MachineCoreReg): MachineCoreInst =
+    return machineCoreMsub(rd, rn, rm, ra)
+
+fn machineCmp(rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    return machineCoreCmp(rn, rm)
+
+fn machineBCond(cond: MachineCoreCond, label: str): MachineCoreInst =
+    return machineCoreBCond(cond, label)
+
+fn machineB(label: str): MachineCoreInst =
+    return machineCoreB(label)
+
+fn machineBl(label: str): MachineCoreInst =
+    return machineCoreBl(label)
+
+fn machineBlr(reg: MachineCoreReg): MachineCoreInst =
+    return machineCoreBlr(reg)
+
+fn machineFmovDx(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    return machineCoreFmovDx(rd, rn)
+
+fn machineFmovXd(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    return machineCoreFmovXd(rd, rn)
+
+fn machineFbin(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    return machineCoreFbin(op, rd, rn, rm)
+
+fn machineFcmpD(rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
+    return machineCoreFcmpD(rn, rm)
+
+fn machineFnegD(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    return machineCoreFnegD(rd, rn)
+
+fn machineScvtfDx(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
+    return machineCoreScvtfDx(rd, rn)
+
+fn machineSvc(imm: int64): MachineCoreInst =
+    return machineCoreSvc(imm)
+
+fn machineRet(): MachineCoreInst =
+    return machineCoreRet()
+
+fn machineStrb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreStrb(rd, base, offset)
+
+fn machineLdrb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreLdrb(rd, base, offset)
+
+fn machineLdrsb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreLdrsb(rd, base, offset)
+
+fn machineStrh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreStrh(rd, base, offset)
+
+fn machineLdrh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreLdrh(rd, base, offset)
+
+fn machineLdrsh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreLdrsh(rd, base, offset)
+
+fn machineStr(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreStr(rd, base, offset)
+
+fn machineLdr(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
+    return machineCoreLdr(rd, base, offset)
+
+fn machineSubSp(amount: int64): MachineCoreInst =
+    return machineCoreSubSp(amount)
+
+fn machineAddSp(amount: int64): MachineCoreInst =
+    return machineCoreAddSp(amount)
