@@ -18,12 +18,54 @@ sh src/tooling/cheng_tooling.sh run backend_prod_closure --help
 
 # 简写：省略 run
 sh src/tooling/cheng_tooling.sh backend_prod_closure --help
+
+# 构建全局多调用二进制（默认 system-link，可执行直出）
+sh src/tooling/cheng_tooling.sh build-global --out:artifacts/tooling_cmd/cheng_tooling_global --linker:system
+
+# 安装多调用链接：一个二进制覆盖全部脚本入口
+artifacts/tooling_cmd/cheng_tooling_global install \
+  --dir:artifacts/tooling_cmd/bin \
+  --bin:artifacts/tooling_cmd/cheng_tooling_global \
+  --mode:symlink \
+  --manifest:artifacts/tooling_cmd/tooling_multicall_manifest.tsv \
+  --force
+
+# 通过多调用链接直接执行脚本 ID（无需再写 run）
+artifacts/tooling_cmd/bin/backend_prod_closure --help
+
+# 按需子集合并（可重复 --only / --exclude），用于拆分“一个或多个”全局二进制入口
+artifacts/tooling_cmd/cheng_tooling_global install \
+  --dir:artifacts/tooling_cmd/bin_core \
+  --bin:artifacts/tooling_cmd/cheng_tooling_global \
+  --mode:copy \
+  --only:cheng_tooling \
+  --only:backend_prod_closure \
+  --only:verify_backend_closedloop \
+  --force
+
+# 按 profile 一次产出多个全局二进制包（full/core）
+artifacts/tooling_cmd/cheng_tooling_global bundle \
+  --out-dir:artifacts/tooling_bundle \
+  --profile:full \
+  --profile:core \
+  --mode:copy \
+  --linker:system \
+  --force
 ```
 
 说明：
-- `src/tooling/cheng_tooling.sh` 会自动构建并复用 `artifacts/tooling_cmd/cheng_tooling`（源码：`src/tooling/cheng_tooling.cheng`）。
+- `src/tooling/cheng_tooling.sh` 会自动构建并复用 `artifacts/tooling_cmd/cheng_tooling`（源码：`src/tooling/cheng_tooling.cheng`）；默认 `TOOLING_LINKER=system`，优先保证聚合器稳定可运行。
+- 如需自研 linker 口径，可显式设置 `TOOLING_LINKER=self` 或在 `build-global` 传 `--linker:self`。
+- 聚合器仅在 `main(argc, argv)` 的 C ABI 入口桥接阶段使用指针参数；构建时显式注入 `STAGE1_NO_POINTERS_NON_C_ABI=0` / `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`，其余脚本闭环仍遵循 `ABI=v2_noptr` 生产口径。
 - 可通过 `TOOLING_BIN` 覆盖可执行路径，通过 `TOOLING_FORCE_BUILD=1` 强制重建。
-- 所有 `src/tooling/*.sh` 可通过该可执行入口统一调用，便于后续逐步收敛到纯 cmdline 工具链。
+- `cheng_tooling` 支持 multicall：当 `argv0` 是脚本 ID（例如 `backend_prod_closure`）时会自动分发到对应 `src/tooling/<id>.sh`。
+- `install` 子命令可把全部 `src/tooling/*.sh` 入口合并安装为“一个全局二进制 + 多个命令入口”的形态；支持重复 `--only:<id>` / `--exclude:<id>` 做按需子集安装，并支持 `--mode:symlink|hardlink|copy` 选择入口物化方式。
+- `bundle` 子命令可按 profile 直接生成“一个或多个全局二进制包”：
+  - `full`：`src/tooling/*.sh` 全量入口
+  - `core`：`cheng_tooling/chengc/backend_prod_closure/verify_backend_closedloop/verify_backend_abi_v2_noptr/verify_fullchain_bootstrap`
+- `src/tooling/tooling_exec.sh <script-id> [args...]`：统一执行入口解析器；支持 `TOOLING_EXEC_BUNDLE_PROFILE=core|full`（默认 `core`）与 `TOOLING_EXEC_BUNDLE_BIN_DIR=<dir>` 指定入口目录。
+- `TOOLING_EXEC_REQUIRE_BUNDLE=1` 可禁用 shell fallback（bundle 缺失直接失败），用于生产闭环“全局二进制分发”强约束。
+- `verify.sh`、`verify_backend_selfhost_nightly.sh` 与 `backend_prod_closure.sh` 已接入该解析器；其中 `backend_prod_closure.sh` 默认 `profile=full` + `require_bundle=1` + `bundle_auto_build=0`（零脚本生产闭环）。
 - 回归脚本：`sh src/tooling/verify_tooling_cmdline.sh`（报告：`artifacts/tooling_cmdline/tooling_cmdline.report.txt`）。
 
 ## chengc.sh
@@ -42,9 +84,11 @@ sh src/tooling/chengc.sh examples/stage1_codegen_fullspec.cheng --jobs:8
 - 当 lock 存在时会拉取依赖包并设置 `PKG_ROOTS` 供 `cheng/<pkg>/...` 域名导入使用；生产包根以 `src/` 为模块根（`cheng/<pkg>/<path>` -> `<pkgroot>/src/<path>.cheng`）。`PKG_ROOTS` 可指向包根列表或容器根（如 `~/.cheng-packages`，解析会优先尝试 `cheng-<pkg>`）。
 - 源码直发拉取可通过 `--source-peer`/`--source-listen` 或环境变量 `PKG_SOURCE_PEERS`/`PKG_SOURCE_LISTEN` 指定源地址。
 - 依赖拉取模式/peer：`PKG_MODE=local|p2p`/`PKG_PEERS`。
+- 供应链默认强制：`PKG_HTTP_FALLBACK=0`、`PKG_REQUIRE_SIGNATURE=1`、`PKG_REQUIRE_REGISTRY_MATCH=1`；`cheng_pkg_fetch.sh` 在拉取前会执行 `lock-verify`，任一校验失败即阻断。
 - 注册中心元数据：当提供 `--package/--channel` 时，会写入 `[snapshot]`（`cid/author_id/signature/pub_key`）。
 - 构建期校验：可加 `--verify`（可选 `--ledger:<path>`）自动校验 buildmeta/lock/pkgmeta/snapshot。
 - `chengc.sh` 入口仅保留 `emit=exe`；`--emit-obj/--obj-out/--backend:obj` 已在生产链路移除并会直接报错。新增 `--release`（等价 `BACKEND_BUILD_TRACK=release`），默认走 system linker；默认（无 `--release`）为 `dev` 轨，支持 self-link 的目标优先 `--linker:self`，否则回退 `system`。linker 选择优先级固定为：`--linker` > `BACKEND_LINKER` > `BACKEND_BUILD_TRACK` 默认策略。可用 `BACKEND_RUNTIME_OBJ=<path>` 指定自定义运行时对象。
+- `emit=obj` 仅用于 internal gate（例如 `verify_backend_self_linker_{elf,coff}.sh` 的跨目标 source-object/linker 验证），不属于生产编译主路径；主路径仍固定为 `emit=exe`（全局内存直出二进制）。
 - 运行入口双模：`--run` 默认 `host runner`（Dev），可显式用 `--run:host`；`--run:file` 保留“先产 exe 再执行”的兼容路径。host runner 关键变量：`BACKEND_HOTPATCH_MODE=trampoline`、`BACKEND_HOSTRUNNER_POOL_MB`（默认 `512`）、`BACKEND_HOSTRUNNER_PAGE_POLICY=rw_rx`、`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program`、`BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`、`BACKEND_HOTPATCH_TARGET_PLATFORMS=darwin,linux`。
 - system linker 自动选择器：`src/tooling/resolve_system_linker.sh` 按 `BACKEND_SYSTEM_LINKER_PRIORITY`（默认 `mold,lld,default`）解析并追加 `-fuse-ld=...`；若显式设置 `BACKEND_LD` 或手写 `-fuse-ld=...`，选择器不覆盖。
 - Linux AArch64 可选 no-libc profile：`BACKEND_ELF_PROFILE=nolibc` 且 `BACKEND_LINKER=self` 时，`chengc.sh`（以及兼容壳 `chengb.sh`）会切换到 `src/std/system_helpers_backend_nolibc_linux_aarch64.cheng`，并走无 `PT_INTERP`/`PT_DYNAMIC` 的静态链接口径；默认 profile 行为不变。
@@ -75,6 +119,8 @@ sh src/tooling/chengc.sh examples/stage1_codegen_fullspec.cheng --jobs:8
 - RPSPAR-04 Out-Ptr 影子桥接：`sh src/tooling/verify_backend_ffi_outptr_tuple.sh` 校验 `@ffi_out_ptrs + @importc` 的 tuple wrapper 降级（运行态正例 + status obj-only 正例 + arity 负例诊断）；输出 `artifacts/backend_ffi_outptr_tuple/*.report.txt`。
 - RPSPAR-05 Handle 沙盒映射：`sh src/tooling/verify_backend_ffi_handle_sandbox.sh` 校验 runtime `ptr<->slot` 映射（C runtime + backend runtime 双实现）与过期 handle fail-safe（返回 `-1`，无 UAF），并输出 `artifacts/backend_ffi_handle_sandbox/*.report.txt`。
 - RPSPAR-06 Borrow Struct* 桥接：`sh src/tooling/verify_backend_ffi_borrow_bridge.sh` 校验 `importc + var object` 正向桥接可运行，并校验产物符号包含 `_cheng_abi_borrow_mut_pair_i32`（默认固定 `system + runtime C` 口径以避免自链接 runtime 缺符号）；输出 `artifacts/backend_ffi_borrow_bridge/*.report.txt`。
+- RPSPAR-07 Raw Pointer FFI 迁移：`sh src/tooling/verify_backend_rawptr_migration.sh` 校验迁移脚本 `src/tooling/rawptr_migrate_ffi.sh` 的 apply/check/rollback 闭环、风险报告与文档迁移入口；输出 `artifacts/backend_rawptr_migration/*.report.txt`。一键迁移：`sh src/tooling/rawptr_migrate_ffi.sh --root:<path> --apply --report:artifacts/backend_rawptr_migration/rawptr_migration.report.txt --backup-manifest:artifacts/backend_rawptr_migration/rawptr_migration.backups.tsv`；回滚：`sh src/tooling/rawptr_migrate_ffi.sh --rollback:artifacts/backend_rawptr_migration/rawptr_migration.backups.tsv`。
+- RPSPAR-08 Raw Pointer 生产闭环：`sh src/tooling/verify_backend_rawptr_closedloop.sh` 校验 Raw Pointer required gate 集合与 `verify_backend_closedloop.sh` / `backend_prod_closure.sh` / `verify.sh` / CI 接入一致性；输出 `artifacts/backend_rawptr_closedloop/*.report.txt`。
 - PAR-02 MemImage 核心：`sh src/tooling/verify_backend_mem_image_core.sh` 校验符号索引、段布局、重定位应用三类核心 marker，并执行 `self-link` 可执行产物探针（无 sidecar `.o/.objs` 残留）；输出 `artifacts/backend_mem_image_core/*.report.txt`。默认仅编译探针（`BACKEND_MEM_IMAGE_CORE_RUN=0`），可设 `BACKEND_MEM_IMAGE_CORE_RUN=1` 启用本机运行校验；可用 `BACKEND_MEM_IMAGE_CORE_DRIVER=<path>` 指定 gate driver。
 - PAR-03 直出 EXE：`sh src/tooling/verify_backend_mem_exe_emit.sh` 校验格式写出（Mach-O/ELF/PE）、runtime 合并（`BACKEND_RUNTIME_OBJ` 负例/正例）与原子写盘（`tmp+rename`），并强制 sidecar 残留为 0；输出 `artifacts/backend_mem_exe_emit/backend_mem_exe_emit.<target>.report.txt`。
 - PAR-04 Hotpatch 元数据：`sh src/tooling/verify_backend_hotpatch_meta.sh` 校验 `thunk map`、`patch_meta(schema=2)`（`thunk_id/target_slot_fileoff_or_memoff/code_pool_offset/layout_hash/commit_epoch`）与缺元数据/坏布局哈希/坏 ABI 负例；输出 `artifacts/backend_hotpatch_meta/backend_hotpatch_meta.<target>.report.txt`。
@@ -93,13 +139,16 @@ sh src/tooling/chengc.sh examples/stage1_codegen_fullspec.cheng --jobs:8
   - 增量 stamp 使用“单元文件状态 hash + 编译参数 hash（含编译器身份）”，减少无关改动重编并避免跨编译器复用旧产物。
   - 可执行单对象回退：`emit=exe` + Darwin + self-link 下可设 `BACKEND_MULTI_EXE_MAX_OBJS=<N>`（默认 `0` 禁用）在单元数超过阈值时回退“单对象编译+链接”；通常不建议开启（大模块多单元编译在当前实现下更快）。
   - `BACKEND_MULTI_LTO=1` 在 `emit=exe + multi` 路径下采用“全模块优化 + 单对象链接”口径（`<out>.objs` 中仅保留 1 个 `.o`），避免跨单元符号裁剪漂移。
+  - `verify_backend_multi_lto.sh` 现为“编译+运行”硬门禁：运行阶段默认 `10s` 超时（`BACKEND_MULTI_LTO_RUN_TIMEOUT`），超时/崩溃/符号缺失都会直接失败，不再回退 compile-only。
 
 Stage1 全语法回归门禁：
 ```bash
 sh src/tooling/verify_stage1_fullspec.sh
 ```
 说明：
+- `--allow-skip` 已不再支持（会直接失败）；不再允许把 unsupported host/missing codesign 视为跳过通过。
 - 默认 `STAGE1_FULLSPEC_VALIDATE=0`（聚焦端到端行为闭环，避免大仓库在 validate=1 下超长编译）；如需严格后端校验口径，可显式设置 `STAGE1_FULLSPEC_VALIDATE=1`。
+- 默认 `STAGE1_SKIP_SEM=0`、`STAGE1_SKIP_OWNERSHIP=0`，fullspec 口径默认启用语义/所有权检查，不再以 skip 作为默认行为。
 - 默认 `STAGE1_FULLSPEC_REUSE=1`：当输入/driver/关键编译参数未变化时，直接复用上次产物（`<name>.stage1_fullspec.stamp`），避免重复冷编译。
 - 复用签名会纳入 `*` 环境变量哈希（排除 `STAGE1_FULLSPEC_REUSE/TIMEOUT`、timeout 诊断/健康探针变量、profile 开关与输入输出路径），配置变化会自动失效重编。
 - 默认超时为 `60s`（`STAGE1_FULLSPEC_TIMEOUT`）；超时后会自动触发一次 profile 诊断复跑（`STAGE1_FULLSPEC_TIMEOUT_DIAG=1`，默认 `20s`，日志目录 `chengcache/stage1_fullspec_timeout_diag`），并追加轻量健康探针（`STAGE1_FULLSPEC_TIMEOUT_HEALTH_PROBE=1`，默认 `10s`）用于区分“特例慢编译”与“整体编译器异常”。
@@ -107,10 +156,17 @@ sh src/tooling/verify_stage1_fullspec.sh
 
 ## 自研后端与全链自举
 
-后端 driver 选择（脚本统一入口）：
+后端 driver 选择（生产收口统一口径）：
 ```bash
-# 默认优先：本地 `artifacts/backend_driver/cheng`（fresh + 可运行）
-# 若缺失/过期，会自动重建本地 driver（默认 system-link）
+# 生产闭环统一可用 driver（无回退口径）
+export BACKEND_DRIVER=artifacts/backend_driver/cheng
+export BACKEND_OPT_DRIVER=artifacts/backend_driver/cheng
+export BACKEND_DRIVER_ALLOW_FALLBACK=0
+
+# 本地缺失时可显式重建（默认 system-link）
+sh src/tooling/build_backend_driver.sh --name:artifacts/backend_driver/cheng
+
+# 开发态可用解析器查看候选（不建议作为生产收口依赖）
 sh src/tooling/backend_driver_path.sh
 
 # 默认：tooling/verify 脚本会在退出时清理本地 `cheng*` 产物（移动到 `chengcache/_trash_cheng`），避免遗留占用空间。
@@ -124,9 +180,9 @@ export BACKEND_DRIVER=artifacts/backend_selfhost_self_obj/cheng.stage2
 ```
 说明：
 - `backend_driver_path.sh` 的可运行性 smoke 默认校验 `stage1` 最小编译路径；如需额外校验 strict 口径，可设 `BACKEND_DRIVER_PATH_STAGE1_STRICT_SMOKE=1`；如需启用 dict fixture 探针可设 `BACKEND_DRIVER_PATH_STAGE1_DICT_SMOKE=1`。
-- `backend_driver_path.sh` 默认优先 `artifacts/backend_driver/cheng`；fallback 顺序为 `artifacts/backend_driver/cheng.fixed3` -> `artifacts/backend_seed/cheng.stage2` -> `dist/releases/current/cheng` -> `backend_driver_exec.sh`，仅在显式 `BACKEND_DRIVER_PATH_ALLOW_SELFHOST=1` 时才追加 `artifacts/backend_selfhost_self_obj/cheng.stage2|stage1`。
-- `backend_prod_closure.sh` 主链 driver 选择默认与上述一致（默认不允许 selfhost fallback）；可用 `BACKEND_PROD_MAIN_DRIVER_PATH_ALLOW_SELFHOST=1` 放开。
-- 若显式 `BACKEND_DRIVER` 不可运行，可设 `BACKEND_DRIVER_ALLOW_FALLBACK=1` 自动回退到可运行候选（默认保持严格失败）。
+- `backend_driver_path.sh` 默认优先 `artifacts/backend_driver/cheng`；其 fallback 候选仅用于开发排障，不属于生产收口口径。
+- `backend_prod_closure.sh` 的生产收口建议固定 `BACKEND_DRIVER=artifacts/backend_driver/cheng` 且 `BACKEND_DRIVER_ALLOW_FALLBACK=0`，避免主链 driver 漂移。
+- 若确需排障对照，可显式 `BACKEND_DRIVER_ALLOW_FALLBACK=1` 允许自动回退候选（不得用于 CI/发布）。
 
 后端链接环境助手（脚本统一注入 self-linker 运行时 `.o`）：
 ```bash
@@ -150,7 +206,7 @@ export SELF_OBJ_BOOTSTRAP_STAGE0=artifacts/backend_seed/cheng.stage2
 sh src/tooling/backend_prod_closure.sh --only-self-obj-bootstrap
 ```
 
-全链自举门禁（Darwin/arm64 必跑；其他平台 best-effort 可能 skip）：
+全链自举门禁（Darwin/arm64 必跑；非支持主机直接失败）：
 ```bash
 sh src/tooling/verify_fullchain_bootstrap.sh
 ```
@@ -158,7 +214,7 @@ sh src/tooling/verify_fullchain_bootstrap.sh
 ```bash
 sh src/tooling/verify_backend_selfhost_bootstrap_fast.sh
 ```
-生产/CI 只跑后端直出 `.o` 的闭环（obj-only fullspec + tool `--help` smoke）：
+生产/CI 的 fullchain 自举闭环（stage2->tool smoke；`stage1_fullspec` 仅作为 internal `obj-only` 校验门禁）：
 ```bash
 FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
 ```
@@ -166,11 +222,13 @@ FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
 - `verify_fullchain_bootstrap.sh` 要求 stage2 driver 已存在（默认 `artifacts/backend_selfhost_self_obj/cheng.stage2`，可用 `FULLCHAIN_STAGE2` 覆盖）。
 - 缺少 stage2 时，先运行 `sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh` 或 `sh src/tooling/verify_backend_ci_obj_only.sh --seed:<path>`。
 - `verify_fullchain_bootstrap.sh` 默认开启复用（`FULLCHAIN_REUSE=1`）：当 stage2/source/runtime 未变化时，复用 `stage1_fullspec_obj`，减少重复闭环耗时。
-- fullchain 工具构建默认关闭（`FULLCHAIN_BUILD_TOOLS=0`）；仅在需要验证 `cheng_pkg_source/cheng_pkg/cheng_storage` 时再显式设置 `FULLCHAIN_BUILD_TOOLS=1`。开启后默认 best-effort（部分工具失败不阻断）；严格模式可设 `FULLCHAIN_BUILD_TOOLS_STRICT=1`，并通过 `FULLCHAIN_BUILD_TOOLS_STRICT_SCOPE=core|all` 控制范围（默认 `core` 仅约束编译器闭环，生态工具保留 best-effort；`all` 强制所有工具源码通过）。
+- fullchain 工具构建默认开启且强阻断（`FULLCHAIN_BUILD_TOOLS=1`）；`FULLCHAIN_BUILD_TOOLS=0` 不再支持。`FULLCHAIN_BUILD_TOOLS_STRICT=0` 已不再支持。
   - 工具构建要求 `MM=orc`，不再自动回退 `MM=off`。
+  - 工具构建链接器默认 `FULLCHAIN_TOOL_LINKER=system`（可显式设为 `self` 进行对照）。
   - 启用后按主机核数并行构建（`FULLCHAIN_TOOL_JOBS`，`0`=auto）。
-  - 工具单项默认超时 `20s`（`FULLCHAIN_TOOL_TIMEOUT`）；超时后优先复用既有可执行产物（`FULLCHAIN_TOOL_FALLBACK_REUSE=1`）。
-  - 若既有产物不可运行，默认会生成仅用于 fullchain gate 的 `--help` stub（`FULLCHAIN_TOOL_STUB_ON_FAIL=1`）；如需“必须源码真实构建”，显式设 `FULLCHAIN_TOOL_STUB_ON_FAIL=0`。
+  - 工具单项默认超时 `60s`（`FULLCHAIN_TOOL_TIMEOUT`）；超时/失败不再复用旧产物或生成 stub，而是直接阻断。
+  - storage 工具默认使用 `src/tooling/cheng_storage_smoke.cheng` 参与 fullchain 构建（`FULLCHAIN_STORAGE_TOOL_SRC` 可覆盖为 `src/tooling/cheng_storage.cheng` 以恢复完整 CLI 口径）。
+  - tool smoke 采用 `--help`/`-h`/无参三路探针；优先要求输出可诊断文本，若工具仅返回状态码（无 stdout/stderr）则记 `info` 并视为“可运行”。
   - `verify_backend_selfhost_bootstrap_self_obj.sh` 支持 `SELF_OBJ_BOOTSTRAP_TIMEOUT=<seconds>`（默认 60）防止 stage1/stage2 自举编译长时间卡死。
   - smoke 子阶段支持独立超时 `SELF_OBJ_BOOTSTRAP_SMOKE_TIMEOUT=<seconds>`（默认 15）；用于在 `fast` 模式下快速触发 smoke fallback，避免总时长被单次卡死拉满。
 - `verify_backend_selfhost_bootstrap_self_obj.sh` 固定使用 `ABI=v2_noptr`（非 `v2_noptr` 将直接报错）。
@@ -195,10 +253,10 @@ FULLCHAIN_OBJ_ONLY=1 sh src/tooling/verify_fullchain_bootstrap.sh
   - 2026-02-08 同机冷态实测：`fast` 约 `17s`，`strict` 约 `24-27s`；`backend_prod_closure.sh --only-self-obj-bootstrap --selfhost-strict` 在 `60s` 约束内通过。
   - 2026-02-06：已修复一类“无输出超时”根因（`src/std/strings.cheng` 的字符串 `==` 对 `nil` 比较递归调用自身）；该问题会让 selfhost 阶段卡住直到超时。
   - 修复后若 selfhost 失败，将优先以可诊断错误退出（而非长时间超时卡住）。
-- `FULLCHAIN_OBJ_ONLY=1` 默认使用 `examples/backend_fullchain_smoke.cheng` 作为 obj-only 样例（要求输出 `fullspec ok`）；可用 `FULLCHAIN_STAGE1_FILE=<path>` 覆盖。
+- `FULLCHAIN_OBJ_ONLY=1` 默认使用 `examples/backend_closedloop_fullspec.cheng` 作为 obj-only 样例（运行 `exit 0` 视为通过）；可用 `FULLCHAIN_STAGE1_FILE=<path>` 覆盖。
 - fullchain stage1 样例编译默认走 `FULLCHAIN_STAGE1_FRONTEND=stage1`（默认单次编译超时 `60s`）。
-- fullchain stage1 样例编译默认超时 `60s`（`FULLCHAIN_STAGE1_TIMEOUT`），默认并行 `FULLCHAIN_STAGE1_MULTI=1`；并行失败会自动串行重试。可用 `FULLCHAIN_STAGE1_MULTI` / `FULLCHAIN_STAGE1_JOBS` 调整并行参数。
-- fullchain stage1 样例链接器可用 `FULLCHAIN_STAGE1_LINKER=auto|self|system` 控制（默认 `auto`：先尝试 `self`，失败后回退 `system`）。
+- fullchain stage1 样例编译默认超时 `60s`（`FULLCHAIN_STAGE1_TIMEOUT`），默认串行 `FULLCHAIN_STAGE1_MULTI=0` 以避免 fullspec 并行抖动；需要并行对照时可显式设 `FULLCHAIN_STAGE1_MULTI=1`（并行失败会自动串行重试）。可用 `FULLCHAIN_STAGE1_MULTI` / `FULLCHAIN_STAGE1_JOBS` 调整并行参数。
+- fullchain stage1 样例链接器仅支持 `FULLCHAIN_STAGE1_LINKER=self|system`（默认 `system`）；`auto` 回退策略已移除（不再自动降级）。
 
 CI/生产（macOS arm64）使用 dist seed 跑“后端自举 + fullchain smoke”：
 ```bash
@@ -207,6 +265,7 @@ sh src/tooling/verify_backend_ci_obj_only.sh
 说明：
 - 默认从 `dist/releases/current_id.txt` 解析 seed；也可传 `--seed:<path>` 指定。
 - 若 dist seed 不存在，会直接失败并提示补充 seed（可用 `--require-seed` 强制严格模式）。
+- `verify_backend_ci_obj_only.sh` 默认 strict：任一步骤返回 `status=2`（skip）会直接失败；`--strict` 仅保留兼容参数。
 - 不会自动使用 `artifacts/backend_seed/cheng.stage2` 或 `artifacts/backend_selfhost_self_obj/cheng.stage2`。
 - 默认额外执行 `backend.ci.selfhost_perf_regression`（读取 `selfhost_timing_<session>.tsv` 做阈值检查）。
 - selfhost perf 阈值默认来自 `src/tooling/selfhost_perf_baseline.env`；可用 `SELFHOST_PERF_BASELINE=<path>` 切换基线文件，或直接用 `SELFHOST_PERF_MAX_*` 覆盖单项阈值。
@@ -228,19 +287,24 @@ sh src/tooling/backend_prod_closure.sh --stress
 ```
 说明：
 - `backend_prod_closure.sh` 默认不跑 fullchain/stress；可用 `--fullchain` / `BACKEND_RUN_FULLCHAIN=1` 和 `--stress` / `BACKEND_RUN_STRESS=1` 显式开启。
+- 一旦开启 `--fullchain`，`backend.fullchain_bootstrap.obj_only` 按 required gate 执行；不再使用 optional/best-effort 语义。
 - `backend_prod_closure.sh` 默认不跑 selfhost 自举（`BACKEND_RUN_SELFHOST=0`）；如需启用自举与相关性能/探针 gate，显式传 `--selfhost`（或设 `BACKEND_RUN_SELFHOST=1`）。
-- `backend_prod_closure.sh` 默认在 `backend.closedloop` 中开启 fullspec（等价注入 `BACKEND_RUN_FULLSPEC=1`）；如需临时快速排障可显式设 `BACKEND_RUN_FULLSPEC=0` 关闭。
+- `backend_prod_closure.sh` 默认在 `backend.closedloop` 中开启 fullspec（等价注入 `BACKEND_RUN_FULLSPEC=1`）；`BACKEND_RUN_FULLSPEC=0` 已不再支持。
 - `backend_prod_closure.sh --uir-stability` 会在 `opt3` 与 `ssa` 闸口之后执行 `backend.uir_stability`；默认已开启（`BACKEND_RUN_UIR_STABILITY=1`）。
-- `backend_prod_closure.sh` 默认 strict：任一步骤 `exit 2`（skip）会直接失败；仅本地排障时再显式加 `--allow-skip`。
+- `backend_prod_closure.sh` 默认 strict：任一步骤 `exit 2`（skip）会直接失败；`--allow-skip` 已不再支持。
 - `backend_prod_closure.sh --no-publish` 默认启用稳定收口参数集（`BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE=1`）：自动关闭 `determinism_strict/opt/opt2/opt3/uir_stability/ssa/ffi/sanitizer/debug/exe_determinism/multi_perf` 可选 gate，仅保留 required 收口链路；设 `BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE=0` 可恢复完整可选 gate。
+- 发布链路默认强制 `release_manifest -> release_bundle -> release_sign -> release_verify` 全链 required；缺失 OpenSSL/签名材料/验签失败会直接阻断（不再 best-effort）。
 - `backend_prod_closure.sh` 不再全局导出统一 linker；改为 gate 级显式口径：dev 链路 gate 固定 `BACKEND_LINKER=self`，release 链路 gate 固定 `BACKEND_LINKER=system`（并强制 `BACKEND_NO_RUNTIME_C=0`）。
 - `backend_prod_closure.sh` 现在仅支持 `ABI=v2_noptr`（若外部传入非 `v2_noptr` 会直接报错退出）；主闭环以 `v2_noptr` 兼容口径执行（`STAGE1_STD_NO_POINTERS=1`），并通过 `backend.abi_v2_noptr` 步骤单独执行严格 no-pointer 门禁。
 - `backend_prod_closure.sh` 默认包含 `backend.abi_v2_noptr` 专项门禁（`src/tooling/verify_backend_abi_v2_noptr.sh`）。
-- `backend_prod_closure.sh` 默认新增并阻断 `backend.profile_schema`（`src/tooling/verify_backend_profile_schema.sh`）、`backend.import_cycle_predeclare`（`src/tooling/verify_backend_import_cycle_predeclare.sh`）、`backend.rawptr_contract`（`src/tooling/verify_backend_rawptr_contract.sh`）、`backend.rawptr_surface_forbid`（`src/tooling/verify_backend_rawptr_surface_forbid.sh`）、`backend.ffi_slice_shim`（`src/tooling/verify_backend_ffi_slice_shim.sh`）、`backend.ffi_outptr_tuple`（`src/tooling/verify_backend_ffi_outptr_tuple.sh`）、`backend.ffi_handle_sandbox`（`src/tooling/verify_backend_ffi_handle_sandbox.sh`）、`backend.ffi_borrow_bridge`（`src/tooling/verify_backend_ffi_borrow_bridge.sh`）、`backend.mem_contract`（`src/tooling/verify_backend_mem_contract.sh`）、`backend.dod_contract`（`src/tooling/verify_backend_dod_contract.sh`）、`backend.mem_image_core`（`src/tooling/verify_backend_mem_image_core.sh`）、`backend.mem_exe_emit`（`src/tooling/verify_backend_mem_exe_emit.sh`）、`backend.profile_baseline`（`src/tooling/verify_backend_profile_baseline.sh`）、`backend.dual_track`（`src/tooling/verify_backend_dual_track.sh`）、`backend.linkerless_dev`（`src/tooling/verify_backend_linkerless_dev.sh`）、`backend.hotpatch_meta`（`src/tooling/verify_backend_hotpatch_meta.sh`）、`backend.hotpatch_inplace`（`src/tooling/verify_backend_hotpatch_inplace.sh`）、`backend.incr_patch_fastpath`（`src/tooling/verify_backend_incr_patch_fastpath.sh`）、`backend.mem_patch_regression`（`src/tooling/verify_backend_mem_patch_regression.sh`）、`backend.hotpatch`（`src/tooling/verify_backend_hotpatch.sh`）、`backend.dod_soa`（`src/tooling/verify_backend_dod_soa.sh`）、`backend.metering_stream`（`src/tooling/verify_backend_metering_stream.sh`）、`backend.release_system_link`（`src/tooling/verify_backend_release_c_o3_lto.sh`）、`backend.noalias_opt`（`src/tooling/verify_backend_noalias_opt.sh`）、`backend.egraph_cost`（`src/tooling/verify_backend_egraph_cost.sh`）、`backend.dod_opt_regression`（`src/tooling/verify_backend_dod_opt_regression.sh`）、`backend.plugin_isolation`（`src/tooling/verify_backend_plugin_isolation.sh`）、`backend.mir_borrow`（`src/tooling/verify_backend_mir_borrow.sh`）与 `backend.plugin_system`（`src/tooling/verify_backend_plugin_system.sh`），确保观测基线、导入循环硬错误与无前置声明回归、Raw Pointer Safety 契约与语法/诊断禁令、Slice 影子桥接、Out-Ptr Tuple 桥接、Handle 沙盒映射、Borrow Struct* 桥接、MemImage/PatchMeta 契约、DOD SoA/Arena/index 契约、MemImage 核心数据流、MemImage 直出 EXE（runtime 合并 + 原子写盘）、热补丁元数据面、热补丁事务执行面、热补丁增量快路径、内存补丁回归门禁、DOD/SoA、noalias/egraph 正确性负例回归、metering streaming、Release system-link 与 Linkerless dev 路径持续收敛。
+- `backend_prod_closure.sh` 默认新增并阻断 `backend.profile_schema`（`src/tooling/verify_backend_profile_schema.sh`）、`backend.emit_obj_contract`（`src/tooling/verify_backend_emit_obj_contract.sh`）、`backend.import_cycle_predeclare`（`src/tooling/verify_backend_import_cycle_predeclare.sh`）、`backend.rawptr_contract`（`src/tooling/verify_backend_rawptr_contract.sh`）、`backend.rawptr_surface_forbid`（`src/tooling/verify_backend_rawptr_surface_forbid.sh`）、`backend.rawptr_migration`（`src/tooling/verify_backend_rawptr_migration.sh`）、`backend.ffi_slice_shim`（`src/tooling/verify_backend_ffi_slice_shim.sh`）、`backend.ffi_outptr_tuple`（`src/tooling/verify_backend_ffi_outptr_tuple.sh`）、`backend.ffi_handle_sandbox`（`src/tooling/verify_backend_ffi_handle_sandbox.sh`）、`backend.ffi_borrow_bridge`（`src/tooling/verify_backend_ffi_borrow_bridge.sh`）、`backend.rawptr_closedloop`（`src/tooling/verify_backend_rawptr_closedloop.sh`）、`backend.mem_contract`（`src/tooling/verify_backend_mem_contract.sh`）、`backend.dod_contract`（`src/tooling/verify_backend_dod_contract.sh`）、`backend.mem_image_core`（`src/tooling/verify_backend_mem_image_core.sh`）、`backend.mem_exe_emit`（`src/tooling/verify_backend_mem_exe_emit.sh`）、`backend.profile_baseline`（`src/tooling/verify_backend_profile_baseline.sh`）、`backend.dual_track`（`src/tooling/verify_backend_dual_track.sh`）、`backend.linkerless_dev`（`src/tooling/verify_backend_linkerless_dev.sh`）、`backend.hotpatch_meta`（`src/tooling/verify_backend_hotpatch_meta.sh`）、`backend.hotpatch_inplace`（`src/tooling/verify_backend_hotpatch_inplace.sh`）、`backend.incr_patch_fastpath`（`src/tooling/verify_backend_incr_patch_fastpath.sh`）、`backend.mem_patch_regression`（`src/tooling/verify_backend_mem_patch_regression.sh`）、`backend.hotpatch`（`src/tooling/verify_backend_hotpatch.sh`）、`backend.dod_soa`（`src/tooling/verify_backend_dod_soa.sh`）、`backend.metering_stream`（`src/tooling/verify_backend_metering_stream.sh`）、`backend.release_system_link`（`src/tooling/verify_backend_release_c_o3_lto.sh`）、`backend.noalias_opt`（`src/tooling/verify_backend_noalias_opt.sh`）、`backend.egraph_cost`（`src/tooling/verify_backend_egraph_cost.sh`）、`backend.dod_opt_regression`（`src/tooling/verify_backend_dod_opt_regression.sh`）、`backend.plugin_isolation`（`src/tooling/verify_backend_plugin_isolation.sh`）、`backend.mir_borrow`（`src/tooling/verify_backend_mir_borrow.sh`）与 `backend.plugin_system`（`src/tooling/verify_backend_plugin_system.sh`），确保观测基线、导入循环硬错误与无前置声明回归、Raw Pointer Safety 契约与语法/诊断禁令、迁移脚本与风险报告收口、Slice 影子桥接、Out-Ptr Tuple 桥接、Handle 沙盒映射、Borrow Struct* 桥接、Raw Pointer required gate 闭环一致性、MemImage/PatchMeta 契约、DOD SoA/Arena/index 契约、MemImage 核心数据流、MemImage 直出 EXE（runtime 合并 + 原子写盘）、热补丁元数据面、热补丁事务执行面、热补丁增量快路径、内存补丁回归门禁、DOD/SoA、noalias/egraph 正确性负例回归、metering streaming、Release system-link 与 Linkerless dev 路径持续收敛。
 - `verify_backend_release_c_o3_lto.sh` 已升级为 required 的 release system-link gate：不再允许 known-blocker 放行，默认强制执行 `system-link + O3/LTO` 并运行产物。
 - `verify_backend_dod_opt_regression.sh` 默认执行 noalias 负例回归（guard fixture off/on 对象一致）与 egraph/cost model 确定性双跑（对象 `cmp -s` 一致），并输出 `artifacts/backend_dod_opt_regression/*.report.txt`。
 - `backend_prod_closure.sh` 默认新增并阻断 `backend.linker_abi_core`（`src/tooling/verify_backend_linker_abi_core.sh`）：生成 Darwin/Linux 自研 linker ABI manifest，差分仅允许 `src/tooling/linker_abi_core_diff_whitelist.allowlist` 白名单键。
 - `backend.linker_abi_core` 默认只尝试非 selfhost driver；仅显式 `BACKEND_LINKER_ABI_CORE_ALLOW_SELFHOST=1` 时才回退 `backend_selfhost_self_obj/*`。
+- `verify_backend_self_linker_elf.sh` / `verify_backend_self_linker_coff.sh` / `verify_backend_linker_abi_core.sh` 已移除 prebuilt-obj link-only 降级：必须由同一 driver 完成跨目标源码编译 + self-link，失败直接阻断。
+- `verify_backend_hotpatch.sh` / `verify_backend_hotpatch_meta.sh` 现固定 required `self-link` 运行态口径：`BACKEND_HOTPATCH_GATE_LINKER` 只允许 `self`，不再接受 system-link 降级；命中 unsupported target 直接失败（不再 `status=skip`）。
+- `verify_backend_emit_obj_contract.sh` 递归扫描 `src/tooling/**/*.sh` 中所有 `BACKEND_EMIT=obj` 使用点，强制要求统一经 `env_prefix_bridge.sh` 注入 internal allow，并阻断显式关闭 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ` 的脚本。
 - `backend_prod_closure.sh` 支持 `BACKEND_OPT_DRIVER`：可仅覆盖 `backend.determinism_strict/exe_determinism_strict` 与 `backend.opt/opt2/multi_lto/multi_perf/opt3/simd/uir_stability/ssa/ffi/sanitizer/debug/exe_determinism` gate driver，不影响主 required-gates driver。
 - `backend_prod_closure.sh` 默认新增并阻断 `backend.noptr_default_cli`（`src/tooling/verify_backend_noptr_default_cli.sh`）与 `backend.noptr_exemption_scope`（`src/tooling/verify_backend_noptr_exemption_scope.sh`），确保“默认入口零指针”与“豁免范围仅限自举/探针 allowlist”。
 - `backend.abi_v2_noptr` 默认优先使用本地 `artifacts/backend_driver/cheng`（要求具备 non-C-ABI no-pointer 诊断 marker），并回退到当前 `BACKEND_DRIVER`；仅在启用 selfhost 时才探测 `backend_selfhost_self_obj/*`；可用 `BACKEND_ABI_V2_DRIVER` 显式覆盖。
@@ -253,9 +317,10 @@ sh src/tooling/backend_prod_closure.sh --stress
 - `verify_backend_closedloop.sh` 默认执行 `backend.import_cycle_predeclare`（`src/tooling/verify_backend_import_cycle_predeclare.sh`），持续验证“循环导入硬错误 + 无前置声明可编译”口径；该 gate 已切换为纯 runtime 断言（负例必须编译失败并输出 `Import cycle detected: ... -> ...` 链路），不再允许 source-contract fallback。
 - `verify_backend_closedloop.sh` 默认执行 `backend.release_system_link`（`src/tooling/verify_backend_release_c_o3_lto.sh`）与 `backend.dual_track`（`src/tooling/verify_backend_dual_track.sh`），确保 Dev/Release 双轨策略持续可回归。
 - `verify_backend_closedloop.sh` 默认执行 `backend.mir_borrow`（`src/tooling/verify_backend_mir_borrow.sh`），确保 `ownership/borrow -> noalias` 语义下沉与 `compile_stamp/generics_report` 字段持续可回归。
-- `verify_backend_closedloop.sh` 中 `backend.x86_64_darwin`/`backend.x86_64_linux` 作为目标矩阵扩展项，即使 `BACKEND_MATRIX_STRICT=1` 也允许 `skip`（不阻断主闭环）。
+- `verify_backend_closedloop.sh` 默认执行并阻断 `backend.linker_abi_core`（`src/tooling/verify_backend_linker_abi_core.sh`）与 `backend.self_linker.(elf|coff)`，跨目标 self-link 门禁不允许 skip 降级。
+- `verify_backend_closedloop.sh` 默认 `BACKEND_MATRIX_STRICT=1` 且 `BACKEND_RUN_FULLSPEC=1`：`status=2` 视为失败，fullspec 固定执行编译+运行（返回码为 0），不再使用 compile-only fallback。
 - `verify_backend_obj_fullspec_gate.sh` 默认复用已有 `artifacts/backend_obj_fullspec_gate/backend_obj_fullspec`（避免重复冷编译超时）；如需强制重编可设 `BACKEND_OBJ_FULLSPEC_REBUILD_ON_SOURCE=1` 或 `BACKEND_OBJ_FULLSPEC_REBUILD_ON_DRIVER=1`。
-- `backend_prod_closure.sh` 在启用 selfhost 时，默认将自举阶段单次编译超时设为 `120s`（`BACKEND_PROD_SELFHOST_TIMEOUT`）。
+- `backend_prod_closure.sh` 在启用 selfhost 时，默认将自举阶段单次编译超时设为 `60s`（`BACKEND_PROD_SELFHOST_TIMEOUT`），并默认启用 RSS 守卫 `24576MB`（`BACKEND_PROD_SELFHOST_MAX_RSS_MB`，设 `0` 关闭）。
 - `backend_prod_closure.sh` 默认对每个 gate 施加 `60s` 超时（`BACKEND_PROD_GATE_TIMEOUT`，设为 `0` 可关闭），超时直接失败并打印 gate 标签。
 - `backend_prod_closure.sh` 默认开启超时诊断（`BACKEND_PROD_TIMEOUT_DIAG=1`）：当 gate 超时会自动采样并输出诊断文件路径（默认目录 `chengcache/backend_timeout_diag`，采样时长 `BACKEND_PROD_TIMEOUT_DIAG_SECONDS=5`，可通过 `BACKEND_PROD_TIMEOUT_DIAG_TOOL` 覆盖采样器命令）。
 - `backend_prod_closure.sh` 默认开启超时摘要（`BACKEND_PROD_TIMEOUT_DIAG_SUMMARY=1`）：超时后会调用 `src/tooling/summarize_timeout_diag.sh` 输出热点 TopN（`BACKEND_PROD_TIMEOUT_DIAG_SUMMARY_TOP`）。
@@ -263,7 +328,7 @@ sh src/tooling/backend_prod_closure.sh --stress
 - `backend.selfhost_perf_regression` 默认加载 `src/tooling/selfhost_perf_baseline.env`（可通过 `SELFHOST_PERF_BASELINE` 覆盖）；发布 bundle 会附带该基线文件以保证阈值口径一致。
 - `backend_prod_closure.sh` 默认开启 `backend.multi_perf_regression`（`BACKEND_RUN_MULTI_PERF=1`），对 `backend.multi`/`backend.multi_lto` 做并行编译性能阈值检查（可用 `--no-multi-perf` 关闭）。
 - `backend.multi_perf_regression` 默认加载 `src/tooling/multi_perf_baseline.env`（可通过 `MULTI_PERF_BASELINE` 覆盖）；可用 `BACKEND_PROD_MULTI_PERF_TIMEOUT` 或 `MULTI_PERF_TIMEOUT` 调整单 gate 超时。
-- 当 `BACKEND_RUN_FULLSPEC=1` 时，`backend.closedloop` 使用独立超时 `BACKEND_PROD_CLOSEDLOOP_TIMEOUT`（默认 `120s`），避免 fullspec 编译被通用 60s gate 误杀。
+- 当 `BACKEND_RUN_FULLSPEC=1` 时，`backend.closedloop` 使用独立超时 `BACKEND_PROD_CLOSEDLOOP_TIMEOUT`（默认 `180s`），避免 fullspec 编译被通用 60s gate 误杀。
 - `backend_prod_closure.sh` 的 selfhost 自举步骤会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`（仅用于自举编译器源码），non-C-ABI no-pointer 策略仍由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁强制。
 - `backend_prod_closure.sh` 在启用 selfhost 时默认自举模式为 `fast`；可用 `--selfhost-strict`（或 `BACKEND_PROD_SELFHOST_MODE=strict`）切到 fixed-point 口径。
 - `backend_prod_closure.sh` 提供显式参数 `--selfhost-fast` / `--selfhost-strict`（优先级高于环境变量）；启用 selfhost 后默认启用 `--selfhost-strict-gate`（可用 `BACKEND_RUN_SELFHOST_STRICT=0` 关闭）在 `fast` 主链后追加一轮 `strict` 自举门禁。
@@ -275,20 +340,20 @@ sh src/tooling/backend_prod_closure.sh --stress
 - strict no-reuse 探针默认阻断主链：默认 `gate=110s`（`BACKEND_PROD_SELFHOST_STRICT_NOREUSE_GATE_TIMEOUT`）与内部 `probe=90s`（`BACKEND_PROD_SELFHOST_STRICT_NOREUSE_PROBE_TIMEOUT`），并自动夹到 `< gate timeout` 以避免外层 gate 误判；会话可用 `BACKEND_PROD_SELFHOST_STRICT_NOREUSE_SESSION` 覆盖。
 - `verify_backend_selfhost_strict_noreuse_probe.sh` 默认使用 `SELFHOST_STRICT_PROBE_GENERIC_MODE=dict`、`SELFHOST_STRICT_PROBE_SKIP_CPROFILE=1`、`SELFHOST_STRICT_PROBE_REQUIRE_RUNNABLE=0`、`SELFHOST_STRICT_PROBE_MULTI=0`、`SELFHOST_STRICT_PROBE_MULTI_FORCE=0`、`SELFHOST_STRICT_PROBE_ALLOW_RETRY=0`、`SELFHOST_STRICT_PROBE_PREFLIGHT=1`（默认 `20s` 预检）；并行 worker 探针若命中 `fork worker failed / unit file not found / crash` 会在进入 stage1 前自动回退串行，避免“并行失败 + 重试”导致门禁耗时放大。当 stage0 seed 明确无法编译 `backend_driver.cheng` 时，软探针会快速 skip 并输出 preflight 日志路径，避免固定等待到 90s/110s 超时。
 - 并行专项性能检查：`sh src/tooling/verify_backend_selfhost_parallel_perf.sh`（同一 stage0 下依次跑 serial/multi 两轮 strict no-reuse，默认要求 `parallel <= serial + 2s`）；`backend_prod_closure.sh` 在启用 selfhost 时默认阻断 `backend.selfhost_parallel_perf`（`BACKEND_RUN_SELFHOST_PARALLEL_PERF=0` 可关闭）。
-- 新增新 driver 自举 smoke 阻断 gate：`sh src/tooling/verify_backend_driver_selfbuild_smoke.sh`。`backend_prod_closure.sh` 在启用 selfhost 时默认阻断 `backend.driver_selfbuild_smoke`（`BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=0` 可关闭），默认 gate 超时 `60s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_TIMEOUT`），内部自举超时 `55s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_BUILD_TIMEOUT`）；失败会输出 `build_log/attempt_report/attempt_log/crash_report` 与根因分类（`cause`）。
+- 新增新 driver 自举 smoke 阻断 gate：`sh src/tooling/verify_backend_driver_selfbuild_smoke.sh`。`backend_prod_closure.sh` 在启用 selfhost 时默认阻断 `backend.driver_selfbuild_smoke`（`BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=0` 可关闭），默认 gate 超时 `60s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_TIMEOUT`），内部自举超时 `55s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_BUILD_TIMEOUT`），stage1 smoke 超时默认 `60s`（`DRIVER_SELFBUILD_SMOKE_STAGE1_TIMEOUT`），并默认启用 RSS 守卫 `24576MB`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_MAX_RSS_MB` / `DRIVER_SELFBUILD_SMOKE_MAX_RSS_MB`，设 `0` 关闭）；默认输出与主 driver 统一为 `artifacts/backend_driver/cheng`（可用 `BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_OUTPUT` 覆盖）；生产闭环会强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0`/`DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，避免 smoke 语义被环境变量降级；`--help` 探针日志默认落盘到 `<report-dir>/selfbuild_smoke.help.<pid>.log` 便于诊断。失败会输出 `build_log/smoke_log/attempt_report/attempt_log/crash_report` 与根因分类（`cause`）。
 - 若已显式设置 `BACKEND_DRIVER` 且可执行，`backend_prod_closure.sh` 会优先将其作为 selfhost stage0，避免额外重建本地 driver。
 - 若未显式提供 stage0，`backend_prod_closure.sh` 会按“可编译 smoke 探测”优先复用 `artifacts/backend_selfhost_self_obj/cheng_stage0_prod`（其次 `cheng_stage0_default`、`cheng.stage2`、`cheng.stage1`、`artifacts/backend_driver/cheng`、`dist/releases/current/cheng`、`artifacts/backend_seed/cheng.stage2`）；探测失败（如可执行但编译崩溃）会自动跳过并回退到 `backend_driver_path.sh`。
 - stage0 探针默认走 `BACKEND_PROD_STAGE0_PROBE_MODE=path`（仅复用 `backend_driver_path.sh` 的可运行 smoke，不再额外重编 `backend_driver.cheng`）；可切到 `light`（stage1 小样例）或 `full`（历史重型探针）排查问题。
 - `backend_prod_closure.sh` 在启用 selfhost 时默认固定复用口径：`BACKEND_PROD_SELFHOST_REUSE=1`、`BACKEND_PROD_SELFHOST_SESSION=prod`（可覆盖），减少重复冷编译与并发互踩。
 - `verify_backend_selfhost_bootstrap_self_obj.sh` 会把 stage0 driver 固化拷贝到 `artifacts/backend_selfhost_self_obj/cheng_stage0_<session>` 后再执行，且仅在 stage0 **内容变化**时更新该副本，避免因时间戳漂移触发无效重编。
 - `verify_backend_selfhost_bootstrap_self_obj.sh` 在 `SELF_OBJ_BOOTSTRAP_REUSE=1` 下会复用 smoke 产物（`hello_puts`）并仅在依赖变化时重编，降低重复验收耗时。
-- `verify_backend_selfhost_bootstrap_self_obj.sh` 在 `GENERIC_MODE` 未显式设置时：`fast` 默认 `dict`、`strict` 默认 `hybrid`；并且 timeout 回收采用进程组+进程本体双重 kill，避免遗留孤儿编译进程。
+- `verify_backend_selfhost_bootstrap_self_obj.sh` 在 `GENERIC_MODE` 未显式设置时：`fast` 默认 `dict`、`strict` 默认 `hybrid`；并且 timeout 回收采用进程组+进程本体双重 kill，避免遗留孤儿编译进程。脚本默认启用 RSS 守卫 `SELF_OBJ_BOOTSTRAP_MAX_RSS_MB=24576`（设 `0` 关闭），并在启动前回收 `artifacts/backend_selfhost_self_obj` 下的孤儿 `cheng_stage*` 进程。
 - `backend_prod_closure.sh` 默认执行 `backend.coff_lld_link`；`verify_backend_coff_lld_link.sh` 在缺少 `lld-link/llvm-lld/ld.lld/lld` 时自动回退为 COFF `obj-only` 校验（不再 skip）。
 - `backend_prod_closure.sh` 结束时会输出 `backend_prod_closure.timing_top`（按耗时降序的 gate top 列表），用于持续压缩闭环耗时。
 - 生产/CI 可用 `--require-seed` 禁止使用本机 stage0；`--require-seed` 需要显式传 `--seed/--seed-id/--seed-tar`。
 - 发布（默认开启）要求显式 seed：需传 `--seed/--seed-id/--seed-tar`；仅做本地闭环可加 `--no-publish`。
 - `scripts/closedloop.sh` 在 `CLOSEDLOOP_PROD=1` 下默认以 `--no-publish` 运行 `backend_prod_closure.sh`；若需要发布门禁，请显式设置 `CLOSEDLOOP_BACKEND_PROD_ARGS` 传入 seed 参数。
-- 在上述 `backend_prod_closure.sh` 调用中，`backend.closedloop` 默认会跑 fullspec（`BACKEND_RUN_FULLSPEC=1`）；仅本地排障时可在 `CLOSEDLOOP_BACKEND_PROD_ARGS` 或环境中显式设置 `BACKEND_RUN_FULLSPEC=0`。
+- 在上述 `backend_prod_closure.sh` 调用中，`backend.closedloop` 默认会跑 fullspec（`BACKEND_RUN_FULLSPEC=1`）；`BACKEND_RUN_FULLSPEC=0` 已不再支持。
 - `scripts/closedloop.sh` 也支持 `CLOSEDLOOP_UIR_STABILITY=1`，会自动把 `backend_prod_closure.sh --uir-stability` 加到生产闭环参数（与 `CLOSEDLOOP_BACKEND_PROD_ARGS` 合并）。
 - `scripts/closedloop.sh` 默认导出 `BACKEND_PROD_GATE_TIMEOUT=60`、`BACKEND_PROD_SELFHOST_TIMEOUT=60`、`BACKEND_PROD_TIMEOUT_DIAG=1`、`BACKEND_RUN_SELFHOST_PERF=1`。
 - `scripts/closedloop.sh` 在 `CLOSEDLOOP_PROD=1` 下默认 `STAGE1_FULLSPEC=0`（可通过 `STAGE1_FULLSPEC=1` 或 `CLOSEDLOOP_STAGE1_FULLSPEC_DEFAULT=1` 开启）；开启时默认导出 `STAGE1_FULLSPEC_TIMEOUT=60`（可显式覆盖）。
@@ -297,7 +362,7 @@ sh src/tooling/backend_prod_closure.sh --stress
 - `scripts/closedloop.sh` 末尾默认尝试输出 timeout 采样摘要（`CLOSEDLOOP_TIMEOUT_SUMMARY=1`）以及 stage1 fullspec 超时摘要（`CLOSEDLOOP_STAGE1_TIMEOUT_SUMMARY=1`）。
 - `build_backend_driver.sh` 自举重建默认采用串行增量（`BACKEND_BUILD_DRIVER_MULTI=0`）；需要并行时可显式设为 `1`（并行失败会自动串行重试）。可用 `BACKEND_BUILD_DRIVER_MULTI` / `BACKEND_BUILD_DRIVER_INCREMENTAL` / `BACKEND_BUILD_DRIVER_JOBS` 覆盖。
 - `build_backend_driver.sh` 未显式指定 stage0 时，会优先尝试 `artifacts/backend_selfhost_self_obj/cheng_stage0_*` 与 `artifacts/backend_selfhost_self_obj/cheng.stage2|stage1`，再尝试 `artifacts/backend_driver/cheng`、`dist/releases/current/cheng`、`artifacts/backend_seed/cheng.stage2` 与本地 `./cheng`。
-- `build_backend_driver.sh` 默认 `BACKEND_BUILD_DRIVER_LINKER=system`（可显式设 `self` 做兼容验证）、`GENERIC_MODE=dict`（可覆盖）；默认单次编译尝试超时 `60s`（`BACKEND_BUILD_DRIVER_TIMEOUT`）；默认最多尝试 3 个 stage0 候选（`BACKEND_BUILD_DRIVER_MAX_STAGE0_ATTEMPTS`，`0` 表示尝试全部）；默认关闭 stage1 编译 smoke（`BACKEND_BUILD_DRIVER_SMOKE=0`，需要时可设 `1` 开启）；可设 `BACKEND_BUILD_DRIVER_FORCE=1` 跳过 reuse 强制重建。默认允许“重建失败后保留已有健康 driver”，如需硬失败可设 `BACKEND_BUILD_DRIVER_NO_RECOVER=1`（新 smoke 阻断 gate 默认开启此开关）。自举超时/失败会直接失败并返回错误，不再回退 stage0。
+- `build_backend_driver.sh` 默认 `BACKEND_BUILD_DRIVER_LINKER=system`（可显式设 `self` 做兼容验证）、`GENERIC_MODE=dict`（可覆盖）；默认单次编译尝试超时 `60s`（`BACKEND_BUILD_DRIVER_TIMEOUT`）并启用 RSS 守卫 `24576MB`（`BACKEND_BUILD_DRIVER_MAX_RSS_MB`，设 `0` 关闭）；默认最多尝试 3 个 stage0 候选（`BACKEND_BUILD_DRIVER_MAX_STAGE0_ATTEMPTS`，`0` 表示尝试全部）；默认关闭 stage1 编译 smoke（`BACKEND_BUILD_DRIVER_SMOKE=0`，需要时可设 `1` 开启）；可设 `BACKEND_BUILD_DRIVER_FORCE=1` 跳过 reuse 强制重建。默认允许“重建失败后保留已有健康 driver”，如需硬失败可设 `BACKEND_BUILD_DRIVER_NO_RECOVER=1`（新 smoke 阻断 gate 默认开启此开关）。自举超时/失败会直接失败并返回错误，不再回退 stage0。
 - `build_backend_driver.sh` 自举编译会同步注入 `STAGE1_SKIP_SEM/OWNERSHIP/CPROFILE` 与 `CHENG_STAGE1_SKIP_SEM/OWNERSHIP/CPROFILE` 双口径环境变量，兼容历史 seed stage0 的前缀读取差异，避免误开语义检查导致自举失败。
 - 在 `MM=orc BACKEND_LINKER=self` 口径下，`opt/opt2/multi-lto/ssa/debug`（以及可选 `stress`）gate 已统一固定串行口径（`BACKEND_MULTI=0`、`BACKEND_MULTI_FORCE=0`、`BACKEND_WHOLE_PROGRAM=1`）以保证稳定可复现。
 - `verify_backend_concurrency_stress.sh` 默认跳过（`BACKEND_CONCURRENCY_STRESS_ENABLED=0`）；需要并发压力回归时显式设置 `BACKEND_CONCURRENCY_STRESS_ENABLED=1`。
@@ -353,12 +418,12 @@ MM=orc BACKEND_LINKER=system BACKEND_RUN_FULLSPEC=1 sh src/tooling/verify_backen
 MM=orc sh src/tooling/verify_backend_self_linker_riscv64.sh
 ```
 说明：
-- `verify_backend_closedloop.sh` 默认 `BACKEND_RUN_FULLSPEC=0`（不跑 fullspec）；显式设为 `1` 才开启 fullspec 编译+运行门禁。
+- `verify_backend_closedloop.sh` 默认 `BACKEND_RUN_FULLSPEC=1` 且 `BACKEND_MATRIX_STRICT=1`（fullspec 编译+运行门禁为 required）；`BACKEND_RUN_FULLSPEC=0` / `BACKEND_MATRIX_STRICT=0` 已不再支持。
 - `verify_backend_closedloop.sh` 已纳入 `backend.spawn_api_gate`，对应脚本为 `src/tooling/verify_backend_spawn_api_gate.sh`（默认 API 禁 raw spawn、legacy 显式入口可用；当前 `fn()` 入口正向口径为 `spawn(entry)`）。
-- `BACKEND_RUN_FULLSPEC=1` 默认使用 `examples/backend_closedloop_fullspec.cheng`；可用 `BACKEND_CLOSEDLOOP_FULLSPEC_INPUT` 覆盖输入文件。
+- `BACKEND_RUN_FULLSPEC=1` 使用 `examples/backend_closedloop_fullspec.cheng`；可用 `BACKEND_CLOSEDLOOP_FULLSPEC_INPUT` 覆盖输入文件。
 - fullspec 编译默认口径为 `BACKEND_FULLSPEC_SKIP_SEM=1`、`BACKEND_FULLSPEC_GENERIC_MODE=dict`、`BACKEND_FULLSPEC_GENERIC_SPEC_BUDGET=0`、`BACKEND_FULLSPEC_SKIP_OWNERSHIP=1`、`BACKEND_FULLSPEC_VALIDATE=0`，并固定 `BACKEND_WHOLE_PROGRAM=1` 与 `BACKEND_CLOSEDLOOP_FULLSPEC_MULTI=0`（默认串行编译；需要并行时显式覆盖）。
 - `verify_backend_closedloop.sh` 在 fullspec 编译后新增 `backend.closedloop_fullspec.symcheck`：若可用 `nm`，会阻断未解析 `seqBytesOf_T` 符号回归。
-- `verify_backend_mm.sh` 默认运行 `mm_live_balance + mm_container_balance`；容器用例默认使用 `BACKEND_MM_CONTAINER_FRONTEND=stage1`。如需关闭容器用例可设 `BACKEND_MM_CONTAINER=0`。
+- `verify_backend_mm.sh` 固定运行 `mm_live_balance + mm_container_balance`（required runtime gate）；`BACKEND_MM_CONTAINER=0` 已不再支持。容器用例前端可用 `BACKEND_MM_CONTAINER_FRONTEND` 覆盖（默认 `stage1`）。
 - `verify_backend_multi.sh` 保持并行优先；并行失败会自动串行重试，避免偶发并行崩溃阻断闭环。
 - `verify_backend_self_linker_riscv64.sh` 默认口径为 `MM=orc`，并优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（若存在）以避免 gate 内重建 driver 触发超时。
 
@@ -437,9 +502,26 @@ sh src/tooling/verify_stage1_seed_layout.sh
 - 主 seed 口径为 backend 可执行 seed（优先 `artifacts/backend_seed/cheng.stage2`，也可通过 `SELF_OBJ_BOOTSTRAP_STAGE0` 指定）。
 - `src/stage1/frontend_bootstrap.seed.c` 必须不存在。
 - `verify.sh` 与 `verify_backend_closedloop.sh` 会执行该门禁。
-- `verify.sh` 默认导出 `BACKEND_PROD_GATE_TIMEOUT=60`、`BACKEND_PROD_SELFHOST_TIMEOUT=120`、`BACKEND_PROD_TIMEOUT_DIAG=1`、`BACKEND_RUN_SELFHOST=0`；可通过 `VERIFY_LIBP2P_FRONTIER=1` 追加 `libp2p frontier` 探针门禁。
+- `verify.sh` 默认导出 `BACKEND_PROD_GATE_TIMEOUT=60`、`BACKEND_PROD_SELFHOST_TIMEOUT=60`、`BACKEND_PROD_TIMEOUT_DIAG=1`、`BACKEND_RUN_SELFHOST=0`；可通过 `VERIFY_LIBP2P_FRONTIER=1` 追加 `libp2p frontier` 探针门禁。
 - `verify.sh` 默认同时导出 `BACKEND_PROD_TIMEOUT_DIAG_SUMMARY=1` 与 `FRONTIER_TIMEOUT_DIAG_SUMMARY=1`（超时后自动打印热点摘要）。
+- `verify.sh` 默认把 `verify.tooling_cmdline` 作为必跑 gate（`sh src/tooling/verify_tooling_cmdline.sh`）。
+- `verify.sh` 默认优先使用 `bundle core` 入口运行 `chengc/verify_backend_closedloop/backend_prod_closure`（缺失时自动构建）：
+  - `VERIFY_USE_TOOLING_BUNDLE_CORE=1`（默认开启）
+  - `VERIFY_TOOLING_BUNDLE_CORE_AUTO_BUILD=1`（默认开启）
+  - `VERIFY_TOOLING_BUNDLE_OUT_DIR`（默认 `artifacts/tooling_bundle`）
+  - `VERIFY_TOOLING_BUNDLE_CORE_BIN_DIR`（默认 `artifacts/tooling_bundle/core/bin`）
+  - `VERIFY_TOOLING_BUNDLE_LINKER`（默认 `system`）
+- `backend_prod_closure.sh` 默认把 required gates 收口到 `full bundle` 入口（直接执行 `artifacts/tooling_bundle/full/bin/<gate>`），并强制：
+  - `TOOLING_EXEC_BUNDLE_PROFILE=full`
+  - `TOOLING_EXEC_REQUIRE_BUNDLE=1`
+  - `TOOLING_EXEC_BUNDLE_CORE_AUTO_BUILD=0`
+- 新增阻断门禁：`backend.zero_script_closure`（`src/tooling/verify_backend_zero_script_closure.sh`），禁止 `backend_prod_closure.sh` 出现 `sh src/tooling/*.sh` 直调。
+- `verify_tooling_cmdline.sh` 现在同时校验：
+  - `core profile`（聚焦闭环核心入口）
+  - `full profile + TOOLING_EXEC_REQUIRE_BUNDLE=1`（抽样非 core 入口 `verify_no_legacy_net_multiformats_imports`）
+- `verify.sh` 在运行 `verify.backend_prod_closure` 前会预构建 `full bundle`（`build.tooling_bundle_full` / `bundle.tooling_full`），以满足零脚本闭环的 bundle 预置要求。
 - `verify.sh` 的 `chengc` smoke case 默认固定 `BACKEND_DRIVER=artifacts/backend_seed/cheng.stage2`；可用 `VERIFY_CHENGC_DRIVER=<path>` 覆盖，或 `VERIFY_USE_STABLE_DRIVERS=0` 关闭稳定 driver 注入。
+- `verify.sh` 的轻量 `chengc` smoke 默认使用 `VERIFY_SMOKE_LINKER=system`（避免开发态 self-link 抖动导致误报）；如需对照 self-link 可显式设 `VERIFY_SMOKE_LINKER=self`。
 - `verify.sh` 轻量 case 默认使用 `VERIFY_FRONTEND=stage1`。
 - `list_comp` 与 `pkg_import_srcroot` 默认走 `build` 模式（快速 obj 编译校验，不再默认跳过）：
   - `VERIFY_LIST_COMP_MODE=build|run|skip`（兼容 `VERIFY_LIST_COMP=1` -> `run`）。
@@ -499,9 +581,22 @@ sh src/tooling/cheng_pkg_fetch.sh --lock:build/cheng_pkg/cheng.lock.toml --print
 - `src/tooling/mobile_ci_android.sh`
 - `src/tooling/mobile_ci_ios.sh`
 - `src/tooling/mobile_ci_harmony.sh`
+- `src/tooling/mobile_run_android.sh`
+- `src/tooling/mobile_run_ios.sh`
+- `src/tooling/mobile_run_harmony.sh`
+- `src/tooling/verify_mobile_run_entrypoints.sh`
 
 说明：
 - `src/tooling/build_mobile_export.sh` 在导出 Android 工程时，会优先使用 `src/tooling/mobile/android/cheng_mobile_host_android.c` 覆盖模板，避免部分设备 `ANativeWindow_lock` 返回非 4BPP buffer 导致的越界写崩溃。
+- Android 导出与运行链路默认启用 Kotlin-only 校验：
+  - `app/src/main/kotlin` 必须存在
+  - `app/src/main` 下出现 `.java` 源文件会直接失败
+- 统一入口支持：
+  - `src/tooling/chengc.sh run android <file.cheng>`（支持 `--no-build --no-install --no-run --serial: --native`）
+  - `src/tooling/chengc.sh run ios <file.cheng>`
+  - `src/tooling/chengc.sh run harmony <file.cheng>`
+- 快速门禁（不依赖真机安装）：
+  - `sh src/tooling/verify_mobile_run_entrypoints.sh`
 
 ## bootstrap.sh（已退役）
 
