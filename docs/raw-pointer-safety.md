@@ -132,6 +132,14 @@ importc fn sqlite3_close(db: SqliteDb)
 - 非目标：本轮不引入新语言级裸指针类型，不新增“逃生后门”语法。
 - 兼容策略：允许旧 FFI 声明通过迁移脚本升级，不允许继续新增裸指针签名。
 
+### 1.0) 方案命名与规范级别
+- 官方方案名：`零裸指针生产闭环`（`Zero-RawPtr Production Closure`，缩写 `ZRPC`）。
+- 规范级别：`Normative`（规范性约束）；实现、门禁、文档如有冲突，以 `docs/cheng-formal-spec.md` 附录 B 为准。
+- `rawptr_contract.scheme.id=ZRPC`
+- `rawptr_contract.scheme.name=zero_rawptr_production_closure`
+- `rawptr_contract.scheme.normative=1`
+- `rawptr_contract.enforce.mode=hard_fail`
+
 ### 1.1) RPSPAR-01 冻结契约标记（机器可校验）
 - `rawptr_contract.version=1`
 - `rawptr_contract.annotation.ffi_map=arg_ptr_len`
@@ -345,29 +353,47 @@ flowchart LR
   - 校验摘要：`closedloop_gate_ok=1`、`prod_closure_gate_ok=1`
 
 ## 9) 进度同步（RPSPAR-04）
-- `状态`：`in_progress`（代码已落地，生产闭环验收阻塞）
+- `状态`：`done`
 - `同步日期`：`2026-02-21`
 - `变更范围`：
   - `src/backend/uir/uir_internal/uir_core_builder.cheng`：新增 `@ffi_out_ptrs + @importc` 降级（raw extern + tuple wrapper），覆盖 out 参数物理位次映射、tuple arity 校验、status/no-status 两种返回形态。
   - `src/backend/uir/uir_internal/uir_core_builder.cheng`：补充 stage0 兼容改写（`add(outNodes, n)`，避免 `add(outNodes->, n)` 触发老编译器语法错误）。
+  - `src/backend/uir/uir_internal/uir_core_builder.cheng`：补齐 tuple 返回布局收敛（object-return `nkTupleLit` 走 `emitTupleLitToPtr` 直写 `__ret`，避免 `typeCache` 丢失导致的字段偏移不一致）。
+  - `src/backend/tooling/backend_driver.cheng`：恢复 internal `emit=obj` 输出路径（受 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ`/`CHENG_BACKEND_INTERNAL_ALLOW_EMIT_OBJ` 保护），用于 outptr gate 的 obj-only 正例验收。
   - `tests/cheng/backend/fixtures/ffi_outptr_tuple_importc_pair_i32.cheng`：运行态正例（void + out-ptr -> tuple）。
   - `tests/cheng/backend/fixtures/ffi_outptr_tuple_importc_status_i32_objonly.cheng`：status tuple 正例（obj-only 编译）。
   - `tests/cheng/backend/fixtures/compile_fail_ffi_outptr_tuple_arity_mismatch.cheng`：arity 负例（诊断必须命中）。
-  - `src/tooling/verify_backend_ffi_outptr_tuple.sh`：新增 gate（运行态正例 + obj-only 正例 + 负例诊断）。
+  - `src/tooling/verify_backend_ffi_outptr_tuple.sh`：新增 gate 并收敛默认链路（`gate_linker=system`，`BACKEND_NO_RUNTIME_C=0`，obj-only 子用例同步注入 `CHENG_BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`）。
   - `src/tooling/build_backend_driver.sh`：补齐 `BACKEND_*` 与 `CHENG_BACKEND_*` 双栈环境注入，修复旧 stage0 驱动的前缀兼容问题（避免直接 `output path required` 失败）。
   - `src/tooling/verify_backend_closedloop.sh`：接入 `backend.ffi_outptr_tuple`。
   - `src/tooling/backend_prod_closure.sh`：接入 required `backend.ffi_outptr_tuple`，并补充发布 bundle 附带脚本/fixture。
   - `src/tooling/README.md`、`docs/cheng-backend-arch.md`：补充 gate 与回归入口说明。
 - `验收命令`：
+  - `BACKEND_BUILD_DRIVER_FORCE=1 BACKEND_BUILD_DRIVER_NO_RECOVER=1 sh src/tooling/build_backend_driver.sh --name:artifacts/backend_driver/cheng`
   - `sh src/tooling/verify_backend_ffi_outptr_tuple.sh`
+  - `sh src/tooling/verify_backend_ffi_slice_shim.sh`
+  - `sh src/tooling/verify_backend_ffi_borrow_bridge.sh`
+  - `sh src/tooling/verify_backend_ffi_handle_sandbox.sh`
 - `验收结果`：
-  - 当前输出：`src/tooling/backend_driver_exec.sh: line 65: <pid> Segmentation fault: 11 "$real_driver" "$@"`
-  - gate 结论：`runtime fixture build failed (status=139)`
-  - 阻塞说明：
-    - 现网 `artifacts/backend_driver/cheng` 在 RPSPAR-04 fixture 编译路径崩溃，无法进入新增 lowering 验收。
-    - `sh src/tooling/build_backend_driver.sh --name:artifacts/backend_driver/cheng` 在本机仍未收敛：
-      - `selfhost_system_link`：`ld: symbol(s) not found for architecture arm64`
-      - `selfhost_self_link`：`macho_linker: unsupported undefined reloc type (0) for __tlv_bootstrap`
+  - 输出：`verify_backend_ffi_outptr_tuple ok`
+  - 报告：`artifacts/backend_ffi_outptr_tuple/backend_ffi_outptr_tuple.arm64-apple-darwin.report.txt`
+  - 快照：`artifacts/backend_ffi_outptr_tuple/backend_ffi_outptr_tuple.arm64-apple-darwin.snapshot.env`
+  - 校验摘要：`build_run_status=0`、`run_status=0`、`build_obj_status=0`、`diag_ok=1`
+  - 回归摘要：`verify_backend_ffi_slice_shim ok`、`verify_backend_ffi_borrow_bridge ok`、`verify_backend_ffi_handle_sandbox ok`
+- `闭环收敛增量`（`2026-02-21`）：
+  - `src/tooling/verify_backend_noalias_opt.sh`、`src/tooling/verify_backend_egraph_cost.sh`、`src/tooling/verify_backend_dod_opt_regression.sh`：所有 `BACKEND_EMIT=obj` 编译路径补齐 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1` 与 `CHENG_BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`，消除 internal obj gate 误拦截。
+  - `src/tooling/verify_backend_hotpatch.sh`、`src/tooling/verify_backend_hotpatch_meta.sh`：固定 required `self-link` 运行态探针；运行态异常（含信号退出）直接失败，已移除 `system linker` 回退路径。
+  - `src/tooling/verify_backend_self_linker_elf.sh`、`src/tooling/verify_backend_self_linker_coff.sh`、`src/tooling/verify_backend_linker_abi_core.sh`：跨目标自链接能力缺失时按 required gate 直接失败（`exit 1`），不再 `skip`。
+  - `src/tooling/verify_backend_noptr_exemption_scope.sh`：补齐 no-pointer 豁免 allowlist（`verify_backend_mem_patch_regression.sh`、`verify_backend_import_cycle_predeclare.sh`），消除白名单误报。
+  - `docs/raw-pointer-safety.md`、`docs/cheng-formal-spec.md`：将方案名固定为 `ZRPC`，并新增 `rawptr_contract.enforce.mode=hard_fail`，明确该契约为规范强制执行而非建议项。
+  - `src/tooling/build_backend_rawptr_contract.sh`、`src/tooling/verify_backend_rawptr_contract.sh`：新增 `ZRPC + normative=1 + enforce.mode=hard_fail` 的硬校验；任一缺失或值漂移直接 fail，阻断闭环与发布路径。
+  - `src/tooling/verify_backend_coff_lld_link.sh`：补齐 obj-only 产物构建的 internal 放行开关（`BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1` + `CHENG_BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`），与“外部仅 `emit=exe`”约束对齐。
+  - `src/tooling/verify_backend_mm.sh`：`self-link` 构建/运行失败直接失败，已移除 compile-only 回退路径。
+  - `src/tooling/backend_rawptr_contract.env`：按最新脚本/文档哈希重建契约基线。
+  - 验收命令：`BACKEND_RUN_FULLSPEC=0 sh src/tooling/verify_backend_closedloop.sh`
+  - 验收结果：`verify_backend_closedloop ok`
+  - 验收命令：`sh src/tooling/backend_prod_closure.sh --no-publish`
+  - 验收结果：`backend_prod_closure ok`（`EXIT_CODE=0`，含 `verify_backend_coff_lld_link ok`、`verify_backend_mm ok`）
 
 ## 9) 进度同步（RPSPAR-06）
 - `状态`：`done`
@@ -455,3 +481,53 @@ flowchart LR
   - 报告：`artifacts/backend_rawptr_surface_forbid/backend_rawptr_surface_forbid.report.txt`
   - 快照：`artifacts/backend_rawptr_surface_forbid/backend_rawptr_surface_forbid.snapshot.env`
   - 校验摘要：`backend.rawptr_surface_forbid` 已接入 `verify_backend_closedloop` 与 `backend_prod_closure` required 链路
+
+## 13) 迁移入口（RPSPAR-07）
+- `迁移前后对照`（最小样例）：
+  - before：`@importc("cheng_abi_sum_seq_i32") fn sumSeqI32(xs: openArray[int32]): int32`
+  - after：`@importc("cheng_abi_sum_seq_i32") fn sumSeqI32(xs: int32[]): int32`
+- `一键迁移命令`：
+  - `sh src/tooling/rawptr_migrate_ffi.sh --root:src --apply --report:artifacts/backend_rawptr_migration/rawptr_migration.report.txt --suggestions:artifacts/backend_rawptr_migration/rawptr_migration.suggestions.txt --backup-manifest:artifacts/backend_rawptr_migration/rawptr_migration.backups.tsv`
+- `一键回滚命令`：
+  - `sh src/tooling/rawptr_migrate_ffi.sh --rollback:artifacts/backend_rawptr_migration/rawptr_migration.backups.tsv`
+- `说明`：
+  - 当前自动改写范围固定为 safe rewrite：`openArray[T] -> T[]`。
+  - `void* / ptr_add / load_ptr / store_ptr / copyMem / setMem / zeroMem` 会产出风险报告与替代建议（`@ffi_handle`、`@ffi_out_ptrs`、borrow bridge、slice bridge），不做盲改。
+
+## 14) 进度同步（RPSPAR-07）
+- `状态`：`done`
+- `完成日期`：`2026-02-22`
+- `变更范围`：
+  - `src/tooling/rawptr_migrate_ffi.sh`：新增 Raw Pointer FFI 迁移工具（scan/apply/check/rollback + report/suggestions/backups）。
+  - `src/tooling/verify_backend_rawptr_migration.sh`：新增 `backend.rawptr_migration` gate（apply/check/rollback 闭环 + 文档/接入点校验）。
+  - `src/tooling/verify_backend_closedloop.sh`：接入 `backend.rawptr_migration`。
+  - `src/tooling/backend_prod_closure.sh`：接入 required `backend.rawptr_migration`，并将迁移脚本与 gate 脚本纳入 release bundle extras。
+  - `src/tooling/README.md`：新增迁移入口、回滚命令与 gate 描述。
+- `验收命令`：
+  - `sh src/tooling/verify_backend_rawptr_migration.sh`
+- `验收结果`：
+  - 输出：`verify_backend_rawptr_migration ok`
+  - 报告：`artifacts/backend_rawptr_migration/backend_rawptr_migration.report.txt`
+  - 快照：`artifacts/backend_rawptr_migration/backend_rawptr_migration.snapshot.env`
+  - 校验摘要：`apply_status=0`、`rollback_status=0`、`risk_status=1`（`--check` 正确阻断 legacy raw pointer fixture）
+
+## 15) 进度同步（RPSPAR-08）
+- `状态`：`done`
+- `完成日期`：`2026-02-22`
+- `变更范围`：
+  - `src/tooling/verify_backend_rawptr_closedloop.sh`：新增 `backend.rawptr_closedloop` gate（required gate 集合、脚本存在性、closedloop/prod closure/verify.sh/CI 接入一致性校验）。
+  - `src/tooling/verify_backend_closedloop.sh`：接入 `backend.rawptr_closedloop`。
+  - `src/tooling/backend_prod_closure.sh`：接入 required `backend.rawptr_closedloop`。
+  - `src/tooling/build_backend_rawptr_contract.sh`：`BACKEND_RAWPTR_CONTRACT_REQUIRED_GATES` 改为从 `rawptr_contract.required_gate.*=1` 自动提取。
+  - `src/tooling/verify_backend_rawptr_contract.sh`：按 `BACKEND_RAWPTR_CONTRACT_REQUIRED_GATES` 全量校验 closedloop/prod closure 接入，不再硬编码两项。
+  - `src/tooling/backend_rawptr_contract.env`：重建 required gates 基线（覆盖 `backend.rawptr_contract` 到 `backend.rawptr_closedloop` 全集）。
+  - `src/tooling/README.md`：required gate 总览新增 `backend.rawptr_migration` 与 `backend.rawptr_closedloop`。
+- `验收命令`：
+  - `sh src/tooling/verify_backend_rawptr_closedloop.sh`
+  - `sh src/tooling/verify_backend_rawptr_contract.sh`
+- `验收结果`：
+  - 输出：`verify_backend_rawptr_closedloop ok`
+  - 输出：`verify_backend_rawptr_contract ok`
+  - 报告：`artifacts/backend_rawptr_closedloop/backend_rawptr_closedloop.report.txt`
+  - 快照：`artifacts/backend_rawptr_closedloop/backend_rawptr_closedloop.snapshot.env`
+  - 校验摘要：Raw Pointer required gates 已全量接入 `verify_backend_closedloop` 与 `backend_prod_closure`，并经 `verify.sh` 与 CI 路径覆盖。

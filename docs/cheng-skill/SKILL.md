@@ -75,6 +75,8 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - `backend_prod_closure.sh` 在 `STAGE1_NO_POINTERS_NON_C_ABI=1` 下默认不把主门禁切到 selfhost driver（保持 stable driver）；可用 `BACKEND_MAIN_ALLOW_SELFHOST_DRIVER=1` 强制切换。
 - `backend_prod_closure.sh` 的 selfhost 自举步骤默认会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`；non-C-ABI no-pointer 收敛由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁负责。
 - `backend.abi_v2_noptr` 在 `backend_prod_closure.sh` 中默认优先使用本地 `artifacts/backend_driver/cheng`（要求具备 non-C-ABI no-pointer 诊断字符串）；其次当前 `BACKEND_DRIVER`，再到 selfhost `cheng.stage2/stage1`；可用 `BACKEND_ABI_V2_DRIVER` 显式覆盖。
+- `backend.import_cycle_predeclare` 已切为纯 runtime 门禁：负例必须 compile fail 且包含 `Import cycle detected: ... -> ...` 链路，不再接受 source-contract fallback。
+- `build_backend_driver.sh` 自举编译会同时注入 `STAGE1_SKIP_SEM/OWNERSHIP/CPROFILE` 与 `CHENG_STAGE1_SKIP_*`，兼容 seed stage0 的历史前缀读取。
 - 非 C ABI no-pointer 收口建议显式跑：`sh src/tooling/verify_backend_abi_v2_noptr.sh`。
 - 优化语义边界：
   - `DOD/SoA`、`Memory-Exe/Hotpatch`、`E-Graph` 以 `Low-UIR` 为主战场。

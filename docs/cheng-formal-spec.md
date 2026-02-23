@@ -1,6 +1,6 @@
 # Cheng 正式规范（语法与语义）
 
-> 版本：2026-02-21
+> 版本：2026-02-23
 
 本文为 Cheng 语言最终规范，描述语法与核心语义。
 
@@ -96,7 +96,7 @@
 - **逃逸规则**：借用值禁止 `return/yield`、禁止写入全局、`share(x)` 禁止接收借用值；借用值不得传给非 `var` 形参（默认 move），仅当目标函数显式标注 `@borrows` 时允许；标注 `@escapes` 的函数在调用处仍拒绝借用值。
 - **借用视图识别**：`ident/deref` 直接视为借用；`field/index` 本身不标记为借用，但作为借用视图调用的“来源”参与传播；`get/getPtr/TableGet*/SeqGet*/StringView` 仅在入参已是借用来源时传播借用；`&/dataPtr/getPointer` 视为显式指针借用；其它调用默认视为 Owned。
 - **显式指针**：`&x`/`dataPtr(...)`/`getPointer(...)` 视为显式低级指针视图；禁止返回/`share` 逃逸，作为参数传递视为绕过借用证明（需调用方保证生命周期）。
-- **限制**：不做跨过程数据流分析；未知/未解析的调用会跳过借用证明；类型细分（Copy/RC/原始指针）仍待完善。
+- **能力边界（已工程化约束）**：跨过程默认要求显式摘要（`@borrows/@escapes`）；未知/未解析调用在“借用活跃”场景下按编译期硬错误处理（需提供可解析签名或显式注解）；类型细分（Copy/RC/原始指针）遵循当前 `Send/Sync + no-pointer` 门禁口径并持续细化。
 
 ### 0.3 多线程内存安全
 
@@ -141,20 +141,20 @@
 - **函数指针**仅包含代码地址，不携带环境；ABI 更直接，适合 `importc` 回调与 C 交互。
 - 不捕获的匿名函数可视作函数指针使用，但仍需确保签名与回调形参匹配。
 
-### 0.5.1 已知问题与改进点（工程视角）
+### 0.5.1 工程状态与剩余改进项（工程视角）
 
 - **语法一致性**：`TypeExpr(expr)` 仅用于类型转换；默认初始化仅通过“带类型标注且省略初始化”的隐式默认值实现；禁止引入 `TypeExpr()` 或 `TypeExpr expr` 变体。
 - **匿名函数书写**：显式函数类型 + `fn(...) =` 语法偏冗长；可考虑提供语法糖（如 `fn(...) => expr`）但需明确闭包/函数指针 ABI 差异。
-- **泛型/trait 诊断**：`where` 约束与 `Self` 约束的错误提示需更聚焦，避免“编译期失败但缺少最小定位信息”的体验问题。
-- **FFI/ABI 边界**：`importc` 聚合返回必须 wrapper/out 参数；`varargs` 仅允许受限签名（darwin/arm64 已回归直连 i32 子集，其它平台建议 wrapper）；捕获型回调必须 `ctx` 承载环境。
+- **泛型/trait 诊断（已工程化并持续增强）**：语义阶段默认前移并阻断关键约束错误；`where`/`Self` 的最小定位信息已纳入生产门禁口径，后续仅做可读性增强。
+- **FFI/ABI 边界（已工程化）**：`importc` 聚合返回必须 wrapper/out 参数；`varargs` 仅允许受限签名（darwin/arm64 已回归直连 i32 子集，其它平台建议 wrapper）；捕获型回调必须 `ctx` 承载环境，并由 `verify_backend_ffi_abi.sh` 等门禁阻断回归。
   - `varargs` call lowering 需维护 16B 栈对齐，且遵循目标 ABI（x86_64 `AL=0`；AArch64 Darwin 8B 槽 + i32 扩展）。
   - `var` out 参数调用点按“自动取址”规则传递（源码 `foo(x)`，ABI 传 `&x`）。
-- **泛型实例化**：跨模块实例缓存与去重策略需完善，避免重复生成与编译膨胀。
+- **泛型实例化（已工程化基线）**：跨模块实例缓存/去重以 determinism + UIR 稳定性门禁持续约束，禁止出现“实例膨胀但无门禁可观测”的回退。
 - **ORC/所有权**：跨线程边界、闭包捕获与析构顺序需更明确的规范与诊断。
-- **构建确定性**：缓存键需覆盖 fullspec/示例输入；determinism 校验必须包含 seed、编译参数、目标平台与关键环境变量。
+- **构建确定性（已收口）**：缓存键需覆盖 fullspec/示例输入；determinism 校验必须包含 seed、编译参数、目标平台与关键环境变量；发布打包链路要求确定性产物（稳定 mtime/排序 + `gzip -n`，不再 best-effort）。
 - **标准库一致性/性能**：高频容器统一到 `hashmap/hashset` 等高性能实现，并保持 `[]`/`[]=` 语义一致。
-- **工具链体验**：错误提示格式统一；将后端报错尽量前移到语义阶段；提供最小可复现输出模式。
-- **包管理/供应链**：依赖锁、签名校验、离线构建、版本回溯策略仍需标准化。
+- **工具链体验（持续收敛）**：错误提示格式统一；将后端报错前移到语义阶段（例如“借用活跃 + unresolved call”改为语义硬错误）；并持续完善最小可复现输出模式。
+- **包管理/供应链（已默认强制）**：依赖锁、签名校验、registry 一致性在生产口径默认硬失败，不再作为建议项；仅显式 `PKG_INSECURE_ALLOW_NO_VERIFY=1` 允许本地诊断放宽（不得用于 CI/发布）。
 - **诊断可用性**：错误消息需包含变量名/模块路径/关键类型摘要，避免“静默降级或后端才报错”。
 
 ### 0.6 改进建议（实现同步清单，优先级）
@@ -167,7 +167,7 @@
 
 #### 0.6.2 语义与安全（后续）
 
-- **借用证明**：为跨过程/未知调用提供可选摘要或注解（如 `@borrows/@escapes`），避免“跳过证明”导致安全缺口或误拒。
+- **借用证明**：跨过程调用默认要求显式摘要（`@borrows/@escapes`）；未知/未解析调用在借用活跃路径必须阻断，后续优化聚焦“自动摘要推断”而非“允许跳过证明”。
 - **ORC/循环引用**：标准库容器统一实现 `=trace`；提供可选 cycle collector 或 Arena/Region 一等公民化方案，并明确启用开关与性能基线。
 - **线程边界**：标准库线程/任务/通道 API 内建白名单；`@thread_boundary` 未标注视为错误；`T*`/FFI 句柄默认 `!Send/!Sync` 且需显式封装。
 - **已移除子集清理**：剔除 HRT/ASM/legacy C bootstrap 相关门禁与入口，统一生产语义到 backend-only 主链路。
@@ -747,15 +747,20 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - SIMD 能力说明：当前闭环未要求向量化；SSA 与 SIMD 并非替代关系。SSA 负责值语义化优化（当前最小闭环主侧），SIMD 是向量化优化能力，需要在后续 UIR 阶段增加向量类型、并行化合法性分析与后端寄存器映射后分阶段接入。
 - 验证入口：`src/tooling/verify_backend_float.sh` 负责生成并执行最小闭环样例（`emit=exe` 口径）。
 - 跨平台矩阵（可验收）：`src/tooling/verify_backend_targets_matrix.sh` 覆盖 darwin/ios(Mach‑O `.o`) + android/linux(ELF `.o`) + windows(COFF `.obj`)。
-- 全语义回归入口：`src/tooling/verify_backend_closedloop.sh` 会使用后端 driver（默认 `artifacts/backend_driver/cheng`，兼容回退 `./cheng`；可用 `BACKEND_DRIVER=<path>` 指定）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求 stdout 包含 `fullspec ok`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；当前以 macOS ARM64 为主，非“全平台”闭环）。
-- 除平台生产闭环入口：`src/tooling/backend_prod_closure.sh`（默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression`、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256）与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。
-- 全链自举门禁：`src/tooling/verify_fullchain_bootstrap.sh`（stage2→tools；obj-only fullspec + 工具 `--help` smoke）。
+- 全语义回归入口：`src/tooling/verify_backend_closedloop.sh` 会使用后端 driver（默认 `artifacts/backend_driver/cheng`；可用 `BACKEND_DRIVER=<path>` 显式指定，未命中可运行 driver 直接失败）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求运行返回码为 `0`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；跨目标 `self_linker(ELF/COFF)` 与 `linker_abi_core` 门禁默认强制阻断，且已移除 prebuilt-obj/link-only 降级路径，不允许 skip 与 compile-only 回退）。
+- 除平台生产闭环入口：`src/tooling/backend_prod_closure.sh`（默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression`、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256，`sign/verify` 在发布链路默认 required）与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。
+- 零脚本生产闭环：`backend_prod_closure.sh` 默认要求 `TOOLING_EXEC_BUNDLE_PROFILE=full` + `TOOLING_EXEC_REQUIRE_BUNDLE=1` + `TOOLING_EXEC_BUNDLE_CORE_AUTO_BUILD=0`，并阻断 `backend.zero_script_closure`，禁止闭环脚本直接 `sh src/tooling/*.sh` 调用。
+- driver 自举 smoke 口径：`backend.driver_selfbuild_smoke` 为 required gate，默认输出路径与主 driver 统一为 `artifacts/backend_driver/cheng`；生产收口口径固定统一 driver（`BACKEND_DRIVER=artifacts/backend_driver/cheng` + `BACKEND_DRIVER_ALLOW_FALLBACK=0`），不依赖自动回退候选；seed/selfhost 仅允许显式覆盖用于排障。闭环强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0` 与 `DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，防止语义降级。
+- 全链自举门禁：`src/tooling/verify_fullchain_bootstrap.sh`（stage2→tools；obj-only fullspec internal gate + 工具 `--help` smoke；失败即阻断）。
+- 热补丁运行态门禁：`src/tooling/verify_backend_hotpatch.sh` 与 `src/tooling/verify_backend_hotpatch_meta.sh` 固定 `self-link` 口径并执行可运行探针，不接受 system-link 回退；unsupported target 直接失败（不再 `skip`）。
 - 本地发布/回滚：`src/tooling/backend_prod_publish.sh`（验收后发布到 `dist/releases`），`src/tooling/backend_release_rollback.sh`（切换 `dist/releases/current` 回滚）。
 - 语句支持：MVP 已支持 `let/var/赋值` 的栈槽降级与读取，用于闭环验证。
 
 ## 附录 B Raw Pointer Safety 契约冻结（RPSPAR-01）
 
 规范性约束（Normative）：
+- 本契约的规范名为 `零裸指针生产闭环`（`Zero-RawPtr Production Closure`，`ZRPC`），属于发布门禁的规范性约束，不是建议项。
+- 执行模式为 `hard_fail`：任一契约漂移或门禁缺失必须阻断闭环与发布。
 - 语言表面禁止裸指针类型与指针算术；不得向用户暴露 `void*` 语义入口。
 - C ABI 互操作仅允许通过“影子桥接”完成，用户可见接口保持值/借用语义：
   - `ffi_map`：`slice -> (ptr,len)` 物理拆包。
@@ -765,4 +770,8 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 释放后句柄必须 fail-safe（panic/error），不得退化为 UAF/野指针访问。
 
 同步标记（供门禁脚本读取）：
+- `rawptr_contract.scheme.id=ZRPC`
+- `rawptr_contract.scheme.name=zero_rawptr_production_closure`
+- `rawptr_contract.scheme.normative=1`
+- `rawptr_contract.enforce.mode=hard_fail`
 - `rawptr_contract.formal_spec.synced=1`

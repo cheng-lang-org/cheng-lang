@@ -114,7 +114,8 @@ source_addrs = ["/ip4/1.2.3.4/tcp/4001"]
 - 远程仅负责传输内容，依赖解析以 lock 中的 CID 为准。
 - 拉取前校验作者签名与包身份，确保 CID 未被篡改。
 - 允许配置 `PKG_MODE=local|p2p|auto` 与 `PKG_PEERS`，并支持白名单/黑名单策略。
-- 建议在企业/生产环境禁用 HTTP 回退或强制签名校验失败即拒绝。
+- 企业/生产环境默认禁用 HTTP 回退；签名与 registry 校验失败必须拒绝（硬失败）。
+- 工具链默认强制 `PKG_REQUIRE_SIGNATURE=1` 与 `PKG_REQUIRE_REGISTRY_MATCH=1`；仅显式 `PKG_INSECURE_ALLOW_NO_VERIFY=1` 时允许本地诊断放宽。
 
 远程配置示例（补充）：
 ```toml
@@ -138,8 +139,8 @@ require_registry_match = true
 - `configs/cheng-pkg-config.toml`
 
 ## 生产闭环（摘要）
-- 生产流程建议执行 `resolve -> verify -> meta -> fetch -> build`，并保存 `cheng.meta.toml` 供审计。
-- 生产环境建议启用 L2 策略：禁用 HTTP 回退、白名单 peer、强制签名与 registry 校验。
+- 生产流程默认执行 `resolve -> verify -> meta -> fetch -> build`，并保存 `cheng.meta.toml` 供审计。
+- 生产环境默认启用 L2 策略：禁用 HTTP 回退、白名单 peer、强制签名与 registry 校验（任一失败即阻断）；`PKG_INSECURE_ALLOW_NO_VERIFY=1` 仅用于本地排障，不得进入 CI/发布口径。
 - 详见去中心化计算与存储文档的生产闭环章节。
 
 ## 滥用控制

@@ -127,7 +127,7 @@ flowchart LR
 ## 6. 必过门禁（建议 required）
 - `backend.mem_contract`
 - `backend.mem_image_core`
-- `backend.mem_exe_emit`
+- `backend.mem_exe_emit`（runtime 合并 + 原子写盘，sidecar 残留为 0）
 - `backend.hotpatch_meta`
 - `backend.hotpatch_inplace`
 - `backend.incr_patch_fastpath`

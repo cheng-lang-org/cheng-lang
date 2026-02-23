@@ -27,7 +27,7 @@
 ### 1.2 平台策略
 - macOS：ARM64 + Mach‑O（已落地）；x86_64 + Mach‑O（已闭环）
 - iOS：ARM64 + Mach‑O
-- Windows：ARM64 + COFF（targets matrix 已覆盖 COFF `.obj` 产物校验）；x86_64 + COFF（已闭环 `.obj` 产物校验；`lld-link` 链接为 best-effort）
+- Windows：ARM64 + COFF（targets matrix 已覆盖 COFF `.obj` 产物校验）；x86_64 + COFF（已闭环 `.obj` 产物校验；`lld-link` 链接校验为可选增量 gate）
 - Linux：ARM64 + ELF（已落地自研 ELF linker 初版；支持 `BACKEND_ELF_PROFILE=nolibc` 的真 no-libc 静态口径）；x86_64 + ELF（已闭环 `.o` 产物校验；link+run 需目标平台/交叉链接器）
 - Linux：RISC-V64 + ELF（自研 `machine select/obj writer/self-linker` 代码路径已落地；闭环 gate 为 `src/tooling/verify_backend_self_linker_riscv64.sh`）
 - Android：ARM64 + ELF
@@ -109,17 +109,17 @@ Dev 轨热更终态（Darwin/Linux 首发）：
 - Android 真机/模拟器运行：`src/tooling/verify_backend_android_run.sh`（需要 `adb` 与设备；可用 `ANDROID_SERIAL` 指定设备；默认复用 `artifacts/backend_android/*.android`，也可设 `ANDROID_REBUILD=1` 强制重建）。
 - 一键闭环：`src/tooling/verify_backend_closedloop.sh`（聚合执行 targets/determinism/multi/float + stage1 smoke + mm；若存在 NDK 则额外跑 Android）。
   - 默认编译/链接口径：Dev gate 固定 `MM=orc + BACKEND_LINKER=self`；Release gate 固定 `BACKEND_LINKER=system + BACKEND_NO_RUNTIME_C=0`（`mold -> lld -> default`）。
-  - `fullspec` 回归口径：使用后端 driver（默认 `artifacts/backend_driver/cheng`，兼容回退 `./cheng`；可用 `BACKEND_DRIVER=<path>` 指定）编译 `examples/backend_closedloop_fullspec.cheng` → 运行并要求 stdout 包含 `fullspec ok`；`backend_prod_closure` 默认注入 `BACKEND_RUN_FULLSPEC=1`，可显式设 `BACKEND_RUN_FULLSPEC=0` 临时关闭；可用 `BACKEND_CLOSEDLOOP_FULLSPEC_INPUT` 覆盖输入文件。
+  - `fullspec` 回归口径：使用后端 driver（默认 `artifacts/backend_driver/cheng`，兼容回退 `./cheng`；可用 `BACKEND_DRIVER=<path>` 指定）编译 `examples/backend_closedloop_fullspec.cheng` → 运行并要求返回码为 `0`；`backend_prod_closure` 默认注入 `BACKEND_RUN_FULLSPEC=1`，`BACKEND_RUN_FULLSPEC=0` 已不再支持；可用 `BACKEND_CLOSEDLOOP_FULLSPEC_INPUT` 覆盖输入文件。
   - 可选：`ANDROID_RUN=1` 时额外跑 `verify_backend_android_run.sh`。
 - 生产闭环（除平台）：`src/tooling/backend_prod_closure.sh`（默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt/opt2、multi‑lto、multi_perf_regression、FFI/ABI matrix、obj/exe determinism、release manifest+bundle+sign/verify 与 mm 回归；`fullchain/stress` 为显式开关）。
   - ABI 口径：仅支持 `ABI=v2_noptr`；主闭环默认 no-pointer 兼容口径（`STAGE1_STD_NO_POINTERS=1`、`STAGE1_STD_NO_POINTERS_STRICT=0`、`STAGE1_NO_POINTERS_NON_C_ABI=1`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`），并由 `verify_backend_abi_v2_noptr.sh` 专项 gate 强制 strict 验证。
   - 用户默认入口（`chengc.sh`）在 `v2_noptr` 下默认也强制 `STAGE1_NO_POINTERS_NON_C_ABI=1`（可显式覆盖用于排障）；`STAGE1_STD_NO_POINTERS_STRICT` 默认仍为 `0`。
-  - 默认 strict：任一子步骤 `exit 2`（skip）即失败；仅本地排障时通过 `--allow-skip` 放宽。
+  - 默认 strict：任一子步骤 `exit 2`（skip）即失败；`--allow-skip` 已不再支持。
   - 自举：默认包含后端 selfhost（产出 stage2）；全链自举（stage2→tools）改为显式 `--fullchain`（或 `BACKEND_RUN_FULLCHAIN=1`）。
   - 发布：默认启用 publish，且要求显式 seed（`--seed/--seed-id/--seed-tar`）；本地仅验收可用 `--no-publish`。
   - 打包：若存在 `artifacts/backend_selfhost_self_obj/cheng.stage2`，则 manifest/bundle 默认记录并打包 stage2 driver，并可附带全链产物。
-  - 驱动选择：`BACKEND_DRIVER` 未显式设置时，优先复用 `artifacts/backend_selfhost_self_obj/cheng.stage2`（其次 `cheng.stage1`、`artifacts/backend_seed/cheng.stage2`）；都不可用时才回落 `src/tooling/backend_driver_path.sh`。
-    - `backend_driver_path.sh` 会继续尝试 `artifacts/backend_driver/cheng`、`dist/releases/current/cheng`、`artifacts/backend_selfhost_self_obj/cheng_stage0_*` 等备选。
+  - 驱动选择（生产收口）：统一固定 `BACKEND_DRIVER=artifacts/backend_driver/cheng` 且 `BACKEND_DRIVER_ALLOW_FALLBACK=0`，主链不依赖 resolver 自动回退；seed/selfhost driver 仅用于显式排障覆盖。
+    - `backend_driver_path.sh` 的候选回退链仅用于开发排障，不作为生产收口默认路径。
   - stage0 探针默认走 `BACKEND_PROD_STAGE0_PROBE_MODE=path`（只复用 `backend_driver_path.sh` 的可运行 smoke），避免为探针重编整个 `backend_driver.cheng`；必要时可切 `light`/`full`。
   - 主门禁链路在 `STAGE1_NO_POINTERS_NON_C_ABI=1` 时默认保持 stable driver（`BACKEND_MAIN_ALLOW_SELFHOST_DRIVER=auto`），selfhost driver 主要用于 `backend.abi_v2_noptr` 专项 gate；可用 `BACKEND_MAIN_ALLOW_SELFHOST_DRIVER=1` 强制主链切换 selfhost。
   - selfhost 自举步骤默认以 `STAGE1_NO_POINTERS_NON_C_ABI=0` / `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0` 运行（避免编译器源码阶段误拦截）；non-C-ABI no-pointer 由后续 `backend.closedloop` 与 `backend.abi_v2_noptr` 门禁收敛。
@@ -144,7 +144,7 @@ Dev 轨热更终态（Darwin/Linux 首发）：
 - Linux AArch64 no-libc 口径：`src/tooling/verify_backend_nolibc_linux_aarch64.sh` 已通过 Darwin/arm64 静态门禁；运行门禁需在 Linux aarch64 主机执行。
 
 可选语义回归门禁（fullspec）：
-- `fullspec`：`src/tooling/verify_backend_closedloop.sh` 支持 stage1 `fullspec`（默认 `examples/backend_closedloop_fullspec.cheng`）编译+运行验收，要求输出 `fullspec ok`；该脚本独立运行时默认 `BACKEND_RUN_FULLSPEC=0`，而 `backend_prod_closure.sh` 默认注入 `BACKEND_RUN_FULLSPEC=1`。
+- `fullspec`：`src/tooling/verify_backend_closedloop.sh` 支持 stage1 `fullspec`（默认 `examples/backend_closedloop_fullspec.cheng`）编译+运行验收，要求返回码为 `0`；该脚本独立运行时默认 `BACKEND_RUN_FULLSPEC=1`，`BACKEND_RUN_FULLSPEC=0` 已不再支持。
 - fullspec 编译默认口径：`BACKEND_FULLSPEC_SKIP_SEM=1`、`BACKEND_FULLSPEC_GENERIC_MODE=dict`、`BACKEND_FULLSPEC_GENERIC_SPEC_BUDGET=0`、`BACKEND_FULLSPEC_SKIP_OWNERSHIP=1`、`BACKEND_FULLSPEC_VALIDATE=0`（可按需覆盖）；编译后会执行符号门禁，阻断未解析 `seqBytesOf_T` 回归。
 
 已闭环（除平台生产闭环）：
@@ -156,11 +156,11 @@ Dev 轨热更终态（Darwin/Linux 首发）：
   - 2026-02-07：自举临时产物改为稳定 session 命名（默认 `SELF_OBJ_BOOTSTRAP_SESSION=default`），可复用增量缓存；并发场景可显式指定不同 session 隔离。
   - 2026-02-07：脚本结束会输出 `backend.selfhost_self_obj.timing`（lock/stage1/stage2/smoke/total），用于快速定位自举慢阶段。
 - 固定 seed（纯 Cheng 更新，不走 C 后端）：用“上一版本的 stage2 driver（二进制）”作为 seed（`SELF_OBJ_BOOTSTRAP_STAGE0=<seed>`），运行 `sh src/tooling/backend_seed_pure.sh --seed:<seed>` 可在同一链路下生成新的 stage2（自举固定点）。
-- CI/生产（obj-only）：`sh src/tooling/verify_backend_ci_obj_only.sh`，默认从 `dist/releases/current_id.txt` 指向的发布 seed 提取 driver 走全链 `.o` 自举；也可传 `--seed:<path>`/`--seed-id:<id>`/`--seed-tar:<path>` 显式指定，不再自动候选本地 artifacts seed。
+- CI/生产（obj-only）：`sh src/tooling/verify_backend_ci_obj_only.sh`，默认从 `dist/releases/current_id.txt` 指向的发布 seed 提取 driver 走全链 `.o` 自举；也可传 `--seed:<path>`/`--seed-id:<id>`/`--seed-tar:<path>` 显式指定，不再自动候选本地 artifacts seed。该脚本默认 strict：子步骤返回 `status=2`（skip）会直接失败（`--strict` 仅保留兼容参数）。
 - 全链复用口径：`verify_fullchain_bootstrap.sh` 默认 `FULLCHAIN_REUSE=1`，在 stage2/source/runtime 未变化时复用 `stage1_fullspec_obj` 与工具产物，仅执行运行 smoke，降低重复闭环耗时。
-- 全链 stage1 样例口径：默认样例为 `examples/backend_fullchain_smoke.cheng`（可用 `FULLCHAIN_STAGE1_FILE` 覆盖），默认前端为 `FULLCHAIN_STAGE1_FRONTEND=stage1`，默认单次编译超时 `FULLCHAIN_STAGE1_TIMEOUT=60`，默认并行 `FULLCHAIN_STAGE1_MULTI=1`（失败自动串行重试）。
-- 全链 stage1 样例链接器口径：`FULLCHAIN_STAGE1_LINKER=auto|self|system`（默认 `auto`，先尝试 `self`，失败后自动回退 `system`）。
-- 全链工具并行：`verify_fullchain_bootstrap.sh` 默认按主机核数并行构建 `cheng_pkg_source/cheng_pkg/cheng_storage`（`FULLCHAIN_TOOL_JOBS=0` auto），冷路径下可缩短 fullchain 时长；工具构建默认 best-effort（部分失败仅告警）。严格模式可设 `FULLCHAIN_BUILD_TOOLS_STRICT=1`，并通过 `FULLCHAIN_BUILD_TOOLS_STRICT_SCOPE=core|all` 控制范围（默认 `core` 不因生态工具失败阻断编译器闭环；`all` 强制所有工具源码通过）。工具单项默认超时 `FULLCHAIN_TOOL_TIMEOUT=20`；超时时优先复用既有可执行（`FULLCHAIN_TOOL_FALLBACK_REUSE=1`），若不可用则默认生成 fullchain gate 专用 `--help` stub（`FULLCHAIN_TOOL_STUB_ON_FAIL=1`，可设 `0` 强制源码真实构建）。
+- 全链 stage1 样例口径：默认样例为 `examples/backend_closedloop_fullspec.cheng`（可用 `FULLCHAIN_STAGE1_FILE` 覆盖），默认前端为 `FULLCHAIN_STAGE1_FRONTEND=stage1`，默认单次编译超时 `FULLCHAIN_STAGE1_TIMEOUT=60`，默认串行 `FULLCHAIN_STAGE1_MULTI=0`（显式并行失败会自动串行重试）。
+- 全链 stage1 样例链接器口径：`FULLCHAIN_STAGE1_LINKER=self|system`（默认 `system`），`auto` 已不再支持。
+- 全链工具并行：`verify_fullchain_bootstrap.sh` 默认按主机核数并行构建 `cheng_pkg_source/cheng_pkg/cheng_storage`（`FULLCHAIN_TOOL_JOBS=0` auto）；工具构建默认 required（`FULLCHAIN_BUILD_TOOLS=1`，`FULLCHAIN_BUILD_TOOLS=0` 与 `FULLCHAIN_BUILD_TOOLS_STRICT=0` 均不再支持）。工具单项默认超时 `FULLCHAIN_TOOL_TIMEOUT=60`，超时/失败直接阻断，不再复用旧产物或生成 stub。
 - 调试与可观测性：在移除 `emit=asm` 后已恢复最小 dSYM 口径回归（`src/tooling/verify_backend_debug.sh`）。
 - UIR 校验：`BACKEND_VALIDATE=1` 在 codegen 前跑 `uirCoreValidateModule`，覆盖 block/terminator、branch target、表达式结构、object‑local 取址误用、object layout 边界等一致性检查。
 - 确定性更强口径（初版）：`src/tooling/verify_backend_determinism_strict.sh` 覆盖噪声环境变量/临时目录下的双跑一致性（以 `.o` 为口径）。
@@ -186,6 +186,7 @@ Dev 轨热更终态（Darwin/Linux 首发）：
   在 `verify_backend_opt2/opt3/closedloop` 里可用于快速验证“激进闭环”是否回归语义。
 - SIMD 闸口：`verify_backend_simd.sh` 作为 `opt3` 后阻断 gate，覆盖 `simd on/off` 语义一致与 `simd on` 对象确定性。
 - 跨文件优化（multi‑lto，初版）：`BACKEND_MULTI_LTO=1` 在 `--multi` 的 exe 路径上先对全模块做 UIR 优化，再走单对象链接路径（避免分单元产物缺失与链接漂移）；回归入口 `src/tooling/verify_backend_multi_lto.sh`。
+  - 运行态口径：`verify_backend_multi_lto.sh` 默认执行可运行探针（`BACKEND_MULTI_LTO_RUN_TIMEOUT` 默认 `10s`），超时/符号缺失/崩溃均硬失败，不再回退 compile-only。
 - 自研 ELF `.o` writer（可验收）：后端 `emit=obj` **默认直接产出** relocatable `.o`（不调用 `cc -c`）；可用 `BACKEND_OBJ_WRITER=elf` 强制选择 writer。回归入口 `src/tooling/verify_backend_self_obj_writer.sh`（需 NDK，用于 readelf/nm/link 校验）。
 - 自研目标文件确定性（初版）：`src/tooling/verify_backend_self_obj_writer_elf_determinism.sh` / `src/tooling/verify_backend_self_obj_writer_macho_determinism.sh` / `src/tooling/verify_backend_self_obj_writer_coff_determinism.sh` 在相同输入下双跑比对自研 `.o/.obj` 的 sha256 一致性。
 - Sanitizer（可选）：`src/tooling/verify_backend_sanitizer.sh` 以 `-fsanitize=address` 构建并运行一个最小 fixture；不支持则自动 skip（exit 2）。
@@ -205,7 +206,7 @@ Dev 轨热更终态（Darwin/Linux 首发）：
 
 仍待完善（工程长期项）：
 - 编译器全链自举（初版已落地）：`verify_backend_selfhost_bootstrap_self_obj.sh` 默认 `fast` 口径产出 selfhost stage2（stage1 alias）；`strict` 口径执行 fixed-point（stage1/stage2，必要时追加 `stage3 exe witness` + compile-stamp/hash witness 收敛）。`verify_fullchain_bootstrap.sh` 直接要求已有 stage2（默认 `artifacts/backend_selfhost_self_obj/cheng.stage2`，可用 `FULLCHAIN_STAGE2` 覆盖），并以 `MM=orc` 构建核心工具、执行 obj-only smoke（默认 `examples/backend_fullchain_smoke.cheng`）与 `--help` smoke。需要重样例时可显式设置 `FULLCHAIN_STAGE1_FILE=examples/backend_obj_fullspec.cheng`。生产/CI（macOS arm64）通常通过 `verify_backend_ci_obj_only.sh` 以发布 seed 完成“seed→stage2→fullchain(obj-only)”闭环。
-- 跨平台 `.o/.obj` 产物闭环：已补齐 x86_64（Linux ELF / Windows COFF）的 codegen+obj 回归（见 `verify_backend_targets_matrix.sh`）；Darwin x86_64 已有 exe+run（Rosetta）闭环；Windows 侧对接 `lld-link` 为 best-effort（`src/tooling/verify_backend_coff_lld_link.sh` 可在本机装有 LLVM lld 时做 COFF `.obj`→DLL 的 link 校验）。
+- 跨平台 `.o/.obj` 产物闭环：已补齐 x86_64（Linux ELF / Windows COFF）的 codegen+obj 回归（见 `verify_backend_targets_matrix.sh`）；Darwin x86_64 已有 exe+run（Rosetta）闭环；Windows 侧 `lld-link` 校验作为可选增量 gate（`src/tooling/verify_backend_coff_lld_link.sh` 可在本机装有 LLVM lld 时做 COFF `.obj`→DLL 的 link 校验）。
 - UIR/SSA：UIR 主链默认承载 SSA 语义，`verify_backend_ssa.sh` 保留文件名兼容并用于 `dict/hybrid` 一致性回归；opt2 已覆盖 DCE/内联/死函数裁剪 +（基础版）CSE/SROA/LICM + CFG 无条件跳转压缩；跨模块优化已落地 multi‑lto 初版（`BACKEND_MULTI_LTO=1`），仍需更完整的链接器级 LTO。
 - 目标文件/链接链路：自研 relocatable 目标文件 writer 已落地（AArch64）：ELF `.o` / Mach‑O `.o` / COFF `.obj`。
   - 入口：后端默认直接生成 relocatable `.o`；可用 `BACKEND_OBJ_WRITER=elf|macho|coff` 强制选择（默认按 target 自动选择）。
@@ -461,7 +462,7 @@ block <label>:
   - COFF：`src/tooling/verify_backend_self_obj_writer_coff.sh`
 - 优化增强（已落地基础版）：opt2 已覆盖内联 + 死函数裁剪 + CFG liveness DCE + const folding +（基础版）SROA/CSE/LICM + 结构化跳转压缩（回归 `src/tooling/verify_backend_opt2.sh`）；跨模块优化已落地 multi‑lto 初版（回归 `src/tooling/verify_backend_multi_lto.sh`），仍按收益逐步增强。
 - 闭环入口统一：优先用 `sh src/tooling/backend_prod_closure.sh` 做后端产物/发布链路验收，避免漏测。
-- 生产闭环仍需补强：`backend_prod_closure` 默认 strict（skip 即失败），但 `backend.coff_lld_link` 会先做宿主能力探测（缺 `lld-link/llvm-lld/ld.lld/lld` 时打印 skip 不阻塞闭环）；全量覆盖仍建议在 CI 固定工具链中单独强制跑 `verify_backend_coff_lld_link.sh`。
+- 生产闭环收口：`backend_prod_closure` 默认 strict（skip 即失败）；`backend.coff_lld_link` 在缺少 `lld-link/llvm-lld/ld.lld/lld` 时自动回退为 COFF `obj-only` 验证并保持 gate 通过，不再以 skip 语义降级。
 - 自举性能门槛：`backend_prod_closure` 默认将 selfhost 单次编译超时设置为 `60s`（`BACKEND_PROD_SELFHOST_TIMEOUT`），用于提前暴露编译性能回退。
 - 自举模式分层：`verify_backend_selfhost_bootstrap_self_obj.sh` 支持 `SELF_OBJ_BOOTSTRAP_MODE=strict|fast`（默认 `fast`）。`strict` 保留 `stage1/stage2` 固定点校验，并在不收敛时执行 `stage3 exe witness`（`emit=exe`）+ compile-stamp/hash 见证；`fast` 只编译 stage1 并同步 stage2 产物用于开发提速（不作为发布门禁口径）。脚本会记录 stage2 产物模式，`strict` 不会复用 `fast` 产物充当 fixed-point 结果。
   - 同机实测（2026-02-12，当前源码冷态）：`fast` 约 `17s`，`strict` 约 `24-27s`，默认 `60s` 门槛内可通过。
@@ -483,7 +484,7 @@ block <label>:
 - 自举 smoke 复用：`verify_backend_selfhost_bootstrap_self_obj.sh` 在 `SELF_OBJ_BOOTSTRAP_REUSE=1` 下复用 `hello_puts` smoke 产物，仅在依赖变化时重编，减少重复闭环耗时。
 - 闭环耗时观测：`backend_prod_closure` 结束时输出 `backend_prod_closure.timing_top`（按耗时降序的 gate top 列表），用于持续压缩串/并行链路耗时。
 - 自举并行性能阻断：`backend_prod_closure` 默认启用 `backend.selfhost_parallel_perf`（`verify_backend_selfhost_parallel_perf.sh`），同一 stage0 下串行/并行各跑一轮 strict no-reuse，要求 `parallel <= serial + 2s`（可用 `SELFHOST_PARALLEL_PERF_MAX_SLOWDOWN_SEC` 调整）。
-- 新 driver 自举 smoke 阻断：`backend_prod_closure` 默认启用 `backend.driver_selfbuild_smoke`（`verify_backend_driver_selfbuild_smoke.sh`）；可用 `BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=0` 关闭。默认 gate 超时 `60s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_TIMEOUT`），内部自举超时 `55s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_BUILD_TIMEOUT`）。
+- 新 driver 自举 smoke 阻断：`backend_prod_closure` 默认启用 `backend.driver_selfbuild_smoke`（`verify_backend_driver_selfbuild_smoke.sh`）；可用 `BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=0` 关闭。默认 gate 超时 `60s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_TIMEOUT`），内部自举超时 `55s`（`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_BUILD_TIMEOUT`），且默认输出与主 driver 统一为 `artifacts/backend_driver/cheng`（可用 `BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_OUTPUT` 覆盖）。
 - 热点采样可执行化：`src/tooling/profile_backend_sample.sh` 已转为 wrapper，实际执行 `artifacts/bin/profile_backend_sample`（由 `src/tooling/profile_backend_sample.c` 构建）；支持 `--attach-substr` 按子进程名 attach，避免采到脚本壳 `wait4` 假热点。
 - 内建分段计时：`BACKEND_PROFILE=1` 时编译器会在 stderr 输出 `backend_profile\t<label>\tstep_ms=...\ttotal_ms=...`，用于补足 sample 无符号时的慢阶段定位。
 - 前端分段计时：`STAGE1_PROFILE=1` 时编译器会在 stdout 输出 `[stage1] profile: ...`，并附带 `[sem]/[mono]/[ownership]` 细分统计，用于把 `backend_profile build_module` 拆到 lex/load/sem/mono/ownership。
@@ -526,14 +527,14 @@ block <label>:
 - 对齐跨平台最小可运行闭环目标：优先补齐 `x86_64 ELF/COFF` 的可执行链路与 `lld-link` 端到端回归。
 - 验收命令（P0）：`sh src/tooling/backend_prod_closure.sh`、`sh src/tooling/verify_backend_targets_matrix.sh`、`sh src/tooling/verify_backend_coff_lld_link.sh`。
 - 本轮已落地：
-  - `backend_prod_closure` 默认 strict（skip 策略）且 selfhost 默认 `fast`；`backend.coff_lld_link` 改为先做宿主能力探测（缺 `lld-link/llvm-lld/ld.lld/lld` 时打印 skip，不触发 strict 失败），并保留单脚本 `verify_backend_coff_lld_link.sh` 供固定工具链环境强制门禁。
+  - `backend_prod_closure` 默认 strict（skip 策略）且 selfhost 默认 `fast`；`backend.coff_lld_link` 在工具缺失时改走 COFF `obj-only` 回退（非 skip），并保留单脚本 `verify_backend_coff_lld_link.sh` 供固定工具链环境强制门禁。
   - `verify_backend_coff_lld_link.sh` 扩展为跨平台工具解析（`lld-link/llvm-lld/ld.lld/lld` 与 `llvm-objdump`），可在 Linux CI 端到端校验 COFF `.obj -> .dll`（含 x86_64）。
   - Linux amd64 CI 增加 `verify_backend_x86_64_linux.sh` 与 `verify_backend_coff_lld_link.sh` 门禁步骤。
   - `verify_backend_targets_matrix.sh` 完成跨主机验证兼容改造（`nm/otool` 缺失时回退 `llvm-nm/llvm-objdump`），并在 Linux amd64 CI 上启用 strict matrix 门禁。
   - `verify_backend_closedloop.sh` 改为按主机启用 x86_64 专项（Darwin 跑 `verify_backend_x86_64_darwin.sh`，Linux x86_64 跑 `verify_backend_x86_64_linux.sh`），避免 strict 门禁被跨主机 `skip` 干扰。
 
 ### 9.3 P1（下一迭代，2-4 周）
-- Windows COFF/PE 自研 linker 能力补齐：完善未覆盖 reloc、`.reloc/ASLR`，并把“可运行闭环”从 best-effort 提升为可验收项。
+- Windows COFF/PE 自研 linker 能力补齐：完善未覆盖 reloc、`.reloc/ASLR`，并把“可运行闭环”从可选增量 gate 提升为可验收项。
 - Determinism 口径增强：从“同机双跑”扩展到“跨机器/跨工具链版本”的复现校验与缓存键完备性。
 - 调试能力增强：在自研 obj writer 内补齐 DWARF（行号/CFI/unwind），把“最小可用”提升到“可单步调试”。
 - FFI/ABI 长尾覆盖：扩展 varargs 浮点、更复杂 callback、闭包捕获与析构顺序的稳定回归。

@@ -1,6 +1,6 @@
 # Backend 生产闭环值班手册
 
-更新时间：2026-02-21
+更新时间：2026-02-23
 
 ## 1. 值班目标
 - 在主机环境上可重复执行一次 backend 生产闭环。
@@ -23,7 +23,8 @@ sh src/tooling/backend_prod_closure.sh --no-publish
 注：生产主链默认不跑 selfhost；仅在排查自举兼容问题时显式加 `--selfhost`。
 注：`--no-publish` 默认启用稳定收口参数集（`BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE=1`），仅保留 required 收口链路；如需恢复完整可选 gate，可设 `BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE=0`。
 注：可用 `BACKEND_PROD_TARGET=<triple>` 显式覆盖优化/可执行门禁目标；未设置时会忽略外部非 darwin `BACKEND_TARGET` 污染并固定 darwin 默认口径。
-注：`BACKEND_OPT_DRIVER` 覆盖 `determinism/opt/ffi/debug/sanitizer` 子门禁 driver；当前值班建议固定 `artifacts/backend_seed/cheng.stage2`。
+注：值班收口统一 driver 口径：固定 `artifacts/backend_driver/cheng`，并保持 `BACKEND_DRIVER_ALLOW_FALLBACK=0`（无自动回退）。
+注：`BACKEND_OPT_DRIVER` 覆盖 `determinism/opt/ffi/debug/sanitizer` 子门禁 driver；当前值班建议与主 driver 一致固定 `artifacts/backend_driver/cheng`。
 注：`backend.self_linker.elf` / `backend.self_linker.coff` 已是默认 required gate（`BACKEND_RUN_SELF_LINKER_GATES=1`）。
 注：`backend.no_obj_artifacts` 已是默认 required gate，闭环产物中不允许残留 `.o/.obj/.objs`。
 注：`backend.release_rollback_drill` 已是默认 required gate，会执行 `publish -> rollback -> restore` 演练。
@@ -31,12 +32,13 @@ sh src/tooling/backend_prod_closure.sh --no-publish
 发布演练（含 publish）：
 ```sh
 env BACKEND_DRIVER=artifacts/backend_driver/cheng \
-    BACKEND_SELF_LINKER_DRIVER=artifacts/backend_seed/cheng.stage2 \
-    BACKEND_OPT_DRIVER=artifacts/backend_seed/cheng.stage2 \
-    BACKEND_LINKERLESS_DRIVER=artifacts/backend_seed/cheng.stage2 \
-    BACKEND_MULTI_DRIVER=artifacts/backend_seed/cheng.stage2 \
-    BACKEND_STAGE1_SMOKE_DRIVER=artifacts/backend_seed/cheng.stage2 \
-    BACKEND_MM_DRIVER=artifacts/backend_seed/cheng.stage2 \
+    BACKEND_DRIVER_ALLOW_FALLBACK=0 \
+    BACKEND_SELF_LINKER_DRIVER=artifacts/backend_driver/cheng \
+    BACKEND_OPT_DRIVER=artifacts/backend_driver/cheng \
+    BACKEND_LINKERLESS_DRIVER=artifacts/backend_driver/cheng \
+    BACKEND_MULTI_DRIVER=artifacts/backend_driver/cheng \
+    BACKEND_STAGE1_SMOKE_DRIVER=artifacts/backend_driver/cheng \
+    BACKEND_MM_DRIVER=artifacts/backend_driver/cheng \
     PAR05_DRIVER_REFRESH=0 \
     sh src/tooling/backend_prod_closure.sh \
       --seed:artifacts/backend_seed/cheng.stage2
