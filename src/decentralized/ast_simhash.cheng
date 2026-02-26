@@ -1,8 +1,8 @@
 import std/os
 import std/strutils as strutil
-import cheng/libp2p/crypto/sha256 as sha256
-import cheng/libp2p/utils/bytes as bytes
-import cheng/libp2p/utils/result as result
+import libp2p/crypto/sha256 as sha256
+import libp2p/utils/bytes as bytes
+import libp2p/utils/result as result
 import std/seqs
 
 const
@@ -75,6 +75,18 @@ fn strEndsWith(text: str, suffix: str): bool =
             return false
     return true
 
+fn strStartsWith(text: str, prefix: str): bool =
+    if text == nil || prefix == nil:
+        return false
+    let n: int32 = len(text)
+    let m: int32 = len(prefix)
+    if m <= 0 || m > n:
+        return false
+    for i in 0..<m:
+        if text[i] != prefix[i]:
+            return false
+    return true
+
 fn pathHasExcludedSegment(path: str): bool =
     if path == nil || len(path) == 0:
         return true
@@ -88,6 +100,32 @@ fn pathHasExcludedSegment(path: str): bool =
            seg == "__pycache__":
             return true
     return false
+
+fn lineHasStdImport(lineRaw: str): bool =
+    if lineRaw == nil:
+        return false
+    let line: str = strutil.toLowerAscii(strutil.strip(lineRaw))
+    if !strStartsWith(line, "import"):
+        return false
+    if len(line) > 6:
+        let sep = line[6]
+        if sep != ' ' && sep != '\t':
+            return false
+    return strutil.contains(line, "std/")
+
+fn simhashStripStdImportLines(text: str): str =
+    if text == nil || len(text) == 0:
+        return ""
+    let lines = strutil.split(text, '\n')
+    var out: str = ""
+    for i in 0..<lines.len:
+        let line = lines[i]
+        if lineHasStdImport(line):
+            continue
+        if len(out) > 0:
+            out = out + "\n"
+        out = out + line
+    return out
 
 fn sortStrings(values: var str[]) =
     for i in 0..<values.len:
@@ -257,7 +295,8 @@ fn computeAstSimhash64ForDir(root: str): result.Result[str] =
         let content = os.readFile(files[i])
         if content == nil || len(content) == 0:
             continue
-        let tokens = tokenizeSourceShape(content)
+        let filtered = simhashStripStdImportLines(content)
+        let tokens = tokenizeSourceShape(filtered)
         for j in 0..<tokens.len:
             add[str](allTokens, tokens[j])
     if allTokens.len <= 0:

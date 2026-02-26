@@ -3,8 +3,8 @@ import std/seqs
 import std/strings
 import std/result
 import std/os
-import cheng/backend/uir/uir_types
-import cheng/backend/machine/machine_types
+import backend/uir/uir_types
+import backend/machine/machine_types
 
 type
     LabelState = ref
@@ -16,9 +16,8 @@ var
     iselExprDepthLimitCached: bool = false
     iselExprDepthLimitValue: int32 = 4096
 
-# Stage0 compatibility: explicit forward declaration avoids unresolved call
-# target regressions in older selfhost compilers.
-fn iselEmitExprCompat(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
+# Forward declarations for mutually recursive emitters.
+fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
                 retType: UirLowerType, dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
                 baseReg: MachineReg, labelState: LabelState): Result[int32]
 fn iselEmitStmt(func: MachineFunc, module: UirModule, stmt: UirStmt, uirFunc: UirFunc,
@@ -558,7 +557,7 @@ fn iselEmitLinuxSyscallBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
     iselEmitSubSp(func, stackSize)
 
     let nrExpr: UirExpr = uirExprArgAt(expr, 0)
-    let nrRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, nrExpr, uirTypeI64(),
+    let nrRes: Result[int32] = iselEmitExpr(func, module, uirFunc, nrExpr, uirTypeI64(),
                                             MachineReg(17), MachineReg(18), MachineReg(19), baseReg, labelState)
     if !IsOk[int32](nrRes):
         return nrRes
@@ -571,7 +570,7 @@ fn iselEmitLinuxSyscallBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
         let argReg: MachineReg = Value[MachineReg](argRegRes)
         let argExpr: UirExpr = uirExprArgAt(expr, ai + 1)
         let argTy: UirLowerType = iselExprType(module, uirFunc, argExpr, uirTypeI64())
-        let argRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, argExpr, uirTypeI64(),
+        let argRes: Result[int32] = iselEmitExpr(func, module, uirFunc, argExpr, uirTypeI64(),
                                                  argReg, MachineReg(18), MachineReg(19), baseReg, labelState)
         if !IsOk[int32](argRes):
             return argRes
@@ -611,7 +610,7 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
     let callReg: MachineReg = MachineReg(20)
 
     if realArgCount == 0:
-        let fnRes0: Result[int32] = iselEmitExprCompat(func, module, uirFunc, fnPtrExpr, uirTypeI64(),
+        let fnRes0: Result[int32] = iselEmitExpr(func, module, uirFunc, fnPtrExpr, uirTypeI64(),
                                                  callReg, MachineReg(18), MachineReg(19), baseReg, labelState)
         if !IsOk[int32](fnRes0):
             return fnRes0
@@ -660,7 +659,7 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
         let argDst: MachineReg = iselReg0(argType)
         let argTmp: MachineReg = iselReg1(argType)
         let argScratch: MachineReg = iselReg2(argType)
-        let argRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, argExpr, argType,
+        let argRes: Result[int32] = iselEmitExpr(func, module, uirFunc, argExpr, argType,
                                                  argDst, argTmp, argScratch,
                                                  baseReg, labelState)
         if ! IsOk[int32](argRes):
@@ -672,7 +671,7 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
             off = stackArgOffs[ai]
         machineAddInst(func, machineStr(argDst, MachineReg(23), off))
 
-    let fnRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, fnPtrExpr, uirTypeI64(),
+    let fnRes: Result[int32] = iselEmitExpr(func, module, uirFunc, fnPtrExpr, uirTypeI64(),
                                             callReg, MachineReg(18), MachineReg(19), baseReg, labelState)
     if !IsOk[int32](fnRes):
         return fnRes
@@ -727,7 +726,7 @@ fn iselEmitF64BitsIntrinsic(func: MachineFunc, module: UirModule, uirFunc: UirFu
         if uirExprArgsLen(expr) != 1:
             return Err[int32]("isel: intrinsic arg count mismatch: " + name)
         let arg0: UirExpr = uirExprArgAt(expr, 0)
-        let argRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, arg0, uirTypeI64(),
+        let argRes: Result[int32] = iselEmitExpr(func, module, uirFunc, arg0, uirTypeI64(),
                                                  dstX, tmpX, scratchX, baseReg, labelState)
         if !IsOk[int32](argRes):
             return argRes
@@ -745,12 +744,12 @@ fn iselEmitF64BitsIntrinsic(func: MachineFunc, module: UirModule, uirFunc: UirFu
         return Err[int32]("isel: intrinsic arg count mismatch: " + name)
     let lhs: UirExpr = uirExprArgAt(expr, 0)
     let rhs: UirExpr = uirExprArgAt(expr, 1)
-    let lhsRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, lhs, uirTypeI64(),
+    let lhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, lhs, uirTypeI64(),
                                              dstX, tmpX, scratchX, baseReg, labelState)
     if !IsOk[int32](lhsRes):
         return lhsRes
     iselPush(func, dstX)
-    let rhsRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, rhs, uirTypeI64(),
+    let rhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, rhs, uirTypeI64(),
                                              tmpX, scratchX, dstX, baseReg, labelState)
     if !IsOk[int32](rhsRes):
         return rhsRes
@@ -805,7 +804,7 @@ fn iselFreshLabel(prefix: str, state: LabelState): str =
     memRetain void*(out)
     return out
 
-fn iselEmitExprCompat(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
+fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
                 retType: UirLowerType, dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
                 baseReg: MachineReg, labelState: LabelState): Result[int32] =
     let lim: int32 = iselExprDepthLimit()
@@ -927,7 +926,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
                 let argDst: MachineReg = iselReg0(argType)
                 let argTmp: MachineReg = iselReg1(argType)
                 let argScratch: MachineReg = iselReg2(argType)
-                let argRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, argExpr, argType,
+                let argRes: Result[int32] = iselEmitExpr(func, module, uirFunc, argExpr, argType,
                                                          argDst, argTmp, argScratch,
                                                          baseReg, labelState)
                 if ! IsOk[int32](argRes):
@@ -1015,7 +1014,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
             let argDst: MachineReg = iselReg0(argType)
             let argTmp: MachineReg = iselReg1(argType)
             let argScratch: MachineReg = iselReg2(argType)
-            let argRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, argExpr, argType,
+            let argRes: Result[int32] = iselEmitExpr(func, module, uirFunc, argExpr, argType,
                                                      argDst, argTmp, argScratch,
                                                      baseReg, labelState)
             if ! IsOk[int32](argRes):
@@ -1051,7 +1050,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         let srcDst: MachineReg = iselRegWithType(tmp, srcType)
         let srcTmp: MachineReg = iselRegWithType(scratch, srcType)
         let srcScratch: MachineReg = iselRegWithType(dst, srcType)
-        let srcRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, srcExpr, srcType,
+        let srcRes: Result[int32] = iselEmitExpr(func, module, uirFunc, srcExpr, srcType,
                                                  srcDst, srcTmp, srcScratch, baseReg, labelState)
         if ! IsOk[int32](srcRes):
             return srcRes
@@ -1102,7 +1101,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         let addrReg: MachineReg = iselRegWithType(tmp, uirTypeI64())
         let addrTmp: MachineReg = iselRegWithType(scratch, uirTypeI64())
         let addrScratch: MachineReg = iselRegWithType(dst, uirTypeI64())
-        let addrRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, uirExprAddrExprOf(expr),
+        let addrRes: Result[int32] = iselEmitExpr(func, module, uirFunc, uirExprAddrExprOf(expr),
                                                   uirTypeI64(), addrReg, addrTmp, addrScratch,
                                                   baseReg, labelState)
         if ! IsOk[int32](addrRes):
@@ -1118,12 +1117,12 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         machineAddInst(func, machineAddPageOff(addrReg, addrReg, label))
         return Ok[int32](0)
     if uirExprKindOf(expr) == meBin:
-        let lhsRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, uirExprLhsOf(expr), exprType,
+        let lhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, uirExprLhsOf(expr), exprType,
                                                  dstT, tmpT, scratchT, baseReg, labelState)
         if ! IsOk[int32](lhsRes):
             return lhsRes
         iselPush(func, dstT)
-        let rhsRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, uirExprRhsOf(expr), exprType,
+        let rhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, uirExprRhsOf(expr), exprType,
                                                  tmpT, scratchT, dstT, baseReg, labelState)
         if ! IsOk[int32](rhsRes):
             return rhsRes
@@ -1185,14 +1184,14 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         let dstCmp: MachineReg = iselRegWithType(dst, cmpType)
         let tmpCmp: MachineReg = iselRegWithType(tmp, cmpType)
         let scratchCmp: MachineReg = iselRegWithType(scratch, cmpType)
-        let lhsRes2: Result[int32] = iselEmitExprCompat(func, module, uirFunc, lhsExpr, cmpType,
+        let lhsRes2: Result[int32] = iselEmitExpr(func, module, uirFunc, lhsExpr, cmpType,
                                                   dstCmp, tmpCmp, scratchCmp, baseReg, labelState)
         if ! IsOk[int32](lhsRes2):
             return lhsRes2
         if cmpType.kind == mtI64 && lt.kind != mtI64 && !lt.isUnsigned:
             machineAddInst(func, machineSxtw(dstCmp, iselRegWithType(dstCmp, uirTypeI32())))
         iselPush(func, dstCmp)
-        let rhsRes2: Result[int32] = iselEmitExprCompat(func, module, uirFunc, rhsExpr, cmpType,
+        let rhsRes2: Result[int32] = iselEmitExpr(func, module, uirFunc, rhsExpr, cmpType,
                                                   tmpCmp, scratchCmp, dstCmp, baseReg, labelState)
         if ! IsOk[int32](rhsRes2):
             return rhsRes2
@@ -1312,14 +1311,14 @@ fn iselEmitCondBranch(func: MachineFunc, module: UirModule, uirFunc: UirFunc, ex
         let dstT: MachineReg = iselRegWithType(dst, cmpType)
         let tmpT: MachineReg = iselRegWithType(tmp, cmpType)
         let scratchT: MachineReg = iselRegWithType(scratch, cmpType)
-        let lhsRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, uirExprLhsOf(expr), cmpType,
+        let lhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, uirExprLhsOf(expr), cmpType,
                                                  dstT, tmpT, scratchT, baseReg, labelState)
         if ! IsOk[int32](lhsRes):
             return lhsRes
         if cmpType.kind == mtI64 && lt.kind != mtI64 && !lt.isUnsigned:
             machineAddInst(func, machineSxtw(dstT, iselRegWithType(dstT, uirTypeI32())))
         iselPush(func, dstT)
-        let rhsRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, uirExprRhsOf(expr), cmpType,
+        let rhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, uirExprRhsOf(expr), cmpType,
                                                  tmpT, scratchT, dstT, baseReg, labelState)
         if ! IsOk[int32](rhsRes):
             return rhsRes
@@ -1335,7 +1334,7 @@ fn iselEmitCondBranch(func: MachineFunc, module: UirModule, uirFunc: UirFunc, ex
     let dstT2: MachineReg = iselRegWithType(dst, exprType)
     let tmpT2: MachineReg = iselRegWithType(tmp, exprType)
     let scratchT2: MachineReg = iselRegWithType(scratch, exprType)
-    let exprRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, expr, exprType, dstT2,
+    let exprRes: Result[int32] = iselEmitExpr(func, module, uirFunc, expr, exprType, dstT2,
                                               tmpT2, scratchT2, baseReg, labelState)
     if ! IsOk[int32](exprRes):
         return exprRes
@@ -1403,7 +1402,7 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
         if retType.kind != mtVoid:
             if dbgStep:
                 echo("[isel.step] term.ret.emit_expr.begin")
-            let valRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, term.retExpr,
+            let valRes: Result[int32] = iselEmitExpr(func, module, uirFunc, term.retExpr,
                                                      retType, retReg, tmpReg, scratchReg,
                                                      baseReg, labelState)
             if ! IsOk[int32](valRes):
@@ -1437,7 +1436,7 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
         let condReg: MachineReg = iselRegWithType(retReg, condType)
         let condTmp: MachineReg = iselRegWithType(tmpReg, condType)
         let condScratch: MachineReg = iselRegWithType(scratchReg, condType)
-        let condRes: Result[int32] = iselEmitExprCompat(func, module, uirFunc, term.condExpr,
+        let condRes: Result[int32] = iselEmitExpr(func, module, uirFunc, term.condExpr,
                                                         condType, condReg, condTmp, condScratch,
                                                         baseReg, labelState)
         if ! IsOk[int32](condRes):

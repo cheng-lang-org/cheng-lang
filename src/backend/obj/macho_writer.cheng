@@ -4,9 +4,9 @@ import std/strings
 import std/hashmaps
 import std/result
 import std/os
-import cheng/backend/machine/machine_types
-import cheng/backend/obj/obj_buf
-import cheng/backend/obj/aarch64_enc
+import backend/machine/machine_types
+import backend/obj/obj_buf
+import backend/obj/aarch64_enc
 
 type
     MachoReloc = ref
@@ -288,6 +288,13 @@ fn machoSeqInitEmpty_MachoSym(items: var MachoSym[]) =
     items.len = 0
     items.cap = 0
 
+fn machoSeqInitEmpty_int32(items: var int32[]) =
+    if items == nil:
+        return
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
 fn macho_seqAddUniqueStr(items: var str[], value: str) =
     if value == nil || len(value) == 0:
         return
@@ -422,14 +429,14 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
     var text: uint8[]
     var cstring: uint8[]
     var data: uint8[]
-    machoSeqInitEmpty[uint8](text)
-    machoSeqInitEmpty[uint8](&cstring)
-    machoSeqInitEmpty[uint8](&data)
+    machoSeqInitEmpty_uint8(text)
+    machoSeqInitEmpty_uint8(&cstring)
+    machoSeqInitEmpty_uint8(&data)
     var bssSize: uint64 = 0
 
     # Layout cstrings.
     var cSymOffs: uint64[]
-    machoSeqInitEmpty[uint64](&cSymOffs)
+    machoSeqInitEmpty_uint64(&cSymOffs)
     cSymOffs.len = int(cstrCount)
     let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
     for ci in 0..<cstrCount:
@@ -449,10 +456,10 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
 
     # Layout globals.
     var dataSymOffs: uint64[]
-    machoSeqInitEmpty[uint64](&dataSymOffs)
+    machoSeqInitEmpty_uint64(&dataSymOffs)
     dataSymOffs.len = int(globalCount)
     var bssSymOffs: uint64[]
-    machoSeqInitEmpty[uint64](&bssSymOffs)
+    machoSeqInitEmpty_uint64(&bssSymOffs)
     bssSymOffs.len = int(globalCount)
     var maxDataAlignPow2: int32 = 0
     var maxBssAlignPow2: int32 = 0
@@ -481,8 +488,8 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
     # Encode .text and collect relocations.
     var relocs: MachoReloc[]
     var funcOffs: uint64[]
-    machoSeqInitEmpty[MachoReloc](&relocs)
-    machoSeqInitEmpty[uint64](&funcOffs)
+    machoSeqInitEmpty_MachoReloc(&relocs)
+    machoSeqInitEmpty_uint64(&funcOffs)
     funcOffs.len = int(funcCount)
     machoDebug("[macho] build:func_offs_ready")
     for fi in 0..<funcCount:
@@ -501,10 +508,10 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
 
         # Pass 1: compute label offsets within this function (in bytes from func start).
         var labels: str[]
-        machoSeqInitEmpty[str](&labels)
+        machoSeqInitEmpty_str(&labels)
         labels.cap = 16
         var labelOffs: int32[]
-        machoSeqInitEmpty[int32](&labelOffs)
+        machoSeqInitEmpty_int32(&labelOffs)
         labelOffs.cap = 16
         var scanOff: int32 = 0
         for si in 0..<machineFuncInstsLen(f):
@@ -747,8 +754,8 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
     # this object (no cross-object `L*` symbol resolution required).
     var synthCstrNames: str[]
     var synthCstrOffs: uint64[]
-    machoSeqInitEmpty[str](&synthCstrNames)
-    machoSeqInitEmpty[uint64](&synthCstrOffs)
+    machoSeqInitEmpty_str(&synthCstrNames)
+    machoSeqInitEmpty_uint64(&synthCstrOffs)
     machoCollectSynthCstringsFromRelocs(relocs, cstring, synthCstrNames, synthCstrOffs)
 
     # Sections: always include __text, optionally __cstring/__data/__bss.
@@ -802,7 +809,7 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
 
     # Build symbol list in dyld order: locals, extdefs, undefs.
     var syms: MachoSym[]
-    machoSeqInitEmpty[MachoSym](syms)
+    machoSeqInitEmpty_MachoSym(syms)
     var symIndexCapHint: int32 = cstrCount + synthCstrNames.len + funcCount + globalCount
     if symIndexCapHint < 64:
         symIndexCapHint = 64
@@ -849,7 +856,7 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
 
     # undefs referenced by relocations.
     var undefs: str[]
-    machoSeqInitEmpty[str](&undefs)
+    machoSeqInitEmpty_str(&undefs)
     let undefCapHint: int32 = relocs.len < 64 ? 64 : relocs.len
     var undefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(undefCapHint * 2 + 1)
     for ri in 0..<relocs.len:
@@ -879,7 +886,7 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
 
     # Build string table and fill nameOff.
     var strtab: uint8[]
-    machoSeqInitEmpty[uint8](strtab)
+    machoSeqInitEmpty_uint8(strtab)
     add(strtab, uint8(0))
     for si in 0..<syms.len:
         let s0: MachoSym = syms[si]
@@ -935,7 +942,7 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
 
     # Build file.
     var out: uint8[]
-    machoSeqInitEmpty[uint8](out)
+    machoSeqInitEmpty_uint8(out)
     machoDebug("[macho] build:file_layout_done")
 
     # mach_header_64

@@ -89,10 +89,11 @@ PKG_ROOTS="/abs/pkgs/cheng-libp2p,/abs/pkgs/cheng-ai" \
   --target=arm64-apple-darwin \
   --frontend=stage1 \
   --allow-no-main \
-  --whole-program \
   --input=src/std/system_helpers_backend.cheng \
   --output=chengcache/system_helpers_backend.arm64-apple-darwin.o
 ```
+
+说明：`whole_program` 已在编译器内部固定为 `1`，无需也不能再通过参数切换。
 
 ---
 

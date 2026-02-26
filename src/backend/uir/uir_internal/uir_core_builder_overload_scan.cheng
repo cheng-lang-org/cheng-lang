@@ -1,0 +1,89 @@
+# UIR core builder overload/mangle helpers (split from uir_core_builder).
+import std/hashsets
+import std/hashmaps
+import stage1/ast
+
+fn uirCoreFuncSigMarker(): str =
+    return "__cheng_sig_"
+
+fn uirCoreFuncSigInput(retKey0: str, paramKeys: str[]): str =
+    var retKey: str = retKey0
+    if retKey == nil:
+        retKey = ""
+    var out: str = retKey + "|"
+    for i in 0..<paramKeys.len:
+        let pk0: str = paramKeys[i]
+        let pk: str = (pk0 != nil) ? pk0 : ""
+        out = out + pk + ";"
+    return out
+
+fn uirCoreFuncSigId(retKey: str, paramKeys: str[]): str =
+    return uirCoreU64ToHex(uirCoreFnv1a64(uirCoreFuncSigInput(retKey, paramKeys)))
+
+fn uirCoreMangleOverloadName(baseSym: str, retKey: str, paramKeys: str[]): str =
+    return baseSym + uirCoreFuncSigMarker() + uirCoreFuncSigId(retKey, paramKeys)
+
+fn uirCoreComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
+    # Stage1 monomorphize may emit multiple functions with the same base name (e.g. `len`)
+    # but different signatures. The MIR module requires globally-unique function symbols,
+    # so we precompute which base names are overloaded.
+    var overloaded: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
+    let rootKids: int32 = kidCount(root)
+    let mapCap: int32 = (rootKids > 128) ? (rootKids * 2) : 256
+    var nameIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(mapCap)
+    var seenNames: str[]
+    var firstSigs: str[]
+
+    var queue: Node[256]
+    add(queue, root)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil || n.kind == nkEmpty:
+            continue
+        if n.kind == nkStmtList || n.kind == nkModule:
+            for i in 0..<kidCount(n):
+                add(queue, kid(n, i))
+            continue
+        if (n.kind != nkFnDecl && n.kind != nkIteratorDecl) || kidCount(n) == 0:
+            continue
+        if uirCoreFuncSigHasUnresolvedGenerics(n):
+            continue
+        let nameNode: Node = kid(n, 0)
+        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
+            continue
+        let rawName: str = backendStripSpaces(plainName(nameNode))
+        let baseId: str = rawName
+        if baseId == nil || len(baseId) == 0:
+            continue
+
+        let paramsNode: Node = kid(n, 1)
+        var paramKeys: str[]
+        if paramsNode != nil && paramsNode.kind == nkFormalParams:
+            for pi in 0..<kidCount(paramsNode):
+                let defs: Node = kid(paramsNode, pi)
+                if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 1:
+                    let tn: Node = kid(defs, 1)
+                    let pk: str = (tn != nil) ? typeKey(tn) : ""
+                    add(paramKeys, pk)
+
+        let retNode: Node = kid(n, 2)
+        var retKey: str = ""
+        if retNode != nil && retNode.kind != nkEmpty:
+            retKey = typeKey(retNode)
+        let sigId: str = uirCoreFuncSigId(retKey, paramKeys)
+
+        var foundName: bool = false
+        let idxPlus1: int32 = uirCoreHashMapStrIntGetCompat(nameIndex, baseId, foundName)
+        if !foundName || idxPlus1 <= 0:
+            let newIdx: int32 = seenNames.len
+            add(seenNames, baseId)
+            add(firstSigs, sigId)
+            hashmaps.hashMapStrIntPut(nameIndex, baseId, newIdx + 1)
+            continue
+        let prevIdx: int32 = idxPlus1 - 1
+        if prevIdx >= 0 && prevIdx < firstSigs.len:
+            let prevSig: str = firstSigs[prevIdx]
+            if !(prevSig == sigId):
+                hashsets.hashSetStrAdd(overloaded, baseId)
+    return overloaded

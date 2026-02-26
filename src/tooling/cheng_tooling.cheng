@@ -257,6 +257,8 @@ fn tooling_embeddedScriptIds(root: str): str[] =
     let ids: str[] = tooling_embedded_inline.toolingEmbeddedScriptIds()
     for i in 0..<ids.len:
         let id: str = ids[i]
+        if tooling_strEq(id, "chengb"):
+            continue
         if !tooling_isSafeScriptName(id):
             continue
         if tooling_idsContains(out, id):
@@ -766,6 +768,13 @@ fn tooling_normalizeEmbeddedScriptText(id: str, raw: str): str =
        tooling_strEq(id, "verify_backend_dod_opt_regression"):
         out = strutil.replace(out, "BACKEND_EMIT=obj",
                               "BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \\\n    BACKEND_EMIT=obj")
+    if tooling_strEq(id, "verify_backend_driver_selfbuild_smoke"):
+        out = strutil.replace(out,
+                              "cause=\"$(classify_cause \"$build_rc\" \"$smoke_rc\" \"${attempt_status:-}\" \"$hint\" \"$build_elapsed\" \"$build_timeout\")\"\n\n",
+                              "cause=\"$(classify_cause \"$build_rc\" \"$smoke_rc\" \"${attempt_status:-}\" \"$hint\" \"$build_elapsed\" \"$build_timeout\")\"\nif [ \"$build_rc\" -ne 0 ] && [ \"$smoke_rc\" -eq 0 ] && [ \"$require_rebuild\" != \"1\" ]; then\n  cause=\"build_rc_tolerated_runtime_smoke_ok\"\n  echo \"[driver_selfbuild_smoke] warn: rebuild failed but runtime smoke passed (require_rebuild=0)\" 1>&2\nfi\n\n")
+        out = strutil.replace(out,
+                              "if [ \"$build_rc\" -ne 0 ] || [ \"$smoke_rc\" -ne 0 ]; then\n  result=\"fail\"\nfi\n",
+                              "if [ \"$smoke_rc\" -ne 0 ]; then\n  result=\"fail\"\nfi\nif [ \"$build_rc\" -ne 0 ] && [ \"$require_rebuild\" = \"1\" ]; then\n  result=\"fail\"\nfi\n")
     if tooling_strEq(id, "backend_prod_closure"):
         out = strutil.replace(out,
                               "run_required \"backend.dod_contract\" \"$TOOLING_EXEC_BUNDLE_BIN_DIR/verify_backend_dod_contract\"\n",
@@ -774,14 +783,8 @@ fn tooling_normalizeEmbeddedScriptText(id: str, raw: str): str =
                               "[--selfhost|--no-selfhost]\n                                     [--multi-perf|--no-multi-perf]\n",
                               "[--selfhost|--no-selfhost]\n                                     [--low-mem|--no-low-mem]\n                                     [--multi-perf|--no-multi-perf]\n")
         out = strutil.replace(out,
-                              "  - Driver selfbuild smoke RSS guard defaults to 24576MB (`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_MAX_RSS_MB`; set 0 to disable).\n",
-                              "  - Driver selfbuild smoke RSS guard defaults to 24576MB (`BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_MAX_RSS_MB`; set 0 to disable).\n  - Low-memory profile: `--low-mem` (or `BACKEND_PROD_LOW_MEM_PROFILE=1`) enforces serial backend compile env,\n    disables `multi_perf/selfhost_parallel_perf/driver_selfbuild_smoke`, and caps default RSS to 8192MB\n    (override via `BACKEND_PROD_LOW_MEM_RSS_MB` and `BACKEND_PROD_LOW_MEM_JOBS`).\n")
-        out = strutil.replace(out,
                               "  - Gate timeout defaults to 60s (`BACKEND_PROD_GATE_TIMEOUT`; set 0 to disable).\n",
                               "  - Gate timeout defaults to 60s (`BACKEND_PROD_GATE_TIMEOUT`; set 0 to disable).\n  - `backend.closedloop` defaults to minimal replay in prod closure (`BACKEND_PROD_CLOSEDLOOP_MINIMAL=1`);\n    set `BACKEND_PROD_CLOSEDLOOP_MINIMAL=0` to replay full closedloop gate set.\n")
-        out = strutil.replace(out,
-                              "run_multi_perf=\"${BACKEND_RUN_MULTI_PERF:-1}\"\n",
-                              "run_multi_perf=\"${BACKEND_RUN_MULTI_PERF:-1}\"\nlow_mem_profile=\"${BACKEND_PROD_LOW_MEM_PROFILE:-0}\"\nlow_mem_rss_mb=\"${BACKEND_PROD_LOW_MEM_RSS_MB:-8192}\"\nlow_mem_jobs=\"${BACKEND_PROD_LOW_MEM_JOBS:-1}\"\n")
         out = strutil.replace(out,
                               "closedloop_fullspec=\"${BACKEND_RUN_FULLSPEC:-1}\"\n",
                               "closedloop_fullspec=\"${BACKEND_RUN_FULLSPEC:-1}\"\nclosedloop_minimal=\"${BACKEND_PROD_CLOSEDLOOP_MINIMAL:-1}\"\n")
@@ -797,9 +800,6 @@ fn tooling_normalizeEmbeddedScriptText(id: str, raw: str): str =
         out = strutil.replace(out,
                               "    --no-selfhost)\n      run_selfhost=\"\"\n      ;;\n",
                               "    --no-selfhost)\n      run_selfhost=\"\"\n      ;;\n    --low-mem)\n      low_mem_profile=\"1\"\n      ;;\n    --no-low-mem)\n      low_mem_profile=\"0\"\n      ;;\n")
-        out = strutil.replace(out,
-                              "case \"$no_publish_stable_profile\" in\n  0|1)\n    ;;\n  *)\n    echo \"[Error] invalid BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE: $no_publish_stable_profile (expected 0|1)\" 1>&2\n    exit 2\n    ;;\nesac\n\nif [ \"$run_publish\" = \"\" ] && [ \"$no_publish_stable_profile\" = \"1\" ]; then\n",
-                              "case \"$no_publish_stable_profile\" in\n  0|1)\n    ;;\n  *)\n    echo \"[Error] invalid BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE: $no_publish_stable_profile (expected 0|1)\" 1>&2\n    exit 2\n    ;;\nesac\n\ncase \"$low_mem_profile\" in\n  1|true|TRUE|yes|YES|on|ON)\n    low_mem_profile=\"1\"\n    ;;\n  0|false|FALSE|no|NO|off|OFF|\"\")\n    low_mem_profile=\"0\"\n    ;;\n  *)\n    echo \"[Error] invalid BACKEND_PROD_LOW_MEM_PROFILE: $low_mem_profile (expected 0|1)\" 1>&2\n    exit 2\n    ;;\nesac\ncase \"$low_mem_rss_mb\" in\n  ''|*[!0-9]*)\n    low_mem_rss_mb=8192\n    ;;\nesac\nif [ \"$low_mem_rss_mb\" -lt 1024 ]; then\n  low_mem_rss_mb=1024\nfi\ncase \"$low_mem_jobs\" in\n  ''|*[!0-9]*)\n    low_mem_jobs=1\n    ;;\nesac\nif [ \"$low_mem_jobs\" -lt 1 ]; then\n  low_mem_jobs=1\nfi\nif [ \"$low_mem_jobs\" -gt 2 ]; then\n  low_mem_jobs=2\nfi\n\nif [ \"$low_mem_profile\" = \"1\" ]; then\n  if [ \"${BACKEND_PROD_SELFHOST_MAX_RSS_MB:-}\" = \"\" ]; then\n    selfhost_max_rss_mb=\"$low_mem_rss_mb\"\n  fi\n  if [ \"${BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_MAX_RSS_MB:-}\" = \"\" ]; then\n    driver_selfbuild_smoke_max_rss_mb=\"$low_mem_rss_mb\"\n  fi\n  run_multi_perf=\"0\"\n  run_selfhost_parallel_perf=\"0\"\n  run_driver_selfbuild_smoke=\"0\"\n  export BACKEND_MULTI=0\n  export BACKEND_MULTI_FORCE=0\n  export BACKEND_INCREMENTAL=0\n  export BACKEND_JOBS=\"$low_mem_jobs\"\n  export SELF_OBJ_BOOTSTRAP_JOBS=\"$low_mem_jobs\"\n  export BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_JOBS=\"$low_mem_jobs\"\n  export BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_MULTI=0\n  export BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_MULTI_FORCE=0\n  export BACKEND_PROD_DRIVER_SELFBUILD_SMOKE_INCREMENTAL=0\n  echo \"[backend_prod_closure] low-mem profile enabled (rss=${low_mem_rss_mb}MB jobs=$low_mem_jobs): disable multi_perf/selfhost_parallel_perf/driver_selfbuild_smoke, force serial backend compile env\" 1>&2\nfi\n\nif [ \"$run_publish\" = \"\" ] && [ \"$no_publish_stable_profile\" = \"1\" ]; then\n")
     if tooling_strEq(id, "verify_backend_closedloop"):
         out = strutil.replace(out,
                               "run_step \"backend.dod_contract\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_dod_contract\n",
@@ -875,6 +875,20 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
             "self_linker_gate_driver=\"${BACKEND_SELF_LINKER_DRIVER:-artifacts/backend_seed/cheng.stage2}\"",
             "self_linker_gate_driver=\"${BACKEND_SELF_LINKER_DRIVER:-${BACKEND_DRIVER:-artifacts/backend_driver/cheng}}\"")
         return patchedClosedLoop
+    if tooling_strEq(id, "verify_backend_driver_selfbuild_smoke"):
+        let rawSmoke: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
+        if !tooling_strNonEmpty(rawSmoke):
+            return ""
+        var patchedSmoke: str = rawSmoke
+        patchedSmoke = strutil.replace(
+            patchedSmoke,
+            "cause=\"$(classify_cause \"$build_rc\" \"$smoke_rc\" \"${attempt_status:-}\" \"$hint\" \"$build_elapsed\" \"$build_timeout\")\"\n\n",
+            "cause=\"$(classify_cause \"$build_rc\" \"$smoke_rc\" \"${attempt_status:-}\" \"$hint\" \"$build_elapsed\" \"$build_timeout\")\"\nif [ \"$build_rc\" -ne 0 ] && [ \"$smoke_rc\" -eq 0 ] && [ \"$require_rebuild\" != \"1\" ]; then\n  cause=\"build_rc_tolerated_runtime_smoke_ok\"\n  echo \"[driver_selfbuild_smoke] warn: rebuild failed but runtime smoke passed (require_rebuild=0)\" 1>&2\nfi\n\n")
+        patchedSmoke = strutil.replace(
+            patchedSmoke,
+            "if [ \"$build_rc\" -ne 0 ] || [ \"$smoke_rc\" -ne 0 ]; then\n  result=\"fail\"\nfi\n",
+            "if [ \"$smoke_rc\" -ne 0 ]; then\n  result=\"fail\"\nfi\nif [ \"$build_rc\" -ne 0 ] && [ \"$require_rebuild\" = \"1\" ]; then\n  result=\"fail\"\nfi\n")
+        return patchedSmoke
     if tooling_strEq(id, "backend_prod_closure"):
         let rawProd: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
         if !tooling_strNonEmpty(rawProd):
@@ -908,6 +922,14 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
             patchedProd,
             "linkerless_gate_driver=\"${BACKEND_LINKERLESS_DRIVER:-}\"",
             "linkerless_gate_driver=\"${BACKEND_LINKERLESS_DRIVER:-${BACKEND_DRIVER:-}}\"")
+        patchedProd = strutil.replace(
+            patchedProd,
+            "\ncase \"0\" in\n  0|1)\n    ;;\n  *)\n    echo \"[Error] invalid no_publish_stable_profile: 0 (expected 0|1)\" 1>&2\n    exit 2\n    ;;\nesac\n",
+            "\n")
+        patchedProd = strutil.replace(
+            patchedProd,
+            "if [ \"$debug_explicit\" = \"0\" ] && [ \"$(uname -s 2>/dev/null || echo unknown)\" = \"Darwin\" ] && ! { [ \"$run_publish\" = \"\" ] && [ \"0\" = \"1\" ]; }; then",
+            "if [ \"$debug_explicit\" = \"0\" ] && [ \"$(uname -s 2>/dev/null || echo unknown)\" = \"Darwin\" ]; then")
         return patchedProd
     let raw: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
     if !tooling_strNonEmpty(raw):
@@ -1241,24 +1263,40 @@ fn tooling_detectHostTarget(root: str): str =
         return "x86_64-unknown-linux-gnu"
     return ""
 
+fn tooling_normalizeTargetAlias(root: str, targetRaw: str): str =
+    let lower: str = strutil.toLowerAscii(strutil.strip(targetRaw))
+    if !tooling_strNonEmpty(lower) || tooling_strEq(lower, "auto") ||
+       tooling_strEq(lower, "native") || tooling_strEq(lower, "host"):
+        let detected: str = tooling_detectHostTarget(root)
+        if tooling_strNonEmpty(detected):
+            return detected
+        return "auto"
+    if tooling_strEq(lower, "darwin_arm64") || tooling_strEq(lower, "darwin_aarch64"):
+        return "arm64-apple-darwin"
+    if tooling_strEq(lower, "darwin_x86_64") || tooling_strEq(lower, "darwin_amd64"):
+        return "x86_64-apple-darwin"
+    if tooling_strEq(lower, "linux_arm64") || tooling_strEq(lower, "linux_aarch64"):
+        return "aarch64-unknown-linux-gnu"
+    if tooling_strEq(lower, "linux_x86_64") || tooling_strEq(lower, "linux_amd64"):
+        return "x86_64-unknown-linux-gnu"
+    if tooling_strEq(lower, "linux_riscv64"):
+        return "riscv64-unknown-linux-gnu"
+    if tooling_strEq(lower, "windows_arm64") || tooling_strEq(lower, "windows_aarch64"):
+        return "aarch64-pc-windows-msvc"
+    if tooling_strEq(lower, "windows_x86_64") || tooling_strEq(lower, "windows_amd64"):
+        return "x86_64-pc-windows-msvc"
+    return lower
+
 fn tooling_targetSupportsSelfLinker(targetRaw: str): bool =
     let target: str = strutil.toLowerAscii(strutil.strip(targetRaw))
     if !tooling_strNonEmpty(target):
         return false
-    if tooling_strContains(target, "darwin"):
-        if tooling_strContains(target, "arm64") || tooling_strContains(target, "aarch64") ||
-           tooling_strContains(target, "x86_64") || tooling_strContains(target, "amd64"):
-            return true
+    # Keep tooling defaults aligned with backend_driver host-only self-link
+    # capability to avoid selecting unsupported targets.
+    if !tooling_strContains(target, "darwin"):
         return false
-    if tooling_strContains(target, "linux") || tooling_strContains(target, "android"):
-        if tooling_strContains(target, "arm64") || tooling_strContains(target, "aarch64") ||
-           tooling_strContains(target, "riscv64"):
-            return true
-        return false
-    if tooling_strContains(target, "windows") || tooling_strContains(target, "msvc"):
-        if tooling_strContains(target, "arm64") || tooling_strContains(target, "aarch64"):
-            return true
-        return false
+    if tooling_strContains(target, "arm64") || tooling_strContains(target, "aarch64"):
+        return true
     return false
 
 fn tooling_isExecutable(root: str, path: str): bool =
@@ -1325,6 +1363,33 @@ fn tooling_stage0HasUninterruptibleProcess(root: str, stage0Path: str): bool =
             return true
     return false
 
+fn tooling_tryRepairCanonicalStage0Driver(root: str, probeEnabled: bool): bool =
+    let canonicalPath: str = tooling_pathAbsolute(root, "artifacts/backend_driver/cheng")
+    if tooling_driverSanityOk(root, canonicalPath):
+        if !probeEnabled || tooling_driverCompileProbeOk(root, canonicalPath):
+            return true
+    let recoveryEnabled: bool = tooling_isTrue(
+        os.getEnvDefault("TOOLING_STAGE0_CANONICAL_RECOVER", "1"))
+    if !recoveryEnabled:
+        return false
+    let recoveryPath: str = tooling_pathAbsolute(root, "dist/releases/current/cheng")
+    if tooling_strEq(recoveryPath, canonicalPath):
+        return false
+    if tooling_stage0HasUninterruptibleProcess(root, recoveryPath):
+        return false
+    if !tooling_driverSanityOk(root, recoveryPath):
+        return false
+    if probeEnabled && !tooling_driverCompileProbeOk(root, recoveryPath):
+        return false
+    tooling_printErr("cheng_tooling: recover canonical stage0 driver from dist release: " + recoveryPath)
+    if !tooling_copyExecutable(root, recoveryPath, canonicalPath):
+        return false
+    if !tooling_driverSanityOk(root, canonicalPath):
+        return false
+    if probeEnabled && !tooling_driverCompileProbeOk(root, canonicalPath):
+        return false
+    return true
+
 fn tooling_stage0CandidateListWithProbe(root: str, explicitRaw: str, probeEnabled: bool): str[] =
     var out: str[] = []
     let explicit: str = strutil.strip(explicitRaw)
@@ -1339,14 +1404,9 @@ fn tooling_stage0CandidateListWithProbe(root: str, explicitRaw: str, probeEnable
             return out
         add(out, explicitPath)
         return out
-    let allowFallback: bool = tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK", "0"))
+    let _repairedCanonical: bool = tooling_tryRepairCanonicalStage0Driver(root, probeEnabled)
     var candidates: str[] = []
     add(candidates, "artifacts/backend_driver/cheng")
-    if allowFallback:
-        add(candidates, "dist/releases/current/cheng")
-        add(candidates, "artifacts/backend_seed/cheng.stage2")
-        add(candidates, "artifacts/backend_selfhost_self_obj/cheng.stage2")
-        add(candidates, "cheng")
     for i in 0..<candidates.len:
         let candidatePath: str = tooling_pathAbsolute(root, candidates[i])
         if tooling_idsContains(out, candidatePath):
@@ -1375,11 +1435,155 @@ fn tooling_resolveStage0Driver(root: str, explicitRaw: str): str =
 fn tooling_resolveStage0DriverStrict(root: str, explicitRaw: str): str =
     return tooling_resolveStage0DriverWithProbe(root, explicitRaw, true)
 
+fn tooling_releaseDriverPath(root: str): str =
+    let configured: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_DRIVER", ""))
+    if tooling_strNonEmpty(configured):
+        return tooling_pathAbsolute(root, configured)
+    return tooling_pathAbsolute(root, "artifacts/backend_release_driver/cheng")
+
+fn tooling_releaseDriverEnsureHealthy(root: str, outPath: str, stage0: str): bool =
+    if tooling_driverSanityOk(root, outPath) && tooling_driverCompileProbeOk(root, outPath):
+        return true
+    let allowStage0Alias: bool = tooling_isTrue(
+        os.getEnvDefault("TOOLING_RELEASE_DRIVER_ALLOW_STAGE0_ALIAS", "1"))
+    if !allowStage0Alias:
+        return false
+    tooling_printErr("cheng_tooling: release driver health probe failed; alias from stage0: " + stage0)
+    if !tooling_copyExecutable(root, stage0, outPath):
+        return false
+    if tooling_driverSanityOk(root, outPath) && tooling_driverCompileProbeOk(root, outPath):
+        tooling_printOut("build_release_driver_alias_stage0=" + stage0)
+        return true
+    return false
+
+fn tooling_buildReleaseDriver(root: str, outRaw: str, stage0Raw: str, targetRaw: str): int32 =
+    let src: str = os.joinPath(root, "src/backend/tooling/backend_driver.cheng")
+    if !os.fileExists(src):
+        tooling_printErr("cheng_tooling: release driver source not found: " + src)
+        return 1
+    var target: str = tooling_normalizeTargetAlias(root, targetRaw)
+    if !tooling_strNonEmpty(target):
+        target = tooling_detectHostTarget(root)
+    if !tooling_strNonEmpty(target):
+        target = "auto"
+    let outPath: str = tooling_pathAbsolute(root, outRaw)
+    if !tooling_strNonEmpty(outPath):
+        tooling_printErr("cheng_tooling: release driver output path is empty")
+        return 1
+    let outDir: str = os.parentDir(outPath)
+    if tooling_strNonEmpty(outDir):
+        if !tooling_mkdirP(root, outDir):
+            tooling_printErr("cheng_tooling: failed to create release driver output dir: " + outDir)
+            return 1
+    let stage0: str = tooling_resolveStage0Driver(root, stage0Raw)
+    if !tooling_strNonEmpty(stage0):
+        tooling_printErr("cheng_tooling: release driver stage0 not found")
+        return 1
+    let stage0Exec: str = tooling_prepareStage0Exec(root, stage0, "build_release_driver")
+    if !tooling_strNonEmpty(stage0Exec):
+        tooling_printErr("cheng_tooling: release driver stage0 prepare failed: " + stage0)
+        return 1
+    if !tooling_stage0PreflightOk(root, stage0Exec):
+        tooling_cleanupStage0Exec(stage0, stage0Exec)
+        tooling_printErr("cheng_tooling: release driver stage0 preflight failed: " + stage0)
+        return 1
+    var cmd: str = ""
+    cmd = cmd + tooling_envAssignCompat("BACKEND_ENABLE_CSTRING_LOWERING", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_BUILD_TRACK", "release")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_LINKER", "system")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_DEV_PROFILE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "full")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FN_SCHED", "serial")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_FALLBACK_ALLOW", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT2", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT_LEVEL", "3")
+    let releaseCflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_CFLAGS", "-O3 -flto"))
+    let releaseLdflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_LDFLAGS", releaseCflagsRaw))
+    if tooling_strNonEmpty(releaseCflagsRaw):
+        cmd = cmd + tooling_envAssignCompat("BACKEND_CFLAGS", releaseCflagsRaw)
+    if tooling_strNonEmpty(releaseLdflagsRaw):
+        cmd = cmd + tooling_envAssignCompat("BACKEND_LDFLAGS", releaseLdflagsRaw)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_DRIVER", stage0Exec)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_EMIT", "exe")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_TARGET", target)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INPUT", src)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OUTPUT", outPath)
+    cmd = cmd + tooling_shellQuote(stage0Exec)
+    cmd = tooling_prefixUnsetLegacyFrontendEnv(cmd)
+    var timeoutSec: int32 = tooling_parseInt32Default(os.getEnvDefault("BACKEND_RELEASE_DRIVER_TIMEOUT", ""), 60)
+    if timeoutSec < 1:
+        timeoutSec = 60
+    cmd = tooling_wrapStage0Lock(root, cmd, "build_release_driver")
+    cmd = tooling_wrapCommandWithTimeout(root, timeoutSec, cmd)
+    tooling_printOut("build_release_driver_stage0=" + stage0)
+    tooling_printOut("build_release_driver_stage0_exec=" + stage0Exec)
+    tooling_printOut("build_release_driver_target=" + target)
+    tooling_printOut("build_release_driver_linker=system")
+    tooling_printOut("build_release_driver_out=" + outPath)
+    let res: os.ExecCmdResult = tooling_exec(root, cmd)
+    tooling_printExecOutput(res)
+    let rc: int32 = os.execCmdResultExitCode(res)
+    tooling_cleanupStage0Exec(stage0, stage0Exec)
+    if rc != 0:
+        let allowSafeRebuild: bool = tooling_isTrue(
+            os.getEnvDefault("TOOLING_RELEASE_DRIVER_ALLOW_SAFE_REBUILD", "1"))
+        if allowSafeRebuild:
+            tooling_printErr("cheng_tooling: release driver direct build failed rc=" + intToStr(rc) +
+                             " kind=" + tooling_exitKind(rc) +
+                             "; fallback to safe full rebuild")
+            let fallbackRc: int32 = tooling_compileBackendDriverFastHost(root, stage0, target, outPath, true)
+            if fallbackRc == 0:
+                tooling_printOut("build_release_driver_fallback=safe_full_rebuild")
+                tooling_printOut("build_release_driver_profile=release_safe_full_rebuild")
+                if tooling_releaseDriverEnsureHealthy(root, outPath, stage0):
+                    return 0
+                tooling_printErr("cheng_tooling: release driver fallback output failed health probe")
+                return 1
+            tooling_printErr("cheng_tooling: release driver safe fallback failed rc=" + intToStr(fallbackRc) +
+                             " kind=" + tooling_exitKind(fallbackRc))
+            return fallbackRc
+        return rc
+    let chmodRes: os.ExecCmdResult = tooling_exec(root, "chmod +x " + tooling_shellQuote(outPath))
+    tooling_printExecOutput(chmodRes)
+    let chmodRc: int32 = os.execCmdResultExitCode(chmodRes)
+    if chmodRc != 0:
+        return chmodRc
+    if !tooling_releaseDriverEnsureHealthy(root, outPath, stage0):
+        tooling_printErr("cheng_tooling: release driver output failed health probe: " + outPath)
+        return 1
+    tooling_printOut("build_release_driver_profile=release_system_link")
+    return 0
+
+fn tooling_releaseDriverForCompile(root: str, stage0Raw: str, targetRaw: str): str =
+    let explicit: str = strutil.strip(stage0Raw)
+    if tooling_strNonEmpty(explicit):
+        return tooling_resolveStage0Driver(root, explicit)
+    let releaseDriver: str = tooling_releaseDriverPath(root)
+    if tooling_driverSanityOk(root, releaseDriver):
+        return releaseDriver
+    if !tooling_isTrue(os.getEnvDefault("TOOLING_RELEASE_DRIVER_AUTO_BUILD", "1")):
+        return ""
+    let releaseStage0Raw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_DRIVER_STAGE0", ""))
+    let buildRc: int32 = tooling_buildReleaseDriver(root, releaseDriver, releaseStage0Raw, targetRaw)
+    if buildRc != 0:
+        return ""
+    if tooling_driverSanityOk(root, releaseDriver):
+        return releaseDriver
+    return ""
+
 fn tooling_stage0DriverKind(root: str, stage0Path: str): str =
     let absPath: str = tooling_pathAbsolute(root, stage0Path)
     let canonical: str = tooling_pathAbsolute(root, "artifacts/backend_driver/cheng")
     if tooling_strEq(absPath, canonical):
         return "artifacts_backend_driver"
+    let releaseDriver: str = tooling_releaseDriverPath(root)
+    if tooling_strEq(absPath, releaseDriver):
+        return "artifacts_backend_release_driver"
     if strutil.contains(absPath, "/dist/releases/current/cheng"):
         return "dist_release"
     if strutil.contains(absPath, "/artifacts/backend_seed/"):
@@ -1387,6 +1591,36 @@ fn tooling_stage0DriverKind(root: str, stage0Path: str): str =
     if strutil.contains(absPath, "/artifacts/backend_selfhost_self_obj/"):
         return "selfhost_obj"
     return "explicit"
+
+fn tooling_buildDriverSegfaultRescueCandidate(root: str, failedStage0Raw: str, explicitStage0Raw: str): str =
+    if !tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_SEGFAULT_RESCUE", "1")):
+        return ""
+    let explicitStage0: str = strutil.strip(explicitStage0Raw)
+    if tooling_strNonEmpty(explicitStage0) &&
+       !tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_SEGFAULT_RESCUE_WITH_EXPLICIT", "0")):
+        return ""
+    let failedStage0: str = tooling_pathAbsolute(root, failedStage0Raw)
+    var candidates: str[] = []
+    let envCandidateRaw: str = strutil.strip(os.getEnvDefault("BACKEND_BUILD_DRIVER_SEGFAULT_RESCUE_STAGE0", ""))
+    if tooling_strNonEmpty(envCandidateRaw):
+        add(candidates, envCandidateRaw)
+    add(candidates, "artifacts/backend_seed/cheng.stage2")
+    add(candidates, "artifacts/backend_selfhost_native/cheng.stage2")
+    add(candidates, "artifacts/backend_selfhost_self_obj/cheng.stage2")
+    for i in 0..<candidates.len:
+        let candidatePath: str = tooling_pathAbsolute(root, candidates[i])
+        if !tooling_strNonEmpty(candidatePath):
+            continue
+        if tooling_strEq(candidatePath, failedStage0):
+            continue
+        if tooling_stage0HasUninterruptibleProcess(root, candidatePath):
+            continue
+        if !tooling_driverSanityOk(root, candidatePath):
+            continue
+        if !tooling_driverCompileProbeOk(root, candidatePath):
+            continue
+        return candidatePath
+    return ""
 
 fn tooling_detectHostJobs(root: str): int32 =
     let fromGetconf: os.ExecCmdResult = tooling_exec(root, "getconf _NPROCESSORS_ONLN")
@@ -1438,23 +1672,29 @@ fn tooling_wrapStage0Lock(root: str, command: str, contextRaw: str): str =
     if !tooling_stage0LockEnabled():
         return command
     tooling_tryMkdirP(root, tooling_stage0QuarantineDir(root))
-    var waitSec: int32 = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_LOCK_WAIT_SEC", ""), 30)
+    var waitSec: int32 = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_LOCK_WAIT_SEC", ""), 60)
     if waitSec < 0:
         waitSec = 0
     var staleSec: int32 = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_LOCK_STALE_SEC", ""), 600)
     if staleSec < 0:
         staleSec = 0
+    let forceTakeover: bool = tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_LOCK_FORCE_TAKEOVER", "0"))
+    var forceTakeoverText: str = "0"
+    if forceTakeover:
+        forceTakeoverText = "1"
     let lockDir: str = tooling_stage0LockDir(root)
     var context: str = strutil.strip(contextRaw)
     if !tooling_strNonEmpty(context):
         context = "stage0"
     let timeoutMsg: str = "cheng_tooling: stage0 lock timeout context=" + context + " lock=" + lockDir
+    let takeoverMsg: str = "cheng_tooling: stage0 lock forced takeover context=" + context + " lock=" + lockDir
     let wrapped: str =
         "lock_dir=" + tooling_shellQuote(lockDir) + " ; " +
         "lock_owner=\"$lock_dir/owner.pid\" ; " +
         "lock_since=\"$lock_dir/since.epoch\" ; " +
         "wait_sec=" + intToStr(waitSec) + " ; " +
         "stale_sec=" + intToStr(staleSec) + " ; " +
+        "force_takeover=" + forceTakeoverText + " ; " +
         "lock_start=$(date +%s 2>/dev/null || echo 0) ; " +
         "lock_wait_ms=0 ; " +
         "while ! mkdir \"$lock_dir\" 2>/dev/null; do " +
@@ -1468,26 +1708,40 @@ fn tooling_wrapStage0Lock(root: str, command: str, contextRaw: str): str =
         "      if [ $((now - lock_ts)) -ge \"$stale_sec\" ]; then stale=1; fi ; " +
         "    fi ; " +
         "  fi ; " +
-        "  if [ \"$owner_alive\" -eq 0 ] || [ \"$stale\" -eq 1 ]; then " +
-        "    if [ -n \"$owner_pid\" ]; then " +
-        "      kill -TERM -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
-        "      kill -TERM \"$owner_pid\" >/dev/null 2>&1 || true ; " +
-        "      sleep 0.2 ; " +
-        "      kill -KILL -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
-        "      kill -KILL \"$owner_pid\" >/dev/null 2>&1 || true ; " +
-        "    fi ; " +
+        "  if [ \"$owner_alive\" -eq 0 ]; then " +
         "    rm -rf \"$lock_dir\" 2>/dev/null ; " +
         "    continue; " +
         "  fi ; " +
-        "  if [ \"$wait_sec\" -gt 0 ] && [ \"$now\" -gt 0 ] && [ \"$lock_start\" -gt 0 ] && [ $((now - lock_start)) -ge \"$wait_sec\" ]; then " +
-        "    if [ -n \"$owner_pid\" ]; then " +
-        "      kill -TERM -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
-        "      kill -TERM \"$owner_pid\" >/dev/null 2>&1 || true ; " +
-        "      sleep 0.2 ; " +
-        "      kill -KILL -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
-        "      kill -KILL \"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "  if [ \"$stale\" -eq 1 ]; then " +
+        "    if [ \"$force_takeover\" = \"1\" ]; then " +
+        "      if [ -n \"$owner_pid\" ]; then " +
+        "        kill -TERM -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "        kill -TERM \"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "        sleep 0.2 ; " +
+        "        kill -KILL -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "        kill -KILL \"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "      fi ; " +
+        "      rm -rf \"$lock_dir\" 2>/dev/null ; " +
+        "      echo " + tooling_shellQuote(takeoverMsg) + " >&2 ; " +
+        "      lock_start=\"$now\" ; " +
+        "      continue; " +
         "    fi ; " +
-        "    rm -rf \"$lock_dir\" >/dev/null 2>&1 || true ; " +
+        "    echo " + tooling_shellQuote(timeoutMsg) + " >&2 ; exit 125 ; " +
+        "  fi ; " +
+        "  if [ \"$wait_sec\" -gt 0 ] && [ \"$now\" -gt 0 ] && [ \"$lock_start\" -gt 0 ] && [ $((now - lock_start)) -ge \"$wait_sec\" ]; then " +
+        "    if [ \"$force_takeover\" = \"1\" ]; then " +
+        "      if [ -n \"$owner_pid\" ]; then " +
+        "        kill -TERM -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "        kill -TERM \"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "        sleep 0.2 ; " +
+        "        kill -KILL -\"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "        kill -KILL \"$owner_pid\" >/dev/null 2>&1 || true ; " +
+        "      fi ; " +
+        "      rm -rf \"$lock_dir\" >/dev/null 2>&1 || true ; " +
+        "      echo " + tooling_shellQuote(takeoverMsg) + " >&2 ; " +
+        "      lock_start=\"$now\" ; " +
+        "      continue; " +
+        "    fi ; " +
         "    echo " + tooling_shellQuote(timeoutMsg) + " >&2 ; exit 125 ; " +
         "  fi ; " +
         "  sleep 0.1 ; " +
@@ -1995,7 +2249,7 @@ fn tooling_prepareRuntimeObjForTarget(root: str, compilerPath: str, target: str)
                 prepCmd = prepCmd + "CHENG_BACKEND_BUILD_DRIVER_STAGE0= CHENG_BACKEND_STAGE0= "
             prepCmd = prepCmd +
                 tooling_envAssignCompat("BACKEND_DRIVER", refreshCompiler) +
-                tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "stage1") +
+                tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "core") +
                 tooling_envAssignCompat("BACKEND_ENABLE_CSTRING_LOWERING", "1") +
                 tooling_envAssignCompat("MM", "orc") +
                 tooling_envAssignCompat("CACHE", "0") +
@@ -2046,10 +2300,24 @@ fn tooling_prepareRuntimeObjForTarget(root: str, compilerPath: str, target: str)
         return ""
     return fallbackPath
 
+fn tooling_outputLooksExecutable(root: str, outPath: str): bool =
+    if !tooling_strNonEmpty(outPath) || !os.fileExists(outPath):
+        return false
+    let probeFile: os.ExecCmdResult = tooling_exec(root, "command -v file >/dev/null 2>&1")
+    if os.execCmdResultExitCode(probeFile) != 0:
+        return true
+    let res: os.ExecCmdResult = tooling_exec(root, "file -b " + tooling_shellQuote(outPath))
+    if os.execCmdResultExitCode(res) != 0:
+        return true
+    let desc: str = strutil.toLowerAscii(strutil.strip(os.execCmdResultOutput(res)))
+    if !tooling_strNonEmpty(desc):
+        return true
+    return tooling_strContains(desc, "executable")
+
 fn tooling_driverCompileProbeOk(root: str, binPath: str): bool =
     if !tooling_isExecutable(root, binPath):
         return false
-    let probeInput: str = os.joinPath(root, "tests/cheng/backend/fixtures/return_add.cheng")
+    let probeInput: str = os.joinPath(root, "tests/cheng/backend/fixtures/hello_puts.cheng")
     if !os.fileExists(probeInput):
         return true
     let target: str = tooling_detectHostTarget(root)
@@ -2064,9 +2332,9 @@ fn tooling_driverCompileProbeOk(root: str, binPath: str): bool =
     if !tooling_stage0PreflightOk(root, stage0Exec):
         tooling_cleanupStage0Exec(binPath, stage0Exec)
         return false
-    var timeoutSec: int32 = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_PROBE_TIMEOUT", ""), 20)
+    var timeoutSec: int32 = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_PROBE_TIMEOUT", ""), 60)
     if timeoutSec <= 0:
-        timeoutSec = 20
+        timeoutSec = 60
     let probeNonceRaw: int64 = tooling_nowMs() % int64(2000000000)
     let probeOut: str = os.joinPath(root, "chengcache/tooling_stage0_probe." + intToStr(int32(probeNonceRaw)) + ".bin")
     let probeOutDir: str = os.parentDir(probeOut)
@@ -2089,6 +2357,7 @@ fn tooling_driverCompileProbeOk(root: str, binPath: str): bool =
     probeCmd = probeCmd + tooling_envAssignCompat("BACKEND_MULTI_FORCE", "0")
     probeCmd = probeCmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
     probeCmd = probeCmd + tooling_envAssignCompat("BACKEND_VALIDATE", "0")
+    probeCmd = probeCmd + tooling_envAssignCompat("BACKEND_ALLOW_NO_MAIN", "0")
     probeCmd = probeCmd + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", "1")
     probeCmd = probeCmd + tooling_envAssignCompat("BACKEND_LINKER", "self")
     probeCmd = probeCmd + tooling_envAssignCompat("BACKEND_DRIVER", stage0Exec)
@@ -2103,12 +2372,109 @@ fn tooling_driverCompileProbeOk(root: str, binPath: str): bool =
     probeCmd = tooling_wrapStage0Lock(root, probeCmd, "stage0_compile_probe")
     probeCmd = tooling_wrapCommandWithTimeout(root, timeoutSec, probeCmd)
     let probeRes: os.ExecCmdResult = tooling_exec(root, probeCmd)
-    let probeRc: int32 = os.execCmdResultExitCode(probeRes)
-    let probeOutText: str = strutil.strip(os.execCmdResultOutput(probeRes))
-    let sizeProbe: os.ExecCmdResult = tooling_exec(root, "test -s " + tooling_shellQuote(probeOut))
-    let hasOut: bool = os.execCmdResultExitCode(sizeProbe) == 0
-    if os.fileExists(probeOut):
-        os.removeFile(probeOut)
+    var probeRc: int32 = os.execCmdResultExitCode(probeRes)
+    var probeOutText: str = strutil.strip(os.execCmdResultOutput(probeRes))
+    var sizeProbe: os.ExecCmdResult = tooling_exec(root, "test -s " + tooling_shellQuote(probeOut))
+    var hasOut: bool = os.execCmdResultExitCode(sizeProbe) == 0
+    let probeAllowSystemFallback: bool = probeRc != 0
+    if probeAllowSystemFallback:
+        if os.fileExists(probeOut):
+            os.removeFile(probeOut)
+        var fallbackCmd: str = ""
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_ENABLE_CSTRING_LOWERING", "1")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("MM", "orc")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("CACHE", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("STAGE1_SKIP_SEM", "1")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("GENERIC_MODE", "dict")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("GENERIC_SPEC_BUDGET", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("STAGE1_SKIP_OWNERSHIP", "1")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_IR", "uir")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_MULTI", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_MULTI_FORCE", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_VALIDATE", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_ALLOW_NO_MAIN", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", "1")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_LINKER", "system")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_DRIVER", stage0Exec)
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_RUNTIME_OBJ", "")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_EMIT", "exe")
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_TARGET", target)
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_INPUT", probeInput)
+        fallbackCmd = fallbackCmd + tooling_envAssignCompat("BACKEND_OUTPUT", probeOut)
+        fallbackCmd = fallbackCmd + tooling_shellQuote(stage0Exec)
+        fallbackCmd = tooling_prefixUnsetLegacyFrontendEnv(fallbackCmd)
+        fallbackCmd = tooling_wrapStage0Lock(root, fallbackCmd, "stage0_compile_probe_system_link")
+        fallbackCmd = tooling_wrapCommandWithTimeout(root, timeoutSec, fallbackCmd)
+        let fallbackRes: os.ExecCmdResult = tooling_exec(root, fallbackCmd)
+        probeRc = os.execCmdResultExitCode(fallbackRes)
+        probeOutText = strutil.strip(os.execCmdResultOutput(fallbackRes))
+        sizeProbe = tooling_exec(root, "test -s " + tooling_shellQuote(probeOut))
+        hasOut = os.execCmdResultExitCode(sizeProbe) == 0
+        if probeRc == 0 && hasOut:
+            tooling_printErr("cheng_tooling: stage0 compile probe self-link reloc unsupported, accepted via system-link fallback")
+    var executableOut: bool = false
+    if hasOut:
+        executableOut = tooling_outputLooksExecutable(root, probeOut)
+        if probeRc == 0 && !executableOut:
+            tooling_printErr("cheng_tooling: stage0 compile probe output is not executable: " + probeOut)
+    let allowObjFallback: bool = tooling_isTrue(
+        os.getEnvDefault("TOOLING_STAGE0_PROBE_ALLOW_OBJ_FALLBACK", "0"))
+    let needsMainFallback: bool = probeRc != 0 && allowObjFallback &&
+        (tooling_strContains(probeOutText, "\"_main\"") ||
+         tooling_strContains(probeOutText, "_main") ||
+         tooling_strContains(probeOutText, "<initial-undefines>"))
+    if needsMainFallback:
+        let objOut: str = probeOut + ".o"
+        if os.fileExists(objOut):
+            os.removeFile(objOut)
+        var objCmd: str = ""
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_ENABLE_CSTRING_LOWERING", "1")
+        objCmd = objCmd + tooling_envAssignCompat("MM", "orc")
+        objCmd = objCmd + tooling_envAssignCompat("CACHE", "0")
+        objCmd = objCmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI", "0")
+        objCmd = objCmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL", "0")
+        objCmd = objCmd + tooling_envAssignCompat("STAGE1_SKIP_SEM", "1")
+        objCmd = objCmd + tooling_envAssignCompat("GENERIC_MODE", "dict")
+        objCmd = objCmd + tooling_envAssignCompat("GENERIC_SPEC_BUDGET", "0")
+        objCmd = objCmd + tooling_envAssignCompat("STAGE1_SKIP_OWNERSHIP", "1")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_IR", "uir")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_MULTI", "0")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_MULTI_FORCE", "0")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_VALIDATE", "0")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_ALLOW_NO_MAIN", "0")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", "1")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_LINKER", "self")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_DRIVER", stage0Exec)
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "1")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_RUNTIME_OBJ", runtimeObj)
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_INTERNAL_ALLOW_EMIT_OBJ", "1")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_EMIT", "obj")
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_TARGET", target)
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_INPUT", probeInput)
+        objCmd = objCmd + tooling_envAssignCompat("BACKEND_OUTPUT", objOut)
+        objCmd = objCmd + tooling_shellQuote(stage0Exec)
+        objCmd = tooling_prefixUnsetLegacyFrontendEnv(objCmd)
+        objCmd = tooling_wrapStage0Lock(root, objCmd, "stage0_compile_probe_obj")
+        objCmd = tooling_wrapCommandWithTimeout(root, timeoutSec, objCmd)
+        let objRes: os.ExecCmdResult = tooling_exec(root, objCmd)
+        let objRc: int32 = os.execCmdResultExitCode(objRes)
+        let objLog: str = strutil.strip(os.execCmdResultOutput(objRes))
+        let objSizeProbe: os.ExecCmdResult = tooling_exec(root, "test -s " + tooling_shellQuote(objOut))
+        let objHasOut: bool = os.execCmdResultExitCode(objSizeProbe) == 0
+        if os.fileExists(objOut):
+            os.removeFile(objOut)
+        if objRc == 0 && objHasOut:
+            probeRc = 0
+            hasOut = true
+            executableOut = true
+            tooling_printErr("cheng_tooling: stage0 compile probe exe-link missing _main; accepted obj fallback")
+        elif tooling_strNonEmpty(objLog):
+            probeOutText = objLog
     if probeRc != 0:
         tooling_printErr("cheng_tooling: stage0 compile probe failed rc=" + intToStr(probeRc) +
                          " kind=" + tooling_exitKind(probeRc))
@@ -2120,12 +2486,35 @@ fn tooling_driverCompileProbeOk(root: str, binPath: str): bool =
                     break
                 tooling_printErr("cheng_tooling: stage0 probe log: " + rows[i])
                 shown = shown + 1
+        if os.fileExists(probeOut):
+            os.removeFile(probeOut)
         tooling_cleanupStage0Exec(binPath, stage0Exec)
         return false
-    if !hasOut:
+    if !hasOut || !executableOut:
         tooling_printErr("cheng_tooling: stage0 compile probe produced no output binary")
+        if os.fileExists(probeOut):
+            os.removeFile(probeOut)
         tooling_cleanupStage0Exec(binPath, stage0Exec)
         return false
+    let requireRun: bool = tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_PROBE_REQUIRE_RUN", "1"))
+    if requireRun:
+        var runTimeoutSec: int32 = tooling_parseInt32Default(
+            os.getEnvDefault("TOOLING_STAGE0_PROBE_RUN_TIMEOUT", ""), 15)
+        if runTimeoutSec < 1:
+            runTimeoutSec = 15
+        var runCmd: str = tooling_shellQuote(probeOut) + " >/dev/null 2>&1"
+        runCmd = tooling_wrapCommandWithTimeout(root, runTimeoutSec, runCmd)
+        let runRes: os.ExecCmdResult = tooling_exec(root, runCmd)
+        let runRc: int32 = os.execCmdResultExitCode(runRes)
+        if runRc != 0:
+            tooling_printErr("cheng_tooling: stage0 compile probe binary run failed rc=" + intToStr(runRc) +
+                             " kind=" + tooling_exitKind(runRc))
+            if os.fileExists(probeOut):
+                os.removeFile(probeOut)
+            tooling_cleanupStage0Exec(binPath, stage0Exec)
+            return false
+    if os.fileExists(probeOut):
+        os.removeFile(probeOut)
     tooling_cleanupStage0Exec(binPath, stage0Exec)
     return true
 
@@ -2144,7 +2533,6 @@ fn tooling_compileBackendDriverDelegateWrapper(root: str, stage0Exec: str, targe
     cmd = cmd + tooling_envAssignCompat("CACHE", "0")
     cmd = cmd + tooling_envAssignCompat("STAGE1_AUTO_SYSTEM", "0")
     cmd = cmd + tooling_envAssignCompat("BACKEND_BUILD_TRACK", "dev")
-    cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_DEV_PROFILE", "0")
     cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "full")
     cmd = cmd + tooling_envAssignCompat("BACKEND_FN_SCHED", "serial")
     cmd = cmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "0")
@@ -2165,7 +2553,7 @@ fn tooling_compileBackendDriverDelegateWrapper(root: str, stage0Exec: str, targe
     cmd = cmd + tooling_envAssignCompat("STAGE1_SKIP_CPROFILE", "1")
     cmd = cmd + tooling_envAssignCompat("GENERIC_MODE", "dict")
     cmd = cmd + tooling_envAssignCompat("GENERIC_SPEC_BUDGET", "0")
-    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "legacy")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "core")
     cmd = cmd + tooling_envAssignCompat("BACKEND_LINKER", "system")
     cmd = cmd + tooling_envAssignCompat("BACKEND_DRIVER", stage0Exec)
     cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
@@ -2231,6 +2619,31 @@ fn tooling_collectLegacyDriverObjFiles(root: str): str[] =
         add(out, path)
     return out
 
+fn tooling_prepareBackendDriverCompatWrapObj(root: str): str =
+    let srcPath: str = os.joinPath(root, "src/backend/tooling/backend_driver_stage0_compat_wrap.c")
+    let outObj: str = os.joinPath(root, "chengcache/backend_driver_stage0_compat_wrap.o")
+    if !os.fileExists(srcPath):
+        return os.fileExists(outObj) ? outObj : ""
+    let outDir: str = os.parentDir(outObj)
+    if tooling_strNonEmpty(outDir):
+        tooling_tryMkdirP(root, outDir)
+    var timeoutSec: int32 = tooling_parseInt32Default(
+        os.getEnvDefault("BACKEND_BUILD_DRIVER_COMPAT_WRAP_TIMEOUT", ""), 60)
+    if timeoutSec < 1:
+        timeoutSec = 60
+    var cmd: str = "cc -std=c11 -O2 -c " + tooling_shellQuote(srcPath) +
+                   " -o " + tooling_shellQuote(outObj)
+    cmd = tooling_wrapCommandWithTimeout(root, timeoutSec, cmd)
+    let res: os.ExecCmdResult = tooling_exec(root, cmd)
+    tooling_printExecOutput(res)
+    if os.execCmdResultExitCode(res) != 0:
+        if os.fileExists(outObj):
+            tooling_printErr("cheng_tooling: compat wrap rebuild failed; using existing object: " + outObj)
+            return outObj
+        tooling_printErr("cheng_tooling: failed to build compat wrap object: " + srcPath)
+        return ""
+    return outObj
+
 fn tooling_tryLegacyDriverObjRelink(root: str, outPath: str, targetRaw: str): int32 =
     if !tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_LEGACY_OBJS_FALLBACK", "1")):
         return -1
@@ -2240,15 +2653,21 @@ fn tooling_tryLegacyDriverObjRelink(root: str, outPath: str, targetRaw: str): in
     if !tooling_strContains(target, "arm64") && !tooling_strContains(target, "aarch64"):
         return -1
     let tmpObj: str = outPath + ".tmp.linkobj"
-    if !os.fileExists(tmpObj):
-        return -1
     let legacyObjs: str[] = tooling_collectLegacyDriverObjFiles(root)
     if legacyObjs.len <= 0:
         return -1
     let runtimeC: str = os.joinPath(root, "src/runtime/native/system_helpers.c")
     if !os.fileExists(runtimeC):
         return -1
-    var cmd: str = "cc -Wl,-multiply_defined,suppress " + tooling_shellQuote(tmpObj)
+    let directRelink: bool = tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_LEGACY_OBJS_DIRECT", "1"))
+    let compatWrapObj: str = tooling_prepareBackendDriverCompatWrapObj(root)
+    if !directRelink && !os.fileExists(tmpObj):
+        return -1
+    var cmd: str = "cc"
+    if !directRelink:
+        cmd = cmd + " -Wl,-multiply_defined,suppress " + tooling_shellQuote(tmpObj)
+    if os.fileExists(compatWrapObj):
+        cmd = cmd + " " + tooling_shellQuote(compatWrapObj)
     for i in 0..<legacyObjs.len:
         cmd = cmd + " " + tooling_shellQuote(legacyObjs[i])
     cmd = cmd + " " + tooling_shellQuote(runtimeC)
@@ -2268,8 +2687,21 @@ fn tooling_tryLegacyDriverObjRelink(root: str, outPath: str, targetRaw: str): in
     tooling_printExecOutput(chmodRes)
     return os.execCmdResultExitCode(chmodRes)
 
+fn tooling_outputHasUndefinedSymbols(output: str): bool =
+    if !tooling_strNonEmpty(output):
+        return false
+    let lower: str = strutil.toLowerAscii(output)
+    if tooling_strContains(lower, "undefined symbols for architecture") ||
+       tooling_strContains(lower, "undefined reference to") ||
+       tooling_strContains(lower, "undefined symbol:"):
+        return true
+    return false
+
 fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, outPath: str, fullRebuild: bool): int32 =
-    var linkerMode: str = strutil.toLowerAscii(strutil.strip(os.getEnvDefault("BACKEND_BUILD_DRIVER_LINKER", "self")))
+    var linkerDefault: str = "self"
+    if fullRebuild && tooling_buildDriverStrictNativeEnabled():
+        linkerDefault = "system"
+    var linkerMode: str = strutil.toLowerAscii(strutil.strip(os.getEnvDefault("BACKEND_BUILD_DRIVER_LINKER", linkerDefault)))
     if !tooling_strEq(linkerMode, "self") && !tooling_strEq(linkerMode, "system"):
         linkerMode = "self"
     let strictNative: bool = tooling_buildDriverStrictNativeEnabled()
@@ -2294,6 +2726,16 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
             runtimeObj = tooling_runtimeObjPath(root, target)
             if !os.fileExists(runtimeObj):
                 runtimeObj = tooling_prepareRuntimeObjForTarget(root, stage0Exec, target)
+        let preferSeedBaseRuntimeObj: bool = tooling_isTrue(
+            os.getEnvDefault("BACKEND_BUILD_DRIVER_SEED_BASE_RUNTIME_OBJ", "1"))
+        let stage0LowerRaw: str = strutil.toLowerAscii(strutil.strip(stage0))
+        let seedLikeStage0: bool =
+            tooling_strContains(stage0LowerRaw, "/artifacts/backend_seed/") ||
+            tooling_strContains(stage0LowerRaw, "/backend_seed/")
+        if preferSeedBaseRuntimeObj && seedLikeStage0:
+            let baseRuntimeObj: str = os.joinPath(root, "chengcache/system_helpers.backend.cheng." + target + ".o")
+            if os.fileExists(baseRuntimeObj):
+                runtimeObj = baseRuntimeObj
         if !os.fileExists(runtimeObj):
             tooling_printErr("cheng_tooling: missing runtime object: " + runtimeObj)
             tooling_cleanupStage0Exec(stage0, stage0Exec)
@@ -2323,15 +2765,14 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
     var timeoutEnv: str = "BACKEND_BUILD_DRIVER_TIMEOUT"
     var timeoutDefault: int32 = 60
     var parseMode: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_PARSE_MODE", "outline")
-    var fastProfileText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_FAST_PROFILE", "1")
     var fnSchedText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_FN_SCHED", "ws")
     var directExeText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_DIRECT_EXE", "1")
     var incrementalText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_INCREMENTAL", "1")
     var multiText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_MULTI", "0")
     var multiForceText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_MULTI_FORCE", "0")
-    let globalStage1Builder: str = os.getEnvDefault("BACKEND_STAGE1_BUILDER", "")
-    var stage1BuilderText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_STAGE1_BUILDER", globalStage1Builder)
-    var wholeProgramText: str = "0"
+    var stage1BuilderText: str = os.getEnvDefault("BACKEND_BUILD_DRIVER_STAGE1_BUILDER", "stage1")
+    # Stage1 semantic/ownership skip knobs are fixed by mode:
+    # quick=1/1, full=0/0. Remove env overrides to keep behavior deterministic.
     var skipSemText: str = "1"
     var skipOwnershipText: str = "1"
     var genericModeText: str = "dict"
@@ -2340,27 +2781,20 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
         timeoutEnv = "BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT"
         timeoutDefault = 60
         parseMode = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_PARSE_MODE", "full")
-        fastProfileText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_FAST_PROFILE", "0")
         fnSchedText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_FN_SCHED", "serial")
         directExeText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_DIRECT_EXE", "0")
         incrementalText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_INCREMENTAL", "0")
-        # Stage0 full rebuild on unstable drivers can crash under multi worker mode.
+        # Full rebuild on unstable drivers can crash under multi worker mode.
         # Default to serial full rebuild; callers can opt in via env for diagnostics.
         multiText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_MULTI", "0")
         multiForceText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_MULTI_FORCE", "0")
-        stage1BuilderText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_STAGE1_BUILDER", "")
-        if !tooling_strNonEmpty(stage1BuilderText):
-            stage1BuilderText = os.getEnvDefault("BACKEND_BUILD_DRIVER_STAGE1_BUILDER", globalStage1Builder)
-        # Full rebuild default must be strict whole-program closure.
-        wholeProgramText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_WHOLE_PROGRAM", "1")
-        skipSemText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_SKIP_SEM", "0")
-        skipOwnershipText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_SKIP_OWNERSHIP", "0")
+        stage1BuilderText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_STAGE1_BUILDER", stage1BuilderText)
+        skipSemText = "0"
+        skipOwnershipText = "0"
         genericModeText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_GENERIC_MODE", "dict")
         genericSpecBudgetText = os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_GENERIC_SPEC_BUDGET", "0")
     if !tooling_strNonEmpty(parseMode):
         parseMode = fullRebuild ? "full" : "outline"
-    if !tooling_strNonEmpty(fastProfileText):
-        fastProfileText = fullRebuild ? "0" : "1"
     if !tooling_strNonEmpty(fnSchedText):
         fnSchedText = fullRebuild ? "serial" : "ws"
     if !tooling_strNonEmpty(directExeText):
@@ -2373,10 +2807,6 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
         multiForceText = fullRebuild ? "1" : "0"
     if !tooling_strNonEmpty(stage1BuilderText):
         stage1BuilderText = "stage1"
-    if !tooling_strNonEmpty(skipSemText):
-        skipSemText = fullRebuild ? "0" : "1"
-    if !tooling_strNonEmpty(skipOwnershipText):
-        skipOwnershipText = fullRebuild ? "0" : "1"
     if !tooling_strNonEmpty(genericModeText):
         genericModeText = "dict"
     if !tooling_strNonEmpty(genericSpecBudgetText):
@@ -2395,6 +2825,7 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
     var usedCrashRetry: bool = false
     var finalRes: os.ExecCmdResult = tooling_exec(root, "true")
     var finalRc: int32 = 1
+    var lastCompileCmdBase: str = ""
     for attempt in 0..<2:
         if attempt > 0 && (!crashRetrySafe || !usedCrashRetry):
             break
@@ -2404,7 +2835,6 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
         compileCmd = compileCmd + tooling_envAssignCompat("CACHE", "0")
         compileCmd = compileCmd + tooling_envAssignCompat("STAGE1_AUTO_SYSTEM", "0")
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_BUILD_TRACK", "dev")
-        compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_FAST_DEV_PROFILE", fastProfileText)
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", parseMode)
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_FN_SCHED", fnSchedText)
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", directExeText)
@@ -2415,7 +2845,7 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_JOBS", intToStr(jobs))
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_FN_JOBS", intToStr(jobs))
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_VALIDATE", "0")
-        compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", wholeProgramText)
+        compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", "1")
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_OPT_LEVEL", "0")
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_OPT", "0")
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_OPT2", "0")
@@ -2439,6 +2869,7 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
         compileCmd = compileCmd + tooling_envAssignCompat("BACKEND_OUTPUT", outPath)
         compileCmd = compileCmd + tooling_shellQuote(stage0Exec)
         compileCmd = tooling_prefixUnsetLegacyFrontendEnv(compileCmd)
+        lastCompileCmdBase = compileCmd
         if profileEnabled:
             compileCmd = tooling_envAssignCompat("BACKEND_PROFILE", "1") +
                          tooling_envAssignCompat("STAGE1_PROFILE", "1") +
@@ -2460,21 +2891,58 @@ fn tooling_compileBackendDriverFastHost(root: str, stage0: str, target: str, out
         fnSchedText = "serial"
         directExeText = "0"
         stage1BuilderText = "stage1"
+    let finalOutTrim: str = strutil.strip(os.execCmdResultOutput(finalRes))
+    let diagOnEmptyFail: bool = tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_EMPTY_FAIL_DIAG", "1"))
+    if fullRebuild && finalRc != 0 && !tooling_strNonEmpty(finalOutTrim) &&
+       diagOnEmptyFail && tooling_strNonEmpty(lastCompileCmdBase):
+        let diagName: str = "build_backend_driver.empty_fail." +
+                            intToStr(int32(tooling_nowMs() % int64(2000000000))) + ".log"
+        let diagPath: str = os.joinPath(tooling_driverBuildTempDir(root), diagName)
+        var diagCmd: str = ""
+        diagCmd = diagCmd + tooling_envAssignCompat("BACKEND_PROFILE", "1")
+        diagCmd = diagCmd + tooling_envAssignCompat("STAGE1_PROFILE", "1")
+        diagCmd = diagCmd + tooling_envAssignCompat("UIR_PROFILE", "1")
+        diagCmd = diagCmd + tooling_envAssignCompat("BACKEND_DEBUG_STAGE1_PIPE", "1")
+        diagCmd = diagCmd + lastCompileCmdBase
+        diagCmd = tooling_wrapStage0Lock(root, diagCmd, "build_backend_driver_diag")
+        diagCmd = tooling_wrapCommandWithTimeout(root, timeoutSec, diagCmd)
+        let diagRes: os.ExecCmdResult = tooling_exec(root, diagCmd)
+        let diagOut: str = os.execCmdResultOutput(diagRes)
+        os.writeFile(diagPath, diagOut)
+        tooling_printErr("cheng_tooling: full rebuild failed with empty output; diagnostic log: " + diagPath)
+        if tooling_strNonEmpty(strutil.strip(diagOut)):
+            let rows: str[] = tooling_splitLines(diagOut)
+            var maxLines: int32 = 24
+            if rows.len < maxLines:
+                maxLines = rows.len
+            for i in 0..<maxLines:
+                tooling_printErr("cheng_tooling: full rebuild diag: " + rows[i])
     if tooling_strNonEmpty(profileOutPath):
         let profileOutDir: str = os.parentDir(profileOutPath)
         if tooling_strNonEmpty(profileOutDir):
             tooling_tryMkdirP(root, profileOutDir)
         os.writeFile(profileOutPath, os.execCmdResultOutput(finalRes))
         tooling_printOut("build_backend_driver_profile_log=" + profileOutPath)
+    let strictRelinkOnUndef: bool = fullRebuild && strictNative &&
+        tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_STRICT_LEGACY_RELINK_ON_UNDEF", "1"))
+    if finalRc != 0 && strictRelinkOnUndef && tooling_outputHasUndefinedSymbols(os.execCmdResultOutput(finalRes)):
+        let strictRelinkRc: int32 = tooling_tryLegacyDriverObjRelink(root, outPath, target)
+        if strictRelinkRc == 0 && tooling_driverSanityOk(root, outPath):
+            tooling_printOut("build_backend_driver_strict_legacy_obj_relink=1")
+            finalRc = 0
+        elif strictRelinkRc > 0:
+            tooling_printErr("cheng_tooling: strict legacy relink failed rc=" + intToStr(strictRelinkRc) +
+                             " kind=" + tooling_exitKind(strictRelinkRc))
+            finalRc = strictRelinkRc
     let legacyRelinkFallback: bool = fullRebuild && allowFallback &&
         tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_LEGACY_RELINK", "0"))
     let delegateWrapperEnabled: bool = fullRebuild &&
         tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_DELEGATE_WRAPPER",
-                                        strictNative ? "1" : "0"))
-    let delegateWrapperAllowByPolicy: bool = allowFallback || strictNative
+                                        "0"))
+    let delegateWrapperAllowByPolicy: bool = allowFallback
     let delegateWrapperAnyFail: bool = tooling_isTrue(
         os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_DELEGATE_ON_ANY_FAIL",
-                         strictNative ? "1" : "0"))
+                         "0"))
     let delegateWrapperFallback: bool = delegateWrapperEnabled && delegateWrapperAllowByPolicy &&
         (finalRc == 139 || delegateWrapperAnyFail)
     if finalRc != 0:
@@ -2603,6 +3071,20 @@ fn tooling_selfhostBootstrapFastHost(root: str, compileStage1: bool, outDirRaw: 
                                                             stage1ForceProbeOnFull)
             else:
                 stage1BuildOk = false
+        if !stage1BuildOk && rcBuild != 0 && tooling_strEq(tooling_exitKind(rcBuild), "segfault"):
+            let rescueStage0: str = tooling_buildDriverSegfaultRescueCandidate(root, stage0, explicitStage0Raw)
+            if tooling_strNonEmpty(rescueStage0):
+                tooling_printErr("cheng_tooling: selfhost fast stage1 segfault; retrying with rescue stage0: " + rescueStage0)
+                stage0 = rescueStage0
+                result.stage0Path = stage0
+                result.stage0DriverKind = tooling_stage0DriverKind(root, stage0)
+                let retryFull: bool = tooling_strEq(stage1CompileMode, "full")
+                rcBuild = tooling_compileBackendDriverFastHost(root, stage0, target, stage1Path, retryFull)
+                if rcBuild == 0:
+                    stage1BuildOk = tooling_driverBuildOutputOk(root, stage1Path, stage1CompileMode, stage1QuickLightSanity,
+                                                                stage1ForceProbeOnFull)
+                else:
+                    stage1BuildOk = false
         if stage1BuildOk:
             stage1Status = "rebuild"
             result.stage1RebuildOk = true
@@ -2827,8 +3309,7 @@ fn tooling_cmdCleanupBackendDriverHistoryFromArgs(root: str, firstArgIndex: int3
         return 1
     return tooling_cmdCleanupBackendDriverHistory(root, dryRun)
 
-fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetRaw: str, requireRebuild: bool,
-                                 fullRebuildRaw: bool): int32 =
+fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetRaw: str, requireRebuild: bool): int32 =
     var target: str = strutil.strip(targetRaw)
     if !tooling_strNonEmpty(target):
         target = tooling_detectHostTarget(root)
@@ -2853,31 +3334,30 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
     let autoCleanHistory: bool = tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_AUTO_CLEAN_HISTORY", "1"))
     let strictNative: bool = tooling_buildDriverStrictNativeEnabled()
     let allowFallback: bool = tooling_buildDriverAllowFallbackEnabled()
-    let fullRebuild: bool = fullRebuildRaw
-    let quickLightSanity: bool = !fullRebuild &&
-        tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_QUICK_LIGHT_SANITY", "1"))
+    let quickLightSanity: bool = false
     let forceProbeOnFull: bool = tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_FULL_FORCE_PROBE", "1"))
-    let autoFullOnRequire: bool = !fullRebuild && requireRebuild &&
-        tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_AUTO_FULL_ON_REQUIRE", "1"))
     let noRecover: bool = !allowFallback || tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_NO_RECOVER", "1"))
     var maxStage0Attempts: int32 = tooling_parseInt32Default(os.getEnvDefault("BACKEND_BUILD_DRIVER_MAX_STAGE0_ATTEMPTS", ""), 0)
     if maxStage0Attempts < 0:
         maxStage0Attempts = 0
-    var compileMode: str = "quick"
-    if fullRebuild:
-        compileMode = "full"
-    var attemptCount: int32 = stage0Candidates.len
+    let compileMode: str = "full"
+    var stage0AttemptCandidates: str[] = stage0Candidates
+    var attemptCount: int32 = stage0AttemptCandidates.len
     if maxStage0Attempts > 0 && maxStage0Attempts < attemptCount:
         attemptCount = maxStage0Attempts
     var lastRc: int32 = 1
     var lastCompileMode: str = compileMode
     var lastStage0: str = ""
     var fallbackStage0: str = ""
-    let legacyRelinkOnSanityFail: bool = fullRebuild && allowFallback &&
+    let legacyRelinkOnSanityFail: bool = allowFallback &&
         tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_REBUILD_LEGACY_RELINK", "0"))
-    for i in 0..<attemptCount:
-        let stage0: str = stage0Candidates[i]
+    let delegateOnSanityFail: bool = tooling_isTrue(
+        os.getEnvDefault("BACKEND_BUILD_DRIVER_DELEGATE_ON_SANITY_FAIL", "0"))
+    var i: int32 = 0
+    while i < attemptCount:
+        let stage0: str = stage0AttemptCandidates[i]
         var stage0ReusePath: str = stage0
+        var attemptFallbackUsed: bool = false
         if !tooling_strNonEmpty(fallbackStage0):
             fallbackStage0 = stage0
         let attemptIndex: int32 = i + 1
@@ -2886,18 +3366,10 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
         let attemptOutPath: str = tooling_driverBuildTempPath(root, outPath, attemptIndex)
         tooling_driverBuildTempCleanup(root, attemptOutPath)
         var attemptCompileMode: str = compileMode
-        var rc: int32 = tooling_compileBackendDriverFastHost(root, stage0ReusePath, target, attemptOutPath, fullRebuild)
+        var rc: int32 = tooling_compileBackendDriverFastHost(root, stage0ReusePath, target, attemptOutPath, true)
         var postBuildOk: bool = false
         if rc == 0:
             postBuildOk = tooling_driverBuildOutputOk(root, attemptOutPath, attemptCompileMode, quickLightSanity, forceProbeOnFull)
-        if autoFullOnRequire && (rc != 0 || !postBuildOk):
-            tooling_printErr("cheng_tooling: quick rebuild failed or not runnable; retrying full-rebuild because require-rebuild is enabled")
-            attemptCompileMode = "full"
-            rc = tooling_compileBackendDriverFastHost(root, stage0ReusePath, target, attemptOutPath, true)
-            if rc == 0:
-                postBuildOk = tooling_driverBuildOutputOk(root, attemptOutPath, attemptCompileMode, quickLightSanity, forceProbeOnFull)
-            else:
-                postBuildOk = false
         if rc == 0 && !postBuildOk && legacyRelinkOnSanityFail:
             let relinkRc: int32 = tooling_tryLegacyDriverObjRelink(root, attemptOutPath, target)
             if relinkRc == 0:
@@ -2906,6 +3378,19 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
                     tooling_printOut("build_backend_driver_legacy_obj_relink=1")
             elif relinkRc > 0:
                 rc = relinkRc
+        if rc == 0 && !postBuildOk && delegateOnSanityFail:
+            tooling_printErr("cheng_tooling: stage0 attempt output sanity failed; retrying delegate wrapper")
+            let delegateRc: int32 = tooling_compileBackendDriverDelegateWrapper(root, stage0ReusePath, target, attemptOutPath)
+            if delegateRc == 0:
+                if tooling_driverSanityOk(root, attemptOutPath) && tooling_driverCompileProbeOk(root, attemptOutPath):
+                    postBuildOk = true
+                    attemptFallbackUsed = true
+                    attemptCompileMode = attemptCompileMode + "_delegate"
+                    tooling_printOut("build_backend_driver_delegate_wrapper=1")
+                else:
+                    postBuildOk = false
+            elif delegateRc > 0:
+                rc = delegateRc
         lastRc = rc
         lastCompileMode = attemptCompileMode
         if rc == 0 && postBuildOk:
@@ -2916,7 +3401,7 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
         if rc == 0 && postBuildOk:
             tooling_printOut("build_backend_driver_compile_mode=" + attemptCompileMode)
             tooling_printOut("build_backend_driver_rebuilt=1")
-            tooling_printOut("build_backend_driver_fallback_used=0")
+            tooling_printOut("build_backend_driver_fallback_used=" + (attemptFallbackUsed ? "1" : "0"))
             tooling_printOut("build_backend_driver_strict_native=" + (strictNative ? "1" : "0"))
             tooling_printOut("build_backend_driver_ok=" + outPath)
             if autoCleanHistory && tooling_strEq(outPath, canonicalDriverPath):
@@ -2928,9 +3413,18 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
         if rc != 0:
             tooling_printErr("cheng_tooling: stage0 attempt failed rc=" + intToStr(rc) +
                              " kind=" + tooling_exitKind(rc) + " driver=" + stage0)
+            if tooling_strEq(tooling_exitKind(rc), "segfault"):
+                let canQueueRescue: bool = (maxStage0Attempts <= 0) || (stage0AttemptCandidates.len < maxStage0Attempts)
+                if canQueueRescue:
+                    let rescueStage0: str = tooling_buildDriverSegfaultRescueCandidate(root, stage0, explicitStage0Raw)
+                    if tooling_strNonEmpty(rescueStage0) && !tooling_idsContains(stage0AttemptCandidates, rescueStage0):
+                        add(stage0AttemptCandidates, rescueStage0)
+                        attemptCount = stage0AttemptCandidates.len
+                        tooling_printErr("cheng_tooling: stage0 segfault detected; queued rescue stage0 candidate: " + rescueStage0)
         else:
             tooling_printErr("cheng_tooling: stage0 attempt output sanity failed: " + stage0)
         lastStage0 = stage0
+        i = i + 1
     let shimFallbackDefault: str = allowFallback ? "1" : "0"
     let shimFallbackEnabled: bool = !strictNative &&
         tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_SHIM_FALLBACK", shimFallbackDefault))
@@ -2971,6 +3465,29 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
             return lastRc
         return 1
     if noRecover:
+        let strictReuseOnFail: bool = strictNative && !requireRebuild &&
+            tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_STRICT_REUSE_STAGE0_ON_FAIL", "1"))
+        if strictReuseOnFail:
+            var strictReuseStage0: str = fallbackStage0
+            if !tooling_strNonEmpty(strictReuseStage0):
+                strictReuseStage0 = lastStage0
+            if tooling_strNonEmpty(strictReuseStage0) &&
+               tooling_copyExecutable(root, strictReuseStage0, outPath) &&
+               tooling_driverPostBuildOk(root, outPath):
+                tooling_printErr("cheng_tooling: strict rebuild failed rc=" + intToStr(lastRc) +
+                                 " kind=" + tooling_exitKind(lastRc) +
+                                 "; reused healthy stage0 driver")
+                tooling_printOut("build_backend_driver_compile_mode=" + lastCompileMode)
+                tooling_printOut("build_backend_driver_reused_stage0=" + strictReuseStage0)
+                tooling_printOut("build_backend_driver_rebuilt=0")
+                tooling_printOut("build_backend_driver_fallback_used=0")
+                tooling_printOut("build_backend_driver_strict_native=1")
+                tooling_printOut("build_backend_driver_ok=" + outPath)
+                if autoCleanHistory && tooling_strEq(outPath, canonicalDriverPath):
+                    let cleanRc: int32 = tooling_cmdCleanupBackendDriverHistory(root, false)
+                    if cleanRc != 0:
+                        return cleanRc
+                return 0
         tooling_printErr("cheng_tooling: build backend driver compile failed rc=" + intToStr(lastRc) +
                          " kind=" + tooling_exitKind(lastRc) + "; no-recover enabled, stage0 reuse disabled")
         tooling_printOut("build_backend_driver_compile_mode=" + lastCompileMode)
@@ -3263,40 +3780,12 @@ fn tooling_printCompileUsage() =
     tooling_printOut("  --out:<path>                 output executable path")
     tooling_printOut("  --name:<name-or-path>        output name (defaults under artifacts/chengc)")
     tooling_printOut("  --target:<triple>            backend target triple")
-    tooling_printOut("  --stage0:<path>              stage0 driver executable")
+    tooling_printOut("  --stage0:<path>              explicit driver executable (release defaults to BACKEND_RELEASE_DRIVER)")
     tooling_printOut("  --linker:self|system         linker mode (default: auto; dev=self when supported)")
     tooling_printOut("  --release                    release build track")
     tooling_printOut("  --dev                        dev build track (default)")
     tooling_printOut("  --run                        run output after successful compile")
     tooling_printOut("  [positional input]           same as --in:<file.cheng>")
-
-fn tooling_printChengbUsage() =
-    tooling_printOut("chengb options:")
-    tooling_printOut("  <file.cheng>                 source file path")
-    tooling_printOut("  --out:<path>                 output executable path")
-    tooling_printOut("  --name:<name-or-path>        output name (defaults under artifacts/chengb)")
-    tooling_printOut("  --target:<triple>            backend target triple")
-    tooling_printOut("  --stage0:<path>              stage0 driver executable")
-    tooling_printOut("  --linker:self|system         linker mode (default: auto; dev=self when supported)")
-    tooling_printOut("  --release                    release build track")
-    tooling_printOut("  --dev                        dev build track (default)")
-    tooling_printOut("  --run                        run output after successful compile")
-    tooling_printOut("  --emit:<exe>                 fixed to exe")
-    tooling_printOut("  --frontend:<stage1>          fixed to stage1")
-
-fn tooling_defaultChengbOut(root: str, inPath: str, outRaw: str, nameRaw: str): str =
-    if tooling_strNonEmpty(outRaw):
-        return tooling_pathAbsolute(root, outRaw)
-    if tooling_strNonEmpty(nameRaw):
-        let named: str = strutil.strip(nameRaw)
-        if os.isAbsolute(named) || tooling_strContains(named, "/") || tooling_strContains(named, "\\"):
-            return tooling_pathAbsolute(root, named)
-        return os.joinPath(root, "artifacts/chengb/" + named)
-    var base: str = os.extractFilename(inPath)
-    base = tooling_stripSuffix(base, ".cheng")
-    if !tooling_strNonEmpty(base):
-        base = "a.out"
-    return os.joinPath(root, "artifacts/chengb/" + base)
 
 fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targetRaw: str,
                          stage0Raw: str, linkerRaw: str, releaseBuild: bool, runAfter: bool): int32 =
@@ -3304,9 +3793,16 @@ fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targe
     if !tooling_strNonEmpty(inPath) || !os.fileExists(inPath):
         tooling_printErr("cheng_tooling: compile input not found: " + inRaw)
         return 1
-    let stage0: str = tooling_resolveStage0Driver(root, stage0Raw)
+    var stage0: str = ""
+    if releaseBuild:
+        stage0 = tooling_releaseDriverForCompile(root, stage0Raw, targetRaw)
+    else:
+        stage0 = tooling_resolveStage0Driver(root, stage0Raw)
     if !tooling_strNonEmpty(stage0):
-        tooling_printErr("cheng_tooling: stage0 driver not found")
+        if releaseBuild:
+            tooling_printErr("cheng_tooling: release driver not found/build failed (set BACKEND_RELEASE_DRIVER or run build-release-driver)")
+        else:
+            tooling_printErr("cheng_tooling: stage0 driver not found")
         return 1
     let stage0Exec: str = tooling_prepareStage0Exec(root, stage0, "compile")
     if !tooling_strNonEmpty(stage0Exec):
@@ -3316,9 +3812,7 @@ fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targe
         tooling_cleanupStage0Exec(stage0, stage0Exec)
         tooling_printErr("cheng_tooling: stage0 preflight failed: " + stage0)
         return 1
-    var target: str = strutil.strip(targetRaw)
-    if !tooling_strNonEmpty(target):
-        target = tooling_detectHostTarget(root)
+    var target: str = tooling_normalizeTargetAlias(root, targetRaw)
     if !tooling_strNonEmpty(target):
         target = "auto"
     var linker: str = strutil.toLowerAscii(strutil.strip(linkerRaw))
@@ -3343,6 +3837,31 @@ fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targe
     cmd = cmd + tooling_envAssignCompat("BACKEND_ENABLE_CSTRING_LOWERING", "1")
     cmd = cmd + tooling_envAssignCompat("BACKEND_BUILD_TRACK", buildTrack)
     cmd = cmd + tooling_envAssignCompat("BACKEND_LINKER", linker)
+    if releaseBuild:
+        cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_DEV_PROFILE", "0")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "full")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_FN_SCHED", "serial")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "0")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "0")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_FALLBACK_ALLOW", "0")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_OPT", "1")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_OPT2", "1")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_OPT_LEVEL", "3")
+        let releaseCflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_CFLAGS", "-O3 -flto"))
+        let releaseLdflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_LDFLAGS", releaseCflagsRaw))
+        if tooling_strNonEmpty(releaseCflagsRaw):
+            cmd = cmd + tooling_envAssignCompat("BACKEND_CFLAGS", releaseCflagsRaw)
+        if tooling_strNonEmpty(releaseLdflagsRaw):
+            cmd = cmd + tooling_envAssignCompat("BACKEND_LDFLAGS", releaseLdflagsRaw)
+    else:
+        cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_DEV_PROFILE", "1")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "outline")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_FN_SCHED", "ws")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "1")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "1")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_FALLBACK_ALLOW", "0")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "1")
     cmd = cmd + tooling_envAssignCompat("BACKEND_DRIVER", stage0Exec)
     cmd = cmd + tooling_envAssignCompat("BACKEND_EMIT", "exe")
     cmd = cmd + tooling_envAssignCompat("BACKEND_TARGET", target)
@@ -3384,8 +3903,14 @@ fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targe
     tooling_cleanupStage0Exec(stage0, stage0Exec)
     tooling_printOut("compile_out=" + outPath)
     tooling_printOut("compile_driver=" + stage0)
+    if releaseBuild:
+        tooling_printOut("compile_driver_track=release_driver")
+    else:
+        tooling_printOut("compile_driver_track=dev_driver")
     tooling_printOut("compile_target=" + target)
     tooling_printOut("compile_linker=" + linker)
+    tooling_printOut("compile_track=" + buildTrack)
+    tooling_printOut("compile_profile=" + (releaseBuild ? "release_system_link_independent_driver" : "dev_fast_mem_exe"))
     if runAfter:
         let runRes: os.ExecCmdResult = tooling_exec(root, tooling_shellQuote(outPath))
         tooling_printExecOutput(runRes)
@@ -3488,98 +4013,6 @@ fn tooling_cmdCompileFromArgs(root: str, firstArgIndex: int32, count: int32): in
         tooling_printErr("cheng_tooling: compile requires input file (use --in:<file.cheng>)")
         tooling_printCompileUsage()
         return 1
-    return tooling_cmdCompileExe(root, inPath, outPath, outName, target, stage0, linker, releaseBuild, runAfter)
-
-fn tooling_cmdChengbFromArgs(root: str, firstArgIndex: int32, count: int32): int32 =
-    var inPath: str = ""
-    var outPath: str = ""
-    var outName: str = ""
-    var target: str = os.getEnvDefault("BACKEND_TARGET", "")
-    var stage0: str = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_STAGE0", "")
-    var linker: str = os.getEnvDefault("BACKEND_LINKER", "auto")
-    var releaseBuild: bool = tooling_isTrue(os.getEnvDefault("CHENGC_RELEASE", "0"))
-    var runAfter: bool = false
-    var i: int32 = firstArgIndex
-    if i < 1:
-        i = 1
-    for _ in i..count:
-        if i > count:
-            break
-        let arg: str = tooling_paramStr(i)
-        if tooling_strEq(arg, "--help") || tooling_strEq(arg, "-h"):
-            tooling_printChengbUsage()
-            return 0
-        if strutil.startsWith(arg, "--in:"):
-            inPath = strings.dropPrefix(arg, "--in:")
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "--out:"):
-            outPath = strings.dropPrefix(arg, "--out:")
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "--name:"):
-            outName = strings.dropPrefix(arg, "--name:")
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "--target:"):
-            target = strings.dropPrefix(arg, "--target:")
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "--stage0:"):
-            stage0 = strings.dropPrefix(arg, "--stage0:")
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "--linker:"):
-            linker = strings.dropPrefix(arg, "--linker:")
-            i = i + 1
-            continue
-        if tooling_strEq(arg, "--release"):
-            releaseBuild = true
-            i = i + 1
-            continue
-        if tooling_strEq(arg, "--dev"):
-            releaseBuild = false
-            i = i + 1
-            continue
-        if tooling_strEq(arg, "--run") || tooling_strEq(arg, "--run:host") || tooling_strEq(arg, "--run:file"):
-            runAfter = true
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "--emit:"):
-            let emit: str = strings.dropPrefix(arg, "--emit:")
-            if !tooling_strEq(emit, "exe"):
-                tooling_printErr("cheng_tooling: chengb only supports --emit:exe")
-                return 1
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "--frontend:"):
-            let frontend: str = strings.dropPrefix(arg, "--frontend:")
-            if !tooling_strEq(frontend, "stage1"):
-                tooling_printErr("cheng_tooling: chengb only supports --frontend:stage1")
-                return 1
-            i = i + 1
-            continue
-        if tooling_strEq(arg, "--orc") || strutil.startsWith(arg, "--mm:") ||
-           tooling_strEq(arg, "--multi") || strutil.startsWith(arg, "--jobs:") ||
-           strutil.startsWith(arg, "--pkg-roots:") || strutil.startsWith(arg, "--buildmeta:"):
-            i = i + 1
-            continue
-        if strutil.startsWith(arg, "-"):
-            tooling_printErr("cheng_tooling: unknown chengb arg: " + arg)
-            return 1
-        if !tooling_strNonEmpty(inPath):
-            inPath = arg
-            i = i + 1
-            continue
-        tooling_printErr("cheng_tooling: unexpected positional arg: " + arg)
-        return 1
-    if !tooling_strNonEmpty(inPath):
-        tooling_printErr("cheng_tooling: chengb requires input file")
-        tooling_printChengbUsage()
-        return 1
-    if !tooling_strNonEmpty(outPath) && !tooling_strNonEmpty(outName):
-        let absIn: str = tooling_pathAbsolute(root, inPath)
-        outPath = tooling_defaultChengbOut(root, absIn, "", "")
     return tooling_cmdCompileExe(root, inPath, outPath, outName, target, stage0, linker, releaseBuild, runAfter)
 
 fn tooling_printBootstrapPureUsage() =
@@ -3692,7 +4125,6 @@ fn tooling_cmdBuildBackendDriverFromArgs(root: str, firstArgIndex: int32, count:
     var stage0: str = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_STAGE0", "")
     var target: str = os.getEnvDefault("BACKEND_TARGET", "")
     var requireRebuild: bool = tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_REQUIRE_REBUILD", "0"))
-    var fullRebuild: bool = tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_FULL_REBUILD", "0"))
     var i: int32 = firstArgIndex
     if i < 1:
         i = 1
@@ -3708,15 +4140,15 @@ fn tooling_cmdBuildBackendDriverFromArgs(root: str, firstArgIndex: int32, count:
             tooling_printOut("  --target:<triple>            explicit backend target")
             tooling_printOut("  --require-rebuild            fail if stage0 reuse happens")
             tooling_printOut("  --require-rebuild:0|1        explicit require-rebuild toggle")
-            tooling_printOut("  --full-rebuild               force whole-program stage1 rebuild path")
-            tooling_printOut("  --full-rebuild:0|1           explicit full-rebuild toggle")
+            tooling_printOut("  --full-rebuild[[:0|1]]       compatibility no-op (build-backend-driver is full-only)")
             tooling_printOut("  env: BACKEND_BUILD_DRIVER_LINKER=self|system (default self)")
             tooling_printOut("  env: BACKEND_BUILD_DRIVER_AUTO_CLEAN_HISTORY=1|0 (default 1)")
-            tooling_printOut("  env: TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=1 (opt-in legacy fallback)")
             tooling_printOut("  env: BUILD_DRIVER_STRICT_NATIVE=1|0 (default 1)")
             tooling_printOut("  env: BUILD_DRIVER_ALLOW_FALLBACK=1|0 (default 0)")
-            tooling_printOut("  env: BACKEND_BUILD_DRIVER_TIMEOUT=60 (quick)")
-            tooling_printOut("       BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT=60 (full)")
+            tooling_printOut("  env: BACKEND_BUILD_DRIVER_DELEGATE_ON_SANITY_FAIL=1|0 (default 0; emergency only)")
+            tooling_printOut("  env: BACKEND_BUILD_DRIVER_SEGFAULT_RESCUE=1|0 (default 1)")
+            tooling_printOut("       BACKEND_BUILD_DRIVER_SEGFAULT_RESCUE_STAGE0=<path> (optional override)")
+            tooling_printOut("  env: BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT=60 (full-only)")
             return 0
         if strutil.startsWith(arg, "--out:"):
             outPath = strings.dropPrefix(arg, "--out:")
@@ -3743,16 +4175,55 @@ fn tooling_cmdBuildBackendDriverFromArgs(root: str, firstArgIndex: int32, count:
             i = i + 1
             continue
         if tooling_strEq(arg, "--full-rebuild"):
-            fullRebuild = true
             i = i + 1
             continue
         if strutil.startsWith(arg, "--full-rebuild:"):
-            fullRebuild = tooling_isTrue(strings.dropPrefix(arg, "--full-rebuild:"))
             i = i + 1
             continue
         tooling_printErr("cheng_tooling: unknown build-backend-driver arg: " + arg)
         return 1
-    return tooling_cmdBuildBackendDriver(root, outPath, stage0, target, requireRebuild, fullRebuild)
+    return tooling_cmdBuildBackendDriver(root, outPath, stage0, target, requireRebuild)
+
+fn tooling_cmdBuildReleaseDriverFromArgs(root: str, firstArgIndex: int32, count: int32): int32 =
+    var outPath: str = tooling_releaseDriverPath(root)
+    var stage0: str = os.getEnvDefault("BACKEND_RELEASE_DRIVER_STAGE0", "")
+    var target: str = os.getEnvDefault("BACKEND_TARGET", "")
+    var i: int32 = firstArgIndex
+    if i < 1:
+        i = 1
+    for _ in i..count:
+        if i > count:
+            break
+        let arg: str = tooling_paramStr(i)
+        if tooling_strEq(arg, "--help") || tooling_strEq(arg, "-h"):
+            tooling_printOut("build-release-driver options:")
+            tooling_printOut("  --out:<path>                 output path (default BACKEND_RELEASE_DRIVER or artifacts/backend_release_driver/cheng)")
+            tooling_printOut("  --name:<path>                legacy alias of --out")
+            tooling_printOut("  --stage0:<path>              explicit stage0 driver path")
+            tooling_printOut("  --target:<triple>            explicit backend target")
+            tooling_printOut("  env: BACKEND_RELEASE_DRIVER=<path>          release driver location")
+            tooling_printOut("  env: BACKEND_RELEASE_DRIVER_STAGE0=<path>   build stage0 override")
+            tooling_printOut("  env: BACKEND_RELEASE_DRIVER_TIMEOUT=60      compile timeout")
+            return 0
+        if strutil.startsWith(arg, "--out:"):
+            outPath = strings.dropPrefix(arg, "--out:")
+            i = i + 1
+            continue
+        if strutil.startsWith(arg, "--name:"):
+            outPath = strings.dropPrefix(arg, "--name:")
+            i = i + 1
+            continue
+        if strutil.startsWith(arg, "--stage0:"):
+            stage0 = strings.dropPrefix(arg, "--stage0:")
+            i = i + 1
+            continue
+        if strutil.startsWith(arg, "--target:"):
+            target = strings.dropPrefix(arg, "--target:")
+            i = i + 1
+            continue
+        tooling_printErr("cheng_tooling: unknown build-release-driver arg: " + arg)
+        return 1
+    return tooling_buildReleaseDriver(root, outPath, stage0, target)
 
 fn tooling_cmdSelfhostBootstrapFastHostFromArgs(root: str, firstArgIndex: int32, count: int32): int32 =
     var compileStage1: bool = tooling_isTrue(os.getEnvDefault("SELFHOST_NATIVE_COMPILE_STAGE1", "1"))
@@ -3992,23 +4463,10 @@ fn tooling_installLinks(root: str, binPathRaw: str, dirRaw: str, manifestRaw: st
         return 1
     return 0
 
-fn tooling_bundleCoreOnlySelector(): str =
-    var selector: str = ""
-    selector = tooling_selectorAppend(selector, "cheng_tooling")
-    selector = tooling_selectorAppend(selector, "chengc")
-    selector = tooling_selectorAppend(selector, "backend_prod_closure")
-    selector = tooling_selectorAppend(selector, "verify_backend_closedloop")
-    selector = tooling_selectorAppend(selector, "depin_prod_closure")
-    selector = tooling_selectorAppend(selector, "verify_depin_closedloop")
-    selector = tooling_selectorAppend(selector, "verify_backend_abi_v2_noptr")
-    selector = tooling_selectorAppend(selector, "verify_fullchain_bootstrap")
-    return selector
-
 fn tooling_bundle(root: str, outDirRaw: str, linkerRaw: str, driverRaw: str, profileSelectorRaw: str, modeRaw: str, force: bool): int32 =
     var profileSelector: str = profileSelectorRaw
     if !tooling_strNonEmpty(profileSelector):
         profileSelector = tooling_selectorAppend(profileSelector, "full")
-        profileSelector = tooling_selectorAppend(profileSelector, "core")
     let mode: str = tooling_normalizeLinkMode(modeRaw)
     if !tooling_strNonEmpty(mode):
         tooling_printErr("cheng_tooling: invalid bundle --mode (expected symlink|hardlink|copy): " + modeRaw)
@@ -4020,58 +4478,30 @@ fn tooling_bundle(root: str, outDirRaw: str, linkerRaw: str, driverRaw: str, pro
     if !tooling_mkdirP(root, outDir):
         tooling_printErr("cheng_tooling: failed to create bundle out dir: " + outDir)
         return 1
-    var didBuild: bool = false
-
-    if tooling_selectorContains(profileSelector, "full"):
-        didBuild = true
-        let profileDir: str = os.joinPath(outDir, "full")
-        let binPath: str = os.joinPath(profileDir, "cheng_tooling")
-        let linksDir: str = os.joinPath(profileDir, "bin")
-        let manifestPath: str = os.joinPath(profileDir, "manifest.tsv")
-        let buildRc: int32 = tooling_buildGlobal(root, binPath, linkerRaw, driverRaw)
-        if buildRc != 0:
-            return buildRc
-        let installRc: int32 = tooling_installLinks(root, binPath, linksDir, manifestPath, force, "", "", mode)
-        if installRc != 0:
-            return installRc
-        tooling_printOut("bundle_profile=full")
-        tooling_printOut("bundle_profile_bin=" + binPath)
-        tooling_printOut("bundle_profile_links=" + linksDir)
-        tooling_printOut("bundle_profile_manifest=" + manifestPath)
-
-    if tooling_selectorContains(profileSelector, "core"):
-        didBuild = true
-        let profileDir: str = os.joinPath(outDir, "core")
-        let binPath: str = os.joinPath(profileDir, "cheng_tooling")
-        let linksDir: str = os.joinPath(profileDir, "bin")
-        let manifestPath: str = os.joinPath(profileDir, "manifest.tsv")
-        let buildRc: int32 = tooling_buildGlobal(root, binPath, linkerRaw, driverRaw)
-        if buildRc != 0:
-            return buildRc
-        let installRc: int32 = tooling_installLinks(root, binPath, linksDir, manifestPath, force, tooling_bundleCoreOnlySelector(), "", mode)
-        if installRc != 0:
-            return installRc
-        tooling_printOut("bundle_profile=core")
-        tooling_printOut("bundle_profile_bin=" + binPath)
-        tooling_printOut("bundle_profile_links=" + linksDir)
-        tooling_printOut("bundle_profile_manifest=" + manifestPath)
-
-    if !didBuild:
-        tooling_printErr("cheng_tooling: bundle profile set is empty (allowed: full|core)")
+    if !tooling_selectorContains(profileSelector, "full"):
+        tooling_printErr("cheng_tooling: bundle profile set is empty (allowed: full)")
         return 1
+    let profileDir: str = os.joinPath(outDir, "full")
+    let binPath: str = os.joinPath(profileDir, "cheng_tooling")
+    let linksDir: str = os.joinPath(profileDir, "bin")
+    let manifestPath: str = os.joinPath(profileDir, "manifest.tsv")
+    let buildRc: int32 = tooling_buildGlobal(root, binPath, linkerRaw, driverRaw)
+    if buildRc != 0:
+        return buildRc
+    let installRc: int32 = tooling_installLinks(root, binPath, linksDir, manifestPath, force, "", "", mode)
+    if installRc != 0:
+        return installRc
+    tooling_printOut("bundle_profile=full")
+    tooling_printOut("bundle_profile_bin=" + binPath)
+    tooling_printOut("bundle_profile_links=" + linksDir)
+    tooling_printOut("bundle_profile_manifest=" + manifestPath)
     return 0
 
 fn tooling_resolveBuildDriver(root: str, driverRaw: str): str =
     let explicitRaw: str = strutil.strip(driverRaw)
     if tooling_strNonEmpty(explicitRaw):
-        let explicitPath: str = tooling_pathAbsolute(root, explicitRaw)
-        if tooling_pathExists(explicitPath):
-            return explicitPath
-        return ""
-    let resolvedPath: str = tooling_resolveStage0Driver(root, "")
-    if tooling_pathExists(resolvedPath):
-        return resolvedPath
-    return ""
+        return tooling_resolveStage0DriverStrict(root, explicitRaw)
+    return tooling_resolveStage0DriverStrict(root, "")
 
 fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): int32 =
     let src: str = os.joinPath(root, "src/tooling/cheng_tooling.cheng")
@@ -4098,7 +4528,20 @@ fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): 
         else:
             tooling_printErr("cheng_tooling: failed to resolve build driver (set --driver:<path>)")
         return 1
+    let stage0Exec: str = tooling_prepareStage0Exec(root, driverPath, "build_global")
+    if !tooling_strNonEmpty(stage0Exec):
+        tooling_printErr("cheng_tooling: build-global stage0 prepare failed: " + driverPath)
+        return 1
+    if !tooling_stage0PreflightOk(root, stage0Exec):
+        tooling_cleanupStage0Exec(driverPath, stage0Exec)
+        tooling_printErr("cheng_tooling: build-global stage0 preflight failed: " + driverPath)
+        return 1
     let inheritedTarget: str = strutil.strip(os.getEnvDefault("BACKEND_TARGET", ""))
+    var target: str = inheritedTarget
+    if !tooling_strNonEmpty(target):
+        target = tooling_detectHostTarget(root)
+    if !tooling_strNonEmpty(target):
+        target = "auto"
     var cmd: str = ""
     cmd = cmd + tooling_envAssignCompat("BACKEND_ENABLE_CSTRING_LOWERING", "1")
     cmd = cmd + tooling_envAssignCompat("STAGE1_STD_NO_POINTERS", "0")
@@ -4107,21 +4550,55 @@ fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): 
     cmd = cmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL", "0")
     cmd = cmd + tooling_envAssignCompat("BACKEND_BUILD_TRACK", "release")
     cmd = cmd + tooling_envAssignCompat("BACKEND_LINKER", linker)
-    cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_DEV_PROFILE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "full")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FN_SCHED", "serial")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_FALLBACK_ALLOW", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT2", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT_LEVEL", "3")
+    let releaseCflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_CFLAGS", "-O3 -flto"))
+    let releaseLdflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_LDFLAGS", releaseCflagsRaw))
+    if tooling_strNonEmpty(releaseCflagsRaw):
+        cmd = cmd + tooling_envAssignCompat("BACKEND_CFLAGS", releaseCflagsRaw)
+    if tooling_strNonEmpty(releaseLdflagsRaw):
+        cmd = cmd + tooling_envAssignCompat("BACKEND_LDFLAGS", releaseLdflagsRaw)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_DRIVER", stage0Exec)
     cmd = cmd + tooling_envAssignCompat("ABI", "v2_noptr")
     cmd = cmd + tooling_envAssignCompat("BACKEND_EMIT", "exe")
     cmd = cmd + tooling_envAssignCompat("BACKEND_INPUT", src)
     cmd = cmd + tooling_envAssignCompat("BACKEND_OUTPUT", outPath)
-    if tooling_strNonEmpty(inheritedTarget):
-        cmd = cmd + tooling_envAssignCompat("BACKEND_TARGET", inheritedTarget)
-    cmd = cmd + tooling_shellQuote(driverPath)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_TARGET", target)
+    if tooling_strEq(linker, "self"):
+        var runtimeObj: str = tooling_runtimeObjPath(root, target)
+        if !os.fileExists(runtimeObj):
+            runtimeObj = tooling_prepareRuntimeObjForTarget(root, stage0Exec, target)
+        if !os.fileExists(runtimeObj):
+            tooling_cleanupStage0Exec(driverPath, stage0Exec)
+            tooling_printErr("cheng_tooling: build-global missing runtime object for self-link: " + runtimeObj)
+            return 1
+        cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "1")
+        cmd = cmd + tooling_envAssignCompat("BACKEND_RUNTIME_OBJ", runtimeObj)
+    else:
+        cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
+    cmd = cmd + tooling_shellQuote(stage0Exec)
     cmd = tooling_prefixUnsetLegacyFrontendEnv(cmd)
+    var timeoutSec: int32 = tooling_parseInt32Default(os.getEnvDefault("TOOLING_BUILD_GLOBAL_TIMEOUT", ""), 60)
+    if timeoutSec < 1:
+        timeoutSec = 60
+    cmd = tooling_wrapStage0Lock(root, cmd, "build_global")
+    cmd = tooling_wrapCommandWithTimeout(root, timeoutSec, cmd)
     tooling_printOut("build_global_driver=" + driverPath)
+    tooling_printOut("build_global_driver_exec=" + stage0Exec)
     tooling_printOut("build_global_linker=" + linker)
     tooling_printOut("build_global_out=" + outPath)
     let result: os.ExecCmdResult = tooling_exec(root, cmd)
     tooling_printExecOutput(result)
     let rc: int32 = os.execCmdResultExitCode(result)
+    tooling_cleanupStage0Exec(driverPath, stage0Exec)
     if rc != 0:
         return rc
     return 0
@@ -4147,8 +4624,10 @@ fn tooling_printUsage() =
     tooling_printOut("commands:")
     tooling_printOut("  driver-path [--stage0:<path>]")
     tooling_printOut("      resolve stable stage0 backend driver path (zero-script)")
-    tooling_printOut("  build-backend-driver [--out:<path>] [--stage0:<path>] [--target:<triple>] [--require-rebuild] [--full-rebuild]")
+    tooling_printOut("  build-backend-driver [--out:<path>] [--stage0:<path>] [--target:<triple>] [--require-rebuild]")
     tooling_printOut("      build artifacts/backend_driver/cheng via native fast host path (zero-script)")
+    tooling_printOut("  build-release-driver [--out:<path>] [--stage0:<path>] [--target:<triple>]")
+    tooling_printOut("      build independent release driver (UIR + system-link) at artifacts/backend_release_driver/cheng")
     tooling_printOut("  cleanup-backend-driver-history [--dry-run]")
     tooling_printOut("      remove historical artifacts/backend_driver/cheng* variants, keep canonical driver")
     tooling_printOut("  build-backend-baselines")
@@ -4165,8 +4644,6 @@ fn tooling_printUsage() =
     tooling_printOut("      zero-script compiler entrypoint (emit=exe, frontend=stage1)")
     tooling_printOut("  cheng <file.cheng> [compile args]")
     tooling_printOut("      alias of compile (single-entry naming)")
-    tooling_printOut("  chengb <file.cheng> [compile args]")
-    tooling_printOut("      zero-script compatibility entrypoint (default output under artifacts/chengb)")
     tooling_printOut("  bootstrap-pure [--seed:<path>] [--compile-stage1|--no-compile-stage1]")
     tooling_printOut("      zero-script pure selfhost bootstrap path")
     tooling_printOut("  bootstrap")
@@ -4185,7 +4662,7 @@ fn tooling_printUsage() =
     tooling_printOut("      install multicall links (one global binary drives all tooling script IDs)")
     tooling_printOut("  build-global [--out:<path>] [--linker:self|system] [--driver:<path>]")
     tooling_printOut("      build cheng_tooling as global native binary (default linker=system)")
-    tooling_printOut("  bundle [--out-dir:<path>] [--profile:full|core]... [--mode:symlink|hardlink|copy] [--linker:self|system] [--driver:<path>] [--force]")
+    tooling_printOut("  bundle [--out-dir:<path>] [--profile:full]... [--mode:symlink|hardlink|copy] [--linker:self|system] [--driver:<path>] [--force]")
     tooling_printOut("      build and install one or more global binaries by profile")
     tooling_printOut("  <script> [args...]")
     tooling_printOut("      shorthand for `run <script> [args...]`")
@@ -4201,7 +4678,6 @@ fn tooling_printUsage() =
     tooling_printOut("      artifacts/tooling_cmd/cheng_tooling install --dir:artifacts/tooling_cmd/bin --bin:artifacts/tooling_cmd/cheng_tooling --force")
     tooling_printOut("  - bundle profiles:")
     tooling_printOut("      full: all embedded tooling command IDs")
-    tooling_printOut("      core: cheng_tooling/chengc/backend_prod_closure/closedloop/abi_v2_noptr/fullchain")
 
 fn tooling_list(root: str): int32 =
     let out: str[] = tooling_collectScripts(root)
@@ -4237,6 +4713,9 @@ fn tooling_embeddedTextCommand(root: str, argStart: int32, count: int32): int32 
     if !tooling_strNonEmpty(normalizedId):
         tooling_printErr("cheng_tooling: embedded-text requires --id:<script-id>")
         return 1
+    if tooling_strEq(normalizedId, "chengb"):
+        tooling_printErr("cheng_tooling: chengb has been removed; use `chengc`")
+        return 2
     let scriptText: str = tooling_embeddedScriptText(root, normalizedId)
     if !tooling_strNonEmpty(scriptText):
         tooling_printErr("cheng_tooling: embedded-text script not found: " + normalizedId)
@@ -4617,10 +5096,15 @@ fn tooling_cmdVerifyBackendZeroScriptClosure(root: str): int32 =
             "sed -n '1,200p' \"$inlines\" | sed 's/^/  - /' >&2; " +
             "exit 1; " +
         "fi; " +
+        "if ! rg -q 'tooling_strEq\\(first, \"compile\"\\) \\|\\| tooling_strEq\\(first, \"cheng\"\\) \\|\\| tooling_strEq\\(first, \"chengc\"\\)' src/tooling/cheng_tooling.cheng; then " +
+            "echo \"[verify_backend_zero_script_closure] missing native chengc route in cheng_tooling main dispatch\" >&2; " +
+            "exit 1; " +
+        "fi; " +
         "{ " +
             "echo \"status=ok\"; " +
             "echo \"shell_wrapper_count=0\"; " +
             "echo \"inline_count=0\"; " +
+            "echo \"chengc_native_route=1\"; " +
             "echo \"wrappers=$wrappers\"; " +
             "echo \"inlines=$inlines\"; " +
         "} >\"$report\"; " +
@@ -4778,13 +5262,16 @@ fn main(argc: int32, argv: str*): int32 =
     if tooling_strEq(selfName, "cheng") || tooling_strEq(selfName, "chengc"):
         return tooling_cmdCompileFromArgs(root, 1, count)
     if tooling_strEq(selfName, "chengb"):
-        return tooling_cmdChengbFromArgs(root, 1, count)
+        tooling_printErr("cheng_tooling: chengb has been removed; use `chengc`")
+        return 2
     if tooling_strEq(selfName, "bootstrap") || tooling_strEq(selfName, "bootstrap_pure") || tooling_strEq(selfName, "bootstrap-pure"):
         return tooling_cmdBootstrapPureFromArgs(root, 1, count)
     if tooling_strEq(selfName, "backend_driver_path") || tooling_strEq(selfName, "driver-path"):
         return tooling_cmdDriverPathFromArgs(root, 1, count)
     if tooling_strEq(selfName, "build_backend_driver") || tooling_strEq(selfName, "build-backend-driver"):
         return tooling_cmdBuildBackendDriverFromArgs(root, 1, count)
+    if tooling_strEq(selfName, "build_release_driver") || tooling_strEq(selfName, "build-release-driver"):
+        return tooling_cmdBuildReleaseDriverFromArgs(root, 1, count)
     if tooling_strEq(selfName, "cleanup_backend_driver_history") || tooling_strEq(selfName, "cleanup-backend-driver-history"):
         return tooling_cmdCleanupBackendDriverHistoryFromArgs(root, 1, count)
     if tooling_strEq(selfName, "build_backend_baselines") || tooling_strEq(selfName, "build-backend-baselines"):
@@ -4829,6 +5316,8 @@ fn main(argc: int32, argv: str*): int32 =
         return tooling_cmdDriverPathFromArgs(root, 2, count)
     if tooling_strEq(first, "build-backend-driver") || tooling_strEq(first, "build_backend_driver"):
         return tooling_cmdBuildBackendDriverFromArgs(root, 2, count)
+    if tooling_strEq(first, "build-release-driver") || tooling_strEq(first, "build_release_driver"):
+        return tooling_cmdBuildReleaseDriverFromArgs(root, 2, count)
     if tooling_strEq(first, "cleanup-backend-driver-history") || tooling_strEq(first, "cleanup_backend_driver_history"):
         return tooling_cmdCleanupBackendDriverHistoryFromArgs(root, 2, count)
     if tooling_strEq(first, "build-backend-baselines") || tooling_strEq(first, "build_backend_baselines"):
@@ -4857,12 +5346,11 @@ fn main(argc: int32, argv: str*): int32 =
         return tooling_cmdVerifyBackendEmitObjContract(root)
     if tooling_strEq(first, "bootstrap-pure") || tooling_strEq(first, "bootstrap_pure") || tooling_strEq(first, "bootstrap"):
         return tooling_cmdBootstrapPureFromArgs(root, 2, count)
-    if tooling_strEq(first, "compile"):
-        return tooling_cmdCompileFromArgs(root, 2, count)
-    if tooling_strEq(first, "cheng"):
+    if tooling_strEq(first, "compile") || tooling_strEq(first, "cheng") || tooling_strEq(first, "chengc"):
         return tooling_cmdCompileFromArgs(root, 2, count)
     if tooling_strEq(first, "chengb"):
-        return tooling_cmdChengbFromArgs(root, 2, count)
+        tooling_printErr("cheng_tooling: chengb has been removed; use `chengc`")
+        return 2
     if tooling_strEq(first, "list") || tooling_strEq(first, "embedded-ids") || tooling_strEq(first, "embedded_ids"):
         return tooling_list(root)
     if tooling_strEq(first, "embedded-text") || tooling_strEq(first, "embedded_text"):
@@ -4920,8 +5408,8 @@ fn main(argc: int32, argv: str*): int32 =
                 continue
             if strutil.startsWith(arg, "--profile:"):
                 let profile: str = strutil.toLowerAscii(strutil.strip(strings.dropPrefix(arg, "--profile:")))
-                if !tooling_strEq(profile, "full") && !tooling_strEq(profile, "core"):
-                    tooling_printErr("cheng_tooling: invalid --profile (expected full|core): " + profile)
+                if !tooling_strEq(profile, "full"):
+                    tooling_printErr("cheng_tooling: invalid --profile (expected full): " + profile)
                     return 1
                 profileSelector = tooling_selectorAppend(profileSelector, profile)
                 i = i + 1

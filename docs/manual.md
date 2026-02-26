@@ -738,7 +738,6 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - IR 语义显式化：整数运算与移位使用 `sdiv/udiv`、`smod/umod`、`lshr/ashr` 等显式操作，避免 C 语义歧义。
 - 产物策略：生产默认 `emit=exe`（self/system linker 双轨）；`.o/.obj` 仅保留 internal gate（需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`）。
 - Dev 快速自举管线（host-only）：
-  - `BACKEND_FAST_DEV_PROFILE=1`（fast selfhost 默认注入）。
   - `BACKEND_STAGE1_PARSE_MODE=outline|full`（dev 默认 `outline`，release 默认 `full`）。
   - `BACKEND_FN_SCHED=ws|serial` + `BACKEND_FN_JOBS`（dev 默认 `ws`，release 默认 `serial`）。
   - `BACKEND_DIRECT_EXE=1` 在 host darwin/arm64 + self-link 口径走 `macho_direct_exe_writer`；默认失败阻断（`BACKEND_FAST_FALLBACK_ALLOW=0`）。
@@ -749,7 +748,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 跨平台矩阵（可验收）：`sh src/tooling/tooling_exec.sh verify_backend_targets_matrix` 覆盖 darwin/ios(Mach‑O `.o`) + android/linux(ELF `.o`) + windows(COFF `.obj`)。
 - 全语义回归入口：`sh src/tooling/tooling_exec.sh verify_backend_closedloop` 会使用后端 driver（默认 `artifacts/backend_driver/cheng`；可用 `BACKEND_DRIVER=<path>` 显式指定，未命中可运行 driver 直接失败）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求运行返回码为 `0`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；跨目标 `self_linker(ELF/COFF)` 与 `linker_abi_core` 门禁默认强制阻断，且已移除 prebuilt-obj/link-only 降级路径，不允许 skip 与 compile-only 回退）。
 - 除平台生产闭环入口：`sh src/tooling/tooling_exec.sh backend_prod_closure`（默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression`、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256，`sign/verify` 在发布链路默认 required）与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。
-- 零脚本生产闭环：`backend_prod_closure` 默认要求 `TOOLING_EXEC_BUNDLE_PROFILE=full` + `TOOLING_EXEC_REQUIRE_BUNDLE=1` + `TOOLING_EXEC_BUNDLE_CORE_AUTO_BUILD=0`，并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`（`tooling_exec.sh` / `env_prefix_bridge.sh` 除外）。
+- 零脚本生产闭环：`backend_prod_closure` 默认要求 `TOOLING_EXEC_BUNDLE_PROFILE=full` + `TOOLING_EXEC_REQUIRE_BUNDLE=1` + `TOOLING_EXEC_BUNDLE_CORE_AUTO_BUILD=0`，并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`（`tooling_exec.sh` / `env_prefix_bridge.sh` 除外）；`cheng/chengc` 核心入口必须走 `cheng_tooling` 原生命令路由，不允许 `cheng_tooling chengc` 回落 embedded shell payload。
 - driver 自举 smoke 口径：`backend.driver_selfbuild_smoke` 为 required gate，默认输出路径与主 driver 统一为 `artifacts/backend_driver/cheng`；生产收口口径固定统一 driver（`BACKEND_DRIVER=artifacts/backend_driver/cheng` + `BACKEND_DRIVER_ALLOW_FALLBACK=0`），不依赖自动回退候选；seed/selfhost 仅允许显式覆盖用于排障。闭环强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0` 与 `DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，防止语义降级。
 - 全链自举门禁：`sh src/tooling/tooling_exec.sh verify_fullchain_bootstrap`（stage2→tools；obj-only fullspec internal gate + 工具 `--help` smoke；失败即阻断）。
 - 专用机 100ms 自举门禁：`sh src/tooling/tooling_exec.sh verify_backend_selfhost_100ms_host`（基线文件 `src/tooling/selfhost_perf_100ms_host.env`；非目标主机默认报告模式）。

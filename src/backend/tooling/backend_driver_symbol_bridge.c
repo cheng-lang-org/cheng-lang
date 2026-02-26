@@ -33,7 +33,7 @@ typedef struct {
 
 __attribute__((weak)) int32_t driver_puts(const char *text) {
   if (text == NULL) {
-    return fputs("[bridge] driver_puts: <null>\n", stderr) >= 0 ? 0 : -1;
+    return puts("[bridge] driver_puts: <null>") >= 0 ? 0 : -1;
   }
   return puts(text);
 }

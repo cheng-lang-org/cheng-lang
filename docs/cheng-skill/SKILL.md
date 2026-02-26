@@ -67,7 +67,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
   - system linker 优先级变量：`BACKEND_SYSTEM_LINKER_PRIORITY`（默认 `mold,lld,default`）。
   - Dev 热更默认：`BACKEND_HOTPATCH_MODE=trampoline`、`BACKEND_HOSTRUNNER_POOL_MB=512`、`BACKEND_HOSTRUNNER_PAGE_POLICY=rw_rx`、`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program`、`BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
   - Dev 编译默认：`BACKEND_INCREMENTAL=1` + `CHENGC_DEV_MULTI_DEFAULT=1`；`BACKEND_MULTI_MODULE_CACHE` 默认 `0`，且 stable driver 当前对其做安全降级（`CHENGC_ALLOW_UNSTABLE_MULTI_MODULE_CACHE=1` + `BACKEND_MODULE_CACHE_UNSTABLE_ALLOW=1` 仅用于显式排障请求）；为避免 `multi+module-cache` 运行时崩溃，stable driver 当前硬禁用 module-cache load 路径；可选 `CHENGC_DAEMON=1` 使用 `chengc_daemon` 常驻 worker。
-  - Dev fast 自举默认注入：`BACKEND_FAST_DEV_PROFILE=1`、`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`；strict/release 默认 `0/full/serial/0`。
+  - Dev fast 自举默认注入：`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`；strict/release 默认 `full/serial/0`。
   - `emit=obj` 为 internal gate 兼容入口，需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`；公共入口 `chengc` 固定拒绝 obj 输出。
 - 生产闭环入口 `cheng_tooling backend_prod_closure` 仅接受 `ABI=v2_noptr`。
 - 验证入口迁移：`verify_*` 已并入 `cheng_tooling` 原生子命令；统一执行口径为 `cheng_tooling <verify_id>`。

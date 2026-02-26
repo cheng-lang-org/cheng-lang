@@ -1,0 +1,299 @@
+# Shared scope/block helper routines split from uir_core_builder.
+import std/os
+import std/strutils
+import std/hashmaps
+import std/system
+import stage1/lexer
+import stage1/ast
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+
+fn scopeStripSpaces(s: str): str =
+    if s == nil:
+        return ""
+    return strutils.strip(s)
+
+fn scopeStripSpacesMaybe(s: str): str =
+    if s == nil:
+        return ""
+    let out: str = strutils.strip(s)
+    if out == nil:
+        return ""
+    return out
+
+fn scopeOpName(n: Node): str =
+    if n == nil:
+        return ""
+    return scopeStripSpaces(plainName(n))
+
+fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): BlockBuilder =
+    var b: BlockBuilder
+    new b
+    b.env = env
+    b.module = module
+    b.func = func
+    b.currentLabel = "entry"
+    b.currentStmts = []
+    b.labelCounter = 0
+    b.objCursor = 0
+    b.loopStack = []
+    b.deferStack = []
+    return b
+
+fn blockBuilderNextLabel(b: BlockBuilder, prefix: str): str =
+    let id: int32 = b.labelCounter
+    b.labelCounter = b.labelCounter + 1
+    return prefix + intToStr(id)
+
+fn blockBuilderStart(b: BlockBuilder, label: str) =
+    b.currentLabel = label
+    b.currentStmts = []
+
+fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
+    # Copy stmt buffer so finished blocks don't alias the builder's scratch seq.
+    # (Without this, later appends can realloc/free the shared buffer.)
+    var stmtsCopy: UirCoreStmt[]
+    if b.currentStmts.len > 0:
+        stmtsCopy.cap = b.currentStmts.len
+        for si in 0..<b.currentStmts.len:
+            add(stmtsCopy, b.currentStmts[si])
+    let blk: UirCoreBlock = uirCoreBlockWithStmts(b.currentLabel, stmtsCopy, term)
+    let dbgFunc: UirCoreFunc = b.func
+    let dbgName: str = (dbgFunc != nil) ? dbgFunc.name : ""
+    if (os.getEnvDefault("BACKEND_DEBUG_MIR_FINISH", "") == dbgName):
+        let curLen: int32 = b.currentStmts.len
+        let blkLen: int32 = blk.stmts.len
+        echo("[backend] dbgFinish: fn=" + dbgName + " label=" + b.currentLabel +
+             " cur.len=" + intToStr(curLen) + " blk.len=" + intToStr(blkLen))
+        if curLen > 0:
+            let s0: UirCoreStmt = b.currentStmts[0]
+            echo("[backend] dbgFinish: cur0.kind=" + intToStr(int32(s0.kind)) +
+                 " slot=" + intToStr(s0.slot))
+        if blkLen > 0:
+            let s1: UirCoreStmt = blk.stmts[0]
+            echo("[backend] dbgFinish: blk0.kind=" + intToStr(int32(s1.kind)) +
+                 " slot=" + intToStr(s1.slot))
+    uirCoreAddBlock(b.func, blk)
+    b.currentLabel = ""
+    b.currentStmts = []
+
+fn blockBuilderPushLoop(b: BlockBuilder, breakLabel: str, continueLabel: str) =
+    var ctx: LoopContext
+    new ctx
+    ctx.breakLabel = breakLabel
+    ctx.continueLabel = continueLabel
+    ctx.deferDepth = b.deferStack.len
+    add(b.loopStack, ctx)
+
+fn blockBuilderPopLoop(b: BlockBuilder): LoopContext =
+    if b.loopStack.len == 0:
+        return nil
+    let idx: int32 = b.loopStack.len - 1
+    let ctx: LoopContext = b.loopStack[idx]
+    b.loopStack.len = idx
+    return ctx
+
+fn blockBuilderPeekLoop(b: BlockBuilder): LoopContext =
+    if b.loopStack.len == 0:
+        return nil
+    return b.loopStack[b.loopStack.len - 1]
+
+fn blockBuilderPushDefer(b: BlockBuilder) =
+    if b == nil:
+        return
+    var frame: DeferFrame
+    new frame
+    frame.bodies = []
+    add(b.deferStack, frame)
+
+fn blockBuilderPopDefer(b: BlockBuilder): DeferFrame =
+    if b == nil || b.deferStack.len == 0:
+        return nil
+    let idx: int32 = b.deferStack.len - 1
+    let frame: DeferFrame = b.deferStack[idx]
+    b.deferStack.len = idx
+    return frame
+
+fn blockBuilderPeekDefer(b: BlockBuilder): DeferFrame =
+    if b == nil || b.deferStack.len == 0:
+        return nil
+    return b.deferStack[b.deferStack.len - 1]
+
+fn blockBuilderNextTemp(b: BlockBuilder, prefix: str): str =
+    return blockBuilderNextLabel(b, prefix)
+
+fn isControlExpr(n: Node): bool =
+    var node: Node = n
+    while node != nil && node.kind == nkPar && kidCount(node) > 0:
+        node = kid(node, 0)
+    if node == nil:
+        return false
+    if node.kind == nkIf:
+        return true
+    if node.kind == nkCase:
+        return true
+    if node.kind == nkInfix && kidCount(node) >= 3:
+        let opNode: Node = kid(node, 0)
+        let op: str = scopeOpName(opNode)
+        if op == "&&" || op == "||":
+            return true
+    return false
+
+fn isImplicitReturnExpr(n: Node): bool =
+    if n == nil:
+        return false
+    var node: Node = n
+    while node != nil && node.kind == nkPar && kidCount(node) > 0:
+        node = kid(node, 0)
+    if node == nil:
+        return false
+    case node.kind
+    of nkCall, nkInfix, nkPrefix, nkPostfix, nkDotExpr, nkBracketExpr,
+       nkCurlyExpr, nkTupleLit, nkSeqLit, nkTableLit,
+       nkIdent, nkSymbol,
+       nkIntLit, nkFloatLit, nkStrLit, nkCharLit, nkBoolLit, nkNilLit:
+        return true
+    return false
+
+fn uirCoreAddStrPtr(items: str[]*, value: str) =
+    if items == nil:
+        return
+    add(items, value)
+
+fn mbWrite[T](seqInst: var T[], idx: int32, val: T) =
+    if idx < 0 || idx >= seqInst.len:
+        panic "uirCore_builder: seq index out of bounds"
+    seqInst[idx] = val
+
+fn mbWriteBool(seqInst: var bool[], idx: int32, val: bool) =
+    if idx < 0 || idx >= seqInst.len:
+        panic "uirCore_builder: seq index out of bounds"
+    seqInst[idx] = val
+
+fn mbWriteStr(seqInst: var str[], idx: int32, val: str) =
+    if idx < 0 || idx >= seqInst.len:
+        panic "uirCore_builder: seq index out of bounds"
+    seqInst[idx] = val
+
+fn mbWriteObjLocal(seqInst: var UirCoreObjLocal[], idx: int32, val: UirCoreObjLocal) =
+    if idx < 0 || idx >= seqInst.len:
+        panic "uirCore_builder: seq index out of bounds"
+    seqInst[idx] = val
+
+fn mbWriteObjType(seqInst: var UirCoreObjType[], idx: int32, val: UirCoreObjType) =
+    if idx < 0 || idx >= seqInst.len:
+        panic "uirCore_builder: seq index out of bounds"
+    seqInst[idx] = val
+
+fn mbWriteGlobal(seqInst: var UirCoreGlobal[], idx: int32, val: UirCoreGlobal) =
+    if idx < 0 || idx >= seqInst.len:
+        panic "uirCore_builder: seq index out of bounds"
+    seqInst[idx] = val
+
+fn mbWriteFunc(seqInst: var UirCoreFunc[], idx: int32, val: UirCoreFunc) =
+    if idx < 0 || idx >= seqInst.len:
+        panic "uirCore_builder: seq index out of bounds"
+    seqInst[idx] = val
+
+fn localEnvNew(): LocalEnv =
+    var env: LocalEnv
+    new env
+    env.names = []
+    env.types = []
+    env.typeKeys = []
+    env.callTargets = []
+    env.active = []
+    env.scopeMarks = []
+    env.nameIndex = hashmaps.hashMapStrIntInit(64)
+    env.prevSlots = []
+    return env
+
+fn localEnvPushScope(env: LocalEnv) =
+    if env == nil:
+        return
+    add(env.scopeMarks, env.names.len)
+
+fn localEnvPopScope(env: LocalEnv) =
+    if env == nil || env.scopeMarks.len == 0:
+        return
+    let mark: int32 = env.scopeMarks[env.scopeMarks.len - 1]
+    env.scopeMarks.len = env.scopeMarks.len - 1
+    if mark < 0:
+        return
+    let __for_start_slot = env.names.len - 1
+    for __for_rev_slot in 0..(__for_start_slot - (mark)):
+        let slot = __for_start_slot - __for_rev_slot
+        if slot >= 0 && slot < env.names.len && slot < env.prevSlots.len:
+            let nm: str = env.names[slot]
+            let prev: int32 = env.prevSlots[slot]
+            let restore: int32 = (prev >= 0) ? (prev + 1) : 0
+            hashmaps.hashMapStrIntPut(env.nameIndex, nm, restore)
+    for i in mark..<env.active.len:
+        mbWriteBool(env.active, i, false)
+
+fn localIndex(env: LocalEnv, name: str): int32 =
+    if env == nil:
+        return -1
+    if name == nil || len(name) == 0:
+        return -1
+    let query: str = scopeStripSpacesMaybe(name)
+    if query == nil || len(query) == 0:
+        return -1
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, query)
+    if idxPlus1 <= 0:
+        return -1
+    let idx: int32 = idxPlus1 - 1
+    if env.active.len == env.names.len && idx < env.active.len && !env.active[idx]:
+        return -1
+    return idx
+
+fn localAdd(env: LocalEnv, name: str, ty: UirCoreType): int32 =
+    if env == nil:
+        return -1
+    let nm: str = scopeStripSpaces(name)
+    if (getEnv "BACKEND_DEBUG_LET" == "1") && (nm == "snapRes"):
+        let mark: int32 = (env.scopeMarks.len > 0) ? env.scopeMarks[env.scopeMarks.len - 1] : -1
+        echo("[backend] debugLocalAdd: name='snapRes' slot=" + intToStr(env.names.len) +
+             " scopeMarks=" + intToStr(env.scopeMarks.len) + " topMark=" + intToStr(mark))
+    trackLexString void*(nm)
+    let prevPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, nm)
+    let prevSlot: int32 = (prevPlus1 > 0) ? (prevPlus1 - 1) : -1
+    add(env.names, nm)
+    add(env.types, ty)
+    add(env.typeKeys, "")
+    add(env.callTargets, "")
+    add(env.active, true)
+    add(env.prevSlots, prevSlot)
+    hashmaps.hashMapStrIntPut(env.nameIndex, nm, env.names.len)
+    return env.names.len - 1
+
+fn localType(env: LocalEnv, idx: int32): UirCoreType =
+    if env == nil || idx < 0 || idx >= env.types.len:
+        return uirCoreTypeI32()
+    return env.types[idx]
+
+fn localTypeKey(env: LocalEnv, idx: int32): str =
+    if env == nil || idx < 0 || idx >= env.typeKeys.len:
+        return ""
+    return env.typeKeys[idx]
+
+fn localCallTarget(env: LocalEnv, idx: int32): str =
+    if env == nil || idx < 0 || idx >= env.callTargets.len:
+        return ""
+    return env.callTargets[idx]
+
+fn localSetTypeKey(env: LocalEnv, idx: int32, key: str) =
+    if env == nil || key == nil || len(key) == 0:
+        return
+    if idx < 0 || idx >= env.typeKeys.len:
+        return
+    trackLexString void*(key)
+    mbWriteStr(env.typeKeys, idx, key)
+
+fn localSetCallTarget(env: LocalEnv, idx: int32, target: str) =
+    if env == nil || target == nil || len(target) == 0:
+        return
+    if idx < 0 || idx >= env.callTargets.len:
+        return
+    trackLexString void*(target)
+    mbWriteStr(env.callTargets, idx, target)

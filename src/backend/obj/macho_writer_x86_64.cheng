@@ -4,8 +4,8 @@ import std/strings
 import std/hashmaps
 import std/result
 import std/os
-import cheng/backend/machine/machine_types
-import cheng/backend/obj/obj_buf
+import backend/machine/machine_types
+import backend/obj/obj_buf
 
 type
     MachoX64Reloc = ref
@@ -192,6 +192,41 @@ fn mx64_addStrPtr(items: var str[], value: str) =
     add(items, value)
 
 fn mx64_seqInitEmpty[T](items: var T[]) =
+    if items == nil:
+        return
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn mx64_seqInitEmpty_uint8(items: var uint8[]) =
+    if items == nil:
+        return
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn mx64_seqInitEmpty_uint64(items: var uint64[]) =
+    if items == nil:
+        return
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn mx64_seqInitEmpty_str(items: var str[]) =
+    if items == nil:
+        return
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn mx64_seqInitEmpty_MachoX64Reloc(items: var MachoX64Reloc[]) =
+    if items == nil:
+        return
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn mx64_seqInitEmpty_MachoX64Sym(items: var MachoX64Sym[]) =
     if items == nil:
         return
     items.buffer = nil
@@ -714,14 +749,14 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     var text: uint8[]
     var cstring: uint8[]
     var data: uint8[]
-    mx64_seqInitEmpty[uint8](text)
-    mx64_seqInitEmpty[uint8](&cstring)
-    mx64_seqInitEmpty[uint8](&data)
+    mx64_seqInitEmpty_uint8(text)
+    mx64_seqInitEmpty_uint8(&cstring)
+    mx64_seqInitEmpty_uint8(&data)
     var bssSize: uint64 = 0
 
     # Layout cstrings.
     var cSymOffs: uint64[]
-    mx64_seqInitEmpty[uint64](&cSymOffs)
+    mx64_seqInitEmpty_uint64(&cSymOffs)
     cSymOffs.len = int(machineModuleCstrsLen(module))
     for ci in 0..<machineModuleCstrsLen(module):
         let c: MachineCString = mx64_moduleCStringAtRaw(module, ci)
@@ -731,10 +766,10 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
 
     # Layout globals.
     var dataSymOffs: uint64[]
-    mx64_seqInitEmpty[uint64](&dataSymOffs)
+    mx64_seqInitEmpty_uint64(&dataSymOffs)
     dataSymOffs.len = int(machineModuleGlobalsLen(module))
     var bssSymOffs: uint64[]
-    mx64_seqInitEmpty[uint64](&bssSymOffs)
+    mx64_seqInitEmpty_uint64(&bssSymOffs)
     bssSymOffs.len = int(machineModuleGlobalsLen(module))
     var maxDataAlignPow2: int32 = 0
     var maxBssAlignPow2: int32 = 0
@@ -762,8 +797,8 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # Encode .text and collect relocations.
     var relocs: MachoX64Reloc[]
     var funcOffs: uint64[]
-    mx64_seqInitEmpty[MachoX64Reloc](&relocs)
-    mx64_seqInitEmpty[uint64](&funcOffs)
+    mx64_seqInitEmpty_MachoX64Reloc(&relocs)
+    mx64_seqInitEmpty_uint64(&funcOffs)
     funcOffs.len = int(machineModuleFuncsLen(module))
     for fi in 0..<machineModuleFuncsLen(module):
         bufAlign(text, 4)
@@ -919,8 +954,8 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # linkers do not need cross-object resolution for temporary-style symbols.
     var synthCstrNames: str[]
     var synthCstrOffs: uint64[]
-    mx64_seqInitEmpty[str](&synthCstrNames)
-    mx64_seqInitEmpty[uint64](&synthCstrOffs)
+    mx64_seqInitEmpty_str(&synthCstrNames)
+    mx64_seqInitEmpty_uint64(&synthCstrOffs)
     mx64_collectSynthCstringsFromRelocs(relocs, cstring, synthCstrNames, synthCstrOffs)
 
     # Sections: always include __text, optionally __cstring/__data/__bss.
@@ -974,7 +1009,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
 
     # Build symbol list in dyld order: locals, extdefs, undefs.
     var syms: MachoX64Sym[]
-    mx64_seqInitEmpty[MachoX64Sym](syms)
+    mx64_seqInitEmpty_MachoX64Sym(syms)
     var symIndexCapHint: int32 = machineModuleCstrsLen(module) + synthCstrNames.len +
                                  machineModuleFuncsLen(module) + machineModuleGlobalsLen(module)
     if symIndexCapHint < 64:
@@ -1022,7 +1057,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
 
     # undefs referenced by relocations.
     var undefs: str[]
-    mx64_seqInitEmpty[str](&undefs)
+    mx64_seqInitEmpty_str(&undefs)
     let undefCapHint: int32 = relocs.len < 64 ? 64 : relocs.len
     var undefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(undefCapHint * 2 + 1)
     for ri in 0..<relocs.len:
@@ -1045,7 +1080,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
 
     # Build string table and fill nameOff.
     var strtab: uint8[]
-    mx64_seqInitEmpty[uint8](strtab)
+    mx64_seqInitEmpty_uint8(strtab)
     add(strtab, uint8(0))
     for si in 0..<syms.len:
         let s0: MachoX64Sym = syms[si]
@@ -1101,7 +1136,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
 
     # Build file.
     var out: uint8[]
-    mx64_seqInitEmpty[uint8](out)
+    mx64_seqInitEmpty_uint8(out)
 
     # mach_header_64
     bufU32(out, MX64_MH_MAGIC_64)

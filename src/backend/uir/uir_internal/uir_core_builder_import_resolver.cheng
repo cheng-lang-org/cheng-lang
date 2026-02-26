@@ -2,8 +2,8 @@
 import std/os
 import std/result
 import std/strutils
-import cheng/stage1/ast
-import cheng/stage1/frontend_lib
+import stage1/ast
+import stage1/frontend_lib
 
 fn resolverStripSpaces(s: str): str =
     if s == nil:
@@ -60,12 +60,55 @@ fn indexOfChar(s: str, ch: char): int32 =
             return i
     return -1
 
+fn indexOfCharFrom(s: str, ch: char, start0: int32): int32 =
+    if s == nil || len(s) == 0:
+        return -1
+    var start: int32 = start0
+    if start < 0:
+        start = 0
+    let n: int32 = len(s)
+    if start >= n:
+        return -1
+    for i in start..<n:
+        if s[i] == ch:
+            return i
+    return -1
+
+fn resolverSliceRange(s: str, start0: int32, end0: int32): str =
+    if s == nil:
+        return ""
+    let n: int32 = len(s)
+    if n <= 0:
+        return ""
+    var start: int32 = start0
+    var endIdx: int32 = end0
+    if start < 0:
+        start = 0
+    if endIdx >= n:
+        endIdx = n - 1
+    if start > endIdx:
+        return ""
+    let outLen: int32 = endIdx - start + 1
+    let buf: void* = alloc(outLen + 1)
+    if buf == nil:
+        return ""
+    for i in 0..<outLen:
+        let dst: void* = ptr_add(buf, i)
+        let pch: char* = char*(dst)
+        *pch = s[start + i]
+    setMem(ptr_add(buf, outLen), 0, 1)
+    return str(buf)
+
 fn parseQuotedValue(line: str): str =
     if line == nil:
         return ""
     if len(line) <= 0:
         return ""
-    # Stage0 compatibility: keep quoted-value parser minimal on this path.
+    let first: int32 = indexOfCharFrom(line, '"', 0)
+    if first >= 0:
+        let second: int32 = indexOfCharFrom(line, '"', first + 1)
+        if second > first:
+            return resolverSliceRange(line, first + 1, second - 1)
     return ""
 
 fn importPathDropChengPrefix(path: str): str =
@@ -86,7 +129,7 @@ fn packageNameFromRest(rest: str): str =
     let slash: int32 = indexOfChar(normalized, '/')
     if slash <= 0:
         return ""
-    # Stage0 stability: avoid os.sliceStr in this hot path.
+    # Avoid os.sliceStr in this hot path.
     let nameLen: int32 = slash
     let buf: void* = alloc(nameLen + 1)
     if buf == nil:
@@ -118,8 +161,29 @@ fn packageIdFromRest(rest: str): str =
     return "pkg://cheng/" + name
 
 fn packageIdFromManifest(manifestPath: str): str =
-    let _manifestPath: str = manifestPath
-    # Stage0 compatibility: disable manifest text slicing in this path.
+    if manifestPath == nil || len(manifestPath) == 0:
+        return ""
+    if !frontend_lib.stage1_fileExists(manifestPath):
+        return ""
+    let content: str = frontend_lib.stage1_readFile(manifestPath)
+    if content == nil || len(content) == 0:
+        return ""
+    let contentLen: int32 = len(content)
+    let key: str = "package_id"
+    let keyLen: int32 = len(key)
+    var start: int32 = 0
+    for i in 0..contentLen:
+        if i == contentLen || content[i] == '\n':
+            if i > start:
+                let line: str = resolverSliceRange(content, start, i - 1)
+                let trimmed: str = resolverStripSpaces(line)
+                if strHasPrefix(trimmed, key):
+                    let trimmedLen: int32 = len(trimmed)
+                    if trimmedLen == keyLen || trimmed[keyLen] == '=' || trimmed[keyLen] == ':' || trimmed[keyLen] == ' ':
+                        let value: str = parseQuotedValue(trimmed)
+                        if value != nil && len(value) > 0:
+                            return value
+            start = i + 1
     return ""
 
 fn packageIdMatches(manifestPath: str, expected: str): bool =
@@ -134,13 +198,28 @@ fn pkgRootsFromEnv(): str[] =
     var out: str[]
     let single: str = os.getEnvDefault("PKG_ROOT", "")
     if single != nil && len(single) > 0:
-        add(out, resolverStripSpaces(single))
+        let trimmedSingle: str = resolverStripSpaces(single)
+        if trimmedSingle != nil && len(trimmedSingle) > 0:
+            add(out, trimmedSingle)
     let raw: str = os.getEnvDefault("PKG_ROOTS", "")
-    # Stage0 compatibility: keep PKG_ROOTS parsing conservative (single entry only).
     if raw != nil && len(raw) > 0:
-        let trimmedRaw: str = resolverStripSpaces(raw)
-        if trimmedRaw != nil && len(trimmedRaw) > 0:
-            add(out, trimmedRaw)
+        let rawLen: int32 = len(raw)
+        var hasCommaOrSemi: bool = false
+        for k in 0..<rawLen:
+            let c0: char = raw[k]
+            if c0 == ',' || c0 == ';':
+                hasCommaOrSemi = true
+                break
+        let useColon: bool = !hasCommaOrSemi
+        var start: int32 = 0
+        for i in 0..rawLen:
+            if i == rawLen || raw[i] == ',' || raw[i] == ';' || (useColon && raw[i] == ':'):
+                if i > start:
+                    let part: str = resolverSliceRange(raw, start, i - 1)
+                    let trimmed: str = resolverStripSpaces(part)
+                    if trimmed != nil && len(trimmed) > 0:
+                        add(out, trimmed)
+                start = i + 1
     if out.len == 0:
         let home: str = os.getEnvDefault("HOME", "")
         if home != nil && len(home) > 0:
@@ -185,8 +264,54 @@ fn resolvePkgInRoot(pkgRoot: str, relInPkg: str, relForPkgRoot: str): str =
     return ""
 
 fn resolvePkgImport(root: str, rest: str): str =
-    let _root: str = root
-    let _rest: str = rest
-    # Stage0 compatibility: disable package-root deep probing in this path.
-    return ""
+    if root == nil || len(root) == 0 || rest == nil || len(rest) == 0:
+        return ""
+    let expectedPkgId: str = packageIdFromRest(rest)
+    let importPkgName: str = packageNameFromRest(rest)
+    var relForPkgRoot: str = importPathDropChengPrefix(rest)
+    if relForPkgRoot == nil || len(relForPkgRoot) == 0:
+        relForPkgRoot = rest
 
+    let manifest: str = os.joinPath(root, "cheng-package.toml")
+    if frontend_lib.stage1_fileExists(manifest):
+        if !packageIdMatches(manifest, expectedPkgId):
+            return ""
+        var relInPkg: str = relForPkgRoot
+        if len(expectedPkgId) > 0 && len(importPkgName) > 0:
+            let prefix: str = importPkgName + "/"
+            if len(relInPkg) > len(prefix) && strHasPrefix(relInPkg, prefix):
+                relInPkg = resolverSliceRange(relInPkg, len(prefix), len(relInPkg) - 1)
+        return resolvePkgInRoot(root, relInPkg, relForPkgRoot)
+
+    if len(expectedPkgId) > 0:
+        if importPkgName == nil || len(importPkgName) == 0:
+            return ""
+        let prefixedRoot: str = os.joinPath(root, "cheng-" + importPkgName)
+        let prefixedManifest: str = os.joinPath(prefixedRoot, "cheng-package.toml")
+        if frontend_lib.stage1_fileExists(prefixedManifest) && packageIdMatches(prefixedManifest, expectedPkgId):
+            var relInPkgPref: str = relForPkgRoot
+            let prefixPref: str = importPkgName + "/"
+            if len(relInPkgPref) > len(prefixPref) && strHasPrefix(relInPkgPref, prefixPref):
+                relInPkgPref = resolverSliceRange(relInPkgPref, len(prefixPref), len(relInPkgPref) - 1)
+            let resolvedPref: str = resolvePkgInRoot(prefixedRoot, relInPkgPref, relForPkgRoot)
+            if resolvedPref != nil && len(resolvedPref) > 0:
+                return resolvedPref
+        let plainRoot: str = os.joinPath(root, importPkgName)
+        let plainManifest: str = os.joinPath(plainRoot, "cheng-package.toml")
+        if frontend_lib.stage1_fileExists(plainManifest) && packageIdMatches(plainManifest, expectedPkgId):
+            var relInPkgPlain: str = relForPkgRoot
+            let prefixPlain: str = importPkgName + "/"
+            if len(relInPkgPlain) > len(prefixPlain) && strHasPrefix(relInPkgPlain, prefixPlain):
+                relInPkgPlain = resolverSliceRange(relInPkgPlain, len(prefixPlain), len(relInPkgPlain) - 1)
+            let resolvedPlain: str = resolvePkgInRoot(plainRoot, relInPkgPlain, relForPkgRoot)
+            if resolvedPlain != nil && len(resolvedPlain) > 0:
+                return resolvedPlain
+        return ""
+
+    let slash: int32 = indexOfChar(rest, '/')
+    if slash > 0 && slash < len(rest) - 1:
+        let pkgName: str = resolverSliceRange(rest, 0, slash - 1)
+        let rel: str = resolverSliceRange(rest, slash + 1, len(rest) - 1)
+        let pkgRoot: str = os.joinPath(root, pkgName)
+        return resolvePkgInRoot(pkgRoot, rel, rest)
+    return ""

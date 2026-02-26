@@ -1,11 +1,48 @@
-# UIR 生产主链说明（自研，不依赖 LLVM）
+# UIR 生产主链说明（自研后端，非 C-as-IR）
 
-## Summary
+## 1) 架构定位
+- `cheng` 当前生产链路不是“AST -> C 文本 -> Clang/GCC O3”的 C Backend 路线。
 - 生产主链已收敛为：`Stage1(语义后 AST) -> UIR -> Machine -> Obj/Exe`。
 - `backend_driver` 仅接受 `BACKEND_IR=uir`；非 `uir` 直接失败。
-- 编译器仍是自研实现：借鉴 LLVM 的统一 IR/SSA 思路，但不引入 LLVM IR/LLVM 库作为生产依赖。
+- Runtime C 的角色是“预编译 OS/ABI 胶水对象 + 必要运行时符号提供”，不是“把业务源码翻译成 C 再交给 C 编译器做主优化”。
+- Release 轨默认通过 system linker 做最终物理收敛（包含链接期优化能力），但中间优化主导权在 UIR/Machine 侧。
 
-## Current Architecture
+## 2) 为什么不是 C-as-IR
+在编译器工程里，C-as-IR 的优势是快速跨平台与工具链复用；代价是前端语义在降级到 C 语义后会损失控制力。  
+`cheng` 选择 UIR 直出，目标是把优化与确定性控制放在自研 IR 管线中完成，再与 Runtime C 对象在链接阶段会师。
+
+对应工程现实：
+- 不支持 `emit-c` / `--backend:c` 生产路径。
+- 对外主语义是 `emit=exe`。
+- `emit=obj` 仅 internal gate 使用。
+
+## 3) UIR 相对 C-as-IR 的五个工程维度
+
+### 3.1 内存与别名信息保真（NoAlias 传递）
+- C-as-IR 下，许多高层 noalias/ownership 证明会在 C 指针语义中被稀释，优化器更保守。
+- UIR 直接消费前端/中间层的别名事实（如 noalias pass 结果），在 SROA、CSE、LICM、向量化等 pass 中可保持更激进但可证的优化前提。
+
+### 3.2 内部调用约定可控（非公开边界）
+- 对 C ABI 暴露边界必须守平台 ABI。
+- 对模块内部调用，UIR/Machine 可按寄存器分配与目标机规则做更紧凑的调用布局，减少不必要栈往返。
+- 该能力由 `machine_select_*` + `machine_regalloc` 路径承担，而不是依赖 C 编译器“猜测”。
+
+### 3.3 栈帧与挂起点控制（异步/状态机）
+- C-as-IR 常需要把高层异步/状态机改写成更保守的 C 结构，调度与寄存器活跃信息利用受限。
+- UIR 在 lowering 到 machine 前可结合 CFG/liveness 做更细粒度布局，减少保存/恢复开销。
+- 本质是“在 IR 层保留语义，再到机器层定制实现”，而不是先退化成 C 语义。
+
+### 3.4 相位排序可控（优化与计费/插桩）
+- C-as-IR 场景下，插桩与 O3 的相互作用受外部编译器相位控制，行为稳定性更难约束。
+- UIR 路线可在自研 pass 管线里先完成主优化，再在后段做受控插桩/收尾，降低“插桩破坏优化”与“版本漂移导致行为波动”的风险。
+
+### 3.5 双轨收敛（UIR 主优化 + system linker 物理缝合）
+- Runtime C：提前编译为稳定对象，承担平台胶水。
+- 业务代码：由 UIR/Machine 完成主要优化与裁剪。
+- 最后交给系统链接器做物理链接与 LTO 收敛。
+- 这个模型避免“所有优化都押给 C 编译器”带来的不可控相位耦合，同时保留成熟链接器生态。
+
+## 4) Current Architecture
 - UIR 门面：
   - `src/backend/uir/uir_frontend.cheng`
   - `src/backend/uir/uir_types.cheng`
@@ -24,36 +61,23 @@
   - `src/backend/machine/select_internal/*`
 - 目标写出：`src/backend/obj/*` 消费 `MachineModule`。
 
-## Defaults
+## 5) Defaults
 - `BACKEND_OPT_LEVEL` 默认 `2`（未设置时）。
 - `GENERIC_MODE` 默认 `dict`。
 - `GENERIC_SPEC_BUDGET` 默认 `0`。
 - `UIR_SIMD`：
-  - 未设置：`optLevel>=3` 自动开启，`<3` 关闭
-  - 显式 `0/1`：强制关闭/开启
+  - 未设置：`optLevel>=3` 自动开启，`<3` 关闭。
+  - 显式 `0/1`：强制关闭/开启。
 - `UIR_SIMD_POLICY` 默认 `autovec`。
 
-## Removed Env Policy
-以下变量已下线，设置即失败：
-- `MIR_PROFILE`
-- `BACKEND_SSA`
-- `STAGE1_SKIP_MONO`
-- `BACKEND_SKIP_MONO`
-- `BACKEND_SKIP_MONO_AFTER_CPROFILE`
-- `BACKEND_SKIP_MONO_DICT`
-- `STAGE1_SKIP_MONO_AFTER_CPROFILE`
-- `STAGE1_SKIP_MONO_DICT`
-
-报错格式：`backend_driver: removed env <NAME>, use <NEW_NAME>`。
-
-## Diagnostics
+## 6) Diagnostics
 - UIR profile：
   - `UIR_PROFILE=1`
   - 输出：`uir_profile\t<label>\tstep_ms=...\ttotal_ms=...`
 - Generics report：
   - 输出：`generics_report\tir=uir\tmode=...\tspec_budget=...\tinstances_total=...\tinstances_reused=...\tinstances_specialized=...\tdict_calls=...\tms=...`
 
-## Optimization Pipeline
+## 7) Optimization Pipeline
 - `O1`：
   - const-fold（`uir_opt.const_fold`）
 - `O2`（默认）：
@@ -73,11 +97,24 @@
 - `UIR_AGGRESSIVE`
 - `UIR_FULL_ITERS`
 
-## Generics Policy
+## 8) Removed Env Policy
+以下变量已下线，设置即失败：
+- `MIR_PROFILE`
+- `BACKEND_SSA`
+- `STAGE1_SKIP_MONO`
+- `BACKEND_SKIP_MONO`
+- `BACKEND_SKIP_MONO_AFTER_CPROFILE`
+- `BACKEND_SKIP_MONO_DICT`
+- `STAGE1_SKIP_MONO_AFTER_CPROFILE`
+- `STAGE1_SKIP_MONO_DICT`
+
+报错格式：`backend_driver: removed env <NAME>, use <NEW_NAME>`。
+
+## 9) Generics Policy
 - `dict`：默认生产策略（编译时优先）。
 - `hybrid`：预算内特化（`GENERIC_SPEC_BUDGET>0` 时启用特化，超预算回退字典路径）。
 
-## Production Closure Gates
+## 10) Production Closure Gates
 必跑（阻断）：
 - `sh src/tooling/tooling_exec.sh verify_backend_no_legacy_refs`
 - `sh src/tooling/tooling_exec.sh verify_backend_opt2`
@@ -95,6 +132,6 @@ fullspec 默认闭环口径（`BACKEND_RUN_FULLSPEC=1`）：
 
 通过标准：以上门禁全部 `ok`，且 `backend_prod_closure` 输出 `backend_prod_closure ok`。
 
-## Scope Notes
+## 11) Scope Notes
 - 本文档描述生产主链口径。
 - internal 命名已完成收敛：`uir_internal`/`machine_internal`/`select_internal` 不再保留 `Mir/Lir` 与 `lr/lc/lo` 旧符号；`verify_backend_no_legacy_refs` 对 internal + non-internal 一并做硬阻断。

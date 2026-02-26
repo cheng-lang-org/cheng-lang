@@ -7,21 +7,34 @@ import std/seqs
 import std/system
 import std/hashmaps
 import std/hashsets
-import cheng/stage1/lexer
-import cheng/stage1/parser
-import cheng/stage1/ast
-import cheng/stage1/frontend_lib
-import cheng/stage1/type_syntax_lowering
-import cheng/stage1/semantics
-import cheng/stage1/monomorphize
-import cheng/stage1/c_profile_lowering
-import cheng/stage1/ownership
-import cheng/stage1/diagnostics
-import cheng/backend/uir/uir_internal/uir_core_types
-import cheng/backend/uir/uir_internal/uir_core_builder_import_resolver
+import stage1/lexer
+import stage1/parser
+import stage1/ast
+import stage1/frontend_lib
+import stage1/type_syntax_lowering
+import stage1/semantics
+import stage1/monomorphize
+import stage1/c_profile_lowering
+import stage1/ownership
+import stage1/diagnostics
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_scope_helpers
+import backend/uir/uir_internal/uir_core_builder_import_resolver
+import backend/uir/uir_internal/uir_core_builder_policy_contract
+import backend/uir/uir_internal/uir_core_builder_ffi_out_ptr
+import backend/uir/uir_internal/uir_core_builder_symbol_state
+import backend/uir/uir_internal/uir_core_builder_dup_scan
+import backend/uir/uir_internal/uir_core_builder_overload_scan
+import backend/uir/uir_internal/uir_core_builder_top_level_passes
 
 fn lowerAscii(s: str): str =
     return strutils.toLowerAscii(s)
+
+fn uirCoreOkModule(mod: UirCoreModule): Result[UirCoreModule] =
+    # Use shared constructor from uir_core_types to avoid stage0-specific
+    # return-value instability on large Result payloads.
+    return Ok_UirCoreModule(mod)
 
 @importc("cheng_parse_f64_bits")
 fn cheng_parse_f64_bits(s: str): int64
@@ -50,80 +63,7 @@ fn cheng_f32_bits_to_i64(bits: int32): int64
 @importc("cheng_f32_bits_to_u64")
 fn cheng_f32_bits_to_u64(bits: int32): uint64
 
-type
-    LocalEnv = ref
-        names: str[]
-        types: UirCoreType[]
-        typeKeys: str[]
-        callTargets: str[]
-        active: bool[]
-        scopeMarks: int32[]
-        nameIndex: hashmaps.HashMapStrInt
-        prevSlots: int32[]
-    DeferFrame = ref
-        bodies: Node[]
-    LoopContext = ref
-        breakLabel: str
-        continueLabel: str
-        deferDepth: int32
-    BlockBuilder = ref
-        env: LocalEnv
-        module: UirCoreModule
-        func: UirCoreFunc
-        currentLabel: str
-        currentStmts: UirCoreStmt[]
-        labelCounter: int32
-        objCursor: int32
-        loopStack: LoopContext[]
-        deferStack: DeferFrame[]
-
-    DotAccess =
-        addr: UirCoreExpr
-        fieldTy: UirCoreType
-        # Non-empty only when fieldTy == mtVoid (composite/inlined object field).
-        objTypeName: str
-
-    UirCorePhaseContractStats =
-        highCheckedFuncs: int32
-        highFallbackFuncs: int32
-        highUnmappedFuncs: int32
-        highNoProofFuncs: int32
-
-fn Ok_DotAccess(value: DotAccess): Result[DotAccess] =
-    var out: Result[DotAccess]
-    out.ok = true
-    out.value = value
-    out.err = ErrorOk()
-    return out
-
-fn Err_DotAccess(err: str): Result[DotAccess] =
-    var out: Result[DotAccess]
-    out.ok = false
-    out.err = ErrorNew(err)
-    return out
-
 var
-    uirCoreGlobalObjTypeIndex: hashmaps.HashMapStrInt
-    uirCoreGlobalObjTypeNames: str[]
-    uirCoreGlobalObjTypeReady: bool = false
-    uirCoreGlobalTypeKeyIndex: hashmaps.HashMapStrInt
-    uirCoreGlobalTypeKeyNames: str[]
-    uirCoreGlobalTypeKeyReady: bool = false
-    uirCoreInlineObjFieldTypeIndex: hashmaps.HashMapStrInt
-    uirCoreInlineObjFieldTypeNames: str[]
-    uirCoreInlineObjFieldTypeReady: bool = false
-    uirCoreObjFieldTypeKeyIndex: hashmaps.HashMapStrInt
-    uirCoreObjFieldTypeKeyNames: str[]
-    uirCoreObjFieldTypeKeyReady: bool = false
-    uirCoreTupleFieldIndex: hashmaps.HashMapStrInt
-    uirCoreTupleFieldIndexReady: bool = false
-    uirCoreObjAliasIndex: hashmaps.HashMapStrInt
-    uirCoreObjAliasNames: str[]
-    uirCoreObjAliasReady: bool = false
-    uirCoreDupFnBases: hashsets.HashSetStr
-    uirCoreDupFnBasesReady: bool = false
-    uirCoreDupGlobalNames: hashsets.HashSetStr
-    uirCoreDupGlobalNamesReady: bool = false
     uirCoreCalleeCandidates: hashmaps.HashMapStrSeqInt
     uirCoreCalleeCandidatesReady: bool = false
 
@@ -136,726 +76,6 @@ var
     uirCore_globalIndex_cache: hashmaps.HashMapStrInt
     uirCore_globalIndex_cache_len: int32
     uirCore_globalIndex_cache_ready: bool = false
-
-var
-    uirCorePluginEnableCached: int32 = -1
-    uirCorePluginPathsCached: str[]
-    uirCorePluginPathsCachedReady: bool = false
-    uirCorePluginMeteringCached: str = nil
-
-fn backendSkipGlobalInit(): bool =
-    return envIsTrue "BACKEND_SKIP_GLOBAL_INIT"
-
-fn backendAllowNoMainByEmit(): bool =
-    let emitModeRaw: str = backendStripSpaces(os.getEnvDefault("BACKEND_EMIT", ""))
-    let emitMode: str = lowerAscii(emitModeRaw)
-    if emitMode == "obj" || emitMode == "object" || emitMode == "o":
-        return true
-    let outPathRaw: str = backendStripSpaces(os.getEnvDefault("BACKEND_OUTPUT", ""))
-    if outPathRaw == nil || len(outPathRaw) <= 0:
-        return false
-    let outPath: str = lowerAscii(outPathRaw)
-    if strHasSuffix(outPath, ".o") || strHasSuffix(outPath, ".obj"):
-        return true
-    return false
-
-fn uirCorePluginEnabled(): bool =
-    if uirCorePluginEnableCached >= 0:
-        return uirCorePluginEnableCached == 1
-    let raw: str = lowerAscii(backendStripSpaces(getEnv "PLUGIN_ENABLE"))
-    let enabled: bool = (raw == "1" || raw == "true" || raw == "yes" || raw == "on")
-    uirCorePluginEnableCached = enabled ? 1 : 0
-    return enabled
-
-fn uirCorePluginPathsFromEnv(): str[] =
-    if uirCorePluginPathsCachedReady:
-        return uirCorePluginPathsCached
-    var out: str[]
-    let raw: str = backendStripSpaces(getEnv "PLUGIN_PATH")
-    if raw != nil && len(raw) > 0:
-        add(out, raw)
-    let raw2: str = backendStripSpaces(getEnv "PLUGIN_PATHS")
-    if raw2 != nil && len(raw2) > 0:
-        if out.len == 0 || out[0] != raw2:
-            add(out, raw2)
-    uirCorePluginPathsCached = out
-    uirCorePluginPathsCachedReady = true
-    return out
-
-fn uirCorePluginMeteringId(): str =
-    let cached: str = uirCorePluginMeteringCached
-    if cached != nil:
-        return cached
-    let raw: str = getEnv "METERING_PLUGIN"
-    if raw == nil:
-        return ""
-    let trimmed: str = backendStripSpaces(raw)
-    uirCorePluginMeteringCached = trimmed
-    return trimmed
-
-fn uirCoreResolvePluginImportCandidate(candidate: str): str =
-    let _: str = candidate
-    return ""
-
-fn uirCoreResolvePluginImportPath(path: str): str =
-    let _: str = path
-    if !uirCorePluginEnabled():
-        return ""
-    let roots: str[] = uirCorePluginPathsFromEnv()
-    if roots.len > 0:
-        let _: str = roots[0]
-    return ""
-
-fn uirCoreApplyAstPluginHooks(filePath: str, root: Node): Node =
-    if root == nil:
-        return root
-    if !uirCorePluginEnabled():
-        return root
-    return root
-
-fn uirCoreApplyMirPluginHooks(filePath: str, root: Node): Node =
-    if root == nil:
-        return root
-    if !uirCorePluginEnabled():
-        return root
-    return root
-
-fn uirCoreNativeContractEnabled(): bool =
-    let raw: str = lowerAscii(backendStripSpaces(getEnv "BACKEND_NATIVE_CONTRACT"))
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
-
-fn uirCoreNativeContractChargeSymbol(): str =
-    let raw: str = backendStripSpaces(getEnv "BACKEND_NATIVE_CONTRACT_CHARGE_SYMBOL")
-    if raw != nil && len(raw) > 0:
-        return raw
-    return "__cheng_contract_charge_block"
-
-fn uirCoreNativeContractGasCounterSymbol(): str =
-    let raw: str = backendStripSpaces(getEnv "BACKEND_NATIVE_CONTRACT_GAS_COUNTER")
-    if raw != nil && len(raw) > 0:
-        return raw
-    return "__cheng_contract_gas_used"
-
-fn uirCoreNativeContractStartsWith(text: str, prefix: str): bool =
-    if text == nil || prefix == nil:
-        return false
-    let n: int32 = len(text)
-    let m: int32 = len(prefix)
-    if m <= 0:
-        return true
-    if m > n:
-        return false
-    for i in 0..<m:
-        if text[i] != prefix[i]:
-            return false
-    return true
-
-fn uirCoreNativeContractStripLeadingUnderscores(raw: str): str =
-    if raw == nil || len(raw) == 0:
-        return ""
-    let n: int32 = len(raw)
-    var i: int32 = 0
-    for __for_guard_i in 0..<n:
-        if !(i < n && raw[i] == '_'):
-            break
-        i = i + 1
-    if i <= 0:
-        return raw
-    if i >= n:
-        return ""
-    return strings.sliceBytes(raw, i, n - i)
-
-fn uirCoreNativeContractNormalizeSymbol(raw: str): str =
-    let s0: str = lowerAscii(backendStripSpaces(raw))
-    if s0 == nil || len(s0) == 0:
-        return ""
-    return uirCoreNativeContractStripLeadingUnderscores(s0)
-
-fn uirCoreNativeContractTypeIsFloat(ty: UirCoreType): bool =
-    return ty.kind == mtF32 || ty.kind == mtF64
-
-fn uirCoreNativeContractIsSyscallSymbol(raw: str): bool =
-    let sym: str = uirCoreNativeContractNormalizeSymbol(raw)
-    if sym == nil || len(sym) == 0:
-        return false
-    return uirCoreNativeContractStartsWith(sym, "cheng_linux_syscall")
-
-fn uirCoreNativeContractIsFloatIntrinsicSymbol(raw: str): bool =
-    let sym: str = uirCoreNativeContractNormalizeSymbol(raw)
-    if sym == nil || len(sym) == 0:
-        return false
-    if uirCoreNativeContractStartsWith(sym, "cheng_f64_"):
-        return true
-    if uirCoreNativeContractStartsWith(sym, "cheng_f32_"):
-        return true
-    if sym == "cheng_parse_f64_bits" ||
-       sym == "cheng_i64_to_f64_bits" ||
-       sym == "cheng_u64_to_f64_bits" ||
-       sym == "cheng_f64_bits_to_i64" ||
-       sym == "cheng_f64_bits_to_u64":
-        return true
-    return false
-
-fn uirCoreNativeContractExprViolation(expr: UirCoreExpr, where: str): str =
-    if expr == nil:
-        return ""
-    if expr.kind == meCall:
-        let callee: str = expr.callee
-        if uirCoreNativeContractIsSyscallSymbol(callee):
-            return "forbid syscall symbol=" + callee + " @" + where
-        if uirCoreNativeContractIsFloatIntrinsicSymbol(callee):
-            return "forbid float intrinsic symbol=" + callee + " @" + where
-        for ai in 0..<expr.args.len:
-            let v: str = uirCoreNativeContractExprViolation(expr.args[ai], where + "/arg" + intToStr(ai))
-            if v != nil && len(v) > 0:
-                return v
-        return ""
-    if expr.kind == meBin || expr.kind == meCmp:
-        let lhsV: str = uirCoreNativeContractExprViolation(expr.lhs, where + "/lhs")
-        if lhsV != nil && len(lhsV) > 0:
-            return lhsV
-        let rhsV: str = uirCoreNativeContractExprViolation(expr.rhs, where + "/rhs")
-        if rhsV != nil && len(rhsV) > 0:
-            return rhsV
-        return ""
-    if expr.kind == meCast:
-        if uirCoreNativeContractTypeIsFloat(expr.castType):
-            return "forbid float cast @" + where
-        return uirCoreNativeContractExprViolation(expr.castExpr, where + "/cast")
-    if expr.kind == meLoad:
-        if uirCoreNativeContractTypeIsFloat(expr.loadType):
-            return "forbid float load @" + where
-        return uirCoreNativeContractExprViolation(expr.addrExpr, where + "/addr")
-    return ""
-
-fn uirCoreNativeContractStmtViolation(stmt: UirCoreStmt, where: str): str =
-    if stmt.kind == msStore && uirCoreNativeContractTypeIsFloat(stmt.storeType):
-        return "forbid float store @" + where
-    let exprV: str = uirCoreNativeContractExprViolation(stmt.expr, where + "/expr")
-    if exprV != nil && len(exprV) > 0:
-        return exprV
-    let addrV: str = uirCoreNativeContractExprViolation(stmt.addrExpr, where + "/addr")
-    if addrV != nil && len(addrV) > 0:
-        return addrV
-    return ""
-
-fn uirCoreNativeContractTermViolation(term: UirCoreTerm, where: str): str =
-    if term.kind == mtRet:
-        return uirCoreNativeContractExprViolation(term.retExpr, where + "/ret")
-    if term.kind == mtCbr:
-        return uirCoreNativeContractExprViolation(term.condExpr, where + "/cond")
-    return ""
-
-fn uirCoreNativeContractFuncViolation(f: UirCoreFunc): str =
-    if f == nil:
-        return ""
-    if uirCoreNativeContractTypeIsFloat(f.retType):
-        return "forbid float return type fn=" + f.name
-    for pi in 0..<f.params.len:
-        let p: UirCoreParam = f.params[pi]
-        if uirCoreNativeContractTypeIsFloat(p.ty):
-            return "forbid float param fn=" + f.name + " param=" + p.name
-    for li in 0..<f.localTypes.len:
-        if uirCoreNativeContractTypeIsFloat(f.localTypes[li]):
-            return "forbid float local fn=" + f.name + " slot=" + intToStr(li)
-    for bi in 0..<f.blocks.len:
-        let blk: UirCoreBlock = f.blocks[bi]
-        if blk == nil:
-            continue
-        for si in 0..<blk.stmts.len:
-            let sv: str = uirCoreNativeContractStmtViolation(blk.stmts[si],
-                                                             "fn=" + f.name + " block=" + blk.label + " stmt=" + intToStr(si))
-            if sv != nil && len(sv) > 0:
-                return sv
-        let tv: str = uirCoreNativeContractTermViolation(blk.term,
-                                                         "fn=" + f.name + " block=" + blk.label + " term")
-        if tv != nil && len(tv) > 0:
-            return tv
-    return ""
-
-fn uirCoreNativeContractFindFuncIndex(mod: UirCoreModule, rawName: str): int32 =
-    if mod == nil:
-        return -1
-    let name: str = backendStripSpaces(rawName)
-    if name == nil || len(name) == 0:
-        return -1
-    for i in 0..<mod.funcs.len:
-        let f: UirCoreFunc = mod.funcs[i]
-        if f == nil:
-            continue
-        if f.name == name || f.linkName == name:
-            return i
-    let nameNorm: str = uirCoreNativeContractNormalizeSymbol(name)
-    if nameNorm == nil || len(nameNorm) == 0:
-        return -1
-    for i2 in 0..<mod.funcs.len:
-        let f2: UirCoreFunc = mod.funcs[i2]
-        if f2 == nil:
-            continue
-        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(f2.name)
-        if fnNorm == nameNorm:
-            return i2
-        let lnNorm: str = uirCoreNativeContractNormalizeSymbol(f2.linkName)
-        if lnNorm == nameNorm:
-            return i2
-    return -1
-
-fn uirCoreNativeContractEnqueueByName(mod: UirCoreModule, queue: var int32[], reachable: var bool[], rawName: str) =
-    if mod == nil:
-        return
-    let idx: int32 = uirCoreNativeContractFindFuncIndex(mod, rawName)
-    if idx < 0 || idx >= reachable.len:
-        return
-    if reachable[idx]:
-        return
-    reachable[idx] = true
-    add(queue, idx)
-
-fn uirCoreNativeContractCollectCallsFromExpr(mod: UirCoreModule, expr: UirCoreExpr,
-                                             queue: var int32[], reachable: var bool[]) =
-    if expr == nil:
-        return
-    if expr.kind == meCall:
-        uirCoreNativeContractEnqueueByName(mod, queue, reachable, expr.callee)
-        for ai in 0..<expr.args.len:
-            uirCoreNativeContractCollectCallsFromExpr(mod, expr.args[ai], queue, reachable)
-        return
-    if expr.kind == meBin || expr.kind == meCmp:
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.lhs, queue, reachable)
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.rhs, queue, reachable)
-        return
-    if expr.kind == meCast:
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.castExpr, queue, reachable)
-        return
-    if expr.kind == meLoad:
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.addrExpr, queue, reachable)
-        return
-
-fn uirCoreNativeContractCollectCallsFromStmt(mod: UirCoreModule, stmt: UirCoreStmt,
-                                             queue: var int32[], reachable: var bool[]) =
-    uirCoreNativeContractCollectCallsFromExpr(mod, stmt.expr, queue, reachable)
-    uirCoreNativeContractCollectCallsFromExpr(mod, stmt.addrExpr, queue, reachable)
-
-fn uirCoreNativeContractCollectCallsFromTerm(mod: UirCoreModule, term: UirCoreTerm,
-                                             queue: var int32[], reachable: var bool[]) =
-    if term.kind == mtRet:
-        uirCoreNativeContractCollectCallsFromExpr(mod, term.retExpr, queue, reachable)
-    elif term.kind == mtCbr:
-        uirCoreNativeContractCollectCallsFromExpr(mod, term.condExpr, queue, reachable)
-
-fn uirCoreNativeContractReachableMask(mod: UirCoreModule): bool[] =
-    var reachable: bool[]
-    if mod == nil:
-        return reachable
-    reachable.len = mod.funcs.len
-    var queue: int32[]
-    var entryIdx: int32 = uirCoreNativeContractFindFuncIndex(mod, "main")
-    if entryIdx < 0:
-        entryIdx = uirCoreNativeContractFindFuncIndex(mod, "_main")
-    if entryIdx < 0:
-        for i in 0..<reachable.len:
-            reachable[i] = true
-        return reachable
-    if entryIdx >= 0 && entryIdx < reachable.len:
-        reachable[entryIdx] = true
-        add(queue, entryIdx)
-    for qi in 0..<queue.len:
-        let idx: int32 = queue[qi]
-        if idx < 0 || idx >= mod.funcs.len:
-            continue
-        let f: UirCoreFunc = mod.funcs[idx]
-        if f == nil || f.isExtern:
-            continue
-        for bi in 0..<f.blocks.len:
-            let blk: UirCoreBlock = f.blocks[bi]
-            if blk == nil:
-                continue
-            for si in 0..<blk.stmts.len:
-                uirCoreNativeContractCollectCallsFromStmt(mod, blk.stmts[si], queue, reachable)
-            uirCoreNativeContractCollectCallsFromTerm(mod, blk.term, queue, reachable)
-    return reachable
-
-fn uirCoreNativeContractEnsureGasHelper(mod: UirCoreModule, chargeName: str, counterName: str) =
-    if mod == nil:
-        return
-    if !moduleHasGlobal(mod, counterName):
-        uirCoreAddGlobal(mod, counterName, uirCoreTypeI64(), 0, true, "<native_contract>")
-    if moduleHasFunc(mod, chargeName):
-        return
-    let helper: UirCoreFunc = uirCoreNewFunc(chargeName, uirCoreTypeI64())
-    uirCoreFuncSetOriginFile(helper, "<native_contract>")
-    uirCoreAddParam(helper, "cost", 0, uirCoreTypeI64())
-    uirCoreSetLocalType(helper, 1, uirCoreTypeI64())
-    uirCoreSetLocalType(helper, 2, uirCoreTypeI64())
-    var stmts: UirCoreStmt[]
-    add(stmts, uirCoreStmtParam("cost", 0, 0))
-    let oldExpr: UirCoreExpr = uirCoreLoad(uirCoreGlobalAddr(counterName), uirCoreTypeI64())
-    add(stmts, uirCoreStmtLet("gas_old", 1, oldExpr))
-    let nextExpr: UirCoreExpr = uirCoreBin(mbAdd, uirCoreLocal(1), uirCoreLocal(0))
-    add(stmts, uirCoreStmtLet("gas_new", 2, nextExpr))
-    add(stmts, uirCoreStmtStore(uirCoreGlobalAddr(counterName), uirCoreLocal(2), uirCoreTypeI64()))
-    let term: UirCoreTerm = uirCoreTermRet(uirCoreLocal(2))
-    let entry: UirCoreBlock = uirCoreBlockWithStmts("entry", stmts, term)
-    uirCoreAddBlock(helper, entry)
-    uirCoreAddFunc(mod, helper)
-
-fn uirCoreNativeContractFirstNonParamStmt(blk: UirCoreBlock): int32 =
-    if blk == nil:
-        return -1
-    # Stage0 stability: avoid while+local-alias form that has triggered seed crashes.
-    for idx in 0..<blk.stmts.len:
-        if blk.stmts[idx] == nil:
-            return idx
-        if blk.stmts[idx].kind != msParam:
-            return idx
-    return blk.stmts.len
-
-fn uirCoreNativeContractStmtCallsCharge(stmt: UirCoreStmt, chargeNorm: str): bool =
-    if stmt == nil:
-        return false
-    if stmt.kind != msExpr:
-        return false
-    let expr0: UirCoreExpr = stmt.expr
-    if expr0 == nil:
-        return false
-    if expr0.kind != meCall:
-        return false
-    let calleeNorm: str = uirCoreNativeContractNormalizeSymbol(expr0.callee)
-    return calleeNorm == chargeNorm
-
-fn uirCoreNativeContractInjectGas(mod: UirCoreModule) =
-    if mod == nil:
-        return
-    let chargeName: str = uirCoreNativeContractChargeSymbol()
-    let counterName: str = uirCoreNativeContractGasCounterSymbol()
-    uirCoreNativeContractEnsureGasHelper(mod, chargeName, counterName)
-    let chargeNorm: str = uirCoreNativeContractNormalizeSymbol(chargeName)
-    var fi: int32 = 0
-    while fi < mod.funcs.len:
-        let f: UirCoreFunc = mod.funcs[fi]
-        fi = fi + 1
-        if f == nil || f.isExtern:
-            continue
-        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(f.name)
-        if fnNorm == chargeNorm:
-            continue
-        var bi: int32 = 0
-        while bi < f.blocks.len:
-            let blk: UirCoreBlock = f.blocks[bi]
-            bi = bi + 1
-            if blk == nil:
-                continue
-            let insertAt: int32 = uirCoreNativeContractFirstNonParamStmt(blk)
-            if insertAt < 0:
-                continue
-            if insertAt < blk.stmts.len:
-                let firstStmt: UirCoreStmt = blk.stmts[insertAt]
-                if uirCoreNativeContractStmtCallsCharge(firstStmt, chargeNorm):
-                    continue
-            var args: UirCoreExpr[]
-            let blockCost: int64 = int64(1 + blk.stmts.len)
-            add(args, uirCoreConstI64(blockCost))
-            let chargeExpr: UirCoreExpr = uirCoreCall(chargeName, args)
-            let chargeStmt: UirCoreStmt = uirCoreStmtExpr(chargeExpr)
-            var out: UirCoreStmt[]
-            var si: int32 = 0
-            while si < blk.stmts.len:
-                if si == insertAt:
-                    add(out, chargeStmt)
-                add(out, blk.stmts[si])
-                si = si + 1
-            if insertAt >= blk.stmts.len:
-                add(out, chargeStmt)
-            blk.stmts = out
-
-fn uirCoreNativeContractEnforce(filePath: str, mod: UirCoreModule) =
-    if mod == nil:
-        return
-    let reachable: bool[] = uirCoreNativeContractReachableMask(mod)
-    for fi in 0..<mod.funcs.len:
-        if fi < reachable.len && !reachable[fi]:
-            continue
-        let f: UirCoreFunc = mod.funcs[fi]
-        let v: str = uirCoreNativeContractFuncViolation(f)
-        if v != nil && len(v) > 0:
-            let panicMsg: str = "uirCore_builder: native_contract hard-fail @" + filePath + ": " + v
-            panic panicMsg
-    uirCoreNativeContractInjectGas(mod)
-
-fn uirCoreApplyUirPluginHooks(filePath: str, mod: UirCoreModule) =
-    let pluginEnabled: bool = uirCorePluginEnabled()
-    let nativeContractEnabled: bool = uirCoreNativeContractEnabled()
-    if !pluginEnabled && !nativeContractEnabled:
-        return
-    if mod == nil:
-        return
-    if nativeContractEnabled:
-        uirCoreNativeContractEnforce(filePath, mod)
-    return
-
-fn uirCoreIsOne(raw: str): bool =
-    return raw != nil && len(raw) == 1 && raw[0] == char('1')
-
-fn uirCoreParseInt32(raw: str, defaultValue: int32): int32 =
-    if raw == nil || len(raw) == 0:
-        return defaultValue
-    let n: int32 = len(raw)
-    var i: int32 = 0
-    var neg: bool = false
-    if raw[0] == '-':
-        neg = true
-        i = 1
-    if i >= n:
-        return defaultValue
-    var v: int64 = 0
-    for __for_guard_i in 0..<n:
-        if !(i < n):
-            break
-        let c: char = raw[i]
-        if c < '0' || c > '9':
-            return defaultValue
-        v = v * 10 + int64(int32(c) - int32('0'))
-        i = i + 1
-    if neg:
-        v = -v
-    return int32(v)
-
-fn uirCoreGenericSpecBudget(): int32 =
-    let raw: str = backendStripSpaces(getEnv "GENERIC_SPEC_BUDGET")
-    if raw == nil || len(raw) == 0:
-        return 0
-    let parsed: int32 = uirCoreParseInt32(raw, 0)
-    return parsed
-
-fn uirCoreGenericModeNormalized(): str =
-    let raw0: str = lowerAscii(backendStripSpaces(getEnv "GENERIC_MODE"))
-    if raw0 == nil || len(raw0) == 0:
-        return "dict"
-    return raw0
-
-fn uirCoreBorrowIrNormalized(): str =
-    let raw0: str = lowerAscii(backendStripSpaces(getEnv "BORROW_IR"))
-    if raw0 == nil || len(raw0) == 0:
-        return "mir"
-    return raw0
-
-fn uirCoreGenericLoweringNormalized(): str =
-    let raw0: str = lowerAscii(backendStripSpaces(getEnv "GENERIC_LOWERING"))
-    if raw0 == nil || len(raw0) == 0:
-        return "mir_hybrid"
-    return raw0
-
-fn uirCoreBorrowIrSupported(mode: str): bool =
-    return mode == "mir" || mode == "stage1"
-
-fn uirCoreGenericLoweringSupported(mode: str): bool =
-    return mode == "mir_hybrid" || mode == "mir_dict"
-
-fn uirCoreDictHelperClosureEnabled(): bool =
-    let mode: str = uirCoreGenericModeNormalized()
-    return mode == "dict" || mode == "dictionary"
-
-fn uirCoreShouldSkipMonoPass(): bool =
-    let mode: str = uirCoreGenericModeNormalized()
-    if mode == "dict" || mode == "dictionary":
-        # Dict mode keeps mono off by default for compile-time stability.
-        # Local env can opt back into mono for debug/bring-up.
-        let forceMonoDict: bool = envIsTrue "STAGE1_FORCE_MONO_DICT"
-        var skipDict: bool = true
-        if forceMonoDict:
-            skipDict = false
-        if os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1":
-            let f: os.File = os.get_stderr()
-            os.writeLine(f, "[backend] stage1: skip_mono mode=" + mode +
-                         " skip_dict=" + (skipDict ? "1" : "0"))
-            os.c_fflush f
-        return skipDict
-    if mode == "hybrid":
-        let budget: int32 = uirCoreGenericSpecBudget()
-        let forceMonoHybrid: bool = envIsTrue "STAGE1_FORCE_MONO_HYBRID"
-        # Budget <= 0 keeps a dict-like fast path; >0 allows controlled
-        # mono re-entry for small/explicitly budgeted instantiations.
-        let skipDict: bool = !forceMonoHybrid && budget <= 0
-        if os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1":
-            let f: os.File = os.get_stderr()
-            os.writeLine(f, "[backend] stage1: skip_mono mode=" + mode +
-                         " budget=" + intToStr(budget) +
-                         " skip=" + (skipDict ? "1" : "0"))
-            os.c_fflush f
-        return skipDict
-    return false
-
-fn uirCoreIsOrcMode(mm: str): bool =
-    return mm != nil && len(mm) == 3 &&
-           mm[0] == char('o') && mm[1] == char('r') && mm[2] == char('c')
-
-fn uirCoreEnsurePolicyDiag(diags: var Diagnostic[], filePath: str, msg: str) =
-    if hasError(diags):
-        return
-    var d: Diagnostic
-    d.severity = svError
-    d.filename = filePath
-    d.line = 1
-    d.col = 1
-    let needsRawPtrHint: bool = strContains(msg, "no-pointer policy:") || strContains(msg, "std policy:")
-    d.message = needsRawPtrHint ? rawPointerForbidMessage(msg) : msg
-    add(diags, d)
-
-fn uirCoreFileLikelyHasPointerSyntax(path: str): bool =
-    if path == nil || len(path) == 0:
-        return false
-    let content: str = stage1_readFile(path)
-    if content == nil || len(content) == 0:
-        return false
-    if strContains(content, "ptr_add(") || strContains(content, "load_ptr(") || strContains(content, "store_ptr("):
-        return true
-    if strContains(content, "alloc(") || strContains(content, "dealloc("):
-        return true
-    if strContains(content, "ptr[") || strContains(content, "ref["):
-        return true
-    var colonSeen: bool = false
-    var sawAssign: bool = false
-    for i in 0..<len(content):
-        let ch: char = content[i]
-        if ch == '\n' || ch == '\r':
-            colonSeen = false
-            sawAssign = false
-            continue
-        if ch == ':':
-            colonSeen = true
-            sawAssign = false
-            continue
-        if ch == '=':
-            sawAssign = true
-            continue
-        if ch == '*' && colonSeen && !sawAssign:
-            return true
-    return false
-
-fn uirCoreHasDefaultSpawnCall(content: str): bool =
-    if content == nil || len(content) < 6:
-        return false
-    let n: int32 = len(content)
-    for i in 0..(n - 6):
-        if content[i] == 's' &&
-           content[i + 1] == 'p' &&
-           content[i + 2] == 'a' &&
-           content[i + 3] == 'w' &&
-           content[i + 4] == 'n' &&
-           content[i + 5] == '(':
-            if i > 0:
-                let prev: char = content[i - 1]
-                if prev == '.' || prev == '_' ||
-                   (prev >= 'a' && prev <= 'z') ||
-                   (prev >= 'A' && prev <= 'Z') ||
-                   (prev >= '0' && prev <= '9'):
-                    continue
-            return true
-    return false
-
-fn uirCoreFileLikelyUsesRawSpawn(path: str): bool =
-    if path == nil || len(path) == 0:
-        return false
-    let content: str = stage1_readFile(path)
-    if content == nil || len(content) == 0:
-        return false
-    if !uirCoreHasDefaultSpawnCall(content):
-        return false
-    if strContains(content, "void*") || strContains(content, "void *"):
-        return true
-    if strContains(content, "fn_ptr") || strContains(content, "fnPtr"):
-        return true
-    return false
-
-fn uirCorePathLooksStdModule(path: str): bool =
-    if path == nil || len(path) == 0:
-        return false
-    if strContains(path, "src/std/") || strContains(path, "src\\std\\"):
-        return true
-    return false
-
-fn uirCorePathSyntheticOrStd(path: str): bool =
-    if path == nil || len(path) == 0:
-        return false
-    if path[0] == '<':
-        return true
-    if strContains(path, "/src/std/") || strContains(path, "\\src\\std\\"):
-        return true
-    if strContains(path, "/src/core/") || strContains(path, "\\src\\core\\"):
-        return true
-    if strContains(path, "/src/system/") || strContains(path, "\\src\\system\\"):
-        return true
-    return false
-
-fn uirCoreSkipSemStdDuplicateRelaxEnabled(): bool =
-    return uirCoreIsOne(getEnv "STAGE1_SKIP_SEM")
-
-fn uirCoreStage1ParseModeNormalized(): str =
-    var raw: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_STAGE1_PARSE_MODE", "")))
-    if raw == "":
-        raw = lowerAscii(backendStripSpaces(os.getEnvDefault("STAGE1_PARSE_MODE", "")))
-    if raw == "":
-        var fastRaw: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_FAST_DEV_PROFILE", "")))
-        if fastRaw == "0" || fastRaw == "false" || fastRaw == "no" || fastRaw == "off":
-            raw = "full"
-        elif fastRaw == "1" || fastRaw == "true" || fastRaw == "yes" || fastRaw == "on":
-            raw = "outline"
-    if raw == "":
-        let track: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_BUILD_TRACK", "dev")))
-        if track == "release":
-            raw = "full"
-        else:
-            raw = "outline"
-    if raw == "outline":
-        return "outline"
-    return "full"
-
-fn uirCoreStdNoPointerEnabled(): bool =
-    let stdNoPtrEnv: str = getEnv "STAGE1_STD_NO_POINTERS"
-    if uirCoreIsOne(stdNoPtrEnv):
-        return true
-    if stdNoPtrEnv == "0":
-        return false
-    let abiEnv: str = getEnv "ABI"
-    return abiEnv == "v2_noptr"
-
-fn uirCoreStage1StdNoPointerPrecheck(root: Node, inPath: str, diags: var Diagnostic[]): bool =
-    if !uirCoreStdNoPointerEnabled():
-        return false
-    var ctx: SemCtx
-    initSemCtxInPlace(ctx)
-    ctx.diags = diags
-    ctx.filename = inPath
-    var hits: int32 = semCheckStdNoPointerPolicy(ctx, root)
-    # Heuristic fallback must honor std policy exemptions; otherwise internal
-    # bridge modules (explicitly exempt) are rejected in strict bootstrap.
-    if hits <= 0 &&
-       uirCorePathLooksStdModule(inPath) &&
-       !semIsStdPointerPolicyExempt(inPath) &&
-       uirCoreFileLikelyHasPointerSyntax(inPath):
-        hits = 1
-    diags = ctx.diags
-    if hits > 0:
-        uirCoreEnsurePolicyDiag(diags, inPath, "std policy: pointer types are forbidden in standard library")
-    return hits > 0
-
-fn uirCoreStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Diagnostic[]): bool =
-    var ctx: SemCtx
-    initSemCtxInPlace(ctx)
-    ctx.diags = diags
-    ctx.filename = inPath
-    var hits: int32 = semCheckNoPointerNonCAbiPolicy(ctx, root)
-    # Heuristic fallback must use the same scope gate as semantic checks.
-    # Otherwise compiler-internal modules are flagged even when
-    # STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0.
-    if hits <= 0 &&
-       semPointerPolicyShouldCheckNonCAbi(inPath) &&
-       uirCoreFileLikelyHasPointerSyntax(inPath):
-        hits = 1
-    diags = ctx.diags
-    if hits > 0:
-        uirCoreEnsurePolicyDiag(diags, inPath, "no-pointer policy: pointer types are forbidden outside C ABI modules")
-    return hits > 0
 
 fn uirCoreCalleeCandidatesReset() =
     uirCoreCalleeCandidates = hashmaps.hashMapStrSeqIntInit(2048)
@@ -939,40 +159,6 @@ fn uirCoreProfileStep(p: UirCoreProfileState, name: str) =
     os.write(f, "\ttotal_ms=")
     os.writeLine(f, int64ToStr(totalMs))
     os.c_fflush f
-
-fn uirCoreGlobalObjTypesReset() =
-    uirCoreGlobalObjTypeIndex = hashmaps.hashMapStrIntInit(256)
-    uirCoreGlobalObjTypeNames.len = 0
-    uirCoreGlobalObjTypeNames.cap = 128
-    uirCoreGlobalObjTypeReady = true
-
-fn uirCoreGlobalTypeKeysReset() =
-    uirCoreGlobalTypeKeyIndex = hashmaps.hashMapStrIntInit(256)
-    uirCoreGlobalTypeKeyNames.len = 0
-    uirCoreGlobalTypeKeyNames.cap = 128
-    uirCoreGlobalTypeKeyReady = true
-
-fn uirCoreInlineObjFieldTypesReset() =
-    uirCoreInlineObjFieldTypeIndex = hashmaps.hashMapStrIntInit(512)
-    uirCoreInlineObjFieldTypeNames.len = 0
-    uirCoreInlineObjFieldTypeNames.cap = 256
-    uirCoreInlineObjFieldTypeReady = true
-
-fn uirCoreObjFieldTypeKeysReset() =
-    uirCoreObjFieldTypeKeyIndex = hashmaps.hashMapStrIntInit(1024)
-    uirCoreObjFieldTypeKeyNames.len = 0
-    uirCoreObjFieldTypeKeyNames.cap = 512
-    uirCoreObjFieldTypeKeyReady = true
-
-fn uirCoreTupleFieldIndicesReset() =
-    uirCoreTupleFieldIndex = hashmaps.hashMapStrIntInit(1024)
-    uirCoreTupleFieldIndexReady = true
-
-fn uirCoreObjAliasesReset() =
-    uirCoreObjAliasIndex = hashmaps.hashMapStrIntInit(512)
-    uirCoreObjAliasNames.len = 0
-    uirCoreObjAliasNames.cap = 256
-    uirCoreObjAliasReady = true
 
 fn uirCoreHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
     if key == nil || len(key) == 0 || m.mask == 0:
@@ -1097,516 +283,6 @@ fn uirCoreApplyOwnershipPhaseContract(module: UirCoreModule, skipOwnership: bool
         uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), highChecked, true, fallbackReason)
     return st
 
-fn uirCoreInlineObjFieldTypePut(parentType: str, fieldName: str, objTypeName: str) =
-    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || objTypeName == nil || len(objTypeName) == 0:
-        return
-    if (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parentType == "ProtoBuffer" && fieldName == "out":
-        echo("[backend] debugOverloadDot: put inline field parent='ProtoBuffer' field='out' objType='" + objTypeName + "'")
-    if !uirCoreInlineObjFieldTypeReady:
-        uirCoreInlineObjFieldTypesReset()
-    let key: str = parentType + "::" + fieldName
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreInlineObjFieldTypeIndex, key, found)
-    if idx >= 0 && idx < uirCoreInlineObjFieldTypeNames.len:
-        mbWriteStr(uirCoreInlineObjFieldTypeNames, idx, objTypeName)
-        return
-    if found:
-        if idx >= 0 && idx < uirCoreInlineObjFieldTypeNames.len:
-            mbWriteStr(uirCoreInlineObjFieldTypeNames, idx, objTypeName)
-        return
-    let newIdx: int32 = uirCoreInlineObjFieldTypeNames.len
-    add(uirCoreInlineObjFieldTypeNames, objTypeName)
-    hashmaps.hashMapStrIntPut(uirCoreInlineObjFieldTypeIndex, key, newIdx)
-
-fn uirCoreInlineObjFieldTypeGet(parentType: str, fieldName: str): str =
-    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || !uirCoreInlineObjFieldTypeReady:
-        return ""
-    let key: str = parentType + "::" + fieldName
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreInlineObjFieldTypeIndex, key, found)
-    if idx < 0 || idx >= uirCoreInlineObjFieldTypeNames.len:
-        return ""
-    return get_string(uirCoreInlineObjFieldTypeNames, idx)
-
-fn uirCoreObjFieldTypeKeyPut(parentType: str, fieldName: str, fieldTypeKey: str) =
-    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || fieldTypeKey == nil || len(fieldTypeKey) == 0:
-        return
-    if !uirCoreObjFieldTypeKeyReady:
-        uirCoreObjFieldTypeKeysReset()
-    let key: str = parentType + "::" + fieldName
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreObjFieldTypeKeyIndex, key, found)
-    if idx >= 0 && idx < uirCoreObjFieldTypeKeyNames.len:
-        mbWriteStr(uirCoreObjFieldTypeKeyNames, idx, fieldTypeKey)
-        return
-    if found:
-        if idx >= 0 && idx < uirCoreObjFieldTypeKeyNames.len:
-            mbWriteStr(uirCoreObjFieldTypeKeyNames, idx, fieldTypeKey)
-        return
-    let newIdx: int32 = uirCoreObjFieldTypeKeyNames.len
-    add(uirCoreObjFieldTypeKeyNames, fieldTypeKey)
-    hashmaps.hashMapStrIntPut(uirCoreObjFieldTypeKeyIndex, key, newIdx)
-
-fn uirCoreObjFieldTypeKeyGet(parentType: str, fieldName: str): str =
-    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || !uirCoreObjFieldTypeKeyReady:
-        return ""
-    let key: str = parentType + "::" + fieldName
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreObjFieldTypeKeyIndex, key, found)
-    if (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parentType == "ProtoBuffer" && fieldName == "out":
-        let foundCompat: bool = idx >= 0
-        echo("[backend] debugOverloadDot: keyGetCompat key='" + key + "' found=" + (foundCompat ? "1" : "0") +
-             " idx=" + intToStr(idx) + " namesLen=" + intToStr(uirCoreObjFieldTypeKeyNames.len))
-    if idx < 0 || idx >= uirCoreObjFieldTypeKeyNames.len:
-        return ""
-    return get_string(uirCoreObjFieldTypeKeyNames, idx)
-
-fn uirCoreTupleFieldIndexPut(tupleKey: str, fieldName: str, idx0: int32) =
-    if tupleKey == nil || len(tupleKey) == 0 || fieldName == nil || len(fieldName) == 0 || idx0 < 0:
-        return
-    if !uirCoreTupleFieldIndexReady:
-        uirCoreTupleFieldIndicesReset()
-    let key: str = tupleKey + "::" + fieldName
-    var found: bool = false
-    let existing: int32 = uirCoreHashMapStrIntGetCompat(uirCoreTupleFieldIndex, key, found)
-    if existing >= 0:
-        # Structural tuple types may share the same key without field labels. If a label maps to
-        # different indices, treat it as ambiguous.
-        if existing != idx0 && existing != -2:
-            hashmaps.hashMapStrIntPut(uirCoreTupleFieldIndex, key, -2)
-        return
-    hashmaps.hashMapStrIntPut(uirCoreTupleFieldIndex, key, idx0)
-
-fn uirCoreTupleFieldIndexGet(tupleKey: str, fieldName: str): int32 =
-    if tupleKey == nil || len(tupleKey) == 0 || fieldName == nil || len(fieldName) == 0 || !uirCoreTupleFieldIndexReady:
-        return -1
-    let key: str = tupleKey + "::" + fieldName
-    var found: bool = false
-    let v: int32 = uirCoreHashMapStrIntGetCompat(uirCoreTupleFieldIndex, key, found)
-    if v < 0:
-        return -1
-    return v
-
-fn uirCoreGlobalObjTypePut(name: str, objTypeName: str) =
-    if name == nil || len(name) == 0 || objTypeName == nil || len(objTypeName) == 0:
-        return
-    if !uirCoreGlobalObjTypeReady:
-        uirCoreGlobalObjTypesReset()
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreGlobalObjTypeIndex, name, found)
-    if idx >= 0 && idx < uirCoreGlobalObjTypeNames.len:
-        mbWriteStr(uirCoreGlobalObjTypeNames, idx, objTypeName)
-        return
-    if found:
-        if idx >= 0 && idx < uirCoreGlobalObjTypeNames.len:
-            mbWriteStr(uirCoreGlobalObjTypeNames, idx, objTypeName)
-        return
-    let newIdx: int32 = uirCoreGlobalObjTypeNames.len
-    add(uirCoreGlobalObjTypeNames, objTypeName)
-    hashmaps.hashMapStrIntPut(uirCoreGlobalObjTypeIndex, name, newIdx)
-
-fn uirCoreGlobalObjTypeGet(name: str): str =
-    if name == nil || len(name) == 0 || !uirCoreGlobalObjTypeReady:
-        return ""
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreGlobalObjTypeIndex, name, found)
-    if idx < 0 || idx >= uirCoreGlobalObjTypeNames.len:
-        return ""
-    return get_string(uirCoreGlobalObjTypeNames, idx)
-
-fn uirCoreGlobalTypeKeyPut(name: str, typeKey0: str) =
-    if name == nil || len(name) == 0 || typeKey0 == nil || len(typeKey0) == 0:
-        return
-    if !uirCoreGlobalTypeKeyReady:
-        uirCoreGlobalTypeKeysReset()
-    let typeKey: str = backendStripSpaces(typeKey0)
-    if typeKey == nil || len(typeKey) == 0:
-        return
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreGlobalTypeKeyIndex, name, found)
-    if idx >= 0 && idx < uirCoreGlobalTypeKeyNames.len:
-        mbWriteStr(uirCoreGlobalTypeKeyNames, idx, typeKey)
-        return
-    if found:
-        if idx >= 0 && idx < uirCoreGlobalTypeKeyNames.len:
-            mbWriteStr(uirCoreGlobalTypeKeyNames, idx, typeKey)
-        return
-    let newIdx: int32 = uirCoreGlobalTypeKeyNames.len
-    add(uirCoreGlobalTypeKeyNames, typeKey)
-    hashmaps.hashMapStrIntPut(uirCoreGlobalTypeKeyIndex, name, newIdx)
-
-fn uirCoreGlobalTypeKeyGet(name: str): str =
-    if name == nil || len(name) == 0 || !uirCoreGlobalTypeKeyReady:
-        return ""
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreGlobalTypeKeyIndex, name, found)
-    if idx < 0 || idx >= uirCoreGlobalTypeKeyNames.len:
-        return ""
-    return get_string(uirCoreGlobalTypeKeyNames, idx)
-
-fn uirCoreObjAliasPut(aliasName0: str, targetName0: str) =
-    if aliasName0 == nil || len(aliasName0) == 0 || targetName0 == nil || len(targetName0) == 0:
-        return
-    if !uirCoreObjAliasReady:
-        uirCoreObjAliasesReset()
-    let aliasName: str = backendStripSpaces(aliasName0)
-    let targetName: str = backendStripSpaces(targetName0)
-    if aliasName == nil || len(aliasName) == 0 || targetName == nil || len(targetName) == 0:
-        return
-    if (aliasName == targetName):
-        return
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreObjAliasIndex, aliasName, found)
-    if idx >= 0 && idx < uirCoreObjAliasNames.len:
-        mbWriteStr(uirCoreObjAliasNames, idx, targetName)
-        return
-    if found:
-        if idx >= 0 && idx < uirCoreObjAliasNames.len:
-            mbWriteStr(uirCoreObjAliasNames, idx, targetName)
-        return
-    let newIdx: int32 = uirCoreObjAliasNames.len
-    add(uirCoreObjAliasNames, targetName)
-    hashmaps.hashMapStrIntPut(uirCoreObjAliasIndex, aliasName, newIdx)
-
-fn uirCoreObjAliasGet(aliasName0: str): str =
-    if aliasName0 == nil || len(aliasName0) == 0 || !uirCoreObjAliasReady:
-        return ""
-    let aliasName: str = backendStripSpaces(aliasName0)
-    if aliasName == nil || len(aliasName) == 0:
-        return ""
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCoreObjAliasIndex, aliasName, found)
-    if idx < 0 || idx >= uirCoreObjAliasNames.len:
-        return ""
-    return get_string(uirCoreObjAliasNames, idx)
-
-fn uirCoreObjAliasCanon(name0: str): str =
-    if name0 == nil || len(name0) == 0:
-        return ""
-    if !uirCoreObjAliasReady:
-        return name0
-    var cur: str = name0
-    for i in 0..<8:
-        let next: str = uirCoreObjAliasGet(cur)
-        if next == nil || len(next) == 0 || (next == cur):
-            return cur
-        cur = next
-    return cur
-
-fn uirCoreObjLayoutName(module: UirCoreModule, name0: str): str =
-    if name0 == nil || len(name0) == 0:
-        return ""
-    let name: str = name0
-    if module != nil:
-        if uirCoreStrStartsWith(name, "seq_") && uirCoreHasObjType(module, "seq"):
-            return "seq"
-        if uirCoreStrStartsWith(name, "seq_fixed_") && uirCoreHasObjType(module, "seq"):
-            return "seq"
-        if uirCoreStrStartsWith(name, "Table_") && uirCoreHasObjType(module, "Table"):
-            return "Table"
-    return name
-
-fn uirCoreModuleIdForFile(filePath0: str): str =
-    let filePath: str = (filePath0 != nil) ? filePath0 : ""
-    if len(filePath) == 0:
-        return "0000000000000000"
-    return uirCoreU64ToHex(uirCoreFnv1a64(filePath))
-
-fn uirCoreDupFnBasesReset() =
-    uirCoreDupFnBases = hashsets.hashSetStrInit(256)
-    uirCoreDupFnBasesReady = true
-
-fn uirCoreDupFnBasesHas(baseName: str): bool =
-    if !uirCoreDupFnBasesReady:
-        return false
-    if baseName == nil || len(baseName) == 0:
-        return false
-    return hashsets.hashSetStrHas(uirCoreDupFnBases, baseName)
-
-fn uirCoreMaybeMangleDupFnBase(baseName0: str, originFile0: str): str =
-    let baseName: str = (baseName0 != nil) ? baseName0 : ""
-    if len(baseName) == 0:
-        return ""
-    if (baseName == "main"):
-        return baseName
-    if !uirCoreDupFnBasesHas(baseName):
-        return baseName
-    let originFile: str = (originFile0 != nil) ? originFile0 : ""
-    return baseName + "__cheng_mod_" + uirCoreModuleIdForFile(originFile)
-
-fn uirCoreCollectGenericParamNames(generics: Node): str[] =
-    var out: str[4]
-    if generics == nil || generics.kind == nkEmpty:
-        return out
-    for i in 0..<kidCount(generics):
-        let n0: Node = kid(generics, i)
-        if n0 == nil || n0.kind == nkEmpty:
-            continue
-        var nameNode: Node = nil
-        if n0.kind == nkIdentDefs && kidCount(n0) > 0:
-            nameNode = kid(n0, 0)
-        elif n0.kind == nkIdent || n0.kind == nkSymbol:
-            nameNode = n0
-        elif kidCount(n0) > 0:
-            nameNode = kid(n0, 0)
-        if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
-            let nm: str = backendStripSpaces(plainName(nameNode))
-            if nm != nil && len(nm) > 0:
-                add(out, nm)
-    return out
-
-fn uirCoreTypeNodeHasGenericParam(typeNode0: Node, genericNames: str[]): bool =
-    if typeNode0 == nil || genericNames.len == 0:
-        return false
-    var stack: Node[16]
-    add(stack, typeNode0)
-    while stack.len > 0:
-        let n: Node = stack[stack.len - 1]
-        stack.len = stack.len - 1
-        if n == nil || n.kind == nkEmpty:
-            continue
-        if n.kind == nkIdent || n.kind == nkSymbol:
-            let nm: str = backendStripSpaces(plainName(n))
-            if nm != nil && len(nm) > 0:
-                for gi in 0..<genericNames.len:
-                    if (nm == genericNames[gi]):
-                        return true
-        for ki in 0..<kidCount(n):
-            add(stack, kid(n, ki))
-    return false
-
-fn uirCoreFuncSigHasUnresolvedGenerics(fnNode: Node): bool =
-    if fnNode == nil || kidCount(fnNode) <= 4:
-        return false
-    let genNode: Node = kid(fnNode, 4)
-    if genNode == nil || genNode.kind == nkEmpty || kidCount(genNode) == 0:
-        return false
-    let genNames: str[] = uirCoreCollectGenericParamNames(genNode)
-    if genNames.len == 0:
-        return false
-    let retNode: Node = (kidCount(fnNode) > 2) ? kid(fnNode, 2) : nil
-    if retNode != nil && retNode.kind != nkEmpty:
-        if uirCoreTypeNodeHasGenericParam(retNode, genNames):
-            return true
-    let paramsNode: Node = (kidCount(fnNode) > 1) ? kid(fnNode, 1) : nil
-    if paramsNode != nil && paramsNode.kind == nkFormalParams:
-        for pi in 0..<kidCount(paramsNode):
-            let defs: Node = kid(paramsNode, pi)
-            if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 1:
-                let tn: Node = kid(defs, 1)
-                if tn != nil && tn.kind != nkEmpty:
-                    if uirCoreTypeNodeHasGenericParam(tn, genNames):
-                        return true
-    return false
-
-fn uirCoreComputeDuplicateFnBases(root: Node, overloaded: hashsets.HashSetStr* = nil): hashsets.HashSetStr =
-    var dup: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
-    if root == nil:
-        return dup
-    var seenNames: str[]
-    var seenCounts: int32[]
-    var queue: Node[]
-    add(queue, root)
-    while queue.len > 0:
-        let n: Node = queue[queue.len - 1]
-        queue.len = queue.len - 1
-        if n == nil || n.kind == nkEmpty:
-            continue
-        if n.kind == nkStmtList || n.kind == nkModule:
-            for i in 0..<kidCount(n):
-                add(queue, kid(n, i))
-            continue
-        if n.kind != nkFnDecl && n.kind != nkIteratorDecl:
-            continue
-        if kidCount(n) > 3:
-            let body: Node = kid(n, 3)
-            # Forward decls (no body, no importc) should not count as duplicates.
-            if body == nil || body.kind == nkEmpty:
-                continue
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
-            continue
-        let nameNode: Node = kid(n, 0)
-        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
-            continue
-        let rawName: str = backendStripSpaces(plainName(nameNode))
-        if rawName == nil || len(rawName) == 0 || (rawName == "main"):
-            continue
-        # Overloaded base names still need cross-module duplicate detection.
-        # Otherwise different modules that share the same overloaded signature
-        # can collide at link time (same base + same __cheng_sig_* hash).
-        var idx: int32 = -1
-        for ci in 0..<seenNames.len:
-            if seenNames[ci] == rawName:
-                idx = ci
-                break
-        if idx < 0:
-            add(seenNames, rawName)
-            add(seenCounts, 1)
-        else:
-            let next: int32 = seenCounts[idx] + 1
-            seenCounts[idx] = next
-            if next > 1:
-                hashsets.hashSetStrAdd(dup, rawName)
-    return dup
-
-fn uirCoreDupGlobalNamesReset() =
-    uirCoreDupGlobalNames = hashsets.hashSetStrInit(256)
-    uirCoreDupGlobalNamesReady = true
-
-fn uirCoreDupGlobalNamesHas(baseName: str): bool =
-    if !uirCoreDupGlobalNamesReady:
-        return false
-    if baseName == nil || len(baseName) == 0:
-        return false
-    return hashsets.hashSetStrHas(uirCoreDupGlobalNames, baseName)
-
-fn uirCoreMaybeMangleDupGlobalName(baseName0: str, originFile0: str): str =
-    let baseName: str = (baseName0 != nil) ? baseName0 : ""
-    if len(baseName) == 0:
-        return ""
-    if !uirCoreDupGlobalNamesHas(baseName):
-        return baseName
-    let originFile: str = (originFile0 != nil) ? originFile0 : ""
-    return baseName + "__cheng_mod_" + uirCoreModuleIdForFile(originFile)
-
-fn uirCoreComputeDuplicateGlobalNames(root: Node): hashsets.HashSetStr =
-    var dup: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
-    if root == nil:
-        return dup
-    var seenNames: str[]
-    var seenCounts: int32[]
-    var queue: Node[]
-    add(queue, root)
-    while queue.len > 0:
-        let n: Node = queue[queue.len - 1]
-        queue.len = queue.len - 1
-        if n == nil || n.kind == nkEmpty:
-            continue
-        if n.kind == nkStmtList || n.kind == nkModule:
-            for i in 0..<kidCount(n):
-                add(queue, kid(n, i))
-            continue
-        if n.kind != nkVar && n.kind != nkLet && n.kind != nkConst:
-            continue
-        var pat: Node = nil
-        if kidCount(n) > 0:
-            pat = kid(n, 0)
-        var nameNode: Node = pat
-        if pat != nil && pat.kind == nkPattern && kidCount(pat) > 0:
-            nameNode = kid(pat, 0)
-        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
-            continue
-        let rawName: str = backendStripSpaces(plainName(nameNode))
-        if rawName == nil || len(rawName) == 0:
-            continue
-        var idx: int32 = -1
-        for ci in 0..<seenNames.len:
-            if seenNames[ci] == rawName:
-                idx = ci
-                break
-        if idx < 0:
-            add(seenNames, rawName)
-            add(seenCounts, 1)
-        else:
-            let next: int32 = seenCounts[idx] + 1
-            seenCounts[idx] = next
-            if next > 1:
-                hashsets.hashSetStrAdd(dup, rawName)
-    return dup
-
-fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): BlockBuilder =
-    var b: BlockBuilder
-    new b
-    b.env = env
-    b.module = module
-    b.func = func
-    b.currentLabel = "entry"
-    b.currentStmts = []
-    b.labelCounter = 0
-    b.objCursor = 0
-    b.loopStack = []
-    b.deferStack = []
-    return b
-
-fn blockBuilderNextLabel(b: BlockBuilder, prefix: str): str =
-    let id: int32 = b.labelCounter
-    b.labelCounter = b.labelCounter + 1
-    return prefix + intToStr(id)
-
-fn blockBuilderStart(b: BlockBuilder, label: str) =
-    b.currentLabel = label
-    b.currentStmts = []
-
-fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
-    # Copy stmt buffer so finished blocks don't alias the builder's scratch seq.
-    # (Without this, later appends can realloc/free the shared buffer.)
-    var stmtsCopy: UirCoreStmt[]
-    if b.currentStmts.len > 0:
-        stmtsCopy.cap = b.currentStmts.len
-        for si in 0..<b.currentStmts.len:
-            add(stmtsCopy, b.currentStmts[si])
-    let blk: UirCoreBlock = uirCoreBlockWithStmts(b.currentLabel, stmtsCopy, term)
-    let dbgFunc: UirCoreFunc = b.func
-    let dbgName: str = (dbgFunc != nil) ? dbgFunc.name : ""
-    if (os.getEnvDefault("BACKEND_DEBUG_MIR_FINISH", "") == dbgName):
-        let curLen: int32 = b.currentStmts.len
-        let blkLen: int32 = blk.stmts.len
-        echo("[backend] dbgFinish: fn=" + dbgName + " label=" + b.currentLabel +
-             " cur.len=" + intToStr(curLen) + " blk.len=" + intToStr(blkLen))
-        if curLen > 0:
-            let s0: UirCoreStmt = b.currentStmts[0]
-            echo("[backend] dbgFinish: cur0.kind=" + intToStr(int32(s0.kind)) +
-                 " slot=" + intToStr(s0.slot))
-        if blkLen > 0:
-            let s1: UirCoreStmt = blk.stmts[0]
-            echo("[backend] dbgFinish: blk0.kind=" + intToStr(int32(s1.kind)) +
-                 " slot=" + intToStr(s1.slot))
-    uirCoreAddBlock(b.func, blk)
-    b.currentLabel = ""
-    b.currentStmts = []
-
-fn blockBuilderPushLoop(b: BlockBuilder, breakLabel: str, continueLabel: str) =
-    var ctx: LoopContext
-    new ctx
-    ctx.breakLabel = breakLabel
-    ctx.continueLabel = continueLabel
-    ctx.deferDepth = b.deferStack.len
-    add(b.loopStack, ctx)
-
-fn blockBuilderPopLoop(b: BlockBuilder): LoopContext =
-    if b.loopStack.len == 0:
-        return nil
-    let idx: int32 = b.loopStack.len - 1
-    let ctx: LoopContext = b.loopStack[idx]
-    b.loopStack.len = idx
-    return ctx
-
-fn blockBuilderPeekLoop(b: BlockBuilder): LoopContext =
-    if b.loopStack.len == 0:
-        return nil
-    return b.loopStack[b.loopStack.len - 1]
-
-fn blockBuilderPushDefer(b: BlockBuilder) =
-    if b == nil:
-        return
-    var frame: DeferFrame
-    new frame
-    frame.bodies = []
-    add(b.deferStack, frame)
-
-fn blockBuilderPopDefer(b: BlockBuilder): DeferFrame =
-    if b == nil || b.deferStack.len == 0:
-        return nil
-    let idx: int32 = b.deferStack.len - 1
-    let frame: DeferFrame = b.deferStack[idx]
-    b.deferStack.len = idx
-    return frame
-
-fn blockBuilderPeekDefer(b: BlockBuilder): DeferFrame =
-    if b == nil || b.deferStack.len == 0:
-        return nil
-    return b.deferStack[b.deferStack.len - 1]
-
 fn emitDeferFrames(b: BlockBuilder, frames: DeferFrame[]): Result[bool] =
     if frames.buffer == nil || frames.len == 0:
         return Ok[bool](false)
@@ -1640,185 +316,6 @@ fn blockBuilderEmitDefers(b: BlockBuilder, minDepth: int32): Result[bool] =
         let i = __for_start_i - __for_rev_i
         add(frames, b.deferStack[i])
     return emitDeferFrames(b, frames)
-
-fn blockBuilderNextTemp(b: BlockBuilder, prefix: str): str =
-    return blockBuilderNextLabel(b, prefix)
-
-fn isControlExpr(n: Node): bool =
-    var node: Node = n
-    while node != nil && node.kind == nkPar && kidCount(node) > 0:
-        node = kid(node, 0)
-    if node == nil:
-        return false
-    if node.kind == nkIf:
-        return true
-    if node.kind == nkCase:
-        return true
-    if node.kind == nkInfix && kidCount(node) >= 3:
-        let opNode: Node = kid(node, 0)
-        let op: str = backendOpName(opNode)
-        if op == "&&" || op == "||":
-            return true
-    return false
-
-fn isImplicitReturnExpr(n: Node): bool =
-    if n == nil:
-        return false
-    var node: Node = n
-    while node != nil && node.kind == nkPar && kidCount(node) > 0:
-        node = kid(node, 0)
-    if node == nil:
-        return false
-    case node.kind
-    of nkCall, nkInfix, nkPrefix, nkPostfix, nkDotExpr, nkBracketExpr,
-       nkCurlyExpr, nkTupleLit, nkSeqLit, nkTableLit,
-       nkIdent, nkSymbol,
-       nkIntLit, nkFloatLit, nkStrLit, nkCharLit, nkBoolLit, nkNilLit:
-        return true
-    return false
-
-fn uirCoreAddStrPtr(items: str[]*, value: str) =
-    if items == nil:
-        return
-    add(items, value)
-
-fn mbWrite[T](seqInst: var T[], idx: int32, val: T) =
-    if idx < 0 || idx >= seqInst.len:
-        panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
-
-fn mbWriteBool(seqInst: var bool[], idx: int32, val: bool) =
-    if idx < 0 || idx >= seqInst.len:
-        panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
-
-fn mbWriteStr(seqInst: var str[], idx: int32, val: str) =
-    if idx < 0 || idx >= seqInst.len:
-        panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
-
-fn mbWriteObjLocal(seqInst: var UirCoreObjLocal[], idx: int32, val: UirCoreObjLocal) =
-    if idx < 0 || idx >= seqInst.len:
-        panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
-
-fn mbWriteObjType(seqInst: var UirCoreObjType[], idx: int32, val: UirCoreObjType) =
-    if idx < 0 || idx >= seqInst.len:
-        panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
-
-fn mbWriteGlobal(seqInst: var UirCoreGlobal[], idx: int32, val: UirCoreGlobal) =
-    if idx < 0 || idx >= seqInst.len:
-        panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
-
-fn mbWriteFunc(seqInst: var UirCoreFunc[], idx: int32, val: UirCoreFunc) =
-    if idx < 0 || idx >= seqInst.len:
-        panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
-
-fn localEnvNew(): LocalEnv =
-    var env: LocalEnv
-    new env
-    env.names = []
-    env.types = []
-    env.typeKeys = []
-    env.callTargets = []
-    env.active = []
-    env.scopeMarks = []
-    env.nameIndex = hashmaps.hashMapStrIntInit(64)
-    env.prevSlots = []
-    return env
-
-fn localEnvPushScope(env: LocalEnv) =
-    if env == nil:
-        return
-    add(env.scopeMarks, env.names.len)
-
-fn localEnvPopScope(env: LocalEnv) =
-    if env == nil || env.scopeMarks.len == 0:
-        return
-    let mark: int32 = env.scopeMarks[env.scopeMarks.len - 1]
-    env.scopeMarks.len = env.scopeMarks.len - 1
-    if mark < 0:
-        return
-    let __for_start_slot = env.names.len - 1
-    for __for_rev_slot in 0..(__for_start_slot - (mark)):
-        let slot = __for_start_slot - __for_rev_slot
-        if slot >= 0 && slot < env.names.len && slot < env.prevSlots.len:
-            let nm: str = env.names[slot]
-            let prev: int32 = env.prevSlots[slot]
-            let restore: int32 = (prev >= 0) ? (prev + 1) : 0
-            hashmaps.hashMapStrIntPut(env.nameIndex, nm, restore)
-    for i in mark..<env.active.len:
-        mbWriteBool(env.active, i, false)
-
-fn localIndex(env: LocalEnv, name: str): int32 =
-    if env == nil:
-        return -1
-    if name == nil || len(name) == 0:
-        return -1
-    let query: str = backendStripSpacesMaybe(name)
-    if query == nil || len(query) == 0:
-        return -1
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, query)
-    if idxPlus1 <= 0:
-        return -1
-    let idx: int32 = idxPlus1 - 1
-    if env.active.len == env.names.len && idx < env.active.len && !env.active[idx]:
-        return -1
-    return idx
-
-fn localAdd(env: LocalEnv, name: str, ty: UirCoreType): int32 =
-    if env == nil:
-        return -1
-    let nm: str = backendStripSpaces(name)
-    if (getEnv "BACKEND_DEBUG_LET" == "1") && (nm == "snapRes"):
-        let mark: int32 = (env.scopeMarks.len > 0) ? env.scopeMarks[env.scopeMarks.len - 1] : -1
-        echo("[backend] debugLocalAdd: name='snapRes' slot=" + intToStr(env.names.len) +
-             " scopeMarks=" + intToStr(env.scopeMarks.len) + " topMark=" + intToStr(mark))
-    trackLexString void*(nm)
-    let prevPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, nm)
-    let prevSlot: int32 = (prevPlus1 > 0) ? (prevPlus1 - 1) : -1
-    add(env.names, nm)
-    add(env.types, ty)
-    add(env.typeKeys, "")
-    add(env.callTargets, "")
-    add(env.active, true)
-    add(env.prevSlots, prevSlot)
-    hashmaps.hashMapStrIntPut(env.nameIndex, nm, env.names.len)
-    return env.names.len - 1
-
-fn localType(env: LocalEnv, idx: int32): UirCoreType =
-    if env == nil || idx < 0 || idx >= env.types.len:
-        return uirCoreTypeI32()
-    return env.types[idx]
-
-fn localTypeKey(env: LocalEnv, idx: int32): str =
-    if env == nil || idx < 0 || idx >= env.typeKeys.len:
-        return ""
-    return env.typeKeys[idx]
-
-fn localCallTarget(env: LocalEnv, idx: int32): str =
-    if env == nil || idx < 0 || idx >= env.callTargets.len:
-        return ""
-    return env.callTargets[idx]
-
-fn localSetTypeKey(env: LocalEnv, idx: int32, key: str) =
-    if env == nil || key == nil || len(key) == 0:
-        return
-    if idx < 0 || idx >= env.typeKeys.len:
-        return
-    trackLexString void*(key)
-    mbWriteStr(env.typeKeys, idx, key)
-
-fn localSetCallTarget(env: LocalEnv, idx: int32, target: str) =
-    if env == nil || target == nil || len(target) == 0:
-        return
-    if idx < 0 || idx >= env.callTargets.len:
-        return
-    trackLexString void*(target)
-    mbWriteStr(env.callTargets, idx, target)
 
 fn alignUpPow2(value: int32, alignPow2: int32): int32 =
     if alignPow2 <= 0:
@@ -2910,88 +1407,6 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
         os.c_fflush fDbgDone
     return reachable
 
-fn uirCoreFuncSigMarker(): str =
-    return "__cheng_sig_"
-
-fn uirCoreFuncSigInput(retKey0: str, paramKeys: str[]): str =
-    var retKey: str = retKey0
-    if retKey == nil:
-        retKey = ""
-    var out: str = retKey + "|"
-    for i in 0..<paramKeys.len:
-        let pk0: str = paramKeys[i]
-        let pk: str = (pk0 != nil) ? pk0 : ""
-        out = out + pk + ";"
-    return out
-
-fn uirCoreFuncSigId(retKey: str, paramKeys: str[]): str =
-    return uirCoreU64ToHex(uirCoreFnv1a64(uirCoreFuncSigInput(retKey, paramKeys)))
-
-fn uirCoreMangleOverloadName(baseSym: str, retKey: str, paramKeys: str[]): str =
-    return baseSym + uirCoreFuncSigMarker() + uirCoreFuncSigId(retKey, paramKeys)
-
-fn uirCoreComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
-    # Stage1 monomorphize may emit multiple functions with the same base name (e.g. `len`)
-    # but different signatures. The MIR module requires globally-unique function symbols,
-    # so we precompute which base names are overloaded.
-    var overloaded: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
-    var seenNames: str[]
-    var firstSigs: str[]
-
-    var queue: Node[256]
-    add(queue, root)
-    while queue.len > 0:
-        let n: Node = queue[queue.len - 1]
-        queue.len = queue.len - 1
-        if n == nil || n.kind == nkEmpty:
-            continue
-        if n.kind == nkStmtList || n.kind == nkModule:
-            for i in 0..<kidCount(n):
-                add(queue, kid(n, i))
-            continue
-        if (n.kind != nkFnDecl && n.kind != nkIteratorDecl) || kidCount(n) == 0:
-            continue
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
-            continue
-        let nameNode: Node = kid(n, 0)
-        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
-            continue
-        let rawName: str = backendStripSpaces(plainName(nameNode))
-        let baseId: str = rawName
-        if baseId == nil || len(baseId) == 0:
-            continue
-
-        let paramsNode: Node = kid(n, 1)
-        var paramKeys: str[]
-        if paramsNode != nil && paramsNode.kind == nkFormalParams:
-            for pi in 0..<kidCount(paramsNode):
-                let defs: Node = kid(paramsNode, pi)
-                if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 1:
-                    let tn: Node = kid(defs, 1)
-                    let pk: str = (tn != nil) ? typeKey(tn) : ""
-                    add(paramKeys, pk)
-
-        let retNode: Node = kid(n, 2)
-        var retKey: str = ""
-        if retNode != nil && retNode.kind != nkEmpty:
-            retKey = typeKey(retNode)
-        let sigId: str = uirCoreFuncSigId(retKey, paramKeys)
-
-        var prevIdx: int32 = -1
-        for si in 0..<seenNames.len:
-            if seenNames[si] == baseId:
-                prevIdx = si
-                break
-        if prevIdx < 0:
-            add(seenNames, baseId)
-            add(firstSigs, sigId)
-            continue
-        if prevIdx < firstSigs.len:
-            let prevSig: str = firstSigs[prevIdx]
-            if !(prevSig == sigId):
-                hashsets.hashSetStrAdd(overloaded, baseId)
-    return overloaded
-
 fn uirCoreMaybeEnqueueMissingRoutine(mod: UirCoreModule, declIndex: hashmaps.HashMapStrInt,
                                  seen: hashsets.HashSetStr*, queue: str[]*, name0: str) =
     if mod == nil || seen == nil || queue == nil || name0 == nil || len(name0) == 0:
@@ -3737,6 +2152,10 @@ fn uirCore_ensureGlobalIndexCache(module: UirCoreModule) =
         uirCore_buildGlobalIndexCache(module)
         return
     if uirCore_globalIndex_cache_len < module.globals.len:
+        let cap: int32 = uirCore_globalIndex_cache.states.len
+        if cap > 0 && module.globals.len >= cap - (cap / 4):
+            uirCore_buildGlobalIndexCache(module)
+            return
         for i in uirCore_globalIndex_cache_len..<module.globals.len:
             let g: UirCoreGlobal = module.globals[i]
             if g.name != nil && len(g.name) > 0:
@@ -3751,6 +2170,8 @@ fn moduleGlobalIndex(module: UirCoreModule, name: str): int32 =
         if uirCore_globalIndex_cache_ready && uirCore_globalIndex_cache_module == module:
             var found: bool = false
             let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCore_globalIndex_cache, name, found)
+            if !found:
+                return -1
             if found && idx >= 0 && idx < module.globals.len:
                 let g0: UirCoreGlobal = module.globals[idx]
                 if (g0.name == name):
@@ -4010,7 +2431,7 @@ fn seqFixedInitInfo(typeNode0: Node): SeqFixedInit =
 fn emitSeqFixedReserveInitToPtr(b: BlockBuilder, dstBasePtr: UirCoreExpr, info: SeqFixedInit): Result[bool] =
     if b == nil || b.module == nil || b.func == nil:
         return Err[bool]("uirCore_builder: seq_fixed init missing builder/module")
-    # Stage0 compatibility: avoid chained dot access through a ref-typed field.
+    # Pull ref fields into locals once so nil/empty checks stay explicit.
     let elemTypeNode: Node = info.elemType
     let capExprNode: Node = info.capExpr
     if elemTypeNode == nil || capExprNode == nil || capExprNode.kind == nkEmpty:
@@ -4306,22 +2727,10 @@ fn inferInlineObjFieldTypeName(module: UirCoreModule, parent: UirCoreObjType, fi
     let declaredKey: str = uirCoreObjFieldTypeKeyGet(parent.name, fieldName)
     if (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parent.name == "ProtoBuffer" && fieldName == "out":
         let lookupKeyDbg: str = parent.name + "::" + fieldName
-        var scanFound: bool = false
-        if uirCoreObjFieldTypeKeyIndex.keys.len > 0:
-            for si in 0..<uirCoreObjFieldTypeKeyIndex.keys.len:
-                if uirCoreObjFieldTypeKeyIndex.states[si] != uint8(1):
-                    continue
-                let kk: str = uirCoreObjFieldTypeKeyIndex.keys[si]
-                if kk == lookupKeyDbg:
-                    scanFound = true
-                    let vi: int32 = uirCoreObjFieldTypeKeyIndex.vals[si]
-                    var vv: str = ""
-                    if vi >= 0 && vi < uirCoreObjFieldTypeKeyNames.len:
-                        vv = get_string(uirCoreObjFieldTypeKeyNames, vi)
-                    echo("[backend] debugOverloadDot: scan fieldKeyMap key='" + lookupKeyDbg + "' slot=" +
-                         intToStr(si) + " valIdx=" + intToStr(vi) + " val='" + vv + "'")
-                    break
-        if !scanFound:
+        let scanEntry: str = uirCoreObjFieldTypeKeyDebugEntry(parent.name, fieldName)
+        if scanEntry != nil && len(scanEntry) > 0:
+            echo("[backend] debugOverloadDot: scan fieldKeyMap key='" + lookupKeyDbg + "' " + scanEntry)
+        else:
             echo("[backend] debugOverloadDot: scan fieldKeyMap key='" + lookupKeyDbg + "' missing")
         echo("[backend] debugOverloadDot: lookupKey len=" + intToStr(len(lookupKeyDbg)) +
              " parentLen=" + intToStr(len(parent.name)) + " fieldLen=" + intToStr(len(fieldName)))
@@ -4555,7 +2964,7 @@ fn lowerDotAccess(b: BlockBuilder, dotNode: Node): Result[DotAccess] =
             if len(objTypeName) > 0:
                 basePtrRes = Ok[UirCoreExpr](uirCoreLocal(slot))
             else:
-                # Stage0/early stage1 pipelines may lack typeCache on locals; fall back to local type keys.
+                # Some bootstrap pipelines may lack typeCache on locals; fall back to local type keys.
                 var key: str = localTypeKey(b.env, slot)
                 if uirCoreStrStartsWith(key, "ref_"):
                     key = str(ptr_add(void*(key), 4))
@@ -5344,7 +3753,7 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: UirCoreExpr): 
                         let canonOk: str = (canon3 != nil && len(canon3) > 0) ? canon3 : ""
                         echo("[backend] debugNestedCtorLead: ctor=" + callName + " field=" + fieldName +
                              " key3='" + key3 + "' canon='" + canonOk + "' objNm='" + objNm + "'" +
-                             " aliasReady=" + (uirCoreObjAliasReady ? "1" : "0"))
+                             " aliasReady=" + (uirCoreObjAliasReadyFlag() ? "1" : "0"))
                 if len(objNm) == 0:
                     let line3: str = (valNode != nil) ? intToStr(valNode.pos.line) : "0"
                     let col3: str = (valNode != nil) ? intToStr(valNode.pos.col) : "0"
@@ -13606,448 +12015,6 @@ fn lowerStmtList(b: BlockBuilder, listNode: Node): Result[bool] =
         localEnvPopScope(b.env)
     return Ok[bool](false)
 
-fn uirCoreParseImportcAnnotation(ann: Node, hasImportc: bool*, importcLinkName: str*): bool =
-    if ann == nil || ann.kind != nkAnnotation || kidCount(ann) == 0:
-        return false
-    let annName: str = backendStripSpaces(plainName(kid(ann, 0)))
-    if annName != "importc":
-        return false
-    if kidCount(ann) < 2:
-        return false
-    let arg0: Node = kid(ann, 1)
-    if arg0 == nil || arg0.kind != nkStrLit:
-        return false
-    if hasImportc != nil:
-        *hasImportc = true
-    if importcLinkName != nil:
-        *importcLinkName = arg0.strVal
-    return true
-
-fn uirCoreParseImportcLinkName(funcNode: Node, hasImportc: bool*, importcLinkName: str*) =
-    if hasImportc != nil:
-        *hasImportc = false
-    if importcLinkName != nil:
-        *importcLinkName = ""
-    if funcNode == nil:
-        return
-    for ki in 0..<kidCount(funcNode):
-        let kidNode: Node = kid(funcNode, ki)
-        if kidNode != nil:
-            if kidNode.kind == nkAnnotation:
-                if uirCoreParseImportcAnnotation(kidNode, hasImportc, importcLinkName):
-                    return
-            elif kidNode.kind == nkPragma:
-                for pi in 0..<kidCount(kidNode):
-                    let ann2: Node = kid(kidNode, pi)
-                    if uirCoreParseImportcAnnotation(ann2, hasImportc, importcLinkName):
-                        return
-
-fn uirCoreStage1AddDiag(diags: Diagnostic[]*, n: Node, msg: str) =
-    if diags == nil:
-        return
-    var filePath: str = ""
-    var line: int32 = 1
-    var col: int32 = 1
-    if n != nil:
-        if n.strVal != nil && len(n.strVal) > 0:
-            filePath = n.strVal
-        line = n.pos.line
-        col = n.pos.col
-    addDiag(diags, svError, filePath, line, col, msg)
-
-fn uirCoreTupleTypeCoreNode(typeNode0: Node): Node =
-    var typeNode: Node = typeNode0
-    while typeNode != nil && typeNode.kind == nkPar && kidCount(typeNode) > 0:
-        typeNode = kid(typeNode, 0)
-    if typeNode != nil && typeNode.kind == nkVarTy && kidCount(typeNode) > 0:
-        typeNode = kid(typeNode, 0)
-    return typeNode
-
-fn uirCoreTupleTypeElemCount(typeNode0: Node): int32 =
-    let typeNode: Node = uirCoreTupleTypeCoreNode(typeNode0)
-    if typeNode == nil || typeNode.kind != nkTupleTy:
-        return 0
-    return kidCount(typeNode)
-
-fn uirCoreTupleTypeElemType(typeNode0: Node, idx: int32): Node =
-    let typeNode: Node = uirCoreTupleTypeCoreNode(typeNode0)
-    if typeNode == nil || typeNode.kind != nkTupleTy:
-        return nil
-    if idx < 0 || idx >= kidCount(typeNode):
-        return nil
-    let elem: Node = kid(typeNode, idx)
-    if elem == nil:
-        return nil
-    if elem.kind == nkIdentDefs:
-        if kidCount(elem) < 2:
-            return nil
-        return kid(elem, 1)
-    return elem
-
-fn uirCoreFfiOutPtrFindOrderByPos(outPhysPos: int32[], pos: int32): int32 =
-    for i in 0..<outPhysPos.len:
-        if outPhysPos[i] == pos:
-            return i
-    return -1
-
-fn uirCoreParseFfiOutPtrArgIndex(argNode: Node, outIdx: int32*): bool =
-    if outIdx != nil:
-        *outIdx = -1
-    if argNode == nil:
-        return false
-    var raw: str = backendStripSpaces(plainName(argNode))
-    if (raw == nil || len(raw) == 0) && argNode.kind == nkStrLit:
-        raw = backendStripSpaces(argNode.strVal)
-    if raw == nil || len(raw) < 4:
-        return false
-    if !strHasPrefix(raw, "arg"):
-        return false
-    var value: int32 = 0
-    for i in 3..<len(raw):
-        let ch: char = raw[i]
-        if ch < '0' || ch > '9':
-            return false
-        value = value * 10 + (int32(ch) - int32('0'))
-    if outIdx != nil:
-        *outIdx = value
-    return true
-
-fn uirCoreClonePragmasFiltered(pragmas: Node, dropImportc: bool, dropFfiOutPtrs: bool): Node =
-    if pragmas == nil || pragmas.kind != nkPragma:
-        return emptyNode(zeroPos())
-    var outPragmas: Node = newNode(nkPragma, pragmas.pos)
-    for i in 0..<kidCount(pragmas):
-        let ann: Node = kid(pragmas, i)
-        if ann != nil && ann.kind == nkAnnotation && kidCount(ann) > 0:
-            let annName: str = backendStripSpaces(plainName(kid(ann, 0)))
-            if dropImportc && annName == "importc":
-                continue
-            if dropFfiOutPtrs && annName == "ffi_out_ptrs":
-                continue
-        addSon(outPragmas, cloneTree(ann))
-    if kidCount(outPragmas) == 0:
-        return emptyNode(pragmas.pos)
-    return outPragmas
-
-fn uirCoreMakeParamDef(name: str, typeNode: Node, pos: SourcePos): Node =
-    var defs: Node = newNode(nkIdentDefs, pos)
-    addSon(defs, newIdent(name, pos))
-    if typeNode != nil:
-        addSon(defs, cloneTree(typeNode))
-    else:
-        addSon(defs, emptyNode(pos))
-    addSon(defs, emptyNode(pos))
-    return defs
-
-fn uirCoreRewriteFfiOutPtrFunc(n: Node, synthId: int32*, diags: Diagnostic[]*, outNodes: Node[]*): bool =
-    if outNodes == nil:
-        return false
-    if n == nil || (n.kind != nkFnDecl && n.kind != nkIteratorDecl):
-        add(outNodes, n)
-        return false
-
-    var pragmas: Node = nil
-    if kidCount(n) > 5:
-        pragmas = kid(n, 5)
-    if pragmas == nil || pragmas.kind != nkPragma:
-        add(outNodes, n)
-        return false
-
-    var importcAnn: Node = nil
-    var outPtrAnn: Node = nil
-    var importcLinkNameRaw: str = ""
-    for i in 0..<kidCount(pragmas):
-        let ann: Node = kid(pragmas, i)
-        if ann == nil || ann.kind != nkAnnotation || kidCount(ann) == 0:
-            continue
-        let annName: str = backendStripSpaces(plainName(kid(ann, 0)))
-        var hasImportc: bool = false
-        var importcLinkName: str = ""
-        if uirCoreParseImportcAnnotation(ann, &hasImportc, &importcLinkName) && hasImportc:
-            importcAnn = ann
-            importcLinkNameRaw = importcLinkName
-        if annName == "ffi_out_ptrs":
-            outPtrAnn = ann
-
-    if importcAnn == nil || outPtrAnn == nil:
-        add(outNodes, n)
-        return false
-    if importcLinkNameRaw == nil || len(importcLinkNameRaw) == 0:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs importc annotation requires explicit link name")
-        add(outNodes, n)
-        return false
-
-    if n.kind != nkFnDecl:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs only supports fn declarations")
-        add(outNodes, n)
-        return false
-
-    let bodyNode: Node = kid(n, 3)
-    if bodyNode != nil && bodyNode.kind != nkEmpty:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs importc declaration must not define a body")
-        add(outNodes, n)
-        return false
-
-    let genericsNode: Node = kid(n, 4)
-    if genericsNode != nil && genericsNode.kind != nkEmpty && kidCount(genericsNode) > 0:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs does not support generic importc declarations")
-        add(outNodes, n)
-        return false
-
-    var outPhysPos: int32[]
-    for ai in 1..<kidCount(outPtrAnn):
-        let argNode: Node = kid(outPtrAnn, ai)
-        var argIdx: int32 = -1
-        if !uirCoreParseFfiOutPtrArgIndex(argNode, &argIdx):
-            uirCoreStage1AddDiag(diags, argNode, "ffi_out_ptrs expects arguments like arg0,arg1,...")
-            add(outNodes, n)
-            return false
-        if argIdx < 0:
-            uirCoreStage1AddDiag(diags, argNode, "ffi_out_ptrs argument index must be >= 0")
-            add(outNodes, n)
-            return false
-        if uirCoreFfiOutPtrFindOrderByPos(outPhysPos, argIdx) >= 0:
-            uirCoreStage1AddDiag(diags, argNode, "ffi_out_ptrs has duplicate physical argument index: arg" + intToStr(argIdx))
-            add(outNodes, n)
-            return false
-        add(outPhysPos, argIdx)
-    if outPhysPos.len == 0:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs requires at least one out argument marker")
-        add(outNodes, n)
-        return false
-
-    let retNode: Node = kid(n, 2)
-    let tupleElemCount: int32 = uirCoreTupleTypeElemCount(retNode)
-    if tupleElemCount <= 0:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs requires tuple return type")
-        add(outNodes, n)
-        return false
-
-    var hasStatus: bool = false
-    if tupleElemCount == outPhysPos.len:
-        hasStatus = false
-    elif tupleElemCount == outPhysPos.len + 1:
-        hasStatus = true
-    else:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs tuple arity mismatch: expected tuple size " +
-                             intToStr(outPhysPos.len) + " or " + intToStr(outPhysPos.len + 1))
-        add(outNodes, n)
-        return false
-
-    var userParamNames: str[]
-    var userParamTypes: Node[]
-    let paramsNode: Node = kid(n, 1)
-    if paramsNode != nil && paramsNode.kind == nkFormalParams:
-        for pi in 0..<kidCount(paramsNode):
-            let defs: Node = kid(paramsNode, pi)
-            if defs == nil || defs.kind != nkIdentDefs:
-                uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs requires canonical parameter declarations")
-                add(outNodes, n)
-                return false
-            let nameCount: int32 = identDefsNameCount(defs)
-            if nameCount != 1:
-                uirCoreStage1AddDiag(diags, defs, "ffi_out_ptrs requires one identifier per parameter")
-                add(outNodes, n)
-                return false
-            let nameNode: Node = kid(defs, 0)
-            if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
-                uirCoreStage1AddDiag(diags, defs, "ffi_out_ptrs requires identifier parameters")
-                add(outNodes, n)
-                return false
-            let typeNode: Node = identDefsType(defs)
-            if typeNode == nil || typeNode.kind == nkEmpty:
-                uirCoreStage1AddDiag(diags, defs, "ffi_out_ptrs requires explicit parameter types")
-                add(outNodes, n)
-                return false
-            add(userParamNames, backendStripSpaces(plainName(nameNode)))
-            add(userParamTypes, typeNode)
-
-    let physCount: int32 = userParamNames.len + outPhysPos.len
-    var outByPhys: int32[]
-    outByPhys.len = physCount
-    for i in 0..<outByPhys.len:
-        outByPhys[i] = -1
-    for oi in 0..<outPhysPos.len:
-        let pos: int32 = outPhysPos[oi]
-        if pos < 0 || pos >= physCount:
-            uirCoreStage1AddDiag(diags, outPtrAnn, "ffi_out_ptrs argument index out of range: arg" + intToStr(pos))
-            add(outNodes, n)
-            return false
-        if outByPhys[pos] >= 0:
-            uirCoreStage1AddDiag(diags, outPtrAnn, "ffi_out_ptrs duplicate physical argument index: arg" + intToStr(pos))
-            add(outNodes, n)
-            return false
-        outByPhys[pos] = oi
-    var nonOutCount: int32 = 0
-    for pos in 0..<physCount:
-        if outByPhys[pos] < 0:
-            nonOutCount = nonOutCount + 1
-    if nonOutCount != userParamNames.len:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs physical argument mapping does not match function parameters")
-        add(outNodes, n)
-        return false
-
-    var outTupleTypes: Node[]
-    for oi in 0..<outPhysPos.len:
-        let elemIdx: int32 = hasStatus ? (oi + 1) : oi
-        let elemType: Node = uirCoreTupleTypeElemType(retNode, elemIdx)
-        if elemType == nil || elemType.kind == nkEmpty:
-            uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs tuple element type missing at index " + intToStr(elemIdx))
-            add(outNodes, n)
-            return false
-        add(outTupleTypes, elemType)
-    var statusType: Node = nil
-    if hasStatus:
-        statusType = uirCoreTupleTypeElemType(retNode, 0)
-        if statusType == nil || statusType.kind == nkEmpty:
-            uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs status return type is missing")
-            add(outNodes, n)
-            return false
-
-    let nameNode: Node = kid(n, 0)
-    let baseName: str = backendStripSpaces(plainName(nameNode))
-    var sid: int32 = 0
-    if synthId != nil:
-        sid = *synthId
-        *synthId = sid + 1
-    let rawName: str = importcLinkNameRaw
-
-    var rawParams: Node = newNode(nkFormalParams, n.pos)
-    var userCursor: int32 = 0
-    for pos in 0..<physCount:
-        let outOrder: int32 = outByPhys[pos]
-        if outOrder >= 0:
-            let outTy: Node = outTupleTypes[outOrder]
-            var varTy: Node = newNode(nkVarTy, outTy.pos)
-            addSon(varTy, cloneTree(outTy))
-            let outName: str = "__ffi_out_" + intToStr(outOrder)
-            addSon(rawParams, uirCoreMakeParamDef(outName, varTy, n.pos))
-        else:
-            if userCursor < 0 || userCursor >= userParamNames.len:
-                uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs parameter mapping overflow")
-                add(outNodes, n)
-                return false
-            addSon(rawParams, uirCoreMakeParamDef(userParamNames[userCursor], userParamTypes[userCursor], n.pos))
-            userCursor = userCursor + 1
-    if userCursor != userParamNames.len:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs parameter mapping underflow")
-        add(outNodes, n)
-        return false
-
-    var rawRet: Node = emptyNode(n.pos)
-    if hasStatus:
-        rawRet = cloneTree(statusType)
-    var rawPragmas: Node = uirCoreClonePragmasFiltered(pragmas, true, true)
-    if rawPragmas == nil || rawPragmas.kind != nkPragma:
-        rawPragmas = newNode(nkPragma, n.pos)
-    var rawImportcAnn: Node = newNode(nkAnnotation, n.pos)
-    addSon(rawImportcAnn, newIdent("importc", n.pos))
-    addSon(rawImportcAnn, newStrLit(importcLinkNameRaw, n.pos))
-    addSon(rawPragmas, rawImportcAnn)
-    let wrapPragmas: Node = uirCoreClonePragmasFiltered(pragmas, true, true)
-
-    var rawFn: Node = newNode(nkFnDecl, n.pos)
-    addSon(rawFn, newIdent(rawName, n.pos))
-    addSon(rawFn, rawParams)
-    addSon(rawFn, rawRet)
-    addSon(rawFn, emptyNode(n.pos))
-    if genericsNode != nil:
-        addSon(rawFn, cloneTree(genericsNode))
-    else:
-        addSon(rawFn, emptyNode(n.pos))
-    addSon(rawFn, rawPragmas)
-    if n.strVal != nil && len(n.strVal) > 0:
-        nodeSetStrVal(rawFn, n.strVal)
-
-    var body: Node = newNode(nkStmtList, n.pos)
-    for oi in 0..<outTupleTypes.len:
-        let outName: str = "__ffi_out_" + intToStr(oi)
-        var outDecl: Node = newNode(nkVar, n.pos)
-        addSon(outDecl, newIdent(outName, n.pos))
-        addSon(outDecl, cloneTree(outTupleTypes[oi]))
-        addSon(outDecl, emptyNode(n.pos))
-        addSon(outDecl, emptyNode(n.pos))
-        addSon(body, outDecl)
-
-    var callNode: Node = newNode(nkCall, n.pos)
-    addSon(callNode, newIdent(rawName, n.pos))
-    var userArgCursor: int32 = 0
-    for pos in 0..<physCount:
-        let outOrder: int32 = outByPhys[pos]
-        if outOrder >= 0:
-            addSon(callNode, newIdent("__ffi_out_" + intToStr(outOrder), n.pos))
-        else:
-            if userArgCursor < 0 || userArgCursor >= userParamNames.len:
-                uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs wrapper argument mapping overflow")
-                add(outNodes, n)
-                return false
-            addSon(callNode, newIdent(userParamNames[userArgCursor], n.pos))
-            userArgCursor = userArgCursor + 1
-    if userArgCursor != userParamNames.len:
-        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs wrapper argument mapping underflow")
-        add(outNodes, n)
-        return false
-
-    var statusName: str = ""
-    if hasStatus:
-        statusName = "__ffi_status"
-        var statusDecl: Node = newNode(nkLet, n.pos)
-        addSon(statusDecl, newIdent(statusName, n.pos))
-        addSon(statusDecl, cloneTree(statusType))
-        addSon(statusDecl, callNode)
-        addSon(statusDecl, emptyNode(n.pos))
-        addSon(body, statusDecl)
-    else:
-        addSon(body, callNode)
-
-    var tupleRet: Node = newNode(nkTupleLit, n.pos)
-    # Keep tuple literal layout aligned with declared return type.
-    # Without an explicit type cache, tuple element inference may widen ints
-    # and produce mismatched field offsets in ABI copies.
-    tupleRet.typeCacheValid = true
-    tupleRet.typeCache = cloneTree(retNode)
-    if hasStatus:
-        addSon(tupleRet, newIdent(statusName, n.pos))
-    for oi in 0..<outTupleTypes.len:
-        addSon(tupleRet, newIdent("__ffi_out_" + intToStr(oi), n.pos))
-    var retStmt: Node = newNode(nkReturn, n.pos)
-    addSon(retStmt, tupleRet)
-    addSon(body, retStmt)
-
-    var wrapperFn: Node = newNode(nkFnDecl, n.pos)
-    addSon(wrapperFn, cloneTree(nameNode))
-    addSon(wrapperFn, cloneTree(paramsNode))
-    addSon(wrapperFn, cloneTree(retNode))
-    addSon(wrapperFn, body)
-    if genericsNode != nil:
-        addSon(wrapperFn, cloneTree(genericsNode))
-    else:
-        addSon(wrapperFn, emptyNode(n.pos))
-    addSon(wrapperFn, wrapPragmas)
-    if n.strVal != nil && len(n.strVal) > 0:
-        nodeSetStrVal(wrapperFn, n.strVal)
-
-    add(outNodes, rawFn)
-    add(outNodes, wrapperFn)
-    return true
-
-fn uirCoreLowerFfiOutPtrAnnotations(root: Node, diags: Diagnostic[]*): bool =
-    if root == nil:
-        return false
-    if root.kind != nkModule && root.kind != nkStmtList:
-        return false
-    var loweredKids: Node[]
-    loweredKids.cap = kidCount(root) + 8
-    var changed: bool = false
-    var synthId: int32 = 0
-    for i in 0..<kidCount(root):
-        let n: Node = kid(root, i)
-        if uirCoreRewriteFfiOutPtrFunc(n, &synthId, diags, &loweredKids):
-            changed = true
-    if changed:
-        root.kids = loweredKids
-    return changed
-
 fn uirCoreBuildFuncHeader(module: UirCoreModule, funcNode: Node, originFile: str = "",
                       overloaded: hashsets.HashSetStr* = nil): Result[UirCoreFunc] =
     if funcNode == nil || (funcNode.kind != nkFnDecl && funcNode.kind != nkIteratorDecl):
@@ -14438,6 +12405,10 @@ fn uirCore_ensureFuncIndexCache(mod: UirCoreModule) =
         uirCore_buildFuncIndexCache(mod)
         return
     if uirCore_funcIndex_cache_len < mod.funcs.len:
+        let cap: int32 = uirCore_funcIndex_cache.states.len
+        if cap > 0 && mod.funcs.len >= cap - (cap / 4):
+            uirCore_buildFuncIndexCache(mod)
+            return
         for i in uirCore_funcIndex_cache_len..<mod.funcs.len:
             let f: UirCoreFunc = mod.funcs[i]
             if f != nil && f.name != nil && len(f.name) > 0:
@@ -14452,9 +12423,7 @@ fn moduleFuncIndex(mod: UirCoreModule, name: str): int32 =
         if uirCore_funcIndex_cache_ready && uirCore_funcIndex_cache_module == mod:
             var found: bool = false
             let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCore_funcIndex_cache, name, found)
-            if !found:
-                return -1
-            if idx >= 0 && idx < mod.funcs.len:
+            if found && idx >= 0 && idx < mod.funcs.len:
                 let f0: UirCoreFunc = mod.funcs[idx]
                 if f0 != nil && (f0.name == name):
                     return idx
@@ -14462,6 +12431,8 @@ fn moduleFuncIndex(mod: UirCoreModule, name: str): int32 =
     for i in 0..<mod.funcs.len:
         let f: UirCoreFunc = mod.funcs[i]
         if f != nil && (f.name == name):
+            if mod.funcs.len >= 32 && uirCore_funcIndex_cache_ready && uirCore_funcIndex_cache_module == mod:
+                hashmaps.hashMapStrIntPut(uirCore_funcIndex_cache, name, i)
             return i
     return -1
 
@@ -15622,24 +13593,6 @@ fn uirCoreConsumeTypeDecls(mod: UirCoreModule, root: Node): Result[bool] =
         pass = pass + 1
     return Ok[bool](false)
 
-type
-    UirCoreBuildCtx = ref
-        foundMain: bool
-        traceEnabled: bool
-        traceFnCount: int32
-        traceGlobalCount: int32
-        overloadedFnBases: hashsets.HashSetStr
-        globalInits: UirCoreGlobalInit[]
-
-    UirCoreGlobalInit = ref
-        name: str
-        ty: UirCoreType
-        objTypeName: str
-        initNode: Node
-        filePath: str
-        seqFixedElemType: Node
-        seqFixedCapExpr: Node
-
 fn uirCorePredeclareGlobalsForTypes(mod: UirCoreModule, root: Node) =
     # Array type expressions like `array[ConstLen, T]` require the length constant
     # to be available during type dependency resolution. Predeclare simple scalar
@@ -16062,7 +14015,7 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
 
     for gi in 0..<dupGlobalNames.len:
         if dupGlobalCounts[gi] > 1:
-            hashsets.hashSetStrAdd(uirCoreDupGlobalNames, dupGlobalNames[gi])
+            uirCoreDupGlobalNamesAdd(dupGlobalNames[gi])
 
     # Pass 1b: consume type declarations in import order (imports before importers).
     # This avoids spurious "unresolved type dependencies" when a file's type decls
@@ -16189,332 +14142,7 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
 
     uirCoreApplyUirPluginHooks(path, mod)
     uirCoreNormalizeModule(mod)
-    return Ok[UirCoreModule](mod)
-
-fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root: Node, filePath: str, n: Node,
-                              reachable: hashsets.HashSetStr* = nil,
-                              overloaded: hashsets.HashSetStr* = nil): Result[bool] =
-    if n == nil || n.kind == nkEmpty:
-        return Ok[bool](false)
-    if n.kind == nkStmtList || n.kind == nkModule:
-        let fallback: str = (filePath != nil && len(filePath) > 0) ? filePath : (root != nil ? root.strVal : "")
-        for j in 0..<kidCount(n):
-            let nn: Node = kid(n, j)
-            let stmtPath: str = (nn != nil && nn.strVal != nil && len(nn.strVal) > 0) ? nn.strVal : fallback
-            let res: Result[bool] = uirCoreConsumeTopLevelFromRoot(mod, ctx, root, stmtPath, nn, reachable, overloaded)
-            if ! IsOk[bool](res):
-                return res
-        return Ok[bool](true)
-    if n.kind == nkVar || n.kind == nkLet || n.kind == nkConst:
-        var pat: Node = nil
-        if kidCount(n) > 0:
-            pat = kid(n, 0)
-        var init: Node = nil
-        if kidCount(n) > 2:
-            init = kid(n, 2)
-        var nameNode: Node = pat
-        var typeNode: Node = nil
-        if kidCount(n) > 1:
-            typeNode = kid(n, 1)
-        if pat != nil && pat.kind == nkPattern && kidCount(pat) > 0:
-            nameNode = kid(pat, 0)
-            if kidCount(pat) > 1:
-                typeNode = kid(pat, 1)
-        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
-            return Err[bool]("uirCore_builder: global expects identifier")
-        let rawName: str = backendStripSpaces(plainName(nameNode))
-        let name: str = uirCoreMaybeMangleDupGlobalName(rawName, filePath)
-        let debugDot: bool = (getEnv "BACKEND_DEBUG_DOT" == "1")
-        if debugDot && rawName == "baseIdentity":
-            var typeKindDbg: str = "nil"
-            if typeNode != nil:
-                typeKindDbg = intToStr(int32(typeNode.kind))
-            echo("[backend] debugDot: consumeGlobal rawName='" + rawName +
-                 "' file='" + filePath + "' typeKind=nk#" + typeKindDbg + "'")
-        let existingGi: int32 = moduleGlobalIndex(mod, name)
-        var allowDupGlobal: bool = false
-        if existingGi >= 0:
-            let g0: UirCoreGlobal = mod.globals[existingGi]
-            allowDupGlobal = (g0.originFile == "<predeclared>")
-        var declType: UirCoreType = uirCoreTypeFromNodeWithModule(mod, typeNode)
-        var objTypeName: str = ""
-        var objTypeNode: Node = typeNode
-        if (objTypeNode == nil || objTypeNode.kind == nkEmpty) && init != nil && init.kind != nkEmpty &&
-           init.typeCacheValid && init.typeCache != nil:
-            objTypeNode = init.typeCache
-        if objTypeNode != nil && objTypeNode.kind != nkEmpty:
-            objTypeName = typeNodeObjTypeName(mod, objTypeNode)
-        let isObj: bool = len(objTypeName) > 0 && objTypeNode != nil && typeNodeIsObjValue(mod, objTypeNode)
-        if debugDot && rawName == "baseIdentity":
-            let objNodeKindDbg: str = (objTypeNode != nil) ? intToStr(int32(objTypeNode.kind)) : "nil"
-            echo("[backend] debugDot: consumeGlobal name='" + name +
-                 "' objTypeName='" + objTypeName + "' isObj=" + (isObj ? "1" : "0") +
-                 " objNodeKind=nk#" + objNodeKindDbg + "'")
-        if isObj:
-            uirCoreGlobalObjTypePut(name, objTypeName)
-            if debugDot && rawName == "baseIdentity":
-                let chkObj: str = uirCoreGlobalObjTypeGet(name)
-                echo("[backend] debugDot: consumeGlobal putObj name='" + name + "' objTypeName='" +
-                     objTypeName + "' chkObj='" + chkObj + "'")
-        if isObj:
-            declType = uirCoreTypeI64()
-        elif typeNode == nil || typeNode.kind == nkEmpty:
-            declType = inferExprTypeWithGlobals(nil, mod, nil, init, declType)
-        # Match stage1 C backend's global layout: store sub-32-bit scalars as i32 slots.
-        # This keeps the MVP backend's global pipeline simple and avoids i8/i16-only data sections.
-        if !isObj && (declType.kind == mtI8 || declType.kind == mtI16):
-            let wasUnsigned: bool = declType.isUnsigned
-            declType = uirCoreTypeI32()
-            declType.isUnsigned = wasUnsigned
-
-        if existingGi >= 0 && !allowDupGlobal && n.kind == nkConst && !isObj:
-            var init0: Node = init
-            while init0 != nil && init0.kind == nkPar && kidCount(init0) > 0:
-                init0 = kid(init0, 0)
-            let isLiteralInit: bool = init0 != nil &&
-                (init0.kind == nkIntLit || init0.kind == nkBoolLit || init0.kind == nkNilLit)
-            if isLiteralInit:
-                let g0: UirCoreGlobal = mod.globals[existingGi]
-                let prevFile: str = g0.originFile
-                let prevSyntheticOrStd: bool = (prevFile != nil && len(prevFile) > 0) &&
-                    (prevFile[0] == '<' || __cheng_string_contains_str(prevFile, "/src/std/") ||
-                     __cheng_string_contains_str(prevFile, "/src/core/") || __cheng_string_contains_str(prevFile, "/src/system/"))
-                let curSyntheticOrStd: bool = (filePath != nil && len(filePath) > 0) &&
-                    (filePath[0] == '<' || __cheng_string_contains_str(filePath, "/src/std/") ||
-                     __cheng_string_contains_str(filePath, "/src/core/") || __cheng_string_contains_str(filePath, "/src/system/"))
-                if (prevSyntheticOrStd || curSyntheticOrStd) &&
-                   g0.ty.kind == declType.kind && g0.ty.isUnsigned == declType.isUnsigned:
-                    allowDupGlobal = true
-        if existingGi >= 0 && !allowDupGlobal && uirCoreSkipSemStdDuplicateRelaxEnabled():
-            let g0: UirCoreGlobal = mod.globals[existingGi]
-            let prevFile2: str = g0.originFile
-            if (uirCorePathSyntheticOrStd(prevFile2) || uirCorePathSyntheticOrStd(filePath)) &&
-               g0.ty.kind == declType.kind && g0.ty.isUnsigned == declType.isUnsigned:
-                allowDupGlobal = true
-
-        if moduleHasFunc(mod, name) || (existingGi >= 0 && !allowDupGlobal) ||
-           uirCoreFindTypeAlias(mod, name) >= 0 || uirCoreFindObjType(mod, name) >= 0:
-            let line0: str = intToStr(nameNode.pos.line)
-            let col0: str = intToStr(nameNode.pos.col)
-            var prevFile: str = ""
-            if existingGi >= 0:
-                let gPrev: UirCoreGlobal = mod.globals[existingGi]
-                prevFile = gPrev.originFile
-            return Err[bool]("uirCore_builder: duplicate global name: " + name +
-                             " (prev=" + prevFile + " cur=" + filePath + ":" + line0 + ":" + col0 + ")")
-
-        var hasInit: bool = false
-        var initVal: int64 = 0
-
-        if isObj:
-            # Object globals are represented as pointers to heap storage; initialize at runtime.
-            hasInit = false
-            initVal = 0
-            let sfi: SeqFixedInit = seqFixedInitInfo(typeNode)
-            ctxAddGlobalInit(ctx, name, declType, objTypeName, init, filePath, sfi.elemType, sfi.capExpr)
-        elif init != nil && init.kind != nkEmpty:
-            # Scalar globals: allow static init for simple literals; otherwise defer to runtime init.
-            if init.kind == nkIntLit:
-                hasInit = true
-                initVal = init.intVal
-            elif init.kind == nkBoolLit:
-                hasInit = true
-                let v: str = backendStripSpaces(init.ident)
-                initVal = (v == "true") ? 1 : 0
-            elif init.kind == nkNilLit:
-                hasInit = true
-                initVal = 0
-            else:
-                hasInit = false
-                initVal = 0
-                ctxAddGlobalInit(ctx, name, declType, "", init, filePath)
-
-        if existingGi >= 0 && allowDupGlobal:
-            var gOut: UirCoreGlobal
-            gOut.name = uirCoreOwnStr(name)
-            gOut.ty = declType
-            gOut.init = initVal
-            gOut.hasInit = hasInit
-            gOut.originFile = uirCoreOwnStr(filePath)
-            mbWriteGlobal(mod.globals, existingGi, gOut)
-        else:
-            uirCoreAddGlobal(mod, name, declType, initVal, hasInit, filePath)
-
-        var keyOut: str = ""
-        if objTypeNode != nil && objTypeNode.kind != nkEmpty:
-            keyOut = typeKey(objTypeNode)
-            if keyOut == nil || len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(objTypeNode)
-        if len(keyOut) == 0 && typeNode != nil && typeNode.kind != nkEmpty:
-            keyOut = typeKey(typeNode)
-            if keyOut == nil || len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(typeNode)
-        if len(keyOut) == 0 && init != nil && init.kind != nkEmpty:
-            var initKeyNode: Node = init
-            while initKeyNode != nil && initKeyNode.kind == nkPar && kidCount(initKeyNode) > 0:
-                initKeyNode = kid(initKeyNode, 0)
-            if initKeyNode != nil && initKeyNode.typeCacheValid && initKeyNode.typeCache != nil:
-                keyOut = typeKey initKeyNode.typeCache
-            elif initKeyNode != nil && initKeyNode.kind == nkStrLit:
-                keyOut = "str"
-            elif initKeyNode != nil && initKeyNode.kind == nkFloatLit:
-                keyOut = "float64"
-            elif initKeyNode != nil && initKeyNode.kind == nkBoolLit:
-                keyOut = "bool"
-            elif initKeyNode != nil && initKeyNode.kind == nkCharLit:
-                keyOut = "char"
-            elif initKeyNode != nil && initKeyNode.kind == nkIntLit:
-                if declType.kind == mtI64:
-                    keyOut = declType.isUnsigned ? "uint64" : "int64"
-                elif declType.kind == mtI32:
-                    keyOut = declType.isUnsigned ? "uint32" : "int32"
-                elif declType.kind == mtF64:
-                    keyOut = "float64"
-                elif declType.kind == mtF32:
-                    keyOut = "float32"
-                elif declType.kind == mtI16:
-                    keyOut = declType.isUnsigned ? "uint16" : "int16"
-                elif declType.kind == mtI8:
-                    keyOut = declType.isUnsigned ? "uint8" : "int8"
-        if keyOut != nil && len(keyOut) > 0:
-            uirCoreGlobalTypeKeyPut(name, keyOut)
-            if debugDot && rawName == "baseIdentity":
-                let chkKey: str = uirCoreGlobalTypeKeyGet(name)
-                echo("[backend] debugDot: consumeGlobal putKey name='" + name +
-                     "' keyOut='" + keyOut + "' chkKey='" + chkKey + "'")
-        if ctx != nil && ctx.traceEnabled:
-            ctx.traceGlobalCount = ctx.traceGlobalCount + 1
-            if (ctx.traceGlobalCount % 200) == 0:
-                stage1Trace("backend: uir globals=" + intToStr(ctx.traceGlobalCount) + " last=" + name)
-        return Ok[bool](true)
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
-        var entryPathProbe: str = backendStripSpaces(filePath)
-        if n != nil && n.strVal != nil && len(n.strVal) > 0:
-            entryPathProbe = backendStripSpaces(n.strVal)
-        let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
-        if reachable != nil && !keepByEntryFile:
-            let nameNode: Node = kid(n, 0)
-            if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
-                let nm: str = backendStripSpaces(plainName(nameNode))
-                if !hashsets.hashSetStrHas(*reachable, nm):
-                    return Ok[bool](false)
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
-            return Ok[bool](false)
-        let fRes: Result[UirCoreFunc] = uirCoreBuildFunc(mod, n, filePath, overloaded)
-        if ! IsOk[UirCoreFunc](fRes):
-            return ErrInfo[bool](ErrorInfoOf[UirCoreFunc](fRes))
-        let f: UirCoreFunc = Value[UirCoreFunc](fRes)
-        if f == nil:
-            return Ok[bool](false)
-        # Predeclare pass inserts header-only entries first. Always try
-        # same-file replacement before duplicate-name checks so stale caches
-        # cannot leave body-less declarations in the final module.
-        var sameFileIdx: int32 = -1
-        for di in 0..<mod.funcs.len:
-            let ex: UirCoreFunc = mod.funcs[di]
-            if ex != nil && (ex.name == f.name) && (ex.originFile == f.originFile):
-                sameFileIdx = di
-                break
-        if sameFileIdx >= 0:
-            let ex2: UirCoreFunc = mod.funcs[sameFileIdx]
-            if ex2 == nil || ex2.blocks.len == 0:
-                mbWriteFunc(mod.funcs, sameFileIdx, f)
-                if (f.name == "main"):
-                    if ctx != nil && ctx.foundMain:
-                        return Err[bool]("uirCore_builder: multiple main functions")
-                    if ctx != nil:
-                        ctx.foundMain = true
-                if ctx != nil && ctx.traceEnabled:
-                    ctx.traceFnCount = ctx.traceFnCount + 1
-                    if (ctx.traceFnCount % 50) == 0:
-                        stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + f.name)
-                return Ok[bool](true)
-            if uirCoreSkipSemStdDuplicateRelaxEnabled() &&
-               (uirCorePathSyntheticOrStd(ex2.originFile) || uirCorePathSyntheticOrStd(f.originFile)):
-                return Ok[bool](false)
-            return Err[bool]("uirCore_builder: duplicate function name: " + f.name)
-        if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
-           uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
-            if uirCoreSkipSemStdDuplicateRelaxEnabled():
-                var prevFile: str = ""
-                for di in 0..<mod.funcs.len:
-                    let ex: UirCoreFunc = mod.funcs[di]
-                    if ex != nil && (ex.name == f.name):
-                        prevFile = ex.originFile
-                        break
-                if uirCorePathSyntheticOrStd(prevFile) || uirCorePathSyntheticOrStd(f.originFile):
-                    return Ok[bool](false)
-            return Err[bool]("uirCore_builder: duplicate function name: " + f.name)
-        if (f.name == "main"):
-            if ctx != nil && ctx.foundMain:
-                return Err[bool]("uirCore_builder: multiple main functions")
-            if ctx != nil:
-                ctx.foundMain = true
-        uirCoreAddFunc(mod, f)
-        if ctx != nil && ctx.traceEnabled:
-            ctx.traceFnCount = ctx.traceFnCount + 1
-            if (ctx.traceFnCount % 50) == 0:
-                stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + f.name)
-        return Ok[bool](true)
-    return Ok[bool](false)
-
-fn uirCorePredeclareTopLevelFromRoot(mod: UirCoreModule, root: Node, filePath: str, n: Node,
-                                 reachable: hashsets.HashSetStr* = nil,
-                                 overloaded: hashsets.HashSetStr* = nil): Result[bool] =
-    if mod == nil || n == nil || n.kind == nkEmpty:
-        return Ok[bool](false)
-    if n.kind == nkStmtList || n.kind == nkModule:
-        let fallback: str = (filePath != nil && len(filePath) > 0) ? filePath : (root != nil ? root.strVal : "")
-        for j in 0..<kidCount(n):
-            let nn: Node = kid(n, j)
-            let stmtPath: str = (nn != nil && nn.strVal != nil && len(nn.strVal) > 0) ? nn.strVal : fallback
-            let res: Result[bool] = uirCorePredeclareTopLevelFromRoot(mod, root, stmtPath, nn, reachable, overloaded)
-            if !IsOk[bool](res):
-                return res
-        return Ok[bool](true)
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
-        var entryPathProbe: str = backendStripSpaces(filePath)
-        if n != nil && n.strVal != nil && len(n.strVal) > 0:
-            entryPathProbe = backendStripSpaces(n.strVal)
-        let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
-        if reachable != nil && !keepByEntryFile:
-            let nameNode: Node = kid(n, 0)
-            if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
-                let nm: str = backendStripSpaces(plainName(nameNode))
-                if !hashsets.hashSetStrHas(*reachable, nm):
-                    return Ok[bool](false)
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
-            return Ok[bool](false)
-        let fRes: Result[UirCoreFunc] = uirCoreBuildFuncHeader(mod, n, filePath, overloaded)
-        if !IsOk[UirCoreFunc](fRes):
-            return ErrInfo[bool](ErrorInfoOf[UirCoreFunc](fRes))
-        let f: UirCoreFunc = Value[UirCoreFunc](fRes)
-        if f == nil:
-            return Ok[bool](false)
-        if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
-           uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
-            var sameFile: bool = false
-            var prevFile: str = ""
-            for di in 0..<mod.funcs.len:
-                let ex: UirCoreFunc = mod.funcs[di]
-                if ex != nil && (ex.name == f.name):
-                    if (ex.originFile == f.originFile):
-                        sameFile = true
-                        break
-                    let exFile: str = ex.originFile
-                    if len prevFile == 0 && exFile != nil && len exFile > 0:
-                        prevFile = exFile
-            if sameFile:
-                return Ok[bool](false)
-            if uirCoreSkipSemStdDuplicateRelaxEnabled() &&
-               (uirCorePathSyntheticOrStd(prevFile) || uirCorePathSyntheticOrStd(f.originFile)):
-                return Ok[bool](false)
-            if len prevFile > 0:
-                return Err[bool]("uirCore_builder: duplicate function name: " + f.name + " (files: " + prevFile + ", " + f.originFile + ")")
-            return Err[bool]("uirCore_builder: duplicate function name: " + f.name + " (file: " + f.originFile + ")")
-        uirCoreAddFunc(mod, f)
-        return Ok[bool](true)
-    return Ok[bool](false)
+    return uirCoreOkModule(mod)
 
 fn uirCoreBuildGlobalInitFunc(mod: UirCoreModule, ctx: UirCoreBuildCtx): Result[UirCoreFunc] =
     if mod == nil || ctx == nil || ctx.globalInits.len == 0:
@@ -16665,6 +14293,23 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
     let prof: UirCoreProfileState = uirCoreProfileInit()
     let dbgLower: bool = (os.getEnvDefault("BACKEND_DEBUG_MIR_LOWER", "") == "1")
     let dbgSummary: bool = (os.getEnvDefault("BACKEND_DEBUG_MODULE_SUMMARY", "") == "1")
+    let dbgPipeCount: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
+    if dbgPipeCount:
+        var fnDeclCount: int32 = 0
+        var fnScan: Node[]
+        add(fnScan, root)
+        while fnScan.len > 0:
+            let nn: Node = fnScan[fnScan.len - 1]
+            fnScan.len = fnScan.len - 1
+            if nn == nil || nn.kind == nkEmpty:
+                continue
+            if nn.kind == nkFnDecl || nn.kind == nkIteratorDecl:
+                fnDeclCount = fnDeclCount + 1
+            for ni in 0..<kidCount(nn):
+                add(fnScan, kid(nn, ni))
+        let fDbgPipe: os.File = os.get_stderr()
+        os.writeLine(fDbgPipe, "[backend] stage1: uir_root_fn_nodes=" + intToStr(fnDeclCount))
+        os.c_fflush fDbgPipe
     uirCoreGlobalObjTypesReset()
     uirCoreGlobalTypeKeysReset()
     uirCoreInlineObjFieldTypesReset()
@@ -16683,10 +14328,8 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
     if ctx.traceEnabled:
         stage1Trace("backend: uir build start files=" + intToStr(kidCount(root)))
     ctx.overloadedFnBases = uirCoreComputeOverloadedFnBases(root)
-    uirCoreDupFnBases = uirCoreComputeDuplicateFnBases(root, &ctx.overloadedFnBases)
-    uirCoreDupFnBasesReady = true
-    uirCoreDupGlobalNames = uirCoreComputeDuplicateGlobalNames(root)
-    uirCoreDupGlobalNamesReady = true
+    uirCoreDupFnBasesSet(uirCoreComputeDuplicateFnBases(root, &ctx.overloadedFnBases))
+    uirCoreDupGlobalNamesSet(uirCoreComputeDuplicateGlobalNames(root))
     uirCoreProfileStep(prof, "dups")
     ctx.globalInits = []
     ensureBuiltinObjTypes(mod)
@@ -16724,6 +14367,14 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
             stage1Trace("backend: uir predeclare " + intToStr(pi + 1) + "/" + intToStr(rootKidCount) + " file=" + filePath)
         let res: Result[bool] = uirCorePredeclareTopLevelFromRoot(mod, root, filePath, n, reachablePtr, &ctx.overloadedFnBases)
         if !IsOk[bool](res):
+            if (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1"):
+                let infoPre: ErrorInfo = ErrorInfoOf[bool](res)
+                let msgPre: str = ErrorFormat(infoPre)
+                let fDbgPre: os.File = os.get_stderr()
+                os.writeLine(fDbgPre, "[backend] stage1: predeclare_fail idx=" + intToStr(pi + 1) +
+                                      "/" + intToStr(rootKidCount) +
+                                      " file='" + filePath + "' msg='" + msgPre + "'")
+                os.c_fflush fDbgPre
             return ErrInfo[UirCoreModule](ErrorInfoOf[bool](res))
     uirCoreProfileStep(prof, "predeclare_top_level")
     if dbgSummary:
@@ -16852,7 +14503,7 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
     if envIsTrue "STAGE1_RELEASE_ARENA_AFTER_BUILD":
         releaseNodeArena()
         releaseLexStrings()
-    return Ok[UirCoreModule](mod)
+    return uirCoreOkModule(mod)
 
 fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
     if len(inPath) == 0:
@@ -16990,8 +14641,7 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: imports_repo_root_start")
         os.c_fflush dbgFile
-    # Stage0/selfhost compatibility:
-    # avoid relying on getcwd() in bootstrap-compiled driver builds.
+    # Prefer PWD first for repo root resolution in bootstrap/selfhost builds.
     var repoRoot: str = os.getEnvDefault("PWD", ".")
     if repoRoot == nil || len(repoRoot) == 0:
         repoRoot = "."
@@ -17328,7 +14978,8 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
         let info0: ErrorInfo = ErrorInfoOf[UirCoreModule](uirCoreRes)
         let msg0: str = ErrorFormat(info0)
         if msg0 == nil || len(msg0) == 0 || msg0 == "error":
-                return Err[UirCoreModule]("uirCore_builder: stage1 uir build failed (empty error) input=" + inPath)
+            return Err[UirCoreModule]("uirCore_builder: stage1 uir build failed (empty error) input=" + inPath)
+        return ErrInfo[UirCoreModule](info0)
     let mod: UirCoreModule = Value[UirCoreModule](uirCoreRes)
     let phaseStats: UirCorePhaseContractStats =
         uirCoreApplyOwnershipPhaseContract(mod, skipOwnership, borrowIrMode)
@@ -17341,6 +14992,6 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
                      " high_uir_unmapped_funcs=" + intToStr(phaseStats.highUnmappedFuncs) +
                      " high_uir_no_proof_funcs=" + intToStr(phaseStats.highNoProofFuncs))
         os.c_fflush dbgFile
-    if profOn:
-        echo("[stage1] profile_ext: fn_tasks=" + int64ToStr(profFnTasks / 1000000) + "ms")
-    return Ok[UirCoreModule](mod)
+    # Keep the tail minimal for stage0 stability; extended trace/profile output
+    # beyond this point is non-functional and can corrupt return flow.
+    return uirCoreOkModule(mod)

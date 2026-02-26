@@ -498,7 +498,8 @@ block <label>:
 - 前端分段计时：`STAGE1_PROFILE=1` 时编译器会在 stdout 输出 `[stage1] profile: ...`，并附带 `[sem]/[mono]/[ownership]` 细分统计，用于把 `backend_profile build_module` 拆到 lex/load/sem/mono/ownership。
 - Stage1 outline/函数任务观测：`STAGE1_PROFILE=1` 还会输出 `outline_parse/materialize_bodies/merge_module`，并追加 `[stage1] profile_ext: fn_tasks=...ms`，用于跟踪两遍扫描与函数任务阶段耗时。
 - UIR 分段计时：`UIR_PROFILE=1` 时编译器会在 stderr 输出 `uir_profile\t<label>\tstep_ms=...\ttotal_ms=...`，用于把 `backend_profile build_module` 继续拆到 `lower_top_level/fixups/...`。`MIR_PROFILE` 已移除，设置后会在 driver 直接报错。
-- backend driver 快速管线开关：`BACKEND_FAST_DEV_PROFILE`、`BACKEND_STAGE1_PARSE_MODE`（`outline|full`）、`BACKEND_FN_SCHED`（`ws|serial`）、`BACKEND_FN_JOBS`、`BACKEND_DIRECT_EXE`、`BACKEND_FAST_FALLBACK_ALLOW`；dev 轨默认 `outline/ws/direct_exe`，release 轨默认 `full/serial/no-direct`。
+- backend driver 快速管线开关：`BACKEND_STAGE1_PARSE_MODE`（`outline|full`）、`BACKEND_FN_SCHED`（`ws|serial`）、`BACKEND_FN_JOBS`、`BACKEND_DIRECT_EXE`、`BACKEND_FAST_FALLBACK_ALLOW`；dev 轨默认 `outline/ws/direct_exe`，release 轨默认 `full/serial/no-direct`。
+- `backend_driver` 轨道默认值已内建：`BACKEND_BUILD_TRACK=dev` 默认 `BACKEND_LINKER=self`（仅 host darwin/arm64 可用，否则自动降级 `system`）并启用 fast-dev 直出链路；`BACKEND_BUILD_TRACK=release` 默认 `BACKEND_LINKER=system`。
 - host darwin/arm64 的 direct-exe 路径已收敛到 `macho_direct_exe_writer`（内存直写 + self-link）；默认失败即阻断，不再静默回退到 system-link（除非显式 `BACKEND_FAST_FALLBACK_ALLOW=1`）。
 - `backend_driver` 在 direct-exe 路径新增 profile 标签：`direct_exe_layout`、`direct_exe_patch`、`direct_exe_write`（随 `BACKEND_PROFILE/UIR_PROFILE` 输出）。
 - 专用机 100ms 门禁：`sh src/tooling/tooling_exec.sh verify_backend_selfhost_100ms_host`（基线：`src/tooling/selfhost_perf_100ms_host.env`）；`backend_prod_closure` 在 `BACKEND_RUN_SELFHOST_100MS=1` 时拆成 quick/report 与 full/blocking 双轨：quick 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=0`，full 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=1` + `SELFHOST_STAGE1_REQUIRE_REBUILD=1`，并可导出 `BACKEND_BUILD_DRIVER_PROFILE_OUT` 画像日志；非目标主机仍为报告模式。

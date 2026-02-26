@@ -1,0 +1,419 @@
+# UIR core builder symbol/object/duplicate state helpers (split from uir_core_builder).
+import std/hashmaps
+import std/hashsets
+import std/strutils
+import stage1/ast
+import backend/uir/uir_internal/uir_core_types
+
+var
+    uirCoreGlobalObjTypeIndex: hashmaps.HashMapStrInt
+    uirCoreGlobalObjTypeNames: str[]
+    uirCoreGlobalObjTypeReady: bool = false
+    uirCoreGlobalTypeKeyIndex: hashmaps.HashMapStrInt
+    uirCoreGlobalTypeKeyNames: str[]
+    uirCoreGlobalTypeKeyReady: bool = false
+    uirCoreInlineObjFieldTypeIndex: hashmaps.HashMapStrInt
+    uirCoreInlineObjFieldTypeNames: str[]
+    uirCoreInlineObjFieldTypeReady: bool = false
+    uirCoreObjFieldTypeKeyIndex: hashmaps.HashMapStrInt
+    uirCoreObjFieldTypeKeyNames: str[]
+    uirCoreObjFieldTypeKeyReady: bool = false
+    uirCoreTupleFieldIndex: hashmaps.HashMapStrInt
+    uirCoreTupleFieldIndexReady: bool = false
+    uirCoreObjAliasIndex: hashmaps.HashMapStrInt
+    uirCoreObjAliasNames: str[]
+    uirCoreObjAliasReady: bool = false
+    uirCoreDupFnBases: hashsets.HashSetStr
+    uirCoreDupFnBasesReady: bool = false
+    uirCoreDupGlobalNames: hashsets.HashSetStr
+    uirCoreDupGlobalNamesReady: bool = false
+
+fn symbolStripSpaces(s: str): str =
+    if s == nil:
+        return ""
+    return strutils.strip(s)
+
+fn symbolStrStartsWith(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    let n: int32 = len(s)
+    let m: int32 = len(prefix)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..<m:
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn symbolMbWriteStr(seqInst: var str[], idx: int32, val: str) =
+    if idx < 0:
+        return
+    if idx >= seqInst.len:
+        seqInst.len = idx + 1
+    seqInst[idx] = val
+
+fn symbolHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
+    if key == nil || len(key) == 0 || m.mask == 0:
+        found = false
+        return -1
+    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
+        found = false
+        return -1
+    var mask: int32 = int32(m.mask)
+    if mask < 0:
+        found = false
+        return -1
+    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
+        let cap0: int32 = m.states.len
+        if m.keys.len < cap0 || m.vals.len < cap0:
+            found = false
+            return -1
+        mask = cap0 - 1
+    if mask < 0:
+        found = false
+        return -1
+    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
+    var scanned: int32 = 0
+    let __for_start_scanned_compat = scanned
+    for __for_scanned_compat in __for_start_scanned_compat..mask:
+        scanned = __for_scanned_compat
+        let st: uint8 = m.states[probe]
+        if st == uint8(0):
+            found = false
+            return -1
+        if hashmaps.hashMapStrEq(m.keys[probe], key):
+            found = true
+            return m.vals[probe]
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    found = false
+    return -1
+
+fn uirCoreGlobalObjTypesReset() =
+    uirCoreGlobalObjTypeIndex = hashmaps.hashMapStrIntInit(256)
+    uirCoreGlobalObjTypeNames.len = 0
+    uirCoreGlobalObjTypeNames.cap = 128
+    uirCoreGlobalObjTypeReady = true
+
+fn uirCoreGlobalTypeKeysReset() =
+    uirCoreGlobalTypeKeyIndex = hashmaps.hashMapStrIntInit(256)
+    uirCoreGlobalTypeKeyNames.len = 0
+    uirCoreGlobalTypeKeyNames.cap = 128
+    uirCoreGlobalTypeKeyReady = true
+
+fn uirCoreInlineObjFieldTypesReset() =
+    uirCoreInlineObjFieldTypeIndex = hashmaps.hashMapStrIntInit(512)
+    uirCoreInlineObjFieldTypeNames.len = 0
+    uirCoreInlineObjFieldTypeNames.cap = 256
+    uirCoreInlineObjFieldTypeReady = true
+
+fn uirCoreObjFieldTypeKeysReset() =
+    uirCoreObjFieldTypeKeyIndex = hashmaps.hashMapStrIntInit(1024)
+    uirCoreObjFieldTypeKeyNames.len = 0
+    uirCoreObjFieldTypeKeyNames.cap = 512
+    uirCoreObjFieldTypeKeyReady = true
+
+fn uirCoreTupleFieldIndicesReset() =
+    uirCoreTupleFieldIndex = hashmaps.hashMapStrIntInit(1024)
+    uirCoreTupleFieldIndexReady = true
+
+fn uirCoreObjAliasesReset() =
+    uirCoreObjAliasIndex = hashmaps.hashMapStrIntInit(512)
+    uirCoreObjAliasNames.len = 0
+    uirCoreObjAliasNames.cap = 256
+    uirCoreObjAliasReady = true
+
+fn uirCoreInlineObjFieldTypePut(parentType: str, fieldName: str, objTypeName: str) =
+    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || objTypeName == nil || len(objTypeName) == 0:
+        return
+    if (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parentType == "ProtoBuffer" && fieldName == "out":
+        echo("[backend] debugOverloadDot: put inline field parent='ProtoBuffer' field='out' objType='" + objTypeName + "'")
+    if !uirCoreInlineObjFieldTypeReady:
+        uirCoreInlineObjFieldTypesReset()
+    let key: str = parentType + "::" + fieldName
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreInlineObjFieldTypeIndex, key, found)
+    if idx >= 0 && idx < uirCoreInlineObjFieldTypeNames.len:
+        symbolMbWriteStr(uirCoreInlineObjFieldTypeNames, idx, objTypeName)
+        return
+    if found:
+        if idx >= 0 && idx < uirCoreInlineObjFieldTypeNames.len:
+            symbolMbWriteStr(uirCoreInlineObjFieldTypeNames, idx, objTypeName)
+        return
+    let newIdx: int32 = uirCoreInlineObjFieldTypeNames.len
+    add(uirCoreInlineObjFieldTypeNames, objTypeName)
+    hashmaps.hashMapStrIntPut(uirCoreInlineObjFieldTypeIndex, key, newIdx)
+
+fn uirCoreInlineObjFieldTypeGet(parentType: str, fieldName: str): str =
+    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || !uirCoreInlineObjFieldTypeReady:
+        return ""
+    let key: str = parentType + "::" + fieldName
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreInlineObjFieldTypeIndex, key, found)
+    if idx < 0 || idx >= uirCoreInlineObjFieldTypeNames.len:
+        return ""
+    return get_string(uirCoreInlineObjFieldTypeNames, idx)
+
+fn uirCoreObjFieldTypeKeyPut(parentType: str, fieldName: str, fieldTypeKey: str) =
+    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || fieldTypeKey == nil || len(fieldTypeKey) == 0:
+        return
+    if !uirCoreObjFieldTypeKeyReady:
+        uirCoreObjFieldTypeKeysReset()
+    let key: str = parentType + "::" + fieldName
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjFieldTypeKeyIndex, key, found)
+    if idx >= 0 && idx < uirCoreObjFieldTypeKeyNames.len:
+        symbolMbWriteStr(uirCoreObjFieldTypeKeyNames, idx, fieldTypeKey)
+        return
+    if found:
+        if idx >= 0 && idx < uirCoreObjFieldTypeKeyNames.len:
+            symbolMbWriteStr(uirCoreObjFieldTypeKeyNames, idx, fieldTypeKey)
+        return
+    let newIdx: int32 = uirCoreObjFieldTypeKeyNames.len
+    add(uirCoreObjFieldTypeKeyNames, fieldTypeKey)
+    hashmaps.hashMapStrIntPut(uirCoreObjFieldTypeKeyIndex, key, newIdx)
+
+fn uirCoreObjFieldTypeKeyGet(parentType: str, fieldName: str): str =
+    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || !uirCoreObjFieldTypeKeyReady:
+        return ""
+    let key: str = parentType + "::" + fieldName
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjFieldTypeKeyIndex, key, found)
+    if (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parentType == "ProtoBuffer" && fieldName == "out":
+        let foundCompat: bool = idx >= 0
+        echo("[backend] debugOverloadDot: keyGetCompat key='" + key + "' found=" + (foundCompat ? "1" : "0") +
+             " idx=" + intToStr(idx) + " namesLen=" + intToStr(uirCoreObjFieldTypeKeyNames.len))
+    if idx < 0 || idx >= uirCoreObjFieldTypeKeyNames.len:
+        return ""
+    return get_string(uirCoreObjFieldTypeKeyNames, idx)
+
+fn uirCoreObjFieldTypeKeyDebugEntry(parentType: str, fieldName: str): str =
+    if parentType == nil || len(parentType) == 0 || fieldName == nil || len(fieldName) == 0 || !uirCoreObjFieldTypeKeyReady:
+        return ""
+    let key: str = parentType + "::" + fieldName
+    if uirCoreObjFieldTypeKeyIndex.keys.len <= 0:
+        return ""
+    for si in 0..<uirCoreObjFieldTypeKeyIndex.keys.len:
+        if uirCoreObjFieldTypeKeyIndex.states[si] != uint8(1):
+            continue
+        let kk: str = uirCoreObjFieldTypeKeyIndex.keys[si]
+        if kk == key:
+            let vi: int32 = uirCoreObjFieldTypeKeyIndex.vals[si]
+            var vv: str = ""
+            if vi >= 0 && vi < uirCoreObjFieldTypeKeyNames.len:
+                vv = get_string(uirCoreObjFieldTypeKeyNames, vi)
+            return "slot=" + intToStr(si) + " valIdx=" + intToStr(vi) + " val='" + vv + "'"
+    return ""
+
+fn uirCoreTupleFieldIndexPut(tupleKey: str, fieldName: str, idx0: int32) =
+    if tupleKey == nil || len(tupleKey) == 0 || fieldName == nil || len(fieldName) == 0 || idx0 < 0:
+        return
+    if !uirCoreTupleFieldIndexReady:
+        uirCoreTupleFieldIndicesReset()
+    let key: str = tupleKey + "::" + fieldName
+    var found: bool = false
+    let existing: int32 = symbolHashMapStrIntGetCompat(uirCoreTupleFieldIndex, key, found)
+    if existing >= 0:
+        # Structural tuple types may share the same key without field labels. If a label maps to
+        # different indices, treat it as ambiguous.
+        if existing != idx0 && existing != -2:
+            hashmaps.hashMapStrIntPut(uirCoreTupleFieldIndex, key, -2)
+        return
+    hashmaps.hashMapStrIntPut(uirCoreTupleFieldIndex, key, idx0)
+
+fn uirCoreTupleFieldIndexGet(tupleKey: str, fieldName: str): int32 =
+    if tupleKey == nil || len(tupleKey) == 0 || fieldName == nil || len(fieldName) == 0 || !uirCoreTupleFieldIndexReady:
+        return -1
+    let key: str = tupleKey + "::" + fieldName
+    var found: bool = false
+    let v: int32 = symbolHashMapStrIntGetCompat(uirCoreTupleFieldIndex, key, found)
+    if v < 0:
+        return -1
+    return v
+
+fn uirCoreGlobalObjTypePut(name: str, objTypeName: str) =
+    if name == nil || len(name) == 0 || objTypeName == nil || len(objTypeName) == 0:
+        return
+    if !uirCoreGlobalObjTypeReady:
+        uirCoreGlobalObjTypesReset()
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreGlobalObjTypeIndex, name, found)
+    if idx >= 0 && idx < uirCoreGlobalObjTypeNames.len:
+        symbolMbWriteStr(uirCoreGlobalObjTypeNames, idx, objTypeName)
+        return
+    if found:
+        if idx >= 0 && idx < uirCoreGlobalObjTypeNames.len:
+            symbolMbWriteStr(uirCoreGlobalObjTypeNames, idx, objTypeName)
+        return
+    let newIdx: int32 = uirCoreGlobalObjTypeNames.len
+    add(uirCoreGlobalObjTypeNames, objTypeName)
+    hashmaps.hashMapStrIntPut(uirCoreGlobalObjTypeIndex, name, newIdx)
+
+fn uirCoreGlobalObjTypeGet(name: str): str =
+    if name == nil || len(name) == 0 || !uirCoreGlobalObjTypeReady:
+        return ""
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreGlobalObjTypeIndex, name, found)
+    if idx < 0 || idx >= uirCoreGlobalObjTypeNames.len:
+        return ""
+    return get_string(uirCoreGlobalObjTypeNames, idx)
+
+fn uirCoreGlobalTypeKeyPut(name: str, typeKey0: str) =
+    if name == nil || len(name) == 0 || typeKey0 == nil || len(typeKey0) == 0:
+        return
+    if !uirCoreGlobalTypeKeyReady:
+        uirCoreGlobalTypeKeysReset()
+    let typeKey: str = symbolStripSpaces(typeKey0)
+    if typeKey == nil || len(typeKey) == 0:
+        return
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreGlobalTypeKeyIndex, name, found)
+    if idx >= 0 && idx < uirCoreGlobalTypeKeyNames.len:
+        symbolMbWriteStr(uirCoreGlobalTypeKeyNames, idx, typeKey)
+        return
+    if found:
+        if idx >= 0 && idx < uirCoreGlobalTypeKeyNames.len:
+            symbolMbWriteStr(uirCoreGlobalTypeKeyNames, idx, typeKey)
+        return
+    let newIdx: int32 = uirCoreGlobalTypeKeyNames.len
+    add(uirCoreGlobalTypeKeyNames, typeKey)
+    hashmaps.hashMapStrIntPut(uirCoreGlobalTypeKeyIndex, name, newIdx)
+
+fn uirCoreGlobalTypeKeyGet(name: str): str =
+    if name == nil || len(name) == 0 || !uirCoreGlobalTypeKeyReady:
+        return ""
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreGlobalTypeKeyIndex, name, found)
+    if idx < 0 || idx >= uirCoreGlobalTypeKeyNames.len:
+        return ""
+    return get_string(uirCoreGlobalTypeKeyNames, idx)
+
+fn uirCoreObjAliasPut(aliasName0: str, targetName0: str) =
+    if aliasName0 == nil || len(aliasName0) == 0 || targetName0 == nil || len(targetName0) == 0:
+        return
+    if !uirCoreObjAliasReady:
+        uirCoreObjAliasesReset()
+    let aliasName: str = symbolStripSpaces(aliasName0)
+    let targetName: str = symbolStripSpaces(targetName0)
+    if aliasName == nil || len(aliasName) == 0 || targetName == nil || len(targetName) == 0:
+        return
+    if (aliasName == targetName):
+        return
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjAliasIndex, aliasName, found)
+    if idx >= 0 && idx < uirCoreObjAliasNames.len:
+        symbolMbWriteStr(uirCoreObjAliasNames, idx, targetName)
+        return
+    if found:
+        if idx >= 0 && idx < uirCoreObjAliasNames.len:
+            symbolMbWriteStr(uirCoreObjAliasNames, idx, targetName)
+        return
+    let newIdx: int32 = uirCoreObjAliasNames.len
+    add(uirCoreObjAliasNames, targetName)
+    hashmaps.hashMapStrIntPut(uirCoreObjAliasIndex, aliasName, newIdx)
+
+fn uirCoreObjAliasGet(aliasName0: str): str =
+    if aliasName0 == nil || len(aliasName0) == 0 || !uirCoreObjAliasReady:
+        return ""
+    let aliasName: str = symbolStripSpaces(aliasName0)
+    if aliasName == nil || len(aliasName) == 0:
+        return ""
+    var found: bool = false
+    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjAliasIndex, aliasName, found)
+    if idx < 0 || idx >= uirCoreObjAliasNames.len:
+        return ""
+    return get_string(uirCoreObjAliasNames, idx)
+
+fn uirCoreObjAliasCanon(name0: str): str =
+    if name0 == nil || len(name0) == 0:
+        return ""
+    if !uirCoreObjAliasReady:
+        return name0
+    var cur: str = name0
+    for i in 0..<8:
+        let next: str = uirCoreObjAliasGet(cur)
+        if next == nil || len(next) == 0 || (next == cur):
+            return cur
+        cur = next
+    return cur
+
+fn uirCoreObjAliasReadyFlag(): bool =
+    return uirCoreObjAliasReady
+
+fn uirCoreObjLayoutName(module: UirCoreModule, name0: str): str =
+    if name0 == nil || len(name0) == 0:
+        return ""
+    let name: str = name0
+    if module != nil:
+        if symbolStrStartsWith(name, "seq_") && uirCoreHasObjType(module, "seq"):
+            return "seq"
+        if symbolStrStartsWith(name, "seq_fixed_") && uirCoreHasObjType(module, "seq"):
+            return "seq"
+        if symbolStrStartsWith(name, "Table_") && uirCoreHasObjType(module, "Table"):
+            return "Table"
+    return name
+
+fn uirCoreModuleIdForFile(filePath0: str): str =
+    let filePath: str = (filePath0 != nil) ? filePath0 : ""
+    if len(filePath) == 0:
+        return "0000000000000000"
+    return uirCoreU64ToHex(uirCoreFnv1a64(filePath))
+
+fn uirCoreDupFnBasesReset() =
+    uirCoreDupFnBases = hashsets.hashSetStrInit(256)
+    uirCoreDupFnBasesReady = true
+
+fn uirCoreDupFnBasesHas(baseName: str): bool =
+    if !uirCoreDupFnBasesReady:
+        return false
+    if baseName == nil || len(baseName) == 0:
+        return false
+    return hashsets.hashSetStrHas(uirCoreDupFnBases, baseName)
+
+fn uirCoreDupFnBasesSet(vals: hashsets.HashSetStr) =
+    uirCoreDupFnBases = vals
+    uirCoreDupFnBasesReady = true
+
+fn uirCoreMaybeMangleDupFnBase(baseName0: str, originFile0: str): str =
+    let baseName: str = (baseName0 != nil) ? baseName0 : ""
+    if len(baseName) == 0:
+        return ""
+    if (baseName == "main"):
+        return baseName
+    if !uirCoreDupFnBasesHas(baseName):
+        return baseName
+    let originFile: str = (originFile0 != nil) ? originFile0 : ""
+    return baseName + "__cheng_mod_" + uirCoreModuleIdForFile(originFile)
+
+fn uirCoreDupGlobalNamesReset() =
+    uirCoreDupGlobalNames = hashsets.hashSetStrInit(256)
+    uirCoreDupGlobalNamesReady = true
+
+fn uirCoreDupGlobalNamesHas(baseName: str): bool =
+    if !uirCoreDupGlobalNamesReady:
+        return false
+    if baseName == nil || len(baseName) == 0:
+        return false
+    return hashsets.hashSetStrHas(uirCoreDupGlobalNames, baseName)
+
+fn uirCoreDupGlobalNamesSet(vals: hashsets.HashSetStr) =
+    uirCoreDupGlobalNames = vals
+    uirCoreDupGlobalNamesReady = true
+
+fn uirCoreDupGlobalNamesAdd(name0: str) =
+    if name0 == nil || len(name0) == 0:
+        return
+    if !uirCoreDupGlobalNamesReady:
+        uirCoreDupGlobalNamesReset()
+    hashsets.hashSetStrAdd(uirCoreDupGlobalNames, name0)
+
+fn uirCoreMaybeMangleDupGlobalName(baseName0: str, originFile0: str): str =
+    let baseName: str = (baseName0 != nil) ? baseName0 : ""
+    if len(baseName) == 0:
+        return ""
+    if !uirCoreDupGlobalNamesHas(baseName):
+        return baseName
+    let originFile: str = (originFile0 != nil) ? originFile0 : ""
+    return baseName + "__cheng_mod_" + uirCoreModuleIdForFile(originFile)

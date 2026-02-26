@@ -1,8 +1,12 @@
 # Minimal Mach-O x86_64 linker (Darwin/x86_64): links backend-emitted `.o` into an executable.
 # Scope (v1 bootstrap):
 # - Input objects: Mach-O MH_OBJECT emitted by our backend (macho_writer_x86_64.cheng).
-# - Relocations supported: X86_64_RELOC_BRANCH, X86_64_RELOC_SIGNED (pcrel disp32).
-# - Undefined symbols: supported only for BRANCH (functions); resolved via dyld bind info + local stubs.
+# - Relocations supported:
+#   X86_64_RELOC_BRANCH, X86_64_RELOC_SIGNED, X86_64_RELOC_SIGNED_1,
+#   X86_64_RELOC_SIGNED_2, X86_64_RELOC_SIGNED_4, X86_64_RELOC_GOT_LOAD,
+#   X86_64_RELOC_GOT (pcrel disp32).
+# - Undefined symbols: supported for call and address-style pcrel relocations; resolved via
+#   dyld bind info + local stubs/pointer slots.
 # - Output format: MH_EXECUTE + LC_DYLD_INFO_ONLY (no fixup chains); codesigned later via `codesign -s -`.
 import std/seqs
 import std/strings
@@ -10,8 +14,8 @@ import std/bytes
 import std/hashmaps
 import std/os
 import std/result
-import cheng/backend/obj/obj_buf
-import cheng/backend/obj/linker_shared_core
+import backend/obj/obj_buf
+import backend/obj/linker_shared_core
 
 type
     MachoObjReloc =
@@ -124,6 +128,11 @@ const
     X86_64_RELOC_UNSIGNED: int32 = 0
     X86_64_RELOC_SIGNED: int32 = 1
     X86_64_RELOC_BRANCH: int32 = 2
+    X86_64_RELOC_GOT_LOAD: int32 = 3
+    X86_64_RELOC_GOT: int32 = 4
+    X86_64_RELOC_SIGNED_1: int32 = 6
+    X86_64_RELOC_SIGNED_2: int32 = 7
+    X86_64_RELOC_SIGNED_4: int32 = 8
 
     # Internal tagged addresses used during merge (must stay local to this file).
     MX64_REL_CSTRING: uint64 = uint64(0x8000000000000000)
@@ -444,6 +453,19 @@ fn mx64WriteDisp32Reloc(data: var uint8[], off: int32, placeAddr: uint64, target
     mx64WriteU32LEToSeq(data, off, uint32(int32(disp)))
     return Ok[bool](true)
 
+fn mx64RelocUsesImportStub(rtype: int32): bool =
+    return rtype == X86_64_RELOC_BRANCH
+
+fn mx64RelocUsesImportPtrSlot(rtype: int32): bool =
+    if rtype == X86_64_RELOC_SIGNED || rtype == X86_64_RELOC_SIGNED_1 ||
+       rtype == X86_64_RELOC_SIGNED_2 || rtype == X86_64_RELOC_SIGNED_4 ||
+       rtype == X86_64_RELOC_GOT_LOAD || rtype == X86_64_RELOC_GOT:
+        return true
+    return false
+
+fn mx64RelocSupportsUndefinedImport(rtype: int32): bool =
+    return mx64RelocUsesImportStub(rtype) || mx64RelocUsesImportPtrSlot(rtype)
+
 fn mx64ResolveTaggedAddr(layout: MachoLinkLayout, textOff: uint64, cstrOff: uint64, rel: uint64): uint64 =
     if layout == nil:
         return uint64(0)
@@ -632,7 +654,7 @@ fn mx64MergeObjs(objs: MachoObjFile[]): Result[MachoLinkLayout] =
                         add(defName, sym.name)
                         add(defAddr, relAddr)
 
-    # Gather undefined imports used by BRANCH relocations.
+    # Gather undefined imports used by call/address relocations.
     var importNeeded: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
@@ -646,7 +668,7 @@ fn mx64MergeObjs(objs: MachoObjFile[]): Result[MachoLinkLayout] =
                     if r.extern && r.symIndex >= 0 && r.symIndex < obj.symbols.len:
                         let sym: MachoObjSymbol = obj.symbols[r.symIndex]
                         if sym != nil && mx64SymIsUndef(sym) && mx64SymIsExt(sym):
-                            if r.rtype == X86_64_RELOC_BRANCH:
+                            if mx64RelocSupportsUndefinedImport(r.rtype):
                                 if sym.name != nil && len(sym.name) > 0:
                                     let defIdxPlus1: int32 = hashmaps.hashMapStrIntGet(defIndex, sym.name)
                                     if defIdxPlus1 > 0:
@@ -654,7 +676,7 @@ fn mx64MergeObjs(objs: MachoObjFile[]): Result[MachoLinkLayout] =
                                     if hashmaps.hashMapStrIntGet(importNeeded, sym.name) == 0:
                                         hashmaps.hashMapStrIntPut(importNeeded, sym.name, 1)
                             else:
-                                return Err[MachoLinkLayout]("macho_linker: unsupported undefined reloc type for " + sym.name)
+                                return Err[MachoLinkLayout]("macho_linker: unsupported undefined reloc type (" + intToStr(r.rtype) + ") for " + sym.name)
 
     # Extract imports in stable order (deterministic).
     # hashmaps.HashMapStrInt does not provide iteration; do a scan over all symbol tables for stable order.
@@ -894,13 +916,17 @@ fn machoLinkExeX86_64Core(objs: MachoObjFile[], outputPath: str, symtabAll: bool
                     oj = oj + 1
 
                 if !resolved:
-                    # Unresolved: for undefined BRANCH targets, fall back to import stub.
+                    # Unresolved: undefined imports use branch stubs (call) or pointer slots (addr).
                     if sym != nil && mx64SymIsUndef(sym):
                         let impIdxPlus1: int32 = hashmaps.hashMapStrIntGet(importIndex, symName)
-                        if impIdxPlus1 > 0 && r.rtype == X86_64_RELOC_BRANCH:
+                        if impIdxPlus1 > 0 && mx64RelocUsesImportStub(r.rtype):
                             let impIdx: int32 = impIdxPlus1 - 1
                             isImport = true
                             targetAddr = stubAddrs[impIdx]
+                        elif impIdxPlus1 > 0 && mx64RelocUsesImportPtrSlot(r.rtype):
+                            let impIdx: int32 = impIdxPlus1 - 1
+                            isImport = true
+                            targetAddr = ptrSlotAddrs[impIdx]
                         else:
                             return Err[bool]("macho_linker_x86_64: unresolved symbol: " + symName)
                     else:
@@ -908,7 +934,7 @@ fn machoLinkExeX86_64Core(objs: MachoObjFile[], outputPath: str, symtabAll: bool
 
                 if !r.pcrel || r.length != 2:
                     return Err[bool]("macho_linker_x86_64: unsupported reloc encoding")
-                if r.rtype == X86_64_RELOC_BRANCH || r.rtype == X86_64_RELOC_SIGNED:
+                if mx64RelocSupportsUndefinedImport(r.rtype):
                     let dispRes: Result[bool] = mx64WriteDisp32Reloc(layout.text, placeOffInFileTextBytes, placeAddr, targetAddr)
                     if !IsOk[bool](dispRes):
                         return ErrInfo[bool](ErrorInfoOf[bool](dispRes))

@@ -23,7 +23,7 @@ sh src/tooling/tooling_exec.sh backend_prod_closure --no-publish
 
 注：`--no-obj/--no-obj-determinism/--no-self-obj-writer` 已废弃并被闭环脚本忽略（新口径不再走 obj/self-obj gate）。
 注：生产主链默认不跑 selfhost；仅在排查自举兼容问题时显式加 `--selfhost`。
-注：`--no-publish` 默认启用稳定收口参数集（`BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE=1`），仅保留 required 收口链路；如需恢复完整可选 gate，可设 `BACKEND_PROD_NO_PUBLISH_STABLE_PROFILE=0`。
+注：`--no-publish` 不再走 stable-profile 降级语义，默认保持完整 gate 集。
 注：可用 `BACKEND_PROD_TARGET=<triple>` 显式覆盖优化/可执行门禁目标；未设置时会忽略外部非 darwin `BACKEND_TARGET` 污染并固定 darwin 默认口径。
 注：值班收口统一 driver 口径：固定 `artifacts/backend_driver/cheng`，并保持 `BACKEND_DRIVER_ALLOW_FALLBACK=0`（无自动回退）。
 注：`build-backend-driver` 默认不启用历史 stage0 回退；仅显式设置 `TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=1` 时允许排障回退。

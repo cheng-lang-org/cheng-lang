@@ -1,0 +1,189 @@
+# UIR core builder duplicate-name scan helpers (split from uir_core_builder).
+import std/hashsets
+import std/hashmaps
+import std/strutils
+import stage1/ast
+
+fn dupScanStripSpaces(s: str): str =
+    if s == nil:
+        return ""
+    return strutils.strip(s)
+
+fn dupScanHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
+    let v: int32 = hashmaps.hashMapStrIntGetEx(m, key, found)
+    if found:
+        return v
+    return -1
+
+fn uirCoreCollectGenericParamNames(generics: Node): str[] =
+    var out: str[]
+    out.cap = 4
+    if generics == nil || generics.kind == nkEmpty:
+        return out
+    for i in 0..<kidCount(generics):
+        let n0: Node = kid(generics, i)
+        if n0 == nil || n0.kind == nkEmpty:
+            continue
+        var nameNode: Node = nil
+        if n0.kind == nkIdentDefs && kidCount(n0) > 0:
+            nameNode = kid(n0, 0)
+        elif n0.kind == nkIdent || n0.kind == nkSymbol:
+            nameNode = n0
+        elif kidCount(n0) > 0:
+            nameNode = kid(n0, 0)
+        if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
+            let nm: str = dupScanStripSpaces(plainName(nameNode))
+            if nm != nil && len(nm) > 0:
+                add(out, nm)
+    return out
+
+fn uirCoreTypeNodeHasGenericParam(typeNode0: Node, genericNames: str[]): bool =
+    if typeNode0 == nil || genericNames.len == 0:
+        return false
+    var stack: Node[]
+    stack.cap = 16
+    add(stack, typeNode0)
+    while stack.len > 0:
+        let n: Node = stack[stack.len - 1]
+        stack.len = stack.len - 1
+        if n == nil || n.kind == nkEmpty:
+            continue
+        if n.kind == nkIdent || n.kind == nkSymbol:
+            let nm: str = dupScanStripSpaces(plainName(n))
+            if nm != nil && len(nm) > 0:
+                for gi in 0..<genericNames.len:
+                    if (nm == genericNames[gi]):
+                        return true
+        for ki in 0..<kidCount(n):
+            add(stack, kid(n, ki))
+    return false
+
+fn uirCoreFuncSigHasUnresolvedGenerics(fnNode: Node): bool =
+    if fnNode == nil || kidCount(fnNode) <= 4:
+        return false
+    let genNode: Node = kid(fnNode, 4)
+    if genNode == nil || genNode.kind == nkEmpty || kidCount(genNode) == 0:
+        return false
+    let genNames: str[] = uirCoreCollectGenericParamNames(genNode)
+    if genNames.len == 0:
+        return false
+    let retNode: Node = (kidCount(fnNode) > 2) ? kid(fnNode, 2) : nil
+    if retNode != nil && retNode.kind != nkEmpty:
+        if uirCoreTypeNodeHasGenericParam(retNode, genNames):
+            return true
+    let paramsNode: Node = (kidCount(fnNode) > 1) ? kid(fnNode, 1) : nil
+    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        for pi in 0..<kidCount(paramsNode):
+            let defs: Node = kid(paramsNode, pi)
+            if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 1:
+                let tn: Node = kid(defs, 1)
+                if tn != nil && tn.kind != nkEmpty:
+                    if uirCoreTypeNodeHasGenericParam(tn, genNames):
+                        return true
+    return false
+
+fn uirCoreComputeDuplicateFnBases(root: Node, overloaded: hashsets.HashSetStr* = nil): hashsets.HashSetStr =
+    let _overloaded: hashsets.HashSetStr* = overloaded
+    var dup: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
+    if root == nil:
+        return dup
+    let rootKids: int32 = kidCount(root)
+    let mapCap: int32 = (rootKids > 128) ? (rootKids * 2) : 256
+    var nameIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(mapCap)
+    var seenNames: str[]
+    var seenCounts: int32[]
+    var queue: Node[]
+    add(queue, root)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil || n.kind == nkEmpty:
+            continue
+        if n.kind == nkStmtList || n.kind == nkModule:
+            for i in 0..<kidCount(n):
+                add(queue, kid(n, i))
+            continue
+        if n.kind != nkFnDecl && n.kind != nkIteratorDecl:
+            continue
+        if kidCount(n) > 3:
+            let body: Node = kid(n, 3)
+            # Forward decls (no body, no importc) should not count as duplicates.
+            if body == nil || body.kind == nkEmpty:
+                continue
+        if uirCoreFuncSigHasUnresolvedGenerics(n):
+            continue
+        let nameNode: Node = kid(n, 0)
+        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
+            continue
+        let rawName: str = dupScanStripSpaces(plainName(nameNode))
+        if rawName == nil || len(rawName) == 0 || (rawName == "main"):
+            continue
+        # Overloaded base names still need cross-module duplicate detection.
+        # Otherwise different modules that share the same overloaded signature
+        # can collide at link time (same base + same __cheng_sig_* hash).
+        var found: bool = false
+        let idxPlus1: int32 = dupScanHashMapStrIntGetCompat(nameIndex, rawName, found)
+        var idx: int32 = -1
+        if found && idxPlus1 > 0:
+            idx = idxPlus1 - 1
+        if idx < 0:
+            let newIdx: int32 = seenNames.len
+            add(seenNames, rawName)
+            add(seenCounts, 1)
+            hashmaps.hashMapStrIntPut(nameIndex, rawName, newIdx + 1)
+        else:
+            let next: int32 = seenCounts[idx] + 1
+            seenCounts[idx] = next
+            if next > 1:
+                hashsets.hashSetStrAdd(dup, rawName)
+    return dup
+
+fn uirCoreComputeDuplicateGlobalNames(root: Node): hashsets.HashSetStr =
+    var dup: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
+    if root == nil:
+        return dup
+    let rootKids: int32 = kidCount(root)
+    let mapCap: int32 = (rootKids > 128) ? (rootKids * 2) : 256
+    var nameIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(mapCap)
+    var seenNames: str[]
+    var seenCounts: int32[]
+    var queue: Node[]
+    add(queue, root)
+    while queue.len > 0:
+        let n: Node = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if n == nil || n.kind == nkEmpty:
+            continue
+        if n.kind == nkStmtList || n.kind == nkModule:
+            for i in 0..<kidCount(n):
+                add(queue, kid(n, i))
+            continue
+        if n.kind != nkVar && n.kind != nkLet && n.kind != nkConst:
+            continue
+        var pat: Node = nil
+        if kidCount(n) > 0:
+            pat = kid(n, 0)
+        var nameNode: Node = pat
+        if pat != nil && pat.kind == nkPattern && kidCount(pat) > 0:
+            nameNode = kid(pat, 0)
+        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
+            continue
+        let rawName: str = dupScanStripSpaces(plainName(nameNode))
+        if rawName == nil || len(rawName) == 0:
+            continue
+        var found: bool = false
+        let idxPlus1: int32 = dupScanHashMapStrIntGetCompat(nameIndex, rawName, found)
+        var idx: int32 = -1
+        if found && idxPlus1 > 0:
+            idx = idxPlus1 - 1
+        if idx < 0:
+            let newIdx: int32 = seenNames.len
+            add(seenNames, rawName)
+            add(seenCounts, 1)
+            hashmaps.hashMapStrIntPut(nameIndex, rawName, newIdx + 1)
+        else:
+            let next: int32 = seenCounts[idx] + 1
+            seenCounts[idx] = next
+            if next > 1:
+                hashsets.hashSetStrAdd(dup, rawName)
+    return dup

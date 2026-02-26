@@ -1,22 +1,37 @@
 # Unified IR builder facade: stage1 frontend entry routed through UIR frontend.
 import std/result
-import cheng/backend/uir/uir_types
-import cheng/backend/uir/uir_frontend
-
-fn uirBuildModuleFromFile(path: str): Result[UirModule] =
-    return uirFrontendBuildModuleFromFile(path)
-
-fn uirBuildModuleFromFileStage1(path: str): Result[UirModule] =
-    return uirFrontendBuildModuleFromFileStage1(path)
+import std/os
+import backend/uir/uir_types
+import backend/uir/uir_internal/uir_core_builder
+import backend/uir/uir_internal/uir_core_types
 
 fn uirBuildModuleFromFileOrPanic(path: str): UirModule =
-    let res: Result[UirModule] = uirBuildModuleFromFile(path)
-    if !IsOk[UirModule](res):
-        panic ErrorFormat(ErrorInfoOf[UirModule](res))
-    return Value[UirModule](res)
+    let res: Result[UirCoreModule] = uirCoreBuildModuleFromFile(path)
+    if !IsOk[UirCoreModule](res):
+        let info: ErrorInfo = ErrorInfoOf[UirCoreModule](res)
+        let msg: str = ErrorFormat(info)
+        if msg == nil || len(msg) == 0 || msg == "error":
+            os.writeLine(os.get_stderr(), "[backend] stage1_orpanic: empty_error uirCoreBuildModuleFromFile input=" + path)
+            os.c_fflush os.get_stderr()
+            panic "uirCore_builder: build failed (empty error) input=" + path
+        panic msg
+    return Value[UirCoreModule](res)
 
 fn uirBuildModuleFromFileStage1OrPanic(path: str): UirModule =
-    let res: Result[UirModule] = uirBuildModuleFromFileStage1(path)
-    if !IsOk[UirModule](res):
-        panic ErrorFormat(ErrorInfoOf[UirModule](res))
-    return Value[UirModule](res)
+    let dbgPipe: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
+    let res: Result[UirCoreModule] = uirCoreBuildModuleFromFileStage1(path)
+    if dbgPipe:
+        os.writeLine(os.get_stderr(), "[backend] stage1_orpanic: build_done ok=" + (IsOk[UirCoreModule](res) ? "1" : "0"))
+        os.c_fflush os.get_stderr()
+    if !IsOk[UirCoreModule](res):
+        let info: ErrorInfo = ErrorInfoOf[UirCoreModule](res)
+        let msg: str = ErrorFormat(info)
+        if msg == nil || len(msg) == 0 || msg == "error":
+            os.writeLine(os.get_stderr(), "[backend] stage1_orpanic: empty_error uirCoreBuildModuleFromFileStage1 input=" + path)
+            os.c_fflush os.get_stderr()
+            panic "uirCore_builder: stage1 uir build failed (empty error) input=" + path
+        panic msg
+    if dbgPipe:
+        os.writeLine(os.get_stderr(), "[backend] stage1_orpanic: return_ok")
+        os.c_fflush os.get_stderr()
+    return Value[UirCoreModule](res)

@@ -21,7 +21,6 @@
 - `--output=<path>`（可替代位置参数）
 - `--linker=self`
 - `--allow-no-main` / `--no-allow-no-main`
-- `--whole-program` / `--no-whole-program`
 - `--skip-global-init` / `--no-skip-global-init`
 - `--runtime-obj=<path>`
 - `--runtime-c=<path>` / `--no-runtime-c`
@@ -38,7 +37,6 @@
   --target=arm64-apple-darwin \
   --frontend=stage1 \
   --allow-no-main \
-  --whole-program \
   --input=src/std/system_helpers_backend.cheng \
   --output=chengcache/system_helpers_backend.arm64-apple-darwin.o
 ```
@@ -61,3 +59,4 @@
 
 - `emit=asm` 已移除。
 - `emit-c` 路径已移除，不再建议使用 `stage1` C 输出链。
+- `whole_program` 已固定为内部 `1`，不再提供 `--whole-program/--no-whole-program` 切换。

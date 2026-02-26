@@ -2,10 +2,10 @@
 import std/result
 import std/os
 
-import cheng/backend/uir/[uir_types, uir_opt]
-import cheng/backend/uir/[uir_validate]
-import cheng/backend/machine/[machine_types, machine_select_aarch64, machine_select_x86_64, machine_regalloc]
-import cheng/backend/obj/[macho_writer, macho_writer_x86_64, elf_writer, elf_writer_x86_64, coff_writer, coff_writer_x86_64]
+import backend/uir/[uir_types, uir_opt]
+import backend/uir/[uir_validate]
+import backend/machine/[machine_types, machine_select_aarch64, machine_regalloc]
+import backend/obj/[macho_writer, elf_writer, coff_writer]
 
 fn uirTargetIsDarwin(target: str): bool =
     if target == nil || len(target) == 0:
@@ -63,14 +63,9 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
     if dbgCodegen:
         echo("[codegen] select.begin")
     let isAarch64: bool = uirTargetIsAarch64(target)
-    let isX86_64: bool = uirTargetIsX86_64(target)
-    if !isAarch64 && !isX86_64:
+    if !isAarch64:
         return Err[MachineModule]("uir_codegen: unsupported target arch: " + target)
-    var res: Result[MachineModule]
-    if isAarch64:
-        res = machineSelectAarch64(module)
-    else:
-        res = machineSelectX86_64(module)
+    let res: Result[MachineModule] = machineSelectAarch64(module)
     if ! IsOk[MachineModule](res):
         return res
     if dbgCodegen:
@@ -137,7 +132,8 @@ fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): R
         return Err[uint8[]](ErrorFormat(ErrorInfoOf[str](writerRes)))
     let resolvedWriter: str = writerRes.value
     let isAarch64: bool = uirTargetIsAarch64(target)
-    let isX86_64: bool = uirTargetIsX86_64(target)
+    if !isAarch64:
+        return Err[uint8[]]("uir_codegen: unsupported target arch: " + target)
     if dbgCodegen:
         echo("[codegen] writer.begin")
     let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
@@ -158,20 +154,14 @@ fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): R
     if resolvedWriter == "macho":
         if isAarch64:
             return machoWriteAarch64RelocatableObj(machine)
-        if isX86_64:
-            return machoWriteX86_64RelocatableObj(machine)
         return Err[uint8[]]("uir_codegen: macho writer unsupported target arch: " + target)
     if resolvedWriter == "elf":
         if isAarch64:
             return elfWriteAarch64RelocatableObj(machine)
-        if isX86_64:
-            return elfWriteX86_64RelocatableObj(machine)
         return Err[uint8[]]("uir_codegen: elf writer unsupported target arch: " + target)
     if resolvedWriter == "coff":
         if isAarch64:
             return coffWriteAarch64RelocatableObj(machine)
-        if isX86_64:
-            return coffWriteX86_64RelocatableObj(machine)
         return Err[uint8[]]("uir_codegen: coff writer unsupported target arch: " + target)
     return Err[uint8[]]("uir_codegen: unresolved object writer after validation: " + resolvedWriter)
 
