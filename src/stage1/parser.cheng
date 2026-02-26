@@ -35,6 +35,8 @@ type
         idx: int32
         filename: str
         diags: Diagnostic[]*
+        outlineOnly: bool
+        routineOrdinalNext: int32
 
 fn posFrom(t: Token): SourcePos =
     var sp: SourcePos
@@ -1875,6 +1877,31 @@ fn parseSuite(p: ParserStateObj*): Node =
     addSon(sl2, s2)
     return sl2
 
+fn parserSkipInlineSuiteTokens(p: ParserStateObj*) =
+    while true:
+        let k: TokenKind = curKind(p)
+        if k == tkEof || k == tkNewline || k == tkDedent:
+            break
+        advance p
+
+fn parserSkipSuiteTokens(p: ParserStateObj*) =
+    if p == nil:
+        return
+    if match(p, tkNewline):
+        skipNewlines p
+        if match(p, tkIndent):
+            var depth: int32 = 1
+            while depth > 0 && curKind(p) != tkEof:
+                if match(p, tkIndent):
+                    depth = depth + 1
+                    continue
+                if match(p, tkDedent):
+                    depth = depth - 1
+                    continue
+                advance p
+            return
+    parserSkipInlineSuiteTokens p
+
 fn parseIf(p: ParserStateObj*, isWhen: bool): Node =
     let startTok: Token = current p
     advance p
@@ -2070,8 +2097,15 @@ fn parseRoutine(p: ParserStateObj*, kind: NodeKind, annots: Node[]): Node =
             addSon(whereAnn, whereExpr)
             addSon(pragma, whereAnn)
     var body: Node = emptyNode(posFrom(kw))
+    var bodyStartTok: int32 = -1
+    var bodyEndTok: int32 = -1
     if matchSymbol(p, "="):
-        body = parseSuite p
+        if p != nil && p->outlineOnly:
+            bodyStartTok = p->idx
+            parserSkipSuiteTokens p
+            bodyEndTok = p->idx
+        else:
+            body = parseSuite p
     var rn: Node = newNode(kind, posFrom(kw))
     addSon(rn, name)
     addSon(rn, params)
@@ -2079,6 +2113,13 @@ fn parseRoutine(p: ParserStateObj*, kind: NodeKind, annots: Node[]): Node =
     addSon(rn, body)
     addSon(rn, generics)
     addSon(rn, pragma)
+    if p != nil:
+        rn.declOrdinal = p->routineOrdinalNext
+        p->routineOrdinalNext = p->routineOrdinalNext + 1
+    if bodyStartTok >= 0 && bodyEndTok >= bodyStartTok:
+        rn.deferredBodyStartTok = bodyStartTok
+        rn.deferredBodyEndTok = bodyEndTok
+        rn.deferredBodyState = 1
     return rn
 
 fn parseLambda(p: ParserStateObj*, kw: str): Node =
@@ -2518,7 +2559,70 @@ fn parseStatement(p: ParserStateObj*): Node =
     return expr
 
 # ---- Module parsing ----
-fn parseModuleImpl(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
+fn parserIsRoutineDeclNodeKind(kind: NodeKind): bool =
+    return kind == nkFnDecl || kind == nkIteratorDecl || kind == nkMacroDecl || kind == nkTemplateDecl
+
+fn parserMaterializeRoutineBodyFromTokensImpl(tokens: Token[], filename: str, routine: Node, diags: Diagnostic[]*): bool =
+    if routine == nil:
+        return false
+    if ! parserIsRoutineDeclNodeKind(routine.kind):
+        return false
+    if routine.deferredBodyState == 2:
+        return true
+    if routine.deferredBodyState != 1:
+        return false
+    if kidCount(routine) <= 3:
+        addDiag(diags, svError, filename, routine.pos.line, routine.pos.col,
+                "internal parser error: deferred routine node has no body slot")
+        return false
+    let startTok: int32 = routine.deferredBodyStartTok
+    let endTok: int32 = routine.deferredBodyEndTok
+    if startTok < 0 || endTok < startTok || endTok > tokens.len:
+        addDiag(diags, svError, filename, routine.pos.line, routine.pos.col,
+                "internal parser error: invalid deferred body token span")
+        return false
+    var bodyTokens: Token[] = []
+    let bodySpan: int32 = endTok - startTok
+    if bodySpan > 0:
+        bodyTokens.cap = bodySpan + 1
+    for i in startTok..<endTok:
+        add(bodyTokens, tokens[i])
+    var eofT: Token = eofTok()
+    if bodyTokens.len > 0:
+        let last: Token = bodyTokens[bodyTokens.len - 1]
+        eofT.line = last.line
+        eofT.col = last.col
+    add(bodyTokens, eofT)
+    var pObj: ParserStateObj
+    pObj.tokens = bodyTokens
+    pObj.idx = 0
+    pObj.filename = filename
+    pObj.diags = diags
+    pObj.outlineOnly = false
+    pObj.routineOrdinalNext = 0
+    let body: Node = parseSuite(&pObj)
+    setKid(routine, 3, body)
+    routine.deferredBodyState = 2
+    return true
+
+fn materializeRoutineBodyFromTokens(tokens: Token[], filename: str, routine: Node, diags: Diagnostic[]*): bool =
+    return parserMaterializeRoutineBodyFromTokensImpl(tokens, filename, routine, diags)
+
+fn parserMaterializeRoutineBodiesInNode(tokens: Token[], filename: str, root: Node, diags: Diagnostic[]*): int32 =
+    if root == nil:
+        return 0
+    var materialized: int32 = 0
+    if parserIsRoutineDeclNodeKind(root.kind):
+        if parserMaterializeRoutineBodyFromTokensImpl(tokens, filename, root, diags):
+            materialized = materialized + 1
+    for i in 0..<kidCount(root):
+        materialized = materialized + parserMaterializeRoutineBodiesInNode(tokens, filename, kid(root, i), diags)
+    return materialized
+
+fn materializeModuleRoutineBodiesFromTokens(tokens: Token[], filename: str, root: Node, diags: Diagnostic[]*): int32 =
+    return parserMaterializeRoutineBodiesInNode(tokens, filename, root, diags)
+
+fn parseModuleImplMode(tokens: Token[], filename: str, diags: Diagnostic[]*, outlineOnly: bool): Node =
     var pObj: ParserStateObj* = ParserStateObj*(alloc(sizeof ParserStateObj))
     if pObj == nil:
         return nil
@@ -2527,6 +2631,8 @@ fn parseModuleImpl(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
     pObj->idx = 0
     pObj->filename = filename
     pObj->diags = diags
+    pObj->outlineOnly = outlineOnly
+    pObj->routineOrdinalNext = 0
     var p: ParserStateObj* = pObj
 
     var root: Node = newNode(nkModule, default[SourcePos])
@@ -2551,8 +2657,14 @@ fn parseModuleImpl(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
     dealloc pObj
     return root
 
+fn parseModuleImpl(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
+    return parseModuleImplMode(tokens, filename, diags, false)
+
 fn parseModuleWithDiagnostics(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
     return parseModuleImpl(tokens, filename, diags)
+
+fn parseModuleOutlineWithDiagnostics(tokens: Token[], filename: str, diags: Diagnostic[]*): Node =
+    return parseModuleImplMode(tokens, filename, diags, true)
 
 fn parseModule(tokens: Token[], filename: str = "stdin"): Node =
     return parseModuleImpl(tokens, filename, nil)

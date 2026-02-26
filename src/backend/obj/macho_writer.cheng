@@ -173,21 +173,8 @@ fn machoHexNibble(c: char): int32 =
     return -1
 
 fn machoCanonicalCStringReloc(name: str): str =
-    if name == nil:
-        return ""
-    var base: str = name
-    if strings.startsWith(base, "_L_cheng_str_"):
-        if len(base) != 29:
-            return ""
-        base = os.sliceStr(base, 1, len(base) - 1)
-    if !strings.startsWith(base, "L_cheng_str_"):
-        return ""
-    if len(base) != 28:
-        return ""
-    for i in 12..<28:
-        if machoHexNibble(base[i]) < 0:
-            return ""
-    return base
+    let _: str = name
+    return ""
 
 fn machoCStringSymbolAlias(rawName: str, canonical: str): str =
     if rawName == nil || canonical == nil || len(rawName) == 0 || len(canonical) == 0:
@@ -341,6 +328,21 @@ fn machoAddSym(outSyms: MachoSym[], name: str, nType: uint8, nSect: uint8, nValu
     add(outSyms, s)
     return outSyms
 
+fn machoSymIndexInsertFirst(index: var hashmaps.HashMapStrInt, name: str, symIdx: int32) =
+    if name == nil || len(name) == 0 || name[0] == char(0):
+        return
+    var exists: bool = false
+    hashmaps.hashMapStrIntGetEx(index, name, exists)
+    if !exists:
+        hashmaps.hashMapStrIntPut(index, name, symIdx)
+
+fn machoAddSymIndexed(outSyms: MachoSym[], index: var hashmaps.HashMapStrInt,
+                      name: str, nType: uint8, nSect: uint8, nValue: uint64): MachoSym[] =
+    let out: MachoSym[] = machoAddSym(outSyms, name, nType, nSect, nValue)
+    if out.len > 0:
+        machoSymIndexInsertFirst(index, name, out.len - 1)
+    return out
+
 fn machoFindSymIndex(syms: MachoSym[], name: str): int32 =
     if name == nil:
         return -1
@@ -369,9 +371,6 @@ fn macho_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
 fn machoSeqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
     return items[int(idx)]
 
-fn machoSeqAtMachineCString(items: MachineCString[], idx: int32): MachineCString =
-    return items[int(idx)]
-
 fn machoSeqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
     return items[int(idx)]
 
@@ -386,7 +385,7 @@ fn machoModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
 fn machoModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
     if mod == nil:
         return nil
-    return machoSeqAtMachineCString(mod.cstrs, idx)
+    return machineModuleCStringAt(mod, idx)
 
 fn machoModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
     if mod == nil:
@@ -432,9 +431,18 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
     var cSymOffs: uint64[]
     machoSeqInitEmpty[uint64](&cSymOffs)
     cSymOffs.len = int(cstrCount)
+    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
     for ci in 0..<cstrCount:
         let c: MachineCString = machoModuleCStringAtRaw(mod, ci)
         let off: uint64 = uint64(cstring.len)
+        if dbgCstr && ci < 8:
+            let cLabelDbg: str = machineCStringLabelOf(c)
+            let cValueDbg: str = machineCStringValueOf(c)
+            let cLenDbg: int32 = cValueDbg == nil ? -1 : len(cValueDbg)
+            let c0Dbg: int32 = (cValueDbg != nil && cLenDbg > 0) ? int32(cValueDbg[0]) : -1
+            let c1Dbg: int32 = (cValueDbg != nil && cLenDbg > 1) ? int32(cValueDbg[1]) : -1
+            echo("[macho.cstr.a64] i=" + intToStr(ci) + " label=" + cLabelDbg +
+                 " len=" + intToStr(cLenDbg) + " b0=" + intToStr(c0Dbg) + " b1=" + intToStr(c1Dbg))
         cSymOffs[ci] = off
         bufStr0(&cstring, machineCStringValueOf(c))
     machoDebug("[macho] build:cstrings_done")
@@ -795,17 +803,23 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
     # Build symbol list in dyld order: locals, extdefs, undefs.
     var syms: MachoSym[]
     machoSeqInitEmpty[MachoSym](syms)
+    var symIndexCapHint: int32 = cstrCount + synthCstrNames.len + funcCount + globalCount
+    if symIndexCapHint < 64:
+        symIndexCapHint = 64
+    var symIndexMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(symIndexCapHint * 2 + 1)
 
     # locals: cstrings
     for ci in 0..<cstrCount:
         let c2: MachineCString = machoModuleCStringAtRaw(mod, ci)
         if hasCstr:
             let v: uint64 = cstrAddr + cSymOffs[ci]
-            syms = machoAddSym(syms, machineCStringLabelOf(c2), N_SECT, cstrSectIndex, v)
+            syms = machoAddSymIndexed(syms, symIndexMap, machineCStringLabelOf(c2), N_SECT, cstrSectIndex, v)
     for si in 0..<synthCstrNames.len:
-        if hasCstr && machoFindSymIndex(syms, synthCstrNames[si]) < 0:
+        var hasSynth: bool = false
+        hashmaps.hashMapStrIntGetEx(symIndexMap, synthCstrNames[si], hasSynth)
+        if hasCstr && !hasSynth:
             let vSynth: uint64 = cstrAddr + synthCstrOffs[si]
-            syms = machoAddSym(syms, synthCstrNames[si], N_SECT, cstrSectIndex, vSynth)
+            syms = machoAddSymIndexed(syms, symIndexMap, synthCstrNames[si], N_SECT, cstrSectIndex, vSynth)
 
     let localCount: uint32 = uint32(syms.len)
 
@@ -813,7 +827,8 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
     for fi in 0..<funcCount:
         let f2: MachineFunc = machoModuleFuncAtRaw(mod, fi)
         let v2: uint64 = textAddr + funcOffs[fi]
-        syms = machoAddSym(syms, symPrefix + machineFuncNameOf(f2), uint8(N_SECT | N_EXT), textSectIndex, v2)
+        syms = machoAddSymIndexed(syms, symIndexMap, symPrefix + machineFuncNameOf(f2),
+                                  uint8(N_SECT | N_EXT), textSectIndex, v2)
 
     # extdefs: data/bss globals
     for gi in 0..<globalCount:
@@ -822,22 +837,32 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
         if machineGlobalHasInit(g3):
             if hasData:
                 let v3: uint64 = dataAddr + dataSymOffs[gi]
-                syms = machoAddSym(syms, gSym, uint8(N_SECT | N_EXT), dataSectIndex, v3)
+                syms = machoAddSymIndexed(syms, symIndexMap, gSym,
+                                          uint8(N_SECT | N_EXT), dataSectIndex, v3)
         else:
             if hasBss:
                 let v4: uint64 = bssAddr + bssSymOffs[gi]
-                syms = machoAddSym(syms, gSym, uint8(N_SECT | N_EXT), bssSectIndex, v4)
+                syms = machoAddSymIndexed(syms, symIndexMap, gSym,
+                                          uint8(N_SECT | N_EXT), bssSectIndex, v4)
 
     let extdefCount: uint32 = uint32(syms.len) - localCount
 
     # undefs referenced by relocations.
     var undefs: str[]
     machoSeqInitEmpty[str](&undefs)
+    let undefCapHint: int32 = relocs.len < 64 ? 64 : relocs.len
+    var undefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(undefCapHint * 2 + 1)
     for ri in 0..<relocs.len:
         let r0: MachoReloc = relocs[ri]
         if r0 != nil && r0.sym != nil && len(r0.sym) > 0 && r0.sym[0] != char(0):
-            if machoFindSymIndex(syms, r0.sym) < 0 && !macho_seqContainsStr(undefs, r0.sym):
-                add(undefs, r0.sym)
+            var hasSym: bool = false
+            hashmaps.hashMapStrIntGetEx(symIndexMap, r0.sym, hasSym)
+            if !hasSym:
+                var hasUndef: bool = false
+                hashmaps.hashMapStrIntGetEx(undefSeen, r0.sym, hasUndef)
+                if !hasUndef:
+                    hashmaps.hashMapStrIntPut(undefSeen, r0.sym, 1)
+                    add(undefs, r0.sym)
     machoDebug("[macho] build:undef_scan_done")
     macho_sortStringsStable(undefs)
     machoDebug("[macho] build:undef_sort_done")
@@ -847,7 +872,7 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
             echo undefs[ri]
     for ri in 0..<undefs.len:
         let name: str = undefs[ri]
-        syms = machoAddSym(syms, name, uint8(N_UNDF | N_EXT), uint8(0), uint64(0))
+        syms = machoAddSymIndexed(syms, symIndexMap, name, uint8(N_UNDF | N_EXT), uint8(0), uint64(0))
     machoDebug("[macho] build:symbols_done")
 
     let undefCount: uint32 = uint32(undefs.len)
@@ -1054,8 +1079,9 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
             return Err[uint8[]]("macho_writer: internal offset mismatch (reloff)")
         for ri in 0..<relocs.len:
             let r5: MachoReloc = relocs[ri]
-            let symIdx: int32 = machoFindSymIndex(syms, r5.sym)
-            if symIdx < 0:
+            var hasSymReloc: bool = false
+            let symIdx: int32 = hashmaps.hashMapStrIntGetEx(symIndexMap, r5.sym, hasSymReloc)
+            if !hasSymReloc:
                 if machoDebugEnabled():
                     echo "[macho] missing reloc sym:"
                     echo r5.sym
@@ -1100,4 +1126,18 @@ fn machoBuild(mod: MachineModule): Result[uint8[]] =
     return Ok[uint8[]](out)
 
 fn machoWriteAarch64RelocatableObj(mod: MachineModule): Result[uint8[]] =
+    let dbgCstrWrap: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    if dbgCstrWrap:
+        let cCountWrap: int32 = machineModuleCstrsLen(mod)
+        echo("[macho.wrap.a64] cstrs=" + intToStr(cCountWrap))
+        for ciWrap in 0..<cCountWrap:
+            if ciWrap >= 4:
+                break
+            let cWrap: MachineCString = machineModuleCStringAt(mod, ciWrap)
+            let lWrap: str = machineCStringLabelOf(cWrap)
+            let vWrap: str = machineCStringValueOf(cWrap)
+            let nWrap: int32 = vWrap == nil ? -1 : len(vWrap)
+            let b0Wrap: int32 = (vWrap != nil && nWrap > 0) ? int32(vWrap[0]) : -1
+            echo("[macho.wrap.a64] i=" + intToStr(ciWrap) + " label=" + lWrap +
+                 " len=" + intToStr(nWrap) + " b0=" + intToStr(b0Wrap))
     return machoBuild(mod)

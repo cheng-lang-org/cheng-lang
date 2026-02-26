@@ -2,6 +2,7 @@
 import std/seqs
 import std/strings
 import std/result
+import std/os
 import cheng/backend/uir/uir_types
 import cheng/backend/machine/machine_types
 
@@ -9,6 +10,12 @@ type
     LabelState = ref
         nextId: int32
         prefix: str
+
+# Stage0 compatibility: explicit forward declaration avoids unresolved call
+# target regressions in older selfhost compilers.
+fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
+                retType: UirLowerType, dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
+                baseReg: MachineReg, labelState: LabelState): Result[int32]
 
 fn iselOkMachineFunc(value: MachineFunc): Result[MachineFunc] =
     var out: Result[MachineFunc]
@@ -21,6 +28,19 @@ fn iselErrInfoMachineFunc(err: ErrorInfo): Result[MachineFunc] =
     var out: Result[MachineFunc]
     out.ok = false
     out.err = err
+    return out
+
+fn iselOkMachineReg(value: MachineReg): Result[MachineReg] =
+    var out: Result[MachineReg]
+    out.ok = true
+    out.value = value
+    out.err = ErrorOk()
+    return out
+
+fn iselErrMachineReg(err: str): Result[MachineReg] =
+    var out: Result[MachineReg]
+    out.ok = false
+    out.err = ErrorNew(err)
     return out
 
 fn isel_strContains(hay: str, needle: str): bool =
@@ -59,36 +79,62 @@ fn iselTargetIsDarwin(target: str): bool =
         return true
     return isel_strContains(target, "apple") || isel_strContains(target, "darwin") || isel_strContains(target, "ios")
 
+fn iselEnvBoolFalse(raw: str): bool =
+    return strings.streq(raw, "0") || strings.streq(raw, "false") || strings.streq(raw, "off") || strings.streq(raw, "no") ||
+           strings.streq(raw, "FALSE") || strings.streq(raw, "OFF") || strings.streq(raw, "NO")
+
+fn iselEnvBoolTrue(raw: str): bool =
+    return strings.streq(raw, "1") || strings.streq(raw, "true") || strings.streq(raw, "on") || strings.streq(raw, "yes") ||
+           strings.streq(raw, "TRUE") || strings.streq(raw, "ON") || strings.streq(raw, "YES")
+
+fn iselCStringLoweringEnabled(): bool =
+    # Keep historical self-link defaults stable, but auto-enable when
+    # system-link + runtime-c is explicitly requested.
+    var raw: str = os.getEnvDefault("BACKEND_ENABLE_CSTRING_LOWERING", "")
+    if raw != nil && len(raw) > 0:
+        if iselEnvBoolFalse(raw):
+            return false
+        if iselEnvBoolTrue(raw):
+            return true
+    var linkerRaw: str = os.getEnvDefault("BACKEND_LINKER", "")
+    var noRuntimeRaw: str = os.getEnvDefault("BACKEND_NO_RUNTIME_C", "")
+    if strings.streq(linkerRaw, "system") || strings.streq(linkerRaw, "SYSTEM"):
+        if noRuntimeRaw == nil || len(noRuntimeRaw) == 0:
+            return false
+        if iselEnvBoolFalse(noRuntimeRaw):
+            return true
+    return false
+
 fn iselTypeKeyIsVarargs(typeKey: str): bool =
     if typeKey == nil || len(typeKey) == 0:
         return false
-    if (typeKey == "varargs"):
+    if strings.streq(typeKey, "varargs"):
         return true
     return isel_strStartsWith(typeKey, "varargs_")
 
 fn iselVarargsElemTypeFromTypeKey(typeKey: str): Result[UirLowerType] =
-    if typeKey == nil || len(typeKey) == 0 || (typeKey == "varargs"):
+    if typeKey == nil || len(typeKey) == 0 || strings.streq(typeKey, "varargs"):
         return Ok[UirLowerType](uirTypeI32())
-    if (typeKey == "varargs_int32") || (typeKey == "varargs_i32"):
+    if strings.streq(typeKey, "varargs_int32") || strings.streq(typeKey, "varargs_i32"):
         return Ok[UirLowerType](uirTypeI32())
-    if (typeKey == "varargs_uint32") || (typeKey == "varargs_u32"):
+    if strings.streq(typeKey, "varargs_uint32") || strings.streq(typeKey, "varargs_u32"):
         return Ok[UirLowerType](uirTypeU32())
-    if (typeKey == "varargs_int") || (typeKey == "varargs_NI"):
+    if strings.streq(typeKey, "varargs_int") || strings.streq(typeKey, "varargs_NI"):
         return Ok[UirLowerType](uirTypeI32())
-    if (typeKey == "varargs_uint") || (typeKey == "varargs_NU"):
+    if strings.streq(typeKey, "varargs_uint") || strings.streq(typeKey, "varargs_NU"):
         return Ok[UirLowerType](uirTypeU32())
-    if (typeKey == "varargs_int64") || (typeKey == "varargs_i64"):
+    if strings.streq(typeKey, "varargs_int64") || strings.streq(typeKey, "varargs_i64"):
         return Ok[UirLowerType](uirTypeI64())
-    if (typeKey == "varargs_uint64") || (typeKey == "varargs_u64"):
+    if strings.streq(typeKey, "varargs_uint64") || strings.streq(typeKey, "varargs_u64"):
         return Ok[UirLowerType](uirTypeU64())
-    if (typeKey == "varargs_ptr") || (typeKey == "varargs_void*") ||
-       (typeKey == "varargs_cstring") || (typeKey == "varargs_str"):
+    if strings.streq(typeKey, "varargs_ptr") || strings.streq(typeKey, "varargs_void*") ||
+       strings.streq(typeKey, "varargs_cstring") || strings.streq(typeKey, "varargs_str"):
         return Ok[UirLowerType](uirTypeI64())
-    if (typeKey == "varargs_bool") || (typeKey == "varargs_char") ||
-       (typeKey == "varargs_int8") || (typeKey == "varargs_i8") ||
-       (typeKey == "varargs_uint8") || (typeKey == "varargs_u8") ||
-       (typeKey == "varargs_int16") || (typeKey == "varargs_i16") ||
-       (typeKey == "varargs_uint16") || (typeKey == "varargs_u16"):
+    if strings.streq(typeKey, "varargs_bool") || strings.streq(typeKey, "varargs_char") ||
+       strings.streq(typeKey, "varargs_int8") || strings.streq(typeKey, "varargs_i8") ||
+       strings.streq(typeKey, "varargs_uint8") || strings.streq(typeKey, "varargs_u8") ||
+       strings.streq(typeKey, "varargs_int16") || strings.streq(typeKey, "varargs_i16") ||
+       strings.streq(typeKey, "varargs_uint16") || strings.streq(typeKey, "varargs_u16"):
         return Ok[UirLowerType](uirTypeI32())
     return Err[UirLowerType]("isel: unsupported varargs element typeKey: " + typeKey)
 
@@ -113,13 +159,13 @@ fn iselStripTargetSymPrefixOnce(target: str, name: str): str =
 
 fn iselCondFromCmp(op: UirCmpOp, isUnsigned: bool): MachineCond =
     case op
-    of mcEq: return machineCondEq
-    of mcNe: return machineCondNe
-    of mcLt: return isUnsigned ? machineCondLo : machineCondLt
-    of mcLe: return isUnsigned ? machineCondLs : machineCondLe
-    of mcGt: return isUnsigned ? machineCondHi : machineCondGt
-    of mcGe: return isUnsigned ? machineCondHs : machineCondGe
-    return machineCondEq
+    of mcEq: return MachineCond(0)
+    of mcNe: return MachineCond(1)
+    of mcLt: return isUnsigned ? MachineCond(7) : MachineCond(3)
+    of mcLe: return isUnsigned ? MachineCond(8) : MachineCond(4)
+    of mcGt: return isUnsigned ? MachineCond(9) : MachineCond(5)
+    of mcGe: return isUnsigned ? MachineCond(10) : MachineCond(6)
+    return MachineCond(0)
 
 fn iselTypeIs64(ty: UirLowerType): bool =
     return ty.kind == mtI64 || ty.kind == mtF64
@@ -148,21 +194,21 @@ fn iselRetReg(retType: UirLowerType): MachineReg =
 fn iselArgReg(retType: UirLowerType, index: int32): Result[MachineReg] =
     if iselTypeIs64(retType):
         case index
-        of 0: return Ok[MachineReg](machineRegRdi)
-        of 1: return Ok[MachineReg](machineRegRsi)
-        of 2: return Ok[MachineReg](machineRegRdx)
-        of 3: return Ok[MachineReg](machineRegRcx)
-        of 4: return Ok[MachineReg](machineRegR8)
-        of 5: return Ok[MachineReg](machineRegR9)
-        return Err[MachineReg]("isel: too many call args")
+        of 0: return iselOkMachineReg(machineRegRdi)
+        of 1: return iselOkMachineReg(machineRegRsi)
+        of 2: return iselOkMachineReg(machineRegRdx)
+        of 3: return iselOkMachineReg(machineRegRcx)
+        of 4: return iselOkMachineReg(machineRegR8)
+        of 5: return iselOkMachineReg(machineRegR9)
+        return iselErrMachineReg("isel: too many call args")
     case index
-    of 0: return Ok[MachineReg](machineRegEdi)
-    of 1: return Ok[MachineReg](machineRegEsi)
-    of 2: return Ok[MachineReg](machineRegEdx)
-    of 3: return Ok[MachineReg](machineRegEcx)
-    of 4: return Ok[MachineReg](machineRegR8d)
-    of 5: return Ok[MachineReg](machineRegR9d)
-    return Err[MachineReg]("isel: too many call args")
+    of 0: return iselOkMachineReg(machineRegEdi)
+    of 1: return iselOkMachineReg(machineRegEsi)
+    of 2: return iselOkMachineReg(machineRegEdx)
+    of 3: return iselOkMachineReg(machineRegEcx)
+    of 4: return iselOkMachineReg(machineRegR8d)
+    of 5: return iselOkMachineReg(machineRegR9d)
+    return iselErrMachineReg("isel: too many call args")
 
 fn iselTmpReg(retType: UirLowerType): MachineReg =
     return iselReg1(retType)
@@ -338,40 +384,44 @@ fn iselCanUseImmOffset(offsetBytes: int64): bool =
     return offsetBytes >= int64(-2147483648) && offsetBytes <= int64(2147483647)
 
 fn iselAddLoad(func: MachineFunc, rd: MachineReg, base: MachineReg, offset: int64, ty: UirLowerType) =
+    var loadBase: MachineReg = base
+    var loadOffset: int64 = offset
     if !iselCanUseImmOffset(offset):
         machineAddInst(func, machineMovReg(machineRegR10, base))
         machineAddInst(func, machineMovImm(machineRegR11, offset))
         machineAddInst(func, machineBin(machineOpAdd, machineRegR10, machineRegR10, machineRegR11))
-        iselAddLoad(func, rd, machineRegR10, 0, ty)
-        return
+        loadBase = machineRegR10
+        loadOffset = 0
     if ty.kind == mtI8:
         if ty.isUnsigned:
-            machineAddInst(func, machineLdrb(rd, base, offset))
+            machineAddInst(func, machineLdrb(rd, loadBase, loadOffset))
         else:
-            machineAddInst(func, machineLdrsb(rd, base, offset))
+            machineAddInst(func, machineLdrsb(rd, loadBase, loadOffset))
         return
     if ty.kind == mtI16:
         if ty.isUnsigned:
-            machineAddInst(func, machineLdrh(rd, base, offset))
+            machineAddInst(func, machineLdrh(rd, loadBase, loadOffset))
         else:
-            machineAddInst(func, machineLdrsh(rd, base, offset))
+            machineAddInst(func, machineLdrsh(rd, loadBase, loadOffset))
         return
-    machineAddInst(func, machineLdr(rd, base, offset))
+    machineAddInst(func, machineLdr(rd, loadBase, loadOffset))
 
 fn iselAddStore(func: MachineFunc, rd: MachineReg, base: MachineReg, offset: int64, ty: UirLowerType) =
+    var storeBase: MachineReg = base
+    var storeOffset: int64 = offset
     if !iselCanUseImmOffset(offset):
         machineAddInst(func, machineMovReg(machineRegR10, base))
         machineAddInst(func, machineMovImm(machineRegR11, offset))
         machineAddInst(func, machineBin(machineOpAdd, machineRegR10, machineRegR10, machineRegR11))
-        iselAddStore(func, rd, machineRegR10, 0, ty)
-        return
+        storeBase = machineRegR10
+        storeOffset = 0
     if ty.kind == mtI8:
-        machineAddInst(func, machineStrb(rd, base, offset))
+        machineAddInst(func, machineStrb(rd, storeBase, storeOffset))
         return
     if ty.kind == mtI16:
-        machineAddInst(func, machineStrh(rd, base, offset))
+        machineAddInst(func, machineStrh(rd, storeBase, storeOffset))
         return
-    machineAddInst(func, machineStr(rd, base, offset))
+    machineAddInst(func, machineStr(rd, storeBase, storeOffset))
 
 fn iselEmitSubSp(func: MachineFunc, amount: int64) =
     if func == nil || amount <= 0:
@@ -482,16 +532,16 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
 fn iselIsF64BitsIntrinsic(name: str): bool =
     if name == nil || len(name) == 0:
         return false
-    return (name == "cheng_f64_add_bits") ||
-           (name == "cheng_f64_sub_bits") ||
-           (name == "cheng_f64_mul_bits") ||
-           (name == "cheng_f64_div_bits") ||
-           (name == "cheng_f64_neg_bits") ||
-           (name == "cheng_f64_lt_bits") ||
-           (name == "cheng_f64_le_bits") ||
-           (name == "cheng_f64_gt_bits") ||
-           (name == "cheng_f64_ge_bits") ||
-           (name == "cheng_i64_to_f64_bits")
+    return strings.streq(name, "cheng_f64_add_bits") ||
+           strings.streq(name, "cheng_f64_sub_bits") ||
+           strings.streq(name, "cheng_f64_mul_bits") ||
+           strings.streq(name, "cheng_f64_div_bits") ||
+           strings.streq(name, "cheng_f64_neg_bits") ||
+           strings.streq(name, "cheng_f64_lt_bits") ||
+           strings.streq(name, "cheng_f64_le_bits") ||
+           strings.streq(name, "cheng_f64_gt_bits") ||
+           strings.streq(name, "cheng_f64_ge_bits") ||
+           strings.streq(name, "cheng_i64_to_f64_bits")
 
 fn iselEmitF64BitsIntrinsic(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr, name: str,
                             dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
@@ -501,7 +551,7 @@ fn iselEmitF64BitsIntrinsic(func: MachineFunc, module: UirModule, uirFunc: UirFu
     let dstX: MachineReg = iselRegWithType(dst, uirTypeI64())
     let tmpX: MachineReg = iselRegWithType(tmp, uirTypeI64())
     let scratchX: MachineReg = iselRegWithType(scratch, uirTypeI64())
-    if (name == "cheng_f64_neg_bits") || (name == "cheng_i64_to_f64_bits"):
+    if strings.streq(name, "cheng_f64_neg_bits") || strings.streq(name, "cheng_i64_to_f64_bits"):
         if uirExprArgsLen(expr) != 1:
             return Err[int32]("isel: intrinsic arg count mismatch: " + name)
         let arg0: UirExpr = uirExprArgAt(expr, 0)
@@ -509,7 +559,7 @@ fn iselEmitF64BitsIntrinsic(func: MachineFunc, module: UirModule, uirFunc: UirFu
                                                  dstX, tmpX, scratchX, baseReg, labelState)
         if !IsOk[int32](argRes):
             return argRes
-        if (name == "cheng_f64_neg_bits"):
+        if strings.streq(name, "cheng_f64_neg_bits"):
             machineAddInst(func, machineMovImm(tmpX, int64(-9223372036854775808)))
             machineAddInst(func, machineBin(machineOpEor, dstX, dstX, tmpX))
             return Ok[int32](0)
@@ -534,28 +584,28 @@ fn iselEmitF64BitsIntrinsic(func: MachineFunc, module: UirModule, uirFunc: UirFu
     iselPop(func, dstX)
     machineAddInst(func, machineFmovDx(machineRegD0, dstX))
     machineAddInst(func, machineFmovDx(machineRegD1, tmpX))
-    if (name == "cheng_f64_add_bits"):
+    if strings.streq(name, "cheng_f64_add_bits"):
         machineAddInst(func, machineFbin(machineOpFaddD, machineRegD0, machineRegD0, machineRegD1))
-    elif (name == "cheng_f64_sub_bits"):
+    elif strings.streq(name, "cheng_f64_sub_bits"):
         machineAddInst(func, machineFbin(machineOpFsubD, machineRegD0, machineRegD0, machineRegD1))
-    elif (name == "cheng_f64_mul_bits"):
+    elif strings.streq(name, "cheng_f64_mul_bits"):
         machineAddInst(func, machineFbin(machineOpFmulD, machineRegD0, machineRegD0, machineRegD1))
-    elif (name == "cheng_f64_div_bits"):
+    elif strings.streq(name, "cheng_f64_div_bits"):
         machineAddInst(func, machineFbin(machineOpFdivD, machineRegD0, machineRegD0, machineRegD1))
-    elif (name == "cheng_f64_lt_bits") || (name == "cheng_f64_le_bits") ||
-         (name == "cheng_f64_gt_bits") || (name == "cheng_f64_ge_bits"):
+    elif strings.streq(name, "cheng_f64_lt_bits") || strings.streq(name, "cheng_f64_le_bits") ||
+         strings.streq(name, "cheng_f64_gt_bits") || strings.streq(name, "cheng_f64_ge_bits"):
         machineAddInst(func, machineFcmpD(machineRegD0, machineRegD1))
         machineAddInst(func, machineMovImm(dstX, 0))
         let labelTrue: str = iselFreshLabel("f64cmp_true_", labelState)
         let labelEnd: str = iselFreshLabel("f64cmp_end_", labelState)
-        if (name == "cheng_f64_lt_bits"):
-            machineAddInst(func, machineBCond(machineCondLo, labelTrue))
-        elif (name == "cheng_f64_le_bits"):
-            machineAddInst(func, machineBCond(machineCondLs, labelTrue))
-        elif (name == "cheng_f64_gt_bits"):
-            machineAddInst(func, machineBCond(machineCondHi, labelTrue))
+        if strings.streq(name, "cheng_f64_lt_bits"):
+            machineAddInst(func, machineBCond(MachineCond(7), labelTrue))
+        elif strings.streq(name, "cheng_f64_le_bits"):
+            machineAddInst(func, machineBCond(MachineCond(8), labelTrue))
+        elif strings.streq(name, "cheng_f64_gt_bits"):
+            machineAddInst(func, machineBCond(MachineCond(9), labelTrue))
         else:
-            machineAddInst(func, machineBCond(machineCondHs, labelTrue))
+            machineAddInst(func, machineBCond(MachineCond(10), labelTrue))
         machineAddInst(func, machineB(labelEnd))
         machineAddInst(func, machineLabel(labelTrue))
         machineAddInst(func, machineMovImm(dstX, 1))
@@ -570,8 +620,9 @@ fn iselNewLabelState(prefix: str): LabelState =
     var st: LabelState
     new st
     st.nextId = 0
-    memRetain void*(prefix)
-    st.prefix = prefix
+    let ownedPrefix: str = prefix == nil ? "" : ("" + prefix)
+    memRetain void*(ownedPrefix)
+    st.prefix = ownedPrefix
     return st
 
 fn iselFreshLabel(prefix: str, state: LabelState): str =
@@ -580,6 +631,11 @@ fn iselFreshLabel(prefix: str, state: LabelState): str =
     let out: str = state.prefix + prefix + intToStr(id)
     memRetain void*(out)
     return out
+
+fn iselAddFuncRaw(module: MachineModule, func: MachineFunc) =
+    if module == nil || func == nil:
+        return
+    add(module.funcs, func)
 
 fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
                 retType: UirLowerType, dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
@@ -601,7 +657,9 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
         let argCount: int32 = uirExprArgsLen(expr)
         let callee: UirFunc = iselFindFunc(module, uirExprCalleeOf(expr))
         var callName: str = uirExprCalleeOf(expr)
-        let calleeLinkName: str = uirFuncLinkNameOf(callee)
+        var calleeLinkName: str = ""
+        if callee != nil:
+            calleeLinkName = uirFuncLinkNameOf(callee)
         if callee != nil && calleeLinkName != nil && len(calleeLinkName) > 0:
             callName = calleeLinkName
         let callSym: str = iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), callName)
@@ -617,13 +675,13 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
         var varargsElemType: UirLowerType = uirTypeI32()
         if callee != nil && uirFuncIsExtern(callee) && uirFuncParamsLen(callee) > 0:
             let lastP: UirParam = uirFuncParamAt(callee, uirFuncParamsLen(callee) - 1)
-            if iselTypeKeyIsVarargs(lastP.typeKey):
+            var typeKeyIsVarargs: bool = false
+            if lastP.typeKey != nil && strings.streq(lastP.typeKey, "varargs"):
+                typeKeyIsVarargs = true
+            if typeKeyIsVarargs:
                 hasVarargs = true
                 fixedCount = uirFuncParamsLen(callee) - 1
-                let elemRes: Result[UirLowerType] = iselVarargsElemTypeFromTypeKey(lastP.typeKey)
-                if ! IsOk[UirLowerType](elemRes):
-                    return ErrInfo[int32](ErrorInfoOf[UirLowerType](elemRes))
-                varargsElemType = Value[UirLowerType](elemRes)
+                varargsElemType = uirTypeI32()
 
         if hasVarargs && argCount < fixedCount:
             return Err[int32]("isel: varargs call missing fixed args")
@@ -717,10 +775,12 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
                 machineAddInst(func, machineMovReg(outReg, srcDst))
             return Ok[int32](0)
         if castType.kind == mtI64 && !srcIs64:
-            machineAddInst(func, machineSxtw(outReg, iselRegWithType(srcDst, uirTypeI32())))
+            let srcI32: MachineReg = iselRegWithType(srcDst, uirTypeI32())
+            machineAddInst(func, machineSxtw(outReg, srcI32))
             return Ok[int32](0)
         if castType.kind == mtF64 && !srcIs64:
-            machineAddInst(func, machineSxtw(outReg, iselRegWithType(srcDst, uirTypeI32())))
+            let srcI32: MachineReg = iselRegWithType(srcDst, uirTypeI32())
+            machineAddInst(func, machineSxtw(outReg, srcI32))
             return Ok[int32](0)
         if castType.kind != mtI64 && castType.kind != mtF64 && srcType.kind == mtI64:
             let truncSrc: MachineReg = iselRegWithType(srcDst, uirTypeI32())
@@ -786,7 +846,9 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
                 machineAddInst(func, machineBin(machineOpUdiv, dstT, dstT, tmpT))
             else:
                 machineAddInst(func, machineBin(machineOpSdiv, dstT, dstT, tmpT))
-            machineAddInst(func, machineMovReg(dstT, iselRegWithType(machineRegRdx, exprType)))
+            let rdxReg: MachineReg = machineRegRdx
+            let rdxTyped: MachineReg = iselRegWithType(rdxReg, exprType)
+            machineAddInst(func, machineMovReg(dstT, rdxTyped))
         of mbAnd:
             machineAddInst(func, machineBin(machineOpAnd, dstT, dstT, tmpT))
         of mbOr:
@@ -827,14 +889,16 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
         if ! IsOk[int32](lhsRes2):
             return lhsRes2
         if cmpType.kind == mtI64 && lt.kind != mtI64 && !lt.isUnsigned:
-            machineAddInst(func, machineSxtw(dstCmp, iselRegWithType(dstCmp, uirTypeI32())))
+            let dstCmpI32: MachineReg = iselRegWithType(dstCmp, uirTypeI32())
+            machineAddInst(func, machineSxtw(dstCmp, dstCmpI32))
         iselPush(func, dstCmp)
         let rhsRes2: Result[int32] = iselEmitExpr(func, module, uirFunc, rhsExpr, cmpType,
                                                   tmpCmp, scratchCmp, dstCmp, baseReg, labelState)
         if ! IsOk[int32](rhsRes2):
             return rhsRes2
         if cmpType.kind == mtI64 && rt.kind != mtI64 && !rt.isUnsigned:
-            machineAddInst(func, machineSxtw(tmpCmp, iselRegWithType(tmpCmp, uirTypeI32())))
+            let tmpCmpI32: MachineReg = iselRegWithType(tmpCmp, uirTypeI32())
+            machineAddInst(func, machineSxtw(tmpCmp, tmpCmpI32))
         iselPop(func, dstCmp)
         machineAddInst(func, machineCmp(dstCmp, tmpCmp))
         let cond: MachineCond = iselCondFromCmp(uirExprCmpOpOf(expr), cmpType.isUnsigned)
@@ -941,14 +1005,16 @@ fn iselEmitCondBranch(func: MachineFunc, module: UirModule, uirFunc: UirFunc, ex
         if ! IsOk[int32](lhsRes):
             return lhsRes
         if cmpType.kind == mtI64 && lt.kind != mtI64 && !lt.isUnsigned:
-            machineAddInst(func, machineSxtw(dstT, iselRegWithType(dstT, uirTypeI32())))
+            let dstI32: MachineReg = iselRegWithType(dstT, uirTypeI32())
+            machineAddInst(func, machineSxtw(dstT, dstI32))
         iselPush(func, dstT)
         let rhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, uirExprRhsOf(expr), cmpType,
                                                  tmpT, scratchT, dstT, baseReg, labelState)
         if ! IsOk[int32](rhsRes):
             return rhsRes
         if cmpType.kind == mtI64 && rt.kind != mtI64 && !rt.isUnsigned:
-            machineAddInst(func, machineSxtw(tmpT, iselRegWithType(tmpT, uirTypeI32())))
+            let tmpI32: MachineReg = iselRegWithType(tmpT, uirTypeI32())
+            machineAddInst(func, machineSxtw(tmpT, tmpI32))
         iselPop(func, dstT)
         machineAddInst(func, machineCmp(dstT, tmpT))
         let cond: MachineCond = iselCondFromCmp(uirExprCmpOpOf(expr), cmpType.isUnsigned)
@@ -965,7 +1031,7 @@ fn iselEmitCondBranch(func: MachineFunc, module: UirModule, uirFunc: UirFunc, ex
         return exprRes
     machineAddInst(func, machineMovImm(tmpT2, 0))
     machineAddInst(func, machineCmp(dstT2, tmpT2))
-    machineAddInst(func, machineBCond(machineCondNe, tLabel))
+    machineAddInst(func, machineBCond(MachineCond(1), tLabel))
     machineAddInst(func, machineB(fLabel))
     return Ok[int32](0)
 
@@ -1000,7 +1066,7 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
                                                      baseReg, labelState)
             if ! IsOk[int32](valRes):
                 return valRes
-        elif (uirFuncNameOf(uirFunc) == "main"):
+        elif strings.streq(uirFuncNameOf(uirFunc), "main"):
             machineAddInst(func, machineMovImm(retReg, 0))
         if frameSize > 0:
             iselEmitAddSp(func, frameSize)
@@ -1018,21 +1084,82 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
         let fLabel: str = labelState.prefix + term.targetFalse
         memRetain void*(tLabel)
         memRetain void*(fLabel)
-        return iselEmitCondBranch(func, module, uirFunc, term.condExpr, retType,
-                                  tLabel,
-                                  fLabel, retReg, tmpReg,
-                                  scratchReg, baseReg, labelState)
+        let condExpr: UirExpr = term.condExpr
+        if condExpr == nil:
+            return Err[int32]("isel: nil cond")
+        if uirExprKindOf(condExpr) == meCmp:
+            let lhsExpr: UirExpr = uirExprLhsOf(condExpr)
+            let rhsExpr: UirExpr = uirExprRhsOf(condExpr)
+            var lt: UirLowerType
+            var rt: UirLowerType
+            if lhsExpr != nil && uirExprKindOf(lhsExpr) == meConstI64 && rhsExpr != nil && uirExprKindOf(rhsExpr) == meConstI64:
+                lt = uirTypeI32()
+                rt = uirTypeI32()
+            elif lhsExpr != nil && uirExprKindOf(lhsExpr) == meConstI64:
+                rt = iselExprType(module, uirFunc, rhsExpr, retType)
+                lt = iselExprType(module, uirFunc, lhsExpr, rt)
+            elif rhsExpr != nil && uirExprKindOf(rhsExpr) == meConstI64:
+                lt = iselExprType(module, uirFunc, lhsExpr, retType)
+                rt = iselExprType(module, uirFunc, rhsExpr, lt)
+            else:
+                lt = iselExprType(module, uirFunc, lhsExpr, retType)
+                rt = iselExprType(module, uirFunc, rhsExpr, retType)
+            let cmpType: UirLowerType = iselMaxType(lt, rt)
+            let dstCmp: MachineReg = iselRegWithType(retReg, cmpType)
+            let tmpCmp: MachineReg = iselRegWithType(tmpReg, cmpType)
+            let scratchCmp: MachineReg = iselRegWithType(scratchReg, cmpType)
+            let lhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, lhsExpr, cmpType,
+                                                     dstCmp, tmpCmp, scratchCmp, baseReg, labelState)
+            if ! IsOk[int32](lhsRes):
+                return lhsRes
+            if cmpType.kind == mtI64 && lt.kind != mtI64 && !lt.isUnsigned:
+                let dstCmpI32: MachineReg = iselRegWithType(dstCmp, uirTypeI32())
+                machineAddInst(func, machineSxtw(dstCmp, dstCmpI32))
+            iselPush(func, dstCmp)
+            let rhsRes: Result[int32] = iselEmitExpr(func, module, uirFunc, rhsExpr, cmpType,
+                                                     tmpCmp, scratchCmp, dstCmp, baseReg, labelState)
+            if ! IsOk[int32](rhsRes):
+                return rhsRes
+            if cmpType.kind == mtI64 && rt.kind != mtI64 && !rt.isUnsigned:
+                let tmpCmpI32: MachineReg = iselRegWithType(tmpCmp, uirTypeI32())
+                machineAddInst(func, machineSxtw(tmpCmp, tmpCmpI32))
+            iselPop(func, dstCmp)
+            machineAddInst(func, machineCmp(dstCmp, tmpCmp))
+            let cond: MachineCond = iselCondFromCmp(uirExprCmpOpOf(condExpr), cmpType.isUnsigned)
+            machineAddInst(func, machineBCond(cond, tLabel))
+            machineAddInst(func, machineB(fLabel))
+            return Ok[int32](0)
+        let exprType: UirLowerType = iselExprType(module, uirFunc, condExpr, retType)
+        let dstCond: MachineReg = iselRegWithType(retReg, exprType)
+        let tmpCond: MachineReg = iselRegWithType(tmpReg, exprType)
+        let scratchCond: MachineReg = iselRegWithType(scratchReg, exprType)
+        let exprRes: Result[int32] = iselEmitExpr(func, module, uirFunc, condExpr, exprType,
+                                                  dstCond, tmpCond, scratchCond, baseReg, labelState)
+        if ! IsOk[int32](exprRes):
+            return exprRes
+        machineAddInst(func, machineMovImm(tmpCond, 0))
+        machineAddInst(func, machineCmp(dstCond, tmpCond))
+        machineAddInst(func, machineBCond(MachineCond(1), tLabel))
+        machineAddInst(func, machineB(fLabel))
+        return Ok[int32](0)
     return Err[int32]("isel: unsupported terminator")
 
 fn x86_64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
+    if func == nil:
+        return Err[MachineFunc]("isel: nil function")
     let linkName: str = uirFuncLinkNameOf(func)
     let funcName: str = (linkName != nil && len(linkName) > 0) ? linkName : uirFuncNameOf(func)
-    let out: MachineFunc = machineNewFunc(iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), funcName))
+    let strippedName: str = iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), funcName)
+    let stableName: str = (strippedName == nil || len(strippedName) == 0) ? "" : strippedName
+    var out: MachineFunc
+    new out
+    out.name = stableName
+    out.insts = []
     let retType: UirLowerType = uirFuncRetTypeOf(func)
     let retReg: MachineReg = iselRetReg(retType)
     let tmpReg: MachineReg = iselTmpReg(retType)
     let scratchReg: MachineReg = iselScratchReg(retType)
-    var labelPrefix: str = out.name
+    var labelPrefix: str = stableName
     if labelPrefix == nil || len(labelPrefix) == 0:
         labelPrefix = uirFuncNameOf(func)
     let labelSep: str = "_"
@@ -1056,8 +1183,12 @@ fn x86_64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
     return iselOkMachineFunc(out)
 
 fn x86_64LowerModule(module: UirModule): Result[MachineModule] =
-    var out: MachineModule = machineNewModule()
+    var out: MachineModule
+    new out
     out.target = uirModuleTargetOf(module)
+    out.funcs = []
+    out.cstrs = []
+    out.globals = []
     for gi in 0..<uirModuleGlobalsLen(module):
         let g: UirGlobal = uirModuleGlobalAt(module, gi)
         let size: int32 = iselTypeSize(g.ty)
@@ -1067,15 +1198,33 @@ fn x86_64LowerModule(module: UirModule): Result[MachineModule] =
             return Err[MachineModule]("isel: unsupported global type (name=" + uirGlobalNameOf(g) + ", kind=" + tk + ", origin=" + origin + ")")
         let alignPow2: int32 = iselTypeAlignPow2(g.ty)
         machineAddGlobal(out, uirGlobalNameOf(g), size, alignPow2, g.init, g.hasInit)
-    for ci in 0..<uirModuleCStringsLen(module):
-        let c: UirCString = uirModuleCStringAt(module, ci)
-        machineAddCString(out, uirCStringLabelOf(c), uirCStringValueOf(c))
+    let lowerCstrs: bool = iselCStringLoweringEnabled()
+    let dbgCstr: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", ""), "1")
+    if lowerCstrs:
+        for ci in 0..<uirModuleCStringsLen(module):
+            let c: UirCString = uirModuleCStringAt(module, ci)
+            let cLabel: str = uirCStringLabelOf(c)
+            let cValue: str = uirCStringValueOf(c)
+            if dbgCstr && ci < 8:
+                let cLen: int32 = cValue == nil ? -1 : len(cValue)
+                let c0: int32 = (cValue != nil && cLen > 0) ? int32(cValue[0]) : -1
+                let c1: int32 = (cValue != nil && cLen > 1) ? int32(cValue[1]) : -1
+                echo("[isel.cstr.x64] i=" + intToStr(ci) + " label=" + cLabel +
+                     " len=" + intToStr(cLen) + " b0=" + intToStr(c0) + " b1=" + intToStr(c1))
+            machineAddCString(out, cLabel, cValue)
     for i in 0..<uirModuleFuncsLen(module):
         let f: UirFunc = uirModuleFuncAt(module, i)
+        if f == nil:
+            continue
         if f != nil && uirFuncIsExtern(f):
             continue
         let fRes: Result[MachineFunc] = x86_64LowerFunc(module, f)
         if ! IsOk[MachineFunc](fRes):
             return ErrInfo[MachineModule](ErrorInfoOf[MachineFunc](fRes))
-        machineAddFunc(out, Value[MachineFunc](fRes))
-    return Ok[MachineModule](out)
+        iselAddFuncRaw(out, Value[MachineFunc](fRes))
+    memRetain void*(out)
+    var okOut: Result[MachineModule]
+    okOut.ok = true
+    okOut.value = out
+    okOut.err = ErrorOk()
+    return okOut

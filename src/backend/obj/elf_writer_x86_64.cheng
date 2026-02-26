@@ -157,6 +157,38 @@ fn elfx64_sortStringsStable(items: var str[]) =
             elfx64WriteStrPtr(items, j + 1, elfx64ReadStrPtr(items, j))
         elfx64WriteStrPtr(items, j + 1, key)
 
+fn elfx64SeqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
+    return items[int(idx)]
+
+fn elfx64SeqAtMachineCString(items: MachineCString[], idx: int32): MachineCString =
+    return items[int(idx)]
+
+fn elfx64SeqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
+    return items[int(idx)]
+
+fn elfx64SeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
+    return items[int(idx)]
+
+fn elfx64ModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
+    if mod == nil:
+        return nil
+    return elfx64SeqAtMachineFunc(mod.funcs, idx)
+
+fn elfx64ModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
+    if mod == nil:
+        return nil
+    return elfx64SeqAtMachineCString(mod.cstrs, idx)
+
+fn elfx64ModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
+    if mod == nil:
+        return nil
+    return elfx64SeqAtMachineGlobal(mod.globals, idx)
+
+fn elfx64FuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
+    if func == nil:
+        return nil
+    return elfx64SeqAtMachineInst(func.insts, idx)
+
 fn elfx64_alignUp(value: uint64, align: uint64): uint64 =
     if align == 0:
         return value
@@ -614,7 +646,7 @@ fn x64JccCode(cond: MachineCond): uint8 =
 fn elfx64Build(module: MachineModule): Result[uint8[]] =
     if module == nil:
         return Err[uint8[]]("elf_writer_x86_64: nil module")
-    if elfx64_targetIsDarwin(module.target):
+    if elfx64_targetIsDarwin(machineModuleTargetOf(module)):
         return Err[uint8[]]("elf_writer_x86_64: darwin target not supported")
 
     # Sections (fixed indices):
@@ -635,51 +667,51 @@ fn elfx64Build(module: MachineModule): Result[uint8[]] =
 
     # Layout rodata (cstrings).
     var cSymOffs: uint64[]
-    cSymOffs.len = int(module.cstrs.len)
-    for ci in 0..<module.cstrs.len:
-        let c: MachineCString = module.cstrs[ci]
+    cSymOffs.len = int(machineModuleCstrsLen(module))
+    for ci in 0..<machineModuleCstrsLen(module):
+        let c: MachineCString = elfx64ModuleCStringAtRaw(module, ci)
         let off: uint64 = uint64(rodata.len)
         cSymOffs[ci] = off
-        bufStr0(&rodata, c.value)
+        bufStr0(&rodata, machineCStringValueOf(c))
 
     # Layout globals.
     var dataSymOffs: uint64[]
-    dataSymOffs.len = int(module.globals.len)
+    dataSymOffs.len = int(machineModuleGlobalsLen(module))
     var bssSymOffs: uint64[]
-    bssSymOffs.len = int(module.globals.len)
+    bssSymOffs.len = int(machineModuleGlobalsLen(module))
     var maxDataAlign: uint64 = 1
     var maxBssAlign: uint64 = 1
-    for gi in 0..<module.globals.len:
-        let g: MachineGlobal = module.globals[gi]
-        let align: uint64 = uint64(1) << uint64(g.alignPow2)
-        if g.hasInit:
+    for gi in 0..<machineModuleGlobalsLen(module):
+        let g: MachineGlobal = elfx64ModuleGlobalAtRaw(module, gi)
+        let align: uint64 = uint64(1) << uint64(machineGlobalAlignPow2Of(g))
+        if machineGlobalHasInit(g):
             if align > maxDataAlign:
                 maxDataAlign = align
             bufAlign(&data, align)
             dataSymOffs[gi] = uint64(data.len)
-            if g.size == 4:
-                bufU32(&data, uint32(int32(g.init)))
+            if machineGlobalSizeOf(g) == 4:
+                bufU32(&data, uint32(int32(machineGlobalInitOf(g))))
             else:
-                bufU64(&data, uint64(g.init))
+                bufU64(&data, uint64(machineGlobalInitOf(g)))
         else:
             if align > maxBssAlign:
                 maxBssAlign = align
             bssSize = elfx64_alignUp(bssSize, align)
             bssSymOffs[gi] = bssSize
-            bssSize = bssSize + uint64(g.size)
+            bssSize = bssSize + uint64(machineGlobalSizeOf(g))
 
     # Encode .text and collect relocations.
     var relocs: ElfX64Reloc[]
     var funcOffs: uint64[]
-    funcOffs.len = int(module.funcs.len)
+    funcOffs.len = int(machineModuleFuncsLen(module))
     var funcSizes: uint64[]
-    funcSizes.len = int(module.funcs.len)
+    funcSizes.len = int(machineModuleFuncsLen(module))
 
-    for fi in 0..<module.funcs.len:
+    for fi in 0..<machineModuleFuncsLen(module):
         bufAlign(text, 4)
         let fStart: uint64 = uint64(text.len)
         funcOffs[fi] = fStart
-        let f: MachineFunc = module.funcs[fi]
+        let f: MachineFunc = elfx64ModuleFuncAtRaw(module, fi)
 
         var labels: str[]
         labels.cap = 16
@@ -688,128 +720,128 @@ fn elfx64Build(module: MachineModule): Result[uint8[]] =
         var fixups: ElfX64TextFixup[]
         fixups.cap = 16
 
-        for ii in 0..<f.insts.len:
-            let inst: MachineInst = f.insts[ii]
-            if inst.op == machineOpLabel:
-                add(labels, inst.label)
+        for ii in 0..<machineFuncInstsLen(f):
+            let inst: MachineInst = elfx64FuncInstAtRaw(f, ii)
+            if machineInstOpOf(inst) == machineOpLabel:
+                add(labels, machineInstLabelOf(inst))
                 add(labelOffs, int32(text.len))
                 continue
             let instStart: int32 = int32(text.len)
-            case inst.op
+            case machineInstOpOf(inst)
             of machineOpSubSp:
-                x64EmitSubRspImm32(text, inst.imm)
+                x64EmitSubRspImm32(text, machineInstImmOf(inst))
             of machineOpAddSp:
-                x64EmitAddRspImm32(text, inst.imm)
+                x64EmitAddRspImm32(text, machineInstImmOf(inst))
             of machineOpMovReg:
-                x64EmitMovRegReg(text, inst.rd, inst.rn)
+                x64EmitMovRegReg(text, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpMovImm:
-                x64EmitMovImm(text, inst.rd, inst.imm)
+                x64EmitMovImm(text, machineInstRdOf(inst), machineInstImmOf(inst))
             of machineOpAdrp:
-                x64EmitLeaRipRel32(text, inst.rd)
+                x64EmitLeaRipRel32(text, machineInstRdOf(inst))
                 var r: ElfX64Reloc
                 new r
                 r.off = uint64(instStart + 3)
-                r.sym = inst.label
+                r.sym = machineInstLabelOf(inst)
                 r.rtype = R_X86_64_PC32
                 r.addend = -4
                 add(relocs, r)
             of machineOpSxtw:
-                x64EmitMovsxd(text, inst.rd, inst.rn)
+                x64EmitMovsxd(text, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpAdd:
-                x64EmitBinRR(text, uint8(0x01), inst.rd, inst.rn, inst.rm)
+                x64EmitBinRR(text, uint8(0x01), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpSub:
-                x64EmitBinRR(text, uint8(0x29), inst.rd, inst.rn, inst.rm)
+                x64EmitBinRR(text, uint8(0x29), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpAnd:
-                x64EmitBinRR(text, uint8(0x21), inst.rd, inst.rn, inst.rm)
+                x64EmitBinRR(text, uint8(0x21), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpOrr:
-                x64EmitBinRR(text, uint8(0x09), inst.rd, inst.rn, inst.rm)
+                x64EmitBinRR(text, uint8(0x09), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpEor:
-                x64EmitBinRR(text, uint8(0x31), inst.rd, inst.rn, inst.rm)
+                x64EmitBinRR(text, uint8(0x31), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpLsl:
-                x64EmitShift(text, 4, inst.rd, inst.rn)
+                x64EmitShift(text, 4, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpLsr:
-                x64EmitShift(text, 5, inst.rd, inst.rn)
+                x64EmitShift(text, 5, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpAsr:
-                x64EmitShift(text, 7, inst.rd, inst.rn)
+                x64EmitShift(text, 7, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpMul:
-                x64EmitImul(text, inst.rd, inst.rn, inst.rm)
+                x64EmitImul(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpFmovDx:
-                x64EmitMovqXmmReg(text, inst.rd, inst.rn)
+                x64EmitMovqXmmReg(text, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpFmovXd:
-                x64EmitMovqRegXmm(text, inst.rd, inst.rn)
+                x64EmitMovqRegXmm(text, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpFaddD:
-                x64EmitFbinD(text, uint8(0x58), inst.rd, inst.rn, inst.rm)
+                x64EmitFbinD(text, uint8(0x58), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpFsubD:
-                x64EmitFbinD(text, uint8(0x5C), inst.rd, inst.rn, inst.rm)
+                x64EmitFbinD(text, uint8(0x5C), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpFmulD:
-                x64EmitFbinD(text, uint8(0x59), inst.rd, inst.rn, inst.rm)
+                x64EmitFbinD(text, uint8(0x59), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpFdivD:
-                x64EmitFbinD(text, uint8(0x5E), inst.rd, inst.rn, inst.rm)
+                x64EmitFbinD(text, uint8(0x5E), machineInstRdOf(inst), machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpScvtfDx:
-                x64EmitScvtfDx(text, inst.rd, inst.rn)
+                x64EmitScvtfDx(text, machineInstRdOf(inst), machineInstRnOf(inst))
             of machineOpFcmpD:
-                x64EmitFcmpD(text, inst.rn, inst.rm)
+                x64EmitFcmpD(text, machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpSdiv:
-                let is64: bool = x64Is64(inst.rd)
+                let is64: bool = x64Is64(machineInstRdOf(inst))
                 if is64:
                     x64EmitCqo(text)
                 else:
                     x64EmitCdq(text)
-                x64EmitDiv(text, true, is64, inst.rm)
+                x64EmitDiv(text, true, is64, machineInstRmOf(inst))
             of machineOpUdiv:
-                let is64u: bool = x64Is64(inst.rd)
+                let is64u: bool = x64Is64(machineInstRdOf(inst))
                 x64EmitXorEdxEdx(text)
-                x64EmitDiv(text, false, is64u, inst.rm)
+                x64EmitDiv(text, false, is64u, machineInstRmOf(inst))
             of machineOpCmp:
-                x64EmitCmpRR(text, inst.rn, inst.rm)
+                x64EmitCmpRR(text, machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpB:
                 x64EmitJmpRel32(text)
                 var f0: ElfX64TextFixup
                 new f0
                 f0.dispOff = instStart + 1
                 f0.nextOff = int32(text.len)
-                f0.label = inst.label
+                f0.label = machineInstLabelOf(inst)
                 add(fixups, f0)
             of machineOpBCond:
-                let cc: uint8 = x64JccCode(inst.cond)
+                let cc: uint8 = x64JccCode(machineInstCondOf(inst))
                 x64EmitJccRel32(text, cc)
                 var f1: ElfX64TextFixup
                 new f1
                 f1.dispOff = instStart + 2
                 f1.nextOff = int32(text.len)
-                f1.label = inst.label
+                f1.label = machineInstLabelOf(inst)
                 add(fixups, f1)
             of machineOpBl:
                 x64EmitCallRel32(text)
                 var r2: ElfX64Reloc
                 new r2
                 r2.off = uint64(instStart + 1)
-                r2.sym = inst.label
+                r2.sym = machineInstLabelOf(inst)
                 r2.rtype = R_X86_64_PLT32
                 r2.addend = -4
                 add(relocs, r2)
             of machineOpBlr:
-                x64EmitCallReg(text, inst.rn)
+                x64EmitCallReg(text, machineInstRnOf(inst))
             of machineOpRet:
                 bufU8(text, uint8(0xC3))
             of machineOpStr:
-                x64EmitStore(text, inst.rd, inst.rn, inst.imm)
+                x64EmitStore(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst))
             of machineOpLdr:
-                x64EmitLoad(text, inst.rd, inst.rn, inst.imm)
+                x64EmitLoad(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst))
             of machineOpStrb:
-                x64EmitStore8(text, inst.rd, inst.rn, inst.imm)
+                x64EmitStore8(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst))
             of machineOpLdrb:
-                x64EmitLoad8(text, inst.rd, inst.rn, inst.imm, false)
+                x64EmitLoad8(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst), false)
             of machineOpLdrsb:
-                x64EmitLoad8(text, inst.rd, inst.rn, inst.imm, true)
+                x64EmitLoad8(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst), true)
             of machineOpStrh:
-                x64EmitStore16(text, inst.rd, inst.rn, inst.imm)
+                x64EmitStore16(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst))
             of machineOpLdrh:
-                x64EmitLoad16(text, inst.rd, inst.rn, inst.imm, false)
+                x64EmitLoad16(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst), false)
             of machineOpLdrsh:
-                x64EmitLoad16(text, inst.rd, inst.rn, inst.imm, true)
+                x64EmitLoad16(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst), true)
             else:
-                return Err[uint8[]]("elf_writer_x86_64: unsupported machine op (op=" + intToStr(int32(inst.op)) + ")")
+                return Err[uint8[]]("elf_writer_x86_64: unsupported machine op (op=" + intToStr(int32(machineInstOpOf(inst))) + ")")
 
         # Patch local branches.
         for pi in 0..<fixups.len:
@@ -839,26 +871,26 @@ fn elfx64Build(module: MachineModule): Result[uint8[]] =
     elfx64AddSectionSym(syms, uint16(4))
 
     # locals: cstrings
-    for ci in 0..<module.cstrs.len:
-        let c2: MachineCString = module.cstrs[ci]
-        elfx64AddSym(syms, c2.label, STB_LOCAL, STT_OBJECT, uint16(2),
-                     cSymOffs[ci], uint64(len(c2.value) + 1))
+    for ci in 0..<machineModuleCstrsLen(module):
+        let c2: MachineCString = elfx64ModuleCStringAtRaw(module, ci)
+        elfx64AddSym(syms, machineCStringLabelOf(c2), STB_LOCAL, STT_OBJECT, uint16(2),
+                     cSymOffs[ci], uint64(len(machineCStringValueOf(c2)) + 1))
 
     # globals: funcs
-    for fi in 0..<module.funcs.len:
-        let f2: MachineFunc = module.funcs[fi]
-        elfx64AddSym(syms, f2.name, STB_GLOBAL, STT_FUNC, uint16(1),
+    for fi in 0..<machineModuleFuncsLen(module):
+        let f2: MachineFunc = elfx64ModuleFuncAtRaw(module, fi)
+        elfx64AddSym(syms, machineFuncNameOf(f2), STB_GLOBAL, STT_FUNC, uint16(1),
                      funcOffs[fi], funcSizes[fi])
 
     # globals: data/bss
-    for gi in 0..<module.globals.len:
-        let g2: MachineGlobal = module.globals[gi]
-        if g2.hasInit:
-            elfx64AddSym(syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(3),
-                         dataSymOffs[gi], uint64(g2.size))
+    for gi in 0..<machineModuleGlobalsLen(module):
+        let g2: MachineGlobal = elfx64ModuleGlobalAtRaw(module, gi)
+        if machineGlobalHasInit(g2):
+            elfx64AddSym(syms, machineGlobalNameOf(g2), STB_GLOBAL, STT_OBJECT, uint16(3),
+                         dataSymOffs[gi], uint64(machineGlobalSizeOf(g2)))
         else:
-            elfx64AddSym(syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(4),
-                         bssSymOffs[gi], uint64(g2.size))
+            elfx64AddSym(syms, machineGlobalNameOf(g2), STB_GLOBAL, STT_OBJECT, uint16(4),
+                         bssSymOffs[gi], uint64(machineGlobalSizeOf(g2)))
 
     # undefs from relocations.
     var undefs: str[]
@@ -1061,4 +1093,6 @@ fn elfx64Build(module: MachineModule): Result[uint8[]] =
     return Ok[uint8[]](out)
 
 fn elfWriteX86_64RelocatableObj(module: MachineModule): Result[uint8[]] =
+    if module != nil:
+        memRetain(void*(module))
     return elfx64Build(module)

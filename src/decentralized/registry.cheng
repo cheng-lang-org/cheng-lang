@@ -5,6 +5,7 @@ import cheng/runtime/json_ast as json
 import cheng/decentralized/json_parse as jparse
 import cheng/decentralized/cid as dcid
 import cheng/decentralized/file_bytes as fbytes
+import cheng/decentralized/ast_simhash as simhash
 import cheng/libp2p/crypto/crypto as crypto
 import cheng/libp2p/multibase as multibase
 import cheng/libp2p/utils/bytes as bytes
@@ -19,6 +20,8 @@ type
         epoch: int32
         cidText: str
         format: str
+        astSimhash64: str
+        originalityScore: float64
         pubKeyText: str
         sigText: str
         createdTs: str
@@ -38,6 +41,10 @@ fn snapshotPayload(s: PackageSnapshot): str =
         intToStr(s.epoch) + "|" + s.cidText
     if s.format != nil && len(s.format) > 0:
         out = out + "|" + s.format
+    if s.astSimhash64 != nil && len(s.astSimhash64) > 0:
+        out = out + "|" + s.astSimhash64
+    if s.originalityScore > 0:
+        out = out + "|" + $ s.originalityScore
     return out
 
 fn normalizeSnapshotFormat(fmt: str): str =
@@ -123,6 +130,11 @@ fn signSnapshot(s: PackageSnapshot, privText: str): result.Result[PackageSnapsho
     return result.Ok[PackageSnapshot](out)
 
 fn verifySnapshot(s: PackageSnapshot): bool =
+    let hashRes: result.Result[str] = simhash.normalizeSimhash64(s.astSimhash64)
+    if result.IsErr(hashRes):
+        return false
+    if s.originalityScore <= 0.0 || s.originalityScore > 1.0:
+        return false
     if s.pubKeyText == nil || len(s.pubKeyText) == 0:
         return false
     if s.sigText == nil || len(s.sigText) == 0:
@@ -147,6 +159,10 @@ fn snapshotToJson(s: PackageSnapshot): json.JsonNode =
     node["cid"] = json.newJString(s.cidText)
     if s.format != nil && len(s.format) > 0:
         node["format"] = json.newJString(s.format)
+    if s.astSimhash64 != nil && len(s.astSimhash64) > 0:
+        node["ast_simhash64"] = json.newJString(s.astSimhash64)
+    if s.originalityScore > 0:
+        node["originality_score"] = json.newJFloat(s.originalityScore)
     if s.pubKeyText != nil && len(s.pubKeyText) > 0:
         node["pub_key"] = json.newJString(s.pubKeyText)
     if s.sigText != nil && len(s.sigText) > 0:
@@ -163,6 +179,8 @@ fn parseSnapshot(node: json.JsonNode): PackageSnapshot =
     s.epoch = int32(jparse.getIntField(node, "epoch", 0))
     s.cidText = jparse.getStringField(node, "cid", "")
     s.format = normalizeSnapshotFormat(jparse.getStringField(node, "format", ""))
+    s.astSimhash64 = jparse.getStringField(node, "ast_simhash64", "")
+    s.originalityScore = jparse.getFloatField(node, "originality_score", 0.0)
     s.pubKeyText = jparse.getStringField(node, "pub_key", "")
     s.sigText = jparse.getStringField(node, "signature", "")
     s.createdTs = jparse.getStringField(node, "created_ts", "")
@@ -190,6 +208,41 @@ fn appendLine(path: str, line: str): bool =
     os.close(f)
     return true
 
+fn findSimhashCollision(registryPath: str, candidateRaw: str): result.Result[bool] =
+    let candRes: result.Result[str] = simhash.normalizeSimhash64(candidateRaw)
+    if result.IsErr(candRes):
+        return result.Err[bool]("registry: invalid ast_simhash64")
+    let candidate: str = result.Value(candRes)
+    if ! os.fileExists(registryPath):
+        return result.Ok[bool](false)
+    let content = os.readFile(registryPath)
+    if content == nil || len(content) == 0:
+        return result.Ok[bool](false)
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let node: json.JsonNode = parsed.value
+        let kind = jparse.getStringField(node, "type", "")
+        if kind != "publish":
+            continue
+        let existingHash = jparse.getStringField(node, "ast_simhash64", "")
+        if existingHash == nil || len(existingHash) == 0:
+            continue
+        let dist = simhash.hammingDistanceHex64(candidate, existingHash)
+        if dist <= 6:
+            return result.Err[bool](
+                "registry: originality guard blocked (simhash distance <= 6, approx similarity >= 90%)"
+            )
+    return result.Ok[bool](false)
+
+fn fingerprintSourceDirAstSimhash64(root: str): result.Result[str] =
+    return simhash.computeAstSimhash64ForDir(root)
+
 fn publishSnapshot(registryPath: str, s: PackageSnapshot, privText: str): result.Result[PackageSnapshot] =
     if ! isChannelSupported(s.channel):
         return result.Err[PackageSnapshot]("registry: invalid channel")
@@ -207,6 +260,17 @@ fn publishSnapshot(registryPath: str, s: PackageSnapshot, privText: str): result
         return result.Err[PackageSnapshot](result.Error(cidRes))
     var out: PackageSnapshot = s
     out.format = normFormat
+    let hashRes: result.Result[str] = simhash.normalizeSimhash64(out.astSimhash64)
+    if result.IsErr(hashRes):
+        return result.Err[PackageSnapshot]("registry: missing or invalid ast_simhash64")
+    out.astSimhash64 = result.Value(hashRes)
+    if out.originalityScore <= 0.0:
+        out.originalityScore = 1.0
+    if out.originalityScore > 1.0:
+        out.originalityScore = 1.0
+    let guardRes: result.Result[bool] = findSimhashCollision(registryPath, out.astSimhash64)
+    if result.IsErr(guardRes):
+        return result.Err[PackageSnapshot](result.Error(guardRes))
     if out.createdTs == nil || len(out.createdTs) == 0:
         out.createdTs = snapshotTs()
     let signedRes: result.Result[PackageSnapshot] = signSnapshot(out, privText)

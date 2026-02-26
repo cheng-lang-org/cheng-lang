@@ -1,0 +1,298 @@
+import std/os
+import std/strutils as strutil
+import std/tables_compat as tables
+import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import cheng/decentralized/exec_request as dexec
+
+type
+    AskCard =
+        peerId: str
+        tsMs: int64
+        ttlMs: int64
+        bandwidthOutBytes: int64
+        askPriceCpuNano: int64
+        askPriceGpuNano: int64
+        askPriceIoNano: int64
+        askWorkloadMask: int64
+        fraudScore: float64
+
+    MatchResult =
+        ok: bool
+        peerId: str
+        expectedCostNano: int64
+        fraudScore: float64
+        bandwidthOutBytes: int64
+        reason: str
+
+const
+    workloadMaskTrain = 1
+    workloadMaskInfer = 2
+    workloadMaskOther = 4
+    workloadMaskAll = workloadMaskTrain | workloadMaskInfer | workloadMaskOther
+    defaultRiskWindowEpochs = 3
+
+fn initMatchResult(): MatchResult =
+    MatchResult(ok: false, peerId: "", expectedCostNano: 0, fraudScore: 0.0, bandwidthOutBytes: 0, reason: "")
+
+fn matchFail(reason: str): MatchResult =
+    var out = initMatchResult()
+    out.reason = reason
+    return out
+
+fn workloadMaskFor(workloadRaw: str): int64 =
+    let workload = strutil.toLowerAscii(strutil.strip(workloadRaw))
+    if workload == "train":
+        return workloadMaskTrain
+    if workload == "infer":
+        return workloadMaskInfer
+    return workloadMaskOther
+
+fn fraudSeverityWeight(severityRaw: str): float64 =
+    let severity = strutil.toLowerAscii(strutil.strip(severityRaw))
+    if severity == "low":
+        return 0.1
+    if severity == "medium":
+        return 0.5
+    return 1.0
+
+fn clampFraudScore(score: float64): float64 =
+    if score < 0.0:
+        return 0.0
+    if score > 1.0:
+        return 1.0
+    return score
+
+fn safeMul(a: int64, b: int64): int64 =
+    if a <= 0 || b <= 0:
+        return 0
+    let maxI64: int64 = 9223372036854775807
+    if a > maxI64 / b:
+        return maxI64
+    return a * b
+
+fn safeAdd(a: int64, b: int64): int64 =
+    let maxI64: int64 = 9223372036854775807
+    if b > 0 && a > maxI64 - b:
+        return maxI64
+    return a + b
+
+fn ceilDiv(a: int64, b: int64): int64 =
+    if a <= 0 || b <= 0:
+        return 0
+    return (a + b - 1) / b
+
+fn computeExpectedCostNano(req: dexec.ExecRequest, card: AskCard): int64 =
+    let cpuCost = safeMul(req.maxCpuMs, card.askPriceCpuNano)
+    let gpuCost = safeMul(req.maxGpuMs, card.askPriceGpuNano)
+    let ioCost = safeMul(ceilDiv(req.maxIoBytes, 1024), card.askPriceIoNano)
+    return safeAdd(safeAdd(cpuCost, gpuCost), ioCost)
+
+fn readBandwidthOut(node: json.JsonNode): int64 =
+    let direct = jparse.getIntField(node, "bandwidth_out_bytes", 0)
+    if direct > 0:
+        return direct
+    if node != nil && node.hasKey("resource"):
+        let resNode = json.jsonGetField(node, "resource")
+        let nested = jparse.getIntField(resNode, "bandwidth_out_bytes", 0)
+        if nested > 0:
+            return nested
+    return 0
+
+fn parseAskCard(node: json.JsonNode): AskCard =
+    var out: AskCard
+    out.peerId = jparse.getStringField(node, "peer_id", "")
+    out.tsMs = jparse.getIntField(node, "ts_ms", 0)
+    out.ttlMs = jparse.getIntField(node, "ttl_ms", 0)
+    out.bandwidthOutBytes = readBandwidthOut(node)
+    out.askPriceCpuNano = jparse.getIntField(node, "ask_price_cpu_nano", 0)
+    out.askPriceGpuNano = jparse.getIntField(node, "ask_price_gpu_nano", 0)
+    out.askPriceIoNano = jparse.getIntField(node, "ask_price_io_nano", 0)
+    out.askWorkloadMask = jparse.getIntField(node, "ask_workload_mask", workloadMaskAll)
+    if out.askWorkloadMask <= 0:
+        out.askWorkloadMask = 0
+    out.fraudScore = jparse.getFloatField(node, "fraud_score", 0.0)
+    if out.fraudScore == 0.0:
+        out.fraudScore = jparse.getFloatField(node, "executor_fraud_score", 0.0)
+    if out.fraudScore < 0.0:
+        out.fraudScore = 0.0
+    if out.fraudScore > 1.0:
+        out.fraudScore = 1.0
+    return out
+
+fn detectFraudReferenceEpoch(ledgerPath: str, epochHint: int32): int32 =
+    if epochHint > 0:
+        return epochHint
+    if ledgerPath == nil || len(ledgerPath) == 0:
+        return 0
+    if ! os.fileExists(ledgerPath):
+        return 0
+    let content = os.readFile(ledgerPath)
+    if content == nil || len(content) == 0:
+        return 0
+    var latest: int32 = 0
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let epoch = int32(jparse.getIntField(parsed.value, "epoch", 0))
+        if epoch > latest:
+            latest = epoch
+    return latest
+
+fn computeFraudScores(ledgerPath: str, refEpoch: int32, riskWindowEpochs: int32): tables.Table[float64] =
+    var scores: tables.Table[float64] = tables.TableInit[float64](256)
+    if ledgerPath == nil || len(ledgerPath) == 0:
+        return scores
+    if ! os.fileExists(ledgerPath):
+        return scores
+    let content = os.readFile(ledgerPath)
+    if content == nil || len(content) == 0:
+        return scores
+    var window: int32 = riskWindowEpochs
+    if window <= 0:
+        window = defaultRiskWindowEpochs
+    var epochBound: int32 = refEpoch
+    if epochBound < 0:
+        epochBound = 0
+    let startEpoch: int32 = epochBound - window + 1
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let node = parsed.value
+        let kind = jparse.getStringField(node, "type", "")
+        if kind != "fraud_report":
+            continue
+        let epoch = int32(jparse.getIntField(node, "epoch", 0))
+        if epoch < startEpoch || epoch > epochBound:
+            continue
+        let executorId = jparse.getStringField(node, "executor_id", "")
+        if executorId == nil || len(executorId) == 0:
+            continue
+        let severity = jparse.getStringField(node, "severity", "high")
+        let oldScore = tables.TableGet[float64](scores, executorId)
+        let newScore = clampFraudScore(oldScore + fraudSeverityWeight(severity))
+        tables.TablePut[float64](scores, executorId, newScore)
+    return scores
+
+fn lookupFraudScore(scores: tables.Table[float64], executorId: str): float64 =
+    if executorId == nil || len(executorId) == 0:
+        return 0.0
+    if ! tables.TableHas[float64](scores, executorId):
+        return 0.0
+    return clampFraudScore(tables.TableGet[float64](scores, executorId))
+
+fn cardExpired(card: AskCard, nowMs: int64): bool =
+    if card.ttlMs <= 0:
+        return false
+    if card.tsMs <= 0:
+        return false
+    return nowMs > card.tsMs + card.ttlMs
+
+fn isBetter(
+    costA: int64,
+    fraudScoreA: float64,
+    cardA: AskCard,
+    costB: int64,
+    fraudScoreB: float64,
+    cardB: AskCard
+): bool =
+    if costA < costB:
+        return true
+    if costA > costB:
+        return false
+    if fraudScoreA < fraudScoreB:
+        return true
+    if fraudScoreA > fraudScoreB:
+        return false
+    if cardA.bandwidthOutBytes > cardB.bandwidthOutBytes:
+        return true
+    if cardA.bandwidthOutBytes < cardB.bandwidthOutBytes:
+        return false
+    return cardA.peerId < cardB.peerId
+
+fn collectCards(root: json.JsonNode, out: var AskCard[]): int32 =
+    if root == nil:
+        return 0
+    var count: int32 = 0
+    if root.kind == json.JArray:
+        for i in 0..<root.a.len:
+            let node = root.a[i]
+            add[AskCard](out, parseAskCard(node))
+            count = count + 1
+        return count
+    if root.kind == json.JObject && root.hasKey("cards"):
+        let cards = json.jsonGetField(root, "cards")
+        if cards != nil && cards.kind == json.JArray:
+            for i in 0..<cards.a.len:
+                let node = cards.a[i]
+                add[AskCard](out, parseAskCard(node))
+                count = count + 1
+        return count
+    return 0
+
+fn chooseExecutorFromText(content: str, req: dexec.ExecRequest, fraudScores: tables.Table[float64]): MatchResult =
+    if content == nil || len(content) == 0:
+        return matchFail("orderbook is empty")
+    let parsed = jparse.parseJsonSafe(content)
+    if ! parsed.ok:
+        return matchFail("orderbook parse failed")
+    var cards: AskCard[]
+    let total = collectCards(parsed.value, cards)
+    if total <= 0:
+        return matchFail("orderbook has no cards")
+    let workloadMask = workloadMaskFor(req.workloadKind)
+    let nowMs = int64(os.time()) * 1000
+    var found = false
+    var best: AskCard
+    var bestCost: int64 = 0
+    var bestFraudScore: float64 = 0.0
+    for i in 0..<cards.len:
+        let card = cards[i]
+        if card.peerId == nil || len(card.peerId) == 0:
+            continue
+        if card.askWorkloadMask > 0 && ((card.askWorkloadMask & workloadMask) == 0):
+            continue
+        if cardExpired(card, nowMs):
+            continue
+        let cost = computeExpectedCostNano(req, card)
+        let fraudScore = lookupFraudScore(fraudScores, card.peerId)
+        if ! found:
+            found = true
+            best = card
+            bestCost = cost
+            bestFraudScore = fraudScore
+            continue
+        if isBetter(cost, fraudScore, card, bestCost, bestFraudScore, best):
+            best = card
+            bestCost = cost
+            bestFraudScore = fraudScore
+    if ! found:
+        return matchFail("no eligible executor in orderbook")
+    var out = initMatchResult()
+    out.ok = true
+    out.peerId = best.peerId
+    out.expectedCostNano = bestCost
+    out.fraudScore = bestFraudScore
+    out.bandwidthOutBytes = best.bandwidthOutBytes
+    out.reason = "matched"
+    return out
+
+fn chooseExecutor(orderbookPath: str, ledgerPath: str, req: dexec.ExecRequest, riskWindowEpochs: int32): MatchResult =
+    if orderbookPath == nil || len(orderbookPath) == 0:
+        return matchFail("orderbook path missing")
+    if ! os.fileExists(orderbookPath):
+        return matchFail("orderbook file not found")
+    let content = os.readFile(orderbookPath)
+    let refEpoch = detectFraudReferenceEpoch(ledgerPath, req.epoch)
+    let fraudScores = computeFraudScores(ledgerPath, refEpoch, riskWindowEpochs)
+    return chooseExecutorFromText(content, req, fraudScores)

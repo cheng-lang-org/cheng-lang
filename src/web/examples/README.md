@@ -6,17 +6,17 @@ Counter demo (WASM runtime):
 - Open `index.html`.
 
 Dev server (live reload):
-- Build: `cheng/web/cli/build_native_server.sh --entry:cheng/web/cli/dev_server_main.cheng --name:cheng_dev_server`
+- Build: `sh src/tooling/tooling_exec.sh web_build_native_server --entry:cheng/web/cli/dev_server_main.cheng --name:cheng_dev_server`
 - Run: `WEB_ROOT=cheng/web/examples ./cheng_dev_server --host:127.0.0.1 --port:5173`
 - Optional: `WEB_BUILD="<your build command>"` to rebuild wasm on change.
-  - Or build `src/tooling/chengc.sh cheng/web/cli/web.cheng --name:cheng_web` then run `WEB_ROOT=cheng/web/examples ./cheng_web dev --host:127.0.0.1 --port:5173`.
+  - Or build `sh src/tooling/tooling_exec.sh chengc cheng/web/cli/web.cheng --name:cheng_web` then run `WEB_ROOT=cheng/web/examples ./cheng_web dev --host:127.0.0.1 --port:5173`.
 
 Build (compile .cwc):
-- `src/tooling/chengc.sh cheng/web/cli/web.cheng --name:cheng_web`
+- `sh src/tooling/tooling_exec.sh chengc cheng/web/cli/web.cheng --name:cheng_web`
 - `WEB_ROOT=cheng/web/examples ./cheng_web build --out:cheng/web/examples/dist --map` (copies common assets + map)
 
 Preview server (static):
-- Build: `cheng/web/cli/build_native_server.sh --entry:cheng/web/cli/preview_server_main.cheng --name:cheng_preview_server`
+- Build: `sh src/tooling/tooling_exec.sh web_build_native_server --entry:cheng/web/cli/preview_server_main.cheng --name:cheng_preview_server`
 - Run: `WEB_ROOT=cheng/web/examples ./cheng_preview_server --host:127.0.0.1 --port:4173`
   - Or run `WEB_ROOT=cheng/web/examples ./cheng_web preview --host:127.0.0.1 --port:4173`.
 
@@ -29,7 +29,7 @@ Files:
 
 Router demo:
 - Route files live under `examples/routes` (file-based routing shape only).
-- Generate `routes_manifest.cheng` via `src/tooling/chengc.sh cheng/web/cli/route_manifest.cheng --name:cheng_route_manifest` then run `./cheng_route_manifest --root:cheng/web/examples/routes --out:cheng/web/examples/routes_manifest.cheng`.
+- Generate `routes_manifest.cheng` via `sh src/tooling/tooling_exec.sh chengc cheng/web/cli/route_manifest.cheng --name:cheng_route_manifest` then run `./cheng_route_manifest --root:cheng/web/examples/routes --out:cheng/web/examples/routes_manifest.cheng`.
   - Or run `./cheng_web route-manifest --root:cheng/web/examples/routes --out:cheng/web/examples/routes_manifest.cheng`.
 - Compile `router_app.cheng` to `client.wasm` to try routing.
   - Alternatively, set `WEB_MANIFEST_ROOT=cheng/web/examples/routes` and run the dev server to auto-generate.
@@ -46,4 +46,4 @@ Server demo:
 Server app:
 - server_app.cheng: uses runtime `server_app` + std/server to expose `server_handle` for adapters.
 - server_main.cheng: entrypoint that calls the native server adapter.
-- build with `cheng/web/cli/build_native_server.sh --entry:cheng/web/examples/server_main.cheng`.
+- build with `sh src/tooling/tooling_exec.sh web_build_native_server --entry:cheng/web/examples/server_main.cheng`.

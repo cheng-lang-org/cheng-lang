@@ -1,0 +1,44 @@
+# Host-only direct executable writer facade (phase-1).
+# This keeps a stable API for function-chunk/relo patch planning while
+# reusing the proven in-memory self-linker core.
+import std/result
+import cheng/backend/obj/macho_linker
+
+type
+    DirectFunctionChunk = ref
+        name: str
+        textOffset: uint64
+        textSize: uint64
+
+    DirectRelocPatch = ref
+        fromOffset: uint64
+        toSymbol: str
+        patchKind: str
+
+fn machoDirectComputeTextLayout(chunks: DirectFunctionChunk[]): uint64[] =
+    var out: uint64[]
+    out.cap = chunks.len
+    var cursor: uint64 = 0
+    for i in 0..<chunks.len:
+        add(out, cursor)
+        let c: DirectFunctionChunk = chunks[i]
+        if c != nil:
+            cursor = cursor + c.textSize
+    return out
+
+fn machoDirectWriteHostExe(mainObjBytes: uint8[],
+                           chunks: DirectFunctionChunk[],
+                           patches: DirectRelocPatch[],
+                           outputPath: str,
+                           symtabAll: bool,
+                           runtimeObj: str): Result[bool] =
+    if outputPath == nil || len(outputPath) == 0:
+        return Err[bool]("macho_direct_exe_writer: missing output path")
+    if mainObjBytes == nil || mainObjBytes.len <= 0:
+        return Err[bool]("macho_direct_exe_writer: empty main object bytes")
+    let _layout: uint64[] = machoDirectComputeTextLayout(chunks)
+    let _patchCount: int32 = patches.len
+    if _layout.len < 0 || _patchCount < 0:
+        return Err[bool]("macho_direct_exe_writer: invalid direct layout metadata")
+    var extraObjPaths: str[]
+    return machoLinkExeAarch64MainObjMem(mainObjBytes, extraObjPaths, outputPath, symtabAll, runtimeObj)

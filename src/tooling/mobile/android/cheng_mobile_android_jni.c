@@ -5,9 +5,15 @@
 #include <android/log.h>
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "cheng_mobile_host_api.h"
 #include "cheng_mobile_host_android.h"
+#if defined(__has_include)
+#  if __has_include("cheng_mobile_exports.h")
+#    include "cheng_mobile_exports.h"
+#  endif
+#endif
 
 #ifndef MOBILE_THREAD_STACK_BYTES
 #define MOBILE_THREAD_STACK_BYTES (8u * 1024u * 1024u)
@@ -30,11 +36,28 @@ static int cheng_mobile_action_to_kind(int action) {
 
 __attribute__((weak)) void cheng_mobile_app_main(void);
 __attribute__((weak)) int main(int argc, char **argv);
+extern uint64_t cheng_app_init(void) __attribute__((weak));
+extern void cheng_app_set_window(uint64_t app_id, uint64_t window_id, int physical_w, int physical_h, float scale) __attribute__((weak));
+extern void cheng_app_tick(uint64_t app_id, float delta_time) __attribute__((weak));
+extern void cheng_app_on_touch(uint64_t app_id, int action, int pointer_id, float x, float y) __attribute__((weak));
+extern void cheng_app_pause(uint64_t app_id) __attribute__((weak));
+extern void cheng_app_resume(uint64_t app_id) __attribute__((weak));
 
 static int cheng_mobile_started = 0;
 static pthread_t cheng_mobile_thread;
+static uint64_t s_app_id = 0u;
 static int s_frame_count = 0;
 static int s_touch_count = 0;
+static double s_density_scale = 1.0;
+
+static int cheng_mobile_has_app_abi_v2(void) {
+  return cheng_app_init != NULL &&
+         cheng_app_set_window != NULL &&
+         cheng_app_tick != NULL &&
+         cheng_app_on_touch != NULL &&
+         cheng_app_pause != NULL &&
+         cheng_app_resume != NULL;
+}
 
 static void* cheng_mobile_entry_thread(void* arg) {
   (void)arg;
@@ -64,6 +87,13 @@ JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_start(
   if (cheng_mobile_started) {
     return;
   }
+  if (cheng_mobile_has_app_abi_v2()) {
+    s_app_id = cheng_app_init();
+    cheng_mobile_started = (s_app_id != 0u);
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "start ABI v2 app_id=%llu", (unsigned long long)s_app_id);
+    return;
+  }
+
   cheng_mobile_started = 1;
 
   pthread_attr_t attr;
@@ -110,7 +140,11 @@ JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onTouch(
         (double)dx,
         (double)dy);
   }
-  cheng_mobile_host_emit_pointer((int)windowId, kind, x, y, dx, dy, (int)button, (int)pointerId, (int64_t)timeMs);
+  if (cheng_mobile_has_app_abi_v2() && s_app_id != 0u) {
+    cheng_app_on_touch(s_app_id, (int)action, (int)pointerId, x, y);
+  } else {
+    cheng_mobile_host_emit_pointer((int)windowId, kind, x, y, dx, dy, (int)button, (int)pointerId, (int64_t)timeMs);
+  }
 }
 
 JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onKey(
@@ -154,7 +188,11 @@ JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onFrame(
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "jni onFrame count=%d", s_frame_count);
   }
   cheng_mobile_host_android_jni_register(env);
-  cheng_mobile_host_emit_frame_tick();
+  if (cheng_mobile_has_app_abi_v2() && s_app_id != 0u) {
+    cheng_app_tick(s_app_id, 1.0f / 60.0f);
+  } else {
+    cheng_mobile_host_emit_frame_tick();
+  }
 }
 
 JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onSurface(
@@ -169,6 +207,9 @@ JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onSurface(
   if (surface == NULL) {
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "jni onSurface null");
     cheng_mobile_host_android_set_surface(NULL, 0, 0);
+    if (cheng_mobile_has_app_abi_v2() && s_app_id != 0u) {
+      cheng_app_set_window(s_app_id, 0u, 0, 0, (float)s_density_scale);
+    }
     return;
   }
   ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
@@ -178,6 +219,14 @@ JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onSurface(
   }
   __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "jni onSurface size=%dx%d", (int)width, (int)height);
   cheng_mobile_host_android_set_surface(window, (int)width, (int)height);
+  if (cheng_mobile_has_app_abi_v2()) {
+    if (s_app_id == 0u) {
+      s_app_id = cheng_app_init();
+    }
+    if (s_app_id != 0u) {
+      cheng_app_set_window(s_app_id, (uint64_t)(uintptr_t)window, (int)width, (int)height, (float)s_density_scale);
+    }
+  }
   ANativeWindow_release(window);
 }
 
@@ -238,7 +287,82 @@ JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_setDensityScale(
 ) {
   (void)cls;
   cheng_mobile_host_android_jni_register(env);
+  s_density_scale = (double)scale;
   cheng_mobile_host_android_set_density_scale((double)scale);
+  if (cheng_mobile_has_app_abi_v2() && s_app_id != 0u) {
+    cheng_app_set_window(
+        s_app_id,
+        0u,
+        cheng_mobile_host_android_width(),
+        cheng_mobile_host_android_height(),
+        (float)s_density_scale);
+  }
+}
+
+JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onPauseNative(
+    JNIEnv* env,
+    jclass cls
+) {
+  (void)cls;
+  cheng_mobile_host_android_jni_register(env);
+  if (cheng_mobile_has_app_abi_v2() && s_app_id != 0u) {
+    cheng_app_pause(s_app_id);
+  }
+}
+
+JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_onResumeNative(
+    JNIEnv* env,
+    jclass cls
+) {
+  (void)cls;
+  cheng_mobile_host_android_jni_register(env);
+  if (cheng_mobile_has_app_abi_v2() && s_app_id != 0u) {
+    cheng_app_resume(s_app_id);
+    cheng_app_set_window(
+        s_app_id,
+        0u,
+        cheng_mobile_host_android_width(),
+        cheng_mobile_host_android_height(),
+        (float)s_density_scale);
+  }
+}
+
+JNIEXPORT void JNICALL Java_com_cheng_mobile_ChengNative_setLaunchArgs(
+    JNIEnv* env,
+    jclass cls,
+    jstring argsKv,
+    jstring argsJson
+) {
+  (void)cls;
+  cheng_mobile_host_android_jni_register(env);
+  const char* kv = NULL;
+  const char* js = NULL;
+  if (argsKv != NULL) {
+    kv = (*env)->GetStringUTFChars(env, argsKv, 0);
+  }
+  if (argsJson != NULL) {
+    js = (*env)->GetStringUTFChars(env, argsJson, 0);
+  }
+  cheng_mobile_host_runtime_set_launch_args(kv, js);
+  if (kv != NULL) {
+    (*env)->ReleaseStringUTFChars(env, argsKv, kv);
+  }
+  if (js != NULL) {
+    (*env)->ReleaseStringUTFChars(env, argsJson, js);
+  }
+}
+
+JNIEXPORT jstring JNICALL Java_com_cheng_mobile_ChengNative_runtimeStateJson(
+    JNIEnv* env,
+    jclass cls
+) {
+  (void)cls;
+  cheng_mobile_host_android_jni_register(env);
+  const char* raw = cheng_mobile_host_runtime_state_json();
+  if (raw == NULL || raw[0] == '\0') {
+    raw = "{\"native_ready\":false}";
+  }
+  return (*env)->NewStringUTF(env, raw);
 }
 
 #endif

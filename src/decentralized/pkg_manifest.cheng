@@ -24,6 +24,8 @@ type
         cidText: str
         format: str
         authorId: str
+        astSimhash64: str
+        originalityScore: float64
         pubKeyText: str
         sigText: str
 
@@ -39,6 +41,8 @@ type
         cidText: str
         format: str
         authorId: str
+        astSimhash64: str
+        originalityScore: float64
         pubKeyText: str
         sigText: str
         createdTs: str
@@ -248,6 +252,55 @@ fn parseTomlIntValue(raw: str): result.Result[int64] =
     if ! hadDigit:
         return result.Err[int64]("toml: invalid int")
     return result.Ok[int64](value * sign)
+
+fn parseTomlFloatValue(raw: str): result.Result[float64] =
+    let text = strutil.strip(raw)
+    if text == nil || len(text) == 0:
+        return result.Err[float64]("toml: expected float")
+    var i: int32 = 0
+    var sign: float64 = 1.0
+    if text[0] == '-':
+        sign = -1.0
+        i = 1
+    if i >= len(text):
+        return result.Err[float64]("toml: invalid float")
+    var intPart: float64 = 0.0
+    var hadIntDigit: bool = false
+    let __for_start_i_3 = i
+    for __for_i_3 in __for_start_i_3..<len(text):
+        i = __for_i_3
+        let ch = text[i]
+        if ch == '_':
+            i = i + 1
+            continue
+        if ch < '0' || ch > '9':
+            break
+        hadIntDigit = true
+        intPart = intPart * 10.0 + float64(int32(ch) - int32('0'))
+        i = i + 1
+    var fracPart: float64 = 0.0
+    var fracDiv: float64 = 1.0
+    var hadFracDigit: bool = false
+    if i < len(text) && text[i] == '.':
+        i = i + 1
+        let __for_start_i_4 = i
+        for __for_i_4 in __for_start_i_4..<len(text):
+            i = __for_i_4
+            let ch = text[i]
+            if ch == '_':
+                i = i + 1
+                continue
+            if ch < '0' || ch > '9':
+                return result.Err[float64]("toml: invalid float")
+            hadFracDigit = true
+            fracPart = fracPart * 10.0 + float64(int32(ch) - int32('0'))
+            fracDiv = fracDiv * 10.0
+            i = i + 1
+    if ! hadIntDigit && ! hadFracDigit:
+        return result.Err[float64]("toml: invalid float")
+    if i < len(text):
+        return result.Err[float64]("toml: invalid float")
+    return result.Ok[float64](sign * (intPart + (fracPart / fracDiv)))
 
 fn escapeQuotedString(value: str): str =
     if value == nil:
@@ -585,6 +638,8 @@ fn resolveManifest(manifest: PackageManifest, registryPath: str): result.Result[
         locked.cidText = snap.cidText
         locked.format = normalizeFormat(snap.format)
         locked.authorId = snap.authorId
+        locked.astSimhash64 = snap.astSimhash64
+        locked.originalityScore = snap.originalityScore
         locked.pubKeyText = snap.pubKeyText
         locked.sigText = snap.sigText
         lock.dependencies.add(locked)
@@ -605,6 +660,10 @@ fn lockToJson(lock: PackageLock): json.JsonNode =
         if dep.format != nil && len(dep.format) > 0:
             node["format"] = json.newJString(normalizeFormat(dep.format))
         node["author_id"] = json.newJString(dep.authorId)
+        if dep.astSimhash64 != nil && len(dep.astSimhash64) > 0:
+            node["ast_simhash64"] = json.newJString(dep.astSimhash64)
+        if dep.originalityScore > 0:
+            node["originality_score"] = json.newJFloat(dep.originalityScore)
         if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
             node["pub_key"] = json.newJString(dep.pubKeyText)
         if dep.sigText != nil && len(dep.sigText) > 0:
@@ -628,6 +687,10 @@ fn lockToToml(lock: PackageLock): str =
         if dep.format != nil && len(dep.format) > 0:
             out = out + "format = " + quoteTomlString(normalizeFormat(dep.format)) + "\n"
         out = out + "author_id = " + quoteTomlString(dep.authorId) + "\n"
+        if dep.astSimhash64 != nil && len(dep.astSimhash64) > 0:
+            out = out + "ast_simhash64 = " + quoteTomlString(dep.astSimhash64) + "\n"
+        if dep.originalityScore > 0:
+            out = out + "originality_score = " + $ dep.originalityScore + "\n"
         if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
             out = out + "pub_key = " + quoteTomlString(dep.pubKeyText) + "\n"
         if dep.sigText != nil && len(dep.sigText) > 0:
@@ -649,6 +712,10 @@ fn lockToYaml(lock: PackageLock): str =
         if dep.format != nil && len(dep.format) > 0:
             out = out + "    format: " + quoteYamlString(normalizeFormat(dep.format)) + "\n"
         out = out + "    author_id: " + quoteYamlString(dep.authorId) + "\n"
+        if dep.astSimhash64 != nil && len(dep.astSimhash64) > 0:
+            out = out + "    ast_simhash64: " + quoteYamlString(dep.astSimhash64) + "\n"
+        if dep.originalityScore > 0:
+            out = out + "    originality_score: " + $ dep.originalityScore + "\n"
         if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
             out = out + "    pub_key: " + quoteYamlString(dep.pubKeyText) + "\n"
         if dep.sigText != nil && len(dep.sigText) > 0:
@@ -677,6 +744,8 @@ fn parseLockNode(root: json.JsonNode): result.Result[PackageLock] =
             dep.cidText = jparse.getStringField(node, "cid", "")
             dep.format = normalizeFormat(jparse.getStringField(node, "format", ""))
             dep.authorId = jparse.getStringField(node, "author_id", "")
+            dep.astSimhash64 = jparse.getStringField(node, "ast_simhash64", "")
+            dep.originalityScore = jparse.getFloatField(node, "originality_score", 0.0)
             dep.pubKeyText = jparse.getStringField(node, "pub_key", "")
             dep.sigText = jparse.getStringField(node, "signature", "")
             if dep.packageId == nil || len(dep.packageId) == 0:
@@ -758,6 +827,16 @@ fn parseLockToml(content: str): result.Result[PackageLock] =
                 if result.IsErr(valRes):
                     return result.Err[PackageLock](result.Error(valRes))
                 current.authorId = result.Value(valRes)
+            elif key == "ast_simhash64":
+                let valRes = parseTomlStringValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.astSimhash64 = result.Value(valRes)
+            elif key == "originality_score":
+                let valRes = parseTomlFloatValue(value)
+                if result.IsErr(valRes):
+                    return result.Err[PackageLock](result.Error(valRes))
+                current.originalityScore = result.Value(valRes)
             elif key == "pub_key":
                 let valRes = parseTomlStringValue(value)
                 if result.IsErr(valRes):
@@ -870,6 +949,16 @@ fn parseLockYaml(content: str): result.Result[PackageLock] =
                         if result.IsErr(valRes):
                             return result.Err[PackageLock](result.Error(valRes))
                         current.authorId = result.Value(valRes)
+                    elif key == "ast_simhash64":
+                        let valRes = parseYamlStringValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.astSimhash64 = result.Value(valRes)
+                    elif key == "originality_score":
+                        let valRes = parseTomlFloatValue(value)
+                        if result.IsErr(valRes):
+                            return result.Err[PackageLock](result.Error(valRes))
+                        current.originalityScore = result.Value(valRes)
                     elif key == "pub_key":
                         let valRes = parseYamlStringValue(value)
                         if result.IsErr(valRes):
@@ -917,6 +1006,16 @@ fn parseLockYaml(content: str): result.Result[PackageLock] =
                     if result.IsErr(valRes):
                         return result.Err[PackageLock](result.Error(valRes))
                     current.authorId = result.Value(valRes)
+                elif key == "ast_simhash64":
+                    let valRes = parseYamlStringValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.astSimhash64 = result.Value(valRes)
+                elif key == "originality_score":
+                    let valRes = parseTomlFloatValue(value)
+                    if result.IsErr(valRes):
+                        return result.Err[PackageLock](result.Error(valRes))
+                    current.originalityScore = result.Value(valRes)
                 elif key == "pub_key":
                     let valRes = parseYamlStringValue(value)
                     if result.IsErr(valRes):
@@ -969,6 +1068,8 @@ fn verifyLock(lock: PackageLock): bool =
         snap.cidText = dep.cidText
         snap.format = normalizeFormat(dep.format)
         snap.authorId = dep.authorId
+        snap.astSimhash64 = dep.astSimhash64
+        snap.originalityScore = dep.originalityScore
         snap.pubKeyText = dep.pubKeyText
         snap.sigText = dep.sigText
         if ! dreg.verifySnapshot(snap):
@@ -992,6 +1093,10 @@ fn verifyLockAgainstRegistry(lock: PackageLock, registryPath: str): bool =
         if (depFormat != nil && len(depFormat) > 0) || (snapFormat != nil && len(snapFormat) > 0):
             if depFormat != snapFormat:
                 return false
+        if dep.astSimhash64 != snap.astSimhash64:
+            return false
+        if dep.originalityScore != snap.originalityScore:
+            return false
     return true
 
 fn buildMetaFromLock(lock: PackageLock, snap: dreg.PackageSnapshot): PackageMeta =
@@ -1002,6 +1107,8 @@ fn buildMetaFromLock(lock: PackageLock, snap: dreg.PackageSnapshot): PackageMeta
     meta.cidText = snap.cidText
     meta.format = normalizeFormat(snap.format)
     meta.authorId = snap.authorId
+    meta.astSimhash64 = snap.astSimhash64
+    meta.originalityScore = snap.originalityScore
     meta.pubKeyText = snap.pubKeyText
     meta.sigText = snap.sigText
     meta.createdTs = lock.createdTs
@@ -1017,6 +1124,10 @@ fn metaToJson(meta: PackageMeta): json.JsonNode =
     if meta.format != nil && len(meta.format) > 0:
         root["format"] = json.newJString(normalizeFormat(meta.format))
     root["author_id"] = json.newJString(meta.authorId)
+    if meta.astSimhash64 != nil && len(meta.astSimhash64) > 0:
+        root["ast_simhash64"] = json.newJString(meta.astSimhash64)
+    if meta.originalityScore > 0:
+        root["originality_score"] = json.newJFloat(meta.originalityScore)
     if meta.pubKeyText != nil && len(meta.pubKeyText) > 0:
         root["pub_key"] = json.newJString(meta.pubKeyText)
     if meta.sigText != nil && len(meta.sigText) > 0:
@@ -1034,6 +1145,10 @@ fn metaToJson(meta: PackageMeta): json.JsonNode =
         if dep.format != nil && len(dep.format) > 0:
             node["format"] = json.newJString(normalizeFormat(dep.format))
         node["author_id"] = json.newJString(dep.authorId)
+        if dep.astSimhash64 != nil && len(dep.astSimhash64) > 0:
+            node["ast_simhash64"] = json.newJString(dep.astSimhash64)
+        if dep.originalityScore > 0:
+            node["originality_score"] = json.newJFloat(dep.originalityScore)
         if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
             node["pub_key"] = json.newJString(dep.pubKeyText)
         if dep.sigText != nil && len(dep.sigText) > 0:
@@ -1051,6 +1166,10 @@ fn metaToToml(meta: PackageMeta): str =
     if meta.format != nil && len(meta.format) > 0:
         out = out + "format = " + quoteTomlString(normalizeFormat(meta.format)) + "\n"
     out = out + "author_id = " + quoteTomlString(meta.authorId) + "\n"
+    if meta.astSimhash64 != nil && len(meta.astSimhash64) > 0:
+        out = out + "ast_simhash64 = " + quoteTomlString(meta.astSimhash64) + "\n"
+    if meta.originalityScore > 0:
+        out = out + "originality_score = " + $ meta.originalityScore + "\n"
     if meta.pubKeyText != nil && len(meta.pubKeyText) > 0:
         out = out + "pub_key = " + quoteTomlString(meta.pubKeyText) + "\n"
     if meta.sigText != nil && len(meta.sigText) > 0:
@@ -1067,6 +1186,10 @@ fn metaToToml(meta: PackageMeta): str =
         if dep.format != nil && len(dep.format) > 0:
             out = out + "format = " + quoteTomlString(normalizeFormat(dep.format)) + "\n"
         out = out + "author_id = " + quoteTomlString(dep.authorId) + "\n"
+        if dep.astSimhash64 != nil && len(dep.astSimhash64) > 0:
+            out = out + "ast_simhash64 = " + quoteTomlString(dep.astSimhash64) + "\n"
+        if dep.originalityScore > 0:
+            out = out + "originality_score = " + $ dep.originalityScore + "\n"
         if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
             out = out + "pub_key = " + quoteTomlString(dep.pubKeyText) + "\n"
         if dep.sigText != nil && len(dep.sigText) > 0:
@@ -1082,6 +1205,10 @@ fn metaToYaml(meta: PackageMeta): str =
     if meta.format != nil && len(meta.format) > 0:
         out = out + "format: " + quoteYamlString(normalizeFormat(meta.format)) + "\n"
     out = out + "author_id: " + quoteYamlString(meta.authorId) + "\n"
+    if meta.astSimhash64 != nil && len(meta.astSimhash64) > 0:
+        out = out + "ast_simhash64: " + quoteYamlString(meta.astSimhash64) + "\n"
+    if meta.originalityScore > 0:
+        out = out + "originality_score: " + $ meta.originalityScore + "\n"
     if meta.pubKeyText != nil && len(meta.pubKeyText) > 0:
         out = out + "pub_key: " + quoteYamlString(meta.pubKeyText) + "\n"
     if meta.sigText != nil && len(meta.sigText) > 0:
@@ -1098,6 +1225,10 @@ fn metaToYaml(meta: PackageMeta): str =
         if dep.format != nil && len(dep.format) > 0:
             out = out + "    format: " + quoteYamlString(normalizeFormat(dep.format)) + "\n"
         out = out + "    author_id: " + quoteYamlString(dep.authorId) + "\n"
+        if dep.astSimhash64 != nil && len(dep.astSimhash64) > 0:
+            out = out + "    ast_simhash64: " + quoteYamlString(dep.astSimhash64) + "\n"
+        if dep.originalityScore > 0:
+            out = out + "    originality_score: " + $ dep.originalityScore + "\n"
         if dep.pubKeyText != nil && len(dep.pubKeyText) > 0:
             out = out + "    pub_key: " + quoteYamlString(dep.pubKeyText) + "\n"
         if dep.sigText != nil && len(dep.sigText) > 0:

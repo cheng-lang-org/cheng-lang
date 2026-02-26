@@ -159,7 +159,7 @@ require_registry_match = true
 ## 参考实现
 参考分润计算器同时提供 Python 与 Cheng 版本。
 - Python: `src/tooling/cheng_pkg_rewards.py`
-- Cheng: `src/tooling/cheng_pkg_rewards.cheng`（用 `src/tooling/chengc.sh` 编译）
+- Cheng: `src/tooling/cheng_pkg_rewards.cheng`（用 `sh src/tooling/tooling_exec.sh chengc` 编译）
 示例：
 ```bash
 python src/tooling/cheng_pkg_rewards.py \
@@ -170,6 +170,6 @@ python src/tooling/cheng_pkg_rewards.py \
 
 Cheng 示例：
 ```bash
-src/tooling/chengc.sh src/tooling/cheng_pkg_rewards.cheng --name:cheng_pkg_rewards
+sh src/tooling/tooling_exec.sh chengc src/tooling/cheng_pkg_rewards.cheng --name:cheng_pkg_rewards
 ./cheng_pkg_rewards --input docs/cheng-package-incentives-example.json --out build/cheng-package-incentives-payouts.json --pretty
 ```

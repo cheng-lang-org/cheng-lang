@@ -1003,6 +1003,14 @@ fn cheng_bits_to_f32(bits: int32): float64 =
 fn cheng_f32_to_bits(value: float64): int32 =
     return cheng_f64_bits_to_f32_bits(cheng_f64_to_bits(value))
 
+# Stage0/self-link compatibility: some legacy driver builds still reference
+# plain symbol names instead of @importc("cheng_*") aliases.
+fn bitsToF32(bits: int32): float64 =
+    return cheng_bits_to_f32(bits)
+
+fn f32ToBits(value: float64): int32 =
+    return cheng_f32_to_bits(value)
+
 fn cheng_bits_to_f64(bits: int64): float64 =
     var v64: float64
     *int64*(&v64) = bits
@@ -1491,6 +1499,38 @@ fn cheng_abi_sum16_i32(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p: int32): i
 fn cheng_abi_mix_i32_i64(a: int32, b: int64, c: int32, d: int64): int64 =
     return int64(a) + b + int64(c) + d
 
+fn cheng_abi_sum_seq_i32_raw(ptr: int32*, len: int32): int32 =
+    if ptr == nil || len <= 0:
+        return 0
+    var sum: int64 = 0
+    var i: int32 = 0
+    while i < len:
+        sum = sum + int64(*(ptr + i))
+        i = i + 1
+    return int32(sum)
+
+fn cheng_abi_sum_seq_i32(seqLike0: uint64, seqLike1: uint64, seqLike2: uint64): int32 =
+    # RPSPAR-03 slice bridge helper:
+    # - split mode:  arg0=len, arg1=cap, arg2=data pointer
+    # - packed mode: arg0 packs len/cap (low/high 32b), arg1=data pointer
+    # - pointer mode: arg0 points to seq header (len/cap/buffer)
+    if seqLike0 <= (uint64(1) << uint64(20)) &&
+       seqLike1 <= (uint64(1) << uint64(20)) &&
+       seqLike2 > uint64(4096):
+        return cheng_abi_sum_seq_i32_raw(int32*(void*(seqLike2)), int32(seqLike0))
+
+    let lo: uint32 = uint32(seqLike0 & uint64(0xffffffff))
+    let hi: uint32 = uint32((seqLike0 >> uint64(32)) & uint64(0xffffffff))
+    if lo <= hi && hi <= uint32(1 << 20) && seqLike1 > uint64(4096):
+        return cheng_abi_sum_seq_i32_raw(int32*(void*(seqLike1)), int32(lo))
+
+    if seqLike0 == uint64(0):
+        return 0
+    let seq: ChengSeqHeader* = ChengSeqHeader*(void*(seqLike0))
+    if seq->len < 0 || seq->len > (1 << 26):
+        return 0
+    return cheng_abi_sum_seq_i32_raw(int32*(seq->buffer), seq->len)
+
 fn cheng_abi_store_i32(p: int64, v: int32) =
     if p == 0:
         return
@@ -1552,6 +1592,17 @@ fn cheng_abi_ret_pair_i32_out(outA: int64, outB: int64, a: int32, b: int32) =
 
 fn cheng_abi_out_pair_i32(outA: int64, outB: int64, a: int32, b: int32) =
     cheng_abi_ret_pair_i32_out(outA, outB, a, b)
+
+fn cheng_abi_borrow_mut_pair_i32(pairPtr: int64, da: int32, db: int32) =
+    if pairPtr == 0:
+        return
+    let base: int32* = int32*(void*(uint64(pairPtr)))
+    if base == nil:
+        return
+    let pa: int32* = base
+    let pb: int32* = base + 1
+    *pa = *pa + da
+    *pb = *pb + db
 
 # --- Minimal std/os + os.cheng backend runtime (Darwin/POSIX, AArch64) ---
 
@@ -1744,9 +1795,11 @@ fn cheng_iometer_call(hook: void*, op: int32, bytes: int64) =
 fn cheng_file_exists(path: char*): int32 =
     if path == nil || *path == '\0':
         return 0
-    let f: void* = libc_fopen(path, "rb")
-    if f != nil:
-        libc_fclose(f)
+    let mtime: int64 = cheng_file_mtime(path)
+    if mtime != 0:
+        return 1
+    let size: int64 = cheng_file_size(path)
+    if size > 0:
         return 1
     return 0
 

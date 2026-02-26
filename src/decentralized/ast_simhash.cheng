@@ -1,0 +1,268 @@
+import std/os
+import std/strutils as strutil
+import cheng/libp2p/crypto/sha256 as sha256
+import cheng/libp2p/utils/bytes as bytes
+import cheng/libp2p/utils/result as result
+import std/seqs
+
+const
+    SimhashHexLen = 16
+
+fn simhashHexCharLower(v: int32): char =
+    if v >= 0 && v <= 9:
+        return char(int32('0') + v)
+    return char(int32('a') + (v - 10))
+
+fn simhashHexNibbleValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn normalizeSimhash64(raw: str): result.Result[str] =
+    if raw == nil:
+        return result.Err[str]("simhash: empty")
+    var text: str = strutil.toLowerAscii(strutil.strip(raw))
+    if strutil.startsWith(text, "0x"):
+        if len(text) <= 2:
+            return result.Err[str]("simhash: invalid 0x form")
+        text = text[2..len(text) - 1]
+    if len(text) != SimhashHexLen:
+        return result.Err[str]("simhash: expected 16 hex chars")
+    for i in 0..<len(text):
+        if simhashHexNibbleValue(text[i]) < 0:
+            return result.Err[str]("simhash: invalid hex char")
+    return result.Ok[str](text)
+
+fn popcountNibble(vRaw: int32): int32 =
+    var v: int32 = vRaw & 15
+    var out: int32 = 0
+    for i in 0..<4:
+        if (v & (1 << i)) != 0:
+            out = out + 1
+    return out
+
+fn hammingDistanceHex64(aRaw: str, bRaw: str): int32 =
+    let aNormRes: result.Result[str] = normalizeSimhash64(aRaw)
+    if result.IsErr(aNormRes):
+        return 64
+    let bNormRes: result.Result[str] = normalizeSimhash64(bRaw)
+    if result.IsErr(bNormRes):
+        return 64
+    let aNorm: str = result.Value(aNormRes)
+    let bNorm: str = result.Value(bNormRes)
+    var dist: int32 = 0
+    for i in 0..<SimhashHexLen:
+        let aNib: int32 = simhashHexNibbleValue(aNorm[i])
+        let bNib: int32 = simhashHexNibbleValue(bNorm[i])
+        if aNib < 0 || bNib < 0:
+            return 64
+        dist = dist + popcountNibble(aNib ^ bNib)
+    return dist
+
+fn strEndsWith(text: str, suffix: str): bool =
+    if text == nil || suffix == nil:
+        return false
+    let n: int32 = len(text)
+    let m: int32 = len(suffix)
+    if m <= 0 || m > n:
+        return false
+    for i in 0..<m:
+        if text[n - m + i] != suffix[i]:
+            return false
+    return true
+
+fn pathHasExcludedSegment(path: str): bool =
+    if path == nil || len(path) == 0:
+        return true
+    var norm = strutil.toLowerAscii(path)
+    norm = strutil.replace(norm, "\\", "/")
+    let segs = strutil.split(norm, '/')
+    for i in 0..<segs.len:
+        let seg = segs[i]
+        if seg == ".git" || seg == "chengcache" || seg == ".cheng-cache" || seg == "build" ||
+           seg == "dist" || seg == "out" || seg == "tmp" || seg == "tmp_build" ||
+           seg == "__pycache__":
+            return true
+    return false
+
+fn sortStrings(values: var str[]) =
+    for i in 0..<values.len:
+        var minIdx: int32 = i
+        for j in i + 1..<values.len:
+            if cmp(values[j], values[minIdx]) < 0:
+                minIdx = j
+        if minIdx != i:
+            let tmp = values[i]
+            values[i] = values[minIdx]
+            values[minIdx] = tmp
+
+fn collectSourceFiles(root: str): str[] =
+    var out: str[]
+    if root == nil || len(root) == 0:
+        return out
+    let absRoot = os.absolutePath(root)
+    if absRoot == nil || len(absRoot) == 0:
+        return out
+    if ! os.dirExists(absRoot):
+        return out
+    let paths = os.walkDirRec(absRoot)
+    for i in 0..<paths.len:
+        let p = paths[i]
+        if os.dirExists(p):
+            continue
+        let lower = strutil.toLowerAscii(p)
+        if ! strEndsWith(lower, ".cheng"):
+            continue
+        if pathHasExcludedSegment(lower):
+            continue
+        add[str](out, p)
+    sortStrings(out)
+    return out
+
+fn isIdentStart(ch: char): bool =
+    if ch >= 'a' && ch <= 'z':
+        return true
+    if ch >= 'A' && ch <= 'Z':
+        return true
+    return ch == '_'
+
+fn isIdentChar(ch: char): bool =
+    if isIdentStart(ch):
+        return true
+    return ch >= '0' && ch <= '9'
+
+fn isKeyword(word: str): bool =
+    if word == "fn" || word == "type" || word == "import" || word == "if" || word == "elif" ||
+       word == "else" || word == "for" || word == "while" || word == "return" ||
+       word == "let" || word == "var" || word == "const" || word == "enum" ||
+       word == "break" || word == "continue" || word == "defer" || word == "discard" ||
+       word == "true" || word == "false" || word == "nil":
+        return true
+    return false
+
+fn addToken(out: var str[], token: str) =
+    if token != nil && len(token) > 0:
+        add[str](out, token)
+
+fn tokenizeSourceShape(text: str): str[] =
+    var out: str[]
+    if text == nil || len(text) == 0:
+        return out
+    var i: int32 = 0
+    while i < len(text):
+        let ch = text[i]
+        if ch == '#':
+            i = i + 1
+            while i < len(text) && text[i] != '\n':
+                i = i + 1
+            continue
+        if ch == '/' && i + 1 < len(text) && text[i + 1] == '/':
+            i = i + 2
+            while i < len(text) && text[i] != '\n':
+                i = i + 1
+            continue
+        if ch == '"' || ch == '\'':
+            let quote = ch
+            addToken(out, "lit:str")
+            i = i + 1
+            while i < len(text):
+                let cc = text[i]
+                if cc == '\\' && i + 1 < len(text):
+                    i = i + 2
+                    continue
+                i = i + 1
+                if cc == quote:
+                    break
+            continue
+        if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n':
+            i = i + 1
+            continue
+        if ch >= '0' && ch <= '9':
+            addToken(out, "lit:num")
+            i = i + 1
+            while i < len(text):
+                let cc = text[i]
+                if (cc >= '0' && cc <= '9') || cc == '_' || cc == '.':
+                    i = i + 1
+                    continue
+                break
+            continue
+        if isIdentStart(ch):
+            let start = i
+            i = i + 1
+            while i < len(text) && isIdentChar(text[i]):
+                i = i + 1
+            let word = strutil.toLowerAscii(text[start..i - 1])
+            if isKeyword(word):
+                addToken(out, "kw:" + word)
+            else:
+                addToken(out, "id")
+            continue
+        if i + 1 < len(text):
+            let pair = text[i..i + 1]
+            if pair == "==" || pair == "!=" || pair == "<=" || pair == ">=" ||
+               pair == "&&" || pair == "||" || pair == "->" || pair == "=>" ||
+               pair == "::" || pair == ".." || pair == "+=" || pair == "-=" ||
+               pair == "*=" || pair == "/=" || pair == "%=":
+                addToken(out, "op:" + pair)
+                i = i + 2
+                continue
+        addToken(out, "op:" + charToStr(ch))
+        i = i + 1
+    return out
+
+fn buildSimhashFeatures(tokens: str[]): str[] =
+    var out: str[]
+    for i in 0..<tokens.len:
+        let t0 = tokens[i]
+        add[str](out, "u:" + t0)
+        if i + 1 < tokens.len:
+            add[str](out, "b:" + t0 + "|" + tokens[i + 1])
+        if i + 2 < tokens.len:
+            add[str](out, "t:" + t0 + "|" + tokens[i + 1] + "|" + tokens[i + 2])
+    return out
+
+fn simhashFromFeatures(features: str[]): str =
+    var weights: int32[64]
+    for i in 0..<features.len:
+        let digest = sha256.sha256Digest(bytes.bytesFromString(features[i]))
+        for byteIdx in 0..<8:
+            let b = bytes.bytesGet(digest, byteIdx)
+            for bit in 0..<8:
+                let idx = byteIdx * 8 + bit
+                if ((b >> bit) & 1) != 0:
+                    weights[idx] = weights[idx] + 1
+                else:
+                    weights[idx] = weights[idx] - 1
+    var out: str = ""
+    for nibIdx in 0..<16:
+        var nibble: int32 = 0
+        for bitInNib in 0..<4:
+            let bitIndex = nibIdx * 4 + bitInNib
+            if weights[bitIndex] > 0:
+                nibble = nibble | (1 << bitInNib)
+        out = out + charToStr(simhashHexCharLower(nibble))
+    return out
+
+fn computeAstSimhash64ForDir(root: str): result.Result[str] =
+    let files = collectSourceFiles(root)
+    if files.len <= 0:
+        return result.Err[str]("simhash: no .cheng source files")
+    var allTokens: str[]
+    for i in 0..<files.len:
+        let content = os.readFile(files[i])
+        if content == nil || len(content) == 0:
+            continue
+        let tokens = tokenizeSourceShape(content)
+        for j in 0..<tokens.len:
+            add[str](allTokens, tokens[j])
+    if allTokens.len <= 0:
+        return result.Err[str]("simhash: no source tokens")
+    let features = buildSimhashFeatures(allTokens)
+    if features.len <= 0:
+        return result.Err[str]("simhash: no feature vectors")
+    return result.Ok[str](simhashFromFeatures(features))

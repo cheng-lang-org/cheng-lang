@@ -2,6 +2,7 @@
 import std/os
 import std/result
 import std/strings
+import std/strutils
 import std/seqs
 import std/system
 import std/hashmaps
@@ -17,6 +18,10 @@ import cheng/stage1/c_profile_lowering
 import cheng/stage1/ownership
 import cheng/stage1/diagnostics
 import cheng/backend/uir/uir_internal/uir_core_types
+import cheng/backend/uir/uir_internal/uir_core_builder_import_resolver
+
+fn lowerAscii(s: str): str =
+    return strutils.toLowerAscii(s)
 
 @importc("cheng_parse_f64_bits")
 fn cheng_parse_f64_bits(s: str): int64
@@ -142,61 +147,37 @@ fn backendSkipGlobalInit(): bool =
     return envIsTrue "BACKEND_SKIP_GLOBAL_INIT"
 
 fn backendAllowNoMainByEmit(): bool =
-    let emitMode: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_EMIT", "")))
+    let emitModeRaw: str = backendStripSpaces(os.getEnvDefault("BACKEND_EMIT", ""))
+    let emitMode: str = lowerAscii(emitModeRaw)
     if emitMode == "obj" || emitMode == "object" || emitMode == "o":
         return true
-    let outPath: str = backendStripSpaces(os.getEnvDefault("BACKEND_OUTPUT", ""))
-    if outPath != nil && len(outPath) >= 2 && outPath[len(outPath) - 2] == '.' && outPath[len(outPath) - 1] == 'o':
-        return true
-    if outPath != nil && len(outPath) >= 4 &&
-       outPath[len(outPath) - 4] == '.' &&
-       (outPath[len(outPath) - 3] == 'o' || outPath[len(outPath) - 3] == 'O') &&
-       (outPath[len(outPath) - 2] == 'b' || outPath[len(outPath) - 2] == 'B') &&
-       (outPath[len(outPath) - 1] == 'j' || outPath[len(outPath) - 1] == 'J'):
+    let outPathRaw: str = backendStripSpaces(os.getEnvDefault("BACKEND_OUTPUT", ""))
+    if outPathRaw == nil || len(outPathRaw) <= 0:
+        return false
+    let outPath: str = lowerAscii(outPathRaw)
+    if strHasSuffix(outPath, ".o") || strHasSuffix(outPath, ".obj"):
         return true
     return false
 
 fn uirCorePluginEnabled(): bool =
     if uirCorePluginEnableCached >= 0:
         return uirCorePluginEnableCached == 1
-    let raw: str = backendStripSpaces(getEnv "PLUGIN_ENABLE")
-    if raw == nil || len(raw) == 0 || raw == "1" || raw == "true" || raw == "yes":
-        uirCorePluginEnableCached = 1
-        return true
-    if raw == "0" || raw == "false" || raw == "no":
-        uirCorePluginEnableCached = 0
-        return false
-    uirCorePluginEnableCached = 1
-    return true
+    let raw: str = lowerAscii(backendStripSpaces(getEnv "PLUGIN_ENABLE"))
+    let enabled: bool = (raw == "1" || raw == "true" || raw == "yes" || raw == "on")
+    uirCorePluginEnableCached = enabled ? 1 : 0
+    return enabled
 
 fn uirCorePluginPathsFromEnv(): str[] =
     if uirCorePluginPathsCachedReady:
         return uirCorePluginPathsCached
     var out: str[]
-    let legacy: str = getEnv "PLUGIN_PATH"
-    if legacy != nil && len(legacy) > 0:
-        let legacyTrimmed: str = backendStripSpaces(legacy)
-        if len(legacyTrimmed) > 0:
-            add(out, legacyTrimmed)
-    let raw: str = getEnv "PLUGIN_PATHS"
+    let raw: str = backendStripSpaces(getEnv "PLUGIN_PATH")
     if raw != nil && len(raw) > 0:
-        var hasCommaOrSemi: bool = false
-        for ki in 0..<len(raw):
-            let ck: char = raw[ki]
-            if ck == ',' || ck == ';':
-                hasCommaOrSemi = true
-                break
-        let useColon: bool = !hasCommaOrSemi
-        var start: int32 = 0
-        for i in 0..len(raw):
-            let c: char = (i < len(raw)) ? raw[i] : char(0)
-            if i == len(raw) || c == ',' || c == ';' || (useColon && c == ':'):
-                if i > start:
-                    let part: str = os.sliceStr(raw, start, i - 1)
-                    let trimmed: str = backendStripSpaces(part)
-                    if len(trimmed) > 0:
-                        add(out, trimmed)
-                start = i + 1
+        add(out, raw)
+    let raw2: str = backendStripSpaces(getEnv "PLUGIN_PATHS")
+    if raw2 != nil && len(raw2) > 0:
+        if out.len == 0 || out[0] != raw2:
+            add(out, raw2)
     uirCorePluginPathsCached = out
     uirCorePluginPathsCachedReady = true
     return out
@@ -213,56 +194,16 @@ fn uirCorePluginMeteringId(): str =
     return trimmed
 
 fn uirCoreResolvePluginImportCandidate(candidate: str): str =
-    if candidate == nil || len(candidate) == 0:
-        return ""
-    if frontend_lib.stage1_fileExists(candidate):
-        return candidate
-    var withExt: str = candidate
-    if !strHasSuffix(withExt, ".cheng"):
-        withExt = candidate + ".cheng"
-    if frontend_lib.stage1_fileExists(withExt):
-        return withExt
+    let _: str = candidate
     return ""
 
 fn uirCoreResolvePluginImportPath(path: str): str =
+    let _: str = path
     if !uirCorePluginEnabled():
         return ""
-    if path == nil || len(path) == 0:
-        return ""
-    if !strHasPrefix(path, "cheng/web/") && !strHasPrefix(path, "cheng/decentralized/"):
-        return ""
     let roots: str[] = uirCorePluginPathsFromEnv()
-    if roots.len == 0:
-        return ""
-    let relPath: str = importPathDropChengPrefix(path)
-    for i in 0..<roots.len:
-        let root: str = roots[i]
-        if root == nil || len(root) == 0:
-            continue
-        let c0: str = os.joinPath(root, path)
-        let h0: str = uirCoreResolvePluginImportCandidate(c0)
-        if len(h0) > 0:
-            return h0
-        let c1: str = os.joinPath(root, "src", path)
-        let h1: str = uirCoreResolvePluginImportCandidate(c1)
-        if len(h1) > 0:
-            return h1
-        let c2: str = os.joinPath(root, "cheng", path)
-        let h2: str = uirCoreResolvePluginImportCandidate(c2)
-        if len(h2) > 0:
-            return h2
-        let c3: str = os.joinPath(root, relPath)
-        let h3: str = uirCoreResolvePluginImportCandidate(c3)
-        if len(h3) > 0:
-            return h3
-        let c4: str = os.joinPath(root, "src", relPath)
-        let h4: str = uirCoreResolvePluginImportCandidate(c4)
-        if len(h4) > 0:
-            return h4
-        let c5: str = os.joinPath(root, "cheng", relPath)
-        let h5: str = uirCoreResolvePluginImportCandidate(c5)
-        if len(h5) > 0:
-            return h5
+    if roots.len > 0:
+        let _: str = roots[0]
     return ""
 
 fn uirCoreApplyAstPluginHooks(filePath: str, root: Node): Node =
@@ -279,11 +220,377 @@ fn uirCoreApplyMirPluginHooks(filePath: str, root: Node): Node =
         return root
     return root
 
+fn uirCoreNativeContractEnabled(): bool =
+    let raw: str = lowerAscii(backendStripSpaces(getEnv "BACKEND_NATIVE_CONTRACT"))
+    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+
+fn uirCoreNativeContractChargeSymbol(): str =
+    let raw: str = backendStripSpaces(getEnv "BACKEND_NATIVE_CONTRACT_CHARGE_SYMBOL")
+    if raw != nil && len(raw) > 0:
+        return raw
+    return "__cheng_contract_charge_block"
+
+fn uirCoreNativeContractGasCounterSymbol(): str =
+    let raw: str = backendStripSpaces(getEnv "BACKEND_NATIVE_CONTRACT_GAS_COUNTER")
+    if raw != nil && len(raw) > 0:
+        return raw
+    return "__cheng_contract_gas_used"
+
+fn uirCoreNativeContractStartsWith(text: str, prefix: str): bool =
+    if text == nil || prefix == nil:
+        return false
+    let n: int32 = len(text)
+    let m: int32 = len(prefix)
+    if m <= 0:
+        return true
+    if m > n:
+        return false
+    for i in 0..<m:
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn uirCoreNativeContractStripLeadingUnderscores(raw: str): str =
+    if raw == nil || len(raw) == 0:
+        return ""
+    let n: int32 = len(raw)
+    var i: int32 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n && raw[i] == '_'):
+            break
+        i = i + 1
+    if i <= 0:
+        return raw
+    if i >= n:
+        return ""
+    return strings.sliceBytes(raw, i, n - i)
+
+fn uirCoreNativeContractNormalizeSymbol(raw: str): str =
+    let s0: str = lowerAscii(backendStripSpaces(raw))
+    if s0 == nil || len(s0) == 0:
+        return ""
+    return uirCoreNativeContractStripLeadingUnderscores(s0)
+
+fn uirCoreNativeContractTypeIsFloat(ty: UirCoreType): bool =
+    return ty.kind == mtF32 || ty.kind == mtF64
+
+fn uirCoreNativeContractIsSyscallSymbol(raw: str): bool =
+    let sym: str = uirCoreNativeContractNormalizeSymbol(raw)
+    if sym == nil || len(sym) == 0:
+        return false
+    return uirCoreNativeContractStartsWith(sym, "cheng_linux_syscall")
+
+fn uirCoreNativeContractIsFloatIntrinsicSymbol(raw: str): bool =
+    let sym: str = uirCoreNativeContractNormalizeSymbol(raw)
+    if sym == nil || len(sym) == 0:
+        return false
+    if uirCoreNativeContractStartsWith(sym, "cheng_f64_"):
+        return true
+    if uirCoreNativeContractStartsWith(sym, "cheng_f32_"):
+        return true
+    if sym == "cheng_parse_f64_bits" ||
+       sym == "cheng_i64_to_f64_bits" ||
+       sym == "cheng_u64_to_f64_bits" ||
+       sym == "cheng_f64_bits_to_i64" ||
+       sym == "cheng_f64_bits_to_u64":
+        return true
+    return false
+
+fn uirCoreNativeContractExprViolation(expr: UirCoreExpr, where: str): str =
+    if expr == nil:
+        return ""
+    if expr.kind == meCall:
+        let callee: str = expr.callee
+        if uirCoreNativeContractIsSyscallSymbol(callee):
+            return "forbid syscall symbol=" + callee + " @" + where
+        if uirCoreNativeContractIsFloatIntrinsicSymbol(callee):
+            return "forbid float intrinsic symbol=" + callee + " @" + where
+        for ai in 0..<expr.args.len:
+            let v: str = uirCoreNativeContractExprViolation(expr.args[ai], where + "/arg" + intToStr(ai))
+            if v != nil && len(v) > 0:
+                return v
+        return ""
+    if expr.kind == meBin || expr.kind == meCmp:
+        let lhsV: str = uirCoreNativeContractExprViolation(expr.lhs, where + "/lhs")
+        if lhsV != nil && len(lhsV) > 0:
+            return lhsV
+        let rhsV: str = uirCoreNativeContractExprViolation(expr.rhs, where + "/rhs")
+        if rhsV != nil && len(rhsV) > 0:
+            return rhsV
+        return ""
+    if expr.kind == meCast:
+        if uirCoreNativeContractTypeIsFloat(expr.castType):
+            return "forbid float cast @" + where
+        return uirCoreNativeContractExprViolation(expr.castExpr, where + "/cast")
+    if expr.kind == meLoad:
+        if uirCoreNativeContractTypeIsFloat(expr.loadType):
+            return "forbid float load @" + where
+        return uirCoreNativeContractExprViolation(expr.addrExpr, where + "/addr")
+    return ""
+
+fn uirCoreNativeContractStmtViolation(stmt: UirCoreStmt, where: str): str =
+    if stmt.kind == msStore && uirCoreNativeContractTypeIsFloat(stmt.storeType):
+        return "forbid float store @" + where
+    let exprV: str = uirCoreNativeContractExprViolation(stmt.expr, where + "/expr")
+    if exprV != nil && len(exprV) > 0:
+        return exprV
+    let addrV: str = uirCoreNativeContractExprViolation(stmt.addrExpr, where + "/addr")
+    if addrV != nil && len(addrV) > 0:
+        return addrV
+    return ""
+
+fn uirCoreNativeContractTermViolation(term: UirCoreTerm, where: str): str =
+    if term.kind == mtRet:
+        return uirCoreNativeContractExprViolation(term.retExpr, where + "/ret")
+    if term.kind == mtCbr:
+        return uirCoreNativeContractExprViolation(term.condExpr, where + "/cond")
+    return ""
+
+fn uirCoreNativeContractFuncViolation(f: UirCoreFunc): str =
+    if f == nil:
+        return ""
+    if uirCoreNativeContractTypeIsFloat(f.retType):
+        return "forbid float return type fn=" + f.name
+    for pi in 0..<f.params.len:
+        let p: UirCoreParam = f.params[pi]
+        if uirCoreNativeContractTypeIsFloat(p.ty):
+            return "forbid float param fn=" + f.name + " param=" + p.name
+    for li in 0..<f.localTypes.len:
+        if uirCoreNativeContractTypeIsFloat(f.localTypes[li]):
+            return "forbid float local fn=" + f.name + " slot=" + intToStr(li)
+    for bi in 0..<f.blocks.len:
+        let blk: UirCoreBlock = f.blocks[bi]
+        if blk == nil:
+            continue
+        for si in 0..<blk.stmts.len:
+            let sv: str = uirCoreNativeContractStmtViolation(blk.stmts[si],
+                                                             "fn=" + f.name + " block=" + blk.label + " stmt=" + intToStr(si))
+            if sv != nil && len(sv) > 0:
+                return sv
+        let tv: str = uirCoreNativeContractTermViolation(blk.term,
+                                                         "fn=" + f.name + " block=" + blk.label + " term")
+        if tv != nil && len(tv) > 0:
+            return tv
+    return ""
+
+fn uirCoreNativeContractFindFuncIndex(mod: UirCoreModule, rawName: str): int32 =
+    if mod == nil:
+        return -1
+    let name: str = backendStripSpaces(rawName)
+    if name == nil || len(name) == 0:
+        return -1
+    for i in 0..<mod.funcs.len:
+        let f: UirCoreFunc = mod.funcs[i]
+        if f == nil:
+            continue
+        if f.name == name || f.linkName == name:
+            return i
+    let nameNorm: str = uirCoreNativeContractNormalizeSymbol(name)
+    if nameNorm == nil || len(nameNorm) == 0:
+        return -1
+    for i2 in 0..<mod.funcs.len:
+        let f2: UirCoreFunc = mod.funcs[i2]
+        if f2 == nil:
+            continue
+        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(f2.name)
+        if fnNorm == nameNorm:
+            return i2
+        let lnNorm: str = uirCoreNativeContractNormalizeSymbol(f2.linkName)
+        if lnNorm == nameNorm:
+            return i2
+    return -1
+
+fn uirCoreNativeContractEnqueueByName(mod: UirCoreModule, queue: var int32[], reachable: var bool[], rawName: str) =
+    if mod == nil:
+        return
+    let idx: int32 = uirCoreNativeContractFindFuncIndex(mod, rawName)
+    if idx < 0 || idx >= reachable.len:
+        return
+    if reachable[idx]:
+        return
+    reachable[idx] = true
+    add(queue, idx)
+
+fn uirCoreNativeContractCollectCallsFromExpr(mod: UirCoreModule, expr: UirCoreExpr,
+                                             queue: var int32[], reachable: var bool[]) =
+    if expr == nil:
+        return
+    if expr.kind == meCall:
+        uirCoreNativeContractEnqueueByName(mod, queue, reachable, expr.callee)
+        for ai in 0..<expr.args.len:
+            uirCoreNativeContractCollectCallsFromExpr(mod, expr.args[ai], queue, reachable)
+        return
+    if expr.kind == meBin || expr.kind == meCmp:
+        uirCoreNativeContractCollectCallsFromExpr(mod, expr.lhs, queue, reachable)
+        uirCoreNativeContractCollectCallsFromExpr(mod, expr.rhs, queue, reachable)
+        return
+    if expr.kind == meCast:
+        uirCoreNativeContractCollectCallsFromExpr(mod, expr.castExpr, queue, reachable)
+        return
+    if expr.kind == meLoad:
+        uirCoreNativeContractCollectCallsFromExpr(mod, expr.addrExpr, queue, reachable)
+        return
+
+fn uirCoreNativeContractCollectCallsFromStmt(mod: UirCoreModule, stmt: UirCoreStmt,
+                                             queue: var int32[], reachable: var bool[]) =
+    uirCoreNativeContractCollectCallsFromExpr(mod, stmt.expr, queue, reachable)
+    uirCoreNativeContractCollectCallsFromExpr(mod, stmt.addrExpr, queue, reachable)
+
+fn uirCoreNativeContractCollectCallsFromTerm(mod: UirCoreModule, term: UirCoreTerm,
+                                             queue: var int32[], reachable: var bool[]) =
+    if term.kind == mtRet:
+        uirCoreNativeContractCollectCallsFromExpr(mod, term.retExpr, queue, reachable)
+    elif term.kind == mtCbr:
+        uirCoreNativeContractCollectCallsFromExpr(mod, term.condExpr, queue, reachable)
+
+fn uirCoreNativeContractReachableMask(mod: UirCoreModule): bool[] =
+    var reachable: bool[]
+    if mod == nil:
+        return reachable
+    reachable.len = mod.funcs.len
+    var queue: int32[]
+    var entryIdx: int32 = uirCoreNativeContractFindFuncIndex(mod, "main")
+    if entryIdx < 0:
+        entryIdx = uirCoreNativeContractFindFuncIndex(mod, "_main")
+    if entryIdx < 0:
+        for i in 0..<reachable.len:
+            reachable[i] = true
+        return reachable
+    if entryIdx >= 0 && entryIdx < reachable.len:
+        reachable[entryIdx] = true
+        add(queue, entryIdx)
+    for qi in 0..<queue.len:
+        let idx: int32 = queue[qi]
+        if idx < 0 || idx >= mod.funcs.len:
+            continue
+        let f: UirCoreFunc = mod.funcs[idx]
+        if f == nil || f.isExtern:
+            continue
+        for bi in 0..<f.blocks.len:
+            let blk: UirCoreBlock = f.blocks[bi]
+            if blk == nil:
+                continue
+            for si in 0..<blk.stmts.len:
+                uirCoreNativeContractCollectCallsFromStmt(mod, blk.stmts[si], queue, reachable)
+            uirCoreNativeContractCollectCallsFromTerm(mod, blk.term, queue, reachable)
+    return reachable
+
+fn uirCoreNativeContractEnsureGasHelper(mod: UirCoreModule, chargeName: str, counterName: str) =
+    if mod == nil:
+        return
+    if !moduleHasGlobal(mod, counterName):
+        uirCoreAddGlobal(mod, counterName, uirCoreTypeI64(), 0, true, "<native_contract>")
+    if moduleHasFunc(mod, chargeName):
+        return
+    let helper: UirCoreFunc = uirCoreNewFunc(chargeName, uirCoreTypeI64())
+    uirCoreFuncSetOriginFile(helper, "<native_contract>")
+    uirCoreAddParam(helper, "cost", 0, uirCoreTypeI64())
+    uirCoreSetLocalType(helper, 1, uirCoreTypeI64())
+    uirCoreSetLocalType(helper, 2, uirCoreTypeI64())
+    var stmts: UirCoreStmt[]
+    add(stmts, uirCoreStmtParam("cost", 0, 0))
+    let oldExpr: UirCoreExpr = uirCoreLoad(uirCoreGlobalAddr(counterName), uirCoreTypeI64())
+    add(stmts, uirCoreStmtLet("gas_old", 1, oldExpr))
+    let nextExpr: UirCoreExpr = uirCoreBin(mbAdd, uirCoreLocal(1), uirCoreLocal(0))
+    add(stmts, uirCoreStmtLet("gas_new", 2, nextExpr))
+    add(stmts, uirCoreStmtStore(uirCoreGlobalAddr(counterName), uirCoreLocal(2), uirCoreTypeI64()))
+    let term: UirCoreTerm = uirCoreTermRet(uirCoreLocal(2))
+    let entry: UirCoreBlock = uirCoreBlockWithStmts("entry", stmts, term)
+    uirCoreAddBlock(helper, entry)
+    uirCoreAddFunc(mod, helper)
+
+fn uirCoreNativeContractFirstNonParamStmt(blk: UirCoreBlock): int32 =
+    if blk == nil:
+        return -1
+    # Stage0 stability: avoid while+local-alias form that has triggered seed crashes.
+    for idx in 0..<blk.stmts.len:
+        if blk.stmts[idx] == nil:
+            return idx
+        if blk.stmts[idx].kind != msParam:
+            return idx
+    return blk.stmts.len
+
+fn uirCoreNativeContractStmtCallsCharge(stmt: UirCoreStmt, chargeNorm: str): bool =
+    if stmt == nil:
+        return false
+    if stmt.kind != msExpr:
+        return false
+    let expr0: UirCoreExpr = stmt.expr
+    if expr0 == nil:
+        return false
+    if expr0.kind != meCall:
+        return false
+    let calleeNorm: str = uirCoreNativeContractNormalizeSymbol(expr0.callee)
+    return calleeNorm == chargeNorm
+
+fn uirCoreNativeContractInjectGas(mod: UirCoreModule) =
+    if mod == nil:
+        return
+    let chargeName: str = uirCoreNativeContractChargeSymbol()
+    let counterName: str = uirCoreNativeContractGasCounterSymbol()
+    uirCoreNativeContractEnsureGasHelper(mod, chargeName, counterName)
+    let chargeNorm: str = uirCoreNativeContractNormalizeSymbol(chargeName)
+    var fi: int32 = 0
+    while fi < mod.funcs.len:
+        let f: UirCoreFunc = mod.funcs[fi]
+        fi = fi + 1
+        if f == nil || f.isExtern:
+            continue
+        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(f.name)
+        if fnNorm == chargeNorm:
+            continue
+        var bi: int32 = 0
+        while bi < f.blocks.len:
+            let blk: UirCoreBlock = f.blocks[bi]
+            bi = bi + 1
+            if blk == nil:
+                continue
+            let insertAt: int32 = uirCoreNativeContractFirstNonParamStmt(blk)
+            if insertAt < 0:
+                continue
+            if insertAt < blk.stmts.len:
+                let firstStmt: UirCoreStmt = blk.stmts[insertAt]
+                if uirCoreNativeContractStmtCallsCharge(firstStmt, chargeNorm):
+                    continue
+            var args: UirCoreExpr[]
+            let blockCost: int64 = int64(1 + blk.stmts.len)
+            add(args, uirCoreConstI64(blockCost))
+            let chargeExpr: UirCoreExpr = uirCoreCall(chargeName, args)
+            let chargeStmt: UirCoreStmt = uirCoreStmtExpr(chargeExpr)
+            var out: UirCoreStmt[]
+            var si: int32 = 0
+            while si < blk.stmts.len:
+                if si == insertAt:
+                    add(out, chargeStmt)
+                add(out, blk.stmts[si])
+                si = si + 1
+            if insertAt >= blk.stmts.len:
+                add(out, chargeStmt)
+            blk.stmts = out
+
+fn uirCoreNativeContractEnforce(filePath: str, mod: UirCoreModule) =
+    if mod == nil:
+        return
+    let reachable: bool[] = uirCoreNativeContractReachableMask(mod)
+    for fi in 0..<mod.funcs.len:
+        if fi < reachable.len && !reachable[fi]:
+            continue
+        let f: UirCoreFunc = mod.funcs[fi]
+        let v: str = uirCoreNativeContractFuncViolation(f)
+        if v != nil && len(v) > 0:
+            let panicMsg: str = "uirCore_builder: native_contract hard-fail @" + filePath + ": " + v
+            panic panicMsg
+    uirCoreNativeContractInjectGas(mod)
+
 fn uirCoreApplyUirPluginHooks(filePath: str, mod: UirCoreModule) =
-    if !uirCorePluginEnabled():
+    let pluginEnabled: bool = uirCorePluginEnabled()
+    let nativeContractEnabled: bool = uirCoreNativeContractEnabled()
+    if !pluginEnabled && !nativeContractEnabled:
         return
     if mod == nil:
         return
+    if nativeContractEnabled:
+        uirCoreNativeContractEnforce(filePath, mod)
     return
 
 fn uirCoreIsOne(raw: str): bool =
@@ -390,7 +697,8 @@ fn uirCoreEnsurePolicyDiag(diags: var Diagnostic[], filePath: str, msg: str) =
     d.filename = filePath
     d.line = 1
     d.col = 1
-    d.message = msg
+    let needsRawPtrHint: bool = strContains(msg, "no-pointer policy:") || strContains(msg, "std policy:")
+    d.message = needsRawPtrHint ? rawPointerForbidMessage(msg) : msg
     add(diags, d)
 
 fn uirCoreFileLikelyHasPointerSyntax(path: str): bool =
@@ -466,6 +774,42 @@ fn uirCorePathLooksStdModule(path: str): bool =
         return true
     return false
 
+fn uirCorePathSyntheticOrStd(path: str): bool =
+    if path == nil || len(path) == 0:
+        return false
+    if path[0] == '<':
+        return true
+    if strContains(path, "/src/std/") || strContains(path, "\\src\\std\\"):
+        return true
+    if strContains(path, "/src/core/") || strContains(path, "\\src\\core\\"):
+        return true
+    if strContains(path, "/src/system/") || strContains(path, "\\src\\system\\"):
+        return true
+    return false
+
+fn uirCoreSkipSemStdDuplicateRelaxEnabled(): bool =
+    return uirCoreIsOne(getEnv "STAGE1_SKIP_SEM")
+
+fn uirCoreStage1ParseModeNormalized(): str =
+    var raw: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_STAGE1_PARSE_MODE", "")))
+    if raw == "":
+        raw = lowerAscii(backendStripSpaces(os.getEnvDefault("STAGE1_PARSE_MODE", "")))
+    if raw == "":
+        var fastRaw: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_FAST_DEV_PROFILE", "")))
+        if fastRaw == "0" || fastRaw == "false" || fastRaw == "no" || fastRaw == "off":
+            raw = "full"
+        elif fastRaw == "1" || fastRaw == "true" || fastRaw == "yes" || fastRaw == "on":
+            raw = "outline"
+    if raw == "":
+        let track: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_BUILD_TRACK", "dev")))
+        if track == "release":
+            raw = "full"
+        else:
+            raw = "outline"
+    if raw == "outline":
+        return "outline"
+    return "full"
+
 fn uirCoreStdNoPointerEnabled(): bool =
     let stdNoPtrEnv: str = getEnv "STAGE1_STD_NO_POINTERS"
     if uirCoreIsOne(stdNoPtrEnv):
@@ -496,9 +840,6 @@ fn uirCoreStage1StdNoPointerPrecheck(root: Node, inPath: str, diags: var Diagnos
     return hits > 0
 
 fn uirCoreStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Diagnostic[]): bool =
-    let nonCAbiNoPtrEnv: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI"
-    if !uirCoreIsOne(nonCAbiNoPtrEnv):
-        return false
     var ctx: SemCtx
     initSemCtxInPlace(ctx)
     ctx.diags = diags
@@ -1090,8 +1431,9 @@ fn uirCoreComputeDuplicateFnBases(root: Node, overloaded: hashsets.HashSetStr* =
         let rawName: str = backendStripSpaces(plainName(nameNode))
         if rawName == nil || len(rawName) == 0 || (rawName == "main"):
             continue
-        if overloaded != nil && hashsets.hashSetStrHas(*overloaded, rawName):
-            continue
+        # Overloaded base names still need cross-module duplicate detection.
+        # Otherwise different modules that share the same overloaded signature
+        # can collide at link time (same base + same __cheng_sig_* hash).
         var idx: int32 = -1
         for ci in 0..<seenNames.len:
             if seenNames[ci] == rawName:
@@ -2400,6 +2742,29 @@ fn uirCoreReachDeclIdxs(index: hashmaps.HashMapStrSeqInt, nodes: Node[], name: s
         *foundOut = out.len > 0
     return out
 
+fn uirCorePathBaseName(path: str): str =
+    if path == nil || len(path) == 0:
+        return ""
+    let parts: SplitFileResult = os.splitFile(path)
+    let name0: str = backendStripSpaces(parts.name)
+    if name0 != nil && len(name0) > 0:
+        return name0
+    return backendStripSpaces(path)
+
+fn uirCoreIsEntryFilePath(filePath: str): bool =
+    if filePath == nil || len(filePath) == 0:
+        return false
+    let entryPath: str = backendStripSpaces(os.getEnvDefault("BACKEND_INPUT", ""))
+    if entryPath == nil || len(entryPath) == 0:
+        return false
+    if filePath == entryPath:
+        return true
+    let fileBase: str = uirCorePathBaseName(filePath)
+    let entryBase: str = uirCorePathBaseName(entryPath)
+    if fileBase == nil || len(fileBase) == 0 || entryBase == nil || len(entryBase) == 0:
+        return false
+    return fileBase == entryBase
+
 fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashSetStr =
     let rootKids0: int32 = kidCount(root)
     let rootKids: int32 = (rootKids0 > 0) ? rootKids0 : 1
@@ -2407,12 +2772,59 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
     var index: hashmaps.HashMapStrSeqInt = hashmaps.hashMapStrSeqIntInit(workCap)
     var nodes: Node[workCap]
     uirCoreIndexFnDecls(root, &index, &nodes)
+    let dbgReach: bool = (os.getEnvDefault("BACKEND_DEBUG_REACHABLE", "") == "1")
+    var dbgBudget: int32 = 64
+    if dbgReach:
+        let fDbg: os.File = os.get_stderr()
+        os.writeLine(fDbg, "[backend] reachable: index_nodes=" + intToStr(nodes.len) +
+                          " root_kids=" + intToStr(rootKids0))
+        os.c_fflush fDbg
 
     var reachable: hashsets.HashSetStr = hashsets.hashSetStrInit(workCap)
     var queue: str[]
     queue.cap = workCap
     hashsets.hashSetStrAdd(reachable, "main")
     add(queue, "main")
+    let inputPath: str = backendStripSpaces(os.getEnvDefault("BACKEND_INPUT", ""))
+    var rootPath: str = inputPath
+    if rootPath == nil || len(rootPath) == 0:
+        rootPath = backendStripSpaces((root != nil) ? root.strVal : "")
+    let rootBase: str = uirCorePathBaseName(rootPath)
+    var seededEntryDecls: int32 = 0
+    if rootPath != nil && len(rootPath) > 0:
+        # Keep intra-entry-unit calls closed even when inter-module reachability
+        # misses qualified call forms. This avoids unresolved self symbols in
+        # non-whole-program fast paths while still pruning unrelated imports.
+        for i in 0..<nodes.len:
+            let declNode: Node = nodes[i]
+            if declNode == nil || kidCount(declNode) <= 0:
+                continue
+            var declPath: str = backendStripSpaces(declNode.strVal)
+            if declPath == nil || len(declPath) == 0:
+                declPath = rootPath
+            var sameEntry: bool = (declPath == rootPath)
+            if !sameEntry && rootBase != nil && len(rootBase) > 0:
+                sameEntry = (uirCorePathBaseName(declPath) == rootBase)
+            if !sameEntry:
+                continue
+            let declNameNode: Node = kid(declNode, 0)
+            if declNameNode == nil || (declNameNode.kind != nkIdent && declNameNode.kind != nkSymbol):
+                continue
+            let declName: str = backendStripSpaces(plainName(declNameNode))
+            if declName == nil || len(declName) == 0:
+                continue
+            if !hashsets.hashSetStrHas(reachable, declName):
+                hashsets.hashSetStrAdd(reachable, declName)
+                add(queue, declName)
+                seededEntryDecls = seededEntryDecls + 1
+    if dbgReach:
+        var foundMain: bool = false
+        let mainIdxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, "main", &foundMain)
+        let fDbgMain: os.File = os.get_stderr()
+        os.writeLine(fDbgMain, "[backend] reachable: seed main found=" + (foundMain ? "1" : "0") +
+                               " idxs=" + intToStr(mainIdxs.len) +
+                               " seed_entry_decls=" + intToStr(seededEntryDecls))
+        os.c_fflush fDbgMain
 
     # Global initializers run before `main`, so their callees must be treated as reachable even
     # if they are not referenced from the function call graph rooted at `main`.
@@ -2444,6 +2856,11 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
                                 if len(declName) > 0 && !hashsets.hashSetStrHas(reachable, declName):
                                     hashsets.hashSetStrAdd(reachable, declName)
                                     add(queue, declName)
+                                    if dbgReach && dbgBudget > 0:
+                                        let fDbgInit: os.File = os.get_stderr()
+                                        os.writeLine(fDbgInit, "[backend] reachable: add from_global_init -> " + declName)
+                                        os.c_fflush fDbgInit
+                                        dbgBudget = dbgBudget - 1
         for i in 0..<kidCount(n):
             add(initWork, kid(n, i))
 
@@ -2451,6 +2868,13 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
         let cur: str = queue[qi]
         var found: bool = false
         let idxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, cur, &found)
+        if dbgReach && dbgBudget > 0:
+            let fDbgCur: os.File = os.get_stderr()
+            os.writeLine(fDbgCur, "[backend] reachable: pop name=" + cur +
+                                 " found=" + (found ? "1" : "0") +
+                                 " idxs=" + intToStr(idxs.len))
+            os.c_fflush fDbgCur
+            dbgBudget = dbgBudget - 1
         if !found || idxs.len == 0:
             continue
         for ni in 0..<idxs.len:
@@ -2475,6 +2899,15 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
                                 if len(declName) > 0 && !hashsets.hashSetStrHas(reachable, declName):
                                     hashsets.hashSetStrAdd(reachable, declName)
                                     add(queue, declName)
+                                    if dbgReach && dbgBudget > 0:
+                                        let fDbgAdd: os.File = os.get_stderr()
+                                        os.writeLine(fDbgAdd, "[backend] reachable: add from_call " + cur + " -> " + declName)
+                                        os.c_fflush fDbgAdd
+                                        dbgBudget = dbgBudget - 1
+    if dbgReach:
+        let fDbgDone: os.File = os.get_stderr()
+        os.writeLine(fDbgDone, "[backend] reachable: final_count=" + intToStr(queue.len))
+        os.c_fflush fDbgDone
     return reachable
 
 fn uirCoreFuncSigMarker(): str =
@@ -5224,13 +5657,13 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: UirCoreExpr): 
         let cand: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, callName, argNodes, hint)
         if cand != nil:
             calleeFunc = cand
-            callInternal = cand.name
+            callInternal = uirCoreCallSymbolForFunc(cand)
         elif moduleHasFuncByBase(mod2, callName):
             let calleeRes: Result[UirCoreFunc] = uirCoreResolveCalleeFunc(b, callNode, callName, argNodes)
             if !IsOk[UirCoreFunc](calleeRes):
                 return ErrInfo[UirCoreExpr](ErrorInfoOf[UirCoreFunc](calleeRes))
             calleeFunc = Value[UirCoreFunc](calleeRes)
-            callInternal = calleeFunc.name
+            callInternal = uirCoreCallSymbolForFunc(calleeFunc)
 
     var args: UirCoreExpr[]
     add(args, lead)
@@ -6465,11 +6898,11 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
                             add(argNodes0, base0)
                             let cand0: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, callName0, argNodes0, "")
                             if cand0 != nil:
-                                callInternal0 = cand0.name
+                                callInternal0 = uirCoreCallSymbolForFunc(cand0)
                             else:
                                 let cand1: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, "freeSeq", argNodes0, "")
                                 if cand1 != nil:
-                                    callInternal0 = cand1.name
+                                    callInternal0 = uirCoreCallSymbolForFunc(cand1)
                         var args0: UirCoreExpr[]
                         add(args0, Value[UirCoreExpr](baseRes0))
                         return Ok[UirCoreExpr](uirCoreCall(callInternal0, args0))
@@ -8746,13 +9179,13 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
             let cand: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, callName, argNodes, hint)
             if cand != nil:
                 calleeFunc = cand
-                callInternal = cand.name
+                callInternal = uirCoreCallSymbolForFunc(cand)
             elif moduleHasFuncByBase(mod2, callName):
                 let calleeRes: Result[UirCoreFunc] = uirCoreResolveCalleeFunc(b, node, callName, argNodes)
                 if !IsOk[UirCoreFunc](calleeRes):
                     return ErrInfo[UirCoreExpr](ErrorInfoOf[UirCoreFunc](calleeRes))
                 calleeFunc = Value[UirCoreFunc](calleeRes)
-                callInternal = calleeFunc.name
+                callInternal = uirCoreCallSymbolForFunc(calleeFunc)
         if name == "Value" && argNodes.len == 1:
             let valueArg0: Node = argNodes[0]
             if valueArg0 != nil:
@@ -8907,13 +9340,13 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
             if mod2 != nil:
                 let cand: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, "$", argNodes0, "str")
                 if cand != nil:
-                    callInternal0 = cand.name
+                    callInternal0 = uirCoreCallSymbolForFunc(cand)
                 elif moduleHasFuncByBase(mod2, "$"):
                     let calleeRes: Result[UirCoreFunc] = uirCoreResolveCalleeFunc(b, node, "$", argNodes0)
                     if !IsOk[UirCoreFunc](calleeRes):
                         return ErrInfo[UirCoreExpr](ErrorInfoOf[UirCoreFunc](calleeRes))
                     let callee: UirCoreFunc = Value[UirCoreFunc](calleeRes)
-                    callInternal0 = callee.name
+                    callInternal0 = uirCoreCallSymbolForFunc(callee)
             let rhsRes0: Result[UirCoreExpr] = lowerExprValue(b, rhs, uirCoreTypeI64())
             if !IsOk[UirCoreExpr](rhsRes0):
                 return ErrInfo[UirCoreExpr](ErrorInfoOf[UirCoreExpr](rhsRes0))
@@ -13003,6 +13436,18 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                         return ErrInfo[bool](ErrorInfoOf[bool](deferRes))
                     blockBuilderFinish(b, uirCoreTermRet(uirCoreLocal(retSlot3)))
                     return Ok[bool](true)
+                if expr0 != nil && expr0.kind == nkTupleLit &&
+                   (objRetName == "tuple" || uirCoreStrStartsWith(objRetName, "tuple_")):
+                    # Tuple literal typeCache may be cleared by earlier stage1 passes.
+                    # Store directly into the typed return slot to keep field layout stable.
+                    let litRes: Result[bool] = emitTupleLitToPtr(b, uirCoreLocal(retSlot3), objRetName, expr0)
+                    if !IsOk[bool](litRes):
+                        return ErrInfo[bool](ErrorInfoOf[bool](litRes))
+                    let deferRes: Result[bool] = blockBuilderEmitDefers(b, 0)
+                    if !IsOk[bool](deferRes):
+                        return ErrInfo[bool](ErrorInfoOf[bool](deferRes))
+                    blockBuilderFinish(b, uirCoreTermRet(uirCoreLocal(retSlot3)))
+                    return Ok[bool](true)
                 if expr0 != nil && expr0.kind == nkCall:
                     let callRes: Result[UirCoreExpr] = lowerCallWithLeadingArg(b, expr0, uirCoreLocal(retSlot3))
                     if ! IsOk[UirCoreExpr](callRes):
@@ -13310,6 +13755,7 @@ fn uirCoreRewriteFfiOutPtrFunc(n: Node, synthId: int32*, diags: Diagnostic[]*, o
 
     var importcAnn: Node = nil
     var outPtrAnn: Node = nil
+    var importcLinkNameRaw: str = ""
     for i in 0..<kidCount(pragmas):
         let ann: Node = kid(pragmas, i)
         if ann == nil || ann.kind != nkAnnotation || kidCount(ann) == 0:
@@ -13319,10 +13765,15 @@ fn uirCoreRewriteFfiOutPtrFunc(n: Node, synthId: int32*, diags: Diagnostic[]*, o
         var importcLinkName: str = ""
         if uirCoreParseImportcAnnotation(ann, &hasImportc, &importcLinkName) && hasImportc:
             importcAnn = ann
+            importcLinkNameRaw = importcLinkName
         if annName == "ffi_out_ptrs":
             outPtrAnn = ann
 
     if importcAnn == nil || outPtrAnn == nil:
+        add(outNodes, n)
+        return false
+    if importcLinkNameRaw == nil || len(importcLinkNameRaw) == 0:
+        uirCoreStage1AddDiag(diags, n, "ffi_out_ptrs importc annotation requires explicit link name")
         add(outNodes, n)
         return false
 
@@ -13459,7 +13910,7 @@ fn uirCoreRewriteFfiOutPtrFunc(n: Node, synthId: int32*, diags: Diagnostic[]*, o
     if synthId != nil:
         sid = *synthId
         *synthId = sid + 1
-    let rawName: str = "__cheng_ffi_outptr_raw_" + intToStr(sid) + "_" + baseName
+    let rawName: str = importcLinkNameRaw
 
     var rawParams: Node = newNode(nkFormalParams, n.pos)
     var userCursor: int32 = 0
@@ -13486,7 +13937,13 @@ fn uirCoreRewriteFfiOutPtrFunc(n: Node, synthId: int32*, diags: Diagnostic[]*, o
     var rawRet: Node = emptyNode(n.pos)
     if hasStatus:
         rawRet = cloneTree(statusType)
-    let rawPragmas: Node = uirCoreClonePragmasFiltered(pragmas, false, true)
+    var rawPragmas: Node = uirCoreClonePragmasFiltered(pragmas, true, true)
+    if rawPragmas == nil || rawPragmas.kind != nkPragma:
+        rawPragmas = newNode(nkPragma, n.pos)
+    var rawImportcAnn: Node = newNode(nkAnnotation, n.pos)
+    addSon(rawImportcAnn, newIdent("importc", n.pos))
+    addSon(rawImportcAnn, newStrLit(importcLinkNameRaw, n.pos))
+    addSon(rawPragmas, rawImportcAnn)
     let wrapPragmas: Node = uirCoreClonePragmasFiltered(pragmas, true, true)
 
     var rawFn: Node = newNode(nkFnDecl, n.pos)
@@ -13544,6 +14001,11 @@ fn uirCoreRewriteFfiOutPtrFunc(n: Node, synthId: int32*, diags: Diagnostic[]*, o
         addSon(body, callNode)
 
     var tupleRet: Node = newNode(nkTupleLit, n.pos)
+    # Keep tuple literal layout aligned with declared return type.
+    # Without an explicit type cache, tuple element inference may widen ints
+    # and produce mismatched field offsets in ABI copies.
+    tupleRet.typeCacheValid = true
+    tupleRet.typeCache = cloneTree(retNode)
     if hasStatus:
         addSon(tupleRet, newIdent(statusName, n.pos))
     for oi in 0..<outTupleTypes.len:
@@ -14385,6 +14847,13 @@ fn uirCoreInferCallRetKeyHint(callNode: Node): str =
         return typeKey callNode.typeCache
     return ""
 
+fn uirCoreCallSymbolForFunc(callee: UirCoreFunc): str =
+    if callee == nil:
+        return ""
+    if callee.isExtern && callee.linkName != nil && len(callee.linkName) > 0:
+        return callee.linkName
+    return callee.name
+
 fn uirCoreScoreCalleeForCall(callee: UirCoreFunc, argKeys: str[], retKeyHint: str): int32 =
     if callee == nil:
         return -1
@@ -14682,248 +15151,6 @@ fn uirCoreResolveCalleeFunc(b: BlockBuilder, callNode: Node, baseName: str, argN
 
 fn moduleHasGlobal(mod: UirCoreModule, name: str): bool =
     return moduleGlobalIndex(mod, name) >= 0
-
-fn strHasSuffix(s: str, suffix: str): bool =
-    if s == nil || suffix == nil:
-        return false
-    let n: int32 = len(s)
-    let m: int32 = len(suffix)
-    if m == 0:
-        return true
-    if n < m:
-        return false
-    for i in 0..<m:
-        if s[n - m + i] != suffix[i]:
-            return false
-    return true
-
-fn strHasPrefix(s: str, prefix: str): bool =
-    if s == nil || prefix == nil:
-        return false
-    let n: int32 = len(s)
-    let m: int32 = len(prefix)
-    if m == 0:
-        return true
-    if n < m:
-        return false
-    for i in 0..<m:
-        if s[i] != prefix[i]:
-            return false
-    return true
-
-fn strStripPrefix(s: str, prefix: str): str =
-    if s == nil || prefix == nil:
-        return ""
-    let n: int32 = len(s)
-    let m: int32 = len(prefix)
-    if m == 0:
-        return s
-    if n < m:
-        return ""
-    for i in 0..<m:
-        if s[i] != prefix[i]:
-            return ""
-    return str(ptr_add(void*(s), m))
-
-fn indexOfChar(s: str, ch: char): int32 =
-    if s == nil || len(s) == 0:
-        return -1
-    for i in 0..<len(s):
-        if s[i] == ch:
-            return i
-    return -1
-
-fn parseQuotedValue(line: str): str =
-    if line == nil || len(line) == 0:
-        return ""
-    let first: int32 = indexOfChar(line, '"')
-    if first < 0:
-        return ""
-    let second: int32 = indexOfChar(str(ptr_add(void*(line), first + 1)), '"')
-    if second <= 0:
-        return ""
-    return os.sliceStr(line, first + 1, first + second)
-
-fn importPathDropChengPrefix(path: str): str =
-    if path == nil || len(path) == 0:
-        return ""
-    if strHasPrefix(path, "cheng/"):
-        if len(path) <= 6:
-            return ""
-        return strStripPrefix(path, "cheng/")
-    return path
-
-fn packageNameFromRest(rest: str): str =
-    let normalized: str = importPathDropChengPrefix(rest)
-    if normalized == nil || len(normalized) == 0:
-        return ""
-    let slash: int32 = indexOfChar(normalized, '/')
-    if slash <= 0:
-        return ""
-    let pkgName: str = os.sliceStr(normalized, 0, slash - 1)
-    if pkgName == "std" || pkgName == "core" || pkgName == "system" ||
-       pkgName == "ide" || pkgName == "gui":
-        return ""
-    return pkgName
-
-fn packageIdFromRest(rest: str): str =
-    let name: str = packageNameFromRest(rest)
-    if name == nil || len(name) == 0:
-        return ""
-    if (name == "stdlib"):
-        return ""
-    return "pkg://cheng/" + name
-
-fn packageIdFromManifest(manifestPath: str): str =
-    if manifestPath == nil || len(manifestPath) == 0:
-        return ""
-    if ! frontend_lib.stage1_fileExists(manifestPath):
-        return ""
-    let content: str = frontend_lib.stage1_readFile(manifestPath)
-    if content == nil || len(content) == 0:
-        return ""
-    let key: str = "package_id"
-    var start: int32 = 0
-    for i in 0..len(content):
-        if i == len(content) || content[i] == '\n':
-            if i > start:
-                let line: str = os.sliceStr(content, start, i - 1)
-                let trimmed: str = backendStripSpaces(line)
-                if strHasPrefix(trimmed, key):
-                    if len(trimmed) == len(key) || trimmed[len(key)] == '=' ||
-                       trimmed[len(key)] == ':' || trimmed[len(key)] == ' ':
-                        let value: str = parseQuotedValue(trimmed)
-                        if value != nil && len(value) > 0:
-                            return value
-            start = i + 1
-    return ""
-
-fn packageIdMatches(manifestPath: str, expected: str): bool =
-    if expected == nil || len(expected) == 0:
-        return true
-    let got: str = packageIdFromManifest manifestPath
-    if got == nil || len(got) == 0:
-        return false
-    return (got == expected)
-
-fn pkgRootsFromEnv(): str[] =
-    var out: str[]
-    let single: str = os.getEnvDefault("PKG_ROOT", "")
-    if single != nil && len(single) > 0:
-        add(out, backendStripSpaces(single))
-    let raw: str = os.getEnvDefault("PKG_ROOTS", "")
-    var hasCommaOrSemi: bool = false
-    var k: int32 = 0
-    while raw != nil && k < len(raw):
-        let c0: char = raw[k]
-        if c0 == ',' || c0 == ';':
-            hasCommaOrSemi = true
-            break
-        k = k + 1
-    let useColon: bool = !hasCommaOrSemi
-    var start: int32 = 0
-    var i: int32 = 0
-    if raw != nil && len(raw) > 0:
-        let __for_start_i_2 = i
-        for __for_i_2 in __for_start_i_2..len(raw):
-            i = __for_i_2
-            let c: char = (i < len(raw)) ? raw[i] : char(int8(0))
-            if i == len(raw) || c == ',' || c == ';' || (useColon && c == ':'):
-                if i > start:
-                    let part: str = os.sliceStr(raw, start, i - 1)
-                    let trimmed: str = backendStripSpaces(part)
-                    if trimmed != nil && len(trimmed) > 0:
-                        add(out, trimmed)
-                start = i + 1
-            i = i + 1
-    if out.len == 0:
-        let home: str = os.getEnvDefault("HOME", "")
-        if home != nil && len(home) > 0:
-            add(out, os.joinPath(home, ".cheng-packages"))
-    return out
-
-fn resolvePkgCandidate(base: str): str =
-    if base == nil || len(base) == 0:
-        return ""
-    var full: str = base
-    if ! strHasSuffix(full, ".cheng"):
-        full = full + ".cheng"
-    if frontend_lib.stage1_fileExists(full):
-        return full
-    return ""
-
-fn resolvePkgInRoot(pkgRoot: str, relInPkg: str, relForPkgRoot: str): str =
-    if pkgRoot == nil || len(pkgRoot) == 0:
-        return ""
-
-    if relInPkg != nil && len(relInPkg) > 0:
-        var candidate: str = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "src"), relInPkg))
-        if len(candidate) > 0:
-            return candidate
-        candidate = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "cheng"), relInPkg))
-        if len(candidate) > 0:
-            return candidate
-        candidate = resolvePkgCandidate(os.joinPath(pkgRoot, relInPkg))
-        if len(candidate) > 0:
-            return candidate
-
-    if relForPkgRoot != nil && len(relForPkgRoot) > 0:
-        var legacy: str = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "src"), relForPkgRoot))
-        if len(legacy) > 0:
-            return legacy
-        legacy = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "cheng"), relForPkgRoot))
-        if len(legacy) > 0:
-            return legacy
-        legacy = resolvePkgCandidate(os.joinPath(pkgRoot, relForPkgRoot))
-        if len(legacy) > 0:
-            return legacy
-    return ""
-
-fn resolvePkgImport(root: str, rest: str): str =
-    if root == nil || len(root) == 0 || rest == nil || len(rest) == 0:
-        return ""
-    let normalizedRest: str = importPathDropChengPrefix(rest)
-    if normalizedRest == nil || len(normalizedRest) == 0:
-        return ""
-    let slash: int32 = indexOfChar(normalizedRest, '/')
-    if slash <= 0 || slash >= len(normalizedRest) - 1:
-        return ""
-    let pkg: str = os.sliceStr(normalizedRest, 0, slash - 1)
-    if (pkg == "stdlib"):
-        return ""
-    let expectedPkgId: str = packageIdFromRest(normalizedRest)
-    let relInPkg: str = os.sliceStr(normalizedRest, slash + 1, len(normalizedRest) - 1)
-    let manifest: str = os.joinPath(root, "cheng-package.toml")
-    if frontend_lib.stage1_fileExists(manifest):
-        if ! packageIdMatches(manifest, expectedPkgId):
-            return ""
-        return resolvePkgInRoot(root, relInPkg, normalizedRest)
-
-    # Container root: try cheng-<pkg> and <pkg> subdirectories.
-    let prefixedRoot: str = os.joinPath(root, "cheng-" + pkg)
-    let plainRoot: str = os.joinPath(root, pkg)
-    let prefManifest: str = os.joinPath(prefixedRoot, "cheng-package.toml")
-    if frontend_lib.stage1_fileExists(prefManifest):
-        if packageIdMatches(prefManifest, expectedPkgId):
-            let resolvedPref: str = resolvePkgInRoot(prefixedRoot, relInPkg, normalizedRest)
-            if len(resolvedPref) > 0:
-                return resolvedPref
-    else:
-        let resolvedPrefLegacy: str = resolvePkgInRoot(prefixedRoot, relInPkg, normalizedRest)
-        if len(resolvedPrefLegacy) > 0:
-            return resolvedPrefLegacy
-
-    let plainManifest: str = os.joinPath(plainRoot, "cheng-package.toml")
-    if frontend_lib.stage1_fileExists(plainManifest):
-        if packageIdMatches(plainManifest, expectedPkgId):
-            let resolvedPlain: str = resolvePkgInRoot(plainRoot, relInPkg, normalizedRest)
-            if len(resolvedPlain) > 0:
-                return resolvedPlain
-    else:
-        let resolvedPlainLegacy: str = resolvePkgInRoot(plainRoot, relInPkg, normalizedRest)
-        if len(resolvedPlainLegacy) > 0:
-            return resolvedPlainLegacy
-    return ""
 
 fn resolveImportToFilePath(importPath: str, fromFilePath: str): Result[str] =
     if importPath == nil || len(importPath) == 0:
@@ -15706,12 +15933,19 @@ fn uirCoreConsumeFile(mod: UirCoreModule, ctx: UirCoreBuildCtx, filePath: str): 
             if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
                uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
                 var sameFile: bool = false
+                var prevFile: str = ""
                 for di in 0..<mod.funcs.len:
                     let ex: UirCoreFunc = mod.funcs[di]
-                    if ex != nil && (ex.name == f.name) && (ex.originFile == f.originFile):
-                        sameFile = true
-                        break
+                    if ex != nil && (ex.name == f.name):
+                        if ex.originFile == f.originFile:
+                            sameFile = true
+                            break
+                        if len(prevFile) == 0 && ex.originFile != nil && len(ex.originFile) > 0:
+                            prevFile = ex.originFile
                 if sameFile:
+                    continue
+                if uirCoreSkipSemStdDuplicateRelaxEnabled() &&
+                   (uirCorePathSyntheticOrStd(prevFile) || uirCorePathSyntheticOrStd(f.originFile)):
                     continue
                 releaseNodeArena()
                 return Err[str[]]("uirCore_builder: duplicate function name: " + f.name)
@@ -16051,6 +16285,12 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
                 if (prevSyntheticOrStd || curSyntheticOrStd) &&
                    g0.ty.kind == declType.kind && g0.ty.isUnsigned == declType.isUnsigned:
                     allowDupGlobal = true
+        if existingGi >= 0 && !allowDupGlobal && uirCoreSkipSemStdDuplicateRelaxEnabled():
+            let g0: UirCoreGlobal = mod.globals[existingGi]
+            let prevFile2: str = g0.originFile
+            if (uirCorePathSyntheticOrStd(prevFile2) || uirCorePathSyntheticOrStd(filePath)) &&
+               g0.ty.kind == declType.kind && g0.ty.isUnsigned == declType.isUnsigned:
+                allowDupGlobal = true
 
         if moduleHasFunc(mod, name) || (existingGi >= 0 && !allowDupGlobal) ||
            uirCoreFindTypeAlias(mod, name) >= 0 || uirCoreFindObjType(mod, name) >= 0:
@@ -16148,7 +16388,11 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
                 stage1Trace("backend: uir globals=" + intToStr(ctx.traceGlobalCount) + " last=" + name)
         return Ok[bool](true)
     if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
-        if reachable != nil:
+        var entryPathProbe: str = backendStripSpaces(filePath)
+        if n != nil && n.strVal != nil && len(n.strVal) > 0:
+            entryPathProbe = backendStripSpaces(n.strVal)
+        let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
+        if reachable != nil && !keepByEntryFile:
             let nameNode: Node = kid(n, 0)
             if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
                 let nm: str = backendStripSpaces(plainName(nameNode))
@@ -16185,9 +16429,21 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
                     if (ctx.traceFnCount % 50) == 0:
                         stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + f.name)
                 return Ok[bool](true)
+            if uirCoreSkipSemStdDuplicateRelaxEnabled() &&
+               (uirCorePathSyntheticOrStd(ex2.originFile) || uirCorePathSyntheticOrStd(f.originFile)):
+                return Ok[bool](false)
             return Err[bool]("uirCore_builder: duplicate function name: " + f.name)
         if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
            uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
+            if uirCoreSkipSemStdDuplicateRelaxEnabled():
+                var prevFile: str = ""
+                for di in 0..<mod.funcs.len:
+                    let ex: UirCoreFunc = mod.funcs[di]
+                    if ex != nil && (ex.name == f.name):
+                        prevFile = ex.originFile
+                        break
+                if uirCorePathSyntheticOrStd(prevFile) || uirCorePathSyntheticOrStd(f.originFile):
+                    return Ok[bool](false)
             return Err[bool]("uirCore_builder: duplicate function name: " + f.name)
         if (f.name == "main"):
             if ctx != nil && ctx.foundMain:
@@ -16217,7 +16473,11 @@ fn uirCorePredeclareTopLevelFromRoot(mod: UirCoreModule, root: Node, filePath: s
                 return res
         return Ok[bool](true)
     if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
-        if reachable != nil:
+        var entryPathProbe: str = backendStripSpaces(filePath)
+        if n != nil && n.strVal != nil && len(n.strVal) > 0:
+            entryPathProbe = backendStripSpaces(n.strVal)
+        let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
+        if reachable != nil && !keepByEntryFile:
             let nameNode: Node = kid(n, 0)
             if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
                 let nm: str = backendStripSpaces(plainName(nameNode))
@@ -16245,6 +16505,9 @@ fn uirCorePredeclareTopLevelFromRoot(mod: UirCoreModule, root: Node, filePath: s
                     if len prevFile == 0 && exFile != nil && len exFile > 0:
                         prevFile = exFile
             if sameFile:
+                return Ok[bool](false)
+            if uirCoreSkipSemStdDuplicateRelaxEnabled() &&
+               (uirCorePathSyntheticOrStd(prevFile) || uirCorePathSyntheticOrStd(f.originFile)):
                 return Ok[bool](false)
             if len prevFile > 0:
                 return Err[bool]("uirCore_builder: duplicate function name: " + f.name + " (files: " + prevFile + ", " + f.originFile + ")")
@@ -16523,7 +16786,16 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
                     " name=" + nameDbg +
                     " @" + lineDbg + ":" + colDbg)
             return ErrInfo[UirCoreModule](info0)
+        if dbgLower:
+            let fDbgDone: os.File = os.get_stderr()
+            os.write(fDbgDone, "uirCore_lower_done\t")
+            os.write(fDbgDone, intToStr(i + 1))
+            os.write(fDbgDone, "/")
+            os.write(fDbgDone, intToStr(rootKidCount))
+            os.writeLine(fDbgDone, "")
+            os.c_fflush fDbgDone
     uirCoreProfileStep(prof, "lower_top_level")
+    uirCoreProfileStep(prof, "fn_tasks")
     if dbgSummary:
         echo("[uir] lower funcs=" + intToStr(mod.funcs.len) +
              " globals=" + intToStr(mod.globals.len) +
@@ -16613,6 +16885,10 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
     var profMark: int64 = 0
     var profLex: int64 = 0
     var profLoad: int64 = 0
+    var profOutlineParse: int64 = 0
+    var profMaterializeBodies: int64 = 0
+    var profMergeModule: int64 = 0
+    var profFnTasks: int64 = 0
     var profSem: int64 = 0
     var profMono: int64 = 0
     var profOwn: int64 = 0
@@ -16674,12 +16950,22 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
         if ! cacheRes.hit:
             writeTokenCache(inPath, size, mtime, tokens)
     dumpTokens(inPath, tokens)
-    let userRoot: Node = parseModuleWithDiagnostics(tokens, inPath, &diags)
+    let parseMode: str = uirCoreStage1ParseModeNormalized()
+    let outlineMode: bool = parseMode == "outline"
+    if outlineMode:
+        stage1Trace "internal: outline_parse"
+    let outlineParseStart: int64 = profOn ? cheng_monotime_ns() : int64(0)
+    var userRoot: Node = nil
+    if outlineMode:
+        userRoot = parseModuleOutlineWithDiagnostics(tokens, inPath, &diags)
+    else:
+        userRoot = parseModuleWithDiagnostics(tokens, inPath, &diags)
+    if profOn:
+        profOutlineParse = cheng_monotime_ns() - outlineParseStart
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: parsed_user_module")
+        os.writeLine(dbgFile, "[backend] stage1: parse_mode=" + parseMode)
         os.c_fflush dbgFile
-    tokens = []
-    lexDiags = []
 
     if userRoot != nil:
         let inPathTag: str = normalizeImportPath inPath
@@ -16701,10 +16987,32 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: imports_start")
         os.c_fflush dbgFile
-    let repoRoot: str = os.getCurrentDir()
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_repo_root_start")
+        os.c_fflush dbgFile
+    # Stage0/selfhost compatibility:
+    # avoid relying on getcwd() in bootstrap-compiled driver builds.
+    var repoRoot: str = os.getEnvDefault("PWD", ".")
+    if repoRoot == nil || len(repoRoot) == 0:
+        repoRoot = "."
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_repo_root_done")
+        os.c_fflush dbgFile
     var importVisited: StrSetList = strSetListInit(16)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_visited_init_done")
+        os.c_fflush dbgFile
     var importCache: NodeCache = nodeCacheInit(128)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_cache_init_done")
+        os.c_fflush dbgFile
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: load_system_module_start")
+        os.c_fflush dbgFile
     let sysRoot: Node = loadSystemModule(inPath, &diags)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: load_system_module_done")
+        os.c_fflush dbgFile
     if sysRoot != nil:
         let sysResolved: str = resolveImportPath("system", "", repoRoot)
         if len sysResolved > 0:
@@ -16728,6 +17036,8 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
         for si in 0..<sysImported.len:
             addSon(sysRoot, sysImported[si])
 
+    stage1Trace "internal: merge_module"
+    let mergeStart: int64 = profOn ? cheng_monotime_ns() : int64(0)
     var root0: Node = nil
     if userRoot == nil:
         root0 = mergeModules(sysRoot, userRoot)
@@ -16752,6 +17062,18 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
             addSon(root0, imported[ii])
         for ui in 0..<kidCount(userRoot):
             addSon(root0, kid(userRoot, ui))
+    if profOn:
+        profMergeModule = cheng_monotime_ns() - mergeStart
+
+    if outlineMode && userRoot != nil:
+        stage1Trace "internal: materialize_bodies"
+        let materializeStart: int64 = profOn ? cheng_monotime_ns() : int64(0)
+        let _materializedUserFns: int32 = materializeModuleRoutineBodiesFromTokens(tokens, inPath, userRoot, &diags)
+        if profOn:
+            profMaterializeBodies = cheng_monotime_ns() - materializeStart
+
+    tokens = []
+    lexDiags = []
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: imports_done")
         os.c_fflush dbgFile
@@ -16764,13 +17086,13 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
         if hasError diags:
             printDiagnostics diags
         else:
-            echo "std policy: pointer types are forbidden in standard library"
+            echo rawPointerForbidMessage("std policy: pointer types are forbidden in standard library")
         return Err[UirCoreModule]("uirCore_builder: stage1 errors")
     if uirCoreStage1NoPointerNonCAbiPrecheck(root0, inPath, diags):
         if hasError diags:
             printDiagnostics diags
         else:
-            echo "no-pointer policy: pointer types are forbidden outside C ABI modules"
+            echo rawPointerForbidMessage("no-pointer policy: pointer types are forbidden outside C ABI modules")
         return Err[UirCoreModule]("uirCore_builder: stage1 errors")
     if uirCoreFileLikelyUsesRawSpawn(inPath):
         echo "spawn raw function pointer is forbidden in default API; use std/async_rt_legacy.spawn"
@@ -16978,6 +17300,12 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
         msg = msg + int64ToStr(profMono / 1000000)
         msg = msg + "ms ownership="
         msg = msg + int64ToStr(profOwn / 1000000)
+        msg = msg + "ms outline_parse="
+        msg = msg + int64ToStr(profOutlineParse / 1000000)
+        msg = msg + "ms materialize_bodies="
+        msg = msg + int64ToStr(profMaterializeBodies / 1000000)
+        msg = msg + "ms merge_module="
+        msg = msg + int64ToStr(profMergeModule / 1000000)
         msg = msg + "ms borrow_ir="
         msg = msg + borrowIrMode
         msg = msg + " generic_lowering="
@@ -16991,7 +17319,11 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: uirCore_build_start")
         os.c_fflush dbgFile
+    stage1Trace "internal: fn_tasks"
+    let fnTasksStart: int64 = profOn ? cheng_monotime_ns() : int64(0)
     let uirCoreRes: Result[UirCoreModule] = uirCoreBuildModuleFromRoot(root)
+    if profOn:
+        profFnTasks = cheng_monotime_ns() - fnTasksStart
     if !IsOk[UirCoreModule](uirCoreRes):
         let info0: ErrorInfo = ErrorInfoOf[UirCoreModule](uirCoreRes)
         let msg0: str = ErrorFormat(info0)
@@ -17009,4 +17341,6 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
                      " high_uir_unmapped_funcs=" + intToStr(phaseStats.highUnmappedFuncs) +
                      " high_uir_no_proof_funcs=" + intToStr(phaseStats.highNoProofFuncs))
         os.c_fflush dbgFile
+    if profOn:
+        echo("[stage1] profile_ext: fn_tasks=" + int64ToStr(profFnTasks / 1000000) + "ms")
     return Ok[UirCoreModule](mod)

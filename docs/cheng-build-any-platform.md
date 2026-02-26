@@ -44,7 +44,7 @@ MM=orc ./cheng \
 说明：
 - `--target=auto` 会按运行平台自动映射（Darwin/Linux/Windows 的 arm64/x86_64）。
 - 不传 `--target` 时，默认同样走 `auto`。
-- 默认使用系统链接器路径（`cc/ld`），无需外层 `chengb.sh` 包装。
+- 默认使用系统链接器路径（`cc/ld`），无需外层 `chengb` 包装。
 
 ---
 

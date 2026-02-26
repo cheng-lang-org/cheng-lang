@@ -5,7 +5,6 @@
 import std/seqs
 import std/strings
 import std/result
-import std/hashmaps
 import cheng/backend/uir/uir_internal/uir_core_types
 
 type
@@ -309,6 +308,28 @@ fn ssaSortEdgesStable(edges: SsaEdgeMoves[]*): bool =
         edges[j + 1] = key
     return changed
 
+fn ssaStrEq(a: str, b: str): bool =
+    if a == b:
+        return true
+    if a == nil || b == nil:
+        return false
+    let n: int32 = len(a)
+    if len(b) != n:
+        return false
+    for i in 0..<n:
+        if a[i] != b[i]:
+            return false
+    return true
+
+fn ssaFindBlockIndexByLabel(func: UirCoreFunc, label: str): int32 =
+    if func == nil || label == nil || len(label) == 0:
+        return -1
+    for i in 0..<func.blocks.len:
+        let b: UirCoreBlock = func.blocks[i]
+        if b != nil && ssaStrEq(b.label, label):
+            return i
+    return -1
+
 fn ssaRenameBlock(ctx: SsaRenameCtx, bi: int32): Result[bool] =
     if ctx == nil:
         return Err[bool]("uirCore_ssa: nil ctx")
@@ -430,12 +451,10 @@ fn uirCoreSsaLowerFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
     if n <= 0:
         return Ok[bool](true)
 
-    var labelMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(n * 2 + 8)
     for bi in 0..<n:
         let b: UirCoreBlock = func.blocks[bi]
         if b == nil || b.label == nil || len(b.label) == 0:
             return Err[bool]("uirCore_ssa: missing block label (" + func.name + ")")
-        hashmaps.hashMapStrIntPut(labelMap, b.label, bi)
 
     var preds: SsaGridInt32 = ssaNewSeq2DInt(n)
     var succs: SsaGridInt32 = ssaNewSeq2DInt(n)
@@ -444,27 +463,38 @@ fn uirCoreSsaLowerFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
         if b2 == nil:
             continue
         if b2.term.kind == mtBr:
-            var found: bool = false
-            let si: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.target, found)
-            if ! found:
+            let si: int32 = ssaFindBlockIndexByLabel(func, b2.term.target)
+            if si < 0:
                 return Err[bool]("uirCore_ssa: br target not found (" + func.name + ":" + b2.label + ")")
             ssa2dAddUniqueInt(&succs, bi, si)
             ssa2dAddUniqueInt(&preds, si, bi)
         elif b2.term.kind == mtCbr:
-            var foundT: bool = false
-            var foundF: bool = false
-            let st: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetTrue, foundT)
-            let sf: int32 = hashmaps.hashMapStrIntGet(labelMap, b2.term.targetFalse, foundF)
-            if ! foundT || ! foundF:
-                return Err[bool]("uirCore_ssa: cbr target not found (" + func.name + ":" + b2.label + ")")
+            let st: int32 = ssaFindBlockIndexByLabel(func, b2.term.targetTrue)
+            let sf: int32 = ssaFindBlockIndexByLabel(func, b2.term.targetFalse)
+            if st < 0 || sf < 0:
+                var labelsDump: str = ""
+                for li in 0..<n:
+                    let lb: UirCoreBlock = func.blocks[li]
+                    if lb == nil:
+                        continue
+                    if len(labelsDump) > 0:
+                        labelsDump = labelsDump + ","
+                    labelsDump = labelsDump + lb.label + "#" + uirCoreU64ToHex(uirCoreFnv1a64(lb.label))
+                return Err[bool]("uirCore_ssa: cbr target not found (" + func.name + ":" + b2.label +
+                                 ") true=" + b2.term.targetTrue +
+                                 " true_len=" + intToStr(len(b2.term.targetTrue)) +
+                                 " true_hash=" + uirCoreU64ToHex(uirCoreFnv1a64(b2.term.targetTrue)) +
+                                 " false=" + b2.term.targetFalse +
+                                 " false_len=" + intToStr(len(b2.term.targetFalse)) +
+                                 " false_hash=" + uirCoreU64ToHex(uirCoreFnv1a64(b2.term.targetFalse)) +
+                                 " labels=[" + labelsDump + "]")
             ssa2dAddUniqueInt(&succs, bi, st)
             ssa2dAddUniqueInt(&succs, bi, sf)
             ssa2dAddUniqueInt(&preds, st, bi)
             ssa2dAddUniqueInt(&preds, sf, bi)
 
-    var foundEntry: bool = false
-    var entry: int32 = hashmaps.hashMapStrIntGet(labelMap, "entry", foundEntry)
-    if ! foundEntry:
+    var entry: int32 = ssaFindBlockIndexByLabel(func, "entry")
+    if entry < 0:
         entry = 0
 
     # Reverse postorder of reachable CFG.

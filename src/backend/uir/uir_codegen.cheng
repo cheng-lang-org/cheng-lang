@@ -4,8 +4,8 @@ import std/os
 
 import cheng/backend/uir/[uir_types, uir_opt]
 import cheng/backend/uir/[uir_validate]
-import cheng/backend/machine/[machine_types, machine_select_aarch64, machine_regalloc]
-import cheng/backend/obj/[macho_writer]
+import cheng/backend/machine/[machine_types, machine_select_aarch64, machine_select_x86_64, machine_regalloc]
+import cheng/backend/obj/[macho_writer, macho_writer_x86_64, elf_writer, elf_writer_x86_64, coff_writer, coff_writer_x86_64]
 
 fn uirTargetIsDarwin(target: str): bool =
     if target == nil || len(target) == 0:
@@ -16,6 +16,11 @@ fn uirTargetIsWindows(target: str): bool =
     if target == nil || len(target) == 0:
         return false
     return uirStrContains(target, "windows") || uirStrContains(target, "msvc")
+
+fn uirTargetIsLinuxLike(target: str): bool =
+    if target == nil || len(target) == 0:
+        return false
+    return uirStrContains(target, "linux") || uirStrContains(target, "android") || uirStrContains(target, "gnu")
 
 fn uirTargetIsAarch64(target: str): bool =
     if target == nil || len(target) == 0:
@@ -51,19 +56,43 @@ fn uirStrContains(hay: str, needle: str): bool =
             return true
     return false
 
-fn uirModuleToMachine(module: UirModule, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
+fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
     if optLevel >= 1:
         uirOptimizeModule(module, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
     if dbgCodegen:
         echo("[codegen] select.begin")
-    let res: Result[MachineModule] = machineSelectAarch64(module)
+    let isAarch64: bool = uirTargetIsAarch64(target)
+    let isX86_64: bool = uirTargetIsX86_64(target)
+    if !isAarch64 && !isX86_64:
+        return Err[MachineModule]("uir_codegen: unsupported target arch: " + target)
+    var res: Result[MachineModule]
+    if isAarch64:
+        res = machineSelectAarch64(module)
+    else:
+        res = machineSelectX86_64(module)
     if ! IsOk[MachineModule](res):
         return res
     if dbgCodegen:
         echo("[codegen] select.end")
         echo("[codegen] regalloc.begin")
     let allocated: MachineModule = machineAssignRegisters(res.value)
+    allocated.target = target
+    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    if dbgCstr:
+        let cCount: int32 = machineModuleCstrsLen(allocated)
+        echo("[codegen.cstr] post-regalloc cstrs=" + intToStr(cCount))
+        for ci in 0..<cCount:
+            if ci >= 8:
+                break
+            let c: MachineCString = machineModuleCStringAt(allocated, ci)
+            let lbl: str = machineCStringLabelOf(c)
+            let val: str = machineCStringValueOf(c)
+            let vLen: int32 = val == nil ? -1 : len(val)
+            let v0: int32 = (val != nil && vLen > 0) ? int32(val[0]) : -1
+            let v1: int32 = (val != nil && vLen > 1) ? int32(val[1]) : -1
+            echo("[codegen.cstr] i=" + intToStr(ci) + " label=" + lbl +
+                 " len=" + intToStr(vLen) + " b0=" + intToStr(v0) + " b1=" + intToStr(v1))
     if dbgCodegen:
         echo("[codegen] regalloc.end")
     var out: Result[MachineModule]
@@ -72,18 +101,79 @@ fn uirModuleToMachine(module: UirModule, optLevel: int32, uirSimdEnabled: bool, 
     out.err = ErrorOk()
     return out
 
+fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
+    var objWriter: str = objWriterRaw
+    if objWriter == nil:
+        objWriter = ""
+    if len(objWriter) == 0:
+        if uirTargetIsWindows(target):
+            objWriter = "coff"
+        elif uirTargetIsDarwin(target):
+            objWriter = "macho"
+        elif uirTargetIsLinuxLike(target):
+            objWriter = "elf"
+        else:
+            return Err[str]("uir_codegen: cannot infer object writer for target: " + target)
+    if objWriter != "macho" && objWriter != "elf" && objWriter != "coff":
+        return Err[str]("uir_codegen: unsupported object writer: " + objWriter)
+    if objWriter == "macho" && !uirTargetIsDarwin(target):
+        return Err[str]("uir_codegen: macho writer requires darwin target: " + target)
+    if objWriter == "coff" && !uirTargetIsWindows(target):
+        return Err[str]("uir_codegen: coff writer requires windows/msvc target: " + target)
+    if objWriter == "elf" && (uirTargetIsDarwin(target) || uirTargetIsWindows(target)):
+        return Err[str]("uir_codegen: elf writer requires linux/android/gnu target: " + target)
+    var out: Result[str]
+    out.ok = true
+    out.value = objWriter
+    out.err = ErrorOk()
+    return out
+
 fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): Result[uint8[]] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
-    if !uirTargetIsDarwin(target):
-        return Err[uint8[]]("uir_codegen: bootstrap path only supports darwin target: " + target)
-    if len(objWriter) > 0 && objWriter != "macho":
-        return Err[uint8[]]("uir_codegen: bootstrap path only supports macho writer")
+    if machine != nil:
+        memRetain(void*(machine))
+    let writerRes: Result[str] = uirResolveObjWriter(target, objWriter)
+    if !IsOk[str](writerRes):
+        return Err[uint8[]](ErrorFormat(ErrorInfoOf[str](writerRes)))
+    let resolvedWriter: str = writerRes.value
+    let isAarch64: bool = uirTargetIsAarch64(target)
+    let isX86_64: bool = uirTargetIsX86_64(target)
     if dbgCodegen:
         echo("[codegen] writer.begin")
-    return machoWriteAarch64RelocatableObj(machine)
-
-fn writerIsEmptyOrInvalidRiscv(objWriter: str): bool =
-    return objWriter == nil || len(objWriter) == 0
+    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    if dbgCstr:
+        let cCount2: int32 = machineModuleCstrsLen(machine)
+        echo("[codegen.cstr] pre-writer cstrs=" + intToStr(cCount2))
+        for ci2 in 0..<cCount2:
+            if ci2 >= 8:
+                break
+            let c2: MachineCString = machineModuleCStringAt(machine, ci2)
+            let lbl2: str = machineCStringLabelOf(c2)
+            let val2: str = machineCStringValueOf(c2)
+            let vLen2: int32 = val2 == nil ? -1 : len(val2)
+            let v02: int32 = (val2 != nil && vLen2 > 0) ? int32(val2[0]) : -1
+            let v12: int32 = (val2 != nil && vLen2 > 1) ? int32(val2[1]) : -1
+            echo("[codegen.cstr] pre i=" + intToStr(ci2) + " label=" + lbl2 +
+                 " len=" + intToStr(vLen2) + " b0=" + intToStr(v02) + " b1=" + intToStr(v12))
+    if resolvedWriter == "macho":
+        if isAarch64:
+            return machoWriteAarch64RelocatableObj(machine)
+        if isX86_64:
+            return machoWriteX86_64RelocatableObj(machine)
+        return Err[uint8[]]("uir_codegen: macho writer unsupported target arch: " + target)
+    if resolvedWriter == "elf":
+        if isAarch64:
+            return elfWriteAarch64RelocatableObj(machine)
+        if isX86_64:
+            return elfWriteX86_64RelocatableObj(machine)
+        return Err[uint8[]]("uir_codegen: elf writer unsupported target arch: " + target)
+    if resolvedWriter == "coff":
+        if isAarch64:
+            return coffWriteAarch64RelocatableObj(machine)
+        if isX86_64:
+            return coffWriteX86_64RelocatableObj(machine)
+        return Err[uint8[]]("uir_codegen: coff writer unsupported target arch: " + target)
+    return Err[uint8[]]("uir_codegen: unresolved object writer after validation: " + resolvedWriter)
 
 fn uirEmitObjFromModule(module: UirModule, optLevel: int32, target: str, objWriter: str,
                          validateModule: bool,
@@ -94,7 +184,16 @@ fn uirEmitObjFromModule(module: UirModule, optLevel: int32, target: str, objWrit
         let vRes: Result[bool] = uirValidateModule(module)
         if ! IsOk[bool](vRes):
             return Err[uint8[]](ErrorFormat(ErrorInfoOf[bool](vRes)))
-    let machineRes: Result[MachineModule] = uirModuleToMachine(module, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
+    let machineRes: Result[MachineModule] = uirModuleToMachine(module, target, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
     if ! IsOk[MachineModule](machineRes):
         return Err[uint8[]](ErrorFormat(ErrorInfoOf[MachineModule](machineRes)))
     return uirEmitObjFromMachine(machineRes.value, target, objWriter)
+
+fn uirEmitObjFromModuleOrPanic(module: UirModule, optLevel: int32, target: str, objWriter: str,
+                               validateModule: bool,
+                               uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): uint8[] =
+    let res: Result[uint8[]] = uirEmitObjFromModule(module, optLevel, target, objWriter, validateModule,
+                                                    uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
+    if !IsOk[uint8[]](res):
+        panic ErrorFormat(ErrorInfoOf[uint8[]](res))
+    return Value[uint8[]](res)

@@ -723,11 +723,7 @@ fn semPointerPolicyShouldCheckNonCAbi(path: str): bool =
     let strictStdNoPointer: bool = semStrEq(getEnv "STAGE1_STD_NO_POINTERS_STRICT", "1")
     if semIsStdModulePath(path) && !strictStdNoPointer:
         return false
-    # Default enforces internal modules too; set =0 only for temporary bootstrap compatibility.
-    let strictInternalRaw: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL"
-    let strictInternal: bool = !semStrEq(strictInternalRaw, "0")
-    if !strictInternal && semIsCompilerInternalModulePath(path):
-        return false
+    # ZRPC hard gate: compiler-internal modules are checked too.
     if semIsCAbiBridgeModulePath(path):
         return false
     return true
@@ -1887,7 +1883,7 @@ fn semCheckStdNoPointerPolicy(ctx: var SemCtx, root: Node): int32 =
                 semAddErrorAtFile(ctx, policyFile, n.pos, msg)
                 hits = hits + 1
                 if hits == semStdNoPointerDiagLimit:
-                    semAddErrorAtFile(ctx, policyFile, n.pos, "std policy: too many pointer violations; further diagnostics are suppressed")
+                    semAddErrorAtFile(ctx, policyFile, n.pos, rawPointerForbidMessage("std policy: too many pointer violations; further diagnostics are suppressed"))
                     return hits
         let childCount: int32 = semPolicyKidCount(n)
         for i in 0..<childCount:
@@ -1948,7 +1944,7 @@ fn semCheckNoPointerNonCAbiPolicy(ctx: var SemCtx, root: Node): int32 =
                 semAddErrorAtFile(ctx, policyFile, n.pos, msg)
                 hits = hits + 1
                 if hits == semStdNoPointerDiagLimit:
-                    semAddErrorAtFile(ctx, policyFile, n.pos, "no-pointer policy: too many violations; further diagnostics are suppressed")
+                    semAddErrorAtFile(ctx, policyFile, n.pos, rawPointerForbidMessage("no-pointer policy: too many violations; further diagnostics are suppressed"))
                     return hits
         let childCount: int32 = semPolicyKidCount(n)
         for i in 0..<childCount:
@@ -2390,15 +2386,20 @@ fn semCheckVarParamCall(ctx: var SemCtx, callNode: Node, callName: str, baseArg:
     let escapesBorrow: bool = semIsBorrowEscapeNameNormalized(ctx, name)
     let sigIdx: int32 = semFnSigFindNormalized(ctx, name)
     if sigIdx < 0:
-        # v1: no cross-procedure analysis. Unknown/unresolved calls skip borrow-proof,
-        # except when explicitly marked as escaping.
-        if ctx.borrowActiveTotal > 0 && escapesBorrow:
-            if baseArg != nil:
-                let baseVal: Node = semCallArgValue baseArg
+        # Unknown/unresolved calls cannot silently bypass borrow proof when a borrow is active.
+        # Require an explicit signature (or @borrows/@escapes annotation) at call boundaries.
+        if baseArg != nil:
+            let baseVal: Node = semCallArgValue baseArg
+            if !allowBorrow && baseVal != nil && semExprIsBorrowed(ctx, baseVal):
+                semAddError(ctx, baseVal.pos, "Borrowed value cannot be passed to unresolved call: " + name + " self/arg1")
+            if escapesBorrow:
                 semCheckBorrowEscape(ctx, baseVal, "escape via call " + name)
-            for i0 in 1..<kidCount callNode:
-                let arg0: Node = kid(callNode, i0)
-                let val0: Node = semCallArgValue arg0
+        for i0 in 1..<kidCount callNode:
+            let arg0: Node = kid(callNode, i0)
+            let val0: Node = semCallArgValue arg0
+            if !allowBorrow && val0 != nil && semExprIsBorrowed(ctx, val0):
+                semAddError(ctx, val0.pos, "Borrowed value cannot be passed to unresolved call: " + name + " argument #" + intToStr(i0))
+            if escapesBorrow:
                 semCheckBorrowEscape(ctx, val0, "escape via call " + name)
         return
     if semFindDefDepth(ctx, name) > 0:
@@ -3819,14 +3820,13 @@ fn checkSemantics(root: Node, diags: var Diagnostic[], ownershipEnabled: bool, o
         diags = ctx.diags
         return
     semDebugLog(semDbg, "[sem-debug] checkSemantics:ctx_ready")
-    let nonCAbiNoPtrEnv: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI"
     let enforceStdNoPointer: bool = semShouldEnforceStdNoPointer()
     if enforceStdNoPointer:
         let stdPointerViolations: int32 = semCheckStdNoPointerPolicy(ctx, root)
         if stdPointerViolations > 0:
             diags = ctx.diags
             return
-    let enforceNonCAbiNoPointer: bool = semStrEq(nonCAbiNoPtrEnv, "1")
+    let enforceNonCAbiNoPointer: bool = true
     if enforceNonCAbiNoPointer:
         let nonCAbiPointerViolations: int32 = semCheckNoPointerNonCAbiPolicy(ctx, root)
         if nonCAbiPointerViolations > 0:

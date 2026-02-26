@@ -50,15 +50,15 @@ static void usage(void) {
           "Presets:\n"
           "  selfhost-cold  env CLEAN_CHENG_LOCAL=0 SELF_OBJ_BOOTSTRAP_REUSE=0\n"
           "                 SELF_OBJ_BOOTSTRAP_SESSION=sample_cold\n"
-          "                 sh src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh\n"
+          "                 sh src/tooling/tooling_exec.sh verify_backend_selfhost_bootstrap_self_obj\n"
           "\n"
           "  fullchain-cold env CLEAN_CHENG_LOCAL=0 FULLCHAIN_REUSE=0\n"
           "                 FULLCHAIN_TOOL_JOBS=3\n"
-          "                 sh src/tooling/verify_fullchain_bootstrap.sh\n"
+          "                 sh src/tooling/tooling_exec.sh verify_fullchain_bootstrap\n"
           "\n"
           "  closure-cold   env CLEAN_CHENG_LOCAL=0 BACKEND_PROD_SELFHOST_REUSE=0\n"
           "                 FULLCHAIN_REUSE=0 FULLCHAIN_TOOL_JOBS=3\n"
-          "                 sh src/tooling/backend_prod_closure.sh --no-publish\n"
+          "                 sh src/tooling/tooling_exec.sh backend_prod_closure --no-publish\n"
           "\n"
           "Notes:\n"
           "  - Requires macOS and /usr/bin/sample.\n"
@@ -588,7 +588,7 @@ static int pick_preset_command(const char *preset, char *const **out_argv, const
       "SELF_OBJ_BOOTSTRAP_REUSE=0",
       "SELF_OBJ_BOOTSTRAP_SESSION=sample_cold",
       "sh",
-      "src/tooling/verify_backend_selfhost_bootstrap_self_obj.sh",
+      "src/tooling/verify_inline/verify_backend_selfhost_bootstrap_self_obj.inline",
       NULL,
   };
   static char *const fullchain[] = {
@@ -597,7 +597,7 @@ static int pick_preset_command(const char *preset, char *const **out_argv, const
       "FULLCHAIN_REUSE=0",
       "FULLCHAIN_TOOL_JOBS=3",
       "sh",
-      "src/tooling/verify_fullchain_bootstrap.sh",
+      "src/tooling/verify_inline/verify_fullchain_bootstrap.inline",
       NULL,
   };
   static char *const closure[] = {

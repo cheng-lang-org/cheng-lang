@@ -19,5 +19,5 @@ Manual use:
 set -a
 . src/tooling/toolchains/android_a64.env
 set +a
-sh src/tooling/chengb.sh tests/cheng/backend/fixtures/return_add.cheng --target:aarch64-linux-android
+sh src/tooling/tooling_exec.sh chengb tests/cheng/backend/fixtures/return_add.cheng --target:aarch64-linux-android
 ```

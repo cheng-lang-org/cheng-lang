@@ -6,6 +6,18 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#if !defined(_WIN32) && !defined(__ANDROID__)
+#if defined(__has_include)
+#if __has_include(<execinfo.h>)
+#include <execinfo.h>
+#define CHENG_HAS_EXECINFO 1
+#endif
+#endif
+#endif
+
+#ifndef CHENG_HAS_EXECINFO
+#define CHENG_HAS_EXECINFO 0
+#endif
 #if defined(__APPLE__)
 #include <crt_externs.h>
 #endif
@@ -632,6 +644,33 @@ void cheng_exit(int32_t code) { exit(code); }
 void cheng_bounds_check(int32_t len, int32_t idx) {
     if (idx < 0 || idx >= len) {
         fprintf(stderr, "[cheng] bounds check failed: idx=%d len=%d\n", idx, len);
+        const char* trace = getenv("BOUNDS_TRACE");
+        if (trace != NULL && trace[0] != '\0' && trace[0] != '0') {
+            void* caller = __builtin_return_address(0);
+            Dl_info info;
+            if (dladdr(caller, &info) != 0) {
+                uintptr_t pc = (uintptr_t)caller;
+                uintptr_t base = (uintptr_t)info.dli_fbase;
+                uintptr_t off = pc >= base ? (pc - base) : 0;
+                fprintf(
+                    stderr,
+                    "[cheng] bounds caller=%p module=%s symbol=%s offset=0x%zx\n",
+                    caller,
+                    info.dli_fname ? info.dli_fname : "?",
+                    info.dli_sname ? info.dli_sname : "?",
+                    (size_t)off
+                );
+            } else {
+                fprintf(stderr, "[cheng] bounds caller=%p module=? symbol=? offset=0x0\n", caller);
+            }
+#if CHENG_HAS_EXECINFO
+            void* frames[24];
+            int count = backtrace(frames, 24);
+            if (count > 0) {
+                backtrace_symbols_fd(frames, count, 2);
+            }
+#endif
+        }
 #if defined(__ANDROID__)
         __android_log_print(
             ANDROID_LOG_ERROR,

@@ -18,6 +18,8 @@ type
         packageId: str
         authorId: str
         channel: str
+        cidText: str
+        format: str
         epoch: int32
         privKeyText: str
         registryPath: str
@@ -51,6 +53,8 @@ fn printUsage() =
     printLine("  publish  --src:<dir> --package:<id> --author:<id> --channel:<edge|stable|lts> --epoch:<n>")
     printLine("           --priv:<key> [--registry:<path>] [--source-addr:<addr>] [--manifest-out:<file>]")
     printLine("           [--root:<dir>] [--mode:local]")
+    printLine("  publish-cid --src:<dir> --package:<id> --author:<id> --channel:<edge|stable|lts> --epoch:<n>")
+    printLine("           --cid:<cid> --priv:<key> [--format:<tar|source>] [--registry:<path>]")
     printLine("  serve    (moved to p2p toolchain; unsupported in local-only core binary)")
     printLine("  fetch    --manifest:<file|cid> --out:<dir> [--root:<dir>] [--mode:local]")
     printLine("  lock-verify --lock:<file> [--registry:<path>]")
@@ -103,6 +107,10 @@ fn parseArgs(): Args =
             res.authorId = str(ptr_add(arg, len("--author:")))
         elif strutil.startsWith(arg, "--channel:"):
             res.channel = str(ptr_add(arg, len("--channel:")))
+        elif strutil.startsWith(arg, "--cid:"):
+            res.cidText = str(ptr_add(arg, len("--cid:")))
+        elif strutil.startsWith(arg, "--format:"):
+            res.format = str(ptr_add(arg, len("--format:")))
         elif strutil.startsWith(arg, "--epoch:"):
             res.epoch = parseInt(str(ptr_add(arg, len("--epoch:"))))
         elif strutil.startsWith(arg, "--priv:"):
@@ -210,9 +218,58 @@ fn cmdPublish(args: Args): int32 =
     snap.epoch = args.epoch
     snap.cidText = cidText
     snap.format = "source"
+    let simRes: result.Result[str] = dreg.fingerprintSourceDirAstSimhash64(args.src)
+    if result.IsErr(simRes):
+        printErr("publish: ast simhash failed")
+        return 1
+    snap.astSimhash64 = result.Value(simRes)
+    snap.originalityScore = 1.0
     let pubRes: result.Result[dreg.PackageSnapshot] = dreg.publishSnapshot(args.registryPath, snap, args.privKeyText)
     if result.IsErr(pubRes):
         printErr("publish: registry publish failed")
+        return 1
+    let node = dreg.snapshotToJson(result.Value(pubRes))
+    writeOutput(args.outPath, json.pretty(node))
+    return 0
+
+fn cmdPublishCid(args: Args): int32 =
+    if args.src == nil || len(args.src) == 0:
+        printErr("publish-cid: missing --src")
+        return 1
+    if args.packageId == nil || len(args.packageId) == 0:
+        printErr("publish-cid: missing --package")
+        return 1
+    if args.authorId == nil || len(args.authorId) == 0:
+        printErr("publish-cid: missing --author")
+        return 1
+    if args.channel == nil || len(args.channel) == 0:
+        printErr("publish-cid: missing --channel")
+        return 1
+    if args.cidText == nil || len(args.cidText) == 0:
+        printErr("publish-cid: missing --cid")
+        return 1
+    if args.privKeyText == nil || len(args.privKeyText) == 0:
+        printErr("publish-cid: missing --priv")
+        return 1
+    var fmt: str = args.format
+    if fmt == nil || len(fmt) == 0:
+        fmt = "tar"
+    var snap: dreg.PackageSnapshot
+    snap.packageId = args.packageId
+    snap.authorId = args.authorId
+    snap.channel = args.channel
+    snap.epoch = args.epoch
+    snap.cidText = args.cidText
+    snap.format = fmt
+    let simRes: result.Result[str] = dreg.fingerprintSourceDirAstSimhash64(args.src)
+    if result.IsErr(simRes):
+        printErr("publish-cid: ast simhash failed")
+        return 1
+    snap.astSimhash64 = result.Value(simRes)
+    snap.originalityScore = 1.0
+    let pubRes: result.Result[dreg.PackageSnapshot] = dreg.publishSnapshot(args.registryPath, snap, args.privKeyText)
+    if result.IsErr(pubRes):
+        printErr("publish-cid: registry publish failed")
         return 1
     let node = dreg.snapshotToJson(result.Value(pubRes))
     writeOutput(args.outPath, json.pretty(node))
@@ -282,6 +339,8 @@ fn main(argc: int32, argv: str*): int32 =
         return cmdManifest(args)
     if args.cmd == "publish":
         return cmdPublish(args)
+    if args.cmd == "publish-cid":
+        return cmdPublishCid(args)
     if args.cmd == "serve":
         return cmdServe(args)
     if args.cmd == "fetch":

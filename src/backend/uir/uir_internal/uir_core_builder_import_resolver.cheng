@@ -1,0 +1,192 @@
+# UIR core builder import/package resolver helpers (split from uir_core_builder).
+import std/os
+import std/result
+import std/strutils
+import cheng/stage1/ast
+import cheng/stage1/frontend_lib
+
+fn resolverStripSpaces(s: str): str =
+    if s == nil:
+        return ""
+    return strutils.strip(s)
+
+fn strHasSuffix(s: str, suffix: str): bool =
+    if s == nil || suffix == nil:
+        return false
+    let n: int32 = len(s)
+    let m: int32 = len(suffix)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..<m:
+        if s[n - m + i] != suffix[i]:
+            return false
+    return true
+
+fn strHasPrefix(s: str, prefix: str): bool =
+    if s == nil || prefix == nil:
+        return false
+    let n: int32 = len(s)
+    let m: int32 = len(prefix)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..<m:
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn strStripPrefix(s: str, prefix: str): str =
+    if s == nil || prefix == nil:
+        return ""
+    let n: int32 = len(s)
+    let m: int32 = len(prefix)
+    if m == 0:
+        return s
+    if n < m:
+        return ""
+    for i in 0..<m:
+        if s[i] != prefix[i]:
+            return ""
+    return str(ptr_add(void*(s), m))
+
+fn indexOfChar(s: str, ch: char): int32 =
+    if s == nil || len(s) == 0:
+        return -1
+    for i in 0..<len(s):
+        if s[i] == ch:
+            return i
+    return -1
+
+fn parseQuotedValue(line: str): str =
+    if line == nil:
+        return ""
+    if len(line) <= 0:
+        return ""
+    # Stage0 compatibility: keep quoted-value parser minimal on this path.
+    return ""
+
+fn importPathDropChengPrefix(path: str): str =
+    if path == nil || len(path) == 0:
+        return ""
+    if strHasPrefix(path, "cheng/"):
+        if len(path) <= 6:
+            return ""
+        return strStripPrefix(path, "cheng/")
+    return path
+
+fn packageNameFromRest(rest: str): str =
+    let normalized: str = importPathDropChengPrefix(rest)
+    if normalized == nil:
+        return ""
+    if len(normalized) == 0:
+        return ""
+    let slash: int32 = indexOfChar(normalized, '/')
+    if slash <= 0:
+        return ""
+    # Stage0 stability: avoid os.sliceStr in this hot path.
+    let nameLen: int32 = slash
+    let buf: void* = alloc(nameLen + 1)
+    if buf == nil:
+        return ""
+    for i in 0..<nameLen:
+        let dst: void* = ptr_add(buf, i)
+        let pch: char* = char*(dst)
+        *pch = normalized[i]
+    setMem(ptr_add(buf, nameLen), 0, 1)
+    let pkgName: str = str(buf)
+    if pkgName == "std":
+        return ""
+    if pkgName == "core":
+        return ""
+    if pkgName == "system":
+        return ""
+    if pkgName == "ide":
+        return ""
+    if pkgName == "gui":
+        return ""
+    return pkgName
+
+fn packageIdFromRest(rest: str): str =
+    let name: str = packageNameFromRest(rest)
+    if name == nil || len(name) == 0:
+        return ""
+    if (name == "stdlib"):
+        return ""
+    return "pkg://cheng/" + name
+
+fn packageIdFromManifest(manifestPath: str): str =
+    let _manifestPath: str = manifestPath
+    # Stage0 compatibility: disable manifest text slicing in this path.
+    return ""
+
+fn packageIdMatches(manifestPath: str, expected: str): bool =
+    if expected == nil || len(expected) == 0:
+        return true
+    let got: str = packageIdFromManifest manifestPath
+    if got == nil || len(got) == 0:
+        return false
+    return (got == expected)
+
+fn pkgRootsFromEnv(): str[] =
+    var out: str[]
+    let single: str = os.getEnvDefault("PKG_ROOT", "")
+    if single != nil && len(single) > 0:
+        add(out, resolverStripSpaces(single))
+    let raw: str = os.getEnvDefault("PKG_ROOTS", "")
+    # Stage0 compatibility: keep PKG_ROOTS parsing conservative (single entry only).
+    if raw != nil && len(raw) > 0:
+        let trimmedRaw: str = resolverStripSpaces(raw)
+        if trimmedRaw != nil && len(trimmedRaw) > 0:
+            add(out, trimmedRaw)
+    if out.len == 0:
+        let home: str = os.getEnvDefault("HOME", "")
+        if home != nil && len(home) > 0:
+            add(out, os.joinPath(home, ".cheng-packages"))
+    return out
+
+fn resolvePkgCandidate(base: str): str =
+    if base == nil || len(base) == 0:
+        return ""
+    var full: str = base
+    if ! strHasSuffix(full, ".cheng"):
+        full = full + ".cheng"
+    if frontend_lib.stage1_fileExists(full):
+        return full
+    return ""
+
+fn resolvePkgInRoot(pkgRoot: str, relInPkg: str, relForPkgRoot: str): str =
+    if pkgRoot == nil || len(pkgRoot) == 0:
+        return ""
+
+    if relInPkg != nil && len(relInPkg) > 0:
+        var candidate: str = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "src"), relInPkg))
+        if len(candidate) > 0:
+            return candidate
+        candidate = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "cheng"), relInPkg))
+        if len(candidate) > 0:
+            return candidate
+        candidate = resolvePkgCandidate(os.joinPath(pkgRoot, relInPkg))
+        if len(candidate) > 0:
+            return candidate
+
+    if relForPkgRoot != nil && len(relForPkgRoot) > 0:
+        var legacy: str = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "src"), relForPkgRoot))
+        if len(legacy) > 0:
+            return legacy
+        legacy = resolvePkgCandidate(os.joinPath(os.joinPath(pkgRoot, "cheng"), relForPkgRoot))
+        if len(legacy) > 0:
+            return legacy
+        legacy = resolvePkgCandidate(os.joinPath(pkgRoot, relForPkgRoot))
+        if len(legacy) > 0:
+            return legacy
+    return ""
+
+fn resolvePkgImport(root: str, rest: str): str =
+    let _root: str = root
+    let _rest: str = rest
+    # Stage0 compatibility: disable package-root deep probing in this path.
+    return ""
+

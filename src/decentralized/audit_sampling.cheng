@@ -1,12 +1,18 @@
 import std/os
 import std/times
 import std/strutils as strutil
+import std/tables_compat as tables
 import cheng/runtime/json_ast as json
 import cheng/decentralized/json_parse as jparse
 import cheng/libp2p/crypto/sha256 as sha256
 import cheng/libp2p/utils/bytes as bytes
 import std/strings
 import std/seqs
+
+const
+    DefaultBaseRateBps = 1000
+    DefaultHighRiskRateBps = 10000
+    DefaultRiskWindowEpochs = 3
 
 type
     AuditSample =
@@ -20,8 +26,23 @@ type
         auditorId: str
         epoch: int32
         rateBps: int32
+        baseRateBps: int32
+        highRiskRateBps: int32
+        riskLevel: str
+        riskReason: str
         seed: str
         ts: str
+
+    ReceiptEvent =
+        receiptId: str
+        requestId: str
+        taskId: str
+        executorId: str
+        resultCid: str
+        status: str
+        usageId: str
+        error: str
+        epoch: int32
 
 fn auditSampleTs(): str =
     return times.now().format("unix")
@@ -31,6 +52,11 @@ fn buildAuditSampleId(ev: AuditSample): str =
         ev.executorId + "|" + ev.auditorId + "|" + intToStr(ev.epoch) + "|" + ev.ts
     return "sample-" + intToStr(int32(len(payload)))
 
+fn normalizeRiskLevel(level: str): str =
+    if level == "high" || level == "medium":
+        return level
+    return "low"
+
 fn normalizeAuditSample(ev: AuditSample): AuditSample =
     var out = ev
     if out.auditorId == nil || len(out.auditorId) == 0:
@@ -39,10 +65,19 @@ fn normalizeAuditSample(ev: AuditSample): AuditSample =
         out.ts = auditSampleTs()
     if out.sampleId == nil || len(out.sampleId) == 0:
         out.sampleId = buildAuditSampleId(out)
+    out.riskLevel = normalizeRiskLevel(out.riskLevel)
+    if out.riskReason == nil:
+        out.riskReason = ""
     return out
 
 fn rateToBps(rate: float64): int32 =
-    var bps: int32 = int32(rate * 10000.0 + 0.5)
+    var bps: int32 = 0
+    if rate <= 1.0:
+        bps = int32(rate * 10000.0 + 0.5)
+    elif rate <= 100.0:
+        bps = int32(rate * 100.0 + 0.5)
+    else:
+        bps = int32(rate + 0.5)
     if bps < 0:
         bps = 0
     if bps > 10000:
@@ -69,14 +104,64 @@ fn shouldSample(receiptId: str, rateBps: int32, seed: str): bool =
     let score = hashScore(text)
     return score < rateBps
 
+fn tableSetMaxEpoch(t: var tables.Table[int32], key: str, epoch: int32) =
+    if key == nil || len(key) == 0:
+        return
+    if ! tables.TableHas[int32](t, key):
+        tables.TablePut[int32](t, key + "", epoch)
+        return
+    let old = tables.TableGet[int32](t, key)
+    if epoch > old:
+        tables.TablePut[int32](t, key + "", epoch)
+
+fn latestEpochForKey(t: tables.Table[int32], key: str): int32 =
+    if key == nil || len(key) == 0:
+        return -2147483648
+    if ! tables.TableHas[int32](t, key):
+        return -2147483648
+    return tables.TableGet[int32](t, key)
+
+fn riskReasonForReceipt(
+    rec: ReceiptEvent,
+    windowStart: int32,
+    fraudByRequest: tables.Table[int32],
+    fraudByReceipt: tables.Table[int32],
+    fraudByTask: tables.Table[int32],
+    fraudByExecutor: tables.Table[int32],
+    badByExecutor: tables.Table[int32]
+): str =
+    if rec.status != "ok":
+        return "receipt_status_non_ok"
+    if rec.requestId == nil || len(rec.requestId) == 0:
+        return "request_missing"
+    if rec.taskId == nil || len(rec.taskId) == 0:
+        return "task_missing"
+    if rec.executorId == nil || len(rec.executorId) == 0:
+        return "executor_missing"
+    if rec.usageId == nil || len(rec.usageId) == 0:
+        return "usage_missing"
+    if latestEpochForKey(fraudByReceipt, rec.receiptId) >= windowStart:
+        return "fraud_linked_receipt"
+    if latestEpochForKey(fraudByRequest, rec.requestId) >= windowStart:
+        return "fraud_linked_request"
+    if latestEpochForKey(fraudByTask, rec.taskId) >= windowStart:
+        return "fraud_linked_task"
+    if latestEpochForKey(fraudByExecutor, rec.executorId) >= windowStart:
+        return "fraud_linked_executor"
+    if latestEpochForKey(badByExecutor, rec.executorId) >= windowStart:
+        return "executor_history_bad"
+    return ""
+
 fn sampleReceipts(
     ledgerPath: str,
     epochFilter: int32,
-    rate: float64,
+    baseRate: float64,
+    highRiskRate: float64,
+    riskWindowEpochs: int32,
     seed: str,
     auditorId: str
 ): AuditSample[] =
-    var out: AuditSample[] 
+    var out: AuditSample[]
     if ledgerPath == nil || len(ledgerPath) == 0:
         return out
     if ! os.fileExists(ledgerPath):
@@ -84,10 +169,103 @@ fn sampleReceipts(
     let content = os.readFile(ledgerPath)
     if content == nil || len(content) == 0:
         return out
-    epochFilter
-    rate
-    seed
-    auditorId
+
+    var baseRateBps: int32 = rateToBps(baseRate)
+    var highRiskRateBps: int32 = rateToBps(highRiskRate)
+    var windowEpochs: int32 = riskWindowEpochs
+    if baseRateBps < 0:
+        baseRateBps = DefaultBaseRateBps
+    if highRiskRateBps < 0:
+        highRiskRateBps = DefaultHighRiskRateBps
+    if windowEpochs <= 0:
+        windowEpochs = DefaultRiskWindowEpochs
+
+    var receipts: ReceiptEvent[]
+    var fraudByRequest: tables.Table[int32] = tables.TableInit[int32](256)
+    var fraudByReceipt: tables.Table[int32] = tables.TableInit[int32](256)
+    var fraudByTask: tables.Table[int32] = tables.TableInit[int32](256)
+    var fraudByExecutor: tables.Table[int32] = tables.TableInit[int32](256)
+    var badByExecutor: tables.Table[int32] = tables.TableInit[int32](256)
+
+    var latestEpoch: int32 = 0
+    var hasLatestEpoch: bool = false
+
+    let lines = strutil.split(content, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if line == nil || len(line) == 0:
+            continue
+        let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+        if ! parsed.ok:
+            continue
+        let node: json.JsonNode = parsed.value
+        let kind = jparse.getStringField(node, "type", "")
+        let epoch = int32(jparse.getIntField(node, "epoch", 0))
+        if ! hasLatestEpoch || epoch > latestEpoch:
+            latestEpoch = epoch
+            hasLatestEpoch = true
+
+        if kind == "exec_receipt":
+            let status = jparse.getStringField(node, "status", "")
+            let executor = jparse.getStringField(node, "executor_id", "")
+            if status != "ok":
+                tableSetMaxEpoch(badByExecutor, executor, epoch)
+            if epochFilter >= 0 && epoch != epochFilter:
+                continue
+            add[ReceiptEvent](receipts, ReceiptEvent(
+                receiptId: jparse.getStringField(node, "receipt_id", ""),
+                requestId: jparse.getStringField(node, "request_id", ""),
+                taskId: jparse.getStringField(node, "task_id", ""),
+                executorId: executor,
+                resultCid: jparse.getStringField(node, "result_cid", ""),
+                status: status,
+                usageId: jparse.getStringField(node, "usage_id", ""),
+                error: jparse.getStringField(node, "error", ""),
+                epoch: epoch
+            ))
+        elif kind == "fraud_report":
+            let reqId = jparse.getStringField(node, "request_id", "")
+            let recId = jparse.getStringField(node, "receipt_id", "")
+            let taskId = jparse.getStringField(node, "task_id", "")
+            let executor = jparse.getStringField(node, "executor_id", "")
+            tableSetMaxEpoch(fraudByRequest, reqId, epoch)
+            tableSetMaxEpoch(fraudByReceipt, recId, epoch)
+            tableSetMaxEpoch(fraudByTask, taskId, epoch)
+            tableSetMaxEpoch(fraudByExecutor, executor, epoch)
+
+    var windowRefEpoch: int32 = latestEpoch
+    if epochFilter >= 0:
+        windowRefEpoch = epochFilter
+    let windowStart: int32 = windowRefEpoch - windowEpochs + 1
+
+    var seedText: str = seed
+    if seedText == nil:
+        seedText = ""
+
+    for i in 0..<receipts.len:
+        let rec = receipts[i]
+        let reason = riskReasonForReceipt(rec, windowStart, fraudByRequest, fraudByReceipt, fraudByTask, fraudByExecutor, badByExecutor)
+        let riskLevel: str = if len(reason) > 0: "high" else: "low"
+        let rateBps: int32 = if riskLevel == "high": highRiskRateBps else: baseRateBps
+        if ! shouldSample(rec.receiptId, rateBps, seedText):
+            continue
+        var sample: AuditSample
+        sample.receiptId = rec.receiptId
+        sample.requestId = rec.requestId
+        sample.taskId = rec.taskId
+        sample.executorId = rec.executorId
+        sample.resultCid = rec.resultCid
+        sample.status = rec.status
+        sample.auditorId = auditorId
+        sample.epoch = rec.epoch
+        sample.rateBps = rateBps
+        sample.baseRateBps = baseRateBps
+        sample.highRiskRateBps = highRiskRateBps
+        sample.riskLevel = riskLevel
+        sample.riskReason = reason
+        sample.seed = seedText
+        sample.ts = auditSampleTs()
+        add[AuditSample](out, normalizeAuditSample(sample))
     return out
 
 fn escapeQuotedString(value: str): str =
@@ -120,6 +298,7 @@ fn samplesToJson(samples: AuditSample[]): json.JsonNode =
     let root = json.newJObject()
     root["count"] = json.newJInt(samples.len)
     let arr = json.newJArray()
+    var highRiskCount: int32 = 0
     for i in 0..<samples.len:
         let node = json.newJObject()
         node["sample_id"] = json.newJString(samples[i].sampleId)
@@ -132,14 +311,26 @@ fn samplesToJson(samples: AuditSample[]): json.JsonNode =
         node["auditor_id"] = json.newJString(samples[i].auditorId)
         node["epoch"] = json.newJInt(samples[i].epoch)
         node["rate_bps"] = json.newJInt(samples[i].rateBps)
+        node["base_rate_bps"] = json.newJInt(samples[i].baseRateBps)
+        node["high_risk_rate_bps"] = json.newJInt(samples[i].highRiskRateBps)
+        node["risk_level"] = json.newJString(samples[i].riskLevel)
+        node["risk_reason"] = json.newJString(samples[i].riskReason)
         node["seed"] = json.newJString(samples[i].seed)
         node["ts"] = json.newJString(samples[i].ts)
+        if samples[i].riskLevel == "high":
+            highRiskCount = highRiskCount + 1
         arr.add(node)
+    root["high_risk_count"] = json.newJInt(highRiskCount)
     root["samples"] = arr
     return root
 
 fn samplesToToml(samples: AuditSample[]): str =
+    var highRiskCount: int32 = 0
     var out: str = "count = " + intToStr(samples.len) + "\n"
+    for i in 0..<samples.len:
+        if samples[i].riskLevel == "high":
+            highRiskCount = highRiskCount + 1
+    out = out + "high_risk_count = " + intToStr(highRiskCount) + "\n"
     for i in 0..<samples.len:
         out = out + "\n[[samples]]\n"
         out = out + "sample_id = " + quoteTomlString(samples[i].sampleId) + "\n"
@@ -152,6 +343,10 @@ fn samplesToToml(samples: AuditSample[]): str =
         out = out + "auditor_id = " + quoteTomlString(samples[i].auditorId) + "\n"
         out = out + "epoch = " + intToStr(samples[i].epoch) + "\n"
         out = out + "rate_bps = " + intToStr(samples[i].rateBps) + "\n"
+        out = out + "base_rate_bps = " + intToStr(samples[i].baseRateBps) + "\n"
+        out = out + "high_risk_rate_bps = " + intToStr(samples[i].highRiskRateBps) + "\n"
+        out = out + "risk_level = " + quoteTomlString(samples[i].riskLevel) + "\n"
+        out = out + "risk_reason = " + quoteTomlString(samples[i].riskReason) + "\n"
         if samples[i].seed != nil && len(samples[i].seed) > 0:
             out = out + "seed = " + quoteTomlString(samples[i].seed) + "\n"
         out = out + "ts = " + quoteTomlString(samples[i].ts) + "\n"
@@ -159,6 +354,11 @@ fn samplesToToml(samples: AuditSample[]): str =
 
 fn samplesToYaml(samples: AuditSample[]): str =
     var out: str = "count: " + intToStr(samples.len) + "\n"
+    var highRiskCount: int32 = 0
+    for i in 0..<samples.len:
+        if samples[i].riskLevel == "high":
+            highRiskCount = highRiskCount + 1
+    out = out + "high_risk_count: " + intToStr(highRiskCount) + "\n"
     if samples.len == 0:
         out = out + "samples: []\n"
         return out
@@ -174,6 +374,10 @@ fn samplesToYaml(samples: AuditSample[]): str =
         out = out + "    auditor_id: " + quoteYamlString(samples[i].auditorId) + "\n"
         out = out + "    epoch: " + intToStr(samples[i].epoch) + "\n"
         out = out + "    rate_bps: " + intToStr(samples[i].rateBps) + "\n"
+        out = out + "    base_rate_bps: " + intToStr(samples[i].baseRateBps) + "\n"
+        out = out + "    high_risk_rate_bps: " + intToStr(samples[i].highRiskRateBps) + "\n"
+        out = out + "    risk_level: " + quoteYamlString(samples[i].riskLevel) + "\n"
+        out = out + "    risk_reason: " + quoteYamlString(samples[i].riskReason) + "\n"
         if samples[i].seed != nil && len(samples[i].seed) > 0:
             out = out + "    seed: " + quoteYamlString(samples[i].seed) + "\n"
         out = out + "    ts: " + quoteYamlString(samples[i].ts) + "\n"

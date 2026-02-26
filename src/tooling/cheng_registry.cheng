@@ -2,7 +2,7 @@ import cmdline
 import std/os
 import std/strutils as strutil
 import cheng/runtime/json_ast as json
-import cheng/decentralized/registry as dreg
+import cheng/decentralized/registry_local as dreg
 import cheng/libp2p/utils/result as result
 import std/strings
 
@@ -15,6 +15,7 @@ type
         channel: str
         cidText: str
         filePath: str
+        sourcePath: str
         epoch: int32
         privKeyText: str
         format: str
@@ -36,6 +37,7 @@ fn printUsage() =
     printLine("  keygen   --out:<file>")
     printLine("  publish  --package:<id> --author:<id> --channel:<edge|stable|lts> --epoch:<n>")
     printLine("           (--cid:<cid> | --file:<path>) --priv:<key> [--format:<tar|source>] [--registry:<path>]")
+    printLine("           --src:<dir> (required for ast simhash originality guard)")
     printLine("  resolve  --package:<id> --channel:<edge|stable|lts> [--registry:<path>] [--out:<file>]")
     printLine("  verify   --package:<id> --channel:<edge|stable|lts> [--registry:<path>]")
 
@@ -85,6 +87,8 @@ fn parseArgs(): Args =
             res.cidText = arg["--cid:".len..^ 1]
         elif strutil.startsWith(arg, "--file:"):
             res.filePath = arg["--file:".len..^ 1]
+        elif strutil.startsWith(arg, "--src:"):
+            res.sourcePath = arg["--src:".len..^ 1]
         elif strutil.startsWith(arg, "--priv:"):
             res.privKeyText = arg["--priv:".len..^ 1]
         elif strutil.startsWith(arg, "--format:"):
@@ -128,6 +132,9 @@ fn cmdPublish(args: Args): int32 =
     if args.privKeyText == nil || len(args.privKeyText) == 0:
         printErr("publish: missing --priv")
         return 1
+    if args.sourcePath == nil || len(args.sourcePath) == 0:
+        printErr("publish: missing --src")
+        return 1
     var snap: dreg.PackageSnapshot
     if args.filePath != nil && len(args.filePath) > 0:
         let snapRes: result.Result[dreg.PackageSnapshot] =
@@ -147,6 +154,12 @@ fn cmdPublish(args: Args): int32 =
         snap.cidText = args.cidText
     if args.format != nil && len(args.format) > 0:
         snap.format = args.format
+    let simRes: result.Result[str] = dreg.fingerprintSourceDirAstSimhash64(args.sourcePath)
+    if result.IsErr(simRes):
+        printErr("publish: ast simhash failed")
+        return 1
+    snap.astSimhash64 = result.Value(simRes)
+    snap.originalityScore = 1.0
     let pubRes: result.Result[dreg.PackageSnapshot] = dreg.publishSnapshot(args.registryPath, snap, args.privKeyText)
     if result.IsErr(pubRes):
         printErr("publish: failed")

@@ -110,6 +110,19 @@ fn elf_seqContainsStr(items: str[], value: str): bool =
             return true
     return false
 
+fn elfHexNibble(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn elfCanonicalCStringReloc(name: str): str =
+    let _: str = name
+    return ""
+
 
 fn elfReadStrPtr(items: var str[], idx: int32): str =
     if items == nil:
@@ -210,11 +223,47 @@ fn elfFindSymIndex(syms: ElfSym[], name: str): int32 =
             return i
     return -1
 
+fn elfSeqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
+    return items[int(idx)]
+
+fn elfSeqAtMachineCString(items: MachineCString[], idx: int32): MachineCString =
+    return items[int(idx)]
+
+fn elfSeqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
+    return items[int(idx)]
+
+fn elfSeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
+    return items[int(idx)]
+
+fn elfModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
+    if mod == nil:
+        return nil
+    return elfSeqAtMachineFunc(mod.funcs, idx)
+
+fn elfModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
+    if mod == nil:
+        return nil
+    return elfSeqAtMachineCString(mod.cstrs, idx)
+
+fn elfModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
+    if mod == nil:
+        return nil
+    return elfSeqAtMachineGlobal(mod.globals, idx)
+
+fn elfFuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
+    if func == nil:
+        return nil
+    return elfSeqAtMachineInst(func.insts, idx)
+
 fn elfBuild(module: MachineModule): Result[uint8[]] =
     if module == nil:
         return Err[uint8[]]("elf_writer: nil module")
-    if elf_targetIsDarwin(module.target):
+    let target: str = machineModuleTargetOf(module)
+    if elf_targetIsDarwin(target):
         return Err[uint8[]]("elf_writer: darwin target not supported")
+    let cstrCount: int32 = machineModuleCstrsLen(module)
+    let globalCount: int32 = machineModuleGlobalsLen(module)
+    let funcCount: int32 = machineModuleFuncsLen(module)
 
     # Sections (fixed indices):
     # 0: null
@@ -234,92 +283,96 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
 
     # Layout rodata (cstrings).
     var cSymOffs: uint64[]
-    cSymOffs.len = int(module.cstrs.len)
-    for ci in 0..<module.cstrs.len:
-        let c: MachineCString = module.cstrs[ci]
+    cSymOffs.len = int(cstrCount)
+    var cSymLabels: str[]
+    cSymLabels.len = int(cstrCount)
+    for ci in 0..<cstrCount:
+        let c: MachineCString = elfModuleCStringAtRaw(module, ci)
         let off: uint64 = uint64(rodata.len)
         cSymOffs[ci] = off
-        bufStr0(&rodata, c.value)
+        cSymLabels[ci] = machineCStringLabelOf(c)
+        bufStr0(&rodata, machineCStringValueOf(c))
 
     # Layout globals.
     var dataSymOffs: uint64[]
-    dataSymOffs.len = int(module.globals.len)
+    dataSymOffs.len = int(globalCount)
     var bssSymOffs: uint64[]
-    bssSymOffs.len = int(module.globals.len)
+    bssSymOffs.len = int(globalCount)
     var maxDataAlign: uint64 = 1
     var maxBssAlign: uint64 = 1
-    for gi in 0..<module.globals.len:
-        let g: MachineGlobal = module.globals[gi]
-        let align: uint64 = uint64(1) << uint64(g.alignPow2)
-        if g.hasInit:
+    for gi in 0..<globalCount:
+        let g: MachineGlobal = elfModuleGlobalAtRaw(module, gi)
+        let align: uint64 = uint64(1) << uint64(machineGlobalAlignPow2Of(g))
+        if machineGlobalHasInit(g):
             if align > maxDataAlign:
                 maxDataAlign = align
             bufAlign(&data, align)
             dataSymOffs[gi] = uint64(data.len)
-            if g.size == 4:
-                bufU32(&data, uint32(int32(g.init)))
+            if machineGlobalSizeOf(g) == 4:
+                bufU32(&data, uint32(int32(machineGlobalInitOf(g))))
             else:
-                bufU64(&data, uint64(g.init))
+                bufU64(&data, uint64(machineGlobalInitOf(g)))
         else:
             if align > maxBssAlign:
                 maxBssAlign = align
             bssSize = elf_alignUp(bssSize, align)
             bssSymOffs[gi] = bssSize
-            bssSize = bssSize + uint64(g.size)
+            bssSize = bssSize + uint64(machineGlobalSizeOf(g))
 
     # Encode .text and collect relocations.
     var relocs: ElfReloc[]
 
     # Track function start offsets.
     var funcOffs: uint64[]
-    funcOffs.len = int(module.funcs.len)
-    for fi in 0..<module.funcs.len:
+    funcOffs.len = int(funcCount)
+    for fi in 0..<funcCount:
         bufAlign(text, 4)
         funcOffs[fi] = uint64(text.len)
-        let f: MachineFunc = module.funcs[fi]
+        let f: MachineFunc = elfModuleFuncAtRaw(module, fi)
+        let instCount: int32 = machineFuncInstsLen(f)
 
         # Pass 1: compute label offsets within this function (in bytes from func start).
         var labels: str[16]
         var labelOffs: int32[16]
         var scanOff: int32 = 0
-        for si in 0..<f.insts.len:
-            let inst0: MachineInst = f.insts[si]
-            if inst0.op == machineOpLabel:
-                add(labels, inst0.label)
+        for si in 0..<instCount:
+            let inst0: MachineInst = elfFuncInstAtRaw(f, si)
+            if machineInstOpOf(inst0) == machineOpLabel:
+                add(labels, machineInstLabelOf(inst0))
                 add(labelOffs, scanOff)
                 continue
-            if inst0.op == machineOpMovImm:
-                let wc: int32 = a64MovImmWordCount(a64Is64(inst0.rd), inst0.imm)
+            if machineInstOpOf(inst0) == machineOpMovImm:
+                let wc: int32 = a64MovImmWordCount(a64Is64(machineInstRdOf(inst0)), machineInstImmOf(inst0))
                 scanOff = scanOff + (wc * 4)
             else:
                 scanOff = scanOff + 4
 
         var ii: int32 = 0
         var curOff: int32 = 0
-        for __for_guard_ii in 0..<f.insts.len:
-            if !(ii < f.insts.len):
+        for __for_guard_ii in 0..<instCount:
+            if !(ii < instCount):
                 break
-            let inst: MachineInst = f.insts[ii]
-            if inst.op == machineOpLabel:
+            let inst: MachineInst = elfFuncInstAtRaw(f, ii)
+            if machineInstOpOf(inst) == machineOpLabel:
                 ii = ii + 1
                 continue
             let off: uint64 = uint64(text.len)
             var word: uint32 = 0
-            if inst.op == machineOpSubSp:
-                if inst.imm < 0 || inst.imm > 4095:
+            if machineInstOpOf(inst) == machineOpSubSp:
+                if machineInstImmOf(inst) < 0 || machineInstImmOf(inst) > 4095:
                     return Err[uint8[]]("elf_writer: sub sp immediate out of range")
-                word = a64EncSubImm(true, 31, 31, int32(inst.imm))
-            elif inst.op == machineOpAddSp:
-                if inst.imm < 0 || inst.imm > 4095:
+                word = a64EncSubImm(true, 31, 31, int32(machineInstImmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpAddSp:
+                if machineInstImmOf(inst) < 0 || machineInstImmOf(inst) > 4095:
                     return Err[uint8[]]("elf_writer: add sp immediate out of range")
-                word = a64EncAddImm(true, 31, 31, int32(inst.imm))
-            elif inst.op == machineOpMovReg:
-                let is64: bool = a64Is64(inst.rd)
-                word = a64EncAddImm(is64, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
-            elif inst.op == machineOpMovImm:
-                let is64: bool = a64Is64(inst.rd)
-                let rd: int32 = a64RegNum(inst.rd)
-                let v: uint64 = uint64(inst.imm)
+                word = a64EncAddImm(true, 31, 31, int32(machineInstImmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpMovReg:
+                let is64: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAddImm(is64, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), 0)
+            elif machineInstOpOf(inst) == machineOpMovImm:
+                let is64: bool = a64Is64(machineInstRdOf(inst))
+                let rd: int32 = a64RegNum(machineInstRdOf(inst))
+                let v: uint64 = uint64(machineInstImmOf(inst))
                 # Emit movz/movk chain (0..3 halfwords).
                 word = a64EncMovz(is64, rd, int32(v & uint64(0xFFFF)), 0)
                 emitU32LE(text, word)
@@ -329,81 +382,81 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
                         let w2: uint32 = a64EncMovk(is64, rd, int32(part), hw)
                         emitU32LE(text, w2)
                 ii = ii + 1
-                curOff = curOff + (a64MovImmWordCount(is64, inst.imm) * 4)
+                curOff = curOff + (a64MovImmWordCount(is64, machineInstImmOf(inst)) * 4)
                 continue
-            elif inst.op == machineOpAdrp:
-                word = a64EncAdrp(a64RegNum(inst.rd))
+            elif machineInstOpOf(inst) == machineOpAdrp:
+                word = a64EncAdrp(a64RegNum(machineInstRdOf(inst)))
                 var r: ElfReloc
                 new r
                 r.off = off
-                r.sym = inst.label
+                r.sym = machineInstLabelOf(inst)
                 r.rtype = R_AARCH64_ADR_PREL_PG_HI21
                 r.addend = 0
                 add(relocs, r)
-            elif inst.op == machineOpAddPageOff:
-                word = a64EncAddImm(true, a64RegNum(inst.rd), a64RegNum(inst.rn), 0)
+            elif machineInstOpOf(inst) == machineOpAddPageOff:
+                word = a64EncAddImm(true, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), 0)
                 var r2: ElfReloc
                 new r2
                 r2.off = off
-                r2.sym = inst.label
+                r2.sym = machineInstLabelOf(inst)
                 r2.rtype = R_AARCH64_ADD_ABS_LO12_NC
                 r2.addend = 0
                 add(relocs, r2)
-            elif inst.op == machineOpSxtw:
-                word = a64EncSxtw(a64RegNum(inst.rd), a64RegNum(inst.rn))
-            elif inst.op == machineOpAdd:
-                let is64a: bool = a64Is64(inst.rd)
-                word = a64EncAddReg(is64a, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpSub:
-                let is64s2: bool = a64Is64(inst.rd)
-                word = a64EncSubReg(is64s2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpMul:
-                let is64m2: bool = a64Is64(inst.rd)
-                word = a64EncMul(is64m2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpSdiv:
-                let is64d: bool = a64Is64(inst.rd)
-                word = a64EncSdiv(is64d, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpUdiv:
-                let is64d2: bool = a64Is64(inst.rd)
-                word = a64EncUdiv(is64d2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpMsub:
-                let is64ms: bool = a64Is64(inst.rd)
-                word = a64EncMsub(is64ms, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm), a64RegNum(inst.ra))
-            elif inst.op == machineOpAnd:
-                let is64l: bool = a64Is64(inst.rd)
-                word = a64EncAndReg(is64l, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpOrr:
-                let is64o: bool = a64Is64(inst.rd)
-                word = a64EncOrrReg(is64o, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpEor:
-                let is64e: bool = a64Is64(inst.rd)
-                word = a64EncEorReg(is64e, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpLsl:
-                let is64sh: bool = a64Is64(inst.rd)
-                word = a64EncLslv(is64sh, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpLsr:
-                let is64sh2: bool = a64Is64(inst.rd)
-                word = a64EncLsrv(is64sh2, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpAsr:
-                let is64sh3: bool = a64Is64(inst.rd)
-                word = a64EncAsrv(is64sh3, a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpCmp:
-                let is64c: bool = a64Is64(inst.rn)
-                word = a64EncCmpReg(is64c, a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpBCond:
-                let toffRes: Result[int32] = elf_findLabelOff(labels, labelOffs, inst.label)
+            elif machineInstOpOf(inst) == machineOpSxtw:
+                word = a64EncSxtw(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif machineInstOpOf(inst) == machineOpAdd:
+                let is64a: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAddReg(is64a, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpSub:
+                let is64s2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncSubReg(is64s2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpMul:
+                let is64m2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncMul(is64m2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpSdiv:
+                let is64d: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncSdiv(is64d, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpUdiv:
+                let is64d2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncUdiv(is64d2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpMsub:
+                let is64ms: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncMsub(is64ms, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)), a64RegNum(machineInstRaOf(inst)))
+            elif machineInstOpOf(inst) == machineOpAnd:
+                let is64l: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAndReg(is64l, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpOrr:
+                let is64o: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncOrrReg(is64o, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpEor:
+                let is64e: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncEorReg(is64e, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpLsl:
+                let is64sh: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncLslv(is64sh, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpLsr:
+                let is64sh2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncLsrv(is64sh2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpAsr:
+                let is64sh3: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAsrv(is64sh3, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpCmp:
+                let is64c: bool = a64Is64(machineInstRnOf(inst))
+                word = a64EncCmpReg(is64c, a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpBCond:
+                let toffRes: Result[int32] = elf_findLabelOff(labels, labelOffs, machineInstLabelOf(inst))
                 if !IsOk[int32](toffRes):
                     return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes))
                 let targetOff: int32 = Value[int32](toffRes)
                 let deltaBytes: int64 = int64(targetOff - curOff)
                 if deltaBytes % 4 != 0:
                     return Err[uint8[]]("elf_writer: misaligned branch target")
-                let encRes: Result[uint32] = a64EncBCond(deltaBytes / 4, inst.cond)
+                let encRes: Result[uint32] = a64EncBCond(deltaBytes / 4, machineInstCondOf(inst))
                 if !IsOk[uint32](encRes):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes))
                 word = Value[uint32](encRes)
-            elif inst.op == machineOpB:
-                let toffRes2: Result[int32] = elf_findLabelOff(labels, labelOffs, inst.label)
+            elif machineInstOpOf(inst) == machineOpB:
+                let toffRes2: Result[int32] = elf_findLabelOff(labels, labelOffs, machineInstLabelOf(inst))
                 if !IsOk[int32](toffRes2):
                     return ErrInfo[uint8[]](ErrorInfoOf[int32](toffRes2))
                 let targetOff2: int32 = Value[int32](toffRes2)
@@ -414,90 +467,109 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
                 if !IsOk[uint32](encRes2):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes2))
                 word = Value[uint32](encRes2)
-            elif inst.op == machineOpStr:
-                let is64s: bool = a64Is64(inst.rd)
-                let encRes: Result[uint32] = a64EncStrImm(is64s, a64RegNum(inst.rd),
-                                                          a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpStr:
+                let is64s: bool = a64Is64(machineInstRdOf(inst))
+                let encRes: Result[uint32] = a64EncStrImm(is64s, a64RegNum(machineInstRdOf(inst)),
+                                                          a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if ! IsOk[uint32](encRes):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes))
                 word = Value[uint32](encRes)
-            elif inst.op == machineOpLdr:
-                let is64l: bool = a64Is64(inst.rd)
-                let encRes2: Result[uint32] = a64EncLdrImm(is64l, a64RegNum(inst.rd),
-                                                           a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpLdr:
+                let is64l: bool = a64Is64(machineInstRdOf(inst))
+                let encRes2: Result[uint32] = a64EncLdrImm(is64l, a64RegNum(machineInstRdOf(inst)),
+                                                           a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if ! IsOk[uint32](encRes2):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes2))
                 word = Value[uint32](encRes2)
-            elif inst.op == machineOpStrb:
-                let encRes3: Result[uint32] = a64EncStrbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpStrb:
+                let encRes3: Result[uint32] = a64EncStrbImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if !IsOk[uint32](encRes3):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes3))
                 word = Value[uint32](encRes3)
-            elif inst.op == machineOpLdrb:
-                let encRes4: Result[uint32] = a64EncLdrbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpLdrb:
+                let encRes4: Result[uint32] = a64EncLdrbImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if !IsOk[uint32](encRes4):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes4))
                 word = Value[uint32](encRes4)
-            elif inst.op == machineOpLdrsb:
-                let encRes5: Result[uint32] = a64EncLdrsbImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpLdrsb:
+                let encRes5: Result[uint32] = a64EncLdrsbImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if !IsOk[uint32](encRes5):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes5))
                 word = Value[uint32](encRes5)
-            elif inst.op == machineOpStrh:
-                let encRes6: Result[uint32] = a64EncStrhImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpStrh:
+                let encRes6: Result[uint32] = a64EncStrhImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if !IsOk[uint32](encRes6):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes6))
                 word = Value[uint32](encRes6)
-            elif inst.op == machineOpLdrh:
-                let encRes7: Result[uint32] = a64EncLdrhImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpLdrh:
+                let encRes7: Result[uint32] = a64EncLdrhImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if !IsOk[uint32](encRes7):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes7))
                 word = Value[uint32](encRes7)
-            elif inst.op == machineOpLdrsh:
-                let encRes8: Result[uint32] = a64EncLdrshImm(a64RegNum(inst.rd), a64RegNum(inst.rn), inst.imm)
+            elif machineInstOpOf(inst) == machineOpLdrsh:
+                let encRes8: Result[uint32] = a64EncLdrshImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
                 if !IsOk[uint32](encRes8):
                     return ErrInfo[uint8[]](ErrorInfoOf[uint32](encRes8))
                 word = Value[uint32](encRes8)
-            elif inst.op == machineOpBl:
+            elif machineInstOpOf(inst) == machineOpBl:
                 word = a64EncBl()
                 var r3: ElfReloc
                 new r3
                 r3.off = off
-                r3.sym = inst.label
+                r3.sym = machineInstLabelOf(inst)
                 r3.rtype = R_AARCH64_CALL26
                 r3.addend = 0
                 add(relocs, r3)
-            elif inst.op == machineOpBlr:
-                word = a64EncBlr(a64RegNum(inst.rn))
-            elif inst.op == machineOpFmovDx:
-                word = a64EncFmovDx(a64RegNum(inst.rd), a64RegNum(inst.rn))
-            elif inst.op == machineOpFmovXd:
-                word = a64EncFmovXd(a64RegNum(inst.rd), a64RegNum(inst.rn))
-            elif inst.op == machineOpFcmpD:
-                word = a64EncFcmpD(a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpFaddD:
-                word = a64EncFaddD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpFsubD:
-                word = a64EncFsubD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpFmulD:
-                word = a64EncFmulD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpFdivD:
-                word = a64EncFdivD(a64RegNum(inst.rd), a64RegNum(inst.rn), a64RegNum(inst.rm))
-            elif inst.op == machineOpFnegD:
-                word = a64EncFnegD(a64RegNum(inst.rd), a64RegNum(inst.rn))
-            elif inst.op == machineOpScvtfDx:
-                word = a64EncScvtfDx(a64RegNum(inst.rd), a64RegNum(inst.rn))
-            elif inst.op == machineOpSvc:
-                if inst.imm < 0 || inst.imm > 65535:
+            elif machineInstOpOf(inst) == machineOpBlr:
+                word = a64EncBlr(a64RegNum(machineInstRnOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFmovDx:
+                word = a64EncFmovDx(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFmovXd:
+                word = a64EncFmovXd(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFcmpD:
+                word = a64EncFcmpD(a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFaddD:
+                word = a64EncFaddD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFsubD:
+                word = a64EncFsubD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFmulD:
+                word = a64EncFmulD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFdivD:
+                word = a64EncFdivD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpFnegD:
+                word = a64EncFnegD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif machineInstOpOf(inst) == machineOpScvtfDx:
+                word = a64EncScvtfDx(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif machineInstOpOf(inst) == machineOpSvc:
+                if machineInstImmOf(inst) < 0 || machineInstImmOf(inst) > 65535:
                     return Err[uint8[]]("elf_writer: svc immediate out of range")
-                word = a64EncSvc(int32(inst.imm))
-            elif inst.op == machineOpRet:
+                word = a64EncSvc(int32(machineInstImmOf(inst)))
+            elif machineInstOpOf(inst) == machineOpRet:
                 word = a64EncRet()
             else:
-                return Err[uint8[]]("elf_writer: unsupported machine op (op=" + intToStr(int32(inst.op)) + ")")
+                return Err[uint8[]]("elf_writer: unsupported machine op (op=" + intToStr(int32(machineInstOpOf(inst))) + ")")
             emitU32LE(text, word)
             ii = ii + 1
             curOff = curOff + 4
+
+    # Some stage0/seed paths keep L_cheng_str_* as reloc-only symbols.
+    # Materialize zero-terminated placeholders in .rodata so linkers can
+    # resolve these locals within the same object.
+    var synthCstrNames: str[]
+    var synthCstrOffs: uint64[]
+    for ri in 0..<relocs.len:
+        let rSynth: ElfReloc = relocs[ri]
+        if rSynth == nil || rSynth.sym == nil || len(rSynth.sym) == 0:
+            continue
+        let canonical: str = elfCanonicalCStringReloc(rSynth.sym)
+        if len(canonical) == 0:
+            continue
+        if elf_seqContainsStr(cSymLabels, canonical) || elf_seqContainsStr(synthCstrNames, canonical):
+            continue
+        let offSynth: uint64 = uint64(rodata.len)
+        bufU8(&rodata, uint8(0))
+        add(synthCstrNames, canonical)
+        add(synthCstrOffs, offSynth)
 
     # Build symbol list.
     var syms: ElfSym[]
@@ -510,26 +582,29 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
     elfAddSectionSym(syms, uint16(4))
 
     # local rodata symbols
-    for ci in 0..<module.cstrs.len:
-        let c2: MachineCString = module.cstrs[ci]
-        elfAddSym(syms, c2.label, STB_LOCAL, STT_OBJECT, uint16(2),
+    for ci in 0..<cstrCount:
+        let c2: MachineCString = elfModuleCStringAtRaw(module, ci)
+        elfAddSym(syms, machineCStringLabelOf(c2), STB_LOCAL, STT_OBJECT, uint16(2),
                   cSymOffs[ci], 0)
+    for si in 0..<synthCstrNames.len:
+        elfAddSym(syms, synthCstrNames[si], STB_LOCAL, STT_OBJECT, uint16(2),
+                  synthCstrOffs[si], 0)
 
     # globals: funcs
-    for fi in 0..<module.funcs.len:
-        let f2: MachineFunc = module.funcs[fi]
-        elfAddSym(syms, f2.name, STB_GLOBAL, STT_FUNC, uint16(1),
+    for fi in 0..<funcCount:
+        let f2: MachineFunc = elfModuleFuncAtRaw(module, fi)
+        elfAddSym(syms, machineFuncNameOf(f2), STB_GLOBAL, STT_FUNC, uint16(1),
                   funcOffs[fi], 0)
 
     # globals: data/bss
-    for gi in 0..<module.globals.len:
-        let g2: MachineGlobal = module.globals[gi]
-        if g2.hasInit:
-            elfAddSym(syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(3),
-                      dataSymOffs[gi], uint64(g2.size))
+    for gi in 0..<globalCount:
+        let g2: MachineGlobal = elfModuleGlobalAtRaw(module, gi)
+        if machineGlobalHasInit(g2):
+            elfAddSym(syms, machineGlobalNameOf(g2), STB_GLOBAL, STT_OBJECT, uint16(3),
+                      dataSymOffs[gi], uint64(machineGlobalSizeOf(g2)))
         else:
-            elfAddSym(syms, g2.name, STB_GLOBAL, STT_OBJECT, uint16(4),
-                      bssSymOffs[gi], uint64(g2.size))
+            elfAddSym(syms, machineGlobalNameOf(g2), STB_GLOBAL, STT_OBJECT, uint16(4),
+                      bssSymOffs[gi], uint64(machineGlobalSizeOf(g2)))
 
     # undefined symbols referenced by relocations.
     var undefs: str[]
@@ -736,4 +811,6 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
     return Ok[uint8[]](out)
 
 fn elfWriteAarch64RelocatableObj(module: MachineModule): Result[uint8[]] =
+    if module != nil:
+        memRetain(void*(module))
     return elfBuild(module)

@@ -90,6 +90,40 @@ fn stage1_autoSystemEnabled(): bool =
         return true
     return true
 
+fn stage1_parseModeNormalized(): str =
+    var raw: str = lowerAscii(stage1_getEnv("BACKEND_STAGE1_PARSE_MODE"))
+    if raw == "":
+        raw = lowerAscii(stage1_getEnv("STAGE1_PARSE_MODE"))
+    if raw == "":
+        var fastRaw: str = lowerAscii(stage1_getEnv("BACKEND_FAST_DEV_PROFILE"))
+        if fastRaw == "0" || fastRaw == "false" || fastRaw == "no" || fastRaw == "off":
+            raw = "full"
+        elif fastRaw == "1" || fastRaw == "true" || fastRaw == "yes" || fastRaw == "on":
+            raw = "outline"
+    if raw == "":
+        let track: str = lowerAscii(stage1_getEnv("BACKEND_BUILD_TRACK"))
+        if track == "release":
+            raw = "full"
+        else:
+            raw = "outline"
+    if raw == "outline":
+        return "outline"
+    return "full"
+
+fn stage1_parseModuleByMode(tokens: Token[], path: str, diags: Diagnostic[]*): Node =
+    let mode: str = stage1_parseModeNormalized()
+    if mode == "outline":
+        return parseModuleOutlineWithDiagnostics(tokens, path, diags)
+    return parseModuleWithDiagnostics(tokens, path, diags)
+
+fn stage1_materializeModuleBodiesForMode(tokens: Token[], path: str, root: Node, diags: Diagnostic[]*): int32 =
+    if root == nil:
+        return 0
+    let mode: str = stage1_parseModeNormalized()
+    if mode != "outline":
+        return 0
+    return materializeModuleRoutineBodiesFromTokens(tokens, path, root, diags)
+
 var stage1TraceEnabledCached: int32 = -1
 var stage1TraceImportsEnabledCached: int32 = -1
 var stage1TraceFlushEnabledCached: int32 = -1
@@ -1792,16 +1826,27 @@ fn setHasStr(v: StrSetList, key: str): bool =
 fn setAddStr(v: StrSetList*, key: str) =
     if v == nil || key == nil:
         return
-    if hashsets.hashSetStrHas(v->set, key):
+    if setHasStr(*v, key):
         return
     add(v->items, key)
     hashsets.hashSetStrAdd(v->set, key)
+
+fn stage1StrEq(a: str, b: str): bool =
+    if a == nil || b == nil:
+        return a == b
+    let n: int32 = len(a)
+    if n != len(b):
+        return false
+    for i in 0..<n:
+        if a[i] != b[i]:
+            return false
+    return true
 
 fn importTraceFind(v: ImportTrace, path: str): int32 =
     if path == nil || len(path) == 0:
         return -1
     for i in 0..<v.items.len:
-        if v.items[i] == path:
+        if stage1StrEq(v.items[i], path):
             return i
     return -1
 
@@ -1931,8 +1976,9 @@ fn loadModuleRecursive(path: str, rootDir: str, visited: StrSetList*, diags: Dia
         appendDiagnostics(diags, lexDiags)
         if lexDiags.len == 0:
             writeTokenCache(path, size, mtime, tokens)
-    let mroot0: Node = parseModuleWithDiagnostics(tokens, path, diags)
-    let mroot: Node = stage1ApplyAstPluginHooks(path, mroot0)
+    let mrootParsed: Node = stage1_parseModuleByMode(tokens, path, diags)
+    let _mrootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, path, mrootParsed, diags)
+    let mroot: Node = stage1ApplyAstPluginHooks(path, mrootParsed)
     freeSeq[Token](tokens)
     freeSeq[Diagnostic](lexDiags)
     if mroot == nil:
@@ -2088,8 +2134,9 @@ fn loadSystemModule(userFile: str, diags: Diagnostic[]*): Node =
         if lexDiags.len == 0:
             writeTokenCache(sysPath, size, mtime, tokens)
     dumpTokens(sysPath, tokens)
-    let sysRoot0: Node = parseModuleWithDiagnostics(tokens, sysPath, diags)
-    let sysRoot: Node = stage1ApplyAstPluginHooks(sysPath, sysRoot0)
+    let sysRootParsed: Node = stage1_parseModuleByMode(tokens, sysPath, diags)
+    let _sysBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, sysPath, sysRootParsed, diags)
+    let sysRoot: Node = stage1ApplyAstPluginHooks(sysPath, sysRootParsed)
     freeSeq[Token](tokens)
     freeSeq[Diagnostic](lexDiags)
     return sysRoot
@@ -2122,8 +2169,9 @@ fn parseModuleForDeps(path: str, diags: Diagnostic[]*): Node =
         appendDiagnostics(diags, lexDiags)
         if lexDiags.len == 0:
             writeTokenCache(path, size, mtime, tokens)
-    let root0: Node = parseModuleWithDiagnostics(tokens, path, diags)
-    let root: Node = stage1ApplyAstPluginHooks(path, root0)
+    let rootParsed: Node = stage1_parseModuleByMode(tokens, path, diags)
+    let _rootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, path, rootParsed, diags)
+    let root: Node = stage1ApplyAstPluginHooks(path, rootParsed)
     freeSeq[Token](tokens)
     freeSeq[Diagnostic](lexDiags)
     return root

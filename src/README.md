@@ -7,7 +7,7 @@
 - `std/`：标准库与后端运行时源码。
 
 构建与运行示例见 `docs/cheng-dev-plan.md`：
-- 纯 Cheng 一键自举（obj/exe + self-link，seed 启动）：`src/tooling/bootstrap_pure.sh --fullspec`
-- 兼容入口（转发到 pure 自举）：`src/tooling/bootstrap.sh --fullspec`
+- 纯 Cheng 一键自举（obj/exe + self-link，seed 启动）：`sh src/tooling/tooling_exec.sh bootstrap_pure --fullspec`
+- 兼容入口（转发到 pure 自举）：`sh src/tooling/tooling_exec.sh bootstrap --fullspec`
 
 GUI IDE 见 `../cheng-ide/README.md`（或 `$IDE_ROOT/README.md`）。

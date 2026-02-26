@@ -79,13 +79,13 @@
 
 ## Production Closure Gates
 必跑（阻断）：
-- `sh src/tooling/verify_backend_no_legacy_refs.sh`
-- `sh src/tooling/verify_backend_opt2.sh`
-- `sh src/tooling/verify_backend_opt3.sh`
-- `sh src/tooling/verify_backend_multi_perf_regression.sh`
-- `sh src/tooling/verify_backend_simd.sh`
-- `sh src/tooling/verify_backend_uir_stability.sh`
-- `sh src/tooling/backend_prod_closure.sh --no-publish`
+- `sh src/tooling/tooling_exec.sh verify_backend_no_legacy_refs`
+- `sh src/tooling/tooling_exec.sh verify_backend_opt2`
+- `sh src/tooling/tooling_exec.sh verify_backend_opt3`
+- `sh src/tooling/tooling_exec.sh verify_backend_multi_perf_regression`
+- `sh src/tooling/tooling_exec.sh verify_backend_simd`
+- `sh src/tooling/tooling_exec.sh verify_backend_uir_stability`
+- `sh src/tooling/tooling_exec.sh backend_prod_closure --no-publish`
 
 fullspec 默认闭环口径（`BACKEND_RUN_FULLSPEC=1`）：
 - `BACKEND_FULLSPEC_GENERIC_MODE=dict`
@@ -97,4 +97,4 @@ fullspec 默认闭环口径（`BACKEND_RUN_FULLSPEC=1`）：
 
 ## Scope Notes
 - 本文档描述生产主链口径。
-- internal 命名已完成收敛：`uir_internal`/`machine_internal`/`select_internal` 不再保留 `Mir/Lir` 与 `lr/lc/lo` 旧符号；`verify_backend_no_legacy_refs.sh` 对 internal + non-internal 一并做硬阻断。
+- internal 命名已完成收敛：`uir_internal`/`machine_internal`/`select_internal` 不再保留 `Mir/Lir` 与 `lr/lc/lo` 旧符号；`verify_backend_no_legacy_refs` 对 internal + non-internal 一并做硬阻断。

@@ -70,17 +70,20 @@ fn ownSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void*
     if idx < 0 || idx >= len0:
         panic "ownership: seq index out of bounds"
     let off64: int64 = int64(idx) * int64(elemSize)
-    return ptr_add(buffer, int32(off64))
+    # Stage0 stability: returning ptr_add(...) directly can crash some seed compilers
+    # when callers cast the result; keep an explicit local first.
+    let p: void* = ptr_add(buffer, int32(off64))
+    return p
 
 fn ownReadPtr(seqInst: ptr[], i: int32): ptr =
-    let p: ptr* = ptr*(ownSeqElemPtr(seqInst.buffer, seqInst.len, i, sizeof ptr))
-    return *p
+    if i < 0 || i >= seqInst.len:
+        panic "ownership: seq index out of bounds"
+    return seqInst[i]
 
-fn ownWritePtr(seqInst: ptr[]*, i: int32, val: ptr) =
-    if seqInst == nil:
-        panic "ownership: nil seq pointer"
-    let p: ptr* = ptr*(ownSeqElemPtr(seqInst->buffer, seqInst->len, i, sizeof ptr))
-    *p = val
+fn ownWritePtr(seqInst: var ptr[], i: int32, val: ptr) =
+    if i < 0 || i >= seqInst.len:
+        panic "ownership: seq index out of bounds"
+    seqInst[i] = val
 
 fn ownReadI32(seqInst: int32[], i: int32): int32 =
     let p: int32* = int32*(ownSeqElemPtr(seqInst.buffer, seqInst.len, i, sizeof int32))
@@ -288,7 +291,7 @@ fn ownIndexMapInsert(p: void*, val: int32) =
     while true:
         let key: void* = void*(ownReadPtr(ownIndexMapKeys, idx))
         if key == nil:
-            ownWritePtr(&ownIndexMapKeys, idx, ptr(p))
+            ownWritePtr(ownIndexMapKeys, idx, ptr(p))
             ownWriteI32(&ownIndexMapVals, idx, val + 1)
             ownIndexMapCount = ownIndexMapCount + 1
             return
@@ -464,7 +467,7 @@ fn ownLocalMapGrow() =
             if val > 0:
                 let slot: int32 = ownLocalMapFindSlot(str(key), true)
                 if slot >= 0:
-                    ownWritePtr(&ownLocalMapKeys, slot, ptr(key))
+                    ownWritePtr(ownLocalMapKeys, slot, ptr(key))
                     ownWriteI32(&ownLocalMapVals, slot, val)
                     ownLocalMapUsed = ownLocalMapUsed + 1
                     ownLocalMapLive = ownLocalMapLive + 1
@@ -490,7 +493,7 @@ fn ownLocalMapInc(name: str) =
     if slot < 0:
         return
     if ownReadPtr(ownLocalMapKeys, slot) == nil:
-        ownWritePtr(&ownLocalMapKeys, slot, ptr(name))
+        ownWritePtr(ownLocalMapKeys, slot, ptr(name))
         ownWriteI32(&ownLocalMapVals, slot, 1)
         ownLocalMapUsed = ownLocalMapUsed + 1
         ownLocalMapLive = ownLocalMapLive + 1

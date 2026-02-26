@@ -34,6 +34,8 @@ jobs:
 
     name: '${{ matrix.target.os }}-${{ matrix.target.cpu }} (${{ matrix.branch }})'
     runs-on: ${{ matrix.builder }}
+    env:
+      TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK: '0'
     steps:
       - name: set `core.autocrlf` to false
         run: |
@@ -146,37 +148,63 @@ jobs:
         run: |
           src/tooling/build_nifc_c.sh
 
+      - name: Zero-python embedded map guard
+        working-directory: nif
+        shell: bash
+        run: |
+          if rg -n "embed_query|cheng_tooling_embed_query.py" -S .; then
+            echo "[Error] legacy embed query python reference detected" >&2
+            exit 1
+          fi
+          tmp_map="artifacts/tooling_cmd/ci_embedded_inline.rewrite.cheng"
+          artifacts/tooling_cmd/cheng_tooling rewrite-map src/tooling/cheng_tooling_embedded_inline.cheng "$tmp_map"
+          if ! cmp -s "$tmp_map" src/tooling/cheng_tooling_embedded_inline.cheng; then
+            echo "[Error] embedded map drift detected; run: artifacts/tooling_cmd/cheng_tooling rewrite-map src/tooling/cheng_tooling_embedded_inline.cheng" >&2
+            exit 1
+          fi
+
       - name: Bootstrap
         if: runner.os != 'macOS' || matrix.target.cpu != 'arm64'
         working-directory: nif
         run: |
-          src/tooling/bootstrap_pure.sh --fullspec
+          artifacts/tooling_cmd/cheng_tooling bootstrap_pure --fullspec
 
       - name: Verify
         if: matrix.target.cpu != 'i386' && (runner.os != 'macOS' || matrix.target.cpu != 'arm64')
         working-directory: nif
         run: |
+          expected="$PWD/artifacts/backend_driver/cheng"
+          resolved="$(artifacts/tooling_cmd/cheng_tooling driver-path)"
+          if [ "$resolved" != "$expected" ]; then
+            echo "[Error] single-driver gate failed: expected=$expected got=$resolved" >&2
+            exit 1
+          fi
           export BACKEND_DRIVER=artifacts/backend_driver/cheng
-          export BACKEND_DRIVER_ALLOW_FALLBACK=0
           export VERIFY_USE_TOOLING_BUNDLE_CORE=1
           export VERIFY_TOOLING_BUNDLE_CORE_AUTO_BUILD=1
           export VERIFY_TOOLING_BUNDLE_LINKER=system
-          ./verify.sh
+          artifacts/tooling_cmd/cheng_tooling verify
 
       - name: Backend x86_64 closure (Linux amd64)
         if: runner.os == 'Linux' && matrix.target.cpu == 'amd64'
         working-directory: nif
         run: |
-          sh src/tooling/verify_backend_x86_64_linux.sh
-          sh src/tooling/verify_backend_coff_lld_link.sh
-          BACKEND_MATRIX_STRICT=1 sh src/tooling/verify_backend_targets_matrix.sh
+          artifacts/tooling_cmd/cheng_tooling verify_backend_x86_64_linux
+          artifacts/tooling_cmd/cheng_tooling verify_backend_coff_lld_link
+          BACKEND_MATRIX_STRICT=1 artifacts/tooling_cmd/cheng_tooling verify_backend_targets_matrix
+
+      - name: DePIN closedloop gate (Linux amd64)
+        if: runner.os == 'Linux' && matrix.target.cpu == 'amd64'
+        working-directory: nif
+        run: |
+          artifacts/tooling_cmd/cheng_tooling verify_depin_closedloop
 
       - name: Cheng skill consistency gate (Linux amd64)
         if: runner.os == 'Linux' && matrix.target.cpu == 'amd64'
         working-directory: nif
         run: |
-          sh src/tooling/verify_cheng_skill_consistency.sh
-          sh src/tooling/verify_backend_runtime_abi.sh
+          artifacts/tooling_cmd/cheng_tooling verify_cheng_skill_consistency
+          artifacts/tooling_cmd/cheng_tooling verify_backend_runtime_abi
 
       - name: Cheng skill consistency gate (Windows amd64, docs-only)
         if: runner.os == 'Windows' && matrix.target.cpu == 'amd64'
@@ -185,7 +213,7 @@ jobs:
         run: |
           SKILL_COMPILE=0 \
           SKILL_COMPARE_HOME=0 \
-          sh src/tooling/verify_cheng_skill_consistency.sh
+          artifacts/tooling_cmd/cheng_tooling verify_cheng_skill_consistency
 
       - name: Fetch backend seed (macOS arm64)
         if: runner.os == 'macOS' && matrix.target.cpu == 'arm64'
@@ -199,16 +227,26 @@ jobs:
         if: runner.os == 'macOS' && matrix.target.cpu == 'arm64'
         working-directory: nif
         run: |
-          sh src/tooling/verify_backend_ci_obj_only.sh \
+          artifacts/tooling_cmd/cheng_tooling verify_backend_ci_obj_only \
             --seed-tar:/tmp/backend_release.tar.gz \
             --require-seed
+
+      - name: Single driver gate (macOS arm64)
+        if: runner.os == 'macOS' && matrix.target.cpu == 'arm64'
+        working-directory: nif
+        run: |
+          expected="$PWD/artifacts/backend_driver/cheng"
+          resolved="$(artifacts/tooling_cmd/cheng_tooling driver-path)"
+          if [ "$resolved" != "$expected" ]; then
+            echo "[Error] single-driver gate failed: expected=$expected got=$resolved" >&2
+            exit 1
+          fi
 
       - name: Cheng skill consistency gate (macOS arm64)
         if: runner.os == 'macOS' && matrix.target.cpu == 'arm64'
         working-directory: nif
         run: |
           BACKEND_DRIVER=artifacts/backend_driver/cheng \
-          BACKEND_DRIVER_ALLOW_FALLBACK=0 \
           SKILL_COMPARE_HOME=0 \
-          sh src/tooling/verify_cheng_skill_consistency.sh
-          sh src/tooling/verify_backend_runtime_abi.sh
+          artifacts/tooling_cmd/cheng_tooling verify_cheng_skill_consistency
+          artifacts/tooling_cmd/cheng_tooling verify_backend_runtime_abi

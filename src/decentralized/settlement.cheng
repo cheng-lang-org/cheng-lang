@@ -6,6 +6,11 @@ import cheng/decentralized/json_parse as jparse
 import std/strings
 import std/seqs
 
+const
+    pricingAlphaTrainBps = 13500
+    pricingAlphaInferBps = 8500
+    pricingAlphaOtherBps = 10000
+
 type
     Settlement =
         epoch: int32
@@ -13,10 +18,16 @@ type
         computeTotal: float64
         auditTotal: float64
         treasuryTotal: float64
+        gpuCoreTotal: float64
+        gpuMemTotal: float64
+        gpuAlphaWeightedTotal: float64
         leaseCount: int32
         computeCount: int32
         auditCount: int32
         auditSampleCount: int32
+        auditSampleHighRiskCount: int32
+        samplingBaseRateBps: int32
+        samplingHighRiskRateBps: int32
         fraudReportCount: int32
         storageProofCount: int32
         storageProofMissingCount: int32
@@ -84,10 +95,16 @@ fn initSettlement(epoch: int32): Settlement =
         computeTotal: 0.0,
         auditTotal: 0.0,
         treasuryTotal: 0.0,
+        gpuCoreTotal: 0.0,
+        gpuMemTotal: 0.0,
+        gpuAlphaWeightedTotal: 0.0,
         leaseCount: 0,
         computeCount: 0,
         auditCount: 0,
         auditSampleCount: 0,
+        auditSampleHighRiskCount: 0,
+        samplingBaseRateBps: 1000,
+        samplingHighRiskRateBps: 10000,
         fraudReportCount: 0,
         storageProofCount: 0,
         storageProofMissingCount: 0,
@@ -134,6 +151,22 @@ fn tableSetString(t: var tables.Table[str], key: str, value: str) =
     if value0 != nil:
         value0 = value0 + ""
     tables.TablePut[str](t, key + "", value0)
+
+fn alphaBpsForWorkload(workloadRaw: str): int32 =
+    let workload = strutil.toLowerAscii(strutil.strip(workloadRaw))
+    if workload == "train":
+        return pricingAlphaTrainBps
+    if workload == "infer":
+        return pricingAlphaInferBps
+    return pricingAlphaOtherBps
+
+fn fraudSeverityWeight(severityRaw: str): float64 =
+    let severity = strutil.toLowerAscii(strutil.strip(severityRaw))
+    if severity == "low":
+        return 0.1
+    if severity == "medium":
+        return 0.5
+    return 1.0
 
 fn strLess(a: str, b: str): bool =
     if a == nil:
@@ -641,49 +674,54 @@ fn epochsToYamlList(indent: str, label: str, values: EpochMismatchEntry[]): str 
         out = out + indent + "    ref_epoch: " + intToStr(values[i].refEpoch) + "\n"
     return out
 
-fn settleLease(node: json.JsonNode, out: Settlement*) =
-    if out == nil:
-        return
+fn settleLease(node: json.JsonNode, out: var Settlement) =
     let authorId = jparse.getStringField(node, "author_id", "")
     let providerId = jparse.getStringField(node, "provider_id", "")
     let royalty = jparse.getFloatField(node, "royalty", 0.0)
     let provider = jparse.getFloatField(node, "provider", 0.0)
     let treasury = jparse.getFloatField(node, "treasury", 0.0)
-    out->storageTotal = out->storageTotal + royalty + provider + treasury
-    out->treasuryTotal = out->treasuryTotal + treasury
-    out->leaseCount = out->leaseCount + 1
-    tableAdd(out->authors, authorId, royalty)
-    tableAdd(out->providers, providerId, provider)
+    out.storageTotal = out.storageTotal + royalty + provider + treasury
+    out.treasuryTotal = out.treasuryTotal + treasury
+    out.leaseCount = out.leaseCount + 1
+    tableAdd(out.authors, authorId, royalty)
+    tableAdd(out.providers, providerId, provider)
 
-fn settleCompute(node: json.JsonNode, out: Settlement*) =
-    if out == nil:
-        return
+fn settleCompute(node: json.JsonNode, out: var Settlement) =
     let authorId = jparse.getStringField(node, "author_id", "")
     let executorId = jparse.getStringField(node, "executor_id", "")
     let royalty = jparse.getFloatField(node, "royalty", 0.0)
     let executor = jparse.getFloatField(node, "executor", 0.0)
     let treasury = jparse.getFloatField(node, "treasury", 0.0)
-    out->computeTotal = out->computeTotal + royalty + executor + treasury
-    out->treasuryTotal = out->treasuryTotal + treasury
-    out->computeCount = out->computeCount + 1
-    tableAdd(out->authors, authorId, royalty)
-    tableAdd(out->executors, executorId, executor)
+    out.computeTotal = out.computeTotal + royalty + executor + treasury
+    out.treasuryTotal = out.treasuryTotal + treasury
+    out.computeCount = out.computeCount + 1
+    tableAdd(out.authors, authorId, royalty)
+    tableAdd(out.executors, executorId, executor)
+    let gpuMs = float64(jparse.getIntField(node, "gpu_ms", 0))
+    let gpuMemBytes = float64(jparse.getIntField(node, "gpu_mem_bytes", 0))
+    let priceGpuMs = jparse.getFloatField(node, "price_gpu_ms", 0.0)
+    let priceGpuMemGb = jparse.getFloatField(node, "price_gpu_mem_gb", 0.0)
+    let gpuCoreCost = gpuMs * priceGpuMs
+    let gpuMemCost = (gpuMemBytes / (1024.0 * 1024.0 * 1024.0)) * priceGpuMemGb
+    let alphaBps = alphaBpsForWorkload(jparse.getStringField(node, "workload_kind", "other"))
+    let gpuAlphaCost = (gpuCoreCost + gpuMemCost) * (float64(alphaBps) / 10000.0)
+    out.gpuCoreTotal = out.gpuCoreTotal + gpuCoreCost
+    out.gpuMemTotal = out.gpuMemTotal + gpuMemCost
+    out.gpuAlphaWeightedTotal = out.gpuAlphaWeightedTotal + gpuAlphaCost
 
-fn settleAudit(node: json.JsonNode, out: Settlement*) =
-    if out == nil:
-        return
+fn settleAudit(node: json.JsonNode, out: var Settlement) =
     let executorId = jparse.getStringField(node, "executor_id", "")
     let status = jparse.getStringField(node, "status", "")
     let penalty = jparse.getFloatField(node, "penalty", 0.0)
-    out->auditCount = out->auditCount + 1
+    out.auditCount = out.auditCount + 1
     if penalty <= 0.0:
         return
     if status == "ok":
         return
-    out->auditTotal = out->auditTotal + penalty
-    out->treasuryTotal = out->treasuryTotal + penalty
-    tableAdd(out->executors, executorId, -penalty)
-    tableAdd(out->penalties, executorId, penalty)
+    out.auditTotal = out.auditTotal + penalty
+    out.treasuryTotal = out.treasuryTotal + penalty
+    tableAdd(out.executors, executorId, -penalty)
+    tableAdd(out.penalties, executorId, penalty)
 
 fn settleLedger(ledgerPath: str, epochFilter: int32): Settlement =
     var out: Settlement = initSettlement(epochFilter)
@@ -708,20 +746,30 @@ fn settleLedger(ledgerPath: str, epochFilter: int32): Settlement =
         if epochFilter >= 0 && epoch != epochFilter:
             continue
         if kind == "lease":
-            settleLease(node, &out)
+            settleLease(node, out)
         elif kind == "compute":
-            settleCompute(node, &out)
+            settleCompute(node, out)
             let usageId = jparse.getStringField(node, "usage_id", "")
             tableSetInt(out.usageIds, usageId)
             tableSetIntValue(out.usageEpochs, usageId, epoch)
         elif kind == "audit":
-            settleAudit(node, &out)
+            settleAudit(node, out)
         elif kind == "audit_sample":
             out.auditSampleCount = out.auditSampleCount + 1
+            let riskLevel = jparse.getStringField(node, "risk_level", "")
+            if riskLevel == "high":
+                out.auditSampleHighRiskCount = out.auditSampleHighRiskCount + 1
+            let baseRateBps = int32(jparse.getIntField(node, "base_rate_bps", int64(out.samplingBaseRateBps)))
+            let highRiskRateBps = int32(jparse.getIntField(node, "high_risk_rate_bps", int64(out.samplingHighRiskRateBps)))
+            if baseRateBps > 0:
+                out.samplingBaseRateBps = baseRateBps
+            if highRiskRateBps > 0:
+                out.samplingHighRiskRateBps = highRiskRateBps
         elif kind == "fraud_report":
             out.fraudReportCount = out.fraudReportCount + 1
             let executorId = jparse.getStringField(node, "executor_id", "")
-            tableAdd(out.fraudExecutors, executorId, 1.0)
+            let severity = jparse.getStringField(node, "severity", "")
+            tableAdd(out.fraudExecutors, executorId, fraudSeverityWeight(severity))
         elif kind == "storage_proof":
             out.storageProofCount = out.storageProofCount + 1
             let providerId = jparse.getStringField(node, "provider_id", "")
@@ -786,6 +834,22 @@ fn settlementToJson(settle: Settlement, previewTop: int32): json.JsonNode =
     payouts["executors"] = tableToJson(settle.executors)
     payouts["penalties"] = tableToJson(settle.penalties)
     root["payouts"] = payouts
+    let pricing = json.newJObject()
+    let alphaMap = json.newJObject()
+    alphaMap["train"] = json.newJInt(pricingAlphaTrainBps)
+    alphaMap["infer"] = json.newJInt(pricingAlphaInferBps)
+    alphaMap["other"] = json.newJInt(pricingAlphaOtherBps)
+    pricing["alpha_map_bps"] = alphaMap
+    pricing["gpu_core_total"] = json.newJFloat(settle.gpuCoreTotal)
+    pricing["gpu_mem_total"] = json.newJFloat(settle.gpuMemTotal)
+    pricing["gpu_alpha_weighted_total"] = json.newJFloat(settle.gpuAlphaWeightedTotal)
+    root["pricing"] = pricing
+    let sampling = json.newJObject()
+    sampling["base_rate_bps"] = json.newJInt(settle.samplingBaseRateBps)
+    sampling["high_risk_rate_bps"] = json.newJInt(settle.samplingHighRiskRateBps)
+    sampling["selected_count"] = json.newJInt(settle.auditSampleCount)
+    sampling["high_risk_selected_count"] = json.newJInt(settle.auditSampleHighRiskCount)
+    root["sampling"] = sampling
     let trust = json.newJObject()
     trust["audit_sample_count"] = json.newJInt(settle.auditSampleCount)
     trust["fraud_report_count"] = json.newJInt(settle.fraudReportCount)
@@ -840,6 +904,19 @@ fn settlementToToml(settle: Settlement, previewTop: int32): str =
     out = out + tableToToml("payouts.providers", settle.providers)
     out = out + tableToToml("payouts.executors", settle.executors)
     out = out + tableToToml("payouts.penalties", settle.penalties)
+    out = out + "\n[pricing]\n"
+    out = out + "gpu_core_total = " + $ settle.gpuCoreTotal + "\n"
+    out = out + "gpu_mem_total = " + $ settle.gpuMemTotal + "\n"
+    out = out + "gpu_alpha_weighted_total = " + $ settle.gpuAlphaWeightedTotal + "\n"
+    out = out + "\n[pricing.alpha_map_bps]\n"
+    out = out + "train = " + intToStr(pricingAlphaTrainBps) + "\n"
+    out = out + "infer = " + intToStr(pricingAlphaInferBps) + "\n"
+    out = out + "other = " + intToStr(pricingAlphaOtherBps) + "\n"
+    out = out + "\n[sampling]\n"
+    out = out + "base_rate_bps = " + intToStr(settle.samplingBaseRateBps) + "\n"
+    out = out + "high_risk_rate_bps = " + intToStr(settle.samplingHighRiskRateBps) + "\n"
+    out = out + "selected_count = " + intToStr(settle.auditSampleCount) + "\n"
+    out = out + "high_risk_selected_count = " + intToStr(settle.auditSampleHighRiskCount) + "\n"
     out = out + "\n[trust]\n"
     out = out + "audit_sample_count = " + intToStr(settle.auditSampleCount) + "\n"
     out = out + "fraud_report_count = " + intToStr(settle.fraudReportCount) + "\n"
@@ -892,6 +969,19 @@ fn settlementToYaml(settle: Settlement, previewTop: int32): str =
     out = out + tableToYaml("  ", "providers", settle.providers)
     out = out + tableToYaml("  ", "executors", settle.executors)
     out = out + tableToYaml("  ", "penalties", settle.penalties)
+    out = out + "pricing:\n"
+    out = out + "  alpha_map_bps:\n"
+    out = out + "    train: " + intToStr(pricingAlphaTrainBps) + "\n"
+    out = out + "    infer: " + intToStr(pricingAlphaInferBps) + "\n"
+    out = out + "    other: " + intToStr(pricingAlphaOtherBps) + "\n"
+    out = out + "  gpu_core_total: " + $ settle.gpuCoreTotal + "\n"
+    out = out + "  gpu_mem_total: " + $ settle.gpuMemTotal + "\n"
+    out = out + "  gpu_alpha_weighted_total: " + $ settle.gpuAlphaWeightedTotal + "\n"
+    out = out + "sampling:\n"
+    out = out + "  base_rate_bps: " + intToStr(settle.samplingBaseRateBps) + "\n"
+    out = out + "  high_risk_rate_bps: " + intToStr(settle.samplingHighRiskRateBps) + "\n"
+    out = out + "  selected_count: " + intToStr(settle.auditSampleCount) + "\n"
+    out = out + "  high_risk_selected_count: " + intToStr(settle.auditSampleHighRiskCount) + "\n"
     out = out + "trust:\n"
     out = out + "  audit_sample_count: " + intToStr(settle.auditSampleCount) + "\n"
     out = out + "  fraud_report_count: " + intToStr(settle.fraudReportCount) + "\n"

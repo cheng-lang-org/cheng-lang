@@ -2,6 +2,7 @@
 import std/result
 import std/os
 import std/monotimes
+import std/strutils
 import cheng/backend/uir/uir_types
 import cheng/backend/uir/uir_pass_manager
 import cheng/backend/uir/uir_noalias_pass
@@ -9,6 +10,7 @@ import cheng/backend/uir/uir_egraph_rewrite
 import cheng/backend/uir/uir_egraph_cost
 import cheng/backend/uir/uir_internal/uir_core_opt
 import cheng/backend/uir/uir_internal/uir_core_opt2
+import cheng/backend/uir/uir_internal/uir_core_ssu
 import cheng/backend/uir/uir_internal/uir_core_ssa
 
 type
@@ -20,6 +22,9 @@ type
 fn uirOptNowNs(): int64 =
     let mt: monotimes.MonoTime = monotimes.getMonoTime()
     return mt.ns
+
+fn lowerAscii(s: str): str =
+    return strutils.toLowerAscii(s)
 
 fn uirParseBoolEnv(name: str, defaultValue: bool): bool =
     let raw: str = os.getEnvDefault(name, "")
@@ -753,20 +758,18 @@ fn uirOptimizeModule(module: UirModule, optLevel: int32, simdEnabled: bool, simd
         else:
             uirProfileStep(profileState, "uir_opt2.noalias.disabled")
 
-        # Stability-first opt2 path: keep lightweight, deterministic transforms
-        # enabled by default; disable heavy LICM/CSE/SROA/converge loops that
-        # can crash in selfhost stage1 smoke.
-        let _ = uirRunCoreModuleExprFoldPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleConstPropPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleForwardSubstPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleNormalizeExprPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleAlgebraicPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleNoopAssignPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleDseStoresPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleFoldPureExprsPass(module, profileState, "uir_opt2.safe")
+        # Opt2 default pipeline: noalias -> ssu -> opt2 -> cleanup -> egraph.
+        let ssuEnabled: bool = uirCoreSsuEmitReport(module)
+        if ssuEnabled:
+            uirProfileStep(profileState, "uir_opt2.ssu")
+        else:
+            uirProfileStep(profileState, "uir_opt2.ssu.disabled")
+
+        let _ = uirRunCoreOptimizeConverge(module, "uir_opt2.opt2", opt2Iters, profileState)
+        # Keep a stable profile marker for existing surface gates.
         let _ = uirRunCoreModuleCopyPropPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleCfgPass(module, profileState, "uir_opt2.safe")
-        let _ = uirRunCoreModuleCleanupPass(module, profileState, "uir_opt2.safe")
+        let _ = uirRunCoreModuleCleanupPass(module, profileState, "uir_opt2.cleanup")
+
         if egraphRequireProof:
             uirProfileStep(profileState, "uir_opt2.egraph.proof_required")
             uirProfileStep(profileState, "uir_opt2.egraph.proof_backed_funcs=" + intToStr(uirModuleCountHighUirCheckedFuncs(module)))
@@ -782,7 +785,8 @@ fn uirOptimizeModule(module: UirModule, optLevel: int32, simdEnabled: bool, simd
         uirProfileStep(profileState, "uir_opt3.ssa.lower")
         let ssaRes: Result[bool] = uirCoreSsaLowerModule(module)
         if !IsOk[bool](ssaRes):
-            panic("uir_opt: uir_core_ssa.lower failed at opt level 3")
+            let ssaErr: ErrorInfo = ErrorInfoOf[bool](ssaRes)
+            panic("uir_opt: uir_core_ssa.lower failed at opt level 3: " + ErrorMessage(ssaErr))
 
         for i in 0..<opt3PostIters:
             uirProfileStep(profileState, "uir_opt3.post_ssa_opt.round" + intToStr(i))

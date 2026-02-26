@@ -1,12 +1,13 @@
 module cmdline
 # Command-line argument helpers.
-# - Injected by calling `__cheng_setCmdLine(argc, argv)` in `main(argc, argv)`.
+# - Internal bridge only: `__cheng_setCmdLine(argc, argv)` is a C ABI ingress shim.
 # - In bootstrap runtime, `str` is cstring-like, so argv entries can be read as `str`.
 # - Pointer stride is fixed to 8 bytes for bootstrap/runtime compatibility.
 import std/strings as strings
 
 var __cheng_cmdCount: int32 = 0
-var __cheng_cmdLine: void* = nil
+var __cheng_cmdCacheCount: int32 = 0
+var __cheng_cmdCache: str[4096]
 const __cheng_cmdCountMax: int32 = 4096
 const __cheng_argvStride: int32 = 8
 const __cheng_int32Max: int64 = int64(2147483647)
@@ -15,14 +16,24 @@ const __cheng_int32MinAbs: int64 = int64(2147483648)
 
 fn __cheng_setCmdLine(argc: int32, argv: void*) =
     __cheng_cmdCount = argc
-    __cheng_cmdLine = argv
+    __cheng_cmdCacheCount = 0
+    if argc <= 0:
+        return
+    if argv == nil:
+        return
+    if argc > __cheng_cmdCountMax:
+        return
+    for i in 0..<argc:
+        let p: void* = ptr_add(argv, i * __cheng_argvStride)
+        __cheng_cmdCache[i] = *str*(p)
+    __cheng_cmdCacheCount = argc
 
 fn __cmdReady(): bool =
     if __cheng_cmdCount <= 0:
         return false
-    if __cheng_cmdLine == nil:
-        return false
     if __cheng_cmdCount > __cheng_cmdCountMax:
+        return false
+    if __cheng_cmdCacheCount != __cheng_cmdCount:
         return false
     return true
 
@@ -44,10 +55,9 @@ fn paramStr(i: int32): str =
         return ""
     if !__cmdReady():
         return ""
-    if i >= __cheng_cmdCount:
+    if i >= __cheng_cmdCacheCount:
         return ""
-    let p: void* = ptr_add(__cheng_cmdLine, i * __cheng_argvStride)
-    return *str*(p)
+    return __cheng_cmdCache[i]
 
 fn argStr(i: int32): str =
     return paramStr(i)

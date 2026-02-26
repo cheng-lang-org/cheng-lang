@@ -40,15 +40,15 @@
 - **解析规则**：单版本 + 通道；只允许顶层覆盖通道；支持 workspace/path override 但标记为 dev-only，禁止发布。
 - **分发与缓存**：registry 只存快照映射；包体走 CID 内容寻址；客户端优先用 libp2p bitswap 拉取，失败再回退 HTTP；缓存到 `chengcache/packages/<cid>/`。
 - **校验链路**：resolve -> verify(lock+registry) -> meta(build) -> buildmeta 写入产物；可选 ledger 校验，强制可审计。
-- **工具链闭环**：`cheng_pkg resolve/verify/meta` + `chengc.sh --manifest/--lock/--package` 一键完成依赖解析与构建元数据。
+- **工具链闭环**：`cheng_pkg resolve/verify/meta` + `chengc --manifest/--lock/--package` 一键完成依赖解析与构建元数据。
 - **lock 校验落地**：`cheng_pkg_source lock-verify --lock:<file> [--registry:<path>]` 校验签名/冲突/注册表一致性。
-- **闭环脚本**：`scripts/closedloop.sh` 统一跑 bootstrap + verify（可选 `CLOSEDLOOP_LIBP2P=1` 触发 libp2p production closure；`CLOSEDLOOP_STRICT=1` 强制完整后端生产校验）。
+- **闭环入口**：`sh src/tooling/tooling_exec.sh closedloop` 统一跑 bootstrap + verify（可选 `CLOSEDLOOP_LIBP2P=1` 触发 libp2p production closure；`CLOSEDLOOP_STRICT=1` 强制完整后端生产校验）。
 
 ### A1.1 源码直发（no-copy）
 - **发布模式**：包不打包，直接发布源码清单（manifest），manifest 仅包含 `path/cid/size` 与 `source_addrs`。
 - **只读接口**：`cheng_pkg_source serve` 的 p2p 服务能力已从 core binary 移出，需使用 p2p 专项工具链；core binary 当前仅保留 local-only manifest/publish/fetch。
 - **锁文件标记**：`format = "source"` 表示依赖为源码直发；未标记默认 `tar`。
-- **客户端拉取**：`cheng_pkg_fetch.sh` 遇到 `format=source` 使用 `cheng_pkg_source fetch` 拉取源码到 `chengcache/packages/<cid>/`。
+- **客户端拉取**：`cheng_pkg_fetch` 遇到 `format=source` 使用 `cheng_pkg_source fetch` 拉取源码到 `chengcache/packages/<cid>/`。
 - **no-copy 的边界**：no-copy 代表“发布与分发策略”，而非物理上只有一份副本；可用访问控制/加密或远程执行保证不可分发。
 
 ### A1.2 版本图（Git-like）与“唯一入口”
@@ -560,13 +560,13 @@ fn p2pProbe(listenAddr: str): bool =
 ### A3. 生产闭环流程（打包 -> 发布 -> 解析 -> 拉取 -> 编译）
 1) 打包并发布快照：
 ```bash
-sh src/tooling/cheng_pkg_publish.sh --src:/Users/lbcheng/.cheng-packages/cheng-libp2p --package:pkg://cheng/libp2p \
+sh src/tooling/tooling_exec.sh cheng_pkg_publish --src:/Users/lbcheng/.cheng-packages/cheng-libp2p --package:pkg://cheng/libp2p \
   --author:node:alice --channel:edge --epoch:1 --priv:keys/alice.priv
 ```
 
 源码直发（no-copy）发布：
 ```bash
-sh src/tooling/cheng_pkg_publish.sh --src:/Users/lbcheng/.cheng-packages/cheng-libp2p --package:pkg://cheng/libp2p \
+sh src/tooling/tooling_exec.sh cheng_pkg_publish --src:/Users/lbcheng/.cheng-packages/cheng-libp2p --package:pkg://cheng/libp2p \
   --author:node:alice --channel:edge --epoch:1 --priv:keys/alice.priv --format:source \
   --source-addr:/ip4/127.0.0.1/tcp/4005
 ```
@@ -586,18 +586,18 @@ sh src/tooling/cheng_pkg_publish.sh --src:/Users/lbcheng/.cheng-packages/cheng-l
 
 3) 拉取依赖快照并准备 `PKG_ROOTS`：
 ```bash
-sh src/tooling/cheng_pkg_fetch.sh --lock:build/cheng_pkg/cheng.lock.toml --print-roots
+sh src/tooling/tooling_exec.sh cheng_pkg_fetch --lock:build/cheng_pkg/cheng.lock.toml --print-roots
 ```
 
 源码直发拉取（可选指定源地址）：
 ```bash
-sh src/tooling/cheng_pkg_fetch.sh --lock:build/cheng_pkg/cheng.lock.toml --print-roots \
+sh src/tooling/tooling_exec.sh cheng_pkg_fetch --lock:build/cheng_pkg/cheng.lock.toml --print-roots \
   --source-peer:/ip4/127.0.0.1/tcp/4005
 ```
 
-4) 编译（`chengc.sh` 会自动拉取并设置 `PKG_ROOTS`）：
+4) 编译（`chengc` 会自动拉取并设置 `PKG_ROOTS`）：
 ```bash
-sh src/tooling/chengc.sh examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
+sh src/tooling/tooling_exec.sh chengc examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
   --lock:build/cheng_pkg/cheng.lock.toml --registry:build/cheng_registry/registry.jsonl
 ```
 
@@ -622,7 +622,7 @@ require_registry_match = true
 1) 发布快照（含签名）：
 ```bash
 ./cheng_registry keygen --out:build/cheng_registry/keypair.json
-sh src/tooling/cheng_pkg_publish.sh --src:/Users/lbcheng/.cheng-packages/cheng-libp2p --package:pkg://cheng/libp2p \
+sh src/tooling/tooling_exec.sh cheng_pkg_publish --src:/Users/lbcheng/.cheng-packages/cheng-libp2p --package:pkg://cheng/libp2p \
   --author:node:alice --channel:stable --epoch:1 --priv:keys/alice.priv
 ```
 
@@ -638,10 +638,10 @@ sh src/tooling/cheng_pkg_publish.sh --src:/Users/lbcheng/.cheng-packages/cheng-l
 3) 拉取 + 编译（仅 p2p，禁 HTTP 回退）：
 ```bash
 PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
-  sh src/tooling/cheng_pkg_fetch.sh --lock:build/cheng_pkg/cheng.lock.toml --print-roots
+  sh src/tooling/tooling_exec.sh cheng_pkg_fetch --lock:build/cheng_pkg/cheng.lock.toml --print-roots
 
 PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
-  sh src/tooling/chengc.sh examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
+  sh src/tooling/tooling_exec.sh chengc examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
   --lock:build/cheng_pkg/cheng.lock.toml --registry:build/cheng_registry/registry.jsonl
 ```
 
@@ -694,7 +694,7 @@ PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
 ### D. 计费与分润（RWAD 生态飞轮）
 - **cheng-lang 职责**：只生产可审计事件（租约、计量、回执、审计、欺诈、存储证明）与 epoch 结算批次。
 - **RWAD-blockchain 职责**：预算、积分核算、兑换率、队列积压、惩罚与状态滚动全部在链侧执行。
-- **对接方式**：`cheng_rwad_bridge.sh export/apply` + `cheng-rwad-settlement/v1` 契约，不在本仓实现积分↔RWAD算法。
+- **对接方式**：`cheng_rwad_bridge export/apply` + `cheng-rwad-settlement/v2` 契约，不在本仓实现积分↔RWAD算法。
 - **策略文档归属**：经济模型、参数治理与风控规则统一维护在 `RWAD-blockchain/docs`。
 
 ### E. 链上结算与 RWAD
@@ -749,14 +749,14 @@ PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
 
 ## 当前实现（MVP 起步）
 - 位置：`cheng/decentralized/*`（CID/租约/账本/本地存储 + libp2p P2P 入口 + 注册中心 + 计量/结算/审计 + 抽样/欺诈/信誉 + 执行请求/回执 + 计量 SDK）
-- 结算现状：账本事件仍写入 `ledger.jsonl`；`cheng-lang` 通过 `cheng_rwad_bridge.sh export/apply` 与 `RWAD-blockchain` 接口对接，不在本仓内执行积分↔RWAD兑换规则。
+- 结算现状：账本事件仍写入 `ledger.jsonl`；`cheng-lang` 通过 `cheng_rwad_bridge export/apply` 与 `RWAD-blockchain` 接口对接，不在本仓内执行积分↔RWAD兑换规则。
 - 接口契约：`export` 批次固定输出 `settlement_sha256`；`apply` 默认强校验 `result_schema/request_schema` 与批次状态。
 - 计算计量与执行请求新增 GPU 字段：`gpu_ms/gpu_mem_bytes/gpu_count/gpu_type/workload_kind` 与 GPU 价格字段，账本事件与 CLI 参数同步。
 - ledger 事件新增 `audit_sample`/`fraud_report`/`storage_proof`，用于抽样审计、作恶上报与存储证明记录。
 - CLI：
   - `src/tooling/cheng_storage.cheng`（存储 + 计量 + 结算 + 审计）
-  - `src/tooling/cheng_rwad_bridge.sh`（RWAD 接口导出/回执应用）
-  - `src/tooling/verify_rwad_interface_contract.sh`（跨仓接口契约验收）
+  - `sh src/tooling/tooling_exec.sh cheng_rwad_bridge`（RWAD 接口导出/回执应用）
+  - `sh src/tooling/tooling_exec.sh verify_rwad_interface_contract`（跨仓接口契约验收）
   - `src/tooling/cheng_registry.cheng`（通道注册中心）
   - `src/tooling/cheng_pkg.cheng`（manifest 解析与 resolve/lock/verify）
 - `--mode:p2p` 已接入 cheng-libp2p bitswap 的最小读写与 `serve`，用于点对点获取区块；可选从本地块目录预热 bitswap。
@@ -767,14 +767,14 @@ PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
 - IO shim（应用侧便捷 API）：新增 `cheng/decentralized/io_shim.cheng`，提供 `readFileAuto/writeFileAuto` 与 `ioLastError`，以及 `write*WithLease`（无 Result 样板）。
 - CLI put 对齐：`cheng_storage put` 使用 io_backend，支持租约写入时落账本，并遵循租约强制策略。
 - 新增 **租约 token 签名/校验**：`leasegen` 生成租约 token（含签名），`put --lease:<token>` 在写入前校验。
-- 新增跨仓闭环脚本：`src/tooling/demo_compute_settle.sh` 与 `src/tooling/verify_demo_compute_settle.sh` 覆盖 exec/meter/receipt/sample/audit/fraud/settle/bridge-export/bridge-apply。
+- 新增跨仓闭环脚本：`sh src/tooling/tooling_exec.sh demo_compute_settle` 与 `sh src/tooling/tooling_exec.sh verify_demo_compute_settle` 覆盖 exec/meter/receipt/sample/audit/fraud/settle/bridge-export/bridge-apply。
 
 CLI 示例：
 ```bash
 # 编译 CLI
-src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage
-src/tooling/chengc.sh src/tooling/cheng_registry.cheng --name:cheng_registry
-src/tooling/chengc.sh src/tooling/cheng_pkg.cheng --name:cheng_pkg
+sh src/tooling/tooling_exec.sh chengc src/tooling/cheng_storage.cheng --name:cheng_storage
+sh src/tooling/tooling_exec.sh chengc src/tooling/cheng_registry.cheng --name:cheng_registry
+sh src/tooling/tooling_exec.sh chengc src/tooling/cheng_pkg.cheng --name:cheng_pkg
 
 # 初始化存储目录
 ./cheng_storage init --root:build/cheng_storage --mode:local
@@ -794,17 +794,17 @@ src/tooling/chengc.sh src/tooling/cheng_pkg.cheng --name:cheng_pkg
 # ./cheng_storage cat --cid:<cid> --raw --root:build/cheng_storage --mode:local
 
 # 最小端到端示例（租约 -> 写入 -> 读取 -> 结算）
-# sh src/tooling/demo_io_lease.sh --mode:local --root:build/cheng_demo
-# sh src/tooling/demo_io_lease.sh --mode:p2p --root:build/cheng_demo --listen:/memory/1 --peer:/memory/1 --require-lease
+# sh src/tooling/tooling_exec.sh demo_io_lease --mode:local --root:build/cheng_demo
+# sh src/tooling/tooling_exec.sh demo_io_lease --mode:p2p --root:build/cheng_demo --listen:/memory/1 --peer:/memory/1 --require-lease
 # # 可选：--clean 清理 root，--reset-ledger 仅清理 ledger，--fail-without-lease 演示无租约写入失败
 # #      --regen-lease 强制重新生成租约 token（默认复用以便重复验收）
 # # p2p 模式要求至少提供 --listen 或 --peer
 # # demo 会同时展示 cat 与 cat --raw 的输出差异
-# # 验收脚本：sh src/tooling/verify_demo_io_lease.sh --mode:local --root:build/cheng_demo_verify
+# # 验收脚本：sh src/tooling/tooling_exec.sh verify_demo_io_lease --mode:local --root:build/cheng_demo_verify
 
 # 最小计算闭环示例（exec -> meter -> receipt -> sample/audit -> settle -> bridge-export -> bridge-apply）
-# sh src/tooling/demo_compute_settle.sh --mode:local --root:build/cheng_demo_compute
-# # 验收脚本：sh src/tooling/verify_demo_compute_settle.sh --mode:local --root:build/cheng_demo_compute_verify
+# sh src/tooling/tooling_exec.sh demo_compute_settle --mode:local --root:build/cheng_demo_compute
+# # 验收脚本：sh src/tooling/tooling_exec.sh verify_demo_compute_settle --mode:local --root:build/cheng_demo_compute_verify
 
 # P2P serve：监听并响应 bitswap 请求（默认处理 1 次，可用 --max 调整）
 ./cheng_storage serve --root:build/cheng_storage --mode:p2p --listen:/memory/1 --max:10
@@ -943,7 +943,7 @@ src/tooling/chengc.sh src/tooling/cheng_pkg.cheng --name:cheng_pkg
   --result:cid://... --epoch:1 --note:sample-checked --root:build/cheng_storage
 
 # 抽样生成审计清单（可选写入 ledger）
-./cheng_storage sample --epoch:1 --rate:0.05 --seed:round-1 --auditor:node:auditor-1 \
+./cheng_storage sample --epoch:1 --base-rate:0.10 --high-risk-rate:1.0 --risk-window-epochs:3 --seed:round-1 --auditor:node:auditor-1 \
   --ledger:build/cheng_storage/ledger.jsonl --format:json --out:build/cheng_storage/audit-sample.json --record
 
 # 上报欺诈/作恶线索
@@ -971,16 +971,16 @@ src/tooling/chengc.sh src/tooling/cheng_pkg.cheng --name:cheng_pkg
   --reconcile-csv:build/cheng_storage/reconcile-epoch-1.csv
 
 # 导出 RWAD 接口批次（由 RWAD-blockchain 执行积分/RWAD结算）
-sh src/tooling/cheng_rwad_bridge.sh export --epoch:1 --root:build/cheng_storage \
+sh src/tooling/tooling_exec.sh cheng_rwad_bridge export --epoch:1 --root:build/cheng_storage \
   --batch-id:cheng-epoch-1 --out:build/cheng_storage/rwad-batch-epoch-1.json
 
 # 应用 RWAD-blockchain 返回结果（状态与批次一致性校验）
-sh src/tooling/cheng_rwad_bridge.sh apply --result:build/cheng_storage/rwad-result-epoch-1.json \
+sh src/tooling/tooling_exec.sh cheng_rwad_bridge apply --result:build/cheng_storage/rwad-result-epoch-1.json \
   --batch:build/cheng_storage/rwad-batch-epoch-1.json \
   --batch-id:cheng-epoch-1 --require-status:finalized --out:build/cheng_storage/rwad-ack-epoch-1.json
 
 # 接口契约验收（不依赖 cheng_storage 写路径）
-sh src/tooling/verify_rwad_interface_contract.sh --rwad-root:/Users/lbcheng/.cheng-packages/RWAD-blockchain
+sh src/tooling/tooling_exec.sh verify_rwad_interface_contract --rwad-root:/Users/lbcheng/.cheng-packages/RWAD-blockchain
 
 # 结算输出包含 counts/audit_total/penalties：处罚金额会计入 treasury_total，并从 executors 扣减。
 # 结算输出包含 preview（top 列表，limit 可用 --top 控制；设为 0 可关闭）。

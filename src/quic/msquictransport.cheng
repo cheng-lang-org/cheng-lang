@@ -1,0 +1,101 @@
+# MsQUIC transport compatibility shim.
+# NOTE: This fallback maps MsQUIC stream semantics onto memory transport and
+# keeps datagram APIs as explicit stubs.
+
+import cheng/libp2p/utils/result
+import cheng/libp2p/utils/bytes
+import cheng/libp2p/utils/strings
+import cheng/libp2p/multiaddress
+import cheng/libp2p/stream/connection
+import cheng/libp2p/transports/memorytransport
+
+type
+    MsQuicSettings =
+        allowDatagram: bool
+        maxDatagram: int32
+        minimumMtu: int32
+        maximumMtu: int32
+        migrationEnabled: bool
+        ecnEnabled: bool
+
+    MsQuicTransport =
+        memory: MemoryTransport
+        settings: MsQuicSettings
+
+fn initMsQuicSettings(): MsQuicSettings =
+    MsQuicSettings(
+        allowDatagram: true,
+        maxDatagram: 65535,
+        minimumMtu: 1200,
+        maximumMtu: 0,
+        migrationEnabled: true,
+        ecnEnabled: false
+    )
+
+fn initMsQuicTransport(): MsQuicTransport =
+    MsQuicTransport(memory: initMemoryTransport(), settings: initMsQuicSettings())
+
+fn msquicTransportSettings(t: MsQuicTransport): MsQuicSettings =
+    return t.settings
+
+fn setMsQuicTransportSettings(t: var MsQuicTransport, settings: MsQuicSettings): Result[bool] =
+    if settings.maxDatagram < 0:
+        return Err[bool]("msquic: invalid maxDatagram")
+    if settings.minimumMtu < 0:
+        return Err[bool]("msquic: invalid minimumMtu")
+    if settings.maximumMtu < 0:
+        return Err[bool]("msquic: invalid maximumMtu")
+    t.settings = settings
+    return Ok[bool](true)
+
+fn start(t: var MsQuicTransport, addr: MultiAddress) =
+    var mem: MemoryTransport = t.memory
+    start(mem, addr)
+    t.memory = mem
+
+fn stop(t: var MsQuicTransport) =
+    var mem: MemoryTransport = t.memory
+    stop(mem)
+    t.memory = mem
+
+fn accept(t: var MsQuicTransport): Result[Connection] =
+    var mem: MemoryTransport = t.memory
+    let res: Result[Connection] = accept(mem)
+    t.memory = mem
+    return res
+
+fn dial(t: var MsQuicTransport, addr: MultiAddress): Result[Connection] =
+    var mem: MemoryTransport = t.memory
+    let res: Result[Connection] = dial(mem, addr)
+    t.memory = mem
+    return res
+
+fn handles(t: MsQuicTransport, addr: MultiAddress): bool =
+    t
+    let text: str = lpMultiAddressToString(addr)
+    if strContains(text, "/quic-v1"):
+        return true
+    return strContains(text, "/msquic")
+
+fn dropMsQuicPendingByPipe(t: MsQuicTransport, addr: MultiAddress, pipeIdx: int32): Result[bool] =
+    return dropMemoryPendingByPipe(t.memory, addr, pipeIdx)
+
+fn dropMsQuicConnectionsByPipe(pipeIdx: int32) =
+    pipeIdx
+
+fn msquicTransportDatagramWrite(t: MsQuicTransport, conn: var Connection, data: Bytes): Result[int32] =
+    t
+    conn
+    if ! t.settings.allowDatagram:
+        return Err[int32]("msquic: datagram disabled")
+    if bytesLen(data) <= 0:
+        return Ok[int32](0)
+    if t.settings.maxDatagram > 0 && bytesLen(data) > t.settings.maxDatagram:
+        return Err[int32]("msquic: datagram too large")
+    # Datagram fallback: no persistent queue, treat as accepted write.
+    return Ok[int32](bytesLen(data))
+
+fn msquicTransportDatagramRead(t: MsQuicTransport, conn: var Connection): Result[Bytes] =
+    t
+    conn
+    return Err[Bytes]("msquic: datagram queue empty")

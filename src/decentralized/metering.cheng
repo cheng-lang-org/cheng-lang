@@ -1,8 +1,12 @@
 import std/times
 import std/strings
+import std/strutils as strutil
 
 const
     BytesPerGb = 1024.0 * 1024.0 * 1024.0
+    WorkloadTrainAlpha = 1.35
+    WorkloadInferAlpha = 0.85
+    WorkloadOtherAlpha = 1.0
 
 type
     ComputeUsage =
@@ -52,16 +56,31 @@ fn computeUsageCost(usage: ComputeUsage): ComputeCost =
     let cpuCost: float64 = float64(usage.cpuMs) * usage.priceCpuMs
     let memCost: float64 = (float64(usage.memBytes) / (1024.0 * 1024.0 * 1024.0)) * usage.priceMemGb
     let ioCost: float64 = (float64(usage.ioBytes) / (1024.0 * 1024.0 * 1024.0)) * usage.priceIoGb
-    let gpuCost: float64 = float64(usage.gpuMs) * usage.priceGpuMs
+    let gpuCoreCost: float64 = float64(usage.gpuMs) * usage.priceGpuMs
     let gpuMemCost: float64 = (float64(usage.gpuMemBytes) / (1024.0 * 1024.0 * 1024.0)) * usage.priceGpuMemGb
-    cost.total = cpuCost + memCost + ioCost + gpuCost + gpuMemCost
+    let gpuAlphaCost: float64 = (gpuCoreCost + gpuMemCost) * workloadAlpha(usage.workloadKind)
+    cost.total = cpuCost + memCost + ioCost + gpuAlphaCost
     cost.royalty = cost.total * usage.royaltyRate
     cost.treasury = cost.total * usage.treasuryRate
     cost.executor = cost.total - cost.royalty - cost.treasury
     return cost
 
+fn workloadAlpha(workloadKindRaw: str): float64 =
+    let workloadKind = strutil.toLowerAscii(strutil.strip(workloadKindRaw))
+    if workloadKind == "train":
+        return WorkloadTrainAlpha
+    if workloadKind == "infer":
+        return WorkloadInferAlpha
+    return WorkloadOtherAlpha
+
 fn normalizeUsage(usage: ComputeUsage): ComputeUsage =
     var out = usage
+    if out.workloadKind == nil || len(out.workloadKind) == 0:
+        out.workloadKind = "other"
+    else:
+        out.workloadKind = strutil.toLowerAscii(strutil.strip(out.workloadKind))
+        if out.workloadKind != "train" && out.workloadKind != "infer" && out.workloadKind != "other":
+            out.workloadKind = "other"
     if out.startTs == nil || len(out.startTs) == 0:
         out.startTs = usageStartTs()
     if out.usageId == nil || len(out.usageId) == 0:

@@ -2,6 +2,8 @@ import cmdline
 import std/os
 import std/strutils as strutil
 import cheng/runtime/json_ast as json
+import cheng/decentralized/json_parse as jparse
+import std/tables_compat as tables
 import std/strings
 import cheng/decentralized/cid as dcid
 import cheng/decentralized/file_bytes as fbytes
@@ -13,6 +15,7 @@ import cheng/decentralized/settlement as dsettle
 import cheng/decentralized/audit as daudit
 import cheng/decentralized/exec_request as dexec
 import cheng/decentralized/exec_receipt as dreceipt
+import cheng/decentralized/market_match as dmatch
 import cheng/decentralized/runtime as druntime
 import cheng/decentralized/audit_sampling as dsample
 import cheng/decentralized/fraud_report as dfraud
@@ -58,6 +61,8 @@ fn printUsage() =
     printLine("         [--price_cpu:<f>] [--price_mem:<f>] [--price_io:<f>] [--price_gpu:<f>] [--price_gpu_mem:<f>]")
     printLine("         [--royalty:<f>] [--treasury:<f>] [--epoch:<n>] [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
     printLine("  exec   --task:<id> --package:<id> --author:<id> --requester:<id>")
+    printLine("         [--executor:<id>] [--orderbook:<path>]")
+    printLine("         [--risk-window-epochs:<n>]")
     printLine("         [--input:<cid>] [--code:<cid>] [--args:<cid>] [--cpu_ms:<n>] [--mem_bytes:<n>] [--io_bytes:<n>]")
     printLine("         [--gpu_ms:<n>] [--gpu_mem_bytes:<n>] [--gpu_count:<n>] [--gpu_type:<text>]")
     printLine("         [--workload:<train|infer|other>]")
@@ -71,7 +76,8 @@ fn printUsage() =
     printLine("         [--ledger:<path>] [--root:<dir>] [--mode:local|p2p]")
     printLine("  settle --epoch:<n> [--ledger:<path>] [--root:<dir>] [--out:<file>]")
     printLine("         [--format:toml|yaml|json] [--top:<n>] [--reconcile-csv:<file>]")
-    printLine("  sample --ledger:<path> [--epoch:<n>] [--rate:<f>] [--seed:<text>]")
+    printLine("  sample --ledger:<path> [--epoch:<n>] [--base-rate:<f>] [--high-risk-rate:<f>]")
+    printLine("         [--risk-window-epochs:<n>] [--seed:<text>]")
     printLine("         [--auditor:<id>] [--record] [--out:<file>] [--format:toml|yaml|json]")
     printLine("  fraud  --task:<id> --executor:<id> --reporter:<id> [--request:<id>] [--receipt:<id>]")
     printLine("         [--reason:<text>] [--evidence:<cid>] [--severity:<low|medium|high>]")
@@ -688,6 +694,9 @@ fn cmdExec(argsStart: int32, count: int32): int32 =
     let root = parseRootArg(argsStart, count)
     let ledgerPath = parseLedgerArg(argsStart, count, root)
     let mode = parseModeArg(argsStart, count)
+    var explicitExecutor: str = ""
+    var orderbookPath = os.joinPath(os.absolutePath(root), "orderbook.json")
+    var riskWindowEpochs: int32 = 3
     var req: dexec.ExecRequest = dexec.ExecRequest()
     req.priceCpuMs = 0.0
     req.priceMemGb = 0.0
@@ -706,6 +715,12 @@ fn cmdExec(argsStart: int32, count: int32): int32 =
             req.authorId = strings.dropPrefix(arg, "--author:")
         elif strutil.startsWith(arg, "--requester:"):
             req.requesterId = strings.dropPrefix(arg, "--requester:")
+        elif strutil.startsWith(arg, "--executor:"):
+            explicitExecutor = strings.dropPrefix(arg, "--executor:")
+        elif strutil.startsWith(arg, "--orderbook:"):
+            orderbookPath = strings.dropPrefix(arg, "--orderbook:")
+        elif strutil.startsWith(arg, "--risk-window-epochs:"):
+            riskWindowEpochs = int32(parseInt64(strings.dropPrefix(arg, "--risk-window-epochs:")))
         elif strutil.startsWith(arg, "--input:"):
             req.inputCid = strings.dropPrefix(arg, "--input:")
         elif strutil.startsWith(arg, "--code:"):
@@ -752,6 +767,19 @@ fn cmdExec(argsStart: int32, count: int32): int32 =
     if req.requesterId == nil || len(req.requesterId) == 0:
         printErr("exec: missing --requester")
         return 1
+    if explicitExecutor != nil && len(explicitExecutor) > 0:
+        req.executorId = explicitExecutor
+        req.selectionSource = "explicit"
+    else:
+        let matchRes = dmatch.chooseExecutor(orderbookPath, ledgerPath, req, riskWindowEpochs)
+        if ! matchRes.ok:
+            printErr("exec: orderbook match failed: " + matchRes.reason)
+            return 1
+        req.executorId = matchRes.peerId
+        req.expectedCostNano = matchRes.expectedCostNano
+        req.selectedFraudScore = matchRes.fraudScore
+        req.selectedBandwidthOutBytes = matchRes.bandwidthOutBytes
+        req.selectionSource = "orderbook"
     req.ts = dexec.execRequestTs()
     req = dexec.normalizeExecRequest(req)
     if ! dledger.appendExecRequestEventWithMode(ledgerPath, req, druntime.storageModeText(mode)):
@@ -852,84 +880,22 @@ fn cmdAudit(argsStart: int32, count: int32): int32 =
     return 0
 
 fn cmdSettle(argsStart: int32, count: int32): int32 =
-    parseRootArg(argsStart, count)
-    parseLedgerArg(argsStart, count, "")
-    parseEpochArg(argsStart, count)
+    let root = parseRootArg(argsStart, count)
+    let ledgerPath = parseLedgerArg(argsStart, count, root)
+    let epoch = parseEpochArg(argsStart, count)
     let outPath = parseOutArg(argsStart, count)
     let reconcileCsvPath = parseReconcileCsvArg(argsStart, count)
     let format = parseFormatArg(argsStart, count, "json")
     let topN = parseTopArg(argsStart, count, 10)
+    let settle = dsettle.settleLedger(ledgerPath, epoch)
     var text: str = ""
     if format == "toml" || format == "":
-        text = "epoch = -1\n"
-        text = text + "storage_total = 0\n"
-        text = text + "compute_total = 0\n"
-        text = text + "audit_total = 0\n"
-        text = text + "treasury_total = 0\n\n"
-        text = text + "[counts]\n"
-        text = text + "lease = 0\n"
-        text = text + "compute = 0\n"
-        text = text + "audit = 0\n"
-        text = text + "exec_request = 0\n"
-        text = text + "exec_receipt = 0\n\n"
-        text = text + "[payouts.authors]\n\n"
-        text = text + "[payouts.providers]\n\n"
-        text = text + "[payouts.executors]\n\n"
-        text = text + "[payouts.penalties]\n\n"
-        text = text + "[trust]\n"
-        text = text + "audit_sample_count = 0\n"
-        text = text + "fraud_report_count = 0\n"
-        text = text + "storage_proof_count = 0\n"
-        text = text + "storage_proof_missing_count = 0\n\n"
-        text = text + "[trust.fraud_by_executor]\n\n"
-        text = text + "[trust.storage_ok_by_provider]\n\n"
-        text = text + "[trust.storage_missing_by_provider]\n\n"
-        text = text + "[reconcile]\n"
-        text = text + "limit = " + intToStr(topN) + "\n"
-        text = text + "missing_receipt_count = 0\n"
-        text = text + "orphan_receipt_count = 0\n"
-        text = text + "missing_usage_count = 0\n"
-        text = text + "unreferenced_usage_count = 0\n"
-        text = text + "bad_receipt_count = 0\n"
-        text = text + "request_epoch_mismatch_count = 0\n"
-        text = text + "usage_epoch_mismatch_count = 0\n"
-        text = text + "missing_receipt = []\n"
-        text = text + "unreferenced_usage = []\n\n"
-        text = text + "[preview]\n"
-        text = text + "limit = " + intToStr(topN) + "\n"
+        text = dsettle.settlementToToml(settle, topN)
     elif format == "yaml" || format == "yml":
-        text = "epoch: -1\n"
-        text = text + "storage_total: 0\n"
-        text = text + "compute_total: 0\n"
-        text = text + "audit_total: 0\n"
-        text = text + "treasury_total: 0\n"
-        text = text + "counts:\n"
-        text = text + "  lease: 0\n"
-        text = text + "  compute: 0\n"
-        text = text + "  audit: 0\n"
-        text = text + "  exec_request: 0\n"
-        text = text + "  exec_receipt: 0\n"
-        text = text + "trust:\n"
-        text = text + "  audit_sample_count: 0\n"
-        text = text + "  fraud_report_count: 0\n"
-        text = text + "  storage_proof_count: 0\n"
-        text = text + "  storage_proof_missing_count: 0\n"
-        text = text + "reconcile:\n"
-        text = text + "  limit: " + intToStr(topN) + "\n"
-        text = text + "preview:\n"
-        text = text + "  limit: " + intToStr(topN) + "\n"
+        text = dsettle.settlementToYaml(settle, topN)
     elif format == "json":
-        text = "{\"epoch\":-1"
-        text = text + ",\"storage_total\":0"
-        text = text + ",\"compute_total\":0"
-        text = text + ",\"audit_total\":0"
-        text = text + ",\"treasury_total\":0"
-        text = text + ",\"counts\":{\"lease\":0,\"compute\":0,\"audit\":0,\"exec_request\":0,\"exec_receipt\":0}"
-        text = text + ",\"payouts\":{\"authors\":{},\"providers\":{},\"executors\":{},\"penalties\":{}}"
-        text = text + ",\"trust\":{\"audit_sample_count\":0,\"fraud_report_count\":0,\"storage_proof_count\":0,\"storage_proof_missing_count\":0,\"fraud_by_executor\":{},\"storage_ok_by_provider\":{},\"storage_missing_by_provider\":{}}"
-        text = text + ",\"reconcile\":{\"limit\":" + intToStr(topN)
-        text = text + ",\"missing_receipt_count\":0,\"orphan_receipt_count\":0,\"missing_usage_count\":0,\"unreferenced_usage_count\":0,\"bad_receipt_count\":0,\"request_epoch_mismatch_count\":0,\"usage_epoch_mismatch_count\":0,\"missing_receipt\":[],\"unreferenced_usage\":[]}"
-        text = text + ",\"preview\":{\"limit\":" + intToStr(topN) + "}}"
+        let node = dsettle.settlementToJson(settle, topN)
+        text = json.pretty(node)
     else:
         printErr("settle: unknown format")
         return 1
@@ -941,7 +907,7 @@ fn cmdSettle(argsStart: int32, count: int32): int32 =
     else:
         printLine(text)
     if reconcileCsvPath != nil && len(reconcileCsvPath) > 0:
-        let csvText = "kind,id,issue\n"
+        let csvText = dsettle.settlementReconcileCsv(settle, topN)
         let dir = os.parentDir(reconcileCsvPath)
         if dir != nil && len(dir) > 0 && ! os.dirExists(dir):
             os.createDir(dir)
@@ -954,21 +920,38 @@ fn cmdSample(argsStart: int32, count: int32): int32 =
     let epoch = parseEpochArg(argsStart, count)
     let outPath = parseOutArg(argsStart, count)
     let format = parseFormatArg(argsStart, count, "json")
-    var rate: float64 = 0.05
+    var baseRate: float64 = 0.10
+    var highRiskRate: float64 = 1.0
+    var riskWindowEpochs: int32 = 3
     var seed: str = ""
     var auditorId: str = "system"
     var record = false
     for i in argsStart..count:
         let arg = cmdline.paramStr(i)
-        if strutil.startsWith(arg, "--rate:"):
-            rate = parseFloat64(strings.dropPrefix(arg, "--rate:"))
+        if strutil.startsWith(arg, "--base-rate:"):
+            baseRate = parseFloat64(strings.dropPrefix(arg, "--base-rate:"))
+        elif strutil.startsWith(arg, "--high-risk-rate:"):
+            highRiskRate = parseFloat64(strings.dropPrefix(arg, "--high-risk-rate:"))
+        elif strutil.startsWith(arg, "--risk-window-epochs:"):
+            riskWindowEpochs = int32(parseInt64(strings.dropPrefix(arg, "--risk-window-epochs:")))
+        elif strutil.startsWith(arg, "--rate:"):
+            printErr("sample: --rate has been removed, use --base-rate and --high-risk-rate")
+            return 1
         elif strutil.startsWith(arg, "--seed:"):
             seed = strings.dropPrefix(arg, "--seed:")
         elif strutil.startsWith(arg, "--auditor:"):
             auditorId = strings.dropPrefix(arg, "--auditor:")
         elif arg == "--record":
             record = true
-    let samples = dsample.sampleReceipts(ledgerPath, epoch, rate, seed, auditorId)
+    let samples = dsample.sampleReceipts(
+        ledgerPath,
+        epoch,
+        baseRate,
+        highRiskRate,
+        riskWindowEpochs,
+        seed,
+        auditorId
+    )
     var text: str = ""
     if format == "toml" || format == "":
         text = dsample.samplesToToml(samples)
@@ -991,6 +974,13 @@ fn cmdSample(argsStart: int32, count: int32): int32 =
         for j in 0..<samples.len:
             dledger.appendAuditSampleEvent(ledgerPath, samples[j])
     return 0
+
+fn fraudSeverityWeight(severity: str): float64 =
+    if severity == "low":
+        return 0.1
+    if severity == "medium":
+        return 0.5
+    return 1.0
 
 fn cmdFraud(argsStart: int32, count: int32): int32 =
     let root = parseRootArg(argsStart, count)
@@ -1025,11 +1015,92 @@ fn cmdFraud(argsStart: int32, count: int32): int32 =
     if ev.reporterId == nil || len(ev.reporterId) == 0:
         printErr("fraud: missing --reporter")
         return 1
+    if (ev.requestId == nil || len(ev.requestId) == 0) && (ev.receiptId == nil || len(ev.receiptId) == 0):
+        printErr("fraud: missing --request or --receipt")
+        return 1
+
+    var requestTaskById: tables.Table[str] = tables.TableInit[str](256)
+    var receiptRequestById: tables.Table[str] = tables.TableInit[str](256)
+    var receiptTaskById: tables.Table[str] = tables.TableInit[str](256)
+    var receiptExecutorById: tables.Table[str] = tables.TableInit[str](256)
+    var requestReceiptCount: tables.Table[int32] = tables.TableInit[int32](256)
+    var requestExecutorSeen: tables.Table[int32] = tables.TableInit[int32](256)
+
+    if os.fileExists(ledgerPath):
+        let content = os.readFile(ledgerPath)
+        if content != nil && len(content) > 0:
+            let lines = strutil.split(content, '\n')
+            for i in 0..<lines.len:
+                let line = strutil.strip(lines[i])
+                if line == nil || len(line) == 0:
+                    continue
+                let parsed: jparse.ParseResult = jparse.parseJsonSafe(line)
+                if ! parsed.ok:
+                    continue
+                let node: json.JsonNode = parsed.value
+                let kind = jparse.getStringField(node, "type", "")
+                if kind == "exec_request":
+                    let reqId = jparse.getStringField(node, "request_id", "")
+                    let taskId = jparse.getStringField(node, "task_id", "")
+                    if reqId != nil && len(reqId) > 0:
+                        tables.TablePut[str](requestTaskById, reqId, taskId)
+                elif kind == "exec_receipt":
+                    let receiptId = jparse.getStringField(node, "receipt_id", "")
+                    let reqId = jparse.getStringField(node, "request_id", "")
+                    let taskId = jparse.getStringField(node, "task_id", "")
+                    let executorId = jparse.getStringField(node, "executor_id", "")
+                    if receiptId != nil && len(receiptId) > 0:
+                        tables.TablePut[str](receiptRequestById, receiptId, reqId)
+                        tables.TablePut[str](receiptTaskById, receiptId, taskId)
+                        tables.TablePut[str](receiptExecutorById, receiptId, executorId)
+                    if reqId != nil && len(reqId) > 0:
+                        tables.TablePut[int32](requestReceiptCount, reqId, tables.TableGet[int32](requestReceiptCount, reqId) + 1)
+                        if executorId != nil && len(executorId) > 0:
+                            let key = reqId + "|" + executorId
+                            tables.TablePut[int32](requestExecutorSeen, key, 1)
+
+    if ev.requestId != nil && len(ev.requestId) > 0:
+        if ! tables.TableHas[str](requestTaskById, ev.requestId):
+            printErr("fraud: request not found in ledger")
+            return 1
+        let reqTask = tables.TableGet[str](requestTaskById, ev.requestId)
+        if reqTask != nil && len(reqTask) > 0 && reqTask != ev.taskId:
+            printErr("fraud: request/task mismatch")
+            return 1
+        if tables.TableHas[int32](requestReceiptCount, ev.requestId):
+            let execKey = ev.requestId + "|" + ev.executorId
+            if ! tables.TableHas[int32](requestExecutorSeen, execKey):
+                printErr("fraud: request/executor mismatch")
+                return 1
+
+    if ev.receiptId != nil && len(ev.receiptId) > 0:
+        if ! tables.TableHas[str](receiptRequestById, ev.receiptId):
+            printErr("fraud: receipt not found in ledger")
+            return 1
+        let recReqId = tables.TableGet[str](receiptRequestById, ev.receiptId)
+        let recTaskId = tables.TableGet[str](receiptTaskById, ev.receiptId)
+        let recExecutorId = tables.TableGet[str](receiptExecutorById, ev.receiptId)
+        if ev.requestId == nil || len(ev.requestId) == 0:
+            ev.requestId = recReqId
+        elif ev.requestId != recReqId:
+            printErr("fraud: request/receipt mismatch")
+            return 1
+        if recTaskId != nil && len(recTaskId) > 0 && ev.taskId != recTaskId:
+            printErr("fraud: task/receipt mismatch")
+            return 1
+        if recExecutorId != nil && len(recExecutorId) > 0 && ev.executorId != recExecutorId:
+            printErr("fraud: executor/receipt mismatch")
+            return 1
+
     ev = dfraud.normalizeFraudReport(ev)
+    if ev.severity != "low" && ev.severity != "medium" && ev.severity != "high":
+        printErr("fraud: invalid --severity (expected low|medium|high)")
+        return 1
+    let severityWeight = fraudSeverityWeight(ev.severity)
     if ! dledger.appendFraudReportEvent(ledgerPath, ev):
         printErr("fraud: failed to write ledger")
         return 1
-    printLine("fraud ok: " + ev.reportId)
+    printLine("fraud ok: " + ev.reportId + " severity_weight=" + $ severityWeight)
     return 0
 
 fn cmdRateLimit(argsStart: int32, count: int32): int32 =
