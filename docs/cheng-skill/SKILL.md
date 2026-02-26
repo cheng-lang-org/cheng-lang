@@ -54,6 +54,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - `for ... in ...` 的 `in` 表达式支持：range 字面值（`a..<b` / `a..b`）、数组/Table/HashMap 的字面值、常量与变量；Table/HashMap 支持 `for k, v in tableOrMap` 键值迭代。
 - 带类型标注可省略初始化并走隐式默认值；`default[T]` 仅用于表达式/返回/实参位置。
 - 隐式默认值速记：`bool=false`，整数/枚举=0，浮点=0.0，`char='\0'`，`str/cstring=""`，指针/`ref`/`var`/`void*`=`nil`，复合类型为 zero-init。
+- 字符串 nil 规则（稳定口径）：`str = nil`、`let/var x: str = nil`、`x == nil`、`x != nil` 均在编译阶段报错；`str` 判空请写 `len(s) == 0` / `len(s) > 0`。仅 `cstring`（C ABI 指针语义）保留 `nil` 比较。
 - 符号重载分发是**编译期静态分发**：按静态类型/泛型实例化选定目标；不做运行时动态分派。
 - 下标赋值优先级：`a[b] = v` 优先匹配 ``[]=``；读取 `a[b]` 走 ``[]``（或内建容器 lowering）。
 - 当前常用容器的 `[]/[]=`（`str`、`T[]`、`T[N]`、`HashMap`、`JsonNode`、`Table` 等）要求编译期可确定分派目标（静态分发，且带边界检查）。

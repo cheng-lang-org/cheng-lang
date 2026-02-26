@@ -1,5 +1,5 @@
 # Backend UIR driver: host-only darwin/arm64 build UIR -> machine obj/exe.
-import std/[cmdline, seqs, strings, os, result, hashmaps, monotimes, bytes, tables]
+import std/[cmdline, seqs, strings, os, result, hashmaps, monotimes, bytes]
 import backend/uir/uir_types
 import backend/uir/uir_builder
 import backend/uir/uir_codegen
@@ -62,14 +62,8 @@ type
     DriverRowU64 = ref
         values: DriverSeqU64
     DriverSeqSeqU64 = DriverRowU64[]
-    # Driver-local table layout keeps caching/indexing deterministic without
-    # relying on std/table internal field shapes.
-    DriverTableInt64 =
-        keys: str[]
-        vals: int64[]
-        states: uint8[]
-        len: int32
     # Common string -> int map alias for driver-owned indexes.
+    DriverTableInt64 = hashmaps.HashMapStrInt
     DriverMapStrInt = DriverTableInt64
 
 type
@@ -278,192 +272,14 @@ fn driver_strSliceEq(s: str, start: int32, endExclusive: int32, needle: str): bo
             return false
     return true
 
-# Stage1/self-link fallback symbols for concrete Table[int64] helpers.
-fn tableReadStrSlot(keys: str[], idx: int32): str =
-    if idx < 0 || idx >= keys.len || keys.buffer == nil:
-        return ""
-    let off: int32 = idx * int32(sizeof str)
-    let p: str* = str*(driver_ptr_add(keys.buffer, off))
-    return *p
-
-fn tableWriteStrSlot(keys: str[]*, idx: int32, key: str) =
-    if keys == nil || idx < 0 || idx >= keys->len || keys->buffer == nil:
-        return
-    let off: int32 = idx * int32(sizeof str)
-    let p: str* = str*(driver_ptr_add(keys->buffer, off))
-    *p = key
-
-fn tableReadI64Slot(vals: int64[], idx: int32): int64 =
-    if idx < 0 || idx >= vals.len || vals.buffer == nil:
-        return int64(0)
-    let off: int32 = idx * int32(sizeof int64)
-    let p: int64* = int64*(driver_ptr_add(vals.buffer, off))
-    return *p
-
-fn tableWriteI64Slot(vals: int64[]*, idx: int32, val: int64) =
-    if vals == nil || idx < 0 || idx >= vals->len || vals->buffer == nil:
-        return
-    let off: int32 = idx * int32(sizeof int64)
-    let p: int64* = int64*(driver_ptr_add(vals->buffer, off))
-    *p = val
-
-fn tableReadStateSlot(states: uint8[], idx: int32): uint8 =
-    if idx < 0 || idx >= states.len || states.buffer == nil:
-        return uint8(0)
-    let p: uint8* = uint8*(driver_ptr_add(states.buffer, idx))
-    return *p
-
-fn tableWriteStateSlot(states: uint8[]*, idx: int32, st: uint8) =
-    if states == nil || idx < 0 || idx >= states->len || states->buffer == nil:
-        return
-    let p: uint8* = uint8*(driver_ptr_add(states->buffer, idx))
-    *p = st
-
-fn tableHashStr(s: str): int32 =
-    var h: int32 = 0
-    if s == nil:
-        return 0
-    let n: int32 = len(s)
-    for i in 0..<n:
-        let code: int32 = int32(s[i])
-        h = h + code
-        h = h + (h << 10)
-        h = h ^ (h >> 6)
-    h = h + (h << 3)
-    h = h ^ (h >> 11)
-    h = h + (h << 15)
-    return h
-
-fn tableRoundUpPow2(x0: int32): int32 =
-    var x: int32 = x0
-    if x <= 1:
-        return 1
-    x = x - 1
-    x = x | (x >> 1)
-    x = x | (x >> 2)
-    x = x | (x >> 4)
-    x = x | (x >> 8)
-    x = x | (x >> 16)
-    x = x + 1
-    return x
-
-fn tableInitCap(initialCap: int32): int32 =
-    var cap: int32 = initialCap
-    if cap < 8:
-        cap = 8
-    return tableRoundUpPow2(cap)
-
 fn driver_hashMapStrIntInit(initialCap: int32 = 64): DriverMapStrInt =
-    return TableInit_int64(initialCap)
+    return hashmaps.hashMapStrIntInit(initialCap)
 
 fn driver_hashMapStrIntPut(m: var DriverMapStrInt, key: str, val: int32) =
-    TablePut_int64(m, key, int64(val))
+    hashmaps.hashMapStrIntPut(m, key, val)
 
 fn driver_hashMapStrIntGet(m: var DriverMapStrInt, key: str, found: var bool): int32 =
-    found = TableHas_int64(m, key)
-    if !found:
-        return 0
-    return int32(TableGet_int64(m, key))
-
-fn TableInit_int64(initialCap: int32 = 64): DriverTableInt64 =
-    let cap: int32 = tableInitCap(initialCap)
-    var keys: str[cap]
-    var vals: int64[cap]
-    var states: uint8[cap]
-    keys.len = cap
-    vals.len = cap
-    states.len = cap
-    var out: DriverTableInt64
-    out.keys = keys
-    out.vals = vals
-    out.states = states
-    out.len = 0
-    return out
-
-fn tableFindSlotI64(t: DriverTableInt64, key: str, allowInsert: bool): int32 =
-    let cap: int32 = t.keys.len
-    if cap <= 0 || key == nil:
-        return -1
-    var probe: int32 = (tableHashStr(key) & 0x7fffffff) % cap
-    for _ in 0..<cap:
-        let st: uint8 = tableReadStateSlot(t.states, probe)
-        if st == uint8(0):
-            if allowInsert:
-                return probe
-            return -1
-        if st == uint8(1) && tableReadStrSlot(t.keys, probe) == key:
-            return probe
-        probe = probe + 1
-        if probe >= cap:
-            probe = 0
-    return -1
-
-fn tableFindSlotMutI64(t: var DriverTableInt64, key: str, allowInsert: bool): int32 =
-    let cap: int32 = t.keys.len
-    if cap <= 0 || key == nil:
-        return -1
-    var probe: int32 = (tableHashStr(key) & 0x7fffffff) % cap
-    for _ in 0..<cap:
-        let st: uint8 = tableReadStateSlot(t.states, probe)
-        if st == uint8(0):
-            if allowInsert:
-                return probe
-            return -1
-        if st == uint8(1) && tableReadStrSlot(t.keys, probe) == key:
-            return probe
-        probe = probe + 1
-        if probe >= cap:
-            probe = 0
-    return -1
-
-fn tableGrowI64(t: var DriverTableInt64) =
-    let oldKeys: str[] = t.keys
-    let oldVals: int64[] = t.vals
-    let oldStates: uint8[] = t.states
-    let oldCap: int32 = oldKeys.len
-
-    var growCap: int32 = oldCap * 2
-    if growCap < 8:
-        growCap = 8
-    var nt: DriverTableInt64 = TableInit_int64(growCap)
-
-    for i in 0..<oldCap:
-        if tableReadStateSlot(oldStates, i) == uint8(1):
-            let k: str = tableReadStrSlot(oldKeys, i)
-            let slot: int32 = tableFindSlotMutI64(nt, k, true)
-            if slot >= 0:
-                tableWriteStrSlot(&nt.keys, slot, k)
-                tableWriteI64Slot(&nt.vals, slot, tableReadI64Slot(oldVals, i))
-                tableWriteStateSlot(&nt.states, slot, uint8(1))
-                nt.len = nt.len + 1
-
-    t = nt
-
-fn TableHas_int64(t: DriverTableInt64, key: str): bool =
-    let slot: int32 = tableFindSlotI64(t, key, false)
-    return slot >= 0
-
-fn TableGet_int64(t: DriverTableInt64, key: str): int64 =
-    let slot: int32 = tableFindSlotI64(t, key, false)
-    if slot < 0:
-        return int64(0)
-    return tableReadI64Slot(t.vals, slot)
-
-fn TablePut_int64(t: var DriverTableInt64, key: str, val: int64) =
-    if key == nil:
-        return
-    if t.keys.len <= 0:
-        t = TableInit_int64(64)
-    if (t.len + 1) * 10 >= t.keys.len * 7:
-        tableGrowI64(t)
-    let slot: int32 = tableFindSlotMutI64(t, key, true)
-    if slot < 0:
-        return
-    if tableReadStateSlot(t.states, slot) != uint8(1):
-        t.len = t.len + 1
-        tableWriteStateSlot(&t.states, slot, uint8(1))
-    tableWriteStrSlot(&t.keys, slot, key)
-    tableWriteI64Slot(&t.vals, slot, val)
+    return hashmaps.hashMapStrIntGet(m, key, found)
 
 fn driver_flagsHasToken(flags: str, token: str): bool =
     if flags == nil || token == nil:
@@ -503,8 +319,8 @@ fn driver_strStripPrefix(s: str, prefix: str): str =
     return str(driver_ptr_add(void*(s), off))
 
 fn driver_joinDir(dir: str, name: str): str =
-    if dir == nil || len(dir) == 0:
-        if name == nil || len(name) == 0:
+    if len(dir) == 0:
+        if len(name) == 0:
             return ""
         return "" + name
     return dir + "/" + name
@@ -560,9 +376,6 @@ fn driver_panicResult_bool(res: Result[bool]) =
 fn driver_panicResult_seq_uint8(res: Result[uint8[]]) =
     let _unused: Result[uint8[]] = res
     driver_panic("backend_driver: bytes result error")
-
-fn Err_DriverModuleCache(err: str): Result[DriverModuleCache] =
-    return Err[DriverModuleCache](err)
 
 fn driver_parseInt32Default(s: str, defaultValue: int32): int32 =
     if driver_strIsEmpty(s):
@@ -981,7 +794,7 @@ fn driver_isPathLikeExe(s: str): bool =
     return driver_strContains(s, "/") || driver_strContains(s, "\\")
 
 fn driver_pathIsAbsolute(path: str): bool =
-    if path == nil || len(path) == 0:
+    if len(path) == 0:
         return false
     let c0: char = path[0]
     if c0 == '/' || c0 == '\\':
@@ -991,7 +804,7 @@ fn driver_pathIsAbsolute(path: str): bool =
     return false
 
 fn driver_pathAbsolute(path: str): str =
-    if path == nil || len(path) == 0:
+    if len(path) == 0:
         return ""
     if driver_pathIsAbsolute(path):
         return path
@@ -1001,7 +814,7 @@ fn driver_pathAbsolute(path: str): str =
     return os.joinPath(cwd, path)
 
 fn driver_resolveSelfExeForParallel(raw: str): str =
-    if raw == nil || len(raw) == 0:
+    if len(raw) == 0:
         return ""
     if driver_isPathLikeExe(raw):
         let abs: str = driver_pathAbsolute(raw)
@@ -2157,13 +1970,13 @@ fn driver_buildUnitIndex(full: UirModule, unitFiles: str[]): DriverUnitIndex =
     for fi in 0..<nfuncs:
         let f: UirFunc = uir_types.uirModuleFuncAt(full, fi)
         let fname: str = (f != nil) ? uir_types.uirFuncNameOf(f) : nil
-        if fname != nil && len(fname) > 0:
+        if len(fname) > 0:
             var exists: bool = false
             let _seenNameToFunc: int32 = driver_hashMapStrIntGet(nameToFuncIdxMap, fname, exists)
             if ! exists:
                 driver_hashMapStrIntPut(nameToFuncIdxMap, fname, fi)
         let flink: str = (f != nil) ? uir_types.uirFuncLinkNameOf(f) : nil
-        if flink != nil && len(flink) > 0:
+        if len(flink) > 0:
             var hasLink: bool = false
             let _seenNameToFuncLink: int32 = driver_hashMapStrIntGet(nameToFuncIdxMap, flink, hasLink)
             if !hasLink:
@@ -2434,8 +2247,10 @@ fn driver_cacheReadModule(cr: DriverCacheReader*, strings: str[]): UirModule =
 fn driver_cacheReadUnitIndex(cr: DriverCacheReader*, strings: str[], module: UirModule): DriverUnitIndex =
     return nil
 
-fn driver_loadModuleCache(path: str, expectedCompileStampHash: int64): Result[DriverModuleCache] =
-    return Err[DriverModuleCache]("module cache disabled")
+fn driver_loadModuleCache(path: str, expectedCompileStampHash: int64): DriverModuleCache =
+    let _path: str = path
+    let _expectedCompileStampHash: int64 = expectedCompileStampHash
+    return nil
 
 fn driver_moduleCacheToUnitIndex(cache: DriverModuleCache): DriverUnitIndex =
     if cache == nil:

@@ -631,6 +631,11 @@ charLiteral    ::= `'` CHARACTER `'` ;
   - `T*`/`ref T`/`var T`/`void*` -> `nil`
   - 复合类型（`tuple/object/T[]/T[N]/Table/...` 等）-> 该类型的零值（zero-init）；其中 `T[]/T[N]` 的零值为“空序列”（`len=0 cap=0 buffer=nil`）
 - 字符串类型命名约束：内建字符串类型仅 `str` 与 `cstring`；`string` 不属于内建类型名，生产代码不应使用。
+- 字符串 nil 语义（稳定口径）：
+  - `str` 省略初始化默认 `""`。
+  - `str = nil`、`let/var x: str = nil`、`x == nil`、`x != nil` 在编译阶段直接报错。
+  - `str` 判空请显式写 `len(s) == 0` 或 `len(s) > 0`。
+  - `cstring` 作为 C ABI 指针语义保留 `nil` 比较（`== nil` / `!= nil`）。
 - 实现约束：编译器后端前端统一按 `stage1` 口径处理（旧前端别名已移除），并会显式拒绝 `string`（报错提示改用 `str`/`cstring`）。
 - 类型表达式允许点限定名 `Module.Type` 用于消歧；语义等价于 `Type`，模块前缀在语义/后端 lowering 时消解。
 - `default[T]` 仅用于表达式/返回/实参位置；禁止写 `let/var/const x: T = default[T]`，应省略初始化表达式。
