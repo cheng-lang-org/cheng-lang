@@ -5,14 +5,14 @@ import std/seqs
 import std/strings
 import std/strutils
 
-fn lowerAscii(s: str): str =
+fn uirCoreOpt2LowerAscii(s: str): str =
     return strutils.toLowerAscii(s)
 
 fn uirCoreOpt2ParseBoolEnv(name: str, defaultValue: bool): bool =
     let raw: str = os.getEnvDefault(name, "")
     if len(raw) == 0:
         return defaultValue
-    let s: str = lowerAscii(raw)
+    let s: str = uirCoreOpt2LowerAscii(raw)
     if s == "1" || s == "true" || s == "yes" || s == "on":
         return true
     if s == "0" || s == "false" || s == "no" || s == "off":
@@ -326,7 +326,7 @@ fn uirCoreOpt2TermKey(term: UirCoreTerm): str =
     return "term"
 
 fn uirCoreOpt2FindBlockIndex(func: UirCoreFunc, label: str): int32 =
-    if func == nil || label == nil:
+    if func == nil || len(label) == 0:
         return -1
     for i in 0..<func.blocks.len:
         let blk: UirCoreBlock = func.blocks[i]
@@ -335,7 +335,7 @@ fn uirCoreOpt2FindBlockIndex(func: UirCoreFunc, label: str): int32 =
     return -1
 
 fn uirCoreOpt2RewriteTargets(func: UirCoreFunc, fromLabel: str, toLabel: str): bool =
-    if func == nil || fromLabel == nil || toLabel == nil || fromLabel == toLabel:
+    if func == nil || len(fromLabel) == 0 || len(toLabel) == 0 || fromLabel == toLabel:
         return false
     var changed: bool = false
     for bi in 0..<func.blocks.len:
@@ -1027,7 +1027,40 @@ fn uirCorePruneUnreachableFuncs(module: UirCoreModule): bool =
     return changed
 
 fn uirCoreOptimizeModuleNoopAssign(module: UirCoreModule): bool =
-    return false
+    if module == nil:
+        return false
+    var changed: bool = false
+    for fi in 0..<module.funcs.len:
+        let func: UirCoreFunc = module.funcs[fi]
+        if func == nil || func.isExtern:
+            continue
+        for bi in 0..<func.blocks.len:
+            let blk: UirCoreBlock = func.blocks[bi]
+            if blk == nil:
+                continue
+            var out: UirCoreStmt[]
+            for si in 0..<blk.stmts.len:
+                let st: UirCoreStmt = blk.stmts[si]
+                var dropStmt: bool = false
+                if st.kind == msAssign && st.slot >= 0:
+                    let expr: UirCoreExpr = st.expr
+                    if expr != nil:
+                        if expr.kind == meLocal && expr.localIndex == st.slot:
+                            dropStmt = true
+                        elif expr.kind == meCast:
+                            let castExpr: UirCoreExpr = expr.castExpr
+                            if castExpr != nil && castExpr.kind == meLocal &&
+                               castExpr.localIndex == st.slot:
+                                let srcTy: UirCoreType = uirCoreOpt2InferExprType(func, castExpr)
+                                if uirCoreOpt2TypeEq(srcTy, expr.castType):
+                                    dropStmt = true
+                if dropStmt:
+                    changed = true
+                    continue
+                add(out, st)
+            if out.len != blk.stmts.len:
+                blk.stmts = out
+    return changed
 
 fn uirCoreOptimizeModuleDseStores(module: UirCoreModule): bool =
     if module == nil:

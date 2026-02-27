@@ -9,6 +9,8 @@
 - 默认目标平台：`auto`（按当前运行平台自动选择 target triple）。
 - 默认内存模型：`MM=orc`（建议始终显式设置）。
 - 仅支持 `obj/exe` 产物，`emit-c` 与 `--backend:c` 不再作为生产路径。
+- 自举闭环入口：`cheng_tooling bootstrap_pure --mode:strict --fullspec`（strict fixed-point + fullchain）。
+- C-Drop 仅应急：`cheng_tooling verify_backend_cdrop_emergency`（默认不纳入发布阻断链，`BACKEND_RUN_CDROP_EMERGENCY=0`）。
 - 直接命令行参数见：`docs/backend-driver-cli.md`。
 
 ---

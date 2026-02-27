@@ -1,12 +1,11 @@
 # Connection abstraction(minimal, synchronous).
 
-import std/system
 import std/result
 import std/rawbytes
-import std/seqs
 import std/multiformats/multiaddress
 import std/net/stream/bufferstream
 import std/net/resourcemanager
+
 type
     Direction = enum
         Inbound = 0
@@ -34,8 +33,7 @@ type
         count: int32
         head: int32
         tail: int32
-        # Keep pointer handles in a seq to avoid fragile fixed-array lowering.
-        items: int64[]
+        items: Connection[connectionQueueCapacity]
 
     ConnectionPair =
         outbound: Connection
@@ -48,21 +46,11 @@ const
 
 var
     pipeCount: int32 = 0
-    pipeSlots: int64[]
+    pipeUsed: bool[maxPipes]
+    pipeSlots: Pipe[maxPipes]
 
 fn initConnectionQueue(): ConnectionQueue =
-    var q: ConnectionQueue = ConnectionQueue(count: 0, head: 0, tail: 0)
-    if connectionQueueCapacity > 0:
-        let bytes64: int64 = int64(connectionQueueCapacity) * sizeof int64
-        let bytes: int32 = int32(bytes64)
-        let mem: void* = alloc(bytes)
-        if mem == nil:
-            panic "connectionqueue: out of memory"
-        zeroMem(mem, bytes)
-        q.items.buffer = mem
-        q.items.cap = connectionQueueCapacity
-        q.items.len = connectionQueueCapacity
-    return q
+    return ConnectionQueue(count: 0, head: 0, tail: 0)
 
 fn connectionQueueIsEmpty(q: ConnectionQueue): bool =
     q.count <= 0
@@ -70,78 +58,10 @@ fn connectionQueueIsEmpty(q: ConnectionQueue): bool =
 fn connectionQueueIsFull(q: ConnectionQueue): bool =
     q.count >= connectionQueueCapacity
 
-fn copyConnection(dst: var Connection, src: Connection) =
-    dst.localAddr = src.localAddr
-    dst.remoteAddr = src.remoteAddr
-    dst.dir = src.dir
-    dst.stream = src.stream
-    dst.open = src.open
-    dst.pipeIdx = src.pipeIdx
-    dst.pipeSide = src.pipeSide
-    dst.remotePeer = src.remotePeer
-    dst.accounting = src.accounting
-    dst.queueReserved = src.queueReserved
-    dst.queueReservedBytes = src.queueReservedBytes
-
-fn int64SeqPtr(seqInst: var int64[], idx: int32): int64* =
-    if seqInst.buffer == nil || idx < 0 || idx >= seqInst.len:
-        return nil
-    let offset: int32 = idx * int32(sizeof int64)
-    return int64*(ptr_add(seqInst.buffer, offset))
-
-fn int64SeqGet(seqInst: var int64[], idx: int32): int64 =
-    let slotPtr: int64* = int64SeqPtr(seqInst, idx)
-    if slotPtr == nil:
-        return 0
-    return *slotPtr
-
-fn int64SeqSet(seqInst: var int64[], idx: int32, value: int64): bool =
-    let slotPtr: int64* = int64SeqPtr(seqInst, idx)
-    if slotPtr == nil:
-        return false
-    *slotPtr = value
-    return true
-
-fn connectionQueueEnsureSlot(q: var ConnectionQueue, idx: int32): Connection* =
-    if idx < 0 || idx >= connectionQueueCapacity:
-        return nil
-    if q.items.buffer == nil || q.items.cap < connectionQueueCapacity:
-        let bytes64: int64 = int64(connectionQueueCapacity) * sizeof int64
-        let bytes: int32 = int32(bytes64)
-        let mem: void* = realloc(q.items.buffer, bytes)
-        if mem == nil:
-            return nil
-        if q.items.buffer == nil:
-            zeroMem(mem, bytes)
-        q.items.buffer = mem
-        q.items.cap = connectionQueueCapacity
-        q.items.len = connectionQueueCapacity
-    elif q.items.len < connectionQueueCapacity:
-        let tailBytes64: int64 = int64(connectionQueueCapacity - q.items.len) * sizeof int64
-        if tailBytes64 > 0:
-            let tailBytes: int32 = int32(tailBytes64)
-            let offset64: int64 = int64(q.items.len) * sizeof int64
-            zeroMem(ptr_add(q.items.buffer, int32(offset64)), tailBytes)
-        q.items.len = connectionQueueCapacity
-    let existing: int64 = int64SeqGet(q.items, idx)
-    if existing != 0:
-        return Connection*(void*(existing))
-    let mem: void* = alloc(sizeof Connection)
-    if mem == nil:
-        return nil
-    zeroMem(mem, sizeof Connection)
-    if !int64SeqSet(q.items, idx, int64(mem)):
-        dealloc(mem)
-        return nil
-    return Connection*(mem)
-
 fn enqueueConnection(q: var ConnectionQueue, conn: Connection): Result[bool] =
     if connectionQueueIsFull(q):
         return Err[bool]("connectionqueue: full")
-    let slot: Connection* = connectionQueueEnsureSlot(q, q.tail)
-    if slot == nil:
-        return Err[bool]("connectionqueue: alloc failed")
-    copyConnection(*slot, conn)
+    q.items[q.tail] = conn
     q.tail = (q.tail + 1) % connectionQueueCapacity
     q.count = q.count + 1
     return Ok[bool](true)
@@ -149,12 +69,7 @@ fn enqueueConnection(q: var ConnectionQueue, conn: Connection): Result[bool] =
 fn dequeueConnection(q: var ConnectionQueue): Result[Connection] =
     if connectionQueueIsEmpty(q):
         return Err[Connection]("connectionqueue: empty")
-    let rawSlot: int64 = int64SeqGet(q.items, q.head)
-    let slot: Connection* = Connection*(void*(rawSlot))
-    if slot == nil:
-        return Err[Connection]("connectionqueue: corrupt")
-    var conn: Connection
-    copyConnection(conn, *slot)
+    let conn: Connection = q.items[q.head]
     q.head = (q.head + 1) % connectionQueueCapacity
     q.count = q.count - 1
     return Ok[Connection](conn)
@@ -162,69 +77,18 @@ fn dequeueConnection(q: var ConnectionQueue): Result[Connection] =
 fn initPipe(): Pipe =
     Pipe(aToB: newBufferStream(), bToA: newBufferStream(), closed: false)
 
-fn ensurePipeSlotsInit() =
-    if maxPipes <= 0:
-        return
-    if pipeSlots.buffer == nil || pipeSlots.cap < maxPipes:
-        let bytes64: int64 = int64(maxPipes) * sizeof int64
-        let bytes: int32 = int32(bytes64)
-        let mem: void* = realloc(pipeSlots.buffer, bytes)
-        if mem == nil:
-            panic "pipe slots: out of memory"
-        if pipeSlots.buffer == nil:
-            zeroMem(mem, bytes)
-        pipeSlots.buffer = mem
-        pipeSlots.cap = maxPipes
-        pipeSlots.len = maxPipes
-        return
-    if pipeSlots.len < maxPipes:
-        let tailBytes64: int64 = int64(maxPipes - pipeSlots.len) * sizeof int64
-        if tailBytes64 > 0:
-            let tailBytes: int32 = int32(tailBytes64)
-            let offset64: int64 = int64(pipeSlots.len) * sizeof int64
-            zeroMem(ptr_add(pipeSlots.buffer, int32(offset64)), tailBytes)
-        pipeSlots.len = maxPipes
-
-fn ensurePipeSlot(idx: int32): Pipe* =
-    ensurePipeSlotsInit()
-    if idx < 0 || idx >= maxPipes:
-        return nil
-    let existing: int64 = int64SeqGet(pipeSlots, idx)
-    if existing != 0:
-        return Pipe*(void*(existing))
-    let mem: void* = alloc(sizeof Pipe)
-    if mem == nil:
-        return nil
-    zeroMem(mem, sizeof Pipe)
-    if !int64SeqSet(pipeSlots, idx, int64(mem)):
-        dealloc(mem)
-        return nil
-    return Pipe*(mem)
-
-fn getPipeSlot(idx: int32): Pipe* =
-    ensurePipeSlotsInit()
-    if idx < 0 || idx >= pipeCount:
-        return nil
-    let rawSlot: int64 = int64SeqGet(pipeSlots, idx)
-    return Pipe*(void*(rawSlot))
-
 fn resetPipe(idx: int32) =
     if idx < 0 || idx >= maxPipes:
         return
-    let p: Pipe* = ensurePipeSlot(idx)
-    if p == nil:
-        return
-    p.aToB = newBufferStream()
-    p.bToA = newBufferStream()
-    p.closed = false
+    pipeSlots[idx] = initPipe()
+    pipeUsed[idx] = true
 
 fn allocPipe(): Result[int32] =
-    ensurePipeSlotsInit()
+    for i in 0..<pipeCount:
+        if pipeUsed[i] && pipeSlots[i].closed:
+            resetPipe(i)
+            return Ok[int32](i)
     if pipeCount >= maxPipes:
-        for i in 0..<maxPipes:
-            if pipeIsClosed(i):
-                resetPipe(i)
-                return Ok[int32](i)
         return Err[int32]("pipe: full")
     let idx: int32 = pipeCount
     resetPipe(idx)
@@ -232,40 +96,38 @@ fn allocPipe(): Result[int32] =
     return Ok[int32](idx)
 
 fn pipeIsClosed(idx: int32): bool =
-    let p: Pipe* = getPipeSlot(idx)
-    if p == nil:
+    if idx < 0 || idx >= maxPipes:
         return true
-    return p.closed
+    if ! pipeUsed[idx]:
+        return true
+    return pipeSlots[idx].closed
 
 fn pipeWrite(idx: int32, side: int32, data: Bytes): Result[int32] =
-    let p: Pipe* = getPipeSlot(idx)
-    if p == nil:
+    if idx < 0 || idx >= maxPipes || ! pipeUsed[idx]:
         return Err[int32]("pipe: invalid")
-    if p.closed:
+    if pipeSlots[idx].closed:
         return Err[int32]("pipe: closed")
     if side == 0:
-        return bufferstream.write(p.aToB, data)
-    return bufferstream.write(p.bToA, data)
+        return bufferstream.write(pipeSlots[idx].aToB, data)
+    return bufferstream.write(pipeSlots[idx].bToA, data)
 
 fn pipeRead(idx: int32, side: int32, count: int32): Result[Bytes] =
-    let p: Pipe* = getPipeSlot(idx)
-    if p == nil:
+    if idx < 0 || idx >= maxPipes || ! pipeUsed[idx]:
         return Err[Bytes]("pipe: invalid")
-    if p.closed:
+    if pipeSlots[idx].closed:
         return Err[Bytes]("pipe: closed")
     if side == 0:
-        return bufferstream.read(p.bToA, count)
-    return bufferstream.read(p.aToB, count)
+        return bufferstream.read(pipeSlots[idx].bToA, count)
+    return bufferstream.read(pipeSlots[idx].aToB, count)
 
 fn pipeClose(idx: int32) =
-    let p: Pipe* = getPipeSlot(idx)
-    if p == nil:
+    if idx < 0 || idx >= maxPipes || ! pipeUsed[idx]:
         return
-    if p.closed:
+    if pipeSlots[idx].closed:
         return
-    p.closed = true
-    closeBufferStream(p.aToB)
-    closeBufferStream(p.bToA)
+    pipeSlots[idx].closed = true
+    closeBufferStream(pipeSlots[idx].aToB)
+    closeBufferStream(pipeSlots[idx].bToA)
 
 fn newConnection(localAddr: MultiAddress, remoteAddr: MultiAddress, dir: Direction): Connection =
     Connection(

@@ -5,14 +5,45 @@ import std/strutils
 import stage1/ast
 
 fn dupScanStripSpaces(s: str): str =
-    if s == nil:
+    if len(s) == 0:
         return ""
     return strutils.strip(s)
 
 fn dupScanHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
-    let v: int32 = hashmaps.hashMapStrIntGetEx(m, key, found)
-    if found:
-        return v
+    if len(key) == 0 || m.mask == 0:
+        found = false
+        return -1
+    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
+        found = false
+        return -1
+    var mask: int32 = int32(m.mask)
+    if mask < 0:
+        found = false
+        return -1
+    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
+        let cap0: int32 = m.states.len
+        if m.keys.len < cap0 || m.vals.len < cap0:
+            found = false
+            return -1
+        mask = cap0 - 1
+    if mask < 0:
+        found = false
+        return -1
+    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
+    var scanned: int32 = 0
+    let __for_start_scanned_compat = scanned
+    for __for_scanned_compat in __for_start_scanned_compat..mask:
+        scanned = __for_scanned_compat
+        let st: uint8 = m.states[probe]
+        if st == uint8(0):
+            found = false
+            return -1
+        if hashmaps.hashMapStrEq(m.keys[probe], key):
+            found = true
+            return m.vals[probe]
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    found = false
     return -1
 
 fn uirCoreCollectGenericParamNames(generics: Node): str[] =
@@ -99,24 +130,20 @@ fn uirCoreComputeDuplicateFnBases(root: Node, overloaded: hashsets.HashSetStr* =
         queue.len = queue.len - 1
         if n == nil || n.kind == nkEmpty:
             continue
-        if n.kind == nkStmtList || n.kind == nkModule:
+        if n.kind != nkFnDecl && n.kind != nkIteratorDecl:
+            # Root/module wrappers vary across stage0/stage1 and parse modes.
+            # Traverse generic containers so duplicate-base detection remains
+            # stable for operators like `[]` across std modules.
             for i in 0..<kidCount(n):
                 add(queue, kid(n, i))
-            continue
-        if n.kind != nkFnDecl && n.kind != nkIteratorDecl:
-            continue
-        if kidCount(n) > 3:
-            let body: Node = kid(n, 3)
-            # Forward decls (no body, no importc) should not count as duplicates.
-            if body == nil || body.kind == nkEmpty:
-                continue
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
             continue
         let nameNode: Node = kid(n, 0)
         if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
             continue
         let rawName: str = dupScanStripSpaces(plainName(nameNode))
         if len(rawName) == 0 || (rawName == "main"):
+            continue
+        if uirCoreFuncSigHasUnresolvedGenerics(n):
             continue
         # Overloaded base names still need cross-module duplicate detection.
         # Otherwise different modules that share the same overloaded signature
@@ -154,11 +181,9 @@ fn uirCoreComputeDuplicateGlobalNames(root: Node): hashsets.HashSetStr =
         queue.len = queue.len - 1
         if n == nil || n.kind == nkEmpty:
             continue
-        if n.kind == nkStmtList || n.kind == nkModule:
+        if n.kind != nkVar && n.kind != nkLet && n.kind != nkConst:
             for i in 0..<kidCount(n):
                 add(queue, kid(n, i))
-            continue
-        if n.kind != nkVar && n.kind != nkLet && n.kind != nkConst:
             continue
         var pat: Node = nil
         if kidCount(n) > 0:

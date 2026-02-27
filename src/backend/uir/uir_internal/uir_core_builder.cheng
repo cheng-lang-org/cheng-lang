@@ -28,7 +28,7 @@ import backend/uir/uir_internal/uir_core_builder_dup_scan
 import backend/uir/uir_internal/uir_core_builder_overload_scan
 import backend/uir/uir_internal/uir_core_builder_top_level_passes
 
-fn lowerAscii(s: str): str =
+fn backendLowerAscii(s: str): str =
     return strutils.toLowerAscii(s)
 
 fn uirCoreOkModule(mod: UirCoreModule): Result[UirCoreModule] =
@@ -77,8 +77,15 @@ var
     uirCore_globalIndex_cache_len: int32
     uirCore_globalIndex_cache_ready: bool = false
 
-fn uirCoreCalleeCandidatesReset() =
-    uirCoreCalleeCandidates = hashmaps.hashMapStrSeqIntInit(2048)
+fn uirCoreCalleeCandidatesReset(modFuncHint: int32 = 0) =
+    var cap: int32 = 2048
+    if modFuncHint > 0:
+        cap = modFuncHint * 2 + 1024
+        if cap < 2048:
+            cap = 2048
+        if cap > 1048576:
+            cap = 1048576
+    uirCoreCalleeCandidates = hashmaps.hashMapStrSeqIntInit(cap)
     uirCoreCalleeCandidatesReady = true
 
 fn uirCoreCalleeCandidatesGet(mod: UirCoreModule, baseName: str): int32[] =
@@ -86,7 +93,7 @@ fn uirCoreCalleeCandidatesGet(mod: UirCoreModule, baseName: str): int32[] =
     if mod == nil || len(baseName) == 0:
         return out
     if !uirCoreCalleeCandidatesReady:
-        uirCoreCalleeCandidatesReset()
+        uirCoreCalleeCandidatesReset(mod.funcs.len)
     var found: bool = false
     let cached: int32[] = hashmaps.hashMapStrSeqIntGet(uirCoreCalleeCandidates, baseName, &found)
     if found:
@@ -103,16 +110,24 @@ fn uirCoreCalleeCandidatesGet(mod: UirCoreModule, baseName: str): int32[] =
     let overloadPrefix: str = baseSym + uirCoreFuncSigMarker()
     let dupPrefix: str = baseSym + "__cheng_mod_"
     let instPrefix: str = baseSym + "_"
+    let complexMangledName: bool =
+        uirCoreStrIndexOf(baseName, uirCoreFuncSigMarker()) >= 0 ||
+        uirCoreStrIndexOf(baseName, "__cheng_mod_") >= 0 ||
+        uirCoreStrIndexOf(baseName, "__cheng_") >= 0
+    let allowInstPrefix: bool = !complexMangledName && len(baseName) > 0 && len(baseName) <= 64
+    let maxCandidates: int32 = 512
     for i in 0..<mod.funcs.len:
         let f: UirCoreFunc = mod.funcs[i]
-        if f == nil || f.name == nil:
+        if f == nil || len(f.name) == 0:
             continue
         if (f.name == baseName) ||
            uirCoreStrStartsWith(f.name, overloadPrefix) ||
            uirCoreStrStartsWith(f.name, dupPrefix):
             add(out, i)
+            if out.len >= maxCandidates:
+                break
             continue
-        if uirCoreStrStartsWith(f.name, instPrefix):
+        if allowInstPrefix && uirCoreStrStartsWith(f.name, instPrefix):
             # Avoid double-counting "__cheng_sig_" / "__cheng_mod_" candidates; both start with `baseSym + "_"`.
             if uirCoreStrStartsWith(f.name, overloadPrefix) || uirCoreStrStartsWith(f.name, dupPrefix):
                 continue
@@ -120,6 +135,8 @@ fn uirCoreCalleeCandidatesGet(mod: UirCoreModule, baseName: str): int32[] =
             if len(f.name) > len(instPrefix) && f.name[len(instPrefix)] == '_':
                 continue
             add(out, i)
+            if out.len >= maxCandidates:
+                break
 
     # Cache version marker (negative sentinel): -1 - mod.funcs.len
     add(out, -1 - mod.funcs.len)
@@ -160,7 +177,7 @@ fn uirCoreProfileStep(p: UirCoreProfileState, name: str) =
     os.writeLine(f, int64ToStr(totalMs))
     os.c_fflush f
 
-fn uirCoreHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
+fn uirCoreHashMapStrIntGetCompatLocal(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
     if len(key) == 0 || m.mask == 0:
         found = false
         return -1
@@ -198,7 +215,7 @@ fn uirCoreHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var
     return -1
 
 fn uirCoreOwnershipEngineNormalized(): str =
-    let raw: str = lowerAscii(backendStripSpaces(getEnv "STAGE1_OWNERSHIP_ENGINE"))
+    let raw: str = backendLowerAscii(backendStripSpaces(getEnv "STAGE1_OWNERSHIP_ENGINE"))
     if len(raw) == 0:
         return "scan"
     if raw == "legacy":
@@ -496,7 +513,7 @@ fn typeNodeObjTypeName(module: UirCoreModule, typeNode: Node): str =
                 var foundCount: int32 = 0
                 for oi in 0..<module.objTypes.len:
                     let ot: UirCoreObjType = module.objTypes[oi]
-                    if ot.name != nil && uirCoreStrStartsWith(ot.name, prefix):
+                    if len(ot.name) > 0 && uirCoreStrStartsWith(ot.name, prefix):
                         foundName = ot.name
                         foundCount = foundCount + 1
                         if foundCount > 1:
@@ -1217,13 +1234,18 @@ fn uirCoreIndexFnDecls(root: Node, outMap: hashmaps.HashMapStrSeqInt*, outNodes:
                     if len(base2) > 0 && !(base2 == nm):
                         hashmaps.hashMapStrSeqIntAdd(outMap, base2, idx)
 
-fn uirCoreReachDeclIdxs(index: hashmaps.HashMapStrSeqInt, nodes: Node[], name: str, foundOut: bool* = nil): int32[] =
+fn uirCoreReachDeclIdxs(index: hashmaps.HashMapStrSeqInt, nodes: Node[], name: str,
+                        foundOut: bool* = nil, allowLinearFallback: bool = false): int32[] =
     var found: bool = false
     let idxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, name, &found)
     if found && idxs.len > 0:
         if foundOut != nil:
             *foundOut = true
         return idxs
+    if !allowLinearFallback:
+        if foundOut != nil:
+            *foundOut = false
+        return []
     var out: int32[]
     for i in 0..<nodes.len:
         let declNode: Node = nodes[i]
@@ -1248,16 +1270,50 @@ fn uirCorePathBaseName(path: str): str =
         return name0
     return backendStripSpaces(path)
 
+fn uirCorePathDirName(path: str): str =
+    if len(path) == 0:
+        return ""
+    let parts: SplitFileResult = os.splitFile(path)
+    return backendStripSpaces(parts.dir)
+
+var uirCoreEntryPathCachedRaw: str = ""
+var uirCoreEntryPathCachedNorm: str = ""
+var uirCoreEntryPathCachedDir: str = ""
+var uirCoreEntryPathCachedBase: str = ""
+var uirCoreEntryPathCachedKeepDir: bool = true
+var uirCoreEntryPathCacheReady: bool = false
+
+fn uirCoreRefreshEntryPathCache() =
+    let raw: str = backendStripSpaces(os.getEnvDefault("BACKEND_INPUT", ""))
+    let keepDir: bool = os.getEnvDefault("BACKEND_REACHABLE_KEEP_ENTRY_DIR", "1") != "0"
+    if uirCoreEntryPathCacheReady &&
+       raw == uirCoreEntryPathCachedRaw &&
+       keepDir == uirCoreEntryPathCachedKeepDir:
+        return
+    uirCoreEntryPathCachedRaw = raw
+    uirCoreEntryPathCachedNorm = raw
+    uirCoreEntryPathCachedDir = uirCorePathDirName(raw)
+    uirCoreEntryPathCachedBase = uirCorePathBaseName(raw)
+    uirCoreEntryPathCachedKeepDir = keepDir
+    uirCoreEntryPathCacheReady = true
+
 fn uirCoreIsEntryFilePath(filePath: str): bool =
     if len(filePath) == 0:
         return false
-    let entryPath: str = backendStripSpaces(os.getEnvDefault("BACKEND_INPUT", ""))
+    uirCoreRefreshEntryPathCache()
+    let entryPath: str = uirCoreEntryPathCachedNorm
     if len(entryPath) == 0:
         return false
     if filePath == entryPath:
         return true
+    let keepEntryDir: bool = uirCoreEntryPathCachedKeepDir
+    if keepEntryDir:
+        let fileDir: str = uirCorePathDirName(filePath)
+        let entryDir: str = uirCoreEntryPathCachedDir
+        if len(fileDir) > 0 && len(entryDir) > 0 && fileDir == entryDir:
+            return true
     let fileBase: str = uirCorePathBaseName(filePath)
-    let entryBase: str = uirCorePathBaseName(entryPath)
+    let entryBase: str = uirCoreEntryPathCachedBase
     if len(fileBase) == 0 || len(entryBase) == 0:
         return false
     return fileBase == entryBase
@@ -1270,6 +1326,7 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
     var nodes: Node[workCap]
     uirCoreIndexFnDecls(root, &index, &nodes)
     let dbgReach: bool = (os.getEnvDefault("BACKEND_DEBUG_REACHABLE", "") == "1")
+    let linearFallback: bool = os.getEnvDefault("BACKEND_REACHABLE_LINEAR_FALLBACK", "0") == "1"
     var dbgBudget: int32 = 64
     if dbgReach:
         let fDbg: os.File = os.get_stderr()
@@ -1341,7 +1398,7 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
             for ci in 0..<callees.len:
                 let nm: str = callees[ci]
                 var inProgram: bool = false
-                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(index, nodes, nm, &inProgram)
+                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(index, nodes, nm, &inProgram, linearFallback)
                 if inProgram && calleeIdxs.len > 0:
                     for ki in 0..<calleeIdxs.len:
                         let k: int32 = calleeIdxs[ki]
@@ -1384,7 +1441,7 @@ fn uirCoreComputeReachableFns(module: UirCoreModule, root: Node): hashsets.HashS
             for ci in 0..<callees.len:
                 let nm: str = callees[ci]
                 var inProgram: bool = false
-                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(index, nodes, nm, &inProgram)
+                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(index, nodes, nm, &inProgram, linearFallback)
                 if inProgram && calleeIdxs.len > 0:
                     for ki in 0..<calleeIdxs.len:
                         let k: int32 = calleeIdxs[ki]
@@ -1413,7 +1470,7 @@ fn uirCoreMaybeEnqueueMissingRoutine(mod: UirCoreModule, declIndex: hashmaps.Has
         return
     trackLexString void*(name0)
     var foundDecl: bool = false
-    let _declIdx: int32 = uirCoreHashMapStrIntGetCompat(declIndex, name0, foundDecl)
+    let _declIdx: int32 = uirCoreHashMapStrIntGetCompatLocal(declIndex, name0, foundDecl)
     if !foundDecl || _declIdx < 0:
         return
     if moduleHasFunc(mod, name0):
@@ -1489,7 +1546,7 @@ fn uirCoreIndexFnDeclsMangled(root: Node, overloaded: hashsets.HashSetStr*,
         if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
             continue
         let rawName: str = backendStripSpaces(plainName(nameNode))
-        let fp: str = (len(n.strVal) > 0) ? n.strVal : (root.strVal != nil ? root.strVal : "")
+        let fp: str = (len(n.strVal) > 0) ? n.strVal : ((root != nil && len(root.strVal) > 0) ? root.strVal : "")
         let symName: str = uirCoreMaybeMangleDupFnBase(rawName, fp)
         let baseSym: str = backendSanitizeLinkName(symName)
 
@@ -1509,7 +1566,7 @@ fn uirCoreIndexFnDeclsMangled(root: Node, overloaded: hashsets.HashSetStr*,
             retKey = typeKey(retNode)
 
         var name: str = symName
-        if rawName != nil && !(rawName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, rawName):
+        if len(rawName) > 0 && !(rawName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, rawName):
             name = uirCoreMangleOverloadName(baseSym, retKey, paramKeys)
 
         let idx: int32 = outNodes->len
@@ -1543,7 +1600,7 @@ fn uirCoreBuildMissingRoutinesFromUir(mod: UirCoreModule, root: Node, overloaded
         if hashsets.hashSetStrHas(existingFuncs, nm):
             continue
         var found: bool = false
-        let idx: int32 = uirCoreHashMapStrIntGetCompat(declIndex, nm, found)
+        let idx: int32 = uirCoreHashMapStrIntGetCompatLocal(declIndex, nm, found)
         if !found || idx < 0 || idx >= declNodes.len:
             continue
         let n: Node = declNodes[idx]
@@ -1551,7 +1608,7 @@ fn uirCoreBuildMissingRoutinesFromUir(mod: UirCoreModule, root: Node, overloaded
             continue
         if uirCoreFuncSigHasUnresolvedGenerics(n):
             continue
-        let fp: str = (len(n.strVal) > 0) ? n.strVal : (root.strVal != nil ? root.strVal : "")
+        let fp: str = (len(n.strVal) > 0) ? n.strVal : ((root != nil && len(root.strVal) > 0) ? root.strVal : "")
         let fRes: Result[UirCoreFunc] = uirCoreBuildFunc(mod, n, fp, overloaded)
         if ! IsOk[UirCoreFunc](fRes):
             return ErrInfo[bool](ErrorInfoOf[UirCoreFunc](fRes))
@@ -1561,11 +1618,11 @@ fn uirCoreBuildMissingRoutinesFromUir(mod: UirCoreModule, root: Node, overloaded
         if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
            uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
             var sameFile: bool = false
-            for di in 0..<mod.funcs.len:
-                let ex: UirCoreFunc = mod.funcs[di]
-                if ex != nil && (ex.name == f.name) && (ex.originFile == f.originFile):
+            let exIdx: int32 = moduleFuncIndex(mod, f.name)
+            if exIdx >= 0 && exIdx < mod.funcs.len:
+                let ex: UirCoreFunc = mod.funcs[exIdx]
+                if ex != nil && (ex.originFile == f.originFile):
                     sameFile = true
-                    break
             if sameFile:
                 continue
             return Err[bool]("uirCore_builder: duplicate function name: " + f.name)
@@ -1598,7 +1655,7 @@ fn nodeIsTypeArgInCall(b: BlockBuilder, n: Node): bool =
         return uirCoreFindTypeAlias(b.module, nm) >= 0 || uirCoreFindObjType(b.module, nm) >= 0
     return false
 
-fn uirCoreTypeKindName(t: UirCoreType): str =
+fn uirCoreTypeKindNameLocal(t: UirCoreType): str =
     if t.kind == mtVoid:
         return "void"
     if t.kind == mtF64:
@@ -1616,7 +1673,7 @@ fn uirCoreTypeKindName(t: UirCoreType): str =
     return "i32"
 
 fn backendStripSpaces(s: str): str =
-    if s == nil:
+    if len(s) == 0:
         return ""
     let n: int32 = len s
     if n == 0:
@@ -1646,7 +1703,7 @@ fn backendStripSpacesMaybe(s: str): str =
     return backendStripSpaces(s)
 
 fn backendIsSafeLinkName(name: str): bool =
-    if name == nil:
+    if len(name) == 0:
         return false
     let n: int32 = len(name)
     if n == 0:
@@ -1675,12 +1732,12 @@ fn backendHexByteLower(v: int32): str =
     return charToStr(backendHexDigitLower(hi)) + charToStr(backendHexDigitLower(lo))
 
 fn backendSanitizeLinkName(raw: str): str =
-    if raw == nil:
+    if len(raw) == 0:
         return ""
     let name: str = backendStripSpaces(raw)
     if backendIsSafeLinkName(name):
         return name
-    if name == nil:
+    if len(name) == 0:
         return "__cheng_anon"
     let nameLen: int32 = len(name)
     if nameLen == 0:
@@ -1693,7 +1750,9 @@ fn backendSanitizeLinkName(raw: str): str =
     return out
 
 fn uirCoreStrStartsWith(s: str, prefix: str): bool =
-    if s == nil || prefix == nil:
+    if len(prefix) == 0:
+        return true
+    if len(s) == 0:
         return false
     var i: int32 = 0
     while true:
@@ -1708,7 +1767,7 @@ fn uirCoreStrStartsWith(s: str, prefix: str): bool =
         i = i + 1
 
 fn uirCoreStripLeadingUnderscores(raw: str): str =
-    if raw == nil:
+    if len(raw) == 0:
         return ""
     let n: int32 = len(raw)
     if n <= 0:
@@ -1728,12 +1787,12 @@ fn uirCoreInferCtorSuffixFromTypeCache(b: BlockBuilder, callNode: Node, objPrefi
     if callNode.typeCacheValid && callNode.typeCache != nil:
         let tc: Node = callNode.typeCache
         let objName0: str = typeNodeObjTypeName(b.module, tc)
-        if objName0 != nil && uirCoreStrStartsWith(objName0, objPrefix):
+        if len(objName0) > 0 && uirCoreStrStartsWith(objName0, objPrefix):
             let suffix0: str = str(ptr_add(void*(objName0), len(objPrefix)))
             if len(suffix0) > 0:
                 return suffix0
         let key0: str = typeKey(tc)
-        if key0 != nil && uirCoreStrStartsWith(key0, objPrefix):
+        if len(key0) > 0 && uirCoreStrStartsWith(key0, objPrefix):
             let suffix1: str = str(ptr_add(void*(key0), len(objPrefix)))
             if len(suffix1) > 0:
                 return suffix1
@@ -1741,7 +1800,7 @@ fn uirCoreInferCtorSuffixFromTypeCache(b: BlockBuilder, callNode: Node, objPrefi
 
 fn uirCoreTypeKeyStripIterWrappers(typeKey0: str): str =
     var key: str = backendStripSpaces(typeKey0)
-    if key == nil:
+    if len(key) == 0:
         return ""
     while true:
         if uirCoreStrStartsWith(key, "ref_"):
@@ -1821,12 +1880,12 @@ fn uirCoreHashMapIterFlavorFromTypeKey(typeKey0: str): int32 =
     return 0
 
 fn uirCoreStrIndexOf(s: str, sub: str): int32 =
-    if s == nil || sub == nil:
-        return -1
     let n: int32 = len(s)
     let m: int32 = len(sub)
     if m == 0:
         return 0
+    if n == 0:
+        return -1
     if m > n:
         return -1
     for i in 0..n - m:
@@ -1838,7 +1897,7 @@ fn uirCoreStrIndexOf(s: str, sub: str): int32 =
     return -1
 
 fn uirCoreStrTake(s: str, count: int32): str =
-    if s == nil || count <= 0:
+    if len(s) == 0 || count <= 0:
         return ""
     let n: int32 = len(s)
     var k: int32 = count
@@ -2163,13 +2222,13 @@ fn uirCore_ensureGlobalIndexCache(module: UirCoreModule) =
         uirCore_globalIndex_cache_len = module.globals.len
 
 fn moduleGlobalIndex(module: UirCoreModule, name: str): int32 =
-    if module == nil || name == nil:
+    if module == nil || len(name) == 0:
         return -1
     if module.globals.len >= 32:
         uirCore_ensureGlobalIndexCache(module)
         if uirCore_globalIndex_cache_ready && uirCore_globalIndex_cache_module == module:
             var found: bool = false
-            let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCore_globalIndex_cache, name, found)
+            let idx: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_globalIndex_cache, name, found)
             if !found:
                 return -1
             if found && idx >= 0 && idx < module.globals.len:
@@ -2848,7 +2907,7 @@ fn uirCoreInferValueCallInnerKey(b: BlockBuilder, callNode: Node): str =
             argKey0 = str(ptr_add(void*(argKey0), 4))
         if uirCoreStrStartsWith(argKey0, "ptr_"):
             argKey0 = str(ptr_add(void*(argKey0), 4))
-    if argKey0 != nil && uirCoreStrStartsWith(argKey0, "Result_"):
+    if len(argKey0) > 0 && uirCoreStrStartsWith(argKey0, "Result_"):
         let valKey0: str = str(ptr_add(void*(argKey0), 7))
         if dbgValueInner:
             echo("[backend] debugValueInner: argKey='" + argKey0 + "' valKey='" + valKey0 + "'")
@@ -3946,7 +4005,7 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: UirCoreExpr): 
     # the same behavior here to avoid relying on a monomorphized helper function.
     if b.module != nil && ((name == "TableInit") || uirCoreStrStartsWith(callName, "TableInit_")):
         let retKeyHint: str = uirCoreInferCallRetKeyHint(callNode)
-        if (retKeyHint != nil && uirCoreStrStartsWith(retKeyHint, "Table_")) && uirCoreHasObjType(b.module, "Table"):
+        if (len(retKeyHint) > 0 && uirCoreStrStartsWith(retKeyHint, "Table_")) && uirCoreHasObjType(b.module, "Table"):
             var capNode: Node = nil
             if argNodes.len > 0:
                 capNode = argNodes[0]
@@ -4113,7 +4172,7 @@ fn lowerCallWithLeadingArg(b: BlockBuilder, callNode: Node, lead: UirCoreExpr): 
                 return ErrInfo[UirCoreExpr](ErrorInfoOf[UirCoreExpr](argRes2))
             add(args, Value[UirCoreExpr](argRes2))
     let valueLikeCall0: bool = (callInternal == "Value") || (callName == "Value") ||
-        (calleeFunc != nil && calleeFunc.linkName != nil && (calleeFunc.linkName == "Value"))
+        (calleeFunc != nil && len(calleeFunc.linkName) > 0 && (calleeFunc.linkName == "Value"))
     if valueLikeCall0 && args.len >= 2 && b.module != nil:
         var srcPtr1: UirCoreExpr = args[1]
         if argNodes.len > 0 && argNodes[0] != nil:
@@ -4582,13 +4641,13 @@ fn lowerInExpr(b: BlockBuilder, lhsNode0: Node, rhsNode0: Node, negate: bool): R
     return Err[UirCoreExpr]("uirCore_builder: unsupported 'in' rhs (key=" + rhsKey + " @" + line + ":" + col + ")")
 
 fn isFloat64Key(key0: str): bool =
-    if key0 == nil:
+    if len(key0) == 0:
         return false
     let key: str = backendStripSpaces(key0)
     return (key == "float64") || (key == "float")
 
 fn isFloat32Key(key0: str): bool =
-    if key0 == nil:
+    if len(key0) == 0:
         return false
     let key: str = backendStripSpaces(key0)
     return key == "float32"
@@ -4597,13 +4656,13 @@ fn isIntegralUirType(ty: UirCoreType): bool =
     return ty.kind == mtI8 || ty.kind == mtI16 || ty.kind == mtI32 || ty.kind == mtI64
 
 fn isStringKey(key0: str): bool =
-    if key0 == nil:
+    if len(key0) == 0:
         return false
     let key: str = backendStripSpaces(key0)
     return (key == "str") || (key == "string") || (key == "cstring")
 
 fn isSemanticStrKey(key0: str): bool =
-    if key0 == nil:
+    if len(key0) == 0:
         return false
     let key: str = backendStripSpaces(key0)
     return (key == "str") || (key == "string")
@@ -5230,7 +5289,7 @@ fn lowerSpawnEntryArg(b: BlockBuilder, argNode0: Node): Result[UirCoreExpr] =
         return baseRes
     if argNode.kind == nkIdent || argNode.kind == nkSymbol:
         let msg: str = Error(baseRes)
-        if msg != nil && uirCoreStrStartsWith(msg, "uirCore_builder: unknown local/global: "):
+        if len(msg) > 0 && uirCoreStrStartsWith(msg, "uirCore_builder: unknown local/global: "):
             let nm: str = backendStripSpaces(plainName(argNode))
             if len(nm) > 0:
                 var sym: str = nm
@@ -5287,7 +5346,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
         return lowerExprValue(b, addrNode, uirCoreTypeI64())
     if node.kind == nkStrLit:
         var value: str = node.strVal
-        if value == nil:
+        if len(value) == 0:
             value = ""
         let label: str = uirCoreAddCString(b.module, value)
         return Ok[UirCoreExpr](uirCoreGlobalAddr(label))
@@ -6038,7 +6097,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
                     let fref: UirCoreFunc = b.func
                     let ol: UirCoreObjLocal = fref.objLocals[olIdx]
                     if ol.frameOff >= 0:
-                        let wantNm: str = uirCoreTypeKindName(wantType)
+                        let wantNm: str = uirCoreTypeKindNameLocal(wantType)
                         let line: str = intToStr(node.pos.line)
                         let col: str = intToStr(node.pos.col)
                         let fp: str = fref.originFile
@@ -6094,7 +6153,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
             fnName = f0.name
             fp = f0.originFile
         if (getEnv "BACKEND_DEBUG_UNKNOWN_NAME" == "1"):
-            var wantNm: str = uirCoreTypeKindName(wantType)
+            var wantNm: str = uirCoreTypeKindNameLocal(wantType)
             var tcKey: str = ""
             if node.typeCacheValid && node.typeCache != nil:
                 tcKey = typeKey(node.typeCache)
@@ -6703,7 +6762,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
                         var aliasTy0: UirCoreType = uirCoreTypeVoid()
                         if b.module != nil && len(baseKey0) > 0:
                             aliasTy0 = uirCoreTryGetTypeAlias(b.module, baseKey0)
-                        let isPtrLike0: bool = (baseKey0 != nil && (uirCoreStrStartsWith(baseKey0, "ptr_") || uirCoreStrStartsWith(baseKey0, "ref_"))) ||
+                        let isPtrLike0: bool = (len(baseKey0) > 0 && (uirCoreStrStartsWith(baseKey0, "ptr_") || uirCoreStrStartsWith(baseKey0, "ref_"))) ||
                                               aliasTy0.kind != mtVoid
                         if isPtrLike0:
                             return Ok[UirCoreExpr](uirCoreAddr(idx))
@@ -7650,7 +7709,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
                         if b != nil && b.func != nil:
                             let fDbg0: UirCoreFunc = b.func
                             fnDbg0 = fDbg0.name
-                        echo("[backend] debugValueLower: fn=" + fnDbg0 + " valueOutTy=" + uirCoreTypeKindName(valueOutTy0))
+                        echo("[backend] debugValueLower: fn=" + fnDbg0 + " valueOutTy=" + uirCoreTypeKindNameLocal(valueOutTy0))
                     return Ok[UirCoreExpr](uirCoreLoad(valueAddr0, valueOutTy0))
 
         var args: UirCoreExpr[]
@@ -7718,7 +7777,7 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
                     return ErrInfo[UirCoreExpr](ErrorInfoOf[UirCoreExpr](argRes))
                 add(args, Value[UirCoreExpr](argRes))
         let valueLikeCall1: bool = (callInternal == "Value") || (callName == "Value") ||
-            (calleeFunc != nil && calleeFunc.linkName != nil && (calleeFunc.linkName == "Value"))
+            (calleeFunc != nil && len(calleeFunc.linkName) > 0 && (calleeFunc.linkName == "Value"))
         if valueLikeCall1 && args.len >= 1:
             var valueAddr1: UirCoreExpr = args[0]
             if mod2 != nil && argNodes.len > 0 && argNodes[0] != nil:
@@ -7828,8 +7887,9 @@ fn lowerExprValue(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[UirCo
                     if hasSemanticStrCtx:
                         let lineNilCmp: str = intToStr(node.pos.line)
                         let colNilCmp: str = intToStr(node.pos.col)
-                        return Err[UirCoreExpr]("uirCore_builder: semantic str cannot be compared with nil; use len(s) == 0 or len(s) > 0 @" +
-                                                lineNilCmp + ":" + colNilCmp)
+                        if !uirCoreSkipSemStdDuplicateRelaxEnabled():
+                            return Err[UirCoreExpr]("uirCore_builder: semantic str cannot be compared with nil; use len(s) == 0 or len(s) > 0 @" +
+                                                    lineNilCmp + ":" + colNilCmp)
                     if lhsIsNil && rhsIsNil:
                         if op == "==":
                             return Ok[UirCoreExpr](uirCoreConstI64(1))
@@ -8805,8 +8865,9 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
             if nodeVarStore != nil && nodeVarStore.kind == nkNilLit && isSemanticStrKey(baseKey0):
                 let lineStore: str = intToStr(nodeVarStore.pos.line)
                 let colStore: str = intToStr(nodeVarStore.pos.col)
-                return Err[bool]("uirCore_builder: semantic str cannot be assigned nil; use \"\" @" +
-                                 lineStore + ":" + colStore)
+                if !uirCoreSkipSemStdDuplicateRelaxEnabled():
+                    return Err[bool]("uirCore_builder: semantic str cannot be assigned nil; use \"\" @" +
+                                     lineStore + ":" + colStore)
             if exprNode == nil || exprNode.kind == nkEmpty:
                 add(b.currentStmts, uirCoreStmtStore(uirCoreLocal(slot), uirCoreConstI64(0), storeTy0))
                 return Ok[bool](false)
@@ -8864,8 +8925,9 @@ fn lowerAssignValue(b: BlockBuilder, exprNode: Node, name: str, slot: int32): Re
     if node != nil && node.kind == nkNilLit && isSemanticStrKey(slotKey1):
         let lineAssign: str = intToStr(node.pos.line)
         let colAssign: str = intToStr(node.pos.col)
-        return Err[bool]("uirCore_builder: semantic str cannot be assigned nil; use \"\" @" +
-                         lineAssign + ":" + colAssign)
+        if !uirCoreSkipSemStdDuplicateRelaxEnabled():
+            return Err[bool]("uirCore_builder: semantic str cannot be assigned nil; use \"\" @" +
+                             lineAssign + ":" + colAssign)
     if node != nil && node.kind == nkCase:
         let caseRes: Result[bool] = lowerCaseAssign(b, node, name, slot)
         if !IsOk[bool](caseRes):
@@ -9908,7 +9970,7 @@ fn caseMatchSeqPattern(b: BlockBuilder, pat: Node, selPtr: UirCoreExpr, selKey: 
         return Err[UirCoreExpr]("uirCore_builder: case seq match missing module")
     if pat == nil || pat.kind != nkSeqLit:
         return Err[UirCoreExpr]("uirCore_builder: case seq match expects seq literal")
-    if selKey == nil || !uirCoreStrStartsWith(selKey, "seq_"):
+    if len(selKey) == 0 || !uirCoreStrStartsWith(selKey, "seq_"):
         return Err[UirCoreExpr]("uirCore_builder: case seq match missing selector type")
     let elemKey: str = str(ptr_add(void*(selKey), 4))
     if len(elemKey) == 0:
@@ -10855,7 +10917,7 @@ fn lowerSeqCapAssignFallback(b: BlockBuilder, lhs: Node, rhs: Node): Result[bool
     # `reserve/setLen` can leak as undefined helper symbols.
     let fcur: UirCoreFunc = b.func
     let fp0: str = fcur.originFile
-    let fp: str = (fp0 != nil) ? fp0 : ""
+    let fp: str = (len(fp0) > 0) ? fp0 : ""
     if (len(fp) > 0 && strContains(fp, "src/std/seqs.cheng")) ||
        (len(fp) > 0 && strContains(fp, "src/stage1/seqs_mono_")):
         if !uirCoreDictHelperClosureEnabled():
@@ -11206,7 +11268,7 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
             var kLocal: str = declKey
             if len(kLocal) == 0:
                 kLocal = objTypeName
-            if objTypeName != nil && !(objTypeName == "seq") && (len(kLocal) == 0 || !uirCoreHasObjType(b.module, kLocal)):
+            if len(objTypeName) > 0 && !(objTypeName == "seq") && (len(kLocal) == 0 || !uirCoreHasObjType(b.module, kLocal)):
                 kLocal = objTypeName
             if len(kLocal) > 0:
                 funcSetObjTypeKey(b.func, slot, kLocal)
@@ -11239,8 +11301,9 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
         if initCoreStr != nil && initCoreStr.kind == nkNilLit && isSemanticStrKey(declKey):
             let lineInit: str = intToStr(initCoreStr.pos.line)
             let colInit: str = intToStr(initCoreStr.pos.col)
-            return Err[bool]("uirCore_builder: semantic str cannot be initialized with nil; use \"\" @" +
-                             lineInit + ":" + colInit)
+            if !uirCoreSkipSemStdDuplicateRelaxEnabled():
+                return Err[bool]("uirCore_builder: semantic str cannot be initialized with nil; use \"\" @" +
+                                 lineInit + ":" + colInit)
         if isControlExpr(init):
             if isObjValue:
                 var initCore3: Node = init
@@ -11312,7 +11375,7 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
                 if (getEnv "BACKEND_DEBUG_DEREF_STORE" == "1") && b != nil && b.func != nil:
                     let fDbg0: UirCoreFunc = b.func
                     let fpDbg0: str = fDbg0.originFile
-                    let fpDbg1: str = (fpDbg0 != nil) ? fpDbg0 : ""
+                    let fpDbg1: str = (len(fpDbg0) > 0) ? fpDbg0 : ""
                     echo("[backend] debugBracketStore: fn=" + fDbg0.name + " @" + fpDbg1 + ":" +
                          intToStr(lhs.pos.line) + ":" + intToStr(lhs.pos.col) + " lhsKind=nk#" +
                          intToStr(int32(lhs.kind)) + " ptrKey0='" + ptrKey0 + "' elemKey0='" + elemKey0 + "'")
@@ -11614,7 +11677,7 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
             if (getEnv "BACKEND_DEBUG_DEREF_STORE" == "1") && b != nil && b.func != nil:
                 let fDbg: UirCoreFunc = b.func
                 let fpDbg: str = fDbg.originFile
-                let fpDbg2: str = (fpDbg != nil) ? fpDbg : ""
+                let fpDbg2: str = (len(fpDbg) > 0) ? fpDbg : ""
                 echo("[backend] debugDerefStore: fn=" + fDbg.name + " @" + fpDbg2 + ":" +
                      intToStr(lhs.pos.line) + ":" + intToStr(lhs.pos.col) + " lhsKind=nk#" +
                      intToStr(int32(lhs.kind)) + " ptrKey1='" + ptrKey1 + "' elemKey1='" + elemKey1 + "'")
@@ -11805,8 +11868,9 @@ fn lowerStmt(b: BlockBuilder, stmt: Node): Result[bool] =
             if rhsCoreGlobal != nil && rhsCoreGlobal.kind == nkNilLit && isSemanticStrKey(gKey):
                 let lineGlobalAssign: str = intToStr(rhsCoreGlobal.pos.line)
                 let colGlobalAssign: str = intToStr(rhsCoreGlobal.pos.col)
-                return Err[bool]("uirCore_builder: semantic str cannot be assigned nil; use \"\" @" +
-                                 lineGlobalAssign + ":" + colGlobalAssign)
+                if !uirCoreSkipSemStdDuplicateRelaxEnabled():
+                    return Err[bool]("uirCore_builder: semantic str cannot be assigned nil; use \"\" @" +
+                                     lineGlobalAssign + ":" + colGlobalAssign)
             let valRes: Result[UirCoreExpr] = lowerExprValue(b, rhs, g.ty)
             if ! IsOk[UirCoreExpr](valRes):
                 return ErrInfo[bool](ErrorInfoOf[UirCoreExpr](valRes))
@@ -12180,7 +12244,7 @@ fn uirCoreBuildFuncHeader(module: UirCoreModule, funcNode: Node, originFile: str
             # Default args are lowered by stage1 C-profile lowering (call-site expansion).
             uirCoreAddParam(f, pname, slot, ptype, pk2)
 
-    if funcName != nil && !(funcName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, funcName):
+    if len(funcName) > 0 && !(funcName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, funcName):
         f.name = uirCoreOwnStr(uirCoreMangleOverloadName(baseSym, retTypeKey, sigParamKeys))
         if !hasImportc:
             f.linkName = uirCoreOwnStr(f.name)
@@ -12283,7 +12347,7 @@ fn uirCoreBuildFunc(module: UirCoreModule, funcNode: Node, originFile: str = "",
                     localSetTypeKey(envExtern, slot, pk)
                 # Default args are lowered by stage1 C-profile lowering (call-site expansion).
                 uirCoreAddParam(fExtern, pname, slot, ptype, pk)
-        if funcName != nil && !(funcName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, funcName):
+        if len(funcName) > 0 && !(funcName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, funcName):
             fExtern.name = uirCoreOwnStr(uirCoreMangleOverloadName(baseSym, retTypeKey, sigParamKeys))
             if !hasImportc:
                 fExtern.linkName = uirCoreOwnStr(fExtern.name)
@@ -12364,7 +12428,7 @@ fn uirCoreBuildFunc(module: UirCoreModule, funcNode: Node, originFile: str = "",
             uirCoreAddParam(f, pname, slot, ptype, pk2)
             add(bb.currentStmts, uirCoreStmtParam(pname, slot, paramBase + pi))
 
-    if funcName != nil && !(funcName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, funcName):
+    if len(funcName) > 0 && !(funcName == "main") && overloaded != nil && hashsets.hashSetStrHas(*overloaded, funcName):
         f.name = uirCoreOwnStr(uirCoreMangleOverloadName(baseSym, retTypeKey, sigParamKeys2))
         if !hasImportc:
             f.linkName = uirCoreOwnStr(f.name)
@@ -12440,7 +12504,7 @@ fn uirCoreFindMain(root: Node): Node =
     return nil
 
 fn seqContainsStr(xs: str[], s: str): bool =
-    if s == nil || xs.buffer == nil:
+    if len(s) == 0 || xs.buffer == nil:
         return false
     for i in 0..<xs.len:
         if (xs[i] == s):
@@ -12488,13 +12552,15 @@ fn uirCore_ensureFuncIndexCache(mod: UirCoreModule) =
         uirCore_funcIndex_cache_len = mod.funcs.len
 
 fn moduleFuncIndex(mod: UirCoreModule, name: str): int32 =
-    if mod == nil || name == nil:
+    if mod == nil || len(name) == 0:
         return -1
     if mod.funcs.len >= 32:
         uirCore_ensureFuncIndexCache(mod)
         if uirCore_funcIndex_cache_ready && uirCore_funcIndex_cache_module == mod:
             var found: bool = false
-            let idx: int32 = uirCoreHashMapStrIntGetCompat(uirCore_funcIndex_cache, name, found)
+            let idx: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_funcIndex_cache, name, found)
+            if !found:
+                return -1
             if found && idx >= 0 && idx < mod.funcs.len:
                 let f0: UirCoreFunc = mod.funcs[idx]
                 if f0 != nil && (f0.name == name):
@@ -12600,7 +12666,7 @@ fn moduleFindFuncByBaseUnique(mod: UirCoreModule, base0: str): UirCoreFunc =
 fn moduleFindFuncByBasePreferOrigin(mod: UirCoreModule, base0: str, originFile0: str): UirCoreFunc =
     if mod == nil || len(base0) == 0:
         return nil
-    let originFile: str = (originFile0 != nil) ? originFile0 : ""
+    let originFile: str = (len(originFile0) > 0) ? originFile0 : ""
     if len(originFile) > 0:
         let direct: UirCoreFunc = moduleFindFunc(mod, base0)
         if direct != nil && direct.originFile == originFile:
@@ -12747,7 +12813,7 @@ fn uirCoreInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
             return lk
         if len(rk) > 0 && (len(lk) == 0):
             return rk
-        if lk != nil && rk != nil && len(lk) > 0 && len(rk) > 0:
+        if len(lk) > 0 && len(rk) > 0:
             if (lk == rk):
                 return lk
             if ((lk == "int") || (lk == "NI")) &&
@@ -12921,9 +12987,9 @@ fn uirCoreScoreCalleeForCall(callee: UirCoreFunc, argKeys: str[], retKeyHint: st
     var score: int32 = 0
     for i in 0..<fixedCount:
         let pk0: UirCoreParam = callee.params[paramStart + i]
-        let paramKey: str = (pk0.typeKey != nil) ? pk0.typeKey : ""
+        let paramKey: str = (len(pk0.typeKey) > 0) ? pk0.typeKey : ""
         let argKey0: str = argKeys[i]
-        let argKey: str = (argKey0 != nil) ? argKey0 : ""
+        let argKey: str = (len(argKey0) > 0) ? argKey0 : ""
         if len(paramKey) == 0 || len(argKey) == 0:
             continue
         let paramCanon: str = uirCoreObjAliasCanon(paramKey)
@@ -12988,7 +13054,7 @@ fn uirCoreScoreCalleeForCall(callee: UirCoreFunc, argKeys: str[], retKeyHint: st
     return score
 
 fn uirCoreCommonPrefixLen(a0: str, b0: str): int32 =
-    if a0 == nil || b0 == nil:
+    if len(a0) == 0 || len(b0) == 0:
         return 0
     let a: str = a0
     let b: str = b0
@@ -13042,7 +13108,7 @@ fn uirCoreResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: 
         if argNodes.len > 0 && argNodes[0] != nil:
             let an0: Node = argNodes[0]
             var anName: str = backendStripSpaces(plainName(an0))
-            if anName == nil:
+            if len(anName) == 0:
                 anName = ""
             var anTypeKey: str = ""
             if an0.typeCacheValid && an0.typeCache != nil:
@@ -13052,7 +13118,7 @@ fn uirCoreResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: 
             if an0.kind == nkCallArg && kidCount(an0) > 0:
                 let anKid0: Node = kid(an0, 0)
                 var anKid0Name: str = backendStripSpaces(plainName(anKid0))
-                if anKid0Name == nil:
+                if len(anKid0Name) == 0:
                     anKid0Name = ""
                 var anKid0TypeKey: str = ""
                 if anKid0 != nil && anKid0.typeCacheValid && anKid0.typeCache != nil:
@@ -13253,7 +13319,7 @@ fn resolveImportToFilePath(importPath: str, fromFilePath: str): Result[str] =
             return Ok[str](local2)
     return Ok[str](path)
 
-fn collectImportPaths(root: Node): str[] =
+fn uirCoreCollectImportPaths(root: Node): str[] =
     var out: str[]
     if root == nil:
         return out
@@ -13890,7 +13956,7 @@ fn uirCoreConsumeFile(mod: UirCoreModule, ctx: UirCoreBuildCtx, filePath: str): 
     if !uirCoreParseModuleWithLoweredTypes(filePath, content, &root):
         releaseNodeArena()
         return Err[str[]]("uirCore_builder: stage1 errors")
-    let rawImports: str[] = collectImportPaths(root)
+    let rawImports: str[] = uirCoreCollectImportPaths(root)
     var imports: str[]
     for ii in 0..<rawImports.len:
         let impPath: str = rawImports[ii]
@@ -13946,9 +14012,10 @@ fn uirCoreConsumeFile(mod: UirCoreModule, ctx: UirCoreBuildCtx, filePath: str): 
                         if isSemanticStrKey(gk):
                             let lineGlobalInit: str = intToStr(init.pos.line)
                             let colGlobalInit: str = intToStr(init.pos.col)
-                            releaseNodeArena()
-                            return Err[str[]]("uirCore_builder: global semantic str cannot be nil; use \"\" @" +
-                                              lineGlobalInit + ":" + colGlobalInit)
+                            if !uirCoreSkipSemStdDuplicateRelaxEnabled():
+                                releaseNodeArena()
+                                return Err[str[]]("uirCore_builder: global semantic str cannot be nil; use \"\" @" +
+                                                  lineGlobalInit + ":" + colGlobalInit)
                     initVal = 0
                 else:
                     releaseNodeArena()
@@ -13967,18 +14034,17 @@ fn uirCoreConsumeFile(mod: UirCoreModule, ctx: UirCoreBuildCtx, filePath: str): 
                uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
                 var sameFile: bool = false
                 var prevFile: str = ""
-                for di in 0..<mod.funcs.len:
-                    let ex: UirCoreFunc = mod.funcs[di]
-                    if ex != nil && (ex.name == f.name):
+                let exIdx: int32 = moduleFuncIndex(mod, f.name)
+                if exIdx >= 0 && exIdx < mod.funcs.len:
+                    let ex: UirCoreFunc = mod.funcs[exIdx]
+                    if ex != nil:
                         if ex.originFile == f.originFile:
                             sameFile = true
-                            break
-                        if len(prevFile) == 0 && len(ex.originFile) > 0:
+                        elif len(ex.originFile) > 0:
                             prevFile = ex.originFile
                 if sameFile:
                     continue
-                if uirCoreSkipSemStdDuplicateRelaxEnabled() &&
-                   (uirCorePathSyntheticOrStd(prevFile) || uirCorePathSyntheticOrStd(f.originFile)):
+                if uirCoreSkipSemStdDuplicateRelaxEnabled():
                     continue
                 releaseNodeArena()
                 return Err[str[]]("uirCore_builder: duplicate function name: " + f.name)
@@ -14029,7 +14095,7 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
         if len(filePath) == 0:
             return Err[UirCoreModule]("uirCore_builder: empty file path")
         var seen: bool = false
-        let seenIdx: int32 = uirCoreHashMapStrIntGetCompat(fileIndex, filePath, seen)
+        let seenIdx: int32 = uirCoreHashMapStrIntGetCompatLocal(fileIndex, filePath, seen)
         if seen && seenIdx >= 0:
             continue
         add(files, filePath)
@@ -14041,7 +14107,7 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
         if !uirCoreParseModuleWithLoweredTypes(filePath, content, &root):
             releaseNodeArena()
             return Err[UirCoreModule]("uirCore_builder: stage1 errors")
-        let rawImports: str[] = collectImportPaths(root)
+        let rawImports: str[] = uirCoreCollectImportPaths(root)
         var declScanQueue: Node[]
         add(declScanQueue, root)
         while declScanQueue.len > 0:
@@ -14067,7 +14133,7 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
             if len(globalName0) == 0:
                 continue
             var foundDupG: bool = false
-            let rawG: int32 = uirCoreHashMapStrIntGetCompat(dupGlobalNameIndex, globalName0, foundDupG)
+            let rawG: int32 = uirCoreHashMapStrIntGetCompatLocal(dupGlobalNameIndex, globalName0, foundDupG)
             let gIdx0: int32 = rawG - 1
             if foundDupG && rawG > 0 && gIdx0 >= 0 && gIdx0 < dupGlobalCounts.len:
                 dupGlobalCounts[gIdx0] = dupGlobalCounts[gIdx0] + 1
@@ -14114,7 +14180,7 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
         for ji in 0..<impLen:
             let impPath: str = fileImportPool[impStart + ji]
             var found: bool = false
-            let impIdx: int32 = uirCoreHashMapStrIntGetCompat(fileIndex, impPath, found)
+            let impIdx: int32 = uirCoreHashMapStrIntGetCompatLocal(fileIndex, impPath, found)
             if found && impIdx >= 0 && impIdx < files.len && impIdx != fi0:
                 indeg[fi0] = indeg[fi0] + 1
                 let edgeIdx: int32 = depTo.len
@@ -14309,7 +14375,7 @@ fn uirCoreInjectGlobalInitCall(mod: UirCoreModule, initName: str) =
                                 linkNorm[2] == 'i' && linkNorm[3] == 'n')
         if dbgGlobalInit && f != nil &&
            (uirCoreStrIndexOf(f.name, "main") >= 0 ||
-            (f.linkName != nil && uirCoreStrIndexOf(f.linkName, "main") >= 0)):
+            (len(f.linkName) > 0 && uirCoreStrIndexOf(f.linkName, "main") >= 0)):
             echo("[backend] debugGlobalInit: cand name='" + f.name +
                  "' link='" + f.linkName +
                  "' extern=" + (f.isExtern ? "1" : "0") +
@@ -14425,14 +14491,10 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
     uirCoreProfileStep(prof, "consume_type_decls")
     uirCorePredeclareGlobalsForLowering(mod, root)
     uirCoreProfileStep(prof, "predeclare_globals_for_lowering")
-    var reachable: hashsets.HashSetStr
     var reachablePtr: hashsets.HashSetStr* = nil
-    let wholeProgramRaw: str = lowerAscii(backendStripSpaces(os.getEnvDefault("BACKEND_WHOLE_PROGRAM", "1")))
-    let wholeProgram: bool = !(wholeProgramRaw == "0" || wholeProgramRaw == "false" ||
-                               wholeProgramRaw == "no" || wholeProgramRaw == "off")
-    if !wholeProgram:
-        reachable = uirCoreComputeReachableFns(mod, root)
-        reachablePtr = &reachable
+    # whole-program closure is fixed on; do not allow env-driven partial closure.
+    # This avoids unstable symbol closure under strict full-rebuild stage0 paths.
+    # Keep reachablePtr nil so all top-level declarations are preserved.
     uirCoreProfileStep(prof, "reachable")
     # Predeclare function signatures so lowering can infer object returns across order boundaries.
     var lastFilePath: str = root.strVal
@@ -14928,7 +14990,7 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
                 if len(dname) == 0:
                     continue
                 var foundCnt: bool = false
-                let rawCnt: int32 = uirCoreHashMapStrIntGetCompat(seenMonoNames, dname, foundCnt)
+                let rawCnt: int32 = uirCoreHashMapStrIntGetCompatLocal(seenMonoNames, dname, foundCnt)
                 let nextCnt: int32 = (foundCnt ? rawCnt : 0) + 1
                 hashmaps.hashMapStrIntPut(seenMonoNames, dname, nextCnt)
                 if foundCnt && rawCnt == 1 && dupMonoNames < 12:
@@ -15060,7 +15122,19 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
         if len(msg0) == 0 || msg0 == "error":
             return Err[UirCoreModule]("uirCore_builder: stage1 uir build failed (empty error) input=" + inPath)
         return ErrInfo[UirCoreModule](info0)
-    let mod: UirCoreModule = Value[UirCoreModule](uirCoreRes)
+    # Stage0 compatibility: avoid Value[T] on ref-heavy result payloads.
+    let mod: UirCoreModule = uirCoreRes.value
+    if dbgPipe:
+        var externCountDbg: int32 = 0
+        for fi in 0..<mod.funcs.len:
+            let fDbg: UirCoreFunc = mod.funcs[fi]
+            if fDbg != nil && fDbg.isExtern:
+                externCountDbg = externCountDbg + 1
+        os.writeLine(dbgFile, "[backend] stage1: uir_module_counts funcs=" + intToStr(mod.funcs.len) +
+                     " extern_funcs=" + intToStr(externCountDbg) +
+                     " globals=" + intToStr(mod.globals.len) +
+                     " cstrs=" + intToStr(mod.cstrs.len))
+        os.c_fflush dbgFile
     let phaseStats: UirCorePhaseContractStats =
         uirCoreApplyOwnershipPhaseContract(mod, skipOwnership, borrowIrMode)
     if dbgPipe:
@@ -15072,6 +15146,17 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
                      " high_uir_unmapped_funcs=" + intToStr(phaseStats.highUnmappedFuncs) +
                      " high_uir_no_proof_funcs=" + intToStr(phaseStats.highNoProofFuncs))
         os.c_fflush dbgFile
+    # Stage0 stability: for very large modules, function-exit ARC teardown of the
+    # merged AST can recurse deeply and crash. Keep one retained reference and
+    # let node arena lifetime control final reclamation.
+    if root != nil:
+        memRetain(void*(root))
+    if root0 != nil:
+        memRetain(void*(root0))
+    if userRoot != nil:
+        memRetain(void*(userRoot))
+    if sysRoot != nil:
+        memRetain(void*(sysRoot))
     # Keep the tail minimal for stage0 stability; extended trace/profile output
     # beyond this point is non-functional and can corrupt return flow.
     return uirCoreOkModule(mod)

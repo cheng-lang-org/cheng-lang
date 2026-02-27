@@ -28,7 +28,7 @@
 - `rawptr_contract.forbid.user_raw_ptr_syntax=1`
 - `rawptr_contract.forbid.pointer_arithmetic=1`
 - `rawptr_contract.forbid.user_void_ptr=1`
-- `rawptr_contract.required_gate.backend.rawptr_hard_gate=1`
+- `rawptr_contract.required_gate.backend.rawptr_contract=1`
 
 以下是实现“绝对零指针 FFI”的 4 大核心设计（我称之为 **语义影子桥接 Semantic Shadow Bridge**）：
 

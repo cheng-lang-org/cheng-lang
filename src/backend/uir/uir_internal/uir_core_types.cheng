@@ -5,7 +5,7 @@ import std/result
 import std/hashmaps
 
 fn uirCoreOwnStr(s: str): str =
-    if s == nil:
+    if len(s) == 0:
         return ""
     memRetain(void*(s))
     return s
@@ -202,9 +202,40 @@ var
     uirCore_cstrs_cache_ready: bool
 
 fn uirCoreHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
-    let v: int32 = hashmaps.hashMapStrIntGetEx(m, key, found)
-    if found:
-        return v
+    if len(key) == 0 || m.mask == 0:
+        found = false
+        return -1
+    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
+        found = false
+        return -1
+    var mask: int32 = int32(m.mask)
+    if mask < 0:
+        found = false
+        return -1
+    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
+        let cap0: int32 = m.states.len
+        if m.keys.len < cap0 || m.vals.len < cap0:
+            found = false
+            return -1
+        mask = cap0 - 1
+    if mask < 0:
+        found = false
+        return -1
+    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
+    var scanned: int32 = 0
+    let __for_start_scanned_compat = scanned
+    for __for_scanned_compat in __for_start_scanned_compat..mask:
+        scanned = __for_scanned_compat
+        let st: uint8 = m.states[probe]
+        if st == uint8(0):
+            found = false
+            return -1
+        if hashmaps.hashMapStrEq(m.keys[probe], key):
+            found = true
+            return m.vals[probe]
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    found = false
     return -1
 
 fn uirCore_buildTypeAliasIndexCache(module: UirCoreModule) =
@@ -247,7 +278,7 @@ fn uirCore_buildCStringIndexCache(module: UirCoreModule) =
     uirCore_cstrs_cache = hashmaps.hashMapStrIntInit(module.cstrs.len * 2 + 8)
     for i in 0..<module.cstrs.len:
         let c: UirCoreCString = module.cstrs[i]
-        if c.value != nil:
+        if len(c.value) > 0:
             hashmaps.hashMapStrIntPut(uirCore_cstrs_cache, c.value, i + 1)
     uirCore_cstrs_cache_len = module.cstrs.len
     uirCore_cstrs_cache_ready = true
@@ -708,7 +739,7 @@ fn uirCoreTypeAlignPow2(ty: UirCoreType): int32 =
     return 0
 
 fn uirCoreFindTypeAlias(module: UirCoreModule, name: str): int32 =
-    if module == nil || name == nil:
+    if module == nil || len(name) == 0:
         return -1
     if module.typeAliases.len >= 32:
         if uirCore_typeAliases_cache_module != module || !uirCore_typeAliases_cache_ready ||
@@ -761,7 +792,7 @@ fn uirCoreAddTypeAlias(module: UirCoreModule, name: str, ty: UirCoreType) =
         uirCore_typeAliases_cache_len = module.typeAliases.len
 
 fn uirCoreFindObjType(module: UirCoreModule, name: str): int32 =
-    if module == nil || name == nil:
+    if module == nil || len(name) == 0:
         return -1
     if module.objTypes.len >= 32:
         if uirCore_objTypes_cache_module != module || !uirCore_objTypes_cache_ready ||
@@ -1139,7 +1170,7 @@ fn uirCoreGlobalOriginFileOf(global: UirCoreGlobal): str =
     return global.originFile
 
 fn uirCoreFnv1a64(s: str): int64 =
-    if s == nil:
+    if len(s) == 0:
         return int64(0)
     var h: uint64 = uint64(1469598103934665603)
     for i in 0..<len(s):
@@ -1168,7 +1199,7 @@ fn uirCoreU64ToHex(v: int64): str =
 fn uirCoreFindCStringLabel(module: UirCoreModule, value: str): str =
     if module == nil:
         return ""
-    let v: str = (value == nil) ? "" : value
+    let v: str = len(value) == 0 ? "" : value
     if module.cstrs.len >= 32:
         if uirCore_cstrs_cache_module != module || !uirCore_cstrs_cache_ready ||
            uirCore_cstrs_cache_len != module.cstrs.len:
@@ -1189,7 +1220,7 @@ fn uirCoreAddCString(module: UirCoreModule, value: str): str =
     if module == nil:
         return ""
     var v: str = value
-    if v == nil:
+    if len(v) == 0:
         v = ""
     let existing: str = uirCoreFindCStringLabel(module, v)
     if len(existing) > 0:
@@ -1207,11 +1238,11 @@ fn uirCoreAddCString(module: UirCoreModule, value: str): str =
     return label
 
 fn uirCoreStrCmp(a: str, b: str): int32 =
-    if a == nil && b == nil:
+    if len(a) == 0 && len(b) == 0:
         return 0
-    if a == nil:
+    if len(a) == 0:
         return -1
-    if b == nil:
+    if len(b) == 0:
         return 1
     let na: int32 = len(a)
     let nb: int32 = len(b)
@@ -1605,7 +1636,7 @@ fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
                     return Err[bool]("uirCore_validate: stmt missing expr (" + func.name + ":" + b2.label +
                                      " si=" + intToStr(si) +
                                      " kind=" + uirCoreStmtKindName(s.kind) +
-                                     " name=" + (s.name == nil ? "" : s.name) +
+                                     " name=" + (len(s.name) == 0 ? "" : s.name) +
                                      " slot=" + intToStr(s.slot) + ")")
                 let eres: Result[bool] = uirCoreValidateExpr(func, s.expr, func.name + ":" + b2.label + "/stmt")
                 if ! IsOk[bool](eres):
@@ -1650,7 +1681,7 @@ fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
         if func.localTypes.len > 0:
             let slotTy: UirCoreType = func.localTypes[ol2.slot]
             if slotTy.kind != mtI64:
-                let tk: str = (ol2.typeKey != nil) ? ol2.typeKey : ""
+                let tk: str = len(ol2.typeKey) > 0 ? ol2.typeKey : ""
                 return Err[bool]("uirCore_validate: obj local slot not i64 (" + func.name +
                                  " slot=" + intToStr(ol2.slot) +
                                  " ty=" + uirCoreTypeKindName(slotTy) +

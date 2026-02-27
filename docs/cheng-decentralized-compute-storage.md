@@ -1042,10 +1042,6 @@ package_id = "pkg://cheng/app-demo"
 [[dependencies]]
 package_id = "pkg://cheng/fs"
 channel = "stable"
-
-[[dependencies]]
-package_id = "pkg://cheng/net"
-channel = "edge"
 ```
 
 manifest 示例（`docs/cheng-package-manifest.yaml`）：
@@ -1054,8 +1050,6 @@ package_id: "pkg://cheng/app-demo"
 dependencies:
   - package_id: "pkg://cheng/fs"
     channel: "stable"
-  - package_id: "pkg://cheng/net"
-    channel: "edge"
 ```
 
 ## 关键指标（用于评估成败）

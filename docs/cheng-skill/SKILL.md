@@ -72,23 +72,23 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
   - `emit=obj` 为 internal gate 兼容入口，需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`；公共入口 `chengc` 固定拒绝 obj 输出。
 - 生产闭环入口 `cheng_tooling backend_prod_closure` 仅接受 `ABI=v2_noptr`。
 - 验证入口迁移：`verify_*` 已并入 `cheng_tooling` 原生子命令；统一执行口径为 `cheng_tooling <verify_id>`。
-- 主闭环默认 no-pointer 兼容口径（`STAGE1_STD_NO_POINTERS=1`、`STAGE1_STD_NO_POINTERS_STRICT=0`、`STAGE1_NO_POINTERS_NON_C_ABI=1`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`），strict `std` 门禁由 `verify_backend_abi_v2_noptr` 专项覆盖。
-- `verify_backend_abi_v2_noptr` 固定仅校验 `v2_noptr`；其 non-C-ABI 子门禁会显式设 `STAGE1_STD_NO_POINTERS=0` 以隔离诊断，且默认 `BACKEND_ABI_V2_NOPTR_NON_C_ABI_STRICT=1`（阻断）。
+- 主闭环默认 no-pointer 兼容口径（`STAGE1_STD_NO_POINTERS=1`、`STAGE1_STD_NO_POINTERS_STRICT=0`、`STAGE1_NO_POINTERS_NON_C_ABI=1`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`），CLI 收口由 `verify_backend_noptr_default_cli` 覆盖。
+- `verify_backend_abi_v2_noptr` 现为兼容别名（转发到 `verify_backend_noptr_default_cli`），不再维护独立 gate 语义。
 - `verify_backend_closedloop` 默认执行 `backend.spawn_api_gate`（v2 友好 fixture，默认 API 禁 raw spawn、legacy 显式入口可用）。
 - `BACKEND_DRIVER` 未显式设置时，`backend_prod_closure` 主门禁固定通过 `backend_driver_path` 选择稳定 driver（默认 `artifacts/backend_driver/cheng`）；缺失则重建，体检失败阻断。默认不再自动回退其它 stage0 候选；仅在显式设置 `TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=1` 时，才会追加探测 `dist/releases/current/cheng -> artifacts/backend_seed/cheng.stage2 -> artifacts/backend_selfhost_self_obj/cheng.stage2 -> ./cheng`（命中 `UE/UEs` 仍会跳过）。
 - `backend_prod_closure` 的 stage0 探针与 selfhost 口径对齐（`STAGE1_NO_POINTERS_NON_C_ABI=0`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`、`STAGE1_SKIP_SEM=1`、`GENERIC_MODE=dict`、`GENERIC_SPEC_BUDGET=0`、`STAGE1_SKIP_OWNERSHIP=1`），避免误选不稳定 stage0。
 - `backend_prod_closure` 主门禁固定 stable driver（默认 `artifacts/backend_driver/cheng`）；selfhost 仅用于 stage0/专项 gate，不再自动切换主门禁 driver。
-- `backend_prod_closure` 的 selfhost 自举步骤默认会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`；non-C-ABI no-pointer 收敛由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁负责。
-- `backend.abi_v2_noptr` 在 `backend_prod_closure` 中默认优先使用本地 `artifacts/backend_driver/cheng`（要求具备 non-C-ABI no-pointer 诊断字符串）；其次当前 `BACKEND_DRIVER`，再到 selfhost `cheng.stage2/stage1`；可用 `BACKEND_ABI_V2_DRIVER` 显式覆盖。
+- `backend_prod_closure` 的 selfhost 自举步骤默认会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`；non-C-ABI no-pointer 收敛由后续 `backend.closedloop` 与 `verify_backend_noptr_default_cli` 负责。
+- `backend.abi_v2_noptr` 已退出 required closure；如遇旧脚本调用 `verify_backend_abi_v2_noptr`，会走兼容别名到 `verify_backend_noptr_default_cli`。
 - `backend.import_cycle_predeclare` 已切为纯 runtime 门禁：负例必须 compile fail 且包含 `Import cycle detected: ... -> ...` 链路，不再接受 source-contract fallback。
 - `build_backend_driver` 自举编译会同时注入 `STAGE1_SKIP_SEM/OWNERSHIP/CPROFILE` 与 `STAGE1_SKIP_*`，兼容 seed stage0 的历史前缀读取。
 - `cheng_tooling build-backend-driver` 在未显式设置 `BACKEND_BUILD_DRIVER_STAGE0` 时，默认只使用 `artifacts/backend_driver/cheng` 作为 stage0；如需临时回退旧候选链，显式设置 `TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=1`。
 - `backend_prod_closure` 的 selfhost 默认超时为 `BACKEND_PROD_SELFHOST_TIMEOUT=240`，并默认启用 `BACKEND_PROD_SELFHOST_MAX_RSS_MB=24576`；默认开启 compile-stage1 且要求 full 重编（`BACKEND_PROD_SELFHOST_NATIVE_COMPILE_STAGE1=1`、`BACKEND_PROD_SELFHOST_STAGE1_FULL_REBUILD=1`、`BACKEND_PROD_SELFHOST_STAGE1_REQUIRE_REBUILD=1`）。
-- 非 C ABI no-pointer 收口建议显式跑：`cheng_tooling verify_backend_abi_v2_noptr`。
+- 非 C ABI no-pointer 收口建议显式跑：`cheng_tooling verify_backend_noptr_default_cli`（`verify_backend_abi_v2_noptr` 为兼容别名）。
 - 专用机 100ms 自举门禁：`cheng_tooling verify_backend_selfhost_100ms_host`（基线：`src/tooling/selfhost_perf_100ms_host.env`；非目标主机默认报告模式）。`backend_prod_closure` 在 `BACKEND_RUN_SELFHOST_100MS=1` 时会拆 quick/report + full/blocking 双轨：quick 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=0`，full 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=1` + `SELFHOST_STAGE1_REQUIRE_REBUILD=1`，并支持 `BACKEND_BUILD_DRIVER_PROFILE_OUT` 输出重编画像日志。
 - 零脚本（native）Host-only 核心链路已提供 `cheng_tooling` 子命令：`driver-path`、`build-backend-driver`、`selfhost-bootstrap-fast-host`、`selfhost-100ms-host`、`compile`（`emit=exe`）、`cheng`、`chengb`、`bootstrap-pure`；对 `cheng/chengc/chengb/bootstrap/bootstrap_pure/backend_driver_path/build_backend_driver/verify_backend_selfhost_bootstrap_self_obj/verify_backend_selfhost_100ms_host` 采用 native-required（失败即失败，不再脚本回退）。
 - `build-backend-driver` 原生命令在 stage0 自举重编失败（如 segfault）时会显式输出 `build_backend_driver_reused_stage0` 并复用当前可运行 stage0 到目标路径，不会静默脚本回退。
-- 原生 `compile` 子命令默认注入 `BACKEND_ENABLE_CSTRING_LOWERING=1`（含 `BACKEND_ENABLE_CSTRING_LOWERING=1`），用于规避旧 driver 在 cstring lowering 关闭时产出不可运行 exe 的问题。
+- `BACKEND_ENABLE_CSTRING_LOWERING` 已移除；cstring lowering 在后端选择器中固定开启，不再提供开关。
 - 优化语义边界：
   - `DOD/SoA`、`Memory-Exe/Hotpatch`、`E-Graph` 以 `Low-UIR` 为主战场。
   - `Ownership/No-Alias` 必须先在 `High-UIR(MIR语义)` 证明，再下沉到 `Low-UIR` 供 noalias/egraph pass 消费（proof-backed）。

@@ -1,0 +1,333 @@
+# UDP syscall helpers (BSD socket wrapper + errno mapping).
+
+import std/system as sys
+import std/result
+import std/rawbytes
+import std/os as os
+
+const
+    udpAfInet = 2
+    udpAfInet6Linux = 10
+    udpAfInet6Bsd = 30
+    udpSockDgram = 2
+
+    udpIpProtoIp = 0
+    udpIpProtoIpv6 = 41
+    udpIpTosLinux = 1
+    udpIpTosBsd = 3
+    udpIpv6TclassLinux = 67
+    udpIpv6TclassBsd = 36
+
+    udpFcntlGetFl = 3
+    udpFcntlSetFl = 4
+    udpONonblockLinux = 0x800
+    udpONonblockBsd = 0x4
+    udpMsgDontWait = 128
+
+    udpErrAgainLinux = 11
+    udpErrAgainBsd = 35
+    udpErrWouldBlockLinux = 11
+    udpErrWouldBlockBsd = 35
+    udpErrIntr = 4
+    udpErrInvalid = 22
+    udpErrNoSys = 38
+    udpErrOpNotSuppLinux = 95
+    udpErrOpNotSuppBsd = 45
+
+type
+    UdpSocketHandle =
+        fd: int32
+        family: int32
+        isV6: bool
+
+    UdpSockAddr =
+        data: Bytes
+        len: int32
+        family: int32
+        isV6: bool
+        host: str
+        port: int32
+
+    UdpRecvResult =
+        data: Bytes
+        fromAddr: UdpSockAddr
+
+fn udpErrno(): int32 =
+    return os.udpErrno()
+
+fn udpErrText(code: int32): str =
+    return os.udpErrText(code)
+
+fn udpErrWouldBlockOrIntr(code: int32): bool =
+    if code == udpErrIntr:
+        return true
+    if code == udpErrAgainLinux || code == udpErrAgainBsd:
+        return true
+    if code == udpErrWouldBlockLinux || code == udpErrWouldBlockBsd:
+        return true
+    return false
+
+fn udpErrSupportsLenFallback(code: int32): bool =
+    if code == udpErrInvalid || code == udpErrNoSys:
+        return true
+    if code == udpErrOpNotSuppLinux || code == udpErrOpNotSuppBsd:
+        return true
+    return false
+
+fn udpSocketEnableNonblock(fd: int32) =
+    if fd < 0:
+        return
+    let flags: int32 = os.udpFcntl(fd, udpFcntlGetFl, 0)
+    if flags < 0:
+        return
+    if os.udpFcntl(fd, udpFcntlSetFl, flags | udpONonblockLinux) == 0:
+        return
+    let _ = os.udpFcntl(fd, udpFcntlSetFl, flags | udpONonblockBsd)
+
+fn udpSocketOpenDgram(isV6: bool): Result[UdpSocketHandle] =
+    if !isV6:
+        let fd: int32 = sys.socket(udpAfInet, udpSockDgram, 0)
+        if fd < 0:
+            let errCode: int32 = udpErrno()
+            return Err[UdpSocketHandle]("udp syscall: socket failed: " + udpErrText(errCode) + " (" + $errCode + ")")
+        udpSocketEnableNonblock(fd)
+        return Ok[UdpSocketHandle](UdpSocketHandle(fd: fd, family: udpAfInet, isV6: false))
+
+    let fdLinux: int32 = sys.socket(udpAfInet6Linux, udpSockDgram, 0)
+    if fdLinux >= 0:
+        udpSocketEnableNonblock(fdLinux)
+        return Ok[UdpSocketHandle](UdpSocketHandle(fd: fdLinux, family: udpAfInet6Linux, isV6: true))
+    let errLinux: int32 = udpErrno()
+
+    let fdBsd: int32 = sys.socket(udpAfInet6Bsd, udpSockDgram, 0)
+    if fdBsd >= 0:
+        udpSocketEnableNonblock(fdBsd)
+        return Ok[UdpSocketHandle](UdpSocketHandle(fd: fdBsd, family: udpAfInet6Bsd, isV6: true))
+    let errBsd: int32 = udpErrno()
+
+    if errLinux == errBsd:
+        return Err[UdpSocketHandle]("udp syscall: ipv6 socket failed: " + udpErrText(errBsd) + " (" + $errBsd + ")")
+    return Err[UdpSocketHandle](
+        "udp syscall: ipv6 socket failed: " +
+        udpErrText(errLinux) + " (" + $errLinux + ")" +
+        " | " +
+        udpErrText(errBsd) + " (" + $errBsd + ")"
+    )
+
+fn udpSocketClose(fd: int32) =
+    if fd < 0:
+        return
+    let _ = sys.close(fd)
+
+fn udpWriteU16BE(buf: Bytes, offset: int32, value: int32) =
+    bytesSet(buf, offset, (value >> 8) & 0xff)
+    bytesSet(buf, offset + 1, value & 0xff)
+
+fn udpReadU16BE(buf: Bytes, offset: int32): int32 =
+    return (bytesGet(buf, offset) << 8) | bytesGet(buf, offset + 1)
+
+fn udpNormalizeHostLiteral(host: str, isV6: bool): str =
+    if len(host) <= 0:
+        return ""
+    if host == "localhost":
+        return if isV6: "::1" else: "127.0.0.1"
+    return host
+
+fn udpSockAddrFromHostPort(host: str, port: int32, isV6: bool, family: int32, useLenField: bool): Result[UdpSockAddr] =
+    if port < 0 || port > 65535:
+        return Err[UdpSockAddr]("udp syscall: port out of range")
+
+    var resolvedFamily: int32 = family
+    if isV6:
+        if resolvedFamily != udpAfInet6Linux && resolvedFamily != udpAfInet6Bsd:
+            resolvedFamily = udpAfInet6Linux
+    else:
+        resolvedFamily = udpAfInet
+
+    let addrSize: int32 = if isV6: 28 else: 16
+    let raw: Bytes = bytesAlloc(addrSize)
+
+    if useLenField:
+        bytesSet(raw, 0, addrSize)
+        bytesSet(raw, 1, resolvedFamily & 0xff)
+    else:
+        bytesSet(raw, 0, resolvedFamily & 0xff)
+        bytesSet(raw, 1, (resolvedFamily >> 8) & 0xff)
+
+    udpWriteU16BE(raw, 2, port)
+
+    let ipOffset: int32 = if isV6: 8 else: 4
+    let ipSize: int32 = if isV6: 16 else: 4
+    let ipBytes: Bytes = bytesAlloc(ipSize)
+    let normalizedHost: str = udpNormalizeHostLiteral(host, isV6)
+    if len(normalizedHost) > 0:
+        let ptonRes: int32 = os.udpInetPton(resolvedFamily, normalizedHost, ipBytes)
+        if ptonRes != 1:
+            return Err[UdpSockAddr]("udp syscall: invalid ip literal")
+        for i in 0..<ipSize:
+            bytesSet(raw, ipOffset + i, bytesGet(ipBytes, i))
+
+    return Ok[UdpSockAddr](
+        UdpSockAddr(
+            data: raw,
+            len: addrSize,
+            family: resolvedFamily,
+            isV6: isV6,
+            host: if len(normalizedHost) > 0: normalizedHost else: (if isV6: "::" else: "0.0.0.0"),
+            port: port
+        )
+    )
+
+fn udpSockAddrDecode(raw: Bytes, rawLen: int32): Result[UdpSockAddr] =
+    if rawLen <= 0:
+        return Err[UdpSockAddr]("udp syscall: empty sockaddr")
+    if bytesLen(raw) < rawLen:
+        return Err[UdpSockAddr]("udp syscall: truncated sockaddr")
+    if rawLen < 8:
+        return Err[UdpSockAddr]("udp syscall: short sockaddr")
+
+    let b0: int32 = bytesGet(raw, 0)
+    let b1: int32 = bytesGet(raw, 1)
+
+    var family: int32 = 0
+    if (b0 == 16 || b0 == 28) && (b1 == udpAfInet || b1 == udpAfInet6Linux || b1 == udpAfInet6Bsd):
+        family = b1
+    else:
+        family = b0 | (b1 << 8)
+
+    var isV6: bool = false
+    if family == udpAfInet:
+        isV6 = false
+    elif family == udpAfInet6Linux || family == udpAfInet6Bsd:
+        isV6 = true
+    else:
+        return Err[UdpSockAddr]("udp syscall: unsupported sockaddr family")
+
+    let addrSize: int32 = if isV6: 28 else: 16
+    if rawLen < addrSize:
+        return Err[UdpSockAddr]("udp syscall: sockaddr size mismatch")
+
+    let port: int32 = udpReadU16BE(raw, 2)
+    let ipOffset: int32 = if isV6: 8 else: 4
+    let ipSize: int32 = if isV6: 16 else: 4
+    let ipView: Bytes = bytesSlice(raw, ipOffset, ipSize)
+    var hostText: str = os.udpInetNtop(family, ipView)
+    if len(hostText) <= 0 && isV6:
+        let altFamily: int32 = if family == udpAfInet6Linux: udpAfInet6Bsd else: udpAfInet6Linux
+        hostText = os.udpInetNtop(altFamily, ipView)
+        if len(hostText) > 0:
+            family = altFamily
+    if len(hostText) <= 0:
+        return Err[UdpSockAddr]("udp syscall: inet_ntop failed")
+    let packed: Bytes = bytesSlice(raw, 0, addrSize)
+
+    return Ok[UdpSockAddr](
+        UdpSockAddr(
+            data: packed,
+            len: addrSize,
+            family: family,
+            isV6: isV6,
+            host: hostText,
+            port: port
+        )
+    )
+
+fn udpSockAddrCanonical(addr: UdpSockAddr): str =
+    if addr.isV6:
+        return "udp://[" + addr.host + "]:" + $addr.port
+    return "udp://" + addr.host + ":" + $addr.port
+
+fn udpBindAddr(fd: int32, addr: UdpSockAddr): Result[bool] =
+    if fd < 0:
+        return Err[bool]("udp syscall: invalid socket")
+    let res: int32 = os.udpBindFd(fd, addr.data, addr.len)
+    if res == 0:
+        return Ok[bool](true)
+    let errCode: int32 = udpErrno()
+    return Err[bool]("udp syscall: bind failed: " + udpErrText(errCode) + " (" + $errCode + ")")
+
+fn udpGetSockName(fd: int32): Result[UdpSockAddr] =
+    if fd < 0:
+        return Err[UdpSockAddr]("udp syscall: invalid socket")
+    let rawAddr: Bytes = bytesAlloc(128)
+    var rawLen: int32 = bytesLen(rawAddr)
+    let rc: int32 = sys.getsockname(fd, rawAddr.data, &rawLen)
+    if rc != 0 || rawLen <= 0:
+        let errCode: int32 = udpErrno()
+        return Err[UdpSockAddr]("udp syscall: getsockname failed: " + udpErrText(errCode) + " (" + $errCode + ")")
+    if rawLen > bytesLen(rawAddr):
+        rawLen = bytesLen(rawAddr)
+    return udpSockAddrDecode(rawAddr, rawLen)
+
+fn udpSendTo(fd: int32, payload: Bytes, toAddr: UdpSockAddr): Result[int32] =
+    if fd < 0:
+        return Err[int32]("udp syscall: invalid socket")
+    if bytesLen(payload) <= 0:
+        return Ok[int32](0)
+    let sent: int32 = os.udpSendToFd(fd, payload, 0, toAddr.data, toAddr.len)
+    if sent >= 0:
+        return Ok[int32](sent)
+    let errCode: int32 = udpErrno()
+    return Err[int32]("udp syscall: sendto failed: " + udpErrText(errCode) + " (" + $errCode + ")")
+
+fn udpRecvFromNonblock(fd: int32, maxBytes: int32): Result[UdpRecvResult] =
+    if fd < 0:
+        return Err[UdpRecvResult]("udp syscall: invalid socket")
+    if maxBytes <= 0:
+        return Err[UdpRecvResult]("udp syscall: invalid recv size")
+
+    let dataBuf: Bytes = bytesAlloc(maxBytes)
+    let rawAddr: Bytes = bytesAlloc(128)
+    var rawLen: int32 = bytesLen(rawAddr)
+    let recvLenRaw: int32 = sys.recvfrom(fd, dataBuf.data, maxBytes, udpMsgDontWait, rawAddr.data, &rawLen)
+    if recvLenRaw < 0:
+        let errCode: int32 = udpErrno()
+        if udpErrWouldBlockOrIntr(errCode):
+            return Err[UdpRecvResult]("udp syscall: queue empty")
+        return Err[UdpRecvResult]("udp syscall: recvfrom failed: " + udpErrText(errCode) + " (" + $errCode + ")")
+    var recvLen: int32 = recvLenRaw
+    if recvLen > bytesLen(dataBuf):
+        recvLen = bytesLen(dataBuf)
+    if rawLen > bytesLen(rawAddr):
+        rawLen = bytesLen(rawAddr)
+    if rawLen <= 0:
+        return Err[UdpRecvResult]("udp syscall: recvfrom missing peer sockaddr")
+    let payload: Bytes =
+        if recvLen <= 0:
+            emptyBytes()
+        else:
+            bytesSlice(dataBuf, 0, recvLen)
+
+    let fromRes: Result[UdpSockAddr] = udpSockAddrDecode(rawAddr, rawLen)
+    if IsErr(fromRes):
+        return Err[UdpRecvResult](Error(fromRes))
+    return Ok[UdpRecvResult](UdpRecvResult(data: payload, fromAddr: Value(fromRes)))
+
+fn udpSetSockOptInt(fd: int32, level: int32, optName: int32, value: int32): bool =
+    let optBytes: Bytes = bytesAlloc(4)
+    bytesSet(optBytes, 0, value & 0xff)
+    bytesSet(optBytes, 1, (value >> 8) & 0xff)
+    bytesSet(optBytes, 2, (value >> 16) & 0xff)
+    bytesSet(optBytes, 3, (value >> 24) & 0xff)
+    return os.udpSetSockOptIntFd(fd, level, optName, optBytes) == 0
+
+fn udpSetDscpTos(fd: int32, dscp: int32, isV6: bool): Result[bool] =
+    if fd < 0:
+        return Err[bool]("udp syscall: invalid socket")
+    if dscp < 0:
+        return Ok[bool](false)
+
+    let tos: int32 = (dscp & 63) << 2
+    if isV6:
+        if udpSetSockOptInt(fd, udpIpProtoIpv6, udpIpv6TclassLinux, tos):
+            return Ok[bool](true)
+        if udpSetSockOptInt(fd, udpIpProtoIpv6, udpIpv6TclassBsd, tos):
+            return Ok[bool](true)
+    else:
+        if udpSetSockOptInt(fd, udpIpProtoIp, udpIpTosLinux, tos):
+            return Ok[bool](true)
+        if udpSetSockOptInt(fd, udpIpProtoIp, udpIpTosBsd, tos):
+            return Ok[bool](true)
+
+    let errCode: int32 = udpErrno()
+    return Err[bool]("udp syscall: setsockopt failed: " + udpErrText(errCode) + " (" + $errCode + ")")

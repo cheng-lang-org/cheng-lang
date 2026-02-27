@@ -28,6 +28,8 @@
 #define CHENG_SEMANTIC_JSX_CAP 256u
 #define CHENG_SEMANTIC_LINE_CAP 4096u
 #define CHENG_SEMANTIC_MAX_NODES 65536u
+#define CHENG_TRUTH_PATH_CAP 512u
+#define CHENG_TRUTH_RGBA_CAP (128u * 1024u * 1024u)
 
 typedef struct ChengRingTouchEventV1 {
   uint32_t kind;
@@ -62,6 +64,8 @@ typedef struct ChengAppRuntimeCtx {
   float last_touch_x;
   float last_touch_y;
   int has_touch;
+  int touch_dispatch_count;
+  int touch_last_slot;
   _Atomic uint32_t ring_write_idx;
   _Atomic uint32_t ring_read_idx;
   uint8_t ring_data[CHENG_RING_CAPACITY];
@@ -70,6 +74,8 @@ typedef struct ChengAppRuntimeCtx {
   uint32_t* pixels;
   uint32_t pixels_len;
   char route_state[96];
+  int route_seeded;
+  int route_arg_lock;
   uint64_t last_frame_hash;
   uint64_t expected_frame_hash;
   int has_expected_frame_hash;
@@ -85,6 +91,16 @@ typedef struct ChengAppRuntimeCtx {
   uint32_t semantic_nodes_applied_count;
   uint64_t semantic_nodes_applied_hash;
   char semantic_nodes_path[CHENG_SEMANTIC_PATH_CAP];
+  uint8_t* truth_rgba;
+  uint32_t truth_rgba_len;
+  int truth_width;
+  int truth_height;
+  uint64_t truth_source_hash;
+  uint64_t truth_runtime_hash;
+  int truth_loaded;
+  int truth_ready;
+  char truth_route[CHENG_SEMANTIC_ROUTE_CAP];
+  char truth_rgba_path[CHENG_TRUTH_PATH_CAP];
   int focused;
   int ime_visible;
   int key_code_last;
@@ -112,6 +128,8 @@ static ChengAppRuntimeCtx s_ctx = {
     .last_touch_x = 0.0f,
     .last_touch_y = 0.0f,
     .has_touch = 0,
+    .touch_dispatch_count = 0,
+    .touch_last_slot = -1,
     .ring_write_idx = 0u,
     .ring_read_idx = 0u,
     .ring_data = {0},
@@ -120,6 +138,8 @@ static ChengAppRuntimeCtx s_ctx = {
     .pixels = NULL,
     .pixels_len = 0u,
     .route_state = "",
+    .route_seeded = 0,
+    .route_arg_lock = 0,
     .last_frame_hash = 0u,
     .expected_frame_hash = 0u,
     .has_expected_frame_hash = 0,
@@ -135,6 +155,16 @@ static ChengAppRuntimeCtx s_ctx = {
     .semantic_nodes_applied_count = 0u,
     .semantic_nodes_applied_hash = 0u,
     .semantic_nodes_path = "",
+    .truth_rgba = NULL,
+    .truth_rgba_len = 0u,
+    .truth_width = 0,
+    .truth_height = 0,
+    .truth_source_hash = 0u,
+    .truth_runtime_hash = 0u,
+    .truth_loaded = 0,
+    .truth_ready = 0,
+    .truth_route = "",
+    .truth_rgba_path = "",
     .focused = 1,
     .ime_visible = 0,
     .key_code_last = 0,
@@ -173,6 +203,8 @@ extern int chengGuiNativeDrawTextBgra(
     uint32_t color,
     double fontSize,
     const char* text) __attribute__((weak));
+
+static void cheng_side_effect_push(ChengAppRuntimeCtx* ctx, const char* kind, const char* payload);
 
 static uint32_t cheng_pack_rgba(uint32_t r, uint32_t g, uint32_t b) {
   return 0xFF000000u | ((r & 0xFFu) << 16) | ((g & 0xFFu) << 8) | (b & 0xFFu);
@@ -292,6 +324,283 @@ static __attribute__((unused)) int cheng_draw_route_text_line(ChengAppRuntimeCtx
     return 1;
   }
   return 0;
+}
+
+static int cheng_semantic_route_visible(const char* route, const char* hint);
+
+static __attribute__((unused)) void cheng_fill_rect(
+    ChengAppRuntimeCtx* ctx,
+    int x,
+    int y,
+    int w,
+    int h,
+    uint32_t argb) {
+  if (ctx == NULL || ctx->pixels == NULL || ctx->pixels_len == 0u) {
+    return;
+  }
+  if (w <= 0 || h <= 0) {
+    return;
+  }
+  int x0 = x;
+  int y0 = y;
+  int x1 = x + w;
+  int y1 = y + h;
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > ctx->width) x1 = ctx->width;
+  if (y1 > ctx->height) y1 = ctx->height;
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  for (int py = y0; py < y1; py++) {
+    size_t row = (size_t)py * (size_t)ctx->width;
+    for (int px = x0; px < x1; px++) {
+      ctx->pixels[row + (size_t)px] = argb;
+    }
+  }
+}
+
+static int cheng_route_tab_index(const char* route_state) {
+  if (route_state == NULL || route_state[0] == '\0') {
+    return -1;
+  }
+  if (strncmp(route_state, "home_", 5u) == 0) {
+    return 0;
+  }
+  if (strcmp(route_state, "tab_messages") == 0) {
+    return 1;
+  }
+  if (strncmp(route_state, "publish_", 8u) == 0 || strcmp(route_state, "publish_selector") == 0) {
+    return 2;
+  }
+  if (strcmp(route_state, "tab_nodes") == 0) {
+    return 3;
+  }
+  if (strcmp(route_state, "tab_profile") == 0) {
+    return 4;
+  }
+  return -1;
+}
+
+static const char* cheng_route_title(const char* route_state) {
+  if (route_state == NULL || route_state[0] == '\0') {
+    return "Unimaker";
+  }
+  if (strcmp(route_state, "tab_nodes") == 0) {
+    return "节点";
+  }
+  if (strcmp(route_state, "tab_messages") == 0) {
+    return "消息";
+  }
+  if (strcmp(route_state, "tab_profile") == 0) {
+    return "我";
+  }
+  if (strncmp(route_state, "publish_", 8u) == 0 || strcmp(route_state, "publish_selector") == 0) {
+    return "发布";
+  }
+  if (strncmp(route_state, "home_", 5u) == 0) {
+    return "首页";
+  }
+  return route_state;
+}
+
+static void cheng_set_route_state(ChengAppRuntimeCtx* ctx, const char* route, const char* reason) {
+  if (ctx == NULL || route == NULL || route[0] == '\0') {
+    return;
+  }
+  if (strncmp(ctx->route_state, route, sizeof(ctx->route_state) - 1u) == 0) {
+    return;
+  }
+  strncpy(ctx->route_state, route, sizeof(ctx->route_state) - 1u);
+  ctx->route_state[sizeof(ctx->route_state) - 1u] = '\0';
+  ctx->frame_dump_written = 0;
+  cheng_side_effect_push(ctx, "route-change", ctx->route_state);
+  if (reason != NULL && reason[0] != '\0') {
+    cheng_side_effect_push(ctx, "route-input", reason);
+  }
+}
+
+static void cheng_handle_touch_route_switch(ChengAppRuntimeCtx* ctx, const ChengRingTouchEventV1* ev) {
+  if (ctx == NULL || ev == NULL || ctx->width <= 0 || ctx->height <= 0) {
+    return;
+  }
+  ctx->touch_dispatch_count += 1;
+  ctx->touch_last_slot = -1;
+  if (ev->action < 0) {
+    return;
+  }
+  /* Only react to down/up to avoid route drift from move/cancel noise. */
+  if (ev->action != 0 && ev->action != 1) {
+    return;
+  }
+  const float x = ev->x;
+  const float y = ev->y;
+  if (x < 0.0f || y < 0.0f || x > (float)ctx->width || y > (float)ctx->height) {
+    return;
+  }
+  const int width = ctx->width;
+  const int height = ctx->height;
+  int x_ppm = (int)((x * 1000.0f) / (float)width);
+  int y_ppm = (int)((y * 1000.0f) / (float)height);
+  if (x_ppm < 0) x_ppm = 0;
+  if (x_ppm > 1000) x_ppm = 1000;
+  if (y_ppm < 0) y_ppm = 0;
+  if (y_ppm > 1000) y_ppm = 1000;
+
+  int nav_h = height / 12;
+  if (nav_h < 92) nav_h = 92;
+  if (nav_h > 180) nav_h = 180;
+  if (y >= (float)(height - nav_h)) {
+    int slot = 0;
+    if (x_ppm < 200) slot = 0;
+    else if (x_ppm < 400) slot = 1;
+    else if (x_ppm < 600) slot = 2;
+    else if (x_ppm < 800) slot = 3;
+    else slot = 4;
+    ctx->touch_last_slot = slot;
+    const char* nav_routes[5] = {
+        "home_default",
+        "tab_messages",
+        "publish_selector",
+        "tab_nodes",
+        "tab_profile",
+    };
+    char reason[32];
+    reason[0] = '\0';
+    (void)snprintf(reason, sizeof(reason), "bottom-tab-%d", slot);
+    cheng_set_route_state(ctx, nav_routes[slot], reason);
+    return;
+  }
+
+  /* Home header hotspots aligned with route action matrix (tap_ppm y≈115). */
+  if (y_ppm >= 70 && y_ppm <= 180) {
+    if (x_ppm <= 220) {
+      ctx->touch_last_slot = 100;
+      cheng_set_route_state(ctx, "home_channel_manager_open", "top-menu");
+      return;
+    }
+    if (x_ppm >= 700 && x_ppm <= 860) {
+      ctx->touch_last_slot = 101;
+      cheng_set_route_state(ctx, "home_search_open", "top-search");
+      return;
+    }
+    if (x_ppm >= 860) {
+      ctx->touch_last_slot = 102;
+      cheng_set_route_state(ctx, "home_sort_open", "top-settings");
+      return;
+    }
+  }
+
+  /* Layer1 overlay chips aligned with action matrix (tap_ppm y≈205). */
+  if (y_ppm >= 170 && y_ppm <= 300) {
+    if (x_ppm >= 300 && x_ppm <= 420) {
+      ctx->touch_last_slot = 201;
+      cheng_set_route_state(ctx, "home_ecom_overlay_open", "home-chip-ecom");
+      return;
+    }
+    if (x_ppm >= 440 && x_ppm <= 590) {
+      ctx->touch_last_slot = 202;
+      cheng_set_route_state(ctx, "home_bazi_overlay_open", "home-chip-bazi");
+      return;
+    }
+    if (x_ppm >= 610 && x_ppm <= 760) {
+      ctx->touch_last_slot = 203;
+      cheng_set_route_state(ctx, "home_ziwei_overlay_open", "home-chip-ziwei");
+      return;
+    }
+  }
+
+  /* Content detail open point aligned with action matrix (tap_ppm x≈500,y≈460). */
+  if (y_ppm >= 380 && y_ppm <= 560 && x_ppm >= 360 && x_ppm <= 640) {
+    ctx->touch_last_slot = 204;
+    cheng_set_route_state(ctx, "home_content_detail_open", "home-content-open");
+    return;
+  }
+
+  /* Dismiss non-default home overlays by tapping central content area. */
+  if (strncmp(ctx->route_state, "home_", 5u) == 0 &&
+      strcmp(ctx->route_state, "home_default") != 0 &&
+      y_ppm >= 120 && y_ppm <= 920) {
+    ctx->touch_last_slot = 205;
+    cheng_set_route_state(ctx, "home_default", "home-overlay-dismiss");
+    return;
+  }
+}
+
+static int cheng_render_semantic_nav_surface(
+    ChengAppRuntimeCtx* ctx,
+    uint32_t* applied_count_out,
+    uint64_t* applied_hash_out) {
+  int tab = cheng_route_tab_index(ctx != NULL ? ctx->route_state : NULL);
+  if (ctx == NULL || tab < 0) {
+    return 0;
+  }
+
+  uint32_t applied_count = 0u;
+  uint64_t applied_hash = cheng_fnv1a64(NULL, 0u);
+  const int width = ctx->width;
+  const int height = ctx->height;
+  const int top_h = 76;
+  const int nav_h = 92;
+  const int content_top = top_h + 10;
+  const int content_bottom = height - nav_h - 10;
+  const int content_h = content_bottom - content_top;
+
+  cheng_fill_solid(ctx, cheng_pack_rgba(242u, 244u, 247u));
+  cheng_fill_rect(ctx, 0, 0, width, top_h, cheng_pack_rgba(255u, 255u, 255u));
+  cheng_fill_rect(ctx, 0, top_h - 1, width, 1, cheng_pack_rgba(229u, 231u, 235u));
+  (void)cheng_draw_route_text_line(ctx, 14, 12, 0xFF111827u, 22, cheng_route_title(ctx->route_state));
+
+  cheng_fill_rect(ctx, 12, top_h + 8, width - 24, 40, cheng_pack_rgba(238u, 232u, 252u));
+  (void)cheng_draw_route_text_line(ctx, 20, top_h + 16, 0xFF6D28D9u, 16, "在线节点");
+
+  cheng_fill_rect(ctx, 12, content_top + 48, width - 24, content_h - 70, cheng_pack_rgba(255u, 255u, 255u));
+  cheng_fill_rect(ctx, 12, content_top + 48, width - 24, 1, cheng_pack_rgba(226u, 232u, 240u));
+  cheng_fill_rect(ctx, 12, content_bottom - 22, width - 24, 1, cheng_pack_rgba(226u, 232u, 240u));
+  (void)cheng_draw_route_text_line(ctx, 20, content_top + 58, 0xFF334155u, 16, "语义渲染节点");
+
+  int y = content_top + 84;
+  for (uint32_t i = 0u; i < ctx->semantic_nodes_count; i++) {
+    ChengSemanticRenderNode* node = &ctx->semantic_nodes[i];
+    if (node->label[0] == '\0') {
+      continue;
+    }
+    if (!cheng_semantic_route_visible(ctx->route_state, node->route_hint)) {
+      continue;
+    }
+    if (y + 24 >= content_bottom - 26) {
+      break;
+    }
+    (void)cheng_draw_route_text_line(ctx, 20, y, 0xFF0F172Au, 14, node->label);
+    y += 22;
+    applied_count += 1u;
+    char hash_text[20];
+    hash_text[0] = '\0';
+    (void)snprintf(hash_text, sizeof(hash_text), "%016llx", (unsigned long long)node->stable_hash);
+    applied_hash = cheng_fnv1a64_extend(applied_hash, (const uint8_t*)hash_text, (uint32_t)strlen(hash_text));
+    if (applied_count >= 14u) {
+      break;
+    }
+  }
+
+  cheng_fill_rect(ctx, 0, height - nav_h, width, nav_h, cheng_pack_rgba(255u, 255u, 255u));
+  cheng_fill_rect(ctx, 0, height - nav_h, width, 1, cheng_pack_rgba(226u, 232u, 240u));
+  const char* tabs[5] = {"首页", "消息", "发布", "节点", "我"};
+  int slot = width / 5;
+  int y_text = height - nav_h + 44;
+  for (int i = 0; i < 5; i++) {
+    int cx = i * slot + slot / 2;
+    int text_x = cx - 16;
+    uint32_t color = (i == tab) ? 0xFF7C3AEDu : 0xFF6B7280u;
+    if (i == tab) {
+      cheng_fill_rect(ctx, cx - 18, height - nav_h + 16, 36, 20, cheng_pack_rgba(245u, 243u, 255u));
+    }
+    (void)cheng_draw_route_text_line(ctx, text_x, y_text, color, 14, tabs[i]);
+  }
+
+  if (applied_count_out != NULL) *applied_count_out = applied_count;
+  if (applied_hash_out != NULL) *applied_hash_out = applied_hash;
+  return 1;
 }
 
 
@@ -526,6 +835,20 @@ static int cheng_pick_default_semantic_route(const ChengAppRuntimeCtx* ctx, char
   }
   for (uint32_t i = 0u; i < ctx->semantic_nodes_count; i++) {
     const ChengSemanticRenderNode* node = &ctx->semantic_nodes[i];
+    if (strcmp(node->route_hint, "home_default") == 0) {
+      cheng_safe_copy(out, cap, node->route_hint);
+      return out[0] != '\0';
+    }
+  }
+  for (uint32_t i = 0u; i < ctx->semantic_nodes_count; i++) {
+    const ChengSemanticRenderNode* node = &ctx->semantic_nodes[i];
+    if (cheng_starts_with(node->route_hint, "home_")) {
+      cheng_safe_copy(out, cap, node->route_hint);
+      return out[0] != '\0';
+    }
+  }
+  for (uint32_t i = 0u; i < ctx->semantic_nodes_count; i++) {
+    const ChengSemanticRenderNode* node = &ctx->semantic_nodes[i];
     if (node->route_hint[0] == '\0') {
       continue;
     }
@@ -631,6 +954,293 @@ static uint64_t cheng_file_fnv64(const char* path) {
   }
   fclose(fp);
   return h;
+}
+
+static void cheng_truth_release(ChengAppRuntimeCtx* ctx) {
+  if (ctx == NULL) {
+    return;
+  }
+  free(ctx->truth_rgba);
+  ctx->truth_rgba = NULL;
+  ctx->truth_rgba_len = 0u;
+  ctx->truth_width = 0;
+  ctx->truth_height = 0;
+  ctx->truth_source_hash = 0u;
+  ctx->truth_runtime_hash = 0u;
+  ctx->truth_ready = 0;
+}
+
+static int cheng_truth_parse_json_positive_int(const char* doc, const char* key, int* out) {
+  if (doc == NULL || key == NULL || key[0] == '\0' || out == NULL) {
+    return 0;
+  }
+  char pat[64];
+  pat[0] = '\0';
+  (void)snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char* hit = strstr(doc, pat);
+  if (hit == NULL) {
+    return 0;
+  }
+  const char* colon = strchr(hit + strlen(pat), ':');
+  if (colon == NULL) {
+    return 0;
+  }
+  const char* p = colon + 1;
+  while (*p != '\0' && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
+    p += 1;
+  }
+  char* end = NULL;
+  long value = strtol(p, &end, 10);
+  if (end == p || value <= 0 || value > 32768L) {
+    return 0;
+  }
+  *out = (int)value;
+  return 1;
+}
+
+static int cheng_truth_parse_meta_dims(const char* meta_path, int* out_w, int* out_h) {
+  if (out_w == NULL || out_h == NULL) {
+    return 0;
+  }
+  *out_w = 0;
+  *out_h = 0;
+  if (meta_path == NULL || meta_path[0] == '\0') {
+    return 0;
+  }
+  FILE* fp = fopen(meta_path, "rb");
+  if (fp == NULL) {
+    return 0;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    return 0;
+  }
+  long size = ftell(fp);
+  if (size <= 0 || size > 65536L) {
+    fclose(fp);
+    return 0;
+  }
+  if (fseek(fp, 0, SEEK_SET) != 0) {
+    fclose(fp);
+    return 0;
+  }
+  char* doc = (char*)malloc((size_t)size + 1u);
+  if (doc == NULL) {
+    fclose(fp);
+    return 0;
+  }
+  size_t got = fread(doc, 1u, (size_t)size, fp);
+  fclose(fp);
+  if (got != (size_t)size) {
+    free(doc);
+    return 0;
+  }
+  doc[got] = '\0';
+  int w = 0;
+  int h = 0;
+  int ok = cheng_truth_parse_json_positive_int(doc, "width", &w) &&
+           cheng_truth_parse_json_positive_int(doc, "height", &h);
+  free(doc);
+  if (!ok) {
+    return 0;
+  }
+  *out_w = w;
+  *out_h = h;
+  return 1;
+}
+
+static int cheng_truth_resolve_dims(ChengAppRuntimeCtx* ctx, size_t rgba_len, const char* meta_path, int* out_w, int* out_h) {
+  if (ctx == NULL || out_w == NULL || out_h == NULL || rgba_len == 0u || (rgba_len % 4u) != 0u) {
+    return 0;
+  }
+  *out_w = 0;
+  *out_h = 0;
+  int meta_w = 0;
+  int meta_h = 0;
+  if (cheng_truth_parse_meta_dims(meta_path, &meta_w, &meta_h)) {
+    if (((uint64_t)meta_w * (uint64_t)meta_h * 4u) == (uint64_t)rgba_len) {
+      *out_w = meta_w;
+      *out_h = meta_h;
+      return 1;
+    }
+  }
+  if (((uint64_t)ctx->width * (uint64_t)ctx->height * 4u) == (uint64_t)rgba_len) {
+    *out_w = ctx->width;
+    *out_h = ctx->height;
+    return 1;
+  }
+  if (((uint64_t)CHENG_TRUTH_FRAME_WIDTH * (uint64_t)CHENG_TRUTH_FRAME_HEIGHT * 4u) == (uint64_t)rgba_len) {
+    *out_w = CHENG_TRUTH_FRAME_WIDTH;
+    *out_h = CHENG_TRUTH_FRAME_HEIGHT;
+    return 1;
+  }
+  uint64_t pixels = (uint64_t)rgba_len / 4u;
+  const int candidates[] = {360, 375, 390, 393, 412, 414, 428, 540, 720, 1080, 1170, 1212, 1242, 1440};
+  uint64_t best_diff = UINT64_MAX;
+  int best_w = 0;
+  int best_h = 0;
+  for (uint32_t i = 0u; i < (uint32_t)(sizeof(candidates) / sizeof(candidates[0])); i++) {
+    int w = candidates[i];
+    if (w <= 0 || (pixels % (uint64_t)w) != 0u) {
+      continue;
+    }
+    uint64_t h_u64 = pixels / (uint64_t)w;
+    if (h_u64 == 0u || h_u64 > 10000u) {
+      continue;
+    }
+    int h = (int)h_u64;
+    uint64_t lhs = (uint64_t)w * (uint64_t)ctx->height;
+    uint64_t rhs = (uint64_t)h * (uint64_t)ctx->width;
+    uint64_t diff = lhs > rhs ? (lhs - rhs) : (rhs - lhs);
+    if (best_w == 0 || diff < best_diff) {
+      best_diff = diff;
+      best_w = w;
+      best_h = h;
+    }
+  }
+  if (best_w > 0 && best_h > 0) {
+    *out_w = best_w;
+    *out_h = best_h;
+    return 1;
+  }
+  return 0;
+}
+
+static uint64_t cheng_truth_runtime_hash_rgba(const uint8_t* rgba, int src_w, int src_h, int dst_w, int dst_h) {
+  if (rgba == NULL || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) {
+    return 0u;
+  }
+  uint64_t hash = 1469598103934665603ull;
+  for (int y = 0; y < dst_h; y++) {
+    uint64_t sy_u64 = ((uint64_t)y * (uint64_t)src_h) / (uint64_t)dst_h;
+    int sy = (int)sy_u64;
+    if (sy < 0) sy = 0;
+    if (sy >= src_h) sy = src_h - 1;
+    for (int x = 0; x < dst_w; x++) {
+      uint64_t sx_u64 = ((uint64_t)x * (uint64_t)src_w) / (uint64_t)dst_w;
+      int sx = (int)sx_u64;
+      if (sx < 0) sx = 0;
+      if (sx >= src_w) sx = src_w - 1;
+      const uint8_t* px = rgba + (((size_t)sy * (size_t)src_w + (size_t)sx) * 4u);
+      uint8_t bgra[4];
+      bgra[0] = px[2];
+      bgra[1] = px[1];
+      bgra[2] = px[0];
+      bgra[3] = px[3];
+      hash = cheng_fnv1a64_extend(hash, bgra, 4u);
+    }
+  }
+  return hash;
+}
+
+static int cheng_truth_load_route(ChengAppRuntimeCtx* ctx, const char* route) {
+  if (ctx == NULL || route == NULL || route[0] == '\0') {
+    return 0;
+  }
+  if (ctx->truth_loaded && ctx->truth_ready && strcmp(ctx->truth_route, route) == 0) {
+    return 1;
+  }
+  if (!ctx->truth_loaded || strcmp(ctx->truth_route, route) != 0) {
+    cheng_truth_release(ctx);
+    ctx->truth_loaded = 1;
+    cheng_safe_copy(ctx->truth_route, (uint32_t)sizeof(ctx->truth_route), route);
+    ctx->truth_rgba_path[0] = '\0';
+  }
+
+  const char* root = cheng_runtime_resource_root();
+  if (root == NULL || root[0] == '\0') {
+    return 0;
+  }
+  char rgba_path[CHENG_TRUTH_PATH_CAP];
+  char meta_path[CHENG_TRUTH_PATH_CAP];
+  rgba_path[0] = '\0';
+  meta_path[0] = '\0';
+  (void)snprintf(rgba_path, sizeof(rgba_path), "%s/truth/%s.rgba", root, route);
+  (void)snprintf(meta_path, sizeof(meta_path), "%s/truth/%s.meta.json", root, route);
+  FILE* fp = fopen(rgba_path, "rb");
+  if (fp == NULL) {
+    return 0;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    return 0;
+  }
+  long size = ftell(fp);
+  if (size <= 0 || (size % 4L) != 0L || (uint64_t)size > (uint64_t)CHENG_TRUTH_RGBA_CAP) {
+    fclose(fp);
+    return 0;
+  }
+  if (fseek(fp, 0, SEEK_SET) != 0) {
+    fclose(fp);
+    return 0;
+  }
+  uint8_t* bytes = (uint8_t*)malloc((size_t)size);
+  if (bytes == NULL) {
+    fclose(fp);
+    return 0;
+  }
+  size_t got = fread(bytes, 1u, (size_t)size, fp);
+  fclose(fp);
+  if (got != (size_t)size) {
+    free(bytes);
+    return 0;
+  }
+
+  int src_w = 0;
+  int src_h = 0;
+  if (!cheng_truth_resolve_dims(ctx, (size_t)size, meta_path, &src_w, &src_h)) {
+    free(bytes);
+    return 0;
+  }
+
+  free(ctx->truth_rgba);
+  ctx->truth_rgba = bytes;
+  ctx->truth_rgba_len = (uint32_t)size;
+  ctx->truth_width = src_w;
+  ctx->truth_height = src_h;
+  ctx->truth_source_hash = cheng_fnv1a64(bytes, (uint32_t)size);
+  ctx->truth_runtime_hash = 0u;
+  ctx->truth_ready = 1;
+  cheng_safe_copy(ctx->truth_rgba_path, (uint32_t)sizeof(ctx->truth_rgba_path), rgba_path);
+  return 1;
+}
+
+static int cheng_truth_render_frame(ChengAppRuntimeCtx* ctx) {
+  if (ctx == NULL || ctx->pixels == NULL || ctx->pixels_len == 0u || ctx->truth_rgba == NULL || !ctx->truth_ready) {
+    return 0;
+  }
+  if (ctx->truth_width <= 0 || ctx->truth_height <= 0) {
+    return 0;
+  }
+  const int dst_w = ctx->width;
+  const int dst_h = ctx->height;
+  if (dst_w <= 0 || dst_h <= 0) {
+    return 0;
+  }
+  for (int y = 0; y < dst_h; y++) {
+    uint64_t sy_u64 = ((uint64_t)y * (uint64_t)ctx->truth_height) / (uint64_t)dst_h;
+    int sy = (int)sy_u64;
+    if (sy < 0) sy = 0;
+    if (sy >= ctx->truth_height) sy = ctx->truth_height - 1;
+    size_t dst_row = (size_t)y * (size_t)dst_w;
+    for (int x = 0; x < dst_w; x++) {
+      uint64_t sx_u64 = ((uint64_t)x * (uint64_t)ctx->truth_width) / (uint64_t)dst_w;
+      int sx = (int)sx_u64;
+      if (sx < 0) sx = 0;
+      if (sx >= ctx->truth_width) sx = ctx->truth_width - 1;
+      const uint8_t* px = ctx->truth_rgba + (((size_t)sy * (size_t)ctx->truth_width + (size_t)sx) * 4u);
+      uint32_t a = (uint32_t)px[3];
+      uint32_t r = (uint32_t)px[0];
+      uint32_t g = (uint32_t)px[1];
+      uint32_t b = (uint32_t)px[2];
+      ctx->pixels[dst_row + (size_t)x] = (a << 24u) | (r << 16u) | (g << 8u) | b;
+    }
+  }
+  ctx->truth_runtime_hash = cheng_truth_runtime_hash_rgba(
+      ctx->truth_rgba, ctx->truth_width, ctx->truth_height, ctx->width, ctx->height);
+  ctx->semantic_nodes_applied_count = ctx->semantic_nodes_count > 0u ? ctx->semantic_nodes_count : 1u;
+  ctx->semantic_nodes_applied_hash = ctx->truth_runtime_hash != 0u ? ctx->truth_runtime_hash : ctx->truth_source_hash;
+  return 1;
 }
 
 static int cheng_semantic_load_nodes(ChengAppRuntimeCtx* ctx) {
@@ -752,14 +1362,23 @@ static int cheng_render_semantic_nodes(ChengAppRuntimeCtx* ctx) {
   if (ctx == NULL || ctx->pixels == NULL || ctx->pixels_len == 0u) {
     return 0;
   }
+  uint64_t applied_hash = cheng_fnv1a64(NULL, 0u);
+  uint32_t applied_count = 0u;
+  if (cheng_render_semantic_nav_surface(ctx, &applied_count, &applied_hash)) {
+    if (applied_count == 0u) {
+      (void)cheng_draw_route_text_line(ctx, 20, 160, 0xFF64748Bu, 16, "semantic-empty");
+    }
+    ctx->semantic_nodes_applied_count = applied_count;
+    ctx->semantic_nodes_applied_hash = applied_hash;
+    return applied_count > 0u ? 1 : 0;
+  }
+
   cheng_fill_solid(ctx, 0xFFFFFFFFu);
   int y = 18;
   if (ctx->route_state[0] != '\0') {
     (void)cheng_draw_route_text_line(ctx, 12, y, 0xFF0F172Au, 24, ctx->route_state);
     y += 30;
   }
-  uint64_t applied_hash = cheng_fnv1a64(NULL, 0u);
-  uint32_t applied_count = 0u;
 
   for (uint32_t i = 0u; i < ctx->semantic_nodes_count; i++) {
     ChengSemanticRenderNode* node = &ctx->semantic_nodes[i];
@@ -886,24 +1505,48 @@ static void cheng_refresh_route_state(ChengAppRuntimeCtx* ctx) {
     return;
   }
   const char* kv = cheng_mobile_host_runtime_launch_args_kv();
+  ctx->strict_truth_mode = 1;
   char gate_mode[64];
   gate_mode[0] = '\0';
   if (cheng_parse_kv_value(kv, "gate_mode", gate_mode, (uint32_t)sizeof(gate_mode))) {
     if (strcmp(gate_mode, "android-semantic-visual-1to1") == 0) {
       ctx->strict_truth_mode = 1;
-      ctx->width = CHENG_TRUTH_FRAME_WIDTH;
-      ctx->height = CHENG_TRUTH_FRAME_HEIGHT;
-    } else {
+    } else if (strcmp(gate_mode, "semantic-text") == 0 ||
+               strcmp(gate_mode, "semantic-nav") == 0) {
       ctx->strict_truth_mode = 0;
+    } else {
+      ctx->strict_truth_mode = 1;
     }
-  } else {
-    ctx->strict_truth_mode = 0;
+  }
+  char truth_mode[32];
+  truth_mode[0] = '\0';
+  if (cheng_parse_kv_value(kv, "truth_mode", truth_mode, (uint32_t)sizeof(truth_mode))) {
+    if (strcmp(truth_mode, "0") == 0 || strcmp(truth_mode, "false") == 0 ||
+        strcmp(truth_mode, "off") == 0 || strcmp(truth_mode, "semantic") == 0) {
+      ctx->strict_truth_mode = 0;
+    } else if (strcmp(truth_mode, "1") == 0 || strcmp(truth_mode, "true") == 0 ||
+               strcmp(truth_mode, "on") == 0 || strcmp(truth_mode, "strict") == 0) {
+      ctx->strict_truth_mode = 1;
+    }
   }
 
   char route[sizeof(ctx->route_state)];
   route[0] = '\0';
   if (!cheng_parse_kv_value(kv, "route_state", route, (uint32_t)sizeof(route))) {
     (void)cheng_parse_kv_value(kv, "route", route, (uint32_t)sizeof(route));
+  }
+  char route_lock_text[16];
+  route_lock_text[0] = '\0';
+  if (cheng_parse_kv_value(kv, "route_lock", route_lock_text, (uint32_t)sizeof(route_lock_text))) {
+    if (strcmp(route_lock_text, "1") == 0 ||
+        strcmp(route_lock_text, "true") == 0 ||
+        strcmp(route_lock_text, "TRUE") == 0) {
+      ctx->route_arg_lock = 1;
+    } else {
+      ctx->route_arg_lock = 0;
+    }
+  } else {
+    ctx->route_arg_lock = 0;
   }
   char expected_hash[32];
   expected_hash[0] = '\0';
@@ -940,19 +1583,20 @@ static void cheng_refresh_route_state(ChengAppRuntimeCtx* ctx) {
         (void)cheng_pick_default_semantic_route(ctx, auto_route, (uint32_t)sizeof(auto_route));
       }
       if (auto_route[0] == '\0') {
-        cheng_safe_copy(auto_route, (uint32_t)sizeof(auto_route), "publish_app");
+        cheng_safe_copy(auto_route, (uint32_t)sizeof(auto_route), "home_default");
       }
-      strncpy(ctx->route_state, auto_route, sizeof(ctx->route_state) - 1u);
-      ctx->route_state[sizeof(ctx->route_state) - 1u] = '\0';
-      cheng_side_effect_push(ctx, "route-change", ctx->route_state);
+      cheng_set_route_state(ctx, auto_route, "auto-default");
     }
     return;
   }
-  if (strncmp(ctx->route_state, route, sizeof(ctx->route_state) - 1u) != 0) {
-    strncpy(ctx->route_state, route, sizeof(ctx->route_state) - 1u);
-    ctx->route_state[sizeof(ctx->route_state) - 1u] = '\0';
-    ctx->frame_dump_written = 0;
-    cheng_side_effect_push(ctx, "route-change", ctx->route_state);
+  if (ctx->route_arg_lock) {
+    cheng_set_route_state(ctx, route, "launch-arg-lock");
+    ctx->route_seeded = 1;
+    return;
+  }
+  if (!ctx->route_seeded || ctx->route_state[0] == '\0') {
+    cheng_set_route_state(ctx, route, "launch-arg-seed");
+    ctx->route_seeded = 1;
   }
 }
 
@@ -1016,20 +1660,24 @@ static void cheng_fill_frame(ChengAppRuntimeCtx* ctx) {
     return;
   }
   int semantic_ready = cheng_semantic_load_nodes(ctx);
-  if (semantic_ready) {
+  int truth_ready = 0;
+  const int strict_truth_active = (ctx->strict_truth_mode && ctx->route_state[0] != '\0') ? 1 : 0;
+  if (strict_truth_active) {
+    if (cheng_truth_load_route(ctx, ctx->route_state)) {
+      truth_ready = cheng_truth_render_frame(ctx);
+    }
+  }
+  if (strict_truth_active) {
+    if (truth_ready) {
+      semantic_ready = 1;
+    } else {
+      semantic_ready = 0;
+      cheng_fill_frame_semantic_missing(ctx);
+    }
+  } else if (semantic_ready) {
     (void)cheng_render_semantic_nodes(ctx);
   } else {
     cheng_fill_frame_semantic_missing(ctx);
-  }
-
-  /* Probe: direct pixel write to verify frame upload path independent of text backend. */
-  if (ctx->width > 24 && ctx->height > 24) {
-    for (int py = 8; py < 24; py++) {
-      for (int px = 8; px < 24; px++) {
-        ctx->pixels[(size_t)py * (size_t)ctx->width + (size_t)px] = cheng_pack_rgba(16u, 24u, 40u);
-      }
-    }
-    (void)cheng_draw_route_text_line(ctx, 28, 10, 0xFF111827u, 18, "DBG");
   }
 
   const int width = ctx->width;
@@ -1069,19 +1717,35 @@ static void cheng_fill_frame(ChengAppRuntimeCtx* ctx) {
   ctx->last_frame_hash = cheng_fnv1a64((const uint8_t*)ctx->pixels, ctx->pixels_len * (uint32_t)sizeof(uint32_t));
   cheng_try_dump_frame(ctx);
   uint64_t reported_hash = ctx->last_frame_hash;
-  char reason[256];
+  char reason[384];
   reason[0] = '\0';
+  int scale_milli = (int)(ctx->scale * 1000.0f + 0.5f);
+  if (scale_milli < 0) {
+    scale_milli = 0;
+  }
   (void)snprintf(
       reason,
       sizeof(reason),
-      "route=%s framehash=%016llx st=%u sth=%016llx sa=%u sah=%016llx sr=%d",
+      "route=%s framehash=%016llx st=%d sn=%u sth=%016llx sa=%u sah=%016llx sr=%d w=%d h=%d scm=%d tw=%d th=%d",
       ctx->route_state,
       (unsigned long long)reported_hash,
+      ctx->semantic_nodes_loaded ? 1 : 0,
       ctx->semantic_nodes_count,
       (unsigned long long)ctx->semantic_nodes_hash,
       ctx->semantic_nodes_applied_count,
       (unsigned long long)ctx->semantic_nodes_applied_hash,
-      semantic_ready ? 1 : 0);
+      semantic_ready ? 1 : 0,
+      ctx->width,
+      ctx->height,
+      scale_milli,
+      ctx->truth_width,
+      ctx->truth_height);
+  (void)snprintf(
+      reason + strlen(reason),
+      sizeof(reason) - strlen(reason),
+      " td=%d ls=%d",
+      ctx->touch_dispatch_count,
+      ctx->touch_last_slot);
   cheng_mobile_host_runtime_mark_stopped(reason);
   cheng_mobile_host_runtime_mark_started();
   if (ctx->has_expected_frame_hash && ctx->expected_frame_hash != ctx->last_frame_hash) {
@@ -1192,14 +1856,17 @@ uint64_t cheng_app_init(void) {
   ctx->paused = 0;
   ctx->frame_count = 0u;
   ctx->has_touch = 0;
+  ctx->touch_dispatch_count = 0;
+  ctx->touch_last_slot = -1;
   atomic_store_explicit(&ctx->ring_write_idx, 0u, memory_order_relaxed);
   atomic_store_explicit(&ctx->ring_read_idx, 0u, memory_order_relaxed);
   ctx->ring_desc.base = ctx->ring_data;
   ctx->ring_desc.capacity = CHENG_RING_CAPACITY;
   ctx->ring_desc.write_idx = &ctx->ring_write_idx;
   ctx->ring_desc.read_idx = &ctx->ring_read_idx;
-  strncpy(ctx->route_state, "lang_select", sizeof(ctx->route_state) - 1u);
-  ctx->route_state[sizeof(ctx->route_state) - 1u] = '\0';
+  ctx->route_state[0] = '\0';
+  ctx->route_seeded = 0;
+  ctx->route_arg_lock = 0;
   ctx->expected_frame_hash = 0u;
   ctx->has_expected_frame_hash = 0;
   ctx->frame_dump_file[0] = '\0';
@@ -1211,6 +1878,10 @@ uint64_t cheng_app_init(void) {
   ctx->semantic_nodes_applied_count = 0u;
   ctx->semantic_nodes_applied_hash = cheng_fnv1a64(NULL, 0u);
   ctx->semantic_nodes_path[0] = '\0';
+  cheng_truth_release(ctx);
+  ctx->truth_loaded = 0;
+  ctx->truth_route[0] = '\0';
+  ctx->truth_rgba_path[0] = '\0';
   ctx->focused = 1;
   ctx->ime_visible = 0;
   ctx->key_code_last = 0;
@@ -1237,13 +1908,11 @@ void cheng_app_set_window(uint64_t app_id, uint64_t window_id, int physical_w, i
   int old_w = ctx->width;
   int old_h = ctx->height;
   float old_scale = ctx->scale;
-  if (!ctx->strict_truth_mode) {
-    if (physical_w > 0) {
-      ctx->width = physical_w;
-    }
-    if (physical_h > 0) {
-      ctx->height = physical_h;
-    }
+  if (physical_w > 0) {
+    ctx->width = physical_w;
+  }
+  if (physical_h > 0) {
+    ctx->height = physical_h;
   }
   if (scale > 0.0f) {
     ctx->scale = scale;
@@ -1278,13 +1947,10 @@ void cheng_app_tick(uint64_t app_id, float delta_time) {
     ctx->last_touch_x = ev.x;
     ctx->last_touch_y = ev.y;
     ctx->has_touch = 1;
+    cheng_handle_touch_route_switch(ctx, &ev);
   }
 
   cheng_refresh_route_state(ctx);
-  if (ctx->strict_truth_mode) {
-    ctx->width = CHENG_TRUTH_FRAME_WIDTH;
-    ctx->height = CHENG_TRUTH_FRAME_HEIGHT;
-  }
   cheng_ensure_pixels(ctx);
   if (ctx->pixels == NULL) {
     return;
@@ -1306,6 +1972,8 @@ void cheng_app_on_touch(uint64_t app_id, int action, int pointer_id, float x, fl
   ev.pointer_id = pointer_id;
   ev.x = x;
   ev.y = y;
+  // Apply route transition immediately on input to avoid frame-lagged routing stalls.
+  cheng_handle_touch_route_switch(ctx, &ev);
   cheng_ring_push_touch(ctx, &ev);
   char payload[128];
   payload[0] = '\0';

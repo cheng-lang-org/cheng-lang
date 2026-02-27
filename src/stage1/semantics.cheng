@@ -509,8 +509,6 @@ fn semHasPrefix(s: str, prefix: str): bool =
     return true
 
 fn semStrEq(a: str, b: str): bool =
-    if a == nil || b == nil:
-        return a == nil && b == nil
     let n: int32 = len a
     if n != len b:
         return false
@@ -580,6 +578,22 @@ fn semShouldEnforceStdNoPointer(): bool =
     if semStrEq(stdNoPtrEnv, "0"):
         return false
     return semStrEq(getEnv "ABI", "v2_noptr")
+
+fn semShouldEnforceNonCAbiNoPointer(): bool =
+    let nonCAbiEnv: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI"
+    if semStrEq(nonCAbiEnv, "1"):
+        return true
+    if semStrEq(nonCAbiEnv, "0"):
+        return false
+    return semStrEq(getEnv "ABI", "v2_noptr")
+
+fn semShouldEnforceNonCAbiNoPointerInternal(): bool =
+    let internalEnv: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL"
+    if semStrEq(internalEnv, "1"):
+        return true
+    if semStrEq(internalEnv, "0"):
+        return false
+    return semShouldEnforceNonCAbiNoPointer()
 
 fn semIsStdPointerPolicyExempt(path: str): bool =
     if len(path) == 0:
@@ -659,6 +673,14 @@ fn semIsStdPointerPolicyExempt(path: str): bool =
         return true
     if strContains(path, "src\\std\\async_rt.cheng"):
         return true
+    if strContains(path, "src/std/net/transports/udp_syscall.cheng"):
+        return true
+    if strContains(path, "src\\std\\net\\transports\\udp_syscall.cheng"):
+        return true
+    if semHasPrefix(path, "std/net/transports/udp_syscall"):
+        return true
+    if semHasPrefix(path, "std\\net\\transports\\udp_syscall"):
+        return true
     if strContains(path, "src/std/sync.cheng"):
         return true
     if strContains(path, "src\\std\\sync.cheng"):
@@ -703,6 +725,14 @@ fn semIsCAbiBridgeModulePath(path: str): bool =
         return true
     if strContains(path, "src\\std\\async_rt_legacy.cheng"):
         return true
+    if strContains(path, "src/std/net/transports/udp_syscall.cheng"):
+        return true
+    if strContains(path, "src\\std\\net\\transports\\udp_syscall.cheng"):
+        return true
+    if semHasPrefix(path, "std/net/transports/udp_syscall"):
+        return true
+    if semHasPrefix(path, "std\\net\\transports\\udp_syscall"):
+        return true
     if strContains(path, "src/web/runtime/abi.cheng"):
         return true
     if strContains(path, "src\\web\\runtime\\abi.cheng"):
@@ -711,9 +741,19 @@ fn semIsCAbiBridgeModulePath(path: str): bool =
         return true
     if strContains(path, "src\\runtime\\mobile_app.cheng"):
         return true
+    if strContains(path, "/src/mobile_ffi/"):
+        return true
+    if strContains(path, "\\src\\mobile_ffi\\"):
+        return true
+    if semHasPrefix(path, "mobile_ffi/"):
+        return true
+    if semHasPrefix(path, "mobile_ffi\\"):
+        return true
     return false
 
 fn semPointerPolicyShouldCheckNonCAbi(path: str): bool =
+    if !semShouldEnforceNonCAbiNoPointer():
+        return false
     if len(path) == 0:
         return false
     if semIsGeneratedModule(path):
@@ -724,12 +764,14 @@ fn semPointerPolicyShouldCheckNonCAbi(path: str): bool =
     if semIsStdModulePath(path) && !strictStdNoPointer:
         return false
     # ZRPC hard gate: compiler-internal modules are checked too.
+    if semIsCompilerInternalModulePath(path) && !semShouldEnforceNonCAbiNoPointerInternal():
+        return false
     if semIsCAbiBridgeModulePath(path):
         return false
     return true
 
 fn semNormalizeNameCore(name: str): str =
-    if name == nil:
+    if len(name) == 0:
         return ""
     let n: int32 = len name
     if n <= 0:
@@ -1593,7 +1635,7 @@ fn semBorrowSeenFastHas(seenNames: str[], seenDepths: int32[], mask: uint64, nam
     var idx: uint64 = semHashBorrowPair(name, depth) & mask
     while true:
         let slotName: str = seenNames[int32(idx)]
-        if slotName == nil:
+        if len(slotName) == 0:
             return false
         if slotName == name && semReadI32(seenDepths, int32(idx)) == depth:
             return true
@@ -1603,7 +1645,7 @@ fn semBorrowSeenFastPut(seenNames: var str[], seenDepths: var int32[], mask: uin
     var idx: uint64 = semHashBorrowPair(name, depth) & mask
     while true:
         let slotName: str = seenNames[int32(idx)]
-        if slotName == nil:
+        if len(slotName) == 0:
             seenNames[int32(idx)] = name
             seenDepths[int32(idx)] = depth
             return
@@ -3074,7 +3116,7 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
     semDebugLog(semDbg, "[sem-debug] semCollectGlobals:done")
 
 fn semSliceRange(s: str, start: int32, stop: int32): str =
-    if s == nil:
+    if len(s) == 0:
         return ""
     if stop < start:
         return ""
@@ -3826,7 +3868,7 @@ fn checkSemantics(root: Node, diags: var Diagnostic[], ownershipEnabled: bool, o
         if stdPointerViolations > 0:
             diags = ctx.diags
             return
-    let enforceNonCAbiNoPointer: bool = true
+    let enforceNonCAbiNoPointer: bool = semShouldEnforceNonCAbiNoPointer()
     if enforceNonCAbiNoPointer:
         let nonCAbiPointerViolations: int32 = semCheckNoPointerNonCAbiPolicy(ctx, root)
         if nonCAbiPointerViolations > 0:

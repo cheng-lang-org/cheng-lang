@@ -630,7 +630,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
   - `str`/`cstring` -> `""`
   - `T*`/`ref T`/`var T`/`void*` -> `nil`
   - 复合类型（`tuple/object/T[]/T[N]/Table/...` 等）-> 该类型的零值（zero-init）；其中 `T[]/T[N]` 的零值为“空序列”（`len=0 cap=0 buffer=nil`）
-- 字符串类型命名约束：内建字符串类型仅 `str` 与 `cstring`；`string` 不属于内建类型名，生产代码不应使用。
+- 字符串类型命名约束：内建字符串类型仅 `str` 与 `cstring`；。
 - 字符串 nil 语义（稳定口径）：
   - `str` 省略初始化默认 `""`。
   - `str = nil`、`let/var x: str = nil`、`x == nil`、`x != nil` 在编译阶段直接报错。

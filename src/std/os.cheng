@@ -4,6 +4,7 @@ import std/seqs
 import std/system
 import std/strings
 import std/times
+import std/rawbytes
 
 type
     File = void*
@@ -111,8 +112,67 @@ fn cheng_pty_write(fd: int32, data: cstring, len: int32): int32
 fn cheng_pty_close(fd: int32): int32
 @importc("cheng_pty_wait")
 fn cheng_pty_wait(pid: int64, outExitCode: int32*): int32
+@importc("cheng_errno")
+fn cheng_errno(): int32
+@importc("cheng_strerror")
+fn cheng_strerror(err: int32): cstring
+@importc("close")
+fn cheng_close_fd(fd: int32): int32
+@importc("fcntl")
+fn cheng_fcntl(fd: int32, cmd: int32, arg: int32): int32
+@importc("inet_pton")
+fn cheng_inet_pton(family: int32, src: cstring, dst: void*): int32
+@importc("inet_ntop")
+fn cheng_inet_ntop(family: int32, src: void*, dst: cstring, size: int32): cstring
 fn c_fwrite_std(ptr: void*, size, n: int64, stream: void*): int32 =
     return cheng_fwrite(ptr, size, n, File(stream))
+
+fn udpErrno(): int32 =
+    return cheng_errno()
+
+fn udpErrText(errCode: int32): str =
+    let textPtr: cstring = cheng_strerror(errCode)
+    if textPtr == nil:
+        return "unknown"
+    return str(textPtr)
+
+fn udpCloseFd(fd: int32): int32 =
+    return cheng_close_fd(fd)
+
+fn udpFcntl(fd: int32, cmd: int32, arg: int32): int32 =
+    return cheng_fcntl(fd, cmd, arg)
+
+fn udpInetPton(family: int32, src: str, dst: Bytes): int32 =
+    if len(src) <= 0 || bytesLen(dst) <= 0:
+        return 0
+    return cheng_inet_pton(family, cstring(src), dst.data)
+
+fn udpInetNtop(family: int32, src: Bytes): str =
+    if bytesLen(src) <= 0:
+        return ""
+    let outBuf: Bytes = bytesAlloc(128)
+    if bytesLen(outBuf) <= 0:
+        return ""
+    bytesSet(outBuf, 0, 0)
+    let textPtr: cstring = cheng_inet_ntop(family, src.data, cstring(outBuf.data), bytesLen(outBuf))
+    if textPtr == nil:
+        return ""
+    return str(textPtr)
+
+fn udpBindFd(fd: int32, addr: Bytes, addrLen: int32): int32 =
+    if fd < 0 || addrLen <= 0:
+        return -1
+    return bind(fd, addr.data, addrLen)
+
+fn udpSendToFd(fd: int32, payload: Bytes, flags: int32, addr: Bytes, addrLen: int32): int32 =
+    if fd < 0 || addrLen <= 0 || bytesLen(payload) <= 0:
+        return -1
+    return sendto(fd, payload.data, bytesLen(payload), flags, addr.data, addrLen)
+
+fn udpSetSockOptIntFd(fd: int32, level: int32, optName: int32, optBytes: Bytes): int32 =
+    if fd < 0 || bytesLen(optBytes) <= 0:
+        return -1
+    return setsockopt(fd, level, optName, optBytes.data, bytesLen(optBytes))
 
 fn setIoMeterHook(hook: IoMeterHook) =
     ioMeterHasHook = (hook != nil)
@@ -252,15 +312,17 @@ fn os_arcRetainSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
     for i in 0..<seqInst.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
         let path: str = entry.path
-        if path != nil:
-            memRetain void*(path)
+        let pathPtr: void* = void*(path)
+        if pathPtr != nil:
+            memRetain pathPtr
 
 fn os_arcReleaseSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
     for i in 0..<seqInst.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
         let path: str = entry.path
-        if path != nil:
-            memRelease void*(path)
+        let pathPtr: void* = void*(path)
+        if pathPtr != nil:
+            memRelease pathPtr
     if seqInst.buffer != nil:
         memRelease seqInst.buffer
 
@@ -288,7 +350,8 @@ fn removeDir(path: str) =
     path
 fn getEnvImpl(key: str, defaultValue: str): str =
     let v: str = c_getenv key
-    if v == nil:
+    let vPtr: void* = void*(v)
+    if vPtr == nil:
         return defaultValue
     return v
 fn getEnv(key: str): str =
@@ -322,7 +385,7 @@ fn `/`(a: str, b: str): str =
     return joinPath(a, b)
 
 fn sliceStr(text: str, start: int32, stop: int32): str =
-    if text == nil:
+    if len(text) == 0:
         return ""
     var s: int32 = start
     var e: int32 = stop
@@ -440,8 +503,8 @@ fn walkDir(path: str): seq_WalkDirEntry =
         return out
     let listText: str = cheng_list_dir path
     if len(listText) == 0 || listText[0] == char(0):
-        if listText != nil:
-            let listTextPtr: void* = void*(listText)
+        let listTextPtr: void* = void*(listText)
+        if listTextPtr != nil:
             dealloc listTextPtr
         return out
     let total: int32 = len listText
@@ -458,7 +521,7 @@ fn walkDir(path: str): seq_WalkDirEntry =
                 endIdx = endIdx - 1
             if endIdx >= start:
                 let name: str = sliceStr(listText, start, endIdx)
-                if name != nil && name[0] != char(0):
+                if len(name) > 0 && name[0] != char(0):
                     let fullPath: str = joinPath(path, name)
                     var kind: PathComponent = pcOther
                     if dirExists fullPath:
@@ -513,7 +576,8 @@ fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult 
         merge = 1
     var exitCode: int64 = -1
     let output: str = cheng_exec_cmd_ex(command, workingDir, merge, &exitCode)
-    if output != nil:
+    let outputPtr: void* = void*(output)
+    if outputPtr != nil:
         result.output = output
     result.exitCode = exitCode
     return result
@@ -546,14 +610,14 @@ fn readFile(path: str): str =
     if f == nil:
         return ""
     let content: str = readAll f
-    close f
+    c_fclose f
     return content
 fn writeFile(path: str, content: str) =
     let f: File = open(path, fmWrite)
     if f == nil:
         return
     write(f, content)
-    close f
+    c_fclose f
 
 fn writeFileBytes(path: str, bytes: uint8[]) =
     let f: File = open(path, fmWrite)
@@ -562,4 +626,4 @@ fn writeFileBytes(path: str, bytes: uint8[]) =
     if bytes.buffer != nil && bytes.len > 0:
         let wrote: int32 = c_fwrite_std(bytes.buffer, 1, int64(bytes.len), void*(f))
         ioMeterReport(ioWrite, int64(wrote))
-    close f
+    c_fclose f

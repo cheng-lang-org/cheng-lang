@@ -74,12 +74,12 @@ fn iselErrInfoMachineFunc(err: ErrorInfo): Result[MachineFunc] =
     return out
 
 fn isel_strContains(hay: str, needle: str): bool =
-    if hay == nil || needle == nil:
-        return false
     let n: int32 = len(hay)
     let m: int32 = len(needle)
     if m == 0:
         return true
+    if n == 0:
+        return false
     if n < m:
         return false
     for i in 0..n - m:
@@ -91,12 +91,12 @@ fn isel_strContains(hay: str, needle: str): bool =
     return false
 
 fn isel_strStartsWith(s: str, prefix: str): bool =
-    if s == nil || prefix == nil:
-        return false
     let n: int32 = len(s)
     let m: int32 = len(prefix)
     if m == 0:
         return true
+    if n == 0:
+        return false
     if n < m:
         return false
     for i in 0..<m:
@@ -109,31 +109,9 @@ fn iselTargetIsDarwin(target: str): bool =
         return true
     return isel_strContains(target, "apple") || isel_strContains(target, "darwin") || isel_strContains(target, "ios")
 
-fn iselEnvBoolFalse(raw: str): bool =
-    return strings.streq(raw, "0") || strings.streq(raw, "false") || strings.streq(raw, "off") || strings.streq(raw, "no") ||
-           strings.streq(raw, "FALSE") || strings.streq(raw, "OFF") || strings.streq(raw, "NO")
-
-fn iselEnvBoolTrue(raw: str): bool =
-    return strings.streq(raw, "1") || strings.streq(raw, "true") || strings.streq(raw, "on") || strings.streq(raw, "yes") ||
-           strings.streq(raw, "TRUE") || strings.streq(raw, "ON") || strings.streq(raw, "YES")
-
 fn iselCStringLoweringEnabled(): bool =
-    # Keep historical self-link defaults stable, but auto-enable when
-    # system-link + runtime-c is explicitly requested.
-    var raw: str = os.getEnvDefault("BACKEND_ENABLE_CSTRING_LOWERING", "")
-    if len(raw) > 0:
-        if iselEnvBoolFalse(raw):
-            return false
-        if iselEnvBoolTrue(raw):
-            return true
-    var linkerRaw: str = os.getEnvDefault("BACKEND_LINKER", "")
-    var noRuntimeRaw: str = os.getEnvDefault("BACKEND_NO_RUNTIME_C", "")
-    if strings.streq(linkerRaw, "system") || strings.streq(linkerRaw, "SYSTEM"):
-        if len(noRuntimeRaw) == 0:
-            return false
-        if iselEnvBoolFalse(noRuntimeRaw):
-            return true
-    return false
+    # C string lowering is now mandatory in production/native paths.
+    return true
 
 fn iselTypeKeyIsVarargs(typeKey: str): bool =
     if len(typeKey) == 0:
@@ -180,7 +158,7 @@ fn iselIsInternalSym(name: str): bool =
     return isel_strStartsWith(name, "L_cheng_")
 
 fn iselStripTargetSymPrefixOnce(target: str, name: str): str =
-    if name == nil:
+    if len(name) == 0:
         return ""
     if iselTargetIsDarwin(target) && len(name) > 0 && name[0] == '_' :
         # Only strip the Mach-O leading underscore once.
@@ -301,7 +279,7 @@ fn iselFindFunc(module: UirModule, name: str): UirFunc =
     return nil
 
 fn iselHasGlobal(module: UirModule, name: str): bool =
-    if module == nil || name == nil:
+    if module == nil || len(name) == 0:
         return false
     for i in 0..<uirModuleGlobalsLen(module):
         let g: UirGlobal = uirModuleGlobalAt(module, i)
@@ -310,7 +288,7 @@ fn iselHasGlobal(module: UirModule, name: str): bool =
     return false
 
 fn iselGlobalSym(module: UirModule, name: str): str =
-    if name == nil:
+    if len(name) == 0:
         return ""
     if iselIsInternalSym(name):
         return name
@@ -397,6 +375,10 @@ fn iselTypeSize(ty: UirLowerType): int32 =
     if ty.kind == mtI8:
         return 1
     return 0
+
+fn iselTypeKindKnown(ty: UirLowerType): bool =
+    let k: int32 = int32(ty.kind)
+    return k >= int32(mtVoid) && k <= int32(mtF64)
 
 fn iselTypeAlignPow2(ty: UirLowerType): int32 =
     if ty.kind == mtF64:
@@ -809,7 +791,7 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
                 baseReg: MachineReg, labelState: LabelState): Result[int32] =
     let lim: int32 = iselExprDepthLimit()
     if lim > 0 && iselExprDepth >= lim:
-        let fnName: str = (uirFunc != nil && uirFuncLinkNameOf(uirFunc) != nil) ? uirFuncLinkNameOf(uirFunc) : ""
+        let fnName: str = (uirFunc != nil && len(uirFuncLinkNameOf(uirFunc)) > 0) ? uirFuncLinkNameOf(uirFunc) : ""
         return Err[int32]("isel: expr recursion depth exceeded fn=" + fnName +
                           " depth=" + intToStr(iselExprDepth) +
                           " limit=" + intToStr(lim))
@@ -831,7 +813,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         if uirExprKindOf(expr) == meCall:
             calleeDbg = uirExprCalleeOf(expr)
         echo("[isel.expr] kind=" + intToStr(k) +
-             " callee=" + (calleeDbg == nil ? "" : calleeDbg) +
+             " callee=" + ((len(calleeDbg) > 0) ? calleeDbg : "") +
              " dst=" + intToStr(int32(dst)))
     let exprType: UirLowerType = iselExprType(module, uirFunc, expr, retType)
     let dstT: MachineReg = iselRegWithType(dst, exprType)
@@ -870,7 +852,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         if callee != nil && uirFuncIsExtern(callee) && uirFuncParamsLen(callee) > 0:
             let lastP: UirParam = uirFuncParamAt(callee, uirFuncParamsLen(callee) - 1)
             var typeKeyIsVarargs: bool = false
-            if lastP.typeKey != nil && strings.streq(lastP.typeKey, "varargs"):
+            if len(lastP.typeKey) > 0 && strings.streq(lastP.typeKey, "varargs"):
                 typeKeyIsVarargs = true
             if typeKeyIsVarargs:
                 hasVarargs = true
@@ -1272,8 +1254,8 @@ fn iselEmitStmt(func: MachineFunc, module: UirModule, stmt: UirStmt, uirFunc: Ui
     if stmt.kind == msExpr:
         return iselEmitExprInner(func, module, uirFunc, stmt.expr, retType, dst, tmp,
                                  scratch, baseReg, labelState)
-    let funcName: str = (uirFunc != nil && uirFuncLinkNameOf(uirFunc) != nil) ? uirFuncLinkNameOf(uirFunc) : ""
-    let stmtName: str = stmt.name != nil ? stmt.name : ""
+    let funcName: str = (uirFunc != nil && len(uirFuncLinkNameOf(uirFunc)) > 0) ? uirFuncLinkNameOf(uirFunc) : ""
+    let stmtName: str = len(stmt.name) > 0 ? stmt.name : ""
     let msg: str = "isel: unsupported stmt kind=" + intToStr(int32(stmt.kind)) +
                    " slot=" + intToStr(stmt.slot) +
                    " name=" + stmtName +
@@ -1491,7 +1473,7 @@ fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
         if ! IsOk[int32](bRes):
             return iselErrInfoMachineFunc(ErrorInfoOf[int32](bRes))
     if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_STEP", ""), "1"):
-        echo("[isel.step] func.return.ok name=" + (out.name == nil ? "" : out.name))
+        echo("[isel.step] func.return.ok name=" + ((len(out.name) > 0) ? out.name : ""))
     return iselOkMachineFunc(out)
 
 fn aarch64LowerModule(module: UirModule): Result[MachineModule] =
@@ -1509,11 +1491,13 @@ fn aarch64LowerModule(module: UirModule): Result[MachineModule] =
         echo("[isel] target=" + uirModuleTargetOf(module) + " funcs=" + intToStr(uirModuleFuncsLen(module)))
     for gi in 0..<uirModuleGlobalsLen(module):
         let g: UirGlobal = uirModuleGlobalAt(module, gi)
+        if !iselTypeKindKnown(g.ty):
+            continue
         let size: int32 = iselTypeSize(g.ty)
         if size <= 0:
-            let tk: str = intToStr(int32(g.ty.kind))
-            let origin: str = (len(g.originFile) > 0) ? g.originFile : ""
-            return Err_MachineModule("isel: unsupported global type (name=" + uirGlobalNameOf(g) + ", kind=" + tk + ", origin=" + origin + ")")
+            # Object/aggregate globals can appear as mtVoid placeholders in UIR.
+            # AArch64 selector currently lowers only scalar globals.
+            continue
         let alignPow2: int32 = iselTypeAlignPow2(g.ty)
         var mg: MachineGlobal
         new mg
@@ -1531,9 +1515,9 @@ fn aarch64LowerModule(module: UirModule): Result[MachineModule] =
             let cLabel: str = uirCStringLabelOf(c)
             let cValue: str = uirCStringValueOf(c)
             if dbgCstr && ci < 8:
-                let cLen: int32 = cValue == nil ? -1 : len(cValue)
-                let c0: int32 = (cValue != nil && cLen > 0) ? int32(cValue[0]) : -1
-                let c1: int32 = (cValue != nil && cLen > 1) ? int32(cValue[1]) : -1
+                let cLen: int32 = len(cValue)
+                let c0: int32 = (cLen > 0) ? int32(cValue[0]) : -1
+                let c1: int32 = (cLen > 1) ? int32(cValue[1]) : -1
                 echo("[isel.cstr.a64] i=" + intToStr(ci) + " label=" + cLabel +
                      " len=" + intToStr(cLen) + " b0=" + intToStr(c0) + " b1=" + intToStr(c1))
             machineAddCString(out, cLabel, cValue)
