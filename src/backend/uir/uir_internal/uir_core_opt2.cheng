@@ -68,40 +68,71 @@ fn uirCoreOpt2TypeKey(ty: UirCoreType): str =
 fn uirCoreOpt2TypeEq(a: UirCoreType, b: UirCoreType): bool =
     return a.kind == b.kind && a.isUnsigned == b.isUnsigned
 
+fn uirCoreOpt2ExprScanBudget(): int32 =
+    # Keep opt2 resilient to pathological or cyclic expression graphs.
+    return 2000000
+
 fn uirCoreOpt2ExprHasCall(expr: UirCoreExpr): bool =
     if expr == nil:
         return false
-    let k: UirCoreExprKind = expr.kind
-    if k == meCall:
-        return true
-    if k == meBin || k == meCmp:
-        return uirCoreOpt2ExprHasCall(expr.lhs) || uirCoreOpt2ExprHasCall(expr.rhs)
-    if k == meCast:
-        return uirCoreOpt2ExprHasCall(expr.castExpr)
-    if k == meLoad:
-        return uirCoreOpt2ExprHasCall(expr.addrExpr)
-    if k == meCall:
-        for i in 0..<expr.args.len:
-            if uirCoreOpt2ExprHasCall(expr.args[i]):
-                return true
-        return false
+    var work: UirCoreExpr[]
+    work.cap = 16
+    add(work, expr)
+    var steps: int32 = 0
+    let budget: int32 = uirCoreOpt2ExprScanBudget()
+    while work.len > 0:
+        let cur: UirCoreExpr = work[work.len - 1]
+        work.len = work.len - 1
+        if cur == nil:
+            continue
+        steps = steps + 1
+        if steps > budget:
+            return true
+        let k: UirCoreExprKind = cur.kind
+        if k == meCall:
+            return true
+        if k == meBin || k == meCmp:
+            add(work, cur.rhs)
+            add(work, cur.lhs)
+            continue
+        if k == meCast:
+            add(work, cur.castExpr)
+            continue
+        if k == meLoad:
+            add(work, cur.addrExpr)
+            continue
     return false
 
 fn uirCoreOpt2ExprHasAnyLoad(expr: UirCoreExpr): bool =
     if expr == nil:
         return false
-    let k: UirCoreExprKind = expr.kind
-    if k == meLoad:
-        return true
-    if k == meBin || k == meCmp:
-        return uirCoreOpt2ExprHasAnyLoad(expr.lhs) || uirCoreOpt2ExprHasAnyLoad(expr.rhs)
-    if k == meCast:
-        return uirCoreOpt2ExprHasAnyLoad(expr.castExpr)
-    if k == meCall:
-        for i in 0..<expr.args.len:
-            if uirCoreOpt2ExprHasAnyLoad(expr.args[i]):
-                return true
-        return false
+    var work: UirCoreExpr[]
+    work.cap = 16
+    add(work, expr)
+    var steps: int32 = 0
+    let budget: int32 = uirCoreOpt2ExprScanBudget()
+    while work.len > 0:
+        let cur: UirCoreExpr = work[work.len - 1]
+        work.len = work.len - 1
+        if cur == nil:
+            continue
+        steps = steps + 1
+        if steps > budget:
+            return true
+        let k: UirCoreExprKind = cur.kind
+        if k == meLoad:
+            return true
+        if k == meBin || k == meCmp:
+            add(work, cur.rhs)
+            add(work, cur.lhs)
+            continue
+        if k == meCast:
+            add(work, cur.castExpr)
+            continue
+        if k == meCall:
+            for i in 0..<cur.args.len:
+                add(work, cur.args[i])
+            continue
     return false
 
 fn uirCoreOpt2ExprIsPure(expr: UirCoreExpr): bool =

@@ -4,6 +4,10 @@
 
 本文为 Cheng 语言最终规范，描述语法与核心语义。
 
+命令前缀约定（文内命令可直接执行）：
+- `TOOLING=artifacts/tooling_cmd/cheng_tooling`
+- 示例中的 `$TOOLING <subcmd>` 等价于直接调用 canonical tooling binary。
+
 ---
 
 ## 0. 语义与内存管理
@@ -47,13 +51,13 @@
 - Codegen 注入：生产链路由后端 driver 直接生成 `.o/.exe`（见 `src/backend/tooling/backend_driver.cheng`）。Ownership 的最终落地位置以当前实现为准。
 - 运行时与容器：`src/std/system.cheng` 提供 ORC API；`str[]` 与 `Table[str]` 的关键写入路径（`addPtr_str`/`setStringAt`/`insert`/`delete`/`TablePut[str]`）已在容器实现内完成 retain/release 语义；codegen 不再对这些容器 API 做字符串 call-site retain 特判。
 - 开关与诊断：`src/stage1/frontend_lib.cheng` 按 `MM`/`MM_STRICT` 开启 ownership/ORC；编译期诊断用 `OWNERSHIP_DIAGS`；`STAGE1_OWNERSHIP_DEEP=1` 强制深度遍历（默认浅遍历以提升 stage1 性能，仅用于对照/排障）；运行时计数与日志用 `MM_DIAG`。
-- 确定性与回归：`sh src/tooling/tooling_exec.sh bootstrap --fullspec` 与 `sh src/tooling/tooling_exec.sh bootstrap_pure --fullspec` 用于输出 hash 一致性检查；`examples/test_orc_closedloop.cheng` 作为 ORC 回归用例。
+- 确定性与回归：`$TOOLING bootstrap --fullspec` 与 `$TOOLING bootstrap-pure --fullspec` 用于输出 hash 一致性检查；`examples/test_orc_closedloop.cheng` 作为 ORC 回归用例。
 - 发布门槛：严格模式回归必须通过；retain/release/escape 计数一致；任何（已启用的）moveHint 退化或容器 escape 漏标禁止发布。
 
 #### 0.1.3 生产级落地清单（工具链/CI/发布）
 
 - 可复现构建：固定编译器版本与依赖；产物随附 build hash、`MM` 配置与 backend driver 版本信息。
-- CI gating：全量跑 `sh src/tooling/tooling_exec.sh bootstrap --fullspec` / `sh src/tooling/tooling_exec.sh bootstrap_pure --fullspec`；ORC/escape 回归用例必须通过且计数一致。
+- CI gating：全量跑 `$TOOLING bootstrap --fullspec` / `$TOOLING bootstrap-pure --fullspec`；ORC/escape 回归用例必须通过且计数一致。
 - 发布包组成：`cheng`（backend driver）、`cheng.stage2` seed、`cheng-formal-spec.md` 对应版本号与验收 hash。
 - 回滚策略：严格模式默认启用；不再支持 `MM=off` 退化；保留 `MM_DIAG` 作为线上诊断开关。
 - 生产观测：按需启用 retain/release/escape 计数与日志；发布后进行计数基线对比与异常告警。
@@ -649,11 +653,11 @@ charLiteral    ::= `'` CHARACTER `'` ;
 ### 1.2.2 破坏性语法升级流程（工程约束，非语义）
 
 - 当需要移除/替换源码层语法（例如 `seq[T]` -> `T[]`、`@[...]` -> `[...]`、引入列表生成式等）时，推荐按以下最小流程落地，避免自举/文档/门禁漂移：
-  1. 规范与文档先行：先更新本规范与相关设计文档（如 `docs/container-refactor.md`、`docs/list-comprehension.md`），并同步 `docs/cheng-skill/` 与 `$HOME/.codex/skills/cheng语言/`；跑 `sh src/tooling/tooling_exec.sh verify_cheng_skill_consistency`。
+  1. 规范与文档先行：先更新本规范与相关设计文档（如 `docs/container-refactor.md`、`docs/list-comprehension.md`），并同步 `docs/cheng-skill/` 与 `$HOME/.codex/skills/cheng语言/`；跑 `$TOOLING verify_cheng_skill_consistency`。
   2. 实现新语法：parser 支持 + type/expr lowering 到内部 canonical；尽量保持后端/标准库的稳定面，必要时加 parse recovery。
   3. 禁用旧语法：旧写法一律硬错误并给迁移提示；旧语法只允许作为内部 lowering 目标存在。
   4. 自举兼容：生产链路不再支持 stage0 overlay；若 seed stage0 不支持新语法，需刷新 stage0/seed，并保证 `backend.stage0_no_compat` 门禁通过。
-  5. 回归与 seed 更新：补最小正/反例 tests；跑 `sh verify.sh` 或相关 gate；需要刷新 seed 时用 `sh src/tooling/tooling_exec.sh bootstrap_pure` 并设置 `BOOTSTRAP_UPDATE_SEED=1`。
+  5. 回归与 seed 更新：补最小正/反例 tests；跑 `sh verify.sh` 或相关 gate；需要刷新 seed 时用 `$TOOLING bootstrap-pure` 并设置 `BOOTSTRAP_UPDATE_SEED=1`。
 
 ### 1.3 运算符优先级
 
@@ -739,7 +743,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 
 ## 附录 A 自研后端与 UIR 摘要
 
-本附录记录自研后端落地的实现约束与 UIR 摘要；完整任务清单与文件结构见 `docs/cheng-backend-arch.md`。
+本附录记录自研后端落地的实现约束与 UIR 摘要；完整任务清单与文件结构见 `docs/cheng-build-any-platform.md`。
 
 - 后端定位：保持语言语义不变，编译器内部统一使用 UIR：生产主路径为 `Stage1 -> UIR -> Machine -> Obj/Exe`（`BACKEND_IR=uir`）；不再存在独立 MIR/LIR 生产链路。
 - UIR 生产默认：`BACKEND_OPT_LEVEL` 未设置时默认 `2`；`UIR_SIMD` 未设置时在 `optLevel>=3` 自动开启。
@@ -756,19 +760,24 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - Dev 热补丁策略：`BACKEND_HOTPATCH_MODE=trampoline` + append-only code pool；`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program` 且 `BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
 - 当前实现：UIR internal 采用表达式树 + `ret/br/cbr` 终结指令，machine internal 覆盖 AArch64 基本算术/比较/分支/栈操作；`mod` 以 `sdiv+msub` 降级。
 - SIMD 能力说明：当前闭环未要求向量化；SSA 与 SIMD 并非替代关系。SSA 负责值语义化优化（当前最小闭环主侧），SIMD 是向量化优化能力，需要在后续 UIR 阶段增加向量类型、并行化合法性分析与后端寄存器映射后分阶段接入。
-- 验证入口迁移：`verify_*` 已并入 `cheng_tooling` 原生子命令；统一执行口径为 `sh src/tooling/tooling_exec.sh <verify_id>`（或 `cheng_tooling <verify_id>`）。文中历史 `sh src/tooling/tooling_exec.sh verify_xxx` 写法视为等价调用。
-- 入口迁移（非 verify）：tooling 主链路已迁移为 `cheng_tooling` 内嵌脚本表（`src/tooling/cheng_tooling_embedded_inline.cheng`）并统一通过 `tooling_exec` 分发；仓外 `closedloop/mdns/web-cli` 的历史 shell 入口已收敛为 `tooling_exec` 子命令（`closedloop/run_mdns_lan_two_node_smoke/web_build_native_server`）。
-- 验证入口：`sh src/tooling/tooling_exec.sh verify_backend_float` 负责生成并执行最小闭环样例（`emit=exe` 口径）。
-- 跨平台矩阵（可验收）：`sh src/tooling/tooling_exec.sh verify_backend_targets_matrix` 覆盖 darwin/ios(Mach‑O `.o`) + android/linux(ELF `.o`) + windows(COFF `.obj`)。
-- 全语义回归入口：`sh src/tooling/tooling_exec.sh verify_backend_closedloop` 会使用后端 driver（默认 `artifacts/backend_driver/cheng`；可用 `BACKEND_DRIVER=<path>` 显式指定，未命中可运行 driver 直接失败）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求运行返回码为 `0`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；跨目标 `self_linker(ELF/COFF)` 与 `linker_abi_core` 门禁默认强制阻断，默认固定 stable driver 口径且不再自动回退 seed/selfhost/release 候选，已移除 prebuilt-obj/link-only 降级路径，不允许 skip 与 compile-only 回退）。
-- 除平台生产闭环入口：`sh src/tooling/tooling_exec.sh backend_prod_closure`（默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression`、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256，`sign/verify` 在发布链路默认 required）与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。
-- 零脚本生产闭环：`backend_prod_closure` 默认要求 `TOOLING_EXEC_BUNDLE_PROFILE=full` + `TOOLING_EXEC_REQUIRE_BUNDLE=1` + `TOOLING_EXEC_BUNDLE_CORE_AUTO_BUILD=0`，并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`（`tooling_exec.sh` / `env_prefix_bridge.sh` 除外）；`cheng/chengc` 核心入口必须走 `cheng_tooling` 原生命令路由，不允许 `cheng_tooling chengc` 回落 embedded shell payload。
-- driver 自举 smoke 口径：`backend.driver_selfbuild_smoke` 为 required gate，默认输出路径与主 driver 统一为 `artifacts/backend_driver/cheng`；生产收口口径固定统一 driver（`BACKEND_DRIVER=artifacts/backend_driver/cheng`），driver 体检失败直接阻断，不依赖自动回退候选；seed/selfhost 仅允许显式覆盖用于排障。闭环强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0` 与 `DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，防止语义降级。
+- 验证入口迁移：`verify_*` 已并入 `cheng_tooling` 原生子命令；统一执行口径为 `$TOOLING <verify_id>`，历史 shell 包装入口不计入规范主口径。
+- tooling 可执行落点：命令名 `cheng_tooling` 对应 canonical 二进制 `artifacts/tooling_cmd/cheng_tooling`（未配置 PATH 时请直接使用该路径）。
+- 入口迁移（非 verify）：tooling 主链路已迁移为 `cheng_tooling` 内嵌脚本表（`src/tooling/cheng_tooling_embedded_inline.cheng`）并统一通过原生子命令分发；仓外 `closedloop/mdns/web-cli` 历史 shell 入口已收敛为 `cheng_tooling` 子命令链路。
+- 验证入口：`$TOOLING verify_backend_float` 负责生成并执行最小闭环样例（`emit=exe` 口径）。
+- 跨平台矩阵（可验收）：`$TOOLING verify_backend_targets_matrix` 覆盖 darwin/ios(Mach‑O `.o`) + android/linux(ELF `.o`) + windows(COFF `.obj`)。
+- 全语义回归入口：`$TOOLING verify_backend_closedloop` 会使用后端 driver（默认 `artifacts/backend_driver/cheng`；可用 `BACKEND_DRIVER=<path>` 显式指定，未命中可运行 driver 直接失败）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求运行返回码为 `0`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；跨目标 `self_linker(ELF/COFF)` 与 `linker_abi_core` 门禁默认强制阻断，默认固定 stable driver 口径且不再自动回退 seed/selfhost/release 候选，已移除 prebuilt-obj/link-only 降级路径，不允许 skip 与 compile-only 回退）。
+- 除平台生产闭环入口：`$TOOLING backend_prod_closure`（默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression`、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256，`sign/verify` 在发布链路默认 required）与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。
+- 零脚本生产闭环：`backend_prod_closure` 默认要求 `TOOLING_EXEC_BUNDLE_PROFILE=full` + `TOOLING_EXEC_REQUIRE_BUNDLE=1` + `TOOLING_EXEC_BUNDLE_CORE_AUTO_BUILD=0`，并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`；`cheng/chengc` 核心入口必须走 `cheng_tooling` 原生命令路由，不允许 `$TOOLING chengc` 回落 embedded shell payload。
+- driver 自举 smoke 口径：`backend.driver_selfbuild_smoke` 为可选 gate（默认关闭，需显式 `--driver-selfbuild-smoke` 或 `BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=1` 开启）；默认输出路径与主 driver 统一为 `artifacts/backend_driver/cheng`。启用后强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0` 与 `DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，防止语义降级。
 - driver 解析口径：`backend_driver_path` 默认使用稳定 driver `artifacts/backend_driver/cheng`，并带 stage0 编译探针；首选不健康时直接阻断（仅允许显式 `--stage0` 覆盖）。
-- 全链自举门禁：`sh src/tooling/tooling_exec.sh verify_fullchain_bootstrap`（stage2→tools；obj-only fullspec internal gate + 工具 `--help` smoke；失败即阻断）。
-- 专用机 100ms 自举门禁：`sh src/tooling/tooling_exec.sh verify_backend_selfhost_100ms_host`（基线文件 `src/tooling/selfhost_perf_100ms_host.env`）；`backend_prod_closure` 在 `BACKEND_RUN_SELFHOST_100MS=1` 时拆成 quick/report + full/blocking 双轨：quick 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=0`，full 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=1` + `SELFHOST_STAGE1_REQUIRE_REBUILD=1`，并支持 `BACKEND_BUILD_DRIVER_PROFILE_OUT` 导出重编画像；非目标主机默认报告不阻断。
-- 热补丁运行态门禁：`sh src/tooling/tooling_exec.sh verify_backend_hotpatch` 与 `sh src/tooling/tooling_exec.sh verify_backend_hotpatch_meta` 固定 `self-link` 口径并执行可运行探针，不接受 system-link 回退；required 口径下禁用 runnable 重试回退（`BACKEND_HOTPATCH_RUNNABLE_RETRIES>1` 直接失败）；unsupported target 直接失败（不再 `skip`）。
-- 本地发布/回滚：`sh src/tooling/tooling_exec.sh backend_prod_publish`（验收后发布到 `dist/releases`），`sh src/tooling/tooling_exec.sh backend_release_rollback`（切换 `dist/releases/current` 回滚）。
+- 全链自举门禁：`$TOOLING verify_fullchain_bootstrap`（stage2→tools；obj-only fullspec internal gate + 工具 `--help` smoke；失败即阻断）。
+- 专用机 100ms 自举门禁：`$TOOLING verify_backend_selfhost_100ms_host`（基线文件 `src/tooling/selfhost_perf_100ms_host.env`）；`backend_prod_closure` 在 `BACKEND_RUN_SELFHOST_100MS=1` 时拆成 quick/report + full/blocking 双轨：quick 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=0`，full 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=1` + `SELFHOST_STAGE1_REQUIRE_REBUILD=1`，并支持 `BACKEND_BUILD_DRIVER_PROFILE_OUT` 导出重编画像；非目标主机默认报告不阻断。
+- 热补丁运行态门禁：`$TOOLING verify_backend_hotpatch` 与 `$TOOLING verify_backend_hotpatch_meta` 固定 `self-link` 口径并执行可运行探针，不接受 system-link 回退；required 口径下禁用 runnable 重试回退（`BACKEND_HOTPATCH_RUNNABLE_RETRIES>1` 直接失败）；unsupported target 直接失败（不再 `skip`）。
+- 本地发布/回滚：`$TOOLING backend_prod_publish`（验收后发布到 `dist/releases`），`$TOOLING backend_release_rollback`（切换 `dist/releases/current` 回滚）。
+- stage0 quarantine 稳定性约束：默认开启“自动清理后短重检”（`TOOLING_STAGE0_QUARANTINE_BLOCK_RECHECKS=2`），用于降低“首轮已清理但仍阻断”的抖动。
+- noalias/egraph/dod runtime probe 稳定性约束：in-memory self-link 口径下默认固定 `UIR_PROFILE=0` + `BACKEND_PROFILE=0`，规避 `driver_profileStep -> fwrite` 崩溃链；probe 验收以报告字段与 source marker 为准。
+- self-link 读对象稳定性约束：`std/bytes.readFileBytes` 采用 `fileSize` 预分配 + 顺序读取并统一 `c_fclose` 关闭路径，以避免 `machoParseObj -> readFileBytes -> fclose` 段错误链路。
+- NJVL 文档收口：独立 `docs/njvl*.md` 文档已下线；NJVL/SSU 的规范与验收口径统一以本规范、`docs/UIR.md` 与 `src/tooling/README.md` 为准。
 - 语句支持：MVP 已支持 `let/var/赋值` 的栈槽降级与读取，用于闭环验证。
 
 ## 附录 B Raw Pointer Safety 契约冻结（RPSPAR-01）

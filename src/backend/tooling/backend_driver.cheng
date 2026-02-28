@@ -864,9 +864,8 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
     let skipSemRaw: str = driver_trimAsciiSpace(driver_envDefault("STAGE1_SKIP_SEM", ""))
     let skipOwnershipRaw: str = driver_trimAsciiSpace(driver_envDefault("STAGE1_SKIP_OWNERSHIP", ""))
     let skipSemEffective: str = driver_bool01(driver_strEq(skipSemRaw, "1"))
-    let skipOwnershipDefault: str = driver_bool01(driver_strIsEmpty(skipOwnershipRaw))
-    let skipOwnershipEffective: str = driver_bool01(driver_strIsEmpty(skipOwnershipRaw) ||
-                                                    driver_strEq(skipOwnershipRaw, "1"))
+    let skipOwnershipDefault: str = "0"
+    let skipOwnershipEffective: str = driver_bool01(driver_strEq(skipOwnershipRaw, "1"))
     let uirSimdRaw: str = driver_bool01(uirSimdEnabled)
     let uirSimdMaxWidthText: str = intToStr(uirSimdMaxWidth)
     let uirSimdPolicyRaw: str = driver_trimAsciiSpace(uirSimdPolicy)
@@ -3038,23 +3037,35 @@ fn backendMainNative(): int32 =
         resolvedLinker = trackDefaultLinker
     linker = resolvedLinker
 
-    if driver_strEq(resolvedLinker, "self") && noRuntimeC:
+    let runtimeObjOptionalForNativeContract: bool =
+        nativeContractEnabled &&
+        driver_targetIsLinux(target) &&
+        driver_targetIsAarch64(target) &&
+        !driver_targetIsAndroid(target) &&
+        !driver_targetIsDarwin(target) &&
+        !driver_targetIsWindows(target)
+    if driver_strEq(emitMode, "exe") && driver_strEq(resolvedLinker, "self") && noRuntimeC:
         let runtimeObjSpecified: bool = driver_strNonEmpty(driver_trimAsciiSpace(runtimeObj))
-        runtimeObj = driver_resolveSelfLinkRuntimeObj(target, runtimeObj)
-        if driver_strIsEmpty(runtimeObj):
-            driver_panic("backend_driver: missing self-link runtime object for target: " + target +
-                         " (set BACKEND_RUNTIME_OBJ or prepare chengcache/runtime_selflink/system_helpers.backend.combined.<target>.o)")
-        if !driver_runtimeObjHasCoreSymbols(runtimeObj):
-            if runtimeCoreSymbolsStrict:
-                if runtimeObjSpecified:
-                    driver_panic("backend_driver: runtime object missing required self-link symbols: " + runtimeObj +
-                                 " (use combined runtime object, e.g. chengcache/runtime_selflink/system_helpers.backend.combined.<target>.o)")
-                driver_panic("backend_driver: self-link runtime object incomplete: " + runtimeObj +
-                             " (prepare runtime_selflink combined object for target " + target + ")")
-            else:
-                driver_writeLine(os.get_stderr(),
-                             "backend_driver: warn runtime object missing strict core symbol set; continue for nolibc profile: " +
-                             runtimeObj)
+        if runtimeObjOptionalForNativeContract && !runtimeObjSpecified:
+            # Native-contract linux/aarch64 fixtures do not require runtime glue.
+            # Keep runtime object empty to avoid picking host/legacy objects.
+            runtimeObj = ""
+        else:
+            runtimeObj = driver_resolveSelfLinkRuntimeObj(target, runtimeObj)
+            if driver_strIsEmpty(runtimeObj):
+                driver_panic("backend_driver: missing self-link runtime object for target: " + target +
+                             " (set BACKEND_RUNTIME_OBJ or prepare chengcache/runtime_selflink/system_helpers.backend.combined.<target>.o)")
+            if !driver_runtimeObjHasCoreSymbols(runtimeObj):
+                if runtimeCoreSymbolsStrict:
+                    if runtimeObjSpecified:
+                        driver_panic("backend_driver: runtime object missing required self-link symbols: " + runtimeObj +
+                                     " (use combined runtime object, e.g. chengcache/runtime_selflink/system_helpers.backend.combined.<target>.o)")
+                    driver_panic("backend_driver: self-link runtime object incomplete: " + runtimeObj +
+                                 " (prepare runtime_selflink combined object for target " + target + ")")
+                else:
+                    driver_writeLine(os.get_stderr(),
+                                 "backend_driver: warn runtime object missing strict core symbol set; continue for nolibc profile: " +
+                                 runtimeObj)
 
     let linkerSymtabAll: bool = driver_parseLinkerSymtabAll(linkerSymtab)
 

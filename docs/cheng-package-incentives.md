@@ -1,5 +1,9 @@
 # Cheng 包管理器与存储收益激励（草案）
 
+命令前缀约定（文内命令可直接执行）：
+- `TOOLING=artifacts/tooling_cmd/cheng_tooling`
+- 示例中的 `$TOOLING <subcmd>` 等价于直接调用 canonical tooling binary。
+
 ## 目标
 - 为包作者提供稳定、可预测的收益。
 - 在不强制 VM 运行时的前提下避免版本碎片。
@@ -159,7 +163,7 @@ require_registry_match = true
 ## 参考实现
 参考分润计算器同时提供 Python 与 Cheng 版本。
 - Python: `src/tooling/cheng_pkg_rewards.py`
-- Cheng: `src/tooling/cheng_pkg_rewards.cheng`（用 `sh src/tooling/tooling_exec.sh chengc` 编译）
+- Cheng: `src/tooling/cheng_pkg_rewards.cheng`（用 `$TOOLING chengc` 编译）
 示例：
 ```bash
 python src/tooling/cheng_pkg_rewards.py \
@@ -170,6 +174,6 @@ python src/tooling/cheng_pkg_rewards.py \
 
 Cheng 示例：
 ```bash
-sh src/tooling/tooling_exec.sh chengc src/tooling/cheng_pkg_rewards.cheng --name:cheng_pkg_rewards
+$TOOLING chengc src/tooling/cheng_pkg_rewards.cheng --name:cheng_pkg_rewards
 ./cheng_pkg_rewards --input docs/cheng-package-incentives-example.json --out build/cheng-package-incentives-payouts.json --pretty
 ```

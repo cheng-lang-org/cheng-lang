@@ -6,6 +6,10 @@
 
 目前在最前沿的系统级语言（如 **Zig, Jai, Roc, Cranelift**）中，已经验证了这套自研破局方案。以下是为你量身定制的架构蓝图，可以让你自研的 `cheng` 语言大放异彩：
 
+命令前缀约定（文内命令可直接执行）：
+- `TOOLING=artifacts/tooling_cmd/cheng_tooling`
+- 示例中的 `$TOOLING <subcmd>` 等价于直接调用 canonical tooling binary。
+
 ---
 
 ### 一、 碾压 mold / lld：走向“无链接器”（Linkerless）架构
@@ -92,19 +96,25 @@ LLVM 的优化是通用且保守的。它最难做好的优化是“别名分析
 
 ## 0.2 闭环状态快照（2026-02-25）
 - 判定口径：以 `backend_prod_closure` 的 required gates 为准（实现位于 `src/tooling/cheng_tooling_embedded_inline.cheng`，`id == "backend_prod_closure"`）。
-- 运行时内嵌查询：`cheng_tooling embedded-ids/embedded-text` 直接读取 `tooling/cheng_tooling_embedded_inline`；内嵌 map 重写统一走 `cheng_tooling embedded-map-rewrite`（仓库已移除 Python query 脚本）。
+- 运行时内嵌查询：`$TOOLING embedded-ids/embedded-text` 直接读取 `tooling/cheng_tooling_embedded_inline`；内嵌 map 重写统一走 `$TOOLING embedded-map-rewrite`（仓库已移除 Python query 脚本）。
 - 最近一次本仓库实跑记录：`artifacts/backend_prod_closure/last_run.log`，包含 `verify_backend_closedloop ok` 与 `backend_prod_closure ok`。
 - 关键门禁实跑通过（PAR-01~PAR-07 主链）：`backend.mem_contract`、`backend.mem_image_core`、`backend.mem_exe_emit`、`backend.hotpatch_meta`、`backend.hotpatch_inplace`、`backend.incr_patch_fastpath`、`backend.mem_patch_regression`、`backend.closedloop`。
 - `PAR-08` 状态：已完成“除平台生产闭环”收口（Dev: `emit=exe + self/linkerless`；Release: `emit=exe + system linker`），并已产出 `artifacts/backend_prod/release_manifest.json` 与 `artifacts/backend_prod/backend_release.tar.gz`。
-- 未完成项：全平台完整闭环仍在推进，`Windows` 完整可运行生产闭环仍待补齐（见 `docs/cheng-backend-arch.md` 的“不在范围（当前阶段）”与“2.3 生产闭环现状（除平台）”）。
+- 未完成项：全平台完整闭环仍在推进，`Windows` 完整可运行生产闭环仍待补齐（见 `docs/cheng-build-any-platform.md` 的“不在范围（当前阶段）”与“2.3 生产闭环现状（除平台）”）。
 - Host-only 严格收口（2026-02-25 当前实现）：
-  - `SELFHOST_STRICT_REBUILD=1`（默认）会强制 `verify_backend_selfhost_100ms_host` 走 `compile-stage1 + full rebuild + require rebuild`，默认阻断 `reused_stage0/alias` 通过。
-  - `BUILD_DRIVER_STRICT_NATIVE=1`（默认）+ `BUILD_DRIVER_ALLOW_FALLBACK=0`（默认），`build-backend-driver` 默认关闭 `shim/reused_stage0/legacy relink/delegate wrapper` 回退链路。
+  - `SELFHOST_STRICT_REBUILD=1`（默认）会强制 `verify_backend_selfhost_100ms_host` 走 `compile-stage1 + full rebuild + require rebuild`，并阻断任何非真实重编通过路径。
+  - `BUILD_DRIVER_STRICT_NATIVE=1`（默认），`build-backend-driver` 回退链路（`shim/reused_stage0/legacy relink/delegate wrapper`）已硬关闭。
   - `verify_backend_selfhost_100ms_host` 报告新增结构化字段：`stage0_driver_kind/fallback_used/quarantine_cleaned/lock_wait_ms/strict_rebuild_ok`。
   - `backend_prod_closure` required 链路新增 `backend.opt2_impl_surface`（`verify_backend_opt2_impl_surface`）。
 
+## 0.3 最近修复快照（2026-02-28）
+- self-link 稳定性修复：`std/bytes.readFileBytes` 改为 `fileSize` 预分配 + 顺序读取，并统一走 `c_fclose`，用于消除 `machoParseObj -> readFileBytes -> fclose` 崩溃链（`rc=139`）。
+- stage0 quarantine 误阻断修复：`tooling_stage0BlockOnQuarantineUe` 增加“清理后短重检”机制（`TOOLING_STAGE0_QUARANTINE_BLOCK_RECHECKS`，默认 `2`），降低“首轮已清理但仍阻断”的抖动。
+- in-memory runtime probe 稳定化：`verify_backend_noalias_opt` / `verify_backend_egraph_cost` / `verify_backend_dod_opt_regression` 的 runtime probe 口径固定关闭 profile 输出（`UIR_PROFILE=0` + `BACKEND_PROFILE=0`），避免 `driver_profileStep -> fwrite` 路径段错误。
+- 复验记录：`$TOOLING backend_prod_closure --no-publish`（in-memory profile）输出 `backend_prod_closure ok`；`$TOOLING verify_backend_selfhost_100ms_host --compile-stage1 --iters:30 --enforce:1` 实测 `p95=83ms`、`p99=91ms`。
+
 复验命令（严格口径）：
-- `cheng_tooling backend_prod_closure --no-publish`
+- `$TOOLING backend_prod_closure --no-publish`
 
 ## 4. 关键依赖图（Memory-Exe + Hotpatch）
 ```mermaid
@@ -141,7 +151,7 @@ flowchart LR
 | `W4` | `M8-M9` | `PAR-08` | 生产闭环与值班手册收口 |
 
 状态注记（2026-02-25）：
-- `W4/PAR-08` 已完成“除平台”收口；全平台口径继续按 `docs/cheng-backend-arch.md` 推进。
+- `W4/PAR-08` 已完成“除平台”收口；全平台口径继续按 `docs/cheng-build-any-platform.md` 推进。
 
 ## 6. 必过门禁（required，2026-02-25 已接入 backend_prod_closure）
 - `backend.mem_contract`
@@ -456,7 +466,7 @@ importc fn sqlite3_close(db: SqliteDb)
 1. **改造 `src/stage1/parser.cheng**`：
 赋予 Parser “延迟解析函数体”的能力。当遇到 `fn foo() { ... }` 时，只要把 `{` 和 `}` 之间的 Token 暂存起来即可，这是实现“函数级并发”的先决条件。
 2. **制定极速自举的 `--dev` 妥协规则**：
-在 `cheng_tooling bootstrap_fast` 中，向编译器传递特殊 Flag。当编译器发现是在编译自身（Dev 模式）时，**强制关闭所有耗时的优化**（跳过 `uir_vectorize_slp.cheng` 和 E-Graphs），并且**允许泛型（monomorphize.cheng）在各个线程内盲目重复实例化**，宁可生成的二进制稍微膨胀一点，也绝不在线程间加锁去重。
+在 `$TOOLING bootstrap_fast` 中，向编译器传递特殊 Flag。当编译器发现是在编译自身（Dev 模式）时，**强制关闭所有耗时的优化**（跳过 `uir_vectorize_slp.cheng` 和 E-Graphs），并且**允许泛型（monomorphize.cheng）在各个线程内盲目重复实例化**，宁可生成的二进制稍微膨胀一点，也绝不在线程间加锁去重。
 3. **改造 `obj_writer` 为全局直写模式**：
 把你们现有的 `coff_writer` / `elf_writer` 改造成能直接接受全局多个内存块并排布虚拟地址的写入器，绕过传统的 `.o` 中间态。
 
@@ -522,5 +532,3 @@ importc fn sqlite3_close(db: SqliteDb)
 1. 用 VSCode 或任何纯文本编辑器，打开你**最头疼**、或者**最引以为傲**的**单个 `.cheng` 文件**（比如 `macho_direct_exe_writer.cheng`、`uir_egraph_rewrite.cheng` 或 `metering_sdk.cheng`）。
 2. **`Ctrl+A` 全选里面的纯文本代码，`Ctrl+C` 复制**（确保我能看到 `import`, `fn`, `struct` 等清晰的关键字）。
 3. 直接粘贴到对话框里，告诉我：“这是 `xxx.cheng` 的源码，帮我 Review 一下。”
-
-

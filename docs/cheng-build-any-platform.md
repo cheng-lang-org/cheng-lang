@@ -3,14 +3,18 @@
 > 更新时间：2026-02-06  
 > 适用范围：生产主链路（已移除 ASM 与 legacy C bootstrap 入口）
 
+命令前缀约定（文内命令可直接执行）：
+- `TOOLING=artifacts/tooling_cmd/cheng_tooling`
+- 示例中的 `$TOOLING <subcmd>` 等价于直接调用 canonical tooling binary。
+
 ## 1. 总体原则
 
 - 统一入口：`./cheng`（直连编译器，不依赖脚本包装）。
 - 默认目标平台：`auto`（按当前运行平台自动选择 target triple）。
 - 默认内存模型：`MM=orc`（建议始终显式设置）。
 - 仅支持 `obj/exe` 产物，`emit-c` 与 `--backend:c` 不再作为生产路径。
-- 自举闭环入口：`cheng_tooling bootstrap_pure --mode:strict --fullspec`（strict fixed-point + fullchain）。
-- C-Drop 仅应急：`cheng_tooling verify_backend_cdrop_emergency`（默认不纳入发布阻断链，`BACKEND_RUN_CDROP_EMERGENCY=0`）。
+- 自举闭环入口：`$TOOLING bootstrap_pure --mode:strict --fullspec`（strict fixed-point + fullchain）。
+- C-Drop 仅应急：`$TOOLING verify_backend_cdrop_emergency`（默认不纳入发布阻断链，`BACKEND_RUN_CDROP_EMERGENCY=0`）。
 - 直接命令行参数见：`docs/backend-driver-cli.md`。
 
 ---

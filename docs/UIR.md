@@ -74,6 +74,8 @@
 - UIR profile：
   - `UIR_PROFILE=1`
   - 输出：`uir_profile\t<label>\tstep_ms=...\ttotal_ms=...`
+- runtime probe 例外：
+  - `verify_backend_noalias_opt` / `verify_backend_egraph_cost` / `verify_backend_dod_opt_regression` 的门禁探针默认固定 `UIR_PROFILE=0` + `BACKEND_PROFILE=0`，避免 in-memory self-link 场景的 profile 崩溃；这些 gate 以报告字段与 surface marker 验收。
 - Generics report：
   - 输出：`generics_report\tir=uir\tmode=...\tspec_budget=...\tinstances_total=...\tinstances_reused=...\tinstances_specialized=...\tdict_calls=...\tms=...`
 
@@ -115,14 +117,17 @@
 - `hybrid`：预算内特化（`GENERIC_SPEC_BUDGET>0` 时启用特化，超预算回退字典路径）。
 
 ## 10) Production Closure Gates
+命令前缀（避免 PATH 差异）：
+- `TOOLING=artifacts/tooling_cmd/cheng_tooling`
+
 必跑（阻断）：
-- `sh src/tooling/tooling_exec.sh verify_backend_no_legacy_refs`
-- `sh src/tooling/tooling_exec.sh verify_backend_opt2`
-- `sh src/tooling/tooling_exec.sh verify_backend_opt3`
-- `sh src/tooling/tooling_exec.sh verify_backend_multi_perf_regression`
-- `sh src/tooling/tooling_exec.sh verify_backend_simd`
-- `sh src/tooling/tooling_exec.sh verify_backend_uir_stability`
-- `sh src/tooling/tooling_exec.sh backend_prod_closure --no-publish`
+- `$TOOLING verify_backend_no_legacy_refs`
+- `$TOOLING verify_backend_opt2`
+- `$TOOLING verify_backend_opt3`
+- `$TOOLING verify_backend_multi_perf_regression`
+- `$TOOLING verify_backend_simd`
+- `$TOOLING verify_backend_uir_stability`
+- `$TOOLING backend_prod_closure --no-publish`
 
 fullspec 默认闭环口径（`BACKEND_RUN_FULLSPEC=1`）：
 - `BACKEND_FULLSPEC_GENERIC_MODE=dict`

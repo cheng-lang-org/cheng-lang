@@ -1,6 +1,6 @@
 # Backend 生产闭环值班手册
 
-更新时间：2026-02-25
+更新时间：2026-02-28
 
 通知基线：`docs/process-notice-backend-driver-unification-2026-02-25.md`（单 driver 收口）
 
@@ -10,25 +10,26 @@
 
 ## 2. 标准收口命令（当前值班口径）
 ```sh
-sh src/tooling/tooling_exec.sh backend_prod_closure --no-publish
+TOOLING=artifacts/tooling_cmd/cheng_tooling
+$TOOLING backend_prod_closure --no-publish
 ```
 
 通过判定：输出包含 `backend_prod_closure ok`。
 若命中 `backend.profile_baseline` 漂移，先执行
-`sh src/tooling/tooling_exec.sh build_backend_profile_baseline --schema:src/tooling/backend_profile_schema.env --out:src/tooling/backend_profile_baseline.env`
+`$TOOLING build_backend_profile_baseline --schema:src/tooling/backend_profile_schema.env --out:src/tooling/backend_profile_baseline.env`
 再复测。
 若命中 `backend.mem_contract` 漂移，先执行
-`sh src/tooling/tooling_exec.sh build_backend_mem_contract --doc:docs/backend-mem-hotpatch-contract.md --out:src/tooling/backend_mem_contract.env`
+`$TOOLING build_backend_mem_contract --doc:docs/backend-mem-hotpatch-contract.md --out:src/tooling/backend_mem_contract.env`
 再复测。
 
 注：`--no-obj/--no-obj-determinism/--no-self-obj-writer` 已废弃并被闭环脚本忽略（新口径不再走 obj/self-obj gate）。
 注：生产主链默认不跑 selfhost；仅在排查自举兼容问题时显式加 `--selfhost`。
 注：`--no-publish` 不再走 stable-profile 降级语义，默认保持完整 gate 集。
 注：可用 `BACKEND_PROD_TARGET=<triple>` 显式覆盖优化/可执行门禁目标；未设置时会忽略外部非 darwin `BACKEND_TARGET` 污染并固定 darwin 默认口径。
-注：值班收口统一 driver 口径：固定 `artifacts/backend_driver/cheng`，并保持 `BACKEND_DRIVER_ALLOW_FALLBACK=0`（无自动回退）。
+注：值班收口统一 driver 口径：固定 `artifacts/backend_driver/cheng`；自动回退链路已硬禁用（无 `BACKEND_DRIVER_ALLOW_FALLBACK` 开关）。
 注：`build-backend-driver` 默认不启用历史 stage0 回退；仅显式设置 `TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=1` 时允许排障回退。
 注：`build-backend-driver` 默认自动清理历史 `artifacts/backend_driver/cheng*` 变体（`BACKEND_BUILD_DRIVER_AUTO_CLEAN_HISTORY=1`）。
-注：可手动执行 `cheng_tooling cleanup-backend-driver-history --dry-run` 预览，确认后执行 `cheng_tooling cleanup-backend-driver-history`。
+注：可手动执行 `$TOOLING cleanup-backend-driver-history --dry-run` 预览，确认后执行 `$TOOLING cleanup-backend-driver-history`。
 注：`BACKEND_OPT_DRIVER` 覆盖 `determinism/opt/ffi/debug/sanitizer` 子门禁 driver；当前值班建议与主 driver 一致固定 `artifacts/backend_driver/cheng`。
 注：`backend.self_linker.elf` / `backend.self_linker.coff` 已是默认 required gate（`BACKEND_RUN_SELF_LINKER_GATES=1`）。
 注：`backend.no_obj_artifacts` 已是默认 required gate，闭环产物中不允许残留 `.o/.obj/.objs`。
@@ -37,7 +38,6 @@ sh src/tooling/tooling_exec.sh backend_prod_closure --no-publish
 发布演练（含 publish）：
 ```sh
 env BACKEND_DRIVER=artifacts/backend_driver/cheng \
-    BACKEND_DRIVER_ALLOW_FALLBACK=0 \
     BACKEND_SELF_LINKER_DRIVER=artifacts/backend_driver/cheng \
     BACKEND_OPT_DRIVER=artifacts/backend_driver/cheng \
     BACKEND_LINKERLESS_DRIVER=artifacts/backend_driver/cheng \
@@ -45,7 +45,7 @@ env BACKEND_DRIVER=artifacts/backend_driver/cheng \
     BACKEND_STAGE1_SMOKE_DRIVER=artifacts/backend_driver/cheng \
     BACKEND_MM_DRIVER=artifacts/backend_driver/cheng \
     PAR05_DRIVER_REFRESH=0 \
-    sh src/tooling/tooling_exec.sh backend_prod_closure \
+    $TOOLING backend_prod_closure \
       --seed:artifacts/backend_seed/cheng.stage2
 ```
 
@@ -58,12 +58,12 @@ env BACKEND_DRIVER=artifacts/backend_driver/cheng \
 
 ## 4. 常见失败与处理
 - `backend.release_system_link` 触发 no-pointer policy：
-  - 先确认 `sh src/tooling/tooling_exec.sh verify_backend_release_c_o3_lto` 内 gate 编译环境显式设置了：
+  - 先确认 `$TOOLING verify_backend_release_c_o3_lto` 内 gate 编译环境显式设置了：
     - `STAGE1_STD_NO_POINTERS=0`
     - `STAGE1_NO_POINTERS_NON_C_ABI=0`
 - `backend.release_system_link` 链接器异常（mold/lld 缺失或行为不一致）：
-  - 优先重跑：`BACKEND_SYSTEM_LINKER_PRIORITY=mold,lld,default sh src/tooling/tooling_exec.sh verify_backend_release_c_o3_lto`
-  - 若需临时回退发布口径：`BACKEND_LINKER=system BACKEND_LD=cc sh src/tooling/tooling_exec.sh verify_backend_release_c_o3_lto`
+  - 优先重跑：`BACKEND_SYSTEM_LINKER_PRIORITY=mold,lld,default $TOOLING verify_backend_release_c_o3_lto`
+  - 若需临时回退发布口径：`BACKEND_LINKER=system BACKEND_LD=cc $TOOLING verify_backend_release_c_o3_lto`
   - 若需强制开发态回退排障：`chengc --release --linker:self <fixture>.cheng`（仅支持 self-link 目标）。
 - `backend.hotpatch*` 失败（新热更链路）：
   - 先看 `artifacts/backend_hotpatch/hotpatch.<target>.report.txt` 的 `append_commit_kind/growth_restart_commit_kind/layout_restart_commit_kind`。
@@ -71,11 +71,11 @@ env BACKEND_DRIVER=artifacts/backend_driver/cheng \
   - 若是池耗尽导致频繁重启：调大 `BACKEND_HOSTRUNNER_POOL_MB`（默认 `512`）。
   - 若需临时绕过 host runner 排障：改用 `chengc --run:file <fixture>.cheng`。
 - `backend.noptr_exemption_scope` 报 allowlist 外例外：
-  - 将新增脚本加入 `sh src/tooling/tooling_exec.sh verify_backend_noptr_exemption_scope` 的 `allowlist`。
-  - 复验：`sh src/tooling/tooling_exec.sh verify_backend_noptr_exemption_scope`。
-- `backend.driver_selfbuild_smoke` 失败：
-  - 先执行 `BACKEND_BUILD_DRIVER_FORCE=1 BACKEND_BUILD_DRIVER_NO_RECOVER=1 sh src/tooling/tooling_exec.sh build_backend_driver --name:artifacts/backend_driver/cheng`；
-  - 再执行 `sh src/tooling/tooling_exec.sh verify_backend_driver_selfbuild_smoke` 定位 stage0/build/smoke 明细。
+  - 将新增脚本加入 `$TOOLING verify_backend_noptr_exemption_scope` 的 `allowlist`。
+  - 复验：`$TOOLING verify_backend_noptr_exemption_scope`。
+- `backend.driver_selfbuild_smoke` 失败（仅在显式启用该 gate 时）：
+  - 先执行 `BACKEND_BUILD_DRIVER_FORCE=1 BACKEND_BUILD_DRIVER_NO_RECOVER=1 $TOOLING build_backend_driver --name:artifacts/backend_driver/cheng`；
+  - 再执行 `$TOOLING verify_backend_driver_selfbuild_smoke` 定位 stage0/build/smoke 明细。
 - `backend.no_obj_artifacts` 失败：
   - 先查看 `artifacts/backend_no_obj_artifacts/backend_no_obj_artifacts.matches.txt`；
   - 再按路径回溯到对应 gate 脚本补齐 sidecar 清理。

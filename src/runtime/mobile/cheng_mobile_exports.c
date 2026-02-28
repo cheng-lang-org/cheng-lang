@@ -145,7 +145,7 @@ static ChengAppRuntimeCtx s_ctx = {
     .has_expected_frame_hash = 0,
     .frame_dump_file = "",
     .frame_dump_written = 0,
-    .strict_truth_mode = 0,
+    .strict_truth_mode = 1,
     .semantic_nodes = NULL,
     .semantic_nodes_count = 0u,
     .semantic_nodes_cap = 0u,
@@ -447,10 +447,142 @@ static void cheng_handle_touch_route_switch(ChengAppRuntimeCtx* ctx, const Cheng
   if (y_ppm < 0) y_ppm = 0;
   if (y_ppm > 1000) y_ppm = 1000;
 
+  /* Sidebar drawer route owns gesture dispatch while opened. */
+  if (strcmp(ctx->route_state, "home_channel_manager_open") == 0) {
+    /* Drawer width is ~72% of viewport in ClaudeDesign sidebar. */
+    const int drawer_right_ppm = 760;
+    if (x_ppm > drawer_right_ppm) {
+      ctx->touch_last_slot = 300;
+      cheng_set_route_state(ctx, "home_default", "sidebar-overlay-dismiss");
+      return;
+    }
+
+    /* Header close button (X) on drawer top-right. */
+    if (y_ppm >= 20 && y_ppm <= 170 && x_ppm >= 600) {
+      ctx->touch_last_slot = 301;
+      cheng_set_route_state(ctx, "home_default", "sidebar-close");
+      return;
+    }
+
+    /* Primary navigation rows inside sidebar. */
+    if (x_ppm >= 20 && x_ppm <= 730) {
+      if (y_ppm >= 360 && y_ppm <= 445) {
+        ctx->touch_last_slot = 302;
+        cheng_set_route_state(ctx, "trading_main", "sidebar-trading");
+        return;
+      }
+      if (y_ppm >= 446 && y_ppm <= 530) {
+        ctx->touch_last_slot = 303;
+        cheng_set_route_state(ctx, "marketplace_main", "sidebar-marketplace");
+        return;
+      }
+      if (y_ppm >= 740 && y_ppm <= 820) {
+        ctx->touch_last_slot = 304;
+        cheng_set_route_state(ctx, "lang_select", "sidebar-language");
+        return;
+      }
+      if (y_ppm >= 821 && y_ppm <= 900) {
+        ctx->touch_last_slot = 305;
+        cheng_set_route_state(ctx, "update_center_main", "sidebar-updates");
+        return;
+      }
+    }
+
+    /* Other sidebar rows are informational in current route model. */
+    ctx->touch_last_slot = 399;
+    return;
+  }
+
+  /* Publish selector owns touch dispatch while opened. */
+  if (strcmp(ctx->route_state, "publish_selector") == 0) {
+    /* Tap on dark overlay area above sheet closes selector. */
+    if (y_ppm <= 340) {
+      ctx->touch_last_slot = 410;
+      cheng_set_route_state(ctx, "home_default", "publish-overlay-dismiss");
+      return;
+    }
+
+    /* Publish type rows aligned with route action matrix tap_ppm coordinates. */
+    if (x_ppm >= 360 && x_ppm <= 640) {
+      if (y_ppm >= 360 && y_ppm < 470) {
+        ctx->touch_last_slot = 411;
+        cheng_set_route_state(ctx, "publish_content", "publish-select-content");
+        return;
+      }
+      if (y_ppm >= 470 && y_ppm < 570) {
+        ctx->touch_last_slot = 412;
+        cheng_set_route_state(ctx, "publish_product", "publish-select-product");
+        return;
+      }
+      if (y_ppm >= 570 && y_ppm < 670) {
+        ctx->touch_last_slot = 413;
+        cheng_set_route_state(ctx, "publish_live", "publish-select-live");
+        return;
+      }
+      if (y_ppm >= 670 && y_ppm < 770) {
+        ctx->touch_last_slot = 414;
+        cheng_set_route_state(ctx, "publish_app", "publish-select-app");
+        return;
+      }
+      if (y_ppm >= 770 && y_ppm < 870) {
+        ctx->touch_last_slot = 415;
+        cheng_set_route_state(ctx, "publish_food", "publish-select-food");
+        return;
+      }
+      if (y_ppm >= 870 && y_ppm <= 930) {
+        ctx->touch_last_slot = 416;
+        cheng_set_route_state(ctx, "publish_ride", "publish-select-ride");
+        return;
+      }
+    }
+    if (y_ppm >= 560 && y_ppm <= 940) {
+      if (x_ppm >= 220 && x_ppm < 500) {
+        if (y_ppm < 680) {
+          ctx->touch_last_slot = 417;
+          cheng_set_route_state(ctx, "publish_job", "publish-select-job");
+          return;
+        }
+        if (y_ppm < 820) {
+          ctx->touch_last_slot = 418;
+          cheng_set_route_state(ctx, "publish_rent", "publish-select-rent");
+          return;
+        }
+        ctx->touch_last_slot = 419;
+        cheng_set_route_state(ctx, "publish_secondhand", "publish-select-secondhand");
+        return;
+      }
+      if (x_ppm >= 500 && x_ppm <= 780) {
+        if (y_ppm < 680) {
+          ctx->touch_last_slot = 420;
+          cheng_set_route_state(ctx, "publish_hire", "publish-select-hire");
+          return;
+        }
+        if (y_ppm < 820) {
+          ctx->touch_last_slot = 421;
+          cheng_set_route_state(ctx, "publish_sell", "publish-select-sell");
+          return;
+        }
+        ctx->touch_last_slot = 422;
+        cheng_set_route_state(ctx, "publish_crowdfunding", "publish-select-crowdfunding");
+        return;
+      }
+    }
+
+    /* Lower sheet area acts as cancel fallback when no tile is hit. */
+    if (y_ppm >= 700) {
+      ctx->touch_last_slot = 423;
+      cheng_set_route_state(ctx, "home_default", "publish-cancel");
+      return;
+    }
+
+    /* Consume unmatched touches to avoid leaking into home hotspots. */
+    ctx->touch_last_slot = 499;
+    return;
+  }
+
   int nav_h = height / 12;
   if (nav_h < 92) nav_h = 92;
-  if (nav_h > 180) nav_h = 180;
-  if (y >= (float)(height - nav_h)) {
+  if (y_ppm >= 900 || y >= (float)(height - nav_h)) {
     int slot = 0;
     if (x_ppm < 200) slot = 0;
     else if (x_ppm < 400) slot = 1;
@@ -473,7 +605,7 @@ static void cheng_handle_touch_route_switch(ChengAppRuntimeCtx* ctx, const Cheng
   }
 
   /* Home header hotspots aligned with route action matrix (tap_ppm y≈115). */
-  if (y_ppm >= 70 && y_ppm <= 180) {
+  if (y_ppm >= 40 && y_ppm <= 160) {
     if (x_ppm <= 220) {
       ctx->touch_last_slot = 100;
       cheng_set_route_state(ctx, "home_channel_manager_open", "top-menu");
@@ -492,7 +624,7 @@ static void cheng_handle_touch_route_switch(ChengAppRuntimeCtx* ctx, const Cheng
   }
 
   /* Layer1 overlay chips aligned with action matrix (tap_ppm y≈205). */
-  if (y_ppm >= 170 && y_ppm <= 300) {
+  if (y_ppm >= 130 && y_ppm <= 230) {
     if (x_ppm >= 300 && x_ppm <= 420) {
       ctx->touch_last_slot = 201;
       cheng_set_route_state(ctx, "home_ecom_overlay_open", "home-chip-ecom");
@@ -511,7 +643,7 @@ static void cheng_handle_touch_route_switch(ChengAppRuntimeCtx* ctx, const Cheng
   }
 
   /* Content detail open point aligned with action matrix (tap_ppm x≈500,y≈460). */
-  if (y_ppm >= 380 && y_ppm <= 560 && x_ppm >= 360 && x_ppm <= 640) {
+  if (y_ppm >= 350 && y_ppm <= 560 && x_ppm >= 360 && x_ppm <= 640) {
     ctx->touch_last_slot = 204;
     cheng_set_route_state(ctx, "home_content_detail_open", "home-content-open");
     return;
@@ -1505,15 +1637,13 @@ static void cheng_refresh_route_state(ChengAppRuntimeCtx* ctx) {
     return;
   }
   const char* kv = cheng_mobile_host_runtime_launch_args_kv();
+  /* Default policy: truth-first 1:1 visual runtime. */
   ctx->strict_truth_mode = 1;
   char gate_mode[64];
   gate_mode[0] = '\0';
   if (cheng_parse_kv_value(kv, "gate_mode", gate_mode, (uint32_t)sizeof(gate_mode))) {
     if (strcmp(gate_mode, "android-semantic-visual-1to1") == 0) {
       ctx->strict_truth_mode = 1;
-    } else if (strcmp(gate_mode, "semantic-text") == 0 ||
-               strcmp(gate_mode, "semantic-nav") == 0) {
-      ctx->strict_truth_mode = 0;
     } else {
       ctx->strict_truth_mode = 1;
     }
@@ -1521,11 +1651,11 @@ static void cheng_refresh_route_state(ChengAppRuntimeCtx* ctx) {
   char truth_mode[32];
   truth_mode[0] = '\0';
   if (cheng_parse_kv_value(kv, "truth_mode", truth_mode, (uint32_t)sizeof(truth_mode))) {
-    if (strcmp(truth_mode, "0") == 0 || strcmp(truth_mode, "false") == 0 ||
-        strcmp(truth_mode, "off") == 0 || strcmp(truth_mode, "semantic") == 0) {
-      ctx->strict_truth_mode = 0;
-    } else if (strcmp(truth_mode, "1") == 0 || strcmp(truth_mode, "true") == 0 ||
+    if (strcmp(truth_mode, "1") == 0 || strcmp(truth_mode, "true") == 0 ||
                strcmp(truth_mode, "on") == 0 || strcmp(truth_mode, "strict") == 0) {
+      ctx->strict_truth_mode = 1;
+    } else {
+      /* Hard gate: ignore non-strict requests and keep truth-first mode. */
       ctx->strict_truth_mode = 1;
     }
   }
@@ -2093,11 +2223,9 @@ int32_t cheng_app_push_side_effect_result(uint64_t app_id, const char* envelope_
   if (envelope_utf8 == NULL || envelope_utf8[0] == '\0') {
     return 0;
   }
-  char route[sizeof(ctx->route_state)];
-  route[0] = '\0';
-  if (cheng_parse_kv_value(envelope_utf8, "route", route, (uint32_t)sizeof(route))) {
-    cheng_safe_copy(ctx->route_state, (uint32_t)sizeof(ctx->route_state), route);
-  }
+  /* Route authority is local runtime interaction + launch args only.
+   * Side-effect responses must not mutate route_state, otherwise route drift
+   * appears under async host callbacks. */
   char text_in[CHENG_TEXT_INPUT_CAP];
   text_in[0] = '\0';
   if (cheng_parse_kv_value(envelope_utf8, "text", text_in, (uint32_t)sizeof(text_in))) {

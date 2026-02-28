@@ -1276,6 +1276,50 @@ fn uirCorePathDirName(path: str): str =
     let parts: SplitFileResult = os.splitFile(path)
     return backendStripSpaces(parts.dir)
 
+fn uirCoreRootHasStd(root: str): bool =
+    let trimmed: str = backendStripSpaces(root)
+    if len(trimmed) == 0:
+        return false
+    let stdSystem: str = os.joinPath(os.joinPath(trimmed, "src/std"), "system.cheng")
+    return frontend_lib.stage1_fileExists(stdSystem)
+
+fn uirCoreGuessRepoRootFromPath(path: str): str =
+    let raw: str = backendStripSpaces(path)
+    if len(raw) == 0:
+        return ""
+    let split0: SplitFileResult = os.splitFile(raw)
+    var probe: str = backendStripSpaces(split0.dir)
+    if len(probe) == 0:
+        probe = raw
+    while len(probe) > 0:
+        if uirCoreRootHasStd(probe):
+            return probe
+        let parts: SplitFileResult = os.splitFile(probe)
+        let parent: str = backendStripSpaces(parts.dir)
+        if len(parent) == 0 || parent == probe:
+            break
+        probe = parent
+    return ""
+
+fn uirCoreResolveRepoRoot(inPath: str): str =
+    let explicitRoot: str = backendStripSpaces(os.getEnvDefault("BACKEND_REPO_ROOT", ""))
+    if len(explicitRoot) > 0 && uirCoreRootHasStd(explicitRoot):
+        return explicitRoot
+    let pwdRoot: str = backendStripSpaces(os.getEnvDefault("PWD", ""))
+    if len(pwdRoot) > 0 && uirCoreRootHasStd(pwdRoot):
+        return pwdRoot
+    let guessed: str = uirCoreGuessRepoRootFromPath(inPath)
+    if len(guessed) > 0:
+        return guessed
+    let roots: str[] = pkgRootsFromEnv()
+    for ri in 0..<roots.len:
+        let root: str = backendStripSpaces(roots[ri])
+        if len(root) > 0 && uirCoreRootHasStd(root):
+            return root
+    if len(pwdRoot) > 0:
+        return pwdRoot
+    return "."
+
 var uirCoreEntryPathCachedRaw: str = ""
 var uirCoreEntryPathCachedNorm: str = ""
 var uirCoreEntryPathCachedDir: str = ""
@@ -13287,12 +13331,28 @@ fn resolveImportToFilePath(importPath: str, fromFilePath: str): Result[str] =
 
     if strHasPrefix(path, "std/"):
         let rest: str = strStripPrefix(path, "std/")
-        var localStd: str = "src/std/" + rest
-        if ! strHasSuffix(localStd, ".cheng"):
-            localStd = localStd + ".cheng"
-        if frontend_lib.stage1_fileExists(localStd):
-            return Ok[str](localStd)
-        return Ok[str](localStd)
+        var relStd: str = "src/std/" + rest
+        if ! strHasSuffix(relStd, ".cheng"):
+            relStd = relStd + ".cheng"
+        let fromRoot: str = uirCoreGuessRepoRootFromPath(fromFilePath)
+        if len(fromRoot) > 0:
+            let fromCandidate: str = os.joinPath(fromRoot, relStd)
+            if frontend_lib.stage1_fileExists(fromCandidate):
+                return Ok[str](fromCandidate)
+        let roots: str[] = pkgRootsFromEnv()
+        for ri in 0..<roots.len:
+            let rootCandidate: str = os.joinPath(roots[ri], relStd)
+            if frontend_lib.stage1_fileExists(rootCandidate):
+                return Ok[str](rootCandidate)
+        let repoRoot: str = uirCoreResolveRepoRoot(fromFilePath)
+        if len(repoRoot) > 0:
+            let repoCandidate: str = os.joinPath(repoRoot, relStd)
+            if frontend_lib.stage1_fileExists(repoCandidate):
+                return Ok[str](repoCandidate)
+            return Ok[str](repoCandidate)
+        if frontend_lib.stage1_fileExists(relStd):
+            return Ok[str](relStd)
+        return Ok[str](relStd)
 
     let pkgPath: str = importPathDropChengPrefix(path)
     if len(pkgPath) > 0:
@@ -14783,8 +14843,7 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: imports_repo_root_start")
         os.c_fflush dbgFile
-    # Prefer PWD first for repo root resolution in bootstrap/selfhost builds.
-    var repoRoot: str = os.getEnvDefault("PWD", ".")
+    var repoRoot: str = uirCoreResolveRepoRoot(inPath)
     if len(repoRoot) == 0:
         repoRoot = "."
     if dbgPipe:
@@ -15051,9 +15110,8 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
 
     let arcOn: bool = arcEnabled()
     let skipOwnershipEnv: str = getEnv "STAGE1_SKIP_OWNERSHIP"
-    # Ownership path currently remains unstable in stage0/driver bootstrap paths;
-    # keep default skip-on unless caller explicitly sets STAGE1_SKIP_OWNERSHIP=0.
-    let skipOwnership: bool = len(skipOwnershipEnv) == 0 || uirCoreIsOne(skipOwnershipEnv)
+    # Ownership defaults to enabled; only explicit STAGE1_SKIP_OWNERSHIP=1 can skip.
+    let skipOwnership: bool = uirCoreIsOne(skipOwnershipEnv)
     let ownershipEngine: str = uirCoreOwnershipEngineNormalized()
     let borrowStageLabel: str = borrowIrMode == "mir" ? "mir_borrow" : "ownership"
     stage1Trace("internal: " + borrowStageLabel)
