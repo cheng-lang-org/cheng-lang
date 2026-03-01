@@ -47,6 +47,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
   - 违规则报 `no-pointer policy` 诊断。
 - Raw Pointer Safety FFI 影子桥接约束：用户层优先 `@ffi_map`（`slice -> ptr/len`）、`@ffi_out_ptrs`（`out-ptr -> tuple`）、`@ffi_handle`（`void* <-> handle`）与 `@importc + var T`（borrow struct bridge），不再推荐显式暴露 `ptr + len/out-ptr/void*`。
 - Raw Pointer Safety 规范名固定为 `ZRPC`（`zero_rawptr_production_closure`），属于发布链路 hard-fail 约束；no-pointer 相关诊断应携带该规范标识。
+- ZRPC 生产口径要求编译器内部 AST/UIR/基本块采用 `Arena + SoA` 连续存储，跨节点引用使用 `int32` 索引，不得将对象裸指针暴露为优化/门禁接口中的长期关联键。
 - 隐式泛型（语法糖）：例程声明可省略 `[T]`，由签名中的单字母大写类型名（`T/U/K/V`）自动引入类型参数；仍为编译期单态化静态分发。调用侧优先写 `f(x)`，推断失败再显式写 `f[T](x)`。
 - 列表生成式：`[expr for pat in iter if cond]`（`if` 可选，编译期 lowering 为循环追加）。
 - 计数型迭代规范：源码中形如 `var i = start; while i < end: ...; i = i + 1`、`while i <= end`、`while i > end`、`while i >= end` 的自增/自减计数循环，建议优先改写为 `for in` 迭代（含 guard-for 等价写法）；若存在多条件判断或改写后明显更复杂，可保留 `while`。

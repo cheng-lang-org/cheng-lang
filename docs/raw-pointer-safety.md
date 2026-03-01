@@ -13,6 +13,7 @@
 - `ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1` 仍是生产默认约束；direct-exe 路径与常规路径共享同一 no-pointer 门禁与诊断口径。
 - Host-only strict 默认（`SELFHOST_STRICT_REBUILD=1`、`BUILD_DRIVER_STRICT_NATIVE=1`）只改变自举/driver 失败策略，不放宽 `ZRPC` 与 no-pointer 规则；driver 回退链路为硬禁用。
 - `verify_backend_opt2_impl_surface` 为优化实现面 gate，不新增任何用户层裸指针语法面，也不改变 `verify_backend_rawptr_surface_forbid`/`verify_backend_rawptr_contract` 判定口径。
+- DOD/SoA 路径在生产口径纳入 ZRPC 一致性约束：编译器内部 AST/UIR/基本块应使用 Arena + SoA 连续存储，跨节点引用使用 `int32` 索引，禁止把对象裸指针作为长期关联键暴露到优化与门禁接口。
 
 ### ZRPC 机器可校验契约（RPSPAR-01）
 
@@ -28,6 +29,8 @@
 - `rawptr_contract.forbid.user_raw_ptr_syntax=1`
 - `rawptr_contract.forbid.pointer_arithmetic=1`
 - `rawptr_contract.forbid.user_void_ptr=1`
+- `rawptr_contract.impl.ir_storage=soa_arena`
+- `rawptr_contract.impl.ir_ref=index32`
 - `rawptr_contract.required_gate.backend.rawptr_contract=1`
 
 以下是实现“绝对零指针 FFI”的 4 大核心设计（我称之为 **语义影子桥接 Semantic Shadow Bridge**）：

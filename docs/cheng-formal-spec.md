@@ -786,6 +786,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 本契约的规范名为 `零裸指针生产闭环`（`Zero-RawPtr Production Closure`，`ZRPC`），属于发布门禁的规范性约束，不是建议项。
 - 执行模式为 `hard_fail`：任一契约漂移或门禁缺失必须阻断闭环与发布。
 - 语言表面禁止裸指针类型与指针算术；不得向用户暴露 `void*` 语义入口。
+- 编译器内部表示（AST/UIR/基本块）在生产口径应采用 `Arena + SoA` 连续存储，跨节点引用应使用 `int32` 索引；不得以对象裸指针作为长期关联键暴露到优化与门禁接口。
 - C ABI 互操作仅允许通过“影子桥接”完成，用户可见接口保持值/借用语义：
   - `ffi_map`：`slice -> (ptr,len)` 物理拆包。
   - `ffi_out_ptrs`：`out-ptr -> tuple` 语义回收。
