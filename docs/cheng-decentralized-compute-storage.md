@@ -601,7 +601,7 @@ $TOOLING cheng_pkg_fetch --lock:build/cheng_pkg/cheng.lock.toml --print-roots \
 
 4) 编译（`chengc` 会自动拉取并设置 `PKG_ROOTS`）：
 ```bash
-$TOOLING chengc examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
+$TOOLING cheng examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
   --lock:build/cheng_pkg/cheng.lock.toml --registry:build/cheng_registry/registry.jsonl
 ```
 
@@ -645,7 +645,7 @@ PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
   $TOOLING cheng_pkg_fetch --lock:build/cheng_pkg/cheng.lock.toml --print-roots
 
 PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
-  $TOOLING chengc examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
+  $TOOLING cheng examples/your_app.cheng --manifest:docs/cheng-package-manifest.toml \
   --lock:build/cheng_pkg/cheng.lock.toml --registry:build/cheng_registry/registry.jsonl
 ```
 
@@ -776,9 +776,9 @@ PKG_MODE=p2p PKG_PEERS=/dns4/node.example/tcp/4001 \
 CLI 示例：
 ```bash
 # 编译 CLI
-$TOOLING chengc src/tooling/cheng_storage.cheng --name:cheng_storage
-$TOOLING chengc src/tooling/cheng_registry.cheng --name:cheng_registry
-$TOOLING chengc src/tooling/cheng_pkg.cheng --name:cheng_pkg
+$TOOLING cheng src/tooling/cheng_storage.cheng --name:cheng_storage
+$TOOLING cheng src/tooling/cheng_registry.cheng --name:cheng_registry
+$TOOLING cheng src/tooling/cheng_pkg.cheng --name:cheng_pkg
 
 # 初始化存储目录
 ./cheng_storage init --root:build/cheng_storage --mode:local

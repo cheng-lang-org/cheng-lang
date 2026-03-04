@@ -42,7 +42,7 @@ fn policyModuleHasGlobal(mod: UirCoreModule, name: str): bool =
     let n: int32 = uirCoreModuleGlobalsLen(mod)
     for i in 0..<n:
         let g: UirCoreGlobal = uirCoreModuleGlobalAt(mod, i)
-        if g.name == name:
+        if uirCoreGlobalNameOf(g) == name:
             return true
     return false
 
@@ -54,7 +54,7 @@ fn policyModuleHasFunc(mod: UirCoreModule, name: str): bool =
         let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
         if f == nil:
             continue
-        if f.name == name || f.linkName == name:
+        if uirCoreFuncNameOf(f) == name || uirCoreFuncLinkNameOf(f) == name:
             return true
     return false
 
@@ -123,20 +123,25 @@ fn uirCoreResolvePluginImportPath(path: str): str =
 
 fn uirCoreApplyAstPluginHooks(filePath: str, root: Node): Node =
     let _: str = filePath
-    if root == nil:
+    if astRefIsNil(root):
         return root
     if !uirCorePluginEnabled():
         return root
     return root
+
+fn uirCoreApplyAstPluginHooksId(filePath: str, rootId: AstNodeId): AstNodeId =
+    return uirCoreApplyAstPluginHooks(filePath, rootId)
 
 fn uirCoreApplyMirPluginHooks(filePath: str, root: Node): Node =
     let _: str = filePath
-    if root == nil:
+    if astRefIsNil(root):
         return root
     if !uirCorePluginEnabled():
         return root
     return root
 
+fn uirCoreApplyMirPluginHooksId(filePath: str, rootId: AstNodeId): AstNodeId =
+    return uirCoreApplyMirPluginHooks(filePath, rootId)
 fn uirCoreNativeContractEnabled(): bool =
     let raw: str = policyLowerAscii(policyStripSpaces(getEnv "BACKEND_NATIVE_CONTRACT"))
     return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
@@ -213,79 +218,84 @@ fn uirCoreNativeContractIsFloatIntrinsicSymbol(raw: str): bool =
         return true
     return false
 
-fn uirCoreNativeContractExprViolation(expr: UirCoreExpr, where: str): str =
-    if expr == nil:
+fn uirCoreNativeContractExprViolation(expr: UirExprId, where: str): str =
+    if !uirCoreExprIdValid(expr):
         return ""
-    if expr.kind == meCall:
-        let callee: str = expr.callee
+    let exprKind: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if exprKind == meCall:
+        let callee: str = uirCoreExprCalleeOf(expr)
         if uirCoreNativeContractIsSyscallSymbol(callee):
             return "forbid syscall symbol=" + callee + " @" + where
         if uirCoreNativeContractIsFloatIntrinsicSymbol(callee):
             return "forbid float intrinsic symbol=" + callee + " @" + where
-        for ai in 0..<expr.args.len:
-            let v: str = uirCoreNativeContractExprViolation(expr.args[ai], where + "/arg" + intToStr(ai))
+        for ai in 0..<uirCoreExprArgsLen(expr):
+            let v: str = uirCoreNativeContractExprViolation(uirCoreExprArgAt(expr, ai), where + "/arg" + intToStr(ai))
             if len(v) > 0:
                 return v
         return ""
-    if expr.kind == meBin || expr.kind == meCmp:
-        let lhsV: str = uirCoreNativeContractExprViolation(expr.lhs, where + "/lhs")
+    if exprKind == meBin || exprKind == meCmp:
+        let lhsV: str = uirCoreNativeContractExprViolation(uirCoreExprLhsOf(expr), where + "/lhs")
         if len(lhsV) > 0:
             return lhsV
-        let rhsV: str = uirCoreNativeContractExprViolation(expr.rhs, where + "/rhs")
+        let rhsV: str = uirCoreNativeContractExprViolation(uirCoreExprRhsOf(expr), where + "/rhs")
         if len(rhsV) > 0:
             return rhsV
         return ""
-    if expr.kind == meCast:
-        if uirCoreNativeContractTypeIsFloat(expr.castType):
+    if exprKind == meCast:
+        if uirCoreNativeContractTypeIsFloat(uirCoreExprCastTypeOf(expr)):
             return "forbid float cast @" + where
-        return uirCoreNativeContractExprViolation(expr.castExpr, where + "/cast")
-    if expr.kind == meLoad:
-        if uirCoreNativeContractTypeIsFloat(expr.loadType):
+        return uirCoreNativeContractExprViolation(uirCoreExprCastExprOf(expr), where + "/cast")
+    if exprKind == meLoad:
+        if uirCoreNativeContractTypeIsFloat(uirCoreExprLoadTypeOf(expr)):
             return "forbid float load @" + where
-        return uirCoreNativeContractExprViolation(expr.addrExpr, where + "/addr")
+        return uirCoreNativeContractExprViolation(uirCoreExprAddrExprOf(expr), where + "/addr")
     return ""
 
-fn uirCoreNativeContractStmtViolation(stmt: UirCoreStmt, where: str): str =
-    if stmt.kind == msStore && uirCoreNativeContractTypeIsFloat(stmt.storeType):
+fn uirCoreNativeContractStmtViolation(stmt: UirStmtId, where: str): str =
+    if uirCoreStmtKindOf(stmt) == msStore && uirCoreNativeContractTypeIsFloat(uirCoreStmtStoreTypeOf(stmt)):
         return "forbid float store @" + where
-    let exprV: str = uirCoreNativeContractExprViolation(stmt.expr, where + "/expr")
+    let exprV: str = uirCoreNativeContractExprViolation(uirCoreStmtExprOf(stmt), where + "/expr")
     if len(exprV) > 0:
         return exprV
-    let addrV: str = uirCoreNativeContractExprViolation(stmt.addrExpr, where + "/addr")
+    let addrV: str = uirCoreNativeContractExprViolation(uirCoreStmtAddrExprOf(stmt), where + "/addr")
     if len(addrV) > 0:
         return addrV
     return ""
 
 fn uirCoreNativeContractTermViolation(term: UirCoreTerm, where: str): str =
-    if term.kind == mtRet:
-        return uirCoreNativeContractExprViolation(term.retExpr, where + "/ret")
-    if term.kind == mtCbr:
-        return uirCoreNativeContractExprViolation(term.condExpr, where + "/cond")
+    if uirCoreTermKindOf(term) == mtRet:
+        return uirCoreNativeContractExprViolation(uirCoreTermRetExprOf(term), where + "/ret")
+    if uirCoreTermKindOf(term) == mtCbr:
+        return uirCoreNativeContractExprViolation(uirCoreTermCondExprOf(term), where + "/cond")
     return ""
 
 fn uirCoreNativeContractFuncViolation(f: UirCoreFunc): str =
     if f == nil:
         return ""
-    if uirCoreNativeContractTypeIsFloat(f.retType):
-        return "forbid float return type fn=" + f.name
-    for pi in 0..<f.params.len:
-        let p: UirCoreParam = f.params[pi]
+    let fnName: str = uirCoreFuncNameOf(f)
+    if uirCoreNativeContractTypeIsFloat(uirCoreFuncRetTypeOf(f)):
+        return "forbid float return type fn=" + fnName
+    for pi in 0..<uirCoreFuncParamsLen(f):
+        let p: UirCoreParam = uirCoreFuncParamAt(f, pi)
         if uirCoreNativeContractTypeIsFloat(p.ty):
-            return "forbid float param fn=" + f.name + " param=" + p.name
-    for li in 0..<f.localTypes.len:
-        if uirCoreNativeContractTypeIsFloat(f.localTypes[li]):
-            return "forbid float local fn=" + f.name + " slot=" + intToStr(li)
-    for bi in 0..<f.blocks.len:
-        let blk: UirCoreBlock = f.blocks[bi]
-        if blk == nil:
+            return "forbid float param fn=" + fnName + " param=" + p.name
+    for li in 0..<uirCoreFuncLocalTypesLen(f):
+        if uirCoreNativeContractTypeIsFloat(uirCoreFuncLocalTypeAt(f, li)):
+            return "forbid float local fn=" + fnName + " slot=" + intToStr(li)
+    for bi in 0..<uirCoreFuncBlocksLen(f):
+        let blk: UirBlockId = uirCoreFuncBlockAt(f, bi)
+        if !uirCoreBlockIdValid(blk):
             continue
-        for si in 0..<blk.stmts.len:
-            let sv: str = uirCoreNativeContractStmtViolation(blk.stmts[si],
-                                                             "fn=" + f.name + " block=" + blk.label + " stmt=" + intToStr(si))
+        let blkLabel: str = uirCoreBlockLabelOf(blk)
+        let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+        for si in 0..<stmtCount:
+            let stmt0: UirStmtId = uirCoreBlockStmtAt(blk, si)
+            let sv: str = uirCoreNativeContractStmtViolation(stmt0,
+                                                             "fn=" + fnName + " block=" + blkLabel + " stmt=" + intToStr(si))
             if len(sv) > 0:
                 return sv
-        let tv: str = uirCoreNativeContractTermViolation(blk.term,
-                                                         "fn=" + f.name + " block=" + blk.label + " term")
+        let tv: str = uirCoreNativeContractTermViolation(uirCoreBlockTermOf(blk),
+                                                         "fn=" + fnName + " block=" + blkLabel + " term")
         if len(tv) > 0:
             return tv
     return ""
@@ -296,23 +306,23 @@ fn uirCoreNativeContractFindFuncIndex(mod: UirCoreModule, rawName: str): int32 =
     let name: str = policyStripSpaces(rawName)
     if len(name) == 0:
         return -1
-    for i in 0..<mod.funcs.len:
-        let f: UirCoreFunc = mod.funcs[i]
+    for i in 0..<uirCoreModuleFuncsLen(mod):
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
         if f == nil:
             continue
-        if f.name == name || f.linkName == name:
+        if uirCoreFuncNameOf(f) == name || uirCoreFuncLinkNameOf(f) == name:
             return i
     let nameNorm: str = uirCoreNativeContractNormalizeSymbol(name)
     if len(nameNorm) == 0:
         return -1
-    for i2 in 0..<mod.funcs.len:
-        let f2: UirCoreFunc = mod.funcs[i2]
+    for i2 in 0..<uirCoreModuleFuncsLen(mod):
+        let f2: UirCoreFunc = uirCoreModuleFuncAt(mod, i2)
         if f2 == nil:
             continue
-        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(f2.name)
+        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(uirCoreFuncNameOf(f2))
         if fnNorm == nameNorm:
             return i2
-        let lnNorm: str = uirCoreNativeContractNormalizeSymbol(f2.linkName)
+        let lnNorm: str = uirCoreNativeContractNormalizeSymbol(uirCoreFuncLinkNameOf(f2))
         if lnNorm == nameNorm:
             return i2
     return -1
@@ -328,43 +338,44 @@ fn uirCoreNativeContractEnqueueByName(mod: UirCoreModule, queue: var int32[], re
     reachable[idx] = true
     add(queue, idx)
 
-fn uirCoreNativeContractCollectCallsFromExpr(mod: UirCoreModule, expr: UirCoreExpr,
+fn uirCoreNativeContractCollectCallsFromExpr(mod: UirCoreModule, expr: UirExprId,
                                              queue: var int32[], reachable: var bool[]) =
-    if expr == nil:
+    if !uirCoreExprIdValid(expr):
         return
-    if expr.kind == meCall:
-        uirCoreNativeContractEnqueueByName(mod, queue, reachable, expr.callee)
-        for ai in 0..<expr.args.len:
-            uirCoreNativeContractCollectCallsFromExpr(mod, expr.args[ai], queue, reachable)
+    let exprKind: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if exprKind == meCall:
+        uirCoreNativeContractEnqueueByName(mod, queue, reachable, uirCoreExprCalleeOf(expr))
+        for ai in 0..<uirCoreExprArgsLen(expr):
+            uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreExprArgAt(expr, ai), queue, reachable)
         return
-    if expr.kind == meBin || expr.kind == meCmp:
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.lhs, queue, reachable)
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.rhs, queue, reachable)
+    if exprKind == meBin || exprKind == meCmp:
+        uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreExprLhsOf(expr), queue, reachable)
+        uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreExprRhsOf(expr), queue, reachable)
         return
-    if expr.kind == meCast:
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.castExpr, queue, reachable)
+    if exprKind == meCast:
+        uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreExprCastExprOf(expr), queue, reachable)
         return
-    if expr.kind == meLoad:
-        uirCoreNativeContractCollectCallsFromExpr(mod, expr.addrExpr, queue, reachable)
+    if exprKind == meLoad:
+        uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreExprAddrExprOf(expr), queue, reachable)
         return
 
-fn uirCoreNativeContractCollectCallsFromStmt(mod: UirCoreModule, stmt: UirCoreStmt,
+fn uirCoreNativeContractCollectCallsFromStmt(mod: UirCoreModule, stmt: UirStmtId,
                                              queue: var int32[], reachable: var bool[]) =
-    uirCoreNativeContractCollectCallsFromExpr(mod, stmt.expr, queue, reachable)
-    uirCoreNativeContractCollectCallsFromExpr(mod, stmt.addrExpr, queue, reachable)
+    uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreStmtExprOf(stmt), queue, reachable)
+    uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreStmtAddrExprOf(stmt), queue, reachable)
 
 fn uirCoreNativeContractCollectCallsFromTerm(mod: UirCoreModule, term: UirCoreTerm,
                                              queue: var int32[], reachable: var bool[]) =
-    if term.kind == mtRet:
-        uirCoreNativeContractCollectCallsFromExpr(mod, term.retExpr, queue, reachable)
-    elif term.kind == mtCbr:
-        uirCoreNativeContractCollectCallsFromExpr(mod, term.condExpr, queue, reachable)
+    if uirCoreTermKindOf(term) == mtRet:
+        uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreTermRetExprOf(term), queue, reachable)
+    elif uirCoreTermKindOf(term) == mtCbr:
+        uirCoreNativeContractCollectCallsFromExpr(mod, uirCoreTermCondExprOf(term), queue, reachable)
 
 fn uirCoreNativeContractReachableMask(mod: UirCoreModule): bool[] =
     var reachable: bool[]
     if mod == nil:
         return reachable
-    reachable.len = mod.funcs.len
+    reachable.len = uirCoreModuleFuncsLen(mod)
     var queue: int32[]
     var entryIdx: int32 = uirCoreNativeContractFindFuncIndex(mod, "main")
     if entryIdx < 0:
@@ -378,18 +389,19 @@ fn uirCoreNativeContractReachableMask(mod: UirCoreModule): bool[] =
         add(queue, entryIdx)
     for qi in 0..<queue.len:
         let idx: int32 = queue[qi]
-        if idx < 0 || idx >= mod.funcs.len:
+        if idx < 0 || idx >= uirCoreModuleFuncsLen(mod):
             continue
-        let f: UirCoreFunc = mod.funcs[idx]
-        if f == nil || f.isExtern:
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, idx)
+        if f == nil || uirCoreFuncIsExtern(f):
             continue
-        for bi in 0..<f.blocks.len:
-            let blk: UirCoreBlock = f.blocks[bi]
-            if blk == nil:
+        for bi in 0..<uirCoreFuncBlocksLen(f):
+            let blk: UirBlockId = uirCoreFuncBlockAt(f, bi)
+            if !uirCoreBlockIdValid(blk):
                 continue
-            for si in 0..<blk.stmts.len:
-                uirCoreNativeContractCollectCallsFromStmt(mod, blk.stmts[si], queue, reachable)
-            uirCoreNativeContractCollectCallsFromTerm(mod, blk.term, queue, reachable)
+            let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+            for si in 0..<stmtCount:
+                uirCoreNativeContractCollectCallsFromStmt(mod, uirCoreBlockStmtAt(blk, si), queue, reachable)
+            uirCoreNativeContractCollectCallsFromTerm(mod, uirCoreBlockTermOf(blk), queue, reachable)
     return reachable
 
 fn uirCoreNativeContractEnsureGasHelper(mod: UirCoreModule, chargeName: str, counterName: str) =
@@ -404,40 +416,38 @@ fn uirCoreNativeContractEnsureGasHelper(mod: UirCoreModule, chargeName: str, cou
     uirCoreAddParam(helper, "cost", 0, uirCoreTypeI64())
     uirCoreSetLocalType(helper, 1, uirCoreTypeI64())
     uirCoreSetLocalType(helper, 2, uirCoreTypeI64())
-    var stmts: UirCoreStmt[]
+    var stmts: UirStmtId[]
     add(stmts, uirCoreStmtParam("cost", 0, 0))
-    let oldExpr: UirCoreExpr = uirCoreLoad(uirCoreGlobalAddr(counterName), uirCoreTypeI64())
+    let oldExpr: UirExprId = uirCoreLoad(uirCoreGlobalAddr(counterName), uirCoreTypeI64())
     add(stmts, uirCoreStmtLet("gas_old", 1, oldExpr))
-    let nextExpr: UirCoreExpr = uirCoreBin(mbAdd, uirCoreLocal(1), uirCoreLocal(0))
+    let nextExpr: UirExprId = uirCoreBin(mbAdd, uirCoreLocal(1), uirCoreLocal(0))
     add(stmts, uirCoreStmtLet("gas_new", 2, nextExpr))
     add(stmts, uirCoreStmtStore(uirCoreGlobalAddr(counterName), uirCoreLocal(2), uirCoreTypeI64()))
     let term: UirCoreTerm = uirCoreTermRet(uirCoreLocal(2))
-    let entry: UirCoreBlock = uirCoreBlockWithStmts("entry", stmts, term)
+    let entry: UirBlockId = uirCoreBlockWithStmts("entry", stmts, term)
     uirCoreAddBlock(helper, entry)
     uirCoreAddFunc(mod, helper)
 
-fn uirCoreNativeContractFirstNonParamStmt(blk: UirCoreBlock): int32 =
-    if blk == nil:
+fn uirCoreNativeContractFirstNonParamStmt(blk: UirBlockId): int32 =
+    if !uirCoreBlockIdValid(blk):
         return -1
     # Use for-range form; avoid fragile while+local-alias lowering.
-    for idx in 0..<blk.stmts.len:
-        if blk.stmts[idx] == nil:
+    let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+    for idx in 0..<stmtCount:
+        let stmt0: UirStmtId = uirCoreBlockStmtAt(blk, idx)
+        if uirCoreStmtKindOf(stmt0) != msParam:
             return idx
-        if blk.stmts[idx].kind != msParam:
-            return idx
-    return blk.stmts.len
+    return stmtCount
 
-fn uirCoreNativeContractStmtCallsCharge(stmt: UirCoreStmt, chargeNorm: str): bool =
-    if stmt == nil:
+fn uirCoreNativeContractStmtCallsCharge(stmt: UirStmtId, chargeNorm: str): bool =
+    if uirCoreStmtKindOf(stmt) != msExpr:
         return false
-    if stmt.kind != msExpr:
+    let expr0: UirExprId = uirCoreStmtExprOf(stmt)
+    if !uirCoreExprIdValid(expr0):
         return false
-    let expr0: UirCoreExpr = stmt.expr
-    if expr0 == nil:
+    if uirCoreExprKindOf(expr0) != meCall:
         return false
-    if expr0.kind != meCall:
-        return false
-    let calleeNorm: str = uirCoreNativeContractNormalizeSymbol(expr0.callee)
+    let calleeNorm: str = uirCoreNativeContractNormalizeSymbol(uirCoreExprCalleeOf(expr0))
     return calleeNorm == chargeNorm
 
 fn uirCoreNativeContractInjectGas(mod: UirCoreModule) =
@@ -448,51 +458,52 @@ fn uirCoreNativeContractInjectGas(mod: UirCoreModule) =
     uirCoreNativeContractEnsureGasHelper(mod, chargeName, counterName)
     let chargeNorm: str = uirCoreNativeContractNormalizeSymbol(chargeName)
     var fi: int32 = 0
-    while fi < mod.funcs.len:
-        let f: UirCoreFunc = mod.funcs[fi]
+    while fi < uirCoreModuleFuncsLen(mod):
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, fi)
         fi = fi + 1
-        if f == nil || f.isExtern:
+        if f == nil || uirCoreFuncIsExtern(f):
             continue
-        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(f.name)
+        let fnNorm: str = uirCoreNativeContractNormalizeSymbol(uirCoreFuncNameOf(f))
         if fnNorm == chargeNorm:
             continue
         var bi: int32 = 0
-        while bi < f.blocks.len:
-            let blk: UirCoreBlock = f.blocks[bi]
+        while bi < uirCoreFuncBlocksLen(f):
+            let blk: UirBlockId = uirCoreFuncBlockAt(f, bi)
             bi = bi + 1
-            if blk == nil:
+            if !uirCoreBlockIdValid(blk):
                 continue
             let insertAt: int32 = uirCoreNativeContractFirstNonParamStmt(blk)
             if insertAt < 0:
                 continue
-            if insertAt < blk.stmts.len:
-                let firstStmt: UirCoreStmt = blk.stmts[insertAt]
+            let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+            if insertAt < stmtCount:
+                let firstStmt: UirStmtId = uirCoreBlockStmtAt(blk, insertAt)
                 if uirCoreNativeContractStmtCallsCharge(firstStmt, chargeNorm):
                     continue
-            var args: UirCoreExpr[]
-            let blockCost: int64 = int64(1 + blk.stmts.len)
+            var args: UirExprId[]
+            let blockCost: int64 = int64(1 + stmtCount)
             add(args, uirCoreConstI64(blockCost))
-            let chargeExpr: UirCoreExpr = uirCoreCall(chargeName, args)
-            let chargeStmt: UirCoreStmt = uirCoreStmtExpr(chargeExpr)
-            var out: UirCoreStmt[]
+            let chargeExpr: UirExprId = uirCoreCall(chargeName, args)
+            let chargeStmt: UirStmtId = uirCoreStmtExpr(chargeExpr)
+            var out: UirStmtId[]
             var si: int32 = 0
-            while si < blk.stmts.len:
+            while si < stmtCount:
                 if si == insertAt:
                     add(out, chargeStmt)
-                add(out, blk.stmts[si])
+                add(out, uirCoreBlockStmtAt(blk, si))
                 si = si + 1
-            if insertAt >= blk.stmts.len:
+            if insertAt >= stmtCount:
                 add(out, chargeStmt)
-            blk.stmts = out
+            uirCoreBlockSetStmts(blk, out)
 
 fn uirCoreNativeContractEnforce(filePath: str, mod: UirCoreModule) =
     if mod == nil:
         return
     let reachable: bool[] = uirCoreNativeContractReachableMask(mod)
-    for fi in 0..<mod.funcs.len:
+    for fi in 0..<uirCoreModuleFuncsLen(mod):
         if fi < reachable.len && !reachable[fi]:
             continue
-        let f: UirCoreFunc = mod.funcs[fi]
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, fi)
         let v: str = uirCoreNativeContractFuncViolation(f)
         if len(v) > 0:
             let panicMsg: str = "uirCore_builder: native_contract hard-fail @" + filePath + ": " + v
@@ -538,17 +549,15 @@ fn uirCoreParseInt32(raw: str, defaultValue: int32): int32 =
     return int32(v)
 
 fn uirCoreGenericSpecBudget(): int32 =
-    let raw: str = policyStripSpaces(getEnv "GENERIC_SPEC_BUDGET")
-    if len(raw) == 0:
-        return 0
-    let parsed: int32 = uirCoreParseInt32(raw, 0)
-    return parsed
+    return 0
 
 fn uirCoreGenericModeNormalized(): str =
     let raw0: str = policyLowerAscii(policyStripSpaces(getEnv "GENERIC_MODE"))
     if len(raw0) == 0:
         return "dict"
-    return raw0
+    if raw0 == "dict" || raw0 == "dictionary":
+        return raw0
+    return "dict"
 
 fn uirCoreBorrowIrNormalized(): str =
     let raw0: str = policyLowerAscii(policyStripSpaces(getEnv "BORROW_IR"))
@@ -559,14 +568,14 @@ fn uirCoreBorrowIrNormalized(): str =
 fn uirCoreGenericLoweringNormalized(): str =
     let raw0: str = policyLowerAscii(policyStripSpaces(getEnv "GENERIC_LOWERING"))
     if len(raw0) == 0:
-        return "mir_hybrid"
+        return "mir_dict"
     return raw0
 
 fn uirCoreBorrowIrSupported(mode: str): bool =
     return mode == "mir" || mode == "stage1"
 
 fn uirCoreGenericLoweringSupported(mode: str): bool =
-    return mode == "mir_hybrid" || mode == "mir_dict"
+    return mode == "mir_dict"
 
 fn uirCoreDictHelperClosureEnabled(): bool =
     let mode: str = uirCoreGenericModeNormalized()
@@ -587,20 +596,7 @@ fn uirCoreShouldSkipMonoPass(): bool =
                          " skip_dict=" + (skipDict ? "1" : "0"))
             os.c_fflush f
         return skipDict
-    if mode == "hybrid":
-        let budget: int32 = uirCoreGenericSpecBudget()
-        let forceMonoHybrid: bool = envIsTrue "STAGE1_FORCE_MONO_HYBRID"
-        # Budget <= 0 keeps a dict-like fast path; >0 allows controlled
-        # mono re-entry for small/explicitly budgeted instantiations.
-        let skipDict: bool = !forceMonoHybrid && budget <= 0
-        if os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1":
-            let f: os.File = os.get_stderr()
-            os.writeLine(f, "[backend] stage1: skip_mono mode=" + mode +
-                         " budget=" + intToStr(budget) +
-                         " skip=" + (skipDict ? "1" : "0"))
-            os.c_fflush f
-        return skipDict
-    return false
+    return true
 
 fn uirCoreIsOrcMode(mm: str): bool =
     return len(mm) == 3 &&
@@ -624,7 +620,7 @@ fn uirCoreFileLikelyHasPointerSyntax(path: str): bool =
     let content: str = frontend_lib.stage1_readFile(path)
     if len(content) == 0:
         return false
-    if strContains(content, "ptr_add(") || strContains(content, "load_ptr(") || strContains(content, "store_ptr("):
+    if strContains(content, "rawmemPtrAdd(") || strContains(content, "load_ptr(") || strContains(content, "store_ptr("):
         return true
     if strContains(content, "alloc(") || strContains(content, "dealloc("):
         return true
@@ -713,7 +709,11 @@ fn uirCorePathSyntheticOrStd(path: str): bool =
     return false
 
 fn uirCoreSkipSemStdDuplicateRelaxEnabled(): bool =
-    return uirCoreIsOne(getEnv "STAGE1_SKIP_SEM")
+    if uirCoreIsOne(getEnv "STAGE1_SKIP_SEM"):
+        return true
+    if uirCoreIsOne(os.getEnvDefault("BACKEND_STAGE1_DISABLE_DUP_SCAN", "0")):
+        return true
+    return false
 
 fn uirCoreStage1ParseModeNormalized(): str =
     var raw: str = policyLowerAscii(policyStripSpaces(os.getEnvDefault("BACKEND_STAGE1_PARSE_MODE", "")))
@@ -758,6 +758,9 @@ fn uirCoreStage1StdNoPointerPrecheck(root: Node, inPath: str, diags: var Diagnos
         uirCoreEnsurePolicyDiag(diags, inPath, "std policy: pointer types are forbidden in standard library")
     return hits > 0
 
+fn uirCoreStage1StdNoPointerPrecheckId(rootId: AstNodeId, inPath: str, diags: var Diagnostic[]): bool =
+    return uirCoreStage1StdNoPointerPrecheck(rootId, inPath, diags)
+
 fn uirCoreStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Diagnostic[]): bool =
     var ctx: SemCtx
     initSemCtxInPlace(ctx)
@@ -775,3 +778,6 @@ fn uirCoreStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Dia
     if hits > 0:
         uirCoreEnsurePolicyDiag(diags, inPath, "no-pointer policy: pointer types are forbidden outside C ABI modules")
     return hits > 0
+
+fn uirCoreStage1NoPointerNonCAbiPrecheckId(rootId: AstNodeId, inPath: str, diags: var Diagnostic[]): bool =
+    return uirCoreStage1NoPointerNonCAbiPrecheck(rootId, inPath, diags)

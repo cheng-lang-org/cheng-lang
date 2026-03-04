@@ -581,9 +581,16 @@ fn reserve(seq: void*, newCap: int32) =
     let targetCap: int32 = __cheng_next_cap(seqHdr->cap, newCap)
     if targetCap <= 0:
         return
-    let newBuf: void* = c_realloc(seqHdr->buffer, int64(targetCap))
+    let slotBytesRaw: int32 = cheng_ptr_size_runtime()
+    let slotBytesBase: int32 = slotBytesRaw <= 0 ? int32(8) : slotBytesRaw
+    let slotBytes: int32 = slotBytesBase < int32(32) ? int32(32) : slotBytesBase
+    let newBytes: int64 = int64(targetCap) * int64(slotBytes)
+    let oldBytes: int64 = int64(seqHdr->cap) * int64(slotBytes)
+    let newBuf: void* = c_realloc(seqHdr->buffer, newBytes)
     if newBuf == nil:
         return
+    if newBytes > oldBytes:
+        c_memset(ptr_add(newBuf, int32(oldBytes)), 0, newBytes - oldBytes)
     seqHdr->buffer = newBuf
     seqHdr->cap = targetCap
 
@@ -673,6 +680,11 @@ fn cheng_free(p: void*) =
     cheng_mm_free_total = cheng_mm_free_total + 1
     if cheng_mm_live_total > 0:
         cheng_mm_live_total = cheng_mm_live_total - 1
+
+@weak
+@ exportc("dealloc")
+fn dealloc(p: void*) =
+    cheng_free(p)
 
 fn cheng_realloc(p: void*, size: int32): void* =
     if p == nil:

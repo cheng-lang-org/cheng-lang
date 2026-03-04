@@ -13,7 +13,9 @@
 ## 强制口径
 1. canonical driver 固定为 `artifacts/backend_driver/cheng`。
 2. 默认不启用历史 stage0 回退链。
-3. 仅当显式设置 `TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=1` 时，允许回退到历史候选做应急排障。
+3. 历史 stage0 回退链已下线；`build/compile/verify` 不再接受 legacy fallback。
+4. `BACKEND_DRIVER` / `CHENG_BACKEND_DRIVER` 覆盖入口已移除（非空即配置错误）。
+5. `SELF_OBJ_BOOTSTRAP_STAGE0` / `BACKEND_BUILD_DRIVER_STAGE0` 与 `--stage0` / `--seed*` driver 覆盖语义已移除。
 
 ## 工具行为更新
 1. `$TOOLING build-backend-driver` 默认自动清理历史 `cheng*` 变体（`BACKEND_BUILD_DRIVER_AUTO_CLEAN_HISTORY=1`）。

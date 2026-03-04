@@ -1,6 +1,6 @@
 # Cheng 正式规范（语法与语义）
 
-> 版本：2026-02-23
+> 版本：2026-03-03
 
 本文为 Cheng 语言最终规范，描述语法与核心语义。
 
@@ -91,7 +91,7 @@
   - **禁用指针类型**：`T*`、`void*`、`ref T`、`ptr[T]`。
   - **禁用指针操作**：解引用（`*`/`->`）、取址（`&`）、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
   - **违规诊断**：语义阶段报 `no-pointer policy`。
-  - **默认 CLI 入口**：`chengc` 在 `ABI=v2_noptr` 下默认注入 `STAGE1_NO_POINTERS_NON_C_ABI=1` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
+  - **默认 CLI 入口**：`cheng` 在 `ABI=v2_noptr` 下默认注入 `STAGE1_NO_POINTERS_NON_C_ABI=1` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
 
 #### 0.2.1 编译期借用证明（v1 落地）
 
@@ -137,120 +137,13 @@
 
 自 `2026-02-06` 起，官方生产工具链已移除 ASM/HRT 与 legacy C bootstrap 入口。  
 `bin/cheng-stage0 --mode:hrt`、`ASM_RT`、`HRT_PROFILE` 不再属于现行支持范围。  
-历史约束文档（如 `docs/hrt-profile-v1.md`）仅保留为存档，不再作为生产规范与验收门禁。
+历史约束文档仅保留为存档，不再作为生产规范与验收门禁。
 
 ### 0.5 匿名函数与函数指针（语义差异）
 
 - **匿名函数（lambda/closure）**可以捕获外部变量，值语义包含“环境”；编译期可能生成 env 结构与 trampoline。
 - **函数指针**仅包含代码地址，不携带环境；ABI 更直接，适合 `importc` 回调与 C 交互。
 - 不捕获的匿名函数可视作函数指针使用，但仍需确保签名与回调形参匹配。
-
-### 0.5.1 工程状态与剩余改进项（工程视角）
-
-- **语法一致性**：`TypeExpr(expr)` 仅用于类型转换；默认初始化仅通过“带类型标注且省略初始化”的隐式默认值实现；禁止引入 `TypeExpr()` 或 `TypeExpr expr` 变体。
-- **匿名函数书写**：显式函数类型 + `fn(...) =` 语法偏冗长；可考虑提供语法糖（如 `fn(...) => expr`）但需明确闭包/函数指针 ABI 差异。
-- **泛型/trait 诊断（已工程化并持续增强）**：语义阶段默认前移并阻断关键约束错误；`where`/`Self` 的最小定位信息已纳入生产门禁口径，后续仅做可读性增强。
-- **FFI/ABI 边界（已工程化）**：`importc` 聚合返回必须 wrapper/out 参数；`varargs` 仅允许受限签名（darwin/arm64 已回归直连 i32 子集，其它平台建议 wrapper）；捕获型回调必须 `ctx` 承载环境，并由 `verify_backend_ffi_abi` 等门禁阻断回归。
-  - `varargs` call lowering 需维护 16B 栈对齐，且遵循目标 ABI（x86_64 `AL=0`；AArch64 Darwin 8B 槽 + i32 扩展）。
-  - `var` out 参数调用点按“自动取址”规则传递（源码 `foo(x)`，ABI 传 `&x`）。
-- **泛型实例化（已工程化基线）**：跨模块实例缓存/去重以 determinism + UIR 稳定性门禁持续约束，禁止出现“实例膨胀但无门禁可观测”的回退。
-- **ORC/所有权**：跨线程边界、闭包捕获与析构顺序需更明确的规范与诊断。
-- **构建确定性（已收口）**：缓存键需覆盖 fullspec/示例输入；determinism 校验必须包含 seed、编译参数、目标平台与关键环境变量；发布打包链路要求确定性产物（稳定 mtime/排序 + `gzip -n`，不再 best-effort）。
-- **标准库一致性/性能**：高频容器统一到 `hashmap/hashset` 等高性能实现，并保持 `[]`/`[]=` 语义一致。
-- **工具链体验（持续收敛）**：错误提示格式统一；将后端报错前移到语义阶段（例如“借用活跃 + unresolved call”改为语义硬错误）；并持续完善最小可复现输出模式。
-- **包管理/供应链（已默认强制）**：依赖锁、签名校验、registry 一致性在生产口径默认硬失败，不再作为建议项；仅显式 `PKG_INSECURE_ALLOW_NO_VERIFY=1` 允许本地诊断放宽（不得用于 CI/发布）。
-- **诊断可用性**：错误消息需包含变量名/模块路径/关键类型摘要，避免“静默降级或后端才报错”。
-
-### 0.6 改进建议（实现同步清单，优先级）
-
-#### 0.6.1 性能与编译（优先）
-
-- **moveHint**：引入更结构化的 def-use/SSA 或缓存化数据流摘要，减少分支/循环/`defer` 触发的保守回退，并提供 `why-not-move` 诊断。
-- **retain/release 优化**：对 `NoEscape` 与纯值表达式跳过 retain；对局部 Owned 临时值提供 fast-path，降低 RC 压力。
-- **构建确定性**：统一产物 metadata schema，强制记录 `MM/MM_STRICT/profile/target/seed`；提供缓存命中统计与失效原因。
-
-#### 0.6.2 语义与安全（后续）
-
-- **借用证明**：跨过程调用默认要求显式摘要（`@borrows/@escapes`）；未知/未解析调用在借用活跃路径必须阻断，后续优化聚焦“自动摘要推断”而非“允许跳过证明”。
-- **ORC/循环引用**：标准库容器统一实现 `=trace`；提供可选 cycle collector 或 Arena/Region 一等公民化方案，并明确启用开关与性能基线。
-- **线程边界**：标准库线程/任务/通道 API 内建白名单；`@thread_boundary` 未标注视为错误；`T*`/FFI 句柄默认 `!Send/!Sync` 且需显式封装。
-- **已移除子集清理**：剔除 HRT/ASM/legacy C bootstrap 相关门禁与入口，统一生产语义到 backend-only 主链路。
-
-##### 落地说明（v0.6.2 语义闭环草案）
-
-- `@borrows`：允许借用值作为非 `var` 形参传入；返回值视作借用视图（若存在借用来源），禁止跨越调用栈持久化。
-- `@escapes`：显式声明参数可能逃逸；传入借用值时在调用处报错，要求调用方转为 Owned 或显式复制。
-- `@borrows` 与 `@escapes` 互斥；同一函数或同一参数同时标注视为错误。
-- 线程边界白名单（如 `spawn/chanI32Send/chanI32Recv`）必须标注 `@thread_boundary`；未标注会在声明/调用处报错并给出最小迁移建议。
-- `T*`/FFI 句柄默认 `!Send/!Sync`；跨线程传递必须显式封装为可发送/可共享的安全句柄类型。
-- 生产模式下保持统一语义：`panic` 与 `?` 按主语言规则处理，不再区分 HRT 特化分支。
-
-最小示例（语义层）：
-
-```cheng
-type Buffer = object
-    data: void*
-    len: int32
-
-var globalBuf: Buffer
-
-@borrows
-fn view(buf: Buffer): Buffer =
-    return buf
-
-@escapes
-fn store(buf: Buffer): int32 =
-    globalBuf = buf
-    return 0
-
-@thread_boundary
-fn spawn(entry: fn(void*), ctx: void*): int32 =
-    return 0
-
-fn taskMain(ctx: void*): int32 =
-    return 0
-
-fn demo(): int32 =
-    let b: Buffer = globalBuf
-    let v: Buffer = view(b)
-    store(b) # ok: Owned 进入 @escapes
-    # spawn(taskMain, b)  # error: Cross-thread argument must be Send/Sync: spawn argument #2
-    # spawn(taskMain, v)  # error: Borrowed value cannot be passed across threads: spawn argument #2
-    return 0
-```
-
-常见误用与诊断（草案，语义阶段）：
-
-1) 借用值进入 `@escapes`（逃逸）：
-```cheng
-@borrows
-fn view(buf: Buffer): Buffer =
-    return buf
-
-@escapes
-fn store(buf: Buffer): int32 =
-    globalBuf = buf
-    return 0
-
-fn badEscapes(): int32 =
-    let v: Buffer = view(globalBuf)
-    store(v) # error: Borrowed value cannot escape via call store: globalBuf
-    return 0
-```
-
-2) 线程边界未标注 / 非 Send 值跨线程：
-```cheng
-fn spawn(entry: fn(void*), ctx: void*): int32 =
-    return 0
-# error: thread boundary requires @thread_boundary: spawn (声明/调用处均可触发)
-
-fn taskMain(ctx: void*): int32 =
-    return 0
-
-fn badThread(): int32 =
-    # spawn(taskMain, globalBuf) # error: Cross-thread argument must be Send/Sync: spawn argument #2
-    return 0
-```
 
 ## 1. 形式文法（BNF）
 
@@ -358,18 +251,6 @@ traitDecl      ::= "trait" ident [ typeParamList ] ":" suite ;
 
 typeParamList  ::= "[" typeParam { ("," | ";") typeParam } "]" ;
 typeParam      ::= ident [ ":" typeExpr ] [ "=" typeExpr ] ;
-
-#### 隐式类型参数（语法糖，编译期）
-
-除显式 `typeParamList`（如 `fn f[T](x: T): T = ...`）外，Cheng 还支持**隐式类型参数**的简写形式：
-
-- 适用范围：`fn` / `iterator` / `template` / `macro` 的例程声明（不含 lambda 字面量）。
-- 触发条件：例程头部省略 `typeParamList`，但在**参数类型**或**返回类型**里出现了自由的单字母大写标识符（`T`/`U`/`K`/`V`/...）。
-- 语义：编译器按签名从左到右的首次出现顺序补全类型参数列表；例如
-  - `fn len(xs: T[]): int32 = xs.len` 等价于 `fn len[T](xs: T[]): int32 = xs.len`
-  - `template mapIt(xs: T[], body: untyped): U[] = ...` 等价于 `template mapIt[T, U](...) = ...`
-- 限制：只识别 ASCII 单字母大写；限定名（如 `mod.T`）不引入隐式类型参数；若同名类型已在作用域内定义，则按该类型解析（不当作隐式类型参数）。
-
 paramList      ::= "(" [ param { ("," | ";") param } ] ")" ;
 param          ::= ident [ ":" typeExpr ] [ "=" expression ] ;
 
@@ -473,7 +354,7 @@ pattern        ::= ident [ ":" typeExpr ]
                   | literalPattern
                   | "(" pattern { "," pattern } ")"
                   | "[" [ pattern { "," pattern } ] "]"
-                  | "{" setElem { "," setElem } "}"
+                  | "{" pattern { "," pattern } "}"
                   | rangePattern
                   | objectPattern ;
 
@@ -504,7 +385,8 @@ term           ::= factor { ("*" | "/" | "%") factor } ;
 factor         ::= spaceCall
                   | postfix
                   | whenExpr
-                  | ifExpr ;
+                  | ifExpr
+                  | caseExpr ;
 
 postfix        ::= unary { "." ident
                          | "->" ident
@@ -594,6 +476,17 @@ boolLiteral    ::= "true" | "false" ;
 charLiteral    ::= `'` CHARACTER `'` ;
 ```
 
+#### 隐式类型参数（语法糖，编译期）
+
+除显式 `typeParamList`（如 `fn f[T](x: T): T = ...`）外，Cheng 还支持**隐式类型参数**的简写形式：
+
+- 适用范围：`fn` / `iterator` / `template` / `macro` 的例程声明（不含 lambda 字面量）。
+- 触发条件：例程头部省略 `typeParamList`，但在**参数类型**或**返回类型**里出现了自由的单字母大写标识符（`T`/`U`/`K`/`V`/...）。
+- 语义：编译器按签名从左到右的首次出现顺序补全类型参数列表；例如
+  - `fn len(xs: T[]): int32 = xs.len` 等价于 `fn len[T](xs: T[]): int32 = xs.len`
+  - `template mapIt(xs: T[], body: untyped): U[] = ...` 等价于 `template mapIt[T, U](...) = ...`
+- 限制：只识别 ASCII 单字母大写；限定名（如 `mod.T`）不引入隐式类型参数；若同名类型已在作用域内定义，则按该类型解析（不当作隐式类型参数）。
+
 ### 1.2.1 语义约束（补充）
 
 - 表达式语句允许忽略返回值；语法级 `discard` 已移除（`discard x`/`discard(x)` 旧写法会报错），默认允许 unused-value。
@@ -618,7 +511,8 @@ charLiteral    ::= `'` CHARACTER `'` ;
   - 禁用指针类型：`T*`、`void*`、`ref T`、`ptr[T]`。
   - 禁用指针操作：解引用（`*`/`->`）、取址（`&`）、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
   - 违规则在语义阶段报 `no-pointer policy` 诊断。
-  - 默认 CLI 入口：`chengc` 在 `ABI=v2_noptr` 下默认注入 `STAGE1_NO_POINTERS_NON_C_ABI=1` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
+  - 默认 CLI 入口：`cheng` 在 `ABI=v2_noptr` 下默认注入 `STAGE1_NO_POINTERS_NON_C_ABI=1` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
+  - `std/cmdline` 约束：`main(argc, argv)` 入口统一调用 `cmdline.__cheng_captureCmdLine(argc, argv)` 将参数转交 runtime C；`cmdline` 通过 `__cheng_rt_paramCount/__cheng_rt_paramStr/__cheng_rt_paramStrCopy` 获取并缓存参数。语言层禁止暴露 `argv:void*` 与指针算术语义。
 
 类型转换与调用约定：
 - 显式类型转换仅使用紧邻小括号：`TypeExpr(expr)`（包含 `T*`、`ref T`、`var T` 或泛型类型等复杂类型）；不允许 `TypeExpr (expr)`。
@@ -634,7 +528,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
   - `str`/`cstring` -> `""`
   - `T*`/`ref T`/`var T`/`void*` -> `nil`
   - 复合类型（`tuple/object/T[]/T[N]/Table/...` 等）-> 该类型的零值（zero-init）；其中 `T[]/T[N]` 的零值为“空序列”（`len=0 cap=0 buffer=nil`）
-- 字符串类型命名约束：内建字符串类型仅 `str` 与 `cstring`；。
+- 字符串类型命名约束：内建字符串类型仅 `str` 与 `cstring`。
 - 字符串 nil 语义（稳定口径）：
   - `str` 省略初始化默认 `""`。
   - `str = nil`、`let/var x: str = nil`、`x == nil`、`x != nil` 在编译阶段直接报错。
@@ -653,18 +547,18 @@ charLiteral    ::= `'` CHARACTER `'` ;
 ### 1.2.2 破坏性语法升级流程（工程约束，非语义）
 
 - 当需要移除/替换源码层语法（例如 `seq[T]` -> `T[]`、`@[...]` -> `[...]`、引入列表生成式等）时，推荐按以下最小流程落地，避免自举/文档/门禁漂移：
-  1. 规范与文档先行：先更新本规范与相关设计文档（如 `docs/container-refactor.md`、`docs/list-comprehension.md`），并同步 `docs/cheng-skill/` 与 `$HOME/.codex/skills/cheng语言/`；跑 `$TOOLING verify_cheng_skill_consistency`。
+  1. 规范与文档先行：先更新本规范与相关设计文档（如 `docs/list-comprehension.md`），并同步 `docs/cheng-skill/` 与 `$HOME/.codex/skills/cheng语言/`；跑 `$TOOLING verify_cheng_skill_consistency`。
   2. 实现新语法：parser 支持 + type/expr lowering 到内部 canonical；尽量保持后端/标准库的稳定面，必要时加 parse recovery。
   3. 禁用旧语法：旧写法一律硬错误并给迁移提示；旧语法只允许作为内部 lowering 目标存在。
-  4. 自举兼容：生产链路不再支持 stage0 overlay；若 seed stage0 不支持新语法，需刷新 stage0/seed，并保证 `backend.stage0_no_compat` 门禁通过。
-  5. 回归与 seed 更新：补最小正/反例 tests；跑 `sh verify.sh` 或相关 gate；需要刷新 seed 时用 `$TOOLING bootstrap-pure` 并设置 `BOOTSTRAP_UPDATE_SEED=1`。
+  4. 自举兼容：生产链路不再支持 stage0 overlay；若 seed stage0 不支持新语法，需刷新 stage0/seed，并保证 `backend.stage0_no_compat` 门禁通过。该 gate 默认使用 `src/backend/tooling/backend_driver.cheng` 作为 `stage1_input`（真实编译器源码口径）以尽早暴露语法不兼容；`build-backend-driver` 默认启用 stage0 capability preflight（比较 stage0 `.cap` 签名与当前 parser/UIR/driver 源签名），不匹配会 fail-fast 并提示先刷新 seed/driver。
+  5. 回归与 seed 更新：补最小正/反例 tests；跑 `$TOOLING verify_backend_closedloop` 或相关 gate；需要刷新 seed 时用 `$TOOLING bootstrap-pure` 并设置 `BOOTSTRAP_UPDATE_SEED=1`。
 
 ### 1.3 运算符优先级
 
 | 优先级 | 运算符/结构 | 说明 |
 |--------|-------------|------|
 | 120 | `.` `->` | 成员访问 |
-| 110 | `()` `[]` `?` | 调用、下标/切片、Result 解包 |
+| 110 | `()` `[]` postfix `?` | 调用、下标/切片、Result 解包 |
 | 100 | 单目 `+ - * & ! ~ $ ^ await` | 前缀运算 |
 | 90  | `* / %` | 乘除取模 |
 | 80  | `+ -` | 加减 / 字符串拼接 |
@@ -711,6 +605,13 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 标准容器（含 `hashmap/json/Table` 等）的 `[]/[]=` 也遵循同一静态分发规则。
 - 若候选不唯一或不存在可用重载，必须在编译期报错（不得回退为运行时动态判别）。
 
+#### 1.3.4 条件表达式 `?:` 与 postfix `?` 区分
+
+- Cheng 支持三目条件表达式：`cond ? thenExpr : elseExpr`。
+- `?:` 为右结合，语义遵循 `conditionalExpr ::= logicalOr [ "?" expression ":" conditionalExpr ]`。
+- postfix `expr?` 表示 Result/Option 风格解包语义（失败分支提前返回/传播）；它与三目 `?:` 是两套独立语义。
+- 推荐实践：当表达式中同时出现两类 `?`（例如 `x? ? a : b`）时，使用括号显式分组以避免可读性歧义。
+
 ### 1.4 模块导出与可见性
 
 - Cheng 采用 Go 风格的“首字母大写导出”规则：标识符首字符为 ASCII 大写字母的符号视为导出。
@@ -743,37 +644,46 @@ charLiteral    ::= `'` CHARACTER `'` ;
 
 ## 附录 A 自研后端与 UIR 摘要
 
-本附录记录自研后端落地的实现约束与 UIR 摘要；完整任务清单与文件结构见 `docs/cheng-build-any-platform.md`。
+本附录记录自研后端落地的实现约束与 UIR 摘要；完整实现细节见 `src/tooling/README.md`，总体路线见 `docs/cheng-plan-full.md`。
 
 - 后端定位：保持语言语义不变，编译器内部统一使用 UIR：生产主路径为 `Stage1 -> UIR -> Machine -> Obj/Exe`（`BACKEND_IR=uir`）；不再存在独立 MIR/LIR 生产链路。
 - UIR 生产默认：`BACKEND_OPT_LEVEL` 未设置时默认 `2`；`UIR_SIMD` 未设置时在 `optLevel>=3` 自动开启。
 - 兼容开关策略：`MIR_PROFILE`、`BACKEND_SSA`、旧单态化跳过开关已移除；设置后编译器直接报错。
 - IR 语义显式化：整数运算与移位使用 `sdiv/udiv`、`smod/umod`、`lshr/ashr` 等显式操作，避免 C 语义歧义。
-- 产物策略：生产默认 `emit=exe`（self/system linker 双轨）；`.o/.obj` 仅保留 internal gate（需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`）。
-- Dev 运行策略：`chengc --run` 默认进入 host runner（`--run:host`）；`--run:file` 为兼容执行路径。
-- Dev 编译策略：`chengc` 默认 `BACKEND_INCREMENTAL=1`；dev 轨默认并行（`CHENGC_DEV_MULTI_DEFAULT=1`）、release 轨默认串行（`CHENGC_RELEASE_MULTI_DEFAULT=0`）；`BACKEND_MULTI_MODULE_CACHE` 默认关闭（`0`），stable driver 当前对其做安全降级（`CHENGC_ALLOW_UNSTABLE_MULTI_MODULE_CACHE=1` + `BACKEND_MODULE_CACHE_UNSTABLE_ALLOW=1` 仅用于显式排障请求）；为避免 `multi+module-cache` 运行时崩溃，stable driver 当前硬禁用 module-cache load 路径。
+- 产物策略：生产默认 `emit=exe`（self/system linker 双轨）；公开可选 `emit=c`（`cheng/release-compile --emit:c`）；非 release 可执行构建禁止 `emit=obj`，`.o/.obj` 仅保留内部 `allow-no-main` 工件生成通道（需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`）。
+- Dev 运行策略：`cheng --run` 默认进入 host runner（`--run:host`）；`--run:file` 为兼容执行路径。
+- Dev 编译策略：`cheng` 固定为 canonical dev 轨入口（`compile/chengc` 已移除并返回 `rc=2`；默认 `BACKEND_INCREMENTAL=1`、`CHENGC_DEV_MULTI_DEFAULT=1`）；`BACKEND_MULTI_MODULE_CACHE` 默认关闭（`0`），stable driver 当前固定禁用 module-cache load 路径（不作为生产配置面）。release 轨改用显式入口 `release-compile`（默认串行口径 `CHENGC_RELEASE_MULTI_DEFAULT=0`）。
+- linker 参数收口：`cheng` 与 `release-compile` 均不接受 `--linker:*`，也不接受 `BACKEND_LINKER` 环境覆盖；dev 轨固定 `self-link + direct-exe`，release 轨固定 `system-link`。
+- `emit=c` 语义：覆盖边界外必须硬失败并输出 `emit-c not-mapped`；禁止自动回退到 `emit=exe`。`--emit:c` 下禁止 `--run/--run:*`（命令配置错误，`rc=2`）。
 - Dev 快速自举管线（host-only）：
-  - 前端解析模式：`BACKEND_STAGE1_PARSE_MODE=outline|full`（dev 默认 `outline`，release 默认 `full`）。
-  - 函数任务调度：`BACKEND_FN_SCHED=ws|serial` + `BACKEND_FN_JOBS`（dev 默认 `ws`，release 默认 `serial`）。
+  - 前端解析模式：`cheng`/`selfhost` dev 入口固定 `BACKEND_STAGE1_PARSE_MODE=outline`（不再接受外部覆盖）；`release-compile` 固定 `full`。
+  - 函数任务调度：`cheng`/`selfhost` dev 入口固定 `BACKEND_FN_SCHED=ws`（不再接受外部覆盖）；`release-compile` 固定 `serial`。
   - 直写可执行：`BACKEND_DIRECT_EXE=1` 在 host darwin/arm64 + self-link 口径走 `macho_direct_exe_writer`；默认失败阻断（`BACKEND_FAST_FALLBACK_ALLOW=0`）。
-- 可选常驻编译 worker：`CHENGC_DAEMON=1` 时，`chengc` 请求经 `chengc_daemon` 本地队列执行（`start/status/stop`），用于降低频繁冷启动开销。
+- 可选常驻编译 worker：`CHENGC_DAEMON=1` 时，`cheng` 请求经 `chengc_daemon` 本地队列执行（`start/status/stop`），用于降低频繁冷启动开销。
 - Dev 热补丁策略：`BACKEND_HOTPATCH_MODE=trampoline` + append-only code pool；`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program` 且 `BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
 - 当前实现：UIR internal 采用表达式树 + `ret/br/cbr` 终结指令，machine internal 覆盖 AArch64 基本算术/比较/分支/栈操作；`mod` 以 `sdiv+msub` 降级。
 - SIMD 能力说明：当前闭环未要求向量化；SSA 与 SIMD 并非替代关系。SSA 负责值语义化优化（当前最小闭环主侧），SIMD 是向量化优化能力，需要在后续 UIR 阶段增加向量类型、并行化合法性分析与后端寄存器映射后分阶段接入。
 - 验证入口迁移：`verify_*` 已并入 `cheng_tooling` 原生子命令；统一执行口径为 `$TOOLING <verify_id>`，历史 shell 包装入口不计入规范主口径。
 - tooling 可执行落点：命令名 `cheng_tooling` 对应 canonical 二进制 `artifacts/tooling_cmd/cheng_tooling`（未配置 PATH 时请直接使用该路径）。
-- 入口迁移（非 verify）：tooling 主链路已迁移为 `cheng_tooling` 内嵌脚本表（`src/tooling/cheng_tooling_embedded_inline.cheng`）并统一通过原生子命令分发；仓外 `closedloop/mdns/web-cli` 历史 shell 入口已收敛为 `cheng_tooling` 子命令链路。
+- 入口迁移（非 verify）：tooling 主链路已迁移为 `cheng_tooling` 原生子命令分发；embedded 文本仅保留兼容回退面（运行时使用临时脚本文件，不保留 `.embedded.sh` 常驻缓存）。
 - 验证入口：`$TOOLING verify_backend_float` 负责生成并执行最小闭环样例（`emit=exe` 口径）。
 - 跨平台矩阵（可验收）：`$TOOLING verify_backend_targets_matrix` 覆盖 darwin/ios(Mach‑O `.o`) + android/linux(ELF `.o`) + windows(COFF `.obj`)。
-- 全语义回归入口：`$TOOLING verify_backend_closedloop` 会使用后端 driver（默认 `artifacts/backend_driver/cheng`；可用 `BACKEND_DRIVER=<path>` 显式指定，未命中可运行 driver 直接失败）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求运行返回码为 `0`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；跨目标 `self_linker(ELF/COFF)` 与 `linker_abi_core` 门禁默认强制阻断，默认固定 stable driver 口径且不再自动回退 seed/selfhost/release 候选，已移除 prebuilt-obj/link-only 降级路径，不允许 skip 与 compile-only 回退）。
-- 除平台生产闭环入口：`$TOOLING backend_prod_closure`（默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression`、release manifest+bundle+sign/verify（OpenSSL/Ed25519；若环境不支持 Ed25519 则自动降级 RSA‑SHA256，`sign/verify` 在发布链路默认 required）与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级；manifest/bundle 默认记录并打包 stage2 driver（如存在），并可附带全链产物）。
-- 零脚本生产闭环：`backend_prod_closure` 默认要求 `TOOLING_EXEC_BUNDLE_PROFILE=full` + `TOOLING_EXEC_REQUIRE_BUNDLE=1` + `TOOLING_EXEC_BUNDLE_CORE_AUTO_BUILD=0`，并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`；`cheng/chengc` 核心入口必须走 `cheng_tooling` 原生命令路由，不允许 `$TOOLING chengc` 回落 embedded shell payload。
+- 全语义回归入口：`$TOOLING verify_backend_closedloop` 固定使用 canonical backend driver（`$TOOLING driver-path --path-only`，默认 `artifacts/backend_driver/cheng`）编译并运行 `examples/backend_closedloop_fullspec.cheng`，要求运行返回码为 `0`（默认并固定 `MM=orc`；ORC/Ownership 专项回归见 `examples/test_orc_closedloop.cheng`；跨目标 `self_linker(ELF/COFF)` 与 `linker_abi_core` 门禁默认强制阻断，默认固定 stable driver 口径且不再自动回退 seed/selfhost/release 候选，已移除 prebuilt-obj/link-only 降级路径，不允许 skip 与 compile-only 回退）。
+- 除平台生产闭环入口：`$TOOLING backend_prod_closure`（dev-only，默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression` 与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级）。
+- 零脚本生产闭环：`backend_prod_closure` 与 `backend-prod-publish` 默认固定 canonical tooling 路径 `artifacts/tooling_cmd/cheng_tooling`（`BACKEND_PROD_ALLOW_NONCANONICAL_TOOL_BIN=0`）；并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`；`cheng` 核心入口必须走 `cheng_tooling` 原生命令路由（`compile/chengc` 已移除并返回 `rc=2`）。
+- required 运行稳定性门禁（native）：`backend_prod_closure` required 链路包含 `backend.symbol_closure`（`verify_backend_symbol_closure`，固定 `return_add/return_new_ref_seq_growth` 可编译可运行并阻断 `_alloc/_c_strlen/_zeroMem` 缺失）与 `backend.release_compile_stability`（`verify_backend_release_compile_stability`，固定 `return_new_ref_seq_growth` 的 release-compile 默认 3 次稳定性，出现 `rc=139` 直接失败）。
+- required emit-c 门禁（native）：`backend_prod_closure` required 链路包含 `backend.emit_c_surface`（CLI surface）、`backend.emit_c_ffi_shadow`（slice/outptr/handle/borrow 影子桥接闭环）与 `backend.emit_c_hard_fail`（未覆盖语义必须 `emit-c not-mapped`）。
+- required 零脚本残留门禁（native）：`backend_prod_closure` required 链路包含 `backend.zero_script_residual`（`verify_backend_zero_script_residual`），强制断言 `src/tooling` 下 shell 文件残留为 0、required 闭环函数不含 compile-only/skip 语义、并阻断 tooling/backend 执行路径上的 legacy `CHENG_*` 环境变量读取。
+- RawPtr + SoA required gate（native）：`backend_prod_closure` required 链路包含 `backend.rawptr_surface_forbid`（`verify_backend_rawptr_surface_forbid`，含 `std/cmdline` 无裸指针 surface 断言）、`backend.uir_soa_surface`（`verify_backend_uir_soa_surface`，SoA/index surface + runtime 合约；要求 runtime 日志包含 `soa_report` 且 `balance_ok=1`，并对双次 runtime probe 执行 determinism 一致性断言）与 `backend.uir_soa_self_probe`（`verify_backend_uir_soa_self_probe`，固定 `self-link` 子探针强制阻断）。
+- 编译入口并发收口：`cheng` 默认移除 stage0 全局锁包装，固定为 `stage0 quarantine + preflight + timeout` 语义，不再通过 compile-path lock 串行化并发任务。
 - driver 自举 smoke 口径：`backend.driver_selfbuild_smoke` 为可选 gate（默认关闭，需显式 `--driver-selfbuild-smoke` 或 `BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=1` 开启）；默认输出路径与主 driver 统一为 `artifacts/backend_driver/cheng`。启用后强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0` 与 `DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，防止语义降级。
-- driver 解析口径：`backend_driver_path` 默认使用稳定 driver `artifacts/backend_driver/cheng`，并带 stage0 编译探针；首选不健康时直接阻断（仅允许显式 `--stage0` 覆盖）。
+- native-contract autosystem 口径：当 `BACKEND_NATIVE_CONTRACT=1` 时，stage1 前端必须强制关闭自动 `std/system` 导入（`stage1_autoSystemEnabled()` 返回 `false`），不得依赖 gate 脚本额外注入 `STAGE1_AUTO_SYSTEM=0`。
+- native-contract required gates：`backend.native_contract` + `backend.native_contract_autosystem`（`verify_backend_native_contract_autosystem`）需同时通过，前者验证契约与 hard-fail 语义，后者验证 `STAGE1_AUTO_SYSTEM` 的 unset/forced-on 两种情形编译稳定。
+- driver 解析口径：`backend_driver_path` 默认使用稳定 driver `artifacts/backend_driver/cheng`，并带 stage0 编译探针；首选不健康时直接阻断（不再允许 `--stage0` 覆盖）。
 - 全链自举门禁：`$TOOLING verify_fullchain_bootstrap`（stage2→tools；obj-only fullspec internal gate + 工具 `--help` smoke；失败即阻断）。
 - 专用机 100ms 自举门禁：`$TOOLING verify_backend_selfhost_100ms_host`（基线文件 `src/tooling/selfhost_perf_100ms_host.env`）；`backend_prod_closure` 在 `BACKEND_RUN_SELFHOST_100MS=1` 时拆成 quick/report + full/blocking 双轨：quick 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=0`，full 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=1` + `SELFHOST_STAGE1_REQUIRE_REBUILD=1`，并支持 `BACKEND_BUILD_DRIVER_PROFILE_OUT` 导出重编画像；非目标主机默认报告不阻断。
 - 热补丁运行态门禁：`$TOOLING verify_backend_hotpatch` 与 `$TOOLING verify_backend_hotpatch_meta` 固定 `self-link` 口径并执行可运行探针，不接受 system-link 回退；required 口径下禁用 runnable 重试回退（`BACKEND_HOTPATCH_RUNNABLE_RETRIES>1` 直接失败）；unsupported target 直接失败（不再 `skip`）。
-- 本地发布/回滚：`$TOOLING backend_prod_publish`（验收后发布到 `dist/releases`），`$TOOLING backend_release_rollback`（切换 `dist/releases/current` 回滚）。
+- 本地发布/回滚：`$TOOLING backend-prod-publish`（先跑 dev closure，再执行 release required gates 与发布尾链，发布到 `dist/releases`），`$TOOLING backend_release_rollback`（切换 `dist/releases/current` 回滚）。
 - stage0 quarantine 稳定性约束：默认开启“自动清理后短重检”（`TOOLING_STAGE0_QUARANTINE_BLOCK_RECHECKS=2`），用于降低“首轮已清理但仍阻断”的抖动。
 - noalias/egraph/dod runtime probe 稳定性约束：in-memory self-link 口径下默认固定 `UIR_PROFILE=0` + `BACKEND_PROFILE=0`，规避 `driver_profileStep -> fwrite` 崩溃链；probe 验收以报告字段与 source marker 为准。
 - self-link 读对象稳定性约束：`std/bytes.readFileBytes` 采用 `fileSize` 预分配 + 顺序读取并统一 `c_fclose` 关闭路径，以避免 `machoParseObj -> readFileBytes -> fclose` 段错误链路。

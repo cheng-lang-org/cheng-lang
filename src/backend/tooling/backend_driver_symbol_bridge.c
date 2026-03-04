@@ -15,6 +15,7 @@ extern int32_t cheng_file_exists(const char *path);
 extern int64_t cheng_file_mtime(const char *path);
 extern int64_t cheng_file_size(const char *path);
 extern void *cheng_malloc(int32_t size);
+extern void cheng_iometer_call(void *hook, int32_t op, int64_t bytes);
 extern void *cheng_jpeg_decode(void *data, int32_t len, void *out_w, void *out_h);
 extern void cheng_jpeg_free(void *p);
 extern int32_t libc_fflush(void *stream);
@@ -48,6 +49,20 @@ __attribute__((weak)) void *ptr_add(void *p, int32_t offset) {
   return (void *)((char *)p + offset);
 }
 
+__attribute__((weak)) void *rawmemAsVoid(void *p) {
+  return p;
+}
+
+void backend_driver_stage0_setindex_compat(char *s, int32_t idx, int32_t value)
+    __asm__("_[]=");
+__attribute__((weak)) void
+backend_driver_stage0_setindex_compat(char *s, int32_t idx, int32_t value) {
+  if (s == NULL || idx < 0) {
+    return;
+  }
+  s[idx] = (char)value;
+}
+
 __attribute__((weak)) void *driver_memcpy(void *dest, void *src, int64_t n) {
   if (n <= 0) {
     return dest;
@@ -66,6 +81,10 @@ __attribute__((weak)) void *driver_c_alloc(int32_t size) { return cheng_malloc(s
 
 __attribute__((weak)) int32_t driver_file_exists(const char *path) {
   return cheng_file_exists(path);
+}
+
+__attribute__((weak)) void c_iometer_call(void *hook, int32_t op, int64_t bytes) {
+  cheng_iometer_call(hook, op, bytes);
 }
 
 __attribute__((weak)) int64_t driver_file_mtime(const char *path) {
@@ -116,7 +135,68 @@ __attribute__((weak)) int32_t libc_rename(const char *oldpath, const char *newpa
   return rename(oldpath, newpath);
 }
 
+/*
+ * Keep self-link runtime object symbol closure stable when composed from
+ * backend_mm object + bridge objects (without full selflink shim).
+ */
+__attribute__((weak)) uint64_t processOptionMask(int32_t opt) {
+  if (opt < 0 || opt >= 64) return 0ull;
+  return 1ull << (uint32_t)opt;
+}
+
+__attribute__((weak)) char *sliceStr(char *text, int32_t start, int32_t stop) {
+  if (text == NULL) return NULL;
+  int32_t n = (int32_t)strlen(text);
+  if (start < 0) start = 0;
+  if (stop < start) stop = start;
+  if (start > n) start = n;
+  if (stop > n) stop = n;
+  int32_t m = stop - start;
+  char *out = (char *)malloc((size_t)m + 1u);
+  if (out == NULL) return NULL;
+  if (m > 0) memcpy(out, text + start, (size_t)m);
+  out[m] = '\0';
+  return out;
+}
+
+__attribute__((weak)) int64_t libc_write(int32_t fd, void *data, int64_t n) {
+  if (fd < 0 || data == NULL || n <= 0) return 0;
+  ssize_t wrote = write(fd, data, (size_t)n);
+  if (wrote < 0) return -1;
+  return (int64_t)wrote;
+}
+
 __attribute__((weak)) int32_t c_fflush(void *stream) { return libc_fflush(stream); }
+
+/*
+ * Stable raw byte writer for backend_driver object emission. This bypasses
+ * stage0/stage2 variations in std/os write helpers and writes through libc.
+ * Returns 1 on success, 0 on failure.
+ */
+__attribute__((weak)) int32_t backend_driver_write_file_bytes(const char *path,
+                                                              const void *data,
+                                                              int64_t len) {
+  if (path == NULL || path[0] == '\0' || len < 0) {
+    return 0;
+  }
+  FILE *f = fopen(path, "wb");
+  if (f == NULL) {
+    return 0;
+  }
+  if (data != NULL && len > 0) {
+    size_t want = (size_t)len;
+    size_t wrote = fwrite(data, 1u, want, f);
+    if (wrote != want) {
+      fclose(f);
+      return 0;
+    }
+  }
+  fflush(f);
+  if (fclose(f) != 0) {
+    return 0;
+  }
+  return 1;
+}
 
 __attribute__((weak)) char *lower_c_getenv(const char *name) { return getenv(name); }
 

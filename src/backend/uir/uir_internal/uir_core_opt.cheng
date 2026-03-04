@@ -1,26 +1,8 @@
 # MIR v1 optimizer (MVP): expression-level constant folding.
 import backend/uir/uir_internal/uir_core_types
 
-fn uirCoreOptWriteExpr(seqInst: UirCoreExpr[]*, idx: int32, val: UirCoreExpr) =
-    if seqInst == nil:
-        panic "uirCore_opt: nil seq pointer"
-    if idx < 0 || idx >= seqInst->len:
-        panic "uirCore_opt: seq index out of bounds"
-    seqInst[idx] = val
-
-fn uirCoreOptWriteStmt(seqInst: UirCoreStmt[]*, idx: int32, val: UirCoreStmt) =
-    if seqInst == nil:
-        panic "uirCore_opt: nil seq pointer"
-    if idx < 0 || idx >= seqInst->len:
-        panic "uirCore_opt: seq index out of bounds"
-    seqInst[idx] = val
-
-fn uirCoreOptWriteBlock(seqInst: UirCoreBlock[]*, idx: int32, val: UirCoreBlock) =
-    if seqInst == nil:
-        panic "uirCore_opt: nil seq pointer"
-    if idx < 0 || idx >= seqInst->len:
-        panic "uirCore_opt: seq index out of bounds"
-    seqInst[idx] = val
+fn uirCoreOptRecursionLimit(): int32 =
+    return 256
 
 fn uirCoreOptMaxType(a: UirCoreType, b: UirCoreType): UirCoreType =
     if a.kind == mtF64 || b.kind == mtF64:
@@ -38,39 +20,65 @@ fn uirCoreOptMaxType(a: UirCoreType, b: UirCoreType): UirCoreType =
     out2.isUnsigned = a.isUnsigned || b.isUnsigned
     return out2
 
-fn uirCoreOptExprType(module: UirCoreModule, func: UirCoreFunc, expr: UirCoreExpr, fallback: UirCoreType): UirCoreType =
-    if expr == nil:
+fn uirCoreOptExprTypeInner(module: UirCoreModule,
+                           func: UirCoreFunc,
+                           expr: UirExprId,
+                           fallback: UirCoreType,
+                           depth: int32*): UirCoreType =
+    if (!uirCoreExprIdValid(expr)) || (depth == nil):
         return fallback
-    if expr.kind == meLocal:
-        if func != nil && expr.localIndex >= 0 && expr.localIndex < func.localTypes.len:
-            return func.localTypes[expr.localIndex]
+    if *depth >= uirCoreOptRecursionLimit():
         return fallback
-    if expr.kind == meCall:
-        if module != nil && len(expr.callee) > 0:
-            for i in 0..<module.funcs.len:
-                let f: UirCoreFunc = module.funcs[i]
-                if f != nil && (f.name == expr.callee):
-                    return f.retType
-        return fallback
-    if expr.kind == meBin:
-        if expr.binOp == mbShl || expr.binOp == mbShr:
-            return uirCoreOptExprType(module, func, expr.lhs, fallback)
-        let lt: UirCoreType = uirCoreOptExprType(module, func, expr.lhs, fallback)
-        let rt: UirCoreType = uirCoreOptExprType(module, func, expr.rhs, fallback)
-        return uirCoreOptMaxType(lt, rt)
-    if expr.kind == meCmp:
-        return uirCoreTypeI32()
-    if expr.kind == meCast:
-        return expr.castType
-    if expr.kind == meAddr:
-        return uirCoreTypeI64()
-    if expr.kind == meLoad:
-        if expr.loadType.kind == mtVoid:
-            return fallback
-        return expr.loadType
-    if expr.kind == meGlobalAddr:
-        return uirCoreTypeI64()
-    return fallback
+    *depth = *depth + 1
+    var out: UirCoreType = fallback
+    let kind: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if kind == meLocal:
+        let localIndex: int32 = uirCoreExprLocalIndexOf(expr)
+        if uirCoreFuncIdValid(func) && localIndex >= 0 && localIndex < uirCoreFuncLocalTypesLen(func):
+            out = uirCoreFuncLocalTypeAt(func, localIndex)
+        else:
+            out = fallback
+    elif kind == meCall:
+        let callee: str = uirCoreExprCalleeOf(expr)
+        if !(module == nil) && len(callee) > 0:
+            let funcCount: int32 = uirCoreModuleFuncsLen(module)
+            for i in 0..<funcCount:
+                let f: UirCoreFunc = uirCoreModuleFuncAt(module, i)
+                if !(f == nil) && (uirCoreFuncNameOf(f) == callee):
+                    out = uirCoreFuncRetTypeOf(f)
+                    break
+        else:
+            out = fallback
+    elif kind == meBin:
+        let binOp: UirCoreBinOp = uirCoreExprBinOpOf(expr)
+        if binOp == mbShl || binOp == mbShr:
+            out = uirCoreOptExprTypeInner(module, func, uirCoreExprLhsOf(expr), fallback, depth)
+        else:
+            let lt: UirCoreType = uirCoreOptExprTypeInner(module, func, uirCoreExprLhsOf(expr), fallback, depth)
+            let rt: UirCoreType = uirCoreOptExprTypeInner(module, func, uirCoreExprRhsOf(expr), fallback, depth)
+            out = uirCoreOptMaxType(lt, rt)
+    elif kind == meCmp:
+        out = uirCoreTypeI32()
+    elif kind == meCast:
+        out = uirCoreExprCastTypeOf(expr)
+    elif kind == meAddr:
+        out = uirCoreTypeI64()
+    elif kind == meLoad:
+        let loadTy: UirCoreType = uirCoreExprLoadTypeOf(expr)
+        if loadTy.kind == mtVoid:
+            out = fallback
+        else:
+            out = loadTy
+    elif kind == meGlobalAddr:
+        out = uirCoreTypeI64()
+    else:
+        out = fallback
+    *depth = *depth - 1
+    return out
+
+fn uirCoreOptExprType(module: UirCoreModule, func: UirCoreFunc, expr: UirExprId, fallback: UirCoreType): UirCoreType =
+    var depth: int32 = 0
+    return uirCoreOptExprTypeInner(module, func, expr, fallback, &depth)
 
 fn uirCoreOptWidth(ty: UirCoreType): int32 =
     if ty.kind == mtF32:
@@ -116,7 +124,7 @@ fn uirCoreOptArithShr(v: uint64, sh: int32, ty: UirCoreType): uint64 =
     return uirCoreOptNorm(shifted | fill, ty)
 
 fn uirCoreOptFoldBin(op: UirCoreBinOp, a0: int64, b0: int64, ty: UirCoreType, ok: bool*): int64 =
-    if ok != nil:
+    if !(ok == nil):
         *ok = false
     let a: uint64 = uirCoreOptNorm(uint64(a0), ty)
     let b: uint64 = uirCoreOptNorm(uint64(b0), ty)
@@ -138,7 +146,7 @@ fn uirCoreOptFoldBin(op: UirCoreBinOp, a0: int64, b0: int64, ty: UirCoreType, ok
         let w: int32 = uirCoreOptWidth(ty)
         let sh: int32 = int32(b % uint64(w))
         out = uirCoreOptNorm(a << sh, ty)
-        if ok != nil:
+        if !(ok == nil):
             *ok = true
         return int64(out)
     of mbShr:
@@ -148,13 +156,13 @@ fn uirCoreOptFoldBin(op: UirCoreBinOp, a0: int64, b0: int64, ty: UirCoreType, ok
             out = uirCoreOptNorm(a >> sh2, ty)
         else:
             out = uirCoreOptArithShr(a, sh2, ty)
-        if ok != nil:
+        if !(ok == nil):
             *ok = true
         return int64(out)
     else:
         return 0
     out = uirCoreOptNorm(out, ty)
-    if ok != nil:
+    if !(ok == nil):
         *ok = true
     return int64(out)
 
@@ -215,95 +223,139 @@ fn uirCoreOptCastHasFloat(srcType: UirCoreType, dstType: UirCoreType): bool =
 fn uirCoreOptTypeEq(a: UirCoreType, b: UirCoreType): bool =
     return a.kind == b.kind && a.isUnsigned == b.isUnsigned
 
-fn uirCoreOptExpr(module: UirCoreModule, func: UirCoreFunc, expr: UirCoreExpr, fallback: UirCoreType): UirCoreExpr =
-    if expr == nil:
-        return nil
-    if expr.kind == meConstI64 || expr.kind == meLocal || expr.kind == meAddr || expr.kind == meGlobalAddr:
+fn uirCoreOptExprInner(module: UirCoreModule,
+                       func: UirCoreFunc,
+                       expr: UirExprId,
+                       fallback: UirCoreType,
+                       depth: int32*): UirExprId =
+    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+        return uirCoreInvalidId()
+    if *depth >= uirCoreOptRecursionLimit():
         return expr
-    if expr.kind == meLoad:
-        expr.addrExpr = uirCoreOptExpr(module, func, expr.addrExpr, uirCoreTypeI64())
-        return expr
-    if expr.kind == meCall:
-        for i in 0..<expr.args.len:
-            let a: UirCoreExpr = expr.args[i]
+    *depth = *depth + 1
+    var out: UirExprId = expr
+    let kind: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if kind == meConstI64 || kind == meLocal || kind == meAddr || kind == meGlobalAddr:
+        out = expr
+    elif kind == meLoad:
+        let addrExpr: UirExprId = uirCoreExprAddrExprOf(expr)
+        uirCoreExprSetAddrExpr(expr, uirCoreOptExprInner(module, func, addrExpr, uirCoreTypeI64(), depth))
+        out = expr
+    elif kind == meCall:
+        for i in 0..<uirCoreExprArgsLen(expr):
+            let a: UirExprId = uirCoreExprArgAt(expr, i)
             let at: UirCoreType = uirCoreOptExprType(module, func, a, fallback)
-            uirCoreOptWriteExpr(&expr.args, i, uirCoreOptExpr(module, func, a, at))
-        return expr
-    if expr.kind == meCast:
-        let srcType: UirCoreType = uirCoreOptExprType(module, func, expr.castExpr, fallback)
-        expr.castExpr = uirCoreOptExpr(module, func, expr.castExpr, srcType)
-        if uirCoreOptTypeEq(srcType, expr.castType):
-            return expr.castExpr
-        let inner: UirCoreExpr = expr.castExpr
-        if inner != nil && inner.kind == meConstI64:
+            uirCoreExprSetArgAt(expr, i, uirCoreOptExprInner(module, func, a, at, depth))
+        out = expr
+    elif kind == meCast:
+        let castExpr: UirExprId = uirCoreExprCastExprOf(expr)
+        let castType: UirCoreType = uirCoreExprCastTypeOf(expr)
+        let srcType: UirCoreType = uirCoreOptExprType(module, func, castExpr, fallback)
+        uirCoreExprSetCastExpr(expr, uirCoreOptExprInner(module, func, castExpr, srcType, depth))
+        let inner: UirExprId = uirCoreExprCastExprOf(expr)
+        if uirCoreOptTypeEq(srcType, castType):
+            out = inner
+        elif uirCoreExprIdValid(inner) && uirCoreExprKindOf(inner) == meConstI64:
             # Numeric float casts in Cheng are lowered via runtime helpers in MIR builder.
             # Folding them as bit-width trunc/extend is semantically wrong, so keep the cast.
-            if uirCoreOptCastHasFloat(srcType, expr.castType):
-                return expr
-            let v2: int64 = uirCoreOptFoldCast(srcType, expr.castType, inner.value)
-            return uirCoreConstI64(v2)
-        return expr
-    if expr.kind == meBin:
+            if uirCoreOptCastHasFloat(srcType, castType):
+                out = expr
+            else:
+                let v2: int64 = uirCoreOptFoldCast(srcType, castType, uirCoreExprConstValueOf(inner))
+                out = uirCoreConstI64(v2)
+        else:
+            out = expr
+    elif kind == meBin:
         let exprType: UirCoreType = uirCoreOptExprType(module, func, expr, fallback)
-        expr.lhs = uirCoreOptExpr(module, func, expr.lhs, exprType)
-        expr.rhs = uirCoreOptExpr(module, func, expr.rhs, exprType)
-        let lhs0: UirCoreExpr = expr.lhs
-        let rhs0: UirCoreExpr = expr.rhs
-        if lhs0 != nil && rhs0 != nil && lhs0.kind == meConstI64 && rhs0.kind == meConstI64:
+        uirCoreExprSetLhs(expr, uirCoreOptExprInner(module, func, uirCoreExprLhsOf(expr), exprType, depth))
+        uirCoreExprSetRhs(expr, uirCoreOptExprInner(module, func, uirCoreExprRhsOf(expr), exprType, depth))
+        let lhs0: UirExprId = uirCoreExprLhsOf(expr)
+        let rhs0: UirExprId = uirCoreExprRhsOf(expr)
+        if uirCoreExprIdValid(lhs0) && uirCoreExprIdValid(rhs0) &&
+           uirCoreExprKindOf(lhs0) == meConstI64 && uirCoreExprKindOf(rhs0) == meConstI64:
             var ok: bool = false
-            let v3: int64 = uirCoreOptFoldBin(expr.binOp, lhs0.value, rhs0.value, exprType, &ok)
+            let v3: int64 = uirCoreOptFoldBin(uirCoreExprBinOpOf(expr), uirCoreExprConstValueOf(lhs0),
+                                              uirCoreExprConstValueOf(rhs0), exprType, &ok)
             if ok:
-                return uirCoreConstI64(v3)
-        return expr
-    if expr.kind == meCmp:
-        let lt: UirCoreType = uirCoreOptExprType(module, func, expr.lhs, fallback)
-        let rt: UirCoreType = uirCoreOptExprType(module, func, expr.rhs, fallback)
+                out = uirCoreConstI64(v3)
+            else:
+                out = expr
+        else:
+            out = expr
+    elif kind == meCmp:
+        let lhsExpr: UirExprId = uirCoreExprLhsOf(expr)
+        let rhsExpr: UirExprId = uirCoreExprRhsOf(expr)
+        let lt: UirCoreType = uirCoreOptExprType(module, func, lhsExpr, fallback)
+        let rt: UirCoreType = uirCoreOptExprType(module, func, rhsExpr, fallback)
         let cmpTy: UirCoreType = uirCoreOptMaxType(lt, rt)
-        expr.lhs = uirCoreOptExpr(module, func, expr.lhs, cmpTy)
-        expr.rhs = uirCoreOptExpr(module, func, expr.rhs, cmpTy)
-        let lhs1: UirCoreExpr = expr.lhs
-        let rhs1: UirCoreExpr = expr.rhs
-        if lhs1 != nil && rhs1 != nil && lhs1.kind == meConstI64 && rhs1.kind == meConstI64:
-            return uirCoreConstI64(uirCoreOptFoldCmp(expr.cmpOp, lhs1.value, rhs1.value, cmpTy))
-        return expr
-    return expr
+        uirCoreExprSetLhs(expr, uirCoreOptExprInner(module, func, lhsExpr, cmpTy, depth))
+        uirCoreExprSetRhs(expr, uirCoreOptExprInner(module, func, rhsExpr, cmpTy, depth))
+        let lhs1: UirExprId = uirCoreExprLhsOf(expr)
+        let rhs1: UirExprId = uirCoreExprRhsOf(expr)
+        if uirCoreExprIdValid(lhs1) && uirCoreExprIdValid(rhs1) &&
+           uirCoreExprKindOf(lhs1) == meConstI64 && uirCoreExprKindOf(rhs1) == meConstI64:
+            out = uirCoreConstI64(uirCoreOptFoldCmp(uirCoreExprCmpOpOf(expr), uirCoreExprConstValueOf(lhs1),
+                                                    uirCoreExprConstValueOf(rhs1), cmpTy))
+        else:
+            out = expr
+    else:
+        out = expr
+    *depth = *depth - 1
+    return out
+
+fn uirCoreOptExpr(module: UirCoreModule, func: UirCoreFunc, expr: UirExprId, fallback: UirCoreType): UirExprId =
+    var depth: int32 = 0
+    return uirCoreOptExprInner(module, func, expr, fallback, &depth)
 
 fn uirCoreOptimizeFunc(module: UirCoreModule, func: UirCoreFunc): bool =
-    if module == nil || func == nil || func.isExtern:
+    if (module == nil) || (!uirCoreFuncIdValid(func)) || uirCoreFuncIsExtern(func):
         return false
-    let fallback: UirCoreType = func.retType
-    for bi in 0..<func.blocks.len:
-        let b: UirCoreBlock = func.blocks[bi]
-        if b != nil:
-            for si in 0..<b.stmts.len:
-                let s: UirCoreStmt = b.stmts[si]
-                if s.kind == msLet || s.kind == msVar || s.kind == msAssign:
+    let fallback: UirCoreType = uirCoreFuncRetTypeOf(func)
+    let blockCount: int32 = uirCoreFuncBlocksLen(func)
+    for bi in 0..<blockCount:
+        let b: UirBlockId = uirCoreFuncBlockAt(func, bi)
+        if uirCoreBlockIdValid(b):
+            let stmtCount: int32 = uirCoreBlockStmtsLen(b)
+            for si in 0..<stmtCount:
+                var s: UirStmtId = uirCoreBlockStmtAt(b, si)
+                let stmtKind: UirCoreStmtKind = uirCoreStmtKindOf(s)
+                if stmtKind == msLet || stmtKind == msVar || stmtKind == msAssign:
                     var slotTy: UirCoreType = fallback
-                    if s.slot >= 0 && s.slot < func.localTypes.len:
-                        slotTy = func.localTypes[s.slot]
-                    s.expr = uirCoreOptExpr(module, func, s.expr, slotTy)
-                    uirCoreOptWriteStmt(&b.stmts, si, s)
-                elif s.kind == msStore:
-                    s.addrExpr = uirCoreOptExpr(module, func, s.addrExpr, uirCoreTypeI64())
-                    s.expr = uirCoreOptExpr(module, func, s.expr, s.storeType)
-                    uirCoreOptWriteStmt(&b.stmts, si, s)
+                    let slot: int32 = uirCoreStmtSlotOf(s)
+                    if slot >= 0 && slot < uirCoreFuncLocalTypesLen(func):
+                        slotTy = uirCoreFuncLocalTypeAt(func, slot)
+                    s = uirCoreStmtWithExpr(s, uirCoreOptExpr(module, func, uirCoreStmtExprOf(s), slotTy))
+                    uirCoreBlockSetStmtAt(b, si, s)
+                elif stmtKind == msStore:
+                    s = uirCoreStmtWithAddrExpr(s, uirCoreOptExpr(module, func, uirCoreStmtAddrExprOf(s), uirCoreTypeI64()))
+                    s = uirCoreStmtWithExpr(s, uirCoreOptExpr(module, func, uirCoreStmtExprOf(s), uirCoreStmtStoreTypeOf(s)))
+                    uirCoreBlockSetStmtAt(b, si, s)
                 else:
-                    s.expr = uirCoreOptExpr(module, func, s.expr, fallback)
-                    uirCoreOptWriteStmt(&b.stmts, si, s)
-            if b.term.kind == mtRet && b.term.retExpr != nil:
-                b.term.retExpr = uirCoreOptExpr(module, func, b.term.retExpr, func.retType)
-                uirCoreOptWriteBlock(&func.blocks, bi, b)
-            elif b.term.kind == mtCbr && b.term.condExpr != nil:
-                b.term.condExpr = uirCoreOptExpr(module, func, b.term.condExpr, uirCoreTypeI32())
-                uirCoreOptWriteBlock(&func.blocks, bi, b)
+                    s = uirCoreStmtWithExpr(s, uirCoreOptExpr(module, func, uirCoreStmtExprOf(s), fallback))
+                    uirCoreBlockSetStmtAt(b, si, s)
+            let term: UirCoreTerm = uirCoreBlockTermOf(b)
+            if uirCoreTermKindOf(term) == mtRet && uirCoreExprIdValid(uirCoreTermRetExprOf(term)):
+                let nextTerm: UirCoreTerm = uirCoreTermWithRetExpr(
+                    term,
+                    uirCoreOptExpr(module, func, uirCoreTermRetExprOf(term), uirCoreFuncRetTypeOf(func))
+                )
+                uirCoreBlockSetTerm(b, nextTerm)
+                uirCoreFuncSetBlockAt(func, bi, b)
+            elif uirCoreTermKindOf(term) == mtCbr && uirCoreExprIdValid(uirCoreTermCondExprOf(term)):
+                let nextTerm2: UirCoreTerm = uirCoreTermWithCondExpr(
+                    term,
+                    uirCoreOptExpr(module, func, uirCoreTermCondExprOf(term), uirCoreTypeI32())
+                )
+                uirCoreBlockSetTerm(b, nextTerm2)
+                uirCoreFuncSetBlockAt(func, bi, b)
     return true
 
 fn uirCoreOptimizeModule(module: UirCoreModule): bool =
-    if module == nil:
+    if (module == nil):
         return false
     var any: bool = false
-    for i in 0..<module.funcs.len:
-        let f: UirCoreFunc = module.funcs[i]
+    for i in 0..<uirCoreModuleFuncsLen(module):
+        let f: UirCoreFunc = uirCoreModuleFuncAt(module, i)
         if uirCoreOptimizeFunc(module, f):
             any = true
     return any

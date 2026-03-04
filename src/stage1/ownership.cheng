@@ -3,6 +3,7 @@
 import std/strings
 import std/seqs
 import stage1/ast
+import std/rawmem_support
 
 type
     OwnershipExprClass = enum
@@ -24,7 +25,7 @@ var ownershipEscapeClasses: int32[]
 var ownershipMustRetain: int32[]
 var ownershipMoveNames: str[]
 var ownDeepEnabled: bool = false
-var ownershipLastNode: void* = nil
+var ownershipLastNode: ptr = nil
 var ownershipLastIndex: int32 = -1
 var ownIndexMapKeys: ptr[]
 var ownIndexMapVals: int32[]
@@ -70,9 +71,9 @@ fn ownSeqElemPtr(buffer: void*, len0: int32, idx: int32, elemSize: int32): void*
     if idx < 0 || idx >= len0:
         panic "ownership: seq index out of bounds"
     let off64: int64 = int64(idx) * int64(elemSize)
-    # Returning ptr_add(...) directly can crash some bootstrap compilers
+    # Returning rawmemPtrAdd(...) directly can crash some bootstrap compilers
     # when callers cast the result; keep an explicit local first.
-    let p: void* = ptr_add(buffer, int32(off64))
+    let p: void* = rawmemPtrAdd(buffer, int32(off64))
     return p
 
 fn ownReadPtr(seqInst: ptr[], i: int32): ptr =
@@ -273,14 +274,14 @@ fn ownIndexMapInit(cap0: int32) =
         zeroMem(ownIndexMapVals.buffer, cap * 4)
     ownIndexMapCount = 0
 
-fn ownIndexMapHash(p: void*): int32 =
+fn ownIndexMapHash(p: ptr): int32 =
     let v: int64 = int64(p)
     var h: int64 = v
     h = h ^(h >> 33)
     h = h ^(h >> 17)
     return int32(h) & 0x7fffffff
 
-fn ownIndexMapInsert(p: void*, val: int32) =
+fn ownIndexMapInsert(p: ptr, val: int32) =
     if p == nil:
         return
     if ownIndexMapKeys.len == 0:
@@ -289,9 +290,9 @@ fn ownIndexMapInsert(p: void*, val: int32) =
     let mask: int32 = cap - 1
     var idx: int32 = ownIndexMapHash p & mask
     while true:
-        let key: void* = void*(ownReadPtr(ownIndexMapKeys, idx))
+        let key: ptr = ownReadPtr(ownIndexMapKeys, idx)
         if key == nil:
-            ownWritePtr(ownIndexMapKeys, idx, ptr(p))
+            ownWritePtr(ownIndexMapKeys, idx, p)
             ownWriteI32(&ownIndexMapVals, idx, val + 1)
             ownIndexMapCount = ownIndexMapCount + 1
             return
@@ -322,7 +323,7 @@ fn ownIndexMapGrow() =
         zeroMem(ownIndexMapVals.buffer, newCap * 4)
     ownIndexMapCount = 0
     for i in 0..<oldCap:
-        let key: void* = void*(ownReadPtr(oldKeys, i))
+        let key: ptr = ownReadPtr(oldKeys, i)
         if key != nil:
             let val: int32 = ownReadI32(oldVals, i)
             if val != 0:
@@ -330,7 +331,7 @@ fn ownIndexMapGrow() =
     ownFreePtrSeq(oldKeys)
     ownFreeI32Seq(oldVals)
 
-fn ownIndexMapGet(p: void*): int32 =
+fn ownIndexMapGet(p: ptr): int32 =
     if p == nil || ownIndexMapKeys.len == 0:
         return -1
     let cap: int32 = ownIndexMapKeys.len
@@ -338,7 +339,7 @@ fn ownIndexMapGet(p: void*): int32 =
     var idx: int32 = ownIndexMapHash p & mask
     let start: int32 = idx
     while true:
-        let key: void* = void*(ownReadPtr(ownIndexMapKeys, idx))
+        let key: ptr = ownReadPtr(ownIndexMapKeys, idx)
         if key == nil:
             return -1
         if key == p:
@@ -352,7 +353,7 @@ fn ownIndexMapGet(p: void*): int32 =
         if idx == start:
             return -1
 
-fn ownIndexMapPut(p: void*, val: int32) =
+fn ownIndexMapPut(p: ptr, val: int32) =
     if p == nil:
         return
     if ownIndexMapKeys.len == 0:
@@ -367,8 +368,7 @@ fn ownHashStr(s: str): int32 =
     var h: int32 = 0
     let n: int32 = len s
     for i in 0..<n:
-        let p: void* = ptr_add(void*(s), i)
-        let c: int8 = *int8*(p)
+        let c: int8 = int8(s[i])
         h = h + int32(c)
         h = h +(h << 10)
         h = h ^(h >> 6)
@@ -380,7 +380,7 @@ fn ownHashStr(s: str): int32 =
 fn ownHashCached(s: str): int32 =
     if len(s) == 0:
         return 0
-    return ownIndexMapHash(void*(s))
+    return ownIndexMapHash(ptr(s))
 
 fn ownSeenHash(s: str): int32 =
     if len(s) == 0:
@@ -421,7 +421,7 @@ fn ownLocalMapFindSlot(name: str, allowInsert: bool): int32 =
     let start: int32 = idx
     var tomb: int32 = -1
     while true:
-        let key: void* = void*(ownReadPtr(ownLocalMapKeys, idx))
+        let key: ptr = ownReadPtr(ownLocalMapKeys, idx)
         if key == nil:
             if allowInsert && tomb >= 0:
                 return tomb
@@ -461,13 +461,13 @@ fn ownLocalMapGrow() =
     ownLocalMapUsed = 0
     ownLocalMapLive = 0
     for i in 0..<oldCap:
-        let key: void* = void*(ownReadPtr(oldKeys, i))
+        let key: ptr = ownReadPtr(oldKeys, i)
         if key != nil:
             let val: int32 = ownReadI32(oldVals, i)
             if val > 0:
                 let slot: int32 = ownLocalMapFindSlot(str(key), true)
                 if slot >= 0:
-                    ownWritePtr(ownLocalMapKeys, slot, ptr(key))
+                    ownWritePtr(ownLocalMapKeys, slot, key)
                     ownWriteI32(&ownLocalMapVals, slot, val)
                     ownLocalMapUsed = ownLocalMapUsed + 1
                     ownLocalMapLive = ownLocalMapLive + 1
@@ -554,31 +554,31 @@ fn ownStripSpaces(s: str): str =
         return s
     let count: int32 = b - a + 1
     let p: void* = alloc(count + 1)
-    let src: void* = ptr_add(void*(s), a)
-    copyMem(p, src, count)
-    setMem(ptr_add(p, count), 0, 1)
+    let src: void* = rawmemPtrAdd(ptr(s), a)
+    rawmemCopy(p, src, count)
+    rawmemSet(rawmemPtrAdd(p, count), 0, 1)
     let out: str = str(p)
     ownStripLastIn = s
     ownStripLastOut = out
     return out
 
 fn ownExprIdentNode(n: Node): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     var cur: Node = n
-    if cur.kind == nkCallArg && kidCount cur > 1:
+    if nodeKind(cur) == nkCallArg && kidCount cur > 1:
         cur = kid(cur, 1)
-    if cur.kind == nkPar && kidCount cur == 1:
+    if nodeKind(cur) == nkPar && kidCount cur == 1:
         cur = kid(cur, 0)
-    if cur.kind == nkIdent || cur.kind == nkSymbol:
+    if nodeKind(cur) == nkIdent || nodeKind(cur) == nkSymbol:
         return cur
-    return nil
+    return astInvalidNodeId()
 
 fn ownExprIdentName(n: Node): str =
     let id: Node = ownExprIdentNode n
-    if id == nil:
+    if astRefIsNil(id):
         return ""
-    return ownStripSpaces id.ident
+    return ownStripSpaces nodeIdent(id)
 
 fn ownIsStmtKind(k: NodeKind): bool =
     if k == nkStmtList: return true
@@ -595,9 +595,9 @@ fn ownIsStmtKind(k: NodeKind): bool =
     return false
 
 fn ownIsExprNode(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    if ownIsStmtKind n.kind:
+    if ownIsStmtKind nodeKind(n):
         return false
     return true
 
@@ -751,31 +751,31 @@ fn ownProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
     return msg
 
 fn ownLValueIdentName(n: Node): str =
-    if n == nil:
+    if astRefIsNil(n):
         return ""
     var cur: Node = n
-    if cur.kind == nkPar && kidCount cur == 1:
+    if nodeKind(cur) == nkPar && kidCount cur == 1:
         cur = kid(cur, 0)
-    if cur.kind == nkHiddenDeref && kidCount cur > 0:
+    if nodeKind(cur) == nkHiddenDeref && kidCount cur > 0:
         cur = kid(cur, 0)
-    if cur.kind == nkIdent || cur.kind == nkSymbol:
-        return ownStripSpaces cur.ident
+    if nodeKind(cur) == nkIdent || nodeKind(cur) == nkSymbol:
+        return ownStripSpaces nodeIdent(cur)
     return ""
 
 fn ownNodeHasIdentNorm(n: Node, norm: str): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     if len(norm) == 0:
         return false
-    if n.kind == nkIdent || n.kind == nkSymbol:
-        return ownStripSpaces n.ident == norm
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
+        return ownStripSpaces nodeIdent(n) == norm
     for i in 0..<kidCount n:
         if ownNodeHasIdentNorm(kid(n, i), norm):
             return true
     return false
 
 fn ownStmtListHasIdentAfter(list: Node, startIdx: int32, name: str): bool =
-    if list == nil:
+    if astRefIsNil(list):
         return false
     let norm: str = ownStripSpaces name
     for i in startIdx + 1..<kidCount list:
@@ -784,7 +784,7 @@ fn ownStmtListHasIdentAfter(list: Node, startIdx: int32, name: str): bool =
     return false
 
 fn ownStmtListHasIdentInDeferBefore(list: Node, endIdx: int32, name: str): bool =
-    if list == nil:
+    if astRefIsNil(list):
         return false
     let norm: str = ownStripSpaces name
     if len(norm) == 0:
@@ -793,7 +793,7 @@ fn ownStmtListHasIdentInDeferBefore(list: Node, endIdx: int32, name: str): bool 
         if !(i < kidCount list):
             break
         let s: Node = kid(list, i)
-        if s != nil && s.kind == nkDefer:
+        if astRefNonNil(s) && nodeKind(s) == nkDefer:
             if ownNodeHasIdentNorm(s, norm):
                 return true
     return false
@@ -839,7 +839,7 @@ fn ownSeenMapFindSlot(seenKeys: str[], name: str, allowInsert: bool): int32 =
             if allowInsert:
                 return idx
             return -1
-        if void*(key) == void*(name):
+        if key == name:
             return idx
         if c_strcmp(str(key), name) == 0:
             return idx
@@ -962,12 +962,12 @@ fn ownSeenMapReset(seen: OwnSeenSet*) =
         seen->slots.len = 0
 
 fn ownCollectIdentNames(n: Node, seen: OwnSeenSet*) =
-    if n == nil || seen == nil:
+    if astRefIsNil(n) || seen == nil:
         return
-    if ownSkipIdentScanKind(n.kind):
+    if ownSkipIdentScanKind(nodeKind(n)):
         return
-    if n.kind == nkIdent || n.kind == nkSymbol:
-        ownSeenAdd(seen, n.ident)
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
+        ownSeenAdd(seen, nodeIdent(n))
         return
     for i in 0..<kidCount n:
         ownCollectIdentNames(kid(n, i), seen)
@@ -995,49 +995,49 @@ fn ownSkipIdentScanKind(k: NodeKind): bool =
     return false
 
 fn ownCollectIdentNamesShallowSkipIndex(n: Node, seen: OwnSeenSet*, skipIdx: int32) =
-    if n == nil || seen == nil:
+    if astRefIsNil(n) || seen == nil:
         return
-    if ownSkipIdentScanKind(n.kind):
+    if ownSkipIdentScanKind(nodeKind(n)):
         return
-    if n.kind == nkIdent || n.kind == nkSymbol:
-        ownSeenAdd(seen, n.ident)
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
+        ownSeenAdd(seen, nodeIdent(n))
         return
     for i in 0..<kidCount n:
         if i == skipIdx:
             continue
         let child: Node = kid(n, i)
-        if child != nil && child.kind == nkStmtList:
+        if astRefNonNil(child) && nodeKind(child) == nkStmtList:
             continue
         ownCollectIdentNamesShallowSkipIndex(child, seen, -1)
 
 fn ownCollectLValueNames(n: Node, seen: OwnSeenSet*) =
-    if n == nil || seen == nil:
+    if astRefIsNil(n) || seen == nil:
         return
     var cur: Node = n
-    if ownSkipIdentScanKind(cur.kind):
+    if ownSkipIdentScanKind(nodeKind(cur)):
         return
-    if cur.kind == nkPattern:
+    if nodeKind(cur) == nkPattern:
         for pi in 0..<kidCount cur:
             ownCollectLValueNames(kid(cur, pi), seen)
         return
-    if cur.kind == nkPar && kidCount cur == 1:
+    if nodeKind(cur) == nkPar && kidCount cur == 1:
         ownCollectLValueNames(kid(cur, 0), seen)
         return
-    if cur.kind == nkHiddenDeref && kidCount cur > 0:
+    if nodeKind(cur) == nkHiddenDeref && kidCount cur > 0:
         ownCollectLValueNames(kid(cur, 0), seen)
         return
-    if cur.kind == nkDotExpr || cur.kind == nkBracketExpr:
+    if nodeKind(cur) == nkDotExpr || nodeKind(cur) == nkBracketExpr:
         if kidCount cur > 0:
             ownCollectLValueNames(kid(cur, 0), seen)
         return
-    if cur.kind == nkIdent || cur.kind == nkSymbol:
-        ownSeenAdd(seen, cur.ident)
+    if nodeKind(cur) == nkIdent || nodeKind(cur) == nkSymbol:
+        ownSeenAdd(seen, nodeIdent(cur))
         return
     for i in 0..<kidCount cur:
         ownCollectLValueNames(kid(cur, i), seen)
 
 fn ownCollectIdentNamesProfiled(n: Node, seen: OwnSeenSet*) =
-    if n == nil || seen == nil:
+    if astRefIsNil(n) || seen == nil:
         return
     if ownProfOn:
         let startNs: int64 = cheng_monotime_ns()
@@ -1051,7 +1051,7 @@ fn ownCollectIdentNamesShallowProfiled(n: Node, seen: OwnSeenSet*) =
     ownCollectIdentNamesShallowSkipIndexProfiled(n, seen, -1)
 
 fn ownCollectIdentNamesShallowSkipIndexProfiled(n: Node, seen: OwnSeenSet*, skipIdx: int32) =
-    if n == nil || seen == nil:
+    if astRefIsNil(n) || seen == nil:
         return
     if ownProfOn:
         let startNs: int64 = cheng_monotime_ns()
@@ -1062,7 +1062,7 @@ fn ownCollectIdentNamesShallowSkipIndexProfiled(n: Node, seen: OwnSeenSet*, skip
     ownCollectIdentNamesShallowSkipIndex(n, seen, skipIdx)
 
 fn ownCollectLValueNamesProfiled(n: Node, seen: OwnSeenSet*) =
-    if n == nil || seen == nil:
+    if astRefIsNil(n) || seen == nil:
         return
     if ownProfOn:
         let startNs: int64 = cheng_monotime_ns()
@@ -1073,9 +1073,9 @@ fn ownCollectLValueNamesProfiled(n: Node, seen: OwnSeenSet*) =
     ownCollectLValueNames(n, seen)
 
 fn ownAddStmtUses(s: Node, seen: OwnSeenSet*) =
-    if s == nil || seen == nil:
+    if astRefIsNil(s) || seen == nil:
         return
-    case s.kind
+    case nodeKind(s)
     of nkVar, nkLet, nkConst:
         if kidCount s > 2:
             ownCollectIdentNamesProfiled(kid(s, 2), seen)
@@ -1108,7 +1108,7 @@ fn ownStmtListHasIdentInDeferBeforeProfiled(list: Node, endIdx: int32, name: str
 fn ownLoopCondPush(n: Node) =
     let start: int32 = ownLoopCondNames.len
     add(ownLoopCondStarts, start)
-    if n == nil:
+    if astRefIsNil(n):
         return
     var condSeen: OwnSeenSet
     ownCollectIdentNamesProfiled(n, &condSeen)
@@ -1138,19 +1138,19 @@ fn ownLoopCondAddToSet(keys: OwnSeenSet*) =
             ownSeenAddNorm(keys, nm)
 
 fn ownCollectLoopCarried(list: Node, outSeen: OwnSeenSet*) =
-    if list == nil || outSeen == nil:
+    if astRefIsNil(list) || outSeen == nil:
         return
     var defsSeen: OwnSeenSet
     var lhsNames: OwnSeenSet
     var useKeys: OwnSeenSet
     for i in 0..<kidCount list:
         let s: Node = kid(list, i)
-        if s == nil || s.kind == nkEmpty:
+        if astRefIsNil(s) || nodeKind(s) == nkEmpty:
             continue
-        var lhs: Node = nil
-        var rhs: Node = nil
-        var useNode: Node = nil
-        case s.kind
+        var lhs: Node = astInvalidNodeId()
+        var rhs: Node = astInvalidNodeId()
+        var useNode: Node = astInvalidNodeId()
+        case nodeKind(s)
         of nkVar, nkLet, nkConst:
             if kidCount s > 2:
                 rhs = kid(s, 2)
@@ -1169,14 +1169,14 @@ fn ownCollectLoopCarried(list: Node, outSeen: OwnSeenSet*) =
             else:
                 useNode = s
         ownSeenMapReset(&lhsNames)
-        if lhs != nil:
+        if astRefNonNil(lhs):
             ownCollectLValueNamesProfiled(lhs, &lhsNames)
         ownSeenMapReset(&useKeys)
-        if rhs != nil:
+        if astRefNonNil(rhs):
             ownCollectIdentNamesProfiled(rhs, &useKeys)
-        if useNode != nil:
+        if astRefNonNil(useNode):
             ownCollectIdentNamesProfiled(useNode, &useKeys)
-        if lhs != nil && useNode == nil:
+        if astRefNonNil(lhs) && astRefIsNil(useNode):
             ownCollectIdentNamesProfiled(lhs, &useKeys)
         for ui in 0..<useKeys.list.len:
             let nm: str = ownReadStr(useKeys.list, ui)
@@ -1192,11 +1192,11 @@ fn ownCollectLoopCarried(list: Node, outSeen: OwnSeenSet*) =
     ownSeenMapFree(&useKeys)
 
 fn ownCollectDeferIdentNames(list: Node, seen: OwnSeenSet*) =
-    if list == nil || seen == nil:
+    if astRefIsNil(list) || seen == nil:
         return
     for i in 0..<kidCount list:
         let s: Node = kid(list, i)
-        if s != nil && s.kind == nkDefer:
+        if astRefNonNil(s) && nodeKind(s) == nkDefer:
             ownCollectIdentNamesProfiled(s, seen)
 
 fn ownSeenMergeFrom(keys: OwnSeenSet*, outerKeys: OwnSeenSet*) =
@@ -1208,7 +1208,7 @@ fn ownSeenMergeFrom(keys: OwnSeenSet*, outerKeys: OwnSeenSet*) =
             ownSeenAddNorm(keys, nm)
 
 fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
-    if list == nil:
+    if astRefIsNil(list):
         return
     let inLoop: bool = ownLoopDepth > 0
     var loopCarried: OwnSeenSet
@@ -1230,7 +1230,7 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
     for __for_rev_i in 0..(__for_start_i - (0)):
         let i = __for_start_i - __for_rev_i
         let s: Node = kid(list, i)
-        if s != nil && s.kind != nkEmpty:
+        if astRefNonNil(s) && nodeKind(s) != nkEmpty:
             var sampleOn: bool = false
             var sampleMul: int32 = 0
             var sampleStart: int64 = 0
@@ -1240,10 +1240,10 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
                     sampleOn = true
                     sampleMul = ownSampleRate
                     sampleStart = cheng_monotime_ns()
-            if s.kind == nkWhile || s.kind == nkFor:
-                var condNode: Node = nil
+            if nodeKind(s) == nkWhile || nodeKind(s) == nkFor:
+                var condNode: Node = astInvalidNodeId()
                 var condIdx: int32 = -1
-                if s.kind == nkWhile:
+                if nodeKind(s) == nkWhile:
                     if kidCount s > 0:
                         condIdx = 0
                         condNode = kid(s, 0)
@@ -1255,7 +1255,7 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
                 ownLoopDepth = ownLoopDepth + 1
                 for ci in 0..<kidCount s:
                     let child: Node = kid(s, ci)
-                    if child != nil && child.kind == nkStmtList:
+                    if astRefNonNil(child) && nodeKind(child) == nkStmtList:
                         ownershipMarkMovesInStmtListWithOuter(child, &seenKeys)
                 if ownLoopCondStarts.len > 0:
                     let condStart: int32 = ownReadI32(ownLoopCondStarts, ownLoopCondStarts.len - 1)
@@ -1270,18 +1270,18 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
             else:
                 for ci2 in 0..<kidCount s:
                     let child2: Node = kid(s, ci2)
-                    if child2 != nil && child2.kind == nkStmtList:
+                    if astRefNonNil(child2) && nodeKind(child2) == nkStmtList:
                         ownershipMarkMovesInStmtListWithOuter(child2, &seenKeys)
-            var rhs: Node = nil
+            var rhs: Node = astInvalidNodeId()
             var lhsName: str = ""
             ownSeenMapReset(&lhsNames)
-            case s.kind
+            case nodeKind(s)
             of nkVar, nkLet, nkConst:
                 if kidCount s > 2:
                     rhs = kid(s, 2)
                 if kidCount s > 0:
                     var lhsNode: Node = kid(s, 0)
-                    if lhsNode != nil && lhsNode.kind == nkPattern && kidCount lhsNode > 0:
+                    if astRefNonNil(lhsNode) && nodeKind(lhsNode) == nkPattern && kidCount lhsNode > 0:
                         lhsNode = kid(lhsNode, 0)
                     lhsName = ownLValueIdentName lhsNode
                     ownCollectLValueNamesProfiled(kid(s, 0), &lhsNames)
@@ -1291,10 +1291,10 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
                 if kidCount s > 0:
                     lhsName = ownLValueIdentName kid(s, 0)
                     ownCollectLValueNamesProfiled(kid(s, 0), &lhsNames)
-            if rhs != nil:
+            if astRefNonNil(rhs):
                 let rhsId: Node = ownExprIdentNode rhs
-                if rhsId != nil:
-                    let rhsName: str = ownStripSpaces rhsId.ident
+                if astRefNonNil(rhsId):
+                    let rhsName: str = ownStripSpaces nodeIdent(rhsId)
                     if len rhsName > 0 && rhsName != lhsName:
                         if ! (inLoop && ownSeenHasNorm(loopCarried, rhsName)):
                             if ! ownSeenHasNorm(seenKeys, rhsName) && ! ownSeenHasNorm(lhsNames, rhsName):
@@ -1303,7 +1303,7 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
             ownAddStmtUses(s, &seenKeys)
             if sampleOn:
                 let deltaNs: int64 = cheng_monotime_ns() - sampleStart
-                ownProfRecordKind(&ownProfMarkKindNs, &ownProfMarkKindCalls, s.kind, deltaNs, sampleMul)
+                ownProfRecordKind(&ownProfMarkKindNs, &ownProfMarkKindCalls, nodeKind(s), deltaNs, sampleMul)
     ownSeenMapFree(&seenKeys)
     ownSeenMapFree(&lhsNames)
     if inLoop:
@@ -1312,19 +1312,49 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet*) =
 fn ownershipMarkMovesInStmtList(list: Node) =
     ownershipMarkMovesInStmtListWithOuter(list, nil)
 
-fn ownershipMarkMovesTree(n: Node) =
-    if n == nil:
+fn ownershipMarkMovesInStmtListId(listId: AstNodeId) =
+    if !astNodeIdValid(listId):
         return
-    if n.kind == nkModule || n.kind == nkStmtList:
+    let listNode: Node = listId
+    if astRefIsNil(listNode):
+        return
+    ownershipMarkMovesInStmtList(listNode)
+
+fn ownershipMarkMovesTree(n: Node) =
+    if astRefIsNil(n):
+        return
+    if nodeKind(n) == nkModule || nodeKind(n) == nkStmtList:
         ownershipMarkMovesInStmtList n
         return
     for i in 0..<kidCount n:
         ownershipMarkMovesTree kid(n, i)
 
+fn ownershipMarkMovesTreeId(rootId: AstNodeId) =
+    if !astNodeIdValid(rootId):
+        return
+    var stack: AstNodeId[]
+    stack.buffer = nil
+    stack.len = 0
+    stack.cap = 256
+    add(stack, rootId)
+    while stack.len > 0:
+        let lastIdx: int32 = stack.len - 1
+        let nId: AstNodeId = stack[lastIdx]
+        stack.len = int(lastIdx)
+        if !astNodeIdValid(nId):
+            continue
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkModule || nKind == nkStmtList:
+            ownershipMarkMovesInStmtListId(nId)
+            continue
+        let childCount: int32 = astKidCount(nId)
+        for i in 0..<childCount:
+            add(stack, astKidAt(nId, i))
+
 fn ownershipIndex(n: Node): int32 =
-    if n == nil:
+    if astRefIsNil(n):
         return -1
-    let p: void* = void*(n)
+    let p: ptr = ptr(n)
     if p == ownershipLastNode:
         return ownershipLastIndex
     let idx: int32 = ownIndexMapGet p
@@ -1333,9 +1363,9 @@ fn ownershipIndex(n: Node): int32 =
     return idx
 
 fn ownershipEnsure(n: Node): int32 =
-    if n == nil:
+    if astRefIsNil(n):
         return -1
-    let p: void* = void*(n)
+    let p: ptr = ptr(n)
     var idx: int32 = -1
     if p == ownershipLastNode:
         idx = ownershipLastIndex
@@ -1345,14 +1375,14 @@ fn ownershipEnsure(n: Node): int32 =
         ownershipLastNode = p
         ownershipLastIndex = idx
         return idx
-    add(ownershipNodes, void*(n))
+    add(ownershipNodes, ptr(n))
     add(ownershipFlags, int32(0))
     add(ownershipExprClasses, int32(oecUnknown))
     add(ownershipEscapeClasses, int32(oescUnknown))
     add(ownershipMustRetain, int32(0))
     add(ownershipMoveNames, "")
     let newIdx: int32 = ownershipNodes.len - 1
-    ownIndexMapPut(void*(n), newIdx)
+    ownIndexMapPut(ptr(n), newIdx)
     ownershipLastNode = p
     ownershipLastIndex = newIdx
     return newIdx
@@ -1408,7 +1438,7 @@ fn ownershipEscapeClass(n: Node): OwnershipEscapeClass =
     return OwnershipEscapeClass(ownReadI32(ownershipEscapeClasses, idx))
 
 fn ownershipAddFlag(n: Node, flag: int32) =
-    if n == nil:
+    if astRefIsNil(n):
         return
     let idx: int32 = ownershipEnsure n
     if idx < 0:
@@ -1417,7 +1447,7 @@ fn ownershipAddFlag(n: Node, flag: int32) =
     ownWriteI32(&ownershipFlags, idx, cur | flag)
 
 fn ownershipHasFlag(n: Node, flag: int32): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     let idx: int32 = ownershipIndex n
     if idx < 0:
@@ -1435,7 +1465,7 @@ fn ownershipMoveName(n: Node): str =
     if ! ownershipEnabledFlag:
         return ""
     let id: Node = ownExprIdentNode n
-    if id == nil:
+    if astRefIsNil(id):
         return ""
     let idx: int32 = ownershipIndex id
     if idx < 0:
@@ -1446,7 +1476,7 @@ fn ownershipIsMove(n: Node): bool =
     if ! ownershipEnabledFlag:
         return false
     let id: Node = ownExprIdentNode n
-    if id == nil:
+    if astRefIsNil(id):
         return false
     return ownershipHasFlag(id, ownMoveFlag)
 
@@ -1472,10 +1502,10 @@ fn ownershipIsBorrowedCallName(name: str): bool =
     return false
 
 fn ownCallBaseName(n: Node): str =
-    if n == nil || n.kind != nkCall || kidCount n == 0:
+    if astRefIsNil(n) || nodeKind(n) != nkCall || kidCount n == 0:
         return ""
     let callee: Node = kid(n, 0)
-    if callee != nil && callee.kind == nkBracketExpr && kidCount callee > 0:
+    if astRefNonNil(callee) && nodeKind(callee) == nkBracketExpr && kidCount callee > 0:
         return ownStripSpaces(plainName(kid(callee, 0)))
     return ownStripSpaces(plainName(callee))
 
@@ -1489,13 +1519,13 @@ fn ownCombineExprClass(a: OwnershipExprClass, b: OwnershipExprClass): OwnershipE
     return oecUnknown
 
 fn ownershipClassifyExpr(n: Node): OwnershipExprClass =
-    if n == nil:
+    if astRefIsNil(n):
         return oecUnmanaged
     let existing: OwnershipExprClass = ownershipExprClass n
     if existing != oecUnknown:
         return existing
     var cls: OwnershipExprClass = oecOwned
-    case n.kind
+    case nodeKind(n)
     of nkIntLit, nkFloatLit, nkCharLit, nkBoolLit, nkNilLit:
         cls = oecUnmanaged
     of nkStrLit:
@@ -1601,7 +1631,7 @@ fn ownDefineLValueNames(lhs: Node, isGlobal: bool) =
     ownSeenMapFree(&seenKeys)
 
 fn ownLValueHasGlobal(lhs: Node): bool =
-    if lhs == nil || ownFnDepth == 0:
+    if astRefIsNil(lhs) || ownFnDepth == 0:
         return false
     var seenKeys: OwnSeenSet
     ownCollectLValueNames(lhs, &seenKeys)
@@ -1615,28 +1645,28 @@ fn ownLValueHasGlobal(lhs: Node): bool =
     return false
 
 fn ownLValueBaseIdent(n: Node): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     var cur: Node = n
-    if cur.kind == nkPar && kidCount cur == 1:
+    if nodeKind(cur) == nkPar && kidCount cur == 1:
         return ownLValueBaseIdent kid(cur, 0)
-    if cur.kind == nkHiddenDeref && kidCount cur > 0:
+    if nodeKind(cur) == nkHiddenDeref && kidCount cur > 0:
         return ownLValueBaseIdent kid(cur, 0)
-    if cur.kind == nkDotExpr && kidCount cur > 0:
+    if nodeKind(cur) == nkDotExpr && kidCount cur > 0:
         return ownLValueBaseIdent kid(cur, 0)
-    if cur.kind == nkBracketExpr && kidCount cur > 0:
+    if nodeKind(cur) == nkBracketExpr && kidCount cur > 0:
         return ownLValueBaseIdent kid(cur, 0)
-    if cur.kind == nkIdent || cur.kind == nkSymbol:
+    if nodeKind(cur) == nkIdent || nodeKind(cur) == nkSymbol:
         return cur
-    return nil
+    return astInvalidNodeId()
 
 fn ownIsGlobalLValue(lhs: Node): bool =
-    if lhs == nil || ownFnDepth == 0:
+    if astRefIsNil(lhs) || ownFnDepth == 0:
         return false
     let base: Node = ownLValueBaseIdent lhs
-    if base == nil:
+    if astRefIsNil(base):
         return false
-    let name: str = ownStripSpaces base.ident
+    let name: str = ownStripSpaces nodeIdent(base)
     if len name == 0 ||(name ==  "_"):
         return false
     if ownIsLocal name:
@@ -1646,12 +1676,12 @@ fn ownIsGlobalLValue(lhs: Node): bool =
     return true
 
 fn ownershipMarkMoveIfLastUse(list: Node, idx: int32, rhsExpr: Node, lhsName: str) =
-    if rhsExpr == nil:
+    if astRefIsNil(rhsExpr):
         return
     let rhsId: Node = ownExprIdentNode rhsExpr
-    if rhsId == nil:
+    if astRefIsNil(rhsId):
         return
-    let rhsName: str = ownStripSpaces rhsId.ident
+    let rhsName: str = ownStripSpaces nodeIdent(rhsId)
     if len rhsName == 0:
         return
     if rhsName == lhsName:
@@ -1664,7 +1694,7 @@ fn ownershipMarkMoveIfLastUse(list: Node, idx: int32, rhsExpr: Node, lhsName: st
     ownershipSetMoveName(rhsId, rhsName)
 
 fn ownershipAnalyzeStmtList(list: Node) =
-    if list == nil || ! ownershipEnabledFlag:
+    if astRefIsNil(list) || ! ownershipEnabledFlag:
         return
     var pushed: bool = false
     if ownFnDepth > 0:
@@ -1672,7 +1702,7 @@ fn ownershipAnalyzeStmtList(list: Node) =
         pushed = true
     for i in 0..<kidCount list:
         let s: Node = kid(list, i)
-        if s == nil || s.kind == nkEmpty:
+        if astRefIsNil(s) || nodeKind(s) == nkEmpty:
             continue
         var sampleOn: bool = false
         var sampleMul: int32 = 0
@@ -1683,9 +1713,9 @@ fn ownershipAnalyzeStmtList(list: Node) =
                 sampleOn = true
                 sampleMul = ownSampleRate
                 sampleStart = cheng_monotime_ns()
-        case s.kind
+        case nodeKind(s)
         of nkVar, nkLet, nkConst:
-            var rhs: Node = nil
+            var rhs: Node = astInvalidNodeId()
             if kidCount s > 2:
                 rhs = kid(s, 2)
             if kidCount s > 0:
@@ -1695,8 +1725,8 @@ fn ownershipAnalyzeStmtList(list: Node) =
                     ownDefineLValueNames(kid(s, 0), true)
             ownershipClassifyExpr rhs
         of nkAsgn, nkFastAsgn:
-            var rhs2: Node = nil
-            var lhs2: Node = nil
+            var rhs2: Node = astInvalidNodeId()
+            var lhs2: Node = astInvalidNodeId()
             if kidCount s > 1:
                 rhs2 = kid(s, 1)
             if kidCount s > 0:
@@ -1715,40 +1745,40 @@ fn ownershipAnalyzeStmtList(list: Node) =
             ownershipAnalyzeNode s
         if sampleOn:
             let deltaNs2: int64 = cheng_monotime_ns() - sampleStart
-            ownProfRecordKind(&ownProfAnalyzeKindNs, &ownProfAnalyzeKindCalls, s.kind, deltaNs2, sampleMul)
+            ownProfRecordKind(&ownProfAnalyzeKindNs, &ownProfAnalyzeKindCalls, nodeKind(s), deltaNs2, sampleMul)
     if pushed:
         ownScopePop()
 
 fn ownershipAnalyzeFn(n: Node) =
-    if n == nil || kidCount n < 4:
+    if astRefIsNil(n) || kidCount n < 4:
         return
     ownFnDepth = ownFnDepth + 1
     ownScopePush()
     let paramsNode: Node = kid(n, 1)
-    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+    if astRefNonNil(paramsNode) && nodeKind(paramsNode) == nkFormalParams:
         for pi in 0..<kidCount paramsNode:
             let defs: Node = kid(paramsNode, pi)
-            if defs != nil && defs.kind == nkIdentDefs && kidCount defs >= 2:
-                for pj in 0..<kidCount defs - 2:
+            if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs >= 2:
+                for pj in 0..<identDefsNameCount(defs):
                     let paramName: Node = kid(defs, pj)
-                    if paramName != nil:
-                        ownDefineLocal paramName.ident
+                    if astRefNonNil(paramName):
+                        ownDefineLocal nodeIdent(paramName)
     let bodyNode: Node = kid(n, 3)
-    if bodyNode != nil:
+    if astRefNonNil(bodyNode):
         ownershipAnalyzeNode bodyNode
     ownScopePop()
     ownFnDepth = ownFnDepth - 1
 
 fn ownershipAnalyzeNode(n: Node) =
-    if n == nil:
+    if astRefIsNil(n):
         return
-    if ownSkipOwnershipKind n.kind:
+    if ownSkipOwnershipKind nodeKind(n):
         return
     if ownIsExprNode n:
         ownershipClassifyExpr n
-        if ! ownDeepEnabled && ! ownExprHasStmtChildren n.kind:
+        if ! ownDeepEnabled && ! ownExprHasStmtChildren nodeKind(n):
             return
-    case n.kind
+    case nodeKind(n)
     of nkModule:
         ownershipAnalyzeStmtList n
     of nkStmtList:
@@ -1756,8 +1786,8 @@ fn ownershipAnalyzeNode(n: Node) =
     of nkFnDecl, nkIteratorDecl:
         ownershipAnalyzeFn n
     of nkWhile, nkFor:
-        var condNode: Node = nil
-        if n.kind == nkWhile:
+        var condNode: Node = astInvalidNodeId()
+        if nodeKind(n) == nkWhile:
             if kidCount n > 0:
                 condNode = kid(n, 0)
         else:
@@ -1773,9 +1803,9 @@ fn ownershipAnalyzeNode(n: Node) =
         for i2 in 0..<kidCount n:
             ownershipAnalyzeNode kid(n, i2)
 
-fn ownershipAnalyze(root: Node) =
+fn ownershipAnalyzeImpl(root: Node) =
     ownershipClear()
-    if root == nil:
+    if astRefIsNil(root):
         return
     if ! ownershipEnabledFlag:
         return
@@ -1801,7 +1831,11 @@ fn ownershipAnalyze(root: Node) =
     var profAnalyze: int64 = 0
     if profOn:
         profMark = cheng_monotime_ns()
-    ownershipMarkMovesTree root
+    let rootId: AstNodeId = root
+    if astNodeIdValid(rootId):
+        ownershipMarkMovesTreeId(rootId)
+    else:
+        ownershipMarkMovesTree(root)
     if profOn:
         profMarkMoves = cheng_monotime_ns() - profMark
         profMark = cheng_monotime_ns()
@@ -1852,3 +1886,7 @@ fn ownershipAnalyze(root: Node) =
         echo markTop
         let analyzeTop: str = ownProfTopKinds(ownProfAnalyzeKindNs, ownProfAnalyzeKindCalls, "[ownership-analyze-top]")
         echo analyzeTop
+
+fn ownershipAnalyzeId(rootId: AstNodeId) =
+    let root: Node = rootId
+    ownershipAnalyzeImpl(root)

@@ -44,6 +44,12 @@ type
         modBits: int32
         modLen: int32
 
+fn rsaCopyBytes(dst: var Bytes, dstOffset: int32, src: Bytes, srcOffset: int32, count: int32) =
+    if count <= 0:
+        return
+    for i in 0..<count:
+        bytesSet(dst, dstOffset + i, bytesGet(src, srcOffset + i))
+
 fn gcd(a: int64, b: int64): int64 =
     var x: int64 = if a < 0: -a else: a
     var y: int64 = if b < 0: -b else: b
@@ -384,7 +390,7 @@ fn rsaBigDecrypt(pub: RsaBigPublicKey, sig: Bytes): Result[Bytes] =
     let em: Bytes = bigToBytes(Value(mRes), pub.modLen)
     return Ok[Bytes](em)
 
-fn rsaBigSignEm(priv: RsaBigPrivateKey*, em: Bytes): Result[Bytes] =
+fn rsaBigSignEm(priv: RsaBigPrivateKey, em: Bytes): Result[Bytes] =
     if bytesLen(em) != priv.modLen:
         return Err[Bytes]("rsa: encoded message length mismatch")
     let emRes: Result[BigInt] = bigFromBytes(em)
@@ -398,7 +404,7 @@ fn rsaBigSignEm(priv: RsaBigPrivateKey*, em: Bytes): Result[Bytes] =
         return Err[Bytes](Error(sigRes))
     return Ok[Bytes](bigToBytes(Value(sigRes), priv.modLen))
 
-fn rsaBigSignPkcs1(priv: RsaBigPrivateKey*, msg: Bytes, useSha384: bool): Result[Bytes] =
+fn rsaBigSignPkcs1(priv: RsaBigPrivateKey, msg: Bytes, useSha384: bool): Result[Bytes] =
     var digest: Bytes
     if useSha384:
         digest = rsaHashSha384(msg)
@@ -423,10 +429,10 @@ fn rsaBigSignPkcs1(priv: RsaBigPrivateKey*, msg: Bytes, useSha384: bool): Result
     for i in 0..<psLen:
         bytesSet(em, 2 + i, 0xff)
     bytesSet(em, 2 + psLen, 0x00)
-    copyMem(ptr_add(em.data, 3 + psLen), t.data, tLen)
+    rsaCopyBytes(em, 3 + psLen, t, 0, tLen)
     return rsaBigSignEm(priv, em)
 
-fn rsaBigSignPss(priv: RsaBigPrivateKey*, msg: Bytes, useSha384: bool): Result[Bytes] =
+fn rsaBigSignPss(priv: RsaBigPrivateKey, msg: Bytes, useSha384: bool): Result[Bytes] =
     let hLen: int32 = if useSha384: rsaHashLenSha384() else: rsaHashLenSha256()
     let sLen: int32 = hLen
     let emLen: int32 = priv.modLen
@@ -453,7 +459,7 @@ fn rsaBigSignPss(priv: RsaBigPrivateKey*, msg: Bytes, useSha384: bool): Result[B
         return Err[Bytes]("rsa: pss ps len invalid")
     let db: Bytes = bytesAlloc(psLen + 1 + sLen)
     bytesSet(db, psLen, 0x01)
-    copyMem(ptr_add(db.data, psLen + 1), salt.data, sLen)
+    rsaCopyBytes(db, psLen + 1, salt, 0, sLen)
     let dbMask: Bytes = rsaMgf1(h, emLen - hLen - 1, useSha384)
     let maskedRes: Result[Bytes] = rsaBytesXor(db, dbMask)
     if IsErr(maskedRes):
@@ -465,8 +471,8 @@ fn rsaBigSignPss(priv: RsaBigPrivateKey*, msg: Bytes, useSha384: bool): Result[B
         let mask: int32 = 0xff >> unusedBits
         bytesSet(maskedDb, 0, bytesGet(maskedDb, 0) & mask)
     let em: Bytes = bytesAlloc(emLen)
-    copyMem(em.data, maskedDb.data, emLen - hLen - 1)
-    copyMem(ptr_add(em.data, emLen - hLen - 1), h.data, hLen)
+    rsaCopyBytes(em, 0, maskedDb, 0, emLen - hLen - 1)
+    rsaCopyBytes(em, emLen - hLen - 1, h, 0, hLen)
     bytesSet(em, emLen - 1, 0xbc)
     return rsaBigSignEm(priv, em)
 
@@ -710,8 +716,8 @@ fn validateRsaSignatureBytes(data: Bytes): bool =
 fn rsaSignBytes(privData: Bytes, msg: Bytes): Result[Bytes] =
     let bigRes: Result[RsaBigPrivateKey] = rsaBigPrivateKeyFromBytes(privData)
     if IsOk(bigRes):
-        var priv: RsaBigPrivateKey = Value(bigRes)
-        let sigRes: Result[Bytes] = rsaBigSignPkcs1(&priv, msg, false)
+        let priv: RsaBigPrivateKey = Value(bigRes)
+        let sigRes: Result[Bytes] = rsaBigSignPkcs1(priv, msg, false)
         if IsErr(sigRes):
             return Err[Bytes](Error(sigRes))
         return sigRes

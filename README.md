@@ -15,13 +15,13 @@ then runs fullchain obj-only checks.
 ## Compile a program
 
 ```bash
-cheng_tooling chengc examples/hello_puts.cheng --run
+cheng_tooling cheng examples/hello_puts.cheng --run
 ```
 
 ## ORC closedloop (backend-only)
 
 ```bash
-MM=orc cheng_tooling chengc examples/test_orc_closedloop.cheng --name:test_orc_closedloop
+MM=orc cheng_tooling cheng examples/test_orc_closedloop.cheng --name:test_orc_closedloop
 MM=orc ./artifacts/chengc/test_orc_closedloop
 ```
 

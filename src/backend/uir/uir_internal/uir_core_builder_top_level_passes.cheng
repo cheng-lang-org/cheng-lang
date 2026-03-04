@@ -5,62 +5,88 @@ import stage1/ast
 import backend/uir/uir_internal/uir_core_types
 import backend/uir/uir_internal/uir_core_builder_types
 
-fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root: Node, filePath: str, n: Node,
-                              reachable: hashsets.HashSetStr* = nil,
-                              overloaded: hashsets.HashSetStr* = nil): Result[bool] =
-    if n == nil || n.kind == nkEmpty:
+fn uirCorePathHasControlChars(path: str): bool =
+    if len(path) == 0:
+        return false
+    for i in 0..<len(path):
+        let ch: char = path[i]
+        if ch < ' ':
+            return true
+    return false
+
+fn uirCoreNormalizeTopLevelPath(path: str, fallback: str): str =
+    var out: str = backendStripSpaces(path)
+    if len(out) == 0 || uirCorePathHasControlChars(out):
+        out = backendStripSpaces(fallback)
+    if uirCorePathHasControlChars(out):
+        return ""
+    return out
+
+fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, rootId: AstNodeId, filePath: str, nId: AstNodeId,
+                                    reachable: hashsets.HashSetStr* = nil,
+                                    overloaded: hashsets.HashSetStr* = nil): Result[bool] =
+    if !astNodeIdValid(nId) || astNodeKind(nId) == nkEmpty:
         return Ok[bool](false)
-    if n.kind == nkStmtList || n.kind == nkModule:
-        let fallback: str = (len(filePath) > 0) ? filePath : (root != nil ? root.strVal : "")
-        for j in 0..<kidCount(n):
-            let nn: Node = kid(n, j)
-            let stmtPath: str = (nn != nil && len(nn.strVal) > 0) ? nn.strVal : fallback
-            let res: Result[bool] = uirCoreConsumeTopLevelFromRoot(mod, ctx, root, stmtPath, nn, reachable, overloaded)
-            if ! IsOk[bool](res):
+    let callFilePath: str = uirCoreNormalizeTopLevelPath(filePath, astNodeStrVal(rootId))
+    let nKind: NodeKind = astNodeKind(nId)
+    if nKind == nkStmtList || nKind == nkModule:
+        let fallback: str = callFilePath
+        for j in 0..<astKidCount(nId):
+            let nnId: AstNodeId = astKidAt(nId, j)
+            let ownPath: str = astNodeStrVal(nnId)
+            let stmtPath: str = uirCoreNormalizeTopLevelPath(ownPath, fallback)
+            let res: Result[bool] = uirCoreConsumeTopLevelFromRootId(mod, ctx, rootId, stmtPath, nnId, reachable, overloaded)
+            if !IsOk[bool](res):
                 return res
         return Ok[bool](true)
-    if n.kind == nkVar || n.kind == nkLet || n.kind == nkConst:
-        var pat: Node = nil
-        if kidCount(n) > 0:
-            pat = kid(n, 0)
-        var init: Node = nil
-        if kidCount(n) > 2:
-            init = kid(n, 2)
-        var nameNode: Node = pat
-        var typeNode: Node = nil
-        if kidCount(n) > 1:
-            typeNode = kid(n, 1)
-        if pat != nil && pat.kind == nkPattern && kidCount(pat) > 0:
-            nameNode = kid(pat, 0)
-            if kidCount(pat) > 1:
-                typeNode = kid(pat, 1)
-        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
+    if nKind == nkVar || nKind == nkLet || nKind == nkConst:
+        var patId: AstNodeId = astInvalidNodeId()
+        if astKidCount(nId) > 0:
+            patId = astKidAt(nId, 0)
+        var initId: AstNodeId = astInvalidNodeId()
+        if astKidCount(nId) > 2:
+            initId = astKidAt(nId, 2)
+        var nameNodeId: AstNodeId = patId
+        var typeNodeId: AstNodeId = astInvalidNodeId()
+        if astKidCount(nId) > 1:
+            typeNodeId = astKidAt(nId, 1)
+        if astNodeIdValid(patId) && astNodeKind(patId) == nkPattern && astKidCount(patId) > 0:
+            nameNodeId = astKidAt(patId, 0)
+            if astKidCount(patId) > 1:
+                typeNodeId = astKidAt(patId, 1)
+        if !astNodeIdValid(nameNodeId) || (astNodeKind(nameNodeId) != nkIdent && astNodeKind(nameNodeId) != nkSymbol):
             return Err[bool]("uirCore_builder: global expects identifier")
-        let rawName: str = backendStripSpaces(plainName(nameNode))
-        let name: str = uirCoreMaybeMangleDupGlobalName(rawName, filePath)
+        let rawName: str = backendStripSpaces(astPlainName(nameNodeId))
+        let name: str = uirCoreMaybeMangleDupGlobalName(rawName, callFilePath)
         let debugDot: bool = (getEnv "BACKEND_DEBUG_DOT" == "1")
         if debugDot && rawName == "baseIdentity":
             var typeKindDbg: str = "nil"
-            if typeNode != nil:
-                typeKindDbg = intToStr(int32(typeNode.kind))
+            if astNodeIdValid(typeNodeId):
+                typeKindDbg = intToStr(int32(astNodeKind(typeNodeId)))
             echo("[backend] debugDot: consumeGlobal rawName='" + rawName +
                  "' file='" + filePath + "' typeKind=nk#" + typeKindDbg + "'")
         let existingGi: int32 = moduleGlobalIndex(mod, name)
         var allowDupGlobal: bool = false
         if existingGi >= 0:
-            let g0: UirCoreGlobal = mod.globals[existingGi]
-            allowDupGlobal = (g0.originFile == "<predeclared>")
-        var declType: UirCoreType = uirCoreTypeFromNodeWithModule(mod, typeNode)
+            let g0: UirCoreGlobal = uirCoreModuleGlobalAt(mod, existingGi)
+            let prevOrigin0: str = uirCoreGlobalOriginFileOf(g0)
+            allowDupGlobal = (prevOrigin0 == "<predeclared>") || __cheng_string_contains_str(prevOrigin0, "<predecl")
+            # Stage0 compatibility: treat any synthetic "<...>" origin as predecl placeholder.
+            if !allowDupGlobal && len(prevOrigin0) > 0 && prevOrigin0[0] == '<':
+                allowDupGlobal = true
+        var declType: UirCoreType = uirCoreTypeFromNodeWithModule(mod, typeNodeId)
         var objTypeName: str = ""
-        var objTypeNode: Node = typeNode
-        if (objTypeNode == nil || objTypeNode.kind == nkEmpty) && init != nil && init.kind != nkEmpty &&
-           init.typeCacheValid && init.typeCache != nil:
-            objTypeNode = init.typeCache
-        if objTypeNode != nil && objTypeNode.kind != nkEmpty:
-            objTypeName = typeNodeObjTypeName(mod, objTypeNode)
-        let isObj: bool = len(objTypeName) > 0 && objTypeNode != nil && typeNodeIsObjValue(mod, objTypeNode)
+        var objTypeNodeId: AstNodeId = typeNodeId
+        if (!astNodeIdValid(objTypeNodeId) || astNodeKind(objTypeNodeId) == nkEmpty) &&
+           astNodeIdValid(initId) && astNodeKind(initId) != nkEmpty &&
+           astNodeTypeCacheValid(initId) && astNodeIdValid(astNodeTypeCacheId(initId)):
+            objTypeNodeId = astNodeTypeCacheId(initId)
+        if astNodeIdValid(objTypeNodeId) && astNodeKind(objTypeNodeId) != nkEmpty:
+            objTypeName = typeNodeObjTypeName(mod, objTypeNodeId)
+        let isObj: bool = len(objTypeName) > 0 && astNodeIdValid(objTypeNodeId) &&
+                          typeNodeIsObjValue(mod, objTypeNodeId)
         if debugDot && rawName == "baseIdentity":
-            let objNodeKindDbg: str = (objTypeNode != nil) ? intToStr(int32(objTypeNode.kind)) : "nil"
+            let objNodeKindDbg: str = astNodeIdValid(objTypeNodeId) ? intToStr(int32(astNodeKind(objTypeNodeId))) : "nil"
             echo("[backend] debugDot: consumeGlobal name='" + name +
                  "' objTypeName='" + objTypeName + "' isObj=" + (isObj ? "1" : "0") +
                  " objNodeKind=nk#" + objNodeKindDbg + "'")
@@ -72,31 +98,40 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
                      objTypeName + "' chkObj='" + chkObj + "'")
         if isObj:
             declType = uirCoreTypeI64()
-        elif typeNode == nil || typeNode.kind == nkEmpty:
-            declType = inferExprTypeWithGlobals(nil, mod, nil, init, declType)
-        # Match stage1 C backend's global layout: store sub-32-bit scalars as i32 slots.
-        # This keeps the MVP backend's global pipeline simple and avoids i8/i16-only data sections.
+        elif !astNodeIdValid(typeNodeId) || astNodeKind(typeNodeId) == nkEmpty:
+            declType = inferExprTypeWithGlobals(nil, mod, nil, initId, declType)
         if !isObj && (declType.kind == mtI8 || declType.kind == mtI16):
             let wasUnsigned: bool = declType.isUnsigned
             declType = uirCoreTypeI32()
             declType.isUnsigned = wasUnsigned
 
-        if existingGi >= 0 && !allowDupGlobal && n.kind == nkConst && !isObj:
-            var init0: Node = init
-            while init0 != nil && init0.kind == nkPar && kidCount(init0) > 0:
-                init0 = kid(init0, 0)
-            let isLiteralInit: bool = init0 != nil &&
-                (init0.kind == nkIntLit || init0.kind == nkBoolLit || init0.kind == nkNilLit)
+        if existingGi >= 0 && !allowDupGlobal && nKind == nkConst && !isObj:
+            var init0Id: AstNodeId = initId
+            while astNodeIdValid(init0Id) && astNodeKind(init0Id) == nkPar && astKidCount(init0Id) > 0:
+                init0Id = astKidAt(init0Id, 0)
+            let init0Kind: NodeKind = astNodeKind(init0Id)
+            let isLiteralInit: bool = astNodeIdValid(init0Id) &&
+                                      (init0Kind == nkIntLit || init0Kind == nkBoolLit || init0Kind == nkNilLit)
             if isLiteralInit:
-                let g0: UirCoreGlobal = mod.globals[existingGi]
-                let prevFile: str = g0.originFile
+                let g0: UirCoreGlobal = uirCoreModuleGlobalAt(mod, existingGi)
+                let prevFile: str = uirCoreGlobalOriginFileOf(g0)
                 let prevSyntheticOrStd: bool = (len(prevFile) > 0) &&
                     (prevFile[0] == '<' || __cheng_string_contains_str(prevFile, "/src/std/") ||
-                     __cheng_string_contains_str(prevFile, "/src/core/") || __cheng_string_contains_str(prevFile, "/src/system/"))
-                let curSyntheticOrStd: bool = (len(filePath) > 0) &&
-                    (filePath[0] == '<' || __cheng_string_contains_str(filePath, "/src/std/") ||
-                     __cheng_string_contains_str(filePath, "/src/core/") || __cheng_string_contains_str(filePath, "/src/system/"))
-                if (prevSyntheticOrStd || curSyntheticOrStd) &&
+                     __cheng_string_contains_str(prevFile, "/src/core/") ||
+                     __cheng_string_contains_str(prevFile, "/src/system/") ||
+                     __cheng_string_contains_str(prevFile, "/src/backend/"))
+                let curSyntheticOrStd: bool = (len(callFilePath) > 0) &&
+                    (callFilePath[0] == '<' || __cheng_string_contains_str(callFilePath, "/src/std/") ||
+                     __cheng_string_contains_str(callFilePath, "/src/core/") ||
+                     __cheng_string_contains_str(callFilePath, "/src/system/") ||
+                     __cheng_string_contains_str(callFilePath, "/src/backend/"))
+                # Stage0/SoA migration can surface non-path originFile bytes for already-inserted
+                # synthetic globals. Keep const literal duplicates in std/backend synthetic sources
+                # idempotent when type shape matches.
+                if curSyntheticOrStd &&
+                   g0.ty.kind == declType.kind && g0.ty.isUnsigned == declType.isUnsigned:
+                    allowDupGlobal = true
+                elif (prevSyntheticOrStd || curSyntheticOrStd) &&
                    g0.ty.kind == declType.kind && g0.ty.isUnsigned == declType.isUnsigned:
                     allowDupGlobal = true
         if existingGi >= 0 && !allowDupGlobal && uirCoreSkipSemStdDuplicateRelaxEnabled():
@@ -104,40 +139,42 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
 
         if moduleHasFunc(mod, name) || (existingGi >= 0 && !allowDupGlobal) ||
            uirCoreFindTypeAlias(mod, name) >= 0 || uirCoreFindObjType(mod, name) >= 0:
-            let line0: str = intToStr(nameNode.pos.line)
-            let col0: str = intToStr(nameNode.pos.col)
+            let line0: str = intToStr(astNodePosLine(nameNodeId))
+            let col0: str = intToStr(astNodePosCol(nameNodeId))
             var prevFile: str = ""
             if existingGi >= 0:
-                let gPrev: UirCoreGlobal = mod.globals[existingGi]
-                prevFile = gPrev.originFile
+                let gPrev: UirCoreGlobal = uirCoreModuleGlobalAt(mod, existingGi)
+                prevFile = uirCoreGlobalOriginFileOf(gPrev)
+                # In outline/deferred flows a declaration can be revisited from the same file.
+                # Treat same-origin duplicates as idempotent instead of hard-failing.
+                if len(prevFile) > 0 && prevFile == callFilePath:
+                    return Ok[bool](false)
             return Err[bool]("uirCore_builder: duplicate global name: " + name +
-                             " (prev=" + prevFile + " cur=" + filePath + ":" + line0 + ":" + col0 + ")")
+                             " (prev=" + prevFile + " cur=" + callFilePath + ":" + line0 + ":" + col0 + ")")
 
         var hasInit: bool = false
         var initVal: int64 = 0
-
         if isObj:
-            # Object globals are represented as pointers to heap storage; initialize at runtime.
             hasInit = false
             initVal = 0
-            let sfi: SeqFixedInit = seqFixedInitInfo(typeNode)
-            ctxAddGlobalInit(ctx, name, declType, objTypeName, init, filePath, sfi.elemType, sfi.capExpr)
-        elif init != nil && init.kind != nkEmpty:
-            # Scalar globals: allow static init for simple literals; otherwise defer to runtime init.
-            if init.kind == nkIntLit:
+            let sfi: SeqFixedInit = seqFixedInitInfo(typeNodeId)
+            ctxAddGlobalInit(ctx, name, declType, objTypeName, initId, callFilePath, sfi.elemType, sfi.capExpr)
+        elif astNodeIdValid(initId) && astNodeKind(initId) != nkEmpty:
+            let initKind: NodeKind = astNodeKind(initId)
+            if initKind == nkIntLit:
                 hasInit = true
-                initVal = init.intVal
-            elif init.kind == nkBoolLit:
+                initVal = astNodeIntVal(initId)
+            elif initKind == nkBoolLit:
                 hasInit = true
-                let v: str = backendStripSpaces(init.ident)
+                let v: str = backendStripSpaces(astNodeIdent(initId))
                 initVal = (v == "true") ? 1 : 0
-            elif init.kind == nkNilLit:
+            elif initKind == nkNilLit:
                 hasInit = true
                 initVal = 0
             else:
                 hasInit = false
                 initVal = 0
-                ctxAddGlobalInit(ctx, name, declType, "", init, filePath)
+                ctxAddGlobalInit(ctx, name, declType, "", initId, callFilePath)
 
         if existingGi >= 0 && allowDupGlobal:
             var gOut: UirCoreGlobal
@@ -145,35 +182,36 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
             gOut.ty = declType
             gOut.init = initVal
             gOut.hasInit = hasInit
-            gOut.originFile = uirCoreOwnStr(filePath)
+            gOut.originFile = uirCoreOwnStr(callFilePath)
             mbWriteGlobal(mod.globals, existingGi, gOut)
         else:
-            uirCoreAddGlobal(mod, name, declType, initVal, hasInit, filePath)
+            uirCoreAddGlobal(mod, name, declType, initVal, hasInit, callFilePath)
 
         var keyOut: str = ""
-        if objTypeNode != nil && objTypeNode.kind != nkEmpty:
-            keyOut = typeKey(objTypeNode)
+        if astNodeIdValid(objTypeNodeId) && astNodeKind(objTypeNodeId) != nkEmpty:
+            keyOut = typeKey(objTypeNodeId)
             if len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(objTypeNode)
-        if len(keyOut) == 0 && typeNode != nil && typeNode.kind != nkEmpty:
-            keyOut = typeKey(typeNode)
+                keyOut = uirCoreTypeKeyFromNodeLoose(objTypeNodeId)
+        if len(keyOut) == 0 && astNodeIdValid(typeNodeId) && astNodeKind(typeNodeId) != nkEmpty:
+            keyOut = typeKey(typeNodeId)
             if len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(typeNode)
-        if len(keyOut) == 0 && init != nil && init.kind != nkEmpty:
-            var initKeyNode: Node = init
-            while initKeyNode != nil && initKeyNode.kind == nkPar && kidCount(initKeyNode) > 0:
-                initKeyNode = kid(initKeyNode, 0)
-            if initKeyNode != nil && initKeyNode.typeCacheValid && initKeyNode.typeCache != nil:
-                keyOut = typeKey initKeyNode.typeCache
-            elif initKeyNode != nil && initKeyNode.kind == nkStrLit:
+                keyOut = uirCoreTypeKeyFromNodeLoose(typeNodeId)
+        if len(keyOut) == 0 && astNodeIdValid(initId) && astNodeKind(initId) != nkEmpty:
+            var initKeyId: AstNodeId = initId
+            while astNodeIdValid(initKeyId) && astNodeKind(initKeyId) == nkPar && astKidCount(initKeyId) > 0:
+                initKeyId = astKidAt(initKeyId, 0)
+            let initKeyKind: NodeKind = astNodeKind(initKeyId)
+            if astNodeIdValid(initKeyId) && astNodeTypeCacheValid(initKeyId) && astNodeIdValid(astNodeTypeCacheId(initKeyId)):
+                keyOut = typeKey(astNodeTypeCacheId(initKeyId))
+            elif initKeyKind == nkStrLit:
                 keyOut = "str"
-            elif initKeyNode != nil && initKeyNode.kind == nkFloatLit:
+            elif initKeyKind == nkFloatLit:
                 keyOut = "float64"
-            elif initKeyNode != nil && initKeyNode.kind == nkBoolLit:
+            elif initKeyKind == nkBoolLit:
                 keyOut = "bool"
-            elif initKeyNode != nil && initKeyNode.kind == nkCharLit:
+            elif initKeyKind == nkCharLit:
                 keyOut = "char"
-            elif initKeyNode != nil && initKeyNode.kind == nkIntLit:
+            elif initKeyKind == nkIntLit:
                 if declType.kind == mtI64:
                     keyOut = declType.isUnsigned ? "uint64" : "int64"
                 elif declType.kind == mtI32:
@@ -197,40 +235,40 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
             if (ctx.traceGlobalCount % 200) == 0:
                 stage1Trace("backend: uir globals=" + intToStr(ctx.traceGlobalCount) + " last=" + name)
         return Ok[bool](true)
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+    if nKind == nkFnDecl || nKind == nkIteratorDecl:
         if reachable != nil:
-            var entryPathProbe: str = backendStripSpaces(filePath)
-            if n != nil && len(n.strVal) > 0:
-                entryPathProbe = backendStripSpaces(n.strVal)
+            var entryPathProbe: str = callFilePath
+            let ownPath: str = astNodeStrVal(nId)
+            if len(ownPath) > 0:
+                entryPathProbe = uirCoreNormalizeTopLevelPath(ownPath, callFilePath)
             let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
             if !keepByEntryFile:
-                let nameNode: Node = kid(n, 0)
-                if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
-                    let nm: str = backendStripSpaces(plainName(nameNode))
+                let nameNodeId: AstNodeId = astKidAt(nId, 0)
+                if astNodeIdValid(nameNodeId) && (astNodeKind(nameNodeId) == nkIdent || astNodeKind(nameNodeId) == nkSymbol):
+                    let nm: str = backendStripSpaces(astPlainName(nameNodeId))
                     if !hashsets.hashSetStrHas(*reachable, nm):
                         return Ok[bool](false)
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
+        if uirCoreFuncSigHasUnresolvedGenericsId(nId):
             return Ok[bool](false)
-        let fRes: Result[UirCoreFunc] = uirCoreBuildFunc(mod, n, filePath, overloaded)
-        if ! IsOk[UirCoreFunc](fRes):
+        let fRes: Result[UirCoreFunc] = uirCoreBuildFuncId(mod, nId, callFilePath, overloaded)
+        if !IsOk[UirCoreFunc](fRes):
             return ErrInfo[bool](ErrorInfoOf[UirCoreFunc](fRes))
         let f: UirCoreFunc = Value[UirCoreFunc](fRes)
         if f == nil:
             return Ok[bool](false)
-        # Predeclare pass inserts header-only entries first. Always try
-        # same-file replacement before duplicate-name checks so stale caches
-        # cannot leave body-less declarations in the final module.
         var sameFileIdx: int32 = -1
-        let exIdx: int32 = moduleFuncIndex(mod, f.name)
+        let fnName: str = uirCoreFuncNameOf(f)
+        let fnOriginFile: str = uirCoreFuncOriginFileOf(f)
+        let exIdx: int32 = moduleFuncIndex(mod, fnName)
         if exIdx >= 0:
-            let ex: UirCoreFunc = mod.funcs[exIdx]
-            if ex != nil && ex.originFile == f.originFile:
+            let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
+            if ex != nil && uirCoreFuncOriginFileOf(ex) == fnOriginFile:
                 sameFileIdx = exIdx
         if sameFileIdx >= 0:
-            let ex2: UirCoreFunc = mod.funcs[sameFileIdx]
-            if ex2 == nil || ex2.blocks.len == 0:
-                mbWriteFunc(mod.funcs, sameFileIdx, f)
-                if (f.name == "main"):
+            let ex2: UirCoreFunc = uirCoreModuleFuncAt(mod, sameFileIdx)
+            if ex2 == nil || uirCoreFuncBlocksLen(ex2) == 0:
+                uirCoreModuleSetFuncAt(mod, sameFileIdx, f)
+                if fnName == "main":
                     if ctx != nil && ctx.foundMain:
                         return Err[bool]("uirCore_builder: multiple main functions")
                     if ctx != nil:
@@ -238,17 +276,17 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
                 if ctx != nil && ctx.traceEnabled:
                     ctx.traceFnCount = ctx.traceFnCount + 1
                     if (ctx.traceFnCount % 50) == 0:
-                        stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + f.name)
+                        stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + fnName)
                 return Ok[bool](true)
             if uirCoreSkipSemStdDuplicateRelaxEnabled():
                 return Ok[bool](false)
-            return Err[bool]("uirCore_builder: duplicate function name: " + f.name)
-        if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
-           uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
+            return Err[bool]("uirCore_builder: duplicate function name: " + fnName)
+        if moduleHasFunc(mod, fnName) || moduleHasGlobal(mod, fnName) ||
+           uirCoreFindTypeAlias(mod, fnName) >= 0 || uirCoreFindObjType(mod, fnName) >= 0:
             if uirCoreSkipSemStdDuplicateRelaxEnabled():
                 return Ok[bool](false)
-            return Err[bool]("uirCore_builder: duplicate function name: " + f.name)
-        if (f.name == "main"):
+            return Err[bool]("uirCore_builder: duplicate function name: " + fnName)
+        if fnName == "main":
             if ctx != nil && ctx.foundMain:
                 return Err[bool]("uirCore_builder: multiple main functions")
             if ctx != nil:
@@ -257,65 +295,81 @@ fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root
         if ctx != nil && ctx.traceEnabled:
             ctx.traceFnCount = ctx.traceFnCount + 1
             if (ctx.traceFnCount % 50) == 0:
-                stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + f.name)
+                stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + fnName)
         return Ok[bool](true)
     return Ok[bool](false)
 
-fn uirCorePredeclareTopLevelFromRoot(mod: UirCoreModule, root: Node, filePath: str, n: Node,
-                                 reachable: hashsets.HashSetStr* = nil,
-                                 overloaded: hashsets.HashSetStr* = nil): Result[bool] =
-    if mod == nil || n == nil || n.kind == nkEmpty:
+fn uirCoreConsumeTopLevelFromRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx, root: Node, filePath: str, n: Node,
+                                  reachable: hashsets.HashSetStr* = nil,
+                                  overloaded: hashsets.HashSetStr* = nil): Result[bool] =
+    return uirCoreConsumeTopLevelFromRootId(mod, ctx, root, filePath, n, reachable, overloaded)
+
+fn uirCorePredeclareTopLevelFromRootId(mod: UirCoreModule, rootId: AstNodeId, filePath: str, nId: AstNodeId,
+                                       reachable: hashsets.HashSetStr* = nil,
+                                       overloaded: hashsets.HashSetStr* = nil): Result[bool] =
+    if mod == nil || !astNodeIdValid(nId) || astNodeKind(nId) == nkEmpty:
         return Ok[bool](false)
-    if n.kind == nkStmtList || n.kind == nkModule:
-        let fallback: str = (len(filePath) > 0) ? filePath : (root != nil ? root.strVal : "")
-        for j in 0..<kidCount(n):
-            let nn: Node = kid(n, j)
-            let stmtPath: str = (nn != nil && len(nn.strVal) > 0) ? nn.strVal : fallback
-            let res: Result[bool] = uirCorePredeclareTopLevelFromRoot(mod, root, stmtPath, nn, reachable, overloaded)
+    let callFilePath: str = uirCoreNormalizeTopLevelPath(filePath, astNodeStrVal(rootId))
+    let nKind: NodeKind = astNodeKind(nId)
+    if nKind == nkStmtList || nKind == nkModule:
+        let fallback: str = callFilePath
+        for j in 0..<astKidCount(nId):
+            let nnId: AstNodeId = astKidAt(nId, j)
+            let ownPath: str = astNodeStrVal(nnId)
+            let stmtPath: str = uirCoreNormalizeTopLevelPath(ownPath, fallback)
+            let res: Result[bool] = uirCorePredeclareTopLevelFromRootId(mod, rootId, stmtPath, nnId, reachable, overloaded)
             if !IsOk[bool](res):
                 return res
         return Ok[bool](true)
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+    if nKind == nkFnDecl || nKind == nkIteratorDecl:
         if reachable != nil:
-            var entryPathProbe: str = backendStripSpaces(filePath)
-            if n != nil && len(n.strVal) > 0:
-                entryPathProbe = backendStripSpaces(n.strVal)
+            var entryPathProbe: str = callFilePath
+            let ownPath: str = astNodeStrVal(nId)
+            if len(ownPath) > 0:
+                entryPathProbe = uirCoreNormalizeTopLevelPath(ownPath, callFilePath)
             let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
             if !keepByEntryFile:
-                let nameNode: Node = kid(n, 0)
-                if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
-                    let nm: str = backendStripSpaces(plainName(nameNode))
+                let nameNodeId: AstNodeId = astKidAt(nId, 0)
+                if astNodeIdValid(nameNodeId) && (astNodeKind(nameNodeId) == nkIdent || astNodeKind(nameNodeId) == nkSymbol):
+                    let nm: str = backendStripSpaces(astPlainName(nameNodeId))
                     if !hashsets.hashSetStrHas(*reachable, nm):
                         return Ok[bool](false)
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
+        if uirCoreFuncSigHasUnresolvedGenericsId(nId):
             return Ok[bool](false)
-        let fRes: Result[UirCoreFunc] = uirCoreBuildFuncHeader(mod, n, filePath, overloaded)
+        let fRes: Result[UirCoreFunc] = uirCoreBuildFuncHeaderId(mod, nId, callFilePath, overloaded)
         if !IsOk[UirCoreFunc](fRes):
             return ErrInfo[bool](ErrorInfoOf[UirCoreFunc](fRes))
         let f: UirCoreFunc = Value[UirCoreFunc](fRes)
         if f == nil:
             return Ok[bool](false)
-        if moduleHasFunc(mod, f.name) || moduleHasGlobal(mod, f.name) ||
-           uirCoreFindTypeAlias(mod, f.name) >= 0 || uirCoreFindObjType(mod, f.name) >= 0:
+        let fnName: str = uirCoreFuncNameOf(f)
+        let fnOriginFile: str = uirCoreFuncOriginFileOf(f)
+        if moduleHasFunc(mod, fnName) || moduleHasGlobal(mod, fnName) ||
+           uirCoreFindTypeAlias(mod, fnName) >= 0 || uirCoreFindObjType(mod, fnName) >= 0:
             var sameFile: bool = false
             var prevFile: str = ""
-            let exIdx: int32 = moduleFuncIndex(mod, f.name)
+            let exIdx: int32 = moduleFuncIndex(mod, fnName)
             if exIdx >= 0:
-                let ex: UirCoreFunc = mod.funcs[exIdx]
+                let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
                 if ex != nil:
-                    if ex.originFile == f.originFile:
+                    if uirCoreFuncOriginFileOf(ex) == fnOriginFile:
                         sameFile = true
                     else:
-                        let exFile: str = ex.originFile
-                        if len prevFile == 0 && len(exFile) > 0:
+                        let exFile: str = uirCoreFuncOriginFileOf(ex)
+                        if len(prevFile) == 0 && len(exFile) > 0:
                             prevFile = exFile
             if sameFile:
                 return Ok[bool](false)
             if uirCoreSkipSemStdDuplicateRelaxEnabled():
                 return Ok[bool](false)
-            if len prevFile > 0:
-                return Err[bool]("uirCore_builder: duplicate function name: " + f.name + " (files: " + prevFile + ", " + f.originFile + ")")
-            return Err[bool]("uirCore_builder: duplicate function name: " + f.name + " (file: " + f.originFile + ")")
+            if len(prevFile) > 0:
+                return Err[bool]("uirCore_builder: duplicate function name: " + fnName + " (files: " + prevFile + ", " + fnOriginFile + ")")
+            return Err[bool]("uirCore_builder: duplicate function name: " + fnName + " (file: " + fnOriginFile + ")")
         uirCoreAddFunc(mod, f)
         return Ok[bool](true)
     return Ok[bool](false)
+
+fn uirCorePredeclareTopLevelFromRoot(mod: UirCoreModule, root: Node, filePath: str, n: Node,
+                                     reachable: hashsets.HashSetStr* = nil,
+                                     overloaded: hashsets.HashSetStr* = nil): Result[bool] =
+    return uirCorePredeclareTopLevelFromRootId(mod, root, filePath, n, reachable, overloaded)

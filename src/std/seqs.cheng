@@ -33,6 +33,30 @@ fn cheng__seqGrowToRaw(pBuffer: void**, pCap: int32*, minCap: int32, typeSize: i
     if newBytes > oldBytes:
         zeroMem(ptr_add(newBuffer, oldBytes), newBytes - oldBytes)
 
+fn cheng__seqGrowInst(seqPtr: T[]*, minCap: int32, typeSize: int32) =
+    if seqPtr == nil:
+        return
+    if minCap <= 0:
+        return
+    let cap: int32 = seqPtr->cap
+    let buffer: void* = seqPtr->buffer
+    if buffer != nil && minCap <= cap:
+        return
+    var newCap: int32 = cap
+    if newCap < minCap:
+        newCap = cheng__seqNextCap(cap, minCap)
+    if newCap <= 0:
+        newCap = cheng__seqNextCap(0, minCap)
+    let oldBytes: int32 = (buffer != nil) ? (cap * typeSize) : 0
+    let newBytes: int32 = newCap * typeSize
+    let newBuffer: void* = realloc(buffer, newBytes)
+    if newBuffer == nil:
+        panic "cheng: out of memory"
+    seqPtr->buffer = newBuffer
+    seqPtr->cap = newCap
+    if newBytes > oldBytes:
+        zeroMem(ptr_add(newBuffer, oldBytes), newBytes - oldBytes)
+
 fn cheng__seqZeroTailRaw(buffer: void*, cap: int32, len: int32, target: int32, typeSize: int32) =
     if buffer == nil || target <= len:
         return
@@ -46,7 +70,7 @@ fn setLen(seqInst: var T[], newLen: int) =
     if target < 0:
         target = 0
     if target > seqInst.cap || (target > 0 && seqInst.buffer == nil):
-        cheng__seqGrowToRaw(&seqInst.buffer, &seqInst.cap, target, int32(sizeof T))
+        cheng__seqGrowInst(&seqInst, target, int32(sizeof T))
     if target > seqInst.len:
         cheng__seqZeroTailRaw(seqInst.buffer, seqInst.cap, seqInst.len, target, int32(sizeof T))
     seqInst.len = target
@@ -61,7 +85,7 @@ fn setLen(seqInst: T[]*, newLen: int) =
     if target < 0:
         target = 0
     if target > seqInst->cap || (target > 0 && seqInst->buffer == nil):
-        cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, target, int32(sizeof T))
+        cheng__seqGrowInst(seqInst, target, int32(sizeof T))
     if target > seqInst->len:
         cheng__seqZeroTailRaw(seqInst->buffer, seqInst->cap, seqInst->len, target, int32(sizeof T))
     seqInst->len = target
@@ -77,7 +101,7 @@ fn reserve(seqInst: var T[], newCap: int32) =
         return
     if newCap < 0:
         return
-    cheng__seqGrowToRaw(&seqInst.buffer, &seqInst.cap, newCap, int32(sizeof T))
+    cheng__seqGrowInst(&seqInst, newCap, int32(sizeof T))
 
 fn reserve(seqInst: var T[], newCap: int) =
     reserve(seqInst, int32(newCap))
@@ -89,7 +113,7 @@ fn reserve(seqInst: T[]*, newCap: int32) =
         return
     if newCap < 0:
         return
-    cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, newCap, int32(sizeof T))
+    cheng__seqGrowInst(seqInst, newCap, int32(sizeof T))
 
 fn reserve(seqInst: T[]*, newCap: int) =
     reserve(seqInst, int32(newCap))
@@ -121,7 +145,7 @@ fn get(seqInst: T[]*, at: int32): T =
 
 fn add(seqInst: var T[], val: T) =
     if seqInst.buffer == nil || seqInst.len >= seqInst.cap:
-        cheng__seqGrowToRaw(&seqInst.buffer, &seqInst.cap, seqInst.len + 1, int32(sizeof T))
+        cheng__seqGrowInst(&seqInst, seqInst.len + 1, int32(sizeof T))
     let elemBytes: int32 = seqInst.len * int32(sizeof T)
     let writePtr: T* = T*(ptr_add(seqInst.buffer, elemBytes))
     *writePtr = val
@@ -129,7 +153,7 @@ fn add(seqInst: var T[], val: T) =
 
 fn seqAdd(seqInst: var T[], val: T) =
     if seqInst.buffer == nil || seqInst.len >= seqInst.cap:
-        cheng__seqGrowToRaw(&seqInst.buffer, &seqInst.cap, seqInst.len + 1, int32(sizeof T))
+        cheng__seqGrowInst(&seqInst, seqInst.len + 1, int32(sizeof T))
     let elemBytes: int32 = seqInst.len * int32(sizeof T)
     let writePtr: T* = T*(ptr_add(seqInst.buffer, elemBytes))
     *writePtr = val
@@ -139,7 +163,7 @@ fn add(seqInst: T[]*, val: T) =
     if seqInst == nil:
         return
     if seqInst->buffer == nil || seqInst->len >= seqInst->cap:
-        cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, seqInst->len + 1, int32(sizeof T))
+        cheng__seqGrowInst(seqInst, seqInst->len + 1, int32(sizeof T))
     let elemBytes: int32 = seqInst->len * int32(sizeof T)
     let writePtr: T* = T*(ptr_add(seqInst->buffer, elemBytes))
     *writePtr = val
@@ -152,8 +176,24 @@ fn add(seqInst: var ptr[], val: void*) =
 fn add(seqInst: ptr[]*, val: void*) =
     if seqInst == nil:
         return
-    let valPtr: ptr = ptr(val)
-    add(seqInst, valPtr)
+    if seqInst->buffer == nil || seqInst->len >= seqInst->cap:
+        let oldCap: int32 = seqInst->cap
+        var newCap: int32 = cheng__seqNextCap(oldCap, seqInst->len + 1)
+        if newCap <= 0:
+            newCap = seqInst->len + 1
+        let oldBytes: int32 = (seqInst->buffer != nil) ? (oldCap * int32(sizeof ptr)) : 0
+        let newBytes: int32 = newCap * int32(sizeof ptr)
+        let newBuffer: void* = realloc(seqInst->buffer, newBytes)
+        if newBuffer == nil:
+            panic "cheng: out of memory"
+        seqInst->buffer = newBuffer
+        seqInst->cap = newCap
+        if newBytes > oldBytes:
+            zeroMem(ptr_add(newBuffer, oldBytes), newBytes - oldBytes)
+    let elemBytes: int32 = seqInst->len * int32(sizeof ptr)
+    var valLocal: void* = val
+    copyMem(ptr_add(seqInst->buffer, elemBytes), &valLocal, int32(sizeof ptr))
+    seqInst->len = seqInst->len + 1
 
 fn findImpl(seqInst: T[], val: T, start: int32): int32 =
     var index: int32 = start

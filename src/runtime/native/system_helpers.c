@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #if defined(__has_include)
 #if __has_include(<execinfo.h>)
@@ -31,13 +33,30 @@
 #define WEAK
 #endif
 
+int32_t cheng_strlen(char* s);
+
 /*
- * Compatibility shim:
- * Stage1 frontend may lower cmdline helpers to plain C symbols `paramCount/paramStr`.
- * Provide weak fallbacks so binaries remain runnable even when the std/cmdline
- * Cheng module is not linked in this path.
+ * Command-line runtime bridge:
+ * `std/cmdline` now reads argv from `__cheng_rt_paramCount/__cheng_rt_paramStr`.
+ * Keep `paramCount/paramStr` as weak compatibility aliases for one migration cycle.
  */
-WEAK int32_t paramCount(void) {
+static int32_t cheng_saved_argc = 0;
+static const char** cheng_saved_argv = NULL;
+
+WEAK void __cheng_setCmdLine(int32_t argc, const char** argv) {
+    if (argc <= 0 || argc > 4096 || argv == NULL) {
+        cheng_saved_argc = 0;
+        cheng_saved_argv = NULL;
+        return;
+    }
+    cheng_saved_argc = argc;
+    cheng_saved_argv = argv;
+}
+
+WEAK int32_t __cheng_rt_paramCount(void) {
+    if (cheng_saved_argc > 0 && cheng_saved_argc <= 4096 && cheng_saved_argv != NULL) {
+        return cheng_saved_argc;
+    }
 #if defined(__APPLE__)
     int* argc_ptr = _NSGetArgc();
     if (argc_ptr == NULL) {
@@ -47,13 +66,33 @@ WEAK int32_t paramCount(void) {
     if (argc <= 0 || argc > 4096) {
         return 0;
     }
-    return (int32_t)(argc - 1);
+    return (int32_t)argc;
 #else
     return 0;
 #endif
 }
 
-WEAK const char* paramStr(int32_t i) {
+/*
+ * Compatibility shim for legacy stage0 codegen that can externalize
+ * cmdline-local helper calls.
+ */
+WEAK int32_t __cmdCountFromRuntime(void) {
+    int32_t argc = __cheng_rt_paramCount();
+    if (argc <= 0 || argc > 4096) {
+        return 0;
+    }
+    return argc;
+}
+
+WEAK int32_t cmdCountFromRuntime(void) {
+    return __cmdCountFromRuntime();
+}
+
+WEAK const char* __cheng_rt_paramStr(int32_t i) {
+    if (i >= 0 && cheng_saved_argc > 0 && cheng_saved_argc <= 4096 && cheng_saved_argv != NULL && i < cheng_saved_argc) {
+        const char* s = cheng_saved_argv[i];
+        return s != NULL ? s : "";
+    }
 #if defined(__APPLE__)
     if (i < 0) {
         return "";
@@ -75,6 +114,35 @@ WEAK const char* paramStr(int32_t i) {
 #endif
 }
 
+WEAK char* __cheng_rt_paramStrCopy(int32_t i) {
+    const char* s = __cheng_rt_paramStr(i);
+    if (s == NULL) {
+        s = "";
+    }
+    size_t n = strlen(s);
+    char* out = (char*)malloc(n + 1u);
+    if (out == NULL) {
+        return (char*)"";
+    }
+    if (n > 0) {
+        memcpy(out, s, n);
+    }
+    out[n] = '\0';
+    return out;
+}
+
+WEAK int32_t paramCount(void) {
+    int32_t argc = __cheng_rt_paramCount();
+    if (argc <= 0) {
+        return 0;
+    }
+    return argc - 1;
+}
+
+WEAK const char* paramStr(int32_t i) {
+    return __cheng_rt_paramStr(i);
+}
+
 #if !defined(_WIN32)
 int32_t SystemFunction036(void* buf, int32_t len) {
     (void)buf;
@@ -82,6 +150,131 @@ int32_t SystemFunction036(void* buf, int32_t len) {
     return 0;
 }
 #endif
+
+WEAK int32_t c_puts(char* text) {
+    return puts(text != NULL ? text : "");
+}
+
+WEAK char* c_getenv(char* name) {
+    if (name == NULL) {
+        return NULL;
+    }
+    return getenv(name);
+}
+
+WEAK int32_t c_strcmp(char* a, char* b) {
+    return strcmp(a != NULL ? a : "", b != NULL ? b : "");
+}
+
+WEAK int32_t __cheng_str_eq(const char* a, const char* b) {
+    if (a == b) {
+        return 1;
+    }
+    if (a == NULL || b == NULL) {
+        return 0;
+    }
+    return strcmp(a, b) == 0 ? 1 : 0;
+}
+
+WEAK int32_t c_strlen(char* s) {
+    return cheng_strlen(s);
+}
+
+WEAK void c_iometer_call(void* hook, int32_t op, int64_t bytes) {
+    (void)hook;
+    (void)op;
+    (void)bytes;
+}
+
+WEAK int32_t libc_remove(const char* path) {
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    return remove(path);
+}
+
+WEAK int32_t libc_open(const char* path, int32_t flags, int32_t mode) {
+    if (path == NULL) {
+        return -1;
+    }
+    return open(path, flags, mode);
+}
+
+WEAK int32_t cheng_open_w_trunc(const char* path) {
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    return creat(path, 0644);
+}
+
+WEAK int32_t libc_close(int32_t fd) {
+    if (fd < 0) {
+        return -1;
+    }
+    return close(fd);
+}
+
+WEAK int64_t libc_write(int32_t fd, void* data, int64_t n) {
+    if (fd < 0 || data == NULL || n <= 0) {
+        return 0;
+    }
+    ssize_t wrote = write(fd, data, (size_t)n);
+    if (wrote < 0) {
+        return -1;
+    }
+    return (int64_t)wrote;
+}
+
+WEAK void zeroMem(void* p, int64_t n) {
+    if (p == NULL || n <= 0) {
+        return;
+    }
+    memset(p, 0, (size_t)n);
+}
+
+WEAK void* openImpl(char* filename, int32_t mode) {
+    const char* path = filename != NULL ? filename : "";
+    const char* openMode = "rb";
+    if (mode == 1) {
+        openMode = "wb";
+    } else if (mode != 0) {
+        openMode = "rb+";
+    }
+    return fopen(path, openMode);
+}
+
+WEAK uint64_t processOptionMask(int32_t opt) {
+    if (opt < 0 || opt >= 63) {
+        return 0;
+    }
+    return ((uint64_t)1) << (uint64_t)opt;
+}
+
+WEAK char* sliceStr(char* text, int32_t start, int32_t stop) {
+    if (text == NULL) {
+        return (char*)"";
+    }
+    int32_t n = cheng_strlen(text);
+    if (n <= 0) {
+        return (char*)"";
+    }
+    int32_t a = start < 0 ? 0 : start;
+    int32_t b = stop;
+    if (b >= n) {
+        b = n - 1;
+    }
+    if (b < a) {
+        return (char*)"";
+    }
+    int32_t span = b - a + 1;
+    char* out = (char*)malloc((size_t)span + 1u);
+    if (out == NULL) {
+        return (char*)"";
+    }
+    memcpy(out, text + a, (size_t)span);
+    out[span] = '\0';
+    return out;
+}
 
 #define STBI_ONLY_JPEG
 #define STBI_NO_STDIO
@@ -561,6 +754,13 @@ void* ptr_add(void* p, int32_t offset) {
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak))
 #endif
+void* rawmemAsVoid(void* p) {
+    return p;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
 uint64_t cheng_ptr_to_u64(void* p) {
     return (uint64_t)(uintptr_t)p;
 }
@@ -812,11 +1012,38 @@ static int32_t cheng_seq_next_cap(int32_t cur_cap, int32_t need) {
     return cap;
 }
 
+static void cheng_seq_sanitize(ChengSeqHeader* seq) {
+    if (seq == NULL) {
+        return;
+    }
+    if (seq->cap < 0 || seq->cap > (1 << 27) || seq->len < 0 || seq->len > seq->cap) {
+        seq->len = 0;
+        seq->cap = 0;
+        seq->buffer = NULL;
+        return;
+    }
+    if (seq->cap == 0) {
+        seq->buffer = NULL;
+    }
+    if (seq->buffer == NULL && seq->len != 0) {
+        seq->len = 0;
+    }
+    if (seq->buffer != NULL) {
+        uintptr_t p = (uintptr_t)seq->buffer;
+        if (p < 4096u || p > 0x0000FFFFFFFFFFFFull) {
+            seq->len = 0;
+            seq->cap = 0;
+            seq->buffer = NULL;
+        }
+    }
+}
+
 WEAK void reserve(void* seq_ptr, int32_t new_cap) {
     ChengSeqHeader* seq = (ChengSeqHeader*)seq_ptr;
     if (seq == NULL || new_cap < 0) {
         return;
     }
+    cheng_seq_sanitize(seq);
     if (new_cap == 0) {
         return;
     }
@@ -827,9 +1054,15 @@ WEAK void reserve(void* seq_ptr, int32_t new_cap) {
     if (target <= 0) {
         return;
     }
-    void* new_buf = realloc(seq->buffer, (size_t)target);
+    const size_t slot_bytes = sizeof(void*) < 32u ? 32u : sizeof(void*);
+    const size_t old_bytes = (size_t)(seq->cap > 0 ? seq->cap : 0) * slot_bytes;
+    const size_t new_bytes = (size_t)target * slot_bytes;
+    void* new_buf = realloc(seq->buffer, new_bytes);
     if (new_buf == NULL) {
         return;
+    }
+    if (new_bytes > old_bytes) {
+        memset((char*)new_buf + old_bytes, 0, new_bytes - old_bytes);
     }
     seq->buffer = new_buf;
     seq->cap = target;
@@ -844,6 +1077,7 @@ WEAK void setLen(void* seq_ptr, int32_t new_len) {
     if (seq == NULL) {
         return;
     }
+    cheng_seq_sanitize(seq);
     int32_t target = new_len;
     if (target < 0) {
         target = 0;
@@ -1452,11 +1686,35 @@ int32_t cheng_strlen(char* s) {
     const char* safe = cheng_safe_cstr((const char*)s);
     return (int32_t)strlen(safe);
 }
+char* cheng_str_concat(char* a, char* b) {
+    const char* sa = cheng_safe_cstr((const char*)a);
+    const char* sb = cheng_safe_cstr((const char*)b);
+    size_t la = strlen(sa);
+    size_t lb = strlen(sb);
+    size_t total = la + lb;
+    if (total > (size_t)INT32_MAX - 1) {
+        total = (size_t)INT32_MAX - 1;
+    }
+    char* out = (char*)cheng_malloc((int32_t)total + 1);
+    if (!out) {
+        return NULL;
+    }
+    if (la > 0) {
+        memcpy(out, sa, la);
+    }
+    if (lb > 0) {
+        memcpy(out + la, sb, lb);
+    }
+    out[total] = '\0';
+    return out;
+}
+WEAK char* __cheng_str_concat(char* a, char* b) { return cheng_str_concat(a, b); }
 void* cheng_memcpy(void* dest, void* src, int64_t n) { return memcpy(dest, src, (size_t)n); }
 void* cheng_memset(void* dest, int32_t val, int64_t n) { return memset(dest, val, (size_t)n); }
 void* cheng_memcpy_ffi(void* dest, void* src, int64_t n) { return cheng_memcpy(dest, src, n); }
 void* cheng_memset_ffi(void* dest, int32_t val, int64_t n) { return cheng_memset(dest, val, n); }
 __attribute__((weak)) void* alloc(int32_t size) { return cheng_malloc(size); }
+__attribute__((weak)) void dealloc(void* p) { cheng_free(p); }
 __attribute__((weak)) void copyMem(void* dest, void* src, int32_t size) { (void)cheng_memcpy(dest, src, (int64_t)size); }
 __attribute__((weak)) void setMem(void* dest, int32_t val, int32_t size) { (void)cheng_memset(dest, val, (int64_t)size); }
 int32_t cheng_memcmp(void* a, void* b, int64_t n) { return memcmp(a, b, (size_t)n); }
@@ -1590,12 +1848,30 @@ void* cheng_fopen(const char* filename, const char* mode) {
     return (void*)fopen(filename, mode);
 }
 
-int32_t cheng_fclose(void* f) { return fclose((FILE*)f); }
+static FILE* cheng_safe_stream(void* stream) {
+    if (stream == (void*)stdout || stream == (void*)stderr || stream == (void*)stdin) {
+        return (FILE*)stream;
+    }
+    if (stream == NULL) return stdout;
+    uintptr_t v = (uintptr_t)stream;
+    if (v < 0x100000000ull) {
+        return stdout;
+    }
+    return (FILE*)stream;
+}
+
+int32_t cheng_fclose(void* f) {
+    FILE* stream = cheng_safe_stream(f);
+    if (stream == stdout || stream == stderr || stream == stdin) return 0;
+    return fclose(stream);
+}
 int32_t cheng_fread(void* ptr, int64_t size, int64_t n, void* stream) {
-    return (int32_t)fread(ptr, (size_t)size, (size_t)n, (FILE*)stream);
+    FILE* f = cheng_safe_stream(stream);
+    return (int32_t)fread(ptr, (size_t)size, (size_t)n, f);
 }
 int32_t cheng_fwrite(void* ptr, int64_t size, int64_t n, void* stream) {
-    return (int32_t)fwrite(ptr, (size_t)size, (size_t)n, (FILE*)stream);
+    FILE* f = cheng_safe_stream(stream);
+    return (int32_t)fwrite(ptr, (size_t)size, (size_t)n, f);
 }
 int32_t cheng_fseek(void* stream, int64_t offset, int32_t whence) {
 #if defined(_WIN32)
@@ -1606,17 +1882,33 @@ int32_t cheng_fseek(void* stream, int64_t offset, int32_t whence) {
 }
 int64_t cheng_ftell(void* stream) {
 #if defined(_WIN32)
-    return (int64_t)_ftelli64((FILE*)stream);
+    FILE* f = cheng_safe_stream(stream);
+    return (int64_t)_ftelli64(f);
 #else
-    return (int64_t)ftello((FILE*)stream);
+    FILE* f = cheng_safe_stream(stream);
+    return (int64_t)ftello(f);
 #endif
 }
-int32_t cheng_fflush(void* stream) { return fflush((FILE*)stream); }
-int32_t cheng_fgetc(void* stream) { return fgetc((FILE*)stream); }
+int32_t cheng_fflush(void* stream) {
+    FILE* f = cheng_safe_stream(stream);
+    return fflush(f);
+}
+int32_t cheng_fgetc(void* stream) {
+    FILE* f = cheng_safe_stream(stream);
+    return fgetc(f);
+}
 
 void* get_stdin() { return (void*)stdin; }
 void* get_stdout() { return (void*)stdout; }
 void* get_stderr() { return (void*)stderr; }
+
+/*
+ * Stage0 compatibility shim:
+ * older bootstrap outputs may keep a direct unresolved call to symbol "[]=".
+ * Provide a benign fallback body to keep runtime symbol closure deterministic.
+ */
+int64_t cheng_index_set_compat(void) __asm__("_[]=");
+int64_t cheng_index_set_compat(void) { return 0; }
 
 // Backend fallback: provide `__addr` symbol (Mach-O uses leading underscore).
 // The backend should lower `__addr(...)` as an intrinsic, but during bootstrap
@@ -1655,6 +1947,7 @@ void* sys_memset(void* dest, int32_t val, int32_t n) {
   #include <netinet/in.h>
   #include <sys/socket.h>
   #include <unistd.h>   // getcwd
+  #include <sys/syscall.h>
   #include <sys/stat.h> // stat, mkdir
   #include <sys/wait.h>
   #include <sys/ioctl.h>
@@ -2232,6 +2525,20 @@ int32_t cheng_pty_write(int32_t fd, const char* data, int32_t len) {
         }
         return -1;
     }
+    return (int32_t)n;
+#endif
+}
+
+int32_t cheng_fd_write(int32_t fd, const char* data, int32_t len) {
+#if defined(_WIN32)
+    (void)fd;
+    (void)data;
+    (void)len;
+    return -1;
+#else
+    if (fd < 0 || data == NULL || len <= 0) return 0;
+    ssize_t n = (ssize_t)syscall(SYS_write, fd, data, (size_t)len);
+    if (n < 0) return -1;
     return (int32_t)n;
 #endif
 }

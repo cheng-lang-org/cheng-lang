@@ -8,6 +8,7 @@ import std/os
 import stage1/ast
 import stage1/diagnostics
 import stage1/lexer
+import std/rawmem_support
 
 let monoNodeKindCount: int32 = int32(nkNilLit) + 1
 
@@ -48,7 +49,7 @@ var monoOneArgFnParamTypes: Node[]
 var monoFnRetNames: str[]
 var monoFnRetTypes: Node[]
 var monoFnRetIndex: hashmaps.HashMapStrInt
-var monoRoot: Node = nil
+var monoRoot: Node = astInvalidNodeId()
 var monoTypeNames: str[]
 var monoTypeNodes: Node[]
 var monoTypeIndex: hashmaps.HashMapStrInt
@@ -97,9 +98,9 @@ var monoTypeMatchesCalls: int32 = 0
 var monoTypeMatchesNs: int64 = 0
 var stripSpacesCalls: int32 = 0
 var stripSpacesNs: int64 = 0
-var monoStripIndex: hashmaps.HashMapPtrInt
+var monoStripIndex: hashmaps.HashMapStrInt
 var monoStripValues: str[]
-var monoUnderscoreIndex: hashmaps.HashMapPtrInt
+var monoUnderscoreIndex: hashmaps.HashMapStrInt
 var monoLambdaCaptureIndex: hashmaps.HashMapPtrInt
 var monoLambdaCaptureValues: int8[]
 var monoZeroArgFnIndex: hashmaps.HashMapStrInt
@@ -185,6 +186,10 @@ fn monoEnsureInitMaps() =
         monoTypeNodeIndex = hashmaps.hashMapStrIntInit(256)
     if monoTypeKeyValidIndex.mask == 0:
         monoTypeKeyValidIndex = hashmaps.hashMapStrIntInit(256)
+    if monoStripIndex.mask == 0:
+        monoStripIndex = hashmaps.hashMapStrIntInit(2048)
+    if monoUnderscoreIndex.mask == 0:
+        monoUnderscoreIndex = hashmaps.hashMapStrIntInit(2048)
     if monoZeroArgFnIndex.mask == 0:
         monoZeroArgFnIndex = hashmaps.hashMapStrIntInit(128)
     if monoOneArgFnIndex.mask == 0:
@@ -222,8 +227,15 @@ var transformSeqLitNs: int64 = 0
 
 fn monoZeroHashMapStrInt(): hashmaps.HashMapStrInt =
     var m: hashmaps.HashMapStrInt
+    m.keys.buffer = nil
     m.keys.len = 0
+    m.keys.cap = 0
+    m.vals.buffer = nil
     m.vals.len = 0
+    m.vals.cap = 0
+    m.states.buffer = nil
+    m.states.len = 0
+    m.states.cap = 0
     m.mask = 0
     m.used = 0
     return m
@@ -236,6 +248,12 @@ fn monoStrEq(a: str, b: str): bool =
 
 fn monoStrNe(a: str, b: str): bool =
     return a != b
+
+fn monoNodeEq(a: Node, b: Node): bool =
+    return a == b
+
+fn monoNodeNe(a: Node, b: Node): bool =
+    return !monoNodeEq(a, b)
 
 fn monoProfileEnabled(): bool =
     let v0: str = mono_getenv("STAGE1_MONO_PROFILE")
@@ -456,7 +474,7 @@ fn monoNameTail(full: str): str =
         return full
     if cut >= n - 1:
         return ""
-    return str(ptr_add(full, cut + 1))
+    return rawmemStrFromOffset(full, cut + 1)
 
 fn genericFnHas(name: str): bool =
     if len name == 0:
@@ -485,12 +503,12 @@ fn genericFnHas(name: str): bool =
 
 fn genericFnGet(name: str): Node =
     if len name == 0:
-        return nil
+        return astInvalidNodeId()
     if monoHasChar(name, '_'):
         if ! genericFnHasUnderscore:
-            return nil
+            return astInvalidNodeId()
         if ! genericFnHasLowerUnderscore && ! monoHasUpperAlpha(name):
-            return nil
+            return astInvalidNodeId()
     var foundExact: bool = false
     let rawIdx: int32 = monoHashMapStrIntGetCompat(genericFnIndex, name, foundExact)
     if rawIdx > 0:
@@ -506,7 +524,7 @@ fn genericFnGet(name: str): Node =
             let fullName2: str = get(genericFnNames, aliasIdx)
             if monoStrEq(monoNameTail(fullName2), name):
                 return get(genericFnNodes, aliasIdx)
-    return nil
+    return astInvalidNodeId()
 
 fn genericFnAdd(name: str, node: Node) =
     if len name == 0:
@@ -528,72 +546,72 @@ fn genericFnAdd(name: str, node: Node) =
             genericFnHasLowerUnderscore = true
 
 fn monoGenericFnFirstParamIsSeq(fnNode: Node): bool =
-    if fnNode == nil || kidCount(fnNode) <= 1:
+    if astRefIsNil(fnNode) || kidCount(fnNode) <= 1:
         return false
     let params: Node = kid(fnNode, 1)
-    if params == nil || params.kind != nkFormalParams || kidCount(params) <= 0:
+    if astRefIsNil(params) || nodeKind(params) != nkFormalParams || kidCount(params) <= 0:
         return false
     let defs: Node = kid(params, 0)
-    if defs == nil || defs.kind != nkIdentDefs || kidCount(defs) <= 1:
+    if astRefIsNil(defs) || nodeKind(defs) != nkIdentDefs || kidCount(defs) <= 1:
         return false
-    var ty: Node = kid(defs, 1)
-    while ty != nil:
-        if ty.kind == nkPar || ty.kind == nkVarTy || ty.kind == nkRefTy || ty.kind == nkPtrTy:
+    var ty: Node = identDefsType(defs)
+    while astRefNonNil(ty):
+        if nodeKind(ty) == nkPar || nodeKind(ty) == nkVarTy || nodeKind(ty) == nkRefTy || nodeKind(ty) == nkPtrTy:
             if kidCount(ty) <= 0:
                 break
             ty = kid(ty, 0)
             continue
         break
-    if ty == nil:
+    if astRefIsNil(ty):
         return false
-    if ty.kind == nkBracketExpr && kidCount(ty) > 0:
+    if nodeKind(ty) == nkBracketExpr && kidCount(ty) > 0:
         let base: str = monoStripSpaces(plainName(kid(ty, 0)))
         return monoStrEq(base, "seq") || monoStrEq(base, "seq_fixed")
-    if ty.kind == nkIdent || ty.kind == nkSymbol:
+    if nodeKind(ty) == nkIdent || nodeKind(ty) == nkSymbol:
         let key: str = monoStripSpaces(plainName(ty))
         return monoStrEq(key, "seq") || monoStrEq(key, "seq_fixed") || monoStartsWith(key, "seq_") || monoStartsWith(key, "seq_fixed_")
     return false
 
 
 fn collectGenericDecls(n: Node) =
-    if n == nil:
+    if astRefIsNil(n):
         return
-    if n.kind == nkTypeDecl:
+    if nodeKind(n) == nkTypeDecl:
         let nameNode: Node = kid(n, 0)
-        if nameNode != nil:
+        if astRefNonNil(nameNode):
             let nm: str = getName nameNode
             if len nm > 0 && ! mapHasStrIndex(monoTypeIndex, nm):
                 mapPutStrNodeIndex(monoTypeIndex, monoTypeNames, monoTypeNodes, nm, n)
         if kidCount n > 2:
             let gens: Node = kid(n, 2)
-            if gens != nil && gens.kind == nkGenericParams && kidCount gens > 0:
-                if nameNode != nil:
+            if astRefNonNil(gens) && nodeKind(gens) == nkGenericParams && kidCount gens > 0:
+                if astRefNonNil(nameNode):
                     let nm2: str = getName nameNode
                     if len nm2 > 0 && ! mapHasStrIndex(genericTypeIndex, nm2):
                         mapPutStrNodeIndex(genericTypeIndex, genericTypeNames, genericTypeNodes, nm2, n)
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+    if nodeKind(n) == nkFnDecl || nodeKind(n) == nkIteratorDecl:
         if kidCount n > 4:
             let gens2: Node = kid(n, 4)
-            if gens2 != nil && gens2.kind == nkGenericParams && kidCount gens2 > 0:
+            if astRefNonNil(gens2) && nodeKind(gens2) == nkGenericParams && kidCount gens2 > 0:
                 let nameNode2: Node = kid(n, 0)
-                if nameNode2 != nil:
+                if astRefNonNil(nameNode2):
                     let nm2: str = getName nameNode2
                     if len nm2 > 0:
                         if ! genericFnHas(nm2):
                             genericFnAdd(nm2, n)
                         elif monoStrEq(nm2, "len"):
                             let prev: Node = genericFnGet(nm2)
-                            if prev != nil && !monoGenericFnFirstParamIsSeq(prev) && monoGenericFnFirstParamIsSeq(n):
+                            if astRefNonNil(prev) && !monoGenericFnFirstParamIsSeq(prev) && monoGenericFnFirstParamIsSeq(n):
                                 genericFnAdd(nm2, n)
-    if n.kind == nkTraitDecl:
+    if nodeKind(n) == nkTraitDecl:
         let nameNode3: Node = kid(n, 0)
-        if nameNode3 != nil:
+        if astRefNonNil(nameNode3):
             let nm3: str = getName nameNode3
             if len nm3 > 0 && ! mapHasStrIndex(traitIndex, nm3):
                 mapPutStrNodeIndex(traitIndex, traitNames, traitNodes, nm3, n)
-    if n.kind == nkConceptDecl:
+    if nodeKind(n) == nkConceptDecl:
         let nameNode4: Node = kid(n, 0)
-        if nameNode4 != nil:
+        if astRefNonNil(nameNode4):
             let nm4: str = getName nameNode4
             if len nm4 > 0 && ! mapHasStrIndex(conceptIndex, nm4):
                 mapPutStrNodeIndex(conceptIndex, conceptNames, conceptNodes, nm4, n)
@@ -634,7 +652,7 @@ fn monoValueScopePop() =
 fn monoValueAdd(name: str, ty: Node) =
     if len(name) == 0 || monoStrEq(name, "_"):
         return
-    if ty == nil || ty.kind == nkEmpty:
+    if astRefIsNil(ty) || nodeKind(ty) == nkEmpty:
         return
     var found: bool = false
     let prevIndexPlus1: int32 = monoHashMapStrIntGetCompat(monoValueIndex, name, found)
@@ -649,42 +667,42 @@ fn monoValueAdd(name: str, ty: Node) =
 
 fn monoValueLookup(name: str): Node =
     if len(name) == 0:
-        return nil
+        return astInvalidNodeId()
     var found: bool = false
     let idxPlus1: int32 = monoHashMapStrIntGetCompat(monoValueIndex, name, found)
     if ! found || idxPlus1 <= 0:
-        return nil
+        return astInvalidNodeId()
     let idx: int32 = idxPlus1 - 1
     if idx < 0 || idx >= monoValueTypes.len:
-        return nil
+        return astInvalidNodeId()
     return get(monoValueTypes, idx)
 
 fn monoNormalizeType(ty: Node): Node =
-    if ty == nil:
-        return nil
-    if ty.kind == nkVarTy && kidCount ty > 0:
+    if astRefIsNil(ty):
+        return astInvalidNodeId()
+    if nodeKind(ty) == nkVarTy && kidCount ty > 0:
         let inner: Node = monoNormalizeType kid(ty, 0)
         if inner != kid(ty, 0):
-            var wrap: Node = newNode(nkVarTy, ty.pos)
+            var wrap: Node = newNode(nkVarTy, nodePos(ty))
             addSon(wrap, inner)
             return wrap
         return ty
-    if ty.kind == nkIdent || ty.kind == nkSymbol:
+    if nodeKind(ty) == nkIdent || nodeKind(ty) == nkSymbol:
         let nm: str = monoStripSpaces(plainName(ty))
         let inst: Node = mapGetStrNodeIndex(instTypeIndex, instTypeNodes, nm)
-        if inst != nil:
+        if astRefNonNil(inst):
             return inst
     return ty
 
 fn monoUnwrapParType(n: Node): Node =
     var cur: Node = n
-    while cur != nil && cur.kind == nkPar && kidCount cur == 1:
+    while astRefNonNil(cur) && nodeKind(cur) == nkPar && kidCount cur == 1:
         cur = kid(cur, 0)
     return cur
 
 fn monoStripPtrRefVar(ty: Node): Node =
     var cur: Node = monoUnwrapParType ty
-    while cur != nil && (cur.kind == nkVarTy || cur.kind == nkPtrTy || cur.kind == nkRefTy):
+    while astRefNonNil(cur) && (nodeKind(cur) == nkVarTy || nodeKind(cur) == nkPtrTy || nodeKind(cur) == nkRefTy):
         if kidCount cur > 0:
             cur = monoUnwrapParType kid(cur, 0)
         else:
@@ -697,7 +715,7 @@ fn monoFieldClear() =
     hashmaps.hashMapStrIntClear(monoFieldIndex)
 
 fn monoAddFieldType(owner: str, fieldName: str, typeNode: Node) =
-    if len(owner) == 0 || len(fieldName) == 0 || typeNode == nil:
+    if len(owner) == 0 || len(fieldName) == 0 || astRefIsNil(typeNode):
         return
     let key: str = owner + "." + fieldName
     var found: bool = false
@@ -711,98 +729,98 @@ fn monoAddFieldType(owner: str, fieldName: str, typeNode: Node) =
 
 fn monoLookupFieldType(owner: str, fieldName: str): Node =
     if len(owner) == 0 || len(fieldName) == 0:
-        return nil
+        return astInvalidNodeId()
     let key: str = owner + "." + fieldName
     var found: bool = false
     let idxPlus1: int32 = monoHashMapStrIntGetCompat(monoFieldIndex, key, found)
     if found && idxPlus1 > 0 && idxPlus1 <= monoFieldTypes.len:
         return get(monoFieldTypes, idxPlus1 - 1)
-    return nil
+    return astInvalidNodeId()
 
 fn monoTypeDeclObjectDef(def: Node): Node =
-    if def == nil:
-        return nil
+    if astRefIsNil(def):
+        return astInvalidNodeId()
     let cur: Node = monoUnwrapParType def
-    if cur == nil:
-        return nil
-    if cur.kind == nkObjectDecl:
+    if astRefIsNil(cur):
+        return astInvalidNodeId()
+    if nodeKind(cur) == nkObjectDecl:
         return cur
-    if cur.kind == nkRefTy || cur.kind == nkPtrTy || cur.kind == nkVarTy:
+    if nodeKind(cur) == nkRefTy || nodeKind(cur) == nkPtrTy || nodeKind(cur) == nkVarTy:
         if kidCount cur > 0:
             let base: Node = monoUnwrapParType kid(cur, 0)
-            if base != nil && base.kind == nkObjectDecl:
+            if astRefNonNil(base) && nodeKind(base) == nkObjectDecl:
                 return base
-    return nil
+    return astInvalidNodeId()
 
 fn monoCollectRecListFieldTypes(owner: str, recList: Node) =
-    if len(owner) == 0 || recList == nil:
+    if len(owner) == 0 || astRefIsNil(recList):
         return
     for i in 0..<kidCount recList:
         let entry: Node = kid(recList, i)
-        if entry != nil && entry.kind == nkIdentDefs:
+        if astRefNonNil(entry) && nodeKind(entry) == nkIdentDefs:
             let typeNode: Node = identDefsType entry
             let nameCount: int32 = identDefsNameCount entry
             for j in 0..<nameCount:
                 var nameNode: Node = kid(entry, j)
-                if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 0:
+                if astRefNonNil(nameNode) && nodeKind(nameNode) == nkPattern && kidCount nameNode > 0:
                     nameNode = kid(nameNode, 0)
-                if nameNode != nil:
+                if astRefNonNil(nameNode):
                     let fieldName: str = monoStripSpaces(plainName(nameNode))
                     if len fieldName > 0:
                         monoAddFieldType(owner, fieldName, typeNode)
-        elif entry != nil && entry.kind == nkRecCase:
+        elif astRefNonNil(entry) && nodeKind(entry) == nkRecCase:
             if kidCount entry > 0:
                 let caseDefs: Node = kid(entry, 0)
-                if caseDefs != nil && caseDefs.kind == nkIdentDefs:
+                if astRefNonNil(caseDefs) && nodeKind(caseDefs) == nkIdentDefs:
                     let tagType: Node = identDefsType caseDefs
                     let tagCount: int32 = identDefsNameCount caseDefs
                     for tj in 0..<tagCount:
                         var tagName: Node = kid(caseDefs, tj)
-                        if tagName != nil && tagName.kind == nkPattern && kidCount tagName > 0:
+                        if astRefNonNil(tagName) && nodeKind(tagName) == nkPattern && kidCount tagName > 0:
                             tagName = kid(tagName, 0)
-                        if tagName != nil:
+                        if astRefNonNil(tagName):
                             let name: str = monoStripSpaces(plainName(tagName))
                             if len name > 0:
                                 monoAddFieldType(owner, name, tagType)
             for bi in 1..<kidCount entry:
                 let branch: Node = kid(entry, bi)
-                var body: Node = nil
-                if branch != nil && branch.kind == nkOfBranch && kidCount branch > 1:
+                var body: Node = astInvalidNodeId()
+                if astRefNonNil(branch) && nodeKind(branch) == nkOfBranch && kidCount branch > 1:
                     body = kid(branch, 1)
-                elif branch != nil && branch.kind == nkElse && kidCount branch > 0:
+                elif astRefNonNil(branch) && nodeKind(branch) == nkElse && kidCount branch > 0:
                     body = kid(branch, 0)
-                if body != nil && body.kind == nkRecList:
+                if astRefNonNil(body) && nodeKind(body) == nkRecList:
                     monoCollectRecListFieldTypes(owner, body)
 
 fn monoCollectObjectFieldTypes(owner: str, objDef: Node) =
-    if len(owner) == 0 || objDef == nil:
+    if len(owner) == 0 || astRefIsNil(objDef):
         return
-    var recList: Node = nil
+    var recList: Node = astInvalidNodeId()
     if kidCount objDef > 1:
         recList = kid(objDef, 1)
-    if recList == nil:
+    if astRefIsNil(recList):
         return
     monoCollectRecListFieldTypes(owner, recList)
 
 fn monoCollectFieldTypes(n: Node) =
-    if n == nil:
+    if astRefIsNil(n):
         return
-    if n.kind == nkTypeDecl:
+    if nodeKind(n) == nkTypeDecl:
         let nameNode: Node = kid(n, 0)
         let owner: str = getName nameNode
         if kidCount n > 1 && len owner > 0:
             let defNode: Node = kid(n, 1)
             let objDef: Node = monoTypeDeclObjectDef(defNode)
-            if objDef != nil:
+            if astRefNonNil(objDef):
                 monoCollectObjectFieldTypes(owner, objDef)
     for i in 0..<kidCount n:
         monoCollectFieldTypes kid(n, i)
 
 fn monoLookupExprType(n: Node): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     let profOn: bool = monoProfileActive
-    let profKind: NodeKind = n.kind
+    let profKind: NodeKind = nodeKind(n)
     var startNs: int64 = 0
     if profOn:
         monoLookupExprTypeCalls = monoLookupExprTypeCalls + 1
@@ -812,85 +830,85 @@ fn monoLookupExprType(n: Node): Node =
             let deltaNs: int64 = cheng_monotime_ns() - startNs
             monoLookupExprTypeNs = monoLookupExprTypeNs + deltaNs
             monoProfRecordExprKind(profKind, deltaNs)
-    if n.kind == nkPar && kidCount n == 1:
+    if nodeKind(n) == nkPar && kidCount n == 1:
         return monoLookupExprType kid(n, 0)
-    if n.kind == nkDotExpr && kidCount n > 1:
+    if nodeKind(n) == nkDotExpr && kidCount n > 1:
         let base: Node = kid(n, 0)
         let member: Node = kid(n, 1)
         let baseType0: Node = monoLookupExprType base
         var baseType: Node = monoStripPtrRefVar(monoNormalizeType(baseType0))
         var owner: str = ""
-        if baseType != nil && (baseType.kind == nkIdent || baseType.kind == nkSymbol):
+        if astRefNonNil(baseType) && (nodeKind(baseType) == nkIdent || nodeKind(baseType) == nkSymbol):
             owner = monoStripSpaces(plainName(baseType))
-        elif baseType != nil && baseType.kind == nkBracketExpr && kidCount baseType > 0:
+        elif astRefNonNil(baseType) && nodeKind(baseType) == nkBracketExpr && kidCount baseType > 0:
             owner = monoStripSpaces(plainName(kid(baseType, 0)))
-        if len owner > 0 && member != nil:
+        if len owner > 0 && astRefNonNil(member):
             let fieldName: str = monoStripSpaces(plainName(member))
             let fieldTy: Node = monoLookupFieldType(owner, fieldName)
-            if fieldTy != nil && fieldTy.kind != nkEmpty:
+            if astRefNonNil(fieldTy) && nodeKind(fieldTy) != nkEmpty:
                 return fieldTy
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         let nm: str = monoStripSpaces(plainName(n))
         return monoNormalizeType(monoValueLookup(nm))
-    if n.kind == nkBracketExpr:
+    if nodeKind(n) == nkBracketExpr:
         if kidCount n == 1:
             let baseTy: Node = monoNormalizeType(monoLookupExprType(kid(n, 0)))
-            if baseTy != nil && (baseTy.kind == nkPtrTy || baseTy.kind == nkRefTy || baseTy.kind == nkVarTy) && kidCount baseTy > 0:
+            if astRefNonNil(baseTy) && (nodeKind(baseTy) == nkPtrTy || nodeKind(baseTy) == nkRefTy || nodeKind(baseTy) == nkVarTy) && kidCount baseTy > 0:
                 return monoNormalizeType(kid(baseTy, 0))
         elif kidCount n > 1:
             let baseTy0: Node = monoLookupExprType(kid(n, 0))
             let baseTy: Node = monoStripPtrRefVar(monoNormalizeType(baseTy0))
-            if baseTy != nil && baseTy.kind == nkBracketExpr && kidCount baseTy > 1:
+            if astRefNonNil(baseTy) && nodeKind(baseTy) == nkBracketExpr && kidCount baseTy > 1:
                 let baseName: str = monoStripSpaces(plainName(kid(baseTy, 0)))
                 if monoStrEq(baseName, "seq") || monoStrEq(baseName, "seq_fixed"):
                     return monoNormalizeType(kid(baseTy, 1))
-    if n.kind == nkCall && kidCount n > 0:
+    if nodeKind(n) == nkCall && kidCount n > 0:
         let head: Node = kid(n, 0)
         var headNameNode: Node = head
-        if head != nil && head.kind == nkDotExpr && kidCount head > 1:
+        if astRefNonNil(head) && nodeKind(head) == nkDotExpr && kidCount head > 1:
             headNameNode = kid(head, 1)
-        elif head != nil && head.kind == nkBracketExpr && kidCount head > 0:
+        elif astRefNonNil(head) && nodeKind(head) == nkBracketExpr && kidCount head > 0:
             let h0: Node = kid(head, 0)
             headNameNode = h0
-            if h0 != nil && h0.kind == nkDotExpr && kidCount h0 > 1:
+            if astRefNonNil(h0) && nodeKind(h0) == nkDotExpr && kidCount h0 > 1:
                 headNameNode = kid(h0, 1)
-        if headNameNode != nil && (headNameNode.kind == nkIdent || headNameNode.kind == nkSymbol):
+        if astRefNonNil(headNameNode) && (nodeKind(headNameNode) == nkIdent || nodeKind(headNameNode) == nkSymbol):
             let nm2: str = monoStripSpaces(plainName(headNameNode))
             let retTy: Node = mapGetStrNodeIndex(monoFnRetIndex, monoFnRetTypes, nm2)
-            if retTy != nil && retTy.kind != nkEmpty:
+            if astRefNonNil(retTy) && nodeKind(retTy) != nkEmpty:
                 return monoNormalizeType(retTy)
-    return nil
+    return astInvalidNodeId()
 
 fn monoBindNameWithType(nameNode: Node, ty: Node) =
-    if nameNode == nil:
+    if astRefIsNil(nameNode):
         return
-    if nameNode.kind == nkIdent || nameNode.kind == nkSymbol:
+    if nodeKind(nameNode) == nkIdent || nodeKind(nameNode) == nkSymbol:
         let nm: str = monoStripSpaces(plainName(nameNode))
         monoValueAdd(nm, ty)
         return
-    if nameNode.kind == nkPattern && kidCount nameNode > 0:
+    if nodeKind(nameNode) == nkPattern && kidCount nameNode > 0:
         monoBindNameWithType(kid(nameNode, 0), ty)
 
 fn monoBindFormalParams(paramsNode: Node) =
-    if paramsNode == nil || paramsNode.kind != nkFormalParams:
+    if astRefIsNil(paramsNode) || nodeKind(paramsNode) != nkFormalParams:
         return
     for i in 0..<kidCount paramsNode:
         let defs: Node = kid(paramsNode, i)
-        if defs != nil && defs.kind == nkIdentDefs && kidCount defs >= 2:
-            let typeNode: Node = kid(defs, 1)
-            for j in 0..<kidCount defs - 2:
+        if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs >= 2:
+            let typeNode: Node = identDefsType(defs)
+            for j in 0..<identDefsNameCount(defs):
                 monoBindNameWithType(kid(defs, j), typeNode)
 
 fn monoFirstParamType(fnNode: Node): Node =
-    if fnNode == nil:
-        return nil
+    if astRefIsNil(fnNode):
+        return astInvalidNodeId()
     if kidCount fnNode > 1:
         let paramsNode: Node = kid(fnNode, 1)
-        if paramsNode != nil && paramsNode.kind == nkFormalParams && kidCount paramsNode > 0:
+        if astRefNonNil(paramsNode) && nodeKind(paramsNode) == nkFormalParams && kidCount paramsNode > 0:
             let defs: Node = kid(paramsNode, 0)
-            if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
-                return kid(defs, 1)
-    return nil
+            if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs > 1:
+                return identDefsType(defs)
+    return astInvalidNodeId()
 
 fn monoFnSetClear() =
     monoZeroArgFnNames.len = 0
@@ -922,7 +940,7 @@ fn monoFnSetAdd(v: str[]*, name: str, index: hashmaps.HashMapStrInt* = nil) =
 fn monoFnRetAdd(name: str, ty: Node) =
     if len(name) == 0:
         return
-    if ty == nil || ty.kind == nkEmpty:
+    if astRefIsNil(ty) || nodeKind(ty) == nkEmpty:
         return
     var found: bool = false
     let prevIdx: int32 = monoHashMapStrIntGetCompat(monoFnRetIndex, name, found)
@@ -952,13 +970,13 @@ fn monoFnHasArity(name: str, arity: int32): bool =
 fn monoFnParamAdd(name: str, ty: Node) =
     if len(name) == 0:
         return
-    if ty == nil || ty.kind == nkEmpty:
+    if astRefIsNil(ty) || nodeKind(ty) == nkEmpty:
         return
     add(monoOneArgFnParamNames, name)
     add(monoOneArgFnParamTypes, ty)
 
 fn monoStripVarType(ty: Node): Node =
-    if ty != nil && ty.kind == nkVarTy && kidCount ty > 0:
+    if astRefNonNil(ty) && nodeKind(ty) == nkVarTy && kidCount ty > 0:
         return kid(ty, 0)
     return ty
 
@@ -967,7 +985,7 @@ fn monoTypeKeyNorm(ty: Node): str =
     return typeKey norm
 
 fn monoTypeMatches(paramTy: Node, baseTy: Node): bool =
-    if paramTy == nil || baseTy == nil:
+    if astRefIsNil(paramTy) || astRefIsNil(baseTy):
         return false
     if paramTy == baseTy:
         return true
@@ -1035,15 +1053,15 @@ fn monoFirstUnderscorePos(name: str): int32 =
         return -1
     let n: int32 = len name
     var cached: bool = false
-    let cachedPlus2: int32 = hashmaps.hashMapPtrIntGet(monoUnderscoreIndex, void*(name), &cached)
+    let cachedPlus2: int32 = hashmaps.hashMapStrIntGetEx(monoUnderscoreIndex, name, cached)
     if cached && cachedPlus2 > 0:
         return cachedPlus2 - 2
     for i in 0..<n:
         if name[i] == '_':
             let stored: int32 = i + 2
-            hashmaps.hashMapPtrIntPut(&monoUnderscoreIndex, void*(name), stored)
+            hashmaps.hashMapStrIntPut(monoUnderscoreIndex, name, stored)
             return i
-    hashmaps.hashMapPtrIntPut(&monoUnderscoreIndex, void*(name), 1)
+    hashmaps.hashMapStrIntPut(monoUnderscoreIndex, name, 1)
     return -1
 
 fn monoSliceRange(s: str, start: int32, stop: int32): str =
@@ -1061,9 +1079,9 @@ fn monoSliceRange(s: str, start: int32, stop: int32): str =
         endIdx = n - 1
     let count: int32 = endIdx - start + 1
     let p: void* = alloc(count + 1)
-    let src: void* = ptr_add(void*(s), start)
-    copyMem(p, src, count)
-    setMem(ptr_add(p, count), 0, 1)
+    let src: void* = rawmemPtrAdd(ptr(s), start)
+    rawmemCopy(p, src, count)
+    rawmemSet(rawmemPtrAdd(p, count), 0, 1)
     return str(p)
 
 fn monoDropPrefix(s: str, prefixLen: int32): str =
@@ -1074,7 +1092,7 @@ fn monoDropPrefix(s: str, prefixLen: int32): str =
         return s
     if prefixLen >= n:
         return ""
-    return str(ptr_add(s, prefixLen))
+    return rawmemStrFromOffset(s, prefixLen)
 
 fn monoStripDotSuffix(s: str): str =
     if len(s) == 0:
@@ -1144,18 +1162,18 @@ fn monoIsValidTypeKey(key: str): bool =
 
 fn monoTypeNodeFromKey(key: str): Node =
     if monoStrEq(key, ""):
-        return nil
+        return astInvalidNodeId()
     var found: bool = false
     let cachedIdx: int32 = monoHashMapStrIntGetCompat(monoTypeNodeIndex, key, found)
     if found && cachedIdx >= 0 && cachedIdx < monoTypeNodeValues.len:
         return get(monoTypeNodeValues, cachedIdx)
     let pos: SourcePos = monoDummyPos()
-    var out: Node = nil
+    var out: Node = astInvalidNodeId()
     if monoStartsWith(key, "ptr_"):
         let rest: str = monoDropPrefix(key, 4)
         var n: Node = newNode(nkPtrTy, pos)
         var base: Node = monoTypeNodeFromKey(rest)
-        if base == nil:
+        if astRefIsNil(base):
             base = newIdent("void", pos)
         addSon(n, base)
         out = n
@@ -1163,7 +1181,7 @@ fn monoTypeNodeFromKey(key: str): Node =
         let rest2: str = monoDropPrefix(key, 4)
         var n2: Node = newNode(nkRefTy, pos)
         var base2: Node = monoTypeNodeFromKey(rest2)
-        if base2 == nil:
+        if astRefIsNil(base2):
             base2 = newIdent("void", pos)
         addSon(n2, base2)
         out = n2
@@ -1171,7 +1189,7 @@ fn monoTypeNodeFromKey(key: str): Node =
         let rest3: str = monoDropPrefix(key, 4)
         var n3: Node = newNode(nkVarTy, pos)
         var base3: Node = monoTypeNodeFromKey(rest3)
-        if base3 == nil:
+        if astRefIsNil(base3):
             base3 = newIdent("void", pos)
         addSon(n3, base3)
         out = n3
@@ -1205,9 +1223,9 @@ fn monoTypeNodeFromKey(key: str): Node =
     return out
 
 fn monoMaybeInstantiateMangledFnName(n: Node, rootStmts: Node[]*) =
-    if n == nil || rootStmts == nil:
+    if astRefIsNil(n) || rootStmts == nil:
         return
-    if n.kind != nkIdent && n.kind != nkSymbol:
+    if nodeKind(n) != nkIdent && nodeKind(n) != nkSymbol:
         return
     if genericFnNames.len == 0:
         return
@@ -1235,16 +1253,16 @@ fn monoMaybeInstantiateMangledFnName(n: Node, rootStmts: Node[]*) =
             if len base > 0:
                 let baseLen: int32 = firstIdx
                 let genNode: Node = genericFnGet(base)
-                if genNode != nil:
-                    var generics: Node = nil
+                if astRefNonNil(genNode):
+                    var generics: Node = astInvalidNodeId()
                     if kidCount genNode > 4:
                         generics = kid(genNode, 4)
-                    if generics != nil && generics.kind == nkGenericParams && kidCount generics == 1:
+                    if astRefNonNil(generics) && nodeKind(generics) == nkGenericParams && kidCount generics == 1:
                         let rest0: str = monoDropPrefix(name, baseLen + 1)
                         let rest: str = monoStripDotSuffix(rest0)
                         if len rest > 0 && monoIsValidTypeKey(rest):
                             let arg0: Node = monoTypeNodeFromKey(rest)
-                            if arg0 != nil:
+                            if astRefNonNil(arg0):
                                 var args: Node[1]
                                 add(args, arg0)
                                 instantiateFn(base, args, rootStmts)
@@ -1258,22 +1276,22 @@ fn monoMaybeInstantiateMangledFnName(n: Node, rootStmts: Node[]*) =
                 if len base > 0:
                     let baseLen: int32 = i
                     let genNode: Node = genericFnGet(base)
-                    if genNode != nil:
-                        var generics: Node = nil
+                    if astRefNonNil(genNode):
+                        var generics: Node = astInvalidNodeId()
                         if kidCount genNode > 4:
                             generics = kid(genNode, 4)
-                        if generics != nil && generics.kind == nkGenericParams && kidCount generics == 1:
+                        if astRefNonNil(generics) && nodeKind(generics) == nkGenericParams && kidCount generics == 1:
                             let rest0: str = monoDropPrefix(name, baseLen + 1)
                             let rest: str = monoStripDotSuffix(rest0)
                             if len rest > 0 && monoIsValidTypeKey(rest):
                                 let arg0: Node = monoTypeNodeFromKey(rest)
-                                if arg0 != nil:
+                                if astRefNonNil(arg0):
                                     var args: Node[1]
                                     add(args, arg0)
                                     instantiateFn(base, args, rootStmts)
 
 fn monoFnOneArgMatches(name: str, baseTy: Node): bool =
-    if len(name) == 0 || baseTy == nil:
+    if len(name) == 0 || astRefIsNil(baseTy):
         return false
     let __for_start_i = monoOneArgFnParamNames.len - 1
     for __for_rev_i in 0..(__for_start_i - (0)):
@@ -1285,22 +1303,22 @@ fn monoFnOneArgMatches(name: str, baseTy: Node): bool =
     return false
 
 fn monoBracketBaseName(ty: Node): str =
-    if ty == nil || ty.kind != nkBracketExpr || kidCount ty == 0:
+    if astRefIsNil(ty) || nodeKind(ty) != nkBracketExpr || kidCount ty == 0:
         return ""
     return monoStripSpaces(plainName(kid(ty, 0)))
 
 fn fnParamCount(paramsNode: Node): int32 =
-    if paramsNode == nil || paramsNode.kind != nkFormalParams:
+    if astRefIsNil(paramsNode) || nodeKind(paramsNode) != nkFormalParams:
         return 0
     return kidCount paramsNode
 
 fn monoInferGenericArgsFromCall(fnNode: Node, callNode: Node, outArgs: Node[]*): bool =
-    if fnNode == nil || callNode == nil || outArgs == nil:
+    if astRefIsNil(fnNode) || astRefIsNil(callNode) || outArgs == nil:
         return false
-    var generics: Node = nil
+    var generics: Node = astInvalidNodeId()
     if kidCount fnNode > 4:
         generics = kid(fnNode, 4)
-    if generics == nil || generics.kind != nkGenericParams || kidCount generics == 0:
+    if astRefIsNil(generics) || nodeKind(generics) != nkGenericParams || kidCount generics == 0:
         return false
     var paramNames: str[4]
     collectGenericParamNames(generics, &paramNames)
@@ -1313,32 +1331,32 @@ fn monoInferGenericArgsFromCall(fnNode: Node, callNode: Node, outArgs: Node[]*):
         if paramIndex >= paramTypes.len:
             break
         var argNode: Node = kid(callNode, argIndex)
-        if argNode != nil && argNode.kind == nkCallArg && kidCount argNode > 1:
+        if astRefNonNil(argNode) && nodeKind(argNode) == nkCallArg && kidCount argNode > 1:
             argNode = kid(argNode, 1)
         var actualTy: Node = monoLookupExprType argNode
         let paramTy: Node = get(paramTypes, paramIndex)
-        if actualTy != nil && paramTy != nil:
+        if astRefNonNil(actualTy) && astRefNonNil(paramTy):
             var actualAdj: Node = actualTy
-            if actualAdj != nil && (actualAdj.kind == nkIdent || actualAdj.kind == nkSymbol):
+            if astRefNonNil(actualAdj) && (nodeKind(actualAdj) == nkIdent || nodeKind(actualAdj) == nkSymbol):
                 let key: str = typeKey actualAdj
                 let parsed: Node = monoTypeNodeFromKey(key)
-                if parsed != nil && parsed.kind != nkIdent && parsed.kind != nkSymbol:
+                if astRefNonNil(parsed) && nodeKind(parsed) != nkIdent && nodeKind(parsed) != nkSymbol:
                     actualAdj = parsed
-            if paramTy.kind == nkVarTy && actualAdj.kind != nkVarTy:
-                var wrap: Node = newNode(nkVarTy, callNode.pos)
+            if nodeKind(paramTy) == nkVarTy && nodeKind(actualAdj) != nkVarTy:
+                var wrap: Node = newNode(nkVarTy, nodePos(callNode))
                 addSon(wrap, actualAdj)
                 actualAdj = wrap
             let pCore: Node = monoStripVarType paramTy
             let aCore: Node = monoStripVarType actualAdj
-            if pCore != nil && pCore.kind == nkBracketExpr:
-                if aCore == nil || aCore.kind != nkBracketExpr:
-                    actualAdj = nil
+            if astRefNonNil(pCore) && nodeKind(pCore) == nkBracketExpr:
+                if astRefIsNil(aCore) || nodeKind(aCore) != nkBracketExpr:
+                    actualAdj = astInvalidNodeId()
                 else:
                     let pBase: str = monoBracketBaseName pCore
                     let aBase: str = monoBracketBaseName aCore
                     if len pBase > 0 && len aBase > 0 && pBase != aBase:
-                        actualAdj = nil
-            if actualAdj != nil:
+                        actualAdj = astInvalidNodeId()
+            if astRefNonNil(actualAdj):
                 bindTypeVars(paramTy, actualAdj, paramNames, &mapNames, &mapTypes)
         paramIndex = paramIndex + 1
     var emptyArgs: Node[]
@@ -1346,49 +1364,49 @@ fn monoInferGenericArgsFromCall(fnNode: Node, callNode: Node, outArgs: Node[]*):
     return outArgs->len == kidCount generics
 
 fn monoMaybeLowerAssignToEqCall(lhs0: Node, rhs0: Node, rootStmts: Node[]*): Node =
-    if lhs0 == nil || rhs0 == nil || rootStmts == nil:
-        return nil
+    if astRefIsNil(lhs0) || astRefIsNil(rhs0) || rootStmts == nil:
+        return astInvalidNodeId()
     var lhs: Node = lhs0
-    while lhs != nil && lhs.kind == nkPar && kidCount(lhs) > 0:
+    while astRefNonNil(lhs) && nodeKind(lhs) == nkPar && kidCount(lhs) > 0:
         lhs = kid(lhs, 0)
     # Indexed assignment lowers through `[]=`; do not rewrite into `=`.
-    if lhs != nil && lhs.kind == nkBracketExpr && kidCount(lhs) > 1:
-        return nil
+    if astRefNonNil(lhs) && nodeKind(lhs) == nkBracketExpr && kidCount(lhs) > 1:
+        return astInvalidNodeId()
     # Prefer explicit simple lvalues for assignment overloads.
-    if lhs == nil || (lhs.kind != nkIdent && lhs.kind != nkSymbol):
-        return nil
+    if astRefIsNil(lhs) || (nodeKind(lhs) != nkIdent && nodeKind(lhs) != nkSymbol):
+        return astInvalidNodeId()
     let name: str = "="
     var genNode: Node = genericFnGet(name)
-    if genNode == nil && genericFnHas(name):
+    if astRefIsNil(genNode) && genericFnHas(name):
         genNode = findGenericFnDecl(monoRoot, name)
-        if genNode != nil:
+        if astRefNonNil(genNode):
             genericFnAdd(name, genNode)
-    if genNode == nil:
-        return nil
-    var probeCall: Node = newNode(nkCall, lhs.pos)
-    addSon(probeCall, newIdent(name, lhs.pos))
+    if astRefIsNil(genNode):
+        return astInvalidNodeId()
+    var probeCall: Node = newNode(nkCall, nodePos(lhs))
+    addSon(probeCall, newIdent(name, nodePos(lhs)))
     addSon(probeCall, lhs0)
     addSon(probeCall, rhs0)
     var instArgs: Node[4]
     if !monoInferGenericArgsFromCall(genNode, probeCall, &instArgs):
-        return nil
+        return astInvalidNodeId()
     let instName: str = mangleInstance(name, instArgs)
     if !instantiateFn(name, instArgs, rootStmts):
-        return nil
-    var callNode: Node = newNode(nkCall, lhs.pos)
-    addSon(callNode, newIdent(instName, lhs.pos))
+        return astInvalidNodeId()
+    var callNode: Node = newNode(nkCall, nodePos(lhs))
+    addSon(callNode, newIdent(instName, nodePos(lhs)))
     addSon(callNode, lhs0)
     addSon(callNode, rhs0)
     return callNode
 
 fn collectFnArities(n: Node) =
-    if n == nil:
+    if astRefIsNil(n):
         return
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
-        var generics: Node = nil
+    if nodeKind(n) == nkFnDecl || nodeKind(n) == nkIteratorDecl:
+        var generics: Node = astInvalidNodeId()
         if kidCount n > 4:
             generics = kid(n, 4)
-        if generics == nil || generics.kind != nkGenericParams || kidCount generics == 0:
+        if astRefIsNil(generics) || nodeKind(generics) != nkGenericParams || kidCount generics == 0:
             let nameNode: Node = kid(n, 0)
             let paramsNode: Node = kid(n, 1)
             let pname: str = getName nameNode
@@ -1397,10 +1415,10 @@ fn collectFnArities(n: Node) =
                 monoFnSetAdd(&monoZeroArgFnNames, pname, &monoZeroArgFnIndex)
             elif count == 1:
                 monoFnSetAdd(&monoOneArgFnNames, pname, &monoOneArgFnIndex)
-                if paramsNode != nil && kidCount paramsNode > 0:
+                if astRefNonNil(paramsNode) && kidCount paramsNode > 0:
                     let defs: Node = kid(paramsNode, 0)
-                    if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
-                        monoFnParamAdd(pname, kid(defs, 1))
+                    if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs > 1:
+                        monoFnParamAdd(pname, identDefsType(defs))
             if kidCount n > 2:
                 let retTy: Node = kid(n, 2)
                 monoFnRetAdd(pname, retTy)
@@ -1408,61 +1426,61 @@ fn collectFnArities(n: Node) =
         collectFnArities kid(n, i)
 
 fn monoCallHeadName(callNode: Node): str =
-    if callNode == nil || callNode.kind != nkCall || kidCount callNode == 0:
+    if astRefIsNil(callNode) || nodeKind(callNode) != nkCall || kidCount callNode == 0:
         return ""
     let head: Node = kid(callNode, 0)
-    if head == nil:
+    if astRefIsNil(head):
         return ""
     var headNameNode: Node = head
-    if head.kind == nkDotExpr && kidCount head > 1:
+    if nodeKind(head) == nkDotExpr && kidCount head > 1:
         headNameNode = kid(head, 1)
-    elif head.kind == nkBracketExpr && kidCount head > 0:
+    elif nodeKind(head) == nkBracketExpr && kidCount head > 0:
         let h0: Node = kid(head, 0)
         headNameNode = h0
-        if h0 != nil && h0.kind == nkDotExpr && kidCount h0 > 1:
+        if astRefNonNil(h0) && nodeKind(h0) == nkDotExpr && kidCount h0 > 1:
             headNameNode = kid(h0, 1)
-    if headNameNode != nil && (headNameNode.kind == nkIdent || headNameNode.kind == nkSymbol):
+    if astRefNonNil(headNameNode) && (nodeKind(headNameNode) == nkIdent || nodeKind(headNameNode) == nkSymbol):
         return monoStripSpaces(plainName(headNameNode))
     return ""
 
 fn monoInferBindTypeFromInitCall(initNode: Node): Node =
-    if initNode == nil || initNode.kind != nkCall:
-        return nil
+    if astRefIsNil(initNode) || nodeKind(initNode) != nkCall:
+        return astInvalidNodeId()
     let calleeName: str = monoCallHeadName(initNode)
     if len calleeName == 0:
-        return nil
+        return astInvalidNodeId()
     return mapGetStrNodeIndex(monoFnRetIndex, monoFnRetTypes, calleeName)
 
 fn cloneNodeShallow(n: Node): Node =
-    if n == nil:
-        return nil
-    var out: Node = newNode(n.kind, n.pos)
-    nodeSetIdent(out, n.ident)
-    nodeSetStrVal(out, n.strVal)
-    out.intVal = n.intVal
-    out.floatVal = n.floatVal
-    out.callStyle = n.callStyle
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    var out: Node = newNode(nodeKind(n), nodePos(n))
+    nodeSetIdent(out, nodeIdent(n))
+    nodeSetStrVal(out, nodeStrVal(n))
+    nodeSetIntVal(out, nodeIntVal(n))
+    nodeSetFloatVal(out, nodeFloatVal(n))
+    nodeSetCallStyle(out, nodeCallStyle(n))
     return out
 
 fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node
 fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node
 
 fn monoCallHeadIsCharAt(head: Node): bool =
-    if head == nil:
+    if astRefIsNil(head):
         return false
-    if head.kind == nkIdent || head.kind == nkSymbol:
+    if nodeKind(head) == nkIdent || nodeKind(head) == nkSymbol:
         return monoStrEq(monoStripSpaces(plainName(head)), "charAt")
-    if head.kind == nkDotExpr && kidCount(head) > 1:
+    if nodeKind(head) == nkDotExpr && kidCount(head) > 1:
         return monoStrEq(monoStripSpaces(plainName(kid(head, 1))), "charAt")
     return false
 
 fn monoIsIntLitZero(n: Node): bool =
-    return n != nil && n.kind == nkIntLit && n.intVal == 0
+    return astRefNonNil(n) && nodeKind(n) == nkIntLit && nodeIntVal(n) == 0
 
 fn monoExprMentionsIdent(n: Node, name: str): bool =
-    if n == nil || len(name) == 0:
+    if astRefIsNil(n) || len(name) == 0:
         return false
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         return monoStrEq(monoStripSpaces(plainName(n)), name)
     for i in 0..<kidCount n:
         if monoExprMentionsIdent(kid(n, i), name):
@@ -1470,27 +1488,27 @@ fn monoExprMentionsIdent(n: Node, name: str): bool =
     return false
 
 fn monoSeqElemTypeFromExpr(n: Node): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     var ty0: Node = monoLookupExprType n
     # Fallback: some identifier nodes (especially globals) may not be in the
     # local value map during implicit-call lowering, but still carry semantic
     # typeCache.
-    if (ty0 == nil || ty0.kind == nkEmpty) && n.typeCacheValid && n.typeCache != nil:
-        ty0 = n.typeCache
+    if (astRefIsNil(ty0) || nodeKind(ty0) == nkEmpty) && nodeTypeCacheValid(n) && astRefNonNil(nodeTypeCache(n)):
+        ty0 = nodeTypeCache(n)
     var ty: Node = monoStripPtrRefVar(monoNormalizeType(ty0))
-    if ty == nil:
-        return nil
+    if astRefIsNil(ty):
+        return astInvalidNodeId()
     # Normalize instantiated seq types like `seq_T` into `seq[T]` so we can
     # extract the element type.
-    if ty.kind == nkIdent || ty.kind == nkSymbol:
+    if nodeKind(ty) == nkIdent || nodeKind(ty) == nkSymbol:
         let key: str = typeKey ty
         if monoStartsWith(key, "seq_") || monoStartsWith(key, "seq_fixed_"):
             let parsed: Node = monoTypeNodeFromKey key
-            if parsed != nil:
+            if astRefNonNil(parsed):
                 ty = parsed
-    if ty.kind != nkBracketExpr:
-        return nil
+    if nodeKind(ty) != nkBracketExpr:
+        return astInvalidNodeId()
     let baseName: str = monoBracketBaseName ty
     if monoStrNe(baseName, "seq") && monoStrNe(baseName, "seq_fixed"):
         # Defensive fallback for old/new parser boundary shapes:
@@ -1502,79 +1520,73 @@ fn monoSeqElemTypeFromExpr(n: Node): Node =
                 return monoNormalizeType(kid(ty, 0))
             if kidCount ty == 2:
                 return monoNormalizeType(kid(ty, 0))
-        return nil
+        return astInvalidNodeId()
     if kidCount ty <= 1:
-        return nil
+        return astInvalidNodeId()
     return monoNormalizeType(kid(ty, 1))
 
 fn monoMaybeLowerSeqLenCapAssign(stmt: Node, lhs: Node, rhs: Node, rootStmts: Node[]*): Node =
-    if stmt == nil || lhs == nil || rhs == nil || rootStmts == nil:
-        return nil
+    if astRefIsNil(stmt) || astRefIsNil(lhs) || astRefIsNil(rhs) || rootStmts == nil:
+        return astInvalidNodeId()
     # `std/seqs` implements low-level seq header mutations; do not rewrite.
-    if len(stmt.strVal) > 0 && strContains(stmt.strVal, "src/std/seqs.cheng"):
-        return nil
-    if lhs.kind != nkDotExpr || kidCount lhs <= 1:
-        return nil
+    if len(nodeStrVal(stmt)) > 0 && strContains(nodeStrVal(stmt), "src/std/seqs.cheng"):
+        return astInvalidNodeId()
+    if nodeKind(lhs) != nkDotExpr || kidCount lhs <= 1:
+        return astInvalidNodeId()
     let base: Node = kid(lhs, 0)
     let member: Node = kid(lhs, 1)
-    if base == nil || member == nil:
-        return nil
+    if astRefIsNil(base) || astRefIsNil(member):
+        return astInvalidNodeId()
     let memberName: str = monoStripSpaces(plainName(member))
     if monoStrNe(memberName, "len") && monoStrNe(memberName, "cap"):
-        return nil
+        return astInvalidNodeId()
     # Keep `_` placeholder untouched when it appears as a direct base.
-    if base.kind == nkIdent || base.kind == nkSymbol:
+    if nodeKind(base) == nkIdent || nodeKind(base) == nkSymbol:
         let baseName: str = monoStripSpaces(plainName(base))
         if len(baseName) == 0 || monoStrEq(baseName, "_"):
-            return nil
+            return astInvalidNodeId()
         # Don't rewrite self-referential mutations like `xs.len = xs.len - 1`.
         if monoExprMentionsIdent(rhs, baseName):
-            return nil
+            return astInvalidNodeId()
     # Keep raw header mutations for `var` params (common in low-level code).
     let baseTyRaw: Node = monoLookupExprType base
-    if baseTyRaw != nil && baseTyRaw.kind == nkVarTy:
-        return nil
+    if astRefNonNil(baseTyRaw) && nodeKind(baseTyRaw) == nkVarTy:
+        return astInvalidNodeId()
     # Keep explicit zeroing patterns (bootstrap header init).
     if monoIsIntLitZero rhs:
-        return nil
+        return astInvalidNodeId()
     let elemTy: Node = monoSeqElemTypeFromExpr base
-    if elemTy == nil || elemTy.kind == nkEmpty:
-        return nil
+    if astRefIsNil(elemTy) || nodeKind(elemTy) == nkEmpty:
+        return astInvalidNodeId()
     var instArgs: Node[1]
     add(instArgs, elemTy)
     let calleeBase: str = monoStrEq(memberName, "len") ? "setLen" : "reserve"
     let instName: str = mangleInstance(calleeBase, instArgs)
     if !instantiateFn(calleeBase, instArgs, rootStmts):
-        return nil
+        return astInvalidNodeId()
     if len(instName) == 0:
-        return nil
+        return astInvalidNodeId()
 
-    var addr: Node = newNode(nkCall, stmt.pos)
-    addSon(addr, newIdent("__addr", stmt.pos))
+    var addr: Node = newNode(nkCall, nodePos(stmt))
+    addSon(addr, newIdent("__addr", nodePos(stmt)))
     addSon(addr, base)
 
-    var call: Node = newNode(nkCall, stmt.pos)
-    addSon(call, newIdent(instName, stmt.pos))
+    var call: Node = newNode(nkCall, nodePos(stmt))
+    addSon(call, newIdent(instName, nodePos(stmt)))
     addSon(call, addr)
     addSon(call, rhs)
     return call
 
 fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
-    if n == nil:
-        return nil
-    if n.kind == nkTypeDecl || n.kind == nkObjectDecl || n.kind == nkEnumDecl || n.kind == nkEnumFieldDecl ||
-       n.kind == nkConceptDecl || n.kind == nkTraitDecl || n.kind == nkMacroDecl || n.kind == nkTemplateDecl ||
-       n.kind == nkFormalParams || n.kind == nkIdentDefs || n.kind == nkGenericParams ||
-       n.kind == nkRefTy || n.kind == nkPtrTy || n.kind == nkVarTy || n.kind == nkTupleTy || n.kind == nkSetTy || n.kind == nkFnTy ||
-       n.kind == nkRecList || n.kind == nkRecCase ||
-       n.kind == nkPragma || n.kind == nkAnnotation ||
-       n.kind == nkImportStmt || n.kind == nkImportAs || n.kind == nkImportGroup:
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    if nodeKind(n) == nkTypeDecl || nodeKind(n) == nkObjectDecl || nodeKind(n) == nkEnumDecl || nodeKind(n) == nkEnumFieldDecl ||       nodeKind(n) == nkConceptDecl || nodeKind(n) == nkTraitDecl || nodeKind(n) == nkMacroDecl || nodeKind(n) == nkTemplateDecl ||       nodeKind(n) == nkFormalParams || nodeKind(n) == nkIdentDefs || nodeKind(n) == nkGenericParams ||       nodeKind(n) == nkRefTy || nodeKind(n) == nkPtrTy || nodeKind(n) == nkVarTy || nodeKind(n) == nkTupleTy || nodeKind(n) == nkSetTy || nodeKind(n) == nkFnTy ||       nodeKind(n) == nkRecList || nodeKind(n) == nkRecCase ||       nodeKind(n) == nkPragma || nodeKind(n) == nkAnnotation ||       nodeKind(n) == nkImportStmt || nodeKind(n) == nkImportAs || nodeKind(n) == nkImportGroup:
         return n
-    case n.kind
+    case nodeKind(n)
     of nkIdent, nkSymbol:
         let nm: str = monoStripSpaces(plainName(n))
-        if monoFnHasArity(nm, 0) && monoValueLookup nm == nil:
-            var call0: Node = newNode(nkCall, n.pos)
+        if monoFnHasArity(nm, 0) && astRefIsNil(monoValueLookup(nm)):
+            var call0: Node = newNode(nkCall, nodePos(n))
             addSon(call0, n)
             return call0
         return n
@@ -1586,13 +1598,13 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
             for ci in 1..<kidCount n:
                 let oldArg: Node = kid(n, ci)
                 let newArg: Node = lowerImplicitCallsExpr(oldArg, rootStmts)
-                if newArg != oldArg:
+                if monoNodeNe(newArg, oldArg):
                     changedCall = true
-                if newArg != nil:
+                if astRefNonNil(newArg):
                     add(outKidsCall, newArg)
             if outKidsCall.len == 3 && monoCallHeadIsCharAt(kid(n, 0)):
-                var bracketCall: Node = newNode(nkCall, n.pos)
-                addSon(bracketCall, newIdent("[]", n.pos))
+                var bracketCall: Node = newNode(nkCall, nodePos(n))
+                addSon(bracketCall, newIdent("[]", nodePos(n)))
                 addSon(bracketCall, get(outKidsCall, 1))
                 addSon(bracketCall, get(outKidsCall, 2))
                 return bracketCall
@@ -1615,41 +1627,41 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
                 # introduce missing symbol instantiations during bootstrap).
                 if monoStrEq(memberName, "len") || monoStrEq(memberName, "cap"):
                     let elemTy: Node = monoSeqElemTypeFromExpr base2
-                    if elemTy != nil && elemTy.kind != nkEmpty:
-                        if base2 != base:
-                            var dotHdr: Node = newNode(nkDotExpr, n.pos)
+                    if astRefNonNil(elemTy) && nodeKind(elemTy) != nkEmpty:
+                        if monoNodeNe(base2, base):
+                            var dotHdr: Node = newNode(nkDotExpr, nodePos(n))
                             addSon(dotHdr, base2)
                             addSon(dotHdr, member)
                             return dotHdr
                         return n
                 let genNode: Node = genericFnGet(memberName)
                 let baseTy: Node = monoLookupExprType base2
-                var generics: Node = nil
-                if genNode != nil && kidCount genNode > 4:
+                var generics: Node = astInvalidNodeId()
+                if astRefNonNil(genNode) && kidCount genNode > 4:
                     generics = kid(genNode, 4)
-                if genNode != nil && baseTy != nil && generics != nil && generics.kind == nkGenericParams && kidCount generics > 0:
+                if astRefNonNil(genNode) && astRefNonNil(baseTy) && astRefNonNil(generics) && nodeKind(generics) == nkGenericParams && kidCount generics > 0:
                     var paramNames: str[4]
                     collectGenericParamNames(generics, &paramNames)
                     var mapNames: str[4]
                     var mapTypes: Node[4]
                     let firstParamTy: Node = monoFirstParamType genNode
-                    if firstParamTy != nil:
+                    if astRefNonNil(firstParamTy):
                         var actualTy: Node = baseTy
-                        if firstParamTy.kind == nkVarTy && actualTy != nil && actualTy.kind != nkVarTy:
-                            var wrap: Node = newNode(nkVarTy, base2.pos)
+                        if nodeKind(firstParamTy) == nkVarTy && astRefNonNil(actualTy) && nodeKind(actualTy) != nkVarTy:
+                            var wrap: Node = newNode(nkVarTy, nodePos(base2))
                             addSon(wrap, actualTy)
                             actualTy = wrap
                         let fpCore: Node = monoStripVarType firstParamTy
                         let actCore: Node = monoStripVarType actualTy
-                        if fpCore != nil && fpCore.kind == nkBracketExpr:
-                            if actCore == nil || actCore.kind != nkBracketExpr:
-                                actualTy = nil
+                        if astRefNonNil(fpCore) && nodeKind(fpCore) == nkBracketExpr:
+                            if astRefIsNil(actCore) || nodeKind(actCore) != nkBracketExpr:
+                                actualTy = astInvalidNodeId()
                             else:
                                 let fpBase: str = monoBracketBaseName fpCore
                                 let actBase: str = monoBracketBaseName actCore
                                 if len fpBase > 0 && len actBase > 0 && fpBase != actBase:
-                                    actualTy = nil
-                        if actualTy != nil:
+                                    actualTy = astInvalidNodeId()
+                        if astRefNonNil(actualTy):
                             bindTypeVars(firstParamTy, actualTy, paramNames, &mapNames, &mapTypes)
                     var instArgs: Node[4]
                     var emptyArgs: Node[]
@@ -1657,21 +1669,21 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
                     if instArgs.len == kidCount generics:
                         let instName: str = mangleInstance(memberName, instArgs)
                         if instantiateFn(memberName, instArgs, rootStmts):
-                            var call1: Node = newNode(nkCall, n.pos)
-                            addSon(call1, newIdent(instName, n.pos))
+                            var call1: Node = newNode(nkCall, nodePos(n))
+                            addSon(call1, newIdent(instName, nodePos(n)))
                             addSon(call1, base2)
                             return call1
-                if monoFnHasArity(memberName, 1) && baseTy != nil && monoFnOneArgMatches(memberName, baseTy):
+                if monoFnHasArity(memberName, 1) && astRefNonNil(baseTy) && monoFnOneArgMatches(memberName, baseTy):
                     var dotOut: Node = n
-                    if base2 != base:
-                        dotOut = newNode(nkDotExpr, n.pos)
+                    if monoNodeNe(base2, base):
+                        dotOut = newNode(nkDotExpr, nodePos(n))
                         addSon(dotOut, base2)
                         addSon(dotOut, member)
-                    var call2: Node = newNode(nkCall, n.pos)
+                    var call2: Node = newNode(nkCall, nodePos(n))
                     addSon(call2, dotOut)
                     return call2
-            if base2 != base:
-                var dotNew: Node = newNode(nkDotExpr, n.pos)
+            if monoNodeNe(base2, base):
+                var dotNew: Node = newNode(nkDotExpr, nodePos(n))
                 addSon(dotNew, base2)
                 addSon(dotNew, member)
                 return dotNew
@@ -1681,8 +1693,8 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
             let nameNode: Node = kid(n, 0)
             let valNode: Node = kid(n, 1)
             let newVal: Node = lowerImplicitCallsExpr(valNode, rootStmts)
-            if newVal != valNode:
-                var outArg: Node = newNode(nkCallArg, n.pos)
+            if monoNodeNe(newVal, valNode):
+                var outArg: Node = newNode(nkCallArg, nodePos(n))
                 addSon(outArg, nameNode)
                 addSon(outArg, newVal)
                 return outArg
@@ -1698,9 +1710,9 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
             var childL: Node = oldChildL
             if li == 3:
                 childL = lowerImplicitCallsStmt(oldChildL, rootStmts)
-            if childL != oldChildL:
+            if monoNodeNe(childL, oldChildL):
                 changedL = true
-            if childL != nil:
+            if astRefNonNil(childL):
                 add(outKidsL, childL)
         monoValueScopePop()
         if ! changedL:
@@ -1717,9 +1729,9 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
             var childC: Node = oldChildC
             if ci > 0:
                 childC = lowerImplicitCallsExpr(oldChildC, rootStmts)
-            if childC != oldChildC:
+            if monoNodeNe(childC, oldChildC):
                 changedC = true
-            if childC != nil:
+            if astRefNonNil(childC):
                 add(outKidsC, childC)
         if ! changedC:
             return n
@@ -1733,9 +1745,9 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
         for i in 0..<kidCount n:
             let oldChild: Node = kid(n, i)
             let child: Node = lowerImplicitCallsExpr(oldChild, rootStmts)
-            if child != oldChild:
+            if monoNodeNe(child, oldChild):
                 changed = true
-            if child != nil:
+            if astRefNonNil(child):
                 add(outKids, child)
         if ! changed:
             return n
@@ -1745,9 +1757,9 @@ fn lowerImplicitCallsExpr(n: Node, rootStmts: Node[]*): Node =
         return out
 
 fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
-    if n == nil:
-        return nil
-    case n.kind
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    case nodeKind(n)
     of nkModule, nkStmtList:
         monoValueScopePush()
         var changed: bool = false
@@ -1755,9 +1767,9 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
         for i in 0..<kidCount n:
             let oldChild: Node = kid(n, i)
             let child: Node = lowerImplicitCallsStmt(oldChild, rootStmts)
-            if child != oldChild:
+            if monoNodeNe(child, oldChild):
                 changed = true
-            if child != nil:
+            if astRefNonNil(child):
                 add(outKids, child)
         monoValueScopePop()
         if ! changed:
@@ -1777,7 +1789,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             var child2: Node = oldChild2
             if i2 == 3:
                 child2 = lowerImplicitCallsStmt(oldChild2, rootStmts)
-            if child2 != oldChild2:
+            if monoNodeNe(child2, oldChild2):
                 changed2 = true
             add(outKids2, child2)
         monoValueScopePop()
@@ -1788,10 +1800,10 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             addSon(out2, get(outKids2, k2))
         return out2
     of nkVar, nkLet, nkConst:
-        var nameNode: Node = nil
-        var typeNode: Node = nil
-        var valNode: Node = nil
-        var pragmaNode: Node = nil
+        var nameNode: Node = astInvalidNodeId()
+        var typeNode: Node = astInvalidNodeId()
+        var valNode: Node = astInvalidNodeId()
+        var pragmaNode: Node = astInvalidNodeId()
         if kidCount n > 0:
             nameNode = kid(n, 0)
         if kidCount n > 1:
@@ -1802,30 +1814,30 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             pragmaNode = kid(n, 3)
         let newVal: Node = lowerImplicitCallsExpr(valNode, rootStmts)
         var out3: Node = n
-        if newVal != valNode:
-            out3 = newNode(n.kind, n.pos)
+        if monoNodeNe(newVal, valNode):
+            out3 = newNode(nodeKind(n), nodePos(n))
             addSon(out3, nameNode)
             addSon(out3, typeNode)
             addSon(out3, newVal)
             addSon(out3, pragmaNode)
-        var patternType: Node = nil
-        if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 1:
+        var patternType: Node = astInvalidNodeId()
+        if astRefNonNil(nameNode) && nodeKind(nameNode) == nkPattern && kidCount nameNode > 1:
             patternType = kid(nameNode, 1)
         var bindType: Node = typeNode
-        if bindType == nil || bindType.kind == nkEmpty:
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
             bindType = patternType
-        if bindType == nil || bindType.kind == nkEmpty:
-            if newVal != nil && newVal.typeCacheValid && !isEmpty(newVal.typeCache):
-                bindType = newVal.typeCache
-            elif valNode != nil && valNode.typeCacheValid && !isEmpty(valNode.typeCache):
-                bindType = valNode.typeCache
-        if bindType == nil || bindType.kind == nkEmpty:
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
+            if astRefNonNil(newVal) && nodeTypeCacheValid(newVal) && !isEmpty(nodeTypeCache(newVal)):
+                bindType = nodeTypeCache(newVal)
+            elif astRefNonNil(valNode) && nodeTypeCacheValid(valNode) && !isEmpty(nodeTypeCache(valNode)):
+                bindType = nodeTypeCache(valNode)
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
             let inferred: Node = monoInferBindTypeFromInitCall(newVal)
-            if inferred != nil && inferred.kind != nkEmpty:
+            if astRefNonNil(inferred) && nodeKind(inferred) != nkEmpty:
                 bindType = inferred
-        if bindType == nil || bindType.kind == nkEmpty:
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
             let inferred2: Node = monoLookupExprType(newVal)
-            if inferred2 != nil && inferred2.kind != nkEmpty:
+            if astRefNonNil(inferred2) && nodeKind(inferred2) != nkEmpty:
                 bindType = inferred2
         monoBindNameWithType(nameNode, bindType)
         return out3
@@ -1833,7 +1845,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
         if kidCount n > 0:
             let oldExpr: Node = kid(n, 0)
             let newExpr: Node = lowerImplicitCallsExpr(oldExpr, rootStmts)
-            if newExpr != oldExpr:
+            if monoNodeNe(newExpr, oldExpr):
                 var out4: Node = cloneNodeShallow n
                 addSon(out4, newExpr)
                 return out4
@@ -1844,12 +1856,12 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let rhs: Node = kid(n, 1)
             let newRhs: Node = lowerImplicitCallsExpr(rhs, rootStmts)
             let seqAssignCall: Node = monoMaybeLowerSeqLenCapAssign(n, lhs, newRhs, rootStmts)
-            if seqAssignCall != nil:
+            if astRefNonNil(seqAssignCall):
                 return seqAssignCall
             let eqCall: Node = monoMaybeLowerAssignToEqCall(lhs, newRhs, rootStmts)
-            if eqCall != nil:
+            if astRefNonNil(eqCall):
                 return eqCall
-            if newRhs != rhs:
+            if monoNodeNe(newRhs, rhs):
                 var out5: Node = cloneNodeShallow n
                 addSon(out5, lhs)
                 addSon(out5, newRhs)
@@ -1864,7 +1876,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let body: Node = kid(n, i3 + 1)
             let cond2: Node = lowerImplicitCallsExpr(cond, rootStmts)
             let body2: Node = lowerImplicitCallsStmt(body, rootStmts)
-            if cond2 != cond || body2 != body:
+            if monoNodeNe(cond2, cond) || monoNodeNe(body2, body):
                 changed3 = true
             add(outKids3, cond2)
             add(outKids3, body2)
@@ -1872,7 +1884,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
         if i3 < kidCount n:
             let tail: Node = kid(n, i3)
             let tail2: Node = lowerImplicitCallsStmt(tail, rootStmts)
-            if tail2 != tail:
+            if monoNodeNe(tail2, tail):
                 changed3 = true
             add(outKids3, tail2)
         if ! changed3:
@@ -1887,7 +1899,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let bodyW: Node = kid(n, 1)
             let condW2: Node = lowerImplicitCallsExpr(condW, rootStmts)
             let bodyW2: Node = lowerImplicitCallsStmt(bodyW, rootStmts)
-            if condW2 != condW || bodyW2 != bodyW:
+            if monoNodeNe(condW2, condW) || monoNodeNe(bodyW2, bodyW):
                 var out7: Node = cloneNodeShallow n
                 addSon(out7, condW2)
                 addSon(out7, bodyW2)
@@ -1900,7 +1912,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let bodyF: Node = kid(n, 2)
             let iterExpr2: Node = lowerImplicitCallsExpr(iterExpr, rootStmts)
             let bodyF2: Node = lowerImplicitCallsStmt(bodyF, rootStmts)
-            if iterExpr2 != iterExpr || bodyF2 != bodyF:
+            if monoNodeNe(iterExpr2, iterExpr) || monoNodeNe(bodyF2, bodyF):
                 var out8: Node = cloneNodeShallow n
                 addSon(out8, pat)
                 addSon(out8, iterExpr2)
@@ -1914,7 +1926,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
         if kidCount n > 0:
             let sel: Node = kid(n, 0)
             let sel2: Node = lowerImplicitCallsExpr(sel, rootStmts)
-            if sel2 != sel:
+            if monoNodeNe(sel2, sel):
                 changed4 = true
             add(outKids4, sel2)
             ci = 1
@@ -1923,7 +1935,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             ci = __for_ci_1
             let br: Node = kid(n, ci)
             let br2: Node = lowerImplicitCallsStmt(br, rootStmts)
-            if br2 != br:
+            if monoNodeNe(br2, br):
                 changed4 = true
             add(outKids4, br2)
             ci = ci + 1
@@ -1939,15 +1951,15 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
         for bi in 0..<kidCount n:
             let ch: Node = kid(n, bi)
             var ch2: Node = ch
-            if ch != nil && ch.kind == nkGuard && kidCount ch > 0:
+            if astRefNonNil(ch) && nodeKind(ch) == nkGuard && kidCount ch > 0:
                 let gexpr: Node = kid(ch, 0)
                 let gexpr2: Node = lowerImplicitCallsExpr(gexpr, rootStmts)
-                if gexpr2 != gexpr:
-                    ch2 = newNode(nkGuard, ch.pos)
+                if monoNodeNe(gexpr2, gexpr):
+                    ch2 = newNode(nkGuard, nodePos(ch))
                     addSon(ch2, gexpr2)
-            elif ch != nil && ch.kind == nkStmtList:
+            elif astRefNonNil(ch) && nodeKind(ch) == nkStmtList:
                 ch2 = lowerImplicitCallsStmt(ch, rootStmts)
-            if ch2 != ch:
+            if monoNodeNe(ch2, ch):
                 changed5 = true
             add(outKids5, ch2)
         if ! changed5:
@@ -1960,7 +1972,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
         if kidCount n > 0:
             let bodyE: Node = kid(n, 0)
             let bodyE2: Node = lowerImplicitCallsStmt(bodyE, rootStmts)
-            if bodyE2 != bodyE:
+            if monoNodeNe(bodyE2, bodyE):
                 var out11: Node = cloneNodeShallow n
                 addSon(out11, bodyE2)
                 return out11
@@ -1970,7 +1982,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
             let label: Node = kid(n, 0)
             let bodyB: Node = kid(n, 1)
             let bodyB2: Node = lowerImplicitCallsStmt(bodyB, rootStmts)
-            if bodyB2 != bodyB:
+            if monoNodeNe(bodyB2, bodyB):
                 var out12: Node = cloneNodeShallow n
                 addSon(out12, label)
                 addSon(out12, bodyB2)
@@ -1980,7 +1992,7 @@ fn lowerImplicitCallsStmt(n: Node, rootStmts: Node[]*): Node =
         if kidCount n > 0:
             let bodyD: Node = kid(n, 0)
             let bodyD2: Node = lowerImplicitCallsStmt(bodyD, rootStmts)
-            if bodyD2 != bodyD:
+            if monoNodeNe(bodyD2, bodyD):
                 var out13: Node = cloneNodeShallow n
                 addSon(out13, bodyD2)
                 return out13
@@ -2026,11 +2038,11 @@ fn mapGetStrNode(keys: str[], vals: Node[], key: str): Node =
     for i in 0..<keys.len:
         if monoStrEq(get(keys, i), key):
             return get(vals, i)
-    return nil
+    return astInvalidNodeId()
 
 fn mapGetStrNodeIndex(index: hashmaps.HashMapStrInt, vals: Node[], key: str): Node =
     if len(key) == 0:
-        return nil
+        return astInvalidNodeId()
     let profOn: bool = monoProfileActive
     var startNs: int64 = 0
     if profOn:
@@ -2043,7 +2055,7 @@ fn mapGetStrNodeIndex(index: hashmaps.HashMapStrInt, vals: Node[], key: str): No
     let idx: int32 = monoHashMapStrIntGetCompat(index, key, found)
     if found && idx >= 0 && idx < vals.len:
         return get(vals, idx)
-    return nil
+    return astInvalidNodeId()
 
 fn mapHasStr(keys: str[], key: str): bool =
     let profOn: bool = monoProfileActive
@@ -2176,7 +2188,7 @@ fn instRoundUpPow2(x0: int32): int32 =
 fn instMapSet(idx: int32, key: str) =
     let off64: int64 = int64(idx) * sizeof cstring
     let off32: int32 = int32(off64)
-    let p: void* = ptr_add(instMapKeys.buffer, off32)
+    let p: void* = rawmemPtrAdd(instMapKeys.buffer, off32)
     *str*(p) = key
 
 fn instMapInit(cap0: int32) =
@@ -2186,14 +2198,14 @@ fn instMapInit(cap0: int32) =
     cap = instRoundUpPow2 cap
     if instMapKeys.buffer != nil && instMapKeys.cap >= cap:
         instMapKeys.len = instMapKeys.cap
-        setMem(instMapKeys.buffer, 0, instMapKeys.cap * 8)
+        rawmemSet(instMapKeys.buffer, 0, instMapKeys.cap * 8)
         instMapCount = 0
         return
     instMapKeys = []
     instMapKeys.cap = cap
     instMapKeys.len = int(cap)
     if instMapKeys.buffer != nil:
-        setMem(instMapKeys.buffer, 0, cap * 8)
+        rawmemSet(instMapKeys.buffer, 0, cap * 8)
     instMapCount = 0
 
 fn instMapHas(key: str): bool =
@@ -2213,7 +2225,7 @@ fn instMapHas(key: str): bool =
 
 fn instMapGet(key: str): str =
     if len(key) == 0:
-        return nil
+        return ""
     if instMapKeys.buffer == nil || instMapKeys.cap == 0:
         instMapInit 256
     let mask: uint64 = uint64(instMapKeys.cap) - 1
@@ -2221,7 +2233,7 @@ fn instMapGet(key: str): str =
     while true:
         let slot: str = get(instMapKeys, int32(idx))
         if len(slot) == 0:
-            return nil
+            return ""
         if monoStrEq(slot, key):
             return slot
         idx =(idx + 1) & mask
@@ -2230,7 +2242,7 @@ fn instMapGetOrTrack(key: str): str =
     let existing: str = instMapGet(key)
     if len(existing) > 0:
         return existing
-    trackLexString void*(key)
+    trackLexStringStr(key)
     return key
 
 fn instMapAdd(key: str) =
@@ -2262,7 +2274,7 @@ fn monoStripSpaces(s: str): str =
     if len(s) == 0:
         return ""
     var cached: bool = false
-    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoStripIndex, void*(s), &cached)
+    let cachedIdx: int32 = hashmaps.hashMapStrIntGetEx(monoStripIndex, s, cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoStripValues.len:
         return get(monoStripValues, cachedIdx - 1)
     let profOn: bool = monoProfileActive
@@ -2276,10 +2288,10 @@ fn monoStripSpaces(s: str): str =
     let n: int32 = len s
     if n <= 0:
         let emptyRes: str = ""
-        trackLexString void*(emptyRes)
+        trackLexStringStr(emptyRes)
         add(monoStripValues, emptyRes)
         let storedIdx: int32 = monoStripValues.len
-        hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx)
+        hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx)
         return emptyRes
     var a: int32 = 0
     var b: int32 = n - 1
@@ -2293,50 +2305,50 @@ fn monoStripSpaces(s: str): str =
         b = b - 1
     if b < a:
         let emptyRes2: str = ""
-        trackLexString void*(emptyRes2)
+        trackLexStringStr(emptyRes2)
         add(monoStripValues, emptyRes2)
         let storedIdx2: int32 = monoStripValues.len
-        hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx2)
+        hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx2)
         return emptyRes2
     if a == 0 && b == n - 1:
-        trackLexString void*(s)
+        trackLexStringStr(s)
         add(monoStripValues, s)
         let storedIdx3: int32 = monoStripValues.len
-        hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx3)
+        hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx3)
         return s
     let count: int32 = b - a + 1
     let p: void* = alloc(count + 1)
-    let src: void* = ptr_add(void*(s), a)
-    copyMem(p, src, count)
-    setMem(ptr_add(p, count), 0, 1)
+    let src: void* = rawmemPtrAdd(ptr(s), a)
+    rawmemCopy(p, src, count)
+    rawmemSet(rawmemPtrAdd(p, count), 0, 1)
     let res: str = str(p)
     trackLexString p
     add(monoStripValues, res)
     let storedIdx4: int32 = monoStripValues.len
-    hashmaps.hashMapPtrIntPut(&monoStripIndex, void*(s), storedIdx4)
+    hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx4)
     return res
 
 fn nextLambdaName(): str =
     let name: str = "__cheng_lambda_" + intToStr lambdaCounter
-    trackLexString void*(name)
+    trackLexStringStr(name)
     lambdaCounter = lambdaCounter + 1
     return name
 
 fn unwrapLambda(n: Node): Node =
-    if n == nil:
-        return nil
-    if n.kind == nkLambda:
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    if nodeKind(n) == nkLambda:
         return n
-    if n.kind == nkPar && kidCount n == 1:
+    if nodeKind(n) == nkPar && kidCount n == 1:
         let inner: Node = kid(n, 0)
-        if inner != nil && inner.kind == nkLambda:
+        if astRefNonNil(inner) && nodeKind(inner) == nkLambda:
             return inner
-    return nil
+    return astInvalidNodeId()
 
 fn lambdaDeclKind(lam: Node): NodeKind =
-    if lam == nil:
+    if astRefIsNil(lam):
         return nkFnDecl
-    let kw: str = monoStripSpaces lam.ident
+    let kw: str = monoStripSpaces nodeIdent(lam)
     if monoStrEq(kw, "iterator"):
         return nkIteratorDecl
     if monoStrEq(kw, "fn"):
@@ -2344,7 +2356,7 @@ fn lambdaDeclKind(lam: Node): NodeKind =
     return nkFnDecl
 
 fn lambdaBaseName(lam: Node): str =
-    if lam != nil && kidCount lam > 0:
+    if astRefNonNil(lam) && kidCount lam > 0:
         let nameNode: Node = kid(lam, 0)
         let nm: str = monoStripSpaces(plainName(nameNode))
         if len nm > 0:
@@ -2352,43 +2364,43 @@ fn lambdaBaseName(lam: Node): str =
     return nextLambdaName()
 
 fn monoCollectPatternNames(n: Node, out: str[]*) =
-    if n == nil || out == nil:
+    if astRefIsNil(n) || out == nil:
         return
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         let nm: str = monoStripSpaces(plainName(n))
         if len nm > 0:
             monoSeqStrAdd(out, nm)
         return
-    if n.kind == nkPattern && kidCount n > 0:
+    if nodeKind(n) == nkPattern && kidCount n > 0:
         monoCollectPatternNames(kid(n, 0), out)
         return
     for i in 0..<kidCount n:
         monoCollectPatternNames(kid(n, i), out)
 
 fn monoCollectLocalsInBody(n: Node, out: str[]*) =
-    if n == nil || out == nil:
+    if astRefIsNil(n) || out == nil:
         return
-    if n.kind == nkLambda:
+    if nodeKind(n) == nkLambda:
         return
-    if n.kind == nkLet || n.kind == nkVar || n.kind == nkConst:
+    if nodeKind(n) == nkLet || nodeKind(n) == nkVar || nodeKind(n) == nkConst:
         if kidCount n > 0:
             monoCollectPatternNames(kid(n, 0), out)
-    elif n.kind == nkFor:
+    elif nodeKind(n) == nkFor:
         if kidCount n > 0:
             monoCollectPatternNames(kid(n, 0), out)
     for i in 0..<kidCount n:
         monoCollectLocalsInBody(kid(n, i), out)
 
 fn monoCollectLambdaLocals(lam: Node, out: str[]*) =
-    if lam == nil || out == nil:
+    if astRefIsNil(lam) || out == nil:
         return
     if kidCount lam > 1:
         let paramsNode: Node = kid(lam, 1)
-        if paramsNode != nil && paramsNode.kind == nkFormalParams:
+        if astRefNonNil(paramsNode) && nodeKind(paramsNode) == nkFormalParams:
             for i in 0..<kidCount paramsNode:
                 let defs: Node = kid(paramsNode, i)
-                if defs != nil && defs.kind == nkIdentDefs:
-                    let nameCount: int32 = kidCount defs - 2
+                if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs:
+                    let nameCount: int32 = identDefsNameCount(defs)
                     for j in 0..<nameCount:
                         monoCollectPatternNames(kid(defs, j), out)
     if kidCount lam > 3:
@@ -2396,24 +2408,24 @@ fn monoCollectLambdaLocals(lam: Node, out: str[]*) =
         monoCollectLocalsInBody(bodyNode, out)
 
 fn monoLambdaHasCaptureVisit(n: Node, locals: str[], localIndex: hashmaps.HashMapStrInt*, found: bool*) =
-    if n == nil || found == nil || *found:
+    if astRefIsNil(n) || found == nil || *found:
         return
-    if n.kind == nkLambda:
+    if nodeKind(n) == nkLambda:
         return
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         let nm: str = monoStripSpaces(plainName(n))
         if len nm > 0 && !monoSeqStrHasIndexed(locals, localIndex, nm):
-            if monoValueLookup(nm) != nil:
+            if astRefNonNil(monoValueLookup(nm)):
                 *found = true
                 return
     for i in 0..<kidCount n:
         monoLambdaHasCaptureVisit(kid(n, i), locals, localIndex, found)
 
 fn monoLambdaHasCapture(lam: Node): bool =
-    if lam == nil:
+    if astRefIsNil(lam):
         return false
     var cached: bool = false
-    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoLambdaCaptureIndex, void*(lam), &cached)
+    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoLambdaCaptureIndex, int64(ptr(lam)), cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoLambdaCaptureValues.len:
         return get(monoLambdaCaptureValues, cachedIdx - 1) != 0
     var locals: str[8]
@@ -2424,7 +2436,7 @@ fn monoLambdaHasCapture(lam: Node): bool =
     if locals.len > 3:
         localIdx = &localIndex
         hashmaps.hashIndexStrFirst(locals, localIdx)
-    var body: Node = nil
+    var body: Node = astInvalidNodeId()
     if kidCount lam > 3:
         body = kid(lam, 3)
     monoLambdaHasCaptureVisit(body, locals, localIdx, &found)
@@ -2433,7 +2445,7 @@ fn monoLambdaHasCapture(lam: Node): bool =
         capVal = 1
     add(monoLambdaCaptureValues, capVal)
     let storedIdx: int32 = monoLambdaCaptureValues.len
-    hashmaps.hashMapPtrIntPut(&monoLambdaCaptureIndex, void*(lam), storedIdx)
+    hashmaps.hashMapPtrIntPut(&monoLambdaCaptureIndex, int64(ptr(lam)), storedIdx)
     return found
 
 fn addWhereDiag(pos: SourcePos, msg: str) =
@@ -2448,36 +2460,37 @@ fn addWhereDiag(pos: SourcePos, msg: str) =
     add(currentDiags, d)
 
 fn collectGenericParamNames(generics: Node, outNames: str[]*) =
-    if generics == nil || generics.kind != nkGenericParams:
+    if astRefIsNil(generics) || nodeKind(generics) != nkGenericParams:
         return
     for i in 0..<kidCount generics:
         let defn: Node = kid(generics, i)
-        if defn != nil && defn.kind == nkIdentDefs && kidCount defn > 0:
+        if astRefNonNil(defn) && nodeKind(defn) == nkIdentDefs && kidCount defn > 0:
             let nm: str = monoStripSpaces(plainName(kid(defn, 0)))
             if len nm > 0:
                 add(outNames, nm)
 
 fn monoBuildIndex(names: str[], outIndex: hashmaps.HashMapStrInt*): hashmaps.HashMapStrInt* =
-    if outIndex == nil:
-        return nil
-    if names.len <= 2:
-        return nil
-    hashmaps.hashIndexStrFirst(names, outIndex)
-    return outIndex
-
-fn mapGetStrNodeByIndex(keys: str[], vals: Node[], key: str, index: hashmaps.HashMapStrInt* = nil): Node =
-    if index != nil && index->mask != 0:
-        var found: bool = false
-        let pos: int32 = monoHashMapStrIntGetCompat(*index, key, found)
-        if found && pos >= 0 && pos < vals.len:
-            return get(vals, pos)
-    for i in 0..<keys.len:
-        if monoStrEq(get(keys, i), key):
-            return get(vals, i)
+    let _names: str[] = names
+    let _outIndex: hashmaps.HashMapStrInt* = outIndex
+    # Stage0 stability path: disable temporary map-index acceleration in
+    # monomorphize argument/type substitution. Generic arg vectors are tiny,
+    # so linear scans are acceptable and avoid pointer-index crash paths.
     return nil
 
+fn mapGetStrNodeByIndex(keys: str[], vals: Node[], key: str, index: hashmaps.HashMapStrInt* = nil): Node =
+    let _index: hashmaps.HashMapStrInt* = index
+    # Stage0 safety: keep generic arg lookup on the linear path.
+    # The key set is tiny (generic params, usually <= 4), so O(n) is stable
+    # and avoids invalid pointer deref crashes observed in mixed stage0 builds.
+    for i in 0..<keys.len:
+        if i >= vals.len:
+            break
+        if monoStrEq(get(keys, i), key):
+            return get(vals, i)
+    return astInvalidNodeId()
+
 fn bindTypeVars(genericTy: Node, actualTy: Node, paramNames: str[], outNames: str[]*, outTypes: Node[]*) =
-    if genericTy == nil || actualTy == nil:
+    if astRefIsNil(genericTy) || astRefIsNil(actualTy):
         return
     let profOn: bool = monoProfileActive
     var startNs: int64 = 0
@@ -2487,39 +2500,38 @@ fn bindTypeVars(genericTy: Node, actualTy: Node, paramNames: str[], outNames: st
     defer:
         if profOn:
             bindTypeVarsNs = bindTypeVarsNs + (cheng_monotime_ns() - startNs)
-    if genericTy.kind == nkIdent || genericTy.kind == nkSymbol:
+    if nodeKind(genericTy) == nkIdent || nodeKind(genericTy) == nkSymbol:
         let nm: str = monoStripSpaces(plainName(genericTy))
         if len nm > 0 && monoSeqStrHas(paramNames, nm):
             if ! monoSeqStrHas(*outNames, nm):
                 add(outNames, nm)
                 add(outTypes, actualTy)
             return
-    if genericTy.kind == nkBracketExpr && actualTy.kind == nkBracketExpr:
+    if nodeKind(genericTy) == nkBracketExpr && nodeKind(actualTy) == nkBracketExpr:
         for i in 0..<kidCount genericTy:
             if !(i < kidCount actualTy):
                 break
             bindTypeVars(kid(genericTy, i), kid(actualTy, i), paramNames, outNames, outTypes)
         return
-    if (genericTy.kind == nkPtrTy || genericTy.kind == nkRefTy || genericTy.kind == nkVarTy || genericTy.kind == nkSetTy) &&
-       (actualTy.kind == nkPtrTy || actualTy.kind == nkRefTy || actualTy.kind == nkVarTy || actualTy.kind == nkSetTy):
+    if (nodeKind(genericTy) == nkPtrTy || nodeKind(genericTy) == nkRefTy || nodeKind(genericTy) == nkVarTy || nodeKind(genericTy) == nkSetTy) &&       (nodeKind(actualTy) == nkPtrTy || nodeKind(actualTy) == nkRefTy || nodeKind(actualTy) == nkVarTy || nodeKind(actualTy) == nkSetTy):
         if kidCount genericTy > 0 && kidCount actualTy > 0:
             bindTypeVars(kid(genericTy, 0), kid(actualTy, 0), paramNames, outNames, outTypes)
         return
-    if genericTy.kind == nkTupleTy && actualTy.kind == nkTupleTy:
+    if nodeKind(genericTy) == nkTupleTy && nodeKind(actualTy) == nkTupleTy:
         for j in 0..<kidCount genericTy:
             if !(j < kidCount actualTy):
                 break
             bindTypeVars(kid(genericTy, j), kid(actualTy, j), paramNames, outNames, outTypes)
         return
-    if genericTy.kind == nkFnTy && actualTy.kind == nkFnTy:
+    if nodeKind(genericTy) == nkFnTy && nodeKind(actualTy) == nkFnTy:
         if kidCount genericTy > 0 && kidCount actualTy > 0:
             let gfp: Node = kid(genericTy, 0)
             let afp: Node = kid(actualTy, 0)
             var pi: int32 = 0
-            while gfp != nil && afp != nil && pi < kidCount gfp && pi < kidCount afp:
+            while astRefNonNil(gfp) && astRefNonNil(afp) && pi < kidCount gfp && pi < kidCount afp:
                 let gdef: Node = kid(gfp, pi)
                 let adef: Node = kid(afp, pi)
-                if gdef != nil && adef != nil && kidCount gdef > 1 && kidCount adef > 1:
+                if astRefNonNil(gdef) && astRefNonNil(adef) && kidCount gdef > 1 && kidCount adef > 1:
                     bindTypeVars(kid(gdef, 1), kid(adef, 1), paramNames, outNames, outTypes)
                 pi = pi + 1
         if kidCount genericTy > 1 && kidCount actualTy > 1:
@@ -2527,7 +2539,7 @@ fn bindTypeVars(genericTy: Node, actualTy: Node, paramNames: str[], outNames: st
         return
 
 fn buildTypeArgsFromMap(generics: Node, mapNames: str[], mapTypes: Node[], outArgs: Node[]*, mapIndex: hashmaps.HashMapStrInt* = nil): bool =
-    if generics == nil || generics.kind != nkGenericParams:
+    if astRefIsNil(generics) || nodeKind(generics) != nkGenericParams:
         return true
     var localIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     var idx: hashmaps.HashMapStrInt* = mapIndex
@@ -2536,30 +2548,30 @@ fn buildTypeArgsFromMap(generics: Node, mapNames: str[], mapTypes: Node[], outAr
     var ok: bool = true
     for i in 0..<kidCount generics:
         let defn: Node = kid(generics, i)
-        if defn != nil && defn.kind == nkIdentDefs && kidCount defn > 0:
+        if astRefNonNil(defn) && nodeKind(defn) == nkIdentDefs && kidCount defn > 0:
             let name: str = monoStripSpaces(plainName(kid(defn, 0)))
-            var mapped: Node = nil
+            var mapped: Node = astInvalidNodeId()
             if len name > 0:
                 mapped = mapGetStrNodeByIndex(mapNames, mapTypes, name, idx)
-            if mapped == nil && kidCount defn > 2:
+            if astRefIsNil(mapped) && kidCount defn > 2:
                 let defaultVal: Node = kid(defn, 2)
-                if defaultVal != nil && defaultVal.kind != nkEmpty:
+                if astRefNonNil(defaultVal) && nodeKind(defaultVal) != nkEmpty:
                     mapped = replaceTypeVars(defaultVal, mapNames, mapTypes, idx)
-            if mapped != nil:
+            if astRefNonNil(mapped):
                 add(outArgs, mapped)
             else:
                 ok = false
     return ok
 
 fn inferTypeArgsFromExpectedFn(lam: Node, expectedFn: Node, outArgs: Node[]*): bool =
-    if lam == nil:
+    if astRefIsNil(lam):
         return false
-    var generics: Node = nil
+    var generics: Node = astInvalidNodeId()
     if kidCount lam > 4:
         generics = kid(lam, 4)
-    if generics == nil || generics.kind != nkGenericParams || kidCount generics == 0:
+    if astRefIsNil(generics) || nodeKind(generics) != nkGenericParams || kidCount generics == 0:
         return true
-    if expectedFn == nil || expectedFn.kind != nkFnTy:
+    if astRefIsNil(expectedFn) || nodeKind(expectedFn) != nkFnTy:
         return false
     var paramNames: str[4]
     collectGenericParamNames(generics, &paramNames)
@@ -2567,27 +2579,27 @@ fn inferTypeArgsFromExpectedFn(lam: Node, expectedFn: Node, outArgs: Node[]*): b
         return true
     var mapNames: str[4]
     var mapTypes: Node[4]
-    var lamParams: Node = nil
+    var lamParams: Node = astInvalidNodeId()
     if kidCount lam > 1:
         lamParams = kid(lam, 1)
-    var expParams: Node = nil
+    var expParams: Node = astInvalidNodeId()
     if kidCount expectedFn > 0:
         expParams = kid(expectedFn, 0)
-    if lamParams != nil && expParams != nil:
+    if astRefNonNil(lamParams) && astRefNonNil(expParams):
         for i in 0..<kidCount lamParams:
             if i >= kidCount expParams:
                 break
             let ldef: Node = kid(lamParams, i)
             let edef: Node = kid(expParams, i)
-            if ldef != nil && edef != nil && kidCount ldef > 1 && kidCount edef > 1:
+            if astRefNonNil(ldef) && astRefNonNil(edef) && kidCount ldef > 1 && kidCount edef > 1:
                 bindTypeVars(kid(ldef, 1), kid(edef, 1), paramNames, &mapNames, &mapTypes)
-    var lamRet: Node = nil
+    var lamRet: Node = astInvalidNodeId()
     if kidCount lam > 2:
         lamRet = kid(lam, 2)
-    var expRet: Node = nil
+    var expRet: Node = astInvalidNodeId()
     if kidCount expectedFn > 1:
         expRet = kid(expectedFn, 1)
-    if lamRet != nil && expRet != nil:
+    if astRefNonNil(lamRet) && astRefNonNil(expRet):
         bindTypeVars(lamRet, expRet, paramNames, &mapNames, &mapTypes)
     return buildTypeArgsFromMap(generics, mapNames, mapTypes, outArgs)
 
@@ -2619,7 +2631,7 @@ fn sanitizeKey(s: str): str =
     return out
 
 fn typeKeyCore(n: Node): str =
-    if n == nil:
+    if astRefIsNil(n):
         return ""
     let profOn: bool = monoProfileActive
     var tkStart: int64 = 0
@@ -2629,9 +2641,9 @@ fn typeKeyCore(n: Node): str =
     defer:
         if profOn:
             typeKeyNs = typeKeyNs + (cheng_monotime_ns() - tkStart)
-    case n.kind
+    case nodeKind(n)
     of nkIdent, nkSymbol:
-        return sanitizeKey(monoStripSpaces(n.ident))
+        return sanitizeKey(monoStripSpaces(nodeIdent(n)))
     of nkIdentDefs:
         if kidCount n > 1:
             return typeKey kid(n, 1)
@@ -2641,7 +2653,7 @@ fn typeKeyCore(n: Node): str =
             return typeKey kid(n, 1)
         return ""
     of nkIntLit:
-        return intToStr int32(n.intVal)
+        return intToStr int32(nodeIntVal(n))
     of nkPtrTy:
         if kidCount n > 0:
             return "ptr_" + typeKey kid(n, 0)
@@ -2662,10 +2674,10 @@ fn typeKeyCore(n: Node): str =
         var parts: str[4]
         if kidCount n > 0:
             let fp: Node = kid(n, 0)
-            if fp != nil && fp.kind == nkFormalParams:
+            if astRefNonNil(fp) && nodeKind(fp) == nkFormalParams:
                 for i in 0..<kidCount fp:
                     let d: Node = kid(fp, i)
-                    if d != nil && d.kind == nkIdentDefs && kidCount d > 1:
+                    if astRefNonNil(d) && nodeKind(d) == nkIdentDefs && kidCount d > 1:
                         let k: str = typeKey kid(d, 1)
                         if len k > 0:
                             add(parts, k)
@@ -2714,80 +2726,82 @@ fn typeKeyCore(n: Node): str =
                 out3 = out3 + get(parts3, j3)
             return out3
     else:
-        if len n.ident > 0:
-            return sanitizeKey(monoStripSpaces(n.ident))
+        if len nodeIdent(n) > 0:
+            return sanitizeKey(monoStripSpaces(nodeIdent(n)))
         return "node"
     return ""
 
 fn typeKey(n: Node): str =
-    if n == nil:
+    if astRefIsNil(n):
         return ""
     var cached: bool = false
-    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoTypeKeyIndex, void*(n), &cached)
+    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoTypeKeyIndex, int64(ptr(n)), cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoTypeKeyValues.len:
         return get(monoTypeKeyValues, cachedIdx - 1)
     let res: str = typeKeyCore(n)
-    trackLexString void*(res)
+    trackLexStringStr(res)
     add(monoTypeKeyValues, res)
     let storedIdx: int32 = monoTypeKeyValues.len
-    hashmaps.hashMapPtrIntPut(&monoTypeKeyIndex, void*(n), storedIdx)
+    hashmaps.hashMapPtrIntPut(&monoTypeKeyIndex, int64(ptr(n)), storedIdx)
     return res
 
 fn constraintBaseName(n: Node): str =
-    if n == nil:
+    if astRefIsNil(n):
         return ""
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         return monoStripSpaces(plainName(n))
-    if n.kind == nkBracketExpr && kidCount n > 0:
+    if nodeKind(n) == nkBracketExpr && kidCount n > 0:
         return monoStripSpaces(plainName(kid(n, 0)))
     return ""
 
 fn constraintArgs(n: Node, mapNames: str[], mapTypes: Node[], outArgs: Node[]*, mapIndex: hashmaps.HashMapStrInt* = nil) =
-    if n == nil:
+    if astRefIsNil(n):
         return
     var localIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     var idx: hashmaps.HashMapStrInt* = mapIndex
     if idx == nil:
         idx = monoBuildIndex(mapNames, &localIndex)
-    if n.kind == nkBracketExpr && kidCount n > 1:
+    if nodeKind(n) == nkBracketExpr && kidCount n > 1:
         for i in 1..<kidCount n:
             let raw: Node = kid(n, i)
             let resolved: Node = replaceTypeVars(raw, mapNames, mapTypes, idx)
             add(outArgs, resolved)
 
 fn traitBodyNode(traitNode: Node): Node =
-    if traitNode != nil && kidCount traitNode > 2:
+    if astRefNonNil(traitNode) && kidCount traitNode > 2:
         return kid(traitNode, 2)
-    return nil
+    return astInvalidNodeId()
 
 fn traitGenericsNode(traitNode: Node): Node =
-    if traitNode != nil && kidCount traitNode > 1:
+    if astRefNonNil(traitNode) && kidCount traitNode > 1:
         return kid(traitNode, 1)
-    return nil
+    return astInvalidNodeId()
 
 fn collectTraitMethods(traitNode: Node, out: Node[]*) =
     let body: Node = traitBodyNode traitNode
-    if body == nil:
+    if astRefIsNil(body):
         return
     for i in 0..<kidCount body:
         let n: Node = kid(body, i)
-        if n != nil && (n.kind == nkFnDecl || n.kind == nkIteratorDecl):
+        if astRefNonNil(n) && (nodeKind(n) == nkFnDecl || nodeKind(n) == nkIteratorDecl):
             add(out, n)
 
 fn fnParamTypes(fnNode: Node, out: Node[]*) =
-    if fnNode == nil || kidCount fnNode < 2:
+    if astRefIsNil(fnNode) || kidCount fnNode < 2:
         return
     let params: Node = kid(fnNode, 1)
-    if params == nil || params.kind != nkFormalParams:
+    if astRefIsNil(params) || nodeKind(params) != nkFormalParams:
         return
     for i in 0..<kidCount params:
         let defs: Node = kid(params, i)
-        if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
-            let ty: Node = kid(defs, 1)
-            add(out, ty)
+        if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs > 1:
+            let ty: Node = identDefsType(defs)
+            let namesN: int32 = identDefsNameCount(defs)
+            for ni in 0..<namesN:
+                add(out, ty)
 
 fn fnSigMatches(fnNode: Node, expParams: Node[], expRet: Node): bool =
-    if fnNode == nil:
+    if astRefIsNil(fnNode):
         return false
     var params: Node[4]
     fnParamTypes(fnNode, &params)
@@ -2798,62 +2812,62 @@ fn fnSigMatches(fnNode: Node, expParams: Node[], expRet: Node): bool =
         let b: str = typeKey(monoNormalizeType(get(expParams, i)))
         if monoStrEq(a, "") || monoStrEq(b, "") || monoStrNe(a, b):
             return false
-    var retNode: Node = newNode(nkEmpty, fnNode.pos)
+    var retNode: Node = newNode(nkEmpty, nodePos(fnNode))
     if kidCount fnNode > 2:
         retNode = kid(fnNode, 2)
-    if expRet == nil || expRet.kind == nkEmpty:
-        return retNode == nil || retNode.kind == nkEmpty
+    if astRefIsNil(expRet) || nodeKind(expRet) == nkEmpty:
+        return astRefIsNil(retNode) || nodeKind(retNode) == nkEmpty
     let rk: str = typeKey(monoNormalizeType(retNode))
     let ek: str = typeKey(monoNormalizeType(expRet))
     return monoStrNe(rk, "") && monoStrEq(rk, ek)
 
 fn findFnImplIn(n: Node, name: str, expParams: Node[], expRet: Node): Node =
-    if n == nil:
-        return nil
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    if nodeKind(n) == nkFnDecl || nodeKind(n) == nkIteratorDecl:
         let nameNode: Node = kid(n, 0)
-        if nameNode != nil && monoStrEq(monoStripSpaces(plainName(nameNode)), name):
+        if astRefNonNil(nameNode) && monoStrEq(monoStripSpaces(plainName(nameNode)), name):
             if fnSigMatches(n, expParams, expRet):
                 return n
     for i in 0..<kidCount n:
         let found: Node = findFnImplIn(kid(n, i), name, expParams, expRet)
-        if found != nil:
+        if astRefNonNil(found):
             return found
-    return nil
+    return astInvalidNodeId()
 
 fn findFnImpl(name: str, expParams: Node[], expRet: Node, rootStmts: Node[]*): Node =
     let found: Node = findFnImplIn(monoRoot, name, expParams, expRet)
-    if found != nil:
+    if astRefNonNil(found):
         return found
     if rootStmts != nil:
         for i in 0..<rootStmts->len:
             let n: Node = get(*rootStmts, i)
             let found2: Node = findFnImplIn(n, name, expParams, expRet)
-            if found2 != nil:
+            if astRefNonNil(found2):
                 return found2
-    return nil
+    return astInvalidNodeId()
 
 fn monoFindFnByFirstParamMatchIn(n: Node, name: str, baseTy: Node, paramCount: int32): Node =
-    if n == nil:
-        return nil
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    if nodeKind(n) == nkFnDecl || nodeKind(n) == nkIteratorDecl:
         let nameNode: Node = kid(n, 0)
-        if nameNode != nil && monoStrEq(monoStripSpaces(plainName(nameNode)), name):
-            var gens: Node = nil
+        if astRefNonNil(nameNode) && monoStrEq(monoStripSpaces(plainName(nameNode)), name):
+            var gens: Node = astInvalidNodeId()
             if kidCount n > 4:
                 gens = kid(n, 4)
-            if gens == nil || gens.kind != nkGenericParams || kidCount gens == 0:
+            if astRefIsNil(gens) || nodeKind(gens) != nkGenericParams || kidCount gens == 0:
                 let paramsNode: Node = kid(n, 1)
-                if paramsNode != nil && paramsNode.kind == nkFormalParams:
+                if astRefNonNil(paramsNode) && nodeKind(paramsNode) == nkFormalParams:
                     if paramCount < 0 || fnParamCount(paramsNode) == paramCount:
                         let firstTy: Node = monoFirstParamType n
                         if monoTypeMatches(firstTy, baseTy):
                             return n
     for i in 0..<kidCount n:
         let found: Node = monoFindFnByFirstParamMatchIn(kid(n, i), name, baseTy, paramCount)
-        if found != nil:
+        if astRefNonNil(found):
             return found
-    return nil
+    return astInvalidNodeId()
 
 fn monoFirstParamMatchCacheKey(name: str, baseTy: Node, paramCount: int32): str =
     if len(name) == 0:
@@ -2870,51 +2884,53 @@ fn monoFindFnByFirstParamMatch(name: str, baseTy: Node, paramCount: int32, rootS
         let cachedIdx: int32 = monoHashMapStrIntGetCompat(monoFirstParamMatchIndex, cacheKey, cached)
         if cached && cachedIdx >= 0 && cachedIdx < monoFirstParamMatchNodes.len:
             let cachedNode: Node = get(monoFirstParamMatchNodes, cachedIdx)
-            if cachedNode != nil:
+            if astRefNonNil(cachedNode):
                 return cachedNode
         else:
             let foundInRoot: Node = monoFindFnByFirstParamMatchIn(monoRoot, name, baseTy, paramCount)
-            trackLexString void*(cacheKey)
+            trackLexStringStr(cacheKey)
             mapPutStrNodeIndex(monoFirstParamMatchIndex, monoFirstParamMatchKeys, monoFirstParamMatchNodes, cacheKey, foundInRoot)
-            if foundInRoot != nil:
+            if astRefNonNil(foundInRoot):
                 return foundInRoot
     else:
         let found: Node = monoFindFnByFirstParamMatchIn(monoRoot, name, baseTy, paramCount)
-        if found != nil:
+        if astRefNonNil(found):
             return found
     if rootStmts != nil:
         for i in 0..<rootStmts->len:
             let n: Node = get(*rootStmts, i)
             let found2: Node = monoFindFnByFirstParamMatchIn(n, name, baseTy, paramCount)
-            if found2 != nil:
+            if astRefNonNil(found2):
                 return found2
-    return nil
+    return astInvalidNodeId()
 
 fn traitMethodFnType(methodNode: Node, substNames: str[], substTypes: Node[], substIndex: hashmaps.HashMapStrInt* = nil): Node =
-    if methodNode == nil:
-        return nil
+    if astRefIsNil(methodNode):
+        return astInvalidNodeId()
     var localIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     var idx: hashmaps.HashMapStrInt* = substIndex
     if idx == nil:
         idx = monoBuildIndex(substNames, &localIndex)
-    var fp: Node = newNode(nkFormalParams, methodNode.pos)
+    var fp: Node = newNode(nkFormalParams, nodePos(methodNode))
     if kidCount methodNode > 1:
         let params: Node = kid(methodNode, 1)
-        if params != nil && params.kind == nkFormalParams:
+        if astRefNonNil(params) && nodeKind(params) == nkFormalParams:
             for i in 0..<kidCount params:
                 let defs: Node = kid(params, i)
-                if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
-                    let nameNode: Node = kid(defs, 0)
-                    let tyNode: Node = replaceTypeVars(kid(defs, 1), substNames, substTypes, idx)
-                    var outDefs: Node = newNode(nkIdentDefs, defs.pos)
-                    addSon(outDefs, cloneTree nameNode)
-                    addSon(outDefs, tyNode)
-                    addSon(outDefs, newNode(nkEmpty, defs.pos))
-                    addSon(fp, outDefs)
-    var retNode: Node = newNode(nkEmpty, methodNode.pos)
+                if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs > 1:
+                    let tyNode: Node = replaceTypeVars(identDefsType(defs), substNames, substTypes, idx)
+                    let namesN: int32 = identDefsNameCount(defs)
+                    for ni in 0..<namesN:
+                        let nameNode: Node = kid(defs, ni)
+                        var outDefs: Node = newNode(nkIdentDefs, nodePos(defs))
+                        addSon(outDefs, cloneTree nameNode)
+                        addSon(outDefs, tyNode)
+                        addSon(outDefs, newNode(nkEmpty, nodePos(defs)))
+                        addSon(fp, outDefs)
+    var retNode: Node = newNode(nkEmpty, nodePos(methodNode))
     if kidCount methodNode > 2:
         retNode = replaceTypeVars(kid(methodNode, 2), substNames, substTypes, idx)
-    var fnTy: Node = newNode(nkFnTy, methodNode.pos)
+    var fnTy: Node = newNode(nkFnTy, nodePos(methodNode))
     addSon(fnTy, fp)
     addSon(fnTy, retNode)
     return fnTy
@@ -2948,66 +2964,66 @@ fn ensureTraitVtable(traitNode: Node, traitName: str, selfTy: Node, traitArgs: N
         add(substTypes, get(traitArgs, gi))
     var substIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     let substIdx: hashmaps.HashMapStrInt* = monoBuildIndex(substNames, &substIndex)
-    var recList: Node = newNode(nkRecList, traitNode.pos)
+    var recList: Node = newNode(nkRecList, nodePos(traitNode))
     for mi in 0..<methodDecls.len:
         let m: Node = get(methodDecls, mi)
         let mname: str = monoStripSpaces(plainName(kid(m, 0)))
         if monoStrNe(mname, ""):
-            var defs: Node = newNode(nkIdentDefs, m.pos)
-            addSon(defs, newIdent(mname, m.pos))
+            var defs: Node = newNode(nkIdentDefs, nodePos(m))
+            addSon(defs, newIdent(mname, nodePos(m)))
             addSon(defs, traitMethodFnType(m, substNames, substTypes, substIdx))
-            addSon(defs, newNode(nkEmpty, m.pos))
+            addSon(defs, newNode(nkEmpty, nodePos(m)))
             addSon(recList, defs)
-    var obj: Node = newNode(nkObjectDecl, traitNode.pos)
-    addSon(obj, newNode(nkEmpty, traitNode.pos))
+    var obj: Node = newNode(nkObjectDecl, nodePos(traitNode))
+    addSon(obj, newNode(nkEmpty, nodePos(traitNode)))
     addSon(obj, recList)
-    var decl: Node = newNode(nkTypeDecl, traitNode.pos)
-    nodeSetStrVal(decl, traitNode.strVal)
-    addSon(decl, newIdent(vtblName, traitNode.pos))
+    var decl: Node = newNode(nkTypeDecl, nodePos(traitNode))
+    nodeSetStrVal(decl, nodeStrVal(traitNode))
+    addSon(decl, newIdent(vtblName, nodePos(traitNode)))
     addSon(decl, obj)
-    addSon(decl, newNode(nkEmpty, traitNode.pos))
-    addSon(decl, newNode(nkEmpty, traitNode.pos))
-    addSon(decl, newNode(nkEmpty, traitNode.pos))
+    addSon(decl, newNode(nkEmpty, nodePos(traitNode)))
+    addSon(decl, newNode(nkEmpty, nodePos(traitNode)))
+    addSon(decl, newNode(nkEmpty, nodePos(traitNode)))
     add(rootStmts, decl)
-    var initFn: Node = newNode(nkFnDecl, traitNode.pos)
-    nodeSetStrVal(initFn, traitNode.strVal)
-    addSon(initFn, newIdent(initName, traitNode.pos))
-    var fpInit: Node = newNode(nkFormalParams, traitNode.pos)
+    var initFn: Node = newNode(nkFnDecl, nodePos(traitNode))
+    nodeSetStrVal(initFn, nodeStrVal(traitNode))
+    addSon(initFn, newIdent(initName, nodePos(traitNode)))
+    var fpInit: Node = newNode(nkFormalParams, nodePos(traitNode))
     addSon(initFn, fpInit)
-    addSon(initFn, newIdent(vtblName, traitNode.pos))
-    var body: Node = newNode(nkStmtList, traitNode.pos)
+    addSon(initFn, newIdent(vtblName, nodePos(traitNode)))
+    var body: Node = newNode(nkStmtList, nodePos(traitNode))
     let varName: str = "__vt"
-    var vdecl: Node = newNode(nkVar, traitNode.pos)
-    addSon(vdecl, newIdent(varName, traitNode.pos))
-    addSon(vdecl, newIdent(vtblName, traitNode.pos))
-    var oc: Node = newNode(nkBracketExpr, traitNode.pos)
-    addSon(oc, newIdent("default", traitNode.pos))
-    addSon(oc, newIdent(vtblName, traitNode.pos))
+    var vdecl: Node = newNode(nkVar, nodePos(traitNode))
+    addSon(vdecl, newIdent(varName, nodePos(traitNode)))
+    addSon(vdecl, newIdent(vtblName, nodePos(traitNode)))
+    var oc: Node = newNode(nkBracketExpr, nodePos(traitNode))
+    addSon(oc, newIdent("default", nodePos(traitNode)))
+    addSon(oc, newIdent(vtblName, nodePos(traitNode)))
     addSon(vdecl, oc)
-    addSon(vdecl, newNode(nkEmpty, traitNode.pos))
+    addSon(vdecl, newNode(nkEmpty, nodePos(traitNode)))
     addSon(body, vdecl)
     for mi2 in 0..<methodDecls.len:
         let m2: Node = get(methodDecls, mi2)
         let mname2: str = monoStripSpaces(plainName(kid(m2, 0)))
         if monoStrNe(mname2, ""):
-            var asg: Node = newNode(nkAsgn, m2.pos)
-            var lhs: Node = newNode(nkDotExpr, m2.pos)
-            addSon(lhs, newIdent(varName, m2.pos))
-            addSon(lhs, newIdent(mname2, m2.pos))
+            var asg: Node = newNode(nkAsgn, nodePos(m2))
+            var lhs: Node = newNode(nkDotExpr, nodePos(m2))
+            addSon(lhs, newIdent(varName, nodePos(m2)))
+            addSon(lhs, newIdent(mname2, nodePos(m2)))
             addSon(asg, lhs)
-            addSon(asg, newIdent(mname2, m2.pos))
+            addSon(asg, newIdent(mname2, nodePos(m2)))
             addSon(body, asg)
-    var retNode: Node = newNode(nkReturn, traitNode.pos)
-    addSon(retNode, newIdent(varName, traitNode.pos))
+    var retNode: Node = newNode(nkReturn, nodePos(traitNode))
+    addSon(retNode, newIdent(varName, nodePos(traitNode)))
     addSon(body, retNode)
     addSon(initFn, body)
-    addSon(initFn, newNode(nkEmpty, traitNode.pos))
-    addSon(initFn, newNode(nkEmpty, traitNode.pos))
+    addSon(initFn, newNode(nkEmpty, nodePos(traitNode)))
+    addSon(initFn, newNode(nkEmpty, nodePos(traitNode)))
     add(rootStmts, initFn)
     return vtblName
 
 fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], rootStmts: Node[]*, mapIndex: hashmaps.HashMapStrInt* = nil) =
-    if generics == nil || generics.kind != nkGenericParams:
+    if astRefIsNil(generics) || nodeKind(generics) != nkGenericParams:
         return
     var localIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     var idx: hashmaps.HashMapStrInt* = mapIndex
@@ -3015,21 +3031,21 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
         idx = monoBuildIndex(mapNames, &localIndex)
     for i in 0..<kidCount generics:
         let defn: Node = kid(generics, i)
-        if defn != nil && defn.kind == nkIdentDefs && kidCount defn > 1:
+        if astRefNonNil(defn) && nodeKind(defn) == nkIdentDefs && kidCount defn > 1:
             let nameNode: Node = kid(defn, 0)
             let paramName: str = monoStripSpaces(plainName(nameNode))
             let constraint: Node = kid(defn, 1)
-            if monoStrNe(paramName, "") && constraint != nil && constraint.kind != nkEmpty:
+            if monoStrNe(paramName, "") && astRefNonNil(constraint) && nodeKind(constraint) != nkEmpty:
                 let actualTy: Node = mapGetStrNodeByIndex(mapNames, mapTypes, paramName, idx)
-                if actualTy != nil:
+                if astRefNonNil(actualTy):
                     let baseName: str = constraintBaseName(constraint)
                     var traitNode: Node = mapGetStrNodeIndex(traitIndex, traitNodes, baseName)
                     var isConcept: bool = false
-                    if traitNode == nil:
+                    if astRefIsNil(traitNode):
                         traitNode = mapGetStrNodeIndex(conceptIndex, conceptNodes, baseName)
-                        if traitNode != nil:
+                        if astRefNonNil(traitNode):
                             isConcept = true
-                    if traitNode != nil:
+                    if astRefNonNil(traitNode):
                         var args: Node[4]
                         constraintArgs(constraint, mapNames, mapTypes, &args, idx)
                         var genNode: Node = traitGenericsNode(traitNode)
@@ -3040,8 +3056,8 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
                         let idx2: hashmaps.HashMapStrInt* = monoBuildIndex(mapNames2, &mapIndex2)
                         var fullArgs: Node[4]
                         buildFullTypeArgs(genNode, mapNames2, mapTypes2, args, &fullArgs, idx2)
-                        if genNode != nil && genNode.kind == nkGenericParams && kidCount genNode > 0 && fullArgs.len != kidCount genNode:
-                            addWhereDiag(constraint.pos, "trait constraint missing type args: " + baseName)
+                        if astRefNonNil(genNode) && nodeKind(genNode) == nkGenericParams && kidCount genNode > 0 && fullArgs.len != kidCount genNode:
+                            addWhereDiag(nodePos(constraint), "trait constraint missing type args: " + baseName)
                         let vtblName: str = ensureTraitVtable(traitNode, baseName, actualTy, fullArgs, rootStmts)
                         let initName: str = traitVtableInitName vtblName
                         var methodDecls: Node[4]
@@ -3066,25 +3082,27 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
                                 var expParams: Node[4]
                                 if kidCount m > 1:
                                     let params: Node = kid(m, 1)
-                                    if params != nil && params.kind == nkFormalParams:
+                                    if astRefNonNil(params) && nodeKind(params) == nkFormalParams:
                                         for pi in 0..<kidCount params:
                                             let defs: Node = kid(params, pi)
-                                            if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 1:
-                                                let tyNode: Node = replaceTypeVars(kid(defs, 1), substNames, substTypes, substIdx)
-                                                add(expParams, tyNode)
-                                var expRet: Node = newNode(nkEmpty, m.pos)
+                                            if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs > 1:
+                                                let tyNode: Node = replaceTypeVars(identDefsType(defs), substNames, substTypes, substIdx)
+                                                let namesN: int32 = identDefsNameCount(defs)
+                                                for ni in 0..<namesN:
+                                                    add(expParams, tyNode)
+                                var expRet: Node = newNode(nkEmpty, nodePos(m))
                                 if kidCount m > 2:
                                     expRet = replaceTypeVars(kid(m, 2), substNames, substTypes, substIdx)
                                 let impl: Node = findFnImpl(mname, expParams, expRet, rootStmts)
-                                if impl == nil:
+                                if astRefIsNil(impl):
                                     var msg: str = "missing implementation for "
                                     if isConcept:
                                         msg = msg + "concept "
                                     else:
                                         msg = msg + "trait "
                                     msg = msg + baseName + "." + mname
-                                    addWhereDiag(m.pos, msg)
-                                traitDispatchAdd(actualTy, mname, vtblName, initName, m.pos)
+                                    addWhereDiag(nodePos(m), msg)
+                                traitDispatchAdd(actualTy, mname, vtblName, initName, nodePos(m))
 
 fn mangleInstance(name: str, typeArgs: Node[]): str =
     var base: str = name
@@ -3110,54 +3128,54 @@ fn mangleInstance(name: str, typeArgs: Node[]): str =
     if keys.len == 0:
         return base
     let p: void* = alloc(total + 1)
-    copyMem(p, void*(base), len base)
+    rawmemCopy(p, ptr(base), len base)
     var off: int32 = len base
     for j in 0..<keys.len:
-        setMem(ptr_add(p, off), int32('_'), 1)
+        rawmemSet(rawmemPtrAdd(p, off), int32('_'), 1)
         off = off + 1
         let k: str = get(keys, j)
         let kn: int32 = len k
         if kn > 0:
-            copyMem(ptr_add(p, off), void*(k), kn)
+            rawmemCopy(rawmemPtrAdd(p, off), ptr(k), kn)
             off = off + kn
-    setMem(ptr_add(p, total), 0, 1)
+    rawmemSet(rawmemPtrAdd(p, total), 0, 1)
     return str(p)
 
 fn inferLitType(n: Node): Node =
-    if n == nil:
-        return nil
-    case n.kind
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    case nodeKind(n)
     of nkIntLit:
-        if n.intVal > 2147483647 || n.intVal < (-2147483647 - 1):
-            return newIdent("int64", n.pos)
-        return newIdent("int32", n.pos)
+        if nodeIntVal(n) > 2147483647 || nodeIntVal(n) < (-2147483647 - 1):
+            return newIdent("int64", nodePos(n))
+        return newIdent("int32", nodePos(n))
     of nkFloatLit:
-        return newIdent("float64", n.pos)
+        return newIdent("float64", nodePos(n))
     of nkBoolLit:
-        return newIdent("bool", n.pos)
+        return newIdent("bool", nodePos(n))
     of nkCharLit:
-        return newIdent("char", n.pos)
+        return newIdent("char", nodePos(n))
     of nkStrLit:
-        return newIdent("str", n.pos)
+        return newIdent("str", nodePos(n))
     of nkIdent, nkSymbol:
-        let nm: str = monoStripSpaces n.ident
+        let nm: str = monoStripSpaces nodeIdent(n)
         if monoStrEq(nm, "true") || monoStrEq(nm, "false"):
-            return newIdent("bool", n.pos)
-        return nil
+            return newIdent("bool", nodePos(n))
+        return astInvalidNodeId()
     of nkCallArg:
         if kidCount n > 1:
             return inferLitType kid(n, 1)
-        return nil
+        return astInvalidNodeId()
     of nkPar:
         if kidCount n == 1:
             return inferLitType kid(n, 0)
-        return nil
+        return astInvalidNodeId()
     else:
-        return nil
+        return astInvalidNodeId()
 
 fn replaceTypeVars(n: Node, names: str[], types: Node[], index: hashmaps.HashMapStrInt* = nil): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     let profOn: bool = monoProfileActive
     var startNs: int64 = 0
     if profOn:
@@ -3166,8 +3184,8 @@ fn replaceTypeVars(n: Node, names: str[], types: Node[], index: hashmaps.HashMap
     defer:
         if profOn:
             replaceTypeVarsNs = replaceTypeVarsNs + (cheng_monotime_ns() - startNs)
-    if n.kind == nkIdent || n.kind == nkSymbol:
-        let nm: str = monoStripSpaces n.ident
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
+        let nm: str = monoStripSpaces nodeIdent(n)
         if index != nil && index->mask != 0:
             var found: bool = false
             let pos: int32 = monoHashMapStrIntGetCompat(*index, nm, found)
@@ -3186,61 +3204,61 @@ fn replaceTypeVars(n: Node, names: str[], types: Node[], index: hashmaps.HashMap
     for j in 0..<kc:
         let oldChild: Node = kid(n, j)
         let child: Node = replaceTypeVars(oldChild, names, types, index)
-        if !changed && child != oldChild:
+        if !changed && monoNodeNe(child, oldChild):
             changed = true
             outKids.cap = kc
             for back in 0..<j:
                 let prev: Node = kid(n, back)
-                if prev != nil:
+                if astRefNonNil(prev):
                     add(outKids, prev)
-        if changed && child != nil:
+        if changed && astRefNonNil(child):
             add(outKids, child)
     if ! changed:
         return n
-    var out: Node = newNode(n.kind, n.pos)
-    nodeSetIdent(out, n.ident)
-    nodeSetStrVal(out, n.strVal)
-    out.intVal = n.intVal
-    out.floatVal = n.floatVal
-    out.callStyle = n.callStyle
+    var out: Node = newNode(nodeKind(n), nodePos(n))
+    nodeSetIdent(out, nodeIdent(n))
+    nodeSetStrVal(out, nodeStrVal(n))
+    nodeSetIntVal(out, nodeIntVal(n))
+    nodeSetFloatVal(out, nodeFloatVal(n))
+    nodeSetCallStyle(out, nodeCallStyle(n))
     for k in 0..<outKids.len:
         addSon(out, get(outKids, k))
     return out
 
 fn whereTypeKey(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.HashMapStrInt* = nil): str =
-    if expr == nil:
+    if astRefIsNil(expr):
         return ""
     var localIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     var idx: hashmaps.HashMapStrInt* = mapIndex
     if idx == nil:
         idx = monoBuildIndex(names, &localIndex)
     var e: Node = expr
-    if e.kind == nkPar && kidCount e == 1:
+    if nodeKind(e) == nkPar && kidCount e == 1:
         e = kid(e, 0)
     let resolved: Node = replaceTypeVars(e, names, types, idx)
-    if resolved == nil:
+    if astRefIsNil(resolved):
         return ""
-    case resolved.kind
+    case nodeKind(resolved)
     of nkIdent, nkSymbol, nkPtrTy, nkRefTy, nkVarTy, nkSetTy, nkFnTy, nkTupleTy, nkBracketExpr:
         return typeKey resolved
     else:
         return ""
 
 fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.HashMapStrInt* = nil): int32 =
-    if expr == nil || expr.kind == nkEmpty:
+    if astRefIsNil(expr) || nodeKind(expr) == nkEmpty:
         return 1
     var localIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     var idx: hashmaps.HashMapStrInt* = mapIndex
     if idx == nil:
         idx = monoBuildIndex(names, &localIndex)
-    case expr.kind
+    case nodeKind(expr)
     of nkBoolLit:
-        let v: str = monoStripSpaces expr.ident
+        let v: str = monoStripSpaces nodeIdent(expr)
         if monoStrEq(v, "true"): return 1
         if monoStrEq(v, "false"): return 0
         return -1
     of nkIdent, nkSymbol:
-        let v2: str = monoStripSpaces expr.ident
+        let v2: str = monoStripSpaces nodeIdent(expr)
         if monoStrEq(v2, "true"): return 1
         if monoStrEq(v2, "false"): return 0
         return -1
@@ -3251,7 +3269,7 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.Has
     of nkPrefix:
         if kidCount expr > 1:
             let opn: Node = kid(expr, 0)
-            if opn != nil && monoStrEq(monoStripSpaces(opn.ident), "!"):
+            if astRefNonNil(opn) && monoStrEq(monoStripSpaces(nodeIdent(opn)), "!"):
                 let inner: int32 = evalWhereExpr(kid(expr, 1), names, types, idx)
                 if inner < 0:
                     return -1
@@ -3263,8 +3281,8 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[], mapIndex: hashmaps.Has
         if kidCount expr > 2:
             let opn2: Node = kid(expr, 0)
             var op: str = ""
-            if opn2 != nil:
-                op = monoStripSpaces opn2.ident
+            if astRefNonNil(opn2):
+                op = monoStripSpaces nodeIdent(opn2)
             if monoStrEq(op, "&&"):
                 let lhs: int32 = evalWhereExpr(kid(expr, 1), names, types, idx)
                 let rhs: int32 = evalWhereExpr(kid(expr, 2), names, types, idx)
@@ -3303,8 +3321,8 @@ fn getName(n: Node): str =
     return nm
 
 fn findGenericFnDecl(n: Node, name: str): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     let profOn: bool = monoProfileActive
     var startNs: int64 = 0
     if profOn:
@@ -3313,25 +3331,25 @@ fn findGenericFnDecl(n: Node, name: str): Node =
     defer:
         if profOn:
             findGenericFnDeclNs = findGenericFnDeclNs + (cheng_monotime_ns() - startNs)
-    if n.kind == nkFnDecl || n.kind == nkIteratorDecl:
+    if nodeKind(n) == nkFnDecl || nodeKind(n) == nkIteratorDecl:
         if kidCount n > 4:
             let gens: Node = kid(n, 4)
-            if gens != nil && gens.kind == nkGenericParams && kidCount gens > 0:
+            if astRefNonNil(gens) && nodeKind(gens) == nkGenericParams && kidCount gens > 0:
                 if monoStrEq(getName(kid(n, 0)), name):
                     return n
     for i in 0..<kidCount n:
         let found: Node = findGenericFnDecl(kid(n, i), name)
-        if found != nil:
+        if astRefNonNil(found):
             return found
-    return nil
+    return astInvalidNodeId()
 
 
 fn isComparableType(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    if n.kind == nkPtrTy || n.kind == nkRefTy:
+    if nodeKind(n) == nkPtrTy || nodeKind(n) == nkRefTy:
         return true
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         let name: str = monoStripSpaces(plainName(n))
         if monoStrEq(name, "int") || monoStrEq(name, "int8") || monoStrEq(name, "int16") || monoStrEq(name, "int32") || monoStrEq(name, "int64"):
             return true
@@ -3346,22 +3364,22 @@ fn isComparableType(n: Node): bool =
     return false
 
 fn collectTypeArgMap(generics: Node, args: Node[], outNames: str[]*, outTypes: Node[]*) =
-    if generics == nil || generics.kind != nkGenericParams:
+    if astRefIsNil(generics) || nodeKind(generics) != nkGenericParams:
         return
     for i in 0..<kidCount generics:
         let defn: Node = kid(generics, i)
-        if defn != nil && defn.kind == nkIdentDefs && kidCount defn > 0:
+        if astRefNonNil(defn) && nodeKind(defn) == nkIdentDefs && kidCount defn > 0:
             let nameNode: Node = kid(defn, 0)
             let name: str = monoStripSpaces(plainName(nameNode))
             if len name > 0:
-                var mapped: Node = nil
+                var mapped: Node = astInvalidNodeId()
                 if i < args.len:
                     mapped = get(args, i)
                 elif kidCount defn > 2:
                     let defaultVal: Node = kid(defn, 2)
-                    if defaultVal != nil && defaultVal.kind != nkEmpty:
+                    if astRefNonNil(defaultVal) && nodeKind(defaultVal) != nkEmpty:
                         mapped = replaceTypeVars(defaultVal, *outNames, *outTypes)
-                if mapped != nil:
+                if astRefNonNil(mapped):
                     add(outNames, name)
                     add(outTypes, mapped)
 
@@ -3370,7 +3388,7 @@ fn buildFullTypeArgs(generics: Node, mapNames: str[], mapTypes: Node[], fallback
     var idx: hashmaps.HashMapStrInt* = mapIndex
     if idx == nil:
         idx = monoBuildIndex(mapNames, &localIndex)
-    if generics != nil && generics.kind == nkGenericParams:
+    if astRefNonNil(generics) && nodeKind(generics) == nkGenericParams:
         if buildTypeArgsFromMap(generics, mapNames, mapTypes, outArgs, idx):
             return
     for i in 0..<fallbackArgs.len:
@@ -3386,9 +3404,9 @@ fn instantiateType(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =
         if profOn:
             instantiateTypeNs = instantiateTypeNs + (cheng_monotime_ns() - startNs)
     let genNode: Node = mapGetStrNodeIndex(genericTypeIndex, genericTypeNodes, name)
-    if genNode == nil:
+    if astRefIsNil(genNode):
         return false
-    var generics: Node = nil
+    var generics: Node = astInvalidNodeId()
     if kidCount genNode > 2:
         generics = kid(genNode, 2)
     var mapNames: str[4]
@@ -3403,41 +3421,41 @@ fn instantiateType(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =
     if len(instMapGet(instName)) > 0:
         return true
     if ! mapHasStrIndex(instTypeIndex, instName):
-        var instTy: Node = newNode(nkBracketExpr, genNode.pos)
-        addSon(instTy, newIdent(name, genNode.pos))
+        var instTy: Node = newNode(nkBracketExpr, nodePos(genNode))
+        addSon(instTy, newIdent(name, nodePos(genNode)))
         for ti in 0..<instArgs.len:
             addSon(instTy, cloneTree get(instArgs, ti))
         mapPutStrNodeIndex(instTypeIndex, instTypeNames, instTypeNodes, instName, instTy)
-    var whereExpr: Node = nil
+    var whereExpr: Node = astInvalidNodeId()
     if kidCount genNode > 3:
         whereExpr = kid(genNode, 3)
-    if whereExpr != nil && whereExpr.kind != nkEmpty:
+    if astRefNonNil(whereExpr) && nodeKind(whereExpr) != nkEmpty:
         let res: int32 = evalWhereExpr(whereExpr, mapNames, mapTypes, idx)
         if res == 0:
-            addWhereDiag(whereExpr.pos, "where condition not satisfied: " + instName)
+            addWhereDiag(nodePos(whereExpr), "where condition not satisfied: " + instName)
             return false
-    trackLexString void*(instName)
+    trackLexStringStr(instName)
     instMapAdd instName
-    var defNode: Node = nil
+    var defNode: Node = astInvalidNodeId()
     if kidCount genNode > 1:
         defNode = kid(genNode, 1)
     let replacedDef: Node = replaceTypeVars(defNode, mapNames, mapTypes, idx)
     var newDef: Node = transform(replacedDef, rootStmts, true)
-    if newDef == nil:
+    if astRefIsNil(newDef):
         newDef = replacedDef
-    var decl: Node = newNode(nkTypeDecl, genNode.pos)
-    nodeSetStrVal(decl, genNode.strVal)
-    addSon(decl, newIdent(instName, genNode.pos))
+    var decl: Node = newNode(nkTypeDecl, nodePos(genNode))
+    nodeSetStrVal(decl, nodeStrVal(genNode))
+    addSon(decl, newIdent(instName, nodePos(genNode)))
     addSon(decl, newDef)
-    addSon(decl, newNode(nkEmpty, genNode.pos))
-    addSon(decl, newNode(nkEmpty, genNode.pos))
-    var pragmaNode: Node = nil
+    addSon(decl, newNode(nkEmpty, nodePos(genNode)))
+    addSon(decl, newNode(nkEmpty, nodePos(genNode)))
+    var pragmaNode: Node = astInvalidNodeId()
     if kidCount genNode > 4:
         pragmaNode = kid(genNode, 4)
-    if pragmaNode != nil && pragmaNode.kind != nkEmpty:
+    if astRefNonNil(pragmaNode) && nodeKind(pragmaNode) != nkEmpty:
         addSon(decl, cloneTree pragmaNode)
     else:
-        addSon(decl, newNode(nkEmpty, genNode.pos))
+        addSon(decl, newNode(nkEmpty, nodePos(genNode)))
     add(rootStmts, decl)
     if monoEagerContainerInstEnabled():
         if monoStrEq(name, "seq"):
@@ -3472,7 +3490,7 @@ fn instantiateFn(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =
         if profOn:
             instantiateFnNs = instantiateFnNs + (cheng_monotime_ns() - startNs)
     var genNode: Node = genericFnGet(name)
-    if genNode == nil:
+    if astRefIsNil(genNode):
         var missCached: bool = false
         let missFlag: int32 = monoHashMapStrIntGetCompat(genericFnMissingIndex, name, missCached)
         if missCached && missFlag != 0:
@@ -3481,14 +3499,14 @@ fn instantiateFn(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =
         # Re-scan once by exact name and backfill indices so the instantiation
         # defines the same symbol that transform() rewrites calls to.
         genNode = findGenericFnDecl(monoRoot, name)
-        if genNode != nil:
+        if astRefNonNil(genNode):
             genericFnAdd(name, genNode)
             hashmaps.hashMapStrIntPut(genericFnMissingIndex, name, 0)
         else:
             hashmaps.hashMapStrIntPut(genericFnMissingIndex, name, 1)
-    if genNode == nil:
+    if astRefIsNil(genNode):
         return false
-    var generics: Node = nil
+    var generics: Node = astInvalidNodeId()
     if kidCount genNode > 4:
         generics = kid(genNode, 4)
     var mapNames: str[4]
@@ -3502,30 +3520,30 @@ fn instantiateFn(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =
     let instName: str = mangleInstance(name, instArgs)
     if len(instMapGet(instName)) > 0:
         return true
-    var pragmaNode: Node = nil
+    var pragmaNode: Node = astInvalidNodeId()
     if kidCount genNode > 5:
         pragmaNode = kid(genNode, 5)
-    if pragmaNode != nil && pragmaNode.kind == nkPragma:
+    if astRefNonNil(pragmaNode) && nodeKind(pragmaNode) == nkPragma:
         for wi in 0..<kidCount pragmaNode:
             let ann: Node = kid(pragmaNode, wi)
-            if ann != nil && ann.kind == nkAnnotation && kidCount ann > 0:
+            if astRefNonNil(ann) && nodeKind(ann) == nkAnnotation && kidCount ann > 0:
                 let aname: str = monoStripSpaces(plainName(kid(ann, 0)))
                 if monoStrEq(aname, "where") && kidCount ann > 1:
                     let whereExpr2: Node = kid(ann, 1)
-                    if whereExpr2 != nil && whereExpr2.kind != nkEmpty:
+                    if astRefNonNil(whereExpr2) && nodeKind(whereExpr2) != nkEmpty:
                         let res2: int32 = evalWhereExpr(whereExpr2, mapNames, mapTypes, idx)
                         if res2 == 0:
-                            addWhereDiag(whereExpr2.pos, "where condition not satisfied: " + instName)
+                            addWhereDiag(nodePos(whereExpr2), "where condition not satisfied: " + instName)
                             return false
-    trackLexString void*(instName)
+    trackLexStringStr(instName)
     instMapAdd instName
-    var paramsNode: Node = nil
+    var paramsNode: Node = astInvalidNodeId()
     if kidCount genNode > 1:
         paramsNode = kid(genNode, 1)
-    var retNode: Node = nil
+    var retNode: Node = astInvalidNodeId()
     if kidCount genNode > 2:
         retNode = kid(genNode, 2)
-    var bodyNode: Node = nil
+    var bodyNode: Node = astInvalidNodeId()
     if kidCount genNode > 3:
         bodyNode = kid(genNode, 3)
     let replacedParams: Node = replaceTypeVars(paramsNode, mapNames, mapTypes, idx)
@@ -3534,37 +3552,37 @@ fn instantiateFn(name: str, typeArgs: Node[], rootStmts: Node[]*): bool =
     var newParams: Node = transform(replacedParams, rootStmts, false)
     var newRet: Node = transform(replacedRet, rootStmts, true)
     var newBody: Node = transform(replacedBody, rootStmts, false)
-    if newParams == nil:
+    if astRefIsNil(newParams):
         newParams = replacedParams
-    if newRet == nil:
+    if astRefIsNil(newRet):
         newRet = replacedRet
-    if newBody == nil:
+    if astRefIsNil(newBody):
         newBody = replacedBody
-    var decl: Node = newNode(genNode.kind, genNode.pos)
-    nodeSetStrVal(decl, genNode.strVal)
-    addSon(decl, newIdent(instName, genNode.pos))
+    var decl: Node = newNode(nodeKind(genNode), nodePos(genNode))
+    nodeSetStrVal(decl, nodeStrVal(genNode))
+    addSon(decl, newIdent(instName, nodePos(genNode)))
     addSon(decl, newParams)
     addSon(decl, newRet)
     addSon(decl, newBody)
-    addSon(decl, newNode(nkEmpty, genNode.pos))
-    if pragmaNode != nil && pragmaNode.kind != nkEmpty:
+    addSon(decl, newNode(nkEmpty, nodePos(genNode)))
+    if astRefNonNil(pragmaNode) && nodeKind(pragmaNode) != nkEmpty:
         addSon(decl, cloneTree pragmaNode)
     else:
-        addSon(decl, newNode(nkEmpty, genNode.pos))
+        addSon(decl, newNode(nkEmpty, nodePos(genNode)))
     add(rootStmts, decl)
     return true
 
 fn instantiateLambda(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
-    if lam == nil:
-        return nil
+    if astRefIsNil(lam):
+        return astInvalidNodeId()
     let baseName: str = lambdaBaseName lam
     var instName: str = baseName
-    var generics: Node = nil
+    var generics: Node = astInvalidNodeId()
     if kidCount lam > 4:
         generics = kid(lam, 4)
     var mapNames: str[4]
     var mapTypes: Node[4]
-    if generics != nil && generics.kind == nkGenericParams && kidCount generics > 0:
+    if astRefNonNil(generics) && nodeKind(generics) == nkGenericParams && kidCount generics > 0:
         collectTypeArgMap(generics, typeArgs, &mapNames, &mapTypes)
     var mapIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     let idx: hashmaps.HashMapStrInt* = monoBuildIndex(mapNames, &mapIndex)
@@ -3574,76 +3592,76 @@ fn instantiateLambda(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
         instName = mangleInstance(baseName, instArgs)
     let existing: str = instMapGet(instName)
     if len(existing) > 0:
-        return newIdent(existing, lam.pos)
+        return newIdent(existing, nodePos(lam))
     if instArgs.len > 0:
-        trackLexString void*(instName)
+        trackLexStringStr(instName)
     instMapAdd instName
-    var paramsNode: Node = nil
+    var paramsNode: Node = astInvalidNodeId()
     if kidCount lam > 1:
         paramsNode = kid(lam, 1)
-    var retNode: Node = nil
+    var retNode: Node = astInvalidNodeId()
     if kidCount lam > 2:
         retNode = kid(lam, 2)
-    var bodyNode: Node = nil
+    var bodyNode: Node = astInvalidNodeId()
     if kidCount lam > 3:
         bodyNode = kid(lam, 3)
     let newParams: Node = transform(replaceTypeVars(paramsNode, mapNames, mapTypes, idx), rootStmts, false)
     let newRet: Node = transform(replaceTypeVars(retNode, mapNames, mapTypes, idx), rootStmts, true)
     let newBody: Node = transform(replaceTypeVars(bodyNode, mapNames, mapTypes, idx), rootStmts, false)
-    var decl: Node = newNode(lambdaDeclKind lam, lam.pos)
-    nodeSetStrVal(decl, lam.strVal)
-    addSon(decl, newIdent(instName, lam.pos))
+    var decl: Node = newNode(lambdaDeclKind lam, nodePos(lam))
+    nodeSetStrVal(decl, nodeStrVal(lam))
+    addSon(decl, newIdent(instName, nodePos(lam)))
     addSon(decl, newParams)
     addSon(decl, newRet)
     addSon(decl, newBody)
-    addSon(decl, newNode(nkEmpty, lam.pos))
-    addSon(decl, newNode(nkEmpty, lam.pos))
+    addSon(decl, newNode(nkEmpty, nodePos(lam)))
+    addSon(decl, newNode(nkEmpty, nodePos(lam)))
     add(rootStmts, decl)
-    return newIdent(instName, lam.pos)
+    return newIdent(instName, nodePos(lam))
 
 fn lambdaFnType(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
-    if lam == nil:
-        return nil
-    var generics: Node = nil
+    if astRefIsNil(lam):
+        return astInvalidNodeId()
+    var generics: Node = astInvalidNodeId()
     if kidCount lam > 4:
         generics = kid(lam, 4)
     var mapNames: str[4]
     var mapTypes: Node[4]
-    if generics != nil && generics.kind == nkGenericParams && kidCount generics > 0:
+    if astRefNonNil(generics) && nodeKind(generics) == nkGenericParams && kidCount generics > 0:
         collectTypeArgMap(generics, typeArgs, &mapNames, &mapTypes)
     var mapIndex: hashmaps.HashMapStrInt = monoZeroHashMapStrInt()
     let idx: hashmaps.HashMapStrInt* = monoBuildIndex(mapNames, &mapIndex)
-    var paramsNode: Node = nil
+    var paramsNode: Node = astInvalidNodeId()
     if kidCount lam > 1:
         paramsNode = kid(lam, 1)
-    var retNode: Node = nil
+    var retNode: Node = astInvalidNodeId()
     if kidCount lam > 2:
         retNode = kid(lam, 2)
     let newParams: Node = transform(replaceTypeVars(paramsNode, mapNames, mapTypes, idx), rootStmts, false)
     let newRet: Node = transform(replaceTypeVars(retNode, mapNames, mapTypes, idx), rootStmts, true)
-    var ty: Node = newNode(nkFnTy, lam.pos)
+    var ty: Node = newNode(nkFnTy, nodePos(lam))
     addSon(ty, newParams)
     addSon(ty, newRet)
     return ty
 
 fn transformCallTemplate(name: str, templNode: Node, callNode: Node, rootStmts: Node[]*): Node =
-    if templNode == nil || callNode == nil:
+    if astRefIsNil(templNode) || astRefIsNil(callNode):
         return callNode
-    var paramsNode: Node = nil
+    var paramsNode: Node = astInvalidNodeId()
     if kidCount templNode > 1:
         paramsNode = kid(templNode, 1)
-    var bodyNode: Node = nil
+    var bodyNode: Node = astInvalidNodeId()
     if kidCount templNode > 3:
         bodyNode = kid(templNode, 3)
-    if paramsNode == nil || bodyNode == nil:
+    if astRefIsNil(paramsNode) || astRefIsNil(bodyNode):
         return callNode
     var mapNames: str[4]
     var mapTypes: Node[4]
     var argIdx: int32 = 1
     for pi in 0..<kidCount paramsNode:
         let defs: Node = kid(paramsNode, pi)
-        if defs != nil && defs.kind == nkIdentDefs && kidCount defs > 2:
-            for ni in 0..<kidCount defs - 2:
+        if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs > 2:
+            for ni in 0..<identDefsNameCount(defs):
                 let nameNode: Node = kid(defs, ni)
                 if argIdx < kidCount callNode:
                     add(mapNames, monoStripSpaces(plainName(nameNode)))
@@ -3651,16 +3669,16 @@ fn transformCallTemplate(name: str, templNode: Node, callNode: Node, rootStmts: 
                     argIdx = argIdx + 1
     let expanded: Node = replaceTypeVars(bodyNode, mapNames, mapTypes)
     let transformed: Node = transform(expanded, rootStmts)
-    if transformed != nil && transformed.kind == nkStmtList && kidCount transformed == 1:
+    if astRefNonNil(transformed) && nodeKind(transformed) == nkStmtList && kidCount transformed == 1:
         return kid(transformed, 0)
     return transformed
 
 fn typeBaseName(n: Node): str =
-    if n == nil:
+    if astRefIsNil(n):
         return ""
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         return monoStripSpaces(plainName(n))
-    if n.kind == nkDotExpr && kidCount n > 1:
+    if nodeKind(n) == nkDotExpr && kidCount n > 1:
         return monoStripSpaces(plainName(kid(n, 1)))
     return ""
 
@@ -3671,9 +3689,9 @@ fn startsUpperAscii(s: str): bool =
     return (c >= 'A' && c <= 'Z')
 
 fn looksLikeTypeNameNode(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    if n.kind != nkIdent && n.kind != nkSymbol:
+    if nodeKind(n) != nkIdent && nodeKind(n) != nkSymbol:
         return false
     if isComparableType n:
         return true
@@ -3683,9 +3701,9 @@ fn looksLikeTypeNameNode(n: Node): bool =
     return startsUpperAscii nm
 
 fn looksLikeTypeExpr(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    case n.kind
+    case nodeKind(n)
     of nkIdent, nkSymbol:
         return looksLikeTypeNameNode n
     of nkPtrTy, nkRefTy, nkVarTy, nkSetTy:
@@ -3716,7 +3734,7 @@ fn looksLikeTypeExpr(n: Node): bool =
         return false
 
 fn bracketLooksLikeTypeCall(n: Node): bool =
-    if n == nil || n.kind != nkBracketExpr:
+    if astRefIsNil(n) || nodeKind(n) != nkBracketExpr:
         return false
     if kidCount n == 0:
         return false
@@ -3729,9 +3747,9 @@ fn bracketLooksLikeTypeCall(n: Node): bool =
     return true
 
 fn isDefiniteTypeCallee(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    case n.kind
+    case nodeKind(n)
     of nkPtrTy, nkRefTy, nkVarTy, nkTupleTy, nkSetTy, nkFnTy:
         return true
     of nkPar:
@@ -3750,7 +3768,7 @@ fn isDefiniteTypeCallee(n: Node): bool =
     of nkDotExpr:
         if kidCount n > 1:
             let member: Node = kid(n, 1)
-            if member != nil && (member.kind == nkIdent || member.kind == nkSymbol):
+            if astRefNonNil(member) && (nodeKind(member) == nkIdent || nodeKind(member) == nkSymbol):
                 let nm2: str = monoStripSpaces(plainName(member))
                 if monoIsBuiltinTypeKey(nm2):
                     return true
@@ -3772,27 +3790,27 @@ fn isDefiniteTypeCallee(n: Node): bool =
         return false
 
 fn bracketCallToExpr(n: Node): Node =
-    if n == nil || n.kind != nkCall || kidCount n < 2:
-        return nil
+    if astRefIsNil(n) || nodeKind(n) != nkCall || kidCount n < 2:
+        return astInvalidNodeId()
     let head: Node = kid(n, 0)
-    if head == nil:
-        return nil
+    if astRefIsNil(head):
+        return astInvalidNodeId()
     let hname: str = monoStripSpaces(plainName(head))
     if monoStrNe(hname, "bracket") && monoStrNe(hname, "[]"):
-        return nil
-    var br: Node = newNode(nkBracketExpr, n.pos)
+        return astInvalidNodeId()
+    var br: Node = newNode(nkBracketExpr, nodePos(n))
     for i in 1..<kidCount n:
         addSon(br, kid(n, i))
     return br
 
 fn transformIdentDefs(n: Node, rootStmts: Node[]*, defaultsAreTypes: bool): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     var changed: bool = false
     var outKids: Node[4]
     for i in 0..<kidCount n:
         let oldChild: Node = kid(n, i)
-        var child: Node = nil
+        var child: Node = astInvalidNodeId()
         if i == 0:
             child = transform(oldChild, rootStmts, false)
         elif i == 1:
@@ -3804,44 +3822,44 @@ fn transformIdentDefs(n: Node, rootStmts: Node[]*, defaultsAreTypes: bool): Node
                 child = transform(oldChild, rootStmts, false)
         else:
             child = transform(oldChild, rootStmts, false)
-        if child != oldChild:
+        if monoNodeNe(child, oldChild):
             changed = true
-        if child != nil:
+        if astRefNonNil(child):
             add(outKids, child)
     if ! changed:
         return n
-    var out: Node = newNode(n.kind, n.pos)
-    nodeSetIdent(out, n.ident)
-    nodeSetStrVal(out, n.strVal)
-    out.intVal = n.intVal
-    out.floatVal = n.floatVal
+    var out: Node = newNode(nodeKind(n), nodePos(n))
+    nodeSetIdent(out, nodeIdent(n))
+    nodeSetStrVal(out, nodeStrVal(n))
+    nodeSetIntVal(out, nodeIntVal(n))
+    nodeSetFloatVal(out, nodeFloatVal(n))
     for j in 0..<outKids.len:
         addSon(out, get(outKids, j))
     return out
 
 fn transformGenericParams(n: Node, rootStmts: Node[]*): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     var changed: bool = false
     var outKids: Node[4]
     for i in 0..<kidCount n:
         let oldChild: Node = kid(n, i)
         var child: Node = oldChild
-        if oldChild != nil && oldChild.kind == nkIdentDefs:
+        if astRefNonNil(oldChild) && nodeKind(oldChild) == nkIdentDefs:
             child = transformIdentDefs(oldChild, rootStmts, true)
         else:
             child = transform(oldChild, rootStmts, true)
-        if child != oldChild:
+        if monoNodeNe(child, oldChild):
             changed = true
-        if child != nil:
+        if astRefNonNil(child):
             add(outKids, child)
     if ! changed:
         return n
-    var out: Node = newNode(n.kind, n.pos)
-    nodeSetIdent(out, n.ident)
-    nodeSetStrVal(out, n.strVal)
-    out.intVal = n.intVal
-    out.floatVal = n.floatVal
+    var out: Node = newNode(nodeKind(n), nodePos(n))
+    nodeSetIdent(out, nodeIdent(n))
+    nodeSetStrVal(out, nodeStrVal(n))
+    nodeSetIntVal(out, nodeIntVal(n))
+    nodeSetFloatVal(out, nodeFloatVal(n))
     for j in 0..<outKids.len:
         addSon(out, get(outKids, j))
     return out
@@ -3862,30 +3880,30 @@ fn transformFallback(n: Node, rootStmts: Node[]*, inTypeContext: bool): Node =
     for k in 0..<kc:
         let oldChild: Node = kid(n, k)
         let child: Node = transform(oldChild, rootStmts, inTypeContext)
-        let removed: bool = (child == nil) && (oldChild != nil)
-        if !changed && (child != oldChild || removed):
+        let removed: bool = (astRefIsNil(child)) && (astRefNonNil(oldChild))
+        if !changed && (monoNodeNe(child, oldChild) || removed):
             changed = true
             outKids.cap = kc
             for back in 0..<k:
                 let prev: Node = kid(n, back)
-                if prev != nil:
+                if astRefNonNil(prev):
                     add(outKids, prev)
-        if changed && child != nil:
+        if changed && astRefNonNil(child):
             add(outKids, child)
     if ! changed:
         return n
-    var out: Node = newNode(n.kind, n.pos)
-    nodeSetIdent(out, n.ident)
-    nodeSetStrVal(out, n.strVal)
-    out.intVal = n.intVal
-    out.floatVal = n.floatVal
+    var out: Node = newNode(nodeKind(n), nodePos(n))
+    nodeSetIdent(out, nodeIdent(n))
+    nodeSetStrVal(out, nodeStrVal(n))
+    nodeSetIntVal(out, nodeIntVal(n))
+    nodeSetFloatVal(out, nodeFloatVal(n))
     for ki in 0..<outKids.len:
         addSon(out, get(outKids, ki))
     return out
 
 fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
-    if n == nil:
-        return nil
+    if astRefIsNil(n):
+        return astInvalidNodeId()
     var profStart: int64 = 0
     if monoProfileActive:
         transformCalls = transformCalls + 1
@@ -3893,10 +3911,10 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
     defer:
         if monoProfileActive:
             transformNs = transformNs + (cheng_monotime_ns() - profStart)
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         monoMaybeInstantiateMangledFnName(n, rootStmts)
     var changed: bool = false
-    case n.kind
+    case nodeKind(n)
     of nkModule, nkStmtList:
         var profStartMod: int64 = 0
         if monoProfileActive:
@@ -3910,18 +3928,18 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         for i0 in 0..<kidCount n:
             let oldChild0: Node = kid(n, i0)
             let child0: Node = transform(oldChild0, rootStmts, false)
-            if child0 != oldChild0:
+            if monoNodeNe(child0, oldChild0):
                 changed = true
-            if child0 != nil:
+            if astRefNonNil(child0):
                 add(outKids0, child0)
         monoValueScopePop()
         if ! changed:
             return n
-        var out0: Node = newNode(n.kind, n.pos)
-        nodeSetIdent(out0, n.ident)
-        nodeSetStrVal(out0, n.strVal)
-        out0.intVal = n.intVal
-        out0.floatVal = n.floatVal
+        var out0: Node = newNode(nodeKind(n), nodePos(n))
+        nodeSetIdent(out0, nodeIdent(n))
+        nodeSetStrVal(out0, nodeStrVal(n))
+        nodeSetIntVal(out0, nodeIntVal(n))
+        nodeSetFloatVal(out0, nodeFloatVal(n))
         for k0 in 0..<outKids0.len:
             addSon(out0, get(outKids0, k0))
         return out0
@@ -3935,36 +3953,36 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 transformTypeDeclNs = transformTypeDeclNs + (cheng_monotime_ns() - profStartTypeDecl)
         if kidCount n > 2:
             let gens: Node = kid(n, 2)
-            if gens != nil && gens.kind == nkGenericParams && kidCount gens > 0:
+            if astRefNonNil(gens) && nodeKind(gens) == nkGenericParams && kidCount gens > 0:
                 let nm0: str = getName kid(n, 0)
                 if len nm0 > 0 && ! mapHasStrIndex(genericTypeIndex, nm0):
                     mapPutStrNodeIndex(genericTypeIndex, genericTypeNames, genericTypeNodes, nm0, n)
-                return newNode(nkEmpty, n.pos)
+                return newNode(nkEmpty, nodePos(n))
         var outKids: Node[4]
         for i in 0..<kidCount n:
             let oldChild: Node = kid(n, i)
-            var child: Node = nil
+            var child: Node = astInvalidNodeId()
             if i == 0:
                 child = transform(oldChild, rootStmts, false)
             elif i == 1:
                 child = transform(oldChild, rootStmts, true)
-            elif i == 2 && oldChild != nil && oldChild.kind == nkGenericParams:
+            elif i == 2 && astRefNonNil(oldChild) && nodeKind(oldChild) == nkGenericParams:
                 child = transformGenericParams(oldChild, rootStmts)
             else:
                 child = transform(oldChild, rootStmts, false)
-            if child == nil:
+            if astRefIsNil(child):
                 child = oldChild
-            if child != oldChild:
+            if monoNodeNe(child, oldChild):
                 changed = true
-            if child != nil:
+            if astRefNonNil(child):
                 add(outKids, child)
         if ! changed:
             return n
-        var out: Node = newNode(n.kind, n.pos)
-        nodeSetIdent(out, n.ident)
-        nodeSetStrVal(out, n.strVal)
-        out.intVal = n.intVal
-        out.floatVal = n.floatVal
+        var out: Node = newNode(nodeKind(n), nodePos(n))
+        nodeSetIdent(out, nodeIdent(n))
+        nodeSetStrVal(out, nodeStrVal(n))
+        nodeSetIntVal(out, nodeIntVal(n))
+        nodeSetFloatVal(out, nodeFloatVal(n))
         for ki in 0..<outKids.len:
             addSon(out, get(outKids, ki))
         return out
@@ -3978,18 +3996,18 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 transformFnDeclNs = transformFnDeclNs + (cheng_monotime_ns() - profStartFnDecl)
         if kidCount n > 4:
             let gens2: Node = kid(n, 4)
-            if gens2 != nil && gens2.kind == nkGenericParams && kidCount gens2 > 0:
+            if astRefNonNil(gens2) && nodeKind(gens2) == nkGenericParams && kidCount gens2 > 0:
                 let nm1: str = getName kid(n, 0)
                 if len nm1 > 0 && ! genericFnHas(nm1):
                     genericFnAdd(nm1, n)
-                return newNode(nkEmpty, n.pos)
+                return newNode(nkEmpty, nodePos(n))
         monoValueScopePush()
         if kidCount n > 1:
             monoBindFormalParams kid(n, 1)
         var outKids2: Node[6]
         for i2 in 0..<kidCount n:
             let oldChild2: Node = kid(n, i2)
-            var child2: Node = nil
+            var child2: Node = astInvalidNodeId()
             if i2 == 0:
                 child2 = oldChild2
             elif i2 == 1:
@@ -3998,23 +4016,23 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 child2 = transform(oldChild2, rootStmts, true)
             elif i2 == 3:
                 child2 = transform(oldChild2, rootStmts, false)
-            elif i2 == 4 && oldChild2 != nil && oldChild2.kind == nkGenericParams:
+            elif i2 == 4 && astRefNonNil(oldChild2) && nodeKind(oldChild2) == nkGenericParams:
                 child2 = transformGenericParams(oldChild2, rootStmts)
             else:
                 child2 = transform(oldChild2, rootStmts, false)
-            if child2 == nil:
+            if astRefIsNil(child2):
                 child2 = oldChild2
-            if child2 != oldChild2:
+            if monoNodeNe(child2, oldChild2):
                 changed = true
             add(outKids2, child2)
         monoValueScopePop()
         if ! changed:
             return n
-        var out2: Node = newNode(n.kind, n.pos)
-        nodeSetIdent(out2, n.ident)
-        nodeSetStrVal(out2, n.strVal)
-        out2.intVal = n.intVal
-        out2.floatVal = n.floatVal
+        var out2: Node = newNode(nodeKind(n), nodePos(n))
+        nodeSetIdent(out2, nodeIdent(n))
+        nodeSetStrVal(out2, nodeStrVal(n))
+        nodeSetIntVal(out2, nodeIntVal(n))
+        nodeSetFloatVal(out2, nodeFloatVal(n))
         for ki2 in 0..<outKids2.len:
             addSon(out2, get(outKids2, ki2))
         return out2
@@ -4024,10 +4042,10 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         return transformIdentDefs(n, rootStmts, false)
     of nkTemplateDecl:
         mapPutStrNodeIndex(templateIndex, templateNames, templateNodes, getName kid(n, 0), n)
-        return newNode(nkEmpty, n.pos)
+        return newNode(nkEmpty, nodePos(n))
     of nkMacroDecl:
         mapPutStrNodeIndex(macroIndex, macroNames, macroNodes, getName kid(n, 0), n)
-        return newNode(nkEmpty, n.pos)
+        return newNode(nkEmpty, nodePos(n))
     of nkLet, nkVar, nkConst:
         var profStartLet: int64 = 0
         if monoProfileActive:
@@ -4036,41 +4054,41 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         defer:
             if monoProfileActive:
                 transformLetNs = transformLetNs + (cheng_monotime_ns() - profStartLet)
-        var nameNode: Node = nil
+        var nameNode: Node = astInvalidNodeId()
         if kidCount n > 0:
             nameNode = kid(n, 0)
-        var typeNode: Node = nil
+        var typeNode: Node = astInvalidNodeId()
         if kidCount n > 1:
             typeNode = kid(n, 1)
-        var valNode: Node = nil
+        var valNode: Node = astInvalidNodeId()
         if kidCount n > 2:
             valNode = kid(n, 2)
-        var pragmaNode: Node = nil
+        var pragmaNode: Node = astInvalidNodeId()
         if kidCount n > 3:
             pragmaNode = kid(n, 3)
-        var patternType: Node = nil
-        if nameNode != nil && nameNode.kind == nkPattern && kidCount nameNode > 1:
+        var patternType: Node = astInvalidNodeId()
+        if astRefNonNil(nameNode) && nodeKind(nameNode) == nkPattern && kidCount nameNode > 1:
             patternType = kid(nameNode, 1)
         var newType: Node = transform(typeNode, rootStmts, true)
-        if (newType == nil || newType.kind == nkEmpty) && patternType != nil && patternType.kind != nkEmpty:
+        if (astRefIsNil(newType) || nodeKind(newType) == nkEmpty) && astRefNonNil(patternType) && nodeKind(patternType) != nkEmpty:
             newType = transform(patternType, rootStmts, true)
-        var newVal: Node = nil
+        var newVal: Node = astInvalidNodeId()
         var lamArgs: Node[4]
         var lamArgsReady: bool = false
         let lam: Node = unwrapLambda valNode
-        if lam != nil:
+        if astRefNonNil(lam):
             let hasCapture: bool = monoLambdaHasCapture lam
             if ! hasCapture:
-                var gen: Node = nil
+                var gen: Node = astInvalidNodeId()
                 if kidCount lam > 4:
                     gen = kid(lam, 4)
-                if gen != nil && gen.kind == nkGenericParams && kidCount gen > 0:
+                if astRefNonNil(gen) && nodeKind(gen) == nkGenericParams && kidCount gen > 0:
                     var expectedType: Node = newType
-                    if expectedType == nil || expectedType.kind != nkFnTy:
+                    if astRefIsNil(expectedType) || nodeKind(expectedType) != nkFnTy:
                         expectedType = typeNode
-                    if (expectedType == nil || expectedType.kind != nkFnTy) && patternType != nil:
+                    if (astRefIsNil(expectedType) || nodeKind(expectedType) != nkFnTy) && astRefNonNil(patternType):
                         expectedType = patternType
-                    if expectedType != nil && expectedType.kind == nkFnTy:
+                    if astRefNonNil(expectedType) && nodeKind(expectedType) == nkFnTy:
                         var args: Node[4]
                         if inferTypeArgsFromExpectedFn(lam, expectedType, &args):
                             newVal = instantiateLambda(lam, args, rootStmts)
@@ -4080,20 +4098,20 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                             var paramNames: str[2]
                             collectGenericParamNames(gen, &paramNames)
                             if paramNames.len == 1:
-                                var picked: Node = nil
+                                var picked: Node = astInvalidNodeId()
                                 if kidCount expectedType > 0:
                                     let expParams: Node = kid(expectedType, 0)
-                                    if expParams != nil && kidCount expParams > 0:
+                                    if astRefNonNil(expParams) && kidCount expParams > 0:
                                         let edef: Node = kid(expParams, 0)
-                                        if edef != nil && kidCount edef > 1:
+                                        if astRefNonNil(edef) && kidCount edef > 1:
                                             let et: Node = kid(edef, 1)
-                                            if et != nil && et.kind != nkEmpty:
+                                            if astRefNonNil(et) && nodeKind(et) != nkEmpty:
                                                 picked = et
-                                if picked == nil && kidCount expectedType > 1:
+                                if astRefIsNil(picked) && kidCount expectedType > 1:
                                     let retTy: Node = kid(expectedType, 1)
-                                    if retTy != nil && retTy.kind != nkEmpty:
+                                    if astRefNonNil(retTy) && nodeKind(retTy) != nkEmpty:
                                         picked = retTy
-                                if picked != nil:
+                                if astRefNonNil(picked):
                                     var args2: Node[1]
                                     add(args2, picked)
                                     newVal = instantiateLambda(lam, args2, rootStmts)
@@ -4102,37 +4120,37 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                 else:
                     newVal = instantiateLambda(lam, default[Node[]], rootStmts)
                     lamArgsReady = true
-                if (newType == nil || newType.kind == nkEmpty) && lamArgsReady:
+                if (astRefIsNil(newType) || nodeKind(newType) == nkEmpty) && lamArgsReady:
                     let fnTy: Node = lambdaFnType(lam, lamArgs, rootStmts)
-                    if fnTy != nil:
+                    if astRefNonNil(fnTy):
                         newType = fnTy
-        if newVal == nil:
+        if astRefIsNil(newVal):
             newVal = transform(valNode, rootStmts, false)
-        if newVal == nil:
+        if astRefIsNil(newVal):
             newVal = valNode
         var newName: Node = transform(nameNode, rootStmts, false)
-        if newName == nil:
+        if astRefIsNil(newName):
             newName = nameNode
-        var outLet: Node = newNode(n.kind, n.pos)
+        var outLet: Node = newNode(nodeKind(n), nodePos(n))
         addSon(outLet, newName)
         addSon(outLet, newType)
         addSon(outLet, newVal)
         addSon(outLet, transform(pragmaNode, rootStmts, false))
         var bindType: Node = typeNode
-        if bindType == nil || bindType.kind == nkEmpty:
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
             bindType = patternType
-        if bindType == nil || bindType.kind == nkEmpty:
-            if newVal != nil && newVal.typeCacheValid && !isEmpty(newVal.typeCache):
-                bindType = newVal.typeCache
-            elif valNode != nil && valNode.typeCacheValid && !isEmpty(valNode.typeCache):
-                bindType = valNode.typeCache
-        if bindType == nil || bindType.kind == nkEmpty:
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
+            if astRefNonNil(newVal) && nodeTypeCacheValid(newVal) && !isEmpty(nodeTypeCache(newVal)):
+                bindType = nodeTypeCache(newVal)
+            elif astRefNonNil(valNode) && nodeTypeCacheValid(valNode) && !isEmpty(nodeTypeCache(valNode)):
+                bindType = nodeTypeCache(valNode)
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
             let inferred: Node = monoInferBindTypeFromInitCall(newVal)
-            if inferred != nil && inferred.kind != nkEmpty:
+            if astRefNonNil(inferred) && nodeKind(inferred) != nkEmpty:
                 bindType = inferred
-        if bindType == nil || bindType.kind == nkEmpty:
+        if astRefIsNil(bindType) || nodeKind(bindType) == nkEmpty:
             let inferred2: Node = monoLookupExprType(newVal)
-            if inferred2 != nil && inferred2.kind != nkEmpty:
+            if astRefNonNil(inferred2) && nodeKind(inferred2) != nkEmpty:
                 bindType = inferred2
         monoBindNameWithType(nameNode, bindType)
         return outLet
@@ -4147,21 +4165,21 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         if kidCount n > 0:
             let head: Node = kid(n, 0)
             let lam2: Node = unwrapLambda head
-            if lam2 != nil:
+            if astRefNonNil(lam2):
                 if monoLambdaHasCapture lam2:
                     return transformFallback(n, rootStmts, inTypeContext)
                 var args0: Node[4]
                 for ai in 1..<kidCount n:
                     let arg0: Node = transform(kid(n, ai), rootStmts, false)
-                    if arg0 != nil:
+                    if astRefNonNil(arg0):
                         add(args0, arg0)
                 return instantiateLambda(lam2, args0, rootStmts)
-            if head != nil && (head.kind == nkIdent || head.kind == nkSymbol || head.kind == nkDotExpr):
+            if astRefNonNil(head) && (nodeKind(head) == nkIdent || nodeKind(head) == nkSymbol || nodeKind(head) == nkDotExpr):
                 var name: str = ""
                 var headNameNode: Node = head
-                if head != nil && head.kind == nkDotExpr && kidCount head > 1:
+                if astRefNonNil(head) && nodeKind(head) == nkDotExpr && kidCount head > 1:
                     headNameNode = kid(head, 1)
-                if headNameNode != nil && (headNameNode.kind == nkIdent || headNameNode.kind == nkSymbol):
+                if astRefNonNil(headNameNode) && (nodeKind(headNameNode) == nkIdent || nodeKind(headNameNode) == nkSymbol):
                     name = monoStripSpaces(plainName(headNameNode))
                 if len name > 0:
                     if inTypeContext && mapHasStrIndex(genericTypeIndex, name):
@@ -4169,8 +4187,8 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                         for i in 1..<kidCount n:
                             add(args, kid(n, i))
                         var genNode: Node = mapGetStrNodeIndex(genericTypeIndex, genericTypeNodes, name)
-                        var generics: Node = nil
-                        if genNode != nil && kidCount genNode > 2:
+                        var generics: Node = astInvalidNodeId()
+                        if astRefNonNil(genNode) && kidCount genNode > 2:
                             generics = kid(genNode, 2)
                         var mapNames: str[4]
                         var mapTypes: Node[4]
@@ -4179,17 +4197,17 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                         buildFullTypeArgs(generics, mapNames, mapTypes, args, &instArgs)
                         let instTypeName: str = mangleInstance(name, instArgs)
                         if instantiateType(name, instArgs, rootStmts):
-                            return newIdent(instTypeName, n.pos)
+                            return newIdent(instTypeName, nodePos(n))
                     var genNode2: Node = genericFnGet(name)
-                    if genNode2 == nil && genericFnHas(name):
+                    if astRefIsNil(genNode2) && genericFnHas(name):
                         genNode2 = findGenericFnDecl(monoRoot, name)
-                        if genNode2 != nil:
+                        if astRefNonNil(genNode2):
                             genericFnAdd(name, genNode2)
-                    if genNode2 != nil:
+                    if astRefNonNil(genNode2):
                         var args2: Node[4]
                         for j in 1..<kidCount n:
                             add(args2, kid(n, j))
-                        var generics2: Node = nil
+                        var generics2: Node = astInvalidNodeId()
                         if kidCount genNode2 > 4:
                             generics2 = kid(genNode2, 4)
                         var mapNames2: str[4]
@@ -4199,17 +4217,17 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                         buildFullTypeArgs(generics2, mapNames2, mapTypes2, args2, &instArgs2)
                         let instFnName2: str = mangleInstance(name, instArgs2)
                         if instantiateFn(name, instArgs2, rootStmts):
-                            return newIdent(instFnName2, n.pos)
+                            return newIdent(instFnName2, nodePos(n))
         return transformFallback(n, rootStmts, inTypeContext)
     of nkPrefix:
         if kidCount n > 1:
             let opNode: Node = kid(n, 0)
-            if opNode != nil && monoStrEq(getName(opNode), "$"):
+            if astRefNonNil(opNode) && monoStrEq(getName(opNode), "$"):
                 let argNode: Node = kid(n, 1)
-                let callNode: Node = newNode(nkCall, n.pos)
-                callNode.typeCache = n.typeCache
-                callNode.typeCacheValid = n.typeCacheValid
-                addSon(callNode, newIdent("$", n.pos))
+                let callNode: Node = newNode(nkCall, nodePos(n))
+                nodeSetTypeCache(callNode, nodeTypeCache(n))
+                nodeSetTypeCacheValid(callNode, nodeTypeCacheValid(n))
+                addSon(callNode, newIdent("$", nodePos(n)))
                 addSon(callNode, argNode)
                 return transform(callNode, rootStmts, false)
         return transformFallback(n, rootStmts, inTypeContext)
@@ -4221,34 +4239,34 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         defer:
             if monoProfileActive:
                 transformLambdaNs = transformLambdaNs + (cheng_monotime_ns() - profStartLambda)
-        var gen2: Node = nil
+        var gen2: Node = astInvalidNodeId()
         if kidCount n > 4:
             gen2 = kid(n, 4)
-        if gen2 != nil && gen2.kind == nkGenericParams && kidCount gen2 > 0:
+        if astRefNonNil(gen2) && nodeKind(gen2) == nkGenericParams && kidCount gen2 > 0:
             return n
         if monoLambdaHasCapture n:
             var outKidsL: Node[6]
             for li in 0..<kidCount n:
                 let oldChildL: Node = kid(n, li)
-                var childL: Node = nil
+                var childL: Node = astInvalidNodeId()
                 if li == 1:
                     childL = transform(oldChildL, rootStmts, false)
                 elif li == 2:
                     childL = transform(oldChildL, rootStmts, true)
                 elif li == 3:
                     childL = transform(oldChildL, rootStmts, false)
-                elif li == 4 && oldChildL != nil && oldChildL.kind == nkGenericParams:
+                elif li == 4 && astRefNonNil(oldChildL) && nodeKind(oldChildL) == nkGenericParams:
                     childL = transformGenericParams(oldChildL, rootStmts)
                 else:
                     childL = transform(oldChildL, rootStmts, false)
-                if childL == nil:
+                if astRefIsNil(childL):
                     childL = oldChildL
                 add(outKidsL, childL)
-            var outL: Node = newNode(n.kind, n.pos)
-            nodeSetIdent(outL, n.ident)
-            nodeSetStrVal(outL, n.strVal)
-            outL.intVal = n.intVal
-            outL.floatVal = n.floatVal
+            var outL: Node = newNode(nodeKind(n), nodePos(n))
+            nodeSetIdent(outL, nodeIdent(n))
+            nodeSetStrVal(outL, nodeStrVal(n))
+            nodeSetIntVal(outL, nodeIntVal(n))
+            nodeSetFloatVal(outL, nodeFloatVal(n))
             for lk in 0..<outKidsL.len:
                 addSon(outL, get(outKidsL, lk))
             return outL
@@ -4265,33 +4283,33 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
             let rawHead: Node = kid(n, 0)
             var head2: Node = rawHead
             let bracketHead: Node = bracketCallToExpr rawHead
-            let headFromBracket: bool = bracketHead != nil
+            let headFromBracket: bool = astRefNonNil(bracketHead)
             if headFromBracket:
                 head2 = bracketHead
             let isTypeCall: bool = (kidCount n == 2) && isDefiniteTypeCallee(head2)
-            if head2 != nil && head2.kind == nkBracketExpr && bracketLooksLikeTypeCall head2:
+            if astRefNonNil(head2) && nodeKind(head2) == nkBracketExpr && bracketLooksLikeTypeCall head2:
                 var callChanged: bool = false
                 var outKidsCall: Node[4]
                 for ci in 0..<kidCount n:
                     var oldChildC: Node = kid(n, ci)
                     if ci == 0 && headFromBracket:
                         oldChildC = head2
-                    var childC: Node = nil
+                    var childC: Node = astInvalidNodeId()
                     if ci == 0:
                         childC = transform(oldChildC, rootStmts, true)
                     else:
                         childC = transform(oldChildC, rootStmts, false)
-                    if childC != oldChildC:
+                    if monoNodeNe(childC, oldChildC):
                         callChanged = true
-                    if childC != nil:
+                    if astRefNonNil(childC):
                         add(outKidsCall, childC)
                 if ! callChanged:
                     return n
-                var outCall: Node = newNode(n.kind, n.pos)
-                nodeSetIdent(outCall, n.ident)
-                nodeSetStrVal(outCall, n.strVal)
-                outCall.intVal = n.intVal
-                outCall.floatVal = n.floatVal
+                var outCall: Node = newNode(nodeKind(n), nodePos(n))
+                nodeSetIdent(outCall, nodeIdent(n))
+                nodeSetStrVal(outCall, nodeStrVal(n))
+                nodeSetIntVal(outCall, nodeIntVal(n))
+                nodeSetFloatVal(outCall, nodeFloatVal(n))
                 for cj in 0..<outKidsCall.len:
                     addSon(outCall, get(outKidsCall, cj))
                 return outCall
@@ -4302,62 +4320,62 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                     var oldChild2: Node = kid(n, ci2)
                     if ci2 == 0:
                         oldChild2 = head2
-                    var child2: Node = nil
+                    var child2: Node = astInvalidNodeId()
                     if ci2 == 0:
                         child2 = transform(oldChild2, rootStmts, false)
                     else:
                         child2 = transform(oldChild2, rootStmts, false)
-                    if child2 != oldChild2:
+                    if monoNodeNe(child2, oldChild2):
                         callChanged2 = true
-                    if child2 != nil:
+                    if astRefNonNil(child2):
                         add(outKidsCall2, child2)
                 if ! callChanged2:
                     return n
-                var outCall2: Node = newNode(n.kind, n.pos)
-                nodeSetIdent(outCall2, n.ident)
-                nodeSetStrVal(outCall2, n.strVal)
-                outCall2.intVal = n.intVal
-                outCall2.floatVal = n.floatVal
+                var outCall2: Node = newNode(nodeKind(n), nodePos(n))
+                nodeSetIdent(outCall2, nodeIdent(n))
+                nodeSetStrVal(outCall2, nodeStrVal(n))
+                nodeSetIntVal(outCall2, nodeIntVal(n))
+                nodeSetFloatVal(outCall2, nodeFloatVal(n))
                 for cj2 in 0..<outKidsCall2.len:
                     addSon(outCall2, get(outKidsCall2, cj2))
                 return outCall2
-            if head2 != nil && head2.kind == nkDotExpr && kidCount head2 > 1:
+            if astRefNonNil(head2) && nodeKind(head2) == nkDotExpr && kidCount head2 > 1:
                 let base2: Node = kid(head2, 0)
                 let member2: Node = kid(head2, 1)
-                if member2 != nil && (member2.kind == nkIdent || member2.kind == nkSymbol):
+                if astRefNonNil(member2) && (nodeKind(member2) == nkIdent || nodeKind(member2) == nkSymbol):
                     let nm2: str = monoStripSpaces(plainName(member2))
                     let baseTy2: Node = monoLookupExprType base2
                     let dispatchIdx: int32 = traitDispatchLookup(baseTy2, nm2)
                     if dispatchIdx >= 0:
                         let initName: str = get(traitDispatchInitNames, dispatchIdx)
-                        var vtCall: Node = newNode(nkCall, n.pos)
-                        addSon(vtCall, newIdent(initName, n.pos))
-                        var dotCall: Node = newNode(nkDotExpr, n.pos)
+                        var vtCall: Node = newNode(nkCall, nodePos(n))
+                        addSon(vtCall, newIdent(initName, nodePos(n)))
+                        var dotCall: Node = newNode(nkDotExpr, nodePos(n))
                         addSon(dotCall, vtCall)
-                        addSon(dotCall, newIdent(nm2, n.pos))
-                        var outCallV: Node = newNode(nkCall, n.pos)
+                        addSon(dotCall, newIdent(nm2, nodePos(n)))
+                        var outCallV: Node = newNode(nkCall, nodePos(n))
                         addSon(outCallV, dotCall)
                         addSon(outCallV, transform(base2, rootStmts, false))
                         for aiV in 1..<kidCount n:
                             let argV: Node = transform(kid(n, aiV), rootStmts, false)
-                            if argV != nil:
+                            if astRefNonNil(argV):
                                 addSon(outCallV, argV)
                         return outCallV
                     let genNode3: Node = genericFnGet(nm2)
                     let baseTy: Node = monoLookupExprType base2
-                    var generics3: Node = nil
-                    if genNode3 != nil && kidCount genNode3 > 4:
+                    var generics3: Node = astInvalidNodeId()
+                    if astRefNonNil(genNode3) && kidCount genNode3 > 4:
                         generics3 = kid(genNode3, 4)
-                    if genNode3 != nil && baseTy != nil && generics3 != nil && generics3.kind == nkGenericParams && kidCount generics3 > 0:
+                    if astRefNonNil(genNode3) && astRefNonNil(baseTy) && astRefNonNil(generics3) && nodeKind(generics3) == nkGenericParams && kidCount generics3 > 0:
                         var paramNames3: str[4]
                         collectGenericParamNames(generics3, &paramNames3)
                         var mapNames3: str[4]
                         var mapTypes3: Node[4]
                         let firstParamTy: Node = monoFirstParamType genNode3
-                        if firstParamTy != nil:
+                        if astRefNonNil(firstParamTy):
                             var actualTy: Node = baseTy
-                            if firstParamTy.kind == nkVarTy && actualTy != nil && actualTy.kind != nkVarTy:
-                                var wrap: Node = newNode(nkVarTy, base2.pos)
+                            if nodeKind(firstParamTy) == nkVarTy && astRefNonNil(actualTy) && nodeKind(actualTy) != nkVarTy:
+                                var wrap: Node = newNode(nkVarTy, nodePos(base2))
                                 addSon(wrap, actualTy)
                                 actualTy = wrap
                             bindTypeVars(firstParamTy, actualTy, paramNames3, &mapNames3, &mapTypes3)
@@ -4367,89 +4385,89 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                         if instArgs3.len == kidCount generics3:
                             let instName: str = mangleInstance(nm2, instArgs3)
                             if instantiateFn(nm2, instArgs3, rootStmts):
-                                var outCall2: Node = newNode(nkCall, n.pos)
-                                addSon(outCall2, newIdent(instName, n.pos))
+                                var outCall2: Node = newNode(nkCall, nodePos(n))
+                                addSon(outCall2, newIdent(instName, nodePos(n)))
                                 addSon(outCall2, transform(base2, rootStmts, false))
                                 for ai2 in 1..<kidCount n:
                                     let arg2: Node = transform(kid(n, ai2), rootStmts, false)
-                                    if arg2 != nil:
+                                    if astRefNonNil(arg2):
                                         addSon(outCall2, arg2)
                                 return outCall2
-                    if genNode3 != nil && baseTy == nil && generics3 != nil && generics3.kind == nkGenericParams && kidCount generics3 > 0:
+                    if astRefNonNil(genNode3) && astRefIsNil(baseTy) && astRefNonNil(generics3) && nodeKind(generics3) == nkGenericParams && kidCount generics3 > 0:
                         var instArgs4: Node[4]
                         if monoInferGenericArgsFromCall(genNode3, n, &instArgs4):
                             let instName4: str = mangleInstance(nm2, instArgs4)
                             if instantiateFn(nm2, instArgs4, rootStmts):
-                                var outCall4: Node = newNode(nkCall, n.pos)
-                                outCall4.callStyle = n.callStyle
-                                addSon(outCall4, newIdent(instName4, n.pos))
+                                var outCall4: Node = newNode(nkCall, nodePos(n))
+                                nodeSetCallStyle(outCall4, nodeCallStyle(n))
+                                addSon(outCall4, newIdent(instName4, nodePos(n)))
                                 for ai4 in 1..<kidCount n:
                                     let arg4: Node = transform(kid(n, ai4), rootStmts, false)
-                                    if arg4 != nil:
+                                    if astRefNonNil(arg4):
                                         addSon(outCall4, arg4)
                                 return outCall4
-                    if baseTy != nil:
+                    if astRefNonNil(baseTy):
                         let paramCount: int32 = (kidCount n - 1) + 1
                         let foundFn: Node = monoFindFnByFirstParamMatch(nm2, baseTy, paramCount, rootStmts)
-                        if foundFn != nil:
-                            var outCall3: Node = newNode(nkCall, n.pos)
-                            outCall3.callStyle = n.callStyle
-                            addSon(outCall3, newIdent(nm2, n.pos))
+                        if astRefNonNil(foundFn):
+                            var outCall3: Node = newNode(nkCall, nodePos(n))
+                            nodeSetCallStyle(outCall3, nodeCallStyle(n))
+                            addSon(outCall3, newIdent(nm2, nodePos(n)))
                             addSon(outCall3, transform(base2, rootStmts, false))
                             for ai3 in 1..<kidCount n:
                                 let arg3: Node = transform(kid(n, ai3), rootStmts, false)
-                                if arg3 != nil:
+                                if astRefNonNil(arg3):
                                     addSon(outCall3, arg3)
                             return outCall3
-            if head2 != nil && (head2.kind == nkIdent || head2.kind == nkSymbol):
+            if astRefNonNil(head2) && (nodeKind(head2) == nkIdent || nodeKind(head2) == nkSymbol):
                 let nm: str = monoStripSpaces(plainName(head2))
                 if monoStrEq(nm, "len") && kidCount n == 2:
                     var argNodeL: Node = kid(n, 1)
-                    if argNodeL != nil && argNodeL.kind == nkCallArg && kidCount argNodeL > 1:
+                    if astRefNonNil(argNodeL) && nodeKind(argNodeL) == nkCallArg && kidCount argNodeL > 1:
                         argNodeL = kid(argNodeL, 1)
                     let argTy0: Node = monoLookupExprType argNodeL
                     var argTy: Node = monoStripPtrRefVar(monoNormalizeType(argTy0))
                     var seqLikeL: bool = false
-                    if argTy != nil && (argTy.kind == nkIdent || argTy.kind == nkSymbol):
+                    if astRefNonNil(argTy) && (nodeKind(argTy) == nkIdent || nodeKind(argTy) == nkSymbol):
                         let keyL: str = typeKey argTy
                         if monoStartsWith(keyL, "seq_") || monoStartsWith(keyL, "seq_fixed_"):
                             seqLikeL = true
                         elif len(keyL) > 0:
                             let parsedL: Node = monoTypeNodeFromKey(keyL)
-                            if parsedL != nil && parsedL.kind == nkBracketExpr:
+                            if astRefNonNil(parsedL) && nodeKind(parsedL) == nkBracketExpr:
                                 argTy = parsedL
-                    if !seqLikeL && argTy != nil && argTy.kind == nkBracketExpr:
+                    if !seqLikeL && astRefNonNil(argTy) && nodeKind(argTy) == nkBracketExpr:
                         let baseNameL: str = monoBracketBaseName argTy
                         if monoStrEq(baseNameL, "seq") || monoStrEq(baseNameL, "seq_fixed"):
                             seqLikeL = true
                     if seqLikeL:
-                        var outDot: Node = newNode(nkDotExpr, n.pos)
+                        var outDot: Node = newNode(nkDotExpr, nodePos(n))
                         addSon(outDot, transform(argNodeL, rootStmts, false))
-                        addSon(outDot, newIdent("len", n.pos))
+                        addSon(outDot, newIdent("len", nodePos(n)))
                         return outDot
                 let templ: Node = mapGetStrNodeIndex(templateIndex, templateNodes, nm)
-                if templ != nil:
+                if astRefNonNil(templ):
                     return transformCallTemplate(nm, templ, n, rootStmts)
                 let mac: Node = mapGetStrNodeIndex(macroIndex, macroNodes, nm)
-                if mac != nil:
+                if astRefNonNil(mac):
                     return transformCallTemplate(nm, mac, n, rootStmts)
                 if !isTypeCall:
                     var genNode4: Node = genericFnGet(nm)
-                    if genNode4 == nil && genericFnHas(nm):
+                    if astRefIsNil(genNode4) && genericFnHas(nm):
                         genNode4 = findGenericFnDecl(monoRoot, nm)
-                        if genNode4 != nil:
+                        if astRefNonNil(genNode4):
                             genericFnAdd(nm, genNode4)
-                    if genNode4 != nil:
+                    if astRefNonNil(genNode4):
                         var instArgs4: Node[4]
                         if monoInferGenericArgsFromCall(genNode4, n, &instArgs4):
                             let instName4: str = mangleInstance(nm, instArgs4)
                             if instantiateFn(nm, instArgs4, rootStmts):
-                                var outCall4: Node = newNode(nkCall, n.pos)
-                                outCall4.callStyle = n.callStyle
-                                addSon(outCall4, newIdent(instName4, n.pos))
+                                var outCall4: Node = newNode(nkCall, nodePos(n))
+                                nodeSetCallStyle(outCall4, nodeCallStyle(n))
+                                addSon(outCall4, newIdent(instName4, nodePos(n)))
                                 for ai4 in 1..<kidCount n:
                                     let arg4: Node = transform(kid(n, ai4), rootStmts, false)
-                                    if arg4 != nil:
+                                    if astRefNonNil(arg4):
                                         addSon(outCall4, arg4)
                                 return outCall4
         return transformFallback(n, rootStmts, inTypeContext)
@@ -4461,12 +4479,12 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
         defer:
             if monoProfileActive:
                 transformSeqLitNs = transformSeqLitNs + (cheng_monotime_ns() - profStartSeqLit)
-        var elemTy: Node = nil
+        var elemTy: Node = astInvalidNodeId()
         for si in 0..<kidCount n:
-            if !(elemTy == nil):
+            if !(astRefIsNil(elemTy)):
                 break
             elemTy = inferLitType kid(n, si)
-        if elemTy != nil:
+        if astRefNonNil(elemTy):
             var args3: Node[1]
             add(args3, elemTy)
             instantiateType("seq", args3, rootStmts)
@@ -4474,7 +4492,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
     else:
         return transformFallback(n, rootStmts, inTypeContext)
 
-fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
+fn monomorphizeImpl(root: Node, diags: Diagnostic[]*): Node =
     monoDebugProgress("enter")
     let monoProfOn: bool = monoProfileEnabled()
     var monoProfStart: int64 = 0
@@ -4508,8 +4526,8 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
     monoTypeMatchesNs = 0
     stripSpacesCalls = 0
     stripSpacesNs = 0
-    hashmaps.hashMapPtrIntClear(&monoStripIndex)
-    hashmaps.hashMapPtrIntClear(&monoUnderscoreIndex)
+    hashmaps.hashMapStrIntClear(monoStripIndex)
+    hashmaps.hashMapStrIntClear(monoUnderscoreIndex)
     monoStripValues = []
     monoStripValues.cap = 256
     hashmaps.hashMapPtrIntClear(&monoTypeKeyIndex)
@@ -4551,8 +4569,8 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
     transformSeqLitCalls = 0
     transformSeqLitNs = 0
     currentDiags = diags
-    if root != nil && len(root.strVal) > 0:
-        currentFilename = root.strVal
+    if astRefNonNil(root) && len(nodeStrVal(root)) > 0:
+        currentFilename = nodeStrVal(root)
     else:
         currentFilename = ""
     vecClearStr(&genericTypeNames)
@@ -4594,9 +4612,9 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
     monoValueClear()
     instMapInit 1024
     lambdaCounter = 0
-    if root == nil:
+    if astRefIsNil(root):
         monoDebugProgress("root=nil")
-        return nil
+        return astInvalidNodeId()
     monoRoot = root
     monoDebugProgress("collectGenericDecls.start")
     collectGenericDecls root
@@ -4618,28 +4636,26 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
         let raw: Node = kid(root, i)
         if monoDebugProgressEnabled():
             var itemName: str = ""
-            if raw != nil && (raw.kind == nkFnDecl || raw.kind == nkIteratorDecl ||
-                              raw.kind == nkTypeDecl || raw.kind == nkMacroDecl ||
-                              raw.kind == nkTemplateDecl) && kidCount(raw) > 0:
+            if astRefNonNil(raw) && (nodeKind(raw) == nkFnDecl || nodeKind(raw) == nkIteratorDecl ||                              nodeKind(raw) == nkTypeDecl || nodeKind(raw) == nkMacroDecl ||                              nodeKind(raw) == nkTemplateDecl) && kidCount(raw) > 0:
                 let name0: str = getName(kid(raw, 0))
                 if len(name0) > 0:
                     itemName = " name=" + name0
             monoDebugProgress("transform.root.item.start i=" + intToStr(i) +
-                              " kind=" + intToStr(int32(raw.kind)) +
-                              " line=" + intToStr(raw.pos.line) +
+                              " kind=" + intToStr(int32(nodeKind(raw))) +
+                              " line=" + intToStr(nodePos(raw).line) +
                               itemName)
         let t: Node = transform(raw, &newStmts)
         if monoDebugProgressEnabled():
             monoDebugProgress("transform.root.item.done i=" + intToStr(i))
-        if t != nil && t.kind != nkEmpty:
+        if astRefNonNil(t) && nodeKind(t) != nkEmpty:
             add(bodyStmts, t)
     monoDebugProgress("transform.root.done")
-    var out: Node = newNode(root.kind, root.pos)
-    nodeSetIdent(out, root.ident)
-    nodeSetStrVal(out, root.strVal)
-    out.intVal = root.intVal
-    out.floatVal = root.floatVal
-    out.callStyle = root.callStyle
+    var out: Node = newNode(nodeKind(root), nodePos(root))
+    nodeSetIdent(out, nodeIdent(root))
+    nodeSetStrVal(out, nodeStrVal(root))
+    nodeSetIntVal(out, nodeIntVal(root))
+    nodeSetFloatVal(out, nodeFloatVal(root))
+    nodeSetCallStyle(out, nodeCallStyle(root))
     for j in 0..<newStmts.len:
         addSon(out, get(newStmts, j))
     for k in 0..<bodyStmts.len:
@@ -4669,7 +4685,7 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
         monoProfLower = cheng_monotime_ns() - monoProfMark
     currentDiags = nil
     currentFilename = ""
-    monoRoot = nil
+    monoRoot = astInvalidNodeId()
     monoDebugProgress("leave")
     if monoProfOn:
         let collectMs: int32 = int32(monoProfCollect / 1000000)
@@ -4812,4 +4828,9 @@ fn monomorphize(root: Node, diags: Diagnostic[]*): Node =
         if len exprTop > 0:
             echo exprTop
     monoProfileActive = false
+    return out
+
+fn monomorphizeId(rootId: AstNodeId, diags: Diagnostic[]*): AstNodeId =
+    let root: Node = rootId
+    let out: Node = monomorphizeImpl(root, diags)
     return out

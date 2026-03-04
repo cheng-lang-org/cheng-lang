@@ -1,49 +1,72 @@
 module cmdline
 # Command-line argument helpers.
-# - Internal bridge only: `__cheng_setCmdLine(argc, argv)` is a C ABI ingress shim.
-# - In bootstrap runtime, `str` is cstring-like, so argv entries can be read as `str`.
-# - Pointer stride is fixed to 8 bytes for bootstrap/runtime compatibility.
+# - Runtime bridge only: argv ingress is provided by native runtime helpers.
 import std/strings as strings
 
 var __cheng_cmdCount: int32 = 0
-var __cheng_cmdCacheCount: int32 = 0
-var __cheng_cmdCache: str[4096]
+var __cheng_cmdCaptured: bool = false
 const __cheng_cmdCountMax: int32 = 4096
-const __cheng_argvStride: int32 = 8
 const __cheng_int32Max: int64 = int64(2147483647)
 const __cheng_int32Min: int64 = int64(-2147483648)
 const __cheng_int32MinAbs: int64 = int64(2147483648)
 
-fn __cheng_setCmdLine(argc: int32, argv: void*) =
-    __cheng_cmdCount = argc
-    __cheng_cmdCacheCount = 0
-    if argc <= 0:
-        return
-    if argv == nil:
-        return
-    if argc > __cheng_cmdCountMax:
-        return
-    for i in 0..<argc:
-        let p: void* = ptr_add(argv, i * __cheng_argvStride)
-        __cheng_cmdCache[i] = *str*(p)
-    __cheng_cmdCacheCount = argc
+@importc("__cheng_rt_paramCount")
+fn __cheng_rt_paramCount(): int32
 
-fn __cmdReady(): bool =
+@importc("__cheng_rt_paramStr")
+fn __cheng_rt_paramStr(i: int32): cstring
+
+@importc("__cheng_rt_paramStrCopy")
+fn __cheng_rt_paramStrCopy(i: int32): str
+
+fn __cheng_captureCmdLine(argc: int32, argv: str*) =
+    # `argv: str*` is Cheng-managed string storage and must not be reinterpreted
+    # as a C argv pointer bridge in no-pointer production surface.
+    # Runtime argv access stays on __cheng_rt_paramCount/__cheng_rt_paramStrCopy.
+    let _argvIgnore: str* = argv
+    __cheng_cmdCaptured = false
+    __cheng_cmdCount = 0
+    if argc <= 0 || argc > __cheng_cmdCountMax:
+        return
+    __cheng_cmdCaptured = true
+    __cheng_cmdCount = argc
+
+fn cmdCountFromCaptured(): int32 =
+    if !__cheng_cmdCaptured:
+        return 0
+    if __cheng_cmdCount <= 0 || __cheng_cmdCount > __cheng_cmdCountMax:
+        return 0
+    return __cheng_cmdCount
+
+fn cmdCountFromRuntime(): int32 =
+    let capturedCount: int32 = cmdCountFromCaptured()
+    if capturedCount > 0:
+        return capturedCount
+    let argcRaw: int32 = __cheng_rt_paramCount()
+    var argc: int32 = argcRaw
+    if argc < 0:
+        argc = 0
+    if argc <= 0:
+        return 0
+    if argc > __cheng_cmdCountMax:
+        return 0
+    return argc
+
+fn cmdReady(): bool =
+    __cheng_cmdCount = cmdCountFromRuntime()
     if __cheng_cmdCount <= 0:
         return false
     if __cheng_cmdCount > __cheng_cmdCountMax:
         return false
-    if __cheng_cmdCacheCount != __cheng_cmdCount:
-        return false
     return true
 
 fn programName(): str =
-    if !__cmdReady():
+    if !cmdReady():
         return ""
     return paramStr(0)
 
 fn paramCount(): int32 =
-    if !__cmdReady():
+    if !cmdReady():
         return 0
     return __cheng_cmdCount - 1
 
@@ -53,16 +76,22 @@ fn argCount(): int32 =
 fn paramStr(i: int32): str =
     if i < 0:
         return ""
-    if !__cmdReady():
+    let argcCaptured: int32 = cmdCountFromCaptured()
+    if argcCaptured > 0:
+        if i >= argcCaptured:
+            return ""
+        return __cheng_rt_paramStrCopy(i)
+    let argc: int32 = cmdCountFromRuntime()
+    if argc <= 0:
         return ""
-    if i >= __cheng_cmdCacheCount:
+    if i >= argc:
         return ""
-    return __cheng_cmdCache[i]
+    return __cheng_rt_paramStrCopy(i)
 
 fn argStr(i: int32): str =
     return paramStr(i)
 
-fn __cmdStartsWith(text: str, prefix: str): bool =
+fn cmdStartsWith(text: str, prefix: str): bool =
     let n: int32 = strings.len(text)
     let m: int32 = strings.len(prefix)
     if m == 0:
@@ -76,16 +105,16 @@ fn __cmdStartsWith(text: str, prefix: str): bool =
             return false
     return true
 
-fn __cmdIsSpace(c: char): bool =
+fn cmdIsSpace(c: char): bool =
     return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 
-fn __cmdTrimAsciiSpace(raw: str): str =
+fn cmdTrimAsciiSpace(raw: str): str =
     if strings.len(raw) == 0:
         return ""
     let n: int32 = strings.len(raw)
     var start: int32 = 0
     for i in 0..<n:
-        if !__cmdIsSpace(raw[i]):
+        if !cmdIsSpace(raw[i]):
             start = i
             break
         if i == n - 1:
@@ -94,7 +123,7 @@ fn __cmdTrimAsciiSpace(raw: str): str =
     let __stop0 = stop
     for __for_rev in 0..<(__stop0 - start):
         stop = __stop0 - __for_rev
-        if !__cmdIsSpace(raw[stop - 1]):
+        if !cmdIsSpace(raw[stop - 1]):
             break
     if stop <= start:
         return ""
@@ -102,7 +131,7 @@ fn __cmdTrimAsciiSpace(raw: str): str =
         return raw
     return strings.sliceBytes(raw, start, stop - start)
 
-fn __cmdLowerAscii(raw: str): str =
+fn cmdLowerAscii(raw: str): str =
     if strings.len(raw) == 0:
         return ""
     let n: int32 = strings.len(raw)
@@ -142,11 +171,11 @@ fn tryInlineFlagValue(arg: str, key: str, outValue: var str): bool =
     if strings.len(arg) == 0 || strings.len(key) == 0:
         return false
     let prefixColon: str = key + ":"
-    if __cmdStartsWith(arg, prefixColon):
+    if cmdStartsWith(arg, prefixColon):
         outValue = strings.dropPrefix(arg, prefixColon)
         return true
     let prefixEq: str = key + "="
-    if __cmdStartsWith(arg, prefixEq):
+    if cmdStartsWith(arg, prefixEq):
         outValue = strings.dropPrefix(arg, prefixEq)
         return true
     return false
@@ -221,7 +250,7 @@ fn readFlagValue(key: str, outValue: var str): bool =
     return readLastFlagValue(key, outValue)
 
 fn parseBool(raw: str, outValue: var bool): bool =
-    let s: str = __cmdLowerAscii(__cmdTrimAsciiSpace(raw))
+    let s: str = cmdLowerAscii(cmdTrimAsciiSpace(raw))
     if s == "":
         return false
     if s == "1" || s == "true" || s == "yes" || s == "on":
@@ -233,7 +262,7 @@ fn parseBool(raw: str, outValue: var bool): bool =
     return false
 
 fn parseInt32(raw: str, outValue: var int32): bool =
-    let s: str = __cmdTrimAsciiSpace(raw)
+    let s: str = cmdTrimAsciiSpace(raw)
     if s == "":
         return false
     let n: int32 = strings.len(s)

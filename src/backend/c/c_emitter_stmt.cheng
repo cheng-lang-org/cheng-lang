@@ -1,0 +1,89 @@
+# backend/c/c_emitter_stmt.cheng
+import std/result
+import backend/uir/uir_types
+import backend/c/c_emitter_types
+import backend/c/c_emitter_expr
+
+fn cEmitFallbackI64Type(): UirLowerType =
+    var t: UirLowerType
+    t.kind = mtI64
+    t.isUnsigned = false
+    return t
+
+fn cEmitLocalType(func: UirFunc, slot: int32): UirLowerType =
+    if slot >= 0 && slot < uirFuncLocalTypesLen(func):
+        return uirFuncLocalTypeAt(func, slot)
+    return cEmitFallbackI64Type()
+
+fn cEmitStmt(func: UirFunc, stmt: UirStmt, nameMap: CEmitNameMap, paramNames: str[]): Result[str] =
+    if stmt <= 0:
+        return Ok[str]("")
+    let kind: UirStmtKind = uirStmtKindOf(stmt)
+    if kind == msExpr:
+        let exprRes: Result[str] = cEmitExpr(func, uirStmtExprOf(stmt), nameMap)
+        if !IsOk[str](exprRes):
+            return exprRes
+        return Ok[str]("  " + exprRes.value + ";\n")
+    if kind == msParam:
+        let slot: int32 = uirStmtSlotOf(stmt)
+        let paramIdx: int32 = uirStmtParamIndexOf(stmt)
+        if slot < 0:
+            return Ok[str]("")
+        let ty: str = cEmitTypeName(cEmitLocalType(func, slot))
+        var pName: str = "p" + intToStr(paramIdx)
+        if paramIdx >= 0 && paramIdx < paramNames.len:
+            pName = paramNames[paramIdx]
+        return Ok[str]("  l" + intToStr(slot) + " = ((" + ty + ")(" + pName + "));\n")
+    if kind == msStore:
+        let addrRes: Result[str] = cEmitExpr(func, uirStmtAddrExprOf(stmt), nameMap)
+        if !IsOk[str](addrRes):
+            return addrRes
+        let valRes: Result[str] = cEmitExpr(func, uirStmtExprOf(stmt), nameMap)
+        if !IsOk[str](valRes):
+            return valRes
+        let sty: str = cEmitTypeName(uirStmtStoreTypeOf(stmt))
+        return Ok[str]("  *((" + sty + "*)(uintptr_t)(" + addrRes.value + ")) = ((" + sty + ")(" + valRes.value + "));\n")
+    if kind == msLet || kind == msVar || kind == msAssign:
+        let slot2: int32 = uirStmtSlotOf(stmt)
+        if slot2 < 0:
+            return Err[str]("emit-c not-mapped: let/var/assign with invalid slot")
+        let exprRes2: Result[str] = cEmitExpr(func, uirStmtExprOf(stmt), nameMap)
+        if !IsOk[str](exprRes2):
+            return exprRes2
+        let ty2: str = cEmitTypeName(cEmitLocalType(func, slot2))
+        return Ok[str]("  l" + intToStr(slot2) + " = ((" + ty2 + ")(" + exprRes2.value + "));\n")
+    return Err[str]("emit-c not-mapped: stmt kind")
+
+fn cEmitFindBlockIndexByLabel(labels: str[], name: str): int32 =
+    for i in 0..<labels.len:
+        if labels[i] == name:
+            return i
+    return -1
+
+fn cEmitTerm(func: UirFunc, blk: UirLowerBlock, labels: str[], nameMap: CEmitNameMap): Result[str] =
+    let term: UirTerm = uirBlockTermOf(blk)
+    if term.kind == mtRet:
+        let retTy: UirLowerType = uirFuncRetTypeOf(func)
+        if retTy.kind == mtVoid:
+            return Ok[str]("  return;\n")
+        let rExpr: UirExpr = term.retExpr
+        let rRes: Result[str] = cEmitExpr(func, rExpr, nameMap)
+        if !IsOk[str](rRes):
+            return rRes
+        return Ok[str]("  return ((" + cEmitTypeName(retTy) + ")(" + rRes.value + "));\n")
+    if term.kind == mtBr:
+        let idx: int32 = cEmitFindBlockIndexByLabel(labels, term.target)
+        if idx < 0:
+            return Err[str]("emit-c not-mapped: br target")
+        return Ok[str]("  goto B" + intToStr(idx) + ";\n")
+    if term.kind == mtCbr:
+        let tIdx: int32 = cEmitFindBlockIndexByLabel(labels, term.targetTrue)
+        let fIdx: int32 = cEmitFindBlockIndexByLabel(labels, term.targetFalse)
+        if tIdx < 0 || fIdx < 0:
+            return Err[str]("emit-c not-mapped: cbr target")
+        let cRes: Result[str] = cEmitExpr(func, term.condExpr, nameMap)
+        if !IsOk[str](cRes):
+            return cRes
+        return Ok[str]("  if (" + cRes.value + ") goto B" + intToStr(tIdx) +
+                       "; else goto B" + intToStr(fIdx) + ";\n")
+    return Err[str]("emit-c not-mapped: term kind")

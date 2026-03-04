@@ -14,11 +14,18 @@ import stage1/monomorphize
 import stage1/c_profile_lowering
 import stage1/ownership
 import stage1/diagnostics
+import std/rawmem_support
 
 fn stage1_c_getenv(name: cstring): str =
     return os.getEnvDefault(name, "")
 fn stage1_memRelease(p: void*) =
     memRelease(p)
+
+fn stage1WriteCharAt(p: void*, idx: int32, c: char) =
+    rawmemWriteChar(p, idx, c)
+
+fn stage1WriteZeroAt(p: void*, idx: int32) =
+    rawmemSet(rawmemPtrAdd(p, idx), 0, 1)
 
 fn stage1_getEnv(name: str): str =
     return stage1_c_getenv name
@@ -34,10 +41,8 @@ fn lowerAscii(s: str): str =
         if c >= 'A' && c <= 'Z':
             let oc: int32 = int32(c) + 32
             out = chr oc
-        let dst: void* = ptr_add(p, i)
-        var pc: char* = char*(dst)
-        *pc = out
-    setMem(ptr_add(p, n), 0, 1)
+        stage1WriteCharAt(p, i, out)
+    stage1WriteZeroAt(p, n)
     return str(p)
 
 fn envIsTrue(name: str): bool =
@@ -74,6 +79,10 @@ fn envIsTrue(name: str): bool =
     return false
 
 fn stage1_autoSystemEnabled(): bool =
+    # Native-contract compile path is host-agnostic/nolibc and must not
+    # auto-import std/system; enforce in frontend to avoid env-mismatch crashes.
+    if envIsTrue("BACKEND_NATIVE_CONTRACT"):
+        return false
     let raw: str = lowerAscii(stage1_getEnv("STAGE1_AUTO_SYSTEM"))
     if raw == "":
         return true
@@ -97,19 +106,19 @@ fn stage1_parseModeNormalized(): str =
         return "outline"
     return "full"
 
-fn stage1_parseModuleByMode(tokens: Token[], path: str, diags: Diagnostic[]*): Node =
+fn stage1_parseModuleByMode(tokens: Token[], path: str, diags: Diagnostic[]*): AstNodeId =
     let mode: str = stage1_parseModeNormalized()
     if mode == "outline":
-        return parseModuleOutlineWithDiagnostics(tokens, path, diags)
-    return parseModuleWithDiagnostics(tokens, path, diags)
+        return parseModuleOutlineWithDiagnosticsId(tokens, path, diags)
+    return parseModuleWithDiagnosticsId(tokens, path, diags)
 
-fn stage1_materializeModuleBodiesForMode(tokens: Token[], path: str, root: Node, diags: Diagnostic[]*): int32 =
-    if root == nil:
+fn stage1_materializeModuleBodiesForMode(tokens: Token[], path: str, rootId: AstNodeId, diags: Diagnostic[]*): int32 =
+    if !astNodeIdValid(rootId):
         return 0
     let mode: str = stage1_parseModeNormalized()
     if mode != "outline":
         return 0
-    return materializeModuleRoutineBodiesFromTokens(tokens, path, root, diags)
+    return materializeModuleRoutineBodiesFromTokensId(tokens, path, rootId, diags)
 
 var stage1TraceEnabledCached: int32 = -1
 var stage1TraceImportsEnabledCached: int32 = -1
@@ -273,19 +282,23 @@ fn stage1ResolvePluginImportPath(path: str): str =
             return hit5
     return ""
 
-fn stage1ApplyAstPluginHooks(path: str, root: Node): Node =
-    if root == nil:
-        return root
+fn stage1ApplyAstPluginHooksId(path: str, rootId: AstNodeId): AstNodeId =
+    let _pathUnused: str = path
+    if !astNodeIdValid(rootId):
+        return astInvalidNodeId()
     if !stage1PluginEnabled():
-        return root
-    return root
+        return rootId
+    return rootId
 
 fn stage1Trace(msg: str) =
     if stage1TraceEnabled():
-        let line: str = "[stage1] " + msg
-        echo line
+        let fOut: os.File = get_stdout()
+        os.write(fOut, "[stage1] ")
+        if len(msg) > 0:
+            os.write(fOut, msg)
+        os.writeLine(fOut, "")
         if stage1TraceFlushEnabled():
-            c_fflush get_stdout()
+            c_fflush fOut
 
 fn memMode(): str =
     let mm: str = lowerAscii(stage1_getEnv("MM"))
@@ -438,10 +451,10 @@ fn u64ToHex(v: uint64): str =
         let masked: uint64 =(v >> uint64(shift)) & uint64(15)
         let digit: int32 = int32(masked)
         let c: char = hexDigit digit
-        let dst: void* = ptr_add(p, i)
+        let dst: void* = rawmemPtrAdd(p, i)
         let pc: char* = char*(dst)
         *pc = c
-    setMem(ptr_add(p, 16), 0, 1)
+    rawmemSet(rawmemPtrAdd(p, 16), 0, 1)
     return str(p)
 
 fn moduleTag(path: str): str =
@@ -561,34 +574,25 @@ fn escapeCacheField(s: str): str =
     for i in 0..<n:
         let c: char = s[i]
         if c == '\\':
-            let d0: void* = ptr_add(p, oi)
-            let d1: void* = ptr_add(p, oi + 1)
-            *char*(d0) = '\\'
-            *char*(d1) = '\\'
+            stage1WriteCharAt(p, oi, '\\')
+            stage1WriteCharAt(p, oi + 1, '\\')
             oi = oi + 2
         elif c == '\n':
-            let d0: void* = ptr_add(p, oi)
-            let d1: void* = ptr_add(p, oi + 1)
-            *char*(d0) = '\\'
-            *char*(d1) = 'n'
+            stage1WriteCharAt(p, oi, '\\')
+            stage1WriteCharAt(p, oi + 1, 'n')
             oi = oi + 2
         elif c == '\r':
-            let d0: void* = ptr_add(p, oi)
-            let d1: void* = ptr_add(p, oi + 1)
-            *char*(d0) = '\\'
-            *char*(d1) = 'r'
+            stage1WriteCharAt(p, oi, '\\')
+            stage1WriteCharAt(p, oi + 1, 'r')
             oi = oi + 2
         elif c == '\t':
-            let d0: void* = ptr_add(p, oi)
-            let d1: void* = ptr_add(p, oi + 1)
-            *char*(d0) = '\\'
-            *char*(d1) = 't'
+            stage1WriteCharAt(p, oi, '\\')
+            stage1WriteCharAt(p, oi + 1, 't')
             oi = oi + 2
         else:
-            let d0: void* = ptr_add(p, oi)
-            *char*(d0) = c
+            stage1WriteCharAt(p, oi, c)
             oi = oi + 1
-    setMem(ptr_add(p, outLen), 0, 1)
+    stage1WriteZeroAt(p, outLen)
     return str(p)
 
 fn unescapeCacheField(s: str): str =
@@ -605,29 +609,29 @@ fn unescapeCacheField(s: str): str =
         if c == '\\' && i + 1 < n:
             let n2: char = s[i + 1]
             if n2 == 'n':
-                *char*(ptr_add(p, oi)) = '\n'
+                stage1WriteCharAt(p, oi, '\n')
                 oi = oi + 1
                 i = i + 2
                 continue
             elif n2 == 'r':
-                *char*(ptr_add(p, oi)) = '\r'
+                stage1WriteCharAt(p, oi, '\r')
                 oi = oi + 1
                 i = i + 2
                 continue
             elif n2 == 't':
-                *char*(ptr_add(p, oi)) = '\t'
+                stage1WriteCharAt(p, oi, '\t')
                 oi = oi + 1
                 i = i + 2
                 continue
             elif n2 == '\\':
-                *char*(ptr_add(p, oi)) = '\\'
+                stage1WriteCharAt(p, oi, '\\')
                 oi = oi + 1
                 i = i + 2
                 continue
-        *char*(ptr_add(p, oi)) = c
+        stage1WriteCharAt(p, oi, c)
         oi = oi + 1
         i = i + 1
-    setMem(ptr_add(p, oi), 0, 1)
+    stage1WriteZeroAt(p, oi)
     return str(p)
 
 fn sliceRangePlainKnownLen(s: str, n: int32, start: int32, stop: int32): str =
@@ -641,9 +645,9 @@ fn sliceRangePlainKnownLen(s: str, n: int32, start: int32, stop: int32): str =
         return ""
     let count: int32 = b - a + 1
     let p: void* = alloc(count + 1)
-    let src: void* = ptr_add(void*(s), a)
-    copyMem(p, src, count)
-    setMem(ptr_add(p, count), 0, 1)
+    let src: void* = rawmemPtrAdd(ptr(s), a)
+    rawmemCopy(p, src, count)
+    rawmemSet(rawmemPtrAdd(p, count), 0, 1)
     return str(p)
 
 fn sliceRangePlain(s: str, start: int32, stop: int32): str =
@@ -766,7 +770,7 @@ fn loadTokenCache(path: str, size: int64, mtime: int64): TokenCacheResult =
                     let prefixVal: int32 = int32(parseInt64(parts[3]))
                     let lexemeEsc: str = parts[4]
                     let lexeme: str = unescapeCacheField lexemeEsc
-                    trackLexString void*(lexeme)
+                    trackLexStringStr(lexeme)
                     var tok: Token
                     tok.kind = TokenKind(kindId)
                     tok.lexeme = lexeme
@@ -841,9 +845,15 @@ fn writeTokenCache(path: str, size: int64, mtime: int64, tokens: Token[]) =
     c_fclose f
 
 fn stage1_fileExists(path: str): bool =
-    if len(path) == 0 || path[0] == char(0):
+    if len(path) == 0:
         return false
-    return cheng_file_exists(path) != 0
+    if path[0] == char(0):
+        return false
+    let f: File = openRead(path)
+    if f == nil:
+        return false
+    c_fclose f
+    return true
 
 fn stage1_readFile(path: str): str =
     let f: File = openRead path
@@ -863,7 +873,7 @@ fn stage1_writeFile(path: str, content: str) =
 fn releaseString(s: str) =
     if s[0] == char(0):
         return
-    stage1_memRelease void*(s)
+    stage1_memRelease(s)
 
 fn endsWith(s: str, suffix: str): bool =
     let n: int32 = len s
@@ -1001,106 +1011,111 @@ fn normalizeImportPathChecked(path: str, root: str): str =
             return norm
     return ""
 
-fn importNodePath(n: Node): str =
-    if n == nil:
+fn importNodePathId(nId: AstNodeId): str =
+    if !astNodeIdValid(nId):
         return ""
-    case n.kind
+    let kind: NodeKind = astNodeKind(nId)
+    case kind
     of nkImportAs:
-        if kidCount n > 0:
-            return importNodePath kid(n, 0)
+        if astKidCount(nId) > 0:
+            return importNodePathId(astKidAt(nId, 0))
         return ""
     of nkIdent, nkSymbol:
-        return stripSpaces n.ident
+        return stripSpaces(astNodeIdent(nId))
     of nkStrLit:
-        return n.strVal
+        return astNodeStrVal(nId)
     else:
         return ""
 
-fn collectImportNodes(root: Node, acc: Node[]*) =
-    if root == nil || acc == nil:
+fn collectImportNodesId(rootId: AstNodeId, acc: AstNodeId[]*) =
+    if !astNodeIdValid(rootId) || acc == nil:
         return
-    if root.kind != nkModule && root.kind != nkStmtList:
+    let kind: NodeKind = astNodeKind(rootId)
+    if kind != nkModule && kind != nkStmtList:
         return
-    for i in 0..<kidCount root:
-        let n: Node = kid(root, i)
-        if n != nil && (n.kind == nkImportStmt || n.kind == nkImportGroup):
-            add(acc, n)
+    for i in 0..<astKidCount(rootId):
+        let nId: AstNodeId = astKidAt(rootId, i)
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkImportStmt || nKind == nkImportGroup:
+            add(acc, nId)
 
-fn collectImportPaths(n: Node, out: str[]*) =
-    if n == nil || out == nil:
+fn collectImportPathsId(nId: AstNodeId, out: str[]*) =
+    if !astNodeIdValid(nId) || out == nil:
         return
-    if n.kind == nkImportGroup:
-        if kidCount n <= 0:
+    let kind: NodeKind = astNodeKind(nId)
+    if kind == nkImportGroup:
+        if astKidCount(nId) <= 0:
             return
-        let base: str = importNodePath kid(n, 0)
-        for i in 1..<kidCount n:
-            let entry: str = importNodePath kid(n, i)
+        let base: str = importNodePathId(astKidAt(nId, 0))
+        for i in 1..<astKidCount(nId):
+            let entry: str = importNodePathId(astKidAt(nId, i))
             if len entry > 0:
                 if len base > 0:
                     let combined: str = base + "/" + entry
-                    trackLexString void*(combined)
+                    trackLexStringStr(combined)
                     add(out, combined)
                 else:
-                    trackLexString void*(entry)
+                    trackLexStringStr(entry)
                     add(out, entry)
         return
-    if n.kind == nkImportStmt:
-        for j in 0..<kidCount n:
-            let item: Node = kid(n, j)
-            if item != nil && item.kind == nkImportGroup:
-                collectImportPaths(item, out)
+    if kind == nkImportStmt:
+        for j in 0..<astKidCount(nId):
+            let itemId: AstNodeId = astKidAt(nId, j)
+            if astNodeKind(itemId) == nkImportGroup:
+                collectImportPathsId(itemId, out)
             else:
-                let path: str = importNodePath item
+                let path: str = importNodePathId(itemId)
                 if len path > 0:
-                    trackLexString void*(path)
+                    trackLexStringStr(path)
                     add(out, path)
         return
-    if n.kind == nkImportAs:
-        if kidCount n > 0:
-            let path: str = importNodePath kid(n, 0)
+    if kind == nkImportAs:
+        if astKidCount(nId) > 0:
+            let path: str = importNodePathId(astKidAt(nId, 0))
             if len path > 0:
-                trackLexString void*(path)
+                trackLexStringStr(path)
                 add(out, path)
         return
-    let path2: str = importNodePath n
+    let path2: str = importNodePathId(nId)
     if len path2 > 0:
-        trackLexString void*(path2)
+        trackLexStringStr(path2)
         add(out, path2)
 
-fn importAliasName(n: Node): str =
-    if n == nil:
+fn importAliasNameId(nId: AstNodeId): str =
+    if !astNodeIdValid(nId):
         return ""
-    case n.kind
+    let kind: NodeKind = astNodeKind(nId)
+    case kind
     of nkImportAs:
-        if kidCount n > 1:
-            return stripSpaces(plainName(kid(n, 1)))
-        if kidCount n > 0:
-            return semImportModuleName(stripSpaces(plainName(kid(n, 0))))
+        if astKidCount(nId) > 1:
+            return stripSpaces(astPlainName(astKidAt(nId, 1)))
+        if astKidCount(nId) > 0:
+            return semImportModuleName(stripSpaces(astPlainName(astKidAt(nId, 0))))
         return ""
     of nkIdent, nkSymbol:
-        return semImportModuleName(stripSpaces(n.ident))
+        return semImportModuleName(stripSpaces(astNodeIdent(nId)))
     of nkStrLit:
-        return semImportModuleName(n.strVal)
+        return semImportModuleName(astNodeStrVal(nId))
     else:
         return ""
 
-fn importAliasValue(n: Node): str =
-    if n == nil:
+fn importAliasValueId(nId: AstNodeId): str =
+    if !astNodeIdValid(nId):
         return ""
-    if n.kind == nkImportAs:
-        return importAliasName n
+    if astNodeKind(nId) == nkImportAs:
+        return importAliasNameId(nId)
     return ""
 
-fn appendImportDep(base: str, item: Node, out: str[]*) =
-    if item == nil || out == nil:
+fn appendImportDepId(base: str, itemId: AstNodeId, out: str[]*) =
+    if !astNodeIdValid(itemId) || out == nil:
         return
-    let path: str = importNodePath item
+    let path: str = importNodePathId(itemId)
     if len path == 0:
         return
     var full: str = path
     if len base > 0:
         full = base + "/" + path
-    let alias: str = importAliasValue item
+    let alias: str = importAliasValueId(itemId)
     if len alias > 0:
         full = full + " as "
         full = full + alias
@@ -1120,63 +1135,42 @@ fn stripImportAlias(item: str): str =
             return sliceRange(item, 0, i - 1)
     return item
 
-fn collectImportDeps(root: Node, out: str[]*) =
-    if root == nil || out == nil:
+fn collectImportAliasesId(rootId: AstNodeId, out: str[]*) =
+    if !astNodeIdValid(rootId) || out == nil:
         return
-    if root.kind == nkImportStmt:
-        for j in 0..<kidCount root:
-            let item: Node = kid(root, j)
-            if item != nil && item.kind == nkImportGroup:
-                if kidCount item > 0:
-                    let base: str = importNodePath kid(item, 0)
-                    for k in 1..<kidCount item:
-                        appendImportDep(base, kid(item, k), out)
-            else:
-                appendImportDep("", item, out)
+    let rootKind: NodeKind = astNodeKind(rootId)
+    if rootKind != nkModule && rootKind != nkStmtList:
         return
-    if root.kind == nkImportGroup:
-        if kidCount root > 0:
-            let base2: str = importNodePath kid(root, 0)
-            for m in 1..<kidCount root:
-                appendImportDep(base2, kid(root, m), out)
-        return
-    for i in 0..<kidCount root:
-        collectImportDeps(kid(root, i), out)
-
-fn collectImportAliases(root: Node, out: str[]*) =
-    if root == nil || out == nil:
-        return
-    if root.kind != nkModule && root.kind != nkStmtList:
-        return
-    for i in 0..<kidCount root:
-        let n: Node = kid(root, i)
-        if n == nil:
+    for i in 0..<astKidCount(rootId):
+        let nId: AstNodeId = astKidAt(rootId, i)
+        if !astNodeIdValid(nId):
             continue
-        if n.kind == nkImportStmt:
-            for j in 0..<kidCount n:
-                let item: Node = kid(n, j)
-                if item != nil && item.kind == nkImportGroup:
-                    if kidCount item <= 1:
-                        let baseName: str = importAliasName kid(item, 0)
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkImportStmt:
+            for j in 0..<astKidCount(nId):
+                let itemId: AstNodeId = astKidAt(nId, j)
+                if astNodeKind(itemId) == nkImportGroup:
+                    if astKidCount(itemId) <= 1:
+                        let baseName: str = importAliasNameId(astKidAt(itemId, 0))
                         if len baseName > 0:
                             add(out, baseName)
                     else:
-                        for k in 1..<kidCount item:
-                            let entryName: str = importAliasName kid(item, k)
+                        for k in 1..<astKidCount(itemId):
+                            let entryName: str = importAliasNameId(astKidAt(itemId, k))
                             if len entryName > 0:
                                 add(out, entryName)
                 else:
-                    let aliasName: str = importAliasName item
+                    let aliasName: str = importAliasNameId(itemId)
                     if len aliasName > 0:
                         add(out, aliasName)
-        elif n.kind == nkImportGroup:
-            if kidCount n <= 1:
-                let baseName2: str = importAliasName kid(n, 0)
+        elif nKind == nkImportGroup:
+            if astKidCount(nId) <= 1:
+                let baseName2: str = importAliasNameId(astKidAt(nId, 0))
                 if len baseName2 > 0:
                     add(out, baseName2)
             else:
-                for k2 in 1..<kidCount n:
-                    let entryName2: str = importAliasName kid(n, k2)
+                for k2 in 1..<astKidCount(nId):
+                    let entryName2: str = importAliasNameId(astKidAt(nId, k2))
                     if len entryName2 > 0:
                         add(out, entryName2)
 
@@ -1188,52 +1182,55 @@ fn isModuleAlias(name: str, aliases: str[]): bool =
             return true
     return false
 
-fn lowerModuleQualifiersCtxShadow(n: Node, aliases: str[], shadowed: str[], keepDot: bool): Node =
-    if n == nil:
-        return nil
+fn lowerModuleQualifiersCtxShadowId(nId: AstNodeId, aliases: str[], shadowed: str[], keepDot: bool): AstNodeId =
+    if !astNodeIdValid(nId):
+        return astInvalidNodeId()
     var localShadowed: str[] = shadowed
-    if (n.kind == nkFnDecl || n.kind == nkIteratorDecl) && kidCount(n) > 1:
+    let nKind: NodeKind = astNodeKind(nId)
+    if (nKind == nkFnDecl || nKind == nkIteratorDecl) && astKidCount(nId) > 1:
         var fnShadowed: str[4]
-        let paramsNode: Node = kid(n, 1)
-        if paramsNode != nil && paramsNode.kind == nkFormalParams:
-            for pi in 0..<kidCount(paramsNode):
-                let defs: Node = kid(paramsNode, pi)
-                if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 0:
-                    let nameNode: Node = kid(defs, 0)
-                    if nameNode != nil && (nameNode.kind == nkIdent || nameNode.kind == nkSymbol):
-                        let nm: str = stripSpaces nameNode.ident
+        let paramsId: AstNodeId = astKidAt(nId, 1)
+        if astNodeKind(paramsId) == nkFormalParams:
+            for pi in 0..<astKidCount(paramsId):
+                let defsId: AstNodeId = astKidAt(paramsId, pi)
+                if astNodeKind(defsId) == nkIdentDefs && astKidCount(defsId) > 0:
+                    let nameId: AstNodeId = astKidAt(defsId, 0)
+                    let nameKind: NodeKind = astNodeKind(nameId)
+                    if nameKind == nkIdent || nameKind == nkSymbol:
+                        let nm: str = stripSpaces(astNodeIdent(nameId))
                         if isModuleAlias(nm, aliases) && !isModuleAlias(nm, fnShadowed):
                             add(fnShadowed, nm)
         localShadowed = fnShadowed
-    if n.kind == nkDotExpr && kidCount n > 1:
-        let base: Node = kid(n, 0)
-        let member: Node = kid(n, 1)
-        if ! keepDot && base != nil && (base.kind == nkIdent || base.kind == nkSymbol):
-            let bname: str = stripSpaces base.ident
+    if nKind == nkDotExpr && astKidCount(nId) > 1:
+        let baseId: AstNodeId = astKidAt(nId, 0)
+        let memberId: AstNodeId = astKidAt(nId, 1)
+        let baseKind: NodeKind = astNodeKind(baseId)
+        if !keepDot && (baseKind == nkIdent || baseKind == nkSymbol):
+            let bname: str = stripSpaces(astNodeIdent(baseId))
             if isModuleAlias(bname, aliases) && !isModuleAlias(bname, localShadowed):
-                return lowerModuleQualifiersCtxShadow(member, aliases, localShadowed, keepDot)
-    for i in 0..<kidCount n:
-        let child: Node = kid(n, i)
+                return lowerModuleQualifiersCtxShadowId(memberId, aliases, localShadowed, keepDot)
+    for i in 0..<astKidCount(nId):
+        let childId: AstNodeId = astKidAt(nId, i)
         var childKeep: bool = false
         if keepDot:
-            if n.kind == nkBracketExpr:
+            if nKind == nkBracketExpr:
                 childKeep = (i == 0)
             else:
                 childKeep = true
-        elif n.kind == nkCall && i == 0:
+        elif nKind == nkCall && i == 0:
             childKeep = true
-        let lowered: Node = lowerModuleQualifiersCtxShadow(child, aliases, localShadowed, childKeep)
-        if lowered != child:
-            setKid(n, i, lowered)
-    return n
+        let loweredId: AstNodeId = lowerModuleQualifiersCtxShadowId(childId, aliases, localShadowed, childKeep)
+        if astNodeIdValid(loweredId) && loweredId != childId:
+            astSetKid(nId, i, loweredId)
+    return nId
 
-fn lowerModuleQualifiersCtx(n: Node, aliases: str[], keepDot: bool): Node =
+fn lowerModuleQualifiersCtxId(nId: AstNodeId, aliases: str[], keepDot: bool): AstNodeId =
     var empty: str[1]
-    return lowerModuleQualifiersCtxShadow(n, aliases, empty, keepDot)
+    return lowerModuleQualifiersCtxShadowId(nId, aliases, empty, keepDot)
 
-fn lowerModuleQualifiers(n: Node, aliases: str[]): Node =
+fn lowerModuleQualifiersId(nId: AstNodeId, aliases: str[]): AstNodeId =
     var empty: str[1]
-    return lowerModuleQualifiersCtxShadow(n, aliases, empty, false)
+    return lowerModuleQualifiersCtxShadowId(nId, aliases, empty, false)
 
 fn normalizeImportPath(path: str): str =
     let abs: str = absolutePath path
@@ -1756,7 +1753,7 @@ type
         keys: str[]
         valStart: int32[]
         valLen: int32[]
-        pool: Node[]
+        pool: AstNodeId[]
         index: hashmaps.HashMapStrInt
 
 fn strSetListInit(cap0: int32 = 16): StrSetList =
@@ -1784,24 +1781,46 @@ fn nodeCacheInit(cap0: int32 = 32): NodeCache =
     c.index = hashmaps.hashMapStrIntInit(cap * 2)
     return c
 
+fn stage1NormalizeVisitedPath(path: str): str =
+    let trimmed: str = stripSpaces(path)
+    if len(trimmed) == 0:
+        return ""
+    return normalizeImportPath(trimmed)
+
 fn setHasStr(v: StrSetList, key: str): bool =
-    return hashsets.hashSetStrHas(v.set, key)
+    let normKey: str = stage1NormalizeVisitedPath(key)
+    if len(normKey) == 0:
+        return false
+    if hashsets.hashSetStrHas(v.set, normKey):
+        return true
+    for i in 0..<v.items.len:
+        if stage1StrEq(v.items[i], normKey):
+            return true
+    return false
 
 fn setAddStr(v: StrSetList*, key: str) =
-    if v == nil || len(key) == 0:
+    if v == nil:
         return
-    if setHasStr(*v, key):
+    let normKey: str = stage1NormalizeVisitedPath(key)
+    if len(normKey) == 0:
         return
-    add(v->items, key)
-    hashsets.hashSetStrAdd(v->set, key)
+    if setHasStr(*v, normKey):
+        return
+    add(v->items, normKey)
+    hashsets.hashSetStrAdd(v->set, normKey)
 
 fn stage1StrEq(a: str, b: str): bool =
     let n: int32 = len(a)
-    if n != len(b):
+    let m: int32 = len(b)
+    if n != m:
         return false
-    for i in 0..<n:
+    if n == 0:
+        return true
+    var i: int32 = 0
+    while i < n:
         if a[i] != b[i]:
             return false
+        i = i + 1
     return true
 
 fn importTraceFind(v: ImportTrace, path: str): int32 =
@@ -1843,7 +1862,7 @@ fn importTraceCycleMessage(v: ImportTrace, path: str): str =
     msg = msg + path
     return msg
 
-fn mapGetNodes(cache: NodeCache, key: str, found: bool* = nil): Node[] =
+fn mapGetNodes(cache: NodeCache, key: str, found: bool* = nil): AstNodeId[] =
     var ok: bool = false
     let idx: int32 = hashmaps.hashMapStrIntGetEx(cache.index, key, ok)
     if ok && idx >= 0 && idx < cache.valStart.len:
@@ -1851,7 +1870,7 @@ fn mapGetNodes(cache: NodeCache, key: str, found: bool* = nil): Node[] =
             *found = true
         let start: int32 = cache.valStart[idx]
         let n: int32 = cache.valLen[idx]
-        var out: Node[]
+        var out: AstNodeId[]
         if start >= 0 && n > 0:
             reserve(out, n)
             for i in 0..<n:
@@ -1861,7 +1880,7 @@ fn mapGetNodes(cache: NodeCache, key: str, found: bool* = nil): Node[] =
         *found = false
     return []
 
-fn mapSetNodes(cache: NodeCache*, key: str, val: Node[]) =
+fn mapSetNodes(cache: NodeCache*, key: str, val: AstNodeId[]) =
     if cache == nil || len(key) == 0:
         return
     var existed: bool = false
@@ -1885,110 +1904,119 @@ fn mapSetNodes(cache: NodeCache*, key: str, val: Node[]) =
     if existed || idx != newIdx:
         hashmaps.hashMapStrIntPut(cache->index, key, newIdx)
 
-fn loadModuleRecursive(path: str, rootDir: str, visited: StrSetList*, diags: Diagnostic[]*,
-                       cache: NodeCache* = nil, trace: ImportTrace* = nil): Node[] =
-    var out: Node[8]
-    if len path == 0:
+fn loadModuleRecursiveId(path: str, rootDir: str, visited: StrSetList*, diags: Diagnostic[]*,
+                         cache: NodeCache* = nil, trace: ImportTrace* = nil): AstNodeId[] =
+    var out: AstNodeId[]
+    reserve(out, 64)
+    let pathNorm: str = stage1NormalizeVisitedPath(path)
+    if len(pathNorm) == 0:
         return out
     if stage1TraceImportsEnabled():
-        stage1Trace("import: load " + path)
-    if trace != nil && importTraceHas(*trace, path):
-        addDiag(diags, svError, path, 1, 1, importTraceCycleMessage(*trace, path))
+        stage1Trace("import: load " + pathNorm)
+    if trace != nil && importTraceHas(*trace, pathNorm):
+        addDiag(diags, svError, pathNorm, 1, 1, importTraceCycleMessage(*trace, pathNorm))
         return out
-    if visited != nil && setHasStr(*visited, path):
+    if visited != nil && setHasStr(*visited, pathNorm):
         return out
     var tracePushed: bool = false
     if trace != nil:
-        importTracePush(trace, path)
+        importTracePush(trace, pathNorm)
         tracePushed = true
     defer:
         if tracePushed:
             importTracePop(trace)
     if visited != nil:
-        setAddStr(visited, path)
+        setAddStr(visited, pathNorm)
     if cache != nil:
         var cachedOk: bool = false
-        let cached: Node[] = mapGetNodes(*cache, path, &cachedOk)
+        let cached: AstNodeId[] = mapGetNodes(*cache, pathNorm, &cachedOk)
         if cachedOk:
             return cached
-    if ! stage1_fileExists path:
+    if ! stage1_fileExists pathNorm:
         if stage1TraceImportsEnabled():
-            stage1Trace("import: missing " + path)
-        addDiag(diags, svError, path, 1, 1, "Unable to read imported module")
+            stage1Trace("import: missing " + pathNorm)
+        addDiag(diags, svError, pathNorm, 1, 1, "Unable to read imported module")
         return out
-    let size: int64 = fileSize path
-    let mtime: int64 = fileMtime path
+    let size: int64 = fileSize pathNorm
+    let mtime: int64 = fileMtime pathNorm
     var tokens: Token[]
     var lexDiags: Diagnostic[]
     lexDiags.buffer = nil
     lexDiags.len = 0
     lexDiags.cap = 0
-    let cacheRes: TokenCacheResult = loadTokenCache(path, size, mtime)
+    let cacheRes: TokenCacheResult = loadTokenCache(pathNorm, size, mtime)
     if cacheRes.hit:
         tokens = cacheRes.tokens
     else:
-        let content: str = stage1_readFile path
+        let content: str = stage1_readFile pathNorm
         if (content == ""):
-            addDiag(diags, svError, path, 1, 1, "Unable to read imported module")
+            addDiag(diags, svError, pathNorm, 1, 1, "Unable to read imported module")
             return out
-        let lexRes: LexResult = lex(content, path)
+        let lexRes: LexResult = lex(content, pathNorm)
         releaseString content
         tokens = lexRes.tokens
         lexDiags = lexRes.diagnostics
         appendDiagnostics(diags, lexDiags)
         if lexDiags.len == 0:
-            writeTokenCache(path, size, mtime, tokens)
-    let mrootParsed: Node = stage1_parseModuleByMode(tokens, path, diags)
-    let _mrootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, path, mrootParsed, diags)
-    let mroot: Node = stage1ApplyAstPluginHooks(path, mrootParsed)
+            writeTokenCache(pathNorm, size, mtime, tokens)
+    let mrootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, pathNorm, diags)
+    let _mrootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, pathNorm, mrootParsedId, diags)
+    let mrootId: AstNodeId = stage1ApplyAstPluginHooksId(pathNorm, mrootParsedId)
     freeSeq[Token](tokens)
     freeSeq[Diagnostic](lexDiags)
-    if mroot == nil:
+    if !astNodeIdValid(mrootId):
         return out
-    tagModuleChildren(mroot, path)
-    var aliases: str[8]
-    collectImportAliases(mroot, &aliases)
+    tagModuleChildrenId(mrootId, pathNorm)
+    var aliases: str[]
+    reserve(aliases, 32)
+    collectImportAliasesId(mrootId, &aliases)
     if aliases.len > 0:
-        lowerModuleQualifiers(mroot, aliases)
-    let split: SplitFileResult = parser_splitFile path
+        let _loweredRootId: AstNodeId = lowerModuleQualifiersId(mrootId, aliases)
+    let split: SplitFileResult = parser_splitFile(pathNorm)
     let moduleDir: str = split.dir
-    var importNodes: Node[8]
-    collectImportNodes(mroot, &importNodes)
+    var importNodes: AstNodeId[]
+    reserve(importNodes, 32)
+    collectImportNodesId(mrootId, &importNodes)
     for ii in 0..<importNodes.len:
-        let imp: Node = importNodes[ii]
-        var paths: str[8]
-        collectImportPaths(imp, &paths)
+        let impId: AstNodeId = importNodes[ii]
+        var paths: str[]
+        reserve(paths, 16)
+        collectImportPathsId(impId, &paths)
         for pi in 0..<paths.len:
             let rawPath: str = paths[pi]
             if len rawPath > 0 && !(rawPath == "system"):
                 var resolved: str = resolveImportPath(rawPath, moduleDir, rootDir)
                 if len resolved == 0:
-                    addDiag(diags, svError, path, 1, 1, "Unable to read imported module: " + rawPath)
+                    addDiag(diags, svError, pathNorm, 1, 1, "Unable to read imported module: " + rawPath)
                     continue
                 resolved = canonicalizeResolvedPath(resolved, rootDir)
+                resolved = stage1NormalizeVisitedPath(resolved)
                 if stage1TraceImportsEnabled():
-                    stage1Trace("import: " + path + " -> " + rawPath + " => " + resolved)
-                let nested: Node[] = loadModuleRecursive(resolved, rootDir, visited, diags, cache, trace)
+                    stage1Trace("import: " + pathNorm + " -> " + rawPath + " => " + resolved)
+                let nested: AstNodeId[] = loadModuleRecursiveId(resolved, rootDir, visited, diags, cache, trace)
                 for ni in 0..<nested.len:
                     add(out, nested[ni])
-    if mroot.kind == nkModule || mroot.kind == nkStmtList:
-        for ci in 0..<kidCount mroot:
-            let child: Node = kid(mroot, ci)
-            if child != nil && child.kind != nkEmpty && child.kind != nkImportStmt && child.kind != nkImportGroup:
-                if len(child.strVal) == 0:
-                    nodeSetStrVal(child, path)
-                add(out, child)
+    let mrootKind: NodeKind = astNodeKind(mrootId)
+    if mrootKind == nkModule || mrootKind == nkStmtList:
+        for ci in 0..<astKidCount(mrootId):
+                let childId: AstNodeId = astKidAt(mrootId, ci)
+                let childKind: NodeKind = astNodeKind(childId)
+                if childKind != nkEmpty && childKind != nkImportStmt && childKind != nkImportGroup:
+                    if len(astNodeStrVal(childId)) == 0:
+                        astSetNodeStrVal(childId, pathNorm)
+                    add(out, childId)
     else:
-        if mroot.kind != nkEmpty:
-            add(out, mroot)
+        if mrootKind != nkEmpty:
+            add(out, mrootId)
     if cache != nil:
-        mapSetNodes(cache, path, out)
+        mapSetNodes(cache, pathNorm, out)
     return out
 
-fn loadImports(root: Node, baseDir: str, rootDir: str, diags: Diagnostic[]*, visitedIn: StrSetList* = nil,
-               cache: NodeCache* = nil): Node[] =
-    var out: Node[8]
-    if root == nil:
+fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: Diagnostic[]*, visitedIn: StrSetList* = nil,
+                 cache: NodeCache* = nil): AstNodeId[] =
+    var out: AstNodeId[]
+    reserve(out, 64)
+    if !astNodeIdValid(rootId):
         return out
     var localVisited: StrSetList = strSetListInit(16)
     var visited: StrSetList* = visitedIn
@@ -1998,18 +2026,21 @@ fn loadImports(root: Node, baseDir: str, rootDir: str, diags: Diagnostic[]*, vis
     trace.items = []
     reserve(trace.items, 16)
     var rootTracePushed: bool = false
-    if len(root.strVal) > 0:
-        importTracePush(&trace, root.strVal)
+    let rootPath: str = astNodeStrVal(rootId)
+    if len(rootPath) > 0:
+        importTracePush(&trace, rootPath)
         rootTracePushed = true
     defer:
         if rootTracePushed:
             importTracePop(&trace)
-    var importNodes: Node[8]
-    collectImportNodes(root, &importNodes)
+    var importNodes: AstNodeId[]
+    reserve(importNodes, 32)
+    collectImportNodesId(rootId, &importNodes)
     for i in 0..<importNodes.len:
-        let imp: Node = importNodes[i]
-        var paths: str[8]
-        collectImportPaths(imp, &paths)
+        let impId: AstNodeId = importNodes[i]
+        var paths: str[]
+        reserve(paths, 16)
+        collectImportPathsId(impId, &paths)
         for pi in 0..<paths.len:
             let rawPath: str = paths[pi]
             if len rawPath > 0 && !(rawPath == "system"):
@@ -2018,10 +2049,11 @@ fn loadImports(root: Node, baseDir: str, rootDir: str, diags: Diagnostic[]*, vis
                     addDiag(diags, svError, baseDir, 1, 1, "Unable to read imported module: " + rawPath)
                     continue
                 resolved = canonicalizeResolvedPath(resolved, rootDir)
+                resolved = stage1NormalizeVisitedPath(resolved)
                 if stage1TraceImportsEnabled():
-                    let owner: str = (len(root.strVal) > 0) ? root.strVal : baseDir
+                    let owner: str = (len(rootPath) > 0) ? rootPath : baseDir
                     stage1Trace("import: " + owner + " -> " + rawPath + " => " + resolved)
-                let nested: Node[] = loadModuleRecursive(resolved, rootDir, visited, diags, cache, &trace)
+                let nested: AstNodeId[] = loadModuleRecursiveId(resolved, rootDir, visited, diags, cache, &trace)
                 for ni in 0..<nested.len:
                     add(out, nested[ni])
     return out
@@ -2065,14 +2097,14 @@ fn printHints(diags: Diagnostic[]) =
             let diagText: str = format d
             echo diagText
 
-fn loadSystemModule(userFile: str, diags: Diagnostic[]*): Node =
+fn loadSystemModuleId(userFile: str, diags: Diagnostic[]*): AstNodeId =
     if !stage1_autoSystemEnabled():
-        return nil
+        return astInvalidNodeId()
     var sysPath: str = "src/std/system.cheng"
     if (userFile == sysPath):
-        return nil
+        return astInvalidNodeId()
     if ! stage1_fileExists sysPath:
-        return nil
+        return astInvalidNodeId()
     let size: int64 = fileSize sysPath
     let mtime: int64 = fileMtime sysPath
     var tokens: Token[]
@@ -2086,7 +2118,7 @@ fn loadSystemModule(userFile: str, diags: Diagnostic[]*): Node =
     else:
         let content: str = stage1_readFile sysPath
         if (content == ""):
-            return nil
+            return astInvalidNodeId()
         let lexRes: LexResult = lex(content, sysPath)
         releaseString content
         tokens = lexRes.tokens
@@ -2096,19 +2128,19 @@ fn loadSystemModule(userFile: str, diags: Diagnostic[]*): Node =
         if lexDiags.len == 0:
             writeTokenCache(sysPath, size, mtime, tokens)
     dumpTokens(sysPath, tokens)
-    let sysRootParsed: Node = stage1_parseModuleByMode(tokens, sysPath, diags)
-    let _sysBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, sysPath, sysRootParsed, diags)
-    let sysRoot: Node = stage1ApplyAstPluginHooks(sysPath, sysRootParsed)
+    let sysRootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, sysPath, diags)
+    let _sysBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, sysPath, sysRootParsedId, diags)
+    let sysRootId: AstNodeId = stage1ApplyAstPluginHooksId(sysPath, sysRootParsedId)
     freeSeq[Token](tokens)
     freeSeq[Diagnostic](lexDiags)
-    return sysRoot
+    return sysRootId
 
-fn parseModuleForDeps(path: str, diags: Diagnostic[]*): Node =
+fn parseModuleForDepsId(path: str, diags: Diagnostic[]*): AstNodeId =
     if len path == 0:
-        return nil
+        return astInvalidNodeId()
     if ! stage1_fileExists path:
         addDiag(diags, svError, path, 1, 1, "Unable to read input file")
-        return nil
+        return astInvalidNodeId()
     let size: int64 = fileSize path
     let mtime: int64 = fileMtime path
     var tokens: Token[]
@@ -2123,7 +2155,7 @@ fn parseModuleForDeps(path: str, diags: Diagnostic[]*): Node =
         let content: str = stage1_readFile path
         if (content == ""):
             addDiag(diags, svError, path, 1, 1, "Unable to read input file")
-            return nil
+            return astInvalidNodeId()
         let lexRes: LexResult = lex(content, path)
         releaseString content
         tokens = lexRes.tokens
@@ -2131,43 +2163,68 @@ fn parseModuleForDeps(path: str, diags: Diagnostic[]*): Node =
         appendDiagnostics(diags, lexDiags)
         if lexDiags.len == 0:
             writeTokenCache(path, size, mtime, tokens)
-    let rootParsed: Node = stage1_parseModuleByMode(tokens, path, diags)
-    let _rootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, path, rootParsed, diags)
-    let root: Node = stage1ApplyAstPluginHooks(path, rootParsed)
+    let rootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, path, diags)
+    let _rootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, path, rootParsedId, diags)
+    let rootId: AstNodeId = stage1ApplyAstPluginHooksId(path, rootParsedId)
     freeSeq[Token](tokens)
     freeSeq[Diagnostic](lexDiags)
-    return root
+    return rootId
 
-fn mergeModules(sysRoot: Node, userRoot: Node): Node =
-    if userRoot == nil:
-        return sysRoot
-    if sysRoot == nil:
-        return userRoot
-    var root: Node = newNode(nkModule, userRoot.pos)
-    nodeSetStrVal(root, userRoot.strVal)
-    nodeSetIdent(root, userRoot.ident)
-    for i in 0..<kidCount sysRoot:
-        addSon(root, kid(sysRoot, i))
-    for j in 0..<kidCount userRoot:
-        addSon(root, kid(userRoot, j))
-    return root
+fn mergeModulesId(sysRootId: AstNodeId, userRootId: AstNodeId): AstNodeId =
+    if !astNodeIdValid(userRootId):
+        return sysRootId
+    if !astNodeIdValid(sysRootId):
+        return userRootId
+    let rootId: AstNodeId = astNewNodeId(nkModule, astNodePos(userRootId))
+    astSetNodeStrVal(rootId, astNodeStrVal(userRootId))
+    astSetNodeIdent(rootId, astNodeIdent(userRootId))
+    for i in 0..<astKidCount(sysRootId):
+        astAddKid(rootId, astKidAt(sysRootId, i))
+    for j in 0..<astKidCount(userRootId):
+        astAddKid(rootId, astKidAt(userRootId, j))
+    return rootId
 
-fn tagModuleChildren(root: Node, path: str) =
-    if root == nil:
+fn tagModuleChildrenId(rootId: AstNodeId, path: str) =
+    if !astNodeIdValid(rootId):
         return
     if len(path) == 0 || path[0] == char(0):
         return
-    for i in 0..<kidCount root:
-        let child: Node = kid(root, i)
-        if child != nil && child.kind != nkEmpty:
-            if child.kind == nkStmtList:
-                for j in 0..<kidCount child:
-                    let stmt: Node = kid(child, j)
-                    if stmt != nil && stmt.kind != nkEmpty:
-                        if len(stmt.strVal) == 0:
-                            nodeSetStrVal(stmt, path)
-            elif len(child.strVal) == 0:
-                nodeSetStrVal(child, path)
+    for i in 0..<astKidCount(rootId):
+        let childId: AstNodeId = astKidAt(rootId, i)
+        let childKind: NodeKind = astNodeKind(childId)
+        if childKind != nkEmpty:
+            if childKind == nkStmtList:
+                for j in 0..<astKidCount(childId):
+                    let stmtId: AstNodeId = astKidAt(childId, j)
+                    if astNodeKind(stmtId) != nkEmpty:
+                        if len(astNodeStrVal(stmtId)) == 0:
+                            astSetNodeStrVal(stmtId, path)
+            elif len(astNodeStrVal(childId)) == 0:
+                astSetNodeStrVal(childId, path)
+
+fn collectImportDepsId(rootId: AstNodeId, out: str[]*) =
+    if !astNodeIdValid(rootId) || out == nil:
+        return
+    let kind: NodeKind = astNodeKind(rootId)
+    if kind == nkImportStmt:
+        for j in 0..<astKidCount(rootId):
+            let itemId: AstNodeId = astKidAt(rootId, j)
+            if astNodeKind(itemId) == nkImportGroup:
+                if astKidCount(itemId) > 0:
+                    let base: str = importNodePathId(astKidAt(itemId, 0))
+                    for k in 1..<astKidCount(itemId):
+                        appendImportDepId(base, astKidAt(itemId, k), out)
+            else:
+                appendImportDepId("", itemId, out)
+        return
+    if kind == nkImportGroup:
+        if astKidCount(rootId) > 0:
+            let base2: str = importNodePathId(astKidAt(rootId, 0))
+            for m in 1..<astKidCount(rootId):
+                appendImportDepId(base2, astKidAt(rootId, m), out)
+        return
+    for i in 0..<astKidCount(rootId):
+        collectImportDepsId(astKidAt(rootId, i), out)
 
 fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
     releaseNodeArena()
@@ -2177,13 +2234,13 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
     defer:
         releaseNodeArena()
         releaseLexStrings()
-    let userRoot: Node = parseModuleForDeps(inPath, diags)
-    let sysRoot: Node = loadSystemModule(inPath, diags)
+    let userRootId: AstNodeId = parseModuleForDepsId(inPath, diags)
+    let sysRootId: AstNodeId = loadSystemModuleId(inPath, diags)
     if diags != nil && hasError(*diags):
         return []
-    let combined: Node = mergeModules(sysRoot, userRoot)
+    let combinedId: AstNodeId = mergeModulesId(sysRootId, userRootId)
     var imports: str[16]
-    collectImportDeps(combined, &imports)
+    collectImportDepsId(combinedId, &imports)
     var uniqSet: StrSetList = strSetListInit(imports.len)
     for importIndex in 0..<imports.len:
         let imp: str = imports[importIndex]
@@ -2218,12 +2275,12 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
             var nextPending: str[]
             for pi in 0..<pendingLen:
                 let modPath: str = pending[pi] + ""
-                let modRoot: Node = parseModuleForDeps(modPath, diags)
-                if modRoot == nil:
+                let modRootId: AstNodeId = parseModuleForDepsId(modPath, diags)
+                if !astNodeIdValid(modRootId):
                     continue
                 let modDir: str =(parser_splitFile modPath).dir
                 var modImports: str[8]
-                collectImportDeps(modRoot, &modImports)
+                collectImportDepsId(modRootId, &modImports)
                 for mi in 0..<modImports.len:
                     let rawNext: str = stripImportAlias modImports[mi]
                     if len rawNext > 0:

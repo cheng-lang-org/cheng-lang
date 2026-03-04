@@ -223,8 +223,8 @@ var semNormalizeIndexStr: hashmaps.HashMapStrInt
 var semNormalizeValues: str[]
 var semSendEpoch: int32 = 0
 var semBorrowEpoch: int32 = 0
-var semStmtVisitedModules: Node[]
-var semStmtVisitedDecls: Node[]
+var semStmtVisitedModules: AstNodeId[]
+var semStmtVisitedDecls: AstNodeId[]
 
 fn semDebugLog(enabled: bool, msg: str) =
     if !enabled:
@@ -240,23 +240,34 @@ fn semInitHashMapStrInt(m: var hashmaps.HashMapStrInt) =
     m.mask = 0
     m.used = 0
 
+fn semProfResetI64Array(seqInst: var int64[], n: int32) =
+    var count: int32 = n
+    if count < 0:
+        count = 0
+    seqInst.len = 0
+    seqInst.cap = int(count)
+    for _ in 0..<count:
+        add(seqInst, 0)
+
+fn semProfResetI32Array(seqInst: var int32[], n: int32) =
+    var count: int32 = n
+    if count < 0:
+        count = 0
+    seqInst.len = 0
+    seqInst.cap = int(count)
+    for _ in 0..<count:
+        add(seqInst, 0)
+
 fn semProfResetKinds() =
-    semProfStmtKindNs.len = 0
-    semProfStmtKindNs.len = int(semNodeKindCount)
-    semProfStmtKindCalls.len = 0
-    semProfStmtKindCalls.len = int(semNodeKindCount)
-    semProfExprKindNs.len = 0
-    semProfExprKindNs.len = int(semNodeKindCount)
-    semProfExprKindCalls.len = 0
-    semProfExprKindCalls.len = int(semNodeKindCount)
-    semProfSendKindNs.len = 0
-    semProfSendKindNs.len = int(semNodeKindCount)
-    semProfSendKindCalls.len = 0
-    semProfSendKindCalls.len = int(semNodeKindCount)
-    semProfBorrowKindNs.len = 0
-    semProfBorrowKindNs.len = int(semNodeKindCount)
-    semProfBorrowKindCalls.len = 0
-    semProfBorrowKindCalls.len = int(semNodeKindCount)
+    let nKinds: int32 = semNodeKindCount
+    semProfResetI64Array(semProfStmtKindNs, nKinds)
+    semProfResetI32Array(semProfStmtKindCalls, nKinds)
+    semProfResetI64Array(semProfExprKindNs, nKinds)
+    semProfResetI32Array(semProfExprKindCalls, nKinds)
+    semProfResetI64Array(semProfSendKindNs, nKinds)
+    semProfResetI32Array(semProfSendKindCalls, nKinds)
+    semProfResetI64Array(semProfBorrowKindNs, nKinds)
+    semProfResetI32Array(semProfBorrowKindCalls, nKinds)
 
 fn semProfSkipStmtKind(kind: NodeKind): bool =
     return kind == nkModule || kind == nkStmtList
@@ -312,58 +323,65 @@ fn semProfKindLabel(idx: int32): str =
     return out
 
 fn semReadI64(seqInst: int64[], idx: int32): int64 =
+    if seqInst.len <= 0:
+        return 0
     if idx < 0 || idx >= seqInst.len:
         return 0
     return seqInst[idx]
 
 fn semWriteI64(seqInst: var int64[], idx: int32, val: int64) =
+    if seqInst.len <= 0:
+        return
     if idx < 0 || idx >= seqInst.len:
         return
     seqInst[idx] = val
 
 fn semReadI32(seqInst: int32[], idx: int32): int32 =
+    if seqInst.len <= 0:
+        return 0
     if idx < 0 || idx >= seqInst.len:
         return 0
     return seqInst[idx]
 
 fn semWriteI32(seqInst: var int32[], idx: int32, val: int32) =
+    if seqInst.len <= 0:
+        return
     if idx < 0 || idx >= seqInst.len:
         return
     seqInst[idx] = val
 
 fn semReadStr(seqInst: str[], idx: int32): str =
+    if seqInst.len <= 0:
+        return ""
     if idx < 0 || idx >= seqInst.len:
         return ""
     return seqInst[idx]
 
-fn semReadNode(seqInst: Node[], idx: int32): Node =
-    if idx < 0 || idx >= seqInst.len:
-        return nil
-    return seqInst[idx]
-
-fn semNodeVisited(nodes: var Node[], target: Node): bool =
-    if target == nil:
+fn semNodeIdVisited(ids: var AstNodeId[], target: AstNodeId): bool =
+    if !astNodeIdValid(target):
         return false
-    for i in 0..<nodes.len:
-        if nodes[i] == target:
+    for i in 0..<ids.len:
+        if ids[i] == target:
             return true
     return false
 
-fn semMarkNodeVisited(nodes: var Node[], target: Node): bool =
-    if target == nil:
+fn semMarkNodeIdVisited(ids: var AstNodeId[], target: AstNodeId): bool =
+    if !astNodeIdValid(target):
         return false
-    if semNodeVisited(nodes, target):
+    if semNodeIdVisited(ids, target):
         return false
-    add(nodes, target)
+    add(ids, target)
     return true
 
 fn semProfRecordKind(nsSeq: var int64[], callsSeq: var int32[], kind: NodeKind, deltaNs: int64, mul: int32, skipStmtContainers: bool) =
     if mul <= 0:
         return
+    if nsSeq.len <= 0 || callsSeq.len <= 0:
+        return
     if skipStmtContainers && semProfSkipStmtKind(kind):
         return
     let idx: int32 = int32(kind)
-    if idx < 0 || idx >= nsSeq.len:
+    if idx < 0 || idx >= nsSeq.len || idx >= callsSeq.len:
         return
     let scaled: int64 = deltaNs * int64(mul)
     let curNs: int64 = nsSeq[idx]
@@ -381,12 +399,34 @@ fn semProfSampleMul(): int32 =
 fn semProfRecordStmtKind(kind: NodeKind, deltaNs: int64) =
     if ! semProfOn || ! semProfStmtSampleOn:
         return
-    semProfRecordKind(semProfStmtKindNs, semProfStmtKindCalls, kind, deltaNs, semProfStmtSampleMul, true)
+    if semProfSkipStmtKind(kind):
+        return
+    let idx: int32 = int32(kind)
+    if idx < 0 || idx >= semProfStmtKindNs.len || idx >= semProfStmtKindCalls.len:
+        return
+    let mul: int32 = semProfStmtSampleMul
+    if mul <= 0:
+        return
+    let scaled: int64 = deltaNs * int64(mul)
+    let curNs: int64 = semReadI64(semProfStmtKindNs, idx)
+    semWriteI64(semProfStmtKindNs, idx, curNs + scaled)
+    let curCalls: int32 = semReadI32(semProfStmtKindCalls, idx)
+    semWriteI32(semProfStmtKindCalls, idx, curCalls + mul)
 
 fn semProfRecordExprKind(kind: NodeKind, deltaNs: int64) =
     if ! semProfOn || ! semProfExprSampleOn:
         return
-    semProfRecordKind(semProfExprKindNs, semProfExprKindCalls, kind, deltaNs, semProfExprSampleMul, false)
+    let idx: int32 = int32(kind)
+    if idx < 0 || idx >= semProfExprKindNs.len || idx >= semProfExprKindCalls.len:
+        return
+    let mul: int32 = semProfExprSampleMul
+    if mul <= 0:
+        return
+    let scaled: int64 = deltaNs * int64(mul)
+    let curNs: int64 = semReadI64(semProfExprKindNs, idx)
+    semWriteI64(semProfExprKindNs, idx, curNs + scaled)
+    let curCalls: int32 = semReadI32(semProfExprKindCalls, idx)
+    semWriteI32(semProfExprKindCalls, idx, curCalls + mul)
 
 fn semProfRecordSendKind(kind: NodeKind, deltaNs: int64) =
     if ! semProfOn:
@@ -394,7 +434,14 @@ fn semProfRecordSendKind(kind: NodeKind, deltaNs: int64) =
     let mul: int32 = semProfSampleMul()
     if mul <= 0:
         return
-    semProfRecordKind(semProfSendKindNs, semProfSendKindCalls, kind, deltaNs, mul, false)
+    let idx: int32 = int32(kind)
+    if idx < 0 || idx >= semProfSendKindNs.len || idx >= semProfSendKindCalls.len:
+        return
+    let scaled: int64 = deltaNs * int64(mul)
+    let curNs: int64 = semReadI64(semProfSendKindNs, idx)
+    semWriteI64(semProfSendKindNs, idx, curNs + scaled)
+    let curCalls: int32 = semReadI32(semProfSendKindCalls, idx)
+    semWriteI32(semProfSendKindCalls, idx, curCalls + mul)
 
 fn semProfRecordBorrowKind(kind: NodeKind, deltaNs: int64) =
     if ! semProfOn:
@@ -402,7 +449,14 @@ fn semProfRecordBorrowKind(kind: NodeKind, deltaNs: int64) =
     let mul: int32 = semProfSampleMul()
     if mul <= 0:
         return
-    semProfRecordKind(semProfBorrowKindNs, semProfBorrowKindCalls, kind, deltaNs, mul, false)
+    let idx: int32 = int32(kind)
+    if idx < 0 || idx >= semProfBorrowKindNs.len || idx >= semProfBorrowKindCalls.len:
+        return
+    let scaled: int64 = deltaNs * int64(mul)
+    let curNs: int64 = semReadI64(semProfBorrowKindNs, idx)
+    semWriteI64(semProfBorrowKindNs, idx, curNs + scaled)
+    let curCalls: int32 = semReadI32(semProfBorrowKindCalls, idx)
+    semWriteI32(semProfBorrowKindCalls, idx, curCalls + mul)
 
 fn semProfTopKinds(nsSeq: int64[], callsSeq: int32[], skipStmtContainers: bool, label: str): str =
     var top1Idx: int32 = -1
@@ -562,9 +616,19 @@ fn semLooksLikeModulePath(path: str): bool =
     return false
 
 fn semPolicyKidCount(n: Node): int32 =
-    if n == nil:
+    if astRefIsNil(n):
         return 0
     let count: int32 = kidCount n
+    if count < 0:
+        return 0
+    if count > semPolicyMaxKidCount:
+        return 0
+    return count
+
+fn semPolicyKidCountId(id: AstNodeId): int32 =
+    if !astNodeIdValid(id):
+        return 0
+    let count: int32 = astKidCount(id)
     if count < 0:
         return 0
     if count > semPolicyMaxKidCount:
@@ -825,11 +889,11 @@ fn semNormalizeName(name: str): str =
     return res
 
 fn semIdentNameNormalized(n: Node): str =
-    if n == nil:
+    if astRefIsNil(n):
         return ""
-    if n.kind != nkIdent && n.kind != nkSymbol:
+    if nodeKind(n) != nkIdent && nodeKind(n) != nkSymbol:
         return ""
-    return semNormalizeName n.ident
+    return semNormalizeName nodeIdent(n)
 
 fn semIsOperatorName(name: str): bool =
     if (name ==  "+"): return true
@@ -864,99 +928,145 @@ fn semIsOperatorName(name: str): bool =
     return false
 
 fn semIsVarTypeNode(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    return n.kind == nkVarTy
-
+    return nodeKind(n) == nkVarTy
 fn semIsPtrLikeTypeNode(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     var base: Node = n
-    if base.kind == nkVarTy && kidCount base > 0:
+    if nodeKind(base) == nkVarTy && kidCount base > 0:
         base = kid(base, 0)
-    if base == nil:
+    if astRefIsNil(base):
         return false
-    if base.kind == nkPtrTy || base.kind == nkRefTy:
+    if nodeKind(base) == nkPtrTy || nodeKind(base) == nkRefTy:
         return true
-    if base.kind == nkBracketExpr && kidCount base > 0:
+    if nodeKind(base) == nkBracketExpr && kidCount base > 0:
         let ctorName: str = semNormalizeName(plainName(kid(base, 0)))
         if ctorName == "ptr" || ctorName == "ref":
             return true
     return false
 
 fn semIsVoidTypeNode(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     var base: Node = n
-    while base != nil && base.kind == nkPar && kidCount base == 1:
+    while astRefNonNil(base) && nodeKind(base) == nkPar && kidCount base == 1:
         base = kid(base, 0)
-    if base == nil:
+    if astRefIsNil(base):
         return false
-    if base.kind == nkIdent || base.kind == nkSymbol:
+    if nodeKind(base) == nkIdent || nodeKind(base) == nkSymbol:
         let nm: str = semNormalizeName(plainName(base))
         return nm == "void"
     return false
 
 fn semIsVoidPtrTypeNode(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     var base: Node = n
-    if base.kind == nkVarTy && kidCount base > 0:
+    if nodeKind(base) == nkVarTy && kidCount base > 0:
         base = kid(base, 0)
-    if base == nil:
+    if astRefIsNil(base):
         return false
-    if base.kind == nkPtrTy && kidCount base > 0:
+    if nodeKind(base) == nkPtrTy && kidCount base > 0:
         return semIsVoidTypeNode(kid(base, 0))
-    if base.kind == nkBracketExpr && kidCount base > 1:
+    if nodeKind(base) == nkBracketExpr && kidCount base > 1:
         let ctorName: str = semNormalizeName(plainName(kid(base, 0)))
         if ctorName == "ptr":
             return semIsVoidTypeNode(kid(base, 1))
     return false
 
+fn semIsPtrLikeTypeNodeId(nId: AstNodeId): bool =
+    if !astNodeIdValid(nId):
+        return false
+    var baseId: AstNodeId = nId
+    if astNodeKind(baseId) == nkVarTy && astKidCount(baseId) > 0:
+        baseId = astKidAt(baseId, 0)
+    if !astNodeIdValid(baseId):
+        return false
+    let baseKind: NodeKind = astNodeKind(baseId)
+    if baseKind == nkPtrTy || baseKind == nkRefTy:
+        return true
+    if baseKind == nkBracketExpr && astKidCount(baseId) > 0:
+        let ctorName: str = semNormalizeName(astPlainName(astKidAt(baseId, 0)))
+        if ctorName == "ptr" || ctorName == "ref":
+            return true
+    return false
+
+fn semIsVoidTypeNodeId(nId: AstNodeId): bool =
+    if !astNodeIdValid(nId):
+        return false
+    var baseId: AstNodeId = nId
+    while astNodeIdValid(baseId) && astNodeKind(baseId) == nkPar && astKidCount(baseId) == 1:
+        baseId = astKidAt(baseId, 0)
+    if !astNodeIdValid(baseId):
+        return false
+    let baseKind: NodeKind = astNodeKind(baseId)
+    if baseKind == nkIdent || baseKind == nkSymbol:
+        let nm: str = semNormalizeName(astPlainName(baseId))
+        return nm == "void"
+    return false
+
+fn semIsVoidPtrTypeNodeId(nId: AstNodeId): bool =
+    if !astNodeIdValid(nId):
+        return false
+    var baseId: AstNodeId = nId
+    if astNodeKind(baseId) == nkVarTy && astKidCount(baseId) > 0:
+        baseId = astKidAt(baseId, 0)
+    if !astNodeIdValid(baseId):
+        return false
+    if astNodeKind(baseId) == nkPtrTy && astKidCount(baseId) > 0:
+        return semIsVoidTypeNodeId(astKidAt(baseId, 0))
+    if astNodeKind(baseId) == nkBracketExpr && astKidCount(baseId) > 1:
+        let ctorName: str = semNormalizeName(astPlainName(astKidAt(baseId, 0)))
+        if ctorName == "ptr":
+            return semIsVoidTypeNodeId(astKidAt(baseId, 1))
+    return false
+
 fn semStripParExpr(n: Node): Node =
-    if n == nil:
-        return nil
-    if n.kind == nkPar && kidCount n == 1:
+    if astRefIsNil(n):
+        return astInvalidNodeId()
+    if nodeKind(n) == nkPar && kidCount n == 1:
         return semStripParExpr kid(n, 0)
     return n
 
 fn semIsSeqTypeNode(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     var base: Node = n
-    if base.kind == nkVarTy && kidCount base > 0:
+    if nodeKind(base) == nkVarTy && kidCount base > 0:
         base = kid(base, 0)
-    if base == nil:
+    if astRefIsNil(base):
         return false
-    if base.kind == nkBracketExpr && kidCount base > 1:
+    if nodeKind(base) == nkBracketExpr && kidCount base > 1:
         let name: str = semNormalizeName(plainName(kid(base, 0)))
         if (name ==  "seq") ||(name ==  "seq_fixed") ||(name ==  "openArray"):
             return true
-    if base.kind == nkIdent || base.kind == nkSymbol:
+    if nodeKind(base) == nkIdent || nodeKind(base) == nkSymbol:
         let nm: str = semIdentNameNormalized base
         if hasPrefix(nm, "seq_"):
             return true
     return false
 
 fn semTypeIsSend(typeNode: Node): bool =
-    if typeNode == nil:
+    if astRefIsNil(typeNode):
         return false
     var base: Node = typeNode
-    if base.kind == nkVarTy && kidCount base > 0:
+    if nodeKind(base) == nkVarTy && kidCount base > 0:
         base = kid(base, 0)
-    if base == nil:
+    if astRefIsNil(base):
         return false
-    if base.kind == nkTupleTy:
+    if nodeKind(base) == nkTupleTy:
         for ti in 0..<kidCount base:
             var elem: Node = kid(base, ti)
-            if elem != nil && elem.kind == nkIdentDefs && kidCount elem > 1:
+            if astRefNonNil(elem) && nodeKind(elem) == nkIdentDefs && kidCount elem > 1:
                 elem = kid(elem, 1)
             if ! semTypeIsSend elem:
                 return false
         return true
-    if base.kind == nkPtrTy || base.kind == nkRefTy:
+    if nodeKind(base) == nkPtrTy || nodeKind(base) == nkRefTy:
         return false
-    if base.kind == nkBracketExpr:
+    if nodeKind(base) == nkBracketExpr:
         if kidCount base > 0:
             let name: str = semNormalizeName(plainName(kid(base, 0)))
             if (name ==  "Arc") ||(name ==  "Mutex") ||(name ==  "RwLock") ||(name ==  "Atomic"):
@@ -964,7 +1074,7 @@ fn semTypeIsSend(typeNode: Node): bool =
                     return semTypeIsSend kid(base, 1)
                 return true
         return false
-    if base.kind == nkIdent || base.kind == nkSymbol:
+    if nodeKind(base) == nkIdent || nodeKind(base) == nkSymbol:
         let name: str = semIdentNameNormalized base
         if (name ==  "int") ||(name ==  "int8") ||(name ==  "int16") ||(name ==  "int32") ||(name ==  "int64"):
             return true
@@ -1046,9 +1156,9 @@ fn semSendIsActive(ctx: var SemCtx, name: str): bool =
     return false
 
 fn semSendMarkPattern(ctx: var SemCtx, pat: Node, sendable: bool) =
-    if pat == nil:
+    if astRefIsNil(pat):
         return
-    case pat.kind
+    case nodeKind(pat)
     of nkPattern:
         if kidCount pat > 0:
             semSendMarkPattern(ctx, kid(pat, 0), sendable)
@@ -1056,14 +1166,14 @@ fn semSendMarkPattern(ctx: var SemCtx, pat: Node, sendable: bool) =
         if kidCount pat > 1:
             semSendMarkPattern(ctx, kid(pat, 1), sendable)
     of nkIdent, nkSymbol:
-        semSendDefine(ctx, pat.ident, sendable)
+        semSendDefine(ctx, nodeIdent(pat), sendable)
     of nkTupleLit, nkSeqLit, nkBracket:
         for i in 0..<kidCount pat:
             semSendMarkPattern(ctx, kid(pat, i), sendable)
     of nkCall:
         for ci in 1..<kidCount pat:
             let arg: Node = kid(pat, ci)
-            if arg != nil && arg.kind == nkCallArg && kidCount arg > 1:
+            if astRefNonNil(arg) && nodeKind(arg) == nkCallArg && kidCount arg > 1:
                 semSendMarkPattern(ctx, kid(arg, 1), sendable)
             else:
                 semSendMarkPattern(ctx, arg, sendable)
@@ -1073,16 +1183,17 @@ fn semSendMarkPattern(ctx: var SemCtx, pat: Node, sendable: bool) =
     else:
         return
 fn semMarkParamSend(ctx: var SemCtx, fp: Node) =
-    if fp == nil:
+    if astRefIsNil(fp):
         return
-    if fp.kind != nkFormalParams:
+    if nodeKind(fp) != nkFormalParams:
         return
     for i in 0..<kidCount fp:
         let defs: Node = kid(fp, i)
-        if defs != nil && defs.kind == nkIdentDefs && kidCount defs >= 2:
-            let typeNode: Node = kid(defs, 1)
+        if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs >= 2:
+            let typeNode: Node = identDefsType(defs)
             let sendable: bool = semTypeIsSend typeNode
-            for j in 0..<kidCount defs - 2:
+            let namesN: int32 = identDefsNameCount(defs)
+            for j in 0..<namesN:
                 let pname: str = plainName kid(defs, j)
                 semSendDefine(ctx, pname, sendable)
 
@@ -1092,14 +1203,14 @@ fn semIsSendCtorCallName(name: str): bool =
     return (name ==  "arcNew") ||(name ==  "arcClone") ||(name ==  "share_mt") ||(name ==  "mutexNew") ||(name ==  "rwLockNew") ||(name ==  "atomicNew") ||(name ==  "chanI32New")
 
 fn semExprIsSend(ctx: var SemCtx, n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     let profKindOn: bool = semProfOn && (semProfExprSampleOn || semProfStmtSampleOn)
     var profStartNs: int64 = 0
     if profKindOn:
         profStartNs = cheng_monotime_ns()
     var res: bool = false
-    case n.kind
+    case nodeKind(n)
     of nkIntLit, nkFloatLit, nkBoolLit, nkCharLit:
         res = true
     of nkNilLit:
@@ -1107,7 +1218,7 @@ fn semExprIsSend(ctx: var SemCtx, n: Node): bool =
     of nkStrLit:
         res = false
     of nkIdent, nkSymbol:
-        if semIsLiteralIdent n.ident:
+        if semIsLiteralIdent nodeIdent(n):
             res = true
         else:
             let nm: str = semIdentNameNormalized n
@@ -1154,7 +1265,7 @@ fn semExprIsSend(ctx: var SemCtx, n: Node): bool =
             elif callName ==  "__addr":
                 if kidCount n > 1:
                     let target: Node = semCallArgValue kid(n, 1)
-                    if target != nil &&(target.kind == nkIdent || target.kind == nkSymbol):
+                    if astRefNonNil(target) &&(nodeKind(target) == nkIdent || nodeKind(target) == nkSymbol):
                         let tname: str = semIdentNameNormalized target
                         res = semFnSigFindNormalized(ctx, tname) >= 0
                     else:
@@ -1168,22 +1279,22 @@ fn semExprIsSend(ctx: var SemCtx, n: Node): bool =
     else:
         res = false
     if profKindOn:
-        semProfRecordSendKind(n.kind, cheng_monotime_ns() - profStartNs)
+        semProfRecordSendKind(nodeKind(n), cheng_monotime_ns() - profStartNs)
     return res
 
 fn semFnHasAnnotation(n: Node, annName: str): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    if n.kind != nkFnDecl && n.kind != nkIteratorDecl:
+    if nodeKind(n) != nkFnDecl && nodeKind(n) != nkIteratorDecl:
         return false
     if kidCount n <= 5:
         return false
     let pragmas: Node = kid(n, 5)
-    if pragmas == nil || pragmas.kind != nkPragma:
+    if astRefIsNil(pragmas) || nodeKind(pragmas) != nkPragma:
         return false
     for i in 0..<kidCount pragmas:
         let a: Node = kid(pragmas, i)
-        if a != nil && a.kind == nkAnnotation && kidCount a > 0:
+        if astRefNonNil(a) && nodeKind(a) == nkAnnotation && kidCount a > 0:
             let name: str = semNormalizeName(plainName(kid(a, 0)))
             if name ==  annName:
                 return true
@@ -1373,9 +1484,9 @@ fn semIsGenericValueParam(ctx: var SemCtx, name: str): bool =
     return found && idxPlus1 > 0
 
 fn semIsGenericParamType(ctx: var SemCtx, typeNode: Node): bool =
-    if typeNode == nil:
+    if astRefIsNil(typeNode):
         return false
-    if typeNode.kind == nkIdent || typeNode.kind == nkSymbol:
+    if nodeKind(typeNode) == nkIdent || nodeKind(typeNode) == nkSymbol:
         return semIsGenericParamName(ctx, plainName typeNode)
     return false
 
@@ -1387,11 +1498,11 @@ fn semFnSigAdd(ctx: var SemCtx, name: str, paramsNode: Node) =
     var count: int32 = 0
     var hasVar: int32 = 0
     var hasNonPtr: int32 = 0
-    if paramsNode != nil && paramsNode.kind == nkFormalParams:
+    if astRefNonNil(paramsNode) && nodeKind(paramsNode) == nkFormalParams:
         for i in 0..<kidCount paramsNode:
             let defs: Node = kid(paramsNode, i)
-            if defs != nil && defs.kind == nkIdentDefs && kidCount defs >= 2:
-                let typeNode: Node = kid(defs, 1)
+            if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs >= 2:
+                let typeNode: Node = identDefsType(defs)
                 var isVar: int32 = 0
                 if semIsVarTypeNode typeNode:
                     isVar = 1
@@ -1402,7 +1513,8 @@ fn semFnSigAdd(ctx: var SemCtx, name: str, paramsNode: Node) =
                     hasVar = 1
                 if isPtrLike == 0:
                     hasNonPtr = 1
-                for j in 0..<kidCount defs - 2:
+                let namesN: int32 = identDefsNameCount(defs)
+                for j in 0..<namesN:
                     let pname: str = semNormalizeName(plainName kid(defs, j))
                     if pname != "":
                         semAddStr(ctx.fnSigParamNames, pname)
@@ -1498,7 +1610,7 @@ fn semFnSigHasNonPtr(ctx: var SemCtx, sigIdx: int32): bool =
     return semReadI32(ctx.fnSigHasNonPtr, sigIdx) != 0
 
 fn semCallArgValue(n: Node): Node =
-    if n != nil && n.kind == nkCallArg:
+    if astRefNonNil(n) && nodeKind(n) == nkCallArg:
         if kidCount n > 1:
             return kid(n, 1)
         if kidCount n > 0:
@@ -1506,37 +1618,37 @@ fn semCallArgValue(n: Node): Node =
     return n
 
 fn semIsAddrCall(n: Node): bool =
-    if n == nil || n.kind != nkCall || kidCount n <= 0:
+    if astRefIsNil(n) || nodeKind(n) != nkCall || kidCount n <= 0:
         return false
     let callee: Node = kid(n, 0)
-    if callee != nil && (callee.kind == nkIdent || callee.kind == nkSymbol):
+    if astRefNonNil(callee) && (nodeKind(callee) == nkIdent || nodeKind(callee) == nkSymbol):
         let nm: str = semIdentNameNormalized callee
         return (nm ==  "__addr")
     return false
 
 fn semIsExplicitPtrCall(n: Node): bool =
-    if n == nil || n.kind != nkCall:
+    if astRefIsNil(n) || nodeKind(n) != nkCall:
         return false
     let name: str = semCallBaseName n
     return semIsExplicitPtrCallNameNormalized name
 
 fn semIsShareCall(n: Node): bool =
-    if n == nil || n.kind != nkCall:
+    if astRefIsNil(n) || nodeKind(n) != nkCall:
         return false
     let name: str = semCallName n
     return (name ==  "share") ||(name ==  "share_mt")
 
 fn semIsLValueExpr(n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     var cur: Node = n
-    if cur.kind == nkPar && kidCount cur == 1:
+    if nodeKind(cur) == nkPar && kidCount cur == 1:
         return semIsLValueExpr kid(cur, 0)
-    if cur.kind == nkHiddenDeref || cur.kind == nkDerefExpr:
+    if nodeKind(cur) == nkHiddenDeref || nodeKind(cur) == nkDerefExpr:
         return true
-    if cur.kind == nkIdent || cur.kind == nkSymbol:
+    if nodeKind(cur) == nkIdent || nodeKind(cur) == nkSymbol:
         return true
-    if (cur.kind == nkDotExpr || cur.kind == nkBracketExpr) && kidCount cur > 0:
+    if (nodeKind(cur) == nkDotExpr || nodeKind(cur) == nkBracketExpr) && kidCount cur > 0:
         return semIsLValueExpr kid(cur, 0)
     return false
 
@@ -1695,9 +1807,9 @@ fn semBorrowOriginIsActive(ctx: var SemCtx, name: str): bool =
     return found && count > 0
 
 fn semBorrowMarkPattern(ctx: var SemCtx, pat: Node, borrowed: bool) =
-    if pat == nil:
+    if astRefIsNil(pat):
         return
-    case pat.kind
+    case nodeKind(pat)
     of nkPattern:
         if kidCount pat > 0:
             semBorrowMarkPattern(ctx, kid(pat, 0), borrowed)
@@ -1705,7 +1817,7 @@ fn semBorrowMarkPattern(ctx: var SemCtx, pat: Node, borrowed: bool) =
         if kidCount pat > 1:
             semBorrowMarkPattern(ctx, kid(pat, 1), borrowed)
     of nkIdent, nkSymbol:
-        semBorrowMark(ctx, pat.ident, borrowed)
+        semBorrowMark(ctx, nodeIdent(pat), borrowed)
     of nkTupleLit:
         for i in 0..<kidCount pat:
             semBorrowMarkPattern(ctx, kid(pat, i), borrowed)
@@ -1715,7 +1827,7 @@ fn semBorrowMarkPattern(ctx: var SemCtx, pat: Node, borrowed: bool) =
     of nkCall:
         for ci in 1..<kidCount pat:
             let arg: Node = kid(pat, ci)
-            if arg != nil && arg.kind == nkCallArg && kidCount arg > 1:
+            if astRefNonNil(arg) && nodeKind(arg) == nkCallArg && kidCount arg > 1:
                 semBorrowMarkPattern(ctx, kid(arg, 1), borrowed)
             else:
                 semBorrowMarkPattern(ctx, arg, borrowed)
@@ -1725,9 +1837,9 @@ fn semBorrowMarkPattern(ctx: var SemCtx, pat: Node, borrowed: bool) =
     else:
         return
 fn semPatternIdent(pat: Node): Node =
-    if pat == nil:
-        return nil
-    case pat.kind
+    if astRefIsNil(pat):
+        return astInvalidNodeId()
+    case nodeKind(pat)
     of nkPattern:
         if kidCount pat > 0:
             return semPatternIdent kid(pat, 0)
@@ -1740,22 +1852,22 @@ fn semPatternIdent(pat: Node): Node =
     of nkIdent, nkSymbol:
         return pat
     else:
-        return nil
-    return nil
+        return astInvalidNodeId()
+    return astInvalidNodeId()
 
 fn semBindingTypeNode(pat: Node, typeNode: Node): Node =
-    if typeNode != nil && typeNode.kind != nkEmpty:
+    if astRefNonNil(typeNode) && nodeKind(typeNode) != nkEmpty:
         return typeNode
-    if pat != nil && pat.kind == nkPattern && kidCount pat > 1:
+    if astRefNonNil(pat) && nodeKind(pat) == nkPattern && kidCount pat > 1:
         let ty: Node = kid(pat, 1)
-        if ty != nil && ty.kind != nkEmpty:
+        if astRefNonNil(ty) && nodeKind(ty) != nkEmpty:
             return ty
     return typeNode
 
 fn semBorrowMarkPatternWithOrigin(ctx: var SemCtx, pat: Node, origin: str) =
-    if pat == nil:
+    if astRefIsNil(pat):
         return
-    case pat.kind
+    case nodeKind(pat)
     of nkPattern:
         if kidCount pat > 0:
             semBorrowMarkPatternWithOrigin(ctx, kid(pat, 0), origin)
@@ -1763,7 +1875,7 @@ fn semBorrowMarkPatternWithOrigin(ctx: var SemCtx, pat: Node, origin: str) =
         if kidCount pat > 1:
             semBorrowMarkPatternWithOrigin(ctx, kid(pat, 1), origin)
     of nkIdent, nkSymbol:
-        semBorrowMarkWithOrigin(ctx, pat.ident, true, origin)
+        semBorrowMarkWithOrigin(ctx, nodeIdent(pat), true, origin)
     of nkTupleLit:
         for i in 0..<kidCount pat:
             semBorrowMarkPatternWithOrigin(ctx, kid(pat, i), origin)
@@ -1773,7 +1885,7 @@ fn semBorrowMarkPatternWithOrigin(ctx: var SemCtx, pat: Node, origin: str) =
     of nkCall:
         for ci in 1..<kidCount pat:
             let arg: Node = kid(pat, ci)
-            if arg != nil && arg.kind == nkCallArg && kidCount arg > 1:
+            if astRefNonNil(arg) && nodeKind(arg) == nkCallArg && kidCount arg > 1:
                 semBorrowMarkPatternWithOrigin(ctx, kid(arg, 1), origin)
             else:
                 semBorrowMarkPatternWithOrigin(ctx, arg, origin)
@@ -1788,15 +1900,15 @@ type SemCallInfo = object
     base: Node
 
 fn semCallBaseName(n: Node): str =
-    if n == nil || n.kind != nkCall || kidCount n == 0:
+    if astRefIsNil(n) || nodeKind(n) != nkCall || kidCount n == 0:
         return ""
     let callee: Node = kid(n, 0)
-    if callee != nil && callee.kind == nkBracketExpr && kidCount callee > 0:
+    if astRefNonNil(callee) && nodeKind(callee) == nkBracketExpr && kidCount callee > 0:
         return semNormalizeName(plainName(kid(callee, 0)))
     return semNormalizeName(plainName(callee))
 
 fn semCallName(n: Node): str =
-    if n == nil || n.kind != nkCall || kidCount n == 0:
+    if astRefIsNil(n) || nodeKind(n) != nkCall || kidCount n == 0:
         return ""
     let info: SemCallInfo = semCallInfoNormalized(n)
     return info.name
@@ -1804,20 +1916,31 @@ fn semCallName(n: Node): str =
 fn semCallInfoNormalized(n: Node): SemCallInfo =
     var info: SemCallInfo
     info.name = ""
-    info.base = nil
-    if n == nil || n.kind != nkCall || kidCount n == 0:
+    info.base = astInvalidNodeId()
+    if astRefIsNil(n) || nodeKind(n) != nkCall || kidCount n == 0:
         return info
     var callee: Node = kid(n, 0)
-    if callee != nil && callee.kind == nkBracketExpr && kidCount callee > 0:
+    if astRefNonNil(callee) && nodeKind(callee) == nkBracketExpr && kidCount callee > 0:
         callee = kid(callee, 0)
-    var base: Node = nil
+    var base: Node = astInvalidNodeId()
     var nameNode: Node = callee
-    if callee != nil && callee.kind == nkDotExpr && kidCount callee > 1:
+    if astRefNonNil(callee) && nodeKind(callee) == nkDotExpr && kidCount callee > 1:
         base = kid(callee, 0)
         nameNode = kid(callee, 1)
     info.name = semNormalizeName(plainName(nameNode))
     info.base = base
     return info
+
+fn semCallNameNormalizedId(nId: AstNodeId): str =
+    if !astNodeIdValid(nId) || astNodeKind(nId) != nkCall || astKidCount(nId) == 0:
+        return ""
+    var calleeId: AstNodeId = astKidAt(nId, 0)
+    if astNodeIdValid(calleeId) && astNodeKind(calleeId) == nkBracketExpr && astKidCount(calleeId) > 0:
+        calleeId = astKidAt(calleeId, 0)
+    var nameId: AstNodeId = calleeId
+    if astNodeIdValid(calleeId) && astNodeKind(calleeId) == nkDotExpr && astKidCount(calleeId) > 1:
+        nameId = astKidAt(calleeId, 1)
+    return semNormalizeName(astPlainName(nameId))
 
 fn semIsShareCallName(nm: str): bool =
     return nm ==  "share" || nm ==  "share_mt"
@@ -1875,11 +1998,11 @@ fn semIsStdPointerOpCallNameNormalized(nm: str): bool =
         return true
     return false
 
-fn semCheckStdNoPointerPolicy(ctx: var SemCtx, root: Node): int32 =
-    if root == nil:
+fn semCheckStdNoPointerPolicy(ctx: var SemCtx, rootId: AstNodeId): int32 =
+    if !astNodeIdValid(rootId):
         return 0
     var hits: int32 = 0
-    var stackNodes: Node[]
+    var stackNodes: AstNodeId[]
     stackNodes.buffer = nil
     stackNodes.len = 0
     stackNodes.cap = 256
@@ -1887,57 +2010,58 @@ fn semCheckStdNoPointerPolicy(ctx: var SemCtx, root: Node): int32 =
     stackFiles.buffer = nil
     stackFiles.len = 0
     stackFiles.cap = 256
-    var visitedMods: Node[]
+    var visitedMods: AstNodeId[]
     visitedMods.buffer = nil
     visitedMods.len = 0
     visitedMods.cap = 128
-    add(stackNodes, root)
+    add(stackNodes, rootId)
     add(stackFiles, ctx.filename)
     while stackNodes.len > 0:
         let lastIdx: int32 = stackNodes.len - 1
-        let n: Node = stackNodes[lastIdx]
+        let nId: AstNodeId = stackNodes[lastIdx]
         let inheritedFile: str = stackFiles[lastIdx]
         stackNodes.len = int(lastIdx)
         stackFiles.len = int(lastIdx)
-        if n == nil:
+        if !astNodeIdValid(nId):
             continue
-        if n.kind == nkModule || n.kind == nkStmtList:
-            if !semMarkNodeVisited(visitedMods, n):
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkModule || nKind == nkStmtList:
+            if !semMarkNodeIdVisited(visitedMods, nId):
                 continue
         var fileName: str = inheritedFile
-        if semLooksLikeModulePath(n.strVal):
-            fileName = n.strVal
+        let nodePath: str = astNodeStrVal(nId)
+        if semLooksLikeModulePath(nodePath):
+            fileName = nodePath
         var policyFile: str = fileName
         if !semIsStdModulePath(policyFile) && semIsStdModulePath(ctx.filename):
             policyFile = ctx.filename
         if semIsStdModulePath(policyFile) && !semIsStdPointerPolicyExempt(policyFile):
             var msg: str = ""
-            if semIsPtrLikeTypeNode(n):
+            if semIsPtrLikeTypeNodeId(nId):
                 msg = rawPointerForbidMessage("std policy: pointer types are forbidden in standard library")
-            elif n.kind == nkHiddenDeref || n.kind == nkDerefExpr:
+            elif nKind == nkHiddenDeref || nKind == nkDerefExpr:
                 msg = rawPointerForbidMessage("std policy: pointer dereference is forbidden in standard library")
-            elif n.kind == nkCall:
-                let callInfo: SemCallInfo = semCallInfoNormalized(n)
-                let callName: str = callInfo.name
+            elif nKind == nkCall:
+                let callName: str = semCallNameNormalizedId(nId)
                 if semIsStdPointerOpCallNameNormalized(callName):
                     msg = rawPointerForbidMessage("std policy: pointer operation is forbidden in standard library: " + callName)
             if msg != "":
-                semAddErrorAtFile(ctx, policyFile, n.pos, msg)
+                semAddErrorAtFile(ctx, policyFile, astNodePos(nId), msg)
                 hits = hits + 1
                 if hits == semStdNoPointerDiagLimit:
-                    semAddErrorAtFile(ctx, policyFile, n.pos, rawPointerForbidMessage("std policy: too many pointer violations; further diagnostics are suppressed"))
+                    semAddErrorAtFile(ctx, policyFile, astNodePos(nId), rawPointerForbidMessage("std policy: too many pointer violations; further diagnostics are suppressed"))
                     return hits
-        let childCount: int32 = semPolicyKidCount(n)
+        let childCount: int32 = semPolicyKidCountId(nId)
         for i in 0..<childCount:
-            add(stackNodes, kid(n, i))
+            add(stackNodes, astKidAt(nId, i))
             add(stackFiles, fileName)
     return hits
 
-fn semCheckNoPointerNonCAbiPolicy(ctx: var SemCtx, root: Node): int32 =
-    if root == nil:
+fn semCheckNoPointerNonCAbiPolicy(ctx: var SemCtx, rootId: AstNodeId): int32 =
+    if !astNodeIdValid(rootId):
         return 0
     var hits: int32 = 0
-    var stackNodes: Node[]
+    var stackNodes: AstNodeId[]
     stackNodes.buffer = nil
     stackNodes.len = 0
     stackNodes.cap = 256
@@ -1945,52 +2069,53 @@ fn semCheckNoPointerNonCAbiPolicy(ctx: var SemCtx, root: Node): int32 =
     stackFiles.buffer = nil
     stackFiles.len = 0
     stackFiles.cap = 256
-    var visitedMods: Node[]
+    var visitedMods: AstNodeId[]
     visitedMods.buffer = nil
     visitedMods.len = 0
     visitedMods.cap = 128
-    add(stackNodes, root)
+    add(stackNodes, rootId)
     add(stackFiles, ctx.filename)
     while stackNodes.len > 0:
         let lastIdx: int32 = stackNodes.len - 1
-        let n: Node = stackNodes[lastIdx]
+        let nId: AstNodeId = stackNodes[lastIdx]
         let inheritedFile: str = stackFiles[lastIdx]
         stackNodes.len = int(lastIdx)
         stackFiles.len = int(lastIdx)
-        if n == nil:
+        if !astNodeIdValid(nId):
             continue
-        if n.kind == nkModule || n.kind == nkStmtList:
-            if !semMarkNodeVisited(visitedMods, n):
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkModule || nKind == nkStmtList:
+            if !semMarkNodeIdVisited(visitedMods, nId):
                 continue
         var fileName: str = inheritedFile
-        if semLooksLikeModulePath(n.strVal):
-            fileName = n.strVal
+        let nodePath: str = astNodeStrVal(nId)
+        if semLooksLikeModulePath(nodePath):
+            fileName = nodePath
         var policyFile: str = fileName
         if !semLooksLikeModulePath(policyFile):
             policyFile = ctx.filename
         if semPointerPolicyShouldCheckNonCAbi(policyFile):
             var msg: str = ""
-            if semIsPtrLikeTypeNode(n):
-                if semIsVoidPtrTypeNode(n):
+            if semIsPtrLikeTypeNodeId(nId):
+                if semIsVoidPtrTypeNodeId(nId):
                     msg = rawPointerForbidMessage("no-pointer policy: bare void* surface is forbidden outside C ABI modules")
                 else:
                     msg = rawPointerForbidMessage("no-pointer policy: pointer types are forbidden outside C ABI modules")
-            elif n.kind == nkHiddenDeref || n.kind == nkDerefExpr:
+            elif nKind == nkHiddenDeref || nKind == nkDerefExpr:
                 msg = rawPointerForbidMessage("no-pointer policy: pointer dereference is forbidden outside C ABI modules")
-            elif n.kind == nkCall:
-                let callInfo: SemCallInfo = semCallInfoNormalized(n)
-                let callName: str = callInfo.name
+            elif nKind == nkCall:
+                let callName: str = semCallNameNormalizedId(nId)
                 if semIsStdPointerOpCallNameNormalized(callName):
                     msg = rawPointerForbidMessage("no-pointer policy: pointer operation is forbidden outside C ABI modules: " + callName)
             if msg != "":
-                semAddErrorAtFile(ctx, policyFile, n.pos, msg)
+                semAddErrorAtFile(ctx, policyFile, astNodePos(nId), msg)
                 hits = hits + 1
                 if hits == semStdNoPointerDiagLimit:
-                    semAddErrorAtFile(ctx, policyFile, n.pos, rawPointerForbidMessage("no-pointer policy: too many violations; further diagnostics are suppressed"))
+                    semAddErrorAtFile(ctx, policyFile, astNodePos(nId), rawPointerForbidMessage("no-pointer policy: too many violations; further diagnostics are suppressed"))
                     return hits
-        let childCount: int32 = semPolicyKidCount(n)
+        let childCount: int32 = semPolicyKidCountId(nId)
         for i in 0..<childCount:
-            add(stackNodes, kid(n, i))
+            add(stackNodes, astKidAt(nId, i))
             add(stackFiles, fileName)
     return hits
 
@@ -2232,12 +2357,12 @@ fn semIsBorrowPassAllowedCallName(name: str): bool =
     return semIsBorrowPassAllowedCallNameNormalized(nm)
 
 fn semExprIsBorrowSource(ctx: var SemCtx, n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     var out: bool = false
-    case n.kind
+    case nodeKind(n)
     of nkIdent, nkSymbol:
-        out = semBorrowIsActive(ctx, n.ident)
+        out = semBorrowIsActive(ctx, nodeIdent(n))
     of nkDotExpr, nkBracketExpr, nkHiddenDeref, nkDerefExpr:
         if kidCount n > 0:
             out = semExprIsBorrowSource(ctx, kid(n, 0))
@@ -2258,7 +2383,7 @@ fn semExprIsBorrowSource(ctx: var SemCtx, n: Node): bool =
     return out
 
 fn semExprIsBorrowed(ctx: var SemCtx, n: Node): bool =
-    if n == nil:
+    if astRefIsNil(n):
         return false
     if ctx.borrowActiveTotal == 0:
         return false
@@ -2267,9 +2392,9 @@ fn semExprIsBorrowed(ctx: var SemCtx, n: Node): bool =
     if profKindOn:
         profStartNs = cheng_monotime_ns()
     var res: bool = false
-    case n.kind
+    case nodeKind(n)
     of nkIdent, nkSymbol:
-        res = semBorrowIsActive(ctx, n.ident)
+        res = semBorrowIsActive(ctx, nodeIdent(n))
     of nkDotExpr, nkBracketExpr:
         res = false
     of nkHiddenDeref, nkDerefExpr:
@@ -2312,7 +2437,7 @@ fn semExprIsBorrowed(ctx: var SemCtx, n: Node): bool =
     else:
         res = false
     if profKindOn:
-        semProfRecordBorrowKind(n.kind, cheng_monotime_ns() - profStartNs)
+        semProfRecordBorrowKind(nodeKind(n), cheng_monotime_ns() - profStartNs)
     return res
 
 fn semExprIsBorrowedForCall(ctx: var SemCtx, n: Node): bool =
@@ -2325,25 +2450,25 @@ fn semExprIsBorrowedForCall(ctx: var SemCtx, n: Node): bool =
     if semExprIsBorrowed(ctx, n):
         return true
     let n2: Node = semStripParExpr n
-    if n2 != nil && (n2.kind == nkIdent || n2.kind == nkSymbol):
-        if semBorrowIsActive(ctx, n2.ident):
+    if astRefNonNil(n2) && (nodeKind(n2) == nkIdent || nodeKind(n2) == nkSymbol):
+        if semBorrowIsActive(ctx, nodeIdent(n2)):
             return true
     return false
 
 fn semBorrowOriginName(ctx: var SemCtx, n: Node): str =
-    if n == nil:
+    if astRefIsNil(n):
         return ""
-    if n.kind == nkCallArg && kidCount n > 1:
+    if nodeKind(n) == nkCallArg && kidCount n > 1:
         return semBorrowOriginName(ctx, kid(n, 1))
-    if n.kind == nkPar && kidCount n == 1:
+    if nodeKind(n) == nkPar && kidCount n == 1:
         return semBorrowOriginName(ctx, kid(n, 0))
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         return semIdentNameNormalized n
-    if n.kind == nkDotExpr || n.kind == nkBracketExpr || n.kind == nkHiddenDeref || n.kind == nkDerefExpr:
+    if nodeKind(n) == nkDotExpr || nodeKind(n) == nkBracketExpr || nodeKind(n) == nkHiddenDeref || nodeKind(n) == nkDerefExpr:
         if kidCount n > 0:
             return semBorrowOriginName(ctx, kid(n, 0))
         return ""
-    if n.kind == nkCall:
+    if nodeKind(n) == nkCall:
         let name: str = semCallBaseName n
         if semIsBorrowedCallNameNormalizedWithCtx(ctx, name):
             if semIsExplicitPtrCallNameNormalized name:
@@ -2376,48 +2501,48 @@ fn semBorrowOriginWriteMessage(name: str): str =
     return "Cannot write while borrowed: " + name
 
 fn semCheckBorrowEscape(ctx: var SemCtx, expr: Node, what: str) =
-    if expr == nil:
+    if astRefIsNil(expr):
         return
     if ctx.borrowActiveTotal == 0:
         return
     if semExprIsBorrowed(ctx, expr):
         let nm: str = semBorrowRootName(ctx, expr)
-        semAddError(ctx, expr.pos, semBorrowEscapeMessage(what, nm))
+        semAddError(ctx, nodePos(expr), semBorrowEscapeMessage(what, nm))
         return
     let expr2: Node = semStripParExpr expr
-    if expr2 != nil && (expr2.kind == nkIdent || expr2.kind == nkSymbol):
-        if semBorrowIsActive(ctx, expr2.ident):
+    if astRefNonNil(expr2) && (nodeKind(expr2) == nkIdent || nodeKind(expr2) == nkSymbol):
+        if semBorrowIsActive(ctx, nodeIdent(expr2)):
             let nm2: str = semBorrowRootName(ctx, expr2)
-            semAddError(ctx, expr2.pos, semBorrowEscapeMessage(what, nm2))
+            semAddError(ctx, nodePos(expr2), semBorrowEscapeMessage(what, nm2))
 
 fn semCheckBorrowOriginUse(ctx: var SemCtx, expr: Node) =
-    if expr == nil:
+    if astRefIsNil(expr):
         return
     if ctx.borrowActiveTotal == 0:
         return
-    if expr.kind != nkIdent && expr.kind != nkSymbol:
+    if nodeKind(expr) != nkIdent && nodeKind(expr) != nkSymbol:
         return
     let nm: str = semIdentNameNormalized expr
     if (nm ==  "") ||(nm ==  "_"):
         return
     if semBorrowOriginIsActive(ctx, nm):
-        semAddError(ctx, expr.pos, semBorrowOriginUseMessage nm)
+        semAddError(ctx, nodePos(expr), semBorrowOriginUseMessage nm)
 
 fn semCheckBorrowOriginWrite(ctx: var SemCtx, expr: Node) =
-    if expr == nil:
+    if astRefIsNil(expr):
         return
     if ctx.borrowActiveTotal == 0:
         return
-    if expr.kind != nkIdent && expr.kind != nkSymbol:
+    if nodeKind(expr) != nkIdent && nodeKind(expr) != nkSymbol:
         return
     let nm: str = semIdentNameNormalized expr
     if (nm ==  "") ||(nm ==  "_"):
         return
     if semBorrowOriginIsActive(ctx, nm):
-        semAddError(ctx, expr.pos, semBorrowOriginWriteMessage nm)
+        semAddError(ctx, nodePos(expr), semBorrowOriginWriteMessage nm)
 
 fn semCheckVarParamCall(ctx: var SemCtx, callNode: Node, callName: str, baseArg: Node) =
-    if callNode == nil || callNode.kind != nkCall || kidCount callNode == 0:
+    if astRefIsNil(callNode) || nodeKind(callNode) != nkCall || kidCount callNode == 0:
         return
     if ctx.fnSigNames.len == 0:
         return
@@ -2430,17 +2555,17 @@ fn semCheckVarParamCall(ctx: var SemCtx, callNode: Node, callName: str, baseArg:
     if sigIdx < 0:
         # Unknown/unresolved calls cannot silently bypass borrow proof when a borrow is active.
         # Require an explicit signature (or @borrows/@escapes annotation) at call boundaries.
-        if baseArg != nil:
+        if astRefNonNil(baseArg):
             let baseVal: Node = semCallArgValue baseArg
-            if !allowBorrow && baseVal != nil && semExprIsBorrowed(ctx, baseVal):
-                semAddError(ctx, baseVal.pos, "Borrowed value cannot be passed to unresolved call: " + name + " self/arg1")
+            if !allowBorrow && astRefNonNil(baseVal) && semExprIsBorrowed(ctx, baseVal):
+                semAddError(ctx, nodePos(baseVal), "Borrowed value cannot be passed to unresolved call: " + name + " self/arg1")
             if escapesBorrow:
                 semCheckBorrowEscape(ctx, baseVal, "escape via call " + name)
         for i0 in 1..<kidCount callNode:
             let arg0: Node = kid(callNode, i0)
             let val0: Node = semCallArgValue arg0
-            if !allowBorrow && val0 != nil && semExprIsBorrowed(ctx, val0):
-                semAddError(ctx, val0.pos, "Borrowed value cannot be passed to unresolved call: " + name + " argument #" + intToStr(i0))
+            if !allowBorrow && astRefNonNil(val0) && semExprIsBorrowed(ctx, val0):
+                semAddError(ctx, nodePos(val0), "Borrowed value cannot be passed to unresolved call: " + name + " argument #" + intToStr(i0))
             if escapesBorrow:
                 semCheckBorrowEscape(ctx, val0, "escape via call " + name)
         return
@@ -2453,58 +2578,58 @@ fn semCheckVarParamCall(ctx: var SemCtx, callNode: Node, callName: str, baseArg:
             return
     let count: int32 = semReadI32(ctx.fnSigParamCounts, sigIdx)
     var baseArg0: Node = baseArg
-    if baseArg0 != nil:
+    if astRefNonNil(baseArg0):
         # Dot-call base can be a module qualifier (e.g. `tables.TablePut(...)`), not an implicit self argument.
         # If the resolved signature arity matches the explicit argument count, ignore the base for borrow checks.
         let argCount: int32 = kidCount callNode - 1
         if count == argCount:
-            baseArg0 = nil
+            baseArg0 = astInvalidNodeId()
     var posIdx: int32 = 0
-    if baseArg0 != nil:
+    if astRefNonNil(baseArg0):
         let baseIsVar: bool = semFnSigParamIsVar(ctx, sigIdx, 0)
         let baseIsPtrLike: bool = semFnSigParamIsPtrLike(ctx, sigIdx, 0)
         if baseIsVar:
             if ! semIsAddrCall baseArg0 && ! semIsLValueExpr baseArg0:
-                semAddError(ctx, baseArg0.pos, "var parameter requires a mutable borrow (lvalue): " + name + " self/arg1")
+                semAddError(ctx, nodePos(baseArg0), "var parameter requires a mutable borrow (lvalue): " + name + " self/arg1")
         else:
             if escapesBorrow:
                 semCheckBorrowEscape(ctx, semCallArgValue baseArg0, "escape via call " + name)
             if ! allowBorrow && ! baseIsPtrLike && semExprIsBorrowedForCall(ctx, baseArg0):
-                semAddError(ctx, baseArg0.pos, "Borrowed value cannot be passed to non-var parameter: " + name + " self/arg1")
+                semAddError(ctx, nodePos(baseArg0), "Borrowed value cannot be passed to non-var parameter: " + name + " self/arg1")
         posIdx = 1
     for i in 1..<kidCount callNode:
         let arg: Node = kid(callNode, i)
-        if arg == nil:
+        if astRefIsNil(arg):
             continue
-        if arg.kind == nkCallArg && kidCount arg > 1:
+        if nodeKind(arg) == nkCallArg && kidCount arg > 1:
             let argNameRaw: str = plainName kid(arg, 0)
             let argNameNm: str = semNormalizeName argNameRaw
             let idx: int32 = semFnSigParamIndexNormalized(ctx, sigIdx, argNameNm)
             if idx >= 0 && semFnSigParamIsVar(ctx, sigIdx, idx):
                 let val: Node = semCallArgValue arg
-                if val != nil && ! semIsAddrCall val && ! semIsLValueExpr val:
-                    semAddError(ctx, val.pos, "var parameter requires a mutable borrow (lvalue): " + name + " argument " + argNameRaw)
+                if astRefNonNil(val) && ! semIsAddrCall val && ! semIsLValueExpr val:
+                    semAddError(ctx, nodePos(val), "var parameter requires a mutable borrow (lvalue): " + name + " argument " + argNameRaw)
             elif idx >= 0:
                 let isPtrLikeParam: bool = semFnSigParamIsPtrLike(ctx, sigIdx, idx)
                 let val2: Node = semCallArgValue arg
                 if escapesBorrow:
                     semCheckBorrowEscape(ctx, val2, "escape via call " + name)
-                if ! allowBorrow && ! isPtrLikeParam && val2 != nil && semExprIsBorrowedForCall(ctx, val2):
-                    semAddError(ctx, val2.pos, "Borrowed value cannot be passed to non-var parameter: " + name + " argument " + argNameRaw)
+                if ! allowBorrow && ! isPtrLikeParam && astRefNonNil(val2) && semExprIsBorrowedForCall(ctx, val2):
+                    semAddError(ctx, nodePos(val2), "Borrowed value cannot be passed to non-var parameter: " + name + " argument " + argNameRaw)
         else:
             if posIdx < count && semFnSigParamIsVar(ctx, sigIdx, posIdx):
                 let val2: Node = semCallArgValue arg
-                if val2 != nil && ! semIsAddrCall val2 && ! semIsLValueExpr val2:
+                if astRefNonNil(val2) && ! semIsAddrCall val2 && ! semIsLValueExpr val2:
                     let argIdx: int32 = posIdx + 1
-                    semAddError(ctx, val2.pos, "var parameter requires a mutable borrow (lvalue): " + name + " argument #" + intToStr argIdx)
+                    semAddError(ctx, nodePos(val2), "var parameter requires a mutable borrow (lvalue): " + name + " argument #" + intToStr argIdx)
             elif posIdx < count:
                 let isPtrLikePos: bool = semFnSigParamIsPtrLike(ctx, sigIdx, posIdx)
                 let val3: Node = semCallArgValue arg
                 if escapesBorrow:
                     semCheckBorrowEscape(ctx, val3, "escape via call " + name)
-                if ! allowBorrow && ! isPtrLikePos && val3 != nil && semExprIsBorrowedForCall(ctx, val3):
+                if ! allowBorrow && ! isPtrLikePos && astRefNonNil(val3) && semExprIsBorrowedForCall(ctx, val3):
                     let argIdx: int32 = posIdx + 1
-                    semAddError(ctx, val3.pos, "Borrowed value cannot be passed to non-var parameter: " + name + " argument #" + intToStr argIdx)
+                    semAddError(ctx, nodePos(val3), "Borrowed value cannot be passed to non-var parameter: " + name + " argument #" + intToStr argIdx)
             posIdx = posIdx + 1
 
 fn semThreadBoundaryBorrowMessage(name: str, label: str): str =
@@ -2514,67 +2639,67 @@ fn semThreadBoundarySendMessage(name: str, label: str): str =
     return "Cross-thread argument must be Send/Sync: " + name + " argument " + label
 
 fn semCheckThreadBoundaryArg(ctx: var SemCtx, name: str, argNode: Node, label: str) =
-    if argNode == nil:
+    if astRefIsNil(argNode):
         return
     let val: Node = semCallArgValue argNode
-    if val == nil:
+    if astRefIsNil(val):
         return
     if semExprIsBorrowed(ctx, val):
-        semAddError(ctx, val.pos, semThreadBoundaryBorrowMessage(name, label))
+        semAddError(ctx, nodePos(val), semThreadBoundaryBorrowMessage(name, label))
         return
     if ! semExprIsSend(ctx, val):
-        semAddError(ctx, val.pos, semThreadBoundarySendMessage(name, label))
+        semAddError(ctx, nodePos(val), semThreadBoundarySendMessage(name, label))
 
 fn semSpawnEntryMessage(label: str): str =
     return "spawn entry expects function reference: " + label
 
 fn semExprIsSpawnEntry(ctx: var SemCtx, n0: Node): bool =
-    if n0 == nil:
+    if astRefIsNil(n0):
         return false
     var n: Node = n0
-    while n != nil && n.kind == nkPar && kidCount(n) > 0:
+    while astRefNonNil(n) && nodeKind(n) == nkPar && kidCount(n) > 0:
         n = kid(n, 0)
-    if n == nil:
+    if astRefIsNil(n):
         return false
-    if n.kind == nkNilLit:
+    if nodeKind(n) == nkNilLit:
         return true
-    if n.kind == nkIdent || n.kind == nkSymbol:
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         let nm: str = semIdentNameNormalized(n)
         return semFnSigFindNormalized(ctx, nm) >= 0
-    if n.kind == nkPrefix && kidCount(n) > 1:
+    if nodeKind(n) == nkPrefix && kidCount(n) > 1:
         let opName: str = semNormalizeName(plainName(kid(n, 0)))
         if opName == "&":
             let inner: Node = kid(n, 1)
-            if inner != nil && (inner.kind == nkIdent || inner.kind == nkSymbol):
+            if astRefNonNil(inner) && (nodeKind(inner) == nkIdent || nodeKind(inner) == nkSymbol):
                 let innerName: str = semIdentNameNormalized(inner)
                 return semFnSigFindNormalized(ctx, innerName) >= 0
             return false
-    if n.kind == nkCall:
+    if nodeKind(n) == nkCall:
         let callInfo: SemCallInfo = semCallInfoNormalized(n)
         if callInfo.name == "__addr" && kidCount(n) > 1:
             let inner2: Node = semCallArgValue(kid(n, 1))
-            if inner2 != nil && (inner2.kind == nkIdent || inner2.kind == nkSymbol):
+            if astRefNonNil(inner2) && (nodeKind(inner2) == nkIdent || nodeKind(inner2) == nkSymbol):
                 let innerName2: str = semIdentNameNormalized(inner2)
                 return semFnSigFindNormalized(ctx, innerName2) >= 0
     return false
 
 fn semCheckSpawnEntryArg(ctx: var SemCtx, argNode: Node, label: str) =
-    if argNode == nil:
+    if astRefIsNil(argNode):
         return
     let val: Node = semCallArgValue(argNode)
-    if val == nil:
+    if astRefIsNil(val):
         return
     if semExprIsBorrowed(ctx, val):
-        semAddError(ctx, val.pos, semThreadBoundaryBorrowMessage("spawn", label))
+        semAddError(ctx, nodePos(val), semThreadBoundaryBorrowMessage("spawn", label))
         return
     if !semExprIsSpawnEntry(ctx, val):
-        semAddError(ctx, val.pos, semSpawnEntryMessage(label))
+        semAddError(ctx, nodePos(val), semSpawnEntryMessage(label))
 
 fn semCallArgNameNormalized(argNode: Node): str =
-    if argNode == nil || argNode.kind != nkCallArg || kidCount(argNode) <= 1:
+    if astRefIsNil(argNode) || nodeKind(argNode) != nkCallArg || kidCount(argNode) <= 1:
         return ""
     let nameNode: Node = kid(argNode, 0)
-    if nameNode == nil || nameNode.kind == nkEmpty:
+    if astRefIsNil(nameNode) || nodeKind(nameNode) == nkEmpty:
         return ""
     return semNormalizeName(plainName(nameNode))
 
@@ -2582,7 +2707,7 @@ fn semCallArgHasName(argNode: Node): bool =
     return semCallArgNameNormalized(argNode) != ""
 
 fn semThreadBoundarySkipArg(name: str, argNode: Node, posIdx: int32): bool =
-    if !semIsThreadBoundaryRequiredNameNormalized(name) || argNode == nil:
+    if !semIsThreadBoundaryRequiredNameNormalized(name) || astRefIsNil(argNode):
         return false
     if !(name == "spawn" || semNameHasQualifiedTail(name, "spawn")):
         return false
@@ -2598,47 +2723,45 @@ fn semThreadBoundarySkipArg(name: str, argNode: Node, posIdx: int32): bool =
     return false
 
 fn semCheckThreadBoundaryCall(ctx: var SemCtx, callNode: Node, callName: str, baseArg: Node) =
-    if callNode == nil || callNode.kind != nkCall:
+    if astRefIsNil(callNode) || nodeKind(callNode) != nkCall:
         return
-    let kids: Node[] = callNode.kids
-    if kids.len == 0:
+    let count: int32 = kidCount(callNode)
+    if count == 0:
         return
     let name: str = callName
     if name ==  "":
         return
     if semIsThreadBoundaryRequiredNameNormalized(name) && ! semIsThreadBoundaryNormalized(ctx, name):
-        semAddError(ctx, callNode.pos, "thread boundary requires @thread_boundary: " + name)
+        semAddError(ctx, nodePos(callNode), "thread boundary requires @thread_boundary: " + name)
         return
     if ctx.threadBoundaryNames.len == 0:
         return
     if ! semIsThreadBoundaryNormalized(ctx, name):
         return
     var baseArg0: Node = baseArg
-    if baseArg0 != nil:
+    if astRefNonNil(baseArg0):
         let sigIdx: int32 = semFnSigFindNormalized(ctx, name)
         if sigIdx >= 0:
             let sigCount: int32 = semReadI32(ctx.fnSigParamCounts, sigIdx)
             let argCount: int32 = kidCount callNode - 1
             if sigCount == argCount:
-                baseArg0 = nil
-    if baseArg0 != nil:
+                baseArg0 = astInvalidNodeId()
+    if astRefNonNil(baseArg0):
         semCheckThreadBoundaryArg(ctx, name, baseArg0, "self/arg1")
     var posIdx: int32 = 0
-    let count: int32 = kids.len
     for i in 1..<count:
         let arg: Node = kid(callNode, i)
-        if arg == nil:
+        if astRefIsNil(arg):
             continue
-        let isPositionalArg: bool = (arg.kind != nkCallArg) || !semCallArgHasName(arg)
+        let isPositionalArg: bool = (nodeKind(arg) != nkCallArg) || !semCallArgHasName(arg)
         if semThreadBoundarySkipArg(name, arg, posIdx):
             let label: str = isPositionalArg ? ("#" + intToStr(posIdx + 1)) : semCallArgNameNormalized(arg)
             semCheckSpawnEntryArg(ctx, arg, label)
             if isPositionalArg:
                 posIdx = posIdx + 1
             continue
-        if arg.kind == nkCallArg:
-            let argKids: Node[] = arg.kids
-            if argKids.len > 1:
+        if nodeKind(arg) == nkCallArg:
+            if kidCount(arg) > 1:
                 let argName: str = plainName kid(arg, 0)
                 semCheckThreadBoundaryArg(ctx, name, arg, argName)
             else:
@@ -2654,10 +2777,10 @@ fn semSendCtorMessage(name: str, label: str): str =
     return "Cross-thread constructor requires Send/Sync: " + name + " argument " + label
 
 fn semCheckSendCtorCall(ctx: var SemCtx, callNode: Node, callName: str) =
-    if callNode == nil || callNode.kind != nkCall:
+    if astRefIsNil(callNode) || nodeKind(callNode) != nkCall:
         return
-    let kids: Node[] = callNode.kids
-    if kids.len == 0:
+    let count: int32 = kidCount(callNode)
+    if count == 0:
         return
     let name: str = callName
     if name ==  "":
@@ -2666,32 +2789,30 @@ fn semCheckSendCtorCall(ctx: var SemCtx, callNode: Node, callName: str) =
        name != "rwLockNew" && name != "atomicNew":
         return
     var posIdx: int32 = 0
-    let count: int32 = kids.len
     for i in 1..<count:
         let arg: Node = kid(callNode, i)
-        if arg == nil:
+        if astRefIsNil(arg):
             continue
-        if arg.kind == nkCallArg:
-            let argKids: Node[] = arg.kids
-            if argKids.len > 1:
+        if nodeKind(arg) == nkCallArg:
+            if kidCount(arg) > 1:
                 let argName: str = plainName kid(arg, 0)
                 let val: Node = semCallArgValue arg
-                if val != nil && ! semExprIsSend(ctx, val):
-                    if ! ((val.kind == nkIdent || val.kind == nkSymbol) && semIsGenericValueParam(ctx, plainName val)):
-                        semAddError(ctx, val.pos, semSendCtorMessage(name, argName))
+                if astRefNonNil(val) && ! semExprIsSend(ctx, val):
+                    if ! ((nodeKind(val) == nkIdent || nodeKind(val) == nkSymbol) && semIsGenericValueParam(ctx, plainName val)):
+                        semAddError(ctx, nodePos(val), semSendCtorMessage(name, argName))
             else:
                 let val2: Node = semCallArgValue arg
-                if val2 != nil && ! semExprIsSend(ctx, val2):
-                    if ! ((val2.kind == nkIdent || val2.kind == nkSymbol) && semIsGenericValueParam(ctx, plainName val2)):
+                if astRefNonNil(val2) && ! semExprIsSend(ctx, val2):
+                    if ! ((nodeKind(val2) == nkIdent || nodeKind(val2) == nkSymbol) && semIsGenericValueParam(ctx, plainName val2)):
                         let argIdx: int32 = posIdx + 1
-                        semAddError(ctx, val2.pos, semSendCtorMessage(name, "#" + intToStr argIdx))
+                        semAddError(ctx, nodePos(val2), semSendCtorMessage(name, "#" + intToStr argIdx))
                 posIdx = posIdx + 1
         else:
             let val2: Node = semCallArgValue arg
-            if val2 != nil && ! semExprIsSend(ctx, val2):
-                if ! ((val2.kind == nkIdent || val2.kind == nkSymbol) && semIsGenericValueParam(ctx, plainName val2)):
+            if astRefNonNil(val2) && ! semExprIsSend(ctx, val2):
+                if ! ((nodeKind(val2) == nkIdent || nodeKind(val2) == nkSymbol) && semIsGenericValueParam(ctx, plainName val2)):
                     let argIdx: int32 = posIdx + 1
-                    semAddError(ctx, val2.pos, semSendCtorMessage(name, "#" + intToStr argIdx))
+                    semAddError(ctx, nodePos(val2), semSendCtorMessage(name, "#" + intToStr argIdx))
             posIdx = posIdx + 1
 
 fn semIsLiteralIdent(name: str): bool =
@@ -2959,35 +3080,35 @@ fn isSemNameDefined(ctx: var SemCtx, name: str): bool =
     return isSemNameDefinedCore(ctx, name)
 
 fn semIsRemovedCastCall(callNode: Node): bool =
-    if callNode == nil || callNode.kind != nkCall || kidCount callNode == 0:
+    if astRefIsNil(callNode) || nodeKind(callNode) != nkCall || kidCount callNode == 0:
         return false
     let callee: Node = kid(callNode, 0)
-    if callee == nil || callee.kind != nkBracketExpr || kidCount callee == 0:
+    if astRefIsNil(callee) || nodeKind(callee) != nkBracketExpr || kidCount callee == 0:
         return false
     let base: Node = kid(callee, 0)
-    if base == nil:
+    if astRefIsNil(base):
         return false
-    if base.kind == nkIdent || base.kind == nkSymbol:
+    if nodeKind(base) == nkIdent || nodeKind(base) == nkSymbol:
         return semNormalizeName(plainName(base)) == "cast"
-    if base.kind == nkDotExpr && kidCount base > 1:
+    if nodeKind(base) == nkDotExpr && kidCount base > 1:
         return semNormalizeName(plainName(kid(base, 1))) == "cast"
     return false
 
 fn semRequireIdentDefined(ctx: var SemCtx, n: Node) =
-    if n == nil:
+    if astRefIsNil(n):
         return
-    if n.kind != nkIdent:
-        if n.kind != nkSymbol:
+    if nodeKind(n) != nkIdent:
+        if nodeKind(n) != nkSymbol:
             return
     let nm: str = semIdentNameNormalized n
     if isSemNameDefinedNormalized(ctx, nm):
         return
-    semAddError(ctx, n.pos, "Undefined identifier '" + nm + "'")
+    semAddError(ctx, nodePos(n), "Undefined identifier '" + nm + "'")
 
 fn semDefinePattern(ctx: var SemCtx, pat: Node) =
-    if pat == nil:
+    if astRefIsNil(pat):
         return
-    case pat.kind
+    case nodeKind(pat)
     of nkPattern:
         if kidCount pat > 0:
             semDefinePattern(ctx, kid(pat, 0))
@@ -2997,7 +3118,7 @@ fn semDefinePattern(ctx: var SemCtx, pat: Node) =
     of nkIdent, nkSymbol:
         let nm: str = semIdentNameNormalized pat
         if ! (nm ==  "_"):
-            defineSemName(ctx, pat.ident)
+            defineSemName(ctx, nodeIdent(pat))
     of nkTupleLit:
         for i in 0..<kidCount pat:
             semDefinePattern(ctx, kid(pat, i))
@@ -3007,7 +3128,7 @@ fn semDefinePattern(ctx: var SemCtx, pat: Node) =
     of nkCall:
         for ci in 1..<kidCount pat:
             let arg: Node = kid(pat, ci)
-            if arg != nil && arg.kind == nkCallArg && kidCount arg > 1:
+            if astRefNonNil(arg) && nodeKind(arg) == nkCallArg && kidCount arg > 1:
                 semDefinePattern(ctx, kid(arg, 1))
             else:
                 semDefinePattern(ctx, arg)
@@ -3017,17 +3138,17 @@ fn semDefinePattern(ctx: var SemCtx, pat: Node) =
     else:
         return
 fn semDefineCasePattern(ctx: var SemCtx, pat: Node) =
-    if pat == nil:
+    if astRefIsNil(pat):
         return
-    case pat.kind
+    case nodeKind(pat)
     of nkPattern:
         if kidCount pat > 0:
             let inner: Node = kid(pat, 0)
-            if inner != nil && (inner.kind == nkIdent || inner.kind == nkSymbol):
+            if astRefNonNil(inner) && (nodeKind(inner) == nkIdent || nodeKind(inner) == nkSymbol):
                 let nm: str = semIdentNameNormalized inner
                 if ! (nm ==  "_"):
-                    defineSemName(ctx, inner.ident)
-            elif inner != nil && inner.kind == nkPar && kidCount inner == 1:
+                    defineSemName(ctx, nodeIdent(inner))
+            elif astRefNonNil(inner) && nodeKind(inner) == nkPar && kidCount inner == 1:
                 semDefineCasePattern(ctx, kid(inner, 0))
     of nkPar:
         if kidCount pat == 1:
@@ -3037,17 +3158,17 @@ fn semDefineCasePattern(ctx: var SemCtx, pat: Node) =
 fn semCollectGlobals(ctx: var SemCtx, root: Node) =
     let semDbg: bool = getEnv "STAGE1_SEM_DEBUG" == "1"
     semDebugLog(semDbg, "[sem-debug] semCollectGlobals:enter")
-    if root == nil:
+    if astRefIsNil(root):
         return
-    if root.kind != nkModule:
-        if root.kind != nkStmtList:
+    if nodeKind(root) != nkModule:
+        if nodeKind(root) != nkStmtList:
             return
     let progressOn: bool = semProgressOn
     var stack: Node[]
     stack.buffer = nil
     stack.len = 0
     stack.cap = 16
-    var visited: Node[]
+    var visited: AstNodeId[]
     visited.cap = 16
     add(stack, root)
     semDebugLog(semDbg, "[sem-debug] semCollectGlobals:init_done len=" + intToStr(stack.len))
@@ -3059,24 +3180,24 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
         let cur: Node = stack[lastIdx]
         semDebugLog(semDbg, "[sem-debug] semCollectGlobals:loop_after_read")
         stack.len = int(lastIdx)
-        if cur == nil:
+        if astRefIsNil(cur):
             continue
-        if cur.kind != nkModule:
-            if cur.kind != nkStmtList:
+        if nodeKind(cur) != nkModule:
+            if nodeKind(cur) != nkStmtList:
                 continue
-        if cur.kind == nkModule:
-            if !semMarkNodeVisited(visited, cur):
+        if nodeKind(cur) == nkModule:
+            if !semMarkNodeIdVisited(visited, cur):
                 continue
         if progressOn:
-            semProgressMaybe(cur.kind, cur.pos, "collect-globals")
+            semProgressMaybe(nodeKind(cur), nodePos(cur), "collect-globals")
         for i in 0..<kidCount cur:
             let n: Node = kid(cur, i)
-            if n == nil:
+            if astRefIsNil(n):
                 continue
-            if n.kind == nkStmtList || n.kind == nkModule:
+            if nodeKind(n) == nkStmtList || nodeKind(n) == nkModule:
                 add(stack, n)
                 continue
-            case n.kind
+            case nodeKind(n)
             of nkFnDecl, nkMacroDecl, nkTemplateDecl, nkIteratorDecl:
                 var fnName: str = ""
                 if kidCount n > 0:
@@ -3088,7 +3209,7 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
                 if hasThreadBoundary && fnName != "":
                     semThreadBoundaryAdd(ctx, fnName)
                 if fnName != "" && semIsThreadBoundaryRequiredNameNormalized(fnName) && !hasThreadBoundary:
-                    semAddError(ctx, n.pos, "thread boundary requires @thread_boundary: " + fnName)
+                    semAddError(ctx, nodePos(n), "thread boundary requires @thread_boundary: " + fnName)
                 let hasBorrows: bool = semFnHasAnnotation(n, "borrows")
                 let hasEscapes: bool = semFnHasAnnotation(n, "escapes")
                 if hasBorrows && fnName != "":
@@ -3096,18 +3217,18 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
                 if hasEscapes && fnName != "":
                     semBorrowEscapeAdd(ctx, fnName)
                 if hasBorrows && hasEscapes && fnName != "":
-                    semAddError(ctx, n.pos, "@borrows and @escapes cannot be used together: " + fnName)
+                    semAddError(ctx, nodePos(n), "@borrows and @escapes cannot be used together: " + fnName)
             of nkTypeDecl:
                 if kidCount n > 0:
                     defineSemName(ctx, plainName kid(n, 0))
                 if kidCount n > 1:
                     let def: Node = kid(n, 1)
-                    if def != nil:
-                        if def.kind == nkEnumDecl:
+                    if astRefNonNil(def):
+                        if nodeKind(def) == nkEnumDecl:
                             for fi in 0..<kidCount def:
                                 let f: Node = kid(def, fi)
-                                if f != nil:
-                                    if f.kind == nkEnumFieldDecl:
+                                if astRefNonNil(f):
+                                    if nodeKind(f) == nkEnumFieldDecl:
                                         if kidCount f > 0:
                                             defineSemName(ctx, plainName kid(f, 0))
             of nkLet, nkVar, nkConst:
@@ -3163,9 +3284,9 @@ fn semImportModuleName(path: str): str =
     return semStripChengExt(semLastPathSegment(path))
 
 fn semDefineImportItem(ctx: var SemCtx, item: Node) =
-    if item == nil:
+    if astRefIsNil(item):
         return
-    case item.kind
+    case nodeKind(item)
     of nkImportAs:
         if kidCount item > 1:
             defineSemName(ctx, plainName(kid(item, 1)))
@@ -3178,74 +3299,73 @@ fn semDefineImportItem(ctx: var SemCtx, item: Node) =
             if kidCount item == 1:
                 defineSemName(ctx, semImportModuleName(plainName(kid(item, 0))))
     of nkIdent, nkSymbol:
-        defineSemName(ctx, semImportModuleName(item.ident))
+        defineSemName(ctx, semImportModuleName(nodeIdent(item)))
     of nkStrLit:
-        defineSemName(ctx, semImportModuleName(item.strVal))
+        defineSemName(ctx, semImportModuleName(nodeStrVal(item)))
     else:
         return
 fn semBindImports(ctx: var SemCtx, root: Node) =
-    if root == nil:
+    if astRefIsNil(root):
         return
     for i in 0..<kidCount root:
         let n: Node = kid(root, i)
-        if n == nil:
+        if astRefIsNil(n):
             continue
-        semProgressMaybe(n.kind, n.pos, "bind-imports")
-        if n.kind == nkImportStmt:
+        semProgressMaybe(nodeKind(n), nodePos(n), "bind-imports")
+        if nodeKind(n) == nkImportStmt:
             ctx.allowUnknown = true
             for j in 0..<kidCount n:
                 semDefineImportItem(ctx, kid(n, j))
-        elif n.kind == nkImportGroup:
+        elif nodeKind(n) == nkImportGroup:
             ctx.allowUnknown = true
             for j in 0..<kidCount n:
                 semDefineImportItem(ctx, kid(n, j))
 
 fn semAnalyzeExprWithCtx(ctx: var SemCtx, expr: Node, allowEmptySeq: bool) =
-    if expr == nil:
+    if astRefIsNil(expr):
         return
-    let kids: Node[] = expr.kids
-    let count: int32 = kids.len
+    let count: int32 = kidCount(expr)
     let profKindOn: bool = semProfOn && semProfExprSampleOn
-    let profKind: NodeKind = expr.kind
+    let profKind: NodeKind = nodeKind(expr)
     var profStartNs: int64 = 0
     if profKindOn:
         profStartNs = cheng_monotime_ns()
-    if expr.kind == nkSeqLit && count == 0:
+    if nodeKind(expr) == nkSeqLit && count == 0:
         if ! allowEmptySeq:
-            semAddError(ctx, expr.pos, "Empty seq literal can only be used in assignment/return/call arguments")
+            semAddError(ctx, nodePos(expr), "Empty seq literal can only be used in assignment/return/call arguments")
         if profKindOn:
             semProfRecordExprKind(profKind, cheng_monotime_ns() - profStartNs)
         return
-    case expr.kind
+    case nodeKind(expr)
     of nkIdent, nkSymbol:
         semRequireIdentDefined(ctx, expr)
         if ctx.borrowActiveTotal > 0:
             semCheckBorrowOriginUse(ctx, expr)
     of nkCallArg:
         if count > 1:
-            semAnalyzeExprWithCtx(ctx, kids[1], allowEmptySeq)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 1), allowEmptySeq)
     of nkPar:
         if count == 1:
-            semAnalyzeExprWithCtx(ctx, kids[0], allowEmptySeq)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 0), allowEmptySeq)
     of nkPrefix:
         if count > 1:
-            semAnalyzeExprWithCtx(ctx, kids[1], allowEmptySeq)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 1), allowEmptySeq)
     of nkInfix:
         if count > 1:
-            semAnalyzeExprWithCtx(ctx, kids[1], allowEmptySeq)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 1), allowEmptySeq)
         if count > 2:
-            semAnalyzeExprWithCtx(ctx, kids[2], allowEmptySeq)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 2), allowEmptySeq)
     of nkDotExpr:
         if count > 0:
-            semAnalyzeExprWithCtx(ctx, kids[0], allowEmptySeq)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 0), allowEmptySeq)
     of nkBracketExpr, nkHiddenDeref, nkDerefExpr:
         if count > 0:
-            semAnalyzeExprWithCtx(ctx, kids[0], allowEmptySeq)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 0), allowEmptySeq)
         for j in 1..<count:
-            semAnalyzeExpr(ctx, kids[j])
+            semAnalyzeExpr(ctx, kid(expr, j))
     of nkCall:
         var callName: str = ""
-        var baseArg: Node = nil
+        var baseArg: Node = astInvalidNodeId()
         if profKindOn:
             let nameStartNs: int64 = cheng_monotime_ns()
             let callInfo: SemCallInfo = semCallInfoNormalized(expr)
@@ -3259,11 +3379,11 @@ fn semAnalyzeExprWithCtx(ctx: var SemCtx, expr: Node, allowEmptySeq: bool) =
             callName = callInfo.name
             baseArg = callInfo.base
         if callName == "cast":
-            var callee: Node = nil
+            var callee: Node = astInvalidNodeId()
             if count > 0:
                 callee = kid(expr, 0)
-            if callee != nil && callee.kind == nkBracketExpr:
-                semAddError(ctx, expr.pos, "cast[T](x) is removed; use T(x)")
+            if astRefNonNil(callee) && nodeKind(callee) == nkBracketExpr:
+                semAddError(ctx, nodePos(expr), "cast[T](x) is removed; use T(x)")
         if callName != "":
             if profKindOn:
                 let varStartNs: int64 = cheng_monotime_ns()
@@ -3296,7 +3416,7 @@ fn semAnalyzeExprWithCtx(ctx: var SemCtx, expr: Node, allowEmptySeq: bool) =
                     if profKindOn:
                         shareStartNs = cheng_monotime_ns()
                     for si in 1..<count:
-                        let arg: Node = kids[si]
+                        let arg: Node = kid(expr, si)
                         let val: Node = semCallArgValue arg
                         semCheckBorrowEscape(ctx, val, "be shared")
                     if profKindOn:
@@ -3304,25 +3424,25 @@ fn semAnalyzeExprWithCtx(ctx: var SemCtx, expr: Node, allowEmptySeq: bool) =
                         semProfCallShareNs = semProfCallShareNs + (shareDelta * int64(semProfExprSampleMul))
                         semProfCallShareCalls = semProfCallShareCalls + semProfExprSampleMul
         if count > 0:
-            semAnalyzeExprWithCtx(ctx, kids[0], false)
+            semAnalyzeExprWithCtx(ctx, kid(expr, 0), false)
         if count > 1:
             var argStartNs: int64 = 0
             if profKindOn:
                 argStartNs = cheng_monotime_ns()
             for i in 1..<count:
-                let argNode: Node = kids[i]
+                let argNode: Node = kid(expr, i)
                 let val: Node = semCallArgValue argNode
-                if val != nil:
-                semAnalyzeExprWithCtx(ctx, val, true)
+                if astRefNonNil(val):
+                    semAnalyzeExprWithCtx(ctx, val, true)
             if profKindOn:
                 let argDelta: int64 = cheng_monotime_ns() - argStartNs
                 semProfCallArgsNs = semProfCallArgsNs + (argDelta * int64(semProfExprSampleMul))
                 semProfCallArgsCalls = semProfCallArgsCalls + semProfExprSampleMul
     of nkComprehension:
-        var pat: Node = nil
-        var iterExpr: Node = nil
-        var cond: Node = nil
-        var body: Node = nil
+        var pat: Node = astInvalidNodeId()
+        var iterExpr: Node = astInvalidNodeId()
+        var cond: Node = astInvalidNodeId()
+        var body: Node = astInvalidNodeId()
         if count > 0:
             pat = kid(expr, 0)
         if count > 1:
@@ -3332,19 +3452,19 @@ fn semAnalyzeExprWithCtx(ctx: var SemCtx, expr: Node, allowEmptySeq: bool) =
         elif count > 3:
             cond = kid(expr, 2)
             body = kid(expr, 3)
-        if iterExpr != nil:
+        if astRefNonNil(iterExpr):
             semAnalyzeExpr(ctx, iterExpr)
         pushSemScope ctx
-        if pat != nil:
+        if astRefNonNil(pat):
             semDefinePattern(ctx, pat)
-        if cond != nil && cond.kind != nkEmpty:
+        if astRefNonNil(cond) && nodeKind(cond) != nkEmpty:
             semAnalyzeExpr(ctx, cond)
-        if body != nil:
+        if astRefNonNil(body):
             semAnalyzeExpr(ctx, body)
         popSemScope ctx
     else:
         for i in 0..<count:
-            semAnalyzeExprWithCtx(ctx, kids[i], false)
+            semAnalyzeExprWithCtx(ctx, kid(expr, i), false)
     if profKindOn:
         semProfRecordExprKind(profKind, cheng_monotime_ns() - profStartNs)
 
@@ -3352,8 +3472,8 @@ fn semAnalyzeExprCore(ctx: var SemCtx, expr: Node) =
     semAnalyzeExprWithCtx(ctx, expr, false)
 
 fn semAnalyzeExpr(ctx: var SemCtx, expr: Node) =
-    if expr != nil && semProgressOn:
-        semProgressMaybe(expr.kind, expr.pos, "analyze-expr")
+    if astRefNonNil(expr) && semProgressOn:
+        semProgressMaybe(nodeKind(expr), nodePos(expr), "analyze-expr")
     if ! semProfOn:
         semAnalyzeExprCore(ctx, expr)
         return
@@ -3370,26 +3490,26 @@ fn semAnalyzeExpr(ctx: var SemCtx, expr: Node) =
     semAnalyzeExprCore(ctx, expr)
 
 fn semAnalyzeExprWrite(ctx: var SemCtx, expr: Node) =
-    if expr == nil:
+    if astRefIsNil(expr):
         return
     let count: int32 = kidCount expr
-    if expr.kind == nkIdent || expr.kind == nkSymbol:
+    if nodeKind(expr) == nkIdent || nodeKind(expr) == nkSymbol:
         semRequireIdentDefined(ctx, expr)
         if ctx.borrowActiveTotal > 0:
             semCheckBorrowOriginWrite(ctx, expr)
         return
-    if expr.kind == nkPar && count == 1:
+    if nodeKind(expr) == nkPar && count == 1:
         semAnalyzeExprWrite(ctx, kid(expr, 0))
         return
-    if expr.kind == nkCallArg && kidCount expr > 1:
+    if nodeKind(expr) == nkCallArg && kidCount expr > 1:
         semAnalyzeExprWrite(ctx, kid(expr, 1))
         return
-    if expr.kind == nkDotExpr:
+    if nodeKind(expr) == nkDotExpr:
         if kidCount expr > 0:
             semAnalyzeExprWrite(ctx, kid(expr, 0))
         # Do not analyze field name as identifier.
         return
-    if expr.kind == nkBracketExpr || expr.kind == nkHiddenDeref || expr.kind == nkDerefExpr:
+    if nodeKind(expr) == nkBracketExpr || nodeKind(expr) == nkHiddenDeref || nodeKind(expr) == nkDerefExpr:
         if kidCount expr > 0:
             semAnalyzeExprWrite(ctx, kid(expr, 0))
         for j in 1..<count:
@@ -3399,47 +3519,49 @@ fn semAnalyzeExprWrite(ctx: var SemCtx, expr: Node) =
         semAnalyzeExpr(ctx, kid(expr, i))
 
 fn semMarkVarParamBorrow(ctx: var SemCtx, fp: Node) =
-    if fp == nil:
+    if astRefIsNil(fp):
         return
-    if fp.kind != nkFormalParams:
+    if nodeKind(fp) != nkFormalParams:
         return
     for i in 0..<kidCount fp:
         let defs: Node = kid(fp, i)
-        if defs != nil && defs.kind == nkIdentDefs && kidCount defs >= 2:
-            let typeNode: Node = kid(defs, 1)
+        if astRefNonNil(defs) && nodeKind(defs) == nkIdentDefs && kidCount defs >= 2:
+            let typeNode: Node = identDefsType(defs)
             if semIsVarTypeNode typeNode:
-                for j in 0..<kidCount defs - 2:
+                let namesN: int32 = identDefsNameCount(defs)
+                for j in 0..<namesN:
                     let pname: str = plainName kid(defs, j)
                     semBorrowMark(ctx, pname, true)
 
 fn semAnalyzeRoutine(ctx: var SemCtx, n: Node) =
-    if n == nil:
+    if astRefIsNil(n):
         return
     pushSemScope ctx
     semGenericScopePush ctx
     if kidCount n > 4:
         let gp: Node = kid(n, 4)
-        if gp != nil && gp.kind == nkGenericParams:
+        if astRefNonNil(gp) && nodeKind(gp) == nkGenericParams:
             for gi in 0..<kidCount gp:
                 let gdef: Node = kid(gp, gi)
-                if gdef != nil && gdef.kind == nkIdentDefs && kidCount gdef > 0:
+                if astRefNonNil(gdef) && nodeKind(gdef) == nkIdentDefs && kidCount gdef > 0:
                     semGenericParamAdd(ctx, plainName kid(gdef, 0))
     if kidCount n > 1:
         let fp: Node = kid(n, 1)
-        if fp != nil:
-            if fp.kind == nkFormalParams:
+        if astRefNonNil(fp):
+            if nodeKind(fp) == nkFormalParams:
                 for i in 0..<kidCount fp:
                     let d: Node = kid(fp, i)
-                    if d != nil:
-                        if d.kind == nkIdentDefs:
-                            if kidCount d > 0:
-                                semDefinePattern(ctx, kid(d, 0))
-                            if kidCount d > 1:
-                                let typeNode: Node = kid(d, 1)
-                                if semIsGenericParamType(ctx, typeNode):
-                                    for j in 0..<kidCount d - 2:
-                                        let pname: str = plainName kid(d, j)
-                                        semGenericValueParamAdd(ctx, pname)
+                    if astRefNonNil(d):
+                        if nodeKind(d) == nkIdentDefs:
+                            let namesN: int32 = identDefsNameCount(d)
+                            if namesN > 0:
+                                for j in 0..<namesN:
+                                    semDefinePattern(ctx, kid(d, j))
+                            let typeNode: Node = identDefsType(d)
+                            if semIsGenericParamType(ctx, typeNode):
+                                for j in 0..<namesN:
+                                    let pname: str = plainName kid(d, j)
+                                    semGenericValueParamAdd(ctx, pname)
             semMarkVarParamBorrow(ctx, fp)
             semMarkParamSend(ctx, fp)
     if kidCount n > 3:
@@ -3448,16 +3570,15 @@ fn semAnalyzeRoutine(ctx: var SemCtx, n: Node) =
     popSemScope ctx
 
 fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
-    if stmt == nil:
+    if astRefIsNil(stmt):
         return
-    let kids: Node[] = stmt.kids
-    let count: int32 = kids.len
+    let count: int32 = kidCount(stmt)
     let profKindOn: bool = semProfOn && semProfStmtSampleOn
-    let profKind: NodeKind = stmt.kind
+    let profKind: NodeKind = nodeKind(stmt)
     var profStartNs: int64 = 0
     if profKindOn:
         profStartNs = cheng_monotime_ns()
-    case stmt.kind
+    case nodeKind(stmt)
     of nkStmtList, nkModule:
         for i in 0..<count:
             semAnalyzeStmt(ctx, kid(stmt, i))
@@ -3465,47 +3586,47 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
         pushSemScope ctx
         if count > 1:
             let body: Node = kid(stmt, 1)
-            if body != nil:
+            if astRefNonNil(body):
                 semAnalyzeStmt(ctx, body)
         popSemScope ctx
     of nkFnDecl, nkMacroDecl, nkTemplateDecl, nkIteratorDecl:
-        if !semMarkNodeVisited(semStmtVisitedDecls, stmt):
+        if !semMarkNodeIdVisited(semStmtVisitedDecls, stmt):
             if profKindOn:
                 semProfRecordStmtKind(profKind, cheng_monotime_ns() - profStartNs)
             return
         semAnalyzeRoutine(ctx, stmt)
     of nkLet, nkVar, nkConst:
-        var pat: Node = nil
+        var pat: Node = astInvalidNodeId()
         if count > 0:
             pat = kid(stmt, 0)
-        var typeNode: Node = nil
+        var typeNode: Node = astInvalidNodeId()
         if count > 1:
             typeNode = kid(stmt, 1)
-        var init: Node = nil
+        var init: Node = astInvalidNodeId()
         if count > 2:
             init = kid(stmt, 2)
-        let hasInit: bool = init != nil && init.kind != nkEmpty
+        let hasInit: bool = astRefNonNil(init) && nodeKind(init) != nkEmpty
         let bindingType: Node = semBindingTypeNode(pat, typeNode)
-        if ! hasInit &&(bindingType == nil || bindingType.kind == nkEmpty):
-            semAddError(ctx, stmt.pos, "Binding requires a type annotation or initializer")
+        if ! hasInit &&(astRefIsNil(bindingType) || nodeKind(bindingType) == nkEmpty):
+            semAddError(ctx, nodePos(stmt), "Binding requires a type annotation or initializer")
         let initExpr: Node = semStripParExpr init
-        if hasInit && initExpr != nil && initExpr.kind == nkSeqLit && initExpr.kids.len == 0:
-            if bindingType == nil || bindingType.kind == nkEmpty:
-                semAddError(ctx, initExpr.pos, "Empty list literal requires a type annotation; e.g. let xs: T[] = []")
-        if pat != nil:
+        if hasInit && astRefNonNil(initExpr) && nodeKind(initExpr) == nkSeqLit && kidCount(initExpr) == 0:
+            if astRefIsNil(bindingType) || nodeKind(bindingType) == nkEmpty:
+                semAddError(ctx, nodePos(initExpr), "Empty list literal requires a type annotation; e.g. let xs: T[] = []")
+        if astRefNonNil(pat):
             semDefinePattern(ctx, pat)
         var sendable: bool = false
-        if bindingType != nil && bindingType.kind != nkEmpty:
+        if astRefNonNil(bindingType) && nodeKind(bindingType) != nkEmpty:
             sendable = semTypeIsSend bindingType
         elif hasInit:
             sendable = semExprIsSend(ctx, init)
-        if pat != nil:
+        if astRefNonNil(pat):
             semSendMarkPattern(ctx, pat, sendable)
         if hasInit:
             var initBorrowed: bool = semExprIsBorrowed(ctx, init)
             if ! initBorrowed:
-                if initExpr != nil && (initExpr.kind == nkIdent || initExpr.kind == nkSymbol):
-                    if semBorrowIsActive(ctx, initExpr.ident):
+                if astRefNonNil(initExpr) && (nodeKind(initExpr) == nkIdent || nodeKind(initExpr) == nkSymbol):
+                    if semBorrowIsActive(ctx, nodeIdent(initExpr)):
                         initBorrowed = true
             var origin: str = ""
             if initBorrowed:
@@ -3513,16 +3634,16 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
             semAnalyzeExprWithCtx(ctx, init, true)
             let patIdent: Node = semPatternIdent pat
             if initBorrowed:
-                if patIdent != nil:
-                    semBorrowMarkWithOrigin(ctx, patIdent.ident, true, origin)
+                if astRefNonNil(patIdent):
+                    semBorrowMarkWithOrigin(ctx, nodeIdent(patIdent), true, origin)
                 else:
                     semBorrowMarkPatternWithOrigin(ctx, pat, origin)
             else:
-                if patIdent != nil:
-                    semBorrowMarkWithOrigin(ctx, patIdent.ident, false, "")
+                if astRefNonNil(patIdent):
+                    semBorrowMarkWithOrigin(ctx, nodeIdent(patIdent), false, "")
                 else:
                     semBorrowMarkPattern(ctx, pat, false)
-        elif bindingType != nil && bindingType.kind != nkEmpty:
+        elif astRefNonNil(bindingType) && nodeKind(bindingType) != nkEmpty:
             semBorrowMarkPattern(ctx, pat, false)
     of nkIf, nkWhen:
         var i: int32 = 0
@@ -3537,7 +3658,7 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                 semProfIfCondCalls = semProfIfCondCalls + semProfStmtSampleMul
             else:
                 semAnalyzeExpr(ctx, cond)
-            if body != nil:
+            if astRefNonNil(body):
                 pushSemScope ctx
                 if semProfOn && semProfStmtSampleOn:
                     let startNs2: int64 = cheng_monotime_ns()
@@ -3562,7 +3683,7 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                 semAnalyzeExpr(ctx, cond)
         if count > 1:
             let body: Node = kid(stmt, 1)
-            if body != nil:
+            if astRefNonNil(body):
                 pushSemScope ctx
                 if semProfOn && semProfStmtSampleOn:
                     let startNs2: int64 = cheng_monotime_ns()
@@ -3588,7 +3709,7 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
             semDefinePattern(ctx, kid(stmt, 0))
         if count > 2:
             let body: Node = kid(stmt, 2)
-            if body != nil:
+            if astRefNonNil(body):
                 if semProfOn && semProfStmtSampleOn:
                     let startNs2: int64 = cheng_monotime_ns()
                     semAnalyzeStmt(ctx, body)
@@ -3610,19 +3731,17 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                 semAnalyzeExpr(ctx, kid(stmt, 0))
         for i in 1..<count:
             let br: Node = kid(stmt, i)
-            if br == nil:
+            if astRefIsNil(br):
                 continue
-            if br.kind == nkOfBranch:
+            if nodeKind(br) == nkOfBranch:
                 pushSemScope ctx
                 var bi: int32 = 0
-                let brKids: Node[] = br.kids
-                let brCount: int32 = brKids.len
+                let brCount: int32 = kidCount(br)
                 while bi + 1 < brCount:
                     let ent: Node = kid(br, bi)
-                    if ent != nil:
-                        if ent.kind == nkGuard:
-                            let entKids: Node[] = ent.kids
-                            if entKids.len > 0:
+                    if astRefNonNil(ent):
+                        if nodeKind(ent) == nkGuard:
+                            if kidCount(ent) > 0:
                                 semAnalyzeExpr(ctx, kid(ent, 0))
                         else:
                             semDefineCasePattern(ctx, ent)
@@ -3637,11 +3756,10 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                     else:
                         semAnalyzeStmt(ctx, kid(br, brCount - 1))
                 popSemScope ctx
-            elif br.kind == nkElse:
-                let brKids: Node[] = br.kids
-                if brKids.len > 0:
+            elif nodeKind(br) == nkElse:
+                if kidCount(br) > 0:
                     let body: Node = kid(br, 0)
-                    if body != nil:
+                    if astRefNonNil(body):
                         pushSemScope ctx
                         if semProfOn && semProfStmtSampleOn:
                             let startNs3: int64 = cheng_monotime_ns()
@@ -3655,25 +3773,25 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
     of nkReturn, nkYield:
         for i in 0..<count:
             let expr: Node = kid(stmt, i)
-            if stmt.kind == nkReturn:
+            if nodeKind(stmt) == nkReturn:
                 semAnalyzeExprWithCtx(ctx, expr, true)
             else:
                 semAnalyzeExpr(ctx, expr)
             var what: str = "be yielded"
-            if stmt.kind == nkReturn:
+            if nodeKind(stmt) == nkReturn:
                 what = "be returned"
             semCheckBorrowEscape(ctx, expr, what)
     of nkBreak, nkContinue, nkDefer:
         for i in 0..<count:
             semAnalyzeExpr(ctx, kid(stmt, i))
     of nkAsgn, nkFastAsgn:
-        var lhs: Node = nil
+        var lhs: Node = astInvalidNodeId()
         if count > 0:
             lhs = kid(stmt, 0)
-        var rhs: Node = nil
+        var rhs: Node = astInvalidNodeId()
         if count > 1:
             rhs = kid(stmt, 1)
-        if lhs != nil:
+        if astRefNonNil(lhs):
             if semProfOn && semProfStmtSampleOn:
                 let startNs: int64 = cheng_monotime_ns()
                 semAnalyzeExprWrite(ctx, lhs)
@@ -3682,7 +3800,7 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                 semProfAsgnLhsCalls = semProfAsgnLhsCalls + semProfStmtSampleMul
             else:
                 semAnalyzeExprWrite(ctx, lhs)
-        if rhs != nil:
+        if astRefNonNil(rhs):
             if semProfOn && semProfStmtSampleOn:
                 let startNs2: int64 = cheng_monotime_ns()
                 semAnalyzeExprWithCtx(ctx, rhs, true)
@@ -3691,7 +3809,7 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                 semProfAsgnRhsCalls = semProfAsgnRhsCalls + semProfStmtSampleMul
             else:
                 semAnalyzeExprWithCtx(ctx, rhs, true)
-            if lhs != nil && (lhs.kind == nkIdent || lhs.kind == nkSymbol):
+            if astRefNonNil(lhs) && (nodeKind(lhs) == nkIdent || nodeKind(lhs) == nkSymbol):
                 var rhsBorrowed: bool = false
                 if semProfOn && semProfStmtSampleOn:
                     let startNsB: int64 = cheng_monotime_ns()
@@ -3703,8 +3821,8 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                     rhsBorrowed = semExprIsBorrowed(ctx, rhs)
                 if ! rhsBorrowed:
                     let rhsExpr: Node = semStripParExpr rhs
-                    if rhsExpr != nil && (rhsExpr.kind == nkIdent || rhsExpr.kind == nkSymbol):
-                        if semBorrowIsActive(ctx, rhsExpr.ident):
+                    if astRefNonNil(rhsExpr) && (nodeKind(rhsExpr) == nkIdent || nodeKind(rhsExpr) == nkSymbol):
+                        if semBorrowIsActive(ctx, nodeIdent(rhsExpr)):
                             rhsBorrowed = true
                 var rhsSendable: bool = false
                 if semProfOn && semProfStmtSampleOn:
@@ -3717,7 +3835,7 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
                     rhsSendable = semExprIsSend(ctx, rhs)
                 let lname: str = plainName lhs
                 if rhsBorrowed && semFindDefDepth(ctx, lname) == 0:
-                    semAddError(ctx, rhs.pos, semBorrowEscapeMessage("be written to global", semBorrowRootName(ctx, rhs)))
+                    semAddError(ctx, nodePos(rhs), semBorrowEscapeMessage("be written to global", semBorrowRootName(ctx, rhs)))
                 if rhsBorrowed:
                     let origin: str = semBorrowOriginName(ctx, rhs)
                     semBorrowMarkWithOrigin(ctx, lname, true, origin)
@@ -3734,13 +3852,13 @@ fn semAnalyzeStmtCore(ctx: var SemCtx, stmt: Node) =
         semProfRecordStmtKind(profKind, cheng_monotime_ns() - profStartNs)
 
 fn semAnalyzeStmt(ctx: var SemCtx, stmt: Node) =
-    if stmt == nil:
+    if astRefIsNil(stmt):
         return
-    if stmt.kind == nkModule || stmt.kind == nkStmtList:
-        if !semMarkNodeVisited(semStmtVisitedModules, stmt):
+    if nodeKind(stmt) == nkModule || nodeKind(stmt) == nkStmtList:
+        if !semMarkNodeIdVisited(semStmtVisitedModules, stmt):
             return
-    if stmt != nil && semProgressOn:
-        semProgressMaybe(stmt.kind, stmt.pos, "analyze-stmt")
+    if astRefNonNil(stmt) && semProgressOn:
+        semProgressMaybe(nodeKind(stmt), nodePos(stmt), "analyze-stmt")
     if ! semProfOn:
         semAnalyzeStmtCore(ctx, stmt)
         return
@@ -3756,8 +3874,9 @@ fn semAnalyzeStmt(ctx: var SemCtx, stmt: Node) =
         return
     semAnalyzeStmtCore(ctx, stmt)
 
-fn checkSemantics(root: Node, diags: var Diagnostic[], ownershipEnabled: bool, orcStrictWarn: bool) =
-    if root == nil:
+fn checkSemanticsId(rootId: AstNodeId, diags: var Diagnostic[], ownershipEnabled: bool, orcStrictWarn: bool) =
+    let root: Node = rootId
+    if astRefIsNil(root):
         return
     let semDbg: bool = getEnv "STAGE1_SEM_DEBUG" == "1"
     semDebugLog(semDbg, "[sem-debug] checkSemantics:enter")
@@ -3841,9 +3960,9 @@ fn checkSemantics(root: Node, diags: var Diagnostic[], ownershipEnabled: bool, o
     hashmaps.hashMapStrIntClear(semNormalizeIndexStr)
     freeSeq[str](semNormalizeValues)
     semNormalizeValues.cap = 256
-    freeSeq[Node](semStmtVisitedModules)
+    freeSeq[AstNodeId](semStmtVisitedModules)
     semStmtVisitedModules.cap = 512
-    freeSeq[Node](semStmtVisitedDecls)
+    freeSeq[AstNodeId](semStmtVisitedDecls)
     semStmtVisitedDecls.cap = 512
     semSendEpoch = 1
     semBorrowEpoch = 1
@@ -3854,7 +3973,7 @@ fn checkSemantics(root: Node, diags: var Diagnostic[], ownershipEnabled: bool, o
     initSemCtxInPlace(ctx)
     semDebugLog(semDbg, "[sem-debug] checkSemantics:ctx_init_done")
     ctx.diags = diags
-    ctx.filename = root.strVal
+    ctx.filename = nodeStrVal(root)
     ctx.allowUnknown = true
     ctx.ownershipEnabled = ownershipEnabled
     ctx.orcStrictWarn = orcStrictWarn
@@ -3864,13 +3983,13 @@ fn checkSemantics(root: Node, diags: var Diagnostic[], ownershipEnabled: bool, o
     semDebugLog(semDbg, "[sem-debug] checkSemantics:ctx_ready")
     let enforceStdNoPointer: bool = semShouldEnforceStdNoPointer()
     if enforceStdNoPointer:
-        let stdPointerViolations: int32 = semCheckStdNoPointerPolicy(ctx, root)
+        let stdPointerViolations: int32 = semCheckStdNoPointerPolicy(ctx, rootId)
         if stdPointerViolations > 0:
             diags = ctx.diags
             return
     let enforceNonCAbiNoPointer: bool = semShouldEnforceNonCAbiNoPointer()
     if enforceNonCAbiNoPointer:
-        let nonCAbiPointerViolations: int32 = semCheckNoPointerNonCAbiPolicy(ctx, root)
+        let nonCAbiPointerViolations: int32 = semCheckNoPointerNonCAbiPolicy(ctx, rootId)
         if nonCAbiPointerViolations > 0:
             diags = ctx.diags
             return

@@ -120,8 +120,7 @@ type
 
     X509CertList =
         count: int32
-        # Store pointers and allocate stable storage per slot.
-        items: X509Certificate*[x509MaxChain]
+        items: X509Certificate[x509MaxChain]
 
     X509RevocationMode = enum
         X509RevocationOff = 0
@@ -171,18 +170,6 @@ fn initX509Certificate(): X509Certificate =
 fn initX509CertList(): X509CertList =
     X509CertList(count: 0)
 
-fn x509CertListEnsureSlot(list: var X509CertList, idx: int32): X509Certificate* =
-    if idx < 0 || idx >= x509MaxChain:
-        return nil
-    if list.items[idx] != nil:
-        return list.items[idx]
-    let mem: void* = alloc(sizeof X509Certificate)
-    if mem == nil:
-        return nil
-    zeroMem(mem, sizeof X509Certificate)
-    list.items[idx] = X509Certificate*(mem)
-    return list.items[idx]
-
 fn initX509Crl(): X509Crl =
     X509Crl(
         issuer: emptyBytes(),
@@ -194,10 +181,7 @@ fn initX509Crl(): X509Crl =
 fn x509CertListAdd(list: var X509CertList, cert: X509Certificate): Result[bool] =
     if list.count >= x509MaxChain:
         return Err[bool]("x509: cert list full")
-    let slot: X509Certificate* = x509CertListEnsureSlot(list, list.count)
-    if slot == nil:
-        return Err[bool]("x509: cert list alloc failed")
-    *slot = cert
+    list.items[list.count] = cert
     list.count = list.count + 1
     return Ok[bool](true)
 
@@ -205,29 +189,22 @@ fn x509CertListAllocSlot(list: var X509CertList): Result[int32] =
     if list.count >= x509MaxChain:
         return Err[int32]("x509: cert list full")
     let idx: int32 = list.count
-    let slot: X509Certificate* = x509CertListEnsureSlot(list, idx)
-    if slot == nil:
-        return Err[int32]("x509: cert list alloc failed")
-    *slot = initX509Certificate()
+    list.items[idx] = initX509Certificate()
     list.count = list.count + 1
     return Ok[int32](idx)
 
 
-fn x509CertListFindBySubject(list: X509CertList*, subject: Bytes): Result[X509Certificate*] =
-    if void*(list) == nil:
-        return Err[X509Certificate*]("x509: issuer ! found")
+fn x509CertListFindBySubject(list: X509CertList, subject: Bytes): Result[X509Certificate] =
     for i in 0..<list.count:
-        let p: X509Certificate* = list.items[i]
-        if p != nil && bytesEqual(p.subject, subject):
-            return Ok[X509Certificate*](p)
-    return Err[X509Certificate*]("x509: issuer ! found")
+        let cert: X509Certificate = list.items[i]
+        if bytesEqual(cert.subject, subject):
+            return Ok[X509Certificate](cert)
+    return Err[X509Certificate]("x509: issuer ! found")
 
-fn x509CertListFindBySubjectIndex(list: X509CertList*, subject: Bytes): int32 =
-    if void*(list) == nil:
-        return -1
+fn x509CertListFindBySubjectIndex(list: X509CertList, subject: Bytes): int32 =
     for i in 0..<list.count:
-        let p: X509Certificate* = list.items[i]
-        if p != nil && bytesEqual(p.subject, subject):
+        let cert: X509Certificate = list.items[i]
+        if bytesEqual(cert.subject, subject):
             return i
     return -1
 
@@ -977,12 +954,11 @@ fn x509CertListAddDer(list: var X509CertList, der: Bytes): Result[bool] =
     if list.count >= x509MaxChain:
         return Err[bool]("x509: cert list full")
     let idx: int32 = list.count
-    let slot: X509Certificate* = x509CertListEnsureSlot(list, idx)
-    if slot == nil:
-        return Err[bool]("x509: cert list alloc failed")
-    let parseRes: Result[bool] = x509ParseCertificateInto(*slot, der)
+    var cert: X509Certificate = initX509Certificate()
+    let parseRes: Result[bool] = x509ParseCertificateInto(cert, der)
     if IsErr(parseRes):
         return Err[bool](Error(parseRes))
+    list.items[idx] = cert
     list.count = list.count + 1
     return Ok[bool](true)
 
@@ -991,8 +967,8 @@ fn x509LeftPad(data: Bytes, length: int32): Result[Bytes] =
         return Err[Bytes]("x509: integer too large")
     let out: Bytes = bytesAlloc(length)
     let offset: int32 = length - bytesLen(data)
-    if bytesLen(data) > 0:
-        copyMem(ptr_add(out.data, offset), data.data, bytesLen(data))
+    for i in 0..<bytesLen(data):
+        bytesSet(out, offset + i, bytesGet(data, i))
     return Ok[Bytes](out)
 
 fn x509DecodeEcdsaSignature(sig: Bytes): Result[Bytes] =
@@ -1012,14 +988,15 @@ fn x509DecodeEcdsaSignature(sig: Bytes): Result[Bytes] =
     let sPadRes: Result[Bytes] = x509LeftPad(Value(sRes).value, 32)
     if IsErr(sPadRes):
         return Err[Bytes](Error(sPadRes))
+    var rPad: Bytes = Value(rPadRes)
+    var sPad: Bytes = Value(sPadRes)
     let out: Bytes = bytesAlloc(64)
-    copyMem(out.data, Value(rPadRes).data, 32)
-    copyMem(ptr_add(out.data, 32), Value(sPadRes).data, 32)
+    for i in 0..<32:
+        bytesSet(out, i, bytesGet(rPad, i))
+        bytesSet(out, 32 + i, bytesGet(sPad, i))
     return Ok[Bytes](out)
 
-fn x509VerifySignature(cert: X509Certificate*, issuer: X509Certificate*): Result[bool] =
-    if void*(cert) == nil || void*(issuer) == nil:
-        return Err[bool]("x509: invalid signature args")
+fn x509VerifySignature(cert: X509Certificate, issuer: X509Certificate): Result[bool] =
     if cert.sigAlg == X509SigUnknown:
         return Err[bool]("x509: unsupported signature algorithm kind=unknown")
     if cert.sigAlg == X509SigRsaSha256 || cert.sigAlg == X509SigRsaSha384:
@@ -1061,18 +1038,14 @@ fn x509VerifySignature(cert: X509Certificate*, issuer: X509Certificate*): Result
         return Err[bool]("x509: ecdsa sha384 unsupported")
     return Err[bool]("x509: unsupported signature algorithm kind=" + x509IntToString(int64(cert.sigAlg)))
 
-fn x509VerifyValidity(cert: X509Certificate*, now: int64): Result[bool] =
-    if void*(cert) == nil:
-        return Err[bool]("x509: invalid validity args")
+fn x509VerifyValidity(cert: X509Certificate, now: int64): Result[bool] =
     if cert.notBefore > 0 && now < cert.notBefore:
         return Err[bool]("x509: ! yet valid")
     if cert.notAfter > 0 && now > cert.notAfter:
         return Err[bool]("x509: expired")
     return Ok[bool](true)
 
-fn x509VerifyLeafConstraints(cert: X509Certificate*): Result[bool] =
-    if void*(cert) == nil:
-        return Err[bool]("x509: invalid constraints args")
+fn x509VerifyLeafConstraints(cert: X509Certificate): Result[bool] =
     if cert.hasUnknownCritical:
         return Err[bool]("x509: unknown critical extension")
     if cert.hasBasicConstraints && cert.isCa:
@@ -1083,9 +1056,7 @@ fn x509VerifyLeafConstraints(cert: X509Certificate*): Result[bool] =
         return Err[bool]("x509: leaf missing serverAuth eku")
     return Ok[bool](true)
 
-fn x509VerifyCaConstraints(cert: X509Certificate*): Result[bool] =
-    if void*(cert) == nil:
-        return Err[bool]("x509: invalid ca constraints args")
+fn x509VerifyCaConstraints(cert: X509Certificate): Result[bool] =
     if cert.hasUnknownCritical:
         return Err[bool]("x509: ca has unknown critical extension")
     if ! cert.hasBasicConstraints || ! cert.isCa:
@@ -1094,14 +1065,10 @@ fn x509VerifyCaConstraints(cert: X509Certificate*): Result[bool] =
         return Err[bool]("x509: ca missing keyCertSign")
     return Ok[bool](true)
 
-fn x509IsSelfSigned(cert: X509Certificate*): bool =
-    if void*(cert) == nil:
-        return false
+fn x509IsSelfSigned(cert: X509Certificate): bool =
     return bytesEqual(cert.issuer, cert.subject)
 
-fn x509VerifySelfSigned(cert: X509Certificate*): Result[bool] =
-    if void*(cert) == nil:
-        return Err[bool]("x509: invalid self-signed args")
+fn x509VerifySelfSigned(cert: X509Certificate): Result[bool] =
     if ! x509IsSelfSigned(cert):
         return Err[bool]("x509: ! self-signed")
     let sigRes: Result[bool] = x509VerifySignature(cert, cert)
@@ -1111,18 +1078,14 @@ fn x509VerifySelfSigned(cert: X509Certificate*): Result[bool] =
         return Err[bool]("x509: self-signature invalid")
     return Ok[bool](true)
 
-fn x509VerifyChain(leaf: X509Certificate*, intermediates: X509CertList*, roots: X509CertList*, now: int64): Result[bool] =
-    if void*(intermediates) == nil || void*(roots) == nil:
-        return Err[bool]("x509: verify chain invalid args")
-    if void*(leaf) == nil:
-        return Err[bool]("x509: verify chain invalid leaf")
+fn x509VerifyChain(leaf: X509Certificate, intermediates: X509CertList, roots: X509CertList, now: int64): Result[bool] =
     let leafTimeRes: Result[bool] = x509VerifyValidity(leaf, now)
     if IsErr(leafTimeRes):
         return Err[bool](Error(leafTimeRes))
     let leafRes: Result[bool] = x509VerifyLeafConstraints(leaf)
     if IsErr(leafRes):
         return Err[bool](Error(leafRes))
-    var current: X509Certificate* = leaf
+    var current: X509Certificate = leaf
     var depth: int32 = 0
     let __for_guard_start_depth_1 = depth
     for __for_guard_depth_1 in __for_guard_start_depth_1..<x509MaxChain:
@@ -1138,9 +1101,7 @@ fn x509VerifyChain(leaf: X509Certificate*, intermediates: X509CertList*, roots: 
             return Ok[bool](true)
         let issuerIdx: int32 = x509CertListFindBySubjectIndex(intermediates, current.issuer)
         if issuerIdx >= 0:
-            let issuerPtr: X509Certificate* = intermediates.items[issuerIdx]
-            if issuerPtr == nil:
-                return Err[bool]("x509: issuer ! found")
+            let issuerPtr: X509Certificate = intermediates.items[issuerIdx]
             let caRes: Result[bool] = x509VerifyCaConstraints(issuerPtr)
             if IsErr(caRes):
                 return Err[bool](Error(caRes))
@@ -1173,9 +1134,7 @@ fn x509VerifyChain(leaf: X509Certificate*, intermediates: X509CertList*, roots: 
             continue
         let rootIdx: int32 = x509CertListFindBySubjectIndex(roots, current.issuer)
         if rootIdx >= 0:
-            let rootPtr: X509Certificate* = roots.items[rootIdx]
-            if rootPtr == nil:
-                return Err[bool]("x509: issuer ! found")
+            let rootPtr: X509Certificate = roots.items[rootIdx]
             let caRes: Result[bool] = x509VerifyCaConstraints(rootPtr)
             if IsErr(caRes):
                 return Err[bool](Error(caRes))
@@ -1259,9 +1218,7 @@ fn x509MatchDnsName(host: str, pattern: str): bool =
         return true
     return (host == pattern)
 
-fn x509VerifyHostname(cert: X509Certificate*, host: str): bool =
-    if void*(cert) == nil:
-        return false
+fn x509VerifyHostname(cert: X509Certificate, host: str): bool =
     let normalized: str = x509TrimTrailingDot(x509LowerAscii(host))
     if len(normalized) <= 0:
         return false
@@ -1294,13 +1251,10 @@ fn x509PublicKeyBytes(pub: X509PublicKey): Result[Bytes] =
 fn x509VerifySignatureBytes(
     sigAlg: X509SignatureKind,
     pssHash: X509HashKind,
-    issuer: X509Certificate*,
+    issuer: X509Certificate,
     msg: Bytes,
     sig: Bytes
 ): Result[bool] =
-    
-    if void*(issuer) == nil:
-        return Err[bool]("x509: invalid signature issuer")
     if sigAlg == X509SigRsaSha256 || sigAlg == X509SigRsaSha384:
         if issuer.publicKey.kind != X509KeyRsa:
             return Err[bool]("x509: rsa signature with non-rsa issuer")
@@ -1416,9 +1370,7 @@ fn x509ParseCrlTbs(tbsValue: Bytes): Result[X509Crl] =
             listOff = Value(entryRes).next
     return Ok[X509Crl](crl)
 
-fn x509VerifyCrl(der: Bytes, issuer: X509Certificate*, now: int64): Result[X509Crl] =
-    if void*(issuer) == nil:
-        return Err[X509Crl]("x509: crl invalid issuer")
+fn x509VerifyCrl(der: Bytes, issuer: X509Certificate, now: int64): Result[X509Crl] =
     let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(der, 0)
     if IsErr(seqRes):
         return Err[X509Crl](Error(seqRes))
@@ -1455,13 +1407,10 @@ fn x509VerifyCrl(der: Bytes, issuer: X509Certificate*, now: int64): Result[X509C
 
 fn x509VerifyOcspResponse(
     ocsp: Bytes,
-    leaf: X509Certificate*,
-    issuer: X509Certificate*,
+    leaf: X509Certificate,
+    issuer: X509Certificate,
     now: int64
 ): Result[X509RevocationStatus] =
-    
-    if void*(leaf) == nil || void*(issuer) == nil:
-        return Err[X509RevocationStatus]("x509: ocsp invalid args")
     if bytesLen(ocsp) <= 0:
         return Err[X509RevocationStatus]("x509: ocsp empty")
     let respRes: Result[Asn1ValueNext] = asn1DecodeSequence(ocsp, 0)
@@ -1633,28 +1582,22 @@ fn x509VerifyOcspResponse(
     return Ok[X509RevocationStatus](status)
 
 fn x509FindIssuer(
-    leaf: X509Certificate*,
-    intermediates: X509CertList*,
-    roots: X509CertList*
-): Result[X509Certificate*] =
-    
-    if void*(leaf) == nil || void*(intermediates) == nil || void*(roots) == nil:
-        return Err[X509Certificate*]("x509: issuer ! found")
+    leaf: X509Certificate,
+    intermediates: X509CertList,
+    roots: X509CertList
+): Result[X509Certificate] =
     if bytesLen(leaf.issuer) <= 0:
-        return Err[X509Certificate*]("x509: issuer missing")
-    let interRes: Result[X509Certificate*] = x509CertListFindBySubject(intermediates, leaf.issuer)
+        return Err[X509Certificate]("x509: issuer missing")
+    let interRes: Result[X509Certificate] = x509CertListFindBySubject(intermediates, leaf.issuer)
     if IsOk(interRes):
         return interRes
     return x509CertListFindBySubject(roots, leaf.issuer)
 
 fn x509FindIssuerIndex(
-    leaf: X509Certificate*,
-    intermediates: X509CertList*,
-    roots: X509CertList*
+    leaf: X509Certificate,
+    intermediates: X509CertList,
+    roots: X509CertList
 ): Result[int32] =
-    
-    if void*(leaf) == nil || void*(intermediates) == nil || void*(roots) == nil:
-        return Err[int32]("x509: issuer ! found")
     if bytesLen(leaf.issuer) <= 0:
         return Err[int32]("x509: issuer missing")
     let interIdx: int32 = x509CertListFindBySubjectIndex(intermediates, leaf.issuer)
@@ -1666,8 +1609,8 @@ fn x509FindIssuerIndex(
     return Err[int32]("x509: issuer ! found")
 
 fn x509VerifyRevocationWithIssuer(
-    leaf: X509Certificate*,
-    issuer: X509Certificate*,
+    leaf: X509Certificate,
+    issuer: X509Certificate,
     ocsp: Bytes,
     crls: Bytes[x509MaxCrls],
     crlCount: int32,
@@ -1709,20 +1652,17 @@ fn x509VerifyRevocationWithIssuer(
     return Ok[bool](true)
 
 fn x509VerifyRevocation(
-    leaf: X509Certificate*,
-    intermediates: X509CertList*,
-    roots: X509CertList*,
+    leaf: X509Certificate,
+    intermediates: X509CertList,
+    roots: X509CertList,
     ocsp: Bytes,
     crls: Bytes[x509MaxCrls],
     crlCount: int32,
     now: int64,
     mode: X509RevocationMode
 ): Result[bool] =
-    
     if mode == X509RevocationOff:
         return Ok[bool](true)
-    if void*(leaf) == nil || void*(intermediates) == nil || void*(roots) == nil:
-        return Err[bool]("x509: revocation invalid args")
     let issuerIdxRes: Result[int32] = x509FindIssuerIndex(leaf, intermediates, roots)
     if IsErr(issuerIdxRes):
         if mode == X509RevocationStrict:
@@ -1730,12 +1670,8 @@ fn x509VerifyRevocation(
         return Ok[bool](true)
     let issuerIdx: int32 = Value(issuerIdxRes)
     if issuerIdx >= 0:
-        let issuerPtr: X509Certificate* = intermediates.items[issuerIdx]
-        if issuerPtr == nil:
-            return Err[bool]("x509: issuer ! found")
+        let issuerPtr: X509Certificate = intermediates.items[issuerIdx]
         return x509VerifyRevocationWithIssuer(leaf, issuerPtr, ocsp, crls, crlCount, now, mode)
     let rootIdx: int32 = -issuerIdx - 1
-    let rootPtr: X509Certificate* = roots.items[rootIdx]
-    if rootPtr == nil:
-        return Err[bool]("x509: issuer ! found")
+    let rootPtr: X509Certificate = roots.items[rootIdx]
     return x509VerifyRevocationWithIssuer(leaf, rootPtr, ocsp, crls, crlCount, now, mode)

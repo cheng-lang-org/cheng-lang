@@ -7,7 +7,6 @@ typedef struct {
   int32_t cap;
 } cheng_seq_u8;
 
-extern void *uirBuildModuleFromFile(const char *path);
 extern void *uirBuildModuleFromFileStage1(const char *path);
 extern cheng_seq_u8 uirEmitObjFromModule(void *module, int32_t optLevel,
                                          const char *target,
@@ -18,7 +17,7 @@ extern cheng_seq_u8 uirEmitObjFromModule(void *module, int32_t optLevel,
                                          const char *uirSimdPolicy);
 
 __attribute__((weak)) void *uirBuildModuleFromFileOrPanic(const char *path) {
-  void *module = uirBuildModuleFromFile(path);
+  void *module = uirBuildModuleFromFileStage1(path);
   if (module == NULL) {
     abort();
   }

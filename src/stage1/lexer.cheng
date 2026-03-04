@@ -2,6 +2,7 @@
 # Stage1 lexer (ported from stage0/lexer).
 import std/strings
 import std/seqs
+import std/rawmem_support
 
 fn lex_memRelease(p: void*) =
     memRelease(p)
@@ -29,7 +30,7 @@ fn initLexStringPool() =
     lexStringPoolReady = true
 
 fn trackLexString(p: void*) =
-    if p == nil:
+    if astRefIsNil(p):
         return
     initLexStringPool()
     lex_memScopeEscape p
@@ -37,13 +38,15 @@ fn trackLexString(p: void*) =
     let pooled: ptr = ptr(p)
     add(lexStringPool, pooled)
 
+fn trackLexStringStr(s: str) =
+    trackLexString(ptr(s))
+
 fn releaseLexStrings() =
     if ! lexStringPoolReady:
         return
     for i in 0..<lexStringPool.len:
-        let slot: void* = ptr_add(lexStringPool.buffer, i * ptrSize())
-        let p: void* = load_ptr(slot)
-        if p != nil:
+        let p: void* = lexStringPool[i]
+        if astRefNonNil(p):
             lex_memRelease p
     freeSeq[ptr](lexStringPool)
     lexStringPoolReady = false
@@ -110,15 +113,15 @@ fn sliceRange(s: str, start: int32, stop: int32): str =
         return ""
     let count: int32 = b - a + 1
     let p: void* = alloc(count + 1)
-    let src: void* = ptr_add(void*(s), a)
-    copyMem(p, src, count)
-    setMem(ptr_add(p, count), 0, 1)
+    let src: void* = rawmemPtrAdd(ptr(s), a)
+    rawmemCopy(p, src, count)
+    rawmemSet(rawmemPtrAdd(p, count), 0, 1)
     return str(p)
 
 fn sliceRangeLex(s: str, start: int32, stop: int32): str =
     let out: str = sliceRange(s, start, stop)
     if len(out) > 0:
-        trackLexString void*(out)
+        trackLexStringStr(out)
     return out
 
 fn trimTrailingCR(s: str): str =
@@ -335,21 +338,13 @@ fn lineStartsContinueKeyword(lineStr: str): bool =
 fn emitIndentTokens(tokens: var Token[], stack: var int32[], newIndent: int32, line: int32, filename: str, diags: var Diagnostic[]) =
     var current: int32 = 0
     if stack.len > 0:
-        let idx: int32 = stack.len - 1
-        let off32: int32 = int32(int64(idx) * sizeof int32)
-        let p: void* = ptr_add(stack.buffer, off32)
-        let pt: int32* = int32*(p)
-        current = *pt
+        current = stack[stack.len - 1]
     if newIndent > current:
         add(stack, newIndent)
         add(tokens, newToken(tkIndent, "", line, 1))
     elif newIndent < current:
         while stack.len > 0:
-            let idx2: int32 = stack.len - 1
-            let off32b: int32 = int32(int64(idx2) * sizeof int32)
-            let p2: void* = ptr_add(stack.buffer, off32b)
-            let pt2: int32* = int32*(p2)
-            let top: int32 = *pt2
+            let top: int32 = stack[stack.len - 1]
             if top <= newIndent:
                 break
             stack.len = stack.len - 1
@@ -359,11 +354,7 @@ fn emitIndentTokens(tokens: var Token[], stack: var int32[], newIndent: int32, l
             add(stack, newIndent)
             add(tokens, newToken(tkIndent, "", line, 1))
         else:
-            let idx3: int32 = stack.len - 1
-            let off32c: int32 = int32(int64(idx3) * sizeof int32)
-            let p3: void* = ptr_add(stack.buffer, off32c)
-            let pt3: int32* = int32*(p3)
-            let top2: int32 = *pt3
+            let top2: int32 = stack[stack.len - 1]
             if top2 != newIndent:
                 addLexDiag(diags, filename, line, 1, "Indentation level mismatch")
                 add(stack, newIndent)
@@ -451,7 +442,7 @@ fn lexNumber(content: str, start: int32, line: int32, filename: str, diags: var 
                         continue
                     break
                 lexeme = sliceRange(content, start, i - 1)
-                trackLexString void*(lexeme)
+                trackLexStringStr(lexeme)
                 result.tok = newToken(tkNumber, lexeme, line, start + 1)
                 result.nextPos = i
                 return result
@@ -480,7 +471,7 @@ fn lexNumber(content: str, start: int32, line: int32, filename: str, diags: var 
             continue
         break
     lexeme = sliceRange(content, start, i - 1)
-    trackLexString void*(lexeme)
+    trackLexStringStr(lexeme)
     result.tok = newToken(tkNumber, lexeme, line, start + 1)
     result.nextPos = i
     return result
@@ -501,7 +492,7 @@ fn lexIdent(content: str, start: int32, line: int32): ScanResult =
             continue
         break
     let lexeme: str = sliceRange(content, start, i - 1)
-    trackLexString void*(lexeme)
+    trackLexStringStr(lexeme)
     var kind: TokenKind = tkIdent
     if isKeyword lexeme:
         kind = tkKeyword
@@ -548,7 +539,7 @@ fn lexChar(content: str, start: int32, line: int32, filename: str, diags: var Di
                         okLen = true
     if ! okLen:
         addLexDiag(diags, filename, line, start + 1, "Character literal must contain exactly one character")
-    trackLexString void*(lexeme)
+    trackLexStringStr(lexeme)
     result.tok = newToken(tkChar, lexeme, line, start + 1)
     result.nextPos = i + 1
     return result
@@ -587,11 +578,11 @@ fn lexString(content: str, start: int32, line: int32, filename: str, diags: var 
                         lexeme = sliceRange(content, contentStart, i - 1)
                     if i + 2 >= n:
                         addLexDiag(diags, filename, line, start + 1, "Unterminated string literal")
-                        trackLexString void*(lexeme)
+                        trackLexStringStr(lexeme)
                         result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
                         result.nextPos = n
                         return result
-                    trackLexString void*(lexeme)
+                    trackLexStringStr(lexeme)
                     result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
                     result.nextPos = i + 3
                     return result
@@ -614,11 +605,11 @@ fn lexString(content: str, start: int32, line: int32, filename: str, diags: var 
         lexeme = sliceRange(content, contentStart2, i - 1)
     if i >= n:
         addLexDiag(diags, filename, line, start + 1, "Unterminated string literal")
-        trackLexString void*(lexeme)
+        trackLexStringStr(lexeme)
         result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
         result.nextPos = i
         return result
-    trackLexString void*(lexeme)
+    trackLexStringStr(lexeme)
     result.tok = newToken(tkString, lexeme, line, start + 1, prefix)
     result.nextPos = i + 1
     return result
@@ -1014,7 +1005,7 @@ fn lex(content: str, filename: str = "stdin"): LexResult =
                     i = i + 1
                 if i < lineLen:
                     i = i + 1
-                    trackLexString void*(lexeme)
+                    trackLexStringStr(lexeme)
                     let tok: Token = newToken(tkIdent, lexeme, lineNum, pos + 1)
                     add(tokens, tok)
                     if lineTokenCount == 0:

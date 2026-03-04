@@ -5,7 +5,7 @@ import std/os
 import backend/uir/[uir_types, uir_opt]
 import backend/uir/[uir_validate]
 import backend/machine/[machine_types, machine_select_aarch64, machine_regalloc]
-import backend/obj/[macho_writer, elf_writer, coff_writer]
+import backend/obj/[macho_writer]
 
 fn uirTargetIsDarwin(target: str): bool =
     if len(target) == 0:
@@ -56,8 +56,15 @@ fn uirStrContains(hay: str, needle: str): bool =
 
 fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
+    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    if dbgCstr:
+        let preOptCstrs: int32 = uirModuleCStringsLen(module)
+        echo("[codegen.cstr] pre-opt module_cstrs=" + intToStr(preOptCstrs))
     if optLevel >= 1:
         uirOptimizeModule(module, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
+    if dbgCstr:
+        let postOptCstrs: int32 = uirModuleCStringsLen(module)
+        echo("[codegen.cstr] post-opt module_cstrs=" + intToStr(postOptCstrs))
     if dbgCodegen:
         echo("[codegen] select.begin")
     let isAarch64: bool = uirTargetIsAarch64(target)
@@ -70,8 +77,25 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
         echo("[codegen] select.end")
         echo("[codegen] regalloc.begin")
     let allocated: MachineModule = machineAssignRegisters(res.value)
+    # Some stage0/legacy selector builds can drop module cstring payloads.
+    # Keep machine emission robust by backfilling from UIR module metadata.
+    let moduleCstrCount: int32 = uirModuleCStringsLen(module)
+    let machineCstrCount0: int32 = machineModuleCstrsLen(allocated)
+    if moduleCstrCount > 0 && machineCstrCount0 == 0:
+        var added: int32 = 0
+        for ci in 0..<moduleCstrCount:
+            let uc: UirCString = uirModuleCStringAt(module, ci)
+            let uLabel: str = uirCStringLabelOf(uc)
+            if len(uLabel) == 0:
+                continue
+            let uValue: str = uirCStringValueOf(uc)
+            machineAddCString(allocated, uLabel, uValue)
+            added = added + 1
+        if dbgCstr:
+            echo("[codegen.cstr] backfill added=" + intToStr(added) +
+                 " module_cstrs=" + intToStr(moduleCstrCount) +
+                 " machine_cstrs=" + intToStr(machineModuleCstrsLen(allocated)))
     allocated.target = target
-    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
     if dbgCstr:
         let cCount: int32 = machineModuleCstrsLen(allocated)
         echo("[codegen.cstr] post-regalloc cstrs=" + intToStr(cCount))
@@ -99,22 +123,18 @@ fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
     if len(objWriter) == 0:
         objWriter = ""
     if len(objWriter) == 0:
-        if uirTargetIsWindows(target):
-            objWriter = "coff"
-        elif uirTargetIsDarwin(target):
+        if uirTargetIsDarwin(target):
             objWriter = "macho"
-        elif uirTargetIsLinuxLike(target):
-            objWriter = "elf"
         else:
-            return Err[str]("uir_codegen: cannot infer object writer for target: " + target)
+            return Err[str]("uir_codegen: host-only object writer requires darwin target: " + target)
     if objWriter != "macho" && objWriter != "elf" && objWriter != "coff":
         return Err[str]("uir_codegen: unsupported object writer: " + objWriter)
     if objWriter == "macho" && !uirTargetIsDarwin(target):
         return Err[str]("uir_codegen: macho writer requires darwin target: " + target)
     if objWriter == "coff" && !uirTargetIsWindows(target):
-        return Err[str]("uir_codegen: coff writer requires windows/msvc target: " + target)
+        return Err[str]("uir_codegen: coff writer disabled in host-only build: " + target)
     if objWriter == "elf" && (uirTargetIsDarwin(target) || uirTargetIsWindows(target)):
-        return Err[str]("uir_codegen: elf writer requires linux/android/gnu target: " + target)
+        return Err[str]("uir_codegen: elf writer disabled in host-only build: " + target)
     var out: Result[str]
     out.ok = true
     out.value = objWriter
@@ -123,8 +143,8 @@ fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
 
 fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): Result[uint8[]] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
-    if machine != nil:
-        memRetain(void*(machine))
+    if !(machine == nil):
+        memRetain(machine)
     let writerRes: Result[str] = uirResolveObjWriter(target, objWriter)
     if !IsOk[str](writerRes):
         return Err[uint8[]](ErrorFormat(ErrorInfoOf[str](writerRes)))
@@ -154,19 +174,15 @@ fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): R
             return machoWriteAarch64RelocatableObj(machine)
         return Err[uint8[]]("uir_codegen: macho writer unsupported target arch: " + target)
     if resolvedWriter == "elf":
-        if isAarch64:
-            return elfWriteAarch64RelocatableObj(machine)
-        return Err[uint8[]]("uir_codegen: elf writer unsupported target arch: " + target)
+        return Err[uint8[]]("uir_codegen: elf writer disabled in host-only build: " + target)
     if resolvedWriter == "coff":
-        if isAarch64:
-            return coffWriteAarch64RelocatableObj(machine)
-        return Err[uint8[]]("uir_codegen: coff writer unsupported target arch: " + target)
+        return Err[uint8[]]("uir_codegen: coff writer disabled in host-only build: " + target)
     return Err[uint8[]]("uir_codegen: unresolved object writer after validation: " + resolvedWriter)
 
 fn uirEmitObjFromModule(module: UirModule, optLevel: int32, target: str, objWriter: str,
                          validateModule: bool,
                          uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[uint8[]] =
-    if module == nil:
+    if (module == nil):
         return Err[uint8[]]("uir_codegen: module is nil")
     if validateModule:
         let vRes: Result[bool] = uirValidateModule(module)

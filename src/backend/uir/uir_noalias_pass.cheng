@@ -7,6 +7,10 @@ import backend/uir/uir_internal/uir_core_types
 import std/os
 import std/strings
 import std/strutils
+import std/rawmem_support
+
+fn uirNoAliasRecursionLimit(): int32 =
+    return 256
 
 fn uirNoAliasLowerAscii(s: str): str =
     return strutils.toLowerAscii(s)
@@ -41,19 +45,19 @@ fn uirNoAliasInitI32Seq(n: int32, value: int32): int32[] =
     return out
 
 fn uirNoAliasInvalidateKnown(knownValid: bool[]*) =
-    if knownValid == nil:
+    if (knownValid == nil):
         return
     for i in 0..<knownValid->len:
         knownValid[i] = false
 
 fn uirNoAliasInvalidatePtrBase(ptrBase: int32[]*) =
-    if ptrBase == nil:
+    if (ptrBase == nil):
         return
     for i in 0..<ptrBase->len:
         ptrBase[i] = -1
 
 fn uirNoAliasDisablePromotable(promotable: bool[]*) =
-    if promotable == nil:
+    if (promotable == nil):
         return
     for i in 0..<promotable->len:
         promotable[i] = false
@@ -64,10 +68,10 @@ fn uirNoAliasInvalidateAll(knownValid: bool[]*, ptrBase: int32[]*, promotable: b
     uirNoAliasDisablePromotable(promotable)
 
 fn uirNoAliasIsObjSlot(func: UirCoreFunc, slot: int32): bool =
-    if func == nil || slot < 0:
+    if (!uirCoreFuncIdValid(func)) || slot < 0:
         return false
-    for i in 0..<func.objLocals.len:
-        let ol: UirObjLocal = func.objLocals[i]
+    for i in 0..<uirCoreFuncObjLocalsLen(func):
+        let ol: UirObjLocal = uirCoreFuncObjLocalAt(func, i)
         if ol.slot == slot:
             return true
     return false
@@ -77,138 +81,197 @@ fn uirNoAliasEnsureName(name: str, slot: int32): str =
         return name
     return "__na_l" + intToStr(slot)
 
-fn uirNoAliasResolveAddrBaseSlot(addrExpr: UirExpr, ptrBase: int32[]): int32 =
-    if addrExpr == nil:
+fn uirNoAliasResolveAddrBaseSlotInner(addrExpr: UirExpr, ptrBase: int32[], depth: int32*): int32 =
+    if (addrExpr <= 0) || (depth == nil):
         return -1
+    if *depth >= uirNoAliasRecursionLimit():
+        return -1
+    *depth = *depth + 1
+    var out: int32 = -1
     let k: UirExprKind = uirExprKindOf(addrExpr)
     if k == meAddr:
-        return uirExprLocalIndexOf(addrExpr)
-    if k == meLocal:
+        out = uirExprLocalIndexOf(addrExpr)
+    elif k == meLocal:
         let slot: int32 = uirExprLocalIndexOf(addrExpr)
         if slot >= 0 && slot < ptrBase.len:
-            return ptrBase[slot]
-        return -1
-    if k == meCast:
-        return uirNoAliasResolveAddrBaseSlot(uirExprCastExprOf(addrExpr), ptrBase)
-    return -1
+            out = ptrBase[slot]
+        else:
+            out = -1
+    elif k == meCast:
+        out = uirNoAliasResolveAddrBaseSlotInner(uirExprCastExprOf(addrExpr), ptrBase, depth)
+    else:
+        out = -1
+    *depth = *depth - 1
+    return out
 
-fn uirNoAliasExprStable(expr: UirExpr): bool =
-    if expr == nil:
+fn uirNoAliasResolveAddrBaseSlot(addrExpr: UirExpr, ptrBase: int32[]): int32 =
+    var depth: int32 = 0
+    return uirNoAliasResolveAddrBaseSlotInner(addrExpr, ptrBase, &depth)
+
+fn uirNoAliasExprStableInner(expr: UirExpr, depth: int32*): bool =
+    if (expr <= 0) || (depth == nil):
         return false
+    if *depth >= uirNoAliasRecursionLimit():
+        return false
+    *depth = *depth + 1
+    var out: bool = false
     let k: UirExprKind = uirExprKindOf(expr)
     if k == meConstI64 || k == meLocal || k == meAddr || k == meGlobalAddr:
-        return true
-    if k == meCall || k == meLoad:
-        return false
-    if k == meCast:
-        return uirNoAliasExprStable(uirExprCastExprOf(expr))
-    if k == meBin || k == meCmp:
-        return uirNoAliasExprStable(uirExprLhsOf(expr)) &&
-               uirNoAliasExprStable(uirExprRhsOf(expr))
-    return false
+        out = true
+    elif k == meCall || k == meLoad:
+        out = false
+    elif k == meCast:
+        out = uirNoAliasExprStableInner(uirExprCastExprOf(expr), depth)
+    elif k == meBin || k == meCmp:
+        out = uirNoAliasExprStableInner(uirExprLhsOf(expr), depth) &&
+              uirNoAliasExprStableInner(uirExprRhsOf(expr), depth)
+    else:
+        out = false
+    *depth = *depth - 1
+    return out
 
-fn uirNoAliasExprHasCall(expr: UirExpr): bool =
-    if expr == nil:
+fn uirNoAliasExprStable(expr: UirExpr): bool =
+    var depth: int32 = 0
+    return uirNoAliasExprStableInner(expr, &depth)
+
+fn uirNoAliasExprHasCallInner(expr: UirExpr, depth: int32*): bool =
+    if (expr <= 0) || (depth == nil):
         return false
+    if *depth >= uirNoAliasRecursionLimit():
+        return true
+    *depth = *depth + 1
+    var out: bool = false
     let k: UirExprKind = uirExprKindOf(expr)
     if k == meCall:
-        return true
-    if k == meCast:
-        return uirNoAliasExprHasCall(uirExprCastExprOf(expr))
-    if k == meBin || k == meCmp:
-        return uirNoAliasExprHasCall(uirExprLhsOf(expr)) ||
-               uirNoAliasExprHasCall(uirExprRhsOf(expr))
-    if k == meLoad:
-        return uirNoAliasExprHasCall(uirExprAddrExprOf(expr))
-    if k == meLocal || k == meAddr || k == meConstI64 || k == meGlobalAddr:
-        return false
-    for i in 0..<uirExprArgsLen(expr):
-        if uirNoAliasExprHasCall(uirExprArgAt(expr, i)):
-            return true
-    return false
+        out = true
+    elif k == meCast:
+        out = uirNoAliasExprHasCallInner(uirExprCastExprOf(expr), depth)
+    elif k == meBin || k == meCmp:
+        out = uirNoAliasExprHasCallInner(uirExprLhsOf(expr), depth) ||
+              uirNoAliasExprHasCallInner(uirExprRhsOf(expr), depth)
+    elif k == meLoad:
+        out = uirNoAliasExprHasCallInner(uirExprAddrExprOf(expr), depth)
+    elif k == meLocal || k == meAddr || k == meConstI64 || k == meGlobalAddr:
+        out = false
+    else:
+        out = false
+        for i in 0..<uirExprArgsLen(expr):
+            if uirNoAliasExprHasCallInner(uirExprArgAt(expr, i), depth):
+                out = true
+                break
+    *depth = *depth - 1
+    return out
+
+fn uirNoAliasExprHasCall(expr: UirExpr): bool =
+    var depth: int32 = 0
+    return uirNoAliasExprHasCallInner(expr, &depth)
 
 fn uirNoAliasExprMayClobber(expr: UirExpr): bool =
     return uirNoAliasExprHasCall(expr)
 
-fn uirNoAliasExprHasLoadFromBase(expr: UirExpr, baseSlot: int32, ptrBase: int32[]): bool =
-    if expr == nil:
+fn uirNoAliasExprHasLoadFromBaseInner(expr: UirExpr, baseSlot: int32, ptrBase: int32[], depth: int32*): bool =
+    if (expr <= 0) || (depth == nil):
         return false
+    if *depth >= uirNoAliasRecursionLimit():
+        return true
+    *depth = *depth + 1
+    var out: bool = false
     let k: UirExprKind = uirExprKindOf(expr)
     if k == meLoad:
         let loadBase: int32 = uirNoAliasResolveAddrBaseSlot(uirExprAddrExprOf(expr), ptrBase)
         if loadBase == baseSlot:
-            return true
-        return uirNoAliasExprHasLoadFromBase(uirExprAddrExprOf(expr), baseSlot, ptrBase)
-    if k == meCast:
-        return uirNoAliasExprHasLoadFromBase(uirExprCastExprOf(expr), baseSlot, ptrBase)
-    if k == meBin || k == meCmp:
-        return uirNoAliasExprHasLoadFromBase(uirExprLhsOf(expr), baseSlot, ptrBase) ||
-               uirNoAliasExprHasLoadFromBase(uirExprRhsOf(expr), baseSlot, ptrBase)
-    if k == meCall:
+            out = true
+        else:
+            out = uirNoAliasExprHasLoadFromBaseInner(uirExprAddrExprOf(expr), baseSlot, ptrBase, depth)
+    elif k == meCast:
+        out = uirNoAliasExprHasLoadFromBaseInner(uirExprCastExprOf(expr), baseSlot, ptrBase, depth)
+    elif k == meBin || k == meCmp:
+        out = uirNoAliasExprHasLoadFromBaseInner(uirExprLhsOf(expr), baseSlot, ptrBase, depth) ||
+              uirNoAliasExprHasLoadFromBaseInner(uirExprRhsOf(expr), baseSlot, ptrBase, depth)
+    elif k == meCall:
         for i in 0..<uirExprArgsLen(expr):
-            if uirNoAliasExprHasLoadFromBase(uirExprArgAt(expr, i), baseSlot, ptrBase):
-                return true
-    return false
+            if uirNoAliasExprHasLoadFromBaseInner(uirExprArgAt(expr, i), baseSlot, ptrBase, depth):
+                out = true
+                break
+    else:
+        out = false
+    *depth = *depth - 1
+    return out
 
-fn uirNoAliasHasFutureLoad(blk: UirCoreBlock, startIdx: int32, baseSlot: int32, ptrBase: int32[]): bool =
-    if blk == nil || startIdx < 0:
+fn uirNoAliasExprHasLoadFromBase(expr: UirExpr, baseSlot: int32, ptrBase: int32[]): bool =
+    var depth: int32 = 0
+    return uirNoAliasExprHasLoadFromBaseInner(expr, baseSlot, ptrBase, &depth)
+
+fn uirNoAliasHasFutureLoad(blk: UirBlockId, startIdx: int32, baseSlot: int32, ptrBase: int32[]): bool =
+    if (blk <= 0) || startIdx < 0:
         return false
-    for si in startIdx..<blk.stmts.len:
-        let st: UirCoreStmt = blk.stmts[si]
-        if uirNoAliasExprHasLoadFromBase(st.expr, baseSlot, ptrBase):
+    let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+    for si in startIdx..<stmtCount:
+        let st: UirStmtId = uirCoreBlockStmtAt(blk, si)
+        if uirNoAliasExprHasLoadFromBase(uirCoreStmtExprOf(st), baseSlot, ptrBase):
             return true
-        if st.kind == msStore && uirNoAliasExprHasLoadFromBase(st.addrExpr, baseSlot, ptrBase):
+        if uirCoreStmtKindOf(st) == msStore &&
+           uirNoAliasExprHasLoadFromBase(uirCoreStmtAddrExprOf(st), baseSlot, ptrBase):
             return true
-    if blk.term.kind == mtRet:
-        return uirNoAliasExprHasLoadFromBase(blk.term.retExpr, baseSlot, ptrBase)
-    if blk.term.kind == mtCbr:
-        return uirNoAliasExprHasLoadFromBase(blk.term.condExpr, baseSlot, ptrBase)
+    let term: UirCoreTerm = uirCoreBlockTermOf(blk)
+    if uirCoreTermKindOf(term) == mtRet:
+        return uirNoAliasExprHasLoadFromBase(uirCoreTermRetExprOf(term), baseSlot, ptrBase)
+    if uirCoreTermKindOf(term) == mtCbr:
+        return uirNoAliasExprHasLoadFromBase(uirCoreTermCondExprOf(term), baseSlot, ptrBase)
     return false
 
-fn uirNoAliasExprMarkUses(expr: UirExpr, marks: bool[]*) =
-    if expr == nil || marks == nil:
+fn uirNoAliasExprMarkUsesInner(expr: UirExpr, marks: bool[]*, depth: int32*) =
+    if (expr <= 0) || (marks == nil) || (depth == nil):
         return
+    if *depth >= uirNoAliasRecursionLimit():
+        for i in 0..<marks->len:
+            marks[i] = true
+        return
+    *depth = *depth + 1
     let k: UirExprKind = uirExprKindOf(expr)
     if k == meLocal:
         let slot: int32 = uirExprLocalIndexOf(expr)
         if slot >= 0 && slot < marks->len:
             marks[slot] = true
-        return
-    if k == meBin || k == meCmp:
-        uirNoAliasExprMarkUses(uirExprLhsOf(expr), marks)
-        uirNoAliasExprMarkUses(uirExprRhsOf(expr), marks)
-        return
-    if k == meCast:
-        uirNoAliasExprMarkUses(uirExprCastExprOf(expr), marks)
-        return
-    if k == meLoad:
-        uirNoAliasExprMarkUses(uirExprAddrExprOf(expr), marks)
-        return
-    if k == meCall:
+    elif k == meBin || k == meCmp:
+        uirNoAliasExprMarkUsesInner(uirExprLhsOf(expr), marks, depth)
+        uirNoAliasExprMarkUsesInner(uirExprRhsOf(expr), marks, depth)
+    elif k == meCast:
+        uirNoAliasExprMarkUsesInner(uirExprCastExprOf(expr), marks, depth)
+    elif k == meLoad:
+        uirNoAliasExprMarkUsesInner(uirExprAddrExprOf(expr), marks, depth)
+    elif k == meCall:
         for i in 0..<uirExprArgsLen(expr):
-            uirNoAliasExprMarkUses(uirExprArgAt(expr, i), marks)
-        return
+            uirNoAliasExprMarkUsesInner(uirExprArgAt(expr, i), marks, depth)
+    *depth = *depth - 1
 
-fn uirNoAliasBuildLastUse(blk: UirCoreBlock, localCount: int32): int32[] =
+fn uirNoAliasExprMarkUses(expr: UirExpr, marks: bool[]*) =
+    var depth: int32 = 0
+    uirNoAliasExprMarkUsesInner(expr, marks, &depth)
+
+fn uirNoAliasBuildLastUse(blk: UirBlockId, localCount: int32): int32[] =
     var lastUse: int32[] = uirNoAliasInitI32Seq(localCount, -1)
-    if blk == nil || localCount <= 0:
+    if (blk <= 0) || localCount <= 0:
         return lastUse
     var marks: bool[] = uirNoAliasInitBoolSeq(localCount, false)
-    for si in 0..<blk.stmts.len:
+    let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+    for si in 0..<stmtCount:
         for i in 0..<localCount:
             marks[i] = false
-        uirNoAliasExprMarkUses(blk.stmts[si].expr, &marks)
-        uirNoAliasExprMarkUses(blk.stmts[si].addrExpr, &marks)
+        let st: UirStmtId = uirCoreBlockStmtAt(blk, si)
+        uirNoAliasExprMarkUses(uirCoreStmtExprOf(st), &marks)
+        uirNoAliasExprMarkUses(uirCoreStmtAddrExprOf(st), &marks)
         for i in 0..<localCount:
             if marks[i]:
                 lastUse[i] = si
-    let termMark: int32 = blk.stmts.len
+    let termMark: int32 = stmtCount
     for i in 0..<localCount:
         marks[i] = false
-    if blk.term.kind == mtRet:
-        uirNoAliasExprMarkUses(blk.term.retExpr, &marks)
-    elif blk.term.kind == mtCbr:
-        uirNoAliasExprMarkUses(blk.term.condExpr, &marks)
+    let term: UirCoreTerm = uirCoreBlockTermOf(blk)
+    if uirCoreTermKindOf(term) == mtRet:
+        uirNoAliasExprMarkUses(uirCoreTermRetExprOf(term), &marks)
+    elif uirCoreTermKindOf(term) == mtCbr:
+        uirNoAliasExprMarkUses(uirCoreTermCondExprOf(term), &marks)
     for i in 0..<localCount:
         if marks[i]:
             lastUse[i] = termMark
@@ -219,7 +282,7 @@ fn uirNoAliasApplyKillLite(stepIdx: int32,
                            knownValid: bool[]*,
                            ptrBase: int32[]*,
                            killEvents: int32*) =
-    if knownValid == nil || ptrBase == nil:
+    if (knownValid == nil) || (ptrBase == nil):
         return
     for i in 0..<lastUse.len:
         if lastUse[i] != stepIdx:
@@ -231,50 +294,58 @@ fn uirNoAliasApplyKillLite(stepIdx: int32,
         if i < ptrBase->len && ptrBase[i] != -1:
             ptrBase[i] = -1
             touched = true
-        if touched && killEvents != nil:
+        if touched && !(killEvents == nil):
             *killEvents = *killEvents + 1
 
-fn uirNoAliasExprCollectResolvedBases(expr: UirExpr,
-                                      ptrBase: int32[],
-                                      resolved: bool[]*,
-                                      unknownCount: int32*) =
-    if expr == nil || resolved == nil:
+fn uirNoAliasExprCollectResolvedBasesInner(expr: UirExpr,
+                                           ptrBase: int32[],
+                                           resolved: bool[]*,
+                                           unknownCount: int32*,
+                                           depth: int32*) =
+    if (expr <= 0) || (resolved == nil) || (depth == nil):
         return
+    if *depth >= uirNoAliasRecursionLimit():
+        if !(unknownCount == nil):
+            *unknownCount = *unknownCount + 1
+        return
+    *depth = *depth + 1
     let k: UirExprKind = uirExprKindOf(expr)
     if k == meAddr:
         let slot: int32 = uirExprLocalIndexOf(expr)
         if slot >= 0 && slot < resolved->len:
             resolved[slot] = true
-        elif unknownCount != nil:
+        elif !(unknownCount == nil):
             *unknownCount = *unknownCount + 1
-        return
-    if k == meLocal:
+    elif k == meLocal:
         let slot: int32 = uirExprLocalIndexOf(expr)
         if slot >= 0 && slot < ptrBase.len:
             let base: int32 = ptrBase[slot]
             if base >= 0 && base < resolved->len:
                 resolved[base] = true
-            elif unknownCount != nil:
+            elif !(unknownCount == nil):
                 *unknownCount = *unknownCount + 1
-        elif unknownCount != nil:
+        elif !(unknownCount == nil):
             *unknownCount = *unknownCount + 1
-        return
-    if k == meCast:
-        uirNoAliasExprCollectResolvedBases(uirExprCastExprOf(expr), ptrBase, resolved, unknownCount)
-        return
-    if k == meLoad:
-        uirNoAliasExprCollectResolvedBases(uirExprAddrExprOf(expr), ptrBase, resolved, unknownCount)
-        return
-    if k == meBin || k == meCmp:
-        uirNoAliasExprCollectResolvedBases(uirExprLhsOf(expr), ptrBase, resolved, unknownCount)
-        uirNoAliasExprCollectResolvedBases(uirExprRhsOf(expr), ptrBase, resolved, unknownCount)
-        return
-    if k == meCall:
-        if unknownCount != nil:
+    elif k == meCast:
+        uirNoAliasExprCollectResolvedBasesInner(uirExprCastExprOf(expr), ptrBase, resolved, unknownCount, depth)
+    elif k == meLoad:
+        uirNoAliasExprCollectResolvedBasesInner(uirExprAddrExprOf(expr), ptrBase, resolved, unknownCount, depth)
+    elif k == meBin || k == meCmp:
+        uirNoAliasExprCollectResolvedBasesInner(uirExprLhsOf(expr), ptrBase, resolved, unknownCount, depth)
+        uirNoAliasExprCollectResolvedBasesInner(uirExprRhsOf(expr), ptrBase, resolved, unknownCount, depth)
+    elif k == meCall:
+        if !(unknownCount == nil):
             *unknownCount = *unknownCount + 1
         for i in 0..<uirExprArgsLen(expr):
-            uirNoAliasExprCollectResolvedBases(uirExprArgAt(expr, i), ptrBase, resolved, unknownCount)
-        return
+            uirNoAliasExprCollectResolvedBasesInner(uirExprArgAt(expr, i), ptrBase, resolved, unknownCount, depth)
+    *depth = *depth - 1
+
+fn uirNoAliasExprCollectResolvedBases(expr: UirExpr,
+                                      ptrBase: int32[],
+                                      resolved: bool[]*,
+                                      unknownCount: int32*) =
+    var depth: int32 = 0
+    uirNoAliasExprCollectResolvedBasesInner(expr, ptrBase, resolved, unknownCount, &depth)
 
 fn uirNoAliasApplyExprClobber(expr: UirExpr,
                               njvlLite: bool,
@@ -285,7 +356,7 @@ fn uirNoAliasApplyExprClobber(expr: UirExpr,
                               unknownGlobalClobbers: int32*) =
     if !uirNoAliasExprMayClobber(expr):
         return
-    if knownValid == nil || promotable == nil:
+    if (knownValid == nil) || (promotable == nil):
         return
     if !njvlLite:
         uirNoAliasInvalidateAll(knownValid, &ptrBase, promotable)
@@ -303,13 +374,82 @@ fn uirNoAliasApplyExprClobber(expr: UirExpr,
             if i < ptrBase.len:
                 ptrBase[i] = -1
 
-    if unknownCount > 0 && unknownSlotClobbers != nil:
+    if unknownCount > 0 && !(unknownSlotClobbers == nil):
         *unknownSlotClobbers = *unknownSlotClobbers + unknownCount
 
     if resolvedCount <= 0 || unknownCount > 0:
-        if unknownGlobalClobbers != nil:
+        if !(unknownGlobalClobbers == nil):
             *unknownGlobalClobbers = *unknownGlobalClobbers + 1
         uirNoAliasInvalidateAll(knownValid, &ptrBase, promotable)
+
+fn uirNoAliasRewriteExprInner(expr: UirExpr,
+                              ptrBase: int32[],
+                              knownVals: UirExpr[],
+                              knownValid: bool[],
+                              promotable: bool[],
+                              changed: bool*,
+                              forwardedLoads: int32*,
+                              mem2regLoads: int32*,
+                              proofBackedChanges: int32*,
+                              proofBacked: bool,
+                              depth: int32*): UirExpr =
+    if (expr <= 0) || (depth == nil):
+        return nil
+    if *depth >= uirNoAliasRecursionLimit():
+        return expr
+    *depth = *depth + 1
+    var cur: UirExprId = expr
+    let k: UirExprKind = uirExprKindOf(cur)
+    if k == meBin || k == meCmp:
+        uirCoreExprSetLhs(cur, uirNoAliasRewriteExprInner(uirCoreExprLhsOf(cur), ptrBase, knownVals, knownValid, promotable,
+                                                          changed, forwardedLoads, mem2regLoads,
+                                                          proofBackedChanges, proofBacked, depth))
+        uirCoreExprSetRhs(cur, uirNoAliasRewriteExprInner(uirCoreExprRhsOf(cur), ptrBase, knownVals, knownValid, promotable,
+                                                          changed, forwardedLoads, mem2regLoads,
+                                                          proofBackedChanges, proofBacked, depth))
+        *depth = *depth - 1
+        return cur
+    if k == meCall:
+        for i in 0..<uirCoreExprArgsLen(cur):
+            uirCoreExprSetArgAt(cur, i, uirNoAliasRewriteExprInner(uirCoreExprArgAt(cur, i), ptrBase, knownVals, knownValid, promotable,
+                                                                   changed, forwardedLoads, mem2regLoads,
+                                                                   proofBackedChanges, proofBacked, depth))
+        *depth = *depth - 1
+        return cur
+    if k == meCast:
+        uirCoreExprSetCastExpr(cur, uirNoAliasRewriteExprInner(uirCoreExprCastExprOf(cur), ptrBase, knownVals, knownValid, promotable,
+                                                               changed, forwardedLoads, mem2regLoads,
+                                                               proofBackedChanges, proofBacked, depth))
+        *depth = *depth - 1
+        return cur
+    if k == meLoad:
+        uirCoreExprSetAddrExpr(cur, uirNoAliasRewriteExprInner(uirCoreExprAddrExprOf(cur), ptrBase, knownVals, knownValid, promotable,
+                                                               changed, forwardedLoads, mem2regLoads,
+                                                               proofBackedChanges, proofBacked, depth))
+        let baseSlot: int32 = uirNoAliasResolveAddrBaseSlot(uirCoreExprAddrExprOf(cur), ptrBase)
+        if baseSlot >= 0 && baseSlot < knownValid.len:
+            if knownValid[baseSlot] && knownVals[baseSlot] > 0:
+                if !(changed == nil):
+                    *changed = true
+                if !(forwardedLoads == nil):
+                    *forwardedLoads = *forwardedLoads + 1
+                if proofBacked && !(proofBackedChanges == nil):
+                    *proofBackedChanges = *proofBackedChanges + 1
+                *depth = *depth - 1
+                return knownVals[baseSlot]
+            if baseSlot < promotable.len && promotable[baseSlot]:
+                if !(changed == nil):
+                    *changed = true
+                if !(mem2regLoads == nil):
+                    *mem2regLoads = *mem2regLoads + 1
+                if proofBacked && !(proofBackedChanges == nil):
+                    *proofBackedChanges = *proofBackedChanges + 1
+                *depth = *depth - 1
+                return uirCoreLocal(baseSlot)
+        *depth = *depth - 1
+        return cur
+    *depth = *depth - 1
+    return cur
 
 fn uirNoAliasRewriteExpr(expr: UirExpr,
                          ptrBase: int32[],
@@ -321,53 +461,10 @@ fn uirNoAliasRewriteExpr(expr: UirExpr,
                          mem2regLoads: int32*,
                          proofBackedChanges: int32*,
                          proofBacked: bool): UirExpr =
-    if expr == nil:
-        return nil
-    var cur: UirCoreExpr = expr
-    let k: UirExprKind = uirExprKindOf(cur)
-    if k == meBin || k == meCmp:
-        cur.lhs = uirNoAliasRewriteExpr(cur.lhs, ptrBase, knownVals, knownValid, promotable,
-                                        changed, forwardedLoads, mem2regLoads,
-                                        proofBackedChanges, proofBacked)
-        cur.rhs = uirNoAliasRewriteExpr(cur.rhs, ptrBase, knownVals, knownValid, promotable,
-                                        changed, forwardedLoads, mem2regLoads,
-                                        proofBackedChanges, proofBacked)
-        return cur
-    if k == meCall:
-        for i in 0..<cur.args.len:
-            cur.args[i] = uirNoAliasRewriteExpr(cur.args[i], ptrBase, knownVals, knownValid, promotable,
-                                                changed, forwardedLoads, mem2regLoads,
-                                                proofBackedChanges, proofBacked)
-        return cur
-    if k == meCast:
-        cur.castExpr = uirNoAliasRewriteExpr(cur.castExpr, ptrBase, knownVals, knownValid, promotable,
-                                             changed, forwardedLoads, mem2regLoads,
-                                             proofBackedChanges, proofBacked)
-        return cur
-    if k == meLoad:
-        cur.addrExpr = uirNoAliasRewriteExpr(cur.addrExpr, ptrBase, knownVals, knownValid, promotable,
-                                             changed, forwardedLoads, mem2regLoads,
-                                             proofBackedChanges, proofBacked)
-        let baseSlot: int32 = uirNoAliasResolveAddrBaseSlot(cur.addrExpr, ptrBase)
-        if baseSlot >= 0 && baseSlot < knownValid.len:
-            if knownValid[baseSlot] && knownVals[baseSlot] != nil:
-                if changed != nil:
-                    *changed = true
-                if forwardedLoads != nil:
-                    *forwardedLoads = *forwardedLoads + 1
-                if proofBacked && proofBackedChanges != nil:
-                    *proofBackedChanges = *proofBackedChanges + 1
-                return knownVals[baseSlot]
-            if baseSlot < promotable.len && promotable[baseSlot]:
-                if changed != nil:
-                    *changed = true
-                if mem2regLoads != nil:
-                    *mem2regLoads = *mem2regLoads + 1
-                if proofBacked && proofBackedChanges != nil:
-                    *proofBackedChanges = *proofBackedChanges + 1
-                return uirCoreLocal(baseSlot)
-        return cur
-    return cur
+    var depth: int32 = 0
+    return uirNoAliasRewriteExprInner(expr, ptrBase, knownVals, knownValid, promotable,
+                                      changed, forwardedLoads, mem2regLoads,
+                                      proofBackedChanges, proofBacked, &depth)
 
 fn uirNoAliasRunFunc(func: UirCoreFunc,
                      changedAny: bool*,
@@ -380,18 +477,19 @@ fn uirNoAliasRunFunc(func: UirCoreFunc,
                      unknownSlotClobbers: int32*,
                      unknownGlobalClobbers: int32*,
                      killEvents: int32*): bool =
-    if func == nil || func.isExtern:
+    if (!uirCoreFuncIdValid(func)) || uirCoreFuncIsExtern(func):
         return false
-    let localCount: int32 = func.localTypes.len
+    let localCount: int32 = uirCoreFuncLocalTypesLen(func)
     if localCount <= 0:
         return false
 
     var funcChanged: bool = false
-    for bi in 0..<func.blocks.len:
-        let blkView: UirLowerBlock = func.blocks[bi]
-        if blkView == nil:
+    let blockCount: int32 = uirCoreFuncBlocksLen(func)
+    for bi in 0..<blockCount:
+        let blkView: UirLowerBlock = uirCoreFuncBlockAt(func, bi)
+        if (blkView <= 0):
             continue
-        let blk: UirCoreBlock = blkView
+        let blk: UirBlockId = blkView
         var ptrBase: int32[] = uirNoAliasInitI32Seq(localCount, -1)
         var knownVals: UirExpr[] = uirNoAliasInitExprSeq(localCount)
         var knownValid: bool[] = uirNoAliasInitBoolSeq(localCount, false)
@@ -401,56 +499,73 @@ fn uirNoAliasRunFunc(func: UirCoreFunc,
             if uirNoAliasIsObjSlot(func, si0):
                 promotable[si0] = false
 
-        for si in 0..<blk.stmts.len:
-            var st: UirCoreStmt = blk.stmts[si]
-            if st.kind == msLet || st.kind == msVar || st.kind == msAssign:
-                st.expr = uirNoAliasRewriteExpr(st.expr, ptrBase, knownVals, knownValid, promotable,
-                                                &funcChanged, forwardedLoads, mem2regLoads,
-                                                proofBackedChanges, proofBacked)
-                if st.slot >= 0 && st.slot < localCount:
-                    knownValid[st.slot] = false
-                    if uirNoAliasExprStable(st.expr):
-                        knownVals[st.slot] = st.expr
-                        knownValid[st.slot] = true
-                    let aliasBase: int32 = uirNoAliasResolveAddrBaseSlot(st.expr, ptrBase)
+        let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+        for si in 0..<stmtCount:
+            var st: UirStmtId = uirCoreBlockStmtAt(blk, si)
+            let stmtKind: UirCoreStmtKind = uirCoreStmtKindOf(st)
+            if stmtKind == msLet || stmtKind == msVar || stmtKind == msAssign:
+                st = uirCoreStmtWithExpr(
+                    st,
+                    uirNoAliasRewriteExpr(uirCoreStmtExprOf(st), ptrBase, knownVals, knownValid, promotable,
+                                          &funcChanged, forwardedLoads, mem2regLoads,
+                                          proofBackedChanges, proofBacked)
+                )
+                let slot: int32 = uirCoreStmtSlotOf(st)
+                let expr: UirExpr = uirCoreStmtExprOf(st)
+                if slot >= 0 && slot < localCount:
+                    knownValid[slot] = false
+                    if uirNoAliasExprStable(expr):
+                        knownVals[slot] = expr
+                        knownValid[slot] = true
+                    let aliasBase: int32 = uirNoAliasResolveAddrBaseSlot(expr, ptrBase)
                     if aliasBase >= 0 && aliasBase < localCount:
-                        ptrBase[st.slot] = aliasBase
+                        ptrBase[slot] = aliasBase
                     else:
-                        ptrBase[st.slot] = -1
-                blk.stmts[si] = st
-                uirNoAliasApplyExprClobber(st.expr, njvlLite, ptrBase, &knownValid, &promotable,
+                        ptrBase[slot] = -1
+                uirCoreBlockSetStmtAt(blk, si, st)
+                uirNoAliasApplyExprClobber(expr, njvlLite, ptrBase, &knownValid, &promotable,
                                            unknownSlotClobbers, unknownGlobalClobbers)
-            elif st.kind == msParam:
-                if st.slot >= 0 && st.slot < localCount:
-                    knownValid[st.slot] = false
-                    ptrBase[st.slot] = -1
-            elif st.kind == msStore:
-                st.addrExpr = uirNoAliasRewriteExpr(st.addrExpr, ptrBase, knownVals, knownValid, promotable,
-                                                    &funcChanged, forwardedLoads, mem2regLoads,
-                                                    proofBackedChanges, proofBacked)
-                st.expr = uirNoAliasRewriteExpr(st.expr, ptrBase, knownVals, knownValid, promotable,
-                                                &funcChanged, forwardedLoads, mem2regLoads,
-                                                proofBackedChanges, proofBacked)
-                let baseSlot: int32 = uirNoAliasResolveAddrBaseSlot(st.addrExpr, ptrBase)
+            elif stmtKind == msParam:
+                let slot: int32 = uirCoreStmtSlotOf(st)
+                if slot >= 0 && slot < localCount:
+                    knownValid[slot] = false
+                    ptrBase[slot] = -1
+            elif stmtKind == msStore:
+                st = uirCoreStmtWithAddrExpr(
+                    st,
+                    uirNoAliasRewriteExpr(uirCoreStmtAddrExprOf(st), ptrBase, knownVals, knownValid, promotable,
+                                          &funcChanged, forwardedLoads, mem2regLoads,
+                                          proofBackedChanges, proofBacked)
+                )
+                st = uirCoreStmtWithExpr(
+                    st,
+                    uirNoAliasRewriteExpr(uirCoreStmtExprOf(st), ptrBase, knownVals, knownValid, promotable,
+                                          &funcChanged, forwardedLoads, mem2regLoads,
+                                          proofBackedChanges, proofBacked)
+                )
+                let addrExpr: UirExpr = uirCoreStmtAddrExprOf(st)
+                let valueExpr: UirExpr = uirCoreStmtExprOf(st)
+                let baseSlot: int32 = uirNoAliasResolveAddrBaseSlot(addrExpr, ptrBase)
                 if baseSlot >= 0 && baseSlot < localCount && promotable[baseSlot]:
                     let futureLoad: bool = uirNoAliasHasFutureLoad(blk, si + 1, baseSlot, ptrBase)
                     if futureLoad:
-                        st.kind = msAssign
-                        st.name = uirNoAliasEnsureName(st.name, baseSlot)
-                        st.slot = baseSlot
-                        st.addrExpr = nil
-                        if uirNoAliasExprStable(st.expr):
-                            knownVals[baseSlot] = st.expr
+                        st = uirCoreStmtWithKind(st, msAssign)
+                        st = uirCoreStmtWithName(st, uirNoAliasEnsureName(uirCoreStmtNameOf(st), baseSlot))
+                        st = uirCoreStmtWithSlot(st, baseSlot)
+                        st = uirCoreStmtWithAddrExpr(st, nil)
+                        let nextExpr: UirExpr = uirCoreStmtExprOf(st)
+                        if uirNoAliasExprStable(nextExpr):
+                            knownVals[baseSlot] = nextExpr
                             knownValid[baseSlot] = true
                         else:
                             knownValid[baseSlot] = false
-                        if mem2regStores != nil:
+                        if !(mem2regStores == nil):
                             *mem2regStores = *mem2regStores + 1
-                        if proofBacked && proofBackedChanges != nil:
+                        if proofBacked && !(proofBackedChanges == nil):
                             *proofBackedChanges = *proofBackedChanges + 1
                         funcChanged = true
-                    elif uirNoAliasExprStable(st.expr):
-                        knownVals[baseSlot] = st.expr
+                    elif uirNoAliasExprStable(valueExpr):
+                        knownVals[baseSlot] = valueExpr
                         knownValid[baseSlot] = true
                     else:
                         knownValid[baseSlot] = false
@@ -458,44 +573,50 @@ fn uirNoAliasRunFunc(func: UirCoreFunc,
                     if baseSlot >= 0 && baseSlot < localCount:
                         knownValid[baseSlot] = false
                     else:
-                        if unknownSlotClobbers != nil:
+                        if !(unknownSlotClobbers == nil):
                             *unknownSlotClobbers = *unknownSlotClobbers + 1
-                        if unknownGlobalClobbers != nil:
+                        if !(unknownGlobalClobbers == nil):
                             *unknownGlobalClobbers = *unknownGlobalClobbers + 1
                         uirNoAliasInvalidateAll(&knownValid, &ptrBase, &promotable)
-                blk.stmts[si] = st
-                uirNoAliasApplyExprClobber(st.expr, njvlLite, ptrBase, &knownValid, &promotable,
+                uirCoreBlockSetStmtAt(blk, si, st)
+                uirNoAliasApplyExprClobber(uirCoreStmtExprOf(st), njvlLite, ptrBase, &knownValid, &promotable,
                                            unknownSlotClobbers, unknownGlobalClobbers)
-                uirNoAliasApplyExprClobber(st.addrExpr, njvlLite, ptrBase, &knownValid, &promotable,
+                uirNoAliasApplyExprClobber(uirCoreStmtAddrExprOf(st), njvlLite, ptrBase, &knownValid, &promotable,
                                            unknownSlotClobbers, unknownGlobalClobbers)
             else:
-                st.expr = uirNoAliasRewriteExpr(st.expr, ptrBase, knownVals, knownValid, promotable,
-                                                &funcChanged, forwardedLoads, mem2regLoads,
-                                                proofBackedChanges, proofBacked)
-                blk.stmts[si] = st
-                uirNoAliasApplyExprClobber(st.expr, njvlLite, ptrBase, &knownValid, &promotable,
+                st = uirCoreStmtWithExpr(
+                    st,
+                    uirNoAliasRewriteExpr(uirCoreStmtExprOf(st), ptrBase, knownVals, knownValid, promotable,
+                                          &funcChanged, forwardedLoads, mem2regLoads,
+                                          proofBackedChanges, proofBacked)
+                )
+                uirCoreBlockSetStmtAt(blk, si, st)
+                uirNoAliasApplyExprClobber(uirCoreStmtExprOf(st), njvlLite, ptrBase, &knownValid, &promotable,
                                            unknownSlotClobbers, unknownGlobalClobbers)
 
             if njvlLite:
                 uirNoAliasApplyKillLite(si, lastUse, &knownValid, &ptrBase, killEvents)
 
-        if blk.term.kind == mtRet && blk.term.retExpr != nil:
-            blk.term.retExpr = uirNoAliasRewriteExpr(blk.term.retExpr, ptrBase, knownVals, knownValid, promotable,
-                                                     &funcChanged, forwardedLoads, mem2regLoads,
-                                                     proofBackedChanges, proofBacked)
-            uirNoAliasApplyExprClobber(blk.term.retExpr, njvlLite, ptrBase, &knownValid, &promotable,
+        let term: UirCoreTerm = uirCoreBlockTermOf(blk)
+        if uirCoreTermKindOf(term) == mtRet && !(uirCoreTermRetExprOf(term) <= 0):
+            let retExpr: UirExpr = uirNoAliasRewriteExpr(uirCoreTermRetExprOf(term), ptrBase, knownVals, knownValid, promotable,
+                                                         &funcChanged, forwardedLoads, mem2regLoads,
+                                                         proofBackedChanges, proofBacked)
+            uirCoreBlockSetTerm(blk, uirCoreTermWithRetExpr(term, retExpr))
+            uirNoAliasApplyExprClobber(retExpr, njvlLite, ptrBase, &knownValid, &promotable,
                                        unknownSlotClobbers, unknownGlobalClobbers)
-        elif blk.term.kind == mtCbr && blk.term.condExpr != nil:
-            blk.term.condExpr = uirNoAliasRewriteExpr(blk.term.condExpr, ptrBase, knownVals, knownValid, promotable,
-                                                      &funcChanged, forwardedLoads, mem2regLoads,
-                                                      proofBackedChanges, proofBacked)
-            uirNoAliasApplyExprClobber(blk.term.condExpr, njvlLite, ptrBase, &knownValid, &promotable,
+        elif uirCoreTermKindOf(term) == mtCbr && !(uirCoreTermCondExprOf(term) <= 0):
+            let condExpr: UirExpr = uirNoAliasRewriteExpr(uirCoreTermCondExprOf(term), ptrBase, knownVals, knownValid, promotable,
+                                                          &funcChanged, forwardedLoads, mem2regLoads,
+                                                          proofBackedChanges, proofBacked)
+            uirCoreBlockSetTerm(blk, uirCoreTermWithCondExpr(term, condExpr))
+            uirNoAliasApplyExprClobber(condExpr, njvlLite, ptrBase, &knownValid, &promotable,
                                        unknownSlotClobbers, unknownGlobalClobbers)
 
         if njvlLite:
-            uirNoAliasApplyKillLite(blk.stmts.len, lastUse, &knownValid, &ptrBase, killEvents)
+            uirNoAliasApplyKillLite(stmtCount, lastUse, &knownValid, &ptrBase, killEvents)
 
-    if funcChanged && changedAny != nil:
+    if funcChanged && !(changedAny == nil):
         *changedAny = true
     return funcChanged
 
@@ -536,7 +657,7 @@ fn uirNoAliasEmitReport(forwardedLoads: int32, mem2regLoads: int32, mem2regStore
     os.c_fflush f
 
 fn uirRunNoAliasPrep(module: UirModule, requireProof: bool): bool =
-    if module == nil:
+    if (module == nil):
         return false
     let njvlLite: bool = uirNoAliasParseBoolEnv("UIR_NOALIAS_NJVL_LITE", true)
     var changedAny: bool = false
@@ -552,10 +673,10 @@ fn uirRunNoAliasPrep(module: UirModule, requireProof: bool): bool =
     var killEvents: int32 = 0
     for fi in 0..<uirModuleFuncsLen(module):
         let funcView: UirFunc = uirModuleFuncAt(module, fi)
-        if funcView == nil || uirFuncIsExtern(funcView):
+        if (funcView == nil) || uirFuncIsExtern(funcView):
             continue
         let func: UirCoreFunc = funcView
-        let proofBacked: bool = func.highUirChecked && func.lowUirLowered
+        let proofBacked: bool = uirCoreFuncHighUirCheckedOf(func) && uirCoreFuncLowUirLoweredOf(func)
         if proofBacked:
             proofCheckedFuncs = proofCheckedFuncs + 1
         elif requireProof:

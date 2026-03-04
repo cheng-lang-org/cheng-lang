@@ -1,0 +1,72 @@
+# backend/c/c_emitter_expr.cheng
+import std/result
+import backend/uir/uir_types
+import backend/c/c_emitter_types
+
+fn cEmitLocalName(slot: int32): str =
+    return "l" + intToStr(slot)
+
+fn cEmitExpr(func: UirFunc, expr: UirExpr, nameMap: CEmitNameMap): Result[str] =
+    let _func: UirFunc = func
+    if expr <= 0:
+        return Ok[str]("0")
+    let k: UirExprKind = uirExprKindOf(expr)
+    if k == meConstI64:
+        return Ok[str](int64ToStr(uirExprConstValueOf(expr)))
+    if k == meLocal:
+        return Ok[str](cEmitLocalName(uirExprLocalIndexOf(expr)))
+    if k == meBin:
+        let lhsRes: Result[str] = cEmitExpr(func, uirExprLhsOf(expr), nameMap)
+        if !IsOk[str](lhsRes):
+            return lhsRes
+        let rhsRes: Result[str] = cEmitExpr(func, uirExprRhsOf(expr), nameMap)
+        if !IsOk[str](rhsRes):
+            return rhsRes
+        let op: str = cEmitBinOpToken(uirExprBinOpOf(expr))
+        if len(op) == 0:
+            return Err[str]("emit-c not-mapped: binary op")
+        return Ok[str]("(" + lhsRes.value + " " + op + " " + rhsRes.value + ")")
+    if k == meCmp:
+        let lhsRes2: Result[str] = cEmitExpr(func, uirExprLhsOf(expr), nameMap)
+        if !IsOk[str](lhsRes2):
+            return lhsRes2
+        let rhsRes2: Result[str] = cEmitExpr(func, uirExprRhsOf(expr), nameMap)
+        if !IsOk[str](rhsRes2):
+            return rhsRes2
+        let op2: str = cEmitCmpOpToken(uirExprCmpOpOf(expr))
+        if len(op2) == 0:
+            return Err[str]("emit-c not-mapped: cmp op")
+        return Ok[str]("(" + lhsRes2.value + " " + op2 + " " + rhsRes2.value + ")")
+    if k == meCall:
+        let calleeRaw: str = uirExprCalleeOf(expr)
+        let calleeC: str = cEmitNameMapGet(nameMap, calleeRaw, cEmitSanitizeIdent(calleeRaw, "fn_call"))
+        var out: str = calleeC + "("
+        for i in 0..<uirExprArgsLen(expr):
+            if i > 0:
+                out = out + ", "
+            let argRes: Result[str] = cEmitExpr(func, uirExprArgAt(expr, i), nameMap)
+            if !IsOk[str](argRes):
+                return argRes
+            out = out + argRes.value
+        out = out + ")"
+        return Ok[str](out)
+    if k == meCast:
+        let innerRes: Result[str] = cEmitExpr(func, uirExprCastExprOf(expr), nameMap)
+        if !IsOk[str](innerRes):
+            return innerRes
+        let cty: str = cEmitTypeName(uirExprCastTypeOf(expr))
+        return Ok[str]("((" + cty + ")(" + innerRes.value + "))")
+    if k == meAddr:
+        let slot: int32 = uirExprLocalIndexOf(expr)
+        return Ok[str]("((int64_t)(uintptr_t)(&" + cEmitLocalName(slot) + "))")
+    if k == meLoad:
+        let addrRes: Result[str] = cEmitExpr(func, uirExprAddrExprOf(expr), nameMap)
+        if !IsOk[str](addrRes):
+            return addrRes
+        let lty: str = cEmitTypeName(uirExprLoadTypeOf(expr))
+        return Ok[str]("(*((" + lty + "*)(uintptr_t)(" + addrRes.value + ")))")
+    if k == meGlobalAddr:
+        let gRaw: str = uirExprGlobalNameOf(expr)
+        let gName: str = cEmitSanitizeIdent(gRaw, "g")
+        return Ok[str]("((int64_t)(uintptr_t)(&" + gName + "))")
+    return Err[str]("emit-c not-mapped: expr kind")

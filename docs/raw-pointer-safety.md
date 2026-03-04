@@ -14,6 +14,9 @@
 - Host-only strict 默认（`SELFHOST_STRICT_REBUILD=1`、`BUILD_DRIVER_STRICT_NATIVE=1`）只改变自举/driver 失败策略，不放宽 `ZRPC` 与 no-pointer 规则；driver 回退链路为硬禁用。
 - `verify_backend_opt2_impl_surface` 为优化实现面 gate，不新增任何用户层裸指针语法面，也不改变 `verify_backend_rawptr_surface_forbid`/`verify_backend_rawptr_contract` 判定口径。
 - DOD/SoA 路径在生产口径纳入 ZRPC 一致性约束：编译器内部 AST/UIR/基本块应使用 Arena + SoA 连续存储，跨节点引用使用 `int32` 索引，禁止把对象裸指针作为长期关联键暴露到优化与门禁接口。
+- `std/cmdline` 已切换到 runtime bridge ingress：`__cheng_rt_paramCount/__cheng_rt_paramStr/__cheng_rt_paramStrCopy`。入口 `main` 仅调用 `cmdline.__cheng_captureCmdLine(argc, argv)` 转交 runtime C，语言层 `cmdline` 实现继续禁止 `void* / ptr_add / alloc / copyMem / setMem / *str*`，并由 `verify_backend_rawptr_surface_forbid` 阻断回归。
+- `emit:c` 已作为公开输出通道接入 `cheng/release-compile`，用于 FFI 影子桥接验收；未覆盖语义一律 `emit-c not-mapped` 硬失败，不回退到 `emit=exe`。
+- `@ffi_out_ptrs` arity 规则固定为：`tuple_len == out_ptr_count` 或 `tuple_len == out_ptr_count + 1`；违规则报 `FULLC.FFI.OUTPTR` 诊断并阻断。
 
 ### ZRPC 机器可校验契约（RPSPAR-01）
 
@@ -44,7 +47,7 @@ C 语言最常见的指针场景是传递数组或缓冲区：`void process_data
 * **Cheng 语言侧（完全零指针）**：
 在 `cheng` 中，开发者只能使用安全的切片借用，如 `&mut [u8]` 或内置的 `Buffer`。语言层完全没有指针加减法。
 * **后端的“影子垫片 (Shim)”降级**：
-得益于你采用了 **C Backend**，编译器在生成 C 代码时，会自动把安全的切片“物理拆包”，生成一个不可见的 C 包装器。
+通过 UIR 主链的 `emit:c` 输出通道，编译器会把安全切片“物理拆包”为 C ABI 形态，生成不可见的 C 包装器。
 
 **【Cheng 源码】（极其安全）：**
 
@@ -79,7 +82,7 @@ C 语言没有多返回值，遇到需要返回多个状态时，必须传入指
 * **Cheng 语言侧（优雅的元组）**：
 利用现代语言的元组（Tuple）。语言层完全禁止声明类似 `*int` 这样的未初始化输出类型。
 * **后端的“影子垫片”降级**：
-通过编译器注解，让 C Backend 自动在栈帧上分配局部变量，并**隐式地取地址（`&`）** 传递给 C 函数，最后打包成元组返回。
+通过编译器注解，让 `emit:c` 发射器在栈帧上分配局部变量，并**隐式地取地址（`&`）** 传递给 C 函数，最后打包成元组返回。
 
 **【Cheng 源码】（优雅的多返回值）：**
 
@@ -121,7 +124,7 @@ C 库极其喜欢返回你不该触碰的黑盒指针，比如 `sqlite3*` 或 `G
 
 ```cheng
 // 语言层只知道它是个纯数字句柄（Token ID），绝对无法解引用
-type SqliteDb = distinct u32 
+type SqliteDb = uint32 
 
 importc fn sqlite3_close(db: SqliteDb)
 

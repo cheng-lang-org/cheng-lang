@@ -3,6 +3,9 @@ import std/os
 import std/strings
 import std/strutils
 
+fn uirCoreSsuRecursionLimit(): int32 =
+    return 256
+
 fn uirCoreSsuLowerAscii(s: str): str =
     return strutils.toLowerAscii(s)
 
@@ -17,123 +20,143 @@ fn uirCoreSsuParseBoolEnv(name: str, defaultValue: bool): bool =
         return false
     return defaultValue
 
-fn uirCoreSsuExprMarkUses(expr: UirCoreExpr, counts: int32[]*) =
-    if expr == nil || counts == nil:
+fn uirCoreSsuExprMarkUsesInner(expr: UirExprId, counts: int32[]*, depth: int32*) =
+    if (!uirCoreExprIdValid(expr)) || (counts == nil) || (depth == nil):
         return
-    let k: UirCoreExprKind = expr.kind
+    if *depth >= uirCoreSsuRecursionLimit():
+        for i in 0..<counts->len:
+            counts[i] = counts[i] + 1
+        return
+    *depth = *depth + 1
+    let k: UirCoreExprKind = uirCoreExprKindOf(expr)
     if k == meLocal:
-        let slot: int32 = expr.localIndex
+        let slot: int32 = uirCoreExprLocalIndexOf(expr)
         if slot >= 0 && slot < counts->len:
             counts[slot] = counts[slot] + 1
-        return
-    if k == meBin || k == meCmp:
-        uirCoreSsuExprMarkUses(expr.lhs, counts)
-        uirCoreSsuExprMarkUses(expr.rhs, counts)
-        return
-    if k == meCall:
-        for i in 0..<expr.args.len:
-            uirCoreSsuExprMarkUses(expr.args[i], counts)
-        return
-    if k == meCast:
-        uirCoreSsuExprMarkUses(expr.castExpr, counts)
-        return
-    if k == meLoad:
-        uirCoreSsuExprMarkUses(expr.addrExpr, counts)
-        return
+    elif k == meBin || k == meCmp:
+        uirCoreSsuExprMarkUsesInner(uirCoreExprLhsOf(expr), counts, depth)
+        uirCoreSsuExprMarkUsesInner(uirCoreExprRhsOf(expr), counts, depth)
+    elif k == meCall:
+        for i in 0..<uirCoreExprArgsLen(expr):
+            uirCoreSsuExprMarkUsesInner(uirCoreExprArgAt(expr, i), counts, depth)
+    elif k == meCast:
+        uirCoreSsuExprMarkUsesInner(uirCoreExprCastExprOf(expr), counts, depth)
+    elif k == meLoad:
+        uirCoreSsuExprMarkUsesInner(uirCoreExprAddrExprOf(expr), counts, depth)
+    *depth = *depth - 1
 
-fn uirCoreSsuStmtMarkUses(stmt: UirCoreStmt, counts: int32[]*) =
-    if counts == nil:
+fn uirCoreSsuExprMarkUses(expr: UirExprId, counts: int32[]*) =
+    var depth: int32 = 0
+    uirCoreSsuExprMarkUsesInner(expr, counts, &depth)
+
+fn uirCoreSsuStmtMarkUses(stmt: UirStmtId, counts: int32[]*) =
+    if (counts == nil):
         return
-    uirCoreSsuExprMarkUses(stmt.expr, counts)
-    uirCoreSsuExprMarkUses(stmt.addrExpr, counts)
+    uirCoreSsuExprMarkUses(uirCoreStmtExprOf(stmt), counts)
+    uirCoreSsuExprMarkUses(uirCoreStmtAddrExprOf(stmt), counts)
 
 fn uirCoreSsuTermMarkUses(term: UirCoreTerm, counts: int32[]*) =
-    if counts == nil:
+    if (counts == nil):
         return
-    if term.kind == mtRet:
-        uirCoreSsuExprMarkUses(term.retExpr, counts)
-    elif term.kind == mtCbr:
-        uirCoreSsuExprMarkUses(term.condExpr, counts)
+    if uirCoreTermKindOf(term) == mtRet:
+        uirCoreSsuExprMarkUses(uirCoreTermRetExprOf(term), counts)
+    elif uirCoreTermKindOf(term) == mtCbr:
+        uirCoreSsuExprMarkUses(uirCoreTermCondExprOf(term), counts)
 
-fn uirCoreSsuExprUsesSlot(expr: UirCoreExpr, slot: int32): bool =
-    if expr == nil || slot < 0:
+fn uirCoreSsuExprUsesSlotInner(expr: UirExprId, slot: int32, depth: int32*): bool =
+    if (!uirCoreExprIdValid(expr)) || slot < 0 || (depth == nil):
         return false
-    let k: UirCoreExprKind = expr.kind
+    if *depth >= uirCoreSsuRecursionLimit():
+        return true
+    *depth = *depth + 1
+    var out: bool = false
+    let k: UirCoreExprKind = uirCoreExprKindOf(expr)
     if k == meLocal:
-        return expr.localIndex == slot
-    if k == meBin || k == meCmp:
-        return uirCoreSsuExprUsesSlot(expr.lhs, slot) ||
-               uirCoreSsuExprUsesSlot(expr.rhs, slot)
-    if k == meCall:
-        for i in 0..<expr.args.len:
-            if uirCoreSsuExprUsesSlot(expr.args[i], slot):
-                return true
-        return false
-    if k == meCast:
-        return uirCoreSsuExprUsesSlot(expr.castExpr, slot)
-    if k == meLoad:
-        return uirCoreSsuExprUsesSlot(expr.addrExpr, slot)
-    return false
+        out = uirCoreExprLocalIndexOf(expr) == slot
+    elif k == meBin || k == meCmp:
+        out = uirCoreSsuExprUsesSlotInner(uirCoreExprLhsOf(expr), slot, depth) ||
+              uirCoreSsuExprUsesSlotInner(uirCoreExprRhsOf(expr), slot, depth)
+    elif k == meCall:
+        for i in 0..<uirCoreExprArgsLen(expr):
+            if uirCoreSsuExprUsesSlotInner(uirCoreExprArgAt(expr, i), slot, depth):
+                out = true
+                break
+    elif k == meCast:
+        out = uirCoreSsuExprUsesSlotInner(uirCoreExprCastExprOf(expr), slot, depth)
+    elif k == meLoad:
+        out = uirCoreSsuExprUsesSlotInner(uirCoreExprAddrExprOf(expr), slot, depth)
+    else:
+        out = false
+    *depth = *depth - 1
+    return out
 
-fn uirCoreSsuStmtUsesSlot(stmt: UirCoreStmt, slot: int32): bool =
-    return uirCoreSsuExprUsesSlot(stmt.expr, slot) ||
-           uirCoreSsuExprUsesSlot(stmt.addrExpr, slot)
+fn uirCoreSsuExprUsesSlot(expr: UirExprId, slot: int32): bool =
+    var depth: int32 = 0
+    return uirCoreSsuExprUsesSlotInner(expr, slot, &depth)
+
+fn uirCoreSsuStmtUsesSlot(stmt: UirStmtId, slot: int32): bool =
+    return uirCoreSsuExprUsesSlot(uirCoreStmtExprOf(stmt), slot) ||
+           uirCoreSsuExprUsesSlot(uirCoreStmtAddrExprOf(stmt), slot)
 
 fn uirCoreSsuTermUsesSlot(term: UirCoreTerm, slot: int32): bool =
-    if term.kind == mtRet:
-        return uirCoreSsuExprUsesSlot(term.retExpr, slot)
-    if term.kind == mtCbr:
-        return uirCoreSsuExprUsesSlot(term.condExpr, slot)
+    if uirCoreTermKindOf(term) == mtRet:
+        return uirCoreSsuExprUsesSlot(uirCoreTermRetExprOf(term), slot)
+    if uirCoreTermKindOf(term) == mtCbr:
+        return uirCoreSsuExprUsesSlot(uirCoreTermCondExprOf(term), slot)
     return false
 
-fn uirCoreSsuCopySrcSlot(stmt: UirCoreStmt, srcSlot: int32*): bool =
-    if srcSlot != nil:
+fn uirCoreSsuCopySrcSlot(stmt: UirStmtId, srcSlot: int32*): bool =
+    if !(srcSlot == nil):
         *srcSlot = -1
-    if stmt.kind != msLet && stmt.kind != msVar && stmt.kind != msAssign:
+    let kind: UirCoreStmtKind = uirCoreStmtKindOf(stmt)
+    let dstSlot: int32 = uirCoreStmtSlotOf(stmt)
+    if kind != msLet && kind != msVar && kind != msAssign:
         return false
-    if stmt.slot < 0:
+    if dstSlot < 0:
         return false
-    let e: UirCoreExpr = stmt.expr
-    if e == nil || e.kind != meLocal:
+    let e: UirExprId = uirCoreStmtExprOf(stmt)
+    if (!uirCoreExprIdValid(e)) || uirCoreExprKindOf(e) != meLocal:
         return false
-    let src: int32 = e.localIndex
-    if src < 0 || src == stmt.slot:
+    let src: int32 = uirCoreExprLocalIndexOf(e)
+    if src < 0 || src == dstSlot:
         return false
-    if srcSlot != nil:
+    if !(srcSlot == nil):
         *srcSlot = src
     return true
 
 fn uirCoreSsuIsMoveCandidate(func: UirCoreFunc, blockIdx: int32, stmtIdx: int32): bool =
-    if func == nil || func.isExtern || blockIdx < 0 || stmtIdx < 0 || blockIdx >= func.blocks.len:
+    if (!uirCoreFuncIdValid(func)) || uirCoreFuncIsExtern(func) || blockIdx < 0 || stmtIdx < 0 || blockIdx >= uirCoreFuncBlocksLen(func):
         return false
-    let blk: UirCoreBlock = func.blocks[blockIdx]
-    if blk == nil || stmtIdx >= blk.stmts.len:
+    let blk: UirBlockId = uirCoreFuncBlockAt(func, blockIdx)
+    let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+    if (!uirCoreBlockIdValid(blk)) || stmtIdx >= stmtCount:
         return false
     var srcSlot: int32 = -1
-    if !uirCoreSsuCopySrcSlot(blk.stmts[stmtIdx], &srcSlot):
+    if !uirCoreSsuCopySrcSlot(uirCoreBlockStmtAt(blk, stmtIdx), &srcSlot):
         return false
-    for si in stmtIdx + 1..<blk.stmts.len:
-        if uirCoreSsuStmtUsesSlot(blk.stmts[si], srcSlot):
+    for si in stmtIdx + 1..<stmtCount:
+        if uirCoreSsuStmtUsesSlot(uirCoreBlockStmtAt(blk, si), srcSlot):
             return false
-    if uirCoreSsuTermUsesSlot(blk.term, srcSlot):
+    if uirCoreSsuTermUsesSlot(uirCoreBlockTermOf(blk), srcSlot):
         return false
     return true
 
 fn uirCoreSsuCopyKind(func: UirCoreFunc, blockIdx: int32, stmtIdx: int32): int32 =
-    if func == nil || blockIdx < 0 || stmtIdx < 0 || blockIdx >= func.blocks.len:
+    if (!uirCoreFuncIdValid(func)) || blockIdx < 0 || stmtIdx < 0 || blockIdx >= uirCoreFuncBlocksLen(func):
         return 0
-    let blk: UirCoreBlock = func.blocks[blockIdx]
-    if blk == nil || stmtIdx >= blk.stmts.len:
+    let blk: UirBlockId = uirCoreFuncBlockAt(func, blockIdx)
+    let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+    if (!uirCoreBlockIdValid(blk)) || stmtIdx >= stmtCount:
         return 0
     var srcSlot: int32 = -1
-    if !uirCoreSsuCopySrcSlot(blk.stmts[stmtIdx], &srcSlot):
+    if !uirCoreSsuCopySrcSlot(uirCoreBlockStmtAt(blk, stmtIdx), &srcSlot):
         return 0
     if uirCoreSsuIsMoveCandidate(func, blockIdx, stmtIdx):
         return 2
     return 1
 
 fn uirCoreSsuEmitReport(module: UirCoreModule): bool =
-    if module == nil:
+    if (module == nil):
         return false
     var enabled: bool = uirCoreSsuParseBoolEnv("UIR_SSU", true)
     var dupCandidates: int32 = 0
@@ -141,27 +164,30 @@ fn uirCoreSsuEmitReport(module: UirCoreModule): bool =
     var useVersionMax: int32 = 0
     var trackedFuncs: int32 = 0
     if enabled:
-        for fi in 0..<module.funcs.len:
-            let func: UirCoreFunc = module.funcs[fi]
-            if func == nil || func.isExtern:
+        let funcCount: int32 = uirCoreModuleFuncsLen(module)
+        for fi in 0..<funcCount:
+            let func: UirCoreFunc = uirCoreModuleFuncAt(module, fi)
+            if (!uirCoreFuncIdValid(func)) || uirCoreFuncIsExtern(func):
                 continue
             trackedFuncs = trackedFuncs + 1
-            let localCount: int32 = func.localTypes.len
+            let localCount: int32 = uirCoreFuncLocalTypesLen(func)
             var useCounts: int32[]
             for i0 in 0..<localCount:
                 add(useCounts, 0)
-            for bi in 0..<func.blocks.len:
-                let blk: UirCoreBlock = func.blocks[bi]
-                if blk == nil:
+            let blockCount: int32 = uirCoreFuncBlocksLen(func)
+            for bi in 0..<blockCount:
+                let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+                if (!uirCoreBlockIdValid(blk)):
                     continue
-                for si in 0..<blk.stmts.len:
-                    uirCoreSsuStmtMarkUses(blk.stmts[si], &useCounts)
+                let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+                for si in 0..<stmtCount:
+                    uirCoreSsuStmtMarkUses(uirCoreBlockStmtAt(blk, si), &useCounts)
                     let ck: int32 = uirCoreSsuCopyKind(func, bi, si)
                     if ck == 2:
                         moveCandidates = moveCandidates + 1
                     elif ck == 1:
                         dupCandidates = dupCandidates + 1
-                uirCoreSsuTermMarkUses(blk.term, &useCounts)
+                uirCoreSsuTermMarkUses(uirCoreBlockTermOf(blk), &useCounts)
             for i in 0..<useCounts.len:
                 if useCounts[i] > useVersionMax:
                     useVersionMax = useCounts[i]

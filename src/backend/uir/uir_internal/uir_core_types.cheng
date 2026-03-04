@@ -1,14 +1,32 @@
-# MIR v1 types (expression-tree based, MVP).
+# MIR/UIR core types.
+# Runtime path is ID/SoA based (`UirExprId/UirStmtId/UirBlockId/UirFuncId`).
 import std/seqs
 import std/strings
 import std/result
 import std/hashmaps
+import std/rawmem_support
 
 fn uirCoreOwnStr(s: str): str =
-    if len(s) == 0:
+    let n: int32 = len(s)
+    if n <= 0:
         return ""
-    memRetain(void*(s))
-    return s
+    # Avoid rawmem/ptr string cloning in stage0-sensitive paths; use a stable
+    # language-level byte copy to preserve literal payloads.
+    var out: str = ""
+    for i in 0..<n:
+        out = out + charToStr(s[i])
+    return out
+
+fn uirCoreStrPtrSane(s: str): bool =
+    # Stage0 crash hardening: validate object and C-string pointers before any
+    # operation that may dereference string contents (len/hash/strcmp).
+    let objPtr: int64 = int64(rawmemAsVoid(s))
+    if objPtr != 0 && objPtr <= 4096:
+        return false
+    let n: int32 = len(s)
+    if n < 0 || n > (1 << 20):
+        return false
+    return true
 
 type
     UirCoreTypeKind = enum
@@ -29,33 +47,15 @@ type
         meConstI64, meBin, meCmp, meLocal, meCall, meCast,
         meAddr, meLoad, meGlobalAddr
 
-    UirCoreExpr = ref
-        kind: UirCoreExprKind
-        value: int64
-        binOp: UirCoreBinOp
-        cmpOp: UirCoreCmpOp
-        lhs: UirCoreExpr
-        rhs: UirCoreExpr
-        localIndex: int32
-        callee: str
-        args: UirCoreExpr[]
-        castType: UirCoreType
-        castExpr: UirCoreExpr
-        addrExpr: UirCoreExpr
-        loadType: UirCoreType
-        globalName: str
+    UirExprId = int32
+    UirStmtId = int32
+    UirBlockId = int32
+    UirFuncId = int32
+    # SoA hard-cut runtime alias contract: statement handle is ID-only.
+    UirCoreStmt = UirStmtId
 
     UirCoreStmtKind = enum
         msLet, msVar, msAssign, msExpr, msParam, msStore
-
-    UirCoreStmt =
-        kind: UirCoreStmtKind
-        name: str
-        slot: int32
-        expr: UirCoreExpr
-        paramIndex: int32
-        addrExpr: UirCoreExpr
-        storeType: UirCoreType
 
     UirCoreParam =
         name: str
@@ -68,16 +68,11 @@ type
 
     UirCoreTerm =
         kind: UirCoreTermKind
-        retExpr: UirCoreExpr
-        condExpr: UirCoreExpr
+        retExpr: UirExprId
+        condExpr: UirExprId
         target: str
         targetTrue: str
         targetFalse: str
-
-    UirCoreBlock = ref
-        label: str
-        stmts: UirCoreStmt[]
-        term: UirCoreTerm
 
     UirCoreFunc = ref
         name: str
@@ -90,7 +85,7 @@ type
         localTypes: UirCoreType[]
         objLocals: UirCoreObjLocal[]
         objFrameSize: int32
-        blocks: UirCoreBlock[]
+        blocks: UirBlockId[]
         # P4 phase contract: single-IR dual-phase bookkeeping.
         phaseTag: int32
         highUirChecked: bool
@@ -140,6 +135,1058 @@ type
         globals: UirCoreGlobal[]
         typeAliases: UirCoreTypeAlias[]
         objTypes: UirCoreObjType[]
+
+    UirCoreSoa = ref
+        exprKind: UirCoreExprKind[]
+        exprType: UirCoreType[]
+        exprA: int32[]
+        exprB: int32[]
+        exprC: int32[]
+        exprImm: int64[]
+        exprStrId: int32[]
+        stmtKind: UirCoreStmtKind[]
+        stmtDst: int32[]
+        stmtExpr: int32[]
+        stmtNext: int32[]
+        blockFirstStmt: int32[]
+        blockTermKind: UirCoreTermKind[]
+        blockTermA: int32[]
+        blockTermB: int32[]
+        succStart: int32[]
+        succLen: int32[]
+        succEdges: int32[]
+        predStart: int32[]
+        predLen: int32[]
+        predEdges: int32[]
+
+    UirCoreSoaArena =
+        exprCap: int32
+        stmtCap: int32
+        blockCap: int32
+        edgeCap: int32
+
+    UirCoreSoaFuncSpan =
+        funcIndex: int32
+        exprStart: int32
+        exprLen: int32
+        stmtStart: int32
+        stmtLen: int32
+        blockStart: int32
+        blockLen: int32
+        succStart: int32
+        succLen: int32
+        predStart: int32
+        predLen: int32
+
+    UirCoreSoaModule = ref
+        arena: UirCoreSoaArena
+        exprKind: UirCoreExprKind[]
+        exprType: UirCoreType[]
+        exprA: int32[]
+        exprB: int32[]
+        exprC: int32[]
+        exprImm: int64[]
+        exprStrId: int32[]
+        stmtKind: UirCoreStmtKind[]
+        stmtDst: int32[]
+        stmtExpr: int32[]
+        stmtNext: int32[]
+        blockFirstStmt: int32[]
+        blockTermKind: UirCoreTermKind[]
+        blockTermA: int32[]
+        blockTermB: int32[]
+        succStart: int32[]
+        succLen: int32[]
+        succEdges: int32[]
+        predStart: int32[]
+        predLen: int32[]
+        predEdges: int32[]
+        funcSpans: UirCoreSoaFuncSpan[]
+
+var
+    uirCore_exprPool_ready: bool = false
+    uirCore_exprPool_kind: UirCoreExprKind[]
+    uirCore_exprPool_value: int64[]
+    uirCore_exprPool_binOp: UirCoreBinOp[]
+    uirCore_exprPool_cmpOp: UirCoreCmpOp[]
+    uirCore_exprPool_lhs: UirExprId[]
+    uirCore_exprPool_rhs: UirExprId[]
+    uirCore_exprPool_localIndex: int32[]
+    uirCore_exprPool_callee: str[]
+    uirCore_exprPool_args: UirExprId[][]
+    uirCore_exprPool_castType: UirCoreType[]
+    uirCore_exprPool_castExpr: UirExprId[]
+    uirCore_exprPool_addrExpr: UirExprId[]
+    uirCore_exprPool_loadType: UirCoreType[]
+    uirCore_exprPool_globalName: str[]
+    uirCore_stmtPool_ready: bool = false
+    uirCore_stmtPool_kind: UirCoreStmtKind[]
+    uirCore_stmtPool_name: str[]
+    uirCore_stmtPool_slot: int32[]
+    uirCore_stmtPool_expr: UirExprId[]
+    uirCore_stmtPool_paramIndex: int32[]
+    uirCore_stmtPool_addrExpr: UirExprId[]
+    uirCore_stmtPool_storeType: UirCoreType[]
+    uirCore_blockPool_ready: bool = false
+    uirCore_blockPool_label: str[]
+    uirCore_blockPool_stmts: UirStmtId[][]
+    uirCore_blockPool_term: UirCoreTerm[]
+
+fn uirCore_exprPoolInit() =
+    if uirCore_exprPool_ready:
+        return
+    uirCore_exprPool_kind = []
+    uirCore_exprPool_value = []
+    uirCore_exprPool_binOp = []
+    uirCore_exprPool_cmpOp = []
+    uirCore_exprPool_lhs = []
+    uirCore_exprPool_rhs = []
+    uirCore_exprPool_localIndex = []
+    uirCore_exprPool_callee = []
+    uirCore_exprPool_args = []
+    uirCore_exprPool_castType = []
+    uirCore_exprPool_castExpr = []
+    uirCore_exprPool_addrExpr = []
+    uirCore_exprPool_loadType = []
+    uirCore_exprPool_globalName = []
+    add(uirCore_exprPool_kind, meConstI64)
+    add(uirCore_exprPool_value, int64(0))
+    add(uirCore_exprPool_binOp, mbAdd)
+    add(uirCore_exprPool_cmpOp, mcEq)
+    add(uirCore_exprPool_lhs, int32(0))
+    add(uirCore_exprPool_rhs, int32(0))
+    add(uirCore_exprPool_localIndex, int32(-1))
+    add(uirCore_exprPool_callee, "")
+    add(uirCore_exprPool_args, [])
+    add(uirCore_exprPool_castType, uirCoreTypeVoid())
+    add(uirCore_exprPool_castExpr, int32(0))
+    add(uirCore_exprPool_addrExpr, int32(0))
+    add(uirCore_exprPool_loadType, uirCoreTypeVoid())
+    add(uirCore_exprPool_globalName, "")
+    uirCore_exprPool_ready = true
+
+fn uirCore_stmtPoolInit() =
+    if uirCore_stmtPool_ready:
+        return
+    uirCore_stmtPool_kind = []
+    uirCore_stmtPool_name = []
+    uirCore_stmtPool_slot = []
+    uirCore_stmtPool_expr = []
+    uirCore_stmtPool_paramIndex = []
+    uirCore_stmtPool_addrExpr = []
+    uirCore_stmtPool_storeType = []
+    add(uirCore_stmtPool_kind, msExpr)
+    add(uirCore_stmtPool_name, "")
+    add(uirCore_stmtPool_slot, int32(-1))
+    add(uirCore_stmtPool_expr, int32(0))
+    add(uirCore_stmtPool_paramIndex, int32(-1))
+    add(uirCore_stmtPool_addrExpr, int32(0))
+    add(uirCore_stmtPool_storeType, uirCoreTypeVoid())
+    uirCore_stmtPool_ready = true
+
+fn uirCore_blockPoolInit() =
+    if uirCore_blockPool_ready:
+        return
+    uirCore_blockPool_label = []
+    uirCore_blockPool_stmts = []
+    uirCore_blockPool_term = []
+    var nilTerm: UirCoreTerm
+    nilTerm.kind = mtBr
+    nilTerm.retExpr = 0
+    nilTerm.condExpr = 0
+    nilTerm.target = ""
+    nilTerm.targetTrue = ""
+    nilTerm.targetFalse = ""
+    add(uirCore_blockPool_label, "")
+    add(uirCore_blockPool_stmts, [])
+    add(uirCore_blockPool_term, nilTerm)
+    uirCore_blockPool_ready = true
+
+fn rawmemIsNil(expr: UirExprId): bool =
+    return expr <= 0
+
+fn rawmemIsNil(blk: UirBlockId): bool =
+    return blk <= 0
+
+fn rawmemIsNil(v: int32): bool =
+    return v <= 0
+
+fn rawmemIsNil(func: UirCoreFunc): bool =
+    return !uirCoreFuncIdValid(func)
+
+fn rawmemIsNil(module: UirCoreModule): bool =
+    return module == nil
+
+fn rawmemIsNil(soa: UirCoreSoa): bool =
+    return soa == nil
+
+fn rawmemIsNil(soaMod: UirCoreSoaModule): bool =
+    return soaMod == nil
+
+fn rawmemIsNil(indexMap: hashmaps.HashMapStrInt*): bool =
+    return indexMap == nil
+
+fn rawmemIsNil(strPool: str[]*): bool =
+    return strPool == nil
+
+fn rawmemIsNil(depth: int32*): bool =
+    return depth == nil
+
+fn rawmemIsNil(flagPtr: bool*): bool =
+    return flagPtr == nil
+
+fn rawmemIsNil(seqInst: bool[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: int32[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: int64[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreType[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreTypeAlias[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreObjType[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreGlobal[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreCString[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreFunc[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirExprId[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirBlockId[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreParam[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreObjLocal[]*): bool =
+    return seqInst == nil
+
+fn rawmemIsNil(seqInst: UirCoreObjField[]*): bool =
+    return seqInst == nil
+
+fn uirCoreExprIdValid(expr: UirExprId): bool =
+    if expr <= 0:
+        return false
+    if !uirCore_exprPool_ready:
+        return false
+    if expr >= uirCore_exprPool_kind.len:
+        return false
+    # Stage0 crash hardening: keep SoA columns in lock-step before any lookup.
+    if expr >= uirCore_exprPool_value.len:
+        return false
+    if expr >= uirCore_exprPool_binOp.len:
+        return false
+    if expr >= uirCore_exprPool_cmpOp.len:
+        return false
+    if expr >= uirCore_exprPool_lhs.len:
+        return false
+    if expr >= uirCore_exprPool_rhs.len:
+        return false
+    if expr >= uirCore_exprPool_localIndex.len:
+        return false
+    if expr >= uirCore_exprPool_callee.len:
+        return false
+    if expr >= uirCore_exprPool_args.len:
+        return false
+    if expr >= uirCore_exprPool_castType.len:
+        return false
+    if expr >= uirCore_exprPool_castExpr.len:
+        return false
+    if expr >= uirCore_exprPool_addrExpr.len:
+        return false
+    if expr >= uirCore_exprPool_loadType.len:
+        return false
+    if expr >= uirCore_exprPool_globalName.len:
+        return false
+    return true
+
+fn uirCoreBlockIdValid(blk: UirBlockId): bool =
+    if blk <= 0:
+        return false
+    if !uirCore_blockPool_ready:
+        return false
+    if blk >= uirCore_blockPool_label.len:
+        return false
+    if blk >= uirCore_blockPool_stmts.len:
+        return false
+    if blk >= uirCore_blockPool_term.len:
+        return false
+    return true
+
+fn uirCoreStmtIdValid(stmt: UirStmtId): bool =
+    if stmt <= 0:
+        return false
+    if !uirCore_stmtPool_ready:
+        return false
+    if stmt >= uirCore_stmtPool_kind.len:
+        return false
+    if stmt >= uirCore_stmtPool_name.len:
+        return false
+    if stmt >= uirCore_stmtPool_slot.len:
+        return false
+    if stmt >= uirCore_stmtPool_expr.len:
+        return false
+    if stmt >= uirCore_stmtPool_paramIndex.len:
+        return false
+    if stmt >= uirCore_stmtPool_addrExpr.len:
+        return false
+    if stmt >= uirCore_stmtPool_storeType.len:
+        return false
+    return true
+
+fn uirCoreInvalidId(): int32 =
+    return int32(-1)
+
+fn uirCoreFuncIdValid(id: UirFuncId): bool =
+    return id >= 0
+
+fn uirCoreFuncIdValid(func: UirCoreFunc): bool =
+    if func == nil:
+        return false
+    # Stage0 crash hardening: reject clearly invalid low-address refs before
+    # any field dereference in fixup/profile paths.
+    let ptrVal: int64 = int64(rawmemAsVoid(func))
+    return ptrVal > 4096
+
+fn uirCoreSoaNew(): UirCoreSoa =
+    var soa: UirCoreSoa
+    new soa
+    soa.exprKind = []
+    soa.exprType = []
+    soa.exprA = []
+    soa.exprB = []
+    soa.exprC = []
+    soa.exprImm = []
+    soa.exprStrId = []
+    soa.stmtKind = []
+    soa.stmtDst = []
+    soa.stmtExpr = []
+    soa.stmtNext = []
+    soa.blockFirstStmt = []
+    soa.blockTermKind = []
+    soa.blockTermA = []
+    soa.blockTermB = []
+    soa.succStart = []
+    soa.succLen = []
+    soa.succEdges = []
+    soa.predStart = []
+    soa.predLen = []
+    soa.predEdges = []
+    return soa
+
+fn uirCoreSoaExprCount(soa: UirCoreSoa): int32 =
+    if (soa == nil):
+        return 0
+    return soa.exprKind.len
+
+fn uirCoreSoaStmtCount(soa: UirCoreSoa): int32 =
+    if (soa == nil):
+        return 0
+    return soa.stmtKind.len
+
+fn uirCoreSoaBlockCount(soa: UirCoreSoa): int32 =
+    if (soa == nil):
+        return 0
+    return soa.blockFirstStmt.len
+
+fn uirCoreSoaAppendExpr(soa: UirCoreSoa, kind: UirCoreExprKind, ty: UirCoreType,
+                        a: int32, b: int32, c: int32, imm: int64, strId: int32): UirExprId =
+    if (soa == nil):
+        return uirCoreInvalidId()
+    add(soa.exprKind, kind)
+    add(soa.exprType, ty)
+    add(soa.exprA, a)
+    add(soa.exprB, b)
+    add(soa.exprC, c)
+    add(soa.exprImm, imm)
+    add(soa.exprStrId, strId)
+    return soa.exprKind.len - 1
+
+fn uirCoreSoaAppendStmt(soa: UirCoreSoa, kind: UirCoreStmtKind, dst: int32,
+                        expr: int32, next: int32): UirStmtId =
+    if (soa == nil):
+        return uirCoreInvalidId()
+    add(soa.stmtKind, kind)
+    add(soa.stmtDst, dst)
+    add(soa.stmtExpr, expr)
+    add(soa.stmtNext, next)
+    return soa.stmtKind.len - 1
+
+fn uirCoreSoaAppendBlock(soa: UirCoreSoa, firstStmt: int32, termKind: UirCoreTermKind,
+                         termA: int32, termB: int32): UirBlockId =
+    if (soa == nil):
+        return uirCoreInvalidId()
+    add(soa.blockFirstStmt, firstStmt)
+    add(soa.blockTermKind, termKind)
+    add(soa.blockTermA, termA)
+    add(soa.blockTermB, termB)
+    add(soa.succStart, soa.succEdges.len)
+    add(soa.succLen, int32(0))
+    add(soa.predStart, soa.predEdges.len)
+    add(soa.predLen, int32(0))
+    return soa.blockFirstStmt.len - 1
+
+fn uirCoreSoaArenaZero(): UirCoreSoaArena =
+    var arena: UirCoreSoaArena
+    arena.exprCap = 0
+    arena.stmtCap = 0
+    arena.blockCap = 0
+    arena.edgeCap = 0
+    return arena
+
+fn uirCoreSoaArenaAccumulate(arena: var UirCoreSoaArena, exprCap: int32, stmtCap: int32,
+                             blockCap: int32, edgeCap: int32) =
+    if exprCap > 0:
+        arena.exprCap = arena.exprCap + exprCap
+    if stmtCap > 0:
+        arena.stmtCap = arena.stmtCap + stmtCap
+    if blockCap > 0:
+        arena.blockCap = arena.blockCap + blockCap
+    if edgeCap > 0:
+        arena.edgeCap = arena.edgeCap + edgeCap
+
+fn uirCoreSoaEstimateFuncArena(func: UirCoreFunc): UirCoreSoaArena =
+    var arena: UirCoreSoaArena = uirCoreSoaArenaZero()
+    if (!uirCoreFuncIdValid(func)):
+        return arena
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+        let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+        # Heuristic: expressions are at least one per stmt, and binary/call trees
+        # typically contribute an additional node. Keep this linear and cache-friendly.
+        let exprCap: int32 = stmtCount * 2 + 4
+        let edgeCap: int32 = 2
+        uirCoreSoaArenaAccumulate(arena, exprCap, stmtCount, 1, edgeCap)
+    return arena
+
+fn uirCoreSoaReserveModuleColumns(soa: UirCoreSoaModule, arena: UirCoreSoaArena) =
+    if (soa == nil):
+        return
+    if arena.exprCap > 0:
+        reserve(soa.exprKind, arena.exprCap)
+        reserve(soa.exprType, arena.exprCap)
+        reserve(soa.exprA, arena.exprCap)
+        reserve(soa.exprB, arena.exprCap)
+        reserve(soa.exprC, arena.exprCap)
+        reserve(soa.exprImm, arena.exprCap)
+        reserve(soa.exprStrId, arena.exprCap)
+    if arena.stmtCap > 0:
+        reserve(soa.stmtKind, arena.stmtCap)
+        reserve(soa.stmtDst, arena.stmtCap)
+        reserve(soa.stmtExpr, arena.stmtCap)
+        reserve(soa.stmtNext, arena.stmtCap)
+    if arena.blockCap > 0:
+        reserve(soa.blockFirstStmt, arena.blockCap)
+        reserve(soa.blockTermKind, arena.blockCap)
+        reserve(soa.blockTermA, arena.blockCap)
+        reserve(soa.blockTermB, arena.blockCap)
+        reserve(soa.succStart, arena.blockCap)
+        reserve(soa.succLen, arena.blockCap)
+        reserve(soa.predStart, arena.blockCap)
+        reserve(soa.predLen, arena.blockCap)
+        reserve(soa.funcSpans, arena.blockCap)
+    if arena.edgeCap > 0:
+        reserve(soa.succEdges, arena.edgeCap)
+        reserve(soa.predEdges, arena.edgeCap)
+
+fn uirCoreSoaModuleNew(arena: UirCoreSoaArena): UirCoreSoaModule =
+    var soa: UirCoreSoaModule
+    new soa
+    soa.arena = arena
+    soa.exprKind = []
+    soa.exprType = []
+    soa.exprA = []
+    soa.exprB = []
+    soa.exprC = []
+    soa.exprImm = []
+    soa.exprStrId = []
+    soa.stmtKind = []
+    soa.stmtDst = []
+    soa.stmtExpr = []
+    soa.stmtNext = []
+    soa.blockFirstStmt = []
+    soa.blockTermKind = []
+    soa.blockTermA = []
+    soa.blockTermB = []
+    soa.succStart = []
+    soa.succLen = []
+    soa.succEdges = []
+    soa.predStart = []
+    soa.predLen = []
+    soa.predEdges = []
+    soa.funcSpans = []
+    uirCoreSoaReserveModuleColumns(soa, arena)
+    return soa
+
+fn uirCoreSoaExprFieldNeedsExprRebase(kind: UirCoreExprKind, fieldIndex: int32): bool =
+    if fieldIndex <= 0:
+        return kind == meBin || kind == meCmp || kind == meCall || kind == meCast || kind == meLoad
+    if fieldIndex == 1:
+        return kind == meBin || kind == meCmp || kind == meCall
+    if fieldIndex == 2:
+        return kind == meCall
+    return false
+
+fn uirCoreSoaTermExprRebaseNeeded(kind: UirCoreTermKind, fieldIndex: int32): bool =
+    if kind == mtRet && fieldIndex == 0:
+        return true
+    if kind == mtCbr && fieldIndex == 0:
+        return true
+    return false
+
+fn uirCoreSoaTermBlockRebaseNeeded(kind: UirCoreTermKind, fieldIndex: int32): bool =
+    if kind == mtBr && fieldIndex == 0:
+        return true
+    if kind == mtCbr && fieldIndex == 1:
+        return true
+    return false
+
+fn uirCoreSoaRebaseExprId(raw: int32, base: int32): int32 =
+    if ! uirCoreExprIdValid(raw):
+        return raw
+    return raw + base
+
+fn uirCoreSoaRebaseStmtId(raw: int32, base: int32): int32 =
+    if ! uirCoreStmtIdValid(raw):
+        return raw
+    return raw + base
+
+fn uirCoreSoaRebaseBlockId(raw: int32, base: int32): int32 =
+    if ! uirCoreBlockIdValid(raw):
+        return raw
+    return raw + base
+
+fn uirCoreSoaModuleRollbackAppend(soaMod: UirCoreSoaModule,
+                                  exprLen: int32,
+                                  stmtLen: int32,
+                                  blockLen: int32,
+                                  succLen: int32,
+                                  predLen: int32,
+                                  spanLen: int32) =
+    if (soaMod == nil):
+        return
+    if exprLen >= 0 && exprLen <= soaMod.exprKind.len:
+        soaMod.exprKind.len = exprLen
+        if exprLen <= soaMod.exprType.len:
+            soaMod.exprType.len = exprLen
+        if exprLen <= soaMod.exprA.len:
+            soaMod.exprA.len = exprLen
+        if exprLen <= soaMod.exprB.len:
+            soaMod.exprB.len = exprLen
+        if exprLen <= soaMod.exprC.len:
+            soaMod.exprC.len = exprLen
+        if exprLen <= soaMod.exprImm.len:
+            soaMod.exprImm.len = exprLen
+        if exprLen <= soaMod.exprStrId.len:
+            soaMod.exprStrId.len = exprLen
+    if stmtLen >= 0 && stmtLen <= soaMod.stmtKind.len:
+        soaMod.stmtKind.len = stmtLen
+        if stmtLen <= soaMod.stmtDst.len:
+            soaMod.stmtDst.len = stmtLen
+        if stmtLen <= soaMod.stmtExpr.len:
+            soaMod.stmtExpr.len = stmtLen
+        if stmtLen <= soaMod.stmtNext.len:
+            soaMod.stmtNext.len = stmtLen
+    if blockLen >= 0 && blockLen <= soaMod.blockFirstStmt.len:
+        soaMod.blockFirstStmt.len = blockLen
+        if blockLen <= soaMod.blockTermKind.len:
+            soaMod.blockTermKind.len = blockLen
+        if blockLen <= soaMod.blockTermA.len:
+            soaMod.blockTermA.len = blockLen
+        if blockLen <= soaMod.blockTermB.len:
+            soaMod.blockTermB.len = blockLen
+        if blockLen <= soaMod.succStart.len:
+            soaMod.succStart.len = blockLen
+        if blockLen <= soaMod.succLen.len:
+            soaMod.succLen.len = blockLen
+        if blockLen <= soaMod.predStart.len:
+            soaMod.predStart.len = blockLen
+        if blockLen <= soaMod.predLen.len:
+            soaMod.predLen.len = blockLen
+    if succLen >= 0 && succLen <= soaMod.succEdges.len:
+        soaMod.succEdges.len = succLen
+    if predLen >= 0 && predLen <= soaMod.predEdges.len:
+        soaMod.predEdges.len = predLen
+    if spanLen >= 0 && spanLen <= soaMod.funcSpans.len:
+        soaMod.funcSpans.len = spanLen
+
+fn uirCoreSoaAppendFuncIntoModule(soaMod: UirCoreSoaModule, funcIndex: int32, funcSoa: UirCoreSoa): bool =
+    if (soaMod == nil) || (funcSoa == nil):
+        return false
+
+    let exprBase: int32 = soaMod.exprKind.len
+    let stmtBase: int32 = soaMod.stmtKind.len
+    let blockBase: int32 = soaMod.blockFirstStmt.len
+    let succEdgeBase: int32 = soaMod.succEdges.len
+    let predEdgeBase: int32 = soaMod.predEdges.len
+    let funcSpanBase: int32 = soaMod.funcSpans.len
+    let exprCount: int32 = funcSoa.exprKind.len
+    let stmtCount: int32 = funcSoa.stmtKind.len
+    let blockCount: int32 = funcSoa.blockFirstStmt.len
+    let succCount: int32 = funcSoa.succEdges.len
+    let predCount: int32 = funcSoa.predEdges.len
+
+    if funcSoa.exprType.len != exprCount || funcSoa.exprA.len != exprCount || funcSoa.exprB.len != exprCount ||
+       funcSoa.exprC.len != exprCount || funcSoa.exprImm.len != exprCount || funcSoa.exprStrId.len != exprCount:
+        return false
+    if funcSoa.stmtDst.len != stmtCount || funcSoa.stmtExpr.len != stmtCount || funcSoa.stmtNext.len != stmtCount:
+        return false
+    if funcSoa.blockTermKind.len != blockCount || funcSoa.blockTermA.len != blockCount || funcSoa.blockTermB.len != blockCount ||
+       funcSoa.succStart.len != blockCount || funcSoa.succLen.len != blockCount || funcSoa.predStart.len != blockCount ||
+       funcSoa.predLen.len != blockCount:
+        return false
+
+    var localBi: int32 = 0
+    while localBi < blockCount:
+        let sStart: int32 = funcSoa.succStart[localBi]
+        let sLen: int32 = funcSoa.succLen[localBi]
+        let pStart: int32 = funcSoa.predStart[localBi]
+        let pLen: int32 = funcSoa.predLen[localBi]
+        if sStart < 0 || sLen < 0 || pStart < 0 || pLen < 0:
+            return false
+        if sStart + sLen > succCount:
+            return false
+        if pStart + pLen > predCount:
+            return false
+        localBi = localBi + 1
+
+    var exprI: int32 = 0
+    while exprI < exprCount:
+        let kind: UirCoreExprKind = funcSoa.exprKind[exprI]
+        let rawA: int32 = funcSoa.exprA[exprI]
+        let rawB: int32 = funcSoa.exprB[exprI]
+        let rawC: int32 = funcSoa.exprC[exprI]
+        let a: int32 = if uirCoreSoaExprFieldNeedsExprRebase(kind, 0): uirCoreSoaRebaseExprId(rawA, exprBase) else: rawA
+        let b: int32 = if uirCoreSoaExprFieldNeedsExprRebase(kind, 1): uirCoreSoaRebaseExprId(rawB, exprBase) else: rawB
+        let c: int32 = if uirCoreSoaExprFieldNeedsExprRebase(kind, 2): uirCoreSoaRebaseExprId(rawC, exprBase) else: rawC
+        add(soaMod.exprKind, kind)
+        add(soaMod.exprType, funcSoa.exprType[exprI])
+        add(soaMod.exprA, a)
+        add(soaMod.exprB, b)
+        add(soaMod.exprC, c)
+        add(soaMod.exprImm, funcSoa.exprImm[exprI])
+        add(soaMod.exprStrId, funcSoa.exprStrId[exprI])
+        exprI = exprI + 1
+
+    var stmtI: int32 = 0
+    while stmtI < stmtCount:
+        let kind: UirCoreStmtKind = funcSoa.stmtKind[stmtI]
+        let rawDst: int32 = funcSoa.stmtDst[stmtI]
+        let rawExpr: int32 = funcSoa.stmtExpr[stmtI]
+        let rawNext: int32 = funcSoa.stmtNext[stmtI]
+        let dst: int32 = if kind == msStore: uirCoreSoaRebaseExprId(rawDst, exprBase) else: rawDst
+        let expr: int32 = uirCoreSoaRebaseExprId(rawExpr, exprBase)
+        let next: int32 = uirCoreSoaRebaseStmtId(rawNext, stmtBase)
+        add(soaMod.stmtKind, kind)
+        add(soaMod.stmtDst, dst)
+        add(soaMod.stmtExpr, expr)
+        add(soaMod.stmtNext, next)
+        stmtI = stmtI + 1
+
+    var blockI: int32 = 0
+    while blockI < blockCount:
+        let termKind: UirCoreTermKind = funcSoa.blockTermKind[blockI]
+        let rawFirstStmt: int32 = funcSoa.blockFirstStmt[blockI]
+        let rawTermA: int32 = funcSoa.blockTermA[blockI]
+        let rawTermB: int32 = funcSoa.blockTermB[blockI]
+        let firstStmt: int32 = uirCoreSoaRebaseStmtId(rawFirstStmt, stmtBase)
+        let termAExpr: int32 = uirCoreSoaRebaseExprId(rawTermA, exprBase)
+        let termBExpr: int32 = uirCoreSoaRebaseExprId(rawTermB, exprBase)
+        let termABlk: int32 = uirCoreSoaRebaseBlockId(rawTermA, blockBase)
+        let termBBlk: int32 = uirCoreSoaRebaseBlockId(rawTermB, blockBase)
+        var termA: int32 = rawTermA
+        if uirCoreSoaTermExprRebaseNeeded(termKind, 0):
+            termA = termAExpr
+        elif uirCoreSoaTermBlockRebaseNeeded(termKind, 0):
+            termA = termABlk
+        var termB: int32 = rawTermB
+        if uirCoreSoaTermExprRebaseNeeded(termKind, 1):
+            termB = termBExpr
+        elif uirCoreSoaTermBlockRebaseNeeded(termKind, 1):
+            termB = termBBlk
+        add(soaMod.blockFirstStmt, firstStmt)
+        add(soaMod.blockTermKind, termKind)
+        add(soaMod.blockTermA, termA)
+        add(soaMod.blockTermB, termB)
+        add(soaMod.succStart, funcSoa.succStart[blockI] + succEdgeBase)
+        add(soaMod.succLen, funcSoa.succLen[blockI])
+        add(soaMod.predStart, funcSoa.predStart[blockI] + predEdgeBase)
+        add(soaMod.predLen, funcSoa.predLen[blockI])
+        blockI = blockI + 1
+
+    var succI: int32 = 0
+    while succI < succCount:
+        let rawDst: int32 = funcSoa.succEdges[succI]
+        add(soaMod.succEdges, uirCoreSoaRebaseBlockId(rawDst, blockBase))
+        succI = succI + 1
+
+    var predI: int32 = 0
+    while predI < predCount:
+        let rawSrc: int32 = funcSoa.predEdges[predI]
+        add(soaMod.predEdges, uirCoreSoaRebaseBlockId(rawSrc, blockBase))
+        predI = predI + 1
+
+    let blockEnd: int32 = blockBase + blockCount
+    var checkBi: int32 = blockBase
+    while checkBi < blockEnd:
+        let sStart: int32 = soaMod.succStart[checkBi]
+        let sLen: int32 = soaMod.succLen[checkBi]
+        let pStart: int32 = soaMod.predStart[checkBi]
+        let pLen: int32 = soaMod.predLen[checkBi]
+        if sStart < 0 || sLen < 0 || pStart < 0 || pLen < 0:
+            uirCoreSoaModuleRollbackAppend(soaMod, exprBase, stmtBase, blockBase, succEdgeBase, predEdgeBase, funcSpanBase)
+            return false
+        if sStart + sLen > soaMod.succEdges.len:
+            uirCoreSoaModuleRollbackAppend(soaMod, exprBase, stmtBase, blockBase, succEdgeBase, predEdgeBase, funcSpanBase)
+            return false
+        if pStart + pLen > soaMod.predEdges.len:
+            uirCoreSoaModuleRollbackAppend(soaMod, exprBase, stmtBase, blockBase, succEdgeBase, predEdgeBase, funcSpanBase)
+            return false
+        checkBi = checkBi + 1
+
+    var span: UirCoreSoaFuncSpan
+    span.funcIndex = funcIndex
+    span.exprStart = exprBase
+    span.exprLen = funcSoa.exprKind.len
+    span.stmtStart = stmtBase
+    span.stmtLen = funcSoa.stmtKind.len
+    span.blockStart = blockBase
+    span.blockLen = funcSoa.blockFirstStmt.len
+    span.succStart = succEdgeBase
+    span.succLen = funcSoa.succEdges.len
+    span.predStart = predEdgeBase
+    span.predLen = funcSoa.predEdges.len
+    add(soaMod.funcSpans, span)
+    return true
+
+fn uirCoreSoaBuildFromModule(module: UirCoreModule): UirCoreSoaModule =
+    if (module == nil):
+        return nil
+    var arena: UirCoreSoaArena = uirCoreSoaArenaZero()
+    for fi in 0..<module.funcs.len:
+        let func = module.funcs[fi]
+        if (!uirCoreFuncIdValid(func)) || func.isExtern:
+            continue
+        let est: UirCoreSoaArena = uirCoreSoaEstimateFuncArena(func)
+        uirCoreSoaArenaAccumulate(arena, est.exprCap, est.stmtCap, est.blockCap, est.edgeCap)
+    let soaMod = uirCoreSoaModuleNew(arena)
+    if (soaMod == nil):
+        return nil
+    for fi in 0..<module.funcs.len:
+        let func = module.funcs[fi]
+        if (!uirCoreFuncIdValid(func)) || func.isExtern:
+            continue
+        let funcSoa = uirCoreSoaBuildFromFunc(func)
+        # Keep module-level SoA projection resilient: skip malformed function
+        # fragments instead of failing the whole module projection.
+        if (funcSoa == nil):
+            continue
+        if ! uirCoreSoaAppendFuncIntoModule(soaMod, fi, funcSoa):
+            continue
+    return soaMod
+
+fn uirCoreSoaModuleFuncCount(soaMod: UirCoreSoaModule): int32 =
+    if (soaMod == nil):
+        return 0
+    return soaMod.funcSpans.len
+
+fn uirCoreSoaModuleExprCount(soaMod: UirCoreSoaModule): int32 =
+    if (soaMod == nil):
+        return 0
+    return soaMod.exprKind.len
+
+fn uirCoreSoaModuleStmtCount(soaMod: UirCoreSoaModule): int32 =
+    if (soaMod == nil):
+        return 0
+    return soaMod.stmtKind.len
+
+fn uirCoreSoaModuleBlockCount(soaMod: UirCoreSoaModule): int32 =
+    if (soaMod == nil):
+        return 0
+    return soaMod.blockFirstStmt.len
+
+fn uirCoreSoaModuleSuccEdgeCount(soaMod: UirCoreSoaModule): int32 =
+    if (soaMod == nil):
+        return 0
+    return soaMod.succEdges.len
+
+fn uirCoreSoaModulePredEdgeCount(soaMod: UirCoreSoaModule): int32 =
+    if (soaMod == nil):
+        return 0
+    return soaMod.predEdges.len
+
+fn uirCoreSoaModuleEdgesBalanced(soaMod: UirCoreSoaModule): bool =
+    if (soaMod == nil):
+        return false
+    if soaMod.succEdges.len != soaMod.predEdges.len:
+        return false
+    for bi in 0..<soaMod.blockFirstStmt.len:
+        let sStart: int32 = soaMod.succStart[bi]
+        let sLen: int32 = soaMod.succLen[bi]
+        let pStart: int32 = soaMod.predStart[bi]
+        let pLen: int32 = soaMod.predLen[bi]
+        if sStart < 0 || sLen < 0 || pStart < 0 || pLen < 0:
+            return false
+        if sStart + sLen > soaMod.succEdges.len:
+            return false
+        if pStart + pLen > soaMod.predEdges.len:
+            return false
+    for i in 0..<soaMod.succEdges.len:
+        let dst: int32 = soaMod.succEdges[i]
+        if dst < 0 || dst >= soaMod.blockFirstStmt.len:
+            return false
+    for i in 0..<soaMod.predEdges.len:
+        let src: int32 = soaMod.predEdges[i]
+        if src < 0 || src >= soaMod.blockFirstStmt.len:
+            return false
+    return true
+
+fn uirCoreSoaModuleEdgeBalanceReason(soaMod: UirCoreSoaModule): str =
+    if (soaMod == nil):
+        return "module=nil"
+    if soaMod.succEdges.len != soaMod.predEdges.len:
+        return "edge_count_mismatch succ=" + intToStr(soaMod.succEdges.len) +
+               " pred=" + intToStr(soaMod.predEdges.len)
+    for bi in 0..<soaMod.blockFirstStmt.len:
+        let sStart: int32 = soaMod.succStart[bi]
+        let sLen: int32 = soaMod.succLen[bi]
+        let pStart: int32 = soaMod.predStart[bi]
+        let pLen: int32 = soaMod.predLen[bi]
+        if sStart < 0 || sLen < 0 || pStart < 0 || pLen < 0:
+            return "negative_range block=" + intToStr(bi) +
+                   " succ=(" + intToStr(sStart) + "," + intToStr(sLen) + ")" +
+                   " pred=(" + intToStr(pStart) + "," + intToStr(pLen) + ")"
+        if sStart + sLen > soaMod.succEdges.len:
+            return "succ_range_oob block=" + intToStr(bi) +
+                   " start=" + intToStr(sStart) +
+                   " len=" + intToStr(sLen) +
+                   " total=" + intToStr(soaMod.succEdges.len)
+        if pStart + pLen > soaMod.predEdges.len:
+            return "pred_range_oob block=" + intToStr(bi) +
+                   " start=" + intToStr(pStart) +
+                   " len=" + intToStr(pLen) +
+                   " total=" + intToStr(soaMod.predEdges.len)
+    for i in 0..<soaMod.succEdges.len:
+        let dst: int32 = soaMod.succEdges[i]
+        if dst < 0 || dst >= soaMod.blockFirstStmt.len:
+            return "succ_edge_invalid idx=" + intToStr(i) +
+                   " dst=" + intToStr(dst) +
+                   " blocks=" + intToStr(soaMod.blockFirstStmt.len)
+    for i in 0..<soaMod.predEdges.len:
+        let src: int32 = soaMod.predEdges[i]
+        if src < 0 || src >= soaMod.blockFirstStmt.len:
+            return "pred_edge_invalid idx=" + intToStr(i) +
+                   " src=" + intToStr(src) +
+                   " blocks=" + intToStr(soaMod.blockFirstStmt.len)
+    return "ok"
+
+fn uirCoreSoaInferExprType(func: UirCoreFunc, e: UirExprId): UirCoreType =
+    if (!uirCoreExprIdValid(e)):
+        return uirCoreTypeVoid()
+    let ek: UirCoreExprKind = uirCoreExprKindOf(e)
+    if ek == meConstI64:
+        return uirCoreTypeI64()
+    if ek == meCmp:
+        return uirCoreTypeI32()
+    if ek == meCast:
+        return uirCoreExprCastTypeOf(e)
+    if ek == meLoad:
+        return uirCoreExprLoadTypeOf(e)
+    if ek == meAddr || ek == meGlobalAddr:
+        return uirCoreTypeI64()
+    if ek == meLocal:
+        let slot: int32 = uirCoreExprLocalIndexOf(e)
+        if uirCoreFuncIdValid(func) && slot >= 0 && slot < func.localTypes.len:
+            return func.localTypes[slot]
+        return uirCoreTypeI64()
+    if ek == meBin:
+        let lhsTy: UirCoreType = uirCoreSoaInferExprType(func, uirCoreExprLhsOf(e))
+        if lhsTy.kind != mtVoid:
+            return lhsTy
+        let rhsTy: UirCoreType = uirCoreSoaInferExprType(func, uirCoreExprRhsOf(e))
+        if rhsTy.kind != mtVoid:
+            return rhsTy
+        return uirCoreTypeI64()
+    return uirCoreTypeI64()
+
+fn uirCoreSoaInternStr(indexMap: hashmaps.HashMapStrInt*, strPool: str[]*, s: str): int32 =
+    if (indexMap == nil) || (strPool == nil) || len(s) == 0:
+        return uirCoreInvalidId()
+    var found: bool = false
+    let raw: int32 = uirCoreHashMapStrIntGetCompat(*indexMap, s, found)
+    if found && raw > 0:
+        return raw - 1
+    let id: int32 = strPool->len
+    add(*strPool, uirCoreOwnStr(s))
+    hashmaps.hashMapStrIntPut(*indexMap, s, id + 1)
+    return id
+
+fn uirCoreSoaResolveLabel(labelMap: hashmaps.HashMapStrInt*, label: str): int32 =
+    if (labelMap == nil) || len(label) == 0:
+        return uirCoreInvalidId()
+    var found: bool = false
+    let raw: int32 = uirCoreHashMapStrIntGetCompat(*labelMap, label, found)
+    if !found || raw <= 0:
+        return uirCoreInvalidId()
+    return raw - 1
+
+fn uirCoreSoaAppendExprTree(soa: UirCoreSoa, func: UirCoreFunc, expr: UirExprId,
+                            strIndex: hashmaps.HashMapStrInt*, strPool: str[]*): UirExprId =
+    if (soa == nil) || (!uirCoreExprIdValid(expr)):
+        return uirCoreInvalidId()
+    var a: int32 = uirCoreInvalidId()
+    var b: int32 = uirCoreInvalidId()
+    var c: int32 = uirCoreInvalidId()
+    var imm: int64 = 0
+    var strId: int32 = uirCoreInvalidId()
+    let ty: UirCoreType = uirCoreSoaInferExprType(func, expr)
+    let ek: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if ek == meConstI64:
+        imm = uirCoreExprConstValueOf(expr)
+    elif ek == meLocal || ek == meAddr:
+        a = uirCoreExprLocalIndexOf(expr)
+    elif ek == meBin || ek == meCmp:
+        a = uirCoreSoaAppendExprTree(soa, func, uirCoreExprLhsOf(expr), strIndex, strPool)
+        b = uirCoreSoaAppendExprTree(soa, func, uirCoreExprRhsOf(expr), strIndex, strPool)
+    elif ek == meCall:
+        strId = uirCoreSoaInternStr(strIndex, strPool, uirCoreExprCalleeOf(expr))
+        imm = uirCoreExprArgsLen(expr)
+        for ai in 0..<uirCoreExprArgsLen(expr):
+            let argId: int32 = uirCoreSoaAppendExprTree(soa, func, uirCoreExprArgAt(expr, ai), strIndex, strPool)
+            if ai == 0:
+                a = argId
+            elif ai == 1:
+                b = argId
+            elif ai == 2:
+                c = argId
+    elif ek == meCast:
+        a = uirCoreSoaAppendExprTree(soa, func, uirCoreExprCastExprOf(expr), strIndex, strPool)
+    elif ek == meLoad:
+        a = uirCoreSoaAppendExprTree(soa, func, uirCoreExprAddrExprOf(expr), strIndex, strPool)
+    elif ek == meGlobalAddr:
+        strId = uirCoreSoaInternStr(strIndex, strPool, uirCoreExprGlobalNameOf(expr))
+    return uirCoreSoaAppendExpr(soa, ek, ty, a, b, c, imm, strId)
+
+fn uirCoreSoaBuildFromFunc(func: UirCoreFunc): UirCoreSoa =
+    let soa = uirCoreSoaNew()
+    if (soa == nil) || (!uirCoreFuncIdValid(func)):
+        return soa
+
+    var strIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(uirCoreFuncBlocksLen(func) * 4 + 32)
+    var strPool: str[]
+    var labelMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(uirCoreFuncBlocksLen(func) * 2 + 8)
+
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let blk = uirCoreFuncBlockAt(func, bi)
+        let label: str = uirCoreBlockLabelOf(blk)
+        if len(label) == 0:
+            continue
+        hashmaps.hashMapStrIntPut(labelMap, label, bi + 1)
+
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let blk = uirCoreFuncBlockAt(func, bi)
+        var firstStmt: int32 = uirCoreInvalidId()
+        var prevStmt: int32 = uirCoreInvalidId()
+        var termKind: UirCoreTermKind = mtRet
+        var termA: int32 = uirCoreInvalidId()
+        var termB: int32 = uirCoreInvalidId()
+        for si in 0..<uirCoreBlockStmtsLen(blk):
+            let st: UirStmtId = uirCoreBlockStmtAt(blk, si)
+            var dst: int32 = uirCoreStmtSlotOf(st)
+            let exprId: int32 = uirCoreSoaAppendExprTree(soa, func, uirCoreStmtExprOf(st), &strIndex, &strPool)
+            if uirCoreStmtKindOf(st) == msStore:
+                dst = uirCoreSoaAppendExprTree(soa, func, uirCoreStmtAddrExprOf(st), &strIndex, &strPool)
+            let stmtId: int32 = uirCoreSoaAppendStmt(soa, uirCoreStmtKindOf(st), dst, exprId, uirCoreInvalidId())
+            if firstStmt < 0:
+                firstStmt = stmtId
+            if prevStmt >= 0:
+                soa.stmtNext[prevStmt] = stmtId
+            prevStmt = stmtId
+        let term: UirCoreTerm = uirCoreBlockTermOf(blk)
+        termKind = term.kind
+        if termKind == mtRet:
+            termA = uirCoreSoaAppendExprTree(soa, func, term.retExpr, &strIndex, &strPool)
+        elif termKind == mtBr:
+            termA = uirCoreSoaResolveLabel(&labelMap, term.target)
+        elif termKind == mtCbr:
+            termA = uirCoreSoaAppendExprTree(soa, func, term.condExpr, &strIndex, &strPool)
+            termB = uirCoreSoaResolveLabel(&labelMap, term.targetTrue)
+        let _ = uirCoreSoaAppendBlock(soa, firstStmt, termKind, termA, termB)
+
+    for bi in 0..<soa.blockTermKind.len:
+        let startEdge: int32 = soa.succEdges.len
+        var edgeCount: int32 = 0
+        let k: UirCoreTermKind = soa.blockTermKind[bi]
+        if k == mtBr:
+            let dst: int32 = soa.blockTermA[bi]
+            if dst >= 0 && dst < soa.blockFirstStmt.len:
+                add(soa.succEdges, dst)
+                edgeCount = edgeCount + 1
+        elif k == mtCbr:
+            let trueDst: int32 = soa.blockTermB[bi]
+            if trueDst >= 0 && trueDst < soa.blockFirstStmt.len:
+                add(soa.succEdges, trueDst)
+                edgeCount = edgeCount + 1
+            let blk = uirCoreFuncBlockAt(func, bi)
+            let term: UirCoreTerm = uirCoreBlockTermOf(blk)
+            let falseDst: int32 = uirCoreSoaResolveLabel(&labelMap, term.targetFalse)
+            if falseDst >= 0 && falseDst < soa.blockFirstStmt.len:
+                add(soa.succEdges, falseDst)
+                edgeCount = edgeCount + 1
+        soa.succStart[bi] = startEdge
+        soa.succLen[bi] = edgeCount
+
+    var predCounts: int32[]
+    for bi in 0..<soa.blockFirstStmt.len:
+        add(predCounts, 0)
+    for bi in 0..<soa.blockFirstStmt.len:
+        let succStartI: int32 = soa.succStart[bi]
+        let succLenI: int32 = soa.succLen[bi]
+        for ei in succStartI..<succStartI + succLenI:
+            if ei < 0 || ei >= soa.succEdges.len:
+                continue
+            let dst: int32 = soa.succEdges[ei]
+            if dst >= 0 && dst < predCounts.len:
+                predCounts[dst] = predCounts[dst] + 1
+
+    soa.predEdges = []
+    var predTotal: int32 = 0
+    for bi in 0..<soa.blockFirstStmt.len:
+        soa.predStart[bi] = predTotal
+        soa.predLen[bi] = predCounts[bi]
+        predTotal = predTotal + predCounts[bi]
+    for _i in 0..<predTotal:
+        add(soa.predEdges, uirCoreInvalidId())
+    var writePos: int32[]
+    for bi in 0..<soa.blockFirstStmt.len:
+        add(writePos, soa.predStart[bi])
+    for bi in 0..<soa.blockFirstStmt.len:
+        let succStartI: int32 = soa.succStart[bi]
+        let succLenI: int32 = soa.succLen[bi]
+        for ei in succStartI..<succStartI + succLenI:
+            if ei < 0 || ei >= soa.succEdges.len:
+                continue
+            let dst: int32 = soa.succEdges[ei]
+            if dst < 0 || dst >= writePos.len:
+                continue
+            let pos: int32 = writePos[dst]
+            if pos >= 0 && pos < soa.predEdges.len:
+                soa.predEdges[pos] = bi
+                writePos[dst] = pos + 1
+    return soa
 
 fn uirCoreStmtKindName(k: UirCoreStmtKind): str =
     case k
@@ -239,7 +1286,7 @@ fn uirCoreHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var
     return -1
 
 fn uirCore_buildTypeAliasIndexCache(module: UirCoreModule) =
-    if module == nil:
+    if (module == nil):
         uirCore_typeAliases_cache_module = nil
         uirCore_typeAliases_cache_ready = false
         uirCore_typeAliases_cache_len = 0
@@ -248,13 +1295,13 @@ fn uirCore_buildTypeAliasIndexCache(module: UirCoreModule) =
     uirCore_typeAliases_cache = hashmaps.hashMapStrIntInit(module.typeAliases.len * 2 + 8)
     for i in 0..<module.typeAliases.len:
         let a: UirCoreTypeAlias = module.typeAliases[i]
-        if len(a.name) > 0:
+        if uirCoreStrPtrSane(a.name) && len(a.name) > 0:
             hashmaps.hashMapStrIntPut(uirCore_typeAliases_cache, a.name, i + 1)
     uirCore_typeAliases_cache_len = module.typeAliases.len
     uirCore_typeAliases_cache_ready = true
 
 fn uirCore_buildObjTypeIndexCache(module: UirCoreModule) =
-    if module == nil:
+    if (module == nil):
         uirCore_objTypes_cache_module = nil
         uirCore_objTypes_cache_ready = false
         uirCore_objTypes_cache_len = 0
@@ -269,7 +1316,7 @@ fn uirCore_buildObjTypeIndexCache(module: UirCoreModule) =
     uirCore_objTypes_cache_ready = true
 
 fn uirCore_buildCStringIndexCache(module: UirCoreModule) =
-    if module == nil:
+    if (module == nil):
         uirCore_cstrs_cache_module = nil
         uirCore_cstrs_cache_ready = false
         uirCore_cstrs_cache_len = 0
@@ -349,77 +1396,101 @@ fn uirCoreTypeU64(): UirCoreType =
     t.isUnsigned = true
     return t
 
-fn uirCoreConstI64(value: int64): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meConstI64
-    e.value = value
-    return e
+fn uirCoreExprAllocFields(kind: UirCoreExprKind,
+                          value: int64,
+                          binOp: UirCoreBinOp,
+                          cmpOp: UirCoreCmpOp,
+                          lhs: UirExprId,
+                          rhs: UirExprId,
+                          localIndex: int32,
+                          callee: str,
+                          args: UirExprId[],
+                          castType: UirCoreType,
+                          castExpr: UirExprId,
+                          addrExpr: UirExprId,
+                          loadType: UirCoreType,
+                          globalName: str): UirExprId =
+    uirCore_exprPoolInit()
+    let id: int32 = uirCore_exprPool_kind.len
+    add(uirCore_exprPool_kind, kind)
+    add(uirCore_exprPool_value, value)
+    add(uirCore_exprPool_binOp, binOp)
+    add(uirCore_exprPool_cmpOp, cmpOp)
+    add(uirCore_exprPool_lhs, lhs)
+    add(uirCore_exprPool_rhs, rhs)
+    add(uirCore_exprPool_localIndex, localIndex)
+    add(uirCore_exprPool_callee, callee)
+    add(uirCore_exprPool_args, args)
+    add(uirCore_exprPool_castType, castType)
+    add(uirCore_exprPool_castExpr, castExpr)
+    add(uirCore_exprPool_addrExpr, addrExpr)
+    add(uirCore_exprPool_loadType, loadType)
+    add(uirCore_exprPool_globalName, globalName)
+    return id
 
-fn uirCoreBin(op: UirCoreBinOp, lhs: UirCoreExpr, rhs: UirCoreExpr): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meBin
-    e.binOp = op
-    e.lhs = lhs
-    e.rhs = rhs
-    return e
+fn uirCoreStmtAllocFields(kind: UirCoreStmtKind,
+                          name: str,
+                          slot: int32,
+                          expr: UirExprId,
+                          paramIndex: int32,
+                          addrExpr: UirExprId,
+                          storeType: UirCoreType): UirStmtId =
+    uirCore_stmtPoolInit()
+    let id: int32 = uirCore_stmtPool_kind.len
+    add(uirCore_stmtPool_kind, kind)
+    add(uirCore_stmtPool_name, name)
+    add(uirCore_stmtPool_slot, slot)
+    add(uirCore_stmtPool_expr, expr)
+    add(uirCore_stmtPool_paramIndex, paramIndex)
+    add(uirCore_stmtPool_addrExpr, addrExpr)
+    add(uirCore_stmtPool_storeType, storeType)
+    return id
 
-fn uirCoreLocal(index: int32): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meLocal
-    e.localIndex = index
-    return e
+fn uirCoreBlockAllocFields(label: str, stmts: UirStmtId[], term: UirCoreTerm): UirBlockId =
+    uirCore_blockPoolInit()
+    let id: int32 = uirCore_blockPool_label.len
+    add(uirCore_blockPool_label, label)
+    add(uirCore_blockPool_stmts, stmts)
+    add(uirCore_blockPool_term, term)
+    return id
 
-fn uirCoreCall(name: str, args: UirCoreExpr[]): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meCall
-    e.callee = uirCoreOwnStr(name)
-    e.args = args
-    return e
+fn uirCoreConstI64(value: int64): UirExprId =
+    return uirCoreExprAllocFields(meConstI64, value, mbAdd, mcEq, 0, 0, -1,
+                                  "", [], uirCoreTypeVoid(), 0, 0, uirCoreTypeVoid(), "")
 
-fn uirCoreCast(ty: UirCoreType, expr: UirCoreExpr): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meCast
-    e.castType = ty
-    e.castExpr = expr
-    return e
+fn uirCoreBin(op: UirCoreBinOp, lhs: UirExprId, rhs: UirExprId): UirExprId =
+    return uirCoreExprAllocFields(meBin, 0, op, mcEq, lhs, rhs, -1,
+                                  "", [], uirCoreTypeVoid(), 0, 0, uirCoreTypeVoid(), "")
 
-fn uirCoreAddr(slot: int32): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meAddr
-    e.localIndex = slot
-    return e
+fn uirCoreLocal(index: int32): UirExprId =
+    return uirCoreExprAllocFields(meLocal, 0, mbAdd, mcEq, 0, 0, index,
+                                  "", [], uirCoreTypeVoid(), 0, 0, uirCoreTypeVoid(), "")
 
-fn uirCoreLoad(addr: UirCoreExpr, ty: UirCoreType): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meLoad
-    e.addrExpr = addr
-    e.loadType = ty
-    return e
+fn uirCoreCall(name: str, args: UirExprId[]): UirExprId =
+    return uirCoreExprAllocFields(meCall, 0, mbAdd, mcEq, 0, 0, -1,
+                                  uirCoreOwnStr(name), args, uirCoreTypeVoid(), 0, 0, uirCoreTypeVoid(), "")
 
-fn uirCoreGlobalAddr(name: str): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meGlobalAddr
-    e.globalName = uirCoreOwnStr(name)
-    return e
+fn uirCoreCast(ty: UirCoreType, expr: UirExprId): UirExprId =
+    return uirCoreExprAllocFields(meCast, 0, mbAdd, mcEq, 0, 0, -1,
+                                  "", [], ty, expr, 0, uirCoreTypeVoid(), "")
 
-fn uirCoreCmp(op: UirCoreCmpOp, lhs: UirCoreExpr, rhs: UirCoreExpr): UirCoreExpr =
-    var e: UirCoreExpr
-    new e
-    e.kind = meCmp
-    e.cmpOp = op
-    e.lhs = lhs
-    e.rhs = rhs
-    return e
+fn uirCoreAddr(slot: int32): UirExprId =
+    return uirCoreExprAllocFields(meAddr, 0, mbAdd, mcEq, 0, 0, slot,
+                                  "", [], uirCoreTypeVoid(), 0, 0, uirCoreTypeVoid(), "")
 
-fn uirCoreTermRet(expr: UirCoreExpr): UirCoreTerm =
+fn uirCoreLoad(addr: UirExprId, ty: UirCoreType): UirExprId =
+    return uirCoreExprAllocFields(meLoad, 0, mbAdd, mcEq, 0, 0, -1,
+                                  "", [], uirCoreTypeVoid(), 0, addr, ty, "")
+
+fn uirCoreGlobalAddr(name: str): UirExprId =
+    return uirCoreExprAllocFields(meGlobalAddr, 0, mbAdd, mcEq, 0, 0, -1,
+                                  "", [], uirCoreTypeVoid(), 0, 0, uirCoreTypeVoid(), uirCoreOwnStr(name))
+
+fn uirCoreCmp(op: UirCoreCmpOp, lhs: UirExprId, rhs: UirExprId): UirExprId =
+    return uirCoreExprAllocFields(meCmp, 0, mbAdd, op, lhs, rhs, -1,
+                                  "", [], uirCoreTypeVoid(), 0, 0, uirCoreTypeVoid(), "")
+
+fn uirCoreTermRet(expr: UirExprId): UirCoreTerm =
     var t: UirCoreTerm
     t.kind = mtRet
     t.retExpr = expr
@@ -431,7 +1502,7 @@ fn uirCoreTermBr(target: str): UirCoreTerm =
     t.target = uirCoreOwnStr(target)
     return t
 
-fn uirCoreTermCbr(cond: UirCoreExpr, tLabel: str, fLabel: str): UirCoreTerm =
+fn uirCoreTermCbr(cond: UirExprId, tLabel: str, fLabel: str): UirCoreTerm =
     var t: UirCoreTerm
     t.kind = mtCbr
     t.condExpr = cond
@@ -439,68 +1510,29 @@ fn uirCoreTermCbr(cond: UirCoreExpr, tLabel: str, fLabel: str): UirCoreTerm =
     t.targetFalse = uirCoreOwnStr(fLabel)
     return t
 
-fn uirCoreStmtLet(name: str, slot: int32, expr: UirCoreExpr): UirCoreStmt =
-    var s: UirCoreStmt
-    s.kind = msLet
-    s.name = uirCoreOwnStr(name)
-    s.slot = slot
-    s.expr = expr
-    return s
+fn uirCoreStmtLet(name: str, slot: int32, expr: UirExprId): UirStmtId =
+    return uirCoreStmtAllocFields(msLet, uirCoreOwnStr(name), slot, expr, -1, 0, uirCoreTypeVoid())
 
-fn uirCoreStmtVar(name: str, slot: int32, expr: UirCoreExpr): UirCoreStmt =
-    var s: UirCoreStmt
-    s.kind = msVar
-    s.name = uirCoreOwnStr(name)
-    s.slot = slot
-    s.expr = expr
-    return s
+fn uirCoreStmtVar(name: str, slot: int32, expr: UirExprId): UirStmtId =
+    return uirCoreStmtAllocFields(msVar, uirCoreOwnStr(name), slot, expr, -1, 0, uirCoreTypeVoid())
 
-fn uirCoreStmtAssign(name: str, slot: int32, expr: UirCoreExpr): UirCoreStmt =
-    var s: UirCoreStmt
-    s.kind = msAssign
-    s.name = uirCoreOwnStr(name)
-    s.slot = slot
-    s.expr = expr
-    return s
+fn uirCoreStmtAssign(name: str, slot: int32, expr: UirExprId): UirStmtId =
+    return uirCoreStmtAllocFields(msAssign, uirCoreOwnStr(name), slot, expr, -1, 0, uirCoreTypeVoid())
 
-fn uirCoreStmtExpr(expr: UirCoreExpr): UirCoreStmt =
-    var s: UirCoreStmt
-    s.kind = msExpr
-    s.expr = expr
-    return s
+fn uirCoreStmtExpr(expr: UirExprId): UirStmtId =
+    return uirCoreStmtAllocFields(msExpr, "", -1, expr, -1, 0, uirCoreTypeVoid())
 
-fn uirCoreStmtParam(name: str, slot: int32, paramIndex: int32): UirCoreStmt =
-    var s: UirCoreStmt
-    s.kind = msParam
-    s.name = uirCoreOwnStr(name)
-    s.slot = slot
-    s.paramIndex = paramIndex
-    return s
+fn uirCoreStmtParam(name: str, slot: int32, paramIndex: int32): UirStmtId =
+    return uirCoreStmtAllocFields(msParam, uirCoreOwnStr(name), slot, 0, paramIndex, 0, uirCoreTypeVoid())
 
-fn uirCoreStmtStore(addr: UirCoreExpr, value: UirCoreExpr, ty: UirCoreType): UirCoreStmt =
-    var s: UirCoreStmt
-    s.kind = msStore
-    s.slot = -1
-    s.expr = value
-    s.addrExpr = addr
-    s.storeType = ty
-    return s
+fn uirCoreStmtStore(addr: UirExprId, value: UirExprId, ty: UirCoreType): UirStmtId =
+    return uirCoreStmtAllocFields(msStore, "", -1, value, -1, addr, ty)
 
-fn uirCoreBlock(label: str, term: UirCoreTerm): UirCoreBlock =
-    var b: UirCoreBlock
-    new b
-    b.label = uirCoreOwnStr(label)
-    b.stmts = []
-    b.term = term
-    return b
+fn uirCoreBlock(label: str, term: UirCoreTerm): UirBlockId =
+    return uirCoreBlockAllocFields(uirCoreOwnStr(label), [], term)
 
-fn uirCoreBlockWithStmts(label: str, stmts: UirCoreStmt[], term: UirCoreTerm): UirCoreBlock =
-    var b: UirCoreBlock
-    new b
-    b.label = uirCoreOwnStr(label)
-    b.stmts = stmts
-    b.term = term
-    return b
+fn uirCoreBlockWithStmts(label: str, stmts: UirStmtId[], term: UirCoreTerm): UirBlockId =
+    return uirCoreBlockAllocFields(uirCoreOwnStr(label), stmts, term)
 
 fn uirCoreNewFunc(name: str, retType: UirCoreType): UirCoreFunc =
     var f: UirCoreFunc
@@ -522,102 +1554,120 @@ fn uirCoreNewFunc(name: str, retType: UirCoreType): UirCoreFunc =
     f.phaseFallbackReason = uirCoreOwnStr("high_uir_unchecked")
     return f
 
-fn uirCoreAddBlock(func: UirCoreFunc, block: UirCoreBlock) =
-    if func == nil || block == nil:
+fn uirCoreAddBlock(func: UirCoreFunc, block: UirBlockId) =
+    if (!uirCoreFuncIdValid(func)) || (block == nil):
         return
     uirCoreCanonicalizeBlock(block)
     add(func.blocks, block)
 
 fn uirCoreWriteType(seqInst: UirCoreType[]*, idx: int32, val: UirCoreType) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteTypeAlias(seqInst: UirCoreTypeAlias[]*, idx: int32, val: UirCoreTypeAlias) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteObjType(seqInst: UirCoreObjType[]*, idx: int32, val: UirCoreObjType) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteGlobal(seqInst: UirCoreGlobal[]*, idx: int32, val: UirCoreGlobal) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteCString(seqInst: UirCoreCString[]*, idx: int32, val: UirCoreCString) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteFunc(seqInst: UirCoreFunc[]*, idx: int32, val: UirCoreFunc) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
-fn uirCoreWriteStmt(seqInst: UirCoreStmt[]*, idx: int32, val: UirCoreStmt) =
-    if seqInst == nil:
+fn uirCoreWriteExpr(seqInst: UirExprId[]*, idx: int32, val: UirExprId) =
+    if (seqInst == nil):
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteStmt(seqInst: UirStmtId[]*, idx: int32, val: UirStmtId) =
+    if (seqInst == nil):
+        panic "uirCore_types: nil seq pointer"
+    if idx < 0 || idx >= seqInst->len:
+        panic "uirCore_types: seq index out of bounds"
+    seqInst[idx] = val
+
+fn uirCoreWriteBlock(seqInst: UirBlockId[]*, idx: int32, val: UirBlockId) =
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteParam(seqInst: UirCoreParam[]*, idx: int32, val: UirCoreParam) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteObjLocal(seqInst: UirCoreObjLocal[]*, idx: int32, val: UirCoreObjLocal) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
 fn uirCoreWriteObjField(seqInst: UirCoreObjField[]*, idx: int32, val: UirCoreObjField) =
-    if seqInst == nil:
+    if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
-fn uirCoreOwnExprStrings(expr: UirCoreExpr) =
-    if expr == nil:
+fn uirCoreOwnExprStrings(expr: UirExprId) =
+    if (!uirCoreExprIdValid(expr)):
         return
-    if expr.kind == meCall:
-        expr.callee = uirCoreOwnStr(expr.callee)
-        for i in 0..<expr.args.len:
-            uirCoreOwnExprStrings(expr.args[i])
+    let kind: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if kind == meCall:
+        uirCore_exprPool_callee[expr] = uirCoreOwnStr(uirCoreExprCalleeOf(expr))
+        let argc: int32 = uirCoreExprArgsLen(expr)
+        for i in 0..<argc:
+            let argExpr: UirExprId = uirCoreExprArgAt(expr, i)
+            if uirCoreExprIdValid(argExpr):
+                uirCoreOwnExprStrings(argExpr)
         return
-    if expr.kind == meGlobalAddr:
-        expr.globalName = uirCoreOwnStr(expr.globalName)
+    if kind == meGlobalAddr:
+        uirCore_exprPool_globalName[expr] = uirCoreOwnStr(uirCoreExprGlobalNameOf(expr))
         return
-    if expr.kind == meBin || expr.kind == meCmp:
-        uirCoreOwnExprStrings(expr.lhs)
-        uirCoreOwnExprStrings(expr.rhs)
+    if kind == meBin || kind == meCmp:
+        uirCoreOwnExprStrings(uirCoreExprLhsOf(expr))
+        uirCoreOwnExprStrings(uirCoreExprRhsOf(expr))
         return
-    if expr.kind == meCast:
-        uirCoreOwnExprStrings(expr.castExpr)
+    if kind == meCast:
+        uirCoreOwnExprStrings(uirCoreExprCastExprOf(expr))
         return
-    if expr.kind == meLoad:
-        uirCoreOwnExprStrings(expr.addrExpr)
+    if kind == meLoad:
+        uirCoreOwnExprStrings(uirCoreExprAddrExprOf(expr))
         return
 
 fn uirCoreOwnTermStrings(term: UirCoreTerm): UirCoreTerm =
@@ -635,21 +1685,22 @@ fn uirCoreOwnTermStrings(term: UirCoreTerm): UirCoreTerm =
         return out
     return out
 
-fn uirCoreOwnStmtStrings(stmt: UirCoreStmt): UirCoreStmt =
-    var out: UirCoreStmt = stmt
-    out.name = uirCoreOwnStr(out.name)
-    uirCoreOwnExprStrings(out.expr)
-    uirCoreOwnExprStrings(out.addrExpr)
-    return out
+fn uirCoreOwnStmtStrings(stmt: UirStmtId): UirStmtId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return stmt
+    uirCore_stmtPool_name[stmt] = uirCoreOwnStr(uirCoreStmtNameOf(stmt))
+    uirCoreOwnExprStrings(uirCoreStmtExprOf(stmt))
+    uirCoreOwnExprStrings(uirCoreStmtAddrExprOf(stmt))
+    return stmt
 
-fn uirCoreCanonicalizeBlock(blk: UirCoreBlock) =
-    if blk == nil:
+fn uirCoreCanonicalizeBlock(blk: UirBlockId) =
+    if (!uirCoreBlockIdValid(blk)):
         return
-    blk.label = uirCoreOwnStr(blk.label)
-    blk.term = uirCoreOwnTermStrings(blk.term)
+    uirCore_blockPool_label[blk] = uirCoreOwnStr(uirCore_blockPool_label[blk])
+    uirCore_blockPool_term[blk] = uirCoreOwnTermStrings(uirCore_blockPool_term[blk])
 
 fn uirCoreCanonicalizeFunc(func: UirCoreFunc) =
-    if func == nil:
+    if (!uirCoreFuncIdValid(func)):
         return
     func.name = uirCoreOwnStr(func.name)
     func.linkName = uirCoreOwnStr(func.linkName)
@@ -666,8 +1717,8 @@ fn uirCoreCanonicalizeFunc(func: UirCoreFunc) =
         ol.objTypeName = uirCoreOwnStr(ol.objTypeName)
         ol.typeKey = uirCoreOwnStr(ol.typeKey)
         uirCoreWriteObjLocal(&func.objLocals, oi, ol)
-    for bi in 0..<func.blocks.len:
-        uirCoreCanonicalizeBlock(func.blocks[bi])
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        uirCoreCanonicalizeBlock(uirCoreFuncBlockAt(func, bi))
 
 fn uirCoreCanonicalizeTypeAlias(aIn: UirCoreTypeAlias): UirCoreTypeAlias =
     var out: UirCoreTypeAlias = aIn
@@ -739,7 +1790,11 @@ fn uirCoreTypeAlignPow2(ty: UirCoreType): int32 =
     return 0
 
 fn uirCoreFindTypeAlias(module: UirCoreModule, name: str): int32 =
-    if module == nil || len(name) == 0:
+    if (module == nil):
+        return -1
+    if !uirCoreStrPtrSane(name):
+        return -1
+    if len(name) == 0:
         return -1
     if module.typeAliases.len >= 32:
         if uirCore_typeAliases_cache_module != module || !uirCore_typeAliases_cache_ready ||
@@ -753,6 +1808,8 @@ fn uirCoreFindTypeAlias(module: UirCoreModule, name: str): int32 =
                 return idx
     for i in 0..<module.typeAliases.len:
         let a: UirCoreTypeAlias = module.typeAliases[i]
+        if !uirCoreStrPtrSane(a.name):
+            continue
         if (a.name == name):
             if uirCore_typeAliases_cache_ready && uirCore_typeAliases_cache_module == module:
                 hashmaps.hashMapStrIntPut(uirCore_typeAliases_cache, a.name, i + 1)
@@ -767,9 +1824,15 @@ fn uirCoreTryGetTypeAlias(module: UirCoreModule, name: str): UirCoreType =
     return a.ty
 
 fn uirCoreAddTypeAlias(module: UirCoreModule, name: str, ty: UirCoreType) =
-    if module == nil || len(name) == 0:
+    if (module == nil):
+        return
+    if !uirCoreStrPtrSane(name):
+        return
+    if len(name) == 0:
         return
     let key: str = uirCoreOwnStr(name)
+    if !uirCoreStrPtrSane(key):
+        return
     let idx: int32 = uirCoreFindTypeAlias(module, key)
     if idx >= 0:
         var a2: UirCoreTypeAlias
@@ -792,7 +1855,7 @@ fn uirCoreAddTypeAlias(module: UirCoreModule, name: str, ty: UirCoreType) =
         uirCore_typeAliases_cache_len = module.typeAliases.len
 
 fn uirCoreFindObjType(module: UirCoreModule, name: str): int32 =
-    if module == nil || len(name) == 0:
+    if (module == nil) || len(name) == 0:
         return -1
     if module.objTypes.len >= 32:
         if uirCore_objTypes_cache_module != module || !uirCore_objTypes_cache_ready ||
@@ -827,7 +1890,7 @@ fn uirCoreGetObjType(module: UirCoreModule, name: str): UirCoreObjType =
 
 fn uirCoreAddObjType(module: UirCoreModule, ty: UirCoreObjType) =
     let norm: UirCoreObjType = uirCoreCanonicalizeObjType(ty)
-    if module == nil || len(norm.name) == 0:
+    if (module == nil) || len(norm.name) == 0:
         return
     let idx: int32 = uirCoreFindObjType(module, norm.name)
     if idx >= 0:
@@ -843,13 +1906,13 @@ fn uirCoreAddObjType(module: UirCoreModule, ty: UirCoreObjType) =
         uirCore_objTypes_cache_len = module.objTypes.len
 
 fn uirCoreAddFunc(module: UirCoreModule, func: UirCoreFunc) =
-    if module == nil || func == nil:
+    if (module == nil) || (!uirCoreFuncIdValid(func)):
         return
     uirCoreCanonicalizeFunc(func)
     add(module.funcs, func)
 
 fn uirCoreAddGlobal(module: UirCoreModule, name: str, ty: UirCoreType, init: int64, hasInit: bool, originFile: str) =
-    if module == nil:
+    if (module == nil):
         return
     var g: UirCoreGlobal
     g.name = uirCoreOwnStr(name)
@@ -859,95 +1922,321 @@ fn uirCoreAddGlobal(module: UirCoreModule, name: str, ty: UirCoreType, init: int
     g.originFile = uirCoreOwnStr(originFile)
     add(module.globals, g)
 
-fn uirCoreExprKindOf(expr: UirCoreExpr): UirCoreExprKind =
-    return expr.kind
+fn uirCoreExprKindOf(expr: UirExprId): UirCoreExprKind =
+    if (!uirCoreExprIdValid(expr)):
+        return meConstI64
+    return uirCore_exprPool_kind[expr]
 
-fn uirCoreExprCalleeOf(expr: UirCoreExpr): str =
-    return expr.callee
+fn uirCoreExprCalleeOf(expr: UirExprId): str =
+    if (!uirCoreExprIdValid(expr)):
+        return ""
+    return uirCore_exprPool_callee[expr]
 
-fn uirCoreExprLocalIndexOf(expr: UirCoreExpr): int32 =
-    return expr.localIndex
+fn uirCoreExprLocalIndexOf(expr: UirExprId): int32 =
+    if (!uirCoreExprIdValid(expr)):
+        return -1
+    return uirCore_exprPool_localIndex[expr]
 
-fn uirCoreExprConstValueOf(expr: UirCoreExpr): int64 =
-    return expr.value
+fn uirCoreExprSetLocalIndex(expr: UirExprId, localIndex: int32) =
+    if (!uirCoreExprIdValid(expr)):
+        return
+    uirCore_exprPool_localIndex[expr] = localIndex
 
-fn uirCoreExprBinOpOf(expr: UirCoreExpr): UirCoreBinOp =
-    return expr.binOp
+fn uirCoreExprConstValueOf(expr: UirExprId): int64 =
+    if (!uirCoreExprIdValid(expr)):
+        return 0
+    return uirCore_exprPool_value[expr]
 
-fn uirCoreExprCmpOpOf(expr: UirCoreExpr): UirCoreCmpOp =
-    return expr.cmpOp
+fn uirCoreExprBinOpOf(expr: UirExprId): UirCoreBinOp =
+    if (!uirCoreExprIdValid(expr)):
+        return mbAdd
+    return uirCore_exprPool_binOp[expr]
 
-fn uirCoreExprCastTypeOf(expr: UirCoreExpr): UirCoreType =
-    return expr.castType
+fn uirCoreExprCmpOpOf(expr: UirExprId): UirCoreCmpOp =
+    if (!uirCoreExprIdValid(expr)):
+        return mcEq
+    return uirCore_exprPool_cmpOp[expr]
 
-fn uirCoreExprLoadTypeOf(expr: UirCoreExpr): UirCoreType =
-    return expr.loadType
+fn uirCoreExprCastTypeOf(expr: UirExprId): UirCoreType =
+    if (!uirCoreExprIdValid(expr)):
+        return uirCoreTypeVoid()
+    return uirCore_exprPool_castType[expr]
 
-fn uirCoreExprGlobalNameOf(expr: UirCoreExpr): str =
-    return expr.globalName
+fn uirCoreExprLoadTypeOf(expr: UirExprId): UirCoreType =
+    if (!uirCoreExprIdValid(expr)):
+        return uirCoreTypeVoid()
+    return uirCore_exprPool_loadType[expr]
 
-fn uirCoreExprArgsLen(expr: UirCoreExpr): int32 =
-    return expr.args.len
+fn uirCoreExprGlobalNameOf(expr: UirExprId): str =
+    if (!uirCoreExprIdValid(expr)):
+        return ""
+    return uirCore_exprPool_globalName[expr]
 
-fn uirCoreExprArgAt(expr: UirCoreExpr, idx: int32): UirCoreExpr =
-    return expr.args[idx]
+fn uirCoreExprArgsLen(expr: UirExprId): int32 =
+    if (!uirCoreExprIdValid(expr)):
+        return 0
+    if expr >= uirCore_exprPool_args.len:
+        return 0
+    return uirCore_exprPool_args[expr].len
 
-fn uirCoreExprLhsOf(expr: UirCoreExpr): UirCoreExpr =
-    return expr.lhs
+fn uirCoreExprArgAt(expr: UirExprId, idx: int32): UirExprId =
+    if (!uirCoreExprIdValid(expr)):
+        return uirCoreInvalidId()
+    if expr >= uirCore_exprPool_args.len:
+        return uirCoreInvalidId()
+    let args: UirExprId[] = uirCore_exprPool_args[expr]
+    if idx < 0 || idx >= args.len:
+        return uirCoreInvalidId()
+    return args[idx]
 
-fn uirCoreExprRhsOf(expr: UirCoreExpr): UirCoreExpr =
-    return expr.rhs
+fn uirCoreExprSetArgAt(expr: UirExprId, idx: int32, val: UirExprId) =
+    if (!uirCoreExprIdValid(expr)):
+        return
+    if expr >= uirCore_exprPool_args.len:
+        panic "uirCore_types: expr args column out of sync"
+    var args: UirExprId[] = uirCore_exprPool_args[expr]
+    if idx < 0 || idx >= args.len:
+        panic "uirCore_types: expr arg index out of bounds"
+    args[idx] = val
+    uirCore_exprPool_args[expr] = args
 
-fn uirCoreExprCastExprOf(expr: UirCoreExpr): UirCoreExpr =
-    return expr.castExpr
+fn uirCoreExprLhsOf(expr: UirExprId): UirExprId =
+    if (!uirCoreExprIdValid(expr)):
+        return uirCoreInvalidId()
+    return uirCore_exprPool_lhs[expr]
 
-fn uirCoreExprAddrExprOf(expr: UirCoreExpr): UirCoreExpr =
-    return expr.addrExpr
+fn uirCoreExprSetLhs(expr: UirExprId, lhs: UirExprId) =
+    if (!uirCoreExprIdValid(expr)):
+        return
+    uirCore_exprPool_lhs[expr] = lhs
 
-fn uirCoreExprIsCall(expr: UirCoreExpr): bool =
-    return expr != nil && expr.kind == meCall
+fn uirCoreExprRhsOf(expr: UirExprId): UirExprId =
+    if (!uirCoreExprIdValid(expr)):
+        return uirCoreInvalidId()
+    return uirCore_exprPool_rhs[expr]
 
-fn uirCoreExprIsGlobalAddr(expr: UirCoreExpr): bool =
-    return expr != nil && expr.kind == meGlobalAddr
+fn uirCoreExprSetRhs(expr: UirExprId, rhs: UirExprId) =
+    if (!uirCoreExprIdValid(expr)):
+        return
+    uirCore_exprPool_rhs[expr] = rhs
 
-fn uirCoreExprIsBinOrCmp(expr: UirCoreExpr): bool =
-    return expr != nil && (expr.kind == meBin || expr.kind == meCmp)
+fn uirCoreExprCastExprOf(expr: UirExprId): UirExprId =
+    if (!uirCoreExprIdValid(expr)):
+        return uirCoreInvalidId()
+    return uirCore_exprPool_castExpr[expr]
 
-fn uirCoreExprIsCast(expr: UirCoreExpr): bool =
-    return expr != nil && expr.kind == meCast
+fn uirCoreExprSetCastExpr(expr: UirExprId, castExpr: UirExprId) =
+    if (!uirCoreExprIdValid(expr)):
+        return
+    uirCore_exprPool_castExpr[expr] = castExpr
 
-fn uirCoreExprIsAddrOrLoad(expr: UirCoreExpr): bool =
-    return expr != nil && (expr.kind == meAddr || expr.kind == meLoad)
+fn uirCoreExprAddrExprOf(expr: UirExprId): UirExprId =
+    if (!uirCoreExprIdValid(expr)):
+        return uirCoreInvalidId()
+    return uirCore_exprPool_addrExpr[expr]
 
-fn uirCoreStmtExprOf(stmt: UirCoreStmt): UirCoreExpr =
-    return stmt.expr
+fn uirCoreExprSetAddrExpr(expr: UirExprId, addrExpr: UirExprId) =
+    if (!uirCoreExprIdValid(expr)):
+        return
+    uirCore_exprPool_addrExpr[expr] = addrExpr
 
-fn uirCoreStmtAddrExprOf(stmt: UirCoreStmt): UirCoreExpr =
-    return stmt.addrExpr
+fn uirCoreExprIsCall(expr: UirExprId): bool =
+    return uirCoreExprIdValid(expr) && uirCoreExprKindOf(expr) == meCall
 
-fn uirCoreBlockStmtsLen(block: UirCoreBlock): int32 =
-    return block.stmts.len
+fn uirCoreExprIsGlobalAddr(expr: UirExprId): bool =
+    return uirCoreExprIdValid(expr) && uirCoreExprKindOf(expr) == meGlobalAddr
 
-fn uirCoreBlockStmtAt(block: UirCoreBlock, idx: int32): UirCoreStmt =
-    return block.stmts[idx]
+fn uirCoreExprIsBinOrCmp(expr: UirExprId): bool =
+    if (!uirCoreExprIdValid(expr)):
+        return false
+    let k: UirCoreExprKind = uirCoreExprKindOf(expr)
+    return k == meBin || k == meCmp
 
-fn uirCoreBlockLabelOf(block: UirCoreBlock): str =
-    return block.label
+fn uirCoreExprIsCast(expr: UirExprId): bool =
+    return uirCoreExprIdValid(expr) && uirCoreExprKindOf(expr) == meCast
 
-fn uirCoreBlockTermOf(block: UirCoreBlock): UirCoreTerm =
-    return block.term
+fn uirCoreExprIsAddrOrLoad(expr: UirExprId): bool =
+    if (!uirCoreExprIdValid(expr)):
+        return false
+    let k: UirCoreExprKind = uirCoreExprKindOf(expr)
+    return k == meAddr || k == meLoad
 
-fn uirCoreBlockRetExprOf(block: UirCoreBlock): UirCoreExpr =
-    return block.term.retExpr
+fn uirCoreStmtExprOf(stmt: UirStmtId): UirExprId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return uirCoreInvalidId()
+    return uirCore_stmtPool_expr[stmt]
 
-fn uirCoreBlockCondExprOf(block: UirCoreBlock): UirCoreExpr =
-    return block.term.condExpr
+fn uirCoreStmtKindOf(stmt: UirStmtId): UirCoreStmtKind =
+    if (!uirCoreStmtIdValid(stmt)):
+        return msExpr
+    return uirCore_stmtPool_kind[stmt]
+
+fn uirCoreStmtNameOf(stmt: UirStmtId): str =
+    if (!uirCoreStmtIdValid(stmt)):
+        return ""
+    return uirCore_stmtPool_name[stmt]
+
+fn uirCoreStmtSlotOf(stmt: UirStmtId): int32 =
+    if (!uirCoreStmtIdValid(stmt)):
+        return -1
+    return uirCore_stmtPool_slot[stmt]
+
+fn uirCoreStmtStoreTypeOf(stmt: UirStmtId): UirCoreType =
+    if (!uirCoreStmtIdValid(stmt)):
+        return uirCoreTypeVoid()
+    return uirCore_stmtPool_storeType[stmt]
+
+fn uirCoreStmtParamIndexOf(stmt: UirStmtId): int32 =
+    if (!uirCoreStmtIdValid(stmt)):
+        return -1
+    return uirCore_stmtPool_paramIndex[stmt]
+
+fn uirCoreStmtWithKind(stmt: UirStmtId, kind: UirCoreStmtKind): UirStmtId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return stmt
+    uirCore_stmtPool_kind[stmt] = kind
+    return stmt
+
+fn uirCoreStmtWithName(stmt: UirStmtId, name: str): UirStmtId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return stmt
+    uirCore_stmtPool_name[stmt] = name
+    return stmt
+
+fn uirCoreStmtWithSlot(stmt: UirStmtId, slot: int32): UirStmtId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return stmt
+    uirCore_stmtPool_slot[stmt] = slot
+    return stmt
+
+fn uirCoreStmtWithExpr(stmt: UirStmtId, expr: UirExprId): UirStmtId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return stmt
+    uirCore_stmtPool_expr[stmt] = expr
+    return stmt
+
+fn uirCoreStmtWithAddrExpr(stmt: UirStmtId, addrExpr: UirExprId): UirStmtId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return stmt
+    uirCore_stmtPool_addrExpr[stmt] = addrExpr
+    return stmt
+
+fn uirCoreStmtAddrExprOf(stmt: UirStmtId): UirExprId =
+    if (!uirCoreStmtIdValid(stmt)):
+        return uirCoreInvalidId()
+    return uirCore_stmtPool_addrExpr[stmt]
+
+fn uirCoreBlockStmtsLen(blk: UirBlockId): int32 =
+    if (!uirCoreBlockIdValid(blk)):
+        return 0
+    return uirCore_blockPool_stmts[blk].len
+
+fn uirCoreBlockStmtAt(blk: UirBlockId, idx: int32): UirStmtId =
+    let stmts: UirStmtId[] = uirCore_blockPool_stmts[blk]
+    return stmts[idx]
+
+fn uirCoreBlockSetStmtAt(blk: UirBlockId, idx: int32, stmt: UirStmtId) =
+    if (!uirCoreBlockIdValid(blk)):
+        return
+    var stmts: UirStmtId[] = uirCore_blockPool_stmts[blk]
+    if idx < 0 || idx >= stmts.len:
+        panic "uirCore_types: block stmt index out of bounds"
+    stmts[idx] = stmt
+    uirCore_blockPool_stmts[blk] = stmts
+
+fn uirCoreBlockSetStmts(blk: UirBlockId, stmts: UirStmtId[]) =
+    if (!uirCoreBlockIdValid(blk)):
+        return
+    uirCore_blockPool_stmts[blk] = stmts
+
+fn uirCoreBlockLabelOf(blk: UirBlockId): str =
+    if (!uirCoreBlockIdValid(blk)):
+        return ""
+    return uirCore_blockPool_label[blk]
+
+fn uirCoreBlockTermOf(blk: UirBlockId): UirCoreTerm =
+    if (!uirCoreBlockIdValid(blk)):
+        var t: UirCoreTerm
+        t.kind = mtBr
+        t.target = ""
+        t.targetTrue = ""
+        t.targetFalse = ""
+        t.retExpr = uirCoreInvalidId()
+        t.condExpr = uirCoreInvalidId()
+        return t
+    return uirCore_blockPool_term[blk]
+
+fn uirCoreBlockSetTerm(blk: UirBlockId, term: UirCoreTerm) =
+    if (!uirCoreBlockIdValid(blk)):
+        return
+    uirCore_blockPool_term[blk] = term
+
+fn uirCoreBlockRetExprOf(blk: UirBlockId): UirExprId =
+    return uirCoreBlockTermOf(blk).retExpr
+
+fn uirCoreBlockCondExprOf(blk: UirBlockId): UirExprId =
+    return uirCoreBlockTermOf(blk).condExpr
+
+fn uirCoreTermKindOf(term: UirCoreTerm): UirCoreTermKind =
+    return term.kind
+
+fn uirCoreTermRetExprOf(term: UirCoreTerm): UirExprId =
+    return term.retExpr
+
+fn uirCoreTermCondExprOf(term: UirCoreTerm): UirExprId =
+    return term.condExpr
+
+fn uirCoreTermTargetOf(term: UirCoreTerm): str =
+    return term.target
+
+fn uirCoreTermTargetTrueOf(term: UirCoreTerm): str =
+    return term.targetTrue
+
+fn uirCoreTermTargetFalseOf(term: UirCoreTerm): str =
+    return term.targetFalse
+
+fn uirCoreTermWithRetExpr(term: UirCoreTerm, retExpr: UirExprId): UirCoreTerm =
+    var out: UirCoreTerm = term
+    out.retExpr = retExpr
+    return out
+
+fn uirCoreTermWithCondExpr(term: UirCoreTerm, condExpr: UirExprId): UirCoreTerm =
+    var out: UirCoreTerm = term
+    out.condExpr = condExpr
+    return out
+
+fn uirCoreTermWithTarget(term: UirCoreTerm, target: str): UirCoreTerm =
+    var out: UirCoreTerm = term
+    out.target = target
+    return out
+
+fn uirCoreTermWithTargetTrue(term: UirCoreTerm, targetTrue: str): UirCoreTerm =
+    var out: UirCoreTerm = term
+    out.targetTrue = targetTrue
+    return out
+
+fn uirCoreTermWithTargetFalse(term: UirCoreTerm, targetFalse: str): UirCoreTerm =
+    var out: UirCoreTerm = term
+    out.targetFalse = targetFalse
+    return out
 
 fn uirCoreFuncBlocksLen(func: UirCoreFunc): int32 =
-    return func.blocks.len
+    let blocks: UirBlockId[] = func.blocks
+    return blocks.len
 
-fn uirCoreFuncBlockAt(func: UirCoreFunc, idx: int32): UirCoreBlock =
-    return func.blocks[idx]
+fn uirCoreFuncBlockAt(func: UirCoreFunc, idx: int32): UirBlockId =
+    let blocks: UirBlockId[] = func.blocks
+    return blocks[idx]
+
+fn uirCoreFuncSetBlockAt(func: UirCoreFunc, idx: int32, blk: UirBlockId) =
+    if (!uirCoreFuncIdValid(func)):
+        return
+    uirCoreWriteBlock(&func.blocks, idx, blk)
+
+fn uirCoreFuncSetBlocks(func: UirCoreFunc, blocks: UirBlockId[]) =
+    if (!uirCoreFuncIdValid(func)):
+        return
+    func.blocks = blocks
 
 fn uirCoreFuncIsExtern(func: UirCoreFunc): bool =
     return func.isExtern
@@ -958,8 +2247,14 @@ fn uirCoreFuncNameOf(func: UirCoreFunc): str =
 fn uirCoreFuncRetTypeOf(func: UirCoreFunc): UirCoreType =
     return func.retType
 
+fn uirCoreFuncRetTypeKeyOf(func: UirCoreFunc): str =
+    return func.retTypeKey
+
 fn uirCoreFuncObjFrameSizeOf(func: UirCoreFunc): int32 =
     return func.objFrameSize
+
+fn uirCoreFuncSetObjFrameSize(func: UirCoreFunc, objFrameSize: int32) =
+    func.objFrameSize = objFrameSize
 
 fn uirCoreFuncLinkNameOf(func: UirCoreFunc): str =
     return func.linkName
@@ -994,14 +2289,32 @@ fn uirCoreFuncObjLocalsLen(func: UirCoreFunc): int32 =
 fn uirCoreFuncObjLocalAt(func: UirCoreFunc, idx: int32): UirCoreObjLocal =
     return func.objLocals[idx]
 
+fn uirCoreFuncSetObjLocalAt(func: UirCoreFunc, idx: int32, ol: UirCoreObjLocal) =
+    if (!uirCoreFuncIdValid(func)):
+        return
+    uirCoreWriteObjLocal(&func.objLocals, idx, ol)
+
+fn uirCoreFuncAddObjLocal(func: UirCoreFunc, ol: UirCoreObjLocal) =
+    if (!uirCoreFuncIdValid(func)):
+        return
+    add(func.objLocals, ol)
+
 fn uirCoreFuncLocalTypesLen(func: UirCoreFunc): int32 =
     return func.localTypes.len
 
 fn uirCoreFuncLocalTypeAt(func: UirCoreFunc, idx: int32): UirCoreType =
     return func.localTypes[idx]
 
+fn uirCoreFuncAddLocalType(func: UirCoreFunc, ty: UirCoreType) =
+    if (!uirCoreFuncIdValid(func)):
+        return
+    add(func.localTypes, ty)
+
 fn uirCoreFuncSetLinkName(func: UirCoreFunc, linkName: str) =
     func.linkName = uirCoreOwnStr(linkName)
+
+fn uirCoreFuncSetName(func: UirCoreFunc, name: str) =
+    func.name = uirCoreOwnStr(name)
 
 fn uirCoreFuncSetOriginFile(func: UirCoreFunc, originFile: str) =
     func.originFile = uirCoreOwnStr(originFile)
@@ -1009,10 +2322,13 @@ fn uirCoreFuncSetOriginFile(func: UirCoreFunc, originFile: str) =
 fn uirCoreFuncSetExtern(func: UirCoreFunc, isExtern: bool) =
     func.isExtern = isExtern
 
+fn uirCoreFuncSetRetTypeKey(func: UirCoreFunc, retTypeKey: str) =
+    func.retTypeKey = uirCoreOwnStr(retTypeKey)
+
 fn uirCoreFuncSetPhaseContract(func: UirCoreFunc, phaseTag: int32,
                                highUirChecked: bool, lowUirLowered: bool,
                                fallbackReason: str) =
-    if func == nil:
+    if (!uirCoreFuncIdValid(func)):
         return
     func.phaseTag = phaseTag
     func.highUirChecked = highUirChecked
@@ -1034,49 +2350,61 @@ fn uirCoreModuleTargetOf(module: UirCoreModule): str =
 fn uirCoreModuleFuncAt(module: UirCoreModule, idx: int32): UirCoreFunc =
     return module.funcs[idx]
 
+fn uirCoreModuleSetFuncAt(module: UirCoreModule, idx: int32, func: UirCoreFunc) =
+    if (module == nil):
+        return
+    uirCoreWriteFunc(&module.funcs, idx, func)
+
+fn uirCoreModuleSetFuncs(module: UirCoreModule, funcs: UirCoreFunc[]) =
+    if (module == nil):
+        return
+    setLen(&module.funcs, int32(0))
+    for i in 0..<funcs.len:
+        add(module.funcs, funcs[i])
+
 fn uirCoreModuleCountHighUirCheckedFuncs(module: UirCoreModule): int32 =
-    if module == nil:
+    if (module == nil):
         return 0
     var total: int32 = 0
     for i in 0..<module.funcs.len:
-        let f: UirCoreFunc = module.funcs[i]
-        if f == nil || f.isExtern:
+        let f = module.funcs[i]
+        if (f == nil) || f.isExtern:
             continue
         if f.highUirChecked:
             total = total + 1
     return total
 
 fn uirCoreModuleCountLowUirLoweredFuncs(module: UirCoreModule): int32 =
-    if module == nil:
+    if (module == nil):
         return 0
     var total: int32 = 0
     for i in 0..<module.funcs.len:
-        let f: UirCoreFunc = module.funcs[i]
-        if f == nil || f.isExtern:
+        let f = module.funcs[i]
+        if (f == nil) || f.isExtern:
             continue
         if f.lowUirLowered:
             total = total + 1
     return total
 
 fn uirCoreModuleCountHighUirFallbackFuncs(module: UirCoreModule): int32 =
-    if module == nil:
+    if (module == nil):
         return 0
     var total: int32 = 0
     for i in 0..<module.funcs.len:
-        let f: UirCoreFunc = module.funcs[i]
-        if f == nil || f.isExtern:
+        let f = module.funcs[i]
+        if (f == nil) || f.isExtern:
             continue
         if !f.highUirChecked && len(f.phaseFallbackReason) > 0:
             total = total + 1
     return total
 
 fn uirCoreModuleApplyPhaseContract(module: UirCoreModule, highUirChecked: bool, fallbackReason: str) =
-    if module == nil:
+    if (module == nil):
         return
     let fallback: str = highUirChecked ? "" : fallbackReason
     for i in 0..<module.funcs.len:
-        let f: UirCoreFunc = module.funcs[i]
-        if f == nil || f.isExtern:
+        let f = module.funcs[i]
+        if (f == nil) || f.isExtern:
             continue
         uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), highUirChecked, true, fallback)
 
@@ -1092,6 +2420,18 @@ fn uirCoreModuleCStringsLen(module: UirCoreModule): int32 =
 fn uirCoreModuleCStringAt(module: UirCoreModule, idx: int32): UirCoreCString =
     return module.cstrs[idx]
 
+fn uirCoreModuleObjTypesLen(module: UirCoreModule): int32 =
+    return module.objTypes.len
+
+fn uirCoreModuleObjTypeAt(module: UirCoreModule, idx: int32): UirCoreObjType =
+    return module.objTypes[idx]
+
+fn uirCoreModuleTypeAliasesLen(module: UirCoreModule): int32 =
+    return module.typeAliases.len
+
+fn uirCoreModuleTypeAliasAt(module: UirCoreModule, idx: int32): UirCoreTypeAlias =
+    return module.typeAliases[idx]
+
 fn uirCoreCStringLabelOf(cstr: UirCoreCString): str =
     return cstr.label
 
@@ -1099,21 +2439,21 @@ fn uirCoreCStringValueOf(cstr: UirCoreCString): str =
     return cstr.value
 
 # Concrete Result specializations needed by stage1/self-link bootstrap.
-fn Ok_UirCoreExpr(value: UirCoreExpr): Result[UirCoreExpr] =
-    var out: Result[UirCoreExpr]
+fn Ok_UirCoreExpr(value: UirExprId): Result[UirExprId] =
+    var out: Result[UirExprId]
     out.ok = true
     out.value = value
     out.err = ErrorOk()
     return out
 
-fn Err_UirCoreExpr(err: str): Result[UirCoreExpr] =
-    var out: Result[UirCoreExpr]
+fn Err_UirCoreExpr(err: str): Result[UirExprId] =
+    var out: Result[UirExprId]
     out.ok = false
     out.err = ErrorNew(err)
     return out
 
-fn ErrInfo_UirCoreExpr(err: ErrorInfo): Result[UirCoreExpr] =
-    var out: Result[UirCoreExpr]
+fn ErrInfo_UirCoreExpr(err: ErrorInfo): Result[UirExprId] =
+    var out: Result[UirExprId]
     out.ok = false
     out.err = err
     return out
@@ -1139,7 +2479,7 @@ fn ErrInfo_UirCoreFunc(err: ErrorInfo): Result[UirCoreFunc] =
 
 fn Ok_UirCoreModule(value: UirCoreModule): Result[UirCoreModule] =
     var out: Result[UirCoreModule]
-    if value == nil:
+    if (value == nil):
         out.ok = false
         out.err = ErrorNew("uir core module ok(nil) is forbidden")
         return out
@@ -1190,14 +2530,12 @@ fn uirCoreU64ToHex(v: int64): str =
     for i in 0..<n:
         let shift: int32 = (n - 1 - i) * 4
         let nib: int32 = int32((v >> shift) & int64(0xF))
-        let dst: void* = ptr_add(p, i)
-        var pc: char* = char*(dst)
-        *pc = uirCoreHexDigit(nib)
-    setMem(ptr_add(p, n), 0, 1)
+        rawmemWriteChar(p, i, uirCoreHexDigit(nib))
+    rawmemSet(rawmemPtrAdd(p, n), 0, 1)
     return str(p)
 
 fn uirCoreFindCStringLabel(module: UirCoreModule, value: str): str =
-    if module == nil:
+    if (module == nil):
         return ""
     let v: str = len(value) == 0 ? "" : value
     if module.cstrs.len >= 32:
@@ -1217,7 +2555,7 @@ fn uirCoreFindCStringLabel(module: UirCoreModule, value: str): str =
     return ""
 
 fn uirCoreAddCString(module: UirCoreModule, value: str): str =
-    if module == nil:
+    if (module == nil):
         return ""
     var v: str = value
     if len(v) == 0:
@@ -1261,7 +2599,7 @@ fn uirCoreStrCmp(a: str, b: str): int32 =
     return 0
 
 fn uirCoreNormalizeModule(module: UirCoreModule) =
-    if module == nil:
+    if (module == nil):
         return
     # Deterministic ordering: stable insertion-sort by name/label.
     for i in 1..<module.globals.len:
@@ -1295,36 +2633,37 @@ fn uirCoreNormalizeModule(module: UirCoreModule) =
         uirCoreWriteCString(&module.cstrs, j2 + 1, key2)
 
     for i in 1..<module.funcs.len:
-        let key3: UirCoreFunc = module.funcs[i]
-        let keyName: str = key3 == nil ? "" : key3.name
+        let key3 = module.funcs[i]
+        let keyName: str = (key3 == nil) ? "" : key3.name
         var j3: int32 = i - 1
         let __for_start_j3 = j3
         for __for_rev_j3 in 0..(__for_start_j3 - (0)):
             j3 = __for_start_j3 - __for_rev_j3
-            let cur: UirCoreFunc = module.funcs[j3]
-            let curName: str = cur == nil ? "" : cur.name
+            let cur = module.funcs[j3]
+            let curName: str = (cur == nil) ? "" : cur.name
             if uirCoreStrCmp(curName, keyName) <= 0:
                 break
             uirCoreWriteFunc(&module.funcs, j3 + 1, cur)
         uirCoreWriteFunc(&module.funcs, j3 + 1, key3)
 
 fn uirCoreDemoModule(): UirCoreModule =
-    let mod: UirCoreModule = uirCoreNewModule("arm64-apple-darwin")
+    let mod = uirCoreNewModule("arm64-apple-darwin")
     let retType: UirCoreType = uirCoreTypeI32()
-    let f: UirCoreFunc = uirCoreNewFunc("main", retType)
-    let v: UirCoreExpr = uirCoreConstI64(0)
+    let f = uirCoreNewFunc("main", retType)
+    let v: UirExprId = uirCoreConstI64(0)
     uirCoreAddBlock(f, uirCoreBlock("entry", uirCoreTermRet(v)))
     uirCoreAddFunc(mod, f)
     return mod
 
-fn uirCoreFormatExpr(expr: UirCoreExpr): str =
-    if expr == nil:
+fn uirCoreFormatExpr(expr: UirExprId): str =
+    if (!uirCoreExprIdValid(expr)):
         return "nil"
-    if expr.kind == meConstI64:
-        return intToStr(int32(expr.value))
-    if expr.kind == meBin:
+    let ek: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if ek == meConstI64:
+        return intToStr(int32(uirCoreExprConstValueOf(expr)))
+    if ek == meBin:
         var op: str = "?"
-        case expr.binOp
+        case uirCoreExprBinOpOf(expr)
         of mbAdd: op = "+"
         of mbSub: op = "-"
         of mbMul: op = "*"
@@ -1335,48 +2674,50 @@ fn uirCoreFormatExpr(expr: UirCoreExpr): str =
         of mbXor: op = "^"
         of mbShl: op = "<<"
         of mbShr: op = ">>"
-        return "(" + uirCoreFormatExpr(expr.lhs) + " " + op + " " + uirCoreFormatExpr(expr.rhs) + ")"
-    if expr.kind == meCmp:
+        return "(" + uirCoreFormatExpr(uirCoreExprLhsOf(expr)) + " " + op + " " + uirCoreFormatExpr(uirCoreExprRhsOf(expr)) + ")"
+    if ek == meCmp:
         var op2: str = "=="
-        case expr.cmpOp
+        case uirCoreExprCmpOpOf(expr)
         of mcEq: op2 = "=="
         of mcNe: op2 = "!="
         of mcLt: op2 = "<"
         of mcLe: op2 = "<="
         of mcGt: op2 = ">"
         of mcGe: op2 = ">="
-        return "(" + uirCoreFormatExpr(expr.lhs) + " " + op2 + " " + uirCoreFormatExpr(expr.rhs) + ")"
-    if expr.kind == meLocal:
-        return "$l" + intToStr(expr.localIndex)
-    if expr.kind == meAddr:
-        return "&$l" + intToStr(expr.localIndex)
-    if expr.kind == meLoad:
-        return "*" + uirCoreFormatExpr(expr.addrExpr)
-    if expr.kind == meGlobalAddr:
-        return "&" + expr.globalName
-    if expr.kind == meCall:
-        var out: str = expr.callee + "("
-        for i in 0..<expr.args.len:
+        return "(" + uirCoreFormatExpr(uirCoreExprLhsOf(expr)) + " " + op2 + " " + uirCoreFormatExpr(uirCoreExprRhsOf(expr)) + ")"
+    if ek == meLocal:
+        return "$l" + intToStr(uirCoreExprLocalIndexOf(expr))
+    if ek == meAddr:
+        return "&$l" + intToStr(uirCoreExprLocalIndexOf(expr))
+    if ek == meLoad:
+        return "*" + uirCoreFormatExpr(uirCoreExprAddrExprOf(expr))
+    if ek == meGlobalAddr:
+        return "&" + uirCoreExprGlobalNameOf(expr)
+    if ek == meCall:
+        var out: str = uirCoreExprCalleeOf(expr) + "("
+        for i in 0..<uirCoreExprArgsLen(expr):
             if i > 0:
                 out = out + ", "
-            out = out + uirCoreFormatExpr(expr.args[i])
+            out = out + uirCoreFormatExpr(uirCoreExprArgAt(expr, i))
         return out + ")"
-    if expr.kind == meCast:
-        if expr.castType.kind == mtVoid:
-            return "void(" + uirCoreFormatExpr(expr.castExpr) + ")"
-        if expr.castType.kind == mtF64:
-            return "f64(" + uirCoreFormatExpr(expr.castExpr) + ")"
-        if expr.castType.kind == mtF32:
-            return "f32(" + uirCoreFormatExpr(expr.castExpr) + ")"
-        if expr.castType.kind == mtI64:
-            return (expr.castType.isUnsigned ? "u64(" : "i64(") + uirCoreFormatExpr(expr.castExpr) + ")"
-        if expr.castType.kind == mtI32:
-            return (expr.castType.isUnsigned ? "u32(" : "i32(") + uirCoreFormatExpr(expr.castExpr) + ")"
-        if expr.castType.kind == mtI16:
-            return (expr.castType.isUnsigned ? "u16(" : "i16(") + uirCoreFormatExpr(expr.castExpr) + ")"
-        if expr.castType.kind == mtI8:
-            return (expr.castType.isUnsigned ? "u8(" : "i8(") + uirCoreFormatExpr(expr.castExpr) + ")"
-        return "i32(" + uirCoreFormatExpr(expr.castExpr) + ")"
+    if ek == meCast:
+        let cty: UirCoreType = uirCoreExprCastTypeOf(expr)
+        let cexpr: UirExprId = uirCoreExprCastExprOf(expr)
+        if cty.kind == mtVoid:
+            return "void(" + uirCoreFormatExpr(cexpr) + ")"
+        if cty.kind == mtF64:
+            return "f64(" + uirCoreFormatExpr(cexpr) + ")"
+        if cty.kind == mtF32:
+            return "f32(" + uirCoreFormatExpr(cexpr) + ")"
+        if cty.kind == mtI64:
+            return (cty.isUnsigned ? "u64(" : "i64(") + uirCoreFormatExpr(cexpr) + ")"
+        if cty.kind == mtI32:
+            return (cty.isUnsigned ? "u32(" : "i32(") + uirCoreFormatExpr(cexpr) + ")"
+        if cty.kind == mtI16:
+            return (cty.isUnsigned ? "u16(" : "i16(") + uirCoreFormatExpr(cexpr) + ")"
+        if cty.kind == mtI8:
+            return (cty.isUnsigned ? "u8(" : "i8(") + uirCoreFormatExpr(cexpr) + ")"
+        return "i32(" + uirCoreFormatExpr(cexpr) + ")"
     return "?"
 
 fn uirCoreFormat(module: UirCoreModule): str =
@@ -1405,7 +2746,7 @@ fn uirCoreFormat(module: UirCoreModule): str =
             out = out + " = " + intToStr(int32(g.init))
         out = out + "\n"
     for i in 0..<module.funcs.len:
-        let f: UirCoreFunc = module.funcs[i]
+        let f = module.funcs[i]
         out = out + "fn " + f.name + "("
         for pi in 0..<f.params.len:
             let p: UirCoreParam = f.params[pi]
@@ -1429,86 +2770,101 @@ fn uirCoreFormat(module: UirCoreModule): str =
             out = out + (f.retType.isUnsigned ? "u8\n" : "i8\n")
         else:
             out = out + "i32\n"
-        for bi in 0..<f.blocks.len:
-            let b: UirCoreBlock = f.blocks[bi]
-            out = out + b.label + ":\n"
-            for si in 0..<b.stmts.len:
-                let s: UirCoreStmt = b.stmts[si]
-                if s.kind == msLet:
-                    out = out + "  let " + s.name + " = " + uirCoreFormatExpr(s.expr) + "\n"
-                elif s.kind == msVar:
-                    out = out + "  var " + s.name + " = " + uirCoreFormatExpr(s.expr) + "\n"
-                elif s.kind == msAssign:
-                    out = out + "  " + s.name + " = " + uirCoreFormatExpr(s.expr) + "\n"
-                elif s.kind == msParam:
-                    out = out + "  param " + s.name + "\n"
-                elif s.kind == msStore:
-                    out = out + "  *" + uirCoreFormatExpr(s.addrExpr) + " = " + uirCoreFormatExpr(s.expr) + "\n"
+        for bi in 0..<uirCoreFuncBlocksLen(f):
+            let b = uirCoreFuncBlockAt(f, bi)
+            let bLabel: str = uirCoreBlockLabelOf(b)
+            out = out + bLabel + ":\n"
+            for si in 0..<uirCoreBlockStmtsLen(b):
+                let s: UirStmtId = uirCoreBlockStmtAt(b, si)
+                let sk: UirCoreStmtKind = uirCoreStmtKindOf(s)
+                let sname: str = uirCoreStmtNameOf(s)
+                let sexpr: UirExprId = uirCoreStmtExprOf(s)
+                if sk == msLet:
+                    out = out + "  let " + sname + " = " + uirCoreFormatExpr(sexpr) + "\n"
+                elif sk == msVar:
+                    out = out + "  var " + sname + " = " + uirCoreFormatExpr(sexpr) + "\n"
+                elif sk == msAssign:
+                    out = out + "  " + sname + " = " + uirCoreFormatExpr(sexpr) + "\n"
+                elif sk == msParam:
+                    out = out + "  param " + sname + "\n"
+                elif sk == msStore:
+                    out = out + "  *" + uirCoreFormatExpr(uirCoreStmtAddrExprOf(s)) + " = " + uirCoreFormatExpr(sexpr) + "\n"
                 else:
-                    out = out + "  expr " + uirCoreFormatExpr(s.expr) + "\n"
-            if b.term.kind == mtRet:
-                if b.term.retExpr == nil:
+                    out = out + "  expr " + uirCoreFormatExpr(sexpr) + "\n"
+            let term: UirCoreTerm = uirCoreBlockTermOf(b)
+            if term.kind == mtRet:
+                let retExpr: UirExprId = term.retExpr
+                if (!uirCoreExprIdValid(retExpr)):
                     out = out + "  ret\n"
                 else:
-                    out = out + "  ret " + uirCoreFormatExpr(b.term.retExpr) + "\n"
-            elif b.term.kind == mtBr:
-                out = out + "  br " + b.term.target + "\n"
+                    out = out + "  ret " + uirCoreFormatExpr(retExpr) + "\n"
+            elif term.kind == mtBr:
+                out = out + "  br " + term.target + "\n"
             else:
-                out = out + "  cbr " + uirCoreFormatExpr(b.term.condExpr) + " ? " +
-                      b.term.targetTrue + " : " + b.term.targetFalse + "\n"
+                let condExpr: UirExprId = term.condExpr
+                out = out + "  cbr " + uirCoreFormatExpr(condExpr) + " ? " +
+                      term.targetTrue + " : " + term.targetFalse + "\n"
     return out
 
-fn uirCoreValidateExpr(func: UirCoreFunc, expr: UirCoreExpr, ctx: str): Result[bool] =
-    if expr == nil:
+fn uirCoreValidateExpr(func: UirCoreFunc, expr: UirExprId, ctx: str): Result[bool] =
+    if (!uirCoreExprIdValid(expr)):
         return Err[bool]("uirCore_validate: nil expr (" + ctx + ")")
-    if expr.kind == meConstI64:
+    let ek: UirCoreExprKind = uirCoreExprKindOf(expr)
+    if ek == meConstI64:
         return Ok[bool](true)
-    if expr.kind == meLocal:
-        if expr.localIndex < 0:
+    if ek == meLocal:
+        let localIndex: int32 = uirCoreExprLocalIndexOf(expr)
+        if localIndex < 0:
             return Err[bool]("uirCore_validate: negative local index (" + ctx + ")")
-        if func != nil && expr.localIndex >= func.localTypes.len:
+        if uirCoreFuncIdValid(func) && localIndex >= func.localTypes.len:
             return Err[bool]("uirCore_validate: local index out of range (" + ctx + ")")
         return Ok[bool](true)
-    if expr.kind == meAddr:
-        if expr.localIndex < 0:
+    if ek == meAddr:
+        let addrSlot: int32 = uirCoreExprLocalIndexOf(expr)
+        if addrSlot < 0:
             return Err[bool]("uirCore_validate: negative addr slot (" + ctx + ")")
-        if func != nil:
-            if expr.localIndex >= func.localTypes.len:
+        if uirCoreFuncIdValid(func):
+            if addrSlot >= func.localTypes.len:
                 return Err[bool]("uirCore_validate: addr slot out of range (" + ctx + ")")
             for oi in 0..<func.objLocals.len:
                 let ol: UirCoreObjLocal = func.objLocals[oi]
-                if ol.slot == expr.localIndex && ol.frameOff >= 0:
+                if ol.slot == addrSlot && ol.frameOff >= 0:
                     return Err[bool]("uirCore_validate: meAddr on object-local slot (pointer-to-pointer) (" + ctx + ")")
         return Ok[bool](true)
-    if expr.kind == meLoad:
-        if expr.loadType.kind == mtVoid:
+    if ek == meLoad:
+        let loadType: UirCoreType = uirCoreExprLoadTypeOf(expr)
+        let addrExpr: UirExprId = uirCoreExprAddrExprOf(expr)
+        if loadType.kind == mtVoid:
             return Err[bool]("uirCore_validate: load void type (" + ctx + ")")
-        if expr.addrExpr == nil:
+        if (!uirCoreExprIdValid(addrExpr)):
             return Err[bool]("uirCore_validate: load missing addr (" + ctx + ")")
-        return uirCoreValidateExpr(func, expr.addrExpr, ctx + "/load.addr")
-    if expr.kind == meGlobalAddr:
-        if len(expr.globalName) == 0:
+        return uirCoreValidateExpr(func, addrExpr, ctx + "/load.addr")
+    if ek == meGlobalAddr:
+        if len(uirCoreExprGlobalNameOf(expr)) == 0:
             return Err[bool]("uirCore_validate: global addr missing name (" + ctx + ")")
         return Ok[bool](true)
-    if expr.kind == meBin || expr.kind == meCmp:
-        if expr.lhs == nil || expr.rhs == nil:
+    if ek == meBin || ek == meCmp:
+        let lhs: UirExprId = uirCoreExprLhsOf(expr)
+        let rhs: UirExprId = uirCoreExprRhsOf(expr)
+        if (!uirCoreExprIdValid(lhs)) || (!uirCoreExprIdValid(rhs)):
             return Err[bool]("uirCore_validate: binary expr missing operand (" + ctx + ")")
-        let lres: Result[bool] = uirCoreValidateExpr(func, expr.lhs, ctx + "/lhs")
+        let lres: Result[bool] = uirCoreValidateExpr(func, lhs, ctx + "/lhs")
         if ! IsOk[bool](lres):
             return lres
-        return uirCoreValidateExpr(func, expr.rhs, ctx + "/rhs")
-    if expr.kind == meCall:
-        if len(expr.callee) == 0:
+        return uirCoreValidateExpr(func, rhs, ctx + "/rhs")
+    if ek == meCall:
+        if len(uirCoreExprCalleeOf(expr)) == 0:
             return Err[bool]("uirCore_validate: call missing callee (" + ctx + ")")
-        for ai in 0..<expr.args.len:
-            let ares: Result[bool] = uirCoreValidateExpr(func, expr.args[ai], ctx + "/arg")
+        for ai in 0..<uirCoreExprArgsLen(expr):
+            let ares: Result[bool] = uirCoreValidateExpr(func, uirCoreExprArgAt(expr, ai), ctx + "/arg")
             if ! IsOk[bool](ares):
                 return ares
         return Ok[bool](true)
-    if expr.kind == meCast:
-        if expr.castExpr == nil:
+    if ek == meCast:
+        let castExpr: UirExprId = uirCoreExprCastExprOf(expr)
+        if (!uirCoreExprIdValid(castExpr)):
             return Err[bool]("uirCore_validate: cast missing expr (" + ctx + ")")
-        return uirCoreValidateExpr(func, expr.castExpr, ctx + "/cast")
+        return uirCoreValidateExpr(func, castExpr, ctx + "/cast")
     return Err[bool]("uirCore_validate: unknown expr kind (" + ctx + ")")
 
 fn uirCoreValidateObjType(ty: UirCoreObjType): Result[bool] =
@@ -1553,7 +2909,7 @@ fn uirCoreValidateObjType(ty: UirCoreObjType): Result[bool] =
     return Ok[bool](true)
 
 fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
-    if func == nil:
+    if (!uirCoreFuncIdValid(func)):
         return Err[bool]("uirCore_validate: nil func")
     if len(func.name) == 0:
         return Err[bool]("uirCore_validate: func missing name")
@@ -1570,106 +2926,118 @@ fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
         return Err[bool]("uirCore_validate: checked high phase cannot carry fallback reason (" + func.name + ")")
     if !func.highUirChecked && !hasFallbackReason:
         return Err[bool]("uirCore_validate: unchecked high phase requires fallback reason (" + func.name + ")")
-    if func.blocks.len == 0:
+    if uirCoreFuncBlocksLen(func) == 0:
         return Err[bool]("uirCore_validate: func has no blocks (" + func.name + ")")
     # Labels: unique + reachable branch targets.
-    for i in 0..<func.blocks.len:
-        let b: UirCoreBlock = func.blocks[i]
-        if b == nil:
+    for i in 0..<uirCoreFuncBlocksLen(func):
+        let b = uirCoreFuncBlockAt(func, i)
+        if (!uirCoreBlockIdValid(b)):
             return Err[bool]("uirCore_validate: nil block (" + func.name + ")")
-        if len(b.label) == 0:
+        let label: str = uirCoreBlockLabelOf(b)
+        if len(label) == 0:
             return Err[bool]("uirCore_validate: block missing label (" + func.name + ")")
         for j in 0..<i:
-            let prev: UirCoreBlock = func.blocks[j]
-            if prev != nil && (prev.label == b.label):
-                return Err[bool]("uirCore_validate: duplicate block label (" + func.name + ":" + b.label + ")")
+            let prev = uirCoreFuncBlockAt(func, j)
+            if uirCoreBlockIdValid(prev) && (uirCoreBlockLabelOf(prev) == label):
+                return Err[bool]("uirCore_validate: duplicate block label (" + func.name + ":" + label + ")")
 
-    for bi in 0..<func.blocks.len:
-        let b2: UirCoreBlock = func.blocks[bi]
-        if b2.term.kind == mtRet:
-            if func.retType.kind != mtVoid && b2.term.retExpr == nil:
-                return Err[bool]("uirCore_validate: missing ret expr (" + func.name + ":" + b2.label + ")")
-            if func.retType.kind == mtVoid && b2.term.retExpr != nil:
-                return Err[bool]("uirCore_validate: void ret with expr (" + func.name + ":" + b2.label + ")")
-        elif b2.term.kind == mtBr:
-            if len(b2.term.target) == 0:
-                return Err[bool]("uirCore_validate: br missing target (" + func.name + ":" + b2.label + ")")
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let b2 = uirCoreFuncBlockAt(func, bi)
+        let b2Label: str = uirCoreBlockLabelOf(b2)
+        let term2: UirCoreTerm = uirCoreBlockTermOf(b2)
+        let retExpr2: UirExprId = term2.retExpr
+        let condExpr2: UirExprId = term2.condExpr
+        if term2.kind == mtRet:
+            if func.retType.kind != mtVoid && (!uirCoreExprIdValid(retExpr2)):
+                return Err[bool]("uirCore_validate: missing ret expr (" + func.name + ":" + b2Label + ")")
+            if func.retType.kind == mtVoid && uirCoreExprIdValid(retExpr2):
+                return Err[bool]("uirCore_validate: void ret with expr (" + func.name + ":" + b2Label + ")")
+        elif term2.kind == mtBr:
+            if len(term2.target) == 0:
+                return Err[bool]("uirCore_validate: br missing target (" + func.name + ":" + b2Label + ")")
             var found: bool = false
-            for li in 0..<func.blocks.len:
-                let bb: UirCoreBlock = func.blocks[li]
-                if bb != nil && (bb.label == b2.term.target):
+            for li in 0..<uirCoreFuncBlocksLen(func):
+                let bb = uirCoreFuncBlockAt(func, li)
+                if uirCoreBlockIdValid(bb) && (uirCoreBlockLabelOf(bb) == term2.target):
                     found = true
                     break
             if ! found:
-                return Err[bool]("uirCore_validate: br target not found (" + func.name + ":" + b2.label + ")")
+                return Err[bool]("uirCore_validate: br target not found (" + func.name + ":" + b2Label + ")")
         else:
-            if b2.term.condExpr == nil:
-                return Err[bool]("uirCore_validate: cbr missing cond (" + func.name + ":" + b2.label + ")")
-            if len(b2.term.targetTrue) == 0:
-                return Err[bool]("uirCore_validate: cbr missing true target (" + func.name + ":" + b2.label + ")")
-            if len(b2.term.targetFalse) == 0:
-                return Err[bool]("uirCore_validate: cbr missing false target (" + func.name + ":" + b2.label + ")")
+            if (!uirCoreExprIdValid(condExpr2)):
+                return Err[bool]("uirCore_validate: cbr missing cond (" + func.name + ":" + b2Label + ")")
+            if len(term2.targetTrue) == 0:
+                return Err[bool]("uirCore_validate: cbr missing true target (" + func.name + ":" + b2Label + ")")
+            if len(term2.targetFalse) == 0:
+                return Err[bool]("uirCore_validate: cbr missing false target (" + func.name + ":" + b2Label + ")")
             var foundT: bool = false
             var foundF: bool = false
-            for li2 in 0..<func.blocks.len:
-                let bb2: UirCoreBlock = func.blocks[li2]
-                if bb2 != nil && (bb2.label == b2.term.targetTrue):
+            for li2 in 0..<uirCoreFuncBlocksLen(func):
+                let bb2 = uirCoreFuncBlockAt(func, li2)
+                if uirCoreBlockIdValid(bb2) && (uirCoreBlockLabelOf(bb2) == term2.targetTrue):
                     foundT = true
-                if bb2 != nil && (bb2.label == b2.term.targetFalse):
+                if uirCoreBlockIdValid(bb2) && (uirCoreBlockLabelOf(bb2) == term2.targetFalse):
                     foundF = true
             if ! foundT || ! foundF:
-                return Err[bool]("uirCore_validate: cbr target not found (" + func.name + ":" + b2.label + ")")
-        for si in 0..<b2.stmts.len:
-            let s: UirCoreStmt = b2.stmts[si]
-            if s.kind != msLet && s.kind != msVar && s.kind != msAssign &&
-               s.kind != msExpr && s.kind != msParam && s.kind != msStore:
-                return Err[bool]("uirCore_validate: invalid stmt kind (" + func.name + ":" + b2.label +
+                return Err[bool]("uirCore_validate: cbr target not found (" + func.name + ":" + b2Label + ")")
+        for si in 0..<uirCoreBlockStmtsLen(b2):
+            let s: UirStmtId = uirCoreBlockStmtAt(b2, si)
+            let sk: UirCoreStmtKind = uirCoreStmtKindOf(s)
+            let sslot: int32 = uirCoreStmtSlotOf(s)
+            let sexpr: UirExprId = uirCoreStmtExprOf(s)
+            let sname: str = uirCoreStmtNameOf(s)
+            let sparamIndex: int32 = uirCoreStmtParamIndexOf(s)
+            let saddr: UirExprId = uirCoreStmtAddrExprOf(s)
+            let sstoreTy: UirCoreType = uirCoreStmtStoreTypeOf(s)
+            if sk != msLet && sk != msVar && sk != msAssign &&
+               sk != msExpr && sk != msParam && sk != msStore:
+                return Err[bool]("uirCore_validate: invalid stmt kind (" + func.name + ":" + b2Label +
                                  " si=" + intToStr(si) +
-                                 " kind=" + intToStr(int32(s.kind)) +
-                                 " slot=" + intToStr(s.slot) +
-                                 " stmts.len=" + intToStr(b2.stmts.len) +
+                                 " kind=" + intToStr(int32(sk)) +
+                                 " slot=" + intToStr(sslot) +
+                                 " stmts.len=" + intToStr(uirCoreBlockStmtsLen(b2)) +
                                  ")")
-            if s.kind == msLet || s.kind == msVar || s.kind == msAssign:
-                if s.slot < 0:
-                    return Err[bool]("uirCore_validate: stmt slot < 0 (" + func.name + ":" + b2.label + ")")
-                if s.expr == nil:
-                    return Err[bool]("uirCore_validate: stmt missing expr (" + func.name + ":" + b2.label +
+            if sk == msLet || sk == msVar || sk == msAssign:
+                if sslot < 0:
+                    return Err[bool]("uirCore_validate: stmt slot < 0 (" + func.name + ":" + b2Label + ")")
+                if (!uirCoreExprIdValid(sexpr)):
+                    return Err[bool]("uirCore_validate: stmt missing expr (" + func.name + ":" + b2Label +
                                      " si=" + intToStr(si) +
-                                     " kind=" + uirCoreStmtKindName(s.kind) +
-                                     " name=" + (len(s.name) == 0 ? "" : s.name) +
-                                     " slot=" + intToStr(s.slot) + ")")
-                let eres: Result[bool] = uirCoreValidateExpr(func, s.expr, func.name + ":" + b2.label + "/stmt")
+                                     " kind=" + uirCoreStmtKindName(sk) +
+                                     " name=" + (len(sname) == 0 ? "" : sname) +
+                                     " slot=" + intToStr(sslot) + ")")
+                let eres: Result[bool] = uirCoreValidateExpr(func, sexpr, func.name + ":" + b2Label + "/stmt")
                 if ! IsOk[bool](eres):
                     return eres
-            elif s.kind == msParam:
-                if s.slot < 0 || s.paramIndex < 0:
-                    return Err[bool]("uirCore_validate: param stmt invalid (" + func.name + ":" + b2.label + ")")
-            elif s.kind == msStore:
-                if s.addrExpr == nil || s.expr == nil:
-                    return Err[bool]("uirCore_validate: store missing expr/addr (" + func.name + ":" + b2.label + ")")
-                if s.storeType.kind == mtVoid:
-                    return Err[bool]("uirCore_validate: store void type (" + func.name + ":" + b2.label + ")")
-                let ares: Result[bool] = uirCoreValidateExpr(func, s.addrExpr, func.name + ":" + b2.label + "/store.addr")
+            elif sk == msParam:
+                if sslot < 0 || sparamIndex < 0:
+                    return Err[bool]("uirCore_validate: param stmt invalid (" + func.name + ":" + b2Label + ")")
+            elif sk == msStore:
+                if (!uirCoreExprIdValid(saddr)) || (!uirCoreExprIdValid(sexpr)):
+                    return Err[bool]("uirCore_validate: store missing expr/addr (" + func.name + ":" + b2Label + ")")
+                if sstoreTy.kind == mtVoid:
+                    return Err[bool]("uirCore_validate: store void type (" + func.name + ":" + b2Label + ")")
+                let ares: Result[bool] = uirCoreValidateExpr(func, saddr, func.name + ":" + b2Label + "/store.addr")
                 if ! IsOk[bool](ares):
                     return ares
-                let vres: Result[bool] = uirCoreValidateExpr(func, s.expr, func.name + ":" + b2.label + "/store.value")
+                let vres: Result[bool] = uirCoreValidateExpr(func, sexpr, func.name + ":" + b2Label + "/store.value")
                 if ! IsOk[bool](vres):
                     return vres
             else:
-                if s.expr == nil:
-                    return Err[bool]("uirCore_validate: expr stmt missing expr (" + func.name + ":" + b2.label +
+                if (!uirCoreExprIdValid(sexpr)):
+                    return Err[bool]("uirCore_validate: expr stmt missing expr (" + func.name + ":" + b2Label +
                                      " si=" + intToStr(si) +
-                                     " kind=" + uirCoreStmtKindName(s.kind) + ")")
-                let eres2: Result[bool] = uirCoreValidateExpr(func, s.expr, func.name + ":" + b2.label + "/expr")
+                                     " kind=" + uirCoreStmtKindName(sk) + ")")
+                let eres2: Result[bool] = uirCoreValidateExpr(func, sexpr, func.name + ":" + b2Label + "/expr")
                 if ! IsOk[bool](eres2):
                     return eres2
 
-        if b2.term.kind == mtRet && b2.term.retExpr != nil:
-            let rres: Result[bool] = uirCoreValidateExpr(func, b2.term.retExpr, func.name + ":" + b2.label + "/ret")
+        if term2.kind == mtRet && uirCoreExprIdValid(retExpr2):
+            let rres: Result[bool] = uirCoreValidateExpr(func, retExpr2, func.name + ":" + b2Label + "/ret")
             if ! IsOk[bool](rres):
                 return rres
-        if b2.term.kind == mtCbr && b2.term.condExpr != nil:
-            let cres: Result[bool] = uirCoreValidateExpr(func, b2.term.condExpr, func.name + ":" + b2.label + "/cbr.cond")
+        if term2.kind == mtCbr && uirCoreExprIdValid(condExpr2):
+            let cres: Result[bool] = uirCoreValidateExpr(func, condExpr2, func.name + ":" + b2Label + "/cbr.cond")
             if ! IsOk[bool](cres):
                 return cres
 
@@ -1690,13 +3058,13 @@ fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
                                  " frameOff=" + intToStr(ol2.frameOff) + ")")
         if len(ol2.objTypeName) == 0:
             return Err[bool]("uirCore_validate: obj local missing objTypeName (" + func.name + ")")
-        if module != nil && ! uirCoreHasObjType(module, ol2.objTypeName):
+        if !(module == nil) && ! uirCoreHasObjType(module, ol2.objTypeName):
             return Err[bool]("uirCore_validate: obj local objType not found (" + func.name + ":" + ol2.objTypeName + ")")
 
     return Ok[bool](true)
 
 fn uirCoreValidateModule(module: UirCoreModule): Result[bool] =
-    if module == nil:
+    if (module == nil):
         return Err[bool]("uirCore_validate: nil module")
     for oi in 0..<module.objTypes.len:
         let ot: UirCoreObjType = module.objTypes[oi]
@@ -1704,7 +3072,7 @@ fn uirCoreValidateModule(module: UirCoreModule): Result[bool] =
         if ! IsOk[bool](ores):
             return ores
     for fi in 0..<module.funcs.len:
-        let f: UirCoreFunc = module.funcs[fi]
+        let f = module.funcs[fi]
         let fres: Result[bool] = uirCoreValidateFunc(module, f)
         if ! IsOk[bool](fres):
             return fres

@@ -23,66 +23,69 @@ fn uirCoreFuncSigId(retKey: str, paramKeys: str[]): str =
 fn uirCoreMangleOverloadName(baseSym: str, retKey: str, paramKeys: str[]): str =
     return baseSym + uirCoreFuncSigMarker() + uirCoreFuncSigId(retKey, paramKeys)
 
-fn uirCoreComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
+fn uirCoreComputeOverloadedFnBasesId(rootId: AstNodeId): hashsets.HashSetStr =
     # Stage1 monomorphize may emit multiple functions with the same base name (e.g. `len`)
     # but different signatures. The MIR module requires globally-unique function symbols,
     # so we precompute which base names are overloaded.
     var overloaded: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
-    let rootKids: int32 = kidCount(root)
+    if !astNodeIdValid(rootId):
+        return overloaded
+    let rootKids: int32 = astKidCount(rootId)
     let mapCap: int32 = (rootKids > 128) ? (rootKids * 2) : 256
     var nameIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(mapCap)
-    var seenNames: str[]
     var firstSigs: str[]
-
-    var queue: Node[256]
-    add(queue, root)
-    while queue.len > 0:
-        let n: Node = queue[queue.len - 1]
-        queue.len = queue.len - 1
-        if n == nil || n.kind == nkEmpty:
+    for i in 0..<rootKids:
+        let top: AstNodeId = astKidAt(rootId, i)
+        if !astNodeIdValid(top) || astNodeKind(top) == nkEmpty:
             continue
-        if (n.kind != nkFnDecl && n.kind != nkIteratorDecl) || kidCount(n) == 0:
-            # Root/module wrappers vary by frontend path; recurse generically.
-            for i in 0..<kidCount(n):
-                add(queue, kid(n, i))
+        var n: AstNodeId = top
+        if (astNodeKind(n) != nkFnDecl && astNodeKind(n) != nkIteratorDecl) || astKidCount(n) == 0:
+            # Keep a shallow fallback for wrapper nodes; do not walk function bodies.
+            if astKidCount(top) <= 0:
+                continue
+            n = astKidAt(top, 0)
+            if !astNodeIdValid(n) || astNodeKind(n) == nkEmpty:
+                continue
+            if (astNodeKind(n) != nkFnDecl && astNodeKind(n) != nkIteratorDecl) || astKidCount(n) == 0:
+                continue
+        if uirCoreFuncSigHasUnresolvedGenericsId(n):
             continue
-        if uirCoreFuncSigHasUnresolvedGenerics(n):
+        let nameNode: AstNodeId = astKidAt(n, 0)
+        if !astNodeIdValid(nameNode) || (astNodeKind(nameNode) != nkIdent && astNodeKind(nameNode) != nkSymbol):
             continue
-        let nameNode: Node = kid(n, 0)
-        if nameNode == nil || (nameNode.kind != nkIdent && nameNode.kind != nkSymbol):
-            continue
-        let rawName: str = backendStripSpaces(plainName(nameNode))
+        let rawName: str = backendStripSpaces(astPlainName(nameNode))
         let baseId: str = rawName
         if len(baseId) == 0:
             continue
 
-        let paramsNode: Node = kid(n, 1)
+        let paramsNode: AstNodeId = astKidAt(n, 1)
         var paramKeys: str[]
-        if paramsNode != nil && paramsNode.kind == nkFormalParams:
-            for pi in 0..<kidCount(paramsNode):
-                let defs: Node = kid(paramsNode, pi)
-                if defs != nil && defs.kind == nkIdentDefs && kidCount(defs) > 1:
-                    let tn: Node = kid(defs, 1)
-                    let pk: str = (tn != nil) ? typeKey(tn) : ""
+        if astNodeIdValid(paramsNode) && astNodeKind(paramsNode) == nkFormalParams:
+            for pi in 0..<astKidCount(paramsNode):
+                let defs: AstNodeId = astKidAt(paramsNode, pi)
+                if astNodeIdValid(defs) && astNodeKind(defs) == nkIdentDefs && astKidCount(defs) > 1:
+                    let tn: AstNodeId = astKidAt(defs, 1)
+                    let pk: str = astNodeIdValid(tn) ? typeKey(tn) : ""
                     add(paramKeys, pk)
 
-        let retNode: Node = kid(n, 2)
+        let retNode: AstNodeId = astKidAt(n, 2)
         var retKey: str = ""
-        if retNode != nil && retNode.kind != nkEmpty:
+        if astNodeIdValid(retNode) && astNodeKind(retNode) != nkEmpty:
             retKey = typeKey(retNode)
         let sigId: str = uirCoreFuncSigId(retKey, paramKeys)
 
-        var foundName: bool = false
-        let idxPlus1: int32 = uirCoreHashMapStrIntGetCompat(nameIndex, baseId, foundName)
-        if !foundName || idxPlus1 <= 0:
-            let newIdx: int32 = seenNames.len
-            add(seenNames, baseId)
+        let prevIdxPlus1: int32 = hashmaps.hashMapStrIntGet(nameIndex, baseId)
+        let prevIdx: int32 = (prevIdxPlus1 > 0) ? (prevIdxPlus1 - 1) : -1
+        if prevIdx < 0:
+            let newIdx: int32 = firstSigs.len
             add(firstSigs, sigId)
             hashmaps.hashMapStrIntPut(nameIndex, baseId, newIdx + 1)
             continue
-        let prevIdx: int32 = idxPlus1 - 1
         if prevIdx >= 0 && prevIdx < firstSigs.len:
             let prevSig: str = firstSigs[prevIdx]
             if !(prevSig == sigId):
                 hashsets.hashSetStrAdd(overloaded, baseId)
     return overloaded
+
+fn uirCoreComputeOverloadedFnBases(root: Node): hashsets.HashSetStr =
+    return uirCoreComputeOverloadedFnBasesId(root)

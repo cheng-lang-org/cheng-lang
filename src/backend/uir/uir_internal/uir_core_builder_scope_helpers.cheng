@@ -3,6 +3,7 @@ import std/os
 import std/strutils
 import std/hashmaps
 import std/system
+import std/rawmem_support
 import stage1/lexer
 import stage1/ast
 import backend/uir/uir_internal/uir_core_types
@@ -21,10 +22,13 @@ fn scopeStripSpacesMaybe(s: str): str =
         return ""
     return out
 
-fn scopeOpName(n: Node): str =
-    if n == nil:
+fn scopeOpNameId(id: AstNodeId): str =
+    if !astNodeIdValid(id):
         return ""
-    return scopeStripSpaces(plainName(n))
+    return scopeStripSpaces(astPlainName(id))
+
+fn scopeOpName(n: Node): str =
+    return scopeOpNameId(n)
 
 fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): BlockBuilder =
     var b: BlockBuilder
@@ -38,6 +42,8 @@ fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): Blo
     b.objCursor = 0
     b.loopStack = []
     b.deferStack = []
+    b.exprLowerDepth = 0
+    b.exprLowerStack = []
     return b
 
 fn blockBuilderNextLabel(b: BlockBuilder, prefix: str): str =
@@ -52,27 +58,27 @@ fn blockBuilderStart(b: BlockBuilder, label: str) =
 fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
     # Copy stmt buffer so finished blocks don't alias the builder's scratch seq.
     # (Without this, later appends can realloc/free the shared buffer.)
-    var stmtsCopy: UirCoreStmt[]
+    var stmtsCopy: UirStmtId[]
     if b.currentStmts.len > 0:
         stmtsCopy.cap = b.currentStmts.len
         for si in 0..<b.currentStmts.len:
             add(stmtsCopy, b.currentStmts[si])
-    let blk: UirCoreBlock = uirCoreBlockWithStmts(b.currentLabel, stmtsCopy, term)
+    let blk: UirBlockId = uirCoreBlockWithStmts(b.currentLabel, stmtsCopy, term)
     let dbgFunc: UirCoreFunc = b.func
     let dbgName: str = (dbgFunc != nil) ? dbgFunc.name : ""
     if (os.getEnvDefault("BACKEND_DEBUG_MIR_FINISH", "") == dbgName):
         let curLen: int32 = b.currentStmts.len
-        let blkLen: int32 = blk.stmts.len
+        let blkLen: int32 = uirCoreBlockStmtsLen(blk)
         echo("[backend] dbgFinish: fn=" + dbgName + " label=" + b.currentLabel +
              " cur.len=" + intToStr(curLen) + " blk.len=" + intToStr(blkLen))
         if curLen > 0:
-            let s0: UirCoreStmt = b.currentStmts[0]
-            echo("[backend] dbgFinish: cur0.kind=" + intToStr(int32(s0.kind)) +
-                 " slot=" + intToStr(s0.slot))
+            let s0: UirStmtId = b.currentStmts[0]
+            echo("[backend] dbgFinish: cur0.kind=" + intToStr(int32(uirCoreStmtKindOf(s0))) +
+                 " slot=" + intToStr(uirCoreStmtSlotOf(s0)))
         if blkLen > 0:
-            let s1: UirCoreStmt = blk.stmts[0]
-            echo("[backend] dbgFinish: blk0.kind=" + intToStr(int32(s1.kind)) +
-                 " slot=" + intToStr(s1.slot))
+            let s1: UirStmtId = uirCoreBlockStmtAt(blk, 0)
+            echo("[backend] dbgFinish: blk0.kind=" + intToStr(int32(uirCoreStmtKindOf(s1))) +
+                 " slot=" + intToStr(uirCoreStmtSlotOf(s1)))
     uirCoreAddBlock(b.func, blk)
     b.currentLabel = ""
     b.currentStmts = []
@@ -122,38 +128,44 @@ fn blockBuilderPeekDefer(b: BlockBuilder): DeferFrame =
 fn blockBuilderNextTemp(b: BlockBuilder, prefix: str): str =
     return blockBuilderNextLabel(b, prefix)
 
-fn isControlExpr(n: Node): bool =
-    var node: Node = n
-    while node != nil && node.kind == nkPar && kidCount(node) > 0:
-        node = kid(node, 0)
-    if node == nil:
+fn isControlExprId(id: AstNodeId): bool =
+    var node: AstNodeId = id
+    while astNodeIdValid(node) && astNodeKind(node) == nkPar && astKidCount(node) > 0:
+        node = astKidAt(node, 0)
+    if !astNodeIdValid(node):
         return false
-    if node.kind == nkIf:
+    let nodeKind: NodeKind = astNodeKind(node)
+    if nodeKind == nkIf:
         return true
-    if node.kind == nkCase:
+    if nodeKind == nkCase:
         return true
-    if node.kind == nkInfix && kidCount(node) >= 3:
-        let opNode: Node = kid(node, 0)
-        let op: str = scopeOpName(opNode)
+    if nodeKind == nkInfix && astKidCount(node) >= 3:
+        let op: str = scopeOpNameId(astKidAt(node, 0))
         if op == "&&" || op == "||":
             return true
     return false
 
-fn isImplicitReturnExpr(n: Node): bool =
-    if n == nil:
+fn isControlExpr(n: Node): bool =
+    return isControlExprId(n)
+
+fn isImplicitReturnExprId(id: AstNodeId): bool =
+    if !astNodeIdValid(id):
         return false
-    var node: Node = n
-    while node != nil && node.kind == nkPar && kidCount(node) > 0:
-        node = kid(node, 0)
-    if node == nil:
+    var node: AstNodeId = id
+    while astNodeIdValid(node) && astNodeKind(node) == nkPar && astKidCount(node) > 0:
+        node = astKidAt(node, 0)
+    if !astNodeIdValid(node):
         return false
-    case node.kind
+    case astNodeKind(node)
     of nkCall, nkInfix, nkPrefix, nkPostfix, nkDotExpr, nkBracketExpr,
        nkCurlyExpr, nkTupleLit, nkSeqLit, nkTableLit,
        nkIdent, nkSymbol,
        nkIntLit, nkFloatLit, nkStrLit, nkCharLit, nkBoolLit, nkNilLit:
         return true
     return false
+
+fn isImplicitReturnExpr(n: Node): bool =
+    return isImplicitReturnExprId(n)
 
 fn uirCoreAddStrPtr(items: str[]*, value: str) =
     if items == nil:
@@ -208,6 +220,18 @@ fn localEnvNew(): LocalEnv =
     env.prevSlots = []
     return env
 
+var localEnvLookupModeCached: int32 = -1
+
+fn localEnvUseLinearLookup(): bool =
+    if localEnvLookupModeCached >= 0:
+        return localEnvLookupModeCached == 1
+    let raw: str = strutil.toLowerAscii(strutil.strip(os.getEnvDefault("BACKEND_STAGE1_LOCAL_ENV_LOOKUP", "linear")))
+    if raw == "hash":
+        localEnvLookupModeCached = 0
+    else:
+        localEnvLookupModeCached = 1
+    return localEnvLookupModeCached == 1
+
 fn localEnvPushScope(env: LocalEnv) =
     if env == nil:
         return
@@ -220,14 +244,18 @@ fn localEnvPopScope(env: LocalEnv) =
     env.scopeMarks.len = env.scopeMarks.len - 1
     if mark < 0:
         return
-    let __for_start_slot = env.names.len - 1
-    for __for_rev_slot in 0..(__for_start_slot - (mark)):
-        let slot = __for_start_slot - __for_rev_slot
-        if slot >= 0 && slot < env.names.len && slot < env.prevSlots.len:
-            let nm: str = env.names[slot]
-            let prev: int32 = env.prevSlots[slot]
-            let restore: int32 = (prev >= 0) ? (prev + 1) : 0
-            hashmaps.hashMapStrIntPut(env.nameIndex, nm, restore)
+    let lastSlot: int32 = env.names.len - 1
+    if mark <= lastSlot:
+        var slot: int32 = lastSlot
+        while slot >= mark:
+            if !localEnvUseLinearLookup() && slot >= 0 && slot < env.names.len && slot < env.prevSlots.len:
+                let nm: str = env.names[slot]
+                let prev: int32 = env.prevSlots[slot]
+                let restore: int32 = (prev >= 0) ? (prev + 1) : 0
+                hashmaps.hashMapStrIntPut(env.nameIndex, nm, restore)
+            if slot == 0:
+                break
+            slot = slot - 1
     for i in mark..<env.active.len:
         mbWriteBool(env.active, i, false)
 
@@ -238,6 +266,20 @@ fn localIndex(env: LocalEnv, name: str): int32 =
         return -1
     let query: str = scopeStripSpacesMaybe(name)
     if len(query) == 0:
+        return -1
+    if localEnvUseLinearLookup():
+        var i: int32 = env.names.len - 1
+        while i >= 0:
+            if i < env.active.len && !env.active[i]:
+                if i == 0:
+                    break
+                i = i - 1
+                continue
+            if i < env.names.len && env.names[i] == query:
+                return i
+            if i == 0:
+                break
+            i = i - 1
         return -1
     let idxPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, query)
     if idxPlus1 <= 0:
@@ -255,16 +297,19 @@ fn localAdd(env: LocalEnv, name: str, ty: UirCoreType): int32 =
         let mark: int32 = (env.scopeMarks.len > 0) ? env.scopeMarks[env.scopeMarks.len - 1] : -1
         echo("[backend] debugLocalAdd: name='snapRes' slot=" + intToStr(env.names.len) +
              " scopeMarks=" + intToStr(env.scopeMarks.len) + " topMark=" + intToStr(mark))
-    trackLexString void*(nm)
-    let prevPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, nm)
-    let prevSlot: int32 = (prevPlus1 > 0) ? (prevPlus1 - 1) : -1
+    trackLexString rawmemAsVoid(nm)
+    var prevSlot: int32 = -1
+    if !localEnvUseLinearLookup():
+        let prevPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, nm)
+        prevSlot = (prevPlus1 > 0) ? (prevPlus1 - 1) : -1
     add(env.names, nm)
     add(env.types, ty)
     add(env.typeKeys, "")
     add(env.callTargets, "")
     add(env.active, true)
     add(env.prevSlots, prevSlot)
-    hashmaps.hashMapStrIntPut(env.nameIndex, nm, env.names.len)
+    if !localEnvUseLinearLookup():
+        hashmaps.hashMapStrIntPut(env.nameIndex, nm, env.names.len)
     return env.names.len - 1
 
 fn localType(env: LocalEnv, idx: int32): UirCoreType =
@@ -287,7 +332,7 @@ fn localSetTypeKey(env: LocalEnv, idx: int32, key: str) =
         return
     if idx < 0 || idx >= env.typeKeys.len:
         return
-    trackLexString void*(key)
+    trackLexString rawmemAsVoid(key)
     mbWriteStr(env.typeKeys, idx, key)
 
 fn localSetCallTarget(env: LocalEnv, idx: int32, target: str) =
@@ -295,5 +340,5 @@ fn localSetCallTarget(env: LocalEnv, idx: int32, target: str) =
         return
     if idx < 0 || idx >= env.callTargets.len:
         return
-    trackLexString void*(target)
+    trackLexString rawmemAsVoid(target)
     mbWriteStr(env.callTargets, idx, target)

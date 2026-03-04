@@ -15,12 +15,8 @@ const
     randSeedSize: int32 = 64
     randUrandomPath: str = "/dev/urandom"
 
-@importc("SystemFunction036")
-fn c_rtl_gen_random(buf: void*, len: int32): int32
-
 var rngSeeded: bool = false
 var rngSystemAttempted: bool = false
-var rngWindowsAvailable: int32 = -1
 var rngUrandomAvailable: int32 = -1
 var rngKey: Bytes = Bytes(data: nil, len: 0)
 var rngNonce: Bytes = Bytes(data: nil, len: 0)
@@ -51,7 +47,6 @@ fn setRandomSeed(seed: Bytes): bool =
     if bytesLen(seed) <= 0:
         rngSeeded = false
         rngSystemAttempted = false
-        rngWindowsAvailable = -1
         rngUrandomAvailable = -1
         rngKey.data = nil
         rngKey.len = 0
@@ -66,7 +61,6 @@ fn setRandomSeed(seed: Bytes): bool =
     if IsErr(res):
         rngSeeded = false
         rngSystemAttempted = false
-        rngWindowsAvailable = -1
         rngUrandomAvailable = -1
         rngKey.data = nil
         rngKey.len = 0
@@ -91,15 +85,9 @@ fn setRandomSeed(seed: Bytes): bool =
     return true
 
 fn randomFillWindows(out: Bytes): bool =
-    if bytesLen(out) <= 0:
-        return false
-    if rngWindowsAvailable == 0:
-        return false
-    let res: int32 = c_rtl_gen_random(out.data, bytesLen(out))
-    if res != 0:
-        rngWindowsAvailable = 1
-        return true
-    rngWindowsAvailable = 0
+    # Keep Windows path explicit but pointer-free in std/crypto.
+    # Runtime entropy bridge can be added in a C-ABI module if needed.
+    let _unused: int32 = bytesLen(out)
     return false
 
 fn randomFillUrandom(out: Bytes): bool =
@@ -113,9 +101,10 @@ fn randomFillUrandom(out: Bytes): bool =
         return false
     var total: int32 = 0
     while total < bytesLen(out):
-        let n: int32 = bos.c_fread(ptr_add(out.data, total), 1, bytesLen(out) - total, f)
-        if n > 0:
-            total = total + n
+        let ch: int32 = bos.c_fgetc(f)
+        if ch >= 0:
+            bytesSet(out, total, ch & 255)
+            total = total + 1
             continue
         break
     bos.close(f)
@@ -170,4 +159,3 @@ fn randomBytes(length: int32): Result[Bytes] =
         bytesSet(out, i, bytesGet(rngBlock, rngBlockOffset))
         rngBlockOffset = rngBlockOffset + 1
     return Ok[Bytes](out)
-

@@ -1,0 +1,71 @@
+# backend/c/c_emitter_main.cheng
+import std/[result, os]
+import backend/uir/uir_types
+import backend/c/c_emitter_types
+import backend/c/c_emitter_func
+
+fn cEmitUniqueName(base0: str, nameMap: CEmitNameMap): str =
+    var base: str = base0
+    if len(base) == 0:
+        base = "f"
+    var out: str = base
+    var suffix: int32 = 0
+    while cEmitNameMapHasValue(nameMap, out):
+        suffix = suffix + 1
+        out = base + "_" + intToStr(suffix)
+    return out
+
+fn cEmitBuildNameMap(module: UirModule): CEmitNameMap =
+    let out: CEmitNameMap = cEmitNameMapNew()
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        let rawName: str = uirFuncNameOf(f)
+        var mapped: str = ""
+        if uirFuncIsExtern(f):
+            let linkName: str = uirFuncLinkNameOf(f)
+            mapped = cEmitSanitizeIdent(len(linkName) > 0 ? linkName : rawName, "ext_" + intToStr(i))
+        else:
+            mapped = cEmitSanitizeIdent(rawName, "f_" + intToStr(i))
+        mapped = cEmitUniqueName(mapped, out)
+        cEmitNameMapPut(out, rawName, mapped)
+    return out
+
+fn cEmitModuleText(module: UirModule): Result[str] =
+    if module == nil:
+        return Err[str]("emit-c not-mapped: module is nil")
+    if uirModuleGlobalsLen(module) > 0:
+        return Err[str]("emit-c not-mapped: globals are not supported yet")
+    if uirModuleCStringsLen(module) > 0:
+        return Err[str]("emit-c not-mapped: cstring pool is not supported yet")
+    let nameMap: CEmitNameMap = cEmitBuildNameMap(module)
+    var out: str = ""
+    out = out + "#include <stdint.h>\n"
+    out = out + "#include <stddef.h>\n"
+    out = out + "\n"
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        let protoRes: Result[str] = cEmitFuncPrototype(f, nameMap)
+        if !IsOk[str](protoRes):
+            return protoRes
+        out = out + protoRes.value
+    out = out + "\n"
+    for i2 in 0..<uirModuleFuncsLen(module):
+        let f2: UirFunc = uirModuleFuncAt(module, i2)
+        let defRes: Result[str] = cEmitFuncDefinition(f2, nameMap)
+        if !IsOk[str](defRes):
+            return defRes
+        out = out + defRes.value
+    return Ok[str](out)
+
+fn cEmitModuleToFile(module: UirModule, outPath: str): Result[bool] =
+    let txtRes: Result[str] = cEmitModuleText(module)
+    if !IsOk[str](txtRes):
+        return Err[bool](ErrorFormat(ErrorInfoOf[str](txtRes)))
+    let outText: str = txtRes.value
+    os.writeFile(outPath, outText)
+    return Ok[bool](true)
+
+fn cEmitModuleToFileOrPanic(module: UirModule, outPath: str) =
+    let res: Result[bool] = cEmitModuleToFile(module, outPath)
+    if !IsOk[bool](res):
+        panic ErrorFormat(ErrorInfoOf[bool](res))

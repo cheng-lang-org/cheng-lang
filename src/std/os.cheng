@@ -31,11 +31,20 @@ var EmptyStr: str = ""
 var SlashStr: str = "/"
 var SingleQuoteStr: str = "'"
 var EmptyQuotedStr: str = "''"
+const osOpenWriteOnly: int32 = 0x0001
+const osOpenCreate: int32 = 0x0200
+const osOpenTrunc: int32 = 0x0400
+const osFileMode0644: int32 = 420
 
 @importc("cheng_fopen")
 fn cheng_fopen(filename, mode: cstring): File
+@importc("fopen")
+fn libc_fopen(filename, mode: cstring): File
 fn c_fopen(filename, mode: cstring): File =
-    return cheng_fopen(filename, mode)
+    let f: File = cheng_fopen(filename, mode)
+    if f != nil:
+        return f
+    return libc_fopen(filename, mode)
 @importc("cheng_fclose")
 fn cheng_fclose(f: File): int32
 fn c_fclose(f: File): int32 =
@@ -92,6 +101,12 @@ fn cheng_list_dir(path: cstring): str
 fn libc_rename(oldPath: cstring, newPath: cstring): int32
 fn c_rename(oldPath: cstring, newPath: cstring): int32 =
     return libc_rename(oldPath, newPath)
+@importc("open")
+fn libc_open(path: cstring, flags: int32, mode: int32): int32
+@importc("write")
+fn libc_write(fd: int32, data: void*, n: int64): int64
+@importc("close")
+fn libc_close(fd: int32): int32
 @importc("cheng_exec_cmd_ex")
 fn cheng_exec_cmd_ex(command: cstring, workingDir: cstring, mergeStderr: int32, exitCode: int64*): str
 @importc("cheng_pty_is_supported")
@@ -241,7 +256,7 @@ fn writeLine(f: File, s: str) =
     write(f, "\n")
 
 type
-    SplitFileResult =
+    SplitFileResult = object
         dir: str
         name: str
         ext: str
@@ -249,18 +264,16 @@ type
     PathComponent = enum
         pcFile, pcDir, pcLinkToFile, pcLinkToDir, pcOther
 type
-    WalkDirEntry =
-        kind: PathComponent
-        path: str
+    WalkDirEntry = str
 type
     ProcessOption = enum
         poStdErrToStdOut, poUsePath, poEvalCommand
 type
-    ExecCmdResult =
+    ExecCmdResult = object
         output: str
         exitCode: int
 type
-    seq_WalkDirEntry =
+    seq_WalkDirEntry = object
         len: int32
         cap: int32
         buffer: void*
@@ -282,12 +295,33 @@ fn os_get_WalkDirEntry(seqInst: seq_WalkDirEntry, i: int32): WalkDirEntry =
     var p: void* = ptr_add(seqInst.buffer, offset32)
     var pt: WalkDirEntry* = WalkDirEntry*(p)
     return *pt
-fn walkDirEntryKind(entry: WalkDirEntry): PathComponent =
-    return entry.kind
-fn walkDirEntryPath(entry: WalkDirEntry): str =
-    return entry.path
+fn walkDirEntryKind(entry: str): PathComponent =
+    let entryPtr: void* = void*(entry)
+    if entryPtr == nil || len(entry) <= 0:
+        return PathComponent(4)
+    let pCode: char* = char*(entryPtr)
+    let code: char = *pCode
+    if code == '0':
+        return PathComponent(0)
+    if code == '1':
+        return PathComponent(1)
+    if code == '2':
+        return PathComponent(2)
+    if code == '3':
+        return PathComponent(3)
+    return PathComponent(4)
+fn walkDirEntryPath(entry: str): str =
+    if len(entry) < 2:
+        return ""
+    let entryPtr: void* = void*(entry)
+    if entryPtr == nil:
+        return ""
+    let pSep: char* = char*(ptr_add(entryPtr, 1))
+    if *pSep != '|':
+        return ""
+    return strings.sliceBytes(entry, 2, len(entry) - 2)
 fn pathComponentDir(): PathComponent =
-    return pcDir
+    return PathComponent(1)
 fn os_addPtr_WalkDirEntry(seqInst: seq_WalkDirEntry*, val: WalkDirEntry) =
     if seqInst->len >= seqInst->cap:
         var newCap: int32 = 4
@@ -311,18 +345,16 @@ fn os_arcRetainSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
         memRetain seqInst.buffer
     for i in 0..<seqInst.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
-        let path: str = entry.path
-        let pathPtr: void* = void*(path)
-        if pathPtr != nil:
-            memRetain pathPtr
+        let entryPtr: void* = void*(entry)
+        if entryPtr != nil:
+            memRetain entryPtr
 
 fn os_arcReleaseSeq_WalkDirEntry(seqInst: seq_WalkDirEntry) =
     for i in 0..<seqInst.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(seqInst, i)
-        let path: str = entry.path
-        let pathPtr: void* = void*(path)
-        if pathPtr != nil:
-            memRelease pathPtr
+        let entryPtr: void* = void*(entry)
+        if entryPtr != nil:
+            memRelease entryPtr
     if seqInst.buffer != nil:
         memRelease seqInst.buffer
 
@@ -359,7 +391,7 @@ fn getEnv(key: str): str =
 fn getEnvDefault(key: str, defaultValue: str): str =
     return getEnvImpl(key, defaultValue)
 fn commandLineParams(): str[] =
-    # Depends on `__cheng_setCmdLine(argc, argv)` in `main`.
+    # cmdline module now loads argv from runtime bridge lazily.
     let count: int32 = cmdline.paramCount()
     var out: str[]
     if count <= 0:
@@ -492,11 +524,8 @@ fn setCurrentDir(path: str) =
 fn copyDir(src: str, dest: str) =
     src
     dest
-fn makeWalkDirEntry(kind: PathComponent, path: str): WalkDirEntry =
-    var out: WalkDirEntry
-    out.kind = kind
-    out.path = path
-    return out
+fn makeWalkDirEntry(kind: PathComponent, path: str): str =
+    return charToStr(char(48 + int32(kind))) + "|" + path
 fn walkDir(path: str): seq_WalkDirEntry =
     var out: seq_WalkDirEntry = os_newSeq_WalkDirEntry(0, 0)
     if len(path) == 0 || path[0] == char(0) || ! dirExists path:
@@ -523,11 +552,11 @@ fn walkDir(path: str): seq_WalkDirEntry =
                 let name: str = sliceStr(listText, start, endIdx)
                 if len(name) > 0 && name[0] != char(0):
                     let fullPath: str = joinPath(path, name)
-                    var kind: PathComponent = pcOther
+                    var kind: PathComponent = PathComponent(4)
                     if dirExists fullPath:
-                        kind = pcDir
+                        kind = PathComponent(1)
                     elif fileExists fullPath:
-                        kind = pcFile
+                        kind = PathComponent(0)
                     os_addPtr_WalkDirEntry(&out, makeWalkDirEntry(kind, fullPath))
             start = i + 1
     let listTextPtr: void* = void*(listText)
@@ -538,11 +567,11 @@ fn walkDirRecImpl(path: str, out: str[]*) =
     let items: seq_WalkDirEntry = walkDir path
     for i in 0..<items.len:
         let entry: WalkDirEntry = os_get_WalkDirEntry(items, i)
-        let kind: PathComponent = entry.kind
-        let path: str = entry.path
-        if kind == pcDir || kind == pcLinkToDir:
+        let kind: PathComponent = walkDirEntryKind(entry)
+        let path: str = walkDirEntryPath(entry)
+        if kind == PathComponent(1) || kind == PathComponent(3):
             walkDirRecImpl(path, out)
-        elif kind == pcFile || kind == pcLinkToFile:
+        elif kind == PathComponent(0) || kind == PathComponent(2):
             var pathOwned: str = path
             add(out, pathOwned)
 fn walkDirRec(path: str): str[] =
@@ -613,17 +642,25 @@ fn readFile(path: str): str =
     c_fclose f
     return content
 fn writeFile(path: str, content: str) =
-    let f: File = open(path, fmWrite)
-    if f == nil:
+    if len(path) == 0:
         return
-    write(f, content)
-    c_fclose f
+    let flags: int32 = osOpenWriteOnly | osOpenCreate | osOpenTrunc
+    let fd: int32 = libc_open(path, flags, osFileMode0644)
+    if fd < 0:
+        return
+    if len(content) > 0:
+        let wrote: int64 = libc_write(fd, void*(content), int64(len(content)))
+        ioMeterReport(ioWrite, wrote)
+    libc_close(fd)
 
 fn writeFileBytes(path: str, bytes: uint8[]) =
-    let f: File = open(path, fmWrite)
-    if f == nil:
+    if len(path) == 0:
+        return
+    let flags: int32 = osOpenWriteOnly | osOpenCreate | osOpenTrunc
+    let fd: int32 = libc_open(path, flags, osFileMode0644)
+    if fd < 0:
         return
     if bytes.buffer != nil && bytes.len > 0:
-        let wrote: int32 = c_fwrite_std(bytes.buffer, 1, int64(bytes.len), void*(f))
-        ioMeterReport(ioWrite, int64(wrote))
-    c_fclose f
+        let wrote: int64 = libc_write(fd, bytes.buffer, int64(bytes.len))
+        ioMeterReport(ioWrite, wrote)
+    libc_close(fd)

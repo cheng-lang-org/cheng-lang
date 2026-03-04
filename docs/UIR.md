@@ -12,8 +12,9 @@
 `cheng` 选择 UIR 直出，目标是把优化与确定性控制放在自研 IR 管线中完成，再与 Runtime C 对象在链接阶段会师。
 
 对应工程现实：
-- 不支持 `emit-c` / `--backend:c` 生产路径。
-- 对外主语义是 `emit=exe`。
+- 生产主链仍是 `emit=exe`（UIR -> machine -> obj/exe）。
+- 对外新增可选输出通道 `--emit:c`（`cheng` / `release-compile`），用于 UIR 降级 C 文本与 FFI 影子桥接验收。
+- `emit=c` 覆盖边界外一律硬失败（`emit-c not-mapped`），不会回退到 `emit=exe`。
 - `emit=obj` 仅 internal gate 使用。
 
 ## 3) UIR 相对 C-as-IR 的五个工程维度
@@ -55,6 +56,9 @@
   - `src/backend/uir/uir_internal/uir_core_opt2.cheng`
   - `src/backend/uir/uir_internal/uir_core_ssa.cheng`
   - `src/backend/uir/uir_internal/uir_core_types.cheng`
+  - `uir_core_types` 已提供 SoA/index surface（`UirExprId/UirStmtId/UirBlockId/UirFuncId`、`UirCoreSoa`、`uirCoreSoaNew/Append*`），并新增 `uirCoreSoaBuildFromFunc` 运行期投影构建入口。
+  - UIR 有效性检查命名已收口为 `uirCoreExprIdValid/uirCoreStmtIdValid/uirCoreBlockIdValid`；执行路径不再使用 `*RefValid` 命名。
+  - 模块函数集合访问已收口为 `uirCoreModuleFuncsLen/uirCoreModuleFuncAt` 访问器；执行路径不再直接读取 `module.funcs` 容器字段。
 - Machine 层：
   - `src/backend/machine/machine_types.cheng`
   - `src/backend/machine/machine_internal/machine_core_types.cheng`
@@ -74,6 +78,10 @@
 - UIR profile：
   - `UIR_PROFILE=1`
   - 输出：`uir_profile\t<label>\tstep_ms=...\ttotal_ms=...`
+- SoA runtime report：
+  - `UIR_SOA_REPORT` 默认 `0`（仅 gate/诊断显式开启）
+  - `UIR_SOA_ENFORCE` 默认 `0`（避免日常编译误阻断；`verify_backend_uir_soa_surface/self_probe` 会显式设为 `1`）
+  - 输出：`soa_report\tenabled=...\ttracked_funcs=...\texpr_ids=...\tstmt_ids=...\tblock_ids=...\tsucc_edges=...\tpred_edges=...\tbalance_ok=...`
 - runtime probe 例外：
   - `verify_backend_noalias_opt` / `verify_backend_egraph_cost` / `verify_backend_dod_opt_regression` 的门禁探针默认固定 `UIR_PROFILE=0` + `BACKEND_PROFILE=0`，避免 in-memory self-link 场景的 profile 崩溃；这些 gate 以报告字段与 surface marker 验收。
 - Generics report：
@@ -114,7 +122,7 @@
 
 ## 9) Generics Policy
 - `dict`：默认生产策略（编译时优先）。
-- `hybrid`：预算内特化（`GENERIC_SPEC_BUDGET>0` 时启用特化，超预算回退字典路径）。
+- `hybrid`：已从执行路径移除；设置为 `hybrid` 会被 `cheng_tooling/backend_driver` 拒绝。
 
 ## 10) Production Closure Gates
 命令前缀（避免 PATH 差异）：
@@ -124,6 +132,12 @@
 - `$TOOLING verify_backend_no_legacy_refs`
 - `$TOOLING verify_backend_opt2`
 - `$TOOLING verify_backend_opt3`
+- `$TOOLING verify_backend_symbol_closure`
+- `$TOOLING verify_backend_release_compile_stability`
+- `$TOOLING verify_backend_zero_script_residual`
+- `$TOOLING verify_backend_emit_c_surface`
+- `$TOOLING verify_backend_emit_c_ffi_shadow`
+- `$TOOLING verify_backend_emit_c_hard_fail`
 - `$TOOLING verify_backend_multi_perf_regression`
 - `$TOOLING verify_backend_simd`
 - `$TOOLING verify_backend_uir_stability`
@@ -136,6 +150,17 @@ fullspec 默认闭环口径（`BACKEND_RUN_FULLSPEC=1`）：
 - 编译后执行 `backend.closedloop_fullspec.symcheck`，阻断未解析 `seqBytesOf_T` 符号回归。
 
 通过标准：以上门禁全部 `ok`，且 `backend_prod_closure` 输出 `backend_prod_closure ok`。
+
+SoA 收口门禁（surface + runtime）：
+- `$TOOLING verify_stage1_ast_soa_surface`
+  - 输出 `artifacts/backend_soa_hardcut_baseline/{stage1_ref_surface,uir_ref_surface,rawptr_surface}.txt`。
+  - 默认硬阻断（`BACKEND_STAGE1_AST_SOA_ENFORCE=1`），仅在显式设为 `0` 时退回报告模式。
+- `$TOOLING verify_backend_uir_soa_surface`
+  - runtime 口径为双次 `emit=exe + system-link` 探针，要求 `soa_report` 可观测且两次报告一致（determinism）。
+  - 同时断言 `src/backend/uir` 不得出现 `uirCoreExprRefValid/uirCoreStmtRefValid/uirCoreBlockRefValid` 回流。
+- `$TOOLING verify_backend_uir_soa_self_probe`
+  - 固定开启并强制 self-link 子探针（等价 `BACKEND_UIR_SOA_SELF_PROBE=1` + `BACKEND_UIR_SOA_SELF_PROBE_ENFORCE=1`）。
+  - `backend_prod_closure` required 默认同时执行 `backend.uir_soa_surface` 与 `backend.uir_soa_self_probe`。
 
 ## 11) Scope Notes
 - 本文档描述生产主链口径。
