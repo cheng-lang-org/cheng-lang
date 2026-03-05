@@ -18,16 +18,16 @@ const
     ownSampleMask: int32 = 31
 
 var ownershipEnabledFlag: bool = false
-var ownershipNodes: ptr[]
+var ownershipNodes: AstNodeId[]
 var ownershipFlags: int32[]
 var ownershipExprClasses: int32[]
 var ownershipEscapeClasses: int32[]
 var ownershipMustRetain: int32[]
 var ownershipMoveNames: str[]
 var ownDeepEnabled: bool = false
-var ownershipLastNode: ptr = nil
+var ownershipLastNode: AstNodeId = int32(0)
 var ownershipLastIndex: int32 = -1
-var ownIndexMapKeys: ptr[]
+var ownIndexMapKeys: AstNodeId[]
 var ownIndexMapVals: int32[]
 var ownIndexMapCount: int32 = 0
 var ownLocalMapKeys: ptr[]
@@ -82,6 +82,16 @@ fn ownReadPtr(seqInst: ptr[], i: int32): ptr =
     return seqInst[i]
 
 fn ownWritePtr(seqInst: var ptr[], i: int32, val: ptr) =
+    if i < 0 || i >= seqInst.len:
+        panic "ownership: seq index out of bounds"
+    seqInst[i] = val
+
+fn ownReadNodeId(seqInst: AstNodeId[], i: int32): AstNodeId =
+    if i < 0 || i >= seqInst.len:
+        panic "ownership: seq index out of bounds"
+    return seqInst[i]
+
+fn ownWriteNodeId(seqInst: var AstNodeId[], i: int32, val: AstNodeId) =
     if i < 0 || i >= seqInst.len:
         panic "ownership: seq index out of bounds"
     seqInst[i] = val
@@ -141,6 +151,13 @@ fn ownFreePtrSeq(seqInst: var ptr[]) =
     seqInst.len = 0
     seqInst.cap = 0
 
+fn ownFreeNodeSeq(seqInst: var AstNodeId[]) =
+    if seqInst.buffer != nil:
+        memRelease(seqInst.buffer)
+    seqInst.buffer = nil
+    seqInst.len = 0
+    seqInst.cap = 0
+
 fn ownFreeI32Seq(seqInst: var int32[]) =
     if seqInst.buffer != nil:
         memRelease(seqInst.buffer)
@@ -176,7 +193,7 @@ fn ownershipClear() =
     ownershipMoveNames.cap = 0
     ownershipMoveNames.buffer = nil
     ownDeepEnabled = false
-    ownershipLastNode = nil
+    ownershipLastNode = int32(0)
     ownershipLastIndex = -1
     ownIndexMapKeys.len = 0
     ownIndexMapKeys.cap = 0
@@ -266,7 +283,7 @@ fn ownIndexMapInit(cap0: int32) =
     ownIndexMapKeys.cap = cap
     ownIndexMapKeys.len = int(cap)
     if ownIndexMapKeys.buffer != nil:
-        zeroMem(ownIndexMapKeys.buffer, cap * 8)
+        zeroMem(ownIndexMapKeys.buffer, cap * 4)
     ownIndexMapVals = []
     ownIndexMapVals.cap = cap
     ownIndexMapVals.len = int(cap)
@@ -274,29 +291,28 @@ fn ownIndexMapInit(cap0: int32) =
         zeroMem(ownIndexMapVals.buffer, cap * 4)
     ownIndexMapCount = 0
 
-fn ownIndexMapHash(p: ptr): int32 =
-    let v: int64 = int64(p)
-    var h: int64 = v
+fn ownIndexMapHash(id: AstNodeId): int32 =
+    var h: int64 = int64(id)
     h = h ^(h >> 33)
     h = h ^(h >> 17)
     return int32(h) & 0x7fffffff
 
-fn ownIndexMapInsert(p: ptr, val: int32) =
-    if p == nil:
+fn ownIndexMapInsert(id: AstNodeId, val: int32) =
+    if !astNodeIdValid(id):
         return
     if ownIndexMapKeys.len == 0:
         ownIndexMapInit 256
     let cap: int32 = ownIndexMapKeys.len
     let mask: int32 = cap - 1
-    var idx: int32 = ownIndexMapHash p & mask
+    var idx: int32 = ownIndexMapHash(id) & mask
     while true:
-        let key: ptr = ownReadPtr(ownIndexMapKeys, idx)
-        if key == nil:
-            ownWritePtr(ownIndexMapKeys, idx, p)
+        let key: AstNodeId = ownReadNodeId(ownIndexMapKeys, idx)
+        if !astNodeIdValid(key):
+            ownWriteNodeId(ownIndexMapKeys, idx, id)
             ownWriteI32(&ownIndexMapVals, idx, val + 1)
             ownIndexMapCount = ownIndexMapCount + 1
             return
-        if key == p:
+        if key == id:
             ownWriteI32(&ownIndexMapVals, idx, val + 1)
             return
         idx = idx + 1
@@ -304,7 +320,7 @@ fn ownIndexMapInsert(p: ptr, val: int32) =
             idx = 0
 
 fn ownIndexMapGrow() =
-    let oldKeys: ptr[] = ownIndexMapKeys
+    let oldKeys: AstNodeId[] = ownIndexMapKeys
     let oldVals: int32[] = ownIndexMapVals
     let oldCap: int32 = oldKeys.len
     var newCap: int32 = oldCap * 2
@@ -315,7 +331,7 @@ fn ownIndexMapGrow() =
     ownIndexMapKeys.cap = newCap
     ownIndexMapKeys.len = int(newCap)
     if ownIndexMapKeys.buffer != nil:
-        zeroMem(ownIndexMapKeys.buffer, newCap * 8)
+        zeroMem(ownIndexMapKeys.buffer, newCap * 4)
     ownIndexMapVals = []
     ownIndexMapVals.cap = newCap
     ownIndexMapVals.len = int(newCap)
@@ -323,26 +339,26 @@ fn ownIndexMapGrow() =
         zeroMem(ownIndexMapVals.buffer, newCap * 4)
     ownIndexMapCount = 0
     for i in 0..<oldCap:
-        let key: ptr = ownReadPtr(oldKeys, i)
-        if key != nil:
+        let key: AstNodeId = ownReadNodeId(oldKeys, i)
+        if astNodeIdValid(key):
             let val: int32 = ownReadI32(oldVals, i)
             if val != 0:
                 ownIndexMapInsert(key, val - 1)
-    ownFreePtrSeq(oldKeys)
+    ownFreeNodeSeq(oldKeys)
     ownFreeI32Seq(oldVals)
 
-fn ownIndexMapGet(p: ptr): int32 =
-    if p == nil || ownIndexMapKeys.len == 0:
+fn ownIndexMapGet(id: AstNodeId): int32 =
+    if !astNodeIdValid(id) || ownIndexMapKeys.len == 0:
         return -1
     let cap: int32 = ownIndexMapKeys.len
     let mask: int32 = cap - 1
-    var idx: int32 = ownIndexMapHash p & mask
+    var idx: int32 = ownIndexMapHash(id) & mask
     let start: int32 = idx
     while true:
-        let key: ptr = ownReadPtr(ownIndexMapKeys, idx)
-        if key == nil:
+        let key: AstNodeId = ownReadNodeId(ownIndexMapKeys, idx)
+        if !astNodeIdValid(key):
             return -1
-        if key == p:
+        if key == id:
             let val: int32 = ownReadI32(ownIndexMapVals, idx)
             if val == 0:
                 return -1
@@ -353,14 +369,14 @@ fn ownIndexMapGet(p: ptr): int32 =
         if idx == start:
             return -1
 
-fn ownIndexMapPut(p: ptr, val: int32) =
-    if p == nil:
+fn ownIndexMapPut(id: AstNodeId, val: int32) =
+    if !astNodeIdValid(id):
         return
     if ownIndexMapKeys.len == 0:
         ownIndexMapInit 256
     if (ownIndexMapCount + 1) * 10 >= ownIndexMapKeys.len * 7:
         ownIndexMapGrow()
-    ownIndexMapInsert(p, val)
+    ownIndexMapInsert(id, val)
 
 fn ownHashStr(s: str): int32 =
     if len(s) == 0:
@@ -380,7 +396,7 @@ fn ownHashStr(s: str): int32 =
 fn ownHashCached(s: str): int32 =
     if len(s) == 0:
         return 0
-    return ownIndexMapHash(ptr(s))
+    return ownHashStr(s)
 
 fn ownSeenHash(s: str): int32 =
     if len(s) == 0:
@@ -1354,36 +1370,36 @@ fn ownershipMarkMovesTreeId(rootId: AstNodeId) =
 fn ownershipIndex(n: Node): int32 =
     if astRefIsNil(n):
         return -1
-    let p: ptr = ptr(n)
-    if p == ownershipLastNode:
+    let id: AstNodeId = n
+    if id == ownershipLastNode:
         return ownershipLastIndex
-    let idx: int32 = ownIndexMapGet p
-    ownershipLastNode = p
+    let idx: int32 = ownIndexMapGet(id)
+    ownershipLastNode = id
     ownershipLastIndex = idx
     return idx
 
 fn ownershipEnsure(n: Node): int32 =
     if astRefIsNil(n):
         return -1
-    let p: ptr = ptr(n)
+    let id: AstNodeId = n
     var idx: int32 = -1
-    if p == ownershipLastNode:
+    if id == ownershipLastNode:
         idx = ownershipLastIndex
     else:
-        idx = ownIndexMapGet p
+        idx = ownIndexMapGet(id)
     if idx >= 0:
-        ownershipLastNode = p
+        ownershipLastNode = id
         ownershipLastIndex = idx
         return idx
-    add(ownershipNodes, ptr(n))
+    add(ownershipNodes, id)
     add(ownershipFlags, int32(0))
     add(ownershipExprClasses, int32(oecUnknown))
     add(ownershipEscapeClasses, int32(oescUnknown))
     add(ownershipMustRetain, int32(0))
     add(ownershipMoveNames, "")
     let newIdx: int32 = ownershipNodes.len - 1
-    ownIndexMapPut(ptr(n), newIdx)
-    ownershipLastNode = p
+    ownIndexMapPut(id, newIdx)
+    ownershipLastNode = id
     ownershipLastIndex = newIdx
     return newIdx
 

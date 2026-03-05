@@ -1744,11 +1744,61 @@ fn cheng_parse_f64_bits(s: char*): int64 =
 fn cheng_fopen(filename: char*, mode: char*): void* =
     return libc_fopen(filename, mode)
 
+fn cheng_streamLooksSafe(stream: void*): bool =
+    if stream == nil:
+        return false
+    let raw: uint64 = uint64(stream)
+    if raw < uint64(0x100000000):
+        return false
+    return true
+
+fn cheng_safeReadStream(stream: void*): void* =
+    if cheng_streamLooksSafe(stream):
+        return stream
+    var stdIn: void* = get_stdin()
+    if cheng_streamLooksSafe(stdIn):
+        return stdIn
+    stdIn = libc_fdopen(0, "r")
+    if cheng_streamLooksSafe(stdIn):
+        cheng_stdio_in = stdIn
+        return stdIn
+    stdIn = libc_fopen("/dev/stdin", "r")
+    if cheng_streamLooksSafe(stdIn):
+        cheng_stdio_in = stdIn
+        return stdIn
+    return nil
+
+fn cheng_safeWriteStream(stream: void*): void* =
+    if cheng_streamLooksSafe(stream):
+        return stream
+    var stdOut: void* = get_stdout()
+    if cheng_streamLooksSafe(stdOut):
+        return stdOut
+    stdOut = libc_fdopen(1, "w")
+    if cheng_streamLooksSafe(stdOut):
+        cheng_stdio_out = stdOut
+        return stdOut
+    stdOut = libc_fopen("/dev/stdout", "w")
+    if cheng_streamLooksSafe(stdOut):
+        cheng_stdio_out = stdOut
+        return stdOut
+    return nil
+
 fn cheng_fclose(f: void*): int32 =
+    if f == nil:
+        return 0
+    let stdIn: void* = get_stdin()
+    let stdOut: void* = get_stdout()
+    let stdErr: void* = get_stderr()
+    if f == stdIn || f == stdOut || f == stdErr:
+        return 0
     return libc_fclose(f)
 
 fn cheng_fread(ptr: void*, size: int64, n: int64, stream: void*): int32 =
-    let got: int64 = libc_fread(ptr, size, n, stream)
+    let safeStream: void* = cheng_safeReadStream(stream)
+    if safeStream == nil:
+        return 0
+    let got: int64 = libc_fread(ptr, size, n, safeStream)
     if got <= 0:
         return int32(got)
     # Clamp to int32 (callers use small reads; keep it simple).
@@ -1757,7 +1807,10 @@ fn cheng_fread(ptr: void*, size: int64, n: int64, stream: void*): int32 =
     return int32(got)
 
 fn cheng_fwrite(ptr: void*, size: int64, n: int64, stream: void*): int32 =
-    let wrote: int64 = libc_fwrite(ptr, size, n, stream)
+    let safeStream: void* = cheng_safeWriteStream(stream)
+    if safeStream == nil:
+        return 0
+    let wrote: int64 = libc_fwrite(ptr, size, n, safeStream)
     if wrote <= 0:
         return int32(wrote)
     if wrote > int64(0x7fffffff):
@@ -1771,10 +1824,16 @@ fn cheng_ftell(stream: void*): int64 =
     return libc_ftello(stream)
 
 fn cheng_fflush(stream: void*): int32 =
-    return libc_fflush(stream)
+    let safeStream: void* = cheng_safeWriteStream(stream)
+    if safeStream == nil:
+        return 0
+    return libc_fflush(safeStream)
 
 fn cheng_fgetc(stream: void*): int32 =
-    return libc_fgetc(stream)
+    let safeStream: void* = cheng_safeReadStream(stream)
+    if safeStream == nil:
+        return -1
+    return libc_fgetc(safeStream)
 
 var
     cheng_stdio_in: void*
@@ -1785,18 +1844,24 @@ fn get_stdin(): void* =
     if cheng_stdio_in != nil:
         return cheng_stdio_in
     cheng_stdio_in = libc_fdopen(0, "r")
+    if cheng_stdio_in == nil:
+        cheng_stdio_in = libc_fopen("/dev/stdin", "r")
     return cheng_stdio_in
 
 fn get_stdout(): void* =
     if cheng_stdio_out != nil:
         return cheng_stdio_out
     cheng_stdio_out = libc_fdopen(1, "w")
+    if cheng_stdio_out == nil:
+        cheng_stdio_out = libc_fopen("/dev/stdout", "w")
     return cheng_stdio_out
 
 fn get_stderr(): void* =
     if cheng_stdio_err != nil:
         return cheng_stdio_err
     cheng_stdio_err = libc_fdopen(2, "w")
+    if cheng_stdio_err == nil:
+        cheng_stdio_err = libc_fopen("/dev/stderr", "w")
     return cheng_stdio_err
 
 fn cheng_iometer_call(hook: void*, op: int32, bytes: int64) =

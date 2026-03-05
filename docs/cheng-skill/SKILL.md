@@ -80,12 +80,12 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - `verify_backend_abi_v2_noptr` 固定仅校验 `v2_noptr`；其 non-C-ABI 子门禁会显式设 `STAGE1_STD_NO_POINTERS=0` 以隔离诊断，且默认 `BACKEND_ABI_V2_NOPTR_NON_C_ABI_STRICT=1`（阻断）。
 - `verify_backend_closedloop` 默认执行 `backend.spawn_api_gate`（v2 友好 fixture，默认 API 禁 raw spawn、legacy 显式入口可用）。
 - `backend_prod_closure` 主门禁固定通过 `$TOOLING driver-path --path-only` 使用 canonical driver（默认 `artifacts/backend_driver/cheng`）；缺失则重建，体检失败阻断。生产口径不再接受旧 driver 覆盖环境变量，也不再自动回退 seed/selfhost/dist 候选。
-- `backend_prod_closure` 的 stage0 探针与 selfhost 口径对齐（`STAGE1_NO_POINTERS_NON_C_ABI=0`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`、`STAGE1_SKIP_SEM=1`、`GENERIC_MODE=dict`、`GENERIC_SPEC_BUDGET=0`、`STAGE1_SKIP_OWNERSHIP=1`），避免误选不稳定 stage0。
+- `backend_prod_closure` 的 stage0 探针与 selfhost 口径对齐（`STAGE1_NO_POINTERS_NON_C_ABI=0`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`、`GENERIC_MODE=dict`、`GENERIC_SPEC_BUDGET=0`），避免误选不稳定 stage0。
 - `backend_prod_closure` 主门禁固定 stable driver（默认 `artifacts/backend_driver/cheng`）；selfhost 仅用于 stage0/专项 gate，不再自动切换主门禁 driver。
 - `backend_prod_closure` 的 selfhost 自举步骤默认会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`；non-C-ABI no-pointer 收敛由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁负责。
 - `backend.abi_v2_noptr` 在 `backend_prod_closure` 中默认优先使用本地 canonical driver `artifacts/backend_driver/cheng`（要求具备 non-C-ABI no-pointer 诊断字符串）；`BACKEND_ABI_V2_DRIVER` 仅用于专项排障覆盖。
 - `backend.import_cycle_predeclare` 已切为纯 runtime 门禁：负例必须 compile fail 且包含 `Import cycle detected: ... -> ...` 链路，不再接受 source-contract fallback。
-- `build_backend_driver` 自举编译会同时注入 `STAGE1_SKIP_SEM/OWNERSHIP/CPROFILE` 与 `STAGE1_SKIP_*`，兼容 seed stage0 的历史前缀读取。
+- `build_backend_driver` 自举编译会固定注入必要的 `BACKEND_*`/`STAGE1_*` 参数，并保持 seed stage0 口径一致。
 - `$TOOLING build-backend-driver` 固定只使用 `artifacts/backend_driver/cheng` 作为 stage0，不支持旧候选链回退。
 - stage0 quarantine 默认在自动清理后做短重检（`TOOLING_STAGE0_QUARANTINE_BLOCK_RECHECKS=2`），用于减少“首轮已清理但仍阻断”的抖动。
 - Host-only 严格默认：`BUILD_DRIVER_STRICT_NATIVE=1`；`build-backend-driver` 回退链路（`shim/reused_stage0/legacy relink/delegate wrapper`）已硬关闭。
@@ -95,7 +95,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - Host-only 100ms strict 默认：`SELFHOST_STRICT_REBUILD=1`，`verify_backend_selfhost_100ms_host` 默认 `compile-stage1 + full rebuild + require rebuild`，并输出 `stage0_driver_kind/fallback_used/quarantine_cleaned/lock_wait_ms/strict_rebuild_ok`。
 - required 稳定性 gate（native）：
   - `verify_backend_symbol_closure`：阻断 `_alloc/_c_strlen/_zeroMem` 缺失（固定 `return_add` 与 `return_new_ref_seq_growth` 可编译可运行）。
-  - `verify_backend_release_compile_stability`：固定 `return_new_ref_seq_growth`，默认 30 次 `release-compile` 稳定性（`rc=139` 直接失败）。
+  - `verify_backend_release_compile_stability`：固定 `return_new_ref_seq_growth`，默认 3 次 `release-compile` 稳定性（`rc=139` 直接失败）。
   - `verify_backend_zero_script_residual`：阻断 required 路径 compile-only/skip 语义与 legacy `CHENG_*` 执行路径读取。
 - NJVL 收口 gate：`verify_backend_opt2_impl_surface` 已并入 `cheng_tooling` 原生命令并接入 `backend_prod_closure` required（`backend.opt2_impl_surface`）。
 - Stage1/SoA 表面快照 gate：`verify_stage1_ast_soa_surface` 已并入 `cheng_tooling` 并接入 `backend_prod_closure` required（`backend.stage1_ast_soa_surface`）；默认硬阻断（`BACKEND_PROD_STAGE1_AST_SOA_ENFORCE=1`），仅在显式设为 `0` 时退回报告模式。

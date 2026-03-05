@@ -883,11 +883,6 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
     let noRealRaw: str = driver_envDefault("BACKEND_NO_REAL", "")
     let stdNoPtrRaw: str = driver_envDefault("STAGE1_STD_NO_POINTERS", "")
     let stdNoPtrStrictRaw: str = driver_envDefault("STAGE1_STD_NO_POINTERS_STRICT", "")
-    let skipSemRaw: str = driver_trimAsciiSpace(driver_envDefault("STAGE1_SKIP_SEM", ""))
-    let skipOwnershipRaw: str = driver_trimAsciiSpace(driver_envDefault("STAGE1_SKIP_OWNERSHIP", ""))
-    let skipSemEffective: str = driver_bool01(driver_strEq(skipSemRaw, "1"))
-    let skipOwnershipDefault: str = "0"
-    let skipOwnershipEffective: str = driver_bool01(driver_strEq(skipOwnershipRaw, "1"))
     let uirSimdRaw: str = driver_bool01(uirSimdEnabled)
     let uirSimdMaxWidthText: str = intToStr(uirSimdMaxWidth)
     let uirSimdPolicyRaw: str = driver_trimAsciiSpace(uirSimdPolicy)
@@ -926,11 +921,6 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
     out = out + "mm_strict=" + mmStrictRaw + "\n"
     out = out + "std_no_pointers=" + stdNoPtrRaw + "\n"
     out = out + "std_no_pointers_strict=" + stdNoPtrStrictRaw + "\n"
-    out = out + "stage1_skip_sem_raw=" + skipSemRaw + "\n"
-    out = out + "stage1_skip_sem_effective=" + skipSemEffective + "\n"
-    out = out + "stage1_skip_ownership_raw=" + skipOwnershipRaw + "\n"
-    out = out + "stage1_skip_ownership_effective=" + skipOwnershipEffective + "\n"
-    out = out + "stage1_skip_ownership_default=" + skipOwnershipDefault + "\n"
     out = out + "uir_phase_model=single_ir_dual_phase\n"
     out = out + "uir_high_phase_contract=ownership_func_v1\n"
     out = out + "uir_phase_contract_version=p4_phase_v1\n"
@@ -2752,27 +2742,17 @@ fn driver_tryLinkExeMainObjMem(mainObjBytes: uint8[], target: str, linker: str, 
         return false
     if void*(mainObjBytes) == nil || mainObjBytes.len <= 0:
         driver_panic("backend_driver: empty main object bytes for in-memory self-link")
-    var extraObjPaths: str[]
-    if len(runtimeObj) > 0:
-        if ! driver_fileExists(runtimeObj):
-            driver_panic("backend_driver: runtime obj not found: " + runtimeObj)
-        add(extraObjPaths, runtimeObj)
-    if driver_targetIsDarwin(target) && driver_targetIsAarch64(target):
-        driver_profileStepBoth(profile, uirProfile, "direct_exe_layout")
-        driver_runCmd("rm -f " + driver_shellQuote(outputPath))
-        let linkRes: Result[bool] = machoLinkExeAarch64MainObjMem(mainObjBytes, extraObjPaths, outputPath, linkerSymtabAll, runtimeObj)
-        if !IsOk[bool](linkRes):
-            driver_panic("backend_driver: in-memory self-link failed: " + ErrorFormat(ErrorInfoOf[bool](linkRes)))
-        if !Value[bool](linkRes):
-            return false
-        if !driver_fileExists(outputPath) || driver_file_size(outputPath) <= 0:
-            return false
-        driver_profileStepBoth(profile, uirProfile, "direct_exe_patch")
-        driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
-        if !driver_strEq(driver_envDefault("BACKEND_CODESIGN", "1"), "0"):
-            driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
-        driver_profileStepBoth(profile, uirProfile, "direct_exe_write")
-        return true
+    let _targetUnused: str = target
+    let _symtabAllUnused: bool = linkerSymtabAll
+    let _outputPathUnused: str = outputPath
+    let _runtimeObjUnused: str = runtimeObj
+    let _profileUnused: DriverProfileState = profile
+    let _uirProfileUnused: DriverProfileState = uirProfile
+    # Stage0/core-builder compatibility: keep direct-exe main-object in-memory
+    # fastpath disabled by default until the legacy parser path can type-check
+    # generic Result payloads reliably.
+    if !driver_strEq(driver_envDefault("BACKEND_DIRECT_EXE_MAINOBJ_FASTPATH", "0"), "1"):
+        return false
     return false
 
 fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtabAll: bool,
@@ -3216,13 +3196,13 @@ fn backendMainNative(): int32 =
     driver_failRemovedEnv("STAGE1_SKIP_MONO_AFTER_CPROFILE", "GENERIC_MODE=dict")
     driver_failRemovedEnv("STAGE1_SKIP_MONO_DICT", "GENERIC_MODE=dict")
     driver_failRemovedEnv("C_SYSTEM", "std/system (always enabled)")
-    driver_failRemovedBoolEnvEnabled("STAGE1_SKIP_SEM", "fixed=0")
-    driver_failRemovedBoolEnvEnabled("STAGE1_SKIP_OWNERSHIP", "fixed=0")
     driver_failRemovedBoolEnvEnabled("BACKEND_FAST_FALLBACK_ALLOW", "fixed=0")
     driver_failRemovedBoolEnvEnabled("BACKEND_MULTI_MODULE_CACHE", "fixed=0")
     driver_failRemovedEnv("BACKEND_ENABLE_CSTRING_LOWERING", "cstring lowering is always on (removed config)")
     driver_failRemovedEnv("BACKEND_CSTRING_LOWERING", "cstring lowering is always on (removed config)")
     driver_failRemovedEnv("BACKEND_ISEL_CSTRING_LOWERING", "cstring lowering is always on (removed config)")
+    if driver_strNonEmpty(driver_trimAsciiSpace(moduleCachePath)):
+        driver_panic("backend_driver: --module-cache/BACKEND_MODULE_CACHE is disabled in stable driver")
     if driver_strIsEmpty(abi):
         abi = "v2_noptr"
     elif !driver_strEq(abi, "v2_noptr"):

@@ -60,6 +60,18 @@ fn iselExprDepthLimit(): int32 =
     iselExprDepthLimitValue = iselParseInt32(raw, 4096)
     return iselExprDepthLimitValue
 
+fn iselExprInvalid(expr: UirExpr): bool =
+    return expr <= 0
+
+fn iselBlockInvalid(block: UirLowerBlock): bool =
+    return block <= 0
+
+fn iselFuncInvalid(func: UirFunc): bool =
+    return func == nil
+
+fn iselModuleInvalid(module: UirModule): bool =
+    return module == nil
+
 fn iselOkMachineFunc(value: MachineFunc): Result[MachineFunc] =
     var out: Result[MachineFunc]
     out.ok = true
@@ -279,7 +291,7 @@ fn iselFindFunc(module: UirModule, name: str): UirFunc =
     return nil
 
 fn iselHasGlobal(module: UirModule, name: str): bool =
-    if void*(module) == nil || len(name) == 0:
+    if iselModuleInvalid(module) || len(name) == 0:
         return false
     for i in 0..<uirModuleGlobalsLen(module):
         let g: UirGlobal = uirModuleGlobalAt(module, i)
@@ -327,7 +339,7 @@ fn iselMaxType(a: UirLowerType, b: UirLowerType): UirLowerType =
 
 fn iselExprType(module: UirModule, uirFunc: UirFunc, expr: UirExpr,
                 fallback: UirLowerType): UirLowerType =
-    if void*(expr) == nil:
+    if iselExprInvalid(expr):
         return fallback
     if uirExprKindOf(expr) == meLocal:
         return iselLocalType(uirFunc, uirExprLocalIndexOf(expr), fallback)
@@ -450,7 +462,7 @@ fn iselAddStore(func: MachineFunc, rd: MachineReg, base: MachineReg, offset: int
 fn iselEmitSubSp(func: MachineFunc, amount: int64) =
     # AArch64 SUB (immediate) encodes a 12-bit immediate (no shift supported in our encoders).
     # Keep SP 16-byte aligned by emitting 4080-byte chunks.
-    if void*(func) == nil || amount <= 0:
+    if iselFuncInvalid(func) || amount <= 0:
         return
     if amount > int64(16 * 1024 * 1024):
         panic("isel: unreasonable stack sub amount=" + int64ToStr(amount))
@@ -463,7 +475,7 @@ fn iselEmitSubSp(func: MachineFunc, amount: int64) =
         remaining = remaining - chunk
 
 fn iselEmitAddSp(func: MachineFunc, amount: int64) =
-    if void*(func) == nil || amount <= 0:
+    if iselFuncInvalid(func) || amount <= 0:
         return
     if amount > int64(16 * 1024 * 1024):
         panic("isel: unreasonable stack add amount=" + int64ToStr(amount))
@@ -530,7 +542,7 @@ fn iselEmitLinuxSyscallBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
     let arity: int32 = iselLinuxSyscallBuiltinArity(name)
     if arity < 0:
         return Err[int32]("isel: unknown linux syscall builtin: " + name)
-    if void*(expr) == nil || uirExprArgsLen(expr) != arity + 1:
+    if iselExprInvalid(expr) || uirExprArgsLen(expr) != arity + 1:
         return Err[int32]("isel: linux syscall builtin arg count mismatch: " + name)
 
     let tempCount: int32 = arity + 1
@@ -585,7 +597,7 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
                                callee: UirFunc, retType: UirLowerType,
                                dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
                                baseReg: MachineReg, labelState: LabelState): Result[int32] =
-    if void*(expr) == nil || uirExprArgsLen(expr) <= 0:
+    if iselExprInvalid(expr) || uirExprArgsLen(expr) <= 0:
         return Err[int32]("isel: call_indirect missing fn_ptr")
     let fnPtrExpr: UirExpr = uirExprArgAt(expr, 0)
     let realArgCount: int32 = uirExprArgsLen(expr) - 1
@@ -621,7 +633,7 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
         for ai0 in 8..<realArgCount:
             let argExpr0: UirExpr = uirExprArgAt(expr, ai0 + 1)
             var argType0: UirLowerType = iselArgType(callee, ai0 + 1, retType)
-            if void*(callee) == nil:
+            if iselFuncInvalid(callee):
                 argType0 = iselExprType(module, uirFunc, argExpr0, uirTypeI64())
             # AArch64 ABI: stack-passed arguments use 8-byte slots (even for i32).
             stackSize = iselAlignUp(stackSize, 8)
@@ -636,7 +648,7 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
     for ai in 0..<realArgCount:
         let argExpr: UirExpr = uirExprArgAt(expr, ai + 1)
         var argType: UirLowerType = iselArgType(callee, ai + 1, retType)
-        if void*(callee) == nil:
+        if iselFuncInvalid(callee):
             argType = iselExprType(module, uirFunc, argExpr, uirTypeI64())
         let argDst: MachineReg = iselReg0(argType)
         let argTmp: MachineReg = iselReg1(argType)
@@ -660,7 +672,7 @@ fn iselEmitCallIndirectBuiltin(func: MachineFunc, module: UirModule, uirFunc: Ui
 
     for ri in 0..<tempCount:
         var argType2: UirLowerType = iselArgType(callee, ri + 1, retType)
-        if void*(callee) == nil:
+        if iselFuncInvalid(callee):
             let argExpr2: UirExpr = uirExprArgAt(expr, ri + 1)
             argType2 = iselExprType(module, uirFunc, argExpr2, uirTypeI64())
         let regRes: Result[MachineReg] = iselArgReg(argType2, ri)
@@ -699,7 +711,7 @@ fn iselIsF64BitsIntrinsic(name: str): bool =
 fn iselEmitF64BitsIntrinsic(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr, name: str,
                             dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
                             baseReg: MachineReg, labelState: LabelState): Result[int32] =
-    if void*(expr) == nil:
+    if iselExprInvalid(expr):
         return Err[int32]("isel: nil intrinsic expr")
     let dstX: MachineReg = iselRegWithType(dst, uirTypeI64())
     let tmpX: MachineReg = iselRegWithType(tmp, uirTypeI64())
@@ -804,7 +816,7 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
 fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
                 retType: UirLowerType, dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
                 baseReg: MachineReg, labelState: LabelState): Result[int32] =
-    if void*(expr) == nil:
+    if iselExprInvalid(expr):
         return Err[int32]("isel: nil expr")
     let dbgExpr: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_EXPR", ""), "1")
     if dbgExpr:
@@ -971,7 +983,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
                 var argType0: UirLowerType = iselArgType(callee, ai0, retType)
                 if hasVarargs && ai0 >= fixedCount:
                     argType0 = varargsElemType
-                if void*(callee) == nil:
+                if iselFuncInvalid(callee):
                     argType0 = iselExprType(module, uirFunc, argExpr0, uirTypeI64())
                 # Stack-passed argument layout differs across targets.
                 # - Darwin: i32 is 4-byte aligned/packed on stack.
@@ -991,7 +1003,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
             var argType: UirLowerType = iselArgType(callee, ai, retType)
             if hasVarargs && ai >= fixedCount:
                 argType = varargsElemType
-            if void*(callee) == nil:
+            if iselFuncInvalid(callee):
                 argType = iselExprType(module, uirFunc, argExpr, uirTypeI64())
             let argDst: MachineReg = iselReg0(argType)
             let argTmp: MachineReg = iselReg1(argType)
@@ -1009,7 +1021,7 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
             machineAddInst(func, machineStr(argDst, MachineReg(23), off))
         for ri in 0..<tempCount:
             var argType2: UirLowerType = iselArgType(callee, ri, retType)
-            if void*(callee) == nil:
+            if iselFuncInvalid(callee):
                 let argExpr2: UirExpr = uirExprArgAt(expr, ri)
                 argType2 = iselExprType(module, uirFunc, argExpr2, uirTypeI64())
             let regRes: Result[MachineReg] = iselArgReg(argType2, ri)
@@ -1281,7 +1293,7 @@ fn iselEmitCondBranch(func: MachineFunc, module: UirModule, uirFunc: UirFunc, ex
                       retType: UirLowerType, tLabel: str, fLabel: str, dst: MachineReg,
                       tmp: MachineReg, scratch: MachineReg, baseReg: MachineReg,
                       labelState: LabelState): Result[int32] =
-    if void*(expr) == nil:
+    if iselExprInvalid(expr):
         return Err[int32]("isel: nil cond")
     if uirExprKindOf(expr) == meCmp:
         # Constants are untyped in MIR (`meConstI64`), so `iselExprType` falls back to the
@@ -1346,7 +1358,7 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
                   baseReg: MachineReg, labelState: LabelState, frameSize: int64,
                   localsSize: int64,
                   isEntry: bool): Result[int32] =
-    if void*(block) == nil:
+    if iselBlockInvalid(block):
         return Err[int32]("isel: nil block")
     let blockLabel: str = labelState.prefix + uirBlockLabelOf(block)
     if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_META", ""), "1"):

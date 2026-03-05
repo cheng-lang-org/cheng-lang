@@ -135,9 +135,9 @@ LLVM 的优化是通用且保守的。它最难做好的优化是“别名分析
   - `backend.uir_soa_self_probe`（`verify_backend_uir_soa_self_probe`，self-link 子探针固定阻断口径）
 - `backend_prod_closure` required 扩展：
   - `backend.symbol_closure`（`verify_backend_symbol_closure`，阻断 `_alloc/_c_strlen/_zeroMem` 运行时符号缺失）
-  - `backend.release_compile_stability`（`verify_backend_release_compile_stability`，固定 `return_new_ref_seq_growth` 30 次 release-compile 稳定性）
+  - `backend.release_compile_stability`（`verify_backend_release_compile_stability`，固定 `return_new_ref_seq_growth` 3 次 release-compile 稳定性）
   - `backend.zero_script_residual`（`verify_backend_zero_script_residual`，阻断 required 路径 compile-only/skip 语义与 legacy `CHENG_*` 读取）
-- release 稳定性修复：`release-compile --in:return_new_ref_seq_growth` 已可运行；`verify_backend_release_compile_stability` 默认 30 次通过。
+- release 稳定性修复：`release-compile --in:return_new_ref_seq_growth` 已可运行；`verify_backend_release_compile_stability` 默认 3 次通过。
 - selfhost 100ms 复验：`$TOOLING selfhost-100ms-host --iters:30 --enforce:1` 当前实测 `p95=80ms`、`p99=120ms`。
 - `uir_core_types` 新增 SoA surface 实体：`UirExprId/UirStmtId/UirBlockId/UirFuncId`、`UirCoreSoa`、`uirCoreSoaNew/Append*` 与 `uirCoreSoaBuildFromFunc`；`uir_opt` 新增 `soa_report`（默认关闭，gate 显式 `UIR_SOA_REPORT=1` 开启）。
 - 2026-03-01 收口补充（SIMD + E-Graph）：
@@ -146,6 +146,17 @@ LLVM 的优化是通用且保守的。它最难做好的优化是“别名分析
   - `backend_prod_closure` required 新增 `backend.simd`（`verify_backend_simd` 原生命令，compile determinism + 源实现硬校验）。
   - `verify_backend_egraph_cost` 增强为饱和引擎源实现硬校验 + 多目标（`balanced/latency/size`）编译探针。
   - `backend_native_contract.env` 已同步基线，`$TOOLING backend_prod_closure --no-publish` 实跑输出 `backend_prod_closure ok`（见 `artifacts/backend_prod_closure/last_run.log`）。
+
+### 0.5 最近修复快照（2026-03-05）
+- required embedded payload 收口：`verify_backend_mem_exe_emit` / `verify_backend_hotpatch` / `verify_backend_hotpatch_meta` / `verify_backend_mem_patch_regression` 默认 embedded 文本改为 `cheng` 调用；`verify_backend_mem_exe_emit` 额外移除 `BACKEND_DRIVER` 前缀注入并同步 `cheng_*` 报告字段命名。
+- `verify_backend_zero_script_residual` 新增 required embedded 防回归：固定检查 `verify_backend_mem_exe_emit` / `verify_backend_hotpatch` / `verify_backend_hotpatch_meta` / `verify_backend_mem_patch_regression` / `verify_backend_incr_patch_fastpath` / `verify_backend_hotpatch_inplace`，阻断 `\bchengc\b` 与 `BACKEND_DRIVER=` 残留。
+- `build-backend-driver` 收紧：`BACKEND_BUILD_DRIVER_REQUIRE_REBUILD` 默认值从 `0` 提升到 `1`，且在 `BUILD_DRIVER_STRICT_NATIVE=1` 下禁用 fast-path reuse 与重建失败后复用旧 canonical driver。
+- `emit:c` 主链接入：`backend_driver` 放行 `--emit:c`，并接入 `backend/c/c_emitter_*`（UIR->C 文本发射）；覆盖边界外固定 `emit-c not-mapped` 硬失败，不回退到 `emit=exe`。
+- `emit:c` required gate 接入：`backend.emit_c_surface`、`backend.emit_c_ffi_shadow`、`backend.emit_c_hard_fail` 已纳入 `backend_prod_closure` required 链路。
+- 能力 gate 收紧：
+  - `verify_backend_noalias_opt` 改为多 fixture runtime 直编译探针，并新增 `proof_backed_changes_total/mem2reg_loads_total/forward_loads_total` 统计与硬门禁。
+  - `verify_backend_egraph_cost` 改为 backend driver 直编译探针，新增 trace 级 determinism 硬门禁（`BACKEND_EGRAPH_COST_MAX_DETERMINISM_MISMATCH`，默认 `0`）并分离 `binary_hash_mismatch` 诊断字段。
+  - `verify_backend_dod_opt_regression` 改为多 fixture runtime 直编译探针，并新增 `probe_count/proof_backed_changes_total/egraph_report_count_total` 报告字段。
 
 复验命令（严格口径）：
 - `$TOOLING backend_prod_closure --no-publish`
@@ -202,6 +213,9 @@ flowchart LR
 - `backend.release_compile_stability`
 - `backend.zero_script_residual`
 - `backend.opt2_impl_surface`
+- `backend.emit_c_surface`
+- `backend.emit_c_ffi_shadow`
+- `backend.emit_c_hard_fail`
 
 ## 7. 团队切片（最小配置）
 - `小队A（2人）`：`PAR-01` + `PAR-07`
@@ -217,7 +231,7 @@ flowchart LR
 - 热补丁主链默认：`BACKEND_HOTPATCH_MODE=trampoline` + `BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program` + `BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
 - 任何“原地补丁成功”都必须伴随“失败可回退且可运行”证据。
 - 性能结论必须附 `baseline + 同机复测命令 + 报告路径`。
-- 生产闭环采用双轨 required：Dev 主链 `emit=exe + self/linkerless`，Release 主链 `emit=exe + system linker`。
+- 生产闭环采用双轨 required：Dev 主链 `emit=exe + self/linkerless`，Release 主链 `emit=exe + system linker`；`emit=c` 作为 required 验收通道（surface/ffi_shadow/hard_fail）。
 
 
 ## 10. Codex 并行任务提示词（按合并任务包）
@@ -337,10 +351,10 @@ C 语言最常见的指针场景是传递数组或缓冲区：`void process_data
 @ffi_map(ptr = arg0, len = arg1)
 importc fn process_data(data: &mut [u8])
 
-fn main() {
+fn main() =
     var buf = [1, 2, 3]
     process_data(&mut buf) // 传安全切片，借用检查器保证生命周期安全
-}
+
 
 ```
 

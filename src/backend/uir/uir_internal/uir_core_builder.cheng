@@ -67,6 +67,9 @@ fn cheng_f32_bits_to_u64(bits: int32): uint64
 var
     uirCoreCalleeCandidates: hashmaps.HashMapStrSeqInt
     uirCoreCalleeCandidatesReady: bool = false
+    uirCoreOverloadInferCacheEpoch: int32[] = []
+    uirCoreOverloadInferCacheVals: str[] = []
+    uirCoreOverloadInferCacheRound: int32 = 1
 
     uirCore_funcIndex_cache_module: UirCoreModule
     uirCore_funcIndex_cache: hashmaps.HashMapStrInt
@@ -6468,9 +6471,21 @@ fn lowerExprValueCore(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[U
                 let slot: int32 = localIndex(b.env, nm)
                 if slot < 0:
                     return Err[UirExprId]("uirCore_builder: new expects local var ref")
+                let localKey: str = localTypeKey(b.env, slot)
                 var typeNode: Node = astInvalidNodeId()
                 if nodeTypeCacheValid(argNode0) && astRefNonNil(nodeTypeCache(argNode0)):
                     typeNode = nodeTypeCache(argNode0)
+                var isRefLocal: bool = uirCoreStrStartsWith(localKey, "ref_") || uirCoreStrStartsWith(localKey, "var_ref_")
+                var refProbe: Node = typeNode
+                while astNodeIdValid(refProbe) && nodeKind(refProbe) == nkVarTy && kidCount(refProbe) > 0:
+                    refProbe = kid(refProbe, 0)
+                if astNodeIdValid(refProbe) && nodeKind(refProbe) == nkRefTy:
+                    isRefLocal = true
+                if !isRefLocal:
+                    let line2: str = intToStr(nodePosLine(argNode0))
+                    let col2: str = intToStr(nodePosCol(argNode0))
+                    return Err[UirExprId]("uirCore_builder: new expects local var ref (var=" + nm +
+                                          " @" + line2 + ":" + col2 + ", key=" + localKey + ")")
                 var inner: Node = typeNode
                 while astNodeIdValid(inner) && nodeKind(inner) == nkVarTy && kidCount(inner) > 0:
                     inner = kid(inner, 0)
@@ -6484,21 +6499,20 @@ fn lowerExprValueCore(b: BlockBuilder, n: Node, wantType: UirCoreType): Result[U
                 if astNodeIdValid(inner) && nodeKind(inner) == nkObjectDecl:
                     inner = nil
                 if !astNodeIdValid(inner) || nodeKind(inner) == nkEmpty:
-                    let key: str = localTypeKey(b.env, slot)
-                    if uirCoreStrStartsWith(key, "ref_"):
-                        let innerKey: str = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+                    if uirCoreStrStartsWith(localKey, "ref_"):
+                        let innerKey: str = str(rawmemPtrAdd(rawmemAsVoid(localKey), 4))
                         inner = newIdent(innerKey, nodePos(argNode0))
-                    elif uirCoreStrStartsWith(key, "var_ref_"):
-                        let innerKey2: str = str(rawmemPtrAdd(rawmemAsVoid(key), 8))
+                    elif uirCoreStrStartsWith(localKey, "var_ref_"):
+                        let innerKey2: str = str(rawmemPtrAdd(rawmemAsVoid(localKey), 8))
                         inner = newIdent(innerKey2, nodePos(argNode0))
-                    elif len(key) > 0:
-                        # Newer stage1 pipelines may keep only the inner type key for ref locals.
-                        inner = newIdent(key, nodePos(argNode0))
+                    elif len(localKey) > 0:
+                        # Some stage1 paths keep only inner type keys on ref locals.
+                        inner = newIdent(localKey, nodePos(argNode0))
                 if !astNodeIdValid(inner) || nodeKind(inner) == nkEmpty:
                     let line2: str = intToStr(nodePosLine(argNode0))
                     let col2: str = intToStr(nodePosCol(argNode0))
-                    let key2: str = localTypeKey(b.env, slot)
-                    return Err[UirExprId]("uirCore_builder: new missing type info (var=" + nm + " @" + line2 + ":" + col2 + ", key=" + key2 + ")")
+                    return Err[UirExprId]("uirCore_builder: new missing type info (var=" + nm +
+                                          " @" + line2 + ":" + col2 + ", key=" + localKey + ")")
                 var size: int64 = 0
                 let innerObjName: str = typeNodeObjTypeName(b.module, inner)
                 if len(innerObjName) > 0 && b.module != nil && uirCoreHasObjType(b.module, innerObjName):
@@ -12921,18 +12935,14 @@ fn moduleHasFuncByBase(mod: UirCoreModule, base0: str): bool =
         return false
     if moduleHasFunc(mod, base0):
         return true
-    let baseSym: str = backendSanitizeLinkName(base0)
-    let prefix: str = baseSym + uirCoreFuncSigMarker()
-    let dupPrefix: str = baseSym + "__cheng_mod_"
-    let instPrefix: str = baseSym + "_"
-    for i in 0..<uirCoreModuleFuncsLen(mod):
-        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
-        if (f != nil):
-            let fnName: str = uirCoreFuncNameOf(f)
-            if (fnName == base0) ||
-               uirCoreStrStartsWith(fnName, prefix) ||
-               uirCoreStrStartsWith(fnName, dupPrefix) ||
-               uirCoreStrStartsWith(fnName, instPrefix):
+    let candidates: int32[] = uirCoreCalleeCandidatesGet(mod, base0)
+    for ci in 0..<candidates.len:
+        let idx: int32 = candidates[ci]
+        if idx < 0:
+            break
+        if idx >= 0 && idx < uirCoreModuleFuncsLen(mod):
+            let f: UirCoreFunc = uirCoreModuleFuncAt(mod, idx)
+            if f != nil:
                 return true
     return false
 
@@ -12975,22 +12985,22 @@ fn moduleFindFuncByBaseUnique(mod: UirCoreModule, base0: str): UirCoreFunc =
     let exact: UirCoreFunc = moduleFindFunc(mod, base0)
     if (exact != nil):
         return exact
-    let baseSym: str = backendSanitizeLinkName(base0)
-    let prefix: str = baseSym + uirCoreFuncSigMarker()
-    let dupPrefix: str = baseSym + "__cheng_mod_"
-    let instPrefix: str = baseSym + "_"
+    let candidates: int32[] = uirCoreCalleeCandidatesGet(mod, base0)
     var found: UirCoreFunc = nil
-    for i in 0..<uirCoreModuleFuncsLen(mod):
-        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
-        if (f != nil):
-            let fnName: str = uirCoreFuncNameOf(f)
-            if (fnName == base0) ||
-               uirCoreStrStartsWith(fnName, prefix) ||
-               uirCoreStrStartsWith(fnName, dupPrefix) ||
-               uirCoreStrStartsWith(fnName, instPrefix):
-                if (found != nil):
-                    return nil
-                found = f
+    for ci in 0..<candidates.len:
+        let idx: int32 = candidates[ci]
+        if idx < 0:
+            break
+        if idx < 0 || idx >= uirCoreModuleFuncsLen(mod):
+            continue
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, idx)
+        if f == nil:
+            continue
+        if (found != nil):
+            if uirCoreFuncNameOf(found) == uirCoreFuncNameOf(f):
+                continue
+            return nil
+        found = f
     return found
 
 fn moduleFindFuncByBasePreferOrigin(mod: UirCoreModule, base0: str, originFile0: str): UirCoreFunc =
@@ -13001,28 +13011,79 @@ fn moduleFindFuncByBasePreferOrigin(mod: UirCoreModule, base0: str, originFile0:
         let direct: UirCoreFunc = moduleFindFunc(mod, base0)
         if (direct != nil) && uirCoreFuncOriginFileOf(direct) == originFile:
             return direct
-        let baseSym: str = backendSanitizeLinkName(base0)
-        let prefix: str = baseSym + uirCoreFuncSigMarker()
-        let dupPrefix: str = baseSym + "__cheng_mod_"
-        let instPrefix: str = baseSym + "_"
+        let candidates: int32[] = uirCoreCalleeCandidatesGet(mod, base0)
         var found: UirCoreFunc = nil
-        for i in 0..<uirCoreModuleFuncsLen(mod):
-            let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
+        for ci in 0..<candidates.len:
+            let idx: int32 = candidates[ci]
+            if idx < 0:
+                break
+            if idx < 0 || idx >= uirCoreModuleFuncsLen(mod):
+                continue
+            let f: UirCoreFunc = uirCoreModuleFuncAt(mod, idx)
             if (f == nil) || uirCoreFuncOriginFileOf(f) != originFile:
                 continue
             let fnName: str = uirCoreFuncNameOf(f)
-            if (fnName == base0) || uirCoreStrStartsWith(fnName, prefix) ||
-               uirCoreStrStartsWith(fnName, dupPrefix) || uirCoreStrStartsWith(fnName, instPrefix):
-                if (found != nil):
-                    if uirCoreFuncNameOf(found) == fnName:
-                        continue
-                    return nil
-                found = f
+            if (found != nil):
+                if uirCoreFuncNameOf(found) == fnName:
+                    continue
+                return nil
+            found = f
         if (found != nil):
             return found
     return moduleFindFuncByBaseUnique(mod, base0)
 
+fn uirCoreOverloadInferCacheReset() =
+    let nextRound: int32 = uirCoreOverloadInferCacheRound + 1
+    if nextRound > 0:
+        uirCoreOverloadInferCacheRound = nextRound
+        return
+    # Epoch rollover: clear stamp/value arrays so old entries cannot leak across modules.
+    uirCoreOverloadInferCacheRound = 1
+    uirCoreOverloadInferCacheEpoch.len = 0
+    uirCoreOverloadInferCacheVals.len = 0
+
+fn uirCoreOverloadInferCacheTryGet(n: Node, found: var bool): str =
+    found = false
+    if !astNodeIdValid(n):
+        return ""
+    let idx: int32 = n - 1
+    if idx < 0 || idx >= uirCoreOverloadInferCacheEpoch.len || idx >= uirCoreOverloadInferCacheVals.len:
+        return ""
+    if uirCoreOverloadInferCacheEpoch[idx] != uirCoreOverloadInferCacheRound:
+        return ""
+    found = true
+    return uirCoreOverloadInferCacheVals[idx]
+
+fn uirCoreOverloadInferCachePut(n: Node, key: str) =
+    if !astNodeIdValid(n):
+        return
+    let idx: int32 = n - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreOverloadInferCacheEpoch.len:
+        add(uirCoreOverloadInferCacheEpoch, int32(0))
+    while idx >= uirCoreOverloadInferCacheVals.len:
+        add(uirCoreOverloadInferCacheVals, "")
+    uirCoreOverloadInferCacheEpoch[idx] = uirCoreOverloadInferCacheRound
+    uirCoreOverloadInferCacheVals[idx] = key
+
 fn uirCoreInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
+    if b == nil:
+        return ""
+    var n: Node = n0
+    while astNodeIdValid(n) && nodeKind(n) == nkPar && kidCount(n) > 0:
+        n = kid(n, 0)
+    if n == nil:
+        return ""
+    var foundCached: bool = false
+    let cached: str = uirCoreOverloadInferCacheTryGet(n, foundCached)
+    if foundCached:
+        return cached
+    let out: str = uirCoreInferNodeTypeKeyForOverloadUncached(b, n)
+    uirCoreOverloadInferCachePut(n, out)
+    return out
+
+fn uirCoreInferNodeTypeKeyForOverloadUncached(b: BlockBuilder, n0: Node): str =
     if (b == nil):
         return ""
     var n: Node = n0
@@ -14457,6 +14518,8 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
     uirCoreObjAliasesReset()
     uirCoreDupFnBasesReset()
     uirCoreDupGlobalNamesReset()
+    uirCoreCalleeCandidatesReset()
+    uirCoreOverloadInferCacheReset()
     let mod: UirCoreModule = uirCoreNewModule("arm64-apple-darwin")
     ensureBuiltinObjTypes(mod)
     var ctx: UirCoreBuildCtx
@@ -14883,6 +14946,7 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
         os.writeLine(fDbgPipeR6, "[backend] stage1: uir_reset_6")
         os.c_fflush fDbgPipeR6
     uirCoreCalleeCandidatesReset()
+    uirCoreOverloadInferCacheReset()
     if dbgPipeCount:
         let fDbgPipeR7: os.File = os.get_stderr()
         os.writeLine(fDbgPipeR7, "[backend] stage1: uir_reset_7")
@@ -15559,7 +15623,7 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: pre_skip_flags_start")
         os.c_fflush dbgFile
-    let skipSem: bool = uirCoreIsOne(getEnv "STAGE1_SKIP_SEM")
+    let skipSem: bool = false
     if dbgPipe:
         os.writeLine(dbgFile, "[backend] stage1: pre_skip_flags_after_skip_sem value=" + (skipSem ? "1" : "0"))
         os.c_fflush dbgFile
@@ -15703,9 +15767,7 @@ fn uirCoreBuildModuleFromFileStage1(inPath: str): Result[UirCoreModule] =
         os.c_fflush dbgFile
 
     let arcOn: bool = arcEnabled()
-    let skipOwnershipEnv: str = getEnv "STAGE1_SKIP_OWNERSHIP"
-    # Ownership defaults to enabled; only explicit STAGE1_SKIP_OWNERSHIP=1 can skip.
-    let skipOwnership: bool = uirCoreIsOne(skipOwnershipEnv)
+    let skipOwnership: bool = false
     let ownershipEngine: str = uirCoreOwnershipEngineNormalized()
     let borrowStageLabel: str = borrowIrMode == "mir" ? "mir_borrow" : "ownership"
     stage1Trace("internal: " + borrowStageLabel)

@@ -6,6 +6,9 @@ import backend/c/c_emitter_types
 fn cEmitLocalName(slot: int32): str =
     return "l" + intToStr(slot)
 
+fn cEmitLocalSlotValid(func: UirFunc, slot: int32): bool =
+    return slot >= 0 && slot < uirFuncLocalTypesLen(func)
+
 fn cEmitExpr(func: UirFunc, expr: UirExpr, nameMap: CEmitNameMap): Result[str] =
     let _func: UirFunc = func
     if expr <= 0:
@@ -14,7 +17,10 @@ fn cEmitExpr(func: UirFunc, expr: UirExpr, nameMap: CEmitNameMap): Result[str] =
     if k == meConstI64:
         return Ok[str](int64ToStr(uirExprConstValueOf(expr)))
     if k == meLocal:
-        return Ok[str](cEmitLocalName(uirExprLocalIndexOf(expr)))
+        let slot: int32 = uirExprLocalIndexOf(expr)
+        if !cEmitLocalSlotValid(func, slot):
+            return Err[str]("emit-c not-mapped: local slot")
+        return Ok[str](cEmitLocalName(slot))
     if k == meBin:
         let lhsRes: Result[str] = cEmitExpr(func, uirExprLhsOf(expr), nameMap)
         if !IsOk[str](lhsRes):
@@ -39,7 +45,9 @@ fn cEmitExpr(func: UirFunc, expr: UirExpr, nameMap: CEmitNameMap): Result[str] =
         return Ok[str]("(" + lhsRes2.value + " " + op2 + " " + rhsRes2.value + ")")
     if k == meCall:
         let calleeRaw: str = uirExprCalleeOf(expr)
-        let calleeC: str = cEmitNameMapGet(nameMap, calleeRaw, cEmitSanitizeIdent(calleeRaw, "fn_call"))
+        if len(calleeRaw) == 0:
+            return Err[str]("emit-c not-mapped: call callee")
+        let calleeC: str = cEmitNameMapGet(nameMap, cEmitFnKey(calleeRaw), cEmitSanitizeIdent(calleeRaw, "fn_call"))
         var out: str = calleeC + "("
         for i in 0..<uirExprArgsLen(expr):
             if i > 0:
@@ -58,15 +66,21 @@ fn cEmitExpr(func: UirFunc, expr: UirExpr, nameMap: CEmitNameMap): Result[str] =
         return Ok[str]("((" + cty + ")(" + innerRes.value + "))")
     if k == meAddr:
         let slot: int32 = uirExprLocalIndexOf(expr)
+        if !cEmitLocalSlotValid(func, slot):
+            return Err[str]("emit-c not-mapped: addr slot")
         return Ok[str]("((int64_t)(uintptr_t)(&" + cEmitLocalName(slot) + "))")
     if k == meLoad:
         let addrRes: Result[str] = cEmitExpr(func, uirExprAddrExprOf(expr), nameMap)
         if !IsOk[str](addrRes):
             return addrRes
+        if uirExprLoadTypeOf(expr).kind == mtVoid:
+            return Err[str]("emit-c not-mapped: load void")
         let lty: str = cEmitTypeName(uirExprLoadTypeOf(expr))
         return Ok[str]("(*((" + lty + "*)(uintptr_t)(" + addrRes.value + ")))")
     if k == meGlobalAddr:
         let gRaw: str = uirExprGlobalNameOf(expr)
-        let gName: str = cEmitSanitizeIdent(gRaw, "g")
+        if len(gRaw) == 0:
+            return Err[str]("emit-c not-mapped: global addr name")
+        let gName: str = cEmitNameMapGet(nameMap, cEmitGlobalKey(gRaw), cEmitSanitizeIdent(gRaw, "g"))
         return Ok[str]("((int64_t)(uintptr_t)(&" + gName + "))")
     return Err[str]("emit-c not-mapped: expr kind")

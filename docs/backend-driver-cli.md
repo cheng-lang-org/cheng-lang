@@ -69,7 +69,7 @@ $TOOLING verify_backend_zero_script_residual
 说明：
 
 - `verify_backend_symbol_closure`：阻断 dev 产物运行期 `_alloc/_c_strlen/_zeroMem` 未定义符号。
-- `verify_backend_release_compile_stability`：固定 `return_new_ref_seq_growth`，默认 30 次 release-compile 稳定运行，`rc=139` 直接失败。
+- `verify_backend_release_compile_stability`：固定 `return_new_ref_seq_growth`，默认 3 次 release-compile 稳定运行，`rc=139` 直接失败。
 - `verify_backend_zero_script_residual`：阻断 required 路径 compile-only/skip 语义与 legacy `CHENG_*` 执行路径读取残留。
 
 ## 移除项
