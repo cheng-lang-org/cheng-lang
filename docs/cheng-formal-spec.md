@@ -650,11 +650,11 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - UIR 生产默认：`BACKEND_OPT_LEVEL` 未设置时默认 `2`；`UIR_SIMD` 未设置时在 `optLevel>=3` 自动开启。
 - 兼容开关策略：`MIR_PROFILE`、`BACKEND_SSA`、旧单态化跳过开关已移除；设置后编译器直接报错。
 - IR 语义显式化：整数运算与移位使用 `sdiv/udiv`、`smod/umod`、`lshr/ashr` 等显式操作，避免 C 语义歧义。
-- 产物策略：生产默认 `emit=exe`（self/system linker 双轨）；公开可选 `emit=c`（`cheng/release-compile --emit:c`）；非 release 可执行构建禁止 `emit=obj`，`.o/.obj` 仅保留内部 `allow-no-main` 工件生成通道（需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`）。
+- 产物策略：生产默认 `emit=exe`（self/system linker 双轨）；`release-compile` 支持 `emit=exe|shared|static`；非 release 可执行构建禁止 `emit=obj`，`.o/.obj` 仅保留内部 `allow-no-main` 工件生成通道（需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`）。
 - Dev 运行策略：`cheng --run` 默认进入 host runner（`--run:host`）；`--run:file` 为兼容执行路径。
 - Dev 编译策略：`cheng` 固定为 canonical dev 轨入口（`compile/chengc` 已移除并返回 `rc=2`；默认 `BACKEND_INCREMENTAL=1`、`CHENGC_DEV_MULTI_DEFAULT=1`）；`BACKEND_MULTI_MODULE_CACHE` 默认关闭（`0`），stable driver 当前固定禁用 module-cache load 路径（不作为生产配置面）。release 轨改用显式入口 `release-compile`（默认串行口径 `CHENGC_RELEASE_MULTI_DEFAULT=0`）。
 - linker 参数收口：`cheng` 与 `release-compile` 均不接受 `--linker:*`，也不接受 `BACKEND_LINKER` 环境覆盖；dev 轨固定 `self-link + direct-exe`，release 轨固定 `system-link`。
-- `emit=c` 语义：覆盖边界外必须硬失败并输出 `emit-c not-mapped`；禁止自动回退到 `emit=exe`。`--emit:c` 下禁止 `--run/--run:*`（命令配置错误，`rc=2`）。
+- `emit=shared|static` 语义：采用 release object-first 打包（后端先产 `obj`，再由系统工具链打包库）。`--emit:shared|static` 下禁止 `--run/--run:*`（命令配置错误，`rc=2`）。
 - Dev 快速自举管线（host-only）：
   - 前端解析模式：`cheng`/`selfhost` dev 入口固定 `BACKEND_STAGE1_PARSE_MODE=outline`（不再接受外部覆盖）；`release-compile` 固定 `full`。
   - 函数任务调度：`cheng`/`selfhost` dev 入口固定 `BACKEND_FN_SCHED=ws`（不再接受外部覆盖）；`release-compile` 固定 `serial`。
@@ -672,7 +672,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 除平台生产闭环入口：`$TOOLING backend_prod_closure`（dev-only，默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression` 与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级）。
 - 零脚本生产闭环：`backend_prod_closure` 与 `backend-prod-publish` 默认固定 canonical tooling 路径 `artifacts/tooling_cmd/cheng_tooling`（`BACKEND_PROD_ALLOW_NONCANONICAL_TOOL_BIN=0`）；并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`；`cheng` 核心入口必须走 `cheng_tooling` 原生命令路由（`compile/chengc` 已移除并返回 `rc=2`）。
 - required 运行稳定性门禁（native）：`backend_prod_closure` required 链路包含 `backend.symbol_closure`（`verify_backend_symbol_closure`，固定 `return_add/return_new_ref_seq_growth` 可编译可运行并阻断 `_alloc/_c_strlen/_zeroMem` 缺失）与 `backend.release_compile_stability`（`verify_backend_release_compile_stability`，固定 `return_new_ref_seq_growth` 的 release-compile 默认 3 次稳定性，出现 `rc=139` 直接失败）。
-- required emit-c 门禁（native）：`backend_prod_closure` required 链路包含 `backend.emit_c_surface`（CLI surface）、`backend.emit_c_ffi_shadow`（slice/outptr/handle/borrow 影子桥接闭环）与 `backend.emit_c_hard_fail`（未覆盖语义必须 `emit-c not-mapped`）。
+- required FFI 影子桥接门禁（native）：`backend_prod_closure` required 链路包含 `backend.ffi_slice_shim`、`backend.ffi_outptr_tuple`、`backend.ffi_handle_sandbox` 与 `backend.ffi_borrow_bridge`。
 - required 零脚本残留门禁（native）：`backend_prod_closure` required 链路包含 `backend.zero_script_residual`（`verify_backend_zero_script_residual`），强制断言 `src/tooling` 下 shell 文件残留为 0、required 闭环函数不含 compile-only/skip 语义、并阻断 tooling/backend 执行路径上的 legacy `CHENG_*` 环境变量读取。
 - RawPtr + SoA required gate（native）：`backend_prod_closure` required 链路包含 `backend.rawptr_surface_forbid`（`verify_backend_rawptr_surface_forbid`，含 `std/cmdline` 无裸指针 surface 断言）、`backend.uir_soa_surface`（`verify_backend_uir_soa_surface`，SoA/index surface + runtime 合约；要求 runtime 日志包含 `soa_report` 且 `balance_ok=1`，并对双次 runtime probe 执行 determinism 一致性断言）与 `backend.uir_soa_self_probe`（`verify_backend_uir_soa_self_probe`，固定 `self-link` 子探针强制阻断）。
 - 编译入口并发收口：`cheng` 默认移除 stage0 全局锁包装，固定为 `stage0 quarantine + preflight + timeout` 语义，不再通过 compile-path lock 串行化并发任务。

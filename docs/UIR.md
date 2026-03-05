@@ -13,8 +13,7 @@
 
 对应工程现实：
 - 生产主链仍是 `emit=exe`（UIR -> machine -> obj/exe）。
-- 对外新增可选输出通道 `--emit:c`（`cheng` / `release-compile`），用于 UIR 降级 C 文本与 FFI 影子桥接验收。
-- `emit=c` 覆盖边界外一律硬失败（`emit-c not-mapped`），不会回退到 `emit=exe`。
+- 对外公开输出通道为 `emit=exe`（dev/release）与 `release-compile --emit:shared|static`（release object-first 打包）。
 - `emit=obj` 仅 internal gate 使用。
 
 ## 3) UIR 相对 C-as-IR 的五个工程维度
@@ -135,9 +134,10 @@
 - `$TOOLING verify_backend_symbol_closure`
 - `$TOOLING verify_backend_release_compile_stability`
 - `$TOOLING verify_backend_zero_script_residual`
-- `$TOOLING verify_backend_emit_c_surface`
-- `$TOOLING verify_backend_emit_c_ffi_shadow`
-- `$TOOLING verify_backend_emit_c_hard_fail`
+- `$TOOLING verify_backend_ffi_slice_shim`
+- `$TOOLING verify_backend_ffi_outptr_tuple`
+- `$TOOLING verify_backend_ffi_handle_sandbox`
+- `$TOOLING verify_backend_ffi_borrow_bridge`
 - `$TOOLING verify_backend_multi_perf_regression`
 - `$TOOLING verify_backend_simd`
 - `$TOOLING verify_backend_uir_stability`

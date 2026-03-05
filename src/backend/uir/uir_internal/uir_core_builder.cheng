@@ -66,20 +66,20 @@ fn cheng_f32_bits_to_u64(bits: int32): uint64
 
 var
     uirCoreCalleeCandidates: hashmaps.HashMapStrSeqInt
-    uirCoreCalleeCandidatesReady: bool = false
-    uirCoreOverloadInferCacheEpoch: int32[] = []
-    uirCoreOverloadInferCacheVals: str[] = []
+    uirCoreCalleeCandidatesReady: bool
+    uirCoreOverloadInferCacheEpoch: int32[]
+    uirCoreOverloadInferCacheVals: str[]
     uirCoreOverloadInferCacheRound: int32 = 1
 
     uirCore_funcIndex_cache_module: UirCoreModule
     uirCore_funcIndex_cache: hashmaps.HashMapStrInt
     uirCore_funcIndex_cache_len: int32
-    uirCore_funcIndex_cache_ready: bool = false
+    uirCore_funcIndex_cache_ready: bool
 
     uirCore_globalIndex_cache_module: UirCoreModule
     uirCore_globalIndex_cache: hashmaps.HashMapStrInt
     uirCore_globalIndex_cache_len: int32
-    uirCore_globalIndex_cache_ready: bool = false
+    uirCore_globalIndex_cache_ready: bool
 
 fn uirCoreCalleeCandidatesReset(modFuncHint: int32 = 0) =
     var cap: int32 = 2048
@@ -1364,12 +1364,12 @@ fn uirCoreResolveRepoRoot(inPath: str): str =
         return pwdRoot
     return "."
 
-var uirCoreEntryPathCachedRaw: str = ""
-var uirCoreEntryPathCachedNorm: str = ""
-var uirCoreEntryPathCachedDir: str = ""
-var uirCoreEntryPathCachedBase: str = ""
+var uirCoreEntryPathCachedRaw: str
+var uirCoreEntryPathCachedNorm: str
+var uirCoreEntryPathCachedDir: str
+var uirCoreEntryPathCachedBase: str
 var uirCoreEntryPathCachedKeepDir: bool = true
-var uirCoreEntryPathCacheReady: bool = false
+var uirCoreEntryPathCacheReady: bool
 
 fn uirCoreRefreshEntryPathCache() =
     let raw: str = backendStripSpaces(os.getEnvDefault("BACKEND_INPUT", ""))
@@ -14333,20 +14333,13 @@ fn ctxAddGlobalInit(ctx: UirCoreBuildCtx, name: str, ty: UirCoreType, objTypeNam
                     seqFixedElemType: Node = astInvalidNodeId(), seqFixedCapExpr: Node = astInvalidNodeId()) =
     if (ctx == nil) || len(name) == 0:
         return
-    if ctx.globalInits.buffer == nil:
-        ctx.globalInits.buffer = nil
-        ctx.globalInits.len = 0
-        ctx.globalInits.cap = 0
-    var gi: UirCoreGlobalInit
-    new gi
-    gi.name = uirCoreOwnStr(name)
-    gi.ty = ty
-    gi.objTypeName = uirCoreOwnStr(objTypeName)
-    gi.initNode = initNode
-    gi.filePath = uirCoreOwnStr(filePath)
-    gi.seqFixedElemType = seqFixedElemType
-    gi.seqFixedCapExpr = seqFixedCapExpr
-    add(ctx.globalInits, gi)
+    add(ctx.globalInitNames, uirCoreOwnStr(name))
+    add(ctx.globalInitTypes, ty)
+    add(ctx.globalInitObjTypeNames, uirCoreOwnStr(objTypeName))
+    add(ctx.globalInitNodes, initNode)
+    add(ctx.globalInitFilePaths, uirCoreOwnStr(filePath))
+    add(ctx.globalInitSeqFixedElemTypes, seqFixedElemType)
+    add(ctx.globalInitSeqFixedCapExprs, seqFixedCapExpr)
 
 fn uirCoreParseModuleWithLoweredTypesId(filePath: str, content: str, outRootId: AstNodeId*): bool =
     if (outRootId == nil):
@@ -14528,9 +14521,13 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
     ctx.traceEnabled = stage1TraceEnabled()
     ctx.traceFnCount = 0
     ctx.traceGlobalCount = 0
-    ctx.globalInits.buffer = nil
-    ctx.globalInits.len = 0
-    ctx.globalInits.cap = 0
+    ctx.globalInitNames = []
+    ctx.globalInitTypes = []
+    ctx.globalInitObjTypeNames = []
+    ctx.globalInitNodes = []
+    ctx.globalInitFilePaths = []
+    ctx.globalInitSeqFixedElemTypes = []
+    ctx.globalInitSeqFixedCapExprs = []
 
     # Pass 1: collect full import closure.
     var queue: str[]
@@ -14717,6 +14714,9 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
         releaseNodeArena()
 
     # Pass 3: lower all top-level declarations now that types + signatures exist.
+    # Keep pass-3 AST arena alive until global_init is lowered. ctx global-init
+    # stores AST node ids (init expressions / seq-fixed metadata), and releasing
+    # the arena per-file here leaves dangling ids that can crash in global_init.
     for fi2 in 0..<files.len:
         let filePath: str = files[fi2]
         if len(filePath) == 0:
@@ -14736,53 +14736,106 @@ fn uirCoreBuildModuleFromFile(path: str): Result[UirCoreModule] =
             if ! IsOk[bool](res):
                 releaseNodeArena()
                 return ErrInfo[UirCoreModule](ErrorInfoOf[bool](res))
-        releaseNodeArena()
     let allowNoMain: bool = envIsTrue "BACKEND_ALLOW_NO_MAIN" || backendAllowNoMainByEmit()
     if ! ctx.foundMain && !allowNoMain:
         return Err[UirCoreModule]("uirCore_builder: main not found")
 
-    if ctx.globalInits.len > 0 && !backendSkipGlobalInit():
-        let initRes: Result[UirCoreFunc] = uirCoreBuildGlobalInitFunc(mod, ctx)
-        if !IsOk[UirCoreFunc](initRes):
-            return ErrInfo[UirCoreModule](ErrorInfoOf[UirCoreFunc](initRes))
-        uirCoreAddFunc(mod, Value[UirCoreFunc](initRes))
+    if ctx.globalInitNames.len > 0 && !backendSkipGlobalInit():
+        var initFunc: UirCoreFunc = nil
+        let initRes: Result[bool] = uirCoreBuildGlobalInitFunc(mod, ctx, &initFunc)
+        if !IsOk[bool](initRes):
+            return ErrInfo[UirCoreModule](ErrorInfoOf[bool](initRes))
+        if initFunc == nil:
+            return Err[UirCoreModule]("uirCore_builder: global init builder returned nil")
+        uirCoreAddFunc(mod, initFunc)
         if ctx.foundMain:
             uirCoreInjectGlobalInitCall(mod, "__cheng_global_init")
 
+    releaseNodeArena()
     uirCoreApplyUirPluginHooks(path, mod)
     uirCoreNormalizeModule(mod)
     return uirCoreOkModule(mod)
 
-fn uirCoreBuildGlobalInitFunc(mod: UirCoreModule, ctx: UirCoreBuildCtx): Result[UirCoreFunc] =
-    if (mod == nil) || (ctx == nil) || ctx.globalInits.len == 0:
-        return Err[UirCoreFunc]("uirCore_builder: no global init work")
-    let initName: str = "__cheng_global_init"
+fn uirCoreGlobalInitChunkSize(): int32 =
+    let raw: str = backendStripSpaces(os.getEnvDefault("BACKEND_GLOBAL_INIT_CHUNK_SIZE", "64"))
+    let parsed: int32 = uirCoreParseInt32(raw, 64)
+    if parsed <= 0:
+        return 64
+    return parsed
+
+fn uirCoreGlobalInitDebugWrite(enabled: bool, dbgFile: os.File, msg: str) =
+    if !enabled || (dbgFile == nil):
+        return
+    os.writeLine(dbgFile, msg)
+    os.c_fflush dbgFile
+
+fn uirCoreGlobalInitEnsureNameAvailable(mod: UirCoreModule, initName: str): Result[bool] =
+    if len(initName) == 0:
+        return Err[bool]("uirCore_builder: empty global init name")
     if moduleHasFunc(mod, initName) || moduleHasGlobal(mod, initName) ||
        uirCoreFindTypeAlias(mod, initName) >= 0 || uirCoreFindObjType(mod, initName) >= 0:
-        return Err[UirCoreFunc]("uirCore_builder: global init name conflicts: " + initName)
-    let f: UirCoreFunc = uirCoreNewFunc(initName, uirCoreTypeVoid())
-    uirCoreFuncSetOriginFile(f, "<global_init>")
-    let env: LocalEnv = localEnvNew()
-    let b: BlockBuilder = blockBuilderNew(env, mod, f)
+        return Err[bool]("uirCore_builder: global init name conflicts: " + initName)
+    return Ok[bool](true)
 
-    # 1) Scalar globals: store value to the global slot.
-    for i in 0..<ctx.globalInits.len:
-        let gi: UirCoreGlobalInit = ctx.globalInits[i]
-        if (gi != nil) && (len(gi.objTypeName) == 0):
-            let init0: Node = gi.initNode
-            if astNodeIdValid(init0) && nodeKind(init0) != nkEmpty:
-                let valRes: Result[UirExprId] = lowerExprValue(b, init0, gi.ty)
-                if !IsOk[UirExprId](valRes):
-                    return ErrInfo[UirCoreFunc](ErrorInfoOf[UirExprId](valRes))
-                add(b.currentStmts, uirCoreStmtStore(uirCoreGlobalAddr(gi.name), Value[UirExprId](valRes), gi.ty))
-
-    # 2) Object globals: allocate heap storage, zero it, and store the pointer.
-    for i in 0..<ctx.globalInits.len:
-        let gi2: UirCoreGlobalInit = ctx.globalInits[i]
-        if (gi2 != nil) && len(gi2.objTypeName) > 0:
-            let ot: UirCoreObjType = uirCoreGetObjType(mod, gi2.objTypeName)
+fn uirCoreBuildGlobalInitPhaseChunk(mod: UirCoreModule, ctx: UirCoreBuildCtx,
+                                    phaseKind: int32, phaseLabel: str, helperBase: str,
+                                    startIndex: int32, chunkSize: int32, chunkOrdinal: int32,
+                                    dbgGlobalInitIndex: bool, fDbgGlobalInitIndex: os.File,
+                                    outNextIndex: int32*, outFunc: UirCoreFunc*): Result[bool] =
+    if (mod == nil) || (ctx == nil) || (outNextIndex == nil) || (outFunc == nil):
+        return Err[bool]("uirCore_builder: invalid global init phase chunk args")
+    *outNextIndex = startIndex
+    *outFunc = nil
+    if startIndex < 0 || startIndex > ctx.globalInitNames.len:
+        return Err[bool]("uirCore_builder: invalid global init chunk start")
+    let helperName: str = helperBase + "_" + intToStr(chunkOrdinal)
+    var i: int32 = startIndex
+    var emitted: int32 = 0
+    var f: UirCoreFunc = nil
+    var env: LocalEnv = nil
+    var b: BlockBuilder = nil
+    while i < ctx.globalInitNames.len:
+        let hasObj: bool = len(ctx.globalInitObjTypeNames[i]) > 0
+        let initNode: Node = ctx.globalInitNodes[i]
+        let hasInitExpr: bool = astNodeIdValid(initNode) && nodeKind(initNode) != nkEmpty
+        var matchesPhase: bool = false
+        if phaseKind == 1:
+            matchesPhase = !hasObj && hasInitExpr
+        elif phaseKind == 2:
+            matchesPhase = hasObj
+        elif phaseKind == 3:
+            matchesPhase = hasObj && hasInitExpr
+        else:
+            return Err[bool]("uirCore_builder: invalid global init phase kind")
+        if !matchesPhase:
+            i = i + 1
+            continue
+        if emitted == 0:
+            let nameRes: Result[bool] = uirCoreGlobalInitEnsureNameAvailable(mod, helperName)
+            if !IsOk[bool](nameRes):
+                return ErrInfo[bool](ErrorInfoOf[bool](nameRes))
+            f = uirCoreNewFunc(helperName, uirCoreTypeVoid())
+            uirCoreFuncSetOriginFile(f, "<global_init:" + phaseLabel + ">")
+            env = localEnvNew()
+            b = blockBuilderNew(env, mod, f)
+        var dbgLine: str = "[backend] global_init phase=" + phaseLabel +
+                           " chunk=" + intToStr(chunkOrdinal) +
+                           " i=" + intToStr(i) +
+                           " emitted=" + intToStr(emitted) +
+                           " name=" + ctx.globalInitNames[i]
+        if hasObj:
+            dbgLine = dbgLine + " obj=" + ctx.globalInitObjTypeNames[i]
+        uirCoreGlobalInitDebugWrite(dbgGlobalInitIndex, fDbgGlobalInitIndex, dbgLine)
+        if phaseKind == 1:
+            let valRes: Result[UirExprId] = lowerExprValue(b, initNode, ctx.globalInitTypes[i])
+            if !IsOk[UirExprId](valRes):
+                return ErrInfo[bool](ErrorInfoOf[UirExprId](valRes))
+            add(b.currentStmts, uirCoreStmtStore(uirCoreGlobalAddr(ctx.globalInitNames[i]),
+                                                 Value[UirExprId](valRes), ctx.globalInitTypes[i]))
+        elif phaseKind == 2:
+            let ot: UirCoreObjType = uirCoreGetObjType(mod, ctx.globalInitObjTypeNames[i])
             if ot.size <= 0:
-                return Err[UirCoreFunc]("uirCore_builder: global init missing object layout: " + gi2.objTypeName)
+                return Err[bool]("uirCore_builder: global init missing object layout: " + ctx.globalInitObjTypeNames[i])
             let tmpName: str = blockBuilderNextTemp(b, "__gobj")
             let tmpSlot: int32 = localAdd(env, tmpName, uirCoreTypeI64())
             uirCoreSetLocalType(f, tmpSlot, uirCoreTypeI64())
@@ -14794,33 +14847,132 @@ fn uirCoreBuildGlobalInitFunc(mod: UirCoreModule, ctx: UirCoreBuildCtx): Result[
             add(zeroArgs, uirCoreConstI64(0))
             add(zeroArgs, uirCoreConstI64(int64(ot.size)))
             add(b.currentStmts, uirCoreStmtExpr(uirCoreCall("setMem", zeroArgs)))
-            if gi2.seqFixedElemType != nil && gi2.seqFixedCapExpr != nil:
+            let seqFixedElemType: Node = ctx.globalInitSeqFixedElemTypes[i]
+            let seqFixedCapExpr: Node = ctx.globalInitSeqFixedCapExprs[i]
+            if astNodeIdValid(seqFixedElemType) && astNodeIdValid(seqFixedCapExpr):
                 var sfi: SeqFixedInit
-                sfi.elemType = gi2.seqFixedElemType
-                sfi.capExpr = gi2.seqFixedCapExpr
+                sfi.elemType = seqFixedElemType
+                sfi.capExpr = seqFixedCapExpr
                 let seqInitRes: Result[bool] = emitSeqFixedReserveInitToPtr(b, uirCoreLocal(tmpSlot), sfi)
                 if !IsOk[bool](seqInitRes):
-                    return ErrInfo[UirCoreFunc](ErrorInfoOf[bool](seqInitRes))
-            add(b.currentStmts, uirCoreStmtStore(uirCoreGlobalAddr(gi2.name), uirCoreLocal(tmpSlot), uirCoreTypeI64()))
-
-    # 3) Object globals: run initializer calls (if any) into the allocated storage.
-    for i in 0..<ctx.globalInits.len:
-        let gi3: UirCoreGlobalInit = ctx.globalInits[i]
-        if (gi3 != nil) && len(gi3.objTypeName) > 0:
-            let init1: Node = gi3.initNode
-            if astNodeIdValid(init1) && nodeKind(init1) != nkEmpty:
-                var initCore: Node = init1
-                while astNodeIdValid(initCore) && nodeKind(initCore) == nkPar && kidCount(initCore) > 0:
-                    initCore = kid(initCore, 0)
-                if !astNodeIdValid(initCore) || nodeKind(initCore) != nkCall:
-                    return Err[UirCoreFunc]("uirCore_builder: global object init expects call: " + gi3.name)
-                let lead: UirExprId = uirCoreLoad(uirCoreGlobalAddr(gi3.name), uirCoreTypeI64())
-                let callRes: Result[UirExprId] = lowerCallWithLeadingArg(b, initCore, lead)
-                if !IsOk[UirExprId](callRes):
-                    return ErrInfo[UirCoreFunc](ErrorInfoOf[UirExprId](callRes))
-
+                    return ErrInfo[bool](ErrorInfoOf[bool](seqInitRes))
+            add(b.currentStmts, uirCoreStmtStore(uirCoreGlobalAddr(ctx.globalInitNames[i]),
+                                                 uirCoreLocal(tmpSlot), uirCoreTypeI64()))
+        else:
+            var initCore: Node = initNode
+            while astNodeIdValid(initCore) && nodeKind(initCore) == nkPar && kidCount(initCore) > 0:
+                initCore = kid(initCore, 0)
+            if !astNodeIdValid(initCore) || nodeKind(initCore) != nkCall:
+                return Err[bool]("uirCore_builder: global object init expects call: " + ctx.globalInitNames[i])
+            let lead: UirExprId = uirCoreLoad(uirCoreGlobalAddr(ctx.globalInitNames[i]), uirCoreTypeI64())
+            let callRes: Result[UirExprId] = lowerCallWithLeadingArg(b, initCore, lead)
+            if !IsOk[UirExprId](callRes):
+                return ErrInfo[bool](ErrorInfoOf[UirExprId](callRes))
+        emitted = emitted + 1
+        i = i + 1
+        if emitted >= chunkSize:
+            break
+    *outNextIndex = i
+    if emitted == 0 || (f == nil) || (b == nil):
+        return Ok[bool](false)
     blockBuilderFinish(b, uirCoreTermRet(nil))
-    return Ok[UirCoreFunc](f)
+    *outFunc = f
+    return Ok[bool](true)
+
+fn uirCoreBuildGlobalInitWrapperFunc(mod: UirCoreModule, helperNames: str[],
+                                     outFunc: UirCoreFunc*): Result[bool] =
+    if (mod == nil) || (outFunc == nil):
+        return Err[bool]("uirCore_builder: invalid global init wrapper args")
+    *outFunc = nil
+    let initName: str = "__cheng_global_init"
+    let nameRes: Result[bool] = uirCoreGlobalInitEnsureNameAvailable(mod, initName)
+    if !IsOk[bool](nameRes):
+        return ErrInfo[bool](ErrorInfoOf[bool](nameRes))
+    let f: UirCoreFunc = uirCoreNewFunc(initName, uirCoreTypeVoid())
+    uirCoreFuncSetOriginFile(f, "<global_init>")
+    let env: LocalEnv = localEnvNew()
+    let b: BlockBuilder = blockBuilderNew(env, mod, f)
+    for i in 0..<helperNames.len:
+        var helperArgs: UirExprId[]
+        add(b.currentStmts, uirCoreStmtExpr(uirCoreCall(helperNames[i], helperArgs)))
+    blockBuilderFinish(b, uirCoreTermRet(nil))
+    *outFunc = f
+    return Ok[bool](true)
+
+fn uirCoreBuildGlobalInitFunc(mod: UirCoreModule, ctx: UirCoreBuildCtx, outFunc: UirCoreFunc*): Result[bool] =
+    if (mod == nil) || (ctx == nil) || ctx.globalInitNames.len == 0 || (outFunc == nil):
+        return Err[bool]("uirCore_builder: no global init work")
+    let dbgGlobalInitIndex: bool = envIsTrue "BACKEND_DEBUG_GLOBAL_INIT_INDEX"
+    var fDbgGlobalInitIndex: os.File = nil
+    if dbgGlobalInitIndex:
+        fDbgGlobalInitIndex = os.get_stderr()
+        uirCoreGlobalInitDebugWrite(true, fDbgGlobalInitIndex,
+                                    "[backend] global_init enter total=" + intToStr(ctx.globalInitNames.len))
+    let chunkSize: int32 = uirCoreGlobalInitChunkSize()
+    var helperNames: str[]
+    var startIndex: int32 = 0
+    var chunkOrdinal: int32 = 0
+    while startIndex < ctx.globalInitNames.len:
+        var nextIndex: int32 = startIndex
+        var phaseFunc: UirCoreFunc = nil
+        let phaseRes: Result[bool] = uirCoreBuildGlobalInitPhaseChunk(
+            mod, ctx, 1, "const", "__cheng_global_init_const",
+            startIndex, chunkSize, chunkOrdinal, dbgGlobalInitIndex, fDbgGlobalInitIndex,
+            &nextIndex, &phaseFunc)
+        if !IsOk[bool](phaseRes):
+            return ErrInfo[bool](ErrorInfoOf[bool](phaseRes))
+        if phaseFunc == nil:
+            break
+        uirCoreAddFunc(mod, phaseFunc)
+        add(helperNames, uirCoreOwnStr("__cheng_global_init_const_" + intToStr(chunkOrdinal)))
+        startIndex = nextIndex
+        chunkOrdinal = chunkOrdinal + 1
+    startIndex = 0
+    chunkOrdinal = 0
+    while startIndex < ctx.globalInitNames.len:
+        var nextIndex2: int32 = startIndex
+        var phaseFunc2: UirCoreFunc = nil
+        let phaseRes2: Result[bool] = uirCoreBuildGlobalInitPhaseChunk(
+            mod, ctx, 2, "heap", "__cheng_global_init_heap",
+            startIndex, chunkSize, chunkOrdinal, dbgGlobalInitIndex, fDbgGlobalInitIndex,
+            &nextIndex2, &phaseFunc2)
+        if !IsOk[bool](phaseRes2):
+            return ErrInfo[bool](ErrorInfoOf[bool](phaseRes2))
+        if phaseFunc2 == nil:
+            break
+        uirCoreAddFunc(mod, phaseFunc2)
+        add(helperNames, uirCoreOwnStr("__cheng_global_init_heap_" + intToStr(chunkOrdinal)))
+        startIndex = nextIndex2
+        chunkOrdinal = chunkOrdinal + 1
+    startIndex = 0
+    chunkOrdinal = 0
+    while startIndex < ctx.globalInitNames.len:
+        var nextIndex3: int32 = startIndex
+        var phaseFunc3: UirCoreFunc = nil
+        let phaseRes3: Result[bool] = uirCoreBuildGlobalInitPhaseChunk(
+            mod, ctx, 3, "ctor", "__cheng_global_init_ctor",
+            startIndex, chunkSize, chunkOrdinal, dbgGlobalInitIndex, fDbgGlobalInitIndex,
+            &nextIndex3, &phaseFunc3)
+        if !IsOk[bool](phaseRes3):
+            return ErrInfo[bool](ErrorInfoOf[bool](phaseRes3))
+        if phaseFunc3 == nil:
+            break
+        uirCoreAddFunc(mod, phaseFunc3)
+        add(helperNames, uirCoreOwnStr("__cheng_global_init_ctor_" + intToStr(chunkOrdinal)))
+        startIndex = nextIndex3
+        chunkOrdinal = chunkOrdinal + 1
+    var wrapperFunc: UirCoreFunc = nil
+    let wrapperRes: Result[bool] = uirCoreBuildGlobalInitWrapperFunc(mod, helperNames, &wrapperFunc)
+    if !IsOk[bool](wrapperRes):
+        return ErrInfo[bool](ErrorInfoOf[bool](wrapperRes))
+    if wrapperFunc == nil:
+        return Err[bool]("uirCore_builder: global init wrapper missing")
+    if dbgGlobalInitIndex:
+        uirCoreGlobalInitDebugWrite(true, fDbgGlobalInitIndex,
+                                    "[backend] global_init done chunk_size=" + intToStr(chunkSize) +
+                                    " helpers=" + intToStr(helperNames.len))
+    *outFunc = wrapperFunc
+    return Ok[bool](true)
 
 fn uirCoreInjectGlobalInitCall(mod: UirCoreModule, initName: str) =
     if (mod == nil) || len(initName) == 0:
@@ -15005,9 +15157,13 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
         let fDbgPipeMark1: os.File = os.get_stderr()
         os.writeLine(fDbgPipeMark1, "[backend] stage1: uir_after_dups_mark_1")
         os.c_fflush fDbgPipeMark1
-    ctx.globalInits.buffer = nil
-    ctx.globalInits.len = 0
-    ctx.globalInits.cap = 0
+    ctx.globalInitNames = []
+    ctx.globalInitTypes = []
+    ctx.globalInitObjTypeNames = []
+    ctx.globalInitNodes = []
+    ctx.globalInitFilePaths = []
+    ctx.globalInitSeqFixedElemTypes = []
+    ctx.globalInitSeqFixedCapExprs = []
     if dbgPipeCount:
         let fDbgPipeMark2: os.File = os.get_stderr()
         os.writeLine(fDbgPipeMark2, "[backend] stage1: uir_after_dups_mark_2")
@@ -15188,18 +15344,21 @@ fn uirCoreBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
              " cstrs=" + intToStr(uirCoreModuleCStringsLen(mod)))
     if ctx.traceEnabled:
         stage1Trace("backend: uir lower done funcs=" + intToStr(ctx.traceFnCount) +
-            " globals=" + intToStr(ctx.traceGlobalCount) + " inits=" + intToStr(ctx.globalInits.len))
+            " globals=" + intToStr(ctx.traceGlobalCount) + " inits=" + intToStr(ctx.globalInitNames.len))
     let allowNoMain: bool = envIsTrue "BACKEND_ALLOW_NO_MAIN" || backendAllowNoMainByEmit()
     if ! ctx.foundMain && !allowNoMain:
         return Err[UirCoreModule]("uirCore_builder: main not found")
 
-    if ctx.globalInits.len > 0 && !backendSkipGlobalInit():
+    if ctx.globalInitNames.len > 0 && !backendSkipGlobalInit():
         if ctx.traceEnabled:
             stage1Trace("backend: uir global_init build start")
-        let initRes: Result[UirCoreFunc] = uirCoreBuildGlobalInitFunc(mod, ctx)
-        if !IsOk[UirCoreFunc](initRes):
-            return ErrInfo[UirCoreModule](ErrorInfoOf[UirCoreFunc](initRes))
-        uirCoreAddFunc(mod, Value[UirCoreFunc](initRes))
+        var initFunc: UirCoreFunc = nil
+        let initRes: Result[bool] = uirCoreBuildGlobalInitFunc(mod, ctx, &initFunc)
+        if !IsOk[bool](initRes):
+            return ErrInfo[UirCoreModule](ErrorInfoOf[bool](initRes))
+        if initFunc == nil:
+            return Err[UirCoreModule]("uirCore_builder: global init builder returned nil")
+        uirCoreAddFunc(mod, initFunc)
         if ctx.foundMain:
             uirCoreInjectGlobalInitCall(mod, "__cheng_global_init")
         if ctx.traceEnabled:
