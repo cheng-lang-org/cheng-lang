@@ -86,6 +86,9 @@ fn elfx64_targetIsDarwin(target: str): bool =
         return true
     return elfx64_strContains(target, "apple") || elfx64_strContains(target, "darwin") || elfx64_strContains(target, "ios")
 
+fn elfx64_isPrivateFuncSym(name: str): bool =
+    return strings.hasPrefix(name, "__cheng_global_init")
+
 fn elfx64_strCmp(a: str, b: str): int32 =
     if void*(a) == nil && void*(b) == nil:
         return 0
@@ -172,22 +175,23 @@ fn elfx64SeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
 fn elfx64ModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
     if void*(mod) == nil:
         return nil
-    return elfx64SeqAtMachineFunc(mod.funcs, idx)
+    return machineModuleFuncAt(mod, idx)
 
 fn elfx64ModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
+    var zero: MachineCString
     if void*(mod) == nil:
-        return nil
-    return elfx64SeqAtMachineCString(mod.cstrs, idx)
+        return zero
+    return machineModuleCStringAt(mod, idx)
 
 fn elfx64ModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
     if void*(mod) == nil:
         return nil
-    return elfx64SeqAtMachineGlobal(mod.globals, idx)
+    return machineModuleGlobalAt(mod, idx)
 
 fn elfx64FuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
     if void*(func) == nil:
         return nil
-    return elfx64SeqAtMachineInst(func.insts, idx)
+    return machineFuncInstAt(func, idx)
 
 fn elfx64_alignUp(value: uint64, align: uint64): uint64 =
     if align == 0:
@@ -876,9 +880,19 @@ fn elfx64Build(module: MachineModule): Result[uint8[]] =
         elfx64AddSym(syms, machineCStringLabelOf(c2), STB_LOCAL, STT_OBJECT, uint16(2),
                      cSymOffs[ci], uint64(len(machineCStringValueOf(c2)) + 1))
 
+    # locals: funcs
+    for fi in 0..<machineModuleFuncsLen(module):
+        let f2: MachineFunc = elfx64ModuleFuncAtRaw(module, fi)
+        if !elfx64_isPrivateFuncSym(machineFuncNameOf(f2)):
+            continue
+        elfx64AddSym(syms, machineFuncNameOf(f2), STB_LOCAL, STT_FUNC, uint16(1),
+                     funcOffs[fi], funcSizes[fi])
+
     # globals: funcs
     for fi in 0..<machineModuleFuncsLen(module):
         let f2: MachineFunc = elfx64ModuleFuncAtRaw(module, fi)
+        if elfx64_isPrivateFuncSym(machineFuncNameOf(f2)):
+            continue
         elfx64AddSym(syms, machineFuncNameOf(f2), STB_GLOBAL, STT_FUNC, uint16(1),
                      funcOffs[fi], funcSizes[fi])
 
@@ -904,7 +918,7 @@ fn elfx64Build(module: MachineModule): Result[uint8[]] =
 
     # Build .strtab (symbol names) and fill nameOff.
     var strtab: uint8[]
-    add(strtab, uint8(0))
+    bufAddU8(strtab, uint8(0))
     for si in 0..<syms.len:
         let s0: ElfX64Sym = syms[si]
         if void*(s0) != nil:
@@ -952,7 +966,7 @@ fn elfx64Build(module: MachineModule): Result[uint8[]] =
 
     # Build .shstrtab
     var shstrtab: uint8[]
-    add(shstrtab, uint8(0))
+    bufAddU8(shstrtab, uint8(0))
     let sh_text: uint32 = uint32(shstrtab.len)
     bufStr0(&shstrtab, ".text")
     let sh_rodata: uint32 = uint32(shstrtab.len)

@@ -81,6 +81,9 @@ fn elf_targetIsDarwin(target: str): bool =
         return true
     return elf_strContains(target, "apple") || elf_strContains(target, "darwin") || elf_strContains(target, "ios")
 
+fn elf_isPrivateFuncSym(name: str): bool =
+    return strings.hasPrefix(name, "__cheng_global_init")
+
 fn elf_strCmp(a: str, b: str): int32 =
     if a == b:
         return 0
@@ -137,12 +140,37 @@ fn elfWriteStrPtr(items: var str[], idx: int32, val: str) =
 fn elfAddStrPtr(items: var str[], value: str) =
     if void*(items) == nil:
         return
-    add(items, value)
+    let idx: int32 = items.len
+    setLen(items, idx + 1)
+    items[int(idx)] = value
 
 fn elfAddSymPtr(outSyms: var ElfSym[], s: ElfSym) =
     if void*(outSyms) == nil:
         return
-    add(outSyms, s)
+    let idx: int32 = outSyms.len
+    setLen(outSyms, idx + 1)
+    outSyms[int(idx)] = s
+
+fn elfAddInt32Ptr(items: var int32[], value: int32) =
+    if void*(items) == nil:
+        return
+    let idx: int32 = items.len
+    setLen(items, idx + 1)
+    items[int(idx)] = value
+
+fn elfAddU64Ptr(items: var uint64[], value: uint64) =
+    if void*(items) == nil:
+        return
+    let idx: int32 = items.len
+    setLen(items, idx + 1)
+    items[int(idx)] = value
+
+fn elfAddRelocPtr(items: var ElfReloc[], value: ElfReloc) =
+    if void*(items) == nil:
+        return
+    let idx: int32 = items.len
+    setLen(items, idx + 1)
+    items[int(idx)] = value
 
 fn elf_seqAddUniqueStr(items: var str[], value: str) =
     if void*(items) == nil || len(value) == 0:
@@ -223,42 +251,34 @@ fn elfFindSymIndex(syms: ElfSym[], name: str): int32 =
             return i
     return -1
 
-fn elfSeqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
-    return items[int(idx)]
-
-fn elfSeqAtMachineCString(items: MachineCString[], idx: int32): MachineCString =
-    return items[int(idx)]
-
-fn elfSeqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
-    return items[int(idx)]
-
-fn elfSeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
-    return items[int(idx)]
-
 fn elfModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
     if void*(mod) == nil:
         return nil
-    return elfSeqAtMachineFunc(mod.funcs, idx)
+    return machineModuleFuncAt(mod, idx)
 
 fn elfModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
+    var zero: MachineCString
     if void*(mod) == nil:
-        return nil
-    return elfSeqAtMachineCString(mod.cstrs, idx)
+        return zero
+    return machineModuleCStringAt(mod, idx)
 
 fn elfModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
     if void*(mod) == nil:
         return nil
-    return elfSeqAtMachineGlobal(mod.globals, idx)
+    return machineModuleGlobalAt(mod, idx)
 
 fn elfFuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
     if void*(func) == nil:
         return nil
-    return elfSeqAtMachineInst(func.insts, idx)
+    return machineFuncInstAt(func, idx)
 
 fn elfBuild(module: MachineModule): Result[uint8[]] =
     if void*(module) == nil:
         return Err[uint8[]]("elf_writer: nil module")
-    let target: str = machineModuleTargetOf(module)
+    var target: str = machineModuleTargetOf(module)
+    let envTarget: str = os.getEnvDefault("BACKEND_TARGET", "")
+    if len(envTarget) > 0 && (len(target) == 0 || elf_targetIsDarwin(target)):
+        target = envTarget
     if elf_targetIsDarwin(target):
         return Err[uint8[]]("elf_writer: darwin target not supported")
     let cstrCount: int32 = machineModuleCstrsLen(module)
@@ -338,8 +358,8 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
         for si in 0..<instCount:
             let inst0: MachineInst = elfFuncInstAtRaw(f, si)
             if machineInstOpOf(inst0) == machineOpLabel:
-                add(labels, machineInstLabelOf(inst0))
-                add(labelOffs, scanOff)
+                elfAddStrPtr(labels, machineInstLabelOf(inst0))
+                elfAddInt32Ptr(labelOffs, scanOff)
                 continue
             if machineInstOpOf(inst0) == machineOpMovImm:
                 let wc: int32 = a64MovImmWordCount(a64Is64(machineInstRdOf(inst0)), machineInstImmOf(inst0))
@@ -392,7 +412,7 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
                 r.sym = machineInstLabelOf(inst)
                 r.rtype = R_AARCH64_ADR_PREL_PG_HI21
                 r.addend = 0
-                add(relocs, r)
+                elfAddRelocPtr(relocs, r)
             elif machineInstOpOf(inst) == machineOpAddPageOff:
                 word = a64EncAddImm(true, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), 0)
                 var r2: ElfReloc
@@ -401,7 +421,7 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
                 r2.sym = machineInstLabelOf(inst)
                 r2.rtype = R_AARCH64_ADD_ABS_LO12_NC
                 r2.addend = 0
-                add(relocs, r2)
+                elfAddRelocPtr(relocs, r2)
             elif machineInstOpOf(inst) == machineOpSxtw:
                 word = a64EncSxtw(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
             elif machineInstOpOf(inst) == machineOpAdd:
@@ -519,7 +539,7 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
                 r3.sym = machineInstLabelOf(inst)
                 r3.rtype = R_AARCH64_CALL26
                 r3.addend = 0
-                add(relocs, r3)
+                elfAddRelocPtr(relocs, r3)
             elif machineInstOpOf(inst) == machineOpBlr:
                 word = a64EncBlr(a64RegNum(machineInstRnOf(inst)))
             elif machineInstOpOf(inst) == machineOpFmovDx:
@@ -568,8 +588,8 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
             continue
         let offSynth: uint64 = uint64(rodata.len)
         bufU8(&rodata, uint8(0))
-        add(synthCstrNames, canonical)
-        add(synthCstrOffs, offSynth)
+        elfAddStrPtr(synthCstrNames, canonical)
+        elfAddU64Ptr(synthCstrOffs, offSynth)
 
     # Build symbol list.
     var syms: ElfSym[]
@@ -590,9 +610,19 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
         elfAddSym(syms, synthCstrNames[si], STB_LOCAL, STT_OBJECT, uint16(2),
                   synthCstrOffs[si], 0)
 
+    # locals: funcs
+    for fi in 0..<funcCount:
+        let f2: MachineFunc = elfModuleFuncAtRaw(module, fi)
+        if !elf_isPrivateFuncSym(machineFuncNameOf(f2)):
+            continue
+        elfAddSym(syms, machineFuncNameOf(f2), STB_LOCAL, STT_FUNC, uint16(1),
+                  funcOffs[fi], 0)
+
     # globals: funcs
     for fi in 0..<funcCount:
         let f2: MachineFunc = elfModuleFuncAtRaw(module, fi)
+        if elf_isPrivateFuncSym(machineFuncNameOf(f2)):
+            continue
         elfAddSym(syms, machineFuncNameOf(f2), STB_GLOBAL, STT_FUNC, uint16(1),
                   funcOffs[fi], 0)
 
@@ -619,7 +649,7 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
 
     # Build .strtab (symbol names) and fill nameOff.
     var strtab: uint8[]
-    add(strtab, uint8(0))
+    bufAddU8(strtab, uint8(0))
     for si in 0..<syms.len:
         let s3: ElfSym = syms[si]
         if void*(s3) != nil:
@@ -667,7 +697,7 @@ fn elfBuild(module: MachineModule): Result[uint8[]] =
 
     # Build .shstrtab
     var shstrtab: uint8[]
-    add(shstrtab, uint8(0))
+    bufAddU8(shstrtab, uint8(0))
     let sh_text: uint32 = uint32(shstrtab.len)
     bufStr0(&shstrtab, ".text")
     let sh_rodata: uint32 = uint32(shstrtab.len)

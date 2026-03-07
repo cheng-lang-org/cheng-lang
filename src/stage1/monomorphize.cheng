@@ -73,8 +73,9 @@ var monoProfExprKindNs: int64[]
 var monoProfExprKindCalls: int32[]
 var typeKeyCalls: int32
 var typeKeyNs: int64
-var monoTypeKeyIndex: hashmaps.HashMapPtrInt
+var monoTypeKeyIndex: int32[]
 var monoTypeKeyValues: str[]
+var monoTypeKeyValueIndex: hashmaps.HashMapStrInt
 var monoTypeNodeIndex: hashmaps.HashMapStrInt
 var monoTypeNodeValues: Node[]
 var monoTypeKeyValidIndex: hashmaps.HashMapStrInt
@@ -100,6 +101,8 @@ var stripSpacesCalls: int32
 var stripSpacesNs: int64
 var monoStripIndex: hashmaps.HashMapStrInt
 var monoStripValues: str[]
+var monoSanitizeIndex: hashmaps.HashMapStrInt
+var monoSanitizeValues: str[]
 var monoUnderscoreIndex: hashmaps.HashMapStrInt
 var monoLambdaCaptureIndex: hashmaps.HashMapPtrInt
 var monoLambdaCaptureValues: int8[]
@@ -186,8 +189,12 @@ fn monoEnsureInitMaps() =
         monoTypeNodeIndex = hashmaps.hashMapStrIntInit(256)
     if monoTypeKeyValidIndex.mask == 0:
         monoTypeKeyValidIndex = hashmaps.hashMapStrIntInit(256)
+    if monoTypeKeyValueIndex.mask == 0:
+        monoTypeKeyValueIndex = hashmaps.hashMapStrIntInit(2048)
     if monoStripIndex.mask == 0:
         monoStripIndex = hashmaps.hashMapStrIntInit(2048)
+    if monoSanitizeIndex.mask == 0:
+        monoSanitizeIndex = hashmaps.hashMapStrIntInit(2048)
     if monoUnderscoreIndex.mask == 0:
         monoUnderscoreIndex = hashmaps.hashMapStrIntInit(2048)
     if monoZeroArgFnIndex.mask == 0:
@@ -2273,6 +2280,9 @@ fn instMapAdd(key: str) =
 fn monoStripSpaces(s: str): str =
     if len(s) == 0:
         return ""
+    let n: int32 = len s
+    if n > 0 && s[0] != ' ' && s[n - 1] != ' ':
+        return s
     var cached: bool = false
     let cachedIdx: int32 = hashmaps.hashMapStrIntGetEx(monoStripIndex, s, cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoStripValues.len:
@@ -2285,7 +2295,6 @@ fn monoStripSpaces(s: str): str =
     defer:
         if profOn:
             stripSpacesNs = stripSpacesNs + (cheng_monotime_ns() - startNs)
-    let n: int32 = len s
     if n <= 0:
         let emptyRes: str = ""
         trackLexStringStr(emptyRes)
@@ -2618,6 +2627,10 @@ fn sanitizeKey(s: str): str =
             break
     if !needsSanitize:
         return s
+    var cached: bool = false
+    let cachedIdx: int32 = monoHashMapStrIntGetCompat(monoSanitizeIndex, s, cached)
+    if cached && cachedIdx > 0 && cachedIdx <= monoSanitizeValues.len:
+        return get(monoSanitizeValues, cachedIdx - 1)
     var out: str = ""
     for i in 0..<n:
         let c2: char = s[i]
@@ -2627,8 +2640,33 @@ fn sanitizeKey(s: str): str =
         else:
             out = out + "_"
     if len out == 0:
-        return "anon"
+        out = "anon"
+    add(monoSanitizeValues, out)
+    let storedIdx: int32 = monoSanitizeValues.len
+    hashmaps.hashMapStrIntPut(monoSanitizeIndex, s, storedIdx)
     return out
+
+fn monoTypeKeyEnsureStored(key: str): int32 =
+    var found: bool = false
+    let cachedIdx: int32 = monoHashMapStrIntGetCompat(monoTypeKeyValueIndex, key, found)
+    if found && cachedIdx > 0 && cachedIdx <= monoTypeKeyValues.len:
+        return cachedIdx
+    trackLexStringStr(key)
+    add(monoTypeKeyValues, key)
+    let storedIdx: int32 = monoTypeKeyValues.len
+    hashmaps.hashMapStrIntPut(monoTypeKeyValueIndex, key, storedIdx)
+    return storedIdx
+
+fn monoTypeKeyEnsureNodeCache(n: Node) =
+    if !astNodeIdValid(n):
+        return
+    let needLen: int32 = int32(n) + 1
+    if needLen <= 0:
+        return
+    if monoTypeKeyIndex.cap < needLen:
+        reserve(monoTypeKeyIndex, needLen)
+    if monoTypeKeyIndex.len < needLen:
+        setLen(monoTypeKeyIndex, needLen)
 
 fn typeKeyCore(n: Node): str =
     if astRefIsNil(n):
@@ -2734,16 +2772,21 @@ fn typeKeyCore(n: Node): str =
 fn typeKey(n: Node): str =
     if astRefIsNil(n):
         return ""
-    var cached: bool = false
-    let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(monoTypeKeyIndex, int64(ptr(n)), cached)
-    if cached && cachedIdx > 0 && cachedIdx <= monoTypeKeyValues.len:
-        return get(monoTypeKeyValues, cachedIdx - 1)
+    if astNodeIdValid(n):
+        monoTypeKeyEnsureNodeCache(n)
+        let idx0: int32 = int32(n)
+        if idx0 >= 0 && idx0 < monoTypeKeyIndex.len:
+            let cachedIdx0: int32 = monoTypeKeyIndex[idx0]
+            if cachedIdx0 > 0 && cachedIdx0 <= monoTypeKeyValues.len:
+                return get(monoTypeKeyValues, cachedIdx0 - 1)
     let res: str = typeKeyCore(n)
-    trackLexStringStr(res)
-    add(monoTypeKeyValues, res)
-    let storedIdx: int32 = monoTypeKeyValues.len
-    hashmaps.hashMapPtrIntPut(&monoTypeKeyIndex, int64(ptr(n)), storedIdx)
-    return res
+    let storedIdx: int32 = monoTypeKeyEnsureStored(res)
+    if astNodeIdValid(n):
+        monoTypeKeyEnsureNodeCache(n)
+        let idx1: int32 = int32(n)
+        if idx1 >= 0 && idx1 < monoTypeKeyIndex.len:
+            monoTypeKeyIndex[idx1] = storedIdx
+    return get(monoTypeKeyValues, storedIdx - 1)
 
 fn constraintBaseName(n: Node): str =
     if astRefIsNil(n):
@@ -4530,9 +4573,14 @@ fn monomorphizeImpl(root: Node, diags: Diagnostic[]*): Node =
     hashmaps.hashMapStrIntClear(monoUnderscoreIndex)
     monoStripValues = []
     monoStripValues.cap = 256
-    hashmaps.hashMapPtrIntClear(&monoTypeKeyIndex)
+    hashmaps.hashMapStrIntClear(monoSanitizeIndex)
+    monoSanitizeValues = []
+    monoSanitizeValues.cap = 256
+    setLen(monoTypeKeyIndex, 0)
+    monoTypeKeyIndex.cap = 256
     monoTypeKeyValues = []
     monoTypeKeyValues.cap = 256
+    hashmaps.hashMapStrIntClear(monoTypeKeyValueIndex)
     hashmaps.hashMapPtrIntClear(&monoLambdaCaptureIndex)
     monoLambdaCaptureValues = []
     monoLambdaCaptureValues.cap = 128

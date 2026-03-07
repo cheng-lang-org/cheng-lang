@@ -5,9 +5,19 @@
 import backend/uir/uir_types
 import backend/uir/uir_internal/uir_core_types
 import std/os
+import std/seqs
 import std/strings
 import std/strutils
 import std/rawmem_support
+
+fn add(dst: var UirExpr[], val: UirExpr) =
+    seqs.add(dst, val)
+
+fn add(dst: var bool[], val: bool) =
+    seqs.add(dst, val)
+
+fn add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
 
 fn uirNoAliasRecursionLimit(): int32 =
     return 256
@@ -28,20 +38,28 @@ fn uirNoAliasParseBoolEnv(name: str, defaultValue: bool): bool =
 
 fn uirNoAliasInitExprSeq(n: int32): UirExpr[] =
     var out: UirExpr[]
-    for _ in 0..<n:
-        add(out, nil)
+    if n > 0:
+        setLen(out, n)
     return out
 
 fn uirNoAliasInitBoolSeq(n: int32, value: bool): bool[] =
     var out: bool[]
-    for _ in 0..<n:
-        add(out, value)
+    if n <= 0:
+        return out
+    setLen(out, n)
+    if value:
+        for i in 0..<n:
+            out[i] = true
     return out
 
 fn uirNoAliasInitI32Seq(n: int32, value: int32): int32[] =
     var out: int32[]
-    for _ in 0..<n:
-        add(out, value)
+    if n <= 0:
+        return out
+    setLen(out, n)
+    if value != 0:
+        for i in 0..<n:
+            out[i] = value
     return out
 
 fn uirNoAliasInvalidateKnown(knownValid: bool[]*) =
@@ -75,6 +93,16 @@ fn uirNoAliasIsObjSlot(func: UirCoreFunc, slot: int32): bool =
         if ol.slot == slot:
             return true
     return false
+
+fn uirNoAliasBuildObjSlotFlags(func: UirCoreFunc, localCount: int32): bool[] =
+    var flags: bool[] = uirNoAliasInitBoolSeq(localCount, false)
+    if (!uirCoreFuncIdValid(func)) || localCount <= 0:
+        return flags
+    for i in 0..<uirCoreFuncObjLocalsLen(func):
+        let ol: UirObjLocal = uirCoreFuncObjLocalAt(func, i)
+        if ol.slot >= 0 && ol.slot < localCount:
+            flags[ol.slot] = true
+    return flags
 
 fn uirNoAliasEnsureName(name: str, slot: int32): str =
     if len(name) > 0:
@@ -484,6 +512,7 @@ fn uirNoAliasRunFunc(func: UirCoreFunc,
         return false
 
     var funcChanged: bool = false
+    let objSlotFlags: bool[] = uirNoAliasBuildObjSlotFlags(func, localCount)
     let blockCount: int32 = uirCoreFuncBlocksLen(func)
     for bi in 0..<blockCount:
         let blkView: UirLowerBlock = uirCoreFuncBlockAt(func, bi)
@@ -496,7 +525,7 @@ fn uirNoAliasRunFunc(func: UirCoreFunc,
         var promotable: bool[] = uirNoAliasInitBoolSeq(localCount, true)
         let lastUse: int32[] = uirNoAliasBuildLastUse(blk, localCount)
         for si0 in 0..<localCount:
-            if uirNoAliasIsObjSlot(func, si0):
+            if si0 < objSlotFlags.len && objSlotFlags[si0]:
                 promotable[si0] = false
 
         let stmtCount: int32 = uirCoreBlockStmtsLen(blk)

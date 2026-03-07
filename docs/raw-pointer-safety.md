@@ -10,7 +10,7 @@
 
 - 新增的自举快速管线（`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`）属于编译器内部实现细节，不改变用户可见语义。
 - host darwin/arm64 的 `macho_direct_exe_writer` 仅处理后端内部对象/重定位数据，不向语言层新增任何裸指针语法入口。
-- `ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1` 仍是生产默认约束；direct-exe 路径与常规路径共享同一 no-pointer 门禁与诊断口径。
+- `ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1` 仍是生产默认约束；该兼容名 gate 当前覆盖所有用户源码模块，包含 `@importc/@exportc` 等 C ABI 声明；direct-exe 路径与常规路径共享同一 no-pointer 门禁与诊断口径。
 - Host-only strict 默认（`SELFHOST_STRICT_REBUILD=1`、`BUILD_DRIVER_STRICT_NATIVE=1`）只改变自举/driver 失败策略，不放宽 `ZRPC` 与 no-pointer 规则；driver 回退链路为硬禁用。
 - `verify_backend_opt2_impl_surface` 为优化实现面 gate，不新增任何用户层裸指针语法面，也不改变 `verify_backend_rawptr_surface_forbid`/`verify_backend_rawptr_contract` 判定口径。
 - DOD/SoA 路径在生产口径纳入 ZRPC 一致性约束：编译器内部 AST/UIR/基本块应使用 Arena + SoA 连续存储，跨节点引用使用 `int32` 索引，禁止把对象裸指针作为长期关联键暴露到优化与门禁接口。

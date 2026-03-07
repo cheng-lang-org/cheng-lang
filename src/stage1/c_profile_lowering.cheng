@@ -7,6 +7,36 @@ import stage1/ast
 import stage1/diagnostics
 import std/rawmem_support
 
+fn add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+fn add(dst: int32[]*, val: int32) =
+    seqs.add(dst, val)
+
+fn add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+fn add(dst: str[]*, val: str) =
+    seqs.add(dst, val)
+
+fn add(dst: var Node[], val: Node) =
+    seqs.add(dst, val)
+
+fn add(dst: Node[]*, val: Node) =
+    seqs.add(dst, val)
+
+fn add(dst: var Diagnostic[], val: Diagnostic) =
+    seqs.add(dst, val)
+
+fn add(dst: Diagnostic[]*, val: Diagnostic) =
+    seqs.add(dst, val)
+
+fn add(dst: var void*[], val: void*) =
+    seqs.add(dst, val)
+
+fn add(dst: void*[]*, val: void*) =
+    seqs.add(dst, val)
+
 @importc("getenv")
 fn lower_c_getenv(name: cstring): str
 
@@ -39,6 +69,33 @@ type
         expr: Node
         stmts: Node[]
         closureType: Node
+
+fn lowerParamListAppend(out: ParamList*, name: str, ty: Node, defNode: Node) =
+    if out == nil:
+        return
+    var names0: str[] = out->names
+    var types0: Node[] = out->types
+    var defaults0: Node[] = out->defaults
+    add(names0, name)
+    add(types0, ty)
+    add(defaults0, defNode)
+    out->names = names0
+    out->types = types0
+    out->defaults = defaults0
+
+fn lowerExprResultStmtAppend(out: LowerExprResult*, stmt: Node) =
+    if out == nil:
+        return
+    var stmts0: Node[] = out->stmts
+    add(stmts0, stmt)
+    out->stmts = stmts0
+
+fn lowerClosureExprStmtAppend(out: ClosureExprResult*, stmt: Node) =
+    if out == nil:
+        return
+    var stmts0: Node[] = out->stmts
+    add(stmts0, stmt)
+    out->stmts = stmts0
 
 type
     IterLoopCtx =
@@ -402,9 +459,7 @@ fn lowerParamListFromFn(fnNode: Node): ParamList =
                 typeNode = newNode(nkEmpty, nodePos(defs))
             if astRefIsNil(defNode):
                 defNode = newNode(nkEmpty, nodePos(defs))
-            add(out.names, nm)
-            add(out.types, typeNode)
-            add(out.defaults, defNode)
+            lowerParamListAppend(&out, nm, typeNode, defNode)
     return out
 
 fn lowerParamListFromType(typeNode: Node): ParamList =
@@ -437,9 +492,7 @@ fn lowerParamListFromType(typeNode: Node): ParamList =
                 typeNode2 = newNode(nkEmpty, nodePos(defs))
             if astRefIsNil(defNode):
                 defNode = newNode(nkEmpty, nodePos(defs))
-            add(out.names, nm)
-            add(out.types, typeNode2)
-            add(out.defaults, defNode)
+            lowerParamListAppend(&out, nm, typeNode2, defNode)
     return out
 
 fn lowerParamIndex(names: str[], name: str): int32 =
@@ -1045,13 +1098,13 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
         addSon(envVar, newNode(nkEmpty, nodePos(n)))
         addSon(envVar, newNode(nkEmpty, nodePos(n)))
         var outRes: ClosureExprResult = closureExprResult(newIdent(envVarName, nodePos(n)))
-        add(outRes.stmts, envVar)
+        lowerClosureExprStmtAppend(&outRes, envVar)
         for ci in 0..<capNames.len:
             let cname: str = capNames[ci]
             var asn: Node = newNode(nkAsgn, nodePos(n))
             addSon(asn, lowerMakeDot(envVarName, cname, nodePos(n)))
             addSon(asn, newIdent(cname, nodePos(n)))
-            add(outRes.stmts, asn)
+            lowerClosureExprStmtAppend(&outRes, asn)
         var addrArgs: Node[1]
         add(addrArgs, newIdent(envVarName, nodePos(n)))
         outRes.expr = lowerMakeCall("__addr", nodePos(n), addrArgs)
@@ -2093,8 +2146,8 @@ fn lowerQExpr(n: Node, fnRetType: Node, fnReturnsResult: bool): LowerExprResult 
             addSon(ifNode, body)
             var out: LowerExprResult = lowerExprResult(lowerMakeDot(resName, "value", nodePos(n)))
             lowerAppendStmts(&out.stmts, innerRes.stmts)
-            add(out.stmts, resDecl)
-            add(out.stmts, ifNode)
+            lowerExprResultStmtAppend(&out, resDecl)
+            lowerExprResultStmtAppend(&out, ifNode)
             return out
     if kidCount n == 0:
         return lowerExprResult(n)
@@ -2340,9 +2393,9 @@ fn lowerControlExpr(n: Node): LowerExprResult =
             assignStmt = lowerIfExprAssign(n, lhs)
         assignStmt = lowerControlStmt(assignStmt)
         var out: LowerExprResult = lowerExprResult(newIdent(tmpName, nodePos(n)))
-        add(out.stmts, decl)
+        lowerExprResultStmtAppend(&out, decl)
         if astRefNonNil(assignStmt):
-            add(out.stmts, assignStmt)
+            lowerExprResultStmtAppend(&out, assignStmt)
         return out
     if kidCount n == 0:
         return lowerExprResult(n)
@@ -2413,8 +2466,8 @@ fn lowerControlShortCircuitExpr(n: Node, op: str): LowerExprResult =
     addSon(ifNode, elseBody)
     var out: LowerExprResult = lowerExprResult(newIdent(tmpName, nodePos(n)))
     lowerAppendStmts(&out.stmts, resLhs.stmts)
-    add(out.stmts, decl)
-    add(out.stmts, ifNode)
+    lowerExprResultStmtAppend(&out, decl)
+    lowerExprResultStmtAppend(&out, ifNode)
     return out
 
 fn lowerControlStmt(n: Node): Node =

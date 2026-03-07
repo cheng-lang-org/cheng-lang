@@ -81,6 +81,9 @@ fn rv64_elfTargetIsDarwin(target: str): bool =
         return false
     return rv64_elfStrContains(target, "apple") || rv64_elfStrContains(target, "darwin") || rv64_elfStrContains(target, "ios")
 
+fn rv64_elfIsPrivateFuncSym(name: str): bool =
+    return strings.hasPrefix(name, "__cheng_global_init")
+
 fn rv64_elfStrCmp(a: str, b: str): int32 =
     if a == b:
         return 0
@@ -390,22 +393,24 @@ fn rv64_elfBuild(module: MachineModule): Result[uint8[]] =
 
     # Layout rodata (cstrings).
     var cSymOffs: uint64[]
-    cSymOffs.len = int(module.cstrs.len)
-    for ci in 0..<module.cstrs.len:
-        let c: MachineCString = module.cstrs[ci]
+    let cstrCount: int32 = machineModuleCstrsLen(module)
+    cSymOffs.len = int(cstrCount)
+    for ci in 0..<cstrCount:
+        let c: MachineCString = machineModuleCStringAt(module, ci)
         let off: uint64 = uint64(rodata.len)
         cSymOffs[ci] = off
         bufStr0(&rodata, c.value)
 
     # Layout globals.
     var dataSymOffs: uint64[]
-    dataSymOffs.len = int(module.globals.len)
+    let globalCount: int32 = machineModuleGlobalsLen(module)
+    dataSymOffs.len = int(globalCount)
     var bssSymOffs: uint64[]
-    bssSymOffs.len = int(module.globals.len)
+    bssSymOffs.len = int(globalCount)
     var maxDataAlign: uint64 = 1
     var maxBssAlign: uint64 = 1
-    for gi in 0..<module.globals.len:
-        let g: MachineGlobal = module.globals[gi]
+    for gi in 0..<globalCount:
+        let g: MachineGlobal = machineModuleGlobalAt(module, gi)
         let align: uint64 = uint64(1) << uint64(g.alignPow2)
         if g.hasInit:
             if align > maxDataAlign:
@@ -428,19 +433,20 @@ fn rv64_elfBuild(module: MachineModule): Result[uint8[]] =
 
     # Track function start offsets.
     var funcOffs: uint64[]
-    funcOffs.len = int(module.funcs.len)
-    for fi in 0..<module.funcs.len:
+    funcOffs.len = int(machineModuleFuncsLen(module))
+    for fi in 0..<machineModuleFuncsLen(module):
         bufAlign(text, 4)
         funcOffs[fi] = uint64(text.len)
-        let f: MachineFunc = module.funcs[fi]
+        let f: MachineFunc = machineModuleFuncAt(module, fi)
 
         # Pass 1: compute label offsets within this function (in bytes from func start).
         var labels: str[]
         var labelOffs: int32[]
         var scanOff: int32 = 0
         var scanLastFCmpValid: bool = false
-        for si in 0..<f.insts.len:
-            let inst0: MachineInst = f.insts[si]
+        let instCount: int32 = machineFuncInstsLen(f)
+        for si in 0..<instCount:
+            let inst0: MachineInst = machineFuncInstAt(f, si)
             if inst0.op == machineOpLabel:
                 add(labels, inst0.label)
                 add(labelOffs, scanOff)
@@ -467,10 +473,10 @@ fn rv64_elfBuild(module: MachineModule): Result[uint8[]] =
         var lastFCmpValid: bool = false
         var lastFCmpFs1: int32 = 0
         var lastFCmpFs2: int32 = 0
-        for __for_guard_ii in 0..<f.insts.len:
-            if !(ii < f.insts.len):
+        for __for_guard_ii in 0..<instCount:
+            if !(ii < instCount):
                 break
-            let inst: MachineInst = f.insts[ii]
+            let inst: MachineInst = machineFuncInstAt(f, ii)
             if inst.op == machineOpLabel:
                 ii = ii + 1
                 continue
@@ -1033,20 +1039,30 @@ fn rv64_elfBuild(module: MachineModule): Result[uint8[]] =
     rv64_elfAddSectionSym(syms, uint16(4))
 
     # local rodata symbols
-    for ci in 0..<module.cstrs.len:
-        let c2: MachineCString = module.cstrs[ci]
+    for ci in 0..<cstrCount:
+        let c2: MachineCString = machineModuleCStringAt(module, ci)
         rv64_elfAddSym(syms, c2.label, RV64_STB_LOCAL, RV64_STT_OBJECT, uint16(2),
                   cSymOffs[ci], 0)
 
+    # locals: funcs
+    for fi in 0..<machineModuleFuncsLen(module):
+        let f2: MachineFunc = machineModuleFuncAt(module, fi)
+        if !rv64_elfIsPrivateFuncSym(f2.name):
+            continue
+        rv64_elfAddSym(syms, f2.name, RV64_STB_LOCAL, RV64_STT_FUNC, uint16(1),
+                  funcOffs[fi], 0)
+
     # globals: funcs
-    for fi in 0..<module.funcs.len:
-        let f2: MachineFunc = module.funcs[fi]
+    for fi in 0..<machineModuleFuncsLen(module):
+        let f2: MachineFunc = machineModuleFuncAt(module, fi)
+        if rv64_elfIsPrivateFuncSym(f2.name):
+            continue
         rv64_elfAddSym(syms, f2.name, RV64_STB_GLOBAL, RV64_STT_FUNC, uint16(1),
                   funcOffs[fi], 0)
 
     # globals: data/bss
-    for gi in 0..<module.globals.len:
-        let g2: MachineGlobal = module.globals[gi]
+    for gi in 0..<globalCount:
+        let g2: MachineGlobal = machineModuleGlobalAt(module, gi)
         if g2.hasInit:
             rv64_elfAddSym(syms, g2.name, RV64_STB_GLOBAL, RV64_STT_OBJECT, uint16(3),
                       dataSymOffs[gi], uint64(g2.size))
@@ -1067,7 +1083,7 @@ fn rv64_elfBuild(module: MachineModule): Result[uint8[]] =
 
     # Build .strtab (symbol names) and fill nameOff.
     var strtab: uint8[]
-    add(strtab, uint8(0))
+    bufAddU8(strtab, uint8(0))
     for si in 0..<syms.len:
         let s3: ElfSym = syms[si]
         if void*(s3) != nil:
@@ -1115,7 +1131,7 @@ fn rv64_elfBuild(module: MachineModule): Result[uint8[]] =
 
     # Build .shstrtab
     var shstrtab: uint8[]
-    add(shstrtab, uint8(0))
+    bufAddU8(shstrtab, uint8(0))
     let sh_text: uint32 = uint32(shstrtab.len)
     bufStr0(&shstrtab, ".text")
     let sh_rodata: uint32 = uint32(shstrtab.len)

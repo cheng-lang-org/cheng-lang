@@ -9,7 +9,7 @@
 - 禁止字符串路径导入、相对路径导入、绝对路径导入。
 - 禁止路径中空格。
 - 允许前缀合并导入：`import libp2p/[crypto,transport,swarm]`；分组不支持 `as`。
-- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）下，非 C ABI 模块默认禁指针；C ABI bridge 模块按策略豁免。
+- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）下，用户源码模块默认禁指针；`@importc/@exportc` 等 C ABI 声明不再豁免。
 - 禁用指针类型：`T*`、`void*`、`ref T`、`ptr[T]`。
 - 禁用指针操作：`&`、`*`、`->`、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
 

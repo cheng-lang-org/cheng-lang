@@ -1,6 +1,6 @@
 # token.cheng
 # Stage1 token definitions (ported from stage0/token).
-import std/strings
+import std/rawmem_support
 
 type
     TokenKind = enum
@@ -9,11 +9,140 @@ type
 
     Token =
         kind: TokenKind
-        lexeme: str
+        lexemeId: int32
         ## Only for tkString: records source prefix ('r'/'f'); no prefix => '\0'.
         strPrefix: char
         line: int32
         col: int32
+
+var
+    tokenTextPool: str[]
+    tokenTextPoolReady: bool
+
+fn initTokenTextPool() =
+    if tokenTextPoolReady:
+        return
+    tokenTextPool.buffer = nil
+    tokenTextPool.len = 0
+    tokenTextPool.cap = 0
+    tokenTextPoolReady = true
+
+fn tokenTextPoolPtrAt(idx: int32): str* =
+    if !tokenTextPoolReady:
+        return nil
+    if tokenTextPool.buffer == nil:
+        return nil
+    if idx < 0 || idx >= tokenTextPool.len:
+        return nil
+    let off64: int64 = int64(idx) * sizeof str
+    return str*(rawmemPtrAdd(tokenTextPool.buffer, int32(off64)))
+
+fn tokenTextPoolAppend(text: str): int32 =
+    initTokenTextPool()
+    let idx: int32 = tokenTextPool.len
+    let needLen: int32 = idx + 1
+    if tokenTextPool.buffer == nil || tokenTextPool.cap < needLen:
+        cheng__seqGrowToRaw(&tokenTextPool.buffer, &tokenTextPool.cap, needLen, int32(sizeof str))
+    tokenTextPool.len = needLen
+    let dst: str* = tokenTextPoolPtrAt(idx)
+    if dst == nil:
+        tokenTextPool.len = idx
+        return -1
+    *dst = text
+    if len(text) > 0:
+        memScopeEscape(void*(text))
+        memRetain(void*(text))
+    return idx
+
+fn tokenResetTextPool() =
+    if tokenTextPoolReady:
+        var i: int32 = 0
+        while i < tokenTextPool.len:
+            let textPtr: str* = tokenTextPoolPtrAt(i)
+            let text: str = (textPtr == nil) ? "" : *textPtr
+            if len(text) > 0 && void*(text) != nil:
+                memRelease(void*(text))
+            i = i + 1
+        if tokenTextPool.buffer != nil:
+            memRelease(tokenTextPool.buffer)
+    tokenTextPool.buffer = nil
+    tokenTextPool.len = 0
+    tokenTextPool.cap = 0
+    tokenTextPoolReady = false
+    initTokenTextPool()
+
+fn tokenCloneRange(source: str, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    let out: void* = alloc(count + 1)
+    if out == nil:
+        return ""
+    var i: int32 = 0
+    while i < count:
+        str(out)[i] = source[start + i]
+        i = i + 1
+    str(out)[count] = char(0)
+    return str(out)
+
+fn tokenInternText(text: str): int32 =
+    initTokenTextPool()
+    let n: int32 = len(text)
+    if n <= 0:
+        return 0
+    let copied: str = tokenCloneRange(text, 0, n)
+    if len(copied) == 0:
+        return 0
+    let idx: int32 = tokenTextPoolAppend(copied)
+    if idx < 0:
+        return 0
+    return idx + 1
+
+fn tokenInternRange(source: str, start: int32, count: int32): int32 =
+    initTokenTextPool()
+    if count <= 0:
+        return 0
+    let copied: str = tokenCloneRange(source, start, count)
+    if len(copied) == 0:
+        return 0
+    let idx: int32 = tokenTextPoolAppend(copied)
+    if idx < 0:
+        return 0
+    return idx + 1
+
+fn tokenTextById(id: int32): str =
+    if id <= 0:
+        return ""
+    if !tokenTextPoolReady:
+        return ""
+    let idx: int32 = id - 1
+    let textPtr: str* = tokenTextPoolPtrAt(idx)
+    if textPtr == nil:
+        return ""
+    return *textPtr
+
+fn tokenLexeme(tok: Token): str =
+    return tokenTextById(tok.lexemeId)
+
+fn tokenLexeme(tok: Token*): str =
+    if tok == nil:
+        return ""
+    return tokenTextById(tok->lexemeId)
+
+fn tokenSetLexeme(tok: Token*, text: str) =
+    if tok == nil:
+        return
+    tok->lexemeId = tokenInternText(text)
+
+fn tokenSetLexemeRange(tok: Token*, source: str, start: int32, count: int32) =
+    if tok == nil:
+        return
+    tok->lexemeId = tokenInternRange(source, start, count)
+
+fn tokenLexemeEq(tok: Token, lit: str): bool =
+    return tokenLexeme(tok) == lit
+
+fn tokenLexemeEq(tok: Token*, lit: str): bool =
+    return tokenLexeme(tok) == lit
 
 fn kindName(k: TokenKind): str =
     var out: str = "unknown"
@@ -35,16 +164,40 @@ fn kindName(k: TokenKind): str =
 fn newToken(kind: TokenKind, lexeme: str, line: int32, col: int32, strPrefix: char): Token =
     var t: Token
     t.kind = kind
-    t.lexeme = lexeme
+    tokenSetLexeme(&t, lexeme)
     t.strPrefix = strPrefix
     t.line = line
     t.col = col
     return t
 
+fn tokenInit(tok: Token*, kind: TokenKind, lexeme: str, line: int32, col: int32, strPrefix: char) =
+    if tok == nil:
+        return
+    tok->kind = kind
+    tokenSetLexeme(tok, lexeme)
+    tok->strPrefix = strPrefix
+    tok->line = line
+    tok->col = col
+
+fn tokenInit(tok: Token*, kind: TokenKind, lexeme: str, line: int32, col: int32) =
+    tokenInit(tok, kind, lexeme, line, col, chr 0)
+
+fn tokenInitRange(tok: Token*, kind: TokenKind, source: str, start: int32, count: int32, line: int32, col: int32, strPrefix: char) =
+    if tok == nil:
+        return
+    tok->kind = kind
+    tokenSetLexemeRange(tok, source, start, count)
+    tok->strPrefix = strPrefix
+    tok->line = line
+    tok->col = col
+
+fn tokenInitRange(tok: Token*, kind: TokenKind, source: str, start: int32, count: int32, line: int32, col: int32) =
+    tokenInitRange(tok, kind, source, start, count, line, col, chr 0)
+
 fn newToken(kind: TokenKind, lexeme: str, line: int32, col: int32): Token =
     var t: Token
     t.kind = kind
-    t.lexeme = lexeme
+    tokenSetLexeme(&t, lexeme)
     t.strPrefix = chr 0
     t.line = line
     t.col = col

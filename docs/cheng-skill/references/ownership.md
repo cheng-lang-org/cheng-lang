@@ -8,7 +8,7 @@
 - 严格模式只读 ownership 标注，不回退启发式。
 - `memRetain/memRelease` 仅改 refcount；refcount==0 立即释放并移除。
 - RC 默认原子实现（可用 `MM_ATOMIC=0` 关闭以换取性能/单线程）；跨线程共享仍需 `share_mt/Arc[T]` 与 `Send/Sync` 边界检查。
-- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）下，非 C ABI 模块默认禁指针；仅 C ABI bridge 模块按策略豁免。
+- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）下，用户源码模块默认禁指针；`@importc/@exportc` 等 C ABI 声明不再豁免。
 - 禁用指针类型：`T*`、`void*`、`ref T`、`ptr[T]`。
 - 禁用指针操作：`&`、`*`、`->`、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
 

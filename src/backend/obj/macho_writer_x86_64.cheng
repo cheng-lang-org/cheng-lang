@@ -28,6 +28,15 @@ type
         nextOff: int32
         label: str
 
+fn mx64PersistStr(value: str): str =
+    if len(value) <= 0:
+        return ""
+    var out: str = ""
+    for i in 0..<len(value):
+        out = out + charToStr(value[i])
+    memRetain(void*(out))
+    return out
+
 const
     MX64_MH_MAGIC_64: uint32 = 0xFEEDFACF
     MX64_CPU_TYPE_X86_64: uint32 = 0x01000007
@@ -81,6 +90,9 @@ fn mx64_targetIsDarwin(target: str): bool =
 
 fn mx64_symPrefix(target: str): str =
     return mx64_targetIsDarwin(target) ? "_" : ""
+
+fn mx64_isPrivateFuncSym(name: str): bool =
+    return strings.hasPrefix(name, "__cheng_global_init")
 
 fn mx64_strCmp(a: str, b: str): int32 =
     if void*(a) == nil && void*(b) == nil:
@@ -184,7 +196,7 @@ fn mx64_readStrPtr(items: var str[], idx: int32): str =
 fn mx64_writeStrPtr(items: var str[], idx: int32, val: str) =
     if void*(items) == nil:
         panic "macho_writer_x86_64: nil seq pointer"
-    items[int(idx)] = val
+    items[int(idx)] = len(val) > 0 ? mx64PersistStr(val) : ""
 
 fn mx64_addStrPtr(items: var str[], value: str) =
     if void*(items) == nil:
@@ -255,33 +267,46 @@ fn mx64_sortStringsStable(items: var str[]) =
         mx64_writeStrPtr(items, j + 1, key)
 
 fn mx64_seqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
-    return items[int(idx)]
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    let elemBytes: int32 = idx * int32(sizeof MachineFunc)
+    let readPtr: MachineFunc* = MachineFunc*(ptr_add(items.buffer, elemBytes))
+    return *readPtr
 
 fn mx64_seqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
-    return items[int(idx)]
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    let elemBytes: int32 = idx * int32(sizeof MachineGlobal)
+    let readPtr: MachineGlobal* = MachineGlobal*(ptr_add(items.buffer, elemBytes))
+    return *readPtr
 
 fn mx64_seqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
-    return items[int(idx)]
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    let elemBytes: int32 = idx * int32(sizeof MachineInst)
+    let readPtr: MachineInst* = MachineInst*(ptr_add(items.buffer, elemBytes))
+    return *readPtr
 
 fn mx64_moduleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
     if void*(mod) == nil:
         return nil
-    return mx64_seqAtMachineFunc(mod.funcs, idx)
+    return machineModuleFuncAt(mod, idx)
 
 fn mx64_moduleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
+    var zero: MachineCString
     if void*(mod) == nil:
-        return nil
+        return zero
     return machineModuleCStringAt(mod, idx)
 
 fn mx64_moduleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
     if void*(mod) == nil:
         return nil
-    return mx64_seqAtMachineGlobal(mod.globals, idx)
+    return machineModuleGlobalAt(mod, idx)
 
 fn mx64_funcInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
     if void*(func) == nil:
         return nil
-    return mx64_seqAtMachineInst(func.insts, idx)
+    return machineFuncInstAt(func, idx)
 
 fn mx64_alignUp(value: uint64, align: uint64): uint64 =
     if align == 0:
@@ -294,7 +319,7 @@ fn mx64_alignUp(value: uint64, align: uint64): uint64 =
 fn mx64_addSym(outSyms: MachoX64Sym[], name: str, nType: uint8, nSect: uint8, nValue: uint64): MachoX64Sym[] =
     var s: MachoX64Sym
     new s
-    s.name = name
+    s.name = mx64PersistStr(name)
     s.nType = nType
     s.nSect = nSect
     s.nDesc = uint16(0)
@@ -342,6 +367,28 @@ fn mx64_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
         if (labels[i] == label):
             return Ok[int32](offs[i])
     return Err[int32]("macho_writer_x86_64: missing label: " + label)
+
+fn mx64_inferFuncExportNameFromLabel(label: str): str =
+    let n: int32 = len(label)
+    if n <= 0:
+        return ""
+    if n >= 2:
+        for j in 0..n - 2:
+            if label[j] == '_' && label[j + 1] == '_':
+                if j <= 0:
+                    return ""
+                return strings.sliceBytes(label, 0, j)
+    return label
+
+fn mx64_resolveFuncExportName(func: MachineFunc, labels: str[]): str =
+    let directName: str = machineFuncNameOf(func)
+    if len(directName) > 0:
+        return directName
+    for i in 0..<labels.len:
+        let inferred: str = mx64_inferFuncExportNameFromLabel(labels[i])
+        if len(inferred) > 0:
+            return inferred
+    return ""
 
 fn x64Is64(reg: MachineReg): bool =
     case reg
@@ -757,7 +804,8 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # Layout cstrings.
     var cSymOffs: uint64[]
     mx64_seqInitEmpty_uint64(&cSymOffs)
-    cSymOffs.len = int(machineModuleCstrsLen(module))
+    reserve(cSymOffs, int(machineModuleCstrsLen(module)))
+    setLen(cSymOffs, int(machineModuleCstrsLen(module)))
     for ci in 0..<machineModuleCstrsLen(module):
         let c: MachineCString = mx64_moduleCStringAtRaw(module, ci)
         let off: uint64 = uint64(cstring.len)
@@ -767,10 +815,12 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # Layout globals.
     var dataSymOffs: uint64[]
     mx64_seqInitEmpty_uint64(&dataSymOffs)
-    dataSymOffs.len = int(machineModuleGlobalsLen(module))
+    reserve(dataSymOffs, int(machineModuleGlobalsLen(module)))
+    setLen(dataSymOffs, int(machineModuleGlobalsLen(module)))
     var bssSymOffs: uint64[]
     mx64_seqInitEmpty_uint64(&bssSymOffs)
-    bssSymOffs.len = int(machineModuleGlobalsLen(module))
+    reserve(bssSymOffs, int(machineModuleGlobalsLen(module)))
+    setLen(bssSymOffs, int(machineModuleGlobalsLen(module)))
     var maxDataAlignPow2: int32 = 0
     var maxBssAlignPow2: int32 = 0
     for gi in 0..<machineModuleGlobalsLen(module):
@@ -797,9 +847,14 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # Encode .text and collect relocations.
     var relocs: MachoX64Reloc[]
     var funcOffs: uint64[]
+    var funcSymNames: str[]
     mx64_seqInitEmpty_MachoX64Reloc(&relocs)
     mx64_seqInitEmpty_uint64(&funcOffs)
-    funcOffs.len = int(machineModuleFuncsLen(module))
+    mx64_seqInitEmpty_str(&funcSymNames)
+    reserve(funcOffs, int(machineModuleFuncsLen(module)))
+    setLen(funcOffs, int(machineModuleFuncsLen(module)))
+    reserve(funcSymNames, int(machineModuleFuncsLen(module)))
+    setLen(funcSymNames, int(machineModuleFuncsLen(module)))
     for fi in 0..<machineModuleFuncsLen(module):
         bufAlign(text, 4)
         funcOffs[fi] = uint64(text.len)
@@ -833,7 +888,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
                 var r: MachoX64Reloc
                 new r
                 r.off = uint32(instStart + 3)
-                r.sym = machineInstLabelOf(inst)
+                r.sym = mx64PersistStr(machineInstLabelOf(inst))
                 r.rtype = X86_64_RELOC_SIGNED
                 r.pcrel = true
                 r.rlen = uint8(2)
@@ -894,7 +949,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
                 new f0
                 f0.dispOff = instStart + 1
                 f0.nextOff = int32(text.len)
-                f0.label = machineInstLabelOf(inst)
+                f0.label = mx64PersistStr(machineInstLabelOf(inst))
                 add(fixups, f0)
             of machineOpBCond:
                 let cc: uint8 = x64JccCode(machineInstCondOf(inst))
@@ -903,14 +958,14 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
                 new f1
                 f1.dispOff = instStart + 2
                 f1.nextOff = int32(text.len)
-                f1.label = machineInstLabelOf(inst)
+                f1.label = mx64PersistStr(machineInstLabelOf(inst))
                 add(fixups, f1)
             of machineOpBl:
                 x64EmitCallRel32(text)
                 var r2: MachoX64Reloc
                 new r2
                 r2.off = uint32(instStart + 1)
-                r2.sym = symPrefix + machineInstLabelOf(inst)
+                r2.sym = mx64PersistStr(symPrefix + machineInstLabelOf(inst))
                 r2.rtype = X86_64_RELOC_BRANCH
                 r2.pcrel = true
                 r2.rlen = uint8(2)
@@ -937,6 +992,8 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
                 x64EmitLoad16(text, machineInstRdOf(inst), machineInstRnOf(inst), machineInstImmOf(inst), true)
             else:
                 return Err[uint8[]]("macho_writer_x86_64: unsupported machine op (op=" + intToStr(int32(machineInstOpOf(inst))) + ")")
+
+        funcSymNames[fi] = mx64PersistStr(mx64_resolveFuncExportName(f, labels))
 
         # Patch local branches.
         for pi in 0..<fixups.len:
@@ -1019,7 +1076,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # locals: cstrings
     for ci in 0..<machineModuleCstrsLen(module):
         let c2: MachineCString = mx64_moduleCStringAtRaw(module, ci)
-        if hasCstr:
+        if hasCstr && machineCStringValid(c2) && len(machineCStringLabelOf(c2)) > 0:
             let v: uint64 = cstrAddr + cSymOffs[ci]
             syms = mx64_addSymIndexed(syms, symIndexMap, machineCStringLabelOf(c2), MX64_N_SECT, cstrSectIndex, v)
     for si in 0..<synthCstrNames.len:
@@ -1029,13 +1086,24 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
             let vSynth: uint64 = cstrAddr + synthCstrOffs[si]
             syms = mx64_addSymIndexed(syms, symIndexMap, synthCstrNames[si], MX64_N_SECT, cstrSectIndex, vSynth)
 
+    # local funcs
+    for fi in 0..<machineModuleFuncsLen(module):
+        let fnName: str = funcSymNames[fi]
+        if !mx64_isPrivateFuncSym(fnName):
+            continue
+        let vLocal: uint64 = textAddr + funcOffs[fi]
+        syms = mx64_addSymIndexed(syms, symIndexMap, symPrefix + fnName,
+                                  MX64_N_SECT, textSectIndex, vLocal)
+
     let localCount: uint32 = uint32(syms.len)
 
     # extdefs: funcs
     for fi in 0..<machineModuleFuncsLen(module):
-        let f2: MachineFunc = mx64_moduleFuncAtRaw(module, fi)
+        let fnName: str = funcSymNames[fi]
+        if mx64_isPrivateFuncSym(fnName):
+            continue
         let v2: uint64 = textAddr + funcOffs[fi]
-        syms = mx64_addSymIndexed(syms, symIndexMap, symPrefix + machineFuncNameOf(f2),
+        syms = mx64_addSymIndexed(syms, symIndexMap, symPrefix + fnName,
                                   uint8(MX64_N_SECT | MX64_N_EXT), textSectIndex, v2)
 
     # extdefs: data/bss globals
@@ -1081,7 +1149,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # Build string table and fill nameOff.
     var strtab: uint8[]
     mx64_seqInitEmpty_uint8(strtab)
-    add(strtab, uint8(0))
+    bufAddU8(strtab, uint8(0))
     for si in 0..<syms.len:
         let s0: MachoX64Sym = syms[si]
         if void*(s0) != nil:
@@ -1134,9 +1202,21 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     let stroff: uint64 = symoff + symSize
     let strsize: uint32 = uint32(strtab.len)
 
+    let finalFileSize: uint64 = stroff + uint64(strtab.len)
+    if finalFileSize > uint64(2147483647):
+        return Err[uint8[]]("macho_writer_x86_64: output too large"
+                            + " text=" + intToStr(text.len)
+                            + " cstring=" + intToStr(cstring.len)
+                            + " data=" + intToStr(data.len)
+                            + " relocs=" + intToStr(relocs.len)
+                            + " syms=" + intToStr(syms.len)
+                            + " strtab=" + intToStr(strtab.len)
+                            + " final=" + uint64ToStr(finalFileSize))
+
     # Build file.
     var out: uint8[]
     mx64_seqInitEmpty_uint8(out)
+    reserve(out, int(finalFileSize))
 
     # mach_header_64
     bufU32(out, MX64_MH_MAGIC_64)

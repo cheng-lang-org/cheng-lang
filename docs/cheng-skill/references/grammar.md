@@ -13,7 +13,7 @@
 - 对非相对/非绝对模块路径，解析器可回退尝试 `<workspace>/src/<module>.cheng`。
 - 内建字符串类型仅 `str`、`cstring`（`string` 非内建类型名）。
 - 编译器 `stage1` 主链路会显式拒绝 `string` 类型名。
-- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）下，非 C ABI 模块默认禁指针（C ABI bridge 按策略豁免）。
+- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）下，用户源码模块默认禁指针；`@importc/@exportc` 等 C ABI 声明不再豁免。
 - 禁用指针类型：`T*`、`void*`、`ref T`、`ptr[T]`。
 - 禁用指针操作：`&`、`*`、`->`、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
 - FFI 影子桥接：优先 `@ffi_map`（`T[] -> ptr/len`）、`@ffi_out_ptrs`（`out-ptr -> tuple`）、`@ffi_handle`（`void* <-> handle`）与 `@importc + var T`（borrow struct bridge）。

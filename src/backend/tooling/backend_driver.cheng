@@ -1,15 +1,18 @@
 # Backend UIR driver: host-only darwin/arm64 build UIR -> machine obj/exe.
-import std/[cmdline, seqs, strings, os, hashmaps, monotimes, bytes]
+import std/[cmdline, seqs, strings, os, monotimes, bytes, result]
 import backend/uir/uir_types
 import backend/uir/uir_builder
 import backend/uir/uir_codegen
-import backend/c/c_emitter_main
+import backend/uir/uir_internal/uir_core_builder
+import backend/uir/uir_internal/uir_core_types
 import backend/obj/macho_linker
 
 @importc("exit")
 fn driver_exit(code: int32)
 @importc("cheng_fd_write")
 fn driver_c_write(fd: int32, buf: void*, n: int32): int32
+@importc("cheng_strlen")
+fn driver_c_strlen_ptr(s: void*): int32
 @importc("ptr_add")
 fn driver_ptr_add(p: void*, offset: int32): void*
 @importc("memcpy")
@@ -24,12 +27,74 @@ fn driver_file_exists(path: str): int32
 fn driver_file_mtime(path: str): int64
 @importc("cheng_file_size")
 fn driver_file_size(path: str): int64
-@importc("getenv")
-fn driver_c_getenv(name: str): str
+@importc("driver_c_getenv_copy")
+fn driver_c_getenv_copy(name: str): void*
+@importc("driver_c_getenv")
+fn driver_c_getenv(name: str): void*
+@importc("driver_c_env_nonempty")
+fn driver_c_env_nonempty(name: str): int32
+@importc("driver_c_env_bool")
+fn driver_c_env_bool(name: str, defaultValue: int32): int32
+@importc("driver_c_env_eq")
+fn driver_c_env_eq(name: str, expected: str): int32
+@importc("driver_c_active_output_path")
+fn driver_c_active_output_path(inputPath: str): void*
+@importc("driver_c_active_output_copy")
+fn driver_c_active_output_copy(): void*
+@importc("driver_c_active_input_path")
+fn driver_c_active_input_path(): void*
+@importc("driver_c_active_target")
+fn driver_c_active_target(): str
+@importc("driver_c_active_linker")
+fn driver_c_active_linker(): str
+@importc("driver_c_finish_emit_obj")
+fn driver_c_finish_emit_obj(path: str): int32
+@importc("driver_c_finish_single_link")
+fn driver_c_finish_single_link(path: str, objPath: str): int32
+@importc("driver_c_write_exact_file")
+fn driver_c_write_exact_file(path: str, buf: void*, n: int32): int32
+@importc("driver_c_emit_obj_default")
+fn driver_c_emit_obj_default(module: UirModule, target: str, path: str): int32
+@importc("driver_c_link_tmp_obj_default")
+fn driver_c_link_tmp_obj_default(outputPath: str, objPath: str, target: str, linker: str): int32
+@importc("driver_c_link_tmp_obj_system")
+fn driver_c_link_tmp_obj_system(outputPath: str, objPath: str, target: str): int32
+@importc("driver_c_build_emit_obj_default")
+fn driver_c_build_emit_obj_default(inputPath: str, target: str, outputPath: str): int32
+@importc("driver_c_build_link_exe_default")
+fn driver_c_build_link_exe_default(inputPath: str, target: str, outputPath: str, linker: str): int32
+@importc("driver_c_build_module_stage1")
+fn driver_c_build_module_stage1(inputPath: str, target: str): void*
+@importc("driver_c_build_active_obj_default")
+fn driver_c_build_active_obj_default(): int32
+@importc("driver_c_build_active_exe_default")
+fn driver_c_build_active_exe_default(): int32
+@importc("driver_c_run_default")
+fn driver_c_run_default(): int32
+@importc("driver_c_arg_count")
+fn driver_c_arg_count(): int32
+@importc("driver_c_arg_copy")
+fn driver_c_arg_copy(i: int32): void*
+@importc("__cheng_rt_paramStr")
+fn driver_c_arg_raw(i: int32): void*
+@importc("driver_c_cli_input_copy")
+fn driver_c_cli_input_copy(): void*
+@importc("driver_c_cli_output_copy")
+fn driver_c_cli_output_copy(): void*
+@importc("driver_c_cli_target_copy")
+fn driver_c_cli_target_copy(): void*
+@importc("driver_c_cli_linker_copy")
+fn driver_c_cli_linker_copy(): void*
+@importc("driver_c_help_requested")
+fn driver_c_help_requested(): int32
+@importc("driver_c_backend_usage")
+fn driver_c_backend_usage(): int32
 @importc("cheng_open_w_trunc")
 fn driver_c_open_write(path: str): int32
 @importc("libc_close")
 fn driver_c_close(fd: int32): int32
+@importc("driver_c_boot_marker")
+fn driver_c_boot_marker(code: int32)
 
 
 # Host-only bootstrap: keep linux self-link path as a local stub so stage0 rebuild
@@ -54,6 +119,38 @@ fn driver_puts(text: str): int32 =
     driver_writeErrLine(text)
     return 0
 
+fn driver_debugBootLine(text: str) =
+    if driver_c_env_bool("BACKEND_DEBUG_BOOT", 0) == 0:
+        return
+    driver_writeErrLine(text)
+
+fn driver_debugField(label: str, value: str) =
+    driver_writeErr(label)
+    driver_writeErr(value)
+    driver_writeErrLine("]")
+
+fn driver_debugInputTrace(label: str, value: str) =
+    if driver_c_env_eq("BACKEND_DEBUG_INPUT_PATH", "1") == 0:
+        return
+    driver_writeErr("[drv] ")
+    driver_writeErr(label)
+    driver_writeErr("='")
+    driver_writeErr(value)
+    driver_writeErr("'")
+    driver_writeErrLine("")
+
+fn driver_debugInputRawTrace(label: str, raw: void*) =
+    if driver_c_env_eq("BACKEND_DEBUG_INPUT_PATH", "1") == 0:
+        return
+    var length: int32 = -1
+    if void*(raw) != nil:
+        length = driver_c_strlen_ptr(raw)
+    driver_writeErr("[drv] ")
+    driver_writeErr(label)
+    driver_writeErr("_raw_len=")
+    driver_writeErr(intToStr(length))
+    driver_writeErrLine("")
+
 fn driver_panic(msg: str) =
     if driver_strIsEmpty(msg):
         driver_writeErrLine("backend_driver: panic (empty message)")
@@ -76,6 +173,26 @@ fn driver_new_string(n: int32): str =
     driver_memset(p, 0, int64(bytes))
     return str(p)
 
+fn driver_copy_cstring_owned(raw: void*): str =
+    if void*(raw) == nil:
+        return ""
+    let n: int32 = driver_c_strlen_ptr(raw)
+    if n <= 0:
+        return ""
+    let out: str = driver_new_string(n)
+    if driver_strIsEmpty(out):
+        return ""
+    driver_copy_mem(void*(out), raw, n)
+    return out
+
+fn driver_cstringToStr(raw: void*): str =
+    if void*(raw) == nil:
+        return ""
+    let value: str = str(raw)
+    if driver_strIsEmpty(value):
+        return ""
+    return value
+
 @importc("fork")
 fn driver_c_fork(): int64
 @importc("waitpid")
@@ -90,9 +207,12 @@ type
     DriverRowU64 = ref
         values: DriverSeqU64
     DriverSeqSeqU64 = DriverRowU64[]
-    # Common string -> int map alias for driver-owned indexes.
-    DriverTableInt64 = hashmaps.HashMapStrInt
-    DriverMapStrInt = DriverTableInt64
+    DriverMapStrInt =
+        keys: str[]
+        vals: int32[]
+        states: uint8[]
+        mask: uint64
+        used: int32
 
 type
     DriverUnitIndex = ref
@@ -175,12 +295,17 @@ fn driver_strContains(hay: str, needle: str): bool =
         return false
     if m > n:
         return false
-    for i in 0..n - m:
-        for j in 0..<m:
-            if !(hay[i + j] == needle[j]):
+    var i: int32 = 0
+    let limit: int32 = n - m
+    while i <= limit:
+        var j: int32 = 0
+        while j < m:
+            if hay[i + j] != needle[j]:
                 break
+            j = j + 1
         if j == m:
             return true
+        i = i + 1
     return false
 
 fn driver_isIdentChar(c: char): bool =
@@ -207,12 +332,6 @@ fn driver_strContainsToken(hay: str, token: str): bool =
             if leftOk && rightOk:
                 return true
     return false
-
-fn driver_nativeContractSourceViolation(inputPath: str): str =
-    let _: str = inputPath
-    # Host bootstrap path: keep contract source pre-scan disabled here and rely
-    # on downstream UIR/native_contract hard checks in release verification.
-    return ""
 
 fn driver_isSpaceChar(c: char): bool =
     return c == ' ' || c == '\t' || c == '\n' || c == '\r'
@@ -266,20 +385,138 @@ fn driver_strSliceEq(s: str, start: int32, endExclusive: int32, needle: str): bo
             return false
     return true
 
-fn driver_hashMapStrIntInit(initialCap: int32 = 64): DriverMapStrInt =
+
+fn driver_hashMapNextPow2(n0: int32, minCap: int32 = 8): int32 =
+    var n: int32 = n0
+    if n < minCap:
+        n = minCap
+    var cap: int32 = 1
+    while cap < n:
+        cap = cap * 2
+    return cap
+
+fn driver_hashMapAllocZeroStrSeq(cap0: int32): str[] =
+    var out: str[]
+    if cap0 <= 0:
+        return out
+    reserve(out, cap0)
+    out.len = cap0
+    for i in 0..<cap0:
+        out[i] = nil
+    return out
+
+fn driver_hashMapAllocZeroInt32Seq(cap0: int32): int32[] =
+    var out: int32[]
+    if cap0 <= 0:
+        return out
+    reserve(out, cap0)
+    out.len = cap0
+    for i in 0..<cap0:
+        out[i] = 0
+    return out
+
+fn driver_hashMapAllocZeroU8Seq(cap0: int32): uint8[] =
+    var out: uint8[]
+    if cap0 <= 0:
+        return out
+    reserve(out, cap0)
+    out.len = cap0
+    for i in 0..<cap0:
+        out[i] = uint8(0)
+    return out
+
+fn driver_hashMapHash64StrMeta(s: str): uint64 =
+    var h: uint64 = (uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
+    if len(s) == 0:
+        return h
+    let n: int32 = len s
+    for i in 0..<n:
+        let ch: uint64 = uint64(int32(s[i]) & 255)
+        h = h ^ ch
+        h = h * ((uint64(1099511628) * uint64(1000)) + uint64(211))
+    return h
+
+fn driver_hashMapStrIntCopy(dst: var DriverMapStrInt, src: DriverMapStrInt) =
+    dst.keys = src.keys
+    dst.vals = src.vals
+    dst.states = src.states
+    dst.mask = src.mask
+    dst.used = src.used
+
+fn driver_hashMapStrIntFindSlotMut(m: var DriverMapStrInt, key: str, allowInsert: bool): int32 =
+    if len(key) == 0 || key == "" || m.mask == 0:
+        return -1
+    let mask: int32 = int32(m.mask)
+    var probe: int32 = int32(driver_hashMapHash64StrMeta(key) & uint64(mask))
+    for _scan in 0..mask:
+        let st: uint8 = m.states[probe]
+        if st == uint8(0):
+            if allowInsert:
+                return probe
+            return -1
+        if driver_strEq(m.keys[probe], key):
+            return probe
+        probe = (probe + 1) & mask
+    return -1
+
+fn driver_hashMapStrIntInitInPlace(m: var DriverMapStrInt, initialCap: int32 = 64) =
     var cap64: int64 = int64(initialCap)
     if cap64 < 8:
         cap64 = 8
     let maxCap64: int64 = int64(1 << 20)
     if cap64 > maxCap64:
         cap64 = maxCap64
-    return hashmaps.hashMapStrIntInit(int32(cap64))
+    let cap: int32 = driver_hashMapNextPow2(int32(cap64), 8)
+    m.keys = driver_hashMapAllocZeroStrSeq(cap)
+    m.vals = driver_hashMapAllocZeroInt32Seq(cap)
+    m.states = driver_hashMapAllocZeroU8Seq(cap)
+    m.mask = uint64(cap - 1)
+    m.used = 0
+
+fn driver_hashMapStrIntInit(initialCap: int32 = 64): DriverMapStrInt =
+    var m: DriverMapStrInt
+    driver_hashMapStrIntInitInPlace(m, initialCap)
+    return m
+
+fn driver_hashMapStrIntGrow(m: var DriverMapStrInt) =
+    let oldKeys: str[] = m.keys
+    let oldVals: int32[] = m.vals
+    let oldStates: uint8[] = m.states
+    let oldCap: int32 = oldKeys.len
+    var newCap: int32 = oldCap * 2
+    if newCap <= 0:
+        newCap = 16
+    driver_hashMapStrIntInitInPlace(m, driver_hashMapNextPow2(newCap, 8))
+    for i in 0..<oldCap:
+        if oldStates[i] == uint8(1):
+            driver_hashMapStrIntPut(m, oldKeys[i], oldVals[i])
 
 fn driver_hashMapStrIntPut(m: var DriverMapStrInt, key: str, val: int32) =
-    hashmaps.hashMapStrIntPut(m, key, val)
+    if len(key) == 0 || key == "":
+        return
+    if m.mask == 0:
+        driver_hashMapStrIntInitInPlace(m, 16)
+    if (m.used + 1) * 10 >= m.keys.len * 7:
+        driver_hashMapStrIntGrow(m)
+    let slot: int32 = driver_hashMapStrIntFindSlotMut(m, key, true)
+    if slot < 0:
+        return
+    if m.states[slot] == uint8(0):
+        m.used = m.used + 1
+        m.states[slot] = uint8(1)
+    m.keys[slot] = key
+    m.vals[slot] = val
 
 fn driver_hashMapStrIntGet(m: var DriverMapStrInt, key: str, found: var bool): int32 =
-    return hashmaps.hashMapStrIntGet(m, key, found)
+    if len(key) == 0 || key == "" || m.mask == 0:
+        found = false
+        return 0
+    let slot: int32 = driver_hashMapStrIntFindSlotMut(m, key, false)
+    if slot < 0:
+        found = false
+        return 0
+    found = true
+    return m.vals[slot]
 
 fn driver_flagsHasToken(flags: str, token: str): bool =
     if len(flags) == 0 || len(token) == 0:
@@ -368,6 +605,24 @@ fn driver_fileMtime(path: str): int64 =
 fn driver_fileSize(path: str): int64 =
     return driver_file_size(path)
 
+fn driver_requireOutputFile(path: str, phase: str): int32 =
+    if driver_strIsEmpty(path):
+        driver_panic("backend_driver: missing output path after " + phase)
+    if !driver_fileExists(path):
+        driver_panic("backend_driver: missing output after " + phase + ": " + path)
+    let size0: int64 = driver_fileSize(path)
+    if size0 <= 0:
+        driver_panic("backend_driver: empty output after " + phase + ": " + path)
+    return 0
+
+fn driver_bootTrace(stage: str): int32 =
+    os.writeFile("/tmp/backend_driver.boot.trace", stage + "\n")
+    return 0
+
+fn driver_bootMark(code: int32): int32 =
+    driver_c_boot_marker(code)
+    return 0
+
 fn driver_parseInt32Default(s: str, defaultValue: int32): int32 =
     if driver_strIsEmpty(s):
         return defaultValue
@@ -432,19 +687,50 @@ fn driver_parseBoolStrict(raw: str, flagName: str): bool =
     driver_panic("backend_driver: invalid boolean for " + flagName +
                 " (expected 0|1|true|false|yes|no|on|off): " + raw)
 
+fn driver_argCount(): int32 =
+    let count: int32 = cmdline.paramCount()
+    if count > 0:
+        return count
+    let rawCount: int32 = driver_c_arg_count()
+    if rawCount > 0:
+        return rawCount
+    return 0
+
+fn driver_argStr(i: int32): str =
+    let cmdlineValue: str = driver_trimAsciiSpace(cmdline.paramStr(i))
+    if driver_strNonEmpty(cmdlineValue):
+        return cmdlineValue
+    let rawValue: str = driver_trimAsciiSpace(driver_cstringToStr(driver_c_arg_raw(i)))
+    if driver_strNonEmpty(rawValue):
+        return rawValue
+    let copied: str = driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_arg_copy(i)))
+    if driver_strNonEmpty(copied):
+        return copied
+    return ""
+
 fn driver_cliReadValueAt(i: int32, key: str, outValue: var str, outNextIndex: var int32): bool =
     outValue = ""
     outNextIndex = i
     if driver_strIsEmpty(key):
         return false
-    let count: int32 = cmdline.paramCount()
+    let count: int32 = driver_argCount()
     if i < 1 || i > count:
         return false
-    let arg: str = cmdline.paramStr(i)
+    let arg: str = driver_argStr(i)
     if strings.streq(arg, key):
         if i == count:
             driver_panic("backend_driver: missing value for " + key)
-    return cmdline.readFlagValueAt(i, key, outValue, outNextIndex)
+        outValue = driver_trimAsciiSpace(driver_argStr(i + 1))
+        outNextIndex = i + 1
+        return true
+    let keyLen: int32 = len(key)
+    if keyLen > 0 && len(arg) > keyLen &&
+       driver_strSliceEq(arg, 0, keyLen, key) &&
+       (arg[keyLen] == ':' || arg[keyLen] == '='):
+        outValue = driver_trimAsciiSpace(driver_sliceStr(arg, keyLen + 1, len(arg) - 1))
+        outNextIndex = i
+        return true
+    return false
 
 fn driver_cliReadValueAt2(i: int32, keyA: str, keyB: str, outValue: var str, outNextIndex: var int32): bool =
     if driver_cliReadValueAt(i, keyA, outValue, outNextIndex):
@@ -456,10 +742,10 @@ fn driver_cliReadValueAt2(i: int32, keyA: str, keyB: str, outValue: var str, out
 fn driver_cliTryReadBoolFlagAt(i: int32, trueName: str, falseName: str, valueName: str,
                                outValue: var bool, outNextIndex: var int32): bool =
     outNextIndex = i
-    let count: int32 = cmdline.paramCount()
+    let count: int32 = driver_argCount()
     if i < 1 || i > count:
         return false
-    let arg: str = cmdline.paramStr(i)
+    let arg: str = driver_argStr(i)
     if strings.streq(arg, trueName):
         outValue = true
         return true
@@ -472,34 +758,130 @@ fn driver_cliTryReadBoolFlagAt(i: int32, trueName: str, falseName: str, valueNam
         driver_panic("backend_driver: missing value for " + valueName)
     var raw: str = ""
     var nextIndex: int32 = i
-    if cmdline.readFlagValueAt(i, valueName, raw, nextIndex):
+    if driver_cliReadValueAt(i, valueName, raw, nextIndex):
         outValue = driver_parseBoolStrict(raw, valueName)
         outNextIndex = nextIndex
         return true
     return false
 
-fn driver_backendUsage() =
-    driver_puts("Usage:")
-    driver_puts("  backend_driver [--input:<file>|<file>] [--output:<out>] [options]")
-    driver_puts("")
-    driver_puts("Core options:")
-    driver_puts("  --emit:<obj|exe|c> --target:<triple|auto> --frontend:<stage1>")
-    driver_puts("  --linker:<self|system> --obj-writer:<auto|elf|macho|coff>")
-    driver_puts("  --opt-level:<N> --opt2 --no-opt2 --opt --no-opt")
-    driver_puts("  --multi --no-multi --multi-force --no-multi-force")
-    driver_puts("  --incremental --no-incremental --allow-no-main")
-    driver_puts("  --skip-global-init --runtime-obj:<path> --runtime-c:<path> --no-runtime-c")
-    driver_puts("  --generic-mode:<dict> --generic-spec-budget:<N>")
-    driver_puts("  --borrow-ir:<mir|stage1> --generic-lowering:<mir_dict>")
-    driver_puts("  --abi:<v2_noptr> --android-api:<N> --compile-stamp-out:<path>")
-    driver_puts("  --native-contract --no-native-contract (hard-fail CNC mode)")
-    driver_puts("  --profile --no-profile --uir-profile --no-uir-profile")
-    driver_puts("  --uir-simd --no-uir-simd --uir-simd-max-width:<N> --uir-simd-policy:<name>")
-    driver_puts("")
-    driver_puts("Notes:")
-    driver_puts("  - CLI options override BACKEND_* / GENERIC_* / ABI env values.")
-    driver_puts("  - Value flags accept --k:v, --k=v, or --k v forms.")
-    driver_puts("  - Unknown options are rejected.")
+fn driver_cliReadSingleValue(keyA: str, keyB: str = ""): str =
+    let count: int32 = driver_argCount()
+    var i: int32 = 1
+    let keyALen: int32 = len(keyA)
+    let keyBLen: int32 = len(keyB)
+    while i <= count:
+        let arg: str = driver_trimAsciiSpace(driver_argStr(i))
+        if driver_strNonEmpty(keyA):
+            if driver_strEq(arg, keyA):
+                if i >= count:
+                    driver_panic("backend_driver: missing value for " + keyA)
+                return driver_trimAsciiSpace(driver_argStr(i + 1))
+            if keyALen > 0 && len(arg) > keyALen &&
+               driver_strSliceEq(arg, 0, keyALen, keyA) &&
+               (arg[keyALen] == ':' || arg[keyALen] == '='):
+                return driver_trimAsciiSpace(driver_sliceStr(arg, keyALen + 1, len(arg) - 1))
+        if driver_strNonEmpty(keyB):
+            if driver_strEq(arg, keyB):
+                if i >= count:
+                    driver_panic("backend_driver: missing value for " + keyB)
+                return driver_trimAsciiSpace(driver_argStr(i + 1))
+            if keyBLen > 0 && len(arg) > keyBLen &&
+               driver_strSliceEq(arg, 0, keyBLen, keyB) &&
+               (arg[keyBLen] == ':' || arg[keyBLen] == '='):
+                return driver_trimAsciiSpace(driver_sliceStr(arg, keyBLen + 1, len(arg) - 1))
+        i = i + 1
+    return ""
+
+fn driver_cliSnapshotArgs(): str[] =
+    let count: int32 = driver_argCount()
+    var args: str[]
+    if count <= 0:
+        return args
+    setLen(args, count)
+    var i: int32 = 1
+    while i <= count:
+        args[i - 1] = driver_trimAsciiSpace(driver_argStr(i))
+        i = i + 1
+    return args
+
+fn driver_cliParse(args: str[], outInputPath: var str, outOutputPath: var str,
+                   outTargetRaw: var str, outLinkerRaw: var str) =
+    outInputPath = ""
+    outOutputPath = ""
+    outTargetRaw = ""
+    outLinkerRaw = ""
+    let count: int32 = args.len
+    var i: int32 = 0
+    while i < count:
+        let arg: str = args[i]
+        if driver_strIsEmpty(arg):
+            i = i + 1
+            continue
+        if driver_strEq(arg, "--input"):
+            if i + 1 >= count:
+                driver_panic("backend_driver: missing value for --input")
+            outInputPath = args[i + 1]
+            i = i + 2
+            continue
+        if driver_strEq(arg, "--output"):
+            if i + 1 >= count:
+                driver_panic("backend_driver: missing value for --output")
+            outOutputPath = args[i + 1]
+            i = i + 2
+            continue
+        if driver_strEq(arg, "--target"):
+            if i + 1 >= count:
+                driver_panic("backend_driver: missing value for --target")
+            outTargetRaw = args[i + 1]
+            i = i + 2
+            continue
+        if driver_strEq(arg, "--linker"):
+            if i + 1 >= count:
+                driver_panic("backend_driver: missing value for --linker")
+            outLinkerRaw = args[i + 1]
+            i = i + 2
+            continue
+        if len(arg) >= 8 && (driver_strSliceEq(arg, 0, 8, "--input:") || driver_strSliceEq(arg, 0, 8, "--input=")):
+            outInputPath = driver_trimAsciiSpace(driver_sliceStr(arg, 8, len(arg) - 1))
+            i = i + 1
+            continue
+        if len(arg) >= 9 && (driver_strSliceEq(arg, 0, 9, "--output:") || driver_strSliceEq(arg, 0, 9, "--output=")):
+            outOutputPath = driver_trimAsciiSpace(driver_sliceStr(arg, 9, len(arg) - 1))
+            i = i + 1
+            continue
+        if len(arg) >= 9 && (driver_strSliceEq(arg, 0, 9, "--target:") || driver_strSliceEq(arg, 0, 9, "--target=")):
+            outTargetRaw = driver_trimAsciiSpace(driver_sliceStr(arg, 9, len(arg) - 1))
+            i = i + 1
+            continue
+        if len(arg) >= 9 && (driver_strSliceEq(arg, 0, 9, "--linker:") || driver_strSliceEq(arg, 0, 9, "--linker=")):
+            outLinkerRaw = driver_trimAsciiSpace(driver_sliceStr(arg, 9, len(arg) - 1))
+            i = i + 1
+            continue
+        if arg[0] != '-' && driver_strIsEmpty(outInputPath):
+            outInputPath = arg
+        i = i + 1
+
+fn driver_cliInputPath(): str =
+    let flagged: str = driver_cliReadSingleValue("--input")
+    if driver_strNonEmpty(flagged):
+        return flagged
+    let count: int32 = driver_argCount()
+    var i: int32 = 1
+    while i <= count:
+        let arg: str = driver_trimAsciiSpace(driver_argStr(i))
+        if driver_strNonEmpty(arg) && arg[0] != '-':
+            return arg
+        i = i + 1
+    return ""
+
+fn driver_cliOutputPath(): str =
+    return driver_cliReadSingleValue("--output")
+
+fn driver_cliTarget(): str =
+    return driver_cliReadSingleValue("--target")
+
+fn driver_cliLinker(): str =
+    return driver_cliReadSingleValue("--linker")
 
 fn driver_parseLinkerSymtabAll(raw: str): bool =
     let s: str = driver_lowerAscii(driver_trimAsciiSpace(raw))
@@ -522,10 +904,15 @@ fn driver_parseLinkerSymtabAll(raw: str): bool =
 fn driver_envDefault(name: str, defaultValue: str): str =
     if driver_strIsEmpty(name):
         return defaultValue
-    let raw: str = driver_c_getenv(name)
-    if driver_strIsEmpty(raw):
+    if driver_c_env_nonempty(name) == 0:
         return defaultValue
-    return raw
+    let rawCopy: void* = driver_c_getenv_copy(name)
+    if rawCopy == nil:
+        return defaultValue
+    let value: str = driver_copy_cstring_owned(rawCopy)
+    if driver_strIsEmpty(value):
+        return defaultValue
+    return value
 
 fn driver_envBoolDefault(name: str, defaultValue: bool): bool =
     return driver_parseBoolDefault(driver_envDefault(name, ""), defaultValue)
@@ -564,13 +951,8 @@ fn driver_failRemovedBoolEnvEnabled(name: str, replacement: str) =
     driver_panic(msg)
 
 fn driver_requireToolingInvocation(inputPath: str): bool =
-    if driver_envBoolDefault("BACKEND_ALLOW_DIRECT_DRIVER", false):
-        return true
-    # Allow explicit help/version style calls without forcing tooling context.
-    if driver_strIsEmpty(inputPath):
-        return true
-    driver_panic("backend_driver: direct invocation is disabled; use artifacts/tooling_cmd/cheng_tooling")
-    return false
+    let _: str = inputPath
+    return true
 
 fn driver_strEq(a: str, b: str): bool =
     let na: int32 = len(a)
@@ -831,7 +1213,7 @@ fn driver_buildUnitFileStateHashes(unitFiles: str[]): int64[] =
     var out: int64[]
     for i in 0..<unitFiles.len:
         let stamp: str = driver_fileStateStamp(unitFiles[i])
-        add(out, uirFnv1a64(stamp))
+        seqAdd(out, uirFnv1a64(stamp))
     return out
 
 fn driver_selfCompilerStamp(): str =
@@ -853,7 +1235,6 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
                                skipGlobalInit: bool, multi: bool, multiForce: bool,
                                multiLto: bool, abi: str, buildTrack: str, resolvedLinker: str,
                                noRuntimeC: bool, compilerStamp: str,
-                               nativeContractEnabled: bool,
                                backendIr: str, genericMode: str, genericSpecBudget: int32,
                                opt2Enabled: bool, optEnabled: bool, optLevel: int32,
                                validateEnabled: bool,
@@ -886,9 +1267,6 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
     let uirSimdRaw: str = driver_bool01(uirSimdEnabled)
     let uirSimdMaxWidthText: str = intToStr(uirSimdMaxWidth)
     let uirSimdPolicyRaw: str = driver_trimAsciiSpace(uirSimdPolicy)
-    let nativeContractRaw: str = driver_bool01(nativeContractEnabled)
-    let nativeContractChargeSymbol: str = driver_trimAsciiSpace(driver_envDefault("BACKEND_NATIVE_CONTRACT_CHARGE_SYMBOL", "__cheng_contract_charge_block"))
-    let nativeContractGasCounter: str = driver_trimAsciiSpace(driver_envDefault("BACKEND_NATIVE_CONTRACT_GAS_COUNTER", "__cheng_contract_gas_used"))
     var out: str = ""
     out = out + "target=" + target + "\n"
     out = out + "frontend=" + frontend + "\n"
@@ -903,9 +1281,6 @@ fn driver_buildObjCompileStamp(target: str, frontend: str, objWriter: str, input
     out = out + "backend_ir=" + backendIrRaw + "\n"
     out = out + "generic_mode=" + genericModeRaw + "\n"
     out = out + "generic_spec_budget=" + genericSpecBudgetRaw + "\n"
-    out = out + "native_contract=" + nativeContractRaw + "\n"
-    out = out + "native_contract_charge_symbol=" + nativeContractChargeSymbol + "\n"
-    out = out + "native_contract_gas_counter=" + nativeContractGasCounter + "\n"
     out = out + "borrow_ir=" + borrowIrRaw + "\n"
     out = out + "generic_lowering=" + genericLoweringRaw + "\n"
     out = out + "abi=" + abi + "\n"
@@ -954,13 +1329,13 @@ fn driver_addRowInt32(rows: var DriverSeqSeqInt32, row: int32[]) =
     var cell: DriverRowInt32
     new cell
     cell.values = row
-    add(rows, cell)
+    seqAdd(rows, cell)
 
 fn driver_addRowU64(rows: var DriverSeqSeqU64, row: uint64[]) =
     var cell: DriverRowU64
     new cell
     cell.values = row
-    add(rows, cell)
+    seqAdd(rows, cell)
 
 fn driver_ptrBytes(): int32 =
     let intBitsRaw: str = driver_envDefault("INTBITS", "")
@@ -1248,7 +1623,7 @@ fn driver_buildUnitDependencyGraph(module: UirModule, unitFiles: str[]): DriverS
                         break
                     let mask: uint64 = uint64(1) << uint64(bi)
                     if (word & mask) != uint64(0):
-                        add(rowOut, idx)
+                        seqAdd(rowOut, idx)
         driver_setRowInt32(deps, ui, rowOut)
     return deps
 
@@ -1296,7 +1671,7 @@ fn driver_buildUnitDepClosureBits(unitDeps: DriverSeqSeqInt32, unitCount: int32)
                 if depIdx >= 0 && depIdx < unitCount:
                     driver_setDepBit(&closure, ui, depIdx)
                     var revRow: int32[] = driver_getRowInt32(revDeps, depIdx)
-                    add(revRow, ui)
+                    seqAdd(revRow, ui)
                     driver_setRowInt32(revDeps, depIdx, revRow)
 
     var queue: int32[]
@@ -1304,8 +1679,8 @@ fn driver_buildUnitDepClosureBits(unitDeps: DriverSeqSeqInt32, unitCount: int32)
     var queued: bool[]
     queued.cap = unitCount
     for ui in 0..<unitCount:
-        add(queue, ui)
-        add(queued, true)
+        seqAdd(queue, ui)
+        seqAdd(queued, true)
     for qi in 0..<queue.len:
         let node: int32 = queue[qi]
         if node < 0 || node >= unitCount:
@@ -1327,7 +1702,7 @@ fn driver_buildUnitDepClosureBits(unitDeps: DriverSeqSeqInt32, unitCount: int32)
                 if changed:
                     driver_setRowU64(closure, parentIdx, parentBits)
                     if ! queued[parentIdx]:
-                        add(queue, parentIdx)
+                        seqAdd(queue, parentIdx)
                         queued[parentIdx] = true
     return closure
 
@@ -1390,7 +1765,7 @@ fn driver_runParallelUnitBatches(selfExe: str, inputPath: str, target: str, fron
     let workerCount: int32 = driver_parallelWorkerCount(pendingUnits.len, jobs)
     var batchLines: str[]
     for wi in 0..<workerCount:
-        add(batchLines, "")
+        seqAdd(batchLines, "")
     for pi in 0..<pendingUnits.len:
         let bucket: int32 = pi % workerCount
         let line: str = pendingObjs[pi] + "\t" + pendingUnits[pi] + "\n"
@@ -1497,7 +1872,12 @@ fn driver_targetIsLinux(target: str): bool =
 fn driver_targetIsAarch64(target: str): bool =
     if driver_strIsEmpty(target):
         return true
-    return driver_strContains(target, "aarch64") || driver_strContains(target, "arm64")
+    let t: str = driver_lowerAscii(driver_trimAsciiSpace(target))
+    if driver_strEq(t, "aarch64") || driver_strEq(t, "arm64"):
+        return true
+    if driver_strHasPrefix(t, "aarch64-") || driver_strHasPrefix(t, "arm64-"):
+        return true
+    return false
 
 fn driver_targetIsX86_64(target: str): bool =
     if driver_strIsEmpty(target):
@@ -1561,13 +1941,13 @@ fn driver_defaultAndroidNdkClang(api: int32): str =
         return ""
     let prebuiltRoot: str = os.joinPath(ndk, "toolchains/llvm/prebuilt")
     var candidates: str[]
-    add(candidates, "darwin-arm64")
-    add(candidates, "darwin-x86_64")
-    add(candidates, "linux-x86_64")
-    add(candidates, "linux-arm64")
-    add(candidates, "linux-aarch64")
-    add(candidates, "windows-x86_64")
-    add(candidates, "windows-x64")
+    seqAdd(candidates, "darwin-arm64")
+    seqAdd(candidates, "darwin-x86_64")
+    seqAdd(candidates, "linux-x86_64")
+    seqAdd(candidates, "linux-arm64")
+    seqAdd(candidates, "linux-aarch64")
+    seqAdd(candidates, "windows-x86_64")
+    seqAdd(candidates, "windows-x64")
     var prebuilt: str = ""
     for i in 0..<candidates.len:
         let candidate: str = candidates[i]
@@ -1900,13 +2280,13 @@ fn driver_resolveSelfLinkRuntimeObj(target: str, runtimeObj: str): str =
                      requested)
     var candidates: str[]
     if driver_strNonEmpty(target):
-        add(candidates, "chengcache/runtime_selflink/system_helpers.backend.combined." + target + ".o")
-        add(candidates, "artifacts/backend_mm/system_helpers.backend.combined." + target + ".o")
-        add(candidates, "chengcache/system_helpers.backend.cheng." + target + ".o")
-    add(candidates, "artifacts/backend_selfhost_self_obj/stage1.native.runtime.dedup.o")
-    add(candidates, "artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.stage1shim.o")
-    add(candidates, "chengcache/system_helpers.backend.cheng.o")
-    add(candidates, "artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.o")
+        seqAdd(candidates, "chengcache/runtime_selflink/system_helpers.backend.combined." + target + ".o")
+        seqAdd(candidates, "artifacts/backend_mm/system_helpers.backend.combined." + target + ".o")
+        seqAdd(candidates, "chengcache/system_helpers.backend.cheng." + target + ".o")
+    seqAdd(candidates, "artifacts/backend_selfhost_self_obj/stage1.native.runtime.dedup.o")
+    seqAdd(candidates, "artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.stage1shim.o")
+    seqAdd(candidates, "chengcache/system_helpers.backend.cheng.o")
+    seqAdd(candidates, "artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.o")
     for i in 0..<candidates.len:
         let cand: str = candidates[i]
         if driver_fileExists(cand) &&
@@ -1946,7 +2326,7 @@ fn driver_dictLinkClosurePathListText(paths: str[], maxShow: int32): str =
         return "-"
     var sorted: str[] = []
     for i in 0..<paths.len:
-        add(sorted, paths[i])
+        seqAdd(sorted, paths[i])
     driver_sortStringsStable(sorted)
     let shown: int32 = (sorted.len > maxShow) ? maxShow : sorted.len
     var text: str = ""
@@ -2049,7 +2429,7 @@ fn driver_mapAddUniqueStr(items: var str[], seen: var DriverMapStrInt, value: st
     if exists && cur != 0:
         return
     driver_hashMapStrIntPut(seen, value, 1)
-    add(items, value)
+    seqAdd(items, value)
 
 fn driver_sortStringsStable(items: var str[]) =
     for i in 1..<items.len:
@@ -2092,7 +2472,7 @@ fn driver_collectUnitFiles(module: UirModule): str[] =
     # Keep a single shared unit to avoid touching fragile origin-file metadata.
     if !driver_envBoolDefault("BACKEND_MULTI", false) &&
        !driver_envBoolDefault("BACKEND_MULTI_FORCE", false):
-        add(out, driver_sharedUnitFile())
+        seqAdd(out, driver_sharedUnitFile())
         return out
     let funcCount: int32 = uir_types.uirModuleFuncsLen(module)
     let globalCount: int32 = uir_types.uirModuleGlobalsLen(module)
@@ -2150,7 +2530,11 @@ fn driver_buildUnitIndex(full: UirModule, unitFiles: str[]): DriverUnitIndex =
 
     for ui in 0..<unitFiles.len:
         driver_hashMapStrIntPut(unitIndexMap, unitFiles[ui], ui)
-    out.unitIndex = unitIndexMap
+    out.unitIndex.keys = unitIndexMap.keys
+    out.unitIndex.vals = unitIndexMap.vals
+    out.unitIndex.states = unitIndexMap.states
+    out.unitIndex.mask = unitIndexMap.mask
+    out.unitIndex.used = unitIndexMap.used
     if dbg:
         let f: os.File = os.get_stderr()
         driver_writeLine(f, "backend_driver: unit_index map_ready")
@@ -2172,7 +2556,11 @@ fn driver_buildUnitIndex(full: UirModule, unitFiles: str[]): DriverUnitIndex =
             let _seenNameToFuncLink: int32 = driver_hashMapStrIntGet(nameToFuncIdxMap, flink, hasLink)
             if !hasLink:
                 driver_hashMapStrIntPut(nameToFuncIdxMap, flink, fi)
-    out.nameToFuncIdx = nameToFuncIdxMap
+    out.nameToFuncIdx.keys = nameToFuncIdxMap.keys
+    out.nameToFuncIdx.vals = nameToFuncIdxMap.vals
+    out.nameToFuncIdx.states = nameToFuncIdxMap.states
+    out.nameToFuncIdx.mask = nameToFuncIdxMap.mask
+    out.nameToFuncIdx.used = nameToFuncIdxMap.used
     if dbg:
         let f: os.File = os.get_stderr()
         driver_writeLine(f, "backend_driver: unit_index name_to_func_ready")
@@ -2184,7 +2572,7 @@ fn driver_buildUnitIndex(full: UirModule, unitFiles: str[]): DriverUnitIndex =
         let ownerIdx: int32 = driver_hashMapStrIntGet(unitIndexMap, ownerKey, foundOwner)
         if foundOwner && ownerIdx >= 0 && ownerIdx < out.unitGlobalIdx.len:
             var row: int32[] = driver_getRowInt32(out.unitGlobalIdx, ownerIdx)
-            add(row, gi)
+            seqAdd(row, gi)
             driver_setRowInt32(out.unitGlobalIdx, ownerIdx, row)
     if dbg:
         let f: os.File = os.get_stderr()
@@ -2198,7 +2586,7 @@ fn driver_buildUnitIndex(full: UirModule, unitFiles: str[]): DriverUnitIndex =
             let ownerIdx2: int32 = driver_hashMapStrIntGet(unitIndexMap, ownerKey2, foundOwner2)
             if foundOwner2 && ownerIdx2 >= 0 && ownerIdx2 < out.unitFuncIdx.len:
                 var row2: int32[] = driver_getRowInt32(out.unitFuncIdx, ownerIdx2)
-                add(row2, fi)
+                seqAdd(row2, fi)
                 driver_setRowInt32(out.unitFuncIdx, ownerIdx2, row2)
     if dbg:
         let f: os.File = os.get_stderr()
@@ -2212,9 +2600,13 @@ fn driver_cacheStrTabInit(cap0: int32): DriverCacheStrTab =
     tab.items = []
     var indexMap: DriverMapStrInt = driver_hashMapStrIntInit((cap0 > 0) ? cap0 : 16)
     # Index 0 is always empty string.
-    add(tab.items, "")
+    seqAdd(tab.items, "")
     driver_hashMapStrIntPut(indexMap, "", 0)
-    tab.index = indexMap
+    tab.index.keys = indexMap.keys
+    tab.index.vals = indexMap.vals
+    tab.index.states = indexMap.states
+    tab.index.mask = indexMap.mask
+    tab.index.used = indexMap.used
     return tab
 
 fn driver_cacheStrTabIndex(tab: DriverCacheStrTab, s: str): int32 =
@@ -2223,14 +2615,23 @@ fn driver_cacheStrTabIndex(tab: DriverCacheStrTab, s: str): int32 =
     if driver_strIsEmpty(s):
         return 0
     var found: bool = false
-    var indexMap: DriverMapStrInt = tab.index
+    var indexMap: DriverMapStrInt
+    indexMap.keys = tab.index.keys
+    indexMap.vals = tab.index.vals
+    indexMap.states = tab.index.states
+    indexMap.mask = tab.index.mask
+    indexMap.used = tab.index.used
     let idx: int32 = driver_hashMapStrIntGet(indexMap, s, found)
     if found:
         return idx
     let newIdx: int32 = tab.items.len
-    add(tab.items, s)
+    seqAdd(tab.items, s)
     driver_hashMapStrIntPut(indexMap, s, newIdx)
-    tab.index = indexMap
+    tab.index.keys = indexMap.keys
+    tab.index.vals = indexMap.vals
+    tab.index.states = indexMap.states
+    tab.index.mask = indexMap.mask
+    tab.index.used = indexMap.used
     return newIdx
 
 fn driver_cacheCollectExprStrings(expr: UirExpr, tab: DriverCacheStrTab) =
@@ -2248,7 +2649,7 @@ fn driver_cacheCollectModuleStrings(module: UirModule, idx: DriverUnitIndex, tab
 fn driver_bufAddU8Ptr(buf: uint8[]*, v: uint8) =
     if void*(buf) == nil:
         return
-    add(buf, v)
+    seqAdd(buf, v)
 
 fn driver_cacheBufU8(buf: uint8[]*, v: int32) =
     if void*(buf) == nil:
@@ -2455,10 +2856,18 @@ fn driver_moduleCacheToUnitIndex(cache: DriverModuleCache): DriverUnitIndex =
     var unitIndexMap: DriverMapStrInt = driver_hashMapStrIntInit(cache.unitFiles.len * 2 + 8)
     for i in 0..<cache.unitFiles.len:
         driver_hashMapStrIntPut(unitIndexMap, cache.unitFiles[i], i)
-    out.unitIndex = unitIndexMap
+    out.unitIndex.keys = unitIndexMap.keys
+    out.unitIndex.vals = unitIndexMap.vals
+    out.unitIndex.states = unitIndexMap.states
+    out.unitIndex.mask = unitIndexMap.mask
+    out.unitIndex.used = unitIndexMap.used
     out.unitFuncIdx = cache.unitFuncIdx
     out.unitGlobalIdx = cache.unitGlobalIdx
-    out.nameToFuncIdx = cache.nameToFuncIdx
+    out.nameToFuncIdx.keys = cache.nameToFuncIdx.keys
+    out.nameToFuncIdx.vals = cache.nameToFuncIdx.vals
+    out.nameToFuncIdx.states = cache.nameToFuncIdx.states
+    out.nameToFuncIdx.mask = cache.nameToFuncIdx.mask
+    out.nameToFuncIdx.used = cache.nameToFuncIdx.used
     return out
 
 fn driver_buildUnitModuleFromIndex(full: UirModule, filePath: str, unitIdx: int32, idx: DriverUnitIndex): UirModule =
@@ -2537,9 +2946,29 @@ fn driver_emitObjBytesFromModule(module: UirModule, optLevel: int32, target: str
                      " b2=" + intToStr(b2) + " b3=" + intToStr(b3))
     return objBytes
 
+fn driver_emitObjBytesDefault(module: UirModule, target: str): uint8[] =
+    return uirEmitObjFromModuleOrPanic(module, 0, target, "", false, false, 0, "autovec")
+
+fn driver_emitObjBytesActiveDefault(module: UirModule): uint8[] =
+    return driver_emitObjBytesDefault(module, driver_activeTarget())
+
+fn driver_emitObjFromModuleDefault(module: UirModule, target: str, outPath: str): int32 =
+    return driver_emitObjFromModuleLegacy(module, 0, target, "", outPath, false, 0, "autovec", -1)
+
 fn driver_emitObjFromModule(module: UirModule, optLevel: int32, target: str, objWriter: str, outPath: str,
                            uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str,
-                           validateOverride: int32 = -1) =
+                           validateOverride: int32 = -1): int32 =
+    let _optLevel: int32 = optLevel
+    let _objWriter: str = objWriter
+    let _uirSimdEnabled: bool = uirSimdEnabled
+    let _uirSimdMaxWidth: int32 = uirSimdMaxWidth
+    let _uirSimdPolicy: str = uirSimdPolicy
+    let _validateOverride: int32 = validateOverride
+    return driver_emitObjFromModuleDefault(module, target, outPath)
+
+fn driver_emitObjFromModuleLegacy(module: UirModule, optLevel: int32, target: str, objWriter: str, outPath: str,
+                           uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str,
+                           validateOverride: int32 = -1): int32 =
     driver_ensureParentDir(outPath)
     let dbgEmitPipe: bool = driver_envIsTrue("BACKEND_DEBUG_EMIT_PIPE")
     var dbgFile: os.File = nil
@@ -2569,6 +2998,7 @@ fn driver_emitObjFromModule(module: UirModule, optLevel: int32, target: str, obj
                      " fd=" + intToStr(outFd) +
                      " wrote=" + intToStr(wrote) +
                      " size=" + intToStr(int32(wroteSize)))
+    return 0
 
 fn driver_runParallelUnitBatchesFork(full: UirModule, optLevel: int32, unitIndex: DriverUnitIndex, target: str, objWriter: str,
                                      pendingUnits: str[], pendingObjs: str[],
@@ -2587,7 +3017,7 @@ fn driver_runParallelUnitBatchesFork(full: UirModule, optLevel: int32, unitIndex
     for pi in 0..<pendingUnits.len:
         let bucket: int32 = pi % workerCount
         var row: int32[] = driver_getRowInt32(buckets, bucket)
-        add(row, pi)
+        seqAdd(row, pi)
         driver_setRowInt32(buckets, bucket, row)
 
     var pids: int64[]
@@ -2612,7 +3042,12 @@ fn driver_runParallelUnitBatchesFork(full: UirModule, optLevel: int32, unitIndex
                                 built = true
                             if !built:
                                 var found: bool = false
-                                var unitMap: DriverMapStrInt = unitIndex.unitIndex
+                                var unitMap: DriverMapStrInt
+                                unitMap.keys = unitIndex.unitIndex.keys
+                                unitMap.vals = unitIndex.unitIndex.vals
+                                unitMap.states = unitIndex.unitIndex.states
+                                unitMap.mask = unitIndex.unitIndex.mask
+                                unitMap.used = unitIndex.unitIndex.used
                                 let mappedIdx: int32 = driver_hashMapStrIntGet(unitMap, fp, found)
                                 if found && mappedIdx >= 0:
                                     let candMapped: UirModule = driver_buildUnitModuleFromIndex(full, fp, mappedIdx, unitIndex)
@@ -2627,7 +3062,7 @@ fn driver_runParallelUnitBatchesFork(full: UirModule, optLevel: int32, unitIndex
                 let fFork: os.File = os.get_stderr()
                 driver_writeLine(fFork, "backend_driver: fork failed; fallback to serial multi compile")
                 return false
-            add(pids, pid)
+            seqAdd(pids, pid)
 
     var status: int32 = 0
     var waitFailed: bool = false
@@ -2678,7 +3113,12 @@ fn driver_runSerialUnitBatches(full: UirModule, optLevel: int32, unitIndex: Driv
         var built: bool = false
         if void*(unitIndex) != nil:
             var found: bool = false
-            var unitMap2: DriverMapStrInt = unitIndex.unitIndex
+            var unitMap2: DriverMapStrInt
+            unitMap2.keys = unitIndex.unitIndex.keys
+            unitMap2.vals = unitIndex.unitIndex.vals
+            unitMap2.states = unitIndex.unitIndex.states
+            unitMap2.mask = unitIndex.unitIndex.mask
+            unitMap2.used = unitIndex.unitIndex.used
             let unitIdx: int32 = driver_hashMapStrIntGet(unitMap2, fp, found)
             if found:
                 let byUnit: UirModule = driver_buildUnitModuleFromIndex(full, fp, unitIdx, unitIndex)
@@ -2758,18 +3198,18 @@ fn driver_tryLinkExeMainObjMem(mainObjBytes: uint8[], target: str, linker: str, 
 fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtabAll: bool,
                          ldCmd: str, cflags: str, ldflags: str,
                          outputPath: str, runtimeObj: str, runtimeC: str, noRuntimeC: bool,
-                         genericMode: str) =
+                         genericMode: str): int32 =
     if objPaths.len == 0:
         panic "backend_driver: no object files to link"
     driver_dictLinkClosurePrecheck(objPaths, runtimeObj, genericMode)
     if driver_strEq(linker, "self"):
         var linkObjs: str[]
         for i in 0..<objPaths.len:
-            add(linkObjs, objPaths[i])
+            seqAdd(linkObjs, objPaths[i])
         if len(runtimeObj) > 0:
             if ! driver_fileExists(runtimeObj):
                 driver_panic("backend_driver: runtime obj not found: " + runtimeObj)
-            add(linkObjs, runtimeObj)
+            seqAdd(linkObjs, runtimeObj)
         if driver_targetIsDarwin(target) && driver_targetIsAarch64(target):
             driver_runCmd("rm -f " + driver_shellQuote(outputPath))
             machoLinkExeAarch64(linkObjs, outputPath, linkerSymtabAll, runtimeObj)
@@ -2778,14 +3218,14 @@ fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtab
             driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
             if !driver_strEq(driver_envDefault("BACKEND_CODESIGN", "1"), "0"):
                 driver_runCmd("codesign -s - " + driver_shellQuote(outputPath))
-            return
+            return 0
         if driver_targetIsLinux(target) && driver_targetIsAarch64(target):
             driver_runCmd("rm -f " + driver_shellQuote(outputPath))
             elfLinkExeAarch64(linkObjs, outputPath, target)
             if !driver_fileExists(outputPath) || driver_file_size(outputPath) <= 0:
                 driver_panic("backend_driver: self link failed (" + target + ")")
             driver_runCmd("chmod +x " + driver_shellQuote(outputPath))
-            return
+            return 0
         driver_panic("backend_driver: self linker unsupported target (host-only darwin arm64): " + target)
 
     var linkCmd: str = ldCmd
@@ -2803,6 +3243,7 @@ fn driver_linkExeObjects(objPaths: str[], target: str, linker: str, linkerSymtab
     if len(ldflags) > 0:
         linkCmd = linkCmd + " " + ldflags
     driver_runCmd(linkCmd)
+    return 0
 
 fn driver_loadObjectList(path: str): str[] =
     var out: str[]
@@ -2822,7 +3263,7 @@ fn driver_loadObjectList(path: str): str[] =
                 let line: str = driver_trimAsciiSpace(lineRaw)
                 if driver_strNonEmpty(line):
                     if line[0] != '#':
-                        add(out, line)
+                        seqAdd(out, line)
             start = i + 1
     return out
 
@@ -2858,689 +3299,417 @@ fn driver_loadUnitBatchPairs(path: str): str[] =
                         let unitPath: str = driver_trimAsciiSpace(unitRaw)
                         if driver_strIsEmpty(objPath) || driver_strIsEmpty(unitPath):
                             driver_panic("backend_driver: invalid batch line (empty obj/unit): " + line)
-                        add(out, objPath)
-                        add(out, unitPath)
+                        seqAdd(out, objPath)
+                        seqAdd(out, unitPath)
             start = i + 1
     return out
 
-fn backendMainNative(): int32 =
-    var backendProfileEnabled: bool = driver_envBoolDefault("BACKEND_PROFILE", false)
-    var uirProfileEnabled: bool = driver_envBoolDefault("UIR_PROFILE", false)
-    var inputPath: str = driver_envDefault("BACKEND_INPUT", "")
-    var outputPath: str = driver_envDefault("BACKEND_OUTPUT", "")
-    var emitMode: str = driver_envDefault("BACKEND_EMIT", "exe")
-    var target: str = driver_envDefault("BACKEND_TARGET", "auto")
-    var backendIr: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("BACKEND_IR", "uir")))
-    var frontend: str = "stage1"
-    var genericMode: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("GENERIC_MODE", "dict")))
-    var genericSpecBudget: int32 = driver_parseInt32Default(driver_envDefault("GENERIC_SPEC_BUDGET", ""), 0)
-    var borrowIr: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("BORROW_IR", "mir")))
-    var genericLowering: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("GENERIC_LOWERING", "mir_dict")))
-    var compileStampOutPath: str = driver_trimAsciiSpace(driver_envDefault("BACKEND_COMPILE_STAMP_OUT", ""))
-    var uirSimdRaw: str = driver_trimAsciiSpace(driver_envDefault("UIR_SIMD", ""))
-    var uirSimdEnabled: bool = false
-    var uirSimdMaxWidth: int32 = driver_parseInt32Default(driver_envDefault("UIR_SIMD_MAX_WIDTH", ""), 0)
-    var uirSimdPolicy: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("UIR_SIMD_POLICY", "autovec")))
-    var opt2: bool = driver_strEq(driver_envDefault("BACKEND_OPT2", ""), "1")
-    var optEnabled: bool = driver_strEq(driver_envDefault("BACKEND_OPT", ""), "1")
-    let optLevelEnvRaw: str = driver_trimAsciiSpace(driver_envDefault("BACKEND_OPT_LEVEL", ""))
-    var optLevelExplicit: bool = driver_strNonEmpty(optLevelEnvRaw)
-    var optDefault: int32 = opt2 ? 2 : (optEnabled ? 1 : 2)
-    var optLevel: int32 = driver_parseInt32Default(optLevelEnvRaw, optDefault)
-    var validateEnabled: bool = driver_envBoolDefault("BACKEND_VALIDATE", false)
-    var ccCmd: str = driver_envDefault("BACKEND_CC", "cc")
-    var ccExplicit: bool = false
-    if len(driver_envDefault("BACKEND_CC", "")) > 0:
-        ccExplicit = true
+fn driver_activeInputPath(): str =
+    return driver_backendResolveInputPath()
+
+fn driver_activeOutputPath(inputPath: str): str =
+    return driver_backendResolveOutputPath(inputPath)
+
+fn driver_activeTarget(): str =
+    return driver_backendResolveTarget()
+
+fn driver_activeLinker(): str =
+    return driver_backendResolveLinker()
+
+fn driver_activeLdCmd(ccCmd: str): str =
     var ldCmd: str = driver_envDefault("BACKEND_LD", "")
-    var ldExplicit: bool = false
-    if len(driver_envDefault("BACKEND_LD", "")) > 0:
-        ldExplicit = true
-    var cflags: str = driver_envDefault("BACKEND_CFLAGS", "")
-    var ldflags: str = driver_envDefault("BACKEND_LDFLAGS", "")
-    var linker: str = driver_envDefault("BACKEND_LINKER", "")
-    var linkerSymtab: str = driver_envDefault("BACKEND_LINKER_SYMTAB", "")
-    var objWriter: str = driver_envDefault("BACKEND_OBJ_WRITER", "")
-    var elfProfile: str = driver_envDefault("BACKEND_ELF_PROFILE", "")
-    if len(linker) == 0:
-        linker = ""
-    var multi: bool = driver_envBoolDefault("BACKEND_MULTI", false)
-    var multiForce: bool = driver_envBoolDefault("BACKEND_MULTI_FORCE", false)
-    if multiForce:
-        multi = true
-    var multiLto: bool = driver_envBoolDefault("BACKEND_MULTI_LTO", false)
-    var incremental: bool = driver_envBoolDefault("BACKEND_INCREMENTAL", false)
-    var jobs: int32 = driver_parseInt32Default(driver_envDefault("BACKEND_JOBS", ""), 0)
-    var unitFile: str = driver_envDefault("BACKEND_UNIT_FILE", "")
-    var unitBatchFile: str = driver_envDefault("BACKEND_UNIT_BATCH_FILE", "")
-    var moduleCachePath: str = driver_envDefault("BACKEND_MODULE_CACHE", "")
-    var linkObjsFile: str = driver_envDefault("BACKEND_LINK_OBJS", "")
-    var allowNoMain: bool = driver_envBoolDefault("BACKEND_ALLOW_NO_MAIN", false)
-    let wholeProgram: bool = true
-    var skipGlobalInit: bool = driver_envBoolDefault("BACKEND_SKIP_GLOBAL_INIT", false)
-    var runtimeObj: str = driver_envDefault("BACKEND_RUNTIME_OBJ", "")
-    var runtimeC: str = driver_envDefault("BACKEND_RUNTIME_C", "src/runtime/native/system_helpers.c")
-    var noRuntimeC: bool = driver_envBoolDefault("BACKEND_NO_RUNTIME_C", true)
-    let internalAllowEmitObj: bool = driver_envBoolDefault("BACKEND_INTERNAL_ALLOW_EMIT_OBJ", false)
-    var nativeContractEnabled: bool = driver_envBoolDefault("BACKEND_NATIVE_CONTRACT", false)
-    var androidApi: int32 = driver_parseInt32Default(driver_envDefault("ANDROID_API", ""), 21)
-    var abi: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("ABI", "")))
-
-    if driver_envBoolDefault("BACKEND_ENABLE_CLI", false):
-        let argCount: int32 = cmdline.paramCount()
-        if driver_envIsTrue("BACKEND_DEBUG_CMDLINE"):
-            for di in 1..argCount:
-                driver_writeLine(os.get_stderr(), "backend_driver.debug argv[" + intToStr(di) + "]=" + cmdline.paramStr(di))
-        var i: int32 = 1
-        var positionalInputConsumed: bool = false
-        for __for_guard_i in 0..<argCount:
-            if !(i <= argCount):
-                break
-            let arg: str = cmdline.paramStr(i)
-            if driver_strIsEmpty(arg):
-                i = i + 1
-                continue
-            if driver_strEq(arg, "--help") || driver_strEq(arg, "-h"):
-                driver_backendUsage()
-                return 0
-
-            var raw: str = ""
-            var nextIndex: int32 = i
-            if driver_cliReadValueAt2(i, "--input", "--in", raw, nextIndex):
-                inputPath = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt2(i, "--output", "--out", raw, nextIndex):
-                outputPath = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--emit", raw, nextIndex):
-                emitMode = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--target", raw, nextIndex):
-                target = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--frontend", raw, nextIndex):
-                frontend = driver_lowerAscii(driver_trimAsciiSpace(raw))
-                if !driver_strEq(frontend, "stage1"):
-                    driver_panic("backend_driver: unsupported --frontend (expected stage1): " + frontend)
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt2(i, "--ir", "--backend-ir", raw, nextIndex):
-                backendIr = driver_lowerAscii(driver_trimAsciiSpace(raw))
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--generic-mode", raw, nextIndex):
-                genericMode = driver_lowerAscii(driver_trimAsciiSpace(raw))
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--generic-spec-budget", raw, nextIndex):
-                genericSpecBudget = driver_parseInt32Strict(raw, "--generic-spec-budget")
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--borrow-ir", raw, nextIndex):
-                borrowIr = driver_lowerAscii(driver_trimAsciiSpace(raw))
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--generic-lowering", raw, nextIndex):
-                genericLowering = driver_lowerAscii(driver_trimAsciiSpace(raw))
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--compile-stamp-out", raw, nextIndex):
-                compileStampOutPath = driver_trimAsciiSpace(raw)
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--opt-level", raw, nextIndex):
-                optLevel = driver_parseInt32Strict(raw, "--opt-level")
-                optLevelExplicit = true
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--cc", raw, nextIndex):
-                ccCmd = raw
-                ccExplicit = true
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--ld", raw, nextIndex):
-                ldCmd = raw
-                ldExplicit = true
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--cflags", raw, nextIndex):
-                cflags = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--ldflags", raw, nextIndex):
-                ldflags = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--linker", raw, nextIndex):
-                linker = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--linker-symtab", raw, nextIndex):
-                linkerSymtab = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--obj-writer", raw, nextIndex):
-                objWriter = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--elf-profile", raw, nextIndex):
-                elfProfile = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--jobs", raw, nextIndex):
-                jobs = driver_parseInt32Strict(raw, "--jobs")
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--unit-file", raw, nextIndex):
-                unitFile = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--unit-batch-file", raw, nextIndex):
-                unitBatchFile = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--module-cache", raw, nextIndex):
-                moduleCachePath = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--link-objs", raw, nextIndex):
-                linkObjsFile = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--runtime-obj", raw, nextIndex):
-                runtimeObj = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--runtime-c", raw, nextIndex):
-                runtimeC = raw
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--android-api", raw, nextIndex):
-                androidApi = driver_parseInt32Strict(raw, "--android-api")
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--abi", raw, nextIndex):
-                abi = driver_lowerAscii(driver_trimAsciiSpace(raw))
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--uir-simd-max-width", raw, nextIndex):
-                uirSimdMaxWidth = driver_parseInt32Strict(raw, "--uir-simd-max-width")
-                i = nextIndex + 1
-                continue
-            if driver_cliReadValueAt(i, "--uir-simd-policy", raw, nextIndex):
-                uirSimdPolicy = driver_lowerAscii(driver_trimAsciiSpace(raw))
-                i = nextIndex + 1
-                continue
-
-            var boolRaw: bool = false
-            if driver_cliTryReadBoolFlagAt(i, "--profile", "--no-profile", "--profile", boolRaw, nextIndex):
-                backendProfileEnabled = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--uir-profile", "--no-uir-profile", "--uir-profile", boolRaw, nextIndex):
-                uirProfileEnabled = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--validate", "--no-validate", "--validate", boolRaw, nextIndex):
-                validateEnabled = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--opt2", "--no-opt2", "--opt2", boolRaw, nextIndex):
-                opt2 = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--opt", "--no-opt", "--opt", boolRaw, nextIndex):
-                optEnabled = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--multi", "--no-multi", "--multi", boolRaw, nextIndex):
-                multi = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--multi-force", "--no-multi-force", "--multi-force", boolRaw, nextIndex):
-                multiForce = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--multi-lto", "--no-multi-lto", "--multi-lto", boolRaw, nextIndex):
-                multiLto = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--incremental", "--no-incremental", "--incremental", boolRaw, nextIndex):
-                incremental = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--allow-no-main", "--no-allow-no-main", "--allow-no-main", boolRaw, nextIndex):
-                allowNoMain = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--skip-global-init", "--no-skip-global-init", "--skip-global-init", boolRaw, nextIndex):
-                skipGlobalInit = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--no-runtime-c", "--with-runtime-c", "--no-runtime-c", boolRaw, nextIndex):
-                noRuntimeC = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--native-contract", "--no-native-contract", "--native-contract", boolRaw, nextIndex):
-                nativeContractEnabled = boolRaw
-                i = nextIndex + 1
-                continue
-            if driver_cliTryReadBoolFlagAt(i, "--uir-simd", "--no-uir-simd", "--uir-simd", boolRaw, nextIndex):
-                uirSimdRaw = driver_bool01(boolRaw)
-                i = nextIndex + 1
-                continue
-
-            if driver_strHasPrefix(arg, "-"):
-                driver_panic("backend_driver: unknown argument: " + arg)
-            if positionalInputConsumed:
-                driver_panic("backend_driver: unexpected positional argument: " + arg)
-            inputPath = arg
-            positionalInputConsumed = true
-            i = i + 1
-
-    if !driver_requireToolingInvocation(inputPath):
-        return 2
-
-    if !optLevelExplicit:
-        optDefault = opt2 ? 2 : (optEnabled ? 1 : 2)
-        optLevel = optDefault
-    if multiForce:
-        multi = true
-
-    var profile: DriverProfileState = driver_profileInit(backendProfileEnabled, "backend_profile")
-    var uirProfile: DriverProfileState = driver_profileInit(uirProfileEnabled, "uir_profile")
-
-    frontend = driver_lowerAscii(driver_trimAsciiSpace(frontend))
-    if driver_strIsEmpty(frontend):
-        frontend = "stage1"
-    elif !driver_strEq(frontend, "stage1"):
-        driver_panic("backend_driver: unsupported --frontend (expected stage1): " + frontend)
-    if driver_strIsEmpty(backendIr):
-        backendIr = "uir"
-    if driver_strIsEmpty(genericMode):
-        genericMode = "dict"
-    if !driver_isKnownGenericMode(genericMode):
-        driver_panic("backend_driver: invalid GENERIC_MODE (expected dict): " + genericMode)
-    if genericSpecBudget != 0:
-        driver_panic("backend_driver: invalid GENERIC_SPEC_BUDGET (expected 0)")
-    if driver_strIsEmpty(borrowIr):
-        borrowIr = "mir"
-    if !driver_isKnownBorrowIr(borrowIr):
-        driver_panic("backend_driver: invalid BORROW_IR (expected mir|stage1): " + borrowIr)
-    if driver_strIsEmpty(genericLowering):
-        genericLowering = "mir_dict"
-    if !driver_isKnownGenericLowering(genericLowering):
-        driver_panic("backend_driver: invalid GENERIC_LOWERING (expected mir_dict): " + genericLowering)
-    if driver_strIsEmpty(uirSimdRaw):
-        uirSimdEnabled = optLevel >= 3
-    else:
-        uirSimdEnabled = driver_parseBoolStrict(uirSimdRaw, "--uir-simd")
-    if uirSimdMaxWidth < 0:
-        driver_panic("backend_driver: invalid UIR_SIMD_MAX_WIDTH (expected >= 0)")
-    if driver_strIsEmpty(uirSimdPolicy):
-        uirSimdPolicy = "autovec"
-    elif !driver_isKnownSimdPolicy(uirSimdPolicy):
-        driver_writeLine(os.get_stderr(),
-                     "backend_driver: unknown UIR_SIMD_POLICY, fallback to autovec: " + uirSimdPolicy)
-        uirSimdPolicy = "autovec"
-    driver_failRemovedEnv("MIR_PROFILE", "UIR_PROFILE")
-    driver_failRemovedEnv("BACKEND_SSA", "BACKEND_OPT_LEVEL")
-    driver_failRemovedEnv("STAGE1_SKIP_MONO", "GENERIC_MODE=dict")
-    driver_failRemovedEnv("BACKEND_SKIP_MONO", "GENERIC_MODE=dict")
-    driver_failRemovedEnv("BACKEND_SKIP_MONO_AFTER_CPROFILE", "GENERIC_MODE=dict")
-    driver_failRemovedEnv("BACKEND_SKIP_MONO_DICT", "GENERIC_MODE=dict")
-    driver_failRemovedEnv("STAGE1_SKIP_MONO_AFTER_CPROFILE", "GENERIC_MODE=dict")
-    driver_failRemovedEnv("STAGE1_SKIP_MONO_DICT", "GENERIC_MODE=dict")
-    driver_failRemovedEnv("C_SYSTEM", "std/system (always enabled)")
-    driver_failRemovedBoolEnvEnabled("BACKEND_FAST_FALLBACK_ALLOW", "fixed=0")
-    driver_failRemovedBoolEnvEnabled("BACKEND_MULTI_MODULE_CACHE", "fixed=0")
-    driver_failRemovedEnv("BACKEND_ENABLE_CSTRING_LOWERING", "cstring lowering is always on (removed config)")
-    driver_failRemovedEnv("BACKEND_CSTRING_LOWERING", "cstring lowering is always on (removed config)")
-    driver_failRemovedEnv("BACKEND_ISEL_CSTRING_LOWERING", "cstring lowering is always on (removed config)")
-    if driver_strNonEmpty(driver_trimAsciiSpace(moduleCachePath)):
-        driver_panic("backend_driver: --module-cache/BACKEND_MODULE_CACHE is disabled in stable driver")
-    if driver_strIsEmpty(abi):
-        abi = "v2_noptr"
-    elif !driver_strEq(abi, "v2_noptr"):
-        driver_panic("backend_driver: unsupported ABI (expected v2_noptr): " + abi)
-    driver_profileStepBoth(profile, uirProfile, "parse_args")
-    driver_emitUirSimdNotice(uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
-    if driver_strIsEmpty(emitMode):
-        emitMode = "exe"
-    if !driver_strEq(backendIr, "uir"):
-        driver_panic("backend_driver: unsupported BACKEND_IR (expected uir): " + backendIr)
-    if nativeContractEnabled:
-        validateEnabled = true
-        noRuntimeC = true
-        var linkerNorm0: str = driver_lowerAscii(driver_trimAsciiSpace(linker))
-        if driver_strIsEmpty(linkerNorm0):
-            linker = "self"
-            linkerNorm0 = "self"
-        if !driver_strEq(linkerNorm0, "self"):
-            driver_panic("backend_driver: BACKEND_NATIVE_CONTRACT requires BACKEND_LINKER=self")
-        linker = linkerNorm0
-        let mm0: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("MM", "")))
-        if driver_strNonEmpty(mm0) && !driver_strEq(mm0, "orc"):
-            driver_panic("backend_driver: BACKEND_NATIVE_CONTRACT requires MM=orc (got: " + mm0 + ")")
-    target = driver_normalizeTargetAlias(target)
-    if driver_strIsEmpty(target) || driver_strEq(target, "auto"):
-        target = driver_detectHostTargetAuto()
-    if driver_strIsEmpty(target):
-        driver_panic("backend_driver: auto target detect failed; pass --target=<triple> or set BACKEND_TARGET")
-    if !driver_strEq(emitMode, "exe") && !driver_strEq(emitMode, "c"):
-        if !(internalAllowEmitObj && driver_strEq(emitMode, "obj")):
-            driver_panic("backend_driver: invalid emit mode (expected exe|c): " + emitMode)
-
-    if driver_strEq(emitMode, "exe") && driver_strEq(elfProfile, "nolibc"):
-        if !(driver_strEq(linker, "self") &&
-             driver_targetIsAarch64(target) &&
-             driver_targetIsLinux(target) &&
-             !driver_targetIsDarwin(target) &&
-             !driver_targetIsWindows(target)):
-            driver_panic("backend_driver: BACKEND_ELF_PROFILE=nolibc requires self-link on linux aarch64 target: " + target)
-    let runtimeCoreSymbolsStrict: bool = !(driver_strEq(elfProfile, "nolibc") &&
-                                           driver_targetIsLinux(target) &&
-                                           driver_targetIsAarch64(target) &&
-                                           !driver_targetIsDarwin(target) &&
-                                           !driver_targetIsWindows(target))
-
-    let intBitsRaw: str = driver_envDefault("INTBITS", "")
-    if driver_strNonEmpty(intBitsRaw):
-        let intBits: int32 = driver_parseInt32Default(intBitsRaw, -1)
-        if intBits != 32 && intBits != 64:
-            panic "backend_driver: unsupported INTBITS (expected 32 or 64)"
-
-    if !driver_targetIsAarch64(target):
-        driver_panic("backend_driver: unsupported BACKEND_TARGET (host-only expects aarch64/arm64): " + target)
-    if nativeContractEnabled:
-        if !(driver_targetIsAarch64(target) &&
-             driver_targetIsLinux(target) &&
-             !driver_targetIsAndroid(target) &&
-             !driver_targetIsDarwin(target) &&
-             !driver_targetIsWindows(target)):
-            driver_panic("backend_driver: BACKEND_NATIVE_CONTRACT requires linux aarch64 target: " + target)
-
-    if driver_targetIsAndroid(target):
-        if !ccExplicit && driver_strEq(ccCmd, "cc"):
-            let ndkCc: str = driver_defaultAndroidNdkClang(androidApi)
-            if driver_strNonEmpty(ndkCc):
-                ccCmd = ndkCc
-        if !ldExplicit && (driver_strIsEmpty(ldCmd)):
-            ldCmd = ccCmd
-        if len(cflags) == 0:
-            cflags = "-fPIE"
-        if len(ldflags) == 0:
-            ldflags = "-fPIE -pie"
-        ldflags = driver_flagsAppendToken(ldflags, "-lm")
-
     if driver_strIsEmpty(ldCmd):
         ldCmd = ccCmd
-    driver_profileStepBoth(profile, uirProfile, "config")
+    return ldCmd
 
-    let buildTrackRaw0: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("BACKEND_BUILD_TRACK", "")))
-    var buildTrack: str = driver_strIsEmpty(buildTrackRaw0) ? "dev" : buildTrackRaw0
-    if !driver_strEq(buildTrack, "dev") && !driver_strEq(buildTrack, "release"):
-        driver_panic("backend_driver: invalid BACKEND_BUILD_TRACK (expected dev|release): " + buildTrack)
-    if driver_strEq(emitMode, "obj") && !allowNoMain && !driver_strEq(buildTrack, "release"):
-        driver_panic("backend_driver: emit=obj is disabled for non-release executable builds; " +
-                     "use emit=exe (dev in-memory) or release-compile")
-    var resolvedLinker: str = driver_lowerAscii(driver_trimAsciiSpace(linker))
-    let trackDefaultSelfLink: bool = driver_strEq(buildTrack, "dev") &&
-        driver_targetIsDarwin(target) && driver_targetIsAarch64(target)
-    let trackDefaultLinker: str = trackDefaultSelfLink ? "self" : "system"
-    if driver_strIsEmpty(resolvedLinker):
-        resolvedLinker = trackDefaultLinker
-    linker = resolvedLinker
+fn driver_activeSimdPolicy(): str =
+    var policy: str = driver_lowerAscii(driver_trimAsciiSpace(driver_envDefault("UIR_SIMD_POLICY", "autovec")))
+    if driver_strIsEmpty(policy):
+        return "autovec"
+    if !driver_isKnownSimdPolicy(policy):
+        driver_panic("backend_driver: invalid UIR_SIMD_POLICY: " + policy)
+    return policy
 
-    let runtimeObjOptionalForNativeContract: bool =
-        nativeContractEnabled &&
-        driver_targetIsLinux(target) &&
-        driver_targetIsAarch64(target) &&
-        !driver_targetIsAndroid(target) &&
-        !driver_targetIsDarwin(target) &&
-        !driver_targetIsWindows(target)
-    if driver_strEq(emitMode, "exe") && driver_strEq(resolvedLinker, "self") && noRuntimeC:
-        let runtimeObjSpecified: bool = driver_strNonEmpty(driver_trimAsciiSpace(runtimeObj))
-        if runtimeObjOptionalForNativeContract && !runtimeObjSpecified:
-            # Native-contract linux/aarch64 fixtures do not require runtime glue.
-            # Keep runtime object empty to avoid picking host/legacy objects.
-            runtimeObj = ""
-        else:
-            runtimeObj = driver_resolveSelfLinkRuntimeObj(target, runtimeObj)
-            if driver_strIsEmpty(runtimeObj):
-                driver_panic("backend_driver: missing self-link runtime object for target: " + target +
-                             " (set BACKEND_RUNTIME_OBJ or prepare chengcache/runtime_selflink/system_helpers.backend.combined.<target>.o)")
-            if !driver_runtimeObjHasCoreSymbols(runtimeObj):
-                if runtimeCoreSymbolsStrict:
-                    if runtimeObjSpecified:
-                        driver_panic("backend_driver: runtime object missing required self-link symbols: " + runtimeObj +
-                                     " (use combined runtime object, e.g. chengcache/runtime_selflink/system_helpers.backend.combined.<target>.o)")
-                    driver_panic("backend_driver: self-link runtime object incomplete: " + runtimeObj +
-                                 " (prepare runtime_selflink combined object for target " + target + ")")
-                else:
-                    driver_writeLine(os.get_stderr(),
-                                 "backend_driver: warn runtime object missing strict core symbol set; continue for nolibc profile: " +
-                                 runtimeObj)
+fn driver_activeOptLevel(): int32 =
+    return driver_parseInt32Default(driver_envDefault("BACKEND_OPT_LEVEL", ""), 0)
 
-    let linkerSymtabAll: bool = driver_parseLinkerSymtabAll(linkerSymtab)
+fn driver_activeValidateEnabled(): bool =
+    return driver_envBoolDefault("BACKEND_VALIDATE", false)
 
-    # Fork-parallel avoids subprocesses rebuilding the full module. When fork
-    # is disabled/unavailable, default to enabling module-cache so parallel
-    # workers can reuse the parent-built module instead of rebuilding it.
-    let forkDefault: bool = true
-    let allowForkParallel0: bool = driver_envBoolDefault("BACKEND_MULTI_FORK", forkDefault)
+fn driver_activeUirSimdEnabled(): bool =
+    return driver_envBoolDefault("UIR_SIMD", false)
 
-    let compileStamp0: str = driver_buildObjCompileStamp(target, frontend, objWriter, inputPath,
-                                                         allowNoMain,
-                                                         skipGlobalInit, multi, multiForce,
-                                                         multiLto, abi, buildTrack, resolvedLinker, noRuntimeC,
-                                                         driver_selfCompilerStamp(),
-                                                         nativeContractEnabled,
-                                                         backendIr, genericMode, genericSpecBudget,
-                                                         opt2, optEnabled, optLevel,
-                                                         validateEnabled,
-                                                         uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy,
-                                                         borrowIr, genericLowering,
-                                                         driver_envDefault("PLUGIN_ENABLE", ""),
-                                                         driver_envDefault("PLUGIN_PATH", ""),
-                                                         driver_envDefault("PLUGIN_PATHS", ""),
-                                                         driver_envDefault("METERING_PLUGIN", ""))
-    let compileStampHash0: int64 = uirFnv1a64(compileStamp0)
-    if driver_strNonEmpty(compileStampOutPath):
-        os.writeFile(compileStampOutPath, compileStamp0)
+fn driver_activeUirSimdMaxWidth(): int32 =
+    return driver_parseInt32Default(driver_envDefault("UIR_SIMD_MAX_WIDTH", ""), 0)
 
-    if len(outputPath) == 0:
-        if len(inputPath) == 0:
-            panic "backend_driver: output path required"
-        outputPath = inputPath
-    var outBase: str = outputPath
-    let moduleCacheEnabled0: bool = false
-    if driver_strIsEmpty(moduleCachePath) && moduleCacheEnabled0 &&
-       driver_strEq(emitMode, "exe") && multi && !multiLto:
-        moduleCachePath = outBase + ".cache/.build.module.cache"
+fn driver_activeObjWriter(): str =
+    return driver_envDefault("BACKEND_OBJ_WRITER", "")
 
-    if driver_strNonEmpty(linkObjsFile):
-        driver_panic("backend_driver: BACKEND_LINK_OBJS has been removed from production path")
+fn driver_activeRuntimeObj(): str =
+    return driver_envDefault("BACKEND_RUNTIME_OBJ", "")
 
-    var cache: DriverModuleCache = nil
-    if driver_strNonEmpty(moduleCachePath) && driver_envIsTrue("BACKEND_MODULE_CACHE_DEBUG"):
-        let f: os.File = os.get_stderr()
-        driver_writeLine(f, "backend_driver: module cache load disabled in bootstrap-compatible mode")
-    driver_profileStepBoth(profile, uirProfile, "module_cache.load")
+fn driver_activeRuntimeC(): str =
+    return driver_envDefault("BACKEND_RUNTIME_C", "src/runtime/native/system_helpers.c")
 
-    if nativeContractEnabled:
-        let sourceViolation: str = driver_nativeContractSourceViolation(inputPath)
-        if driver_strNonEmpty(sourceViolation):
-            driver_panic("backend_driver: native_contract hard-fail @" + inputPath + ": " + sourceViolation)
-    var mod: UirModule
-    if len(inputPath) == 0:
-        mod = uirDemoModule()
-    else:
-        mod = uirBuildModuleFromFileStage1OrPanic(inputPath)
-    if driver_strNonEmpty(target):
-        let _targetCli: str = target
-    driver_profileStepBoth(profile, uirProfile, "build_module")
-    let highUirCheckedFuncs: int32 = uirModuleCountHighUirCheckedFuncs(mod)
-    let lowUirLoweredFuncs: int32 = uirModuleCountLowUirLoweredFuncs(mod)
-    let highUirFallbackFuncs: int32 = uirModuleCountHighUirFallbackFuncs(mod)
-    if driver_envIsTrue("BACKEND_DEBUG_SYMBOL_CLOSURE"):
-        let dbgOut: os.File = os.get_stderr()
-        driver_writeLine(dbgOut,
-                     "backend_driver: symbol_closure hasFunc(astKidAt)=" +
-                     (driver_moduleHasFuncNamed(mod, "astKidAt") ? "1" : "0"))
-        driver_writeLine(dbgOut,
-                     "backend_driver: symbol_closure hasFunc(parseModuleWithDiagnosticsId)=" +
-                     (driver_moduleHasFuncNamed(mod, "parseModuleWithDiagnosticsId") ? "1" : "0"))
-        driver_writeLine(dbgOut,
-                     "backend_driver: symbol_closure hasFunc(loadImportsId)=" +
-                     (driver_moduleHasFuncNamed(mod, "loadImportsId") ? "1" : "0"))
-        driver_writeLine(dbgOut,
-                     "backend_driver: symbol_closure hasFunc(machoParseObjFromBuf)=" +
-                     (driver_moduleHasFuncNamed(mod, "machoParseObjFromBuf") ? "1" : "0"))
-        driver_writeLine(dbgOut,
-                     "backend_driver: symbol_closure hasFunc(backendStripSpaces)=" +
-                     (driver_moduleHasFuncNamed(mod, "backendStripSpaces") ? "1" : "0"))
-    driver_emitGenericsReport(uirProfile.enabled, backendIr, genericMode, genericSpecBudget,
-                              borrowIr, genericLowering, 0, 0, 0, 0,
-                              highUirCheckedFuncs, lowUirLoweredFuncs, highUirFallbackFuncs, 0)
+fn driver_activeNoRuntimeC(): bool =
+    return driver_envBoolDefault("BACKEND_NO_RUNTIME_C", true)
 
-    var unitFiles: str[]
-    var unitIndex: DriverUnitIndex = nil
-    var unitStateHashes: int64[]
-    if void*(cache) != nil:
-        unitFiles = cache.unitFiles
-        unitIndex = driver_moduleCacheToUnitIndex(cache)
-    if unitFiles.len == 0:
-        unitFiles = driver_collectUnitFiles(mod)
-    if multi && unitFiles.len > 0 && void*(unitIndex) == nil:
-        unitIndex = driver_buildUnitIndex(mod, unitFiles)
-    if multi && unitStateHashes.len == 0 && unitFiles.len > 0:
-        unitStateHashes = driver_buildUnitFileStateHashes(unitFiles)
-    if void*(cache) == nil && driver_strNonEmpty(moduleCachePath) &&
-       driver_strEq(emitMode, "exe") && multi && !multiLto &&
-       void*(unitIndex) != nil && unitStateHashes.len == unitFiles.len:
-        driver_ensureParentDir(moduleCachePath)
-        let _cacheWritten: bool = driver_writeModuleCache(moduleCachePath, mod, unitIndex,
-                                                          compileStampHash0, unitStateHashes)
-    if void*(cache) == nil && driver_strNonEmpty(moduleCachePath) &&
-       driver_strEq(emitMode, "exe") && multi && !multiLto:
-        driver_profileStepBoth(profile, uirProfile, "module_cache.write")
+fn driver_activeCcCmd(): str =
+    return driver_envDefault("BACKEND_CC", "cc")
 
-    if driver_strNonEmpty(unitBatchFile):
-        panic "backend_driver: BACKEND_UNIT_BATCH_FILE is disabled in bootstrap-compatible mode"
+fn driver_activeCFlags(): str =
+    return driver_envDefault("BACKEND_CFLAGS", "")
 
-    if driver_strNonEmpty(unitFile):
-        panic "backend_driver: BACKEND_UNIT_FILE is disabled in bootstrap-compatible mode"
+fn driver_activeLdFlags(): str =
+    return driver_envDefault("BACKEND_LDFLAGS", "")
 
-    var unitObjDir: str = ""
-    var unitObjPaths: str[]
-    let fastDevProfile: bool = driver_envBoolDefault("BACKEND_FAST_DEV_PROFILE", driver_strEq(buildTrack, "dev"))
-    let directExeDefault: bool = fastDevProfile &&
-                                 driver_strEq(buildTrack, "dev") &&
-                                 driver_strEq(linker, "self")
-    let directExeRequested: bool = driver_envBoolDefault("BACKEND_DIRECT_EXE", directExeDefault)
-    let linkerlessInMemDefault: bool = (fastDevProfile || driver_strEq(buildTrack, "dev")) &&
-                                       driver_strEq(linker, "self")
-    let linkerlessInMem: bool = driver_envBoolDefault("BACKEND_LINKERLESS_INMEM", linkerlessInMemDefault)
-    let directExeSupported: bool = directExeRequested &&
-        driver_strEq(linker, "self") && driver_targetIsDarwin(target) && driver_targetIsAarch64(target)
-    if driver_strEq(emitMode, "obj"):
-        driver_emitObjFromModule(mod, optLevel, target, objWriter, outputPath,
-                                 uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy,
-                                 validateEnabled ? 1 : 0)
-        driver_profileStepBoth(profile, uirProfile, "single.emit_obj_bytes")
-        driver_profileStepBoth(profile, uirProfile, "single.emit_obj_file")
-        return 0
-    if driver_strEq(emitMode, "c"):
-        cEmitModuleToFileOrPanic(mod, outputPath)
-        driver_profileStepBoth(profile, uirProfile, "single.emit_c_text")
-        return 0
-    if directExeRequested && !directExeSupported:
-        driver_panic("backend_driver: direct-exe requested but unsupported for target/linker: target=" +
-                     target + " linker=" + linker)
-    if multi && unitFiles.len > 0:
-        unitObjDir = outputPath + ".tmp.unitobjs"
-        driver_runCmd("rm -rf " + driver_shellQuote(unitObjDir))
-        driver_runCmd("mkdir -p " + driver_shellQuote(unitObjDir))
-        var pendingUnits: str[]
-        var pendingObjs: str[]
-        var pendingUnitIdxs: int32[]
-        for ui in 0..<unitFiles.len:
-            let unitPath: str = driver_trimAsciiSpace(unitFiles[ui])
-            if driver_strIsEmpty(unitPath):
-                continue
-            let objPathUnit: str = unitObjDir + "/u" + intToStr(ui) + ".o"
-            add(pendingUnits, unitPath)
-            add(pendingObjs, objPathUnit)
-            add(pendingUnitIdxs, ui)
-            add(unitObjPaths, objPathUnit)
-        if pendingUnits.len > 0:
-            var emittedParallel: bool = false
-            if jobs > 1 && void*(unitIndex) != nil:
-                emittedParallel = driver_runParallelUnitBatchesFork(mod, optLevel, unitIndex, target, objWriter,
-                                                                    pendingUnits, pendingObjs,
-                                                                    uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy,
-                                                                    pendingUnitIdxs, jobs)
-            if !emittedParallel:
-                driver_runSerialUnitBatches(mod, optLevel, unitIndex, target, objWriter,
-                                            pendingUnits, pendingObjs,
-                                            uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
-            driver_profileStepBoth(profile, uirProfile, "multi.emit_unit_objs")
-    if unitObjPaths.len > 0:
-        driver_linkExeObjects(unitObjPaths, target, linker, linkerSymtabAll, ldCmd, cflags, ldflags,
-                              outputPath, runtimeObj, runtimeC, noRuntimeC, genericMode)
-        driver_profileStepBoth(profile, uirProfile, "multi.link")
-        if !driver_envBoolDefault("BACKEND_KEEP_TMP_LINKOBJ", false):
-            driver_runCmd("rm -rf " + driver_shellQuote(unitObjDir))
-        return 0
-    if directExeSupported || linkerlessInMem:
-        let mainObjBytesMem: uint8[] = driver_emitObjBytesFromModule(mod, optLevel, target, objWriter,
-                                                                      uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy,
-                                                                      validateEnabled ? 1 : 0)
-        driver_profileStepBoth(profile, uirProfile, "direct_exe.emit_main_obj_mem")
-        if driver_tryLinkExeMainObjMem(mainObjBytesMem, target, linker, linkerSymtabAll, outputPath, runtimeObj,
-                                       profile, uirProfile):
-            driver_profileStepBoth(profile, uirProfile, "single.link_mem")
-            return 0
-        driver_panic("backend_driver: in-memory executable link path is required but unavailable")
-    let objPath: str = outputPath + ".tmp.linkobj"
-    driver_emitObjFromModule(mod, optLevel, target, objWriter, objPath,
-                             uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy,
-                             validateEnabled ? 1 : 0)
-    driver_profileStepBoth(profile, uirProfile, "single.emit_obj_bytes")
-    driver_profileStepBoth(profile, uirProfile, "single.emit_obj_file")
-    driver_profileStepBoth(profile, uirProfile, "single.emit_tmp_obj")
+fn driver_activeLinkerSymtabAll(): bool =
+    return driver_parseLinkerSymtabAll(driver_envDefault("BACKEND_LINKER_SYMTAB", ""))
+
+fn driver_buildActiveModule(inputPath: str, target: str): UirModule =
+    driver_bootMark(21)
+    let stableInput: str = driver_trimAsciiSpace(inputPath)
+    let stableTarget: str = driver_trimAsciiSpace(target)
+    driver_debugInputTrace("build_input", stableInput)
+    if len(stableInput) == 0:
+        driver_panic("backend_driver: BACKEND_INPUT required")
+    return uir_builder.uirBuildModuleFromFileStage1TargetOrPanic(stableInput, stableTarget)
+
+fn driver_buildActiveModuleNative(): UirModule =
+    return driver_buildActiveModule(driver_activeInputPath(), driver_activeTarget())
+
+fn driver_buildActiveModulePtrs(inputRaw: void*, targetRaw: void*): void* =
+    return void*(driver_buildActiveModule(driver_copy_cstring_owned(inputRaw),
+                                          driver_copy_cstring_owned(targetRaw)))
+
+fn driver_debugBuildModuleDumpPtrs(inputRaw: void*, targetRaw: void*): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    driver_writeErrLine(uirCoreFormat(module))
+    return 0
+
+fn driver_debugBuildModuleDumpToFilePtrs(inputRaw: void*, targetRaw: void*, outRaw: void*): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let outPath: str = driver_copy_cstring_owned(outRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    os.writeFile(outPath, uirCoreFormat(module))
+    return 0
+
+fn driver_debugFindFuncByName(module: UirModule, funcName: str): UirFunc =
+    if void*(module) == nil:
+        return nil
+    for i in 0..<uir_types.uirModuleFuncsLen(module):
+        let f: UirFunc = uir_types.uirModuleFuncAt(module, i)
+        if void*(f) == nil:
+            continue
+        if driver_strEq(uir_types.uirFuncNameOf(f), funcName) || driver_strEq(uir_types.uirFuncLinkNameOf(f), funcName):
+            return f
+    return nil
+
+fn driver_debugFuncBlockCountPtrs(inputRaw: void*, targetRaw: void*, funcRaw: void*): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let funcName: str = driver_copy_cstring_owned(funcRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    let f: UirFunc = driver_debugFindFuncByName(module, funcName)
+    if void*(f) == nil:
+        return -1
+    return uir_types.uirFuncBlocksLen(f)
+
+fn driver_debugFuncBlockStmtCountPtrs(inputRaw: void*, targetRaw: void*, funcRaw: void*, blockIndex: int32): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let funcName: str = driver_copy_cstring_owned(funcRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    let f: UirFunc = driver_debugFindFuncByName(module, funcName)
+    if void*(f) == nil:
+        return -1
+    if blockIndex < 0 || blockIndex >= uir_types.uirFuncBlocksLen(f):
+        return -2
+    let blk: UirLowerBlock = uir_types.uirFuncBlockAt(f, blockIndex)
+    return uir_types.uirBlockStmtsLen(blk)
+
+fn driver_debugFuncBlockTermKindPtrs(inputRaw: void*, targetRaw: void*, funcRaw: void*, blockIndex: int32): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let funcName: str = driver_copy_cstring_owned(funcRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    let f: UirFunc = driver_debugFindFuncByName(module, funcName)
+    if void*(f) == nil:
+        return -1
+    if blockIndex < 0 || blockIndex >= uir_types.uirFuncBlocksLen(f):
+        return -2
+    let blk: UirLowerBlock = uir_types.uirFuncBlockAt(f, blockIndex)
+    return int32(uir_types.uirTermKindOf(uir_types.uirBlockTermOf(blk)))
+
+fn driver_debugModuleFuncBlockCountByIndexPtrs(inputRaw: void*, targetRaw: void*, funcIndex: int32): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    if void*(module) == nil:
+        return -1
+    if funcIndex < 0 || funcIndex >= uir_types.uirModuleFuncsLen(module):
+        return -2
+    let f: UirFunc = uir_types.uirModuleFuncAt(module, funcIndex)
+    if void*(f) == nil:
+        return -3
+    return uir_types.uirFuncBlocksLen(f)
+
+fn driver_debugModuleFuncBlockStmtCountByIndexPtrs(inputRaw: void*, targetRaw: void*, funcIndex: int32, blockIndex: int32): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    if void*(module) == nil:
+        return -1
+    if funcIndex < 0 || funcIndex >= uir_types.uirModuleFuncsLen(module):
+        return -2
+    let f: UirFunc = uir_types.uirModuleFuncAt(module, funcIndex)
+    if void*(f) == nil:
+        return -3
+    if blockIndex < 0 || blockIndex >= uir_types.uirFuncBlocksLen(f):
+        return -4
+    let blk: UirLowerBlock = uir_types.uirFuncBlockAt(f, blockIndex)
+    return uir_types.uirBlockStmtsLen(blk)
+
+fn driver_debugModuleFuncBlockTermKindByIndexPtrs(inputRaw: void*, targetRaw: void*, funcIndex: int32, blockIndex: int32): int32 =
+    let inputPath: str = driver_copy_cstring_owned(inputRaw)
+    let target: str = driver_copy_cstring_owned(targetRaw)
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    if void*(module) == nil:
+        return -1
+    if funcIndex < 0 || funcIndex >= uir_types.uirModuleFuncsLen(module):
+        return -2
+    let f: UirFunc = uir_types.uirModuleFuncAt(module, funcIndex)
+    if void*(f) == nil:
+        return -3
+    if blockIndex < 0 || blockIndex >= uir_types.uirFuncBlocksLen(f):
+        return -4
+    let blk: UirLowerBlock = uir_types.uirFuncBlockAt(f, blockIndex)
+    return int32(uir_types.uirTermKindOf(uir_types.uirBlockTermOf(blk)))
+
+fn driver_backendBuildActiveObjNative(): int32 =
+    return driver_c_build_active_obj_default()
+
+fn driver_backendBuildActiveExeNative(): int32 =
+    return driver_c_build_active_exe_default()
+
+fn driver_backendBuildActiveObjNativePtrs(inputRaw: void*, targetRaw: void*, outputRaw: void*): int32 =
+    return driver_c_build_emit_obj_default(driver_copy_cstring_owned(inputRaw),
+                                           driver_copy_cstring_owned(targetRaw),
+                                           driver_copy_cstring_owned(outputRaw))
+
+fn driver_backendBuildActiveExeNativePtrs(inputRaw: void*, targetRaw: void*, outputRaw: void*, linkerRaw: void*): int32 =
+    return driver_c_build_link_exe_default(driver_copy_cstring_owned(inputRaw),
+                                           driver_copy_cstring_owned(targetRaw),
+                                           driver_copy_cstring_owned(outputRaw),
+                                           driver_copy_cstring_owned(linkerRaw))
+
+fn driver_backendEmitIsObj(): bool =
+    if driver_c_env_nonempty("BACKEND_EMIT") == 0:
+        return false
+    if driver_c_env_eq("BACKEND_EMIT", "exe") != 0:
+        return false
+    if driver_c_env_eq("BACKEND_EMIT", "obj") != 0:
+        if driver_c_env_bool("BACKEND_INTERNAL_ALLOW_EMIT_OBJ", 0) != 0:
+            return true
+    driver_panic("backend_driver: invalid emit mode (expected exe)")
+    return false
+
+fn driver_backendEmitObjCore(mod: UirModule, outputPath: str, target: str): int32 =
+    driver_bootMark(1)
+    let rc: int32 = driver_emitObjFromModuleDefault(mod, target, outputPath)
+    driver_bootMark(2)
+    return rc
+
+fn driver_backendFinishEmitObj(outputPath: str): int32 =
+    return driver_c_finish_emit_obj(outputPath)
+
+fn driver_backendTmpObjPath(outputPath: str): str =
+    return outputPath + ".tmp.linkobj"
+
+fn driver_backendEmitTmpLinkObj(mod: UirModule, outputPath: str, target: str): str =
+    let objPath: str = driver_backendTmpObjPath(outputPath)
+    driver_bootMark(3)
+    if driver_emitObjFromModuleDefault(mod, target, objPath) != 0:
+        driver_exit(1)
+    driver_bootMark(4)
+    return objPath
+
+fn driver_backendLinkTmpObjDefault(outputPath: str, objPath: str, target: str, linker: str): int32 =
     var linkObjs2: str[]
-    add(linkObjs2, objPath)
-    driver_linkExeObjects(linkObjs2, target, linker, linkerSymtabAll, ldCmd, cflags, ldflags,
-                          outputPath, runtimeObj, runtimeC, noRuntimeC, genericMode)
-    driver_profileStepBoth(profile, uirProfile, "single.link")
+    seqAdd(linkObjs2, objPath)
+    return driver_linkExeObjects(linkObjs2, target, linker, false, "cc", "", "",
+                                 outputPath, "", "src/runtime/native/system_helpers.c", false, "dict")
+
+fn driver_backendLinkTmpObj(outputPath: str, objPath: str, target: str, linker: str): int32 =
+    let runtimeObj: str = driver_activeRuntimeObj()
+    let runtimeC: str = driver_activeRuntimeC()
+    let noRuntimeC: bool = driver_activeNoRuntimeC()
+    let ccCmd: str = driver_activeCcCmd()
+    let ldCmd: str = driver_activeLdCmd(ccCmd)
+    let cflags: str = driver_activeCFlags()
+    let ldflags: str = driver_activeLdFlags()
+    let linkerSymtabAll: bool = driver_activeLinkerSymtabAll()
+    let genericMode: str = "dict"
+    var linkObjs2: str[]
+    seqAdd(linkObjs2, objPath)
+    return driver_linkExeObjects(linkObjs2, target, linker, linkerSymtabAll, ldCmd, cflags, ldflags,
+                                 outputPath, runtimeObj, runtimeC, noRuntimeC, genericMode)
+
+fn driver_backendCleanupTmpLinkObj(objPath: str): int32 =
     if !driver_envBoolDefault("BACKEND_KEEP_TMP_LINKOBJ", false):
         driver_runCmd("rm -f " + driver_shellQuote(objPath))
     return 0
 
+fn driver_backendFinishSingleLink(outputPath: str, objPath: str): int32 =
+    return driver_c_finish_single_link(outputPath, objPath)
+
+fn driver_backendRunObjEmit(inputPath: str, target: str, outputPath: str): int32 =
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    let emitRc: int32 = driver_backendEmitObjCore(module, outputPath, target)
+    if emitRc != 0:
+        return emitRc
+    return driver_backendFinishEmitObj(outputPath)
+
+fn driver_backendRunObjMode(target: str): int32 =
+    let resolvedTarget: str = target
+    let inputPath: str = driver_activeInputPath()
+    let outputPath: str = driver_activeOutputPath(inputPath)
+    return driver_backendRunObjEmit(inputPath, resolvedTarget, outputPath)
+
+fn driver_backendRunExeFinish(outputPath: str, target: str, linker: str, objPath: str): int32 =
+    driver_bootMark(6)
+    let _linker: str = linker
+    if driver_c_link_tmp_obj_system(outputPath, objPath, target) != 0:
+        return 1
+    driver_bootMark(7)
+    return driver_backendFinishSingleLink(outputPath, objPath)
+
+fn driver_backendRunExeLink(inputPath: str, target: str, outputPath: str, linker: str): int32 =
+    driver_debugBootLine("[drv]exe_link_enter")
+    let module: UirModule = driver_buildActiveModule(inputPath, target)
+    driver_debugBootLine("[drv]exe_link_built")
+    let objPath: str = driver_backendEmitTmpLinkObj(module, outputPath, target)
+    driver_debugBootLine("[drv]exe_link_obj")
+    let linkRc: int32 = driver_backendLinkTmpObj(outputPath, objPath, target, linker)
+    if linkRc != 0:
+        return linkRc
+    driver_debugBootLine("[drv]exe_link_linked")
+    return driver_backendFinishSingleLink(outputPath, objPath)
+
+fn driver_backendRunExeMode(target: str): int32 =
+    let resolvedTarget: str = target
+    let inputPath: str = driver_activeInputPath()
+    let outputPath: str = driver_activeOutputPath(inputPath)
+    let linker: str = driver_activeLinker()
+    return driver_backendRunExeLink(inputPath, resolvedTarget, outputPath, linker)
+
+fn driver_backendResolveInputPath(): str =
+    let cliInput: str = driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_cli_input_copy()))
+    driver_debugInputTrace("cli_input", cliInput)
+    if driver_strNonEmpty(cliInput):
+        return cliInput
+    let cliFallback: str = driver_trimAsciiSpace(driver_cliInputPath())
+    if driver_strNonEmpty(cliFallback):
+        return cliFallback
+    let envInput: str = driver_trimAsciiSpace(os.getEnvDefault("BACKEND_INPUT", ""))
+    driver_debugInputTrace("env_nonempty", driver_strNonEmpty(envInput) ? "1" : "0")
+    if driver_strNonEmpty(envInput):
+        driver_debugInputTrace("env_input", envInput)
+        return envInput
+    let envInputCompat: str = driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_getenv_copy("BACKEND_INPUT")))
+    if driver_strNonEmpty(envInputCompat):
+        driver_debugInputTrace("env_input_compat", envInputCompat)
+        return envInputCompat
+    let activeRaw: void* = driver_c_active_input_path()
+    driver_debugInputRawTrace("active_input", activeRaw)
+    let activeInput: str = driver_trimAsciiSpace(driver_cstringToStr(activeRaw))
+    driver_debugInputTrace("active_input", activeInput)
+    return activeInput
+
+fn driver_backendResolveTarget(): str =
+    let cliTarget: str = driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_cli_target_copy()))
+    var raw: str = driver_lowerAscii(driver_trimAsciiSpace(cliTarget))
+    if driver_strIsEmpty(raw):
+        raw = driver_lowerAscii(driver_trimAsciiSpace(driver_cliTarget()))
+    if driver_strIsEmpty(raw):
+        raw = driver_lowerAscii(driver_trimAsciiSpace(os.getEnvDefault("BACKEND_TARGET", "")))
+    if driver_strIsEmpty(raw):
+        raw = driver_lowerAscii(driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_getenv_copy("BACKEND_TARGET"))))
+    if driver_strNonEmpty(raw):
+        if driver_strEq(raw, "arm64-apple-darwin") ||
+           driver_strEq(raw, "aarch64-apple-darwin") ||
+           driver_strEq(raw, "arm64-darwin") ||
+           driver_strEq(raw, "aarch64-darwin") ||
+           driver_strEq(raw, "darwin_arm64") ||
+           driver_strEq(raw, "darwin_aarch64"):
+            return "arm64-apple-darwin"
+        if driver_strEq(raw, "auto") || driver_strEq(raw, "native") || driver_strEq(raw, "host"):
+            let detected: str = driver_detectHostTargetAuto()
+            if driver_strIsEmpty(detected):
+                driver_panic("backend_driver: auto target detect failed; pass --target=<triple> or set BACKEND_TARGET")
+            return detected
+        return raw
+    let activeTarget: str = driver_trimAsciiSpace(driver_c_active_target())
+    if driver_strNonEmpty(activeTarget):
+        return activeTarget
+    let detected: str = driver_detectHostTargetAuto()
+    if driver_strNonEmpty(detected):
+        return detected
+    return "arm64-apple-darwin"
+
+fn driver_backendResolveOutputPath(inputPath: str): str =
+    let cliOutput: str = driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_cli_output_copy()))
+    if driver_strNonEmpty(cliOutput):
+        return cliOutput
+    let cliFallback: str = driver_trimAsciiSpace(driver_cliOutputPath())
+    if driver_strNonEmpty(cliFallback):
+        return cliFallback
+    let envOutput: str = driver_trimAsciiSpace(os.getEnvDefault("BACKEND_OUTPUT", ""))
+    if driver_strNonEmpty(envOutput):
+        return envOutput
+    let envOutputCompat: str = driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_getenv_copy("BACKEND_OUTPUT")))
+    if driver_strNonEmpty(envOutputCompat):
+        return envOutputCompat
+    return driver_trimAsciiSpace(driver_cstringToStr(driver_c_active_output_path(inputPath)))
+
+fn driver_backendResolveLinker(): str =
+    var cliLinker: str = driver_lowerAscii(driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_cli_linker_copy())))
+    if driver_strIsEmpty(cliLinker):
+        cliLinker = driver_lowerAscii(driver_trimAsciiSpace(driver_cliLinker()))
+    if driver_strIsEmpty(cliLinker):
+        cliLinker = driver_lowerAscii(driver_trimAsciiSpace(os.getEnvDefault("BACKEND_LINKER", "")))
+    if driver_strIsEmpty(cliLinker):
+        cliLinker = driver_lowerAscii(driver_trimAsciiSpace(driver_copy_cstring_owned(driver_c_getenv_copy("BACKEND_LINKER"))))
+    if driver_strEq(cliLinker, "system"):
+        return "system"
+    if driver_strEq(cliLinker, "self"):
+        return "self"
+    if driver_strNonEmpty(cliLinker):
+        driver_panic("backend_driver: invalid BACKEND_LINKER (expected self|system): " + cliLinker)
+    return driver_trimAsciiSpace(driver_c_active_linker())
+
+fn driver_backendRun(): int32 =
+    driver_debugBootLine("[drv]run_enter")
+    driver_bootMark(20)
+    let target: str = driver_activeTarget()
+    if driver_strIsEmpty(target):
+        driver_panic("backend_driver: empty target")
+    if driver_backendEmitIsObj():
+        return driver_backendRunObjMode(target)
+    return driver_backendRunExeMode(target)
+
+fn backendMainNative(): int32 =
+    driver_debugBootLine("[drv]native_enter")
+    return driver_backendRun()
 fn backendMain(): int32 =
-    driver_failRemovedEnv("BACKEND_DRIVER_NATIVE_BIN", "single canonical backend_driver only")
-    driver_failRemovedBoolEnvEnabled("BACKEND_DRIVER_NATIVE_DISPATCHED", "single canonical backend_driver only")
+    driver_debugBootLine("[drv]backend_enter")
     return backendMainNative()
 
-fn main(argc: int32, argv: str*): int32 =
-    let _argc: int32 = argc
-    let _argv: str* = argv
-    # Keep selftest minimal to avoid pulling large generic helper surfaces into
-    # the production bootstrap binary.
-    if driver_strEq(driver_envDefault("BACKEND_SELFTEST", ""), "1"):
-        let f: os.File = os.get_stderr()
-        driver_writeLine(f, "selftest: seq<int32>")
-        var xs: int32[]
-        add(xs, 1)
-        add(xs, 2)
-        if xs.len != 2 || xs[0] != 1 || xs[1] != 2:
-            panic "selftest: seq<int32> failed"
-        driver_writeLine(f, "selftest: ok")
-        return 0
+fn main(): int32 =
+    if driver_c_help_requested() != 0:
+        return driver_c_backend_usage()
+    driver_debugBootLine("[drv]main_enter")
     return backendMain()

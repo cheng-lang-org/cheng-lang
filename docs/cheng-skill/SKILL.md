@@ -43,7 +43,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - 序列字面量：仅 `[]` / `[a, b, c]`；重置序列用 `xs = []`；`@[]` 已移除（会报错）。
 - 序列初始化：标准库不再提供 `newSeq/newSeqWithCap` 作为初始化入口；使用带类型标注省略初始化（零值）+ `reserve/setLen` 等 API。
 - `std/cmdline` 已升级为统一命令行解析入口：支持 `programName/argCount/argStr/findFlag/hasFlag/readFlagValue/readFlagValueAt2/parseBool/parseInt32`，并兼容 `--k:v`、`--k=v`、`--k v` 三种取值格式。
-- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）：非 C ABI 模块默认禁指针（C ABI bridge 按策略豁免）。
+- no-pointer 生产口径（`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1`）：用户源码模块默认禁指针，`@importc/@exportc` 等 C ABI 声明不再豁免；该环境变量名仅为兼容保留。
   - 禁用指针类型：`T*`、`void*`、`ref T`、`ptr[T]`。
   - 禁用指针操作：`&`、`*`、`->`、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
   - 违规则报 `no-pointer policy` 诊断。
@@ -71,19 +71,19 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
   - system linker 优先级变量：`BACKEND_SYSTEM_LINKER_PRIORITY`（默认 `mold,lld,default`）。
   - Dev 热更默认：`BACKEND_HOTPATCH_MODE=trampoline`、`BACKEND_HOSTRUNNER_POOL_MB=512`、`BACKEND_HOSTRUNNER_PAGE_POLICY=rw_rx`、`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program`、`BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
   - Dev 编译默认：`BACKEND_INCREMENTAL=1` + `CHENGC_DEV_MULTI_DEFAULT=1`；`BACKEND_MULTI_MODULE_CACHE` 默认 `0`，stable driver 当前固定禁用 module-cache load 路径（不作为生产配置面）；可选 `CHENGC_DAEMON=1` 使用 `chengc_daemon` 常驻 worker。
-  - Dev fast 自举默认注入：`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`；strict/release 默认 `full/serial/0`。
+  - Dev fast 自举默认注入：`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`；strict/release 默认 `full/ws/0`。
   - `emit=obj` 为 internal gate 兼容入口，需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`；公共入口 `chengc` 固定拒绝 obj 输出。
 - 生产闭环入口 `$TOOLING backend_prod_closure` 仅接受 `ABI=v2_noptr`。
 - 验证入口迁移：`verify_*` 已并入 `cheng_tooling` 原生子命令；统一执行口径为 `$TOOLING <verify_id>`。
 - 命令落点建议：优先使用 `TOOLING=artifacts/tooling_cmd/cheng_tooling`，文档中的 `cheng_tooling ...` 命令可等价替换为 `$TOOLING ...`，避免 PATH 差异。
 - 主闭环默认 no-pointer 兼容口径（`STAGE1_STD_NO_POINTERS=1`、`STAGE1_STD_NO_POINTERS_STRICT=0`、`STAGE1_NO_POINTERS_NON_C_ABI=1`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`），strict `std` 门禁由 `verify_backend_abi_v2_noptr` 专项覆盖。
-- `verify_backend_abi_v2_noptr` 固定仅校验 `v2_noptr`；其 non-C-ABI 子门禁会显式设 `STAGE1_STD_NO_POINTERS=0` 以隔离诊断，且默认 `BACKEND_ABI_V2_NOPTR_NON_C_ABI_STRICT=1`（阻断）。
+- `verify_backend_abi_v2_noptr` 固定仅校验 `v2_noptr`；其用户源码 no-pointer 子门禁会显式设 `STAGE1_STD_NO_POINTERS=0` 以隔离诊断，且默认 `BACKEND_ABI_V2_NOPTR_NON_C_ABI_STRICT=1`（阻断）。
 - `verify_backend_closedloop` 默认执行 `backend.spawn_api_gate`（v2 友好 fixture，默认 API 禁 raw spawn、legacy 显式入口可用）。
 - `backend_prod_closure` 主门禁固定通过 `$TOOLING driver-path --path-only` 使用 canonical driver（默认 `artifacts/backend_driver/cheng`）；缺失则重建，体检失败阻断。生产口径不再接受旧 driver 覆盖环境变量，也不再自动回退 seed/selfhost/dist 候选。
 - `backend_prod_closure` 的 stage0 探针与 selfhost 口径对齐（`STAGE1_NO_POINTERS_NON_C_ABI=0`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`、`GENERIC_MODE=dict`、`GENERIC_SPEC_BUDGET=0`），避免误选不稳定 stage0。
 - `backend_prod_closure` 主门禁固定 stable driver（默认 `artifacts/backend_driver/cheng`）；selfhost 仅用于 stage0/专项 gate，不再自动切换主门禁 driver。
-- `backend_prod_closure` 的 selfhost 自举步骤默认会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`；non-C-ABI no-pointer 收敛由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁负责。
-- `backend.abi_v2_noptr` 在 `backend_prod_closure` 中默认优先使用本地 canonical driver `artifacts/backend_driver/cheng`（要求具备 non-C-ABI no-pointer 诊断字符串）；`BACKEND_ABI_V2_DRIVER` 仅用于专项排障覆盖。
+- `backend_prod_closure` 的 selfhost 自举步骤默认会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`；该放宽仅用于编译器/运行时内部源码，自举后的用户源码 no-pointer 收敛由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁负责。
+- `backend.abi_v2_noptr` 在 `backend_prod_closure` 中默认优先使用本地 canonical driver `artifacts/backend_driver/cheng`（要求具备 user-surface no-pointer 诊断字符串）；`BACKEND_ABI_V2_DRIVER` 仅用于专项排障覆盖。
 - `backend.import_cycle_predeclare` 已切为纯 runtime 门禁：负例必须 compile fail 且包含 `Import cycle detected: ... -> ...` 链路，不再接受 source-contract fallback。
 - `build_backend_driver` 自举编译会固定注入必要的 `BACKEND_*`/`STAGE1_*` 参数，并保持 seed stage0 口径一致。
 - `$TOOLING build-backend-driver` 固定只使用 `artifacts/backend_driver/cheng` 作为 stage0，不支持旧候选链回退。

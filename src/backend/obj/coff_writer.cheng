@@ -76,6 +76,9 @@ fn coff_targetIsWindows(target: str): bool =
         return false
     return coff_strContains(target, "windows") || coff_strContains(target, "msvc")
 
+fn coff_isPrivateFuncSym(name: str): bool =
+    return strings.hasPrefix(name, "__cheng_global_init")
+
 fn coff_strCmp(a: str, b: str): int32 =
     if a == b:
         return 0
@@ -204,22 +207,23 @@ fn coffSeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
 fn coffModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
     if void*(mod) == nil:
         return nil
-    return coffSeqAtMachineFunc(mod.funcs, idx)
+    return machineModuleFuncAt(mod, idx)
 
 fn coffModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
+    var zero: MachineCString
     if void*(mod) == nil:
-        return nil
-    return coffSeqAtMachineCString(mod.cstrs, idx)
+        return zero
+    return machineModuleCStringAt(mod, idx)
 
 fn coffModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
     if void*(mod) == nil:
         return nil
-    return coffSeqAtMachineGlobal(mod.globals, idx)
+    return machineModuleGlobalAt(mod, idx)
 
 fn coffFuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
     if void*(func) == nil:
         return nil
-    return coffSeqAtMachineInst(func.insts, idx)
+    return machineFuncInstAt(func, idx)
 
 fn coffSectionAlignFlag(pow2: int32): uint32 =
     if pow2 <= 0:
@@ -567,13 +571,24 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
             coffAddSym(syms, synthCstrNames[si], synthCstrOffs[si], rdataIndex,
                        uint16(0), IMAGE_SYM_CLASS_STATIC)
 
+    # local funcs
+    for fi in 0..<funcCount:
+        let f2: MachineFunc = coffModuleFuncAtRaw(module, fi)
+        if !coff_isPrivateFuncSym(machineFuncNameOf(f2)):
+            continue
+        coffAddSym(syms, machineFuncNameOf(f2), funcOffs[fi], textIndex,
+                   IMAGE_SYM_TYPE_FUNCTION, IMAGE_SYM_CLASS_STATIC)
+
     let localCount: int32 = syms.len
 
     # extdefs: funcs
     for fi in 0..<funcCount:
         let f2: MachineFunc = coffModuleFuncAtRaw(module, fi)
+        if coff_isPrivateFuncSym(machineFuncNameOf(f2)):
+            continue
+        let storage: uint8 = IMAGE_SYM_CLASS_EXTERNAL
         coffAddSym(syms, machineFuncNameOf(f2), funcOffs[fi], textIndex,
-                   IMAGE_SYM_TYPE_FUNCTION, IMAGE_SYM_CLASS_EXTERNAL)
+                   IMAGE_SYM_TYPE_FUNCTION, storage)
 
     # extdefs: globals
     for gi in 0..<globalCount:

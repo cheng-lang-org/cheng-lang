@@ -92,6 +92,84 @@ type
         byLabel: hashmaps.HashMapStrInt
         values: str[]
 
+fn machoAppendBool(items: var bool[], value: bool) =
+    if items.buffer == nil || items.len >= items.cap:
+        cheng__seqGrowToRaw(&items.buffer, &items.cap, items.len + 1, int32(sizeof bool))
+    let elemBytes: int32 = items.len * int32(sizeof bool)
+    let writePtr: bool* = bool*(ptr_add(items.buffer, elemBytes))
+    *writePtr = value
+    items.len = items.len + 1
+
+fn machoAppendStr(items: var str[], value: str) =
+    if items.buffer == nil || items.len >= items.cap:
+        cheng__seqGrowToRaw(&items.buffer, &items.cap, items.len + 1, int32(sizeof str))
+    let elemBytes: int32 = items.len * int32(sizeof str)
+    let writePtr: str* = str*(ptr_add(items.buffer, elemBytes))
+    *writePtr = value
+    items.len = items.len + 1
+
+fn machoAppendU64(items: var uint64[], value: uint64) =
+    if items.buffer == nil || items.len >= items.cap:
+        cheng__seqGrowToRaw(&items.buffer, &items.cap, items.len + 1, int32(sizeof uint64))
+    let elemBytes: int32 = items.len * int32(sizeof uint64)
+    let writePtr: uint64* = uint64*(ptr_add(items.buffer, elemBytes))
+    *writePtr = value
+    items.len = items.len + 1
+
+fn machoAppendSymbol(items: var MachoObjSymbol[], value: MachoObjSymbol) =
+    if items.buffer == nil || items.len >= items.cap:
+        cheng__seqGrowToRaw(&items.buffer, &items.cap, items.len + 1, int32(sizeof MachoObjSymbol))
+    let elemBytes: int32 = items.len * int32(sizeof MachoObjSymbol)
+    let writePtr: MachoObjSymbol* = MachoObjSymbol*(ptr_add(items.buffer, elemBytes))
+    *writePtr = value
+    items.len = items.len + 1
+
+fn machoObjSectionAppendReloc(section: MachoObjSection, value: MachoObjReloc) =
+    if section == nil:
+        return
+    let idx: int32 = section.relocs.len
+    let needLen: int32 = idx + 1
+    if section.relocs.buffer == nil || section.relocs.cap < needLen:
+        cheng__seqGrowToRaw(&section.relocs.buffer, &section.relocs.cap, needLen, int32(sizeof MachoObjReloc))
+    let writePtr: MachoObjReloc* = MachoObjReloc*(ptr_add(section.relocs.buffer, idx * int32(sizeof MachoObjReloc)))
+    *writePtr = value
+    section.relocs.len = needLen
+
+fn machoObjFileAppendSection(file: MachoObjFile, value: MachoObjSection) =
+    if file == nil:
+        return
+    let idx: int32 = file.sections.len
+    let needLen: int32 = idx + 1
+    if file.sections.buffer == nil || file.sections.cap < needLen:
+        cheng__seqGrowToRaw(&file.sections.buffer, &file.sections.cap, needLen, int32(sizeof MachoObjSection))
+    let writePtr: MachoObjSection* = MachoObjSection*(ptr_add(file.sections.buffer, idx * int32(sizeof MachoObjSection)))
+    *writePtr = value
+    file.sections.len = needLen
+
+fn machoObjFileAppendSymbol(file: MachoObjFile, value: MachoObjSymbol) =
+    if file == nil:
+        return
+    let idx: int32 = file.symbols.len
+    let needLen: int32 = idx + 1
+    if file.symbols.buffer == nil || file.symbols.cap < needLen:
+        cheng__seqGrowToRaw(&file.symbols.buffer, &file.symbols.cap, needLen, int32(sizeof MachoObjSymbol))
+    let writePtr: MachoObjSymbol* = MachoObjSymbol*(ptr_add(file.symbols.buffer, idx * int32(sizeof MachoObjSymbol)))
+    *writePtr = value
+    file.symbols.len = needLen
+
+fn machoLayoutAppendImport(layout: MachoLinkLayout, value: str) =
+    if layout == nil:
+        return
+    machoAppendStr(layout.imports, value)
+
+fn machoAppendObjFile(items: var MachoObjFile[], value: MachoObjFile) =
+    if items.buffer == nil || items.len >= items.cap:
+        cheng__seqGrowToRaw(&items.buffer, &items.cap, items.len + 1, int32(sizeof MachoObjFile))
+    let elemBytes: int32 = items.len * int32(sizeof MachoObjFile)
+    let writePtr: MachoObjFile* = MachoObjFile*(ptr_add(items.buffer, elemBytes))
+    *writePtr = value
+    items.len = items.len + 1
+
 fn Ok_MachoObjFile(value: MachoObjFile): Result[MachoObjFile] =
     var out: Result[MachoObjFile]
     out.ok = true
@@ -305,6 +383,24 @@ fn machoCStringSymbolAlias(rawName: str, canonical: str): str =
         return canonical
     return ""
 
+fn machoOwnStr(s: str): str =
+    let n: int32 = len(s)
+    if n <= 0:
+        return ""
+    let p: void* = alloc(n + 1)
+    copyMem(p, void*(s), n)
+    setMem(rawmemPtrAdd(p, n), 0, 1)
+    return str(p)
+
+fn machoHashGet(m: var hashmaps.HashMapStrInt, key: str): int32 =
+    var keyStable: str = machoOwnStr(key)
+    var found: bool = false
+    return hashmaps.hashMapStrIntGet(m, keyStable, found)
+
+fn machoHashGetRead(m0: hashmaps.HashMapStrInt, key: str): int32 =
+    var m: hashmaps.HashMapStrInt = m0
+    return machoHashGet(m, key)
+
 fn machoAddDefSymbol(defIndex: var hashmaps.HashMapStrInt,
                      defName: var str[],
                      defAddr: var uint64[],
@@ -312,11 +408,11 @@ fn machoAddDefSymbol(defIndex: var hashmaps.HashMapStrInt,
                      relAddr: uint64) =
     if len(name) == 0:
         return
-    if defIndex[name] > 0:
+    if machoHashGet(defIndex, name) > 0:
         return
     hashmaps.hashMapStrIntPut(defIndex, name, defName.len + 1)
-    add(defName, name)
-    add(defAddr, relAddr)
+    machoAppendStr(defName, name)
+    machoAppendU64(defAddr, relAddr)
 
 fn machoBytesRangeToStr(data: uint8[], start: int32, endExclusive: int32): str =
     let _: uint8[] = data
@@ -415,7 +511,7 @@ fn machoReadBytes(buf: bytes.ByteBuffer, off: uint64, size: uint64): uint8[] =
     var out: uint8[n]
     let off32: int32 = int32(off)
     for i in 0..<n:
-        add(out, uint8(bytes.bufByteAt(buf, off32 + i)))
+        bufAddU8(out, uint8(bytes.bufByteAt(buf, off32 + i)))
     return out
 
 fn machoByteBufFromObjBytes(objBytes: uint8[]): bytes.ByteBuffer =
@@ -516,10 +612,10 @@ fn machoParseObjFromBuf(path: str, inBuf: bytes.ByteBuffer): Result[MachoObjFile
                         r.length = int32((rInfo >> 25) & uint32(0x3))
                         r.extern = ((rInfo >> 27) & 1) != 0
                         r.rtype = int32((rInfo >> 28) & uint32(0xF))
-                        add(s.relocs, r)
+                        machoObjSectionAppendReloc(s, r)
                         ri = ri + 1
                         roff = roff + 8
-                add(out.sections, s)
+                machoObjFileAppendSection(out, s)
                 sectOff = sectOff + 80
         elif cmd == LC_SYMTAB:
             if cmdsize < 24:
@@ -556,7 +652,7 @@ fn machoParseObjFromBuf(path: str, inBuf: bytes.ByteBuffer): Result[MachoObjFile
                 sym.name = ""
             else:
                 sym.name = machoReadCStringAt(out.buf, int32(uint64(stroff) + uint64(n_strx)))
-        add(out.symbols, sym)
+        machoObjFileAppendSymbol(out, sym)
 
     return Ok[MachoObjFile](out)
 
@@ -570,7 +666,7 @@ fn machoParseObjMem(pathHint: str, objBytes: uint8[]): Result[MachoObjFile] =
     return machoParseObjFromBuf(hint, inBuf)
 
 fn machoFreeObj(obj: MachoObjFile) =
-    if void*(obj) == nil:
+    if obj == nil:
         return
     if void*(obj.buf.data) != nil:
         obj.buf.data = nil
@@ -578,7 +674,7 @@ fn machoFreeObj(obj: MachoObjFile) =
 fn machoAddU8Ptr(out: var uint8[], v: uint8) =
     if void*(out) == nil:
         return
-    add(out, v)
+    bufAddU8(out, v)
 
 fn machoWriteUleb128(out: var uint8[], v0: uint64) =
     if void*(out) == nil:
@@ -725,24 +821,24 @@ fn machoWriteStubAt(text: var uint8[], stubOff: int32,
 fn machoFindSectionIndexByName(sections: MachoObjSection[], seg: str, sect: str): int32 =
     for i in 0..<sections.len:
         let s: MachoObjSection = sections[i]
-        if void*(s) != nil && (s.segname == seg) && (s.sectname == sect):
+        if s != nil && (s.segname == seg) && (s.sectname == sect):
             return i
     return -1
 
 fn machoSymIsUndef(sym: MachoObjSymbol): bool =
-    if void*(sym) == nil:
+    if sym == nil:
         return false
     let ty: uint8 = uint8(sym.nType & uint8(0x0E))
     return ty == N_UNDF
 
 fn machoSymIsSect(sym: MachoObjSymbol): bool =
-    if void*(sym) == nil:
+    if sym == nil:
         return false
     let ty: uint8 = uint8(sym.nType & uint8(0x0E))
     return ty == N_SECT
 
 fn machoSymIsExt(sym: MachoObjSymbol): bool =
-    if void*(sym) == nil:
+    if sym == nil:
         return false
     return (sym.nType & N_EXT) != 0
 
@@ -797,7 +893,7 @@ fn machoFindRuntimeObjIndex(objs: MachoObjFile[], runtimeObj: str): int32 =
         return -1
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         if machoPathMatchesCandidate(obj.path, runtimeObj):
             return oi
@@ -810,7 +906,7 @@ fn machoCountObjSymbols(objs: MachoObjFile[]): int32 =
     var total: int32 = 0
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         let n: int32 = obj.symbols.len
         if n <= 0:
@@ -843,39 +939,39 @@ fn machoBuildRuntimeSymbolSet(objs: MachoObjFile[], runtimeObj: str): hashmaps.H
     var runtimeSymCap: int32 = 1024
     if runtimeObjIdx >= 0 && runtimeObjIdx < objs.len:
         let runtimeObjForCap: MachoObjFile = objs[runtimeObjIdx]
-        if void*(runtimeObjForCap) != nil:
+        if runtimeObjForCap != nil:
             runtimeSymCap = machoHashCapForSymbols(runtimeObjForCap.symbols.len, 1024)
     var out: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(runtimeSymCap)
     if runtimeObjIdx < 0 || runtimeObjIdx >= objs.len:
         return out
     let runtimeObj: MachoObjFile = objs[runtimeObjIdx]
-    if void*(runtimeObj) == nil:
+    if runtimeObj == nil:
         return out
     for si in 0..<runtimeObj.symbols.len:
         let sym: MachoObjSymbol = runtimeObj.symbols[si]
-        if void*(sym) != nil && machoSymIsSect(sym):
+        if sym != nil && machoSymIsSect(sym):
             if len(sym.name) > 0:
                 hashmaps.hashMapStrIntPut(out, sym.name, 1)
     return out
 
-fn machoRuntimeSymbolSetHas(set: hashmaps.HashMapStrInt, name: str): bool =
+fn machoRuntimeSymbolSetHas(symSet: hashmaps.HashMapStrInt, name: str): bool =
     if len(name) == 0:
         return false
-    return set[name] != 0
+    return machoHashGetRead(symSet, name) != 0
 
 fn machoSynthesizeCStringDefsFromSectionBytes(objs: MachoObjFile[],
                                               layout: MachoLinkLayout,
                                               defIndex: var hashmaps.HashMapStrInt,
                                               defName: var str[],
                                               defAddr: var uint64[]) =
-    if void*(layout) == nil:
+    if layout == nil:
         return
     let dbg: bool = os.getEnvDefault("BACKEND_DEBUG_MACHO", "") == "1"
     var runningCstrOff: uint64 = uint64(0)
     var added: int32 = 0
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         let cstrIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__cstring")
         if cstrIdx < 0:
@@ -918,42 +1014,42 @@ fn machoSynthesizeCStringDefsFromSectionBytes(objs: MachoObjFile[],
 fn machoSynthesizeMissingCStringDefs(objs: MachoObjFile[], layout: MachoLinkLayout,
                                      defIndex: var hashmaps.HashMapStrInt,
                                      defName: var str[], defAddr: var uint64[]) =
-    if void*(layout) == nil:
+    if layout == nil:
         return
     let dbg: bool = os.getEnvDefault("BACKEND_DEBUG_MACHO", "") == "1"
     var missing: str[]
     var missingSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(512)
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         for secIdx in 0..<obj.sections.len:
             let sect: MachoObjSection = obj.sections[secIdx]
-            if void*(sect) == nil || sect.relocs.len <= 0:
+            if sect == nil || sect.relocs.len <= 0:
                 continue
             for ri in 0..<sect.relocs.len:
                 let r: MachoObjReloc = sect.relocs[ri]
                 if !r.extern || r.symIndex < 0 || r.symIndex >= obj.symbols.len:
                     continue
                 let sym: MachoObjSymbol = obj.symbols[r.symIndex]
-                if void*(sym) == nil || !machoSymIsUndef(sym) || !machoSymIsExt(sym):
+                if sym == nil || !machoSymIsUndef(sym) || !machoSymIsExt(sym):
                     continue
                 let canonical: str = machoCanonicalCStringLabel(sym.name)
                 if len(canonical) == 0:
                     continue
-                if defIndex[sym.name] > 0:
+                if machoHashGet(defIndex, sym.name) > 0:
                     continue
-                let canonicalIdxPlus1: int32 = defIndex[canonical]
+                let canonicalIdxPlus1: int32 = machoHashGet(defIndex, canonical)
                 if canonicalIdxPlus1 > 0:
                     let canonicalIdx: int32 = canonicalIdxPlus1 - 1
                     if canonicalIdx >= 0 && canonicalIdx < defAddr.len:
                         let relAddrCanonical: uint64 = defAddr[canonicalIdx]
                         machoAddDefSymbol(defIndex, defName, defAddr, sym.name, relAddrCanonical)
                     continue
-                if missingSeen[sym.name] > 0:
+                if machoHashGet(missingSeen, sym.name) > 0:
                     continue
                 hashmaps.hashMapStrIntPut(missingSeen, sym.name, 1)
-                add(missing, sym.name)
+                machoAppendStr(missing, sym.name)
     if missing.len <= 0:
         return
 
@@ -962,7 +1058,7 @@ fn machoSynthesizeMissingCStringDefs(objs: MachoObjFile[], layout: MachoLinkLayo
     if dbg:
         echo("macho_linker: cstring synth missing_labels=" + intToStr(missing.len) + " root=" + rootPath)
     let synth: MachoCStringSynthIndex = machoBuildCStringSynthIndex(rootPath)
-    if void*(synth) == nil:
+    if synth == nil:
         return
 
     var added: int32 = 0
@@ -970,12 +1066,12 @@ fn machoSynthesizeMissingCStringDefs(objs: MachoObjFile[], layout: MachoLinkLayo
     var missesLogged: int32 = 0
     for i in 0..<missing.len:
         let rawLabel: str = missing[i]
-        if defIndex[rawLabel] > 0:
+        if machoHashGet(defIndex, rawLabel) > 0:
             continue
         let canonical: str = machoCanonicalCStringLabel(rawLabel)
         if len(canonical) == 0:
             continue
-        let canonicalIdxPlus1: int32 = defIndex[canonical]
+        let canonicalIdxPlus1: int32 = machoHashGet(defIndex, canonical)
         if canonicalIdxPlus1 > 0:
             let canonicalIdx: int32 = canonicalIdxPlus1 - 1
             if canonicalIdx >= 0 && canonicalIdx < defAddr.len:
@@ -1034,7 +1130,7 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
 
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         # Merge __text
         let textIdx: int32 = machoFindSectionIndexByName(obj.sections, "__TEXT", "__text")
@@ -1077,12 +1173,9 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
             objBssBase[oi] = layout.bssSize
 
     # Second pass: build global symbol table (defined symbols) and gather imports.
-    var defIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(defMapCap)
-    var defAddr: uint64[]
     var defName: str[]
     var defFromRuntime: bool[]
     var defPath: str[]
-    defAddr.len = 0
     defName.len = 0
     defFromRuntime.len = 0
     defPath.len = 0
@@ -1091,12 +1184,12 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
 
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         let fromRuntimeObj: bool = runtimeObjIdx >= 0 && oi == runtimeObjIdx
         for si in 0..<obj.symbols.len:
             let sym: MachoObjSymbol = obj.symbols[si]
-            if void*(sym) != nil && machoSymIsSect(sym):
+            if sym != nil && machoSymIsSect(sym):
                 if len(sym.name) > 0:
                     # Compute symbol address within merged layout (still relative; final vmaddrs decided later).
                     let sectIndex0: int32 = int32(sym.nSect) - 1
@@ -1116,7 +1209,7 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
                             relAddr = objTextBase[oi] + symOffInSect
 
                         let isExtDef: bool = machoSymIsExt(sym)
-                        let oldIdxPlus1: int32 = defIndex[sym.name]
+                        let oldIdxPlus1: int32 = machoHashGet(layout.defIndex, sym.name)
                         if oldIdxPlus1 > 0:
                             if ! isExtDef:
                                 # Internal/local labels may legitimately collide across objects.
@@ -1135,7 +1228,7 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
                                     continue
                                 elif oldIdx >= 0 && oldIdx < defFromRuntime.len && defFromRuntime[oldIdx]:
                                     # Replace runtime definition with explicit non-runtime definition.
-                                    defAddr[oldIdx] = relAddr
+                                    layout.defAddr[oldIdx] = relAddr
                                     defFromRuntime[oldIdx] = false
                                     if oldIdx >= 0 && oldIdx < defPath.len:
                                         defPath[oldIdx] = obj.path
@@ -1153,8 +1246,8 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
                                 if machoKeepFirstDuplicateRuntimeSymbol(sym.name):
                                     continue
                                 let oldIdx: int32 = oldIdxPlus1 - 1
-                                if oldIdx >= 0 && oldIdx < defAddr.len:
-                                    defAddr[oldIdx] = relAddr
+                                if oldIdx >= 0 && oldIdx < layout.defAddr.len:
+                                    layout.defAddr[oldIdx] = relAddr
                                     if oldIdx >= 0 && oldIdx < defPath.len:
                                         defPath[oldIdx] = obj.path
                                 continue
@@ -1163,34 +1256,34 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
                             if oldIdx2 >= 0 && oldIdx2 < defPath.len:
                                 prevPath2 = defPath[oldIdx2]
                             return Err[MachoLinkLayout]("macho_linker: duplicate symbol: " + sym.name + " (prev=" + prevPath2 + ", cur=" + obj.path + ")")
-                        hashmaps.hashMapStrIntPut(defIndex, sym.name, defName.len + 1)
-                        add(defName, sym.name)
-                        add(defAddr, relAddr)
-                        add(defFromRuntime, fromRuntimeObj)
-                        add(defPath, obj.path)
+                        hashmaps.hashMapStrIntPut(layout.defIndex, sym.name, defName.len + 1)
+                        machoAppendStr(defName, sym.name)
+                        machoAppendU64(layout.defAddr, relAddr)
+                        machoAppendBool(defFromRuntime, fromRuntimeObj)
+                        machoAppendStr(defPath, obj.path)
 
     # Legacy emitter fallback: some emitters can leave L_cheng_str_* as
     # undefined externs without emitting __cstring symbol definitions.
-    machoSynthesizeCStringDefsFromSectionBytes(objs, layout, defIndex, defName, defAddr)
-    machoSynthesizeMissingCStringDefs(objs, layout, defIndex, defName, defAddr)
+    machoSynthesizeCStringDefsFromSectionBytes(objs, layout, layout.defIndex, defName, layout.defAddr)
+    machoSynthesizeMissingCStringDefs(objs, layout, layout.defIndex, defName, layout.defAddr)
 
     # Gather undefined imports used by call/address relocations.
     let importMapCap: int32 = machoHashCapForSymbols(machoCountObjSymbols(objs), 1024)
     var importNeeded: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(importMapCap)
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         for secIdx in 0..<obj.sections.len:
             let sect: MachoObjSection = obj.sections[secIdx]
-            if void*(sect) != nil && sect.relocs.len > 0:
+            if sect != nil && sect.relocs.len > 0:
                 for ri in 0..<sect.relocs.len:
                     let r: MachoObjReloc = sect.relocs[ri]
                     if r.extern && r.symIndex >= 0 && r.symIndex < obj.symbols.len:
                         let sym: MachoObjSymbol = obj.symbols[r.symIndex]
-                        if void*(sym) != nil && machoSymIsUndef(sym) && machoSymIsExt(sym):
+                        if sym != nil && machoSymIsUndef(sym) && machoSymIsExt(sym):
                             if len(sym.name) > 0:
-                                let defIdxPlus1: int32 = defIndex[sym.name]
+                                let defIdxPlus1: int32 = machoHashGet(layout.defIndex, sym.name)
                                 if defIdxPlus1 > 0:
                                     continue
                                 let canonicalCstr: str = machoCanonicalCStringLabel(sym.name)
@@ -1198,66 +1291,63 @@ fn machoMergeObjs(objs: MachoObjFile[], runtimeObj: str): Result[MachoLinkLayout
                                     let off: uint64 = uint64(layout.cstring.len)
                                     obj_buf.bufStr0(layout.cstring, "")
                                     let relAddr: uint64 = MACHO_REL_CSTRING | off
-                                    machoAddDefSymbol(defIndex, defName, defAddr, canonicalCstr, relAddr)
-                                    machoAddDefSymbol(defIndex, defName, defAddr, sym.name, relAddr)
+                                    machoAddDefSymbol(layout.defIndex, defName, layout.defAddr, canonicalCstr, relAddr)
+                                    machoAddDefSymbol(layout.defIndex, defName, layout.defAddr, sym.name, relAddr)
                                     let aliasCstr: str = machoCStringSymbolAlias(sym.name, canonicalCstr)
-                                    machoAddDefSymbol(defIndex, defName, defAddr, aliasCstr, relAddr)
+                                    machoAddDefSymbol(layout.defIndex, defName, layout.defAddr, aliasCstr, relAddr)
                                     continue
                                 if r.rtype == ARM64_RELOC_BRANCH26 || r.rtype == ARM64_RELOC_PAGE21 ||
                                    r.rtype == ARM64_RELOC_PAGEOFF12 || r.rtype == ARM64_RELOC_GOT_LOAD_PAGE21 ||
                                    r.rtype == ARM64_RELOC_GOT_LOAD_PAGEOFF12:
-                                    if importNeeded[sym.name] == 0:
+                                    if machoHashGet(importNeeded, sym.name) == 0:
                                         hashmaps.hashMapStrIntPut(importNeeded, sym.name, 1)
                                 else:
                                     return Err[MachoLinkLayout]("macho_linker: unsupported undefined reloc type (" + intToStr(r.rtype) + ") for " + sym.name)
 
     let dbgImports: bool = os.getEnvDefault("BACKEND_DEBUG_MACHO_IMPORTS", "") == "1"
     if dbgImports:
-        let mallocDefPlus1: int32 = defIndex["_malloc"]
-        let mallocNeed: int32 = importNeeded["_malloc"]
-        let callocDefPlus1: int32 = defIndex["_calloc"]
-        let callocNeed: int32 = importNeeded["_calloc"]
+        let mallocDefPlus1: int32 = machoHashGet(layout.defIndex, "_malloc")
+        let mallocNeed: int32 = machoHashGet(importNeeded, "_malloc")
+        let callocDefPlus1: int32 = machoHashGet(layout.defIndex, "_calloc")
+        let callocNeed: int32 = machoHashGet(importNeeded, "_calloc")
         echo("macho_linker: debug import _malloc need=" + intToStr(mallocNeed) +
              " def_idx_plus1=" + intToStr(mallocDefPlus1))
         echo("macho_linker: debug import _calloc need=" + intToStr(callocNeed) +
              " def_idx_plus1=" + intToStr(callocDefPlus1))
         if mallocDefPlus1 > 0:
             let idx: int32 = mallocDefPlus1 - 1
-            if idx >= 0 && idx < defName.len && idx < defAddr.len:
+            if idx >= 0 && idx < defName.len && idx < layout.defAddr.len:
                 echo("macho_linker: debug _malloc def_name=" + defName[idx] +
-                     " rel=" + intToStr(int32(defAddr[idx] & uint64(0x7FFFFFFF))))
+                     " rel=" + intToStr(int32(layout.defAddr[idx] & uint64(0x7FFFFFFF))))
         if callocDefPlus1 > 0:
             let idx2: int32 = callocDefPlus1 - 1
-            if idx2 >= 0 && idx2 < defName.len && idx2 < defAddr.len:
+            if idx2 >= 0 && idx2 < defName.len && idx2 < layout.defAddr.len:
                 echo("macho_linker: debug _calloc def_name=" + defName[idx2] +
-                     " rel=" + intToStr(int32(defAddr[idx2] & uint64(0x7FFFFFFF))))
+                     " rel=" + intToStr(int32(layout.defAddr[idx2] & uint64(0x7FFFFFFF))))
 
     # Extract imports in stable order (deterministic).
     # hashmaps.HashMapStrInt does not provide iteration; do a scan over all symbol tables for stable order.
     var importSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(importMapCap)
     for oi in 0..<objs.len:
         let obj: MachoObjFile = objs[oi]
-        if void*(obj) == nil:
+        if obj == nil:
             continue
         for si2 in 0..<obj.symbols.len:
             let sym2: MachoObjSymbol = obj.symbols[si2]
-            if void*(sym2) != nil && machoSymIsUndef(sym2) && machoSymIsExt(sym2):
-                let neededFlag: int32 = importNeeded[sym2.name]
+            if sym2 != nil && machoSymIsUndef(sym2) && machoSymIsExt(sym2):
+                let neededFlag: int32 = machoHashGet(importNeeded, sym2.name)
                 if neededFlag > 0:
-                    let defIdxPlus2: int32 = defIndex[sym2.name]
+                    let defIdxPlus2: int32 = machoHashGet(layout.defIndex, sym2.name)
                     if defIdxPlus2 > 0:
                         continue
-                    if importSeen[sym2.name] == 0:
+                    if machoHashGet(importSeen, sym2.name) == 0:
                         hashmaps.hashMapStrIntPut(importSeen, sym2.name, 1)
-                        add(layout.imports, sym2.name)
-
-    layout.defIndex = defIndex
-    layout.defAddr = defAddr
+                        machoLayoutAppendImport(layout, sym2.name)
 
     return Ok[MachoLinkLayout](layout)
 
 fn machoResolveTaggedAddr(layout: MachoLinkLayout, textOff: uint64, cstrOff: uint64, rel: uint64): uint64 =
-    if void*(layout) == nil:
+    if layout == nil:
         return uint64(0)
     if (rel & MACHO_REL_CSTRING) != 0:
         return layout.textVmaddr + cstrOff + (rel & ~MACHO_REL_CSTRING)
@@ -1343,7 +1433,7 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
     layout.linkeditVmaddr = layout.dataVmaddr + layout.dataSegVmSize
 
     # Resolve _main for LC_MAIN entryoff using prebuilt definition index.
-    let mainIdxPlus1: int32 = layout.defIndex["_main"]
+    let mainIdxPlus1: int32 = machoHashGetRead(layout.defIndex, "_main")
     let mainIdx: int32 = mainIdxPlus1 - 1
     if mainIdxPlus1 <= 0 || mainIdx < 0 || mainIdx >= layout.defAddr.len:
         for oi in 0..<objs.len:
@@ -1360,7 +1450,7 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
     # This avoids stage0-sensitive append/write aliasing patterns.
     let stubsBaseOff: uint64 = mergedTextLen
     for __for_guard_stub_fill in 0..<int32(stubBytesLen):
-        add(layout.text, uint8(0))
+        bufAddU8(layout.text, uint8(0))
     var stubAddrs: uint64[layout.imports.len]
     var ptrSlotAddrs: uint64[layout.imports.len]
     stubAddrs.len = int(layout.imports.len)
@@ -1406,7 +1496,7 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
                 var targetAddr: uint64 = 0
                 var isImport: bool = false
                 var resolved: bool = false
-                let defIdxPlus1: int32 = layout.defIndex[symName]
+                let defIdxPlus1: int32 = machoHashGetRead(layout.defIndex, symName)
                 let defIdx: int32 = defIdxPlus1 - 1
                 if defIdxPlus1 > 0 && defIdx >= 0 && defIdx < layout.defAddr.len:
                     let relTarget: uint64 = layout.defAddr[defIdx]
@@ -1415,8 +1505,8 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
 
                 if !resolved:
                     # Unresolved: undefined externs fall back to import stubs.
-                    if void*(sym) != nil && machoSymIsUndef(sym):
-                        let impIdxPlus1: int32 = importIndex[symName]
+                    if sym != nil && machoSymIsUndef(sym):
+                        let impIdxPlus1: int32 = machoHashGet(importIndex, symName)
                         if impIdxPlus1 > 0:
                             let impIdx: int32 = impIdxPlus1 - 1
                             isImport = true
@@ -1456,7 +1546,7 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
         let bindStartOffInDataSeg: uint64 = ptrSlotsOffInData
         machoWriteBindInfo(&bindInfo, uint8(2), bindStartOffInDataSeg, layout.imports)
     else:
-        add(bindInfo, BIND_OPCODE_DONE)
+        bufAddU8(bindInfo, BIND_OPCODE_DONE)
 
     # Build symbol table (extdefs + undefs).
     var syms: MachoObjSymbol[]
@@ -1466,15 +1556,15 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
         var extdefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(extdefCap)
         for oi3 in 0..<objs.len:
             let obj3: MachoObjFile = objs[oi3]
-            if void*(obj3) == nil:
+            if obj3 == nil:
                 continue
             for si4 in 0..<obj3.symbols.len:
                 let sym4: MachoObjSymbol = obj3.symbols[si4]
-                if void*(sym4) != nil && machoSymIsSect(sym4) && machoSymIsExt(sym4):
+                if sym4 != nil && machoSymIsSect(sym4) && machoSymIsExt(sym4):
                     if len(sym4.name) > 0:
-                        if extdefSeen[sym4.name] == 0:
+                        if machoHashGet(extdefSeen, sym4.name) == 0:
                             hashmaps.hashMapStrIntPut(extdefSeen, sym4.name, 1)
-                            let defIdxPlus4: int32 = layout.defIndex[sym4.name]
+                            let defIdxPlus4: int32 = machoHashGetRead(layout.defIndex, sym4.name)
                             let defIdx4: int32 = defIdxPlus4 - 1
                             if defIdxPlus4 <= 0 || defIdx4 < 0 || defIdx4 >= layout.defAddr.len:
                                 for oiFree0 in 0..<objs.len:
@@ -1496,7 +1586,7 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
                                 ds.nSect = uint8(1)
                             ds.nDesc = uint16(0)
                             ds.nValue = addr4
-                            add(syms, ds)
+                            machoAppendSymbol(syms, ds)
         extdefCount = uint32(syms.len)
     else:
         # extdef: _main only (enough for tooling); other symbols can be added later.
@@ -1507,7 +1597,7 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
         mainSym.nSect = uint8(1)
         mainSym.nDesc = uint16(0)
         mainSym.nValue = mainAddr
-        add(syms, mainSym)
+        machoAppendSymbol(syms, mainSym)
         extdefCount = uint32(1)
 
     # undefs
@@ -1519,11 +1609,11 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
         us.nSect = uint8(0)
         us.nDesc = uint16(0)
         us.nValue = uint64(0)
-        add(syms, us)
+        machoAppendSymbol(syms, us)
 
     # String table
     var strtab: uint8[]
-    add(strtab, uint8(0))
+    bufAddU8(strtab, uint8(0))
     var symNameOffs: uint32[syms.len]
     symNameOffs.len = int(syms.len)
     for si3 in 0..<syms.len:
@@ -1787,7 +1877,9 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
         outBytes[int32(layout.linkeditFileOff) + li] = linkedit[li]
 
     if !linkerCoreWriteFileAtomic(outputPath, outBytes):
-        return Err[bool]("macho_linker: failed to write output atomically: " + outputPath)
+        let detail: str = linkerCoreAtomicWriteError()
+        return Err[bool]("macho_linker: failed to write output atomically: " + outputPath +
+                         (len(detail) > 0 ? " (" + detail + ")" : ""))
 
     # Free object buffers.
     for oi in 0..<objs.len:
@@ -1810,7 +1902,7 @@ fn machoLinkExeAarch64(objPaths: str[], outputPath: str, symtabAll: bool,
             for oi in 0..<objs.len:
                 machoFreeObj(objs[oi])
             return ErrInfo[bool](ErrorInfoOf[MachoObjFile](pr))
-        add(objs, Value[MachoObjFile](pr))
+        machoAppendObjFile(objs, Value[MachoObjFile](pr))
     return machoLinkExeAarch64Core(objs, outputPath, symtabAll, runtimeObj)
 
 fn machoLinkExeAarch64MainObjMem(mainObjBytes: uint8[], extraObjPaths: str[],
@@ -1825,7 +1917,7 @@ fn machoLinkExeAarch64MainObjMem(mainObjBytes: uint8[], extraObjPaths: str[],
     let mainParsed: Result[MachoObjFile] = machoParseObjMem("<main_obj_mem>", mainObjBytes)
     if !IsOk[MachoObjFile](mainParsed):
         return ErrInfo[bool](ErrorInfoOf[MachoObjFile](mainParsed))
-    add(objs, Value[MachoObjFile](mainParsed))
+    machoAppendObjFile(objs, Value[MachoObjFile](mainParsed))
     for i in 0..<extraObjPaths.len:
         let p: str = extraObjPaths[i]
         let pr: Result[MachoObjFile] = machoParseObj(p)
@@ -1833,5 +1925,5 @@ fn machoLinkExeAarch64MainObjMem(mainObjBytes: uint8[], extraObjPaths: str[],
             for oi in 0..<objs.len:
                 machoFreeObj(objs[oi])
             return ErrInfo[bool](ErrorInfoOf[MachoObjFile](pr))
-        add(objs, Value[MachoObjFile](pr))
+        machoAppendObjFile(objs, Value[MachoObjFile](pr))
     return machoLinkExeAarch64Core(objs, outputPath, symtabAll, runtimeObj)

@@ -6,6 +6,12 @@ import std/strings
 import std/times
 import std/rawbytes
 
+fn add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+fn add(dst: str[]*, val: str) =
+    seqs.add(dst, val)
+
 type
     File = void*
 
@@ -32,6 +38,7 @@ var SlashStr: str = "/"
 var SingleQuoteStr: str = "'"
 var EmptyQuotedStr: str = "''"
 const osOpenWriteOnly: int32 = 0x0001
+const osOpenReadOnly: int32 = 0
 const osOpenCreate: int32 = 0x0200
 const osOpenTrunc: int32 = 0x0400
 const osFileMode0644: int32 = 420
@@ -105,6 +112,8 @@ fn c_rename(oldPath: cstring, newPath: cstring): int32 =
 fn libc_open(path: cstring, flags: int32, mode: int32): int32
 @importc("write")
 fn libc_write(fd: int32, data: void*, n: int64): int64
+@importc("read")
+fn libc_read(fd: int32, data: void*, n: int64): int64
 @importc("close")
 fn libc_close(fd: int32): int32
 @importc("cheng_exec_cmd_ex")
@@ -220,21 +229,29 @@ fn open(filename: str, mode: FileMode): File =
 fn close(f: File) =
     c_fclose f
 
-fn readAll(f: File): str =
+fn osStoreStrOut(out: str*, value: str) =
+    if out == nil:
+        return
+    store_ptr(void*(out), void*(value))
+
+fn readAllInto(f: File, out: str* = nil): bool =
     if f == nil:
-        return ""
+        osStoreStrOut(out, "")
+        return true
     var cap: int32 = 256
     var lenRead: int32 = 0
     var p: void* = alloc cap
     if p == nil:
-        return ""
+        osStoreStrOut(out, "")
+        return true
     while true:
         var room: int32 = cap - lenRead - 1
         if room <= 0:
             cap = cap * 2
             p = realloc(p, cap)
             if p == nil:
-                return ""
+                osStoreStrOut(out, "")
+                return true
             room = cap - lenRead - 1
             if room <= 0:
                 break
@@ -245,7 +262,13 @@ fn readAll(f: File): str =
         lenRead = lenRead + got
         ioMeterReport(ioRead, int64(got))
     setMem(ptr_add(p, lenRead), 0, 1)
-    return str(p)
+    osStoreStrOut(out, str(p))
+    return true
+
+fn readAll(f: File): str =
+    var out: str = ""
+    let _ok: bool = readAllInto(f, &out)
+    return out
 
 fn write(f: File, s: str) =
     let wrote: int32 = c_fwrite(s, 1, len(s), f)
@@ -396,8 +419,9 @@ fn commandLineParams(): str[] =
     var out: str[]
     if count <= 0:
         return out
+    setLen(out, count)
     for i in 1..count:
-        add(out, cmdline.paramStr(i))
+        out[i - 1] = cmdline.paramStr(i)
     return out
 fn quoteShell(value: str): str =
     if len(value) == 0 || value[0] == char(0):
@@ -634,13 +658,44 @@ fn ptyClose(fd: int32) =
     cheng_pty_close fd
 fn ptyWait(pid: int64, outExitCode: int32*): int32 =
     return cheng_pty_wait(pid, outExitCode)
-fn readFile(path: str): str =
-    let f: File = open(path, fmRead)
+fn readFileSizedInto(path: str, size: int32, out: str* = nil): bool =
+    let f: File = openRead(path)
     if f == nil:
-        return ""
-    let content: str = readAll f
+        osStoreStrOut(out, "")
+        return true
+    let p: void* = alloc(size + 1)
+    if p == nil:
+        c_fclose f
+        osStoreStrOut(out, "")
+        return true
+    let got: int32 = c_fread(p, 1, size, f)
     c_fclose f
-    return content
+    if got > 0:
+        ioMeterReport(ioRead, got)
+    setMem(ptr_add(p, got), 0, 1)
+    if got != size:
+        free p
+        osStoreStrOut(out, "")
+        return true
+    osStoreStrOut(out, str(p))
+    return true
+
+fn readFileInto(path: str, out: str* = nil): bool =
+    let size64: int64 = fileSize(path)
+    if size64 > 0 && size64 <= int64(2147483647):
+        return readFileSizedInto(path, int32(size64), out)
+    let f: File = openRead(path)
+    if f == nil:
+        osStoreStrOut(out, "")
+        return true
+    let ok: bool = readAllInto(f, out)
+    c_fclose f
+    return ok
+
+fn readFile(path: str): str =
+    var out: str = ""
+    let _ok: bool = readFileInto(path, &out)
+    return out
 fn writeFile(path: str, content: str) =
     if len(path) == 0:
         return

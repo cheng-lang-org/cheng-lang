@@ -5,7 +5,7 @@ import std/os
 import backend/uir/[uir_types, uir_opt]
 import backend/uir/[uir_validate]
 import backend/machine/[machine_types, machine_select_aarch64, machine_regalloc]
-import backend/obj/[macho_writer]
+import backend/obj/[macho_writer, elf_writer]
 
 fn uirTargetIsDarwin(target: str): bool =
     if len(target) == 0:
@@ -95,7 +95,6 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
             echo("[codegen.cstr] backfill added=" + intToStr(added) +
                  " module_cstrs=" + intToStr(moduleCstrCount) +
                  " machine_cstrs=" + intToStr(machineModuleCstrsLen(allocated)))
-    allocated.target = target
     if dbgCstr:
         let cCount: int32 = machineModuleCstrsLen(allocated)
         echo("[codegen.cstr] post-regalloc cstrs=" + intToStr(cCount))
@@ -112,11 +111,7 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
                  " len=" + intToStr(vLen) + " b0=" + intToStr(v0) + " b1=" + intToStr(v1))
     if dbgCodegen:
         echo("[codegen] regalloc.end")
-    var out: Result[MachineModule]
-    out.ok = true
-    out.value = allocated
-    out.err = ErrorOk()
-    return out
+    return Ok[MachineModule](allocated)
 
 fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
     var objWriter: str = objWriterRaw
@@ -125,8 +120,10 @@ fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
     if len(objWriter) == 0:
         if uirTargetIsDarwin(target):
             objWriter = "macho"
+        elif uirTargetIsLinuxLike(target):
+            objWriter = "elf"
         else:
-            return Err[str]("uir_codegen: host-only object writer requires darwin target: " + target)
+            return Err[str]("uir_codegen: host-only object writer requires darwin or linux-like target: " + target)
     if objWriter != "macho" && objWriter != "elf" && objWriter != "coff":
         return Err[str]("uir_codegen: unsupported object writer: " + objWriter)
     if objWriter == "macho" && !uirTargetIsDarwin(target):
@@ -135,11 +132,7 @@ fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
         return Err[str]("uir_codegen: coff writer disabled in host-only build: " + target)
     if objWriter == "elf" && (uirTargetIsDarwin(target) || uirTargetIsWindows(target)):
         return Err[str]("uir_codegen: elf writer disabled in host-only build: " + target)
-    var out: Result[str]
-    out.ok = true
-    out.value = objWriter
-    out.err = ErrorOk()
-    return out
+    return Ok[str](objWriter)
 
 fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): Result[uint8[]] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
@@ -174,7 +167,9 @@ fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): R
             return machoWriteAarch64RelocatableObj(machine)
         return Err[uint8[]]("uir_codegen: macho writer unsupported target arch: " + target)
     if resolvedWriter == "elf":
-        return Err[uint8[]]("uir_codegen: elf writer disabled in host-only build: " + target)
+        if isAarch64:
+            return elfWriteAarch64RelocatableObj(machine)
+        return Err[uint8[]]("uir_codegen: elf writer unsupported target arch: " + target)
     if resolvedWriter == "coff":
         return Err[uint8[]]("uir_codegen: coff writer disabled in host-only build: " + target)
     return Err[uint8[]]("uir_codegen: unresolved object writer after validation: " + resolvedWriter)

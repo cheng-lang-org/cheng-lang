@@ -11,7 +11,7 @@
 > 通知原文：`docs/process-notice-backend-driver-unification-2026-02-25.md`。
 
 1. Canonical backend driver 固定为 `artifacts/backend_driver/cheng`。
-2. `build-backend-driver` / `driver-path` 默认仅使用 canonical driver（`artifacts/backend_driver/cheng`）。
+2. `build-backend-driver` 输出仍收口到 canonical driver（默认 `artifacts/backend_driver/cheng`）；`driver-path` 固定返回 canonical driver。`build-backend-driver` 的 stage0 选择则允许在内部优先探测健康的 `artifacts/backend_selfhost_self_obj/cheng.stage2`。
 3. `driver-path/compile` 不再支持 stage0 覆盖；固定 canonical driver。
 4. `build-backend-driver` 的 `.attempt/.tmp.linkobj/.objs.lock` 临时产物迁移到 `chengcache/backend_driver_build_tmp`，不再写入 `artifacts/backend_driver` 顶层。
 5. 新增清理命令：`cheng_tooling cleanup-backend-driver-history [--dry-run]`，仅保留 `cheng` 与 `cheng.objs`。
@@ -89,7 +89,7 @@ artifacts/tooling_cmd/cheng_tooling stage0-ue-clean --strict:1
 - `build-global` 默认启用安全首编（`TOOLING_BUILD_GLOBAL_SAFE_FIRST=1`），优先规避 stage0 首轮 `rc=139`；可设 `TOOLING_BUILD_GLOBAL_SAFE_FIRST=0` 恢复先高优化再按崩溃重试。
 - `build-global` 的 fast-path 仅在“现有产物健康且源码不比产物新”时复用；源码更新会强制重编。
 - `build-global` 自链接产物不健康时会自动走 release-system fallback，默认保守参数（`BACKEND_RELEASE_CFLAGS=-O0` / `BACKEND_RELEASE_LDFLAGS=-O0`）避免 `SIGILL/Segfault` 级别坏产物覆盖 canonical。
-- 聚合器仅在 `main(argc, argv)` 的 C ABI 入口桥接阶段使用指针参数；构建时显式注入 `STAGE1_NO_POINTERS_NON_C_ABI=0` / `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`，其余脚本闭环仍遵循 `ABI=v2_noptr` 生产口径。
+- 聚合器仅在 `main(argc, argv)` 的编译器内部 C ABI 入口桥接阶段使用指针参数；构建时显式注入 `STAGE1_NO_POINTERS_NON_C_ABI=0` / `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0` 仅用于 tooling/runtime/internal 构建路径，用户源码 `@importc/@exportc` surface 仍遵循 `ABI=v2_noptr` 生产口径。
 - 可通过 `TOOLING_BIN` 覆盖可执行路径，通过 `TOOLING_BUILD_GLOBAL_EAGER_REBUILD=1` 强制重建。
 - `cheng_tooling` 支持 multicall：当 `argv0` 是脚本 ID（例如 `backend_prod_closure`）时会自动分发到内嵌脚本负载。
 - `install` 子命令可把全部 tooling 入口（内嵌脚本表）合并安装为“一个全局二进制 + 多个命令入口”的形态；支持重复 `--only:<id>` / `--exclude:<id>` 做按需子集安装，并支持 `--mode:symlink|hardlink|copy` 选择入口物化方式。默认 `--mode:hardlink`（可显式改为 `copy`）。
@@ -120,7 +120,7 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
 - 注册中心元数据：当提供 `--package/--channel` 时，会写入 `[snapshot]`（`cid/author_id/signature/pub_key`）。
 - 构建期校验：可加 `--verify`（可选 `--ledger:<path>`）自动校验 buildmeta/lock/pkgmeta/snapshot。
 - `cheng` 入口（canonical）支持 `--emit:exe`；`--emit-obj/--obj-out/--backend:obj` 已在生产链路移除并会直接报错。`compile/chengc` 已移除并返回 `rc=2`；`cheng` 固定 dev-only：固定注入 `BACKEND_BUILD_TRACK=dev`、`BACKEND_FAST_DEV_PROFILE=1`、`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`、`BACKEND_LINKERLESS_INMEM=1`、`BACKEND_FAST_FALLBACK_ALLOW=0`，并拒绝 `--release` 与 `BACKEND_BUILD_TRACK=release` 抬升。
-- 发布编译入口改为 `release-compile`：固定 `BACKEND_BUILD_TRACK=release`、`BACKEND_LINKER=system`、`BACKEND_NO_RUNTIME_C=0`、`BACKEND_OPT_LEVEL=3`（默认 `BACKEND_RELEASE_CFLAGS/BACKEND_RELEASE_LDFLAGS=-O3 -flto`）。
+- 发布编译入口改为 `release-compile`：固定 `BACKEND_BUILD_TRACK=release`、`BACKEND_LINKER=system`、`BACKEND_FN_SCHED=ws`、`BACKEND_NO_RUNTIME_C=0`、`BACKEND_OPT_LEVEL=3`（默认 `BACKEND_RELEASE_CFLAGS/BACKEND_RELEASE_LDFLAGS=-O3 -flto`）。
 - `release-compile` 支持 `--emit:exe|shared|static`。其中 `shared/static` 走 release object-first 打包链（后端先产 `obj`，再由系统工具链打包库；默认附带 runtime C object，可用 `BACKEND_RELEASE_LIBRARY_INCLUDE_RUNTIME=0` 关闭）。
 - `cheng/release-compile` 都不接受 `--linker:*`，也不接受 `BACKEND_LINKER` 环境覆盖；`cheng` 固定 `self-link + direct-exe`，`release-compile` 固定 `system-link`。
 - `--emit:shared|static` 不允许 `--run/--run:*`；违规返回 `rc=2`。
@@ -130,8 +130,8 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
 - system linker 自动选择器：`cheng_tooling resolve_system_linker` 按 `BACKEND_SYSTEM_LINKER_PRIORITY`（默认 `mold,lld,default`）解析并追加 `-fuse-ld=...`；若显式设置 `BACKEND_LD` 或手写 `-fuse-ld=...`，选择器不覆盖。
 - Linux AArch64 可选 no-libc profile：`BACKEND_ELF_PROFILE=nolibc` 且 `BACKEND_LINKER=self` 时，`chengc` 会切换到 `src/std/system_helpers_backend_nolibc_linux_aarch64.cheng`，并走无 `PT_INTERP`/`PT_DYNAMIC` 的静态链接口径；默认 profile 行为不变。
 - 后端 driver 层（`src/backend/tooling/backend_driver.cheng`）：生产默认 `BACKEND_EMIT=exe`，`BACKEND_LINK_OBJS` 与 `emit=obj` 旧入口已移除；`emit=obj` 在非 release 可执行构建硬禁用，内部仅允许 `allow-no-main` 工件生成；`BACKEND_LINKER=system|self` 负责最终可执行物链接。
-- 自举稳定性口径：`src/backend/tooling/backend_driver.cheng` 仅保留 native dispatch；`build-backend-driver`（full-only）命中 stage0 崩溃或硬失败时直接按严格失败返回，不再走 delegate wrapper 回退链路。
-- `build-backend-driver` full rebuild 固定要求 `BACKEND_BUILD_DRIVER_REBUILD_SKIP_GLOBAL_INIT=0`（非 0 会直接拒绝），并默认 `BACKEND_BUILD_DRIVER_REBUILD_DISABLE_DUP_SCAN=0`。
+- 自举稳定性口径：`src/backend/tooling/backend_driver.cheng` 仅保留 native dispatch；`build-backend-driver` 的 seal/full 轨命中 stage0 崩溃或硬失败时直接按严格失败返回，不再走 delegate wrapper 回退链路。
+- `build-backend-driver` seal/full rebuild 固定要求 `BACKEND_BUILD_DRIVER_REBUILD_SKIP_GLOBAL_INIT=0`（非 0 会直接拒绝），并默认 `BACKEND_BUILD_DRIVER_REBUILD_DISABLE_DUP_SCAN=0`。
 - stage0 cstring 兼容前缀改为二进制 marker 探测，命中“removed config”新驱动时不再注入 `BACKEND_ENABLE_CSTRING_LOWERING/*` 旧环境变量。
 - 后端 driver 默认参数：`BACKEND_EMIT=exe`、`BACKEND_TARGET=auto`；并行/增量由 `chengc` 入口统一控制。
 - `backend_driver_path` 默认使用稳定 driver `artifacts/backend_driver/cheng`，并附带 stage0 编译探针；首选不健康时直接阻断。
@@ -152,14 +152,11 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
   - 也可直接改写 `opt2/opt3` 轮次：`--uir-opt2-iters:<n>`、`--uir-opt3-iters:<n>`、`--uir-opt3-cleanup-iters:<n>`、`--uir-cfg-canon-iters:<n>`，以及 SIMD/内联：`--uir-simd`（或 `--no-uir-simd`）、`--uir-simd-max-width:<n>`、`--uir-simd-policy:<policy>`、`--uir-inline-iters:<n>`。
 - UIR 观测：`UIR_PROFILE=1` 输出 `uir_profile\t<label>\tstep_ms=...\ttotal_ms=...`，并在 `build_module` 后输出 `generics_report\tir=uir\tmode=...\tspec_budget=...\tborrow_ir=...\tgeneric_lowering=...`。
 - PAR-01 观测基线：`cheng_tooling build_backend_profile_schema` 与 `cheng_tooling build_backend_profile_baseline` 生成冻结快照（默认写入 `src/tooling/backend_profile_schema.env` 与 `src/tooling/backend_profile_baseline.env`）；`cheng_tooling verify_backend_profile_schema` 与 `cheng_tooling verify_backend_profile_baseline` 校验 schema/baseline 漂移并输出 `artifacts/backend_profile/*.report.txt`。
-- 契约/基线一键重建：`cheng_tooling build-backend-baselines`（单次调用顺序执行 rawptr/mem/dod/native/profile schema/profile baseline 六项）。
+- 契约/基线一键重建：`cheng_tooling build-backend-baselines`（单次调用顺序执行 rawptr/mem/dod/profile schema/profile baseline 五项）。
 - PAR-01 契约冻结：`cheng_tooling build_backend_mem_contract` 生成 `src/tooling/backend_mem_contract.env`；`cheng_tooling verify_backend_mem_contract` 校验 `docs/backend-mem-hotpatch-contract.md`（MemImage/PatchMeta）与闭环接入点漂移，输出 `artifacts/backend_mem_contract/*.report.txt`。
 - DOPAR-01 DOD 契约冻结：`cheng_tooling build_backend_dod_contract` 生成 `src/tooling/backend_dod_contract.env`；`cheng_tooling verify_backend_dod_contract` 校验 `docs/cheng-plan-full.md`（DOD SoA/Arena/index 契约）与闭环接入点漂移，输出 `artifacts/backend_dod_contract/*.report.txt`。
 - RPSPAR-01 Raw Pointer Safety 契约冻结：`cheng_tooling build_backend_rawptr_contract` 生成 `src/tooling/backend_rawptr_contract.env`；`cheng_tooling verify_backend_rawptr_contract` 校验 `docs/raw-pointer-safety.md` + `docs/cheng-formal-spec.md` + `src/tooling/README.md` 的冻结契约与闭环接入点漂移，输出 `artifacts/backend_rawptr_contract/*.report.txt`。
   - `rawptr_contract.tooling_readme.synced=1`
-- CNCPAR-01 Native Contract 契约冻结：`cheng_tooling build_backend_native_contract` 生成 `src/tooling/backend_native_contract.env`；`cheng_tooling verify_backend_native_contract` 校验 `docs/cheng-native-contract.md` 的冻结契约、Gas/plugin 锚点与闭环接入点漂移，输出 `artifacts/backend_native_contract/*.report.txt`。
-  - `verify_backend_native_contract` 默认 crash 重试次数为 `1`（`NATIVE_CONTRACT_DRIVER_RETRIES` 可覆盖），并对每次 driver 调用施加子进程超时（`NATIVE_CONTRACT_DRIVER_TIMEOUT_SEC`，默认 `20s`），避免 UE 子进程导致 gate 无界挂起。
-  - `verify_backend_native_contract_autosystem` 校验 native-contract 编译在 `STAGE1_AUTO_SYSTEM` unset / `STAGE1_AUTO_SYSTEM=1` 两种场景都稳定（不再依赖脚本注入 `STAGE1_AUTO_SYSTEM=0`）；默认使用 `BACKEND_STAGE1_PARSE_MODE=full` 以规避 outline 口径崩溃，可通过 `NATIVE_CONTRACT_AUTOSYSTEM_STAGE1_PARSE_MODE=full|outline` 覆盖；crash 重试默认 `10` 次（`NATIVE_CONTRACT_AUTOSYSTEM_RETRIES` 覆盖，未设置时回落 `NATIVE_CONTRACT_DRIVER_RETRIES`）。
 - RPSPAR-02 ZRPC 收口 gate：`cheng_tooling verify_backend_rawptr_contract` 负责契约收口；`backend_prod_closure` / `verify_backend_closedloop` 同步执行 `rawptr_surface_forbid + rawptr_closedloop`，共同覆盖“语言表面绝对零裸指针”闭环。
 - RPSPAR-02 Raw Pointer Surface 禁令：`cheng_tooling verify_backend_rawptr_surface_forbid` 校验“裸指针声明/指针运算/裸 `void*` 透出”三类负例必须失败，且诊断必须包含 `slice/tuple/handle/borrow` 替代建议；输出 `artifacts/backend_rawptr_surface_forbid/*.report.txt`。
 - RPSPAR-03 Slice 影子桥接：`cheng_tooling verify_backend_ffi_slice_shim` 校验 `importc` 形参 `T[]` 的桥接调用可编译（默认 compile-only；可设 `BACKEND_FFI_SLICE_SHIM_RUN=1` 开启运行）并覆盖 legacy `openArray[T]` 与用户层裸指针 surface 负例；输出 `artifacts/backend_ffi_slice_shim/backend_ffi_slice_shim.<target>.report.txt`。
@@ -230,24 +227,28 @@ cp -f "$(pwd)/artifacts/tooling_cmd/cheng_tooling" /tmp/cheng
 # 如需保留（加速反复调试），可关闭：
 # export CLEAN_CHENG_LOCAL=0
 #
-# `cheng_tooling build_backend_driver` 固定 self-link 重建（system-link 已移除）。
+# `cheng_tooling build_backend_driver` 双轨：默认 fast，门禁/发布走 seal。
 ```
 说明：
 - `backend_driver_path` 默认校验 `stage1` 最小编译 smoke；如需额外 strict 口径，可设 `BACKEND_DRIVER_PATH_STAGE1_STRICT_SMOKE=1`；如需启用 dict fixture 探针可设 `BACKEND_DRIVER_PATH_STAGE1_DICT_SMOKE=1`。
 - 生产闭环固定 canonical driver（`artifacts/backend_driver/cheng`）；若该 driver 体检失败会直接阻断，不再自动回退。
 - `build_backend_driver` 原生命令会先尝试重编；若当前 stage0 在 `backend_driver.cheng` 上崩溃/失败，或重编产物体检失败，直接失败（无 stage0 复用回退）。
 - stage0 环境变量已统一：native 重编/probe/compile/runtime-refresh 仅注入 `BACKEND_*`、`STAGE1_*`、`MM`、`CACHE`，不再注入 `CHENG_*` 兼容前缀。
-- `build_backend_driver` 会输出 `build_backend_driver_compile_mode=full` 与 `build_backend_driver_rebuilt=1|0`；`--require-rebuild`（或 `BACKEND_BUILD_DRIVER_REQUIRE_REBUILD=1`）用于强制“必须真实重编”。
+- `build_backend_driver` 会输出 `build_backend_driver_mode=fast|seal` 与 `build_backend_driver_compile_mode=quick|full`，以及 `build_backend_driver_rebuilt=1|0`；`--require-rebuild`（或 `BACKEND_BUILD_DRIVER_REQUIRE_REBUILD=1`）用于强制“必须真实重编”。
 - `build_backend_driver` 失败路径会额外输出 `build_backend_driver_last_stage0`、`build_backend_driver_last_rc`、`build_backend_driver_last_kind`，用于快速定位最后一次失败候选与退出类型。
 - `--require-rebuild` 启用时，`build_backend_driver` 在所有 stage0 尝试失败后不再回写 stage0 到输出路径（避免覆盖失败现场），直接返回失败并保留诊断上下文。
 - `build_backend_driver` 默认关闭 post-build compile probe（`BACKEND_BUILD_DRIVER_POST_PROBE=0`），避免坏产物 probe 触发长时间挂起；需要 strict 运行验证时可显式设 `BACKEND_BUILD_DRIVER_POST_PROBE=1`。
 - `build_backend_driver` 内部固定 `whole_program=1`（不再提供 `BACKEND_BUILD_DRIVER_WHOLE_PROGRAM`/`BACKEND_BUILD_DRIVER_REBUILD_WHOLE_PROGRAM` 参数），并做两层产物体检：`nm -u` 内部未解析符号拦截（`BACKEND_BUILD_DRIVER_UNDEF_GUARD=1`）+ 必需导出符号检查（必须包含 `backendMain`）。拦截范围覆盖 `backend/driver/tooling/cheng_*` 与 `uir/macho/elf/coff/os_*` 等应由闭包吸收的符号。
-- `build_backend_driver` 固定仅使用 canonical driver：`artifacts/backend_driver/cheng`。
+- `build_backend_driver` 默认输出 canonical driver：`artifacts/backend_driver/cheng`；未显式传 `--stage0:<path>` 时会优先选择健康的 `artifacts/backend_selfhost_self_obj/cheng.stage2`，再回落到 canonical/seed/dist 候选。
 - `build_backend_driver` 默认执行 stage0 capability preflight（`TOOLING_STAGE0_CAPABILITY_PREFLIGHT=1`）：比较 `stage0.cap` 签名与当前源码签名（`stage1/ast+parser+semantics+ownership+monomorphize+type_syntax_lowering`、`uir_core_types`、`backend_driver`）；不匹配时直接 fail-fast 并提示先刷新 seed/driver。可用 `TOOLING_STAGE0_CAPABILITY_REQUIRE_FILE=1` 强制要求存在 `.cap.env` 侧车。
-- `build_backend_driver` 为 full-only，默认走 strict 参数集：`BACKEND_BUILD_DRIVER_REBUILD_PARSE_MODE=full`、`BACKEND_BUILD_DRIVER_REBUILD_FN_SCHED=serial`、`BACKEND_BUILD_DRIVER_REBUILD_DIRECT_EXE=1`、`BACKEND_BUILD_DRIVER_REBUILD_INCREMENTAL=0`、`BACKEND_BUILD_DRIVER_REBUILD_MULTI=0`、`BACKEND_BUILD_DRIVER_REBUILD_MULTI_FORCE=0`，并固定 `BACKEND_STAGE1_BUILDER=stage1` 与 `BACKEND_BUILD_DRIVER_REBUILD_JOBS=1`。
-- strict native 下（`BUILD_DRIVER_STRICT_NATIVE=1`）即使 `timeout<=60s` 也默认不启用 `tight` profile；如需诊断才显式开启 `BACKEND_BUILD_DRIVER_REBUILD_TIGHT_TIMEOUT_PROFILE=1` 并关闭 strict。`tight` 仅调整 `parse/sched`（`outline/ws`），不会再降级 `skip_sem/skip_ownership`（固定 `0/0`）。
-- `full-rebuild` 默认关闭“同参安全重试”（`BACKEND_BUILD_DRIVER_REBUILD_CRASH_RETRY_SAFE=0`）；需要排障时可显式开启，命中 `rc=139` 会降级到单 worker 串行重试（`jobs=1` + `multi=0`）。
-- `build_backend_driver` 在 self-link 模式默认优先复用现有 runtime 组合对象（`BACKEND_BUILD_DRIVER_RUNTIME_OBJ_REFRESH=0`）；仅在显式开启时才刷新重建（`BACKEND_BUILD_DRIVER_RUNTIME_OBJ_REFRESH=1`）。底层刷新逻辑可用 `BACKEND_RUNTIME_OBJ_REFRESH_TIMEOUT` / `BACKEND_RUNTIME_OBJ_REFRESH_STRICT` 调整（超时默认 60s）。
+- `build_backend_driver` 支持双轨：
+  - `fast` 轨：默认轨，`compile_mode=quick`，默认 `BACKEND_BUILD_DRIVER_FAST_STRICT_NATIVE=1`，先走可用的 quick/system-link，并启用 quick stamp cache（`BACKEND_BUILD_DRIVER_QUICK_STAMP_CACHE=1`）与跨输出路径共享 quick cache（`BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=1`）；如需实验 quick/self-link，可显式设 `BACKEND_BUILD_DRIVER_FAST_STRICT_NATIVE=0`。
+  - `seal` 轨：`--seal`、`--full-rebuild` 或 `--require-rebuild` / `debug` 下默认进入，`compile_mode=full`，继续走 strict 参数集与稳定性优先口径。
+- `build_backend_driver` fast 轨默认开启 `BACKEND_BUILD_DRIVER_FAST_REUSE=1`，但仅当 final 输出自带的 build-driver stamp 与当前源码/能力签名精确匹配时才直接复用；旧 stamp 或缺失 stamp 会自动回退到正常重编。
+- `build_backend_driver` fast 轨默认开启 `BACKEND_BUILD_DRIVER_FAST_CANONICAL_SMOKE=1`：当输出目标是 canonical driver（`artifacts/backend_driver/cheng`）时，quick 候选在安装前必须通过 `dev-inmem + release-system` 双 smoke，并写入 `cheng.quick_canonical_smoke.env` 证明侧车；缺失/不匹配时不会 direct-reuse，坏候选会按二进制 SHA 进入 quarantine，切断 quick/shared cache 复用。
+- seal 轨的 strict native 下（`BUILD_DRIVER_STRICT_NATIVE=1`）即使 `timeout<=60s` 也默认不启用 `tight` profile；如需诊断才显式开启 `BACKEND_BUILD_DRIVER_REBUILD_TIGHT_TIMEOUT_PROFILE=1` 并关闭 strict。`tight` 仅调整 `parse/sched`（`outline/ws`），不会再降级 `skip_sem/skip_ownership`（固定 `0/0`）。
+- seal/full-rebuild 默认关闭“同参安全重试”（`BACKEND_BUILD_DRIVER_REBUILD_CRASH_RETRY_SAFE=0`）；需要排障时可显式开启，命中 `rc=139` 会降级到单 worker 串行重试（`jobs=1` + `multi=0`）。
+- `build_backend_driver` 在 self-link / experimental fast 轨默认优先复用现有 runtime 组合对象（`BACKEND_BUILD_DRIVER_RUNTIME_OBJ_REFRESH=0`）；仅在显式开启时才刷新重建（`BACKEND_BUILD_DRIVER_RUNTIME_OBJ_REFRESH=1`）。底层刷新逻辑可用 `BACKEND_RUNTIME_OBJ_REFRESH_TIMEOUT` / `BACKEND_RUNTIME_OBJ_REFRESH_STRICT` 调整（超时默认 60s）。
 - `build_backend_driver` 与 `selfhost-bootstrap-fast-host` 的 stage0 解析默认强制 compile probe，并默认跳过命中 `UE/UEs` 或 `PPID=1` 孤儿的候选路径（`TOOLING_STAGE0_ORPHAN_GUARD=1`，可设 `0` 关闭）。其中 `build_backend_driver` 在未显式传 `--stage0:<path>` 时，会优先探测健康的 `artifacts/backend_selfhost_self_obj/cheng.stage2`，再回落到常规候选列表。
 - `build_backend_driver` 与 `selfhost-bootstrap-fast-host` 默认启用 stage0 quarantine 门禁（`TOOLING_STAGE0_QUARANTINE=1`）并在执行前做 preflight（`TOOLING_STAGE0_PREFLIGHT_TIMEOUT`，默认 8s）；执行路径不再复制隔离副本。发现既有 quarantine `UE/UEs` 或孤儿残留时会阻断新启动（`TOOLING_STAGE0_QUARANTINE_BLOCK_ON_UE=1`，可显式设 `0` 继续排障）。自动清理后会做短重检（`TOOLING_STAGE0_QUARANTINE_BLOCK_RECHECKS`，默认 `2`），降低“首轮已清理但仍误阻断”的抖动。
 - Darwin 平台默认启用二进制执行策略静态预检（`TOOLING_DARWIN_CODESIGN_PREFLIGHT=1`）：在执行 stage0/`--help` 探针前先做 `codesign --verify`，失败立即阻断，避免反复触发 `_dyld_start` 类 `UE`。
@@ -261,16 +262,16 @@ cp -f "$(pwd)/artifacts/tooling_cmd/cheng_tooling" /tmp/cheng
 - 新增原生排障命令：`stage0-ue-status`（查看残留）、`stage0-ue-clean`（清理残留）。
 - `cheng_tooling backend_prod_closure` 默认增加前置硬门禁：先执行 `build_backend_driver --full-rebuild --require-rebuild` 且必须出现 `build_backend_driver_rebuilt=1`（可用 `BACKEND_PROD_REQUIRE_DRIVER_FULL_REBUILD=0` 临时关闭）。
 - `cheng_tooling backend_prod_closure` 默认使用 native backend driver，不再包含 delegate boot mode 应急通道。
-- `cheng_tooling build_backend_driver` 支持显式 `--stage0:<path>`；未显式指定时会优先选择健康的 `artifacts/backend_selfhost_self_obj/cheng.stage2`，再回落到 canonical/seed/dist 候选。
+- `cheng_tooling build_backend_driver` 支持显式 `--stage0:<path>` 与 `--mode:auto|fast|seal`；未显式指定模式时默认 `auto`，即 `require-rebuild/debug` 走 `seal`，其余走 `fast`。
 - `cheng_tooling backend_prod_closure` 前置 full-rebuild 继承 `build_backend_driver` 的 stage0 选择策略。
 - stage0 解析默认会跳过“早于当前 driver 文件代际”的历史 `UE/UEs`（`TOOLING_STAGE0_GENERATION_GUARD=1`，默认开启；优先按 `TOOLING_STAGE0_INODE_GUARD=1` 比较进程 `txt` inode 与当前 driver inode，不可用时再回退到进程 `etime` 与 driver `mtime`，容差 `TOOLING_STAGE0_GENERATION_MARGIN_SEC`，默认 `3s`），避免旧残留造成永久阻断。
 - stage0 quarantine stamp 现在按当前 binary `sha256` 生效；即使进程 `rc=0`，只要出现“编译成功但未产生产物”的假成功，也会写入 `stage0_block.<sha>.env` 并阻断后续复用。
 - `TOOLING_STAGE0_SKIP_UE_GUARD=1` 与 `TOOLING_STAGE0_ORPHAN_ONLY_BYPASS=1` 均不再放行（会打印忽略提示并继续 hard-block）。
 - stage0 增加 digest 硬阻断：可通过 `TOOLING_STAGE0_BLOCK_SHA256=<sha[,sha...]>` 配置阻断列表，防止坏 driver 再次进入执行链。
 - stage0 quarantine 计数默认不再把 `dist/releases/current/cheng` 的历史 `UE` 计入全局阻断（`TOOLING_STAGE0_DIST_UE_GUARD=0`）；若需排障可显式设为 `1` 重新纳入统计。
-- `build_backend_driver` 仅支持 `BACKEND_BUILD_DRIVER_LINKER=self`（system-link 已移除）。
+- `build_backend_driver` fast/seal 两轨默认都走 `system`；如需实验 fast self-link，可显式设 `BACKEND_BUILD_DRIVER_FAST_STRICT_NATIVE=0` 并配合合法 linker 策略。
 - `build_backend_driver` 在显式 seed stage0（`artifacts/backend_seed/...`）下，默认优先使用不含 bridge 的基础 runtime obj（`BACKEND_BUILD_DRIVER_SEED_BASE_RUNTIME_OBJ=1`），用于规避旧 stage0 对 `___stderrp` 未定义重定位类型的兼容问题。
-- `build_backend_driver` 固定 whole-program full 重编路径；默认超时 `BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT=180`。
+- `build_backend_driver` 两轨都固定 `whole_program=1`；`fast` 轨默认 quick rebuild，`seal` 轨默认 full rebuild，seal 超时默认 `BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT=180`。
 - 原生超时包装会把子进程输出先落到临时日志再回放，避免 `UE/UEs` 子进程持有管道导致父进程长时间不返回；内部超时默认返回 `124`，若被外层 timeout/信号终止则可能表现为 `143`。
 - 原生超时包装默认输出结构化诊断行（`TOOLING_TIMEOUT_DIAG=1`）：`cheng_tooling_timeout=1 timeout_sec=... elapsed_sec=... child_pid=... no_orphan=... drain_sec=... drain_loops=... label=...`；可用 `TOOLING_TIMEOUT_LABEL` 标记调用场景。
 - 超时包装默认开启“强制回收孤儿子进程”语义（`TOOLING_TIMEOUT_NO_ORPHAN=1`）；如需临时恢复“超时即返回”，可设 `TOOLING_TIMEOUT_NO_ORPHAN=0`（可能增加孤儿进程残留风险）。
@@ -329,13 +330,13 @@ FULLCHAIN_OBJ_ONLY=1 cheng_tooling verify_fullchain_bootstrap
   - smoke 子阶段支持独立超时 `SELF_OBJ_BOOTSTRAP_SMOKE_TIMEOUT=<seconds>`（默认 15）；用于在 `fast` 模式下快速触发 smoke fallback，避免总时长被单次卡死拉满。
 - `verify_backend_selfhost_bootstrap_self_obj` 固定使用 `ABI=v2_noptr`（非 `v2_noptr` 将直接报错）。
 - `ABI=v2_noptr` 默认会在 stage1 语义层启用 std no-pointer 门禁；可用 `STAGE1_STD_NO_POINTERS=0` 显式关闭（兼容口径），或用 `STAGE1_STD_NO_POINTERS=1`/`STAGE1_STD_NO_POINTERS_STRICT=1` 强制严格门禁。
-- 新增 `STAGE1_NO_POINTERS_NON_C_ABI=1`：在非 C ABI 对接模块禁用 `*`/`&`/deref/`ptr_*` 等指针语法与操作（C ABI 桥接模块豁免）。
+- 新增 `STAGE1_NO_POINTERS_NON_C_ABI=1`：在用户源码模块禁用 `*`/`&`/deref/`ptr_*` 等指针语法与操作；`@importc/@exportc` 等 C ABI 声明不再豁免。该环境变量名仅为兼容保留。
 - `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL` 默认按开启处理（仅显式设为 `0` 时放宽到编译器内部路径），因此 `src/stage1`/`src/backend`/`src/tooling` 也默认纳入 no-pointer 门禁。
-- `v2_noptr` 的 no-pointer 策略由 `verify_backend_noptr_default_cli` 负向样例门禁保证：默认 `chengc` 入口必须拒绝 non-C-ABI 指针样例。
+- `v2_noptr` 的 no-pointer 策略由 `verify_backend_noptr_default_cli` 负向样例门禁保证：默认 `chengc` 入口必须拒绝用户源码裸指针样例，包括 `@importc` raw-pointer surface。
 - 兼容命令 `verify_backend_abi_v2_noptr` 已收敛为 `verify_backend_noptr_default_cli` 的别名，不再维护独立 gate 逻辑。
-- `verify_backend_noptr_default_cli` 会显式设置 `STAGE1_STD_NO_POINTERS=0` 的隔离探针来验证 non-C-ABI 诊断本身，同时保留正样例与 C ABI bridge 通过路径。
+- `verify_backend_noptr_default_cli` 默认验证三类路径：用户裸指针负例、safe `@importc` 正例、raw `@importc void*` 负例。
 - `chengc` 在 `ABI=v2_noptr` 时会自动注入 `STAGE1_STD_NO_POINTERS=1`、`STAGE1_STD_NO_POINTERS_STRICT=0`、`STAGE1_NO_POINTERS_NON_C_ABI=1`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
-- 新增 `verify_backend_noptr_default_cli`：验证默认 `chengc` 入口（不手工注入 non-C-ABI env）会拒绝 non-C-ABI 指针样例，同时保留正样例与 C ABI bridge 正常通过。
+- 新增 `verify_backend_noptr_default_cli`：验证默认 `chengc` 入口（不手工放宽 no-pointer env）会拒绝用户指针样例与 raw `@importc void*` 样例，同时保留普通正样例与 safe `@importc` 正常通过。
   - stage0 选择固定为 canonical：`artifacts/backend_driver/cheng`；不可用则直接阻断。
   - 自举模式：`SELF_OBJ_BOOTSTRAP_MODE=strict|fast`（默认 `fast`）。`strict` 固定执行 `stage1 -> stage2 -> stage3(witness)` 三轮 full rebuild，并强制 `SHA256(stage2) == SHA256(stage3)`；仅诊断场景可用 `SELF_OBJ_BOOTSTRAP_STRICT_DIAG_ALLOW_MISMATCH=1` 放宽。`fast` 只编译 stage1 并同步为 stage2（开发加速，跳过 fixed-point 校验）。
   - strict fixed-point mismatch 会自动落盘诊断：`<out-dir>/strict_mismatch/summary.env`（含 `bytes/symbols/strings` diff 路径），并通过 `bootstrap_pure_strict_mismatch_report` / `selfhost_bootstrap_strict_mismatch_report` 字段输出。
@@ -371,7 +372,7 @@ cheng_tooling verify_backend_ci_obj_only
 - 专用机 100ms 硬门禁入口：`cheng_tooling verify_backend_selfhost_100ms_host`（基线文件：`src/tooling/selfhost_perf_100ms_host.env`）。
   - 零脚本（native）核心入口已并入 `cheng_tooling` 子命令（建议用于 Host-only 自举/编译链路）：
   - `cheng_tooling driver-path [--path-only]`
-  - `cheng_tooling build-backend-driver [--out:<path>] [--target:<triple>] [--require-rebuild]`
+  - `cheng_tooling build-backend-driver [--out:<path>] [--target:<triple>] [--fast|--seal] [--require-rebuild]`
   - `cheng_tooling selfhost-bootstrap-fast-host [--compile-stage1|--no-compile-stage1] [--out-dir:<path>] [--timing-out:<path>]`
   - `cheng_tooling verify_backend_selfhost_bootstrap_self_obj [--mode:fast|strict] [--out-dir:<path>] [--timing-out:<path>]`
   - `cheng_tooling selfhost-100ms-host [--iters:<N>] [--p95-ms:<ms>] [--p99-ms:<ms>] [--host-only:<tag>] [--report:<path>] [--enforce:0|1]`
@@ -433,8 +434,6 @@ cheng_tooling backend_prod_closure --full-closure
 - `backend_prod_closure` 已不再包含独立 `backend.abi_v2_noptr` required gate；兼容命令 `verify_backend_abi_v2_noptr` 保留为 `verify_backend_noptr_default_cli` 别名。
 - `backend_prod_closure` required 链路包含 `backend.rawptr_contract`（`cheng_tooling verify_backend_rawptr_contract`），并单独执行 `backend.rawptr_surface_forbid` 与 `backend.rawptr_closedloop`。
 - `verify_backend_rawptr_surface_forbid` 的 native 路径会额外校验 `src/std/cmdline.cheng`：必须走 runtime bridge `__cheng_rt_paramCount/__cheng_rt_paramStr`（并允许 `__cheng_rt_paramStrCopy` 稳定化字符串转值），且禁止 `void* / ptr_add / alloc / copyMem / setMem / *str*` 语法回流。
-- `backend.native_contract` 在 native `backend_prod_closure` 路径已恢复 required 执行（不再因 `BACKEND_PROD_INMEM_ONLY=1` 默认 skip）。
-- `backend.native_contract_autosystem` 已接入 `backend_prod_closure` required：验证前端在 `BACKEND_NATIVE_CONTRACT=1` 时强制关闭 `std/system` 自动导入。
 - `backend_prod_closure` 现默认要求 `backend.symbol_closure`（`cheng_tooling verify_backend_symbol_closure`）：固定 `return_add/return_new_ref_seq_growth` 需可编译且可运行，阻断 `_alloc/_c_strlen/_zeroMem` 运行时符号缺失。
 - `backend_prod_closure` 现默认要求 `backend.release_compile_stability`（`cheng_tooling verify_backend_release_compile_stability`）：固定 `return_new_ref_seq_growth` 默认 3 次 `release-compile` 稳定性回归（可用 `BACKEND_PROD_RELEASE_COMPILE_STABILITY_ITERS` 覆盖）；出现 `rc=139` 直接失败。`verify_backend_release_compile_stability` 单独执行时默认 3 次（可用 `BACKEND_RELEASE_COMPILE_STABILITY_ITERS` 覆盖），发布入口 `backend-prod-publish` 默认也是 3 次（可用 `BACKEND_PROD_PUBLISH_RELEASE_COMPILE_STABILITY_ITERS` 覆盖）。
 - `backend_prod_closure` required 默认执行 Native FFI 影子桥接四个硬门禁：
@@ -468,20 +467,20 @@ cheng_tooling backend_prod_closure --full-closure
 - `verify_backend_hotpatch` / `verify_backend_hotpatch_meta` 在 required 口径下禁用 runnable 重试回退（`BACKEND_HOTPATCH_RUNNABLE_RETRIES>1` 会直接失败）。
 - `verify_backend_emit_obj_contract` 已移除（命令固定 `rc=2`）；主口径改为“非 release 可执行构建禁止 `emit=obj`”，以 driver 硬策略阻断。
 - `backend_prod_closure` 支持 `BACKEND_OPT_DRIVER`：可仅覆盖 `backend.determinism_strict/exe_determinism_strict` 与 `backend.opt/opt2/multi_lto/multi_perf/opt3/simd/uir_stability/ssa/ffi/sanitizer/debug/exe_determinism` gate driver，不影响主 required-gates driver。
+- `verify_backend_determinism_strict` / `verify_backend_exe_determinism_strict` 默认固定到 stable release/system 口径：`BACKEND_BUILD_TRACK=release`、`BACKEND_LINKER=system`、`BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`。仅在显式传入 `BACKEND_LINKER=self` 时才走 self-link 变体。
 - `backend_prod_closure` 默认新增并阻断 `backend.noptr_default_cli`（`cheng_tooling verify_backend_noptr_default_cli`）与 `backend.noptr_exemption_scope`（`cheng_tooling verify_backend_noptr_exemption_scope`），确保“默认入口零指针”与“豁免范围仅限自举/探针 allowlist”。
-- `backend.abi_v2_noptr` 默认优先使用本地 `artifacts/backend_driver/cheng`（要求具备 non-C-ABI no-pointer 诊断 marker）；可用 `BACKEND_ABI_V2_DRIVER` 显式覆盖。
+- `backend.abi_v2_noptr` 默认优先使用本地 `artifacts/backend_driver/cheng`（要求具备 user-surface no-pointer 诊断 marker）；可用 `BACKEND_ABI_V2_DRIVER` 显式覆盖。
 - `backend_prod_closure` 主门禁链路固定稳定 driver（默认来自 `backend_driver_path`，即 `artifacts/backend_driver/cheng`），不再自动切换到 selfhost/stage2 候选。
 - 若 canonical driver 体检失败，`backend_prod_closure` 会直接失败；请先修复或重建 `artifacts/backend_driver/cheng` 后重试。
 - `backend_prod_closure` 在主 driver 完成体检后会导出 `BACKEND_DRIVER_PATH_STAGE1_STRICT_SMOKE=0`，后续 gate 不再重复 strict smoke（保留主链稳定性并减少抖动）。
 - `verify_backend_closedloop` 默认执行 `backend.spawn_api_gate`（`cheng_tooling verify_backend_spawn_api_gate`）；该 gate 已切换到不依赖 `std/async_rt` 指针实现的 fixture，因此在 `ABI=v2_noptr` 下也可直接回归。
 - `verify_backend_closedloop` 默认执行 `backend.import_cycle_predeclare`（`cheng_tooling verify_backend_import_cycle_predeclare`），持续验证“循环导入硬错误 + 无前置声明可编译”口径；该 gate 已切换为纯 runtime 断言（负例必须编译失败并输出 `Import cycle detected: ... -> ...` 链路），不再允许 source-contract fallback。
-- `verify_backend_closedloop` 默认执行 `backend.native_contract`（`cheng_tooling verify_backend_native_contract`），确保 CNC 机器可校验契约与闭环 required gate 保持一致。
 - `verify_backend_closedloop` 默认执行 `backend.release_system_link`（`cheng_tooling verify_backend_release_c_o3_lto`）与 `backend.dual_track`（`cheng_tooling verify_backend_dual_track`），确保 Dev/Release 双轨策略持续可回归。
 - `verify_backend_closedloop` 默认执行 `backend.mir_borrow`（`cheng_tooling verify_backend_mir_borrow`），确保 `ownership/borrow -> noalias` 语义下沉与 `compile_stamp/generics_report` 字段持续可回归。
 - `verify_backend_closedloop` 默认执行并阻断 `backend.linker_abi_core`（`cheng_tooling verify_backend_linker_abi_core`）与 `backend.self_linker.(elf|coff)`，跨目标 self-link 门禁不允许 skip 降级。
 - `verify_backend_closedloop` 默认 `BACKEND_MATRIX_STRICT=1` 且 `BACKEND_RUN_FULLSPEC=1`：`status=2` 视为失败，fullspec 固定执行编译+运行（返回码为 0），不再使用 compile-only fallback。
 - `verify_backend_obj_fullspec_gate` 默认复用已有 `artifacts/backend_obj_fullspec_gate/backend_obj_fullspec`（避免重复冷编译超时）；如需强制重编可设 `BACKEND_OBJ_FULLSPEC_REBUILD_ON_SOURCE=1` 或 `BACKEND_OBJ_FULLSPEC_REBUILD_ON_DRIVER=1`。
-- `backend_prod_closure` 在启用 selfhost 时，默认将自举阶段单次编译超时设为 `60s`（`BACKEND_PROD_SELFHOST_TIMEOUT`），并默认启用 RSS 守卫 `8192MB`（`BACKEND_PROD_SELFHOST_MAX_RSS_MB`，设 `0` 关闭）。
+- `backend_prod_closure` 在启用 selfhost 时，默认将自举阶段单次编译超时设为 `240s`（`BACKEND_PROD_SELFHOST_TIMEOUT`），并默认启用 RSS 守卫 `8192MB`（`BACKEND_PROD_SELFHOST_MAX_RSS_MB`，设 `0` 关闭）。
 - `backend_prod_closure` 低内存档位默认开启（`BACKEND_PROD_LOW_MEM_PROFILE=1`，可用 `--no-low-mem` 或 `BACKEND_PROD_LOW_MEM_PROFILE=0` 关闭）：会强制串行编译口径（`BACKEND_MULTI=0/BACKEND_MULTI_FORCE=0/BACKEND_INCREMENTAL=0/BACKEND_JOBS<=2`），默认关闭 `multi_perf/selfhost_parallel_perf/driver_selfbuild_smoke`，并把 selfhost/driver-selfbuild 默认 RSS 上限收敛到 `8192MB`（可用 `BACKEND_PROD_LOW_MEM_RSS_MB`、`BACKEND_PROD_LOW_MEM_JOBS` 覆盖）。
 - `backend_prod_closure` 默认对每个 gate 施加 `60s` 超时（`BACKEND_PROD_GATE_TIMEOUT`，设为 `0` 可关闭），超时直接失败并打印 gate 标签。
 - `backend_prod_closure` 默认开启超时诊断（`BACKEND_PROD_TIMEOUT_DIAG=1`）：当 gate 超时会自动采样并输出诊断文件路径（默认目录 `chengcache/backend_timeout_diag`，采样时长 `BACKEND_PROD_TIMEOUT_DIAG_SECONDS=5`，可通过 `BACKEND_PROD_TIMEOUT_DIAG_TOOL` 覆盖采样器命令）。
@@ -499,7 +498,7 @@ cheng_tooling backend_prod_closure --full-closure
 - `backend.multi_perf_regression` 默认加载 `src/tooling/multi_perf_baseline.env`（可通过 `MULTI_PERF_BASELINE` 覆盖）；可用 `BACKEND_PROD_MULTI_PERF_TIMEOUT` 或 `MULTI_PERF_TIMEOUT` 调整单 gate 超时。
 - 当 `BACKEND_RUN_FULLSPEC=1` 时，`backend.closedloop` 使用独立超时 `BACKEND_PROD_CLOSEDLOOP_TIMEOUT`（默认 `60s`），避免 fullspec 编译被通用 60s gate 误杀。
 - `backend_prod_closure` 默认以最小闭环模式执行 `backend.closedloop`（`BACKEND_PROD_CLOSEDLOOP_MINIMAL=1`）；如需回放完整 closedloop 集合可显式设 `BACKEND_PROD_CLOSEDLOOP_MINIMAL=0`。
-- `backend_prod_closure` 的 selfhost 自举步骤会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`（仅用于自举编译器源码），non-C-ABI no-pointer 策略仍由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁强制。
+- `backend_prod_closure` 的 selfhost 自举步骤会显式设置 `STAGE1_NO_POINTERS_NON_C_ABI=0` 与 `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0`（仅用于编译器/运行时内部源码），用户源码 no-pointer 策略仍由后续 `backend.closedloop`/`backend.abi_v2_noptr` 门禁强制。
 - `backend_prod_closure` 在启用 selfhost 时默认自举模式为 `fast`；可用 `--selfhost-strict`（或 `BACKEND_PROD_SELFHOST_MODE=strict`）切到 fixed-point 口径。
 - `backend_prod_closure` 提供显式参数 `--selfhost-fast` / `--selfhost-strict`（优先级高于环境变量）；启用 selfhost 后默认启用 `--selfhost-strict-gate`（可用 `BACKEND_RUN_SELFHOST_STRICT=0` 关闭）在 `fast` 主链后追加一轮 `strict` 自举门禁。
 - `--selfhost-strict-gate` 默认复用 fast 同一 session（避免重复冷编译）；可用 `BACKEND_PROD_SELFHOST_STRICT_SESSION=<name>` 指定独立 strict session。
@@ -534,9 +533,10 @@ cheng_tooling backend_prod_closure --full-closure
 - `cheng_tooling closedloop` 支持 `CLOSEDLOOP_FRONTIER=auto|0|1`（默认 `auto`）：自动检测到 `cheng-libp2p` 仓库时追加 `verify_libp2p_frontier`；`auto` 默认非阻断（`CLOSEDLOOP_FRONTIER_SOFT_AUTO=1`），显式 `1` 仍为阻断门禁。
 - `cheng_tooling closedloop` 在 `CLOSEDLOOP_LIBP2P=1` 时执行 `verify_libp2p_prod_closure`（不再是 smoke-only）。
 - `cheng_tooling closedloop` 末尾默认尝试输出 timeout 采样摘要（`CLOSEDLOOP_TIMEOUT_SUMMARY=1`）以及 stage1 fullspec 超时摘要（`CLOSEDLOOP_STAGE1_TIMEOUT_SUMMARY=1`）。
-- `build_backend_driver` 自举重建默认采用串行增量（`BACKEND_BUILD_DRIVER_MULTI=0`）；需要并行时可显式设为 `1`（并行失败会自动串行重试）。可用 `BACKEND_BUILD_DRIVER_MULTI` / `BACKEND_BUILD_DRIVER_INCREMENTAL` / `BACKEND_BUILD_DRIVER_JOBS` 覆盖。
-- `build_backend_driver` 未显式指定 stage0 时，仅尝试 `artifacts/backend_driver/cheng`。
-- `build_backend_driver` 默认固定 `BACKEND_BUILD_DRIVER_LINKER=self`，并固定 `GENERIC_MODE=dict` / `GENERIC_LOWERING=mir_dict`；默认编译尝试超时 `180s`（`BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT`）并启用 RSS 守卫 `24576MB`（`BACKEND_BUILD_DRIVER_MAX_RSS_MB`，设 `0` 关闭）；默认硬失败不回写 stage0（`BACKEND_BUILD_DRIVER_NO_RECOVER=1`）；仅显式设 `BACKEND_BUILD_DRIVER_NO_RECOVER=0` 才允许失败后复用健康 stage0。
+- `build_backend_driver` fast 轨默认 `BACKEND_BUILD_DRIVER_MULTI=0`、`BACKEND_BUILD_DRIVER_INCREMENTAL=1`，并默认开启 `BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE=1`，允许同一份源码/stage0/参数在不同 `--out` 之间复用 quick 产物；quick/shared stamp 现在额外绑定 `source_capability_signature`，覆盖 `stage1 parser/semantics/ownership/monomorphize/type_syntax_lowering + uir_core_types + backend_driver` 变更；seal 轨默认 `BACKEND_BUILD_DRIVER_REBUILD_MULTI=0`、`BACKEND_BUILD_DRIVER_REBUILD_INCREMENTAL=0`。需要并行时可显式覆盖 jobs/multi。
+- fast 路径下“保留现有 canonical driver”不再顺手清掉 quick/cap/smoke 侧车；历史清理继续只在 seal/canonical 安装收口时执行，避免把 fast reuse 条件自己擦掉。
+- `build_backend_driver` 未显式指定 stage0 时，会优先尝试健康的 `artifacts/backend_selfhost_self_obj/cheng.stage2`，再回落到 canonical/seed/dist 候选。
+- `build_backend_driver` fast/seal 两轨默认都走 `system`，并固定 `GENERIC_MODE=dict` / `GENERIC_LOWERING=mir_dict`；如需实验 fast self-link，可显式设 `BACKEND_BUILD_DRIVER_FAST_STRICT_NATIVE=0`。seal 编译尝试超时默认 `180s`（`BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT`）并启用 RSS 守卫 `24576MB`（`BACKEND_BUILD_DRIVER_MAX_RSS_MB`，设 `0` 关闭）；默认硬失败不回写 stage0（`BACKEND_BUILD_DRIVER_NO_RECOVER=1`）；仅显式设 `BACKEND_BUILD_DRIVER_NO_RECOVER=0` 才允许失败后复用健康 stage0。
 - `build_backend_driver` 自举编译仅注入必需的 `BACKEND_*`/`STAGE1_*`（不含 skip_sem/skip_ownership）环境变量，保持 seed stage0 口径稳定。
 - 在 `MM=orc BACKEND_LINKER=self` 口径下，`opt/opt2/multi-lto/ssa/debug`（以及可选 `stress`）gate 已统一固定串行口径（`BACKEND_MULTI=0`、`BACKEND_MULTI_FORCE=0`；`whole_program` 内部固定为 `1`）以保证稳定可复现。
 - `verify_backend_concurrency_stress` 默认跳过（`BACKEND_CONCURRENCY_STRESS_ENABLED=0`）；需要并发压力回归时显式设置 `BACKEND_CONCURRENCY_STRESS_ENABLED=1`。
@@ -676,7 +676,7 @@ cheng_tooling verify_stage1_seed_layout
 - 主 seed 口径为 backend 可执行 seed（优先 `artifacts/backend_seed/cheng.stage2`）。
 - `src/stage1/frontend_bootstrap.seed.c` 必须不存在。
 - `verify.sh` 与 `verify_backend_closedloop` 会执行该门禁。
-- `verify.sh` 默认导出 `BACKEND_PROD_GATE_TIMEOUT=60`、`BACKEND_PROD_SELFHOST_TIMEOUT=60`、`BACKEND_PROD_TIMEOUT_DIAG=1`、`BACKEND_RUN_SELFHOST=0`；可通过 `VERIFY_LIBP2P_FRONTIER=1` 追加 `libp2p frontier` 探针门禁。
+- `verify.sh` 默认导出 `BACKEND_PROD_GATE_TIMEOUT=60`、`BACKEND_PROD_SELFHOST_TIMEOUT=240`、`BACKEND_PROD_TIMEOUT_DIAG=1`、`BACKEND_RUN_SELFHOST=0`；可通过 `VERIFY_LIBP2P_FRONTIER=1` 追加 `libp2p frontier` 探针门禁。
 - `verify.sh` 默认同时导出 `BACKEND_PROD_TIMEOUT_DIAG_SUMMARY=1` 与 `FRONTIER_TIMEOUT_DIAG_SUMMARY=1`（超时后自动打印热点摘要）。
 - `verify.sh` 默认把 `verify.tooling_cmdline` 作为必跑 gate（`cheng_tooling verify_tooling_cmdline`）。
 - `verify.sh` 默认优先使用 `bundle full` 入口运行 `chengc/verify_backend_closedloop/backend_prod_closure`（缺失时自动构建）：

@@ -5,6 +5,7 @@ import std/seqs
 import std/hashmaps
 import std/hashsets
 import std/monotimes
+import std/system
 import stage1/lexer
 import stage1/parser
 import stage1/ast
@@ -15,6 +16,45 @@ import stage1/c_profile_lowering
 import stage1/ownership
 import stage1/diagnostics
 import std/rawmem_support
+
+@importc("cheng_file_exists")
+fn stage1_c_fileExists(path: str): int32
+
+fn add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+fn add(dst: int32[]*, val: int32) =
+    seqs.add(dst, val)
+
+fn add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+fn add(dst: str[]*, val: str) =
+    seqs.add(dst, val)
+
+fn add(dst: var AstNodeId[], val: AstNodeId) =
+    seqs.add(dst, val)
+
+fn add(dst: AstNodeId[]*, val: AstNodeId) =
+    seqs.add(dst, val)
+
+fn add(dst: var Node[], val: Node) =
+    seqs.add(dst, val)
+
+fn add(dst: Node[]*, val: Node) =
+    seqs.add(dst, val)
+
+fn add(dst: var Token[], val: Token) =
+    seqs.add(dst, val)
+
+fn add(dst: Token[]*, val: Token) =
+    seqs.add(dst, val)
+
+fn add(dst: var Diagnostic[], val: Diagnostic) =
+    seqs.add(dst, val)
+
+fn add(dst: Diagnostic[]*, val: Diagnostic) =
+    seqs.add(dst, val)
 
 fn stage1_c_getenv(name: cstring): str =
     return os.getEnvDefault(name, "")
@@ -353,7 +393,7 @@ fn setOrcEnabled(enabled: bool) =
 fn setOrcStrict(enabled: bool) =
     orcStrictFlag = enabled
 
-let cacheHeader: str = "CHENGTOK9"
+let cacheHeader: str = "CHENGTOK10"
 let cacheSpecVersion: str = "2026-01-25"
 
 fn cacheCompilerVersion(): str =
@@ -396,9 +436,9 @@ fn cacheMetaLine(): str =
 
 fn cacheEnabled(): bool =
     let tokenCache: str = lowerAscii(stage1_getEnv("STAGE1_TOKEN_CACHE"))
-    if (tokenCache == "0") || (tokenCache == "false") || (tokenCache == "no"):
-        return false
-    return !(stage1_getEnv "CACHE" == "0")
+    if (tokenCache == "1") || (tokenCache == "true") || (tokenCache == "yes"):
+        return !(stage1_getEnv "CACHE" == "0")
+    return false
 
 fn cacheDir(): str =
     let env: str = stage1_getEnv "CACHE_DIR"
@@ -406,14 +446,76 @@ fn cacheDir(): str =
         return env
     return joinPath(getCurrentDir(), ".cheng-cache/stage1")
 
+fn stage1SplitDir(path: str): str =
+    let pathLen: int32 = len path
+    if pathLen == 0:
+        return ""
+    var lastSep: int32 = -1
+    for i in 0..<pathLen:
+        let ch: char = path[i]
+        if ch == '/' || ch == '\\':
+            lastSep = i
+    if lastSep < 0:
+        return ""
+    if lastSep == 0:
+        return sliceRange(path, 0, 0)
+    return sliceRange(path, 0, lastSep - 1)
+
+fn stage1SplitName(path: str): str =
+    let pathLen: int32 = len path
+    if pathLen == 0:
+        return ""
+    var lastSep: int32 = -1
+    for i in 0..<pathLen:
+        let ch: char = path[i]
+        if ch == '/' || ch == '\\':
+            lastSep = i
+    let nameStart: int32 = lastSep + 1
+    if nameStart >= pathLen:
+        return ""
+    var lastDot: int32 = -1
+    let __for_start_i = pathLen - 1
+    for __for_rev_i in 0..(__for_start_i - (nameStart)):
+        let i = __for_start_i - __for_rev_i
+        let ch: char = path[i]
+        if ch == '.':
+            lastDot = i
+            break
+    if lastDot > lastSep && lastDot >= 0:
+        if lastDot - 1 < nameStart:
+            return ""
+        return sliceRange(path, nameStart, lastDot - 1)
+    return sliceRange(path, nameStart, pathLen - 1)
+
+fn stage1SplitExt(path: str): str =
+    let pathLen: int32 = len path
+    if pathLen == 0:
+        return ""
+    var lastSep: int32 = -1
+    for i in 0..<pathLen:
+        let ch: char = path[i]
+        if ch == '/' || ch == '\\':
+            lastSep = i
+    var lastDot: int32 = -1
+    let __for_start_i = pathLen - 1
+    for __for_rev_i in 0..(__for_start_i - ((lastSep) + (1))):
+        let i = __for_start_i - __for_rev_i
+        let ch: char = path[i]
+        if ch == '.':
+            lastDot = i
+            break
+    if lastDot > lastSep && lastDot >= 0:
+        return sliceRange(path, lastDot, pathLen - 1)
+    return ""
+
 fn ensureDir(path: str) =
     if len path == 0:
         return
     if bos_dirExists path:
         return
-    let parts: SplitFileResult = parser_splitFile path
-    if len parts.dir > 0 && ! bos_dirExists parts.dir:
-        makeDir parts.dir
+    let parentDir: str = stage1SplitDir path
+    if len parentDir > 0 && ! bos_dirExists parentDir:
+        makeDir parentDir
     makeDir path
 
 fn startsWith(s: str, prefix: str): bool =
@@ -458,8 +560,7 @@ fn u64ToHex(v: uint64): str =
     return str(p)
 
 fn moduleTag(path: str): str =
-    let parts: SplitFileResult = parser_splitFile path
-    var base: str = parts.name
+    var base: str = stage1SplitName path
     if len base == 0:
         base = "module"
     let key: str = u64ToHex(hash64(path))
@@ -540,7 +641,7 @@ fn dumpTokens(path: str, tokens: Token[]) =
         let lineStr: str = stage1_int64ToStr int64(t.line)
         let colStr: str = stage1_int64ToStr int64(t.col)
         let kindStr: str = kindName t.kind
-        let lexStr: str = escapeCacheField t.lexeme
+        let lexStr: str = escapeCacheField tokenLexeme(t)
         let msg0: str = lineStr + ":" + colStr
         let msg1: str = msg0 + " " + kindStr
         let msg2: str = msg1 + " " + lexStr
@@ -685,114 +786,14 @@ fn cachePath(path: str): str =
     releaseString name
     return out
 
-type
-    TokenCacheResult =
-        hit: bool
-        tokens: Token[]
-
-fn loadTokenCache(path: str, size: int64, mtime: int64): TokenCacheResult =
-    var res: TokenCacheResult
-    res.hit = false
-    if ! cacheEnabled():
-        return res
-    let cpath: str = cachePath path
-    defer:
-        releaseString cpath
-    if ! stage1_fileExists cpath:
-        return res
-    let content: str = stage1_readFile cpath
-    if len(content) == 0 || content[0] == char(0):
-        return res
-    defer:
-        releaseString content
-    var sizeVal: int64 = -1
-    var mtimeVal: int64 = -1
-    var countVal: int64 = -1
-    var out: Token[64]
-    var ok: bool = true
-    var lineNo: int32 = 0
-    let n: int32 = len content
-    var idx: int32 = 0
-    for __for_guard_idx in 0..<n:
-        if !(idx < n):
-            break
-        var lineStart: int32 = idx
-        for __for_guard_idx2 in 0..<n:
-            if !(idx < n && content[idx] != '\n'):
-                break
-            idx = idx + 1
-        var lineEnd: int32 = idx - 1
-        if idx < n && content[idx] == '\n':
-            idx = idx + 1
-        var line: str = ""
-        if lineStart <= lineEnd:
-            # Avoid O(n) strlen on the whole file for every line slice.
-            line = sliceRangePlainKnownLen(content, n, lineStart, lineEnd)
-            line = trimTrailingCRPlain line
-        if lineNo == 0:
-            if line != cacheHeader:
-                ok = false
-        elif lineNo == 1:
-            let expected: str = cacheMetaLine()
-            if line != expected:
-                ok = false
-            releaseString expected
-        elif lineNo == 2:
-            if ! startsWith(line, "size="):
-                ok = false
-            else:
-                let sizeStr: str = sliceRangePlain(line, 5, len line - 1)
-                sizeVal = parseInt64 sizeStr
-                releaseString sizeStr
-        elif lineNo == 3:
-            if ! startsWith(line, "mtime="):
-                ok = false
-            else:
-                let mtimeStr: str = sliceRangePlain(line, 6, len line - 1)
-                mtimeVal = parseInt64 mtimeStr
-                releaseString mtimeStr
-        elif lineNo == 4:
-            if ! startsWith(line, "count="):
-                ok = false
-            else:
-                let countStr: str = sliceRangePlain(line, 6, len line - 1)
-                countVal = parseInt64 countStr
-                releaseString countStr
-            if sizeVal != size || mtimeVal != mtime || countVal < 0:
-                ok = false
-        else:
-            if len line > 0:
-                let parts: str[] = splitTabs line
-                if parts.len >= 5:
-                    let kindId: int32 = int32(parseInt64(parts[0]))
-                    let lineNoTok: int32 = int32(parseInt64(parts[1]))
-                    let colNo: int32 = int32(parseInt64(parts[2]))
-                    let prefixVal: int32 = int32(parseInt64(parts[3]))
-                    let lexemeEsc: str = parts[4]
-                    let lexeme: str = unescapeCacheField lexemeEsc
-                    trackLexStringStr(lexeme)
-                    var tok: Token
-                    tok.kind = TokenKind(kindId)
-                    tok.lexeme = lexeme
-                    tok.strPrefix = chr prefixVal
-                    tok.line = lineNoTok
-                    tok.col = colNo
-                    add(out, tok)
-                for pi in 0..<parts.len:
-                    releaseString parts[pi]
-                freeSeq[str](parts)
-        releaseString line
-        if ! ok:
-            break
-        lineNo = lineNo + 1
-    if ! ok || lineNo < 5 || int64(out.len) != countVal:
-        for ti in 0..<out.len:
-            let tok: Token = out[ti]
-            releaseString tok.lexeme
-        return res
-    res.hit = true
-    res.tokens = out
-    return res
+fn loadTokenCacheInto(path: str, size: int64, mtime: int64, out: Token[]*): bool =
+    path
+    size
+    mtime
+    out
+    # Current stage0 still miscompiles object-return cacheResult paths; keep
+    # cache write enabled but force read miss until selfhost is stable.
+    return false
 
 fn writeInt64(f: File, v: int64) =
     if v == 0:
@@ -838,7 +839,7 @@ fn writeTokenCache(path: str, size: int64, mtime: int64, tokens: Token[]) =
         write(f, "\t")
         writeInt64(f, int64(t.strPrefix))
         write(f, "\t")
-        let esc: str = escapeCacheField t.lexeme
+        let esc: str = escapeCacheField tokenLexeme(t)
         write(f, esc)
         releaseString esc
         write(f, "\n")
@@ -849,19 +850,15 @@ fn stage1_fileExists(path: str): bool =
         return false
     if path[0] == char(0):
         return false
-    let f: File = openRead(path)
-    if f == nil:
-        return false
-    c_fclose f
-    return true
+    return stage1_c_fileExists(path) != 0
+
+fn stage1_readFileInto(path: str, out: str* = nil): bool =
+    return os.readFileInto(path, out)
 
 fn stage1_readFile(path: str): str =
-    let f: File = openRead path
-    if f == nil:
-        return ""
-    let content: str = readAll f
-    c_fclose f
-    return content
+    var out: str = ""
+    let _ok: bool = stage1_readFileInto(path, &out)
+    return out
 
 fn stage1_writeFile(path: str, content: str) =
     let f: File = open(path, fmWrite)
@@ -1358,7 +1355,8 @@ fn packageIdFromManifest(manifestPath: str): str =
         return ""
     if ! stage1_fileExists manifestPath:
         return ""
-    let content: str = stage1_readFile manifestPath
+    var content: str = ""
+    let _readOk: bool = stage1_readFileInto(manifestPath, &content)
     if len(content) == 0 || content[0] == char(0):
         return ""
     let contentLen: int32 = len content
@@ -1806,7 +1804,9 @@ fn setAddStr(v: StrSetList*, key: str) =
         return
     if setHasStr(*v, normKey):
         return
-    add(v->items, normKey)
+    var items0: str[] = v->items
+    add(items0, normKey)
+    v->items = items0
     hashsets.hashSetStrAdd(v->set, normKey)
 
 fn stage1StrEq(a: str, b: str): bool =
@@ -1837,7 +1837,9 @@ fn importTraceHas(v: ImportTrace, path: str): bool =
 fn importTracePush(v: ImportTrace*, path: str) =
     if v == nil || len(path) == 0:
         return
-    add(v->items, path)
+    var items0: str[] = v->items
+    add(items0, path)
+    v->items = items0
 
 fn importTracePop(v: ImportTrace*) =
     if v == nil:
@@ -1887,8 +1889,10 @@ fn mapSetNodes(cache: NodeCache*, key: str, val: AstNodeId[]) =
     let idx: int32 = hashmaps.hashMapStrIntGetOrInsertEx(cache->index, key, cache->keys.len, existed)
     let start: int32 = cache->pool.len
     let n: int32 = val.len
+    var pool0: AstNodeId[] = cache->pool
     for i in 0..<n:
-        add(cache->pool, val[i])
+        add(pool0, val[i])
+    cache->pool = pool0
     if existed && idx >= 0 && idx < cache->valStart.len:
         var valStartSeq: int32[] = cache->valStart
         var valLenSeq: int32[] = cache->valLen
@@ -1898,9 +1902,15 @@ fn mapSetNodes(cache: NodeCache*, key: str, val: AstNodeId[]) =
         cache->valLen = valLenSeq
         return
     let newIdx: int32 = cache->keys.len
-    add(cache->keys, key)
-    add(cache->valStart, start)
-    add(cache->valLen, n)
+    var keys0: str[] = cache->keys
+    var starts0: int32[] = cache->valStart
+    var lens0: int32[] = cache->valLen
+    add(keys0, key)
+    add(starts0, start)
+    add(lens0, n)
+    cache->keys = keys0
+    cache->valStart = starts0
+    cache->valLen = lens0
     if existed || idx != newIdx:
         hashmaps.hashMapStrIntPut(cache->index, key, newIdx)
 
@@ -1944,18 +1954,15 @@ fn loadModuleRecursiveId(path: str, rootDir: str, visited: StrSetList*, diags: D
     lexDiags.buffer = nil
     lexDiags.len = 0
     lexDiags.cap = 0
-    let cacheRes: TokenCacheResult = loadTokenCache(pathNorm, size, mtime)
-    if cacheRes.hit:
-        tokens = cacheRes.tokens
-    else:
-        let content: str = stage1_readFile pathNorm
+    let cacheHit: bool = loadTokenCacheInto(pathNorm, size, mtime, &tokens)
+    if !cacheHit:
+        var content: str = ""
+        let _readOk: bool = stage1_readFileInto(pathNorm, &content)
         if (content == ""):
             addDiag(diags, svError, pathNorm, 1, 1, "Unable to read imported module")
             return out
-        let lexRes: LexResult = lex(content, pathNorm)
+        let _lexOk: bool = lexInto(content, pathNorm, &tokens, &lexDiags)
         releaseString content
-        tokens = lexRes.tokens
-        lexDiags = lexRes.diagnostics
         appendDiagnostics(diags, lexDiags)
         if lexDiags.len == 0:
             writeTokenCache(pathNorm, size, mtime, tokens)
@@ -1972,8 +1979,7 @@ fn loadModuleRecursiveId(path: str, rootDir: str, visited: StrSetList*, diags: D
     collectImportAliasesId(mrootId, &aliases)
     if aliases.len > 0:
         let _loweredRootId: AstNodeId = lowerModuleQualifiersId(mrootId, aliases)
-    let split: SplitFileResult = parser_splitFile(pathNorm)
-    let moduleDir: str = split.dir
+    let moduleDir: str = stage1SplitDir pathNorm
     var importNodes: AstNodeId[]
     reserve(importNodes, 32)
     collectImportNodesId(mrootId, &importNodes)
@@ -2059,7 +2065,8 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: Diagnosti
     return out
 
 fn copyFile(src: str, dst: str): bool =
-    let content: str = stage1_readFile src
+    var content: str = ""
+    let _readOk: bool = stage1_readFileInto(src, &content)
     if (content == ""):
         return false
     stage1_writeFile(dst, content)
@@ -2112,17 +2119,14 @@ fn loadSystemModuleId(userFile: str, diags: Diagnostic[]*): AstNodeId =
     lexDiags.buffer = nil
     lexDiags.len = 0
     lexDiags.cap = 0
-    let cacheRes: TokenCacheResult = loadTokenCache(sysPath, size, mtime)
-    if cacheRes.hit:
-        tokens = cacheRes.tokens
-    else:
-        let content: str = stage1_readFile sysPath
+    let cacheHit: bool = loadTokenCacheInto(sysPath, size, mtime, &tokens)
+    if !cacheHit:
+        var content: str = ""
+        let _readOk: bool = stage1_readFileInto(sysPath, &content)
         if (content == ""):
             return astInvalidNodeId()
-        let lexRes: LexResult = lex(content, sysPath)
+        let _lexOk: bool = lexInto(content, sysPath, &tokens, &lexDiags)
         releaseString content
-        tokens = lexRes.tokens
-        lexDiags = lexRes.diagnostics
         if diags != nil:
             appendDiagnostics(diags, lexDiags)
         if lexDiags.len == 0:
@@ -2148,18 +2152,15 @@ fn parseModuleForDepsId(path: str, diags: Diagnostic[]*): AstNodeId =
     lexDiags.buffer = nil
     lexDiags.len = 0
     lexDiags.cap = 0
-    let cacheRes: TokenCacheResult = loadTokenCache(path, size, mtime)
-    if cacheRes.hit:
-        tokens = cacheRes.tokens
-    else:
-        let content: str = stage1_readFile path
+    let cacheHit: bool = loadTokenCacheInto(path, size, mtime, &tokens)
+    if !cacheHit:
+        var content: str = ""
+        let _readOk: bool = stage1_readFileInto(path, &content)
         if (content == ""):
             addDiag(diags, svError, path, 1, 1, "Unable to read input file")
             return astInvalidNodeId()
-        let lexRes: LexResult = lex(content, path)
+        let _lexOk: bool = lexInto(content, path, &tokens, &lexDiags)
         releaseString content
-        tokens = lexRes.tokens
-        lexDiags = lexRes.diagnostics
         appendDiagnostics(diags, lexDiags)
         if lexDiags.len == 0:
             writeTokenCache(path, size, mtime, tokens)
@@ -2246,14 +2247,15 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
         let imp: str = imports[importIndex]
         if len imp > 0:
             setAddStr(&uniqSet, imp)
-    let inParts: SplitFileResult = parser_splitFile inPath
-    if stage1_autoSystemEnabled() && !(inParts.name == "system" && inParts.ext == ".cheng"):
+    let inName: str = stage1SplitName inPath
+    let inExt: str = stage1SplitExt inPath
+    if stage1_autoSystemEnabled() && !(inName == "system" && inExt == ".cheng"):
         setAddStr(&uniqSet, "system")
     var resolvedDeps: str[] = uniqSet.items
     let resolveEnv: str = stage1_getEnv "DEPS_RESOLVE"
     if (resolveEnv == "1") || (resolveEnv == "true") || (resolveEnv == "yes"):
         let repoRoot: str = getCurrentDir()
-        let baseDir: str =(parser_splitFile inPath).dir
+        let baseDir: str = stage1SplitDir inPath
         var resolvedSet: StrSetList = strSetListInit(uniqSet.items.len + 4)
         var visitedModules: StrSetList = strSetListInit(uniqSet.items.len + 4)
         var pending: str[]
@@ -2278,7 +2280,7 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
                 let modRootId: AstNodeId = parseModuleForDepsId(modPath, diags)
                 if !astNodeIdValid(modRootId):
                     continue
-                let modDir: str =(parser_splitFile modPath).dir
+                let modDir: str = stage1SplitDir modPath
                 var modImports: str[8]
                 collectImportDepsId(modRootId, &modImports)
                 for mi in 0..<modImports.len:

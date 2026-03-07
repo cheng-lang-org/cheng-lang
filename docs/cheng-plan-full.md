@@ -62,177 +62,13 @@ LLVM 的优化是通用且保守的。它最难做好的优化是“别名分析
 
 ### 给 Cheng 语言的务实落地建议
 
-从您的代码库可以看出，`cheng` 已经有了 `elf_writer` 和 `macho_writer`。你们其实**完全具备了实现“Linkerless 无链接器架构”的底座**。
+从当前代码库的落点看，真正需要收敛的不是“再发明一个通用 LLVM”，而是三条明确的工程主线：
 
-如果你想将 `cheng` 打造成世界顶尖的现代语言，建议采取**双轨制（Dual-Backend）演进路线**：
+1. Dev 轨：继续把 `writer + direct-exe + linkerless` 做成极速开发主链。
+2. Release 轨：固定 `UIR -> .o -> system linker(mold|lld|default)`，把发布极限收敛交给成熟工具链。
+3. 语义特化：把 Ownership/No-Alias、Metering、E-Graph 这类语言护城河落实到可验收的后端能力，而不是停留在概念层。
 
-1. **Dev Mode（极速开发后端 - 纯自研）**：
-* **干掉文件链接**：停止维护 `elf_linker.cheng` 中去解析 `.o` 文件的冗余逻辑。把 `writer` 升级为内存全局 UIR 直出 `.exe`。
-* **全面采用 DOD 架构**：结合简单的线性扫描寄存器分配，实现按下保存键 **100毫秒内** 完成 10 万行代码的编译+运行。给开发者前所未有的震撼体验。
-
-
-2. **Release Mode（极限发布后端 - 借力打力）**：
-* 不要头铁去手写数百种 x86-64 的微架构指令调优。
-* Release 主链固定为 `UIR -> .o -> system linker`，并优先复用 `mold`（不可用回退 `lld`，再回退系统默认 linker）做 `O3/LTO` 发布收敛。
-
-
-3. **专注特定领域的特化（比如 Decentralized 场景）**：
-* 针对您的 `src/decentralized/metering.cheng`（计费插桩），自研后端可以做到极其轻量。在生成 Wasm 或 UIR 阶段，直接原生地织入 Gas 计算指令。在这个细分的智能合约流式编译（Streaming Compilation）赛道上，笨重的 LLVM 毫无用武之地，这是你的绝对护城河。
-
-
-**不要用自研去硬刚传统编译器的通用海量微指令调优，而是用全新架构在“编译速度、开发体验、以及特定领域的高层语义”上对它们进行降维打击。** 这才是自研编译器的终极浪漫。
-
-## 0. 锁定目标（硬约束）
-- `Dev Mode`：自研极速路径，优先实现 `Linkerless`（减少/消灭 `.o` 中间态）。
-- `Release Mode`：保留借力路径，`UIR -> .o -> system linker(mold|lld)`。
-- `性能优先级`：先追求 `编译速度 + 增量体验`，再追求全平台极限微架构调优。
-- `平台顺序`：第一阶段硬门禁 `Darwin + Linux`。
-- `语义护城河`：充分利用 Ownership/No-Alias、Metering 场景特化。
-
-## 0.1 最近收口（2026-02-21）
-- `backend.import_cycle_predeclare` 已升级为纯 runtime 门禁：负例必须编译失败并输出 `Import cycle detected: ... -> ...` 链路；不再接受 source-contract 回退。
-- 前端导入循环检测已修复为 active import trace 函数级 push/pop 守卫，避免递归加载中提前 pop 导致的环路漏检。
-- `build_backend_driver` 自举编译统一注入 `STAGE1_SKIP_*` 与 `STAGE1_SKIP_*` 双口径，兼容 seed stage0 前缀差异并稳定自举链路。
-
-## 0.2 闭环状态快照（2026-02-25）
-- 判定口径：以 `backend_prod_closure` 的 required gates 为准（主执行入口为 `src/tooling/cheng_tooling.cheng` 原生命令；embedded payload 仅保留兼容回退面）。
-- 运行时内嵌查询：`$TOOLING embedded-ids/embedded-text` 直接读取 `tooling/cheng_tooling_embedded_inline`；内嵌 map 重写统一走 `$TOOLING embedded-map-rewrite`（仓库已移除 Python query 脚本）。
-- 最近一次本仓库实跑记录：`artifacts/backend_prod_closure/last_run.log`，包含 `verify_backend_closedloop ok` 与 `backend_prod_closure ok`。
-- 关键门禁实跑通过（PAR-01~PAR-07 主链）：`backend.mem_contract`、`backend.mem_image_core`、`backend.mem_exe_emit`、`backend.hotpatch_meta`、`backend.hotpatch_inplace`、`backend.incr_patch_fastpath`、`backend.mem_patch_regression`、`backend.closedloop`。
-- `PAR-08` 状态：已完成“除平台生产闭环”收口（Dev: `emit=exe + self/linkerless`；Release: `emit=exe + system linker`）；dev gate 收口与发布尾链已拆分为 `backend_prod_closure` 与 `backend-prod-publish` 两个原生命令。
-- 未完成项：全平台完整闭环仍在推进，`Windows` 完整可运行生产闭环仍待补齐（见 `docs/cheng-build-any-platform.md` 的“不在范围（当前阶段）”与“2.3 生产闭环现状（除平台）”）。
-- Host-only 严格收口（2026-02-25 当前实现）：
-  - `SELFHOST_STRICT_REBUILD=1`（默认）会强制 `verify_backend_selfhost_100ms_host` 走 `compile-stage1 + full rebuild + require rebuild`，并阻断任何非真实重编通过路径。
-  - `BUILD_DRIVER_STRICT_NATIVE=1`（默认），`build-backend-driver` 回退链路（`shim/reused_stage0/legacy relink/delegate wrapper`）已硬关闭。
-  - `verify_backend_selfhost_100ms_host` 报告新增结构化字段：`stage0_driver_kind/fallback_used/quarantine_cleaned/lock_wait_ms/strict_rebuild_ok`。
-  - `backend_prod_closure` required 链路新增 `backend.opt2_impl_surface`（`verify_backend_opt2_impl_surface`）。
-
-## 0.3 最近修复快照（2026-02-28）
-- backend driver 单一化：`cheng/release-compile` 与 `backend_prod_closure/backend-prod-publish` 统一固定 canonical driver `artifacts/backend_driver/cheng`；`compile/chengc` 入口已移除（固定 `rc=2`）。
-- 配置面收口：`BACKEND_DRIVER/CHENG_BACKEND_DRIVER` 覆盖入口已移除，`driver-path` 改为结构化输出（`toolchain_root/driver_path/driver_sha256/driver_kind=canonical`）。
-- stage0 覆盖入口收口：`SELF_OBJ_BOOTSTRAP_STAGE0`、`BACKEND_BUILD_DRIVER_STAGE0`、`backend_prod_closure --seed*` 的 driver 覆盖语义已移除；`selfhost/bootstrap/100ms` 不再接受 `--stage0`。
-- 生态接入收口：`cheng-codex/cheng-gui` 与指定外部仓库脚本改为统一调用 `cheng_tooling toolchain-root + driver-path + compile`，不再自行探测 driver 候选链。
-- 跨工作区 UE 治理：新增 `stage0-ue-clean --global`，并把 UE/orphan 匹配收口到 stage0 quarantine + canonical driver 相关命令。
-- self-link 稳定性修复：`std/bytes.readFileBytes` 改为 `fileSize` 预分配 + 顺序读取，并统一走 `c_fclose`，用于消除 `machoParseObj -> readFileBytes -> fclose` 崩溃链（`rc=139`）。
-- stage0 quarantine 误阻断修复：`tooling_stage0BlockOnQuarantineUe` 增加“清理后短重检”机制（`TOOLING_STAGE0_QUARANTINE_BLOCK_RECHECKS`，默认 `2`），降低“首轮已清理但仍阻断”的抖动。
-- stage0 能力前置校验：`build-backend-driver` 默认启用 `TOOLING_STAGE0_CAPABILITY_PREFLIGHT=1`，比较 stage0 `.cap` 签名与当前 `stage1/parser+ast+semantics+ownership+monomorphize+type_syntax_lowering + uir_core_types + backend_driver` 源签名；不匹配时 fail-fast 并提示先 `bootstrap-pure --mode:strict` 刷新 seed/driver。成功重编会自动写回 `<driver>.cap.env`。
-- strict fixed-point 诊断增强：`SELF_OBJ_BOOTSTRAP_MODE=strict` 若 `SHA256(stage2)!=SHA256(stage3)`，会自动产出 `<out-dir>/strict_mismatch/summary.env` 与 bytes/symbols/strings diff，命令输出新增 `bootstrap_pure_strict_mismatch_report` / `selfhost_bootstrap_strict_mismatch_report`。
-- in-memory runtime probe 稳定化：`verify_backend_noalias_opt` / `verify_backend_egraph_cost` / `verify_backend_dod_opt_regression` 的 runtime probe 口径固定关闭 profile 输出（`UIR_PROFILE=0` + `BACKEND_PROFILE=0`），避免 `driver_profileStep -> fwrite` 路径段错误。
-- 复验记录：`$TOOLING backend_prod_closure --no-publish`（dev gate）输出 `backend_prod_closure ok`；`$TOOLING verify_backend_selfhost_100ms_host --compile-stage1 --iters:30 --enforce:1` 实测 `p95=83ms`、`p99=91ms`。
-- 编译入口收口：`cheng` 已移除 stage0 全局锁包装，默认仅保留 `preflight + timeout`，用于支持并发编译。
-- build-driver 收口：full rebuild 默认 `BACKEND_BUILD_DRIVER_REBUILD_DIRECT_EXE=1`，并禁用 profile segfault fail-open（默认 `BACKEND_BUILD_DRIVER_PROFILE_FAIL_OPEN=0`）。
-- native-contract 前端收口：`stage1_autoSystemEnabled()` 在 `BACKEND_NATIVE_CONTRACT=1` 时强制返回 `false`，不再依赖 gate 脚本注入 `STAGE1_AUTO_SYSTEM=0`。
-- required gate 扩展：`backend.native_contract_autosystem`（`verify_backend_native_contract_autosystem`）已接入 `backend_prod_closure`。
-
-### 0.4 最近修复快照（2026-03-01）
-- `std/cmdline` 零裸指针收口：移除 `__cheng_setCmdLine(argc, argv: void*)` 与 `alloc/ptr_add/copyMem/setMem/*str*` 读取路径；改为 runtime bridge `__cheng_rt_paramCount/__cheng_rt_paramStr`，并通过 `__cheng_rt_paramStrCopy` 稳定转值语义字符串缓存。
-- 入口迁移：`stage1/tooling/web` 等 `main(argc, argv)` 统一调用 `cmdline.__cheng_captureCmdLine(argc, argv)`（仅把参数转交 runtime C 影子桥；语言层不再做裸指针算术）。
-- runtime C 新增并导出 `__cheng_setCmdLine`、`__cheng_rt_paramCount/__cheng_rt_paramStr/__cheng_rt_paramStrCopy`（兼容保留弱符号 `paramCount/paramStr` 一版）。
-- `backend_prod_closure` required 新增并阻断：
-  - `backend.rawptr_surface_forbid`（`verify_backend_rawptr_surface_forbid`，含 `std/cmdline` 无裸指针强检查）
-  - `backend.stage1_ast_soa_surface`（`verify_stage1_ast_soa_surface`，输出 `stage1_ref_surface/uir_ref_surface/rawptr_surface` 快照；默认 `BACKEND_PROD_STAGE1_AST_SOA_ENFORCE=1` 硬阻断，设 `0` 可降为报告模式）
-  - `backend.uir_soa_surface`（`verify_backend_uir_soa_surface`，SoA surface + runtime 合约；双次 runtime probe 断言 `soa_report` 一致）
-  - `backend.uir_soa_self_probe`（`verify_backend_uir_soa_self_probe`，self-link 子探针固定阻断口径）
-- `backend_prod_closure` required 扩展：
-  - `backend.symbol_closure`（`verify_backend_symbol_closure`，阻断 `_alloc/_c_strlen/_zeroMem` 运行时符号缺失）
-  - `backend.release_compile_stability`（`verify_backend_release_compile_stability`，固定 `return_new_ref_seq_growth` 3 次 release-compile 稳定性）
-  - `backend.zero_script_residual`（`verify_backend_zero_script_residual`，阻断 required 路径 compile-only/skip 语义与 legacy `CHENG_*` 读取）
-- release 稳定性修复：`release-compile --in:return_new_ref_seq_growth` 已可运行；`verify_backend_release_compile_stability` 默认 3 次通过。
-- selfhost 100ms 复验：`$TOOLING selfhost-100ms-host --iters:30 --enforce:1` 当前实测 `p95=80ms`、`p99=120ms`。
-- `uir_core_types` 新增 SoA surface 实体：`UirExprId/UirStmtId/UirBlockId/UirFuncId`、`UirCoreSoa`、`uirCoreSoaNew/Append*` 与 `uirCoreSoaBuildFromFunc`；`uir_opt` 新增 `soa_report`（默认关闭，gate 显式 `UIR_SOA_REPORT=1` 开启）。
-- 2026-03-01 收口补充（SIMD + E-Graph）：
-  - `uir_vectorize_slp` 从占位升级为可执行 SLP 重写（确定性项排序 + 平衡重建 + `simd_slp_report`）。
-  - `uir_egraph_rewrite` 升级为“等价饱和 + 代价抽取”引擎（rule saturation、class/node budget、`egraph_report`）。
-  - `backend_prod_closure` required 新增 `backend.simd`（`verify_backend_simd` 原生命令，compile determinism + 源实现硬校验）。
-  - `verify_backend_egraph_cost` 增强为饱和引擎源实现硬校验 + 多目标（`balanced/latency/size`）编译探针。
-  - `backend_native_contract.env` 已同步基线，`$TOOLING backend_prod_closure --no-publish` 实跑输出 `backend_prod_closure ok`（见 `artifacts/backend_prod_closure/last_run.log`）。
-
-### 0.5 最近修复快照（2026-03-05）
-- required embedded payload 收口：`verify_backend_mem_exe_emit` / `verify_backend_hotpatch` / `verify_backend_hotpatch_meta` / `verify_backend_mem_patch_regression` 默认 embedded 文本改为 `cheng` 调用；`verify_backend_mem_exe_emit` 额外移除 `BACKEND_DRIVER` 前缀注入并同步 `cheng_*` 报告字段命名。
-- `verify_backend_zero_script_residual` 新增 required embedded 防回归：固定检查 `verify_backend_mem_exe_emit` / `verify_backend_hotpatch` / `verify_backend_hotpatch_meta` / `verify_backend_mem_patch_regression` / `verify_backend_incr_patch_fastpath` / `verify_backend_hotpatch_inplace`，阻断 `\bchengc\b` 与 `BACKEND_DRIVER=` 残留。
-- `build-backend-driver` 收紧：`BACKEND_BUILD_DRIVER_REQUIRE_REBUILD` 默认值从 `0` 提升到 `1`，且在 `BUILD_DRIVER_STRICT_NATIVE=1` 下禁用 fast-path reuse 与重建失败后复用旧 canonical driver。
-- C 文本发射已从工具链主入口移除；`backend_driver` 仅保留 `emit=exe`（以及内部 `emit=obj`）路径。
-- `backend_prod_closure` required FFI gate 收口：`backend.ffi_slice_shim`、`backend.ffi_outptr_tuple`、`backend.ffi_handle_sandbox`、`backend.ffi_borrow_bridge` 纳入 required 链路。
-- 能力 gate 收紧：
-  - `verify_backend_noalias_opt` 改为多 fixture runtime 直编译探针，并新增 `proof_backed_changes_total/mem2reg_loads_total/forward_loads_total` 统计与硬门禁。
-  - `verify_backend_egraph_cost` 改为 backend driver 直编译探针，新增 trace 级 determinism 硬门禁（`BACKEND_EGRAPH_COST_MAX_DETERMINISM_MISMATCH`，默认 `0`）并分离 `binary_hash_mismatch` 诊断字段。
-  - `verify_backend_dod_opt_regression` 改为多 fixture runtime 直编译探针，并新增 `probe_count/proof_backed_changes_total/egraph_report_count_total` 报告字段。
-
-复验命令（严格口径）：
-- `$TOOLING backend_prod_closure --no-publish`
-
-## 4. 关键依赖图（Memory-Exe + Hotpatch）
-```mermaid
-flowchart LR
-  P1["PAR-01 契约冻结"]
-  P2["PAR-02 MemImage 核心"]
-  P3["PAR-03 内存直出 EXE"]
-  P4["PAR-04 Hotpatch 元数据"]
-  P5["PAR-05 原地补丁引擎"]
-  P6["PAR-06 增量快路径"]
-  P7["PAR-07 回归门禁"]
-  P8["PAR-08 生产收口"]
-
-  P1 --> P2
-  P1 --> P4
-  P2 --> P3
-  P3 --> P5
-  P4 --> P5
-  P4 --> P6
-  P5 --> P6
-  P3 --> P7
-  P5 --> P7
-  P6 --> P7
-  P7 --> P8
-```
-
-## 5. 里程碑映射（建议）
-| 批次 | 月份 | 可并行任务包 | 批次出口 |
-|---|---|---|---|
-| `W0` | `M1` | `PAR-01` | 契约冻结 + baseline 骨架 |
-| `W1` | `M2-M4` | `PAR-02` + `PAR-04` | 内存镜像核心 + 热补丁元数据 |
-| `W2` | `M4-M6` | `PAR-03` + `PAR-05` | 直出可执行 + 原地补丁事务 |
-| `W3` | `M6-M8` | `PAR-06` + `PAR-07` | 脏函数增量快路径 + 性能/稳定门禁 |
-| `W4` | `M8-M9` | `PAR-08` | 生产闭环与值班手册收口 |
-
-状态注记（2026-02-25）：
-- `W4/PAR-08` 已完成“除平台”收口；全平台口径继续按 `docs/cheng-build-any-platform.md` 推进。
-
-## 6. 必过门禁（required，2026-02-25 已接入 backend_prod_closure）
-- `backend.mem_contract`
-- `backend.mem_image_core`
-- `backend.mem_exe_emit`（runtime 合并 + 原子写盘，sidecar 残留为 0）
-- `backend.hotpatch_meta`
-- `backend.hotpatch_inplace`
-- `backend.incr_patch_fastpath`
-- `backend.mem_patch_regression`
-- `backend.closedloop`
-- `backend.native_contract`
-- `backend.native_contract_autosystem`
-- `backend.symbol_closure`
-- `backend.release_compile_stability`
-- `backend.zero_script_residual`
-- `backend.opt2_impl_surface`
-- `backend.ffi_slice_shim`
-- `backend.ffi_outptr_tuple`
-- `backend.ffi_handle_sandbox`
-- `backend.ffi_borrow_bridge`
-
-## 7. 团队切片（最小配置）
-- `小队A（2人）`：`PAR-01` + `PAR-07`
-- `小队B（2人）`：`PAR-02` + `PAR-03`
-- `小队C（2人）`：`PAR-04` + `PAR-05`
-- `小队D（1-2人）`：`PAR-06`
-- `小队E（1人）`：`PAR-08`
-
-## 8. 执行铁律
-- 不允许跳过契约冻结直接实现功能；所有二进制格式字段先文档后代码。
-- 本轮已改编译入口：`cheng` 固定为 canonical dev-only 入口（`compile/chengc` 已移除）；release 轨改为显式入口 `release-compile`，并继续复用现有 `backend_driver/tooling` 主链落地。
-- Dev 执行默认：`chengc --run` 走 host runner（`--run:host`）；`--run:file` 保留兼容回退。
-- 热补丁主链默认：`BACKEND_HOTPATCH_MODE=trampoline` + `BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program` + `BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
-- 任何“原地补丁成功”都必须伴随“失败可回退且可运行”证据。
-- 性能结论必须附 `baseline + 同机复测命令 + 报告路径`。
-- 生产闭环采用双轨 required：Dev 主链 `emit=exe + self/linkerless`，Release 主链 `emit=exe + system linker`；FFI required 口径固定走 native UIR 影子桥接（slice/outptr/handle/borrow）。
+后文的并行矩阵、UIR 分层和跨端集成，都按这三条主线展开。
 
 
 ## 10. Codex 并行任务提示词（按合并任务包）
@@ -257,26 +93,6 @@ flowchart LR
 - 改动边界：`src/stage1` + `src/backend/uir` + `src/backend/machine` + `src/tooling` + `docs`。
 - 不在本轮范围：Memory-Exe/Hotpatch 主链路重构、发布流程改造、包管理协议变更。
 
-### 11.6 必过门禁（DOD + 语义特化）
-- `backend.dod_contract`
-- `backend.dod_soa`
-- `backend.mir_borrow`
-- `backend.noalias_opt`
-- `backend.egraph_cost`
-- `backend.dod_opt_regression`
-- `backend.closedloop`
-
-### 11.7 Codex 并行任务提示词（DOD + 语义特化）
-
-#### 11.7.1 全局上下文前缀
-```text
-你在仓库 /Users/lbcheng/cheng-lang 内工作。请执行指定并行任务包（DOPAR-*），并严格遵守：
-1) 目标聚焦：DOD（SoA/Arena/int32 index）+ 高阶语义降维（No-Alias + E-Graph）。
-2) 不改 Memory-Exe/Hotpatch 主链路语义；仅在 DOD/OPT 边界内改动。
-3) 任何新增/变更 schema、ENV、gate 名称必须同步更新 docs/cheng-plan-full.md。
-4) 输出必须包含：修改文件、性能口径、门禁命令、结果摘要、风险点。
-5) 若依赖任务未完成，先输出阻塞点与最小解阻方案，再继续可并行部分。
-```
 
 ### 11.10 IR 层级裁决（新增：UIR 与 MIR 语义边界）
 核心结论：
@@ -384,8 +200,8 @@ C 语言没有多返回值，遇到需要返回多个状态时，必须传入指
 
 ```cheng
 // 注解告诉编译器：第2和第3个物理参数是出参指针，不用暴露在函数签名里
-@ffi_out_ptrs(arg1, arg2) 
-importc fn get_size(input: int32) -> (int32, int32, int32) 
+@ffi_out_ptrs(arg1, arg2)
+importc fn get_size(input: int32) -> (int32, int32, int32)
 
 fn main() {
     let (status, w, h) = get_size(1080) // 纯粹的值语义，没有指针满天飞
@@ -401,7 +217,7 @@ int get_size(int input, int* w, int* h);
 cheng_tuple_i32_3 cheng_ffi_get_size(int32_t input) {
     int32_t out_w, out_h;
     // 编译器偷偷帮你写了 '&' 满足 C ABI 的变态要求
-    int32_t status = get_size(input, &out_w, &out_h); 
+    int32_t status = get_size(input, &out_w, &out_h);
     return (cheng_tuple_i32_3){status, out_w, out_h};
 }
 
@@ -420,7 +236,7 @@ C 库极其喜欢返回你不该触碰的黑盒指针，比如 `sqlite3*` 或 `G
 
 ```cheng
 // 语言层只知道它是个纯数字句柄（Token ID），绝对无法解引用
-type SqliteDb = distinct u32 
+type SqliteDb = distinct u32
 
 importc fn sqlite3_close(db: SqliteDb)
 
@@ -443,10 +259,9 @@ importc fn sqlite3_close(db: SqliteDb)
 由于你从表面语法中抹除了裸指针，UIR 里流转的全部是**绝对没有别名（No-Alias）**的切片、值和整数 Handle。此时编译器拥有了完美的数学确定性，可以毫无顾忌地做极限内存提升和自动向量化。
 2. **与 Web/Decentralized (WASM) 物理模型 100% 同构**
 在 WebAssembly 和智能合约的沙盒里，**本来就不存在物理内存指针**。Wasm 的沙盒模型里只有一条线性内存（大数组），所谓的 C 指针在 WASM 里本来就是个 `i32` 的偏移量索引。你这套 Handle + Slice 的抽象，天生就是为去中心化虚拟机量身定制的！
-3. **把脏活累活全部甩给 C Backend**
-这就是为什么我强烈推荐你走**生成 C 源码（路线 A）**。如果是自研机器码后端，你自己手写汇编去处理垫片（Shim）的寄存器传参和栈对齐会让你痛不欲生。但交给 C Backend，生成这些垫片就像写普通文本一样自然，系统的 Clang 编译器会自动帮你搞定所有 ABI 对齐。
+3. **把 ABI 脏活留在后端，不把裸指针还给用户**
+无论最终采用概念上的 C 垫片，还是生产上的 UIR call-site lowering / thunk synthesis，危险的 ABI 细节都应留在编译器后端处理，而不是重新暴露到用户语法层。
 
-**“真正的内存安全，不是教开发者如何小心翼翼地拿捏裸指针，而是直接把这把带血的刀从语法层面没收，交由编译器在底层黑盒中自动化完成。”** 采用这套方案，Cheng 语言的互操作安全性将远超如今的 Rust。
 
 
 这是一个极具挑战性的“工业级编译器性能工程”问题。**自举（Bootstrap，即用 `cheng` 编译 `cheng` 源码）的速度，是衡量一门系统级语言底层架构能力的最高试金石。**
@@ -532,90 +347,9 @@ importc fn sqlite3_close(db: SqliteDb)
 当团队达成这个目标时，**“等待编译”这个概念将在 `cheng` 语言的开发体验中被彻底抹除**。这种让全世界 C++ / Rust 开发者嫉妒到发狂的巅峰心流体验，将成为 `cheng` 语言在技术布道时最致命的武器。
 
 
-这是一个极为敏锐且切中编译器架构要害的拷问！
-
-直接回答你的问题：**你之前引用的“生成 C 代码垫片（C Backend）”的方案，与目前 `cheng` 语言官方确立的“自研后端（UIR -> Machine -> Obj/Exe）”生产主链是【绝对冲突】的！**
-
-如果你为了实现“零指针 FFI”而退回到生成 C 代码文件，并在编译期拉起庞大缓慢的 Clang/GCC 去编译垫片，这将彻底摧毁你辛辛苦苦建立的 **100 毫秒极速编译、Linkerless 直出、以及 DOD 内存连续性** 的核心护城河。
-
-**好消息是：你不仅可以完全不要 C Backend、直接生成对象文件（Obj/Exe），而且直接在自研的 UIR 层解决这个问题，才是顶尖工业级系统语言（如 Rust, Zig）的真正标准做法，属于更高级的“降维打击”！**
-
-所谓的“影子垫片（Shim）”，根本不需要以“C 语言文本”的形式存在。它完全可以作为 **UIR（中间表示）的底层指令**，由编译器在内存中隐式织入。
-
-以下是不依赖任何外部 C 编译器，纯靠 `cheng` 自研 UIR 后端实现这套“零指针安全桥接”的原生替代方案：
-
 ---
 
-### 终极替代方案：UIR 级 ABI 原地降级 (Call-Site ABI Lowering)
-
-这个方案的核心是：开发者在语法层（AST）依然写最安全的切片和元组，但当编译器前端将 AST 降级为 UIR 时，**会在内存中自动把这些高级结构“物理拆解”成符合 C ABI 规约的底层指令**。
-
-#### 1. 替代核心一：“胖切片”的 UIR 物理拆包
-
-**【开发者写的 Cheng 源码】（保持 ZRPC 绝对安全，无裸指针）**
-
-```cheng
-@ffi_map(ptr = arg0, len = arg1)
-importc fn process_data(data: &mut [u8])
-
-fn main() =
-    var buf = [1, 2, 3]
-    process_data(&mut buf)
-
-```
-
-**【Cheng 编译器底层生成的 UIR 伪代码】**
-当 UIR Builder 处理到 `process_data` 的调用时，它识别到 `@ffi_map` 注解，**绝不原样传递切片**，而是直接在调用点（Call-site）就地解构：
-
-```text
-; 1. 从切片结构体中提取底层裸指针和长度（在 DOD SoA 数组中追加 extract 指令）
-%buf_ptr = uir.extract_field %buf, index=0   ; 提取 dataPtr (void*)
-%buf_len = uir.extract_field %buf, index=1   ; 提取 len (int32)
-
-; 2. 直接根据硬件 ABI 规约发起底层 Call
-; (后续的 Machine 阶段会自动把 %buf_ptr 分配进 x0/rdi 寄存器，%buf_len 进 x1/rsi)
-uir.call @process_data(%buf_ptr, %buf_len)
-
-```
-
-**战果**：没有生成任何 C 文本！这在物理机器码层面实现了**零成本抽象（Zero-Overhead）**。你甚至省掉了 C 语言包装函数的一次 `call/ret` 入栈出栈开销，执行效率直接拉到物理极限。
-
-#### 2. 替代核心二：“出参指针”的 UIR 隐式栈槽回填
-
-**【开发者写的 Cheng 源码】（优雅的元组，消灭了未初始化变量）**
-
-```cheng
-@ffi_out_ptrs(arg1, arg2) 
-importc fn get_size(input: int32) -> (int32, int32, int32) 
-
-fn main() =
-    let (status, w, h) = get_size(1080)
-
-```
-
-**【Cheng 编译器底层生成的 UIR 伪代码】**
-C 语言要求传入指针，我们就用 UIR 自动为它分配栈内存。UIR Builder 自动在当前函数的局部虚拟栈上“偷偷”开辟空间：
-
-```text
-; 1. 隐式栈分配：为 C 函数的 2 个出参开辟局部栈内存 (Alloca)
-%alloc_w = uir.stack_alloc i32
-%alloc_h = uir.stack_alloc i32
-
-; 2. 将分配的栈地址作为指针参数，直接传给外部 C 函数
-%status = uir.call @get_size(1080, %alloc_w, %alloc_h)
-
-; 3. C 函数执行完毕后，安全地从分配的栈槽中读取它写入的值
-%val_w = uir.load %alloc_w
-%val_h = uir.load %alloc_h
-
-; 4. 将结果组装成虚拟的 Tuple 对象，返回给 Cheng 的前端业务逻辑
-%result_tuple = uir.construct_tuple(%status, %val_w, %val_h)
-
-```
-
-**战果**：UIR 完美代劳了 C 语言里最容易出错的取地址（`&`）和解引用（`*`）。危险的裸指针读写被物理封印在了 UIR 指令黑盒中，用户层依然享受着绝对安全的元组。
-
----
+前文“四个 FFI 核心设计”表达的是语义目标，不要求生产实现真的生成一份 C 文本垫片。对当前仓库，更贴近主链的做法是把 ABI 降级留在 UIR 内存图里完成；如果担心复杂 FFI 在调用点直接展开导致 UIR 体积失控，还可以采用下面的备选实现：
 
 ### 备选方案：UIR 内存合成垫片 (In-Memory Thunk Synthesis)
 
@@ -631,24 +365,14 @@ C 语言要求传入指针，我们就用 UIR 自动为它分配栈内存。UIR 
 
 ### 总结：为什么 UIR 降级是工业级编译器的正途？
 
-采用 **UIR 隐式降级** 直接生成对象文件，不仅可行，而且是完美契合你当前架构的唯一正解。它能带来三大核心红利：
+对当前仓库，结论可以收敛成一句话：FFI 与跨端集成都应建立在 `BACKEND_IR=uir`、`ZRPC` 和 `Fat Core, Thin Shell` 上，而不是回退到“生成 C 文本再编译垫片”的旧路径。
 
-1. **完美履行 ZRPC 契约（CNCPAR-01）**
-你的规范附录 B 明确要求 `rawptr_contract.forbid.user_raw_ptr_syntax=1`。在这个方案中，裸指针（`void*`）仅仅作为短暂的虚拟寄存器 ID 存在于 `UirCoreSoa` 的内部数组中，**对开发者 100% 物理隔离**，绝对没有语法逃逸的可能。
-2. **保卫 100ms 极速自举尊严**
-不需要写 `.c` 文件到磁盘、不需要调起外部 Clang。这种 UIR 降级，仅仅是在你的 DOD 连续内存数组里，追加了几个 `extract_field` 和 `stack_alloc` 索引。耗时在纳秒级，完美捍卫了你的 Linkerless 极速开发体验。
-3. **解锁 E-Graphs 的上帝视角优化**
-由于你把 `stack_alloc`（栈分配）和 `load`（读取）的控制权握在了自己手里，你的 E-Graphs 优化器就能看懂这些数据流。如果外部 C 函数返回的 `h` 在后续业务代码中根本没被用到，E-Graphs 可以直接把对应的 `load` 甚至栈分配指令作为**死代码消除（Dead Code Elimination）**，这是你套一层黑盒 C 编译器绝对做不到的极限压榨！
+这意味着：
+- ABI 降级发生在 UIR 内存图里，继续保住 linkerless/dev 轨和后续优化控制权。
+- 宿主侧只保留最薄的 Swift/JNI/N-API 边界层，不重复实现任何核心业务逻辑。
+- 后面的移动端集成示例，重点只放在“产物形态 + 宿主边界 + 生命周期约束”，不再重复论证 C Backend 与 UIR 的取舍。
 
-**执行建议：** 彻底抛弃 C Backend，继续坚守 `BACKEND_IR=uir`。你只需要在 `uir_frontend.cheng`（AST 到 UIR 的生成器）中，针对 `@ffi_map` 和 `@ffi_out_ptrs` 补充对应的 UIR 指令展开逻辑，就可以直接生成极速、纯正、安全的本地对象文件。
-
-将 `cheng` 语言代码库无缝集成到 Android、iOS 和纯血鸿蒙（HarmonyOS NEXT）三端，是发挥 Cheng 语言“一次编写，三端物理级降维打击”战略优势的关键。
-
-结合你确立的 **“自研 UIR 原地降级（弃用 C Backend）”** 以及 **“ZRPC（零裸指针物理隔离）契约”**，跨端集成的核心战略就是：**“厚核心，薄宿主 (Fat Core, Thin Shell)”**。
-
-这意味着：**绝不在 Java、Swift 或 ArkTS 中重复编写任何业务逻辑。** P2P 协议栈、RWAD 结算、DOD 状态机 100% 由 `cheng` 语言编写，并交叉编译为三大平台的原生机器码库（`.so` / `.a`）。移动端的操作系统仅仅作为“UI 渲染器”和“硬件事件代理”。
-
-以下是横跨三大移动端的“大一统”集成蓝图与落地指南：
+以下是横跨三大移动端的集成蓝图与落地指南：
 
 ---
 
@@ -736,12 +460,12 @@ import Foundation
 
 class ChengNodeWrapper {
     private var handle: UInt32 = 0
-    
+
     func start() {
         // 瞬间穿透进入 Cheng 语言的 UIR 黑盒
         self.handle = cheng_engine_init(1)
     }
-    
+
     func process(data: Data) -> Int32 {
         // Swift 将安全的 Data 物理内存解包为 ptr 和 len
         return data.withUnsafeBytes { rawBuffer in

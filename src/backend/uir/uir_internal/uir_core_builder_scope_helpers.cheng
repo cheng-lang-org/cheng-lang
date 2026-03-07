@@ -1,5 +1,6 @@
 # Shared scope/block helper routines split from uir_core_builder.
 import std/os
+import std/seqs
 import std/strutils
 import std/hashmaps
 import std/system
@@ -31,8 +32,17 @@ fn scopeOpName(n: Node): str =
     return scopeOpNameId(n)
 
 fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): BlockBuilder =
+    let dbgPipe: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
+    if dbgPipe:
+        let fDbg0: os.File = os.get_stderr()
+        os.writeLine(fDbg0, "[backend] stage1: block_builder_new_enter")
+        os.c_fflush fDbg0
     var b: BlockBuilder
     new b
+    if dbgPipe:
+        let fDbg1: os.File = os.get_stderr()
+        os.writeLine(fDbg1, "[backend] stage1: block_builder_new_alloc")
+        os.c_fflush fDbg1
     b.env = env
     b.module = module
     b.func = func
@@ -44,6 +54,11 @@ fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): Blo
     b.deferStack = []
     b.exprLowerDepth = 0
     b.exprLowerStack = []
+    b.implicitResultUsed = false
+    if dbgPipe:
+        let fDbg2: os.File = os.get_stderr()
+        os.writeLine(fDbg2, "[backend] stage1: block_builder_new_ready")
+        os.c_fflush fDbg2
     return b
 
 fn blockBuilderNextLabel(b: BlockBuilder, prefix: str): str =
@@ -55,14 +70,72 @@ fn blockBuilderStart(b: BlockBuilder, label: str) =
     b.currentLabel = label
     b.currentStmts = []
 
+fn uirCoreStmtSeqAppend(seqInst: var UirStmtId[], stmt: UirStmtId) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = stmt
+
+fn loopContextSeqAppend(seqInst: var LoopContext[], ctx: LoopContext) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = ctx
+
+fn deferFrameSeqAppend(seqInst: var DeferFrame[], frame: DeferFrame) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = frame
+
+fn astNodeSeqAppend(seqInst: var Node[], node: Node) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = node
+
+fn builderStrSeqAppend(seqInst: var str[], value: str) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = value
+
+fn builderExprSeqAppend(seqInst: var UirExprId[], expr: UirExprId) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = expr
+
+fn blockBuilderExprLowerPush(b: BlockBuilder, node: Node) =
+    if b == nil:
+        return
+    astNodeSeqAppend(b.exprLowerStack, node)
+
+fn blockBuilderAddStmt(b: BlockBuilder, stmt: UirStmtId) =
+    if b == nil:
+        return
+    uirCoreStmtSeqAppend(b.currentStmts, stmt)
+
 fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
     # Copy stmt buffer so finished blocks don't alias the builder's scratch seq.
     # (Without this, later appends can realloc/free the shared buffer.)
     var stmtsCopy: UirStmtId[]
     if b.currentStmts.len > 0:
-        stmtsCopy.cap = b.currentStmts.len
+        setLen(stmtsCopy, b.currentStmts.len)
         for si in 0..<b.currentStmts.len:
-            add(stmtsCopy, b.currentStmts[si])
+            stmtsCopy[si] = b.currentStmts[si]
     let blk: UirBlockId = uirCoreBlockWithStmts(b.currentLabel, stmtsCopy, term)
     let dbgFunc: UirCoreFunc = b.func
     let dbgName: str = (dbgFunc != nil) ? dbgFunc.name : ""
@@ -89,7 +162,7 @@ fn blockBuilderPushLoop(b: BlockBuilder, breakLabel: str, continueLabel: str) =
     ctx.breakLabel = breakLabel
     ctx.continueLabel = continueLabel
     ctx.deferDepth = b.deferStack.len
-    add(b.loopStack, ctx)
+    loopContextSeqAppend(b.loopStack, ctx)
 
 fn blockBuilderPopLoop(b: BlockBuilder): LoopContext =
     if b.loopStack.len == 0:
@@ -110,7 +183,7 @@ fn blockBuilderPushDefer(b: BlockBuilder) =
     var frame: DeferFrame
     new frame
     frame.bodies = []
-    add(b.deferStack, frame)
+    deferFrameSeqAppend(b.deferStack, frame)
 
 fn blockBuilderPopDefer(b: BlockBuilder): DeferFrame =
     if b == nil || b.deferStack.len == 0:
@@ -170,17 +243,17 @@ fn isImplicitReturnExpr(n: Node): bool =
 fn uirCoreAddStrPtr(items: str[]*, value: str) =
     if items == nil:
         return
-    add(items, value)
+    seqs.add(items, value)
 
 fn mbWrite[T](seqInst: var T[], idx: int32, val: T) =
     if idx < 0 || idx >= seqInst.len:
         panic "uirCore_builder: seq index out of bounds"
     seqInst[idx] = val
 
-fn mbWriteBool(seqInst: var bool[], idx: int32, val: bool) =
+fn mbWriteBool(seqInst: var int32[], idx: int32, val: bool) =
     if idx < 0 || idx >= seqInst.len:
         panic "uirCore_builder: seq index out of bounds"
-    seqInst[idx] = val
+    seqInst[idx] = val ? 1 : 0
 
 fn mbWriteStr(seqInst: var str[], idx: int32, val: str) =
     if idx < 0 || idx >= seqInst.len:
@@ -207,6 +280,66 @@ fn mbWriteFunc(seqInst: var UirCoreFunc[], idx: int32, val: UirCoreFunc) =
         panic "uirCore_builder: seq index out of bounds"
     seqInst[idx] = val
 
+fn localEnvSeqHeaderSane(seqLen: int32, seqCap: int32, seqBuf: void*): bool =
+    if seqLen < 0 || seqCap < seqLen:
+        return false
+    if seqCap > (1 << 20):
+        return false
+    let ptrVal: int64 = int64(rawmemAsVoid(seqBuf))
+    if seqLen > 0 && ptrVal <= 4096:
+        return false
+    if ptrVal != 0 && (ptrVal & int64(3)) != 0:
+        return false
+    return true
+
+fn localEnvSane(env: LocalEnv): bool =
+    if env == nil:
+        return false
+    let n: int32 = env.names.len
+    if env.types.len != n || env.typeKeys.len != n ||
+       env.callTargets.len != n || env.active.len != n || env.prevSlots.len != n:
+        return false
+    if !localEnvSeqHeaderSane(env.names.len, env.names.cap, env.names.buffer):
+        return false
+    if !localEnvSeqHeaderSane(env.types.len, env.types.cap, env.types.buffer):
+        return false
+    if !localEnvSeqHeaderSane(env.typeKeys.len, env.typeKeys.cap, env.typeKeys.buffer):
+        return false
+    if !localEnvSeqHeaderSane(env.callTargets.len, env.callTargets.cap, env.callTargets.buffer):
+        return false
+    if !localEnvSeqHeaderSane(env.active.len, env.active.cap, env.active.buffer):
+        return false
+    if !localEnvSeqHeaderSane(env.scopeMarks.len, env.scopeMarks.cap, env.scopeMarks.buffer):
+        return false
+    if !localEnvSeqHeaderSane(env.prevSlots.len, env.prevSlots.cap, env.prevSlots.buffer):
+        return false
+    for i in 0..<env.scopeMarks.len:
+        let mark: int32 = env.scopeMarks[i]
+        if mark < 0 || mark > n:
+            return false
+    return true
+
+fn localEnvAssertSane(env: LocalEnv, where: str) =
+    if localEnvSane(env):
+        return
+    panic "uirCore_builder: local env corrupt @" + where
+
+fn localEnvEnsureCapacity(env: LocalEnv, needLen: int32) =
+    if env == nil || needLen <= 0:
+        return
+    if env.names.buffer == nil || env.names.cap < needLen:
+        reserve(env.names, needLen)
+    if env.types.buffer == nil || env.types.cap < needLen:
+        reserve(env.types, needLen)
+    if env.typeKeys.buffer == nil || env.typeKeys.cap < needLen:
+        reserve(env.typeKeys, needLen)
+    if env.callTargets.buffer == nil || env.callTargets.cap < needLen:
+        reserve(env.callTargets, needLen)
+    if env.active.buffer == nil || env.active.cap < needLen:
+        reserve(env.active, needLen)
+    if env.prevSlots.buffer == nil || env.prevSlots.cap < needLen:
+        reserve(env.prevSlots, needLen)
+
 fn localEnvNew(): LocalEnv =
     var env: LocalEnv
     new env
@@ -216,8 +349,15 @@ fn localEnvNew(): LocalEnv =
     env.callTargets = []
     env.active = []
     env.scopeMarks = []
+    env.names.cap = 64
+    env.types.cap = 64
+    env.typeKeys.cap = 64
+    env.callTargets.cap = 64
+    env.active.cap = 64
+    env.scopeMarks.cap = 16
     env.nameIndex = hashmaps.hashMapStrIntInit(64)
     env.prevSlots = []
+    env.prevSlots.cap = 64
     return env
 
 var localEnvLookupModeCached: int32 = -1
@@ -235,11 +375,19 @@ fn localEnvUseLinearLookup(): bool =
 fn localEnvPushScope(env: LocalEnv) =
     if env == nil:
         return
-    add(env.scopeMarks, env.names.len)
+    localEnvAssertSane(env, "push_scope.enter")
+    let idx: int32 = env.scopeMarks.len
+    let needLen: int32 = idx + 1
+    if env.scopeMarks.buffer == nil || env.scopeMarks.cap < needLen:
+        reserve(env.scopeMarks, needLen)
+    setLen(env.scopeMarks, needLen)
+    env.scopeMarks[idx] = env.names.len
+    localEnvAssertSane(env, "push_scope.exit")
 
 fn localEnvPopScope(env: LocalEnv) =
     if env == nil || env.scopeMarks.len == 0:
         return
+    localEnvAssertSane(env, "pop_scope.enter")
     let mark: int32 = env.scopeMarks[env.scopeMarks.len - 1]
     env.scopeMarks.len = env.scopeMarks.len - 1
     if mark < 0:
@@ -258,6 +406,7 @@ fn localEnvPopScope(env: LocalEnv) =
             slot = slot - 1
     for i in mark..<env.active.len:
         mbWriteBool(env.active, i, false)
+    localEnvAssertSane(env, "pop_scope.exit")
 
 fn localIndex(env: LocalEnv, name: str): int32 =
     if env == nil:
@@ -270,7 +419,7 @@ fn localIndex(env: LocalEnv, name: str): int32 =
     if localEnvUseLinearLookup():
         var i: int32 = env.names.len - 1
         while i >= 0:
-            if i < env.active.len && !env.active[i]:
+            if i < env.active.len && env.active[i] == 0:
                 if i == 0:
                     break
                 i = i - 1
@@ -285,13 +434,14 @@ fn localIndex(env: LocalEnv, name: str): int32 =
     if idxPlus1 <= 0:
         return -1
     let idx: int32 = idxPlus1 - 1
-    if env.active.len == env.names.len && idx < env.active.len && !env.active[idx]:
+    if env.active.len == env.names.len && idx < env.active.len && env.active[idx] == 0:
         return -1
     return idx
 
 fn localAdd(env: LocalEnv, name: str, ty: UirCoreType): int32 =
     if env == nil:
         return -1
+    localEnvAssertSane(env, "localAdd.enter")
     let nm: str = scopeStripSpaces(name)
     if (getEnv "BACKEND_DEBUG_LET" == "1") && (nm == "snapRes"):
         let mark: int32 = (env.scopeMarks.len > 0) ? env.scopeMarks[env.scopeMarks.len - 1] : -1
@@ -302,15 +452,25 @@ fn localAdd(env: LocalEnv, name: str, ty: UirCoreType): int32 =
     if !localEnvUseLinearLookup():
         let prevPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, nm)
         prevSlot = (prevPlus1 > 0) ? (prevPlus1 - 1) : -1
-    add(env.names, nm)
-    add(env.types, ty)
-    add(env.typeKeys, "")
-    add(env.callTargets, "")
-    add(env.active, true)
-    add(env.prevSlots, prevSlot)
+    let slot: int32 = env.names.len
+    let needLen: int32 = slot + 1
+    localEnvEnsureCapacity(env, needLen)
+    setLen(env.names, needLen)
+    setLen(env.types, needLen)
+    setLen(env.typeKeys, needLen)
+    setLen(env.callTargets, needLen)
+    setLen(env.active, needLen)
+    setLen(env.prevSlots, needLen)
+    env.names[slot] = nm
+    env.types[slot] = ty
+    env.typeKeys[slot] = ""
+    env.callTargets[slot] = ""
+    env.active[slot] = 1
+    env.prevSlots[slot] = prevSlot
     if !localEnvUseLinearLookup():
         hashmaps.hashMapStrIntPut(env.nameIndex, nm, env.names.len)
-    return env.names.len - 1
+    localEnvAssertSane(env, "localAdd.exit")
+    return slot
 
 fn localType(env: LocalEnv, idx: int32): UirCoreType =
     if env == nil || idx < 0 || idx >= env.types.len:

@@ -1,0 +1,71 @@
+# UIR semantic protocol validator.
+import std/result
+import std/strutils
+import backend/uir/uir_semantic_types
+
+fn uirSemanticNormalizeFrontend(frontend: str): str =
+    return strutils.toLowerAscii(strutils.strip(frontend))
+
+fn uirSemanticValidateLayoutDesc(desc: UirLayoutDesc): Result[bool] =
+    if len(strutils.strip(desc.name)) == 0:
+        return Err[bool]("uir_semantic_validate: layout name is empty")
+    if desc.sizeBytes < 0:
+        return Err[bool]("uir_semantic_validate: layout size is negative (" + desc.name + ")")
+    if desc.alignBytes < 0:
+        return Err[bool]("uir_semantic_validate: layout alignment is negative (" + desc.name + ")")
+    return Ok[bool](true)
+
+fn uirValidateSemanticModuleV1(module: UirSemanticModuleV1): Result[bool] =
+    if module == nil:
+        return Err[bool]("uir_semantic_validate: module is nil")
+    if module.version != 1:
+        return Err[bool]("uir_semantic_validate: unsupported version " + intToStr(module.version))
+    if module.phaseTag < 0:
+        return Err[bool]("uir_semantic_validate: phaseTag must be non-negative")
+    let frontend: str = uirSemanticNormalizeFrontend(module.frontend)
+    if !(frontend == "stage1" || frontend == "rust" || frontend == "semantic"):
+        return Err[bool]("uir_semantic_validate: unsupported frontend " + module.frontend)
+    if module.funcNames.len != module.funcFirstBlock.len ||
+       module.funcNames.len != module.funcBlockLen.len ||
+       module.funcNames.len != module.funcFirstLocal.len ||
+       module.funcNames.len != module.funcLocalLen.len:
+        return Err[bool]("uir_semantic_validate: function table length mismatch")
+    if module.localNames.len != module.localType.len ||
+       module.localNames.len != module.localMutability.len:
+        return Err[bool]("uir_semantic_validate: local table length mismatch")
+    if module.blockFirstStmt.len != module.blockStmtLen.len ||
+       module.blockFirstStmt.len != module.blockTermKind.len:
+        return Err[bool]("uir_semantic_validate: block table length mismatch")
+    if module.exprKind.len != module.exprType.len ||
+       module.exprKind.len != module.exprA.len ||
+       module.exprKind.len != module.exprB.len ||
+       module.exprKind.len != module.exprC.len:
+        return Err[bool]("uir_semantic_validate: expr table length mismatch")
+    if module.stmtKind.len != module.stmtA.len ||
+       module.stmtKind.len != module.stmtB.len ||
+       module.stmtKind.len != module.stmtC.len:
+        return Err[bool]("uir_semantic_validate: stmt table length mismatch")
+    if frontend == "stage1" && module.stage1RootId <= 0 && len(strutils.strip(module.entryPath)) == 0:
+        return Err[bool]("uir_semantic_validate: stage1 module missing entryPath/rootId")
+    if frontend == "rust":
+        let hasRustTables: bool = module.stringTable.len > 0 || module.funcNames.len > 0 ||
+                                  len(strutils.strip(module.semanticTablesInline)) > 0 ||
+                                  len(strutils.strip(module.semanticTablesPath)) > 0
+        if !hasRustTables:
+            return Err[bool]("uir_semantic_validate: rust module missing semantic tables input")
+    if module.rustReport != nil:
+        if module.rustReport.monoItemsTotal < 0 ||
+           module.rustReport.monoItemsUir < 0 ||
+           module.rustReport.monoItemsLlvmFallback < 0 ||
+           module.rustReport.unsafeRegions < 0 ||
+           module.rustReport.borrowProofItems < 0 ||
+           module.rustReport.elapsedMs < 0:
+            return Err[bool]("uir_semantic_validate: rust report has negative counters")
+        if module.rustReport.monoItemsUir + module.rustReport.monoItemsLlvmFallback >
+           module.rustReport.monoItemsTotal:
+            return Err[bool]("uir_semantic_validate: rust report mono item counters exceed total")
+    for i in 0..<module.layoutDescs.len:
+        let res: Result[bool] = uirSemanticValidateLayoutDesc(module.layoutDescs[i])
+        if !IsOk[bool](res):
+            return res
+    return Ok[bool](true)

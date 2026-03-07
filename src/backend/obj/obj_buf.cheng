@@ -1,10 +1,43 @@
 # Shared byte-buffer helpers for object writers (ELF/Mach-O/COFF).
 import std/seqs
+import std/rawmem_support
+
+fn bufStrPtrSane(s: str): bool =
+    let ptrVal: int64 = int64(rawmem_support.rawmemAsVoid(s))
+    if ptrVal == 0:
+        return true
+    if ptrVal <= 4096:
+        return false
+    if ptrVal >= int64(0x0001000000000000):
+        return false
+    let low32: int64 = ptrVal & int64(0xffffffff)
+    let high32: int64 = (ptrVal >> 32) & int64(0xffffffff)
+    if high32 == 0:
+        return false
+    if high32 > 1 && high32 < int64(0x1000):
+        return false
+    if low32 == 0 && high32 <= 1:
+        return false
+    if high32 == 0 && low32 < int64(1 << 20):
+        return false
+    if low32 > 0 && low32 < int64(1 << 20) && high32 > 0 && high32 < int64(1 << 20):
+        return false
+    if high32 == low32 && low32 > 0 && low32 < (1 << 20):
+        return false
+    return true
+
+fn bufSafeStr(s: str): str =
+    return bufStrPtrSane(s) ? s : ""
 
 fn bufAddU8(buf: var uint8[], v: uint8) =
     if void*(buf) == nil:
         return
-    add(buf, v)
+    if buf.buffer == nil || buf.len >= buf.cap:
+        cheng__seqGrowToRaw(&buf.buffer, &buf.cap, buf.len + 1, int32(sizeof uint8))
+    let elemBytes: int32 = buf.len * int32(sizeof uint8)
+    let writePtr: uint8* = uint8*(ptr_add(buf.buffer, elemBytes))
+    *writePtr = v
+    buf.len = buf.len + 1
 
 fn bufAlign(buf: var uint8[], align: uint64) =
     if void*(buf) == nil || align <= 1:
@@ -49,12 +82,13 @@ fn bufBytes(buf: var uint8[], data: uint8[]) =
 fn bufFixedStr(buf: var uint8[], s: str, size: int32) =
     if void*(buf) == nil:
         return
+    let safe: str = bufSafeStr(s)
     var i: int32 = 0
-    if len(s) > 0:
+    if len(safe) > 0:
         for __for_guard_i in 0..<size:
-            if !(i < len(s) && i < size):
+            if !(i < len(safe) && i < size):
                 break
-            bufAddU8(buf, uint8(int32(int64(s[i]) & int64(0xFF))))
+            bufAddU8(buf, uint8(int32(int64(safe[i]) & int64(0xFF))))
             i = i + 1
     for __for_guard_i in 0..<size:
         if !(i < size):
@@ -68,9 +102,10 @@ fn bufFixedStr8(buf: var uint8[], s: str) =
 fn bufStr0(buf: var uint8[], s: str) =
     if void*(buf) == nil:
         return
-    if len(s) > 0:
-        for i in 0..<len(s):
-            bufAddU8(buf, uint8(int32(int64(s[i]) & int64(0xFF))))
+    let safe: str = bufSafeStr(s)
+    if len(safe) > 0:
+        for i in 0..<len(safe):
+            bufAddU8(buf, uint8(int32(int64(safe[i]) & int64(0xFF))))
     bufAddU8(buf, uint8(0))
 
 fn emitU32LE(buf: var uint8[], v: uint32) =

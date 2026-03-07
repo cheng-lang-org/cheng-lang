@@ -87,7 +87,7 @@
 - **取址/指针**：`&x` 仅为取址与指针交互语义，不作为内存管理借用语法。
 - **指针与 `var`**：`T*` 与 `void*` 为原始指针，默认可读写；`var` 仅用于可变借用语义（非指针）。禁止 `var T*` 与 `var void*` 组合。
 - **指针成员访问**：`T*` 的成员访问统一使用 `->`，等价于 `(*p).field`。
-- **no-pointer 生产门禁**：在 `ABI=v2_noptr` 且 `STAGE1_NO_POINTERS_NON_C_ABI=1` 的口径下，非 C ABI 模块默认禁指针；仅 C ABI bridge 模块可按策略豁免。
+- **no-pointer 生产门禁**：在 `ABI=v2_noptr` 且 `STAGE1_NO_POINTERS_NON_C_ABI=1` 的口径下，用户源码模块默认禁指针；`@importc/@exportc` 等 C ABI 声明不再豁免。该环境变量名仅为兼容保留，当前语义对应“user-surface no-pointer”。
   - **禁用指针类型**：`T*`、`void*`、`ref T`、`ptr[T]`。
   - **禁用指针操作**：解引用（`*`/`->`）、取址（`&`）、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
   - **违规诊断**：语义阶段报 `no-pointer policy`。
@@ -501,13 +501,13 @@ charLiteral    ::= `'` CHARACTER `'` ;
   - `T[N]`：动态序列（`T[]`）的“初始化 reserve 容量提示”（cap hint）。`N` 为整数表达式（可为字面量/常量/变量表达式），在运行时求值；仅影响“省略初始化表达式”的隐式默认值初始化（额外执行一次 `reserve(..., N)`），不改变类型身份与 ABI（`T[N]` 与 `T[]` 类型等价）。
 - 指针与 `[]/[N]` 的后缀允许交错组合：`T*[]`、`T[]*`、`T*[N]`、`T[N]*`。
 - 旧容器语法已移除/禁用并在编译期报错：`seq[T]`、`openArray[T]`、`array[...]`、`seq_fixed[T, N]`（仅允许作为内部 lowering 目标）、`Table_fixed[V, N]`、`Table[V, N]`（容量不得作为类型参数）。
-- FFI 影子桥接（Raw Pointer Safety）：用户层不再推荐显式 `ptr + len`/`out-ptr`/`void*` 暴露。
+- FFI 影子桥接（Raw Pointer Safety）：用户层不得显式暴露 `ptr + len`/`out-ptr`/`void*`。
   - 切片桥接：优先 `T[]` + `@ffi_map`，由后端降级为 `(ptr,len)`。
   - 出参桥接：优先 `@ffi_out_ptrs`，由后端回收为 tuple 返回。
   - 句柄桥接：优先 `@ffi_handle`，由 runtime 负责 `void* <-> handle(u32/u64)` 映射。
   - 借用桥接：优先 `@importc + var T`，在借用校验通过后桥接到 `T*`。
 - 设计结论：只保留 `T[]` 与 `T[N]`；`T[N]` 不改变类型/ABI，只影响“隐式默认值初始化”时的初始 reserve。
-- no-pointer 门禁（生产口径）：`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1` 时，非 C ABI 模块默认禁指针；仅 C ABI bridge 模块可按策略豁免。
+- no-pointer 门禁（生产口径）：`ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1` 时，用户源码模块默认禁指针；`@importc/@exportc` 等 C ABI 声明不再豁免。该环境变量名仅为兼容保留，当前语义对应“user-surface no-pointer”。
   - 禁用指针类型：`T*`、`void*`、`ref T`、`ptr[T]`。
   - 禁用指针操作：解引用（`*`/`->`）、取址（`&`）、`dataPtr/getPointer`、`ptr_add/load_ptr/store_ptr`、`copyMem/setMem/zeroMem`、`alloc/dealloc`。
   - 违规则在语义阶段报 `no-pointer policy` 诊断。
@@ -657,7 +657,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - `emit=shared|static` 语义：采用 release object-first 打包（后端先产 `obj`，再由系统工具链打包库）。`--emit:shared|static` 下禁止 `--run/--run:*`（命令配置错误，`rc=2`）。
 - Dev 快速自举管线（host-only）：
   - 前端解析模式：`cheng`/`selfhost` dev 入口固定 `BACKEND_STAGE1_PARSE_MODE=outline`（不再接受外部覆盖）；`release-compile` 固定 `full`。
-  - 函数任务调度：`cheng`/`selfhost` dev 入口固定 `BACKEND_FN_SCHED=ws`（不再接受外部覆盖）；`release-compile` 固定 `serial`。
+  - 函数任务调度：`cheng`/`selfhost` dev 入口固定 `BACKEND_FN_SCHED=ws`（不再接受外部覆盖）；`release-compile` 也固定 `BACKEND_FN_SCHED=ws`。
   - 直写可执行：`BACKEND_DIRECT_EXE=1` 在 host darwin/arm64 + self-link 口径走 `macho_direct_exe_writer`；默认失败阻断（`BACKEND_FAST_FALLBACK_ALLOW=0`）。
 - 可选常驻编译 worker：`CHENGC_DAEMON=1` 时，`cheng` 请求经 `chengc_daemon` 本地队列执行（`start/status/stop`），用于降低频繁冷启动开销。
 - Dev 热补丁策略：`BACKEND_HOTPATCH_MODE=trampoline` + append-only code pool；`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program` 且 `BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
@@ -678,7 +678,6 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 编译入口并发收口：`cheng` 默认移除 stage0 全局锁包装，固定为 `stage0 quarantine + preflight + timeout` 语义，不再通过 compile-path lock 串行化并发任务。
 - driver 自举 smoke 口径：`backend.driver_selfbuild_smoke` 为可选 gate（默认关闭，需显式 `--driver-selfbuild-smoke` 或 `BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=1` 开启）；默认输出路径与主 driver 统一为 `artifacts/backend_driver/cheng`。启用后强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0` 与 `DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，防止语义降级。
 - native-contract autosystem 口径：当 `BACKEND_NATIVE_CONTRACT=1` 时，stage1 前端必须强制关闭自动 `std/system` 导入（`stage1_autoSystemEnabled()` 返回 `false`），不得依赖 gate 脚本额外注入 `STAGE1_AUTO_SYSTEM=0`。
-- native-contract required gates：`backend.native_contract` + `backend.native_contract_autosystem`（`verify_backend_native_contract_autosystem`）需同时通过，前者验证契约与 hard-fail 语义，后者验证 `STAGE1_AUTO_SYSTEM` 的 unset/forced-on 两种情形编译稳定。
 - driver 解析口径：`backend_driver_path` 默认使用稳定 driver `artifacts/backend_driver/cheng`，并带 stage0 编译探针；首选不健康时直接阻断（不再允许 `--stage0` 覆盖）。
 - 全链自举门禁：`$TOOLING verify_fullchain_bootstrap`（stage2→tools；obj-only fullspec internal gate + 工具 `--help` smoke；失败即阻断）。
 - 专用机 100ms 自举门禁：`$TOOLING verify_backend_selfhost_100ms_host`（基线文件 `src/tooling/selfhost_perf_100ms_host.env`）；`backend_prod_closure` 在 `BACKEND_RUN_SELFHOST_100MS=1` 时拆成 quick/report + full/blocking 双轨：quick 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=0`，full 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=1` + `SELFHOST_STAGE1_REQUIRE_REBUILD=1`，并支持 `BACKEND_BUILD_DRIVER_PROFILE_OUT` 导出重编画像；非目标主机默认报告不阻断。
