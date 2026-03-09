@@ -9,10 +9,14 @@ type
 
     Diagnostic =
         severity: Severity
-        filename: str
+        filenameId: int32
         line: int32
         col: int32
-        message: str
+        messageId: int32
+
+var
+    diagTextValues: str[]
+    diagTextPoolReady: bool
 
 fn freeSeq_Diagnostic(seqInst: var Diagnostic[]) =
     if seqInst.buffer != nil:
@@ -20,6 +24,53 @@ fn freeSeq_Diagnostic(seqInst: var Diagnostic[]) =
     seqInst.buffer = nil
     seqInst.len = 0
     seqInst.cap = 0
+
+fn diagTextAppendStr(seqInst: var str[], val: str) =
+    seqs.add(seqInst, val)
+
+fn diagTextPoolEnsure() =
+    if diagTextPoolReady:
+        return
+    diagTextValues.buffer = nil
+    diagTextValues.len = 0
+    diagTextValues.cap = 0
+    diagTextAppendStr(diagTextValues, "")
+    diagTextPoolReady = true
+
+fn diagTextPoolAppend(text: str): int32 =
+    diagTextPoolEnsure()
+    if len(text) <= 0:
+        return 0
+    let stored: str = strings.sliceBytes(text, 0, len(text))
+    if len(stored) <= 0:
+        return 0
+    let id: int32 = diagTextValues.len
+    diagTextAppendStr(diagTextValues, stored)
+    return id
+
+fn diagInternText(text: str): int32 =
+    return diagTextPoolAppend(text)
+
+fn diagTextById(id: int32): str =
+    diagTextPoolEnsure()
+    if id <= 0 || id >= diagTextValues.len:
+        return ""
+    return diagTextValues[id]
+
+fn diagFilename(d: Diagnostic): str =
+    return diagTextById(d.filenameId)
+
+fn diagMessage(d: Diagnostic): str =
+    return diagTextById(d.messageId)
+
+fn diagMake(severity: Severity, filename: str, line: int32, col: int32, message: str): Diagnostic =
+    var d: Diagnostic
+    d.severity = severity
+    d.filenameId = diagInternText(filename)
+    d.line = line
+    d.col = col
+    d.messageId = diagInternText(message)
+    return d
 
 fn severityLabel(sev: Severity): str =
     var out: str = "unknown"
@@ -94,7 +145,9 @@ fn rawPointerForbidMessage(base: str): str =
 
 fn format(d: Diagnostic): str =
     var s: str = ""
-    s = s + d.filename
+    let fileName: str = diagFilename(d)
+    let message: str = diagMessage(d)
+    s = s + fileName
     s = s + ":"
     s = s + intToStr d.line
     s = s + ":"
@@ -102,9 +155,9 @@ fn format(d: Diagnostic): str =
     s = s + ": ["
     s = s + severityLabel d.severity
     s = s + "] "
-    s = s + d.message
-    if diagContextEnabled() && len(d.filename) > 0:
-        let content: str = diagReadFileText(d.filename)
+    s = s + message
+    if diagContextEnabled() && len(fileName) > 0:
+        let content: str = diagReadFileText(fileName)
         let lineText: str = sliceLineAt(content, d.line)
         if len(lineText) > 0:
             s = s + "\n  "

@@ -1,8 +1,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -15,6 +17,7 @@ extern "C" {
 extern int32_t cheng_file_exists(const char *path);
 extern int64_t cheng_file_mtime(const char *path);
 extern int64_t cheng_file_size(const char *path);
+extern void cheng_register_string_meta(const char *ptr, int32_t len);
 extern int32_t cheng_open_w_trunc(const char *path);
 extern int32_t cheng_fd_write(int32_t fd, const char *data, int32_t len);
 extern int32_t libc_close(int32_t fd);
@@ -33,25 +36,17 @@ extern char *__cheng_rt_paramStrCopy(int32_t i);
 extern void __cheng_setCmdLine(int32_t argc, const char **argv);
 extern int32_t backendMain(void) __attribute__((weak));
 extern int32_t toolingMainWithCount(int32_t count) __attribute__((weak));
-extern void *driver_buildActiveModulePtrs(void *input_raw, void *target_raw) __attribute__((weak));
-extern void *uirCoreBuildModuleFromFileStage1OrPanic(const char *path, const char *target) __attribute__((weak));
 typedef struct {
   int32_t len;
   int32_t cap;
   void *buffer;
 } cheng_seq_u8_header;
-extern void uirEmitObjFromModuleOrPanic(cheng_seq_u8_header *out, void *module, int32_t optLevel,
-                                        const char *target, const char *objWriter,
-                                        bool validateModule, bool uirSimdEnabled,
-                                        int32_t uirSimdMaxWidth,
-                                        const char *uirSimdPolicy) __attribute__((weak));
-extern int32_t driver_emitObjFromModuleDefault(void *module, const char *target,
-                                               const char *out_path) __attribute__((weak));
 __attribute__((weak)) void driver_c_capture_cmdline(int32_t argc, void *argv_void);
 __attribute__((weak)) void driver_c_boot_marker(int32_t code);
 int32_t driver_c_finish_single_link(const char *path, const char *obj_path);
 int32_t driver_c_finish_emit_obj(const char *path);
 void *driver_c_build_module_stage1(const char *input_path, const char *target);
+void *driver_c_build_module_stage1_direct(const char *input_path, const char *target);
 static void driver_c_maybe_inject_env_cli(int *argc_io, char ***argv_io);
 
 typedef struct {
@@ -60,11 +55,133 @@ typedef struct {
   int32_t cap;
 } cheng_seq_i32;
 
+typedef struct ChengStrBridge {
+  const char *ptr;
+  int32_t len;
+  int32_t store_id;
+  int32_t flags;
+} ChengStrBridge;
+
+enum {
+  CHENG_STR_BRIDGE_FLAG_NONE = 0,
+  CHENG_STR_BRIDGE_FLAG_OWNED = 1,
+};
+
+static ChengStrBridge driver_c_bridge_from_owned(char *ptr);
+
 typedef struct {
   void *buffer;
   int32_t len;
   int32_t cap;
 } cheng_seq_any;
+
+typedef void (*cheng_emit_obj_from_module_fn)(cheng_seq_any *out, void *module, int32_t opt_level,
+                                              const char *target, const char *obj_writer,
+                                              int32_t validate_module, int32_t uir_simd_enabled,
+                                              int32_t uir_simd_max_width,
+                                              const char *uir_simd_policy);
+typedef int32_t (*cheng_driver_emit_obj_default_fn)(void *module, const char *target,
+                                                    const char *out_path);
+typedef void *(*cheng_build_active_module_ptrs_fn)(void *input_raw, void *target_raw);
+typedef void (*cheng_global_init_fn)(void);
+typedef void *(*cheng_build_module_stage1_fn)(const char *path, const char *target);
+typedef void *(*cheng_build_module_stage1_target_facade_fn)(const char *path,
+                                                            const char *target);
+typedef void *(*cheng_build_module_stage1_facade_fn)(const char *path);
+
+static int driver_c_diag_enabled(void);
+static void driver_c_diagf(const char *fmt, ...);
+
+static void *driver_c_sidecar_bundle_handle(const char *target_text) {
+  static void *cached_handle = NULL;
+  static char cached_path[1024];
+  const char *disabled = getenv("BACKEND_UIR_SIDECAR_DISABLE");
+  const char *target = (target_text != NULL) ? target_text : "";
+  const char *bundle_env = getenv("BACKEND_UIR_SIDECAR_BUNDLE");
+  char bundle_path[1024];
+  if (disabled != NULL && disabled[0] != '\0' && !(disabled[0] == '0' && disabled[1] == '\0')) {
+    driver_c_diagf("[driver_c_sidecar_bundle_handle] disabled='%s'\n", disabled);
+    return NULL;
+  }
+  bundle_path[0] = '\0';
+  if (bundle_env != NULL && bundle_env[0] != '\0') {
+    snprintf(bundle_path, sizeof(bundle_path), "%s", bundle_env);
+  } else if (target[0] != '\0') {
+    snprintf(bundle_path, sizeof(bundle_path),
+             "/Users/lbcheng/cheng-lang/chengcache/backend_driver_sidecar/backend_driver_uir_sidecar.%s.bundle",
+             target);
+  } else {
+    driver_c_diagf("[driver_c_sidecar_bundle_handle] no_target_or_bundle\n");
+    return NULL;
+  }
+  driver_c_diagf("[driver_c_sidecar_bundle_handle] env='%s' target='%s' path='%s'\n",
+                 bundle_env != NULL ? bundle_env : "", target, bundle_path);
+  if (bundle_path[0] == '\0') return NULL;
+  if (cheng_file_exists(bundle_path) == 0) {
+    driver_c_diagf("[driver_c_sidecar_bundle_handle] missing_path='%s'\n", bundle_path);
+    return NULL;
+  }
+  if (cached_handle != NULL && strcmp(cached_path, bundle_path) == 0) {
+    driver_c_diagf("[driver_c_sidecar_bundle_handle] cache_hit path='%s' handle=%p\n",
+                   bundle_path, cached_handle);
+    return cached_handle;
+  }
+  dlerror();
+  void *handle = dlopen(bundle_path, RTLD_NOW | RTLD_LOCAL);
+  if (handle == NULL) {
+    const char *err = dlerror();
+    driver_c_diagf("[driver_c_sidecar_bundle_handle] dlopen_failed path='%s' err='%s'\n",
+                   bundle_path, err != NULL ? err : "");
+    return NULL;
+  }
+  driver_c_diagf("[driver_c_sidecar_bundle_handle] dlopen_ok path='%s' handle=%p\n",
+                 bundle_path, handle);
+  dlerror();
+  cheng_global_init_fn global_init = (cheng_global_init_fn)dlsym(handle, "__cheng_global_init");
+  const char *init_err = dlerror();
+  driver_c_diagf("[driver_c_sidecar_bundle_handle] global_init=%p err='%s'\n",
+                 (void *)global_init, init_err != NULL ? init_err : "");
+  if (global_init != NULL) {
+    global_init();
+  }
+  snprintf(cached_path, sizeof(cached_path), "%s", bundle_path);
+  cached_handle = handle;
+  return cached_handle;
+}
+
+static cheng_driver_emit_obj_default_fn driver_c_sidecar_emit_obj_fn(const char *target_text) {
+  void *handle = driver_c_sidecar_bundle_handle(target_text);
+  if (handle == NULL) return NULL;
+  return (cheng_driver_emit_obj_default_fn)dlsym(handle, "driver_emit_obj_from_module_default_impl");
+}
+
+static cheng_build_active_module_ptrs_fn driver_c_sidecar_build_module_fn(const char *target_text) {
+  void *handle = driver_c_sidecar_bundle_handle(target_text);
+  if (handle == NULL) return NULL;
+  dlerror();
+  cheng_build_active_module_ptrs_fn fn =
+      (cheng_build_active_module_ptrs_fn)dlsym(handle, "driver_buildActiveModulePtrs");
+  const char *err = dlerror();
+  driver_c_diagf("[driver_c_sidecar_build_module_fn] handle=%p fn=%p err='%s'\n",
+                 handle, (void *)fn, err != NULL ? err : "");
+  return fn;
+}
+
+static int driver_c_diag_enabled(void) {
+  const char *raw = getenv("BACKEND_DEBUG_BOOT");
+  if (raw == NULL || raw[0] == '\0') return 0;
+  if (raw[0] == '0' && raw[1] == '\0') return 0;
+  return 1;
+}
+
+static void driver_c_diagf(const char *fmt, ...) {
+  if (!driver_c_diag_enabled()) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  fflush(stderr);
+}
 
 __attribute__((weak)) int32_t driver_puts(const char *text) {
   if (text == NULL) {
@@ -229,7 +346,10 @@ __attribute__((weak)) char *driver_c_getenv_copy(const char *name) {
   const char *raw = getenv(name != NULL ? name : "");
   if (raw == NULL) {
     char *out = (char *)cheng_malloc(1);
-    if (out != NULL) out[0] = '\0';
+    if (out != NULL) {
+      out[0] = '\0';
+      cheng_register_string_meta(out, 0);
+    }
     return out;
   }
   size_t len = strlen(raw);
@@ -237,7 +357,17 @@ __attribute__((weak)) char *driver_c_getenv_copy(const char *name) {
   if (out == NULL) return NULL;
   memcpy(out, raw, len);
   out[len] = '\0';
+  cheng_register_string_meta(out, (int32_t)len);
   return out;
+}
+
+__attribute__((weak)) ChengStrBridge driver_c_getenv_copy_bridge(const char *name) {
+  return driver_c_bridge_from_owned(driver_c_getenv_copy(name));
+}
+
+__attribute__((weak)) void driver_c_getenv_copy_bridge_into(const char *name, ChengStrBridge *out) {
+  if (out == NULL) return;
+  *out = driver_c_getenv_copy_bridge(name);
 }
 
 static char *driver_c_dup_cstr(const char *raw) {
@@ -247,6 +377,17 @@ static char *driver_c_dup_cstr(const char *raw) {
   if (out == NULL) return NULL;
   if (len > 0) memcpy(out, raw, len);
   out[len] = '\0';
+  cheng_register_string_meta(out, (int32_t)len);
+  return out;
+}
+
+static ChengStrBridge driver_c_bridge_from_owned(char *ptr) {
+  ChengStrBridge out;
+  const char *safe = ptr != NULL ? ptr : "";
+  out.ptr = safe;
+  out.len = (int32_t)strlen(safe);
+  out.store_id = 0;
+  out.flags = CHENG_STR_BRIDGE_FLAG_OWNED;
   return out;
 }
 
@@ -283,28 +424,88 @@ __attribute__((weak)) char *driver_c_cli_input_copy(void) {
   return value;
 }
 
+__attribute__((weak)) ChengStrBridge driver_c_cli_input_copy_bridge(void) {
+  return driver_c_bridge_from_owned(driver_c_cli_input_copy());
+}
+
+__attribute__((weak)) void driver_c_cli_input_copy_bridge_into(ChengStrBridge *out) {
+  if (out == NULL) return;
+  *out = driver_c_cli_input_copy_bridge();
+}
+
 __attribute__((weak)) char *driver_c_cli_output_copy(void) {
   return driver_c_cli_value_copy("--output");
+}
+
+__attribute__((weak)) ChengStrBridge driver_c_cli_output_copy_bridge(void) {
+  return driver_c_bridge_from_owned(driver_c_cli_output_copy());
+}
+
+__attribute__((weak)) void driver_c_cli_output_copy_bridge_into(ChengStrBridge *out) {
+  if (out == NULL) return;
+  *out = driver_c_cli_output_copy_bridge();
 }
 
 __attribute__((weak)) char *driver_c_cli_target_copy(void) {
   return driver_c_cli_value_copy("--target");
 }
 
+__attribute__((weak)) ChengStrBridge driver_c_cli_target_copy_bridge(void) {
+  return driver_c_bridge_from_owned(driver_c_cli_target_copy());
+}
+
+__attribute__((weak)) void driver_c_cli_target_copy_bridge_into(ChengStrBridge *out) {
+  if (out == NULL) return;
+  *out = driver_c_cli_target_copy_bridge();
+}
+
 __attribute__((weak)) char *driver_c_cli_linker_copy(void) {
   return driver_c_cli_value_copy("--linker");
+}
+
+__attribute__((weak)) ChengStrBridge driver_c_cli_linker_copy_bridge(void) {
+  return driver_c_bridge_from_owned(driver_c_cli_linker_copy());
+}
+
+__attribute__((weak)) void driver_c_cli_linker_copy_bridge_into(ChengStrBridge *out) {
+  if (out == NULL) return;
+  *out = driver_c_cli_linker_copy_bridge();
 }
 
 __attribute__((weak)) char *driver_c_new_string(int32_t n) {
   if (n <= 0) {
     char *out = (char *)cheng_malloc(1);
-    if (out != NULL) out[0] = '\0';
+    if (out != NULL) {
+      out[0] = '\0';
+      cheng_register_string_meta(out, 0);
+    }
     return out;
   }
   char *out = (char *)cheng_malloc(n + 1);
   if (out == NULL) return NULL;
   memset(out, 0, (size_t)n + 1u);
+  cheng_register_string_meta(out, n);
   return out;
+}
+
+__attribute__((weak)) ChengStrBridge driver_c_str_from_utf8_copy_bridge(const char *raw, int32_t n) {
+  if (raw == NULL || n <= 0) {
+    return driver_c_bridge_from_owned(driver_c_new_string(0));
+  }
+  char *out = driver_c_new_string(n);
+  if (out != NULL && n > 0) {
+    memcpy(out, raw, (size_t)n);
+  }
+  return driver_c_bridge_from_owned(out);
+}
+
+__attribute__((weak)) ChengStrBridge __cheng_rt_paramStrCopyBridge(int32_t i) {
+  return driver_c_bridge_from_owned(__cheng_rt_paramStrCopy(i));
+}
+
+__attribute__((weak)) void __cheng_rt_paramStrCopyBridgeInto(int32_t i, ChengStrBridge *out) {
+  if (out == NULL) return;
+  *out = __cheng_rt_paramStrCopyBridge(i);
 }
 
 static int32_t g_driver_cli_argc = 0;
@@ -319,6 +520,7 @@ static char *driver_c_make_flag_value(const char *flag, const char *value) {
   out[flag_len] = ':';
   if (value_len > 0) memcpy(out + flag_len + 1u, value, value_len);
   out[flag_len + value_len + 1u] = '\0';
+  cheng_register_string_meta(out, (int32_t)(flag_len + value_len + 1u));
   return out;
 }
 
@@ -391,27 +593,31 @@ __attribute__((weak)) int32_t driver_c_capture_cmdline_keep(int32_t argc, void *
 
 int32_t driver_c_arg_count(void) {
   if (g_driver_cli_argc > 1 && g_driver_cli_argv != NULL) return g_driver_cli_argc - 1;
-  if (__cheng_rt_paramCount != NULL) {
-    int32_t argc = __cheng_rt_paramCount();
-    if (argc > 1 && argc <= 257) return argc - 1;
-  }
+  int32_t argc = __cheng_rt_paramCount();
+  if (argc > 1 && argc <= 257) return argc - 1;
   return 0;
 }
 
 char *driver_c_arg_copy(int32_t i) {
-  if (g_driver_cli_argv == NULL && __cheng_rt_paramStrCopy != NULL && i > 0) {
+  if (g_driver_cli_argv == NULL && i > 0) {
     char *rt = __cheng_rt_paramStrCopy(i);
     if (rt != NULL) return rt;
   }
   if (g_driver_cli_argv == NULL || i <= 0 || i >= g_driver_cli_argc) {
     char *out = (char *)cheng_malloc(1);
-    if (out != NULL) out[0] = '\0';
+    if (out != NULL) {
+      out[0] = '\0';
+      cheng_register_string_meta(out, 0);
+    }
     return out;
   }
   const char *raw = g_driver_cli_argv[i];
   if (raw == NULL) {
     char *out = (char *)cheng_malloc(1);
-    if (out != NULL) out[0] = '\0';
+    if (out != NULL) {
+      out[0] = '\0';
+      cheng_register_string_meta(out, 0);
+    }
     return out;
   }
   size_t len = strlen(raw);
@@ -419,6 +625,7 @@ char *driver_c_arg_copy(int32_t i) {
   if (out == NULL) return NULL;
   memcpy(out, raw, len);
   out[len] = '\0';
+  cheng_register_string_meta(out, (int32_t)len);
   return out;
 }
 
@@ -431,14 +638,12 @@ int32_t driver_c_help_requested(void) {
     }
     return 0;
   }
-  if (__cheng_rt_paramCount != NULL && __cheng_rt_paramStrCopy != NULL) {
-    int32_t argc = __cheng_rt_paramCount();
-    if (argc > 1 && argc <= 4096) {
-      for (int32_t i = 1; i < argc; ++i) {
-        char *arg = __cheng_rt_paramStrCopy(i);
-        if (arg == NULL) continue;
-        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) return 1;
-      }
+  int32_t argc = __cheng_rt_paramCount();
+  if (argc > 1 && argc <= 4096) {
+    for (int32_t i = 1; i < argc; ++i) {
+      char *arg = __cheng_rt_paramStrCopy(i);
+      if (arg == NULL) continue;
+      if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) return 1;
     }
   }
   return 0;
@@ -456,14 +661,11 @@ __attribute__((weak)) int32_t driver_c_cli_help_requested(void) {
   if (g_driver_cli_argc > 1 && g_driver_cli_argv != NULL) {
     return driver_c_argv_is_help(g_driver_cli_argc, g_driver_cli_argv);
   }
-  if (__cheng_rt_paramCount != NULL && __cheng_rt_paramStrCopy != NULL) {
-    int32_t argc = __cheng_rt_paramCount();
-    if (argc != 2) return 0;
-    char *arg1 = __cheng_rt_paramStrCopy(1);
-    if (arg1 == NULL) return 0;
-    return (strcmp(arg1, "--help") == 0 || strcmp(arg1, "-h") == 0) ? 1 : 0;
-  }
-  return 0;
+  int32_t argc = __cheng_rt_paramCount();
+  if (argc != 2) return 0;
+  char *arg1 = __cheng_rt_paramStrCopy(1);
+  if (arg1 == NULL) return 0;
+  return (strcmp(arg1, "--help") == 0 || strcmp(arg1, "-h") == 0) ? 1 : 0;
 }
 
 __attribute__((weak)) int32_t driver_c_env_nonempty(const char *name) {
@@ -618,22 +820,49 @@ __attribute__((weak)) int32_t driver_c_write_exact_file(const char *path, void *
 }
 
 int32_t driver_c_emit_obj_default(void *module, const char *target, const char *path) {
-  if (driver_emitObjFromModuleDefault != NULL) {
-    if (module == NULL) return -11;
-    if (path == NULL || path[0] == '\0') return -12;
-    if (target == NULL) target = "";
-    return driver_emitObjFromModuleDefault(module, target, path);
+  driver_c_diagf("[driver_c_emit_obj_default] module=%p target='%s' path='%s'\n",
+                 module, target != NULL ? target : "", path != NULL ? path : "");
+  if (module == NULL) {
+    driver_c_diagf("[driver_c_emit_obj_default] module_null\n");
+    return -11;
+  }
+  if (path == NULL || path[0] == '\0') {
+    driver_c_diagf("[driver_c_emit_obj_default] path_missing\n");
+    return -12;
+  }
+  if (target == NULL) target = "";
+  cheng_driver_emit_obj_default_fn emit_obj_sidecar_default =
+      (cheng_driver_emit_obj_default_fn)dlsym(RTLD_DEFAULT, "driver_emit_obj_from_module_default_impl");
+  if (emit_obj_sidecar_default != NULL) {
+    int32_t rc = emit_obj_sidecar_default(module, target, path);
+    driver_c_diagf("[driver_c_emit_obj_default] dlsym_emit_rc=%d\n", rc);
+    if (rc == 0) return rc;
+  }
+  {
+    cheng_driver_emit_obj_default_fn sidecar_emit_fn = driver_c_sidecar_emit_obj_fn(target);
+    if (sidecar_emit_fn != NULL) {
+      int32_t rc = sidecar_emit_fn(module, target, path);
+      driver_c_diagf("[driver_c_emit_obj_default] sidecar_rc=%d\n", rc);
+      if (rc == 0) return rc;
+    }
   }
   cheng_seq_u8_header obj;
   memset(&obj, 0, sizeof(obj));
-  if (uirEmitObjFromModuleOrPanic == NULL) return -10;
-  if (module == NULL) return -11;
-  if (path == NULL || path[0] == '\0') return -12;
-  if (target == NULL) target = "";
-  uirEmitObjFromModuleOrPanic(&obj, module, 0, target, "", false, false, 0, "autovec");
+  cheng_emit_obj_from_module_fn emit_obj =
+      (cheng_emit_obj_from_module_fn)dlsym(RTLD_DEFAULT, "uirEmitObjFromModuleOrPanic");
+  if (emit_obj == NULL) {
+    driver_c_diagf("[driver_c_emit_obj_default] no_emit_symbol\n");
+    return -10;
+  }
+  emit_obj((cheng_seq_any *)&obj, module, 0, target, "", false, false, 0, "autovec");
+  driver_c_diagf("[driver_c_emit_obj_default] weak_uir_emit len=%d buffer=%p\n", obj.len, obj.buffer);
   if (obj.len <= 0) return -13;
   if (obj.buffer == NULL) return -14;
-  return driver_c_write_exact_file(path, obj.buffer, obj.len);
+  {
+    int32_t rc = driver_c_write_exact_file(path, obj.buffer, obj.len);
+    driver_c_diagf("[driver_c_emit_obj_default] write_rc=%d\n", rc);
+    return rc;
+  }
 }
 
 int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_path,
@@ -645,16 +874,50 @@ int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_p
   const char *ldflags = getenv("BACKEND_LDFLAGS");
   const char *cflags_text = (cflags != NULL) ? cflags : "";
   const char *ldflags_text = (ldflags != NULL) ? ldflags : "";
+  char full_ldflags[512];
+  char extra_ldflags[96];
+  full_ldflags[0] = '\0';
+  extra_ldflags[0] = '\0';
   if (output_path == NULL || output_path[0] == '\0') return -20;
   if (obj_path == NULL || obj_path[0] == '\0') return -21;
   if (strcmp(linker_text, "system") != 0) return -22;
-  (void)target_text;
+  const char *base = strrchr(obj_path, '/');
+  const char *obj_name = (base != NULL) ? (base + 1) : obj_path;
+  int use_driver_entry_shim = strstr(obj_name, "backend_driver") != NULL;
+  if (strstr(target_text, "darwin") != NULL || strstr(target_text, "apple-darwin") != NULL) {
+    const char *allow_uuid = getenv("BACKEND_ALLOW_UUID");
+    int skip_no_uuid = (allow_uuid != NULL &&
+                        (strcmp(allow_uuid, "1") == 0 ||
+                         strcmp(allow_uuid, "true") == 0 ||
+                         strcmp(allow_uuid, "TRUE") == 0));
+    if (!skip_no_uuid && strstr(ldflags_text, "-Wl,-no_uuid") == NULL) {
+      snprintf(extra_ldflags + strlen(extra_ldflags),
+               sizeof(extra_ldflags) - strlen(extra_ldflags),
+               " -Wl,-no_uuid");
+    }
+    if (strstr(ldflags_text, "-Wl,-no_adhoc_codesign") == NULL) {
+      snprintf(extra_ldflags + strlen(extra_ldflags),
+               sizeof(extra_ldflags) - strlen(extra_ldflags),
+               " -Wl,-no_adhoc_codesign");
+    }
+    if (use_driver_entry_shim && strstr(ldflags_text, "-Wl,-export_dynamic") == NULL) {
+      snprintf(extra_ldflags + strlen(extra_ldflags),
+               sizeof(extra_ldflags) - strlen(extra_ldflags),
+               " -Wl,-export_dynamic");
+    }
+  }
+  snprintf(full_ldflags, sizeof(full_ldflags), "%s%s", ldflags_text, extra_ldflags);
   size_t need = strlen(obj_path) + strlen(runtime_c) + strlen(output_path) +
-                strlen(cflags_text) + strlen(ldflags_text) + 96u;
+                strlen(cflags_text) + strlen(full_ldflags) + 128u;
   char *cmd = (char *)malloc(need);
   if (cmd == NULL) return -23;
-  snprintf(cmd, need, "cc %s '%s' '%s' %s -o '%s'",
-           cflags_text, obj_path, runtime_c, ldflags_text, output_path);
+  if (use_driver_entry_shim) {
+    snprintf(cmd, need, "cc -DCHENG_BACKEND_DRIVER_ENTRY_SHIM %s '%s' '%s' %s -o '%s'",
+             cflags_text, obj_path, runtime_c, full_ldflags, output_path);
+  } else {
+    snprintf(cmd, need, "cc %s '%s' '%s' %s -o '%s'",
+             cflags_text, obj_path, runtime_c, full_ldflags, output_path);
+  }
   int rc = system(cmd);
   free(cmd);
   if (rc != 0) return -24;
@@ -670,13 +933,22 @@ int32_t driver_c_link_tmp_obj_system(const char *output_path, const char *obj_pa
 
 int32_t driver_c_build_emit_obj_default(const char *input_path, const char *target,
                                         const char *output_path) {
+  driver_c_boot_marker(40);
   if (input_path == NULL || input_path[0] == '\0') return -30;
   if (target == NULL || target[0] == '\0') return -31;
   if (output_path == NULL || output_path[0] == '\0') return -32;
+  driver_c_boot_marker(41);
   void *module = driver_c_build_module_stage1(input_path, target);
-  if (module == NULL) return -33;
+  if (module == NULL) {
+    driver_c_boot_marker(42);
+    driver_c_diagf("[driver_c_build_emit_obj_default] module_build_null rc=-33 input='%s' target='%s'\n",
+                   input_path != NULL ? input_path : "", target != NULL ? target : "");
+    return -33;
+  }
+  driver_c_boot_marker(43);
   int32_t emit_rc = driver_c_emit_obj_default(module, target, output_path);
   if (emit_rc != 0) return emit_rc;
+  driver_c_boot_marker(44);
   return driver_c_finish_emit_obj(output_path);
 }
 
@@ -691,6 +963,7 @@ int32_t driver_c_build_active_obj_default(void) {
 int32_t driver_c_build_link_exe_default(const char *input_path, const char *target,
                                         const char *output_path, const char *linker) {
   (void)linker;
+  driver_c_boot_marker(50);
   if (input_path == NULL || input_path[0] == '\0') return -40;
   if (target == NULL || target[0] == '\0') return -41;
   if (output_path == NULL || output_path[0] == '\0') return -42;
@@ -699,30 +972,144 @@ int32_t driver_c_build_link_exe_default(const char *input_path, const char *targ
   char *obj_path = (char *)malloc(need);
   if (obj_path == NULL) return -43;
   snprintf(obj_path, need, "%s%s", output_path, suffix);
+  driver_c_boot_marker(51);
   int32_t emit_rc = driver_c_build_emit_obj_default(input_path, target, obj_path);
   if (emit_rc != 0) {
     free(obj_path);
     return emit_rc;
   }
+  driver_c_boot_marker(52);
   int32_t link_rc = driver_c_link_tmp_obj_system(output_path, obj_path, target);
   if (link_rc != 0) {
     free(obj_path);
     return link_rc;
   }
+  driver_c_boot_marker(53);
   int32_t finish_rc = driver_c_finish_single_link(output_path, obj_path);
   free(obj_path);
   return finish_rc;
 }
 
 void *driver_c_build_module_stage1(const char *input_path, const char *target) {
-  if (input_path == NULL || input_path[0] == '\0') return NULL;
+  driver_c_boot_marker(60);
+  driver_c_diagf("[driver_c_build_module_stage1] input='%s' target='%s'\n",
+                 input_path != NULL ? input_path : "", target != NULL ? target : "");
+  if (input_path == NULL || input_path[0] == '\0') {
+    driver_c_boot_marker(61);
+    driver_c_diagf("[driver_c_build_module_stage1] input_missing\n");
+    return NULL;
+  }
   if (target == NULL) target = "";
-  if (uirCoreBuildModuleFromFileStage1OrPanic != NULL) {
-    return uirCoreBuildModuleFromFileStage1OrPanic(input_path, target);
+  {
+    driver_c_boot_marker(62);
+    cheng_build_module_stage1_fn build_module_stage1 =
+        (cheng_build_module_stage1_fn)dlsym(RTLD_DEFAULT, "uirCoreBuildModuleFromFileStage1OrPanic");
+    if (build_module_stage1 != NULL) {
+      void *module = build_module_stage1(input_path, target);
+      driver_c_diagf("[driver_c_build_module_stage1] dlsym_builder_module=%p\n", module);
+      if (module != NULL) {
+        driver_c_boot_marker(63);
+        return module;
+      }
+    }
   }
-  if (driver_buildActiveModulePtrs != NULL) {
-    return driver_buildActiveModulePtrs((void *)input_path, (void *)target);
+  {
+    driver_c_boot_marker(62);
+    cheng_build_module_stage1_target_facade_fn build_module_stage1_target =
+        (cheng_build_module_stage1_target_facade_fn)dlsym(
+            RTLD_DEFAULT, "uirBuildModuleFromFileStage1TargetOrPanic");
+    if (build_module_stage1_target != NULL) {
+      void *module = build_module_stage1_target(input_path, target);
+      driver_c_diagf("[driver_c_build_module_stage1] dlsym_facade_target_module=%p\n", module);
+      if (module != NULL) {
+        driver_c_boot_marker(63);
+        return module;
+      }
+    }
   }
+  {
+    driver_c_boot_marker(62);
+    cheng_build_module_stage1_facade_fn build_module_stage1_facade =
+        (cheng_build_module_stage1_facade_fn)dlsym(RTLD_DEFAULT,
+                                                   "uirBuildModuleFromFileStage1OrPanic");
+    if (build_module_stage1_facade != NULL) {
+      void *module = build_module_stage1_facade(input_path);
+      driver_c_diagf("[driver_c_build_module_stage1] dlsym_facade_module=%p\n", module);
+      if (module != NULL) {
+        driver_c_boot_marker(63);
+        return module;
+      }
+    }
+  }
+  {
+    driver_c_boot_marker(64);
+    cheng_build_active_module_ptrs_fn build_active_module_ptrs =
+        (cheng_build_active_module_ptrs_fn)dlsym(RTLD_DEFAULT, "driver_buildActiveModulePtrs");
+    if (build_active_module_ptrs != NULL) {
+      void *module = build_active_module_ptrs((void *)input_path, (void *)target);
+      driver_c_diagf("[driver_c_build_module_stage1] dlsym_sidecar_module=%p\n", module);
+      if (module != NULL) {
+        driver_c_boot_marker(65);
+        return module;
+      }
+    }
+  }
+  {
+    driver_c_boot_marker(66);
+    cheng_build_active_module_ptrs_fn sidecar_build_fn = driver_c_sidecar_build_module_fn(target);
+    if (sidecar_build_fn != NULL) {
+      void *module = sidecar_build_fn((void *)input_path, (void *)target);
+      driver_c_diagf("[driver_c_build_module_stage1] sidecar_module=%p\n", module);
+      if (module != NULL) {
+        driver_c_boot_marker(67);
+        return module;
+      }
+    }
+  }
+  driver_c_boot_marker(68);
+  driver_c_diagf("[driver_c_build_module_stage1] no_module\n");
+  return NULL;
+}
+
+void *driver_c_build_module_stage1_direct(const char *input_path, const char *target) {
+  driver_c_diagf("[driver_c_build_module_stage1_direct] input='%s' target='%s'\n",
+                 input_path != NULL ? input_path : "", target != NULL ? target : "");
+  if (input_path == NULL || input_path[0] == '\0') {
+    driver_c_diagf("[driver_c_build_module_stage1_direct] input_missing\n");
+    return NULL;
+  }
+  if (target == NULL) target = "";
+  {
+    cheng_build_module_stage1_fn build_module_stage1 =
+        (cheng_build_module_stage1_fn)dlsym(RTLD_DEFAULT, "uirCoreBuildModuleFromFileStage1OrPanic");
+    if (build_module_stage1 != NULL) {
+      void *module = build_module_stage1(input_path, target);
+      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_builder_module=%p\n", module);
+      if (module != NULL) return module;
+    }
+  }
+  {
+    cheng_build_module_stage1_target_facade_fn build_module_stage1_target =
+        (cheng_build_module_stage1_target_facade_fn)dlsym(
+            RTLD_DEFAULT, "uirBuildModuleFromFileStage1TargetOrPanic");
+    if (build_module_stage1_target != NULL) {
+      void *module = build_module_stage1_target(input_path, target);
+      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_facade_target_module=%p\n",
+                     module);
+      if (module != NULL) return module;
+    }
+  }
+  {
+    cheng_build_module_stage1_facade_fn build_module_stage1_facade =
+        (cheng_build_module_stage1_facade_fn)dlsym(RTLD_DEFAULT,
+                                                   "uirBuildModuleFromFileStage1OrPanic");
+    if (build_module_stage1_facade != NULL) {
+      void *module = build_module_stage1_facade(input_path);
+      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_facade_module=%p\n", module);
+      if (module != NULL) return module;
+    }
+  }
+  driver_c_diagf("[driver_c_build_module_stage1_direct] no_module\n");
   return NULL;
 }
 
@@ -736,17 +1123,36 @@ int32_t driver_c_build_active_exe_default(void) {
 }
 
 __attribute__((weak)) int32_t driver_c_run_default(void) {
+  driver_c_boot_marker(70);
   int32_t emit_mode = driver_c_emit_is_obj_mode();
   if (emit_mode < 0) return emit_mode;
+  driver_c_boot_marker(71);
   char *input_path = driver_c_resolve_input_path();
   char *target = driver_c_resolve_target();
   char *output_path = driver_c_resolve_output_path(input_path);
   char *linker = driver_c_resolve_linker();
+  driver_c_diagf("[driver_c_run_default] emit=%d input='%s' target='%s' output='%s' linker='%s'\n",
+                 emit_mode,
+                 input_path != NULL ? input_path : "",
+                 target != NULL ? target : "",
+                 output_path != NULL ? output_path : "",
+                 linker != NULL ? linker : "");
+  driver_c_boot_marker(72);
   if (input_path == NULL || input_path[0] == '\0') return 2;
   if (target == NULL || target[0] == '\0') return 2;
   if (output_path == NULL || output_path[0] == '\0') return 2;
-  if (emit_mode != 0) return driver_c_build_emit_obj_default(input_path, target, output_path);
-  return driver_c_build_link_exe_default(input_path, target, output_path, linker);
+  if (emit_mode != 0) {
+    driver_c_boot_marker(73);
+    int32_t rc = driver_c_build_emit_obj_default(input_path, target, output_path);
+    driver_c_diagf("[driver_c_run_default] emit_obj_rc=%d\n", rc);
+    return rc;
+  }
+  {
+    driver_c_boot_marker(74);
+    int32_t rc = driver_c_build_link_exe_default(input_path, target, output_path, linker);
+    driver_c_diagf("[driver_c_run_default] link_exe_rc=%d\n", rc);
+    return rc;
+  }
 }
 
 int32_t driver_c_finish_single_link(const char *path, const char *obj_path) {
@@ -795,6 +1201,29 @@ __attribute__((weak)) void driver_c_boot_marker(int32_t code) {
   case 36: driver_c_boot_marker_write("[boot]36\n", sizeof("[boot]36\n") - 1u); break;
   case 37: driver_c_boot_marker_write("[boot]37\n", sizeof("[boot]37\n") - 1u); break;
   case 38: driver_c_boot_marker_write("[boot]38\n", sizeof("[boot]38\n") - 1u); break;
+  case 40: driver_c_boot_marker_write("[phase]emit_obj.enter\n", sizeof("[phase]emit_obj.enter\n") - 1u); break;
+  case 41: driver_c_boot_marker_write("[phase]emit_obj.build_module\n", sizeof("[phase]emit_obj.build_module\n") - 1u); break;
+  case 42: driver_c_boot_marker_write("[phase]emit_obj.module_null\n", sizeof("[phase]emit_obj.module_null\n") - 1u); break;
+  case 43: driver_c_boot_marker_write("[phase]emit_obj.module_ok\n", sizeof("[phase]emit_obj.module_ok\n") - 1u); break;
+  case 44: driver_c_boot_marker_write("[phase]emit_obj.finish\n", sizeof("[phase]emit_obj.finish\n") - 1u); break;
+  case 50: driver_c_boot_marker_write("[phase]link_exe.enter\n", sizeof("[phase]link_exe.enter\n") - 1u); break;
+  case 51: driver_c_boot_marker_write("[phase]link_exe.emit_tmp_obj\n", sizeof("[phase]link_exe.emit_tmp_obj\n") - 1u); break;
+  case 52: driver_c_boot_marker_write("[phase]link_exe.system_link\n", sizeof("[phase]link_exe.system_link\n") - 1u); break;
+  case 53: driver_c_boot_marker_write("[phase]link_exe.finish\n", sizeof("[phase]link_exe.finish\n") - 1u); break;
+  case 60: driver_c_boot_marker_write("[phase]build_module.enter\n", sizeof("[phase]build_module.enter\n") - 1u); break;
+  case 61: driver_c_boot_marker_write("[phase]build_module.input_missing\n", sizeof("[phase]build_module.input_missing\n") - 1u); break;
+  case 62: driver_c_boot_marker_write("[phase]build_module.try_builder\n", sizeof("[phase]build_module.try_builder\n") - 1u); break;
+  case 63: driver_c_boot_marker_write("[phase]build_module.builder_ok\n", sizeof("[phase]build_module.builder_ok\n") - 1u); break;
+  case 64: driver_c_boot_marker_write("[phase]build_module.try_sidecar_symbol\n", sizeof("[phase]build_module.try_sidecar_symbol\n") - 1u); break;
+  case 65: driver_c_boot_marker_write("[phase]build_module.sidecar_symbol_ok\n", sizeof("[phase]build_module.sidecar_symbol_ok\n") - 1u); break;
+  case 66: driver_c_boot_marker_write("[phase]build_module.try_sidecar_bundle\n", sizeof("[phase]build_module.try_sidecar_bundle\n") - 1u); break;
+  case 67: driver_c_boot_marker_write("[phase]build_module.sidecar_bundle_ok\n", sizeof("[phase]build_module.sidecar_bundle_ok\n") - 1u); break;
+  case 68: driver_c_boot_marker_write("[phase]build_module.no_module\n", sizeof("[phase]build_module.no_module\n") - 1u); break;
+  case 70: driver_c_boot_marker_write("[phase]run_default.enter\n", sizeof("[phase]run_default.enter\n") - 1u); break;
+  case 71: driver_c_boot_marker_write("[phase]run_default.resolve_paths\n", sizeof("[phase]run_default.resolve_paths\n") - 1u); break;
+  case 72: driver_c_boot_marker_write("[phase]run_default.dispatch\n", sizeof("[phase]run_default.dispatch\n") - 1u); break;
+  case 73: driver_c_boot_marker_write("[phase]run_default.obj_mode\n", sizeof("[phase]run_default.obj_mode\n") - 1u); break;
+  case 74: driver_c_boot_marker_write("[phase]run_default.exe_mode\n", sizeof("[phase]run_default.exe_mode\n") - 1u); break;
   default: break;
   }
 }

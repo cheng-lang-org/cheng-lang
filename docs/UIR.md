@@ -8,6 +8,11 @@
 - Runtime C 的角色是“预编译 OS/ABI 胶水对象 + 必要运行时符号提供”，不是“把业务源码翻译成 C 再交给 C 编译器做主优化”。
 - Dev 轨固定走 `self-link + direct-exe` 的快速主链；Release 轨固定走 `system-link` 做最终物理收敛。
 - 对外公开输出通道为 `cheng --emit:exe` 与 `release-compile --emit:exe|shared|static`；非 release 可执行构建不对外开放 `emit=obj`。
+- 公开轨道固定口径：
+  - `cheng` 固定 `BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`、`BACKEND_LINKERLESS_INMEM=1`、`BACKEND_FAST_FALLBACK_ALLOW=0`。
+  - `release-compile` 固定 `BACKEND_STAGE1_PARSE_MODE=full`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`、`BACKEND_FAST_FALLBACK_ALLOW=0`、`BACKEND_LINKER=system`。
+  - `BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 仅保留给内部诊断、perf 对照与低内存 bring-up。
+- 函数任务确定性约束：UIR/isel/direct-exe 的函数任务允许并行执行，但结果必须按稳定声明顺序 merge；最终 `.o/.exe` 字节流不得依赖 `BACKEND_JOBS`。
 
 ## 2) 单一 IR 双相模型（High-UIR / Low-UIR）
 `UIR` 不是“单层拍平 IR”。当前生产口径已经按“单一 SoA 存储、双相语义执行”来理解：

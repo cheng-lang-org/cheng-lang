@@ -5,6 +5,7 @@ import std/strutils
 import std/hashmaps
 import std/system
 import std/rawmem_support
+import std/crash_trace_internal
 import stage1/lexer
 import stage1/ast
 import backend/uir/uir_internal/uir_core_types
@@ -47,7 +48,8 @@ fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): Blo
     b.module = module
     b.func = func
     b.currentLabel = "entry"
-    b.currentStmts = []
+    b.currentStmtStart = uirCoreBlockStmtsFlatLen()
+    b.currentStmtLen = 0
     b.labelCounter = 0
     b.objCursor = 0
     b.loopStack = []
@@ -68,15 +70,27 @@ fn blockBuilderNextLabel(b: BlockBuilder, prefix: str): str =
 
 fn blockBuilderStart(b: BlockBuilder, label: str) =
     b.currentLabel = label
-    b.currentStmts = []
+    b.currentStmtStart = uirCoreBlockStmtsFlatLen()
+    b.currentStmtLen = 0
 
-fn uirCoreStmtSeqAppend(seqInst: var UirStmtId[], stmt: UirStmtId) =
-    let idx: int32 = seqInst.len
-    let needLen: int32 = idx + 1
-    if seqInst.buffer == nil || seqInst.cap < needLen:
-        reserve(seqInst, needLen)
-    setLen(seqInst, needLen)
-    seqInst[idx] = stmt
+fn blockBuilderStmtAppend(b: BlockBuilder, stmt: UirStmtId) =
+    if b == nil:
+        return
+    uirCoreBlockStmtsFlatAppend(stmt)
+    b.currentStmtLen = b.currentStmtLen + 1
+
+fn blockBuilderStmtLen(b: BlockBuilder): int32 =
+    if b == nil:
+        return 0
+    return b.currentStmtLen
+
+fn blockBuilderStmtAt(b: BlockBuilder, idx: int32): UirStmtId =
+    if b == nil || idx < 0 || idx >= b.currentStmtLen:
+        return 0
+    let pos: int32 = b.currentStmtStart + idx
+    if pos < 0 || pos >= uirCoreBlockStmtsFlatLen():
+        return 0
+    return uirCoreBlockStmtsFlatAt(pos)
 
 fn loopContextSeqAppend(seqInst: var LoopContext[], ctx: LoopContext) =
     let idx: int32 = seqInst.len
@@ -126,26 +140,24 @@ fn blockBuilderExprLowerPush(b: BlockBuilder, node: Node) =
 fn blockBuilderAddStmt(b: BlockBuilder, stmt: UirStmtId) =
     if b == nil:
         return
-    uirCoreStmtSeqAppend(b.currentStmts, stmt)
+    if crashTraceEnabled():
+        crashTraceSetPhase(cstring("uir.block.add_stmt"))
+        crashTraceMark(cstring("uir.block.add"), stmt, b.currentStmtStart, b.currentStmtLen, 0)
+    blockBuilderStmtAppend(b, stmt)
 
 fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
-    # Copy stmt buffer so finished blocks don't alias the builder's scratch seq.
-    # (Without this, later appends can realloc/free the shared buffer.)
-    var stmtsCopy: UirStmtId[]
-    if b.currentStmts.len > 0:
-        setLen(stmtsCopy, b.currentStmts.len)
-        for si in 0..<b.currentStmts.len:
-            stmtsCopy[si] = b.currentStmts[si]
-    let blk: UirBlockId = uirCoreBlockWithStmts(b.currentLabel, stmtsCopy, term)
+    let stmtStart: int32 = b.currentStmtStart
+    let stmtLen: int32 = b.currentStmtLen
+    let blk: UirBlockId = uirCoreBlockWithStmtSpan(b.currentLabel, stmtStart, stmtLen, term)
     let dbgFunc: UirCoreFunc = b.func
     let dbgName: str = (dbgFunc != nil) ? dbgFunc.name : ""
     if (os.getEnvDefault("BACKEND_DEBUG_MIR_FINISH", "") == dbgName):
-        let curLen: int32 = b.currentStmts.len
+        let curLen: int32 = b.currentStmtLen
         let blkLen: int32 = uirCoreBlockStmtsLen(blk)
         echo("[backend] dbgFinish: fn=" + dbgName + " label=" + b.currentLabel +
              " cur.len=" + intToStr(curLen) + " blk.len=" + intToStr(blkLen))
         if curLen > 0:
-            let s0: UirStmtId = b.currentStmts[0]
+            let s0: UirStmtId = blockBuilderStmtAt(b, 0)
             echo("[backend] dbgFinish: cur0.kind=" + intToStr(int32(uirCoreStmtKindOf(s0))) +
                  " slot=" + intToStr(uirCoreStmtSlotOf(s0)))
         if blkLen > 0:
@@ -154,7 +166,8 @@ fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
                  " slot=" + intToStr(uirCoreStmtSlotOf(s1)))
     uirCoreAddBlock(b.func, blk)
     b.currentLabel = ""
-    b.currentStmts = []
+    b.currentStmtStart = uirCoreBlockStmtsFlatLen()
+    b.currentStmtLen = 0
 
 fn blockBuilderPushLoop(b: BlockBuilder, breakLabel: str, continueLabel: str) =
     var ctx: LoopContext

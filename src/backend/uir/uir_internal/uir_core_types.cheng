@@ -5,6 +5,7 @@ import std/strings
 import std/result
 import std/hashmaps
 import std/rawmem_support
+import std/crash_trace_internal
 
 fn uirCoreReserveTargetCap(currentCap: int32, needLen: int32, minCap: int32): int32 =
     var target: int32 = currentCap
@@ -32,6 +33,11 @@ fn uirCoreOwnStr(s: str): str =
     if len(s) <= 0:
         return ""
     return strings.__cheng_str_clone(s)
+
+fn uirCoreOwnStrSafe(s: str): str =
+    if !uirCoreStrPtrSane(s):
+        return ""
+    return uirCoreOwnStr(s)
 
 var
     uirCore_funcNameIndex: hashmaps.HashMapPtrInt
@@ -551,15 +557,99 @@ fn uirCoreCloneStmtSeq(src: UirStmtId[]): UirStmtId[] =
         out[i] = src[i]
     return out
 
-fn uirCoreAppendBlockStmtSpan(val: UirStmtId[]) =
-    let start: int32 = uirCore_blockStmtsFlat.len
-    let n: int32 = val.len
-    if n > 0:
-        for i in 0..<n:
-            seqs.add(uirCore_blockStmtsFlat, val[i])
-    uirCoreAppendStmtSeq(uirCore_blockPool_stmtsSeq, val)
+fn uirCoreStmtSeqLen(items: UirStmtId[]*): int32 =
+    if items == nil:
+        return 0
+    return items->len
+
+fn uirCoreStmtSeqDataPtr(items: UirStmtId[]*): void* =
+    if items == nil:
+        return nil
+    return items->buffer
+
+fn uirCoreStmtSeqAppend(items: UirStmtId[]*, stmt: UirStmtId) =
+    if items == nil:
+        return
+    seqs.add(items, stmt)
+
+fn uirCoreStmtSeqAt(items: UirStmtId[]*, idx: int32): UirStmtId =
+    if items == nil:
+        return uirCoreInvalidId()
+    return items[idx]
+
+fn uirCoreStmtSeqSet(items: UirStmtId[]*, idx: int32, stmt: UirStmtId) =
+    if items == nil:
+        return
+    items[idx] = stmt
+
+fn uirCoreBlockStmtsFlatLen(): int32 =
+    return uirCore_blockStmtsFlatCount
+
+fn uirCoreResetStmtIdSeq(items: UirStmtId[]*) =
+    if items == nil:
+        return
+    items->buffer = nil
+    items->len = 0
+    items->cap = 0
+
+fn uirCoreSanitizeStmtIdSeq(items: UirStmtId[]*) =
+    if items == nil:
+        return
+    var bad: bool = false
+    if items->len < 0 || items->cap < 0:
+        bad = true
+    elif items->len > items->cap:
+        bad = true
+    elif items->len > 100000000 || items->cap > 100000000:
+        bad = true
+    if bad:
+        uirCoreResetStmtIdSeq(items)
+
+fn uirCoreBlockStmtsFlatAppend(stmt: UirStmtId) =
+    uirCore_blockPoolInit()
+    uirCoreSanitizeStmtIdSeq(&uirCore_blockStmtsFlat)
+    let flatLenBefore: int32 = uirCoreStmtSeqLen(&uirCore_blockStmtsFlat)
+    if crashTraceEnabled():
+        crashTraceSetPhase(cstring("uir.flat.append"))
+        crashTraceMark(cstring("uir.flat.append"), stmt, uirCore_blockStmtsFlatCount, flatLenBefore, 0)
+    if uirCore_blockStmtsFlatCount < 0 || uirCore_blockStmtsFlatCount > flatLenBefore:
+        uirCore_blockStmtsFlatCount = flatLenBefore
+    uirCoreStmtSeqAppend(&uirCore_blockStmtsFlat, stmt)
+    uirCore_blockStmtsFlatCount = uirCoreStmtSeqLen(&uirCore_blockStmtsFlat)
+
+fn uirCoreBlockStmtsFlatAt(idx: int32): UirStmtId =
+    if idx < 0 || idx >= uirCore_blockStmtsFlatCount:
+        return uirCoreInvalidId()
+    uirCoreSanitizeStmtIdSeq(&uirCore_blockStmtsFlat)
+    let flatLen: int32 = uirCoreStmtSeqLen(&uirCore_blockStmtsFlat)
+    if uirCore_blockStmtsFlatCount > flatLen:
+        uirCore_blockStmtsFlatCount = flatLen
+    if uirCoreStmtSeqDataPtr(&uirCore_blockStmtsFlat) == nil || idx >= flatLen:
+        return uirCoreInvalidId()
+    return uirCoreStmtSeqAt(&uirCore_blockStmtsFlat, idx)
+
+fn uirCoreBlockStmtsFlatSet(idx: int32, stmt: UirStmtId) =
+    if idx < 0 || idx >= uirCore_blockStmtsFlatCount:
+        panic "uirCore_types: flat stmt index out of bounds"
+    uirCoreSanitizeStmtIdSeq(&uirCore_blockStmtsFlat)
+    let flatLen: int32 = uirCoreStmtSeqLen(&uirCore_blockStmtsFlat)
+    if uirCore_blockStmtsFlatCount > flatLen:
+        uirCore_blockStmtsFlatCount = flatLen
+    if uirCoreStmtSeqDataPtr(&uirCore_blockStmtsFlat) == nil || idx >= flatLen:
+        panic "uirCore_types: flat stmt backing out of sync"
+    uirCoreStmtSeqSet(&uirCore_blockStmtsFlat, idx, stmt)
+
+fn uirCoreAppendBlockStmtSpanFromSeq(stmts: UirStmtId[]*) =
+    let start: int32 = uirCoreBlockStmtsFlatLen()
+    let stmtLen: int32 = (stmts != nil) ? stmts->len : 0
+    if stmts != nil && stmtLen > 0:
+        for i in 0..<stmtLen:
+            uirCoreBlockStmtsFlatAppend(stmts[i])
     seqs.add(uirCore_blockPool_stmtStart, start)
-    seqs.add(uirCore_blockPool_stmtLenFlat, n)
+    seqs.add(uirCore_blockPool_stmtLenFlat, stmtLen)
+
+fn uirCoreAppendBlockStmtSpan(val: UirStmtId[]) =
+    uirCoreAppendBlockStmtSpanFromSeq(&val)
 
 var
     uirCore_exprPool_ready: bool = false
@@ -594,6 +684,7 @@ var
     uirCore_blockPool_stmtStart: int32[]
     uirCore_blockPool_stmtLenFlat: int32[]
     uirCore_blockStmtsFlat: UirStmtId[]
+    uirCore_blockStmtsFlatCount: int32 = 0
     uirCore_blockPool_term: UirCoreTerm[]
 
 fn uirCore_exprPoolInit() =
@@ -666,7 +757,8 @@ fn uirCore_blockPoolInit() =
     uirCore_blockPool_stmtsSeq = []
     uirCore_blockPool_stmtStart = []
     uirCore_blockPool_stmtLenFlat = []
-    uirCore_blockStmtsFlat = []
+    uirCoreResetStmtIdSeq(&uirCore_blockStmtsFlat)
+    uirCore_blockStmtsFlatCount = 0
     uirCore_blockPool_term = []
     var nilTerm: UirCoreTerm
     nilTerm.kind = mtBr
@@ -2096,14 +2188,27 @@ fn uirCoreStmtAllocFields(kind: UirCoreStmtKind,
     seqs.add(uirCore_stmtPool_storeType, uirCoreEncodeType(storeType))
     return id
 
-fn uirCoreBlockAllocFields(label: str, stmts: UirStmtId[], term: UirCoreTerm): UirBlockId =
+fn uirCoreBlockAllocFieldsFromStmtSeqRef(label: str, stmts: UirStmtId[]*, term: UirCoreTerm): UirBlockId =
     uirCore_blockPoolInit()
     let id: int32 = uirCore_blockPool_label.len
     uirCoreBlockPoolReserve(id + 1)
     seqs.add(uirCore_blockPool_label, label)
-    uirCoreAppendBlockStmtSpan(stmts)
+    uirCoreAppendBlockStmtSpanFromSeq(stmts)
     seqs.add(uirCore_blockPool_term, term)
     return id
+
+fn uirCoreBlockAllocFieldsFromSpan(label: str, stmtStart: int32, stmtLen: int32, term: UirCoreTerm): UirBlockId =
+    uirCore_blockPoolInit()
+    let id: int32 = uirCore_blockPool_label.len
+    uirCoreBlockPoolReserve(id + 1)
+    seqs.add(uirCore_blockPool_label, label)
+    seqs.add(uirCore_blockPool_stmtStart, stmtStart)
+    seqs.add(uirCore_blockPool_stmtLenFlat, stmtLen)
+    seqs.add(uirCore_blockPool_term, term)
+    return id
+
+fn uirCoreBlockAllocFields(label: str, stmts: UirStmtId[], term: UirCoreTerm): UirBlockId =
+    return uirCoreBlockAllocFieldsFromStmtSeqRef(label, &stmts, term)
 
 fn uirCoreConstI64(value: int64): UirExprId =
     return uirCoreExprAllocFieldsNoArgs(meConstI64, value, mbAdd, mcEq, 0, 0, -1,
@@ -2186,6 +2291,12 @@ fn uirCoreStmtStore(addr: UirExprId, value: UirExprId, ty: UirCoreType): UirStmt
 fn uirCoreBlock(label: str, term: UirCoreTerm): UirBlockId =
     return uirCoreBlockAllocFields(uirCoreOwnStr(label), [], term)
 
+fn uirCoreBlockWithStmtSeqRef(label: str, stmts: UirStmtId[]*, term: UirCoreTerm): UirBlockId =
+    return uirCoreBlockAllocFieldsFromStmtSeqRef(uirCoreOwnStr(label), stmts, term)
+
+fn uirCoreBlockWithStmtSpan(label: str, stmtStart: int32, stmtLen: int32, term: UirCoreTerm): UirBlockId =
+    return uirCoreBlockAllocFieldsFromSpan(uirCoreOwnStr(label), stmtStart, stmtLen, term)
+
 fn uirCoreBlockWithStmts(label: str, stmts: UirStmtId[], term: UirCoreTerm): UirBlockId =
     return uirCoreBlockAllocFields(uirCoreOwnStr(label), stmts, term)
 
@@ -2246,9 +2357,7 @@ fn uirCoreAppendBlockPtr(seqInst: UirBlockId[]*, block: UirBlockId) =
     if seqInst->buffer == nil || seqInst->cap < needLen:
         cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, needLen, int32(sizeof UirBlockId))
     seqInst->len = needLen
-    let elemBytes: int32 = idx * int32(sizeof UirBlockId)
-    let writePtr: UirBlockId* = UirBlockId*(ptr_add(seqInst->buffer, elemBytes))
-    *writePtr = block
+    seqInst[idx] = block
 
 fn uirCoreFuncRefSeqSane(funcs: UirCoreFunc[]): bool =
     let funcCount: int32 = funcs.len
@@ -2276,40 +2385,8 @@ fn uirCoreAppendFuncPtr(seqInst: UirCoreFunc[]*, val: UirCoreFunc) =
         cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, needLen, int32(sizeof ptr))
     seqInst->len = needLen
     if val != nil:
-        memRetain(void*(val))
-    let elemBytes: int32 = idx * int32(sizeof ptr)
-    let writePtr: UirCoreFunc* = UirCoreFunc*(ptr_add(seqInst->buffer, elemBytes))
-    *writePtr = val
-
-fn uirCoreRawFuncRefAt(buf: ptr, lenVal: int32, idx: int32): UirCoreFunc =
-    if idx < 0 || idx >= lenVal || buf == nil:
-        return nil
-    let elemBytes: int32 = idx * int32(sizeof ptr)
-    let readPtr: UirCoreFunc* = UirCoreFunc*(ptr_add(buf, elemBytes))
-    if void*(readPtr) == nil:
-        return nil
-    return *readPtr
-
-fn uirCoreRawFuncRefSet(buf: ptr, lenVal: int32, idx: int32, val: UirCoreFunc) =
-    if idx < 0 || idx >= lenVal || buf == nil:
-        return
-    let elemBytes: int32 = idx * int32(sizeof ptr)
-    let writePtr: UirCoreFunc* = UirCoreFunc*(ptr_add(buf, elemBytes))
-    *writePtr = val
-
-fn uirCoreRawBlockAt(buf: ptr, lenVal: int32, idx: int32): UirBlockId =
-    if idx < 0 || idx >= lenVal || buf == nil:
-        return 0
-    let elemBytes: int32 = idx * int32(sizeof UirBlockId)
-    let readPtr: UirBlockId* = UirBlockId*(ptr_add(buf, elemBytes))
-    return *readPtr
-
-fn uirCoreRawBlockSet(buf: ptr, lenVal: int32, idx: int32, val: UirBlockId) =
-    if idx < 0 || idx >= lenVal || buf == nil:
-        return
-    let elemBytes: int32 = idx * int32(sizeof UirBlockId)
-    let writePtr: UirBlockId* = UirBlockId*(ptr_add(buf, elemBytes))
-    *writePtr = val
+        memRetain(rawmemAsVoid(val))
+    seqInst[idx] = val
 
 fn uirCoreFuncSyncBlocks(func: UirCoreFunc) =
     if !uirCoreFuncIdValid(func):
@@ -2375,7 +2452,7 @@ fn uirCoreWriteFunc(seqInst: UirCoreFunc[]*, idx: int32, val: UirCoreFunc) =
     if idx < 0 || idx >= seqInst->len:
         panic "uirCore_types: seq index out of bounds"
     if val != nil:
-        memRetain(void*(val))
+        memRetain(rawmemAsVoid(val))
     seqInst[idx] = val
 
 fn uirCoreWriteExpr(seqInst: UirExprId[]*, idx: int32, val: UirExprId) =
@@ -2480,13 +2557,33 @@ fn uirCoreCanonicalizeBlock(blk: UirBlockId) =
     if (!uirCoreBlockIdValid(blk)):
         return
     uirCore_blockPool_label[blk] = uirCoreOwnStr(uirCore_blockPool_label[blk])
+    let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+    for si in 0..<stmtCount:
+        let stmt: UirStmtId = uirCoreBlockStmtAt(blk, si)
+        if uirCoreStmtIdValid(stmt):
+            uirCoreOwnStmtStrings(stmt)
     uirCore_blockPool_term[blk] = uirCoreOwnTermStrings(uirCore_blockPool_term[blk])
 
 fn uirCoreCanonicalizeFunc(func: UirCoreFunc) =
     if (!uirCoreFuncIdValid(func)):
         return
-    func.name = uirCoreOwnStr(func.name)
-    func.linkName = uirCoreOwnStr(func.linkName)
+    let cachedIdx: int32 = uirCoreFindFuncNameCacheIndex(func)
+    if cachedIdx >= 0:
+        let cachedName: str = uirCoreOwnStr(uirCore_funcNameVals[cachedIdx])
+        let cachedLink: str = uirCoreOwnStr(uirCore_funcLinkVals[cachedIdx])
+        if len(cachedName) > 0:
+            func.name = cachedName
+        else:
+            func.name = uirCoreOwnStr(func.name)
+        if len(cachedLink) > 0:
+            func.linkName = cachedLink
+        else:
+            func.linkName = uirCoreOwnStr(func.linkName)
+    else:
+        func.name = uirCoreOwnStr(func.name)
+        func.linkName = uirCoreOwnStr(func.linkName)
+    if len(func.linkName) == 0 && len(func.name) > 0:
+        func.linkName = uirCoreOwnStr(func.name)
     func.originFile = uirCoreOwnStr(func.originFile)
     func.retTypeKey = uirCoreOwnStr(func.retTypeKey)
     func.phaseFallbackReason = uirCoreOwnStr(func.phaseFallbackReason)
@@ -2603,6 +2700,7 @@ fn uirCoreFindTypeAlias(module: UirCoreModule, name: str): int32 =
             let idx: int32 = raw - 1
             if foundAlias && raw > 0:
                 return idx
+            return -1
     for i in 0..<module.typeAliases.len:
         let a: UirCoreTypeAlias = module.typeAliases[i]
         if !uirCoreStrPtrSane(a.name):
@@ -2667,6 +2765,7 @@ fn uirCoreFindObjType(module: UirCoreModule, name: str): int32 =
             let idx: int32 = raw - 1
             if foundObj && raw > 0:
                 return idx
+            return -1
     for i in 0..<module.objTypes.len:
         let t: UirCoreObjType = module.objTypes[i]
         if (t.name == name):
@@ -2798,6 +2897,76 @@ fn uirCoreReplaceGlobal(module: UirCoreModule, idx: int32, name: str, ty: UirCor
             uirCoreSetInt32(module.globalHasInitBits, idx, 0)
     if idx >= 0 && idx < module.globalOriginFiles.len:
         uirCoreSetStr(module.globalOriginFiles, idx, g.originFile)
+
+fn uirCoreCanonicalizeModule(module: UirCoreModule) =
+    if module == nil:
+        return
+    let dbgCanon: bool = os.getEnvDefault("BACKEND_DEBUG_CANON_MOD", "") == "1"
+    let funcsSane: bool = uirCoreFuncRefSeqSane(module.funcs)
+    if dbgCanon:
+        echo("[backend] canon_mod: funcs=" + intToStr(module.funcs.len) +
+             " funcs_sane=" + (funcsSane ? "1" : "0") +
+             " globals=" + intToStr(module.globals.len) +
+             " cstrs=" + intToStr(module.cstrs.len) +
+             " aliases=" + intToStr(module.typeAliases.len) +
+             " objs=" + intToStr(module.objTypes.len))
+    if !funcsSane:
+        var funcsKeep: UirCoreFunc[]
+        for fi in 0..<module.funcs.len:
+            let func: UirCoreFunc = module.funcs[fi]
+            if dbgCanon:
+                echo("[backend] canon_mod: func_scan fi=" + intToStr(fi) +
+                     " ptr=" + int64ToStr(int64(rawmemAsVoid(func))))
+            if !uirCoreFuncIdValid(func):
+                continue
+            if uirCoreFindFuncNameCacheIndex(func) < 0:
+                continue
+            uirCoreAppendFuncRef(funcsKeep, func)
+        if dbgCanon:
+            echo("[backend] canon_mod: funcs_keep=" + intToStr(funcsKeep.len))
+        uirCoreModuleSetFuncs(module, funcsKeep)
+    for fi in 0..<module.funcs.len:
+        let func: UirCoreFunc = module.funcs[fi]
+        if dbgCanon:
+            echo("[backend] canon_mod: func_canon fi=" + intToStr(fi) +
+                 " ptr=" + int64ToStr(int64(rawmemAsVoid(func))))
+        uirCoreCanonicalizeFunc(func)
+        if dbgCanon:
+            echo("[backend] canon_mod: func_name fi=" + intToStr(fi) +
+                 " name='" + uirCoreFuncNameOf(func) +
+                 "' link='" + uirCoreFuncLinkNameOf(func) + "'")
+    for gi in 0..<module.globals.len:
+        if dbgCanon:
+            echo("[backend] canon_mod: global_canon gi=" + intToStr(gi))
+        var g: UirCoreGlobal = module.globals[gi]
+        g.name = uirCoreOwnStr(g.name)
+        g.originFile = uirCoreOwnStr(g.originFile)
+        uirCoreWriteGlobal(module.globals, gi, g)
+        if gi >= 0 && gi < module.globalNames.len:
+            uirCoreSetStr(module.globalNames, gi, g.name)
+        if gi >= 0 && gi < module.globalOriginFiles.len:
+            uirCoreSetStr(module.globalOriginFiles, gi, g.originFile)
+    for ci in 0..<module.cstrs.len:
+        if dbgCanon:
+            echo("[backend] canon_mod: cstr_canon ci=" + intToStr(ci))
+        var c: UirCoreCString = module.cstrs[ci]
+        c.label = uirCoreOwnStr(c.label)
+        c.value = uirCoreOwnStr(c.value)
+        uirCoreWriteCString(&module.cstrs, ci, c)
+        if ci >= 0 && ci < module.cstrLabels.len:
+            uirCoreSetStr(module.cstrLabels, ci, c.label)
+        if ci >= 0 && ci < module.cstrValues.len:
+            uirCoreSetStr(module.cstrValues, ci, c.value)
+    for ti in 0..<module.typeAliases.len:
+        if dbgCanon:
+            echo("[backend] canon_mod: alias_canon ti=" + intToStr(ti))
+        let alias0: UirCoreTypeAlias = uirCoreCanonicalizeTypeAlias(module.typeAliases[ti])
+        uirCoreWriteTypeAlias(module.typeAliases, ti, alias0)
+    for oi in 0..<module.objTypes.len:
+        if dbgCanon:
+            echo("[backend] canon_mod: obj_canon oi=" + intToStr(oi))
+        let obj0: UirCoreObjType = uirCoreCanonicalizeObjType(module.objTypes[oi])
+        uirCoreWriteObjType(module.objTypes, oi, obj0)
 
 fn uirCoreExprKindOf(expr: UirExprId): UirCoreExprKind =
     if (!uirCoreExprIdValid(expr)):
@@ -3102,73 +3271,68 @@ fn uirCoreStmtAddrExprOf(stmt: UirStmtId): UirExprId =
 fn uirCoreBlockStmtsLen(blk: UirBlockId): int32 =
     if (!uirCoreBlockIdValid(blk)):
         return 0
+    if blk < uirCore_blockPool_stmtLenFlat.len:
+        let stmtLen: int32 = uirCore_blockPool_stmtLenFlat[blk]
+        if stmtLen < 0:
+            return 0
+        if stmtLen == 0:
+            return 0
+        if blk < uirCore_blockPool_stmtStart.len:
+            let stmtStart: int32 = uirCore_blockPool_stmtStart[blk]
+            if stmtStart >= 0 && stmtStart + stmtLen <= uirCoreBlockStmtsFlatLen():
+                return stmtLen
     if blk < uirCore_blockPool_stmtsSeq.len:
         let stmtsSeq: UirStmtId[] = uirCore_blockPool_stmtsSeq[blk]
         if uirCoreStmtSeqSane(stmtsSeq):
             return stmtsSeq.len
-    let stmtLen: int32 = uirCore_blockPool_stmtLenFlat[blk]
-    if stmtLen < 0:
-        return 0
-    let stmtStart: int32 = uirCore_blockPool_stmtStart[blk]
-    if stmtLen == 0:
-        return 0
-    if stmtStart < 0 || stmtStart + stmtLen > uirCore_blockStmtsFlat.len:
-        return 0
-    return stmtLen
+    return 0
 
 fn uirCoreBlockStmtAt(blk: UirBlockId, idx: int32): UirStmtId =
     if (!uirCoreBlockIdValid(blk)):
         return uirCoreInvalidId()
+    if blk < uirCore_blockPool_stmtLenFlat.len && blk < uirCore_blockPool_stmtStart.len:
+        let stmtLen: int32 = uirCore_blockPool_stmtLenFlat[blk]
+        if idx >= 0 && idx < stmtLen:
+            let stmtStart: int32 = uirCore_blockPool_stmtStart[blk]
+            let pos: int32 = stmtStart + idx
+            if stmtStart >= 0 && pos >= 0 && pos < uirCoreBlockStmtsFlatLen():
+                return uirCoreBlockStmtsFlatAt(pos)
     if blk < uirCore_blockPool_stmtsSeq.len:
         let stmtsSeq: UirStmtId[] = uirCore_blockPool_stmtsSeq[blk]
         if uirCoreStmtSeqSane(stmtsSeq):
             if idx < 0 || idx >= stmtsSeq.len:
                 return uirCoreInvalidId()
             return stmtsSeq[idx]
-    let stmtLen: int32 = uirCoreBlockStmtsLen(blk)
-    if idx < 0 || idx >= stmtLen:
-        return uirCoreInvalidId()
-    let stmtStart: int32 = uirCore_blockPool_stmtStart[blk]
-    let pos: int32 = stmtStart + idx
-    if pos < 0 || pos >= uirCore_blockStmtsFlat.len:
-        return uirCoreInvalidId()
-    return uirCore_blockStmtsFlat[pos]
+    return uirCoreInvalidId()
 
 fn uirCoreBlockSetStmtAt(blk: UirBlockId, idx: int32, stmt: UirStmtId) =
     if (!uirCoreBlockIdValid(blk)):
         return
-    if blk < uirCore_blockPool_stmtsSeq.len:
-        var stmtsSeq: UirStmtId[] = uirCore_blockPool_stmtsSeq[blk]
-        if uirCoreStmtSeqSane(stmtsSeq):
-            if idx < 0 || idx >= stmtsSeq.len:
-                panic "uirCore_types: block stmt index out of bounds"
-            stmtsSeq[idx] = stmt
-            uirCoreWriteStmtSeq2D(&uirCore_blockPool_stmtsSeq, blk, stmtsSeq)
-            if blk < uirCore_blockPool_stmtStart.len && blk < uirCore_blockPool_stmtLenFlat.len:
-                let stmtStartMirror: int32 = uirCore_blockPool_stmtStart[blk]
-                let posMirror: int32 = stmtStartMirror + idx
-                if stmtStartMirror >= 0 && posMirror >= 0 && posMirror < uirCore_blockStmtsFlat.len:
-                    uirCore_blockStmtsFlat[posMirror] = stmt
-            return
     let stmtLen: int32 = uirCoreBlockStmtsLen(blk)
     if idx < 0 || idx >= stmtLen:
         panic "uirCore_types: block stmt index out of bounds"
-    let stmtStart: int32 = uirCore_blockPool_stmtStart[blk]
-    let pos: int32 = stmtStart + idx
-    if pos < 0 || pos >= uirCore_blockStmtsFlat.len:
-        panic "uirCore_types: block stmt flat column out of sync"
-    uirCore_blockStmtsFlat[pos] = stmt
+    if blk < uirCore_blockPool_stmtStart.len:
+        let stmtStart: int32 = uirCore_blockPool_stmtStart[blk]
+        let pos: int32 = stmtStart + idx
+        if stmtStart < 0 || pos < 0 || pos >= uirCoreBlockStmtsFlatLen():
+            panic "uirCore_types: block stmt flat column out of sync"
+        uirCoreBlockStmtsFlatSet(pos, stmt)
+    if blk < uirCore_blockPool_stmtsSeq.len:
+        var stmtsSeq: UirStmtId[] = uirCore_blockPool_stmtsSeq[blk]
+        if uirCoreStmtSeqSane(stmtsSeq) && idx < stmtsSeq.len:
+            stmtsSeq[idx] = stmt
+            uirCoreWriteStmtSeq2D(&uirCore_blockPool_stmtsSeq, blk, stmtsSeq)
 
 fn uirCoreBlockSetStmts(blk: UirBlockId, stmts: UirStmtId[]) =
     if (!uirCoreBlockIdValid(blk)):
         return
     if blk < uirCore_blockPool_stmtsSeq.len:
         uirCoreWriteStmtSeq2D(&uirCore_blockPool_stmtsSeq, blk, stmts)
-    let start: int32 = uirCore_blockStmtsFlat.len
+    let start: int32 = uirCoreBlockStmtsFlatLen()
     let stmtLen: int32 = stmts.len
     if stmtLen > 0:
         for i in 0..<stmtLen:
-            add(uirCore_blockStmtsFlat, stmts[i])
+            uirCoreBlockStmtsFlatAppend(stmts[i])
     uirCore_blockPool_stmtStart[blk] = start
     uirCore_blockPool_stmtLenFlat[blk] = stmtLen
 
@@ -3401,23 +3565,26 @@ fn uirCoreFuncAddParam(func: UirCoreFunc, param: UirCoreParam) =
 fn uirCoreModuleFuncsLen(module: UirCoreModule): int32 =
     if module == nil:
         return 0
-    let funcs: UirCoreFunc[] = module.funcs
-    if !uirCoreFuncRefSeqSane(funcs):
+    let out: int32 = module.funcs.len
+    if out < 0:
         return 0
-    return funcs.len
+    return out
 
 fn uirCoreModuleTargetOf(module: UirCoreModule): str =
+    if module == nil:
+        return ""
     return module.target
 
 fn uirCoreModuleFuncAt(module: UirCoreModule, idx: int32): UirCoreFunc =
-    if module == nil:
+    if module == nil || idx < 0:
         return nil
     let funcs: UirCoreFunc[] = module.funcs
-    if !uirCoreFuncRefSeqSane(funcs):
+    if idx >= funcs.len:
         return nil
-    if idx < 0 || idx >= funcs.len:
+    let out: UirCoreFunc = funcs[idx]
+    if !uirCoreFuncIdValid(out):
         return nil
-    return funcs[idx]
+    return out
 
 fn uirCoreParamTypeOf(param: UirCoreParam): UirCoreType =
     return param.ty
@@ -3503,8 +3670,7 @@ fn uirCoreModuleGlobalsLen(module: UirCoreModule): int32 =
     return module.globals.len
 
 fn uirCoreModuleGlobalAt(module: UirCoreModule, idx: int32): UirCoreGlobal =
-    let readPtr: UirCoreGlobal* = uirCoreModuleGlobalPtrAt(module, idx)
-    if void*(readPtr) == nil:
+    if module == nil || idx < 0 || idx >= module.globals.len || module.globals.buffer == nil:
         var zero: UirCoreGlobal
         zero.name = ""
         zero.ty = uirCoreTypeVoid()
@@ -3512,58 +3678,32 @@ fn uirCoreModuleGlobalAt(module: UirCoreModule, idx: int32): UirCoreGlobal =
         zero.hasInit = false
         zero.originFile = ""
         return zero
-    return *readPtr
-
-fn uirCoreModuleGlobalPtrAt(module: UirCoreModule, idx: int32): UirCoreGlobal* =
-    if module == nil || idx < 0 || idx >= module.globals.len || module.globals.buffer == nil:
-        return nil
-    let elemBytes: int32 = idx * int32(sizeof UirCoreGlobal)
-    return UirCoreGlobal*(ptr_add(module.globals.buffer, elemBytes))
+    return module.globals[idx]
 
 fn uirCoreModuleGlobalNameFastAt(module: UirCoreModule, idx: int32): str =
     if module == nil || idx < 0 || idx >= module.globalNames.len || module.globalNames.buffer == nil:
         return ""
-    let elemBytes: int32 = idx * int32(sizeof str)
-    let readPtr: str* = str*(ptr_add(module.globalNames.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return ""
-    return *readPtr
+    return module.globalNames[idx]
 
 fn uirCoreModuleGlobalTypeRawFastAt(module: UirCoreModule, idx: int32): int32 =
     if module == nil || idx < 0 || idx >= module.globalTypesRaw.len || module.globalTypesRaw.buffer == nil:
         return 0
-    let elemBytes: int32 = idx * int32(sizeof int32)
-    let readPtr: int32* = int32*(ptr_add(module.globalTypesRaw.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return 0
-    return *readPtr
+    return module.globalTypesRaw[idx]
 
 fn uirCoreModuleGlobalInitFastAt(module: UirCoreModule, idx: int32): int64 =
     if module == nil || idx < 0 || idx >= module.globalInits.len || module.globalInits.buffer == nil:
         return 0
-    let elemBytes: int32 = idx * int32(sizeof int64)
-    let readPtr: int64* = int64*(ptr_add(module.globalInits.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return 0
-    return *readPtr
+    return module.globalInits[idx]
 
 fn uirCoreModuleGlobalHasInitFastAt(module: UirCoreModule, idx: int32): int32 =
     if module == nil || idx < 0 || idx >= module.globalHasInitBits.len || module.globalHasInitBits.buffer == nil:
         return 0
-    let elemBytes: int32 = idx * int32(sizeof int32)
-    let readPtr: int32* = int32*(ptr_add(module.globalHasInitBits.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return 0
-    return *readPtr
+    return module.globalHasInitBits[idx]
 
 fn uirCoreModuleGlobalOriginFastAt(module: UirCoreModule, idx: int32): str =
     if module == nil || idx < 0 || idx >= module.globalOriginFiles.len || module.globalOriginFiles.buffer == nil:
         return ""
-    let elemBytes: int32 = idx * int32(sizeof str)
-    let readPtr: str* = str*(ptr_add(module.globalOriginFiles.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return ""
-    return *readPtr
+    return module.globalOriginFiles[idx]
 
 fn uirCoreSetStr(seqInst: var str[], idx: int32, value: str) =
     if idx < 0 || idx >= seqInst.len:
@@ -3581,31 +3721,27 @@ fn uirCoreSetI64(seqInst: var int64[], idx: int32, value: int64) =
     seqInst[idx] = value
 
 fn uirCoreModuleGlobalNameAt(module: UirCoreModule, idx: int32): str =
-    let readPtr: UirCoreGlobal* = uirCoreModuleGlobalPtrAt(module, idx)
-    if void*(readPtr) == nil:
+    if module == nil || idx < 0 || idx >= module.globals.len || module.globals.buffer == nil:
         return ""
-    let raw: str = readPtr->name
+    let raw: str = module.globals[idx].name
     if !uirCoreStrPtrSane(raw):
         return ""
     return raw
 
 fn uirCoreModuleGlobalTypeAt(module: UirCoreModule, idx: int32): UirCoreType =
-    let readPtr: UirCoreGlobal* = uirCoreModuleGlobalPtrAt(module, idx)
-    if void*(readPtr) == nil:
+    if module == nil || idx < 0 || idx >= module.globals.len || module.globals.buffer == nil:
         return uirCoreTypeVoid()
-    return readPtr->ty
+    return module.globals[idx].ty
 
 fn uirCoreModuleGlobalHasInitAt(module: UirCoreModule, idx: int32): bool =
-    let readPtr: UirCoreGlobal* = uirCoreModuleGlobalPtrAt(module, idx)
-    if void*(readPtr) == nil:
+    if module == nil || idx < 0 || idx >= module.globals.len || module.globals.buffer == nil:
         return false
-    return readPtr->hasInit
+    return module.globals[idx].hasInit
 
 fn uirCoreModuleGlobalInitAt(module: UirCoreModule, idx: int32): int64 =
-    let readPtr: UirCoreGlobal* = uirCoreModuleGlobalPtrAt(module, idx)
-    if void*(readPtr) == nil:
+    if module == nil || idx < 0 || idx >= module.globals.len || module.globals.buffer == nil:
         return int64(0)
-    return readPtr->init
+    return module.globals[idx].init
 
 fn uirCoreModuleCStringsLen(module: UirCoreModule): int32 =
     if module == nil:
@@ -3618,48 +3754,27 @@ fn uirCoreModuleCStringAt(module: UirCoreModule, idx: int32): UirCoreCString =
     zero.value = ""
     if module == nil || idx < 0 || idx >= module.cstrs.len || module.cstrs.buffer == nil:
         return zero
-    let elemBytes: int32 = idx * int32(sizeof UirCoreCString)
-    let readPtr: UirCoreCString* = UirCoreCString*(ptr_add(module.cstrs.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return zero
+    let raw: UirCoreCString = module.cstrs[idx]
     var out: UirCoreCString
-    out.label = readPtr->label
-    out.value = readPtr->value
+    out.label = raw.label
+    out.value = raw.value
     return out
-
-fn uirCoreModuleCStringPtrAt(module: UirCoreModule, idx: int32): UirCoreCString* =
-    if module == nil || idx < 0 || idx >= module.cstrs.len || module.cstrs.buffer == nil:
-        return nil
-    let elemBytes: int32 = idx * int32(sizeof UirCoreCString)
-    return UirCoreCString*(ptr_add(module.cstrs.buffer, elemBytes))
 
 fn uirCoreModuleCStringLabelFastAt(module: UirCoreModule, idx: int32): str =
     if module == nil || idx < 0 || idx >= module.cstrLabels.len || module.cstrLabels.buffer == nil:
         return ""
-    let elemBytes: int32 = idx * int32(sizeof str)
-    let readPtr: str* = str*(ptr_add(module.cstrLabels.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return ""
-    return *readPtr
+    return module.cstrLabels[idx]
 
 fn uirCoreModuleCStringValueFastAt(module: UirCoreModule, idx: int32): str =
     if module == nil || idx < 0 || idx >= module.cstrValues.len || module.cstrValues.buffer == nil:
         return ""
-    let elemBytes: int32 = idx * int32(sizeof str)
-    let readPtr: str* = str*(ptr_add(module.cstrValues.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return ""
-    return *readPtr
+    return module.cstrValues[idx]
 
 
 fn uirCoreModuleCStringLabelAt(module: UirCoreModule, idx: int32): str =
     if module == nil || idx < 0 || idx >= module.cstrs.len || module.cstrs.buffer == nil:
         return ""
-    let elemBytes: int32 = idx * int32(sizeof UirCoreCString)
-    let readPtr: UirCoreCString* = UirCoreCString*(ptr_add(module.cstrs.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return ""
-    let raw: str = readPtr->label
+    let raw: str = module.cstrs[idx].label
     if !uirCoreStrPtrSane(raw):
         return ""
     return raw
@@ -3667,11 +3782,7 @@ fn uirCoreModuleCStringLabelAt(module: UirCoreModule, idx: int32): str =
 fn uirCoreModuleCStringValueAt(module: UirCoreModule, idx: int32): str =
     if module == nil || idx < 0 || idx >= module.cstrs.len || module.cstrs.buffer == nil:
         return ""
-    let elemBytes: int32 = idx * int32(sizeof UirCoreCString)
-    let readPtr: UirCoreCString* = UirCoreCString*(ptr_add(module.cstrs.buffer, elemBytes))
-    if void*(readPtr) == nil:
-        return ""
-    let raw: str = readPtr->value
+    let raw: str = module.cstrs[idx].value
     if !uirCoreStrPtrSane(raw):
         return ""
     return raw
@@ -3791,13 +3902,28 @@ fn uirCoreHexDigit(v: int32): char =
 
 fn uirCoreU64ToHex(v: int64): str =
     let n: int32 = 16
-    let p: void* = alloc(n + 1)
+    let out: str = newStringAlloc(n)
     for i in 0..<n:
         let shift: int32 = (n - 1 - i) * 4
         let nib: int32 = int32((v >> shift) & int64(0xF))
-        rawmemWriteChar(p, i, uirCoreHexDigit(nib))
-    rawmemSet(rawmemPtrAdd(p, n), 0, 1)
-    return str(p)
+        out[i] = uirCoreHexDigit(nib)
+    return out
+
+fn uirCoreCStringLabelFromHash(h: int64): str =
+    let prefix: str = "L_cheng_str_"
+    let hex: str = uirCoreU64ToHex(h)
+    let prefixLen: int32 = len(prefix)
+    let hexLen: int32 = len(hex)
+    if prefixLen <= 0:
+        return hex
+    if hexLen <= 0:
+        return prefix
+    let out: str = newStringAlloc(prefixLen + hexLen)
+    for i in 0..<prefixLen:
+        out[i] = prefix[i]
+    for j in 0..<hexLen:
+        out[prefixLen + j] = hex[j]
+    return out
 
 fn uirCoreFindCStringLabel(module: UirCoreModule, value: str): str =
     if (module == nil):
@@ -3830,7 +3956,7 @@ fn uirCoreAddCString(module: UirCoreModule, value: str): str =
     if len(existing) > 0:
         return existing
     let h: int64 = uirCoreFnv1a64(v)
-    let label: str = "L_cheng_str_" + uirCoreU64ToHex(h)
+    let label: str = uirCoreCStringLabelFromHash(h)
     let newIdx: int32 = uirCoreModuleCStringsLen(module)
     var c: UirCoreCString
     c.label = uirCoreOwnStr(label)

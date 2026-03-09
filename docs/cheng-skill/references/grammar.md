@@ -5,7 +5,9 @@
 
 ## 关键结论
 - 顶层例程仅使用 `fn` 与 `iterator`。
+- `if/elif/else`、`while`、`for` 等 `:` 后允许单行 suite，例如 `if x < 0: return 0`。
 - 逻辑运算使用 `&&` `||` `!`；按位异或使用 `^`。
+- 条件表达式支持三目 `cond ? thenExpr : elseExpr`，并按右结合解析。
 - 单参数调用允许 `f x` 或 `f(x)`；禁止 `f (x)`。
 - 类型转换仅允许 `TypeExpr(expr)`。
 - 导入仅允许归一化模块路径（`<pkg>/<path>`、`std/<name>`）。

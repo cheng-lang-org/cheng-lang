@@ -6,7 +6,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 # Cheng 编程（稳定版）
 
 ## 维护元数据
-- `last_verified_date`: `2026-03-02`
+- `last_verified_date`: `2026-03-07`
 - `last_verified_commit`: `workspace-local`
 - `upstream_spec`: `docs/cheng-formal-spec.md`
 
@@ -26,6 +26,7 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 ## 关键语法约束（稳定）
 - 逻辑运算：`&&` / `||` / `!`；按位异或：`^`。
 - 条件分支语法固定为 `if/elif/else`；`else if` 为非法写法（需改为 `elif`）。
+- `suite ::= statement` 为稳定语义，因此 `if x < 0: return 0` 这类单行 suite 是合法写法。
 - 条件表达式支持三目：`cond ? thenExpr : elseExpr`（右结合）。注意与 postfix `expr?`（Result/Option 解包）是不同语义。
 - 整除/取模：`/` 与 `%`；`div/mod` 已移除。
 - 字符串拼接：`+`；`concat` 已移除。
@@ -71,7 +72,9 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
   - system linker 优先级变量：`BACKEND_SYSTEM_LINKER_PRIORITY`（默认 `mold,lld,default`）。
   - Dev 热更默认：`BACKEND_HOTPATCH_MODE=trampoline`、`BACKEND_HOSTRUNNER_POOL_MB=512`、`BACKEND_HOSTRUNNER_PAGE_POLICY=rw_rx`、`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program`、`BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
   - Dev 编译默认：`BACKEND_INCREMENTAL=1` + `CHENGC_DEV_MULTI_DEFAULT=1`；`BACKEND_MULTI_MODULE_CACHE` 默认 `0`，stable driver 当前固定禁用 module-cache load 路径（不作为生产配置面）；可选 `CHENGC_DAEMON=1` 使用 `chengc_daemon` 常驻 worker。
-  - Dev fast 自举默认注入：`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`；strict/release 默认 `full/ws/0`。
+  - Dev 入口（含 fast/strict 自举）固定注入：`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`、`BACKEND_LINKERLESS_INMEM=1`、`BACKEND_FAST_FALLBACK_ALLOW=0`。
+  - Release 入口（`release-compile`）固定注入：`BACKEND_STAGE1_PARSE_MODE=full`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`、`BACKEND_FAST_FALLBACK_ALLOW=0`、`BACKEND_LINKER=system`。
+  - 并发公开契约：`BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 只保留给内部诊断、perf 对照和低内存 bring-up。
   - `emit=obj` 为 internal gate 兼容入口，需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`；公共入口 `chengc` 固定拒绝 obj 输出。
 - 生产闭环入口 `$TOOLING backend_prod_closure` 仅接受 `ABI=v2_noptr`。
 - 验证入口迁移：`verify_*` 已并入 `cheng_tooling` 原生子命令；统一执行口径为 `$TOOLING <verify_id>`。
@@ -87,6 +90,8 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - `backend.import_cycle_predeclare` 已切为纯 runtime 门禁：负例必须 compile fail 且包含 `Import cycle detected: ... -> ...` 链路，不再接受 source-contract fallback。
 - `build_backend_driver` 自举编译会固定注入必要的 `BACKEND_*`/`STAGE1_*` 参数，并保持 seed stage0 口径一致。
 - `$TOOLING build-backend-driver` 固定只使用 `artifacts/backend_driver/cheng` 作为 stage0，不支持旧候选链回退。
+- `build-backend-driver` 默认启用 stage0 capability preflight；当前 capability 源列表由 `tooling_stage0CapabilitySourceList()` 定义，覆盖 `src/std/cmdline.cheng`、`src/stage1/{ast,token,lexer,parser,frontend_lib,diagnostics,semantics,ownership,monomorphize,type_syntax_lowering,c_profile_lowering}.cheng`、`src/backend/uir/uir_internal/{uir_core_types,uir_core_builder,uir_core_builder_ffi_out_ptr}.cheng`、`src/backend/uir/uir_codegen.cheng`、`src/backend/machine/machine_internal/machine_core_types.cheng`、`src/backend/machine/select_internal/{aarch64_select,x86_64_select}.cheng`、`src/backend/obj/{macho_writer,linker_shared_core,macho_linker,macho_linker_x86_64,elf_linker,elf_linker_riscv64,coff_linker}.cheng` 与 `src/backend/tooling/backend_driver.cheng`。
+- `.cap.env` 侧车来自正在运行的 `artifacts/tooling_cmd/cheng_tooling` binary；若 binary 陈旧，侧车仍可能输出旧的 `source_count=8` 能力签名。遇到这种情况先重建 canonical tooling/driver，再判断是否真是 capability 漂移。
 - stage0 quarantine 默认在自动清理后做短重检（`TOOLING_STAGE0_QUARANTINE_BLOCK_RECHECKS=2`），用于减少“首轮已清理但仍阻断”的抖动。
 - Host-only 严格默认：`BUILD_DRIVER_STRICT_NATIVE=1`；`build-backend-driver` 回退链路（`shim/reused_stage0/legacy relink/delegate wrapper`）已硬关闭。
 - `verify_backend_noalias_opt` / `verify_backend_egraph_cost` / `verify_backend_dod_opt_regression` 的 runtime probe 默认固定 `UIR_PROFILE=0` + `BACKEND_PROFILE=0`，避免 in-memory self-link 下 `driver_profileStep -> fwrite` 崩溃；这些 gate 的功能验收以报告字段和 surface marker 为准。
@@ -127,6 +132,8 @@ description: Cheng 语言语法与语义、所有权/ORC、并发与模块导入
 - 注意：`noalias/egraph/dod` 三个 runtime probe gate 出于稳定性会强制关闭 profile 输出；若要分析这些链路热点，请改用独立编译命令复现，不要直接依赖 gate 日志。
 - `sample` 若 call graph 大量 `???`，优先用 `BACKEND_LINKER_SYMTAB=all`（或 `--linker-symtab=all`）重建目标二进制再采样。
 - 采样编译器自身热点时，先用 `--linker-symtab=all` 重建一个带符号表的编译器副本（否则闭环默认产物可能只有 `_main` 符号导致 `???`）。
+- 若 `build-backend-driver --require-rebuild --debug-rebuild` 对 `tests/cheng/backend/fixtures/return_add.cheng` 只报 `Unexpected token`，先对比 seed `artifacts/backend_selfhost_self_obj/cheng.stage2` 的同 fixture smoke 与 `chengcache/backend_driver_build_tmp` 中保留的 attempt。当前已知现象是新 attempt 的 token 文本在 lexer 阶段全部变空（典型日志 `src_len=0 dst_len=0`），不是 import failure。
+- 自举词法排障建议环境：`BACKEND_DEBUG_TOKEN_COPY=1`、`STAGE1_TRACE_TOKENS=1`、`BACKEND_DEBUG_PARSE_DIAG=1`。
 
 ### 破坏性语法升级（Checklist）
 

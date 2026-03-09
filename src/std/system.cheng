@@ -8,6 +8,10 @@ type
     cstring = char*
     # Language-level string keeps value semantics; ABI bridge still uses cstring.
     str = char*
+    ChengSeqHeader =
+        len: int32
+        cap: int32
+        buffer: void*
 
 type
     CatchableError =
@@ -46,17 +50,25 @@ fn echo(msg: cstring) =
     c_puts(msg)
 @importc("exit")
 fn exit(code: int32)
+@importc("cheng_dump_backtrace_if_enabled")
+fn cheng_dump_backtrace_if_enabled()
 fn panic(msg: str) =
     c_puts(cstring(msg))
+    cheng_dump_backtrace_if_enabled()
     exit(1)
 fn panicErr(err: result.ErrorInfo) =
     c_puts(cstring(result.ErrorFormat(err)))
+    cheng_dump_backtrace_if_enabled()
     exit(1)
 fn assert(cond: bool, msg: str) =
     if ! cond:
         panic(msg)
 @importc("cheng_malloc")
 fn malloc(size: int32): void*
+@importc("driver_c_new_string")
+fn driver_c_new_string(size: int32): str
+@importc("driver_c_new_string_copy_n")
+fn driver_c_new_string_copy_n(raw: void*, count: int32): str
 @importc("cheng_free")
 fn free(p: void*)
 @importc("cheng_realloc")
@@ -124,10 +136,20 @@ fn c_strlen(s: str): int32 =
 fn cheng_memcpy(dest: void*, src: void*, n: int64): void*
 @importc("ptr_add")
 fn ptr_add(p: void*, offset: int32): void*
+@importc("cheng_ptr_size")
+fn cheng_ptr_size_runtime_bridge(): int32
 fn cheng_ptr_size(): int32 =
-    return sizeof(void*)
+    return cheng_ptr_size_runtime_bridge()
 fn ptrSize(): int32 =
     return cheng_ptr_size()
+fn elemSize[T](): int32 =
+    return int32(sizeof(T))
+
+# Stage0/source-built linker closure shim for elemSize[ptr]().
+# Some builds still lower this specialization to a direct symbol name.
+@exportc("elemSize_ptr")
+fn elemSize_ptr(): int32 =
+    return int32(sizeof(ptr))
 fn cheng_ptr_to_u64(p: void*): uint64 =
     return uint64(p)
 fn ptrToU64(p: void*): uint64 =
@@ -146,40 +168,32 @@ fn seqElemPtr(buffer: void*, len: int32, idx: int32, elemSize: int32): void* =
     return ptr_add(buffer, offset32)
 
 fn `[]`(seqInst: T[], i: int32): T =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, sizeof T)
+    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[T]())
     var pt: T* = T*(p)
     return *pt
 fn `[]=`(seqInst: var T[], i: int32, val: T) =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, sizeof T)
+    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[T]())
     var pt: T* = T*(p)
     *pt = val
 fn `[]`(seqInst: T[]*, i: int32): T =
     if seqInst == nil:
         panic "cheng: nil seq pointer"
-    var p: void* = seqElemPtr(seqInst->buffer, seqInst->len, i, sizeof T)
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(seqInst)
+    var p: void* = seqElemPtr(seqHdr->buffer, seqHdr->len, i, elemSize[T]())
     var pt: T* = T*(p)
     return *pt
 fn `[]=`(seqInst: T[]*, i: int32, val: T) =
     if seqInst == nil:
         panic "cheng: nil seq pointer"
-    var p: void* = seqElemPtr(seqInst->buffer, seqInst->len, i, sizeof T)
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(seqInst)
+    var p: void* = seqElemPtr(seqHdr->buffer, seqHdr->len, i, elemSize[T]())
     var pt: T* = T*(p)
     *pt = val
 fn `[]`(seqInst: ptr[], i: int32): ptr =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, sizeof ptr)
+    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[ptr]())
     return ptr(load_ptr(p))
 fn `[]=`(seqInst: var ptr[], i: int32, val: ptr) =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, sizeof ptr)
-    store_ptr(p, void*(val))
-fn `[]`(seqInst: ptr[]*, i: int32): ptr =
-    if seqInst == nil:
-        panic "cheng: nil seq pointer"
-    var p: void* = seqElemPtr(seqInst->buffer, seqInst->len, i, sizeof ptr)
-    return ptr(load_ptr(p))
-fn `[]=`(seqInst: ptr[]*, i: int32, val: ptr) =
-    if seqInst == nil:
-        panic "cheng: nil seq pointer"
-    var p: void* = seqElemPtr(seqInst->buffer, seqInst->len, i, sizeof ptr)
+    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[ptr]())
     store_ptr(p, void*(val))
 @importc("store_ptr")
 fn store_ptr(p: void*, val: void*)
@@ -209,8 +223,6 @@ fn zeroMem(dest: void*, size: int) =
 fn cmpMem(a, b: void*, size: int64): int32
 @importc("cheng_strcmp")
 fn cheng_strcmp(a, b: cstring): int32
-fn c_strcmp(a, b: str): int32 =
-    return cheng_strcmp(cstring(a), cstring(b))
 fn c_strcmp(a, b: cstring): int32 =
     return cheng_strcmp(a, b)
 @importc("cheng_bits_to_f32")
@@ -349,16 +361,10 @@ fn dec(x: var T, delta: T) =
 fn dec(x: var T) =
     dec(x, T(1))
 # Minimal str concat (for `+` builtin semantics; avoid extra modules).
+@importc("__cheng_str_concat")
+fn system_runtime_str_concat(a: str, b: str): str
 fn __cheng_concat_str(a: str, b: str): str =
-    let l1: int32 = c_strlen a
-    let l2: int32 = c_strlen b
-    let total: int32 = l1 + l2
-    let p: void* = alloc(total + 1)
-    let p2: void* = ptr_add(p, l1)
-    copyMem(p, a, l1)
-    copyMem(p2, b, l2)
-    setMem(ptr_add(p, total), 0, 1)
-    return str(p)
+    return system_runtime_str_concat(a, b)
 fn __cheng_set_range_mask(start: int32, stop: int32, exclusive: bool): uint64 =
     var s: int32 = start
     var e: int32 = stop
@@ -383,14 +389,29 @@ fn setHas(s: set[T], value: T): bool =
 fn newString(len: int32): str =
     if len <= 0:
         return ""
-    let size: int32 = len + 1
-    let p: void* = alloc size
-    setMem(p, 0, size)
-    return str(p)
+    let out: str = newStringAlloc(len)
+    if void*(out) == nil:
+        return ""
+    return out
+
+fn newStringAlloc(len: int32): str =
+    var out: str
+    if len <= 0:
+        return out
+    out = driver_c_new_string(len)
+    return out
+
+fn newStringCopy(raw: void*, count: int32): str =
+    if raw == nil || count <= 0:
+        return ""
+    let out: str = driver_c_new_string_copy_n(raw, count)
+    if void*(out) == nil:
+        return ""
+    return out
 fn newStringOfCap(len: int32): str =
     return newString len
 fn new(x: var ref T) =
-    let size64: int64 = sizeof T
+    let size64: int64 = int64(elemSize[T]())
     let size: int32 = int32(size64)
     let p: void* = alloc size
     if p != nil:

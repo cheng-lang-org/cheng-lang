@@ -57,6 +57,7 @@ fn uirStrContains(hay: str, needle: str): bool =
 fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
     let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    uirCanonicalizeModule(module)
     if dbgCstr:
         let preOptCstrs: int32 = uirModuleCStringsLen(module)
         echo("[codegen.cstr] pre-opt module_cstrs=" + intToStr(preOptCstrs))
@@ -72,6 +73,14 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
         return Err[MachineModule]("uir_codegen: unsupported target arch: " + target)
     let res: Result[MachineModule] = machineSelectAarch64(module)
     if ! IsOk[MachineModule](res):
+        if dbgCodegen || os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+            let err: ErrorInfo = ErrorInfoOf[MachineModule](res)
+            echo("[codegen] select.err")
+            echo(intToStr(ErrorCodeOf(err)))
+            let msg: str = ErrorMessage(err)
+            echo(intToStr(len(msg)))
+            if len(msg) > 0:
+                echo(msg)
         return res
     if dbgCodegen:
         echo("[codegen] select.end")
@@ -164,7 +173,17 @@ fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): R
                  " len=" + intToStr(vLen2) + " b0=" + intToStr(v02) + " b1=" + intToStr(v12))
     if resolvedWriter == "macho":
         if isAarch64:
-            return machoWriteAarch64RelocatableObj(machine)
+            let machoRes: Result[uint8[]] = machoWriteAarch64RelocatableObj(machine)
+            if !IsOk[uint8[]](machoRes):
+                let err: ErrorInfo = ErrorInfoOf[uint8[]](machoRes)
+                echo("[codegen] writer.ret.err")
+                echo("macho")
+                echo(intToStr(ErrorCodeOf(err)))
+                let msg: str = ErrorMessage(err)
+                echo(intToStr(len(msg)))
+                if len(msg) > 0:
+                    echo(msg)
+            return machoRes
         return Err[uint8[]]("uir_codegen: macho writer unsupported target arch: " + target)
     if resolvedWriter == "elf":
         if isAarch64:
@@ -195,5 +214,9 @@ fn uirEmitObjFromModuleOrPanic(module: UirModule, optLevel: int32, target: str, 
         module, optLevel, target, objWriter, validateModule,
         uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
     if !IsOk[uint8[]](res):
-        panic ErrorFormat(ErrorInfoOf[uint8[]](res))
+        let msg: str = ErrorFormat(ErrorInfoOf[uint8[]](res))
+        if os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1" || os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+            echo("[codegen] writer.error")
+            echo(msg)
+        panic msg
     return res.value

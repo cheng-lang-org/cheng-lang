@@ -3,6 +3,18 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+typedef struct ChengStrBridge {
+    const char* ptr;
+    int32_t len;
+    int32_t store_id;
+    int32_t flags;
+} ChengStrBridge;
+
+enum {
+    CHENG_STR_BRIDGE_FLAG_NONE = 0,
+    CHENG_STR_BRIDGE_FLAG_OWNED = 1,
+};
+
 void* cheng_malloc(int32_t size);
 void cheng_free(void* p);
 void* cheng_realloc(void* p, int32_t size);
@@ -21,10 +33,13 @@ void* ptr_add(void* p, int32_t offset);
 void* rawmemAsVoid(void* p);
 uint64_t cheng_ptr_to_u64(void* p);
 int32_t cheng_ptr_size(void);
+int32_t elemSize_ptr(void);
 void __cheng_setCmdLine(int32_t argc, const char** argv);
 int32_t __cheng_rt_paramCount(void);
 const char* __cheng_rt_paramStr(int32_t i);
 char* __cheng_rt_paramStrCopy(int32_t i);
+ChengStrBridge __cheng_rt_paramStrCopyBridge(int32_t i);
+void __cheng_rt_paramStrCopyBridgeInto(int32_t i, ChengStrBridge* out);
 int32_t cmdCountFromRuntime(void);
 int32_t __cmdCountFromRuntime(void);
 int32_t paramCount(void);
@@ -118,6 +133,9 @@ uint64_t cheng_ffi_handle_new_i32(int32_t value);
 int32_t cheng_ffi_handle_get_i32(uint64_t handle, int32_t* out_value);
 int32_t cheng_ffi_handle_add_i32(uint64_t handle, int32_t delta, int32_t* out_value);
 int32_t cheng_ffi_handle_release_i32(uint64_t handle);
+int32_t cheng_crash_trace_enabled(void);
+void cheng_crash_trace_set_phase(const char* phase);
+void cheng_crash_trace_mark(const char* tag, int32_t a, int32_t b, int32_t c, int32_t d);
 
 void* cheng_mem_scope_push(void);
 void cheng_mem_scope_pop(void);
@@ -132,6 +150,29 @@ int32_t cheng_mem_refcount_atomic(void* p);
 int32_t cheng_atomic_cas_i32(int32_t* p, int32_t expect, int32_t desired);
 void cheng_atomic_store_i32(int32_t* p, int32_t val);
 int32_t cheng_atomic_load_i32(int32_t* p);
+
+ChengStrBridge driver_c_str_from_utf8_copy_bridge(const char* raw, int32_t n);
+ChengStrBridge driver_c_str_clone_bridge(const char* s);
+ChengStrBridge driver_c_str_slice_bridge(const char* s, int32_t start, int32_t count);
+int32_t driver_c_str_eq_bridge(ChengStrBridge a, ChengStrBridge b);
+int32_t driver_c_str_has_prefix_bridge(ChengStrBridge s, ChengStrBridge prefix);
+int32_t driver_c_str_contains_char_bridge(ChengStrBridge s, int32_t value);
+int32_t driver_c_str_contains_str_bridge(ChengStrBridge s, ChengStrBridge sub);
+int32_t driver_c_str_get_at_bridge(ChengStrBridge s, int32_t idx);
+void driver_c_str_set_at_bridge(ChengStrBridge* s, int32_t idx, int32_t value);
+ChengStrBridge driver_c_getenv_copy_bridge(const char* name);
+void driver_c_getenv_copy_bridge_into(const char* name, ChengStrBridge* out);
+ChengStrBridge driver_c_cli_input_copy_bridge(void);
+void driver_c_cli_input_copy_bridge_into(ChengStrBridge* out);
+ChengStrBridge driver_c_cli_output_copy_bridge(void);
+void driver_c_cli_output_copy_bridge_into(ChengStrBridge* out);
+ChengStrBridge driver_c_cli_target_copy_bridge(void);
+void driver_c_cli_target_copy_bridge_into(ChengStrBridge* out);
+ChengStrBridge driver_c_cli_linker_copy_bridge(void);
+void driver_c_cli_linker_copy_bridge_into(ChengStrBridge* out);
+ChengStrBridge driver_c_read_file_all_bridge(const char* path);
+void driver_c_read_file_all_bridge_into(const char* path, ChengStrBridge* out);
+void* driver_c_build_module_stage1_direct(const char* input_path, const char* target);
 
 // Cheng std/os + std/times + std/monotimes minimal support (cross-platform)
 int32_t cheng_file_exists(const char* path);

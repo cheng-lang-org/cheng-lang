@@ -104,8 +104,9 @@ fn iselTargetIsDarwin(target: str): bool =
     return isel_strContains(target, "apple") || isel_strContains(target, "darwin") || isel_strContains(target, "ios")
 
 fn iselCStringLoweringEnabled(): bool =
-    # C string lowering is now mandatory in production/native paths.
-    return true
+    # Keep x86_64 consistent with AArch64: selector skips eager cstring lowering
+    # and relies on the canonical post-regalloc backfill in uir_codegen.
+    return false
 
 fn iselTypeKeyIsVarargs(typeKey: str): bool =
     if len(typeKey) == 0:
@@ -216,14 +217,43 @@ fn iselGlobalNameAtSafe(module: UirModule, idx: int32): str =
 fn iselExprCalleeSafe(expr: UirExpr): str =
     if iselExprInvalid(expr):
         return ""
-    let raw: str = uirExprCalleeOf(expr)
-    if !iselStrPtrMaybeValid(raw):
-        if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_META", ""), "1"):
-            let rawPtr: int64 = int64(rawmem_support.rawmemAsVoid(raw))
-            echo("[isel.meta] invalid_callee_ptr expr=" + intToStr(expr) +
-                 " str=" + uirU64ToHex(rawPtr))
-        return ""
-    return raw
+    return uirExprCalleeOf(expr)
+
+fn iselExprSummary(expr: UirExpr): str =
+    if iselExprInvalid(expr):
+        return "nil"
+    let kind: int32 = int32(uirExprKindOf(expr))
+    var out: str = "kind=" + intToStr(kind)
+    if uirExprKindOf(expr) == meCall:
+        out = out + " callee=" + iselExprCalleeSafe(expr) +
+              " argc=" + intToStr(uirExprArgsLen(expr))
+    elif uirExprKindOf(expr) == meGlobalAddr:
+        out = out + " global=" + uirExprGlobalNameOf(expr)
+    return out
+
+fn iselReportEmptySymbol(kind: str, uirFunc: UirFunc, expr: UirExpr, rawName: str) =
+    echo("[isel.err.empty_symbol]")
+    echo(kind)
+    echo(iselFuncBestName(uirFunc))
+    echo(rawName)
+    if iselExprInvalid(expr):
+        echo("nil")
+        return
+    echo(intToStr(int32(uirExprKindOf(expr))))
+    if uirExprKindOf(expr) == meCall:
+        echo(iselExprCalleeSafe(expr))
+        echo(intToStr(uirExprArgsLen(expr)))
+    elif uirExprKindOf(expr) == meGlobalAddr:
+        echo(uirExprGlobalNameOf(expr))
+
+fn iselRequireNamedSymbol(kind: str, uirFunc: UirFunc, expr: UirExpr, rawName: str, symName: str): Result[str] =
+    if len(symName) > 0:
+        return Ok[str](symName)
+    iselReportEmptySymbol(kind, uirFunc, expr, rawName)
+    let fnName: str = iselFuncBestName(uirFunc)
+    let exprInfo: str = iselExprSummary(expr)
+    return Err[str]("isel: empty " + kind + " symbol fn=" + fnName +
+                    " raw=" + rawName + " expr=" + exprInfo)
 
 fn iselCondFromCmp(op: UirCmpOp, isUnsigned: bool): MachineCond =
     case op
@@ -737,7 +767,8 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
                 retType: UirLowerType, dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
                 baseReg: MachineReg, labelState: LabelState): Result[int32] =
     if iselExprInvalid(expr):
-        return Err[int32]("isel: nil expr")
+        iselAddInst(func, machineMovImm(iselRegWithType(dst, uirTypeI64()), 0))
+        return Ok[int32](0)
     let exprType: UirLowerType = iselExprType(module, uirFunc, expr, retType)
     let dstT: MachineReg = iselRegWithType(dst, exprType)
     let tmpT: MachineReg = iselRegWithType(tmp, exprType)
@@ -759,7 +790,11 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
             calleeLinkName = iselFuncLinkNameSafe(callee)
         if void*(callee) != nil && len(calleeLinkName) > 0:
             callName = calleeLinkName
-        let callSym: str = iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), callName)
+        let callSym0: str = iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), callName)
+        let callSymRes: Result[str] = iselRequireNamedSymbol("call", uirFunc, expr, callName, callSym0)
+        if ! IsOk[str](callSymRes):
+            return ErrInfo[int32](ErrorInfoOf[str](callSymRes))
+        let callSym: str = Value[str](callSymRes)
         if iselIsCallIndirectBuiltin(callSym):
             return iselEmitCallIndirectBuiltin(func, module, uirFunc, expr, callee, retType,
                                                dstT, tmpT, scratchT, baseReg, labelState)
@@ -913,7 +948,12 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
         return Ok[int32](0)
     if uirExprKindOf(expr) == meGlobalAddr:
         let addrReg: MachineReg = iselRegWithType(dst, uirTypeI64())
-        let label: str = iselGlobalSym(module, uirExprGlobalNameOf(expr))
+        let rawGlobalName: str = uirExprGlobalNameOf(expr)
+        let label0: str = iselGlobalSym(module, rawGlobalName)
+        let labelRes: Result[str] = iselRequireNamedSymbol("global", uirFunc, expr, rawGlobalName, label0)
+        if ! IsOk[str](labelRes):
+            return ErrInfo[int32](ErrorInfoOf[str](labelRes))
+        let label: str = Value[str](labelRes)
         iselAddInst(func, machineAdrp(addrReg, label))
         return Ok[int32](0)
     if uirExprKindOf(expr) == meBin:
@@ -1303,7 +1343,8 @@ fn x86_64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
 
 fn x86_64LowerModule(module: UirModule): Result[MachineModule] =
     let out: MachineModule = machineCoreNewModule()
-    out.target = uirModuleTargetOf(module)
+    let targetOwned: str = strings.__cheng_str_clone(uirModuleTargetOf(module))
+    out.target = targetOwned
     machineCoreResetSeqFunc(&out.funcs)
     machineCoreResetSeqCString(&out.cstrs)
     machineCoreResetSeqGlobal(&out.globals)
@@ -1337,13 +1378,17 @@ fn x86_64LowerModule(module: UirModule): Result[MachineModule] =
                 let c1: int32 = (cLen > 1) ? int32(cValue[1]) : -1
                 echo("[isel.cstr.x64] i=" + intToStr(ci) + " label=" + cLabel +
                      " len=" + intToStr(cLen) + " b0=" + intToStr(c0) + " b1=" + intToStr(c1))
-            if len(cLabel) > 0:
-                machineAddCString(out, cLabel, cValue)
+            if len(cLabel) <= 0:
+                return Err[MachineModule]("isel: empty cstring label idx=" + intToStr(ci) +
+                                          " value_len=" + intToStr(len(cValue)))
+            machineAddCString(out, cLabel, cValue)
     for i in 0..<uirModuleFuncsLen(module):
         let f: UirFunc = uirModuleFuncAt(module, i)
         if void*(f) == nil:
             continue
         if void*(f) != nil && uirFuncIsExtern(f):
+            continue
+        if uirFuncBlocksLen(f) <= 0:
             continue
         let fRes: Result[MachineFunc] = x86_64LowerFunc(module, f)
         if ! IsOk[MachineFunc](fRes):

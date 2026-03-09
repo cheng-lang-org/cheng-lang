@@ -2,7 +2,7 @@
 # Stage1 lexer (ported from stage0/lexer).
 import std/strings
 import std/seqs
-import std/rawmem_support
+import std/os
 
 fn lex_memRelease(p: void*) =
     memRelease(p)
@@ -12,6 +12,27 @@ fn lex_memScopeEscape(p: void*) =
     memScopeEscape(p)
 import stage1/token
 import stage1/diagnostics
+
+fn lexDebugTokenBytesEnabled(): bool =
+    return os.getEnvDefault("BACKEND_DEBUG_TOKEN_BYTES", "") == "1"
+
+fn lexDebugTokenBytes(tag: str, source: str, start: int32, count: int32) =
+    if !lexDebugTokenBytesEnabled():
+        return
+    let f: os.File = os.get_stderr()
+    os.write(f, "[lexbytes] ")
+    os.write(f, tag)
+    let text: str = sliceBytes(source, start, count)
+    defer:
+        if len(text) > 0:
+            lex_memRelease(text)
+    if len(text) > 0:
+        os.write(f, " nonempty='")
+        let n: int32 = if len(text) > 24: 24 else: len(text)
+        os.write(f, sliceBytes(text, 0, n))
+        os.writeLine(f, "'")
+    else:
+        os.writeLine(f, " empty")
 
 type
     LexResult =
@@ -38,8 +59,8 @@ fn lexAppendStr(seqInst: var str[], val: str) =
     let idx: int32 = seqInst.len
     let needLen: int32 = idx + 1
     if seqInst.buffer == nil || seqInst.cap < needLen:
-        cheng__seqGrowToRaw(&seqInst.buffer, &seqInst.cap, needLen, int32(sizeof str))
-    seqInst.len = needLen
+        seqs.reserve(seqInst, needLen)
+    seqs.setLen(seqInst, needLen)
     seqInst[idx] = val
 
 fn lexAppendI32(seqInst: var int32[], val: int32) =
@@ -50,64 +71,137 @@ fn lexAppendI32(seqInst: var int32[], val: int32) =
     seqInst.len = needLen
     seqInst[idx] = val
 
-fn lexAppendToken(seqInst: var Token[], val: Token) =
+fn lexAppendTokenClone(seqInst: var Token[], val: Token*) =
     let idx: int32 = seqInst.len
-    let needLen: int32 = idx + 1
-    if seqInst.buffer == nil || seqInst.cap < needLen:
-        cheng__seqGrowToRaw(&seqInst.buffer, &seqInst.cap, needLen, int32(sizeof Token))
-    seqInst.len = needLen
-    let off64: int64 = int64(idx) * sizeof Token
-    let dst: Token* = Token*(rawmemPtrAdd(seqInst.buffer, int32(off64)))
+    tokenSeqAppendClone(&seqInst, val)
+    let dst: Token* = tokenSeqPtrRef(&seqInst, idx)
     if dst == nil:
         return
-    dst->kind = val.kind
-    dst->lexeme = val.lexeme
-    dst->strPrefix = val.strPrefix
-    dst->line = val.line
-    dst->col = val.col
+    if os.getEnvDefault("BACKEND_DEBUG_TOKEN_COPY", "") == "1":
+        let f: os.File = os.get_stderr()
+        let srcLex: str = tokenLexeme(val)
+        let dstLex: str = tokenLexeme(dst)
+        os.write(f, "[lexcopy] kind=")
+        os.write(f, kindName(dst->kind))
+        os.write(f, " src_len=")
+        os.write(f, intToStr(len(srcLex)))
+        os.write(f, " src_id=")
+        os.write(f, intToStr(tokenLexemeId(val)))
+        os.write(f, " dst_len=")
+        os.write(f, intToStr(len(dstLex)))
+        os.write(f, " dst_id=")
+        os.write(f, intToStr(tokenLexemeId(dst)))
+        os.write(f, " src='")
+        os.write(f, srcLex)
+        os.write(f, "' dst='")
+        os.write(f, dstLex)
+        os.writeLine(f, "'")
+
+fn lexTokenPtr(tokens: Token[], i: int32): Token* =
+    return tokenSeqPtr(tokens, i)
+
+fn lexInitScanResult(scanRes: ScanResult*, pos: int32) =
+    if scanRes == nil:
+        return
+    tokenZero(&scanRes->tok)
+    scanRes->nextPos = pos
+
+fn lexStoreScanResult(dst: ScanResult*, src: ScanResult*) =
+    if dst == nil || src == nil:
+        return
+    tokenZero(&dst->tok)
+    tokenClone(&dst->tok, &src->tok)
+    dst->nextPos = src->nextPos
+
+fn lexTokenInit(tok: Token*, kind: TokenKind, lexeme: str, line: int32, col: int32, strPrefix: char) =
+    tokenInit(tok, kind, lexeme, line, col, strPrefix)
+
+fn lexTokenInit(tok: Token*, kind: TokenKind, lexeme: str, line: int32, col: int32) =
+    lexTokenInit(tok, kind, lexeme, line, col, chr 0)
+
+fn lexTokenInitCommon(tok: Token*, kind: TokenKind, commonSlot: int32, line: int32, col: int32, strPrefix: char) =
+    if tok == nil:
+        return
+    tokenZero(tok)
+    tok->kind = kind
+    tokenSetLexemeId(tok, tokenCommonId(commonSlot))
+    tok->strPrefix = strPrefix
+    tok->line = line
+    tok->col = col
+
+fn lexTokenInitCommon(tok: Token*, kind: TokenKind, commonSlot: int32, line: int32, col: int32) =
+    lexTokenInitCommon(tok, kind, commonSlot, line, col, chr 0)
+
+fn lexTokenInitEmpty(tok: Token*, kind: TokenKind, line: int32, col: int32, strPrefix: char) =
+    if tok == nil:
+        return
+    tokenZero(tok)
+    tok->kind = kind
+    tokenSetLexemeId(tok, 0)
+    tok->strPrefix = strPrefix
+    tok->line = line
+    tok->col = col
+
+fn lexTokenInitEmpty(tok: Token*, kind: TokenKind, line: int32, col: int32) =
+    lexTokenInitEmpty(tok, kind, line, col, chr 0)
+
+fn lexTokenInitRange(tok: Token*, kind: TokenKind, source: str, start: int32, count: int32, line: int32, col: int32, strPrefix: char) =
+    if tok == nil:
+        return
+    if count <= 0:
+        tokenInit(tok, kind, "", line, col, strPrefix)
+        return
+    tokenInitRange(tok, kind, source, start, count, line, col, strPrefix)
+
+fn lexTokenInitRange(tok: Token*, kind: TokenKind, source: str, start: int32, count: int32, line: int32, col: int32) =
+    lexTokenInitRange(tok, kind, source, start, count, line, col, chr 0)
+
+fn lexTokenSetRange(tok: Token*, source: str, start: int32, count: int32) =
+    if tok == nil:
+        return
+    if count <= 0:
+        tokenSetLexemeId(tok, 0)
+        return
+    tokenSetLexemeRange(tok, source, start, count)
 
 fn lexAppendNewToken(seqInst: var Token[], kind: TokenKind, lexeme: str, line: int32, col: int32, strPrefix: char) =
     var tok: Token
-    tokenInit(&tok, kind, lexeme, line, col, strPrefix)
-    lexAppendToken(seqInst, tok)
+    tokenZero(&tok)
+    lexTokenInit(&tok, kind, lexeme, line, col, strPrefix)
+    lexAppendTokenClone(seqInst, &tok)
+    tokenReleaseLexeme(&tok)
 
 fn lexAppendNewToken(seqInst: var Token[], kind: TokenKind, lexeme: str, line: int32, col: int32) =
     var tok: Token
-    tokenInit(&tok, kind, lexeme, line, col)
-    lexAppendToken(seqInst, tok)
+    tokenZero(&tok)
+    lexTokenInit(&tok, kind, lexeme, line, col)
+    lexAppendTokenClone(seqInst, &tok)
+    tokenReleaseLexeme(&tok)
+
+fn lexAppendNewTokenEmpty(seqInst: var Token[], kind: TokenKind, line: int32, col: int32) =
+    var tok: Token
+    tokenZero(&tok)
+    lexTokenInitEmpty(&tok, kind, line, col)
+    lexAppendTokenClone(seqInst, &tok)
 
 var
-    lexStringPool: ptr[]
+    lexStringPool: str[]
     lexStringPoolReady: bool
 
 fn initLexStringPool() =
     if lexStringPoolReady:
         return
-    freeSeq[ptr](lexStringPool)
-    lexStringPool.buffer = nil
-    lexStringPool.len = 0
-    lexStringPool.cap = 0
+    freeSeq[str](lexStringPool)
     lexStringPoolReady = true
 
-fn trackLexString(p: void*) =
-    if astRefIsNil(p):
-        return
-    initLexStringPool()
-    lex_memScopeEscape p
-    let pooled: ptr = ptr(p)
-    lexAppendPtr(lexStringPool, pooled)
-
 fn trackLexStringStr(s: str) =
-    trackLexString(ptr(s))
+    initLexStringPool()
+    seqs.add(lexStringPool, s)
 
 fn releaseLexStrings() =
     if ! lexStringPoolReady:
         return
-    for i in 0..<lexStringPool.len:
-        let p: void* = lexStringPool[i]
-        if astRefNonNil(p):
-            lex_memRelease p
-    freeSeq[ptr](lexStringPool)
+    freeSeq[str](lexStringPool)
     lexStringPoolReady = false
 
 type
@@ -116,12 +210,7 @@ type
         nextPos: int32
 
 fn addLexDiag(diags: var Diagnostic[], filename: str, line: int32, col: int32, msg: str) =
-    var d: Diagnostic
-    d.severity = svError
-    d.filename = filename
-    d.line = line
-    d.col = col
-    d.message = msg
+    let d: Diagnostic = diagMake(svError, filename, line, col, msg)
     lexAppendDiagnostic(diags, d)
 
 fn isDigit(c: char): bool =
@@ -175,15 +264,7 @@ fn sliceRangeInto(s: str, start: int32, stop: int32, out: str* = nil): bool =
             *out = ""
         return true
     let count: int32 = b - a + 1
-    let p: void* = alloc(count + 1)
-    if p == nil:
-        if out != nil:
-            *out = ""
-        return true
-    let outText: str = str(p)
-    for i in 0..<count:
-        outText[i] = s[a + i]
-    outText[count] = char(0)
+    let outText: str = strings.sliceBytes(s, a, count)
     if out != nil:
         *out = outText
     return true
@@ -645,6 +726,7 @@ fn lineStartsContinueKeyword(text: str, lineStartAbs: int32, lineLen: int32): bo
 
 fn lexNumberLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos: int32, line: int32, filename: str, diags: var Diagnostic[], out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, startPos)
     var i: int32 = startPos
     var lexeme: str = ""
     if i + 1 < lineLen:
@@ -664,13 +746,13 @@ fn lexNumberLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos
                         continue
                     break
                 scanRes.tok.kind = tkNumber
-                tokenSetLexemeRange(&scanRes.tok, content, lineStartAbs + startPos, i - startPos)
+                lexTokenSetRange(&scanRes.tok, content, lineStartAbs + startPos, i - startPos)
                 scanRes.tok.strPrefix = char(0)
                 scanRes.tok.line = line
                 scanRes.tok.col = startPos + 1
                 scanRes.nextPos = i
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
     var hasDot: bool = false
     for __for_guard_i in 0..<lineLen:
@@ -693,17 +775,18 @@ fn lexNumberLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos
             continue
         break
     scanRes.tok.kind = tkNumber
-    tokenSetLexemeRange(&scanRes.tok, content, lineStartAbs + startPos, i - startPos)
+    lexTokenSetRange(&scanRes.tok, content, lineStartAbs + startPos, i - startPos)
     scanRes.tok.strPrefix = char(0)
     scanRes.tok.line = line
     scanRes.tok.col = startPos + 1
     scanRes.nextPos = i
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn lexIdentLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos: int32, line: int32, out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, startPos)
     var i: int32 = startPos
     for __for_guard_i in 0..<lineLen:
         if !(i < lineLen):
@@ -718,17 +801,115 @@ fn lexIdentLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos:
     if isKeywordRange(content, lineStartAbs + startPos, count):
         kind = tkKeyword
     scanRes.tok.kind = kind
-    tokenSetLexemeRange(&scanRes.tok, content, lineStartAbs + startPos, count)
+    lexTokenSetRange(&scanRes.tok, content, lineStartAbs + startPos, count)
     scanRes.tok.strPrefix = char(0)
     scanRes.tok.line = line
     scanRes.tok.col = startPos + 1
     scanRes.nextPos = i
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
+    return true
+
+fn lexNumberLineTokInto(content: str, lineStartAbs: int32, lineLen: int32, startPos: int32, line: int32, filename: str, diags: var Diagnostic[], tokOut: Token* = nil, nextPosOut: int32* = nil): bool =
+    var i: int32 = startPos
+    var tok: Token
+    tokenZero(&tok)
+    filename
+    diags
+    if i + 1 < lineLen:
+        if content[lineStartAbs + i] == '0':
+            let c1: char = content[lineStartAbs + i + 1]
+            var isRadix: bool = false
+            if c1 == 'x' || c1 == 'X' || c1 == 'b' || c1 == 'B' || c1 == 'o' || c1 == 'O':
+                isRadix = true
+            if isRadix:
+                i = i + 2
+                for __for_guard_i in 0..<lineLen:
+                    if !(i < lineLen):
+                        break
+                    let c: char = content[lineStartAbs + i]
+                    if isAlphaNum c || c == '_':
+                        i = i + 1
+                        continue
+                    break
+                tok.kind = tkNumber
+                if os.getEnvDefault("BACKEND_DEBUG_TOKEN_BYTES", "") == "1":
+                    lexDebugTokenBytes("num.range", content, lineStartAbs + startPos, i - startPos)
+                lexTokenSetRange(&tok, content, lineStartAbs + startPos, i - startPos)
+                tok.strPrefix = char(0)
+                tok.line = line
+                tok.col = startPos + 1
+                if tokOut != nil:
+                    tokenClone(tokOut, &tok)
+                if nextPosOut != nil:
+                    *nextPosOut = i
+                tokenReleaseLexeme(&tok)
+                return true
+    var hasDot: bool = false
+    for __for_guard_i in 0..<lineLen:
+        if !(i < lineLen):
+            break
+        let c: char = content[lineStartAbs + i]
+        if isDigit c || c == '_':
+            i = i + 1
+            continue
+        if c == '.':
+            if hasDot:
+                break
+            var isRange: bool = false
+            if i + 1 < lineLen && content[lineStartAbs + i + 1] == '.':
+                isRange = true
+            if isRange:
+                break
+            hasDot = true
+            i = i + 1
+            continue
+        break
+    tok.kind = tkNumber
+    if os.getEnvDefault("BACKEND_DEBUG_TOKEN_BYTES", "") == "1":
+        lexDebugTokenBytes("num.range", content, lineStartAbs + startPos, i - startPos)
+    lexTokenSetRange(&tok, content, lineStartAbs + startPos, i - startPos)
+    tok.strPrefix = char(0)
+    tok.line = line
+    tok.col = startPos + 1
+    if tokOut != nil:
+        tokenClone(tokOut, &tok)
+    if nextPosOut != nil:
+        *nextPosOut = i
+    tokenReleaseLexeme(&tok)
+    return true
+
+fn lexIdentLineTokInto(content: str, lineStartAbs: int32, lineLen: int32, startPos: int32, line: int32, tokOut: Token* = nil, nextPosOut: int32* = nil): bool =
+    var i: int32 = startPos
+    var tok: Token
+    tokenZero(&tok)
+    for __for_guard_i in 0..<lineLen:
+        if !(i < lineLen):
+            break
+        let c: char = content[lineStartAbs + i]
+        if isAlphaNum c || c == '_':
+            i = i + 1
+            continue
+        break
+    let count: int32 = i - startPos
+    var kind: TokenKind = tkIdent
+    if isKeywordRange(content, lineStartAbs + startPos, count):
+        kind = tkKeyword
+    tok.kind = kind
+    lexTokenSetRange(&tok, content, lineStartAbs + startPos, count)
+    tok.strPrefix = char(0)
+    tok.line = line
+    tok.col = startPos + 1
+    if tokOut != nil:
+        tokenClone(tokOut, &tok)
+    if nextPosOut != nil:
+        *nextPosOut = i
+    tokenReleaseLexeme(&tok)
     return true
 
 fn lexCharLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos: int32, line: int32, filename: str, diags: var Diagnostic[], out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, startPos)
     var i: int32 = startPos + 1
     for __for_guard_i in 0..<lineLen:
         if !(i < lineLen):
@@ -740,39 +921,38 @@ fn lexCharLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos: 
             i = i + 2
             continue
         i = i + 1
-    var lexeme: str = ""
-    if i > startPos + 1:
-        lexeme = sliceRange(content, lineStartAbs + startPos + 1, lineStartAbs + i - 1)
+    let lexemeStart: int32 = lineStartAbs + startPos + 1
+    let lexemeCount: int32 = i - (startPos + 1)
     if i >= lineLen:
         addLexDiag(diags, filename, line, startPos + 1, "Unterminated character literal")
-        tokenInit(&scanRes.tok, tkChar, lexeme, line, startPos + 1)
+        lexTokenInitRange(&scanRes.tok, tkChar, content, lexemeStart, lexemeCount, line, startPos + 1)
         scanRes.nextPos = i
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     var okLen: bool = false
-    if len(lexeme) == 1:
+    if lexemeCount == 1:
         okLen = true
-    elif len(lexeme) == 2:
-        if lexeme[0] == chr 92:
+    elif lexemeCount == 2:
+        if content[lexemeStart] == chr 92:
             okLen = true
-    elif len(lexeme) == 4:
-        if lexeme[0] == chr 92 && lexeme[1] == 'x':
-            let a: char = lexeme[2]
-            let b: char = lexeme[3]
+    elif lexemeCount == 4:
+        if content[lexemeStart] == chr 92 && content[lexemeStart + 1] == 'x':
+            let a: char = content[lexemeStart + 2]
+            let b: char = content[lexemeStart + 3]
             if isHexDigit(a) && isHexDigit(b):
                 okLen = true
     if !okLen:
         addLexDiag(diags, filename, line, startPos + 1, "Character literal must contain exactly one character")
-    trackLexStringStr(lexeme)
-    tokenInit(&scanRes.tok, tkChar, lexeme, line, startPos + 1)
+    lexTokenInitRange(&scanRes.tok, tkChar, content, lexemeStart, lexemeCount, line, startPos + 1)
     scanRes.nextPos = i + 1
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn lexStringLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos: int32, line: int32, filename: str, diags: var Diagnostic[], out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, startPos)
     var i: int32 = startPos
     var prefix: char = chr(0)
     if i + 1 < lineLen:
@@ -795,19 +975,19 @@ fn lexStringLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos
             var lexeme: str = ""
             if i > contentStart:
                 lexeme = sliceRange(content, lineStartAbs + contentStart, lineStartAbs + i - 1)
+            let lexemeStart: int32 = lineStartAbs + contentStart
+            let lexemeCount: int32 = i - contentStart
             if i + 2 >= lineLen:
                 addLexDiag(diags, filename, line, startPos + 1, "Unterminated string literal")
-                trackLexStringStr(lexeme)
-                tokenInit(&scanRes.tok, tkString, lexeme, line, startPos + 1, prefix)
+                lexTokenInitRange(&scanRes.tok, tkString, content, lexemeStart, lexemeCount, line, startPos + 1, prefix)
                 scanRes.nextPos = lineLen
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
-            trackLexStringStr(lexeme)
-            tokenInit(&scanRes.tok, tkString, lexeme, line, startPos + 1, prefix)
+            lexTokenInitRange(&scanRes.tok, tkString, content, lexemeStart, lexemeCount, line, startPos + 1, prefix)
             scanRes.nextPos = i + 3
             if out != nil:
-                *out = scanRes
+                lexStoreScanResult(out, &scanRes)
             return true
     if content[lineStartAbs + i] == '"':
         i = i + 1
@@ -825,282 +1005,285 @@ fn lexStringLineInto(content: str, lineStartAbs: int32, lineLen: int32, startPos
     var lexeme: str = ""
     if i > contentStart2:
         lexeme = sliceRange(content, lineStartAbs + contentStart2, lineStartAbs + i - 1)
+    let lexemeStart2: int32 = lineStartAbs + contentStart2
+    let lexemeCount2: int32 = i - contentStart2
     if i >= lineLen:
         addLexDiag(diags, filename, line, startPos + 1, "Unterminated string literal")
-        trackLexStringStr(lexeme)
-        tokenInit(&scanRes.tok, tkString, lexeme, line, startPos + 1, prefix)
+        lexTokenInitRange(&scanRes.tok, tkString, content, lexemeStart2, lexemeCount2, line, startPos + 1, prefix)
         scanRes.nextPos = i
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
-    trackLexStringStr(lexeme)
-    tokenInit(&scanRes.tok, tkString, lexeme, line, startPos + 1, prefix)
+    lexTokenInitRange(&scanRes.tok, tkString, content, lexemeStart2, lexemeCount2, line, startPos + 1, prefix)
     scanRes.nextPos = i + 1
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn matchSymbolLineInto(content: str, lineStartAbs: int32, lineLen: int32, pos: int32, out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, pos)
     var i: int32 = pos
     if i + 2 < lineLen:
         if content[lineStartAbs + i] == '.' && content[lineStartAbs + i + 1] == '.' && content[lineStartAbs + i + 2] == '<':
-            tokenInit(&scanRes.tok, tkSymbol, "..<", 0, 0)
+            lexTokenInitCommon(&scanRes.tok, tkSymbol, 39, 0, 0)
             scanRes.nextPos = i + 3
             if out != nil:
-                *out = scanRes
+                lexStoreScanResult(out, &scanRes)
             return true
     if i + 1 < lineLen:
         let c0: char = content[lineStartAbs + i]
         let c1: char = content[lineStartAbs + i + 1]
         if c0 == '=':
             if c1 == '>':
-                tokenInit(&scanRes.tok, tkSymbol, "=>", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 26, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, "==", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 27, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '-':
             if c1 == '>':
-                tokenInit(&scanRes.tok, tkSymbol, "->", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 28, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '-':
-                tokenInit(&scanRes.tok, tkSymbol, "--", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 29, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '!':
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, "!=", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 30, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '+':
             if c1 == '+':
-                tokenInit(&scanRes.tok, tkSymbol, "++", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 31, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '&':
             if c1 == '&':
-                tokenInit(&scanRes.tok, tkSymbol, "&&", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 32, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '|':
             if c1 == '|':
-                tokenInit(&scanRes.tok, tkSymbol, "||", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 33, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '<':
             if c1 == '<':
-                tokenInit(&scanRes.tok, tkSymbol, "<<", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 34, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, "<=", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 35, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '>':
             if c1 == '>':
-                tokenInit(&scanRes.tok, tkSymbol, ">>", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 36, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, ">=", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 37, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '.':
             if c1 == '.':
-                tokenInit(&scanRes.tok, tkSymbol, "..", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 38, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
     let c: char = content[lineStartAbs + i]
     if c == '(':
-        tokenInit(&scanRes.tok, tkSymbol, "(", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 0, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ')':
-        tokenInit(&scanRes.tok, tkSymbol, ")", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 1, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '[':
-        tokenInit(&scanRes.tok, tkSymbol, "[", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 2, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ']':
-        tokenInit(&scanRes.tok, tkSymbol, "]", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 3, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '{':
-        tokenInit(&scanRes.tok, tkSymbol, "{", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 4, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '}':
-        tokenInit(&scanRes.tok, tkSymbol, "}", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 5, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ',':
-        tokenInit(&scanRes.tok, tkSymbol, ",", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 6, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ':':
-        tokenInit(&scanRes.tok, tkSymbol, ":", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 7, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ';':
-        tokenInit(&scanRes.tok, tkSymbol, ";", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 8, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '.':
-        tokenInit(&scanRes.tok, tkSymbol, ".", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 9, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '=':
-        tokenInit(&scanRes.tok, tkSymbol, "=", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 10, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '+':
-        tokenInit(&scanRes.tok, tkSymbol, "+", 0, 0)
+        if os.getEnvDefault("BACKEND_DEBUG_TOKEN_BYTES", "") == "1":
+            lexDebugTokenBytes("sym.char", content, lineStartAbs + i, 1)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 11, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '-':
-        tokenInit(&scanRes.tok, tkSymbol, "-", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 12, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '*':
-        tokenInit(&scanRes.tok, tkSymbol, "*", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 13, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '/':
-        tokenInit(&scanRes.tok, tkSymbol, "/", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 14, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '%':
-        tokenInit(&scanRes.tok, tkSymbol, "%", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 15, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '<':
-        tokenInit(&scanRes.tok, tkSymbol, "<", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 16, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '>':
-        tokenInit(&scanRes.tok, tkSymbol, ">", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 17, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '&':
-        tokenInit(&scanRes.tok, tkSymbol, "&", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 18, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '|':
-        tokenInit(&scanRes.tok, tkSymbol, "|", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 19, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '^':
-        tokenInit(&scanRes.tok, tkSymbol, "^", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 20, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '~':
-        tokenInit(&scanRes.tok, tkSymbol, "~", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 21, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '!':
-        tokenInit(&scanRes.tok, tkSymbol, "!", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 22, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '$':
-        tokenInit(&scanRes.tok, tkSymbol, "$", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 23, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '?':
-        tokenInit(&scanRes.tok, tkSymbol, "?", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 24, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '@':
-        tokenInit(&scanRes.tok, tkSymbol, "@", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 25, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
-    tokenInit(&scanRes.tok, tkSymbol, "", 0, 0)
+    lexTokenInitEmpty(&scanRes.tok, tkSymbol, 0, 0)
     scanRes.nextPos = i
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn emitIndentTokens(tokens: var Token[], stack: var int32[], newIndent: int32, line: int32, filename: str, diags: var Diagnostic[]) =
@@ -1109,24 +1292,24 @@ fn emitIndentTokens(tokens: var Token[], stack: var int32[], newIndent: int32, l
         current = stack[stack.len - 1]
     if newIndent > current:
         lexAppendI32(stack, newIndent)
-        lexAppendNewToken(tokens, tkIndent, "", line, 1)
+        lexAppendNewTokenEmpty(tokens, tkIndent, line, 1)
     elif newIndent < current:
         while stack.len > 0:
             let top: int32 = stack[stack.len - 1]
             if top <= newIndent:
                 break
             stack.len = stack.len - 1
-            lexAppendNewToken(tokens, tkDedent, "", line, 1)
+            lexAppendNewTokenEmpty(tokens, tkDedent, line, 1)
         if stack.len == 0:
             addLexDiag(diags, filename, line, 1, "Indentation level mismatch")
             lexAppendI32(stack, newIndent)
-            lexAppendNewToken(tokens, tkIndent, "", line, 1)
+            lexAppendNewTokenEmpty(tokens, tkIndent, line, 1)
         else:
             let top2: int32 = stack[stack.len - 1]
             if top2 != newIndent:
                 addLexDiag(diags, filename, line, 1, "Indentation level mismatch")
                 lexAppendI32(stack, newIndent)
-                lexAppendNewToken(tokens, tkIndent, "", line, 1)
+                lexAppendNewTokenEmpty(tokens, tkIndent, line, 1)
 
 fn isContinuationToken(tok: Token): bool =
     if tok.kind == tkSymbol:
@@ -1212,6 +1395,7 @@ fn isDefKeyword(tok: Token): bool =
 
 fn lexNumberInto(content: str, start: int32, line: int32, filename: str, diags: var Diagnostic[], out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, start)
     var i: int32 = start
     let n: int32 = len content
     var lexeme: str = ""
@@ -1245,10 +1429,10 @@ fn lexNumberInto(content: str, start: int32, line: int32, filename: str, diags: 
                         continue
                     break
                 let count: int32 = i - start
-                tokenInitRange(&scanRes.tok, tkNumber, content, start, count, line, start + 1)
+                lexTokenInitRange(&scanRes.tok, tkNumber, content, start, count, line, start + 1)
                 scanRes.nextPos = i
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
     var hasDot: bool = false
     for __for_guard_i in 0..<n:
@@ -1275,10 +1459,10 @@ fn lexNumberInto(content: str, start: int32, line: int32, filename: str, diags: 
             continue
         break
     let count2: int32 = i - start
-    tokenInitRange(&scanRes.tok, tkNumber, content, start, count2, line, start + 1)
+    lexTokenInitRange(&scanRes.tok, tkNumber, content, start, count2, line, start + 1)
     scanRes.nextPos = i
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn lexNumber(content: str, start: int32, line: int32, filename: str, diags: var Diagnostic[]): ScanResult =
@@ -1288,6 +1472,7 @@ fn lexNumber(content: str, start: int32, line: int32, filename: str, diags: var 
 
 fn lexIdentInto(content: str, start: int32, line: int32, out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, start)
     var i: int32 = start
     let n: int32 = len content
     for __for_guard_i in 0..<n:
@@ -1305,10 +1490,10 @@ fn lexIdentInto(content: str, start: int32, line: int32, out: ScanResult* = nil)
     var kind: TokenKind = tkIdent
     if isKeywordRange(content, start, count):
         kind = tkKeyword
-    tokenInitRange(&scanRes.tok, kind, content, start, count, line, start + 1)
+    lexTokenInitRange(&scanRes.tok, kind, content, start, count, line, start + 1)
     scanRes.nextPos = i
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn lexIdent(content: str, start: int32, line: int32): ScanResult =
@@ -1318,6 +1503,7 @@ fn lexIdent(content: str, start: int32, line: int32): ScanResult =
 
 fn lexCharInto(content: str, start: int32, line: int32, filename: str, diags: var Diagnostic[], out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, start)
     let n: int32 = len content
     var i: int32 = start + 1
     for __for_guard_i in 0..<n:
@@ -1331,37 +1517,34 @@ fn lexCharInto(content: str, start: int32, line: int32, filename: str, diags: va
                 i = i + 2
                 continue
         i = i + 1
-    var lexeme: str = ""
-    if i > start + 1:
-        lexeme = sliceRange(content, start + 1, i - 1)
+    let lexemeCount: int32 = i - (start + 1)
     if i >= n:
         addLexDiag(diags, filename, line, start + 1, "Unterminated character literal")
-        tokenInit(&scanRes.tok, tkChar, lexeme, line, start + 1)
+        lexTokenInitRange(&scanRes.tok, tkChar, content, start + 1, lexemeCount, line, start + 1)
         scanRes.nextPos = i
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     var okLen: bool = false
-    if len lexeme == 1:
+    if lexemeCount == 1:
         okLen = true
-    elif len lexeme == 2:
-        if lexeme[0] == chr 92:
+    elif lexemeCount == 2:
+        if content[start + 1] == chr 92:
             okLen = true
-    elif len lexeme == 4:
-        if lexeme[0] == chr 92:
-            if lexeme[1] == 'x':
-                let a: char = lexeme[2]
-                let b: char = lexeme[3]
+    elif lexemeCount == 4:
+        if content[start + 1] == chr 92:
+            if content[start + 2] == 'x':
+                let a: char = content[start + 3]
+                let b: char = content[start + 4]
                 if isHexDigit a:
                     if isHexDigit b:
                         okLen = true
     if ! okLen:
         addLexDiag(diags, filename, line, start + 1, "Character literal must contain exactly one character")
-    trackLexStringStr(lexeme)
-    tokenInit(&scanRes.tok, tkChar, lexeme, line, start + 1)
+    lexTokenInitRange(&scanRes.tok, tkChar, content, start + 1, lexemeCount, line, start + 1)
     scanRes.nextPos = i + 1
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn lexChar(content: str, start: int32, line: int32, filename: str, diags: var Diagnostic[]): ScanResult =
@@ -1371,6 +1554,7 @@ fn lexChar(content: str, start: int32, line: int32, filename: str, diags: var Di
 
 fn lexStringInto(content: str, start: int32, line: int32, filename: str, diags: var Diagnostic[], out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, start)
     let n: int32 = len content
     var i: int32 = start
     var prefix: char = chr 0
@@ -1401,19 +1585,18 @@ fn lexStringInto(content: str, start: int32, line: int32, filename: str, diags: 
                     var lexeme: str = ""
                     if i > contentStart:
                         lexeme = sliceRange(content, contentStart, i - 1)
+                    let lexemeCount: int32 = i - contentStart
                     if i + 2 >= n:
                         addLexDiag(diags, filename, line, start + 1, "Unterminated string literal")
-                        trackLexStringStr(lexeme)
-                        tokenInit(&scanRes.tok, tkString, lexeme, line, start + 1, prefix)
+                        lexTokenInitRange(&scanRes.tok, tkString, content, contentStart, lexemeCount, line, start + 1, prefix)
                         scanRes.nextPos = n
                         if out != nil:
-                            *out = scanRes
+                            lexStoreScanResult(out, &scanRes)
                         return true
-                    trackLexStringStr(lexeme)
-                    tokenInit(&scanRes.tok, tkString, lexeme, line, start + 1, prefix)
+                    lexTokenInitRange(&scanRes.tok, tkString, content, contentStart, lexemeCount, line, start + 1, prefix)
                     scanRes.nextPos = i + 3
                     if out != nil:
-                        *out = scanRes
+                        lexStoreScanResult(out, &scanRes)
                     return true
     if content[i] == '"':
         i = i + 1
@@ -1432,19 +1615,18 @@ fn lexStringInto(content: str, start: int32, line: int32, filename: str, diags: 
     var lexeme: str = ""
     if i > contentStart2:
         lexeme = sliceRange(content, contentStart2, i - 1)
+    let lexemeCount2: int32 = i - contentStart2
     if i >= n:
         addLexDiag(diags, filename, line, start + 1, "Unterminated string literal")
-        trackLexStringStr(lexeme)
-        tokenInit(&scanRes.tok, tkString, lexeme, line, start + 1, prefix)
+        lexTokenInitRange(&scanRes.tok, tkString, content, contentStart2, lexemeCount2, line, start + 1, prefix)
         scanRes.nextPos = i
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
-    trackLexStringStr(lexeme)
-    tokenInit(&scanRes.tok, tkString, lexeme, line, start + 1, prefix)
+    lexTokenInitRange(&scanRes.tok, tkString, content, contentStart2, lexemeCount2, line, start + 1, prefix)
     scanRes.nextPos = i + 1
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn lexString(content: str, start: int32, line: int32, filename: str, diags: var Diagnostic[]): ScanResult =
@@ -1454,268 +1636,269 @@ fn lexString(content: str, start: int32, line: int32, filename: str, diags: var 
 
 fn matchSymbolInto(lineStr: str, pos: int32, out: ScanResult* = nil): bool =
     var scanRes: ScanResult
+    lexInitScanResult(&scanRes, pos)
     var i: int32 = pos
     let lineLen: int32 = len lineStr
     if i + 2 < lineLen:
         if lineStr[i] == '.':
             if lineStr[i + 1] == '.':
                 if lineStr[i + 2] == '<':
-                    tokenInit(&scanRes.tok, tkSymbol, "..<", 0, 0)
+                    lexTokenInitCommon(&scanRes.tok, tkSymbol, 39, 0, 0)
                     scanRes.nextPos = i + 3
                     if out != nil:
-                        *out = scanRes
+                        lexStoreScanResult(out, &scanRes)
                     return true
     if i + 1 < lineLen:
         let c0: char = lineStr[i]
         let c1: char = lineStr[i + 1]
         if c0 == '=':
             if c1 == '>':
-                tokenInit(&scanRes.tok, tkSymbol, "=>", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 26, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, "==", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 27, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '-':
             if c1 == '>':
-                tokenInit(&scanRes.tok, tkSymbol, "->", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 28, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '-':
-                tokenInit(&scanRes.tok, tkSymbol, "--", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 29, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '!':
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, "!=", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 30, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '+':
             if c1 == '+':
-                tokenInit(&scanRes.tok, tkSymbol, "++", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 31, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '&':
             if c1 == '&':
-                tokenInit(&scanRes.tok, tkSymbol, "&&", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 32, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '|':
             if c1 == '|':
-                tokenInit(&scanRes.tok, tkSymbol, "||", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 33, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '<':
             if c1 == '<':
-                tokenInit(&scanRes.tok, tkSymbol, "<<", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 34, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, "<=", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 35, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '>':
             if c1 == '>':
-                tokenInit(&scanRes.tok, tkSymbol, ">>", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 36, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
             if c1 == '=':
-                tokenInit(&scanRes.tok, tkSymbol, ">=", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 37, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
         if c0 == '.':
             if c1 == '.':
-                tokenInit(&scanRes.tok, tkSymbol, "..", 0, 0)
+                lexTokenInitCommon(&scanRes.tok, tkSymbol, 38, 0, 0)
                 scanRes.nextPos = i + 2
                 if out != nil:
-                    *out = scanRes
+                    lexStoreScanResult(out, &scanRes)
                 return true
     let c: char = lineStr[i]
     if c == '(':
-        tokenInit(&scanRes.tok, tkSymbol, "(", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 0, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ')':
-        tokenInit(&scanRes.tok, tkSymbol, ")", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 1, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '[':
-        tokenInit(&scanRes.tok, tkSymbol, "[", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 2, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ']':
-        tokenInit(&scanRes.tok, tkSymbol, "]", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 3, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '{':
-        tokenInit(&scanRes.tok, tkSymbol, "{", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 4, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '}':
-        tokenInit(&scanRes.tok, tkSymbol, "}", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 5, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ',':
-        tokenInit(&scanRes.tok, tkSymbol, ",", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 6, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ':':
-        tokenInit(&scanRes.tok, tkSymbol, ":", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 7, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == ';':
-        tokenInit(&scanRes.tok, tkSymbol, ";", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 8, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '.':
-        tokenInit(&scanRes.tok, tkSymbol, ".", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 9, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '=':
-        tokenInit(&scanRes.tok, tkSymbol, "=", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 10, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '+':
-        tokenInit(&scanRes.tok, tkSymbol, "+", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 11, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '-':
-        tokenInit(&scanRes.tok, tkSymbol, "-", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 12, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '*':
-        tokenInit(&scanRes.tok, tkSymbol, "*", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 13, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '/':
-        tokenInit(&scanRes.tok, tkSymbol, "/", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 14, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '%':
-        tokenInit(&scanRes.tok, tkSymbol, "%", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 15, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '<':
-        tokenInit(&scanRes.tok, tkSymbol, "<", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 16, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '>':
-        tokenInit(&scanRes.tok, tkSymbol, ">", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 17, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '&':
-        tokenInit(&scanRes.tok, tkSymbol, "&", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 18, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '|':
-        tokenInit(&scanRes.tok, tkSymbol, "|", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 19, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '^':
-        tokenInit(&scanRes.tok, tkSymbol, "^", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 20, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '~':
-        tokenInit(&scanRes.tok, tkSymbol, "~", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 21, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '!':
-        tokenInit(&scanRes.tok, tkSymbol, "!", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 22, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '$':
-        tokenInit(&scanRes.tok, tkSymbol, "$", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 23, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '?':
-        tokenInit(&scanRes.tok, tkSymbol, "?", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 24, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
     if c == '@':
-        tokenInit(&scanRes.tok, tkSymbol, "@", 0, 0)
+        lexTokenInitCommon(&scanRes.tok, tkSymbol, 25, 0, 0)
         scanRes.nextPos = i + 1
         if out != nil:
-            *out = scanRes
+            lexStoreScanResult(out, &scanRes)
         return true
-    tokenInit(&scanRes.tok, tkSymbol, "", 0, 0)
+    lexTokenInitEmpty(&scanRes.tok, tkSymbol, 0, 0)
     scanRes.nextPos = i
     if out != nil:
-        *out = scanRes
+        lexStoreScanResult(out, &scanRes)
     return true
 
 fn matchSymbol(lineStr: str, pos: int32): ScanResult =
@@ -1724,7 +1907,10 @@ fn matchSymbol(lineStr: str, pos: int32): ScanResult =
     return scanRes
 
 fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, diagsOut: Diagnostic[]* = nil): bool =
-    tokenResetTextPool()
+    tokenTextPoolEnsure()
+    let contentLen: int32 = len(content)
+    let tokenReserveHint: int32 = contentLen > 0 ? (contentLen + 16) : 32
+    tokenTextPoolReserve(contentLen + 32, tokenReserveHint)
     var tokens: Token[] = []
     var diags: Diagnostic[] = []
     let dbgLexState: bool = os.getEnvDefault("BACKEND_DEBUG_LEX_STATE", "") == "1"
@@ -1798,7 +1984,7 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
         if exprIndentActive && spaceCount <= exprIndentBase && ! lineStartsContinueKeyword(content, lineStartAbs, lineLen):
             while exprIndentStack.len > 1:
                 exprIndentStack.len = exprIndentStack.len - 1
-                lexAppendNewToken(tokens, tkDedent, "", lineNum, 1)
+                lexAppendNewTokenEmpty(tokens, tkDedent, lineNum, 1)
             exprIndentActive = false
             exprIndentBase = 0
             exprIndentStack.len = 1
@@ -1850,9 +2036,9 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
         var lineStartsCase: bool = false
         var lineTokenCount: int32 = 0
         var lineFirstTok: Token
-        tokenInit(&lineFirstTok, tkEof, "", lineNum, 0)
+        lexTokenInitEmpty(&lineFirstTok, tkEof, lineNum, 0)
         var lastTok: Token
-        tokenInit(&lastTok, tkEof, "", lineNum, 0)
+        lexTokenInitEmpty(&lastTok, tkEof, lineNum, 0)
         let __for_guard_start_pos_lx1 = pos
         for __for_guard_pos_lx1 in __for_guard_start_pos_lx1..<lineLen:
             if ! (pos < lineLen):
@@ -1880,7 +2066,7 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
                 sawStringStart = true
                 var res: ScanResult
                 let _ok: bool = lexStringLineInto(content, lineStartAbs, lineLen, pos, lineNum, filename, diags, &res)
-                lexAppendToken(tokens, res.tok)
+                lexAppendTokenClone(tokens, &res.tok)
                 if lineTokenCount == 0:
                     lineFirstTok = res.tok
                 lineTokenCount = lineTokenCount + 1
@@ -1901,48 +2087,52 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
                 isIdentStart = true
             if isIdentStart:
                 sawIdentStart = true
-                var res: ScanResult
-                let _ok: bool = lexIdentLineInto(content, lineStartAbs, lineLen, pos, lineNum, &res)
-                lexAppendToken(tokens, res.tok)
+                var tok: Token
+                tokenZero(&tok)
+                var nextPos: int32 = pos
+                let _ok: bool = lexIdentLineTokInto(content, lineStartAbs, lineLen, pos, lineNum, &tok, &nextPos)
+                lexAppendTokenClone(tokens, &tok)
                 if lineTokenCount == 0:
-                    lineFirstTok = res.tok
+                    lineFirstTok = tok
                 lineTokenCount = lineTokenCount + 1
-                pos = res.nextPos
+                pos = nextPos
                 if ! lineHasTokens:
-                    if res.tok.kind == tkKeyword:
-                        if isBlockStartKeyword tokenLexeme(res.tok):
+                    if tok.kind == tkKeyword:
+                        if isBlockStartKeyword tokenLexeme(tok):
                             lineStartsBlock = true
-                        if isBlockContinueKeyword tokenLexeme(res.tok):
+                        if isBlockContinueKeyword tokenLexeme(tok):
                             lineStartsContinuation = true
-                        if (tokenLexeme(res.tok) ==  "case"):
+                        if (tokenLexeme(tok) ==  "case"):
                             lineStartsCase = true
-                if isDefKeyword res.tok:
+                if isDefKeyword tok:
                     lineHasDef = true
-                lastTok = res.tok
+                lastTok = tok
                 lineHasTokens = true
                 continue
             if isDigit ch:
                 sawDigitStart = true
-                var res: ScanResult
-                let _ok: bool = lexNumberLineInto(content, lineStartAbs, lineLen, pos, lineNum, filename, diags, &res)
-                lexAppendToken(tokens, res.tok)
+                var tok: Token
+                tokenZero(&tok)
+                var nextPos: int32 = pos
+                let _ok: bool = lexNumberLineTokInto(content, lineStartAbs, lineLen, pos, lineNum, filename, diags, &tok, &nextPos)
+                lexAppendTokenClone(tokens, &tok)
                 if lineTokenCount == 0:
-                    lineFirstTok = res.tok
+                    lineFirstTok = tok
                 lineTokenCount = lineTokenCount + 1
-                pos = res.nextPos
+                pos = nextPos
                 if ! lineHasTokens:
-                    if res.tok.kind == tkKeyword:
-                        if isBlockStartKeyword tokenLexeme(res.tok):
+                    if tok.kind == tkKeyword:
+                        if isBlockStartKeyword tokenLexeme(tok):
                             lineStartsBlock = true
-                        if isBlockContinueKeyword tokenLexeme(res.tok):
+                        if isBlockContinueKeyword tokenLexeme(tok):
                             lineStartsContinuation = true
-                lastTok = res.tok
+                lastTok = tok
                 lineHasTokens = true
                 continue
             if ch == chr 39:
                 var res: ScanResult
                 let _ok: bool = lexCharLineInto(content, lineStartAbs, lineLen, pos, lineNum, filename, diags, &res)
-                lexAppendToken(tokens, res.tok)
+                lexAppendTokenClone(tokens, &res.tok)
                 if lineTokenCount == 0:
                     lineFirstTok = res.tok
                 lineTokenCount = lineTokenCount + 1
@@ -1958,7 +2148,6 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
                 continue
             if ch == '`':
                 var i: int32 = pos + 1
-                var lexeme: str = ""
                 let __for_guard_start_i_1 = i
                 for __for_guard_i_1 in __for_guard_start_i_1..<lineLen:
                     if ! (i < lineLen):
@@ -1968,13 +2157,11 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
                     i = i + 1
                 if i < lineLen:
                     let count: int32 = i - (pos + 1)
-                    if count > 0:
-                        lexeme = lexOwnedRangeCopy(content, lineStartAbs + pos + 1, count)
                     i = i + 1
-                    trackLexStringStr(lexeme)
                     var tok: Token
-                    tokenInit(&tok, tkIdent, lexeme, lineNum, pos + 1)
-                    lexAppendToken(tokens, tok)
+                    tokenZero(&tok)
+                    lexTokenInitRange(&tok, tkIdent, content, lineStartAbs + pos + 1, count, lineNum, pos + 1)
+                    lexAppendTokenClone(tokens, &tok)
                     if lineTokenCount == 0:
                         lineFirstTok = tok
                     lineTokenCount = lineTokenCount + 1
@@ -1998,7 +2185,7 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
                 var tok: Token = symRes.tok
                 tok.line = lineNum
                 tok.col = pos + 1
-                lexAppendToken(tokens, tok)
+                lexAppendTokenClone(tokens, &tok)
                 if lineTokenCount == 0:
                     lineFirstTok = tok
                 lineTokenCount = lineTokenCount + 1
@@ -2069,7 +2256,7 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
             if opensBlock:
                 lineContinuesNow = false
             if ! lineContinuesNow:
-                lexAppendNewToken(tokens, tkNewline, "", lineNum, lineLen + 1)
+                lexAppendNewTokenEmpty(tokens, tkNewline, lineNum, lineLen + 1)
             lineContinues = lineContinuesNow
             if lineTokenCount == 1 && lineFirstTok.kind == tkKeyword && tokenLexeme(lineFirstTok) ==  "type" && ! lineContinuesNow:
                 typeIndentPending = true
@@ -2104,14 +2291,14 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
 
     while exprIndentStack.len > 1:
         exprIndentStack.len = exprIndentStack.len - 1
-        lexAppendNewToken(tokens, tkDedent, "", lineStarts.len + 1, 1)
+        lexAppendNewTokenEmpty(tokens, tkDedent, lineStarts.len + 1, 1)
     while parenIndentStack.len > 1:
         parenIndentStack.len = parenIndentStack.len - 1
-        lexAppendNewToken(tokens, tkDedent, "", lineStarts.len + 1, 1)
+        lexAppendNewTokenEmpty(tokens, tkDedent, lineStarts.len + 1, 1)
     while indentStack.len > 1:
         indentStack.len = indentStack.len - 1
-        lexAppendNewToken(tokens, tkDedent, "", lineStarts.len + 1, 1)
-    lexAppendNewToken(tokens, tkEof, "", lineStarts.len + 1, 1)
+        lexAppendNewTokenEmpty(tokens, tkDedent, lineStarts.len + 1, 1)
+    lexAppendNewTokenEmpty(tokens, tkEof, lineStarts.len + 1, 1)
     if dbgLexState:
         if scannedAnyToken:
             os.writeLine(os.get_stderr(), "[lex] scanned_any_token=1")
@@ -2146,11 +2333,19 @@ fn lexInto(content: str, filename: str = "stdin", tokensOut: Token[]* = nil, dia
         let dbgFile: os.File = os.get_stderr()
         var ti: int32 = 0
         while ti < tokens.len && ti < 12:
-            let tok: Token = tokens[ti]
+            let tok: Token* = lexTokenPtr(tokens, ti)
+            let lex: str = tokenLexeme(tok)
             os.write(dbgFile, "[lex-tok] ")
-            os.write(dbgFile, kindName(tok.kind))
+            if tok != nil:
+                os.write(dbgFile, kindName(tok->kind))
+            else:
+                os.write(dbgFile, "nil")
+            os.write(dbgFile, " id=")
+            os.write(dbgFile, intToStr(tokenLexemeId(tok)))
+            os.write(dbgFile, " len=")
+            os.write(dbgFile, intToStr(len(lex)))
             os.write(dbgFile, " '")
-            os.write(dbgFile, tokenLexeme(tok))
+            os.write(dbgFile, lex)
             os.writeLine(dbgFile, "'")
             ti = ti + 1
         os.c_fflush dbgFile

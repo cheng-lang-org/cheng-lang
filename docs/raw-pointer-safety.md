@@ -8,7 +8,7 @@
 
 ### 2026-02 生产闭环补充（ZRPC 对齐）
 
-- 新增的自举快速管线（`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`）属于编译器内部实现细节，不改变用户可见语义。
+- 新增的自举快速管线（dev：`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`；release：`BACKEND_STAGE1_PARSE_MODE=full`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=0`）属于编译器内部实现细节，不改变用户可见语义。
 - host darwin/arm64 的 `macho_direct_exe_writer` 仅处理后端内部对象/重定位数据，不向语言层新增任何裸指针语法入口。
 - `ABI=v2_noptr` + `STAGE1_NO_POINTERS_NON_C_ABI=1` 仍是生产默认约束；该兼容名 gate 当前覆盖所有用户源码模块，包含 `@importc/@exportc` 等 C ABI 声明；direct-exe 路径与常规路径共享同一 no-pointer 门禁与诊断口径。
 - Host-only strict 默认（`SELFHOST_STRICT_REBUILD=1`、`BUILD_DRIVER_STRICT_NATIVE=1`）只改变自举/driver 失败策略，不放宽 `ZRPC` 与 no-pointer 规则；driver 回退链路为硬禁用。

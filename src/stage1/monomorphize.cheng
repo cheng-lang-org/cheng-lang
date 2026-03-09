@@ -76,6 +76,8 @@ var typeKeyNs: int64
 var monoTypeKeyIndex: int32[]
 var monoTypeKeyValues: str[]
 var monoTypeKeyValueIndex: hashmaps.HashMapStrInt
+var monoTypeLeafKeyReady: int8[]
+var monoTypeLeafKeyValues: str[]
 var monoTypeNodeIndex: hashmaps.HashMapStrInt
 var monoTypeNodeValues: Node[]
 var monoTypeKeyValidIndex: hashmaps.HashMapStrInt
@@ -1085,11 +1087,7 @@ fn monoSliceRange(s: str, start: int32, stop: int32): str =
     if endIdx >= n:
         endIdx = n - 1
     let count: int32 = endIdx - start + 1
-    let p: void* = alloc(count + 1)
-    let src: void* = rawmemPtrAdd(ptr(s), start)
-    rawmemCopy(p, src, count)
-    rawmemSet(rawmemPtrAdd(p, count), 0, 1)
-    return str(p)
+    return strings.sliceBytes(s, start, count)
 
 fn monoDropPrefix(s: str, prefixLen: int32): str =
     if len(s) == 0:
@@ -1099,7 +1097,7 @@ fn monoDropPrefix(s: str, prefixLen: int32): str =
         return s
     if prefixLen >= n:
         return ""
-    return rawmemStrFromOffset(s, prefixLen)
+    return strings.sliceBytes(s, prefixLen, n - prefixLen)
 
 fn monoStripDotSuffix(s: str): str =
     if len(s) == 0:
@@ -2326,12 +2324,8 @@ fn monoStripSpaces(s: str): str =
         hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx3)
         return s
     let count: int32 = b - a + 1
-    let p: void* = alloc(count + 1)
-    let src: void* = rawmemPtrAdd(ptr(s), a)
-    rawmemCopy(p, src, count)
-    rawmemSet(rawmemPtrAdd(p, count), 0, 1)
-    let res: str = str(p)
-    trackLexString p
+    let res: str = strings.sliceBytes(s, a, count)
+    trackLexStringStr(res)
     add(monoStripValues, res)
     let storedIdx4: int32 = monoStripValues.len
     hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx4)
@@ -2460,12 +2454,7 @@ fn monoLambdaHasCapture(lam: Node): bool =
 fn addWhereDiag(pos: SourcePos, msg: str) =
     if currentDiags == nil:
         return
-    var d: Diagnostic
-    d.severity = svError
-    d.filename = currentFilename
-    d.line = pos.line
-    d.col = pos.col
-    d.message = msg
+    let d: Diagnostic = diagMake(svError, currentFilename, pos.line, pos.col, msg)
     add(currentDiags, d)
 
 fn collectGenericParamNames(generics: Node, outNames: str[]*) =
@@ -2668,6 +2657,41 @@ fn monoTypeKeyEnsureNodeCache(n: Node) =
     if monoTypeKeyIndex.len < needLen:
         setLen(monoTypeKeyIndex, needLen)
 
+fn monoTypeLeafKeyEnsureNodeCache(n: Node) =
+    if !astNodeIdValid(n):
+        return
+    let needLen: int32 = int32(n) + 1
+    if needLen <= 0:
+        return
+    if monoTypeLeafKeyValues.cap < needLen:
+        reserve(monoTypeLeafKeyValues, needLen)
+    if monoTypeLeafKeyReady.cap < needLen:
+        reserve(monoTypeLeafKeyReady, needLen)
+    if monoTypeLeafKeyValues.len < needLen:
+        setLen(monoTypeLeafKeyValues, needLen)
+    if monoTypeLeafKeyReady.len < needLen:
+        setLen(monoTypeLeafKeyReady, needLen)
+
+fn monoTypeLeafKey(n: Node): str =
+    if astRefIsNil(n):
+        return ""
+    if astNodeIdValid(n):
+        monoTypeLeafKeyEnsureNodeCache(n)
+        let idx0: int32 = int32(n)
+        if idx0 >= 0 && idx0 < monoTypeLeafKeyReady.len && monoTypeLeafKeyReady[idx0] != 0:
+            return get(monoTypeLeafKeyValues, idx0)
+    let raw: str = nodeIdent(n)
+    var res: str = ""
+    if len(raw) > 0:
+        res = sanitizeKey(monoStripSpaces(raw))
+    if astNodeIdValid(n):
+        monoTypeLeafKeyEnsureNodeCache(n)
+        let idx1: int32 = int32(n)
+        if idx1 >= 0 && idx1 < monoTypeLeafKeyReady.len:
+            monoTypeLeafKeyValues[idx1] = res
+            monoTypeLeafKeyReady[idx1] = 1
+    return res
+
 fn typeKeyCore(n: Node): str =
     if astRefIsNil(n):
         return ""
@@ -2681,7 +2705,7 @@ fn typeKeyCore(n: Node): str =
             typeKeyNs = typeKeyNs + (cheng_monotime_ns() - tkStart)
     case nodeKind(n)
     of nkIdent, nkSymbol:
-        return sanitizeKey(monoStripSpaces(nodeIdent(n)))
+        return monoTypeLeafKey(n)
     of nkIdentDefs:
         if kidCount n > 1:
             return typeKey kid(n, 1)
@@ -2709,7 +2733,7 @@ fn typeKeyCore(n: Node): str =
             return "set_" + typeKey kid(n, 0)
         return "set"
     of nkFnTy:
-        var parts: str[4]
+        var sig: str = "fn"
         if kidCount n > 0:
             let fp: Node = kid(n, 0)
             if astRefNonNil(fp) && nodeKind(fp) == nkFormalParams:
@@ -2718,11 +2742,8 @@ fn typeKeyCore(n: Node): str =
                     if astRefNonNil(d) && nodeKind(d) == nkIdentDefs && kidCount d > 1:
                         let k: str = typeKey kid(d, 1)
                         if len k > 0:
-                            add(parts, k)
-        var sig: str = "fn"
-        for pi in 0..<parts.len:
-            sig = sig + "_"
-            sig = sig + get(parts, pi)
+                            sig = sig + "_"
+                            sig = sig + k
         if kidCount n > 1:
             let retKey: str = typeKey kid(n, 1)
             if len retKey > 0:
@@ -2730,15 +2751,12 @@ fn typeKeyCore(n: Node): str =
                 sig = sig + retKey
         return sig
     of nkTupleTy, nkTupleLit:
-        var parts2: str[4]
+        var out2: str = "tuple"
         for i2 in 0..<kidCount n:
             let k2: str = typeKey kid(n, i2)
             if len k2 > 0:
-                add(parts2, k2)
-        var out2: str = "tuple"
-        for j2 in 0..<parts2.len:
-            out2 = out2 + "_"
-            out2 = out2 + get(parts2, j2)
+                out2 = out2 + "_"
+                out2 = out2 + k2
         return out2
     of nkBracketExpr:
         if kidCount n > 0:
@@ -2753,19 +2771,22 @@ fn typeKeyCore(n: Node): str =
                     if len elemKey > 0:
                         return baseKey + "_" + elemKey
                 return baseKey
-            var parts3: str[4]
-            for i3 in 1..<kidCount n:
+            var out3: str = baseKey
+            let argc: int32 = kidCount n
+            if argc == 2:
+                let k1: str = typeKey kid(n, 1)
+                if len k1 > 0:
+                    return out3 + "_" + k1
+                return out3
+            for i3 in 1..<argc:
                 let k3: str = typeKey kid(n, i3)
                 if len k3 > 0:
-                    add(parts3, k3)
-            var out3: str = baseKey
-            for j3 in 0..<parts3.len:
-                out3 = out3 + "_"
-                out3 = out3 + get(parts3, j3)
+                    out3 = out3 + "_"
+                    out3 = out3 + k3
             return out3
     else:
         if len nodeIdent(n) > 0:
-            return sanitizeKey(monoStripSpaces(nodeIdent(n)))
+            return monoTypeLeafKey(n)
         return "node"
     return ""
 
@@ -3170,19 +3191,13 @@ fn mangleInstance(name: str, typeArgs: Node[]): str =
             total = total + 1 + len key
     if keys.len == 0:
         return base
-    let p: void* = alloc(total + 1)
-    rawmemCopy(p, ptr(base), len base)
-    var off: int32 = len base
+    var outText: str = base
     for j in 0..<keys.len:
-        rawmemSet(rawmemPtrAdd(p, off), int32('_'), 1)
-        off = off + 1
+        outText = outText + "_"
         let k: str = get(keys, j)
-        let kn: int32 = len k
-        if kn > 0:
-            rawmemCopy(rawmemPtrAdd(p, off), ptr(k), kn)
-            off = off + kn
-    rawmemSet(rawmemPtrAdd(p, total), 0, 1)
-    return str(p)
+        if len(k) > 0:
+            outText = outText + k
+    return outText
 
 fn inferLitType(n: Node): Node =
     if astRefIsNil(n):
@@ -4580,6 +4595,10 @@ fn monomorphizeImpl(root: Node, diags: Diagnostic[]*): Node =
     monoTypeKeyIndex.cap = 256
     monoTypeKeyValues = []
     monoTypeKeyValues.cap = 256
+    setLen(monoTypeLeafKeyReady, 0)
+    monoTypeLeafKeyReady.cap = 256
+    monoTypeLeafKeyValues = []
+    monoTypeLeafKeyValues.cap = 256
     hashmaps.hashMapStrIntClear(monoTypeKeyValueIndex)
     hashmaps.hashMapPtrIntClear(&monoLambdaCaptureIndex)
     monoLambdaCaptureValues = []

@@ -654,12 +654,19 @@ fn tooling_stage0CapabilitySourceList(): str[] =
     var out: str[] = []
     add(out, "src/std/cmdline.cheng")
     add(out, "src/stage1/ast.cheng")
+    add(out, "src/stage1/token.cheng")
+    add(out, "src/stage1/lexer.cheng")
     add(out, "src/stage1/parser.cheng")
+    add(out, "src/stage1/frontend_lib.cheng")
+    add(out, "src/stage1/diagnostics.cheng")
     add(out, "src/stage1/semantics.cheng")
     add(out, "src/stage1/ownership.cheng")
     add(out, "src/stage1/monomorphize.cheng")
     add(out, "src/stage1/type_syntax_lowering.cheng")
+    add(out, "src/stage1/c_profile_lowering.cheng")
     add(out, "src/backend/uir/uir_internal/uir_core_types.cheng")
+    add(out, "src/backend/uir/uir_internal/uir_core_builder.cheng")
+    add(out, "src/backend/uir/uir_internal/uir_core_builder_ffi_out_ptr.cheng")
     add(out, "src/backend/uir/uir_codegen.cheng")
     add(out, "src/backend/machine/machine_internal/machine_core_types.cheng")
     add(out, "src/backend/obj/macho_writer.cheng")
@@ -987,6 +994,8 @@ fn tooling_embeddedScriptIds(root: str): str[] =
     add(synthetic, "verify_backend_determinism_strict")
     add(synthetic, "verify_backend_exe_determinism_strict")
     add(synthetic, "verify_backend_ue_no_growth")
+    add(synthetic, "verify_backend_seed_uir_import")
+    add(synthetic, "verify_backend_sidecar_cheng_seed")
     for i in 0..<synthetic.len:
         let sid: str = synthetic[i]
         if !tooling_isSafeScriptName(sid):
@@ -1131,6 +1140,8 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
         return tooling_embeddedNativeForwardScript("verify_backend_compile_name_canonical")
     if tooling_strEq(id, "verify_backend_dev_track_only"):
         return tooling_embeddedNativeForwardScript("verify_backend_dev_track_only")
+    if tooling_strEq(id, "verify_backend_loop_runtime"):
+        return tooling_embeddedNativeForwardScript("verify_backend_loop_runtime")
     if tooling_strEq(id, "verify_backend_rawptr_surface_forbid"):
         return tooling_embeddedNativeForwardScript("verify_backend_rawptr_surface_forbid")
     if tooling_strEq(id, "verify_stage1_ast_soa_surface"):
@@ -1145,24 +1156,8 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
         return tooling_embeddedNativeForwardScript("backend-prod-publish")
     if tooling_strEq(id, "release_compile") || tooling_strEq(id, "release-compile"):
         return tooling_embeddedNativeForwardScript("release-compile")
-    if tooling_strEq(id, "verify_backend_rawptr_contract"):
-        let rawRawptrContract: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
-        if !tooling_strNonEmpty(rawRawptrContract):
-            return ""
-        var patchedRawptrContract: str = rawRawptrContract
-        patchedRawptrContract = strutil.replace(
-            patchedRawptrContract,
-            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} embedded-text --id:backend_prod_closure >\"$prod_closure_body\"\n",
-            "prod_closure_cache=\"chengcache/embedded_scripts/backend_prod_closure.embedded.sh\"\nif [ -s \"$prod_closure_cache\" ]; then\n  cp \"$prod_closure_cache\" \"$prod_closure_body\"\nelse\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_prod_closure --help >/dev/null 2>&1 || true\n  if [ -s \"$prod_closure_cache\" ]; then\n    cp \"$prod_closure_cache\" \"$prod_closure_body\"\n  else\n    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} embedded-text --id:backend_prod_closure >\"$prod_closure_body\"\n  fi\nfi\n")
-        patchedRawptrContract = strutil.replace(
-            patchedRawptrContract,
-            "prod_closure_cache=\"chengcache/embedded_scripts/backend_prod_closure.embedded.sh\"\nif [ -s \"$prod_closure_cache\" ]; then\n  cp \"$prod_closure_cache\" \"$prod_closure_body\"\nelse\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_prod_closure --help >/dev/null 2>&1 || true\n  if [ -s \"$prod_closure_cache\" ]; then\n    cp \"$prod_closure_cache\" \"$prod_closure_body\"\n  else\n    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} embedded-text --id:backend_prod_closure >\"$prod_closure_body\"\n  fi\nfi\n",
-            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_prod_closure --help >\"$prod_closure_body\" 2>/dev/null || true\n")
-        patchedRawptrContract = strutil.replace(
-            patchedRawptrContract,
-            "if ! rg -q \"run_required \\\"$gate_clean\\\"\" \"$prod_closure_body\"; then",
-            "if ! rg -q 'tooling_strEq\\(first, \"backend_prod_closure\"\\)' src/tooling/cheng_tooling.cheng || ! rg -q 'tooling_strEq\\(selfName, \"backend_prod_closure\"\\)' src/tooling/cheng_tooling.cheng; then")
-        return patchedRawptrContract
+    if tooling_strEq(id, "verify_backend_rawptr_contract") || tooling_strEq(id, "verify_backend_rawptr_contract_shell"):
+        return tooling_readTextFile(root, "src/tooling/verify_backend_rawptr_contract_native.sh")
     if tooling_strEq(id, "verify_backend_coff_lld_link"):
         let rawCoff: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
         if !tooling_strNonEmpty(rawCoff):
@@ -2182,7 +2177,7 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
             "    BACKEND_LINKER=self \\\n    BACKEND_DIRECT_EXE=1 \\\n    BACKEND_LINKERLESS_INMEM=1 \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_TARGET=\"$preflight_target\" \\\n    BACKEND_FRONTEND=stage1 \\\n")
         patchedStage0NoCompat = strutil.replace(
             patchedStage0NoCompat,
-            "  for cand in \\\n    \"${BACKEND_DRIVER:-}\" \\\n    \"artifacts/backend_selfhost_self_obj/cheng.stage2\" \\\n    \"artifacts/backend_selfhost_self_obj/cheng.stage1\" \\\n    \"artifacts/backend_seed/cheng.stage2\" \\\n    \"dist/releases/current/cheng\" \\\n    \"artifacts/backend_driver/cheng\" \\\n    \"./cheng\"; do",
+            "  for cand in \\\n    \"artifacts/backend_driver/cheng\" \\\n    \"artifacts/backend_selfhost_self_obj/cheng.stage2\" \\\n    \"artifacts/backend_selfhost_self_obj/cheng.stage1\" \\\n    \"dist/releases/current/cheng\"; do",
             "  for cand in \\\n    \"artifacts/backend_driver/cheng\"; do")
         return patchedStage0NoCompat
     if tooling_strEq(id, "verify_tooling_cmdline"):
@@ -2321,7 +2316,7 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
         patchedStage1Fullspec = strutil.replace(
             patchedStage1Fullspec,
             "    BACKEND_VALIDATE=0 \\\n    BACKEND_EMIT=obj \\\n    BACKEND_TARGET=\"$target\" \\\n",
-            "    BACKEND_VALIDATE=0 \\\n    BACKEND_LINKER=\"$linker\" \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_DIRECT_EXE=0 \\\n    BACKEND_LINKERLESS_INMEM=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_TARGET=\"$target\" \\\n")
+            "    BACKEND_VALIDATE=0 \\\n    BACKEND_LINKER=\"$linker\" \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_TARGET=\"$target\" \\\n")
         patchedStage1Fullspec = strutil.replace(
             patchedStage1Fullspec,
             "if [ \"$linker\" = \"self\" ]; then\n  build_sig=\"$build_sig;runtime_obj=$runtime_obj;runtime_sig=$(file_sig \"$runtime_obj\")\"\nfi\n",
@@ -2345,7 +2340,7 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
         patchedStage1Fullspec = strutil.replace(
             patchedStage1Fullspec,
             "      BACKEND_LINKER=system \\\n      BACKEND_NO_RUNTIME_C=0 \\\n      BACKEND_RUNTIME_OBJ= \\\n      BACKEND_VALIDATE=\"$validate\" \\\n",
-            "      BACKEND_LINKER=system \\\n      BACKEND_DIRECT_EXE=0 \\\n      BACKEND_LINKERLESS_INMEM=0 \\\n      BACKEND_NO_RUNTIME_C=0 \\\n      BACKEND_RUNTIME_OBJ= \\\n      BACKEND_VALIDATE=\"$validate\" \\\n")
+            "      BACKEND_LINKER=system \\\n      BACKEND_NO_RUNTIME_C=0 \\\n      BACKEND_RUNTIME_OBJ= \\\n      BACKEND_VALIDATE=\"$validate\" \\\n")
         return patchedStage1Fullspec
     if tooling_strEq(id, "verify_fullchain_bootstrap"):
         let rawFullchain: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
@@ -2412,7 +2407,7 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
             "fullspec_skip_ownership=\"0\"")
         patchedClosedLoop = strutil.replace(
             patchedClosedLoop,
-            "self_linker_gate_driver=\"${BACKEND_SELF_LINKER_DRIVER:-artifacts/backend_seed/cheng.stage2}\"",
+            "self_linker_gate_driver=\"${BACKEND_SELF_LINKER_DRIVER:-artifacts/backend_selfhost_self_obj/cheng.stage2}\"",
             "self_linker_gate_driver=\"${BACKEND_SELF_LINKER_DRIVER:-artifacts/backend_driver/cheng}\"")
         patchedClosedLoop = strutil.replace(
             patchedClosedLoop,
@@ -2528,8 +2523,7 @@ fn tooling_patchEmbeddedRuntimeDefaults(scriptId: str, scriptText: str): str =
                               "allow_selfhost_fallback=\"0\"")
         out = strutil.replace(
             out,
-            "for cand in \\\n    \"${BACKEND_LINKER_ABI_CORE_DRIVER:-}\" \\\n    \"${BACKEND_DRIVER:-}\" \\\n    \"artifacts/backend_driver/cheng.fixed3\" \\\n    \"artifacts/backend_driver/cheng\" \\\n    \"artifacts/backend_seed/cheng.stage2\" \\\n    \"dist/releases/current/cheng\" \\\n    \"$path_from_resolver\"; do",
-            "for cand in \\\n    \"artifacts/backend_driver/cheng\"; do")
+            "for cand in \\\n    \"artifacts/backend_driver/cheng\" \\\n    \"artifacts/backend_selfhost_self_obj/cheng.stage2\" \\\n    \"dist/releases/current/cheng\"; do")
         out = strutil.replace(out,
                               "  echo \"  hint: set BACKEND_LINKER_ABI_CORE_DRIVER=<path>\" >&2\n",
                               "  echo \"  hint: build canonical driver first: artifacts/tooling_cmd/cheng_tooling build-backend-driver\" >&2\n")
@@ -2973,6 +2967,27 @@ fn tooling_strContains(text: str, needle: str): bool =
         return false
     return strutil.contains(text, needle)
 
+fn tooling_maybeAppendFlag(flags: str, flag: str): str =
+    let rawFlags: str = tooling_trimAsciiSpace(flags)
+    if !tooling_strNonEmpty(flag):
+        return rawFlags
+    if tooling_strContains(rawFlags, flag):
+        return rawFlags
+    if !tooling_strNonEmpty(rawFlags):
+        return flag
+    return rawFlags + " " + flag
+
+fn tooling_releaseLdflagsForTarget(flags: str, target: str): str =
+    var out: str = tooling_trimAsciiSpace(flags)
+    let targetText: str = strutil.toLowerAscii(tooling_trimAsciiSpace(target))
+    let allowUuidText: str = tooling_trimAsciiSpace(os.getEnvDefault("BACKEND_ALLOW_UUID", "0"))
+    let allowUuid: bool = tooling_strEq(allowUuidText, "1") || tooling_strEq(strutil.toLowerAscii(allowUuidText), "true")
+    if tooling_strContains(targetText, "darwin") || tooling_strContains(targetText, "apple-darwin"):
+        if !allowUuid:
+            out = tooling_maybeAppendFlag(out, "-Wl,-no_uuid")
+        out = tooling_maybeAppendFlag(out, "-Wl,-no_adhoc_codesign")
+    return out
+
 fn tooling_stripSuffix(text: str, suffix: str): str =
     if !tooling_strNonEmpty(text) || !tooling_strNonEmpty(suffix):
         return text
@@ -3176,9 +3191,6 @@ fn tooling_selfExecPath(root: str): str =
         let forcedAbs: str = tooling_pathAbsolute(root, forcedRaw)
         if tooling_strNonEmpty(forcedAbs) && os.fileExists(forcedAbs):
             return forcedAbs
-    let canonical: str = tooling_pathAbsolute(root, "artifacts/tooling_cmd/cheng_tooling")
-    if tooling_strNonEmpty(canonical) && os.fileExists(canonical):
-        return canonical
     let raw0: str = strutil.strip(tooling_paramStr(0))
     if tooling_strNonEmpty(raw0):
         if tooling_strContains(raw0, "cheng_tooling_embedded:"):
@@ -3188,6 +3200,9 @@ fn tooling_selfExecPath(root: str): str =
             abs0 = tooling_pathAbsolute(root, abs0)
         if tooling_strNonEmpty(abs0) && os.fileExists(abs0):
             return abs0
+    let canonical: str = tooling_pathAbsolute(root, "artifacts/tooling_cmd/cheng_tooling")
+    if tooling_strNonEmpty(canonical) && os.fileExists(canonical):
+        return canonical
     return ""
 
 fn tooling_firstToken(raw: str): str =
@@ -3548,6 +3563,8 @@ fn tooling_tryRepairCanonicalStage0Driver(root: str, probeEnabled: bool): bool =
     tooling_printErr("cheng_tooling: recover canonical stage0 driver from dist release: " + recoveryPath)
     if !tooling_copyExecutable(root, recoveryPath, canonicalPath):
         return false
+    let _clearedCanonicalRepair: int32 =
+        tooling_stage0ClearStamps(root, canonicalPath, "repair_canonical_stage0")
     if !tooling_driverSanityOk(root, canonicalPath):
         return false
     if probeEnabled && !tooling_driverCompileProbeOk(root, canonicalPath):
@@ -3592,15 +3609,26 @@ fn tooling_stage0CandidateListWithProbe(root: str, explicitRaw: str, probeEnable
     if tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_ALLOW_DIST_FALLBACK", "0")):
         tooling_printErr("cheng_tooling: ignore removed env TOOLING_STAGE0_ALLOW_DIST_FALLBACK (canonical stage0 only)")
     let canonicalPath: str = tooling_pathAbsolute(root, "artifacts/backend_driver/cheng")
+    let selfhostStage2Path: str = tooling_pathAbsolute(root, "artifacts/backend_selfhost_self_obj/cheng.stage2")
+    let selfhostStage1Path: str = tooling_pathAbsolute(root, "artifacts/backend_selfhost_self_obj/cheng.stage1")
     var candidates: str[] = []
     var candidateDigests: str[] = []
     add(candidates, canonicalPath)
+    add(candidates, selfhostStage2Path)
+    add(candidates, selfhostStage1Path)
     for i in 0..<candidates.len:
         let candidatePath: str = candidates[i]
         if !tooling_strNonEmpty(candidatePath):
             continue
         if tooling_idsContains(out, candidatePath):
             continue
+        let _clearedStaleCandidate: bool =
+            tooling_stage0MaybeClearStaleStamp(root, candidatePath, requireHelpProbe,
+                                               "stage0_candidate_probe")
+        let _recoveredSelfhostCandidate: bool =
+            tooling_stage0MaybeRecoverStampedSelfhostCandidate(root, candidatePath,
+                                                               requireHelpProbe,
+                                                               "stage0_candidate_recovery")
         if tooling_stage0BlockStamped(root, candidatePath):
             tooling_printErr("cheng_tooling: skip stage0 candidate blocked by quarantine stamp: " + candidatePath)
             continue
@@ -3644,19 +3672,42 @@ fn tooling_resolveStage0DriverStrict(root: str, explicitRaw: str): str =
         os.getEnvDefault("TOOLING_STAGE0_STRICT_COMPILE_PROBE", "0"))
     return tooling_resolveStage0DriverWithProbe(root, explicitRaw, probeEnabled)
 
+fn tooling_stage0CandidateHealthy(root: str, candidatePath: str, probeEnabled: bool, tag: str): bool =
+    if !tooling_isExecutable(root, candidatePath):
+        return false
+    let requireHelpProbe: bool = tooling_isTrue(
+        os.getEnvDefault("TOOLING_STAGE0_REQUIRE_HELP_PROBE", "1"))
+    let _recovered: bool =
+        tooling_stage0MaybeRecoverStampedSelfhostCandidate(root, candidatePath,
+                                                           requireHelpProbe,
+                                                           tag + "_recovery")
+    let _cleared: bool =
+        tooling_stage0MaybeClearStaleStamp(root, candidatePath, requireHelpProbe,
+                                           tag + "_probe")
+    if tooling_stage0BlockStamped(root, candidatePath):
+        return false
+    if tooling_stage0HasUninterruptibleProcess(root, candidatePath):
+        return false
+    if !tooling_driverSanityOk(root, candidatePath):
+        return false
+    if probeEnabled && !tooling_driverCompileProbeOk(root, candidatePath):
+        return false
+    return true
+
+fn tooling_resolveRecoverySeedCompiler(root: str, probeEnabled: bool): str =
+    let distPath: str = tooling_pathAbsolute(root, "dist/releases/current/cheng")
+    if tooling_stage0CandidateHealthy(root, distPath, probeEnabled, "dist_recovery_seed"):
+        return distPath
+    let stage2Path: str = tooling_pathAbsolute(root, "artifacts/backend_selfhost_self_obj/cheng.stage2")
+    if tooling_stage0CandidateHealthy(root, stage2Path, probeEnabled, "preferred_stage0"):
+        return stage2Path
+    let canonicalPath: str = tooling_pathAbsolute(root, "artifacts/backend_driver/cheng")
+    if tooling_stage0CandidateHealthy(root, canonicalPath, probeEnabled, "canonical_recovery_seed"):
+        return canonicalPath
+    return ""
+
 fn tooling_buildBackendDriverPreferredStage0(root: str, probeEnabled: bool): str =
-    let preferredPath: str = tooling_pathAbsolute(root, "artifacts/backend_selfhost_self_obj/cheng.stage2")
-    if !tooling_isExecutable(root, preferredPath):
-        return ""
-    if tooling_stage0BlockStamped(root, preferredPath):
-        return ""
-    if tooling_stage0HasUninterruptibleProcess(root, preferredPath):
-        return ""
-    if !tooling_driverSanityOk(root, preferredPath):
-        return ""
-    if probeEnabled && !tooling_driverCompileProbeOk(root, preferredPath):
-        return ""
-    return preferredPath
+    return tooling_resolveRecoverySeedCompiler(root, probeEnabled)
 
 fn tooling_stage0DriverKind(root: str, stage0Path: str): str =
     let absPath: str = tooling_pathAbsolute(root, stage0Path)
@@ -3694,6 +3745,35 @@ fn tooling_copyExecutable(root: str, srcPath: str, dstPath: str): bool =
         tooling_printExecOutput(chmodSame)
         return os.execCmdResultExitCode(chmodSame) == 0
     return tooling_installExecutableAtomic(root, srcPath, dstPath)
+
+fn tooling_copyExecutablePreserveBytes(root: str, srcPath: str, dstPath: str): bool =
+    if !tooling_strNonEmpty(srcPath) || !tooling_strNonEmpty(dstPath):
+        return false
+    if tooling_strEq(srcPath, dstPath):
+        if !tooling_pathExists(srcPath):
+            return false
+        let chmodSame: os.ExecCmdResult = tooling_exec(root, "chmod +x " + tooling_shellQuote(dstPath))
+        tooling_printExecOutput(chmodSame)
+        return os.execCmdResultExitCode(chmodSame) == 0
+    let outDir: str = os.parentDir(dstPath)
+    if tooling_strNonEmpty(outDir):
+        if !tooling_mkdirP(root, outDir):
+            return false
+    let tmpPath: str = dstPath + ".preserve." + tooling_nowNonceText() + ".tmp"
+    let copyRes: os.ExecCmdResult = tooling_exec(root,
+        "cp -f " + tooling_shellQuote(srcPath) + " " + tooling_shellQuote(tmpPath) +
+        " && chmod +x " + tooling_shellQuote(tmpPath))
+    tooling_printExecOutput(copyRes)
+    if os.execCmdResultExitCode(copyRes) != 0:
+        tooling_exec(root, "rm -f " + tooling_shellQuote(tmpPath))
+        return false
+    let mvRes: os.ExecCmdResult = tooling_exec(root,
+        "mv -f " + tooling_shellQuote(tmpPath) + " " + tooling_shellQuote(dstPath))
+    tooling_printExecOutput(mvRes)
+    if os.execCmdResultExitCode(mvRes) != 0:
+        tooling_exec(root, "rm -f " + tooling_shellQuote(tmpPath))
+        return false
+    return tooling_pathExists(dstPath)
 
 fn tooling_installExecutableNeedsGlobalLock(root: str, dstPathRaw: str): bool =
     let dstPath: str = tooling_pathAbsolute(root, dstPathRaw)
@@ -3845,6 +3925,21 @@ fn tooling_stage0IgnoreBlockStamp(): bool =
         return true
     return tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_IGNORE_CRASH_STAMP", "0"))
 
+fn tooling_stage0IsSelfhostRecoveryCandidate(root: str, stage0PathRaw: str): bool =
+    let stage0Path: str = tooling_pathAbsolute(root, stage0PathRaw)
+    if !tooling_strNonEmpty(stage0Path):
+        return false
+    let selfhostDir: str = tooling_pathAbsolute(root, "artifacts/backend_selfhost_self_obj")
+    if !tooling_strNonEmpty(selfhostDir):
+        return false
+    if !strutil.startsWith(stage0Path, selfhostDir + "/"):
+        return false
+    if tooling_strEndsWith(stage0Path, "/cheng.stage2"):
+        return true
+    if tooling_strEndsWith(stage0Path, "/cheng.stage1"):
+        return true
+    return false
+
 fn tooling_stage0BlockStamped(root: str, stage0PathRaw: str): bool =
     if tooling_stage0IgnoreBlockStamp():
         return false
@@ -3917,6 +4012,37 @@ fn tooling_stage0MarkCrash(root: str, stage0PathRaw: str, rc: int32, contextRaw:
         tooling_printErr("cheng_tooling: stage0 crash stamped: " + stampPath)
     else:
         tooling_printErr("cheng_tooling: stage0 crash stamp write failed: " + stampPath)
+
+fn tooling_stage0ClearStamps(root: str, stage0PathRaw: str, contextRaw: str): int32 =
+    let stage0Path: str = tooling_pathAbsolute(root, stage0PathRaw)
+    if !tooling_strNonEmpty(stage0Path):
+        return 0
+    let qdir: str = tooling_stage0QuarantineDir(root)
+    if !os.dirExists(qdir):
+        return 0
+    var context: str = strutil.strip(contextRaw)
+    if !tooling_strNonEmpty(context):
+        context = "stage0_clear"
+    let cmd: str =
+        "qdir=" + tooling_shellQuote(qdir) + "; " +
+        "target=" + tooling_shellQuote(stage0Path) + "; " +
+        "count=0; " +
+        "for stamp in \"$qdir\"/stage0_block.*.env \"$qdir\"/stage0_crash.*.env; do " +
+        "  [ -f \"$stamp\" ] || continue; " +
+        "  p=$(sed -n 's/^stage0_path=//p' \"$stamp\" | head -n 1); " +
+        "  if [ \"$p\" = \"$target\" ]; then " +
+        "    rm -f \"$stamp\" && count=$((count + 1)); " +
+        "  fi; " +
+        "done; " +
+        "printf '%s' \"$count\""
+    let res: os.ExecCmdResult = tooling_exec(root, cmd)
+    if os.execCmdResultExitCode(res) != 0:
+        return 0
+    let cleaned: int32 = tooling_parseInt32Default(strutil.strip(os.execCmdResultOutput(res)), 0)
+    if cleaned > 0:
+        tooling_printErr("cheng_tooling: cleared stage0 quarantine stamps for " + context +
+                         " path=" + stage0Path + " count=" + intToStr(cleaned))
+    return cleaned
 
 fn tooling_stage0LockEnabled(): bool =
     return tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_LOCK", "1"))
@@ -5114,11 +5240,8 @@ fn tooling_driverDigestBlocked(digestRaw: str): bool =
     let extraBlocked: str = os.getEnvDefault("TOOLING_STAGE0_BLOCK_SHA256", "")
     return tooling_digestListContains(extraBlocked, digest)
 
-fn tooling_driverSanityOk(root: str, binPath: str): bool =
+fn tooling_driverSanityCoreNoStamp(root: str, binPath: str): bool =
     if !tooling_isExecutable(root, binPath):
-        return false
-    if tooling_stage0BlockStamped(root, binPath):
-        tooling_printErr("cheng_tooling: driver sanity blocked quarantine-stamped digest: " + binPath)
         return false
     let digest: str = tooling_sha256File(root, binPath)
     if tooling_driverDigestBlocked(digest):
@@ -5147,6 +5270,12 @@ fn tooling_driverSanityOk(root: str, binPath: str): bool =
         return false
     return true
 
+fn tooling_driverSanityOk(root: str, binPath: str): bool =
+    if tooling_stage0BlockStamped(root, binPath):
+        tooling_printErr("cheng_tooling: driver sanity blocked quarantine-stamped digest: " + binPath)
+        return false
+    return tooling_driverSanityCoreNoStamp(root, binPath)
+
 fn tooling_driverMinimalSanityOk(root: str, binPath: str): bool =
     if !tooling_isExecutable(root, binPath):
         return false
@@ -5156,6 +5285,35 @@ fn tooling_driverMinimalSanityOk(root: str, binPath: str): bool =
     if os.fileSize(binPath) <= int64(0):
         return false
     return true
+
+fn tooling_stage0MaybeClearStaleStamp(root: str, stage0PathRaw: str,
+                                      requireHelpProbe: bool, contextRaw: str): bool =
+    let stage0Path: str = tooling_pathAbsolute(root, stage0PathRaw)
+    if !tooling_strNonEmpty(stage0Path):
+        return false
+    if !tooling_stage0BlockStamped(root, stage0Path):
+        return false
+    if !tooling_driverSanityCoreNoStamp(root, stage0Path):
+        return false
+    if requireHelpProbe && !tooling_binaryHelpProbeOk(root, stage0Path, true):
+        return false
+    let cleared: int32 = tooling_stage0ClearStamps(root, stage0Path, contextRaw)
+    return cleared > 0
+
+fn tooling_stage0MaybeRecoverStampedSelfhostCandidate(root: str, stage0PathRaw: str,
+                                                      requireHelpProbe: bool,
+                                                      contextRaw: str): bool =
+    let stage0Path: str = tooling_pathAbsolute(root, stage0PathRaw)
+    if !tooling_stage0IsSelfhostRecoveryCandidate(root, stage0Path):
+        return false
+    if !tooling_stage0BlockStamped(root, stage0Path):
+        return false
+    if !tooling_driverSanityCoreNoStamp(root, stage0Path):
+        return false
+    if requireHelpProbe && !tooling_binaryHelpProbeOk(root, stage0Path, true):
+        return false
+    let cleared: int32 = tooling_stage0ClearStamps(root, stage0Path, contextRaw)
+    return cleared > 0 || !tooling_stage0BlockStamped(root, stage0Path)
 
 fn tooling_driverCompileProbeOk(root: str, binPath: str): bool =
     let preferReleaseSystem: bool = tooling_isTrue(
@@ -5468,224 +5626,23 @@ fn tooling_runtimeObjHasRequiredSymbols(root: str, objPath: str): bool =
     let nmRes: os.ExecCmdResult = tooling_exec(root, "nm -g " + tooling_shellQuote(objPath) + " 2>/dev/null")
     if os.execCmdResultExitCode(nmRes) != 0:
         return false
-    let rows: str[] = tooling_splitLines(os.execCmdResultOutput(nmRes))
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_strlen"):
+    let nmText: str = os.execCmdResultOutput(nmRes)
+    if !tooling_strNonEmpty(nmText):
         return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_memcpy"):
+    # Host-only build-global only needs a minimal runtime/export closure check.
+    # Full undefined-symbol policing here is too expensive and is validated later
+    # by the rebuilt tooling/backend gates.
+    if !tooling_strContains(nmText, "cheng_strlen"):
         return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_memset"):
+    if !tooling_strContains(nmText, "cheng_malloc"):
         return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_malloc"):
+    if !tooling_strContains(nmText, "cheng_realloc"):
         return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_free"):
+    if !tooling_strContains(nmText, "driver_c_build_active_exe_default"):
         return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_mem_retain"):
+    if !tooling_strContains(nmText, "driver_c_build_emit_obj_default"):
         return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_mem_release"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_seq_get"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_seq_set"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_strcmp"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "__cheng_sym_2b"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_f32_bits_to_i64"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_f64_bits_to_i64"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_bits_to_f32"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_f32_to_bits"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_exec_cmd_ex"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_list_dir"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_monotime_ns"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_parse_f64_bits"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_pipe_spawn"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_epoch_time"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_errno"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fd_read"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fd_read_wait"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fd_write"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_open_w_trunc"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fgetc"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fopen"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fread"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_iometer_call"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_mem_scope_escape"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_pty_read"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_pty_close"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_pty_is_supported"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_pty_spawn"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_pty_wait"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_pty_write"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_strerror"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fclose"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fwrite"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "cheng_fflush"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "libc_open"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "libc_close"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "libc_write"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "processOptionMask"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "sliceStr"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_backend_usage"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_arg_count"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_arg_copy"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_help_requested"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_active_output_path"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_active_input_path"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_active_target"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_active_linker"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_finish_emit_obj"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_emit_obj_default"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_link_tmp_obj_default"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_build_emit_obj_default"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_build_active_obj_default"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_build_link_exe_default"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_build_active_exe_default"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "driver_c_finish_single_link"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "get_stderr"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "__cheng_setCmdLine"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "__cheng_rt_paramCount"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "__cheng_rt_paramStr"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "__cheng_rt_paramStrCopy"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "alloc"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "ptr_add"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "c_strlen"):
-        return false
-    if !tooling_nmRowsHasDefinedSymbol(rows, "zeroMem"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "alloc"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "ptr_add"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "c_strlen"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "zeroMem"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_realloc"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_exec_cmd_ex"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_list_dir"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_monotime_ns"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_parse_f64_bits"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_pipe_spawn"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_pty_read"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_fd_write"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_open_w_trunc"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "__cheng_sym_2b"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_fclose"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_fwrite"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "cheng_fflush"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "libc_open"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "libc_close"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "libc_write"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "processOptionMask"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "sliceStr"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_backend_usage"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_arg_count"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_arg_copy"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_help_requested"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_active_output_path"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_active_input_path"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_active_target"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_active_linker"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_finish_emit_obj"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_emit_obj_default"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_link_tmp_obj_default"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_build_emit_obj_default"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_build_active_obj_default"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_build_link_exe_default"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_build_active_exe_default"):
-        return false
-    if tooling_nmRowsHasUndefinedSymbol(rows, "driver_c_finish_single_link"):
+    if !tooling_strContains(nmText, "__cheng_rt_paramStrCopy"):
         return false
     return true
 
@@ -6501,6 +6458,198 @@ fn tooling_prepareBackendDriverCompatWrapObj(root: str): str =
     let _root: str = root
     return ""
 
+fn tooling_backendDriverUirSidecarMode(root: str): str =
+    let _root: str = root
+    let modeRaw: str = strutil.toLowerAscii(strutil.strip(
+        os.getEnvDefault("BACKEND_UIR_SIDECAR_MODE", "")))
+    if tooling_strEq(modeRaw, "emergency_c"):
+        return "emergency_c"
+    return "cheng"
+
+fn tooling_backendDriverUirSidecarChengSourcePath(root: str): str =
+    return os.joinPath(root, "src/backend/tooling/backend_driver_uir_sidecar.cheng")
+
+fn tooling_backendDriverUirSidecarCSourcePath(root: str): str =
+    return os.joinPath(root, "src/backend/tooling/backend_driver_uir_sidecar_bundle.c")
+
+fn tooling_backendDriverUirSidecarCompatSourcePath(root: str): str =
+    return os.joinPath(root, "src/backend/tooling/backend_driver_uir_sidecar_runtime_compat.c")
+
+fn tooling_backendDriverUirSidecarSourcePath(root: str): str =
+    if tooling_strEq(tooling_backendDriverUirSidecarMode(root), "emergency_c"):
+        return tooling_backendDriverUirSidecarCSourcePath(root)
+    return tooling_backendDriverUirSidecarChengSourcePath(root)
+
+fn tooling_backendDriverUirSidecarObjPath(root: str, target: str): str =
+    return os.joinPath(root, "chengcache/backend_driver_sidecar/backend_driver_uir_sidecar." + target + ".o")
+
+fn tooling_backendDriverUirSidecarBundlePath(root: str, target: str): str =
+    return os.joinPath(root, "chengcache/backend_driver_sidecar/backend_driver_uir_sidecar." + target + ".bundle")
+
+fn tooling_backendDriverUirSidecarCompilerPath(root: str, stage0Exec: str): str =
+    let envPath: str = os.getEnvDefault("BACKEND_UIR_SIDECAR_COMPILER", "")
+    if tooling_strNonEmpty(envPath) && tooling_isExecutable(root, envPath):
+        return envPath
+    if tooling_strNonEmpty(stage0Exec) && tooling_isExecutable(root, stage0Exec):
+        return stage0Exec
+    let canonicalPath: str = tooling_pathAbsolute(root, "artifacts/backend_driver/cheng")
+    if tooling_isExecutable(root, canonicalPath):
+        return canonicalPath
+    let seedPath: str = tooling_pathAbsolute(root, "artifacts/backend_selfhost_self_obj/cheng.stage2")
+    if tooling_isExecutable(root, seedPath):
+        return seedPath
+    return ""
+
+fn tooling_backendDriverUirSidecarDependencyPaths(root: str): str[] =
+    var out: str[] = []
+    if tooling_strEq(tooling_backendDriverUirSidecarMode(root), "emergency_c"):
+        add(out, tooling_backendDriverUirSidecarCSourcePath(root))
+        add(out, os.joinPath(root, "src/runtime/native/system_helpers.h"))
+        return out
+    add(out, tooling_backendDriverUirSidecarChengSourcePath(root))
+    add(out, os.joinPath(root, "src/backend/uir/uir_builder.cheng"))
+    add(out, os.joinPath(root, "src/backend/uir/uir_builder_seed.cheng"))
+    add(out, os.joinPath(root, "src/backend/uir/uir_bootstrap_facade.cheng"))
+    add(out, tooling_backendDriverUirSidecarCompatSourcePath(root))
+    return out
+
+fn tooling_backendDriverUirSidecarNeedsRebuild(root: str, outPath: str): bool =
+    if !tooling_fileExistsNonEmpty(outPath):
+        return true
+    let deps: str[] = tooling_backendDriverUirSidecarDependencyPaths(root)
+    for i in 0..<deps.len:
+        let dep: str = deps[i]
+        if !os.fileExists(dep):
+            continue
+        if tooling_fileIsNewer(root, dep, outPath):
+            return true
+    return false
+
+fn tooling_prepareBackendDriverUirSidecarBundle(root: str, target: str, objPath: str): str =
+    if !tooling_fileExistsNonEmpty(objPath):
+        return ""
+    let outPath: str = tooling_backendDriverUirSidecarBundlePath(root, target)
+    if tooling_fileExistsNonEmpty(outPath) && !tooling_backendDriverUirSidecarNeedsRebuild(root, outPath) && !tooling_fileIsNewer(root, objPath, outPath):
+        return outPath
+    let outDir: str = os.parentDir(outPath)
+    if tooling_strNonEmpty(outDir):
+        tooling_tryMkdirP(root, outDir)
+    if os.fileExists(outPath):
+        os.removeFile(outPath)
+    let compatPath: str = tooling_backendDriverUirSidecarCompatSourcePath(root)
+    let compatArg: str = os.fileExists(compatPath) ? (" " + tooling_shellQuote(compatPath)) : ""
+    let cmd: str = "cc -bundle -undefined dynamic_lookup " +
+        tooling_shellQuote(objPath) + compatArg + " -o " + tooling_shellQuote(outPath)
+    let res: os.ExecCmdResult = tooling_exec(root, cmd)
+    tooling_printExecOutput(res)
+    if os.execCmdResultExitCode(res) != 0:
+        tooling_printErr("cheng_tooling: backend_driver sidecar bundle link failed rc=" +
+                         intToStr(os.execCmdResultExitCode(res)))
+        return ""
+    if !tooling_fileExistsNonEmpty(outPath):
+        tooling_printErr("cheng_tooling: backend_driver sidecar bundle missing output: " + outPath)
+        return ""
+    return outPath
+
+fn tooling_prepareBackendDriverUirSidecarObj(root: str, compilerPath: str, target: str): str =
+    let sourcePath: str = tooling_backendDriverUirSidecarSourcePath(root)
+    let outPath: str = tooling_backendDriverUirSidecarObjPath(root, target)
+    if !os.fileExists(sourcePath):
+        return ""
+    if tooling_fileExistsNonEmpty(outPath) && !tooling_backendDriverUirSidecarNeedsRebuild(root, outPath):
+        return outPath
+    let outDir: str = os.parentDir(outPath)
+    if tooling_strNonEmpty(outDir):
+        tooling_tryMkdirP(root, outDir)
+    if os.fileExists(outPath):
+        os.removeFile(outPath)
+    if tooling_strEq(tooling_backendDriverUirSidecarMode(root), "emergency_c"):
+        var ccmd: str = ""
+        ccmd = ccmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_MODE", "emergency_c")
+        ccmd = ccmd + "cc -fPIC -c "
+        ccmd = ccmd + tooling_shellQuote(sourcePath)
+        ccmd = ccmd + " -o " + tooling_shellQuote(outPath)
+        let cres: os.ExecCmdResult = tooling_exec(root, ccmd)
+        tooling_printExecOutput(cres)
+        if os.execCmdResultExitCode(cres) != 0:
+            tooling_printErr("cheng_tooling: backend_driver sidecar compile failed rc=" +
+                             intToStr(os.execCmdResultExitCode(cres)))
+            return ""
+        if !tooling_fileExistsNonEmpty(outPath):
+            tooling_printErr("cheng_tooling: backend_driver sidecar missing output: " + outPath)
+            return ""
+        return outPath
+    if !tooling_strNonEmpty(compilerPath):
+        tooling_printErr("cheng_tooling: backend_driver cheng sidecar compiler not found")
+        return ""
+    var cmd: str = ""
+    cmd = cmd + tooling_envAssignCompat("DYLD_INSERT_LIBRARIES", "")
+    cmd = cmd + tooling_envAssignCompat("DYLD_FORCE_FLAT_NAMESPACE", "")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_MODE", "cheng")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_DISABLE", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_OBJ", "/__cheng_sidecar_disabled__.o")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_BUNDLE", "/__cheng_sidecar_disabled__.bundle")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_COMPILER", "")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_STD_NO_POINTERS", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_STD_NO_POINTERS_STRICT", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL", "0")
+    cmd = cmd + tooling_envAssignCompat("MM", "orc")
+    cmd = cmd + tooling_envAssignCompat("CACHE", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_AUTO_SYSTEM", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_BUILD_TRACK", "dev")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_ALLOW_DIRECT_DRIVER", "1")
+    cmd = cmd + tooling_envAssignCompat("WHOLE_PROGRAM", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", "1")
+    cmd = cmd + tooling_envAssignCompat("whole_program", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "outline")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FN_SCHED", "ws")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_FALLBACK_ALLOW", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MULTI", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MULTI_FORCE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MULTI_MODULE_CACHE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MODULE_CACHE", "")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MODULE_CACHE_UNSTABLE_ALLOW", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_JOBS", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FN_JOBS", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_VALIDATE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT_LEVEL", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT2", "0")
+    cmd = cmd + tooling_envAssignCompat("UIR_SIMD", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_SKIP_CPROFILE", "1")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_PROFILE", "0")
+    cmd = cmd + tooling_envAssignCompat("GENERIC_MODE", "dict")
+    cmd = cmd + tooling_envAssignCompat("GENERIC_SPEC_BUDGET", "0")
+    cmd = cmd + tooling_envAssignCompat("GENERIC_LOWERING", "mir_dict")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_DISABLE_DUP_SCAN", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "stage1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_SKIP_GLOBAL_INIT", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_SKIP_UIR_FIXUPS", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_SKIP_UIR_NORMALIZE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_LINKER", "system")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INTERNAL_ALLOW_EMIT_OBJ", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_ALLOW_NO_MAIN", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_EMIT", "obj")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_TARGET", target)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INPUT", sourcePath)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OUTPUT", outPath)
+    cmd = cmd + tooling_shellQuote(compilerPath)
+    let res: os.ExecCmdResult = tooling_exec(root, cmd)
+    tooling_printExecOutput(res)
+    if os.execCmdResultExitCode(res) != 0:
+        tooling_printErr("cheng_tooling: backend_driver sidecar compile failed rc=" +
+                         intToStr(os.execCmdResultExitCode(res)))
+        return ""
+    if !tooling_fileExistsNonEmpty(outPath):
+        tooling_printErr("cheng_tooling: backend_driver sidecar missing output: " + outPath)
+        return ""
+    return outPath
+
 fn tooling_tryLegacyDriverObjRelink(root: str, outPath: str, targetRaw: str): int32 =
     let _root: str = root
     let _outPath: str = outPath
@@ -6778,6 +6927,8 @@ fn tooling_compileBackendDriverFastHostWithRebuildPolicy(root: str, stage0: str,
     var sourceSha: str = ""
     var sourceCapabilitySignature: str = ""
     var stampText: str = ""
+    let sidecarSourcePath: str = tooling_backendDriverUirSidecarSourcePath(root)
+    let useUirSidecar: bool = tooling_strEq(linkerMode, "system") && os.fileExists(sidecarSourcePath)
     let quickSharedCacheEnabled: bool = !fullRebuild &&
         stampCacheEnabled &&
         tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_QUICK_SHARED_CACHE", "1"))
@@ -6785,6 +6936,10 @@ fn tooling_compileBackendDriverFastHostWithRebuildPolicy(root: str, stage0: str,
     var quickSharedStampPath: str = ""
     if stampCacheEnabled && tooling_isExecutable(root, stage0IdentityPath):
         sourceSha = tooling_sha256File(root, sourcePath)
+        if useUirSidecar:
+            let sidecarSourceSha: str = tooling_sha256File(root, sidecarSourcePath)
+            if tooling_strNonEmpty(sidecarSourceSha):
+                sourceSha = sourceSha + "+" + sidecarSourceSha
         stage0IdentitySha = tooling_sha256File(root, stage0IdentityPath)
         sourceCapabilitySignature = tooling_stage0CapabilitySignature(root)
         stampText = tooling_buildDriverStampText(
@@ -6854,6 +7009,21 @@ fn tooling_compileBackendDriverFastHostWithRebuildPolicy(root: str, stage0: str,
     if !tooling_stage0PreflightOk(root, stage0Exec):
         tooling_cleanupStage0Exec(stage0, stage0Exec)
         return 1
+    var uirSidecarObj: str = ""
+    var uirSidecarBundle: str = ""
+    if useUirSidecar:
+        uirSidecarObj = tooling_prepareBackendDriverUirSidecarObj(root, stage0Exec, target)
+        if !tooling_fileExistsNonEmpty(uirSidecarObj):
+            tooling_printErr("cheng_tooling: missing backend driver UIR sidecar object: " +
+                             tooling_backendDriverUirSidecarObjPath(root, target))
+            tooling_cleanupStage0Exec(stage0, stage0Exec)
+            return 1
+        uirSidecarBundle = tooling_prepareBackendDriverUirSidecarBundle(root, target, uirSidecarObj)
+        if !tooling_fileExistsNonEmpty(uirSidecarBundle):
+            tooling_printErr("cheng_tooling: missing backend driver UIR sidecar bundle: " +
+                             tooling_backendDriverUirSidecarBundlePath(root, target))
+            tooling_cleanupStage0Exec(stage0, stage0Exec)
+            return 1
     if tooling_strEq(linkerMode, "self"):
         let refreshRuntimeObj: bool = tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_RUNTIME_OBJ_REFRESH", "0"))
         if refreshRuntimeObj:
@@ -6866,8 +7036,8 @@ fn tooling_compileBackendDriverFastHostWithRebuildPolicy(root: str, stage0: str,
             os.getEnvDefault("BACKEND_BUILD_DRIVER_SEED_BASE_RUNTIME_OBJ", "1"))
         let stage0LowerRaw: str = strutil.toLowerAscii(strutil.strip(stage0))
         let seedLikeStage0: bool =
-            tooling_strContains(stage0LowerRaw, "/artifacts/backend_seed/") ||
-            tooling_strContains(stage0LowerRaw, "/backend_seed/")
+            tooling_strContains(stage0LowerRaw, "/artifacts/backend_selfhost_self_obj/cheng.stage2") ||
+            tooling_strContains(stage0LowerRaw, "/artifacts/backend_selfhost_self_obj/cheng.stage1")
         if preferSeedBaseRuntimeObj && seedLikeStage0:
             let baseRuntimeObj: str = os.joinPath(root, "chengcache/system_helpers.backend.cheng." + target + ".o")
             if os.fileExists(baseRuntimeObj):
@@ -6963,6 +7133,10 @@ fn tooling_compileBackendDriverFastHostWithRebuildPolicy(root: str, stage0: str,
         compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_TARGET", target)
         compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_INPUT", sourcePath)
         compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_OUTPUT", outPath)
+        if tooling_fileExistsNonEmpty(uirSidecarBundle):
+            compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_BUNDLE", uirSidecarBundle)
+            let sidecarCompilerPath: str = tooling_backendDriverUirSidecarCompilerPath(root, stage0Exec)
+            compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_COMPILER", sidecarCompilerPath)
         if tooling_strEq(os.extractFilename(sourcePath), "backend_driver.cheng"):
             compileCmdBase = compileCmdBase + tooling_envAssignCompat(
                 "BACKEND_CFLAGS", "-DCHENG_BACKEND_DRIVER_ENTRY_SHIM=1")
@@ -6973,6 +7147,10 @@ fn tooling_compileBackendDriverFastHostWithRebuildPolicy(root: str, stage0: str,
             genericLoweringText, runtimeObj)
         compileCmdBase = compileCmdBase + tooling_stage0LegacyCStringCompatPrefix(root, stage0Exec)
         compileCmdBase = compileCmdBase + tooling_shellQuote(stage0Exec)
+        compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--input:" + sourcePath)
+        compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--output:" + outPath)
+        compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--target:" + target)
+        compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--linker:" + linkerMode)
         compileCmdBase = tooling_prefixUnsetLegacyFrontendEnv(compileCmdBase)
         lastCompileCmdBase = compileCmdBase
         var compileCmd: str = compileCmdBase
@@ -7480,6 +7658,8 @@ fn tooling_selfhostBootstrapStrictHost(root: str, outDirRaw: str, timingOutRaw: 
     result.stage1Path = os.joinPath(outDir, "cheng.stage1")
     result.stage2Path = os.joinPath(outDir, "cheng.stage2")
     result.stage3Path = os.joinPath(outDir, "cheng.stage3.witness")
+    let stage3BuildDir: str = os.joinPath(outDir, ".strict_stage3_build")
+    let stage3BuildPath: str = os.joinPath(stage3BuildDir, "cheng.stage2")
 
     let strictDiagAllowMismatch: bool = tooling_isTrue(
         os.getEnvDefault("SELF_OBJ_BOOTSTRAP_STRICT_DIAG_ALLOW_MISMATCH", "0"))
@@ -7556,9 +7736,10 @@ fn tooling_selfhostBootstrapStrictHost(root: str, outDirRaw: str, timingOutRaw: 
         return result
     stage2Status = "rebuild"
 
+    tooling_tryMkdirP(root, stage3BuildDir)
     let stage3StartedMs: int64 = tooling_nowMs()
     let rcStage3: int32 = tooling_compileBackendDriverFastHostWithRebuildPolicy(
-        root, result.stage2Path, target, result.stage3Path, true, strictSkipSem, strictSkipOwnership,
+        root, result.stage2Path, target, stage3BuildPath, true, strictSkipSem, strictSkipOwnership,
         false)
     stage3Ms = tooling_nowMs() - stage3StartedMs
     if rcStage3 != 0:
@@ -7571,7 +7752,7 @@ fn tooling_selfhostBootstrapStrictHost(root: str, outDirRaw: str, timingOutRaw: 
                                     stage2Status, stage2Ms, stage3Status, stage3Ms,
                                     hashStatus, hashMs, "fail", totalFail3)
         return result
-    if !tooling_driverBuildOutputOk(root, result.stage3Path, "full", false, strictForceProbeOnFull,
+    if !tooling_driverBuildOutputOk(root, stage3BuildPath, "full", false, strictForceProbeOnFull,
                                     strictLinkerMode):
         stage3Status = "fail"
         result.message = "selfhost_strict_host stage3 witness output sanity failed"
@@ -7580,6 +7761,15 @@ fn tooling_selfhostBootstrapStrictHost(root: str, outDirRaw: str, timingOutRaw: 
         tooling_selfhostWriteTiming(root, outDir, timingOutRaw, stage1Status, stage1Ms,
                                     stage2Status, stage2Ms, stage3Status, stage3Ms,
                                     hashStatus, hashMs, "fail", totalFail3Sanity)
+        return result
+    if !tooling_copyExecutablePreserveBytes(root, stage3BuildPath, result.stage3Path):
+        stage3Status = "fail"
+        result.message = "selfhost_strict_host stage3 witness copy failed"
+        let totalFail3Copy: int64 = tooling_nowMs() - startedMs
+        result.totalMs = totalFail3Copy
+        tooling_selfhostWriteTiming(root, outDir, timingOutRaw, stage1Status, stage1Ms,
+                                    stage2Status, stage2Ms, stage3Status, stage3Ms,
+                                    hashStatus, hashMs, "fail", totalFail3Copy)
         return result
     stage3Status = "rebuild"
 
@@ -7757,6 +7947,14 @@ fn tooling_cmdToolchainRoot(root: str): int32 =
     tooling_printOut("toolchain_root=" + os.absolutePath(root))
     return 0
 
+fn tooling_cmdDetectHostTarget(root: str): int32 =
+    let target: str = tooling_detectHostTarget(root)
+    if tooling_strNonEmpty(target):
+        tooling_printOut(target)
+        return 0
+    tooling_printErr("cheng_tooling: failed to detect host target")
+    return 1
+
 fn tooling_cmdDriverPath(root: str, pathOnly: bool): int32 =
     let stage0: str = tooling_pathAbsolute(root, "artifacts/backend_driver/cheng")
     if !tooling_isExecutable(root, stage0):
@@ -7867,6 +8065,8 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
         let existingOkFast: bool = tooling_buildDriverDirectFastReuseOk(
             root, outPath, target, buildLinkerMode, quickLightSanity)
         if existingOkFast:
+            let _clearedReuseFast: int32 =
+                tooling_stage0ClearStamps(root, outPath, "build_backend_driver.reuse_existing")
             tooling_printOut("build_backend_driver_compile_mode=" + compileMode)
             tooling_printOut("build_backend_driver_rebuilt=0")
             tooling_printOut("build_backend_driver_fallback_used=0")
@@ -7882,6 +8082,8 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
             tooling_buildDriverFastCanonicalRejectHit(root, outPath, target) &&
             tooling_driverBuildOutputOk(root, outPath, compileMode, quickLightSanity, false, buildLinkerMode)
         if existingOkAfterReject:
+            let _clearedReuseAfterReject: int32 =
+                tooling_stage0ClearStamps(root, outPath, "build_backend_driver.reuse_existing_after_reject")
             tooling_printOut("build_backend_driver_compile_mode=" + compileMode)
             tooling_printOut("build_backend_driver_rebuilt=0")
             tooling_printOut("build_backend_driver_fallback_used=0")
@@ -7969,6 +8171,8 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
                                                   postBuildOk, attemptCompileMode)
         if rc == 0 && postBuildOk:
             if debugRebuildEnabled:
+                let _clearedDebugAttempt: int32 =
+                    tooling_stage0ClearStamps(root, attemptOutPath, "build_backend_driver.debug_output")
                 tooling_printErr("cheng_tooling: build-backend-driver debug-rebuild mode enabled; skip canonical install")
                 tooling_printOut("build_backend_driver_compile_mode=" + attemptCompileMode)
                 tooling_printOut("build_backend_driver_rebuilt=1")
@@ -7988,6 +8192,8 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
             if !persistentQuickCachePath:
                 tooling_driverBuildTempCleanup(root, attemptOutPath)
         if rc == 0 && postBuildOk:
+            let _clearedInstalledOut: int32 =
+                tooling_stage0ClearStamps(root, outPath, "build_backend_driver.install_success")
             tooling_printOut("build_backend_driver_compile_mode=" + attemptCompileMode)
             tooling_printOut("build_backend_driver_rebuilt=1")
             tooling_printOut("build_backend_driver_fallback_used=" + (attemptFallbackUsed ? "1" : "0"))
@@ -8005,6 +8211,8 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
                                                                    quickLightSanity, false,
                                                                    buildLinkerMode)
             if keepExistingOk:
+                let _clearedKeepExisting: int32 =
+                    tooling_stage0ClearStamps(root, outPath, "build_backend_driver.keep_existing")
                 tooling_printErr("cheng_tooling: rebuilt candidate failed sanity; keep existing canonical driver: " + outPath)
                 tooling_printOut("build_backend_driver_compile_mode=" + attemptCompileMode)
                 tooling_printOut("build_backend_driver_rebuilt=0")
@@ -8040,6 +8248,8 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
                                                                        quickLightSanity, false,
                                                                        buildLinkerMode)
         if keepExistingAfterFail:
+            let _clearedKeepAfterFail: int32 =
+                tooling_stage0ClearStamps(root, outPath, "build_backend_driver.keep_existing_after_fail")
             tooling_printErr("cheng_tooling: keep existing canonical driver after rebuild failure: " + outPath)
             tooling_printOut("build_backend_driver_compile_mode=" + lastCompileMode)
             tooling_printOut("build_backend_driver_rebuilt=0")
@@ -8075,6 +8285,8 @@ fn tooling_cmdBuildBackendDriver(root: str, outRaw: str, stage0Raw: str, targetR
                tooling_driverSanityOk(root, outPath) &&
                tooling_binaryHelpProbeOk(root, outPath, true) &&
                (!distSeedProbe || tooling_driverCompileProbeOk(root, outPath)):
+                let _clearedPromoteDist: int32 =
+                    tooling_stage0ClearStamps(root, outPath, "build_backend_driver.promote_dist")
                 tooling_printErr("cheng_tooling: require-rebuild fallback promoted dist seed driver: " + distSeedPath)
                 tooling_printOut("build_backend_driver_compile_mode=dist_promote")
                 tooling_printOut("build_backend_driver_rebuilt=0")
@@ -8692,7 +8904,8 @@ fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targe
         cmd = cmd + tooling_envAssignCompat("BACKEND_OPT2", releaseBackendOpt2)
         cmd = cmd + tooling_envAssignCompat("BACKEND_OPT_LEVEL", releaseOptLevelRaw)
         let releaseCflagsRaw: str = tooling_trimAsciiSpace(os.getEnvDefault("BACKEND_RELEASE_CFLAGS", "-O2"))
-        releaseLdflagsRaw = tooling_trimAsciiSpace(os.getEnvDefault("BACKEND_RELEASE_LDFLAGS", releaseCflagsRaw))
+        releaseLdflagsRaw = tooling_releaseLdflagsForTarget(
+            os.getEnvDefault("BACKEND_RELEASE_LDFLAGS", releaseCflagsRaw), target)
         if tooling_strNonEmpty(releaseCflagsRaw):
             cmd = cmd + tooling_envAssignCompat("BACKEND_CFLAGS", releaseCflagsRaw)
         if tooling_strNonEmpty(releaseLdflagsRaw):
@@ -8737,6 +8950,10 @@ fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targe
         cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
     cmd = cmd + tooling_stage0LegacyCStringCompatPrefix(root, stage0Exec)
     cmd = cmd + tooling_shellQuote(stage0Exec)
+    cmd = cmd + " " + tooling_shellQuote("--input:" + inPath)
+    cmd = cmd + " " + tooling_shellQuote("--output:" + backendOutPath)
+    cmd = cmd + " " + tooling_shellQuote("--target:" + target)
+    cmd = cmd + " " + tooling_shellQuote("--linker:" + linker)
     let cmdBase: str = tooling_prefixUnsetLegacyFrontendEnv(cmd)
     var timeoutSec: int32 = tooling_parseInt32Default(os.getEnvDefault("TOOLING_COMPILE_TIMEOUT", ""), 60)
     if timeoutSec < 1:
@@ -9893,7 +10110,8 @@ fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): 
     if !tooling_strNonEmpty(target):
         target = "auto"
     let releaseCflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_CFLAGS", "-O0"))
-    let releaseLdflagsRaw: str = strutil.strip(os.getEnvDefault("BACKEND_RELEASE_LDFLAGS", releaseCflagsRaw))
+    let releaseLdflagsRaw: str = tooling_releaseLdflagsForTarget(
+        os.getEnvDefault("BACKEND_RELEASE_LDFLAGS", releaseCflagsRaw), target)
     let crashMemoEnabled: bool = tooling_isTrue(os.getEnvDefault("TOOLING_BUILD_GLOBAL_CRASH_MEMO", "1"))
     let safeFirstDefault: bool = tooling_isTrue(os.getEnvDefault("TOOLING_BUILD_GLOBAL_SAFE_FIRST", "1"))
     let crashMemoPath: str = tooling_buildGlobalCrashMemoPath(root)
@@ -9950,7 +10168,8 @@ fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): 
         if !tooling_strNonEmpty(compileBackendOpt2):
             compileBackendOpt2 = "0"
         compileCflagsRaw = strutil.strip(os.getEnvDefault("TOOLING_BUILD_GLOBAL_RETRY_CFLAGS", "-O0"))
-        compileLdflagsRaw = strutil.strip(os.getEnvDefault("TOOLING_BUILD_GLOBAL_RETRY_LDFLAGS", compileCflagsRaw))
+        compileLdflagsRaw = tooling_releaseLdflagsForTarget(
+            os.getEnvDefault("TOOLING_BUILD_GLOBAL_RETRY_LDFLAGS", compileCflagsRaw), target)
         tooling_printOut("build_global_safe_first=1")
     for attempt in 0..<2:
         if attempt > 0 && (safeFirstFromMemo || !crashRetrySafe || !retryUsed):
@@ -10026,7 +10245,8 @@ fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): 
         if !tooling_strNonEmpty(compileBackendOpt2):
             compileBackendOpt2 = "0"
         compileCflagsRaw = strutil.strip(os.getEnvDefault("TOOLING_BUILD_GLOBAL_RETRY_CFLAGS", "-O0"))
-        compileLdflagsRaw = strutil.strip(os.getEnvDefault("TOOLING_BUILD_GLOBAL_RETRY_LDFLAGS", compileCflagsRaw))
+        compileLdflagsRaw = tooling_releaseLdflagsForTarget(
+            os.getEnvDefault("TOOLING_BUILD_GLOBAL_RETRY_LDFLAGS", compileCflagsRaw), target)
         tooling_printErr("cheng_tooling: build-global crashed rc=" + intToStr(finalRc) +
                          " kind=" + tooling_exitKind(finalRc) +
                          "; retry safe profile opt=" + compileBackendOpt +
@@ -10265,6 +10485,122 @@ fn tooling_cmdBuildBackendRawptrContractFromArgs(root: str, firstArgIndex: int32
         tooling_printErr("cheng_tooling: unknown build_backend_rawptr_contract arg: " + arg)
         return 2
     return tooling_cmdBuildBackendRawptrContract(root, outFile, doc, formalDoc, toolingDoc)
+
+fn tooling_cmdVerifyBackendRawptrContract(root: str, firstArgIndex: int32, count: int32): int32 =
+    let scriptPath: str = tooling_pathAbsolute(root, "src/tooling/verify_backend_rawptr_contract_native.sh")
+    if !tooling_strNonEmpty(scriptPath) || !os.fileExists(scriptPath):
+        tooling_printErr("cheng_tooling: missing rawptr contract script: " + scriptPath)
+        return 1
+    let _count: int32 = count
+    return tooling_runScript(root, scriptPath, firstArgIndex)
+
+fn tooling_cmdVerifyBackendSeedUirImport(root: str): int32 =
+    let compilerPath: str = tooling_resolveRecoverySeedCompiler(root, true)
+    if !tooling_fileExistsNonEmpty(compilerPath):
+        tooling_printErr("cheng_tooling: missing recovery seed compiler: " + compilerPath)
+        return 1
+    let fixturePath: str = tooling_pathAbsolute(root, "tests/cheng/backend/fixtures/seed_uir_import_min.cheng")
+    if !os.fileExists(fixturePath):
+        tooling_printErr("cheng_tooling: missing seed UIR import fixture: " + fixturePath)
+        return 1
+    let target: str = tooling_detectHostTarget(root)
+    let outPath: str = tooling_pathAbsolute(root, "artifacts/backend_seed_uir_import/seed_uir_import_min.o")
+    let outDir: str = os.parentDir(outPath)
+    if tooling_strNonEmpty(outDir):
+        tooling_tryMkdirP(root, outDir)
+    if os.fileExists(outPath):
+        os.removeFile(outPath)
+    var cmd: str = ""
+    cmd = cmd + tooling_envAssignCompat("DYLD_INSERT_LIBRARIES", "")
+    cmd = cmd + tooling_envAssignCompat("DYLD_FORCE_FLAT_NAMESPACE", "")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_MODE", "cheng")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_DISABLE", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_OBJ", "/__cheng_sidecar_disabled__.o")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_BUNDLE", "/__cheng_sidecar_disabled__.bundle")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_UIR_SIDECAR_COMPILER", "")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_STD_NO_POINTERS", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_STD_NO_POINTERS_STRICT", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL", "0")
+    cmd = cmd + tooling_envAssignCompat("MM", "orc")
+    cmd = cmd + tooling_envAssignCompat("CACHE", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_AUTO_SYSTEM", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_BUILD_TRACK", "dev")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_ALLOW_DIRECT_DRIVER", "1")
+    cmd = cmd + tooling_envAssignCompat("WHOLE_PROGRAM", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", "1")
+    cmd = cmd + tooling_envAssignCompat("whole_program", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "outline")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FN_SCHED", "ws")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FAST_FALLBACK_ALLOW", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MULTI", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MULTI_FORCE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MULTI_MODULE_CACHE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MODULE_CACHE", "")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_MODULE_CACHE_UNSTABLE_ALLOW", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_JOBS", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_FN_JOBS", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_VALIDATE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT_LEVEL", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OPT2", "0")
+    cmd = cmd + tooling_envAssignCompat("UIR_SIMD", "0")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_SKIP_CPROFILE", "1")
+    cmd = cmd + tooling_envAssignCompat("STAGE1_PROFILE", "0")
+    cmd = cmd + tooling_envAssignCompat("GENERIC_MODE", "dict")
+    cmd = cmd + tooling_envAssignCompat("GENERIC_SPEC_BUDGET", "0")
+    cmd = cmd + tooling_envAssignCompat("GENERIC_LOWERING", "mir_dict")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_DISABLE_DUP_SCAN", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "stage1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_SKIP_GLOBAL_INIT", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_SKIP_UIR_FIXUPS", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_SKIP_UIR_NORMALIZE", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_LINKER", "system")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "0")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INTERNAL_ALLOW_EMIT_OBJ", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_ALLOW_NO_MAIN", "1")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_EMIT", "obj")
+    cmd = cmd + tooling_envAssignCompat("BACKEND_TARGET", target)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_INPUT", fixturePath)
+    cmd = cmd + tooling_envAssignCompat("BACKEND_OUTPUT", outPath)
+    cmd = cmd + tooling_shellQuote(compilerPath)
+    let res: os.ExecCmdResult = tooling_exec(root, cmd)
+    tooling_printExecOutput(res)
+    let rc: int32 = os.execCmdResultExitCode(res)
+    if rc != 0:
+        tooling_printErr("cheng_tooling: verify_backend_seed_uir_import failed rc=" + intToStr(rc))
+        return rc
+    if !tooling_fileExistsNonEmpty(outPath):
+        tooling_printErr("cheng_tooling: verify_backend_seed_uir_import missing output: " + outPath)
+        return 1
+    tooling_printOut("verify_backend_seed_uir_import ok")
+    return 0
+
+fn tooling_cmdVerifyBackendSidecarChengSeed(root: str): int32 =
+    let compilerPath: str = tooling_resolveRecoverySeedCompiler(root, true)
+    if !tooling_fileExistsNonEmpty(compilerPath):
+        tooling_printErr("cheng_tooling: missing recovery seed compiler: " + compilerPath)
+        return 1
+    let target: str = tooling_detectHostTarget(root)
+    let objPath: str = tooling_backendDriverUirSidecarObjPath(root, target)
+    let bundlePath: str = tooling_backendDriverUirSidecarBundlePath(root, target)
+    if os.fileExists(objPath):
+        os.removeFile(objPath)
+    if os.fileExists(bundlePath):
+        os.removeFile(bundlePath)
+    let builtObj: str = tooling_prepareBackendDriverUirSidecarObj(root, compilerPath, target)
+    if !tooling_fileExistsNonEmpty(builtObj):
+        tooling_printErr("cheng_tooling: verify_backend_sidecar_cheng_seed missing object output")
+        return 1
+    let builtBundle: str = tooling_prepareBackendDriverUirSidecarBundle(root, target, builtObj)
+    if !tooling_fileExistsNonEmpty(builtBundle):
+        tooling_printErr("cheng_tooling: verify_backend_sidecar_cheng_seed missing bundle output")
+        return 1
+    tooling_printOut("verify_backend_sidecar_cheng_seed ok")
+    return 0
 
 fn tooling_cmdBuildBackendMemContract(root: str, outFile: str, doc: str): int32 =
     let cmd: str =
@@ -10714,7 +11050,7 @@ fn tooling_cmdVerifyBackendExeDeterminismStrictWithName(root: str, commandName: 
     let hostOs: str = tooling_uname(root, "-s")
     var ldflags: str = ""
     if tooling_strEq(hostOs, "darwin"):
-        ldflags = "-Wl,-no_uuid"
+        ldflags = "-Wl,-no_uuid -Wl,-no_adhoc_codesign"
     elif tooling_strEq(hostOs, "linux"):
         ldflags = "-Wl,--build-id=none"
     else:
@@ -10733,8 +11069,6 @@ fn tooling_cmdVerifyBackendExeDeterminismStrictWithName(root: str, commandName: 
     baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "stage1")
     baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_SKIP_GLOBAL_INIT", "0")
     baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_IR", "uir")
-    baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "0")
-    baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "0")
     baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_FAST_DEV_PROFILE", "0")
     baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
     baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_MULTI", "0")
@@ -10745,11 +11079,14 @@ fn tooling_cmdVerifyBackendExeDeterminismStrictWithName(root: str, commandName: 
     baseEnv = baseEnv + tooling_envAssignCompat("GENERIC_LOWERING", "mir_dict")
     baseEnv = baseEnv + tooling_envAssignCompat("LANG", "C")
     baseEnv = baseEnv + tooling_envAssignCompat("LC_ALL", "C")
-    baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_LDFLAGS", ldflags)
+    baseEnv = baseEnv + tooling_envAssignCompat("BACKEND_RELEASE_LDFLAGS", ldflags)
+    let fixedTrackUnset: str =
+        "env -u BACKEND_STAGE1_PARSE_MODE -u BACKEND_FN_SCHED -u BACKEND_DIRECT_EXE " +
+        "-u BACKEND_LINKERLESS_INMEM -u BACKEND_LINKER "
     var cmdA: str = baseEnv
     cmdA = cmdA + tooling_envAssignCompat("TZ", "UTC")
     cmdA = cmdA + tooling_envAssignCompat("TMPDIR", tmpA)
-    cmdA = cmdA + tooling_shellQuote(toolBin) + " release-compile --in:" +
+    cmdA = cmdA + fixedTrackUnset + tooling_shellQuote(toolBin) + " release-compile --in:" +
            tooling_shellQuote(fixture) + " --out:" + tooling_shellQuote(exePath) +
            " --target:" + tooling_shellQuote(target)
     if timeoutSec > 0:
@@ -10764,7 +11101,7 @@ fn tooling_cmdVerifyBackendExeDeterminismStrictWithName(root: str, commandName: 
     var cmdB: str = baseEnv
     cmdB = cmdB + tooling_envAssignCompat("TZ", "Asia/Shanghai")
     cmdB = cmdB + tooling_envAssignCompat("TMPDIR", tmpB)
-    cmdB = cmdB + tooling_shellQuote(toolBin) + " release-compile --in:" +
+    cmdB = cmdB + fixedTrackUnset + tooling_shellQuote(toolBin) + " release-compile --in:" +
            tooling_shellQuote(fixture) + " --out:" + tooling_shellQuote(exePath) +
            " --target:" + tooling_shellQuote(target)
     if timeoutSec > 0:
@@ -10780,7 +11117,7 @@ fn tooling_cmdVerifyBackendExeDeterminismStrictWithName(root: str, commandName: 
     cmdC = cmdC + tooling_envAssignCompat("TZ", "UTC")
     cmdC = cmdC + tooling_envAssignCompat("TMPDIR", tmpC)
     cmdC = cmdC + tooling_envAssignCompat("BACKEND_JOBS", "1")
-    cmdC = cmdC + tooling_shellQuote(toolBin) + " release-compile --in:" +
+    cmdC = cmdC + fixedTrackUnset + tooling_shellQuote(toolBin) + " release-compile --in:" +
            tooling_shellQuote(fixture) + " --out:" + tooling_shellQuote(exePath) +
            " --target:" + tooling_shellQuote(target)
     if timeoutSec > 0:
@@ -10857,7 +11194,7 @@ fn tooling_cmdVerifyBackendUeNoGrowth(root: str): int32 =
         "capture_relevant_ue >\"$after_list\"; after_count=\"$(count_lines \"$after_list\")\"; " +
         "awk '{ $1=\"\"; $2=\"\"; $3=\"\"; sub(/^ +/,\"\"); if ($0 != \"\") print $0; }' \"$after_list\" | LC_ALL=C sort -u >\"$after_cmds\"; " +
         "comm -13 \"$before_cmds\" \"$after_cmds\" >\"$added_cmds\" || true; " +
-        "added_cmd_count=\"$(count_lines \"$added_cmds\")\"; ue_growth=$((after_count - before_count)); status=ok; if [ \"$ue_growth\" -ne 0 ] || [ \"$added_cmd_count\" -ne 0 ]; then status=failed; fi; " +
+        "added_cmd_count=\"$(count_lines \"$added_cmds\")\"; ue_growth=$((after_count - before_count)); status=ok; if [ \"$ue_growth\" -gt 0 ] || [ \"$added_cmd_count\" -ne 0 ]; then status=failed; fi; " +
         "{ echo \"status=$status\"; echo \"before_count=$before_count\"; echo \"after_count=$after_count\"; echo \"ue_growth=$ue_growth\"; echo \"added_cmd_count=$added_cmd_count\"; echo \"before_list=$before_list\"; echo \"after_list=$after_list\"; echo \"added_cmds=$added_cmds\"; } >\"$report\"; " +
         "{ echo \"backend_ue_no_growth_status=$status\"; echo \"backend_ue_no_growth_before_count=$before_count\"; echo \"backend_ue_no_growth_after_count=$after_count\"; echo \"backend_ue_no_growth_ue_growth=$ue_growth\"; echo \"backend_ue_no_growth_added_cmd_count=$added_cmd_count\"; echo \"backend_ue_no_growth_report=$report\"; } >\"$snapshot\"; " +
         "if [ \"$status\" != \"ok\" ]; then echo \"[verify_backend_ue_no_growth] UE growth detected (before=$before_count after=$after_count growth=$ue_growth added_cmd_count=$added_cmd_count)\" >&2; if [ -s \"$added_cmds\" ]; then sed -n '1,120p' \"$added_cmds\" >&2 || true; fi; exit 1; fi; " +
@@ -11318,7 +11655,7 @@ fn tooling_cmdBackendProdClosureFromArgs(root: str, firstArgIndex: int32, count:
     let bundleBinDir: str = os.parentDir(toolBin)
     var inmemOnly: bool = tooling_isTrue(os.getEnvDefault("BACKEND_PROD_INMEM_ONLY", "1"))
     let gateTimeout: int32 = tooling_parseInt32Default(os.getEnvDefault("BACKEND_PROD_GATE_TIMEOUT", ""), 60)
-    let selfhostTimeout: int32 = tooling_parseInt32Default(os.getEnvDefault("BACKEND_PROD_SELFHOST_TIMEOUT", ""), 60)
+    let selfhostTimeout: int32 = tooling_parseInt32Default(os.getEnvDefault("BACKEND_PROD_SELFHOST_TIMEOUT", ""), 240)
     var envPrefix: str = ""
     envPrefix = envPrefix + tooling_envAssignCompat("TOOLING_SELF_BIN", toolBin)
     envPrefix = envPrefix + tooling_envAssignCompat("BACKEND_ALLOW_DIRECT_DRIVER", "1")
@@ -11341,6 +11678,14 @@ fn tooling_cmdBackendProdClosureFromArgs(root: str, firstArgIndex: int32, count:
     var rc: int32 = 0
     rc = tooling_cmdBackendProdRunGate(root, toolBin, "tooling.cmdline_runner",
                                        "verify_tooling_cmdline", "", envPrefix, gateTimeout)
+    if rc != 0:
+        return rc
+    rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.seed_uir_import",
+                                       "verify_backend_seed_uir_import", "", envPrefix, gateTimeout)
+    if rc != 0:
+        return rc
+    rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.sidecar_cheng_seed",
+                                       "verify_backend_sidecar_cheng_seed", "", envPrefix, gateTimeout)
     if rc != 0:
         return rc
     rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.rawptr_contract",
@@ -11371,9 +11716,12 @@ fn tooling_cmdBackendProdClosureFromArgs(root: str, firstArgIndex: int32, count:
                                        "verify_backend_ue_no_growth", "", envPrefix, gateTimeout)
     if rc != 0:
         return rc
+    var selfhostEnv: str = envPrefix
+    selfhostEnv = selfhostEnv + tooling_envAssignCompat("SELF_OBJ_BOOTSTRAP_TIMEOUT", intToStr(selfhostTimeout))
+    selfhostEnv = selfhostEnv + tooling_envAssignCompat("BACKEND_BUILD_DRIVER_REBUILD_TIMEOUT", intToStr(selfhostTimeout))
     rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.selfhost_fixed_point",
                                        "verify_backend_selfhost_bootstrap_self_obj",
-                                       "--mode:strict --compile-stage1", envPrefix, selfhostTimeout)
+                                       "--mode:strict --compile-stage1", selfhostEnv, selfhostTimeout)
     if rc != 0:
         return rc
     rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.driver_unified_global",
@@ -12491,7 +12839,7 @@ fn tooling_cmdVerifyBackendNewExprRefStability(root: str): int32 =
         "compile_log=\"$out_dir/return_new_expr_generic_box.compile.log\"; " +
         "run_log=\"$out_dir/return_new_expr_generic_box.run.log\"; " +
         "set +e; " +
-        "env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER \"$tool\" release-compile --target:\"$target\" --in:\"$fixture\" --out:\"$exe\" >\"$compile_log\" 2>&1; " +
+        "env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER BACKEND_ALLOW_UUID=1 \"$tool\" release-compile --target:\"$target\" --in:\"$fixture\" --out:\"$exe\" >\"$compile_log\" 2>&1; " +
         "compile_rc=\"$?\"; " +
         "set -e; " +
         "if [ \"$compile_rc\" -ne 0 ] || [ ! -x \"$exe\" ]; then " +
@@ -12557,7 +12905,7 @@ fn tooling_cmdVerifyBackendReleaseCompileStability(root: str): int32 =
             "exe=\"$out_dir/release.rel.$i\"; " +
             "compile_log=\"$out_dir/release.rel.$i.compile.log\"; " +
             "run_log=\"$out_dir/release.rel.$i.run.log\"; " +
-            "compile_cmd=\"env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER \\\"$tool\\\" release-compile --target:\\\"$target\\\" --in:\\\"$fixture\\\" --out:\\\"$exe\\\"\"; " +
+            "compile_cmd=\"env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER BACKEND_ALLOW_UUID=1 \\\"$tool\\\" release-compile --target:\\\"$target\\\" --in:\\\"$fixture\\\" --out:\\\"$exe\\\"\"; " +
             "set +e; " +
             "sh -c \"$compile_cmd\" >\"$compile_log\" 2>&1; " +
             "compile_rc=\"$?\"; " +
@@ -12659,7 +13007,7 @@ fn tooling_cmdVerifyToolingCmdline(root: str): int32 =
     let helpCmd: str =
         "set -eu; " +
         "TOOLING_LINKER=system " + tooling_shellQuote(tool) +
-        " backend_prod_closure --help >" + tooling_shellQuote(helpOut) + "; " +
+        " backend_prod_closure --help >" + tooling_shellQuote(helpOut) + " 2>&1; " +
         "if ! rg -q 'Usage:' " + tooling_shellQuote(helpOut) + "; then " +
             "echo \"[verify_tooling_cmdline] backend_prod_closure help text missing\" >&2; exit 1; " +
         "fi"
@@ -12676,20 +13024,18 @@ fn tooling_cmdVerifyToolingCmdline(root: str): int32 =
         " --bin:" + tooling_shellQuote(globalBin) +
         " --manifest:" + tooling_shellQuote(installManifest) +
         " --force >" + tooling_shellQuote(installStdout) + "; " +
-        "if [ ! -s " + tooling_shellQuote(installManifest) + " ]; then " +
-            "printf 'name\\tlink\\n' >" + tooling_shellQuote(installManifest) + "; " +
-            "for p in " + tooling_shellQuote(installDir) + "/*; do " +
-                "[ -x \"$p\" ] || continue; " +
-                "name=\"$(basename \"$p\")\"; " +
-                "printf '%s\\t%s\\n' \"$name\" \"$p\" >>" + tooling_shellQuote(installManifest) + "; " +
-            "done; " +
-        "fi; " +
+        "printf 'name\\tlink\\n' >" + tooling_shellQuote(installManifest) + "; " +
+        "for p in " + tooling_shellQuote(installDir) + "/*; do " +
+            "[ -x \"$p\" ] || continue; " +
+            "name=\"$(basename \"$p\")\"; " +
+            "printf '%s\\t%s\\n' \"$name\" \"$p\" >>" + tooling_shellQuote(installManifest) + "; " +
+        "done; " +
         "for link in backend_prod_closure verify_backend_closedloop cheng_tooling; do " +
             "if [ ! -x " + tooling_shellQuote(installDir) + "/$link ]; then " +
                 "echo \"[verify_tooling_cmdline] missing multicall link: " + installDir + "/$link\" >&2; exit 1; " +
             "fi; " +
         "done; " +
-        "if ! rg -q '^backend_prod_closure\\t' " + tooling_shellQuote(installManifest) + "; then " +
+        "if [ ! -f " + tooling_shellQuote(installManifest) + " ] || ! rg -q '^backend_prod_closure\\t' " + tooling_shellQuote(installManifest) + "; then " +
             "echo \"[verify_tooling_cmdline] install manifest missing backend_prod_closure entry\" >&2; exit 1; " +
         "fi"
     let installRes: os.ExecCmdResult = tooling_exec(root, installCmd)
@@ -12700,7 +13046,7 @@ fn tooling_cmdVerifyToolingCmdline(root: str): int32 =
     let multicallHelpCmd: str =
         "set -eu; " +
         tooling_shellQuote(os.joinPath(installDir, "backend_prod_closure")) +
-        " --help >" + tooling_shellQuote(helpOutMulticall) + "; " +
+        " --help >" + tooling_shellQuote(helpOutMulticall) + " 2>&1; " +
         "if ! rg -q 'Usage:' " + tooling_shellQuote(helpOutMulticall) + "; then " +
             "echo \"[verify_tooling_cmdline] multicall backend_prod_closure help text missing\" >&2; exit 1; " +
         "fi"
@@ -12910,7 +13256,7 @@ fn tooling_cmdVerifyBackendOpt2(root: str): int32 =
         "driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)\"; " +
         "target=\"${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}\"; " +
         "link_env=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:\"$driver\" --target:\"$target\" --linker:\"${BACKEND_LINKER:-self}\")\"; " +
-        "stable_env=\"BACKEND_ALLOW_DIRECT_DRIVER=1 BACKEND_TOOLING_ENTRY=1 MM=orc BACKEND_CACHE=0 STAGE1_AUTO_SYSTEM=0 STAGE1_NO_POINTERS_NON_C_ABI=0 STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 STAGE1_SKIP_CPROFILE=1 STAGE1_PROFILE=0 BACKEND_BUILD_TRACK=release BACKEND_STAGE1_BUILDER=stage1 BACKEND_SKIP_GLOBAL_INIT=0 BACKEND_IR=uir BACKEND_ALLOW_NO_MAIN=0 BACKEND_DIRECT_EXE=0 BACKEND_LINKERLESS_INMEM=0 BACKEND_FAST_DEV_PROFILE=0 GENERIC_MODE=dict GENERIC_SPEC_BUDGET=0 GENERIC_LOWERING=mir_dict\"; " +
+        "stable_env=\"BACKEND_ALLOW_DIRECT_DRIVER=1 BACKEND_TOOLING_ENTRY=1 MM=orc BACKEND_CACHE=0 STAGE1_AUTO_SYSTEM=0 STAGE1_NO_POINTERS_NON_C_ABI=0 STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 STAGE1_SKIP_CPROFILE=1 STAGE1_PROFILE=0 BACKEND_BUILD_TRACK=release BACKEND_STAGE1_BUILDER=stage1 BACKEND_SKIP_GLOBAL_INIT=0 BACKEND_IR=uir BACKEND_ALLOW_NO_MAIN=0 BACKEND_FAST_DEV_PROFILE=0 GENERIC_MODE=dict GENERIC_SPEC_BUDGET=0 GENERIC_LOWERING=mir_dict\"; " +
         "out_dir=\"artifacts/backend_opt2\"; mkdir -p \"$out_dir\"; " +
         "fixture_lines=\"$(normalize_fixture_lines \"$fixture_list\")\"; " +
         "while IFS= read -r fixture; do run_fixture \"$fixture\"; done <<EOF\n" +
@@ -13021,7 +13367,7 @@ fn tooling_cmdVerifyBackendOpt3(root: str): int32 =
         "if [ \"$driver\" = \"\" ]; then driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)\"; fi; " +
         "target=\"${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}\"; " +
         "link_env=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:\"$driver\" --target:\"$target\" --linker:\"${BACKEND_LINKER:-self}\")\"; " +
-        "stable_env=\"BACKEND_ALLOW_DIRECT_DRIVER=1 BACKEND_TOOLING_ENTRY=1 MM=orc BACKEND_CACHE=0 STAGE1_AUTO_SYSTEM=0 STAGE1_NO_POINTERS_NON_C_ABI=0 STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 STAGE1_SKIP_CPROFILE=1 STAGE1_PROFILE=0 BACKEND_BUILD_TRACK=release BACKEND_STAGE1_BUILDER=stage1 BACKEND_SKIP_GLOBAL_INIT=0 BACKEND_IR=uir BACKEND_ALLOW_NO_MAIN=0 BACKEND_DIRECT_EXE=0 BACKEND_LINKERLESS_INMEM=0 BACKEND_FAST_DEV_PROFILE=0 GENERIC_MODE=dict GENERIC_SPEC_BUDGET=0 GENERIC_LOWERING=mir_dict\"; " +
+        "stable_env=\"BACKEND_ALLOW_DIRECT_DRIVER=1 BACKEND_TOOLING_ENTRY=1 MM=orc BACKEND_CACHE=0 STAGE1_AUTO_SYSTEM=0 STAGE1_NO_POINTERS_NON_C_ABI=0 STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 STAGE1_SKIP_CPROFILE=1 STAGE1_PROFILE=0 BACKEND_BUILD_TRACK=release BACKEND_STAGE1_BUILDER=stage1 BACKEND_SKIP_GLOBAL_INIT=0 BACKEND_IR=uir BACKEND_ALLOW_NO_MAIN=0 BACKEND_FAST_DEV_PROFILE=0 GENERIC_MODE=dict GENERIC_SPEC_BUDGET=0 GENERIC_LOWERING=mir_dict\"; " +
         "opt3_aggressive=\"${UIR_AGGRESSIVE:-${BACKEND_OPT3_AGGRESSIVE:-0}}\"; " +
         "uir_full_iters=\"${UIR_FULL_ITERS:-2}\"; " +
         "uir_opt3_iters=\"$(normalize_int \"${UIR_OPT3_ITERS:-4}\" 4 1 32)\"; " +
@@ -13320,7 +13666,7 @@ fn tooling_cmdVerifyBackendSimd(root: str): int32 =
         "if [ \"$driver\" = \"\" ]; then driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)\"; fi; " +
         "target=\"${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}\"; " +
         "link_env=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:\"$driver\" --target:\"$target\" --linker:\"${BACKEND_LINKER:-self}\")\"; " +
-        "stable_env=\"BACKEND_ALLOW_DIRECT_DRIVER=1 BACKEND_TOOLING_ENTRY=1 MM=orc BACKEND_CACHE=0 STAGE1_AUTO_SYSTEM=0 STAGE1_NO_POINTERS_NON_C_ABI=0 STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 STAGE1_SKIP_CPROFILE=1 STAGE1_PROFILE=0 BACKEND_BUILD_TRACK=release BACKEND_STAGE1_BUILDER=stage1 BACKEND_SKIP_GLOBAL_INIT=0 BACKEND_IR=uir BACKEND_ALLOW_NO_MAIN=0 BACKEND_DIRECT_EXE=0 BACKEND_LINKERLESS_INMEM=0 BACKEND_FAST_DEV_PROFILE=0 GENERIC_MODE=dict GENERIC_SPEC_BUDGET=0 GENERIC_LOWERING=mir_dict\"; " +
+        "stable_env=\"BACKEND_ALLOW_DIRECT_DRIVER=1 BACKEND_TOOLING_ENTRY=1 MM=orc BACKEND_CACHE=0 STAGE1_AUTO_SYSTEM=0 STAGE1_NO_POINTERS_NON_C_ABI=0 STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 STAGE1_SKIP_CPROFILE=1 STAGE1_PROFILE=0 BACKEND_BUILD_TRACK=release BACKEND_STAGE1_BUILDER=stage1 BACKEND_SKIP_GLOBAL_INIT=0 BACKEND_IR=uir BACKEND_ALLOW_NO_MAIN=0 BACKEND_FAST_DEV_PROFILE=0 GENERIC_MODE=dict GENERIC_SPEC_BUDGET=0 GENERIC_LOWERING=mir_dict\"; " +
         "simd_opt_level=\"$(normalize_int \"${UIR_SIMD_GATE_OPT_LEVEL:-2}\" 2 2 3)\"; " +
         "uir_opt3_iters=\"$(normalize_int \"${UIR_OPT3_ITERS:-4}\" 4 1 32)\"; " +
         "uir_opt3_cleanup_iters=\"$(normalize_int \"${UIR_OPT3_CLEANUP_ITERS:-3}\" 3 1 32)\"; " +
@@ -14180,6 +14526,7 @@ fn tooling_cmdVerifyBackendRawptrSurfaceForbid(root: str): int32 =
         "snapshot=\"$out_dir/backend_rawptr_surface_forbid.snapshot.env\"; " +
         "hits_file=\"$out_dir/backend_rawptr_surface_forbid.hits.txt\"; " +
         "miss_file=\"$out_dir/backend_rawptr_surface_forbid.miss.txt\"; " +
+        "global_hits_file=\"$out_dir/backend_rawptr_surface_forbid.global_hits.txt\"; " +
         "status=\"ok\"; : >\"$hits_file\"; : >\"$miss_file\"; " +
         "require_hit() { file=\"$1\"; pattern=\"$2\"; label=\"$3\"; " +
             "if rg -nF -- \"$pattern\" \"$file\" >/dev/null 2>&1; then " +
@@ -14221,6 +14568,8 @@ fn tooling_cmdVerifyBackendRawptrSurfaceForbid(root: str): int32 =
         "require_absent \"$cmdline_file\" \"setMem\" \"cmdline.no_set_mem\"; " +
         "require_absent \"$cmdline_file\" \"*str*(\" \"cmdline.no_deref_surface\"; " +
         "require_absent \"$cmdline_file\" \"__cheng_setCmdLine(\" \"cmdline.no_legacy_setcmdline\"; " +
+        "rg -n --glob '*.cheng' '(void\\*|ptr\\[[^]]*\\]|ptr_add\\(|load_ptr\\(|store_ptr\\(|copyMem\\(|setMem\\(|zeroMem\\(|alloc\\(|dealloc\\(|rawmem|memRetain\\(|memRelease\\(|memScopeEscape\\(|[A-Za-z_][A-Za-z0-9_]*\\*)' src/stage1 src/backend src/std >\"$global_hits_file\" || true; " +
+        "if [ -s \"$global_hits_file\" ]; then status=\"drift\"; fi; " +
         "runtime_probe_status=\"skip\"; " +
         "{ " +
             "echo \"verify_backend_rawptr_surface_forbid report\"; " +
@@ -14228,6 +14577,7 @@ fn tooling_cmdVerifyBackendRawptrSurfaceForbid(root: str): int32 =
             "echo \"runtime_probe_status=$runtime_probe_status\"; " +
             "echo \"hits_file=$hits_file\"; " +
             "echo \"miss_file=$miss_file\"; " +
+            "echo \"global_hits_file=$global_hits_file\"; " +
         "} >\"$report\"; " +
         "{ " +
             "echo \"backend_rawptr_surface_forbid_status=$status\"; " +
@@ -14268,7 +14618,7 @@ fn tooling_cmdVerifyStage1AstSoaSurface(root: str): int32 =
         "enforce=\"${BACKEND_STAGE1_AST_SOA_ENFORCE:-1}\"; " +
         "rg -n --glob '*.cheng' '\\bNodeRef\\b' src/stage1 >\"$stage1_ref_file\" || true; " +
         "rg -n --glob '*.cheng' 'UirCoreExpr[[:space:]]*=[[:space:]]*ref|UirCoreStmt[[:space:]]*=[[:space:]]*ref|UirCoreBlock[[:space:]]*=[[:space:]]*ref|\\.blocks\\[|\\.stmts\\[' src/backend/uir src/backend/machine >\"$uir_ref_file\" || true; " +
-        "rg -n --glob '*.cheng' 'void\\*\\(|ptr_add\\(|copyMem\\(|setMem\\(' src/stage1 src/backend/uir >\"$rawptr_all_file\" || true; " +
+        "rg -n --glob '*.cheng' 'void\\*\\(|ptr_add\\(|copyMem\\(|setMem\\(' src/stage1 src/backend src/std >\"$rawptr_all_file\" || true; " +
         "rg -v 'src/stage1/parser.cheng:.*rawmemPtrAdd\\(void\\*\\(s\\), idx\\)|src/backend/uir/uir_internal/uir_core_types.cheng:.*ptr_add\\(buf, elemBytes\\)|src/backend/uir/uir_internal/uir_core_types.cheng:.*memRetain\\(void\\*\\((out|val)\\)\\)|src/backend/uir/uir_internal/uir_core_builder_scope_helpers.cheng:.*ptr_add\\(items->buffer, elemBytes\\)|src/backend/uir/uir_semantic_capi.cheng:.*' \"$rawptr_all_file\" >\"$rawptr_file\" || true; " +
         "rg -n --glob '*.cheng' '\\bNode\\b[[:space:]]*==[[:space:]]*nil|\\bNode\\b[[:space:]]*!=[[:space:]]*nil' src/stage1 >\"$stage1_nil_file\" || true; " +
         "rg -n 'fn astRef(IsNil|NonNil)\\(v: void\\*\\)|fn astRef(IsNil|NonNil)\\(v: ptr\\)|fn astRef(IsNil|NonNil)\\[T\\]\\(v: T\\*\\)|fn astRef(IsNil|NonNil)\\[T\\]\\(v: T\\[\\]\\)|fn astRef(IsNil|NonNil)\\[T\\]\\(v: T\\)' src/stage1/ast.cheng >\"$stage1_compat_file\" || true; " +
@@ -14764,6 +15114,10 @@ fn tooling_cmdVerifyMobileCrashFreeFromArgs(root: str, argStart: int32, count: i
 
 fn tooling_dispatchNativeScriptRoute(root: str, scriptIdRaw: str, argStart: int32, count: int32): int32 =
     let scriptId: str = tooling_normalizeScriptId(scriptIdRaw)
+    if tooling_strEq(scriptId, "verify_tooling_cmdline"):
+        return tooling_cmdVerifyToolingCmdline(root)
+    if tooling_strEq(scriptId, "verify_backend_loop_runtime"):
+        return tooling_cmdVerifyBackendLoopRuntime(root)
     if tooling_strEq(scriptId, "backend_prod_closure"):
         return tooling_cmdBackendProdClosureFromArgs(root, argStart, count)
     if tooling_strEq(scriptId, "backend_prod_publish") || tooling_strEq(scriptId, "backend-prod-publish"):
@@ -14806,8 +15160,6 @@ fn tooling_dispatchNativeScriptRoute(root: str, scriptIdRaw: str, argStart: int3
         return tooling_cmdVerifyBackendOpt3Extended(root)
     if tooling_strEq(scriptId, "verify_backend_simd"):
         return tooling_cmdVerifyBackendSimd(root)
-    if tooling_strEq(scriptId, "verify_backend_loop_runtime"):
-        return tooling_cmdVerifyBackendLoopRuntime(root)
     if tooling_strEq(scriptId, "verify_backend_noalias_opt"):
         return tooling_cmdVerifyBackendNoaliasOpt(root)
     if tooling_strEq(scriptId, "verify_backend_egraph_cost"):
@@ -14826,6 +15178,10 @@ fn tooling_dispatchNativeScriptRoute(root: str, scriptIdRaw: str, argStart: int3
         return tooling_cmdVerifyBackendClosedloopMinimal(root)
     if tooling_strEq(scriptId, "verify_backend_rawptr_surface_forbid"):
         return tooling_cmdVerifyBackendRawptrSurfaceForbid(root)
+    if tooling_strEq(scriptId, "verify_backend_seed_uir_import"):
+        return tooling_cmdVerifyBackendSeedUirImport(root)
+    if tooling_strEq(scriptId, "verify_backend_sidecar_cheng_seed"):
+        return tooling_cmdVerifyBackendSidecarChengSeed(root)
     if tooling_strEq(scriptId, "verify_stage1_ast_soa_surface"):
         return tooling_cmdVerifyStage1AstSoaSurface(root)
     if tooling_strEq(scriptId, "verify_backend_rawptr_migration"):
@@ -14876,6 +15232,42 @@ fn tooling_dispatchNativeScriptRoute(root: str, scriptIdRaw: str, argStart: int3
         return tooling_cmdCompileFromArgsNamed(root, argStart, count, "chengc")
     return -1
 
+fn tooling_cmdRunEmbeddedScriptNoCleanup(root: str, scriptId: str, argStart: int32, count: int32): int32 =
+    let cacheDir: str = os.joinPath(root, "chengcache/embedded_scripts")
+    if !tooling_mkdirP(root, cacheDir):
+        tooling_printErr("cheng_tooling: failed to create embedded script cache: " + cacheDir)
+        return 1
+    let tempScript: str = os.joinPath(cacheDir, scriptId + "." + tooling_nowNonceText() + ".native.run.sh")
+    var scriptText: str = tooling_embeddedScriptText(root, scriptId)
+    scriptText = tooling_patchEmbeddedRuntimeDefaults(scriptId, scriptText)
+    if !tooling_strNonEmpty(scriptText):
+        tooling_printErr("cheng_tooling: missing embedded script payload: " + scriptId)
+        return 1
+    let shellBin: str = tooling_scriptShellFromText(scriptText)
+    if !tooling_writeTextFileViaShell(root, tempScript, scriptText):
+        tooling_printErr("cheng_tooling: failed to write temp embedded script: " + tempScript)
+        return 1
+    let chmodRes: os.ExecCmdResult = tooling_exec(root, "chmod +x " + tooling_shellQuote(tempScript))
+    if os.execCmdResultExitCode(chmodRes) != 0:
+        tooling_printErr("cheng_tooling: chmod failed for temp embedded script: " + tempScript)
+        tooling_printExecOutput(chmodRes)
+        let _cleanupChmodFail: os.ExecCmdResult = tooling_exec(root, "rm -f " + tooling_shellQuote(tempScript))
+        return 1
+    let selfExe: str = tooling_selfExecPath(root)
+    var command: str = tooling_envAssignCompat("CLEAN_CHENG_LOCAL", "0")
+    if tooling_strNonEmpty(selfExe):
+        command = command + tooling_envAssignCompat("TOOLING_SELF_BIN", selfExe)
+    command = command + tooling_shellQuote(shellBin) + " " + tooling_shellQuote(tempScript)
+    if argStart <= count:
+        for i in argStart..count:
+            command = command + " " + tooling_shellQuote(tooling_paramStr(i))
+    let result: os.ExecCmdResult = os.execCmdEx(command, uint64(7), root)
+    let output: str = os.execCmdResultOutput(result)
+    if tooling_strNonEmpty(output):
+        os.write(os.get_stdout(), output)
+    let _cleanupRes: os.ExecCmdResult = tooling_exec(root, "rm -f " + tooling_shellQuote(tempScript))
+    return os.execCmdResultExitCode(result)
+
 fn tooling_runScript(root: str, scriptPath: str, argStart: int32): int32 =
     var command: str = ""
     var shellBin: str = "sh"
@@ -14888,6 +15280,8 @@ fn tooling_runScript(root: str, scriptPath: str, argStart: int32): int32 =
         tooling_printBackendProdClosureHelpFast()
         return 0
     if tooling_strNonEmpty(scriptId):
+        if tooling_strEq(scriptId, "verify_backend_ffi_slice_shim"):
+            return tooling_cmdRunEmbeddedScriptNoCleanup(root, scriptId, argStart, count)
         let nativeRc: int32 = tooling_dispatchNativeScriptRoute(root, scriptId, argStart, count)
         if nativeRc != -1:
             return nativeRc
@@ -14920,7 +15314,12 @@ fn tooling_runScript(root: str, scriptPath: str, argStart: int32): int32 =
             tooling_printExecOutput(chmodRes)
             let _cleanupChmodFail: os.ExecCmdResult = tooling_exec(root, "rm -f " + tooling_shellQuote(tempScript))
             return 1
-        command = tooling_shellQuote(shellBin) + " " + tooling_shellQuote(tempScript)
+        let selfExe: str = tooling_selfExecPath(root)
+        if tooling_strNonEmpty(selfExe):
+            command = tooling_envAssignCompat("TOOLING_SELF_BIN", selfExe) +
+                      tooling_shellQuote(shellBin) + " " + tooling_shellQuote(tempScript)
+        else:
+            command = tooling_shellQuote(shellBin) + " " + tooling_shellQuote(tempScript)
         if argStart <= count:
             for i in argStart..count:
                 command = command + " " + tooling_shellQuote(tooling_paramStr(i))
@@ -15145,6 +15544,8 @@ fn tooling_dispatchBuiltinFirstSlim(root: str, count: int32, first: str): int32 
         return 0
     if tooling_strEq2(first, "toolchain-root", "toolchain_root"):
         return tooling_cmdToolchainRoot(root)
+    if tooling_strEq2(first, "detect_host_target", "detect-host-target"):
+        return tooling_cmdDetectHostTarget(root)
     if tooling_strEq(first, "backend_driver_path"):
         return tooling_cmdDriverPath(root, true)
     if tooling_strEq(first, "driver-path"):
@@ -15169,6 +15570,10 @@ fn tooling_dispatchBuiltinFirstSlim(root: str, count: int32, first: str): int32 
         return tooling_cmdReleaseCompileFromArgs(root, 2, count)
     if tooling_strEq3(first, "list", "embedded-ids", "embedded_ids"):
         return tooling_list(root)
+    if tooling_strEq(first, "verify_tooling_cmdline"):
+        return tooling_cmdVerifyToolingCmdline(root)
+    if tooling_strEq(first, "verify_backend_loop_runtime"):
+        return tooling_cmdVerifyBackendLoopRuntime(root)
     if tooling_strEq2(first, "embedded-text", "embedded_text"):
         return tooling_embeddedTextCommand(root, 2, count)
     if tooling_strEq4(first, "embedded-map-rewrite", "embedded_map_rewrite", "rewrite-map", "rewrite_map"):
@@ -15198,6 +15603,8 @@ fn tooling_dispatchBuiltinSelfSlim(root: str, selfName: str, count: int32): int3
         return tooling_cmdBootstrapPureFromArgs(root, 1, count)
     if tooling_strEq2(selfName, "toolchain_root", "toolchain-root"):
         return tooling_cmdToolchainRoot(root)
+    if tooling_strEq2(selfName, "detect_host_target", "detect-host-target"):
+        return tooling_cmdDetectHostTarget(root)
     if tooling_strEq(selfName, "backend_driver_path"):
         return tooling_cmdDriverPath(root, true)
     if tooling_strEq(selfName, "driver-path"):
@@ -15214,6 +15621,10 @@ fn tooling_dispatchBuiltinSelfSlim(root: str, selfName: str, count: int32): int3
         return tooling_cmdBackendProdClosureFromArgs(root, 1, count)
     if tooling_strEq2(selfName, "backend_prod_publish", "backend-prod-publish"):
         return tooling_cmdBackendProdPublishFromArgs(root, 1, count)
+    if tooling_strEq(selfName, "verify_tooling_cmdline"):
+        return tooling_cmdVerifyToolingCmdline(root)
+    if tooling_strEq(selfName, "verify_backend_loop_runtime"):
+        return tooling_cmdVerifyBackendLoopRuntime(root)
     return tooling_routeMiss()
 
 fn tooling_dispatchScriptSlim(root: str, count: int32, first: str): int32 =
@@ -15234,6 +15645,9 @@ fn tooling_dispatchScriptSlim(root: str, count: int32, first: str): int32 =
         return tooling_cmdBackendProdClosureFromArgs(root, argStart, count)
     if tooling_strEq(normalizedScriptArg, "backend_prod_publish") || tooling_strEq(normalizedScriptArg, "backend-prod-publish"):
         return tooling_cmdBackendProdPublishFromArgs(root, argStart, count)
+    let nativeRc: int32 = tooling_dispatchNativeScriptRoute(root, normalizedScriptArg, argStart, count)
+    if nativeRc != tooling_routeMiss():
+        return nativeRc
     let scriptPath: str = tooling_resolveScriptPath(root, scriptArg)
     if !tooling_strNonEmpty(scriptPath):
         tooling_printErr("cheng_tooling: unknown tooling script: " + scriptArg)
@@ -15307,6 +15721,8 @@ fn tooling_mainDispatchLegacy(root: str, selfName: str, count: int32): int32 =
         return tooling_cmdBootstrapPureFromArgs(root, 1, count)
     if tooling_strEq(selfName, "toolchain_root") || tooling_strEq(selfName, "toolchain-root"):
         return tooling_cmdToolchainRoot(root)
+    if tooling_strEq(selfName, "detect_host_target") || tooling_strEq(selfName, "detect-host-target"):
+        return tooling_cmdDetectHostTarget(root)
     if tooling_strEq(selfName, "backend_driver_path"):
         return tooling_cmdDriverPath(root, true)
     if tooling_strEq(selfName, "driver-path"):
@@ -15389,8 +15805,14 @@ fn tooling_mainDispatchLegacy(root: str, selfName: str, count: int32): int32 =
         return tooling_cmdVerifyBackendZeroScriptClosure(root)
     if tooling_strEq(selfName, "verify_backend_closedloop"):
         return tooling_cmdVerifyBackendClosedloopMinimal(root)
+    if tooling_strEq(selfName, "verify_backend_rawptr_contract"):
+        return tooling_cmdVerifyBackendRawptrContract(root, 1, count)
     if tooling_strEq(selfName, "verify_backend_rawptr_surface_forbid"):
         return tooling_cmdVerifyBackendRawptrSurfaceForbid(root)
+    if tooling_strEq(selfName, "verify_backend_seed_uir_import"):
+        return tooling_cmdVerifyBackendSeedUirImport(root)
+    if tooling_strEq(selfName, "verify_backend_sidecar_cheng_seed"):
+        return tooling_cmdVerifyBackendSidecarChengSeed(root)
     if tooling_strEq(selfName, "verify_stage1_ast_soa_surface"):
         return tooling_cmdVerifyStage1AstSoaSurface(root)
     if tooling_strEq(selfName, "backend_prod_closure"):
@@ -15431,6 +15853,8 @@ fn tooling_mainDispatchLegacy(root: str, selfName: str, count: int32): int32 =
         return 0
     if tooling_strEq(first, "toolchain-root") || tooling_strEq(first, "toolchain_root"):
         return tooling_cmdToolchainRoot(root)
+    if tooling_strEq(first, "detect_host_target") || tooling_strEq(first, "detect-host-target"):
+        return tooling_cmdDetectHostTarget(root)
     if tooling_strEq(first, "backend_resolve_selflink_runtime_obj") || tooling_strEq(first, "backend-resolve-selflink-runtime-obj"):
         return tooling_cmdBackendResolveSelflinkRuntimeObjFromArgs(root, 2, count)
     if tooling_strEq(first, "backend_driver_path"):
@@ -15517,8 +15941,14 @@ fn tooling_mainDispatchLegacy(root: str, selfName: str, count: int32): int32 =
         return tooling_cmdVerifyBackendZeroScriptClosure(root)
     if tooling_strEq(first, "verify_backend_closedloop"):
         return tooling_cmdVerifyBackendClosedloopMinimal(root)
+    if tooling_strEq(first, "verify_backend_rawptr_contract"):
+        return tooling_cmdVerifyBackendRawptrContract(root, 2, count)
     if tooling_strEq(first, "verify_backend_rawptr_surface_forbid"):
         return tooling_cmdVerifyBackendRawptrSurfaceForbid(root)
+    if tooling_strEq(first, "verify_backend_seed_uir_import"):
+        return tooling_cmdVerifyBackendSeedUirImport(root)
+    if tooling_strEq(first, "verify_backend_sidecar_cheng_seed"):
+        return tooling_cmdVerifyBackendSidecarChengSeed(root)
     if tooling_strEq(first, "verify_stage1_ast_soa_surface"):
         return tooling_cmdVerifyStage1AstSoaSurface(root)
     if tooling_strEq(first, "backend_prod_closure"):

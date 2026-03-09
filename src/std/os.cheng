@@ -118,6 +118,8 @@ fn libc_read(fd: int32, data: void*, n: int64): int64
 fn libc_close(fd: int32): int32
 @importc("cheng_exec_cmd_ex")
 fn cheng_exec_cmd_ex(command: cstring, workingDir: cstring, mergeStderr: int32, exitCode: int64*): str
+@importc("driver_c_read_file_all")
+fn driver_c_read_file_all(path: cstring): str
 @importc("cheng_pty_is_supported")
 fn cheng_pty_is_supported(): int32
 @importc("cheng_pty_spawn")
@@ -232,37 +234,73 @@ fn close(f: File) =
 fn osStoreStrOut(out: str*, value: str) =
     if out == nil:
         return
-    store_ptr(void*(out), void*(value))
+    *out = value
+
+fn osDebugFileReadEnabled(): bool =
+    return getEnvDefault("BACKEND_DEBUG_FILE_READ", "") == "1"
+
+fn osDebugFileRead(msg: str) =
+    if !osDebugFileReadEnabled():
+        return
+    let f: File = get_stderr()
+    write(f, "[os.read] ")
+    writeLine(f, msg)
+
+fn osDebugFileReadKV(label: str, value: int32) =
+    if !osDebugFileReadEnabled():
+        return
+    let f: File = get_stderr()
+    write(f, "[os.read] ")
+    write(f, label)
+    write(f, "=")
+    writeLine(f, intToStr(value))
 
 fn readAllInto(f: File, out: str* = nil): bool =
     if f == nil:
         osStoreStrOut(out, "")
         return true
-    var cap: int32 = 256
-    var lenRead: int32 = 0
-    var p: void* = alloc cap
+    var cap64: int64 = 256
+    var lenRead64: int64 = 0
+    var p: void* = alloc int32(cap64)
     if p == nil:
         osStoreStrOut(out, "")
         return true
     while true:
-        var room: int32 = cap - lenRead - 1
+        var room64: int64 = cap64 - lenRead64 - 1
+        var room: int32 = int32(room64)
         if room <= 0:
-            cap = cap * 2
-            p = realloc(p, cap)
+            cap64 = cap64 * 2
+            p = realloc(p, int32(cap64))
             if p == nil:
                 osStoreStrOut(out, "")
                 return true
-            room = cap - lenRead - 1
+            room64 = cap64 - lenRead64 - 1
+            room = int32(room64)
             if room <= 0:
                 break
-        let dst: void* = ptr_add(p, lenRead)
+        let dst: void* = ptr_add(p, int32(lenRead64))
         let got: int32 = c_fread(dst, 1, room, f)
+        osDebugFileReadKV("chunk.got", got)
+        osDebugFileReadKV("chunk.room", room)
+        osDebugFileReadKV("chunk.len_before", int32(lenRead64))
         if got <= 0:
             break
-        lenRead = lenRead + got
+        lenRead64 = lenRead64 + int64(got)
         ioMeterReport(ioRead, int64(got))
-    setMem(ptr_add(p, lenRead), 0, 1)
-    osStoreStrOut(out, str(p))
+    let finalLen: int32 = int32(lenRead64)
+    let outText: str = newStringCopy(p, finalLen)
+    osDebugFileReadKV("final.lenRead", finalLen)
+    osDebugFileReadKV("final.outLen", len(outText))
+    if finalLen > 0:
+        let src0: char* = char*(p)
+        if src0 != nil:
+            osDebugFileReadKV("final.src0", ord(*src0))
+    if void*(outText) != nil:
+        osDebugFileReadKV("final.out0", ord(outText[0]))
+    free p
+    if void*(outText) != nil && len(outText) > 0:
+        memScopeEscape(void*(outText))
+    osStoreStrOut(out, outText)
     return true
 
 fn readAll(f: File): str =
@@ -453,12 +491,8 @@ fn sliceStr(text: str, start: int32, stop: int32): str =
     if e >= n:
         e = n - 1
     let count: int32 = e - s + 1
-    let allocCount: int32 = count + 1
-    let p: void* = alloc allocCount
     let src: void* = ptr_add(void*(text), s)
-    copyMem(p, src, count)
-    setMem(ptr_add(p, count), 0, 1)
-    return str(p)
+    return newStringCopy(src, count)
 fn absolutePath(path: str): str =
     if len(path) == 0 || path[0] == char(0):
         return getCurrentDir()
@@ -668,24 +702,42 @@ fn readFileSizedInto(path: str, size: int32, out: str* = nil): bool =
         c_fclose f
         osStoreStrOut(out, "")
         return true
-    let got: int32 = c_fread(p, 1, size, f)
-    c_fclose f
-    if got > 0:
+    let size64: int64 = int64(size)
+    var totalGot64: int64 = 0
+    while totalGot64 < size64:
+        let dst: void* = ptr_add(p, int32(totalGot64))
+        let want: int32 = int32(size64 - totalGot64)
+        let got: int32 = c_fread(dst, 1, want, f)
+        if got <= 0:
+            break
+        totalGot64 = totalGot64 + int64(got)
         ioMeterReport(ioRead, got)
-    setMem(ptr_add(p, got), 0, 1)
-    if got != size:
+    c_fclose f
+    let totalGot: int32 = int32(totalGot64)
+    if totalGot != size:
         free p
         osStoreStrOut(out, "")
         return true
-    osStoreStrOut(out, str(p))
+    let outText: str = newStringCopy(p, totalGot)
+    free p
+    if void*(outText) != nil && len(outText) > 0:
+        memScopeEscape(void*(outText))
+    osStoreStrOut(out, outText)
     return true
 
 fn readFileInto(path: str, out: str* = nil): bool =
-    let size64: int64 = fileSize(path)
-    if size64 > 0 && size64 <= int64(2147483647):
-        return readFileSizedInto(path, int32(size64), out)
+    if osDebugFileReadEnabled():
+        osDebugFileRead("readFileInto path=" + path)
+    let fastText: str = driver_c_read_file_all(cstring(path))
+    if len(fastText) > 0:
+        if void*(fastText) != nil:
+            memScopeEscape(void*(fastText))
+        osStoreStrOut(out, fastText)
+        return true
     let f: File = openRead(path)
     if f == nil:
+        if osDebugFileReadEnabled():
+            osDebugFileRead("openRead nil")
         osStoreStrOut(out, "")
         return true
     let ok: bool = readAllInto(f, out)

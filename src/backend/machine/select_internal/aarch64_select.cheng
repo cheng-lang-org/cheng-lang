@@ -106,7 +106,8 @@ fn iselOkMachineFunc(value: MachineFunc): Result[MachineFunc] =
 fn iselErrInfoMachineFunc(err: ErrorInfo): Result[MachineFunc] =
     var out: Result[MachineFunc]
     out.ok = false
-    out.err = err
+    let msg: str = ErrorMessage(err)
+    out.err = len(msg) > 0 ? err : ErrorNew("isel: empty machine func error")
     return out
 
 fn iselOkFuncTaskResult(value: IselFuncTaskResult): Result[IselFuncTaskResult] =
@@ -119,7 +120,8 @@ fn iselOkFuncTaskResult(value: IselFuncTaskResult): Result[IselFuncTaskResult] =
 fn iselErrInfoFuncTaskResult(err: ErrorInfo): Result[IselFuncTaskResult] =
     var out: Result[IselFuncTaskResult]
     out.ok = false
-    out.err = err
+    let msg: str = ErrorMessage(err)
+    out.err = len(msg) > 0 ? err : ErrorNew("isel: empty func task error")
     return out
 
 fn iselFnSchedNormalized(): str =
@@ -193,6 +195,10 @@ fn iselCollectFuncTasks(module: UirModule, maxFuncs: int32, dbgIsel: bool): Isel
                  " extern=" + (uirFuncIsExtern(f) ? "1" : "0"))
         if void*(f) == nil || uirFuncIsExtern(f):
             continue
+        if uirFuncBlocksLen(f) <= 0:
+            if dbgIsel:
+                echo("[isel] fn[" + intToStr(i) + "] skip zero-block nonextern")
+            continue
         var task: IselFuncTask
         new task
         task.funcIndex = i
@@ -262,8 +268,9 @@ fn iselTargetIsDarwin(target: str): bool =
     return isel_strContains(target, "apple") || isel_strContains(target, "darwin") || isel_strContains(target, "ios")
 
 fn iselCStringLoweringEnabled(): bool =
-    # C string lowering is now mandatory in production/native paths.
-    return true
+    # Eager selector-side cstring lowering is unstable in source-built selfhost
+    # builds. Use the canonical post-regalloc backfill path in uir_codegen.
+    return false
 
 fn iselTypeKeyIsVarargs(typeKey: str): bool =
     if len(typeKey) == 0:
@@ -468,14 +475,44 @@ fn iselDebugDumpFuncUir(func: UirFunc) =
 fn iselExprCalleeSafe(expr: UirExpr): str =
     if iselExprInvalid(expr):
         return ""
-    let raw: str = uirExprCalleeOf(expr)
-    if !iselStrPtrMaybeValid(raw):
-        if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_META", ""), "1"):
-            let rawPtr: int64 = int64(rawmem_support.rawmemAsVoid(raw))
-            echo("[isel.meta] invalid_callee_ptr expr=" + intToStr(expr) +
-                 " str=" + uirU64ToHex(rawPtr))
-        return ""
-    return raw
+    return uirExprCalleeOf(expr)
+
+fn iselExprSummary(expr: UirExpr): str =
+    if iselExprInvalid(expr):
+        return "nil"
+    let kind: int32 = int32(uirExprKindOf(expr))
+    var out: str = "kind=" + intToStr(kind)
+    if uirExprKindOf(expr) == meCall:
+        out = out + " callee=" + iselExprCalleeSafe(expr) +
+              " argc=" + intToStr(uirExprArgsLen(expr))
+    elif uirExprKindOf(expr) == meGlobalAddr:
+        out = out + " global=" + uirExprGlobalNameOf(expr)
+    return out
+
+fn iselReportEmptySymbol(kind: str, uirFunc: UirFunc, expr: UirExpr, rawName: str) =
+    echo("[isel.err.empty_symbol]")
+    echo(kind)
+    echo(iselFuncBestName(uirFunc))
+    echo(rawName)
+    if iselExprInvalid(expr):
+        echo("nil")
+        return
+    echo(intToStr(int32(uirExprKindOf(expr))))
+    if uirExprKindOf(expr) == meCall:
+        echo(iselExprCalleeSafe(expr))
+        echo(intToStr(uirExprArgsLen(expr)))
+    elif uirExprKindOf(expr) == meGlobalAddr:
+        echo(uirExprGlobalNameOf(expr))
+
+fn iselRequireNamedSymbol(kind: str, uirFunc: UirFunc, expr: UirExpr, rawName: str, symName: str): Result[str] =
+    if len(symName) > 0:
+        return Ok[str](symName)
+    iselReportEmptySymbol(kind, uirFunc, expr, rawName)
+    let fnName: str = iselFuncBestName(uirFunc)
+    let exprInfo: str = iselExprSummary(expr)
+    let rawInfo: str = rawName
+    return Err[str]("isel: empty " + kind + " symbol fn=" + fnName +
+                    " raw=" + rawInfo + " expr=" + exprInfo)
 
 fn iselCondFromCmp(op: UirCmpOp, isUnsigned: bool): MachineCond =
     case op
@@ -1142,7 +1179,8 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
                 retType: UirLowerType, dst: MachineReg, tmp: MachineReg, scratch: MachineReg,
                 baseReg: MachineReg, labelState: LabelState): Result[int32] =
     if iselExprInvalid(expr):
-        return Err[int32]("isel: nil expr")
+        iselAddInst(func, machineMovImm(iselRegWithType(dst, uirTypeI64()), 0))
+        return Ok[int32](0)
     let dbgExpr: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_EXPR", ""), "1")
     if dbgExpr:
         let k: int32 = int32(uirExprKindOf(expr))
@@ -1182,7 +1220,11 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
             calleeLinkName = iselFuncLinkNameSafe(callee)
         if void*(callee) != nil && len(calleeLinkName) > 0:
             callName = calleeLinkName
-        let callSym: str = iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), callName)
+        let callSym0: str = iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), callName)
+        let callSymRes: Result[str] = iselRequireNamedSymbol("call", uirFunc, expr, callName, callSym0)
+        if !IsOk[str](callSymRes):
+            return ErrInfo[int32](ErrorInfoOf[str](callSymRes))
+        let callSym: str = Value[str](callSymRes)
         if iselIsCallIndirectBuiltin(callSym):
             return iselEmitCallIndirectBuiltin(func, module, uirFunc, expr, callee, retType,
                                                dstT, tmpT, scratchT, baseReg, labelState)
@@ -1442,7 +1484,12 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         return Ok[int32](0)
     if uirExprKindOf(expr) == meGlobalAddr:
         let addrReg: MachineReg = iselRegWithType(dst, uirTypeI64())
-        let label: str = iselGlobalSym(module, uirExprGlobalNameOf(expr))
+        let rawGlobalName: str = uirExprGlobalNameOf(expr)
+        let label0: str = iselGlobalSym(module, rawGlobalName)
+        let labelRes: Result[str] = iselRequireNamedSymbol("global", uirFunc, expr, rawGlobalName, label0)
+        if !IsOk[str](labelRes):
+            return ErrInfo[int32](ErrorInfoOf[str](labelRes))
+        let label: str = Value[str](labelRes)
         iselAddInst(func, machineAdrp(addrReg, label))
         iselAddInst(func, machineAddPageOff(addrReg, addrReg, label))
         return Ok[int32](0)
@@ -1866,7 +1913,12 @@ fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
                                                  tmpReg, scratchReg, baseReg, labelState,
                                                  frameSize, localsSize, isEntry)
         if ! IsOk[int32](bRes):
-            return iselErrInfoMachineFunc(ErrorInfoOf[int32](bRes))
+            let err: ErrorInfo = ErrorInfoOf[int32](bRes)
+            let msg: str = ErrorMessage(err)
+            if len(msg) == 0:
+                return Err[MachineFunc]("isel: lower block failed fn=" + funcName +
+                                        " block=" + intToStr(i))
+            return iselErrInfoMachineFunc(err)
     if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_META", ""), "1"):
         echo("[isel.meta] out.final name=" + machineFuncNameOf(out) +
              " insts=" + intToStr(machineFuncInstsLen(out)))
@@ -1878,16 +1930,22 @@ fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
 
 fn aarch64LowerModule(module: UirModule): Result[MachineModule] =
     let out: MachineModule = machineCoreNewModule()
-    out.target = "" + uirModuleTargetOf(module)
+    let targetOwned: str = strings.__cheng_str_clone(uirModuleTargetOf(module))
+    out.target = targetOwned
     memRetain void*(out.target)
     machineCoreResetSeqFunc(&out.funcs)
     machineCoreResetSeqCString(&out.cstrs)
     machineCoreResetSeqGlobal(&out.globals)
     let dbgIsel: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL", ""), "1")
+    let dbgStage: bool = dbgIsel ||
+                         strings.streq(os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", ""), "1") ||
+                         strings.streq(os.getEnvDefault("DIAG_CONTEXT", ""), "1")
     let maxFuncsRaw: str = os.getEnvDefault("BACKEND_DEBUG_ISEL_MAX_FUNCS", "")
     let maxFuncs: int32 = iselParseInt32(maxFuncsRaw, 0)
     if dbgIsel:
         echo("[isel] target=" + uirModuleTargetOf(module) + " funcs=" + intToStr(uirModuleFuncsLen(module)))
+    if dbgStage:
+        echo("[isel.stage] globals.begin")
     for gi in 0..<uirModuleGlobalsLen(module):
         let gTy: UirLowerType = uirModuleGlobalTypeAt(module, gi)
         if !iselTypeKindKnown(gTy):
@@ -1904,11 +1962,15 @@ fn aarch64LowerModule(module: UirModule): Result[MachineModule] =
         machineAddGlobal(out, gName, size, alignPow2,
                          uirModuleGlobalInitAt(module, gi),
                          uirModuleGlobalHasInitAt(module, gi))
+    if dbgStage:
+        echo("[isel.stage] globals.end")
     let lowerCstrs: bool = iselCStringLoweringEnabled()
     let dbgCstr: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", ""), "1")
     if dbgCstr:
         echo("[isel.cstr.a64] module_cstrs=" + intToStr(uirModuleCStringsLen(module)) +
              " lower=" + (lowerCstrs ? "1" : "0"))
+    if dbgStage:
+        echo("[isel.stage] cstrings.begin")
     if lowerCstrs:
         for ci in 0..<uirModuleCStringsLen(module):
             let cstr: UirCString = uirModuleCStringAt(module, ci)
@@ -1920,22 +1982,49 @@ fn aarch64LowerModule(module: UirModule): Result[MachineModule] =
                 let c1: int32 = (cLen > 1) ? int32(cValue[1]) : -1
                 echo("[isel.cstr.a64] i=" + intToStr(ci) + " label=" + cLabel +
                      " len=" + intToStr(cLen) + " b0=" + intToStr(c0) + " b1=" + intToStr(c1))
-            if len(cLabel) > 0:
-                machineAddCString(out, cLabel, cValue)
+            if len(cLabel) <= 0:
+                return Err[MachineModule]("isel: empty cstring label idx=" + intToStr(ci) +
+                                          " value_len=" + intToStr(len(cValue)))
+            machineAddCString(out, cLabel, cValue)
+    if dbgStage:
+        echo("[isel.stage] cstrings.end")
     let funcTasks: IselFuncTask[] = iselCollectFuncTasks(module, maxFuncs, dbgIsel)
+    if dbgStage:
+        echo("[isel.stage] tasks.collected")
+        echo(intToStr(funcTasks.len))
     if dbgIsel:
         echo("[isel] task_count=" + intToStr(funcTasks.len) +
              " sched=" + iselFnSchedNormalized())
     for ti in 0..<funcTasks.len:
         let task: IselFuncTask = funcTasks[ti]
+        if dbgStage:
+            echo("[isel.stage] task.begin")
+            echo(intToStr(ti))
+            echo(task != nil ? intToStr(task.funcIndex) : "-1")
         if dbgIsel && task != nil:
             echo("[isel] task[" + intToStr(ti) + "] run fn[" + intToStr(task.funcIndex) +
                  "] cost=" + intToStr(task.costHint))
         let taskRes: Result[IselFuncTaskResult] = iselExecuteFuncTask(module, task)
         if !IsOk[IselFuncTaskResult](taskRes):
-            return ErrInfo_MachineModule(ErrorInfoOf[IselFuncTaskResult](taskRes))
+            let err: ErrorInfo = ErrorInfoOf[IselFuncTaskResult](taskRes)
+            let msg: str = ErrorMessage(err)
+            if dbgStage:
+                echo("[isel.stage] task.err")
+                echo(intToStr(ti))
+                echo(task != nil ? intToStr(task.funcIndex) : "-1")
+                echo(intToStr(ErrorCodeOf(err)))
+                echo(intToStr(len(msg)))
+                if len(msg) > 0:
+                    echo(msg)
+            if len(msg) == 0:
+                let tiMsg: str = task != nil ? intToStr(task.funcIndex) : intToStr(ti)
+                return Err[MachineModule]("isel: func task failed index=" + tiMsg)
+            return ErrInfo_MachineModule(err)
         let loweredTask: IselFuncTaskResult = taskRes.value
         if loweredTask == nil || loweredTask.loweredFunc == nil:
+            if dbgStage:
+                echo("[isel.stage] task.skip")
+                echo(intToStr(ti))
             continue
         if dbgIsel:
             echo("[isel] fn[" + intToStr(loweredTask.funcIndex) + "] lower.ok")
@@ -1943,6 +2032,9 @@ fn aarch64LowerModule(module: UirModule): Result[MachineModule] =
                  machineFuncNameOf(loweredTask.loweredFunc) +
                  " insts=" + intToStr(machineFuncInstsLen(loweredTask.loweredFunc)))
         machineAddFunc(out, loweredTask.loweredFunc)
+        if dbgStage:
+            echo("[isel.stage] task.added")
+            echo(intToStr(loweredTask.funcIndex))
         if dbgIsel:
             echo("[isel] fn[" + intToStr(loweredTask.funcIndex) + "] add.ok len=" +
                  intToStr(machineModuleFuncsLen(out)))

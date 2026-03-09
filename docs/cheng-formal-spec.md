@@ -1,6 +1,6 @@
 # Cheng 正式规范（语法与语义）
 
-> 版本：2026-03-03
+> 版本：2026-03-07
 
 本文为 Cheng 语言最终规范，描述语法与核心语义。
 
@@ -285,6 +285,8 @@ typeArg        ::= typeExpr | numberLiteral | ident ;
 suite          ::= NEWLINE INDENT { statement } DEDENT
                   | statement ;
 
+- `suite ::= statement` 为稳定语义，表示允许单行 suite；例如 `if x < 0: return 0` 是合法写法。
+
 statement      ::= annotations statementCore ;
 statementCore  ::= bindingDecl
                   | typeDecl
@@ -550,7 +552,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
   1. 规范与文档先行：先更新本规范与相关设计文档（如 `docs/list-comprehension.md`），并同步 `docs/cheng-skill/` 与 `$HOME/.codex/skills/cheng语言/`；跑 `$TOOLING verify_cheng_skill_consistency`。
   2. 实现新语法：parser 支持 + type/expr lowering 到内部 canonical；尽量保持后端/标准库的稳定面，必要时加 parse recovery。
   3. 禁用旧语法：旧写法一律硬错误并给迁移提示；旧语法只允许作为内部 lowering 目标存在。
-  4. 自举兼容：生产链路不再支持 stage0 overlay；若 seed stage0 不支持新语法，需刷新 stage0/seed，并保证 `backend.stage0_no_compat` 门禁通过。该 gate 默认使用 `src/backend/tooling/backend_driver.cheng` 作为 `stage1_input`（真实编译器源码口径）以尽早暴露语法不兼容；`build-backend-driver` 默认启用 stage0 capability preflight（比较 stage0 `.cap` 签名与当前 parser/UIR/driver 源签名），不匹配会 fail-fast 并提示先刷新 seed/driver。
+  4. 自举兼容：生产链路不再支持 stage0 overlay；若 seed stage0 不支持新语法，需刷新 stage0/seed，并保证 `backend.stage0_no_compat` 门禁通过。该 gate 默认使用 `src/backend/tooling/backend_driver.cheng` 作为 `stage1_input`（真实编译器源码口径）以尽早暴露语法不兼容；`build-backend-driver` 默认启用 stage0 capability preflight（比较 stage0 `.cap` 签名与当前源码签名），不匹配会 fail-fast 并提示先刷新 seed/driver。当前 capability 源列表由 `src/tooling/cheng_tooling.cheng` 中 `tooling_stage0CapabilitySourceList()` 定义，覆盖 `src/std/cmdline.cheng`、`src/stage1/{ast,token,lexer,parser,frontend_lib,diagnostics,semantics,ownership,monomorphize,type_syntax_lowering,c_profile_lowering}.cheng`、`src/backend/uir/uir_internal/{uir_core_types,uir_core_builder,uir_core_builder_ffi_out_ptr}.cheng`、`src/backend/uir/uir_codegen.cheng`、`src/backend/machine/machine_internal/machine_core_types.cheng`、`src/backend/machine/select_internal/{aarch64_select,x86_64_select}.cheng`、`src/backend/obj/{macho_writer,linker_shared_core,macho_linker,macho_linker_x86_64,elf_linker,elf_linker_riscv64,coff_linker}.cheng` 与 `src/backend/tooling/backend_driver.cheng`。注意 `.cap.env` 侧车由正在运行的 `cheng_tooling` 可执行文件生成；若该 binary 陈旧，即使源码已更新，侧车仍可能停留在旧的 `source_count=8` 口径，此时应先重建 canonical tooling/driver 再判断 capability 漂移。
   5. 回归与 seed 更新：补最小正/反例 tests；跑 `$TOOLING verify_backend_closedloop` 或相关 gate；需要刷新 seed 时用 `$TOOLING bootstrap-pure` 并设置 `BOOTSTRAP_UPDATE_SEED=1`。
 
 ### 1.3 运算符优先级
@@ -611,6 +613,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - `?:` 为右结合，语义遵循 `conditionalExpr ::= logicalOr [ "?" expression ":" conditionalExpr ]`。
 - postfix `expr?` 表示 Result/Option 风格解包语义（失败分支提前返回/传播）；它与三目 `?:` 是两套独立语义。
 - 推荐实践：当表达式中同时出现两类 `?`（例如 `x? ? a : b`）时，使用括号显式分组以避免可读性歧义。
+- 例：`flag ? 1 : false ? 2 : 0` 按右结合解析为 `flag ? 1 : (false ? 2 : 0)`。
 
 ### 1.4 模块导出与可见性
 
@@ -652,13 +655,14 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - IR 语义显式化：整数运算与移位使用 `sdiv/udiv`、`smod/umod`、`lshr/ashr` 等显式操作，避免 C 语义歧义。
 - 产物策略：生产默认 `emit=exe`（self/system linker 双轨）；`release-compile` 支持 `emit=exe|shared|static`；非 release 可执行构建禁止 `emit=obj`，`.o/.obj` 仅保留内部 `allow-no-main` 工件生成通道（需显式 `BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1`）。
 - Dev 运行策略：`cheng --run` 默认进入 host runner（`--run:host`）；`--run:file` 为兼容执行路径。
-- Dev 编译策略：`cheng` 固定为 canonical dev 轨入口（`compile/chengc` 已移除并返回 `rc=2`；默认 `BACKEND_INCREMENTAL=1`、`CHENGC_DEV_MULTI_DEFAULT=1`）；`BACKEND_MULTI_MODULE_CACHE` 默认关闭（`0`），stable driver 当前固定禁用 module-cache load 路径（不作为生产配置面）。release 轨改用显式入口 `release-compile`（默认串行口径 `CHENGC_RELEASE_MULTI_DEFAULT=0`）。
+- Dev 编译策略：`cheng` 固定为 canonical dev 轨入口（`compile/chengc` 已移除并返回 `rc=2`；默认 `BACKEND_INCREMENTAL=1`、`CHENGC_DEV_MULTI_DEFAULT=1`）；`BACKEND_MULTI_MODULE_CACHE` 默认关闭（`0`），stable driver 当前固定禁用 module-cache load 路径（不作为生产配置面）。release 轨改用显式入口 `release-compile`（默认 `CHENGC_RELEASE_MULTI_DEFAULT=0`，是否启用多单元并发与函数任务调度解耦）。
 - linker 参数收口：`cheng` 与 `release-compile` 均不接受 `--linker:*`，也不接受 `BACKEND_LINKER` 环境覆盖；dev 轨固定 `self-link + direct-exe`，release 轨固定 `system-link`。
 - `emit=shared|static` 语义：采用 release object-first 打包（后端先产 `obj`，再由系统工具链打包库）。`--emit:shared|static` 下禁止 `--run/--run:*`（命令配置错误，`rc=2`）。
 - Dev 快速自举管线（host-only）：
   - 前端解析模式：`cheng`/`selfhost` dev 入口固定 `BACKEND_STAGE1_PARSE_MODE=outline`（不再接受外部覆盖）；`release-compile` 固定 `full`。
-  - 函数任务调度：`cheng`/`selfhost` dev 入口固定 `BACKEND_FN_SCHED=ws`（不再接受外部覆盖）；`release-compile` 也固定 `BACKEND_FN_SCHED=ws`。
-  - 直写可执行：`BACKEND_DIRECT_EXE=1` 在 host darwin/arm64 + self-link 口径走 `macho_direct_exe_writer`；默认失败阻断（`BACKEND_FAST_FALLBACK_ALLOW=0`）。
+  - 函数任务调度：`cheng`/`selfhost` dev 入口固定 `BACKEND_FN_SCHED=ws`（不再接受外部覆盖）；`release-compile` 也固定 `BACKEND_FN_SCHED=ws`。`BACKEND_JOBS` 是唯一公开 worker 数控制面；`serial` 仅保留给内部诊断、perf 对照与低内存 bring-up。
+  - 直写可执行：dev 轨固定 `BACKEND_DIRECT_EXE=1`、`BACKEND_LINKERLESS_INMEM=1`；`BACKEND_DIRECT_EXE=1` 在 host darwin/arm64 + self-link 口径走 `macho_direct_exe_writer`。release 轨固定 `BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`。两条轨道都固定 `BACKEND_FAST_FALLBACK_ALLOW=0`。
+  - 确定性边界：函数任务允许并行执行，但 `UirFnTask`/`IselFuncTask`/direct-exe 函数块结果必须按稳定声明顺序 merge；最终 `.o/.exe` 字节流不得依赖 `BACKEND_JOBS`。
 - 可选常驻编译 worker：`CHENGC_DAEMON=1` 时，`cheng` 请求经 `chengc_daemon` 本地队列执行（`start/status/stop`），用于降低频繁冷启动开销。
 - Dev 热补丁策略：`BACKEND_HOTPATCH_MODE=trampoline` + append-only code pool；`BACKEND_HOTPATCH_LAYOUT_HASH_MODE=full_program` 且 `BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`。
 - 当前实现：UIR internal 采用表达式树 + `ret/br/cbr` 终结指令，machine internal 覆盖 AArch64 基本算术/比较/分支/栈操作；`mod` 以 `sdiv+msub` 降级。
@@ -679,6 +683,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - driver 自举 smoke 口径：`backend.driver_selfbuild_smoke` 为可选 gate（默认关闭，需显式 `--driver-selfbuild-smoke` 或 `BACKEND_RUN_DRIVER_SELFBUILD_SMOKE=1` 开启）；默认输出路径与主 driver 统一为 `artifacts/backend_driver/cheng`。启用后强制 `DRIVER_SELFBUILD_SMOKE_SKIP_SEM=0` 与 `DRIVER_SELFBUILD_SMOKE_SKIP_OWNERSHIP=0`，防止语义降级。
 - native-contract autosystem 口径：当 `BACKEND_NATIVE_CONTRACT=1` 时，stage1 前端必须强制关闭自动 `std/system` 导入（`stage1_autoSystemEnabled()` 返回 `false`），不得依赖 gate 脚本额外注入 `STAGE1_AUTO_SYSTEM=0`。
 - driver 解析口径：`backend_driver_path` 默认使用稳定 driver `artifacts/backend_driver/cheng`，并带 stage0 编译探针；首选不健康时直接阻断（不再允许 `--stage0` 覆盖）。
+- `build-backend-driver` 排障口径：若 `build-backend-driver --require-rebuild --debug-rebuild` 生成的新 attempt 在 `tests/cheng/backend/fixtures/return_add.cheng` 上仅报 `Unexpected token`，应先用 seed `artifacts/backend_selfhost_self_obj/cheng.stage2` 对同一 fixture 做 release-system smoke，再检查 `chengcache/backend_driver_build_tmp` 中保留的 attempt。当前已知回归现象是新 attempt 在 lexer 阶段把 token lexeme 全部物化为空串（典型日志为 `src_len=0 dst_len=0`），根因不在 import 解析。建议配合 `BACKEND_DEBUG_TOKEN_COPY=1`、`STAGE1_TRACE_TOKENS=1` 与 `BACKEND_DEBUG_PARSE_DIAG=1` 复现并保留日志。
 - 全链自举门禁：`$TOOLING verify_fullchain_bootstrap`（stage2→tools；obj-only fullspec internal gate + 工具 `--help` smoke；失败即阻断）。
 - 专用机 100ms 自举门禁：`$TOOLING verify_backend_selfhost_100ms_host`（基线文件 `src/tooling/selfhost_perf_100ms_host.env`）；`backend_prod_closure` 在 `BACKEND_RUN_SELFHOST_100MS=1` 时拆成 quick/report + full/blocking 双轨：quick 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=0`，full 轨默认 `SELFHOST_STAGE1_FULL_REBUILD=1` + `SELFHOST_STAGE1_REQUIRE_REBUILD=1`，并支持 `BACKEND_BUILD_DRIVER_PROFILE_OUT` 导出重编画像；非目标主机默认报告不阻断。
 - 热补丁运行态门禁：`$TOOLING verify_backend_hotpatch` 与 `$TOOLING verify_backend_hotpatch_meta` 固定 `self-link` 口径并执行可运行探针，不接受 system-link 回退；required 口径下禁用 runnable 重试回退（`BACKEND_HOTPATCH_RUNNABLE_RETRIES>1` 直接失败）；unsupported target 直接失败（不再 `skip`）。
