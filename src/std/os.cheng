@@ -7,10 +7,28 @@ import std/times
 import std/rawbytes
 
 fn add(dst: var str[], val: str) =
-    seqs.add(dst, val)
+    let writeAt: int32 = dst.len
+    let nextLen: int32 = writeAt + 1
+    if dst.buffer == nil || writeAt >= dst.cap:
+        cheng__seqGrowInst_string(&dst, nextLen)
+    dst.len = nextLen
+    dst[writeAt] = val
 
 fn add(dst: str[]*, val: str) =
-    seqs.add(dst, val)
+    osAddStrArrayPtr(dst, val)
+
+fn osAddStrArrayPtr(dst: str[]*, val: str) =
+    if dst != nil:
+        let writeAt: int32 = dst->len
+        let nextLen: int32 = writeAt + 1
+        if dst->buffer == nil || writeAt >= dst->cap:
+            cheng__seqGrowInst_string(dst, nextLen)
+        let writePtr: str* = str*(ptr_add(dst->buffer, writeAt * ptrSize()))
+        *writePtr = val
+        dst->len = nextLen
+
+fn osReturnStrSeq(out: str[]): str[] =
+    return seq_string(len: out.len, cap: out.cap, buffer: out.buffer)
 
 type
     File = void*
@@ -33,10 +51,6 @@ var
     ioMeterHasHook: bool = false
     ioMeterHook: IoMeterHook = nil
 
-var EmptyStr: str = ""
-var SlashStr: str = "/"
-var SingleQuoteStr: str = "'"
-var EmptyQuotedStr: str = "''"
 const osOpenWriteOnly: int32 = 0x0001
 const osOpenReadOnly: int32 = 0
 const osOpenCreate: int32 = 0x0200
@@ -209,11 +223,8 @@ fn clearIoMeterHook() =
     ioMeterHook = nil
 
 fn ioMeterReport(op: IoMeterOp, bytes: int64) =
-    if !ioMeterHasHook:
-        return
-    if ioMeterHook == nil:
-        return
-    c_iometer_call(ioMeterHook, op, bytes)
+    if ioMeterHasHook && ioMeterHook != nil:
+        c_iometer_call(ioMeterHook, op, bytes)
 
 fn openImpl(filename: str, mode: FileMode): File =
     if mode == fmRead:
@@ -228,32 +239,29 @@ fn openRead(filename: str): File =
 fn open(filename: str, mode: FileMode): File =
     return openImpl(filename, mode)
 
-fn close(f: File) =
+fn close(f: File): void =
     c_fclose f
 
-fn osStoreStrOut(out: str*, value: str) =
-    if out == nil:
-        return
-    *out = value
+fn osStoreStrOut(out: str*, value: str): void =
+    if out != nil:
+        *out = value
 
 fn osDebugFileReadEnabled(): bool =
     return getEnvDefault("BACKEND_DEBUG_FILE_READ", "") == "1"
 
-fn osDebugFileRead(msg: str) =
-    if !osDebugFileReadEnabled():
-        return
-    let f: File = get_stderr()
-    write(f, "[os.read] ")
-    writeLine(f, msg)
+fn osDebugFileRead(msg: str): void =
+    if osDebugFileReadEnabled():
+        let f: File = get_stderr()
+        write(f, "[os.read] ")
+        writeLine(f, msg)
 
-fn osDebugFileReadKV(label: str, value: int32) =
-    if !osDebugFileReadEnabled():
-        return
-    let f: File = get_stderr()
-    write(f, "[os.read] ")
-    write(f, label)
-    write(f, "=")
-    writeLine(f, intToStr(value))
+fn osDebugFileReadKV(label: str, value: int32): void =
+    if osDebugFileReadEnabled():
+        let f: File = get_stderr()
+        write(f, "[os.read] ")
+        write(f, label)
+        write(f, "=")
+        writeLine(f, intToStr(value))
 
 fn readAllInto(f: File, out: str* = nil): bool =
     if f == nil:
@@ -339,22 +347,18 @@ type
         cap: int32
         buffer: void*
 fn os_newSeq_WalkDirEntry(len: int32, cap: int32): seq_WalkDirEntry =
-    var seqInstance: seq_WalkDirEntry
-    seqInstance.len = 0
-    seqInstance.cap = cap
+    var buffer0: void* = nil
     if cap > 0:
-        var size64: int64 = int64(cap) * sizeof WalkDirEntry
+        var size64: int64 = int64(cap) * int64(ptrSize())
         var size32: int32 = int32(size64)
-        seqInstance.buffer = alloc size32
-    else:
-        seqInstance.buffer = nil
-    return seqInstance
+        buffer0 = alloc size32
+    return seq_WalkDirEntry(len: len, cap: cap, buffer: buffer0)
 fn os_get_WalkDirEntry(seqInst: seq_WalkDirEntry, i: int32): WalkDirEntry =
     var idx64: int64 = int64(i)
-    var offset64: int64 = idx64 * sizeof WalkDirEntry
+    var offset64: int64 = idx64 * int64(ptrSize())
     var offset32: int32 = int32(offset64)
     var p: void* = ptr_add(seqInst.buffer, offset32)
-    var pt: WalkDirEntry* = WalkDirEntry*(p)
+    var pt: str* = str*(p)
     return *pt
 fn walkDirEntryKind(entry: str): PathComponent =
     let entryPtr: void* = void*(entry)
@@ -390,14 +394,14 @@ fn os_addPtr_WalkDirEntry(seqInst: seq_WalkDirEntry*, val: WalkDirEntry) =
             newCap = seqInst->cap * 2
         seqInst->cap = newCap
         var cap64: int64 = int64(newCap)
-        var size64: int64 = int64(cap64) * sizeof WalkDirEntry
+        var size64: int64 = int64(cap64) * int64(ptrSize())
         var size32: int32 = int32(size64)
         seqInst->buffer = realloc(seqInst->buffer, size32)
     var idx64: int64 = int64(seqInst->len)
-    var offset64: int64 = int64(idx64) * sizeof WalkDirEntry
+    var offset64: int64 = int64(idx64) * int64(ptrSize())
     var offset32: int32 = int32(offset64)
     var p: void* = ptr_add(seqInst->buffer, offset32)
-    var pt: WalkDirEntry* = WalkDirEntry*(p)
+    var pt: str* = str*(p)
     *pt = val
     seqInst->len = seqInst->len + 1
 
@@ -448,23 +452,47 @@ fn getEnvImpl(key: str, defaultValue: str): str =
         return defaultValue
     return v
 fn getEnv(key: str): str =
-    return getEnvImpl(key, EmptyStr)
+    return getEnvImpl(key, "")
 fn getEnvDefault(key: str, defaultValue: str): str =
     return getEnvImpl(key, defaultValue)
 fn commandLineParams(): str[] =
     # cmdline module now loads argv from runtime bridge lazily.
     let count: int32 = cmdline.paramCount()
     var out: str[]
-    if count <= 0:
-        return out
-    setLen(out, count)
-    for i in 1..count:
-        out[i - 1] = cmdline.paramStr(i)
-    return out
+    if count > 0:
+        setLen(out, count)
+        var i: int32 = 1
+        while i <= count:
+            out[i - 1] = cmdline.paramStr(i)
+            i = i + 1
+    return osReturnStrSeq(out)
 fn quoteShell(value: str): str =
     if len(value) == 0 || value[0] == char(0):
-        return EmptyQuotedStr
-    return SingleQuoteStr + value + SingleQuoteStr
+        return "''"
+    return "'" + value + "'"
+
+fn osJoinPathRaw(a: str, b: str, sep: char): str =
+    let aLen: int32 = len(a)
+    let bLen: int32 = len(b)
+    let needSep: bool = sep != char(0)
+    let totalLen: int32 = aLen + bLen + (needSep ? 1 : 0)
+    let buf: void* = malloc(totalLen)
+    if buf == nil:
+        return a
+    for i in 0..<aLen:
+        let dst: char* = char*(ptr_add(buf, i))
+        *dst = a[i]
+    if needSep:
+        let sepDst: char* = char*(ptr_add(buf, aLen))
+        *sepDst = sep
+    let bOff: int32 = aLen + (needSep ? 1 : 0)
+    for i in 0..<bLen:
+        let dst: char* = char*(ptr_add(buf, bOff + i))
+        *dst = b[i]
+    let out: str = newStringCopy(buf, totalLen)
+    free(buf)
+    return out
+
 fn joinPath(a: str, b: str): str =
     if len(a) == 0 || a[0] == char(0):
         return b
@@ -473,12 +501,12 @@ fn joinPath(a: str, b: str): str =
     let aLen: int32 = len a
     let last: char = a[aLen - 1]
     if last == '/' || last == '\\':
-        return a + b
-    return a + SlashStr + b
+        return osJoinPathRaw(a, b, char(0))
+    return osJoinPathRaw(a, b, '/')
 fn `/`(a: str, b: str): str =
     return joinPath(a, b)
 
-fn sliceStr(text: str, start: int32, stop: int32): str =
+fn osSliceStr(text: str, start: int32, stop: int32): str =
     if len(text) == 0:
         return ""
     var s: int32 = start
@@ -519,21 +547,20 @@ fn relativePath(path: str, base: str): str =
         return path
     let baseLen: int32 = len base
     let pathLen: int32 = len path
-    if pathLen >= baseLen && sliceStr(path, 0, baseLen - 1) == base:
+    if pathLen >= baseLen && osSliceStr(path, 0, baseLen - 1) == base:
         var idx: int32 = baseLen
         if idx < pathLen && (path[idx] == '/' || path[idx] == '\\'):
             idx = idx + 1
         if idx <= pathLen:
-            return sliceStr(path, idx, pathLen - 1)
+            return osSliceStr(path, idx, pathLen - 1)
     return path
 fn splitFile(path: str): SplitFileResult =
-    var out: SplitFileResult
-    out.dir = ""
-    out.name = ""
-    out.ext = ""
+    var dir0: str = ""
+    var name0: str = ""
+    var ext0: str = ""
     let pathLen: int32 = len path
     if pathLen == 0:
-        return out
+        return SplitFileResult(dir: dir0, name: name0, ext: ext0)
     var lastSep: int32 = -1
     for i in 0..<pathLen:
         let ch: char = path[i]
@@ -552,23 +579,23 @@ fn splitFile(path: str): SplitFileResult =
     let nameStart: int32 = lastSep + 1
     if lastSep >= 0:
         if lastSep <= 0:
-            out.dir = ""
+            dir0 = ""
         else:
-            out.dir = sliceStr(path, 0, lastSep - 1)
+            dir0 = osSliceStr(path, 0, lastSep - 1)
         if nameStart >= pathLen:
-            out.name = ""
+            name0 = ""
         else:
-            out.name = sliceStr(path, nameStart, pathLen - 1)
+            name0 = osSliceStr(path, nameStart, pathLen - 1)
     else:
-        out.dir = ""
-        out.name = path
+        dir0 = ""
+        name0 = path
     if lastDot > lastSep && lastDot >= 0:
         if lastDot - 1 >= nameStart:
-            out.name = sliceStr(path, nameStart, lastDot - 1)
+            name0 = osSliceStr(path, nameStart, lastDot - 1)
         else:
-            out.name = ""
-        out.ext = sliceStr(path, lastDot, pathLen - 1)
-    return out
+            name0 = ""
+        ext0 = osSliceStr(path, lastDot, pathLen - 1)
+    return SplitFileResult(dir: dir0, name: name0, ext: ext0)
 fn getFileSize(path: str): int64 =
     path
     return 0
@@ -587,13 +614,13 @@ fn makeWalkDirEntry(kind: PathComponent, path: str): str =
 fn walkDir(path: str): seq_WalkDirEntry =
     var out: seq_WalkDirEntry = os_newSeq_WalkDirEntry(0, 0)
     if len(path) == 0 || path[0] == char(0) || ! dirExists path:
-        return out
+        return seq_WalkDirEntry(len: out.len, cap: out.cap, buffer: out.buffer)
     let listText: str = cheng_list_dir path
     if len(listText) == 0 || listText[0] == char(0):
         let listTextPtr: void* = void*(listText)
         if listTextPtr != nil:
             dealloc listTextPtr
-        return out
+        return seq_WalkDirEntry(len: out.len, cap: out.cap, buffer: out.buffer)
     let total: int32 = len listText
     var start: int32 = 0
     for i in 0..total:
@@ -607,7 +634,7 @@ fn walkDir(path: str): seq_WalkDirEntry =
             if endIdx >= start && listText[endIdx] == '\r':
                 endIdx = endIdx - 1
             if endIdx >= start:
-                let name: str = sliceStr(listText, start, endIdx)
+                let name: str = osSliceStr(listText, start, endIdx)
                 if len(name) > 0 && name[0] != char(0):
                     let fullPath: str = joinPath(path, name)
                     var kind: PathComponent = PathComponent(4)
@@ -619,7 +646,7 @@ fn walkDir(path: str): seq_WalkDirEntry =
             start = i + 1
     let listTextPtr: void* = void*(listText)
     dealloc listTextPtr
-    return out
+    return seq_WalkDirEntry(len: out.len, cap: out.cap, buffer: out.buffer)
 
 fn walkDirRecImpl(path: str, out: str[]*) =
     let items: seq_WalkDirEntry = walkDir path
@@ -631,13 +658,13 @@ fn walkDirRecImpl(path: str, out: str[]*) =
             walkDirRecImpl(path, out)
         elif kind == PathComponent(0) || kind == PathComponent(2):
             var pathOwned: str = path
-            add(out, pathOwned)
+            osAddStrArrayPtr(out, pathOwned)
 fn walkDirRec(path: str): str[] =
     var out: str[]
     if len path == 0 || ! dirExists path:
-        return out
+        return osReturnStrSeq(out)
     walkDirRecImpl(path, &out)
-    return out
+    return osReturnStrSeq(out)
 fn extractFilename(path: str): str =
     let parts: SplitFileResult = splitFile path
     if len parts.ext > 0:
@@ -652,22 +679,21 @@ fn processOptionMask(opt: ProcessOption): uint64 =
     return uint64(1) << uint64(int64(opt))
 
 fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult =
-    var result: ExecCmdResult
-    result.output = ""
-    result.exitCode = -1
+    var output0: str = ""
+    var exitCode0: int32 = -1
     if len command == 0:
-        return result
+        return ExecCmdResult(output: output0, exitCode: exitCode0)
     var merge: int32 = 0
     let mask: uint64 = processOptionMask(poStdErrToStdOut)
     if (options & mask) != 0:
         merge = 1
-    var exitCode: int64 = -1
-    let output: str = cheng_exec_cmd_ex(command, workingDir, merge, &exitCode)
-    let outputPtr: void* = void*(output)
+    var exitCode64: int64 = -1
+    let output1: str = cheng_exec_cmd_ex(command, workingDir, merge, &exitCode64)
+    let outputPtr: void* = void*(output1)
     if outputPtr != nil:
-        result.output = output
-    result.exitCode = exitCode
-    return result
+        output0 = output1
+    exitCode0 = int32(exitCode64)
+    return ExecCmdResult(output: output0, exitCode: exitCode0)
 fn execCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
     return execCmdExImpl(command, options, workingDir)
 fn execCmdResultExitCode(result: ExecCmdResult): int32 =
@@ -711,7 +737,7 @@ fn readFileSizedInto(path: str, size: int32, out: str* = nil): bool =
         if got <= 0:
             break
         totalGot64 = totalGot64 + int64(got)
-        ioMeterReport(ioRead, got)
+        ioMeterReport(ioRead, int64(got))
     c_fclose f
     let totalGot: int32 = int32(totalGot64)
     if totalGot != size:
@@ -749,25 +775,21 @@ fn readFile(path: str): str =
     let _ok: bool = readFileInto(path, &out)
     return out
 fn writeFile(path: str, content: str) =
-    if len(path) == 0:
-        return
-    let flags: int32 = osOpenWriteOnly | osOpenCreate | osOpenTrunc
-    let fd: int32 = libc_open(path, flags, osFileMode0644)
-    if fd < 0:
-        return
-    if len(content) > 0:
-        let wrote: int64 = libc_write(fd, void*(content), int64(len(content)))
-        ioMeterReport(ioWrite, wrote)
-    libc_close(fd)
+    if len(path) > 0:
+        let flags: int32 = osOpenWriteOnly | osOpenCreate | osOpenTrunc
+        let fd: int32 = libc_open(path, flags, osFileMode0644)
+        if fd >= 0:
+            if len(content) > 0:
+                let wrote: int64 = libc_write(fd, void*(content), int64(len(content)))
+                ioMeterReport(ioWrite, wrote)
+            libc_close(fd)
 
 fn writeFileBytes(path: str, bytes: uint8[]) =
-    if len(path) == 0:
-        return
-    let flags: int32 = osOpenWriteOnly | osOpenCreate | osOpenTrunc
-    let fd: int32 = libc_open(path, flags, osFileMode0644)
-    if fd < 0:
-        return
-    if bytes.buffer != nil && bytes.len > 0:
-        let wrote: int64 = libc_write(fd, bytes.buffer, int64(bytes.len))
-        ioMeterReport(ioWrite, wrote)
-    libc_close(fd)
+    if len(path) > 0:
+        let flags: int32 = osOpenWriteOnly | osOpenCreate | osOpenTrunc
+        let fd: int32 = libc_open(path, flags, osFileMode0644)
+        if fd >= 0:
+            if bytes.buffer != nil && bytes.len > 0:
+                let wrote: int64 = libc_write(fd, bytes.buffer, int64(bytes.len))
+                ioMeterReport(ioWrite, wrote)
+            libc_close(fd)

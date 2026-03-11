@@ -3,6 +3,8 @@
 import std/os
 import std/seqs
 import std/strings
+import std/system
+import std/rawmem_support
 
 fn token_memRelease(p: void*) =
     memRelease(p)
@@ -55,8 +57,15 @@ var
     tokenTextBytes: uint8[]
     tokenTextStarts: int32[]
     tokenTextLens: int32[]
+    tokenTextValues: str[]
+    tokenTrimStarts: int32[]
+    tokenTrimLens: int32[]
+    tokenTrimCanonicalIds: int32[]
     tokenCommonIds: int32[]
+    tokenLitCommonKeys: str[]
+    tokenLitCommonSlots: int32[]
     tokenTextPoolReady: bool
+    tokenTextPoolEpoch: int32 = 1
 
 fn tokenTextAppendByte(seqInst: var uint8[], val: uint8) =
     let idx: int32 = seqInst.len
@@ -69,6 +78,37 @@ fn tokenTextAppendByte(seqInst: var uint8[], val: uint8) =
     seqInst[idx] = val
 
 fn tokenTextAppendLen(seqInst: var int32[], val: int32) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+        if seqInst.buffer != nil:
+            token_memScopeEscape(seqInst.buffer)
+    seqs.setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn tokenTextAppendValue(seqInst: var str[], val: str) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+        if seqInst.buffer != nil:
+            token_memScopeEscape(seqInst.buffer)
+    seqs.setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn tokenTextAppendOwnedValue(seqInst: var str[], val: str) =
+    if len(val) > 0 && rawmemAsVoid(val) != nil:
+        token_memRetain(rawmemAsVoid(val))
+    tokenTextAppendValue(seqInst, val)
+
+fn tokenTextReleaseOwnedValues(seqInst: str[]) =
+    for i in 0..<seqInst.len:
+        let val: str = seqInst[i]
+        if len(val) > 0 && rawmemAsVoid(val) != nil:
+            token_memRelease(rawmemAsVoid(val))
+
+fn tokenTextAppendSlot(seqInst: var int32[], val: int32) =
     let idx: int32 = seqInst.len
     let needLen: int32 = idx + 1
     if seqInst.buffer == nil || seqInst.cap < needLen:
@@ -93,6 +133,39 @@ fn tokenRangeCharAt(source: str, start: int32, count: int32, idx: int32): char =
         return char(0)
     return source[start + idx]
 
+fn tokenTextCopyRange(source: str, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    if start == 0 && count == len(source):
+        return source
+    if start < 0 || start + count > len(source):
+        return ""
+    let src: void* = rawmemPtrAdd(ptr(source), start)
+    return newStringCopy(src, count)
+
+fn tokenTextCopyRangeTrusted(source: str, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    let src: void* = rawmemPtrAdd(ptr(source), start)
+    return newStringCopy(src, count)
+
+fn tokenTextCopyRangeById(id: int32, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    let textLen: int32 = tokenTextLen(id)
+    if textLen <= 0:
+        return ""
+    if start < 0 || start + count > textLen:
+        return ""
+    if start == 0 && count == textLen:
+        return tokenTextById(id)
+    let textStart: int32 = tokenTextStart(id)
+    let byteStart: int32 = textStart + start
+    if byteStart < 0 || byteStart + count > tokenTextBytes.len:
+        return ""
+    let src: void* = rawmemPtrAdd(tokenTextBytes.buffer, byteStart)
+    return newStringCopy(src, count)
+
 fn tokenTextLen(id: int32): int32 =
     if !tokenTextPoolReady || id < 0 || id >= tokenTextLens.len:
         return 0
@@ -106,20 +179,9 @@ fn tokenTextStart(id: int32): int32 =
 fn tokenTextById(id: int32): str =
     if !tokenTextPoolReady:
         return ""
-    if id <= 0 || id >= tokenTextStarts.len:
+    if id <= 0 || id >= tokenTextStarts.len || id >= tokenTextValues.len:
         return ""
-    let start: int32 = tokenTextStart(id)
-    let count: int32 = tokenTextLen(id)
-    if count <= 0:
-        return ""
-    if tokenTextBytes.buffer == nil:
-        return ""
-    if start < 0 || start + count > tokenTextBytes.len:
-        return ""
-    var out: str = ""
-    for i in 0..<count:
-        out = out + charToStr(char(tokenTextBytes[start + i]))
-    return out
+    return tokenTextValues[id]
 
 fn tokenTextByteAtId(id: int32, idx: int32): char =
     let start: int32 = tokenTextStart(id)
@@ -130,6 +192,99 @@ fn tokenTextByteAtId(id: int32, idx: int32): char =
     if byteIdx < 0 || byteIdx >= tokenTextBytes.len:
         return char(0)
     return char(tokenTextBytes[byteIdx])
+
+fn tokenTrimEnsureCache(id: int32) =
+    if id <= 0:
+        return
+    let needLen: int32 = id + 1
+    let oldStartLen: int32 = tokenTrimStarts.len
+    if oldStartLen < needLen:
+        seqs.reserve(tokenTrimStarts, needLen)
+        seqs.setLen(tokenTrimStarts, needLen)
+        for i in oldStartLen..<needLen:
+            tokenTrimStarts[i] = 0
+    let oldLenLen: int32 = tokenTrimLens.len
+    if oldLenLen < needLen:
+        seqs.reserve(tokenTrimLens, needLen)
+        seqs.setLen(tokenTrimLens, needLen)
+        for i in oldLenLen..<needLen:
+            tokenTrimLens[i] = -1
+    let oldCanonicalLen: int32 = tokenTrimCanonicalIds.len
+    if oldCanonicalLen < needLen:
+        seqs.reserve(tokenTrimCanonicalIds, needLen)
+        seqs.setLen(tokenTrimCanonicalIds, needLen)
+        for i in oldCanonicalLen..<needLen:
+            tokenTrimCanonicalIds[i] = -1
+
+fn tokenTrimCompute(id: int32) =
+    if id <= 0:
+        return
+    tokenTrimEnsureCache(id)
+    if id < tokenTrimLens.len && tokenTrimLens[id] >= 0:
+        return
+    let rawLen: int32 = tokenTextLen(id)
+    if rawLen <= 0:
+        if id < tokenTrimStarts.len:
+            tokenTrimStarts[id] = 0
+        if id < tokenTrimLens.len:
+            tokenTrimLens[id] = 0
+        return
+    if tokenTextByteAtId(id, 0) != ' ' && tokenTextByteAtId(id, rawLen - 1) != ' ':
+        if id < tokenTrimStarts.len:
+            tokenTrimStarts[id] = 0
+        if id < tokenTrimLens.len:
+            tokenTrimLens[id] = rawLen
+        return
+    var start: int32 = 0
+    var end: int32 = rawLen
+    while start < end && tokenTextByteAtId(id, start) == ' ':
+        start = start + 1
+    while end > start && tokenTextByteAtId(id, end - 1) == ' ':
+        end = end - 1
+    if id < tokenTrimStarts.len:
+        tokenTrimStarts[id] = start
+    if id < tokenTrimLens.len:
+        tokenTrimLens[id] = end - start
+
+fn tokenTextTrimmedStart(id: int32): int32 =
+    if id <= 0:
+        return 0
+    tokenTrimCompute(id)
+    if id < tokenTrimStarts.len:
+        return tokenTrimStarts[id]
+    return 0
+
+fn tokenTextTrimmedLen(id: int32): int32 =
+    if id <= 0:
+        return 0
+    tokenTrimCompute(id)
+    if id < tokenTrimLens.len:
+        return tokenTrimLens[id]
+    return 0
+
+fn tokenTextTrimmedByteAtId(id: int32, idx: int32): char =
+    let trimmedLen: int32 = tokenTextTrimmedLen(id)
+    if idx < 0 || idx >= trimmedLen:
+        return char(0)
+    return tokenTextByteAtId(id, tokenTextTrimmedStart(id) + idx)
+
+fn tokenTextTrimmedCanonicalId(id: int32): int32 =
+    if id <= 0:
+        return 0
+    tokenTrimEnsureCache(id)
+    if id < tokenTrimCanonicalIds.len && tokenTrimCanonicalIds[id] >= 0:
+        return tokenTrimCanonicalIds[id]
+    let rawLen: int32 = tokenTextLen(id)
+    let start: int32 = tokenTextTrimmedStart(id)
+    let trimmedLen: int32 = tokenTextTrimmedLen(id)
+    var out: int32 = id
+    if rawLen <= 0 || trimmedLen <= 0:
+        out = 0
+    elif start != 0 || trimmedLen != rawLen:
+        out = tokenInternText(tokenTextCopyRangeById(id, start, trimmedLen))
+    if id < tokenTrimCanonicalIds.len:
+        tokenTrimCanonicalIds[id] = out
+    return out
 
 fn tokenTextPoolEnsure() =
     if tokenTextPoolReady:
@@ -143,12 +298,41 @@ fn tokenTextPoolEnsure() =
     tokenTextLens.buffer = nil
     tokenTextLens.len = 0
     tokenTextLens.cap = 0
+    tokenTextValues.buffer = nil
+    tokenTextValues.len = 0
+    tokenTextValues.cap = 0
+    tokenTrimStarts.buffer = nil
+    tokenTrimStarts.len = 0
+    tokenTrimStarts.cap = 0
+    tokenTrimLens.buffer = nil
+    tokenTrimLens.len = 0
+    tokenTrimLens.cap = 0
+    tokenTrimCanonicalIds.buffer = nil
+    tokenTrimCanonicalIds.len = 0
+    tokenTrimCanonicalIds.cap = 0
     tokenCommonIds.buffer = nil
     tokenCommonIds.len = 0
     tokenCommonIds.cap = 0
     tokenTextAppendLen(tokenTextStarts, 0)
     tokenTextAppendLen(tokenTextLens, 0)
+    tokenTextAppendValue(tokenTextValues, "")
+    tokenTextAppendLen(tokenTrimStarts, 0)
+    tokenTextAppendLen(tokenTrimLens, 0)
+    tokenTextAppendLen(tokenTrimCanonicalIds, -1)
     tokenTextPoolReady = true
+
+fn tokenTextPoolCurrentEpoch(): int32 =
+    return tokenTextPoolEpoch
+
+fn tokenLitCommonSlotCached(lit: str): int32 =
+    for i in 0..<tokenLitCommonKeys.len:
+        if rawmemAsVoid(tokenLitCommonKeys[i]) == rawmemAsVoid(lit):
+            return tokenLitCommonSlots[i]
+    return -2
+
+fn tokenLitCommonSlotCacheStore(lit: str, slot: int32) =
+    tokenTextAppendValue(tokenLitCommonKeys, lit)
+    tokenTextAppendSlot(tokenLitCommonSlots, slot)
 
 fn tokenCommonEnsure() =
     tokenTextPoolEnsure()
@@ -736,10 +920,16 @@ fn tokenTextPoolAppendRange(source: str, start: int32, count: int32): int32 =
     let startOff: int32 = tokenTextBytes.len
     let needBytes: int32 = startOff + count
     seqs.setLen(tokenTextBytes, needBytes)
-    for i in 0..<count:
-        tokenTextBytes[startOff + i] = uint8(source[start + i])
+    rawmemCopy(rawmemPtrAdd(tokenTextBytes.buffer, startOff), rawmemPtrAdd(ptr(source), start), count)
     tokenTextAppendLen(tokenTextStarts, startOff)
     tokenTextAppendLen(tokenTextLens, count)
+    # tokenTextValues is used after lexer/parser temporaries have been released,
+    # so it must never alias caller-owned string storage.
+    let copied: str = tokenTextCopyRangeTrusted(source, start, count)
+    if len(copied) == count:
+        tokenTextAppendOwnedValue(tokenTextValues, copied)
+    else:
+        tokenTextAppendOwnedValue(tokenTextValues, sliceBytes(source, start, count))
     return id
 
 fn tokenInternTextRange(source: str, start: int32, count: int32): int32 =
@@ -758,6 +948,10 @@ fn tokenInternTextRange(source: str, start: int32, count: int32): int32 =
     return tokenTextPoolAppendRange(source, start, count)
 
 fn tokenResetTextPool() =
+    tokenTextPoolEpoch = tokenTextPoolEpoch + 1
+    if tokenTextPoolEpoch <= 0:
+        tokenTextPoolEpoch = 1
+    tokenTextReleaseOwnedValues(tokenTextValues)
     if tokenTextPoolReady:
         if tokenTextBytes.buffer != nil:
             token_memRelease(tokenTextBytes.buffer)
@@ -774,6 +968,26 @@ fn tokenResetTextPool() =
     tokenTextLens.buffer = nil
     tokenTextLens.len = 0
     tokenTextLens.cap = 0
+    if tokenTextValues.buffer != nil:
+        token_memRelease(tokenTextValues.buffer)
+    tokenTextValues.buffer = nil
+    tokenTextValues.len = 0
+    tokenTextValues.cap = 0
+    if tokenTrimStarts.buffer != nil:
+        token_memRelease(tokenTrimStarts.buffer)
+    tokenTrimStarts.buffer = nil
+    tokenTrimStarts.len = 0
+    tokenTrimStarts.cap = 0
+    if tokenTrimLens.buffer != nil:
+        token_memRelease(tokenTrimLens.buffer)
+    tokenTrimLens.buffer = nil
+    tokenTrimLens.len = 0
+    tokenTrimLens.cap = 0
+    if tokenTrimCanonicalIds.buffer != nil:
+        token_memRelease(tokenTrimCanonicalIds.buffer)
+    tokenTrimCanonicalIds.buffer = nil
+    tokenTrimCanonicalIds.len = 0
+    tokenTrimCanonicalIds.cap = 0
     if tokenCommonIds.buffer != nil:
         token_memRelease(tokenCommonIds.buffer)
     tokenCommonIds.buffer = nil
@@ -885,6 +1099,14 @@ fn tokenLexemeCharAt(tok: Token*, idx: int32): char =
     return tokenLexemeCharAt(*tok, idx)
 
 fn tokenTextEqLitId(id: int32, lit: str): bool =
+    var slot: int32 = tokenLitCommonSlotCached(lit)
+    if slot == -2:
+        slot = tokenCommonSlotIndex(lit)
+        tokenLitCommonSlotCacheStore(lit, slot)
+    if slot >= 0:
+        let commonId: int32 = tokenCommonId(slot)
+        if commonId > 0:
+            return id == commonId
     let n: int32 = tokenTextLen(id)
     if n != len(lit):
         return false

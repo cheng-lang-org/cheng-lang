@@ -285,6 +285,61 @@ fn astEnsureArenaRuntime() =
     if !astArenaStorageReady:
         panic "ast arena storage not initialized"
 
+fn astReserveNodeI32(seqInst: var int32[], needLen: int32) =
+    if needLen > 0 && seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+
+fn astReserveNodeI64(seqInst: var int64[], needLen: int32) =
+    if needLen > 0 && seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+
+fn astReserveNodeF64(seqInst: var float64[], needLen: int32) =
+    if needLen > 0 && seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+
+fn astReserveNodeI8(seqInst: var int8[], needLen: int32) =
+    if needLen > 0 && seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+
+fn astReserveNodeBool(seqInst: var bool[], needLen: int32) =
+    if needLen > 0 && seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+
+fn astReserveNodeKindSeq(seqInst: var NodeKind[], needLen: int32) =
+    if needLen > 0 && seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+
+fn astReserveNodeIdSeq(seqInst: var AstNodeId[], needLen: int32) =
+    if needLen > 0 && seqInst.cap < needLen:
+        seqs.reserve(seqInst, needLen)
+
+fn astReserveAdditional(nodeCount: int32, kidCount: int32) =
+    astEnsureArenaRuntime()
+    if nodeCount > 0:
+        let needNodes: int32 = len(astKindByNode) + nodeCount
+        astReserveNodeKindSeq(astKindByNode, needNodes)
+        astReserveNodeI32(astPosLineByNode, needNodes)
+        astReserveNodeI32(astPosColByNode, needNodes)
+        astReserveNodeI32(astIdentByNode, needNodes)
+        astReserveNodeI32(astStrValByNode, needNodes)
+        astReserveNodeI64(astIntValByNode, needNodes)
+        astReserveNodeF64(astFloatValByNode, needNodes)
+        astReserveNodeI8(astCallStyleByNode, needNodes)
+        astReserveNodeI32(astDeferredBodyStartTokByNode, needNodes)
+        astReserveNodeI32(astDeferredBodyEndTokByNode, needNodes)
+        astReserveNodeI8(astDeferredBodyStateByNode, needNodes)
+        astReserveNodeI32(astDeclOrdinalByNode, needNodes)
+        astReserveNodeIdSeq(astTypeCacheByNode, needNodes)
+        astReserveNodeBool(astTypeCacheValidByNode, needNodes)
+        astReserveNodeI8(astManagedCacheStateByNode, needNodes)
+        astReserveNodeI32(astKidHeadByNode, needNodes)
+        astReserveNodeI32(astKidTailByNode, needNodes)
+        astReserveNodeI32(astKidCountByNode, needNodes)
+    if kidCount > 0:
+        let needKids: int32 = len(astKidValue) + kidCount
+        astReserveNodeIdSeq(astKidValue, needKids)
+        astReserveNodeI32(astKidNext, needKids)
+
 fn astResetArenaStorage(releaseBuffers: bool) =
     astResetSeq(astKindByNode, releaseBuffers)
     astResetSeq(astPosLineByNode, releaseBuffers)
@@ -405,6 +460,11 @@ fn astNodeStrVal(id: AstNodeId): str =
         return ""
     return tokenTextById(astStrValByNode[astNodeIndex(id)])
 
+fn astNodeStrValId(id: AstNodeId): int32 =
+    if !astNodeIdValid(id):
+        return 0
+    return astStrValByNode[astNodeIndex(id)]
+
 fn astNodeIntVal(id: AstNodeId): int64 =
     if !astNodeIdValid(id):
         return 0
@@ -464,10 +524,30 @@ fn astSetNodeIdent(id: AstNodeId, s: str) =
         return
     astIdentByNode[astNodeIndex(id)] = textId
 
+fn astSetNodeIdentId(id: AstNodeId, textId: int32) =
+    if !astNodeIdValid(id):
+        return
+    if textId <= 0:
+        astIdentByNode[astNodeIndex(id)] = 0
+        return
+    if astIdentByNode[astNodeIndex(id)] == textId:
+        return
+    astIdentByNode[astNodeIndex(id)] = textId
+
 fn astSetNodeStrVal(id: AstNodeId, s: str) =
     if !astNodeIdValid(id):
         return
     let textId: int32 = tokenInternText(s)
+    if astStrValByNode[astNodeIndex(id)] == textId:
+        return
+    astStrValByNode[astNodeIndex(id)] = textId
+
+fn astSetNodeStrValId(id: AstNodeId, textId: int32) =
+    if !astNodeIdValid(id):
+        return
+    if textId <= 0:
+        astStrValByNode[astNodeIndex(id)] = 0
+        return
     if astStrValByNode[astNodeIndex(id)] == textId:
         return
     astStrValByNode[astNodeIndex(id)] = textId
@@ -721,12 +801,23 @@ fn astNewNodeId(kind: NodeKind, pos: SourcePos): AstNodeId =
 fn nodeSetIdent(n: Node, s: str) =
     astSetNodeIdent(n, s)
 
+fn nodeSetIdentId(n: Node, textId: int32) =
+    astSetNodeIdentId(n, textId)
+
 fn nodeSetStrVal(n: Node, s: str) =
     astSetNodeStrVal(n, s)
+
+fn nodeSetStrValId(n: Node, textId: int32) =
+    astSetNodeStrValId(n, textId)
 
 fn newIdent(ident: str, pos: SourcePos): Node =
     var n: Node = newNode(nkIdent, pos)
     nodeSetIdent(n, ident)
+    return n
+
+fn newIdentWithId(identId: int32, pos: SourcePos): Node =
+    var n: Node = newNode(nkIdent, pos)
+    nodeSetIdentId(n, identId)
     return n
 
 fn astNewIdentId(ident: str, pos: SourcePos): AstNodeId =
@@ -735,6 +826,11 @@ fn astNewIdentId(ident: str, pos: SourcePos): AstNodeId =
 fn newSymbol(ident: str, pos: SourcePos): Node =
     var n: Node = newNode(nkSymbol, pos)
     nodeSetIdent(n, ident)
+    return n
+
+fn newSymbolWithId(identId: int32, pos: SourcePos): Node =
+    var n: Node = newNode(nkSymbol, pos)
+    nodeSetIdentId(n, identId)
     return n
 
 fn astNewSymbolId(ident: str, pos: SourcePos): AstNodeId =
@@ -759,6 +855,11 @@ fn astNewFloatLitId(val: float64, pos: SourcePos): AstNodeId =
 fn newStrLit(val: str, pos: SourcePos): Node =
     var n: Node = newNode(nkStrLit, pos)
     nodeSetStrVal(n, val)
+    return n
+
+fn newStrLitWithId(valId: int32, pos: SourcePos): Node =
+    var n: Node = newNode(nkStrLit, pos)
+    nodeSetStrValId(n, valId)
     return n
 
 fn astNewStrLitId(val: str, pos: SourcePos): AstNodeId =

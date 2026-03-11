@@ -3,13 +3,6 @@ module cmdline
 # - Runtime bridge only: argv ingress is provided by native runtime helpers.
 import std/strings as strings
 
-var __cheng_cmdCount: int32 = 0
-var __cheng_cmdCaptured: bool = false
-const __cheng_cmdCountMax: int32 = 4096
-const __cheng_int32Max: int64 = int64(2147483647)
-const __cheng_int32Min: int64 = int64(-2147483648)
-const __cheng_int32MinAbs: int64 = int64(2147483648)
-
 @importc("__cheng_rt_paramCount")
 fn __cheng_rt_paramCount(): int32
 
@@ -19,46 +12,30 @@ fn __cheng_rt_paramStr(i: int32): cstring
 @importc("__cheng_rt_paramStrCopy")
 fn __cheng_rt_paramStrCopy(i: int32): str
 
-fn __cheng_captureCmdLine(argc: int32, argv: str*) =
+fn __cheng_cmdCountMax(): int32 =
+    return 4096
+
+fn __cheng_captureCmdLine(argc: int32, argv: str*): void =
     # `argv: str*` is Cheng-managed string storage and must not be reinterpreted
     # as a C argv pointer bridge in no-pointer production surface.
     # Runtime argv access stays on __cheng_rt_paramCount/__cheng_rt_paramStrCopy.
-    let _argvIgnore: str* = argv
-    __cheng_cmdCaptured = false
-    __cheng_cmdCount = 0
-    if argc <= 0 || argc > __cheng_cmdCountMax:
-        return
-    __cheng_cmdCaptured = true
-    __cheng_cmdCount = argc
+    argc
+    argv
 
 fn cmdCountFromCaptured(): int32 =
-    if !__cheng_cmdCaptured:
-        return 0
-    if __cheng_cmdCount <= 0 || __cheng_cmdCount > __cheng_cmdCountMax:
-        return 0
-    return __cheng_cmdCount
+    return 0
 
 fn cmdCountFromRuntime(): int32 =
-    let capturedCount: int32 = cmdCountFromCaptured()
     let runtimeRaw: int32 = __cheng_rt_paramCount()
-    var runtimeCount: int32 = runtimeRaw
-    if runtimeCount < 0:
-        runtimeCount = 0
-    if runtimeCount > __cheng_cmdCountMax:
-        runtimeCount = 0
-    # Prefer runtime argv: some stage0/stub paths can pass truncated argc.
-    if runtimeCount > 0:
-        if capturedCount != runtimeCount:
-            __cheng_cmdCaptured = false
-            __cheng_cmdCount = runtimeCount
-        return runtimeCount
-    return capturedCount
+    if runtimeRaw < 0 || runtimeRaw > __cheng_cmdCountMax():
+        return 0
+    return runtimeRaw
 
 fn cmdReady(): bool =
-    __cheng_cmdCount = cmdCountFromRuntime()
-    if __cheng_cmdCount <= 0:
+    let argc: int32 = cmdCountFromRuntime()
+    if argc <= 0:
         return false
-    if __cheng_cmdCount > __cheng_cmdCountMax:
+    if argc > __cheng_cmdCountMax():
         return false
     return true
 
@@ -68,9 +45,10 @@ fn programName(): str =
     return paramStr(0)
 
 fn paramCount(): int32 =
-    if !cmdReady():
+    let argc: int32 = cmdCountFromRuntime()
+    if argc <= 0:
         return 0
-    return __cheng_cmdCount - 1
+    return argc - 1
 
 fn argCount(): int32 =
     return paramCount()
@@ -79,9 +57,7 @@ fn paramStr(i: int32): str =
     if i < 0:
         return ""
     let argc: int32 = cmdCountFromRuntime()
-    if argc <= 0:
-        return ""
-    if i >= argc:
+    if argc <= 0 || i >= argc:
         return ""
     let copied: str = __cheng_rt_paramStrCopy(i)
     if strings.len(copied) > 0:
@@ -116,20 +92,20 @@ fn cmdTrimAsciiSpace(raw: str): str =
         return ""
     let n: int32 = strings.len(raw)
     var start: int32 = 0
+    var found: bool = false
     for i in 0..<n:
         if !cmdIsSpace(raw[i]):
             start = i
+            found = true
             break
         if i == n - 1:
             return ""
-    var stop: int32 = n
-    let __stop0 = stop
-    for __for_rev in 0..<(__stop0 - start):
-        stop = __stop0 - __for_rev
-        if !cmdIsSpace(raw[stop - 1]):
-            break
-    if stop <= start:
+    if !found:
         return ""
+    var stop: int32 = start + 1
+    for i in start..<n:
+        if !cmdIsSpace(raw[i]):
+            stop = i + 1
     if start == 0 && stop == n:
         return raw
     return strings.sliceBytes(raw, start, stop - start)
@@ -224,11 +200,15 @@ fn readFirstFlagValue(key: str, outValue: var str): bool =
         return false
     let count: int32 = paramCount()
     for i in 1..count:
-        var v: str = ""
-        var nextIndex: int32 = i
-        if readFlagValueAt(i, key, v, nextIndex):
-            outValue = v
+        let arg: str = paramStr(i)
+        if tryInlineFlagValue(arg, key, outValue):
             return true
+        if !(arg == key):
+            continue
+        if i >= count:
+            return false
+        outValue = paramStr(i + 1)
+        return true
     return false
 
 fn readLastFlagValue(key: str, outValue: var str): bool =
@@ -237,18 +217,15 @@ fn readLastFlagValue(key: str, outValue: var str): bool =
         return false
     var found: bool = false
     let count: int32 = paramCount()
-    var i: int32 = 1
-    for __for_guard_i in 0..<count:
-        if !(i <= count):
-            break
-        var v: str = ""
-        var nextIndex: int32 = i
-        if readFlagValueAt(i, key, v, nextIndex):
-            outValue = v
+    for i in 1..count:
+        let arg: str = paramStr(i)
+        if tryInlineFlagValue(arg, key, outValue):
             found = true
-            i = nextIndex + 1
             continue
-        i = i + 1
+        if arg == key:
+            if i < count:
+                outValue = paramStr(i + 1)
+                found = true
     return found
 
 fn readFlagValue(key: str, outValue: var str): bool =
@@ -281,7 +258,7 @@ fn parseInt32(raw: str, outValue: var int32): bool =
     if i >= n:
         return false
     var v: int64 = 0
-    let limit: int64 = neg ? __cheng_int32MinAbs : __cheng_int32Max
+    let limit: int64 = neg ? int64(2147483648) : int64(2147483647)
     for __for_guard_i in 0..<n:
         if !(i < n):
             break
@@ -294,7 +271,7 @@ fn parseInt32(raw: str, outValue: var int32): bool =
         v = v * int64(10) + digit
         i = i + 1
     var signed: int64 = neg ? (int64(0) - v) : v
-    if signed < __cheng_int32Min || signed > __cheng_int32Max:
+    if signed < int64(-2147483648) || signed > int64(2147483647):
         return false
     outValue = int32(signed)
     return true
@@ -306,36 +283,43 @@ fn readBoolFlagAt(i: int32, trueName: str, falseName: str, valueName: str,
     if i < 1 || i > count:
         return false
     let arg: str = paramStr(i)
-    if !(trueName == "") && arg == trueName:
+    let hasTrueName: bool = strings.len(trueName) > 0
+    if hasTrueName && arg == trueName:
         outValue = true
         return true
-    if !(falseName == "") && arg == falseName:
+    let hasFalseName: bool = strings.len(falseName) > 0
+    if hasFalseName && arg == falseName:
         outValue = false
         return true
+    let hasValueName: bool = strings.len(valueName) > 0
     var raw: str = ""
-    if !(valueName == "") && tryInlineFlagValue(arg, valueName, raw):
-        return parseBool(raw, outValue)
-    if !(valueName == "") && arg == valueName:
+    if hasValueName:
+        let hasInlineValue: bool = tryInlineFlagValue(arg, valueName, raw)
+        if hasInlineValue:
+            let parsedOk: bool = parseBool(raw, outValue)
+            return parsedOk
+    if hasValueName && arg == valueName:
         let nextIndex: int32 = i + 1
         if nextIndex > count:
             return false
+        let nextValue: str = paramStr(nextIndex)
         outNextIndex = nextIndex
-        return parseBool(paramStr(nextIndex), outValue)
+        let parsedOk: bool = parseBool(nextValue, outValue)
+        return parsedOk
     return false
 
 fn readIntFlagAt(i: int32, key: str, outValue: var int32, outNextIndex: var int32): bool =
     var raw: str = ""
     if !readFlagValueAt(i, key, raw, outNextIndex):
         return false
-    return parseInt32(raw, outValue)
+    let parsedOk: bool = parseInt32(raw, outValue)
+    return parsedOk
 
 fn readBoolFlag(trueName: str, falseName: str, valueName: str, outValue: var bool): bool =
     let count: int32 = paramCount()
     var found: bool = false
     var i: int32 = 1
-    for __for_guard_i in 0..<count:
-        if !(i <= count):
-            break
+    while i <= count:
         var parsed: bool = false
         var nextIndex: int32 = i
         if readBoolFlagAt(i, trueName, falseName, valueName, parsed, nextIndex):
@@ -350,9 +334,7 @@ fn readIntFlag(key: str, outValue: var int32): bool =
     let count: int32 = paramCount()
     var found: bool = false
     var i: int32 = 1
-    for __for_guard_i in 0..<count:
-        if !(i <= count):
-            break
+    while i <= count:
         var parsed: int32 = 0
         var nextIndex: int32 = i
         if readIntFlagAt(i, key, parsed, nextIndex):

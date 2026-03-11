@@ -42,27 +42,27 @@ fn xor_0(a, b: int32): int32
 fn bitnot_0(a: int32): int32
 @importc("not_0")
 fn not_0(a: bool): bool
-@importc("puts")
-fn puts(s: cstring): int32
-fn c_puts(s: cstring): int32 =
-    return puts s
+importc fn puts(s: cstring): int32
+importc fn c_puts(s: cstring): int32
 fn echo(msg: cstring) =
-    c_puts(msg)
-@importc("exit")
-fn exit(code: int32)
-@importc("cheng_dump_backtrace_if_enabled")
-fn cheng_dump_backtrace_if_enabled()
+    puts(msg)
+importc fn exit(code: int32)
+importc fn cheng_dump_backtrace_if_enabled()
 fn panic(msg: str) =
-    c_puts(cstring(msg))
-    cheng_dump_backtrace_if_enabled()
+    puts(cstring(msg))
     exit(1)
 fn panicErr(err: result.ErrorInfo) =
-    c_puts(cstring(result.ErrorFormat(err)))
-    cheng_dump_backtrace_if_enabled()
+    let msg: str =
+        if len(err.msg) == 0:
+            "error"
+        else:
+            err.msg
+    puts(cstring(msg))
     exit(1)
 fn assert(cond: bool, msg: str) =
     if ! cond:
-        panic(msg)
+        puts(cstring(msg))
+        exit(1)
 @importc("cheng_malloc")
 fn malloc(size: int32): void*
 @importc("driver_c_new_string")
@@ -94,22 +94,33 @@ fn memReleaseCount(): int64
 
 # Compatibility helper for stage1/backend transitional callsites.
 # Keep symbol names stable so stage0-generated code can link.
-fn astRefIsNil(v: void*): bool =
-    return v == void*(0)
+@importc("astRefIsNil")
+fn astRefIsNil(v: void*): bool
 
-fn astRefNonNil(v: void*): bool =
-    return !astRefIsNil(v)
+@importc("astRefNonNil")
+fn astRefNonNil(v: void*): bool
 
 # Compatibility symbols for stage0-produced transitional calls.
-fn rawmemIsNil(v: void*): bool =
-    return v == void*(0)
+@importc("rawmemIsNil")
+fn rawmemIsNil(v: void*): bool
+@importc("cheng_seq_header_len_get")
+fn chengSeqHdrLenGet(seqPtr: void*): int32
+@importc("cheng_seq_header_len_set")
+fn chengSeqHdrLenSet(seqPtr: void*, value: int32)
+@importc("cheng_seq_header_cap_get")
+fn chengSeqHdrCapGet(seqPtr: void*): int32
+@importc("cheng_seq_header_cap_set")
+fn chengSeqHdrCapSet(seqPtr: void*, value: int32)
+@importc("cheng_seq_header_buffer_get")
+fn chengSeqHdrBufferGet(seqPtr: void*): void*
+@importc("cheng_seq_header_buffer_set")
+fn chengSeqHdrBufferSet(seqPtr: void*, value: void*)
 
 fn freeSeq_AstNodeId(seqInst: var int32[]) =
-    if seqInst.buffer != nil:
-        memRelease(seqInst.buffer)
-    seqInst.buffer = nil
-    seqInst.len = 0
-    seqInst.cap = 0
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(&seqInst)
+    seqHdr->buffer = nil
+    seqHdr->len = 0
+    seqHdr->cap = 0
 @importc("cheng_mm_alloc_count")
 fn memAllocCount(): int64
 @importc("cheng_mm_free_count")
@@ -124,173 +135,200 @@ fn atomicCasI32(p: int32*, expect: int32, desired: int32): int32
 fn atomicStoreI32(p: int32*, val: int32)
 @importc("cheng_atomic_load_i32")
 fn atomicLoadI32(p: int32*): int32
-fn alloc(size: int32): void* =
-    return malloc size
-fn dealloc(p: void*) =
-    free p
+@importc("cheng_malloc")
+fn alloc(size: int32): void*
+@importc("cheng_free")
+fn dealloc(p: void*)
 @importc("cheng_strlen")
 fn cheng_strlen(s: str): int32
-fn c_strlen(s: str): int32 =
-    return cheng_strlen(s)
-@importc("cheng_memcpy")
-fn cheng_memcpy(dest: void*, src: void*, n: int64): void*
-@importc("ptr_add")
-fn ptr_add(p: void*, offset: int32): void*
-@importc("cheng_ptr_size")
-fn cheng_ptr_size_runtime_bridge(): int32
-fn cheng_ptr_size(): int32 =
-    return cheng_ptr_size_runtime_bridge()
+@importc("cheng_strlen")
+fn c_strlen(s: str): int32
+importc fn cheng_memcpy(dest: void*, src: void*, n: int64): void*
+importc fn ptr_add(p: void*, offset: int32): void*
+importc fn cheng_ptr_size(): int32
 fn ptrSize(): int32 =
     return cheng_ptr_size()
 fn elemSize[T](): int32 =
-    return int32(sizeof(T))
+    return int32(sizeof T)
 
-# Stage0/source-built linker closure shim for elemSize[ptr]().
-# Some builds still lower this specialization to a direct symbol name.
-@exportc("elemSize_ptr")
+# Concrete fallback symbols for older stage0/self-link paths that still expect
+# direct elemSize_* references instead of a generic instantiation.
+fn elemSize_int32(): int32 =
+    return int32(sizeof(int32))
+
+fn elemSize_int64(): int32 =
+    return int32(sizeof(int64))
+
+fn elemSize_str(): int32 =
+    return int32(sizeof(str))
+
+fn elemSize_uint8(): int32 =
+    return int32(sizeof(uint8))
+
 fn elemSize_ptr(): int32 =
-    return int32(sizeof(ptr))
-fn cheng_ptr_to_u64(p: void*): uint64 =
-    return uint64(p)
-fn ptrToU64(p: void*): uint64 =
-    return cheng_ptr_to_u64(p)
+    return ptrSize()
+
+@importc("cheng_ptr_to_u64")
+fn cheng_ptr_to_u64(p: void*): uint64
+@importc("cheng_ptr_to_u64")
+fn ptrToU64(p: void*): uint64
 @importc("cheng_seq_get")
 fn cheng_seq_get(buffer: void*, len: int32, idx: int32, elemSize: int32): void*
 
 @importc("cheng_seq_set")
 fn cheng_seq_set(buffer: void*, len: int32, idx: int32, elemSize: int32): void*
 
-fn seqElemPtr(buffer: void*, len: int32, idx: int32, elemSize: int32): void* =
-    if idx < 0 || idx >= len:
-        panic "seq index out of bounds"
-    var offset64: int64 = int64(idx) * int64(elemSize)
-    var offset32: int32 = int32(offset64)
-    return ptr_add(buffer, offset32)
-
 fn `[]`(seqInst: T[], i: int32): T =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[T]())
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(&seqInst)
+    let seqLen: int32 = seqHdr->len
+    if i < 0 || i >= seqLen:
+        panic "seq index out of bounds"
+    var offset64: int64 = int64(i) * int64(elemSize[T]())
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(seqHdr->buffer, offset32)
     var pt: T* = T*(p)
-    return *pt
+    var out: T
+    out = *pt
+    return out
 fn `[]=`(seqInst: var T[], i: int32, val: T) =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[T]())
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(&seqInst)
+    let seqLen: int32 = seqHdr->len
+    if i < 0 || i >= seqLen:
+        panic "seq index out of bounds"
+    var offset64: int64 = int64(i) * int64(elemSize[T]())
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(seqHdr->buffer, offset32)
     var pt: T* = T*(p)
     *pt = val
 fn `[]`(seqInst: T[]*, i: int32): T =
     if seqInst == nil:
         panic "cheng: nil seq pointer"
     let seqHdr: ChengSeqHeader* = ChengSeqHeader*(seqInst)
-    var p: void* = seqElemPtr(seqHdr->buffer, seqHdr->len, i, elemSize[T]())
+    let seqLen: int32 = seqHdr->len
+    if i < 0 || i >= seqLen:
+        panic "seq index out of bounds"
+    var offset64: int64 = int64(i) * int64(elemSize[T]())
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(seqHdr->buffer, offset32)
     var pt: T* = T*(p)
-    return *pt
+    var out: T
+    out = *pt
+    return out
 fn `[]=`(seqInst: T[]*, i: int32, val: T) =
     if seqInst == nil:
         panic "cheng: nil seq pointer"
     let seqHdr: ChengSeqHeader* = ChengSeqHeader*(seqInst)
-    var p: void* = seqElemPtr(seqHdr->buffer, seqHdr->len, i, elemSize[T]())
+    let seqLen: int32 = seqHdr->len
+    if i < 0 || i >= seqLen:
+        panic "seq index out of bounds"
+    var offset64: int64 = int64(i) * int64(elemSize[T]())
+    var offset32: int32 = int32(offset64)
+    var p: void* = ptr_add(seqHdr->buffer, offset32)
     var pt: T* = T*(p)
     *pt = val
 fn `[]`(seqInst: ptr[], i: int32): ptr =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[ptr]())
-    return ptr(load_ptr(p))
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(&seqInst)
+    let seqLen: int32 = seqHdr->len
+    if i < 0 || i >= seqLen:
+        panic "seq index out of bounds"
+    var offset64: int64 = int64(i) * int64(elemSize[ptr]())
+    var offset32: int32 = int32(offset64)
+    let p: void* = ptr_add(seqHdr->buffer, offset32)
+    let pp: void** = void**(p)
+    return *pp
+
 fn `[]=`(seqInst: var ptr[], i: int32, val: ptr) =
-    var p: void* = seqElemPtr(seqInst.buffer, seqInst.len, i, elemSize[ptr]())
-    store_ptr(p, void*(val))
-@importc("store_ptr")
-fn store_ptr(p: void*, val: void*)
-@importc("load_ptr")
-fn load_ptr(p: void*): void*
+    let seqHdr: ChengSeqHeader* = ChengSeqHeader*(&seqInst)
+    let seqLen: int32 = seqHdr->len
+    if i < 0 || i >= seqLen:
+        panic "seq index out of bounds"
+    var offset64: int64 = int64(i) * int64(elemSize[ptr]())
+    var offset32: int32 = int32(offset64)
+    let p: void* = ptr_add(seqHdr->buffer, offset32)
+    let pp: void** = void**(p)
+    *pp = void*(val)
+fn store_ptr(p: void*, val: void*) =
+    if p == nil:
+        return
+    let pp: void** = void**(p)
+    *pp = val
+
+fn load_ptr(p: void*): void* =
+    if p == nil:
+        return nil
+    let pp: void** = void**(p)
+    return *pp
 @importc("cheng_memset")
 fn cheng_memset(dest: void*, val: int32, n: int64): void*
-fn dotdot(a, b: int32): int32 =
-    return 0
-fn dotdotless(a, b: int32): int32 =
-    return 0
 fn store(p: void*, val: T) =
     var pT: T* = T*(p)
     *pT = val
 fn load(p: void*): T =
     var pT: T* = T*(p)
     return *pT
-fn copyMem(dest, src: void*, size: int) =
-    0
-    cheng_memcpy(dest, src, int64(size))
-fn setMem(dest: void*, val: int32, size: int) =
-    0
-    cheng_memset(dest, val, int64(size))
+importc fn copyMem(dest, src: void*, size: int32)
+importc fn setMem(dest: void*, val: int32, size: int32)
 fn zeroMem(dest: void*, size: int) =
-    cheng_memset(dest, 0, int64(size))
+    setMem(dest, 0, int32(size))
 @importc("cheng_memcmp")
 fn cmpMem(a, b: void*, size: int64): int32
 @importc("cheng_strcmp")
 fn cheng_strcmp(a, b: cstring): int32
-fn c_strcmp(a, b: cstring): int32 =
-    return cheng_strcmp(a, b)
+@importc("cheng_strcmp")
+fn c_strcmp(a, b: cstring): int32
 @importc("cheng_bits_to_f32")
 fn bitsToF32(bits: int32): float64
 @importc("cheng_f32_to_bits")
 fn f32ToBits(value: float64): int32
 @importc("cheng_f64_to_bits")
 fn f64ToBits(value: float64): int64
-
-fn f64BitsIsNaN(bits: int64): bool =
-    let ubits: uint64 = uint64(bits)
-    let expRaw: uint64 = (ubits >> uint64(52)) & uint64(0x7ff)
-    let frac: uint64 = ubits & uint64(0x000fffffffffffff)
-    return expRaw == uint64(0x7ff) && frac != uint64(0)
-
-fn f64BitsIsZero(bits: int64): bool =
-    let mag: uint64 = uint64(bits) & uint64(0x7fffffffffffffff)
-    return mag == uint64(0)
-
-fn f64BitsOrder(bits: int64): uint64 =
-    let ubits: uint64 = uint64(bits)
-    let signMask: uint64 = uint64(1) << uint64(63)
-    if (ubits & signMask) != uint64(0):
-        return ~ubits
-    return ubits ^ signMask
+@importc("cheng_f64_bits_is_nan")
+fn f64BitsIsNaN(bits: int64): bool
+@importc("cheng_f64_bits_is_zero")
+fn f64BitsIsZero(bits: int64): bool
+@importc("cheng_f64_bits_order")
+fn f64BitsOrder(bits: int64): uint64
 
 fn int(x: T): int32 =
-    int32(x)
+    return int32(x)
 fn int8(x: T): int8 =
-    int8(x)
+    return int8(x)
 fn int16(x: T): int16 =
-    int16(x)
+    return int16(x)
 fn int32(x: T): int32 =
-    int32(x)
+    return int32(x)
 fn int64(x: T): int64 =
-    int64(x)
+    return int64(x)
 fn float64(x: T): float64 =
-    float64(x)
+    return float64(x)
 fn float(x: T): float64 =
-    float64(x)
+    return float64(x)
 fn uint8(x: T): uint8 =
-    uint8(x)
+    return uint8(x)
 fn uint16(x: T): uint16 =
-    uint16(x)
+    return uint16(x)
 fn uint32(x: T): uint32 =
-    uint32(x)
+    return uint32(x)
 fn uint64(x: T): uint64 =
-    uint64(x)
+    return uint64(x)
 fn char(x: T): char =
-    char(x)
-fn chr(x: int32): char =
-    char(x)
-fn ord(c: char): int32 =
-    int32(c)
-fn toString(x: str): str =
-    return x
-fn toString(x: bool): str =
-    if x:
-        return "true"
-    return "false"
-fn toString(x: char): str =
-    return charToStr(x)
-fn defined(x: bool): bool =
-    x
+    return char(x)
+@importc("driver_c_chr_i32")
+fn chr(x: int32): char
+@importc("driver_c_ord_char")
+fn ord(c: char): int32
+@importc("driver_c_str_clone")
+fn toString(x: str): str
+@importc("driver_c_bool_to_str")
+fn boolToString(x: bool): str
+@importc("driver_c_char_to_str")
+fn charToString(x: char): str
+@importc("driver_c_bool_identity")
+fn defined(x: bool): bool
 fn newException(t: typedesc[T], message: str): T =
     t
+    message
     var e: T
-    e.msg = message
     return e
 fn repr(x: T): str =
     x
@@ -327,17 +365,13 @@ fn cmpInt(a: int, b: int): int32 =
     else:
         return 0
 fn cmpFloat(a: float64, b: float64): int32 =
-    let aBits: int64 = f64ToBits(a)
-    let bBits: int64 = f64ToBits(b)
-    if f64BitsIsNaN(aBits) || f64BitsIsNaN(bBits):
+    if a != a || b != b:
         return 0
-    if f64BitsIsZero(aBits) && f64BitsIsZero(bBits):
+    if a == 0.0 && b == 0.0:
         return 0
-    let aOrd: uint64 = f64BitsOrder(aBits)
-    let bOrd: uint64 = f64BitsOrder(bBits)
-    if aOrd < bOrd:
+    if a < b:
         return -1
-    elif aOrd > bOrd:
+    elif a > b:
         return 1
     else:
         return 0
@@ -355,19 +389,21 @@ fn swap(a: var T, b: var T) =
 fn inc(x: var T, delta: T) =
     x = x + delta
 fn inc(x: var T) =
-    inc(x, T(1))
+    x = x + T(1)
 fn dec(x: var T, delta: T) =
     x = x - delta
 fn dec(x: var T) =
-    dec(x, T(1))
+    x = x - T(1)
 # Minimal str concat (for `+` builtin semantics; avoid extra modules).
 @importc("__cheng_str_concat")
 fn system_runtime_str_concat(a: str, b: str): str
 fn __cheng_concat_str(a: str, b: str): str =
     return system_runtime_str_concat(a, b)
 fn __cheng_set_range_mask(start: int32, stop: int32, exclusive: bool): uint64 =
-    var s: int32 = start
-    var e: int32 = stop
+    var s: int32
+    s = start
+    var e: int32
+    e = stop
     if exclusive:
         e = e - 1
     if s < 0:
@@ -376,37 +412,49 @@ fn __cheng_set_range_mask(start: int32, stop: int32, exclusive: bool): uint64 =
         return uint64(0)
     if e > 63:
         e = 63
-    var mask: uint64 = uint64(0)
-    for i in s..e:
+    var mask: uint64
+    mask = uint64(0)
+    var i: int32
+    i = s
+    while i <= e:
         mask = mask |(uint64(1) << uint64(i))
+        i = i + 1
     return mask
 fn setHas(s: set[T], value: T): bool =
     let idx64 = int64(value)
     let idx = uint64(idx64)
     let mask = uint64(1) << idx
     let bits = uint64(s)
-    return (bits & mask) != 0
+    var out: bool
+    out = (bits & mask) != 0
+    return out
 fn newString(len: int32): str =
     if len <= 0:
         return ""
-    let out: str = newStringAlloc(len)
-    if void*(out) == nil:
-        return ""
-    return out
+    return newStringAlloc(len)
 
 fn newStringAlloc(len: int32): str =
-    var out: str
     if len <= 0:
-        return out
-    out = driver_c_new_string(len)
-    return out
+        return ""
+    let total: int32 = len + 1
+    let raw: void* = alloc(total)
+    if raw == nil:
+        return ""
+    zeroMem(raw, total)
+    return str(raw)
 
 fn newStringCopy(raw: void*, count: int32): str =
     if raw == nil || count <= 0:
         return ""
-    let out: str = driver_c_new_string_copy_n(raw, count)
+    let total: int32 = count + 1
+    let rawOut: void* = alloc(total)
+    if rawOut == nil:
+        return ""
+    zeroMem(rawOut, total)
+    let out: str = str(rawOut)
     if void*(out) == nil:
         return ""
+    copyMem(void*(out), raw, count)
     return out
 fn newStringOfCap(len: int32): str =
     return newString len
@@ -416,7 +464,7 @@ fn new(x: var ref T) =
     let p: void* = alloc size
     if p != nil:
         zeroMem(p, size)
-        x = ref(T(p))
+        x = ref T(p)
 fn new(): ref T =
     var r: ref T
     new r

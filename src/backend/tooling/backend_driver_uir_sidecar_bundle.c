@@ -105,6 +105,12 @@ static char *driver_sidecar_env_pair(const char *name, const char *value) {
   return out;
 }
 
+static const char *driver_sidecar_env_or_default(const char *name, const char *fallback) {
+  const char *raw = getenv(name);
+  if (raw != NULL && raw[0] != '\0') return raw;
+  return fallback;
+}
+
 static char **driver_sidecar_build_envp(const DriverSidecarEnvOverride *overrides,
                                         size_t override_count,
                                         char ***owned_pairs_out) {
@@ -208,9 +214,9 @@ static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
       {"BACKEND_JOBS", "1"},
       {"BACKEND_FN_JOBS", "1"},
       {"BACKEND_VALIDATE", "0"},
-      {"BACKEND_OPT_LEVEL", "0"},
-      {"BACKEND_OPT", "0"},
-      {"BACKEND_OPT2", "0"},
+      {"BACKEND_OPT_LEVEL", NULL},
+      {"BACKEND_OPT", NULL},
+      {"BACKEND_OPT2", NULL},
       {"UIR_SIMD", "0"},
       {"STAGE1_SKIP_CPROFILE", "1"},
       {"STAGE1_PROFILE", "0"},
@@ -243,6 +249,9 @@ static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
   final_target = (target != NULL && target[0] != '\0')
       ? target
       : ((h->target != NULL && h->target[0] != '\0') ? h->target : "arm64-apple-darwin");
+  overrides[32].value = driver_sidecar_env_or_default("BACKEND_OPT_LEVEL", "0");
+  overrides[33].value = driver_sidecar_env_or_default("BACKEND_OPT", "0");
+  overrides[34].value = driver_sidecar_env_or_default("BACKEND_OPT2", "0");
   overrides[override_count - 3].value = final_target;
   overrides[override_count - 2].value = (h->input_path != NULL) ? h->input_path : "";
   overrides[override_count - 1].value = out_path;

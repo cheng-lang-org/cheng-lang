@@ -3,6 +3,7 @@ import std/seqs
 import std/strings
 import std/result
 import std/os
+import std/hashmaps
 import std/rawmem_support
 import backend/uir/uir_types
 import backend/machine/machine_types
@@ -11,6 +12,11 @@ type
     LabelState = ref
         nextId: int32
         prefix: str
+
+var
+    iselFuncIndexCacheModule: UirModule
+    iselFuncIndexCacheLen: int32 = -1
+    iselFuncIndexCacheMap: hashmaps.HashMapStrInt
 
 # Forward declaration for mutually recursive emitters.
 fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
@@ -214,6 +220,30 @@ fn iselGlobalNameAtSafe(module: UirModule, idx: int32): str =
     let raw: str = uirModuleGlobalNameAt(module, idx)
     return raw
 
+fn iselFuncIndexCacheEnsure(module: UirModule) =
+    if module == nil:
+        if iselFuncIndexCacheModule != nil || iselFuncIndexCacheLen != -1:
+            iselFuncIndexCacheModule = nil
+            iselFuncIndexCacheLen = -1
+            iselFuncIndexCacheMap = hashmaps.hashMapStrIntInit(1024)
+        return
+    let funcsLen: int32 = uirModuleFuncsLen(module)
+    if iselFuncIndexCacheModule == module && iselFuncIndexCacheLen == funcsLen:
+        return
+    iselFuncIndexCacheModule = module
+    iselFuncIndexCacheLen = funcsLen
+    iselFuncIndexCacheMap = hashmaps.hashMapStrIntInit(funcsLen > 0 ? (funcsLen * 2) : 16)
+    for i in 0..<funcsLen:
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if f == nil:
+            continue
+        let linkName: str = iselFuncLinkNameSafe(f)
+        if len(linkName) > 0:
+            hashmaps.hashMapStrIntPut(iselFuncIndexCacheMap, linkName, i + 1)
+        let funcName: str = iselFuncNameSafe(f)
+        if len(funcName) > 0:
+            hashmaps.hashMapStrIntPut(iselFuncIndexCacheMap, funcName, i + 1)
+
 fn iselExprCalleeSafe(expr: UirExpr): str =
     if iselExprInvalid(expr):
         return ""
@@ -369,8 +399,14 @@ fn iselRegWithType(reg: MachineReg, ty: UirLowerType): MachineReg =
     else: return reg
 
 fn iselFindFunc(module: UirModule, name: str): UirFunc =
-    if !iselStrPtrMaybeValid(name):
+    if module == nil || !iselStrPtrMaybeValid(name) || len(name) == 0:
         return nil
+    iselFuncIndexCacheEnsure(module)
+    var foundCached: bool = false
+    let rawIdx: int32 = hashmaps.hashMapStrIntGet(iselFuncIndexCacheMap, name, foundCached)
+    let idxCached: int32 = rawIdx - 1
+    if foundCached && idxCached >= 0 && idxCached < uirModuleFuncsLen(module):
+        return uirModuleFuncAt(module, idxCached)
     for i in 0..<uirModuleFuncsLen(module):
         let f: UirFunc = uirModuleFuncAt(module, i)
         let linkName: str = iselFuncLinkNameSafe(f)
@@ -784,6 +820,8 @@ fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: Ui
         let argCount: int32 = uirExprArgsLen(expr)
         let calleeName0: str = iselExprCalleeSafe(expr)
         var callee: UirFunc = nil
+        if len(calleeName0) > 0:
+            callee = iselFindFunc(module, calleeName0)
         var callName: str = calleeName0
         var calleeLinkName: str = ""
         if void*(callee) != nil:

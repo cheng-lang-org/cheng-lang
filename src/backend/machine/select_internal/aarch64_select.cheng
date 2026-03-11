@@ -3,6 +3,7 @@ import std/seqs
 import std/strings
 import std/result
 import std/os
+import std/hashmaps
 import std/rawmem_support
 import backend/uir/uir_types
 import backend/machine/machine_types
@@ -39,6 +40,9 @@ var
     iselExprDepth: int32
     iselExprDepthLimitCached: bool = false
     iselExprDepthLimitValue: int32 = 4096
+    iselFuncIndexCacheModule: UirModule
+    iselFuncIndexCacheLen: int32 = -1
+    iselFuncIndexCacheMap: hashmaps.HashMapStrInt
 
 # Forward declarations for mutually recursive emitters.
 fn iselEmitExpr(func: MachineFunc, module: UirModule, uirFunc: UirFunc, expr: UirExpr,
@@ -129,6 +133,30 @@ fn iselFnSchedNormalized(): str =
     if raw == "ws":
         return "ws"
     return "serial"
+
+fn iselFuncIndexCacheEnsure(module: UirModule) =
+    if module == nil:
+        if iselFuncIndexCacheModule != nil || iselFuncIndexCacheLen != -1:
+            iselFuncIndexCacheModule = nil
+            iselFuncIndexCacheLen = -1
+            iselFuncIndexCacheMap = hashmaps.hashMapStrIntInit(1024)
+        return
+    let funcsLen: int32 = uirModuleFuncsLen(module)
+    if iselFuncIndexCacheModule == module && iselFuncIndexCacheLen == funcsLen:
+        return
+    iselFuncIndexCacheModule = module
+    iselFuncIndexCacheLen = funcsLen
+    iselFuncIndexCacheMap = hashmaps.hashMapStrIntInit(funcsLen > 0 ? (funcsLen * 2) : 16)
+    for i in 0..<funcsLen:
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if f == nil:
+            continue
+        let linkName: str = iselFuncLinkNameSafe(f)
+        if len(linkName) > 0:
+            hashmaps.hashMapStrIntPut(iselFuncIndexCacheMap, linkName, i + 1)
+        let funcName: str = iselFuncNameSafe(f)
+        if len(funcName) > 0:
+            hashmaps.hashMapStrIntPut(iselFuncIndexCacheMap, funcName, i + 1)
 
 fn iselFuncTaskCostHint(func: UirFunc): int32 =
     if func == nil:
@@ -333,6 +361,23 @@ fn iselStableNameCopy(name: str): str =
 fn iselPersistMachineName(target: str, name: str): str =
     let _target: str = target
     return name
+
+fn iselJoinStable(a: str, b: str): str =
+    if len(a) == 0:
+        return b
+    if len(b) == 0:
+        return a
+    let aLen: int32 = len(a)
+    let bLen: int32 = len(b)
+    let totalLen: int32 = aLen + bLen
+    let buf: void* = malloc(totalLen)
+    if buf == nil:
+        return ""
+    rawmem_support.rawmemCopy(buf, rawmem_support.rawmemAsVoid(a), aLen)
+    rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(buf, aLen), rawmem_support.rawmemAsVoid(b), bLen)
+    let out: str = newStringCopy(buf, totalLen)
+    free(buf)
+    return out
 
 fn iselStrPtrMaybeValid(s: str): bool =
     let ptrVal: int64 = int64(rawmem_support.rawmemAsVoid(s))
@@ -622,8 +667,14 @@ fn iselRegWithType(reg: MachineReg, ty: UirLowerType): MachineReg =
     else: return reg
 
 fn iselFindFunc(module: UirModule, name: str): UirFunc =
-    if !iselStrPtrMaybeValid(name):
+    if module == nil || !iselStrPtrMaybeValid(name) || len(name) == 0:
         return nil
+    iselFuncIndexCacheEnsure(module)
+    var foundCached: bool = false
+    let rawIdx: int32 = hashmaps.hashMapStrIntGet(iselFuncIndexCacheMap, name, foundCached)
+    let idxCached: int32 = rawIdx - 1
+    if foundCached && idxCached >= 0 && idxCached < uirModuleFuncsLen(module):
+        return uirModuleFuncAt(module, idxCached)
     for i in 0..<uirModuleFuncsLen(module):
         let f: UirFunc = uirModuleFuncAt(module, i)
         let ln: str = iselFuncLinkNameSafe(f)
@@ -832,6 +883,21 @@ fn iselEmitAddSp(func: MachineFunc, amount: int64) =
             chunk = 4080
         iselAddInst(func, machineAddSp(chunk))
         remaining = remaining - chunk
+
+fn iselRequireReasonableCallStackAmount(uirFunc: UirFunc, expr: UirExpr,
+                                        calleeName: str, argCount: int32,
+                                        tempCount: int32, stackSize: int64,
+                                        outSize: int64, mode: str) =
+    if outSize <= int64(16 * 1024 * 1024):
+        return
+    panic("isel: unreasonable call stack amount=" + int64ToStr(outSize) +
+          " fn=" + iselFuncBestName(uirFunc) +
+          " callee=" + calleeName +
+          " argc=" + intToStr(argCount) +
+          " temp=" + intToStr(tempCount) +
+          " stack=" + int64ToStr(stackSize) +
+          " mode=" + mode +
+          " expr=" + iselExprSummary(expr))
 
 fn iselPush(func: MachineFunc, reg: MachineReg) =
     iselEmitSubSp(func, 16)
@@ -1156,7 +1222,7 @@ fn iselNewLabelState(prefix: str): LabelState =
 fn iselFreshLabel(prefix: str, state: LabelState): str =
     let id: int32 = state.nextId
     state.nextId = state.nextId + 1
-    let out: str = state.prefix + prefix + intToStr(id)
+    let out: str = iselJoinStable(iselJoinStable(state.prefix, prefix), intToStr(id))
     memRetain void*(out)
     return out
 
@@ -1214,6 +1280,8 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         let argCount: int32 = uirExprArgsLen(expr)
         let calleeName0: str = iselExprCalleeSafe(expr)
         var callee: UirFunc = nil
+        if len(calleeName0) > 0:
+            callee = iselFindFunc(module, calleeName0)
         var callName: str = calleeName0
         var calleeLinkName: str = ""
         if void*(callee) != nil:
@@ -1287,6 +1355,9 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
             var outSize: int64 = tempBase + int64(tempCount) * 8
             outSize = iselAlignUp(outSize, 16)
 
+            iselRequireReasonableCallStackAmount(uirFunc, expr, callSym, argCount,
+                                                 tempCount, stackSize, outSize,
+                                                 "darwin_varargs")
             iselEmitSubSp(func, outSize)
             for ai in 0..<argCount:
                 let argExpr: UirExpr = uirExprArgAt(expr, ai)
@@ -1375,6 +1446,9 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc, exp
         let tempBase: int64 = iselAlignUp(stackSize, 8)
         var outSize: int64 = tempBase + int64(tempCount) * 8
         outSize = iselAlignUp(outSize, 16)
+        iselRequireReasonableCallStackAmount(uirFunc, expr, callSym, argCount,
+                                             tempCount, stackSize, outSize,
+                                             hasVarargs ? "generic_varargs" : "generic")
         iselEmitSubSp(func, outSize)
         for ai in 0..<argCount:
             let argExpr: UirExpr = uirExprArgAt(expr, ai)
@@ -1743,9 +1817,10 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
                   baseReg: MachineReg, labelState: LabelState, frameSize: int64,
                   localsSize: int64,
                   isEntry: bool): Result[int32] =
+    let dbgConstIsel: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_CONST", ""), "1")
     if iselBlockInvalid(block):
         return Err[int32]("isel: nil block")
-    let blockLabel: str = labelState.prefix + uirBlockLabelOf(block)
+    let blockLabel: str = iselJoinStable(labelState.prefix, uirBlockLabelOf(block))
     if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_META", ""), "1"):
         echo("[isel.meta] block=" + blockLabel +
              " stmts=" + intToStr(uirBlockStmtsLen(block)) +
@@ -1753,6 +1828,9 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
     let dbgStep: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_STEP", ""), "1")
     memRetain void*(blockLabel)
     iselAddInst(func, machineLabel(blockLabel))
+    if dbgConstIsel:
+        os.writeLine(os.get_stderr(), "[isel.const] block.enter")
+        os.c_fflush os.get_stderr()
     if isEntry:
         # Frame layout (x29 is a stable base pointer):
         #   [x29+0]  = saved x29 (prev FP)
@@ -1800,19 +1878,38 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
                     iselAddInst(func, machineBin(MachineOp(6), MachineReg(18), MachineReg(18), MachineReg(19)))
                 iselAddInst(func, machineStr(MachineReg(18), baseReg, iselSlotOffset(uirObjLocalSlotOf(ol))))
     for si in 0..<uirBlockStmtsLen(block):
+        if dbgConstIsel:
+            if si == 0:
+                os.writeLine(os.get_stderr(), "[isel.const] stmt0.begin")
+                os.c_fflush os.get_stderr()
+            elif si == 1:
+                os.writeLine(os.get_stderr(), "[isel.const] stmt1.begin")
+                os.c_fflush os.get_stderr()
         let s: UirStmt = uirBlockStmtAt(block, si)
         if dbgStep:
             echo("[isel.step] stmt.begin si=" + intToStr(si) +
                  " kind=" + intToStr(int32(uirStmtKindOf(s))) +
-                 " slot=" + intToStr(uirStmtSlotOf(s)))
+                 " slot=" + intToStr(uirStmtSlotOf(s)) +
+                 " name=" + uirStmtNameOf(s) +
+                 " expr=" + uirFormatExpr(uirStmtExprOf(s)))
         let sRes: Result[int32] = iselEmitStmt(func, module, s, uirFunc, retType, retReg,
                                                tmpReg, scratchReg, baseReg, frameSize,
                                                labelState)
         if ! IsOk[int32](sRes):
             return sRes
+        if dbgConstIsel:
+            if si == 0:
+                os.writeLine(os.get_stderr(), "[isel.const] stmt0.end")
+                os.c_fflush os.get_stderr()
+            elif si == 1:
+                os.writeLine(os.get_stderr(), "[isel.const] stmt1.end")
+                os.c_fflush os.get_stderr()
         if dbgStep:
             echo("[isel.step] stmt.end si=" + intToStr(si))
     let term: UirTerm = uirBlockTermOf(block)
+    if dbgConstIsel:
+        os.writeLine(os.get_stderr(), "[isel.const] term.begin")
+        os.c_fflush os.get_stderr()
     if dbgStep:
         echo("[isel.step] term.begin kind=" + intToStr(int32(uirTermKindOf(term))))
     if uirTermKindOf(term) == mtRet:
@@ -1838,15 +1935,18 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
         iselAddInst(func, machineRet())
         if dbgStep:
             echo("[isel.step] term.ret.end")
+        if dbgConstIsel:
+            os.writeLine(os.get_stderr(), "[isel.const] term.ret.end")
+            os.c_fflush os.get_stderr()
         return Ok[int32](0)
     if uirTermKindOf(term) == mtBr:
-        let targetLabel: str = labelState.prefix + uirTermTargetOf(term)
+        let targetLabel: str = iselJoinStable(labelState.prefix, uirTermTargetOf(term))
         memRetain void*(targetLabel)
         iselAddInst(func, machineB(targetLabel))
         return Ok[int32](0)
     if uirTermKindOf(term) == mtCbr:
-        let tLabel: str = labelState.prefix + uirTermTargetTrueOf(term)
-        let fLabel: str = labelState.prefix + uirTermTargetFalseOf(term)
+        let tLabel: str = iselJoinStable(labelState.prefix, uirTermTargetTrueOf(term))
+        let fLabel: str = iselJoinStable(labelState.prefix, uirTermTargetFalseOf(term))
         memRetain void*(tLabel)
         memRetain void*(fLabel)
         let condExpr: UirExpr = uirTermCondExprOf(term)
@@ -1869,8 +1969,12 @@ fn iselLowerBlock(func: MachineFunc, module: UirModule, block: UirLowerBlock, ui
     return Err[int32]("isel: unsupported terminator")
 
 fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
+    let dbgConstIsel: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_CONST", ""), "1")
     let rawFuncName: str = iselFuncBestName(func)
     let funcName: str = iselStableNameCopy(rawFuncName)
+    if dbgConstIsel:
+        os.writeLine(os.get_stderr(), "[isel.const] func.enter")
+        os.c_fflush os.get_stderr()
     iselDebugDumpFuncUir(func)
     if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_META", ""), "1"):
         let rawLinkName: str = iselFuncLinkNameSafe(func)
@@ -1897,7 +2001,7 @@ fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
     var labelPrefix: str = machineName
     if len(labelPrefix) == 0:
         labelPrefix = funcName
-    let labelState: LabelState = iselNewLabelState(labelPrefix + "__")
+    let labelState: LabelState = iselNewLabelState(iselJoinStable(labelPrefix, "__"))
     let baseReg: MachineReg = MachineReg(21)
     let localCount: int32 = uirFuncLocalTypesLen(func)
     let localsSize: int64 = int64(localCount) * 8
@@ -1907,6 +2011,13 @@ fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
     if rem != 0:
         frameSize = frameSize + (16 - rem)
     for i in 0..<uirFuncBlocksLen(func):
+        if dbgConstIsel:
+            if i == 0:
+                os.writeLine(os.get_stderr(), "[isel.const] block0.begin")
+                os.c_fflush os.get_stderr()
+            elif i == 1:
+                os.writeLine(os.get_stderr(), "[isel.const] block1.begin")
+                os.c_fflush os.get_stderr()
         let b: UirLowerBlock = uirFuncBlockAt(func, i)
         let isEntry: bool = i == 0
         let bRes: Result[int32] = iselLowerBlock(out, module, b, func, retType, retReg,
@@ -1919,6 +2030,13 @@ fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
                 return Err[MachineFunc]("isel: lower block failed fn=" + funcName +
                                         " block=" + intToStr(i))
             return iselErrInfoMachineFunc(err)
+        if dbgConstIsel:
+            if i == 0:
+                os.writeLine(os.get_stderr(), "[isel.const] block0.end")
+                os.c_fflush os.get_stderr()
+            elif i == 1:
+                os.writeLine(os.get_stderr(), "[isel.const] block1.end")
+                os.c_fflush os.get_stderr()
     if strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_META", ""), "1"):
         echo("[isel.meta] out.final name=" + machineFuncNameOf(out) +
              " insts=" + intToStr(machineFuncInstsLen(out)))
@@ -1926,6 +2044,9 @@ fn aarch64LowerFunc(module: UirModule, func: UirFunc): Result[MachineFunc] =
         let outNameDbg: str = machineName
         echo("[isel.step] func.return.ok name=" + ((len(outNameDbg) > 0) ? outNameDbg : ""))
     memRetain(void*(out))
+    if dbgConstIsel:
+        os.writeLine(os.get_stderr(), "[isel.const] func.done")
+        os.c_fflush os.get_stderr()
     return iselOkMachineFunc(out)
 
 fn aarch64LowerModule(module: UirModule): Result[MachineModule] =

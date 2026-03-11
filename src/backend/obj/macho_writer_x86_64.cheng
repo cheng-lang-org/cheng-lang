@@ -4,6 +4,7 @@ import std/strings
 import std/hashmaps
 import std/result
 import std/os
+import std/system
 import backend/machine/machine_types
 import backend/obj/obj_buf
 
@@ -269,21 +270,21 @@ fn mx64_sortStringsStable(items: var str[]) =
 fn mx64_seqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
     if idx < 0 || idx >= items.len || items.buffer == nil:
         return nil
-    let elemBytes: int32 = idx * int32(sizeof MachineFunc)
+    let elemBytes: int32 = idx * ptrSize()
     let readPtr: MachineFunc* = MachineFunc*(ptr_add(items.buffer, elemBytes))
     return *readPtr
 
 fn mx64_seqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
     if idx < 0 || idx >= items.len || items.buffer == nil:
         return nil
-    let elemBytes: int32 = idx * int32(sizeof MachineGlobal)
+    let elemBytes: int32 = idx * ptrSize()
     let readPtr: MachineGlobal* = MachineGlobal*(ptr_add(items.buffer, elemBytes))
     return *readPtr
 
 fn mx64_seqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
     if idx < 0 || idx >= items.len || items.buffer == nil:
         return nil
-    let elemBytes: int32 = idx * int32(sizeof MachineInst)
+    let elemBytes: int32 = idx * ptrSize()
     let readPtr: MachineInst* = MachineInst*(ptr_add(items.buffer, elemBytes))
     return *readPtr
 
@@ -1077,8 +1078,13 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     for ci in 0..<machineModuleCstrsLen(module):
         let c2: MachineCString = mx64_moduleCStringAtRaw(module, ci)
         if hasCstr && machineCStringValid(c2) && len(machineCStringLabelOf(c2)) > 0:
+            let symName: str = machineCStringLabelOf(c2)
+            var hasCstrSym: bool = false
+            hashmaps.hashMapStrIntGetEx(symIndexMap, symName, hasCstrSym)
+            if hasCstrSym:
+                continue
             let v: uint64 = cstrAddr + cSymOffs[ci]
-            syms = mx64_addSymIndexed(syms, symIndexMap, machineCStringLabelOf(c2), MX64_N_SECT, cstrSectIndex, v)
+            syms = mx64_addSymIndexed(syms, symIndexMap, symName, MX64_N_SECT, cstrSectIndex, v)
     for si in 0..<synthCstrNames.len:
         var hasSynth: bool = false
         hashmaps.hashMapStrIntGetEx(symIndexMap, synthCstrNames[si], hasSynth)
@@ -1109,7 +1115,12 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # extdefs: data/bss globals
     for gi in 0..<machineModuleGlobalsLen(module):
         let g3: MachineGlobal = mx64_moduleGlobalAtRaw(module, gi)
-        let gSym: str = symPrefix + machineGlobalNameOf(g3)
+        let gNameRaw: str = machineGlobalNameOf(g3)
+        if len(gNameRaw) == 0:
+            continue
+        let gSym: str = symPrefix + gNameRaw
+        if len(gSym) == 0:
+            continue
         if machineGlobalHasInit(g3):
             if hasData:
                 let v3: uint64 = dataAddr + dataSymOffs[gi]

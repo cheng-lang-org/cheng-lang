@@ -2,7 +2,7 @@ import std/os
 import std/strutils as strutil
 import std/strings
 import std/monotimes
-import tooling/cheng_tooling_embedded_stable as tooling_embedded_inline
+import tooling/cheng_tooling_embedded_inline
 
 type
     ToolingSelfhostResult = ref
@@ -30,6 +30,27 @@ type
         stage1SanityMs: int64
         stage1CompileAttempts: int32
         stage1CompileSegfaults: int32
+
+    ToolingSelfhostInnerLoopResult = ref
+        ok: bool
+        message: str
+        totalMs: int64
+        outDir: str
+        summaryPath: str
+        timingPath: str
+        buildDriverPath: str
+        buildMs: int64
+        buildRc: int32
+        inmemRequested: bool
+        inmemMs: int64
+        inmemRes: ToolingSelfhostResult
+        strictRequested: bool
+        strictMs: int64
+        strictRes: ToolingSelfhostResult
+        closureRequested: bool
+        closureMs: int64
+        closureRc: int32
+        failedStep: str
 
 var
     tooling_buildDriverLastStampHit: bool = false
@@ -650,9 +671,27 @@ fn tooling_kvGet(raw: str, key: str): str =
             return strings.dropPrefix(line, prefix)
     return ""
 
+fn tooling_stage0CapabilityAdd(out: str[]*, relPath: str) =
+    if out == nil || !tooling_strNonEmpty(relPath):
+        return
+    add(*out, relPath)
+
+fn tooling_stage0CapabilityAppendUirBuilderSources(out: str[]*) =
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_types.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_scope_helpers.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_import_resolver.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_policy_contract.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_symbol_state.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_dup_scan.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_overload_scan.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_top_level_passes.cheng")
+    tooling_stage0CapabilityAdd(out, "src/backend/uir/uir_internal/uir_core_builder_ffi_out_ptr.cheng")
+
 fn tooling_stage0CapabilitySourceList(): str[] =
     var out: str[] = []
     add(out, "src/std/cmdline.cheng")
+    add(out, "src/std/rawmem_support.cheng")
     add(out, "src/stage1/ast.cheng")
     add(out, "src/stage1/token.cheng")
     add(out, "src/stage1/lexer.cheng")
@@ -665,8 +704,7 @@ fn tooling_stage0CapabilitySourceList(): str[] =
     add(out, "src/stage1/type_syntax_lowering.cheng")
     add(out, "src/stage1/c_profile_lowering.cheng")
     add(out, "src/backend/uir/uir_internal/uir_core_types.cheng")
-    add(out, "src/backend/uir/uir_internal/uir_core_builder.cheng")
-    add(out, "src/backend/uir/uir_internal/uir_core_builder_ffi_out_ptr.cheng")
+    tooling_stage0CapabilityAppendUirBuilderSources(&out)
     add(out, "src/backend/uir/uir_codegen.cheng")
     add(out, "src/backend/machine/machine_internal/machine_core_types.cheng")
     add(out, "src/backend/obj/macho_writer.cheng")
@@ -681,6 +719,46 @@ fn tooling_stage0CapabilitySourceList(): str[] =
     add(out, "src/backend/obj/coff_linker.cheng")
     return out
 
+fn tooling_embeddedToolingSourceList(root: str): str[] =
+    var out: str[] = []
+    add(out, os.joinPath(root, "src/tooling/cheng_tooling_embedded_inline.cheng"))
+    add(out, os.joinPath(root, "src/tooling/cheng_tooling_embedded_part1.cheng"))
+    add(out, os.joinPath(root, "src/tooling/cheng_tooling_embedded_part2.cheng"))
+    add(out, os.joinPath(root, "src/tooling/cheng_tooling_embedded_part3.cheng"))
+    add(out, os.joinPath(root, "src/tooling/cheng_tooling_embedded_part4.cheng"))
+    add(out, os.joinPath(root, "src/tooling/cheng_tooling_embedded_part5.cheng"))
+    add(out, os.joinPath(root, "src/tooling/cheng_tooling_embedded_part6.cheng"))
+    return out
+
+fn tooling_anyFileNewerThan(root: str, files: str[], outPath: str): bool =
+    for i in 0..<files.len:
+        if tooling_fileIsNewer(root, files[i], outPath):
+            return true
+    return false
+
+fn tooling_stage0CapabilityBuilderSourcesConsistent(root: str, files: str[]): bool =
+    let scanRes: os.ExecCmdResult = tooling_exec(
+        root,
+        "if ! command -v rg >/dev/null 2>&1; then exit 0; fi; " +
+        "rg --files src/backend/uir/uir_internal 2>/dev/null | " +
+        "rg '(^|/)uir_core_builder[^/]*\\.cheng$' || true")
+    if os.execCmdResultExitCode(scanRes) != 0:
+        return true
+    let expected: str[] = tooling_splitLines(os.execCmdResultOutput(scanRes))
+    for i in 0..<expected.len:
+        let rel: str = strutil.strip(expected[i])
+        if !tooling_strNonEmpty(rel):
+            continue
+        var listed: bool = false
+        for j in 0..<files.len:
+            if tooling_strEq(files[j], rel):
+                listed = true
+                break
+        if !listed:
+            tooling_printErr("cheng_tooling: stage0 capability builder source missing from source list: " + rel)
+            return false
+    return true
+
 fn tooling_stage0CapabilityFilePath(stage0Path: str): str =
     if !tooling_strNonEmpty(stage0Path):
         return ""
@@ -692,6 +770,8 @@ fn tooling_stage0CapabilityEnsureCache(root: str): bool =
         return true
     let files: str[] = tooling_stage0CapabilitySourceList()
     if files.len <= 0:
+        return false
+    if !tooling_stage0CapabilityBuilderSourcesConsistent(root, files):
         return false
     var manifest: str = ""
     for i in 0..<files.len:
@@ -2195,31 +2275,9 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
             "global_bin=\"${TOOLING_GLOBAL_BIN:-$root/artifacts/tooling_cmd/cheng_tooling}\"")
         return patchedCmdline
     if tooling_strEq(id, "verify_backend_ffi_outptr_tuple"):
-        let rawFfiOutptrTuple: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
-        if !tooling_strNonEmpty(rawFfiOutptrTuple):
-            return ""
-        var patchedFfiOutptrTuple: str = rawFfiOutptrTuple
-        patchedFfiOutptrTuple = strutil.replace(
-            patchedFfiOutptrTuple,
-            "obj_path=\"$out_dir/ffi_outptr_tuple_importc_status_i32.$safe_target.o\"",
-            "obj_path=\"$out_dir/ffi_outptr_tuple_importc_status_i32.$safe_target.bin\"")
-        patchedFfiOutptrTuple = strutil.replace(
-            patchedFfiOutptrTuple,
-            "    obj_path=\"$out_dir/ffi_outptr_tuple_importc_status_i32.$safe_target.obj\"",
-            "    obj_path=\"$out_dir/ffi_outptr_tuple_importc_status_i32.$safe_target.bin\"")
-        patchedFfiOutptrTuple = strutil.replace(
-            patchedFfiOutptrTuple,
-            "  BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \\\n  BACKEND_EMIT=obj \\\n  BACKEND_MULTI=0 \\\n  BACKEND_MULTI_FORCE=0 \\\n",
-            "  BACKEND_LINKER=self \\\n  BACKEND_DIRECT_EXE=1 \\\n  BACKEND_LINKERLESS_INMEM=1 \\\n  BACKEND_NO_RUNTIME_C=0 \\\n  BACKEND_EMIT=exe \\\n  BACKEND_MULTI=0 \\\n  BACKEND_MULTI_FORCE=0 \\\n")
-        patchedFfiOutptrTuple = strutil.replace(
-            patchedFfiOutptrTuple,
-            "  fail \"status fixture obj-only build failed (status=$build_obj_status)\"",
-            "  fail \"status fixture exe build failed (status=$build_obj_status)\"")
-        patchedFfiOutptrTuple = strutil.replace(
-            patchedFfiOutptrTuple,
-            "if [ ! -f \"$obj_path\" ]; then\n  fail \"missing obj output: $obj_path\"\nfi\n",
-            "if [ ! -s \"$obj_path\" ]; then\n  fail \"missing executable output: $obj_path\"\nfi\n")
-        return patchedFfiOutptrTuple
+        return tooling_embedded_inline.toolingEmbeddedScriptBody(id)
+    if tooling_strEq(id, "verify_backend_selfhost_bootstrap_self_obj"):
+        return tooling_embedded_inline.toolingEmbeddedScriptBody(id)
     if tooling_strEq(id, "verify_backend_selfhost_strict_noreuse_probe"):
         let rawStrictNoreuse: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
         if !tooling_strNonEmpty(rawStrictNoreuse):
@@ -2458,16 +2516,10 @@ fn tooling_embeddedScriptText(root: str, id: str): str =
             "if [ \"$rc\" -ne 0 ] || [ ! -s \"$smoke_out\" ]; then\n      IFS=\"$old_ifs\"\n      return 1\n    fi\n",
             "if [ \"$rc\" -ne 0 ] || [ ! -s \"$smoke_out\" ]; then\n      if [ -f \"$smoke_log\" ]; then\n        tail -n 120 \"$smoke_log\" >&2 || true\n      fi\n      IFS=\"$old_ifs\"\n      return 1\n    fi\n")
         return patchedSmoke
+    if tooling_strEq(id, "verify"):
+        return tooling_embedded_inline.toolingEmbeddedScriptBody(id)
     if tooling_strEq(id, "backend_prod_closure"):
-        let rawProd: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
-        if !tooling_strNonEmpty(rawProd):
-            return ""
-        var patchedProd: str = rawProd
-        patchedProd = strutil.replace(
-            patchedProd,
-            "export TOOLING_EXEC_GLOBAL_BIN=\"${TOOLING_EXEC_GLOBAL_BIN:-${BACKEND_TOOLING_BUNDLE_GLOBAL_BIN:-artifacts/tooling_cmd/cheng_tooling_global}}\"",
-            "export TOOLING_EXEC_GLOBAL_BIN=\"${TOOLING_EXEC_GLOBAL_BIN:-${BACKEND_TOOLING_BUNDLE_GLOBAL_BIN:-artifacts/tooling_cmd/cheng_tooling}}\"")
-        return patchedProd
+        return tooling_embedded_inline.toolingEmbeddedScriptBody(id)
     let raw: str = tooling_embedded_inline.toolingEmbeddedScriptBody(id)
     if !tooling_strNonEmpty(raw):
         return ""
@@ -4316,8 +4368,29 @@ fn tooling_stage0UeCommandRelevant(root: str, qdir: str, cmdRaw: str): bool =
     # Cross-workspace guard is always on for production closure.
     if strutil.contains(cmd, "/stage0_quarantine/cheng."):
         return true
+    let canonicalDriver: str = os.joinPath(root, "artifacts/backend_driver/cheng")
+    if tooling_strNonEmpty(canonicalDriver) && strutil.contains(cmd, canonicalDriver):
+        return true
     if strutil.contains(cmd, "/artifacts/backend_driver/cheng") ||
        strutil.contains(cmd, "artifacts/backend_driver/cheng"):
+        return true
+    let distDriver: str = os.joinPath(root, "dist/releases/current/cheng")
+    if tooling_strNonEmpty(distDriver) && strutil.contains(cmd, distDriver):
+        return true
+    if strutil.contains(cmd, "/dist/releases/current/cheng") ||
+       strutil.contains(cmd, "dist/releases/current/cheng"):
+        return true
+    let selfhostStage2: str = os.joinPath(root, "artifacts/backend_selfhost_self_obj/cheng.stage2")
+    if tooling_strNonEmpty(selfhostStage2) && strutil.contains(cmd, selfhostStage2):
+        return true
+    let selfhostStage1: str = os.joinPath(root, "artifacts/backend_selfhost_self_obj/cheng.stage1")
+    if tooling_strNonEmpty(selfhostStage1) && strutil.contains(cmd, selfhostStage1):
+        return true
+    if strutil.contains(cmd, "/artifacts/backend_selfhost_self_obj/cheng.stage2") ||
+       strutil.contains(cmd, "artifacts/backend_selfhost_self_obj/cheng.stage2"):
+        return true
+    if strutil.contains(cmd, "/artifacts/backend_selfhost_self_obj/cheng.stage1") ||
+       strutil.contains(cmd, "artifacts/backend_selfhost_self_obj/cheng.stage1"):
         return true
     let includeDistUe: bool = tooling_isTrue(
         os.getEnvDefault("TOOLING_STAGE0_DIST_UE_GUARD", "0"))
@@ -4935,23 +5008,46 @@ fn tooling_stage0PurposeTag(raw: str): str =
         return text
     return "run"
 
+fn tooling_stage0MirrorExecPath(root: str, stage0PathRaw: str, purposeRaw: str): str =
+    let stage0Path: str = tooling_pathAbsolute(root, stage0PathRaw)
+    if !tooling_strNonEmpty(stage0Path):
+        return ""
+    let qdir: str = tooling_stage0QuarantineDir(root)
+    if !tooling_mkdirP(root, qdir):
+        return ""
+    let purpose: str = tooling_stage0PurposeTag(purposeRaw)
+    let digestFull: str = tooling_sha256Text(root, stage0Path)
+    var digestShort: str = digestFull
+    if len(digestShort) > 12:
+        digestShort = strings.sliceBytes(digestShort, 0, 12)
+    if !tooling_strNonEmpty(digestShort):
+        digestShort = "stage0"
+    return os.joinPath(qdir, "cheng." + purpose + "." + digestShort)
+
 fn tooling_prepareStage0Exec(root: str, stage0Path: str, purposeRaw: str): str =
     if !tooling_isExecutable(root, stage0Path):
         return ""
     if !tooling_stage0QuarantineEnabled():
         return stage0Path
+    let purpose: str = tooling_stage0PurposeTag(purposeRaw)
+    if !tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_MIRROR_EXEC", "1")):
+        tooling_printErr("cheng_tooling: ignore TOOLING_STAGE0_MIRROR_EXEC=0 because stage0 exec is always mirrored")
+    let mirrorPath: str = tooling_stage0MirrorExecPath(root, stage0Path, purpose)
+    if !tooling_strNonEmpty(mirrorPath):
+        return ""
+    if !tooling_copyExecutablePreserveBytes(root, stage0Path, mirrorPath):
+        tooling_printErr("cheng_tooling: failed to mirror stage0 exec: " + mirrorPath)
+        return ""
     if tooling_stage0BlockOnQuarantineUe(root, "TOOLING_STAGE0_QUARANTINE_BLOCK_ON_UE", "stage0 run"):
         return ""
-    let _purposeUnused: str = tooling_stage0PurposeTag(purposeRaw)
-    if tooling_isTrue(os.getEnvDefault("TOOLING_STAGE0_QUARANTINE_COPY", "0")):
-        tooling_printErr("cheng_tooling: ignore removed env TOOLING_STAGE0_QUARANTINE_COPY (canonical stage0 only)")
-    # Hard closure: always execute canonical stage0 path directly.
-    return stage0Path
+    return mirrorPath
 
 fn tooling_cleanupStage0Exec(stage0Original: str, stage0Exec: str) =
     if !tooling_strNonEmpty(stage0Exec):
         return
     if tooling_strEq(stage0Exec, stage0Original):
+        return
+    if strutil.contains(stage0Exec, "/chengcache/stage0_quarantine/cheng."):
         return
     if os.fileExists(stage0Exec):
         os.removeFile(stage0Exec)
@@ -5629,21 +5725,29 @@ fn tooling_runtimeObjHasRequiredSymbols(root: str, objPath: str): bool =
     let nmText: str = os.execCmdResultOutput(nmRes)
     if !tooling_strNonEmpty(nmText):
         return false
-    # Host-only build-global only needs a minimal runtime/export closure check.
-    # Full undefined-symbol policing here is too expensive and is validated later
-    # by the rebuilt tooling/backend gates.
-    if !tooling_strContains(nmText, "cheng_strlen"):
-        return false
-    if !tooling_strContains(nmText, "cheng_malloc"):
-        return false
-    if !tooling_strContains(nmText, "cheng_realloc"):
-        return false
-    if !tooling_strContains(nmText, "driver_c_build_active_exe_default"):
-        return false
-    if !tooling_strContains(nmText, "driver_c_build_emit_obj_default"):
-        return false
-    if !tooling_strContains(nmText, "__cheng_rt_paramStrCopy"):
-        return false
+    let rows: str[] = tooling_splitLines(nmText)
+    let requiredSymbols: str[] = [
+        "cheng_strlen",
+        "cheng_memcpy",
+        "cheng_memset",
+        "cheng_malloc",
+        "cheng_free",
+        "cheng_realloc",
+        "cheng_mem_retain",
+        "cheng_mem_release",
+        "cheng_seq_get",
+        "cheng_seq_set",
+        "cheng_strcmp",
+        "cheng_f32_bits_to_i64",
+        "cheng_f64_bits_to_i64",
+        "cheng_open_w_trunc",
+        "driver_c_build_active_exe_default",
+        "driver_c_build_emit_obj_default",
+        "__cheng_rt_paramStrCopy"
+    ]
+    for i in 0..<requiredSymbols.len:
+        if !tooling_nmRowsHasDefinedSymbol(rows, requiredSymbols[i]):
+            return false
     return true
 
 fn tooling_runtimeObjNeedsRefresh(root: str, objPath: str): bool =
@@ -6093,9 +6197,15 @@ fn tooling_driverCompileSmokeReleaseSystemOk(root: str, binPath: str): bool =
     smokeCmd = smokeCmd + tooling_shellQuote(stage0Exec)
     smokeCmd = tooling_prefixUnsetLegacyFrontendEnv(smokeCmd)
     smokeCmd = tooling_wrapStage0LockTimeout(root, timeoutSec, smokeCmd, "stage0_compile_smoke_release")
-    let smokeRes: os.ExecCmdResult = tooling_exec(root, smokeCmd)
-    let smokeRc: int32 = os.execCmdResultExitCode(smokeRes)
-    let smokeOutText: str = strutil.strip(os.execCmdResultOutput(smokeRes))
+    var smokeRes: os.ExecCmdResult = tooling_exec(root, smokeCmd)
+    var smokeRc: int32 = os.execCmdResultExitCode(smokeRes)
+    var smokeOutText: str = strutil.strip(os.execCmdResultOutput(smokeRes))
+    if smokeRc != 0:
+        if os.fileExists(smokeOut):
+            os.removeFile(smokeOut)
+        smokeRes = tooling_exec(root, smokeCmd)
+        smokeRc = os.execCmdResultExitCode(smokeRes)
+        smokeOutText = strutil.strip(os.execCmdResultOutput(smokeRes))
     if smokeRc != 0:
         tooling_printErr("cheng_tooling: stage0 release-system smoke compile failed rc=" + intToStr(smokeRc) +
                          " kind=" + tooling_exitKind(smokeRc))
@@ -6124,8 +6234,11 @@ fn tooling_driverCompileSmokeReleaseSystemOk(root: str, binPath: str): bool =
         runTimeoutSec = 15
     var runCmd: str = tooling_shellQuote(smokeOut) + " >/dev/null 2>&1"
     runCmd = tooling_wrapCommandWithTimeout(root, runTimeoutSec, runCmd)
-    let runRes: os.ExecCmdResult = tooling_exec(root, runCmd)
-    let runRc: int32 = os.execCmdResultExitCode(runRes)
+    var runRes: os.ExecCmdResult = tooling_exec(root, runCmd)
+    var runRc: int32 = os.execCmdResultExitCode(runRes)
+    if runRc != 0:
+        runRes = tooling_exec(root, runCmd)
+        runRc = os.execCmdResultExitCode(runRes)
     if runRc != 0:
         tooling_printErr("cheng_tooling: stage0 release-system smoke run failed rc=" + intToStr(runRc) +
                          " kind=" + tooling_exitKind(runRc))
@@ -7518,7 +7631,7 @@ fn tooling_selfhostBootstrapFastHost(root: str, compileStage1: bool, outDirRaw: 
         "stage1\t" + stage1Status + "\t" + tooling_msToSecondsText(stage1Ms) + "\n" +
         "stage2\talias\t" + tooling_msToSecondsText(stage2Ms) + "\n" +
         "total\tok\t" + tooling_msToSecondsText(totalMs) + "\n"
-    os.writeFile(timingOut, timingText)
+    let _timingWriteOk: bool = tooling_writeTextFileViaShell(root, timingOut, timingText)
     result.lockWaitMs = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_LOCK_WAIT_MS", ""), 0)
     return result
 
@@ -7541,7 +7654,320 @@ fn tooling_selfhostWriteTiming(root: str, outDirRaw: str, timingOutRaw: str, sta
         "stage3\t" + stage3Status + "\t" + tooling_msToSecondsText(stage3Ms) + "\n" +
         "hash_check\t" + hashStatus + "\t" + tooling_msToSecondsText(hashMs) + "\n" +
         "total\t" + totalStatus + "\t" + tooling_msToSecondsText(totalMs) + "\n"
-    os.writeFile(timingOut, timingText)
+    let _timingWriteOk: bool = tooling_writeTextFileViaShell(root, timingOut, timingText)
+
+fn tooling_summaryOneLine(raw: str): str =
+    if !tooling_strNonEmpty(raw):
+        return ""
+    var out: str = raw
+    out = strutil.replace(out, "\r", " ")
+    out = strutil.replace(out, "\n", " ")
+    out = strutil.replace(out, "\t", " ")
+    return out
+
+fn tooling_selfhostInnerLoopWriteTiming(root: str, outDirRaw: str, timingOutRaw: str,
+                                        buildStatus: str, buildMs: int64,
+                                        inmemStatus: str, inmemMs: int64,
+                                        strictStatus: str, strictMs: int64,
+                                        closureStatus: str, closureMs: int64,
+                                        totalStatus: str, totalMs: int64) =
+    var outDir: str = outDirRaw
+    if !tooling_strNonEmpty(outDir):
+        outDir = "artifacts/backend_selfhost_inner_loop"
+    outDir = tooling_pathAbsolute(root, outDir)
+    var timingOut: str = timingOutRaw
+    if !tooling_strNonEmpty(timingOut):
+        timingOut = os.joinPath(outDir, "selfhost_inner_loop_timing.tsv")
+    timingOut = tooling_pathAbsolute(root, timingOut)
+    let timingDir: str = os.parentDir(timingOut)
+    tooling_tryMkdirP(root, timingDir)
+    let timingText: str =
+        "build_driver\t" + buildStatus + "\t" + tooling_msToSecondsText(buildMs) + "\n" +
+        "inmem_witness\t" + inmemStatus + "\t" + tooling_msToSecondsText(inmemMs) + "\n" +
+        "strict_host\t" + strictStatus + "\t" + tooling_msToSecondsText(strictMs) + "\n" +
+        "closure\t" + closureStatus + "\t" + tooling_msToSecondsText(closureMs) + "\n" +
+        "total\t" + totalStatus + "\t" + tooling_msToSecondsText(totalMs) + "\n"
+    let _timingWriteOk: bool = tooling_writeTextFileViaShell(root, timingOut, timingText)
+
+fn tooling_selfhostInnerLoopWriteSummary(root: str, res: ToolingSelfhostInnerLoopResult): str =
+    var outDir: str = res.outDir
+    if !tooling_strNonEmpty(outDir):
+        outDir = "artifacts/backend_selfhost_inner_loop"
+    outDir = tooling_pathAbsolute(root, outDir)
+    var summaryPath: str = res.summaryPath
+    if !tooling_strNonEmpty(summaryPath):
+        summaryPath = os.joinPath(outDir, "selfhost_inner_loop.summary.env")
+    summaryPath = tooling_pathAbsolute(root, summaryPath)
+    let summaryDir: str = os.parentDir(summaryPath)
+    tooling_tryMkdirP(root, summaryDir)
+    let inmemRes: ToolingSelfhostResult = res.inmemRes
+    let strictRes: ToolingSelfhostResult = res.strictRes
+    let buildOk: bool = res.buildRc == 0
+    var inmemOk: bool = false
+    if res.inmemRequested && inmemRes != nil:
+        inmemOk = inmemRes.ok
+    var strictOk: bool = false
+    if res.strictRequested && strictRes != nil:
+        strictOk = strictRes.ok
+    let closureOk: bool = res.closureRequested && res.closureRc == 0
+    let buildStatus: str = buildOk ? "ok" : "fail"
+    let inmemStatus: str = !res.inmemRequested ? "skip" : (inmemOk ? "ok" : "fail")
+    let strictStatus: str = !res.strictRequested ? "skip" : (strictOk ? "ok" : "fail")
+    let closureStatus: str = !res.closureRequested ? "skip" : (closureOk ? "ok" : "fail")
+    var out: str = ""
+    out = out + "selfhost_inner_loop_version=1\n"
+    out = out + "ok=" + tooling_boolText(res.ok) + "\n"
+    out = out + "failed_step=" + tooling_summaryOneLine(res.failedStep) + "\n"
+    out = out + "message=" + tooling_summaryOneLine(res.message) + "\n"
+    out = out + "out_dir=" + outDir + "\n"
+    out = out + "timing_path=" + tooling_summaryOneLine(res.timingPath) + "\n"
+    out = out + "summary_path=" + summaryPath + "\n"
+    out = out + "build_driver_path=" + tooling_summaryOneLine(res.buildDriverPath) + "\n"
+    out = out + "build_driver_status=" + buildStatus + "\n"
+    out = out + "build_driver_rc=" + intToStr(res.buildRc) + "\n"
+    out = out + "build_driver_ms=" + intToStr(int32(res.buildMs)) + "\n"
+    out = out + "inmem_requested=" + tooling_boolText(res.inmemRequested) + "\n"
+    out = out + "inmem_status=" + inmemStatus + "\n"
+    out = out + "inmem_ms=" + intToStr(int32(res.inmemMs)) + "\n"
+    if inmemRes != nil:
+        out = out + "inmem_message=" + tooling_summaryOneLine(inmemRes.message) + "\n"
+        out = out + "inmem_stage0=" + tooling_summaryOneLine(inmemRes.stage0Path) + "\n"
+        out = out + "inmem_stage0_driver_kind=" + tooling_summaryOneLine(inmemRes.stage0DriverKind) + "\n"
+        out = out + "inmem_stage1=" + tooling_summaryOneLine(inmemRes.stage1Path) + "\n"
+        out = out + "inmem_stage1_status=" + tooling_summaryOneLine(inmemRes.stage1Status) + "\n"
+    out = out + "strict_requested=" + tooling_boolText(res.strictRequested) + "\n"
+    out = out + "strict_status=" + strictStatus + "\n"
+    out = out + "strict_ms=" + intToStr(int32(res.strictMs)) + "\n"
+    if strictRes != nil:
+        out = out + "strict_message=" + tooling_summaryOneLine(strictRes.message) + "\n"
+        out = out + "strict_stage0=" + tooling_summaryOneLine(strictRes.stage0Path) + "\n"
+        out = out + "strict_stage0_driver_kind=" + tooling_summaryOneLine(strictRes.stage0DriverKind) + "\n"
+        out = out + "strict_stage1=" + tooling_summaryOneLine(strictRes.stage1Path) + "\n"
+        out = out + "strict_stage2=" + tooling_summaryOneLine(strictRes.stage2Path) + "\n"
+        out = out + "strict_stage3=" + tooling_summaryOneLine(strictRes.stage3Path) + "\n"
+        out = out + "strict_stage1_status=" + tooling_summaryOneLine(strictRes.stage1Status) + "\n"
+        out = out + "strict_stage1_compile_mode=" + tooling_summaryOneLine(strictRes.stage1CompileMode) + "\n"
+        out = out + "strict_rebuild_ok=" + tooling_boolText(strictRes.strictRebuildOk) + "\n"
+        out = out + "strict_fixed_point_ok=" + tooling_boolText(strictRes.fixedPointOk) + "\n"
+        out = out + "strict_stage2_sha256=" + tooling_summaryOneLine(strictRes.stage2Sha256) + "\n"
+        out = out + "strict_stage3_sha256=" + tooling_summaryOneLine(strictRes.stage3Sha256) + "\n"
+        out = out + "strict_mismatch_report=" + tooling_summaryOneLine(strictRes.strictMismatchReport) + "\n"
+    out = out + "closure_requested=" + tooling_boolText(res.closureRequested) + "\n"
+    out = out + "closure_status=" + closureStatus + "\n"
+    out = out + "closure_rc=" + intToStr(res.closureRc) + "\n"
+    out = out + "closure_ms=" + intToStr(int32(res.closureMs)) + "\n"
+    out = out + "total_ms=" + intToStr(int32(res.totalMs)) + "\n"
+    let _summaryWriteOk: bool = tooling_writeTextFileViaShell(root, summaryPath, out)
+    return summaryPath
+
+fn tooling_compileBackendDriverStrictInmemWitness(root: str, stage0: str, target: str, outPath: str,
+                                                  timeoutSec: int32,
+                                                  allowBootstrapCapabilityRefresh: bool): int32 =
+    let stage0IdentityPath: str = tooling_pathAbsolute(root, stage0)
+    if !tooling_stage0CapabilityPreflightOkEx(root, stage0IdentityPath,
+                                              "selfhost_strict_inmem_witness",
+                                              allowBootstrapCapabilityRefresh):
+        return 2
+    let sourcePath: str = tooling_pathAbsolute(root, "src/backend/tooling/backend_driver.cheng")
+    if !os.fileExists(sourcePath):
+        tooling_printErr("cheng_tooling: strict inmem witness source not found: " + sourcePath)
+        return 1
+    let outDir: str = os.parentDir(outPath)
+    if tooling_strNonEmpty(outDir) && !tooling_mkdirP(root, outDir):
+        tooling_printErr("cheng_tooling: strict inmem witness failed to create output dir: " + outDir)
+        return 1
+    var stage0Exec: str = tooling_prepareStage0Exec(root, stage0, "strict_inmem_witness")
+    if !tooling_strNonEmpty(stage0Exec):
+        return 1
+    if !tooling_stage0PreflightOk(root, stage0Exec):
+        tooling_cleanupStage0Exec(stage0, stage0Exec)
+        return 1
+    var runtimeObj: str = tooling_runtimeObjPath(root, target)
+    if !os.fileExists(runtimeObj):
+        runtimeObj = tooling_prepareRuntimeObjForTarget(root, stage0Exec, target)
+    let preferSeedBaseRuntimeObj: bool = tooling_isTrue(
+        os.getEnvDefault("BACKEND_BUILD_DRIVER_SEED_BASE_RUNTIME_OBJ", "1"))
+    let stage0LowerRaw: str = strutil.toLowerAscii(strutil.strip(stage0))
+    let seedLikeStage0: bool =
+        tooling_strContains(stage0LowerRaw, "/artifacts/backend_selfhost_self_obj/cheng.stage2") ||
+        tooling_strContains(stage0LowerRaw, "/artifacts/backend_selfhost_self_obj/cheng.stage1")
+    if preferSeedBaseRuntimeObj && seedLikeStage0:
+        let baseRuntimeObj: str = os.joinPath(root, "chengcache/system_helpers.backend.cheng." + target + ".o")
+        if os.fileExists(baseRuntimeObj):
+            runtimeObj = baseRuntimeObj
+    if !os.fileExists(runtimeObj):
+        tooling_printErr("cheng_tooling: strict inmem witness missing runtime object: " + runtimeObj)
+        tooling_cleanupStage0Exec(stage0, stage0Exec)
+        return 1
+    if os.fileExists(outPath):
+        os.removeFile(outPath)
+    var compileCmdBase: str = ""
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("STAGE1_STD_NO_POINTERS", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("STAGE1_STD_NO_POINTERS_STRICT", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("MM", "orc")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("CACHE", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("STAGE1_AUTO_SYSTEM", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_BUILD_TRACK", "dev")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_ALLOW_DIRECT_DRIVER", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("WHOLE_PROGRAM", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_WHOLE_PROGRAM", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("whole_program", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_STAGE1_PARSE_MODE", "full")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_FN_SCHED", "ws")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_DIRECT_EXE", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_LINKERLESS_INMEM", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_FAST_FALLBACK_ALLOW", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_MULTI", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_MULTI_FORCE", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_MULTI_MODULE_CACHE", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_MODULE_CACHE", "")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_MODULE_CACHE_UNSTABLE_ALLOW", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_INCREMENTAL", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_JOBS", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_FN_JOBS", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_VALIDATE", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_OPT_LEVEL", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_OPT", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_OPT2", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("UIR_SIMD", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("STAGE1_SKIP_CPROFILE", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("STAGE1_PROFILE", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("GENERIC_MODE", "dict")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("GENERIC_SPEC_BUDGET", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("GENERIC_LOWERING", "mir_dict")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_STAGE1_DISABLE_DUP_SCAN", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_STAGE1_BUILDER", "stage1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_SKIP_GLOBAL_INIT", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_SKIP_UIR_FIXUPS", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_SKIP_UIR_NORMALIZE", "0")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_LINKER", "self")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_NO_RUNTIME_C", "1")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_RUNTIME_OBJ", runtimeObj)
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_EMIT", "exe")
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_TARGET", target)
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_INPUT", sourcePath)
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat("BACKEND_OUTPUT", outPath)
+    compileCmdBase = compileCmdBase + tooling_envAssignCompat(
+        "BACKEND_CFLAGS", "-DCHENG_BACKEND_DRIVER_ENTRY_SHIM=1")
+    compileCmdBase = compileCmdBase + tooling_buildBackendDriverLegacyStage0Prefix(
+        "dev", sourcePath, outPath, target, "self", "full", "ws",
+        "0", "0", "0", 1, "0", "0", "0", "dict", "0", "mir_dict", runtimeObj)
+    compileCmdBase = compileCmdBase + tooling_stage0LegacyCStringCompatPrefix(root, stage0Exec)
+    compileCmdBase = compileCmdBase + tooling_shellQuote(stage0Exec)
+    compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--input:" + sourcePath)
+    compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--output:" + outPath)
+    compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--target:" + target)
+    compileCmdBase = compileCmdBase + " " + tooling_shellQuote("--linker:self")
+    compileCmdBase = tooling_prefixUnsetLegacyFrontendEnv(compileCmdBase)
+    let compileCmd: str = tooling_wrapCommandWithTimeout(root, timeoutSec, compileCmdBase)
+    let res: os.ExecCmdResult = tooling_exec(root, compileCmd)
+    tooling_printExecOutput(res)
+    let rc: int32 = os.execCmdResultExitCode(res)
+    if rc != 0:
+        tooling_cleanupStage0Exec(stage0, stage0Exec)
+        return rc
+    if !tooling_driverBuildOutputOk(root, outPath, "full", false, false, "self"):
+        tooling_cleanupStage0Exec(stage0, stage0Exec)
+        return 1
+    tooling_cleanupStage0Exec(stage0, stage0Exec)
+    return 0
+
+fn tooling_selfhostStrictInmemWitnessHost(root: str, outDirRaw: str, timingOutRaw: str,
+                                          stage0Raw: str,
+                                          allowBootstrapCapabilityRefresh: bool): ToolingSelfhostResult =
+    var result: ToolingSelfhostResult
+    new result
+    result.ok = false
+    result.message = ""
+    result.totalMs = int64(0)
+    result.mode = "strict-inmem-witness"
+    result.stage1Path = ""
+    result.stage2Path = ""
+    result.stage3Path = ""
+    result.stage0Path = ""
+    result.stage0DriverKind = "unknown"
+    result.stage1Status = "init"
+    result.stage1CompileMode = "full-inmem"
+    result.stage1RebuildOk = false
+    result.fallbackUsed = false
+    result.quarantineCleaned = 0
+    result.lockWaitMs = 0
+    result.strictRebuildOk = false
+    result.stage2Sha256 = ""
+    result.stage3Sha256 = ""
+    result.fixedPointOk = false
+    result.strictMismatchReport = ""
+    result.stage1CompileMs = int64(0)
+    result.stage1SanityMs = int64(0)
+    result.stage1CompileAttempts = 0
+    result.stage1CompileSegfaults = 0
+
+    let hostTag: str = tooling_detectHostTag(root)
+    if !tooling_strEq(hostTag, "darwin_arm64"):
+        result.message = "selfhost_strict_inmem_witness unsupported host: " + hostTag
+        return result
+    let target: str = tooling_detectHostTarget(root)
+    if !tooling_strNonEmpty(target):
+        result.message = "selfhost_strict_inmem_witness failed to resolve host target"
+        return result
+    result.quarantineCleaned = tooling_stage0QuarantineSweepUe(root, "selfhost_strict_inmem_witness")
+    if tooling_stage0BlockOnQuarantineUe(root, "TOOLING_SELFHOST_BLOCK_ON_UE", "selfhost_strict_inmem_witness"):
+        result.message = "selfhost_strict_inmem_witness blocked by quarantine stuck/orphan processes"
+        return result
+    let explicitStage0Raw: str = strutil.strip(stage0Raw)
+    let stage0: str = tooling_resolveStage0DriverStrict(root, stage0Raw)
+    if !tooling_strNonEmpty(stage0) && tooling_strNonEmpty(explicitStage0Raw):
+        result.message = "selfhost_strict_inmem_witness explicit stage0 failed strict probe: " + explicitStage0Raw
+        return result
+    if !tooling_strNonEmpty(stage0):
+        result.message = "selfhost_strict_inmem_witness missing stage0 driver"
+        return result
+    result.stage0Path = stage0
+    result.stage0DriverKind = tooling_stage0DriverKind(root, stage0)
+
+    var outDir: str = outDirRaw
+    if !tooling_strNonEmpty(outDir):
+        outDir = "artifacts/backend_selfhost_self_obj"
+    outDir = tooling_pathAbsolute(root, outDir)
+    if !tooling_mkdirP(root, outDir):
+        result.message = "selfhost_strict_inmem_witness failed to create out dir: " + outDir
+        return result
+    result.stage1Path = os.joinPath(outDir, "cheng.stage1.inmem_witness")
+    var timingOut: str = timingOutRaw
+    if !tooling_strNonEmpty(timingOut):
+        timingOut = os.joinPath(outDir, "selfhost_inmem_witness_timing_native.tsv")
+    var timeoutSec: int32 = tooling_parseInt32Default(
+        os.getEnvDefault("SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT", "120"), 120)
+    if timeoutSec < 1:
+        timeoutSec = 120
+    let startedMs: int64 = tooling_nowMs()
+    let stage1StartedMs: int64 = tooling_nowMs()
+    let rcStage1: int32 = tooling_compileBackendDriverStrictInmemWitness(
+        root, stage0, target, result.stage1Path, timeoutSec, allowBootstrapCapabilityRefresh)
+    let stage1Ms: int64 = tooling_nowMs() - stage1StartedMs
+    result.stage1CompileMs = stage1Ms
+    result.stage1CompileAttempts = 1
+    if rcStage1 != 0:
+        result.totalMs = tooling_nowMs() - startedMs
+        result.message = "selfhost_strict_inmem_witness stage1 compile failed rc=" +
+                         intToStr(rcStage1) + " kind=" + tooling_exitKind(rcStage1)
+        tooling_selfhostWriteTiming(root, outDir, timingOut, "fail", stage1Ms,
+                                    "skip", int64(0), "skip", int64(0),
+                                    "skip", int64(0), "fail", result.totalMs)
+        return result
+    result.ok = true
+    result.message = "ok"
+    result.stage1Status = "rebuild"
+    result.stage1RebuildOk = true
+    result.strictRebuildOk = true
+    result.totalMs = tooling_nowMs() - startedMs
+    tooling_selfhostWriteTiming(root, outDir, timingOut, "rebuild", stage1Ms,
+                                "skip", int64(0), "skip", int64(0),
+                                "skip", int64(0), "ok", result.totalMs)
+    result.lockWaitMs = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_LOCK_WAIT_MS", ""), 0)
+    return result
 
 fn tooling_selfhostStrictWriteMismatchDiagnostics(root: str, outDirRaw: str,
                                                   stage2PathRaw: str, stage3PathRaw: str,
@@ -7592,7 +8018,7 @@ fn tooling_selfhostStrictWriteMismatchDiagnostics(root: str, outDirRaw: str,
     summary = summary + "bytes_diff=" + bytesDiffPath + "\n"
     summary = summary + "symbols_diff=" + symbolsDiffPath + "\n"
     summary = summary + "strings_diff=" + stringsDiffPath + "\n"
-    os.writeFile(summaryPath, summary)
+    let _summaryWriteOk: bool = tooling_writeTextFileViaShell(root, summaryPath, summary)
     return summaryPath
 
 fn tooling_selfhostBootstrapStrictHost(root: str, outDirRaw: str, timingOutRaw: str,
@@ -7816,6 +8242,158 @@ fn tooling_selfhostBootstrapStrictHost(root: str, outDirRaw: str, timingOutRaw: 
                                 stage2Status, stage2Ms, stage3Status, stage3Ms,
                                 hashStatus, hashMs, totalStatus, totalMs)
     result.lockWaitMs = tooling_parseInt32Default(os.getEnvDefault("TOOLING_STAGE0_LOCK_WAIT_MS", ""), 0)
+    return result
+
+fn tooling_selfhostInnerLoop(root: str, outDirRaw: str, timingOutRaw: str,
+                             runInmemWitness: bool, runStrict: bool,
+                             runClosure: bool): ToolingSelfhostInnerLoopResult =
+    var result: ToolingSelfhostInnerLoopResult
+    new result
+    result.ok = false
+    result.message = ""
+    result.totalMs = int64(0)
+    result.outDir = "artifacts/backend_selfhost_inner_loop"
+    if tooling_strNonEmpty(outDirRaw):
+        result.outDir = outDirRaw
+    result.outDir = tooling_pathAbsolute(root, result.outDir)
+    result.summaryPath = os.joinPath(result.outDir, "selfhost_inner_loop.summary.env")
+    result.timingPath = os.joinPath(result.outDir, "selfhost_inner_loop_timing.tsv")
+    if tooling_strNonEmpty(timingOutRaw):
+        result.timingPath = tooling_pathAbsolute(root, timingOutRaw)
+    result.buildDriverPath = tooling_pathAbsolute(root, "artifacts/backend_driver/cheng")
+    result.buildMs = int64(0)
+    result.buildRc = 1
+    result.inmemRequested = runInmemWitness
+    result.inmemMs = int64(0)
+    result.inmemRes = nil
+    result.strictRequested = runStrict
+    result.strictMs = int64(0)
+    result.strictRes = nil
+    result.closureRequested = runClosure
+    result.closureMs = int64(0)
+    result.closureRc = 0
+    result.failedStep = ""
+    if !tooling_mkdirP(root, result.outDir):
+        result.message = "selfhost_inner_loop failed to create out dir: " + result.outDir
+        result.failedStep = "setup"
+        return result
+
+    let startedMs: int64 = tooling_nowMs()
+    var buildStatus: str = "fail"
+    var inmemStatus: str = "skip"
+    var strictStatus: str = "skip"
+    var closureStatus: str = "skip"
+    if runInmemWitness:
+        inmemStatus = "fail"
+    if runStrict:
+        strictStatus = "fail"
+    if runClosure:
+        closureStatus = "fail"
+
+    let buildStartedMs: int64 = tooling_nowMs()
+    let buildRc: int32 = tooling_cmdBuildBackendDriver(
+        root, result.buildDriverPath, "", "", true, false, "seal")
+    result.buildMs = tooling_nowMs() - buildStartedMs
+    result.buildRc = buildRc
+    if buildRc != 0:
+        result.message = "selfhost_inner_loop build-backend-driver failed rc=" + intToStr(buildRc)
+        result.failedStep = "build_driver"
+        result.totalMs = tooling_nowMs() - startedMs
+        tooling_selfhostInnerLoopWriteTiming(root, result.outDir, result.timingPath,
+                                             buildStatus, result.buildMs,
+                                             inmemStatus, result.inmemMs,
+                                             strictStatus, result.strictMs,
+                                             closureStatus, result.closureMs,
+                                             "fail", result.totalMs)
+        result.summaryPath = tooling_selfhostInnerLoopWriteSummary(root, result)
+        return result
+    buildStatus = "ok"
+
+    if runInmemWitness:
+        let inmemOutDir: str = os.joinPath(result.outDir, "inmem_witness")
+        let inmemTimingPath: str = os.joinPath(inmemOutDir, "selfhost_inmem_witness_timing_native.tsv")
+        let inmemStartedMs: int64 = tooling_nowMs()
+        result.inmemRes = tooling_selfhostStrictInmemWitnessHost(root, inmemOutDir, inmemTimingPath, "", false)
+        result.inmemMs = tooling_nowMs() - inmemStartedMs
+        let inmemRes: ToolingSelfhostResult = result.inmemRes
+        if inmemRes == nil || !inmemRes.ok:
+            result.message = "selfhost_inner_loop inmem witness failed"
+            if inmemRes != nil && tooling_strNonEmpty(inmemRes.message):
+                result.message = inmemRes.message
+            if !tooling_strNonEmpty(result.message):
+                result.message = "selfhost_inner_loop inmem witness failed"
+            result.failedStep = "inmem_witness"
+            result.totalMs = tooling_nowMs() - startedMs
+            tooling_selfhostInnerLoopWriteTiming(root, result.outDir, result.timingPath,
+                                                 buildStatus, result.buildMs,
+                                                 inmemStatus, result.inmemMs,
+                                                 strictStatus, result.strictMs,
+                                                 closureStatus, result.closureMs,
+                                                 "fail", result.totalMs)
+            result.summaryPath = tooling_selfhostInnerLoopWriteSummary(root, result)
+            return result
+        inmemStatus = "ok"
+    else:
+        inmemStatus = "skip"
+
+    if runStrict:
+        let strictOutDir: str = os.joinPath(result.outDir, "strict_host")
+        let strictTimingPath: str = os.joinPath(strictOutDir, "selfhost_timing_native.tsv")
+        let strictStartedMs: int64 = tooling_nowMs()
+        result.strictRes = tooling_selfhostBootstrapStrictHost(root, strictOutDir, strictTimingPath, "", false)
+        result.strictMs = tooling_nowMs() - strictStartedMs
+        let strictRes: ToolingSelfhostResult = result.strictRes
+        if strictRes == nil || !strictRes.ok:
+            result.message = "selfhost_inner_loop strict host failed"
+            if strictRes != nil && tooling_strNonEmpty(strictRes.message):
+                result.message = strictRes.message
+            if !tooling_strNonEmpty(result.message):
+                result.message = "selfhost_inner_loop strict host failed"
+            result.failedStep = "strict_host"
+            result.totalMs = tooling_nowMs() - startedMs
+            tooling_selfhostInnerLoopWriteTiming(root, result.outDir, result.timingPath,
+                                                 buildStatus, result.buildMs,
+                                                 inmemStatus, result.inmemMs,
+                                                 strictStatus, result.strictMs,
+                                                 closureStatus, result.closureMs,
+                                                 "fail", result.totalMs)
+            result.summaryPath = tooling_selfhostInnerLoopWriteSummary(root, result)
+            return result
+        strictStatus = "ok"
+    else:
+        strictStatus = "skip"
+
+    if runClosure:
+        let closureStartedMs: int64 = tooling_nowMs()
+        result.closureRc = tooling_cmdBackendProdClosureFromArgs(root, 1, 0)
+        result.closureMs = tooling_nowMs() - closureStartedMs
+        if result.closureRc != 0:
+            result.message = "selfhost_inner_loop backend_prod_closure failed rc=" + intToStr(result.closureRc)
+            result.failedStep = "closure"
+            result.totalMs = tooling_nowMs() - startedMs
+            tooling_selfhostInnerLoopWriteTiming(root, result.outDir, result.timingPath,
+                                                 buildStatus, result.buildMs,
+                                                 inmemStatus, result.inmemMs,
+                                                 strictStatus, result.strictMs,
+                                                 closureStatus, result.closureMs,
+                                                 "fail", result.totalMs)
+            result.summaryPath = tooling_selfhostInnerLoopWriteSummary(root, result)
+            return result
+        closureStatus = "ok"
+    else:
+        closureStatus = "skip"
+
+    result.ok = true
+    result.message = "ok"
+    result.failedStep = ""
+    result.totalMs = tooling_nowMs() - startedMs
+    tooling_selfhostInnerLoopWriteTiming(root, result.outDir, result.timingPath,
+                                         buildStatus, result.buildMs,
+                                         inmemStatus, result.inmemMs,
+                                         strictStatus, result.strictMs,
+                                         closureStatus, result.closureMs,
+                                         "ok", result.totalMs)
+    result.summaryPath = tooling_selfhostInnerLoopWriteSummary(root, result)
     return result
 
 fn tooling_sortInt32Asc(values: int32[]): int32[] =
@@ -9593,17 +10171,172 @@ fn tooling_printSelfhostBootstrapVerifyUsage() =
     tooling_printOut("verify_backend_selfhost_bootstrap_self_obj options:")
     tooling_printOut("  --mode:fast|strict           default from SELF_OBJ_BOOTSTRAP_MODE=fast")
     tooling_printOut("  --compile-stage1|--no-compile-stage1   (fast mode only)")
+    tooling_printOut("  --strict-inmem-witness       strict mode only; run full-parse direct-exe in-memory witness before host fixed-point")
     tooling_printOut("  --out-dir:<path>")
     tooling_printOut("  --timing-out:<path>")
     tooling_printOut("  env: SELF_OBJ_BOOTSTRAP_STRICT_DIAG_ALLOW_MISMATCH=0|1 (strict mismatch policy)")
     tooling_printOut("  env: SELF_OBJ_BOOTSTRAP_STRICT_FORCE_PROBE=0|1 (strict full-build probe, default 0)")
+    tooling_printOut("  env: SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT=<sec> (default 120)")
     tooling_printOut("  note: strict mode enforces skip_sem=0 and skip_ownership=0")
+
+fn tooling_printSelfhostStrictInmemWitnessUsage() =
+    tooling_printOut("verify_backend_selfhost_bootstrap_inmem_witness options:")
+    tooling_printOut("  --out-dir:<path>")
+    tooling_printOut("  --timing-out:<path>")
+    tooling_printOut("  env: SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT=<sec> (default 120)")
+    tooling_printOut("  note: runs full-parse + ws + direct-exe + linkerless-inmem witness only; does not replace strict fixed-point gate")
+
+fn tooling_printSelfhostInnerLoopUsage() =
+    tooling_printOut("verify_backend_selfhost_inner_loop options:")
+    tooling_printOut("  --out-dir:<path>")
+    tooling_printOut("  --timing-out:<path>")
+    tooling_printOut("  --inmem-witness|--no-inmem-witness   default on")
+    tooling_printOut("  --strict|--no-strict                 default on")
+    tooling_printOut("  --closure|--no-closure               default off")
+    tooling_printOut("  env: SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT=<sec> (default 120)")
+    tooling_printOut("  env: SELF_OBJ_BOOTSTRAP_TIMEOUT=<sec> (default 180)")
+    tooling_printOut("  note: runs canonical build-backend-driver --require-rebuild first, then fail-fast witness/strict/closure steps")
+
+fn tooling_cmdSelfhostStrictInmemWitnessFromArgs(root: str, firstArgIndex: int32, count: int32): int32 =
+    var outDir: str = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_OUT_DIR", "")
+    var timingOut: str = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_TIMING_OUT", "")
+    var i: int32 = firstArgIndex
+    if i < 1:
+        i = 1
+    for _ in i..count:
+        if i > count:
+            break
+        let arg: str = tooling_paramStr(i)
+        if tooling_strEq(arg, "--help") || tooling_strEq(arg, "-h"):
+            tooling_printSelfhostStrictInmemWitnessUsage()
+            return 0
+        if strutil.startsWith(arg, "--out-dir:"):
+            outDir = strings.dropPrefix(arg, "--out-dir:")
+            i = i + 1
+            continue
+        if strutil.startsWith(arg, "--timing-out:"):
+            timingOut = strings.dropPrefix(arg, "--timing-out:")
+            i = i + 1
+            continue
+        if strutil.startsWith(arg, "--stage0:"):
+            tooling_printErr("cheng_tooling: verify_backend_selfhost_bootstrap_inmem_witness no longer accepts --stage0; canonical driver is mandatory")
+            return 2
+        tooling_printErr("cheng_tooling: unknown verify_backend_selfhost_bootstrap_inmem_witness arg: " + arg)
+        return 1
+    let res: ToolingSelfhostResult = tooling_selfhostStrictInmemWitnessHost(root, outDir, timingOut, "", false)
+    if !res.ok:
+        var msg: str = res.message
+        if !tooling_strNonEmpty(msg):
+            msg = "unknown failure"
+        tooling_printErr("cheng_tooling: verify_backend_selfhost_bootstrap_inmem_witness failed: " + msg)
+        return 1
+    tooling_printOut("selfhost_inmem_witness_mode=" + res.mode)
+    tooling_printOut("selfhost_inmem_witness_stage0=" + res.stage0Path)
+    tooling_printOut("selfhost_inmem_witness_stage0_driver_kind=" + res.stage0DriverKind)
+    tooling_printOut("selfhost_inmem_witness_stage1=" + res.stage1Path)
+    tooling_printOut("selfhost_inmem_witness_stage1_status=" + res.stage1Status)
+    tooling_printOut("selfhost_inmem_witness_total_ms=" + intToStr(int32(res.totalMs)))
+    return 0
+
+fn tooling_cmdSelfhostInnerLoopFromArgs(root: str, firstArgIndex: int32, count: int32): int32 =
+    var outDir: str = os.getEnvDefault("SELFHOST_INNER_LOOP_OUT_DIR", "")
+    var timingOut: str = os.getEnvDefault("SELFHOST_INNER_LOOP_TIMING_OUT", "")
+    var runInmemWitness: bool = !tooling_isTrue(
+        os.getEnvDefault("SELFHOST_INNER_LOOP_SKIP_INMEM_WITNESS", "0"))
+    var runStrict: bool = !tooling_isTrue(os.getEnvDefault("SELFHOST_INNER_LOOP_SKIP_STRICT", "0"))
+    var runClosure: bool = tooling_isTrue(os.getEnvDefault("SELFHOST_INNER_LOOP_RUN_CLOSURE", "0"))
+    var i: int32 = firstArgIndex
+    if i < 1:
+        i = 1
+    for _ in i..count:
+        if i > count:
+            break
+        let arg: str = tooling_paramStr(i)
+        if tooling_strEq(arg, "--help") || tooling_strEq(arg, "-h"):
+            tooling_printSelfhostInnerLoopUsage()
+            return 0
+        if strutil.startsWith(arg, "--out-dir:"):
+            outDir = strings.dropPrefix(arg, "--out-dir:")
+            i = i + 1
+            continue
+        if strutil.startsWith(arg, "--timing-out:"):
+            timingOut = strings.dropPrefix(arg, "--timing-out:")
+            i = i + 1
+            continue
+        if tooling_strEq(arg, "--inmem-witness"):
+            runInmemWitness = true
+            i = i + 1
+            continue
+        if tooling_strEq(arg, "--no-inmem-witness"):
+            runInmemWitness = false
+            i = i + 1
+            continue
+        if tooling_strEq(arg, "--strict"):
+            runStrict = true
+            i = i + 1
+            continue
+        if tooling_strEq(arg, "--no-strict"):
+            runStrict = false
+            i = i + 1
+            continue
+        if tooling_strEq(arg, "--closure"):
+            runClosure = true
+            i = i + 1
+            continue
+        if tooling_strEq(arg, "--no-closure"):
+            runClosure = false
+            i = i + 1
+            continue
+        if strutil.startsWith(arg, "--stage0:"):
+            tooling_printErr("cheng_tooling: verify_backend_selfhost_inner_loop no longer accepts --stage0; canonical driver is mandatory")
+            return 2
+        tooling_printErr("cheng_tooling: unknown verify_backend_selfhost_inner_loop arg: " + arg)
+        return 1
+    if runClosure && !runStrict:
+        tooling_printErr("cheng_tooling: verify_backend_selfhost_inner_loop requires strict host before closure; --closure cannot be combined with --no-strict")
+        return 2
+    let res: ToolingSelfhostInnerLoopResult =
+        tooling_selfhostInnerLoop(root, outDir, timingOut, runInmemWitness, runStrict, runClosure)
+    let inmemRes: ToolingSelfhostResult = res.inmemRes
+    let strictRes: ToolingSelfhostResult = res.strictRes
+    tooling_printOut("selfhost_inner_loop_out_dir=" + res.outDir)
+    tooling_printOut("selfhost_inner_loop_timing=" + res.timingPath)
+    tooling_printOut("selfhost_inner_loop_summary=" + res.summaryPath)
+    tooling_printOut("selfhost_inner_loop_build_driver=" + res.buildDriverPath)
+    tooling_printOut("selfhost_inner_loop_build_driver_ms=" + intToStr(int32(res.buildMs)))
+    tooling_printOut("selfhost_inner_loop_build_driver_rc=" + intToStr(res.buildRc))
+    tooling_printOut("selfhost_inner_loop_inmem_requested=" + tooling_boolText(res.inmemRequested))
+    if inmemRes != nil:
+        tooling_printOut("selfhost_inner_loop_inmem_stage1=" + inmemRes.stage1Path)
+        tooling_printOut("selfhost_inner_loop_inmem_total_ms=" + intToStr(int32(inmemRes.totalMs)))
+    tooling_printOut("selfhost_inner_loop_strict_requested=" + tooling_boolText(res.strictRequested))
+    if strictRes != nil:
+        tooling_printOut("selfhost_inner_loop_strict_stage2=" + strictRes.stage2Path)
+        tooling_printOut("selfhost_inner_loop_strict_stage3=" + strictRes.stage3Path)
+        tooling_printOut("selfhost_inner_loop_strict_total_ms=" + intToStr(int32(strictRes.totalMs)))
+        tooling_printOut("selfhost_inner_loop_strict_fixed_point_ok=" + tooling_boolText(strictRes.fixedPointOk))
+    tooling_printOut("selfhost_inner_loop_closure_requested=" + tooling_boolText(res.closureRequested))
+    tooling_printOut("selfhost_inner_loop_closure_rc=" + intToStr(res.closureRc))
+    tooling_printOut("selfhost_inner_loop_total_ms=" + intToStr(int32(res.totalMs)))
+    if !res.ok:
+        tooling_printOut("selfhost_inner_loop_ok=0")
+        tooling_printOut("selfhost_inner_loop_failed_step=" + res.failedStep)
+        var msg: str = res.message
+        if !tooling_strNonEmpty(msg):
+            msg = "unknown failure"
+        tooling_printErr("cheng_tooling: verify_backend_selfhost_inner_loop failed step=" + res.failedStep +
+                         " message=" + tooling_summaryOneLine(msg))
+        return 1
+    tooling_printOut("selfhost_inner_loop_ok=1")
+    return 0
 
 fn tooling_cmdSelfhostBootstrapVerifyFromArgs(root: str, firstArgIndex: int32, count: int32): int32 =
     var mode: str = tooling_selfhostModeFromEnv("fast")
     var compileStage1: bool = tooling_isTrue(os.getEnvDefault("SELFHOST_NATIVE_COMPILE_STAGE1", "1"))
     var outDir: str = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_OUT_DIR", "")
     var timingOut: str = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_TIMING_OUT", "")
+    var strictInmemWitness: bool = tooling_isTrue(
+        os.getEnvDefault("SELF_OBJ_BOOTSTRAP_STRICT_INMEM_WITNESS", "0"))
     var i: int32 = firstArgIndex
     if i < 1:
         i = 1
@@ -9630,6 +10363,10 @@ fn tooling_cmdSelfhostBootstrapVerifyFromArgs(root: str, firstArgIndex: int32, c
             compileStage1 = false
             i = i + 1
             continue
+        if tooling_strEq(arg, "--strict-inmem-witness"):
+            strictInmemWitness = true
+            i = i + 1
+            continue
         if strutil.startsWith(arg, "--out-dir:"):
             outDir = strings.dropPrefix(arg, "--out-dir:")
             i = i + 1
@@ -9647,6 +10384,18 @@ fn tooling_cmdSelfhostBootstrapVerifyFromArgs(root: str, firstArgIndex: int32, c
     var res: ToolingSelfhostResult
     if tooling_strEq(mode, "strict"):
         compileStage1 = true
+        if strictInmemWitness:
+            let witnessRes: ToolingSelfhostResult =
+                tooling_selfhostStrictInmemWitnessHost(root, outDir, timingOut, "", false)
+            if !witnessRes.ok:
+                var wmsg: str = witnessRes.message
+                if !tooling_strNonEmpty(wmsg):
+                    wmsg = "unknown failure"
+                tooling_printErr("cheng_tooling: strict inmem witness failed before strict host fixed-point: " + wmsg)
+                return 1
+            tooling_printOut("selfhost_strict_inmem_witness_ok=1")
+            tooling_printOut("selfhost_strict_inmem_witness_stage1=" + witnessRes.stage1Path)
+            tooling_printOut("selfhost_strict_inmem_witness_total_ms=" + intToStr(int32(witnessRes.totalMs)))
         res = tooling_selfhostBootstrapStrictHost(root, outDir, timingOut, "", false)
     else:
         res = tooling_selfhostBootstrapFastHost(root, compileStage1, outDir, timingOut, "", false)
@@ -10048,10 +10797,11 @@ fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): 
     if !os.fileExists(src):
         tooling_printErr("cheng_tooling: source not found: " + src)
         return 1
-    let embeddedInlineSrc: str = os.joinPath(root, "src/tooling/cheng_tooling_embedded_inline.cheng")
-    if !os.fileExists(embeddedInlineSrc):
-        tooling_printErr("cheng_tooling: embedded tooling source not found: " + embeddedInlineSrc)
-        return 1
+    let embeddedSources: str[] = tooling_embeddedToolingSourceList(root)
+    for i in 0..<embeddedSources.len:
+        if !os.fileExists(embeddedSources[i]):
+            tooling_printErr("cheng_tooling: embedded tooling source not found: " + embeddedSources[i])
+            return 1
     let outPath: str = tooling_pathAbsolute(root, outRaw)
     if !tooling_strNonEmpty(outPath):
         tooling_printErr("cheng_tooling: build-global requires --out:<path>")
@@ -10060,7 +10810,7 @@ fn tooling_buildGlobal(root: str, outRaw: str, linkerRaw: str, driverRaw: str): 
     let outHealthy: bool = tooling_verifyBuiltToolingBinarySurface(root, outPath)
     let sourceNewerThanOut: bool =
         tooling_fileIsNewer(root, src, outPath) ||
-        tooling_fileIsNewer(root, embeddedInlineSrc, outPath)
+        tooling_anyFileNewerThan(root, embeddedSources, outPath)
     if !eagerRebuild && outHealthy && !sourceNewerThanOut:
         tooling_printOut("build_global_rebuilt=0")
         tooling_printOut("build_global_fast_path=reuse_existing")
@@ -11325,6 +12075,10 @@ fn tooling_printUsage() =
     tooling_printOut("      host-only fast selfhost bootstrap without shell script orchestration")
     tooling_printOut("  verify_backend_selfhost_bootstrap_self_obj [--mode:fast|strict] [--compile-stage1|--no-compile-stage1] [--out-dir:<path>] [--timing-out:<path>]")
     tooling_printOut("      native selfhost bootstrap verifier (strict enforces SHA256(stage2)==SHA256(stage3))")
+    tooling_printOut("  verify_backend_selfhost_bootstrap_inmem_witness [--out-dir:<path>] [--timing-out:<path>]")
+    tooling_printOut("      strict full-parse in-memory direct-exe witness for backend_driver selfhost compile")
+    tooling_printOut("  verify_backend_selfhost_inner_loop [--out-dir:<path>] [--timing-out:<path>] [--closure]")
+    tooling_printOut("      native inner loop: canonical rebuild -> inmem witness -> strict host (-> optional closure)")
     tooling_printOut("  selfhost-100ms-host [--iters:<N>] [--p95-ms:<ms>] [--p99-ms:<ms>] [--host-only:<tag>] [--report:<path>] [--enforce:0|1]")
     tooling_printOut("      host-only 100ms gate using native selfhost bootstrap path")
     tooling_printOut("  verify_backend_cdrop_emergency")
@@ -11771,10 +12525,8 @@ fn tooling_cmdBackendProdClosureFromArgs(root: str, firstArgIndex: int32, count:
                                        "verify_backend_ffi_slice_shim", "", envPrefix, gateTimeout)
     if rc != 0:
         return rc
-    var ffiOutptrEnv: str = envPrefix
-    ffiOutptrEnv = ffiOutptrEnv + tooling_envAssignCompat("BACKEND_FFI_OUTPTR_TUPLE_ALLOW_RUN_FAIL", "1")
     rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.ffi_outptr_tuple",
-                                       "verify_backend_ffi_outptr_tuple", "", ffiOutptrEnv, gateTimeout)
+                                       "verify_backend_ffi_outptr_tuple", "", envPrefix, gateTimeout)
     if rc != 0:
         return rc
     rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.ffi_handle_sandbox",
@@ -14420,7 +15172,7 @@ fn tooling_cmdVerifyBackendNoptrExemptionScope(root: str): int32 =
             "[ \"$line\" != \"\" ] || continue; " +
             "file=\"${line%%:*}\"; " +
             "case \"$file\" in " +
-                "src/tooling/cheng_tooling.cheng|src/tooling/cheng_tooling_embedded_inline.cheng|src/tooling/.tmp_*) " +
+                "src/tooling/cheng_tooling.cheng|src/tooling/cheng_tooling_embedded_inline.cheng|src/tooling/cheng_tooling_embedded_part*.cheng|src/tooling/.tmp_*) " +
                     "continue ;; " +
             "esac; " +
             "printf '%s\\n' \"$line\" >>\"$bad\"; " +
@@ -14435,7 +15187,7 @@ fn tooling_cmdVerifyBackendNoptrExemptionScope(root: str): int32 =
             "echo \"status=ok\"; " +
             "echo \"hit_count=$count\"; " +
             "echo \"hits=$hits\"; " +
-            "echo \"allowlist=src/tooling/cheng_tooling.cheng,src/tooling/cheng_tooling_embedded_inline.cheng,src/tooling/.tmp_*\"; " +
+            "echo \"allowlist=src/tooling/cheng_tooling.cheng,src/tooling/cheng_tooling_embedded_inline.cheng,src/tooling/cheng_tooling_embedded_part*.cheng,src/tooling/.tmp_*\"; " +
         "} >\"$report\"; " +
         "{ " +
             "echo \"backend_noptr_exemption_scope_status=ok\"; " +
@@ -14472,9 +15224,9 @@ fn tooling_cmdVerifyBackendZeroScriptClosure(root: str): int32 =
             "sed -n '1,200p' \"$inlines\" | sed 's/^/  - /' >&2; " +
             "exit 1; " +
         "fi; " +
-        "if rg -q '\\bCHENG_(BACKEND_|STAGE1_|MM|CACHE)' src/tooling/cheng_tooling.cheng src/tooling/cheng_tooling_embedded_inline.cheng; then " +
+        "if rg -q '\\bCHENG_(BACKEND_|STAGE1_|MM|CACHE)' src/tooling/cheng_tooling.cheng src/tooling/cheng_tooling_embedded_inline.cheng src/tooling/cheng_tooling_embedded_part*.cheng; then " +
             "echo \"[verify_backend_zero_script_closure] legacy CHENG_* env compatibility aliases still present\" >&2; " +
-            "rg -n '\\bCHENG_(BACKEND_|STAGE1_|MM|CACHE)' src/tooling/cheng_tooling.cheng src/tooling/cheng_tooling_embedded_inline.cheng | sed -n '1,40p' >&2; " +
+            "rg -n '\\bCHENG_(BACKEND_|STAGE1_|MM|CACHE)' src/tooling/cheng_tooling.cheng src/tooling/cheng_tooling_embedded_inline.cheng src/tooling/cheng_tooling_embedded_part*.cheng | sed -n '1,40p' >&2; " +
             "exit 1; " +
         "fi; " +
         "if rg -n 'probeAllowSystemFallback|needsMainFallback|allowObjFallback' src/tooling/cheng_tooling.cheng | rg -v 'verify_backend_zero_script_closure' >/dev/null 2>&1; then " +
@@ -14848,8 +15600,15 @@ fn tooling_cmdVerifyBackendClosedloopMinimal(root: str): int32 =
             "MM=\"$backend_mm\" GENERIC_MODE=\"$stage1_generic_mode\" GENERIC_SPEC_BUDGET=\"$stage1_generic_budget\" " +
             "\"$tool\" cheng --target:\"$backend_target\" --in:\"$in\" --out:\"$out\"; " +
         "}; " +
+        "compile_smoke_nosystem() { in=\"$1\"; out=\"$2\"; " +
+            "env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER -u BACKEND_LINKER " +
+            "STAGE1_AUTO_SYSTEM=0 MM=\"$backend_mm\" GENERIC_MODE=\"$stage1_generic_mode\" GENERIC_SPEC_BUDGET=\"$stage1_generic_budget\" " +
+            "\"$tool\" cheng --target:\"$backend_target\" --in:\"$in\" --out:\"$out\"; " +
+        "}; " +
         "run_step \"backend.closedloop_stage1_smoke.compile\" compile_smoke tests/cheng/backend/fixtures/hello_puts.cheng artifacts/backend_closedloop/stage1_smoke; " +
         "run_step \"backend.closedloop_stage1_smoke.run\" test -x artifacts/backend_closedloop/stage1_smoke; " +
+        "run_step \"backend.closedloop_stage1_nosystem_strlit_smoke.compile\" compile_smoke_nosystem tests/cheng/backend/fixtures/hello_literal_puts_nosystem.cheng artifacts/backend_closedloop/stage1_nosystem_strlit_smoke; " +
+        "run_step \"backend.closedloop_stage1_nosystem_strlit_smoke.run\" sh -c 'artifacts/backend_closedloop/stage1_nosystem_strlit_smoke | grep -Fq \"hello literal puts nosystem\"'; " +
         "run_step \"backend.closedloop_stage1_std_os_smoke.compile\" compile_smoke tests/cheng/backend/fixtures/return_import_std_os.cheng artifacts/backend_closedloop/stage1_std_os_smoke; " +
         "run_step \"backend.closedloop_stage1_std_os_smoke.run\" test -x artifacts/backend_closedloop/stage1_std_os_smoke; " +
         "run_fullspec=\"${BACKEND_RUN_FULLSPEC:-1}\"; " +
@@ -15114,6 +15873,10 @@ fn tooling_cmdVerifyMobileCrashFreeFromArgs(root: str, argStart: int32, count: i
 
 fn tooling_dispatchNativeScriptRoute(root: str, scriptIdRaw: str, argStart: int32, count: int32): int32 =
     let scriptId: str = tooling_normalizeScriptId(scriptIdRaw)
+    if tooling_strEq(scriptId, "verify_backend_ffi_outptr_tuple"):
+        return tooling_cmdRunEmbeddedScriptNoCleanup(root, scriptId, argStart, count)
+    if tooling_strEq(scriptId, "verify_backend_selfhost_parallel_perf"):
+        return tooling_cmdRunEmbeddedScriptNoCleanup(root, scriptId, argStart, count)
     if tooling_strEq(scriptId, "verify_tooling_cmdline"):
         return tooling_cmdVerifyToolingCmdline(root)
     if tooling_strEq(scriptId, "verify_backend_loop_runtime"):
@@ -15124,6 +15887,10 @@ fn tooling_dispatchNativeScriptRoute(root: str, scriptIdRaw: str, argStart: int3
         return tooling_cmdBackendProdPublishFromArgs(root, argStart, count)
     if tooling_strEq(scriptId, "verify_backend_selfhost_bootstrap_self_obj"):
         return tooling_cmdSelfhostBootstrapVerifyFromArgs(root, argStart, count)
+    if tooling_strEq(scriptId, "verify_backend_selfhost_bootstrap_inmem_witness"):
+        return tooling_cmdSelfhostStrictInmemWitnessFromArgs(root, argStart, count)
+    if tooling_strEq(scriptId, "verify_backend_selfhost_inner_loop"):
+        return tooling_cmdSelfhostInnerLoopFromArgs(root, argStart, count)
     if tooling_strEq(scriptId, "verify_backend_selfhost_100ms_host"):
         return tooling_cmdSelfhost100msHostFromArgs(root, argStart, count)
     if tooling_strEq(scriptId, "verify_backend_cdrop_emergency"):
@@ -15280,7 +16047,9 @@ fn tooling_runScript(root: str, scriptPath: str, argStart: int32): int32 =
         tooling_printBackendProdClosureHelpFast()
         return 0
     if tooling_strNonEmpty(scriptId):
-        if tooling_strEq(scriptId, "verify_backend_ffi_slice_shim"):
+        if tooling_strEq(scriptId, "verify_backend_ffi_slice_shim") ||
+           tooling_strEq(scriptId, "verify_backend_ffi_outptr_tuple") ||
+           tooling_strEq(scriptId, "verify_backend_selfhost_parallel_perf"):
             return tooling_cmdRunEmbeddedScriptNoCleanup(root, scriptId, argStart, count)
         let nativeRc: int32 = tooling_dispatchNativeScriptRoute(root, scriptId, argStart, count)
         if nativeRc != -1:
@@ -15584,6 +16353,8 @@ fn tooling_dispatchBuiltinFirstSlim(root: str, count: int32, first: str): int32 
         return tooling_cmdBundleFromArgsSlim(root, 2, count)
     if tooling_strEq(first, "install"):
         return tooling_cmdInstallFromArgsSlim(root, 2, count)
+    if tooling_strEq(first, "verify_backend_selfhost_inner_loop"):
+        return tooling_cmdSelfhostInnerLoopFromArgs(root, 2, count)
     if tooling_strEq(first, "backend_prod_closure"):
         return tooling_cmdBackendProdClosureFromArgs(root, 2, count)
     if tooling_strEq2(first, "backend_prod_publish", "backend-prod-publish"):
@@ -15617,6 +16388,8 @@ fn tooling_dispatchBuiltinSelfSlim(root: str, selfName: str, count: int32): int3
         return tooling_cmdStage0UeStatusFromArgs(root, 1, count)
     if tooling_strEq2(selfName, "stage0_ue_clean", "stage0-ue-clean"):
         return tooling_cmdStage0UeCleanFromArgs(root, 1, count)
+    if tooling_strEq(selfName, "verify_backend_selfhost_inner_loop"):
+        return tooling_cmdSelfhostInnerLoopFromArgs(root, 1, count)
     if tooling_strEq(selfName, "backend_prod_closure"):
         return tooling_cmdBackendProdClosureFromArgs(root, 1, count)
     if tooling_strEq2(selfName, "backend_prod_publish", "backend-prod-publish"):
@@ -15749,6 +16522,14 @@ fn tooling_mainDispatchLegacy(root: str, selfName: str, count: int32): int32 =
         return tooling_cmdSyncGlobalDeprecated()
     if tooling_strEq(selfName, "verify_backend_selfhost_bootstrap_self_obj"):
         return tooling_cmdSelfhostBootstrapVerifyFromArgs(root, 1, count)
+    if tooling_strEq(selfName, "verify_backend_ffi_outptr_tuple"):
+        return tooling_cmdRunEmbeddedScriptNoCleanup(root, "verify_backend_ffi_outptr_tuple", 1, count)
+    if tooling_strEq(selfName, "verify_backend_selfhost_parallel_perf"):
+        return tooling_cmdRunEmbeddedScriptNoCleanup(root, "verify_backend_selfhost_parallel_perf", 1, count)
+    if tooling_strEq(selfName, "verify_backend_selfhost_bootstrap_inmem_witness"):
+        return tooling_cmdSelfhostStrictInmemWitnessFromArgs(root, 1, count)
+    if tooling_strEq(selfName, "verify_backend_selfhost_inner_loop"):
+        return tooling_cmdSelfhostInnerLoopFromArgs(root, 1, count)
     if tooling_strEq(selfName, "verify_backend_selfhost_100ms_host"):
         return tooling_cmdSelfhost100msHostFromArgs(root, 1, count)
     if tooling_strEq(selfName, "verify_backend_cdrop_emergency"):
@@ -15885,6 +16666,14 @@ fn tooling_mainDispatchLegacy(root: str, selfName: str, count: int32): int32 =
         return tooling_cmdSelfhostBootstrapFastHostFromArgs(root, 2, count)
     if tooling_strEq(first, "verify_backend_selfhost_bootstrap_self_obj"):
         return tooling_cmdSelfhostBootstrapVerifyFromArgs(root, 2, count)
+    if tooling_strEq(first, "verify_backend_ffi_outptr_tuple"):
+        return tooling_cmdRunEmbeddedScriptNoCleanup(root, "verify_backend_ffi_outptr_tuple", 2, count)
+    if tooling_strEq(first, "verify_backend_selfhost_parallel_perf"):
+        return tooling_cmdRunEmbeddedScriptNoCleanup(root, "verify_backend_selfhost_parallel_perf", 2, count)
+    if tooling_strEq(first, "verify_backend_selfhost_bootstrap_inmem_witness"):
+        return tooling_cmdSelfhostStrictInmemWitnessFromArgs(root, 2, count)
+    if tooling_strEq(first, "verify_backend_selfhost_inner_loop"):
+        return tooling_cmdSelfhostInnerLoopFromArgs(root, 2, count)
     if tooling_strEq(first, "selfhost-100ms-host") || tooling_strEq(first, "verify_backend_selfhost_100ms_host"):
         return tooling_cmdSelfhost100msHostFromArgs(root, 2, count)
     if tooling_strEq(first, "verify_backend_cdrop_emergency"):

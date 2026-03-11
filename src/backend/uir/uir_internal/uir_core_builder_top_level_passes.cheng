@@ -2,40 +2,343 @@
 import std/result
 import std/seqs
 import std/hashsets
+import std/hashmaps
+import std/rawmem_support
 import stage1/ast
+import stage1/token
 import backend/uir/uir_internal/uir_core_types
 import backend/uir/uir_internal/uir_core_builder_types
 
-fn uirCorePathHasControlChars(path: str): bool =
-    if len(path) == 0:
+var uirCore_predeclareMeta_module: UirCoreModule
+var uirCore_predeclareMeta_len: int32
+var uirCore_predeclareMeta_ready: bool[]
+var uirCore_predeclareMeta_funcPtrs: int64[]
+var uirCore_predeclareMeta_names: str[]
+var uirCore_predeclareMeta_originNorms: str[]
+var uirCore_predeclareMeta_declOrdinals: int32[]
+var uirCore_predeclareMeta_sourceAstIndices: int32[]
+var uirCore_topLevelPathNorm_ptr_index: hashmaps.HashMapPtrInt
+var uirCore_topLevelPathNorm_ptr_values: str[]
+var uirCore_topLevelRoutineName_ready: int8[]
+var uirCore_topLevelRoutineName_values: str[]
+var uirCore_moduleHasName_cache_module: UirCoreModule
+var uirCore_moduleHasName_ptr_index: hashmaps.HashMapPtrInt
+var uirCore_moduleHasName_ready: int8[]
+var uirCore_moduleHasName_values: int8[]
+var uirCore_moduleHasName_globalsLens: int32[]
+var uirCore_moduleHasName_typeAliasLens: int32[]
+var uirCore_moduleHasName_objTypeLens: int32[]
+
+fn uirCorePredeclareMetaReset(mod: UirCoreModule = nil) =
+    let funcsLen: int32 = (mod != nil) ? uirCoreModuleFuncsLen(mod) : 0
+    uirCore_predeclareMeta_module = mod
+    uirCore_predeclareMeta_len = funcsLen
+    setLen(uirCore_predeclareMeta_ready, funcsLen)
+    setLen(uirCore_predeclareMeta_funcPtrs, funcsLen)
+    setLen(uirCore_predeclareMeta_names, funcsLen)
+    setLen(uirCore_predeclareMeta_originNorms, funcsLen)
+    setLen(uirCore_predeclareMeta_declOrdinals, funcsLen)
+    setLen(uirCore_predeclareMeta_sourceAstIndices, funcsLen)
+    for i in 0..<funcsLen:
+        uirCore_predeclareMeta_ready[i] = false
+        uirCore_predeclareMeta_funcPtrs[i] = 0
+        uirCore_predeclareMeta_names[i] = nil
+        uirCore_predeclareMeta_originNorms[i] = nil
+        uirCore_predeclareMeta_declOrdinals[i] = -1
+        uirCore_predeclareMeta_sourceAstIndices[i] = -1
+
+fn uirCorePredeclareMetaAppendLast(mod: UirCoreModule) =
+    if mod == nil:
+        uirCore_predeclareMeta_len = 0
+        return
+    let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
+    if funcsLen <= 0:
+        uirCore_predeclareMeta_len = funcsLen
+        return
+    setLen(uirCore_predeclareMeta_ready, funcsLen)
+    setLen(uirCore_predeclareMeta_funcPtrs, funcsLen)
+    setLen(uirCore_predeclareMeta_names, funcsLen)
+    setLen(uirCore_predeclareMeta_originNorms, funcsLen)
+    setLen(uirCore_predeclareMeta_declOrdinals, funcsLen)
+    setLen(uirCore_predeclareMeta_sourceAstIndices, funcsLen)
+    let idx: int32 = funcsLen - 1
+    uirCore_predeclareMeta_ready[idx] = false
+    uirCore_predeclareMeta_funcPtrs[idx] = 0
+    uirCore_predeclareMeta_names[idx] = nil
+    uirCore_predeclareMeta_originNorms[idx] = nil
+    uirCore_predeclareMeta_declOrdinals[idx] = -1
+    uirCore_predeclareMeta_sourceAstIndices[idx] = -1
+    uirCore_predeclareMeta_len = funcsLen
+
+fn uirCorePredeclareMetaEnsure(mod: UirCoreModule) =
+    if mod == nil:
+        if uirCore_predeclareMeta_module != nil || uirCore_predeclareMeta_len != 0:
+            uirCorePredeclareMetaReset()
+        return
+    let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
+    if uirCore_predeclareMeta_module != mod:
+        uirCorePredeclareMetaReset(mod)
+        return
+    if funcsLen == uirCore_predeclareMeta_len:
+        return
+    if funcsLen == uirCore_predeclareMeta_len + 1:
+        uirCorePredeclareMetaAppendLast(mod)
+        return
+    uirCorePredeclareMetaReset(mod)
+
+fn uirCorePredeclareMetaEnsureIndex(mod: UirCoreModule, idx: int32, f: UirCoreFunc): bool =
+    if mod == nil || idx < 0:
         return false
-    for i in 0..<len(path):
+    uirCorePredeclareMetaEnsure(mod)
+    if idx >= uirCore_predeclareMeta_len || idx >= uirCoreModuleFuncsLen(mod):
+        return false
+    let func0: UirCoreFunc = (f != nil) ? f : uirCoreModuleFuncAt(mod, idx)
+    let funcPtr: int64 = (func0 != nil) ? int64(rawmemAsVoid(func0)) : 0
+    if uirCore_predeclareMeta_ready[idx] &&
+       uirCore_predeclareMeta_funcPtrs[idx] == funcPtr:
+        return true
+    var name0: str = ""
+    var origin0: str = ""
+    var decl0: int32 = -1
+    var source0: int32 = -1
+    if func0 != nil:
+        let funcObj: UirCoreFuncObj* = uirCoreFuncObjPtr(func0)
+        if funcObj != nil:
+            if len(funcObj->name) > 0:
+                name0 = funcObj->name
+            if len(funcObj->originFile) > 0:
+                origin0 = funcObj->originFile
+            if funcObj->declOrdinal >= 0:
+                decl0 = funcObj->declOrdinal
+            if funcObj->sourceAstIndex >= 0:
+                source0 = funcObj->sourceAstIndex
+        let dynName: str = uirCoreFuncNameOf(func0)
+        if len(name0) == 0 && len(dynName) > 0:
+            name0 = dynName
+        let dynOrigin: str = uirCoreFuncOriginFileOf(func0)
+        if len(origin0) == 0 && len(dynOrigin) > 0:
+            origin0 = dynOrigin
+        let dynDecl: int32 = uirCoreFuncDeclOrdinalOf(func0)
+        if decl0 < 0 && dynDecl >= 0:
+            decl0 = dynDecl
+        let dynSource: int32 = uirCoreFuncSourceAstIndexOf(func0)
+        if source0 < 0 && dynSource >= 0:
+            source0 = dynSource
+    uirCore_predeclareMeta_funcPtrs[idx] = funcPtr
+    uirCore_predeclareMeta_names[idx] = name0
+    uirCore_predeclareMeta_originNorms[idx] = uirCoreNormalizeTopLevelPath(origin0, "")
+    uirCore_predeclareMeta_declOrdinals[idx] = decl0
+    uirCore_predeclareMeta_sourceAstIndices[idx] = source0
+    uirCore_predeclareMeta_ready[idx] = true
+    return true
+
+fn uirCorePredeclareMetaPutAt(mod: UirCoreModule, idx: int32, f: UirCoreFunc,
+                              name: str, originNorm: str,
+                              declOrdinal: int32,
+                              sourceAstIndex: int32) =
+    if mod == nil || idx < 0:
+        return
+    uirCorePredeclareMetaEnsure(mod)
+    if idx >= uirCore_predeclareMeta_len || idx >= uirCoreModuleFuncsLen(mod):
+        return
+    uirCore_predeclareMeta_funcPtrs[idx] = (f != nil) ? int64(rawmemAsVoid(f)) : 0
+    uirCore_predeclareMeta_names[idx] = name
+    uirCore_predeclareMeta_originNorms[idx] = originNorm
+    uirCore_predeclareMeta_declOrdinals[idx] = declOrdinal
+    uirCore_predeclareMeta_sourceAstIndices[idx] = sourceAstIndex
+    uirCore_predeclareMeta_ready[idx] = true
+
+fn uirCorePredeclareMetaRefreshFuncAt(mod: UirCoreModule, idx: int32, f: UirCoreFunc,
+                                      fallbackName: str, fallbackOriginFile: str,
+                                      fallbackDeclOrdinal: int32,
+                                      fallbackSourceAstIndex: int32) =
+    if mod == nil || idx < 0:
+        return
+    uirCorePredeclareMetaEnsure(mod)
+    if idx >= uirCore_predeclareMeta_len || idx >= uirCoreModuleFuncsLen(mod):
+        return
+    let name0: str = uirCore_predeclareMeta_ready[idx] ? uirCore_predeclareMeta_names[idx] : fallbackName
+    let origin0: str = uirCore_predeclareMeta_ready[idx] ? uirCore_predeclareMeta_originNorms[idx] : fallbackOriginFile
+    let decl0: int32 = uirCore_predeclareMeta_ready[idx] ? uirCore_predeclareMeta_declOrdinals[idx] : fallbackDeclOrdinal
+    let source0: int32 = uirCore_predeclareMeta_ready[idx] ? uirCore_predeclareMeta_sourceAstIndices[idx] : fallbackSourceAstIndex
+    uirCorePredeclareMetaPutAt(mod, idx, f, name0, origin0, decl0, source0)
+
+fn uirCoreTopLevelPathCacheReset() =
+    uirCore_topLevelPathNorm_ptr_index = hashmaps.hashMapPtrIntInit(1024)
+    setLen(uirCore_topLevelPathNorm_ptr_values, 0)
+    setLen(uirCore_topLevelRoutineName_ready, 0)
+    setLen(uirCore_topLevelRoutineName_values, 0)
+    uirCore_moduleHasName_cache_module = nil
+    uirCore_moduleHasName_ptr_index = hashmaps.hashMapPtrIntInit(1024)
+    setLen(uirCore_moduleHasName_ready, 0)
+    setLen(uirCore_moduleHasName_values, 0)
+    setLen(uirCore_moduleHasName_globalsLens, 0)
+    setLen(uirCore_moduleHasName_typeAliasLens, 0)
+    setLen(uirCore_moduleHasName_objTypeLens, 0)
+
+fn uirCorePathHasControlChars(path: str): bool =
+    let n: int32 = len(path)
+    if n == 0:
+        return false
+    for i in 0..<n:
         let ch: char = path[i]
         if ch < ' ':
             return true
     return false
 
+fn uirCorePathNeedsNormalize(path: str): bool =
+    let n: int32 = len(path)
+    if n == 0:
+        return false
+    for i in 0..<n:
+        let ch: char = path[i]
+        if ch < ' ' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r':
+            return true
+    return false
+
+fn uirCoreNormalizeTopLevelPathSingle(path: str): str =
+    if len(path) == 0:
+        return ""
+    let ptrKey: int64 = int64(rawmemAsVoid(path))
+    if ptrKey != 0:
+        var foundCached: bool = false
+        let raw: int32 = hashmaps.hashMapPtrIntGet(uirCore_topLevelPathNorm_ptr_index, ptrKey, foundCached)
+        let idx: int32 = raw - 1
+        if foundCached && idx >= 0 && idx < uirCore_topLevelPathNorm_ptr_values.len:
+            return uirCore_topLevelPathNorm_ptr_values[idx]
+    var out: str = path
+    if uirCorePathNeedsNormalize(path):
+        out = backendStripSpaces(path)
+    if uirCorePathHasControlChars(out):
+        out = ""
+    if ptrKey != 0:
+        let nextIdx: int32 = uirCore_topLevelPathNorm_ptr_values.len
+        seqs.add(uirCore_topLevelPathNorm_ptr_values, out)
+        hashmaps.hashMapPtrIntPut(uirCore_topLevelPathNorm_ptr_index, ptrKey, nextIdx + 1)
+    return out
+
+fn uirCoreNormalizeTopLevelPathTextId(textId: int32): str =
+    if textId <= 0:
+        return ""
+    let canonId: int32 = tokenTextTrimmedCanonicalId(textId)
+    if canonId <= 0:
+        return ""
+    let out: str = tokenTextById(canonId)
+    return uirCorePathHasControlChars(out) ? "" : out
+
 fn uirCoreNormalizeTopLevelPath(path: str, fallback: str): str =
-    var out: str = backendStripSpaces(path)
-    if len(out) == 0 || uirCorePathHasControlChars(out):
-        out = backendStripSpaces(fallback)
+    var out: str = uirCoreNormalizeTopLevelPathSingle(path)
+    if len(out) > 0:
+        return out
+    if len(fallback) == 0:
+        return ""
+    out = uirCoreNormalizeTopLevelPathSingle(fallback)
     if uirCorePathHasControlChars(out):
         return ""
     return out
+
+fn uirCorePathLooksCanonical(path: str): bool =
+    if len(path) == 0:
+        return false
+    if path[0] == '/':
+        return true
+    if strContains(path, "/") || strContains(path, "\\"):
+        return true
+    return false
+
+fn uirCoreResolveCallFilePath(rootId: AstNodeId, filePath: str): str =
+    if len(filePath) > 0:
+        return filePath
+    let fileNorm: str = uirCoreNormalizeTopLevelPathSingle(filePath)
+    if len(fileNorm) > 0:
+        return fileNorm
+    return uirCoreNormalizeTopLevelPathTextId(astNodeStrValId(rootId))
+
+fn uirCoreModuleHasNameCacheEnsure(mod: UirCoreModule) =
+    if uirCore_moduleHasName_cache_module == mod:
+        return
+    uirCore_moduleHasName_cache_module = mod
+    uirCore_moduleHasName_ptr_index = hashmaps.hashMapPtrIntInit(1024)
+    setLen(uirCore_moduleHasName_ready, 0)
+    setLen(uirCore_moduleHasName_values, 0)
+    setLen(uirCore_moduleHasName_globalsLens, 0)
+    setLen(uirCore_moduleHasName_typeAliasLens, 0)
+    setLen(uirCore_moduleHasName_objTypeLens, 0)
+
+fn uirCoreModuleHasNameCacheEnsureIndex(idx: int32) =
+    let needLen: int32 = idx + 1
+    if needLen <= 0:
+        return
+    if uirCore_moduleHasName_ready.cap < needLen:
+        reserve(uirCore_moduleHasName_ready, needLen)
+    if uirCore_moduleHasName_values.cap < needLen:
+        reserve(uirCore_moduleHasName_values, needLen)
+    if uirCore_moduleHasName_globalsLens.cap < needLen:
+        reserve(uirCore_moduleHasName_globalsLens, needLen)
+    if uirCore_moduleHasName_typeAliasLens.cap < needLen:
+        reserve(uirCore_moduleHasName_typeAliasLens, needLen)
+    if uirCore_moduleHasName_objTypeLens.cap < needLen:
+        reserve(uirCore_moduleHasName_objTypeLens, needLen)
+    if uirCore_moduleHasName_ready.len < needLen:
+        let oldLen: int32 = uirCore_moduleHasName_ready.len
+        setLen(uirCore_moduleHasName_ready, needLen)
+        setLen(uirCore_moduleHasName_values, needLen)
+        setLen(uirCore_moduleHasName_globalsLens, needLen)
+        setLen(uirCore_moduleHasName_typeAliasLens, needLen)
+        setLen(uirCore_moduleHasName_objTypeLens, needLen)
+        for i in oldLen..<needLen:
+            uirCore_moduleHasName_ready[i] = int8(0)
+            uirCore_moduleHasName_values[i] = int8(0)
+            uirCore_moduleHasName_globalsLens[i] = -1
+            uirCore_moduleHasName_typeAliasLens[i] = -1
+            uirCore_moduleHasName_objTypeLens[i] = -1
 
 fn uirCoreTopLevelRoutineNameNodeId(nId: AstNodeId): AstNodeId =
     if !astNodeIdValid(nId) || astKidCount(nId) <= 0:
         return astInvalidNodeId()
     return astKidAt(nId, 0)
 
+fn uirCoreTopLevelRoutineNameEnsureNodeCache(nId: AstNodeId) =
+    if !astNodeIdValid(nId):
+        return
+    let needLen: int32 = int32(nId) + 1
+    if needLen <= 0:
+        return
+    if uirCore_topLevelRoutineName_ready.cap < needLen:
+        reserve(uirCore_topLevelRoutineName_ready, needLen)
+    if uirCore_topLevelRoutineName_values.cap < needLen:
+        reserve(uirCore_topLevelRoutineName_values, needLen)
+    if uirCore_topLevelRoutineName_ready.len < needLen:
+        let oldLen: int32 = uirCore_topLevelRoutineName_ready.len
+        setLen(uirCore_topLevelRoutineName_ready, needLen)
+        for i in oldLen..<needLen:
+            uirCore_topLevelRoutineName_ready[i] = int8(0)
+    if uirCore_topLevelRoutineName_values.len < needLen:
+        setLen(uirCore_topLevelRoutineName_values, needLen)
+
 fn uirCoreTopLevelRoutineNameId(nId: AstNodeId): str =
+    if astNodeIdValid(nId):
+        uirCoreTopLevelRoutineNameEnsureNodeCache(nId)
+        let idx0: int32 = int32(nId)
+        if idx0 >= 0 && idx0 < uirCore_topLevelRoutineName_ready.len &&
+           uirCore_topLevelRoutineName_ready[idx0] == int8(1):
+            return uirCore_topLevelRoutineName_values[idx0]
     let nameNodeId: AstNodeId = uirCoreTopLevelRoutineNameNodeId(nId)
+    var out: str = ""
     if !astNodeIdValid(nameNodeId):
-        return ""
-    let nameKind: NodeKind = astNodeKind(nameNodeId)
-    if nameKind != nkIdent && nameKind != nkSymbol:
-        return ""
-    return backendStripSpaces(astPlainName(nameNodeId))
+        out = ""
+    else:
+        let nameKind: NodeKind = astNodeKind(nameNodeId)
+        if nameKind == nkIdent || nameKind == nkSymbol:
+            let identId: int32 = astNodeIdentId(nameNodeId)
+            let canonId: int32 = tokenTextTrimmedCanonicalId(identId)
+            out = (canonId > 0) ? tokenTextById(canonId) : ""
+    if astNodeIdValid(nId):
+        let idx1: int32 = int32(nId)
+        if idx1 >= 0 && idx1 < uirCore_topLevelRoutineName_ready.len:
+            uirCore_topLevelRoutineName_ready[idx1] = int8(1)
+            uirCore_topLevelRoutineName_values[idx1] = out
+    return out
 
 fn uirCoreTopLevelRoutineKeepByReachable(nId: AstNodeId, callFilePath: str,
                                          reachable: hashsets.HashSetStr*,
@@ -43,9 +346,10 @@ fn uirCoreTopLevelRoutineKeepByReachable(nId: AstNodeId, callFilePath: str,
     if reachable == nil:
         return true
     var entryPathProbe: str = callFilePath
-    let ownPath: str = astNodeStrVal(nId)
-    if len(ownPath) > 0:
-        entryPathProbe = uirCoreNormalizeTopLevelPath(ownPath, callFilePath)
+    let ownPathId: int32 = astNodeStrValId(nId)
+    let ownPathNorm: str = uirCoreNormalizeTopLevelPathTextId(ownPathId)
+    if len(ownPathNorm) > 0:
+        entryPathProbe = ownPathNorm
     let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
     if envIsTrue "BACKEND_DEBUG_STAGE1_PIPE":
         let fDbgReach0: os.File = os.get_stderr()
@@ -72,24 +376,214 @@ fn uirCoreTopLevelRoutineKeepByReachable(nId: AstNodeId, callFilePath: str,
     return hit
 
 fn uirCoreModuleHasGlobalOrTypeName(mod: UirCoreModule, name: str): bool =
-    if moduleHasGlobal(mod, name):
-        return true
-    if uirCoreFindTypeAlias(mod, name) >= 0:
-        return true
-    if uirCoreFindObjType(mod, name) >= 0:
-        return true
-    return false
+    if mod == nil || len(name) == 0:
+        return false
+    uirCoreModuleHasNameCacheEnsure(mod)
+    let globalsLen: int32 = uirCoreModuleGlobalsLen(mod)
+    let typeAliasLen: int32 = mod.typeAliases.len
+    let objTypeLen: int32 = mod.objTypes.len
+    let ptrKey: int64 = int64(rawmemAsVoid(name))
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let rawPtr: int32 = hashmaps.hashMapPtrIntGet(uirCore_moduleHasName_ptr_index, ptrKey, foundPtr)
+        let idxPtr: int32 = rawPtr - 1
+        if foundPtr && idxPtr >= 0 && idxPtr < uirCore_moduleHasName_ready.len &&
+           uirCore_moduleHasName_ready[idxPtr] == int8(1) &&
+           uirCore_moduleHasName_globalsLens[idxPtr] == globalsLen &&
+           uirCore_moduleHasName_typeAliasLens[idxPtr] == typeAliasLen &&
+           uirCore_moduleHasName_objTypeLens[idxPtr] == objTypeLen:
+            return uirCore_moduleHasName_values[idxPtr] == int8(1)
+    let out: bool =
+        moduleHasGlobal(mod, name) ||
+        uirCoreFindTypeAlias(mod, name) >= 0 ||
+        uirCoreFindObjType(mod, name) >= 0
+    if ptrKey != 0:
+        var foundWrite: bool = false
+        let rawWrite: int32 = hashmaps.hashMapPtrIntGet(uirCore_moduleHasName_ptr_index, ptrKey, foundWrite)
+        var idxWrite: int32 = rawWrite - 1
+        if !foundWrite || idxWrite < 0:
+            idxWrite = uirCore_moduleHasName_ready.len
+            uirCoreModuleHasNameCacheEnsureIndex(idxWrite)
+            hashmaps.hashMapPtrIntPut(uirCore_moduleHasName_ptr_index, ptrKey, idxWrite + 1)
+        else:
+            uirCoreModuleHasNameCacheEnsureIndex(idxWrite)
+        uirCore_moduleHasName_ready[idxWrite] = int8(1)
+        uirCore_moduleHasName_values[idxWrite] = out ? int8(1) : int8(0)
+        uirCore_moduleHasName_globalsLens[idxWrite] = globalsLen
+        uirCore_moduleHasName_typeAliasLens[idxWrite] = typeAliasLen
+        uirCore_moduleHasName_objTypeLens[idxWrite] = objTypeLen
+    return out
 
-fn uirCoreModuleFuncSameOriginIndex(mod: UirCoreModule, fnName: str, fnOriginFile: str): int32 =
+fn uirCoreFuncNameStableForPredeclare(mod: UirCoreModule, idx: int32, f: UirCoreFunc): str =
+    if uirCorePredeclareMetaEnsureIndex(mod, idx, f):
+        return uirCore_predeclareMeta_names[idx]
+    let dynName: str = uirCoreFuncNameOf(f)
+    if len(dynName) > 0:
+        return dynName
+    let funcObj: UirCoreFuncObj* = uirCoreFuncObjPtr(f)
+    if funcObj != nil && len(funcObj->name) > 0:
+        return funcObj->name
+    return ""
+
+fn uirCoreFuncOriginNormStableForPredeclare(mod: UirCoreModule, idx: int32, f: UirCoreFunc): str =
+    if uirCorePredeclareMetaEnsureIndex(mod, idx, f):
+        return uirCore_predeclareMeta_originNorms[idx]
+    let dynOrigin: str = uirCoreFuncOriginFileOf(f)
+    if len(dynOrigin) > 0:
+        return uirCoreNormalizeTopLevelPath(dynOrigin, "")
+    let funcObj: UirCoreFuncObj* = uirCoreFuncObjPtr(f)
+    if funcObj != nil && len(funcObj->originFile) > 0:
+        return uirCoreNormalizeTopLevelPath(funcObj->originFile, "")
+    return ""
+
+fn uirCoreFuncDeclOrdinalStableForPredeclare(mod: UirCoreModule, idx: int32, f: UirCoreFunc): int32 =
+    if uirCorePredeclareMetaEnsureIndex(mod, idx, f):
+        return uirCore_predeclareMeta_declOrdinals[idx]
+    let dynDecl: int32 = uirCoreFuncDeclOrdinalOf(f)
+    if dynDecl >= 0:
+        return dynDecl
+    let funcObj: UirCoreFuncObj* = uirCoreFuncObjPtr(f)
+    if funcObj != nil && funcObj->declOrdinal >= 0:
+        return funcObj->declOrdinal
+    return -1
+
+fn uirCoreFuncSourceAstIndexStableForPredeclare(mod: UirCoreModule, idx: int32,
+                                                f: UirCoreFunc): int32 =
+    if uirCorePredeclareMetaEnsureIndex(mod, idx, f):
+        return uirCore_predeclareMeta_sourceAstIndices[idx]
+    let dynSource: int32 = uirCoreFuncSourceAstIndexOf(f)
+    if dynSource >= 0:
+        return dynSource
+    let funcObj: UirCoreFuncObj* = uirCoreFuncObjPtr(f)
+    if funcObj != nil && funcObj->sourceAstIndex >= 0:
+        return funcObj->sourceAstIndex
+    return -1
+
+fn uirCoreFuncMatchesRoutineKeyNormalized(mod: UirCoreModule, idx: int32, f: UirCoreFunc,
+                                          fnName: str, fnOriginNorm: str,
+                                          declOrdinal: int32,
+                                          sourceAstIndex: int32 = -1): bool =
+    if f == nil || len(fnName) == 0:
+        return false
+    if uirCoreFuncNameStableForPredeclare(mod, idx, f) != fnName:
+        return false
+    let exSourceAstIndex: int32 = uirCoreFuncSourceAstIndexStableForPredeclare(mod, idx, f)
+    let exOriginFile: str = uirCoreFuncOriginNormStableForPredeclare(mod, idx, f)
+    let sameOriginFile: bool = exOriginFile == fnOriginNorm
+    let weakOriginMatch: bool = len(exOriginFile) == 0 || len(fnOriginNorm) == 0 ||
+                                !uirCorePathLooksCanonical(exOriginFile) ||
+                                !uirCorePathLooksCanonical(fnOriginNorm)
+    let placeholderMatch: bool = (uirCoreFuncBlocksLen(f) == 0) &&
+                                 (weakOriginMatch || sameOriginFile)
+    if sourceAstIndex >= 0 && exSourceAstIndex >= 0:
+        if exSourceAstIndex == sourceAstIndex:
+            return true
+        if placeholderMatch:
+            return true
+    let exDeclOrdinal: int32 = uirCoreFuncDeclOrdinalStableForPredeclare(mod, idx, f)
+    if weakOriginMatch:
+        if declOrdinal >= 0 && exDeclOrdinal >= 0 && exDeclOrdinal == declOrdinal:
+            return true
+        if sourceAstIndex >= 0 && exSourceAstIndex >= 0 && exSourceAstIndex == sourceAstIndex:
+            return true
+    if !sameOriginFile:
+        # Predeclare/importc placeholders may not carry origin metadata yet.
+        # Treat same-name zero-block placeholders as replaceable by the later
+        # fully lowered routine from the current file.
+        if !placeholderMatch:
+            return false
+    if declOrdinal >= 0 && exDeclOrdinal >= 0:
+        if placeholderMatch:
+            return true
+        return exDeclOrdinal == declOrdinal
+    if sourceAstIndex >= 0 && exSourceAstIndex >= 0:
+        if placeholderMatch:
+            return true
+        return false
+    return true
+
+fn uirCoreFuncMatchesRoutineKey(f: UirCoreFunc, fnName: str, fnOriginFile: str,
+                                declOrdinal: int32,
+                                sourceAstIndex: int32 = -1): bool =
+    let fnOriginNorm: str = uirCoreNormalizeTopLevelPath(fnOriginFile, "")
+    return uirCoreFuncMatchesRoutineKeyNormalized(nil, -1, f, fnName, fnOriginNorm,
+                                                  declOrdinal, sourceAstIndex)
+
+fn uirCoreFuncMatchesSameOriginSignature(existing: UirCoreFunc,
+                                         candidate: UirCoreFunc): bool =
+    if existing == nil || candidate == nil:
+        return false
+    let exName: str = uirCoreFuncNameOf(existing)
+    let candName: str = uirCoreFuncNameOf(candidate)
+    if len(exName) == 0 || exName != candName:
+        return false
+    let exOrigin: str = uirCoreNormalizeTopLevelPath(uirCoreFuncOriginFileOf(existing), "")
+    let candOrigin: str = uirCoreNormalizeTopLevelPath(uirCoreFuncOriginFileOf(candidate), "")
+    if len(exOrigin) == 0 || exOrigin != candOrigin:
+        return false
+    if uirCoreFuncIsExtern(existing) != uirCoreFuncIsExtern(candidate):
+        return false
+    let exLinkName: str = backendStripSpaces(uirCoreFuncLinkNameOf(existing))
+    let candLinkName: str = backendStripSpaces(uirCoreFuncLinkNameOf(candidate))
+    if len(exLinkName) > 0 && len(candLinkName) > 0 && exLinkName != candLinkName:
+        return false
+    let exRetKey: str = backendStripSpaces(uirCoreFuncRetTypeKeyOf(existing))
+    let candRetKey: str = backendStripSpaces(uirCoreFuncRetTypeKeyOf(candidate))
+    if len(exRetKey) > 0 && len(candRetKey) > 0 && exRetKey != candRetKey:
+        return false
+    let exRetTy: UirCoreType = uirCoreFuncRetTypeOf(existing)
+    let candRetTy: UirCoreType = uirCoreFuncRetTypeOf(candidate)
+    if exRetTy.kind != candRetTy.kind || exRetTy.isUnsigned != candRetTy.isUnsigned:
+        return false
+    let exParamCount: int32 = uirCoreFuncParamsLen(existing)
+    let candParamCount: int32 = uirCoreFuncParamsLen(candidate)
+    if exParamCount != candParamCount:
+        return false
+    for i in 0..<exParamCount:
+        let exParam: UirCoreParam = uirCoreFuncParamAt(existing, i)
+        let candParam: UirCoreParam = uirCoreFuncParamAt(candidate, i)
+        let exParamKey: str = backendStripSpaces(uirCoreParamTypeKeyOf(exParam))
+        let candParamKey: str = backendStripSpaces(uirCoreParamTypeKeyOf(candParam))
+        if len(exParamKey) > 0 && len(candParamKey) > 0 && exParamKey != candParamKey:
+            return false
+        let exParamTy: UirCoreType = uirCoreParamTypeOf(exParam)
+        let candParamTy: UirCoreType = uirCoreParamTypeOf(candParam)
+        if exParamTy.kind != candParamTy.kind || exParamTy.isUnsigned != candParamTy.isUnsigned:
+            return false
+    return true
+
+fn uirCoreModuleFuncSameOriginIndex(mod: UirCoreModule, fnName: str, fnOriginFile: str,
+                                    declOrdinal: int32 = -1,
+                                    sourceAstIndex: int32 = -1): int32 =
+    if mod == nil || len(fnName) == 0:
+        return -1
+    uirCorePredeclareMetaEnsure(mod)
+    let fnOriginNorm: str = uirCoreNormalizeTopLevelPath(fnOriginFile, "")
     let exIdx: int32 = moduleFuncIndex(mod, fnName)
-    if exIdx < 0:
-        return -1
-    let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
-    if ex == nil:
-        return -1
-    if uirCoreFuncOriginFileOf(ex) != fnOriginFile:
-        return -1
-    return exIdx
+    if exIdx >= 0 && exIdx < uirCoreModuleFuncsLen(mod):
+        let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
+        let matched: bool = uirCoreFuncMatchesRoutineKeyNormalized(mod, exIdx, ex, fnName, fnOriginNorm,
+                                                                   declOrdinal, sourceAstIndex)
+        if envIsTrue "BACKEND_DEBUG_ROUTINE_KEY":
+            let cachedName: str = uirCorePredeclareMetaEnsureIndex(mod, exIdx, ex) ? uirCore_predeclareMeta_names[exIdx] : ""
+            let cachedOrigin: str = uirCorePredeclareMetaEnsureIndex(mod, exIdx, ex) ? uirCore_predeclareMeta_originNorms[exIdx] : ""
+            let cachedDecl: int32 = uirCorePredeclareMetaEnsureIndex(mod, exIdx, ex) ? uirCore_predeclareMeta_declOrdinals[exIdx] : -1
+            let cachedSource: int32 = uirCorePredeclareMetaEnsureIndex(mod, exIdx, ex) ? uirCore_predeclareMeta_sourceAstIndices[exIdx] : -1
+            os.writeLine(os.get_stderr(),
+                         "[backend] routine_key fn=" + fnName +
+                         " cur_origin=" + fnOriginNorm +
+                         " cur_decl=" + intToStr(declOrdinal) +
+                         " cur_ast=" + intToStr(sourceAstIndex) +
+                         " ex_idx=" + intToStr(exIdx) +
+                         " ex_name=" + cachedName +
+                         " ex_origin=" + cachedOrigin +
+                         " ex_decl=" + intToStr(cachedDecl) +
+                         " ex_ast=" + intToStr(cachedSource) +
+                         " matched=" + (matched ? "1" : "0"))
+            os.c_fflush(os.get_stderr())
+        if matched:
+            return exIdx
+    return -1
 
 fn uirCoreTraceFoundMainSet(marker: str) =
     if envIsTrue "BACKEND_DEBUG_STAGE1_PIPE":
@@ -144,7 +638,7 @@ fn uirCoreTopLevelRoutineFuncIndexHint(mod: UirCoreModule, nId: AstNodeId,
     let fnName: str = uirCoreTopLevelRoutineNameId(nId)
     if len(fnName) == 0:
         return -1
-    return uirCoreModuleFuncSameOriginIndex(mod, fnName, callFilePath)
+    return uirCoreModuleFuncSameOriginIndex(mod, fnName, callFilePath, astNodeDeclOrdinal(nId), astNodeIndex(nId))
 
 fn uirCorePrepareTopLevelRoutineTaskFromRootId(mod: UirCoreModule, rootId: AstNodeId,
                                                filePath: str, nId: AstNodeId,
@@ -155,7 +649,7 @@ fn uirCorePrepareTopLevelRoutineTaskFromRootId(mod: UirCoreModule, rootId: AstNo
     let nKind: NodeKind = astNodeKind(nId)
     if nKind != nkFnDecl && nKind != nkIteratorDecl:
         return Ok_UirFnTask(nil)
-    let callFilePath: str = uirCoreNormalizeTopLevelPath(filePath, astNodeStrVal(rootId))
+    let callFilePath: str = uirCoreResolveCallFilePath(rootId, filePath)
     if !uirCoreTopLevelRoutineKeepByReachable(nId, callFilePath, reachable, false):
         return Ok_UirFnTask(nil)
     if uirCoreFuncSigHasUnresolvedGenericsId(nId):
@@ -178,17 +672,31 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
                                     f: UirCoreFunc): Result[bool] =
     if f == nil:
         return Ok[bool](false)
+    let dbgMerge: bool = envIsTrue "BACKEND_DEBUG_BOOT"
     let fnName: str = uirCoreFuncNameOf(f)
     let fnOriginFile: str = uirCoreFuncOriginFileOf(f)
+    let fnOriginNorm: str = uirCoreNormalizeTopLevelPath(fnOriginFile, "")
+    let fnDeclOrdinal: int32 = uirCoreFuncDeclOrdinalOf(f)
+    let fnSourceAstIndex: int32 = uirCoreFuncSourceAstIndexOf(f)
+    if fnName == "toString" || uirCoreStrStartsWith(fnName, "toString__cheng"):
+        let fDbgToString: os.File = os.get_stderr()
+        os.write(fDbgToString, "[backend] toString_merge_enter fn=")
+        os.write(fDbgToString, fnName)
+        os.write(fDbgToString, " origin=")
+        os.writeLine(fDbgToString, fnOriginFile)
+        os.c_fflush fDbgToString
     if envIsTrue "BACKEND_DEBUG_STAGE1_PIPE" && uirCoreIsEntryFilePath(fnOriginFile):
         let fDbgEntryFn: os.File = os.get_stderr()
-        os.writeLine(fDbgEntryFn, "[backend] stage1: entry_fn_name=" + fnName)
+        os.write(fDbgEntryFn, "[backend] stage1: entry_fn_name=")
+        os.writeLine(fDbgEntryFn, fnName)
         os.c_fflush fDbgEntryFn
-    let sameFileIdx: int32 = uirCoreModuleFuncSameOriginIndex(mod, fnName, fnOriginFile)
+    let sameFileIdx: int32 = uirCoreModuleFuncSameOriginIndex(mod, fnName, fnOriginFile, fnDeclOrdinal, fnSourceAstIndex)
     if sameFileIdx >= 0:
         let ex2: UirCoreFunc = uirCoreModuleFuncAt(mod, sameFileIdx)
         if ex2 == nil || uirCoreFuncBlocksLen(ex2) == 0:
             uirCoreModuleSetFuncAt(mod, sameFileIdx, f)
+            uirCorePredeclareMetaRefreshFuncAt(mod, sameFileIdx, f, fnName, fnOriginNorm,
+                                               fnDeclOrdinal, fnSourceAstIndex)
             if fnName == "main":
                 if ctx != nil && ctx.foundMain:
                     return Err[bool]("uirCore_builder: multiple main functions")
@@ -198,15 +706,94 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
             if ctx != nil && ctx.traceEnabled:
                 ctx.traceFnCount = ctx.traceFnCount + 1
                 if (ctx.traceFnCount % 50) == 0:
-                    stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + fnName)
+                    stage1Trace("backend: uir funcs milestone")
             return Ok[bool](true)
+        if uirCoreFuncMatchesRoutineKeyNormalized(mod, sameFileIdx, ex2, fnName, fnOriginNorm,
+                                                  fnDeclOrdinal, fnSourceAstIndex):
+            return Ok[bool](false)
+        if uirCoreFuncMatchesSameOriginSignature(ex2, f):
+            return Ok[bool](false)
+        if dbgMerge:
+            let exOrigin2: str = (ex2 != nil) ? uirCoreFuncOriginFileOf(ex2) : ""
+            let exBlocks2: int32 = (ex2 != nil) ? uirCoreFuncBlocksLen(ex2) : -1
+            let fDbgMerge2: os.File = os.get_stderr()
+            os.write(fDbgMerge2, "[backend] merge_dup_same_file fn=")
+            os.write(fDbgMerge2, fnName)
+            os.write(fDbgMerge2, " origin=")
+            os.write(fDbgMerge2, fnOriginFile)
+            os.write(fDbgMerge2, " idx=")
+            os.write(fDbgMerge2, intToStr(sameFileIdx))
+            os.write(fDbgMerge2, " ex_origin=")
+            os.write(fDbgMerge2, exOrigin2)
+            os.write(fDbgMerge2, " ex_blocks=")
+            os.writeLine(fDbgMerge2, intToStr(exBlocks2))
+            os.c_fflush fDbgMerge2
         if uirCoreSkipSemStdDuplicateRelaxEnabled():
             return Ok[bool](false)
-        return Err[bool]("uirCore_builder: duplicate function name: " + fnName)
-    if moduleHasFunc(mod, fnName) || uirCoreModuleHasGlobalOrTypeName(mod, fnName):
+        return Err[bool]("uirCore_builder: duplicate function name")
+    let exIdx3: int32 = moduleFuncIndex(mod, fnName)
+    if exIdx3 >= 0 || uirCoreModuleHasGlobalOrTypeName(mod, fnName):
+        if exIdx3 >= 0:
+            let ex3Replace: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx3)
+            if ex3Replace != nil:
+                let ex3OriginNorm: str = uirCoreFuncOriginNormStableForPredeclare(mod, exIdx3, ex3Replace)
+                let ex3DeclOrdinal: int32 = uirCoreFuncDeclOrdinalStableForPredeclare(mod, exIdx3, ex3Replace)
+                let ex3SourceAstIndex: int32 = uirCoreFuncSourceAstIndexStableForPredeclare(mod, exIdx3, ex3Replace)
+                let ex3WeakOriginMatch: bool = len(ex3OriginNorm) == 0 || len(fnOriginNorm) == 0 ||
+                                               !uirCorePathLooksCanonical(ex3OriginNorm) ||
+                                               !uirCorePathLooksCanonical(fnOriginNorm)
+                let ex3SameOriginFile: bool = ex3OriginNorm == fnOriginNorm
+                let ex3SameSourceKey: bool =
+                    (fnSourceAstIndex >= 0 && ex3SourceAstIndex >= 0 && fnSourceAstIndex == ex3SourceAstIndex) ||
+                    (fnDeclOrdinal >= 0 && ex3DeclOrdinal >= 0 && fnDeclOrdinal == ex3DeclOrdinal)
+                let ex3RoutineMatch: bool = uirCoreFuncMatchesRoutineKeyNormalized(
+                    mod, exIdx3, ex3Replace, fnName, fnOriginNorm, fnDeclOrdinal, fnSourceAstIndex)
+                let ex3SigMatch: bool = uirCoreFuncMatchesSameOriginSignature(ex3Replace, f)
+                let ex3PlaceholderReplaceOk: bool =
+                    uirCoreFuncBlocksLen(ex3Replace) == 0 &&
+                    (ex3RoutineMatch || ex3SigMatch ||
+                     (ex3SameSourceKey && (ex3SameOriginFile || ex3WeakOriginMatch)))
+                if ex3PlaceholderReplaceOk:
+                    uirCoreModuleSetFuncAt(mod, exIdx3, f)
+                    uirCorePredeclareMetaRefreshFuncAt(mod, exIdx3, f, fnName, fnOriginNorm,
+                                                       fnDeclOrdinal, fnSourceAstIndex)
+                    if fnName == "main":
+                        if ctx != nil && ctx.foundMain:
+                            return Err[bool]("uirCore_builder: multiple main functions")
+                        if ctx != nil:
+                            ctx.foundMain = true
+                            uirCoreTraceFoundMainSet("[backend] stage1: found_main_set_replace_global")
+                    if ctx != nil && ctx.traceEnabled:
+                        ctx.traceFnCount = ctx.traceFnCount + 1
+                        if (ctx.traceFnCount % 50) == 0:
+                            stage1Trace("backend: uir funcs milestone")
+                    return Ok[bool](true)
+                if ex3RoutineMatch || ex3SigMatch ||
+                   (ex3SameSourceKey && (ex3SameOriginFile || ex3WeakOriginMatch)):
+                    return Ok[bool](false)
+        if dbgMerge:
+            var exOrigin3: str = ""
+            var exBlocks3: int32 = -1
+            if exIdx3 >= 0:
+                let ex3: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx3)
+                if ex3 != nil:
+                    exOrigin3 = uirCoreFuncOriginFileOf(ex3)
+                    exBlocks3 = uirCoreFuncBlocksLen(ex3)
+            let fDbgMerge3: os.File = os.get_stderr()
+            os.write(fDbgMerge3, "[backend] merge_dup_global fn=")
+            os.write(fDbgMerge3, fnName)
+            os.write(fDbgMerge3, " origin=")
+            os.write(fDbgMerge3, fnOriginFile)
+            os.write(fDbgMerge3, " ex_idx=")
+            os.write(fDbgMerge3, intToStr(exIdx3))
+            os.write(fDbgMerge3, " ex_origin=")
+            os.write(fDbgMerge3, exOrigin3)
+            os.write(fDbgMerge3, " ex_blocks=")
+            os.writeLine(fDbgMerge3, intToStr(exBlocks3))
+            os.c_fflush fDbgMerge3
         if uirCoreSkipSemStdDuplicateRelaxEnabled():
             return Ok[bool](false)
-        return Err[bool]("uirCore_builder: duplicate function name: " + fnName)
+        return Err[bool]("uirCore_builder: duplicate function name")
     if fnName == "main":
         if ctx != nil && ctx.foundMain:
             return Err[bool]("uirCore_builder: multiple main functions")
@@ -217,7 +804,7 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
     if ctx != nil && ctx.traceEnabled:
         ctx.traceFnCount = ctx.traceFnCount + 1
         if (ctx.traceFnCount % 50) == 0:
-            stage1Trace("backend: uir funcs=" + intToStr(ctx.traceFnCount) + " last=" + fnName)
+            stage1Trace("backend: uir funcs milestone")
     return Ok[bool](true)
 
 fn uirCoreExecuteFnTask(mod: UirCoreModule, task: UirFnTask,
@@ -311,23 +898,49 @@ fn uirCorePredeclareTopLevelRoutineId(mod: UirCoreModule, nId: AstNodeId,
     if f == nil:
         return Ok[bool](false)
     let fnName: str = uirCoreFuncNameOf(f)
-    let fnOriginFile: str = uirCoreFuncOriginFileOf(f)
-    let sameFileIdx: int32 = uirCoreModuleFuncSameOriginIndex(mod, fnName, fnOriginFile)
+    let fnOriginFile: str = callFilePath
+    let fnDeclOrdinal: int32 = astNodeDeclOrdinal(nId)
+    let fnSourceAstIndex: int32 = astNodeIndex(nId)
+    let sameFileIdx: int32 = uirCoreModuleFuncSameOriginIndex(mod, fnName, fnOriginFile, fnDeclOrdinal, fnSourceAstIndex)
     if sameFileIdx >= 0:
         return Ok[bool](false)
-    if moduleHasFunc(mod, fnName) || uirCoreModuleHasGlobalOrTypeName(mod, fnName):
+    let exIdx: int32 = moduleFuncIndex(mod, fnName)
+    if exIdx >= 0 || uirCoreModuleHasGlobalOrTypeName(mod, fnName):
+        if exIdx >= 0:
+            let exSameFile: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
+            if uirCoreFuncMatchesSameOriginSignature(exSameFile, f):
+                return Ok[bool](false)
+        if envIsTrue "BACKEND_DEBUG_BOOT":
+            if exIdx >= 0:
+                let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
+                var exOrigin: str = ""
+                var exDeclOrdinal: int32 = -1
+                var exSourceAstIndex: int32 = -1
+                if ex != nil:
+                    exOrigin = uirCoreFuncOriginFileOf(ex)
+                    exDeclOrdinal = uirCoreFuncDeclOrdinalOf(ex)
+                    exSourceAstIndex = uirCoreFuncSourceAstIndexOf(ex)
+                os.writeLine(os.get_stderr(),
+                             "[backend] predeclare_dup fn=" + fnName +
+                             " cur_origin=" + fnOriginFile +
+                             " cur_decl=" + intToStr(fnDeclOrdinal) +
+                             " cur_ast=" + intToStr(fnSourceAstIndex) +
+                             " ex_origin=" + exOrigin +
+                             " ex_decl=" + intToStr(exDeclOrdinal) +
+                             " ex_ast=" + intToStr(exSourceAstIndex))
+                os.c_fflush(os.get_stderr())
         if uirCoreSkipSemStdDuplicateRelaxEnabled():
             return Ok[bool](false)
         var prevFile: str = ""
-        let exIdx: int32 = moduleFuncIndex(mod, fnName)
         if exIdx >= 0:
             let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
             if ex != nil:
                 prevFile = uirCoreFuncOriginFileOf(ex)
-        if len(prevFile) > 0:
-            return Err[bool]("uirCore_builder: duplicate function name: " + fnName + " (files: " + prevFile + ", " + fnOriginFile + ")")
-        return Err[bool]("uirCore_builder: duplicate function name: " + fnName + " (file: " + fnOriginFile + ")")
-    uirCoreAddFunc(mod, f)
+        let _prevFileUnused: str = prevFile
+        return Err[bool]("uirCore_builder: duplicate function name")
+    uirCoreAppendFuncPtr(&mod.funcs, f)
+    uirCorePredeclareMetaPutAt(mod, uirCoreModuleFuncsLen(mod) - 1, f, fnName,
+                               fnOriginFile, fnDeclOrdinal, fnSourceAstIndex)
     return Ok[bool](true)
 
 fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, rootId: AstNodeId, filePath: str, nId: AstNodeId,
@@ -335,19 +948,21 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
                                     overloaded: hashsets.HashSetStr* = nil): Result[bool] =
     if !astNodeIdValid(nId) || astNodeKind(nId) == nkEmpty:
         return Ok[bool](false)
-    let callFilePath: str = uirCoreNormalizeTopLevelPath(filePath, astNodeStrVal(rootId))
+    let callFilePath: str = uirCoreResolveCallFilePath(rootId, filePath)
     let nKind: NodeKind = astNodeKind(nId)
     if nKind == nkStmtList || nKind == nkModule:
         let fallback: str = callFilePath
         for j in 0..<astKidCount(nId):
             let nnId: AstNodeId = astKidAt(nId, j)
-            let ownPath: str = astNodeStrVal(nnId)
-            let stmtPath: str = uirCoreNormalizeTopLevelPath(ownPath, fallback)
+            let ownPathId: int32 = astNodeStrValId(nnId)
+            let ownPathNorm: str = uirCoreNormalizeTopLevelPathTextId(ownPathId)
+            let stmtPath: str = (len(ownPathNorm) > 0) ? ownPathNorm : fallback
             let res: Result[bool] = uirCoreConsumeTopLevelFromRootId(mod, ctx, rootId, stmtPath, nnId, reachable, overloaded)
             if !IsOk[bool](res):
                 return res
         return Ok[bool](true)
     if nKind == nkVar || nKind == nkLet || nKind == nkConst:
+        let dbgTopGlobal: bool = envIsTrue "BACKEND_DEBUG_TOP_GLOBAL"
         var patId: AstNodeId = astInvalidNodeId()
         if astKidCount(nId) > 0:
             patId = astKidAt(nId, 0)
@@ -362,7 +977,19 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
             nameNodeId = astKidAt(patId, 0)
             if astKidCount(patId) > 1:
                 typeNodeId = astKidAt(patId, 1)
+        if dbgTopGlobal:
+            os.writeLine(os.get_stderr(),
+                         "[backend] top_global_raw file=" + callFilePath +
+                         " kind=nk#" + intToStr(int32(nKind)) +
+                         " patKind=nk#" + intToStr(astNodeIdValid(patId) ? int32(astNodeKind(patId)) : -1) +
+                         " nameKind=nk#" + intToStr(astNodeIdValid(nameNodeId) ? int32(astNodeKind(nameNodeId)) : -1) +
+                         " line=" + intToStr(astNodePosLine(nId)) +
+                         " col=" + intToStr(astNodePosCol(nId)))
+            os.c_fflush(os.get_stderr())
         if !astNodeIdValid(nameNodeId) || (astNodeKind(nameNodeId) != nkIdent && astNodeKind(nameNodeId) != nkSymbol):
+            if dbgTopGlobal:
+                os.writeLine(os.get_stderr(), "[backend] top_global_fail reason=bad_name_node")
+                os.c_fflush(os.get_stderr())
             return Err[bool]("uirCore_builder: global expects identifier")
         let rawName: str = backendStripSpaces(astPlainName(nameNodeId))
         let name: str = uirCoreMaybeMangleDupGlobalName(rawName, callFilePath)
@@ -382,6 +1009,15 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
             # Stage0 compatibility: treat any synthetic "<...>" origin as predecl placeholder.
             if !allowDupGlobal && len(prevOrigin0) > 0 && prevOrigin0[0] == '<':
                 allowDupGlobal = true
+        if dbgTopGlobal:
+            let prevOriginDbg: str = (existingGi >= 0) ? uirCoreGlobalOriginFileOf(uirCoreModuleGlobalAt(mod, existingGi)) : ""
+            os.writeLine(os.get_stderr(),
+                         "[backend] top_global_state name=" + name +
+                         " raw=" + rawName +
+                         " existingGi=" + intToStr(existingGi) +
+                         " allowDup=" + (allowDupGlobal ? "1" : "0") +
+                         " prevOrigin=" + prevOriginDbg)
+            os.c_fflush(os.get_stderr())
         var declType: UirCoreType = uirCoreTypeFromNodeWithModule(mod, typeNodeId)
         var objTypeName: str = ""
         var objTypeNodeId: AstNodeId = typeNodeId
@@ -457,6 +1093,12 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
                 # Treat same-origin duplicates as idempotent instead of hard-failing.
                 if len(prevFile) > 0 && prevFile == callFilePath:
                     return Ok[bool](false)
+            if dbgTopGlobal:
+                os.writeLine(os.get_stderr(),
+                             "[backend] top_global_fail reason=duplicate name=" + name +
+                             " prev=" + prevFile +
+                             " cur=" + callFilePath + ":" + line0 + ":" + col0)
+                os.c_fflush(os.get_stderr())
             return Err[bool]("uirCore_builder: duplicate global name: " + name +
                              " (prev=" + prevFile + " cur=" + callFilePath + ":" + line0 + ":" + col0 + ")")
 
@@ -551,14 +1193,15 @@ fn uirCorePredeclareTopLevelFromRootId(mod: UirCoreModule, rootId: AstNodeId, fi
                                        overloaded: hashsets.HashSetStr* = nil): Result[bool] =
     if mod == nil || !astNodeIdValid(nId) || astNodeKind(nId) == nkEmpty:
         return Ok[bool](false)
-    let callFilePath: str = uirCoreNormalizeTopLevelPath(filePath, astNodeStrVal(rootId))
+    let callFilePath: str = uirCoreResolveCallFilePath(rootId, filePath)
     let nKind: NodeKind = astNodeKind(nId)
     if nKind == nkStmtList || nKind == nkModule:
         let fallback: str = callFilePath
         for j in 0..<astKidCount(nId):
             let nnId: AstNodeId = astKidAt(nId, j)
-            let ownPath: str = astNodeStrVal(nnId)
-            let stmtPath: str = uirCoreNormalizeTopLevelPath(ownPath, fallback)
+            let ownPathId: int32 = astNodeStrValId(nnId)
+            let ownPathNorm: str = uirCoreNormalizeTopLevelPathTextId(ownPathId)
+            let stmtPath: str = (len(ownPathNorm) > 0) ? ownPathNorm : fallback
             let res: Result[bool] = uirCorePredeclareTopLevelFromRootId(mod, rootId, stmtPath, nnId, reachable, overloaded)
             if !IsOk[bool](res):
                 return res

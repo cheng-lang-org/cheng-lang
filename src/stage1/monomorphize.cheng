@@ -5,6 +5,7 @@ import std/seqs
 import std/hashmaps
 import std/monotimes
 import std/os
+import std/system
 import stage1/ast
 import stage1/diagnostics
 import stage1/lexer
@@ -76,8 +77,11 @@ var typeKeyNs: int64
 var monoTypeKeyIndex: int32[]
 var monoTypeKeyValues: str[]
 var monoTypeKeyValueIndex: hashmaps.HashMapStrInt
+var monoTypeKeyPtrIndex: hashmaps.HashMapPtrInt
 var monoTypeLeafKeyReady: int8[]
 var monoTypeLeafKeyValues: str[]
+var monoTypeLeafTextReady: int8[]
+var monoTypeLeafTextValues: str[]
 var monoTypeNodeIndex: hashmaps.HashMapStrInt
 var monoTypeNodeValues: Node[]
 var monoTypeKeyValidIndex: hashmaps.HashMapStrInt
@@ -102,8 +106,10 @@ var monoTypeMatchesNs: int64
 var stripSpacesCalls: int32
 var stripSpacesNs: int64
 var monoStripIndex: hashmaps.HashMapStrInt
+var monoStripPtrIndex: hashmaps.HashMapPtrInt
 var monoStripValues: str[]
 var monoSanitizeIndex: hashmaps.HashMapStrInt
+var monoSanitizePtrIndex: hashmaps.HashMapPtrInt
 var monoSanitizeValues: str[]
 var monoUnderscoreIndex: hashmaps.HashMapStrInt
 var monoLambdaCaptureIndex: hashmaps.HashMapPtrInt
@@ -192,11 +198,17 @@ fn monoEnsureInitMaps() =
     if monoTypeKeyValidIndex.mask == 0:
         monoTypeKeyValidIndex = hashmaps.hashMapStrIntInit(256)
     if monoTypeKeyValueIndex.mask == 0:
-        monoTypeKeyValueIndex = hashmaps.hashMapStrIntInit(2048)
+        monoTypeKeyValueIndex = hashmaps.hashMapStrIntInit(32768)
+    if monoTypeKeyPtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(monoTypeKeyPtrIndex, 32768)
     if monoStripIndex.mask == 0:
-        monoStripIndex = hashmaps.hashMapStrIntInit(2048)
+        monoStripIndex = hashmaps.hashMapStrIntInit(8192)
+    if monoStripPtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(monoStripPtrIndex, 8192)
     if monoSanitizeIndex.mask == 0:
-        monoSanitizeIndex = hashmaps.hashMapStrIntInit(2048)
+        monoSanitizeIndex = hashmaps.hashMapStrIntInit(8192)
+    if monoSanitizePtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(monoSanitizePtrIndex, 8192)
     if monoUnderscoreIndex.mask == 0:
         monoUnderscoreIndex = hashmaps.hashMapStrIntInit(2048)
     if monoZeroArgFnIndex.mask == 0:
@@ -257,6 +269,12 @@ fn monoStrEq(a: str, b: str): bool =
 
 fn monoStrNe(a: str, b: str): bool =
     return a != b
+
+fn monoStrPtrKey(s: str): int64 =
+    let raw: void* = rawmemAsVoid(s)
+    if raw == nil:
+        return 0
+    return int64(raw)
 
 fn monoNodeEq(a: Node, b: Node): bool =
     return a == b
@@ -2281,9 +2299,17 @@ fn monoStripSpaces(s: str): str =
     let n: int32 = len s
     if n > 0 && s[0] != ' ' && s[n - 1] != ' ':
         return s
+    let ptrKey: int64 = monoStrPtrKey(s)
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let cachedIdxPtr: int32 = hashmaps.hashMapPtrIntGet(monoStripPtrIndex, ptrKey, foundPtr)
+        if foundPtr && cachedIdxPtr > 0 && cachedIdxPtr <= monoStripValues.len:
+            return get(monoStripValues, cachedIdxPtr - 1)
     var cached: bool = false
     let cachedIdx: int32 = hashmaps.hashMapStrIntGetEx(monoStripIndex, s, cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoStripValues.len:
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(monoStripPtrIndex, ptrKey, cachedIdx)
         return get(monoStripValues, cachedIdx - 1)
     let profOn: bool = monoProfileActive
     var startNs: int64 = 0
@@ -2299,6 +2325,8 @@ fn monoStripSpaces(s: str): str =
         add(monoStripValues, emptyRes)
         let storedIdx: int32 = monoStripValues.len
         hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx)
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(monoStripPtrIndex, ptrKey, storedIdx)
         return emptyRes
     var a: int32 = 0
     var b: int32 = n - 1
@@ -2316,12 +2344,16 @@ fn monoStripSpaces(s: str): str =
         add(monoStripValues, emptyRes2)
         let storedIdx2: int32 = monoStripValues.len
         hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx2)
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(monoStripPtrIndex, ptrKey, storedIdx2)
         return emptyRes2
     if a == 0 && b == n - 1:
         trackLexStringStr(s)
         add(monoStripValues, s)
         let storedIdx3: int32 = monoStripValues.len
         hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx3)
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(monoStripPtrIndex, ptrKey, storedIdx3)
         return s
     let count: int32 = b - a + 1
     let res: str = strings.sliceBytes(s, a, count)
@@ -2329,6 +2361,8 @@ fn monoStripSpaces(s: str): str =
     add(monoStripValues, res)
     let storedIdx4: int32 = monoStripValues.len
     hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx4)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(monoStripPtrIndex, ptrKey, storedIdx4)
     return res
 
 fn nextLambdaName(): str =
@@ -2616,9 +2650,17 @@ fn sanitizeKey(s: str): str =
             break
     if !needsSanitize:
         return s
+    let ptrKey: int64 = monoStrPtrKey(s)
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let cachedIdxPtr: int32 = hashmaps.hashMapPtrIntGet(monoSanitizePtrIndex, ptrKey, foundPtr)
+        if foundPtr && cachedIdxPtr > 0 && cachedIdxPtr <= monoSanitizeValues.len:
+            return get(monoSanitizeValues, cachedIdxPtr - 1)
     var cached: bool = false
     let cachedIdx: int32 = monoHashMapStrIntGetCompat(monoSanitizeIndex, s, cached)
     if cached && cachedIdx > 0 && cachedIdx <= monoSanitizeValues.len:
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(monoSanitizePtrIndex, ptrKey, cachedIdx)
         return get(monoSanitizeValues, cachedIdx - 1)
     var out: str = ""
     for i in 0..<n:
@@ -2633,17 +2675,29 @@ fn sanitizeKey(s: str): str =
     add(monoSanitizeValues, out)
     let storedIdx: int32 = monoSanitizeValues.len
     hashmaps.hashMapStrIntPut(monoSanitizeIndex, s, storedIdx)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(monoSanitizePtrIndex, ptrKey, storedIdx)
     return out
 
 fn monoTypeKeyEnsureStored(key: str): int32 =
+    let ptrKey: int64 = monoStrPtrKey(key)
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let cachedIdxPtr: int32 = hashmaps.hashMapPtrIntGet(monoTypeKeyPtrIndex, ptrKey, foundPtr)
+        if foundPtr && cachedIdxPtr > 0 && cachedIdxPtr <= monoTypeKeyValues.len:
+            return cachedIdxPtr
     var found: bool = false
     let cachedIdx: int32 = monoHashMapStrIntGetCompat(monoTypeKeyValueIndex, key, found)
     if found && cachedIdx > 0 && cachedIdx <= monoTypeKeyValues.len:
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(monoTypeKeyPtrIndex, ptrKey, cachedIdx)
         return cachedIdx
     trackLexStringStr(key)
     add(monoTypeKeyValues, key)
     let storedIdx: int32 = monoTypeKeyValues.len
     hashmaps.hashMapStrIntPut(monoTypeKeyValueIndex, key, storedIdx)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(monoTypeKeyPtrIndex, ptrKey, storedIdx)
     return storedIdx
 
 fn monoTypeKeyEnsureNodeCache(n: Node) =
@@ -2672,18 +2726,128 @@ fn monoTypeLeafKeyEnsureNodeCache(n: Node) =
     if monoTypeLeafKeyReady.len < needLen:
         setLen(monoTypeLeafKeyReady, needLen)
 
+fn monoTypeLeafKeyEnsureTextCache(textId: int32) =
+    if textId <= 0:
+        return
+    let needLen: int32 = textId + 1
+    if monoTypeLeafTextValues.cap < needLen:
+        reserve(monoTypeLeafTextValues, needLen)
+    if monoTypeLeafTextReady.cap < needLen:
+        reserve(monoTypeLeafTextReady, needLen)
+    if monoTypeLeafTextValues.len < needLen:
+        setLen(monoTypeLeafTextValues, needLen)
+    if monoTypeLeafTextReady.len < needLen:
+        setLen(monoTypeLeafTextReady, needLen)
+
+fn monoRawLooksSafeKey(raw: str): bool =
+    let n: int32 = len(raw)
+    if n <= 0:
+        return false
+    for i in 0..<n:
+        let c: char = raw[i]
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_':
+            continue
+        return false
+    return true
+
+fn monoTextIdLooksSafeKey(textId: int32): bool =
+    let n: int32 = tokenTextLen(textId)
+    if n <= 0:
+        return false
+    for i in 0..<n:
+        let c: char = tokenTextByteAtId(textId, i)
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_':
+            continue
+        return false
+    return true
+
+fn monoWriteRawString(dst: void*, pos: int32, s: str): int32 =
+    var outPos: int32 = pos
+    let n: int32 = len(s)
+    for i in 0..<n:
+        let pos0: int32 = outPos
+        let c0: char = s[i]
+        rawmemWriteChar(dst, pos0, c0)
+        outPos = outPos + 1
+    return outPos
+
+fn monoJoinKeyParts(base: str, parts: str[]): str =
+    if parts.len == 0:
+        return base
+    var total: int32 = len(base)
+    for i in 0..<parts.len:
+        let part: str = get(parts, i)
+        if len(part) > 0:
+            total = total + 1 + len(part)
+    if total <= len(base):
+        return base
+    let out: str = newStringOfCap(total)
+    let outPtr: void* = rawmemAsVoid(out)
+    if outPtr == nil:
+        return base
+    var pos: int32 = 0
+    pos = monoWriteRawString(outPtr, pos, base)
+    for i in 0..<parts.len:
+        let part: str = get(parts, i)
+        if len(part) <= 0:
+            continue
+        let pos0: int32 = pos
+        rawmemWriteChar(outPtr, pos0, '_')
+        pos = pos + 1
+        pos = monoWriteRawString(outPtr, pos, part)
+    return out
+
+fn monoJoinKeyPart(base: str, part: str): str =
+    if len(part) == 0:
+        return base
+    let total: int32 = len(base) + 1 + len(part)
+    if total <= len(base):
+        return base
+    let out: str = newStringOfCap(total)
+    let outPtr: void* = rawmemAsVoid(out)
+    if outPtr == nil:
+        return base + "_" + part
+    var pos: int32 = 0
+    pos = monoWriteRawString(outPtr, pos, base)
+    rawmemWriteChar(outPtr, pos, '_')
+    pos = pos + 1
+    pos = monoWriteRawString(outPtr, pos, part)
+    return out
+
 fn monoTypeLeafKey(n: Node): str =
     if astRefIsNil(n):
         return ""
+    let textId: int32 = nodeIdentId(n)
+    if textId > 0:
+        monoTypeLeafKeyEnsureTextCache(textId)
+        if textId >= 0 && textId < monoTypeLeafTextReady.len && monoTypeLeafTextReady[textId] != 0:
+            let cachedText: str = get(monoTypeLeafTextValues, textId)
+            if astNodeIdValid(n):
+                monoTypeLeafKeyEnsureNodeCache(n)
+                let idxText: int32 = int32(n)
+                if idxText >= 0 && idxText < monoTypeLeafKeyReady.len:
+                    monoTypeLeafKeyValues[idxText] = cachedText
+                    monoTypeLeafKeyReady[idxText] = 1
+            return cachedText
     if astNodeIdValid(n):
         monoTypeLeafKeyEnsureNodeCache(n)
         let idx0: int32 = int32(n)
         if idx0 >= 0 && idx0 < monoTypeLeafKeyReady.len && monoTypeLeafKeyReady[idx0] != 0:
             return get(monoTypeLeafKeyValues, idx0)
-    let raw: str = nodeIdent(n)
+    let raw: str = textId > 0 ? tokenTextById(textId) : nodeIdent(n)
     var res: str = ""
     if len(raw) > 0:
-        res = sanitizeKey(monoStripSpaces(raw))
+        if (textId > 0 && monoTextIdLooksSafeKey(textId)) || monoRawLooksSafeKey(raw):
+            res = raw
+        else:
+            res = sanitizeKey(monoStripSpaces(raw))
+    if textId > 0:
+        monoTypeLeafKeyEnsureTextCache(textId)
+        if textId >= 0 && textId < monoTypeLeafTextReady.len:
+            monoTypeLeafTextValues[textId] = res
+            monoTypeLeafTextReady[textId] = 1
     if astNodeIdValid(n):
         monoTypeLeafKeyEnsureNodeCache(n)
         let idx1: int32 = int32(n)
@@ -2713,27 +2877,30 @@ fn typeKeyCore(n: Node): str =
     of nkCallArg:
         if kidCount n > 1:
             return typeKey kid(n, 1)
+        if kidCount n > 0:
+            return typeKey kid(n, 0)
         return ""
     of nkIntLit:
         return intToStr int32(nodeIntVal(n))
     of nkPtrTy:
         if kidCount n > 0:
-            return "ptr_" + typeKey kid(n, 0)
+            return monoJoinKeyPart("ptr", typeKey kid(n, 0))
         return "ptr"
     of nkRefTy:
         if kidCount n > 0:
-            return "ref_" + typeKey kid(n, 0)
+            return monoJoinKeyPart("ref", typeKey kid(n, 0))
         return "ref"
     of nkVarTy:
         if kidCount n > 0:
-            return "var_" + typeKey kid(n, 0)
+            return monoJoinKeyPart("var", typeKey kid(n, 0))
         return "var"
     of nkSetTy:
         if kidCount n > 0:
-            return "set_" + typeKey kid(n, 0)
+            return monoJoinKeyPart("set", typeKey kid(n, 0))
         return "set"
     of nkFnTy:
-        var sig: str = "fn"
+        var parts: str[]
+        parts.cap = 8
         if kidCount n > 0:
             let fp: Node = kid(n, 0)
             if astRefNonNil(fp) && nodeKind(fp) == nkFormalParams:
@@ -2742,24 +2909,33 @@ fn typeKeyCore(n: Node): str =
                     if astRefNonNil(d) && nodeKind(d) == nkIdentDefs && kidCount d > 1:
                         let k: str = typeKey kid(d, 1)
                         if len k > 0:
-                            sig = sig + "_"
-                            sig = sig + k
+                            add(parts, k)
         if kidCount n > 1:
             let retKey: str = typeKey kid(n, 1)
             if len retKey > 0:
-                sig = sig + "_ret_"
-                sig = sig + retKey
-        return sig
+                add(parts, "ret")
+                add(parts, retKey)
+        return monoJoinKeyParts("fn", parts)
     of nkTupleTy, nkTupleLit:
-        var out2: str = "tuple"
+        var parts: str[]
+        parts.cap = kidCount(n)
         for i2 in 0..<kidCount n:
             let k2: str = typeKey kid(n, i2)
             if len k2 > 0:
-                out2 = out2 + "_"
-                out2 = out2 + k2
-        return out2
+                add(parts, k2)
+        return monoJoinKeyParts("tuple", parts)
     of nkBracketExpr:
         if kidCount n > 0:
+            if !bracketLooksLikeTypeCall(n):
+                # Parser/type-lowering boundary can still surface postfix container
+                # syntax as `T[]` => `nkBracketExpr(T)` or `T[N]` => `nkBracketExpr(T, N)`.
+                # Treat these as seq-like type identity instead of collapsing them to
+                # the bare element key (for example `bool[]` must not hash like `bool`).
+                if kidCount n == 1 || kidCount n == 2:
+                    let elemKey0: str = typeKey kid(n, 0)
+                    if len(elemKey0) > 0:
+                        return monoJoinKeyPart("seq", elemKey0)
+                    return "seq"
             let base: Node = kid(n, 0)
             var baseKey: str = typeKey base
             # `seq_fixed[T, N]` is treated as `seq[T]` for type identity.
@@ -2769,21 +2945,21 @@ fn typeKeyCore(n: Node): str =
                 if kidCount n > 1:
                     let elemKey: str = typeKey kid(n, 1)
                     if len elemKey > 0:
-                        return baseKey + "_" + elemKey
+                        return monoJoinKeyPart(baseKey, elemKey)
                 return baseKey
-            var out3: str = baseKey
+            var parts: str[]
+            parts.cap = kidCount(n)
             let argc: int32 = kidCount n
             if argc == 2:
                 let k1: str = typeKey kid(n, 1)
                 if len k1 > 0:
-                    return out3 + "_" + k1
-                return out3
+                    return monoJoinKeyPart(baseKey, k1)
+                return baseKey
             for i3 in 1..<argc:
                 let k3: str = typeKey kid(n, i3)
                 if len k3 > 0:
-                    out3 = out3 + "_"
-                    out3 = out3 + k3
-            return out3
+                    add(parts, k3)
+            return monoJoinKeyParts(baseKey, parts)
     else:
         if len nodeIdent(n) > 0:
             return monoTypeLeafKey(n)
@@ -3182,22 +3358,13 @@ fn mangleInstance(name: str, typeArgs: Node[]): str =
         base = "arrow"
     elif monoStrEq(base, "."):
         base = "dot"
-    var keys: str[4]
-    var total: int32 = len base
+    var keys: str[]
+    keys.cap = typeArgs.len
     for i in 0..<typeArgs.len:
         let key: str = typeKey get(typeArgs, i)
         if len key > 0:
             add(keys, key)
-            total = total + 1 + len key
-    if keys.len == 0:
-        return base
-    var outText: str = base
-    for j in 0..<keys.len:
-        outText = outText + "_"
-        let k: str = get(keys, j)
-        if len(k) > 0:
-            outText = outText + k
-    return outText
+    return monoJoinKeyParts(base, keys)
 
 fn inferLitType(n: Node): Node =
     if astRefIsNil(n):
@@ -4585,21 +4752,28 @@ fn monomorphizeImpl(root: Node, diags: Diagnostic[]*): Node =
     stripSpacesCalls = 0
     stripSpacesNs = 0
     hashmaps.hashMapStrIntClear(monoStripIndex)
+    hashmaps.hashMapPtrIntClear(monoStripPtrIndex)
     hashmaps.hashMapStrIntClear(monoUnderscoreIndex)
     monoStripValues = []
-    monoStripValues.cap = 256
+    monoStripValues.cap = 4096
     hashmaps.hashMapStrIntClear(monoSanitizeIndex)
+    hashmaps.hashMapPtrIntClear(monoSanitizePtrIndex)
     monoSanitizeValues = []
-    monoSanitizeValues.cap = 256
+    monoSanitizeValues.cap = 4096
     setLen(monoTypeKeyIndex, 0)
-    monoTypeKeyIndex.cap = 256
+    monoTypeKeyIndex.cap = 8192
     monoTypeKeyValues = []
-    monoTypeKeyValues.cap = 256
+    monoTypeKeyValues.cap = 16384
     setLen(monoTypeLeafKeyReady, 0)
-    monoTypeLeafKeyReady.cap = 256
+    monoTypeLeafKeyReady.cap = 8192
     monoTypeLeafKeyValues = []
-    monoTypeLeafKeyValues.cap = 256
+    monoTypeLeafKeyValues.cap = 8192
+    setLen(monoTypeLeafTextReady, 0)
+    monoTypeLeafTextReady.cap = 4096
+    monoTypeLeafTextValues = []
+    monoTypeLeafTextValues.cap = 4096
     hashmaps.hashMapStrIntClear(monoTypeKeyValueIndex)
+    hashmaps.hashMapPtrIntClear(monoTypeKeyPtrIndex)
     hashmaps.hashMapPtrIntClear(&monoLambdaCaptureIndex)
     monoLambdaCaptureValues = []
     monoLambdaCaptureValues.cap = 128

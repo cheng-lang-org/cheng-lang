@@ -3,6 +3,7 @@ import std/hashsets
 import std/hashmaps
 import std/seqs
 import stage1/ast
+import stage1/token
 
 fn add(dst: var str[], val: str) =
     seqs.add(dst, val)
@@ -10,80 +11,175 @@ fn add(dst: var str[], val: str) =
 fn uirCoreFuncSigMarker(): str =
     return "__cheng_sig_"
 
+fn uirCoreFnv1a64Update(h0: uint64, s0: str): uint64 =
+    var h: uint64 = h0
+    let s: str = len(s0) > 0 ? s0 : ""
+    for i in 0..<len(s):
+        let c: char = s[i]
+        h = h ^ uint64(int64(c) & int64(0xFF))
+        h = h * uint64(1099511628211)
+    return h
+
+fn uirCoreFnv1a64UpdateChar(h0: uint64, ch: char): uint64 =
+    var h: uint64 = h0
+    h = h ^ uint64(int64(ch) & int64(0xFF))
+    h = h * uint64(1099511628211)
+    return h
+
 fn uirCoreFuncSigInput(retKey0: str, paramKeys: str[]): str =
     var retKey: str = retKey0
     if len(retKey) == 0:
         retKey = ""
-    var out: str = retKey + "|"
+    var total: int32 = len(retKey) + 1
     for i in 0..<paramKeys.len:
         let pk0: str = paramKeys[i]
-        let pk: str = (len(pk0) > 0) ? pk0 : ""
-        out = out + pk + ";"
+        let pk: str = len(pk0) > 0 ? pk0 : ""
+        total = total + len(pk) + 1
+    let out: str = newStringOfCap(total)
+    let outPtr: void* = void*(out)
+    if outPtr == nil:
+        return ""
+    var outIdx: int32 = 0
+    for i in 0..<len(retKey):
+        setMem(ptr_add(outPtr, outIdx), int32(retKey[i]), 1)
+        outIdx = outIdx + 1
+    setMem(ptr_add(outPtr, outIdx), int32('|'), 1)
+    outIdx = outIdx + 1
+    for i in 0..<paramKeys.len:
+        let pk0: str = paramKeys[i]
+        let pk: str = len(pk0) > 0 ? pk0 : ""
+        for j in 0..<len(pk):
+            setMem(ptr_add(outPtr, outIdx), int32(pk[j]), 1)
+            outIdx = outIdx + 1
+        setMem(ptr_add(outPtr, outIdx), int32(';'), 1)
+        outIdx = outIdx + 1
+    return out
+
+fn uirCoreSigSanitizeAtom(atom0: str): str =
+    let atom: str = len(atom0) > 0 ? atom0 : "empty"
+    let atomLen: int32 = len(atom)
+    let out: str = newStringAlloc(atomLen)
+    let outPtr: void* = void*(out)
+    if outPtr == nil:
+        return "empty"
+    for i in 0..<atomLen:
+        let ch: char = atom[i]
+        let ok: bool =
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_'
+        if ok:
+            setMem(ptr_add(outPtr, i), int32(ch), 1)
+        else:
+            setMem(ptr_add(outPtr, i), int32('_'), 1)
+    if len(out) == 0:
+        return "empty"
     return out
 
 fn uirCoreFuncSigId(retKey: str, paramKeys: str[]): str =
-    return uirCoreU64ToHex(uirCoreFnv1a64(uirCoreFuncSigInput(retKey, paramKeys)))
+    let retSan: str = uirCoreSigSanitizeAtom(retKey)
+    let retPrefix: str = "ret_"
+    let paramPrefix: str = "__p_"
+    let voidSuffix: str = "__p_void"
+    var sanParams: str[] = []
+    sanParams.cap = paramKeys.len
+    var total: int32 = len(retPrefix) + len(retSan)
+    for i in 0..<paramKeys.len:
+        let san: str = uirCoreSigSanitizeAtom(paramKeys[i])
+        add(sanParams, san)
+        total = total + len(paramPrefix) + len(san)
+    if sanParams.len == 0:
+        total = total + len(voidSuffix)
+    let out: str = newStringAlloc(total)
+    let outPtr: void* = void*(out)
+    if outPtr == nil:
+        return ""
+    var outIdx: int32 = 0
+    for i in 0..<len(retPrefix):
+        setMem(ptr_add(outPtr, outIdx), int32(retPrefix[i]), 1)
+        outIdx = outIdx + 1
+    for i in 0..<len(retSan):
+        setMem(ptr_add(outPtr, outIdx), int32(retSan[i]), 1)
+        outIdx = outIdx + 1
+    if sanParams.len == 0:
+        for i in 0..<len(voidSuffix):
+            setMem(ptr_add(outPtr, outIdx), int32(voidSuffix[i]), 1)
+            outIdx = outIdx + 1
+        return out
+    for i in 0..<sanParams.len:
+        let san: str = sanParams[i]
+        for j in 0..<len(paramPrefix):
+            setMem(ptr_add(outPtr, outIdx), int32(paramPrefix[j]), 1)
+            outIdx = outIdx + 1
+        for j in 0..<len(san):
+            setMem(ptr_add(outPtr, outIdx), int32(san[j]), 1)
+            outIdx = outIdx + 1
+    return out
 
 fn uirCoreMangleOverloadName(baseSym: str, retKey: str, paramKeys: str[]): str =
-    return baseSym + uirCoreFuncSigMarker() + uirCoreFuncSigId(retKey, paramKeys)
+    let marker: str = uirCoreFuncSigMarker()
+    let sigId: str = uirCoreFuncSigId(retKey, paramKeys)
+    let total: int32 = len(baseSym) + len(marker) + len(sigId)
+    let out: str = newStringAlloc(total)
+    let outPtr: void* = void*(out)
+    if outPtr == nil:
+        return baseSym
+    var outIdx: int32 = 0
+    for i in 0..<len(baseSym):
+        setMem(ptr_add(outPtr, outIdx), int32(baseSym[i]), 1)
+        outIdx = outIdx + 1
+    for i in 0..<len(marker):
+        setMem(ptr_add(outPtr, outIdx), int32(marker[i]), 1)
+        outIdx = outIdx + 1
+    for i in 0..<len(sigId):
+        setMem(ptr_add(outPtr, outIdx), int32(sigId[i]), 1)
+        outIdx = outIdx + 1
+    return out
 
 fn uirCoreComputeOverloadedFnBasesId(rootId: AstNodeId): hashsets.HashSetStr =
     # Stage1 monomorphize may emit multiple functions with the same base name (e.g. `len`)
     # but different signatures. The MIR module requires globally-unique function symbols,
-    # so we precompute which base names are overloaded.
+    # so we precompute which base names are overloaded. Walk wrapper/container nodes
+    # recursively but never descend into function bodies.
     var overloaded: hashsets.HashSetStr = hashsets.hashSetStrInit(256)
     if !astNodeIdValid(rootId):
         return overloaded
     let rootKids: int32 = astKidCount(rootId)
     let mapCap: int32 = (rootKids > 128) ? (rootKids * 2) : 256
     var nameIndex: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(mapCap)
-    var firstSigs: str[]
-    for i in 0..<rootKids:
-        let top: AstNodeId = astKidAt(rootId, i)
+    var stack: AstNodeId[]
+    stack.cap = (rootKids > 0) ? rootKids : 8
+    add(stack, rootId)
+    while stack.len > 0:
+        let top: AstNodeId = stack[stack.len - 1]
+        stack.len = stack.len - 1
         if !astNodeIdValid(top) || astNodeKind(top) == nkEmpty:
             continue
-        var n: AstNodeId = top
-        if (astNodeKind(n) != nkFnDecl && astNodeKind(n) != nkIteratorDecl) || astKidCount(n) == 0:
-            # Keep a shallow fallback for wrapper nodes; do not walk function bodies.
-            if astKidCount(top) <= 0:
-                continue
-            n = astKidAt(top, 0)
-            if !astNodeIdValid(n) || astNodeKind(n) == nkEmpty:
-                continue
-            if (astNodeKind(n) != nkFnDecl && astNodeKind(n) != nkIteratorDecl) || astKidCount(n) == 0:
-                continue
+        let topKind: NodeKind = astNodeKind(top)
+        if topKind != nkFnDecl && topKind != nkIteratorDecl:
+            for ki in 0..<astKidCount(top):
+                add(stack, astKidAt(top, ki))
+            continue
+        let n: AstNodeId = top
+        if astKidCount(n) == 0:
+            continue
         if uirCoreFuncSigHasUnresolvedGenericsId(n):
             continue
         let nameNode: AstNodeId = astKidAt(n, 0)
         if !astNodeIdValid(nameNode) || (astNodeKind(nameNode) != nkIdent && astNodeKind(nameNode) != nkSymbol):
             continue
-        let rawName: str = backendStripSpaces(astPlainName(nameNode))
-        let baseId: str = rawName
+        let textId: int32 = astNodeIdentId(nameNode)
+        var baseId: str = backendStripSpaces(astPlainName(nameNode))
+        if textId > 0:
+            baseId = backendStripSpaces(tokenTextById(textId))
         if len(baseId) == 0:
             continue
-
-        let paramsNode: AstNodeId = astKidAt(n, 1)
-        var paramKeys: str[]
-        if astNodeIdValid(paramsNode) && astNodeKind(paramsNode) == nkFormalParams:
-            for pi in 0..<astKidCount(paramsNode):
-                let defs: AstNodeId = astKidAt(paramsNode, pi)
-                if astNodeIdValid(defs) && astNodeKind(defs) == nkIdentDefs && astKidCount(defs) > 1:
-                    let tn: AstNodeId = astKidAt(defs, 1)
-                    let pk: str = astNodeIdValid(tn) ? typeKey(tn) : ""
-                    add(paramKeys, pk)
-
-        let retNode: AstNodeId = astKidAt(n, 2)
-        var retKey: str = ""
-        if astNodeIdValid(retNode) && astNodeKind(retNode) != nkEmpty:
-            retKey = typeKey(retNode)
-        let sigId: str = uirCoreFuncSigId(retKey, paramKeys)
 
         let prevIdxPlus1: int32 = hashmaps.hashMapStrIntGet(nameIndex, baseId)
         let prevIdx: int32 = (prevIdxPlus1 > 0) ? (prevIdxPlus1 - 1) : -1
         if prevIdx < 0:
-            let newIdx: int32 = firstSigs.len
-            add(firstSigs, sigId)
-            hashmaps.hashMapStrIntPut(nameIndex, baseId, newIdx + 1)
+            hashmaps.hashMapStrIntPut(nameIndex, baseId, 1)
             continue
         hashsets.hashSetStrAdd(overloaded, baseId)
     return overloaded

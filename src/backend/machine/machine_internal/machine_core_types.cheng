@@ -2,6 +2,7 @@
 import std/seqs
 import std/os
 import std/strings
+import std/system
 
 type
     MachineCoreReg = enum
@@ -45,15 +46,7 @@ type
         machineCoreOpStrh, machineCoreOpLdrh, machineCoreOpLdrsh,
         machineCoreOpSubSp, machineCoreOpAddSp
 
-    MachineCoreInst = ref
-        op: MachineCoreOp
-        rd: MachineCoreReg
-        rn: MachineCoreReg
-        rm: MachineCoreReg
-        ra: MachineCoreReg
-        imm: int64
-        label: str
-        cond: MachineCoreCond
+    MachineCoreInst = void*
 
     MachineCoreFunc = ref
         name: str
@@ -82,6 +75,53 @@ var
     machineCoreDebugCStringCached: bool
     machineCoreDebugCStringValue: bool
 
+@importc("cheng_machine_inst_new")
+fn cheng_machine_inst_new(op, rd, rn, rm, ra: int32, imm: int64, label: cstring, cond: int32): MachineCoreInst
+@importc("cheng_machine_inst_clone")
+fn cheng_machine_inst_clone(inst: MachineCoreInst): MachineCoreInst
+@importc("cheng_machine_inst_valid")
+fn cheng_machine_inst_valid(inst: MachineCoreInst): bool
+@importc("cheng_machine_inst_op")
+fn cheng_machine_inst_op(inst: MachineCoreInst): int32
+@importc("cheng_machine_inst_rd")
+fn cheng_machine_inst_rd(inst: MachineCoreInst): int32
+@importc("cheng_machine_inst_rn")
+fn cheng_machine_inst_rn(inst: MachineCoreInst): int32
+@importc("cheng_machine_inst_rm")
+fn cheng_machine_inst_rm(inst: MachineCoreInst): int32
+@importc("cheng_machine_inst_ra")
+fn cheng_machine_inst_ra(inst: MachineCoreInst): int32
+@importc("cheng_machine_inst_imm")
+fn cheng_machine_inst_imm(inst: MachineCoreInst): int64
+@importc("cheng_machine_inst_label")
+fn cheng_machine_inst_label(inst: MachineCoreInst): str
+@importc("cheng_machine_inst_cond")
+fn cheng_machine_inst_cond(inst: MachineCoreInst): int32
+@importc("cheng_seq_set_grow")
+fn cheng_seq_set_grow(seqPtr: void*, idx: int32, elemSize: int32): void*
+@importc("cheng_func_ptr_shadow_remember")
+fn machine_shadow_remember(p: void*)
+@importc("cheng_func_ptr_shadow_recover")
+fn machine_shadow_recover(p: uint64): void*
+
+fn machineCoreNewInst(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg,
+                      rm: MachineCoreReg, ra: MachineCoreReg, imm: int64,
+                      label: str, cond: MachineCoreCond): MachineCoreInst =
+    let safeLabel: str = void*(label) == nil ? "" : label
+    let out: MachineCoreInst = cheng_machine_inst_new(int32(op), int32(rd), int32(rn), int32(rm),
+                                                      int32(ra), imm, cstring(safeLabel), int32(cond))
+    if void*(out) != nil:
+        machine_shadow_remember(void*(out))
+    return out
+
+fn machineCoreInstRecover(inst: MachineCoreInst): MachineCoreInst =
+    if void*(inst) == nil:
+        return nil
+    let recovered: void* = machine_shadow_recover(ptrToU64(void*(inst)))
+    if recovered != nil:
+        return MachineCoreInst(recovered)
+    return inst
+
 fn machineCoreGrowRaw(buffer: ptr*, cap: int32*, needLen: int32, elemSize: int32) =
     if void*(buffer) == nil || void*(cap) == nil || needLen <= 0 || elemSize <= 0:
         return
@@ -109,64 +149,60 @@ fn machineCoreGrowRaw(buffer: ptr*, cap: int32*, needLen: int32, elemSize: int32
 fn machineCoreAppendInstPtr(seqInst: MachineCoreInst[]*, val: MachineCoreInst) =
     if seqInst == nil:
         return
-    if seqInst->len < 0 || seqInst->cap < 0 || seqInst->len > seqInst->cap:
+    let len0: int32 = chengSeqHdrLenGet(seqInst)
+    let cap0: int32 = chengSeqHdrCapGet(seqInst)
+    if len0 < 0 || cap0 < 0 || len0 > cap0:
         machineCoreResetSeqInst(seqInst)
-    let idx: int32 = seqInst->len
-    let needLen: int32 = idx + 1
-    if seqInst->buffer == nil || seqInst->cap < needLen:
-        cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, needLen, int32(sizeof ptr))
-    seqInst->len = needLen
-    if void*(val) != nil:
-        memRetain(void*(val))
-    let elemBytes: int32 = idx * int32(sizeof ptr)
-    let writePtr: MachineCoreInst* = MachineCoreInst*(ptr_add(seqInst->buffer, elemBytes))
-    *writePtr = val
+    let idx: int32 = chengSeqHdrLenGet(seqInst)
+    let safeVal: MachineCoreInst = machineCoreInstRecover(val)
+    let writePtr: MachineCoreInst* = MachineCoreInst*(cheng_seq_set_grow(seqInst, idx, ptrSize()))
+    if writePtr == nil:
+        return
+    *writePtr = safeVal
 
 fn machineCoreAppendFuncPtr(seqInst: MachineCoreFunc[]*, val: MachineCoreFunc) =
     if seqInst == nil:
         return
-    if seqInst->len < 0 || seqInst->cap < 0 || seqInst->len > seqInst->cap:
+    let len0: int32 = chengSeqHdrLenGet(seqInst)
+    let cap0: int32 = chengSeqHdrCapGet(seqInst)
+    if len0 < 0 || cap0 < 0 || len0 > cap0:
         machineCoreResetSeqFunc(seqInst)
-    let idx: int32 = seqInst->len
-    let needLen: int32 = idx + 1
-    if seqInst->buffer == nil || seqInst->cap < needLen:
-        cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, needLen, int32(sizeof ptr))
-    seqInst->len = needLen
+    let idx: int32 = chengSeqHdrLenGet(seqInst)
     if void*(val) != nil:
         memRetain(void*(val))
-    let elemBytes: int32 = idx * int32(sizeof ptr)
-    let writePtr: MachineCoreFunc* = MachineCoreFunc*(ptr_add(seqInst->buffer, elemBytes))
+    let writePtr: MachineCoreFunc* = MachineCoreFunc*(cheng_seq_set_grow(seqInst, idx, ptrSize()))
+    if writePtr == nil:
+        return
     *writePtr = val
 
 fn machineCoreAppendCStringPtr(seqInst: MachineCoreCString[]*, val: MachineCoreCString) =
     if seqInst == nil:
         return
-    if seqInst->len < 0 || seqInst->cap < 0 || seqInst->len > seqInst->cap:
+    let len0: int32 = chengSeqHdrLenGet(seqInst)
+    let cap0: int32 = chengSeqHdrCapGet(seqInst)
+    if len0 < 0 || cap0 < 0 || len0 > cap0:
         machineCoreResetSeqCString(seqInst)
-    let idx: int32 = seqInst->len
-    let needLen: int32 = idx + 1
-    if seqInst->buffer == nil || seqInst->cap < needLen:
-        cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, needLen, int32(sizeof MachineCoreCString))
-    seqInst->len = needLen
-    let elemBytes: int32 = idx * int32(sizeof MachineCoreCString)
-    let writePtr: MachineCoreCString* = MachineCoreCString*(ptr_add(seqInst->buffer, elemBytes))
+    let idx: int32 = chengSeqHdrLenGet(seqInst)
+    let writePtr: MachineCoreCString* =
+        MachineCoreCString*(cheng_seq_set_grow(seqInst, idx, int32(sizeof MachineCoreCString)))
+    if writePtr == nil:
+        return
     writePtr->label = val.label
     writePtr->value = val.value
 
 fn machineCoreAppendGlobalPtr(seqInst: MachineCoreGlobal[]*, val: MachineCoreGlobal) =
     if seqInst == nil:
         return
-    if seqInst->len < 0 || seqInst->cap < 0 || seqInst->len > seqInst->cap:
+    let len0: int32 = chengSeqHdrLenGet(seqInst)
+    let cap0: int32 = chengSeqHdrCapGet(seqInst)
+    if len0 < 0 || cap0 < 0 || len0 > cap0:
         machineCoreResetSeqGlobal(seqInst)
-    let idx: int32 = seqInst->len
-    let needLen: int32 = idx + 1
-    if seqInst->buffer == nil || seqInst->cap < needLen:
-        cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, needLen, int32(sizeof ptr))
-    seqInst->len = needLen
+    let idx: int32 = chengSeqHdrLenGet(seqInst)
     if void*(val) != nil:
         memRetain(void*(val))
-    let elemBytes: int32 = idx * int32(sizeof ptr)
-    let writePtr: MachineCoreGlobal* = MachineCoreGlobal*(ptr_add(seqInst->buffer, elemBytes))
+    let writePtr: MachineCoreGlobal* = MachineCoreGlobal*(cheng_seq_set_grow(seqInst, idx, ptrSize()))
+    if writePtr == nil:
+        return
     *writePtr = val
 
 fn machineCoreInstSeqAppend(seqInst: var MachineCoreInst[], val: MachineCoreInst) =
@@ -214,42 +250,45 @@ fn machineCoreDebugCStringEnabled(): bool =
 fn machineCoreResetSeqFunc(items: MachineCoreFunc[]*) =
     if void*(items) == nil:
         return
-    items->buffer = nil
-    items->len = 0
-    items->cap = 0
+    chengSeqHdrBufferSet(items, nil)
+    chengSeqHdrLenSet(items, 0)
+    chengSeqHdrCapSet(items, 0)
 
 fn machineCoreResetSeqInst(items: MachineCoreInst[]*) =
     if void*(items) == nil:
         return
-    items->buffer = nil
-    items->len = 0
-    items->cap = 0
+    chengSeqHdrBufferSet(items, nil)
+    chengSeqHdrLenSet(items, 0)
+    chengSeqHdrCapSet(items, 0)
 
 fn machineCoreResetSeqCString(items: MachineCoreCString[]*) =
     if void*(items) == nil:
         return
-    items->buffer = nil
-    items->len = 0
-    items->cap = 0
+    chengSeqHdrBufferSet(items, nil)
+    chengSeqHdrLenSet(items, 0)
+    chengSeqHdrCapSet(items, 0)
 
 fn machineCoreResetSeqGlobal(items: MachineCoreGlobal[]*) =
     if void*(items) == nil:
         return
-    items->buffer = nil
-    items->len = 0
-    items->cap = 0
+    chengSeqHdrBufferSet(items, nil)
+    chengSeqHdrLenSet(items, 0)
+    chengSeqHdrCapSet(items, 0)
 
 fn machineCoreSanitizeSeqFunc(items: MachineCoreFunc[]*) =
     if void*(items) == nil:
         return
     var bad: bool = false
-    if items->len < 0 || items->cap < 0:
+    let len0: int32 = chengSeqHdrLenGet(items)
+    let cap0: int32 = chengSeqHdrCapGet(items)
+    let buf0: ptr = ptr(chengSeqHdrBufferGet(items))
+    if len0 < 0 || cap0 < 0:
         bad = true
-    elif items->len > items->cap:
+    elif len0 > cap0:
         bad = true
-    elif items->len > 1000000 || items->cap > 2000000:
+    elif len0 > 1000000 || cap0 > 2000000:
         bad = true
-    elif items->buffer != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(items->buffer))):
+    elif buf0 != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(buf0))):
         bad = true
     if bad:
         machineCoreResetSeqFunc(items)
@@ -258,13 +297,16 @@ fn machineCoreSanitizeSeqInst(items: MachineCoreInst[]*) =
     if void*(items) == nil:
         return
     var bad: bool = false
-    if items->len < 0 || items->cap < 0:
+    let len0: int32 = chengSeqHdrLenGet(items)
+    let cap0: int32 = chengSeqHdrCapGet(items)
+    let buf0: ptr = ptr(chengSeqHdrBufferGet(items))
+    if len0 < 0 || cap0 < 0:
         bad = true
-    elif items->len > items->cap:
+    elif len0 > cap0:
         bad = true
-    elif items->len > 1000000 || items->cap > 2000000:
+    elif len0 > 1000000 || cap0 > 2000000:
         bad = true
-    elif items->buffer != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(items->buffer))):
+    elif buf0 != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(buf0))):
         bad = true
     if bad:
         machineCoreResetSeqInst(items)
@@ -273,13 +315,16 @@ fn machineCoreSanitizeSeqCString(items: MachineCoreCString[]*) =
     if void*(items) == nil:
         return
     var bad: bool = false
-    if items->len < 0 || items->cap < 0:
+    let len0: int32 = chengSeqHdrLenGet(items)
+    let cap0: int32 = chengSeqHdrCapGet(items)
+    let buf0: ptr = ptr(chengSeqHdrBufferGet(items))
+    if len0 < 0 || cap0 < 0:
         bad = true
-    elif items->len > items->cap:
+    elif len0 > cap0:
         bad = true
-    elif items->len > 1000000 || items->cap > 2000000:
+    elif len0 > 1000000 || cap0 > 2000000:
         bad = true
-    elif items->buffer != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(items->buffer))):
+    elif buf0 != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(buf0))):
         bad = true
     if bad:
         machineCoreResetSeqCString(items)
@@ -288,13 +333,16 @@ fn machineCoreSanitizeSeqGlobal(items: MachineCoreGlobal[]*) =
     if void*(items) == nil:
         return
     var bad: bool = false
-    if items->len < 0 || items->cap < 0:
+    let len0: int32 = chengSeqHdrLenGet(items)
+    let cap0: int32 = chengSeqHdrCapGet(items)
+    let buf0: ptr = ptr(chengSeqHdrBufferGet(items))
+    if len0 < 0 || cap0 < 0:
         bad = true
-    elif items->len > items->cap:
+    elif len0 > cap0:
         bad = true
-    elif items->len > 1000000 || items->cap > 2000000:
+    elif len0 > 1000000 || cap0 > 2000000:
         bad = true
-    elif items->buffer != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(items->buffer))):
+    elif buf0 != nil && !machineCoreRefPtrSane(int64(rawmemAsVoid(buf0))):
         bad = true
     if bad:
         machineCoreResetSeqGlobal(items)
@@ -351,10 +399,10 @@ fn machineCoreFuncValid(func: MachineCoreFunc): bool =
     return machineCoreRefPtrSane(ptrVal)
 
 fn machineCoreInstValid(inst: MachineCoreInst): bool =
-    let ptrVal: int64 = int64(rawmemAsVoid(inst))
-    if ptrVal == 0:
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if void*(safeInst) == nil:
         return false
-    return machineCoreRefPtrSane(ptrVal)
+    return cheng_machine_inst_valid(safeInst)
 
 fn machineCoreCStringValid(c: MachineCoreCString): bool =
     return void*(c.label) != nil || void*(c.value) != nil
@@ -402,7 +450,7 @@ fn machineCoreModuleFuncAt(mod: MachineCoreModule, idx: int32): MachineCoreFunc 
     let lenLocal: int32 = machineCoreModuleFuncsLen(mod)
     if idx >= lenLocal || bufLocal == nil:
         return nil
-    let elemBytes: int32 = idx * int32(sizeof ptr)
+    let elemBytes: int32 = idx * ptrSize()
     let readPtr: MachineCoreFunc* = MachineCoreFunc*(ptr_add(bufLocal, elemBytes))
     let out: MachineCoreFunc = *readPtr
     if machineCoreFuncValid(out):
@@ -435,7 +483,7 @@ fn machineCoreModuleGlobalsLen(mod: MachineCoreModule): int32 =
 fn machineCoreModuleGlobalAt(mod: MachineCoreModule, idx: int32): MachineCoreGlobal =
     if !machineCoreModuleValid(mod) || idx < 0 || idx >= mod.globals.len || mod.globals.buffer == nil:
         return nil
-    let elemBytes: int32 = idx * int32(sizeof ptr)
+    let elemBytes: int32 = idx * ptrSize()
     let readPtr: MachineCoreGlobal* = MachineCoreGlobal*(ptr_add(mod.globals.buffer, elemBytes))
     let out: MachineCoreGlobal = *readPtr
     if machineCoreGlobalValid(out):
@@ -489,7 +537,7 @@ fn machineCoreFuncInstAt(func: MachineCoreFunc, idx: int32): MachineCoreInst =
     let capLocal: int32 = lenLocal
     if idx >= lenLocal || bufLocal == nil:
         return nil
-    let elemBytes: int32 = idx * int32(sizeof ptr)
+    let elemBytes: int32 = idx * ptrSize()
     let readPtr: MachineCoreInst* = MachineCoreInst*(ptr_add(bufLocal, elemBytes))
     let out: MachineCoreInst = *readPtr
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1" && !machineCoreInstValid(out):
@@ -536,44 +584,53 @@ fn machineCoreGlobalHasInit(g: MachineCoreGlobal): bool =
     return g.hasInit
 
 fn machineCoreInstOpOf(inst: MachineCoreInst): MachineCoreOp =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return MachineCoreOp(int32(0))
-    return inst.op
+    return MachineCoreOp(cheng_machine_inst_op(safeInst))
 
 fn machineCoreInstRdOf(inst: MachineCoreInst): MachineCoreReg =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return MachineCoreReg(int32(0))
-    return inst.rd
+    return MachineCoreReg(cheng_machine_inst_rd(safeInst))
 
 fn machineCoreInstRnOf(inst: MachineCoreInst): MachineCoreReg =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return MachineCoreReg(int32(0))
-    return inst.rn
+    return MachineCoreReg(cheng_machine_inst_rn(safeInst))
 
 fn machineCoreInstRmOf(inst: MachineCoreInst): MachineCoreReg =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return MachineCoreReg(int32(0))
-    return inst.rm
+    return MachineCoreReg(cheng_machine_inst_rm(safeInst))
 
 fn machineCoreInstRaOf(inst: MachineCoreInst): MachineCoreReg =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return MachineCoreReg(int32(0))
-    return inst.ra
+    return MachineCoreReg(cheng_machine_inst_ra(safeInst))
 
 fn machineCoreInstImmOf(inst: MachineCoreInst): int64 =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return 0
-    return inst.imm
+    return cheng_machine_inst_imm(safeInst)
 
 fn machineCoreInstLabelOf(inst: MachineCoreInst): str =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return ""
-    return inst.label
+    let out: str = cheng_machine_inst_label(safeInst)
+    return void*(out) == nil ? "" : out
 
 fn machineCoreInstCondOf(inst: MachineCoreInst): MachineCoreCond =
-    if !machineCoreInstValid(inst):
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if !machineCoreInstValid(safeInst):
         return MachineCoreCond(int32(0))
-    return inst.cond
+    return MachineCoreCond(cheng_machine_inst_cond(safeInst))
 
 fn machineCoreNewFunc(name: str): MachineCoreFunc =
     var f: MachineCoreFunc
@@ -603,22 +660,12 @@ fn machineCoreFuncSetName(func: MachineCoreFunc, name: str) =
     func.name = machineCorePersistStr(name)
 
 fn machineCoreCloneInst(inst: MachineCoreInst): MachineCoreInst =
-    if void*(inst) == nil:
+    let safeInst: MachineCoreInst = machineCoreInstRecover(inst)
+    if void*(safeInst) == nil:
         return nil
-    var out: MachineCoreInst
-    new out
-    out.op = inst.op
-    out.rd = inst.rd
-    out.rn = inst.rn
-    out.rm = inst.rm
-    out.ra = inst.ra
-    out.imm = inst.imm
-    out.cond = inst.cond
-    let inLabel: str = machineCoreInstLabelOf(inst)
-    if len(inLabel) > 0:
-        out.label = machineCorePersistStr(inLabel)
-    else:
-        out.label = ""
+    let out: MachineCoreInst = cheng_machine_inst_clone(safeInst)
+    if void*(out) != nil:
+        machine_shadow_remember(void*(out))
     return out
 
 fn machineCoreAppendInstRaw(func: MachineCoreFunc, inst: MachineCoreInst) =
@@ -638,6 +685,9 @@ fn machineCoreAddInst(func: MachineCoreFunc, inst: MachineCoreInst) =
         return
     let oldLen: int32 = machineCoreFuncInstsLen(func)
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1" && oldLen < 12:
+        echo("[machine.add_inst] op=" + intToStr(int32(machineCoreInstOpOf(inst))) +
+             " rd=" + intToStr(int32(machineCoreInstRdOf(inst))) +
+             " rn=" + intToStr(int32(machineCoreInstRnOf(inst))))
         echo("[machine.add_inst] before_len=" + intToStr(oldLen) + " " +
              machineCorePtrDebug(int64(rawmemAsVoid(inst))))
         echo("[machine.add_inst] state " + machineCoreBufDebug(machineCoreFuncInstBufferRaw(func), machineCoreFuncInstsLen(func), machineCoreFuncInstsLen(func)))
@@ -684,16 +734,21 @@ fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1":
         var storedFirst: str = "stored_first=nil"
         var storedEight: str = "stored_eight=nil"
+        var storedFirstOp: str = "stored_first_op=nil"
         let storedBuf: ptr = machineCoreFuncInstBufferRaw(stored)
         let storedLen: int32 = machineCoreFuncInstsLen(stored)
         if storedBuf != nil && storedLen > 0:
             let readPtr0: MachineCoreInst* = MachineCoreInst*(storedBuf)
-            storedFirst = machineCorePtrDebug(int64(rawmemAsVoid(*readPtr0)))
+            let firstInst0: MachineCoreInst = *readPtr0
+            storedFirst = machineCorePtrDebug(int64(rawmemAsVoid(firstInst0)))
+            if machineCoreInstValid(firstInst0):
+                storedFirstOp = intToStr(int32(machineCoreInstOpOf(firstInst0)))
         if storedBuf != nil && storedLen > 8:
-            let readPtr8: MachineCoreInst* = MachineCoreInst*(ptr_add(storedBuf, 8 * int32(sizeof ptr)))
+            let readPtr8: MachineCoreInst* = MachineCoreInst*(ptr_add(storedBuf, 8 * ptrSize()))
             storedEight = machineCorePtrDebug(int64(rawmemAsVoid(*readPtr8)))
         echo("[machine.add_func.copy] insts=" + intToStr(storedLen) + " " + storedFirst +
-             " " + storedEight + " " + machineCoreBufDebug(storedBuf, storedLen, stored.insts.cap))
+             " first_op=" + storedFirstOp + " " + storedEight + " " +
+             machineCoreBufDebug(storedBuf, storedLen, stored.insts.cap))
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
         echo("[machine.add_func] append.pre " + machineCoreBufDebug(machineCoreModuleFuncBufferRaw(mod), machineCoreModuleFuncsLen(mod), mod.funcs.cap))
     machineCoreAppendFuncRaw(mod, stored)
@@ -704,16 +759,21 @@ fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
         let added: MachineCoreFunc = machineCoreModuleFuncAt(mod, addedIdx)
         var addedFirst: str = "added_first=nil"
         var addedEight: str = "added_eight=nil"
+        var addedFirstOp: str = "added_first_op=nil"
         let addedBuf: ptr = machineCoreFuncInstBufferRaw(added)
         let addedLen: int32 = machineCoreFuncInstsLen(added)
         if machineCoreFuncValid(added) && addedBuf != nil && addedLen > 0:
             let readPtr1: MachineCoreInst* = MachineCoreInst*(addedBuf)
-            addedFirst = machineCorePtrDebug(int64(rawmemAsVoid(*readPtr1)))
+            let firstInst1: MachineCoreInst = *readPtr1
+            addedFirst = machineCorePtrDebug(int64(rawmemAsVoid(firstInst1)))
+            if machineCoreInstValid(firstInst1):
+                addedFirstOp = intToStr(int32(machineCoreInstOpOf(firstInst1)))
         if machineCoreFuncValid(added) && addedBuf != nil && addedLen > 8:
-            let readPtr8b: MachineCoreInst* = MachineCoreInst*(ptr_add(addedBuf, 8 * int32(sizeof ptr)))
+            let readPtr8b: MachineCoreInst* = MachineCoreInst*(ptr_add(addedBuf, 8 * ptrSize()))
             addedEight = machineCorePtrDebug(int64(rawmemAsVoid(*readPtr8b)))
         echo("[machine.add_func.module] idx=" + intToStr(addedIdx) + " insts=" +
-             intToStr(addedLen) + " " + addedFirst + " " + addedEight + " " +
+             intToStr(addedLen) + " " + addedFirst + " first_op=" + addedFirstOp +
+             " " + addedEight + " " +
              machineCoreBufDebug(addedBuf, addedLen, added.insts.cap))
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
         let mlen2: int32 = machineCoreModuleFuncsLen(mod)
@@ -760,256 +820,139 @@ fn machineCoreLabel(name: str): MachineCoreInst =
         let nlen: int32 = len(name)
         echo("[machine.label] len=" + intToStr(nlen) + " name=" + ((len(name) > 0) ? name : ""))
         machineCoreDebugLabelCount = machineCoreDebugLabelCount + 1
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpLabel
-    inst.label = machineCorePersistStr(name)
-    return inst
+    return machineCoreNewInst(machineCoreOpLabel, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), 0,
+                              machineCorePersistStr(name), MachineCoreCond(int32(0)))
 
 fn machineCoreMovImm(reg: MachineCoreReg, imm: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpMovImm
-    inst.rd = reg
-    inst.imm = imm
-    return inst
+    return machineCoreNewInst(machineCoreOpMovImm, reg, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), imm,
+                              "", MachineCoreCond(int32(0)))
 
 fn machineCoreMovReg(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpMovReg
-    inst.rd = rd
-    inst.rn = rn
-    return inst
+    return machineCoreNewInst(machineCoreOpMovReg, rd, rn, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreSxtw(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpSxtw
-    inst.rd = rd
-    inst.rn = rn
-    return inst
+    return machineCoreNewInst(machineCoreOpSxtw, rd, rn, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreAdrp(rd: MachineCoreReg, label: str): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpAdrp
-    inst.rd = rd
-    inst.label = machineCorePersistStr(label)
-    return inst
+    return machineCoreNewInst(machineCoreOpAdrp, rd, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), 0,
+                              machineCorePersistStr(label), MachineCoreCond(int32(0)))
 
 fn machineCoreAddPageOff(rd: MachineCoreReg, rn: MachineCoreReg, label: str): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpAddPageOff
-    inst.rd = rd
-    inst.rn = rn
-    inst.label = machineCorePersistStr(label)
-    return inst
+    return machineCoreNewInst(machineCoreOpAddPageOff, rd, rn, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, machineCorePersistStr(label),
+                              MachineCoreCond(int32(0)))
 
 fn machineCoreBin(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = op
-    inst.rd = rd
-    inst.rn = rn
-    inst.rm = rm
-    return inst
+    return machineCoreNewInst(op, rd, rn, rm, MachineCoreReg(int32(0)), 0,
+                              "", MachineCoreCond(int32(0)))
 
 fn machineCoreMsub(rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg, ra: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpMsub
-    inst.rd = rd
-    inst.rn = rn
-    inst.rm = rm
-    inst.ra = ra
-    return inst
+    return machineCoreNewInst(machineCoreOpMsub, rd, rn, rm, ra, 0,
+                              "", MachineCoreCond(int32(0)))
 
 fn machineCoreCmp(rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpCmp
-    inst.rn = rn
-    inst.rm = rm
-    return inst
+    return machineCoreNewInst(machineCoreOpCmp, MachineCoreReg(int32(0)), rn, rm,
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreBCond(cond: MachineCoreCond, label: str): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpBCond
-    inst.cond = cond
-    inst.label = machineCorePersistStr(label)
-    return inst
+    return machineCoreNewInst(machineCoreOpBCond, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), 0,
+                              machineCorePersistStr(label), cond)
 
 fn machineCoreB(label: str): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpB
-    inst.label = machineCorePersistStr(label)
-    return inst
+    return machineCoreNewInst(machineCoreOpB, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), 0,
+                              machineCorePersistStr(label), MachineCoreCond(int32(0)))
 
 fn machineCoreBl(label: str): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpBl
-    inst.label = machineCorePersistStr(label)
-    return inst
+    return machineCoreNewInst(machineCoreOpBl, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), 0,
+                              machineCorePersistStr(label), MachineCoreCond(int32(0)))
 
 fn machineCoreBlr(reg: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpBlr
-    inst.rn = reg
-    return inst
+    return machineCoreNewInst(machineCoreOpBlr, MachineCoreReg(int32(0)), reg, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreFmovDx(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpFmovDx
-    inst.rd = rd
-    inst.rn = rn
-    return inst
+    return machineCoreNewInst(machineCoreOpFmovDx, rd, rn, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreFmovXd(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpFmovXd
-    inst.rd = rd
-    inst.rn = rn
-    return inst
+    return machineCoreNewInst(machineCoreOpFmovXd, rd, rn, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreFbin(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = op
-    inst.rd = rd
-    inst.rn = rn
-    inst.rm = rm
-    return inst
+    return machineCoreNewInst(op, rd, rn, rm, MachineCoreReg(int32(0)), 0,
+                              "", MachineCoreCond(int32(0)))
 
 fn machineCoreFcmpD(rn: MachineCoreReg, rm: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpFcmpD
-    inst.rn = rn
-    inst.rm = rm
-    return inst
+    return machineCoreNewInst(machineCoreOpFcmpD, MachineCoreReg(int32(0)), rn, rm,
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreFnegD(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpFnegD
-    inst.rd = rd
-    inst.rn = rn
-    return inst
+    return machineCoreNewInst(machineCoreOpFnegD, rd, rn, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreScvtfDx(rd: MachineCoreReg, rn: MachineCoreReg): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpScvtfDx
-    inst.rd = rd
-    inst.rn = rn
-    return inst
+    return machineCoreNewInst(machineCoreOpScvtfDx, rd, rn, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), 0, "", MachineCoreCond(int32(0)))
 
 fn machineCoreSvc(imm: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpSvc
-    inst.imm = imm
-    return inst
+    return machineCoreNewInst(machineCoreOpSvc, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), imm,
+                              "", MachineCoreCond(int32(0)))
 
 fn machineCoreRet(): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpRet
-    return inst
+    return machineCoreNewInst(machineCoreOpRet, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), 0,
+                              "", MachineCoreCond(int32(0)))
 
 fn machineCoreStrb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpStrb
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpStrb, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreLdrb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpLdrb
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpLdrb, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreLdrsb(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpLdrsb
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpLdrsb, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreStrh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpStrh
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpStrh, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreLdrh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpLdrh
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpLdrh, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreLdrsh(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpLdrsh
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpLdrsh, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreStr(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpStr
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpStr, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreLdr(rd: MachineCoreReg, base: MachineCoreReg, offset: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpLdr
-    inst.rd = rd
-    inst.rn = base
-    inst.imm = offset
-    return inst
+    return machineCoreNewInst(machineCoreOpLdr, rd, base, MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), offset, "", MachineCoreCond(int32(0)))
 
 fn machineCoreSubSp(amount: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpSubSp
-    inst.imm = amount
-    return inst
+    return machineCoreNewInst(machineCoreOpSubSp, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), amount,
+                              "", MachineCoreCond(int32(0)))
 
 fn machineCoreAddSp(amount: int64): MachineCoreInst =
-    var inst: MachineCoreInst
-    new inst
-    inst.op = machineCoreOpAddSp
-    inst.imm = amount
-    return inst
+    return machineCoreNewInst(machineCoreOpAddSp, MachineCoreReg(int32(0)), MachineCoreReg(int32(0)),
+                              MachineCoreReg(int32(0)), MachineCoreReg(int32(0)), amount,
+                              "", MachineCoreCond(int32(0)))
 
 const
     # Stable machine register aliases for outer layers.

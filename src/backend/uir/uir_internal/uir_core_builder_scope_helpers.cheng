@@ -32,6 +32,22 @@ fn scopeOpNameId(id: AstNodeId): str =
 fn scopeOpName(n: Node): str =
     return scopeOpNameId(n)
 
+fn scopeConcat2(left0: str, right0: str): str =
+    let left: str = void*(left0) == nil ? "" : left0
+    let right: str = void*(right0) == nil ? "" : right0
+    let nLeft: int32 = len(left)
+    let nRight: int32 = len(right)
+    if nLeft <= 0:
+        return right
+    if nRight <= 0:
+        return left
+    let out: str = newStringAlloc(nLeft + nRight)
+    if void*(out) == nil:
+        return ""
+    copyMem(void*(out), void*(left), nLeft)
+    copyMem(ptr_add(void*(out), nLeft), void*(right), nRight)
+    return out
+
 fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): BlockBuilder =
     let dbgPipe: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
     if dbgPipe:
@@ -47,6 +63,8 @@ fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): Blo
     b.env = env
     b.module = module
     b.func = func
+    b.funcShadowPtr = uirCoreFuncPtrKey(func)
+    b.funcShadowDynKey = uirCoreFuncNameCacheKey(func)
     b.currentLabel = "entry"
     b.currentStmtStart = uirCoreBlockStmtsFlatLen()
     b.currentStmtLen = 0
@@ -63,10 +81,41 @@ fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): Blo
         os.c_fflush fDbg2
     return b
 
+fn blockBuilderFuncRef(b: BlockBuilder): UirCoreFunc =
+    if b == nil:
+        return nil
+    if uirCoreFuncIdValid(b.func):
+        return b.func
+    let ptrVal: int64 = uirCoreRecoverFuncPtr(b.funcShadowPtr)
+    if uirCoreHostPtrSane(ptrVal):
+        let recovered: UirCoreFunc = UirCoreFunc(void*(uint64(ptrVal)))
+        if uirCoreFuncIdValid(recovered):
+            b.func = recovered
+            return recovered
+    let recoveredDyn: UirCoreFunc = uirCoreFuncFromDynKey(b.funcShadowDynKey)
+    if uirCoreFuncIdValid(recoveredDyn):
+        b.func = recoveredDyn
+        b.funcShadowPtr = uirCoreFuncPtrKey(recoveredDyn)
+        return recoveredDyn
+    return b.func
+
 fn blockBuilderNextLabel(b: BlockBuilder, prefix: str): str =
     let id: int32 = b.labelCounter
     b.labelCounter = b.labelCounter + 1
-    return prefix + intToStr(id)
+    let left: str = void*(prefix) == nil ? "" : prefix
+    let right: str = intToStr(id)
+    let nLeft: int32 = len(left)
+    let nRight: int32 = len(right)
+    if nLeft <= 0:
+        return right
+    if nRight <= 0:
+        return left
+    let out: str = newStringAlloc(nLeft + nRight)
+    if void*(out) == nil:
+        return ""
+    copyMem(void*(out), void*(left), nLeft)
+    copyMem(ptr_add(void*(out), nLeft), void*(right), nRight)
+    return out
 
 fn blockBuilderStart(b: BlockBuilder, label: str) =
     b.currentLabel = label
@@ -149,8 +198,8 @@ fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
     let stmtStart: int32 = b.currentStmtStart
     let stmtLen: int32 = b.currentStmtLen
     let blk: UirBlockId = uirCoreBlockWithStmtSpan(b.currentLabel, stmtStart, stmtLen, term)
-    let dbgFunc: UirCoreFunc = b.func
-    let dbgName: str = (dbgFunc != nil) ? dbgFunc.name : ""
+    let dbgFunc: UirCoreFunc = blockBuilderFuncRef(b)
+    let dbgName: str = (dbgFunc != nil) ? uirCoreFuncNameOf(dbgFunc) : uirCoreFuncNameOfPtrKey(b.funcShadowPtr)
     if (os.getEnvDefault("BACKEND_DEBUG_MIR_FINISH", "") == dbgName):
         let curLen: int32 = b.currentStmtLen
         let blkLen: int32 = uirCoreBlockStmtsLen(blk)
@@ -164,7 +213,11 @@ fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
             let s1: UirStmtId = uirCoreBlockStmtAt(blk, 0)
             echo("[backend] dbgFinish: blk0.kind=" + intToStr(int32(uirCoreStmtKindOf(s1))) +
                  " slot=" + intToStr(uirCoreStmtSlotOf(s1)))
-    uirCoreAddBlock(b.func, blk)
+    let addFunc: UirCoreFunc = blockBuilderFuncRef(b)
+    if uirCoreFuncIdValid(addFunc):
+        uirCoreAddBlock(addFunc, blk)
+    else:
+        uirCoreAddBlockByPtrKey(b.funcShadowPtr, blk)
     b.currentLabel = ""
     b.currentStmtStart = uirCoreBlockStmtsFlatLen()
     b.currentStmtLen = 0
@@ -460,7 +513,6 @@ fn localAdd(env: LocalEnv, name: str, ty: UirCoreType): int32 =
         let mark: int32 = (env.scopeMarks.len > 0) ? env.scopeMarks[env.scopeMarks.len - 1] : -1
         echo("[backend] debugLocalAdd: name='snapRes' slot=" + intToStr(env.names.len) +
              " scopeMarks=" + intToStr(env.scopeMarks.len) + " topMark=" + intToStr(mark))
-    trackLexString rawmemAsVoid(nm)
     var prevSlot: int32 = -1
     if !localEnvUseLinearLookup():
         let prevPlus1: int32 = hashmaps.hashMapStrIntGet(env.nameIndex, nm)
@@ -505,7 +557,6 @@ fn localSetTypeKey(env: LocalEnv, idx: int32, key: str) =
         return
     if idx < 0 || idx >= env.typeKeys.len:
         return
-    trackLexString rawmemAsVoid(key)
     mbWriteStr(env.typeKeys, idx, key)
 
 fn localSetCallTarget(env: LocalEnv, idx: int32, target: str) =
@@ -513,5 +564,4 @@ fn localSetCallTarget(env: LocalEnv, idx: int32, target: str) =
         return
     if idx < 0 || idx >= env.callTargets.len:
         return
-    trackLexString rawmemAsVoid(target)
     mbWriteStr(env.callTargets, idx, target)

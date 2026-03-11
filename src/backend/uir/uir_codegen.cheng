@@ -3,9 +3,13 @@ import std/result
 import std/os
 
 import backend/uir/[uir_types, uir_opt]
+import backend/uir/uir_internal/uir_core_opt2
 import backend/uir/[uir_validate]
 import backend/machine/[machine_types, machine_select_aarch64, machine_regalloc]
 import backend/obj/[macho_writer, elf_writer]
+
+type
+    ByteBuf = uint8[]
 
 fn uirTargetIsDarwin(target: str): bool =
     if len(target) == 0:
@@ -54,10 +58,28 @@ fn uirStrContains(hay: str, needle: str): bool =
             return true
     return false
 
+fn uirCodegenHasEntryFunc(module: UirModule): bool =
+    if module == nil:
+        return false
+    for fi in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, fi)
+        if f == nil || uirFuncIsExtern(f):
+            continue
+        let fnName: str = uirFuncNameOf(f)
+        let linkName: str = uirFuncLinkNameOf(f)
+        if fnName == "main" || fnName == "backendMain" ||
+           linkName == "main" || linkName == "_main":
+            return true
+    return false
+
 fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
     let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
     uirCanonicalizeModule(module)
+    # Keep opt=0 executable codegen from lowering unreachable helper routines.
+    # This trims dead stage1 artifacts without touching no-main library/sidecar modules.
+    if uirCodegenHasEntryFunc(module):
+        uirCorePruneUnreachableFuncs(module)
     if dbgCstr:
         let preOptCstrs: int32 = uirModuleCStringsLen(module)
         echo("[codegen.cstr] pre-opt module_cstrs=" + intToStr(preOptCstrs))
@@ -143,17 +165,17 @@ fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
         return Err[str]("uir_codegen: elf writer disabled in host-only build: " + target)
     return Ok[str](objWriter)
 
-fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): Result[uint8[]] =
+fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): Result[ByteBuf] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
     if !(machine == nil):
         memRetain(machine)
     let writerRes: Result[str] = uirResolveObjWriter(target, objWriter)
     if !IsOk[str](writerRes):
-        return Err[uint8[]](ErrorFormat(ErrorInfoOf[str](writerRes)))
+        return Err[ByteBuf](ErrorFormat(ErrorInfoOf[str](writerRes)))
     let resolvedWriter: str = writerRes.value
     let isAarch64: bool = uirTargetIsAarch64(target)
     if !isAarch64:
-        return Err[uint8[]]("uir_codegen: unsupported target arch: " + target)
+        return Err[ByteBuf]("uir_codegen: unsupported target arch: " + target)
     if dbgCodegen:
         echo("[codegen] writer.begin")
     let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
@@ -173,9 +195,9 @@ fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): R
                  " len=" + intToStr(vLen2) + " b0=" + intToStr(v02) + " b1=" + intToStr(v12))
     if resolvedWriter == "macho":
         if isAarch64:
-            let machoRes: Result[uint8[]] = machoWriteAarch64RelocatableObj(machine)
-            if !IsOk[uint8[]](machoRes):
-                let err: ErrorInfo = ErrorInfoOf[uint8[]](machoRes)
+            let machoRes: Result[ByteBuf] = machoWriteAarch64RelocatableObj(machine)
+            if !IsOk[ByteBuf](machoRes):
+                let err: ErrorInfo = ErrorInfoOf[ByteBuf](machoRes)
                 echo("[codegen] writer.ret.err")
                 echo("macho")
                 echo(intToStr(ErrorCodeOf(err)))
@@ -184,37 +206,37 @@ fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): R
                 if len(msg) > 0:
                     echo(msg)
             return machoRes
-        return Err[uint8[]]("uir_codegen: macho writer unsupported target arch: " + target)
+        return Err[ByteBuf]("uir_codegen: macho writer unsupported target arch: " + target)
     if resolvedWriter == "elf":
         if isAarch64:
             return elfWriteAarch64RelocatableObj(machine)
-        return Err[uint8[]]("uir_codegen: elf writer unsupported target arch: " + target)
+        return Err[ByteBuf]("uir_codegen: elf writer unsupported target arch: " + target)
     if resolvedWriter == "coff":
-        return Err[uint8[]]("uir_codegen: coff writer disabled in host-only build: " + target)
-    return Err[uint8[]]("uir_codegen: unresolved object writer after validation: " + resolvedWriter)
+        return Err[ByteBuf]("uir_codegen: coff writer disabled in host-only build: " + target)
+    return Err[ByteBuf]("uir_codegen: unresolved object writer after validation: " + resolvedWriter)
 
 fn uirEmitObjFromModule(module: UirModule, optLevel: int32, target: str, objWriter: str,
                          validateModule: bool,
-                         uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[uint8[]] =
+                         uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[ByteBuf] =
     if (module == nil):
-        return Err[uint8[]]("uir_codegen: module is nil")
+        return Err[ByteBuf]("uir_codegen: module is nil")
     if validateModule:
         let vRes: Result[bool] = uirValidateModule(module)
         if ! IsOk[bool](vRes):
-            return Err[uint8[]](ErrorFormat(ErrorInfoOf[bool](vRes)))
+            return Err[ByteBuf](ErrorFormat(ErrorInfoOf[bool](vRes)))
     let machineRes: Result[MachineModule] = uirModuleToMachine(module, target, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
     if ! IsOk[MachineModule](machineRes):
-        return Err[uint8[]](ErrorFormat(ErrorInfoOf[MachineModule](machineRes)))
+        return Err[ByteBuf](ErrorFormat(ErrorInfoOf[MachineModule](machineRes)))
     return uirEmitObjFromMachine(machineRes.value, target, objWriter)
 
 fn uirEmitObjFromModuleOrPanic(module: UirModule, optLevel: int32, target: str, objWriter: str,
                                validateModule: bool,
                                uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): uint8[] =
-    let res: Result[uint8[]] = uirEmitObjFromModule(
+    let res: Result[ByteBuf] = uirEmitObjFromModule(
         module, optLevel, target, objWriter, validateModule,
         uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
-    if !IsOk[uint8[]](res):
-        let msg: str = ErrorFormat(ErrorInfoOf[uint8[]](res))
+    if !IsOk[ByteBuf](res):
+        let msg: str = ErrorFormat(ErrorInfoOf[ByteBuf](res))
         if os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1" || os.getEnvDefault("DIAG_CONTEXT", "") == "1":
             echo("[codegen] writer.error")
             echo(msg)

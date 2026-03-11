@@ -1,4 +1,6 @@
 # Strings module (minimal)
+import std/rawmem_support
+import std/seqs
 
 fn len(s: str): int32 =
     return c_strlen s
@@ -6,13 +8,11 @@ fn len(s: str): int32 =
 @importc("__cheng_str_eq")
 fn __cheng_str_eq(s1: str, s2: str): bool
 @importc("__cheng_str_concat")
-fn runtime_str_concat(s1: str, s2: str): str
+fn driver_str_concat_bridge(s1: str, s2: str): str
 @importc("driver_c_str_clone")
 fn driver_c_str_clone(s: str): str
 @importc("driver_c_str_slice")
 fn driver_c_str_slice(s: str, start: int32, count: int32): str
-@importc("driver_c_char_to_str")
-fn driver_c_char_to_str(value: int32): str
 @importc("driver_c_str_get_at")
 fn driver_c_str_get_at(s: str, idx: int32): int32
 @importc("driver_c_str_set_at")
@@ -40,10 +40,19 @@ fn strIsEmpty(s: str): bool =
     return c_strlen(s) == 0
 
 fn strNonEmpty(s: str): bool =
-    return !strIsEmpty(s)
+    return c_strlen(s) != 0
 
 fn hasPrefix(s: str, prefix: str): bool =
-    return driver_c_str_has_prefix(s, prefix) != 0
+    let total: int32 = len(s)
+    let plen: int32 = len(prefix)
+    if plen == 0:
+        return true
+    if plen > total:
+        return false
+    for i in 0..<plen:
+        if s[i] != prefix[i]:
+            return false
+    return true
 
 fn dropPrefix(s: str, prefix: str): str =
     if !hasPrefix(s, prefix):
@@ -52,140 +61,135 @@ fn dropPrefix(s: str, prefix: str): str =
     let total: int32 = len(s)
     if offset >= total:
         return ""
-    return driver_c_str_slice(s, offset, total - offset)
+    return sliceBytes(s, offset, total - offset)
 
 fn arcRetainString(s: str) =
-    let p: void* = void*(s)
-    memRetain p
+    memRetain(void*(s))
 
 fn arcReleaseString(s: str) =
-    let p: void* = void*(s)
-    memRelease p
+    memRelease(void*(s))
 
 fn __cheng_str_clone(s: str): str =
     return driver_c_str_clone(s)
 
 fn __cheng_str_concat(s1: str, s2: str): str =
-    return runtime_str_concat(s1, s2)
+    return driver_str_concat_bridge(s1, s2)
 
 fn __cheng_str_from_bytes(data: uint8[], len: int32): str =
-    if data.buffer == nil || len <= 0 || data.len < len:
+    let dataHdr: ChengSeqHeader* = ChengSeqHeader*(&data)
+    let dataBuf: void* = dataHdr->buffer
+    let dataLen: int32 = dataHdr->len
+    if dataBuf == nil || len <= 0 || dataLen < len:
         return ""
-    return newStringCopy(data.buffer, len)
+    return newStringCopy(dataBuf, len)
 
 fn `+`(s1: str, s2: str): str =
-    return __cheng_str_concat(s1, s2)
-
-fn `+`(s: str, c: char): str =
-    return __cheng_str_concat(s, charToStr(c))
+    return driver_str_concat_bridge(s1, s2)
 
 fn charToStr(c: char): str =
-    return driver_c_char_to_str(int32(c))
+    let out: str = driver_c_str_clone(" ")
+    rawmemWriteChar(void*(out), 0, c)
+    return out
 
 fn `[]`(s: str, i: int32): char =
     return char(driver_c_str_get_at(s, i))
 
 fn `[]=`(s: str, i: int32, val: char) =
-    driver_c_str_set_at(s, i, int32(val))
+    rawmemWriteChar(void*(s), i, val)
     
 fn __cheng_slice_string(s: str, start: int32, stop: int32, exclusive: bool): str =
-    var s0: int32 = start
-    var e: int32 = stop
-    if exclusive:
-        e = e - 1
-    if s0 < 0:
-        s0 = 0
-    if e < s0:
+    let s0: int32 = (start < 0) ? 0 : start
+    let e0: int32 = exclusive ? (stop - 1) : stop
+    if e0 < s0:
         return ""
     let n: int32 = c_strlen s
     if s0 >= n:
         return ""
-    if e >= n:
-        e = n - 1
+    let e: int32 = (e0 >= n) ? (n - 1) : e0
     let count: int32 = e - s0 + 1
     return driver_c_str_slice(s, s0, count)
 fn __cheng_string_contains_char(s: str, c: char): bool =
-    return driver_c_str_contains_char(s, int32(c)) != 0
+    let n: int32 = len(s)
+    for i in 0..<n:
+        if s[i] == c:
+            return true
+    return false
+
 fn __cheng_string_contains_str(s: str, sub: str): bool =
-    return driver_c_str_contains_str(s, sub) != 0
+    let subLen: int32 = len(sub)
+    if subLen == 0:
+        return true
+    let total: int32 = len(s)
+    if subLen > total:
+        return false
+    let limit: int32 = total - subLen
+    for i in 0..limit:
+        if sliceBytes(s, i, subLen) == sub:
+            return true
+    return false
 
 
 fn sliceBytes(text: str, start: int32, count: int32): str =
     if count <= 0:
         return ""
-    var s0: int32 = start
-    if s0 < 0:
-        s0 = 0
+    let s0: int32 = (start < 0) ? 0 : start
     let n: int32 = len(text)
     if s0 >= n:
         return ""
-    var c: int32 = count
-    if s0 + c > n:
-        c = n - s0
+    let c: int32 = ((s0 + count) > n) ? (n - s0) : count
     if c <= 0:
         return ""
     return driver_c_str_slice(text, s0, c)
 
 fn strContains(text: str, sub: str): bool =
     return __cheng_string_contains_str(text, sub)
-fn intToStr(i: int32): str =
-    return driver_c_i32_to_str(i)
+@importc("driver_c_i32_to_str")
+fn intToStr(i: int32): str
 
-fn uint64ToStr(x: uint64): str =
-    return driver_c_u64_to_str(x)
+@importc("driver_c_u64_to_str")
+fn uint64ToStr(x: uint64): str
 
-fn int64ToStr(i: int64): str =
-    return driver_c_i64_to_str(i)
+@importc("driver_c_i64_to_str")
+fn int64ToStr(i: int64): str
 
 fn `$`(s: str): str =
     return s
 
-fn `$`(b: bool): str =
-    if b:
-        return "true"
-    return "false"
-
-fn `$`(c: char): str =
-    return charToStr c
-
-fn `$`(x: int): str =
-    let v: int32 = int32(x)
-    return intToStr v
-
-fn `$`(x: int32): str =
-    return intToStr x
-
-fn `$`(x: int64): str =
-    return int64ToStr x
-
-fn `$`(x: uint): str =
-    let v: int32 = int32(x)
-    return intToStr v
-
-fn `$`(x: uint32): str =
-    let v: int32 = int32(x)
-    return intToStr v
-
-fn `$`(x: uint64): str =
-    return uint64ToStr x
-
-fn `$`(x: float): str =
-    let v: int32 = int32(x)
-    return intToStr v
-
-fn `$`(x: float32): str =
-    let v: int32 = int32(x)
-    return intToStr v
-
-fn `$`(x: float64): str =
-    let v: int32 = int32(x)
-    return intToStr v
-
-fn `$`(xs: T[]): str =
+fn `$`(xs: str[]): str =
     var out: str = "["
-    for i in 0..<xs.len:
+    for i in 0..<len(xs):
         if i > 0:
             out = out + ","
         out = out + $(xs[i])
+    out = out + "]"
+    return out
+
+fn `$`(xs: bool[]): str =
+    var out: str = "["
+    for i in 0..<len(xs):
+        if i > 0:
+            out = out + ","
+        if xs[i]:
+            out = out + "true"
+        else:
+            out = out + "false"
+    out = out + "]"
+    return out
+
+fn `$`(xs: int32[]): str =
+    var out: str = "["
+    for i in 0..<len(xs):
+        if i > 0:
+            out = out + ","
+        out = out + intToStr(xs[i])
+    out = out + "]"
+    return out
+
+fn `$`(xs: int64[]): str =
+    var out: str = "["
+    for i in 0..<len(xs):
+        if i > 0:
+            out = out + ","
+        out = out + int64ToStr(xs[i])
     out = out + "]"
     return out

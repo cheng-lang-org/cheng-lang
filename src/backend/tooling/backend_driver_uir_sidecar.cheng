@@ -1,6 +1,15 @@
 import std/system
+import std/os
+import std/strutils
 import std/rawmem_support
 import backend/uir/uir_builder
+import backend/uir/uir_codegen
+import backend/uir/uir_internal/uir_core_types
+
+importc fn driver_c_write_exact_file(path: cstring, buffer: void*, len: int32): int32
+
+fn driverSidecarOptLevel(): int32 =
+    return int32(parseInt(os.getEnvDefault("BACKEND_OPT_LEVEL", "0")))
 
 @exportc("driver_buildActiveModulePtrs")
 fn driver_buildActiveModulePtrs(input_raw: cstring, target_raw: cstring): void* =
@@ -11,4 +20,40 @@ fn driver_buildActiveModulePtrs(input_raw: cstring, target_raw: cstring): void* 
         return nil
     let target: str = target_raw == nil ? "" : str(target_raw)
     let module: UirModule = uirBuildModuleFromFileStage1TargetOrPanic(inputPath, target)
+    if os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1":
+        echo("[sidecar.build] funcs=" + intToStr(uirModuleFuncsLen(module)) +
+             " target=" + uirModuleTargetOf(module))
+    memRetain(rawmemAsVoid(module))
     return rawmemAsVoid(module)
+
+@exportc("driver_emit_obj_from_module_default_impl")
+fn driver_emit_obj_from_module_default_impl(module_raw: void*, target_raw: cstring, out_raw: cstring): int32 =
+    if module_raw == nil:
+        return -11
+    if out_raw == nil:
+        return -12
+    let outPath: str = str(out_raw)
+    if len(outPath) == 0:
+        return -12
+    let target: str = target_raw == nil ? "" : str(target_raw)
+    let module: UirModule = UirModule(module_raw)
+    var rc: int32 = 0
+    if len(target) > 0:
+        let coreModule: UirCoreModule = UirCoreModule(module)
+        coreModule.target = target
+    if os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1":
+        echo("[sidecar.emit] funcs=" + intToStr(uirModuleFuncsLen(module)) +
+             " target=" + uirModuleTargetOf(module))
+    let objRes: Result[uint8[]] = uirEmitObjFromModule(module, driverSidecarOptLevel(), target, "", false, false, 0, "autovec")
+    if !IsOk[uint8[]](objRes):
+        rc = -10
+    else:
+        let obj: uint8[] = objRes.value
+        if len(obj) <= 0:
+            rc = -13
+        elif obj.buffer == nil:
+            rc = -14
+        else:
+            rc = driver_c_write_exact_file(out_raw, obj.buffer, obj.len)
+    memRelease(module_raw)
+    return rc
