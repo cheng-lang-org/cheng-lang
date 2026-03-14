@@ -1,10 +1,11 @@
 # bytes.cheng - minimal binary buffer + reader helpers
 import std/os
+import std/rawmem_support
 
 type
     ByteBuffer =
         len: int32
-        data: void*
+        data: ptr
 
 type
     ByteReader =
@@ -12,9 +13,13 @@ type
         pos: int32
 
 @importc("cheng_jpeg_decode")
-fn c_jpeg_decode(data: void*, len: int32, out_w: void*, out_h: void*): void*
+fn c_jpeg_decode(data: ptr, len: int32, out_w: ptr, out_h: ptr): ptr
 @importc("cheng_jpeg_free")
-fn c_jpeg_free(p: void*)
+fn c_jpeg_free(p: ptr)
+@importc("cheng_rawbytes_get_at")
+fn bytesRawGetAt(base: ptr, idx: int32): int32
+@importc("cheng_rawbytes_set_at")
+fn bytesRawSetAt(base: ptr, idx: int32, value: int32)
 
 fn emptyBytes(): ByteBuffer =
     ByteBuffer(len: 0, data: nil)
@@ -22,7 +27,7 @@ fn emptyBytes(): ByteBuffer =
 fn newByteBuffer(len: int32): ByteBuffer =
     if len <= 0:
         return ByteBuffer(len: 0, data: nil)
-    let p: void* = alloc len
+    let p: ptr = alloc len
     return ByteBuffer(len: len, data: p)
 
 fn fileExists(path: str): bool =
@@ -50,14 +55,14 @@ fn readFileBytes(path: str): ByteBuffer =
         c_fclose f
         return out
     let cap: int32 = int32(size64)
-    let buf: void* = alloc cap
+    let buf: ptr = alloc cap
     if buf == nil:
         c_fclose f
         return out
     var lenRead: int32 = 0
     while lenRead < cap:
         let avail: int32 = cap - lenRead
-        let dst: void* = ptr_add(buf, lenRead)
+        let dst: ptr = rawmem_support.rawmemPtrAdd(buf, lenRead)
         let got: int32 = c_fread(dst, 1, avail, f)
         if got <= 0:
             break
@@ -70,9 +75,7 @@ fn readFileBytes(path: str): ByteBuffer =
 fn bufByteAt(buf: ByteBuffer, idx: int32): int32 =
     if idx < 0 || idx >= buf.len:
         return -1
-    let p: void* = ptr_add(buf.data, idx)
-    let p8: int8* = int8*(p)
-    var v: int32 = int32(*p8)
+    var v: int32 = bytesRawGetAt(buf.data, idx)
     if v < 0:
         v = v + 256
     return v
@@ -80,9 +83,7 @@ fn bufByteAt(buf: ByteBuffer, idx: int32): int32 =
 fn bufSetByte(buf: ByteBuffer, idx: int32, val: int32) =
     if idx < 0 || idx >= buf.len:
         return
-    let p: void* = ptr_add(buf.data, idx)
-    let p8: int8* = int8*(p)
-    *p8 = int8(val)
+    bytesRawSetAt(buf.data, idx, val)
 
 fn writeU32LEAt(buf: ByteBuffer, idx: int32, val: int32) =
     if idx < 0 || idx + 4 > buf.len:
@@ -171,18 +172,18 @@ fn readF32LEAt(buf: ByteBuffer, idx: int32): float64 =
 fn decodeJpegRgba(data: ByteBuffer): ByteBuffer =
     if data.data == nil || data.len <= 0:
         return emptyBytes()
-    let wPtr: void* = alloc 4
-    let hPtr: void* = alloc 4
+    let wPtr: ptr = alloc 4
+    let hPtr: ptr = alloc 4
     var out: ByteBuffer = emptyBytes()
-    let p: void* = c_jpeg_decode(data.data, data.len, wPtr, hPtr)
+    let p: ptr = c_jpeg_decode(data.data, data.len, wPtr, hPtr)
     if p != nil:
         let w: int32 = load[int32] wPtr
         let h: int32 = load[int32] hPtr
         let size: int32 = w * h * 4
         if size > 0:
             out = newByteBuffer size
-            copyMem(out.data, p, size)
+            rawmem_support.rawmemCopy(out.data, p, size)
     c_jpeg_free p
-    dealloc wPtr
-    dealloc hPtr
+    free(wPtr)
+    free(hPtr)
     return out

@@ -6,6 +6,7 @@ import std/result
 import std/os
 import std/system
 import backend/machine/machine_types
+import backend/obj/cstring_label_support
 import backend/obj/obj_buf
 
 type
@@ -35,7 +36,7 @@ fn mx64PersistStr(value: str): str =
     var out: str = ""
     for i in 0..<len(value):
         out = out + charToStr(value[i])
-    memRetain(void*(out))
+    memRetain(out)
     return out
 
 const
@@ -68,7 +69,7 @@ const
     X86_64_RELOC_BRANCH: uint8 = 2
 
 fn mx64_strContains(hay: str, needle: str): bool =
-    if void*(hay) == nil || void*(needle) == nil:
+    if hay == nil || needle == nil:
         return false
     let n: int32 = len(hay)
     let m: int32 = len(needle)
@@ -96,11 +97,11 @@ fn mx64_isPrivateFuncSym(name: str): bool =
     return strings.hasPrefix(name, "__cheng_global_init")
 
 fn mx64_strCmp(a: str, b: str): int32 =
-    if void*(a) == nil && void*(b) == nil:
+    if a == nil && b == nil:
         return 0
-    if void*(a) == nil:
+    if a == nil:
         return -1
-    if void*(b) == nil:
+    if b == nil:
         return 1
     let na: int32 = len(a)
     let nb: int32 = len(b)
@@ -118,144 +119,66 @@ fn mx64_strCmp(a: str, b: str): int32 =
         return 1
     return 0
 
-fn mx64_seqContainsStr(items: str[], value: str): bool =
-    for i in 0..<items.len:
-        if (items[i] == value):
-            return true
-    return false
-
-fn mx64_hexNibble(c: char): int32 =
-    if c >= '0' && c <= '9':
-        return int32(c) - int32('0')
-    if c >= 'a' && c <= 'f':
-        return 10 + int32(c) - int32('a')
-    if c >= 'A' && c <= 'F':
-        return 10 + int32(c) - int32('A')
-    return -1
-
-fn mx64_canonicalCStringReloc(name: str): str =
-    let _: str = name
-    return ""
-
-fn mx64_cstringSymbolAlias(rawName: str, canonical: str): str =
-    if void*(rawName) == nil || void*(canonical) == nil || len(rawName) == 0 || len(canonical) == 0:
-        return ""
-    let underscored: str = "_" + canonical
-    if rawName == canonical:
-        return underscored
-    if rawName == underscored:
-        return canonical
-    return ""
-
-fn mx64_addSynthCStringSym(names: var str[], offs: var uint64[],
-                           seen: var hashmaps.HashMapStrInt,
-                           name: str, off: uint64) =
+fn mx64_addCstringSymIfAbsent(outSyms: MachoX64Sym[],
+                              index: var hashmaps.HashMapStrInt,
+                              name: str, nSect: uint8, nValue: uint64): MachoX64Sym[] =
     if len(name) == 0:
-        return
+        return outSyms
     var exists: bool = false
-    let cur: int32 = hashmaps.hashMapStrIntGetEx(seen, name, exists)
-    if exists && cur != 0:
-        return
-    hashmaps.hashMapStrIntPut(seen, name, 1)
-    add(names, name)
-    add(offs, off)
-
-fn mx64_collectSynthCstringsFromRelocs(relocs: MachoX64Reloc[], cstring: var uint8[],
-                                       names: var str[], offs: var uint64[]) =
-    if relocs.len == 0:
-        return
-    var canonToOff: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
-    var nameSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(256)
-    for ri in 0..<relocs.len:
-        let r0: MachoX64Reloc = relocs[ri]
-        if void*(r0) == nil || len(r0.sym) == 0:
-            continue
-        let canonical: str = mx64_canonicalCStringReloc(r0.sym)
-        if len(canonical) == 0:
-            continue
-        var hasCanon: bool = false
-        let offStored: int32 = hashmaps.hashMapStrIntGetEx(canonToOff, canonical, hasCanon)
-        var off: uint64 = 0
-        if hasCanon && offStored > 0:
-            off = uint64(offStored - 1)
-        else:
-            off = uint64(cstring.len)
-            bufU8(&cstring, uint8(0))
-            hashmaps.hashMapStrIntPut(canonToOff, canonical, int32(int64(off) + int64(1)))
-        mx64_addSynthCStringSym(names, offs, nameSeen, canonical, off)
-        mx64_addSynthCStringSym(names, offs, nameSeen, r0.sym, off)
-        let alias: str = mx64_cstringSymbolAlias(r0.sym, canonical)
-        mx64_addSynthCStringSym(names, offs, nameSeen, alias, off)
+    hashmaps.hashMapStrIntGetEx(index, name, exists)
+    if exists:
+        return outSyms
+    return mx64_addSymIndexed(outSyms, index, name, MX64_N_SECT, nSect, nValue)
 
 
 
 fn mx64_readStrPtr(items: var str[], idx: int32): str =
-    if void*(items) == nil:
-        panic "macho_writer_x86_64: nil seq pointer"
     return items[int(idx)]
 
 fn mx64_writeStrPtr(items: var str[], idx: int32, val: str) =
-    if void*(items) == nil:
-        panic "macho_writer_x86_64: nil seq pointer"
     items[int(idx)] = len(val) > 0 ? mx64PersistStr(val) : ""
 
 fn mx64_addStrPtr(items: var str[], value: str) =
-    if void*(items) == nil:
-        return
     add(items, value)
 
 fn mx64_seqInitEmpty[T](items: var T[]) =
-    if void*(items) == nil:
-        return
     items.buffer = nil
     items.len = 0
     items.cap = 0
 
 fn mx64_seqInitEmpty_uint8(items: var uint8[]) =
-    if void*(items) == nil:
-        return
     items.buffer = nil
     items.len = 0
     items.cap = 0
 
 fn mx64_seqInitEmpty_uint64(items: var uint64[]) =
-    if void*(items) == nil:
-        return
     items.buffer = nil
     items.len = 0
     items.cap = 0
 
 fn mx64_seqInitEmpty_str(items: var str[]) =
-    if void*(items) == nil:
-        return
     items.buffer = nil
     items.len = 0
     items.cap = 0
 
 fn mx64_seqInitEmpty_MachoX64Reloc(items: var MachoX64Reloc[]) =
-    if void*(items) == nil:
-        return
     items.buffer = nil
     items.len = 0
     items.cap = 0
 
 fn mx64_seqInitEmpty_MachoX64Sym(items: var MachoX64Sym[]) =
-    if void*(items) == nil:
-        return
     items.buffer = nil
     items.len = 0
     items.cap = 0
 
 fn mx64_seqAddUniqueStr(items: var str[], value: str) =
-    if void*(items) == nil || len(value) == 0:
+    if len(value) == 0:
         return
-    if mx64_seqContainsStr(items, value):
+    if objCStringSeqContainsStr(items, value):
         return
     mx64_addStrPtr(items, value)
 
 fn mx64_sortStringsStable(items: var str[]) =
-    if void*(items) == nil:
-        return
     for i in 1..<items.len:
         let key: str = mx64_readStrPtr(items, i)
         var j: int32 = i - 1
@@ -270,42 +193,36 @@ fn mx64_sortStringsStable(items: var str[]) =
 fn mx64_seqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
     if idx < 0 || idx >= items.len || items.buffer == nil:
         return nil
-    let elemBytes: int32 = idx * ptrSize()
-    let readPtr: MachineFunc* = MachineFunc*(ptr_add(items.buffer, elemBytes))
-    return *readPtr
+    return items[idx]
 
 fn mx64_seqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
     if idx < 0 || idx >= items.len || items.buffer == nil:
         return nil
-    let elemBytes: int32 = idx * ptrSize()
-    let readPtr: MachineGlobal* = MachineGlobal*(ptr_add(items.buffer, elemBytes))
-    return *readPtr
+    return items[idx]
 
 fn mx64_seqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
     if idx < 0 || idx >= items.len || items.buffer == nil:
         return nil
-    let elemBytes: int32 = idx * ptrSize()
-    let readPtr: MachineInst* = MachineInst*(ptr_add(items.buffer, elemBytes))
-    return *readPtr
+    return items[idx]
 
 fn mx64_moduleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
-    if void*(mod) == nil:
+    if mod == nil:
         return nil
     return machineModuleFuncAt(mod, idx)
 
 fn mx64_moduleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
     var zero: MachineCString
-    if void*(mod) == nil:
+    if mod == nil:
         return zero
     return machineModuleCStringAt(mod, idx)
 
 fn mx64_moduleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
-    if void*(mod) == nil:
+    if mod == nil:
         return nil
     return machineModuleGlobalAt(mod, idx)
 
 fn mx64_funcInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
-    if void*(func) == nil:
+    if func == nil:
         return nil
     return machineFuncInstAt(func, idx)
 
@@ -318,8 +235,7 @@ fn mx64_alignUp(value: uint64, align: uint64): uint64 =
     return value + (align - rem)
 
 fn mx64_addSym(outSyms: MachoX64Sym[], name: str, nType: uint8, nSect: uint8, nValue: uint64): MachoX64Sym[] =
-    var s: MachoX64Sym
-    new s
+    var s: MachoX64Sym = new(MachoX64Sym)
     s.name = mx64PersistStr(name)
     s.nType = nType
     s.nSect = nSect
@@ -345,11 +261,11 @@ fn mx64_addSymIndexed(outSyms: MachoX64Sym[], index: var hashmaps.HashMapStrInt,
     return out
 
 fn mx64_findSymIndex(syms: MachoX64Sym[], name: str): int32 =
-    if void*(name) == nil:
+    if name == nil:
         return -1
     for i in 0..<syms.len:
         let s: MachoX64Sym = syms[i]
-        if void*(s) != nil && (s.name == name):
+        if s != nil && (s.name == name):
             return i
     return -1
 
@@ -357,7 +273,7 @@ fn mx64_buildSymIndexMap(syms: MachoX64Sym[]): hashmaps.HashMapStrInt =
     var out: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(syms.len * 2 + 1)
     for i in 0..<syms.len:
         let s: MachoX64Sym = syms[i]
-        if void*(s) != nil && void*(s.name) != nil && s.name[0] != char(0):
+        if s != nil && s.name != nil && s.name[0] != char(0):
             hashmaps.hashMapStrIntPut(out, s.name, i)
     return out
 
@@ -786,7 +702,7 @@ fn x64EmitLoad16(out: var uint8[], rd: MachineReg, base: MachineReg, offset: int
                      true, false, false, false)
 
 fn mx64_build(module: MachineModule): Result[uint8[]] =
-    if void*(module) == nil:
+    if module == nil:
         return Err[uint8[]]("macho_writer_x86_64: nil module")
     if ! mx64_targetIsDarwin(machineModuleTargetOf(module)):
         return Err[uint8[]]("macho_writer_x86_64: non-darwin target not supported")
@@ -886,8 +802,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
                 x64EmitMovImm(text, machineInstRdOf(inst), machineInstImmOf(inst))
             of machineOpAdrp:
                 x64EmitLeaRipRel32(text, machineInstRdOf(inst))
-                var r: MachoX64Reloc
-                new r
+                var r: MachoX64Reloc = new(MachoX64Reloc)
                 r.off = uint32(instStart + 3)
                 r.sym = mx64PersistStr(machineInstLabelOf(inst))
                 r.rtype = X86_64_RELOC_SIGNED
@@ -946,8 +861,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
                 x64EmitCmpRR(text, machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpB:
                 x64EmitJmpRel32(text)
-                var f0: TextFixup
-                new f0
+                var f0: TextFixup = new(TextFixup)
                 f0.dispOff = instStart + 1
                 f0.nextOff = int32(text.len)
                 f0.label = mx64PersistStr(machineInstLabelOf(inst))
@@ -955,16 +869,14 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
             of machineOpBCond:
                 let cc: uint8 = x64JccCode(machineInstCondOf(inst))
                 x64EmitJccRel32(text, cc)
-                var f1: TextFixup
-                new f1
+                var f1: TextFixup = new(TextFixup)
                 f1.dispOff = instStart + 2
                 f1.nextOff = int32(text.len)
                 f1.label = mx64PersistStr(machineInstLabelOf(inst))
                 add(fixups, f1)
             of machineOpBl:
                 x64EmitCallRel32(text)
-                var r2: MachoX64Reloc
-                new r2
+                var r2: MachoX64Reloc = new(MachoX64Reloc)
                 r2.off = uint32(instStart + 1)
                 r2.sym = mx64PersistStr(symPrefix + machineInstLabelOf(inst))
                 r2.rtype = X86_64_RELOC_BRANCH
@@ -1007,14 +919,6 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
             if disp < int64(-2147483648) || disp > int64(2147483647):
                 return Err[uint8[]]("macho_writer_x86_64: branch displacement out of range")
             bufU32At(text, fx.dispOff, uint32(int32(disp)))
-
-    # Materialize reloc-only `L_cheng_str_*` labels into this object so system
-    # linkers do not need cross-object resolution for temporary-style symbols.
-    var synthCstrNames: str[]
-    var synthCstrOffs: uint64[]
-    mx64_seqInitEmpty_str(&synthCstrNames)
-    mx64_seqInitEmpty_uint64(&synthCstrOffs)
-    mx64_collectSynthCstringsFromRelocs(relocs, cstring, synthCstrNames, synthCstrOffs)
 
     # Sections: always include __text, optionally __cstring/__data/__bss.
     let hasCstr: bool = cstring.len > 0
@@ -1068,7 +972,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     # Build symbol list in dyld order: locals, extdefs, undefs.
     var syms: MachoX64Sym[]
     mx64_seqInitEmpty_MachoX64Sym(syms)
-    var symIndexCapHint: int32 = machineModuleCstrsLen(module) + synthCstrNames.len +
+    var symIndexCapHint: int32 = machineModuleCstrsLen(module) * 2 +
                                  machineModuleFuncsLen(module) + machineModuleGlobalsLen(module)
     if symIndexCapHint < 64:
         symIndexCapHint = 64
@@ -1079,18 +983,24 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
         let c2: MachineCString = mx64_moduleCStringAtRaw(module, ci)
         if hasCstr && machineCStringValid(c2) && len(machineCStringLabelOf(c2)) > 0:
             let symName: str = machineCStringLabelOf(c2)
-            var hasCstrSym: bool = false
-            hashmaps.hashMapStrIntGetEx(symIndexMap, symName, hasCstrSym)
-            if hasCstrSym:
-                continue
             let v: uint64 = cstrAddr + cSymOffs[ci]
-            syms = mx64_addSymIndexed(syms, symIndexMap, symName, MX64_N_SECT, cstrSectIndex, v)
-    for si in 0..<synthCstrNames.len:
-        var hasSynth: bool = false
-        hashmaps.hashMapStrIntGetEx(symIndexMap, synthCstrNames[si], hasSynth)
-        if hasCstr && !hasSynth:
-            let vSynth: uint64 = cstrAddr + synthCstrOffs[si]
-            syms = mx64_addSymIndexed(syms, symIndexMap, synthCstrNames[si], MX64_N_SECT, cstrSectIndex, vSynth)
+            let canonical: str = objCStringCanonicalTempLabel(symName)
+            syms = mx64_addCstringSymIfAbsent(syms, symIndexMap, symName, cstrSectIndex, v)
+            if len(canonical) > 0 && canonical != symName:
+                syms = mx64_addCstringSymIfAbsent(syms, symIndexMap, canonical, cstrSectIndex, v)
+            let alias: str = objCStringMachoSymbolAlias(symName, len(canonical) > 0 ? canonical : symName)
+            syms = mx64_addCstringSymIfAbsent(syms, symIndexMap, alias, cstrSectIndex, v)
+    for ri in 0..<relocs.len:
+        let r0: MachoX64Reloc = relocs[ri]
+        if r0 == nil || len(r0.sym) == 0:
+            continue
+        let canonicalReloc: str = objCStringCanonicalTempLabel(r0.sym)
+        if len(canonicalReloc) == 0:
+            continue
+        var hasCstrSym: bool = false
+        hashmaps.hashMapStrIntGetEx(symIndexMap, r0.sym, hasCstrSym)
+        if !hasCstrSym:
+            return Err[uint8[]](objCStringMissingSelectorRelocErr("macho_writer_x86_64", r0.sym))
 
     # local funcs
     for fi in 0..<machineModuleFuncsLen(module):
@@ -1141,7 +1051,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     var undefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(undefCapHint * 2 + 1)
     for ri in 0..<relocs.len:
         let r0: MachoX64Reloc = relocs[ri]
-        if void*(r0) != nil && void*(r0.sym) != nil && r0.sym[0] != char(0):
+        if r0 != nil && r0.sym != nil && r0.sym[0] != char(0):
             var hasSym: bool = false
             hashmaps.hashMapStrIntGetEx(symIndexMap, r0.sym, hasSym)
             if !hasSym:
@@ -1163,7 +1073,7 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     bufAddU8(strtab, uint8(0))
     for si in 0..<syms.len:
         let s0: MachoX64Sym = syms[si]
-        if void*(s0) != nil:
+        if s0 != nil:
             if len(s0.name) > 0:
                 s0.nameOff = uint32(strtab.len)
                 bufStr0(strtab, s0.name)
@@ -1406,6 +1316,6 @@ fn mx64_build(module: MachineModule): Result[uint8[]] =
     return Ok[uint8[]](out)
 
 fn machoWriteX86_64RelocatableObj(module: MachineModule): Result[uint8[]] =
-    if void*(module) != nil:
-        memRetain(void*(module))
+    if module != nil:
+        memRetain(module)
     return mx64_build(module)

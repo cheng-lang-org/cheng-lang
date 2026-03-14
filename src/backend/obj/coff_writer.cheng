@@ -3,6 +3,7 @@ import std/seqs
 import std/strings
 import std/result
 import backend/machine/machine_types
+import backend/obj/cstring_label_support
 import backend/obj/obj_buf
 import backend/obj/aarch64_enc
 
@@ -102,56 +103,26 @@ fn coff_strCmp(a: str, b: str): int32 =
         return 1
     return 0
 
-fn coff_seqContainsStr(items: var str[], value: str): bool =
-    for i in 0..<items.len:
-        if (items[i] == value):
-            return true
-    return false
-
-fn coffHexNibble(c: char): int32 =
-    if c >= '0' && c <= '9':
-        return int32(c) - int32('0')
-    if c >= 'a' && c <= 'f':
-        return 10 + int32(c) - int32('a')
-    if c >= 'A' && c <= 'F':
-        return 10 + int32(c) - int32('A')
-    return -1
-
-fn coffCanonicalCStringReloc(name: str): str =
-    let _: str = name
-    return ""
-
-
 fn coffReadStrPtr(items: var str[], idx: int32): str =
-    if void*(items) == nil:
-        panic "coff_writer: nil seq pointer"
     return items[int(idx)]
 
 fn coffWriteStrPtr(items: var str[], idx: int32, val: str) =
-    if void*(items) == nil:
-        panic "coff_writer: nil seq pointer"
     items[int(idx)] = val
 
 fn coffAddStrPtr(items: var str[], value: str) =
-    if void*(items) == nil:
-        return
     add(items, value)
 
 fn coffAddSymPtr(outSyms: var CoffSym[], s: CoffSym) =
-    if void*(outSyms) == nil:
-        return
     add(outSyms, s)
 
 fn coff_seqAddUniqueStr(items: var str[], value: str) =
-    if void*(items) == nil || len(value) == 0:
+    if len(value) == 0:
         return
-    if coff_seqContainsStr(items, value):
+    if objCStringSeqContainsStr(items, value):
         return
     coffAddStrPtr(items, value)
 
 fn coff_sortStringsStable(items: var str[]) =
-    if void*(items) == nil:
-        return
     for i in 1..<items.len:
         let key: str = coffReadStrPtr(items, i)
         var j: int32 = i - 1
@@ -173,8 +144,7 @@ fn alignUp32(value: uint32, align: uint32): uint32 =
 
 fn coffAddSym(outSyms: var CoffSym[], name: str, value: uint32, sect: int32,
               stype: uint16, storage: uint8) =
-    var s: CoffSym
-    new s
+    var s: CoffSym = new(CoffSym)
     s.name = name
     s.value = value
     s.sect = sect
@@ -188,7 +158,7 @@ fn coffFindSymIndex(syms: CoffSym[], name: str): int32 =
         return -1
     for i in 0..<syms.len:
         let s: CoffSym = syms[i]
-        if void*(s) != nil && (s.name == name):
+        if s != nil && (s.name == name):
             return i
     return -1
 
@@ -205,23 +175,23 @@ fn coffSeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
     return items[int(idx)]
 
 fn coffModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
-    if void*(mod) == nil:
+    if mod == nil:
         return nil
     return machineModuleFuncAt(mod, idx)
 
 fn coffModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
     var zero: MachineCString
-    if void*(mod) == nil:
+    if mod == nil:
         return zero
     return machineModuleCStringAt(mod, idx)
 
 fn coffModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
-    if void*(mod) == nil:
+    if mod == nil:
         return nil
     return machineModuleGlobalAt(mod, idx)
 
 fn coffFuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
-    if void*(func) == nil:
+    if func == nil:
         return nil
     return machineFuncInstAt(func, idx)
 
@@ -237,7 +207,7 @@ fn coffSectionAlignFlag(pow2: int32): uint32 =
     return IMAGE_SCN_ALIGN_16BYTES
 
 fn coffBuild(module: MachineModule): Result[uint8[]] =
-    if void*(module) == nil:
+    if module == nil:
         return Err[uint8[]]("coff_writer: nil module")
     let target: str = machineModuleTargetOf(module)
     if ! coff_targetIsWindows(target):
@@ -360,16 +330,14 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
                 continue
             elif machineInstOpOf(inst) == machineOpAdrp:
                 word = a64EncAdrp(a64RegNum(machineInstRdOf(inst)))
-                var r: CoffReloc
-                new r
+                var r: CoffReloc = new(CoffReloc)
                 r.off = off
                 r.sym = machineInstLabelOf(inst)
                 r.rtype = IMAGE_REL_ARM64_PAGEBASE_REL21
                 add(relocs, r)
             elif machineInstOpOf(inst) == machineOpAddPageOff:
                 word = a64EncAddImm(true, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), 0)
-                var r2: CoffReloc
-                new r2
+                var r2: CoffReloc = new(CoffReloc)
                 r2.off = off
                 r2.sym = machineInstLabelOf(inst)
                 r2.rtype = IMAGE_REL_ARM64_PAGEOFFSET_12A
@@ -485,8 +453,7 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
                 word = Value[uint32](encRes8)
             elif machineInstOpOf(inst) == machineOpBl:
                 word = a64EncBl()
-                var r3: CoffReloc
-                new r3
+                var r3: CoffReloc = new(CoffReloc)
                 r3.off = off
                 r3.sym = machineInstLabelOf(inst)
                 r3.rtype = IMAGE_REL_ARM64_BRANCH26
@@ -519,24 +486,17 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
             ii = ii + 1
             curOff = curOff + 4
 
-    # Some stage0/seed paths keep L_cheng_str_* as reloc-only symbols.
-    # Materialize zero-terminated placeholders in .rdata to keep this object
-    # self-contained for local string relocations.
-    var synthCstrNames: str[]
-    var synthCstrOffs: uint32[]
+    # Selector owns cstring materialization. Local canonical cstring relocs must
+    # already point at emitted canonical cstring labels.
     for ri in 0..<relocs.len:
         let rSynth: CoffReloc = relocs[ri]
-        if void*(rSynth) == nil || len(rSynth.sym) == 0:
+        if rSynth == nil || len(rSynth.sym) == 0:
             continue
-        let canonical: str = coffCanonicalCStringReloc(rSynth.sym)
+        let canonical: str = objCStringCanonicalTempLabel(rSynth.sym)
         if len(canonical) == 0:
             continue
-        if coff_seqContainsStr(cSymLabels, canonical) || coff_seqContainsStr(synthCstrNames, canonical):
-            continue
-        let offSynth: uint32 = uint32(rdata.len)
-        bufU8(&rdata, uint8(0))
-        add(synthCstrNames, canonical)
-        add(synthCstrOffs, offSynth)
+        if !objCStringSeqContainsStr(cSymLabels, canonical):
+            return Err[uint8[]](objCStringMissingSelectorRelocErr("coff_writer", rSynth.sym))
 
     let hasRdata: bool = rdata.len > 0
     let hasData: bool = data.len > 0
@@ -566,9 +526,6 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
         for ci in 0..<cstrCount:
             let c2: MachineCString = coffModuleCStringAtRaw(module, ci)
             coffAddSym(syms, machineCStringLabelOf(c2), cSymOffs[ci], rdataIndex,
-                       uint16(0), IMAGE_SYM_CLASS_STATIC)
-        for si in 0..<synthCstrNames.len:
-            coffAddSym(syms, synthCstrNames[si], synthCstrOffs[si], rdataIndex,
                        uint16(0), IMAGE_SYM_CLASS_STATIC)
 
     # local funcs
@@ -606,7 +563,7 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
     var undefs: str[]
     for ri in 0..<relocs.len:
         let r0: CoffReloc = relocs[ri]
-        if void*(r0) != nil && len(r0.sym) > 0:
+        if r0 != nil && len(r0.sym) > 0:
             if coffFindSymIndex(syms, r0.sym) < 0:
                 coff_seqAddUniqueStr(&undefs, r0.sym)
     coff_sortStringsStable(&undefs)
@@ -618,7 +575,7 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
     bufU32(strtab, uint32(0)) # placeholder size
     for si in 0..<syms.len:
         let s0: CoffSym = syms[si]
-        if void*(s0) != nil && len(s0.name) > 8:
+        if s0 != nil && len(s0.name) > 8:
             s0.nameOff = uint32(strtab.len)
             bufStr0(strtab, s0.name)
             syms[si] = s0
@@ -790,6 +747,6 @@ fn coffBuild(module: MachineModule): Result[uint8[]] =
     return Ok[uint8[]](out)
 
 fn coffWriteAarch64RelocatableObj(module: MachineModule): Result[uint8[]] =
-    if void*(module) != nil:
-        memRetain(void*(module))
+    if module != nil:
+        memRetain(module)
     return coffBuild(module)

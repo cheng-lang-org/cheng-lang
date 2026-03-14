@@ -133,6 +133,15 @@
   - `UIR_NOALIAS_NJVL_LITE=1` 时，`noalias_report` 会附带 `unknown_slot_clobbers`、`unknown_global_clobbers`、`kill_events` 等扩展字段。
 - runtime probe 例外：
   - `verify_backend_noalias_opt` / `verify_backend_egraph_cost` / `verify_backend_dod_opt_regression` 的门禁探针默认固定 `UIR_PROFILE=0` + `BACKEND_PROFILE=0`，避免 in-memory self-link 场景的 profile 崩溃；这些 gate 以报告字段与 surface marker 验收。
+- High-UIR / Low-UIR 契约边界：
+  - `verify_backend_opt2_impl_surface` 负责冻结 `High-UIR proof -> Low-UIR consumer` 的实现边界与 marker surface。
+  - `verify_backend_noalias_opt` / `verify_backend_egraph_cost` / `verify_backend_dod_opt_regression` 负责 runtime probe，不再重复承担实现 surface 定义。
+  - `SoA` / `DOD` / `NoAlias` / `Egraph` 四项技术债已按 contract 口径收口；本文只保留单一边界说明，不再为同一事项维护第二套口径。
+- dot-lowering contract sync：
+  - `dot_lowering_contract.uiR_doc.synced=1`
+  - 语义 dot lowering 正式入口在 `src/backend/uir/uir_internal/uir_core_builder.cheng`。
+  - selector-side `cstring lowering` 仍是实现债；canonical backfill 入口在 `src/backend/uir/uir_codegen.cheng`，object writer 兼容 materialization 入口在 `src/backend/obj/coff_writer_x86_64.cheng`。
+  - `dot-lowering` 技术债已按 contract 口径收口；剩余 selector/backfill 差距统一只记在升级条件。
 
 ## 8) Optimization Pipeline
 - `O1`：

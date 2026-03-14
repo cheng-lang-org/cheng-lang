@@ -10,6 +10,17 @@ typedef struct ChengStrBridge {
     int32_t flags;
 } ChengStrBridge;
 
+typedef struct ChengSeqHeader {
+  int32_t len;
+  int32_t cap;
+  void* buffer;
+} ChengSeqHeader;
+
+typedef struct ChengErrorInfoCompat {
+  int32_t code;
+  char* msg;
+} ChengErrorInfoCompat;
+
 enum {
     CHENG_STR_BRIDGE_FLAG_NONE = 0,
     CHENG_STR_BRIDGE_FLAG_OWNED = 1,
@@ -25,10 +36,29 @@ void* cheng_memset_ffi(void* dest, int32_t val, int64_t n);
 void* alloc(int32_t size);
 void copyMem(void* dest, void* src, int32_t size);
 void setMem(void* dest, int32_t val, int32_t size);
+void cheng_zero_mem_compat(void* dest, int32_t size);
 int32_t cheng_memcmp(void* a, void* b, int64_t n);
 int32_t cheng_strlen(char* s);
 int32_t cheng_strcmp(const char* a, const char* b);
 int32_t __cheng_str_eq(const char* a, const char* b);
+bool cheng_str_is_empty(const char* s);
+bool cheng_str_nonempty(const char* s);
+bool cheng_str_has_prefix_bool(const char* s, const char* prefix);
+bool cheng_str_contains_char_bool(const char* s, int32_t value);
+bool cheng_str_contains_str_bool(const char* s, const char* sub);
+char* cheng_str_drop_prefix(const char* s, const char* prefix);
+char* cheng_str_slice_bytes(const char* text, int32_t start, int32_t count);
+void cheng_str_arc_retain(const char* s);
+void cheng_str_arc_release(const char* s);
+char* cheng_str_from_bytes_compat(ChengSeqHeader data, int32_t len);
+char* cheng_char_to_str_compat(int32_t value);
+char* cheng_slice_string_compat(const char* s, int32_t start, int32_t stop, bool exclusive);
+bool cheng_str_contains_compat(const char* text, const char* sub);
+char* cheng_seq_string_repr_compat(ChengSeqHeader xs);
+char* cheng_seq_bool_repr_compat(ChengSeqHeader xs);
+char* cheng_seq_i32_repr_compat(ChengSeqHeader xs);
+char* cheng_seq_i64_repr_compat(ChengSeqHeader xs);
+ChengSeqHeader cheng_seq_return_string_compat(ChengSeqHeader out);
 void* ptr_add(void* p, int32_t offset);
 void* rawmemAsVoid(void* p);
 uint64_t cheng_ptr_to_u64(void* p);
@@ -42,6 +72,9 @@ ChengStrBridge __cheng_rt_paramStrCopyBridge(int32_t i);
 void __cheng_rt_paramStrCopyBridgeInto(int32_t i, ChengStrBridge* out);
 int32_t cmdCountFromRuntime(void);
 int32_t __cmdCountFromRuntime(void);
+bool cheng_cmd_ready_compat(void);
+char* cheng_program_name_compat(void);
+char* cheng_param_str_compat(int32_t i);
 int32_t paramCount(void);
 const char* paramStr(int32_t i);
 void store_int32(void* p, int32_t val);
@@ -51,16 +84,42 @@ int8_t load_bool(void* p);
 void store_ptr(void* p, void* val);
 void* load_ptr(void* p);
 void* cheng_ptr_seq_get_value(ChengSeqHeader seq, int32_t idx);
+void* cheng_ptr_seq_get_compat(ChengSeqHeader seq, int32_t idx);
+void cheng_ptr_seq_set_compat(ChengSeqHeader* seq_ptr, int32_t idx, void* value);
+void cheng_error_info_init_compat(ChengErrorInfoCompat* out, int32_t code, char* msg);
+int32_t cheng_error_info_code_compat(ChengErrorInfoCompat e);
+char* cheng_error_info_msg_compat(ChengErrorInfoCompat e);
 int32_t cheng_seq_header_len_get(void* seq_ptr);
 void cheng_seq_header_len_set(void* seq_ptr, int32_t value);
 int32_t cheng_seq_header_cap_get(void* seq_ptr);
 void cheng_seq_header_cap_set(void* seq_ptr, int32_t value);
 void* cheng_seq_header_buffer_get(void* seq_ptr);
 void cheng_seq_header_buffer_set(void* seq_ptr, void* value);
+int32_t cheng_seq_next_cap(int32_t cur_cap, int32_t need_len);
+void cheng_seq_grow_to_raw(void** p_buffer, int32_t* p_cap, int32_t min_cap, int32_t elem_size);
+void cheng_seq_grow_inst(void* seq_ptr, int32_t min_cap, int32_t elem_size);
+void cheng_seq_zero_tail_raw(void* buffer, int32_t seq_cap, int32_t len, int32_t target, int32_t elem_size);
+int32_t cheng_seq_string_init_cap(int32_t seq_len, int32_t seq_cap);
+int32_t cheng_seq_string_elem_bytes_compat(void);
+void* cheng_seq_string_alloc_compat(int32_t buf_cap);
+void cheng_seq_string_init_compat(void* seq_ptr, int32_t seq_len, int32_t seq_cap);
+ChengSeqHeader cheng_new_seq_string_compat(int32_t seq_len, int32_t seq_cap);
+void cheng_seq_free(void* seq_ptr);
+void cheng_seq_arc_retain(ChengSeqHeader seq);
+void cheng_seq_arc_release(ChengSeqHeader seq);
+char* cheng_seq_string_get_compat(ChengSeqHeader seq, int32_t at);
+void cheng_seq_string_add_compat(void* seq_ptr, const char* value);
+int32_t cheng_rawbytes_get_at(void* base, int32_t idx);
+void cheng_rawbytes_set_at(void* base, int32_t idx, int32_t value);
+void cheng_rawmem_write_i8(void* dst, int32_t idx, int8_t value);
+void cheng_rawmem_write_char(void* dst, int32_t idx, int32_t value);
 void cheng_func_ptr_shadow_remember(void* p);
 void* cheng_func_ptr_shadow_recover(uint64_t p);
 void* cheng_machine_inst_new(int32_t op, int32_t rd, int32_t rn, int32_t rm,
                              int32_t ra, int64_t imm, const char* label, int32_t cond);
+void* cheng_machine_inst_new_n(int32_t op, int32_t rd, int32_t rn, int32_t rm,
+                               int32_t ra, int64_t imm, const char* label, int32_t label_len,
+                               int32_t cond);
 void* cheng_machine_inst_clone(void* inst);
 int32_t cheng_machine_inst_valid(void* inst);
 int32_t cheng_machine_inst_op(void* inst);
@@ -73,6 +132,8 @@ char* cheng_machine_inst_label(void* inst);
 int32_t cheng_machine_inst_cond(void* inst);
 int32_t driver_c_chr_i32(int32_t value);
 int32_t driver_c_ord_char(int32_t value);
+int32_t driver_c_chr_i32_compat(int32_t value);
+int32_t driver_c_ord_char_compat(int32_t value);
 char* driver_c_bool_to_str(bool value);
 bool driver_c_bool_identity(bool value);
 
@@ -103,6 +164,12 @@ void cheng_spawn(void* fn_ptr, void* ctx);
 int32_t cheng_sched_pending(void);
 int32_t cheng_sched_run_once(void);
 void cheng_sched_run(void);
+int32_t cheng_thread_spawn(void* fn_ptr, void* ctx);
+int32_t cheng_thread_spawn_i32(void* fn_ptr, int32_t ctx);
+int32_t cheng_thread_parallelism(void);
+void cheng_thread_yield(void);
+int32_t cheng_thread_local_i32_get(int32_t slot);
+void cheng_thread_local_i32_set(int32_t slot, int32_t value);
 
 struct ChengAwaitI32* cheng_async_pending_i32(void);
 struct ChengAwaitI32* cheng_async_ready_i32(int32_t value);
@@ -153,6 +220,7 @@ uint64_t cheng_f32_bits_to_u64(int32_t bits);
 int32_t cheng_jpeg_decode(const uint8_t* data, int32_t len, int32_t* out_w, int32_t* out_h, uint8_t** out_rgba);
 void cheng_jpeg_free(void* p);
 int32_t cheng_abi_sum_seq_i32(uint64_t seqLike0, uint64_t seqLike1, uint64_t seqLike2);
+int32_t cheng_abi_sum_ptr_len_i32(const int32_t* ptr, int32_t len);
 void cheng_abi_borrow_mut_pair_i32(int64_t pairPtr, int32_t da, int32_t db);
 uint64_t cheng_ffi_handle_register_ptr(void* ptr);
 void* cheng_ffi_handle_resolve_ptr(uint64_t handle);
@@ -161,6 +229,10 @@ uint64_t cheng_ffi_handle_new_i32(int32_t value);
 int32_t cheng_ffi_handle_get_i32(uint64_t handle, int32_t* out_value);
 int32_t cheng_ffi_handle_add_i32(uint64_t handle, int32_t delta, int32_t* out_value);
 int32_t cheng_ffi_handle_release_i32(uint64_t handle);
+void* cheng_ffi_raw_new_i32(int32_t value);
+int32_t cheng_ffi_raw_get_i32(void* p);
+int32_t cheng_ffi_raw_add_i32(void* p, int32_t delta);
+int32_t cheng_ffi_raw_release_i32(void* p);
 int32_t cheng_crash_trace_enabled(void);
 void cheng_crash_trace_set_phase(const char* phase);
 void cheng_crash_trace_mark(const char* tag, int32_t a, int32_t b, int32_t c, int32_t d);

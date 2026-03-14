@@ -15,8 +15,8 @@ fn __cheng_rt_paramStrCopy(i: int32): str
 fn __cheng_cmdCountMax(): int32 =
     return 4096
 
-fn __cheng_captureCmdLine(argc: int32, argv: str*): void =
-    # `argv: str*` is Cheng-managed string storage and must not be reinterpreted
+fn __cheng_captureCmdLine(argc: int32, argv: ptr): void =
+    # `argv` is Cheng-managed string storage and must not be reinterpreted
     # as a C argv pointer bridge in no-pointer production surface.
     # Runtime argv access stays on __cheng_rt_paramCount/__cheng_rt_paramStrCopy.
     argc
@@ -25,47 +25,23 @@ fn __cheng_captureCmdLine(argc: int32, argv: str*): void =
 fn cmdCountFromCaptured(): int32 =
     return 0
 
-fn cmdCountFromRuntime(): int32 =
-    let runtimeRaw: int32 = __cheng_rt_paramCount()
-    if runtimeRaw < 0 || runtimeRaw > __cheng_cmdCountMax():
-        return 0
-    return runtimeRaw
+@importc("cmdCountFromRuntime")
+fn cmdCountFromRuntime(): int32
 
-fn cmdReady(): bool =
-    let argc: int32 = cmdCountFromRuntime()
-    if argc <= 0:
-        return false
-    if argc > __cheng_cmdCountMax():
-        return false
-    return true
+@importc("cheng_cmd_ready_compat")
+fn cmdReady(): bool
 
-fn programName(): str =
-    if !cmdReady():
-        return ""
-    return paramStr(0)
+@importc("cheng_program_name_compat")
+fn programName(): str
 
-fn paramCount(): int32 =
-    let argc: int32 = cmdCountFromRuntime()
-    if argc <= 0:
-        return 0
-    return argc - 1
+@importc("paramCount")
+fn paramCount(): int32
 
 fn argCount(): int32 =
     return paramCount()
 
-fn paramStr(i: int32): str =
-    if i < 0:
-        return ""
-    let argc: int32 = cmdCountFromRuntime()
-    if argc <= 0 || i >= argc:
-        return ""
-    let copied: str = __cheng_rt_paramStrCopy(i)
-    if strings.len(copied) > 0:
-        return copied
-    let raw: cstring = __cheng_rt_paramStr(i)
-    if raw == nil:
-        return ""
-    return str(raw)
+@importc("cheng_param_str_compat")
+fn paramStr(i: int32): str
 
 fn argStr(i: int32): str =
     return paramStr(i)
@@ -79,9 +55,13 @@ fn cmdStartsWith(text: str, prefix: str): bool =
         return false
     if m > n:
         return false
-    for i in 0..<m:
-        if text[i] != prefix[i]:
+    var i: int32 = 0
+    while i < m:
+        let lhs: str = strings.sliceBytes(text, i, 1)
+        let rhs: str = strings.sliceBytes(prefix, i, 1)
+        if !strings.streq(lhs, rhs):
             return false
+        i = i + 1
     return true
 
 fn cmdIsSpace(c: char): bool =

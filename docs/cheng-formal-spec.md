@@ -536,9 +536,21 @@ charLiteral    ::= `'` CHARACTER `'` ;
   - `str = nil`、`let/var x: str = nil`、`x == nil`、`x != nil` 在编译阶段直接报错。
   - `str` 判空请显式写 `len(s) == 0` 或 `len(s) > 0`。
   - `cstring` 作为 C ABI 指针语义保留 `nil` 比较（`== nil` / `!= nil`）。
+- string ABI contract markers：
+  - `string_abi_contract.version=1`
+  - `string_abi_contract.scheme.id=SABI`
+  - `string_abi_contract.scheme.name=backend_string_abi_contract`
+  - `string_abi_contract.scheme.normative=1`
+  - `string_abi_contract.enforce.mode=report_only`
+  - `string_abi_contract.language.str=value_semantics`
+  - `string_abi_contract.abi.cstring=ffi_boundary`
+  - `string_abi_contract.nil_compare.cstring_only=1`
+  - `string_abi_contract.formal_spec.synced=1`
+- `str ABI/cstring` 技术债在规范层已按 contract 口径收口；selector eager lowering 仅作为后端实现升级条件继续存在。
 - 实现约束：编译器后端前端统一按 `stage1` 口径处理（旧前端别名已移除），并会显式拒绝 `string`（报错提示改用 `str`/`cstring`）。
 - 类型表达式允许点限定名 `Module.Type` 用于消歧；语义等价于 `Type`，模块前缀在语义/后端 lowering 时消解。
 - `default[T]` 仅用于表达式/返回/实参位置；禁止写 `let/var/const x: T = default[T]`，应省略初始化表达式。
+- `new` 的唯一合法表面写法为 `new(TypeExpr)`，返回 zero-init 的 `ref` 值；旧 `new x` / `new(x)` 本地变量分配写法已移除。
 - 空的 `[]` 需要类型上下文（例如 `let xs: T[] = []` / `xs = []` / `return []` / 作为实参），否则会报“缺少元素类型”。
 - 类型与值命名空间分离；当 callee 解析为类型且只有一个位置参数时，`T(x)` 表示类型转换；对象构造使用具名字段参数 `T(field: ...)`。
 - C 风格 `(T)(x)` 已移除。
@@ -661,6 +673,11 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - Dev 快速自举管线（host-only）：
   - 前端解析模式：`cheng`/`selfhost` dev 入口固定 `BACKEND_STAGE1_PARSE_MODE=outline`（不再接受外部覆盖）；`release-compile` 固定 `full`。
   - 函数任务调度：`cheng`/`selfhost` dev 入口固定 `BACKEND_FN_SCHED=ws`（不再接受外部覆盖）；`release-compile` 也固定 `BACKEND_FN_SCHED=ws`。`BACKEND_JOBS` 是唯一公开 worker 数控制面；`serial` 仅保留给内部诊断、perf 对照与低内存 bring-up。
+    - `fn_parallel_contract.schedule=ws`
+    - `fn_parallel_contract.serial_internal_only=1`
+    - `fn_parallel_contract.perf_gate=verify_backend_selfhost_parallel_perf`
+    - `fn_parallel_contract.dedicated_host_only=1`
+  - 函数并行技术债在规范层已按 contract 口径收口；剩余仅是 dedicated-host perf baseline 刷新，不再视为当前规范漂移。
   - 直写可执行：dev 轨固定 `BACKEND_DIRECT_EXE=1`、`BACKEND_LINKERLESS_INMEM=1`；`BACKEND_DIRECT_EXE=1` 在 host darwin/arm64 + self-link 口径走 `macho_direct_exe_writer`。release 轨固定 `BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`。两条轨道都固定 `BACKEND_FAST_FALLBACK_ALLOW=0`。
   - 确定性边界：函数任务允许并行执行，但 `UirFnTask`/`IselFuncTask`/direct-exe 函数块结果必须按稳定声明顺序 merge；最终 `.o/.exe` 字节流不得依赖 `BACKEND_JOBS`。
 - 可选常驻编译 worker：`CHENGC_DAEMON=1` 时，`cheng` 请求经 `chengc_daemon` 本地队列执行（`start/status/stop`），用于降低频繁冷启动开销。
@@ -676,7 +693,7 @@ charLiteral    ::= `'` CHARACTER `'` ;
 - 除平台生产闭环入口：`$TOOLING backend_prod_closure`（dev-only，默认启用 `BACKEND_VALIDATE=1`，聚合 determinism‑strict、opt、SSA、FFI/ABI matrix（含 out 参数）、obj 校验+obj determinism、exe determinism、debug(dSYM)、sanitizer（可选）、`backend.selfhost_perf_regression`、`backend.multi_perf_regression` 与 mm 回归；默认包含后端 selfhost（产出 stage2），`fullchain/stress` 需显式 `--fullchain/--stress`（或 `BACKEND_RUN_FULLCHAIN=1` / `BACKEND_RUN_STRESS=1`）开启；一旦开启 `fullchain`，对应 gate 按 required 语义执行，不允许 best-effort/skip 降级）。
 - 零脚本生产闭环：`backend_prod_closure` 与 `backend-prod-publish` 默认固定 canonical tooling 路径 `artifacts/tooling_cmd/cheng_tooling`（`BACKEND_PROD_ALLOW_NONCANONICAL_TOOL_BIN=0`）；并阻断 `backend.zero_script_closure`，禁止闭环链路直调 `sh src/tooling/<id>.sh`；`cheng` 核心入口必须走 `cheng_tooling` 原生命令路由（`compile/chengc` 已移除并返回 `rc=2`）。
 - required 运行稳定性门禁（native）：`backend_prod_closure` required 链路包含 `backend.symbol_closure`（`verify_backend_symbol_closure`，固定 `return_add/return_new_ref_seq_growth` 可编译可运行并阻断 `_alloc/_c_strlen/_zeroMem` 缺失）与 `backend.release_compile_stability`（`verify_backend_release_compile_stability`，固定 `return_new_ref_seq_growth` 的 release-compile 默认 3 次稳定性，出现 `rc=139` 直接失败）。
-- required FFI 影子桥接门禁（native）：`backend_prod_closure` required 链路包含 `backend.ffi_slice_shim`、`backend.ffi_outptr_tuple`、`backend.ffi_handle_sandbox` 与 `backend.ffi_borrow_bridge`。
+- required FFI 影子桥接门禁（native）：`backend_prod_closure` required 链路当前只保留纯 surface 的 `backend.ffi_slice_shim` 与 `backend.ffi_outptr_tuple`；`backend.ffi_handle_sandbox`、`backend.ffi_borrow_bridge` 与 `backend.sidecar_cheng_seed/fresh` 保留为专项 native-substrate gate，不再进入默认 `verify/closure` 图。
 - required 零脚本残留门禁（native）：`backend_prod_closure` required 链路包含 `backend.zero_script_residual`（`verify_backend_zero_script_residual`），强制断言 `src/tooling` 下 shell 文件残留为 0、required 闭环函数不含 compile-only/skip 语义、并阻断 tooling/backend 执行路径上的 legacy `CHENG_*` 环境变量读取。
 - RawPtr + SoA required gate（native）：`backend_prod_closure` required 链路包含 `backend.rawptr_surface_forbid`（`verify_backend_rawptr_surface_forbid`，含 `std/cmdline` 无裸指针 surface 断言）、`backend.uir_soa_surface`（`verify_backend_uir_soa_surface`，SoA/index surface + runtime 合约；要求 runtime 日志包含 `soa_report` 且 `balance_ok=1`，并对双次 runtime probe 执行 determinism 一致性断言）与 `backend.uir_soa_self_probe`（`verify_backend_uir_soa_self_probe`，固定 `self-link` 子探针强制阻断）。
 - 编译入口并发收口：`cheng` 默认移除 stage0 全局锁包装，固定为 `stage0 quarantine + preflight + timeout` 语义，不再通过 compile-path lock 串行化并发任务。

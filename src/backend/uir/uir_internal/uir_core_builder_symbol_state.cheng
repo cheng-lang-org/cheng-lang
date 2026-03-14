@@ -17,40 +17,40 @@ fn add(dst: var str[], val: str) =
     seqs.add(dst, val)
 
 fn symbolJoinFieldKey(parentType: str, fieldName: str): str =
-    let safeParent: str = void*(parentType) == nil ? "" : parentType
-    let safeField: str = void*(fieldName) == nil ? "" : fieldName
+    let safeParent: str = ptr(parentType) == nil ? "" : parentType
+    let safeField: str = ptr(fieldName) == nil ? "" : fieldName
     let nParent: int32 = len(safeParent)
     let nField: int32 = len(safeField)
     if nParent <= 0 || nField <= 0:
         return ""
     let out: str = newStringAlloc(nParent + 2 + nField)
-    if void*(out) == nil:
+    if ptr(out) == nil:
         return ""
-    copyMem(void*(out), void*(safeParent), nParent)
-    rawmemWriteChar(void*(out), nParent, ':')
-    rawmemWriteChar(void*(out), nParent + 1, ':')
-    copyMem(ptr_add(void*(out), nParent + 2), void*(safeField), nField)
+    rawmem_support.rawmemCopy(ptr(out), ptr(safeParent), nParent)
+    rawmemWriteChar(ptr(out), nParent, ':')
+    rawmemWriteChar(ptr(out), nParent + 1, ':')
+    rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(ptr(out), nParent + 2), ptr(safeField), nField)
     return out
 
 fn symbolJoin3(a0: str, b0: str, c0: str): str =
-    let a: str = void*(a0) == nil ? "" : a0
-    let b: str = void*(b0) == nil ? "" : b0
-    let c: str = void*(c0) == nil ? "" : c0
+    let a: str = ptr(a0) == nil ? "" : a0
+    let b: str = ptr(b0) == nil ? "" : b0
+    let c: str = ptr(c0) == nil ? "" : c0
     let nA: int32 = len(a)
     let nB: int32 = len(b)
     let nC: int32 = len(c)
     let out: str = newStringAlloc(nA + nB + nC)
-    if void*(out) == nil:
+    if ptr(out) == nil:
         return ""
     var off: int32 = 0
     if nA > 0:
-        copyMem(ptr_add(void*(out), off), void*(a), nA)
+        rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(ptr(out), off), ptr(a), nA)
         off = off + nA
     if nB > 0:
-        copyMem(ptr_add(void*(out), off), void*(b), nB)
+        rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(ptr(out), off), ptr(b), nB)
         off = off + nB
     if nC > 0:
-        copyMem(ptr_add(void*(out), off), void*(c), nC)
+        rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(ptr(out), off), ptr(c), nC)
     return out
 
 var
@@ -76,10 +76,14 @@ var
     uirCoreObjAliasCanonNames: str[]
     symbolStripPtrIndex: hashmaps.HashMapPtrInt
     symbolStripValues: str[]
+    uirCoreModuleIdFilePtrIndex: hashmaps.HashMapPtrInt
+    uirCoreModuleIdFileValues: str[]
     uirCoreObjAliasReady: bool = false
     uirCoreDupFnBases: hashsets.HashSetStr
+    uirCoreDupFnBasesPtrIndex: hashmaps.HashMapPtrInt
     uirCoreDupFnBasesReady: bool = false
     uirCoreDupGlobalNames: hashsets.HashSetStr
+    uirCoreDupGlobalNamesPtrIndex: hashmaps.HashMapPtrInt
     uirCoreDupGlobalNamesReady: bool = false
 
 fn symbolStrPtrKey(s: str): int64 =
@@ -96,6 +100,15 @@ fn symbolStripCacheReset() =
     if symbolStripValues.cap < 512:
         symbolStripValues.cap = 512
 
+fn uirCoreModuleIdFileCacheReset() =
+    if uirCoreModuleIdFilePtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(uirCoreModuleIdFilePtrIndex, 1024)
+    else:
+        hashmaps.hashMapPtrIntClear(uirCoreModuleIdFilePtrIndex)
+    uirCoreModuleIdFileValues.len = 0
+    if uirCoreModuleIdFileValues.cap < 256:
+        uirCoreModuleIdFileValues.cap = 256
+
 fn symbolStripSpaces(s: str): str =
     if len(s) == 0:
         return ""
@@ -110,15 +123,19 @@ fn symbolStripSpaces(s: str): str =
                       symbol_c_str_contains_char(s, int32('\n')) != 0 ||
                       symbol_c_str_contains_char(s, int32('\r')) != 0
     if !hasWs:
+        let stable: str = uirCoreOwnStr(s)
+        let cached: str = len(stable) > 0 ? stable : s
         if ptrKey != 0:
-            add(symbolStripValues, s)
+            add(symbolStripValues, cached)
             hashmaps.hashMapPtrIntPut(symbolStripPtrIndex, ptrKey, symbolStripValues.len)
-        return s
+        return cached
     let out: str = strutils.strip(s)
+    let stableOut: str = uirCoreOwnStr(out)
+    let cachedOut: str = len(stableOut) > 0 ? stableOut : out
     if ptrKey != 0:
-        add(symbolStripValues, out)
+        add(symbolStripValues, cachedOut)
         hashmaps.hashMapPtrIntPut(symbolStripPtrIndex, ptrKey, symbolStripValues.len)
-    return out
+    return cachedOut
 
 fn symbolStrStartsWith(s: str, prefix: str): bool =
     return symbol_c_str_has_prefix(s, prefix) != 0
@@ -198,28 +215,28 @@ fn uirCoreTupleFieldIndicesReset() =
 
 fn uirCoreObjAliasesReset() =
     symbolStripCacheReset()
-    uirCoreObjAliasIndex = hashmaps.hashMapStrIntInit(512)
-    uirCoreObjAliasPtrIndex = hashmaps.hashMapPtrIntInit(512)
+    uirCoreObjAliasIndex = hashmaps.hashMapStrIntInit(2048)
+    uirCoreObjAliasPtrIndex = hashmaps.hashMapPtrIntInit(2048)
     uirCoreObjAliasNames.len = 0
-    uirCoreObjAliasNames.cap = 256
-    uirCoreObjAliasCanonIndex = hashmaps.hashMapStrIntInit(512)
-    uirCoreObjAliasCanonPtrIndex = hashmaps.hashMapPtrIntInit(512)
+    uirCoreObjAliasNames.cap = 1024
+    uirCoreObjAliasCanonIndex = hashmaps.hashMapStrIntInit(2048)
+    uirCoreObjAliasCanonPtrIndex = hashmaps.hashMapPtrIntInit(2048)
     uirCoreObjAliasCanonNames.len = 0
-    uirCoreObjAliasCanonNames.cap = 256
+    uirCoreObjAliasCanonNames.cap = 1024
     uirCoreObjAliasReady = true
 
 fn uirCoreObjAliasCanonCacheClear() =
     if uirCoreObjAliasCanonIndex.mask == 0:
-        uirCoreObjAliasCanonIndex = hashmaps.hashMapStrIntInit(512)
+        uirCoreObjAliasCanonIndex = hashmaps.hashMapStrIntInit(2048)
     else:
         hashmaps.hashMapStrIntClear(uirCoreObjAliasCanonIndex)
     if uirCoreObjAliasCanonPtrIndex.mask == 0:
-        uirCoreObjAliasCanonPtrIndex = hashmaps.hashMapPtrIntInit(512)
+        uirCoreObjAliasCanonPtrIndex = hashmaps.hashMapPtrIntInit(2048)
     else:
         hashmaps.hashMapPtrIntClear(uirCoreObjAliasCanonPtrIndex)
     uirCoreObjAliasCanonNames.len = 0
-    if uirCoreObjAliasCanonNames.cap < 256:
-        uirCoreObjAliasCanonNames.cap = 256
+    if uirCoreObjAliasCanonNames.cap < 1024:
+        uirCoreObjAliasCanonNames.cap = 1024
 
 fn uirCoreInlineObjFieldTypePut(parentType: str, fieldName: str, objTypeName: str) =
     if len(parentType) == 0 || len(fieldName) == 0 || len(objTypeName) == 0:
@@ -229,17 +246,18 @@ fn uirCoreInlineObjFieldTypePut(parentType: str, fieldName: str, objTypeName: st
     if !uirCoreInlineObjFieldTypeReady:
         uirCoreInlineObjFieldTypesReset()
     let key: str = symbolJoinFieldKey(parentType, fieldName)
+    let stableObjTypeName: str = symbolJoin3(objTypeName, "", "")
     var found: bool = false
     let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreInlineObjFieldTypeIndex, key, found)
     if idx >= 0 && idx < uirCoreInlineObjFieldTypeNames.len:
-        symbolMbWriteStr(uirCoreInlineObjFieldTypeNames, idx, objTypeName)
+        symbolMbWriteStr(uirCoreInlineObjFieldTypeNames, idx, stableObjTypeName)
         return
     if found:
         if idx >= 0 && idx < uirCoreInlineObjFieldTypeNames.len:
-            symbolMbWriteStr(uirCoreInlineObjFieldTypeNames, idx, objTypeName)
+            symbolMbWriteStr(uirCoreInlineObjFieldTypeNames, idx, stableObjTypeName)
         return
     let newIdx: int32 = uirCoreInlineObjFieldTypeNames.len
-    add(uirCoreInlineObjFieldTypeNames, objTypeName)
+    add(uirCoreInlineObjFieldTypeNames, stableObjTypeName)
     hashmaps.hashMapStrIntPut(uirCoreInlineObjFieldTypeIndex, key, newIdx)
 
 fn uirCoreInlineObjFieldTypeGet(parentType: str, fieldName: str): str =
@@ -247,7 +265,9 @@ fn uirCoreInlineObjFieldTypeGet(parentType: str, fieldName: str): str =
         return ""
     let key: str = symbolJoinFieldKey(parentType, fieldName)
     var found: bool = false
-    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreInlineObjFieldTypeIndex, key, found)
+    var idx: int32 = symbolHashMapStrIntGetCompat(uirCoreInlineObjFieldTypeIndex, key, found)
+    if !found:
+        idx = hashmaps.hashMapStrIntGet(uirCoreInlineObjFieldTypeIndex, key, found)
     if idx < 0 || idx >= uirCoreInlineObjFieldTypeNames.len:
         return ""
     return get_string(uirCoreInlineObjFieldTypeNames, idx)
@@ -258,17 +278,18 @@ fn uirCoreObjFieldTypeKeyPut(parentType: str, fieldName: str, fieldTypeKey: str)
     if !uirCoreObjFieldTypeKeyReady:
         uirCoreObjFieldTypeKeysReset()
     let key: str = symbolJoinFieldKey(parentType, fieldName)
+    let stableFieldTypeKey: str = symbolJoin3(fieldTypeKey, "", "")
     var found: bool = false
     let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjFieldTypeKeyIndex, key, found)
     if idx >= 0 && idx < uirCoreObjFieldTypeKeyNames.len:
-        symbolMbWriteStr(uirCoreObjFieldTypeKeyNames, idx, fieldTypeKey)
+        symbolMbWriteStr(uirCoreObjFieldTypeKeyNames, idx, stableFieldTypeKey)
         return
     if found:
         if idx >= 0 && idx < uirCoreObjFieldTypeKeyNames.len:
-            symbolMbWriteStr(uirCoreObjFieldTypeKeyNames, idx, fieldTypeKey)
+            symbolMbWriteStr(uirCoreObjFieldTypeKeyNames, idx, stableFieldTypeKey)
         return
     let newIdx: int32 = uirCoreObjFieldTypeKeyNames.len
-    add(uirCoreObjFieldTypeKeyNames, fieldTypeKey)
+    add(uirCoreObjFieldTypeKeyNames, stableFieldTypeKey)
     hashmaps.hashMapStrIntPut(uirCoreObjFieldTypeKeyIndex, key, newIdx)
 
 fn uirCoreObjFieldTypeKeyGet(parentType: str, fieldName: str): str =
@@ -276,7 +297,9 @@ fn uirCoreObjFieldTypeKeyGet(parentType: str, fieldName: str): str =
         return ""
     let key: str = symbolJoinFieldKey(parentType, fieldName)
     var found: bool = false
-    let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjFieldTypeKeyIndex, key, found)
+    var idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjFieldTypeKeyIndex, key, found)
+    if !found:
+        idx = hashmaps.hashMapStrIntGet(uirCoreObjFieldTypeKeyIndex, key, found)
     if (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1") && parentType == "ProtoBuffer" && fieldName == "out":
         let foundCompat: bool = idx >= 0
         echo("[backend] debugOverloadDot: keyGetCompat key='" + key + "' found=" + (foundCompat ? "1" : "0") +
@@ -391,8 +414,12 @@ fn uirCoreObjAliasPut(aliasName0: str, targetName0: str) =
         return
     if !uirCoreObjAliasReady:
         uirCoreObjAliasesReset()
-    let aliasName: str = symbolStripSpaces(aliasName0)
-    let targetName: str = symbolStripSpaces(targetName0)
+    let aliasNameRaw: str = symbolStripSpaces(aliasName0)
+    let targetNameRaw: str = symbolStripSpaces(targetName0)
+    let aliasNameStable: str = uirCoreOwnStr(aliasNameRaw)
+    let targetNameStable: str = uirCoreOwnStr(targetNameRaw)
+    let aliasName: str = len(aliasNameStable) > 0 ? aliasNameStable : aliasNameRaw
+    let targetName: str = len(targetNameStable) > 0 ? targetNameStable : targetNameRaw
     if len(aliasName) == 0 || len(targetName) == 0:
         return
     if (aliasName == targetName):
@@ -404,24 +431,26 @@ fn uirCoreObjAliasPut(aliasName0: str, targetName0: str) =
         symbolMbWriteStr(uirCoreObjAliasNames, idx, targetName)
         let ptrKeyExisting: int64 = symbolStrPtrKey(aliasName)
         if ptrKeyExisting != 0:
-            hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKeyExisting, idx)
+            hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKeyExisting, idx + 1)
         return
     if found:
         if idx >= 0 && idx < uirCoreObjAliasNames.len:
             symbolMbWriteStr(uirCoreObjAliasNames, idx, targetName)
             let ptrKeyFound: int64 = symbolStrPtrKey(aliasName)
             if ptrKeyFound != 0:
-                hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKeyFound, idx)
+                hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKeyFound, idx + 1)
         return
     let newIdx: int32 = uirCoreObjAliasNames.len
     add(uirCoreObjAliasNames, targetName)
     hashmaps.hashMapStrIntPut(uirCoreObjAliasIndex, aliasName, newIdx)
     let ptrKeyNew: int64 = symbolStrPtrKey(aliasName)
     if ptrKeyNew != 0:
-        hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKeyNew, newIdx)
+        hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKeyNew, newIdx + 1)
 
 fn uirCoreObjAliasGet(aliasName0: str): str =
     if !uirCoreStrPtrSane(aliasName0) || len(aliasName0) == 0 || !uirCoreObjAliasReady:
+        return ""
+    if uirCoreObjAliasNames.len <= 0:
         return ""
     let aliasName: str = symbolStripSpaces(aliasName0)
     if !uirCoreStrPtrSane(aliasName) || len(aliasName) == 0:
@@ -429,13 +458,17 @@ fn uirCoreObjAliasGet(aliasName0: str): str =
     let ptrKey: int64 = symbolStrPtrKey(aliasName)
     if ptrKey != 0:
         var foundPtr: bool = false
-        let idxPtr: int32 = hashmaps.hashMapPtrIntGet(uirCoreObjAliasPtrIndex, ptrKey, foundPtr)
-        if foundPtr && idxPtr >= 0 && idxPtr < uirCoreObjAliasNames.len:
-            return get_string(uirCoreObjAliasNames, idxPtr)
+        let rawPtr: int32 = hashmaps.hashMapPtrIntGet(uirCoreObjAliasPtrIndex, ptrKey, foundPtr)
+        if foundPtr:
+            if rawPtr > 0:
+                let idxPtr: int32 = rawPtr - 1
+                if idxPtr >= 0 && idxPtr < uirCoreObjAliasNames.len:
+                    return get_string(uirCoreObjAliasNames, idxPtr)
+            return ""
     var found: bool = false
     let idx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjAliasIndex, aliasName, found)
-    if found && ptrKey != 0 && idx >= 0:
-        hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKey, idx)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(uirCoreObjAliasPtrIndex, ptrKey, (found && idx >= 0 && idx < uirCoreObjAliasNames.len) ? (idx + 1) : 0)
     if idx < 0 || idx >= uirCoreObjAliasNames.len:
         return ""
     return get_string(uirCoreObjAliasNames, idx)
@@ -445,41 +478,57 @@ fn uirCoreObjAliasCanon(name0: str): str =
         return ""
     if !uirCoreObjAliasReady:
         return name0
-    let name: str = symbolStripSpaces(name0)
+    let nameRaw: str = symbolStripSpaces(name0)
+    let nameStable: str = uirCoreOwnStr(nameRaw)
+    let name: str = len(nameStable) > 0 ? nameStable : nameRaw
     if len(name) == 0:
         return ""
+    if uirCoreObjAliasNames.len <= 0:
+        return name
     let ptrKey: int64 = symbolStrPtrKey(name)
     if ptrKey != 0:
         var foundPtr: bool = false
-        let cachedIdxPtr: int32 = hashmaps.hashMapPtrIntGet(uirCoreObjAliasCanonPtrIndex, ptrKey, foundPtr)
-        if foundPtr && cachedIdxPtr >= 0 && cachedIdxPtr < uirCoreObjAliasCanonNames.len:
-            return get_string(uirCoreObjAliasCanonNames, cachedIdxPtr)
+        let rawPtr: int32 = hashmaps.hashMapPtrIntGet(uirCoreObjAliasCanonPtrIndex, ptrKey, foundPtr)
+        if foundPtr:
+            if rawPtr > 0:
+                let cachedIdxPtr: int32 = rawPtr - 1
+                if cachedIdxPtr >= 0 && cachedIdxPtr < uirCoreObjAliasCanonNames.len:
+                    return get_string(uirCoreObjAliasCanonNames, cachedIdxPtr)
+            return name
     var found: bool = false
     let cachedIdx: int32 = symbolHashMapStrIntGetCompat(uirCoreObjAliasCanonIndex, name, found)
     if found && cachedIdx >= 0 && cachedIdx < uirCoreObjAliasCanonNames.len:
         if ptrKey != 0:
-            hashmaps.hashMapPtrIntPut(uirCoreObjAliasCanonPtrIndex, ptrKey, cachedIdx)
+            hashmaps.hashMapPtrIntPut(uirCoreObjAliasCanonPtrIndex, ptrKey, cachedIdx + 1)
         return get_string(uirCoreObjAliasCanonNames, cachedIdx)
     var cur: str = name
     for i in 0..<8:
         let next: str = uirCoreObjAliasGet(cur)
         if len(next) == 0 || (next == cur):
+            let stableCur: str = uirCoreOwnStr(cur)
+            let cachedCur: str = len(stableCur) > 0 ? stableCur : cur
             let newIdx: int32 = uirCoreObjAliasCanonNames.len
-            add(uirCoreObjAliasCanonNames, cur)
+            add(uirCoreObjAliasCanonNames, cachedCur)
             hashmaps.hashMapStrIntPut(uirCoreObjAliasCanonIndex, name, newIdx)
             if ptrKey != 0:
-                hashmaps.hashMapPtrIntPut(uirCoreObjAliasCanonPtrIndex, ptrKey, newIdx)
-            return cur
-        cur = next
+                hashmaps.hashMapPtrIntPut(uirCoreObjAliasCanonPtrIndex, ptrKey, (cachedCur == name) ? 0 : (newIdx + 1))
+            return cachedCur
+        let stableNext: str = uirCoreOwnStr(next)
+        cur = len(stableNext) > 0 ? stableNext : next
+    let stableCur2: str = uirCoreOwnStr(cur)
+    let cachedCur2: str = len(stableCur2) > 0 ? stableCur2 : cur
     let newIdx2: int32 = uirCoreObjAliasCanonNames.len
-    add(uirCoreObjAliasCanonNames, cur)
+    add(uirCoreObjAliasCanonNames, cachedCur2)
     hashmaps.hashMapStrIntPut(uirCoreObjAliasCanonIndex, name, newIdx2)
     if ptrKey != 0:
-        hashmaps.hashMapPtrIntPut(uirCoreObjAliasCanonPtrIndex, ptrKey, newIdx2)
-    return cur
+        hashmaps.hashMapPtrIntPut(uirCoreObjAliasCanonPtrIndex, ptrKey, (cachedCur2 == name) ? 0 : (newIdx2 + 1))
+    return cachedCur2
 
 fn uirCoreObjAliasReadyFlag(): bool =
     return uirCoreObjAliasReady
+
+fn uirCoreObjAliasCount(): int32 =
+    return uirCoreObjAliasNames.len
 
 fn uirCoreObjLayoutName(module: UirCoreModule, name0: str): str =
     if len(name0) == 0:
@@ -498,10 +547,25 @@ fn uirCoreModuleIdForFile(filePath0: str): str =
     let filePath: str = (len(filePath0) > 0) ? filePath0 : ""
     if len(filePath) == 0:
         return "0000000000000000"
-    return uint64ToStr(uint64(uirCoreFnv1a64(filePath)))
+    let ptrKey: int64 = symbolStrPtrKey(filePath)
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let rawIdx: int32 = hashmaps.hashMapPtrIntGet(uirCoreModuleIdFilePtrIndex, ptrKey, foundPtr)
+        let idx: int32 = rawIdx - 1
+        if foundPtr && idx >= 0 && idx < uirCoreModuleIdFileValues.len:
+            return get_string(uirCoreModuleIdFileValues, idx)
+    let out: str = uint64ToStr(uint64(uirCoreFnv1a64(filePath)))
+    if ptrKey != 0 && len(out) > 0:
+        add(uirCoreModuleIdFileValues, out)
+        hashmaps.hashMapPtrIntPut(uirCoreModuleIdFilePtrIndex, ptrKey, uirCoreModuleIdFileValues.len)
+    return out
 
 fn uirCoreDupFnBasesReset() =
     uirCoreDupFnBases = hashsets.hashSetStrInit(256)
+    if uirCoreDupFnBasesPtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(uirCoreDupFnBasesPtrIndex, 1024)
+    else:
+        hashmaps.hashMapPtrIntClear(uirCoreDupFnBasesPtrIndex)
     uirCoreDupFnBasesReady = true
 
 fn uirCoreDupFnBasesHas(baseName: str): bool =
@@ -509,11 +573,44 @@ fn uirCoreDupFnBasesHas(baseName: str): bool =
         return false
     if len(baseName) == 0:
         return false
-    return hashsets.hashSetStrHas(uirCoreDupFnBases, baseName)
+    let ptrKey: int64 = symbolStrPtrKey(baseName)
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let cached: int32 = hashmaps.hashMapPtrIntGet(uirCoreDupFnBasesPtrIndex, ptrKey, foundPtr)
+        if foundPtr:
+            return cached == 2
+    let out: bool = hashsets.hashSetStrHas(uirCoreDupFnBases, baseName)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(uirCoreDupFnBasesPtrIndex, ptrKey, out ? 2 : 1)
+    return out
 
 fn uirCoreDupFnBasesSet(vals: hashsets.HashSetStr) =
     uirCoreDupFnBases = vals
+    if uirCoreDupFnBasesPtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(uirCoreDupFnBasesPtrIndex, 1024)
+    else:
+        hashmaps.hashMapPtrIntClear(uirCoreDupFnBasesPtrIndex)
     uirCoreDupFnBasesReady = true
+
+fn uirCoreDupFnBasesAdd(baseName0: str) =
+    let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
+    if len(baseName) == 0 || (baseName == "main"):
+        return
+    if !uirCoreDupFnBasesReady:
+        uirCoreDupFnBasesReset()
+    hashsets.hashSetStrAdd(uirCoreDupFnBases, baseName)
+    let ptrKey: int64 = symbolStrPtrKey(baseName)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(uirCoreDupFnBasesPtrIndex, ptrKey, 2)
+
+fn uirCoreForceMangleDupFnBase(baseName0: str, originFile0: str): str =
+    let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
+    if len(baseName) == 0:
+        return ""
+    if (baseName == "main"):
+        return baseName
+    let originFile: str = (len(originFile0) > 0) ? originFile0 : ""
+    return symbolJoin3(baseName, "__cheng_mod_", uirCoreModuleIdForFile(originFile))
 
 fn uirCoreMaybeMangleDupFnBase(baseName0: str, originFile0: str): str =
     let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
@@ -523,11 +620,14 @@ fn uirCoreMaybeMangleDupFnBase(baseName0: str, originFile0: str): str =
         return baseName
     if !uirCoreDupFnBasesHas(baseName):
         return baseName
-    let originFile: str = (len(originFile0) > 0) ? originFile0 : ""
-    return symbolJoin3(baseName, "__cheng_mod_", uirCoreModuleIdForFile(originFile))
+    return uirCoreForceMangleDupFnBase(baseName, originFile0)
 
 fn uirCoreDupGlobalNamesReset() =
     uirCoreDupGlobalNames = hashsets.hashSetStrInit(256)
+    if uirCoreDupGlobalNamesPtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(uirCoreDupGlobalNamesPtrIndex, 1024)
+    else:
+        hashmaps.hashMapPtrIntClear(uirCoreDupGlobalNamesPtrIndex)
     uirCoreDupGlobalNamesReady = true
 
 fn uirCoreDupGlobalNamesHas(baseName: str): bool =
@@ -535,10 +635,23 @@ fn uirCoreDupGlobalNamesHas(baseName: str): bool =
         return false
     if len(baseName) == 0:
         return false
-    return hashsets.hashSetStrHas(uirCoreDupGlobalNames, baseName)
+    let ptrKey: int64 = symbolStrPtrKey(baseName)
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let cached: int32 = hashmaps.hashMapPtrIntGet(uirCoreDupGlobalNamesPtrIndex, ptrKey, foundPtr)
+        if foundPtr:
+            return cached == 2
+    let out: bool = hashsets.hashSetStrHas(uirCoreDupGlobalNames, baseName)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(uirCoreDupGlobalNamesPtrIndex, ptrKey, out ? 2 : 1)
+    return out
 
 fn uirCoreDupGlobalNamesSet(vals: hashsets.HashSetStr) =
     uirCoreDupGlobalNames = vals
+    if uirCoreDupGlobalNamesPtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(uirCoreDupGlobalNamesPtrIndex, 1024)
+    else:
+        hashmaps.hashMapPtrIntClear(uirCoreDupGlobalNamesPtrIndex)
     uirCoreDupGlobalNamesReady = true
 
 fn uirCoreDupGlobalNamesAdd(name0: str) =

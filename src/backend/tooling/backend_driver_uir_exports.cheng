@@ -1,114 +1,25 @@
-import std/system
-import std/os
-import std/strutils
-import std/rawmem_support
-import backend/uir/uir_builder
-import backend/uir/uir_codegen
-import backend/uir/uir_internal/uir_core_types
-
-type
-    ByteBuf = uint8[]
-
-    DriverRetainedModuleHandle = ref
-        module: UirModule
-
-fn driverExportOptLevel(): int32 =
-    return int32(parseInt(os.getEnvDefault("BACKEND_OPT_LEVEL", "0")))
-
-fn driverExportPathRaw(raw: cstring): str =
-    if raw == nil:
-        return ""
-    return str(raw)
-
-importc fn driver_c_write_exact_file(path: cstring, buffer: void*, len: int32): int32
+import backend/tooling/backend_driver_uir_shared
 
 @exportc("uirBuildModuleFromFileStage1TargetOrPanic")
-fn driver_export_uirBuildModuleFromFileStage1TargetOrPanic(path_raw: cstring, target_raw: cstring): void* =
-    let path: str = driverExportPathRaw(path_raw)
-    if len(path) == 0:
-        return nil
-    let target: str = driverExportPathRaw(target_raw)
-    let module: UirModule = uirBuildModuleFromFileStage1TargetOrPanic(path, target)
-    if os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1":
-        echo("[driver.export.target] funcs=" + intToStr(uirModuleFuncsLen(module)) +
-             " target=" + uirModuleTargetOf(module))
-    memRetain(rawmemAsVoid(module))
-    return rawmemAsVoid(module)
+fn driver_export_uirBuildModuleFromFileStage1TargetOrPanic(path_raw: cstring, target_raw: cstring): ptr =
+    driverUirBuildModuleStage1TargetRetained(path_raw, target_raw)
 
 @exportc("driver_buildModuleFromFileStage1TargetRetained")
-fn driver_export_buildModuleFromFileStage1TargetRetained(path_raw: cstring, target_raw: cstring): void* =
-    let path: str = driverExportPathRaw(path_raw)
-    if len(path) == 0:
-        return nil
-    let target: str = driverExportPathRaw(target_raw)
-    let module: UirModule = uirBuildModuleFromFileStage1TargetOrPanic(path, target)
-    if os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1":
-        echo("[driver.export.target] funcs=" + intToStr(uirModuleFuncsLen(module)) +
-             " target=" + uirModuleTargetOf(module))
-    var handle: DriverRetainedModuleHandle
-    new handle
-    handle.module = module
-    memRetain(rawmemAsVoid(handle))
-    return rawmemAsVoid(handle)
+fn driver_export_buildModuleFromFileStage1TargetRetained(path_raw: cstring, target_raw: cstring): ptr =
+    driverUirBuildModuleStage1TargetRetained(path_raw, target_raw)
 
 @exportc("uirBuildModuleFromFileStage1OrPanic")
-fn driver_export_uirBuildModuleFromFileStage1OrPanic(path_raw: cstring): void* =
-    let path: str = driverExportPathRaw(path_raw)
-    if len(path) == 0:
-        return nil
-    let module: UirModule = uirBuildModuleFromFileStage1OrPanic(path)
-    if os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1":
-        echo("[driver.export] funcs=" + intToStr(uirModuleFuncsLen(module)) +
-             " target=" + uirModuleTargetOf(module))
-    memRetain(rawmemAsVoid(module))
-    return rawmemAsVoid(module)
+fn driver_export_uirBuildModuleFromFileStage1OrPanic(path_raw: cstring): ptr =
+    driverUirBuildModuleStage1Retained(path_raw)
 
 @exportc("driver_buildModuleFromFileStage1Retained")
-fn driver_export_buildModuleFromFileStage1Retained(path_raw: cstring): void* =
-    let path: str = driverExportPathRaw(path_raw)
-    if len(path) == 0:
-        return nil
-    let module: UirModule = uirBuildModuleFromFileStage1OrPanic(path)
-    if os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1":
-        echo("[driver.export] funcs=" + intToStr(uirModuleFuncsLen(module)) +
-             " target=" + uirModuleTargetOf(module))
-    var handle: DriverRetainedModuleHandle
-    new handle
-    handle.module = module
-    memRetain(rawmemAsVoid(handle))
-    return rawmemAsVoid(handle)
+fn driver_export_buildModuleFromFileStage1Retained(path_raw: cstring): ptr =
+    driverUirBuildModuleStage1Retained(path_raw)
 
 @exportc("driver_emit_obj_from_module_default_impl")
-fn driver_export_emit_obj_from_module_default_impl(module_raw: void*, target_raw: cstring, out_raw: cstring): int32 =
-    if module_raw == nil:
-        return -11
-    if out_raw == nil:
-        return -12
-    let outPath: str = str(out_raw)
-    if len(outPath) == 0:
-        return -12
-    let target: str = driverExportPathRaw(target_raw)
-    let handle: DriverRetainedModuleHandle = DriverRetainedModuleHandle(module_raw)
-    if handle == nil || handle.module == nil:
-        return -11
-    let module: UirModule = handle.module
-    if len(target) > 0:
-        let coreModule: UirCoreModule = UirCoreModule(module)
-        coreModule.target = target
-    if os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1":
-        echo("[driver.export.emit] funcs=" + intToStr(uirModuleFuncsLen(module)) +
-             " target=" + uirModuleTargetOf(module))
-    let objRes: Result[ByteBuf] = uirEmitObjFromModule(module, driverExportOptLevel(), target, "", false, false, 0, "autovec")
-    var rc: int32 = 0
-    if !IsOk[ByteBuf](objRes):
-        rc = -10
-    else:
-        let obj: uint8[] = objRes.value
-        if len(obj) <= 0:
-            rc = -13
-        elif obj.buffer == nil:
-            rc = -14
-        else:
-            rc = driver_c_write_exact_file(out_raw, obj.buffer, obj.len)
-    memRelease(module_raw)
-    return rc
+fn driver_export_emit_obj_from_module_default_impl(module_raw: ptr, target_raw: cstring, out_raw: cstring): int32 =
+    return driverUirEmitObjFromRetainedModule(module_raw, target_raw, out_raw)
+
+@exportc("driver_build_emit_obj_from_file_stage1_target_impl")
+fn driver_export_build_emit_obj_from_file_stage1_target_impl(path_raw: cstring, target_raw: cstring, out_raw: cstring): int32 =
+    return driverUirBuildEmitObjFromFileStage1Target(path_raw, target_raw, out_raw)

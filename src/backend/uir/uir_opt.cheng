@@ -2,7 +2,6 @@
 import std/result
 import std/os
 import std/monotimes
-import std/strutils
 import backend/uir/uir_types
 import backend/uir/uir_pass_manager
 import backend/uir/uir_noalias_pass
@@ -23,58 +22,6 @@ type
 fn uirOptNowNs(): int64 =
     let mt: monotimes.MonoTime = monotimes.getMonoTime()
     return mt.ns
-
-fn uirOptLowerAscii(s: str): str =
-    return strutils.toLowerAscii(s)
-
-fn uirParseBoolEnv(name: str, defaultValue: bool): bool =
-    let raw: str = os.getEnvDefault(name, "")
-    if len(raw) == 0:
-        return defaultValue
-    let s: str = uirOptLowerAscii(raw)
-    if s == "1" || s == "true" || s == "yes" || s == "on":
-        return true
-    if s == "0" || s == "false" || s == "no" || s == "off":
-        return false
-    return defaultValue
-
-fn uirParseIntEnv(name: str, defaultValue: int32, minValue: int32, maxValue: int32): int32 =
-    let raw: str = os.getEnvDefault(name, "")
-    if len(raw) == 0:
-        return defaultValue
-    let n: int32 = len(raw)
-    var neg: bool = false
-    var i: int32 = 0
-    if raw[0] == '-':
-        neg = true
-        i = 1
-    if i >= n:
-        return defaultValue
-    var v: int64 = 0
-    for __for_guard_i in 0..<n:
-        if !(i < n):
-            break
-        let c: char = raw[i]
-        if c < '0' || c > '9':
-            return defaultValue
-        v = v * 10 + int64(int32(c) - int32('0'))
-        i = i + 1
-    if neg:
-        v = -v
-    if v < int64(minValue):
-        return minValue
-    if v > int64(maxValue):
-        return maxValue
-    return int32(v)
-
-fn uirParseEGraphGoalEnv(name: str, defaultValue: str): str =
-    let raw: str = os.getEnvDefault(name, "")
-    var out: str = defaultValue
-    if len(raw) > 0:
-        out = uirOptLowerAscii(raw)
-    if out == "latency" || out == "size":
-        return out
-    return "balanced"
 
 fn uirProfileInit(enabled: bool): UirProfileState =
     var st: UirProfileState
@@ -105,6 +52,11 @@ fn uirProfilePass(st: var UirProfileState, label: str, changed: bool) =
     uirProfileStep(st, label)
     if changed:
         uirProfileStep(st, label + ".changed")
+
+fn uirProfileOpt2ProofRequirement(st: var UirProfileState, label: str, module: UirModule) =
+    uirProfileStep(st, label + ".proof_required")
+    uirProfileStep(st, label + ".proof_backed_funcs=" +
+                       intToStr(uirModuleCountProofBackedFuncs(module)))
 
 fn uirNormalizeOptLevel(level: int32): int32 =
     var out: int32 = level
@@ -728,33 +680,22 @@ fn uirRunCoreModuleLegacyFullPass(module: UirModule, st: var UirProfileState, st
 fn uirEmitSoaReport(module: UirModule): bool =
     if (module == nil):
         return false
-    let enabled: bool = uirParseBoolEnv("UIR_SOA_REPORT", false)
-    let enforce: bool = uirParseBoolEnv("UIR_SOA_ENFORCE", false)
+    let enabled: bool = uirEnvParseBool("UIR_SOA_REPORT", false)
+    let enforce: bool = uirEnvParseBool("UIR_SOA_ENFORCE", false)
     if !enabled && !enforce:
         return false
 
-    var trackedFuncs: int32 = 0
-    var exprIds: int32 = 0
-    var stmtIds: int32 = 0
-    var blockIds: int32 = 0
-    var succEdges: int32 = 0
-    var predEdges: int32 = 0
-    var balanceOk: bool = true
-
-    let soaModule: UirCoreSoaModule = uirCoreSoaBuildFromModule(module)
-    if (soaModule == nil):
-        balanceOk = false
-    else:
-        trackedFuncs = uirCoreSoaModuleFuncCount(soaModule)
-        exprIds = uirCoreSoaModuleExprCount(soaModule)
-        stmtIds = uirCoreSoaModuleStmtCount(soaModule)
-        blockIds = uirCoreSoaModuleBlockCount(soaModule)
-        succEdges = uirCoreSoaModuleSuccEdgeCount(soaModule)
-        predEdges = uirCoreSoaModulePredEdgeCount(soaModule)
-        balanceOk = uirCoreSoaModuleEdgesBalanced(soaModule)
+    let soaStats: UirSoaSurfaceStats = uirSoaSurfaceStatsCollect(module)
+    let trackedFuncs: int32 = soaStats.trackedFuncs
+    let exprIds: int32 = soaStats.exprIds
+    let stmtIds: int32 = soaStats.stmtIds
+    let blockIds: int32 = soaStats.blockIds
+    let succEdges: int32 = soaStats.succEdges
+    let predEdges: int32 = soaStats.predEdges
+    let balanceOk: bool = soaStats.balanceOk
 
     if enforce && !balanceOk:
-        let reason: str = uirCoreSoaModuleEdgeBalanceReason(soaModule)
+        let reason: str = soaStats.reason
         panic("uir_opt: SoA enforcement failed (module build or edge balance): " + reason +
               " funcs=" + intToStr(trackedFuncs) +
               " expr=" + intToStr(exprIds) +
@@ -789,23 +730,23 @@ fn uirEmitSoaReport(module: UirModule): bool =
 fn uirOptimizeModule(module: UirModule, optLevel: int32, simdEnabled: bool, simdMaxWidth: int32, simdPolicy: str) =
     if (module == nil):
         return
-    let st: UirProfileState = uirProfileInit(uirParseBoolEnv("UIR_PROFILE", false))
+    let st: UirProfileState = uirProfileInit(uirEnvParseBool("UIR_PROFILE", false))
     var level: int32 = uirNormalizeOptLevel(optLevel)
     uirCoreReservePoolsForOptimize(module, level)
 
     # Global, stable defaults kept backward-compatible. Advanced users can tune these with env.
-    let opt2Iters: int32 = uirParseIntEnv("UIR_OPT2_ITERS", 5, 1, 32)
-    let opt3PostIters: int32 = uirParseIntEnv("UIR_OPT3_ITERS", 4, 1, 32)
-    let opt3CleanupIters: int32 = uirParseIntEnv("UIR_OPT3_CLEANUP_ITERS", 3, 1, 32)
-    let inlineIters: int32 = uirParseIntEnv("UIR_INLINE_ITERS", 4, 1, 16)
-    let optCfgCanonicalIters: int32 = uirParseIntEnv("UIR_CFG_CANON_ITERS", 1, 1, 16)
-    let opt3FullIters: int32 = uirParseIntEnv("UIR_FULL_ITERS", 1, 1, 16)
-    let noAliasEnabled: bool = uirParseBoolEnv("UIR_NOALIAS", true)
-    let noAliasRequireProof: bool = uirParseBoolEnv("UIR_NOALIAS_REQUIRE_PROOF", false)
-    let egraphIters: int32 = uirParseIntEnv("UIR_EGRAPH_ITERS", 2, 0, 32)
-    let egraphGoal: str = uirParseEGraphGoalEnv("UIR_EGRAPH_GOAL", "balanced")
-    let egraphRequireProof: bool = uirParseBoolEnv("UIR_EGRAPH_REQUIRE_PROOF", false)
-    let aggressive: bool = uirParseBoolEnv("UIR_AGGRESSIVE", false)
+    let opt2Iters: int32 = uirEnvParseInt("UIR_OPT2_ITERS", 5, 1, 32)
+    let opt3PostIters: int32 = uirEnvParseInt("UIR_OPT3_ITERS", 4, 1, 32)
+    let opt3CleanupIters: int32 = uirEnvParseInt("UIR_OPT3_CLEANUP_ITERS", 3, 1, 32)
+    let inlineIters: int32 = uirEnvParseInt("UIR_INLINE_ITERS", 4, 1, 16)
+    let optCfgCanonicalIters: int32 = uirEnvParseInt("UIR_CFG_CANON_ITERS", 1, 1, 16)
+    let opt3FullIters: int32 = uirEnvParseInt("UIR_FULL_ITERS", 1, 1, 16)
+    let noAliasEnabled: bool = uirEnvParseBool("UIR_NOALIAS", true)
+    let noAliasRequireProof: bool = uirEnvParseBool("UIR_NOALIAS_REQUIRE_PROOF", false)
+    let egraphIters: int32 = uirEnvParseInt("UIR_EGRAPH_ITERS", 2, 0, 32)
+    let egraphGoal: str = uirEGraphGoalParseEnv("UIR_EGRAPH_GOAL", "balanced")
+    let egraphRequireProof: bool = uirEnvParseBool("UIR_EGRAPH_REQUIRE_PROOF", false)
+    let aggressive: bool = uirEnvParseBool("UIR_AGGRESSIVE", false)
 
     var profileState: UirProfileState = st
 
@@ -820,8 +761,7 @@ fn uirOptimizeModule(module: UirModule, optLevel: int32, simdEnabled: bool, simd
     if level >= 2:
         if noAliasEnabled:
             if noAliasRequireProof:
-                uirProfileStep(profileState, "uir_opt2.noalias.proof_required")
-                uirProfileStep(profileState, "uir_opt2.noalias.proof_backed_funcs=" + intToStr(uirModuleCountHighUirCheckedFuncs(module)))
+                uirProfileOpt2ProofRequirement(profileState, "uir_opt2.noalias", module)
             let noAliasChanged: bool = uirRunNoAliasPrep(module, noAliasRequireProof)
             uirProfilePass(profileState, "uir_opt2.noalias", noAliasChanged)
         else:
@@ -837,7 +777,7 @@ fn uirOptimizeModule(module: UirModule, optLevel: int32, simdEnabled: bool, simd
         let soaEnabled: bool = uirEmitSoaReport(module)
         if soaEnabled:
             uirProfileStep(profileState, "uir_opt2.soa")
-        elif uirParseBoolEnv("UIR_SOA_ENFORCE", false):
+        elif uirEnvParseBool("UIR_SOA_ENFORCE", false):
             uirProfileStep(profileState, "uir_opt2.soa.enforced")
         else:
             uirProfileStep(profileState, "uir_opt2.soa.disabled")
@@ -849,8 +789,7 @@ fn uirOptimizeModule(module: UirModule, optLevel: int32, simdEnabled: bool, simd
 
         if egraphIters > 0:
             if egraphRequireProof:
-                uirProfileStep(profileState, "uir_opt2.egraph.proof_required")
-                uirProfileStep(profileState, "uir_opt2.egraph.proof_backed_funcs=" + intToStr(uirModuleCountHighUirCheckedFuncs(module)))
+                uirProfileOpt2ProofRequirement(profileState, "uir_opt2.egraph", module)
             let egraphChanged: bool = uirRunEGraphRewrite(module, egraphIters, egraphGoal, egraphRequireProof)
             uirProfilePass(profileState, "uir_opt2.egraph", egraphChanged)
             uirProfileStep(profileState, "uir_opt2.cost_model")

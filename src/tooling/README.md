@@ -153,13 +153,26 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
   - 也可直接改写 `opt2/opt3` 轮次：`--uir-opt2-iters:<n>`、`--uir-opt3-iters:<n>`、`--uir-opt3-cleanup-iters:<n>`、`--uir-cfg-canon-iters:<n>`，以及 SIMD/内联：`--uir-simd`（或 `--no-uir-simd`）、`--uir-simd-max-width:<n>`、`--uir-simd-policy:<policy>`、`--uir-inline-iters:<n>`。
 - UIR 观测：`UIR_PROFILE=1` 输出 `uir_profile\t<label>\tstep_ms=...\ttotal_ms=...`，并在 `build_module` 后输出 `generics_report\tir=uir\tmode=...\tspec_budget=...\tborrow_ir=...\tgeneric_lowering=...`。
 - PAR-01 观测基线：`cheng_tooling build_backend_profile_schema` 与 `cheng_tooling build_backend_profile_baseline` 生成冻结快照（默认写入 `src/tooling/backend_profile_schema.env` 与 `src/tooling/backend_profile_baseline.env`）；`cheng_tooling verify_backend_profile_schema` 与 `cheng_tooling verify_backend_profile_baseline` 校验 schema/baseline 漂移并输出 `artifacts/backend_profile/*.report.txt`。
-- 契约/基线一键重建：`cheng_tooling build-backend-baselines`（单次调用顺序执行 rawptr/mem/dod/profile schema/profile baseline 五项）。
+- 契约/基线一键重建：`cheng_tooling build-backend-baselines`（单次调用顺序执行 rawptr/mem/dod/string ABI/dot-lowering/profile schema/profile baseline 七项）。
+- 生产技术债总表：`docs/backend-techdebt-matrix.md` 统一记录 `SoA`、`DOD`、`NoAlias`、`Egraph`、`函数并行`、`str ABI/cstring`、`dot-lowering` 七个面；其中 `str ABI/cstring` 与 `dot-lowering` 当前只进 default `verify`，不进 `backend_prod_closure` required。
+- 结项口径：以上七个面的文档、账本与 closure 分层债已清；剩余实现差距或专用 perf 前提统一只记在各自“升级条件”，不再记作当前漂移。
 - PAR-01 契约冻结：`cheng_tooling build_backend_mem_contract` 生成 `src/tooling/backend_mem_contract.env`；`cheng_tooling verify_backend_mem_contract` 校验 `docs/backend-mem-hotpatch-contract.md`（MemImage/PatchMeta）与闭环接入点漂移，输出 `artifacts/backend_mem_contract/*.report.txt`。
 - DOPAR-01 DOD 契约冻结：`cheng_tooling build_backend_dod_contract` 生成 `src/tooling/backend_dod_contract.env`；`cheng_tooling verify_backend_dod_contract` 校验 `docs/cheng-plan-full.md`（DOD SoA/Arena/index 契约）与闭环接入点漂移，输出 `artifacts/backend_dod_contract/*.report.txt`。
 - RPSPAR-01 Raw Pointer Safety 契约冻结：`cheng_tooling build_backend_rawptr_contract` 生成 `src/tooling/backend_rawptr_contract.env`；`cheng_tooling verify_backend_rawptr_contract` 校验 `docs/raw-pointer-safety.md` + `docs/cheng-formal-spec.md` + `src/tooling/README.md` 的冻结契约与闭环接入点漂移，输出 `artifacts/backend_rawptr_contract/*.report.txt`。
   - `rawptr_contract.tooling_readme.synced=1`
+- SABI-01 String ABI / cstring 契约冻结：`cheng_tooling build_backend_string_abi_contract` 生成 `src/tooling/backend_string_abi_contract.env`；`cheng_tooling verify_backend_string_abi_contract` 校验 `docs/backend-string-abi-contract.md` + `docs/cheng-formal-spec.md` + `src/tooling/README.md` + `docs/backend-techdebt-matrix.md` 的漂移，输出 `artifacts/backend_string_abi_contract/*.report.txt`。
+  - `string_abi_contract.tooling_readme.synced=1`
+  - `string_abi_contract.selector_cstring_lowering.user_abi=0`
+  - `string_abi_contract.closure=report_only`
+  - 本项清的是 contract debt；selector eager lowering 继续只记实现债。
+- DOTLOW-01 dot-lowering 契约冻结：`cheng_tooling build_backend_dot_lowering_contract` 生成 `src/tooling/backend_dot_lowering_contract.env`；`cheng_tooling verify_backend_dot_lowering_contract` 校验 `docs/backend-dot-lowering-contract.md` + `docs/UIR.md` + `src/tooling/README.md` + `docs/backend-techdebt-matrix.md` 的漂移，输出 `artifacts/backend_dot_lowering_contract/*.report.txt`。
+  - `dot_lowering_contract.tooling_readme.synced=1`
+  - `dot_lowering_contract.closure=report_only`
+  - 本项清的是边界/分层 debt；selector/backfill 差距继续只记升级条件。
+- `cheng_tooling verify` 默认追加 `verify_backend_string_abi_contract` 与 `verify_backend_dot_lowering_contract`；两者当前仅做日常 contract/report 漂移检查，不提升为 `backend_prod_closure` required。`verify_backend_runtime_abi` 与 `verify_backend_sidecar_cheng_fresh` 已退出默认 `verify` 图，保留为专项 native-substrate gate。
 - RPSPAR-02 ZRPC 收口 gate：`cheng_tooling verify_backend_rawptr_contract` 负责契约收口；`backend_prod_closure` / `verify_backend_closedloop` 同步执行 `rawptr_surface_forbid + rawptr_closedloop`，共同覆盖“语言表面绝对零裸指针”闭环。
 - RPSPAR-02 Raw Pointer Surface 禁令：`cheng_tooling verify_backend_rawptr_surface_forbid` 校验“裸指针声明/指针运算/裸 `void*` 透出”三类负例必须失败，且诊断必须包含 `slice/tuple/handle/borrow` 替代建议；输出 `artifacts/backend_rawptr_surface_forbid/*.report.txt`。
+- PURE-01 全栈纯化 surface gate：`cheng_tooling verify_backend_pure_cheng_surface` 汇总三类硬漂移：旧 `new x/new(x)`、`src/stage1|src/std|src/backend|src/web` 实现层裸指针/内存原语、以及默认 `verify/closure` 构建图里仍残留的 repo-tracked `.c/.h` / native-substrate gate 引用；输出 `artifacts/backend_pure_cheng_surface/*.report.txt`。
 - RPSPAR-03 Slice 影子桥接：`cheng_tooling verify_backend_ffi_slice_shim` 校验 `importc` 形参 `T[]` 的桥接调用可编译（默认 compile-only；可设 `BACKEND_FFI_SLICE_SHIM_RUN=1` 开启运行）并覆盖 legacy `openArray[T]` 与用户层裸指针 surface 负例；输出 `artifacts/backend_ffi_slice_shim/backend_ffi_slice_shim.<target>.report.txt`。
 - RPSPAR-04 Out-Ptr 影子桥接：`cheng_tooling verify_backend_ffi_outptr_tuple` 校验 `@ffi_out_ptrs + @importc` 的 tuple wrapper 降级（运行态正例 + status obj-only 正例 + arity 负例诊断）；输出 `artifacts/backend_ffi_outptr_tuple/*.report.txt`。
 - RPSPAR-05 Handle 沙盒映射：`cheng_tooling verify_backend_ffi_handle_sandbox` 校验 runtime `ptr<->slot` 映射（C runtime + backend runtime 双实现）与过期 handle fail-safe（返回 `-1`，无 UAF），并输出 `artifacts/backend_ffi_handle_sandbox/*.report.txt`。
@@ -282,7 +295,7 @@ cp -f "$(pwd)/artifacts/tooling_cmd/cheng_tooling" /tmp/cheng
 - 外部 `timeout/gtimeout` 调用默认关闭，统一走内建 no-orphan watchdog；如需临时启用外部实现可设 `TOOLING_TIMEOUT_USE_EXTERNAL=1`（不建议在 UE 排障期使用）。
 - 若需在长时间锁占用时强制抢锁，可显式设置 `TOOLING_STAGE0_LOCK_FORCE_TAKEOVER=1`。
 - `cheng_tooling` 默认 `TOOLING_NATIVE_ENABLE=1`，并且 `cheng/chengc/bootstrap/bootstrap_pure/backend_driver_path/build_backend_driver/verify_backend_selfhost_bootstrap_self_obj/verify_backend_selfhost_100ms_host` 为 native-required（失败即失败，不再回退脚本）。
-- `BACKEND_ENABLE_CSTRING_LOWERING`/`BACKEND_CSTRING_LOWERING`/`BACKEND_ISEL_CSTRING_LOWERING` 已移除；cstring lowering 在后端选择器中固定开启，不再提供开关。
+- `BACKEND_ENABLE_CSTRING_LOWERING`/`BACKEND_CSTRING_LOWERING`/`BACKEND_ISEL_CSTRING_LOWERING` 已移除；selector-side eager `cstring lowering` 当前固定禁用，不再提供开关。用户 ABI 契约仍以 `str` 值语义 / `cstring` FFI 边界语义为准，必要 payload 由 `UIR metadata -> post-regalloc backfill` 与 object writer 兼容路径补齐。
 - `run <script>` 的 embedded 执行改为临时脚本文件（`chengcache/embedded_scripts/*.run.sh`）并在命令结束后清理，不再复用 `.embedded.sh` 常驻缓存。
 
 后端链接环境助手（脚本统一注入 self-linker 运行时 `.o`）：
@@ -440,14 +453,20 @@ cheng_tooling backend_prod_closure --full-closure
 - `backend_prod_closure` 现在仅支持 `ABI=v2_noptr`（若外部传入非 `v2_noptr` 会直接报错退出）；主闭环以 `v2_noptr` 兼容口径执行（`STAGE1_STD_NO_POINTERS=1`），no-pointer CLI 收口由 `verify_backend_noptr_default_cli` 单独执行。
 - `backend_prod_closure` 已不再包含独立 `backend.abi_v2_noptr` required gate；兼容命令 `verify_backend_abi_v2_noptr` 保留为 `verify_backend_noptr_default_cli` 别名。
 - `backend_prod_closure` required 链路包含 `backend.rawptr_contract`（`cheng_tooling verify_backend_rawptr_contract`），并单独执行 `backend.rawptr_surface_forbid` 与 `backend.rawptr_closedloop`。
+- `backend_prod_closure` 现会追加并阻断 `backend.pure_cheng_surface`（`cheng_tooling verify_backend_pure_cheng_surface`）：要求 `legacy_new_count=0`、`rawptr_count=0`、`repo_c_file_count=0`、`manifest_ref_count=0` 同时成立；纯化盘点报告继续落到 `artifacts/backend_pure_cheng_surface/`。
+- `backend_prod_closure` required 现默认先执行 `backend.seed_uir_import`（`cheng_tooling verify_backend_seed_uir_import`）；`backend.sidecar_cheng_seed` 已退出默认 closure 图，保留为专项 native-substrate smoke。
+- 相邻 fresh gate：`cheng_tooling verify_backend_sidecar_cheng_fresh`
+  - 固定使用当前 Cheng compiler（当前优先 `dist/releases/current/cheng`）构建 `backend_driver_uir_sidecar.cheng` 的 fresh `cheng` bundle，并复用同一最小 native outer driver 强制走 sidecar 加载路径。
+  - gate 同样 compile+run 三条 smoke：`return_add`、`return_new_expr_generic_box`、`return_new_ref_seq_growth`。
+  - gate 会把结果落到 `artifacts/backend_sidecar_cheng_fresh/verify_backend_sidecar_cheng_fresh.{report.txt,snapshot.env}`，并为每条 fixture 保留 `*.compile.log` / `*.run.log`。
+  - 当前不再默认接入 `cheng_tooling verify`，保留为专项 native-substrate smoke，也不进入 `backend_prod_closure` required。
 - `verify_backend_rawptr_surface_forbid` 的 native 路径会额外校验 `src/std/cmdline.cheng`：必须走 runtime bridge `__cheng_rt_paramCount/__cheng_rt_paramStr`（并允许 `__cheng_rt_paramStrCopy` 稳定化字符串转值），且禁止 `void* / ptr_add / alloc / copyMem / setMem / *str*` 语法回流。
 - `backend_prod_closure` 现默认要求 `backend.symbol_closure`（`cheng_tooling verify_backend_symbol_closure`）：固定 `return_add/return_new_ref_seq_growth` 需可编译且可运行，阻断 `_alloc/_c_strlen/_zeroMem` 运行时符号缺失。
 - `backend_prod_closure` 现默认要求 `backend.release_compile_stability`（`cheng_tooling verify_backend_release_compile_stability`）：固定 `return_new_ref_seq_growth` 默认 3 次 `release-compile` 稳定性回归（可用 `BACKEND_PROD_RELEASE_COMPILE_STABILITY_ITERS` 覆盖）；出现 `rc=139` 直接失败。`verify_backend_release_compile_stability` 单独执行时默认 3 次（可用 `BACKEND_RELEASE_COMPILE_STABILITY_ITERS` 覆盖），发布入口 `backend-prod-publish` 默认也是 3 次（可用 `BACKEND_PROD_PUBLISH_RELEASE_COMPILE_STABILITY_ITERS` 覆盖）。
-- `backend_prod_closure` required 默认执行 Native FFI 影子桥接四个硬门禁：
+- `backend_prod_closure` required 默认执行 Native FFI 影子桥接两个纯 surface 硬门禁：
   - `verify_backend_ffi_slice_shim`（slice -> ptr/len）
   - `verify_backend_ffi_outptr_tuple`（`@ffi_out_ptrs` tuple 降级）
-  - `verify_backend_ffi_handle_sandbox`（handle 沙盒映射）
-  - `verify_backend_ffi_borrow_bridge`（borrow bridge）
+- `verify_backend_ffi_handle_sandbox` 与 `verify_backend_ffi_borrow_bridge` 已退出默认 closure 图，保留为专项 native-substrate gate。
 - `backend_prod_closure` 现默认要求 `backend.zero_script_residual`（`cheng_tooling verify_backend_zero_script_residual`）：阻断 required 路径 compile-only/skip 语义与 legacy `CHENG_*` 执行路径读取残留。
 - `backend_prod_closure` 默认 `BACKEND_PROD_INMEM_ONLY=1`；若开启 `--fullchain`，需显式设置 `BACKEND_PROD_INMEM_ONLY=0`，否则直接失败（不再 skip `backend.fullchain_bootstrap`）。
 - `backend_prod_closure` 现默认要求 `backend.opt2_impl_surface`（`cheng_tooling verify_backend_opt2_impl_surface`）：阻断 `uir_core_opt2` 占位实现回归，并检查 `UIR_SSU/UIR_NOALIAS_NJVL_LITE` 默认开关与 noalias 扩展字段可观测性。

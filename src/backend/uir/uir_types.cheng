@@ -1,7 +1,9 @@
 # Unified IR facade: carries native UIR entities while production lowering remains
 # wired to UIR-internal implementation.
 import backend/uir/uir_internal/uir_core_types
+import std/os
 import std/result
+import std/strutils
 
 type
     UirGenericParam =
@@ -86,17 +88,132 @@ type
 type
     UirObjField = UirCoreObjField
 
+type
+    UirSoaSurfaceStats =
+        trackedFuncs: int32
+        exprIds: int32
+        stmtIds: int32
+        blockIds: int32
+        succEdges: int32
+        predEdges: int32
+        balanceOk: bool
+        reason: str
+
+fn uirTextLowerAscii(s: str): str =
+    return strutils.toLowerAscii(s)
+
+fn uirEnvParseBool(name: str, defaultValue: bool): bool =
+    let raw: str = os.getEnvDefault(name, "")
+    if len(raw) == 0:
+        return defaultValue
+    let s: str = uirTextLowerAscii(strutils.strip(raw))
+    if s == "1" || s == "true" || s == "yes" || s == "on":
+        return true
+    if s == "0" || s == "false" || s == "no" || s == "off":
+        return false
+    return defaultValue
+
+fn uirEnvParseInt(name: str, defaultValue: int32, minValue: int32, maxValue: int32): int32 =
+    let raw: str = strutils.strip(os.getEnvDefault(name, ""))
+    if len(raw) == 0:
+        return defaultValue
+    let n: int32 = len(raw)
+    var neg: bool = false
+    var i: int32 = 0
+    if raw[0] == '-':
+        neg = true
+        i = 1
+    if i >= n:
+        return defaultValue
+    var v: int64 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = raw[i]
+        if c < '0' || c > '9':
+            return defaultValue
+        v = v * 10 + int64(int32(c) - int32('0'))
+        i = i + 1
+    if neg:
+        v = -v
+    if v < int64(minValue):
+        return minValue
+    if v > int64(maxValue):
+        return maxValue
+    return int32(v)
+
+fn uirEGraphGoalNormalize(goal: str): str =
+    let target: str = uirTextLowerAscii(strutils.strip(goal))
+    if target == "latency" || target == "size":
+        return target
+    return "balanced"
+
+fn uirEGraphGoalParseEnv(name: str, defaultValue: str): str =
+    let raw: str = os.getEnvDefault(name, "")
+    if len(raw) > 0:
+        return uirEGraphGoalNormalize(raw)
+    return uirEGraphGoalNormalize(defaultValue)
+
+fn uirFnSchedNormalized(): str =
+    var raw: str = strutils.strip(os.getEnvDefault("BACKEND_FN_SCHED", ""))
+    if len(raw) == 0:
+        raw = strutils.strip(os.getEnvDefault("STAGE1_FN_SCHED", ""))
+    if uirTextLowerAscii(raw) == "ws":
+        return "ws"
+    return "serial"
+
+fn uirExprRecursionLimit(): int32 =
+    return 256
+
+fn uirPhaseContractMarkerText(): str =
+    return "single_ir_dual_phase " +
+           "uir_phase_model=single_ir_dual_phase " +
+           "p4_phase_v1 " +
+           "phase_contract_version=p4_phase_v1 " +
+           "ownership_func_v1 " +
+           "generics_report " +
+           "high_uir_checked_funcs= " +
+           "low_uir_lowered_funcs= " +
+           "high_uir_fallback_funcs= " +
+           "uir_opt2.noalias " +
+           "uir_opt2.egraph " +
+           "uir_opt2.cost_model " +
+           "uir_opt2.cost_model.weights"
+
+fn uirSoaSurfaceStatsCollect(module: UirModule): UirSoaSurfaceStats =
+    var out: UirSoaSurfaceStats
+    out.balanceOk = true
+    out.reason = "ok"
+    if module == nil:
+        out.balanceOk = false
+        out.reason = "module=nil"
+        return out
+    let soaModule: UirCoreSoaModule = uirCoreSoaBuildFromModule(module)
+    if soaModule == nil:
+        out.balanceOk = false
+        out.reason = "module=nil"
+        return out
+    out.trackedFuncs = uirCoreSoaModuleFuncCount(soaModule)
+    out.exprIds = uirCoreSoaModuleExprCount(soaModule)
+    out.stmtIds = uirCoreSoaModuleStmtCount(soaModule)
+    out.blockIds = uirCoreSoaModuleBlockCount(soaModule)
+    out.succEdges = uirCoreSoaModuleSuccEdgeCount(soaModule)
+    out.predEdges = uirCoreSoaModulePredEdgeCount(soaModule)
+    out.balanceOk = uirCoreSoaModuleEdgesBalanced(soaModule)
+    out.reason = uirCoreSoaModuleEdgeBalanceReason(soaModule)
+    return out
+
 fn Ok_UirLowerType(value: UirLowerType): Result[UirLowerType] =
     var out: Result[UirLowerType]
     out.ok = true
     out.value = value
-    out.err = ErrorOk()
+    ErrorOkInto(out.err)
     return out
 
 fn Err_UirLowerType(err: str): Result[UirLowerType] =
     var out: Result[UirLowerType]
     out.ok = false
-    out.err = ErrorNew(err)
+    ErrorNewInto(out.err, err)
     return out
 
 fn uirDemoModule(): UirModule =
@@ -282,14 +399,35 @@ fn uirBlockCondExprOf(block: UirLowerBlock): UirExpr =
 fn uirFuncBlocksLen(func: UirFunc): int32 =
     return uirCoreFuncBlocksLen(func)
 
+fn uirFuncBlocksLenObjFirst(func: UirFunc): int32 =
+    return uirCoreFuncBlocksLenObjFirst(func)
+
 fn uirFuncBlockAt(func: UirFunc, idx: int32): UirLowerBlock =
     return uirCoreFuncBlockAt(func, idx)
+
+fn uirFuncBlockAtObjFirst(func: UirFunc, idx: int32): UirLowerBlock =
+    return uirCoreFuncBlockAtObjFirst(func, idx)
 
 fn uirFuncIsExtern(func: UirFunc): bool =
     return uirCoreFuncIsExtern(func)
 
+fn uirModuleHealExternFlags(module: UirModule) =
+    if module == nil:
+        return
+    for fi in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, fi)
+        if f == nil:
+            continue
+        uirCoreFuncIsExtern(f)
+
+fn uirFuncIsExternObjFirst(func: UirFunc): bool =
+    return uirCoreFuncIsExternObjFirst(func)
+
 fn uirFuncNameOf(func: UirFunc): str =
     return uirCoreFuncNameOf(func)
+
+fn uirFuncNameObjFirst(func: UirFunc): str =
+    return uirCoreFuncNameObjFirst(func)
 
 fn uirFuncRetTypeOf(func: UirFunc): UirLowerType =
     return uirCoreFuncRetTypeOf(func)
@@ -299,6 +437,9 @@ fn uirFuncObjFrameSizeOf(func: UirFunc): int32 =
 
 fn uirFuncLinkNameOf(func: UirFunc): str =
     return uirCoreFuncLinkNameOf(func)
+
+fn uirFuncLinkNameObjFirst(func: UirFunc): str =
+    return uirCoreFuncLinkNameObjFirst(func)
 
 fn uirFuncOriginFileOf(func: UirFunc): str =
     return uirCoreFuncOriginFileOf(func)
@@ -314,6 +455,9 @@ fn uirFuncHighUirCheckedOf(func: UirFunc): bool =
 
 fn uirFuncLowUirLoweredOf(func: UirFunc): bool =
     return uirCoreFuncLowUirLoweredOf(func)
+
+fn uirFuncProofBackedForOpt2(func: UirFunc): bool =
+    return uirFuncHighUirCheckedOf(func) && uirFuncLowUirLoweredOf(func)
 
 fn uirFuncPhaseFallbackReasonOf(func: UirFunc): str =
     return uirCoreFuncPhaseFallbackReasonOf(func)
@@ -377,6 +521,16 @@ fn uirModuleCountHighUirCheckedFuncs(module: UirModule): int32 =
 
 fn uirModuleCountLowUirLoweredFuncs(module: UirModule): int32 =
     return uirCoreModuleCountLowUirLoweredFuncs(module)
+
+fn uirModuleCountProofBackedFuncs(module: UirModule): int32 =
+    if module == nil:
+        return 0
+    var out: int32 = 0
+    for fi in 0..<uirModuleFuncsLen(module):
+        let func: UirFunc = uirModuleFuncAt(module, fi)
+        if (func != nil) && uirFuncProofBackedForOpt2(func):
+            out = out + 1
+    return out
 
 fn uirModuleCountHighUirFallbackFuncs(module: UirModule): int32 =
     return uirCoreModuleCountHighUirFallbackFuncs(module)

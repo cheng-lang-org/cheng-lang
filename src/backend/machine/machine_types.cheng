@@ -1,7 +1,10 @@
 # Machine IR facade: backed by machine internal core types.
 # Export a stable machine surface so object writers do not import internals directly.
 import backend/machine/machine_internal/machine_core_types
+import std/os
 import std/result
+import std/strutils
+import std/system
 
 type
     MachineReg = MachineCoreReg
@@ -13,30 +16,106 @@ type
     MachineGlobal = MachineCoreGlobal
     MachineModule = MachineCoreModule
 
+fn machineSelectorCStringLoweringEnabled(): bool =
+    let raw: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_SELECTOR_CSTRING_LOWERING", "")))
+    if len(raw) > 0 && (raw == "0" || raw == "false" || raw == "no" || raw == "off"):
+        if os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1" ||
+           os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+            echo("[machine.cstr] BACKEND_SELECTOR_CSTRING_LOWERING is ignored; selector cstring lowering is always enabled")
+    return true
+
+@importc("cheng_thread_spawn")
+fn machineThreadSpawnRaw(fn_ptr: ptr, ctx: ptr): int32
+@importc("cheng_thread_spawn_i32")
+fn machineThreadSpawnI32Raw(fn_ptr: ptr, ctx: int32): int32
+@importc("cheng_thread_parallelism")
+fn machineThreadParallelismRaw(): int32
+@importc("cheng_thread_yield")
+fn machineThreadYieldRaw(): void
+@importc("cheng_sched_run_once")
+fn machineSchedRunOnceRaw(): int32
+@importc("cheng_thread_local_i32_get")
+fn machineThreadLocalI32GetRaw(slot: int32): int32
+@importc("cheng_thread_local_i32_set")
+fn machineThreadLocalI32SetRaw(slot: int32, value: int32)
+
+fn machineThreadSpawn(fn_ptr: ptr, ctx: ptr): bool =
+    if fn_ptr == nil:
+        return false
+    return machineThreadSpawnRaw(fn_ptr, ctx) != 0
+
+fn machineThreadSpawnI32(fn_ptr: ptr, ctx: int32): bool =
+    if fn_ptr == nil:
+        return false
+    return machineThreadSpawnI32Raw(fn_ptr, ctx) != 0
+
+fn machineThreadParallelism(): int32 =
+    let fnJobsRaw: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_FN_JOBS", "")))
+    if len(fnJobsRaw) > 0:
+        let parsedFnJobs: int32 = int32(strutils.parseInt(fnJobsRaw))
+        if parsedFnJobs > 0:
+            return parsedFnJobs
+        return 1
+    let jobsRaw: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_JOBS", "")))
+    if len(jobsRaw) > 0:
+        let parsedJobs: int32 = int32(strutils.parseInt(jobsRaw))
+        if parsedJobs > 0:
+            return parsedJobs
+        return 1
+    let rawOverride: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_ISEL_MAX_THREADS", "")))
+    if len(rawOverride) > 0:
+        let parsed: int32 = int32(strutils.parseInt(rawOverride))
+        if parsed > 0:
+            return parsed
+        if parsed == 0:
+            return 1
+    let detected: int32 = machineThreadParallelismRaw()
+    return detected > 1 ? detected : 1
+
+fn machineThreadWorkerLimit(taskCount: int32): int32 =
+    if taskCount <= 1:
+        return 1
+    let workers: int32 = machineThreadParallelism()
+    if workers <= 1:
+        return 1
+    return workers < taskCount ? workers : taskCount
+
+fn machineThreadYield() =
+    machineThreadYieldRaw()
+
+fn machineSchedRunOnce(): int32 =
+    return machineSchedRunOnceRaw()
+
+fn machineThreadLocalI32Get(slot: int32): int32 =
+    return machineThreadLocalI32GetRaw(slot)
+
+fn machineThreadLocalI32Set(slot: int32, value: int32) =
+    machineThreadLocalI32SetRaw(slot, value)
+
 fn Ok_MachineReg(value: MachineReg): Result[MachineReg] =
     var out: Result[MachineReg]
     out.ok = true
     out.value = value
-    out.err = ErrorOk()
+    ErrorOkInto(out.err)
     return out
 
 fn Err_MachineReg(err: str): Result[MachineReg] =
     var out: Result[MachineReg]
     out.ok = false
-    out.err = ErrorNew(err)
+    ErrorNewInto(out.err, err)
     return out
 
 fn Ok_MachineModule(value: MachineModule): Result[MachineModule] =
     var out: Result[MachineModule]
     out.ok = true
     out.value = value
-    out.err = ErrorOk()
+    ErrorOkInto(out.err)
     return out
 
 fn Err_MachineModule(err: str): Result[MachineModule] =
     var out: Result[MachineModule]
     out.ok = false
-    out.err = ErrorNew(err)
+    ErrorNewInto(out.err, err)
     return out
 
 fn ErrInfo_MachineModule(err: ErrorInfo): Result[MachineModule] =
@@ -67,6 +146,11 @@ fn machineModuleFuncAt64(module: MachineModule, idx: int64): MachineFunc =
 
 fn machineModuleCstrsLen(module: MachineModule): int32 =
     return machineCoreModuleCstrsLen(module)
+
+fn machineModuleMissingSelectorCStrings(module: MachineModule, expectedCount: int32): bool =
+    if expectedCount <= 0 || module == nil:
+        return false
+    return machineModuleCstrsLen(module) < expectedCount
 
 fn machineModuleCStringAt(module: MachineModule, idx: int32): MachineCString =
     let coreModule: MachineCoreModule = module

@@ -72,14 +72,80 @@ fn uirCodegenHasEntryFunc(module: UirModule): bool =
             return true
     return false
 
+fn uirCodegenDebugDumpMainCandidate(module: UirModule, tag: str) =
+    if module == nil:
+        echo("[codegen.boot] " + tag + " main_candidate=nil_module")
+        return
+    var found: bool = false
+    for fi in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, fi)
+        if f == nil:
+            continue
+        let fnName: str = uirFuncNameOf(f)
+        let linkName: str = uirFuncLinkNameOf(f)
+        if fnName == "main" || fnName == "backendMain" ||
+           linkName == "main" || linkName == "_main":
+            echo("[codegen.boot] " + tag +
+                 " main_candidate idx=" + intToStr(fi) +
+                 " name=" + fnName +
+                 " link=" + linkName +
+                 " blocks=" + intToStr(uirFuncBlocksLen(f)) +
+                 " extern=" + (uirFuncIsExtern(f) ? "1" : "0"))
+            found = true
+            break
+    if !found:
+        echo("[codegen.boot] " + tag + " main_candidate=missing")
+
 fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
     let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
+    let dbgBoot: bool = os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1"
     let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    uirModuleHealExternFlags(module)
+    if dbgBoot:
+        let funcCount0: int32 = uirModuleFuncsLen(module)
+        var firstName0: str = ""
+        var firstLink0: str = ""
+        var firstBlocks0: int32 = -1
+        var firstExtern0: bool = false
+        if funcCount0 > 0:
+            let firstFunc0: UirFunc = uirModuleFuncAt(module, 0)
+            if firstFunc0 != nil:
+                firstName0 = uirFuncNameOf(firstFunc0)
+                firstLink0 = uirFuncLinkNameOf(firstFunc0)
+                firstBlocks0 = uirFuncBlocksLen(firstFunc0)
+                firstExtern0 = uirFuncIsExtern(firstFunc0)
+        echo("[codegen.boot] pre funcs=" + intToStr(funcCount0) +
+             " has_entry=" + (uirCodegenHasEntryFunc(module) ? "1" : "0") +
+             " first_name=" + firstName0 +
+             " first_link=" + firstLink0 +
+             " first_blocks=" + intToStr(firstBlocks0) +
+             " first_extern=" + (firstExtern0 ? "1" : "0"))
+        uirCodegenDebugDumpMainCandidate(module, "pre")
     uirCanonicalizeModule(module)
     # Keep opt=0 executable codegen from lowering unreachable helper routines.
     # This trims dead stage1 artifacts without touching no-main library/sidecar modules.
     if uirCodegenHasEntryFunc(module):
         uirCorePruneUnreachableFuncs(module)
+    if dbgBoot:
+        let funcCount1: int32 = uirModuleFuncsLen(module)
+        var firstName1: str = ""
+        var firstLink1: str = ""
+        var firstBlocks1: int32 = -1
+        var firstExtern1: bool = false
+        if funcCount1 > 0:
+            let firstFunc1: UirFunc = uirModuleFuncAt(module, 0)
+            if firstFunc1 != nil:
+                firstName1 = uirFuncNameOf(firstFunc1)
+                firstLink1 = uirFuncLinkNameOf(firstFunc1)
+                firstBlocks1 = uirFuncBlocksLen(firstFunc1)
+                firstExtern1 = uirFuncIsExtern(firstFunc1)
+        echo("[codegen.boot] post_prune funcs=" + intToStr(funcCount1) +
+             " has_entry=" + (uirCodegenHasEntryFunc(module) ? "1" : "0") +
+             " first_name=" + firstName1 +
+             " first_link=" + firstLink1 +
+             " first_blocks=" + intToStr(firstBlocks1) +
+             " first_extern=" + (firstExtern1 ? "1" : "0"))
+        uirCodegenDebugDumpMainCandidate(module, "post_prune")
     if dbgCstr:
         let preOptCstrs: int32 = uirModuleCStringsLen(module)
         echo("[codegen.cstr] pre-opt module_cstrs=" + intToStr(preOptCstrs))
@@ -108,24 +174,21 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
         echo("[codegen] select.end")
         echo("[codegen] regalloc.begin")
     let allocated: MachineModule = machineAssignRegisters(res.value)
-    # Some stage0/legacy selector builds can drop module cstring payloads.
-    # Keep machine emission robust by backfilling from UIR module metadata.
+    if dbgBoot:
+        let machineFuncCount: int32 = machineModuleFuncsLen(allocated)
+        var firstMachineName: str = ""
+        if machineFuncCount > 0:
+            firstMachineName = machineFuncNameOf(machineModuleFuncAt(allocated, 0))
+        echo("[codegen.boot] machine funcs=" + intToStr(machineFuncCount) +
+             " first_name=" + firstMachineName)
     let moduleCstrCount: int32 = uirModuleCStringsLen(module)
-    let machineCstrCount0: int32 = machineModuleCstrsLen(allocated)
-    if moduleCstrCount > 0 && machineCstrCount0 == 0:
-        var added: int32 = 0
-        for ci in 0..<moduleCstrCount:
-            let uc: UirCString = uirModuleCStringAt(module, ci)
-            let uLabel: str = uirCStringLabelOf(uc)
-            if len(uLabel) == 0:
-                continue
-            let uValue: str = uirCStringValueOf(uc)
-            machineAddCString(allocated, uLabel, uValue)
-            added = added + 1
-        if dbgCstr:
-            echo("[codegen.cstr] backfill added=" + intToStr(added) +
-                 " module_cstrs=" + intToStr(moduleCstrCount) +
-                 " machine_cstrs=" + intToStr(machineModuleCstrsLen(allocated)))
+    if machineModuleMissingSelectorCStrings(allocated, moduleCstrCount):
+        let machineCstrCount: int32 = machineModuleCstrsLen(allocated)
+        if dbgCstr || dbgCodegen || os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+            echo("[codegen.cstr] selector_missing expected=" + intToStr(moduleCstrCount) +
+                 " actual=" + intToStr(machineCstrCount))
+        return Err[MachineModule]("uir_codegen: selector missing cstring payloads expected=" +
+                                  intToStr(moduleCstrCount) + " actual=" + intToStr(machineCstrCount))
     if dbgCstr:
         let cCount: int32 = machineModuleCstrsLen(allocated)
         echo("[codegen.cstr] post-regalloc cstrs=" + intToStr(cCount))

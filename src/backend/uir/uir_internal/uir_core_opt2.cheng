@@ -61,12 +61,10 @@ fn add(seqInst: var str[], val: str) =
     setLen(seqInst, needLen)
     seqInst[idx] = val
 
-fn add(seqInst: str[]*, val: str) =
-    if seqInst == nil:
-        return
-    let idx: int32 = seqInst->len
+fn add(seqInst: var str[], val: str) =
+    let idx: int32 = seqInst.len
     let needLen: int32 = idx + 1
-    if seqInst->buffer == nil || seqInst->cap < needLen:
+    if seqInst.buffer == nil || seqInst.cap < needLen:
         reserve(seqInst, needLen)
     setLen(seqInst, needLen)
     seqInst[idx] = val
@@ -150,11 +148,11 @@ fn uirCoreOpt2RecursionLimit(): int32 =
     # Guard recursive helper fallbacks from pathological expression graphs.
     return 256
 
-fn uirCoreOpt2ExprSeenOrMark(seen: bool[]*, expr: UirExprId): bool =
-    if seen == nil || (!uirCoreExprIdValid(expr)):
+fn uirCoreOpt2ExprSeenOrMark(seen: var bool[], expr: UirExprId): bool =
+    if !uirCoreExprIdValid(expr):
         return false
-    for __for_guard_seen_grow in seen->len..expr:
-        add(*seen, false)
+    for __for_guard_seen_grow in seen.len..expr:
+        add(seen, false)
     if seen[expr]:
         return true
     seen[expr] = true
@@ -215,7 +213,7 @@ fn uirCoreOpt2ExprHasCall(expr: UirExprId): bool =
         work.len = work.len - 1
         if (!uirCoreExprIdValid(cur)):
             continue
-        if uirCoreOpt2ExprSeenOrMark(&seen, cur):
+        if uirCoreOpt2ExprSeenOrMark(seen, cur):
             continue
         steps = steps + 1
         if steps > budget:
@@ -250,7 +248,7 @@ fn uirCoreOpt2ExprHasAnyLoad(expr: UirExprId): bool =
         work.len = work.len - 1
         if (!uirCoreExprIdValid(cur)):
             continue
-        if uirCoreOpt2ExprSeenOrMark(&seen, cur):
+        if uirCoreOpt2ExprSeenOrMark(seen, cur):
             continue
         steps = steps + 1
         if steps > budget:
@@ -287,7 +285,7 @@ fn uirCoreOpt2ExprIsPure(expr: UirExprId): bool =
         work.len = work.len - 1
         if (!uirCoreExprIdValid(cur)):
             continue
-        if uirCoreOpt2ExprSeenOrMark(&seen, cur):
+        if uirCoreOpt2ExprSeenOrMark(seen, cur):
             continue
         steps = steps + 1
         if steps > budget:
@@ -324,7 +322,7 @@ fn uirCoreOpt2ExprUsesSlot(expr: UirExprId, slot: int32): bool =
         work.len = work.len - 1
         if (!uirCoreExprIdValid(cur)):
             continue
-        if uirCoreOpt2ExprSeenOrMark(&seen, cur):
+        if uirCoreOpt2ExprSeenOrMark(seen, cur):
             continue
         steps = steps + 1
         if steps > budget:
@@ -350,8 +348,8 @@ fn uirCoreOpt2ExprUsesSlot(expr: UirExprId, slot: int32): bool =
                 add(work, uirCoreExprArgAt(cur, i))
     return false
 
-fn uirCoreOpt2ExprMarkUses(expr: UirExprId, live: bool[]*) =
-    if (!uirCoreExprIdValid(expr)) || (live == nil):
+fn uirCoreOpt2ExprMarkUses(expr: UirExprId, live: var bool[]) =
+    if !uirCoreExprIdValid(expr):
         return
     # Iterative walk avoids stack overflow on cyclic/pathological expr graphs.
     var work: UirExprId[]
@@ -366,18 +364,18 @@ fn uirCoreOpt2ExprMarkUses(expr: UirExprId, live: bool[]*) =
         work.len = work.len - 1
         if (!uirCoreExprIdValid(cur)):
             continue
-        if uirCoreOpt2ExprSeenOrMark(&seen, cur):
+        if uirCoreOpt2ExprSeenOrMark(seen, cur):
             continue
         steps = steps + 1
         if steps > budget:
             # Conservative fallback: keep all locals live.
-            for i in 0..<live->len:
+            for i in 0..<live.len:
                 live[i] = true
             return
         let k: UirCoreExprKind = uirCoreExprKindOf(cur)
         if k == meLocal:
             let slot: int32 = uirCoreExprLocalIndexOf(cur)
-            if slot >= 0 && slot < live->len:
+            if slot >= 0 && slot < live.len:
                 live[slot] = true
             continue
         if k == meBin || k == meCmp:
@@ -394,30 +392,30 @@ fn uirCoreOpt2ExprMarkUses(expr: UirExprId, live: bool[]*) =
             for i in 0..<uirCoreExprArgsLen(cur):
                 add(work, uirCoreExprArgAt(cur, i))
 
-fn uirCoreOpt2ResolveAddrBaseInner(expr: UirExprId, depth: int32*): int32 =
-    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+fn uirCoreOpt2ResolveAddrBaseInner(expr: UirExprId, depth: var int32): int32 =
+    if !uirCoreExprIdValid(expr):
         return -1
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return -1
-    *depth = *depth + 1
+    depth = depth + 1
     var out: int32 = -1
     if uirCoreExprKindOf(expr) == meAddr:
         out = uirCoreExprLocalIndexOf(expr)
     elif uirCoreExprKindOf(expr) == meCast:
         out = uirCoreOpt2ResolveAddrBaseInner(uirCoreExprCastExprOf(expr), depth)
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2ResolveAddrBase(expr: UirExprId): int32 =
     var depth: int32 = 0
-    return uirCoreOpt2ResolveAddrBaseInner(expr, &depth)
+    return uirCoreOpt2ResolveAddrBaseInner(expr, depth)
 
-fn uirCoreOpt2ExprHasLoadFromBaseInner(expr: UirExprId, baseSlot: int32, depth: int32*): bool =
-    if (!uirCoreExprIdValid(expr)) || baseSlot < 0 || (depth == nil):
+fn uirCoreOpt2ExprHasLoadFromBaseInner(expr: UirExprId, baseSlot: int32, depth: var int32): bool =
+    if (!uirCoreExprIdValid(expr)) || baseSlot < 0:
         return false
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return false
-    *depth = *depth + 1
+    depth = depth + 1
     var out: bool = false
     let k: UirCoreExprKind = uirCoreExprKindOf(expr)
     if k == meLoad:
@@ -436,25 +434,23 @@ fn uirCoreOpt2ExprHasLoadFromBaseInner(expr: UirExprId, baseSlot: int32, depth: 
             if uirCoreOpt2ExprHasLoadFromBaseInner(uirCoreExprArgAt(expr, i), baseSlot, depth):
                 out = true
                 break
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2ExprHasLoadFromBase(expr: UirExprId, baseSlot: int32): bool =
     var depth: int32 = 0
-    return uirCoreOpt2ExprHasLoadFromBaseInner(expr, baseSlot, &depth)
+    return uirCoreOpt2ExprHasLoadFromBaseInner(expr, baseSlot, depth)
 
 fn uirCoreOpt2ExprRewriteWithMapInner(expr: UirExprId,
                                       mapValid: bool[],
                                       mapExpr: UirExprId[],
-                                      changed: bool*,
-                                      depth: int32*): UirExprId =
+                                      changed: var bool,
+                                      depth: var int32): UirExprId =
     if (!uirCoreExprIdValid(expr)):
         return uirCoreInvalidId()
-    if (depth == nil):
+    if depth >= uirCoreOpt2RecursionLimit():
         return expr
-    if *depth >= uirCoreOpt2RecursionLimit():
-        return expr
-    *depth = *depth + 1
+    depth = depth + 1
     let k: UirCoreExprKind = uirCoreExprKindOf(expr)
     var out: UirExprId = expr
     if k == meLocal:
@@ -463,8 +459,7 @@ fn uirCoreOpt2ExprRewriteWithMapInner(expr: UirExprId,
             let repl: UirExprId = mapExpr[slot]
             if uirCoreExprIdValid(repl):
                 if !(uirCoreExprKindOf(repl) == meLocal && uirCoreExprLocalIndexOf(repl) == slot):
-                    if !(changed == nil):
-                        *changed = true
+                    changed = true
                     out = repl
     elif k == meBin || k == meCmp:
         uirCoreExprSetLhs(expr, uirCoreOpt2ExprRewriteWithMapInner(uirCoreExprLhsOf(expr), mapValid, mapExpr, changed, depth))
@@ -476,15 +471,15 @@ fn uirCoreOpt2ExprRewriteWithMapInner(expr: UirExprId,
     elif k == meCall:
         for i in 0..<uirCoreExprArgsLen(expr):
             uirCoreExprSetArgAt(expr, i, uirCoreOpt2ExprRewriteWithMapInner(uirCoreExprArgAt(expr, i), mapValid, mapExpr, changed, depth))
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2ExprRewriteWithMap(expr: UirExprId,
                                  mapValid: bool[],
                                  mapExpr: UirExprId[],
-                                 changed: bool*): UirExprId =
+                                 changed: var bool): UirExprId =
     var depth: int32 = 0
-    return uirCoreOpt2ExprRewriteWithMapInner(expr, mapValid, mapExpr, changed, &depth)
+    return uirCoreOpt2ExprRewriteWithMapInner(expr, mapValid, mapExpr, changed, depth)
 
 fn uirCoreOpt2ResolveAlias(slot: int32, aliasValid: bool[], aliasSrc: int32[]): int32 =
     if slot < 0 || slot >= aliasValid.len || slot >= aliasSrc.len:
@@ -505,15 +500,13 @@ fn uirCoreOpt2ResolveAlias(slot: int32, aliasValid: bool[], aliasSrc: int32[]): 
 fn uirCoreOpt2ExprRewriteWithAliasInner(expr: UirExprId,
                                         aliasValid: bool[],
                                         aliasSrc: int32[],
-                                        changed: bool*,
-                                        depth: int32*): UirExprId =
+                                        changed: var bool,
+                                        depth: var int32): UirExprId =
     if (!uirCoreExprIdValid(expr)):
         return uirCoreInvalidId()
-    if (depth == nil):
+    if depth >= uirCoreOpt2RecursionLimit():
         return expr
-    if *depth >= uirCoreOpt2RecursionLimit():
-        return expr
-    *depth = *depth + 1
+    depth = depth + 1
     let k: UirCoreExprKind = uirCoreExprKindOf(expr)
     var out: UirExprId = expr
     if k == meLocal:
@@ -521,8 +514,7 @@ fn uirCoreOpt2ExprRewriteWithAliasInner(expr: UirExprId,
         if slot >= 0 && slot < aliasValid.len && slot < aliasSrc.len:
             let root: int32 = uirCoreOpt2ResolveAlias(slot, aliasValid, aliasSrc)
             if root != slot:
-                if !(changed == nil):
-                    *changed = true
+                changed = true
                 out = uirCoreLocal(root)
     elif k == meBin || k == meCmp:
         uirCoreExprSetLhs(expr, uirCoreOpt2ExprRewriteWithAliasInner(uirCoreExprLhsOf(expr), aliasValid, aliasSrc, changed, depth))
@@ -534,29 +526,27 @@ fn uirCoreOpt2ExprRewriteWithAliasInner(expr: UirExprId,
     elif k == meCall:
         for i in 0..<uirCoreExprArgsLen(expr):
             uirCoreExprSetArgAt(expr, i, uirCoreOpt2ExprRewriteWithAliasInner(uirCoreExprArgAt(expr, i), aliasValid, aliasSrc, changed, depth))
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2ExprRewriteWithAlias(expr: UirExprId,
                                    aliasValid: bool[],
                                    aliasSrc: int32[],
-                                   changed: bool*): UirExprId =
+                                   changed: var bool): UirExprId =
     var depth: int32 = 0
-    return uirCoreOpt2ExprRewriteWithAliasInner(expr, aliasValid, aliasSrc, changed, &depth)
+    return uirCoreOpt2ExprRewriteWithAliasInner(expr, aliasValid, aliasSrc, changed, depth)
 
 fn uirCoreOpt2ExprIsConstI64(expr: UirExprId, value: int64): bool =
     if (!uirCoreExprIdValid(expr)):
         return false
     return uirCoreExprKindOf(expr) == meConstI64 && uirCoreExprConstValueOf(expr) == value
 
-fn uirCoreOpt2ExprKeyInner(expr: UirExprId, depth: int32*): str =
+fn uirCoreOpt2ExprKeyInner(expr: UirExprId, depth: var int32): str =
     if (!uirCoreExprIdValid(expr)):
         return "nil"
-    if (depth == nil):
-        return "expr"
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return "cycle"
-    *depth = *depth + 1
+    depth = depth + 1
     let k: UirCoreExprKind = uirCoreExprKindOf(expr)
     var out: str = "expr"
     if k == meConstI64:
@@ -582,12 +572,12 @@ fn uirCoreOpt2ExprKeyInner(expr: UirExprId, depth: int32*): str =
                 out = out + ","
             out = out + uirCoreOpt2ExprKeyInner(uirCoreExprArgAt(expr, i), depth)
         out = out + ")"
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2ExprKey(expr: UirExprId): str =
     var depth: int32 = 0
-    return uirCoreOpt2ExprKeyInner(expr, &depth)
+    return uirCoreOpt2ExprKeyInner(expr, depth)
 
 fn uirCoreOpt2ExprEq(a: UirExprId, b: UirExprId): bool =
     return uirCoreOpt2ExprKey(a) == uirCoreOpt2ExprKey(b)
@@ -687,12 +677,12 @@ fn uirCoreOpt2ReachableBlocks(func: UirCoreFunc): bool[] =
                 add(stack, sf)
     return reachable
 
-fn uirCoreOpt2InferExprTypeInner(func: UirCoreFunc, expr: UirExprId, depth: int32*): UirCoreType =
-    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+fn uirCoreOpt2InferExprTypeInner(func: UirCoreFunc, expr: UirExprId, depth: var int32): UirCoreType =
+    if !uirCoreExprIdValid(expr):
         return uirCoreTypeI32()
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return uirCoreTypeI32()
-    *depth = *depth + 1
+    depth = depth + 1
     var out: UirCoreType = uirCoreTypeI32()
     if uirCoreExprKindOf(expr) == meConstI64:
         out = uirCoreTypeI64()
@@ -712,19 +702,19 @@ fn uirCoreOpt2InferExprTypeInner(func: UirCoreFunc, expr: UirExprId, depth: int3
         out = uirCoreTypeI32()
     elif uirCoreExprKindOf(expr) == meBin:
         out = uirCoreOpt2InferExprTypeInner(func, uirCoreExprLhsOf(expr), depth)
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2InferExprType(func: UirCoreFunc, expr: UirExprId): UirCoreType =
     var depth: int32 = 0
-    return uirCoreOpt2InferExprTypeInner(func, expr, &depth)
+    return uirCoreOpt2InferExprTypeInner(func, expr, depth)
 
-fn uirCoreOpt2ExprUsesAnyInSetInner(expr: UirExprId, flag: bool[], depth: int32*): bool =
-    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+fn uirCoreOpt2ExprUsesAnyInSetInner(expr: UirExprId, flag: bool[], depth: var int32): bool =
+    if !uirCoreExprIdValid(expr):
         return false
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return false
-    *depth = *depth + 1
+    depth = depth + 1
     var out: bool = false
     if uirCoreExprKindOf(expr) == meLocal || uirCoreExprKindOf(expr) == meAddr:
         let slot: int32 = uirCoreExprLocalIndexOf(expr)
@@ -742,19 +732,19 @@ fn uirCoreOpt2ExprUsesAnyInSetInner(expr: UirExprId, flag: bool[], depth: int32*
             if uirCoreOpt2ExprUsesAnyInSetInner(uirCoreExprArgAt(expr, i), flag, depth):
                 out = true
                 break
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2ExprUsesAnyInSet(expr: UirExprId, flag: bool[]): bool =
     var depth: int32 = 0
-    return uirCoreOpt2ExprUsesAnyInSetInner(expr, flag, &depth)
+    return uirCoreOpt2ExprUsesAnyInSetInner(expr, flag, depth)
 
-fn uirCoreOpt2ExprNormalizeInner(expr: UirExprId, changed: bool*, depth: int32*): UirExprId =
-    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+fn uirCoreOpt2ExprNormalizeInner(expr: UirExprId, changed: var bool, depth: var int32): UirExprId =
+    if !uirCoreExprIdValid(expr):
         return uirCoreInvalidId()
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return expr
-    *depth = *depth + 1
+    depth = depth + 1
     if uirCoreExprKindOf(expr) == meBin || uirCoreExprKindOf(expr) == meCmp:
         uirCoreExprSetLhs(expr, uirCoreOpt2ExprNormalizeInner(uirCoreExprLhsOf(expr), changed, depth))
         uirCoreExprSetRhs(expr, uirCoreOpt2ExprNormalizeInner(uirCoreExprRhsOf(expr), changed, depth))
@@ -765,22 +755,22 @@ fn uirCoreOpt2ExprNormalizeInner(expr: UirExprId, changed: bool*, depth: int32*)
     elif uirCoreExprKindOf(expr) == meCall:
         for i in 0..<uirCoreExprArgsLen(expr):
             uirCoreExprSetArgAt(expr, i, uirCoreOpt2ExprNormalizeInner(uirCoreExprArgAt(expr, i), changed, depth))
-    *depth = *depth - 1
+    depth = depth - 1
     return expr
 
-fn uirCoreOpt2ExprNormalize(expr: UirExprId, changed: bool*): UirExprId =
+fn uirCoreOpt2ExprNormalize(expr: UirExprId, changed: var bool): UirExprId =
     var depth: int32 = 0
-    return uirCoreOpt2ExprNormalizeInner(expr, changed, &depth)
+    return uirCoreOpt2ExprNormalizeInner(expr, changed, depth)
 
 fn uirCoreOpt2ExprNormalizeNopProbe(expr: UirExprId): UirExprId =
     return expr
 
-fn uirCoreOpt2ExprAlgebraicInner(expr: UirExprId, changed: bool*, depth: int32*): UirExprId =
-    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+fn uirCoreOpt2ExprAlgebraicInner(expr: UirExprId, changed: var bool, depth: var int32): UirExprId =
+    if !uirCoreExprIdValid(expr):
         return uirCoreInvalidId()
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return expr
-    *depth = *depth + 1
+    depth = depth + 1
     var out: UirExprId = expr
     if uirCoreExprKindOf(expr) == meCast:
         uirCoreExprSetCastExpr(expr, uirCoreOpt2ExprAlgebraicInner(uirCoreExprCastExprOf(expr), changed, depth))
@@ -803,71 +793,64 @@ fn uirCoreOpt2ExprAlgebraicInner(expr: UirExprId, changed: bool*, depth: int32*)
         uirCoreExprSetRhs(expr, uirCoreOpt2ExprAlgebraicInner(uirCoreExprRhsOf(expr), changed, depth))
 
     if uirCoreExprKindOf(expr) != meBin:
-        *depth = *depth - 1
+        depth = depth - 1
         return out
 
     if uirCoreExprBinOpOf(expr) == mbAdd:
         if uirCoreOpt2ExprIsConstI64(uirCoreExprRhsOf(expr), 0):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = uirCoreExprLhsOf(expr)
-            *depth = *depth - 1
+            depth = depth - 1
             return out
         if uirCoreOpt2ExprIsConstI64(uirCoreExprLhsOf(expr), 0):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = uirCoreExprRhsOf(expr)
-            *depth = *depth - 1
+            depth = depth - 1
             return out
         out = expr
-        *depth = *depth - 1
+        depth = depth - 1
         return out
     if uirCoreExprBinOpOf(expr) == mbSub:
         if uirCoreOpt2ExprIsConstI64(uirCoreExprRhsOf(expr), 0):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = uirCoreExprLhsOf(expr)
-            *depth = *depth - 1
+            depth = depth - 1
             return out
         out = expr
-        *depth = *depth - 1
+        depth = depth - 1
         return out
     if uirCoreExprBinOpOf(expr) == mbMul:
         if uirCoreOpt2ExprIsConstI64(uirCoreExprRhsOf(expr), 1):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = uirCoreExprLhsOf(expr)
-            *depth = *depth - 1
+            depth = depth - 1
             return out
         if uirCoreOpt2ExprIsConstI64(uirCoreExprLhsOf(expr), 1):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = uirCoreExprRhsOf(expr)
-            *depth = *depth - 1
+            depth = depth - 1
             return out
         if uirCoreOpt2ExprIsConstI64(uirCoreExprRhsOf(expr), 0) || uirCoreOpt2ExprIsConstI64(uirCoreExprLhsOf(expr), 0):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = uirCoreConstI64(0)
-            *depth = *depth - 1
+            depth = depth - 1
             return out
         out = expr
-        *depth = *depth - 1
+        depth = depth - 1
         return out
     if uirCoreExprBinOpOf(expr) == mbOr || uirCoreExprBinOpOf(expr) == mbXor || uirCoreExprBinOpOf(expr) == mbShl || uirCoreExprBinOpOf(expr) == mbShr:
         if uirCoreOpt2ExprIsConstI64(uirCoreExprRhsOf(expr), 0):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = uirCoreExprLhsOf(expr)
-            *depth = *depth - 1
+            depth = depth - 1
             return out
     out = expr
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
-fn uirCoreOpt2ExprAlgebraic(expr: UirExprId, changed: bool*): UirExprId =
+fn uirCoreOpt2ExprAlgebraic(expr: UirExprId, changed: var bool): UirExprId =
     var depth: int32 = 0
-    return uirCoreOpt2ExprAlgebraicInner(expr, changed, &depth)
+    return uirCoreOpt2ExprAlgebraicInner(expr, changed, depth)
 
 fn uirCoreOpt2ExprContainsCallOrLoad(expr: UirExprId): bool =
     return uirCoreOpt2ExprHasCall(expr) || uirCoreOpt2ExprHasAnyLoad(expr)
@@ -902,19 +885,18 @@ fn uirCoreOpt2BlockPreds(func: UirCoreFunc, targetIdx: int32): int32[] =
 fn uirCoreOpt2RewriteLoadsFromSlotInner(expr: UirExprId,
                                         slot: int32,
                                         replacement: UirExprId,
-                                        changed: bool*,
-                                        depth: int32*): UirExprId =
-    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+                                        changed: var bool,
+                                        depth: var int32): UirExprId =
+    if !uirCoreExprIdValid(expr):
         return uirCoreInvalidId()
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return expr
-    *depth = *depth + 1
+    depth = depth + 1
     var out: UirExprId = expr
     if uirCoreExprKindOf(expr) == meLoad:
         let base: int32 = uirCoreOpt2ResolveAddrBase(uirCoreExprAddrExprOf(expr))
         if base == slot && uirCoreExprIdValid(replacement):
-            if !(changed == nil):
-                *changed = true
+            changed = true
             out = replacement
         else:
             uirCoreExprSetAddrExpr(expr, uirCoreOpt2RewriteLoadsFromSlotInner(uirCoreExprAddrExprOf(expr), slot, replacement, changed, depth))
@@ -930,15 +912,15 @@ fn uirCoreOpt2RewriteLoadsFromSlotInner(expr: UirExprId,
         for i in 0..<uirCoreExprArgsLen(expr):
             uirCoreExprSetArgAt(expr, i, uirCoreOpt2RewriteLoadsFromSlotInner(uirCoreExprArgAt(expr, i), slot, replacement, changed, depth))
         out = expr
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2RewriteLoadsFromSlot(expr: UirExprId,
                                    slot: int32,
                                    replacement: UirExprId,
-                                   changed: bool*): UirExprId =
+                                   changed: var bool): UirExprId =
     var depth: int32 = 0
-    return uirCoreOpt2RewriteLoadsFromSlotInner(expr, slot, replacement, changed, &depth)
+    return uirCoreOpt2RewriteLoadsFromSlotInner(expr, slot, replacement, changed, depth)
 
 fn uirCoreOpt2ExprFindKey(keys: str[], key: str): int32 =
     for i in 0..<keys.len:
@@ -946,12 +928,12 @@ fn uirCoreOpt2ExprFindKey(keys: str[], key: str): int32 =
             return i
     return -1
 
-fn uirCoreOpt2ExprHasUnknownMemAccessInner(expr: UirExprId, depth: int32*): bool =
-    if (!uirCoreExprIdValid(expr)) || (depth == nil):
+fn uirCoreOpt2ExprHasUnknownMemAccessInner(expr: UirExprId, depth: var int32): bool =
+    if !uirCoreExprIdValid(expr):
         return false
-    if *depth >= uirCoreOpt2RecursionLimit():
+    if depth >= uirCoreOpt2RecursionLimit():
         return true
-    *depth = *depth + 1
+    depth = depth + 1
     var out: bool = false
     if uirCoreExprKindOf(expr) == meLoad:
         out = uirCoreOpt2ResolveAddrBase(uirCoreExprAddrExprOf(expr)) < 0
@@ -964,12 +946,12 @@ fn uirCoreOpt2ExprHasUnknownMemAccessInner(expr: UirExprId, depth: int32*): bool
         out = true
     else:
         out = false
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2ExprHasUnknownMemAccess(expr: UirExprId): bool =
     var depth: int32 = 0
-    return uirCoreOpt2ExprHasUnknownMemAccessInner(expr, &depth)
+    return uirCoreOpt2ExprHasUnknownMemAccessInner(expr, depth)
 
 fn uirCoreFuncCse(func: UirCoreFunc, module: UirCoreModule): bool =
     if (!uirCoreFuncIdValid(func)) || uirCoreFuncIsExtern(func):
@@ -1038,8 +1020,8 @@ fn uirCoreFuncSroa(func: UirCoreFunc): bool =
             var st: UirStmtId = uirCoreBlockStmtAt(blk, si)
             for slot in 0..<localCount:
                 if knownValid[slot] && uirCoreExprIdValid(knownVals[slot]):
-                    st = uirCoreStmtWithExpr(st, uirCoreOpt2RewriteLoadsFromSlot(uirCoreStmtExprOf(st), slot, knownVals[slot], &changed))
-                    st = uirCoreStmtWithAddrExpr(st, uirCoreOpt2RewriteLoadsFromSlot(uirCoreStmtAddrExprOf(st), slot, knownVals[slot], &changed))
+                    st = uirCoreStmtWithExpr(st, uirCoreOpt2RewriteLoadsFromSlot(uirCoreStmtExprOf(st), slot, knownVals[slot], changed))
+                    st = uirCoreStmtWithAddrExpr(st, uirCoreOpt2RewriteLoadsFromSlot(uirCoreStmtAddrExprOf(st), slot, knownVals[slot], changed))
             if uirCoreStmtKindOf(st) == msStore:
                 let base: int32 = uirCoreOpt2ResolveAddrBase(uirCoreStmtAddrExprOf(st))
                 if base >= 0 && base < localCount && !uirCoreOpt2ExprContainsCallOrLoad(uirCoreStmtExprOf(st)):
@@ -1067,26 +1049,24 @@ fn uirCoreFuncSroa(func: UirCoreFunc): bool =
         if uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtRet:
             for slot in 0..<localCount:
                 if knownValid[slot] && uirCoreExprIdValid(knownVals[slot]):
-                    uirCoreOpt2BlockSetRetExpr(blk, uirCoreOpt2RewriteLoadsFromSlot(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), slot, knownVals[slot], &changed))
+                    uirCoreOpt2BlockSetRetExpr(blk, uirCoreOpt2RewriteLoadsFromSlot(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), slot, knownVals[slot], changed))
         elif uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtCbr:
             for slot in 0..<localCount:
                 if knownValid[slot] && uirCoreExprIdValid(knownVals[slot]):
-                    uirCoreOpt2BlockSetCondExpr(blk, uirCoreOpt2RewriteLoadsFromSlot(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), slot, knownVals[slot], &changed))
+                    uirCoreOpt2BlockSetCondExpr(blk, uirCoreOpt2RewriteLoadsFromSlot(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), slot, knownVals[slot], changed))
     return changed
 
 fn uirCoreOpt2HoistExprToPreheaderInner(expr: UirExprId,
                                         func: UirCoreFunc,
                                         preheader: UirBlockId,
                                         defsInLoop: bool[],
-                                        changed: bool*,
-                                        depth: int32*): UirExprId =
+                                        changed: var bool,
+                                        depth: var int32): UirExprId =
     if (!uirCoreExprIdValid(expr)):
         return uirCoreInvalidId()
-    if (depth == nil):
+    if depth >= uirCoreOpt2RecursionLimit():
         return expr
-    if *depth >= uirCoreOpt2RecursionLimit():
-        return expr
-    *depth = *depth + 1
+    depth = depth + 1
     if uirCoreExprKindOf(expr) == meBin || uirCoreExprKindOf(expr) == meCmp:
         uirCoreExprSetLhs(expr, uirCoreOpt2HoistExprToPreheaderInner(uirCoreExprLhsOf(expr), func, preheader, defsInLoop, changed, depth))
         uirCoreExprSetRhs(expr, uirCoreOpt2HoistExprToPreheaderInner(uirCoreExprRhsOf(expr), func, preheader, defsInLoop, changed, depth))
@@ -1099,16 +1079,16 @@ fn uirCoreOpt2HoistExprToPreheaderInner(expr: UirExprId,
             uirCoreExprSetArgAt(expr, i, uirCoreOpt2HoistExprToPreheaderInner(uirCoreExprArgAt(expr, i), func, preheader, defsInLoop, changed, depth))
 
     if (!uirCoreBlockIdValid(preheader)) || (!uirCoreFuncIdValid(func)):
-        *depth = *depth - 1
+        depth = depth - 1
         return expr
     if !uirCoreOpt2ExprIsPure(expr):
-        *depth = *depth - 1
+        depth = depth - 1
         return expr
     if uirCoreExprKindOf(expr) == meConstI64 || uirCoreExprKindOf(expr) == meLocal || uirCoreExprKindOf(expr) == meAddr || uirCoreExprKindOf(expr) == meGlobalAddr:
-        *depth = *depth - 1
+        depth = depth - 1
         return expr
     if uirCoreOpt2ExprUsesAnyInSet(expr, defsInLoop):
-        *depth = *depth - 1
+        depth = depth - 1
         return expr
 
     let slot: int32 = uirCoreFuncLocalTypesLen(func)
@@ -1119,19 +1099,18 @@ fn uirCoreOpt2HoistExprToPreheaderInner(expr: UirExprId,
         add(preheaderStmts, uirCoreBlockStmtAt(preheader, si))
     add(preheaderStmts, hoisted)
     uirCoreBlockSetStmts(preheader, preheaderStmts)
-    if !(changed == nil):
-        *changed = true
+    changed = true
     let out: UirExprId = uirCoreLocal(slot)
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
 fn uirCoreOpt2HoistExprToPreheader(expr: UirExprId,
                                    func: UirCoreFunc,
                                    preheader: UirBlockId,
                                    defsInLoop: bool[],
-                                   changed: bool*): UirExprId =
+                                   changed: var bool): UirExprId =
     var depth: int32 = 0
-    return uirCoreOpt2HoistExprToPreheaderInner(expr, func, preheader, defsInLoop, changed, &depth)
+    return uirCoreOpt2HoistExprToPreheaderInner(expr, func, preheader, defsInLoop, changed, depth)
 
 fn uirCoreFuncLicm(func: UirCoreFunc): bool =
     if (!uirCoreFuncIdValid(func)) || uirCoreFuncIsExtern(func):
@@ -1181,7 +1160,7 @@ fn uirCoreFuncLicm(func: UirCoreFunc): bool =
                 defsInLoop[uirCoreStmtSlotOf(st)] = true
 
         if uirCoreTermKindOf(uirCoreBlockTermOf(header)) == mtCbr:
-            uirCoreOpt2BlockSetCondExpr(header, uirCoreOpt2HoistExprToPreheader(uirCoreTermCondExprOf(uirCoreBlockTermOf(header)), func, preheader, defsInLoop, &changed))
+            uirCoreOpt2BlockSetCondExpr(header, uirCoreOpt2HoistExprToPreheader(uirCoreTermCondExprOf(uirCoreBlockTermOf(header)), func, preheader, defsInLoop, changed))
 
     return changed
 
@@ -1199,9 +1178,9 @@ fn uirCoreFuncDceStmts(func: UirCoreFunc): bool =
         for _ in 0..<localCount:
             add(live, false)
         if uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtRet:
-            uirCoreOpt2ExprMarkUses(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), &live)
+            uirCoreOpt2ExprMarkUses(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), live)
         elif uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtCbr:
-            uirCoreOpt2ExprMarkUses(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), &live)
+            uirCoreOpt2ExprMarkUses(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), live)
 
         var keep: bool[]
         for _ in 0..<uirCoreBlockStmtsLen(blk):
@@ -1231,8 +1210,8 @@ fn uirCoreFuncDceStmts(func: UirCoreFunc): bool =
 
             if defSlot >= 0 && defSlot < live.len:
                 live[defSlot] = false
-            uirCoreOpt2ExprMarkUses(uirCoreStmtExprOf(st), &live)
-            uirCoreOpt2ExprMarkUses(uirCoreStmtAddrExprOf(st), &live)
+            uirCoreOpt2ExprMarkUses(uirCoreStmtExprOf(st), live)
+            uirCoreOpt2ExprMarkUses(uirCoreStmtAddrExprOf(st), live)
 
         var newStmts: UirStmtId[]
         for i in 0..<uirCoreBlockStmtsLen(blk):
@@ -1244,15 +1223,13 @@ fn uirCoreFuncDceStmts(func: UirCoreFunc): bool =
 
 fn uirCoreInlineCallExprInner(expr: UirExprId,
                               module: UirCoreModule,
-                              changed: bool*,
-                              depth: int32*): UirExprId =
+                              changed: var bool,
+                              depth: var int32): UirExprId =
     if (!uirCoreExprIdValid(expr)) || (module == nil):
         return expr
-    if (depth == nil):
+    if depth >= uirCoreOpt2RecursionLimit():
         return expr
-    if *depth >= uirCoreOpt2RecursionLimit():
-        return expr
-    *depth = *depth + 1
+    depth = depth + 1
     var out: UirExprId = expr
     if uirCoreExprKindOf(expr) == meBin || uirCoreExprKindOf(expr) == meCmp:
         uirCoreExprSetLhs(expr, uirCoreInlineCallExprInner(uirCoreExprLhsOf(expr), module, changed, depth))
@@ -1287,16 +1264,15 @@ fn uirCoreInlineCallExprInner(expr: UirExprId,
                     let repl: UirExprId = uirCoreTermRetExprOf(uirCoreBlockTermOf(b))
                     if (!uirCoreExprIdValid(repl)):
                         continue
-                    if !(changed == nil):
-                        *changed = true
+                    changed = true
                     out = repl
                     break
-    *depth = *depth - 1
+    depth = depth - 1
     return out
 
-fn uirCoreInlineCallExpr(expr: UirExprId, module: UirCoreModule, changed: bool*): UirExprId =
+fn uirCoreInlineCallExpr(expr: UirExprId, module: UirCoreModule, changed: var bool): UirExprId =
     var depth: int32 = 0
-    return uirCoreInlineCallExprInner(expr, module, changed, &depth)
+    return uirCoreInlineCallExprInner(expr, module, changed, depth)
 
 fn uirCoreInlineModuleOnce(module: UirCoreModule): bool =
     if (module == nil):
@@ -1312,20 +1288,20 @@ fn uirCoreInlineModuleOnce(module: UirCoreModule): bool =
                 continue
             for si in 0..<uirCoreBlockStmtsLen(blk):
                 var st: UirStmtId = uirCoreBlockStmtAt(blk, si)
-                st = uirCoreStmtWithExpr(st, uirCoreInlineCallExpr(uirCoreStmtExprOf(st), module, &changed))
-                st = uirCoreStmtWithAddrExpr(st, uirCoreInlineCallExpr(uirCoreStmtAddrExprOf(st), module, &changed))
+                st = uirCoreStmtWithExpr(st, uirCoreInlineCallExpr(uirCoreStmtExprOf(st), module, changed))
+                st = uirCoreStmtWithAddrExpr(st, uirCoreInlineCallExpr(uirCoreStmtAddrExprOf(st), module, changed))
                 uirCoreBlockSetStmtAt(blk, si, st)
             if uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtRet:
-                uirCoreOpt2BlockSetRetExpr(blk, uirCoreInlineCallExpr(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), module, &changed))
+                uirCoreOpt2BlockSetRetExpr(blk, uirCoreInlineCallExpr(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), module, changed))
             elif uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtCbr:
-                uirCoreOpt2BlockSetCondExpr(blk, uirCoreInlineCallExpr(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), module, &changed))
+                uirCoreOpt2BlockSetCondExpr(blk, uirCoreInlineCallExpr(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), module, changed))
     return changed
 
 fn uirCoreOpt2CalleeBudgetSentinel(): str =
     return "__uir_core_opt2_budget_exceeded__"
 
-fn uirCoreOpt2ExprCollectCallees(expr: UirExprId, names: str[]*) =
-    if (!uirCoreExprIdValid(expr)) || (names == nil):
+fn uirCoreOpt2ExprCollectCallees(expr: UirExprId, names: var str[]) =
+    if !uirCoreExprIdValid(expr):
         return
     # Iterative walk avoids stack overflow on cyclic/pathological expr graphs.
     let sentinel: str = uirCoreOpt2CalleeBudgetSentinel()
@@ -1341,12 +1317,12 @@ fn uirCoreOpt2ExprCollectCallees(expr: UirExprId, names: str[]*) =
         work.len = work.len - 1
         if (!uirCoreExprIdValid(cur)):
             continue
-        if uirCoreOpt2ExprSeenOrMark(&seen, cur):
+        if uirCoreOpt2ExprSeenOrMark(seen, cur):
             continue
         steps = steps + 1
         if steps > budget:
             var hasSentinel: bool = false
-            for i in 0..<names->len:
+            for i in 0..<names.len:
                 if names[i] == sentinel:
                     hasSentinel = true
                     break
@@ -1357,7 +1333,7 @@ fn uirCoreOpt2ExprCollectCallees(expr: UirExprId, names: str[]*) =
         if k == meCall:
             if len(uirCoreExprCalleeOf(cur)) > 0:
                 var exists: bool = false
-                for i in 0..<names->len:
+                for i in 0..<names.len:
                     if names[i] == uirCoreExprCalleeOf(cur):
                         exists = true
                         break
@@ -1444,12 +1420,12 @@ fn uirCorePruneUnreachableFuncs(module: UirCoreModule): bool =
                 continue
             for si in 0..<uirCoreBlockStmtsLen(blk):
                 let st: UirStmtId = uirCoreBlockStmtAt(blk, si)
-                uirCoreOpt2ExprCollectCallees(uirCoreStmtExprOf(st), &callees)
-                uirCoreOpt2ExprCollectCallees(uirCoreStmtAddrExprOf(st), &callees)
+                uirCoreOpt2ExprCollectCallees(uirCoreStmtExprOf(st), callees)
+                uirCoreOpt2ExprCollectCallees(uirCoreStmtAddrExprOf(st), callees)
             if uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtRet:
-                uirCoreOpt2ExprCollectCallees(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), &callees)
+                uirCoreOpt2ExprCollectCallees(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), callees)
             elif uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtCbr:
-                uirCoreOpt2ExprCollectCallees(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), &callees)
+                uirCoreOpt2ExprCollectCallees(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), callees)
         var budgetExceeded: bool = false
         let sentinel: str = uirCoreOpt2CalleeBudgetSentinel()
         for ci in 0..<callees.len:
@@ -1583,8 +1559,8 @@ fn uirCoreOptimizeModuleForwardSubstitute(module: UirCoreModule): bool =
 
             for si in 0..<uirCoreBlockStmtsLen(blk):
                 var st: UirStmtId = uirCoreBlockStmtAt(blk, si)
-                st = uirCoreStmtWithExpr(st, uirCoreOpt2ExprRewriteWithMap(uirCoreStmtExprOf(st), availValid, availVals, &changedAny))
-                st = uirCoreStmtWithAddrExpr(st, uirCoreOpt2ExprRewriteWithMap(uirCoreStmtAddrExprOf(st), availValid, availVals, &changedAny))
+                st = uirCoreStmtWithExpr(st, uirCoreOpt2ExprRewriteWithMap(uirCoreStmtExprOf(st), availValid, availVals, changedAny))
+                st = uirCoreStmtWithAddrExpr(st, uirCoreOpt2ExprRewriteWithMap(uirCoreStmtAddrExprOf(st), availValid, availVals, changedAny))
 
                 var defSlot: int32 = -1
                 if uirCoreStmtKindOf(st) == msLet || uirCoreStmtKindOf(st) == msVar || uirCoreStmtKindOf(st) == msAssign || uirCoreStmtKindOf(st) == msParam:
@@ -1606,9 +1582,9 @@ fn uirCoreOptimizeModuleForwardSubstitute(module: UirCoreModule): bool =
                 uirCoreBlockSetStmtAt(blk, si, st)
 
             if uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtRet:
-                uirCoreOpt2BlockSetRetExpr(blk, uirCoreOpt2ExprRewriteWithMap(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), availValid, availVals, &changedAny))
+                uirCoreOpt2BlockSetRetExpr(blk, uirCoreOpt2ExprRewriteWithMap(uirCoreTermRetExprOf(uirCoreBlockTermOf(blk)), availValid, availVals, changedAny))
             elif uirCoreTermKindOf(uirCoreBlockTermOf(blk)) == mtCbr:
-                uirCoreOpt2BlockSetCondExpr(blk, uirCoreOpt2ExprRewriteWithMap(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), availValid, availVals, &changedAny))
+                uirCoreOpt2BlockSetCondExpr(blk, uirCoreOpt2ExprRewriteWithMap(uirCoreTermCondExprOf(uirCoreBlockTermOf(blk)), availValid, availVals, changedAny))
     return changedAny
 
 fn uirCoreOptimizeModuleFoldPureExprs(module: UirCoreModule): bool =

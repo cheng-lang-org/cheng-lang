@@ -4,6 +4,7 @@ import std/strings
 import std/result
 import std/os
 import backend/machine/machine_types
+import backend/obj/cstring_label_support
 import backend/obj/obj_buf
 
 type
@@ -97,50 +98,22 @@ fn coffx64_strCmp(a: str, b: str): int32 =
         return 1
     return 0
 
-fn coffx64_seqContainsStr(items: str[], value: str): bool =
-    for i in 0..<items.len:
-        if (items[i] == value):
-            return true
-    return false
-
-fn coffx64HexNibble(c: char): int32 =
-    if c >= '0' && c <= '9':
-        return int32(c) - int32('0')
-    if c >= 'a' && c <= 'f':
-        return 10 + int32(c) - int32('a')
-    if c >= 'A' && c <= 'F':
-        return 10 + int32(c) - int32('A')
-    return -1
-
-fn coffx64CanonicalCStringReloc(name: str): str =
-    let _: str = name
-    return ""
-
-
 fn coffx64ReadStrPtr(items: var str[], idx: int32): str =
-    if void*(items) == nil:
-        panic "coff_writer_x86_64: nil seq pointer"
     return items[int(idx)]
 
 fn coffx64WriteStrPtr(items: var str[], idx: int32, val: str) =
-    if void*(items) == nil:
-        panic "coff_writer_x86_64: nil seq pointer"
     items[int(idx)] = val
 
 fn coffx64AddStrPtr(items: var str[], value: str) =
-    if void*(items) == nil:
-        return
     add(items, value)
 
 fn coffx64AddSymPtr(outSyms: var CoffX64Sym[], s: CoffX64Sym) =
-    if void*(outSyms) == nil:
-        return
     add(outSyms, s)
 
 fn coffx64_seqAddUniqueStr(items: var str[], value: str) =
-    if void*(items) == nil || len(value) == 0:
+    if len(value) == 0:
         return
-    if coffx64_seqContainsStr(items, value):
+    if objCStringSeqContainsStr(items, value):
         return
     coffx64AddStrPtr(items, value)
 
@@ -148,8 +121,6 @@ fn coffx64_getTextFixup(items: CoffX64TextFixup[], i: int32): CoffX64TextFixup =
     return items[int(i)]
 
 fn coffx64_sortStringsStable(items: var str[]) =
-    if void*(items) == nil:
-        return
     for i in 1..<items.len:
         let key: str = coffx64ReadStrPtr(items, i)
         var j: int32 = i - 1
@@ -174,23 +145,23 @@ fn coffx64SeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
     return items[int(idx)]
 
 fn coffx64ModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
-    if void*(mod) == nil:
+    if mod == nil:
         return nil
     return machineModuleFuncAt(mod, idx)
 
 fn coffx64ModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
     var zero: MachineCString
-    if void*(mod) == nil:
+    if mod == nil:
         return zero
     return machineModuleCStringAt(mod, idx)
 
 fn coffx64ModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
-    if void*(mod) == nil:
+    if mod == nil:
         return nil
     return machineModuleGlobalAt(mod, idx)
 
 fn coffx64FuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
-    if void*(func) == nil:
+    if func == nil:
         return nil
     return machineFuncInstAt(func, idx)
 
@@ -204,8 +175,7 @@ fn coffx64AlignUp32(value: uint32, align: uint32): uint32 =
 
 fn coffx64AddSym(outSyms: var CoffX64Sym[], name: str, value: uint32, sect: int32,
                  stype: uint16, storage: uint8) =
-    var s: CoffX64Sym
-    new s
+    var s: CoffX64Sym = new(CoffX64Sym)
     s.name = name
     s.value = value
     s.sect = sect
@@ -219,7 +189,7 @@ fn coffx64FindSymIndex(syms: CoffX64Sym[], name: str): int32 =
         return -1
     for i in 0..<syms.len:
         let s: CoffX64Sym = syms[i]
-        if void*(s) != nil && (s.name == name):
+        if s != nil && (s.name == name):
             return i
     return -1
 
@@ -635,7 +605,7 @@ fn x64JccCode(cond: MachineCond): uint8 =
         return uint8(0x5)
 
 fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
-    if void*(module) == nil:
+    if module == nil:
         return Err[uint8[]]("coff_writer_x86_64: nil module")
     if ! coffx64_targetIsWindows(machineModuleTargetOf(module)):
         return Err[uint8[]]("coff_writer_x86_64: non-windows target not supported")
@@ -648,10 +618,13 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
     # Layout .rdata (cstrings).
     var cSymOffs: uint32[]
     cSymOffs.len = int(machineModuleCstrsLen(module))
+    var cSymLabels: str[]
+    cSymLabels.len = int(machineModuleCstrsLen(module))
     for ci in 0..<machineModuleCstrsLen(module):
         let c: MachineCString = coffx64ModuleCStringAtRaw(module, ci)
         let off: uint32 = uint32(rdata.len)
         cSymOffs[ci] = off
+        cSymLabels[ci] = machineCStringLabelOf(c)
         bufStr0(&rdata, machineCStringValueOf(c))
 
     # Layout globals (.data/.bss).
@@ -719,8 +692,7 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
                 x64EmitMovImm(text, machineInstRdOf(inst), machineInstImmOf(inst))
             of machineOpAdrp:
                 x64EmitLeaRipRel32(text, machineInstRdOf(inst))
-                var r: CoffX64Reloc
-                new r
+                var r: CoffX64Reloc = new(CoffX64Reloc)
                 r.off = uint32(instStart + 3)
                 r.sym = machineInstLabelOf(inst)
                 r.rtype = IMAGE_REL_AMD64_REL32
@@ -776,8 +748,7 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
                 x64EmitCmpRR(text, machineInstRnOf(inst), machineInstRmOf(inst))
             of machineOpB:
                 x64EmitJmpRel32(text)
-                var f0: CoffX64TextFixup
-                new f0
+                var f0: CoffX64TextFixup = new(CoffX64TextFixup)
                 f0.dispOff = instStart + 1
                 f0.nextOff = int32(text.len)
                 f0.label = machineInstLabelOf(inst)
@@ -785,16 +756,14 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
             of machineOpBCond:
                 let cc: uint8 = x64JccCode(machineInstCondOf(inst))
                 x64EmitJccRel32(text, cc)
-                var f1: CoffX64TextFixup
-                new f1
+                var f1: CoffX64TextFixup = new(CoffX64TextFixup)
                 f1.dispOff = instStart + 2
                 f1.nextOff = int32(text.len)
                 f1.label = machineInstLabelOf(inst)
                 add(fixups, f1)
             of machineOpBl:
                 x64EmitCallRel32(text)
-                var r2: CoffX64Reloc
-                new r2
+                var r2: CoffX64Reloc = new(CoffX64Reloc)
                 r2.off = uint32(instStart + 1)
                 r2.sym = machineInstLabelOf(inst)
                 r2.rtype = IMAGE_REL_AMD64_REL32
@@ -834,32 +803,17 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
                 return Err[uint8[]]("coff_writer_x86_64: branch displacement out of range")
             bufU32At(text, fx.dispOff, uint32(int32(disp)))
 
-    # Synthesize reloc-only L_cheng_str_* literals so they are local-defined and
-    # force materialization of .rdata when selector cstring lowering is disabled.
-    var synthCstrNames: str[]
-    var synthCstrOffs: uint32[]
+    # Selector owns cstring materialization. Local L_cheng_str_"*" relocs must
+    # already point at emitted canonical cstring labels.
     for ri in 0..<relocs.len:
         let rC: CoffX64Reloc = relocs[ri]
-        if void*(rC) == nil || len(rC.sym) == 0:
+        if rC == nil || len(rC.sym) == 0:
             continue
-        let canonical: str = coffx64CanonicalCStringReloc(rC.sym)
+        let canonical: str = objCStringCanonicalTempLabel(rC.sym)
         if len(canonical) == 0:
             continue
-        var off: uint32 = 0
-        var found: bool = false
-        for si in 0..<synthCstrNames.len:
-            if si < synthCstrOffs.len && synthCstrNames[si] == canonical:
-                off = synthCstrOffs[si]
-                found = true
-                break
-        if !found:
-            off = uint32(rdata.len)
-            bufU8(&rdata, uint8(0))
-            add(synthCstrNames, canonical)
-            add(synthCstrOffs, off)
-        if canonical != rC.sym && !coffx64_seqContainsStr(synthCstrNames, rC.sym):
-            add(synthCstrNames, rC.sym)
-            add(synthCstrOffs, off)
+        if !objCStringSeqContainsStr(cSymLabels, canonical):
+            return Err[uint8[]](objCStringMissingSelectorRelocErr("coff_writer_x86_64", rC.sym))
 
 
     let hasRdata: bool = rdata.len > 0
@@ -891,10 +845,6 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
             let c2: MachineCString = coffx64ModuleCStringAtRaw(module, ci)
             coffx64AddSym(syms, machineCStringLabelOf(c2), cSymOffs[ci], rdataIndex,
                           uint16(0), IMAGE_SYM_CLASS_STATIC)
-        for si in 0..<synthCstrNames.len:
-            if si < synthCstrOffs.len:
-                coffx64AddSym(syms, synthCstrNames[si], synthCstrOffs[si], rdataIndex,
-                              uint16(0), IMAGE_SYM_CLASS_STATIC)
 
     # local funcs
     for fi in 0..<machineModuleFuncsLen(module):
@@ -929,8 +879,8 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
     for ri in 0..<relocs.len:
         let r0: CoffX64Reloc = relocs[ri]
         if coffx64FindSymIndex(syms, r0.sym) < 0:
-            coffx64_seqAddUniqueStr(&undefs, r0.sym)
-    coffx64_sortStringsStable(&undefs)
+            coffx64_seqAddUniqueStr(undefs, r0.sym)
+    coffx64_sortStringsStable(undefs)
     for ri in 0..<undefs.len:
         coffx64AddSym(syms, undefs[ri], uint32(0), 0, uint16(0), IMAGE_SYM_CLASS_EXTERNAL)
 
@@ -939,7 +889,7 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
     bufU32(strtab, uint32(0)) # placeholder size
     for si in 0..<syms.len:
         let s0: CoffX64Sym = syms[si]
-        if void*(s0) != nil && len(s0.name) > 8:
+        if s0 != nil && len(s0.name) > 8:
             s0.nameOff = uint32(strtab.len)
             bufStr0(strtab, s0.name)
             syms[si] = s0
@@ -1111,6 +1061,6 @@ fn coffBuildX86_64(module: MachineModule): Result[uint8[]] =
     return Ok[uint8[]](out)
 
 fn coffWriteX86_64RelocatableObj(module: MachineModule): Result[uint8[]] =
-    if void*(module) != nil:
-        memRetain(void*(module))
+    if module != nil:
+        memRetain(module)
     return coffBuildX86_64(module)

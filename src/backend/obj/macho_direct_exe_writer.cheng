@@ -2,6 +2,7 @@
 # This keeps a stable API for function-chunk/relo patch planning while
 # reusing the proven in-memory self-linker core.
 import std/result
+import std/rawmem_support
 import backend/obj/macho_linker
 
 type
@@ -27,8 +28,7 @@ fn directAppendU64(out: var uint64[], value: uint64) =
     if out.buffer == nil || out.len >= out.cap:
         cheng__seqGrowToRaw(&out.buffer, &out.cap, out.len + 1, int32(sizeof uint64))
     let elemBytes: int32 = out.len * int32(sizeof uint64)
-    let writePtr: uint64* = uint64*(ptr_add(out.buffer, elemBytes))
-    *writePtr = value
+    store(rawmem_support.rawmemPtrAdd(out.buffer, elemBytes), value)
     out.len = out.len + 1
 
 fn machoDirectComputeTextLayout(chunks: DirectFunctionChunk[]): uint64[] =
@@ -38,14 +38,13 @@ fn machoDirectComputeTextLayout(chunks: DirectFunctionChunk[]): uint64[] =
     for i in 0..<chunks.len:
         directAppendU64(out, cursor)
         let c: DirectFunctionChunk = chunks[i]
-        if void*(c) != nil:
+        if ptr(c) != nil:
             cursor = cursor + c.textSize
     return out
 
 fn machoDirectBuildPlan(chunks: DirectFunctionChunk[],
                         patches: DirectRelocPatch[]): Result[DirectExePlan] =
-    var plan: DirectExePlan
-    new plan
+    var plan: DirectExePlan = new(DirectExePlan)
     plan.functionChunks = chunks
     plan.relocPatches = patches
     plan.textLayout = machoDirectComputeTextLayout(chunks)
@@ -63,7 +62,7 @@ fn machoDirectWriteHostExePlan(mainObjBytes: uint8[],
                                runtimeObj: str): Result[bool] =
     if len(outputPath) == 0:
         return Err[bool]("macho_direct_exe_writer: missing output path")
-    if void*(mainObjBytes) == nil || mainObjBytes.len <= 0:
+    if ptr(mainObjBytes) == nil || mainObjBytes.len <= 0:
         return Err[bool]("macho_direct_exe_writer: empty main object bytes")
     if plan == nil || plan.textLayout.len < 0 || plan.relocPatches.len < 0:
         return Err[bool]("macho_direct_exe_writer: invalid direct layout metadata")

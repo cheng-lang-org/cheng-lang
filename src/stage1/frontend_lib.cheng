@@ -1,6 +1,7 @@
 # Stage1 frontend (internal pipeline + fallback).
 import std/os
 import std/strings
+import std/strutils
 import std/seqs
 import std/hashmaps
 import std/hashsets
@@ -64,17 +65,15 @@ fn stage1_readFileFast(path: str): str =
     stage1_c_readFileAllBridgeInto(cstring(path), bridge)
     return stage1_bridgeStrToOwned(bridge)
 
-fn stage1_readFileIntoRaw(pathRaw: cstring, out: str* = nil): bool =
+fn stage1_readFileIntoRaw(pathRaw: cstring, out: var str): bool =
     if pathRaw == nil:
-        if out != nil:
-            *out = ""
+        out = ""
         return false
     var bridge: Stage1StrBridge
     stage1_bridgeStrZero(bridge)
     stage1_c_readFileAllBridgeInto(cstring(pathRaw), bridge)
     let fastText: str = stage1_bridgeStrToOwned(bridge)
-    if out != nil:
-        *out = fastText
+    out = fastText
     if stage1_c_strlen(fastText) > 0:
         return true
     return stage1_c_fileExists(cstring(pathRaw)) != 0
@@ -128,63 +127,104 @@ fn add(dst: Token[]*, val: Token) =
 fn add(dst: var Diagnostic[], val: Diagnostic) =
     seqs.add(dst, val)
 
-fn add(dst: Diagnostic[]*, val: Diagnostic) =
-    seqs.add(dst, val)
+fn add(dst: ptr, val: Diagnostic) =
+    if dst == nil:
+        return
+    var seqVal: Diagnostic[] = load(dst)
+    seqs.add(seqVal, val)
+    store(dst, seqVal)
+
+fn stage1TraceHas(trace: ptr, path: str): bool =
+    if trace == nil:
+        return false
+    let traceVal: ImportTrace = load(trace)
+    return importTraceHas(traceVal, path)
+
+fn stage1TracePush(trace: ptr, path: str) =
+    if trace == nil:
+        return
+    var traceVal: ImportTrace = load(trace)
+    importTracePush(traceVal, path)
+    store(trace, traceVal)
+
+fn stage1TracePop(trace: ptr) =
+    if trace == nil:
+        return
+    var traceVal: ImportTrace = load(trace)
+    importTracePop(traceVal)
+    store(trace, traceVal)
+
+fn stage1VisitedHas(visited: ptr, path: str): bool =
+    if visited == nil:
+        return false
+    let visitedVal: StrSetList = load(visited)
+    return setHasNormalizedStr(visitedVal, path)
+
+fn stage1VisitedAdd(visited: ptr, path: str) =
+    if visited == nil:
+        return
+    var visitedVal: StrSetList = load(visited)
+    setAddNormalizedStr(visitedVal, path)
+    store(visited, visitedVal)
+
+fn stage1CacheHasNodes(cache: ptr, path: str): bool =
+    if cache == nil:
+        return false
+    let cacheVal: NodeCache = load(cache)
+    return mapHasNodes(cacheVal, path)
+
+fn stage1CacheGetNodes(cache: ptr, path: str): AstNodeId[] =
+    var empty: AstNodeId[]
+    if cache == nil:
+        return empty
+    let cacheVal: NodeCache = load(cache)
+    return mapGetNodes(cacheVal, path)
+
+fn stage1CacheSetNodes(cache: ptr, path: str, values: AstNodeId[]) =
+    if cache == nil:
+        return
+    var cacheVal: NodeCache = load(cache)
+    mapSetNodes(cacheVal, path, values)
+    store(cache, cacheVal)
+
+fn stage1DiagsHasError(diags: ptr): bool =
+    if diags == nil:
+        return false
+    let diagVals: Diagnostic[] = load(diags)
+    return hasError(diagVals)
 
 fn stage1_c_getenv(name: cstring): str =
     return os.getEnvDefault(name, "")
 fn stage1_getEnv(name: str): str =
     return stage1_c_getenv name
 
+fn stage1SafeStr(s: str): str =
+    return strNonEmpty(s) ? s : ""
+
 fn lowerAscii(s: str): str =
-    let n: int32 = len s
-    if n == 0:
-        return ""
-    let outText: str = newStringOfCap(n)
-    let outPtr: void* = rawmemAsVoid(outText)
-    if outPtr == nil:
-        return s
-    for i in 0..<n:
-        let c: char = s[i]
-        var out: char = c
-        if c >= 'A' && c <= 'Z':
-            let oc: int32 = int32(c) + 32
-            out = chr oc
-        rawmemWriteChar(outPtr, i, out)
-    return outText
+    return strutils.toLowerAscii(stage1SafeStr(s))
 
 fn stage1Concat2(left: str, right: str): str =
-    let safeLeft: str = void*(left) == nil ? "" : left
-    let safeRight: str = void*(right) == nil ? "" : right
+    let safeLeft: str = stage1SafeStr(left)
+    let safeRight: str = stage1SafeStr(right)
     let nLeft: int32 = len(safeLeft)
     let nRight: int32 = len(safeRight)
     if nLeft <= 0:
         return safeRight
     if nRight <= 0:
         return safeLeft
-    let out: str = newStringAlloc(nLeft + nRight)
-    if void*(out) == nil:
-        return ""
-    copyMem(void*(out), void*(safeLeft), nLeft)
-    copyMem(ptr_add(void*(out), nLeft), void*(safeRight), nRight)
-    return out
+    return safeLeft + safeRight
 
 fn stage1JoinWithSlash(left: str, right: str): str =
-    let safeLeft: str = void*(left) == nil ? "" : left
-    let safeRight: str = void*(right) == nil ? "" : right
+    let safeLeft: str = stage1SafeStr(left)
+    let safeRight: str = stage1SafeStr(right)
     let nLeft: int32 = len(safeLeft)
     let nRight: int32 = len(safeRight)
     if nLeft <= 0:
         return safeRight
     if nRight <= 0:
         return safeLeft
-    let out: str = newStringAlloc(nLeft + 1 + nRight)
-    if void*(out) == nil:
-        return ""
-    copyMem(void*(out), void*(safeLeft), nLeft)
-    rawmemWriteChar(void*(out), nLeft, '/')
-    copyMem(ptr_add(void*(out), nLeft + 1), void*(safeRight), nRight)
-    return out
+    return safeLeft + "/" + safeRight
 
 fn stage1AppendChengExt(path: str): str =
     return endsWith(path, ".cheng") ? path : stage1Concat2(path, ".cheng")
@@ -248,25 +288,25 @@ fn stage1_autoSystemEnabled(): bool =
     return true
 
 fn stage1_parseModeNormalized(): str =
-    let trackRaw: str = stage1_getEnv("BACKEND_BUILD_TRACK")
-    if !stage1EqAsciiLowerKeyword(trackRaw, "release"):
-        return "outline"
     var raw: str = stage1_getEnv("BACKEND_STAGE1_PARSE_MODE")
     if raw == "":
         raw = stage1_getEnv("STAGE1_PARSE_MODE")
-    if raw == "":
-        raw = "full"
     if stage1EqAsciiLowerKeyword(raw, "outline"):
         return "outline"
-    return "full"
+    if stage1EqAsciiLowerKeyword(raw, "full"):
+        return "full"
+    let trackRaw: str = stage1_getEnv("BACKEND_BUILD_TRACK")
+    if stage1EqAsciiLowerKeyword(trackRaw, "release"):
+        return "full"
+    return "outline"
 
-fn stage1_parseModuleByMode(tokens: Token[], path: str, diags: Diagnostic[]*): AstNodeId =
+fn stage1_parseModuleByMode(tokens: Token[], path: str, diags: ptr): AstNodeId =
     let mode: str = stage1_parseModeNormalized()
     if mode == "outline":
         return parseModuleOutlineWithDiagnosticsId(tokens, path, diags)
     return parseModuleWithDiagnosticsId(tokens, path, diags)
 
-fn stage1_materializeModuleBodiesForMode(tokens: Token[], path: str, rootId: AstNodeId, diags: Diagnostic[]*): int32 =
+fn stage1_materializeModuleBodiesForMode(tokens: Token[], path: str, rootId: AstNodeId, diags: ptr): int32 =
     if !astNodeIdValid(rootId):
         return 0
     let mode: str = stage1_parseModeNormalized()
@@ -326,14 +366,64 @@ fn stage1PhaseWriteLine(text: str) =
     if stage1TraceFlushEnabled():
         c_fflush fErr
 
+fn stage1Concat3(left: str, middle: str, right: str): str =
+    let safeLeft: str = stage1SafeStr(left)
+    let safeMiddle: str = stage1SafeStr(middle)
+    let safeRight: str = stage1SafeStr(right)
+    let nLeft: int32 = len(safeLeft)
+    let nMiddle: int32 = len(safeMiddle)
+    let nRight: int32 = len(safeRight)
+    if nLeft <= 0:
+        return stage1Concat2(safeMiddle, safeRight)
+    if nMiddle <= 0:
+        return stage1Concat2(safeLeft, safeRight)
+    if nRight <= 0:
+        return stage1Concat2(safeLeft, safeMiddle)
+    return safeLeft + safeMiddle + safeRight
+
+fn stage1PhaseWritePrefixItem(prefix: str, item: str) =
+    if !stage1PhaseTraceEnabled():
+        return
+    let fErr: os.File = os.get_stderr()
+    os.write(fErr, prefix)
+    os.write(fErr, item)
+    os.write(fErr, "\n")
+    if stage1TraceFlushEnabled():
+        c_fflush fErr
+
+fn stage1PhaseWriteIndexItem(index: int32, item: str) =
+    if !stage1PhaseTraceEnabled():
+        return
+    let fErr: os.File = os.get_stderr()
+    os.write(fErr, "[stage1.phase] ")
+    os.write(fErr, intToStr(index))
+    os.write(fErr, ": ")
+    os.write(fErr, item)
+    os.write(fErr, "\n")
+    if stage1TraceFlushEnabled():
+        c_fflush fErr
+
+fn stage1DebugPipeWriteConst(f: os.File, text: str) =
+    if f == nil:
+        return
+    os.write(f, text)
+    os.write(f, "\n")
+
+fn stage1DebugPipeWritePrefixInt(f: os.File, prefix: str, value: int32) =
+    if f == nil:
+        return
+    os.write(f, prefix)
+    os.write(f, intToStr(value))
+    os.write(f, "\n")
+
 fn stage1PhasePush(name: str, detail: str = "") =
     if !stage1PhaseTraceEnabled():
         return
     var item: str = name
     if len(detail) > 0:
-        item = name + ": " + detail
+        item = stage1Concat3(name, ": ", detail)
     add(stage1PhaseStack, item)
-    stage1PhaseWriteLine("[stage1.phase+] " + item)
+    stage1PhaseWritePrefixItem("[stage1.phase+] ", item)
 
 fn stage1PhasePop() =
     if !stage1PhaseTraceEnabled():
@@ -341,7 +431,7 @@ fn stage1PhasePop() =
     if stage1PhaseStack.len == 0:
         return
     let item: str = stage1PhaseStack[stage1PhaseStack.len - 1]
-    stage1PhaseWriteLine("[stage1.phase-] " + item)
+    stage1PhaseWritePrefixItem("[stage1.phase-] ", item)
     stage1PhaseStack.len = stage1PhaseStack.len - 1
 
 fn stage1PhaseDump() =
@@ -349,7 +439,7 @@ fn stage1PhaseDump() =
         return
     stage1PhaseWriteLine("[stage1.phase] dump.begin")
     for i in 0..<stage1PhaseStack.len:
-        stage1PhaseWriteLine("[stage1.phase] " + intToStr(i) + ": " + stage1PhaseStack[i])
+        stage1PhaseWriteIndexItem(i, stage1PhaseStack[i])
     stage1PhaseWriteLine("[stage1.phase] dump.end")
 
 fn stage1GuiRoot(): str =
@@ -722,16 +812,13 @@ fn hexDigit(v: int32): char =
     return chr code
 
 fn u64ToHex(v: uint64): str =
-    let outText: str = newStringOfCap(16)
-    let outPtr: void* = rawmemAsVoid(outText)
-    if outPtr == nil:
-        return ""
+    var outText: str = ""
     for i in 0..<16:
         let shift: int32 =(15 - i) * 4
         let masked: uint64 =(v >> uint64(shift)) & uint64(15)
         let digit: int32 = int32(masked)
         let c: char = hexDigit digit
-        rawmemWriteChar(outPtr, i, c)
+        outText = outText + charToStr(c)
     return outText
 
 fn moduleTag(path: str): str =
@@ -969,7 +1056,7 @@ fn loadTokenCacheInto(path: str, size: int64, mtime: int64, out: Token[]*): bool
     if !stage1_fileExists(cpath):
         return false
     var content: str = ""
-    let readOk: bool = stage1_readFileInto(cpath, &content)
+    let readOk: bool = stage1_readFileInto(cpath, content)
     defer:
         releaseString content
     if !readOk || len(content) == 0:
@@ -1013,14 +1100,14 @@ fn loadTokenCacheInto(path: str, size: int64, mtime: int64, out: Token[]*): bool
                 releaseString parts[pi]
             return false
         var tok: Token
-        tokenZero(&tok)
+        tokenZero(tok)
         tok.kind = TokenKind(int32(parseInt64(parts[0])))
         tok.line = int32(parseInt64(parts[1]))
         tok.col = int32(parseInt64(parts[2]))
         tok.strPrefix = chr(int32(parseInt64(parts[3])))
         let lexemeEsc: str = parts[4]
         let lexeme: str = unescapeCacheField(lexemeEsc)
-        tokenSetLexeme(&tok, lexeme)
+        tokenSetLexeme(tok, lexeme)
         releaseString lexeme
         add(tokens, tok)
         for pi in 0..<parts.len:
@@ -1094,15 +1181,14 @@ fn stage1_fileExists(path: str): bool =
         return stage1_c_fileExists(cstring(stage1_main_input_raw)) != 0
     return false
 
-fn stage1_readFileInto(path: str, out: str* = nil): bool =
+fn stage1_readFileInto(path: str, out: var str): bool =
     let dbgRead: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
     let dbgFile: os.File = dbgRead ? os.get_stderr() : nil
     let pathLen: int32 = stage1_c_strlen(path)
     if pathLen == 0:
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read empty_path")
-        if out != nil:
-            *out = ""
+        out = ""
         return false
     if dbgRead:
         os.writeLine(dbgFile, "[frontend] read path_nonempty")
@@ -1115,8 +1201,7 @@ fn stage1_readFileInto(path: str, out: str* = nil): bool =
     if stage1_c_strlen(fastText) > 0:
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read fast_nonempty")
-        if out != nil:
-            *out = fastText
+        out = fastText
         return true
     if dbgRead:
         os.writeLine(dbgFile, "[frontend] read fast_empty")
@@ -1125,21 +1210,19 @@ fn stage1_readFileInto(path: str, out: str* = nil): bool =
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read size_positive")
         var sizedText: str = ""
-        let _sizedOk: bool = os.readFileSizedInto(stablePath, int32(size64), &sizedText)
+        let _sizedOk: bool = os.readFileSizedInto(stablePath, int32(size64), sizedText)
         if len(sizedText) > 0:
             if dbgRead:
                 os.writeLine(dbgFile, "[frontend] read sized_nonempty")
-            if out != nil:
-                *out = sizedText
+            out = sizedText
             return true
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read sized_empty")
     elif dbgRead:
         os.writeLine(dbgFile, "[frontend] read size_nonpositive")
     var fallbackText: str = ""
-    let _fallbackOk: bool = os.readFileInto(stablePath, &fallbackText)
-    if out != nil:
-        *out = fallbackText
+    let _fallbackOk: bool = os.readFileInto(stablePath, fallbackText)
+    out = fallbackText
     if len(fallbackText) > 0:
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read fallback_nonempty")
@@ -1164,7 +1247,7 @@ fn stage1_readFileInto(path: str, out: str* = nil): bool =
 
 fn stage1_readFile(path: str): str =
     var out: str = ""
-    let _ok: bool = stage1_readFileInto(path, &out)
+    let _ok: bool = stage1_readFileInto(path, out)
     return out
 
 fn stage1_writeFile(path: str, content: str) =
@@ -1598,7 +1681,7 @@ fn stage1PathReadable(path: str): bool =
     if stage1_fileExists(path):
         return true
     var content: str = ""
-    let readOk: bool = stage1_readFileInto(path, &content)
+    let readOk: bool = stage1_readFileInto(path, content)
     if readOk && len(content) > 0:
         return true
     return false
@@ -1723,7 +1806,7 @@ fn packageIdFromManifest(manifestPath: str): str =
     if !stage1PathReadable(manifestPath):
         return ""
     var content: str = ""
-    let _readOk: bool = stage1_readFileInto(manifestPath, &content)
+    let _readOk: bool = stage1_readFileInto(manifestPath, content)
     if len(content) == 0 || content[0] == char(0):
         return ""
     let contentLen: int32 = len content
@@ -2177,30 +2260,26 @@ fn setHasNormalizedStr(v: StrSetList, key: str): bool =
         return false
     return hashsets.hashSetStrHas(v.set, key)
 
-fn setAddStr(v: StrSetList*, key: str) =
-    if v == nil:
-        return
+fn setAddStr(v: var StrSetList, key: str) =
     let normKey: str = stage1NormalizeVisitedPath(key)
     if len(normKey) == 0:
         return
-    if setHasStr(*v, normKey):
+    if setHasStr(v, normKey):
         return
-    var items0: str[] = v->items
+    var items0: str[] = v.items
     add(items0, normKey)
-    v->items = items0
-    hashsets.hashSetStrAdd(v->set, normKey)
+    v.items = items0
+    hashsets.hashSetStrAdd(v.set, normKey)
 
-fn setAddNormalizedStr(v: StrSetList*, key: str) =
-    if v == nil:
-        return
+fn setAddNormalizedStr(v: var StrSetList, key: str) =
     if len(key) == 0:
         return
-    if setHasNormalizedStr(*v, key):
+    if setHasNormalizedStr(v, key):
         return
-    var items0: str[] = v->items
+    var items0: str[] = v.items
     add(items0, key)
-    v->items = items0
-    hashsets.hashSetStrAdd(v->set, key)
+    v.items = items0
+    hashsets.hashSetStrAdd(v.set, key)
 
 fn stage1StrEq(a: str, b: str): bool =
     let n: int32 = len(a)
@@ -2227,19 +2306,17 @@ fn importTraceFind(v: ImportTrace, path: str): int32 =
 fn importTraceHas(v: ImportTrace, path: str): bool =
     return importTraceFind(v, path) >= 0
 
-fn importTracePush(v: ImportTrace*, path: str) =
-    if v == nil || len(path) == 0:
+fn importTracePush(v: var ImportTrace, path: str) =
+    if len(path) == 0:
         return
-    var items0: str[] = v->items
+    var items0: str[] = v.items
     add(items0, path)
-    v->items = items0
+    v.items = items0
 
-fn importTracePop(v: ImportTrace*) =
-    if v == nil:
+fn importTracePop(v: var ImportTrace) =
+    if v.items.len <= 0:
         return
-    if v->items.len <= 0:
-        return
-    v->items.len = v->items.len - 1
+    v.items.len = v.items.len - 1
 
 fn importTraceCycleMessage(v: ImportTrace, path: str): str =
     var msg: str = "Import cycle detected: "
@@ -2257,58 +2334,59 @@ fn importTraceCycleMessage(v: ImportTrace, path: str): str =
     msg = msg + path
     return msg
 
-fn mapGetNodes(cache: NodeCache, key: str, found: bool* = nil): AstNodeId[] =
+fn mapHasNodes(cache: NodeCache, key: str): bool =
     var ok: bool = false
     let idx: int32 = hashmaps.hashMapStrIntGetEx(cache.index, key, ok)
-    if ok && idx >= 0 && idx < cache.valStart.len:
-        if found != nil:
-            *found = true
-        let start: int32 = cache.valStart[idx]
-        let n: int32 = cache.valLen[idx]
-        var out: AstNodeId[]
-        if start >= 0 && n > 0:
-            reserve(out, n)
-            for i in 0..<n:
-                add(out, cache.pool[start + i])
-        return out
-    if found != nil:
-        *found = false
-    return []
+    return ok && idx >= 0 && idx < cache.valStart.len
 
-fn mapSetNodes(cache: NodeCache*, key: str, val: AstNodeId[]) =
-    if cache == nil || len(key) == 0:
+fn mapGetNodes(cache: NodeCache, key: str): AstNodeId[] =
+    var ok: bool = false
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(cache.index, key, ok)
+    if !(ok && idx >= 0 && idx < cache.valStart.len):
+        return []
+    let start: int32 = cache.valStart[idx]
+    let n: int32 = cache.valLen[idx]
+    var out: AstNodeId[]
+    if start >= 0 && n > 0:
+        reserve(out, n)
+        for i in 0..<n:
+            add(out, cache.pool[start + i])
+    return out
+
+fn mapSetNodes(cache: var NodeCache, key: str, val: AstNodeId[]) =
+    if len(key) == 0:
         return
     var existed: bool = false
-    let idx: int32 = hashmaps.hashMapStrIntGetOrInsertEx(cache->index, key, cache->keys.len, existed)
-    let start: int32 = cache->pool.len
+    let idx: int32 = hashmaps.hashMapStrIntGetOrInsertEx(cache.index, key, cache.keys.len, existed)
+    let start: int32 = cache.pool.len
     let n: int32 = val.len
-    var pool0: AstNodeId[] = cache->pool
+    var pool0: AstNodeId[] = cache.pool
     for i in 0..<n:
         add(pool0, val[i])
-    cache->pool = pool0
-    if existed && idx >= 0 && idx < cache->valStart.len:
-        var valStartSeq: int32[] = cache->valStart
-        var valLenSeq: int32[] = cache->valLen
+    cache.pool = pool0
+    if existed && idx >= 0 && idx < cache.valStart.len:
+        var valStartSeq: int32[] = cache.valStart
+        var valLenSeq: int32[] = cache.valLen
         valStartSeq[idx] = start
         valLenSeq[idx] = n
-        cache->valStart = valStartSeq
-        cache->valLen = valLenSeq
+        cache.valStart = valStartSeq
+        cache.valLen = valLenSeq
         return
-    let newIdx: int32 = cache->keys.len
-    var keys0: str[] = cache->keys
-    var starts0: int32[] = cache->valStart
-    var lens0: int32[] = cache->valLen
+    let newIdx: int32 = cache.keys.len
+    var keys0: str[] = cache.keys
+    var starts0: int32[] = cache.valStart
+    var lens0: int32[] = cache.valLen
     add(keys0, key)
     add(starts0, start)
     add(lens0, n)
-    cache->keys = keys0
-    cache->valStart = starts0
-    cache->valLen = lens0
+    cache.keys = keys0
+    cache.valStart = starts0
+    cache.valLen = lens0
     if existed || idx != newIdx:
-        hashmaps.hashMapStrIntPut(cache->index, key, newIdx)
+        hashmaps.hashMapStrIntPut(cache.index, key, newIdx)
 
-fn loadModuleRecursiveId(pathId: int32, visited: StrSetList*, diags: Diagnostic[]*,
-                         cache: NodeCache* = nil, trace: ImportTrace* = nil): AstNodeId[] =
+fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
+                         cache: ptr = nil, trace: ptr = nil): AstNodeId[] =
     var out: AstNodeId[]
     reserve(out, 64)
     let rootDir: str = stage1ImportRootDirCurrent
@@ -2323,24 +2401,26 @@ fn loadModuleRecursiveId(pathId: int32, visited: StrSetList*, diags: Diagnostic[
         return out
     if stage1TraceImportsEnabled():
         stage1Trace("import: load " + pathNorm)
-    if trace != nil && importTraceHas(*trace, pathNorm):
-        addDiag(diags, svError, pathNorm, 1, 1, importTraceCycleMessage(*trace, pathNorm))
+    if stage1TraceHas(trace, pathNorm):
+        if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+            echo("[importdbg] recursive.cycle_skip pathNorm='" + pathNorm + "'")
+        if stage1TraceImportsEnabled():
+            stage1Trace("import: cycle-skip " + pathNorm)
         return out
-    if visited != nil && setHasNormalizedStr(*visited, pathNorm):
+    if stage1VisitedHas(visited, pathNorm):
         return out
     var tracePushed: bool = false
     if trace != nil:
-        importTracePush(trace, pathNorm)
+        stage1TracePush(trace, pathNorm)
         tracePushed = true
     defer:
         if tracePushed:
-            importTracePop(trace)
+            stage1TracePop(trace)
     if visited != nil:
-        setAddNormalizedStr(visited, pathNorm)
+        stage1VisitedAdd(visited, pathNorm)
     if cache != nil:
-        var cachedOk: bool = false
-        let cached: AstNodeId[] = mapGetNodes(*cache, pathNorm, &cachedOk)
-        if cachedOk:
+        if stage1CacheHasNodes(cache, pathNorm):
+            let cached: AstNodeId[] = stage1CacheGetNodes(cache, pathNorm)
             return cached
     if !stage1PathReadable(pathNorm):
         if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
@@ -2360,7 +2440,7 @@ fn loadModuleRecursiveId(pathId: int32, visited: StrSetList*, diags: Diagnostic[
     let cacheHit: bool = loadTokenCacheInto(pathNorm, size, mtime, &tokens)
     if !cacheHit:
         var content: str = ""
-        let _readOk: bool = stage1_readFileInto(pathNorm, &content)
+        let _readOk: bool = stage1_readFileInto(pathNorm, content)
         if len(content) == 0:
             if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
                 echo("[importdbg] recursive.readempty pathNorm='" + pathNorm + "'")
@@ -2462,13 +2542,13 @@ fn loadModuleRecursiveId(pathId: int32, visited: StrSetList*, diags: Diagnostic[
         if mrootKind != nkEmpty:
             add(out, mrootId)
     if cache != nil:
-        mapSetNodes(cache, pathNorm, out)
+        stage1CacheSetNodes(cache, pathNorm, out)
     freeSeq_Token(tokens)
     freeSeq[Diagnostic](lexDiags)
     return out
 
-fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: Diagnostic[]*, visitedIn: StrSetList* = nil,
-                 cache: NodeCache* = nil): AstNodeId[] =
+fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visitedIn: ptr = nil,
+                 cache: ptr = nil): AstNodeId[] =
     var out: AstNodeId[]
     reserve(out, 64)
     stage1PhasePush("loadImportsId", baseDir)
@@ -2481,7 +2561,7 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: Diagnosti
     defer:
         stage1ImportRootDirCurrent = prevRootDir
     var localVisited: StrSetList = strSetListInit(16)
-    var visited: StrSetList* = visitedIn
+    var visited: ptr = visitedIn
     if visited == nil:
         visited = &localVisited
     var trace: ImportTrace
@@ -2490,11 +2570,11 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: Diagnosti
     var rootTracePushed: bool = false
     let rootPath: str = astNodeStrVal(rootId)
     if len(rootPath) > 0:
-        importTracePush(&trace, rootPath)
+        importTracePush(trace, rootPath)
         rootTracePushed = true
     defer:
         if rootTracePushed:
-            importTracePop(&trace)
+            importTracePop(trace)
     var importNodes: AstNodeId[]
     reserve(importNodes, 32)
     collectImportNodesId(rootId, &importNodes)
@@ -2531,13 +2611,13 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: Diagnosti
 
 fn copyFile(src: str, dst: str): bool =
     var content: str = ""
-    let _readOk: bool = stage1_readFileInto(src, &content)
+    let _readOk: bool = stage1_readFileInto(src, content)
     if len(content) == 0:
         return false
     stage1_writeFile(dst, content)
     return true
 
-fn appendDiagnostics(dst: Diagnostic[]*, src: Diagnostic[]) =
+fn appendDiagnostics(dst: ptr, src: Diagnostic[]) =
     if dst == nil:
         return
     for i in 0..<src.len:
@@ -2587,7 +2667,7 @@ fn printHints(diags: Diagnostic[]) =
         if d.severity == svHint:
             printDiagnosticStable(d)
 
-fn loadSystemModuleId(userFile: str, diags: Diagnostic[]*): AstNodeId =
+fn loadSystemModuleId(userFile: str, diags: ptr): AstNodeId =
     stage1PhasePush("loadSystemModuleId", userFile)
     defer:
         stage1PhasePop()
@@ -2605,23 +2685,23 @@ fn loadSystemModuleId(userFile: str, diags: Diagnostic[]*): AstNodeId =
     lexDiags.cap = 0
     var content: str = stage1_readFileFast(sysPath)
     if stage1_c_strlen(content) == 0:
-        let _readOk: bool = stage1_readFileInto(sysPath, &content)
+        let _readOk: bool = stage1_readFileInto(sysPath, content)
     if dbgPipe:
-        os.writeLine(dbgFile, "[frontend] sysmod content_len=" + intToStr(len(content)))
+        stage1DebugPipeWritePrefixInt(dbgFile, "[frontend] sysmod content_len=", len(content))
     if len(content) == 0:
         if dbgPipe:
-            os.writeLine(dbgFile, "[frontend] sysmod empty_content")
+            stage1DebugPipeWriteConst(dbgFile, "[frontend] sysmod empty_content")
         stage1PhaseDump()
         return astInvalidNodeId()
     let _lexOk: bool = lexInto(content, sysPath, &tokens, &lexDiags)
     releaseString content
     if dbgPipe:
-        os.writeLine(dbgFile, "[frontend] sysmod lex_diags=" + intToStr(lexDiags.len))
+        stage1DebugPipeWritePrefixInt(dbgFile, "[frontend] sysmod lex_diags=", lexDiags.len)
     if diags != nil:
         appendDiagnostics(diags, lexDiags)
     if lexDiags.len > 0:
         if dbgPipe:
-            os.writeLine(dbgFile, "[frontend] sysmod lex_failed")
+            stage1DebugPipeWriteConst(dbgFile, "[frontend] sysmod lex_failed")
         stage1PhaseDump()
         freeSeq_Token(tokens)
         freeSeq[Diagnostic](lexDiags)
@@ -2630,12 +2710,12 @@ fn loadSystemModuleId(userFile: str, diags: Diagnostic[]*): AstNodeId =
     let _sysBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, sysPath, sysRootParsedId, diags)
     let sysRootId: AstNodeId = stage1ApplyAstPluginHooksId(sysPath, sysRootParsedId)
     if dbgPipe:
-        os.writeLine(dbgFile, "[frontend] sysmod parsed_kids=" + intToStr(astKidCount(sysRootId)))
+        stage1DebugPipeWritePrefixInt(dbgFile, "[frontend] sysmod parsed_kids=", astKidCount(sysRootId))
     freeSeq_Token(tokens)
     freeSeq[Diagnostic](lexDiags)
     return sysRootId
 
-fn parseModuleForDepsId(path: str, diags: Diagnostic[]*): AstNodeId =
+fn parseModuleForDepsId(path: str, diags: ptr): AstNodeId =
     stage1PhasePush("parseModuleForDepsId", path)
     defer:
         stage1PhasePop()
@@ -2656,7 +2736,7 @@ fn parseModuleForDepsId(path: str, diags: Diagnostic[]*): AstNodeId =
     let cacheHit: bool = loadTokenCacheInto(path, size, mtime, &tokens)
     if !cacheHit:
         var content: str = ""
-        let _readOk: bool = stage1_readFileInto(path, &content)
+        let _readOk: bool = stage1_readFileInto(path, content)
         if len(content) == 0:
             addDiag(diags, svError, path, 1, 1, "Unable to read input file")
             stage1PhaseDump()
@@ -2729,7 +2809,7 @@ fn collectImportDepsId(rootId: AstNodeId, out: str[]*) =
     for i in 0..<astKidCount(rootId):
         collectImportDepsId(astKidAt(rootId, i), out)
 
-fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
+fn collectResolvedDeps(inPath: str, diags: ptr): str[] =
     releaseNodeArena()
     releaseLexStrings()
     initNodeArena()
@@ -2739,7 +2819,7 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
         releaseLexStrings()
     let userRootId: AstNodeId = parseModuleForDepsId(inPath, diags)
     let sysRootId: AstNodeId = loadSystemModuleId(inPath, diags)
-    if diags != nil && hasError(*diags):
+    if stage1DiagsHasError(diags):
         return []
     let combinedId: AstNodeId = mergeModulesId(sysRootId, userRootId)
     var imports: str[16]
@@ -2748,11 +2828,11 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
     for importIndex in 0..<imports.len:
         let imp: str = imports[importIndex]
         if len imp > 0:
-            setAddStr(&uniqSet, imp)
+            setAddStr(uniqSet, imp)
     let inName: str = stage1SplitName inPath
     let inExt: str = stage1SplitExt inPath
     if stage1_autoSystemEnabled() && !(inName == "system" && inExt == ".cheng"):
-        setAddStr(&uniqSet, "system")
+        setAddStr(uniqSet, "system")
     var resolvedDeps: str[] = uniqSet.items
     let resolveEnv: str = stage1_getEnv "DEPS_RESOLVE"
     if (resolveEnv == "1") || (resolveEnv == "true") || (resolveEnv == "yes"):
@@ -2768,9 +2848,9 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
                 resolved = raw
             if len resolved > 0:
                 resolved = canonicalizeResolvedPath(resolved, repoRoot)
-                setAddStr(&resolvedSet, resolved)
+                setAddStr(resolvedSet, resolved)
                 if stage1_fileExists resolved && ! setHasStr(visitedModules, resolved):
-                    setAddStr(&visitedModules, resolved)
+                    setAddStr(visitedModules, resolved)
                     add(pending, resolved)
         while true:
             let pendingLen: int32 = pending.len
@@ -2793,9 +2873,9 @@ fn collectResolvedDeps(inPath: str, diags: Diagnostic[]*): str[] =
                             resolvedNext = rawNext
                         if len resolvedNext > 0:
                             resolvedNext = canonicalizeResolvedPath(resolvedNext, repoRoot)
-                            setAddStr(&resolvedSet, resolvedNext)
+                            setAddStr(resolvedSet, resolvedNext)
                             if stage1_fileExists resolvedNext && ! setHasStr(visitedModules, resolvedNext):
-                                setAddStr(&visitedModules, resolvedNext)
+                                setAddStr(visitedModules, resolvedNext)
                                 add(nextPending, resolvedNext)
             pending = nextPending
         resolvedDeps = resolvedSet.items
