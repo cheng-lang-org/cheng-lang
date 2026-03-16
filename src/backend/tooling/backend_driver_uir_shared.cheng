@@ -1,0 +1,113 @@
+import std/system
+import std/os
+import std/strutils
+import std/rawmem_support
+import backend/uir/uir_codegen
+import backend/uir/uir_types
+import backend/uir/uir_internal/uir_core_builder
+import backend/uir/uir_internal/uir_core_types
+
+type
+    DriverUirByteBuf = uint8[]
+
+importc fn driver_c_write_exact_file(path: cstring, buffer: ptr, len: int32): int32
+
+fn driverUirDebugBootEnabled(): bool =
+    return os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1"
+
+fn driverUirDebugBoot(msg: str): void =
+    if !driverUirDebugBootEnabled():
+        return
+    let f: File = os.get_stderr()
+    write(f, "[driverUir] ")
+    writeLine(f, msg)
+
+fn driverUirOptLevel(): int32 =
+    return int32(parseInt(os.getEnvDefault("BACKEND_OPT_LEVEL", "0")))
+
+fn driverUirOwnedCString(raw: cstring): str =
+    if raw == nil:
+        return ""
+    let n: int32 = c_strlen(raw)
+    if n <= 0:
+        return ""
+    return driver_c_new_string_copy_n(rawmemAsVoid(raw), n)
+
+fn driverUirBuildModuleStage1TargetRetained(path_raw: cstring, target_raw: cstring): ptr =
+    if path_raw == nil:
+        driverUirDebugBoot("build.nil_path_raw")
+        return nil
+    let path: str = driverUirOwnedCString(path_raw)
+    if len(path) == 0:
+        driverUirDebugBoot("build.empty_path")
+        return nil
+    let target: str = driverUirOwnedCString(target_raw)
+    driverUirDebugBoot("build.enter path_len=" + intToStr(len(path)) +
+                       " target_len=" + intToStr(len(target)))
+    let module: UirCoreModule = uirCoreBuildModuleFromFileStage1OrPanic(path, target)
+    if module == nil:
+        driverUirDebugBoot("build.builder_nil")
+        return nil
+    let modulePtr: ptr = ptr(module)
+    if modulePtr == nil:
+        driverUirDebugBoot("build.module_ptr_nil")
+        return nil
+    memRetain(modulePtr)
+    driverUirDebugBoot("build.ok")
+    return modulePtr
+
+fn driverUirBuildModuleStage1Retained(path_raw: cstring): ptr =
+    driverUirBuildModuleStage1TargetRetained(path_raw, nil)
+
+fn driverUirEmitObjFromRetainedModule(module_raw: ptr, target_raw: cstring, out_raw: cstring): int32 =
+    if module_raw == nil:
+        return -11
+    if out_raw == nil:
+        return -12
+    let outPath: str = driverUirOwnedCString(out_raw)
+    if len(outPath) == 0:
+        return -12
+    let target: str = driverUirOwnedCString(target_raw)
+    let module: UirCoreModule = UirCoreModule(module_raw)
+    var rc: int32 = 0
+    let objRes: Result[DriverUirByteBuf] =
+        uirEmitObjFromModule(module, driverUirOptLevel(), target, "", false, false, 0, "autovec")
+    if !IsOk[DriverUirByteBuf](objRes):
+        rc = -10
+    else:
+        let obj: uint8[] = objRes.value
+        if len(obj) <= 0:
+            rc = -13
+        elif obj.buffer == nil:
+            rc = -14
+        else:
+            rc = driver_c_write_exact_file(out_raw, obj.buffer, obj.len)
+    memRelease(module_raw)
+    return rc
+
+fn driverUirEmitObjBytesFromRetainedModule(module_raw: ptr, optLevel: int32,
+                                           target_raw: cstring, objWriter_raw: cstring,
+                                           validateModule: int32,
+                                           uirSimdEnabled: int32, uirSimdMaxWidth: int32,
+                                           uirSimdPolicy_raw: cstring): uint8[] =
+    if module_raw == nil:
+        var zero: uint8[]
+        return zero
+    let module: UirCoreModule = UirCoreModule(module_raw)
+    let target: str = driverUirOwnedCString(target_raw)
+    let objWriter: str = driverUirOwnedCString(objWriter_raw)
+    let uirSimdPolicy: str = driverUirOwnedCString(uirSimdPolicy_raw)
+    return uirEmitObjFromModuleOrPanic(module, optLevel, target, objWriter,
+                                       validateModule != 0,
+                                       uirSimdEnabled != 0, uirSimdMaxWidth,
+                                       uirSimdPolicy)
+
+fn driverUirBuildEmitObjFromFileStage1Target(path_raw: cstring, target_raw: cstring, out_raw: cstring): int32 =
+    if path_raw == nil:
+        return -11
+    if out_raw == nil:
+        return -12
+    let moduleRaw: ptr = driverUirBuildModuleStage1TargetRetained(path_raw, target_raw)
+    if moduleRaw == nil:
+        return -11
+    return driverUirEmitObjFromRetainedModule(moduleRaw, target_raw, out_raw)

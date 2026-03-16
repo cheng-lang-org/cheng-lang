@@ -1,0 +1,106 @@
+# Shared builder-local missing-routine queue helpers split from uir_core_builder.
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_module_lookup_cache
+
+fn uirCoreDeclIndexFind(names: str[], name: str): int32 =
+    if len(name) == 0 || names.len <= 0:
+        return -1
+    let stop0: int32 = names.len
+    for __for_rev in 0..<stop0:
+        let idx: int32 = stop0 - __for_rev - 1
+        if names[idx] == name:
+            return idx
+    return -1
+
+fn uirCoreStrListHas(items: var str[], count: int32, name: str): bool =
+    if len(name) == 0 || count <= 0:
+        return false
+    for i in 0..<count:
+        if items[i] == name:
+            return true
+    return false
+
+fn uirCoreStrListHas(items: var str[], count: var int32, name: str): bool =
+    if len(name) == 0 || count <= 0:
+        return false
+    for i in 0..<count:
+        if items[i] == name:
+            return true
+    return false
+
+
+fn uirCoreFixedStrAppend(items: var str[], countPtr: ptr, value: str) =
+    if countPtr == nil:
+        panic "uirCore_builder: nil fixed str count"
+    let idx: int32 = load(countPtr)
+    if idx < 0 || idx >= items.len:
+        panic "uirCore_builder: fixed str append overflow"
+    items[idx] = value
+    store(countPtr, idx + 1)
+
+fn uirCoreMaybeEnqueueMissingRoutine(mod: UirCoreModule, declNames: str[],
+                                 seen: var str[], seenCount: var int32, queue: var str[], queueCount: var int32, name0: str) =
+    if mod == nil || len(name0) == 0:
+        return
+    let _declIdx: int32 = uirCoreDeclIndexFind(declNames, name0)
+    if _declIdx < 0:
+        return
+    if moduleHasFunc(mod, name0):
+        return
+    if uirCoreStrListHas(seen, seenCount, name0):
+        return
+    uirCoreFixedStrAppend(seen, &seenCount, name0)
+    uirCoreFixedStrAppend(queue, &queueCount, name0)
+
+fn uirCoreMaybeEnqueueFromExpr(mod: UirCoreModule, declNames: str[],
+                           seen: var str[], seenCount: var int32, queue: var str[], queueCount: var int32, e: UirExprId) =
+    if !uirCoreExprIdValid(e):
+        return
+    case uirCoreExprKindOf(e)
+    of meCall:
+        uirCoreMaybeEnqueueMissingRoutine(mod, declNames, seen, seenCount, queue, queueCount, uirCoreExprCalleeOf(e))
+        for i in 0..<uirCoreExprArgsLen(e):
+            uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, uirCoreExprArgAt(e, i))
+    of meGlobalAddr:
+        uirCoreMaybeEnqueueMissingRoutine(mod, declNames, seen, seenCount, queue, queueCount, uirCoreExprGlobalNameOf(e))
+    of meBin, meCmp:
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, uirCoreExprLhsOf(e))
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, uirCoreExprRhsOf(e))
+    of meCast:
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, uirCoreExprCastExprOf(e))
+    of meLoad:
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, uirCoreExprAddrExprOf(e))
+    else:
+        return
+
+fn uirCoreMaybeEnqueueFromStmt(mod: UirCoreModule, declNames: str[],
+                           seen: var str[], seenCount: var int32, queue: var str[], queueCount: var int32, s: UirStmtId) =
+    if !uirCoreStmtIdValid(s):
+        return
+    let expr0: UirExprId = uirCoreStmtExprOf(s)
+    if uirCoreExprIdValid(expr0):
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, expr0)
+    let addr0: UirExprId = uirCoreStmtAddrExprOf(s)
+    if uirCoreExprIdValid(addr0):
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, addr0)
+
+fn uirCoreMaybeEnqueueFromTerm(mod: UirCoreModule, declNames: str[],
+                           seen: var str[], seenCount: var int32, queue: var str[], queueCount: var int32, t: UirCoreTerm) =
+    if t.kind == mtRet:
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, t.retExpr)
+    elif t.kind == mtCbr:
+        uirCoreMaybeEnqueueFromExpr(mod, declNames, seen, seenCount, queue, queueCount, t.condExpr)
+
+fn uirCoreMaybeEnqueueFromFunc(mod: UirCoreModule, declNames: str[],
+                           seen: var str[], seenCount: var int32, queue: var str[], queueCount: var int32, f: UirCoreFunc) =
+    if !uirCoreFuncIdValid(f):
+        return
+    let blockCount: int32 = uirCoreFuncBlocksLen(f)
+    for bi in 0..<blockCount:
+        let blk: UirBlockId = uirCoreFuncBlockAt(f, bi)
+        if uirCoreBlockIdValid(blk):
+            let stmtCount: int32 = uirCoreBlockStmtsLen(blk)
+            for si in 0..<stmtCount:
+                let stmt: UirStmtId = uirCoreBlockStmtAt(blk, si)
+                uirCoreMaybeEnqueueFromStmt(mod, declNames, seen, seenCount, queue, queueCount, stmt)
+            uirCoreMaybeEnqueueFromTerm(mod, declNames, seen, seenCount, queue, queueCount, uirCoreBlockTermOf(blk))

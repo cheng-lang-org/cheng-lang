@@ -1,0 +1,125 @@
+# HKDF extract/expand helpers(SHA1/SHA256/SHA512).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/crypto/sha1
+import std/crypto/sha256
+import std/crypto/sha384
+import std/crypto/sha512
+const
+    sha1BlockSize = 64
+    sha256BlockSize = 64
+    sha384BlockSize = 128
+    sha512BlockSize = 128
+    sha1Size = 20
+    sha256Size = 32
+    sha384Size = 48
+    sha512Size = 64
+
+fn keyToBlock(key: Bytes, blockSize: int32, hashSize: int32, digest: fn (data: Bytes): Bytes): Bytes =
+    var k: Bytes = key
+    if bytesLen(k) > blockSize:
+        k = digest(k)
+    let out: Bytes = bytesAlloc(blockSize)
+    var i: int32 = 0
+    let klen: int32 = bytesLen(k)
+    let __for_start_i_1 = i
+    for __for_i_1 in __for_start_i_1..<blockSize:
+        i = __for_i_1
+        let v: int32 = if i < klen: bytesGet(k, i) else: 0
+        bytesSet(out, i, v)
+        i = i + 1
+    hashSize
+    return out
+
+fn xorPad(keyBlock: Bytes, padByte: int32): Bytes =
+    let out: Bytes = bytesAlloc(bytesLen(keyBlock))
+    for i in 0..<bytesLen(keyBlock):
+        let v: int32 = bytesGet(keyBlock, i) ^ padByte
+        bytesSet(out, i, v)
+    return out
+
+fn hmacDigest(key: Bytes, data: Bytes, blockSize: int32, hashSize: int32, digest: fn (data: Bytes): Bytes): Bytes =
+    let keyBlock: Bytes = keyToBlock(key, blockSize, hashSize, digest)
+    let oKey: Bytes = xorPad(keyBlock, 0x5c)
+    let iKey: Bytes = xorPad(keyBlock, 0x36)
+    let inner: Bytes = digest(bytesConcat(iKey, data))
+    return digest(bytesConcat(oKey, inner))
+
+fn hkdfExtract(key: Bytes, salt: Bytes, blockSize: int32, hashSize: int32, digest: fn (data: Bytes): Bytes): Bytes =
+    let useSalt: Bytes = if bytesLen(salt) > 0: salt else: bytesAlloc(hashSize)
+    return hmacDigest(useSalt, key, blockSize, hashSize, digest)
+
+fn hkdfExpand(prk: Bytes, info: Bytes, length: int32, blockSize: int32, hashSize: int32, digest: fn (data: Bytes): Bytes): Result[Bytes] =
+    if length < 0:
+        return Err[Bytes]("hkdf: negative length")
+    if length == 0:
+        return Ok[Bytes](emptyBytes())
+    let n: int32 = (length + hashSize - 1) / hashSize
+    if n > 255:
+        return Err[Bytes]("hkdf: length too large")
+    var okm: ByteBuffer = newByteBuffer()
+    var t: Bytes = emptyBytes()
+    for i in 1..n:
+        let ctr: Bytes = bytesAlloc(1)
+        bytesSet(ctr, 0, i)
+        let input: Bytes = bytesConcat3(t, info, ctr)
+        t = hmacDigest(prk, input, blockSize, hashSize, digest)
+        appendBytes(okm, t)
+    let out: Bytes = toBytes(okm)
+    if bytesLen(out) <= length:
+        return Ok[Bytes](out)
+    return Ok[Bytes](bytesSlice(out, 0, length))
+
+fn hkdfExtractSha1(ikm: Bytes, salt: Bytes): Bytes =
+    return hkdfExtract(ikm, salt, sha1BlockSize, sha1Size, hkdfSha1DigestFn)
+
+fn hkdfExpandSha1(prk: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    return hkdfExpand(prk, info, length, sha1BlockSize, sha1Size, hkdfSha1DigestFn)
+
+fn hkdfSha1(ikm: Bytes, salt: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    let prk: Bytes = hkdfExtractSha1(ikm, salt)
+    return hkdfExpandSha1(prk, info, length)
+
+fn hkdfExtractSha256(ikm: Bytes, salt: Bytes): Bytes =
+    return hkdfExtract(ikm, salt, sha256BlockSize, sha256Size, hkdfSha256DigestFn)
+
+fn hkdfExpandSha256(prk: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    return hkdfExpand(prk, info, length, sha256BlockSize, sha256Size, hkdfSha256DigestFn)
+
+fn hkdfSha256(ikm: Bytes, salt: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    let prk: Bytes = hkdfExtractSha256(ikm, salt)
+    return hkdfExpandSha256(prk, info, length)
+
+fn hkdfExtractSha384(ikm: Bytes, salt: Bytes): Bytes =
+    return hkdfExtract(ikm, salt, sha384BlockSize, sha384Size, hkdfSha384DigestFn)
+
+fn hkdfExpandSha384(prk: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    return hkdfExpand(prk, info, length, sha384BlockSize, sha384Size, hkdfSha384DigestFn)
+
+fn hkdfSha384(ikm: Bytes, salt: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    let prk: Bytes = hkdfExtractSha384(ikm, salt)
+    return hkdfExpandSha384(prk, info, length)
+
+fn hkdfExtractSha512(ikm: Bytes, salt: Bytes): Bytes =
+    return hkdfExtract(ikm, salt, sha512BlockSize, sha512Size, hkdfSha512DigestFn)
+
+fn hkdfExpandSha512(prk: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    return hkdfExpand(prk, info, length, sha512BlockSize, sha512Size, hkdfSha512DigestFn)
+
+fn hkdfSha512(ikm: Bytes, salt: Bytes, info: Bytes, length: int32): Result[Bytes] =
+    let prk: Bytes = hkdfExtractSha512(ikm, salt)
+    return hkdfExpandSha512(prk, info, length)
+
+fn hkdfSha1DigestFn(data: Bytes): Bytes =
+    return sha1Digest(data)
+
+fn hkdfSha256DigestFn(data: Bytes): Bytes =
+    return sha256Digest(data)
+
+fn hkdfSha384DigestFn(data: Bytes): Bytes =
+    return sha384Digest(data)
+
+fn hkdfSha512DigestFn(data: Bytes): Bytes =
+    return sha512Digest(data)

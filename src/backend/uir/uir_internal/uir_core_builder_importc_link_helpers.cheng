@@ -1,0 +1,84 @@
+# Shared builder-local importc link-name/source-scan helpers split from uir_core_builder.
+import std/rawmem_support
+import backend/uir/uir_internal/uir_core_builder_scope_helpers
+import backend/uir/uir_internal/uir_core_builder_text_helpers
+import backend/uir/uir_internal/uir_core_builder_string_utils
+
+@importc("driver_c_new_string_copy_n")
+fn builder_importc_c_new_string_copy_n(raw: ptr, n: int32): str
+
+fn uirCoreImportcLinkNameCharOk(ch: char): bool =
+    if ch >= 'a' && ch <= 'z':
+        return true
+    if ch >= 'A' && ch <= 'Z':
+        return true
+    if ch >= '0' && ch <= '9':
+        return true
+    return ch == '_' || ch == '$' || ch == '.'
+
+fn uirCoreImportcLinkNameValid(name0: str): bool =
+    let name: str = backendStripSpaces(name0)
+    if len(name) == 0:
+        return false
+    for i in 0..<len(name):
+        if !uirCoreImportcLinkNameCharOk(name[i]):
+            return false
+    return true
+
+fn uirCoreNormalizeImportcLinkName(funcName0: str, linkName0: str): str =
+    let funcName: str = backendStripSpaces(funcName0)
+    let linkName: str = backendStripSpaces(linkName0)
+    if uirCoreImportcLinkNameValid(linkName):
+        if uirCoreStrStartsWith(funcName, "driver_c_") && linkName != funcName:
+            return funcName
+        return linkName
+    let fallback0: str = backendSanitizeLinkName(funcName)
+    if uirCoreImportcLinkNameValid(fallback0):
+        return fallback0
+    return funcName
+
+fn uirCoreImportcLinkNameFromSource(filePath: str, funcName0: str): str =
+    let funcName: str = backendStripSpaces(funcName0)
+    if len(funcName) == 0:
+        return ""
+    let content: str = uirCoreImportcSourceContent(filePath)
+    if len(content) == 0:
+        return ""
+    let fnNeedle: str = scopeConcat2("fn ", funcName)
+    if len(fnNeedle) == 0:
+        return ""
+    let annNeedle: str = "@importc(\""
+    var searchFrom: int32 = 0
+    while searchFrom >= 0:
+        let fnPos: int32 = uirCoreStrFindFrom(content, fnNeedle, searchFrom)
+        if fnPos < 0:
+            return ""
+        var nameEnd: int32 = fnPos + len(fnNeedle)
+        while nameEnd < len(content) && (content[nameEnd] == ' ' || content[nameEnd] == '\t'):
+            nameEnd = nameEnd + 1
+        if nameEnd >= len(content) || content[nameEnd] != '(':
+            searchFrom = fnPos + 1
+            continue
+        var annPos: int32 = -1
+        var annSearch: int32 = 0
+        while annSearch >= 0:
+            let nextAnn: int32 = uirCoreStrFindFrom(content, annNeedle, annSearch)
+            if nextAnn < 0 || nextAnn >= fnPos:
+                break
+            annPos = nextAnn
+            annSearch = nextAnn + 1
+        if annPos < 0:
+            return ""
+        let interveningFn: int32 = uirCoreStrFindFrom(content, "fn ", annPos + 1)
+        if interveningFn >= 0 && interveningFn < fnPos:
+            searchFrom = fnPos + 1
+            continue
+        let valueStart: int32 = annPos + len(annNeedle)
+        var valueEnd: int32 = valueStart
+        while valueEnd < len(content) && content[valueEnd] != '"':
+            valueEnd = valueEnd + 1
+        if valueEnd <= valueStart || valueEnd > fnPos:
+            searchFrom = fnPos + 1
+            continue
+        return builder_importc_c_new_string_copy_n(rawmem_support.rawmemPtrAdd(rawmemAsVoid(content), valueStart), valueEnd - valueStart)
+    return ""

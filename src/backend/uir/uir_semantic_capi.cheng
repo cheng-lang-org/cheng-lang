@@ -1,0 +1,274 @@
+# Stable C ABI facade for UIR semantic protocol v1.
+import std/os
+import std/result
+import std/strings
+import std/strutils
+import std/cmdline
+import backend/uir/uir_semantic_types
+import backend/uir/uir_semantic_validate
+import backend/uir/uir_semantic_lowering
+import backend/uir/uir_semantic_stage1
+import std/system
+
+@importc("memcpy")
+fn uirCapiMemcpy(dest: ptr, src: ptr, n: int64): ptr
+@importc("memset")
+fn uirCapiMemset(dest: ptr, value: int32, n: int64): ptr
+
+fn uirCapiReadText(ptr0: ptr, len0: int32): str =
+    if ptr0 == nil || len0 <= 0:
+        return ""
+    let dst: ptr = heapNewCompat(len0 + 1)
+    if dst == nil:
+        return ""
+    uirCapiMemset(dst, 0, int64(len0 + 1))
+    uirCapiMemcpy(dst, ptr0, int64(len0))
+    return str(dst)
+
+fn uirCapiReturnText(text: str, outLenPtr: ptr): ptr =
+    let safeLen: int32 = len(text)
+    let raw: ptr = heapNewCompat(safeLen + 1)
+    if raw == nil:
+        if outLenPtr != nil:
+            store(outLenPtr, 0)
+        return nil
+    uirCapiMemset(raw, 0, int64(safeLen + 1))
+    if safeLen > 0:
+        uirCapiMemcpy(raw, ptr(text), int64(safeLen))
+    if outLenPtr != nil:
+        store(outLenPtr, safeLen)
+    return raw
+
+fn uirCapiSetBool(raw: str, outValue: var bool) =
+    var parsed: bool = false
+    if cmdline.parseBool(strutils.strip(raw), parsed):
+        outValue = parsed
+
+fn uirCapiSetInt(raw: str, outValue: var int32) =
+    var parsed: int32 = 0
+    if cmdline.parseInt32(strutils.strip(raw), parsed):
+        outValue = parsed
+
+fn uirCapiUnescapeValue(raw: str): str =
+    if len(raw) == 0:
+        return raw
+    var out: str = ""
+    var i: int32 = 0
+    while i < len(raw):
+        let ch: char = raw[i]
+        if ch != '\\' || i + 1 >= len(raw):
+            out = out + strings.sliceBytes(raw, i, 1)
+            i = i + 1
+            continue
+        let next: char = raw[i + 1]
+        if next == 'n':
+            out = out + "\n"
+        elif next == 'r':
+            out = out + "\r"
+        elif next == '\\':
+            out = out + "\\"
+        else:
+            out = out + strings.sliceBytes(raw, i, 2)
+        i = i + 2
+    return out
+
+fn uirCapiApplyInputKey(semanticModule: UirSemanticModuleV1, key: str, value: str) =
+    if semanticModule == nil:
+        return
+    let k: str = strutils.toLowerAscii(strutils.strip(key))
+    let v: str = uirCapiUnescapeValue(strutils.strip(value))
+    if k == "frontend":
+        semanticModule.frontend = v
+    elif k == "target":
+        semanticModule.target = v
+    elif k == "source_tag":
+        semanticModule.sourceTag = v
+    elif k == "crate_type":
+        semanticModule.crateType = v
+    elif k == "entry_path":
+        semanticModule.entryPath = v
+    elif k == "c_main_target_symbol":
+        semanticModule.cMainTargetSymbol = v
+    elif k == "semantic_tables_path":
+        semanticModule.semanticTablesPath = v
+    elif k == "semantic_tables_inline":
+        semanticModule.semanticTablesInline = v
+    elif k == "symbol_list_path":
+        semanticModule.symbolListPath = v
+    elif k == "symbol_list_inline":
+        semanticModule.symbolListInline = v
+    elif k == "stage1_root_id":
+        uirCapiSetInt(v, semanticModule.stage1RootId)
+    elif k == "phase_tag":
+        uirCapiSetInt(v, semanticModule.phaseTag)
+    elif k == "high_uir_checked":
+        uirCapiSetBool(v, semanticModule.highUirChecked)
+    elif k == "low_uir_lowered":
+        uirCapiSetBool(v, semanticModule.lowUirLowered)
+    elif k == "fallback_reason":
+        semanticModule.phaseFallbackReason = v
+        if semanticModule.rustReport != nil && len(semanticModule.rustReport.fallbackReason) == 0:
+            semanticModule.rustReport.fallbackReason = v
+    elif k == "mono_items_total":
+        if semanticModule.rustReport != nil:
+            uirCapiSetInt(v, semanticModule.rustReport.monoItemsTotal)
+    elif k == "mono_items_uir":
+        if semanticModule.rustReport != nil:
+            uirCapiSetInt(v, semanticModule.rustReport.monoItemsUir)
+    elif k == "mono_items_llvm_fallback":
+        if semanticModule.rustReport != nil:
+            uirCapiSetInt(v, semanticModule.rustReport.monoItemsLlvmFallback)
+    elif k == "unsafe_regions":
+        if semanticModule.rustReport != nil:
+            uirCapiSetInt(v, semanticModule.rustReport.unsafeRegions)
+    elif k == "borrow_proof_items":
+        if semanticModule.rustReport != nil:
+            uirCapiSetInt(v, semanticModule.rustReport.borrowProofItems)
+    elif k == "ms":
+        if semanticModule.rustReport != nil:
+            uirCapiSetInt(v, semanticModule.rustReport.elapsedMs)
+
+fn uirCapiApplyOptionKey(compileOptions: UirSemanticCompileOptionsV1, key: str, value: str) =
+    if compileOptions == nil:
+        return
+    let k: str = strutils.toLowerAscii(strutils.strip(key))
+    let v: str = uirCapiUnescapeValue(strutils.strip(value))
+    if k == "emit":
+        compileOptions.emit = v
+    elif k == "output_path":
+        compileOptions.outputPath = v
+    elif k == "obj_writer":
+        compileOptions.objWriter = v
+    elif k == "opt_level":
+        uirCapiSetInt(v, compileOptions.optLevel)
+    elif k == "validate":
+        uirCapiSetBool(v, compileOptions.validateModule)
+    elif k == "uir_simd":
+        uirCapiSetBool(v, compileOptions.simdEnabled)
+    elif k == "uir_simd_max_width":
+        uirCapiSetInt(v, compileOptions.simdMaxWidth)
+    elif k == "uir_simd_policy":
+        compileOptions.simdPolicy = v
+    elif k == "allow_rust_llvm_fallback":
+        uirCapiSetBool(v, compileOptions.allowRustLlvmFallback)
+
+fn uirCapiParseManifestIntoInput(text: str): UirSemanticModuleV1 =
+    let semanticModule: UirSemanticModuleV1 = uirSemanticModuleV1New("semantic", "")
+    let n: int32 = len(text)
+    var start: int32 = 0
+    while start < n:
+        var stop: int32 = start
+        while stop < n && text[stop] != '\n':
+            stop = stop + 1
+        let line: str = strutils.strip(strings.sliceBytes(text, start, stop - start))
+        if len(line) > 0 && line[0] != '#':
+            var sep: int32 = -1
+            for i in 0..<len(line):
+                if line[i] == '=':
+                    sep = i
+                    break
+            if sep > 0:
+                let key: str = strings.sliceBytes(line, 0, sep)
+                let value: str = strings.sliceBytes(line, sep + 1, len(line) - sep - 1)
+                uirCapiApplyInputKey(semanticModule, key, value)
+        start = stop + 1
+    if uirSemanticNormalizeFrontend(semanticModule.frontend) == "stage1" && len(semanticModule.entryPath) > 0 &&
+       len(semanticModule.sourceTag) == 0:
+        semanticModule.sourceTag = semanticModule.entryPath
+    return semanticModule
+
+fn uirCapiParseManifestIntoOptions(text: str): UirSemanticCompileOptionsV1 =
+    let compileOptions: UirSemanticCompileOptionsV1 = uirSemanticCompileOptionsV1Default()
+    let n: int32 = len(text)
+    var start: int32 = 0
+    while start < n:
+        var stop: int32 = start
+        while stop < n && text[stop] != '\n':
+            stop = stop + 1
+        let line: str = strutils.strip(strings.sliceBytes(text, start, stop - start))
+        if len(line) > 0 && line[0] != '#':
+            var sep: int32 = -1
+            for i in 0..<len(line):
+                if line[i] == '=':
+                    sep = i
+                    break
+            if sep > 0:
+                let key: str = strings.sliceBytes(line, 0, sep)
+                let value: str = strings.sliceBytes(line, sep + 1, len(line) - sep - 1)
+                uirCapiApplyOptionKey(compileOptions, key, value)
+        start = stop + 1
+    return compileOptions
+
+fn uirCapiModuleFromTexts(manifestText: str, semanticText: str = "", symbolText: str = ""): UirSemanticModuleV1 =
+    let semanticModule: UirSemanticModuleV1 = uirCapiParseManifestIntoInput(manifestText)
+    if semanticModule != nil:
+        if len(semanticText) > 0:
+            semanticModule.semanticTablesInline = semanticText
+        if len(symbolText) > 0:
+            semanticModule.symbolListInline = symbolText
+    return semanticModule
+
+@exportc("cheng_uir_validate_v1")
+fn cheng_uir_validate_v1(inputPtr: ptr, inputLen: int32, outLenPtr: ptr): ptr =
+    let inputText: str = uirCapiReadText(inputPtr, inputLen)
+    let semanticModule: UirSemanticModuleV1 = uirCapiModuleFromTexts(inputText)
+    let validateRes: Result[bool] = uirValidateSemanticModuleV1(semanticModule)
+    if !IsOk[bool](validateRes):
+        return uirCapiReturnText("status=error\nerror=" + ErrorFormat(ErrorInfoOf[bool](validateRes)), outLenPtr)
+    return uirCapiReturnText("status=ok\nfrontend=" + semanticModule.frontend + "\ntarget=" + semanticModule.target +
+                             "\nbridge=cheng_native",
+                             outLenPtr)
+
+@exportc("cheng_uir_compile_v1")
+fn cheng_uir_compile_v1(inputPtr: ptr, inputLen: int32,
+                        optionsPtr: ptr, optionsLen: int32,
+                        outLenPtr: ptr): ptr =
+    let inputText: str = uirCapiReadText(inputPtr, inputLen)
+    let optionText: str = uirCapiReadText(optionsPtr, optionsLen)
+    let semanticModule: UirSemanticModuleV1 = uirCapiModuleFromTexts(inputText)
+    let compileOptions: UirSemanticCompileOptionsV1 = uirCapiParseManifestIntoOptions(optionText)
+    let compileRes: Result[UirSemanticCompileResultV1] = uirCompileSemanticModuleV1(semanticModule, compileOptions)
+    if !IsOk[UirSemanticCompileResultV1](compileRes):
+        return uirCapiReturnText("status=error\nerror=" + ErrorFormat(ErrorInfoOf[UirSemanticCompileResultV1](compileRes)),
+                                 outLenPtr)
+    return uirCapiReturnText(compileRes.value.reportText, outLenPtr)
+
+@exportc("cheng_uir_validate_v2")
+fn cheng_uir_validate_v2(inputPtr: ptr, inputLen: int32,
+                         semanticPtr: ptr, semanticLen: int32,
+                         symbolPtr: ptr, symbolLen: int32,
+                         outLenPtr: ptr): ptr =
+    let inputText: str = uirCapiReadText(inputPtr, inputLen)
+    let semanticText: str = uirCapiReadText(semanticPtr, semanticLen)
+    let symbolText: str = uirCapiReadText(symbolPtr, symbolLen)
+    let semanticModule: UirSemanticModuleV1 = uirCapiModuleFromTexts(inputText, semanticText, symbolText)
+    let validateRes: Result[bool] = uirValidateSemanticModuleV1(semanticModule)
+    if !IsOk[bool](validateRes):
+        return uirCapiReturnText("status=error\nerror=" + ErrorFormat(ErrorInfoOf[bool](validateRes)), outLenPtr)
+    return uirCapiReturnText("status=ok\nfrontend=" + semanticModule.frontend + "\ntarget=" + semanticModule.target +
+                             "\nbridge=cheng_native",
+                             outLenPtr)
+
+@exportc("cheng_uir_compile_v2")
+fn cheng_uir_compile_v2(inputPtr: ptr, inputLen: int32,
+                        semanticPtr: ptr, semanticLen: int32,
+                        symbolPtr: ptr, symbolLen: int32,
+                        optionsPtr: ptr, optionsLen: int32,
+                        outLenPtr: ptr): ptr =
+    let inputText: str = uirCapiReadText(inputPtr, inputLen)
+    let semanticText: str = uirCapiReadText(semanticPtr, semanticLen)
+    let symbolText: str = uirCapiReadText(symbolPtr, symbolLen)
+    let optionText: str = uirCapiReadText(optionsPtr, optionsLen)
+    let semanticModule: UirSemanticModuleV1 = uirCapiModuleFromTexts(inputText, semanticText, symbolText)
+    let compileOptions: UirSemanticCompileOptionsV1 = uirCapiParseManifestIntoOptions(optionText)
+    let compileRes: Result[UirSemanticCompileResultV1] = uirCompileSemanticModuleV1(semanticModule, compileOptions)
+    if !IsOk[UirSemanticCompileResultV1](compileRes):
+        return uirCapiReturnText("status=error\nerror=" + ErrorFormat(ErrorInfoOf[UirSemanticCompileResultV1](compileRes)),
+                                 outLenPtr)
+    return uirCapiReturnText(compileRes.value.reportText, outLenPtr)
+
+@exportc("cheng_uir_free_result_v1")
+fn cheng_uir_free_result_v1(ptr0: ptr) =
+    if ptr0 == nil:
+        return
+    memRelease(ptr0)

@@ -1,0 +1,114 @@
+# Shared builder-local text helpers split from uir_core_builder.
+import std/hashmaps
+import std/seqs
+import std/system
+import std/rawmem_support
+import stage1/frontend_lib
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_type_name_cache
+
+@importc("driver_c_str_contains_char")
+fn builder_text_c_str_contains_char(s: str, value: int32): int32
+
+fn uir_core_builder_text_helpers_add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+var backendStripPtrIndex: hashmaps.HashMapPtrInt
+var backendStripTextIndex: hashmaps.HashMapStrInt
+var backendStripValues: str[]
+var uirCore_importcSourceCache_file: str
+var uirCore_importcSourceCache_content: str
+
+fn backendStripPtrKey(s: str): int64 =
+    if !uirCoreStrPtrSane(s):
+        return 0
+    return int64(rawmemAsVoid(s))
+
+fn backendStripCacheReset() =
+    if backendStripPtrIndex.mask == 0:
+        hashmaps.hashMapPtrIntInitInPlace(backendStripPtrIndex, 4096)
+    else:
+        hashmaps.hashMapPtrIntClear(backendStripPtrIndex)
+    if backendStripTextIndex.mask == 0:
+        hashmaps.hashMapStrIntInitInPlace(backendStripTextIndex, 4096)
+    else:
+        hashmaps.hashMapStrIntClear(backendStripTextIndex)
+    backendStripValues.len = 0
+    if backendStripValues.cap < 1024:
+        backendStripValues.cap = 1024
+
+fn backendStripSpaces(s: str): str =
+    let ptrKey: int64 = backendStripPtrKey(s)
+    if ptrKey != 0:
+        var foundPtr: bool = false
+        let cachedIdx: int32 = hashmaps.hashMapPtrIntGet(backendStripPtrIndex, ptrKey, foundPtr)
+        if foundPtr && cachedIdx > 0 && cachedIdx <= backendStripValues.len:
+            return get(backendStripValues, cachedIdx - 1)
+    var foundText: bool = false
+    let cachedTextIdx: int32 = uirCoreHashMapStrIntGetCompatLocal(backendStripTextIndex, s, foundText)
+    if foundText && cachedTextIdx > 0 && cachedTextIdx <= backendStripValues.len:
+        let cached: str = get(backendStripValues, cachedTextIdx - 1)
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(backendStripPtrIndex, ptrKey, cachedTextIdx)
+        return cached
+    if len(s) == 0:
+        return ""
+    let hasWs: bool = builder_text_c_str_contains_char(s, int32(' ')) != 0 ||
+                      builder_text_c_str_contains_char(s, int32('\t')) != 0 ||
+                      builder_text_c_str_contains_char(s, int32('\n')) != 0 ||
+                      builder_text_c_str_contains_char(s, int32('\r')) != 0
+    if !hasWs:
+        let nextIdx: int32 = backendStripValues.len + 1
+        uir_core_builder_text_helpers_add(backendStripValues, s)
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(backendStripPtrIndex, ptrKey, nextIdx)
+        hashmaps.hashMapStrIntPut(backendStripTextIndex, s, nextIdx)
+        return s
+    let n: int32 = len s
+    if n == 0:
+        return ""
+    var kept: int32 = 0
+    for i in 0..<n:
+        let c: char = s[i]
+        if c != ' ' && c != '\t' && c != '\n' && c != '\r':
+            kept = kept + 1
+    if kept <= 0:
+        let nextIdx: int32 = backendStripValues.len + 1
+        uir_core_builder_text_helpers_add(backendStripValues, "")
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(backendStripPtrIndex, ptrKey, nextIdx)
+        hashmaps.hashMapStrIntPut(backendStripTextIndex, s, nextIdx)
+        return ""
+    let out: str = newStringOfCap(kept)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    var outIdx: int32 = 0
+    for i in 0..<n:
+        let c: char = s[i]
+        if c != ' ' && c != '\t' && c != '\n' && c != '\r':
+            rawmemWriteChar(outPtr, outIdx, c)
+            outIdx = outIdx + 1
+    let nextIdx: int32 = backendStripValues.len + 1
+    uir_core_builder_text_helpers_add(backendStripValues, out)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(backendStripPtrIndex, ptrKey, nextIdx)
+    hashmaps.hashMapStrIntPut(backendStripTextIndex, s, nextIdx)
+    return out
+
+fn backendStripSpacesMaybe(s: str): str =
+    return backendStripSpaces(s)
+
+fn uirCoreImportcSourceContent(filePath0: str): str =
+    let filePath: str = backendStripSpaces(filePath0)
+    if len(filePath) == 0 || !frontend_lib.stage1_fileExists(filePath):
+        return ""
+    if uirCore_importcSourceCache_file == filePath &&
+       len(uirCore_importcSourceCache_content) > 0:
+        return uirCore_importcSourceCache_content
+    var content: str = ""
+    if !frontend_lib.stage1_readFileInto(filePath, &content):
+        return ""
+    uirCore_importcSourceCache_file = filePath
+    uirCore_importcSourceCache_content = content
+    return content

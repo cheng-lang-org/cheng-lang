@@ -1,0 +1,374 @@
+# Shared builder-local object synthesis helpers split from uir_core_builder.
+import std/rawmem_support
+import stage1/ast
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_text_helpers
+import backend/uir/uir_internal/uir_core_builder_string_utils
+import backend/uir/uir_internal/uir_core_builder_type_key_helpers
+import backend/uir/uir_internal/uir_core_builder_module_lookup_cache
+import backend/uir/uir_internal/uir_core_builder_symbol_state
+
+fn uirCoreObjSynthAlignUpPow2(value: int32, alignPow2: int32): int32 =
+    if alignPow2 <= 0:
+        return value
+    let align: int32 = 1 << alignPow2
+    let rem: int32 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn uirCoreObjSynthIsStringKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return (key == "str") || (key == "string") || (key == "cstring")
+
+fn uirCoreObjSynthIsPtrKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return (key == "ptr") || (key == ("void" + "*"))
+
+fn uirCoreObjSynthIsStringOrPtrKey(key0: str): bool =
+    return uirCoreObjSynthIsStringKey(key0) || uirCoreObjSynthIsPtrKey(key0)
+
+fn uirCoreObjSynthBuiltinTypeName(name0: str): bool =
+    let name: str = backendStripSpaces(name0)
+    if len(name) == 0:
+        return false
+    if name == "void" || name == "bool" || name == "char":
+        return true
+    if name == "int8" || name == "uint8" || name == "i8" || name == "u8":
+        return true
+    if name == "int16" || name == "uint16" || name == "i16" || name == "u16":
+        return true
+    if name == "int32" || name == "uint32" || name == "i32" || name == "u32":
+        return true
+    if name == "int64" || name == "uint64" || name == "i64" || name == "u64":
+        return true
+    if name == "int" || name == "uint" || name == "NI" || name == "NU":
+        return true
+    if name == "float32" || name == "float64" || name == "float":
+        return true
+    if uirCoreObjSynthIsStringOrPtrKey(name):
+        return true
+    if name == "tuple" || uirCoreStrStartsWith(name, "tuple_"):
+        return true
+    if name == "seq" || uirCoreStrStartsWith(name, "seq_"):
+        return true
+    if name == "seq_fixed" || uirCoreStrStartsWith(name, "seq_fixed_"):
+        return true
+    if name == "Table" || uirCoreStrStartsWith(name, "Table_"):
+        return true
+    if uirCoreStrStartsWith(name, "set_"):
+        return true
+    return false
+
+fn uirCoreObjSynthTypeFromKeyName(key0: str): UirCoreType =
+    if len(key0) == 0:
+        return uirCoreTypeI64()
+    let key: str = backendStripSpaces(key0)
+    if key == "void":
+        return uirCoreTypeVoid()
+    if key == "float64" || key == "float":
+        return uirCoreTypeF64()
+    if key == "float32":
+        return uirCoreTypeF32()
+    if key == "bool" || key == "char":
+        return uirCoreTypeU8()
+    if key == "int8" || key == "i8":
+        return uirCoreTypeI8()
+    if key == "uint8" || key == "u8":
+        return uirCoreTypeU8()
+    if key == "int16" || key == "i16":
+        return uirCoreTypeI16()
+    if key == "uint16" || key == "u16":
+        return uirCoreTypeU16()
+    if key == "int32" || key == "i32":
+        return uirCoreTypeI32()
+    if key == "uint32" || key == "u32":
+        return uirCoreTypeU32()
+    if key == "int64" || key == "i64":
+        return uirCoreTypeI64()
+    if key == "uint64" || key == "u64":
+        return uirCoreTypeU64()
+    if key == "int" || key == "NI":
+        let bits: int32 = uirCoreIntBitsDefault32()
+        return (bits == 64) ? uirCoreTypeI64() : uirCoreTypeI32()
+    if key == "uint" || key == "NU":
+        let bits2: int32 = uirCoreIntBitsDefault32()
+        return (bits2 == 64) ? uirCoreTypeU64() : uirCoreTypeU32()
+    if uirCoreObjSynthIsStringOrPtrKey(key):
+        return uirCoreTypeI64()
+    if uirCoreStrStartsWith(key, "ptr_") || uirCoreStrStartsWith(key, "ref_") || uirCoreStrStartsWith(key, "fn_"):
+        return uirCoreTypeI64()
+    if uirCoreStrStartsWith(key, "seq_") || uirCoreStrStartsWith(key, "seq_fixed_") || uirCoreStrStartsWith(key, "Table_"):
+        return uirCoreTypeI64()
+    if uirCoreStrStartsWith(key, "set_"):
+        return uirCoreTypeU64()
+    return uirCoreTypeI64()
+
+fn ensureTablesEntryObjType(module: UirCoreModule, entryName: str): bool =
+    if (module == nil) || len(entryName) == 0:
+        return false
+    if uirCoreHasObjType(module, entryName):
+        return true
+    let prefix: str = "__cheng_tables_Entry_"
+    if ! uirCoreStrStartsWith(entryName, prefix):
+        return false
+    let valKey: str = str(rawmem_support.rawmemPtrAdd(rawmem_support.rawmemAsVoid(entryName), len(prefix)))
+    if len(valKey) == 0:
+        return false
+    let aliasTy: UirCoreType = uirCoreTryGetTypeAlias(module, valKey)
+    let valTy: UirCoreType = aliasTy.kind != mtVoid ? aliasTy : uirCoreObjSynthTypeFromKeyName(valKey)
+    let valSize: int32 = uirCoreTypeSize(valTy)
+    if valSize <= 0:
+        return false
+    let valAlignPow2: int32 = uirCoreTypeAlignPow2(valTy)
+    var fields: UirCoreObjField[]
+    uirCoreAppendObjFieldNamed(fields, "key", uirCoreTypeI64(), 0)
+    var offset: int32 = 8
+    offset = uirCoreObjSynthAlignUpPow2(offset, valAlignPow2)
+    uirCoreAppendObjFieldNamed(fields, "val", valTy, offset)
+    var maxAlignPow2: int32 = 3
+    if valAlignPow2 > maxAlignPow2:
+        maxAlignPow2 = valAlignPow2
+    let size: int32 = uirCoreObjSynthAlignUpPow2(offset + valSize, maxAlignPow2)
+    uirCoreAddObjTypeParts(module, entryName, maxAlignPow2, size, fields)
+    return true
+
+fn ensureOptionObjType(module: UirCoreModule, optionName: str): bool =
+    if (module == nil) || len(optionName) == 0:
+        return false
+    if uirCoreHasObjType(module, optionName):
+        return true
+    let prefix: str = "Option_"
+    if !uirCoreStrStartsWith(optionName, prefix):
+        return false
+    let valKey: str = str(rawmem_support.rawmemPtrAdd(rawmem_support.rawmemAsVoid(optionName), len(prefix)))
+    if len(valKey) == 0:
+        return false
+    var hasObjVal: bool = uirCoreHasObjType(module, valKey)
+    if !hasObjVal:
+        let valCanon0: str = uirCoreObjAliasCanon(valKey)
+        if len(valCanon0) > 0 && uirCoreHasObjType(module, valCanon0):
+            hasObjVal = true
+    if !uirCoreObjSynthBuiltinTypeName(valKey) && !hasObjVal:
+        let aliasTyCheck: UirCoreType = uirCoreTryGetTypeAlias(module, valKey)
+        if aliasTyCheck.kind == mtVoid:
+            return false
+    var fields: UirCoreObjField[]
+    uirCoreAppendObjFieldNamed(fields, "has", uirCoreTypeU8(), 0)
+    var maxAlignPow2: int32 = 0
+    var offset: int32 = 1
+    if uirCoreHasObjType(module, valKey):
+        let inner: UirCoreObjType = uirCoreGetObjType(module, valKey)
+        if inner.size <= 0 || inner.fields.len == 0:
+            return false
+        let alignPow2: int32 = inner.alignPow2
+        if alignPow2 > maxAlignPow2:
+            maxAlignPow2 = alignPow2
+        offset = uirCoreObjSynthAlignUpPow2(offset, alignPow2)
+        for fi in 0..<inner.fields.len:
+            let innerF: UirCoreObjField = inner.fields[fi]
+            uirCoreAppendObjFieldNamed(fields, "value." + innerF.name, innerF.ty, offset + innerF.offset)
+        offset = offset + inner.size
+        uirCoreInlineObjFieldTypePut(optionName, "value", valKey)
+    else:
+        let aliasTy: UirCoreType = uirCoreTryGetTypeAlias(module, valKey)
+        let valTy: UirCoreType = aliasTy.kind != mtVoid ? aliasTy : uirCoreObjSynthTypeFromKeyName(valKey)
+        let valSize: int32 = uirCoreTypeSize(valTy)
+        if valSize <= 0:
+            return false
+        let valAlignPow2: int32 = uirCoreTypeAlignPow2(valTy)
+        if valAlignPow2 > maxAlignPow2:
+            maxAlignPow2 = valAlignPow2
+        offset = uirCoreObjSynthAlignUpPow2(offset, valAlignPow2)
+        uirCoreAppendObjFieldNamed(fields, "value", valTy, offset)
+        offset = offset + valSize
+    uirCoreAddObjTypeParts(module, optionName, maxAlignPow2, uirCoreObjSynthAlignUpPow2(offset, maxAlignPow2), fields)
+    return true
+
+fn ensureResultObjType(module: UirCoreModule, resultName: str): bool =
+    if (module == nil) || len(resultName) == 0:
+        return false
+    if uirCoreHasObjType(module, resultName):
+        return true
+    let prefix: str = "Result_"
+    if !uirCoreStrStartsWith(resultName, prefix):
+        return false
+    let valKey: str = str(rawmem_support.rawmemPtrAdd(rawmem_support.rawmemAsVoid(resultName), len(prefix)))
+    if len(valKey) == 0:
+        return false
+    var hasObjVal: bool = uirCoreHasObjType(module, valKey)
+    if !hasObjVal:
+        let valCanon0: str = uirCoreObjAliasCanon(valKey)
+        if len(valCanon0) > 0 && uirCoreHasObjType(module, valCanon0):
+            hasObjVal = true
+
+    var errObjName: str = "ErrorInfo"
+    if !uirCoreHasObjType(module, errObjName):
+        let errCanon: str = uirCoreObjAliasCanon(errObjName)
+        if len(errCanon) > 0 && uirCoreHasObjType(module, errCanon):
+            errObjName = errCanon
+    if !uirCoreHasObjType(module, errObjName):
+        return false
+    let errObj: UirCoreObjType = uirCoreGetObjType(module, errObjName)
+    if errObj.size <= 0 || errObj.fields.len == 0:
+        return false
+
+    var fields: UirCoreObjField[]
+    var maxAlignPow2: int32 = 0
+    var offset: int32 = 0
+
+    uirCoreAppendObjFieldNamed(fields, "ok", uirCoreTypeU8(), 0)
+    let okAlign: int32 = uirCoreTypeAlignPow2(uirCoreTypeU8())
+    if okAlign > maxAlignPow2:
+        maxAlignPow2 = okAlign
+    offset = 1
+
+    var valObjName: str = ""
+    if hasObjVal && uirCoreHasObjType(module, valKey):
+        valObjName = valKey
+    elif hasObjVal:
+        let valCanon: str = uirCoreObjAliasCanon(valKey)
+        if len(valCanon) > 0 && uirCoreHasObjType(module, valCanon):
+            valObjName = valCanon
+    let valAliasTy: UirCoreType = uirCoreTryGetTypeAlias(module, valKey)
+    let inlineValObj: bool = len(valObjName) > 0 && valAliasTy.kind == mtVoid
+    uirCoreObjFieldTypeKeyPut(resultName, "value", valKey)
+    if inlineValObj:
+        let inner: UirCoreObjType = uirCoreGetObjType(module, valObjName)
+        if inner.size <= 0 || inner.fields.len == 0:
+            return false
+        let alignPow2: int32 = inner.alignPow2
+        if alignPow2 > maxAlignPow2:
+            maxAlignPow2 = alignPow2
+        offset = uirCoreObjSynthAlignUpPow2(offset, alignPow2)
+        for fi in 0..<inner.fields.len:
+            let innerF: UirCoreObjField = inner.fields[fi]
+            uirCoreAppendObjFieldNamed(fields, uirCoreConcat2("value.", innerF.name), innerF.ty, offset + innerF.offset)
+        offset = offset + inner.size
+        uirCoreInlineObjFieldTypePut(resultName, "value", valObjName)
+    else:
+        let valTy: UirCoreType = valAliasTy.kind != mtVoid ? valAliasTy : uirCoreObjSynthTypeFromKeyName(valKey)
+        let valSize: int32 = uirCoreTypeSize(valTy)
+        if valSize <= 0:
+            return false
+        let valAlignPow2: int32 = uirCoreTypeAlignPow2(valTy)
+        if valAlignPow2 > maxAlignPow2:
+            maxAlignPow2 = valAlignPow2
+        offset = uirCoreObjSynthAlignUpPow2(offset, valAlignPow2)
+        uirCoreAppendObjFieldNamed(fields, "value", valTy, offset)
+        offset = offset + valSize
+
+    uirCoreObjFieldTypeKeyPut(resultName, "err", errObjName)
+    let errAlignPow2: int32 = errObj.alignPow2
+    if errAlignPow2 > maxAlignPow2:
+        maxAlignPow2 = errAlignPow2
+    offset = uirCoreObjSynthAlignUpPow2(offset, errAlignPow2)
+    for ei in 0..<errObj.fields.len:
+        let errF: UirCoreObjField = errObj.fields[ei]
+        uirCoreAppendObjFieldNamed(fields, uirCoreConcat2("err.", errF.name), errF.ty, offset + errF.offset)
+    offset = offset + errObj.size
+    uirCoreInlineObjFieldTypePut(resultName, "err", errObjName)
+
+    uirCoreAddObjTypeParts(module, resultName, maxAlignPow2, uirCoreObjSynthAlignUpPow2(offset, maxAlignPow2), fields)
+    return true
+
+fn tryResolveArrayCount(module: UirCoreModule, n0: Node): int32 =
+    if (module == nil) || (n0 == nil):
+        return -1
+    var n: Node = n0
+    while astNodeIdValid(n) && nodeKind(n) == nkPar && kidCount(n) > 0:
+        n = kid(n, 0)
+    if (n == nil):
+        return -1
+    if nodeKind(n) == nkIntLit:
+        return int32(nodeIntVal(n))
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
+        let nm: str = backendStripSpaces(plainName(n))
+        let gi: int32 = moduleGlobalIndex(module, nm)
+        if gi >= 0:
+            let g: UirCoreGlobal = uirCoreModuleGlobalAt(module, gi)
+            if g.hasInit:
+                return int32(g.init)
+    return -1
+
+fn ensureArrayObjTypeFromElemKey(module: UirCoreModule, arrName: str, elemKey0: str, count: int32): bool =
+    if (module == nil) || len(arrName) == 0 || len(elemKey0) == 0 || count <= 0:
+        return false
+    if uirCoreHasObjType(module, arrName):
+        return true
+    let elemKey: str = backendStripSpaces(elemKey0)
+    if len(elemKey) == 0:
+        return false
+    let elemObjName: str = uirCoreObjTypeFromTypeKey(module, elemKey)
+    var elemTy: UirCoreType = uirCoreObjSynthTypeFromKeyName(elemKey)
+    if len(elemObjName) > 0:
+        if !uirCoreHasObjType(module, elemObjName):
+            return false
+        elemTy = uirCoreTypeI64()
+    else:
+        let aliasTy: UirCoreType = uirCoreTryGetTypeAlias(module, elemKey)
+        if !uirCoreObjSynthBuiltinTypeName(elemKey) && aliasTy.kind == mtVoid:
+            return false
+        if aliasTy.kind != mtVoid:
+            elemTy = aliasTy
+    let elemSize: int32 = uirCoreTypeSize(elemTy)
+    if elemSize <= 0:
+        return false
+    let elemAlignPow2: int32 = uirCoreTypeAlignPow2(elemTy)
+    let stride: int32 = uirCoreObjSynthAlignUpPow2(elemSize, elemAlignPow2)
+    if stride <= 0:
+        return false
+    var fields: UirCoreObjField[]
+    var off: int32 = 0
+    for i in 0..<count:
+        uirCoreAppendObjFieldNamed(fields, uirCoreIndexedName("e", i), elemTy, off)
+        off = off + stride
+    uirCoreAddObjTypeParts(module, arrName, elemAlignPow2, uirCoreObjSynthAlignUpPow2(off, elemAlignPow2), fields)
+    return true
+
+fn ensureSeqUninitObjType(module: UirCoreModule, seqName0: str): bool =
+    if (module == nil) || len(seqName0) == 0:
+        return false
+    let seqName: str = backendStripSpaces(seqName0)
+    if len(seqName) == 0 || !uirCoreStrStartsWith(seqName, "SeqUninit_"):
+        return false
+    if uirCoreHasObjType(module, seqName):
+        return true
+    let elemKey: str = str(rawmem_support.rawmemPtrAdd(rawmem_support.rawmemAsVoid(seqName), 10))
+    if len(elemKey) == 0:
+        return false
+    let seqCap: int32 = 256
+    let itemsObjName: str = uirCoreArrayObjName(seqCap, elemKey)
+    if !ensureArrayObjTypeFromElemKey(module, itemsObjName, elemKey, seqCap):
+        return false
+    let itemsObj: UirCoreObjType = uirCoreGetObjType(module, itemsObjName)
+    if len(itemsObj.name) == 0 || itemsObj.size <= 0:
+        return false
+
+    var fields: UirCoreObjField[]
+    var maxAlignPow2: int32 = 0
+
+    let countTy: UirCoreType = uirCoreTypeI32()
+    let countAlignPow2: int32 = uirCoreTypeAlignPow2(countTy)
+    uirCoreAppendObjFieldNamed(fields, "count", countTy, 0)
+    uirCoreObjFieldTypeKeyPut(seqName, "count", "int32")
+    if countAlignPow2 > maxAlignPow2:
+        maxAlignPow2 = countAlignPow2
+
+    let itemsAlignPow2: int32 = itemsObj.alignPow2
+    if itemsAlignPow2 > maxAlignPow2:
+        maxAlignPow2 = itemsAlignPow2
+    let itemsBaseOff: int32 = uirCoreObjSynthAlignUpPow2(4, itemsAlignPow2)
+    for fi in 0..<itemsObj.fields.len:
+        let innerF: UirCoreObjField = itemsObj.fields[fi]
+        uirCoreAppendObjFieldNamed(fields, "items." + innerF.name, innerF.ty, itemsBaseOff + innerF.offset)
+    uirCoreObjFieldTypeKeyPut(seqName, "items", itemsObjName)
+    uirCoreInlineObjFieldTypePut(seqName, "items", itemsObjName)
+
+    uirCoreAddObjTypeParts(module, seqName, maxAlignPow2,
+                           uirCoreObjSynthAlignUpPow2(itemsBaseOff + itemsObj.size, maxAlignPow2), fields)
+    return true

@@ -1,0 +1,84 @@
+# MultiHash(scaffold).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/varint
+import std/multiformats/multicodec
+import std/crypto/sha256
+import std/crypto/sha1
+import std/crypto/sha512
+
+type
+    MultiHash =
+        code: int64
+        length: int32
+        digest: Bytes
+
+fn newMultiHash(code: int64, digest: Bytes): MultiHash =
+    MultiHash(code: code, length: bytesLen(digest), digest: digest)
+
+fn expectedDigestLen(code: int64): int32 =
+    if code == codecSha1.code:
+        return 20
+    if code == codecSha2_256.code:
+        return 32
+    if code == codecSha2_512.code:
+        return 64
+    return -1
+
+fn encodeMultihash(mh: MultiHash): Bytes =
+    let codeBytes: Bytes = encodeUVarint(mh.code)
+    let lenBytes: Bytes = encodeUVarint(int64(mh.length))
+    var buf: ByteBuffer = newByteBuffer()
+    appendBytes(buf, codeBytes)
+    appendBytes(buf, lenBytes)
+    appendBytes(buf, mh.digest)
+    return toBytes(buf)
+
+fn decodeMultihash(data: Bytes): Result[MultiHash] =
+    let codeRes: Result[VarintDecoded] = decodeUVarint(data, 0)
+    if IsErr(codeRes):
+        return Err[MultiHash](Error(codeRes))
+    let codeDec: VarintDecoded = Value(codeRes)
+    let lenRes: Result[VarintDecoded] = decodeUVarint(data, codeDec.next)
+    if IsErr(lenRes):
+        return Err[MultiHash](Error(lenRes))
+    let lenDec: VarintDecoded = Value(lenRes)
+    let start: int32 = lenDec.next
+    let length: int32 = int32(lenDec.value)
+    if length < 0 || start + length > bytesLen(data):
+        return Err[MultiHash]("multihash: length out of range")
+    let digest: Bytes = bytesSlice(data, start, length)
+    return Ok[MultiHash](MultiHash(code: codeDec.value, length: length, digest: digest))
+
+fn validateMultihash(mh: MultiHash): bool =
+    if mh.length != bytesLen(mh.digest) || mh.length < 0:
+        return false
+    let expected: int32 = expectedDigestLen(mh.code)
+    if expected >= 0:
+        return mh.length == expected
+    return true
+
+fn validateMultihashBytes(data: Bytes): bool =
+    let mhRes: Result[MultiHash] = decodeMultihash(data)
+    if IsErr(mhRes):
+        return false
+    let mh: MultiHash = Value(mhRes)
+    if ! validateMultihash(mh):
+        return false
+    return bytesLen(encodeMultihash(mh)) == bytesLen(data)
+
+fn digest(data: Bytes, codec: MultiCodec): Result[MultiHash] =
+    if codec.code == codecIdentity.code:
+        return Ok[MultiHash](newMultiHash(codec.code, data))
+    if codec.code == codecSha1.code:
+        let out: Bytes = sha1Digest(data)
+        return Ok[MultiHash](newMultiHash(codec.code, out))
+    if codec.code == codecSha2_256.code:
+        let out: Bytes = sha256Digest(data)
+        return Ok[MultiHash](newMultiHash(codec.code, out))
+    if codec.code == codecSha2_512.code:
+        let out: Bytes = sha512Digest(data)
+        return Ok[MultiHash](newMultiHash(codec.code, out))
+    return Err[MultiHash]("multihash digest ! implemented")

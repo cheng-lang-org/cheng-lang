@@ -1,0 +1,1569 @@
+# Mach-O 64 relocatable (.o) writer for AArch64 (MVP subset).
+import std/seqs
+import std/strings
+import std/hashmaps
+import std/result
+import std/os
+import std/system
+import backend/machine/machine_types
+import backend/obj/cstring_label_support
+import backend/machine/machine_internal/machine_core_types
+import backend/obj/obj_buf
+import backend/obj/aarch64_enc
+
+type
+    ByteBuf = uint8[]
+
+    MachoReloc = ref
+        off: uint32
+        sym: str
+        rtype: uint8
+        pcrel: bool
+
+    MachoSym = ref
+        nType: uint8
+        nSect: uint8
+        nDesc: uint16
+        nValue: uint64
+        nameOff: uint32
+
+var machoDebugMode: int8 = int8(-1)
+var machoStepDebugMode: int8 = int8(-1)
+
+fn machoMachineCoreFuncNil(value: MachineCoreFunc): bool =
+    return int64(uint64(value)) == 0
+
+fn machoMachineCoreGlobalNil(value: MachineCoreGlobal): bool =
+    return int64(uint64(value)) == 0
+
+fn machoMachineCoreModuleNil(value: MachineCoreModule): bool =
+    return int64(uint64(value)) == 0
+
+fn machoMachineFuncNil(value: MachineFunc): bool =
+    return int64(uint64(value)) == 0
+
+fn machoMachineGlobalNil(value: MachineGlobal): bool =
+    return int64(uint64(value)) == 0
+
+fn machoMachineInstNil(value: MachineInst): bool =
+    return int64(uint64(value)) == 0
+
+fn machoSymNil(value: MachoSym): bool =
+    return int64(uint64(value)) == 0
+
+fn machoRelocNil(value: MachoReloc): bool =
+    return int64(uint64(value)) == 0
+
+fn machoErrInt(tag: str, msg: str): Result[int32] =
+    echo(tag)
+    if len(msg) > 0:
+        echo(msg)
+    return Err[int32](msg)
+
+fn machoErrBytes(tag: str, msg: str): Result[ByteBuf] =
+    echo(tag)
+    if len(msg) > 0:
+        echo(msg)
+    return Err[ByteBuf](msg)
+
+fn machoErrInfoBytes(tag: str, err: ErrorInfo): Result[ByteBuf] =
+    echo(tag)
+    let msg: str = ErrorMessage(err)
+    if len(msg) > 0:
+        echo(msg)
+    return ErrInfo[ByteBuf](err)
+
+fn machoPersistStr(value: str): str =
+    if len(value) <= 0:
+        return ""
+    let out: str = strings.sliceBytes(value, 0, len(value))
+    memRetain(out)
+    return out
+
+fn machoJoinSym(prefix: str, name: str): str =
+    let nPrefix: int32 = len(prefix)
+    let nName: int32 = len(name)
+    if nPrefix <= 0:
+        return machoPersistStr(name)
+    if nName <= 0:
+        return machoPersistStr(prefix)
+    let totalLen: int32 = nPrefix + nName
+    let out: str = newStringAlloc(totalLen)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    for i in 0..<nPrefix:
+        out[i] = machoStrCharAt(prefix, i)
+    for i in 0..<nName:
+        out[nPrefix + i] = machoStrCharAt(name, i)
+    return machoPersistStr(out)
+
+fn machoStrtabAddRaw(strtab: var uint8[], name: str): uint32 =
+    if len(name) <= 0:
+        return uint32(0)
+    let stableName: str = machoPersistStr(name)
+    if len(stableName) <= 0:
+        return uint32(0)
+    let off: uint32 = uint32(strtab.len)
+    for i in 0..<len(stableName):
+        bufAddU8(strtab, uint8(int32(int64(machoStrCharAt(stableName, i)) & int64(0xFF))))
+    bufAddU8(strtab, uint8(0))
+    return off
+
+fn machoStrtabAddJoined(strtab: var uint8[], prefix: str, name: str): uint32 =
+    return machoStrtabAddRaw(strtab, machoJoinSym(prefix, name))
+
+fn machoPrependUnderscore(name: str): str =
+    let safeName: str = len(name) > 0 ? name : ""
+    let nName: int32 = len(safeName)
+    if nName <= 0:
+        return ""
+    let out: str = newStringAlloc(nName + 1)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    out[0] = '_'
+    for i in 0..<nName:
+        out[i + 1] = safeName[i]
+    return machoPersistStr(out)
+
+fn machoFuncNameRaw(func: MachineFunc): str =
+    let coreFunc: MachineCoreFunc = func
+    if machoMachineCoreFuncNil(coreFunc):
+        return ""
+    return coreFunc.name
+
+fn machoCStringLabelRaw(c: MachineCString): str =
+    return machineCStringLabelOf(c)
+
+fn machoCStringValueRaw(c: MachineCString): str =
+    return machineCStringValueOf(c)
+
+fn machoGlobalNameRaw(g: MachineGlobal): str =
+    let coreGlobal: MachineCoreGlobal = g
+    if machoMachineCoreGlobalNil(coreGlobal):
+        return ""
+    return coreGlobal.name
+
+fn add(items: var str[], value: str) =
+    let idx: int32 = items.len
+    let needLen: int32 = idx + 1
+    if items.buffer == nil || items.len >= items.cap:
+        reserve(items, needLen)
+    setLen(items, needLen)
+    let safe: str = obj_buf.bufSafeStr(value)
+    items[idx] = len(safe) > 0 ? machoPersistStr(safe) : ""
+
+fn add(items: var uint64[], value: uint64) =
+    let idx: int32 = items.len
+    let needLen: int32 = idx + 1
+    if items.buffer == nil || items.cap < needLen:
+        reserve(items, needLen)
+    setLen(items, needLen)
+    items[idx] = value
+
+fn add(items: var int32[], value: int32) =
+    let idx: int32 = items.len
+    let needLen: int32 = idx + 1
+    if items.buffer == nil || items.cap < needLen:
+        reserve(items, needLen)
+    setLen(items, needLen)
+    items[idx] = value
+
+fn add(items: var MachoSym[], value: MachoSym) =
+    let idx: int32 = items.len
+    let needLen: int32 = idx + 1
+    if items.buffer == nil || items.cap < needLen:
+        reserve(items, needLen)
+    setLen(items, needLen)
+    if !machoSymNil(value):
+        memRetain(value)
+    items[idx] = value
+
+fn add(items: var MachoReloc[], value: MachoReloc) =
+    let idx: int32 = items.len
+    let needLen: int32 = idx + 1
+    if items.buffer == nil || items.cap < needLen:
+        reserve(items, needLen)
+    setLen(items, needLen)
+    if !machoRelocNil(value):
+        memRetain(value)
+    items[idx] = value
+
+fn macho_strContains(hay: str, needle: str): bool =
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
+        if j == m:
+            return true
+    return false
+
+fn macho_targetIsDarwin(target: str): bool =
+    if len(target) == 0:
+        return true
+    return macho_strContains(target, "apple") || macho_strContains(target, "darwin") || macho_strContains(target, "ios")
+
+fn machoBuildPlatform(target: str): uint32 =
+    if len(target) > 0:
+        if macho_strContains(target, "iossim") || macho_strContains(target, "simulator"):
+            return uint32(7)
+        if macho_strContains(target, "ios"):
+            return uint32(2)
+    return uint32(1)
+
+fn machoBuildMinOs(target: str): uint32 =
+    let platform: uint32 = machoBuildPlatform(target)
+    if platform == uint32(2) || platform == uint32(7):
+        return uint32(15) << 16
+    return uint32(11) << 16
+
+fn machoSymPrefix(target: str): str =
+    return macho_targetIsDarwin(target) ? "_" : ""
+
+fn machoIsPrivateFuncSym(name: str): bool =
+    return strings.hasPrefix(name, "__cheng_global_init")
+
+fn macho_strCmp(a: str, b: str): int32 =
+    let safeA: str = len(a) > 0 ? a : ""
+    let safeB: str = len(b) > 0 ? b : ""
+    return cmp(safeA, safeB)
+
+fn macho_strEq(a: str, b: str): bool =
+    return macho_strCmp(a, b) == 0
+
+fn machoAddCstringSymIfAbsent(syms: MachoSym[],
+                              symIndexMap: var hashmaps.HashMapStrInt,
+                              symNames: var str[],
+                              strtab: var uint8[],
+                              name: str, cstrSectIndex: uint8, value: uint64): MachoSym[] =
+    if len(name) == 0:
+        return syms
+    var hasSym: bool = false
+    let _: int32 = machoSymIndexLookup(symIndexMap, name, hasSym)
+    if hasSym:
+        return syms
+    let symOff: uint32 = machoStrtabAddRaw(strtab, name)
+    return machoAddSymIndexed(syms, symIndexMap, symNames, name, uint8(0xE), cstrSectIndex, value, symOff)
+
+fn machoDebugEnabled(): bool =
+    if machoDebugMode < int8(0):
+        machoDebugMode = macho_strEq(os.getEnvDefault("BACKEND_DEBUG_MACHO", ""), "1") ? int8(1) : int8(0)
+    return machoDebugMode == int8(1)
+
+fn machoDebug(msg: str) =
+    if machoDebugEnabled():
+        echo msg
+
+fn machoStepDebugEnabled(): bool =
+    if machoStepDebugMode < int8(0):
+        machoStepDebugMode = macho_strEq(os.getEnvDefault("BACKEND_DEBUG_MACHO_STEP", ""), "1") ? int8(1) : int8(0)
+    return machoStepDebugMode == int8(1)
+
+fn machoStep(msg: str) =
+    if machoStepDebugEnabled():
+        echo msg
+
+fn machoStrCharAt(s: str, idx: int32): char =
+    if idx < 0 || idx >= len(s):
+        return char(0)
+    return s[idx]
+
+fn machoPrintableAscii(name: str): bool =
+    let n: int32 = len(name)
+    if n <= 0:
+        return false
+    for i in 0..<n:
+        let c: int32 = int32(machoStrCharAt(name, i))
+        if c < 32 || c > 126:
+            return false
+    return true
+
+fn machoSeqInitEmpty[T](items: var T[]) =
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn machoSeqInitEmpty_uint8(items: var uint8[]) =
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn machoSeqInitEmpty_uint64(items: var uint64[]) =
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn machoSeqInitEmpty_str(items: var str[]) =
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn machoSeqAtStr(items: str[], idx: int32): str =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return ""
+    let out: str = items[idx]
+    return obj_buf.bufSafeStr(out)
+
+fn machoSeqSetStr(items: var str[], idx: int32, value: str) =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return
+    let safe: str = obj_buf.bufSafeStr(value)
+    items[idx] = len(safe) > 0 ? machoPersistStr(safe) : ""
+
+fn machoSeqInitEmpty_MachoReloc(items: var MachoReloc[]) =
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn machoSeqInitEmpty_MachoSym(items: var MachoSym[]) =
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn machoSeqInitEmpty_int32(items: var int32[]) =
+    items.buffer = nil
+    items.len = 0
+    items.cap = 0
+
+fn macho_sortStringsStable(items: var str[]) =
+    for i in 1..<items.len:
+        let key: str = items[i]
+        var j: int32 = i - 1
+        let __for_start_j = j
+        for __for_rev_j in 0..(__for_start_j - (0)):
+            j = __for_start_j - __for_rev_j
+            if !(macho_strCmp(items[j], key) > 0):
+                break
+            items[j + 1] = items[j]
+        items[j + 1] = key
+
+fn macho_alignUp(value: uint64, align: uint64): uint64 =
+    if align == 0:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn machoAddSym(outSyms: MachoSym[], name: str, nType: uint8, nSect: uint8, nValue: uint64): MachoSym[] =
+    let _: str = name
+    var s: MachoSym
+    new s
+    s.nType = nType
+    s.nSect = nSect
+    s.nDesc = uint16(0)
+    s.nValue = nValue
+    s.nameOff = 0
+    add(outSyms, s)
+    return outSyms
+
+fn machoSymIndexInsertFirst(index: var hashmaps.HashMapStrInt, name: str, symIdx: int32) =
+    let stableName: str = machoPersistStr(name)
+    if len(stableName) == 0 || machoStrCharAt(stableName, 0) == char(0):
+        return
+    var exists: bool = false
+    hashmaps.hashMapStrIntGetEx(index, stableName, exists)
+    if !exists:
+        hashmaps.hashMapStrIntPut(index, stableName, symIdx)
+
+fn machoSymIndexAliasName(name: str): str =
+    let safeName: str = len(name) > 0 ? name : ""
+    if len(safeName) <= 0:
+        return ""
+    if machoStrCharAt(safeName, 0) == '_':
+        return strings.sliceBytes(safeName, 1, len(safeName))
+    return machoPrependUnderscore(safeName)
+
+fn machoSymIndexInsertAliases(index: var hashmaps.HashMapStrInt, name: str, symIdx: int32) =
+    machoSymIndexInsertFirst(index, name, symIdx)
+    let alias: str = machoSymIndexAliasName(name)
+    if len(alias) > 0 && alias != name:
+        machoSymIndexInsertFirst(index, alias, symIdx)
+
+fn machoSymIndexLookup(index: hashmaps.HashMapStrInt, name: str, found: var bool): int32 =
+    let safeName: str = len(name) > 0 ? name : ""
+    if len(safeName) <= 0:
+        found = false
+        return 0
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(index, safeName, found)
+    if found:
+        return idx
+    let alias: str = machoSymIndexAliasName(safeName)
+    if len(alias) > 0 && alias != safeName:
+        return hashmaps.hashMapStrIntGetEx(index, alias, found)
+    found = false
+    return 0
+
+fn machoSymIndexLookup(index: var hashmaps.HashMapStrInt, name: str, found: var bool): int32 =
+    let safeName: str = len(name) > 0 ? name : ""
+    if len(safeName) <= 0:
+        found = false
+        return 0
+    let idx: int32 = hashmaps.hashMapStrIntGetEx(index, safeName, found)
+    if found:
+        return idx
+    let alias: str = machoSymIndexAliasName(safeName)
+    if len(alias) > 0 && alias != safeName:
+        return hashmaps.hashMapStrIntGetEx(index, alias, found)
+    found = false
+    return 0
+
+
+fn machoAddSymIndexed(outSyms: MachoSym[], index: var hashmaps.HashMapStrInt,
+                      names: var str[],
+                      name: str, nType: uint8, nSect: uint8, nValue: uint64,
+                      nameOff: uint32): MachoSym[] =
+    let stableName: str = machoPersistStr(name)
+    if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" &&
+       (!machoPrintableAscii(stableName) || len(stableName) <= 4):
+        echo("[macho.sym.bad] len=" + intToStr(len(stableName)) +
+             " type=" + intToStr(int32(nType)) +
+             " sect=" + intToStr(int32(nSect)) +
+             " name=" + stableName)
+    let out: MachoSym[] = machoAddSym(outSyms, stableName, nType, nSect, nValue)
+    if out.len > 0:
+        let sLast: MachoSym = machoSeqAtMachoSym(out, out.len - 1)
+        if !machoSymNil(sLast):
+            sLast.nameOff = nameOff
+            machoSeqSetMachoSym(out, out.len - 1, sLast)
+        add(names, stableName)
+        machoSymIndexInsertAliases(index, stableName, out.len - 1)
+    return out
+
+fn macho_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
+    let safeLabel: str = len(label) > 0 ? label : ""
+    for i in 0..<labels.len:
+        if ! (i < offs.len):
+            break
+        let cur0: str = labels[i]
+        let cur: str = len(cur0) > 0 ? cur0 : ""
+        if macho_strEq(cur, safeLabel):
+            return Ok[int32](offs[i])
+    echo("[macho.err.missing_label_linear]")
+    echo(safeLabel)
+    return machoErrInt("[macho.err.missing_label_linear.ret]",
+                       "macho_writer: missing label: " + safeLabel)
+
+fn machoBuildLabelOffIndex(labels: str[], offs: int32[]): hashmaps.HashMapStrInt =
+    let count: int32 = labels.len < offs.len ? labels.len : offs.len
+    var out: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(count * 2 + 1)
+    for i in 0..<count:
+        let cur0: str = labels[i]
+        let cur: str = len(cur0) > 0 ? machoPersistStr(cur0) : ""
+        if len(cur) <= 0:
+            continue
+        var exists: bool = false
+        hashmaps.hashMapStrIntGet(out, cur, exists)
+        if !exists:
+            hashmaps.hashMapStrIntPut(out, cur, offs[i])
+    return out
+
+fn macho_findLabelOffFast(index: hashmaps.HashMapStrInt, label: str): Result[int32] =
+    let safeLabel: str = len(label) > 0 ? label : ""
+    var found: bool = false
+    let off: int32 = hashmaps.hashMapStrIntGetEx(index, safeLabel, found)
+    if found:
+        return Ok[int32](off)
+    echo("[macho.err.missing_label_fast]")
+    echo(safeLabel)
+    return machoErrInt("[macho.err.missing_label_fast.ret]",
+                       "macho_writer: missing label: " + safeLabel)
+
+fn macho_findLabelOffIndexed(index: hashmaps.HashMapStrInt, labels: str[], offs: int32[],
+                             label: str): Result[int32] =
+    let safeLabel: str = len(label) > 0 ? label : ""
+    var found: bool = false
+    let off: int32 = hashmaps.hashMapStrIntGetEx(index, safeLabel, found)
+    if found:
+        return Ok[int32](off)
+    for i in 0..<labels.len:
+        if !(i < offs.len):
+            break
+        let cur0: str = labels[i]
+        let cur: str = len(cur0) > 0 ? cur0 : ""
+        if macho_strEq(cur, safeLabel):
+            return Ok[int32](offs[i])
+    echo("[macho.err.missing_label_indexed]")
+    echo(safeLabel)
+    return machoErrInt("[macho.err.missing_label_indexed.ret]",
+                       "macho_writer: missing label: " + safeLabel)
+
+fn macho_findSymIndexLinear(names: str[], name: str): Result[int32] =
+    let safeName: str = len(name) > 0 ? name : ""
+    if len(safeName) <= 0:
+        echo("[macho.err.missing_reloc_sym_linear]")
+        echo(safeName)
+        return machoErrInt("[macho.err.missing_reloc_sym_linear.ret]",
+                           "macho_writer: missing relocation symbol: " + safeName)
+    var alt: str = ""
+    if len(safeName) > 0 && machoStrCharAt(safeName, 0) == '_':
+        alt = strings.sliceBytes(safeName, 1, len(safeName))
+    else:
+        alt = machoPrependUnderscore(safeName)
+    for i in 0..<names.len:
+        let cur0: str = names[i]
+        let cur: str = len(cur0) > 0 ? cur0 : ""
+        if macho_strEq(cur, safeName) || (len(alt) > 0 && macho_strEq(cur, alt)):
+            return Ok[int32](i)
+    echo("[macho.err.missing_reloc_sym_linear]")
+    echo(safeName)
+    return machoErrInt("[macho.err.missing_reloc_sym_indexed.ret]",
+                       "macho_writer: missing relocation symbol: " + safeName)
+
+fn macho_findSymIndexIndexed(index: hashmaps.HashMapStrInt, names: str[], name: str): Result[int32] =
+    let safeName: str = len(name) > 0 ? name : ""
+    var found: bool = false
+    let idx: int32 = machoSymIndexLookup(index, safeName, found)
+    if found:
+        return Ok[int32](idx)
+    echo("[macho.err.missing_reloc_sym_indexed]")
+    echo(safeName)
+    return macho_findSymIndexLinear(names, safeName)
+
+fn machoSeqAtMachineFunc(items: MachineFunc[], idx: int32): MachineFunc =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    return items[idx]
+
+fn machoSeqAtMachineGlobal(items: MachineGlobal[], idx: int32): MachineGlobal =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    return items[idx]
+
+fn machoSeqAtMachineInst(items: MachineInst[], idx: int32): MachineInst =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    return items[idx]
+
+fn machoSeqAtMachoSym(items: MachoSym[], idx: int32): MachoSym =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return nil
+    return items[idx]
+
+fn machoSeqSetMachoSym(items: var MachoSym[], idx: int32, val: MachoSym) =
+    if idx < 0 || idx >= items.len || items.buffer == nil:
+        return
+    items[idx] = val
+
+fn machoInferFuncExportNameFromLabel(label: str): str =
+    let n: int32 = len(label)
+    if n <= 0:
+        return ""
+    if n >= 2:
+        for j in 0..n - 2:
+            if label[j] == '_' && label[j + 1] == '_':
+                if j <= 0:
+                    return ""
+                return strings.sliceBytes(label, 0, j)
+    return label
+
+fn machoResolveFuncExportName(func: MachineFunc, labels: str[]): str =
+    let rawName: str = machoFuncNameRaw(func)
+    if machoPrintableAscii(rawName):
+        return rawName
+    for i in 0..<labels.len:
+        let inferred: str = machoInferFuncExportNameFromLabel(labels[i])
+        if len(inferred) > 0:
+            return inferred
+    if len(rawName) > 0:
+        return rawName
+    return ""
+
+fn machoModuleFuncAtRaw(mod: MachineModule, idx: int32): MachineFunc =
+    let coreMod: MachineCoreModule = MachineCoreModule(mod)
+    if machoMachineCoreModuleNil(coreMod) || !machineCoreModuleValid(coreMod):
+        return nil
+    let out: MachineCoreFunc = machineCoreModuleFuncAt(coreMod, idx)
+    return machineCoreFuncValid(out) ? MachineFunc(out) : nil
+
+fn machoModuleCStringAtRaw(mod: MachineModule, idx: int32): MachineCString =
+    let coreMod: MachineCoreModule = MachineCoreModule(mod)
+    var zero: MachineCString
+    if machoMachineCoreModuleNil(coreMod) || !machineCoreModuleValid(coreMod):
+        return zero
+    let out: MachineCoreCString = machineCoreModuleCStringAt(coreMod, idx)
+    return machineCoreCStringValid(out) ? MachineCString(out) : zero
+
+fn machoModuleGlobalAtRaw(mod: MachineModule, idx: int32): MachineGlobal =
+    let coreMod: MachineCoreModule = MachineCoreModule(mod)
+    if machoMachineCoreModuleNil(coreMod) || !machineCoreModuleValid(coreMod):
+        return nil
+    let out: MachineCoreGlobal = machineCoreModuleGlobalAt(coreMod, idx)
+    return machineCoreGlobalValid(out) ? MachineGlobal(out) : nil
+
+fn machoFuncInstAtRaw(func: MachineFunc, idx: int32): MachineInst =
+    let coreFunc: MachineCoreFunc = MachineCoreFunc(func)
+    if machoMachineCoreFuncNil(coreFunc) || !machineCoreFuncValid(coreFunc):
+        return nil
+    let out: MachineCoreInst = machineCoreFuncInstAt(coreFunc, idx)
+    return machineCoreInstValid(out) ? MachineInst(out) : nil
+
+fn machoBuild(mod: MachineModule): Result[ByteBuf] =
+    let dbgMacho: bool = machoDebugEnabled()
+    let dbgStep: bool = machoStepDebugEnabled()
+    machoDebug("[macho] build:start")
+    if machoMachineCoreModuleNil(MachineCoreModule(mod)):
+        return machoErrBytes("[macho.err.nil_module]", "macho_writer: nil module")
+    if ! macho_targetIsDarwin(machineModuleTargetOf(mod)):
+        return machoErrBytes("[macho.err.bad_target]", "macho_writer: non-darwin target not supported")
+    machoDebug("[macho] build:target_ok")
+
+    let symPrefix: str = machoSymPrefix(machineModuleTargetOf(mod))
+    let cstrCount: int32 = machineModuleCstrsLen(mod)
+    let globalCount: int32 = machineModuleGlobalsLen(mod)
+    let funcCount: int32 = machineModuleFuncsLen(mod)
+    if cstrCount < 0 || cstrCount > 2000000:
+        if dbgMacho || dbgStep:
+            echo("[macho.err.bad_cstr_count]")
+            echo(intToStr(cstrCount))
+        return machoErrBytes("[macho.err.bad_cstr_count.ret]",
+                             "macho_writer: invalid cstring count: " + intToStr(cstrCount))
+    if globalCount < 0 || globalCount > 2000000:
+        if dbgMacho || dbgStep:
+            echo("[macho.err.bad_global_count]")
+            echo(intToStr(globalCount))
+        return machoErrBytes("[macho.err.bad_global_count.ret]",
+                             "macho_writer: invalid global count: " + intToStr(globalCount))
+    if funcCount < 0 || funcCount > 2000000:
+        if dbgMacho || dbgStep:
+            echo("[macho.err.bad_func_count]")
+            echo(intToStr(funcCount))
+        return machoErrBytes("[macho.err.bad_func_count.ret]",
+                             "macho_writer: invalid function count: " + intToStr(funcCount))
+    if dbgMacho:
+        echo("[macho] build:counts funcs=" + intToStr(funcCount) + " cstrs=" + intToStr(cstrCount) +
+             " globals=" + intToStr(globalCount))
+
+    # Section raw data.
+    var text: uint8[]
+    var cstring: uint8[]
+    var data: uint8[]
+    machoSeqInitEmpty_uint8(text)
+    machoSeqInitEmpty_uint8(&cstring)
+    machoSeqInitEmpty_uint8(&data)
+    var bssSize: uint64 = 0
+
+    # Layout cstrings.
+    var cSymOffs: uint64[]
+    machoSeqInitEmpty_uint64(&cSymOffs)
+    reserve(cSymOffs, int(cstrCount))
+    setLen(cSymOffs, int(cstrCount))
+    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    for ci in 0..<cstrCount:
+        let c: MachineCString = machoModuleCStringAtRaw(mod, ci)
+        if !machineCStringValid(c):
+            if dbgMacho || dbgStep:
+                echo("[macho.err.invalid_cstring_ref]")
+                echo(intToStr(ci))
+            return machoErrBytes("[macho.err.invalid_cstring_ref.ret]",
+                                 "macho_writer: invalid cstring ref at index " + intToStr(ci))
+        let off: uint64 = uint64(cstring.len)
+        if dbgCstr && ci < 8:
+            let cLabelDbg: str = machoCStringLabelRaw(c)
+            let cValueDbg: str = machoCStringValueRaw(c)
+            let cLenDbg: int32 = len(cValueDbg)
+            let c0Dbg: int32 = cLenDbg > 0 ? int32(machoStrCharAt(cValueDbg, 0)) : -1
+            let c1Dbg: int32 = cLenDbg > 1 ? int32(machoStrCharAt(cValueDbg, 1)) : -1
+            echo("[macho.cstr.a64] i=" + intToStr(ci) + " label=" + cLabelDbg +
+                 " len=" + intToStr(cLenDbg) + " b0=" + intToStr(c0Dbg) + " b1=" + intToStr(c1Dbg))
+        cSymOffs[ci] = off
+        bufStr0(&cstring, machoCStringValueRaw(c))
+    machoDebug("[macho] build:cstrings_done")
+
+    # Layout globals.
+    var dataSymOffs: uint64[]
+    machoSeqInitEmpty_uint64(&dataSymOffs)
+    reserve(dataSymOffs, int(globalCount))
+    setLen(dataSymOffs, int(globalCount))
+    var bssSymOffs: uint64[]
+    machoSeqInitEmpty_uint64(&bssSymOffs)
+    reserve(bssSymOffs, int(globalCount))
+    setLen(bssSymOffs, int(globalCount))
+    var maxDataAlignPow2: int32 = 0
+    var maxBssAlignPow2: int32 = 0
+    for gi in 0..<globalCount:
+        let g: MachineGlobal = machoModuleGlobalAtRaw(mod, gi)
+        if machoMachineGlobalNil(g):
+            if dbgMacho || dbgStep:
+                echo("[macho.err.invalid_global_ref_pre]")
+                echo(intToStr(gi))
+            return machoErrBytes("[macho.err.invalid_global_ref_pre.ret]",
+                                 "macho_writer: invalid global ref at index " + intToStr(gi))
+        if machineGlobalAlignPow2Of(g) > maxDataAlignPow2 && machineGlobalHasInit(g):
+            maxDataAlignPow2 = machineGlobalAlignPow2Of(g)
+        if machineGlobalAlignPow2Of(g) > maxBssAlignPow2 && !machineGlobalHasInit(g):
+            maxBssAlignPow2 = machineGlobalAlignPow2Of(g)
+    for gi in 0..<globalCount:
+        let g2: MachineGlobal = machoModuleGlobalAtRaw(mod, gi)
+        if machoMachineGlobalNil(g2):
+            if dbgMacho || dbgStep:
+                echo("[macho.err.invalid_global_ref_layout]")
+                echo(intToStr(gi))
+            return machoErrBytes("[macho.err.invalid_global_ref_layout.ret]",
+                                 "macho_writer: invalid global ref at index " + intToStr(gi))
+        let align: uint64 = uint64(1) << uint64(machineGlobalAlignPow2Of(g2))
+        if machineGlobalHasInit(g2):
+            bufAlign(&data, align)
+            dataSymOffs[gi] = uint64(data.len)
+            if machineGlobalSizeOf(g2) == 4:
+                bufU32(&data, uint32(int32(machineGlobalInitOf(g2))))
+            else:
+                bufU64(&data, uint64(machineGlobalInitOf(g2)))
+        else:
+            bssSize = macho_alignUp(bssSize, align)
+            bssSymOffs[gi] = bssSize
+            bssSize = bssSize + uint64(machineGlobalSizeOf(g2))
+    machoDebug("[macho] build:globals_done")
+
+    # Encode .text and collect relocations.
+    var relocs: MachoReloc[]
+    var funcOffs: uint64[]
+    var funcSymNames: str[]
+    machoSeqInitEmpty_MachoReloc(&relocs)
+    machoSeqInitEmpty_uint64(&funcOffs)
+    machoSeqInitEmpty_str(&funcSymNames)
+    reserve(funcOffs, int(funcCount))
+    setLen(funcOffs, int(funcCount))
+    reserve(funcSymNames, int(funcCount))
+    setLen(funcSymNames, int(funcCount))
+    machoDebug("[macho] build:func_offs_ready")
+    for fi in 0..<funcCount:
+        if dbgMacho:
+            echo "[macho] text:fi.begin="
+            echo intToStr(fi)
+        bufAlign(text, 4)
+        machoDebug("[macho] text:fi.aligned")
+        funcOffs[fi] = uint64(text.len)
+        machoDebug("[macho] text:fi.off_written")
+        if dbgMacho:
+            machoDebug("[macho] text:fi.len_now=" + intToStr(machineModuleFuncsLen(mod)))
+        let f: MachineFunc = machoModuleFuncAtRaw(mod, fi)
+        if machoMachineFuncNil(f):
+            echo("[macho.err.invalid_function_ref]")
+            echo(intToStr(fi))
+            return machoErrBytes("[macho.err.invalid_function_ref.ret]",
+                                 "macho_writer: invalid function ref at index " + intToStr(fi))
+        let funcInstLen: int32 = machineFuncInstsLen(f)
+        machoDebug("[macho] text:fi.func_loaded")
+        if dbgStep:
+            echo("[macho] text:func_begin fi=" + intToStr(fi) + " name=" + machoFuncNameRaw(f) +
+                 " insts=" + intToStr(funcInstLen))
+
+        # Pass 1: compute label offsets within this function (in bytes from func start).
+        var labels: str[]
+        machoSeqInitEmpty_str(&labels)
+        labels.cap = 16
+        var labelOffs: int32[]
+        machoSeqInitEmpty_int32(&labelOffs)
+        labelOffs.cap = 16
+        var scanOff: int32 = 0
+        for si in 0..<funcInstLen:
+            let inst0: MachineInst = machoFuncInstAtRaw(f, si)
+            if machoMachineInstNil(inst0):
+                echo("[macho.err.invalid_inst_ref_pass1]")
+                echo(intToStr(fi))
+                echo(intToStr(si))
+                return machoErrBytes("[macho.err.invalid_inst_ref_pass1.ret]",
+                                     "macho_writer: invalid inst ref in pass1 (fi=" + intToStr(fi) +
+                                     " si=" + intToStr(si) + ")")
+            let op0: int32 = int32(machineInstOpOf(inst0))
+            if dbgStep:
+                echo("[macho] text:pass1 fi=" + intToStr(fi) + " si=" + intToStr(si) +
+                     " op=" + intToStr(op0) + " scanOff=" + intToStr(scanOff))
+            if op0 == int32(0):
+                let persistedLabel: str = machoPersistStr(machineInstLabelOf(inst0))
+                add(labels, persistedLabel)
+                add(labelOffs, scanOff)
+                continue
+            if op0 == int32(1):
+                let wc: int32 = a64MovImmWordCount(a64Is64(machineInstRdOf(inst0)), machineInstImmOf(inst0))
+                scanOff = scanOff + (wc * 4)
+            else:
+                scanOff = scanOff + 4
+        if dbgStep:
+            echo("[macho] text:pass1_done fi=" + intToStr(fi) + " labels=" + intToStr(labels.len) +
+                 " scanOff=" + intToStr(scanOff))
+        let resolvedFnName: str = machoResolveFuncExportName(f, labels)
+        machoSeqSetStr(funcSymNames, fi, resolvedFnName)
+        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+            let firstLabelDbg: str = labels.len > 0 ? labels[0] : ""
+            echo("[macho.func.resolve] fi=" + intToStr(fi) +
+                 " raw=" + machoFuncNameRaw(f) +
+                 " firstLabel=" + firstLabelDbg +
+                 " resolved=" + resolvedFnName)
+        let labelOffIndex: hashmaps.HashMapStrInt = machoBuildLabelOffIndex(labels, labelOffs)
+
+        var ii: int32 = 0
+        var curOff: int32 = 0
+        for __for_guard_ii in 0..<funcInstLen:
+            if !(ii < funcInstLen):
+                break
+            let inst: MachineInst = machoFuncInstAtRaw(f, ii)
+            if machoMachineInstNil(inst):
+                echo("[macho.err.invalid_inst_ref_pass2]")
+                echo(intToStr(fi))
+                echo(intToStr(ii))
+                return machoErrBytes("[macho.err.invalid_inst_ref_pass2.ret]",
+                                     "macho_writer: invalid inst ref in pass2 (fi=" + intToStr(fi) +
+                                     " ii=" + intToStr(ii) + ")")
+            let op: int32 = int32(machineInstOpOf(inst))
+            if dbgStep:
+                echo("[macho] text:pass2 fi=" + intToStr(fi) + " ii=" + intToStr(ii) +
+                     " op=" + intToStr(op) + " curOff=" + intToStr(curOff))
+            if op == int32(0):
+                ii = ii + 1
+                continue
+            let off: uint64 = uint64(text.len)
+            var word: uint32 = 0
+            if op == int32(42):
+                if machineInstImmOf(inst) < 0 || machineInstImmOf(inst) > 4095:
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.sub_sp_imm_range]")
+                        echo(intToStr(fi))
+                        echo(intToStr(ii))
+                    return machoErrBytes("[macho.err.sub_sp_imm_range.ret]",
+                                         "macho_writer: sub sp immediate out of range")
+                word = a64EncSubImm(true, 31, 31, int32(machineInstImmOf(inst)))
+            elif op == int32(43):
+                if machineInstImmOf(inst) < 0 || machineInstImmOf(inst) > 4095:
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.add_sp_imm_range]")
+                        echo(intToStr(fi))
+                        echo(intToStr(ii))
+                    return machoErrBytes("[macho.err.add_sp_imm_range.ret]",
+                                         "macho_writer: add sp immediate out of range")
+                word = a64EncAddImm(true, 31, 31, int32(machineInstImmOf(inst)))
+            elif op == int32(2):
+                let is64: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAddImm(is64, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), 0)
+            elif op == int32(1):
+                let is64m: bool = a64Is64(machineInstRdOf(inst))
+                let rd: int32 = a64RegNum(machineInstRdOf(inst))
+                let v: uint64 = uint64(machineInstImmOf(inst))
+                word = a64EncMovz(is64m, rd, int32(v & uint64(0xFFFF)), 0)
+                emitU32LE(text, word)
+                for hw in 1..<(is64m ? 4 : 2):
+                    let part: uint64 = (v >> uint64(hw * 16)) & uint64(0xFFFF)
+                    if part != 0:
+                        let w2: uint32 = a64EncMovk(is64m, rd, int32(part), hw)
+                        emitU32LE(text, w2)
+                ii = ii + 1
+                curOff = curOff + (a64MovImmWordCount(is64m, machineInstImmOf(inst)) * 4)
+                continue
+            elif op == int32(4):
+                word = a64EncAdrp(a64RegNum(machineInstRdOf(inst)))
+                var r: MachoReloc
+                new r
+                r.off = uint32(off)
+                let relocLabel0: str = machineInstLabelOf(inst)
+                if len(relocLabel0) <= 0:
+                    echo("[macho.err.empty_reloc_sym_adrp]")
+                    echo(intToStr(fi))
+                    echo(intToStr(ii))
+                r.sym = machoPersistStr(relocLabel0)
+                r.rtype = uint8(3)
+                r.pcrel = true
+                add(relocs, r)
+            elif op == int32(5):
+                word = a64EncAddImm(true, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), 0)
+                var r2: MachoReloc
+                new r2
+                r2.off = uint32(off)
+                let relocLabel1: str = machineInstLabelOf(inst)
+                if len(relocLabel1) <= 0:
+                    echo("[macho.err.empty_reloc_sym_pageoff]")
+                    echo(intToStr(fi))
+                    echo(intToStr(ii))
+                r2.sym = machoPersistStr(relocLabel1)
+                r2.rtype = uint8(4)
+                r2.pcrel = false
+                add(relocs, r2)
+            elif op == int32(3):
+                word = a64EncSxtw(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif op == int32(6):
+                let is64a: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAddReg(is64a, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(7):
+                let is64s2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncSubReg(is64s2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(8):
+                let is64m2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncMul(is64m2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(9):
+                let is64d: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncSdiv(is64d, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(10):
+                let is64d2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncUdiv(is64d2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(11):
+                let is64ms: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncMsub(is64ms, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)), a64RegNum(machineInstRaOf(inst)))
+            elif op == int32(12):
+                let is64l: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAndReg(is64l, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(13):
+                let is64o: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncOrrReg(is64o, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(14):
+                let is64e: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncEorReg(is64e, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(15):
+                let is64sh: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncLslv(is64sh, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(16):
+                let is64sh2: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncLsrv(is64sh2, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(17):
+                let is64sh3: bool = a64Is64(machineInstRdOf(inst))
+                word = a64EncAsrv(is64sh3, a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(18):
+                let is64c: bool = a64Is64(machineInstRnOf(inst))
+                word = a64EncCmpReg(is64c, a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(19):
+                let toffRes: Result[int32] = macho_findLabelOffIndexed(labelOffIndex, labels, labelOffs,
+                                                                       machineInstLabelOf(inst))
+                if !IsOk[int32](toffRes):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.bcond_label]")
+                    return machoErrInfoBytes("[macho.err.bcond_label.ret]", ErrorInfoOf[int32](toffRes))
+                let targetOff: int32 = Value[int32](toffRes)
+                let deltaBytes: int64 = int64(targetOff - curOff)
+                if deltaBytes % 4 != 0:
+                    return machoErrBytes("[macho.err.bcond_misaligned]",
+                                         "macho_writer: misaligned branch target")
+                let encRes: Result[uint32] = a64EncBCond(deltaBytes / 4, machineInstCondOf(inst))
+                if !IsOk[uint32](encRes):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.bcond_enc]")
+                    return machoErrInfoBytes("[macho.err.bcond_enc.ret]", ErrorInfoOf[uint32](encRes))
+                word = Value[uint32](encRes)
+            elif op == int32(20):
+                let toffRes2: Result[int32] = macho_findLabelOffIndexed(labelOffIndex, labels, labelOffs,
+                                                                        machineInstLabelOf(inst))
+                if !IsOk[int32](toffRes2):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.b_label]")
+                    return machoErrInfoBytes("[macho.err.b_label.ret]", ErrorInfoOf[int32](toffRes2))
+                let targetOff2: int32 = Value[int32](toffRes2)
+                let deltaBytes2: int64 = int64(targetOff2 - curOff)
+                if deltaBytes2 % 4 != 0:
+                    return machoErrBytes("[macho.err.b_misaligned]",
+                                         "macho_writer: misaligned branch target")
+                let encRes2: Result[uint32] = a64EncBImm(deltaBytes2 / 4)
+                if !IsOk[uint32](encRes2):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.b_enc]")
+                    return machoErrInfoBytes("[macho.err.b_enc.ret]", ErrorInfoOf[uint32](encRes2))
+                word = Value[uint32](encRes2)
+            elif op == int32(34):
+                let is64s: bool = a64Is64(machineInstRdOf(inst))
+                let encRes: Result[uint32] = a64EncStrImm(is64s, a64RegNum(machineInstRdOf(inst)),
+                                                          a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if ! IsOk[uint32](encRes):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.str_imm]")
+                    return machoErrInfoBytes("[macho.err.str_imm.ret]", ErrorInfoOf[uint32](encRes))
+                word = Value[uint32](encRes)
+            elif op == int32(35):
+                let is64l: bool = a64Is64(machineInstRdOf(inst))
+                let encRes2: Result[uint32] = a64EncLdrImm(is64l, a64RegNum(machineInstRdOf(inst)),
+                                                           a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if ! IsOk[uint32](encRes2):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.ldr_imm]")
+                    return machoErrInfoBytes("[macho.err.ldr_imm.ret]", ErrorInfoOf[uint32](encRes2))
+                word = Value[uint32](encRes2)
+            elif op == int32(36):
+                let encRes3: Result[uint32] = a64EncStrbImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if !IsOk[uint32](encRes3):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.strb_imm]")
+                    return machoErrInfoBytes("[macho.err.strb_imm.ret]", ErrorInfoOf[uint32](encRes3))
+                word = Value[uint32](encRes3)
+            elif op == int32(37):
+                let encRes4: Result[uint32] = a64EncLdrbImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if !IsOk[uint32](encRes4):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.ldrb_imm]")
+                    return machoErrInfoBytes("[macho.err.ldrb_imm.ret]", ErrorInfoOf[uint32](encRes4))
+                word = Value[uint32](encRes4)
+            elif op == int32(38):
+                let encRes5: Result[uint32] = a64EncLdrsbImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if !IsOk[uint32](encRes5):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.ldrsb_imm]")
+                    return machoErrInfoBytes("[macho.err.ldrsb_imm.ret]", ErrorInfoOf[uint32](encRes5))
+                word = Value[uint32](encRes5)
+            elif op == int32(39):
+                let encRes6: Result[uint32] = a64EncStrhImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if !IsOk[uint32](encRes6):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.strh_imm]")
+                    return machoErrInfoBytes("[macho.err.strh_imm.ret]", ErrorInfoOf[uint32](encRes6))
+                word = Value[uint32](encRes6)
+            elif op == int32(40):
+                let encRes7: Result[uint32] = a64EncLdrhImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if !IsOk[uint32](encRes7):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.ldrh_imm]")
+                    return machoErrInfoBytes("[macho.err.ldrh_imm.ret]", ErrorInfoOf[uint32](encRes7))
+                word = Value[uint32](encRes7)
+            elif op == int32(41):
+                let encRes8: Result[uint32] = a64EncLdrshImm(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), machineInstImmOf(inst))
+                if !IsOk[uint32](encRes8):
+                    if dbgMacho || dbgStep:
+                        echo("[macho.err.ldrsh_imm]")
+                    return machoErrInfoBytes("[macho.err.ldrsh_imm.ret]", ErrorInfoOf[uint32](encRes8))
+                word = Value[uint32](encRes8)
+            elif op == int32(21):
+                word = a64EncBl()
+                var r3: MachoReloc
+                new r3
+                r3.off = uint32(off)
+                let relocLabel2: str = machineInstLabelOf(inst)
+                if len(relocLabel2) <= 0:
+                    echo("[macho.err.empty_reloc_sym_bl]")
+                    echo(intToStr(fi))
+                    echo(intToStr(ii))
+                r3.sym = machoJoinSym(symPrefix, relocLabel2)
+                r3.rtype = uint8(2)
+                r3.pcrel = true
+                add(relocs, r3)
+            elif op == int32(22):
+                word = a64EncBlr(a64RegNum(machineInstRnOf(inst)))
+            elif op == int32(23):
+                word = a64EncFmovDx(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif op == int32(24):
+                word = a64EncFmovXd(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif op == int32(30):
+                word = a64EncFcmpD(a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(25):
+                word = a64EncFaddD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(26):
+                word = a64EncFsubD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(27):
+                word = a64EncFmulD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(28):
+                word = a64EncFdivD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)), a64RegNum(machineInstRmOf(inst)))
+            elif op == int32(29):
+                word = a64EncFnegD(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif op == int32(31):
+                word = a64EncScvtfDx(a64RegNum(machineInstRdOf(inst)), a64RegNum(machineInstRnOf(inst)))
+            elif op == int32(32):
+                if machineInstImmOf(inst) < 0 || machineInstImmOf(inst) > 65535:
+                    return machoErrBytes("[macho.err.svc_imm_range]",
+                                         "macho_writer: svc immediate out of range")
+                word = a64EncSvc(int32(machineInstImmOf(inst)))
+            elif op == int32(33):
+                word = a64EncRet()
+            else:
+                echo("[macho.bad_op] fi=" + intToStr(fi))
+                echo("[macho.bad_op] ii=" + intToStr(ii))
+                echo("[macho.bad_op] op=" + intToStr(op))
+                echo("[macho.bad_op] rd=" + intToStr(int32(machineInstRdOf(inst))))
+                echo("[macho.bad_op] rn=" + intToStr(int32(machineInstRnOf(inst))))
+                echo("[macho.bad_op] rm=" + intToStr(int32(machineInstRmOf(inst))))
+                echo("[macho.bad_op] ra=" + intToStr(int32(machineInstRaOf(inst))))
+                echo("[macho.bad_op] imm=" + intToStr(int32(machineInstImmOf(inst))))
+                return machoErrBytes("[macho.err.bad_op.ret]",
+                                     "macho_writer: unsupported machine op (fi=" + intToStr(fi) +
+                                     " ii=" + intToStr(ii) + " op=" + intToStr(op) + ")")
+            emitU32LE(text, word)
+            ii = ii + 1
+            curOff = curOff + 4
+    machoDebug("[macho] build:text_done")
+    if dbgMacho:
+        echo "[macho] mod.funcs.len="
+        echo intToStr(funcCount)
+        for fi2 in 0..<funcCount:
+            let fdbg: MachineFunc = machoModuleFuncAtRaw(mod, fi2)
+            if machoMachineFuncNil(fdbg):
+                continue
+            if len(machoFuncNameRaw(fdbg)) > 0:
+                echo "[macho] func:"
+                echo machoFuncNameRaw(fdbg)
+        echo "[macho] mod.cstrs.len="
+        echo intToStr(cstrCount)
+        for ci2 in 0..<cstrCount:
+            let cdbg: MachineCString = machoModuleCStringAtRaw(mod, ci2)
+            if !machineCStringValid(cdbg):
+                continue
+            if len(machoCStringLabelRaw(cdbg)) > 0:
+                echo "[macho] cstr:"
+                echo machoCStringLabelRaw(cdbg)
+
+    # Sections: always include __text, optionally __cstring/__data/__bss.
+    let hasCstr: bool = cstring.len > 0
+    let hasData: bool = data.len > 0
+    let hasBss: bool = bssSize > 0
+    let nsects: uint32 = uint32(1 + (hasCstr ? 1 : 0) + (hasData ? 1 : 0) + (hasBss ? 1 : 0))
+
+    # Section indices (1-based).
+    let textSectIndex: uint8 = uint8(1)
+    var cstrSectIndex: uint8 = uint8(0)
+    var dataSectIndex: uint8 = uint8(0)
+    var bssSectIndex: uint8 = uint8(0)
+    var nextIdx: uint8 = uint8(2)
+    if hasCstr:
+        cstrSectIndex = nextIdx
+        nextIdx = uint8(nextIdx + 1)
+    if hasData:
+        dataSectIndex = nextIdx
+        nextIdx = uint8(nextIdx + 1)
+    if hasBss:
+        bssSectIndex = nextIdx
+        nextIdx = uint8(nextIdx + 1)
+
+    # Section addresses in "vm space".
+    var addrCursor: uint64 = 0
+    let textAddr: uint64 = addrCursor
+    addrCursor = addrCursor + uint64(text.len)
+
+    var cstrAddr: uint64 = 0
+    if hasCstr:
+        addrCursor = macho_alignUp(addrCursor, uint64(1))
+        cstrAddr = addrCursor
+        addrCursor = addrCursor + uint64(cstring.len)
+
+    var dataAddr: uint64 = 0
+    if hasData:
+        let dataAlign: uint64 = uint64(1) << uint64(maxDataAlignPow2)
+        addrCursor = macho_alignUp(addrCursor, dataAlign)
+        dataAddr = addrCursor
+        addrCursor = addrCursor + uint64(data.len)
+
+    var bssAddr: uint64 = 0
+    if hasBss:
+        let bssAlign: uint64 = uint64(1) << uint64(maxBssAlignPow2)
+        addrCursor = macho_alignUp(addrCursor, bssAlign)
+        bssAddr = addrCursor
+        addrCursor = addrCursor + bssSize
+
+    let vmsize: uint64 = addrCursor
+
+    # Build symbol list in dyld order: locals, extdefs, undefs.
+    var strtab: uint8[]
+    machoSeqInitEmpty_uint8(strtab)
+    bufAddU8(strtab, uint8(0))
+    var syms: MachoSym[]
+    machoSeqInitEmpty_MachoSym(syms)
+    var symNames: str[]
+    machoSeqInitEmpty_str(&symNames)
+    var symIndexCapHint: int32 = cstrCount * 2 + funcCount + globalCount
+    if symIndexCapHint < 64:
+        symIndexCapHint = 64
+    var symIndexMap: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(symIndexCapHint * 2 + 1)
+
+    # locals: cstrings
+    for ci in 0..<cstrCount:
+        let c2: MachineCString = machoModuleCStringAtRaw(mod, ci)
+        if hasCstr && machineCStringValid(c2) && len(machoCStringLabelRaw(c2)) > 0:
+            let symName: str = machoCStringLabelRaw(c2)
+            let v: uint64 = cstrAddr + cSymOffs[ci]
+            let canonical: str = objCStringCanonicalTempLabel(symName)
+            syms = machoAddCstringSymIfAbsent(syms, symIndexMap, symNames, strtab, symName, cstrSectIndex, v)
+            if len(canonical) > 0 && canonical != symName:
+                syms = machoAddCstringSymIfAbsent(syms, symIndexMap, symNames, strtab, canonical, cstrSectIndex, v)
+            let alias: str = objCStringMachoSymbolAlias(symName, len(canonical) > 0 ? canonical : symName)
+            syms = machoAddCstringSymIfAbsent(syms, symIndexMap, symNames, strtab, alias, cstrSectIndex, v)
+    for ri in 0..<relocs.len:
+        let r0: MachoReloc = relocs[ri]
+        if machoRelocNil(r0) || len(r0.sym) == 0:
+            continue
+        let canonicalReloc: str = objCStringCanonicalTempLabel(r0.sym)
+        if len(canonicalReloc) == 0:
+            continue
+        var hasCstrSym: bool = false
+        let _: int32 = machoSymIndexLookup(symIndexMap, r0.sym, hasCstrSym)
+        if !hasCstrSym:
+            return machoErrBytes("[macho.err.missing_selector_cstring]",
+                                 objCStringMissingSelectorRelocErr("macho_writer", r0.sym))
+
+    # local funcs
+    for fi in 0..<funcCount:
+        let fLocal: MachineFunc = machoModuleFuncAtRaw(mod, fi)
+        let fnNameDirect: str = machoFuncNameRaw(fLocal)
+        let fnName: str = len(fnNameDirect) > 0 ? fnNameDirect : machoSeqAtStr(funcSymNames, fi)
+        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+            echo("[macho.func.local] fi=" + intToStr(fi) +
+                 " raw=" + fnNameDirect +
+                 " picked=" + fnName)
+        if !machoIsPrivateFuncSym(fnName):
+            continue
+        let vLocal: uint64 = textAddr + funcOffs[fi]
+        let exportSymLocal: str = machoJoinSym(symPrefix, fnName)
+        let exportSymLocalOff: uint32 = machoStrtabAddJoined(strtab, symPrefix, fnName)
+        syms = machoAddSymIndexed(syms, symIndexMap, symNames, exportSymLocal,
+                                  uint8(0xE), textSectIndex, vLocal, exportSymLocalOff)
+
+    let localCount: uint32 = uint32(syms.len)
+
+    # extdefs: funcs
+    for fi in 0..<funcCount:
+        let fExt: MachineFunc = machoModuleFuncAtRaw(mod, fi)
+        let fnNameDirect: str = machoFuncNameRaw(fExt)
+        let fnName: str = len(fnNameDirect) > 0 ? fnNameDirect : machoSeqAtStr(funcSymNames, fi)
+        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+            echo("[macho.func.ext] fi=" + intToStr(fi) +
+                 " raw=" + fnNameDirect +
+                 " picked=" + fnName)
+        if machoIsPrivateFuncSym(fnName):
+            continue
+        let v2: uint64 = textAddr + funcOffs[fi]
+        let exportSymExt: str = machoJoinSym(symPrefix, fnName)
+        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+            echo("[macho.func.ext.sym] fi=" + intToStr(fi) +
+                 " export=" + exportSymExt)
+        let exportSymExtOff: uint32 = machoStrtabAddJoined(strtab, symPrefix, fnName)
+        syms = machoAddSymIndexed(syms, symIndexMap, symNames, exportSymExt,
+                                  uint8(uint8(0xE) | uint8(0x1)), textSectIndex, v2, exportSymExtOff)
+
+    # extdefs: data/bss globals
+    for gi in 0..<globalCount:
+        let g3: MachineGlobal = machoModuleGlobalAtRaw(mod, gi)
+        let gNameRaw: str = machoGlobalNameRaw(g3)
+        if len(gNameRaw) == 0:
+            continue
+        let gSym: str = machoJoinSym(symPrefix, gNameRaw)
+        if len(gSym) == 0:
+            continue
+        let gNameOff: uint32 = machoStrtabAddJoined(strtab, symPrefix, gNameRaw)
+        if machineGlobalHasInit(g3):
+            if hasData:
+                let v3: uint64 = dataAddr + dataSymOffs[gi]
+                syms = machoAddSymIndexed(syms, symIndexMap, symNames, gSym,
+                                          uint8(uint8(0xE) | uint8(0x1)), dataSectIndex, v3, gNameOff)
+        else:
+            if hasBss:
+                let v4: uint64 = bssAddr + bssSymOffs[gi]
+                syms = machoAddSymIndexed(syms, symIndexMap, symNames, gSym,
+                                          uint8(uint8(0xE) | uint8(0x1)), bssSectIndex, v4, gNameOff)
+
+    let extdefCount: uint32 = uint32(syms.len) - localCount
+
+    # undefs referenced by relocations.
+    var undefs: str[]
+    machoSeqInitEmpty_str(&undefs)
+    let undefCapHint: int32 = relocs.len < 64 ? 64 : relocs.len
+    var undefSeen: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(undefCapHint * 2 + 1)
+    for ri in 0..<relocs.len:
+        let r0: MachoReloc = relocs[ri]
+        if !machoRelocNil(r0) && len(r0.sym) > 0 && machoStrCharAt(r0.sym, 0) != char(0):
+            var hasSym: bool = false
+            let _: int32 = machoSymIndexLookup(symIndexMap, r0.sym, hasSym)
+            if !hasSym:
+                var hasUndef: bool = false
+                hashmaps.hashMapStrIntGetEx(undefSeen, r0.sym, hasUndef)
+                if !hasUndef:
+                    hashmaps.hashMapStrIntPut(undefSeen, r0.sym, 1)
+                    add(undefs, r0.sym)
+    machoDebug("[macho] build:undef_scan_done")
+    macho_sortStringsStable(undefs)
+    machoDebug("[macho] build:undef_sort_done")
+    for ri in 0..<undefs.len:
+        if dbgMacho:
+            echo "[macho] undef:"
+            echo undefs[ri]
+    for ri in 0..<undefs.len:
+        let name: str = undefs[ri]
+        let nameOff: uint32 = machoStrtabAddRaw(strtab, name)
+        syms = machoAddSymIndexed(syms, symIndexMap, symNames, name, uint8(uint8(0x0) | uint8(0x1)), uint8(0), uint64(0), nameOff)
+    machoDebug("[macho] build:symbols_done")
+
+    let undefCount: uint32 = uint32(undefs.len)
+
+    let dbgMainSym: bool = os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1"
+    for si in 0..<syms.len:
+        let s0: MachoSym = machoSeqAtMachoSym(syms, si)
+        if !machoSymNil(s0):
+            if dbgMainSym:
+                echo("[macho] sym[" + intToStr(si) + "] nameOff=" + intToStr(int32(s0.nameOff)))
+
+    # Offsets.
+    let headerSize: uint64 = 32
+    let segCmdSize: uint32 = uint32(72 + uint32(80) * nsects)
+    let buildCmdSize: uint32 = uint32(24)
+    let symtabCmdSize: uint32 = uint32(24)
+    let dysymCmdSize: uint32 = uint32(80)
+    let sizeofcmds: uint32 = segCmdSize + buildCmdSize + symtabCmdSize + dysymCmdSize
+    let fileoff: uint64 = headerSize + uint64(sizeofcmds)
+
+    # Compute raw section offsets (bss has offset 0).
+    var curOff: uint64 = fileoff
+    let textOff: uint64 = macho_alignUp(curOff, 4)
+    curOff = textOff + uint64(text.len)
+
+    var cstrOff: uint64 = 0
+    if hasCstr:
+        cstrOff = macho_alignUp(curOff, 1)
+        curOff = cstrOff + uint64(cstring.len)
+
+    var dataOff: uint64 = 0
+    if hasData:
+        let dataAlign2: uint64 = uint64(1) << uint64(maxDataAlignPow2)
+        dataOff = macho_alignUp(curOff, dataAlign2)
+        curOff = dataOff + uint64(data.len)
+
+    let rawEnd: uint64 = curOff
+    let filesize: uint64 = rawEnd - fileoff
+
+    # Relocations (after raw data, 8-byte aligned).
+    var textRelOff: uint32 = uint32(0)
+    var relocOff: uint64 = macho_alignUp(rawEnd, 8)
+    if relocs.len > 0:
+        textRelOff = uint32(relocOff)
+        relocOff = relocOff + uint64(relocs.len) * 8
+    let relocEnd: uint64 = relocOff
+
+    # Symbol table (16 bytes per nlist_64).
+    let symoff: uint64 = macho_alignUp(relocEnd, 8)
+    let symSize: uint64 = uint64(syms.len) * 16
+    let stroff: uint64 = symoff + symSize
+    let strsize: uint32 = uint32(strtab.len)
+
+    let finalFileSize: uint64 = stroff + uint64(strtab.len)
+    if finalFileSize > uint64(2147483647):
+        return machoErrBytes("[macho.err.output_too_large]",
+                             "macho_writer: output too large"
+                             + " text=" + intToStr(text.len)
+                             + " cstring=" + intToStr(cstring.len)
+                             + " data=" + intToStr(data.len)
+                             + " relocs=" + intToStr(relocs.len)
+                             + " syms=" + intToStr(syms.len)
+                             + " strtab=" + intToStr(strtab.len)
+                             + " final=" + uint64ToStr(finalFileSize))
+
+    # Build file.
+    var out: uint8[]
+    machoSeqInitEmpty_uint8(out)
+    reserve(out, int(finalFileSize))
+    machoDebug("[macho] build:file_layout_done")
+
+    # mach_header_64
+    bufU32(out, uint32(0xFEEDFACF))
+    bufU32(out, uint32(0x0100000C))
+    bufU32(out, uint32(0))
+    bufU32(out, uint32(1))
+    bufU32(out, uint32(4)) # ncmds
+    bufU32(out, sizeofcmds)
+    bufU32(out, uint32(0)) # flags
+    bufU32(out, uint32(0)) # reserved
+
+    # uint32(0x19)
+    bufU32(out, uint32(0x19))
+    bufU32(out, segCmdSize)
+    bufFixedStr(out, "", 16) # segname
+    bufU64(out, uint64(0))   # vmaddr
+    bufU64(out, vmsize)
+    bufU64(out, fileoff)
+    bufU64(out, filesize)
+    bufU32(out, uint32(7)) # maxprot
+    bufU32(out, uint32(7)) # initprot
+    bufU32(out, nsects)
+    bufU32(out, uint32(0)) # flags
+
+    # section_64 entries (80 bytes each).
+    # __TEXT,__text
+    bufFixedStr(out, "__text", 16)
+    bufFixedStr(out, "__TEXT", 16)
+    bufU64(out, textAddr)
+    bufU64(out, uint64(text.len))
+    bufU32(out, uint32(textOff))
+    bufU32(out, uint32(2)) # align pow2
+    bufU32(out, textRelOff)
+    bufU32(out, uint32(relocs.len))
+    bufU32(out, uint32(uint32(0x80000000) | uint32(0x00000400)))
+    bufU32(out, uint32(0))
+    bufU32(out, uint32(0))
+    bufU32(out, uint32(0))
+
+    if hasCstr:
+        bufFixedStr(out, "__cstring", 16)
+        bufFixedStr(out, "__TEXT", 16)
+        bufU64(out, cstrAddr)
+        bufU64(out, uint64(cstring.len))
+        bufU32(out, uint32(cstrOff))
+        bufU32(out, uint32(0)) # align pow2
+        bufU32(out, uint32(0)) # reloff
+        bufU32(out, uint32(0)) # nreloc
+        bufU32(out, uint32(0x2))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+
+    if hasData:
+        bufFixedStr(out, "__data", 16)
+        bufFixedStr(out, "__DATA", 16)
+        bufU64(out, dataAddr)
+        bufU64(out, uint64(data.len))
+        bufU32(out, uint32(dataOff))
+        bufU32(out, uint32(maxDataAlignPow2))
+        bufU32(out, uint32(0)) # reloff
+        bufU32(out, uint32(0)) # nreloc
+        bufU32(out, uint32(0)) # flags
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+
+    if hasBss:
+        bufFixedStr(out, "__bss", 16)
+        bufFixedStr(out, "__DATA", 16)
+        bufU64(out, bssAddr)
+        bufU64(out, bssSize)
+        bufU32(out, uint32(0)) # offset (zerofill)
+        bufU32(out, uint32(maxBssAlignPow2))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0x1))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+        bufU32(out, uint32(0))
+
+    # uint32(0x32) (fixed for determinism)
+    bufU32(out, uint32(0x32))
+    bufU32(out, buildCmdSize)
+    bufU32(out, machoBuildPlatform(machineModuleTargetOf(mod)))
+    bufU32(out, machoBuildMinOs(machineModuleTargetOf(mod)))
+    bufU32(out, uint32(0))        # sdk = n/a
+    bufU32(out, uint32(0))        # ntools
+
+    # uint32(0x2)
+    bufU32(out, uint32(0x2))
+    bufU32(out, symtabCmdSize)
+    bufU32(out, uint32(symoff))
+    bufU32(out, uint32(syms.len))
+    bufU32(out, uint32(stroff))
+    bufU32(out, strsize)
+
+    # uint32(0xB)
+    bufU32(out, uint32(0xB))
+    bufU32(out, dysymCmdSize)
+    bufU32(out, uint32(0)) # ilocalsym
+    bufU32(out, localCount)
+    bufU32(out, localCount) # iextdefsym
+    bufU32(out, extdefCount)
+    bufU32(out, localCount + extdefCount) # iundefsym
+    bufU32(out, undefCount)
+    # rest = 0
+    for z in 0..<12:
+        bufU32(out, uint32(0))
+
+    if uint64(out.len) != fileoff:
+        return machoErrBytes("[macho.err.offset_fileoff]",
+                             "macho_writer: internal offset mismatch (fileoff)")
+
+    # Section raw data.
+    bufAlign(out, 4)
+    if uint64(out.len) != textOff:
+        return machoErrBytes("[macho.err.offset_text]",
+                             "macho_writer: internal offset mismatch (__text)")
+    bufBytes(out, text)
+
+    if hasCstr:
+        bufAlign(out, 1)
+        if uint64(out.len) != cstrOff:
+            return machoErrBytes("[macho.err.offset_cstring]",
+                                 "macho_writer: internal offset mismatch (__cstring)")
+        bufBytes(out, cstring)
+
+    if hasData:
+        let dataAlign3: uint64 = uint64(1) << uint64(maxDataAlignPow2)
+        bufAlign(out, dataAlign3)
+        if uint64(out.len) != dataOff:
+            return machoErrBytes("[macho.err.offset_data]",
+                                 "macho_writer: internal offset mismatch (__data)")
+        bufBytes(out, data)
+
+    if uint64(out.len) != rawEnd:
+        return machoErrBytes("[macho.err.offset_raw_end]",
+                             "macho_writer: internal offset mismatch (rawEnd)")
+
+    # Relocations.
+    bufAlign(out, 8)
+    if relocs.len > 0:
+        if uint64(out.len) != uint64(textRelOff):
+            return machoErrBytes("[macho.err.offset_reloff]",
+                                 "macho_writer: internal offset mismatch (reloff)")
+        for ri in 0..<relocs.len:
+            let r5: MachoReloc = relocs[ri]
+            let symIdxRes: Result[int32] = macho_findSymIndexIndexed(symIndexMap, symNames, r5.sym)
+            if !IsOk[int32](symIdxRes):
+                echo "[macho.err.missing_reloc_sym]"
+                echo r5.sym
+                echo intToStr(int32(r5.off))
+                echo intToStr(int32(r5.rtype))
+                echo(r5.pcrel ? "1" : "0")
+                echo intToStr(syms.len)
+                for si2 in 0..<syms.len:
+                    let sdbg: MachoSym = machoSeqAtMachoSym(syms, si2)
+                    if !machoSymNil(sdbg) && si2 < symNames.len:
+                        echo "[macho.sym]"
+                        echo symNames[si2]
+                return machoErrInfoBytes("[macho.err.missing_reloc_sym.ret]", ErrorInfoOf[int32](symIdxRes))
+            let symIdx: int32 = Value[int32](symIdxRes)
+            let pcrel: uint32 = r5.pcrel ? uint32(1) : uint32(0)
+            let length: uint32 = uint32(2) # long (4 bytes)
+            let ext: uint32 = uint32(1)
+            let info: uint32 = (uint32(symIdx) & uint32(0x00FFFFFF)) |
+                               (pcrel << 24) |
+                               (length << 25) |
+                               (ext << 27) |
+                               (uint32(r5.rtype) << 28)
+            bufU32(out, uint32(r5.off))
+            bufU32(out, info)
+        if uint64(out.len) != relocEnd:
+            return machoErrBytes("[macho.err.offset_reloc_end]",
+                                 "macho_writer: internal offset mismatch (relocEnd)")
+
+    # Symbol table.
+    bufAlign(out, 8)
+    if uint64(out.len) != symoff:
+        return machoErrBytes("[macho.err.offset_symoff]",
+                             "macho_writer: internal offset mismatch (symoff)")
+    for si in 0..<syms.len:
+        let s1: MachoSym = machoSeqAtMachoSym(syms, si)
+        bufU32(out, s1.nameOff)
+        bufU8(out, s1.nType)
+        bufU8(out, s1.nSect)
+        bufU16(out, s1.nDesc)
+        bufU64(out, s1.nValue)
+
+    if uint64(out.len) != stroff:
+        return machoErrBytes("[macho.err.offset_stroff]",
+                             "macho_writer: internal offset mismatch (stroff)")
+    bufBytes(out, strtab)
+    machoDebug("[macho] build:done")
+    return Ok[ByteBuf](out)
+
+fn machoWriteAarch64RelocatableObj(mod: MachineModule): Result[ByteBuf] =
+    let dbgCstrWrap: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    if dbgCstrWrap:
+        let cCountWrap: int32 = machineModuleCstrsLen(mod)
+        echo("[macho.wrap.a64] cstrs=" + intToStr(cCountWrap))
+        for ciWrap in 0..<cCountWrap:
+            if ciWrap >= 4:
+                break
+            let cWrap: MachineCString = machineModuleCStringAt(mod, ciWrap)
+            let lWrap: str = machoCStringLabelRaw(cWrap)
+            let vWrap: str = machoCStringValueRaw(cWrap)
+            let nWrap: int32 = len(vWrap)
+            let b0Wrap: int32 = nWrap > 0 ? int32(machoStrCharAt(vWrap, 0)) : -1
+            echo("[macho.wrap.a64] i=" + intToStr(ciWrap) + " label=" + lWrap +
+                 " len=" + intToStr(nWrap) + " b0=" + intToStr(b0Wrap))
+    let outRes: Result[ByteBuf] = machoBuild(mod)
+    if !IsOk[ByteBuf](outRes):
+        let err: ErrorInfo = ErrorInfoOf[ByteBuf](outRes)
+        echo("[macho.wrap.err]")
+        echo(intToStr(ErrorCodeOf(err)))
+        let msg: str = ErrorMessage(err)
+        echo(intToStr(len(msg)))
+        if len(msg) > 0:
+            echo(msg)
+    return outRes

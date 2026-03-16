@@ -1,0 +1,123 @@
+# Curve25519 helpers (X25519, RFC 7748).
+
+import std/result
+import std/rawbytes
+import std/crypto/rand
+import std/crypto/ed25519/ref10
+
+type
+    Curve25519KeyPair =
+        priv: Bytes
+        pub: Bytes
+
+fn initCurve25519KeyPair(priv: Bytes, pub: Bytes): Curve25519KeyPair =
+    Curve25519KeyPair(priv: priv, pub: pub)
+
+fn curve25519ClampScalar(scalar: Bytes): Bytes =
+    let out: Bytes = bytesSlice(scalar, 0, 32)
+    bytesSet(out, 0, bytesGet(out, 0) & 248)
+    let last: int32 = bytesGet(out, 31)
+    bytesSet(out, 31, (last & 127) | 64)
+    return out
+
+fn curve25519BasePoint(): Bytes =
+    let out: Bytes = bytesAlloc(32)
+    bytesSet(out, 0, 9)
+    return out
+
+fn feCswap(a: var Fe, b: var Fe, swap: int32) =
+    # Constant-time conditional swap for Fe (10 int64 limbs).
+    let mask: int64 = -int64(swap)
+    for i in 0..<10:
+        let x: int64 = (feGet(a, i) ^ feGet(b, i)) & mask
+        feSet(a, i, feGet(a, i) ^ x)
+        feSet(b, i, feGet(b, i) ^ x)
+
+fn curve25519ScalarMult(scalar: Bytes, u: Bytes): Result[Bytes] =
+    if bytesLen(scalar) != 32 || bytesLen(u) != 32:
+        return Err[Bytes]("curve25519: invalid key size")
+
+    let k: Bytes = curve25519ClampScalar(scalar)
+
+    var x1: Fe
+    var x2: Fe
+    var z2: Fe
+    var x3: Fe
+    var z3: Fe
+    var a: Fe
+    var aa: Fe
+    var b: Fe
+    var bb: Fe
+    var e: Fe
+    var c: Fe
+    var d: Fe
+    var da: Fe
+    var cb: Fe
+    var tmp0: Fe
+    var tmp1: Fe
+
+    feFromBytes(x1, u)
+    fe1(x2)
+    fe0(z2)
+    feCopy(x3, x1)
+    fe1(z3)
+
+    var swap: int32 = 0
+    let __for_start_t = 254
+    for __for_rev_t in 0..(__for_start_t - (0)):
+        let t = __for_start_t - __for_rev_t
+        let byteIdx: int32 = t >> 3
+        let bitIdx: int32 = t & 7
+        let kBit: int32 = (bytesGet(k, byteIdx) >> bitIdx) & 1
+
+        swap = swap ^ kBit
+        feCswap(x2, x3, swap)
+        feCswap(z2, z3, swap)
+        swap = kBit
+
+        feAdd(a, x2, z2)
+        feSq(aa, a)
+        feSub(b, x2, z2)
+        feSq(bb, b)
+        feSub(e, aa, bb)
+        feAdd(c, x3, z3)
+        feSub(d, x3, z3)
+        feMul(da, d, a)
+        feMul(cb, c, b)
+        feAdd(tmp0, da, cb)
+        feSq(x3, tmp0)
+        feSub(tmp1, da, cb)
+        feSq(tmp1, tmp1)
+        feMul(z3, x1, tmp1)
+        feMul(x2, aa, bb)
+        # RFC 7748 uses A24 = 121665 for Curve25519.
+        feMul121666(tmp0, e)
+        feSub(tmp0, tmp0, e) # 121665*e = 121666*e - e
+        feAdd(tmp0, aa, tmp0)
+        feMul(z2, e, tmp0)
+
+
+    feCswap(x2, x3, swap)
+    feCswap(z2, z3, swap)
+    feInvert(tmp0, z2)
+    feMul(x2, x2, tmp0)
+    return Ok[Bytes](feToBytes(x2))
+
+fn curve25519PublicFromPrivate(priv: Bytes): Result[Bytes] =
+    if bytesLen(priv) != 32:
+        return Err[Bytes]("curve25519: invalid private key size")
+    let base: Bytes = curve25519BasePoint()
+    return curve25519ScalarMult(priv, base)
+
+fn generateCurve25519KeyPair(): Result[Curve25519KeyPair] =
+    let privRes: Result[Bytes] = randomBytes(32)
+    if IsErr(privRes):
+        return Err[Curve25519KeyPair](Error(privRes))
+    let priv: Bytes = Value(privRes)
+    let pubRes: Result[Bytes] = curve25519PublicFromPrivate(priv)
+    if IsErr(pubRes):
+        return Err[Curve25519KeyPair](Error(pubRes))
+    return Ok[Curve25519KeyPair](initCurve25519KeyPair(priv, Value(pubRes)))
+
+fn curve25519SharedKey(priv: Bytes, pub: Bytes): Result[Bytes] =
+    return curve25519ScalarMult(priv, pub)

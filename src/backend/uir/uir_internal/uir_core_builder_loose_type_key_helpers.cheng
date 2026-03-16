@@ -1,0 +1,239 @@
+# Shared builder-local legacy-bracket / loose type-key helpers split from uir_core_builder.
+import std/os
+import std/seqs
+import stage1/ast
+import stage1/token
+import stage1/monomorphize
+import backend/uir/uir_internal/uir_core_builder_text_helpers
+import backend/uir/uir_internal/uir_core_builder_type_key_helpers
+
+fn uir_core_builder_loose_type_key_helpers_add(dst: var Node[], val: Node) =
+    seqs.add(dst, val)
+
+fn uir_core_builder_loose_type_key_helpers_add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+fn uir_core_builder_loose_type_key_helpers_add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+var
+    uirCoreLegacyGenericBracketCacheEpoch: int32[]
+    uirCoreLegacyGenericBracketCacheVals: str[]
+    uirCoreLegacyGenericBracketCacheRound: int32 = 1
+    uirCoreLooseTypeKeyCacheEpoch: int32[]
+    uirCoreLooseTypeKeyCacheVals: str[]
+    uirCoreLooseTypeKeyCacheRound: int32 = 1
+
+fn uirCoreLegacyGenericBracketInstName(typeNode: Node): str =
+    var foundCached: bool = false
+    let cached: str = uirCoreLegacyGenericBracketCacheTryGet(typeNode, foundCached)
+    if foundCached:
+        return cached
+    if !astNodeIdValid(typeNode) || nodeKind(typeNode) != nkBracketExpr || kidCount(typeNode) < 3:
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let outerBaseNode: Node = kid(typeNode, 0)
+    let outerBase: str = backendStripSpaces(plainName(outerBaseNode))
+    if outerBase != "seq_fixed":
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let genericBaseNode: Node = kid(typeNode, 1)
+    let genericBase: str = backendStripSpaces(plainName(genericBaseNode))
+    if !(genericBase == "Result" || genericBase == "Option" ||
+         genericBase == "SeqUninit" || genericBase == "Table" ||
+         genericBase == "__cheng_tables_Entry"):
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let rawKey: str = backendStripSpaces(typeKey(typeNode))
+    let seqKey: str = uirCoreTypeKeySeqName(genericBase)
+    let seqFixedKey: str = uirCoreTypeKeyPrefixed("seq_fixed_", genericBase, "seq_fixed")
+    if !((rawKey == seqKey) || (rawKey == seqFixedKey)):
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    var instArgs: Node[]
+    instArgs.cap = 4
+    for ai in 2..<kidCount(typeNode):
+        let arg: Node = kid(typeNode, ai)
+        if astNodeIdValid(arg) && nodeKind(arg) != nkEmpty:
+            uir_core_builder_loose_type_key_helpers_add(instArgs, arg)
+    if instArgs.len == 0:
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let out: str = mangleInstance(genericBase, instArgs)
+    uirCoreLegacyGenericBracketCachePut(typeNode, out)
+    return out
+
+fn uirCoreTypeKeyFromNodeLoose(typeNode0: Node): str =
+    var typeNode: Node = typeNode0
+    while astNodeIdValid(typeNode) && nodeKind(typeNode) == nkPar && kidCount(typeNode) > 0:
+        typeNode = kid(typeNode, 0)
+    if (typeNode == nil):
+        return ""
+    var foundCached: bool = false
+    let cached: str = uirCoreLooseTypeKeyCacheTryGet(typeNode, foundCached)
+    if foundCached:
+        return cached
+    if nodeKind(typeNode) == nkDotExpr && kidCount(typeNode) > 1:
+        let rhs: Node = kid(typeNode, 1)
+        let rhsKey: str = uirCoreTypeKeyFromNodeLoose(rhs)
+        if len(rhsKey) > 0:
+            uirCoreLooseTypeKeyCachePut(typeNode, rhsKey)
+            return rhsKey
+    let legacyInstName: str = uirCoreLegacyGenericBracketInstName(typeNode)
+    if len(legacyInstName) > 0:
+        uirCoreLooseTypeKeyCachePut(typeNode, legacyInstName)
+        return legacyInstName
+    if nodeKind(typeNode) == nkBracketExpr && kidCount(typeNode) > 0:
+        let base: Node = kid(typeNode, 0)
+        let baseName: str = backendStripSpaces(plainName(base))
+        let dbgTypeKeyLoose: bool = (os.getEnvDefault("BACKEND_DEBUG_TYPEKEY_LOOSE", "") == "1")
+        if dbgTypeKeyLoose:
+            var arg1Kind: str = ""
+            var arg1Name: str = ""
+            var arg1Key: str = ""
+            var arg1Kid0Kind: str = ""
+            var arg1Kid0Name: str = ""
+            var arg1Kid0Key: str = ""
+            var arg1Kid1Kind: str = ""
+            var arg1Kid1Name: str = ""
+            var arg1Kid1Key: str = ""
+            if kidCount(typeNode) > 1:
+                let arg1: Node = kid(typeNode, 1)
+                if astNodeIdValid(arg1):
+                    arg1Kind = intToStr(int32(nodeKind(arg1)))
+                    arg1Name = backendStripSpaces(plainName(arg1))
+                    arg1Key = backendStripSpaces(typeKey(arg1))
+                    if kidCount(arg1) > 0:
+                        let arg1Kid0: Node = kid(arg1, 0)
+                        if astNodeIdValid(arg1Kid0):
+                            arg1Kid0Kind = intToStr(int32(nodeKind(arg1Kid0)))
+                            arg1Kid0Name = backendStripSpaces(plainName(arg1Kid0))
+                            arg1Kid0Key = backendStripSpaces(typeKey(arg1Kid0))
+                    if kidCount(arg1) > 1:
+                        let arg1Kid1: Node = kid(arg1, 1)
+                        if astNodeIdValid(arg1Kid1):
+                            arg1Kid1Kind = intToStr(int32(nodeKind(arg1Kid1)))
+                            arg1Kid1Name = backendStripSpaces(plainName(arg1Kid1))
+                            arg1Kid1Key = backendStripSpaces(typeKey(arg1Kid1))
+            os.writeLine(os.get_stderr(),
+                "[backend] debugTypeKeyLoose: bracket base='" + baseName +
+                "' rawKey='" + backendStripSpaces(typeKey(typeNode)) +
+                "' kids=" + intToStr(kidCount(typeNode)) +
+                " arg1.kind=" + arg1Kind +
+                " arg1.name='" + arg1Name +
+                "' arg1.key='" + arg1Key +
+                "' arg1.k0.kind=" + arg1Kid0Kind +
+                " arg1.k0.name='" + arg1Kid0Name +
+                "' arg1.k0.key='" + arg1Kid0Key +
+                "' arg1.k1.kind=" + arg1Kid1Kind +
+                " arg1.k1.name='" + arg1Kid1Name +
+                "' arg1.k1.key='" + arg1Kid1Key +
+                " @" + intToStr(nodePosLine(typeNode)) + ":" + intToStr(nodePosCol(typeNode)))
+            os.c_fflush(os.get_stderr())
+        if len(baseName) > 0:
+            if kidCount(typeNode) == 2:
+                let sliceElemKey: str = uirCoreBracketSurfaceSliceElemKey(typeNode)
+                if len(sliceElemKey) > 0:
+                    let sliceInst: str = uirCoreTypeKeySeqName(sliceElemKey)
+                    uirCoreLooseTypeKeyCachePut(typeNode, sliceInst)
+                    return sliceInst
+            if kidCount(typeNode) == 2:
+                let arg1: Node = kid(typeNode, 1)
+                var arg1KeyLoose: str = ""
+                if astNodeIdValid(arg1) && nodeKind(arg1) != nkEmpty:
+                    arg1KeyLoose = uirCoreTypeKeyFromNodeLoose(arg1)
+                    if len(arg1KeyLoose) == 0:
+                        arg1KeyLoose = backendStripSpaces(typeKey(arg1))
+                if len(arg1KeyLoose) > 0:
+                    let oneArgInst: str = (baseName == "seq_fixed") ? uirCoreTypeKeySeqName(arg1KeyLoose) : uirCoreJoinWithChar(baseName, '_', arg1KeyLoose)
+                    uirCoreLooseTypeKeyCachePut(typeNode, oneArgInst)
+                    return oneArgInst
+            var instArgs: Node[]
+            instArgs.cap = 4
+            for ai in 1..<kidCount(typeNode):
+                let arg: Node = kid(typeNode, ai)
+                if astNodeIdValid(arg) && nodeKind(arg) != nkEmpty:
+                    uir_core_builder_loose_type_key_helpers_add(instArgs, arg)
+            if instArgs.len > 0:
+                let instName: str = mangleInstance(baseName, instArgs)
+                if len(instName) > 0:
+                    uirCoreLooseTypeKeyCachePut(typeNode, instName)
+                    return instName
+    let key: str = backendStripSpaces(typeKey(typeNode))
+    if len(key) > 0 && !(key == "node"):
+        uirCoreLooseTypeKeyCachePut(typeNode, key)
+        return key
+    let nm: str = backendStripSpaces(plainName(typeNode))
+    if len(nm) > 0:
+        uirCoreLooseTypeKeyCachePut(typeNode, nm)
+        return nm
+    uirCoreLooseTypeKeyCachePut(typeNode, "")
+    return ""
+
+fn uirCoreLegacyGenericBracketCacheReset() =
+    let nextRound: int32 = uirCoreLegacyGenericBracketCacheRound + 1
+    if nextRound > 0:
+        uirCoreLegacyGenericBracketCacheRound = nextRound
+        return
+    uirCoreLegacyGenericBracketCacheRound = 1
+    uirCoreLegacyGenericBracketCacheEpoch.len = 0
+    uirCoreLegacyGenericBracketCacheVals.len = 0
+
+fn uirCoreLegacyGenericBracketCacheTryGet(n: Node, found: var bool): str =
+    found = false
+    if !astNodeIdValid(n):
+        return ""
+    let idx: int32 = n - 1
+    if idx < 0 || idx >= uirCoreLegacyGenericBracketCacheEpoch.len || idx >= uirCoreLegacyGenericBracketCacheVals.len:
+        return ""
+    if uirCoreLegacyGenericBracketCacheEpoch[idx] != uirCoreLegacyGenericBracketCacheRound:
+        return ""
+    found = true
+    return uirCoreLegacyGenericBracketCacheVals[idx]
+
+fn uirCoreLegacyGenericBracketCachePut(n: Node, key: str) =
+    if !astNodeIdValid(n):
+        return
+    let idx: int32 = n - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreLegacyGenericBracketCacheEpoch.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLegacyGenericBracketCacheEpoch, int32(0))
+    while idx >= uirCoreLegacyGenericBracketCacheVals.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLegacyGenericBracketCacheVals, "")
+    uirCoreLegacyGenericBracketCacheEpoch[idx] = uirCoreLegacyGenericBracketCacheRound
+    uirCoreLegacyGenericBracketCacheVals[idx] = key
+
+fn uirCoreLooseTypeKeyCacheReset() =
+    let nextRound: int32 = uirCoreLooseTypeKeyCacheRound + 1
+    if nextRound > 0:
+        uirCoreLooseTypeKeyCacheRound = nextRound
+        return
+    uirCoreLooseTypeKeyCacheRound = 1
+    uirCoreLooseTypeKeyCacheEpoch.len = 0
+    uirCoreLooseTypeKeyCacheVals.len = 0
+
+fn uirCoreLooseTypeKeyCacheTryGet(n: Node, found: var bool): str =
+    found = false
+    if !astNodeIdValid(n):
+        return ""
+    let idx: int32 = n - 1
+    if idx < 0 || idx >= uirCoreLooseTypeKeyCacheEpoch.len || idx >= uirCoreLooseTypeKeyCacheVals.len:
+        return ""
+    if uirCoreLooseTypeKeyCacheEpoch[idx] != uirCoreLooseTypeKeyCacheRound:
+        return ""
+    found = true
+    return uirCoreLooseTypeKeyCacheVals[idx]
+
+fn uirCoreLooseTypeKeyCachePut(n: Node, key: str) =
+    if !astNodeIdValid(n):
+        return
+    let idx: int32 = n - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreLooseTypeKeyCacheEpoch.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLooseTypeKeyCacheEpoch, int32(0))
+    while idx >= uirCoreLooseTypeKeyCacheVals.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLooseTypeKeyCacheVals, "")
+    uirCoreLooseTypeKeyCacheEpoch[idx] = uirCoreLooseTypeKeyCacheRound
+    uirCoreLooseTypeKeyCacheVals[idx] = key

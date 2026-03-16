@@ -1,0 +1,156 @@
+# Shared builder-local string/link-name helpers split from uir_core_builder.
+import std/system
+import std/rawmem_support
+import backend/uir/uir_internal/uir_core_builder_text_helpers
+
+@importc("driver_c_str_has_prefix")
+fn builder_string_c_str_has_prefix(s: str, prefix: str): int32
+
+fn backendIsSafeLinkName(name: str): bool =
+    if len(name) == 0:
+        return false
+    let n: int32 = len(name)
+    if n == 0:
+        return false
+    let c0: char = name[0]
+    let v0: int32 = int32(int64(c0) & 0xFF)
+    if ! ((v0 >= 65 && v0 <= 90) || (v0 >= 97 && v0 <= 122) || v0 == 95):
+        return false
+    for i in 0..<n:
+        let c: char = name[i]
+        let v: int32 = int32(int64(c) & 0xFF)
+        if (v >= 65 && v <= 90) || (v >= 97 && v <= 122) ||
+           (v >= 48 && v <= 57) || v == 95:
+            continue
+        return false
+    return true
+
+fn backendHexDigitLower(v: int32): char =
+    if v < 10:
+        return char(int8(48 + v))
+    return char(int8(97 + (v - 10)))
+
+fn backendHexByteLower(v: int32): str =
+    let hi: int32 = (v / 16) & 15
+    let lo: int32 = v & 15
+    return charToStr(backendHexDigitLower(hi)) + charToStr(backendHexDigitLower(lo))
+
+fn backendSanitizeLinkName(raw: str): str =
+    if len(raw) == 0:
+        return ""
+    let name: str = backendStripSpaces(raw)
+    if backendIsSafeLinkName(name):
+        return name
+    if len(name) == 0:
+        return "__cheng_anon"
+    let nameLen: int32 = len(name)
+    if nameLen == 0:
+        return "__cheng_anon"
+    let prefix: str = "__cheng_sym"
+    let prefixLen: int32 = len(prefix)
+    let out: str = newStringAlloc(prefixLen + (nameLen * 3))
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return "__cheng_anon"
+    rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(prefix), prefixLen)
+    var writePos: int32 = prefixLen
+    for i in 0..<nameLen:
+        let c: char = name[i]
+        let v: int32 = int32(int64(c) & 0xFF)
+        rawmemWriteChar(outPtr, writePos, '_')
+        rawmemWriteChar(outPtr, writePos + 1, backendHexDigitLower((v / 16) & 15))
+        rawmemWriteChar(outPtr, writePos + 2, backendHexDigitLower(v & 15))
+        writePos = writePos + 3
+    return out
+
+fn uirCoreStrStartsWith(s: str, prefix: str): bool =
+    return builder_string_c_str_has_prefix(s, prefix) != 0
+
+fn uirCoreStripLeadingUnderscores(raw: str): str =
+    if len(raw) == 0:
+        return ""
+    let n: int32 = len(raw)
+    if n <= 0:
+        return ""
+    var i: int32 = 0
+    while i < n && raw[i] == '_':
+        i = i + 1
+    if i <= 0:
+        return raw
+    if i >= n:
+        return ""
+    return rawmemStrFromOffset(raw, i)
+
+fn uirCoreStrFindFrom(text: str, pat: str, start: int32 = 0): int32 =
+    let n: int32 = len(text)
+    let m: int32 = len(pat)
+    if m <= 0:
+        return start <= n ? start : -1
+    if n <= 0 || start < 0 || start >= n || m > n:
+        return -1
+    let last: int32 = n - m
+    var i: int32 = start
+    while i <= last:
+        var ok: bool = true
+        for j in 0..<m:
+            if text[i + j] != pat[j]:
+                ok = false
+                break
+        if ok:
+            return i
+        i = i + 1
+    return -1
+
+fn uirCoreStrIndexOf(s: str, sub: str): int32 =
+    let n: int32 = len(s)
+    let m: int32 = len(sub)
+    if m == 0:
+        return 0
+    if n == 0:
+        return -1
+    if m > n:
+        return -1
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(s[i + j] == sub[j]):
+                break
+        if j == m:
+            return i
+    return -1
+
+fn uirCoreStrTake(s: str, count: int32): str =
+    if len(s) == 0 || count <= 0:
+        return ""
+    let n: int32 = len(s)
+    var k: int32 = count
+    if k > n:
+        k = n
+    let out: str = newStringOfCap(k)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    if k > 0:
+        rawmemCopy(outPtr, s, k)
+    rawmemSet(rawmemPtrAdd(outPtr, k), 0, 1)
+    return out
+
+fn uirCoreStrSliceRange(s: str, start0: int32, end0: int32): str =
+    if len(s) == 0:
+        return ""
+    let n: int32 = len(s)
+    var start: int32 = start0
+    var endIdx: int32 = end0
+    if start < 0:
+        start = 0
+    if endIdx >= n:
+        endIdx = n - 1
+    if start > endIdx:
+        return ""
+    let outLen: int32 = endIdx - start + 1
+    let out: str = newStringOfCap(outLen)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    rawmemCopy(outPtr, rawmemPtrAdd(rawmemAsVoid(s), start), outLen)
+    rawmemSet(rawmemPtrAdd(outPtr, outLen), 0, 1)
+    return out

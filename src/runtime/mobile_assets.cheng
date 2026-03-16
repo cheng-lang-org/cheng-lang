@@ -1,0 +1,90 @@
+import std/os
+import std/strutils
+import std/tables
+
+type
+    MobileAssetIndex =
+        root: str
+        manifestPath: str
+        manifestText: str
+        assets: Table[str, int32]
+
+when defined(android) || defined(ios) || defined(mobile_host):
+    @importc("cheng_mobile_host_default_resource_root")
+    fn cheng_mobile_host_default_resource_root(): str
+else:
+    @weak
+    fn cheng_mobile_host_default_resource_root(): str =
+        return ""
+
+fn mobileAssetsResolveRoot(root: str): str =
+    if root != nil && c_strlen(root) > 0:
+        return root
+    let hostRoot: str = cheng_mobile_host_default_resource_root()
+    if hostRoot != nil && c_strlen(hostRoot) > 0:
+        return hostRoot
+    return root
+
+fn mobileAssetsPath(index: MobileAssetIndex, path: str): str =
+    if len(index.root) == 0:
+        return path
+    if len(path) == 0:
+        return index.root
+    return joinPath(index.root, path)
+
+fn mobileAssetsParse(index: MobileAssetIndex*, manifestText: str) =
+    if index == nil:
+        return
+    index->assets = initTable[str, int32]()
+    let lines = split(manifestText, '\n')
+    for i in 0..<len(lines):
+        let line = strip(lines[i])
+        if len(line) == 0:
+            continue
+        if line[0] == '#':
+            continue
+        let parts = split(line, '\t')
+        if len(parts) >= 2:
+            let sizeVal = parseInt(parts[1])
+            index->assets[parts[0]] = int32(sizeVal)
+    index->manifestText = manifestText
+
+fn mobileAssetsReload(index: MobileAssetIndex*): bool =
+    if index == nil:
+        return false
+    let f = openRead(index->manifestPath)
+    if f == nil:
+        return false
+    let text = readAll(f)
+    close(f)
+    if (text ==  index->manifestText):
+        return false
+    mobileAssetsParse(index, text)
+    return true
+
+fn mobileAssetsInit(root: str): MobileAssetIndex =
+    var out: MobileAssetIndex
+    out.root = mobileAssetsResolveRoot(root)
+    if len(out.root) == 0:
+        out.manifestPath = "assets_manifest.txt"
+    else:
+        out.manifestPath = joinPath(out.root, "assets_manifest.txt")
+    out.manifestText = ""
+    out.assets = initTable[str, int32]()
+    mobileAssetsReload(&out)
+    return out
+
+fn mobileAssetsHas(index: MobileAssetIndex, path: str): bool =
+    return TableHas(index.assets, path)
+
+fn mobileAssetsSize(index: MobileAssetIndex, path: str): int32 =
+    return TableGet(index.assets, path)
+
+fn mobileAssetsRead(index: MobileAssetIndex, path: str): str =
+    let fullPath = mobileAssetsPath(index, path)
+    let f = openRead(fullPath)
+    if f == nil:
+        return ""
+    let text = readAll(f)
+    close(f)
+    return text

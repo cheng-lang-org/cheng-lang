@@ -1,0 +1,291 @@
+# Minimal protobuf helpers(varint + length-delimited).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/varint
+type
+    ProtoFieldKind = enum
+        Varint = 0
+        Length = 2
+
+    ProtoResult[T] = Result[T]
+
+    ProtoHeader =
+        field: int64
+        wire: int64
+        next: int32
+
+    ProtoBuffer =
+        data: Bytes
+        offset: int32
+        out: ByteBuffer
+        writing: bool
+
+const
+    maxRepeatedBytes = 32
+
+type
+    RepeatedBytes =
+        items: Bytes[maxRepeatedBytes]
+        count: int32
+
+fn initRepeatedBytes(): RepeatedBytes =
+    var out: RepeatedBytes
+    out.count = 0
+    return out
+
+fn initProtoBuffer(): ProtoBuffer =
+    var out: ProtoBuffer
+    out.data = emptyBytes()
+    out.offset = 0
+    out.out = newByteBuffer()
+    out.writing = true
+    return out
+
+fn initProtoBuffer(data: Bytes, offset: int32): ProtoBuffer =
+    var out: ProtoBuffer
+    out.data = data
+    out.offset = offset
+    out.out = newByteBuffer()
+    out.writing = false
+    return out
+
+fn protoToBytes(pb: ProtoBuffer): Bytes =
+    if pb.writing:
+        return toBytes(pb.out)
+    return pb.data
+
+fn makeHeader(field: int32, wire: ProtoFieldKind): int64 =
+    (int64(field) << 3) | int64(wire)
+
+fn writeFieldHeader(pb: var ProtoBuffer, field: int32, wire: ProtoFieldKind) =
+    appendBytes(pb.out, encodeUVarint(makeHeader(field, wire)))
+
+fn writeVarint(pb: var ProtoBuffer, field: int32, value: int64) =
+    if ! pb.writing:
+        pb.writing = true
+    writeFieldHeader(pb, field, Varint)
+    appendBytes(pb.out, encodeUVarint(value))
+
+fn writeBytes(pb: var ProtoBuffer, field: int32, value: Bytes) =
+    if ! pb.writing:
+        pb.writing = true
+    writeFieldHeader(pb, field, Length)
+    appendBytes(pb.out, encodeUVarint(bytesLen(value)))
+    appendBytes(pb.out, value)
+
+fn writeString(pb: var ProtoBuffer, field: int32, value: str) =
+    if ! pb.writing:
+        pb.writing = true
+    writeFieldHeader(pb, field, Length)
+    let src: Bytes = bytesFromString(value)
+    let srcLen: int32 = bytesLen(src)
+    appendBytes(pb.out, encodeUVarint(srcLen))
+    appendBytes(pb.out, src)
+
+fn readHeader(data: Bytes, idx: int32): Result[ProtoHeader] =
+    let tagRes: Result[VarintDecoded] = decodeUVarint(data, idx)
+    if IsErr(tagRes):
+        return Err[ProtoHeader](Error(tagRes))
+    let tag: VarintDecoded = Value(tagRes)
+    let wire: int64 = tag.value & 7
+    let field: int64 = tag.value >> 3
+    return Ok[ProtoHeader](ProtoHeader(field: field, wire: wire, next: tag.next))
+
+fn getField(pb: ProtoBuffer, field: int32, output: var Bytes): Result[bool] =
+    var idx: int32 = pb.offset
+    while idx < bytesLen(pb.data):
+        let headerRes = readHeader(pb.data, idx)
+        if ! headerRes.ok:
+            return ErrInfo[bool](headerRes.err)
+        let header: ProtoHeader = headerRes.value
+        idx = header.next
+        if header.field == int64(field):
+            if header.wire != int64(Length):
+                return Err[bool]("protobuf: expected length field")
+            let lenRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(lenRes):
+                return Err[bool](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            let size: int32 = int32(lenDec.value)
+            idx = lenDec.next
+            if size < 0 || idx + size > bytesLen(pb.data):
+                return Err[bool]("protobuf: length out of range")
+            output = bytesSlice(pb.data, idx, size)
+            return Ok[bool](true)
+        if header.wire == int64(Varint):
+            let skipRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(skipRes):
+                return Err[bool](Error(skipRes))
+            let skipDec: VarintDecoded = Value(skipRes)
+            idx = skipDec.next
+        elif header.wire == int64(Length):
+            let lenRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(lenRes):
+                return Err[bool](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            let size: int32 = int32(lenDec.value)
+            idx = lenDec.next + size
+            if size < 0 || idx > bytesLen(pb.data):
+                return Err[bool]("protobuf: length out of range")
+        else:
+            return Err[bool]("protobuf: unsupported wire type")
+    return Ok[bool](false)
+
+fn getField(pb: ProtoBuffer, field: int32, output: var int64): Result[bool] =
+    var idx: int32 = pb.offset
+    while idx < bytesLen(pb.data):
+        let headerRes = readHeader(pb.data, idx)
+        if ! headerRes.ok:
+            return ErrInfo[bool](headerRes.err)
+        let header: ProtoHeader = headerRes.value
+        idx = header.next
+        if header.field == int64(field):
+            if header.wire != int64(Varint):
+                return Err[bool]("protobuf: expected varint field")
+            let valRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(valRes):
+                return Err[bool](Error(valRes))
+            let valDec: VarintDecoded = Value(valRes)
+            output = valDec.value
+            return Ok[bool](true)
+        if header.wire == int64(Varint):
+            let skipRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(skipRes):
+                return Err[bool](Error(skipRes))
+            let skipDec: VarintDecoded = Value(skipRes)
+            idx = skipDec.next
+        elif header.wire == int64(Length):
+            let lenRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(lenRes):
+                return Err[bool](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            let size: int32 = int32(lenDec.value)
+            idx = lenDec.next + size
+            if size < 0 || idx > bytesLen(pb.data):
+                return Err[bool]("protobuf: length out of range")
+        else:
+            return Err[bool]("protobuf: unsupported wire type")
+    return Ok[bool](false)
+
+fn getField(pb: ProtoBuffer, field: int32, output: var str): ProtoResult[bool] =
+    var idx: int32 = pb.offset
+    while idx < bytesLen(pb.data):
+        let headerRes = readHeader(pb.data, idx)
+        if ! headerRes.ok:
+            return ErrInfo[bool](headerRes.err)
+        let header: ProtoHeader = headerRes.value
+        idx = header.next
+        if header.field == int64(field):
+            if header.wire != int64(Length):
+                return Err[bool]("protobuf: expected length field")
+            let lenRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(lenRes):
+                return Err[bool](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            let size: int32 = int32(lenDec.value)
+            idx = lenDec.next
+            if size < 0 || idx + size > bytesLen(pb.data):
+                return Err[bool]("protobuf: length out of range")
+            output = bytesToString(bytesSlice(pb.data, idx, size))
+            return Ok[bool](true)
+        if header.wire == int64(Varint):
+            let skipRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(skipRes):
+                return Err[bool](Error(skipRes))
+            let skipDec: VarintDecoded = Value(skipRes)
+            idx = skipDec.next
+        elif header.wire == int64(Length):
+            let lenRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(lenRes):
+                return Err[bool](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            let size: int32 = int32(lenDec.value)
+            idx = lenDec.next + size
+            if size < 0 || idx > bytesLen(pb.data):
+                return Err[bool]("protobuf: length out of range")
+        else:
+            return Err[bool]("protobuf: unsupported wire type")
+    return Ok[bool](false)
+
+fn getField(pb: ProtoBuffer, field: int32, output: var ProtoBuffer): ProtoResult[bool] =
+    var bytesOut: Bytes = emptyBytes()
+    let res: Result[bool] = getField(pb, field, bytesOut)
+    if IsErr(res):
+        return Err[bool](Error(res))
+    if ! Value(res):
+        return Ok[bool](false)
+    output = initProtoBuffer(bytesOut, 0)
+    return Ok[bool](true)
+
+fn getRequiredField(pb: ProtoBuffer, field: int32, output: var Bytes): ProtoResult[bool] =
+    let res: Result[bool] = getField(pb, field, output)
+    if IsErr(res):
+        return Err[bool](Error(res))
+    if ! Value(res):
+        return Err[bool]("protobuf: required field missing")
+    return Ok[bool](true)
+
+fn getRequiredField(pb: ProtoBuffer, field: int32, output: var int64): ProtoResult[bool] =
+    let res: Result[bool] = getField(pb, field, output)
+    if IsErr(res):
+        return Err[bool](Error(res))
+    if ! Value(res):
+        return Err[bool]("protobuf: required field missing")
+    return Ok[bool](true)
+
+fn getRequiredField(pb: ProtoBuffer, field: int32, output: var str): ProtoResult[bool] =
+    let res: Result[bool] = getField(pb, field, output)
+    if IsErr(res):
+        return Err[bool](Error(res))
+    if ! Value(res):
+        return Err[bool]("protobuf: required field missing")
+    return Ok[bool](true)
+
+fn getRepeatedField(pb: ProtoBuffer, field: int32, output: var RepeatedBytes): ProtoResult[bool] =
+    output.count = 0
+    var idx: int32 = pb.offset
+    var found: bool = false
+    while idx < bytesLen(pb.data):
+        let headerRes = readHeader(pb.data, idx)
+        if ! headerRes.ok:
+            return ErrInfo[bool](headerRes.err)
+        let header: ProtoHeader = headerRes.value
+        idx = header.next
+        if header.field == int64(field):
+            if header.wire != int64(Length):
+                return Err[bool]("protobuf: expected length field")
+            let lenRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(lenRes):
+                return Err[bool](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            let size: int32 = int32(lenDec.value)
+            idx = lenDec.next
+            if size < 0 || idx + size > bytesLen(pb.data):
+                return Err[bool]("protobuf: length out of range")
+            if output.count >= maxRepeatedBytes:
+                return Err[bool]("protobuf: repeated field overflow")
+            output.items[output.count] = bytesSlice(pb.data, idx, size)
+            output.count = output.count + 1
+            found = true
+            idx = idx + size
+            continue
+        if header.wire == int64(Varint):
+            let skipRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(skipRes):
+                return Err[bool](Error(skipRes))
+            let skipDec: VarintDecoded = Value(skipRes)
+            idx = skipDec.next
+        elif header.wire == int64(Length):
+            let lenRes: Result[VarintDecoded] = decodeUVarint(pb.data, idx)
+            if IsErr(lenRes):
+                return Err[bool](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            let size: int32 = int32(lenDec.value)
+            idx = lenDec.next + size
+            if size < 0 || idx > bytesLen(pb.data):
+                return Err[bool]("protobuf: length out of range")
+        else:
+            return Err[bool]("protobuf: unsupported wire type")
+    return Ok[bool](found)

@@ -1,0 +1,819 @@
+# Shared builder-local overload inference and call resolution helpers split from uir_core_builder.
+import std/result
+import std/seqs
+import std/rawmem_support
+import stage1/ast
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_scope_helpers
+import backend/uir/uir_internal/uir_core_builder_text_helpers
+import backend/uir/uir_internal/uir_core_builder_string_utils
+import backend/uir/uir_internal/uir_core_builder_scalar_key_helpers
+import backend/uir/uir_internal/uir_core_builder_obj_local_state
+import backend/uir/uir_internal/uir_core_builder_module_lookup_cache
+import backend/uir/uir_internal/uir_core_builder_name_base_unique_cache
+import backend/uir/uir_internal/uir_core_builder_callee_candidate_cache
+import backend/uir/uir_internal/uir_core_builder_import_direct_cache
+import backend/uir/uir_internal/uir_core_builder_type_query_helpers
+import backend/uir/uir_internal/uir_core_builder_symbol_state
+
+fn uir_core_builder_call_resolution_add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+fn uir_core_builder_call_resolution_add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+var
+    uirCoreOverloadInferCacheEpoch: int32[]
+    uirCoreOverloadInferCacheVals: str[]
+    uirCoreOverloadInferCacheRound: int32 = 1
+
+fn seqContainsStr(xs: str[], s: str): bool =
+    if len(s) == 0 || xs.buffer == nil:
+        return false
+    for i in 0..<xs.len:
+        if (xs[i] == s):
+            return true
+    return false
+
+fn uirCoreTypeKeyIsVarargs(typeKey: str): bool =
+    if len(typeKey) == 0:
+        return false
+    if (typeKey == "varargs"):
+        return true
+    return uirCoreStrStartsWith(typeKey, "varargs_")
+
+fn uirCoreOverloadInferCacheReset() =
+    let nextRound: int32 = uirCoreOverloadInferCacheRound + 1
+    if nextRound > 0:
+        uirCoreOverloadInferCacheRound = nextRound
+        return
+    # Epoch rollover: clear stamp/value arrays so old entries cannot leak across modules.
+    uirCoreOverloadInferCacheRound = 1
+    uirCoreOverloadInferCacheEpoch.len = 0
+    uirCoreOverloadInferCacheVals.len = 0
+
+fn uirCoreOverloadInferCacheTryGet(n: Node, found: var bool): str =
+    found = false
+    if !astNodeIdValid(n):
+        return ""
+    let idx: int32 = n - 1
+    if idx < 0 || idx >= uirCoreOverloadInferCacheEpoch.len || idx >= uirCoreOverloadInferCacheVals.len:
+        return ""
+    if uirCoreOverloadInferCacheEpoch[idx] != uirCoreOverloadInferCacheRound:
+        return ""
+    found = true
+    return uirCoreOverloadInferCacheVals[idx]
+
+fn uirCoreOverloadInferCachePut(n: Node, key: str) =
+    if !astNodeIdValid(n):
+        return
+    let idx: int32 = n - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreOverloadInferCacheEpoch.len:
+        uir_core_builder_call_resolution_add(uirCoreOverloadInferCacheEpoch, int32(0))
+    while idx >= uirCoreOverloadInferCacheVals.len:
+        uir_core_builder_call_resolution_add(uirCoreOverloadInferCacheVals, "")
+    uirCoreOverloadInferCacheEpoch[idx] = uirCoreOverloadInferCacheRound
+    uirCoreOverloadInferCacheVals[idx] = key
+
+fn uirCoreInferNodeTypeKeyForOverload(b: BlockBuilder, n0: Node): str =
+    if b == nil:
+        return ""
+    var n: Node = n0
+    while astNodeIdValid(n) && nodeKind(n) == nkPar && kidCount(n) > 0:
+        n = kid(n, 0)
+    if n == nil:
+        return ""
+    var foundCached: bool = false
+    let cached: str = uirCoreOverloadInferCacheTryGet(n, foundCached)
+    if foundCached:
+        return cached
+    let out: str = uirCoreInferNodeTypeKeyForOverloadUncached(b, n)
+    uirCoreOverloadInferCachePut(n, out)
+    return out
+
+fn uirCoreInferNodeTypeKeyForOverloadUncached(b: BlockBuilder, n0: Node): str =
+    if (b == nil):
+        return ""
+    var n: Node = n0
+    while astNodeIdValid(n) && nodeKind(n) == nkPar && kidCount(n) > 0:
+        n = kid(n, 0)
+    if (n == nil):
+        return ""
+    if nodeTypeCacheValid(n) && astRefNonNil(nodeTypeCache(n)):
+        return typeKey nodeTypeCache(n)
+    if uirCoreNodeIsStringLiteral(n):
+        return "str"
+    if nodeKind(n) == nkFloatLit:
+        return "float64"
+    if nodeKind(n) == nkBoolLit:
+        return "bool"
+    if nodeKind(n) == nkCharLit:
+        return "char"
+    if nodeKind(n) == nkIntLit:
+        return "NI"
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
+        let nm: str = plainName(n)
+        let slot0: int32 = uirCoreResolveLocalSlotOrImplicitResult(b.env, b.func, nm)
+        if slot0 >= 0:
+            if uirCoreFuncIdValid(b.func) && funcFindObjLocal(b.func, slot0) >= 0:
+                let ok0: str = funcObjTypeKey(b.func, slot0)
+                if len(ok0) > 0:
+                    return ok0
+            let lk0: str = localTypeKey(b.env, slot0)
+            if len(lk0) > 0:
+                return lk0
+        if uirCoreDupGlobalNamesHas(nm) && uirCoreFuncIdValid(b.func):
+            let f0: UirCoreFunc = b.func
+            let sym0: str = uirCoreMaybeMangleDupGlobalName(nm, uirCoreFuncOriginFileOf(f0))
+            let gk1: str = uirCoreGlobalTypeKeyGet(sym0)
+            if len(gk1) > 0:
+                return gk1
+        let gk0: str = uirCoreGlobalTypeKeyByBaseUnique(b.module, nm)
+        if len(gk0) > 0:
+            return gk0
+    if nodeKind(n) == nkCall && kidCount(n) > 0:
+        let calleeNode: Node = kid(n, 0)
+        if (calleeNode != nil) && (nodeKind(calleeNode) == nkIdent || nodeKind(calleeNode) == nkSymbol):
+            var tn: str = backendStripSpaces(plainName(calleeNode))
+            if (tn == "string"):
+                tn = "str"
+            elif (tn == "int"):
+                tn = "NI"
+            elif (tn == "uint"):
+                tn = "NU"
+            elif (tn == "i64"):
+                tn = "int64"
+            elif (tn == "u64"):
+                tn = "uint64"
+            elif (tn == "i32"):
+                tn = "int32"
+            elif (tn == "u32"):
+                tn = "uint32"
+            elif (tn == "i16"):
+                tn = "int16"
+            elif (tn == "u16"):
+                tn = "uint16"
+            elif (tn == "i8"):
+                tn = "int8"
+            elif (tn == "u8"):
+                tn = "uint8"
+            if tn == "int64" || tn == "uint64" || tn == "NI" || tn == "NU" ||
+               tn == "int32" || tn == "uint32" ||
+               tn == "int16" || tn == "uint16" ||
+               tn == "int8" || tn == "uint8" ||
+               tn == "bool" || tn == "char" || isStringKey(tn):
+                return tn
+            if isPtrKey(tn):
+                return "ptr"
+    if nodeKind(n) == nkCall && b.module != nil && kidCount(n) > 0:
+        let calleeNode: Node = kid(n, 0)
+        var name: str = ""
+        var typeArgs: Node[]
+        if astNodeIdValid(calleeNode) && nodeKind(calleeNode) == nkBracketExpr && kidCount(calleeNode) > 0:
+            let base: Node = kid(calleeNode, 0)
+            name = backendStripSpaces(plainName(base))
+            for ti in 1..<kidCount(calleeNode):
+                let t: Node = kid(calleeNode, ti)
+                if astNodeIdValid(t) && nodeKind(t) != nkEmpty:
+                    astNodeSeqAppend(typeArgs, t)
+        else:
+            name = backendStripSpaces(plainName(calleeNode))
+        var callName: str = name
+        if typeArgs.len > 0:
+            callName = mangleInstance(name, typeArgs)
+        var argNodes: Node[]
+        for ai in 1..<kidCount(n):
+            var argNode: Node = kid(n, ai)
+            if astNodeIdValid(argNode) && nodeKind(argNode) == nkCallArg && kidCount(argNode) > 1:
+                argNode = kid(argNode, 1)
+            astNodeSeqAppend(argNodes, argNode)
+        let callee0: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, callName, argNodes, "")
+        if (callee0 != nil):
+            if uirCoreFuncParamsLen(callee0) > 0:
+                let p0: UirCoreParam = uirCoreFuncParamAt(callee0, 0)
+                if (p0.name == "__ret"):
+                    return funcObjTypeKey(callee0, p0.slot)
+            if len(uirCoreFuncRetTypeKeyOf(callee0)) > 0:
+                return uirCoreFuncRetTypeKeyOf(callee0)
+    if nodeKind(n) == nkInfix && kidCount(n) >= 3:
+        let opNode: Node = kid(n, 0)
+        let op: str = backendOpName(opNode)
+        let lhsNode: Node = kid(n, 1)
+        let rhsNode: Node = kid(n, 2)
+        let lk: str = uirCoreInferNodeTypeKeyForOverload(b, lhsNode)
+        let rk: str = uirCoreInferNodeTypeKeyForOverload(b, rhsNode)
+        if op == "+":
+            if uirCoreNodeHasSemanticStrCtx(lk, lhsNode) || uirCoreNodeHasSemanticStrCtx(rk, rhsNode):
+                return "str"
+        if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=":
+            return "bool"
+        if len(lk) > 0 && (len(rk) == 0):
+            return lk
+        if len(rk) > 0 && (len(lk) == 0):
+            return rk
+        if len(lk) > 0 && len(rk) > 0:
+            if (lk == rk):
+                return lk
+            if ((lk == "int") || (lk == "NI")) &&
+               ((rk == "int8") || (rk == "int16") || (rk == "int32") || (rk == "int64")):
+                return rk
+            if ((rk == "int") || (rk == "NI")) &&
+               ((lk == "int8") || (lk == "int16") || (lk == "int32") || (lk == "int64")):
+                return lk
+            if ((lk == "uint") || (lk == "NU")) &&
+               ((rk == "uint8") || (rk == "uint16") || (rk == "uint32") || (rk == "uint64")):
+                return rk
+            if ((rk == "uint") || (rk == "NU")) &&
+               ((lk == "uint8") || (lk == "uint16") || (lk == "uint32") || (lk == "uint64")):
+                return lk
+    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
+        let nm: str = plainName(n)
+        let slot0: int32 = uirCoreResolveLocalSlotOrImplicitResult(b.env, b.func, nm)
+        if slot0 >= 0 && funcFindObjLocal(b.func, slot0) >= 0:
+            return funcObjTypeKey(b.func, slot0)
+        if slot0 >= 0:
+            return localTypeKey(b.env, slot0)
+        let gObj: str = uirCoreGlobalObjTypeGet(nm)
+        if len(gObj) > 0:
+            return gObj
+    if nodeKind(n) == nkBracketExpr && kidCount(n) > 0:
+        let base0: Node = kid(n, 0)
+        if kidCount(n) > 1:
+            var idx0: Node = kid(n, 1)
+            while astNodeIdValid(idx0) && nodeKind(idx0) == nkPar && kidCount(idx0) > 0:
+                idx0 = kid(idx0, 0)
+            if astNodeIdValid(idx0) && nodeKind(idx0) == nkInfix && kidCount(idx0) >= 3:
+                let opNode: Node = kid(idx0, 0)
+                let op: str = backendOpName(opNode)
+                if op == ".." || op == "..<":
+                    return uirCoreInferNodeTypeKeyForOverload(b, base0)
+        var baseKey0: str = uirCoreInferNodeTypeKeyForOverload(b, base0)
+        let seqKey0: str = uirCoreSeqLikeKeyFromExpr(b, base0)
+        if len(seqKey0) > 0:
+            baseKey0 = seqKey0
+        if len(baseKey0) > 0:
+            if uirCoreStrStartsWith(baseKey0, "seq_"):
+                return str(rawmemPtrAdd(rawmemAsVoid(baseKey0), 4))
+            if uirCoreStrStartsWith(baseKey0, "seq_fixed_"):
+                return str(rawmemPtrAdd(rawmemAsVoid(baseKey0), 10))
+            if uirCoreStrStartsWith(baseKey0, "Table_"):
+                return str(rawmemPtrAdd(rawmemAsVoid(baseKey0), 6))
+            if uirCoreStrStartsWith(baseKey0, "array_") && b.module != nil:
+                for i0 in 6..<len(baseKey0):
+                    if baseKey0[i0] == '_':
+                        let suffix: str = str(rawmemPtrAdd(rawmemAsVoid(baseKey0), i0 + 1))
+                        if len(suffix) > 0:
+                            if isBuiltinTypeName(suffix) || uirCoreHasObjType(b.module, suffix) ||
+                               uirCoreStrStartsWith(suffix, "seq_") || uirCoreStrStartsWith(suffix, "seq_fixed_") ||
+                               uirCoreStrStartsWith(suffix, "Table_"):
+                                return suffix
+    if nodeKind(n) == nkDotExpr && b.module != nil && uirCoreFuncIdValid(b.func):
+        let dbgOverDot: bool = (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1")
+        if kidCount(n) == 2:
+            let base0: Node = kid(n, 0)
+            let field0: Node = kid(n, 1)
+            if (base0 != nil) && (nodeKind(base0) == nkIdent || nodeKind(base0) == nkSymbol) &&
+               (field0 != nil) && (nodeKind(field0) == nkIdent || nodeKind(field0) == nkSymbol):
+                let baseName0: str = plainName(base0)
+                let slot1: int32 = uirCoreResolveLocalSlotOrImplicitResult(b.env, b.func, baseName0)
+                if dbgOverDot:
+                    let lk0: str = (slot1 >= 0) ? localTypeKey(b.env, slot1) : ""
+                    let fok0: str = (slot1 >= 0) ? funcObjTypeKey(b.func, slot1) : ""
+                    let fon0: str = (slot1 >= 0) ? funcObjTypeName(b.func, slot1) : ""
+                    echo("[backend] debugOverloadDot: base='" + baseName0 + "' slot=" + intToStr(slot1) +
+                         " localKey='" + lk0 + "' funcObjKey='" + fok0 + "' funcObjName='" + fon0 + "'")
+                if slot1 >= 0:
+                    let parentObj: str = funcObjTypeName(b.func, slot1)
+                    if len(parentObj) > 0:
+                        let ot0: UirCoreObjType = uirCoreGetObjType(b.module, parentObj)
+                        let fieldName0: str = backendStripSpaces(plainName(field0))
+                        var prefix: str = "."
+                        let fieldLen0: int32 = len(fieldName0)
+                        if fieldLen0 > 0:
+                            let prefix0: str = newStringAlloc(fieldLen0 + 1)
+                            let prefixPtr0: ptr = rawmemAsVoid(prefix0)
+                            if prefixPtr0 != nil:
+                                rawmem_support.rawmemCopy(prefixPtr0, rawmemAsVoid(fieldName0), fieldLen0)
+                                rawmemWriteChar(prefixPtr0, fieldLen0, '.')
+                                prefix = prefix0
+                        var baseOff: int32 = -1
+                        for fi0 in 0..<ot0.fields.len:
+                            let f0: UirCoreObjField = ot0.fields[fi0]
+                            if uirCoreStrStartsWith(f0.name, prefix):
+                                if baseOff < 0 || f0.offset < baseOff:
+                                    baseOff = f0.offset
+                        if baseOff >= 0:
+                            let objKey0: str = inferInlineObjFieldTypeName(b.module, ot0, fieldName0, baseOff)
+                            if len(objKey0) > 0:
+                                if dbgOverDot:
+                                    echo("[backend] debugOverloadDot: direct parentObj='" + parentObj +
+                                         "' field='" + fieldName0 + "' objKey='" + objKey0 + "'")
+                                return objKey0
+            if (field0 != nil) && (nodeKind(field0) == nkIdent || nodeKind(field0) == nkSymbol):
+                let fieldName1: str = backendStripSpaces(plainName(field0))
+                let baseKey1: str = uirCoreInferNodeTypeKeyForOverload(b, base0)
+                if len(baseKey1) > 0:
+                    let key: str = uirCoreNormalizeObjLookupKey(b.module, baseKey1)
+                    let parentObj2: str = uirCorePtrBaseObjTypeName(b.module, key)
+                    if dbgOverDot:
+                        echo("[backend] debugOverloadDot: fallback field='" + fieldName1 + "' baseKey='" + baseKey1 +
+                             "' stripped='" + key + "' parentObj2='" + parentObj2 + "'")
+                    if len(parentObj2) > 0:
+                        let ot1: UirCoreObjType = uirCoreGetObjType(b.module, parentObj2)
+                        var prefix1: str = "."
+                        let fieldLen1: int32 = len(fieldName1)
+                        if fieldLen1 > 0:
+                            let prefix1Alloc: str = newStringAlloc(fieldLen1 + 1)
+                            let prefix1Ptr: ptr = rawmemAsVoid(prefix1Alloc)
+                            if prefix1Ptr != nil:
+                                rawmem_support.rawmemCopy(prefix1Ptr, rawmemAsVoid(fieldName1), fieldLen1)
+                                rawmemWriteChar(prefix1Ptr, fieldLen1, '.')
+                                prefix1 = prefix1Alloc
+                        var baseOff1: int32 = -1
+                        for fi1 in 0..<ot1.fields.len:
+                            let f1: UirCoreObjField = ot1.fields[fi1]
+                            if uirCoreStrStartsWith(f1.name, prefix1):
+                                if baseOff1 < 0 || f1.offset < baseOff1:
+                                    baseOff1 = f1.offset
+                        if baseOff1 >= 0:
+                            let objKey1: str = inferInlineObjFieldTypeName(b.module, ot1, fieldName1, baseOff1)
+                            if len(objKey1) > 0:
+                                if dbgOverDot:
+                                    echo("[backend] debugOverloadDot: fallback resolved objKey='" + objKey1 + "'")
+                                return objKey1
+        let dk: str = caseInferExprTypeKey(b, n)
+        if dbgOverDot:
+            echo("[backend] debugOverloadDot: caseInfer key='" + dk + "'")
+        if len(dk) > 0:
+            return dk
+        let t: UirCoreType = inferExprTypeWithGlobals(b.env, b.module, b.func, n, uirCoreTypeI32())
+        if t.kind == mtI64:
+            return t.isUnsigned ? "uint64" : "int64"
+        if t.kind == mtI32:
+            return t.isUnsigned ? "uint32" : "int32"
+        if t.kind == mtF64:
+            return "float64"
+        if t.kind == mtF32:
+            return "float32"
+    return ""
+
+fn uirCoreSeqLikeKeyFromExpr(b: BlockBuilder, n0: Node): str =
+    if (b == nil):
+        return ""
+    var seqKey: str = uirCoreStripRefVarKeyOnce(uirCoreInferNodeTypeKeyForOverload(b, n0))
+    seqKey = uirCoreStripPtrKeyOnce(seqKey)
+    if uirCoreStrStartsWith(seqKey, "seq_") || uirCoreStrStartsWith(seqKey, "seq_fixed_"):
+        return seqKey
+    if len(seqKey) > 2 && (seqKey[len(seqKey) - 2] == '[') && (seqKey[len(seqKey) - 1] == ']'):
+        let elemKey0: str = uirCoreStrTake(seqKey, len(seqKey) - 2)
+        if len(elemKey0) > 0:
+            return uirCoreTypeKeySeqName(elemKey0)
+    seqKey = uirCoreStripRefVarKeyOnce(caseInferExprTypeKey(b, n0))
+    seqKey = uirCoreStripPtrKeyOnce(seqKey)
+    if uirCoreStrStartsWith(seqKey, "seq_") || uirCoreStrStartsWith(seqKey, "seq_fixed_"):
+        return seqKey
+    if len(seqKey) > 2 && (seqKey[len(seqKey) - 2] == '[') && (seqKey[len(seqKey) - 1] == ']'):
+        let elemKey1: str = uirCoreStrTake(seqKey, len(seqKey) - 2)
+        if len(elemKey1) > 0:
+            return uirCoreTypeKeySeqName(elemKey1)
+    return ""
+
+fn uirCoreSeqElemKeyFromSeqLikeKey(seqKey0: str): str =
+    var seqKey: str = seqKey0
+    if uirCoreStrStartsWith(seqKey, "seq_"):
+        return str(rawmemPtrAdd(rawmemAsVoid(seqKey), 4))
+    if uirCoreStrStartsWith(seqKey, "seq_fixed_"):
+        return str(rawmemPtrAdd(rawmemAsVoid(seqKey), 10))
+    return ""
+
+fn uirCoreInferCallRetKeyHint(callNode: Node): str =
+    if astNodeIdValid(callNode) && nodeTypeCacheValid(callNode) && astRefNonNil(nodeTypeCache(callNode)):
+        return typeKey nodeTypeCache(callNode)
+    return ""
+
+fn uirCoreCallSymbolForFunc(callee: UirCoreFunc): str =
+    if (callee == nil):
+        return ""
+    if uirCoreFuncIsExtern(callee) && len(uirCoreFuncLinkNameOf(callee)) > 0:
+        return uirCoreFuncLinkNameOf(callee)
+    return uirCoreFuncNameOf(callee)
+
+fn uirCoreResolveStrConcatCallSymbol(mod: UirCoreModule): str =
+    if (mod == nil):
+        return "__cheng_concat_str"
+    let direct1: UirCoreFunc = moduleFindFunc(mod, "__cheng_concat_str")
+    if (direct1 != nil):
+        return uirCoreCallSymbolForFunc(direct1)
+    let uniq1: UirCoreFunc = moduleFindFuncByBaseUnique(mod, "__cheng_concat_str")
+    if (uniq1 != nil):
+        return uirCoreCallSymbolForFunc(uniq1)
+    let direct0: UirCoreFunc = moduleFindFunc(mod, "__cheng_str_concat")
+    if (direct0 != nil):
+        return uirCoreCallSymbolForFunc(direct0)
+    let uniq0: UirCoreFunc = moduleFindFuncByBaseUnique(mod, "__cheng_str_concat")
+    if (uniq0 != nil):
+        return uirCoreCallSymbolForFunc(uniq0)
+    return "__cheng_concat_str"
+
+fn uirCoreScoreCalleeForCall(callee: UirCoreFunc, argKeys: str[], retKeyHint: str): int32 =
+    if (callee == nil):
+        return -1
+    var paramStart: int32 = 0
+    if uirCoreFuncParamsLen(callee) > 0:
+        let p0: UirCoreParam = uirCoreFuncParamAt(callee, 0)
+        if (p0.name == "__ret"):
+            paramStart = 1
+    let argCount: int32 = argKeys.len
+    var paramCount: int32 = uirCoreFuncParamsLen(callee) - paramStart
+    var hasVarargs: bool = false
+    var fixedCount: int32 = paramCount
+    if uirCoreFuncIsExtern(callee) && paramCount > 0:
+        let lastP: UirCoreParam = uirCoreFuncParamAt(callee, uirCoreFuncParamsLen(callee) - 1)
+        if uirCoreTypeKeyIsVarargs(lastP.typeKey):
+            hasVarargs = true
+            fixedCount = paramCount - 1
+    if !hasVarargs && argCount != paramCount:
+        return -1
+    if hasVarargs && argCount < fixedCount:
+        return -1
+    var score: int32 = 0
+    for i in 0..<fixedCount:
+        let pk0: UirCoreParam = uirCoreFuncParamAt(callee, paramStart + i)
+        let paramKey: str = (len(pk0.typeKey) > 0) ? pk0.typeKey : ""
+        let argKey0: str = argKeys[i]
+        let argKey: str = (len(argKey0) > 0) ? argKey0 : ""
+        if len(paramKey) == 0 || len(argKey) == 0:
+            continue
+        let paramCanon: str = uirCoreObjAliasCanon(paramKey)
+        let argCanon: str = uirCoreObjAliasCanon(argKey)
+        if (paramKey == argKey) || (paramCanon == argCanon):
+            score = score + 4
+            continue
+        if ((paramKey == "int") || (paramKey == "NI")) &&
+           ((argKey == "int32") || (argKey == "int64") || (argKey == "int") || (argKey == "NI")):
+            score = score + 3
+            continue
+        if ((paramKey == "uint") || (paramKey == "NU")) &&
+           ((argKey == "uint32") || (argKey == "uint64") || (argKey == "uint") || (argKey == "NU")):
+            score = score + 3
+            continue
+        if ((argKey == "int") || (argKey == "NI")) &&
+           ((paramKey == "int32") || (paramKey == "int64")):
+            score = score + 3
+            continue
+        if ((argKey == "uint") || (argKey == "NU")) &&
+           ((paramKey == "uint32") || (paramKey == "uint64")):
+            score = score + 3
+            continue
+        if uirCoreParamIsVarKey(paramKey) && len(uirCoreParamVarBaseKey(paramKey)) == 0:
+            score = score + 1
+            continue
+        let paramVarBase: str = uirCoreParamVarBaseKey(paramKey)
+        if len(paramVarBase) > 0:
+            let baseKey: str = paramVarBase
+            let baseCanon: str = uirCoreObjAliasCanon(baseKey)
+            if (baseKey == argKey) || (baseCanon == argCanon):
+                score = score + 3
+                continue
+            if uirCoreStrStartsWith(argKey, "ptr_"):
+                let argPtrBase: str = str(rawmemPtrAdd(rawmemAsVoid(argKey), 4))
+                let argPtrCanon: str = uirCoreObjAliasCanon(argPtrBase)
+                if (baseKey == argPtrBase) || (baseCanon == argPtrCanon):
+                    score = score + 3
+                    continue
+        let argVarBase0: str = uirCoreParamVarBaseKey(argKey)
+        if len(argVarBase0) > 0:
+            let baseKey2: str = argVarBase0
+            let baseCanon2: str = uirCoreObjAliasCanon(baseKey2)
+            if ((baseKey2 == paramKey) || (baseCanon2 == paramCanon)) &&
+               !uirCoreStrStartsWith(paramKey, "ref_") &&
+               !uirCoreStrStartsWith(paramKey, "ptr_") &&
+               !uirCoreStrStartsWith(paramKey, "fn_"):
+                score = score + 3
+                continue
+        if uirCoreStrStartsWith(paramKey, "ptr_") && len(argVarBase0) > 0:
+            let paramPtrBase: str = str(rawmemPtrAdd(rawmemAsVoid(paramKey), 4))
+            let paramPtrCanon: str = uirCoreObjAliasCanon(paramPtrBase)
+            let argVarBase: str = argVarBase0
+            let argVarCanon: str = uirCoreObjAliasCanon(argVarBase)
+            if (paramPtrBase == argVarBase) || (paramPtrCanon == argVarCanon):
+                score = score + 3
+                continue
+        return -1
+    if len(retKeyHint) > 0 && len(uirCoreFuncRetTypeKeyOf(callee)) > 0:
+        if !(uirCoreFuncRetTypeKeyOf(callee) == retKeyHint):
+            return -1
+        score = score + 2
+    return score
+
+fn uirCoreCommonPrefixLen(a0: str, b0: str): int32 =
+    if len(a0) == 0 || len(b0) == 0:
+        return 0
+    let a: str = a0
+    let b: str = b0
+    var n: int32 = len(a)
+    if len(b) < n:
+        n = len(b)
+    for i in 0..<n:
+        if a[i] != b[i]:
+            return i
+    return n
+
+fn uirCoreResolveExactNamedCandidate(mod: UirCoreModule, baseName: str,
+                                     candStart: int32, candLen: int32,
+                                     exactExternOut: var UirCoreFunc): UirCoreFunc =
+    exactExternOut = nil
+    if mod == nil || len(baseName) == 0:
+        return nil
+    let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
+    if candLen <= 0:
+        for fiExact in 0..<funcsLen:
+            let candExact: UirCoreFunc = uirCoreModuleFuncAt(mod, fiExact)
+            if (candExact == nil) || !(uirCoreFuncNameForCacheLocal(candExact) == baseName):
+                continue
+            if !uirCoreFuncIsExtern(candExact):
+                return candExact
+            if exactExternOut == nil:
+                exactExternOut = candExact
+        return nil
+    for ciExact in 0..<candLen:
+        let idx: int32 = uirCoreCalleeCandidatePool[candStart + ciExact]
+        if idx < 0 || idx >= funcsLen:
+            continue
+        let cand: UirCoreFunc = uirCoreModuleFuncAt(mod, idx)
+        if (cand == nil) || !(uirCoreFuncNameForCacheLocal(cand) == baseName):
+            continue
+        if !uirCoreFuncIsExtern(cand):
+            return cand
+        if exactExternOut == nil:
+            exactExternOut = cand
+    return nil
+
+fn uirCoreResolveDebugEnabled(baseName: str): bool =
+    if getEnv "BACKEND_DEBUG_RESOLVE" != "1":
+        return false
+    let dbgName: str = getEnv "BACKEND_DEBUG_RESOLVE_NAME"
+    if len(dbgName) > 0:
+        return baseName == dbgName
+    return baseName == "Value"
+
+fn uirCoreResolveDebugDumpCall(b: BlockBuilder, baseName: str, retKeyHint: str,
+                               argNodes: Node[], argKeys: str[]) =
+    var dbgFn: str = ""
+    var dbgFile: str = ""
+    if (b != nil) && uirCoreFuncIdValid(b.func):
+        let dbgFunc0: UirCoreFunc = b.func
+        dbgFn = uirCoreFuncNameOf(dbgFunc0)
+        dbgFile = uirCoreFuncOriginFileOf(dbgFunc0)
+    var dbgArgPos: str = ""
+    if argNodes.len > 0 && astRefNonNil(argNodes[0]):
+        let an0: Node = argNodes[0]
+        dbgArgPos = intToStr(nodePosLine(an0)) + ":" + intToStr(nodePosCol(an0))
+    echo("[backend] debugResolve: base='" + baseName + "' retHint='" + retKeyHint + "'")
+    echo("[backend] debugResolve: fn='" + dbgFn + "' file='" + dbgFile + "' arg0Pos='" + dbgArgPos + "'")
+    echo("[backend] debugResolve: argc=" + intToStr(argKeys.len))
+    if argKeys.len > 0:
+        echo("[backend] debugResolve: arg0Key='" + argKeys[0] + "'")
+    if argNodes.len <= 0 || !astRefNonNil(argNodes[0]):
+        return
+    let an0: Node = argNodes[0]
+    var anName: str = backendStripSpaces(plainName(an0))
+    if len(anName) == 0:
+        anName = ""
+    var anTypeKey: str = ""
+    if nodeTypeCacheValid(an0) && astRefNonNil(nodeTypeCache(an0)):
+        anTypeKey = typeKey(nodeTypeCache(an0))
+    echo("[backend] debugResolve: arg0 kind=nk#" + intToStr(int32(nodeKind(an0))) +
+         " name='" + anName + "' typeKey='" + anTypeKey + "' kids=" + intToStr(kidCount(an0)))
+    if nodeKind(an0) == nkCallArg && kidCount(an0) > 0:
+        let anKid0: Node = kid(an0, 0)
+        var anKid0Name: str = backendStripSpaces(plainName(anKid0))
+        if len(anKid0Name) == 0:
+            anKid0Name = ""
+        var anKid0TypeKey: str = ""
+        if astNodeIdValid(anKid0) && nodeTypeCacheValid(anKid0) && astRefNonNil(nodeTypeCache(anKid0)):
+            anKid0TypeKey = typeKey(nodeTypeCache(anKid0))
+        var anKid0Kind: int32 = -1
+        if anKid0 != nil:
+            anKid0Kind = int32(nodeKind(anKid0))
+        echo("[backend] debugResolve: arg0.k0 kind=nk#" + intToStr(anKid0Kind) +
+             " name='" + anKid0Name + "' typeKey='" + anKid0TypeKey + "'")
+    if argKeys.len > 1:
+        echo("[backend] debugResolve: arg1Key='" + argKeys[1] + "'")
+
+fn uirCoreResolveDebugDumpCandidate(cand: UirCoreFunc, sc: int32,
+                                    dbgPrinted: var int32, dbgMax: int32) =
+    if cand == nil || dbgPrinted >= dbgMax:
+        return
+    var pk0: str = ""
+    var paramStart: int32 = 0
+    if uirCoreFuncParamsLen(cand) > 0:
+        let p0: UirCoreParam = uirCoreFuncParamAt(cand, 0)
+        if p0.name == "__ret":
+            paramStart = 1
+    if uirCoreFuncParamsLen(cand) > paramStart:
+        let p1: UirCoreParam = uirCoreFuncParamAt(cand, paramStart)
+        pk0 = p1.typeKey
+    echo("[backend] debugResolve: cand='" + uirCoreFuncNameOf(cand) + "' pk0='" + pk0 +
+         "' file='" + uirCoreFuncOriginFileOf(cand) + "' score=" + intToStr(sc))
+    dbgPrinted = dbgPrinted + 1
+
+fn uirCoreResolveAppendTieIfNew(ties: UirCoreFunc[]*, cand: UirCoreFunc) =
+    if ties == nil || cand == nil:
+        return
+    for ti0 in 0..<ties->len:
+        let t0: UirCoreFunc = ties[ti0]
+        if (t0 != nil) && uirCoreFuncNameOf(t0) == uirCoreFuncNameOf(cand) &&
+           uirCoreFuncOriginFileOf(t0) == uirCoreFuncOriginFileOf(cand):
+            return
+    builderFuncSeqAppend(ties, cand)
+
+fn uirCoreResolveHasUnknownArg(argKeys: str[]): bool =
+    for ai0 in 0..<argKeys.len:
+        if len(argKeys[ai0]) == 0:
+            return true
+    return false
+
+fn uirCoreResolvePreferDupFnBase(mod: UirCoreModule, b: BlockBuilder, baseName: str,
+                                 argKeys: str[], retKeyHint: str,
+                                 bestScore: int32,
+                                 requireScoreMatch: bool): UirCoreFunc =
+    if mod == nil || !uirCoreFuncIdValid(b.func) || !uirCoreDupFnBasesHas(baseName):
+        return nil
+    let prefer: str = uirCoreMaybeMangleDupFnBase(baseName, uirCoreFuncOriginFileOf(b.func))
+    if len(prefer) == 0:
+        return nil
+    let prefFunc: UirCoreFunc = moduleFindFunc(mod, prefer)
+    if prefFunc == nil:
+        return nil
+    if !requireScoreMatch:
+        return prefFunc
+    let sc: int32 = uirCoreScoreCalleeForCall(prefFunc, argKeys, retKeyHint)
+    return (sc == bestScore) ? prefFunc : nil
+
+fn uirCoreResolvePreferDirectImport(b: BlockBuilder, ties: UirCoreFunc[]): UirCoreFunc =
+    if !uirCoreFuncIdValid(b.func) || ties.len <= 0:
+        return nil
+    let callerFile: str = uirCoreFuncOriginFileOf(b.func)
+    if len(callerFile) == 0:
+        return nil
+    var importMatch: UirCoreFunc = nil
+    var importMatchCount: int32 = 0
+    for tiImp in 0..<ties.len:
+        let candImp: UirCoreFunc = ties[tiImp]
+        if candImp == nil:
+            continue
+        let candFileImp: str = uirCoreFuncOriginFileOf(candImp)
+        if !uirCoreCallerDirectlyImportsFile(callerFile, candFileImp):
+            continue
+        importMatch = candImp
+        importMatchCount = importMatchCount + 1
+        if importMatchCount > 1:
+            return nil
+    return (importMatchCount == 1) ? importMatch : nil
+
+fn uirCoreResolvePreferCommonPrefix(b: BlockBuilder, ties: UirCoreFunc[]): UirCoreFunc =
+    if !uirCoreFuncIdValid(b.func) || ties.len <= 0:
+        return nil
+    let callerFile: str = uirCoreFuncOriginFileOf(b.func)
+    if len(callerFile) == 0:
+        return nil
+    var bestPref: UirCoreFunc = nil
+    var bestLen: int32 = -1
+    var bestCount: int32 = 0
+    for ti in 0..<ties.len:
+        let cand: UirCoreFunc = ties[ti]
+        if cand == nil:
+            continue
+        let candFile: str = uirCoreFuncOriginFileOf(cand)
+        if len(candFile) == 0:
+            continue
+        let pl: int32 = uirCoreCommonPrefixLen(callerFile, candFile)
+        if pl > bestLen:
+            bestPref = cand
+            bestLen = pl
+            bestCount = 1
+        elif pl == bestLen:
+            bestCount = bestCount + 1
+    if (bestPref != nil) && bestCount == 1 && bestLen > 0:
+        return bestPref
+    return nil
+
+fn uirCoreResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: Node[], retKeyHint: str): UirCoreFunc =
+    if (b == nil) || b.module == nil || len(baseName) == 0:
+        return nil
+    let mod: UirCoreModule = b.module
+    let uniqFast: UirCoreFunc = moduleFindFuncByBaseUnique(mod, baseName)
+    if uniqFast != nil:
+        return uniqFast
+    var candStart: int32 = -1
+    var candLen: int32 = 0
+    if !uirCoreCalleeCandidateSpanFresh(mod, baseName, candStart, candLen):
+        candLen = 0
+    var exactExtern: UirCoreFunc = nil
+    let exactFast: UirCoreFunc = uirCoreResolveExactNamedCandidate(mod, baseName, candStart, candLen, exactExtern)
+    if exactFast != nil:
+        return exactFast
+    var argKeys: str[argNodes.len]
+    argKeys.len = 0
+    for ai in 0..<argNodes.len:
+        uir_core_builder_call_resolution_add(argKeys, uirCoreInferNodeTypeKeyForOverload(b, argNodes[ai]))
+    let debugResolve: bool = uirCoreResolveDebugEnabled(baseName)
+    if debugResolve:
+        uirCoreResolveDebugDumpCall(b, baseName, retKeyHint, argNodes, argKeys)
+    var dbgCandCount: int32 = 0
+    var dbgPrinted: int32 = 0
+    let dbgMax: int32 = 30
+    var best: UirCoreFunc = nil
+    var bestScore: int32 = -1
+    var ambiguous: bool = false
+    var ties: UirCoreFunc[]
+    ties.cap = 4
+    let fallbackLinearScan: bool = candLen <= 0
+    let scanLen: int32 = fallbackLinearScan ? uirCoreModuleFuncsLen(mod) : candLen
+    for ci in 0..<scanLen:
+        var cand: UirCoreFunc = nil
+        if fallbackLinearScan:
+            cand = uirCoreModuleFuncAt(mod, ci)
+            if cand == nil:
+                continue
+            let fnName0: str = uirCoreFuncNameForCacheLocal(cand)
+            if !uirCoreFuncNameMatchesBaseAny(fnName0, baseName):
+                continue
+        else:
+            let idx: int32 = uirCoreCalleeCandidatePool[candStart + ci]
+            if idx < 0 || idx >= uirCoreModuleFuncsLen(mod):
+                continue
+            cand = uirCoreModuleFuncAt(mod, idx)
+            if (cand == nil):
+                continue
+        let sc: int32 = uirCoreScoreCalleeForCall(cand, argKeys, retKeyHint)
+        if debugResolve:
+            dbgCandCount = dbgCandCount + 1
+            uirCoreResolveDebugDumpCandidate(cand, sc, dbgPrinted, dbgMax)
+        if sc < 0:
+            continue
+        if sc > bestScore:
+            best = cand
+            bestScore = sc
+            ambiguous = false
+            ties.len = 0
+        elif sc == bestScore:
+            if (best != nil) && uirCoreFuncNameOf(best) == uirCoreFuncNameOf(cand) &&
+               uirCoreFuncOriginFileOf(best) == uirCoreFuncOriginFileOf(cand):
+                continue
+            if !ambiguous:
+                ambiguous = true
+                if (best != nil):
+                    builderFuncSeqAppend(&ties, best)
+            uirCoreResolveAppendTieIfNew(&ties, cand)
+    if ambiguous:
+        if uirCoreResolveHasUnknownArg(argKeys) && ties.len > 0:
+            return ties[0]
+        let preferDup: UirCoreFunc = uirCoreResolvePreferDupFnBase(mod, b, baseName, argKeys,
+                                                                   retKeyHint, bestScore, true)
+        if preferDup != nil:
+            return preferDup
+        if ties.len > 0:
+            let importMatch: UirCoreFunc = uirCoreResolvePreferDirectImport(b, ties)
+            if importMatch != nil:
+                return importMatch
+            let prefixMatch: UirCoreFunc = uirCoreResolvePreferCommonPrefix(b, ties)
+            if prefixMatch != nil:
+                return prefixMatch
+        return nil
+    if (best == nil):
+        let preferBest: UirCoreFunc = uirCoreResolvePreferDupFnBase(mod, b, baseName, argKeys,
+                                                                    retKeyHint, bestScore, false)
+        if preferBest != nil:
+            return preferBest
+        let uniq: UirCoreFunc = moduleFindFuncByBaseUnique(mod, baseName)
+        if (uniq != nil):
+            return uniq
+        if (exactExtern != nil):
+            return exactExtern
+    if debugResolve:
+        var bestNm: str = ""
+        if (best != nil):
+            bestNm = uirCoreFuncNameOf(best)
+        echo("[backend] debugResolve: done base='" + baseName + "' candCount=" + intToStr(dbgCandCount) +
+             " best='" + bestNm + "' ambiguous=" + (ambiguous ? "1" : "0"))
+    return best
+
+fn uirCoreResolveCalleeFunc(b: BlockBuilder, callNode: Node, baseName: str, argNodes: Node[]): Result[UirCoreFunc] =
+    let retKeyHint: str = uirCoreInferCallRetKeyHint(callNode)
+    let f: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, baseName, argNodes, retKeyHint)
+    if (f != nil):
+        return Ok[UirCoreFunc](f)
+    var fnName: str = ""
+    var fp: str = ""
+    if (b != nil) && uirCoreFuncIdValid(b.func):
+        let bf: UirCoreFunc = b.func
+        fnName = uirCoreFuncNameOf(bf)
+        fp = uirCoreFuncOriginFileOf(bf)
+    let line: str = ((callNode != nil)) ? intToStr(nodePosLine(callNode)) : "0"
+    let col: str = ((callNode != nil)) ? intToStr(nodePosCol(callNode)) : "0"
+    return Err[UirCoreFunc](uirCoreUnresolvedCallTargetMsg(baseName, fnName, fp, line, col))

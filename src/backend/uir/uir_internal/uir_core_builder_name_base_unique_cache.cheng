@@ -1,0 +1,326 @@
+# Shared builder-local name/base-unique cache helpers split from uir_core_builder.
+import std/hashmaps
+import std/rawmem_support
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_type_name_cache
+import backend/uir/uir_internal/uir_core_builder_string_utils
+import backend/uir/uir_internal/uir_core_builder_overload_scan
+
+@importc("driver_c_new_string_copy_n")
+fn builder_name_cache_c_new_string_copy_n(raw: ptr, n: int32): str
+
+var
+    uirCore_globalBaseUnique_cache_module: UirCoreModule
+    uirCore_globalBaseUnique_cache: hashmaps.HashMapStrInt
+    uirCore_globalBaseUnique_exact_cache: hashmaps.HashMapStrInt
+    uirCore_globalBaseUnique_cache_len: int32
+    uirCore_globalBaseUnique_cache_ready: bool
+
+    uirCore_funcBaseUnique_cache_module: UirCoreModule
+    uirCore_funcBaseUnique_cache: hashmaps.HashMapStrInt
+    uirCore_funcBaseUnique_cache_len: int32
+    uirCore_funcBaseUnique_cache_ready: bool
+
+fn uirCoreHexNibble(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn uirCoreRecoverSanitizedLinkPrefix(name0: str): str =
+    let prefixLen: int32 = 11
+    let name0Len: int32 = len(name0)
+    if name0Len <= prefixLen + 1 || name0[0] != '_' || name0[1] != '_':
+        return ""
+    let name: str =
+        (name0[0] != ' ' && name0[name0Len - 1] != ' ') ? name0 : backendStripSpaces(name0)
+    let nameLen: int32 = len(name)
+    if nameLen <= prefixLen + 1:
+        return ""
+    if name[0] != '_' || name[1] != '_' || name[2] != 'c' || name[3] != 'h' ||
+       name[4] != 'e' || name[5] != 'n' || name[6] != 'g' || name[7] != '_' ||
+       name[8] != 's' || name[9] != 'y' || name[10] != 'm' || name[11] != '_':
+        return ""
+    let maxBytes: int32 = (nameLen - prefixLen) / 3
+    if maxBytes <= 0:
+        return ""
+    let out: str = newStringOfCap(maxBytes)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    var outIdx: int32 = 0
+    var i: int32 = prefixLen
+    while i + 2 < nameLen && name[i] == '_':
+        let hi: int32 = uirCoreHexNibble(name[i + 1])
+        let lo: int32 = uirCoreHexNibble(name[i + 2])
+        if hi < 0 || lo < 0:
+            break
+        rawmem_support.rawmemSet(rawmem_support.rawmemPtrAdd(outPtr, outIdx), hi * 16 + lo, 1)
+        outIdx = outIdx + 1
+        i = i + 3
+    if outIdx <= 0:
+        return ""
+    var decoded: str = out
+    if outIdx != maxBytes:
+        decoded = builder_name_cache_c_new_string_copy_n(outPtr, outIdx)
+    let modOff: int32 = uirCoreStrIndexOf(decoded, "__cheng_mod_")
+    if modOff > 0:
+        return uirCoreStrTake(decoded, modOff)
+    return decoded
+
+fn uirCoreFuncNameForCacheLocal(f: UirCoreFunc): str =
+    if f == nil:
+        return ""
+    let objName: str = uirCoreFuncNameObjFirst(f)
+    if uirCoreStrPtrSane(objName):
+        return objName
+    let dyn: UirCoreFuncDynState = uirCoreFuncDynStatePtr(f)
+    if dyn != nil && uirCoreStrPtrSane(dyn.name):
+        return dyn.name
+    return uirCoreFuncNameOf(f)
+
+fn uirCoreFuncNameMatchesBaseAny(fnName0: str, base0: str): bool =
+    if len(fnName0) == 0 || len(base0) == 0:
+        return false
+    if fnName0 == base0:
+        return true
+    let baseLen: int32 = len(base0)
+    let rawAlias0: str = uirCoreRecoverSanitizedLinkPrefix(fnName0)
+    if len(rawAlias0) == baseLen && rawAlias0 == base0:
+        return true
+    let sigMarker: str = uirCoreFuncSigMarker()
+    let sigOff: int32 = uirCoreStrIndexOf(fnName0, sigMarker)
+    if sigOff == baseLen && baseLen > 0 && uirCoreStrStartsWith(fnName0, base0):
+        return true
+    let modMarker: str = "__cheng_mod_"
+    let modOff: int32 = uirCoreStrIndexOf(fnName0, modMarker)
+    if modOff == baseLen && baseLen > 0 && uirCoreStrStartsWith(fnName0, base0):
+        return true
+    return false
+
+fn uirCoreBaseUniqueEncode(idx: int32): int32 =
+    if idx >= 0:
+        return idx + 2
+    return 1
+
+fn uirCoreFuncBaseUniqueCacheConsider(
+    exactFuncNames: hashmaps.HashMapStrInt,
+    baseName: str,
+    idx: int32,
+    fnName: str
+) =
+    if len(baseName) == 0 || idx < 0:
+        return
+    var foundExactName: bool = false
+    let exactRaw: int32 = uirCoreHashMapStrIntGetCompatLocal(exactFuncNames, baseName, foundExactName)
+    if foundExactName && exactRaw > 0:
+        return
+    var foundCur: bool = false
+    let curRaw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_funcBaseUnique_cache, baseName, foundCur)
+    if !foundCur:
+        hashmaps.hashMapStrIntPut(uirCore_funcBaseUnique_cache, baseName, uirCoreBaseUniqueEncode(idx))
+        return
+    if curRaw <= 1:
+        return
+    let curIdx: int32 = curRaw - 2
+    if curIdx == idx:
+        return
+    if curIdx >= 0 && uirCore_funcBaseUnique_cache_module != nil &&
+       curIdx < uirCoreModuleFuncsLen(uirCore_funcBaseUnique_cache_module):
+        let curF: UirCoreFunc = uirCoreModuleFuncAt(uirCore_funcBaseUnique_cache_module, curIdx)
+        if curF != nil && uirCoreFuncNameForCacheLocal(curF) == fnName:
+            return
+    hashmaps.hashMapStrIntPut(uirCore_funcBaseUnique_cache, baseName, 1)
+
+fn uirCoreGlobalBaseUniqueCacheReset(mod: UirCoreModule = nil) =
+    uirCore_globalBaseUnique_cache_module = mod
+    uirCore_globalBaseUnique_cache_len = (mod != nil) ? uirCoreModuleGlobalsLen(mod) : 0
+    uirCore_globalBaseUnique_cache = hashmaps.hashMapStrIntInit(uirCore_globalBaseUnique_cache_len * 2 + 8)
+    uirCore_globalBaseUnique_exact_cache = hashmaps.hashMapStrIntInit(uirCore_globalBaseUnique_cache_len * 2 + 8)
+    uirCore_globalBaseUnique_cache_ready = (mod != nil)
+
+fn uirCoreGlobalBaseUniqueCacheBuild(mod: UirCoreModule) =
+    uirCoreGlobalBaseUniqueCacheReset(mod)
+    if mod == nil:
+        return
+    let globalsLen: int32 = uirCoreModuleGlobalsLen(mod)
+    for i in 0..<globalsLen:
+        let g: UirCoreGlobal = uirCoreModuleGlobalAt(mod, i)
+        if len(g.name) == 0:
+            continue
+        hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_exact_cache, g.name, i + 1)
+        hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_cache, g.name, uirCoreBaseUniqueEncode(i))
+    for i in 0..<globalsLen:
+        let g: UirCoreGlobal = uirCoreModuleGlobalAt(mod, i)
+        if len(g.name) == 0:
+            continue
+        let modOff: int32 = uirCoreStrIndexOf(g.name, "__cheng_mod_")
+        if modOff <= 0:
+            continue
+        let base: str = uirCoreStrTake(g.name, modOff)
+        if len(base) == 0 || (base == g.name):
+            continue
+        var hasExact: bool = false
+        let exactRaw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_globalBaseUnique_exact_cache, base, hasExact)
+        if hasExact && exactRaw > 0:
+            continue
+        var foundCur: bool = false
+        let curRaw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_globalBaseUnique_cache, base, foundCur)
+        if !foundCur:
+            hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_cache, base, uirCoreBaseUniqueEncode(i))
+            continue
+        if curRaw <= 1:
+            continue
+        let curIdx: int32 = curRaw - 2
+        if curIdx != i:
+            hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_cache, base, 1)
+
+fn uirCoreGlobalBaseUniqueCacheAppendLast(mod: UirCoreModule) =
+    if mod == nil || !uirCore_globalBaseUnique_cache_ready || uirCore_globalBaseUnique_cache_module != mod:
+        return
+    let globalsLen: int32 = uirCoreModuleGlobalsLen(mod)
+    if globalsLen <= 0:
+        uirCore_globalBaseUnique_cache_len = globalsLen
+        return
+    let i: int32 = globalsLen - 1
+    let g: UirCoreGlobal = uirCoreModuleGlobalAt(mod, i)
+    uirCore_globalBaseUnique_cache_len = globalsLen
+    if len(g.name) == 0:
+        return
+    hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_exact_cache, g.name, i + 1)
+    hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_cache, g.name, uirCoreBaseUniqueEncode(i))
+    let modOff: int32 = uirCoreStrIndexOf(g.name, "__cheng_mod_")
+    if modOff <= 0:
+        return
+    let base: str = uirCoreStrTake(g.name, modOff)
+    if len(base) == 0 || (base == g.name):
+        return
+    var hasExact: bool = false
+    let exactRaw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_globalBaseUnique_exact_cache, base, hasExact)
+    if hasExact && exactRaw > 0:
+        return
+    var foundCur: bool = false
+    let curRaw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_globalBaseUnique_cache, base, foundCur)
+    if !foundCur:
+        hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_cache, base, uirCoreBaseUniqueEncode(i))
+        return
+    if curRaw <= 1:
+        return
+    let curIdx: int32 = curRaw - 2
+    if curIdx != i:
+        hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_cache, base, 1)
+
+fn uirCoreGlobalBaseUniqueCacheEnsure(mod: UirCoreModule) =
+    if mod == nil:
+        if uirCore_globalBaseUnique_cache_ready:
+            uirCoreGlobalBaseUniqueCacheReset()
+        return
+    let globalsLen: int32 = uirCoreModuleGlobalsLen(mod)
+    if !uirCore_globalBaseUnique_cache_ready || uirCore_globalBaseUnique_cache_module != mod:
+        uirCoreGlobalBaseUniqueCacheBuild(mod)
+        return
+    if uirCore_globalBaseUnique_cache_len == globalsLen:
+        return
+    if globalsLen == uirCore_globalBaseUnique_cache_len + 1:
+        uirCoreGlobalBaseUniqueCacheAppendLast(mod)
+        return
+    if uirCore_globalBaseUnique_cache_len != globalsLen:
+        uirCoreGlobalBaseUniqueCacheBuild(mod)
+
+fn uirCoreGlobalBaseUniqueCacheTryGet(mod: UirCoreModule, base0: str, found: var bool): int32 =
+    found = false
+    if mod == nil || len(base0) == 0:
+        return -1
+    uirCoreGlobalBaseUniqueCacheEnsure(mod)
+    if !uirCore_globalBaseUnique_cache_ready || uirCore_globalBaseUnique_cache_module != mod:
+        return -1
+    let raw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_globalBaseUnique_cache, base0, found)
+    if !found || raw <= 0:
+        return -1
+    return raw - 2
+
+fn uirCoreGlobalBaseUniqueCachePut(mod: UirCoreModule, base0: str, idx: int32) =
+    if mod == nil || len(base0) == 0:
+        return
+    uirCoreGlobalBaseUniqueCacheEnsure(mod)
+    if !uirCore_globalBaseUnique_cache_ready || uirCore_globalBaseUnique_cache_module != mod:
+        return
+    hashmaps.hashMapStrIntPut(uirCore_globalBaseUnique_cache, base0, uirCoreBaseUniqueEncode(idx))
+
+fn uirCoreFuncBaseUniqueCacheReset(mod: UirCoreModule = nil) =
+    uirCore_funcBaseUnique_cache_module = mod
+    uirCore_funcBaseUnique_cache_len = (mod != nil) ? uirCoreModuleFuncsLen(mod) : 0
+    uirCore_funcBaseUnique_cache = hashmaps.hashMapStrIntInit(uirCore_funcBaseUnique_cache_len * 2 + 8)
+    uirCore_funcBaseUnique_cache_ready = (mod != nil)
+
+fn uirCoreFuncBaseUniqueCacheBuild(mod: UirCoreModule) =
+    uirCoreFuncBaseUniqueCacheReset(mod)
+    if mod == nil:
+        return
+    let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
+    var exactFuncNames: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(funcsLen * 2 + 8)
+    let sigMarker: str = uirCoreFuncSigMarker()
+    let modMarker: str = "__cheng_mod_"
+    for i in 0..<funcsLen:
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
+        if f == nil:
+            continue
+        let fnName0: str = uirCoreFuncNameForCacheLocal(f)
+        if len(fnName0) == 0:
+            continue
+        hashmaps.hashMapStrIntPut(exactFuncNames, fnName0, i + 1)
+        hashmaps.hashMapStrIntPut(uirCore_funcBaseUnique_cache, fnName0, uirCoreBaseUniqueEncode(i))
+    for i in 0..<funcsLen:
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
+        if f == nil:
+            continue
+        let fnName0: str = uirCoreFuncNameForCacheLocal(f)
+        if len(fnName0) == 0:
+            continue
+        let rawAlias0: str = uirCoreRecoverSanitizedLinkPrefix(fnName0)
+        if len(rawAlias0) > 0 && !(rawAlias0 == fnName0):
+            uirCoreFuncBaseUniqueCacheConsider(exactFuncNames, rawAlias0, i, fnName0)
+        let sigOff: int32 = uirCoreStrIndexOf(fnName0, sigMarker)
+        if sigOff > 0:
+            let baseSig: str = uirCoreStrTake(fnName0, sigOff)
+            if len(baseSig) > 0 && !(baseSig == fnName0):
+                uirCoreFuncBaseUniqueCacheConsider(exactFuncNames, baseSig, i, fnName0)
+        let modOff: int32 = uirCoreStrIndexOf(fnName0, modMarker)
+        if modOff > 0:
+            let baseDup: str = uirCoreStrTake(fnName0, modOff)
+            if len(baseDup) > 0 && !(baseDup == fnName0):
+                uirCoreFuncBaseUniqueCacheConsider(exactFuncNames, baseDup, i, fnName0)
+
+fn uirCoreFuncBaseUniqueCacheEnsure(mod: UirCoreModule) =
+    if mod == nil:
+        if uirCore_funcBaseUnique_cache_ready:
+            uirCoreFuncBaseUniqueCacheReset()
+        return
+    let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
+    if !uirCore_funcBaseUnique_cache_ready ||
+       uirCore_funcBaseUnique_cache_module != mod ||
+       uirCore_funcBaseUnique_cache_len != funcsLen:
+        uirCoreFuncBaseUniqueCacheBuild(mod)
+
+fn uirCoreFuncBaseUniqueCacheTryGet(mod: UirCoreModule, base0: str, found: var bool): int32 =
+    found = false
+    if mod == nil || len(base0) == 0:
+        return -1
+    uirCoreFuncBaseUniqueCacheEnsure(mod)
+    if !uirCore_funcBaseUnique_cache_ready || uirCore_funcBaseUnique_cache_module != mod:
+        return -1
+    let raw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_funcBaseUnique_cache, base0, found)
+    if !found || raw <= 0:
+        return -1
+    return raw - 2
+
+fn uirCoreFuncBaseUniqueCachePut(mod: UirCoreModule, base0: str, idx: int32) =
+    if mod == nil || len(base0) == 0:
+        return
+    uirCoreFuncBaseUniqueCacheEnsure(mod)
+    if !uirCore_funcBaseUnique_cache_ready || uirCore_funcBaseUnique_cache_module != mod:
+        return
+    hashmaps.hashMapStrIntPut(uirCore_funcBaseUnique_cache, base0, uirCoreBaseUniqueEncode(idx))

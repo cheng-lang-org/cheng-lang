@@ -1,0 +1,703 @@
+# Type syntax lowering:
+# - Accept new surface syntax `T[]` and `T[N]` in type positions.
+# - Desugar into existing internal type constructors `seq[T]` and `seq_fixed[T, N]`.
+#
+# NOTE: This pass must run before semantics/monomorphize so downstream stages
+# see canonical `seq[...]` nodes (and internal `seq_fixed[...]` where used).
+import std/[strings, hashmaps]
+import std/seqs
+import stage1/[ast, diagnostics, token]
+
+fn add(seqInst: Diagnostic[]*, val: Diagnostic) =
+    seqs.add(seqInst, val)
+
+fn add(seqInst: var AstNodeId[], val: AstNodeId) =
+    seqs.add(seqInst, val)
+
+fn add(seqInst: var str[], val: str) =
+    seqs.add(seqInst, val)
+
+fn add(seqInst: var int32[], val: int32) =
+    seqs.add(seqInst, val)
+
+fn add(seqInst: str[]*, val: str) =
+    seqs.add(seqInst, val)
+
+var lowerStripEpoch: int32
+var lowerStripReady: bool[]
+var lowerStripValues: str[]
+var lowerNormalizedTextEpoch: int32
+var lowerNormalizedTextReady: bool[]
+var lowerNormalizedTextIds: int32[]
+var lowerGeneratedIdentEpoch: int32
+var lowerGeneratedIdentIndex: hashmaps.HashMapStrInt
+var lowerGeneratedIdentIds: int32[]
+var lowerGeneratedUpperIds: int32[]
+var lowerGeneratedSeqId: int32
+var lowerGeneratedSeqFixedId: int32
+var lowerCompatOverlayReady: bool
+var lowerCompatOverlayFilename: str
+var lowerCompatOverlayFilenamePtr: int64
+var lowerCompatOverlayValue: bool
+
+fn lowerEnsureStripCache(textId: int32) =
+    if textId <= 0:
+        return
+    let epoch: int32 = tokenTextPoolCurrentEpoch()
+    if lowerStripEpoch != epoch:
+        lowerStripEpoch = epoch
+        lowerStripReady.len = 0
+        lowerStripValues.len = 0
+        hashmaps.hashMapStrIntClear(lowerGeneratedIdentIndex)
+        lowerGeneratedIdentIds.len = 0
+    let needLen: int32 = textId + 1
+    let oldReadyLen: int32 = lowerStripReady.len
+    if oldReadyLen < needLen:
+        seqs.reserve(lowerStripReady, needLen)
+        seqs.setLen(lowerStripReady, needLen)
+        for i in oldReadyLen..<needLen:
+            lowerStripReady[i] = false
+    let oldValueLen: int32 = lowerStripValues.len
+    if oldValueLen < needLen:
+        seqs.reserve(lowerStripValues, needLen)
+        seqs.setLen(lowerStripValues, needLen)
+        for i in oldValueLen..<needLen:
+            lowerStripValues[i] = ""
+
+fn lowerEnsureNormalizedTextIdCache(textId: int32) =
+    if textId <= 0:
+        return
+    let epoch: int32 = tokenTextPoolCurrentEpoch()
+    if lowerNormalizedTextEpoch != epoch:
+        lowerNormalizedTextEpoch = epoch
+        lowerNormalizedTextReady.len = 0
+        lowerNormalizedTextIds.len = 0
+    let needLen: int32 = textId + 1
+    let oldReadyLen: int32 = lowerNormalizedTextReady.len
+    if oldReadyLen < needLen:
+        seqs.reserve(lowerNormalizedTextReady, needLen)
+        seqs.setLen(lowerNormalizedTextReady, needLen)
+        for i in oldReadyLen..<needLen:
+            lowerNormalizedTextReady[i] = false
+    let oldValueLen: int32 = lowerNormalizedTextIds.len
+    if oldValueLen < needLen:
+        seqs.reserve(lowerNormalizedTextIds, needLen)
+        seqs.setLen(lowerNormalizedTextIds, needLen)
+        for i in oldValueLen..<needLen:
+            lowerNormalizedTextIds[i] = 0
+
+fn lowerStripId(textId: int32): str =
+    if textId <= 0:
+        return ""
+    lowerEnsureStripCache(textId)
+    if textId < lowerStripReady.len && lowerStripReady[textId]:
+        return lowerStripValues[textId]
+    let rawLen: int32 = tokenTextLen(textId)
+    let trimmedStart: int32 = tokenTextTrimmedStart(textId)
+    let trimmedLen: int32 = tokenTextTrimmedLen(textId)
+    var out: str = ""
+    if trimmedLen <= 0:
+        out = ""
+    elif trimmedStart == 0 && trimmedLen == rawLen:
+        out = tokenTextById(textId)
+    else:
+        out = tokenTextCopyRangeById(textId, trimmedStart, trimmedLen)
+    if textId < lowerStripReady.len && textId < lowerStripValues.len:
+        lowerStripReady[textId] = true
+        lowerStripValues[textId] = out
+    return out
+
+fn lowerNormalizedTextId(textId: int32): int32 =
+    if textId <= 0:
+        return 0
+    lowerEnsureNormalizedTextIdCache(textId)
+    if textId < lowerNormalizedTextReady.len && lowerNormalizedTextReady[textId]:
+        return lowerNormalizedTextIds[textId]
+    let out: int32 = tokenTextTrimmedCanonicalId(textId)
+    if textId < lowerNormalizedTextReady.len && textId < lowerNormalizedTextIds.len:
+        lowerNormalizedTextReady[textId] = true
+        lowerNormalizedTextIds[textId] = out
+    return out
+
+fn lowerEnsureTextIdSet(setIds: var int32[], textId: int32) =
+    if textId <= 0:
+        return
+    let needLen: int32 = textId + 1
+    let oldLen: int32 = setIds.len
+    if oldLen < needLen:
+        seqs.reserve(setIds, needLen)
+        seqs.setLen(setIds, needLen)
+        for i in oldLen..<needLen:
+            setIds[i] = 0
+
+fn lowerTextIdSetAdd(setIds: var int32[], textId: int32) =
+    if textId <= 0:
+        return
+    lowerEnsureTextIdSet(setIds, textId)
+    setIds[textId] = 1
+
+fn lowerTextIdSetHas(setIds: int32[], textId: int32): bool =
+    if textId <= 0:
+        return false
+    if textId >= setIds.len:
+        return false
+    return setIds[textId] != 0
+
+fn lowerStrSetHas(items: str[], value0: str): bool =
+    let value: str = lowerStrip value0
+    if len(value) == 0:
+        return false
+    for i in 0..<items.len:
+        if items[i] == value:
+            return true
+    return false
+
+fn lowerStrSetAdd(items: str[]*, value0: str) =
+    if items == nil:
+        return
+    let value: str = lowerStrip value0
+    if len(value) == 0:
+        return
+    if lowerStrSetHas(*items, value):
+        return
+    add(items, value)
+
+fn lowerGeneratedIdentId(ident: str): int32 =
+    if len(ident) == 0:
+        return 0
+    let epoch: int32 = tokenTextPoolCurrentEpoch()
+    if lowerGeneratedIdentEpoch != epoch:
+        lowerGeneratedIdentEpoch = epoch
+        hashmaps.hashMapStrIntClear(lowerGeneratedIdentIndex)
+        lowerGeneratedIdentIds.len = 0
+        lowerGeneratedSeqId = 0
+        lowerGeneratedSeqFixedId = 0
+        if lowerGeneratedUpperIds.len < 26:
+            seqs.setLen(lowerGeneratedUpperIds, 26)
+        for i in 0..<lowerGeneratedUpperIds.len:
+            lowerGeneratedUpperIds[i] = 0
+    if ident == "seq":
+        if lowerGeneratedSeqId > 0:
+            return lowerGeneratedSeqId
+        lowerGeneratedSeqId = tokenInternText(ident)
+        return lowerGeneratedSeqId
+    if ident == "seq_fixed":
+        if lowerGeneratedSeqFixedId > 0:
+            return lowerGeneratedSeqFixedId
+        lowerGeneratedSeqFixedId = tokenInternText(ident)
+        return lowerGeneratedSeqFixedId
+    if len(ident) == 1:
+        let c0: char = ident[0]
+        if c0 >= 'A' && c0 <= 'Z':
+            let idxUpper: int32 = int32(c0) - int32('A')
+            if idxUpper >= 0 && idxUpper < lowerGeneratedUpperIds.len:
+                let cachedId: int32 = lowerGeneratedUpperIds[idxUpper]
+                if cachedId > 0:
+                    return cachedId
+                let generatedUpperId: int32 = tokenInternText(ident)
+                lowerGeneratedUpperIds[idxUpper] = generatedUpperId
+                return generatedUpperId
+    var found: bool = false
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(lowerGeneratedIdentIndex, ident, found)
+    if found && idxPlus1 > 0 && idxPlus1 <= lowerGeneratedIdentIds.len:
+        return lowerGeneratedIdentIds[idxPlus1 - 1]
+    let generatedId: int32 = tokenInternText(ident)
+    add(lowerGeneratedIdentIds, generatedId)
+    hashmaps.hashMapStrIntPut(lowerGeneratedIdentIndex, ident, lowerGeneratedIdentIds.len)
+    return generatedId
+
+fn lowerIsImplicitTypeParamTextId(textId: int32): bool =
+    if textId <= 0:
+        return false
+    if tokenTextTrimmedLen(textId) != 1:
+        return false
+    let c0: char = tokenTextTrimmedByteAtId(textId, 0)
+    return c0 >= 'A' && c0 <= 'Z'
+
+fn lowerStrip(s: str): str =
+    return stripSpaces s
+
+fn lowerAddError(diags: Diagnostic[]*, filename: str, pos: SourcePos, msg: str) =
+    if diags == nil:
+        return
+    var fileName0: str = filename
+    if len(fileName0) == 0:
+        fileName0 = "stdin"
+    let d: Diagnostic = diagMake(svError, fileName0, pos.line, pos.col, msg)
+    add(diags, d)
+
+fn lowerIsCompatOverlayFile(filename: str): bool =
+    if len(filename) == 0:
+        return false
+    let filenamePtr: int64 = int64(rawmemAsVoid(filename))
+    if lowerCompatOverlayReady && lowerCompatOverlayFilenamePtr == filenamePtr:
+        return lowerCompatOverlayValue
+    if lowerCompatOverlayReady && lowerCompatOverlayFilename == filename:
+        lowerCompatOverlayFilenamePtr = filenamePtr
+        return lowerCompatOverlayValue
+    let res: bool =
+        strContains(filename, "/chengcache/stage0_compat/") ||
+        strContains(filename, "\\chengcache\\stage0_compat\\")
+    lowerCompatOverlayFilename = filename
+    lowerCompatOverlayFilenamePtr = filenamePtr
+    lowerCompatOverlayValue = res
+    lowerCompatOverlayReady = true
+    return res
+
+fn isImplicitTypeParamName(nm0: str): bool =
+    if len(nm0) == 0:
+        return false
+    let nm: str = lowerStrip nm0
+    if len(nm) != 1:
+        return false
+    let c0: char = nm[0]
+    return c0 >= 'A' && c0 <= 'Z'
+
+fn ctorNameFromNodeId(nId: AstNodeId): str =
+    if !astNodeIdValid(nId):
+        return ""
+    let nKind: NodeKind = astNodeKind(nId)
+    if nKind == nkIdent || nKind == nkSymbol:
+        return lowerStripId(astNodeIdentId(nId))
+    if nKind == nkDotExpr && astKidCount(nId) > 1:
+        let memberId: AstNodeId = astKidAt(nId, 1)
+        let memberKind: NodeKind = astNodeKind(memberId)
+        if memberKind == nkIdent || memberKind == nkSymbol:
+            return lowerStripId(astNodeIdentId(memberId))
+    return ""
+
+fn ctorTextIdFromNodeId(nId: AstNodeId): int32 =
+    if !astNodeIdValid(nId):
+        return 0
+    let nKind: NodeKind = astNodeKind(nId)
+    if nKind == nkIdent || nKind == nkSymbol:
+        return lowerNormalizedTextId(astNodeIdentId(nId))
+    if nKind == nkDotExpr && astKidCount(nId) > 1:
+        let memberId: AstNodeId = astKidAt(nId, 1)
+        let memberKind: NodeKind = astNodeKind(memberId)
+        if memberKind == nkIdent || memberKind == nkSymbol:
+            return lowerNormalizedTextId(astNodeIdentId(memberId))
+    return 0
+
+fn lowerIsSynthesizedBracketCtorId(brId: AstNodeId, baseId: AstNodeId): bool =
+    if !astNodeIdValid(brId) || !astNodeIdValid(baseId):
+        return false
+    let brPos: SourcePos = astNodePos(brId)
+    let basePos: SourcePos = astNodePos(baseId)
+    return basePos.line == brPos.line && basePos.col == brPos.col
+
+fn collectTypeConstructorsId(rootId: AstNodeId, outIds: int32[]*) =
+    if !astNodeIdValid(rootId) || outIds == nil:
+        return
+    lowerTextIdSetAdd(*outIds, lowerGeneratedIdentId("seq"))
+    lowerTextIdSetAdd(*outIds, lowerGeneratedIdentId("seq_fixed"))
+    lowerTextIdSetAdd(*outIds, lowerGeneratedIdentId("array"))
+    lowerTextIdSetAdd(*outIds, lowerGeneratedIdentId("Table"))
+    lowerTextIdSetAdd(*outIds, lowerGeneratedIdentId("Table_fixed"))
+    lowerTextIdSetAdd(*outIds, lowerGeneratedIdentId("varargs"))
+    var queue: AstNodeId[]
+    add(queue, rootId)
+    while queue.len > 0:
+        let nId: AstNodeId = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if !astNodeIdValid(nId):
+            continue
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkTypeDecl:
+            if astKidCount(nId) > 2:
+                let gpId: AstNodeId = astKidAt(nId, 2)
+                if astNodeKind(gpId) == nkGenericParams && astKidCount(gpId) > 0:
+                    if astKidCount(nId) > 0:
+                        let nameId: AstNodeId = astKidAt(nId, 0)
+                        let nameKind: NodeKind = astNodeKind(nameId)
+                        if nameKind == nkIdent || nameKind == nkSymbol:
+                            let nameTextId: int32 = astNodeIdentId(nameId)
+                            let normId: int32 = lowerNormalizedTextId(nameTextId)
+                            if normId > 0:
+                                lowerTextIdSetAdd(*outIds, normId)
+        elif nKind == nkConceptDecl || nKind == nkTraitDecl:
+            if astKidCount(nId) > 1:
+                let gpId2: AstNodeId = astKidAt(nId, 1)
+                if astNodeKind(gpId2) == nkGenericParams && astKidCount(gpId2) > 0:
+                    if astKidCount(nId) > 0:
+                        let nameId2: AstNodeId = astKidAt(nId, 0)
+                        let nameKind2: NodeKind = astNodeKind(nameId2)
+                        if nameKind2 == nkIdent || nameKind2 == nkSymbol:
+                            let nameTextId2: int32 = astNodeIdentId(nameId2)
+                            let normId2: int32 = lowerNormalizedTextId(nameTextId2)
+                            if normId2 > 0:
+                                lowerTextIdSetAdd(*outIds, normId2)
+        for i in 0..<astKidCount(nId):
+            add(queue, astKidAt(nId, i))
+
+fn collectTypeSyntaxMetadataId(rootId: AstNodeId, ctorIds: int32[]*, ctorNames: str[]*, knownTypeIds: int32[]*) =
+    if !astNodeIdValid(rootId):
+        return
+    if ctorIds != nil:
+        lowerTextIdSetAdd(*ctorIds, lowerGeneratedIdentId("seq"))
+        lowerTextIdSetAdd(*ctorIds, lowerGeneratedIdentId("seq_fixed"))
+        lowerTextIdSetAdd(*ctorIds, lowerGeneratedIdentId("array"))
+        lowerTextIdSetAdd(*ctorIds, lowerGeneratedIdentId("Table"))
+        lowerTextIdSetAdd(*ctorIds, lowerGeneratedIdentId("Table_fixed"))
+        lowerTextIdSetAdd(*ctorIds, lowerGeneratedIdentId("varargs"))
+    if ctorNames != nil:
+        lowerStrSetAdd(ctorNames, "seq")
+        lowerStrSetAdd(ctorNames, "seq_fixed")
+        lowerStrSetAdd(ctorNames, "array")
+        lowerStrSetAdd(ctorNames, "Table")
+        lowerStrSetAdd(ctorNames, "Table_fixed")
+        lowerStrSetAdd(ctorNames, "varargs")
+    var queue: AstNodeId[]
+    add(queue, rootId)
+    while queue.len > 0:
+        let nId: AstNodeId = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if !astNodeIdValid(nId):
+            continue
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkTypeDecl || nKind == nkConceptDecl || nKind == nkTraitDecl:
+            if astKidCount(nId) > 0:
+                let nameId: AstNodeId = astKidAt(nId, 0)
+                let nameKind: NodeKind = astNodeKind(nameId)
+                if nameKind == nkIdent || nameKind == nkSymbol:
+                    let nameTextId: int32 = astNodeIdentId(nameId)
+                    let normId: int32 = lowerNormalizedTextId(nameTextId)
+                    if normId > 0 && knownTypeIds != nil:
+                        lowerTextIdSetAdd(*knownTypeIds, normId)
+                    if ctorIds != nil:
+                        var hasGenericParams: bool = false
+                        if nKind == nkTypeDecl && astKidCount(nId) > 2:
+                            let gpId: AstNodeId = astKidAt(nId, 2)
+                            hasGenericParams = astNodeKind(gpId) == nkGenericParams && astKidCount(gpId) > 0
+                        elif (nKind == nkConceptDecl || nKind == nkTraitDecl) && astKidCount(nId) > 1:
+                            let gpId2: AstNodeId = astKidAt(nId, 1)
+                            hasGenericParams = astNodeKind(gpId2) == nkGenericParams && astKidCount(gpId2) > 0
+                        if hasGenericParams && normId > 0:
+                            lowerTextIdSetAdd(*ctorIds, normId)
+                            if ctorNames != nil:
+                                lowerStrSetAdd(ctorNames, lowerStripId(nameTextId))
+                            if (getEnv "STAGE1_DEBUG_TYPE_LOWER" == "1"):
+                                let dbgName: str = lowerStripId(nameTextId)
+                                os.writeLine(os.get_stderr(),
+                                             "[stage1] debugTypeLower: add_ctor name=" + dbgName +
+                                             " textId=" + intToStr(normId))
+                                os.c_fflush(os.get_stderr())
+        for i in 0..<astKidCount(nId):
+            add(queue, astKidAt(nId, i))
+
+fn lowerNewIdentId(ident: str, pos: SourcePos): AstNodeId =
+    let id: AstNodeId = astNewNodeId(nkIdent, pos)
+    astSetNodeIdentId(id, lowerGeneratedIdentId(ident))
+    return id
+
+fn lowerTypeExprId(ty0: AstNodeId, ctorIds: int32[], ctorNames: str[], diags: Diagnostic[]*, filename: str): AstNodeId =
+    if !astNodeIdValid(ty0):
+        return ty0
+    var ty: AstNodeId = ty0
+    while astNodeIdValid(ty) && astNodeKind(ty) == nkPar && astKidCount(ty) == 1:
+        ty = astKidAt(ty, 0)
+    if !astNodeIdValid(ty):
+        return ty
+    let tyKind: NodeKind = astNodeKind(ty)
+    case tyKind
+    of nkPtrTy, nkRefTy, nkVarTy:
+        if astKidCount(ty) > 0:
+            let inner: AstNodeId = lowerTypeExprId(astKidAt(ty, 0), ctorIds, ctorNames, diags, filename)
+            if inner != astKidAt(ty, 0):
+                astSetKid(ty, 0, inner)
+        return ty
+    of nkSetTy:
+        if astKidCount(ty) > 0:
+            let inner2: AstNodeId = lowerTypeExprId(astKidAt(ty, 0), ctorIds, ctorNames, diags, filename)
+            if inner2 != astKidAt(ty, 0):
+                astSetKid(ty, 0, inner2)
+        return ty
+    of nkTupleTy:
+        for i in 0..<astKidCount(ty):
+            let c0: AstNodeId = astKidAt(ty, i)
+            if astNodeKind(c0) == nkIdentDefs:
+                if astKidCount(c0) > 1:
+                    let et: AstNodeId = lowerTypeExprId(astKidAt(c0, 1), ctorIds, ctorNames, diags, filename)
+                    if et != astKidAt(c0, 1):
+                        astSetKid(c0, 1, et)
+            else:
+                let et2: AstNodeId = lowerTypeExprId(c0, ctorIds, ctorNames, diags, filename)
+                if et2 != c0:
+                    astSetKid(ty, i, et2)
+        return ty
+    of nkFnTy:
+        if astKidCount(ty) > 0:
+            let fpId: AstNodeId = astKidAt(ty, 0)
+            if astNodeKind(fpId) == nkFormalParams:
+                for j in 0..<astKidCount(fpId):
+                    let defsId: AstNodeId = astKidAt(fpId, j)
+                    if astNodeKind(defsId) == nkIdentDefs && astKidCount(defsId) > 1:
+                        let pty: AstNodeId = lowerTypeExprId(astKidAt(defsId, 1), ctorIds, ctorNames, diags, filename)
+                        if pty != astKidAt(defsId, 1):
+                            astSetKid(defsId, 1, pty)
+        if astKidCount(ty) > 1:
+            let ret: AstNodeId = lowerTypeExprId(astKidAt(ty, 1), ctorIds, ctorNames, diags, filename)
+            if ret != astKidAt(ty, 1):
+                astSetKid(ty, 1, ret)
+        return ty
+    of nkObjectDecl:
+        if astKidCount(ty) > 0:
+            let base: AstNodeId = lowerTypeExprId(astKidAt(ty, 0), ctorIds, ctorNames, diags, filename)
+            if base != astKidAt(ty, 0):
+                astSetKid(ty, 0, base)
+        if astKidCount(ty) > 1:
+            let rl: AstNodeId = astKidAt(ty, 1)
+            if astNodeIdValid(rl):
+                let _lowerRl: AstNodeId = lowerTypeExprId(rl, ctorIds, ctorNames, diags, filename)
+        return ty
+    of nkRecList, nkRecCase, nkOfBranch, nkElse:
+        for i2 in 0..<astKidCount(ty):
+            let child: AstNodeId = astKidAt(ty, i2)
+            let _lowerChild: AstNodeId = lowerTypeExprId(child, ctorIds, ctorNames, diags, filename)
+        return ty
+    of nkIdentDefs:
+        if astKidCount(ty) > 1:
+            let ft: AstNodeId = lowerTypeExprId(astKidAt(ty, 1), ctorIds, ctorNames, diags, filename)
+            if ft != astKidAt(ty, 1):
+                astSetKid(ty, 1, ft)
+        return ty
+    of nkBracketExpr:
+        let count: int32 = astKidCount(ty)
+        let allowLegacyCtorSyntax: bool = lowerIsCompatOverlayFile(filename)
+        if count > 1:
+            let base0: AstNodeId = astKidAt(ty, 0)
+            let ctor0: str = ctorNameFromNodeId(base0)
+            let fromSugar: bool = lowerIsSynthesizedBracketCtorId(ty, base0)
+            if !allowLegacyCtorSyntax && !fromSugar && ((ctor0 == "seq") || (ctor0 == "openArray")):
+                lowerAddError(diags, filename, astNodePos(ty),
+                              "Legacy type syntax is removed; use 'T[]' instead of '" + ctor0 + "[T]'")
+            elif !allowLegacyCtorSyntax && (ctor0 == "Table_fixed"):
+                lowerAddError(diags, filename, astNodePos(ty),
+                              "Legacy type syntax 'Table_fixed[V, N]' is removed; use 'Table[V]' and pass capacity to TableInit(...)")
+            elif !allowLegacyCtorSyntax && (ctor0 == "array"):
+                lowerAddError(diags, filename, astNodePos(ty),
+                              "Legacy type syntax 'array[N, T]' is removed; use 'T[N]' instead")
+            elif !allowLegacyCtorSyntax && (ctor0 == "Table") && count != 2:
+                lowerAddError(diags, filename, astNodePos(ty),
+                              "Legacy type syntax 'Table[V, N]' is removed; use 'Table[V]' and pass capacity to TableInit(...)")
+        if count == 1:
+            let elemTy: AstNodeId = lowerTypeExprId(astKidAt(ty, 0), ctorIds, ctorNames, diags, filename)
+            let outId: AstNodeId = astNewNodeId(nkBracketExpr, astNodePos(ty))
+            astAddKid(outId, lowerNewIdentId("seq", astNodePos(ty)))
+            astAddKid(outId, elemTy)
+            return outId
+        if count == 2:
+            let base0: AstNodeId = astKidAt(ty, 0)
+            let arg0: AstNodeId = astKidAt(ty, 1)
+            let ctorTextId: int32 = ctorTextIdFromNodeId(base0)
+            let ctorName: str = ctorNameFromNodeId(base0)
+            let ctorHit: bool =
+                (ctorTextId > 0 && lowerTextIdSetHas(ctorIds, ctorTextId)) ||
+                lowerStrSetHas(ctorNames, ctorName)
+            if (getEnv "STAGE1_DEBUG_TYPE_LOWER" == "1"):
+                os.writeLine(os.get_stderr(),
+                             "[stage1] debugTypeLower: bracket2 base=" + ctorName +
+                             " ctorTextId=" + intToStr(ctorTextId) +
+                             " ctorHit=" + (ctorHit ? "1" : "0") +
+                             " @" + intToStr(astNodePos(ty).line) + ":" + intToStr(astNodePos(ty).col))
+                os.c_fflush(os.get_stderr())
+            if ctorHit:
+                let base2: AstNodeId = lowerTypeExprId(base0, ctorIds, ctorNames, diags, filename)
+                let arg2: AstNodeId = lowerTypeExprId(arg0, ctorIds, ctorNames, diags, filename)
+                if base2 != base0:
+                    astSetKid(ty, 0, base2)
+                if arg2 != arg0:
+                    astSetKid(ty, 1, arg2)
+                return ty
+            let elemTy2: AstNodeId = lowerTypeExprId(base0, ctorIds, ctorNames, diags, filename)
+            let outId2: AstNodeId = astNewNodeId(nkBracketExpr, astNodePos(ty))
+            astAddKid(outId2, lowerNewIdentId("seq_fixed", astNodePos(ty)))
+            astAddKid(outId2, elemTy2)
+            astAddKid(outId2, arg0)
+            return outId2
+        for i3 in 0..<count:
+            let c5: AstNodeId = astKidAt(ty, i3)
+            let c6: AstNodeId = lowerTypeExprId(c5, ctorIds, ctorNames, diags, filename)
+            if c6 != c5:
+                astSetKid(ty, i3, c6)
+        return ty
+    of nkDotExpr:
+        if astKidCount(ty) > 0:
+            let inner3: AstNodeId = lowerTypeExprId(astKidAt(ty, 0), ctorIds, ctorNames, diags, filename)
+            if inner3 != astKidAt(ty, 0):
+                astSetKid(ty, 0, inner3)
+        return ty
+    else:
+        return ty
+
+fn lowerTypeParamsId(gpId: AstNodeId, ctorIds: int32[], ctorNames: str[], diags: Diagnostic[]*, filename: str) =
+    if !astNodeIdValid(gpId) || astNodeKind(gpId) != nkGenericParams:
+        return
+    for i in 0..<astKidCount(gpId):
+        let defsId: AstNodeId = astKidAt(gpId, i)
+        if astNodeKind(defsId) == nkIdentDefs:
+            if astKidCount(defsId) > 1:
+                let c: AstNodeId = lowerTypeExprId(astKidAt(defsId, 1), ctorIds, ctorNames, diags, filename)
+                if c != astKidAt(defsId, 1):
+                    astSetKid(defsId, 1, c)
+            if astKidCount(defsId) > 2:
+                let d: AstNodeId = lowerTypeExprId(astKidAt(defsId, 2), ctorIds, ctorNames, diags, filename)
+                if d != astKidAt(defsId, 2):
+                    astSetKid(defsId, 2, d)
+
+fn lowerFormalParamsId(fpId: AstNodeId, ctorIds: int32[], ctorNames: str[], diags: Diagnostic[]*, filename: str) =
+    if !astNodeIdValid(fpId) || astNodeKind(fpId) != nkFormalParams:
+        return
+    for i in 0..<astKidCount(fpId):
+        let defsId: AstNodeId = astKidAt(fpId, i)
+        if astNodeKind(defsId) == nkIdentDefs:
+            if astKidCount(defsId) > 1:
+                let pty: AstNodeId = lowerTypeExprId(astKidAt(defsId, 1), ctorIds, ctorNames, diags, filename)
+                if pty != astKidAt(defsId, 1):
+                    astSetKid(defsId, 1, pty)
+
+fn collectKnownTypeNamesId(rootId: AstNodeId, outIds: int32[]*) =
+    if !astNodeIdValid(rootId) || outIds == nil:
+        return
+    var queue: AstNodeId[]
+    add(queue, rootId)
+    while queue.len > 0:
+        let nId: AstNodeId = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if !astNodeIdValid(nId):
+            continue
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkTypeDecl || nKind == nkConceptDecl || nKind == nkTraitDecl:
+            if astKidCount(nId) > 0:
+                let nameId: AstNodeId = astKidAt(nId, 0)
+                let nameKind: NodeKind = astNodeKind(nameId)
+                if nameKind == nkIdent || nameKind == nkSymbol:
+                    let nameTextId: int32 = astNodeIdentId(nameId)
+                    let normId: int32 = lowerNormalizedTextId(nameTextId)
+                    if normId > 0:
+                        lowerTextIdSetAdd(*outIds, normId)
+        for i in 0..<astKidCount(nId):
+            add(queue, astKidAt(nId, i))
+
+fn collectImplicitTypeParamsFromTypeNodeId(tyId: AstNodeId, knownTypeIds: int32[],
+                                           seenIds: int32[]*, out: str[]*) =
+    if !astNodeIdValid(tyId) || seenIds == nil || out == nil:
+        return
+    var queue: AstNodeId[]
+    add(queue, tyId)
+    while queue.len > 0:
+        let nId: AstNodeId = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if !astNodeIdValid(nId):
+            continue
+        let nKind: NodeKind = astNodeKind(nId)
+        if nKind == nkDotExpr:
+            continue
+        if nKind == nkIdent || nKind == nkSymbol:
+            let nameTextId: int32 = astNodeIdentId(nId)
+            if lowerIsImplicitTypeParamTextId(nameTextId):
+                let nmId: int32 = lowerNormalizedTextId(nameTextId)
+                if nmId > 0 &&
+                   !lowerTextIdSetHas(knownTypeIds, nmId) &&
+                   !lowerTextIdSetHas(*seenIds, nmId):
+                    lowerTextIdSetAdd(*seenIds, nmId)
+                    let nm: str = lowerStripId(nameTextId)
+                    add(out, nm)
+            continue
+        for i in 0..<astKidCount(nId):
+            add(queue, astKidAt(nId, i))
+
+fn inferImplicitTypeParamsForRoutineId(routineId: AstNodeId, knownTypeIds: int32[]) =
+    if !astNodeIdValid(routineId):
+        return
+    var gpId: AstNodeId = astInvalidNodeId()
+    if astKidCount(routineId) > 4:
+        gpId = astKidAt(routineId, 4)
+    if astNodeIdValid(gpId) && astNodeKind(gpId) == nkGenericParams && astKidCount(gpId) > 0:
+        return
+    var names: str[]
+    var seenIds: int32[]
+    if astKidCount(routineId) > 1:
+        let fpId: AstNodeId = astKidAt(routineId, 1)
+        if astNodeKind(fpId) == nkFormalParams:
+            for i in 0..<astKidCount(fpId):
+                let defsId: AstNodeId = astKidAt(fpId, i)
+                if astNodeKind(defsId) == nkIdentDefs && astKidCount(defsId) > 1:
+                    collectImplicitTypeParamsFromTypeNodeId(
+                        astKidAt(defsId, 1), knownTypeIds, &seenIds, &names)
+    if astKidCount(routineId) > 2:
+        let retId: AstNodeId = astKidAt(routineId, 2)
+        if astNodeKind(retId) != nkEmpty:
+            collectImplicitTypeParamsFromTypeNodeId(
+                retId, knownTypeIds, &seenIds, &names)
+    if names.len == 0:
+        return
+    let outGpId: AstNodeId = astNewNodeId(nkGenericParams, astNodePos(routineId))
+    for j in 0..<names.len:
+        let nm: str = names[j]
+        let defnId: AstNodeId = astNewNodeId(nkIdentDefs, astNodePos(routineId))
+        astAddKid(defnId, lowerNewIdentId(nm, astNodePos(routineId)))
+        astAddKid(defnId, astNewNodeId(nkEmpty, astNodePos(routineId)))
+        astAddKid(defnId, astNewNodeId(nkEmpty, astNodePos(routineId)))
+        astAddKid(outGpId, defnId)
+    if astKidCount(routineId) > 4:
+        astSetKid(routineId, 4, outGpId)
+
+fn lowerTypeSyntaxIdCore(rootId: AstNodeId, diags: Diagnostic[]*, filename: str) =
+    if !astNodeIdValid(rootId):
+        return
+    var ctorIds: int32[]
+    var ctorNames: str[]
+    var knownTypeIds: int32[]
+    collectTypeSyntaxMetadataId(rootId, &ctorIds, &ctorNames, &knownTypeIds)
+    var queue: AstNodeId[]
+    add(queue, rootId)
+    while queue.len > 0:
+        let nId: AstNodeId = queue[queue.len - 1]
+        queue.len = queue.len - 1
+        if !astNodeIdValid(nId):
+            continue
+        let nKind: NodeKind = astNodeKind(nId)
+        case nKind
+        of nkCall:
+            if astKidCount(nId) > 0:
+                let calleeId: AstNodeId = astKidAt(nId, 0)
+                if astNodeKind(calleeId) == nkBracketExpr && astKidCount(calleeId) > 1:
+                    for ai in 1..<astKidCount(calleeId):
+                        let argId: AstNodeId = astKidAt(calleeId, ai)
+                        let loweredId: AstNodeId = lowerTypeExprId(argId, ctorIds, ctorNames, diags, filename)
+                        if loweredId != argId:
+                            astSetKid(calleeId, ai, loweredId)
+        of nkPattern:
+            if astKidCount(nId) > 1:
+                let tyId: AstNodeId = lowerTypeExprId(astKidAt(nId, 1), ctorIds, ctorNames, diags, filename)
+                if tyId != astKidAt(nId, 1):
+                    astSetKid(nId, 1, tyId)
+        of nkLet, nkVar, nkConst:
+            if astKidCount(nId) > 1:
+                let ty2Id: AstNodeId = lowerTypeExprId(astKidAt(nId, 1), ctorIds, ctorNames, diags, filename)
+                if ty2Id != astKidAt(nId, 1):
+                    astSetKid(nId, 1, ty2Id)
+        of nkTypeDecl:
+            if astKidCount(nId) > 1:
+                let defId: AstNodeId = lowerTypeExprId(astKidAt(nId, 1), ctorIds, ctorNames, diags, filename)
+                if defId != astKidAt(nId, 1):
+                    astSetKid(nId, 1, defId)
+            if astKidCount(nId) > 2:
+                lowerTypeParamsId(astKidAt(nId, 2), ctorIds, ctorNames, diags, filename)
+        of nkFnDecl, nkIteratorDecl, nkTemplateDecl, nkMacroDecl, nkLambda:
+            if astKidCount(nId) > 1:
+                lowerFormalParamsId(astKidAt(nId, 1), ctorIds, ctorNames, diags, filename)
+            if astKidCount(nId) > 2:
+                let retId: AstNodeId = lowerTypeExprId(astKidAt(nId, 2), ctorIds, ctorNames, diags, filename)
+                if retId != astKidAt(nId, 2):
+                    astSetKid(nId, 2, retId)
+            if astKidCount(nId) > 4:
+                lowerTypeParamsId(astKidAt(nId, 4), ctorIds, ctorNames, diags, filename)
+            if nKind != nkLambda:
+                inferImplicitTypeParamsForRoutineId(nId, knownTypeIds)
+        for i in 0..<astKidCount(nId):
+            add(queue, astKidAt(nId, i))
+
+fn lowerTypeSyntaxId(rootId: AstNodeId, diags: Diagnostic[]*, filename: str) =
+    lowerTypeSyntaxIdCore(rootId, diags, filename)

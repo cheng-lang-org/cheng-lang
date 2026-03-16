@@ -1,0 +1,620 @@
+# Unified IR facade: carries native UIR entities while production lowering remains
+# wired to UIR-internal implementation.
+import backend/uir/uir_internal/uir_core_types
+import std/os
+import std/result
+import std/strutils
+
+type
+    UirGenericParam =
+        name: str
+
+type
+    UirTraitConstraint =
+        paramName: str
+        traitName: str
+
+type
+    UirDictType = ref
+        traitName: str
+        methods: str[]
+
+type
+    UirInstanceKey =
+        symbol: str
+        typeArgs: str[]
+        mode: str
+
+type
+    UirModule = UirCoreModule
+
+type
+    UirFunc = UirCoreFunc
+
+type
+    UirGlobal = UirCoreGlobal
+
+type
+    UirCString = UirCoreCString
+
+type
+    UirTypeAlias = UirCoreTypeAlias
+
+type
+    UirObjType = UirCoreObjType
+
+type
+    UirLowerType = UirCoreType
+
+type
+    UirLowerTypeKind = UirCoreTypeKind
+
+type
+    UirLowerBlock = UirBlockId
+
+type
+    UirExpr = UirExprId
+
+type
+    UirExprKind = UirCoreExprKind
+
+type
+    UirBinOp = UirCoreBinOp
+
+type
+    UirCmpOp = UirCoreCmpOp
+
+type
+    UirStmt = UirStmtId
+
+type
+    UirStmtKind = UirCoreStmtKind
+
+type
+    UirTerm = UirCoreTerm
+
+type
+    UirTermKind = UirCoreTermKind
+
+type
+    UirPhaseTag = int32
+
+type
+    UirParam = UirCoreParam
+
+type
+    UirObjLocal = UirCoreObjLocal
+
+type
+    UirObjField = UirCoreObjField
+
+type
+    UirSoaSurfaceStats =
+        trackedFuncs: int32
+        exprIds: int32
+        stmtIds: int32
+        blockIds: int32
+        succEdges: int32
+        predEdges: int32
+        balanceOk: bool
+        reason: str
+
+fn uirTextLowerAscii(s: str): str =
+    return strutils.toLowerAscii(s)
+
+fn uirEnvParseBool(name: str, defaultValue: bool): bool =
+    let raw: str = os.getEnvDefault(name, "")
+    if len(raw) == 0:
+        return defaultValue
+    let s: str = uirTextLowerAscii(strutils.strip(raw))
+    if s == "1" || s == "true" || s == "yes" || s == "on":
+        return true
+    if s == "0" || s == "false" || s == "no" || s == "off":
+        return false
+    return defaultValue
+
+fn uirEnvParseInt(name: str, defaultValue: int32, minValue: int32, maxValue: int32): int32 =
+    let raw: str = strutils.strip(os.getEnvDefault(name, ""))
+    if len(raw) == 0:
+        return defaultValue
+    let n: int32 = len(raw)
+    var neg: bool = false
+    var i: int32 = 0
+    if raw[0] == '-':
+        neg = true
+        i = 1
+    if i >= n:
+        return defaultValue
+    var v: int64 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = raw[i]
+        if c < '0' || c > '9':
+            return defaultValue
+        v = v * 10 + int64(int32(c) - int32('0'))
+        i = i + 1
+    if neg:
+        v = -v
+    if v < int64(minValue):
+        return minValue
+    if v > int64(maxValue):
+        return maxValue
+    return int32(v)
+
+fn uirEGraphGoalNormalize(goal: str): str =
+    let target: str = uirTextLowerAscii(strutils.strip(goal))
+    if target == "latency" || target == "size":
+        return target
+    return "balanced"
+
+fn uirEGraphGoalParseEnv(name: str, defaultValue: str): str =
+    let raw: str = os.getEnvDefault(name, "")
+    if len(raw) > 0:
+        return uirEGraphGoalNormalize(raw)
+    return uirEGraphGoalNormalize(defaultValue)
+
+fn uirFnSchedNormalized(): str =
+    var raw: str = strutils.strip(os.getEnvDefault("BACKEND_FN_SCHED", ""))
+    if len(raw) == 0:
+        raw = strutils.strip(os.getEnvDefault("STAGE1_FN_SCHED", ""))
+    if uirTextLowerAscii(raw) == "ws":
+        return "ws"
+    return "serial"
+
+fn uirExprRecursionLimit(): int32 =
+    return 256
+
+fn uirPhaseContractMarkerText(): str =
+    return "single_ir_dual_phase " +
+           "uir_phase_model=single_ir_dual_phase " +
+           "p4_phase_v1 " +
+           "phase_contract_version=p4_phase_v1 " +
+           "ownership_func_v1 " +
+           "generics_report " +
+           "high_uir_checked_funcs= " +
+           "low_uir_lowered_funcs= " +
+           "high_uir_fallback_funcs= " +
+           "uir_opt2.noalias " +
+           "uir_opt2.egraph " +
+           "uir_opt2.cost_model " +
+           "uir_opt2.cost_model.weights"
+
+fn uirSoaSurfaceStatsCollect(module: UirModule): UirSoaSurfaceStats =
+    var out: UirSoaSurfaceStats
+    out.balanceOk = true
+    out.reason = "ok"
+    if module == nil:
+        out.balanceOk = false
+        out.reason = "module=nil"
+        return out
+    let soaModule: UirCoreSoaModule = uirCoreSoaBuildFromModule(module)
+    if soaModule == nil:
+        out.balanceOk = false
+        out.reason = "module=nil"
+        return out
+    out.trackedFuncs = uirCoreSoaModuleFuncCount(soaModule)
+    out.exprIds = uirCoreSoaModuleExprCount(soaModule)
+    out.stmtIds = uirCoreSoaModuleStmtCount(soaModule)
+    out.blockIds = uirCoreSoaModuleBlockCount(soaModule)
+    out.succEdges = uirCoreSoaModuleSuccEdgeCount(soaModule)
+    out.predEdges = uirCoreSoaModulePredEdgeCount(soaModule)
+    out.balanceOk = uirCoreSoaModuleEdgesBalanced(soaModule)
+    out.reason = uirCoreSoaModuleEdgeBalanceReason(soaModule)
+    return out
+
+fn Ok_UirLowerType(value: UirLowerType): Result[UirLowerType] =
+    var out: Result[UirLowerType]
+    out.ok = true
+    out.value = value
+    ErrorOkInto(out.err)
+    return out
+
+fn Err_UirLowerType(err: str): Result[UirLowerType] =
+    var out: Result[UirLowerType]
+    out.ok = false
+    ErrorNewInto(out.err, err)
+    return out
+
+fn uirDemoModule(): UirModule =
+    return uirCoreDemoModule()
+
+fn uirFnv1a64(s: str): int64 =
+    return uirCoreFnv1a64(s)
+
+fn uirU64ToHex(v: int64): str =
+    return uirCoreU64ToHex(v)
+
+fn uirStrCmp(a: str, b: str): int32 =
+    return uirCoreStrCmp(a, b)
+
+fn uirNewModule(target: str): UirModule =
+    return uirCoreNewModule(target)
+
+fn uirNewFunc(name: str, retType: UirLowerType): UirFunc =
+    return uirCoreNewFunc(name, retType)
+
+fn uirAddFunc(module: UirModule, func: UirFunc) =
+    uirCoreAddFunc(module, func)
+
+fn uirCanonicalizeModule(module: UirModule) =
+    uirCoreCanonicalizeModule(module)
+
+fn rawmemIsNil(expr: UirExpr): bool =
+    return expr <= 0
+
+fn rawmemIsNil(block: UirLowerBlock): bool =
+    return block <= 0
+
+fn rawmemIsNil(module: UirModule): bool =
+    return module == nil
+
+fn rawmemIsNil(func: UirFunc): bool =
+    return func == nil
+
+fn uirExprKindOf(expr: UirExpr): UirExprKind =
+    return uirCoreExprKindOf(expr)
+
+fn uirExprCalleeOf(expr: UirExpr): str =
+    return uirCoreExprCalleeOf(expr)
+
+fn uirExprLocalIndexOf(expr: UirExpr): int32 =
+    return uirCoreExprLocalIndexOf(expr)
+
+fn uirExprConstValueOf(expr: UirExpr): int64 =
+    return uirCoreExprConstValueOf(expr)
+
+fn uirExprBinOpOf(expr: UirExpr): UirBinOp =
+    return uirCoreExprBinOpOf(expr)
+
+fn uirExprCmpOpOf(expr: UirExpr): UirCmpOp =
+    return uirCoreExprCmpOpOf(expr)
+
+fn uirExprCastTypeOf(expr: UirExpr): UirLowerType =
+    return uirCoreExprCastTypeOf(expr)
+
+fn uirExprLoadTypeOf(expr: UirExpr): UirLowerType =
+    return uirCoreExprLoadTypeOf(expr)
+
+fn uirExprGlobalNameOf(expr: UirExpr): str =
+    return uirCoreExprGlobalNameOf(expr)
+
+fn uirExprArgsLen(expr: UirExpr): int32 =
+    return uirCoreExprArgsLen(expr)
+
+fn uirExprArgAt(expr: UirExpr, idx: int32): UirExpr =
+    return uirCoreExprArgAt(expr, idx)
+
+fn uirExprLhsOf(expr: UirExpr): UirExpr =
+    return uirCoreExprLhsOf(expr)
+
+fn uirExprRhsOf(expr: UirExpr): UirExpr =
+    return uirCoreExprRhsOf(expr)
+
+fn uirExprCastExprOf(expr: UirExpr): UirExpr =
+    return uirCoreExprCastExprOf(expr)
+
+fn uirExprAddrExprOf(expr: UirExpr): UirExpr =
+    return uirCoreExprAddrExprOf(expr)
+
+fn uirFormatExpr(expr: UirExpr): str =
+    return uirCoreFormatExpr(expr)
+
+fn uirExprIsCall(expr: UirExpr): bool =
+    return uirCoreExprIsCall(expr)
+
+fn uirExprIsGlobalAddr(expr: UirExpr): bool =
+    return uirCoreExprIsGlobalAddr(expr)
+
+fn uirExprIsBinOrCmp(expr: UirExpr): bool =
+    return uirCoreExprIsBinOrCmp(expr)
+
+fn uirExprIsCast(expr: UirExpr): bool =
+    return uirCoreExprIsCast(expr)
+
+fn uirExprIsAddrOrLoad(expr: UirExpr): bool =
+    return uirCoreExprIsAddrOrLoad(expr)
+
+fn uirStmtExprOf(stmt: UirStmt): UirExpr =
+    return uirCoreStmtExprOf(stmt)
+
+fn uirStmtKindOf(stmt: UirStmt): UirStmtKind =
+    return uirCoreStmtKindOf(stmt)
+
+fn uirStmtNameOf(stmt: UirStmt): str =
+    return uirCoreStmtNameOf(stmt)
+
+fn uirStmtSlotOf(stmt: UirStmt): int32 =
+    return uirCoreStmtSlotOf(stmt)
+
+fn uirStmtStoreTypeOf(stmt: UirStmt): UirLowerType =
+    return uirCoreStmtStoreTypeOf(stmt)
+
+fn uirStmtParamIndexOf(stmt: UirStmt): int32 =
+    return uirCoreStmtParamIndexOf(stmt)
+
+fn uirStmtAddrExprOf(stmt: UirStmt): UirExpr =
+    return uirCoreStmtAddrExprOf(stmt)
+
+fn uirBlockStmtsLen(block: UirLowerBlock): int32 =
+    return uirCoreBlockStmtsLen(block)
+
+fn uirBlockStmtAt(block: UirLowerBlock, idx: int32): UirStmt =
+    return uirCoreBlockStmtAt(block, idx)
+
+fn uirBlockSetStmtAt(block: UirLowerBlock, idx: int32, stmt: UirStmt) =
+    uirCoreBlockSetStmtAt(block, idx, stmt)
+
+fn uirBlockSetStmts(block: UirLowerBlock, stmts: UirStmt[]) =
+    uirCoreBlockSetStmts(block, stmts)
+
+fn uirBlockLabelOf(block: UirLowerBlock): str =
+    return uirCoreBlockLabelOf(block)
+
+fn uirBlockTermOf(block: UirLowerBlock): UirTerm =
+    return uirCoreBlockTermOf(block)
+
+fn uirTermKindOf(term: UirTerm): UirTermKind =
+    return uirCoreTermKindOf(term)
+
+fn uirTermRetExprOf(term: UirTerm): UirExpr =
+    return uirCoreTermRetExprOf(term)
+
+fn uirTermCondExprOf(term: UirTerm): UirExpr =
+    return uirCoreTermCondExprOf(term)
+
+fn uirTermTargetOf(term: UirTerm): str =
+    return uirCoreTermTargetOf(term)
+
+fn uirTermTargetTrueOf(term: UirTerm): str =
+    return uirCoreTermTargetTrueOf(term)
+
+fn uirTermTargetFalseOf(term: UirTerm): str =
+    return uirCoreTermTargetFalseOf(term)
+
+fn uirTermWithRetExpr(term: UirTerm, retExpr: UirExpr): UirTerm =
+    return uirCoreTermWithRetExpr(term, retExpr)
+
+fn uirTermWithCondExpr(term: UirTerm, condExpr: UirExpr): UirTerm =
+    return uirCoreTermWithCondExpr(term, condExpr)
+
+fn uirTermWithTarget(term: UirTerm, target: str): UirTerm =
+    return uirCoreTermWithTarget(term, target)
+
+fn uirTermWithTargetTrue(term: UirTerm, targetTrue: str): UirTerm =
+    return uirCoreTermWithTargetTrue(term, targetTrue)
+
+fn uirTermWithTargetFalse(term: UirTerm, targetFalse: str): UirTerm =
+    return uirCoreTermWithTargetFalse(term, targetFalse)
+
+fn uirBlockSetTerm(block: UirLowerBlock, term: UirTerm) =
+    uirCoreBlockSetTerm(block, term)
+
+fn uirBlockRetExprOf(block: UirLowerBlock): UirExpr =
+    return uirCoreBlockRetExprOf(block)
+
+fn uirBlockCondExprOf(block: UirLowerBlock): UirExpr =
+    return uirCoreBlockCondExprOf(block)
+
+fn uirFuncBlocksLen(func: UirFunc): int32 =
+    return uirCoreFuncBlocksLen(func)
+
+fn uirFuncBlocksLenObjFirst(func: UirFunc): int32 =
+    return uirCoreFuncBlocksLenObjFirst(func)
+
+fn uirFuncBlockAt(func: UirFunc, idx: int32): UirLowerBlock =
+    return uirCoreFuncBlockAt(func, idx)
+
+fn uirFuncBlockAtObjFirst(func: UirFunc, idx: int32): UirLowerBlock =
+    return uirCoreFuncBlockAtObjFirst(func, idx)
+
+fn uirFuncIsExtern(func: UirFunc): bool =
+    return uirCoreFuncIsExtern(func)
+
+fn uirModuleHealExternFlags(module: UirModule) =
+    if module == nil:
+        return
+    for fi in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, fi)
+        if f == nil:
+            continue
+        uirCoreFuncIsExtern(f)
+
+fn uirFuncIsExternObjFirst(func: UirFunc): bool =
+    return uirCoreFuncIsExternObjFirst(func)
+
+fn uirFuncNameOf(func: UirFunc): str =
+    return uirCoreFuncNameOf(func)
+
+fn uirFuncNameObjFirst(func: UirFunc): str =
+    return uirCoreFuncNameObjFirst(func)
+
+fn uirFuncRetTypeOf(func: UirFunc): UirLowerType =
+    return uirCoreFuncRetTypeOf(func)
+
+fn uirFuncObjFrameSizeOf(func: UirFunc): int32 =
+    return uirCoreFuncObjFrameSizeOf(func)
+
+fn uirFuncLinkNameOf(func: UirFunc): str =
+    return uirCoreFuncLinkNameOf(func)
+
+fn uirFuncLinkNameObjFirst(func: UirFunc): str =
+    return uirCoreFuncLinkNameObjFirst(func)
+
+fn uirFuncOriginFileOf(func: UirFunc): str =
+    return uirCoreFuncOriginFileOf(func)
+
+fn uirFuncPhaseTagOf(func: UirFunc): UirPhaseTag =
+    return uirCoreFuncPhaseTagOf(func)
+
+fn uirFuncPhaseNameOf(func: UirFunc): str =
+    return uirCoreFuncPhaseNameOf(func)
+
+fn uirFuncHighUirCheckedOf(func: UirFunc): bool =
+    return uirCoreFuncHighUirCheckedOf(func)
+
+fn uirFuncLowUirLoweredOf(func: UirFunc): bool =
+    return uirCoreFuncLowUirLoweredOf(func)
+
+fn uirFuncProofBackedForOpt2(func: UirFunc): bool =
+    return uirFuncHighUirCheckedOf(func) && uirFuncLowUirLoweredOf(func)
+
+fn uirFuncPhaseFallbackReasonOf(func: UirFunc): str =
+    return uirCoreFuncPhaseFallbackReasonOf(func)
+
+fn uirFuncParamsLen(func: UirFunc): int32 =
+    return uirCoreFuncParamsLen(func)
+
+fn uirFuncParamAt(func: UirFunc, idx: int32): UirParam =
+    return uirCoreFuncParamAt(func, idx)
+
+fn uirParamTypeOf(param: UirParam): UirLowerType =
+    return uirCoreParamTypeOf(param)
+
+fn uirParamSlotOf(param: UirParam): int32 =
+    return uirCoreParamSlotOf(param)
+
+fn uirParamTypeKeyOf(param: UirParam): str =
+    return uirCoreParamTypeKeyOf(param)
+
+fn uirFuncLocalTypesLen(func: UirFunc): int32 =
+    return uirCoreFuncLocalTypesLen(func)
+
+fn uirFuncLocalTypeAt(func: UirFunc, idx: int32): UirLowerType =
+    return uirCoreFuncLocalTypeAt(func, idx)
+
+fn uirFuncObjLocalsLen(func: UirFunc): int32 =
+    return uirCoreFuncObjLocalsLen(func)
+
+fn uirFuncObjLocalAt(func: UirFunc, idx: int32): UirObjLocal =
+    return uirCoreFuncObjLocalAt(func, idx)
+
+fn uirObjLocalSlotOf(ol: UirObjLocal): int32 =
+    return uirCoreObjLocalSlotOf(ol)
+
+fn uirObjLocalFrameOffOf(ol: UirObjLocal): int32 =
+    return uirCoreObjLocalFrameOffOf(ol)
+
+fn uirFuncSetLinkName(func: UirFunc, linkName: str) =
+    uirCoreFuncSetLinkName(func, linkName)
+
+fn uirFuncSetOriginFile(func: UirFunc, originFile: str) =
+    uirCoreFuncSetOriginFile(func, originFile)
+
+fn uirFuncSetExtern(func: UirFunc, isExtern: bool) =
+    uirCoreFuncSetExtern(func, isExtern)
+
+fn uirFuncAddParam(func: UirFunc, param: UirParam) =
+    uirCoreFuncAddParam(func, param)
+
+fn uirModuleFuncsLen(module: UirModule): int32 =
+    return uirCoreModuleFuncsLen(module)
+
+fn uirModuleTargetOf(module: UirModule): str =
+    return uirCoreModuleTargetOf(module)
+
+fn uirModuleFuncAt(module: UirModule, idx: int32): UirFunc =
+    return uirCoreModuleFuncAt(module, idx)
+
+fn uirModuleCountHighUirCheckedFuncs(module: UirModule): int32 =
+    return uirCoreModuleCountHighUirCheckedFuncs(module)
+
+fn uirModuleCountLowUirLoweredFuncs(module: UirModule): int32 =
+    return uirCoreModuleCountLowUirLoweredFuncs(module)
+
+fn uirModuleCountProofBackedFuncs(module: UirModule): int32 =
+    if module == nil:
+        return 0
+    var out: int32 = 0
+    for fi in 0..<uirModuleFuncsLen(module):
+        let func: UirFunc = uirModuleFuncAt(module, fi)
+        if (func != nil) && uirFuncProofBackedForOpt2(func):
+            out = out + 1
+    return out
+
+fn uirModuleCountHighUirFallbackFuncs(module: UirModule): int32 =
+    return uirCoreModuleCountHighUirFallbackFuncs(module)
+
+fn uirModuleGlobalsLen(module: UirModule): int32 =
+    return uirCoreModuleGlobalsLen(module)
+
+fn uirModuleGlobalAt(module: UirModule, idx: int32): UirGlobal =
+    return uirCoreModuleGlobalAt(module, idx)
+
+fn uirModuleGlobalNameAt(module: UirModule, idx: int32): str =
+    return uirCoreModuleGlobalNameAt(module, idx)
+
+fn uirModuleGlobalTypeAt(module: UirModule, idx: int32): UirLowerType =
+    return uirCoreModuleGlobalTypeAt(module, idx)
+
+fn uirModuleGlobalHasInitAt(module: UirModule, idx: int32): bool =
+    return uirCoreModuleGlobalHasInitAt(module, idx)
+
+fn uirModuleGlobalInitAt(module: UirModule, idx: int32): int64 =
+    return uirCoreModuleGlobalInitAt(module, idx)
+
+fn uirModuleCStringsLen(module: UirModule): int32 =
+    return uirCoreModuleCStringsLen(module)
+
+fn uirModuleCStringAt(module: UirModule, idx: int32): UirCString =
+    return uirCoreModuleCStringAt(module, idx)
+
+fn uirModuleCStringLabelAt(module: UirModule, idx: int32): str =
+    return uirCoreModuleCStringLabelAt(module, idx)
+
+fn uirModuleCStringValueAt(module: UirModule, idx: int32): str =
+    return uirCoreModuleCStringValueAt(module, idx)
+
+fn uirCStringLabelOf(cstr: UirCString): str =
+    return uirCoreCStringLabelOf(cstr)
+
+fn uirCStringValueOf(cstr: UirCString): str =
+    return uirCoreCStringValueOf(cstr)
+
+fn uirGlobalNameOf(global: UirGlobal): str =
+    return uirCoreGlobalNameOf(global)
+
+fn uirGlobalTypeOf(global: UirGlobal): UirLowerType =
+    return uirCoreGlobalTypeOf(global)
+
+fn uirGlobalHasInit(global: UirGlobal): bool =
+    return uirCoreGlobalHasInit(global)
+
+fn uirGlobalInitOf(global: UirGlobal): int64 =
+    return uirCoreGlobalInitOf(global)
+
+fn uirGlobalOriginFileOf(global: UirGlobal): str =
+    return uirCoreGlobalOriginFileOf(global)
+
+fn uirTypeVoid(): UirLowerType =
+    return uirCoreTypeVoid()
+
+fn uirTypeI8(): UirLowerType =
+    return uirCoreTypeI8()
+
+fn uirTypeU8(): UirLowerType =
+    return uirCoreTypeU8()
+
+fn uirTypeI16(): UirLowerType =
+    return uirCoreTypeI16()
+
+fn uirTypeU16(): UirLowerType =
+    return uirCoreTypeU16()
+
+fn uirTypeI32(): UirLowerType =
+    return uirCoreTypeI32()
+
+fn uirTypeU32(): UirLowerType =
+    return uirCoreTypeU32()
+
+fn uirTypeI64(): UirLowerType =
+    return uirCoreTypeI64()
+
+fn uirTypeU64(): UirLowerType =
+    return uirCoreTypeU64()
+
+fn uirTypeF32(): UirLowerType =
+    return uirCoreTypeF32()
+
+fn uirTypeF64(): UirLowerType =
+    return uirCoreTypeF64()

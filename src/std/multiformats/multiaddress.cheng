@@ -1,0 +1,677 @@
+# MultiAddress(partial: ip4/ip6/tcp/udp/dns/ws/quic/p2p).
+
+import std/result
+import std/strings as ustrings
+import std/rawbytes
+import std/buffer
+import std/varint
+import std/multiformats/protobuf/minprotobuf
+import std/multiformats/multibase
+import std/multiformats/multihash
+type
+    Protocol =
+        name: str
+        code: int64
+        size: int32 # bytes; 0 = no value, -1 = length-prefixed
+
+    MultiAddress =
+        raw: str
+        data: Bytes
+
+    SegmentRead =
+        seg: str
+        next: int32
+
+    HostPortPair =
+        host: str
+        port: str
+
+fn strLen(text: str): int32 =
+    return len(text)
+
+fn strCharAt(text: str, idx: int32): char =
+    return text[idx]
+
+var
+    protoIp4: Protocol = Protocol(name: "ip4", code: 0x04, size: 4)
+    protoIp6: Protocol = Protocol(name: "ip6", code: 0x29, size: 16)
+    protoIp6Zone: Protocol = Protocol(name: "ip6zone", code: 0x2A, size: -1)
+    protoDccp: Protocol = Protocol(name: "dccp", code: 0x21, size: 2)
+    protoSctp: Protocol = Protocol(name: "sctp", code: 0x84, size: 2)
+    protoUdt: Protocol = Protocol(name: "udt", code: 0x012D, size: 0)
+    protoUtp: Protocol = Protocol(name: "utp", code: 0x012E, size: 0)
+    protoTcp: Protocol = Protocol(name: "tcp", code: 0x06, size: 2)
+    protoUdp: Protocol = Protocol(name: "udp", code: 0x0111, size: 2)
+    protoDns: Protocol = Protocol(name: "dns", code: 0x35, size: -1)
+    protoDns4: Protocol = Protocol(name: "dns4", code: 0x36, size: -1)
+    protoDns6: Protocol = Protocol(name: "dns6", code: 0x37, size: -1)
+    protoDnsAddr: Protocol = Protocol(name: "dnsaddr", code: 0x38, size: -1)
+    protoUnix: Protocol = Protocol(name: "unix", code: 0x0190, size: -1)
+    protoHttp: Protocol = Protocol(name: "http", code: 0x01E0, size: 0)
+    protoHttps: Protocol = Protocol(name: "https", code: 0x01BB, size: 0)
+    protoTls: Protocol = Protocol(name: "tls", code: 0x01C0, size: 0)
+    protoQuic: Protocol = Protocol(name: "quic", code: 0x01CC, size: 0)
+    protoQuicV1: Protocol = Protocol(name: "quic-v1", code: 0x01CD, size: 0)
+    protoWebtransport: Protocol = Protocol(name: "webtransport", code: 0x01D1, size: 0)
+    protoCerthash: Protocol = Protocol(name: "certhash", code: 0x01D2, size: -1)
+    protoWs: Protocol = Protocol(name: "ws", code: 0x01DD, size: 0)
+    protoWss: Protocol = Protocol(name: "wss", code: 0x01DE, size: 0)
+    protoP2pCircuit: Protocol = Protocol(name: "p2p-circuit", code: 0x0122, size: 0)
+    protoP2pWebsocketStar: Protocol = Protocol(name: "p2p-websocket-star", code: 0x01DF, size: 0)
+    protoP2pWebrtcStar: Protocol = Protocol(name: "p2p-webrtc-star", code: 0x0113, size: 0)
+    protoP2pWebrtcDirect: Protocol = Protocol(name: "p2p-webrtc-direct", code: 0x0114, size: 0)
+    protoWebrtcDirect: Protocol = Protocol(name: "webrtc-direct", code: 0x0118, size: 0)
+    protoOnion: Protocol = Protocol(name: "onion", code: 0x01BC, size: 12)
+    protoOnion3: Protocol = Protocol(name: "onion3", code: 0x01BD, size: 37)
+    protoIpfs: Protocol = Protocol(name: "ipfs", code: 0xE3, size: -1)
+    protoP2p: Protocol = Protocol(name: "p2p", code: 0x01A5, size: -1)
+
+fn memoryProtocol(): Protocol =
+    return Protocol(name: "memory", code: 0x0309, size: -1)
+
+fn protoByName(name: str): Result[Protocol] =
+    if name == protoIp4.name: return Ok[Protocol](protoIp4)
+    if name == protoIp6.name: return Ok[Protocol](protoIp6)
+    if name == protoIp6Zone.name: return Ok[Protocol](protoIp6Zone)
+    if name == protoDccp.name: return Ok[Protocol](protoDccp)
+    if name == protoSctp.name: return Ok[Protocol](protoSctp)
+    if name == protoUdt.name: return Ok[Protocol](protoUdt)
+    if name == protoUtp.name: return Ok[Protocol](protoUtp)
+    if name == protoTcp.name: return Ok[Protocol](protoTcp)
+    if name == protoUdp.name: return Ok[Protocol](protoUdp)
+    if name == protoDns.name: return Ok[Protocol](protoDns)
+    if name == protoDns4.name: return Ok[Protocol](protoDns4)
+    if name == protoDns6.name: return Ok[Protocol](protoDns6)
+    if name == protoDnsAddr.name: return Ok[Protocol](protoDnsAddr)
+    if name == protoUnix.name: return Ok[Protocol](protoUnix)
+    if name == protoHttp.name: return Ok[Protocol](protoHttp)
+    if name == protoHttps.name: return Ok[Protocol](protoHttps)
+    if name == protoTls.name: return Ok[Protocol](protoTls)
+    if name == protoQuic.name: return Ok[Protocol](protoQuic)
+    if name == protoQuicV1.name: return Ok[Protocol](protoQuicV1)
+    if name == protoWebtransport.name: return Ok[Protocol](protoWebtransport)
+    if name == protoCerthash.name: return Ok[Protocol](protoCerthash)
+    if name == protoWs.name: return Ok[Protocol](protoWs)
+    if name == protoWss.name: return Ok[Protocol](protoWss)
+    if name == protoP2pCircuit.name: return Ok[Protocol](protoP2pCircuit)
+    if name == protoP2pWebsocketStar.name: return Ok[Protocol](protoP2pWebsocketStar)
+    if name == protoP2pWebrtcStar.name: return Ok[Protocol](protoP2pWebrtcStar)
+    if name == protoP2pWebrtcDirect.name: return Ok[Protocol](protoP2pWebrtcDirect)
+    if name == protoWebrtcDirect.name: return Ok[Protocol](protoWebrtcDirect)
+    if name == protoOnion.name: return Ok[Protocol](protoOnion)
+    if name == protoOnion3.name: return Ok[Protocol](protoOnion3)
+    if name == protoIpfs.name: return Ok[Protocol](protoIpfs)
+    if name == protoP2p.name: return Ok[Protocol](protoP2p)
+    if name == "memory": return Ok[Protocol](memoryProtocol())
+    return Err[Protocol]("multiaddress: unknown protocol")
+
+fn protoByCode(code: int64): Result[Protocol] =
+    if code == protoIp4.code: return Ok[Protocol](protoIp4)
+    if code == protoIp6.code: return Ok[Protocol](protoIp6)
+    if code == protoIp6Zone.code: return Ok[Protocol](protoIp6Zone)
+    if code == protoDccp.code: return Ok[Protocol](protoDccp)
+    if code == protoSctp.code: return Ok[Protocol](protoSctp)
+    if code == protoUdt.code: return Ok[Protocol](protoUdt)
+    if code == protoUtp.code: return Ok[Protocol](protoUtp)
+    if code == protoTcp.code: return Ok[Protocol](protoTcp)
+    if code == protoUdp.code: return Ok[Protocol](protoUdp)
+    if code == protoDns.code: return Ok[Protocol](protoDns)
+    if code == protoDns4.code: return Ok[Protocol](protoDns4)
+    if code == protoDns6.code: return Ok[Protocol](protoDns6)
+    if code == protoDnsAddr.code: return Ok[Protocol](protoDnsAddr)
+    if code == protoUnix.code: return Ok[Protocol](protoUnix)
+    if code == protoHttp.code: return Ok[Protocol](protoHttp)
+    if code == protoHttps.code: return Ok[Protocol](protoHttps)
+    if code == protoTls.code: return Ok[Protocol](protoTls)
+    if code == protoQuic.code: return Ok[Protocol](protoQuic)
+    if code == protoQuicV1.code: return Ok[Protocol](protoQuicV1)
+    if code == protoWebtransport.code: return Ok[Protocol](protoWebtransport)
+    if code == protoCerthash.code: return Ok[Protocol](protoCerthash)
+    if code == protoWs.code: return Ok[Protocol](protoWs)
+    if code == protoWss.code: return Ok[Protocol](protoWss)
+    if code == protoP2pCircuit.code: return Ok[Protocol](protoP2pCircuit)
+    if code == protoP2pWebsocketStar.code: return Ok[Protocol](protoP2pWebsocketStar)
+    if code == protoP2pWebrtcStar.code: return Ok[Protocol](protoP2pWebrtcStar)
+    if code == protoP2pWebrtcDirect.code: return Ok[Protocol](protoP2pWebrtcDirect)
+    if code == protoWebrtcDirect.code: return Ok[Protocol](protoWebrtcDirect)
+    if code == protoOnion.code: return Ok[Protocol](protoOnion)
+    if code == protoOnion3.code: return Ok[Protocol](protoOnion3)
+    if code == protoIpfs.code: return Ok[Protocol](protoIpfs)
+    if code == protoP2p.code: return Ok[Protocol](protoP2p)
+    if code == 0x0309: return Ok[Protocol](memoryProtocol())
+    return Err[Protocol]("multiaddress: unknown protocol")
+
+fn readSegment(text: str, start: int32): Result[SegmentRead] =
+    if start >= len(text):
+        return Err[SegmentRead]("multiaddress: trailing slash")
+    var i: int32 = start
+    while i < len(text) && text[i] != '/':
+        i = i + 1
+    let seg: str = ustrings.sliceBytes(text, start, i - start)
+    let next: int32 = if i < len(text) && text[i] == '/': i + 1 else: i
+    var out: SegmentRead
+    out.seg = seg
+    out.next = next
+    return Ok[SegmentRead](out)
+
+fn parseUIntRange(text: str, start: int32, count: int32): Result[int32] =
+    if count <= 0:
+        return Err[int32]("multiaddress: empty number")
+    var value: int32 = 0
+    for i in 0..<count:
+        let c: char = text[start + i]
+        if c < '0' || c > '9':
+            return Err[int32]("multiaddress: invalid number")
+        value = value * 10 + (int32(c) - int32('0'))
+    return Ok[int32](value)
+
+fn parseIPv4(text: str): Result[Bytes] =
+    var out: Bytes = bytesAlloc(4)
+    var start: int32 = 0
+    var parts: int32 = 0
+    for i in 0..len(text):
+        if i == len(text) || text[i] == '.':
+            let count: int32 = i - start
+            let partRes: Result[int32] = parseUIntRange(text, start, count)
+            if IsErr(partRes):
+                return Err[Bytes](Error(partRes))
+            let value: int32 = Value(partRes)
+            if value < 0 || value > 255:
+                return Err[Bytes]("multiaddress: ip4 out of range")
+            if parts >= 4:
+                return Err[Bytes]("multiaddress: ip4 parts")
+            bytesSet(out, parts, value)
+            parts = parts + 1
+            start = i + 1
+    if parts != 4:
+        return Err[Bytes]("multiaddress: ip4 parts")
+    return Ok[Bytes](out)
+
+fn hexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + (int32(c) - int32('a'))
+    if c >= 'A' && c <= 'F':
+        return 10 + (int32(c) - int32('A'))
+    return -1
+
+fn parseHexSegment(text: str, start: int32, count: int32): Result[int32] =
+    if count <= 0 || count > 4:
+        return Err[int32]("multiaddress: ip6 part length")
+    var value: int32 = 0
+    for i in 0..<count:
+        let v: int32 = hexValue(text[start + i])
+        if v < 0:
+            return Err[int32]("multiaddress: ip6 invalid hex")
+        value = (value << 4) + v
+    return Ok[int32](value)
+
+fn writeHextet(buf: Bytes, idx: int32, value: int32) =
+    bytesSet(buf, idx * 2, (value >> 8) & 255)
+    bytesSet(buf, idx * 2 + 1, value & 255)
+
+fn parseIPv6(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Err[Bytes]("multiaddress: ip6 empty")
+    var head: Bytes = bytesAlloc(16)
+    var tail: Bytes = bytesAlloc(16)
+    var headCount: int32 = 0
+    var tailCount: int32 = 0
+    var seenCompress: bool = false
+    var i: int32 = 0
+    var segmentStart: int32 = 0
+    while i <= len(text):
+        let atEnd: bool = i == len(text)
+        let isColon: bool = (! atEnd) && text[i] == ':'
+        if atEnd || isColon:
+            if i == segmentStart:
+                if isColon && i + 1 < len(text) && text[i + 1] == ':':
+                    if seenCompress:
+                        return Err[Bytes]("multiaddress: ip6 multiple ::")
+                    seenCompress = true
+                    i = i + 1
+                    segmentStart = i + 1
+                else:
+                    if atEnd && seenCompress:
+                        break
+                    return Err[Bytes]("multiaddress: ip6 empty part")
+            else:
+                let partRes: Result[int32] = parseHexSegment(text, segmentStart, i - segmentStart)
+                if IsErr(partRes):
+                    return Err[Bytes](Error(partRes))
+                let value: int32 = Value(partRes)
+                if ! seenCompress:
+                    if headCount >= 8:
+                        return Err[Bytes]("multiaddress: ip6 parts")
+                    writeHextet(head, headCount, value)
+                    headCount = headCount + 1
+                else:
+                    if tailCount >= 8:
+                        return Err[Bytes]("multiaddress: ip6 parts")
+                    writeHextet(tail, tailCount, value)
+                    tailCount = tailCount + 1
+                if isColon && i + 1 < len(text) && text[i + 1] == ':':
+                    if seenCompress:
+                        return Err[Bytes]("multiaddress: ip6 multiple ::")
+                    seenCompress = true
+                    i = i + 1
+                segmentStart = i + 1
+        i = i + 1
+    if seenCompress:
+        if headCount + tailCount > 8:
+            return Err[Bytes]("multiaddress: ip6 parts")
+    else:
+        if headCount != 8:
+            return Err[Bytes]("multiaddress: ip6 parts")
+    let out: Bytes = bytesAlloc(16)
+    var outIdx: int32 = 0
+    var j: int32 = 0
+    while j < headCount:
+        bytesSet(out, outIdx, bytesGet(head, j * 2))
+        bytesSet(out, outIdx + 1, bytesGet(head, j * 2 + 1))
+        outIdx = outIdx + 2
+        j = j + 1
+    let zeroHextets: int32 = if seenCompress: 8 - (headCount + tailCount) else: 0
+    j = 0
+    while j < zeroHextets:
+        bytesSet(out, outIdx, 0)
+        bytesSet(out, outIdx + 1, 0)
+        outIdx = outIdx + 2
+        j = j + 1
+    j = 0
+    while j < tailCount:
+        bytesSet(out, outIdx, bytesGet(tail, j * 2))
+        bytesSet(out, outIdx + 1, bytesGet(tail, j * 2 + 1))
+        outIdx = outIdx + 2
+        j = j + 1
+    return Ok[Bytes](out)
+
+fn lowerAscii(text: str): str =
+    if len(text) <= 0:
+        return ""
+    var buf: ByteBuffer = newByteBuffer()
+    for i in 0..<len(text):
+        let c: char = text[i]
+        if c >= 'A' && c <= 'Z':
+            appendByte(buf, int32(c) + 32)
+        else:
+            appendByte(buf, int32(c))
+    return bytesToString(toBytes(buf))
+
+fn containsChar(text: str, needle: char): bool =
+    for i in 0..<len(text):
+        if text[i] == needle:
+            return true
+    return false
+
+fn splitHostPort(text: str): Result[HostPortPair] =
+    var colon: int32 = -1
+    for i in 0..<len(text):
+        if text[i] == ':':
+            if colon >= 0:
+                return Err[HostPortPair]("multiaddress: invalid onion")
+            colon = i
+    if colon <= 0 || colon >= len(text) - 1:
+        return Err[HostPortPair]("multiaddress: invalid onion")
+    let host: str = ustrings.sliceBytes(text, 0, colon)
+    let port: str = ustrings.sliceBytes(text, colon + 1, len(text) - colon - 1)
+    let out: HostPortPair = HostPortPair(host: host, port: port)
+    return Ok[HostPortPair](out)
+
+fn parseOnion(text: str, hostLen: int32, addrLen: int32): Result[Bytes] =
+    let partsRes = splitHostPort(text)
+    if ! partsRes.ok:
+        return ErrInfo[Bytes](partsRes.err)
+    let parts: HostPortPair = partsRes.value
+    let hostText: str = parts.host
+    if len(hostText) != hostLen:
+        return Err[Bytes]("multiaddress: onion host length")
+    let hostLower: str = lowerAscii(hostText)
+    let hostRes: Result[Bytes] = decodeBase32(hostLower)
+    if IsErr(hostRes):
+        return Err[Bytes](Error(hostRes))
+    let hostBytes: Bytes = Value(hostRes)
+    let hostSize: int32 = bytesLen(hostBytes)
+    if hostSize + 2 != addrLen:
+        return Err[Bytes]("multiaddress: onion host size")
+    let portText: str = parts.port
+    let portRes: Result[int32] = parseUIntRange(portText, 0, len(portText))
+    if IsErr(portRes):
+        return Err[Bytes](Error(portRes))
+    let port: int32 = Value(portRes)
+    if port <= 0 || port > 65535:
+        return Err[Bytes]("multiaddress: onion port out of range")
+    let out: Bytes = bytesAlloc(addrLen)
+    for i in 0..<hostSize:
+        bytesSet(out, i, bytesGet(hostBytes, i))
+    bytesSet(out, hostSize, (port >> 8) & 255)
+    bytesSet(out, hostSize + 1, port & 255)
+    return Ok[Bytes](out)
+
+fn parsePort(text: str): Result[Bytes] =
+    let numRes: Result[int32] = parseUIntRange(text, 0, len(text))
+    if IsErr(numRes):
+        return Err[Bytes](Error(numRes))
+    let port: int32 = Value(numRes)
+    if port < 0 || port > 65535:
+        return Err[Bytes]("multiaddress: port out of range")
+    let out: Bytes = bytesAlloc(2)
+    bytesSet(out, 0, (port >> 8) & 255)
+    bytesSet(out, 1, port & 255)
+    return Ok[Bytes](out)
+
+fn parsePeerIdBytes(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Err[Bytes]("multiaddress: empty peer id")
+    if len(text) >= 2 && text[0] == 'Q' && text[1] == 'm':
+        let b58Res: Result[Bytes] = decodeBase58(text)
+        if IsErr(b58Res):
+            return Err[Bytes](Error(b58Res))
+        let mhRes: Result[MultiHash] = decodeMultihash(Value(b58Res))
+        if IsErr(mhRes):
+            return Err[Bytes](Error(mhRes))
+        return Ok[Bytes](Value(b58Res))
+    let mbRes: Result[Bytes] = decodeMultibase(text)
+    if IsOk(mbRes):
+        let mhRes: Result[MultiHash] = decodeMultihash(Value(mbRes))
+        if IsErr(mhRes):
+            return Err[Bytes](Error(mhRes))
+        return Ok[Bytes](Value(mbRes))
+    let b58Res: Result[Bytes] = decodeBase58(text)
+    if IsErr(b58Res):
+        return Err[Bytes](Error(b58Res))
+    let mhRes: Result[MultiHash] = decodeMultihash(Value(b58Res))
+    if IsErr(mhRes):
+        return Err[Bytes](Error(mhRes))
+    return Ok[Bytes](Value(b58Res))
+
+fn encodeProtoValue(proto: Protocol, text: str): Result[Bytes] =
+    if proto.code == protoIp4.code:
+        return parseIPv4(text)
+    if proto.code == protoIp6.code:
+        return parseIPv6(text)
+    if proto.code == protoTcp.code || proto.code == protoUdp.code || proto.code == protoDccp.code || proto.code == protoSctp.code:
+        return parsePort(text)
+    if proto.code == protoDns.code || proto.code == protoDns4.code || proto.code == protoDns6.code || proto.code == protoDnsAddr.code:
+        if len(text) <= 0:
+            return Err[Bytes]("multiaddress: empty dns")
+        return Ok[Bytes](bytesFromString(text))
+    if proto.code == protoIp6Zone.code:
+        if len(text) <= 0:
+            return Err[Bytes]("multiaddress: empty ip6zone")
+        if containsChar(text, '/'):
+            return Err[Bytes]("multiaddress: invalid ip6zone")
+        return Ok[Bytes](bytesFromString(text))
+    if proto.code == protoUnix.code || proto.code == 0x0309:
+        if len(text) <= 0:
+            return Err[Bytes]("multiaddress: empty path")
+        return Ok[Bytes](bytesFromString(text))
+    if proto.code == protoCerthash.code:
+        if len(text) <= 0:
+            return Err[Bytes]("multiaddress: empty certhash")
+        let mbRes: Result[Bytes] = decodeMultibase(text)
+        if IsErr(mbRes):
+            return Err[Bytes](Error(mbRes))
+        let payload: Bytes = Value(mbRes)
+        if ! validateMultihashBytes(payload):
+            return Err[Bytes]("multiaddress: invalid certhash")
+        return Ok[Bytes](payload)
+    if proto.code == protoOnion.code:
+        return parseOnion(text, 16, 12)
+    if proto.code == protoOnion3.code:
+        return parseOnion(text, 56, 37)
+    if proto.code == protoP2p.code || proto.code == protoIpfs.code:
+        return parsePeerIdBytes(text)
+    return Err[Bytes]("multiaddress: unsupported protocol value")
+
+fn intToString(value: int32): str =
+    if value == 0:
+        return "0"
+    var v: int32 = value
+    var buf: ByteBuffer = newByteBuffer()
+    while v > 0:
+        let digit: int32 = v % 10
+        appendByte(buf, int32('0') + digit)
+        v = v / 10
+    let rev: Bytes = toBytes(buf)
+    let out: Bytes = bytesAlloc(bytesLen(rev))
+    for i in 0..<bytesLen(rev):
+        let srcIdx: int32 = bytesLen(rev) - 1 - i
+        bytesSet(out, i, bytesGet(rev, srcIdx))
+    return bytesToString(out)
+
+fn hextetToString(value: int32): str =
+    if value == 0:
+        return "0"
+    var v: int32 = value
+    var buf: ByteBuffer = newByteBuffer()
+    while v > 0:
+        let digit: int32 = v & 15
+        let ch: int32 = if digit < 10: int32('0') + digit else: int32('a') + (digit - 10)
+        appendByte(buf, ch)
+        v = v >> 4
+    let rev: Bytes = toBytes(buf)
+    let out: Bytes = bytesAlloc(bytesLen(rev))
+    for i in 0..<bytesLen(rev):
+        let srcIdx: int32 = bytesLen(rev) - 1 - i
+        bytesSet(out, i, bytesGet(rev, srcIdx))
+    return bytesToString(out)
+
+fn ipv4ToString(data: Bytes): str =
+    if bytesLen(data) != 4:
+        return ""
+    var out: str = ""
+    for i in 0..<4:
+        out = out + intToString(bytesGet(data, i))
+        if i < 3:
+            out = out + "."
+    return out
+
+fn ipv6ToString(data: Bytes): str =
+    if bytesLen(data) != 16:
+        return ""
+    var bestStart: int32 = -1
+    var bestLen: int32 = 0
+    var curStart: int32 = -1
+    var curLen: int32 = 0
+    var i: int32 = 0
+    while i < 8:
+        let hi: int32 = bytesGet(data, i * 2)
+        let lo: int32 = bytesGet(data, i * 2 + 1)
+        let value: int32 = (hi << 8) + lo
+        if value == 0:
+            if curStart < 0:
+                curStart = i
+                curLen = 1
+            else:
+                curLen = curLen + 1
+        else:
+            if curStart >= 0:
+                if curLen > bestLen:
+                    bestStart = curStart
+                    bestLen = curLen
+                curStart = -1
+                curLen = 0
+        i = i + 1
+    if curStart >= 0 && curLen > bestLen:
+        bestStart = curStart
+        bestLen = curLen
+    if bestLen < 2:
+        bestStart = -1
+        bestLen = 0
+    var out: str = ""
+    i = 0
+    while i < 8:
+        if bestStart >= 0 && i == bestStart:
+            if len(out) == 0:
+                out = "::"
+            else:
+                out = out + "::"
+            i = i + bestLen
+            if i >= 8:
+                break
+        else:
+            let hi: int32 = bytesGet(data, i * 2)
+            let lo: int32 = bytesGet(data, i * 2 + 1)
+            let value: int32 = (hi << 8) + lo
+            if len(out) > 0 && out[len(out) - 1] != ':':
+                out = out + ":"
+            out = out + hextetToString(value)
+            i = i + 1
+    return out
+
+fn onionToString(data: Bytes, hostSize: int32): Result[str] =
+    let totalLen: int32 = bytesLen(data)
+    if totalLen != hostSize + 2:
+        return Err[str]("multiaddress: onion length")
+    let hostBytes: Bytes = bytesSlice(data, 0, hostSize)
+    let host: str = encodeBase32(hostBytes)
+    let port: int32 = (bytesGet(data, hostSize) << 8) + bytesGet(data, hostSize + 1)
+    let portText: str = intToString(port)
+    return Ok[str](host + ":" + portText)
+
+fn portToString(data: Bytes): str =
+    if bytesLen(data) != 2:
+        return ""
+    let port: int32 = (bytesGet(data, 0) << 8) + bytesGet(data, 1)
+    return intToString(port)
+
+fn decodeProtoValue(proto: Protocol, data: Bytes): Result[str] =
+    if proto.code == protoIp4.code:
+        return Ok[str](ipv4ToString(data))
+    if proto.code == protoIp6.code:
+        return Ok[str](ipv6ToString(data))
+    if proto.code == protoTcp.code || proto.code == protoUdp.code || proto.code == protoDccp.code || proto.code == protoSctp.code:
+        return Ok[str](portToString(data))
+    if proto.code == protoDns.code || proto.code == protoDns4.code || proto.code == protoDns6.code || proto.code == protoDnsAddr.code:
+        return Ok[str](bytesToString(data))
+    if proto.code == protoIp6Zone.code:
+        let text: str = bytesToString(data)
+        if containsChar(text, '/'):
+            return Err[str]("multiaddress: invalid ip6zone")
+        return Ok[str](text)
+    if proto.code == protoUnix.code || proto.code == 0x0309:
+        return Ok[str](bytesToString(data))
+    if proto.code == protoCerthash.code:
+        if ! validateMultihashBytes(data):
+            return Err[str]("multiaddress: invalid certhash")
+        return encodeMultibase(baseBase64Url, data)
+    if proto.code == protoOnion.code:
+        return onionToString(data, 10)
+    if proto.code == protoOnion3.code:
+        return onionToString(data, 35)
+    if proto.code == protoP2p.code || proto.code == protoIpfs.code:
+        let mhRes: Result[MultiHash] = decodeMultihash(data)
+        if IsErr(mhRes):
+            return Err[str](Error(mhRes))
+        return Ok[str](encodeBase58(data))
+    return Err[str]("multiaddress: unsupported protocol value")
+
+fn parseMultiAddress(text: str): Result[MultiAddress] =
+    if len(text) <= 0:
+        return Err[MultiAddress]("multiaddress: empty")
+    if text[0] != '/':
+        return Err[MultiAddress]("multiaddress: must start with '/'")
+    var buf: ByteBuffer = newByteBuffer()
+    var idx: int32 = 1
+    while idx < len(text):
+        let segRes: Result[SegmentRead] = readSegment(text, idx)
+        if IsErr(segRes):
+            return Err[MultiAddress]("multiaddress: segment")
+        let seg: SegmentRead = Value(segRes)
+        let protoRes: Result[Protocol] = protoByName(seg.seg)
+        if IsErr(protoRes):
+            return Err[MultiAddress]("multiaddress: protocol")
+        let proto: Protocol = Value(protoRes)
+        appendBytes(buf, encodeUVarint(proto.code))
+        idx = seg.next
+        if proto.size == 0:
+            continue
+        if idx >= len(text):
+            return Err[MultiAddress]("multiaddress: missing value")
+        let valSegRes: Result[SegmentRead] = readSegment(text, idx)
+        if IsErr(valSegRes):
+            return Err[MultiAddress]("multiaddress: value segment")
+        let valSeg: SegmentRead = Value(valSegRes)
+        let valueBytesRes: Result[Bytes] = encodeProtoValue(proto, valSeg.seg)
+        if IsErr(valueBytesRes):
+            return Err[MultiAddress]("multiaddress: encode value")
+        let valueBytes: Bytes = Value(valueBytesRes)
+        if proto.size == -1:
+            appendBytes(buf, encodeUVarint(bytesLen(valueBytes)))
+            appendBytes(buf, valueBytes)
+        else:
+            if bytesLen(valueBytes) != proto.size:
+                return Err[MultiAddress]("multiaddress: size mismatch")
+            appendBytes(buf, valueBytes)
+        idx = valSeg.next
+    return Ok[MultiAddress](MultiAddress(raw: text, data: toBytes(buf)))
+
+fn parseMultiAddressBytes(data: Bytes): Result[MultiAddress] =
+    var idx: int32 = 0
+    var text: str = ""
+    while idx < bytesLen(data):
+        let codeRes: Result[VarintDecoded] = decodeUVarint(data, idx)
+        if IsErr(codeRes):
+            return Err[MultiAddress](Error(codeRes))
+        let codeDec: VarintDecoded = Value(codeRes)
+        let protoRes: Result[Protocol] = protoByCode(codeDec.value)
+        if ! protoRes.ok:
+            return ErrInfo[MultiAddress](protoRes.err)
+        let proto: Protocol = protoRes.value
+        idx = codeDec.next
+        text = text + "/"
+        text = text + proto.name
+        if proto.size == 0:
+            continue
+        var valueLen: int32 = proto.size
+        if proto.size == -1:
+            let lenRes: Result[VarintDecoded] = decodeUVarint(data, idx)
+            if IsErr(lenRes):
+                return Err[MultiAddress](Error(lenRes))
+            let lenDec: VarintDecoded = Value(lenRes)
+            valueLen = int32(lenDec.value)
+            idx = lenDec.next
+        if valueLen < 0 || idx + valueLen > bytesLen(data):
+            return Err[MultiAddress]("multiaddress: value out of range")
+        let valueBytes: Bytes = bytesSlice(data, idx, valueLen)
+        let valueTextRes: Result[str] = decodeProtoValue(proto, valueBytes)
+        if IsErr(valueTextRes):
+            return Err[MultiAddress](Error(valueTextRes))
+        text = text + "/"
+        text = text + Value(valueTextRes)
+        idx = idx + valueLen
+    return Ok[MultiAddress](MultiAddress(raw: text, data: data))
+
+fn toString(addr: MultiAddress): str =
+    if bytesLen(addr.data) > 0:
+        let res: Result[MultiAddress] = parseMultiAddressBytes(addr.data)
+        if ! IsErr(res):
+            return Value(res).raw
+    return addr.raw
+
+fn toBytes(addr: MultiAddress): Bytes =
+    addr.data
+
+fn write(pb: var ProtoBuffer, field: int32, addr: MultiAddress) =
+    if ! pb.writing:
+        pb.writing = true
+    writeFieldHeader(pb, field, Length)
+    let src: Bytes = addr.data
+    let srcLen: int32 = bytesLen(src)
+    appendBytes(pb.out, encodeUVarint(srcLen))
+    appendBytes(pb.out, src)
+
+fn getField(pb: ProtoBuffer, field: int32, output: var MultiAddress): Result[bool] =
+    var raw: Bytes = emptyBytes()
+    let res: Result[bool] = getField(pb, field, raw)
+    if IsErr(res):
+        return Err[bool](Error(res))
+    if ! Value(res):
+        return Ok[bool](false)
+    let addrRes: Result[MultiAddress] = parseMultiAddressBytes(raw)
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    output = Value(addrRes)
+    return Ok[bool](true)

@@ -1,0 +1,71 @@
+# Transport memory manager(minimal).
+
+import std/result
+const
+    transportMemoryMaxInt64Value = 9223372036854775807
+
+type
+    TransportMemoryConfig =
+        enabled: bool
+        limitBytes: int64
+
+    TransportMemoryStats =
+        usedBytes: int64
+        peakBytes: int64
+
+    TransportMemoryManager =
+        config: TransportMemoryConfig
+        stats: TransportMemoryStats
+
+var
+    transportMemoryManager: TransportMemoryManager = TransportMemoryManager(
+        config: TransportMemoryConfig(enabled: true, limitBytes: 0),
+        stats: TransportMemoryStats(usedBytes: 0, peakBytes: 0)
+    )
+
+fn initTransportMemoryConfig(): TransportMemoryConfig =
+    TransportMemoryConfig(enabled: true, limitBytes: 0)
+
+fn setTransportMemoryConfig(config: TransportMemoryConfig) =
+    transportMemoryManager.config = config
+
+fn transportMemoryEnabled(): bool =
+    transportMemoryManager.config.enabled
+
+fn resetTransportMemoryStats() =
+    transportMemoryManager.stats = TransportMemoryStats(usedBytes: 0, peakBytes: 0)
+
+fn transportMemoryUsed(): int64 =
+    transportMemoryManager.stats.usedBytes
+
+fn transportMemoryPeak(): int64 =
+    transportMemoryManager.stats.peakBytes
+
+fn addNoOverflow(current: int64, delta: int64): Result[int64] =
+    if delta < 0:
+        return Err[int64]("transport memory: negative bytes")
+    if delta > 0 && current > transportMemoryMaxInt64Value - delta:
+        return Err[int64]("transport memory: overflow")
+    return Ok[int64](current + delta)
+
+fn reserveTransportMemory(bytes: int64): Result[bool] =
+    if ! transportMemoryEnabled():
+        return Ok[bool](false)
+    let nextRes: Result[int64] = addNoOverflow(transportMemoryManager.stats.usedBytes, bytes)
+    if IsErr(nextRes):
+        return Err[bool](Error(nextRes))
+    let next: int64 = Value(nextRes)
+    if transportMemoryManager.config.limitBytes > 0 && next > transportMemoryManager.config.limitBytes:
+        return Err[bool]("transport memory: limit exceeded")
+    transportMemoryManager.stats.usedBytes = next
+    if next > transportMemoryManager.stats.peakBytes:
+        transportMemoryManager.stats.peakBytes = next
+    return Ok[bool](true)
+
+fn releaseTransportMemory(bytes: int64): Result[bool] =
+    if bytes < 0:
+        return Err[bool]("transport memory: negative bytes")
+    if bytes > transportMemoryManager.stats.usedBytes:
+        return Err[bool]("transport memory: release exceeds usage")
+    transportMemoryManager.stats.usedBytes = transportMemoryManager.stats.usedBytes - bytes
+    return Ok[bool](true)

@@ -1,0 +1,178 @@
+# Shared builder-local object-local/frame metadata helpers split from uir_core_builder.
+import std/seqs
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_scope_helpers
+import backend/uir/uir_internal/uir_core_builder_text_helpers
+
+fn uir_core_builder_obj_local_state_add(dst: var UirCoreObjLocal[], val: UirCoreObjLocal) =
+    seqs.add(dst, val)
+
+fn funcFindObjLocal(func: UirCoreFunc, slot: int32): int32 =
+    if (!uirCoreFuncIdValid(func)):
+        return -1
+    for i in 0..<uirCoreFuncObjLocalsLen(func):
+        let ol: UirCoreObjLocal = uirCoreFuncObjLocalAt(func, i)
+        if ol.slot == slot:
+            return i
+    return -1
+
+fn funcFindObjLocalByPtrKey(ptrKey: int64, slot: int32): int32 =
+    let dyn: UirCoreFuncDynState = uirCoreEnsureFuncDynByPtrKey(ptrKey)
+    if dyn == nil:
+        return -1
+    for i in 0..<dyn.objLocals.len:
+        let ol: UirCoreObjLocal = dyn.objLocals[i]
+        if ol.slot == slot:
+            return i
+    return -1
+
+fn funcObjTypeName(func: UirCoreFunc, slot: int32): str =
+    let idx: int32 = funcFindObjLocal(func, slot)
+    if idx < 0:
+        return ""
+    let ol: UirCoreObjLocal = uirCoreFuncObjLocalAt(func, idx)
+    return ol.objTypeName
+
+fn funcObjTypeKey(func: UirCoreFunc, slot: int32): str =
+    let idx: int32 = funcFindObjLocal(func, slot)
+    if idx < 0:
+        return ""
+    let ol: UirCoreObjLocal = uirCoreFuncObjLocalAt(func, idx)
+    if len(ol.typeKey) > 0:
+        return ol.typeKey
+    return ol.objTypeName
+
+fn uirCoreDebugBuildMainState(tag: str, f: UirCoreFunc): void =
+    let externDbg: bool = uirCoreFuncIsExtern(f)
+    let nameDbg: str = uirCoreFuncNameOf(f)
+    echo("[backend] dbg_build_main." + tag +
+         " dyn_id=" + intToStr(uirCoreFuncDynId(f)) +
+         " obj_extern=" + (externDbg ? "1" : "0") +
+         " dyn_extern=" + (externDbg ? "1" : "0") +
+         " obj_name=" + nameDbg +
+         " dyn_name=" + nameDbg +
+         " blocks=" + intToStr(uirCoreFuncBlocksLen(f)) +
+         " ptr=" + int64ToStr(uirCoreFuncPtrKey(f)))
+
+fn uirCoreHiddenResultSlot(env: LocalEnv, func: UirCoreFunc): int32 =
+    if env == nil:
+        return -1
+    let resultSlot: int32 = localIndex(env, "__result")
+    if !uirCoreFuncIdValid(func):
+        return resultSlot
+    let retSlot: int32 = localIndex(env, "__ret")
+    if retSlot >= 0 && len(funcObjTypeName(func, retSlot)) > 0:
+        return retSlot
+    return resultSlot
+
+fn uirCoreResolveLocalSlotOrImplicitResult(env: LocalEnv, func: UirCoreFunc, name0: str): int32 =
+    if env == nil:
+        return -1
+    let name: str = backendStripSpaces(name0)
+    if len(name) == 0:
+        return -1
+    let slot: int32 = localIndex(env, name)
+    if slot >= 0:
+        return slot
+    if name == "result":
+        return uirCoreHiddenResultSlot(env, func)
+    return -1
+
+fn uirCoreMarkImplicitResultUse(b: BlockBuilder, name0: str, slot: int32) =
+    if (b == nil) || slot < 0:
+        return
+    let name: str = backendStripSpaces(name0)
+    if name != "result":
+        return
+    if localIndex(b.env, name) >= 0:
+        return
+    if slot == uirCoreHiddenResultSlot(b.env, blockBuilderFuncRef(b)):
+        b.implicitResultUsed = true
+
+fn funcSetObjTypeKey(func: UirCoreFunc, slot: int32, typeKey: str) =
+    if (!uirCoreFuncIdValid(func)) || len(typeKey) == 0:
+        return
+    let idx: int32 = funcFindObjLocal(func, slot)
+    if idx < 0:
+        return
+    var ol: UirCoreObjLocal = uirCoreFuncObjLocalAt(func, idx)
+    ol.typeKey = typeKey
+    uirCoreFuncSetObjLocalAt(func, idx, ol)
+
+fn funcAddObjLocalKnownNew(func: UirCoreFunc, slot: int32, objTypeName: str,
+                           frameOff: int32, typeKey: str = "") =
+    if (!uirCoreFuncIdValid(func)) || len(objTypeName) == 0:
+        return
+    let objTypeOwned: str = uirCoreOwnStrSafe(objTypeName)
+    let typeKeyOwned: str = len(typeKey) > 0 ? uirCoreOwnStrSafe(typeKey) : objTypeOwned
+    var ol: UirCoreObjLocal
+    ol.slot = slot
+    ol.objTypeName = objTypeOwned
+    ol.typeKey = typeKeyOwned
+    ol.frameOff = frameOff
+    uirCoreFuncAddObjLocal(func, ol)
+
+fn funcSetObjTypeKeyByPtrKey(ptrKey: int64, slot: int32, typeKey: str) =
+    if len(typeKey) == 0:
+        return
+    let dyn: UirCoreFuncDynState = uirCoreEnsureFuncDynByPtrKey(ptrKey)
+    if dyn == nil:
+        return
+    let idx: int32 = funcFindObjLocalByPtrKey(ptrKey, slot)
+    if idx < 0:
+        return
+    var objLocals0: UirCoreObjLocal[] = dyn.objLocals
+    var ol: UirCoreObjLocal = objLocals0[idx]
+    ol.typeKey = typeKey
+    objLocals0[idx] = ol
+    dyn.objLocals = objLocals0
+    uirCoreFuncSyncObjPayloadByPtrKey(ptrKey, dyn)
+
+fn funcSetObjLocal(func: UirCoreFunc, slot: int32, objTypeName: str, frameOff: int32) =
+    if (!uirCoreFuncIdValid(func)) || len(objTypeName) == 0:
+        return
+    let idx: int32 = funcFindObjLocal(func, slot)
+    let objTypeOwned: str = uirCoreOwnStrSafe(objTypeName)
+    var ol: UirCoreObjLocal
+    ol.slot = slot
+    ol.objTypeName = objTypeOwned
+    ol.typeKey = objTypeOwned
+    ol.frameOff = frameOff
+    if idx >= 0:
+        uirCoreFuncSetObjLocalAt(func, idx, ol)
+        return
+    uirCoreFuncAddObjLocal(func, ol)
+
+fn funcSetObjLocalByPtrKey(ptrKey: int64, slot: int32, objTypeName: str, frameOff: int32) =
+    if len(objTypeName) == 0:
+        return
+    let dyn: UirCoreFuncDynState = uirCoreEnsureFuncDynByPtrKey(ptrKey)
+    if dyn == nil:
+        return
+    let idx: int32 = funcFindObjLocalByPtrKey(ptrKey, slot)
+    let objTypeOwned: str = uirCoreOwnStrSafe(objTypeName)
+    var ol: UirCoreObjLocal
+    ol.slot = slot
+    ol.objTypeName = objTypeOwned
+    ol.typeKey = objTypeOwned
+    ol.frameOff = frameOff
+    var objLocals0: UirCoreObjLocal[] = dyn.objLocals
+    if idx >= 0:
+        objLocals0[idx] = ol
+    else:
+        uir_core_builder_obj_local_state_add(objLocals0, ol)
+    dyn.objLocals = objLocals0
+    uirCoreFuncSyncObjPayloadByPtrKey(ptrKey, dyn)
+
+fn funcObjFrameSizeOfPtrKey(ptrKey: int64): int32 =
+    let dyn: UirCoreFuncDynState = uirCoreEnsureFuncDynByPtrKey(ptrKey)
+    if dyn == nil:
+        return 0
+    return dyn.objFrameSize
+
+fn funcSetObjFrameSizeByPtrKey(ptrKey: int64, objFrameSize: int32) =
+    let dyn: UirCoreFuncDynState = uirCoreEnsureFuncDynByPtrKey(ptrKey)
+    if dyn == nil:
+        return
+    dyn.objFrameSize = objFrameSize

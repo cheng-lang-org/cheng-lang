@@ -1,0 +1,140 @@
+import std/os
+import libp2p/utils/bytes as bytes
+import libp2p/utils/result as result
+
+const
+    fileInt32Max: int64 = int64(2147483647)
+
+fn readFileBytes(path: str): result.Result[bytes.Bytes] =
+    if len(path) == 0:
+        return result.Err[bytes.Bytes]("file: empty path")
+    let f: os.File = os.open(path, os.fmRead)
+    if f == nil:
+        return result.Err[bytes.Bytes]("file: open failed")
+    var cap: int32 = 4096
+    var lenRead: int32 = 0
+    var meterRead: int64 = 0
+    var buf: bytes.Bytes = bytes.bytesAlloc(cap)
+    if bytes.bytesLen(buf) < cap:
+        os.close(f)
+        return result.Err[bytes.Bytes]("file: alloc failed")
+    while true:
+        let ch: int32 = os.c_fgetc(f)
+        if ch < 0:
+            break
+        if lenRead >= cap:
+            let nextCap: int32 = cap * 2
+            var nextBuf: bytes.Bytes = bytes.bytesAlloc(nextCap)
+            if bytes.bytesLen(nextBuf) < nextCap:
+                os.close(f)
+                return result.Err[bytes.Bytes]("file: realloc failed")
+            for i in 0..<lenRead:
+                bytes.bytesSet(nextBuf, i, bytes.bytesGet(buf, i))
+            buf = nextBuf
+            cap = nextCap
+        bytes.bytesSet(buf, lenRead, ch)
+        lenRead = lenRead + 1
+        meterRead = meterRead + 1
+    os.close(f)
+    if meterRead > 0:
+        os.ioMeterReport(os.ioRead, meterRead)
+    if lenRead <= 0:
+        return result.Ok[bytes.Bytes](bytes.emptyBytes())
+    buf.len = lenRead
+    return result.Ok[bytes.Bytes](buf)
+
+fn writeFileBytes(path: str, data: bytes.Bytes): result.Result[bool] =
+    if len(path) == 0:
+        return result.Err[bool]("file: empty path")
+    let f: os.File = os.open(path, os.fmWrite)
+    if f == nil:
+        return result.Err[bool]("file: open failed")
+    let total: int32 = bytes.bytesLen(data)
+    if total > 0:
+        let wrote: int32 = os.c_fwrite(data.data, 1, int64(total), f)
+        if wrote > 0:
+            os.ioMeterReport(os.ioWrite, int64(wrote))
+        os.close(f)
+        if wrote != total:
+            return result.Err[bool]("file: short write")
+        return result.Ok[bool](true)
+    os.close(f)
+    return result.Ok[bool](true)
+
+fn fileSizeBytes(path: str): result.Result[int64] =
+    if len(path) == 0:
+        return result.Err[int64]("file: empty path")
+    let size: int64 = os.fileSize(path)
+    if size < 0:
+        return result.Err[int64]("file: size failed")
+    return result.Ok[int64](size)
+
+fn readFileSlice(path: str, offset: int64, length: int32): result.Result[bytes.Bytes] =
+    if len(path) == 0:
+        return result.Err[bytes.Bytes]("file: empty path")
+    if length <= 0:
+        return result.Ok[bytes.Bytes](bytes.emptyBytes())
+    if offset < 0:
+        return result.Err[bytes.Bytes]("file: invalid offset")
+    let allRes: result.Result[bytes.Bytes] = readFileBytes(path)
+    if result.IsErr(allRes):
+        return result.Err[bytes.Bytes](result.Error(allRes))
+    let all: bytes.Bytes = result.Value(allRes)
+    let total: int32 = bytes.bytesLen(all)
+    if offset >= int64(total):
+        return result.Ok[bytes.Bytes](bytes.emptyBytes())
+    let start: int32 = int32(offset)
+    var take: int32 = length
+    let remain: int32 = total - start
+    if take > remain:
+        take = remain
+    var out: bytes.Bytes = bytes.bytesAlloc(take)
+    if bytes.bytesLen(out) < take:
+        return result.Err[bytes.Bytes]("file: alloc failed")
+    for i in 0..<take:
+        bytes.bytesSet(out, i, bytes.bytesGet(all, start + i))
+    return result.Ok[bytes.Bytes](out)
+
+fn writeFileSlice(path: str, offset: int64, data: bytes.Bytes): result.Result[bool] =
+    if len(path) == 0:
+        return result.Err[bool]("file: empty path")
+    if offset < 0:
+        return result.Err[bool]("file: invalid offset")
+    if offset > fileInt32Max:
+        return result.Err[bool]("file: invalid offset")
+    let total: int32 = bytes.bytesLen(data)
+    if total <= 0:
+        return result.Ok[bool](true)
+    var base: bytes.Bytes = bytes.emptyBytes()
+    if os.fileExists(path):
+        let readRes: result.Result[bytes.Bytes] = readFileBytes(path)
+        if result.IsErr(readRes):
+            return result.Err[bool](result.Error(readRes))
+        base = result.Value(readRes)
+    let start: int32 = int32(offset)
+    let baseLen: int32 = bytes.bytesLen(base)
+    let endPos64: int64 = int64(start) + int64(total)
+    if endPos64 > fileInt32Max:
+        return result.Err[bool]("file: slice too large")
+    let endPos: int32 = int32(endPos64)
+    var newLen: int32 = baseLen
+    if endPos > newLen:
+        newLen = endPos
+    var out: bytes.Bytes = bytes.bytesAlloc(newLen)
+    if bytes.bytesLen(out) < newLen:
+        return result.Err[bool]("file: alloc failed")
+    for i in 0..<baseLen:
+        bytes.bytesSet(out, i, bytes.bytesGet(base, i))
+    for i in 0..<total:
+        bytes.bytesSet(out, start + i, bytes.bytesGet(data, i))
+    return writeFileBytes(path, out)
+
+fn checksumFile(path: str): result.Result[int64] =
+    let readRes: result.Result[bytes.Bytes] = readFileBytes(path)
+    if result.IsErr(readRes):
+        return result.Err[int64](result.Error(readRes))
+    let data: bytes.Bytes = result.Value(readRes)
+    var sum: int64 = 0
+    for i in 0..<bytes.bytesLen(data):
+        sum = sum + int64(bytes.bytesGet(data, i))
+    return result.Ok[int64](sum)

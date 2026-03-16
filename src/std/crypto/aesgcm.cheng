@@ -1,0 +1,206 @@
+# AES-GCM AEAD(RFC 5116 / NIST SP 800-38D).
+
+import std/result
+import std/rawbytes
+import std/crypto/aes
+const
+    aesGcmNonceSize = 12
+    aesGcmTagSize = 16
+
+type
+    AesGcmKey =
+        rounds: int32
+        roundKeys: Bytes
+
+    AesGcmNonce =
+        data: Bytes
+
+    AesGcmTag =
+        data: Bytes
+
+    GcmShiftResult =
+        out: Bytes
+        lsb: int32
+
+fn intoAesGcmKey(data: Bytes): Result[AesGcmKey] =
+    let res: Result[AesRoundKeys] = aesKeyExpand(data)
+    if IsErr(res):
+        return Err[AesGcmKey](Error(res))
+    let keys: AesRoundKeys = Value(res)
+    return Ok[AesGcmKey](AesGcmKey(rounds: keys.rounds, roundKeys: keys.data))
+
+fn intoAesGcmNonce(data: Bytes): Result[AesGcmNonce] =
+    if bytesLen(data) != aesGcmNonceSize:
+        return Err[AesGcmNonce]("aesgcm: invalid nonce size")
+    return Ok[AesGcmNonce](AesGcmNonce(data: data))
+
+fn intoAesGcmTag(data: Bytes): Result[AesGcmTag] =
+    if bytesLen(data) != aesGcmTagSize:
+        return Err[AesGcmTag]("aesgcm: invalid tag size")
+    return Ok[AesGcmTag](AesGcmTag(data: data))
+
+fn gcmXorBlock(a: Bytes, b: Bytes): Bytes =
+    let out: Bytes = bytesAlloc(16)
+    for i in 0..<16:
+        bytesSet(out, i, bytesGet(a, i) ^ bytesGet(b, i))
+    return out
+
+fn gcmGetBit(data: Bytes, idx: int32): int32 =
+    let byteIdx: int32 = idx / 8
+    let bitIdx: int32 = 7 - (idx % 8)
+    return (bytesGet(data, byteIdx) >> bitIdx) & 1
+
+fn gcmShiftRight(data: Bytes): GcmShiftResult =
+    let out: Bytes = bytesAlloc(16)
+    var carry: int32 = 0
+    for i in 0..<16:
+        let b: int32 = bytesGet(data, i)
+        let newCarry: int32 = b & 1
+        let shifted: int32 = (b >> 1) | (carry << 7)
+        bytesSet(out, i, shifted)
+        carry = newCarry
+    return GcmShiftResult(out: out, lsb: carry)
+
+fn gcmMul(x: Bytes, y: Bytes): Bytes =
+    var z: Bytes = bytesAlloc(16)
+    var v: Bytes = bytesSlice(y, 0, 16)
+    for i in 0..<128:
+        if gcmGetBit(x, i) != 0:
+            z = gcmXorBlock(z, v)
+        let shiftRes = gcmShiftRight(v)
+        v = shiftRes.out
+        if shiftRes.lsb != 0:
+            bytesSet(v, 0, bytesGet(v, 0) ^ 0xe1)
+    return z
+
+fn gcmBlock(data: Bytes, offset: int32): Bytes =
+    let out: Bytes = bytesAlloc(16)
+    for i in 0..<16:
+        if !(offset + i < bytesLen(data)):
+            break
+        bytesSet(out, i, bytesGet(data, offset + i))
+    return out
+
+fn storeU64BE(buf: Bytes, offset: int32, value: int64) =
+    let v: int64 = value
+    bytesSet(buf, offset, int32((v >> 56) & 255))
+    bytesSet(buf, offset + 1, int32((v >> 48) & 255))
+    bytesSet(buf, offset + 2, int32((v >> 40) & 255))
+    bytesSet(buf, offset + 3, int32((v >> 32) & 255))
+    bytesSet(buf, offset + 4, int32((v >> 24) & 255))
+    bytesSet(buf, offset + 5, int32((v >> 16) & 255))
+    bytesSet(buf, offset + 6, int32((v >> 8) & 255))
+    bytesSet(buf, offset + 7, int32(v & 255))
+
+fn gcmLengthBlock(aadLen: int32, dataLen: int32): Bytes =
+    let out: Bytes = bytesAlloc(16)
+    let aadBits: int64 = int64(aadLen) * 8
+    let dataBits: int64 = int64(dataLen) * 8
+    storeU64BE(out, 0, aadBits)
+    storeU64BE(out, 8, dataBits)
+    return out
+
+fn ghash(h: Bytes, aad: Bytes, data: Bytes): Bytes =
+    var y: Bytes = bytesAlloc(16)
+    var offset: int32 = 0
+    while offset < bytesLen(aad):
+        let block: Bytes = gcmBlock(aad, offset)
+        y = gcmMul(gcmXorBlock(y, block), h)
+        offset = offset + 16
+    offset = 0
+    while offset < bytesLen(data):
+        let block: Bytes = gcmBlock(data, offset)
+        y = gcmMul(gcmXorBlock(y, block), h)
+        offset = offset + 16
+    let lenBlock: Bytes = gcmLengthBlock(bytesLen(aad), bytesLen(data))
+    y = gcmMul(gcmXorBlock(y, lenBlock), h)
+    return y
+
+fn aesGcmInc32(counter: Bytes): Bytes =
+    let out: Bytes = bytesSlice(counter, 0, 16)
+    let b0: int32 = bytesGet(out, 12)
+    let b1: int32 = bytesGet(out, 13)
+    let b2: int32 = bytesGet(out, 14)
+    let b3: int32 = bytesGet(out, 15)
+    let value: int64 = (int64(b0) << 24) | (int64(b1) << 16) | (int64(b2) << 8) | int64(b3)
+    let next: int64 = (value + 1) & ((int64(1) << 32) - 1)
+    bytesSet(out, 12, int32((next >> 24) & 255))
+    bytesSet(out, 13, int32((next >> 16) & 255))
+    bytesSet(out, 14, int32((next >> 8) & 255))
+    bytesSet(out, 15, int32(next & 255))
+    return out
+
+fn aesGcmXorCtr(keys: AesGcmKey, counter: Bytes, data: Bytes): Result[bool] =
+    var offset: int32 = 0
+    var ctr: Bytes = counter
+    let rk: AesRoundKeys = AesRoundKeys(rounds: keys.rounds, data: keys.roundKeys)
+    while offset < bytesLen(data):
+        ctr = aesGcmInc32(ctr)
+        let blockRes: Result[Bytes] = aesEncryptBlock(rk, ctr)
+        if IsErr(blockRes):
+            return Err[bool](Error(blockRes))
+        let block: Bytes = Value(blockRes)
+        for i in 0..<16:
+            if !(offset + i < bytesLen(data)):
+                break
+            bytesSet(data, offset + i, bytesGet(data, offset + i) ^ bytesGet(block, i))
+        offset = offset + 16
+    return Ok[bool](true)
+
+fn tagEqual(a: Bytes, b: Bytes): bool =
+    if bytesLen(a) != bytesLen(b):
+        return false
+    var diff: int32 = 0
+    for i in 0..<bytesLen(a):
+        diff = diff | (bytesGet(a, i) ^ bytesGet(b, i))
+    return diff == 0
+
+fn aesGcmEncrypt(key: AesGcmKey, nonce: AesGcmNonce, tag: var AesGcmTag, data: Bytes, aad: Bytes): Result[bool] =
+    if bytesLen(nonce.data) != aesGcmNonceSize:
+        return Err[bool]("aesgcm: invalid nonce")
+    let rk: AesRoundKeys = AesRoundKeys(rounds: key.rounds, data: key.roundKeys)
+    let zero: Bytes = bytesAlloc(16)
+    let hRes: Result[Bytes] = aesEncryptBlock(rk, zero)
+    if IsErr(hRes):
+        return Err[bool](Error(hRes))
+    let h: Bytes = Value(hRes)
+    let j0: Bytes = bytesAlloc(16)
+    for i in 0..<aesGcmNonceSize:
+        bytesSet(j0, i, bytesGet(nonce.data, i))
+    bytesSet(j0, 15, 1)
+    let ctrRes: Result[bool] = aesGcmXorCtr(key, j0, data)
+    if IsErr(ctrRes):
+        return Err[bool](Error(ctrRes))
+    let s: Bytes = ghash(h, aad, data)
+    let eRes: Result[Bytes] = aesEncryptBlock(rk, j0)
+    if IsErr(eRes):
+        return Err[bool](Error(eRes))
+    let tagBytes: Bytes = gcmXorBlock(Value(eRes), s)
+    # Avoid composite assignment to a `var` parameter (stage1 backend may mishandle it).
+    tag.data = tagBytes
+    return Ok[bool](true)
+
+fn aesGcmDecrypt(key: AesGcmKey, nonce: AesGcmNonce, tag: AesGcmTag, data: Bytes, aad: Bytes): Result[bool] =
+    if bytesLen(nonce.data) != aesGcmNonceSize:
+        return Err[bool]("aesgcm: invalid nonce")
+    let rk: AesRoundKeys = AesRoundKeys(rounds: key.rounds, data: key.roundKeys)
+    let zero: Bytes = bytesAlloc(16)
+    let hRes: Result[Bytes] = aesEncryptBlock(rk, zero)
+    if IsErr(hRes):
+        return Err[bool](Error(hRes))
+    let h: Bytes = Value(hRes)
+    let j0: Bytes = bytesAlloc(16)
+    for i in 0..<aesGcmNonceSize:
+        bytesSet(j0, i, bytesGet(nonce.data, i))
+    bytesSet(j0, 15, 1)
+    let s: Bytes = ghash(h, aad, data)
+    let eRes: Result[Bytes] = aesEncryptBlock(rk, j0)
+    if IsErr(eRes):
+        return Err[bool](Error(eRes))
+    let expect: Bytes = gcmXorBlock(Value(eRes), s)
+    if ! tagEqual(expect, tag.data):
+        return Err[bool]("aesgcm: tag mismatch")
+    let ctrRes: Result[bool] = aesGcmXorCtr(key, j0, data)
+    if IsErr(ctrRes):
+        return Err[bool](Error(ctrRes))
+    return Ok[bool](true)

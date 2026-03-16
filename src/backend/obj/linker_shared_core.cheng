@@ -1,0 +1,139 @@
+# Shared linker helpers for Darwin/Linux self-linkers.
+# Keep this module small and dependency-free so stage0/stage1 can reuse it.
+import std/os
+
+type
+    LinkerCoreFile = ptr
+
+var
+    linkerCoreAtomicWriteErrText: str = ""
+
+@importc("cheng_fopen")
+fn linkerCore_fopen(filename: cstring, mode: cstring): LinkerCoreFile
+@importc("cheng_fclose")
+fn linkerCore_fclose(f: LinkerCoreFile): int32
+@importc("cheng_fwrite")
+fn linkerCore_fwrite(ptr: ptr, size: int64, n: int64, stream: LinkerCoreFile): int32
+@importc("cheng_fflush")
+fn linkerCore_fflush(stream: LinkerCoreFile): int32
+@importc("cheng_errno")
+fn linkerCore_errno(): int32
+@importc("cheng_strerror")
+fn linkerCore_strerror(err: int32): cstring
+
+@importc("cheng_file_exists")
+fn linkerCore_file_exists(path: cstring): int32
+
+fn linkerCoreAlignUp(value: uint64, align: uint64): uint64 =
+    if align <= 1:
+        return value
+    let rem: uint64 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn linkerCoreStrContains(hay: str, needle: str): bool =
+    let n: int32 = len(hay)
+    let m: int32 = len(needle)
+    if m == 0:
+        return true
+    if n < m:
+        return false
+    for i in 0..n - m:
+        for j in 0..<m:
+            if !(hay[i + j] == needle[j]):
+                break
+        if j == m:
+            return true
+    return false
+
+fn linkerCoreTargetIsAndroid(target: str): bool =
+    if len(target) == 0:
+        return false
+    return linkerCoreStrContains(target, "android")
+
+fn linkerCoreTargetIsLinux(target: str): bool =
+    if len(target) == 0:
+        return false
+    if linkerCoreTargetIsAndroid(target):
+        return false
+    return linkerCoreStrContains(target, "linux")
+
+fn linkerCoreTargetIsDarwin(target: str): bool =
+    if len(target) == 0:
+        return false
+    return linkerCoreStrContains(target, "darwin") || linkerCoreStrContains(target, "apple")
+
+fn linkerCoreBuildTmpOutputPath(outputPath: str): str =
+    if len(outputPath) == 0:
+        return ""
+    return outputPath + ".tmp"
+
+fn linkerCorePathExists(path: str): bool =
+    if len(path) == 0:
+        return false
+    return linkerCore_file_exists(path) != 0
+
+fn linkerCoreAtomicWriteError(): str =
+    return linkerCoreAtomicWriteErrText
+
+fn linkerCoreSetAtomicWriteErr(msg: str) =
+    linkerCoreAtomicWriteErrText = msg
+
+fn linkerCoreErrText(): str =
+    let err: int32 = linkerCore_errno()
+    let textPtr: cstring = linkerCore_strerror(err)
+    if textPtr == nil:
+        return "errno=" + intToStr(err)
+    let text: str = str(textPtr)
+    return len(text) > 0 ? ("errno=" + intToStr(err) + " " + text) : ("errno=" + intToStr(err))
+
+fn linkerCoreWriteFileAtomic(outputPath: str, outBytes: uint8[]): bool =
+    linkerCoreSetAtomicWriteErr("")
+    if len(outputPath) == 0:
+        linkerCoreSetAtomicWriteErr("empty output path")
+        return false
+    let tmpPath: str = linkerCoreBuildTmpOutputPath(outputPath)
+    if len(tmpPath) == 0:
+        linkerCoreSetAtomicWriteErr("empty tmp path")
+        return false
+    # ATOM-08 输出事务：tmp + rename 发布最终产物，避免半写文件暴露给下游。
+    if linkerCorePathExists(tmpPath):
+        os.removeFile(tmpPath)
+    let f: LinkerCoreFile = linkerCore_fopen(cstring(tmpPath), "wb")
+    if f == nil:
+        linkerCoreSetAtomicWriteErr("fopen tmp failed: " + linkerCoreErrText())
+        return false
+    if outBytes.buffer != nil && outBytes.len > 0:
+        let wrote: int32 = linkerCore_fwrite(outBytes.buffer, 1, int64(outBytes.len), f)
+        if wrote != outBytes.len:
+            linkerCore_fclose(f)
+            os.removeFile(tmpPath)
+            linkerCoreSetAtomicWriteErr("fwrite tmp short write wrote=" +
+                                        intToStr(wrote) + " need=" + intToStr(outBytes.len) +
+                                        " " + linkerCoreErrText())
+            return false
+    if linkerCore_fflush(f) != 0:
+        linkerCore_fclose(f)
+        os.removeFile(tmpPath)
+        linkerCoreSetAtomicWriteErr("fflush tmp failed: " + linkerCoreErrText())
+        return false
+    if linkerCore_fclose(f) != 0:
+        os.removeFile(tmpPath)
+        linkerCoreSetAtomicWriteErr("fclose tmp failed: " + linkerCoreErrText())
+        return false
+    if !linkerCorePathExists(tmpPath):
+        linkerCoreSetAtomicWriteErr("tmp not materialized after write")
+        return false
+    if os.renameFile(tmpPath, outputPath):
+        return true
+    # Windows rename may fail when destination exists; fallback remove+rename.
+    if linkerCorePathExists(outputPath):
+        os.removeFile(outputPath)
+        if os.renameFile(tmpPath, outputPath):
+            return true
+        linkerCoreSetAtomicWriteErr("rename after remove failed")
+    else:
+        linkerCoreSetAtomicWriteErr("rename tmp failed")
+    os.removeFile(tmpPath)
+    return false

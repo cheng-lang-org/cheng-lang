@@ -1,0 +1,104 @@
+import cheng/libp2p/utils/result
+import cheng/libp2p/crypto/crypto
+import cheng/libp2p/crypto/rand
+import cheng/libp2p/multiaddress
+import cheng/libp2p/peerid
+import cheng/libp2p/discovery/discoverymngr
+import cheng/libp2p/discovery/mdns
+
+fn checkEncodeDecodeFailurePaths(): Result[bool] =
+    let emptyNameRes: Result[Bytes] = mdnsEncodeName("")
+    if IsOk(emptyNameRes):
+        return Err[bool]("smoke: mdnsEncodeName should fail on empty name")
+    let invalidDecode: Result[MdnsNameDecoded] = mdnsDecodeName(bytesFromString(""), 1)
+    if IsOk(invalidDecode):
+        return Err[bool]("smoke: mdnsDecodeName should fail on invalid offset")
+    return Ok[bool](true)
+
+fn runMdnsSmoke(): Result[bool] =
+    var config: MdnsConfig = initMdnsConfig()
+    config.enableNetwork = false
+    config.bindPort = 5533
+    config.queryTimeoutMs = 50
+    setMdnsConfig(config)
+    setMdnsState(initMdnsState())
+
+    let failPathRes: Result[bool] = checkEncodeDecodeFailurePaths()
+    if IsErr(failPathRes):
+        return Err[bool](Error(failPathRes))
+
+    let nameRes: Result[Bytes] = mdnsEncodeName("peer._libp2p._udp.local")
+    if IsErr(nameRes):
+        return Err[bool](Error(nameRes))
+    let decodeRes: Result[MdnsNameDecoded] = mdnsDecodeName(Value(nameRes), 0)
+    if IsErr(decodeRes):
+        return Err[bool](Error(decodeRes))
+    let decoded: MdnsNameDecoded = Value(decodeRes)
+    if decoded.name != "peer._libp2p._udp.local":
+        return Err[bool]("smoke: mdns name decode mismatch")
+
+    setRandomSeed(bytesFromString("cheng-mdns-smoke"))
+    let kpRes: Result[KeyPair] = generateKeyPair()
+    if IsErr(kpRes):
+        return Err[bool](Error(kpRes))
+    let kp: KeyPair = Value(kpRes)
+    let pidRes: Result[PeerId] = peerIdFromPrivateKey(kp.privateKey)
+    if IsErr(pidRes):
+        return Err[bool](Error(pidRes))
+    let pid: PeerId = Value(pidRes)
+
+    let addrRes: Result[MultiAddress] = parseMultiAddress("/memory/55")
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    var attrs: PeerAttributes = initPeerAttributes()
+    let addPidRes: Result[bool] = peerAttributesAddPeerId(attrs, pid)
+    if IsErr(addPidRes):
+        return Err[bool](Error(addPidRes))
+    let addAddrRes: Result[bool] = peerAttributesAddAddress(attrs, Value(addrRes))
+    if IsErr(addAddrRes):
+        return Err[bool](Error(addAddrRes))
+    let addSvcRes: Result[bool] = peerAttributesAddService(attrs, "mdns-smoke")
+    if IsErr(addSvcRes):
+        return Err[bool](Error(addSvcRes))
+
+    let advRes: Result[bool] = mdnsAdvertise(attrs)
+    if IsErr(advRes):
+        return Err[bool](Error(advRes))
+    let mdnsState: MdnsState = getMdnsState()
+    let ttlRes: Result[int64] = mdnsClampTtl(mdnsState.config)
+    if IsErr(ttlRes):
+        return Err[bool](Error(ttlRes))
+    let respRes: Result[Bytes] = mdnsBuildResponse(attrs, Value(ttlRes), mdnsState.config)
+    if IsErr(respRes):
+        return Err[bool](Error(respRes))
+    let handleRes: Result[int32] = mdnsHandlePacket(Value(respRes), epochTimeNs())
+    if IsErr(handleRes):
+        return Err[bool](Error(handleRes))
+
+    var query: PeerAttributes = initPeerAttributes()
+    let addQueryRes: Result[bool] = peerAttributesAddService(query, "mdns-smoke")
+    if IsErr(addQueryRes):
+        return Err[bool](Error(addQueryRes))
+    var out: PeerAttributesList = initPeerAttributesList()
+    let discRes: Result[bool] = mdnsDiscover(query, out)
+    if IsErr(discRes):
+        return Err[bool](Error(discRes))
+    if out.count != 1:
+        return Err[bool]("smoke: mdns entry count mismatch")
+    var outPid: PeerId
+    if !peerAttributesGetPeerId(out.items[0], outPid):
+        return Err[bool]("smoke: mdns peer id missing")
+    let eqRes: Result[bool] = peerIdEqual(pid, outPid)
+    if IsErr(eqRes):
+        return Err[bool](Error(eqRes))
+    if !Value(eqRes):
+        return Err[bool]("smoke: mdns peer id mismatch")
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let res: Result[bool] = runMdnsSmoke()
+    if IsErr(res):
+        echo("mdns smoke failed: " + Error(res))
+        return 1
+    echo("mdns smoke ok")
+    return 0

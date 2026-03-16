@@ -1,0 +1,1288 @@
+# Shared lowering entry from frontend-agnostic semantic protocol into UIR.
+import std/result
+import std/strings
+import std/strutils
+import std/os
+import std/cmdline
+import std/seqs
+import backend/uir/uir_types
+import backend/uir/uir_frontend
+import backend/uir/uir_codegen
+import backend/uir/uir_semantic_types
+import backend/uir/uir_semantic_validate
+import backend/uir/uir_internal/uir_core_builder
+import backend/uir/uir_internal/uir_core_types
+
+fn uirSemanticRustReportLine(report: UirRustReportV1): str =
+    if report == nil:
+        return "rust_uir_report\tmono_items_total=0\tmono_items_uir=0\tmono_items_llvm_fallback=0\tunsafe_regions=0\tborrow_proof_items=0\tms=0"
+    return "rust_uir_report\tmono_items_total=" + intToStr(report.monoItemsTotal) +
+           "\tmono_items_uir=" + intToStr(report.monoItemsUir) +
+           "\tmono_items_llvm_fallback=" + intToStr(report.monoItemsLlvmFallback) +
+           "\tunsafe_regions=" + intToStr(report.unsafeRegions) +
+           "\tborrow_proof_items=" + intToStr(report.borrowProofItems) +
+           "\tms=" + intToStr(report.elapsedMs)
+
+fn uirSemanticGenericsReportLine(frontend: str, report: UirRustReportV1): str =
+    if frontend == "rust":
+        let total: int32 = report != nil ? report.monoItemsTotal : 0
+        return "generics_report\tir=uir\tmode=rustc_mono\tinstances_total=" + intToStr(total) +
+               "\trustc_mono_items=" + intToStr(total)
+    return ""
+
+fn uirSemanticBuildFallbackResult(reason: str, rustReport: UirRustReportV1): UirSemanticCompileResultV1 =
+    let out: UirSemanticCompileResultV1 = uirSemanticCompileResultV1New()
+    out.ok = true
+    out.fallbackUsed = true
+    out.fallbackReason = reason
+    out.rustReport = rustReport
+    out.reportText = "status=fallback\nfallback_reason=" + reason + "\n" + uirSemanticRustReportLine(rustReport) +
+                     "\n" + uirSemanticGenericsReportLine("rust", rustReport)
+    return out
+
+fn uirSemanticParseBoolDefault(raw: str, defaultValue: bool = false): bool =
+    var out: bool = defaultValue
+    cmdline.parseBool(strutils.strip(raw), out)
+    return out
+
+fn uirSemanticParseIntDefault(raw: str, defaultValue: int32 = 0): int32 =
+    var out: int32 = defaultValue
+    cmdline.parseInt32(strutils.strip(raw), out)
+    return out
+
+fn uirSemanticParseI64Default(raw: str, defaultValue: int64 = 0): int64 =
+    var out: int64 = 0
+    if uirSemanticParseI64Decimal(raw, out):
+        return out
+    if uirSemanticParseI64Hex(raw, out):
+        return out
+    return defaultValue
+
+fn uirSemanticAppendStr(seqInst: var str[], val: str) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendInt(seqInst: var int32[], val: int32) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendBool(seqInst: var bool[], val: bool) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendLayoutDesc(seqInst: var UirLayoutDesc[], val: UirLayoutDesc) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendAliasDomain(seqInst: var UirAliasDomain[], val: UirAliasDomain) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendSafetyRegion(seqInst: var UirSafetyRegion[], val: UirSafetyRegion) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendDropScope(seqInst: var UirDropScope[], val: UirDropScope) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendPanicEdge(seqInst: var UirPanicEdge[], val: UirPanicEdge) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendFatPtrMeta(seqInst: var UirFatPtrMeta[], val: UirFatPtrMeta) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendVtableDesc(seqInst: var UirVtableDesc[], val: UirVtableDesc) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendConstValue(seqInst: var UirConstValue[], val: UirConstValue) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendReadonlyObject(seqInst: var UirReadonlyObject[], val: UirReadonlyObject) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendReadonlyReloc(seqInst: var UirReadonlyReloc[], val: UirReadonlyReloc) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendDataSymbol(seqInst: var UirDataSymbol[], val: UirDataSymbol) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendAggregateLayout(seqInst: var UirAggregateLayout[], val: UirAggregateLayout) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendAggregateField(seqInst: var UirAggregateField[], val: UirAggregateField) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendFuncAbi(seqInst: var UirFunctionAbiDesc[], val: UirFunctionAbiDesc) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendCallAbi(seqInst: var UirCallAbiDesc[], val: UirCallAbiDesc) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendStmt(seqInst: var UirStmtId[], val: UirStmtId) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticAppendExpr(seqInst: var UirExpr[], val: UirExpr) =
+    let idx: int32 = seqInst.len
+    let needLen: int32 = idx + 1
+    if seqInst.buffer == nil || seqInst.cap < needLen:
+        reserve(seqInst, needLen)
+    setLen(seqInst, needLen)
+    seqInst[idx] = val
+
+fn uirSemanticParseI64Decimal(raw: str, outValue: var int64): bool =
+    let text: str = strutils.strip(raw)
+    if len(text) == 0:
+        return false
+    var sign: int64 = 1
+    var i: int32 = 0
+    if text[0] == '-':
+        sign = -1
+        i = 1
+    elif text[0] == '+':
+        i = 1
+    if i >= len(text):
+        return false
+    var acc: int64 = 0
+    while i < len(text):
+        let ch: char = text[i]
+        if ch < '0' || ch > '9':
+            return false
+        acc = acc * 10 + int64(int32(ch) - int32('0'))
+        i = i + 1
+    outValue = acc * sign
+    return true
+
+fn uirSemanticParseI64Hex(raw: str, outValue: var int64): bool =
+    let text: str = strutils.strip(raw)
+    if len(text) < 3:
+        return false
+    if !(text[0] == '0' && (text[1] == 'x' || text[1] == 'X')):
+        return false
+    var acc: int64 = 0
+    var i: int32 = 2
+    while i < len(text):
+        let ch: char = text[i]
+        var digit: int32 = -1
+        if ch >= '0' && ch <= '9':
+            digit = int32(ch) - int32('0')
+        elif ch >= 'a' && ch <= 'f':
+            digit = 10 + int32(ch) - int32('a')
+        elif ch >= 'A' && ch <= 'F':
+            digit = 10 + int32(ch) - int32('A')
+        else:
+            return false
+        acc = (acc << 4) | int64(digit)
+        i = i + 1
+    outValue = acc
+    return true
+
+fn uirSemanticLineFirstToken(line: str): str =
+    for i in 0..<len(line):
+        if line[i] == '\t':
+            return strings.sliceBytes(line, 0, i)
+    return line
+
+fn uirSemanticLineField(line: str, key: str): str =
+    let n: int32 = len(line)
+    var start: int32 = 0
+    var first: bool = true
+    while start < n:
+        var stop: int32 = start
+        while stop < n && line[stop] != '\t':
+            stop = stop + 1
+        if !first:
+            let token: str = strings.sliceBytes(line, start, stop - start)
+            for i in 0..<len(token):
+                if token[i] == '=':
+                    let tokenKey: str = strings.sliceBytes(token, 0, i)
+                    if strings.streq(tokenKey, key):
+                        return strings.sliceBytes(token, i + 1, len(token) - i - 1)
+                    break
+        first = false
+        start = stop + 1
+    return ""
+
+fn uirSemanticUnescapeTableField(raw: str): str =
+    var out: str = ""
+    var i: int32 = 0
+    while i < len(raw):
+        if raw[i] == '\\' && i + 1 < len(raw):
+            let next: char = raw[i + 1]
+            if next == 't':
+                out = out + "\t"
+                i = i + 2
+                continue
+            elif next == 'n':
+                out = out + "\n"
+                i = i + 2
+                continue
+            elif next == '\\':
+                out = out + "\\"
+                i = i + 2
+                continue
+        out = out + strings.sliceBytes(raw, i, 1)
+        i = i + 1
+    return out
+
+fn uirSemanticSplitCsv(raw: str): str[] =
+    var out: str[] = []
+    let text: str = strutils.strip(raw)
+    if len(text) == 0:
+        return out
+    var start: int32 = 0
+    while start <= len(text):
+        var stop: int32 = start
+        while stop < len(text) && text[stop] != ',':
+            stop = stop + 1
+        let item: str = strutils.strip(strings.sliceBytes(text, start, stop - start))
+        uirSemanticAppendStr(out, uirSemanticUnescapeTableField(item))
+        start = stop + 1
+        if stop >= len(text):
+            break
+    return out
+
+fn uirSemanticExpectAppendIdx(kind: str, rawIdx: str, expected: int32): Result[bool] =
+    let parsed: int32 = uirSemanticParseIntDefault(rawIdx, -1)
+    if parsed != expected:
+        return Err[bool]("uir_semantic_lowering: " + kind + " idx mismatch expected=" + intToStr(expected) +
+                         " got=" + rawIdx)
+    return Ok[bool](true)
+
+fn uirSemanticReadRustTablesText(semanticModule: UirSemanticModuleV1): Result[str] =
+    if semanticModule == nil:
+        return Err[str]("uir_semantic_lowering: module is nil")
+    let inlineText: str = semanticModule.semanticTablesInline
+    if len(strutils.strip(inlineText)) > 0:
+        return Ok[str](inlineText)
+    let tablePath: str = strutils.strip(semanticModule.semanticTablesPath)
+    if len(tablePath) == 0:
+        return Err[str]("uir_semantic_lowering: rust semantic module missing semantic_tables_path/inline")
+    if !os.fileExists(tablePath):
+        return Err[str]("uir_semantic_lowering: semantic tables file not found: " + tablePath)
+    let text: str = os.readFile(tablePath)
+    if len(text) == 0:
+        return Err[str]("uir_semantic_lowering: semantic tables file is empty: " + tablePath)
+    return Ok[str](text)
+
+fn uirSemanticLoadRustTables(semanticModule: UirSemanticModuleV1): Result[bool] =
+    if semanticModule == nil:
+        return Err[bool]("uir_semantic_lowering: module is nil")
+    if semanticModule.stringTable.len > 0 || semanticModule.funcNames.len > 0 || semanticModule.exprKind.len > 0:
+        return Ok[bool](true)
+    let textRes: Result[str] = uirSemanticReadRustTablesText(semanticModule)
+    if !IsOk[str](textRes):
+        return Err[bool](ErrorFormat(ErrorInfoOf[str](textRes)))
+    let text: str = textRes.value
+    let n: int32 = len(text)
+    var start: int32 = 0
+    while start < n:
+        var stop: int32 = start
+        while stop < n && text[stop] != '\n':
+            stop = stop + 1
+        let line: str = strutils.strip(strings.sliceBytes(text, start, stop - start))
+        start = stop + 1
+        if len(line) == 0 || line[0] == '#':
+            continue
+        let kind: str = uirSemanticLineFirstToken(line)
+        var eqPos: int32 = -1
+        for eqi in 0..<len(line):
+            if line[eqi] == '=':
+                eqPos = eqi
+                break
+        if eqPos > 0 && strings.streq(kind, line):
+            let lineKey: str = strings.sliceBytes(line, 0, eqPos)
+            let lineValue: str = strings.sliceBytes(line, eqPos + 1, len(line) - eqPos - 1)
+            if strings.streq(lineKey, "version"):
+                semanticModule.version = uirSemanticParseIntDefault(lineValue, 1)
+            elif strings.streq(lineKey, "frontend"):
+                semanticModule.frontend = uirSemanticUnescapeTableField(lineValue)
+            elif strings.streq(lineKey, "target"):
+                semanticModule.target = uirSemanticUnescapeTableField(lineValue)
+            elif strings.streq(lineKey, "source_tag"):
+                semanticModule.sourceTag = uirSemanticUnescapeTableField(lineValue)
+            elif strings.streq(lineKey, "crate_type"):
+                semanticModule.crateType = uirSemanticUnescapeTableField(lineValue)
+            elif strings.streq(lineKey, "c_main_target_symbol"):
+                semanticModule.cMainTargetSymbol = uirSemanticUnescapeTableField(lineValue)
+            continue
+        if strings.streq(kind, "string"):
+            let idxRes: Result[bool] = uirSemanticExpectAppendIdx("string", uirSemanticLineField(line, "idx"),
+                                                                  semanticModule.stringTable.len)
+            if !IsOk[bool](idxRes):
+                return idxRes
+            uirSemanticAppendStr(semanticModule.stringTable, uirSemanticUnescapeTableField(uirSemanticLineField(line, "value")))
+            continue
+        if strings.streq(kind, "type"):
+            let idxRes2: Result[bool] = uirSemanticExpectAppendIdx("type", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.typeNames.len)
+            if !IsOk[bool](idxRes2):
+                return idxRes2
+            uirSemanticAppendStr(semanticModule.typeNames, uirSemanticUnescapeTableField(uirSemanticLineField(line, "name")))
+            continue
+        if strings.streq(kind, "layout"):
+            let idxRes3: Result[bool] = uirSemanticExpectAppendIdx("layout", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.layoutDescs.len)
+            if !IsOk[bool](idxRes3):
+                return idxRes3
+            var desc: UirLayoutDesc
+            desc.name = uirSemanticUnescapeTableField(uirSemanticLineField(line, "name"))
+            desc.sizeBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "size"), 0)
+            desc.alignBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "align"), 0)
+            desc.abiClass = uirSemanticUnescapeTableField(uirSemanticLineField(line, "abi"))
+            desc.nicheBits = uirSemanticParseIntDefault(uirSemanticLineField(line, "niche_bits"), 0)
+            uirSemanticAppendLayoutDesc(semanticModule.layoutDescs, desc)
+            continue
+        if strings.streq(kind, "obj_type"):
+            let idxRes4: Result[bool] = uirSemanticExpectAppendIdx("obj_type", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.objTypeNames.len)
+            if !IsOk[bool](idxRes4):
+                return idxRes4
+            uirSemanticAppendStr(semanticModule.objTypeNames, uirSemanticUnescapeTableField(uirSemanticLineField(line, "name")))
+            continue
+        if strings.streq(kind, "func"):
+            let idxRes5: Result[bool] = uirSemanticExpectAppendIdx("func", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.funcNames.len)
+            if !IsOk[bool](idxRes5):
+                return idxRes5
+            uirSemanticAppendStr(semanticModule.funcNames, uirSemanticUnescapeTableField(uirSemanticLineField(line, "name")))
+            uirSemanticAppendInt(semanticModule.funcFirstBlock, uirSemanticParseIntDefault(uirSemanticLineField(line, "first_block"), 0))
+            uirSemanticAppendInt(semanticModule.funcBlockLen, uirSemanticParseIntDefault(uirSemanticLineField(line, "block_len"), 0))
+            uirSemanticAppendInt(semanticModule.funcFirstLocal, uirSemanticParseIntDefault(uirSemanticLineField(line, "first_local"), 0))
+            uirSemanticAppendInt(semanticModule.funcLocalLen, uirSemanticParseIntDefault(uirSemanticLineField(line, "local_len"), 0))
+            continue
+        if strings.streq(kind, "local"):
+            let idxRes6: Result[bool] = uirSemanticExpectAppendIdx("local", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.localNames.len)
+            if !IsOk[bool](idxRes6):
+                return idxRes6
+            uirSemanticAppendStr(semanticModule.localNames, uirSemanticUnescapeTableField(uirSemanticLineField(line, "name")))
+            uirSemanticAppendInt(semanticModule.localType, uirSemanticParseIntDefault(uirSemanticLineField(line, "type"), -1))
+            uirSemanticAppendBool(semanticModule.localMutability, uirSemanticParseBoolDefault(uirSemanticLineField(line, "mutable")))
+            continue
+        if strings.streq(kind, "block"):
+            let idxRes7: Result[bool] = uirSemanticExpectAppendIdx("block", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.blockFirstStmt.len)
+            if !IsOk[bool](idxRes7):
+                return idxRes7
+            uirSemanticAppendInt(semanticModule.blockFirstStmt, uirSemanticParseIntDefault(uirSemanticLineField(line, "first_stmt"), 0))
+            uirSemanticAppendInt(semanticModule.blockStmtLen, uirSemanticParseIntDefault(uirSemanticLineField(line, "stmt_len"), 0))
+            uirSemanticAppendStr(semanticModule.blockTermKind, uirSemanticUnescapeTableField(uirSemanticLineField(line, "term_kind")))
+            continue
+        if strings.streq(kind, "expr"):
+            let idxRes8: Result[bool] = uirSemanticExpectAppendIdx("expr", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.exprKind.len)
+            if !IsOk[bool](idxRes8):
+                return idxRes8
+            uirSemanticAppendStr(semanticModule.exprKind, uirSemanticUnescapeTableField(uirSemanticLineField(line, "kind")))
+            uirSemanticAppendInt(semanticModule.exprType, uirSemanticParseIntDefault(uirSemanticLineField(line, "type"), -1))
+            uirSemanticAppendInt(semanticModule.exprA, uirSemanticParseIntDefault(uirSemanticLineField(line, "a"), -1))
+            uirSemanticAppendInt(semanticModule.exprB, uirSemanticParseIntDefault(uirSemanticLineField(line, "b"), -1))
+            uirSemanticAppendInt(semanticModule.exprC, uirSemanticParseIntDefault(uirSemanticLineField(line, "c"), -1))
+            continue
+        if strings.streq(kind, "stmt"):
+            let idxRes9: Result[bool] = uirSemanticExpectAppendIdx("stmt", uirSemanticLineField(line, "idx"),
+                                                                   semanticModule.stmtKind.len)
+            if !IsOk[bool](idxRes9):
+                return idxRes9
+            uirSemanticAppendStr(semanticModule.stmtKind, uirSemanticUnescapeTableField(uirSemanticLineField(line, "kind")))
+            uirSemanticAppendInt(semanticModule.stmtA, uirSemanticParseIntDefault(uirSemanticLineField(line, "a"), -1))
+            uirSemanticAppendInt(semanticModule.stmtB, uirSemanticParseIntDefault(uirSemanticLineField(line, "b"), -1))
+            uirSemanticAppendInt(semanticModule.stmtC, uirSemanticParseIntDefault(uirSemanticLineField(line, "c"), -1))
+            continue
+        if strings.streq(kind, "alias_domain"):
+            var alias: UirAliasDomain
+            alias.name = uirSemanticUnescapeTableField(uirSemanticLineField(line, "name"))
+            alias.isMutable = uirSemanticParseBoolDefault(uirSemanticLineField(line, "mutable"))
+            alias.isExclusive = uirSemanticParseBoolDefault(uirSemanticLineField(line, "exclusive"))
+            alias.proofId = uirSemanticUnescapeTableField(uirSemanticLineField(line, "proof_id"))
+            alias.fallbackReason = uirSemanticUnescapeTableField(uirSemanticLineField(line, "fallback_reason"))
+            uirSemanticAppendAliasDomain(semanticModule.aliasDomains, alias)
+            continue
+        if strings.streq(kind, "safety_region"):
+            var region: UirSafetyRegion
+            region.name = uirSemanticUnescapeTableField(uirSemanticLineField(line, "name"))
+            region.kind = uirSemanticUnescapeTableField(uirSemanticLineField(line, "kind"))
+            region.isOpaque = uirSemanticParseBoolDefault(uirSemanticLineField(line, "opaque"))
+            region.entryBlock = uirSemanticParseIntDefault(uirSemanticLineField(line, "entry_block"), -1)
+            region.exitBlock = uirSemanticParseIntDefault(uirSemanticLineField(line, "exit_block"), -1)
+            uirSemanticAppendSafetyRegion(semanticModule.safetyRegions, region)
+            continue
+        if strings.streq(kind, "drop_scope"):
+            var scope: UirDropScope
+            scope.name = uirSemanticUnescapeTableField(uirSemanticLineField(line, "name"))
+            scope.beginBlock = uirSemanticParseIntDefault(uirSemanticLineField(line, "begin_block"), -1)
+            scope.endBlock = uirSemanticParseIntDefault(uirSemanticLineField(line, "end_block"), -1)
+            scope.cleanupBlock = uirSemanticParseIntDefault(uirSemanticLineField(line, "cleanup_block"), -1)
+            uirSemanticAppendDropScope(semanticModule.dropScopes, scope)
+            continue
+        if strings.streq(kind, "panic_edge"):
+            var edge: UirPanicEdge
+            edge.fromBlock = uirSemanticParseIntDefault(uirSemanticLineField(line, "from_block"), -1)
+            edge.toBlock = uirSemanticParseIntDefault(uirSemanticLineField(line, "to_block"), -1)
+            edge.reason = uirSemanticUnescapeTableField(uirSemanticLineField(line, "reason"))
+            edge.unwind = uirSemanticParseBoolDefault(uirSemanticLineField(line, "unwind"))
+            uirSemanticAppendPanicEdge(semanticModule.panicEdges, edge)
+            continue
+        if strings.streq(kind, "fat_ptr"):
+            var meta: UirFatPtrMeta
+            meta.name = uirSemanticUnescapeTableField(uirSemanticLineField(line, "name"))
+            meta.metaKind = uirSemanticUnescapeTableField(uirSemanticLineField(line, "meta_kind"))
+            meta.payloadType = uirSemanticUnescapeTableField(uirSemanticLineField(line, "payload_type"))
+            meta.metadataType = uirSemanticUnescapeTableField(uirSemanticLineField(line, "metadata_type"))
+            uirSemanticAppendFatPtrMeta(semanticModule.fatPtrMeta, meta)
+            continue
+        if strings.streq(kind, "vtable"):
+            let idxRes10: Result[bool] = uirSemanticExpectAppendIdx("vtable", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.vtableDescs.len)
+            if !IsOk[bool](idxRes10):
+                return idxRes10
+            var vtable: UirVtableDesc
+            vtable.label = uirSemanticUnescapeTableField(uirSemanticLineField(line, "label"))
+            vtable.entries = uirSemanticSplitCsv(uirSemanticLineField(line, "entries"))
+            uirSemanticAppendVtableDesc(semanticModule.vtableDescs, vtable)
+            continue
+        if strings.streq(kind, "const"):
+            let idxRes11: Result[bool] = uirSemanticExpectAppendIdx("const", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.constValues.len)
+            if !IsOk[bool](idxRes11):
+                return idxRes11
+            var constValue: UirConstValue
+            constValue.typeIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "type"), -1)
+            constValue.kind = uirSemanticUnescapeTableField(uirSemanticLineField(line, "kind"))
+            constValue.atomAKind = uirSemanticUnescapeTableField(uirSemanticLineField(line, "atom_a_kind"))
+            constValue.atomA = uirSemanticUnescapeTableField(uirSemanticLineField(line, "atom_a"))
+            constValue.atomAAddend = uirSemanticParseI64Default(uirSemanticLineField(line, "atom_a_addend"), 0)
+            constValue.atomBKind = uirSemanticUnescapeTableField(uirSemanticLineField(line, "atom_b_kind"))
+            constValue.atomB = uirSemanticUnescapeTableField(uirSemanticLineField(line, "atom_b"))
+            constValue.atomBAddend = uirSemanticParseI64Default(uirSemanticLineField(line, "atom_b_addend"), 0)
+            uirSemanticAppendConstValue(semanticModule.constValues, constValue)
+            continue
+        if strings.streq(kind, "readonly_object"):
+            let idxRes12: Result[bool] = uirSemanticExpectAppendIdx("readonly_object", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.readonlyObjects.len)
+            if !IsOk[bool](idxRes12):
+                return idxRes12
+            var readonlyObj: UirReadonlyObject
+            readonlyObj.label = uirSemanticUnescapeTableField(uirSemanticLineField(line, "label"))
+            readonlyObj.typeIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "type"), -1)
+            readonlyObj.sizeBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "size"), 0)
+            readonlyObj.alignBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "align"), 0)
+            readonlyObj.bytesHex = uirSemanticUnescapeTableField(uirSemanticLineField(line, "bytes"))
+            uirSemanticAppendReadonlyObject(semanticModule.readonlyObjects, readonlyObj)
+            continue
+        if strings.streq(kind, "readonly_reloc"):
+            let idxRes13: Result[bool] = uirSemanticExpectAppendIdx("readonly_reloc", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.readonlyRelocs.len)
+            if !IsOk[bool](idxRes13):
+                return idxRes13
+            var readonlyReloc: UirReadonlyReloc
+            readonlyReloc.objectIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "object"), -1)
+            readonlyReloc.offsetBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "offset"), 0)
+            readonlyReloc.targetKind = uirSemanticUnescapeTableField(uirSemanticLineField(line, "target_kind"))
+            readonlyReloc.target = uirSemanticUnescapeTableField(uirSemanticLineField(line, "target"))
+            readonlyReloc.addend = uirSemanticParseI64Default(uirSemanticLineField(line, "addend"), 0)
+            uirSemanticAppendReadonlyReloc(semanticModule.readonlyRelocs, readonlyReloc)
+            continue
+        if strings.streq(kind, "data_symbol"):
+            let idxRes14: Result[bool] = uirSemanticExpectAppendIdx("data_symbol", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.dataSymbols.len)
+            if !IsOk[bool](idxRes14):
+                return idxRes14
+            var dataSymbol: UirDataSymbol
+            dataSymbol.symbol = uirSemanticUnescapeTableField(uirSemanticLineField(line, "symbol"))
+            dataSymbol.objectIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "object"), -1)
+            uirSemanticAppendDataSymbol(semanticModule.dataSymbols, dataSymbol)
+            continue
+        if strings.streq(kind, "aggregate"):
+            let idxRes15: Result[bool] = uirSemanticExpectAppendIdx("aggregate", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.aggregateLayouts.len)
+            if !IsOk[bool](idxRes15):
+                return idxRes15
+            var aggregateLayout: UirAggregateLayout
+            aggregateLayout.typeIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "type"), -1)
+            aggregateLayout.sizeBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "size"), 0)
+            aggregateLayout.alignBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "align"), 0)
+            aggregateLayout.fieldStart = uirSemanticParseIntDefault(uirSemanticLineField(line, "field_start"), 0)
+            aggregateLayout.fieldLen = uirSemanticParseIntDefault(uirSemanticLineField(line, "field_len"), 0)
+            uirSemanticAppendAggregateLayout(semanticModule.aggregateLayouts, aggregateLayout)
+            continue
+        if strings.streq(kind, "aggregate_field"):
+            let idxRes16: Result[bool] = uirSemanticExpectAppendIdx("aggregate_field", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.aggregateFields.len)
+            if !IsOk[bool](idxRes16):
+                return idxRes16
+            var aggregateField: UirAggregateField
+            aggregateField.aggregateIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "aggregate"), -1)
+            aggregateField.fieldIndex = uirSemanticParseIntDefault(uirSemanticLineField(line, "field_index"), -1)
+            aggregateField.offsetBytes = uirSemanticParseIntDefault(uirSemanticLineField(line, "offset"), 0)
+            aggregateField.typeIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "type"), -1)
+            uirSemanticAppendAggregateField(semanticModule.aggregateFields, aggregateField)
+            continue
+        if strings.streq(kind, "func_abi"):
+            let idxRes17: Result[bool] = uirSemanticExpectAppendIdx("func_abi", uirSemanticLineField(line, "idx"),
+                                                                    semanticModule.funcAbi.len)
+            if !IsOk[bool](idxRes17):
+                return idxRes17
+            var funcAbi: UirFunctionAbiDesc
+            funcAbi.funcName = uirSemanticUnescapeTableField(uirSemanticLineField(line, "func"))
+            funcAbi.retMode = uirSemanticUnescapeTableField(uirSemanticLineField(line, "ret_mode"))
+            funcAbi.argModes = uirSemanticSplitCsv(uirSemanticLineField(line, "arg_modes"))
+            uirSemanticAppendFuncAbi(semanticModule.funcAbi, funcAbi)
+            continue
+        if strings.streq(kind, "call_abi"):
+            var callAbi: UirCallAbiDesc
+            callAbi.stmtIdx = uirSemanticParseIntDefault(uirSemanticLineField(line, "stmt_idx"), -1)
+            callAbi.callee = uirSemanticUnescapeTableField(uirSemanticLineField(line, "callee"))
+            callAbi.abi = uirSemanticUnescapeTableField(uirSemanticLineField(line, "abi"))
+            callAbi.callKind = uirSemanticUnescapeTableField(uirSemanticLineField(line, "call_kind"))
+            callAbi.vtableSlot = uirSemanticParseIntDefault(uirSemanticLineField(line, "vtable_slot"), -1)
+            callAbi.canUnwind = uirSemanticParseBoolDefault(uirSemanticLineField(line, "can_unwind"))
+            callAbi.retMode = uirSemanticUnescapeTableField(uirSemanticLineField(line, "ret_mode"))
+            callAbi.argModes = uirSemanticSplitCsv(uirSemanticLineField(line, "arg_modes"))
+            uirSemanticAppendCallAbi(semanticModule.callAbi, callAbi)
+            continue
+        if strings.streq(kind, "atomic_expr"):
+            uirSemanticAppendInt(semanticModule.atomicExprs, uirSemanticParseIntDefault(uirSemanticLineField(line, "expr"), -1))
+            continue
+        if strings.streq(kind, "volatile_expr"):
+            uirSemanticAppendInt(semanticModule.volatileExprs, uirSemanticParseIntDefault(uirSemanticLineField(line, "expr"), -1))
+            continue
+    let validateRes: Result[bool] = uirValidateSemanticModuleV1(semanticModule)
+    if !IsOk[bool](validateRes):
+        return validateRes
+    return Ok[bool](true)
+
+fn uirRustSemanticTypeName(semanticModule: UirSemanticModuleV1, typeIdx: int32): str =
+    if semanticModule == nil || typeIdx < 0 || typeIdx >= semanticModule.typeNames.len:
+        return ""
+    return semanticModule.typeNames[typeIdx]
+
+fn uirRustSemanticLayoutDesc(semanticModule: UirSemanticModuleV1, typeIdx: int32): UirLayoutDesc =
+    if semanticModule == nil || typeIdx < 0 || typeIdx >= semanticModule.layoutDescs.len:
+        var out: UirLayoutDesc
+        out.name = ""
+        out.sizeBytes = 0
+        out.alignBytes = 0
+        out.abiClass = ""
+        out.nicheBits = 0
+        return out
+    return semanticModule.layoutDescs[typeIdx]
+
+fn uirRustSemanticLowerScalarType(typeName: str, layout: UirLayoutDesc, allowVoid: bool): UirLowerType =
+    if allowVoid && strings.streq(typeName, "()"):
+        return uirTypeVoid()
+    if strings.streq(typeName, "i8"):
+        return uirTypeI8()
+    if strings.streq(typeName, "u8"):
+        return uirTypeU8()
+    if strings.streq(typeName, "bool"):
+        return uirTypeU8()
+    if strings.streq(typeName, "i16"):
+        return uirTypeI16()
+    if strings.streq(typeName, "u16"):
+        return uirTypeU16()
+    if strings.streq(typeName, "i32"):
+        return uirTypeI32()
+    if strings.streq(typeName, "u32"):
+        return uirTypeU32()
+    if strings.streq(typeName, "char"):
+        return uirTypeU32()
+    if strings.streq(typeName, "f32"):
+        return uirTypeF32()
+    if strings.streq(typeName, "f64"):
+        return uirTypeF64()
+    if strings.streq(typeName, "i64") || strings.streq(typeName, "isize"):
+        return uirTypeI64()
+    if strings.streq(typeName, "u64") || strings.streq(typeName, "usize"):
+        return uirTypeU64()
+    if layout.sizeBytes <= 1:
+        return uirTypeU8()
+    if layout.sizeBytes <= 2:
+        return uirTypeU16()
+    if layout.sizeBytes <= 4:
+        return uirTypeU32()
+    return uirTypeU64()
+
+fn uirRustSemanticLocalName(semanticModule: UirSemanticModuleV1, firstLocal: int32, localLen: int32, slot: int32): str =
+    if slot < 0 || slot >= localLen:
+        return "_tmp"
+    let idx: int32 = firstLocal + slot
+    if idx < 0 || idx >= semanticModule.localNames.len:
+        return "_tmp"
+    return semanticModule.localNames[idx]
+
+fn uirRustSemanticLowerLocalType(semanticModule: UirSemanticModuleV1, firstLocal: int32, localLen: int32,
+                                 slot: int32, allowVoid: bool = false): UirLowerType =
+    if slot < 0 || slot >= localLen:
+        return uirTypeI64()
+    let idx: int32 = firstLocal + slot
+    if idx < 0 || idx >= semanticModule.localType.len:
+        return uirTypeI64()
+    let typeIdx: int32 = semanticModule.localType[idx]
+    let typeName: str = uirRustSemanticTypeName(semanticModule, typeIdx)
+    let layout: UirLayoutDesc = uirRustSemanticLayoutDesc(semanticModule, typeIdx)
+    return uirRustSemanticLowerScalarType(typeName, layout, allowVoid)
+
+fn uirRustSemanticBinaryOp(raw: str, outCmp: var bool, cmpOp: var UirCmpOp, binOp: var UirBinOp): bool =
+    outCmp = false
+    cmpOp = mcEq
+    binOp = mbAdd
+    if strings.streq(raw, "Add"):
+        binOp = mbAdd
+        return true
+    elif strings.streq(raw, "Sub"):
+        binOp = mbSub
+        return true
+    elif strings.streq(raw, "Mul"):
+        binOp = mbMul
+        return true
+    elif strings.streq(raw, "Div"):
+        binOp = mbSdiv
+        return true
+    elif strings.streq(raw, "Rem"):
+        binOp = mbSmod
+        return true
+    elif strings.streq(raw, "BitAnd"):
+        binOp = mbAnd
+        return true
+    elif strings.streq(raw, "BitOr"):
+        binOp = mbOr
+        return true
+    elif strings.streq(raw, "BitXor"):
+        binOp = mbXor
+        return true
+    elif strings.streq(raw, "Shl"):
+        binOp = mbShl
+        return true
+    elif strings.streq(raw, "Shr"):
+        binOp = mbShr
+        return true
+    elif strings.streq(raw, "Eq"):
+        outCmp = true
+        cmpOp = mcEq
+        return true
+    elif strings.streq(raw, "Ne"):
+        outCmp = true
+        cmpOp = mcNe
+        return true
+    elif strings.streq(raw, "Lt"):
+        outCmp = true
+        cmpOp = mcLt
+        return true
+    elif strings.streq(raw, "Le"):
+        outCmp = true
+        cmpOp = mcLe
+        return true
+    elif strings.streq(raw, "Gt"):
+        outCmp = true
+        cmpOp = mcGt
+        return true
+    elif strings.streq(raw, "Ge"):
+        outCmp = true
+        cmpOp = mcGe
+        return true
+    return false
+
+fn uirRustSemanticConstExpr(semanticModule: UirSemanticModuleV1, exprId: int32): Result[UirExpr] =
+    if exprId < 0 || exprId >= semanticModule.exprKind.len:
+        return Err[UirExpr]("uir_semantic_lowering: const expr out of range")
+    let constIdx: int32 = semanticModule.exprA[exprId]
+    if constIdx >= 0 && constIdx < semanticModule.constValues.len:
+        let constValue: UirConstValue = semanticModule.constValues[constIdx]
+        if strings.streq(constValue.kind, "zero_sized") || strings.streq(constValue.kind, "null") ||
+           strings.streq(constValue.kind, "niche_none"):
+            return Ok[UirExpr](uirCoreConstI64(0))
+        if strings.streq(constValue.kind, "scalar"):
+            if strings.streq(constValue.atomAKind, "imm"):
+                return Ok[UirExpr](uirCoreConstI64(uirSemanticParseI64Default(constValue.atomA, 0) + constValue.atomAAddend))
+            if strings.streq(constValue.atomAKind, "readonly") || strings.streq(constValue.atomAKind, "fn_symbol") ||
+               strings.streq(constValue.atomAKind, "symbol") || strings.streq(constValue.atomAKind, "vtable"):
+                return Ok[UirExpr](uirCoreGlobalAddr(constValue.atomA))
+        if strings.streq(constValue.kind, "fn_symbol") || strings.streq(constValue.kind, "readonly_addr"):
+            return Ok[UirExpr](uirCoreGlobalAddr(constValue.atomA))
+        return Err[UirExpr]("uir_semantic_lowering: unsupported structured const kind " + constValue.kind)
+    let stringIdx: int32 = constIdx
+    if stringIdx < 0 || stringIdx >= semanticModule.stringTable.len:
+        return Err[UirExpr]("uir_semantic_lowering: const expr missing string/const payload")
+    let raw: str = semanticModule.stringTable[stringIdx]
+    var intValue: int64 = 0
+    if uirSemanticParseI64Decimal(raw, intValue):
+        return Ok[UirExpr](uirCoreConstI64(intValue))
+    if uirSemanticParseI64Hex(raw, intValue):
+        return Ok[UirExpr](uirCoreConstI64(intValue))
+    if strings.streq(raw, "true"):
+        return Ok[UirExpr](uirCoreConstI64(1))
+    if strings.streq(raw, "false") || strings.streq(raw, "") || strings.streq(raw, "Val(ZeroSized, ())"):
+        return Ok[UirExpr](uirCoreConstI64(0))
+    if strutils.startsWith(raw, "Val(Scalar(0x"):
+        var hexStart: int32 = -1
+        var hexEnd: int32 = -1
+        for i in 0..<len(raw) - 1:
+            if raw[i] == '0' && raw[i + 1] == 'x':
+                hexStart = i
+                break
+        if hexStart >= 0:
+            hexEnd = hexStart + 2
+            while hexEnd < len(raw):
+                let ch: char = raw[hexEnd]
+                if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')):
+                    break
+                hexEnd = hexEnd + 1
+            let hexText: str = strings.sliceBytes(raw, hexStart, hexEnd - hexStart)
+            if uirSemanticParseI64Hex(hexText, intValue):
+                return Ok[UirExpr](uirCoreConstI64(intValue))
+    return Err[UirExpr]("uir_semantic_lowering: unsupported const payload: " + raw)
+
+fn uirRustSemanticOperandListExprs(semanticModule: UirSemanticModuleV1, listExprId: int32): Result[int32[]] =
+    if listExprId < 0 || listExprId >= semanticModule.exprKind.len:
+        return Err[int32[]]("uir_semantic_lowering: operand.list expr out of range")
+    if !strings.streq(semanticModule.exprKind[listExprId], "operand.list"):
+        return Err[int32[]]("uir_semantic_lowering: expected operand.list expr")
+    let stringIdx: int32 = semanticModule.exprA[listExprId]
+    if stringIdx < 0 || stringIdx >= semanticModule.stringTable.len:
+        return Err[int32[]]("uir_semantic_lowering: operand.list missing payload")
+    let raw: str = semanticModule.stringTable[stringIdx]
+    var out: int32[] = []
+    if len(raw) == 0:
+        return Ok[int32[]](out)
+    var start: int32 = 0
+    while start <= len(raw):
+        var stop: int32 = start
+        while stop < len(raw) && raw[stop] != ',':
+            stop = stop + 1
+        let item: str = strings.sliceBytes(raw, start, stop - start)
+        uirSemanticAppendInt(out, uirSemanticParseIntDefault(item, -1))
+        start = stop + 1
+        if stop >= len(raw):
+            break
+    return Ok[int32[]](out)
+
+fn uirRustSemanticLowerExpr(semanticModule: UirSemanticModuleV1, func: UirFunc,
+                            firstLocal: int32, localLen: int32, exprId: int32,
+                            wantType: UirLowerType): Result[UirExpr] =
+    if exprId < 0 || exprId >= semanticModule.exprKind.len:
+        return Err[UirExpr]("uir_semantic_lowering: expr out of range id=" + intToStr(exprId))
+    let kind: str = semanticModule.exprKind[exprId]
+    if strings.streq(kind, "place.local"):
+        return Ok[UirExpr](uirCoreLocal(semanticModule.exprA[exprId]))
+    if strings.streq(kind, "operand.copy") || strings.streq(kind, "operand.move") || strings.streq(kind, "rvalue.use"):
+        return uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.exprA[exprId], wantType)
+    if strings.streq(kind, "operand.const"):
+        return uirRustSemanticConstExpr(semanticModule, exprId)
+    if strings.streq(kind, "rvalue.cast"):
+        let childRes: Result[UirExpr] =
+            uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.exprA[exprId], wantType)
+        if !IsOk[UirExpr](childRes):
+            return childRes
+        let castTy: UirLowerType = uirRustSemanticLowerScalarType(
+            uirRustSemanticTypeName(semanticModule, semanticModule.exprType[exprId]),
+            uirRustSemanticLayoutDesc(semanticModule, semanticModule.exprType[exprId]),
+            false)
+        return Ok[UirExpr](uirCoreCast(castTy, childRes.value))
+    if strings.streq(kind, "rvalue.binary"):
+        let lhsRes: Result[UirExpr] =
+            uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.exprA[exprId], wantType)
+        if !IsOk[UirExpr](lhsRes):
+            return lhsRes
+        let rhsRes: Result[UirExpr] =
+            uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.exprB[exprId], wantType)
+        if !IsOk[UirExpr](rhsRes):
+            return rhsRes
+        let opStringIdx: int32 = semanticModule.exprC[exprId]
+        if opStringIdx < 0 || opStringIdx >= semanticModule.stringTable.len:
+            return Err[UirExpr]("uir_semantic_lowering: rvalue.binary missing op payload")
+        let opRaw: str = semanticModule.stringTable[opStringIdx]
+        var isCmp: bool = false
+        var cmpOp: UirCmpOp = mcEq
+        var binOp: UirBinOp = mbAdd
+        if !uirRustSemanticBinaryOp(opRaw, isCmp, cmpOp, binOp):
+            return Err[UirExpr]("uir_semantic_lowering: unsupported binary op " + opRaw)
+        if isCmp:
+            return Ok[UirExpr](uirCoreCmp(cmpOp, lhsRes.value, rhsRes.value))
+        return Ok[UirExpr](uirCoreBin(binOp, lhsRes.value, rhsRes.value))
+    if strings.streq(kind, "operand.fn_symbol"):
+        let stringIdx2: int32 = semanticModule.exprA[exprId]
+        if stringIdx2 < 0 || stringIdx2 >= semanticModule.stringTable.len:
+            return Err[UirExpr]("uir_semantic_lowering: operand.fn_symbol missing string payload")
+        return Ok[UirExpr](uirCoreGlobalAddr(semanticModule.stringTable[stringIdx2]))
+    if strings.streq(kind, "rvalue.ref"):
+        let targetExprId: int32 = semanticModule.exprA[exprId]
+        if targetExprId < 0 || targetExprId >= semanticModule.exprKind.len:
+            return Err[UirExpr]("uir_semantic_lowering: rvalue.ref target missing")
+        if !strings.streq(semanticModule.exprKind[targetExprId], "place.local"):
+            return Err[UirExpr]("uir_semantic_lowering: rvalue.ref only supports place.local")
+        return Ok[UirExpr](uirCoreAddr(semanticModule.exprA[targetExprId]))
+    if strings.streq(kind, "place.deref"):
+        let addrRes: Result[UirExpr] =
+            uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.exprA[exprId], wantType)
+        if !IsOk[UirExpr](addrRes):
+            return addrRes
+        let loadTy: UirLowerType = uirRustSemanticLowerScalarType(
+            uirRustSemanticTypeName(semanticModule, semanticModule.exprType[exprId]),
+            uirRustSemanticLayoutDesc(semanticModule, semanticModule.exprType[exprId]),
+            false)
+        return Ok[UirExpr](uirCoreLoad(addrRes.value, loadTy))
+    return Err[UirExpr]("uir_semantic_lowering: unsupported expr kind " + kind)
+
+fn uirRustSemanticEmitAssign(semanticModule: UirSemanticModuleV1, firstLocal: int32, localLen: int32,
+                             stmts: var UirStmtId[], placeExprId: int32, valueExpr: UirExpr): Result[bool] =
+    if placeExprId < 0 || placeExprId >= semanticModule.exprKind.len:
+        return Err[bool]("uir_semantic_lowering: assign target expr out of range")
+    let placeKind: str = semanticModule.exprKind[placeExprId]
+    if strings.streq(placeKind, "place.local"):
+        let slot: int32 = semanticModule.exprA[placeExprId]
+        let name: str = uirRustSemanticLocalName(semanticModule, firstLocal, localLen, slot)
+        uirSemanticAppendStmt(stmts, uirCoreStmtAssign(name, slot, valueExpr))
+        return Ok[bool](true)
+    if strings.streq(placeKind, "place.deref"):
+        let addrRes: Result[UirExpr] =
+            uirRustSemanticLowerExpr(semanticModule, nil, firstLocal, localLen, semanticModule.exprA[placeExprId], uirTypeI64())
+        if !IsOk[UirExpr](addrRes):
+            return Err[bool](ErrorFormat(ErrorInfoOf[UirExpr](addrRes)))
+        let storeTy: UirLowerType = uirRustSemanticLowerScalarType(
+            uirRustSemanticTypeName(semanticModule, semanticModule.exprType[placeExprId]),
+            uirRustSemanticLayoutDesc(semanticModule, semanticModule.exprType[placeExprId]),
+            false)
+        uirSemanticAppendStmt(stmts, uirCoreStmtStore(addrRes.value, valueExpr, storeTy))
+        return Ok[bool](true)
+    return Err[bool]("uir_semantic_lowering: unsupported assign target kind " + placeKind)
+
+fn uirRustSemanticBlockLabel(localBlockIdx: int32): str =
+    return "bb" + intToStr(localBlockIdx)
+
+fn uirRustSemanticSwitchPair(raw: str, expectedValue: var int64, trueTarget: var int32, falseTarget: var int32): bool =
+    expectedValue = 0
+    trueTarget = -1
+    falseTarget = -1
+    let text: str = strutils.strip(raw)
+    var comma: int32 = -1
+    for i in 0..<len(text):
+        if text[i] == ',':
+            comma = i
+            break
+    if comma <= 0:
+        return false
+    let first: str = strings.sliceBytes(text, 0, comma)
+    let second: str = strings.sliceBytes(text, comma + 1, len(text) - comma - 1)
+    if !strutils.startsWith(second, "otherwise=>bb"):
+        return false
+    falseTarget = uirSemanticParseIntDefault(strings.sliceBytes(second, 13, len(second) - 13), -1)
+    var arrow: int32 = -1
+    for j in 0..<len(first):
+        if j + 3 < len(first) && first[j] == '=' && first[j + 1] == '>' && first[j + 2] == 'b' && first[j + 3] == 'b':
+            arrow = j
+            break
+    if arrow <= 0:
+        return false
+    let valueText: str = strings.sliceBytes(first, 0, arrow)
+    trueTarget = uirSemanticParseIntDefault(strings.sliceBytes(first, arrow + 4, len(first) - arrow - 4), -1)
+    return uirSemanticParseI64Decimal(valueText, expectedValue)
+
+fn uirRustSemanticLowerBlock(semanticModule: UirSemanticModuleV1, func: UirFunc,
+                             firstBlock: int32, blockLen: int32, firstLocal: int32,
+                             localLen: int32, localBlockIdx: int32): Result[UirLowerBlock] =
+    let blockTableIdx: int32 = firstBlock + localBlockIdx
+    if blockTableIdx < 0 || blockTableIdx >= semanticModule.blockFirstStmt.len:
+        return Err[UirLowerBlock]("uir_semantic_lowering: block out of range")
+    let stmtStart: int32 = semanticModule.blockFirstStmt[blockTableIdx]
+    let stmtLen: int32 = semanticModule.blockStmtLen[blockTableIdx]
+    let termKind: str = semanticModule.blockTermKind[blockTableIdx]
+    var stmts: UirStmtId[] = []
+    var term: UirTerm = uirCoreTermRet(nil)
+    var termBuilt: bool = false
+    var stmtIdx: int32 = stmtStart
+    let stmtStop: int32 = stmtStart + stmtLen
+    while stmtIdx < stmtStop:
+        if stmtIdx < 0 || stmtIdx >= semanticModule.stmtKind.len:
+            return Err[UirLowerBlock]("uir_semantic_lowering: stmt out of range")
+        let stmtKind: str = semanticModule.stmtKind[stmtIdx]
+        if strings.streq(stmtKind, "assign"):
+            let rhsRes: Result[UirExpr] =
+                uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.stmtB[stmtIdx], uirTypeI64())
+            if !IsOk[UirExpr](rhsRes):
+                return Err[UirLowerBlock](ErrorFormat(ErrorInfoOf[UirExpr](rhsRes)))
+            let assignRes: Result[bool] =
+                uirRustSemanticEmitAssign(semanticModule, firstLocal, localLen, stmts, semanticModule.stmtA[stmtIdx], rhsRes.value)
+            if !IsOk[bool](assignRes):
+                return Err[UirLowerBlock](ErrorFormat(ErrorInfoOf[bool](assignRes)))
+        elif strings.streq(stmtKind, "storage_live") || strings.streq(stmtKind, "storage_dead") ||
+             strings.streq(stmtKind, "nop") || strings.streq(stmtKind, "fake_read") ||
+             strings.streq(stmtKind, "retag") || strings.streq(stmtKind, "place_mention") ||
+             strings.streq(stmtKind, "coverage"):
+            termBuilt = termBuilt
+        elif strings.streq(stmtKind, "term.return"):
+            if strings.streq(termKind, "return"):
+                let retTy: UirLowerType = uirFuncRetTypeOf(func)
+                if uirCoreTypeKindRaw(retTy) == int32(mtVoid):
+                    term = uirCoreTermRet(nil)
+                else:
+                    let retRes: Result[UirExpr] =
+                        uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.stmtA[stmtIdx], retTy)
+                    if !IsOk[UirExpr](retRes):
+                        return Err[UirLowerBlock](ErrorFormat(ErrorInfoOf[UirExpr](retRes)))
+                    term = uirCoreTermRet(retRes.value)
+                termBuilt = true
+            else:
+                uirSemanticAppendStmt(stmts, uirCoreStmtExpr(uirCoreConstI64(0)))
+        elif strings.streq(stmtKind, "term.goto"):
+            if !strings.streq(termKind, "goto"):
+                return Err[UirLowerBlock]("uir_semantic_lowering: term.goto mismatches block terminator kind")
+            term = uirCoreTermBr(uirRustSemanticBlockLabel(semanticModule.stmtA[stmtIdx]))
+            termBuilt = true
+        elif strings.streq(stmtKind, "term.switch_int"):
+            if !strings.streq(termKind, "switch_int"):
+                return Err[UirLowerBlock]("uir_semantic_lowering: term.switch_int mismatches block terminator kind")
+            let discrRes: Result[UirExpr] =
+                uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, semanticModule.stmtA[stmtIdx], uirTypeI64())
+            if !IsOk[UirExpr](discrRes):
+                return Err[UirLowerBlock](ErrorFormat(ErrorInfoOf[UirExpr](discrRes)))
+            let targetStringIdx: int32 = semanticModule.stmtC[stmtIdx]
+            if targetStringIdx < 0 || targetStringIdx >= semanticModule.stringTable.len:
+                return Err[UirLowerBlock]("uir_semantic_lowering: switch_int missing targets payload")
+            var expectedValue: int64 = 0
+            var trueTarget: int32 = -1
+            var falseTarget: int32 = -1
+            if !uirRustSemanticSwitchPair(semanticModule.stringTable[targetStringIdx], expectedValue, trueTarget, falseTarget):
+                return Err[UirLowerBlock]("uir_semantic_lowering: only two-way switch_int is supported")
+            let cmpExpr: UirExpr = uirCoreCmp(mcEq, discrRes.value, uirCoreConstI64(expectedValue))
+            term = uirCoreTermCbr(cmpExpr, uirRustSemanticBlockLabel(trueTarget), uirRustSemanticBlockLabel(falseTarget))
+            termBuilt = true
+        elif strings.streq(stmtKind, "term.call"):
+            if !strings.streq(termKind, "call"):
+                return Err[UirLowerBlock]("uir_semantic_lowering: term.call mismatches block terminator kind")
+            let argListRes: Result[int32[]] = uirRustSemanticOperandListExprs(semanticModule, semanticModule.stmtB[stmtIdx])
+            if !IsOk[int32[]](argListRes):
+                return Err[UirLowerBlock](ErrorFormat(ErrorInfoOf[int32[]](argListRes)))
+            var callArgs: UirExpr[] = []
+            for ai in 0..<argListRes.value.len:
+                let argRes: Result[UirExpr] =
+                    uirRustSemanticLowerExpr(semanticModule, func, firstLocal, localLen, argListRes.value[ai], uirTypeI64())
+                if !IsOk[UirExpr](argRes):
+                    return Err[UirLowerBlock](ErrorFormat(ErrorInfoOf[UirExpr](argRes)))
+                uirSemanticAppendExpr(callArgs, argRes.value)
+            var callSymbol: str = ""
+            var targetBlockIdx: int32 = -1
+            var look: int32 = stmtIdx + 1
+            while look < stmtStop:
+                let lookKind: str = semanticModule.stmtKind[look]
+                if strings.streq(lookKind, "term.call_symbol"):
+                    let symbolIdx: int32 = semanticModule.stmtA[look]
+                    if symbolIdx >= 0 && symbolIdx < semanticModule.stringTable.len:
+                        callSymbol = semanticModule.stringTable[symbolIdx]
+                elif strings.streq(lookKind, "term.call_target"):
+                    targetBlockIdx = semanticModule.stmtA[look]
+                look = look + 1
+            if len(callSymbol) == 0:
+                return Err[UirLowerBlock]("uir_semantic_lowering: call terminator missing resolved symbol")
+            let callExpr: UirExpr = uirCoreCall(callSymbol, callArgs)
+            let dstExprId: int32 = semanticModule.stmtC[stmtIdx]
+            if dstExprId >= 0:
+                let assignRes2: Result[bool] =
+                    uirRustSemanticEmitAssign(semanticModule, firstLocal, localLen, stmts, dstExprId, callExpr)
+                if !IsOk[bool](assignRes2):
+                    return Err[UirLowerBlock](ErrorFormat(ErrorInfoOf[bool](assignRes2)))
+            else:
+                uirSemanticAppendStmt(stmts, uirCoreStmtExpr(callExpr))
+            if targetBlockIdx >= 0:
+                term = uirCoreTermBr(uirRustSemanticBlockLabel(targetBlockIdx))
+            else:
+                let retTy2: UirLowerType = uirFuncRetTypeOf(func)
+                if uirCoreTypeKindRaw(retTy2) == int32(mtVoid):
+                    term = uirCoreTermRet(nil)
+                else:
+                    term = uirCoreTermRet(callExpr)
+            termBuilt = true
+        elif strings.streq(stmtKind, "term.call_symbol") || strings.streq(stmtKind, "term.call_target"):
+            termBuilt = termBuilt
+        else:
+            return Err[UirLowerBlock]("uir_semantic_lowering: unsupported stmt kind " + stmtKind +
+                                      " in block " + intToStr(localBlockIdx))
+        stmtIdx = stmtIdx + 1
+    if !termBuilt:
+        if strings.streq(termKind, "return"):
+            term = uirCoreTermRet(nil)
+        else:
+            return Err[UirLowerBlock]("uir_semantic_lowering: block missing supported terminator " + termKind)
+    return Ok[UirLowerBlock](uirCoreBlockWithStmts(uirRustSemanticBlockLabel(localBlockIdx), stmts, term))
+
+fn uirRustSemanticFindFunc(mod: UirModule, symbol: str): UirFunc =
+    if mod == nil || len(symbol) == 0:
+        return nil
+    for fi in 0..<uirModuleFuncsLen(mod):
+        let func: UirFunc = uirModuleFuncAt(mod, fi)
+        if func == nil:
+            continue
+        let linkName: str = uirFuncLinkNameOf(func)
+        if strings.streq(linkName, symbol) || strings.streq(uirFuncNameOf(func), symbol):
+            return func
+    return nil
+
+fn uirRustSemanticEnsureCMainWrapper(mod: UirModule, semanticModule: UirSemanticModuleV1) =
+    if mod == nil || semanticModule == nil:
+        return
+    if !strings.streq(semanticModule.crateType, "bin"):
+        return
+    let targetSymbol: str = strutils.strip(semanticModule.cMainTargetSymbol)
+    if len(targetSymbol) == 0:
+        return
+    if uirRustSemanticFindFunc(mod, "_main") != nil:
+        return
+    let targetFunc: UirFunc = uirRustSemanticFindFunc(mod, targetSymbol)
+    if targetFunc == nil:
+        return
+    let wrapper: UirFunc = uirNewFunc("_main", uirTypeI32())
+    uirFuncSetLinkName(wrapper, "_main")
+    uirFuncSetOriginFile(wrapper, semanticModule.sourceTag)
+    var stmts: UirStmtId[] = []
+    let callExpr: UirExpr = uirCoreCall(targetSymbol, [])
+    let retRaw: int32 = uirCoreTypeKindRaw(uirFuncRetTypeOf(targetFunc))
+    if retRaw == int32(mtVoid):
+        uirSemanticAppendStmt(stmts, uirCoreStmtExpr(callExpr))
+        uirCoreAddBlock(wrapper, uirCoreBlockWithStmts("entry", stmts, uirCoreTermRet(uirCoreConstI64(0))))
+    else:
+        uirCoreAddBlock(wrapper,
+                        uirCoreBlockWithStmts("entry", stmts, uirCoreTermRet(uirCoreCast(uirTypeI32(), callExpr))))
+    uirCoreFuncSetPhaseContract(wrapper, uirCorePhaseLowTag(), true, true, "")
+    uirAddFunc(mod, wrapper)
+
+fn uirRustSemanticLowerModule(semanticModule: UirSemanticModuleV1): Result[UirModule] =
+    let loadRes: Result[bool] = uirSemanticLoadRustTables(semanticModule)
+    if !IsOk[bool](loadRes):
+        return Err[UirModule](ErrorFormat(ErrorInfoOf[bool](loadRes)))
+    let mod: UirModule = uirNewModule(semanticModule.target)
+    for fi in 0..<semanticModule.funcNames.len:
+        let funcName: str = semanticModule.funcNames[fi]
+        let firstBlock: int32 = semanticModule.funcFirstBlock[fi]
+        let blockLen: int32 = semanticModule.funcBlockLen[fi]
+        let firstLocal: int32 = semanticModule.funcFirstLocal[fi]
+        let localLen: int32 = semanticModule.funcLocalLen[fi]
+        let retTy: UirLowerType = uirRustSemanticLowerLocalType(semanticModule, firstLocal, localLen, 0, true)
+        let func: UirFunc = uirNewFunc(funcName, retTy)
+        uirFuncSetLinkName(func, funcName)
+        uirFuncSetOriginFile(func, semanticModule.sourceTag)
+        for slot in 0..<localLen:
+            let slotTy: UirLowerType = uirRustSemanticLowerLocalType(semanticModule, firstLocal, localLen, slot, false)
+            uirCoreSetLocalType(func, slot, slotTy)
+            let localName: str = uirRustSemanticLocalName(semanticModule, firstLocal, localLen, slot)
+            if strutils.startsWith(localName, "arg"):
+                let typeIdx: int32 = semanticModule.localType[firstLocal + slot]
+                let typeKey: str = uirRustSemanticTypeName(semanticModule, typeIdx)
+                uirCoreAddParam(func, localName, slot, slotTy, typeKey)
+        if blockLen <= 0:
+            uirFuncSetExtern(func, true)
+        else:
+            for bi in 0..<blockLen:
+                let blockRes: Result[UirLowerBlock] =
+                    uirRustSemanticLowerBlock(semanticModule, func, firstBlock, blockLen, firstLocal, localLen, bi)
+                if !IsOk[UirLowerBlock](blockRes):
+                    return Err[UirModule]("uir_semantic_lowering: func=" + funcName + " block=" + intToStr(bi) +
+                                          " " + ErrorFormat(ErrorInfoOf[UirLowerBlock](blockRes)))
+                uirCoreAddBlock(func, blockRes.value)
+        uirCoreFuncSetPhaseContract(func, uirCorePhaseLowTag(), true, true, "")
+        uirAddFunc(mod, func)
+    uirRustSemanticEnsureCMainWrapper(mod, semanticModule)
+    uirCoreModuleApplyPhaseContract(mod, true, "")
+    semanticModule.lowUirLowered = true
+    semanticModule.phaseTag = 2
+    return Ok[UirModule](mod)
+
+fn uirLowerSemanticModuleV1(semanticModule: UirSemanticModuleV1): Result[UirModule] =
+    let validateRes: Result[bool] = uirValidateSemanticModuleV1(semanticModule)
+    if !IsOk[bool](validateRes):
+        return Err[UirModule](ErrorFormat(ErrorInfoOf[bool](validateRes)))
+    semanticModule.phaseTag = 1
+    semanticModule.highUirChecked = true
+    let frontend: str = uirSemanticNormalizeFrontend(semanticModule.frontend)
+    if frontend == "stage1":
+        if semanticModule.stage1RootId > 0:
+            let coreRes: Result[UirCoreModule] =
+                uirCoreBuildModuleFromRootId(semanticModule.stage1RootId, semanticModule.sourceTag, semanticModule.target)
+            if !IsOk[UirCoreModule](coreRes):
+                return Err[UirModule](ErrorFormat(ErrorInfoOf[UirCoreModule](coreRes)))
+            semanticModule.lowUirLowered = true
+            semanticModule.phaseTag = 2
+            return Ok[UirModule](coreRes.value)
+        let coreRes: Result[UirCoreModule] = uirCoreBuildModuleFromFileStage1(semanticModule.entryPath, semanticModule.target)
+        if !IsOk[UirCoreModule](coreRes):
+            return Err[UirModule](ErrorFormat(ErrorInfoOf[UirCoreModule](coreRes)))
+        semanticModule.lowUirLowered = true
+        semanticModule.phaseTag = 2
+        return Ok[UirModule](coreRes.value)
+    if frontend == "rust":
+        return uirRustSemanticLowerModule(semanticModule)
+    return Err[UirModule]("uir_semantic_lowering: direct semantic table lowering not wired yet")
+
+fn uirSemanticMemoryAbiCallCount(semanticModule: UirSemanticModuleV1): int32 =
+    if semanticModule == nil:
+        return 0
+    var count: int32 = 0
+    for i in 0..<semanticModule.callAbi.len:
+        let desc: UirCallAbiDesc = semanticModule.callAbi[i]
+        var memoryAbi: bool = strings.streq(desc.retMode, "sret_x8")
+        if !memoryAbi:
+            for j in 0..<desc.argModes.len:
+                let mode: str = desc.argModes[j]
+                if strings.streq(mode, "indirect") || strings.streq(mode, "by_stack"):
+                    memoryAbi = true
+                    break
+        if memoryAbi:
+            count = count + 1
+    return count
+
+fn uirCompileSemanticModuleV1(semanticModule: UirSemanticModuleV1,
+                              options: UirSemanticCompileOptionsV1): Result[UirSemanticCompileResultV1] =
+    if semanticModule == nil:
+        return Err[UirSemanticCompileResultV1]("uir_semantic_lowering: module is nil")
+    var opts: UirSemanticCompileOptionsV1 = options
+    if opts == nil:
+        opts = uirSemanticCompileOptionsV1Default()
+    if len(opts.emit) > 0 && opts.emit != "obj":
+        return Err[UirSemanticCompileResultV1]("uir_semantic_lowering: compile_v1 only supports emit=obj")
+    let frontend: str = uirSemanticNormalizeFrontend(semanticModule.frontend)
+    let lowerRes: Result[UirModule] = uirLowerSemanticModuleV1(semanticModule)
+    if !IsOk[UirModule](lowerRes):
+        if frontend == "rust" && opts.allowRustLlvmFallback:
+            var fallbackReason: str = semanticModule.phaseFallbackReason
+            if len(fallbackReason) == 0:
+                fallbackReason = "rust_frontend_not_connected"
+            return Ok[UirSemanticCompileResultV1](uirSemanticBuildFallbackResult(fallbackReason, semanticModule.rustReport))
+        return Err[UirSemanticCompileResultV1](ErrorFormat(ErrorInfoOf[UirModule](lowerRes)))
+    let lowered: UirModule = lowerRes.value
+    let objRes: Result[uint8[]] =
+        uirEmitObjFromModule(lowered, opts.optLevel, semanticModule.target, opts.objWriter, opts.validateModule,
+                             opts.simdEnabled, opts.simdMaxWidth, opts.simdPolicy)
+    if !IsOk[uint8[]](objRes):
+        return Err[UirSemanticCompileResultV1](ErrorFormat(ErrorInfoOf[uint8[]](objRes)))
+    let out: UirSemanticCompileResultV1 = uirSemanticCompileResultV1New()
+    out.ok = true
+    out.objectBytes = objRes.value
+    out.outputPath = opts.outputPath
+    out.rustReport = semanticModule.rustReport
+    out.fallbackUsed = false
+    out.fallbackReason = ""
+    if len(opts.outputPath) > 0:
+        os.writeFileBytes(opts.outputPath, out.objectBytes)
+    let semanticLowerMs: int32 = 0
+    let uirCodegenMs: int32 = 0
+    let objWriteMs: int32 = 0
+    let abiOverheadMs: int32 = 0
+    let realFnSymbols: int32 = uirModuleFuncsLen(lowered)
+    out.reportText = "status=ok\nfrontend=" + frontend +
+                     "\ntarget=" + semanticModule.target +
+                     "\nbridge=cheng_native" +
+                     "\nphase_tag=" + intToStr(semanticModule.phaseTag) +
+                     "\nhigh_uir_checked=" + (semanticModule.highUirChecked ? "1" : "0") +
+                     "\nlow_uir_lowered=" + (semanticModule.lowUirLowered ? "1" : "0") +
+                     "\noutput_path=" + opts.outputPath +
+                     "\nobj_bytes=" + intToStr(out.objectBytes.len) +
+                     "\nreal_fn_symbols=" + intToStr(realFnSymbols) +
+                     "\nstub_fn_symbols=0" +
+                     "\nuir_funcs=" + intToStr(uirModuleFuncsLen(lowered)) +
+                     "\nuir_globals=" + intToStr(uirModuleGlobalsLen(lowered)) +
+                     "\nuir_cstrs=" + intToStr(uirModuleCStringsLen(lowered)) +
+                     "\nconst_values=" + intToStr(semanticModule.constValues.len) +
+                     "\nreadonly_objects=" + intToStr(semanticModule.readonlyObjects.len) +
+                     "\nreadonly_relocs=" + intToStr(semanticModule.readonlyRelocs.len) +
+                     "\nreadonly_object_count=" + intToStr(semanticModule.readonlyObjects.len) +
+                     "\nreadonly_reloc_count=" + intToStr(semanticModule.readonlyRelocs.len) +
+                     "\nmemory_abi_calls=" + intToStr(uirSemanticMemoryAbiCallCount(semanticModule)) +
+                     "\naggregate_layouts=" + intToStr(semanticModule.aggregateLayouts.len) +
+                     "\nfunc_abi=" + intToStr(semanticModule.funcAbi.len) +
+                     "\ncall_abi=" + intToStr(semanticModule.callAbi.len) +
+                     "\nsemantic_parse_ms=0" +
+                     "\nsemantic_lower_ms=" + intToStr(semanticLowerMs) +
+                     "\nuir_codegen_ms=" + intToStr(uirCodegenMs) +
+                     "\nobj_write_ms=" + intToStr(objWriteMs) +
+                     "\nabi_overhead_ms=" + intToStr(abiOverheadMs) +
+                     "\n" + uirSemanticRustReportLine(semanticModule.rustReport) +
+                     "\n" + uirSemanticGenericsReportLine(frontend, semanticModule.rustReport)
+    return Ok[UirSemanticCompileResultV1](out)

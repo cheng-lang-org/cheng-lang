@@ -1,0 +1,197 @@
+# Shared builder-local scalar/type-key predicate helpers split from uir_core_builder.
+import std/rawmem_support
+import stage1/ast
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_text_helpers
+import backend/uir/uir_internal/uir_core_builder_string_utils
+import backend/uir/uir_internal/uir_core_builder_symbol_state
+
+fn isFloat64Key(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return (key == "float64") || (key == "float")
+
+fn isFloat32Key(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return key == "float32"
+
+fn isIntegralUirType(ty: UirCoreType): bool =
+    return ty.kind == mtI8 || ty.kind == mtI16 || ty.kind == mtI32 || ty.kind == mtI64
+
+fn isStringKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return (key == "str") || (key == "string") || (key == "cstring")
+
+fn isSemanticStrKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return (key == "str") || (key == "string")
+
+fn uirCoreNodeIsStringLiteral(node: Node): bool =
+    return astNodeIdValid(node) && nodeKind(node) == nkStrLit
+
+fn uirCoreNodeHasStringCtx(key0: str, node: Node): bool =
+    return isStringKey(key0) || uirCoreNodeIsStringLiteral(node)
+
+fn uirCoreNodeHasSemanticStrCtx(key0: str, node: Node): bool =
+    return isSemanticStrKey(key0) || uirCoreNodeIsStringLiteral(node)
+
+fn isPtrKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return (key == "ptr") || (key == ("void" + "*"))
+
+fn isStringOrPtrKey(key0: str): bool =
+    return isStringKey(key0) || isPtrKey(key0)
+
+fn isPtrRefVarBareKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return (key == "ptr") || (key == "ref") || (key == "var")
+
+fn isPtrRefVarLikeKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = backendStripSpaces(key0)
+    return uirCoreStrStartsWith(key, "ptr_") || uirCoreStrStartsWith(key, "ref_") ||
+           uirCoreStrStartsWith(key, "var_") || uirCoreStrStartsWith(key, "var_ref_") ||
+           isPtrRefVarBareKey(key)
+
+fn uirCoreParamIsVarKey(paramKey0: str): bool =
+    if len(paramKey0) == 0:
+        return false
+    let key: str = backendStripSpaces(paramKey0)
+    return (key == "var") || uirCoreStrStartsWith(key, "var_") || uirCoreStrStartsWith(key, "var_ref_")
+
+fn uirCoreParamVarBaseKey(paramKey0: str): str =
+    if len(paramKey0) == 0:
+        return ""
+    let key: str = backendStripSpaces(paramKey0)
+    if uirCoreStrStartsWith(key, "var_ref_"):
+        return str(rawmemPtrAdd(rawmemAsVoid(key), 8))
+    if uirCoreStrStartsWith(key, "var_"):
+        return str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+    return ""
+
+fn uirCoreParamWantsVarAddr(module: UirCoreModule, paramKey0: str): bool =
+    let key: str = backendStripSpaces(paramKey0)
+    if len(key) == 0:
+        return false
+    if key == "var":
+        return true
+    let baseKey: str = uirCoreParamVarBaseKey(key)
+    if len(baseKey) == 0:
+        return uirCoreParamIsVarKey(key)
+    if module == nil:
+        return true
+    if uirCoreHasObjType(module, baseKey):
+        return true
+    if uirCoreStrStartsWith(baseKey, "seq_") && uirCoreHasObjType(module, "seq"):
+        return false
+    return true
+
+fn uirCoreStripRefVarKeyOnce(key0: str): str =
+    let key: str = backendStripSpaces(key0)
+    if len(key) == 0:
+        return ""
+    if uirCoreStrStartsWith(key, "ref_"):
+        return str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+    let varBase: str = uirCoreParamVarBaseKey(key)
+    if len(varBase) > 0:
+        return varBase
+    return key
+
+fn uirCoreStripPtrKeyOnce(key0: str): str =
+    let key: str = backendStripSpaces(key0)
+    if len(key) == 0:
+        return ""
+    if uirCoreStrStartsWith(key, "ptr_"):
+        return str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+    return key
+
+fn uirCoreNormalizeObjLookupKey(module: UirCoreModule, key0: str): str =
+    var key: str = uirCoreStripRefVarKeyOnce(key0)
+    if len(key) == 0:
+        return ""
+    if module != nil:
+        let canon: str = uirCoreObjAliasCanon(key)
+        if len(canon) > 0:
+            key = canon
+    return uirCoreStripPtrKeyOnce(key)
+
+fn uirCoreStripParExpr(n0: Node): Node =
+    var n: Node = n0
+    while astNodeIdValid(n) && nodeKind(n) == nkPar && kidCount(n) > 0:
+        n = kid(n, 0)
+    return n
+
+fn uirCoreIsNilExpr(n0: Node): bool =
+    let n: Node = uirCoreStripParExpr(n0)
+    return astNodeIdValid(n) && nodeKind(n) == nkNilLit
+
+fn isByteTypeKey(key: str): bool =
+    if len(key) == 0:
+        return false
+    return (key == "bool") || (key == "char") ||
+           (key == "int8") || (key == "uint8") ||
+           (key == "i8") || (key == "u8")
+
+fn isBytePtrTypeKey(key: str): bool =
+    if len(key) == 0:
+        return false
+    if ! uirCoreStrStartsWith(key, "ptr_"):
+        return false
+    let elemKey: str = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+    return isByteTypeKey(elemKey)
+
+fn byteUirTypeFromKey(key0: str): UirCoreType =
+    if len(key0) == 0:
+        return uirCoreTypeU8()
+    let key: str = backendStripSpaces(key0)
+    if (key == "int8") || (key == "i8"):
+        return uirCoreTypeI8()
+    return uirCoreTypeU8()
+
+fn byteUirTypeFromPtrTypeKey(ptrKey0: str): UirCoreType =
+    if len(ptrKey0) == 0:
+        return uirCoreTypeU8()
+    let ptrKey: str = backendStripSpaces(ptrKey0)
+    if !uirCoreStrStartsWith(ptrKey, "ptr_"):
+        return uirCoreTypeU8()
+    let elemKey: str = str(rawmemPtrAdd(rawmemAsVoid(ptrKey), 4))
+    return byteUirTypeFromKey(elemKey)
+
+fn byteUirTypeFromElemOrPtrKey(elemKey0: str, ptrKey0: str): UirCoreType =
+    if len(elemKey0) > 0:
+        var elemKey: str = backendStripSpaces(elemKey0)
+        if uirCoreStrStartsWith(elemKey, "ptr_"):
+            elemKey = backendStripSpaces(str(rawmemPtrAdd(rawmemAsVoid(elemKey), 4)))
+        return byteUirTypeFromKey(elemKey)
+    return byteUirTypeFromPtrTypeKey(ptrKey0)
+
+fn uirCorePtrBaseObjTypeName(mod: UirCoreModule, baseKey0: str): str =
+    if (mod == nil) || len(baseKey0) == 0:
+        return ""
+    if uirCoreHasObjType(mod, baseKey0):
+        return baseKey0
+    if (uirCoreStrStartsWith(baseKey0, "seq_") || uirCoreStrStartsWith(baseKey0, "seq_fixed_")) && uirCoreHasObjType(mod, "seq"):
+        return "seq"
+    if uirCoreStrStartsWith(baseKey0, "Table_") && uirCoreHasObjType(mod, "Table"):
+        return "Table"
+    let __for_start_i = len(baseKey0) - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        if baseKey0[i] == '.':
+            let sub: str = str(rawmemPtrAdd(rawmemAsVoid(baseKey0), i + 1))
+            if len(sub) > 0 && uirCoreHasObjType(mod, sub):
+                return sub
+            break
+    return ""

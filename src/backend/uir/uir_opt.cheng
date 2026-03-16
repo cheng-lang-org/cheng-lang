@@ -1,0 +1,847 @@
+# Unified IR optimizer facade.
+import std/result
+import std/os
+import std/monotimes
+import backend/uir/uir_types
+import backend/uir/uir_pass_manager
+import backend/uir/uir_noalias_pass
+import backend/uir/uir_egraph_rewrite
+import backend/uir/uir_egraph_cost
+import backend/uir/uir_internal/uir_core_opt
+import backend/uir/uir_internal/uir_core_opt2
+import backend/uir/uir_internal/uir_core_ssu
+import backend/uir/uir_internal/uir_core_ssa
+import backend/uir/uir_internal/uir_core_types
+
+type
+    UirProfileState =
+        startNs: int64
+        lastNs: int64
+        enabled: bool
+
+fn uirOptNowNs(): int64 =
+    let mt: monotimes.MonoTime = monotimes.getMonoTime()
+    return mt.ns
+
+fn uirProfileInit(enabled: bool): UirProfileState =
+    var st: UirProfileState
+    st.enabled = enabled
+    let nowNs: int64 = uirOptNowNs()
+    st.startNs = nowNs
+    st.lastNs = nowNs
+    return st
+
+fn uirProfileStep(st: var UirProfileState, label: str) =
+    if ! st.enabled:
+        return
+    let nowNs: int64 = uirOptNowNs()
+    let stepMs: int64 = (nowNs - st.lastNs) / 1000000
+    let totalMs: int64 = (nowNs - st.startNs) / 1000000
+    st.lastNs = nowNs
+    let f: os.File = os.get_stderr()
+    os.write(f, "uir_profile")
+    os.write(f, "\t")
+    os.write(f, label)
+    os.write(f, "\tstep_ms=")
+    os.write(f, intToStr(stepMs))
+    os.write(f, "\ttotal_ms=")
+    os.writeLine(f, intToStr(totalMs))
+    os.c_fflush f
+
+fn uirProfilePass(st: var UirProfileState, label: str, changed: bool) =
+    uirProfileStep(st, label)
+    if changed:
+        uirProfileStep(st, label + ".changed")
+
+fn uirProfileOpt2ProofRequirement(st: var UirProfileState, label: str, module: UirModule) =
+    uirProfileStep(st, label + ".proof_required")
+    uirProfileStep(st, label + ".proof_backed_funcs=" +
+                       intToStr(uirModuleCountProofBackedFuncs(module)))
+
+fn uirNormalizeOptLevel(level: int32): int32 =
+    var out: int32 = level
+    if out < 0:
+        out = 0
+    if out > 3:
+        out = 3
+    return out
+
+fn uirRunCoreOptimize2(module: UirModule): bool =
+    if (module == nil):
+        return false
+    return uirCoreOptimizeModule2(module)
+
+fn uirRunCoreOptimizeConverge(module: UirModule, stage: str, maxIters: int32, st: var UirProfileState): bool =
+    var rounds: int32 = maxIters
+    if rounds <= 0:
+        rounds = 1
+    var any: bool = false
+    for i in 0..<rounds:
+        let changed: bool = uirRunCoreOptimize2(module)
+        uirProfilePass(st, stage + "." + intToStr(i), changed)
+        if changed:
+            any = true
+        else:
+            break
+    return any
+
+fn uirModExprFoldPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModule(module)
+    uirProfilePass(st, stage + ".expr_fold", changed)
+    return changed
+
+fn uirModNormExprPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleNormalizeExpr(module)
+    uirProfilePass(st, stage + ".normalize_expr", changed)
+    return changed
+
+fn uirModConstPropPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleConstProp(module)
+    uirProfilePass(st, stage + ".const_prop", changed)
+    return changed
+
+fn uirModForwardSubstPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleForwardSubstitute(module)
+    uirProfilePass(st, stage + ".forward_subst", changed)
+    return changed
+
+fn uirModNoopPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleNoopAssign(module)
+    uirProfilePass(st, stage + ".noop", changed)
+    return changed
+
+fn uirModDsePass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleDseStores(module)
+    uirProfilePass(st, stage + ".dse", changed)
+    return changed
+
+fn uirModFoldPurePass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleFoldPureExprs(module)
+    uirProfilePass(st, stage + ".fold_pure", changed)
+    return changed
+
+fn uirModCopyPropPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleCopyProp(module)
+    uirProfilePass(st, stage + ".copy_prop", changed)
+    return changed
+
+fn uirModAlgebraicPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleAlgebraic(module)
+    uirProfilePass(st, stage + ".algebraic", changed)
+    return changed
+
+fn uirModCfgPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleCfg(module)
+    uirProfilePass(st, stage + ".cfg", changed)
+    return changed
+
+fn uirRunCoreModuleFoldJumpToRetPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCoreOptimizeModuleFoldJumpToRet(module)
+    uirProfilePass(st, stage + ".fold_jump", changed)
+    return changed
+
+fn uirModInlinePass(module: UirModule, st: var UirProfileState, stage: str, inlineIters: int32): bool =
+    if (module == nil):
+        return false
+    var maxIters: int32 = inlineIters
+    if maxIters <= 0:
+        maxIters = 1
+    if maxIters > 16:
+        maxIters = 16
+    var changed: bool = false
+    for i in 0..<maxIters:
+        let changedI: bool = uirCoreInlineModuleOnce(module)
+        uirProfilePass(st, stage + ".inline." + intToStr(i), changedI)
+        if changedI:
+            changed = true
+        else:
+            break
+    return changed
+
+fn uirModPruneFuncsPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let changed: bool = uirCorePruneUnreachableFuncs(module)
+    uirProfilePass(st, stage + ".prune_unreachable_funcs", changed)
+    return changed
+
+fn uirFuncPruneBlocksPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncPruneUnreachableBlocks(f):
+            changed = true
+    uirProfilePass(st, stage + ".prune_unreachable_blocks", changed)
+    return changed
+
+fn uirRunCoreModule2OncePass(module: UirModule, st: var UirProfileState, stage: str, inlineIters: int32): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+
+    if uirModInlinePass(module, st, stage + ".inline", inlineIters):
+        changed = true
+    if uirModExprFoldPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModConstPropPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModForwardSubstPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModNormExprPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModConstPropPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModCfgPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModAlgebraicPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModNoopPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModNormExprPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModDsePass(module, st, stage + ".opt"):
+        changed = true
+    if uirModFoldPurePass(module, st, stage + ".opt"):
+        changed = true
+    if uirModCopyPropPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModConstPropPass(module, st, stage + ".opt"):
+        changed = true
+    if uirModCfgPass(module, st, stage + ".opt"):
+        changed = true
+
+    if uirFuncSroaPass(module, st, stage + ".func"):
+        changed = true
+    if uirModNormExprPass(module, st, stage + ".func"):
+        changed = true
+    if uirModAlgebraicPass(module, st, stage + ".func"):
+        changed = true
+    if uirModNormExprPass(module, st, stage + ".func"):
+        changed = true
+    if uirModNoopPass(module, st, stage + ".func"):
+        changed = true
+    if uirModDsePass(module, st, stage + ".func"):
+        changed = true
+    if uirRunCoreModuleFoldJumpToRetPass(module, st, stage + ".func"):
+        changed = true
+    if uirModFoldPurePass(module, st, stage + ".func"):
+        changed = true
+    if uirFuncCsePass(module, st, stage + ".func"):
+        changed = true
+    if uirModCopyPropPass(module, st, stage + ".func"):
+        changed = true
+    if uirFuncLicmPass(module, st, stage + ".func"):
+        changed = true
+    if uirModCfgPass(module, st, stage + ".func"):
+        changed = true
+    if uirModExprFoldPass(module, st, stage + ".func"):
+        changed = true
+    if uirModCfgPass(module, st, stage + ".func"):
+        changed = true
+    if uirModPruneFuncsPass(module, st, stage + ".func"):
+        changed = true
+    if uirFuncDcePass(module, st, stage + ".func"):
+        changed = true
+    if uirModCfgPass(module, st, stage + ".func"):
+        changed = true
+
+    return changed
+
+fn uirFuncCsePass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncCse(f, module):
+            changed = true
+    uirProfilePass(st, stage + ".func_cse", changed)
+    return changed
+
+fn uirFuncSroaPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncSroa(f):
+            changed = true
+    uirProfilePass(st, stage + ".func_sroa", changed)
+    return changed
+
+fn uirFuncLicmPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncLicm(f):
+            changed = true
+    uirProfilePass(st, stage + ".func_licm", changed)
+    return changed
+
+fn uirFuncDcePass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        # Current DCE liveness is not backedge-aware enough; keep loop funcs
+        # conservative to avoid dropping live initializers.
+        if uirCoreFuncHasBackEdge(f):
+            continue
+        if uirCoreFuncDceStmts(f):
+            changed = true
+    uirProfilePass(st, stage + ".func_dce", changed)
+    return changed
+
+fn uirFuncMergeRetPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncMergeIdenticalRetBlocks(f):
+            changed = true
+    uirProfilePass(st, stage + ".merge_identical_ret", changed)
+    return changed
+
+fn uirFuncMergeEqBlocksPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncMergeEquivalentBlocks(f):
+            changed = true
+    uirProfilePass(st, stage + ".merge_equivalent_blocks", changed)
+    return changed
+
+fn uirFuncFoldCbrRetExprPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncFoldCbrToRetExpr(f):
+            changed = true
+    uirProfilePass(st, stage + ".fold_cbr_to_ret_expr", changed)
+    return changed
+
+fn uirFuncFoldCbrRetBoolPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncFoldCbrToRetBool(f):
+            changed = true
+    uirProfilePass(st, stage + ".fold_cbr_to_ret_bool", changed)
+    return changed
+
+fn uirFuncFoldCbrConstPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncFoldCbrConstantTarget(f):
+            changed = true
+    uirProfilePass(st, stage + ".fold_cbr_constant_target", changed)
+    return changed
+
+fn uirFuncSimplifyBranchesPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncSimplifyBranches(f):
+            changed = true
+    uirProfilePass(st, stage + ".simplify_branches", changed)
+    return changed
+
+fn uirFuncSimplifyZeroCmpPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncSimplifyCbrZeroCmp(f):
+            changed = true
+    uirProfilePass(st, stage + ".simplify_cbr_zero_cmp", changed)
+    return changed
+
+fn uirFuncThreadCbrToBrPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncThreadCbrToBr(f):
+            changed = true
+    uirProfilePass(st, stage + ".thread_cbr_to_br", changed)
+    return changed
+
+fn uirFuncFoldCbrSamePass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncFoldCbrSameTarget(f):
+            changed = true
+    uirProfilePass(st, stage + ".fold_cbr_same_target", changed)
+    return changed
+
+fn uirFuncThreadBrToCbrPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncThreadBrToCbr(f):
+            changed = true
+    uirProfilePass(st, stage + ".thread_br_to_cbr", changed)
+    return changed
+
+fn uirFuncNormTruthPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncNormalizeCbrTruthiness(f):
+            changed = true
+    uirProfilePass(st, stage + ".normalize_cbr_truthiness", changed)
+    return changed
+
+fn uirFuncFoldRetAliasPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncFoldRetAlias(f):
+            changed = true
+    uirProfilePass(st, stage + ".fold_ret_alias", changed)
+    return changed
+
+fn uirFuncFoldEmptyJumpPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncFoldEmptyJumpBlocks(f):
+            changed = true
+    uirProfilePass(st, stage + ".fold_empty_jump_blocks", changed)
+    return changed
+
+fn uirFuncMergeJumpChainPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    for i in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, i)
+        if (f == nil) || uirFuncIsExtern(f):
+            continue
+        if uirCoreFuncMergeUncondJumpChain(f):
+            changed = true
+    uirProfilePass(st, stage + ".merge_uncond_jump_chain", changed)
+    return changed
+
+fn uirRunCoreModuleCfgCanonicalizePass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+
+    var changed: bool = false
+    let changedMergeRetEq: bool = uirFuncMergeRetPass(module, st, stage + ".ret_blocks")
+    if changedMergeRetEq:
+        changed = true
+    let changedMergeEqBlk: bool = uirFuncMergeEqBlocksPass(module, st, stage + ".ret_blocks")
+    if changedMergeEqBlk:
+        changed = true
+    let changedFoldCbrEq: bool = uirFuncFoldCbrRetExprPass(module, st, stage + ".branches")
+    if changedFoldCbrEq:
+        changed = true
+    let changedFoldCbrBool: bool = uirFuncFoldCbrRetBoolPass(module, st, stage + ".branches")
+    if changedFoldCbrBool:
+        changed = true
+    let changedFoldCbrConst: bool = uirFuncFoldCbrConstPass(module, st, stage + ".branches")
+    if changedFoldCbrConst:
+        changed = true
+    let changedSimplifyBranches: bool = uirFuncSimplifyBranchesPass(module, st, stage + ".branches")
+    if changedSimplifyBranches:
+        changed = true
+    let changedSimplifyCbrZeroCmp: bool = uirFuncSimplifyZeroCmpPass(module, st, stage + ".branches")
+    if changedSimplifyCbrZeroCmp:
+        changed = true
+    let changedThreadCbrToBr: bool = uirFuncThreadCbrToBrPass(module, st, stage + ".branches")
+    if changedThreadCbrToBr:
+        changed = true
+    let changedThreadBrToCbr: bool = uirFuncThreadBrToCbrPass(module, st, stage + ".branches")
+    if changedThreadBrToCbr:
+        changed = true
+    let changedFoldCbrSame: bool = uirFuncFoldCbrSamePass(module, st, stage + ".branches")
+    if changedFoldCbrSame:
+        changed = true
+    let changedNormalizeCbrTruth: bool = uirFuncNormTruthPass(module, st, stage + ".branches")
+    if changedNormalizeCbrTruth:
+        changed = true
+    let changedFoldRetAlias: bool = uirFuncFoldRetAliasPass(module, st, stage + ".branches")
+    if changedFoldRetAlias:
+        changed = true
+    let changedFoldEmptyJump: bool = uirFuncFoldEmptyJumpPass(module, st, stage + ".branches")
+    if changedFoldEmptyJump:
+        changed = true
+    let changedMergeJumpChain: bool = uirFuncMergeJumpChainPass(module, st, stage + ".branches")
+    if changedMergeJumpChain:
+        changed = true
+    let changedFoldJump: bool = uirRunCoreModuleFoldJumpToRetPass(module, st, stage + ".branches")
+    if changedFoldJump:
+        changed = true
+    let changedPruneBlocks: bool = uirFuncPruneBlocksPass(module, st, stage + ".branches")
+    if changedPruneBlocks:
+        changed = true
+
+    let changedCfg: bool = uirModCfgPass(module, st, stage + ".cfg")
+    if changedCfg:
+        changed = true
+    let changedPruneFuncs: bool = uirModPruneFuncsPass(module, st, stage + ".funcs")
+    if changedPruneFuncs:
+        changed = true
+    let changedCse: bool = uirFuncCsePass(module, st, stage + ".func")
+    if changedCse:
+        changed = true
+    let changedSroa: bool = uirFuncSroaPass(module, st, stage + ".func")
+    if changedSroa:
+        changed = true
+    let changedLicm: bool = uirFuncLicmPass(module, st, stage + ".func")
+    if changedLicm:
+        changed = true
+    let changedPrune: bool = uirRunCoreModuleCleanupPass(module, st, stage + ".cleanup")
+    if changedPrune:
+        changed = true
+
+    return changed
+
+fn uirRunCoreModuleFullPassSequence(module: UirModule, st: var UirProfileState, stage: str, inlineIters: int32): bool =
+    if (module == nil):
+        return false
+    var changed: bool = false
+    if uirRunCoreModule2OncePass(module, st, stage + ".mir2_once", inlineIters):
+        changed = true
+
+    let changedFuncPruneBlk: bool = uirFuncPruneBlocksPass(module, st, stage + ".mir2_once")
+    if changedFuncPruneBlk:
+        changed = true
+    let changedModuleCfg: bool = uirModCfgPass(module, st, stage + ".mir2_once")
+    if changedModuleCfg:
+        changed = true
+
+    # Aggressive CFG shape passes (opt3-only/diagnostic mode):
+    let changedFoldCbrToRetExpr: bool = uirFuncFoldCbrRetExprPass(module, st, stage + ".cfg")
+    if changedFoldCbrToRetExpr:
+        changed = true
+    let changedFoldCbrToRetBool: bool = uirFuncFoldCbrRetBoolPass(module, st, stage + ".cfg")
+    if changedFoldCbrToRetBool:
+        changed = true
+    let changedFoldCbrConst: bool = uirFuncFoldCbrConstPass(module, st, stage + ".cfg")
+    if changedFoldCbrConst:
+        changed = true
+    let changedFoldEmptyJump: bool = uirFuncFoldEmptyJumpPass(module, st, stage + ".cfg")
+    if changedFoldEmptyJump:
+        changed = true
+    let changedMergeUncondJump: bool = uirFuncMergeJumpChainPass(module, st, stage + ".cfg")
+    if changedMergeUncondJump:
+        changed = true
+    let changedMergeIdenticalRet: bool = uirFuncMergeRetPass(module, st, stage + ".cfg")
+    if changedMergeIdenticalRet:
+        changed = true
+    let changedMergeEquivalent: bool = uirFuncMergeEqBlocksPass(module, st, stage + ".cfg")
+    if changedMergeEquivalent:
+        changed = true
+    let changedThreadCbrToBr: bool = uirFuncThreadCbrToBrPass(module, st, stage + ".cfg")
+    if changedThreadCbrToBr:
+        changed = true
+    let changedFoldCbrSameTarget: bool = uirFuncFoldCbrSamePass(module, st, stage + ".cfg")
+    if changedFoldCbrSameTarget:
+        changed = true
+    let changedThreadBrToCbr: bool = uirFuncThreadBrToCbrPass(module, st, stage + ".cfg")
+    if changedThreadBrToCbr:
+        changed = true
+    let changedNormalizeCbrTruthiness: bool = uirFuncNormTruthPass(module, st, stage + ".cfg")
+    if changedNormalizeCbrTruthiness:
+        changed = true
+    let changedFoldRetAlias: bool = uirFuncFoldRetAliasPass(module, st, stage + ".cfg")
+    if changedFoldRetAlias:
+        changed = true
+    let changedSimplifyBranches: bool = uirFuncSimplifyBranchesPass(module, st, stage + ".cfg")
+    if changedSimplifyBranches:
+        changed = true
+    let changedSimplifyCbrZeroCmp: bool = uirFuncSimplifyZeroCmpPass(module, st, stage + ".cfg")
+    if changedSimplifyCbrZeroCmp:
+        changed = true
+
+    if uirRunCoreModuleCfgCanonicalizePass(module, st, stage + ".cfg_canonical"):
+        changed = true
+
+    return changed
+
+fn uirRunCoreModuleCleanupPass(module: UirModule, st: var UirProfileState, stage: str): bool =
+    if (module == nil):
+        return false
+    let pruneChanged: bool = uirCorePruneUnreachableFuncs(module)
+    uirProfilePass(st, stage + ".prune_unreachable_funcs", pruneChanged)
+    let cfgChanged: bool = uirCoreOptimizeModuleCfg(module)
+    uirProfilePass(st, stage + ".cfg", cfgChanged)
+    let dceChanged: bool = uirFuncDcePass(module, st, stage + ".func")
+    return pruneChanged || cfgChanged || dceChanged
+
+fn uirRunCoreModuleLegacyFullPass(module: UirModule, st: var UirProfileState, stage: str, maxIters: int32): bool =
+    if (module == nil):
+        return false
+    var rounds: int32 = maxIters
+    if rounds <= 0:
+        rounds = 1
+    if rounds > 16:
+        rounds = 16
+    var changedAny: bool = false
+    for i in 0..<rounds:
+        let changed: bool = uirCoreOptimizeModule2Once(module)
+        uirProfilePass(st, stage + ".uir_opt2_once." + intToStr(i), changed)
+        if changed:
+            changedAny = true
+        else:
+            break
+    return changedAny
+
+fn uirEmitSoaReport(module: UirModule): bool =
+    if (module == nil):
+        return false
+    let enabled: bool = uirEnvParseBool("UIR_SOA_REPORT", false)
+    let enforce: bool = uirEnvParseBool("UIR_SOA_ENFORCE", false)
+    if !enabled && !enforce:
+        return false
+
+    let soaStats: UirSoaSurfaceStats = uirSoaSurfaceStatsCollect(module)
+    let trackedFuncs: int32 = soaStats.trackedFuncs
+    let exprIds: int32 = soaStats.exprIds
+    let stmtIds: int32 = soaStats.stmtIds
+    let blockIds: int32 = soaStats.blockIds
+    let succEdges: int32 = soaStats.succEdges
+    let predEdges: int32 = soaStats.predEdges
+    let balanceOk: bool = soaStats.balanceOk
+
+    if enforce && !balanceOk:
+        let reason: str = soaStats.reason
+        panic("uir_opt: SoA enforcement failed (module build or edge balance): " + reason +
+              " funcs=" + intToStr(trackedFuncs) +
+              " expr=" + intToStr(exprIds) +
+              " stmt=" + intToStr(stmtIds) +
+              " block=" + intToStr(blockIds) +
+              " succ=" + intToStr(succEdges) +
+              " pred=" + intToStr(predEdges))
+
+    if enabled:
+        let f: os.File = os.get_stderr()
+        os.write(f, "soa_report\tenabled=")
+        os.write(f, intToStr(enabled ? 1 : 0))
+        os.write(f, "\tenforce=")
+        os.write(f, intToStr(enforce ? 1 : 0))
+        os.write(f, "\ttracked_funcs=")
+        os.write(f, intToStr(trackedFuncs))
+        os.write(f, "\texpr_ids=")
+        os.write(f, intToStr(exprIds))
+        os.write(f, "\tstmt_ids=")
+        os.write(f, intToStr(stmtIds))
+        os.write(f, "\tblock_ids=")
+        os.write(f, intToStr(blockIds))
+        os.write(f, "\tsucc_edges=")
+        os.write(f, intToStr(succEdges))
+        os.write(f, "\tpred_edges=")
+        os.write(f, intToStr(predEdges))
+        os.write(f, "\tbalance_ok=")
+        os.writeLine(f, intToStr(balanceOk ? 1 : 0))
+        os.c_fflush f
+    return enabled
+
+fn uirOptimizeModule(module: UirModule, optLevel: int32, simdEnabled: bool, simdMaxWidth: int32, simdPolicy: str) =
+    if (module == nil):
+        return
+    let st: UirProfileState = uirProfileInit(uirEnvParseBool("UIR_PROFILE", false))
+    var level: int32 = uirNormalizeOptLevel(optLevel)
+    uirCoreReservePoolsForOptimize(module, level)
+
+    # Global, stable defaults kept backward-compatible. Advanced users can tune these with env.
+    let opt2Iters: int32 = uirEnvParseInt("UIR_OPT2_ITERS", 5, 1, 32)
+    let opt3PostIters: int32 = uirEnvParseInt("UIR_OPT3_ITERS", 4, 1, 32)
+    let opt3CleanupIters: int32 = uirEnvParseInt("UIR_OPT3_CLEANUP_ITERS", 3, 1, 32)
+    let inlineIters: int32 = uirEnvParseInt("UIR_INLINE_ITERS", 4, 1, 16)
+    let optCfgCanonicalIters: int32 = uirEnvParseInt("UIR_CFG_CANON_ITERS", 1, 1, 16)
+    let opt3FullIters: int32 = uirEnvParseInt("UIR_FULL_ITERS", 1, 1, 16)
+    let noAliasEnabled: bool = uirEnvParseBool("UIR_NOALIAS", true)
+    let noAliasRequireProof: bool = uirEnvParseBool("UIR_NOALIAS_REQUIRE_PROOF", false)
+    let egraphIters: int32 = uirEnvParseInt("UIR_EGRAPH_ITERS", 2, 0, 32)
+    let egraphGoal: str = uirEGraphGoalParseEnv("UIR_EGRAPH_GOAL", "balanced")
+    let egraphRequireProof: bool = uirEnvParseBool("UIR_EGRAPH_REQUIRE_PROOF", false)
+    let aggressive: bool = uirEnvParseBool("UIR_AGGRESSIVE", false)
+
+    var profileState: UirProfileState = st
+
+    if level >= 1:
+        uirProfilePass(profileState, "uir_opt.const_fold", uirCoreOptimizeModule(module))
+        if aggressive:
+            for i in 0..<opt3FullIters:
+                let fullChanged: bool = uirRunCoreModuleFullPassSequence(module, profileState, "uir_opt.full.pass" + intToStr(i), inlineIters)
+                if !fullChanged:
+                    break
+
+    if level >= 2:
+        if noAliasEnabled:
+            if noAliasRequireProof:
+                uirProfileOpt2ProofRequirement(profileState, "uir_opt2.noalias", module)
+            let noAliasChanged: bool = uirRunNoAliasPrep(module, noAliasRequireProof)
+            uirProfilePass(profileState, "uir_opt2.noalias", noAliasChanged)
+        else:
+            uirProfileStep(profileState, "uir_opt2.noalias.disabled")
+
+        # Opt2 default pipeline: noalias -> ssu -> opt2 -> cleanup -> egraph.
+        let ssuEnabled: bool = uirCoreSsuEmitReport(module)
+        if ssuEnabled:
+            uirProfileStep(profileState, "uir_opt2.ssu")
+        else:
+            uirProfileStep(profileState, "uir_opt2.ssu.disabled")
+
+        let soaEnabled: bool = uirEmitSoaReport(module)
+        if soaEnabled:
+            uirProfileStep(profileState, "uir_opt2.soa")
+        elif uirEnvParseBool("UIR_SOA_ENFORCE", false):
+            uirProfileStep(profileState, "uir_opt2.soa.enforced")
+        else:
+            uirProfileStep(profileState, "uir_opt2.soa.disabled")
+
+        let _ = uirRunCoreOptimizeConverge(module, "uir_opt2.opt2", opt2Iters, profileState)
+        # Keep a stable profile marker for existing surface gates.
+        let _ = uirModCopyPropPass(module, profileState, "uir_opt2.safe")
+        let _ = uirRunCoreModuleCleanupPass(module, profileState, "uir_opt2.cleanup")
+
+        if egraphIters > 0:
+            if egraphRequireProof:
+                uirProfileOpt2ProofRequirement(profileState, "uir_opt2.egraph", module)
+            let egraphChanged: bool = uirRunEGraphRewrite(module, egraphIters, egraphGoal, egraphRequireProof)
+            uirProfilePass(profileState, "uir_opt2.egraph", egraphChanged)
+            uirProfileStep(profileState, "uir_opt2.cost_model")
+            uirProfileStep(profileState, "uir_opt2.cost_model." + egraphGoal)
+            uirProfileStep(profileState, "uir_opt2.cost_model.weights." + uirEGraphGoalWeightSignature(egraphGoal))
+        else:
+            uirProfileStep(profileState, "uir_opt2.egraph.disabled")
+
+    if level >= 3:
+        uirProfilePass(profileState, "uir_opt3.pre_ssa_opt", uirCoreOptimizeModule(module))
+
+        uirProfileStep(profileState, "uir_opt3.ssa.lower")
+        let ssaRes: Result[bool] = uirCoreSsaLowerModule(module)
+        if !IsOk[bool](ssaRes):
+            let ssaErr: ErrorInfo = ErrorInfoOf[bool](ssaRes)
+            panic("uir_opt: uir_core_ssa.lower failed at opt level 3: " + ErrorMessage(ssaErr))
+
+        for i in 0..<opt3PostIters:
+            uirProfileStep(profileState, "uir_opt3.post_ssa_opt.round" + intToStr(i))
+            let _ = uirRunCoreOptimizeConverge(module, "uir_opt3.post_ssa_opt", 2, profileState)
+            let cleanupChanged: bool = uirRunCoreModuleCleanupPass(module, profileState, "uir_opt3.post_ssa_cleanup.round" + intToStr(i))
+            let cfgCanonicalChanged: bool = uirRunCoreModuleCfgCanonicalizePass(module, profileState, "uir_opt3.post_ssa_canonical.round" + intToStr(i))
+            if !(cleanupChanged || cfgCanonicalChanged):
+                break
+
+        # Extra late cleanup rounds to expose DCE/CSE/licm effects after SSA block splitting.
+        for j in 0..<opt3CleanupIters:
+            uirProfileStep(profileState, "uir_opt3.final_cleanup.round" + intToStr(j))
+            let changed: bool = uirRunCoreOptimizeConverge(module, "uir_opt3.final_cleanup", 2, profileState)
+            let changedSroa: bool = uirFuncSroaPass(module, profileState, "uir_opt3.final_cleanup")
+            let changedLicm: bool = uirFuncLicmPass(module, profileState, "uir_opt3.final_cleanup")
+            let changedCse: bool = uirFuncCsePass(module, profileState, "uir_opt3.final_cleanup")
+            let cfgCanonicalChanged: bool = uirRunCoreModuleCfgCanonicalizePass(module, profileState, "uir_opt3.final_canonical.round" + intToStr(j))
+            if !(changed || changedSroa || changedLicm || changedCse || cfgCanonicalChanged):
+                break
+            if aggressive:
+                let extra: bool = uirRunCoreModuleLegacyFullPass(module, profileState, "uir_opt3.final_cleanup.full.pass", opt3FullIters)
+                if !extra:
+                    break
+
+        uirProfilePass(profileState, "uir_opt3.final_cleanup", uirCoreOptimizeModule(module))
+        let _ = uirRunCoreModuleCleanupPass(module, profileState, "uir_opt3.final_cleanup2")
+        if aggressive:
+            let _ = uirRunCoreModuleLegacyFullPass(module, profileState, "uir_opt3.full.pass", opt3FullIters)
+
+    if !simdEnabled:
+        return
+    if simdMaxWidth <= 0:
+        simdMaxWidth = 0
+    uirProfileStep(profileState, "uir_simd")
+    uirProfileStep(profileState, "uir_simd.policy_" + simdPolicy)
+    if simdMaxWidth > 0:
+        uirProfileStep(profileState, "uir_simd.max_width=" + intToStr(simdMaxWidth))
+    let vecChanged: bool = uirRunLateVectorPasses(module, level, simdEnabled, simdMaxWidth, simdPolicy)
+    uirProfilePass(profileState, "uir_simd.vectorize", vecChanged)
