@@ -1716,7 +1716,8 @@ WEAK int32_t driver_c_link_tmp_obj_default(const char* outputPath, const char* o
     if (strcmp(linkerText, "system") != 0) return -22;
     const char* base = strrchr(objPath, '/');
     const char* objName = (base != NULL) ? (base + 1) : objPath;
-    int useDriverEntryShim = strstr(objName, "backend_driver") != NULL;
+    int useDriverEntryShim = strstr(objName, "backend_driver") != NULL ||
+                             driver_c_env_bool("BACKEND_FORCE_DRIVER_ENTRY_SHIM", 0) != 0;
     int needsDarwinCodesign = 0;
     if (strstr(targetText, "darwin") != NULL || strstr(targetText, "apple-darwin") != NULL) {
         needsDarwinCodesign = 1;

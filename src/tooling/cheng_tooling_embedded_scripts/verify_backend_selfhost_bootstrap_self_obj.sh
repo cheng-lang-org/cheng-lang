@@ -1647,15 +1647,15 @@ build_exe_self() {
   build_runtime_obj "$runtime_compiler" "$runtime_obj"
   runtime_obj_for_link="$runtime_obj"
   stage_sidecar_compiler=""
+  stage_force_driver_entry_shim="0"
   input_base="$(basename -- "$input")"
+  if [ "$input_base" = "backend_driver_proof.cheng" ]; then
+    stage_force_driver_entry_shim="1"
+  fi
   if [ "${SELF_OBJ_BOOTSTRAP_FORCE_SIDECAR_COMPILER:-}" != "" ]; then
     stage_sidecar_compiler="$SELF_OBJ_BOOTSTRAP_FORCE_SIDECAR_COMPILER"
   elif [ "$input_base" = "backend_driver_proof.cheng" ] && [ -x "${proof_surface_sidecar:-}" ]; then
-    case "$stage" in
-      stage2|stage3.witness)
-        stage_sidecar_compiler="$proof_surface_sidecar"
-        ;;
-    esac
+    stage_sidecar_compiler="$proof_surface_sidecar"
   fi
 
   set +e
@@ -1673,6 +1673,7 @@ build_exe_self() {
     BACKEND_NO_RUNTIME_C=1 \
     BACKEND_RUNTIME_OBJ="$runtime_obj_for_link" \
     BACKEND_UIR_SIDECAR_COMPILER="$stage_sidecar_compiler" \
+    BACKEND_FORCE_DRIVER_ENTRY_SHIM="$stage_force_driver_entry_shim" \
     BACKEND_SIZEOF_UNKNOWN_FALLBACK="$stage_sizeof_unknown_fallback" \
     BACKEND_COMPILE_STAMP_OUT="$compile_stamp_out" \
     STAGE1_SEM_FIXED_0="$stage_skip_sem" \
@@ -1704,6 +1705,7 @@ build_exe_self() {
       BACKEND_NO_RUNTIME_C=1 \
       BACKEND_RUNTIME_OBJ="$runtime_obj_for_link" \
       BACKEND_UIR_SIDECAR_COMPILER="$stage_sidecar_compiler" \
+      BACKEND_FORCE_DRIVER_ENTRY_SHIM="$stage_force_driver_entry_shim" \
       BACKEND_SIZEOF_UNKNOWN_FALLBACK="$stage_sizeof_unknown_fallback" \
       BACKEND_COMPILE_STAMP_OUT="$compile_stamp_out" \
       STAGE1_SEM_FIXED_0="$stage_skip_sem" \

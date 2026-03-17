@@ -1189,13 +1189,19 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
     layout.linkeditFileOff = layout.dataFileOff + layout.dataSegFileSize
     layout.linkeditVmaddr = layout.dataVmaddr + layout.dataSegVmSize
 
-    # Resolve _main for LC_MAIN entryoff using prebuilt definition index.
-    let mainIdxPlus1: int32 = machoHashGetRead(layout.defIndex, "_main")
-    let mainIdx: int32 = mainIdxPlus1 - 1
+    # Resolve LC_MAIN entryoff. Prefer `_main`, but allow tooling-only/selfhost
+    # drivers to publish `backendMain` as the effective entry surface.
+    var mainSymName: str = "_main"
+    var mainIdxPlus1: int32 = machoHashGetRead(layout.defIndex, mainSymName)
+    var mainIdx: int32 = mainIdxPlus1 - 1
+    if mainIdxPlus1 <= 0 || mainIdx < 0 || mainIdx >= layout.defAddr.len:
+        mainSymName = "_backendMain"
+        mainIdxPlus1 = machoHashGetRead(layout.defIndex, mainSymName)
+        mainIdx = mainIdxPlus1 - 1
     if mainIdxPlus1 <= 0 || mainIdx < 0 || mainIdx >= layout.defAddr.len:
         for oi in 0..<objs.len:
             machoFreeObj(objs[oi])
-        return Err[bool]("macho_linker: missing _main symbol (required for LC_MAIN)")
+        return Err[bool]("macho_linker: missing _main/_backendMain symbol (required for LC_MAIN)")
     let mainRel: uint64 = layout.defAddr[mainIdx]
     let mainAddr: uint64 = machoResolveTaggedAddr(layout, textOff, cstrOff, mainRel)
 
@@ -1348,6 +1354,21 @@ fn machoLinkExeAarch64Core(objs: MachoObjFile[], outputPath: str, symtabAll: boo
                             ds.nDesc = uint16(0)
                             ds.nValue = addr4
                             machoAppendSymbol(syms, ds)
+        if machoHashGet(extdefSeen, "_main") == 0:
+            let backendMainIdxPlus1: int32 = machoHashGetRead(layout.defIndex, "_backendMain")
+            let backendMainIdx: int32 = backendMainIdxPlus1 - 1
+            if backendMainIdxPlus1 > 0 &&
+               backendMainIdx >= 0 &&
+               backendMainIdx < layout.defAddr.len:
+                let relMainAlias: uint64 = layout.defAddr[backendMainIdx]
+                let addrMainAlias: uint64 = machoResolveTaggedAddr(layout, textOff, cstrOff, relMainAlias)
+                var mainAliasSym: MachoObjSymbol = new(MachoObjSymbol)
+                mainAliasSym.name = "_main"
+                mainAliasSym.nType = uint8(N_SECT | N_EXT)
+                mainAliasSym.nSect = uint8(1)
+                mainAliasSym.nDesc = uint16(0)
+                mainAliasSym.nValue = addrMainAlias
+                machoAppendSymbol(syms, mainAliasSym)
         extdefCount = uint32(syms.len)
     else:
         # extdef: _main only (enough for tooling); other symbols can be added later.

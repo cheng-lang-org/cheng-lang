@@ -1,24 +1,20 @@
 # Cheng Web Examples
 
 Counter demo (WASM runtime):
-- Compile the Cheng entry to `client.wasm`.
+- Build the SFC helper: `artifacts/tooling_cmd/cheng_tooling cheng --in:src/web/cli/webc.cheng --name:cheng_webc`
+- Compile `counter.cwc`: `./artifacts/chengc/cheng_webc src/web/examples/counter.cwc --out:src/web/examples/counter.generated.cheng --css:src/web/examples/counter.generated.css --map`
 - Serve this folder over HTTP.
 - Open `index.html`.
 
-Dev server (live reload):
-- Build: `sh src/tooling/tooling_exec.sh web_build_native_server --entry:cheng/web/cli/dev_server_main.cheng --name:cheng_dev_server`
-- Run: `WEB_ROOT=cheng/web/examples ./cheng_dev_server --host:127.0.0.1 --port:5173`
-- Optional: `WEB_BUILD="<your build command>"` to rebuild wasm on change.
-  - Or build `sh src/tooling/tooling_exec.sh chengc cheng/web/cli/web.cheng --name:cheng_web` then run `WEB_ROOT=cheng/web/examples ./cheng_web dev --host:127.0.0.1 --port:5173`.
+Build (compile `.cwc` + copy common assets):
+- Build the project compiler: `artifacts/tooling_cmd/cheng_tooling cheng --in:src/web/cli/build.cheng --name:cheng_web_build`
+- Run: `WEB_ROOT=src/web/examples ./artifacts/chengc/cheng_web_build --out:src/web/examples/dist --map`
 
-Build (compile .cwc):
-- `sh src/tooling/tooling_exec.sh chengc cheng/web/cli/web.cheng --name:cheng_web`
-- `WEB_ROOT=cheng/web/examples ./cheng_web build --out:cheng/web/examples/dist --map` (copies common assets + map)
-
-Preview server (static):
-- Build: `sh src/tooling/tooling_exec.sh web_build_native_server --entry:cheng/web/cli/preview_server_main.cheng --name:cheng_preview_server`
-- Run: `WEB_ROOT=cheng/web/examples ./cheng_preview_server --host:127.0.0.1 --port:4173`
-  - Or run `WEB_ROOT=cheng/web/examples ./cheng_web preview --host:127.0.0.1 --port:4173`.
+Dev / preview native server:
+- Historical helper `cheng_tooling web_build_native_server` has been removed and now exits with an error.
+- Current native-server sources are `src/web/cli/native_server.c`, `src/web/cli/dev_server_main.cheng`, `src/web/cli/preview_server_main.cheng`, and `src/web/examples/server_main.cheng`.
+- If you need standalone native dev/preview binaries, link `native_server.c` in your own native build flow and run them with `WEB_ROOT=src/web/examples`.
+- Optional: set `WEB_BUILD="<your build command>"` for rebuild-on-change behavior in the dev server path.
 
 Files:
 - counter.cheng: Cheng UI entrypoint (registers app hooks)
@@ -28,11 +24,11 @@ Files:
 - index.html/style.css: minimal host page
 
 Router demo:
-- Route files live under `examples/routes` (file-based routing shape only).
-- Generate `routes_manifest.cheng` via `sh src/tooling/tooling_exec.sh chengc cheng/web/cli/route_manifest.cheng --name:cheng_route_manifest` then run `./cheng_route_manifest --root:cheng/web/examples/routes --out:cheng/web/examples/routes_manifest.cheng`.
-  - Or run `./cheng_web route-manifest --root:cheng/web/examples/routes --out:cheng/web/examples/routes_manifest.cheng`.
+- Route files live under `src/web/examples/routes` (file-based routing shape only).
+- Build the manifest tool: `artifacts/tooling_cmd/cheng_tooling cheng --in:src/web/cli/route_manifest.cheng --name:cheng_route_manifest`
+- Generate `routes_manifest.cheng`: `./artifacts/chengc/cheng_route_manifest --root:src/web/examples/routes --out:src/web/examples/routes_manifest.cheng`
 - Compile `router_app.cheng` to `client.wasm` to try routing.
-  - Alternatively, set `WEB_MANIFEST_ROOT=cheng/web/examples/routes` and run the dev server to auto-generate.
+  - Alternatively, set `WEB_MANIFEST_ROOT=src/web/examples/routes` in your dev workflow to auto-generate.
 
 Router files:
 - router_app.cheng: runtime router + outlet wiring
@@ -46,4 +42,5 @@ Server demo:
 Server app:
 - server_app.cheng: uses runtime `server_app` + std/server to expose `server_handle` for adapters.
 - server_main.cheng: entrypoint that calls the native server adapter.
-- build with `sh src/tooling/tooling_exec.sh web_build_native_server --entry:cheng/web/examples/server_main.cheng`.
+- native adapter source: `src/web/cli/native_server.c`
+- standalone native server binaries now need a project-local native link step; the old `web_build_native_server` helper is no longer usable.

@@ -1197,7 +1197,8 @@ int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_p
   if (strcmp(linker_text, "system") != 0) return -22;
   const char *base = strrchr(obj_path, '/');
   const char *obj_name = (base != NULL) ? (base + 1) : obj_path;
-  int use_driver_entry_shim = strstr(obj_name, "backend_driver") != NULL;
+  int use_driver_entry_shim = strstr(obj_name, "backend_driver") != NULL ||
+                              driver_c_env_bool("BACKEND_FORCE_DRIVER_ENTRY_SHIM", 0) != 0;
   int needs_darwin_codesign = 0;
   if (strstr(target_text, "darwin") != NULL || strstr(target_text, "apple-darwin") != NULL) {
     needs_darwin_codesign = 1;

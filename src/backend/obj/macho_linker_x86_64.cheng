@@ -760,42 +760,49 @@ fn machoLinkExeX86_64Core(objs: MachoObjFile[], outputPath: str, symtabAll: bool
     layout.linkeditFileOff = layout.dataFileOff + layout.dataSegFileSize
     layout.linkeditVmaddr = layout.dataVmaddr + layout.dataSegVmSize
 
-    # Resolve _main for LC_MAIN entryoff.
+    # Resolve LC_MAIN entryoff. Prefer `_main`, but allow tooling-only/selfhost
+    # drivers to publish `backendMain` as the effective entry surface.
     var mainAddr: uint64 = 0
     var foundMain: bool = false
+    var mainSymName: str = "_main"
     # Compute final addresses by rebuilding a defIndex from merged objects (cheap).
     # For now, search symbol tables directly (stable, no extra maps).
-    for i in 0..<objs.len:
-        let obj: MachoObjFile = objs[i]
-        for si in 0..<obj.symbols.len:
-            let sym: MachoObjSymbol = obj.symbols[si]
-            if sym != nil && (sym.name == "_main") && mx64SymIsSect(sym) && mx64SymIsExt(sym):
-                let sectIndex0: int32 = int32(sym.nSect) - 1
-                if sectIndex0 >= 0 && sectIndex0 < obj.sections.len:
-                    let sect0: MachoObjSection = obj.sections[sectIndex0]
-                    let symOffInSect: uint64 = sym.nValue - sect0.addr
-                    if (sect0.segname == "__TEXT") && (sect0.sectname == "__text"):
-                        # find base for this object's text in merged layout by re-scanning earlier merge rules
-                        # (only used to find main; ok to recompute).
-                        var base: uint64 = 0
-                        var oi2: int32 = 0
-                        var curText: uint64 = 0
-                        for oi2 in 0..<objs.len:
-                            if oi2 == i:
-                                base = curText
-                                break
-                            let o2: MachoObjFile = objs[oi2]
-                            let ti2: int32 = mx64FindSectionIndexByName(o2.sections, "__TEXT", "__text")
-                            if ti2 >= 0:
-                                let s2: MachoObjSection = o2.sections[ti2]
-                                curText = curText + uint64(s2.data.len)
-                                curText = mx64AlignUp(curText, uint64(4))
-                        mainAddr = layout.textVmaddr + textOff + base + symOffInSect
-                        foundMain = true
+    for pass in 0..<2:
+        if pass == 1:
+            mainSymName = "_backendMain"
+        for i in 0..<objs.len:
+            let obj: MachoObjFile = objs[i]
+            for si in 0..<obj.symbols.len:
+                let sym: MachoObjSymbol = obj.symbols[si]
+                if sym != nil && (sym.name == mainSymName) && mx64SymIsSect(sym) && mx64SymIsExt(sym):
+                    let sectIndex0: int32 = int32(sym.nSect) - 1
+                    if sectIndex0 >= 0 && sectIndex0 < obj.sections.len:
+                        let sect0: MachoObjSection = obj.sections[sectIndex0]
+                        let symOffInSect: uint64 = sym.nValue - sect0.addr
+                        if (sect0.segname == "__TEXT") && (sect0.sectname == "__text"):
+                            # find base for this object's text in merged layout by re-scanning earlier merge rules
+                            # (only used to find main; ok to recompute).
+                            var base: uint64 = 0
+                            var oi2: int32 = 0
+                            var curText: uint64 = 0
+                            for oi2 in 0..<objs.len:
+                                if oi2 == i:
+                                    base = curText
+                                    break
+                                let o2: MachoObjFile = objs[oi2]
+                                let ti2: int32 = mx64FindSectionIndexByName(o2.sections, "__TEXT", "__text")
+                                if ti2 >= 0:
+                                    let s2: MachoObjSection = o2.sections[ti2]
+                                    curText = curText + uint64(s2.data.len)
+                                    curText = mx64AlignUp(curText, uint64(4))
+                            mainAddr = layout.textVmaddr + textOff + base + symOffInSect
+                            foundMain = true
+        if foundMain:
+            break
     if !foundMain:
         for oi in 0..<objs.len:
             mx64FreeObj(objs[oi])
-        return Err[bool]("macho_linker: missing _main symbol (required for LC_MAIN)")
+        return Err[bool]("macho_linker: missing _main/_backendMain symbol (required for LC_MAIN)")
 
     layout.entryoff = mainAddr - layout.textVmaddr
 
@@ -972,6 +979,21 @@ fn machoLinkExeX86_64Core(objs: MachoObjFile[], outputPath: str, symtabAll: bool
                             ds.nDesc = uint16(0)
                             ds.nValue = addr4
                             add(syms, ds)
+        if hashmaps.hashMapStrIntGet(extdefSeen, "_main") == 0:
+            let backendMainIdxPlus1: int32 = hashmaps.hashMapStrIntGet(layout.defIndex, "_backendMain")
+            let backendMainIdx: int32 = backendMainIdxPlus1 - 1
+            if backendMainIdxPlus1 > 0 &&
+               backendMainIdx >= 0 &&
+               backendMainIdx < layout.defAddr.len:
+                let relMainAlias: uint64 = layout.defAddr[backendMainIdx]
+                let addrMainAlias: uint64 = mx64ResolveTaggedAddr(layout, textOff, cstrOff, relMainAlias)
+                var mainAliasSym: MachoObjSymbol = new(MachoObjSymbol)
+                mainAliasSym.name = "_main"
+                mainAliasSym.nType = uint8(N_SECT | N_EXT)
+                mainAliasSym.nSect = uint8(1)
+                mainAliasSym.nDesc = uint16(0)
+                mainAliasSym.nValue = addrMainAlias
+                add(syms, mainAliasSym)
         extdefCount = uint32(syms.len)
     else:
         # extdef: _main only (enough for tooling); other symbols can be added later.

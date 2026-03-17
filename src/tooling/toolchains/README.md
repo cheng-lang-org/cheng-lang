@@ -19,5 +19,7 @@ Manual use:
 set -a
 . src/tooling/toolchains/android_a64.env
 set +a
-sh src/tooling/tooling_exec.sh chengc tests/cheng/backend/fixtures/return_add.cheng --target:aarch64-linux-android
+
+TOOLING=artifacts/tooling_cmd/cheng_tooling
+$TOOLING release-compile --in:tests/cheng/backend/fixtures/return_add.cheng --target:aarch64-linux-android --out:artifacts/chengc/return_add.android
 ```

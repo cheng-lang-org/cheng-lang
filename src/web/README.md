@@ -10,4 +10,12 @@ Layout:
 - std: web/server standard library modules
 - examples: minimal runtime demos
 
-Status: runtime + minimal SFC compiler/codegen + examples + dev/preview servers (static + polling reload + SPA fallback) + build/route-manifest CLI + history router runtime + router outlet + registry mapping + route load pipeline (async via ctx.result) + std/server skeleton (http/router/middleware/static) + native server adapter (server_handle). Template bindings cover `on:*`, `bind:value`/`bind:checked`, `class:*`, `style:*`, `if/each` (supports `item, idx in list` + `else` empty), `await` (expects `Signal[AwaitText]` + `await:pending/await:catch`); scoped CSS injects `data-cwc-*`. See doc/cheng-web-frontend-plan.md and doc/cheng-web-wasm-abi.md.
+Status: runtime + minimal SFC compiler/codegen + examples + dev/preview servers (static + polling reload + SPA fallback) + build/route-manifest CLI + history router runtime + router outlet + registry mapping + route load pipeline (async via ctx.result) + std/server skeleton (http/router/middleware/static) + native server adapter (server_handle). Template bindings cover `on:*`, `bind:value`/`bind:checked`, `class:*`, `style:*`, `if/each` (supports `item, idx in list` + `else` empty), `await` (expects `Signal[AwaitText]` + `await:pending/await:catch`); scoped CSS injects `data-cwc-*`.
+
+Current docs live next to the implementation:
+- `src/web/cli/README.md`
+- `src/web/runtime/README.md`
+- `src/web/router/README.md`
+- `src/web/examples/README.md`
+
+Historical `doc/cheng-web-frontend-plan.md` / `doc/cheng-web-wasm-abi.md` references are no longer present in this repository.
