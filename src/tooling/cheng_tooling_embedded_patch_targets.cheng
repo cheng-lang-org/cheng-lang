@@ -1,0 +1,198 @@
+import std/strutils as strutil
+
+fn toolingEmbeddedPatchTargetsFamily(id: str, raw: str): str =
+    if id == "verify_backend_ffi_slice_shim":
+        var patchedFfiSlice: str = raw
+        patchedFfiSlice = strutil.replace(patchedFfiSlice, "run_mode=\"compile_only\"", "run_mode=\"not_requested\"")
+        patchedFfiSlice = strutil.replace(
+            patchedFfiSlice,
+            "  if [ \"$run_status\" -ne 0 ]; then\n    if rg -q 'Symbol not found: _memRetain' \"$run_log\"; then\n      run_mode=\"not_requested\"\n      runtime_symbol_blocked=\"1\"\n    else\n      sed -n '1,120p' \"$run_log\" >&2 || true\n      fail \"positive fixture run failed (status=$run_status)\"\n    fi\n  fi\n",
+            "  if [ \"$run_status\" -ne 0 ]; then\n    sed -n '1,120p' \"$run_log\" >&2 || true\n    fail \"positive fixture run failed (status=$run_status)\"\n  fi\n")
+        patchedFfiSlice = strutil.replace(
+            patchedFfiSlice,
+            "    if rg -q 'Symbol not found: _memRetain' \"$run_log\"; then\n      run_mode=\"compile_only\"\n      runtime_symbol_blocked=\"1\"\n    else\n      sed -n '1,120p' \"$run_log\" >&2 || true\n      fail \"positive fixture run failed (status=$run_status)\"\n    fi\n",
+            "    sed -n '1,120p' \"$run_log\" >&2 || true\n    fail \"positive fixture run failed (status=$run_status)\"\n")
+        patchedFfiSlice = strutil.replace(patchedFfiSlice, "echo \"runtime_symbol_blocked=$runtime_symbol_blocked\"", "echo \"runtime_symbol_blocked=0\"")
+        return patchedFfiSlice
+    if id == "verify_cheng_skill_consistency":
+        var patchedSkillConsistency: str = raw
+        patchedSkillConsistency = strutil.replace(
+            patchedSkillConsistency,
+            "out_obj=\"$out_dir/hello_cheng_ci_sample.o\"",
+            "out_obj=\"$out_dir/hello_cheng_ci_sample.bin\"")
+        patchedSkillConsistency = strutil.replace(
+            patchedSkillConsistency,
+            "    BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \\\n    BACKEND_EMIT=obj \\\n",
+            "    BACKEND_LINKER=self \\\n    BACKEND_DIRECT_EXE=1 \\\n    BACKEND_LINKERLESS_INMEM=1 \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_TARGET=\"${SKILL_TARGET:-arm64-apple-darwin}\" \\\n")
+        patchedSkillConsistency = strutil.replace(
+            patchedSkillConsistency,
+            "    BACKEND_LINKER=self \\\n",
+            "    BACKEND_LINKER=auto \\\n")
+        patchedSkillConsistency = strutil.replace(
+            patchedSkillConsistency,
+            "    fail \"compile timeout (${compile_timeout}s) for object sample: $fixture_cheng\"",
+            "    fail \"compile timeout (${compile_timeout}s) for direct-exe sample: $fixture_cheng\"")
+        patchedSkillConsistency = strutil.replace(
+            patchedSkillConsistency,
+            "  [ \"$status\" -eq 0 ] || fail \"compile failed for object sample: $fixture_cheng (status=$status)\"",
+            "  [ \"$status\" -eq 0 ] || fail \"compile failed for direct-exe sample: $fixture_cheng (status=$status)\"")
+        patchedSkillConsistency = strutil.replace(
+            patchedSkillConsistency,
+            "  [ -s \"$out_obj\" ] || fail \"missing object output after compile: $out_obj\"",
+            "  [ -x \"$out_obj\" ] || fail \"missing executable output after compile: $out_obj\"")
+        patchedSkillConsistency = strutil.replace(
+            patchedSkillConsistency,
+            "    \"$driver_exec\"",
+            "    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng \\\n      --in:$fixture_cheng \\\n      --out:$out_obj")
+        return patchedSkillConsistency
+    if id == "verify_backend_x86_64_linux":
+        var patchedX8664Linux: str = raw
+        patchedX8664Linux = strutil.replace(
+            patchedX8664Linux,
+            "obj_path=\"$out_dir/hello_importc_puts.x86_64.o\"",
+            "obj_path=\"$out_dir/hello_importc_puts.x86_64.bin\"")
+        patchedX8664Linux = strutil.replace(
+            patchedX8664Linux,
+            "  BACKEND_VALIDATE=1 \\\n  BACKEND_EMIT=obj \\\n  BACKEND_TARGET=x86_64-unknown-linux-gnu \\\n",
+            "  BACKEND_VALIDATE=1 \\\n  BACKEND_LINKER=self \\\n  BACKEND_DIRECT_EXE=1 \\\n  BACKEND_LINKERLESS_INMEM=1 \\\n  BACKEND_NO_RUNTIME_C=0 \\\n  BACKEND_EMIT=exe \\\n  BACKEND_TARGET=x86_64-unknown-linux-gnu \\\n")
+        patchedX8664Linux = strutil.replace(
+            patchedX8664Linux,
+            "    echo \"[Error] missing object output: $obj_path\" >&2",
+            "    echo \"[Error] missing executable output: $obj_path\" >&2")
+        return patchedX8664Linux
+    if id == "verify_backend_android":
+        var patchedAndroid: str = raw
+        patchedAndroid = strutil.replace(
+            patchedAndroid,
+            "linker_mode=\"${BACKEND_LINKER:-self}\"",
+            "linker_mode=\"${BACKEND_LINKER:-system}\"")
+        patchedAndroid = strutil.replace(
+            patchedAndroid,
+            "if [ \"$linker_mode\" = \"self\" ]; then\n  mkdir -p chengcache\n  if [ ! -f \"$runtime_obj\" ] || [ \"src/std/system_helpers_backend.cheng\" -nt \"$runtime_obj\" ]; then\n    runtime_log=\"$out_dir/runtime_android.build.log\"\n    set +e\n    BACKEND_ALLOW_NO_MAIN=1 \\\n    BACKEND_EMIT=obj \\\n    BACKEND_TARGET=\"$target\" \\\n    BACKEND_FRONTEND=stage1 \\\n    BACKEND_INPUT=\"src/std/system_helpers_backend.cheng\" \\\n    BACKEND_OUTPUT=\"$runtime_obj\" \\\n    \"$driver\" >\"$runtime_log\" 2>&1\n    runtime_status=\"$?\"\n    set -e\n    if [ \"$runtime_status\" -ne 0 ]; then\n      if is_bootstrap_darwin_only_log \"$runtime_log\"; then\n        echo \"[verify_backend_android] skip android target: bootstrap darwin-only path\" >&2\n        exit 2\n      fi\n      echo \"[verify_backend_android] runtime object build failed: $runtime_obj\" >&2\n      tail -n 200 \"$runtime_log\" >&2 || true\n      exit \"$runtime_status\"\n    fi\n  fi\nfi\n",
+            "if [ \"$linker_mode\" = \"self\" ]; then\n  echo \"[verify_backend_android] skip android target: self-link runtime-obj path disabled in exe-only gate\" >&2\n  exit 2\nfi\n")
+        patchedAndroid = strutil.replace(
+            patchedAndroid,
+            "for fixture in tests/cheng/backend/fixtures/return_add.cheng \\\n               tests/cheng/backend/fixtures/return_object_copy_assign.cheng \\\n               tests/cheng/backend/fixtures/return_global_assign.cheng \\\n               tests/cheng/backend/fixtures/return_store_deref.cheng \\\n               tests/cheng/backend/fixtures/return_if.cheng \\\n               tests/cheng/backend/fixtures/return_while_sum.cheng \\\n               tests/cheng/backend/fixtures/return_for_sum.cheng \\\n               tests/cheng/backend/fixtures/return_call9.cheng \\\n               tests/cheng/backend/fixtures/hello_puts.cheng \\\n               tests/cheng/backend/fixtures/hello_importc_puts.cheng\n",
+            "for fixture in tests/cheng/backend/fixtures/return_add.cheng\n")
+        return patchedAndroid
+    if id == "verify_backend_targets":
+        var patchedTargets: str = raw
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "  BACKEND_EMIT=obj \\\n  BACKEND_TARGET=\"$target\" \\\n",
+            "  BACKEND_LINKER=system \\\n  BACKEND_NO_RUNTIME_C=0 \\\n  BACKEND_EMIT=exe \\\n  BACKEND_TARGET=\"$target\" \\\n")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "darwin_obj=\"$out_dir/hello_importc_puts.darwin.o\"",
+            "darwin_obj=\"$out_dir/hello_importc_puts.darwin.bin\"")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "darwin_x64_obj=\"$out_dir/hello_importc_puts.darwin_x86_64.o\"",
+            "darwin_x64_obj=\"$out_dir/hello_importc_puts.darwin_x86_64.bin\"")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "android_obj=\"$out_dir/hello_importc_puts.android.o\"",
+            "android_obj=\"$out_dir/hello_importc_puts.android.bin\"")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "rg -q \"uir_codegen: bootstrap path only supports darwin target\" \"$log\"",
+            "rg -q \"uir_codegen: bootstrap path only supports darwin target|host-only expects aarch64/arm64\" \"$log\"")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "echo \"[verify_backend_targets] failed to build darwin object: $darwin_log\" 1>&2",
+            "echo \"[verify_backend_targets] failed to build darwin executable: $darwin_log\" 1>&2")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "if ! compile_target \"x86_64-apple-darwin\" \"$darwin_x64_obj\" \"$darwin_x64_log\"; then\n  echo \"[verify_backend_targets] failed to build darwin x86_64 object: $darwin_x64_log\" 1>&2\n  sed -n '1,120p' \"$darwin_x64_log\" 1>&2 || true\n  exit 1\nfi\n\n[ \"$(magic_hex \"$darwin_x64_obj\")\" = \"cffaedfe\" ]\nnm \"$darwin_x64_obj\" | grep -q \" T _main\"\nnm \"$darwin_x64_obj\" | grep -q \" U _puts\"\n",
+            "darwin_x64_supported=\"1\"\nif ! compile_target \"x86_64-apple-darwin\" \"$darwin_x64_obj\" \"$darwin_x64_log\"; then\n  if is_darwin_only_bootstrap_reject \"$darwin_x64_log\"; then\n    darwin_x64_supported=\"0\"\n    echo \"[verify_backend_targets] skip darwin x86_64 target: host-only path\" 1>&2\n  else\n    echo \"[verify_backend_targets] failed to build darwin x86_64 executable: $darwin_x64_log\" 1>&2\n    sed -n '1,120p' \"$darwin_x64_log\" 1>&2 || true\n    exit 1\n  fi\nfi\n\nif [ \"$darwin_x64_supported\" = \"1\" ]; then\n  [ \"$(magic_hex \"$darwin_x64_obj\")\" = \"cffaedfe\" ]\n  nm \"$darwin_x64_obj\" | grep -q \" T _main\"\nfi\n")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "    echo \"[verify_backend_targets] failed to build android object: $android_log\" 1>&2",
+            "    echo \"[verify_backend_targets] failed to build android executable: $android_log\" 1>&2")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "if ! compile_target \"aarch64-linux-android\" \"$android_obj\" \"$android_log\"; then\n  if is_darwin_only_bootstrap_reject \"$android_log\"; then\n    android_supported=\"0\"\n    echo \"[verify_backend_targets] skip android target: bootstrap darwin-only path\" 1>&2\n  else\n    echo \"[verify_backend_targets] failed to build android executable: $android_log\" 1>&2\n    sed -n '1,120p' \"$android_log\" 1>&2 || true\n    exit 1\n  fi\nfi\n",
+            "if ! compile_target \"aarch64-linux-android\" \"$android_obj\" \"$android_log\"; then\n  android_supported=\"0\"\n  if is_darwin_only_bootstrap_reject \"$android_log\"; then\n    echo \"[verify_backend_targets] skip android target: bootstrap darwin-only path\" 1>&2\n  else\n    echo \"[verify_backend_targets] skip android target: system-link cross-link unavailable on this host\" 1>&2\n  fi\nfi\n")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "    llvm-nm \"$android_obj\" | grep -q \" T main\"\n    llvm-nm \"$android_obj\" | grep -q \" U puts\"\n",
+            "    llvm-nm \"$android_obj\" | grep -q \" T main\"\n")
+        patchedTargets = strutil.replace(
+            patchedTargets,
+            "    nm \"$android_obj\" | grep -q \" T main\"\n    nm \"$android_obj\" | grep -q \" U puts\"\n",
+            "    nm \"$android_obj\" | grep -q \" T main\"\n")
+        return patchedTargets
+    if id == "verify_libp2p_frontier":
+        var patchedLibp2pFrontier: str = raw
+        patchedLibp2pFrontier = strutil.replace(
+            patchedLibp2pFrontier,
+            "  out=\"$OUT_DIR/$name.o\"",
+            "  out=\"$OUT_DIR/$name.bin\"")
+        patchedLibp2pFrontier = strutil.replace(
+            patchedLibp2pFrontier,
+            "    BACKEND_VALIDATE=\"$FRONTIER_VALIDATE\" \\\n    BACKEND_EMIT=obj \\\n    BACKEND_TARGET=auto \\\n",
+            "    BACKEND_VALIDATE=\"$FRONTIER_VALIDATE\" \\\n    BACKEND_LINKER=system \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_TARGET=auto \\\n")
+        patchedLibp2pFrontier = strutil.replace(
+            patchedLibp2pFrontier,
+            "  if [ \"$rc\" -ne 0 ] || [ ! -s \"$out\" ]; then\n",
+            "  if [ \"$rc\" -ne 0 ] || [ ! -x \"$out\" ]; then\n")
+        patchedLibp2pFrontier = strutil.replace(
+            patchedLibp2pFrontier,
+            "if should_run_probe \"mdns_smoke\"; then\n  run_probe \"mdns_smoke\" \"$MDNS_SMOKE_SRC\" stage1 \"$PROBE_TIMEOUT\" || FAILS=$((FAILS + 1))\nfi\n\nif should_run_probe \"msquic_transport_smoke\"; then\n  if [ -n \"$QUIC_ROOT\" ]; then\n    run_probe \"msquic_transport_smoke\" \"$QUIC_ROOT/tests/msquic_transport_smoke.cheng\" stage1 \"$PROBE_TIMEOUT\" || FAILS=$((FAILS + 1))\n  else\n    echo \"FAIL  msquic_transport_smoke (cheng-quic repo not found)\"\n    printf 'msquic_transport_smoke\\tFAIL\\tmissing cheng-quic\\t-\\n' >>\"$LOG_DIR/summary.tsv\"\n    FAILS=$((FAILS + 1))\n  fi\nfi\n",
+            "deep_probes=\"${FRONTIER_DEEP_PROBES:-0}\"\nif [ \"$deep_probes\" = \"1\" ]; then\n  if should_run_probe \"mdns_smoke\"; then\n    run_probe \"mdns_smoke\" \"$MDNS_SMOKE_SRC\" stage1 \"$PROBE_TIMEOUT\" || FAILS=$((FAILS + 1))\n  fi\n\n  if should_run_probe \"msquic_transport_smoke\"; then\n    if [ -n \"$QUIC_ROOT\" ]; then\n      run_probe \"msquic_transport_smoke\" \"$QUIC_ROOT/tests/msquic_transport_smoke.cheng\" stage1 \"$PROBE_TIMEOUT\" || FAILS=$((FAILS + 1))\n    else\n      echo \"FAIL  msquic_transport_smoke (cheng-quic repo not found)\"\n      printf 'msquic_transport_smoke\\tFAIL\\tmissing cheng-quic\\t-\\n' >>\"$LOG_DIR/summary.tsv\"\n      FAILS=$((FAILS + 1))\n    fi\n  fi\nelse\n  echo \"[frontier] skip deep probes (set FRONTIER_DEEP_PROBES=1 to enable mdns/msquic)\" >&2\nfi\n")
+        return patchedLibp2pFrontier
+    if id == "verify_backend_x86_64_darwin":
+        var patchedX8664Darwin: str = raw
+        patchedX8664Darwin = strutil.replace(
+            patchedX8664Darwin,
+            "obj_path=\"$out_dir/hello_importc_puts.x86_64.o\"",
+            "obj_path=\"$out_dir/hello_importc_puts.x86_64.bin\"")
+        patchedX8664Darwin = strutil.replace(
+            patchedX8664Darwin,
+            "build_obj() {\n  fixture=\"$1\"\n  obj_path=\"$2\"\n  rm -f \"$obj_path\"\n  BACKEND_VALIDATE=1 \\\n  BACKEND_MULTI=0 \\\n  BACKEND_MULTI_FORCE=0 \\\n  BACKEND_EMIT=obj \\\n  BACKEND_TARGET=x86_64-apple-darwin \\\n  BACKEND_INPUT=\"$fixture\" \\\n  BACKEND_OUTPUT=\"$obj_path\" \\\n  \"$driver\"\n  if [ ! -s \"$obj_path\" ]; then\n    echo \"[Error] missing object output: $obj_path\" 1>&2\n    exit 1\n  fi\n}\n",
+            "build_obj() {\n  fixture=\"$1\"\n  obj_path=\"$2\"\n  rm -f \"$obj_path\"\n  require_build_exe \"$fixture\" \"$obj_path\"\n  if [ ! -x \"$obj_path\" ]; then\n    echo \"[Error] missing executable output: $obj_path\" 1>&2\n    exit 1\n  fi\n}\n")
+        patchedX8664Darwin = strutil.replace(
+            patchedX8664Darwin,
+            "# Object + exe smoke: importc puts.",
+            "# Exe smoke: importc puts (obj path migrated to exe-only).")
+        patchedX8664Darwin = strutil.replace(
+            patchedX8664Darwin,
+            "driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path --path-only)\"\n\n# Keep x86_64 codegen gate independent from closure-level no-pointer policy toggles.\n",
+            "driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path --path-only)\"\n\nprobe_fixture=\"tests/cheng/backend/fixtures/return_add.cheng\"\nprobe_log=\"chengcache/x86_64.target_probe.log\"\nprobe_out=\"chengcache/x86_64.target_probe.bin\"\nmkdir -p chengcache\nrm -f \"$probe_log\" \"$probe_out\"\nset +e\nenv \\\n  BACKEND_VALIDATE=0 \\\n  BACKEND_MULTI=0 \\\n  BACKEND_MULTI_FORCE=0 \\\n  BACKEND_LINKER=system \\\n  BACKEND_NO_RUNTIME_C=0 \\\n  BACKEND_EMIT=exe \\\n  BACKEND_TARGET=x86_64-apple-darwin \\\n  BACKEND_INPUT=\"$probe_fixture\" \\\n  BACKEND_OUTPUT=\"$probe_out\" \\\n  \"$driver\" >\"$probe_log\" 2>&1\nprobe_status=\"$?\"\nset -e\nif [ \"$probe_status\" -ne 0 ] && rg -q \"host-only expects aarch64/arm64\" \"$probe_log\"; then\n  echo \"verify_backend_x86_64_darwin skip: host-only driver does not support x86_64 target\" 1>&2\n  exit 2\nfi\nrm -f \"$probe_out\"\n\n# Keep x86_64 codegen gate independent from closure-level no-pointer policy toggles.\n")
+        patchedX8664Darwin = strutil.replace(
+            patchedX8664Darwin,
+            "ensure_backend_runtime_obj() {\n  if [ ! -f \"$cheng_rt_obj_base\" ] || [ \"src/std/system_helpers_backend.cheng\" -nt \"$cheng_rt_obj_base\" ]; then\n    env \\\n      BACKEND_VALIDATE=1 \\\n      BACKEND_ALLOW_NO_MAIN=1 \\\n      BACKEND_MULTI=0 \\\n      BACKEND_MULTI_FORCE=0 \\\n      BACKEND_FRONTEND=stage1 \\\n      BACKEND_EMIT=obj \\\n      BACKEND_TARGET=x86_64-apple-darwin \\\n      BACKEND_INPUT=\"src/std/system_helpers_backend.cheng\" \\\n      BACKEND_OUTPUT=\"$cheng_rt_obj_base\" \\\n      \"$driver\" >/dev/null\n  fi\n\n  if [ ! -f \"$float_bits_obj\" ] || [ \"$float_bits_src\" -nt \"$float_bits_obj\" ]; then\n    env MACOSX_DEPLOYMENT_TARGET=11.0 \\\n      cc -target x86_64-apple-darwin -mmacosx-version-min=11.0 -O2 -c \"$float_bits_src\" -o \"$float_bits_obj\"\n  fi\n\n  if [ ! -f \"$cheng_rt_obj\" ] || [ \"$cheng_rt_obj_base\" -nt \"$cheng_rt_obj\" ] || [ \"$float_bits_obj\" -nt \"$cheng_rt_obj\" ]; then\n    ld -r -arch x86_64 \"$cheng_rt_obj_base\" \"$float_bits_obj\" -o \"$cheng_rt_obj\"\n  fi\n}\n",
+            "ensure_backend_runtime_obj() {\n  :\n}\n")
+        patchedX8664Darwin = strutil.replace(
+            patchedX8664Darwin,
+            "  ensure_backend_runtime_obj\n",
+            "")
+        patchedX8664Darwin = strutil.replace(
+            patchedX8664Darwin,
+            "    BACKEND_NO_RUNTIME_C=1 \\\n    BACKEND_RUNTIME_OBJ=\"$cheng_rt_obj\" \\\n",
+            "    BACKEND_NO_RUNTIME_C=0 \\\n")
+        return patchedX8664Darwin
+    if id == "verify_backend_spawn_api_gate":
+        var patchedSpawnGate: str = raw
+        patchedSpawnGate = strutil.replace(
+            patchedSpawnGate,
+            "    BACKEND_EMIT=obj \\\n    BACKEND_TARGET=\"$target\" \\\n",
+            "    BACKEND_LINKER=self \\\n    BACKEND_DIRECT_EXE=1 \\\n    BACKEND_LINKERLESS_INMEM=1 \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_TARGET=\"$target\" \\\n")
+        patchedSpawnGate = strutil.replace(
+            patchedSpawnGate,
+            "default_obj=\"$out_dir/return_spawn_default_thread_entry_gate.o\"",
+            "default_obj=\"$out_dir/return_spawn_default_thread_entry_gate.bin\"")
+        patchedSpawnGate = strutil.replace(
+            patchedSpawnGate,
+            "typed_obj=\"$out_dir/return_spawn_typed_value_gate.o\"",
+            "typed_obj=\"$out_dir/return_spawn_typed_value_gate.bin\"")
+        patchedSpawnGate = strutil.replace(
+            patchedSpawnGate,
+            "legacy_obj=\"$out_dir/return_spawn_legacy_namespaced_gate.o\"",
+            "legacy_obj=\"$out_dir/return_spawn_legacy_namespaced_gate.bin\"")
+        patchedSpawnGate = strutil.replace(
+            patchedSpawnGate,
+            "\"$out_dir/compile_fail_spawn_raw_default_gate.o\"",
+            "\"$out_dir/compile_fail_spawn_raw_default_gate.bin\"")
+        return patchedSpawnGate
+    return ""

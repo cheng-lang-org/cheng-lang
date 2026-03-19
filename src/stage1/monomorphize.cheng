@@ -894,6 +894,10 @@ fn monoLookupExprType(n: Node): Node =
                 headNameNode = kid(h0, 1)
         if stage1AstRefNonNil(headNameNode) && (nodeKind(headNameNode) == nkIdent || nodeKind(headNameNode) == nkSymbol):
             let nm2: str = monoStripSpaces(plainName(headNameNode))
+            if monoStrEq(nm2, "new") && kidCount(n) > 1:
+                let newTy: Node = monoInferNewResultType(monoCallArgValue(kid(n, 1)))
+                if stage1AstRefNonNil(newTy) && nodeKind(newTy) != nkEmpty:
+                    return monoNormalizeType(newTy)
             let retTy: Node = mapGetStrNodeIndex(monoFnRetIndex, monoFnRetTypes, nm2)
             if stage1AstRefNonNil(retTy) && nodeKind(retTy) != nkEmpty:
                 return monoNormalizeType(retTy)
@@ -1472,6 +1476,45 @@ fn monoCallArgValue(argNode0: Node): Node =
         argNode = kid(argNode, 0)
     return argNode
 
+fn monoTypeDeclDefByName(name: str): Node =
+    if len(name) == 0:
+        return astInvalidNodeId()
+    var decl: Node = mapGetStrNodeIndex(monoTypeIndex, monoTypeNodes, name)
+    if stage1AstRefIsNil(decl):
+        decl = monoGenericTypeGet(name)
+    if stage1AstRefNonNil(decl) && kidCount(decl) > 1:
+        return kid(decl, 1)
+    return astInvalidNodeId()
+
+fn monoTypeExprReturnsRefLikeValue(ty0: Node): bool =
+    let ty: Node = monoUnwrapParType(monoNormalizeType(ty0))
+    if stage1AstRefIsNil(ty):
+        return false
+    if nodeKind(ty) == nkRefTy || nodeKind(ty) == nkPtrTy || nodeKind(ty) == nkVarTy:
+        return true
+    var baseName: str = ""
+    if nodeKind(ty) == nkBracketExpr && kidCount(ty) > 0:
+        baseName = typeBaseName(kid(ty, 0))
+    else:
+        baseName = typeBaseName(ty)
+    if len(baseName) == 0:
+        return false
+    let defNode: Node = monoUnwrapParType(monoTypeDeclDefByName(baseName))
+    if stage1AstRefNonNil(defNode) &&
+       (nodeKind(defNode) == nkRefTy || nodeKind(defNode) == nkPtrTy || nodeKind(defNode) == nkVarTy):
+        return true
+    return false
+
+fn monoInferNewResultType(allocTypeNode0: Node): Node =
+    let allocTypeNode: Node = monoUnwrapParType(monoNormalizeType(allocTypeNode0))
+    if stage1AstRefIsNil(allocTypeNode):
+        return astInvalidNodeId()
+    if monoTypeExprReturnsRefLikeValue(allocTypeNode):
+        return cloneTree(allocTypeNode)
+    var out: Node = newNode(nkRefTy, nodePos(allocTypeNode))
+    addSon(out, cloneTree(allocTypeNode))
+    return out
+
 fn monoInferBindTypeFromInitCall(initNode: Node): Node =
     if stage1AstRefIsNil(initNode) || nodeKind(initNode) != nkCall:
         return astInvalidNodeId()
@@ -1481,7 +1524,7 @@ fn monoInferBindTypeFromInitCall(initNode: Node): Node =
     if monoStrEq(calleeName, "new") && kidCount(initNode) > 1:
         let argNode: Node = monoCallArgValue(kid(initNode, 1))
         if stage1AstRefNonNil(argNode) && looksLikeTypeExpr(argNode):
-            return argNode
+            return monoInferNewResultType(argNode)
     return mapGetStrNodeIndex(monoFnRetIndex, monoFnRetTypes, calleeName)
 
 fn cloneNodeShallow(n: Node): Node =

@@ -1,0 +1,103 @@
+#!/usr/bin/env sh
+:
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+core_bin="$script_dir/../tooling_bundle/core/cheng_tooling_global"
+full_bin="$script_dir/../tooling_bundle/full/cheng_tooling"
+first_arg="${1:-}"
+
+resolve_root() {
+  start_dir="$1"
+  cur="$start_dir"
+  while [ "$cur" != "/" ] && [ "$cur" != "." ] && [ "$cur" != "" ]; do
+    if [ -f "$cur/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh" ] && \
+       [ -x "$cur/artifacts/tooling_cmd/cheng_tooling" ]; then
+      printf '%s\n' "$cur"
+      return 0
+    fi
+    cur="$(dirname -- "$cur")"
+  done
+  return 1
+}
+
+script_is_self_trampoline() {
+  subcmd="$1"
+  script_path="$2"
+  grep -Eq "^[[:space:]]*exec[[:space:]].*(TOOLING_SELF_BIN|\\\$tool).*[[:space:]]$subcmd([[:space:]]|$)" "$script_path" 2>/dev/null
+}
+
+resolve_repo_script() {
+  root="$1"
+  subcmd="$2"
+  if [ "$subcmd" = "" ] || [ "$subcmd" = "cheng_tooling" ]; then
+    return 1
+  fi
+  script_path="$root/src/tooling/cheng_tooling_embedded_scripts/$subcmd.sh"
+  if [ ! -s "$script_path" ]; then
+    return 1
+  fi
+  if script_is_self_trampoline "$subcmd" "$script_path"; then
+    return 1
+  fi
+  printf '%s\n' "$script_path"
+}
+
+is_list_cmd() {
+  case "${1:-}" in
+    list|embedded-ids|embedded_ids) return 0 ;;
+  esac
+  return 1
+}
+
+run_one() {
+  bin="$1"
+  shift || true
+  [ -x "$bin" ] || return 127
+  "$bin" "$@"
+}
+
+run_with_fallback() {
+  first="$1"
+  second="$2"
+  shift 2 || true
+  if [ ! -x "$first" ]; then
+    run_one "$second" "$@"
+    return $?
+  fi
+  set +e
+  run_one "$first" "$@"
+  rc=$?
+  set -e
+  case "$rc" in
+    0)
+      return 0
+      ;;
+    126|127|139|223)
+      if [ -x "$second" ]; then
+        printf '%s\n' "[cheng_tooling.real.bin] fallback: $first -> $second (rc=$rc)" 1>&2
+        run_one "$second" "$@"
+        return $?
+      fi
+      ;;
+  esac
+  return "$rc"
+}
+
+root="$(resolve_root "$script_dir" || true)"
+repo_wrapper=""
+if [ "$root" != "" ]; then
+  repo_wrapper="$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh"
+fi
+
+if [ "$repo_wrapper" != "" ] && [ "$(resolve_repo_script "$root" "$first_arg" || true)" != "" ]; then
+  exec env TOOLING_BIN="$core_bin" TOOLING_SELF_BIN="$core_bin" sh "$repo_wrapper" "$@"
+fi
+
+if [ "$repo_wrapper" != "" ] && is_list_cmd "$first_arg"; then
+  exec env TOOLING_BIN="$core_bin" TOOLING_SELF_BIN="$core_bin" sh "$repo_wrapper" "$@"
+fi
+
+run_with_fallback "$core_bin" "$full_bin" "$@"
+exit $?

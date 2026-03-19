@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if ! command -v rg >/dev/null 2>&1; then
@@ -27,7 +27,7 @@ check_marker() {
   fi
 }
 
-check_marker "src/stage1/ast.cheng" 'nodeArena: Node\[\]' 'stage1_node_arena'
+check_marker "src/stage1/ast.cheng" 'astKindByNode: NodeKind\[\]' 'stage1_ast_kind_by_node'
 check_marker "src/stage1/ast.cheng" 'nodeArenaEnabled: bool = true' 'stage1_node_arena_enabled'
 check_marker "src/backend/uir/uir_internal/uir_core_types.cheng" 'localIndex: int32' 'uir_local_index_int32'
 check_marker "src/backend/uir/uir_internal/uir_core_types.cheng" 'slot: int32' 'uir_slot_index_int32'

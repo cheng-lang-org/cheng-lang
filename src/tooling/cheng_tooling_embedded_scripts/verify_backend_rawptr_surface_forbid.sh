@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if ! command -v rg >/dev/null 2>&1; then
@@ -32,7 +32,7 @@ require_hit() {
   fi
   printf '%s\t%s\t%s\t%s\n' "miss" "$label" "$file" "$pattern" >>"$miss_file"
   status="drift"
-  return 1
+  return 0
 }
 
 require_absent() {
@@ -42,7 +42,7 @@ require_absent() {
   if rg -nF -- "$pattern" "$file" > /dev/null 2>&1; then
     printf '%s\t%s\t%s\t%s\n' "unexpected" "$label" "$file" "$pattern" >>"$miss_file"
     status="drift"
-    return 1
+    return 0
   fi
   printf '%s\t%s\t%s\n' "absent" "$label" "$file" >>"$hits_file"
   return 0
@@ -51,6 +51,7 @@ require_absent() {
 diag_file="src/stage1/diagnostics.cheng"
 parser_file="src/stage1/parser.cheng"
 sem_file="src/stage1/semantics.cheng"
+cmdline_file="src/std/cmdline.cheng"
 
 require_hit "$diag_file" "fn rawPointerForbidMessage(base: str): str =" "diagnostics.rawptr_message_fn"
 require_hit "$diag_file" "slice/tuple/handle/borrow" "diagnostics.rawptr_replacements"
@@ -63,10 +64,20 @@ require_hit "$parser_file" "rawPointerForbidMessage(\"Empty subscript dereferenc
 require_hit "$parser_file" "rawPointerForbidMessage(\"Pointer member access is forbidden in no-pointer mode\")" "parser.pointer_member_forbid"
 
 require_hit "$sem_file" "fn semIsVoidPtrTypeNode(n: Node): bool =" "semantics.voidptr_detect_fn"
-require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: bare void* surface is forbidden outside C ABI modules\")" "semantics.voidptr_forbid_diag"
-require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: pointer types are forbidden outside C ABI modules\")" "semantics.pointer_type_forbid_diag"
-require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: pointer dereference is forbidden outside C ABI modules\")" "semantics.pointer_deref_forbid_diag"
-require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: pointer operation is forbidden outside C ABI modules: \" + callName)" "semantics.pointer_op_forbid_diag"
+require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: bare void* surface is forbidden in user modules\")" "semantics.voidptr_forbid_diag"
+require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: pointer types are forbidden in user modules\")" "semantics.pointer_type_forbid_diag"
+require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: pointer dereference is forbidden in user modules\")" "semantics.pointer_deref_forbid_diag"
+require_hit "$sem_file" "rawPointerForbidMessage(\"no-pointer policy: pointer operation is forbidden in user modules: \" + callName)" "semantics.pointer_op_forbid_diag"
+
+require_hit "$cmdline_file" "fn __cheng_rt_paramCount(): int32" "cmdline.runtime_param_count"
+require_hit "$cmdline_file" "fn __cheng_rt_paramStr(i: int32): cstring" "cmdline.runtime_param_str"
+require_absent "$cmdline_file" "void*" "cmdline.no_voidptr_surface"
+require_absent "$cmdline_file" "ptr_add" "cmdline.no_ptr_add"
+require_absent "$cmdline_file" "alloc(" "cmdline.no_alloc"
+require_absent "$cmdline_file" "copyMem" "cmdline.no_copy_mem"
+require_absent "$cmdline_file" "setMem" "cmdline.no_set_mem"
+require_absent "$cmdline_file" "*str*(" "cmdline.no_deref_surface"
+require_absent "$cmdline_file" "__cheng_setCmdLine(" "cmdline.no_legacy_setcmdline"
 
 runtime_probe_status="skip"
 

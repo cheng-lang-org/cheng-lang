@@ -1,0 +1,399 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+
+type
+    ToolingBootstrapPureArgs = ref
+        ok: bool
+        exitCode: int32
+        error: str
+        helpRequested: bool
+        mode: str
+        compileStage1: bool
+        outDir: str
+        timingOut: str
+        fullspec: bool
+
+    ToolingSelfhostBootstrapFastHostArgs = ref
+        ok: bool
+        exitCode: int32
+        error: str
+        helpRequested: bool
+        compileStage1: bool
+        outDir: str
+        timingOut: str
+
+    ToolingSelfhostStrictInmemWitnessArgs = ref
+        ok: bool
+        exitCode: int32
+        error: str
+        helpRequested: bool
+        outDir: str
+        timingOut: str
+
+    ToolingSelfhostInnerLoopArgs = ref
+        ok: bool
+        exitCode: int32
+        error: str
+        helpRequested: bool
+        outDir: str
+        timingOut: str
+        runInmemWitness: bool
+        runStrict: bool
+        runClosure: bool
+
+    ToolingSelfhostBootstrapVerifyArgs = ref
+        ok: bool
+        exitCode: int32
+        error: str
+        helpRequested: bool
+        mode: str
+        compileStage1: bool
+        outDir: str
+        timingOut: str
+        strictInmemWitness: bool
+
+fn toolingSelfhostArgsStrNonEmpty(text: str): bool =
+    return len(text) > 0
+
+fn toolingSelfhostArgsStrEq(a: str, b: str): bool =
+    if a == b:
+        return true
+    if len(a) == 0 || len(b) == 0:
+        return false
+    return strings.streq(a, b)
+
+fn toolingSelfhostArgsIsTrue(raw: str): bool =
+    let text: str = strutil.strip(raw)
+    if !toolingSelfhostArgsStrNonEmpty(text):
+        return false
+    let lower: str = strutil.toLowerAscii(text)
+    return toolingSelfhostArgsStrEq(lower, "1") ||
+           toolingSelfhostArgsStrEq(lower, "true") ||
+           toolingSelfhostArgsStrEq(lower, "yes") ||
+           toolingSelfhostArgsStrEq(lower, "on")
+
+fn toolingSelfhostModeNormalized(raw: str): str =
+    let mode: str = strutil.toLowerAscii(strutil.strip(raw))
+    if toolingSelfhostArgsStrEq(mode, "fast") || toolingSelfhostArgsStrEq(mode, "strict"):
+        return mode
+    return ""
+
+fn toolingSelfhostModeFromEnv(defaultModeRaw: str): str =
+    var fallback: str = toolingSelfhostModeNormalized(defaultModeRaw)
+    if !toolingSelfhostArgsStrNonEmpty(fallback):
+        fallback = "fast"
+    let envMode: str = toolingSelfhostModeNormalized(os.getEnvDefault("SELF_OBJ_BOOTSTRAP_MODE", fallback))
+    if toolingSelfhostArgsStrNonEmpty(envMode):
+        return envMode
+    return fallback
+
+fn toolingBootstrapPureUsageLines(): str[] =
+    var out: str[] = []
+    add(out, "bootstrap-pure options:")
+    add(out, "  --mode:fast|strict           bootstrap mode (default from SELF_OBJ_BOOTSTRAP_MODE, fallback fast)")
+    add(out, "  --compile-stage1             rebuild stage1 before stage2 alias copy")
+    add(out, "  --no-compile-stage1          default mode, stage1 aliases stage0")
+    add(out, "  --out-dir:<path>             bootstrap output directory")
+    add(out, "  --timing-out:<path>          timing tsv output path")
+    add(out, "  --fullspec                   run verify_fullchain_bootstrap after selfhost bootstrap")
+    add(out, "  note(strict): semantic/ownership checks are fixed enabled (skip_sem=0, skip_ownership=0)")
+    return out
+
+fn toolingSelfhostBootstrapFastHostUsageLines(): str[] =
+    var out: str[] = []
+    add(out, "selfhost-bootstrap-fast-host options:")
+    add(out, "  --compile-stage1|--no-compile-stage1")
+    add(out, "  --out-dir:<path>")
+    add(out, "  --timing-out:<path>")
+    add(out, "  env: SELFHOST_STAGE1_FULL_REBUILD=1|0 (strict default 1)")
+    add(out, "  env: SELFHOST_STRICT_REBUILD=1|0 (default 1)")
+    return out
+
+fn toolingSelfhostBootstrapVerifyUsageLines(): str[] =
+    var out: str[] = []
+    add(out, "verify_backend_selfhost_bootstrap_self_obj options:")
+    add(out, "  --mode:fast|strict           default from SELF_OBJ_BOOTSTRAP_MODE=fast")
+    add(out, "  --compile-stage1|--no-compile-stage1   (fast mode only)")
+    add(out, "  --strict-inmem-witness       strict mode only; run full-parse direct-exe in-memory witness before host fixed-point")
+    add(out, "  --out-dir:<path>")
+    add(out, "  --timing-out:<path>")
+    add(out, "  env: SELF_OBJ_BOOTSTRAP_STRICT_DIAG_ALLOW_MISMATCH=0|1 (strict mismatch policy)")
+    add(out, "  env: SELF_OBJ_BOOTSTRAP_STRICT_FORCE_PROBE=0|1 (strict full-build probe, default 0)")
+    add(out, "  env: SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT=<sec> (default 60)")
+    add(out, "  note: strict mode enforces skip_sem=0 and skip_ownership=0")
+    return out
+
+fn toolingSelfhostStrictInmemWitnessUsageLines(): str[] =
+    var out: str[] = []
+    add(out, "verify_backend_selfhost_bootstrap_inmem_witness options:")
+    add(out, "  --out-dir:<path>")
+    add(out, "  --timing-out:<path>")
+    add(out, "  env: SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT=<sec> (default 60)")
+    add(out, "  note: runs full-parse + ws + direct-exe + linkerless-inmem witness only; does not replace strict fixed-point gate")
+    return out
+
+fn toolingSelfhostInnerLoopUsageLines(): str[] =
+    var out: str[] = []
+    add(out, "verify_backend_selfhost_inner_loop options:")
+    add(out, "  --out-dir:<path>")
+    add(out, "  --timing-out:<path>")
+    add(out, "  --inmem-witness|--no-inmem-witness   default on")
+    add(out, "  --strict|--no-strict                 default on")
+    add(out, "  --closure|--no-closure               default off")
+    add(out, "  env: SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT=<sec> (default 60)")
+    add(out, "  env: SELF_OBJ_BOOTSTRAP_TIMEOUT=<sec> (default 60)")
+    add(out, "  note: runs canonical build-backend-driver --require-rebuild first, then fail-fast witness/strict/closure steps")
+    return out
+
+fn toolingBootstrapPureArgsDefault(): ToolingBootstrapPureArgs =
+    var out: ToolingBootstrapPureArgs = nil
+    new(out)
+    out.ok = true
+    out.exitCode = 0
+    out.error = ""
+    out.helpRequested = false
+    out.mode = toolingSelfhostModeFromEnv("fast")
+    out.compileStage1 = toolingSelfhostArgsIsTrue(os.getEnvDefault("SELFHOST_NATIVE_COMPILE_STAGE1", "1"))
+    out.outDir = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_OUT_DIR", "")
+    out.timingOut = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_TIMING_OUT", "")
+    out.fullspec = false
+    return out
+
+fn toolingSelfhostBootstrapFastHostArgsDefault(): ToolingSelfhostBootstrapFastHostArgs =
+    var out: ToolingSelfhostBootstrapFastHostArgs = nil
+    new(out)
+    out.ok = true
+    out.exitCode = 0
+    out.error = ""
+    out.helpRequested = false
+    out.compileStage1 = toolingSelfhostArgsIsTrue(os.getEnvDefault("SELFHOST_NATIVE_COMPILE_STAGE1", "1"))
+    out.outDir = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_OUT_DIR", "")
+    out.timingOut = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_TIMING_OUT", "")
+    return out
+
+fn toolingSelfhostStrictInmemWitnessArgsDefault(): ToolingSelfhostStrictInmemWitnessArgs =
+    var out: ToolingSelfhostStrictInmemWitnessArgs = nil
+    new(out)
+    out.ok = true
+    out.exitCode = 0
+    out.error = ""
+    out.helpRequested = false
+    out.outDir = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_OUT_DIR", "")
+    out.timingOut = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_TIMING_OUT", "")
+    return out
+
+fn toolingSelfhostInnerLoopArgsDefault(): ToolingSelfhostInnerLoopArgs =
+    var out: ToolingSelfhostInnerLoopArgs = nil
+    new(out)
+    out.ok = true
+    out.exitCode = 0
+    out.error = ""
+    out.helpRequested = false
+    out.outDir = os.getEnvDefault("SELFHOST_INNER_LOOP_OUT_DIR", "")
+    out.timingOut = os.getEnvDefault("SELFHOST_INNER_LOOP_TIMING_OUT", "")
+    out.runInmemWitness = !toolingSelfhostArgsIsTrue(
+        os.getEnvDefault("SELFHOST_INNER_LOOP_SKIP_INMEM_WITNESS", "0"))
+    out.runStrict = !toolingSelfhostArgsIsTrue(os.getEnvDefault("SELFHOST_INNER_LOOP_SKIP_STRICT", "0"))
+    out.runClosure = toolingSelfhostArgsIsTrue(os.getEnvDefault("SELFHOST_INNER_LOOP_RUN_CLOSURE", "0"))
+    return out
+
+fn toolingSelfhostBootstrapVerifyArgsDefault(): ToolingSelfhostBootstrapVerifyArgs =
+    var out: ToolingSelfhostBootstrapVerifyArgs = nil
+    new(out)
+    out.ok = true
+    out.exitCode = 0
+    out.error = ""
+    out.helpRequested = false
+    out.mode = toolingSelfhostModeFromEnv("fast")
+    out.compileStage1 = toolingSelfhostArgsIsTrue(os.getEnvDefault("SELFHOST_NATIVE_COMPILE_STAGE1", "1"))
+    out.outDir = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_OUT_DIR", "")
+    out.timingOut = os.getEnvDefault("SELF_OBJ_BOOTSTRAP_TIMING_OUT", "")
+    out.strictInmemWitness = toolingSelfhostArgsIsTrue(
+        os.getEnvDefault("SELF_OBJ_BOOTSTRAP_STRICT_INMEM_WITNESS", "0"))
+    return out
+
+fn toolingBootstrapPureParseArgs(args: str[]): ToolingBootstrapPureArgs =
+    var out: ToolingBootstrapPureArgs = toolingBootstrapPureArgsDefault()
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+            out.helpRequested = true
+            return out
+        if toolingSelfhostArgsStrEq(arg, "--compile-stage1"):
+            out.compileStage1 = true
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--no-compile-stage1"):
+            out.compileStage1 = false
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--fullspec"):
+            out.fullspec = true
+            continue
+        if strutil.startsWith(arg, "--mode:"):
+            let parsedMode: str = toolingSelfhostModeNormalized(strings.dropPrefix(arg, "--mode:"))
+            if !toolingSelfhostArgsStrNonEmpty(parsedMode):
+                out.ok = false
+                out.exitCode = 1
+                out.error = "cheng_tooling: invalid bootstrap-pure mode (expected fast|strict): " + arg
+                return out
+            out.mode = parsedMode
+            continue
+        if strutil.startsWith(arg, "--seed:") || strutil.startsWith(arg, "--stage0:"):
+            out.ok = false
+            out.exitCode = 2
+            out.error = "cheng_tooling: bootstrap-pure no longer accepts stage0 overrides; canonical driver is mandatory"
+            return out
+        if strutil.startsWith(arg, "--out-dir:"):
+            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+            continue
+        if strutil.startsWith(arg, "--timing-out:"):
+            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+            continue
+        out.ok = false
+        out.exitCode = 1
+        out.error = "cheng_tooling: unknown bootstrap-pure arg: " + arg
+        return out
+    return out
+
+fn toolingSelfhostBootstrapFastHostParseArgs(args: str[]): ToolingSelfhostBootstrapFastHostArgs =
+    var out: ToolingSelfhostBootstrapFastHostArgs = toolingSelfhostBootstrapFastHostArgsDefault()
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+            out.helpRequested = true
+            return out
+        if toolingSelfhostArgsStrEq(arg, "--compile-stage1"):
+            out.compileStage1 = true
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--no-compile-stage1"):
+            out.compileStage1 = false
+            continue
+        if strutil.startsWith(arg, "--out-dir:"):
+            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+            continue
+        if strutil.startsWith(arg, "--timing-out:"):
+            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+            continue
+        if strutil.startsWith(arg, "--stage0:"):
+            out.ok = false
+            out.exitCode = 2
+            out.error = "cheng_tooling: selfhost-bootstrap-fast-host no longer accepts --stage0; canonical driver is mandatory"
+            return out
+        out.ok = false
+        out.exitCode = 1
+        out.error = "cheng_tooling: unknown selfhost-bootstrap-fast-host arg: " + arg
+        return out
+    return out
+
+fn toolingSelfhostStrictInmemWitnessParseArgs(args: str[]): ToolingSelfhostStrictInmemWitnessArgs =
+    var out: ToolingSelfhostStrictInmemWitnessArgs = toolingSelfhostStrictInmemWitnessArgsDefault()
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+            out.helpRequested = true
+            return out
+        if strutil.startsWith(arg, "--out-dir:"):
+            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+            continue
+        if strutil.startsWith(arg, "--timing-out:"):
+            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+            continue
+        if strutil.startsWith(arg, "--stage0:"):
+            out.ok = false
+            out.exitCode = 2
+            out.error = "cheng_tooling: verify_backend_selfhost_bootstrap_inmem_witness no longer accepts --stage0; canonical driver is mandatory"
+            return out
+        out.ok = false
+        out.exitCode = 1
+        out.error = "cheng_tooling: unknown verify_backend_selfhost_bootstrap_inmem_witness arg: " + arg
+        return out
+    return out
+
+fn toolingSelfhostInnerLoopParseArgs(args: str[]): ToolingSelfhostInnerLoopArgs =
+    var out: ToolingSelfhostInnerLoopArgs = toolingSelfhostInnerLoopArgsDefault()
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+            out.helpRequested = true
+            return out
+        if strutil.startsWith(arg, "--out-dir:"):
+            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+            continue
+        if strutil.startsWith(arg, "--timing-out:"):
+            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--inmem-witness"):
+            out.runInmemWitness = true
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--no-inmem-witness"):
+            out.runInmemWitness = false
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--strict"):
+            out.runStrict = true
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--no-strict"):
+            out.runStrict = false
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--closure"):
+            out.runClosure = true
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--no-closure"):
+            out.runClosure = false
+            continue
+        if strutil.startsWith(arg, "--stage0:"):
+            out.ok = false
+            out.exitCode = 2
+            out.error = "cheng_tooling: verify_backend_selfhost_inner_loop no longer accepts --stage0; canonical driver is mandatory"
+            return out
+        out.ok = false
+        out.exitCode = 1
+        out.error = "cheng_tooling: unknown verify_backend_selfhost_inner_loop arg: " + arg
+        return out
+    if out.runClosure && !out.runStrict:
+        out.ok = false
+        out.exitCode = 2
+        out.error = "cheng_tooling: verify_backend_selfhost_inner_loop requires strict host before closure; --closure cannot be combined with --no-strict"
+        return out
+    return out
+
+fn toolingSelfhostBootstrapVerifyParseArgs(args: str[]): ToolingSelfhostBootstrapVerifyArgs =
+    var out: ToolingSelfhostBootstrapVerifyArgs = toolingSelfhostBootstrapVerifyArgsDefault()
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+            out.helpRequested = true
+            return out
+        if strutil.startsWith(arg, "--mode:"):
+            let parsedMode: str = toolingSelfhostModeNormalized(strings.dropPrefix(arg, "--mode:"))
+            if !toolingSelfhostArgsStrNonEmpty(parsedMode):
+                out.ok = false
+                out.exitCode = 1
+                out.error = "cheng_tooling: invalid verify_backend_selfhost_bootstrap_self_obj mode: " + arg
+                return out
+            out.mode = parsedMode
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--compile-stage1"):
+            out.compileStage1 = true
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--no-compile-stage1"):
+            out.compileStage1 = false
+            continue
+        if toolingSelfhostArgsStrEq(arg, "--strict-inmem-witness"):
+            out.strictInmemWitness = true
+            continue
+        if strutil.startsWith(arg, "--out-dir:"):
+            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+            continue
+        if strutil.startsWith(arg, "--timing-out:"):
+            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+            continue
+        if strutil.startsWith(arg, "--stage0:"):
+            out.ok = false
+            out.exitCode = 2
+            out.error = "cheng_tooling: verify_backend_selfhost_bootstrap_self_obj no longer accepts --stage0; canonical driver is mandatory"
+            return out
+        out.ok = false
+        out.exitCode = 1
+        out.error = "cheng_tooling: unknown verify_backend_selfhost_bootstrap_self_obj arg: " + arg
+        return out
+    return out

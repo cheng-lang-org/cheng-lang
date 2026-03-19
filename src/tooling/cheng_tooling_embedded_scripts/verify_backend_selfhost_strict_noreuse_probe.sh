@@ -34,6 +34,7 @@ Env:
   SELFHOST_STRICT_PROBE_PREFLIGHT=<0|1>            default: 1
   SELFHOST_STRICT_PROBE_PREFLIGHT_TIMEOUT=<seconds> default: 20
   SELFHOST_STRICT_PROBE_PREFLIGHT_INPUT=<path>     default: tests/cheng/backend/fixtures/return_add.cheng
+  SELFHOST_STRICT_PROBE_DRIVER_INPUT=<path>        optional bootstrap driver input override
 
 Notes:
   - Runs strict selfhost bootstrap with reuse disabled, intended as a cold-path
@@ -144,6 +145,16 @@ preflight="${SELFHOST_STRICT_PROBE_PREFLIGHT:-1}"
 preflight_timeout="${SELFHOST_STRICT_PROBE_PREFLIGHT_TIMEOUT:-20}"
 preflight_input="${SELFHOST_STRICT_PROBE_PREFLIGHT_INPUT:-tests/cheng/backend/fixtures/return_add.cheng}"
 preflight_target="${SELFHOST_STRICT_PROBE_PREFLIGHT_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}"
+probe_driver_input="${SELFHOST_STRICT_PROBE_DRIVER_INPUT:-}"
+proof_sidecar_compiler="${SELF_OBJ_BOOTSTRAP_PROOF_SIDECAR_COMPILER:-}"
+
+if [ "$proof_sidecar_compiler" = "" ]; then
+  currentsrc_stage0="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof"
+  if [ -x "$currentsrc_stage0" ]; then
+    proof_sidecar_compiler="$currentsrc_stage0"
+    export SELF_OBJ_BOOTSTRAP_PROOF_SIDECAR_COMPILER="$proof_sidecar_compiler"
+  fi
+fi
 
 echo "== backend.selfhost_strict_noreuse_probe =="
 echo "[selfhost_strict_probe] session=$session timeout=${timeout}s mode=strict reuse=$reuse"
@@ -183,6 +194,10 @@ if is_true "$preflight" && [ "$stage0" != "" ]; then
       exit 0
     fi
   fi
+fi
+
+if [ "$probe_driver_input" != "" ]; then
+  export SELF_OBJ_BOOTSTRAP_DRIVER_INPUT="$probe_driver_input"
 fi
 
 if [ "$stage0" != "" ]; then

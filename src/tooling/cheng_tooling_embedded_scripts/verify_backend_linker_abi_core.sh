@@ -16,7 +16,7 @@ case "$host_tag" in
 esac
 
 target="arm64-apple-darwin"
-driver="$root/artifacts/backend_driver/cheng"
+driver="${BACKEND_DRIVER:-}"
 fixture="$root/tests/cheng/backend/fixtures/hello_importc_puts.cheng"
 out_dir="$root/artifacts/backend_linker_abi_core"
 out="$out_dir/hello_importc_puts.$target.self"
@@ -25,6 +25,15 @@ report="$out_dir/verify_backend_linker_abi_core.report.txt"
 snapshot="$out_dir/verify_backend_linker_abi_core.snapshot.env"
 tool="${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}"
 
+if [ "$driver" = "" ] && [ -x "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" ]; then
+  driver="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"
+fi
+if [ "$driver" = "" ] && [ -x "$root/artifacts/backend_driver/cheng" ]; then
+  driver="$root/artifacts/backend_driver/cheng"
+fi
+if [ "$driver" = "" ]; then
+  driver="$("$tool" backend_driver_path --path-only 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
+fi
 if [ ! -x "$driver" ]; then
   echo "[verify_backend_linker_abi_core] missing canonical driver: $driver" 1>&2
   echo "  hint: artifacts/tooling_cmd/cheng_tooling build-backend-driver" 1>&2
@@ -45,7 +54,11 @@ env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER \
   STAGE1_NO_POINTERS_NON_C_ABI=0 \
   STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
   BACKEND_OPT_LEVEL=2 \
-  "$tool" cheng --target:"$target" --in:"$fixture" --out:"$out" >"$log" 2>&1
+  BACKEND_LINKER=self \
+  BACKEND_TARGET="$target" \
+  BACKEND_INPUT="$fixture" \
+  BACKEND_OUTPUT="$out" \
+  "$driver" >"$log" 2>&1
 rc="$?"
 set -e
 if [ "$rc" -ne 0 ] || [ ! -s "$out" ]; then

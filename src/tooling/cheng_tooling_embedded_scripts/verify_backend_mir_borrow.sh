@@ -7,6 +7,26 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 . "$root/src/tooling/cheng_tooling_embedded_scripts/proof_phase_driver_common.sh"
 
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  cat <<'EOF'
+Usage:
+  src/tooling/cheng_tooling_embedded_scripts/verify_backend_mir_borrow.sh [--help]
+
+Env:
+  MIR_BORROW_IR=<mir|stage1>                default: mir
+  MIR_BORROW_GENERIC_LOWERING=<mode>        default: mir_hybrid
+  MIR_BORROW_GENERIC_BUDGET=<n>             default: 1
+  MIR_BORROW_FIXTURE=<path>                 default: tests/cheng/compiler/fixtures/tooling_borrow_repro_no_call.cheng
+  MIR_BORROW_GENERIC_FIXTURE=<path>         default: tests/cheng/backend/fixtures/return_new_expr_generic_box.cheng
+  BACKEND_DRIVER=<path>                     optional explicit backend driver override
+
+Notes:
+  - Verifies MIR borrow / generic lowering behavior on the ownership-on proof surface.
+  - Emits generics/proof reports and validates compile stamps plus phase counters.
+EOF
+  exit 0
+fi
+
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
   export TOOLING_CLEANUP_DEPTH=1
   cleanup_backend_driver_on_exit() {
@@ -185,9 +205,17 @@ proof_phase_driver_pick \
   "$target" \
   "$out_dir" \
   "${BACKEND_PROOF_PHASE_PREFLIGHT_FIXTURE:-tests/cheng/backend/fixtures/return_i64.cheng}"
-driver="$proof_phase_driver_path"
+phase_driver="$proof_phase_driver_path"
 phase_driver_surface="$proof_phase_driver_surface"
+phase_proof_driver="${proof_phase_driver_proof_path:-$proof_phase_driver_path}"
+phase_proof_surface="${proof_phase_driver_proof_surface:-$proof_phase_driver_surface}"
 driver_real_env="$proof_phase_driver_env"
+phase_driver_summary="$(proof_phase_driver_summary_flat)"
+driver="$phase_driver"
+if [ "$phase_driver" = "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" ] &&
+   [ -x "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" ]; then
+  driver="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"
+fi
 borrow_obj="$out_dir/mir_borrow_check.bin"
 borrow_log="$out_dir/mir_borrow_check.log"
 borrow_stamp="$out_dir/mir_borrow_check.compile_stamp.txt"
@@ -548,6 +576,11 @@ fi
   echo "git_head=$git_head"
   echo "git_dirty_files=$git_dirty_files"
   echo "driver=$driver"
+  echo "phase_driver=$phase_driver"
+  echo "phase_driver_surface=$phase_driver_surface"
+  echo "phase_proof_driver=$phase_proof_driver"
+  echo "phase_proof_surface=$phase_proof_surface"
+  echo "phase_driver_summary=$phase_driver_summary"
   echo "target=$target"
   echo "borrow_ir=$borrow_ir"
   echo "generic_lowering=$generic_lowering"
@@ -584,6 +617,11 @@ fi
 {
   echo "verify_backend_mir_borrow report"
   echo "driver=$driver"
+  echo "phase_driver=$phase_driver"
+  echo "phase_driver_surface=$phase_driver_surface"
+  echo "phase_proof_driver=$phase_proof_driver"
+  echo "phase_proof_surface=$phase_proof_surface"
+  echo "phase_driver_summary=$phase_driver_summary"
   echo "target=$target"
   echo "borrow_ir=$borrow_ir"
   echo "generic_lowering=$generic_lowering"

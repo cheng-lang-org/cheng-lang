@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1753,6 +1754,118 @@ CHENG_SHIM_WEAK int32_t driver_c_link_tmp_obj_system(const char *output_path, co
   return driver_c_link_tmp_obj_default(output_path, obj_path, target, "system");
 }
 
+typedef int32_t (*cheng_driver_bool_dummy_fn)(int32_t);
+
+static int driver_c_runtime_path_contains(const char *path, const char *needle) {
+  return path != NULL && needle != NULL && strstr(path, needle) != NULL;
+}
+
+static int driver_c_runtime_resolve_self_path(char *out, size_t out_cap) {
+  char raw[PATH_MAX];
+  char *resolved = NULL;
+  if (out == NULL || out_cap == 0) return 0;
+  out[0] = '\0';
+#if defined(__APPLE__)
+  {
+    uint32_t size = (uint32_t)sizeof(raw);
+    if (_NSGetExecutablePath(raw, &size) == 0) {
+      resolved = realpath(raw, out);
+      if (resolved != NULL) return 1;
+      if (strlen(raw) < out_cap) {
+        snprintf(out, out_cap, "%s", raw);
+        return 1;
+      }
+    }
+  }
+#elif !defined(_WIN32)
+  {
+    ssize_t n = readlink("/proc/self/exe", raw, sizeof(raw) - 1);
+    if (n > 0 && (size_t)n < sizeof(raw)) {
+      raw[n] = '\0';
+      resolved = realpath(raw, out);
+      if (resolved != NULL) return 1;
+      if ((size_t)n < out_cap) {
+        snprintf(out, out_cap, "%s", raw);
+        return 1;
+      }
+    }
+  }
+#endif
+  return 0;
+}
+
+static const char *driver_c_default_proof_surface_hint(char *out, size_t out_cap) {
+  const char *hint = getenv("BACKEND_PROOF_SURFACE_ORIGIN");
+  if (hint != NULL && hint[0] != '\0') return hint;
+  if (!driver_c_runtime_resolve_self_path(out, out_cap)) return NULL;
+  return out;
+}
+
+static const char *driver_c_default_proof_sidecar_compiler(void) {
+  static const char *currentsrc_stage0 =
+      "/Users/lbcheng/cheng-lang/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof";
+  static const char *preferred =
+      "/Users/lbcheng/cheng-lang/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng";
+  static const char *legacy =
+      "/Users/lbcheng/cheng-lang/artifacts/backend_selfhost_self_obj/probe_proofseed14/cheng_stage0_proofseed14";
+  char self_path[PATH_MAX];
+  const char *proof_surface = driver_c_default_proof_surface_hint(self_path, sizeof(self_path));
+  if (proof_surface == NULL) return NULL;
+  if (!driver_c_runtime_path_contains(
+          proof_surface,
+          "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2") &&
+      !driver_c_runtime_path_contains(
+          proof_surface,
+          "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness") &&
+      !driver_c_runtime_path_contains(
+          proof_surface,
+          "/artifacts/backend_driver/cheng")) {
+    return NULL;
+  }
+  if (access(currentsrc_stage0, X_OK) == 0) return currentsrc_stage0;
+  if (access(preferred, X_OK) == 0) return preferred;
+  if (access(legacy, X_OK) == 0) return legacy;
+  return NULL;
+}
+
+static void driver_c_apply_default_proof_sidecar_compiler(void) {
+  const char *env = getenv("BACKEND_UIR_SIDECAR_COMPILER");
+  const char *fallback = NULL;
+  if (env != NULL && env[0] != '\0') return;
+  fallback = driver_c_default_proof_sidecar_compiler();
+  if (fallback != NULL && fallback[0] != '\0') {
+    setenv("BACKEND_UIR_SIDECAR_COMPILER", fallback, 0);
+    driver_c_diagf("[driver_c_apply_default_proof_sidecar_compiler] default='%s'\n", fallback);
+  }
+}
+
+static int32_t driver_c_sidecar_builds_requested(void) {
+  const char *prefer_env = getenv("BACKEND_UIR_PREFER_SIDECAR");
+  if (prefer_env != NULL && prefer_env[0] != '\0') {
+    if (prefer_env[0] == '0' && prefer_env[1] == '\0') return 0;
+    return 1;
+  }
+  if (driver_c_env_bool("BACKEND_UIR_FORCE_SIDECAR", 0) != 0) {
+    return 1;
+  }
+  cheng_driver_bool_dummy_fn prefer_sidecar_fn =
+      (cheng_driver_bool_dummy_fn)driver_c_lookup_runtime_symbol(
+          "driver_export_prefer_sidecar_builds",
+          "driver_c_prefer_sidecar_builds");
+  if (prefer_sidecar_fn != NULL) {
+    int32_t prefer = prefer_sidecar_fn(0);
+    driver_c_diagf("[driver_c_prefer_sidecar_builds] export=%d\n", prefer);
+    if (prefer != 0) return 1;
+  }
+  return 0;
+}
+
+static int32_t driver_c_prefer_sidecar_builds(void) {
+  int32_t prefer = driver_c_sidecar_builds_requested();
+  if (prefer != 0) driver_c_apply_default_proof_sidecar_compiler();
+  return prefer;
+}
+
 CHENG_SHIM_WEAK int32_t driver_c_build_emit_obj_default(const char *input_path, const char *target,
                                                         const char *output_path) {
   if (input_path == NULL || input_path[0] == '\0') return -30;
@@ -1806,43 +1919,49 @@ CHENG_SHIM_WEAK void *driver_c_build_module_stage1(const char *input_path, const
     return NULL;
   }
   if (target == NULL) target = "";
-  {
-    cheng_build_module_stage1_fn build_module_stage1_target_retained =
-        (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
-            "driver_export_buildModuleFromFileStage1TargetRetained",
-            "driver_c_build_module_stage1.retained_target");
-    if (build_module_stage1_target_retained != NULL) {
-      void *module = build_module_stage1_target_retained(input_path, target);
-      driver_c_diagf("[driver_c_build_module_stage1] dlsym_retained_target_module=%p\n", module);
-      if (module != NULL) return module;
+  int32_t prefer_sidecar = driver_c_prefer_sidecar_builds();
+  if (prefer_sidecar == 0) {
+    {
+      cheng_build_module_stage1_fn build_module_stage1_target_retained =
+          (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
+              "driver_export_buildModuleFromFileStage1TargetRetained",
+              "driver_c_build_module_stage1.retained_target");
+      if (build_module_stage1_target_retained != NULL) {
+        void *module = build_module_stage1_target_retained(input_path, target);
+        driver_c_diagf("[driver_c_build_module_stage1] dlsym_retained_target_module=%p\n", module);
+        if (module != NULL) return module;
+      }
     }
   }
-  if (driver_buildActiveModulePtrs != NULL) {
+  if (prefer_sidecar == 0 && driver_buildActiveModulePtrs != NULL) {
     void *module = driver_buildActiveModulePtrs((void *)input_path, (void *)target);
     driver_c_diagf("[driver_c_build_module_stage1] weak_sidecar_module=%p\n", module);
     if (module != NULL) return module;
   }
-  if (uirCoreBuildModuleFromFileStage1OrPanic != NULL) {
+  if (prefer_sidecar == 0 && uirCoreBuildModuleFromFileStage1OrPanic != NULL) {
     void *module = uirCoreBuildModuleFromFileStage1OrPanic(input_path, target);
     driver_c_diagf("[driver_c_build_module_stage1] weak_builder_module=%p\n", module);
     if (module != NULL) return module;
   }
-  cheng_build_module_stage1_fn build_module_stage1 =
-      (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
-          "uirCoreBuildModuleFromFileStage1OrPanic",
-          "driver_c_build_module_stage1.builder");
-  if (build_module_stage1 != NULL &&
-      build_module_stage1 != (cheng_build_module_stage1_fn)uirCoreBuildModuleFromFileStage1OrPanic) {
-    void *module = build_module_stage1(input_path, target);
-    driver_c_diagf("[driver_c_build_module_stage1] dlsym_builder_module=%p\n", module);
-    if (module != NULL) return module;
+  if (prefer_sidecar == 0) {
+    cheng_build_module_stage1_fn build_module_stage1 =
+        (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
+            "uirCoreBuildModuleFromFileStage1OrPanic",
+            "driver_c_build_module_stage1.builder");
+    if (build_module_stage1 != NULL &&
+        build_module_stage1 != (cheng_build_module_stage1_fn)uirCoreBuildModuleFromFileStage1OrPanic) {
+      void *module = build_module_stage1(input_path, target);
+      driver_c_diagf("[driver_c_build_module_stage1] dlsym_builder_module=%p\n", module);
+      if (module != NULL) return module;
+    }
   }
   {
     cheng_build_active_module_ptrs_fn build_active_module_ptrs_fn =
         (cheng_build_active_module_ptrs_fn)driver_c_lookup_runtime_symbol(
             "driver_buildActiveModulePtrs",
             "driver_c_build_module_stage1.sidecar");
-    if (build_active_module_ptrs_fn != NULL &&
+    if (prefer_sidecar == 0 &&
+        build_active_module_ptrs_fn != NULL &&
         build_active_module_ptrs_fn != driver_buildActiveModulePtrs) {
       void *module = build_active_module_ptrs_fn((void *)input_path, (void *)target);
       driver_c_diagf("[driver_c_build_module_stage1] dlsym_sidecar_module=%p\n", module);
@@ -1872,32 +1991,71 @@ CHENG_SHIM_WEAK void *driver_c_build_module_stage1_direct(const char *input_path
     return NULL;
   }
   if (target == NULL) target = "";
-  {
-    cheng_build_module_stage1_fn build_module_stage1_target_retained =
-        (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
-            "driver_export_buildModuleFromFileStage1TargetRetained",
-            "driver_c_build_module_stage1_direct.retained_target");
-    if (build_module_stage1_target_retained != NULL) {
-      void *module = build_module_stage1_target_retained(input_path, target);
-      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_retained_target_module=%p\n",
-                     module);
-      if (module != NULL) return module;
+  int32_t prefer_sidecar = driver_c_prefer_sidecar_builds();
+  int32_t sidecar_disabled = driver_c_env_bool("BACKEND_UIR_SIDECAR_DISABLE", 0);
+  int32_t allow_direct_exports = (prefer_sidecar == 0 || sidecar_disabled != 0);
+  if (allow_direct_exports != 0) {
+    {
+      cheng_build_module_stage1_fn build_module_stage1_target_retained =
+          (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
+              "driver_export_buildModuleFromFileStage1TargetRetained",
+              "driver_c_build_module_stage1_direct.retained_target");
+      if (build_module_stage1_target_retained != NULL) {
+        void *module = build_module_stage1_target_retained(input_path, target);
+        driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_retained_target_module=%p\n",
+                       module);
+        if (module != NULL) return module;
+      }
     }
   }
-  if (uirCoreBuildModuleFromFileStage1OrPanic != NULL) {
+  if (allow_direct_exports != 0 && uirCoreBuildModuleFromFileStage1OrPanic != NULL) {
     void *module = uirCoreBuildModuleFromFileStage1OrPanic(input_path, target);
     driver_c_diagf("[driver_c_build_module_stage1_direct] weak_builder_module=%p\n", module);
     if (module != NULL) return module;
   }
-  cheng_build_module_stage1_fn build_module_stage1 =
-      (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
-          "uirCoreBuildModuleFromFileStage1OrPanic",
-          "driver_c_build_module_stage1_direct.builder");
-  if (build_module_stage1 != NULL &&
-      build_module_stage1 != (cheng_build_module_stage1_fn)uirCoreBuildModuleFromFileStage1OrPanic) {
-    void *module = build_module_stage1(input_path, target);
-    driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_builder_module=%p\n", module);
+  if (allow_direct_exports != 0) {
+    cheng_build_module_stage1_fn build_module_stage1 =
+        (cheng_build_module_stage1_fn)driver_c_lookup_runtime_symbol(
+            "uirCoreBuildModuleFromFileStage1OrPanic",
+            "driver_c_build_module_stage1_direct.builder");
+    if (build_module_stage1 != NULL &&
+        build_module_stage1 != (cheng_build_module_stage1_fn)uirCoreBuildModuleFromFileStage1OrPanic) {
+      void *module = build_module_stage1(input_path, target);
+      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_builder_module=%p\n", module);
+      if (module != NULL) return module;
+    }
+  }
+  if (allow_direct_exports != 0 && driver_buildActiveModulePtrs != NULL) {
+    void *module = driver_buildActiveModulePtrs((void *)input_path, (void *)target);
+    driver_c_diagf("[driver_c_build_module_stage1_direct] weak_sidecar_module=%p\n", module);
     if (module != NULL) return module;
+  }
+  if (sidecar_disabled != 0) {
+    driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_disabled skip_sidecar\n");
+    return NULL;
+  }
+  {
+    cheng_build_active_module_ptrs_fn build_active_module_ptrs_fn =
+        (cheng_build_active_module_ptrs_fn)driver_c_lookup_runtime_symbol(
+            "driver_buildActiveModulePtrs",
+            "driver_c_build_module_stage1_direct.sidecar");
+    if (allow_direct_exports != 0 &&
+        build_active_module_ptrs_fn != NULL &&
+        build_active_module_ptrs_fn != driver_buildActiveModulePtrs) {
+      void *module = build_active_module_ptrs_fn((void *)input_path, (void *)target);
+      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_sidecar_module=%p\n", module);
+      if (module != NULL) return module;
+    }
+  }
+  {
+    cheng_build_active_module_ptrs_fn sidecar_build_fn =
+        (cheng_build_active_module_ptrs_fn)cheng_sidecar_build_module_symbol(
+            &cheng_sidecar_cache, target, driver_c_diagf, driver_c_sidecar_after_open);
+    if (sidecar_build_fn != NULL) {
+      void *module = sidecar_build_fn((void *)input_path, (void *)target);
+      driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_module=%p\n", module);
+      if (module != NULL) return module;
+    }
   }
   driver_c_diagf("[driver_c_build_module_stage1_direct] no_module\n");
   return NULL;

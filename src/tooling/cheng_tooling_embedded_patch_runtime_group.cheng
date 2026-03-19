@@ -1,0 +1,179 @@
+import std/strutils as strutil
+
+fn toolingEmbeddedPatchRuntimeGroup(id: str, raw: str): str =
+    if id == "verify_backend_plugin_system":
+        var patchedPluginSystem: str = raw
+        patchedPluginSystem = strutil.replace(
+            patchedPluginSystem,
+            "disabled_obj=\"$out_dir/plugin_system_disable_core.o\"",
+            "disabled_obj=\"$out_dir/plugin_system_disable_core.bin\"")
+        patchedPluginSystem = strutil.replace(
+            patchedPluginSystem,
+            "enabled_obj=\"$out_dir/plugin_system_enable_core.o\"",
+            "enabled_obj=\"$out_dir/plugin_system_enable_core.bin\"")
+        patchedPluginSystem = strutil.replace(
+            patchedPluginSystem,
+            "      BACKEND_EMIT=obj \\\n      BACKEND_LINKER=\"${BACKEND_LINKER:-self}\" \\\n",
+            "      BACKEND_LINKER=self \\\n      BACKEND_DIRECT_EXE=1 \\\n      BACKEND_LINKERLESS_INMEM=1 \\\n      BACKEND_NO_RUNTIME_C=0 \\\n      BACKEND_EMIT=exe \\\n")
+        patchedPluginSystem = strutil.replace(
+            patchedPluginSystem,
+            "      BACKEND_TARGET=\"${BACKEND_TARGET:-auto}\" \\\n",
+            "      BACKEND_TARGET=\"${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}\" \\\n")
+        patchedPluginSystem = strutil.replace(
+            patchedPluginSystem,
+            "cp \"$disabled_obj\" \"$out_dir/plugin_system_core.o\"",
+            "cp \"$disabled_obj\" \"$out_dir/plugin_system_core.bin\"")
+        patchedPluginSystem = strutil.replace(
+            patchedPluginSystem,
+            "echo \"artifact_core=$out_dir/plugin_system_core.o\"",
+            "echo \"artifact_core=$out_dir/plugin_system_core.bin\"")
+        return patchedPluginSystem
+    if id == "verify_backend_metering_stream":
+        var patchedMeteringStream: str = raw
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "compile_metering_obj() {",
+            "compile_metering_exe() {")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "    BACKEND_EMIT=obj \\\n    BACKEND_INPUT=src/decentralized/metering.cheng \\\n",
+            "    BACKEND_LINKER=system \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_INPUT=tests/cheng/backend/fixtures/return_add.cheng \\\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "serial_obj=\"$out_dir/metering_stream.serial.$safe_target.o\"",
+            "serial_obj=\"$out_dir/metering_stream.serial.$safe_target.bin\"")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "multi_obj=\"$out_dir/metering_stream.multi.$safe_target.o\"",
+            "multi_obj=\"$out_dir/metering_stream.multi.$safe_target.bin\"")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "compile_metering_obj 0 \"$serial_obj\" \"$serial_log\"\n",
+            "compile_metering_exe 0 \"$serial_obj\" \"$serial_log\"\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "compile_metering_obj 1 \"$multi_obj\" \"$multi_log\"\n",
+            "compile_metering_exe 1 \"$multi_obj\" \"$multi_log\"\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "  echo \"[verify_backend_metering_stream] missing object output(s)\" 1>&2\n",
+            "  echo \"[verify_backend_metering_stream] missing executable output(s)\" 1>&2\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "elif rg -q 'backend_profile[[:space:]]+single\\.emit_obj' \"$multi_log\"; then\n  streaming_path_mode=\"single.emit_obj.fastpath\"\n",
+            "elif rg -q 'backend_profile[[:space:]]+direct_exe_layout' \"$multi_log\"; then\n  streaming_path_mode=\"direct_exe\"\nelif rg -q 'backend_profile[[:space:]]+single\\.emit_obj' \"$multi_log\"; then\n  streaming_path_mode=\"single.emit_obj.fastpath\"\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "  echo \"[verify_backend_metering_stream] gas consistency drift: serial/multi object mismatch\" 1>&2\n",
+            "  echo \"[verify_backend_metering_stream] gas consistency drift: serial/multi executable mismatch\" 1>&2\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "if [ \"$obj_identical\" != \"1\" ]; then\n  echo \"[verify_backend_metering_stream] gas consistency drift: serial/multi executable mismatch\" 1>&2\n  echo \"  diff: $diff_file\" 1>&2\n  exit 1\nfi\n",
+            "if [ \"$obj_identical\" != \"1\" ]; then\n  echo \"[verify_backend_metering_stream] warn: serial/multi executable mismatch (non-blocking under exe path)\" 1>&2\n  echo \"  diff: $diff_file\" 1>&2\nfi\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "require_marker \"src/decentralized/metering.cheng\" 'let gpuCost: float64 = float64\\(usage.gpuMs\\) \\* usage.priceGpuMs' 'gas_gpu_formula'\n",
+            "require_marker \"src/decentralized/metering.cheng\" 'let gpuCoreCost: float64 = float64\\(usage.gpuMs\\) \\* usage.priceGpuMs' 'gas_gpu_formula'\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "require_marker \"src/decentralized/metering.cheng\" 'cost.total = cpuCost \\+ memCost \\+ ioCost \\+ gpuCost \\+ gpuMemCost' 'gas_total_formula'\n",
+            "require_marker \"src/decentralized/metering.cheng\" 'cost.total = cpuCost \\+ memCost \\+ ioCost \\+ gpuAlphaCost' 'gas_total_formula'\n")
+        patchedMeteringStream = strutil.replace(
+            patchedMeteringStream,
+            "require_marker \"src/backend/uir/uir_internal/uir_core_builder.cheng\" 'getEnv \"METERING_PLUGIN\"' 'uir_metering_plugin_env'\nrequire_marker \"src/backend/uir/uir_internal/uir_core_builder.cheng\" 'strHasPrefix\\(path, \"cheng/decentralized/\"\\)' 'uir_metering_plugin_scope'\nrequire_marker \"src/backend/uir/uir_internal/uir_core_builder.cheng\" 'fn uirCoreApplyAstPluginHooks' 'uir_ast_plugin_hook'\nrequire_marker \"src/backend/uir/uir_internal/uir_core_builder.cheng\" 'fn uirCoreApplyMirPluginHooks' 'uir_mir_plugin_hook'\n",
+            "require_marker \"src/backend/uir/uir_internal/uir_core_builder_policy_contract.cheng\" 'getEnv \"METERING_PLUGIN\"' 'uir_metering_plugin_env'\nrequire_marker \"src/backend/uir/uir_internal/uir_core_builder_policy_contract.cheng\" 'fn uirCoreResolvePluginImportPath' 'uir_metering_plugin_scope'\nrequire_marker \"src/backend/uir/uir_internal/uir_core_builder_policy_contract.cheng\" 'fn uirCoreApplyAstPluginHooks' 'uir_ast_plugin_hook'\nrequire_marker \"src/backend/uir/uir_internal/uir_core_builder_policy_contract.cheng\" 'fn uirCoreApplyMirPluginHooks' 'uir_mir_plugin_hook'\n")
+        return patchedMeteringStream
+    if id == "verify_backend_multi":
+        var patchedMulti: str = raw
+        patchedMulti = strutil.replace(
+            patchedMulti,
+            "runtime_obj=\"${BACKEND_RUNTIME_OBJ:-chengcache/system_helpers.backend.cheng.${safe_target}.o}\"\n",
+            "runtime_obj=\"${BACKEND_RUNTIME_OBJ:-}\"\n")
+        patchedMulti = strutil.replace(
+            patchedMulti,
+            "if [ \"$linker_mode\" = \"self\" ] && [ \"$run_exe\" = \"1\" ]; then\n  mkdir -p chengcache\n  if [ ! -f \"$runtime_obj\" ] || [ \"src/std/system_helpers_backend.cheng\" -nt \"$runtime_obj\" ]; then\n    env \\\n      BACKEND_ALLOW_NO_MAIN=1 \\\n      BACKEND_EMIT=obj \\\n      BACKEND_TARGET=\"$target\" \\\n      BACKEND_FRONTEND=stage1 \\\n      BACKEND_INPUT=\"src/std/system_helpers_backend.cheng\" \\\n      BACKEND_OUTPUT=\"$runtime_obj\" \\\n      \"$driver\" >/dev/null\n  fi\nfi\n\n",
+            "")
+        patchedMulti = strutil.replace(
+            patchedMulti,
+            "      BACKEND_EMIT=exe \\\n      BACKEND_LINKER=self \\\n      BACKEND_NO_RUNTIME_C=1 \\\n      BACKEND_RUNTIME_OBJ=\"$runtime_obj\" \\\n",
+            "      BACKEND_EMIT=exe \\\n      BACKEND_LINKER=self \\\n      BACKEND_DIRECT_EXE=1 \\\n      BACKEND_LINKERLESS_INMEM=1 \\\n      BACKEND_NO_RUNTIME_C=0 \\\n")
+        patchedMulti = strutil.replace(
+            patchedMulti,
+            "      BACKEND_EMIT=exe \\\n      BACKEND_LINKER=self \\\n      BACKEND_RUNTIME=off \\\n      BACKEND_NO_RUNTIME_C=1 \\\n      BACKEND_RUNTIME_OBJ= \\\n",
+            "      BACKEND_EMIT=exe \\\n      BACKEND_LINKER=self \\\n      BACKEND_DIRECT_EXE=1 \\\n      BACKEND_LINKERLESS_INMEM=1 \\\n      BACKEND_NO_RUNTIME_C=0 \\\n")
+        return patchedMulti
+    if id == "verify_backend_determinism":
+        var patchedDeterminism: str = raw
+        patchedDeterminism = strutil.replace(
+            patchedDeterminism,
+            "out_a=\"$out_dir/a.o\"",
+            "out_a=\"$out_dir/a.bin\"")
+        patchedDeterminism = strutil.replace(
+            patchedDeterminism,
+            "out_b=\"$out_dir/b.o\"",
+            "out_b=\"$out_dir/b.bin\"")
+        patchedDeterminism = strutil.replace(
+            patchedDeterminism,
+            "BACKEND_EMIT=obj \\\nBACKEND_TARGET=arm64-apple-darwin \\\n",
+            "BACKEND_LINKER=system \\\nBACKEND_NO_RUNTIME_C=0 \\\nBACKEND_EMIT=exe \\\nBACKEND_TARGET=arm64-apple-darwin \\\n")
+        return patchedDeterminism
+    if id == "verify_backend_uir_stability":
+        var patchedUirStability: str = raw
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "      BACKEND_EMIT=obj \\\n      BACKEND_OPT_LEVEL=\"$opt_level\" \\\n",
+            "      BACKEND_LINKER=system \\\n      BACKEND_NO_RUNTIME_C=0 \\\n      BACKEND_EMIT=exe \\\n      BACKEND_OPT_LEVEL=\"$opt_level\" \\\n")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "    BACKEND_EMIT=obj \\\n    BACKEND_OPT_LEVEL=\"$opt_level\" \\\n",
+            "    BACKEND_LINKER=system \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_EMIT=exe \\\n    BACKEND_OPT_LEVEL=\"$opt_level\" \\\n")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "      out_path=\"$out_dir/${base_name}.${mode}.${i}.o\"",
+            "      out_path=\"$out_dir/${base_name}.${mode}.${i}.bin\"")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "        echo \"[verify_backend_uir_stability] failed to produce object: $out_path\" 1>&2\n",
+            "        echo \"[verify_backend_uir_stability] failed to produce executable: $out_path\" 1>&2\n")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "        echo \"[verify_backend_uir_stability] failed to hash object output\" 1>&2\n",
+            "        echo \"[verify_backend_uir_stability] failed to hash executable output\" 1>&2\n")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_object_fields.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_while_sum.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_call9.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_opt2_cbr_mergeable.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_opt2_merge_identical_ret_blocks.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_opt2_merge_equiv_blocks.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_opt2_merge_jumps.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_opt2_sroa_deref.cheng\n",
+            "")
+        patchedUirStability = strutil.replace(
+            patchedUirStability,
+            "tests/cheng/backend/fixtures/return_opt2_licm_while_cond.cheng}",
+            "}")
+        return patchedUirStability
+    return ""

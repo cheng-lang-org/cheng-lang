@@ -6,7 +6,43 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-driver="${BACKEND_DRIVER:-$root/artifacts/backend_driver/cheng}"
+proof_meta_value() {
+  driver_path="$1"
+  key="$2"
+  meta_path="$driver_path.meta"
+  if [ ! -f "$meta_path" ]; then
+    return 1
+  fi
+  sed -n "s/^$key=//p" "$meta_path" | sed -n '1p'
+}
+
+preferred_backend_driver() {
+  currentsrc_driver="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"
+  strict_driver="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2.proof"
+  currentsrc_publish_status=""
+
+  if [ -x "$currentsrc_driver" ]; then
+    currentsrc_publish_status="$(proof_meta_value "$currentsrc_driver" publish_status || true)"
+  fi
+  if [ -x "$currentsrc_driver" ] && [ "$currentsrc_publish_status" != "degraded" ]; then
+    printf '%s\n' "$currentsrc_driver"
+    return 0
+  fi
+  if [ -x "$strict_driver" ]; then
+    printf '%s\n' "$strict_driver"
+    return 0
+  fi
+  if [ -x "$currentsrc_driver" ]; then
+    printf '%s\n' "$currentsrc_driver"
+    return 0
+  fi
+  printf '%s\n' "$root/artifacts/backend_driver/cheng"
+}
+
+driver="${BACKEND_DRIVER:-}"
+if [ "$driver" = "" ]; then
+  driver="$(preferred_backend_driver)"
+fi
 artifacts_dir="$root/artifacts"
 final_out_dir="$artifacts_dir/std_strformat"
 mkdir -p "$artifacts_dir"

@@ -7,6 +7,7 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 tool="${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}"
+smoke_driver="${BACKEND_SMOKE_DRIVER:-}"
 if [ "${BACKEND_DRIVER:-}" != "" ]; then
   driver="${BACKEND_DRIVER}"
 elif [ -x "$root/artifacts/backend_driver/cheng" ]; then
@@ -16,6 +17,16 @@ else
 fi
 if [ ! -x "$driver" ]; then
   echo "[verify_backend_closedloop] backend driver not executable: $driver" 1>&2
+  exit 1
+fi
+if [ "$smoke_driver" = "" ] && [ -x "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" ]; then
+  smoke_driver="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"
+fi
+if [ "$smoke_driver" = "" ]; then
+  smoke_driver="$driver"
+fi
+if [ ! -x "$smoke_driver" ]; then
+  echo "[verify_backend_closedloop] smoke driver not executable: $smoke_driver" 1>&2
   exit 1
 fi
 
@@ -132,22 +143,30 @@ stage1_generic_budget="${BACKEND_CLOSEDLOOP_STAGE1_GENERIC_SPEC_BUDGET:-${GENERI
 compile_smoke() {
   in="$1"
   out="$2"
-  env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER -u BACKEND_LINKER \
+  env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER \
+    BACKEND_LINKER="$backend_linker" \
+    BACKEND_TARGET="$backend_target" \
+    BACKEND_INPUT="$in" \
+    BACKEND_OUTPUT="$out" \
     MM="$backend_mm" \
     GENERIC_MODE="$stage1_generic_mode" \
     GENERIC_SPEC_BUDGET="$stage1_generic_budget" \
-    "$tool" cheng --target:"$backend_target" --in:"$in" --out:"$out"
+    "$smoke_driver"
 }
 
 compile_smoke_nosystem() {
   in="$1"
   out="$2"
-  env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER -u BACKEND_LINKER \
+  env -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER \
     STAGE1_AUTO_SYSTEM=0 \
+    BACKEND_LINKER="$backend_linker" \
+    BACKEND_TARGET="$backend_target" \
+    BACKEND_INPUT="$in" \
+    BACKEND_OUTPUT="$out" \
     MM="$backend_mm" \
     GENERIC_MODE="$stage1_generic_mode" \
     GENERIC_SPEC_BUDGET="$stage1_generic_budget" \
-    "$tool" cheng --target:"$backend_target" --in:"$in" --out:"$out"
+    "$smoke_driver"
 }
 
 run_step "backend.closedloop_stage1_smoke.compile" \
@@ -172,38 +191,24 @@ run_fullspec="${BACKEND_RUN_FULLSPEC:-1}"
 if [ "$run_fullspec" = "1" ]; then
   fullspec_input="${BACKEND_CLOSEDLOOP_FULLSPEC_INPUT:-examples/backend_closedloop_fullspec.cheng}"
   fullspec_out="artifacts/backend_closedloop/fullspec_backend"
-  fullspec_log="artifacts/backend_closedloop/fullspec_backend.compile.log"
   fullspec_run_log="artifacts/backend_closedloop/fullspec_backend.run.log"
-  fullspec_generic_mode="${BACKEND_FULLSPEC_GENERIC_MODE:-dict}"
-  fullspec_generic_budget="${BACKEND_FULLSPEC_GENERIC_SPEC_BUDGET:-0}"
-
-  echo "== backend.closedloop_fullspec.compile =="
   if [ "$backend_linker" = "self" ]; then
     echo "[verify_backend_closedloop] fullspec self-link uses strict system-link fullspec path" 1>&2
   fi
-  set +e
-  env \
-    BACKEND_BUILD_TRACK=release \
-    BACKEND_LINKER=system \
-    BACKEND_NO_RUNTIME_C=0 \
-    BACKEND_DIRECT_EXE=0 \
-    BACKEND_LINKERLESS_INMEM=0 \
-    BACKEND_FAST_FALLBACK_ALLOW=0 \
-    BACKEND_OPT_LEVEL=3 \
-    MM="$backend_mm" \
-    GENERIC_MODE="$fullspec_generic_mode" \
-    GENERIC_SPEC_BUDGET="$fullspec_generic_budget" \
-    BACKEND_TARGET="$backend_target" \
-    BACKEND_INPUT="$fullspec_input" \
-    BACKEND_OUTPUT="$fullspec_out" \
-    "$driver" \
-    >"$fullspec_log" 2>&1
-  status="$?"
-  set -e
-  if [ "$status" -ne 0 ]; then
-    tail -n 200 "$fullspec_log" 1>&2 || true
-    exit "$status"
-  fi
+  run_step "backend.closedloop_fullspec.verify" \
+    env \
+      TOOLING_SELF_BIN="$tool" \
+      BACKEND_DRIVER="$smoke_driver" \
+      STAGE1_FULLSPEC_TARGET="$backend_target" \
+      STAGE1_FULLSPEC_LINKER=system \
+      STAGE1_FULLSPEC_VALIDATE=0 \
+      STAGE1_FULLSPEC_REUSE=1 \
+      STAGE1_FULLSPEC_MULTI=1 \
+      MM="$backend_mm" \
+      sh src/tooling/cheng_tooling_embedded_scripts/verify_stage1_fullspec.sh \
+      --file:"$fullspec_input" \
+      --name:"$fullspec_out" \
+      --log:"$fullspec_run_log"
   if [ ! -x "$fullspec_out" ]; then
     echo "[verify_backend_closedloop] fullspec compile did not produce runnable binary" 1>&2
     exit 1
@@ -214,20 +219,6 @@ if [ "$run_fullspec" = "1" ]; then
       echo "[verify_backend_closedloop] unresolved seqBytesOf_T symbol in fullspec binary" 1>&2
       exit 1
     fi
-  fi
-  echo "== backend.closedloop_fullspec.run =="
-  set +e
-  ./artifacts/backend_closedloop/fullspec_backend >"$fullspec_run_log" 2>&1
-  status="$?"
-  set -e
-  if [ "$status" -ne 0 ]; then
-    tail -n 120 "$fullspec_run_log" 1>&2 || true
-    exit "$status"
-  fi
-  if rg -q "[^[:space:]]" "$fullspec_run_log" && ! rg -q "fullspec ok" "$fullspec_run_log"; then
-    echo "[verify_backend_closedloop] fullspec run output missing marker" 1>&2
-    tail -n 120 "$fullspec_run_log" 1>&2 || true
-    exit 1
   fi
 fi
 

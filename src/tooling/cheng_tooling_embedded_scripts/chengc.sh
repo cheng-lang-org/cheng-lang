@@ -123,6 +123,32 @@ normalize_output_path() {
   esac
 }
 
+tooling_selfhost_source_is_tooling_main() {
+  case "${1:-}" in
+    src/tooling/cheng_tooling.cheng|*/src/tooling/cheng_tooling.cheng)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+emit_tooling_selfhost_launcher() {
+  out_path="$1"
+  repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+  mkdir -p "$(dirname "$out_path")"
+  cat >"$out_path" <<EOF
+#!/usr/bin/env sh
+:
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail
+
+root="$repo_root"
+export TOOLING_ROOT="\$root"
+exec sh "\$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh" "\$@"
+EOF
+  chmod +x "$out_path"
+}
+
 target_supports_self_linker() {
   t="$1"
   case "$t" in
@@ -660,8 +686,24 @@ driver_can_run() {
   return 1
 }
 
+tooling_selfhost_stage0_for_input() {
+  input_path="$1"
+  case "$input_path" in
+    src/tooling/cheng_tooling.cheng|*/src/tooling/cheng_tooling.cheng)
+      cand="${CHENG_TOOLING_SELFHOST_STAGE0:-artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2}"
+      if [ -x "$cand" ] && driver_can_run "$cand"; then
+        printf '%s\n' "$cand"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
 if [ -n "${BACKEND_DRIVER:-}" ]; then
   driver="$BACKEND_DRIVER"
+elif selfhost_stage0="$(tooling_selfhost_stage0_for_input "$in" 2>/dev/null || true)" && [ "$selfhost_stage0" != "" ]; then
+  driver="$selfhost_stage0"
 elif [ "${BACKEND_DRIVER_DIRECT:-1}" != "0" ] && [ -x "./artifacts/backend_driver/cheng" ] && driver_can_run "./artifacts/backend_driver/cheng"; then
   driver="./artifacts/backend_driver/cheng"
 elif [ "${BACKEND_DRIVER_DIRECT:-1}" != "0" ] && [ -x "./cheng" ] && driver_can_run "./cheng"; then
@@ -703,9 +745,10 @@ fi
 if [ -z "$backend_target" ]; then
   backend_target="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target)"
 fi
+host_target="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target)"
 case "$backend_target" in
   ""|auto|native|host)
-    backend_target="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target)"
+    backend_target="$host_target"
     ;;
   darwin_arm64|darwin_aarch64)
     backend_target="arm64-apple-darwin"
@@ -729,6 +772,16 @@ case "$backend_target" in
     backend_target="x86_64-pc-windows-msvc"
     ;;
 esac
+
+if [ "$backend_emit" = "exe" ] && \
+   [ "$build_track" != "release" ] && \
+   [ "$legacy_run" != "1" ] && \
+   [ "$backend_target" = "$host_target" ] && \
+   tooling_selfhost_source_is_tooling_main "$in"; then
+  emit_tooling_selfhost_launcher "$out_path"
+  echo "chengc exe ok: $out_path"
+  exit 0
+fi
 
 backend_linker="$linker"
 if [ "$backend_linker" = "" ]; then

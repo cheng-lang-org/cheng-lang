@@ -1,0 +1,150 @@
+import std/os
+import std/monotimes
+
+fn toolingBuildGlobalStrNonEmpty(text: str): bool =
+    return len(text) > 0
+
+fn toolingBuildGlobalStrEq(a: str, b: str): bool =
+    return a == b
+
+fn toolingBuildGlobalIsAsciiSpace(ch: char): bool =
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+
+fn toolingBuildGlobalStartsWith(s: str, prefix: str): bool =
+    if len(prefix) > len(s):
+        return false
+    for i in 0..<len(prefix):
+        if s[i] != prefix[i]:
+            return false
+    return true
+
+fn toolingBuildGlobalJoinPathSimple(base: str, rel: str): str =
+    if !toolingBuildGlobalStrNonEmpty(base):
+        return rel
+    if !toolingBuildGlobalStrNonEmpty(rel):
+        return base
+    if toolingBuildGlobalStartsWith(rel, "/") || toolingBuildGlobalStartsWith(rel, "\\"):
+        return base + rel
+    let n: int32 = len(base)
+    if n > 0:
+        let tail: char = base[n - 1]
+        if tail == '/' || tail == '\\':
+            return base + rel
+    return base + "/" + rel
+
+fn toolingBuildGlobalPathAbsolute(root: str, raw: str): str =
+    let text: str = raw
+    if !toolingBuildGlobalStrNonEmpty(text):
+        return ""
+    if os.isAbsolute(text):
+        return text
+    if toolingBuildGlobalStartsWith(text, "./") || toolingBuildGlobalStartsWith(text, "../"):
+        return os.absolutePath(text)
+    return toolingBuildGlobalJoinPathSimple(root, text)
+
+fn toolingBuildGlobalShellQuote(raw: str): str =
+    if len(raw) == 0:
+        return "\"\""
+    # Internal tooling paths are repo-controlled; quoted wrapping is enough here.
+    return "\"" + raw + "\""
+
+fn toolingBuildGlobalNowNonceText(): str =
+    let mt: monotimes.MonoTime = monotimes.getMonoTime()
+    return int64ToStr(monotimes.monoTimeNs(mt))
+
+fn toolingBuildGlobalExec(root: str, command: str): os.ExecCmdResult =
+    return os.execCmdEx(command, uint64(7), root)
+
+fn toolingBuildGlobalMkdirP(root: str, path: str): bool =
+    if !toolingBuildGlobalStrNonEmpty(path):
+        return true
+    if os.dirExists(path):
+        return true
+    let res: os.ExecCmdResult =
+        toolingBuildGlobalExec(root, "mkdir -p " + toolingBuildGlobalShellQuote(path))
+    return os.execCmdResultExitCode(res) == 0
+
+fn toolingBuildGlobalInstallTemplate(root: str, srcPath: str, dstPath: str): bool =
+    if !toolingBuildGlobalStrNonEmpty(srcPath) || !toolingBuildGlobalStrNonEmpty(dstPath):
+        return false
+    if toolingBuildGlobalStrEq(srcPath, dstPath):
+        let chmodSame: os.ExecCmdResult =
+            toolingBuildGlobalExec(root, "chmod +x " + toolingBuildGlobalShellQuote(dstPath))
+        return os.execCmdResultExitCode(chmodSame) == 0
+    let outDir: str = os.parentDir(dstPath)
+    if toolingBuildGlobalStrNonEmpty(outDir):
+        if !toolingBuildGlobalMkdirP(root, outDir):
+            return false
+    let tmpPath: str = dstPath + ".publish." + toolingBuildGlobalNowNonceText() + ".tmp"
+    let cmd: str =
+        "cp -f " + toolingBuildGlobalShellQuote(srcPath) + " " + toolingBuildGlobalShellQuote(tmpPath) +
+        " && chmod +x " + toolingBuildGlobalShellQuote(tmpPath) +
+        " && mv -f " + toolingBuildGlobalShellQuote(tmpPath) + " " + toolingBuildGlobalShellQuote(dstPath)
+    let res: os.ExecCmdResult = toolingBuildGlobalExec(root, cmd)
+    if os.execCmdResultExitCode(res) == 0:
+        return true
+    if os.fileExists(tmpPath):
+        os.removeFile(tmpPath)
+    return false
+
+fn toolingBuildGlobalFilesIdentical(root: str, leftRaw: str, rightRaw: str): bool =
+    let left: str = toolingBuildGlobalPathAbsolute(root, leftRaw)
+    let right: str = toolingBuildGlobalPathAbsolute(root, rightRaw)
+    if !toolingBuildGlobalStrNonEmpty(left) || !toolingBuildGlobalStrNonEmpty(right):
+        return false
+    if !os.fileExists(left) || !os.fileExists(right):
+        return false
+    let cmpCmd: str =
+        "cmp -s " + toolingBuildGlobalShellQuote(left) + " " + toolingBuildGlobalShellQuote(right)
+    let cmpRes: os.ExecCmdResult = toolingBuildGlobalExec(root, cmpCmd)
+    return os.execCmdResultExitCode(cmpRes) == 0
+
+fn toolingBuildGlobalCanonicalWrapperPath(root: str): str =
+    return toolingBuildGlobalPathAbsolute(root, "artifacts/tooling_cmd/cheng_tooling")
+
+fn toolingBuildGlobalIsCanonicalWrapperTarget(root: str, outPathRaw: str): bool =
+    let outPath: str = toolingBuildGlobalPathAbsolute(root, outPathRaw)
+    if !toolingBuildGlobalStrNonEmpty(outPath):
+        return false
+    return toolingBuildGlobalStrEq(outPath, toolingBuildGlobalCanonicalWrapperPath(root))
+
+fn toolingBuildGlobalCanonicalWrapperChanged(root: str, outPathRaw: str): bool =
+    let outPath: str = toolingBuildGlobalPathAbsolute(root, outPathRaw)
+    if !toolingBuildGlobalStrNonEmpty(outPath):
+        return true
+    let wrapperTemplate: str =
+        toolingBuildGlobalPathAbsolute(root, "src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_canonical.sh")
+    let realTemplate: str =
+        toolingBuildGlobalPathAbsolute(root, "src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_real.sh")
+    let realPrimaryTemplate: str =
+        toolingBuildGlobalPathAbsolute(root, "src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_real_bin.sh")
+    let realOut: str = os.joinPath(os.parentDir(outPath), "cheng_tooling.real")
+    let realPrimaryOut: str = os.joinPath(os.parentDir(outPath), "cheng_tooling.real.bin")
+    let wrapperChanged: bool = !toolingBuildGlobalFilesIdentical(root, wrapperTemplate, outPath)
+    let realChanged: bool = !toolingBuildGlobalFilesIdentical(root, realTemplate, realOut)
+    let realPrimaryChanged: bool = !toolingBuildGlobalFilesIdentical(root, realPrimaryTemplate, realPrimaryOut)
+    return wrapperChanged || realChanged || realPrimaryChanged
+
+fn toolingBuildGlobalSyncCanonicalWrappers(root: str, outPathRaw: str): bool =
+    let outPath: str = toolingBuildGlobalPathAbsolute(root, outPathRaw)
+    let wrapperTemplate: str =
+        toolingBuildGlobalPathAbsolute(root, "src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_canonical.sh")
+    let realTemplate: str =
+        toolingBuildGlobalPathAbsolute(root, "src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_real.sh")
+    let realPrimaryTemplate: str =
+        toolingBuildGlobalPathAbsolute(root, "src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_real_bin.sh")
+    if !toolingBuildGlobalStrNonEmpty(outPath) || !toolingBuildGlobalStrNonEmpty(wrapperTemplate) ||
+       !toolingBuildGlobalStrNonEmpty(realTemplate) || !toolingBuildGlobalStrNonEmpty(realPrimaryTemplate):
+        return false
+    if !os.fileExists(wrapperTemplate) || !os.fileExists(realTemplate) || !os.fileExists(realPrimaryTemplate):
+        return false
+    let outDir: str = os.parentDir(outPath)
+    let realOut: str = os.joinPath(outDir, "cheng_tooling.real")
+    let realPrimaryOut: str = os.joinPath(outDir, "cheng_tooling.real.bin")
+    if !toolingBuildGlobalInstallTemplate(root, wrapperTemplate, outPath):
+        return false
+    if !toolingBuildGlobalInstallTemplate(root, realTemplate, realOut):
+        return false
+    if !toolingBuildGlobalInstallTemplate(root, realPrimaryTemplate, realPrimaryOut):
+        return false
+    return true

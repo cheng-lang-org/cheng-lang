@@ -1,10 +1,14 @@
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -16,24 +20,247 @@ typedef struct DriverUirSidecarHandle {
   char *compiler;
 } DriverUirSidecarHandle;
 
-static const char *driver_sidecar_default_stage0(void) {
-  return "/Users/lbcheng/cheng-lang/artifacts/backend_selfhost_self_obj/cheng_stage0_default";
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static int driver_sidecar_str_non_empty(const char *s) {
+  return s != NULL && s[0] != '\0';
 }
 
-static const char *driver_sidecar_default_repo_root(void) {
-  return "/Users/lbcheng/cheng-lang";
+static int driver_sidecar_copy_path(char *out, size_t out_size, const char *src) {
+  size_t n;
+  if (out == NULL || out_size == 0 || src == NULL) return 0;
+  n = strlen(src);
+  if (n + 1 > out_size) return 0;
+  memcpy(out, src, n + 1);
+  return 1;
 }
 
-static const char *driver_sidecar_default_preserved_attempt(void) {
-  return "/Users/lbcheng/cheng-lang/chengcache/backend_driver_build_tmp/cheng.attempt.1.40022495030416";
+static int driver_sidecar_join_path(char *out, size_t out_size,
+                                    const char *lhs, const char *rhs) {
+  size_t lhs_len;
+  size_t rhs_len;
+  size_t need;
+  if (out == NULL || out_size == 0 || lhs == NULL || rhs == NULL) return 0;
+  lhs_len = strlen(lhs);
+  rhs_len = strlen(rhs);
+  need = lhs_len + rhs_len + 2;
+  if (need > out_size) return 0;
+  memcpy(out, lhs, lhs_len);
+  if (lhs_len > 0 && lhs[lhs_len - 1] != '/') {
+    out[lhs_len] = '/';
+    lhs_len += 1;
+  }
+  memcpy(out + lhs_len, rhs, rhs_len);
+  out[lhs_len + rhs_len] = '\0';
+  return 1;
 }
 
-static const char *driver_sidecar_default_dist_release(void) {
-  return "/Users/lbcheng/cheng-lang/dist/releases/current/cheng";
+static int driver_sidecar_path_is_dir(const char *path) {
+  struct stat st;
+  if (!driver_sidecar_str_non_empty(path)) return 0;
+  if (stat(path, &st) != 0) return 0;
+  return S_ISDIR(st.st_mode);
 }
 
-static const char *driver_sidecar_default_canonical(void) {
-  return "/Users/lbcheng/cheng-lang/artifacts/backend_driver/cheng";
+static void driver_sidecar_parent_dir(char *path) {
+  size_t n;
+  if (!driver_sidecar_str_non_empty(path)) return;
+  n = strlen(path);
+  while (n > 1 && path[n - 1] == '/') {
+    path[n - 1] = '\0';
+    n -= 1;
+  }
+  while (n > 0 && path[n - 1] != '/') {
+    n -= 1;
+  }
+  if (n == 0) {
+    path[0] = '\0';
+    return;
+  }
+  while (n > 1 && path[n - 1] == '/') {
+    n -= 1;
+  }
+  path[n] = '\0';
+}
+
+static int driver_sidecar_make_absolute(const char *raw, char *out, size_t out_size) {
+  char cwd[PATH_MAX];
+  if (!driver_sidecar_str_non_empty(raw) || out == NULL || out_size == 0) return 0;
+  if (raw[0] == '/') return driver_sidecar_copy_path(out, out_size, raw);
+  if (getcwd(cwd, sizeof(cwd)) == NULL) return 0;
+  return driver_sidecar_join_path(out, out_size, cwd, raw);
+}
+
+static int driver_sidecar_has_repo_marker(const char *root) {
+  char marker[PATH_MAX];
+  if (!driver_sidecar_str_non_empty(root)) return 0;
+  if (!driver_sidecar_join_path(marker, sizeof(marker), root, "src/tooling/cheng_tooling.cheng")) {
+    return 0;
+  }
+  return access(marker, R_OK) == 0;
+}
+
+static int driver_sidecar_find_repo_root_from_path(const char *raw, char *out, size_t out_size) {
+  char probe[PATH_MAX];
+  int depth = 0;
+  if (!driver_sidecar_make_absolute(raw, probe, sizeof(probe))) return 0;
+  if (!driver_sidecar_path_is_dir(probe)) {
+    driver_sidecar_parent_dir(probe);
+  }
+  while (driver_sidecar_str_non_empty(probe) && depth < 16) {
+    if (driver_sidecar_has_repo_marker(probe)) {
+      return driver_sidecar_copy_path(out, out_size, probe);
+    }
+    driver_sidecar_parent_dir(probe);
+    depth += 1;
+  }
+  return 0;
+}
+
+static int driver_sidecar_resolve_repo_root(const char *input_path,
+                                            const char *compiler_path,
+                                            char *out,
+                                            size_t out_size) {
+  const char *env_root = getenv("BACKEND_UIR_SIDECAR_REPO_ROOT");
+  char cwd[PATH_MAX];
+  if (driver_sidecar_find_repo_root_from_path(env_root, out, out_size)) return 1;
+  env_root = getenv("TOOLING_ROOT");
+  if (driver_sidecar_find_repo_root_from_path(env_root, out, out_size)) return 1;
+  if (driver_sidecar_find_repo_root_from_path(input_path, out, out_size)) return 1;
+  if (driver_sidecar_find_repo_root_from_path(compiler_path, out, out_size)) return 1;
+  env_root = getenv("BACKEND_UIR_SIDECAR_COMPILER");
+  if (driver_sidecar_find_repo_root_from_path(env_root, out, out_size)) return 1;
+  env_root = getenv("PWD");
+  if (driver_sidecar_find_repo_root_from_path(env_root, out, out_size)) return 1;
+  if (getcwd(cwd, sizeof(cwd)) != NULL &&
+      driver_sidecar_find_repo_root_from_path(cwd, out, out_size)) {
+    return 1;
+  }
+  return 0;
+}
+
+static int driver_sidecar_build_repo_path(const char *input_path,
+                                          const char *compiler_path,
+                                          const char *relative_path,
+                                          char *out,
+                                          size_t out_size) {
+  char root[PATH_MAX];
+  if (!driver_sidecar_resolve_repo_root(input_path, compiler_path, root, sizeof(root))) return 0;
+  return driver_sidecar_join_path(out, out_size, root, relative_path);
+}
+
+static const char *driver_sidecar_default_stage0_for_input(const char *input_path,
+                                                           const char *compiler_path) {
+  static char path[PATH_MAX];
+  if (!driver_sidecar_build_repo_path(input_path, compiler_path,
+                                      "artifacts/backend_selfhost_self_obj/cheng_stage0_default",
+                                      path, sizeof(path))) {
+    return NULL;
+  }
+  return path;
+}
+
+static int driver_sidecar_find_latest_preserved_attempt(const char *input_path,
+                                                        const char *compiler_path,
+                                                        char *out,
+                                                        size_t out_size) {
+  char dir_path[PATH_MAX];
+  DIR *dir;
+  struct dirent *entry;
+  struct stat st;
+  time_t best_mtime = (time_t)0;
+  int found = 0;
+  if (!driver_sidecar_build_repo_path(input_path, compiler_path,
+                                      "chengcache/backend_driver_build_tmp",
+                                      dir_path, sizeof(dir_path))) {
+    return 0;
+  }
+  dir = opendir(dir_path);
+  if (dir == NULL) return 0;
+  while ((entry = readdir(dir)) != NULL) {
+    char candidate[PATH_MAX];
+    if (strncmp(entry->d_name, "cheng.attempt.", 14) != 0) continue;
+    if (!driver_sidecar_join_path(candidate, sizeof(candidate), dir_path, entry->d_name)) continue;
+    if (access(candidate, X_OK) != 0) continue;
+    if (stat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    if (!found || st.st_mtime > best_mtime) {
+      if (!driver_sidecar_copy_path(out, out_size, candidate)) continue;
+      best_mtime = st.st_mtime;
+      found = 1;
+    }
+  }
+  closedir(dir);
+  return found;
+}
+
+static const char *driver_sidecar_default_preserved_attempt_for_input(const char *input_path,
+                                                                      const char *compiler_path) {
+  static char path[PATH_MAX];
+  if (!driver_sidecar_find_latest_preserved_attempt(input_path, compiler_path,
+                                                    path, sizeof(path))) {
+    return NULL;
+  }
+  return path;
+}
+
+static const char *driver_sidecar_default_currentsrc_proof_stage0_for_input(
+    const char *input_path, const char *compiler_path) {
+  static char path[PATH_MAX];
+  if (!driver_sidecar_build_repo_path(
+          input_path, compiler_path,
+          "artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof",
+          path, sizeof(path))) {
+    return NULL;
+  }
+  return path;
+}
+
+static const char *driver_sidecar_default_currentsrc_proof_outer_for_input(
+    const char *input_path, const char *compiler_path) {
+  static char path[PATH_MAX];
+  if (!driver_sidecar_build_repo_path(
+          input_path, compiler_path,
+          "artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2",
+          path, sizeof(path))) {
+    return NULL;
+  }
+  return path;
+}
+
+static const char *driver_sidecar_default_dist_release_for_input(const char *input_path,
+                                                                 const char *compiler_path) {
+  static char path[PATH_MAX];
+  if (!driver_sidecar_build_repo_path(input_path, compiler_path,
+                                      "dist/releases/current/cheng",
+                                      path, sizeof(path))) {
+    return NULL;
+  }
+  return path;
+}
+
+static const char *driver_sidecar_default_preferred_release_for_input(
+    const char *input_path, const char *compiler_path) {
+  static char path[PATH_MAX];
+  if (!driver_sidecar_build_repo_path(
+          input_path, compiler_path,
+          "dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng",
+          path, sizeof(path))) {
+    return NULL;
+  }
+  return path;
+}
+
+static const char *driver_sidecar_default_canonical_for_input(const char *input_path,
+                                                              const char *compiler_path) {
+  static char path[PATH_MAX];
+  if (!driver_sidecar_build_repo_path(input_path, compiler_path,
+                                      "artifacts/backend_driver/cheng",
+                                      path, sizeof(path))) {
+    return NULL;
+  }
+  return path;
 }
 
 static const char *driver_sidecar_mode(void) {
@@ -73,6 +300,38 @@ static int driver_sidecar_target_is_darwin(const char *target) {
 static int driver_sidecar_should_prefer_preserved_attempt(const char *input_path) {
   if (input_path == NULL || input_path[0] == '\0') return 0;
   return strstr(input_path, "/src/tooling/cheng_tooling.cheng") != NULL;
+}
+
+static int driver_sidecar_should_prefer_currentsrc_proof_child(const char *input_path) {
+  if (input_path == NULL || input_path[0] == '\0') return 0;
+  return strstr(input_path, "/src/backend/tooling/backend_driver_proof.cheng") != NULL;
+}
+
+static int driver_sidecar_compiler_requires_outer_cli_mode(const char *compiler) {
+  if (compiler == NULL || compiler[0] == '\0') return 0;
+  return strstr(
+             compiler,
+             "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof") != NULL;
+}
+
+static int driver_sidecar_compiler_prefers_currentsrc_outer(const char *compiler) {
+  return driver_sidecar_compiler_requires_outer_cli_mode(compiler);
+}
+
+static int driver_sidecar_compiler_is_currentsrc_proof_lineage(const char *compiler) {
+  if (compiler == NULL || compiler[0] == '\0') return 0;
+  if (strstr(
+          compiler,
+          "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2") != NULL) {
+    return 1;
+  }
+  return driver_sidecar_compiler_requires_outer_cli_mode(compiler);
+}
+
+static int driver_sidecar_compiler_supports_new_expr_assignments(const char *compiler) {
+  if (compiler == NULL || compiler[0] == '\0') return 0;
+  if (driver_sidecar_compiler_is_currentsrc_proof_lineage(compiler)) return 1;
+  return 0;
 }
 
 static char *driver_sidecar_dup(const char *s) {
@@ -503,7 +762,6 @@ static char *driver_sidecar_rewrite_generic_ref_types(const char *src, int *chan
         char *alias_suffix = NULL;
         char *alias_name = NULL;
         char *needle = NULL;
-        char *repl = NULL;
         char *field_scan_text;
         if ((q > src && driver_sidecar_is_ident_char(q[-1])) || *after_name != '[') {
           q = q + 1;
@@ -674,7 +932,9 @@ static char *driver_sidecar_rewrite_generic_ref_types(const char *src, int *chan
   return driver_sidecar_dup(src);
 }
 
-static char *driver_sidecar_prepare_rewritten_input(const char *input_path, int *used_out) {
+static char *driver_sidecar_prepare_rewritten_input(const char *input_path,
+                                                    const char *compiler,
+                                                    int *used_out) {
   char *text;
   char *tmp;
   char *next;
@@ -687,10 +947,12 @@ static char *driver_sidecar_prepare_rewritten_input(const char *input_path, int 
   free(text);
   if (next == NULL) return NULL;
   text = next;
-  next = driver_sidecar_rewrite_new_expr_assignments(text, &changed_new);
-  free(text);
-  if (next == NULL) return NULL;
-  text = next;
+  if (!driver_sidecar_compiler_supports_new_expr_assignments(compiler)) {
+    next = driver_sidecar_rewrite_new_expr_assignments(text, &changed_new);
+    free(text);
+    if (next == NULL) return NULL;
+    text = next;
+  }
   if (!changed_generic && !changed_new) {
     if (used_out != NULL) *used_out = 0;
     free(text);
@@ -704,30 +966,50 @@ static char *driver_sidecar_prepare_rewritten_input(const char *input_path, int 
 
 static const char *driver_sidecar_pick_compiler_for_input(const char *input_path) {
   const char *env_path = getenv("BACKEND_UIR_SIDECAR_COMPILER");
+  const char *currentsrc_stage0;
+  const char *preserved_attempt;
+  const char *preferred_release_path;
+  const char *stage0_path;
+  const char *canonical_path;
+  const char *dist_release_path;
   if (env_path != NULL && env_path[0] != '\0' && access(env_path, X_OK) == 0) {
     return env_path;
   }
   /*
    * Sidecar child compiles run with BACKEND_UIR_SIDECAR_DISABLE=1. For
-   * cheng_tooling self-rebuilds, prefer a preserved direct-path attempt over
-   * older stage0 releases; keep the default stage0-first order for ordinary
-   * user/module compiles so existing runtime gates keep their current behavior.
+   * tooling self-rebuilds, prefer preserved/default direct-path compilers over
+   * the heavier current-source proof child. Keep proof-child preference only
+   * for proof-surface inputs that actually require that lineage.
    */
+  currentsrc_stage0 = driver_sidecar_default_currentsrc_proof_stage0_for_input(input_path, env_path);
+  if (driver_sidecar_should_prefer_currentsrc_proof_child(input_path) &&
+      currentsrc_stage0 != NULL && access(currentsrc_stage0, X_OK) == 0) {
+    return currentsrc_stage0;
+  }
+  preserved_attempt = driver_sidecar_default_preserved_attempt_for_input(input_path, env_path);
   if (driver_sidecar_should_prefer_preserved_attempt(input_path) &&
-      access(driver_sidecar_default_preserved_attempt(), X_OK) == 0) {
-    return driver_sidecar_default_preserved_attempt();
+      preserved_attempt != NULL && access(preserved_attempt, X_OK) == 0) {
+    return preserved_attempt;
   }
-  if (access(driver_sidecar_default_stage0(), X_OK) == 0) {
-    return driver_sidecar_default_stage0();
+  preferred_release_path =
+      driver_sidecar_default_preferred_release_for_input(input_path, env_path);
+  if (preferred_release_path != NULL && access(preferred_release_path, X_OK) == 0) {
+    return preferred_release_path;
   }
-  if (access(driver_sidecar_default_preserved_attempt(), X_OK) == 0) {
-    return driver_sidecar_default_preserved_attempt();
+  canonical_path = driver_sidecar_default_canonical_for_input(input_path, env_path);
+  if (canonical_path != NULL && access(canonical_path, X_OK) == 0) {
+    return canonical_path;
   }
-  if (access(driver_sidecar_default_canonical(), X_OK) == 0) {
-    return driver_sidecar_default_canonical();
+  dist_release_path = driver_sidecar_default_dist_release_for_input(input_path, env_path);
+  if (dist_release_path != NULL && access(dist_release_path, X_OK) == 0) {
+    return dist_release_path;
   }
-  if (access(driver_sidecar_default_dist_release(), X_OK) == 0) {
-    return driver_sidecar_default_dist_release();
+  stage0_path = driver_sidecar_default_stage0_for_input(input_path, env_path);
+  if (stage0_path != NULL && access(stage0_path, X_OK) == 0) {
+    return stage0_path;
+  }
+  if (preserved_attempt != NULL && access(preserved_attempt, X_OK) == 0) {
+    return preserved_attempt;
   }
   return NULL;
 }
@@ -773,6 +1055,28 @@ static const char *driver_sidecar_env_or_default(const char *name, const char *f
   return fallback;
 }
 
+static DriverSidecarEnvOverride *driver_sidecar_find_override(DriverSidecarEnvOverride *overrides,
+                                                              size_t override_count,
+                                                              const char *name) {
+  size_t i;
+  if (overrides == NULL || name == NULL) return NULL;
+  for (i = 0; i < override_count; i += 1) {
+    if (strcmp(overrides[i].name, name) == 0) return &overrides[i];
+  }
+  return NULL;
+}
+
+static int driver_sidecar_set_override_value(DriverSidecarEnvOverride *overrides,
+                                             size_t override_count,
+                                             const char *name,
+                                             const char *value) {
+  DriverSidecarEnvOverride *slot =
+      driver_sidecar_find_override(overrides, override_count, name);
+  if (slot == NULL) return 0;
+  slot->value = (value != NULL) ? value : "";
+  return 1;
+}
+
 static char **driver_sidecar_build_envp(const DriverSidecarEnvOverride *overrides,
                                         size_t override_count,
                                         char ***owned_pairs_out) {
@@ -807,6 +1111,16 @@ static char **driver_sidecar_build_envp(const DriverSidecarEnvOverride *override
     }
   }
   for (i = 0; i < override_count; i += 1) {
+    if (overrides[i].name == NULL || overrides[i].value == NULL) {
+      fprintf(stderr,
+              "[backend_driver sidecar] invalid override[%zu] name=%p value=%p\n",
+              i, (void *)overrides[i].name, (void *)overrides[i].value);
+      size_t fi;
+      for (fi = 0; fi < i; fi += 1) free(owned_pairs[fi]);
+      free(owned_pairs);
+      free(envp);
+      return NULL;
+    }
     owned_pairs[i] = driver_sidecar_env_pair(overrides[i].name, overrides[i].value);
     if (owned_pairs[i] == NULL) {
       size_t fi;
@@ -838,13 +1152,17 @@ static int32_t driver_sidecar_patch_macho_cstrings(const DriverUirSidecarHandle 
   pid_t pid;
   int status = 0;
   int spawn_rc;
-  const char *repo_root = driver_sidecar_default_repo_root();
   const char *script_path;
   const char *python_bin;
+  char repo_root[PATH_MAX];
   char script_buf[1024];
   char *argv[9];
   if (h == NULL || out_path == NULL || out_path[0] == '\0') return 0;
   if (!driver_sidecar_target_is_darwin(final_target)) return 0;
+  if (!driver_sidecar_resolve_repo_root(h->input_path, h->compiler, repo_root, sizeof(repo_root))) {
+    fprintf(stderr, "[backend_driver sidecar] unable to resolve repo root for cstring patch\n");
+    return 2;
+  }
   script_path = getenv("BACKEND_UIR_SIDECAR_CSTRING_PATCHER");
   if (script_path == NULL || script_path[0] == '\0') {
     snprintf(script_buf, sizeof(script_buf), "%s/scripts/gen_cstring_compat_obj.py", repo_root);
@@ -891,6 +1209,40 @@ static int32_t driver_sidecar_patch_macho_cstrings(const DriverUirSidecarHandle 
   return 2;
 }
 
+static void driver_sidecar_write_fallback_compile_stamp(const DriverUirSidecarHandle *h,
+                                                        const char *final_target,
+                                                        const char *compiler,
+                                                        const char *generic_mode,
+                                                        const char *generic_lowering) {
+  const char *stamp_path = getenv("BACKEND_COMPILE_STAMP_OUT");
+  const char *frontend = getenv("BACKEND_FRONTEND");
+  const char *borrow_ir = getenv("BORROW_IR");
+  const char *input_path = "";
+  struct stat st;
+  FILE *fp;
+  if (stamp_path == NULL || stamp_path[0] == '\0') return;
+  if (compiler == NULL || !driver_sidecar_compiler_is_currentsrc_proof_lineage(compiler)) return;
+  if (stat(stamp_path, &st) == 0 && st.st_size > 0) return;
+  if (h != NULL && h->input_path != NULL) input_path = h->input_path;
+  if (frontend == NULL || frontend[0] == '\0') frontend = "stage1";
+  if (borrow_ir == NULL) borrow_ir = "";
+  if (generic_mode == NULL || generic_mode[0] == '\0') generic_mode = "dict";
+  if (generic_lowering == NULL || generic_lowering[0] == '\0') generic_lowering = "mir_dict";
+  fp = fopen(stamp_path, "w");
+  if (fp == NULL) return;
+  fprintf(fp, "target=%s\n", final_target != NULL ? final_target : "");
+  fprintf(fp, "frontend=%s\n", frontend);
+  fprintf(fp, "input=%s\n", input_path);
+  fprintf(fp, "generic_mode=%s\n", generic_mode);
+  fprintf(fp, "generic_spec_budget=0\n");
+  fprintf(fp, "borrow_ir=%s\n", borrow_ir);
+  fprintf(fp, "generic_lowering=%s\n", generic_lowering);
+  fprintf(fp, "stage1_skip_ownership_effective=0\n");
+  fprintf(fp, "stage1_skip_ownership_default=0\n");
+  fprintf(fp, "uir_phase_contract_version=p4_phase_v1\n");
+  fclose(fp);
+}
+
 static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
                                                const char *target,
                                                const char *out_path) {
@@ -899,7 +1251,13 @@ static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
   int spawn_rc;
   const char *compiler;
   const char *final_target;
-  char *argv[] = {NULL, NULL};
+  const char *final_generic_mode;
+  const char *final_generic_lowering;
+  const char *final_jobs;
+  const char *outer_sidecar_compiler = NULL;
+  int outer_cli_mode = 0;
+  char *argv[] = {NULL, NULL, NULL, NULL};
+  char *output_arg = NULL;
   char **envp = NULL;
   char **owned_pairs = NULL;
   DriverSidecarEnvOverride overrides[] = {
@@ -909,6 +1267,8 @@ static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
       {"BACKEND_UIR_SIDECAR_OBJ", "/__cheng_sidecar_disabled__.o"},
       {"BACKEND_UIR_SIDECAR_BUNDLE", "/__cheng_sidecar_disabled__.bundle"},
       {"BACKEND_UIR_SIDECAR_COMPILER", ""},
+      {"BACKEND_UIR_PREFER_SIDECAR", "0"},
+      {"BACKEND_UIR_FORCE_SIDECAR", "0"},
       {"STAGE1_STD_NO_POINTERS", "0"},
       {"STAGE1_STD_NO_POINTERS_STRICT", "0"},
       {"STAGE1_NO_POINTERS_NON_C_ABI", "0"},
@@ -973,34 +1333,129 @@ static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
   final_target = (target != NULL && target[0] != '\0')
       ? target
       : ((h->target != NULL && h->target[0] != '\0') ? h->target : "arm64-apple-darwin");
-  overrides[18].value = driver_sidecar_env_or_default("BACKEND_STAGE1_PARSE_MODE", "outline");
-  overrides[19].value = driver_sidecar_env_or_default("BACKEND_FN_SCHED", "ws");
-  overrides[20].value = driver_sidecar_env_or_default("BACKEND_DIRECT_EXE", "0");
-  overrides[21].value = driver_sidecar_env_or_default("BACKEND_LINKERLESS_INMEM", "0");
-  overrides[23].value = driver_sidecar_env_or_default("BACKEND_MULTI", "0");
-  overrides[24].value = driver_sidecar_env_or_default("BACKEND_MULTI_FORCE", "0");
-  overrides[28].value = driver_sidecar_env_or_default("BACKEND_INCREMENTAL", "0");
-  overrides[29].value = driver_sidecar_env_or_default("BACKEND_JOBS", "1");
-  overrides[30].value = driver_sidecar_env_or_default("BACKEND_FN_JOBS", overrides[29].value);
-  overrides[32].value = driver_sidecar_env_or_default("BACKEND_OPT_LEVEL", "0");
-  overrides[33].value = driver_sidecar_env_or_default("BACKEND_OPT", "0");
-  overrides[34].value = driver_sidecar_env_or_default("BACKEND_OPT2", "0");
-  overrides[38].value = driver_sidecar_env_or_default("GENERIC_MODE", "dict");
-  overrides[39].value = driver_sidecar_env_or_default("GENERIC_SPEC_BUDGET", "0");
-  overrides[40].value = driver_sidecar_env_or_default("GENERIC_LOWERING", "mir_dict");
-  overrides[46].value = "system";
-  overrides[50].value = "obj";
-  overrides[override_count - 3].value = final_target;
-  overrides[override_count - 2].value = (h->input_path != NULL) ? h->input_path : "";
-  overrides[override_count - 1].value = out_path;
+  outer_cli_mode = driver_sidecar_compiler_requires_outer_cli_mode(compiler);
+  if (outer_cli_mode) {
+    const char *currentsrc_outer =
+        driver_sidecar_default_currentsrc_proof_outer_for_input(h->input_path, compiler);
+    const char *stage0_path = driver_sidecar_default_stage0_for_input(h->input_path, compiler);
+    outer_sidecar_compiler = getenv("BACKEND_UIR_SIDECAR_COMPILER");
+    if (outer_sidecar_compiler == NULL || outer_sidecar_compiler[0] == '\0' ||
+        strcmp(outer_sidecar_compiler, compiler) == 0 ||
+        driver_sidecar_compiler_requires_outer_cli_mode(outer_sidecar_compiler)) {
+      if (driver_sidecar_compiler_prefers_currentsrc_outer(compiler) &&
+          currentsrc_outer != NULL && access(currentsrc_outer, X_OK) == 0) {
+        outer_sidecar_compiler = currentsrc_outer;
+      } else {
+        outer_sidecar_compiler = (stage0_path != NULL) ? stage0_path : compiler;
+      }
+    }
+    if (!driver_sidecar_set_override_value(overrides, override_count,
+                                           "BACKEND_UIR_SIDECAR_DISABLE", "") ||
+        !driver_sidecar_set_override_value(overrides, override_count,
+                                           "BACKEND_UIR_SIDECAR_OBJ", "") ||
+        !driver_sidecar_set_override_value(overrides, override_count,
+                                           "BACKEND_UIR_SIDECAR_BUNDLE", "") ||
+        !driver_sidecar_set_override_value(overrides, override_count,
+                                           "BACKEND_UIR_SIDECAR_COMPILER",
+                                           outer_sidecar_compiler)) {
+      fprintf(stderr, "[backend_driver sidecar] override map mismatch (outer cli)\n");
+      return 2;
+    }
+  }
+  if (!driver_sidecar_set_override_value(overrides, override_count,
+                                         "BACKEND_STAGE1_PARSE_MODE",
+                                         driver_sidecar_env_or_default("BACKEND_STAGE1_PARSE_MODE",
+                                                                       "outline")) ||
+      !driver_sidecar_set_override_value(overrides, override_count,
+                                         "BACKEND_FN_SCHED",
+                                         driver_sidecar_env_or_default("BACKEND_FN_SCHED", "ws")) ||
+      !driver_sidecar_set_override_value(overrides, override_count,
+                                         "BACKEND_DIRECT_EXE",
+                                         driver_sidecar_env_or_default("BACKEND_DIRECT_EXE", "0")) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_LINKERLESS_INMEM",
+          driver_sidecar_env_or_default("BACKEND_LINKERLESS_INMEM", "0")) ||
+      !driver_sidecar_set_override_value(overrides, override_count,
+                                         "BACKEND_MULTI",
+                                         driver_sidecar_env_or_default("BACKEND_MULTI", "0")) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_MULTI_FORCE",
+          driver_sidecar_env_or_default("BACKEND_MULTI_FORCE", "0")) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_INCREMENTAL",
+          driver_sidecar_env_or_default("BACKEND_INCREMENTAL", "0"))) {
+    fprintf(stderr, "[backend_driver sidecar] override map mismatch (core env)\n");
+    return 2;
+  }
+  if (driver_sidecar_compiler_is_currentsrc_proof_lineage(compiler)) {
+    final_jobs = driver_sidecar_env_or_default("BACKEND_JOBS", "");
+  } else {
+    final_jobs = driver_sidecar_env_or_default("BACKEND_JOBS", outer_cli_mode ? "0" : "1");
+  }
+  if (!driver_sidecar_set_override_value(overrides, override_count, "BACKEND_JOBS", final_jobs) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_FN_JOBS",
+          driver_sidecar_env_or_default("BACKEND_FN_JOBS", final_jobs)) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_OPT_LEVEL",
+          driver_sidecar_env_or_default("BACKEND_OPT_LEVEL", "0")) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_OPT",
+          driver_sidecar_env_or_default("BACKEND_OPT", "0")) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_OPT2",
+          driver_sidecar_env_or_default("BACKEND_OPT2", "0"))) {
+    fprintf(stderr, "[backend_driver sidecar] override map mismatch (jobs/opt env)\n");
+    return 2;
+  }
+  final_generic_mode = driver_sidecar_env_or_default("GENERIC_MODE", "dict");
+  if (driver_sidecar_compiler_is_currentsrc_proof_lineage(compiler)) {
+    final_generic_lowering = "mir_dict";
+  } else {
+    final_generic_lowering = driver_sidecar_env_or_default("GENERIC_LOWERING", "mir_dict");
+  }
+  if (!driver_sidecar_set_override_value(overrides, override_count, "GENERIC_MODE",
+                                         final_generic_mode) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "GENERIC_SPEC_BUDGET",
+          driver_sidecar_env_or_default("GENERIC_SPEC_BUDGET", "0")) ||
+      !driver_sidecar_set_override_value(overrides, override_count, "GENERIC_LOWERING",
+                                         final_generic_lowering) ||
+      !driver_sidecar_set_override_value(overrides, override_count, "BACKEND_LINKER", "system") ||
+      !driver_sidecar_set_override_value(overrides, override_count, "BACKEND_EMIT", "obj") ||
+      !driver_sidecar_set_override_value(overrides, override_count, "BACKEND_TARGET",
+                                         final_target) ||
+      !driver_sidecar_set_override_value(
+          overrides, override_count, "BACKEND_INPUT",
+          (h->input_path != NULL) ? h->input_path : "") ||
+      !driver_sidecar_set_override_value(overrides, override_count, "BACKEND_OUTPUT",
+                                         out_path)) {
+    fprintf(stderr, "[backend_driver sidecar] override map mismatch (io env)\n");
+    return 2;
+  }
   envp = driver_sidecar_build_envp(overrides, override_count, &owned_pairs);
   if (envp == NULL) {
     fprintf(stderr, "[backend_driver sidecar] envp build failed\n");
     return 2;
   }
   argv[0] = (char *)compiler;
-  argv[1] = NULL;
+  if (outer_cli_mode) {
+    size_t output_need = strlen("--output:") + strlen(out_path) + 1u;
+    output_arg = (char *)calloc(output_need, 1u);
+    if (output_arg == NULL) {
+      driver_sidecar_free_envp(envp, owned_pairs, override_count);
+      fprintf(stderr, "[backend_driver sidecar] alloc failed for outer cli output arg\n");
+      return 2;
+    }
+    snprintf(output_arg, output_need, "--output:%s", out_path);
+    argv[1] = (char *)((h->input_path != NULL) ? h->input_path : "");
+    argv[2] = output_arg;
+    argv[3] = NULL;
+  } else {
+    argv[1] = NULL;
+  }
   spawn_rc = posix_spawn(&pid, compiler, NULL, NULL, argv, envp);
+  free(output_arg);
   driver_sidecar_free_envp(envp, owned_pairs, override_count);
   if (spawn_rc != 0) {
     fprintf(stderr, "[backend_driver sidecar] spawn failed: %s\n", strerror(spawn_rc));
@@ -1016,6 +1471,8 @@ static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
   if (WIFEXITED(status)) {
     int32_t rc = (int32_t)WEXITSTATUS(status);
     if (rc != 0) return rc;
+    driver_sidecar_write_fallback_compile_stamp(
+        h, final_target, compiler, final_generic_mode, final_generic_lowering);
     rc = driver_sidecar_patch_macho_cstrings(h, final_target, out_path);
     return rc;
   }
@@ -1040,7 +1497,7 @@ void *driver_buildActiveModulePtrs(void *input_raw, void *target_raw) {
   }
   h = (DriverUirSidecarHandle *)calloc(1, sizeof(DriverUirSidecarHandle));
   if (h == NULL) return NULL;
-  rewrite_path = driver_sidecar_prepare_rewritten_input(input_text, &rewrite_used);
+  rewrite_path = driver_sidecar_prepare_rewritten_input(input_text, compiler, &rewrite_used);
   if (rewrite_used && rewrite_path == NULL) {
     driver_sidecar_free_handle(h);
     return NULL;

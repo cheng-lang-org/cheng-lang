@@ -1,0 +1,128 @@
+import std/os
+import std/strutils as strutil
+import std/strings
+
+fn toolingPathHelpersStrNonEmpty(text: str): bool =
+    return len(text) > 0
+
+fn toolingPathHelpersIsAsciiSpace(ch: char): bool =
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+
+fn toolingPathHelpersTrimAsciiSpace(raw: str): str =
+    if !toolingPathHelpersStrNonEmpty(raw):
+        return ""
+    let n: int32 = len(raw)
+    if n <= 0:
+        return ""
+    var start: int32 = 0
+    while start < n && toolingPathHelpersIsAsciiSpace(raw[start]):
+        start = start + 1
+    if start >= n:
+        return ""
+    var stop: int32 = n - 1
+    while stop >= start && toolingPathHelpersIsAsciiSpace(raw[stop]):
+        stop = stop - 1
+    if start == 0 && stop == n - 1:
+        return raw
+    return strings.sliceBytes(raw, start, stop - start + 1)
+
+fn toolingPathHelpersShellQuote(raw: str): str =
+    if len(raw) == 0:
+        return "\"\""
+    var escaped: str = strutil.replace(raw, "\\", "\\\\")
+    escaped = strutil.replace(escaped, "$", "\\$")
+    escaped = strutil.replace(escaped, "`", "\\`")
+    escaped = strutil.replace(escaped, "\"", "\\\"")
+    return "\"" + escaped + "\""
+
+fn toolingJoinPathSimple(baseRaw: str, relRaw: str): str =
+    let base: str = toolingPathHelpersTrimAsciiSpace(baseRaw)
+    let rel: str = toolingPathHelpersTrimAsciiSpace(relRaw)
+    if !toolingPathHelpersStrNonEmpty(base):
+        return rel
+    if !toolingPathHelpersStrNonEmpty(rel):
+        return base
+    if strutil.startsWith(rel, "/") || strutil.startsWith(rel, "\\"):
+        return base + rel
+    let n: int32 = len(base)
+    if n > 0:
+        let tail: char = base[n - 1]
+        if tail == '/' || tail == '\\':
+            return base + rel
+    return base + "/" + rel
+
+fn toolingPathAbsolute(root: str, raw: str): str =
+    let text: str = toolingPathHelpersTrimAsciiSpace(raw)
+    if !toolingPathHelpersStrNonEmpty(text):
+        return ""
+    if os.isAbsolute(text):
+        return text
+    if strutil.startsWith(text, "./") || strutil.startsWith(text, "../"):
+        return os.absolutePath(text)
+    return toolingJoinPathSimple(root, text)
+
+fn toolingPathExists(path: str): bool =
+    if !toolingPathHelpersStrNonEmpty(path):
+        return false
+    if os.fileExists(path):
+        return true
+    if os.dirExists(path):
+        return true
+    return false
+
+fn toolingFileExistsNonEmpty(pathRaw: str): bool =
+    let path: str = toolingPathHelpersTrimAsciiSpace(pathRaw)
+    if !toolingPathHelpersStrNonEmpty(path) || !os.fileExists(path):
+        return false
+    return os.fileSize(path) > int64(0)
+
+fn toolingFileIsNewer(root: str, lhsRaw: str, rhsRaw: str): bool =
+    let lhs: str = toolingPathAbsolute(root, lhsRaw)
+    let rhs: str = toolingPathAbsolute(root, rhsRaw)
+    if !toolingPathHelpersStrNonEmpty(lhs) || !toolingPathHelpersStrNonEmpty(rhs):
+        return false
+    if !os.fileExists(lhs) || !os.fileExists(rhs):
+        return false
+    let cmd: str = "[ " + toolingPathHelpersShellQuote(lhs) + " -nt " + toolingPathHelpersShellQuote(rhs) + " ]"
+    let opts: uint64 = uint64(7)
+    let res: os.ExecCmdResult = os.execCmdEx(cmd, opts, root)
+    return os.execCmdResultExitCode(res) == 0
+
+fn toolingScriptShell(root: str, scriptPath: str): str =
+    let path: str = toolingPathAbsolute(root, scriptPath)
+    if !toolingPathHelpersStrNonEmpty(path) || !os.fileExists(path):
+        return "sh"
+    let text: str = os.readFile(path)
+    if !toolingPathHelpersStrNonEmpty(text):
+        return "sh"
+    return toolingScriptShellFromText(text)
+
+fn toolingScriptShellFromText(scriptText: str): str =
+    if !toolingPathHelpersStrNonEmpty(scriptText):
+        return "sh"
+    var probeLen: int32 = len(scriptText)
+    if probeLen > 160:
+        probeLen = 160
+    let probe: str = strings.sliceBytes(scriptText, 0, probeLen)
+    let lower: str = strutil.toLowerAscii(strutil.strip(probe))
+    if strutil.startsWith(lower, "#!/usr/bin/env bash") || strutil.startsWith(lower, "#!/bin/bash"):
+        return "bash"
+    return "sh"
+
+fn toolingProgramBaseName(raw0: str): str =
+    let raw: str = toolingPathHelpersTrimAsciiSpace(raw0)
+    if !toolingPathHelpersStrNonEmpty(raw):
+        return "cheng_tooling"
+    let parts: os.SplitFileResult = os.splitFile(raw)
+    if toolingPathHelpersStrNonEmpty(parts.name):
+        return parts.name
+    return raw
+
+fn toolingFileName(pathRaw: str): str =
+    let path: str = toolingPathHelpersTrimAsciiSpace(pathRaw)
+    if !toolingPathHelpersStrNonEmpty(path):
+        return ""
+    let parts: os.SplitFileResult = os.splitFile(path)
+    if toolingPathHelpersStrNonEmpty(parts.name):
+        return parts.name + parts.ext
+    return path

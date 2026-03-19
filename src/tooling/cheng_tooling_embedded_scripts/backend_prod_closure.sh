@@ -8,10 +8,14 @@ cd "$root"
 
 native_bin="${TOOLING_NATIVE_BIN:-}"
 if [ "$native_bin" = "" ]; then
-  if [ -x "$root/artifacts/tooling_bundle/full/cheng_tooling" ]; then
-    native_bin="$root/artifacts/tooling_bundle/full/cheng_tooling"
-  elif [ -x "$root/artifacts/tooling_bundle/core/cheng_tooling_global" ]; then
+  if [ -x "$root/artifacts/tooling_bundle/core/cheng_tooling_global" ]; then
     native_bin="$root/artifacts/tooling_bundle/core/cheng_tooling_global"
+  elif [ -x "$root/artifacts/tooling_cmd/cheng_tooling.real.bin" ]; then
+    native_bin="$root/artifacts/tooling_cmd/cheng_tooling.real.bin"
+  elif [ -x "$root/artifacts/tooling_bundle/full/cheng_tooling" ]; then
+    native_bin="$root/artifacts/tooling_bundle/full/cheng_tooling"
+  elif [ -x "$root/artifacts/tooling_cmd/cheng_tooling" ]; then
+    native_bin="$root/artifacts/tooling_cmd/cheng_tooling"
   else
     echo "[backend_prod_closure] missing native tooling binary" 1>&2
     exit 1

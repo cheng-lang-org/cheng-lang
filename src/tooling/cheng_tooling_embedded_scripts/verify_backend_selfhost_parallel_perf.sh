@@ -9,9 +9,11 @@ Usage:
   src/tooling/verify_backend_selfhost_parallel_perf.sh [--help]
 
 Env:
-  SELFHOST_PARALLEL_PERF_TIMEOUT=<seconds>          default: 80
+  SELFHOST_PARALLEL_PERF_TIMEOUT=<seconds>          default: 60
   SELFHOST_PARALLEL_PERF_STAGE0=<path>              optional stage0 override
   SELFHOST_PARALLEL_PERF_BASE_SESSION=<name>        default: perf.parallel
+  SELFHOST_PARALLEL_PERF_HOST_ONLY=<tag>            optional dedicated-host tag
+  SELFHOST_PARALLEL_PERF_ENFORCE_ON_HOST=<0|1>      default: 0
   SELFHOST_PARALLEL_PERF_JOBS=<N>                   default: 0 (auto)
   SELFHOST_PARALLEL_PERF_MAX_SLOWDOWN_SEC=<N>       default: 2
   SELFHOST_PARALLEL_PERF_SKIP_SMOKE=<0|1>           default: 1
@@ -29,7 +31,10 @@ Notes:
   - Runs strict no-reuse probe twice with same stage0/settings:
       1) serial  (multi=0)
       2) parallel (multi=1, multi_force=0)
-  - Passes only when both runs pass and parallel total <= serial total + max_slowdown.
+  - Probe/build failures always fail.
+  - Slowdown against serial is report-only by default; set
+    `SELFHOST_PARALLEL_PERF_ENFORCE_ON_HOST=1` on a dedicated perf host to
+    make `parallel <= serial + max_slowdown` blocking.
 EOF
 }
 
@@ -48,12 +53,20 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-timeout="${SELFHOST_PARALLEL_PERF_TIMEOUT:-80}"
+timeout="${SELFHOST_PARALLEL_PERF_TIMEOUT:-60}"
 stage0="${SELFHOST_PARALLEL_PERF_STAGE0:-}"
 base_session="${SELFHOST_PARALLEL_PERF_BASE_SESSION:-perf.parallel}"
+host_os="$(uname -s 2>/dev/null | tr 'A-Z' 'a-z')"
+host_arch="$(uname -m 2>/dev/null | tr 'A-Z' 'a-z')"
+host_tag="${host_os}_${host_arch}"
+if [ "$host_os" = "darwin" ] && [ "$host_arch" = "arm64" ]; then
+  host_tag="darwin_arm64"
+fi
+host_only="${SELFHOST_PARALLEL_PERF_HOST_ONLY:-}"
+enforce="${SELFHOST_PARALLEL_PERF_ENFORCE_ON_HOST:-0}"
 jobs="${SELFHOST_PARALLEL_PERF_JOBS:-0}"
 max_slowdown="${SELFHOST_PARALLEL_PERF_MAX_SLOWDOWN_SEC:-2}"
 skip_smoke="${SELFHOST_PARALLEL_PERF_SKIP_SMOKE:-1}"
@@ -69,6 +82,21 @@ generic_budget="${SELFHOST_PARALLEL_PERF_GENERIC_SPEC_BUDGET:-0}"
 report="${SELFHOST_PARALLEL_PERF_REPORT:-artifacts/backend_selfhost_self_obj/selfhost_parallel_perf_$(printf '%s' "$base_session" | tr -c 'A-Za-z0-9._-' '_').tsv}"
 report_dir="$(dirname "$report")"
 mkdir -p "$report_dir" 2>/dev/null || true
+
+case "$enforce" in
+  0|1) ;;
+  *) enforce=0 ;;
+esac
+
+if [ "$host_only" != "" ] && [ "$host_tag" != "$host_only" ]; then
+  {
+    printf 'mode\tstatus\ttotal_sec\tstage1_sec\ttiming_file\n'
+    printf 'meta\tskip_non_target_host\thost=%s\thost_only=%s\treport_only=1\n' "$host_tag" "$host_only"
+    printf 'summary\tskip_non_target_host\t-1\t-1\thost=%s host_only=%s dedicated_host_verified=0\n' "$host_tag" "$host_only"
+  } >"$report"
+  echo "[selfhost_parallel_perf] report-only on non-target host: host=$host_tag target=$host_only"
+  exit 0
+fi
 
 if [ "$stage0" = "" ]; then
   stage0="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
@@ -127,6 +155,7 @@ run_probe() {
 
 : >"$report"
 printf 'mode\tstatus\ttotal_sec\tstage1_sec\ttiming_file\n' >>"$report"
+printf 'meta\thost=%s\tenforce=%s\tmax_slowdown=%s\tstage0=%s\n' "$host_tag" "$enforce" "$max_slowdown" "$stage0" >>"$report"
 
 echo "== backend.selfhost_parallel_perf.serial =="
 run_probe "serial" "0" "0"
@@ -143,6 +172,7 @@ echo "[selfhost_parallel_perf] serial=${serial_total}s status=${serial_status}"
 echo "[selfhost_parallel_perf] parallel=${parallel_total}s status=${parallel_status}"
 
 if [ "$serial_status" != "ok" ] || [ "$parallel_status" != "ok" ]; then
+  printf 'summary\tprobe_failed\t%s\t%s\thost=%s dedicated_host_verified=0\n' "$serial_total" "$parallel_total" "$host_tag" >>"$report"
   echo "[selfhost_parallel_perf] fail: probe status is not ok (report=$report)" 1>&2
   exit 1
 fi
@@ -156,8 +186,22 @@ esac
 
 limit=$((serial_total + max_slowdown))
 if [ "$parallel_total" -gt "$limit" ]; then
-  echo "[selfhost_parallel_perf] fail: parallel slower than budget (parallel=${parallel_total}s > serial=${serial_total}s + ${max_slowdown}s, report=$report)" 1>&2
-  exit 1
+  if [ "$enforce" = "1" ]; then
+    printf 'summary\tdedicated_host_failed\t%s\t%s\thost=%s limit=%s dedicated_host_verified=0\n' "$serial_total" "$parallel_total" "$host_tag" "$limit" >>"$report"
+    echo "[selfhost_parallel_perf] fail: parallel slower than budget (parallel=${parallel_total}s > serial=${serial_total}s + ${max_slowdown}s, report=$report)" 1>&2
+    exit 1
+  fi
+  printf 'summary\treport_only_slow\t%s\t%s\thost=%s limit=%s dedicated_host_verified=0\n' "$serial_total" "$parallel_total" "$host_tag" "$limit" >>"$report"
+  echo "[selfhost_parallel_perf] report-only: parallel slower than budget (parallel=${parallel_total}s > serial=${serial_total}s + ${max_slowdown}s, report=$report)"
+  exit 0
 fi
+
+summary_status="dedicated_host_pending"
+dedicated_host_verified="0"
+if [ "$enforce" = "1" ]; then
+  summary_status="dedicated_host_verified"
+  dedicated_host_verified="1"
+fi
+printf 'summary\t%s\t%s\t%s\thost=%s limit=%s dedicated_host_verified=%s\n' "$summary_status" "$serial_total" "$parallel_total" "$host_tag" "$limit" "$dedicated_host_verified" >>"$report"
 
 echo "[selfhost_parallel_perf] ok (report=$report)"

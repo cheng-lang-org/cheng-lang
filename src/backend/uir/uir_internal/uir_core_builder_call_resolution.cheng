@@ -1,6 +1,7 @@
 # Shared builder-local overload inference and call resolution helpers split from uir_core_builder.
 import std/result
 import std/seqs
+import std/hashmaps
 import std/rawmem_support
 import stage1/ast
 import backend/uir/uir_internal/uir_core_types
@@ -27,6 +28,16 @@ var
     uirCoreOverloadInferCacheEpoch: int32[]
     uirCoreOverloadInferCacheVals: str[]
     uirCoreOverloadInferCacheRound: int32 = 1
+    uirCoreResolvedCalleeCacheEpoch: int32[]
+    uirCoreResolvedCalleeCacheFuncLen: int32[]
+    uirCoreResolvedCalleeCacheVals: int32[]
+    uirCoreResolvedCalleeCacheBase: str[]
+    uirCoreResolvedCalleeCacheHint: str[]
+    uirCoreResolvedCalleeCacheRound: int32 = 1
+    uirCoreResolvedCalleeCacheModule: UirCoreModule
+    uirCoreResolvedSigCacheIndex: hashmaps.HashMapStrInt
+    uirCoreResolvedSigCacheModule: UirCoreModule
+    uirCoreResolvedSigCacheFuncLen: int32 = -1
 
 fn seqContainsStr(xs: str[], s: str): bool =
     if len(s) == 0 || xs.buffer == nil:
@@ -52,6 +63,157 @@ fn uirCoreOverloadInferCacheReset() =
     uirCoreOverloadInferCacheRound = 1
     uirCoreOverloadInferCacheEpoch.len = 0
     uirCoreOverloadInferCacheVals.len = 0
+
+fn uirCoreResolvedCalleeCacheReset() =
+    uirCoreResolvedCalleeCacheModule = nil
+    let nextRound: int32 = uirCoreResolvedCalleeCacheRound + 1
+    if nextRound > 0:
+        uirCoreResolvedCalleeCacheRound = nextRound
+        return
+    uirCoreResolvedCalleeCacheRound = 1
+    uirCoreResolvedCalleeCacheEpoch.len = 0
+    uirCoreResolvedCalleeCacheFuncLen.len = 0
+    uirCoreResolvedCalleeCacheVals.len = 0
+    uirCoreResolvedCalleeCacheBase.len = 0
+    uirCoreResolvedCalleeCacheHint.len = 0
+
+fn uirCoreResolvedSigCacheReset() =
+    uirCoreResolvedSigCacheIndex = hashmaps.hashMapStrIntInit(4096)
+    uirCoreResolvedSigCacheModule = nil
+    uirCoreResolvedSigCacheFuncLen = -1
+
+fn uirCoreResolvedSigCacheEnsure(mod: UirCoreModule) =
+    if mod == nil:
+        return
+    let funcLen: int32 = uirCoreModuleFuncsLen(mod)
+    if uirCoreResolvedSigCacheModule == mod &&
+       uirCoreResolvedSigCacheFuncLen == funcLen:
+        return
+    uirCoreResolvedSigCacheReset()
+    uirCoreResolvedSigCacheModule = mod
+    uirCoreResolvedSigCacheFuncLen = funcLen
+
+fn uirCoreResolvedSigCacheKey(callerFile: str, baseName: str, argKeys: str[], retKeyHint: str): str =
+    var key: str =
+        uirCoreOwnStrSafe(callerFile) + "\x1d" +
+        uirCoreOwnStrSafe(baseName) + "\x1f" +
+        uirCoreOwnStrSafe(retKeyHint)
+    for ai in 0..<argKeys.len:
+        key = key + "\x1e" + uirCoreOwnStrSafe(argKeys[ai])
+    return key
+
+fn uirCoreResolvedSigCacheTryGet(mod: UirCoreModule, sigKey0: str,
+                                 found: var bool): UirCoreFunc =
+    found = false
+    if mod == nil || len(sigKey0) == 0:
+        return nil
+    uirCoreResolvedSigCacheEnsure(mod)
+    let sigKey: str = uirCoreOwnStrSafe(sigKey0)
+    let rawVal: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCoreResolvedSigCacheIndex, sigKey, found)
+    if !found:
+        return nil
+    if rawVal <= 1:
+        return nil
+    let funcIdx: int32 = rawVal - 2
+    if funcIdx < 0 || funcIdx >= uirCoreModuleFuncsLen(mod):
+        found = false
+        return nil
+    return uirCoreModuleFuncAt(mod, funcIdx)
+
+fn uirCoreResolvedSigCachePut(mod: UirCoreModule, sigKey0: str, callee: UirCoreFunc) =
+    if mod == nil || len(sigKey0) == 0:
+        return
+    uirCoreResolvedSigCacheEnsure(mod)
+    let sigKey: str = uirCoreOwnStrSafe(sigKey0)
+    var rawVal: int32 = 1
+    if callee != nil:
+        let funcIdx: int32 = moduleFuncIndex(mod, uirCoreFuncNameForCacheLocal(callee))
+        if funcIdx >= 0:
+            rawVal = funcIdx + 2
+    hashmaps.hashMapStrIntPut(uirCoreResolvedSigCacheIndex, sigKey, rawVal)
+
+fn uirCoreResolvedCalleeCacheEnsureModule(mod: UirCoreModule) =
+    if mod == nil:
+        return
+    if uirCoreResolvedCalleeCacheModule == mod:
+        return
+    uirCoreResolvedCalleeCacheReset()
+    uirCoreResolvedCalleeCacheModule = mod
+
+fn uirCoreResolvedCalleeCacheTryGet(mod: UirCoreModule, callNode: Node,
+                                    baseName: str, retKeyHint: str,
+                                    found: var bool): UirCoreFunc =
+    found = false
+    if mod == nil || !astNodeIdValid(callNode):
+        return nil
+    uirCoreResolvedCalleeCacheEnsureModule(mod)
+    let idx: int32 = callNode - 1
+    if idx < 0 || idx >= uirCoreResolvedCalleeCacheEpoch.len ||
+       idx >= uirCoreResolvedCalleeCacheFuncLen.len ||
+       idx >= uirCoreResolvedCalleeCacheVals.len ||
+       idx >= uirCoreResolvedCalleeCacheBase.len ||
+       idx >= uirCoreResolvedCalleeCacheHint.len:
+        return nil
+    if uirCoreResolvedCalleeCacheEpoch[idx] != uirCoreResolvedCalleeCacheRound:
+        return nil
+    if uirCoreResolvedCalleeCacheFuncLen[idx] != uirCoreModuleFuncsLen(mod):
+        return nil
+    if uirCoreResolvedCalleeCacheBase[idx] != baseName ||
+       uirCoreResolvedCalleeCacheHint[idx] != retKeyHint:
+        return nil
+    found = true
+    let rawVal: int32 = uirCoreResolvedCalleeCacheVals[idx]
+    if rawVal <= 1:
+        return nil
+    let funcIdx: int32 = rawVal - 2
+    if funcIdx < 0 || funcIdx >= uirCoreModuleFuncsLen(mod):
+        found = false
+        return nil
+    return uirCoreModuleFuncAt(mod, funcIdx)
+
+fn uirCoreResolvedCalleeCachePut(mod: UirCoreModule, callNode: Node,
+                                 baseName: str, retKeyHint: str,
+                                 callee: UirCoreFunc) =
+    if mod == nil || !astNodeIdValid(callNode):
+        return
+    uirCoreResolvedCalleeCacheEnsureModule(mod)
+    let idx: int32 = callNode - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreResolvedCalleeCacheEpoch.len:
+        uir_core_builder_call_resolution_add(uirCoreResolvedCalleeCacheEpoch, int32(0))
+    while idx >= uirCoreResolvedCalleeCacheFuncLen.len:
+        uir_core_builder_call_resolution_add(uirCoreResolvedCalleeCacheFuncLen, int32(0))
+    while idx >= uirCoreResolvedCalleeCacheVals.len:
+        uir_core_builder_call_resolution_add(uirCoreResolvedCalleeCacheVals, int32(0))
+    while idx >= uirCoreResolvedCalleeCacheBase.len:
+        uir_core_builder_call_resolution_add(uirCoreResolvedCalleeCacheBase, "")
+    while idx >= uirCoreResolvedCalleeCacheHint.len:
+        uir_core_builder_call_resolution_add(uirCoreResolvedCalleeCacheHint, "")
+    var rawVal: int32 = 1
+    if callee != nil:
+        let funcIdx: int32 = moduleFuncIndex(mod, uirCoreFuncNameForCacheLocal(callee))
+        if funcIdx >= 0:
+            rawVal = funcIdx + 2
+    uirCoreResolvedCalleeCacheEpoch[idx] = uirCoreResolvedCalleeCacheRound
+    uirCoreResolvedCalleeCacheFuncLen[idx] = uirCoreModuleFuncsLen(mod)
+    uirCoreResolvedCalleeCacheVals[idx] = rawVal
+    uirCoreResolvedCalleeCacheBase[idx] = uirCoreOwnStrSafe(baseName)
+    uirCoreResolvedCalleeCacheHint[idx] = uirCoreOwnStrSafe(retKeyHint)
+
+fn uirCoreResolveCalleeFuncBestEffortByNode(b: BlockBuilder, callNode: Node,
+                                            baseName: str, argNodes: Node[],
+                                            retKeyHint: str): UirCoreFunc =
+    if b != nil && b.module != nil && astNodeIdValid(callNode):
+        var foundCached: bool = false
+        let cached: UirCoreFunc =
+            uirCoreResolvedCalleeCacheTryGet(b.module, callNode, baseName, retKeyHint, foundCached)
+        if foundCached:
+            return cached
+    let resolved: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, baseName, argNodes, retKeyHint)
+    if b != nil && b.module != nil && astNodeIdValid(callNode):
+        uirCoreResolvedCalleeCachePut(b.module, callNode, baseName, retKeyHint, resolved)
+    return resolved
 
 fn uirCoreOverloadInferCacheTryGet(n: Node, found: var bool): str =
     found = false
@@ -190,7 +352,7 @@ fn uirCoreInferNodeTypeKeyForOverloadUncached(b: BlockBuilder, n0: Node): str =
             if astNodeIdValid(argNode) && nodeKind(argNode) == nkCallArg && kidCount(argNode) > 1:
                 argNode = kid(argNode, 1)
             astNodeSeqAppend(argNodes, argNode)
-        let callee0: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, callName, argNodes, "")
+        let callee0: UirCoreFunc = uirCoreResolveCalleeFuncBestEffortByNode(b, n, callName, argNodes, "")
         if (callee0 != nil):
             if uirCoreFuncParamsLen(callee0) > 0:
                 let p0: UirCoreParam = uirCoreFuncParamAt(callee0, 0)
@@ -722,6 +884,17 @@ fn uirCoreResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: 
     for ai in 0..<argNodes.len:
         uir_core_builder_call_resolution_add(argKeys, uirCoreInferNodeTypeKeyForOverload(b, argNodes[ai]))
     let debugResolve: bool = uirCoreResolveDebugEnabled(baseName)
+    var callerFile: str = ""
+    if uirCoreFuncIdValid(b.func):
+        callerFile = uirCoreFuncOriginFileOf(b.func)
+    var sigKey: str = ""
+    if !debugResolve:
+        sigKey = uirCoreResolvedSigCacheKey(callerFile, baseName, argKeys, retKeyHint)
+        if len(sigKey) > 0:
+            var foundSig: bool = false
+            let cachedSig: UirCoreFunc = uirCoreResolvedSigCacheTryGet(mod, sigKey, foundSig)
+            if foundSig:
+                return cachedSig
     if debugResolve:
         uirCoreResolveDebugDumpCall(b, baseName, retKeyHint, argNodes, argKeys)
     var dbgCandCount: int32 = 0
@@ -770,42 +943,53 @@ fn uirCoreResolveCalleeFuncBestEffort(b: BlockBuilder, baseName: str, argNodes: 
                 if (best != nil):
                     builderFuncSeqAppend(&ties, best)
             uirCoreResolveAppendTieIfNew(&ties, cand)
+    var resolved: UirCoreFunc = best
     if ambiguous:
         if uirCoreResolveHasUnknownArg(argKeys) && ties.len > 0:
-            return ties[0]
-        let preferDup: UirCoreFunc = uirCoreResolvePreferDupFnBase(mod, b, baseName, argKeys,
-                                                                   retKeyHint, bestScore, true)
-        if preferDup != nil:
-            return preferDup
-        if ties.len > 0:
-            let importMatch: UirCoreFunc = uirCoreResolvePreferDirectImport(b, ties)
-            if importMatch != nil:
-                return importMatch
-            let prefixMatch: UirCoreFunc = uirCoreResolvePreferCommonPrefix(b, ties)
-            if prefixMatch != nil:
-                return prefixMatch
-        return nil
-    if (best == nil):
+            resolved = ties[0]
+        else:
+            let preferDup: UirCoreFunc = uirCoreResolvePreferDupFnBase(mod, b, baseName, argKeys,
+                                                                       retKeyHint, bestScore, true)
+            if preferDup != nil:
+                resolved = preferDup
+            elif ties.len > 0:
+                let importMatch: UirCoreFunc = uirCoreResolvePreferDirectImport(b, ties)
+                if importMatch != nil:
+                    resolved = importMatch
+                else:
+                    let prefixMatch: UirCoreFunc = uirCoreResolvePreferCommonPrefix(b, ties)
+                    if prefixMatch != nil:
+                        resolved = prefixMatch
+                    else:
+                        resolved = nil
+            else:
+                resolved = nil
+    elif (best == nil):
         let preferBest: UirCoreFunc = uirCoreResolvePreferDupFnBase(mod, b, baseName, argKeys,
                                                                     retKeyHint, bestScore, false)
         if preferBest != nil:
-            return preferBest
-        let uniq: UirCoreFunc = moduleFindFuncByBaseUnique(mod, baseName)
-        if (uniq != nil):
-            return uniq
-        if (exactExtern != nil):
-            return exactExtern
+            resolved = preferBest
+        else:
+            let uniq: UirCoreFunc = moduleFindFuncByBaseUnique(mod, baseName)
+            if (uniq != nil):
+                resolved = uniq
+            elif (exactExtern != nil):
+                resolved = exactExtern
+            else:
+                resolved = nil
     if debugResolve:
         var bestNm: str = ""
-        if (best != nil):
-            bestNm = uirCoreFuncNameOf(best)
+        if (resolved != nil):
+            bestNm = uirCoreFuncNameOf(resolved)
         echo("[backend] debugResolve: done base='" + baseName + "' candCount=" + intToStr(dbgCandCount) +
              " best='" + bestNm + "' ambiguous=" + (ambiguous ? "1" : "0"))
-    return best
+    if !debugResolve && len(sigKey) > 0 && resolved != nil:
+        uirCoreResolvedSigCachePut(mod, sigKey, resolved)
+    return resolved
 
 fn uirCoreResolveCalleeFunc(b: BlockBuilder, callNode: Node, baseName: str, argNodes: Node[]): Result[UirCoreFunc] =
     let retKeyHint: str = uirCoreInferCallRetKeyHint(callNode)
-    let f: UirCoreFunc = uirCoreResolveCalleeFuncBestEffort(b, baseName, argNodes, retKeyHint)
+    let f: UirCoreFunc = uirCoreResolveCalleeFuncBestEffortByNode(b, callNode, baseName, argNodes, retKeyHint)
     if (f != nil):
         return Ok[UirCoreFunc](f)
     var fnName: str = ""

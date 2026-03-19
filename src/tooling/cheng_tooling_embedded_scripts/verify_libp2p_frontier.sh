@@ -12,7 +12,7 @@ Usage:
 Env:
   FRONTIER_ONLY=<csv>          Run only selected probes (e.g. mdns_smoke)
   BACKEND_DRIVER=<path>        Explicit backend driver path
-  FRONTIER_TIMEOUT=<seconds>   Stage1 probe timeout (default: 180)
+  FRONTIER_TIMEOUT=<seconds>   Stage1 probe timeout (default: 60)
   FRONTIER_IMPORT_TIMEOUT=<seconds> Import probe timeout (default: 20)
   FRONTIER_TIMEOUT_DIAG=<0|1>  Capture timeout sample diag (default: 1)
   FRONTIER_TIMEOUT_DIAG_SECONDS=<seconds> sample duration on timeout (default: 5)
@@ -45,7 +45,7 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$ROOT"
 
 ROOT="${ROOT:-$ROOT}"
@@ -157,7 +157,7 @@ CACHE="${CACHE:-$FRONTIER_CACHE/cache}"
 CACHE_DIR="${CACHE_DIR:-$CACHE/stage1}"
 OUT_DIR="$FRONTIER_CACHE/out"
 LOG_DIR="$FRONTIER_CACHE/logs"
-PROBE_TIMEOUT="${FRONTIER_TIMEOUT:-180}"
+PROBE_TIMEOUT="${FRONTIER_TIMEOUT:-60}"
 IMPORT_TIMEOUT="${FRONTIER_IMPORT_TIMEOUT:-20}"
 IMPORT_FRONTEND="${FRONTIER_IMPORT_FRONTEND:-stage1}"
 FRONTIER_SKIP_SEM="0"

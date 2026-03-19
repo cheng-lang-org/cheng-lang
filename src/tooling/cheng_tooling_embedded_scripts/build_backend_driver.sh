@@ -19,11 +19,16 @@ Env:
   BACKEND_BUILD_DRIVER_LINKER=system (default system; accepts self|system)
   BACKEND_BUILD_DRIVER_SELFHOST=1    (default 1)
   BACKEND_BUILD_DRIVER_STAGE0=<path> (optional stage driver override)
-  BACKEND_BUILD_DRIVER_MULTI=0       (default 0; serial incremental)
-  BACKEND_BUILD_DRIVER_MULTI_FORCE=0 (default 0)
+  BACKEND_BUILD_DRIVER_MULTI=1       (default 1 on darwin/arm64; else 0)
+  BACKEND_BUILD_DRIVER_MULTI_FORCE=1 (default 1 on darwin/arm64; else 0)
   BACKEND_BUILD_DRIVER_INCREMENTAL=1 (default 1)
-  BACKEND_BUILD_DRIVER_JOBS=0        (default 0=auto)
-  BACKEND_BUILD_DRIVER_TIMEOUT=60    (default 60s per compile attempt)
+  BACKEND_BUILD_DRIVER_JOBS=8        (default 8 on darwin/arm64; else 0=auto)
+  BACKEND_BUILD_DRIVER_TIMEOUT=60    (default/cap 60s per compile attempt)
+  BACKEND_BUILD_DRIVER_TIMEOUT_DIAG=1 (default 1; synchronously sample on timeout and summarize)
+  BACKEND_BUILD_DRIVER_TIMEOUT_DIAG_SECONDS=60 (fixed to compile timeout)
+  BACKEND_BUILD_DRIVER_TIMEOUT_DIAG_DIR=chengcache/backend_timeout_diag
+  BACKEND_BUILD_DRIVER_TIMEOUT_DIAG_SUMMARY=1 (default 1)
+  BACKEND_BUILD_DRIVER_TIMEOUT_DIAG_SUMMARY_TOP=12 (default 12)
   BACKEND_BUILD_DRIVER_SMOKE=0       (default 0; set 1 to run stage1 compile smoke)
   BACKEND_BUILD_DRIVER_REQUIRE_SMOKE=1 (default 1; require smoke for freshly rebuilt driver)
   BACKEND_BUILD_DRIVER_FRONTEND=stage1 (default stage1; frontend used for backend_driver selfbuild)
@@ -96,6 +101,37 @@ run_with_timeout() {
   perl -e '
     use POSIX qw(setsid WNOHANG);
     my $timeout = shift;
+    my $diag_file = $ENV{"TIMEOUT_DIAG_FILE"} // "";
+    my $diag_secs = $ENV{"TIMEOUT_DIAG_SECONDS"} // $timeout;
+    my $diag_on = $ENV{"TIMEOUT_DIAG_ENABLED"} // "0";
+    if ($diag_secs !~ /^\d+$/ || $diag_secs < 1) {
+      $diag_secs = $timeout;
+    }
+    sub deepest_child_pid {
+      my ($root_pid) = @_;
+      my %kids = ();
+      if (open my $ps, "-|", "ps", "-Ao", "pid=,ppid=") {
+        while (my $line = <$ps>) {
+          $line =~ s/^\s+//;
+          $line =~ s/\s+$//;
+          my ($cand, $ppid) = split /\s+/, $line, 2;
+          next if !defined $cand || !defined $ppid;
+          push @{$kids{$ppid}}, $cand;
+        }
+        close $ps;
+      } else {
+        return $root_pid;
+      }
+      my $cur = $root_pid;
+      my %seen = ();
+      while (exists $kids{$cur} && @{$kids{$cur}}) {
+        my @sorted = sort { $a <=> $b } @{$kids{$cur}};
+        my $next = $sorted[-1];
+        last if $seen{$next}++;
+        $cur = $next;
+      }
+      return $cur;
+    }
     my $pid = fork();
     if (!defined $pid) { exit 127; }
     if ($pid == 0) {
@@ -114,6 +150,10 @@ run_with_timeout() {
         exit($status >> 8);
       }
       if (time >= $end) {
+        if ($diag_on ne "0" && $diag_file ne "") {
+          my $target = deepest_child_pid($pid);
+          system("sample", $target, $diag_secs, "-file", $diag_file);
+        }
         kill "TERM", -$pid;
         kill "TERM", $pid;
         my $grace_end = time + 1;
@@ -135,6 +175,82 @@ run_with_timeout() {
       select(undef, undef, undef, 0.1);
     }
   ' "$seconds" "$@"
+}
+
+sanitize_diag_label() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '_'
+}
+
+emit_timeout_diag_summary() {
+  label="$1"
+  diag_file="$2"
+  diag_child_file="$3"
+  log_file="$4"
+  if [ "$diag_file" = "" ] && [ "$diag_child_file" = "" ]; then
+    return 0
+  fi
+  diag_wait=0
+  while [ "$diag_wait" -lt 5 ]; do
+    parent_ready=0
+    child_ready=0
+    if [ "$diag_file" = "" ] || [ -s "$diag_file" ]; then
+      parent_ready=1
+    fi
+    if [ "$diag_child_file" = "" ] || [ -s "$diag_child_file" ]; then
+      child_ready=1
+    fi
+    if [ "$parent_ready" = "1" ] && [ "$child_ready" = "1" ]; then
+      break
+    fi
+    sleep 0.1
+    diag_wait=$((diag_wait + 1))
+  done
+  if [ "$diag_file" != "" ]; then
+    printf 'timeout_diag=%s\n' "$diag_file" >>"$log_file"
+    echo "[build_backend_driver] timeout diag ($label parent): $diag_file" >&2
+  fi
+  if [ "$diag_child_file" != "" ]; then
+    printf 'timeout_diag_child=%s\n' "$diag_child_file" >>"$log_file"
+    echo "[build_backend_driver] timeout diag ($label child): $diag_child_file" >&2
+  fi
+  case "$timeout_diag_summary" in
+    1|true|TRUE|yes|YES|on|ON)
+      if [ -s "$diag_file" ] && [ -f "$root/src/tooling/cheng_tooling_embedded_scripts/summarize_timeout_diag.sh" ]; then
+        sh "$root/src/tooling/cheng_tooling_embedded_scripts/summarize_timeout_diag.sh" \
+          --file:"$diag_file" --top:"$timeout_diag_summary_top" >>"$log_file" 2>&1 || true
+        sh "$root/src/tooling/cheng_tooling_embedded_scripts/summarize_timeout_diag.sh" \
+          --file:"$diag_file" --top:"$timeout_diag_summary_top" 1>&2 || true
+      fi
+      if [ -s "$diag_child_file" ] && [ -f "$root/src/tooling/cheng_tooling_embedded_scripts/summarize_timeout_diag.sh" ]; then
+        sh "$root/src/tooling/cheng_tooling_embedded_scripts/summarize_timeout_diag.sh" \
+          --file:"$diag_child_file" --top:"$timeout_diag_summary_top" >>"$log_file" 2>&1 || true
+        sh "$root/src/tooling/cheng_tooling_embedded_scripts/summarize_timeout_diag.sh" \
+          --file:"$diag_child_file" --top:"$timeout_diag_summary_top" 1>&2 || true
+      fi
+      ;;
+  esac
+}
+
+build_driver_default_multi() {
+  case "$host_os/$host_arch" in
+    Darwin/arm64)
+      printf '1\n'
+      ;;
+    *)
+      printf '0\n'
+      ;;
+  esac
+}
+
+build_driver_default_jobs() {
+  case "$host_os/$host_arch" in
+    Darwin/arm64)
+      printf '8\n'
+      ;;
+    *)
+      printf '0\n'
+      ;;
+  esac
 }
 
 driver_sanity_ok() {
@@ -169,6 +285,7 @@ driver_stage1_smoke_stage0_status=
 driver_stage1_smoke_stage0_class=
 driver_stage1_smoke_stage0_log=
 driver_stage1_smoke_stage0_target=
+driver_stage1_smoke_sidecar_compiler=
 
 driver_stage1_smoke_classify() {
   smoke_log="$1"
@@ -232,25 +349,48 @@ driver_stage1_smoke_ok() {
     rm -rf "$smoke_out.objs" "$smoke_out.objs.lock"
     printf 'target=%s\n' "$smoke_target" >>"$smoke_log"
     set +e
-    run_with_timeout 40 env \
-      MM=orc \
-      STAGE1_NO_POINTERS_NON_C_ABI=0 \
-      STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-      BACKEND_VALIDATE=0 \
-      STAGE1_SEM_FIXED_0=0 \
-      STAGE1_SKIP_CPROFILE=1 \
-      GENERIC_MODE=dict \
-      GENERIC_SPEC_BUDGET=0 \
-      STAGE1_OWNERSHIP_FIXED_0=0 \
-      BACKEND_LINKER=self \
-      BACKEND_NO_RUNTIME_C=1 \
-      BACKEND_RUNTIME_OBJ= \
-      BACKEND_EMIT=exe \
-      BACKEND_TARGET="$smoke_target" \
-      BACKEND_FRONTEND=stage1 \
-      BACKEND_INPUT="$smoke_src" \
-      BACKEND_OUTPUT="$smoke_out" \
-      "$bin" >>"$smoke_log" 2>&1
+    if [ "${driver_stage1_smoke_sidecar_compiler:-}" != "" ]; then
+      run_with_timeout 40 env \
+        MM=orc \
+        STAGE1_NO_POINTERS_NON_C_ABI=0 \
+        STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+        BACKEND_VALIDATE=0 \
+        STAGE1_SEM_FIXED_0=0 \
+        STAGE1_SKIP_CPROFILE=1 \
+        GENERIC_MODE=dict \
+        GENERIC_SPEC_BUDGET=0 \
+        STAGE1_OWNERSHIP_FIXED_0=0 \
+        BACKEND_LINKER=self \
+        BACKEND_NO_RUNTIME_C=1 \
+        BACKEND_RUNTIME_OBJ= \
+        BACKEND_EMIT=exe \
+        BACKEND_TARGET="$smoke_target" \
+        BACKEND_FRONTEND=stage1 \
+        BACKEND_INPUT="$smoke_src" \
+        BACKEND_OUTPUT="$smoke_out" \
+        BACKEND_UIR_SIDECAR_COMPILER="$driver_stage1_smoke_sidecar_compiler" \
+        "$bin" >>"$smoke_log" 2>&1
+    else
+      run_with_timeout 40 env \
+        MM=orc \
+        STAGE1_NO_POINTERS_NON_C_ABI=0 \
+        STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+        BACKEND_VALIDATE=0 \
+        STAGE1_SEM_FIXED_0=0 \
+        STAGE1_SKIP_CPROFILE=1 \
+        GENERIC_MODE=dict \
+        GENERIC_SPEC_BUDGET=0 \
+        STAGE1_OWNERSHIP_FIXED_0=0 \
+        BACKEND_LINKER=self \
+        BACKEND_NO_RUNTIME_C=1 \
+        BACKEND_RUNTIME_OBJ= \
+        BACKEND_EMIT=exe \
+        BACKEND_TARGET="$smoke_target" \
+        BACKEND_FRONTEND=stage1 \
+        BACKEND_INPUT="$smoke_src" \
+        BACKEND_OUTPUT="$smoke_out" \
+        "$bin" >>"$smoke_log" 2>&1
+    fi
     status=$?
     set -e
     driver_stage1_smoke_last_status="$status"
@@ -410,9 +550,10 @@ driver_sidecar_pick_wrapper_compiler() {
   for cand in \
     "${BACKEND_UIR_SIDECAR_WRAPPER_COMPILER:-}" \
     "${BACKEND_BUILD_DRIVER_STAGE0:-}" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng_stage0_default" \
+    "$root/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng" \
     "$root/artifacts/backend_driver/cheng" \
-    "$root/dist/releases/current/cheng"
+    "$root/dist/releases/current/cheng" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng_stage0_default"
   do
     if [ "$cand" = "" ]; then
       continue
@@ -671,11 +812,34 @@ if [ "$selfhost" = "0" ]; then
   exit 2
 fi
 
-driver_multi="${BACKEND_BUILD_DRIVER_MULTI:-0}"
-driver_multi_force="${BACKEND_BUILD_DRIVER_MULTI_FORCE:-0}"
+if [ "${BACKEND_BUILD_DRIVER_MULTI+x}" = "x" ]; then
+  driver_multi="${BACKEND_BUILD_DRIVER_MULTI:-0}"
+else
+  driver_multi="$(build_driver_default_multi)"
+fi
+if [ "${BACKEND_BUILD_DRIVER_MULTI_FORCE+x}" = "x" ]; then
+  driver_multi_force="${BACKEND_BUILD_DRIVER_MULTI_FORCE:-0}"
+else
+  driver_multi_force="$(build_driver_default_multi)"
+fi
 driver_incremental="${BACKEND_BUILD_DRIVER_INCREMENTAL:-1}"
-driver_jobs="${BACKEND_BUILD_DRIVER_JOBS:-0}"
+if [ "${BACKEND_BUILD_DRIVER_JOBS+x}" = "x" ]; then
+  driver_jobs="${BACKEND_BUILD_DRIVER_JOBS:-0}"
+else
+  driver_jobs="$(build_driver_default_jobs)"
+fi
 build_timeout="${BACKEND_BUILD_DRIVER_TIMEOUT:-60}"
+case "$build_timeout" in
+  ''|*[!0-9]*) build_timeout=60 ;;
+esac
+if [ "$build_timeout" -lt 1 ] || [ "$build_timeout" -gt 60 ]; then
+  build_timeout=60
+fi
+timeout_diag_enabled="${BACKEND_BUILD_DRIVER_TIMEOUT_DIAG:-1}"
+timeout_diag_seconds="$build_timeout"
+timeout_diag_dir="${BACKEND_BUILD_DRIVER_TIMEOUT_DIAG_DIR:-$root/chengcache/backend_timeout_diag}"
+timeout_diag_summary="${BACKEND_BUILD_DRIVER_TIMEOUT_DIAG_SUMMARY:-1}"
+timeout_diag_summary_top="${BACKEND_BUILD_DRIVER_TIMEOUT_DIAG_SUMMARY_TOP:-12}"
 driver_smoke="${BACKEND_BUILD_DRIVER_SMOKE:-0}"
 driver_require_smoke="${BACKEND_BUILD_DRIVER_REQUIRE_SMOKE:-1}"
 driver_frontend="${BACKEND_BUILD_DRIVER_FRONTEND:-stage1}"
@@ -725,7 +889,13 @@ name_dir="$(dirname "$name_abs")"
 if [ "$name_dir" != "" ] && [ ! -d "$name_dir" ]; then
   mkdir -p "$name_dir"
 fi
-tmp_bin_abs="${name_abs}.tmp"
+tmp_tag="$(printf '%s' "$name_abs" | tr '/: ' '___' | tr -cd 'A-Za-z0-9._-')"
+if [ "$tmp_tag" = "" ]; then
+  tmp_tag="backend_driver"
+fi
+tmp_out_dir="$root/chengcache/build_backend_driver.tmp/$tmp_tag"
+mkdir -p "$tmp_out_dir"
+tmp_bin_abs="$tmp_out_dir/$(basename "$name_abs").tmp"
 tmp_obj_abs="${tmp_bin_abs}.o"
 
 clear_stale_lock_dir "${name_abs}.objs.lock"
@@ -771,14 +941,148 @@ stage0_tag() {
   printf '%s\n' "$tag"
 }
 
+driver_stage0_supports_new_expr_assignments() {
+  compiler="$1"
+  case "$compiler" in
+    *"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2"|\
+    *"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"|\
+    *"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof")
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+driver_stage0_new_expr_compat_root() {
+  compiler="$1"
+  printf '%s\n' "$root/chengcache/build_backend_driver.compat_new_expr/$(stage0_tag "$compiler")"
+}
+
+driver_prepare_new_expr_compat_root() {
+  compiler="$1"
+  compat_root="$(driver_stage0_new_expr_compat_root "$compiler")"
+  compat_src="$compat_root/src"
+  compat_stamp="$compat_root/.stamp"
+  rebuild="0"
+  if [ ! -d "$compat_src" ] || [ ! -f "$compat_stamp" ]; then
+    rebuild="1"
+  elif find "$root/src" -type f -newer "$compat_stamp" -print -quit | grep . >/dev/null 2>&1; then
+    rebuild="1"
+  fi
+  if [ "$rebuild" = "1" ]; then
+    rm -rf "$compat_root"
+    mkdir -p "$compat_root"
+    cp -R "$root/src" "$compat_src"
+    find "$compat_src" -name '*.cheng' -type f | while read -r f; do
+      perl -0pi -e '
+        our $c = 0;
+        s{^(\h*)(var|let)\h+([A-Za-z_][A-Za-z0-9_]*)\h*:\h*([^\n=]+?)\h*=\h*new\(\h*([^\n\)]+?)\h*\)\h*$}{
+          my ($i, $kw, $name, $ty, $arg) = ($1, $2, $3, $4, $5);
+          my $tty = $ty;
+          my $a = $arg;
+          $tty =~ s/^\h+|\h+$//g;
+          $a =~ s/^\h+|\h+$//g;
+          if ($tty eq $a) {
+            my $tmp = "__cheng_new_tmp_compat_" . $c++;
+            "${i}var ${tmp}: ${tty}\n${i}new ${tmp}\n${i}${kw} ${name}: ${tty} = ${tmp}";
+          } else {
+            $&;
+          }
+        }gme;
+      ' "$f"
+    done
+    touch "$compat_stamp"
+  fi
+  printf '%s\n' "$compat_root"
+}
+
 run_driver_compile_once() {
   compiler="$1"
   out_bin="$2"
   multi_now="$3"
   multi_force_now="$4"
   log_file="$5"
+  diag_label="$6"
+  compile_root="$root"
+  compile_input="src/backend/tooling/backend_driver.cheng"
+  compat_root=""
+  driver_ldflags_now="$driver_ldflags"
+  diag_file=""
+  diag_child_file=""
+  if ! driver_stage0_supports_new_expr_assignments "$compiler"; then
+    compat_root="$(driver_prepare_new_expr_compat_root "$compiler" || true)"
+    if [ "$compat_root" = "" ] || [ ! -f "$compat_root/src/backend/tooling/backend_driver.cheng" ]; then
+      echo "[Error] build_backend_driver failed to prepare new-expr compat root for stage0: $compiler" >>"$log_file"
+      return 1
+    fi
+    compile_root="$compat_root"
+    shim_src="$root/src/backend/tooling/backend_driver_stage0_backend_main_shim.c"
+    shim_obj="$root/chengcache/backend_driver_stage0_backend_main_shim.${target}.o"
+    if ! prepare_driver_symbol_bridge_obj "$shim_src" "$shim_obj"; then
+      echo "[Error] build_backend_driver failed to prepare backend main shim: $shim_src" >>"$log_file"
+      return 1
+    fi
+    if [ "$driver_ldflags_now" = "" ]; then
+      driver_ldflags_now="$shim_obj"
+    else
+      driver_ldflags_now="$driver_ldflags_now $shim_obj"
+    fi
+  fi
+  printf 'compile_root=%s\n' "$compile_root" >>"$log_file"
+  printf 'compile_input=%s\n' "$compile_input" >>"$log_file"
+  printf 'driver_ldflags=%s\n' "$driver_ldflags_now" >>"$log_file"
+  case "$timeout_diag_enabled" in
+    1|true|TRUE|yes|YES|on|ON)
+      mkdir -p "$timeout_diag_dir"
+      diag_stamp="$(date +%Y%m%dT%H%M%S 2>/dev/null || echo timeout)"
+      diag_safe_label="$(sanitize_diag_label "$diag_label")"
+      [ "$diag_safe_label" = "" ] && diag_safe_label="build_backend_driver"
+      diag_file="$timeout_diag_dir/${diag_stamp}_${diag_safe_label}.sample.txt"
+      diag_child_file=""
+      ;;
+  esac
   if [ "$linker_mode" = "self" ]; then
-    run_with_timeout "$build_timeout" env \
+    TIMEOUT_DIAG_FILE="$diag_file" \
+    TIMEOUT_DIAG_SECONDS="$timeout_diag_seconds" \
+    TIMEOUT_DIAG_ENABLED="$timeout_diag_enabled" \
+    run_with_timeout "$build_timeout" \
+      sh -c 'cd "$1" && shift && exec "$@"' sh "$compile_root" \
+      env \
+        MM="$mm" \
+        STAGE1_SEM_FIXED_0="${STAGE1_SEM_FIXED_0:-0}" \
+        STAGE1_SEM_FIXED_0="${STAGE1_SEM_FIXED_0:-${STAGE1_SEM_FIXED_0:-0}}" \
+        STAGE1_OWNERSHIP_FIXED_0="${STAGE1_OWNERSHIP_FIXED_0:-0}" \
+        STAGE1_OWNERSHIP_FIXED_0="${STAGE1_OWNERSHIP_FIXED_0:-${STAGE1_OWNERSHIP_FIXED_0:-0}}" \
+        STAGE1_SKIP_CPROFILE="${STAGE1_SKIP_CPROFILE:-1}" \
+        STAGE1_SKIP_CPROFILE="${STAGE1_SKIP_CPROFILE:-${STAGE1_SKIP_CPROFILE:-1}}" \
+        STAGE1_AUTO_SYSTEM=0 \
+        BACKEND_MULTI="$multi_now" \
+        BACKEND_MULTI_FORCE="$multi_force_now" \
+        BACKEND_INCREMENTAL="$driver_incremental" \
+        BACKEND_JOBS="$driver_jobs" \
+        BACKEND_VALIDATE=0 \
+        BACKEND_LINKER=self \
+        BACKEND_NO_RUNTIME_C=1 \
+        BACKEND_RUNTIME_OBJ="$runtime_obj_abs" \
+        BACKEND_LDFLAGS="$driver_ldflags_now" \
+        BACKEND_EMIT=exe \
+        BACKEND_TARGET="$target" \
+        BACKEND_FRONTEND="$driver_frontend" \
+        BACKEND_INPUT="$compile_input" \
+        BACKEND_OUTPUT="$out_bin" \
+        "$compiler" >>"$log_file" 2>&1
+    status="$?"
+    if [ "$status" -eq 124 ] || [ "$status" -eq 143 ]; then
+      emit_timeout_diag_summary "$diag_label" "$diag_file" "$diag_child_file" "$log_file"
+    fi
+    return "$status"
+  fi
+  TIMEOUT_DIAG_FILE="$diag_file" \
+  TIMEOUT_DIAG_SECONDS="$timeout_diag_seconds" \
+  TIMEOUT_DIAG_ENABLED="$timeout_diag_enabled" \
+  run_with_timeout "$build_timeout" \
+    sh -c 'cd "$1" && shift && exec "$@"' sh "$compile_root" \
+    env \
       MM="$mm" \
       STAGE1_SEM_FIXED_0="${STAGE1_SEM_FIXED_0:-0}" \
       STAGE1_SEM_FIXED_0="${STAGE1_SEM_FIXED_0:-${STAGE1_SEM_FIXED_0:-0}}" \
@@ -792,42 +1096,21 @@ run_driver_compile_once() {
       BACKEND_INCREMENTAL="$driver_incremental" \
       BACKEND_JOBS="$driver_jobs" \
       BACKEND_VALIDATE=0 \
-      BACKEND_LINKER=self \
-      BACKEND_NO_RUNTIME_C=1 \
-      BACKEND_RUNTIME_OBJ="$runtime_obj_abs" \
-      BACKEND_LDFLAGS="$driver_ldflags" \
+      BACKEND_LINKER=system \
+      BACKEND_NO_RUNTIME_C=0 \
+      BACKEND_RUNTIME_OBJ= \
+      BACKEND_LDFLAGS="$driver_ldflags_now" \
       BACKEND_EMIT=exe \
       BACKEND_TARGET="$target" \
       BACKEND_FRONTEND="$driver_frontend" \
-      BACKEND_INPUT="src/backend/tooling/backend_driver.cheng" \
+      BACKEND_INPUT="$compile_input" \
       BACKEND_OUTPUT="$out_bin" \
       "$compiler" >>"$log_file" 2>&1
-    return
+  status="$?"
+  if [ "$status" -eq 124 ] || [ "$status" -eq 143 ]; then
+    emit_timeout_diag_summary "$diag_label" "$diag_file" "$diag_child_file" "$log_file"
   fi
-  run_with_timeout "$build_timeout" env \
-    MM="$mm" \
-    STAGE1_SEM_FIXED_0="${STAGE1_SEM_FIXED_0:-0}" \
-    STAGE1_SEM_FIXED_0="${STAGE1_SEM_FIXED_0:-${STAGE1_SEM_FIXED_0:-0}}" \
-    STAGE1_OWNERSHIP_FIXED_0="${STAGE1_OWNERSHIP_FIXED_0:-0}" \
-    STAGE1_OWNERSHIP_FIXED_0="${STAGE1_OWNERSHIP_FIXED_0:-${STAGE1_OWNERSHIP_FIXED_0:-0}}" \
-    STAGE1_SKIP_CPROFILE="${STAGE1_SKIP_CPROFILE:-1}" \
-    STAGE1_SKIP_CPROFILE="${STAGE1_SKIP_CPROFILE:-${STAGE1_SKIP_CPROFILE:-1}}" \
-    STAGE1_AUTO_SYSTEM=0 \
-    BACKEND_MULTI="$multi_now" \
-    BACKEND_MULTI_FORCE="$multi_force_now" \
-    BACKEND_INCREMENTAL="$driver_incremental" \
-    BACKEND_JOBS="$driver_jobs" \
-    BACKEND_VALIDATE=0 \
-    BACKEND_LINKER=system \
-    BACKEND_NO_RUNTIME_C=0 \
-    BACKEND_RUNTIME_OBJ= \
-    BACKEND_LDFLAGS="$driver_ldflags" \
-    BACKEND_EMIT=exe \
-    BACKEND_TARGET="$target" \
-    BACKEND_FRONTEND="$driver_frontend" \
-    BACKEND_INPUT="src/backend/tooling/backend_driver.cheng" \
-    BACKEND_OUTPUT="$out_bin" \
-    "$compiler" >>"$log_file" 2>&1
+  return "$status"
 }
 
 attempt_build_with_stage0() {
@@ -837,6 +1120,16 @@ attempt_build_with_stage0() {
   attempt_log="$log_root/attempt_${attempt_idx}_${stage0_tag_s}.log"
   : >"$attempt_log"
   printf 'stage0=%s\n' "$stage0" >>"$attempt_log"
+  driver_stage1_smoke_sidecar_compiler=
+  if ! driver_stage0_supports_new_expr_assignments "$stage0"; then
+    currentsrc_sidecar="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof"
+    if [ -x "$currentsrc_sidecar" ]; then
+      driver_stage1_smoke_sidecar_compiler="$currentsrc_sidecar"
+    fi
+  fi
+  if [ "$driver_stage1_smoke_sidecar_compiler" != "" ]; then
+    printf 'smoke_sidecar_compiler=%s\n' "$driver_stage1_smoke_sidecar_compiler" >>"$attempt_log"
+  fi
 
   runtime_needs_rebuild="0"
   if [ "$linker_mode" = "self" ]; then
@@ -855,13 +1148,15 @@ attempt_build_with_stage0() {
 
   rm -f "$tmp_bin_abs" "$tmp_obj_abs"
   set +e
-  run_driver_compile_once "$stage0" "$tmp_bin_abs" "$driver_multi" "$driver_multi_force" "$attempt_log"
+  run_driver_compile_once "$stage0" "$tmp_bin_abs" "$driver_multi" "$driver_multi_force" "$attempt_log" \
+    "build_backend_driver.${attempt_idx}.${stage0_tag_s}.primary"
   status=$?
   set -e
   if [ "$status" -ne 0 ] && [ "$driver_multi" != "0" ] && [ "$status" -ne 124 ]; then
     rm -f "$tmp_bin_abs" "$tmp_obj_abs"
     set +e
-    run_driver_compile_once "$stage0" "$tmp_bin_abs" "0" "0" "$attempt_log"
+    run_driver_compile_once "$stage0" "$tmp_bin_abs" "0" "0" "$attempt_log" \
+      "build_backend_driver.${attempt_idx}.${stage0_tag_s}.serial_retry"
     status=$?
     set -e
   fi

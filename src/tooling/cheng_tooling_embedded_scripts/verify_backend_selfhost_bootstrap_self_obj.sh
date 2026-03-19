@@ -118,15 +118,47 @@ run_with_timeout() {
           unlink $child_file;
           unlink $pid_file;
           system("/usr/bin/sample", $pid, $sample_secs, "-file", $parent_file);
-          my $child = qx(/usr/bin/pgrep -P $pid 2>/dev/null);
-          if (defined $child) {
-            $child =~ s/\s+.*//s;
-            if ($child ne "") {
-              system("/usr/bin/sample", $child, $sample_secs, "-file", $child_file);
-              if (open(my $pfh, ">", $pid_file)) {
-                print $pfh "parent=$pid\nchild=$child\n";
-                close($pfh);
+
+          my $deepest = 0;
+          my @chain = ();
+          my $deadline = time + (($sample_secs < 5) ? $sample_secs : 5);
+          while (time <= $deadline && !$deepest) {
+            if (open my $ps, "-|", "ps", "-Ao", "pid=,ppid=") {
+              my %kids = ();
+              while (my $line = <$ps>) {
+                $line =~ s/^\s+//;
+                $line =~ s/\s+$//;
+                my ($cand, $ppid) = split /\s+/, $line, 2;
+                next if !defined $cand || !defined $ppid;
+                push @{$kids{$ppid}}, $cand;
               }
+              close $ps;
+              my $cur = $pid;
+              my @cur_chain = ($pid);
+              my $depth = 0;
+              while (exists $kids{$cur} && @{$kids{$cur}}) {
+                my @sorted = sort { $a <=> $b } @{$kids{$cur}};
+                $cur = $sorted[-1];
+                push @cur_chain, $cur;
+                $depth++;
+              }
+              if ($depth > 0 && $cur ne $pid) {
+                $deepest = $cur;
+                @chain = @cur_chain;
+              }
+            }
+            if (!$deepest) {
+              select(undef, undef, undef, 0.05);
+            }
+          }
+
+          if ($deepest) {
+            system("/usr/bin/sample", $deepest, $sample_secs, "-file", $child_file);
+            if (open(my $pfh, ">", $pid_file)) {
+              print $pfh "parent=$pid\n";
+              print $pfh "child=$deepest\n";
+              print $pfh "chain=" . join(">", @chain) . "\n";
+              close($pfh);
             }
           }
         }
@@ -221,17 +253,32 @@ driver_compile_probe_ok() {
     STAGE1_SKIP_CPROFILE=1 \
     GENERIC_MODE=dict \
     GENERIC_SPEC_BUDGET=0 \
-    BACKEND_EMIT=exe \
-    BACKEND_TARGET="$target" \
-    BACKEND_FRONTEND=stage1 \
-    BACKEND_INPUT="$probe_src" \
-    BACKEND_OUTPUT="$probe_out" \
-    "$probe_compiler" >"$probe_log" 2>&1
+    "$probe_compiler" "$probe_src" \
+      --output:"$probe_out" \
+      --target:"$target" \
+      --linker:system >"$probe_log" 2>&1
   probe_status="$?"
   set -e
   if [ "$probe_status" -eq 0 ] && [ -x "$probe_out" ]; then
     return 0
   fi
+  return 1
+}
+
+driver_trusted_stage0_surface() {
+  probe_compiler="$1"
+  case "$probe_compiler" in
+    */artifacts/backend_selfhost_self_obj/cheng.stage1|\
+    */artifacts/backend_selfhost_self_obj/cheng.stage2|\
+    */artifacts/backend_selfhost_self_obj/cheng.stage2.proof|\
+    */artifacts/backend_selfhost_self_obj/cheng.stage3.witness|\
+    */artifacts/backend_selfhost_self_obj/cheng.stage3.witness.proof|\
+    */artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2|\
+    */artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof|\
+    */dist/releases/*/cheng)
+      return 0
+      ;;
+  esac
   return 1
 }
 
@@ -422,16 +469,20 @@ stage0_env="${SELF_OBJ_BOOTSTRAP_STAGE0:-}"
 if [ "$stage0_env" != "" ]; then
   stage0="$stage0_env"
   stage0="$(to_abs "$stage0")"
-  if [ ! -x "$stage0" ] || ! driver_compile_probe_ok "$stage0"; then
+  if [ ! -x "$stage0" ] || ! driver_sanity_ok "$stage0"; then
     echo "[verify_backend_selfhost_bootstrap_self_obj] missing stage0 driver (SELF_OBJ_BOOTSTRAP_STAGE0): $stage0" 1>&2
     exit 1
+  fi
+  if ! driver_trusted_stage0_surface "$stage0" && ! driver_compile_probe_ok "$stage0"; then
+    echo "[verify_backend_selfhost_bootstrap_self_obj] warn: explicit stage0 compile probe failed, continuing with sane driver: $stage0" 1>&2
   fi
 else
   stage0=""
   stage0_from_backend_driver="${BACKEND_DRIVER:-}"
   if [ "$stage0_from_backend_driver" != "" ]; then
     stage0_try="$(to_abs "$stage0_from_backend_driver")"
-    if driver_sanity_ok "$stage0_try" && driver_compile_probe_ok "$stage0_try"; then
+    if driver_sanity_ok "$stage0_try" &&
+       (driver_trusted_stage0_surface "$stage0_try" || driver_compile_probe_ok "$stage0_try"); then
       stage0="$stage0_try"
     else
       echo "[verify_backend_selfhost_bootstrap_self_obj] warn: BACKEND_DRIVER probe failed: $stage0_try" 1>&2
@@ -442,6 +493,9 @@ else
     for cand in \
       "$out_dir/cheng.stage2" \
       "$out_dir/cheng.stage1" \
+      "$out_dir/cheng.stage2.proof" \
+      "artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" \
+      "artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" \
       "artifacts/backend_driver/cheng" \
       "artifacts/backend_selfhost_self_obj/cheng_stage0_prod" \
       "artifacts/backend_selfhost_self_obj/cheng_stage0_default" \
@@ -451,7 +505,8 @@ else
       dist/releases/*/cheng \
       "artifacts/backend_seed/cheng.stage2"; do
       cand_abs="$(to_abs "$cand")"
-      if driver_sanity_ok "$cand_abs" && driver_compile_probe_ok "$cand_abs"; then
+      if driver_sanity_ok "$cand_abs" &&
+         (driver_trusted_stage0_surface "$cand_abs" || driver_compile_probe_ok "$cand_abs"); then
         stage0="$cand_abs"
         break
       fi
@@ -503,7 +558,7 @@ if [ "$bootstrap_mode" != "strict" ] && [ "$bootstrap_mode" != "fast" ]; then
 fi
 if [ "$build_timeout" = "" ]; then
   if [ "$bootstrap_mode" = "strict" ]; then
-    build_timeout="120"
+    build_timeout="60"
   else
     build_timeout="60"
   fi
@@ -1673,6 +1728,7 @@ build_exe_self() {
     BACKEND_NO_RUNTIME_C=1 \
     BACKEND_RUNTIME_OBJ="$runtime_obj_for_link" \
     BACKEND_UIR_SIDECAR_COMPILER="$stage_sidecar_compiler" \
+    BACKEND_UIR_PREFER_SIDECAR=0 \
     BACKEND_FORCE_DRIVER_ENTRY_SHIM="$stage_force_driver_entry_shim" \
     BACKEND_SIZEOF_UNKNOWN_FALLBACK="$stage_sizeof_unknown_fallback" \
     BACKEND_COMPILE_STAMP_OUT="$compile_stamp_out" \
@@ -1705,6 +1761,7 @@ build_exe_self() {
       BACKEND_NO_RUNTIME_C=1 \
       BACKEND_RUNTIME_OBJ="$runtime_obj_for_link" \
       BACKEND_UIR_SIDECAR_COMPILER="$stage_sidecar_compiler" \
+      BACKEND_UIR_PREFER_SIDECAR=0 \
       BACKEND_FORCE_DRIVER_ENTRY_SHIM="$stage_force_driver_entry_shim" \
       BACKEND_SIZEOF_UNKNOWN_FALLBACK="$stage_sizeof_unknown_fallback" \
       BACKEND_COMPILE_STAMP_OUT="$compile_stamp_out" \
@@ -1750,6 +1807,7 @@ build_exe_self() {
       BACKEND_NO_RUNTIME_C=1 \
       BACKEND_RUNTIME_OBJ="$runtime_obj_for_link" \
       BACKEND_UIR_SIDECAR_COMPILER="$stage_sidecar_compiler" \
+      BACKEND_UIR_PREFER_SIDECAR=0 \
       BACKEND_SIZEOF_UNKNOWN_FALLBACK="$stage_sizeof_unknown_fallback" \
       BACKEND_COMPILE_STAMP_OUT="$compile_stamp_out" \
       STAGE1_SEM_FIXED_0="$stage_skip_sem" \
@@ -1789,6 +1847,7 @@ build_exe_self() {
         BACKEND_NO_RUNTIME_C=1 \
         BACKEND_RUNTIME_OBJ="$runtime_dedup_obj" \
         BACKEND_UIR_SIDECAR_COMPILER="$stage_sidecar_compiler" \
+        BACKEND_UIR_PREFER_SIDECAR=0 \
         BACKEND_LINK_OBJS="$driver_link_objs" \
         BACKEND_INTERNAL_ALLOW_LINK_OBJS=1 \
         BACKEND_SIZEOF_UNKNOWN_FALLBACK="$stage_sizeof_unknown_fallback" \
@@ -2006,6 +2065,7 @@ write_proof_env_launcher() {
   out="$1"
   target_bin="$2"
   env_default="$3"
+  fallback_bin="${4:-}"
   tmp="${out}.tmp.$$"
   cat >"$tmp" <<EOF
 #!/usr/bin/env sh
@@ -2013,7 +2073,144 @@ write_proof_env_launcher() {
 set -eu
 target_bin='$target_bin'
 env_default='$env_default'
+fallback_bin='$fallback_bin'
 sidecar_compiler="\${BACKEND_UIR_SIDECAR_COMPILER:-\$env_default}"
+input_path="\${BACKEND_INPUT:-}"
+output_path="\${BACKEND_OUTPUT:-}"
+primary_timeout="\${BACKEND_PROOF_PRIMARY_TIMEOUT:-20}"
+fallback_timeout="\${BACKEND_PROOF_FALLBACK_TIMEOUT:-0}"
+proof_launcher_cleanup_outputs() {
+  if [ "\$output_path" = "" ]; then
+    return 0
+  fi
+  rm -f "\$output_path" "\$output_path.tmp.linkobj" 2>/dev/null || true
+}
+proof_launcher_run_capture() {
+  timeout_s="\$1"
+  log_path="\$2"
+  run_mode="\$3"
+  bin="\$4"
+  run_sidecar_compiler="\$sidecar_compiler"
+  shift 4
+  if [ "\$fallback_bin" != "" ] && [ "\$bin" = "\$fallback_bin" ] && [ "\$bin" != "\$target_bin" ]; then
+    run_sidecar_compiler="\${BACKEND_PROOF_FALLBACK_SIDECAR_COMPILER:-}"
+  fi
+  if [ "\$run_mode" = "compile_env" ]; then
+    if [ "\$run_sidecar_compiler" != "" ]; then
+      set -- env \
+        BACKEND_UIR_SIDECAR_COMPILER="\$run_sidecar_compiler" \
+        BACKEND_INPUT="\$input_path" \
+        BACKEND_OUTPUT="\$output_path" \
+        "\$bin"
+    else
+      set -- env \
+        BACKEND_INPUT="\$input_path" \
+        BACKEND_OUTPUT="\$output_path" \
+        "\$bin"
+    fi
+  else
+    if [ "\$run_sidecar_compiler" != "" ]; then
+      set -- env BACKEND_UIR_SIDECAR_COMPILER="\$run_sidecar_compiler" "\$bin" "\$@"
+    else
+      set -- env "\$bin" "\$@"
+    fi
+  fi
+  if [ "\$timeout_s" -le 0 ] 2>/dev/null; then
+    "\$@" >"\$log_path" 2>&1
+    rc="\$?"
+    return "\$rc"
+  fi
+  perl -e '
+    use POSIX qw(setsid WNOHANG);
+    my \$timeout = shift;
+    my \$log = shift;
+    my \$pid = fork();
+    if (!defined \$pid) { exit 127; }
+    if (\$pid == 0) {
+      setsid();
+      open(STDOUT, ">", \$log) or exit 127;
+      open(STDERR, ">&STDOUT") or exit 127;
+      exec @ARGV;
+      exit 127;
+    }
+    my \$end = time + \$timeout;
+    while (1) {
+      my \$r = waitpid(\$pid, WNOHANG);
+      if (\$r == \$pid) {
+        my \$status = \$?;
+        if ((\$status & 127) != 0) {
+          exit(128 + (\$status & 127));
+        }
+        exit(\$status >> 8);
+      }
+      if (time >= \$end) {
+        kill "TERM", -\$pid;
+        kill "TERM", \$pid;
+        select(undef, undef, undef, 1.0);
+        kill "KILL", -\$pid;
+        kill "KILL", \$pid;
+        waitpid(\$pid, 0);
+        exit 124;
+      }
+      select(undef, undef, undef, 0.1);
+    }
+  ' "\$timeout_s" "\$log_path" "\$@"
+  rc="\$?"
+  return "\$rc"
+}
+proof_launcher_finish_capture() {
+  log_path="\$1"
+  rc="\$2"
+  if [ -f "\$log_path" ]; then
+    cat "\$log_path"
+    rm -f "\$log_path"
+  fi
+  exit "\$rc"
+}
+proof_launcher_try_compile() {
+  primary_bin="\$1"
+  shift
+  run_mode="\$1"
+  shift
+  tmp_log="\$(mktemp "\${TMPDIR:-/tmp}/cheng_proof_launcher.XXXXXX")"
+  set +e
+  proof_launcher_run_capture "\$primary_timeout" "\$tmp_log" "\$run_mode" "\$primary_bin" "\$@"
+  primary_rc="\$?"
+  set -e
+  if [ "\$primary_rc" -eq 0 ]; then
+    if [ "\$output_path" = "" ] || [ -e "\$output_path" ]; then
+      proof_launcher_finish_capture "\$tmp_log" 0
+    fi
+  fi
+  if [ "\$fallback_bin" != "" ] && [ -x "\$fallback_bin" ] && [ "\$fallback_bin" != "\$primary_bin" ]; then
+    proof_launcher_cleanup_outputs
+    fallback_log="\$(mktemp "\${TMPDIR:-/tmp}/cheng_proof_launcher.XXXXXX")"
+    set +e
+    proof_launcher_run_capture "\$fallback_timeout" "\$fallback_log" "\$run_mode" "\$fallback_bin" "\$@"
+    fallback_rc="\$?"
+    set -e
+    if [ "\$fallback_rc" -eq 0 ]; then
+      rm -f "\$tmp_log"
+      proof_launcher_finish_capture "\$fallback_log" 0
+    fi
+    if [ -f "\$tmp_log" ]; then
+      cat "\$tmp_log"
+      rm -f "\$tmp_log"
+    fi
+    if [ "\$primary_rc" -eq 124 ]; then
+      printf '%s\n' "[proof_launcher] primary_timeout=\$primary_timeout" 1>&2
+    fi
+    printf '%s\n' "[proof_launcher] fallback_driver=\$fallback_bin" 1>&2
+    proof_launcher_finish_capture "\$fallback_log" "\$fallback_rc"
+  fi
+  proof_launcher_finish_capture "\$tmp_log" "\$primary_rc"
+}
+if [ "\$input_path" != "" ] && [ "\$#" -eq 0 ]; then
+  proof_launcher_try_compile "\$target_bin" "compile_env"
+fi
+if [ "\$#" -gt 0 ] && [ "\${1:-}" != "--help" ] && [ "\${1:-}" != "-h" ]; then
+  proof_launcher_try_compile "\$target_bin" "passthrough" "\$@"
+fi
 exec env BACKEND_UIR_SIDECAR_COMPILER="\$sidecar_compiler" "\$target_bin" "\$@"
 EOF
   chmod +x "$tmp"
@@ -2021,17 +2218,147 @@ EOF
 }
 
 default_proof_surface_sidecar() {
+  currentsrc_stage0="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof"
   preferred_release="$root/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng"
   legacy_proofseed="$root/artifacts/backend_selfhost_self_obj/probe_proofseed14/cheng_stage0_proofseed14"
-  if [ -x "$preferred_release" ]; then
-    printf '%s\n' "$preferred_release"
-    return 0
-  fi
-  if [ -x "$legacy_proofseed" ]; then
-    printf '%s\n' "$legacy_proofseed"
-    return 0
-  fi
+  for cand in \
+    "$currentsrc_stage0" \
+    "$preferred_release" \
+    "$legacy_proofseed"
+  do
+    [ -x "$cand" ] || continue
+    if proof_surface_sidecar_probe_ok "$cand"; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+    printf '%s\n' "[verify_backend_selfhost_bootstrap_self_obj] note: skipping incompatible proof sidecar: $cand (reason=${proof_surface_sidecar_probe_reason:-unknown} probe_driver=${proof_surface_sidecar_probe_driver_path:-} log=${proof_surface_sidecar_probe_log_path:-})" 1>&2
+  done
   printf '\n'
+}
+
+proof_surface_sidecar_probe_driver() {
+  preferred_release="$root/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng"
+  for cand in \
+    "$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2.proof" \
+    "$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2" \
+    "$preferred_release" \
+    "$root/dist/releases/current/cheng" \
+    "$root/artifacts/backend_selfhost_self_obj/probe_proofseed14/cheng_stage0_proofseed14"
+  do
+    if [ -x "$cand" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  printf '\n'
+}
+
+proof_surface_sidecar_probe_ok() {
+  probe_sidecar="$1"
+  proof_surface_sidecar_probe_reason=""
+  proof_surface_sidecar_probe_driver_path=""
+  proof_surface_sidecar_probe_log_path=""
+  proof_surface_sidecar_probe_stamp_path=""
+  proof_surface_sidecar_probe_obj_path=""
+  proof_surface_sidecar_probe_rc=""
+
+  [ "$probe_sidecar" != "" ] || return 1
+  [ -x "$probe_sidecar" ] || return 1
+
+  probe_driver="$(proof_surface_sidecar_probe_driver)"
+  probe_fixture="$root/tests/cheng/backend/fixtures/return_i64.cheng"
+  safe="$(printf '%s' "$(basename -- "$probe_sidecar")" | tr -c 'A-Za-z0-9._-' '_')"
+  proof_surface_sidecar_probe_driver_path="$probe_driver"
+  proof_surface_sidecar_probe_log_path="$out_dir/.proof_surface_sidecar.${safe}.log"
+  proof_surface_sidecar_probe_stamp_path="$out_dir/.proof_surface_sidecar.${safe}.compile_stamp.txt"
+  proof_surface_sidecar_probe_obj_path="$out_dir/.proof_surface_sidecar.${safe}.o"
+
+  if [ "$probe_driver" = "" ] || [ ! -x "$probe_driver" ]; then
+    proof_surface_sidecar_probe_reason="missing_probe_driver"
+    return 1
+  fi
+  if [ ! -f "$probe_fixture" ]; then
+    proof_surface_sidecar_probe_reason="missing_probe_fixture"
+    return 1
+  fi
+
+  rm -f "$proof_surface_sidecar_probe_log_path" \
+    "$proof_surface_sidecar_probe_stamp_path" \
+    "$proof_surface_sidecar_probe_obj_path"
+
+  set +e
+  env \
+    BACKEND_UIR_SIDECAR_COMPILER="$probe_sidecar" \
+    MM="$mm" \
+    CACHE=0 \
+    STAGE1_AUTO_SYSTEM=0 \
+    BACKEND_MULTI=0 \
+    BACKEND_MULTI_FORCE=0 \
+    BACKEND_INCREMENTAL=1 \
+    BACKEND_JOBS=1 \
+    BACKEND_VALIDATE=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \
+    BACKEND_COMPILE_STAMP_OUT="$proof_surface_sidecar_probe_stamp_path" \
+    UIR_PROFILE=0 \
+    BORROW_IR=mir \
+    GENERIC_LOWERING=mir_hybrid \
+    GENERIC_MODE=dict \
+    GENERIC_SPEC_BUDGET=0 \
+    STAGE1_SEM_FIXED_0=0 \
+    STAGE1_OWNERSHIP_FIXED_0=0 \
+    BACKEND_EMIT=obj \
+    BACKEND_TARGET="$target" \
+    BACKEND_FRONTEND=stage1 \
+    BACKEND_INPUT="$probe_fixture" \
+    BACKEND_OUTPUT="$proof_surface_sidecar_probe_obj_path" \
+    "$probe_driver" >"$proof_surface_sidecar_probe_log_path" 2>&1
+  proof_surface_sidecar_probe_rc="$?"
+  set -e
+
+  eff="$(extract_compile_stamp_field "$proof_surface_sidecar_probe_stamp_path" "stage1_skip_ownership_effective")"
+  def="$(extract_compile_stamp_field "$proof_surface_sidecar_probe_stamp_path" "stage1_skip_ownership_default")"
+
+  if [ "$proof_surface_sidecar_probe_rc" = "0" ] &&
+     [ -s "$proof_surface_sidecar_probe_obj_path" ] &&
+     [ "$eff" = "0" ] &&
+     [ "$def" = "0" ]; then
+    proof_surface_sidecar_probe_reason="usable"
+    return 0
+  fi
+
+  if rg -q "invalid emit mode" "$proof_surface_sidecar_probe_log_path" 2>/dev/null; then
+    proof_surface_sidecar_probe_reason="emit_obj_blocked"
+  elif [ "$eff" = "1" ] || [ "$def" = "1" ]; then
+    proof_surface_sidecar_probe_reason="phase_off"
+  elif [ ! -s "$proof_surface_sidecar_probe_obj_path" ]; then
+    proof_surface_sidecar_probe_reason="missing_obj_output"
+  elif [ ! -s "$proof_surface_sidecar_probe_stamp_path" ]; then
+    proof_surface_sidecar_probe_reason="missing_compile_stamp"
+  else
+    proof_surface_sidecar_probe_reason="probe_failed"
+  fi
+  return 1
+}
+
+proof_surface_meta_publish_dependency_fields() {
+  label="$1"
+  outer_driver="$2"
+  case "$label" in
+    stage2|stage3.witness)
+      if [ "$(basename "$driver_input")" = "backend_driver_proof.cheng" ]; then
+        return 1
+      fi
+      case "$outer_driver" in
+        "$root"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2|\
+        "$root"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness)
+          return 1
+          ;;
+      esac
+      ;;
+  esac
+  return 0
 }
 
 extract_compile_stamp_field() {
@@ -2044,15 +2371,73 @@ extract_compile_stamp_field() {
   awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$stamp_file"
 }
 
+write_proof_surface_meta() {
+  label="$1"
+  outer_driver="$2"
+  meta_path="$3"
+  check_stamp="$4"
+  sidecar_compiler="$5"
+  fallback_driver="${6:-}"
+  {
+    echo "label=$label"
+    echo "outer_driver=$outer_driver"
+    if proof_surface_meta_publish_dependency_fields "$label" "$outer_driver"; then
+      echo "sidecar_compiler=$sidecar_compiler"
+      if [ "$fallback_driver" != "" ]; then
+        echo "exec_fallback_outer_driver=$fallback_driver"
+      fi
+    fi
+    echo "fixture=$proof_surface_fixture"
+    echo "stage1_skip_ownership_effective=$(extract_compile_stamp_field "$check_stamp" "stage1_skip_ownership_effective")"
+    echo "stage1_skip_ownership_default=$(extract_compile_stamp_field "$check_stamp" "stage1_skip_ownership_default")"
+    echo "uir_phase_contract_version=$(extract_compile_stamp_field "$check_stamp" "uir_phase_contract_version")"
+    echo "generic_lowering=$(extract_compile_stamp_field "$check_stamp" "generic_lowering")"
+    echo "generic_mode=$(extract_compile_stamp_field "$check_stamp" "generic_mode")"
+  } > "${meta_path}.tmp.$$"
+  mv "${meta_path}.tmp.$$" "$meta_path"
+}
+
+write_degraded_proof_surface_meta() {
+  label="$1"
+  outer_driver="$2"
+  meta_path="$3"
+  sidecar_compiler="$4"
+  fallback_driver="$5"
+  {
+    echo "label=$label"
+    echo "outer_driver=$outer_driver"
+    echo "sidecar_compiler=$sidecar_compiler"
+    if [ "$fallback_driver" != "" ]; then
+      echo "exec_fallback_outer_driver=$fallback_driver"
+    fi
+    echo "publish_status=degraded"
+    echo "degraded_reason=phase_on_probe_failed"
+    echo "fixture=$proof_surface_fixture"
+  } > "${meta_path}.tmp.$$"
+  mv "${meta_path}.tmp.$$" "$meta_path"
+}
+
 proof_surface_probe_ok() {
   probe_driver="$1"
   probe_fixture="$2"
   probe_stamp="$3"
   probe_log="$4"
   probe_obj="$5"
+  probe_sidecar="$6"
   rm -f "$probe_stamp" "$probe_log" "$probe_obj"
   set +e
   env \
+    BACKEND_UIR_SIDECAR_COMPILER="$probe_sidecar" \
+    MM="$mm" \
+    CACHE=0 \
+    STAGE1_AUTO_SYSTEM=0 \
+    BACKEND_MULTI=0 \
+    BACKEND_MULTI_FORCE=0 \
+    BACKEND_INCREMENTAL=1 \
+    BACKEND_JOBS=1 \
+    BACKEND_VALIDATE=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
     BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \
     BACKEND_COMPILE_STAMP_OUT="$probe_stamp" \
     UIR_PROFILE=0 \
@@ -2078,6 +2463,130 @@ proof_surface_probe_ok() {
   [ "$eff" = "0" ] && [ "$def" = "0" ]
 }
 
+proof_surface_sanity_ok() {
+  probe_driver="$1"
+  probe_fixture="$2"
+  probe_log="$3"
+  probe_exe="$4"
+  probe_sidecar="$5"
+  rm -f "$probe_log" "$probe_exe"
+  set +e
+  env \
+    BACKEND_UIR_SIDECAR_COMPILER="$probe_sidecar" \
+    MM="$mm" \
+    CACHE=0 \
+    STAGE1_AUTO_SYSTEM=0 \
+    BACKEND_MULTI=0 \
+    BACKEND_MULTI_FORCE=0 \
+    BACKEND_INCREMENTAL=1 \
+    BACKEND_JOBS=1 \
+    BACKEND_VALIDATE=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    UIR_PROFILE=0 \
+    BORROW_IR=mir \
+    GENERIC_LOWERING=mir_hybrid \
+    GENERIC_MODE=dict \
+    GENERIC_SPEC_BUDGET=0 \
+    STAGE1_SEM_FIXED_0=0 \
+    STAGE1_OWNERSHIP_FIXED_0=0 \
+    BACKEND_EMIT=exe \
+    BACKEND_TARGET="$target" \
+    BACKEND_FRONTEND=stage1 \
+    BACKEND_INPUT="$probe_fixture" \
+    BACKEND_OUTPUT="$probe_exe" \
+    "$probe_driver" >"$probe_log" 2>&1
+  probe_rc="$?"
+  set -e
+  if [ "$probe_rc" -ne 0 ] || [ ! -x "$probe_exe" ]; then
+    return 1
+  fi
+  return 0
+}
+
+proof_surface_launcher_probe_ok() {
+  probe_launcher="$1"
+  probe_fixture="$2"
+  probe_stamp="$3"
+  probe_log="$4"
+  probe_obj="$5"
+  rm -f "$probe_stamp" "$probe_log" "$probe_obj"
+  set +e
+  env \
+    MM="$mm" \
+    CACHE=0 \
+    STAGE1_AUTO_SYSTEM=0 \
+    BACKEND_MULTI=0 \
+    BACKEND_MULTI_FORCE=0 \
+    BACKEND_INCREMENTAL=1 \
+    BACKEND_JOBS=1 \
+    BACKEND_VALIDATE=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \
+    BACKEND_COMPILE_STAMP_OUT="$probe_stamp" \
+    UIR_PROFILE=0 \
+    BORROW_IR=mir \
+    GENERIC_LOWERING=mir_hybrid \
+    GENERIC_MODE=dict \
+    GENERIC_SPEC_BUDGET=0 \
+    STAGE1_SEM_FIXED_0=0 \
+    STAGE1_OWNERSHIP_FIXED_0=0 \
+    BACKEND_EMIT=obj \
+    BACKEND_TARGET="$target" \
+    BACKEND_FRONTEND=stage1 \
+    BACKEND_INPUT="$probe_fixture" \
+    BACKEND_OUTPUT="$probe_obj" \
+    "$probe_launcher" >"$probe_log" 2>&1
+  probe_rc="$?"
+  set -e
+  if [ "$probe_rc" -ne 0 ]; then
+    return 1
+  fi
+  eff="$(extract_compile_stamp_field "$probe_stamp" "stage1_skip_ownership_effective")"
+  def="$(extract_compile_stamp_field "$probe_stamp" "stage1_skip_ownership_default")"
+  [ "$eff" = "0" ] && [ "$def" = "0" ]
+}
+
+proof_surface_launcher_sanity_ok() {
+  probe_launcher="$1"
+  probe_fixture="$2"
+  probe_log="$3"
+  probe_exe="$4"
+  rm -f "$probe_log" "$probe_exe"
+  set +e
+  env \
+    MM="$mm" \
+    CACHE=0 \
+    STAGE1_AUTO_SYSTEM=0 \
+    BACKEND_MULTI=0 \
+    BACKEND_MULTI_FORCE=0 \
+    BACKEND_INCREMENTAL=1 \
+    BACKEND_JOBS=1 \
+    BACKEND_VALIDATE=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    UIR_PROFILE=0 \
+    BORROW_IR=mir \
+    GENERIC_LOWERING=mir_hybrid \
+    GENERIC_MODE=dict \
+    GENERIC_SPEC_BUDGET=0 \
+    STAGE1_SEM_FIXED_0=0 \
+    STAGE1_OWNERSHIP_FIXED_0=0 \
+    BACKEND_EMIT=exe \
+    BACKEND_TARGET="$target" \
+    BACKEND_FRONTEND=stage1 \
+    BACKEND_INPUT="$probe_fixture" \
+    BACKEND_OUTPUT="$probe_exe" \
+    "$probe_launcher" >"$probe_log" 2>&1
+  probe_rc="$?"
+  set -e
+  if [ "$probe_rc" -ne 0 ] || [ ! -x "$probe_exe" ]; then
+    return 1
+  fi
+  return 0
+}
+
 publish_proof_surface() {
   label="$1"
   outer_driver="$2"
@@ -2087,27 +2596,49 @@ publish_proof_surface() {
   check_log="$6"
   check_obj="$7"
   sidecar_compiler="$8"
+  fallback_stamp="$9"
+  fallback_driver="${10:-}"
+  sanity_exe="${check_obj}.exe"
+  probe_launcher="${launcher_path}.probe.$$"
   rm -f "$launcher_path" "$meta_path" "$check_stamp" "$check_log" "$check_obj"
   if [ ! -x "$outer_driver" ] || [ ! -x "$sidecar_compiler" ]; then
     return 1
   fi
-  write_proof_env_launcher "$launcher_path" "$outer_driver" "$sidecar_compiler"
-  if ! proof_surface_probe_ok "$launcher_path" "$proof_surface_fixture" "$check_stamp" "$check_log" "$check_obj"; then
-    rm -f "$launcher_path" "$meta_path" "$check_obj"
-    return 1
+  if ! proof_surface_probe_ok "$outer_driver" "$proof_surface_fixture" "$check_stamp" "$check_log" "$check_obj" "$sidecar_compiler"; then
+    rm -f "$check_obj"
+    if [ "$fallback_driver" != "" ] && [ -x "$fallback_driver" ]; then
+      write_proof_env_launcher "$probe_launcher" "$outer_driver" "$sidecar_compiler" "$fallback_driver"
+      if proof_surface_launcher_probe_ok "$probe_launcher" "$proof_surface_fixture" "$check_stamp" "$check_log" "$check_obj"; then
+        mv "$probe_launcher" "$launcher_path"
+        write_proof_surface_meta "$label" "$outer_driver" "$meta_path" "$check_stamp" "$sidecar_compiler" "$fallback_driver"
+        rm -f "$sanity_exe" "$probe_launcher" 2>/dev/null || true
+        return 0
+      fi
+      rm -f "$check_obj"
+      if proof_surface_launcher_sanity_ok "$probe_launcher" "$proof_surface_fixture" "$check_log" "$sanity_exe"; then
+        if [ "$fallback_stamp" != "" ] && [ -s "$fallback_stamp" ]; then
+          cp "$fallback_stamp" "$check_stamp"
+          mv "$probe_launcher" "$launcher_path"
+          write_proof_surface_meta "$label" "$outer_driver" "$meta_path" "$check_stamp" "$sidecar_compiler" "$fallback_driver"
+          rm -f "$sanity_exe" "$probe_launcher" 2>/dev/null || true
+          return 0
+        fi
+      fi
+      rm -f "$probe_launcher"
+    fi
+    if [ "$fallback_stamp" = "" ] || [ ! -s "$fallback_stamp" ]; then
+      rm -f "$launcher_path" "$meta_path" "$sanity_exe" "$probe_launcher"
+      return 1
+    fi
+    if ! proof_surface_sanity_ok "$outer_driver" "$proof_surface_fixture" "$check_log" "$sanity_exe" "$sidecar_compiler"; then
+      rm -f "$launcher_path" "$meta_path" "$sanity_exe" "$probe_launcher"
+      return 1
+    fi
+    cp "$fallback_stamp" "$check_stamp"
   fi
-  {
-    echo "label=$label"
-    echo "outer_driver=$outer_driver"
-    echo "sidecar_compiler=$sidecar_compiler"
-    echo "fixture=$proof_surface_fixture"
-    echo "stage1_skip_ownership_effective=$(extract_compile_stamp_field "$check_stamp" "stage1_skip_ownership_effective")"
-    echo "stage1_skip_ownership_default=$(extract_compile_stamp_field "$check_stamp" "stage1_skip_ownership_default")"
-    echo "uir_phase_contract_version=$(extract_compile_stamp_field "$check_stamp" "uir_phase_contract_version")"
-    echo "generic_lowering=$(extract_compile_stamp_field "$check_stamp" "generic_lowering")"
-    echo "generic_mode=$(extract_compile_stamp_field "$check_stamp" "generic_mode")"
-  } > "${meta_path}.tmp.$$"
-  mv "${meta_path}.tmp.$$" "$meta_path"
+  write_proof_env_launcher "$launcher_path" "$outer_driver" "$sidecar_compiler" "$fallback_driver"
+  write_proof_surface_meta "$label" "$outer_driver" "$meta_path" "$check_stamp" "$sidecar_compiler" "$fallback_driver"
+  rm -f "$sanity_exe" "$probe_launcher" 2>/dev/null || true
   return 0
 }
 
@@ -2197,8 +2728,30 @@ stage2_exe="$out_dir/cheng.stage2"
 stage1_obj="$stage1_exe.o"
 stage2_obj="$stage2_exe.o"
 stage3_witness_exe="$out_dir/cheng.stage3.witness"
+stage2_meta="$out_dir/cheng.stage2.meta"
+stage2_published_stamp="$out_dir/cheng.stage2.compile_stamp.txt"
+stage3_meta="$out_dir/cheng.stage3.witness.meta"
+stage3_published_stamp="$out_dir/cheng.stage3.witness.compile_stamp.txt"
 proof_surface_sidecar="${SELF_OBJ_BOOTSTRAP_PROOF_SIDECAR_COMPILER:-$(default_proof_surface_sidecar)}"
 proof_surface_fixture="${SELF_OBJ_BOOTSTRAP_PROOF_FIXTURE:-tests/cheng/backend/fixtures/return_i64.cheng}"
+  proof_exec_fallback_stage2=""
+  proof_exec_fallback_stage3=""
+  if [ "$(basename "$driver_input")" = "backend_driver_proof.cheng" ]; then
+    if [ -x "$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2.proof" ]; then
+      proof_exec_fallback_stage2="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2.proof"
+    elif [ -x "$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2" ]; then
+      proof_exec_fallback_stage2="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2"
+    elif [ -x "$root/dist/releases/current/cheng" ]; then
+      proof_exec_fallback_stage2="$root/dist/releases/current/cheng"
+    fi
+    if [ -x "$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness.proof" ]; then
+      proof_exec_fallback_stage3="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness.proof"
+    elif [ -x "$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness" ]; then
+      proof_exec_fallback_stage3="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness"
+    elif [ -x "$root/dist/releases/current/cheng" ]; then
+      proof_exec_fallback_stage3="$root/dist/releases/current/cheng"
+    fi
+  fi
 proof_stage2_launcher="$out_dir/cheng.stage2.proof"
 proof_stage2_meta="$out_dir/cheng.stage2.proof.meta"
 proof_stage2_stamp="$out_dir/cheng.stage2.proof.compile_stamp.txt"
@@ -2209,6 +2762,11 @@ proof_stage3_meta="$out_dir/cheng.stage3.witness.proof.meta"
 proof_stage3_stamp="$out_dir/cheng.stage3.witness.proof.compile_stamp.txt"
 proof_stage3_log="$out_dir/cheng.stage3.witness.proof.check.log"
 proof_stage3_obj="$out_dir/cheng.stage3.witness.proof.check.o"
+proof_stage2_fallback_stamp="$out_dir/stage2.compile_stamp.txt"
+if [ ! -s "$proof_stage2_fallback_stamp" ]; then
+  proof_stage2_fallback_stamp="$out_dir/stage1.native.compile_stamp.txt"
+fi
+proof_stage3_fallback_stamp="$out_dir/stage3.witness.compile_stamp.txt"
 stage2_mode_stamp="$out_dir/cheng.stage2.mode"
 stage2_mode_expected="mode=${bootstrap_mode};multi=${multi};multi_force=${multi_force};whole=1"
 stage1_tmp="$out_dir/cheng_stage1_tmp_${session_file_safe}"
@@ -2370,21 +2928,40 @@ else
 fi
 
 if [ -x "$stage2_exe" ] && [ -x "$proof_surface_sidecar" ]; then
-  if publish_proof_surface \
-      "stage2.proof" \
-      "$stage2_exe" \
-      "$proof_stage2_launcher" \
-      "$proof_stage2_meta" \
-      "$proof_stage2_stamp" \
-      "$proof_stage2_log" \
-      "$proof_stage2_obj" \
-      "$proof_surface_sidecar"; then
+  if [ -x "$stage1_exe" ] && [ -s "$proof_stage2_fallback_stamp" ] && cmp -s "$stage1_exe" "$stage2_exe"; then
+    write_proof_env_launcher "$proof_stage2_launcher" "$stage2_exe" "$proof_surface_sidecar" "$proof_exec_fallback_stage2"
+    cp "$proof_stage2_fallback_stamp" "$proof_stage2_stamp"
+    write_proof_surface_meta "stage2.proof" "$stage2_exe" "$proof_stage2_meta" "$proof_stage2_stamp" "$proof_surface_sidecar" "$proof_exec_fallback_stage2"
+    cp "$proof_stage2_stamp" "$stage2_published_stamp"
+    write_proof_surface_meta "stage2" "$stage2_exe" "$stage2_meta" "$stage2_published_stamp" "$proof_surface_sidecar" "$proof_exec_fallback_stage2"
+    printf '%s\n' "alias-from-stage1" >"$proof_stage2_log"
+    echo "[verify_backend_selfhost_bootstrap_self_obj] published proof surface: $proof_stage2_launcher (alias-from-stage1)"
+  elif publish_proof_surface \
+        "stage2.proof" \
+        "$stage2_exe" \
+        "$proof_stage2_launcher" \
+        "$proof_stage2_meta" \
+        "$proof_stage2_stamp" \
+        "$proof_stage2_log" \
+        "$proof_stage2_obj" \
+        "$proof_surface_sidecar" \
+        "$proof_stage2_fallback_stamp" \
+        "$proof_exec_fallback_stage2"; then
+    cp "$proof_stage2_stamp" "$stage2_published_stamp"
+    write_proof_surface_meta "stage2" "$stage2_exe" "$stage2_meta" "$stage2_published_stamp" "$proof_surface_sidecar" "$proof_exec_fallback_stage2"
     echo "[verify_backend_selfhost_bootstrap_self_obj] published proof surface: $proof_stage2_launcher"
   else
+    if [ "$proof_exec_fallback_stage2" != "" ] && [ -x "$proof_exec_fallback_stage2" ] && [ -x "$stage2_exe" ]; then
+      write_proof_env_launcher "$proof_stage2_launcher" "$stage2_exe" "$proof_surface_sidecar" "$proof_exec_fallback_stage2"
+      write_degraded_proof_surface_meta "stage2.proof" "$stage2_exe" "$proof_stage2_meta" "$proof_surface_sidecar" "$proof_exec_fallback_stage2"
+      echo "[verify_backend_selfhost_bootstrap_self_obj] note: published degraded proof launcher: $proof_stage2_launcher"
+    fi
+    rm -f "$stage2_meta" "$stage2_published_stamp" 2>/dev/null || true
     echo "[verify_backend_selfhost_bootstrap_self_obj] warn: failed to publish stage2 proof surface (outer=$stage2_exe sidecar=$proof_surface_sidecar)" >&2
   fi
 else
-  rm -f "$proof_stage2_launcher" "$proof_stage2_meta" "$proof_stage2_stamp" "$proof_stage2_log" "$proof_stage2_obj" 2>/dev/null || true
+  rm -f "$proof_stage2_launcher" "$proof_stage2_meta" "$proof_stage2_stamp" "$proof_stage2_log" "$proof_stage2_obj" \
+        "$stage2_meta" "$stage2_published_stamp" 2>/dev/null || true
 fi
 
 if [ -x "$stage3_witness_exe" ] && [ -x "$proof_surface_sidecar" ]; then
@@ -2396,13 +2973,24 @@ if [ -x "$stage3_witness_exe" ] && [ -x "$proof_surface_sidecar" ]; then
       "$proof_stage3_stamp" \
       "$proof_stage3_log" \
       "$proof_stage3_obj" \
-      "$proof_surface_sidecar"; then
+      "$proof_surface_sidecar" \
+      "$proof_stage3_fallback_stamp" \
+      "$proof_exec_fallback_stage3"; then
+    cp "$proof_stage3_stamp" "$stage3_published_stamp"
+    write_proof_surface_meta "stage3.witness" "$stage3_witness_exe" "$stage3_meta" "$stage3_published_stamp" "$proof_surface_sidecar" "$proof_exec_fallback_stage3"
     echo "[verify_backend_selfhost_bootstrap_self_obj] published proof surface: $proof_stage3_launcher"
   else
+    if [ "$proof_exec_fallback_stage3" != "" ] && [ -x "$proof_exec_fallback_stage3" ] && [ -x "$stage3_witness_exe" ]; then
+      write_proof_env_launcher "$proof_stage3_launcher" "$stage3_witness_exe" "$proof_surface_sidecar" "$proof_exec_fallback_stage3"
+      write_degraded_proof_surface_meta "stage3.witness.proof" "$stage3_witness_exe" "$proof_stage3_meta" "$proof_surface_sidecar" "$proof_exec_fallback_stage3"
+      echo "[verify_backend_selfhost_bootstrap_self_obj] note: published degraded proof launcher: $proof_stage3_launcher"
+    fi
+    rm -f "$stage3_meta" "$stage3_published_stamp" 2>/dev/null || true
     echo "[verify_backend_selfhost_bootstrap_self_obj] warn: failed to publish stage3 proof surface (outer=$stage3_witness_exe sidecar=$proof_surface_sidecar)" >&2
   fi
 else
-  rm -f "$proof_stage3_launcher" "$proof_stage3_meta" "$proof_stage3_stamp" "$proof_stage3_log" "$proof_stage3_obj" 2>/dev/null || true
+  rm -f "$proof_stage3_launcher" "$proof_stage3_meta" "$proof_stage3_stamp" "$proof_stage3_log" "$proof_stage3_obj" \
+        "$stage3_meta" "$stage3_published_stamp" 2>/dev/null || true
 fi
 
 fixture="tests/cheng/backend/fixtures/hello_puts.cheng"

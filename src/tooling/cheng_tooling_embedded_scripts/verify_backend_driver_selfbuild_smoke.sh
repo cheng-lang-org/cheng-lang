@@ -330,7 +330,7 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 stage0="${DRIVER_SELFBUILD_SMOKE_STAGE0:-}"

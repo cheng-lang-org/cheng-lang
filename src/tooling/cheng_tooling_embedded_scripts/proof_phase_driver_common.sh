@@ -10,6 +10,41 @@ proof_phase_driver_extract_stamp_field() {
   awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$stamp_file"
 }
 
+proof_phase_driver_summary_flat() {
+  if [ "${proof_phase_driver_summary:-}" = "" ]; then
+    printf '\n'
+    return 0
+  fi
+  printf '%s' "$proof_phase_driver_summary" | tr '\n' '|' | sed 's/|$//'
+}
+
+proof_phase_driver_published_surface_ok() {
+  cand="$1"
+  meta="${cand}.meta"
+  stamp="${cand}.compile_stamp.txt"
+  if [ ! -x "$cand" ] || [ ! -s "$meta" ] || [ ! -s "$stamp" ]; then
+    return 1
+  fi
+  eff="$(proof_phase_driver_extract_stamp_field "$stamp" "stage1_skip_ownership_effective")"
+  def="$(proof_phase_driver_extract_stamp_field "$stamp" "stage1_skip_ownership_default")"
+  phase="$(proof_phase_driver_extract_stamp_field "$stamp" "uir_phase_contract_version")"
+  if [ "$eff" != "0" ] || [ "$def" != "0" ]; then
+    return 1
+  fi
+  if [ "$phase" != "p4_phase_v1" ]; then
+    return 1
+  fi
+  case "$cand" in
+    "$root"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2|\
+    "$root"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness)
+      if rg -q '^(sidecar_compiler|exec_fallback_outer_driver)=' "$meta"; then
+        return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
 proof_phase_driver_first_error() {
   log_file="$1"
   if [ ! -f "$log_file" ]; then
@@ -78,12 +113,17 @@ proof_phase_driver_probe_candidate() {
   proof_phase_driver_probe_stamp="$out_dir/.proof_phase_driver.${label}.compile_stamp.txt"
   proof_phase_driver_probe_obj="$out_dir/.proof_phase_driver.${label}.o"
   proof_phase_driver_probe_error=""
+  proof_phase_driver_probe_published="0"
 
   rm -f "$proof_phase_driver_probe_log" "$proof_phase_driver_probe_stamp" "$proof_phase_driver_probe_obj"
 
   if [ "$cand" = "" ] || [ ! -x "$cand" ]; then
     proof_phase_driver_probe_reason="missing"
     return 1
+  fi
+
+  if proof_phase_driver_published_surface_ok "$cand"; then
+    proof_phase_driver_probe_published="1"
   fi
 
   set +e
@@ -176,10 +216,17 @@ proof_phase_driver_pick() {
   proof_phase_driver_env=""
   proof_phase_driver_sidecar_compiler=""
   proof_phase_driver_summary=""
+  proof_phase_driver_proof_path=""
+  proof_phase_driver_proof_surface=""
+  proof_phase_driver_proof_sidecar_compiler=""
   strict_outer_driver="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2"
   strict_stage3_witness="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness"
   strict_outer_driver_proof="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2.proof"
   strict_stage3_witness_proof="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness.proof"
+  currentsrc_outer_driver="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2"
+  currentsrc_stage3_witness="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness"
+  currentsrc_outer_driver_proof="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"
+  currentsrc_stage3_witness_proof="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness.proof"
   proof_surface_sidecar="$(proof_phase_driver_default_sidecar)"
 
   if [ ! -f "$fixture" ]; then
@@ -188,8 +235,42 @@ proof_phase_driver_pick() {
   fi
 
   candidates_tmp="$(mktemp "${TMPDIR:-/tmp}/proof_phase_driver_candidates.XXXXXX")"
+  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$currentsrc_outer_driver"; then
+    proof_phase_driver_proof_path="$currentsrc_outer_driver"
+    proof_phase_driver_proof_surface="probe_currentsrc_proof"
+    proof_phase_driver_proof_sidecar_compiler=""
+  fi
+  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$currentsrc_stage3_witness"; then
+    proof_phase_driver_proof_path="$currentsrc_stage3_witness"
+    proof_phase_driver_proof_surface="probe_currentsrc_stage3_witness_proof"
+    proof_phase_driver_proof_sidecar_compiler=""
+  fi
+  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$currentsrc_outer_driver_proof"; then
+    proof_phase_driver_proof_path="$currentsrc_outer_driver_proof"
+    proof_phase_driver_proof_surface="probe_currentsrc_proof"
+    proof_phase_driver_proof_sidecar_compiler=""
+  fi
+  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$currentsrc_stage3_witness_proof"; then
+    proof_phase_driver_proof_path="$currentsrc_stage3_witness_proof"
+    proof_phase_driver_proof_surface="probe_currentsrc_stage3_witness_proof"
+    proof_phase_driver_proof_sidecar_compiler=""
+  fi
+  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$strict_outer_driver_proof"; then
+    proof_phase_driver_proof_path="$strict_outer_driver_proof"
+    proof_phase_driver_proof_surface="probe_prod_strict_noreuse_proof"
+    proof_phase_driver_proof_sidecar_compiler=""
+  fi
+  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$strict_stage3_witness_proof"; then
+    proof_phase_driver_proof_path="$strict_stage3_witness_proof"
+    proof_phase_driver_proof_surface="probe_prod_strict_stage3_witness_proof"
+    proof_phase_driver_proof_sidecar_compiler=""
+  fi
   {
     proof_phase_driver_append_candidate_line "${BACKEND_PROOF_PHASE_DRIVER:-}" "env" "${BACKEND_UIR_SIDECAR_COMPILER:-}"
+    proof_phase_driver_append_candidate_line "$currentsrc_outer_driver" "probe_currentsrc_proof" ""
+    proof_phase_driver_append_candidate_line "$currentsrc_stage3_witness" "probe_currentsrc_stage3_witness_proof" ""
+    proof_phase_driver_append_candidate_line "$currentsrc_outer_driver_proof" "probe_currentsrc_proof" ""
+    proof_phase_driver_append_candidate_line "$currentsrc_stage3_witness_proof" "probe_currentsrc_stage3_witness_proof" ""
     proof_phase_driver_append_candidate_line "$strict_outer_driver_proof" "probe_prod_strict_noreuse_proof" ""
     proof_phase_driver_append_candidate_line "$strict_stage3_witness_proof" "probe_prod_strict_stage3_witness_proof" ""
     proof_phase_driver_append_candidate_line "$strict_outer_driver" "probe_prod_strict_noreuse_proofrelease" "$proof_surface_sidecar"
@@ -220,10 +301,20 @@ proof_phase_driver_pick() {
       proof_phase_driver_summary="$proof_phase_driver_summary
 $entry"
     fi
+    if [ "${proof_phase_driver_probe_published:-0}" = "1" ] && [ "${proof_phase_driver_proof_path:-}" = "" ]; then
+      proof_phase_driver_proof_path="$cand"
+      proof_phase_driver_proof_surface="$label"
+      proof_phase_driver_proof_sidecar_compiler="$sidecar_compiler"
+    fi
     if [ "${proof_phase_driver_probe_reason:-}" = "usable" ]; then
       proof_phase_driver_path="$cand"
       proof_phase_driver_surface="$label"
       proof_phase_driver_sidecar_compiler="$sidecar_compiler"
+      if [ "${proof_phase_driver_proof_path:-}" = "" ]; then
+        proof_phase_driver_proof_path="$cand"
+        proof_phase_driver_proof_surface="$label"
+        proof_phase_driver_proof_sidecar_compiler="$sidecar_compiler"
+      fi
       if [ "$sidecar_compiler" != "" ]; then
         proof_phase_driver_env="BACKEND_UIR_SIDECAR_COMPILER=$sidecar_compiler"
       fi
@@ -231,6 +322,12 @@ $entry"
     fi
   done <"$candidates_tmp"
   rm -f "$candidates_tmp"
+
+  if [ "$proof_phase_driver_path" != "" ] && [ "${proof_phase_driver_proof_path:-}" = "" ]; then
+    proof_phase_driver_proof_path="$proof_phase_driver_path"
+    proof_phase_driver_proof_surface="$proof_phase_driver_surface"
+    proof_phase_driver_proof_sidecar_compiler="$proof_phase_driver_sidecar_compiler"
+  fi
 
   if [ "$proof_phase_driver_path" != "" ]; then
     return 0

@@ -18,6 +18,58 @@ import stage1/ownership
 import stage1/diagnostics
 import std/rawmem_support
 
+fn stage1PtrLoadDiagnosticSeq(src: ptr): Diagnostic[] =
+    var out: Diagnostic[]
+    if src == nil:
+        return out
+    memCopyCompat(&out, src, int32(sizeof Diagnostic[]))
+    return out
+
+fn stage1PtrStoreDiagnosticSeq(dst: ptr, value: Diagnostic[]) =
+    if dst == nil:
+        return
+    var tmp: Diagnostic[] = value
+    memCopyCompat(dst, &tmp, int32(sizeof Diagnostic[]))
+
+fn stage1PtrLoadImportTrace(src: ptr): ImportTrace =
+    var out: ImportTrace
+    if src == nil:
+        return out
+    memCopyCompat(&out, src, int32(sizeof ImportTrace))
+    return out
+
+fn stage1PtrStoreImportTrace(dst: ptr, value: ImportTrace) =
+    if dst == nil:
+        return
+    var tmp: ImportTrace = value
+    memCopyCompat(dst, &tmp, int32(sizeof ImportTrace))
+
+fn stage1PtrLoadStrSetList(src: ptr): StrSetList =
+    var out: StrSetList
+    if src == nil:
+        return out
+    memCopyCompat(&out, src, int32(sizeof StrSetList))
+    return out
+
+fn stage1PtrStoreStrSetList(dst: ptr, value: StrSetList) =
+    if dst == nil:
+        return
+    var tmp: StrSetList = value
+    memCopyCompat(dst, &tmp, int32(sizeof StrSetList))
+
+fn stage1PtrLoadNodeCache(src: ptr): NodeCache =
+    var out: NodeCache
+    if src == nil:
+        return out
+    memCopyCompat(&out, src, int32(sizeof NodeCache))
+    return out
+
+fn stage1PtrStoreNodeCache(dst: ptr, value: NodeCache) =
+    if dst == nil:
+        return
+    var tmp: NodeCache = value
+    memCopyCompat(dst, &tmp, int32(sizeof NodeCache))
+
 @importc("cheng_file_exists")
 fn stage1_c_fileExists(path: cstring): int32
 @importc("cheng_file_size")
@@ -130,67 +182,67 @@ fn add(dst: var Diagnostic[], val: Diagnostic) =
 fn add(dst: ptr, val: Diagnostic) =
     if dst == nil:
         return
-    var seqVal: Diagnostic[] = load(dst)
+    var seqVal: Diagnostic[] = stage1PtrLoadDiagnosticSeq(dst)
     seqs.add(seqVal, val)
-    store(dst, seqVal)
+    stage1PtrStoreDiagnosticSeq(dst, seqVal)
 
 fn stage1TraceHas(trace: ptr, path: str): bool =
     if trace == nil:
         return false
-    let traceVal: ImportTrace = load(trace)
+    let traceVal: ImportTrace = stage1PtrLoadImportTrace(trace)
     return importTraceHas(traceVal, path)
 
 fn stage1TracePush(trace: ptr, path: str) =
     if trace == nil:
         return
-    var traceVal: ImportTrace = load(trace)
+    var traceVal: ImportTrace = stage1PtrLoadImportTrace(trace)
     importTracePush(traceVal, path)
-    store(trace, traceVal)
+    stage1PtrStoreImportTrace(trace, traceVal)
 
 fn stage1TracePop(trace: ptr) =
     if trace == nil:
         return
-    var traceVal: ImportTrace = load(trace)
+    var traceVal: ImportTrace = stage1PtrLoadImportTrace(trace)
     importTracePop(traceVal)
-    store(trace, traceVal)
+    stage1PtrStoreImportTrace(trace, traceVal)
 
 fn stage1VisitedHas(visited: ptr, path: str): bool =
     if visited == nil:
         return false
-    let visitedVal: StrSetList = load(visited)
+    let visitedVal: StrSetList = stage1PtrLoadStrSetList(visited)
     return setHasNormalizedStr(visitedVal, path)
 
 fn stage1VisitedAdd(visited: ptr, path: str) =
     if visited == nil:
         return
-    var visitedVal: StrSetList = load(visited)
+    var visitedVal: StrSetList = stage1PtrLoadStrSetList(visited)
     setAddNormalizedStr(visitedVal, path)
-    store(visited, visitedVal)
+    stage1PtrStoreStrSetList(visited, visitedVal)
 
 fn stage1CacheHasNodes(cache: ptr, path: str): bool =
     if cache == nil:
         return false
-    let cacheVal: NodeCache = load(cache)
+    let cacheVal: NodeCache = stage1PtrLoadNodeCache(cache)
     return mapHasNodes(cacheVal, path)
 
 fn stage1CacheGetNodes(cache: ptr, path: str): AstNodeId[] =
     var empty: AstNodeId[]
     if cache == nil:
         return empty
-    let cacheVal: NodeCache = load(cache)
+    let cacheVal: NodeCache = stage1PtrLoadNodeCache(cache)
     return mapGetNodes(cacheVal, path)
 
 fn stage1CacheSetNodes(cache: ptr, path: str, values: AstNodeId[]) =
     if cache == nil:
         return
-    var cacheVal: NodeCache = load(cache)
+    var cacheVal: NodeCache = stage1PtrLoadNodeCache(cache)
     mapSetNodes(cacheVal, path, values)
-    store(cache, cacheVal)
+    stage1PtrStoreNodeCache(cache, cacheVal)
 
 fn stage1DiagsHasError(diags: ptr): bool =
     if diags == nil:
         return false
-    let diagVals: Diagnostic[] = load(diags)
+    let diagVals: Diagnostic[] = stage1PtrLoadDiagnosticSeq(diags)
     return hasError(diagVals)
 
 fn stage1_c_getenv(name: cstring): str =
@@ -2471,7 +2523,6 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
         if lexDiags.len == 0:
             writeTokenCache(pathNorm, size, mtime, tokens)
     let mrootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, pathNorm, diags)
-    let _mrootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, pathNorm, mrootParsedId, diags)
     let mrootId: AstNodeId = stage1ApplyAstPluginHooksId(pathNorm, mrootParsedId)
     if !astNodeIdValid(mrootId):
         freeSeq_Token(tokens)
@@ -2725,7 +2776,6 @@ fn loadSystemModuleId(userFile: str, diags: ptr): AstNodeId =
         freeSeq[Diagnostic](lexDiags)
         return astInvalidNodeId()
     let sysRootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, sysPath, diags)
-    let _sysBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, sysPath, sysRootParsedId, diags)
     let sysRootId: AstNodeId = stage1ApplyAstPluginHooksId(sysPath, sysRootParsedId)
     if dbgPipe:
         stage1DebugPipeWritePrefixInt(dbgFile, "[frontend] sysmod parsed_kids=", astKidCount(sysRootId))
@@ -2765,7 +2815,6 @@ fn parseModuleForDepsId(path: str, diags: ptr): AstNodeId =
         if lexDiags.len == 0:
             writeTokenCache(path, size, mtime, tokens)
     let rootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, path, diags)
-    let _rootBodies: int32 = stage1_materializeModuleBodiesForMode(tokens, path, rootParsedId, diags)
     let rootId: AstNodeId = stage1ApplyAstPluginHooksId(path, rootParsedId)
     freeSeq_Token(tokens)
     freeSeq[Diagnostic](lexDiags)

@@ -1,0 +1,187 @@
+import std/os
+import std/strutils as strutil
+import std/strings
+import tooling/cheng_tooling_embedded_inline
+
+fn toolingInventoryStrNonEmpty(text: str): bool =
+    return len(text) > 0
+
+fn toolingInventoryStrEndsWith(text: str, suffix: str): bool =
+    if !toolingInventoryStrNonEmpty(text) || !toolingInventoryStrNonEmpty(suffix):
+        return false
+    let n: int32 = len(text)
+    let m: int32 = len(suffix)
+    if m > n:
+        return false
+    for i in 0..<m:
+        if text[n - m + i] != suffix[i]:
+            return false
+    return true
+
+fn toolingInventoryStripShSuffix(name: str): str =
+    if !toolingInventoryStrEndsWith(name, ".sh"):
+        return name
+    let n: int32 = len(name)
+    if n <= 3:
+        return ""
+    return strings.sliceBytes(name, 0, n - 3)
+
+fn toolingInventoryIsSafeScriptName(name: str): bool =
+    if !toolingInventoryStrNonEmpty(name):
+        return false
+    if strutil.contains(name, ".."):
+        return false
+    for i in 0..<len(name):
+        let ch: char = name[i]
+        let isAlphaLower: bool = ch >= 'a' && ch <= 'z'
+        let isAlphaUpper: bool = ch >= 'A' && ch <= 'Z'
+        let isDigit: bool = ch >= '0' && ch <= '9'
+        if isAlphaLower || isAlphaUpper || isDigit || ch == '_' || ch == '-' || ch == '.':
+            continue
+        return false
+    return true
+
+fn toolingInventoryIdsContains(ids: str[], id: str): bool =
+    for i in 0..<ids.len:
+        if ids[i] == id:
+            return true
+    return false
+
+fn toolingInventoryFileExistsNonEmpty(pathRaw: str): bool =
+    let path: str = strutil.strip(pathRaw)
+    if !toolingInventoryStrNonEmpty(path) || !os.fileExists(path):
+        return false
+    return os.fileSize(path) > int64(0)
+
+fn toolingInventoryEmbeddedPrefix(): str =
+    return "embedded:"
+
+fn toolingEmbeddedScriptIds(root: str): str[] =
+    let _root: str = root
+    var out: str[] = []
+    let ids: str[] = tooling_embedded_inline.toolingEmbeddedScriptIds()
+    for i in 0..<ids.len:
+        let id: str = ids[i]
+        if id == "chengb":
+            continue
+        if !toolingInventoryIsSafeScriptName(id):
+            continue
+        if toolingInventoryIdsContains(out, id):
+            continue
+        add(out, id)
+    var synthetic: str[] = []
+    add(synthetic, "verify")
+    add(synthetic, "verify_tooling_cmdline")
+    add(synthetic, "verify_backend_zero_script_closure")
+    add(synthetic, "verify_backend_stage1_fixed0_envs")
+    add(synthetic, "verify_backend_string_literal_regression")
+    add(synthetic, "verify_new_expr_surface")
+    add(synthetic, "verify_backend_selfhost_currentsrc_proof")
+    add(synthetic, "verify_backend_driver_unified_global")
+    add(synthetic, "verify_backend_compile_name_canonical")
+    add(synthetic, "verify_backend_dev_track_only")
+    add(synthetic, "verify_backend_rawptr_surface_forbid")
+    add(synthetic, "verify_backend_pure_cheng_surface")
+    add(synthetic, "verify_stage1_ast_soa_surface")
+    add(synthetic, "verify_backend_rawptr_migration")
+    add(synthetic, "verify_backend_uir_soa_surface")
+    add(synthetic, "verify_backend_uir_soa_self_probe")
+    add(synthetic, "verify_backend_rawptr_closedloop")
+    add(synthetic, "verify_backend_linker_abi_core_cross")
+    add(synthetic, "verify_backend_symbol_closure")
+    add(synthetic, "verify_backend_new_expr_ref_stability")
+    add(synthetic, "verify_backend_release_compile_stability")
+    add(synthetic, "verify_backend_zero_script_residual")
+    add(synthetic, "build_backend_string_abi_contract")
+    add(synthetic, "verify_backend_string_abi_contract")
+    add(synthetic, "build_backend_dot_lowering_contract")
+    add(synthetic, "verify_backend_dot_lowering_contract")
+    for i in 0..<synthetic.len:
+        let sid: str = synthetic[i]
+        if !toolingInventoryIsSafeScriptName(sid):
+            continue
+        if toolingInventoryIdsContains(out, sid):
+            continue
+        add(out, sid)
+    return out
+
+fn toolingNormalizeScriptId(rawName: str): str =
+    var name: str = strutil.strip(rawName)
+    if !toolingInventoryStrNonEmpty(name):
+        return ""
+    if strutil.startsWith(name, "src/tooling/"):
+        name = strings.dropPrefix(name, "src/tooling/")
+    if toolingInventoryStrEndsWith(name, ".sh"):
+        name = toolingInventoryStripShSuffix(name)
+    if !toolingInventoryIsSafeScriptName(name):
+        return ""
+    return name
+
+fn toolingSelectorContains(selector: str, id: str): bool =
+    if !toolingInventoryStrNonEmpty(selector) || !toolingInventoryStrNonEmpty(id):
+        return false
+    return strutil.contains(selector, "," + id + ",")
+
+fn toolingSelectorAppend(selector: str, id: str): str =
+    if !toolingInventoryStrNonEmpty(id):
+        return selector
+    let token: str = "," + id + ","
+    if strutil.contains(selector, token):
+        return selector
+    return selector + token
+
+fn toolingNormalizeLinkMode(raw: str): str =
+    let text: str = strutil.toLowerAscii(strutil.strip(raw))
+    if text == "symlink" || text == "hardlink" || text == "copy":
+        return text
+    return ""
+
+fn toolingResolveScriptPath(root: str, rawName: str): str =
+    let name: str = toolingNormalizeScriptId(rawName)
+    if !toolingInventoryStrNonEmpty(name):
+        return ""
+    let repoScriptPath: str = os.joinPath(root, "src/tooling/cheng_tooling_embedded_scripts/" + name + ".sh")
+    if toolingInventoryFileExistsNonEmpty(repoScriptPath):
+        return repoScriptPath
+    let ids: str[] = toolingEmbeddedScriptIds(root)
+    if toolingInventoryIdsContains(ids, name):
+        return toolingInventoryEmbeddedPrefix() + name
+    return ""
+
+fn toolingCollectScripts(root: str): str[] =
+    let ids: str[] = toolingEmbeddedScriptIds(root)
+    var out: str[] = []
+    for i in 0..<ids.len:
+        let name: str = ids[i]
+        if !toolingInventoryIsSafeScriptName(name):
+            continue
+        if toolingInventoryIdsContains(out, name):
+            continue
+        add(out, name)
+    if !toolingInventoryIdsContains(out, "verify_backend_opt2_impl_surface"):
+        add(out, "verify_backend_opt2_impl_surface")
+    if !toolingInventoryIdsContains(out, "verify_backend_loop_runtime"):
+        add(out, "verify_backend_loop_runtime")
+    if !toolingInventoryIdsContains(out, "verify_backend_rawptr_migration"):
+        add(out, "verify_backend_rawptr_migration")
+    if !toolingInventoryIdsContains(out, "verify_backend_rawptr_surface_forbid"):
+        add(out, "verify_backend_rawptr_surface_forbid")
+    if !toolingInventoryIdsContains(out, "verify_backend_pure_cheng_surface"):
+        add(out, "verify_backend_pure_cheng_surface")
+    if !toolingInventoryIdsContains(out, "verify_stage1_ast_soa_surface"):
+        add(out, "verify_stage1_ast_soa_surface")
+    if !toolingInventoryIdsContains(out, "verify_backend_uir_soa_surface"):
+        add(out, "verify_backend_uir_soa_surface")
+    if !toolingInventoryIdsContains(out, "verify_backend_uir_soa_self_probe"):
+        add(out, "verify_backend_uir_soa_self_probe")
+    if !toolingInventoryIdsContains(out, "verify_backend_cdrop_emergency"):
+        add(out, "verify_backend_cdrop_emergency")
+    if !toolingInventoryIdsContains(out, "verify_backend_symbol_closure"):
+        add(out, "verify_backend_symbol_closure")
+    if !toolingInventoryIdsContains(out, "verify_backend_new_expr_ref_stability"):
+        add(out, "verify_backend_new_expr_ref_stability")
+    if !toolingInventoryIdsContains(out, "verify_backend_release_compile_stability"):
+        add(out, "verify_backend_release_compile_stability")
+    if !toolingInventoryIdsContains(out, "verify_backend_zero_script_residual"):
+        add(out, "verify_backend_zero_script_residual")
+    return out

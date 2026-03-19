@@ -1,0 +1,136 @@
+import std/strutils as strutil
+
+fn toolingEmbeddedPatchMmHotpatchFamily(id: str, raw: str): str =
+    if len(raw) == 0:
+        return ""
+    if id == "verify_backend_mm":
+        var patched: str = raw
+        patched = strutil.replace(
+            patched,
+            "driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path --path-only)\"",
+            "driver=\"${BACKEND_DRIVER:-}\"\nif [ \"$driver\" = \"\" ]; then\n  driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path --path-only)\"\nfi")
+        patched = strutil.replace(
+            patched,
+            "linker_mode=\"${BACKEND_LINKER:-self}\"",
+            "linker_mode=\"${BACKEND_MM_LINKER:-${BACKEND_LINKER:-system}}\"")
+        patched = strutil.replace(
+            patched,
+            "timeout_s=\"${BACKEND_MM_TIMEOUT:-60}\"\nmkdir -p \"$out_dir\"\n",
+            "timeout_s=\"${BACKEND_MM_TIMEOUT:-60}\"\nmkdir -p \"$out_dir\"\nruntime_env_line=\"\"\nruntime_env_log=\"$out_dir/runtime_env.log\"\nif [ \"$linker_mode\" = \"self\" ]; then\n  set +e\n  runtime_env_line=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:\"$driver\" --target:\"$target\" --linker:self 2>\"$runtime_env_log\")\"\n  runtime_env_status=\"$?\"\n  set -e\n  if [ \"$runtime_env_status\" -ne 0 ] || [ \"$runtime_env_line\" = \"\" ]; then\n    echo \"[verify_backend_mm] backend_link_env failed for target=$target (log: $runtime_env_log)\" >&2\n    if [ -f \"$runtime_env_log\" ]; then\n      tail -n 120 \"$runtime_env_log\" >&2 || true\n    fi\n    exit 1\n  fi\nfi\n")
+        patched = strutil.replace(
+            patched,
+            "    BACKEND_EMIT=obj \\\n    BACKEND_LINKER=self \\\n",
+            "    BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \\\n    BACKEND_EMIT=obj \\\n    BACKEND_LINKER=self \\\n")
+        patched = strutil.replace(
+            patched,
+            "    run_with_timeout \"$timeout_s\" env \\\n",
+            "    # shellcheck disable=SC2086\n    run_with_timeout \"$timeout_s\" env $runtime_env_line \\\n")
+        patched = strutil.replace(
+            patched,
+            "      BACKEND_EMIT=exe \\\n      BACKEND_LINKER=self \\\n      BACKEND_RUNTIME=off \\\n      BACKEND_NO_RUNTIME_C=1 \\\n      BACKEND_RUNTIME_OBJ= \\\n      BACKEND_TARGET=\"$target\" \\\n",
+            "      BACKEND_EMIT=exe \\\n      BACKEND_LINKER=self \\\n      BACKEND_NO_RUNTIME_C=1 \\\n      BACKEND_TARGET=\"$target\" \\\n")
+        patched = strutil.replace(
+            patched,
+            "if is_known_mm_skip_log \"$self_log\"; then\n      echo \"[verify_backend_mm] known self-link instability, fallback compile-only: $base\" >&2\n      if compile_fixture_compile_only \"$fixture\" \"$base\" \"$fixture_frontend\"; then\n        return\n      fi\n      tail -n 200 \"$out_dir/${base}.compile_only.log\" >&2 || true\n      exit 1\n    fi\n",
+            "if is_known_mm_skip_log \"$self_log\"; then\n      echo \"[verify_backend_mm] self-link runtime instability: $base\" >&2\n      tail -n 200 \"$self_log\" >&2 || true\n      exit \"$self_status\"\n    fi\n")
+        patched = strutil.replace(
+            patched,
+            "      BACKEND_VALIDATE=1 \\\n      BACKEND_MULTI=0 \\\n",
+            "      BACKEND_VALIDATE=1 \\\n      BACKEND_OPT_LEVEL=0 \\\n      BACKEND_OPT2=0 \\\n      BACKEND_MULTI=0 \\\n")
+        patched = strutil.replace(
+            patched,
+            "    BACKEND_VALIDATE=1 \\\n    BACKEND_MULTI=0 \\\n",
+            "    BACKEND_VALIDATE=1 \\\n    BACKEND_OPT_LEVEL=0 \\\n    BACKEND_OPT2=0 \\\n    BACKEND_MULTI=0 \\\n")
+        patched = strutil.replace(
+            patched,
+            "    BACKEND_EMIT=exe \\\n    BACKEND_LINKER=system \\\n    BACKEND_TARGET=\"$target\" \\\n",
+            "    BACKEND_EMIT=exe \\\n    BACKEND_LINKER=system \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_TARGET=\"$target\" \\\n")
+        patched = strutil.replace(
+            patched,
+            "if [ \"$mm_container\" = \"1\" ]; then\n  run_fixture \"tests/cheng/backend/fixtures/mm_container_balance.cheng\" \"mm_container_balance\" \"$mm_container_frontend\"\nelse\n  echo \"[verify_backend_mm] skip mm_container_balance (set BACKEND_MM_CONTAINER=1 to enable, current=$mm_container)\" >&2\nfi\n",
+            "if [ \"$mm_container\" = \"1\" ]; then\n  run_fixture \"tests/cheng/backend/fixtures/mm_container_balance.cheng\" \"mm_container_balance\" \"$mm_container_frontend\"\nelse\n  echo \"[verify_backend_mm] BACKEND_MM_CONTAINER=0 is no longer supported (required runtime gate)\" >&2\n  exit 1\nfi\n")
+        return patched
+    if id == "verify_backend_mem_exe_emit":
+        var patched: str = raw
+        patched = strutil.replace(patched, "chengc_file=\"src/tooling/chengc.sh\"",
+                                  "cheng_file=\"src/tooling/cheng_tooling_embedded_inline.cheng\"")
+        patched = strutil.replace(patched, "link_env_file=\"src/tooling/backend_link_env.sh\"",
+                                  "link_env_file=\"src/tooling/cheng_tooling_embedded_inline.cheng\"")
+        patched = strutil.replace(patched, "runtime_obj_chengc_marker", "runtime_obj_cheng_marker")
+        patched = strutil.replace(patched, "chengc_fixture", "cheng_fixture")
+        patched = strutil.replace(patched, "chengc_exe", "cheng_exe")
+        patched = strutil.replace(patched, "chengc_build_log", "cheng_build_log")
+        patched = strutil.replace(
+            patched,
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc ",
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng ")
+        patched = strutil.replace(patched, "chengc emit=exe", "cheng emit=exe")
+        patched = strutil.replace(patched, "missing chengc executable output", "missing cheng executable output")
+        patched = strutil.replace(patched, "chengc emit=exe path has sidecar residue", "cheng emit=exe path has sidecar residue")
+        patched = strutil.replace(patched, "  BACKEND_DRIVER=\"$driver\" \\\n", "")
+        patched = strutil.replace(patched, "  BACKEND_LINKER=self \\\n", "")
+        patched = strutil.replace(
+            patched,
+            "  \"$driver\" >\"$runtime_free_log\" 2>&1\n",
+            "  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng \"$fixture\" --frontend:stage1 --emit:exe --out:\"$runtime_free_exe\" >\"$runtime_free_log\" 2>&1\n")
+        patched = strutil.replace(
+            patched,
+            "env $runtime_env_line \\\n",
+            "env -u BACKEND_LINKER -u BACKEND_NO_RUNTIME_C -u BACKEND_RUNTIME_OBJ -u BACKEND_RUNTIME -u BACKEND_DRIVER -u CHENG_BACKEND_DRIVER \\\n")
+        return patched
+    if id == "verify_backend_hotpatch":
+        var patched: str = raw
+        patched = strutil.replace(
+            patched,
+            "preferred_linker=\"${BACKEND_HOTPATCH_GATE_LINKER:-system}\"",
+            "preferred_linker=\"${BACKEND_HOTPATCH_GATE_LINKER:-self}\"")
+        patched = strutil.replace(
+            patched,
+            "  {\n    echo \"verify_backend_hotpatch report\"\n    echo \"status=skip\"\n    echo \"reason=unsupported_target\"\n    echo \"target=$target\"\n    echo \"host_target=$host_target\"\n  } >\"$report\"\n  echo \"verify_backend_hotpatch skip: unsupported target ($target)\"\n  exit 0\n",
+            "  echo \"[verify_backend_hotpatch] unsupported target: $target (host_target=$host_target)\" >&2\n  exit 1\n")
+        patched = strutil.replace(
+            patched,
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc ",
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng ")
+        patched = strutil.replace(patched, "    BACKEND_LINKER=\"$preferred_linker\" \\\n", "")
+        patched = strutil.replace(patched, "    BACKEND_RUNTIME=off \\\n", "")
+        patched = strutil.replace(patched, "    BACKEND_NO_RUNTIME_C=\"$no_runtime_c\" \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_LINKER=system \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_RUNTIME=off \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_NO_RUNTIME_C=0 \\\n", "")
+        return patched
+    if id == "verify_backend_hotpatch_meta":
+        var patched: str = raw
+        patched = strutil.replace(
+            patched,
+            "  {\n    echo \"verify_backend_hotpatch_meta report\"\n    echo \"status=skip\"\n    echo \"reason=unsupported_target\"\n    echo \"target=$target\"\n    echo \"host_target=$host_target\"\n  } >\"$report\"\n  echo \"verify_backend_hotpatch_meta skip: unsupported target ($target)\"\n  exit 0\n",
+            "  echo \"[verify_backend_hotpatch_meta] unsupported target: $target (host_target=$host_target)\" >&2\n  exit 1\n")
+        patched = strutil.replace(
+            patched,
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc ",
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng ")
+        patched = strutil.replace(patched, "    BACKEND_LINKER=\"$preferred_linker\" \\\n", "")
+        patched = strutil.replace(patched, "    BACKEND_RUNTIME=off \\\n", "")
+        patched = strutil.replace(patched, "    BACKEND_NO_RUNTIME_C=\"$no_runtime_c\" \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_LINKER=system \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_RUNTIME=off \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_NO_RUNTIME_C=0 \\\n", "")
+        return patched
+    if id == "verify_backend_mem_patch_regression":
+        var patched: str = raw
+        patched = strutil.replace(
+            patched,
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc ",
+            "${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng ")
+        patched = strutil.replace(
+            patched,
+            "determinism_gate=chengc_double_build",
+            "determinism_gate=cheng_double_build")
+        patched = strutil.replace(patched, "    BACKEND_LINKER=\"$preferred_linker\" \\\n", "")
+        patched = strutil.replace(patched, "    BACKEND_RUNTIME=off \\\n", "")
+        patched = strutil.replace(patched, "    BACKEND_NO_RUNTIME_C=\"$no_runtime_c\" \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_LINKER=system \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_RUNTIME=off \\\n", "")
+        patched = strutil.replace(patched, "      BACKEND_NO_RUNTIME_C=0 \\\n", "")
+        return patched
+    return ""

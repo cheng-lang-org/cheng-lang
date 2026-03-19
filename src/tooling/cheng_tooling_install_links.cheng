@@ -1,0 +1,161 @@
+import std/os
+import std/strutils as strutil
+
+fn toolingInstallStrNonEmpty(text: str): bool =
+    return len(text) > 0
+
+fn toolingInstallShellQuote(raw: str): str =
+    if len(raw) == 0:
+        return "\"\""
+    var escaped: str = strutil.replace(raw, "\\", "\\\\")
+    escaped = strutil.replace(escaped, "$", "\\$")
+    escaped = strutil.replace(escaped, "`", "\\`")
+    escaped = strutil.replace(escaped, "\"", "\\\"")
+    return "\"" + escaped + "\""
+
+fn toolingInstallStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn toolingInstallPathAbsolute(root: str, raw: str): str =
+    let text: str = strutil.strip(raw)
+    if !toolingInstallStrNonEmpty(text):
+        return ""
+    if os.isAbsolute(text):
+        return text
+    if toolingInstallStartsWith(text, "./") || toolingInstallStartsWith(text, "../"):
+        return os.absolutePath(text)
+    if !toolingInstallStrNonEmpty(root):
+        return text
+    let n: int32 = len(root)
+    if n > 0:
+        let tail: char = root[n - 1]
+        if tail == '/' || tail == '\\':
+            return root + text
+    return root + "/" + text
+
+fn toolingInstallPathExists(path: str): bool =
+    if !toolingInstallStrNonEmpty(path):
+        return false
+    if os.fileExists(path):
+        return true
+    if os.dirExists(path):
+        return true
+    return false
+
+fn toolingInstallExec(root: str, command: str): os.ExecCmdResult =
+    let opts: uint64 = uint64(7)
+    return os.execCmdEx(command, opts, root)
+
+fn toolingInstallPrintExecOutput(result: os.ExecCmdResult) =
+    let out: str = os.execCmdResultOutput(result)
+    if toolingInstallStrNonEmpty(out):
+        os.write(os.get_stdout(), out)
+
+fn toolingInstallMkdirP(root: str, path: str): bool =
+    let cmd: str = "mkdir -p " + toolingInstallShellQuote(path)
+    let result: os.ExecCmdResult = toolingInstallExec(root, cmd)
+    toolingInstallPrintExecOutput(result)
+    return os.execCmdResultExitCode(result) == 0
+
+fn toolingInstallIdsContains(ids: str[], id: str): bool =
+    for i in 0..<ids.len:
+        if ids[i] == id:
+            return true
+    return false
+
+fn toolingInstallSelectorContains(selector: str, id: str): bool =
+    if !toolingInstallStrNonEmpty(selector) || !toolingInstallStrNonEmpty(id):
+        return false
+    return strutil.contains(selector, "," + id + ",")
+
+fn toolingInstallNormalizeLinkMode(raw: str): str =
+    let text: str = strutil.toLowerAscii(strutil.strip(raw))
+    if text == "symlink" || text == "hardlink" || text == "copy":
+        return text
+    return ""
+
+fn toolingInstallLinks(root: str, idsRaw: str[], binPathRaw: str, dirRaw: str, manifestRaw: str,
+                       force: bool, onlySelector: str, excludeSelector: str, modeRaw: str): int32 =
+    let outDir: str = toolingInstallPathAbsolute(root, dirRaw)
+    if !toolingInstallStrNonEmpty(outDir):
+        os.write(os.get_stderr(), "cheng_tooling: install requires --dir:<path>\n")
+        return 1
+    let binPath: str = toolingInstallPathAbsolute(root, binPathRaw)
+    if !toolingInstallStrNonEmpty(binPath):
+        os.write(os.get_stderr(), "cheng_tooling: install requires --bin:<path> (or runnable absolute program name)\n")
+        return 1
+    if !toolingInstallPathExists(binPath):
+        os.write(os.get_stderr(), "cheng_tooling: install binary not found: " + binPath + "\n")
+        return 1
+    let mode: str = toolingInstallNormalizeLinkMode(modeRaw)
+    if !toolingInstallStrNonEmpty(mode):
+        os.write(os.get_stderr(), "cheng_tooling: invalid --mode (expected symlink|hardlink|copy): " + modeRaw + "\n")
+        return 1
+    if !toolingInstallMkdirP(root, outDir):
+        os.write(os.get_stderr(), "cheng_tooling: failed to create install dir: " + outDir + "\n")
+        return 1
+
+    var ids: str[] = idsRaw
+    if ids.len == 0:
+        os.write(os.get_stderr(), "cheng_tooling: no scripts found under src/tooling\n")
+        return 1
+    if !toolingInstallIdsContains(ids, "cheng_tooling"):
+        add(ids, "cheng_tooling")
+
+    var manifest: str = "name\tlink\n"
+    var selectedCount: int32 = 0
+    var failCount: int32 = 0
+    for i in 0..<ids.len:
+        let name: str = ids[i]
+        if toolingInstallStrNonEmpty(onlySelector) && !toolingInstallSelectorContains(onlySelector, name):
+            continue
+        if toolingInstallSelectorContains(excludeSelector, name):
+            continue
+        selectedCount = selectedCount + 1
+        let linkPath: str = os.joinPath(outDir, name)
+        if !force && toolingInstallPathExists(linkPath):
+            manifest = manifest + name + "\t" + linkPath + "\n"
+            continue
+        var cmd: str = ""
+        if mode == "copy":
+            if force:
+                cmd = "cp -f " + toolingInstallShellQuote(binPath) + " " + toolingInstallShellQuote(linkPath)
+            else:
+                cmd = "cp " + toolingInstallShellQuote(binPath) + " " + toolingInstallShellQuote(linkPath)
+        elif mode == "hardlink":
+            if force:
+                cmd = "ln -f " + toolingInstallShellQuote(binPath) + " " + toolingInstallShellQuote(linkPath)
+            else:
+                cmd = "ln " + toolingInstallShellQuote(binPath) + " " + toolingInstallShellQuote(linkPath)
+        else:
+            if force:
+                cmd = "ln -sf " + toolingInstallShellQuote(binPath) + " " + toolingInstallShellQuote(linkPath)
+            else:
+                cmd = "ln -s " + toolingInstallShellQuote(binPath) + " " + toolingInstallShellQuote(linkPath)
+        let result: os.ExecCmdResult = toolingInstallExec(root, cmd)
+        let rc: int32 = os.execCmdResultExitCode(result)
+        if rc == 0:
+            manifest = manifest + name + "\t" + linkPath + "\n"
+            continue
+        failCount = failCount + 1
+        os.write(os.get_stderr(), "cheng_tooling: link failed: " + name + " -> " + linkPath + "\n")
+        toolingInstallPrintExecOutput(result)
+    if selectedCount <= 0:
+        os.write(os.get_stderr(), "cheng_tooling: install selection is empty (adjust --only/--exclude)\n")
+        return 1
+    if toolingInstallStrNonEmpty(manifestRaw):
+        let manifestPath: str = toolingInstallPathAbsolute(root, manifestRaw)
+        if toolingInstallStrNonEmpty(manifestPath):
+            os.writeFile(manifestPath, manifest)
+            os.write(os.get_stdout(), "install_manifest=" + manifestPath + "\n")
+    os.write(os.get_stdout(), "install_dir=" + outDir + "\n")
+    os.write(os.get_stdout(), "install_bin=" + binPath + "\n")
+    os.write(os.get_stdout(), "install_mode=" + mode + "\n")
+    if failCount > 0:
+        return 1
+    return 0

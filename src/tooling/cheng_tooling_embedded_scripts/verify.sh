@@ -28,6 +28,8 @@ run_cmd "verify.backend_stage1_fixed0_envs" sh "$scripts_dir/verify_backend_stag
 run_cmd "verify.backend_string_literal_regression" sh "$scripts_dir/verify_backend_string_literal_regression.sh"
 run_cmd "verify.std_strformat" sh "$scripts_dir/verify_std_strformat.sh"
 run_cmd "verify.backend_default_output_safety" sh "$scripts_dir/verify_backend_default_output_safety.sh"
+run_cmd "verify.new_expr_surface" sh "$scripts_dir/verify_new_expr_surface.sh"
+run_cmd "verify.backend_selfhost_currentsrc_proof" sh "$scripts_dir/verify_backend_selfhost_currentsrc_proof.sh"
 run_cmd "verify.stage1_seed_layout" "$tool" verify_stage1_seed_layout
 run_cmd "verify.no_legacy_net_multiformats_imports" "$tool" verify_no_legacy_net_multiformats_imports
 

@@ -1,0 +1,118 @@
+import std/os
+import std/strutils as strutil
+import std/strings
+import tooling/cheng_tooling_script_inventory as tinv
+
+type
+    ToolingBundleArgs = ref
+        ok: bool
+        exitCode: int32
+        error: str
+        outDir: str
+        linker: str
+        driver: str
+        profileSelector: str
+        mode: str
+        force: bool
+
+fn toolingBundleStrNonEmpty(text: str): bool =
+    return len(text) > 0
+
+fn toolingBundleStrEq(a: str, b: str): bool =
+    if a == b:
+        return true
+    if len(a) == 0 || len(b) == 0:
+        return false
+    return strings.streq(a, b)
+
+fn toolingBundleJoinPathSimple(baseRaw: str, relRaw: str): str =
+    let base: str = strutil.strip(baseRaw)
+    let rel: str = strutil.strip(relRaw)
+    if !toolingBundleStrNonEmpty(base):
+        return rel
+    if !toolingBundleStrNonEmpty(rel):
+        return base
+    if strutil.startsWith(rel, "/") || strutil.startsWith(rel, "\\"):
+        return base + rel
+    let n: int32 = len(base)
+    if n > 0:
+        let tail: char = base[n - 1]
+        if tail == '/' || tail == '\\':
+            return base + rel
+    return base + "/" + rel
+
+fn toolingBundlePathAbsolute(root: str, raw: str): str =
+    let text: str = strutil.strip(raw)
+    if !toolingBundleStrNonEmpty(text):
+        return ""
+    if os.isAbsolute(text):
+        return text
+    if strutil.startsWith(text, "./") || strutil.startsWith(text, "../"):
+        return os.absolutePath(text)
+    return toolingBundleJoinPathSimple(root, text)
+
+fn toolingBundleDefaultArgs(root: str): ToolingBundleArgs =
+    var out: ToolingBundleArgs = nil
+    new(out)
+    out.ok = true
+    out.exitCode = 0
+    out.error = ""
+    out.outDir = os.joinPath(root, "artifacts/tooling_bundle")
+    out.linker = "self"
+    out.driver = ""
+    out.profileSelector = ""
+    out.mode = "hardlink"
+    out.force = false
+    return out
+
+fn toolingBundleFail(out: ToolingBundleArgs, exitCode: int32, msg: str): ToolingBundleArgs =
+    if out == nil:
+        var fresh: ToolingBundleArgs = nil
+        new(fresh)
+        fresh.ok = false
+        fresh.exitCode = exitCode
+        fresh.error = msg
+        return fresh
+    out.ok = false
+    out.exitCode = exitCode
+    out.error = msg
+    return out
+
+fn toolingBundleParseArgs(root: str, args: str[]): ToolingBundleArgs =
+    var out: ToolingBundleArgs = toolingBundleDefaultArgs(root)
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if strutil.startsWith(arg, "--out-dir:"):
+            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+            continue
+        if strutil.startsWith(arg, "--linker:"):
+            out.linker = strings.dropPrefix(arg, "--linker:")
+            if !toolingBundleStrEq(strutil.toLowerAscii(strutil.strip(out.linker)), "self"):
+                return toolingBundleFail(out, 2,
+                    "cheng_tooling: bundle only supports --linker:self")
+            continue
+        if strutil.startsWith(arg, "--driver:"):
+            out.driver = strings.dropPrefix(arg, "--driver:")
+            continue
+        if strutil.startsWith(arg, "--profile:"):
+            let profile: str = strutil.toLowerAscii(strutil.strip(strings.dropPrefix(arg, "--profile:")))
+            if !toolingBundleStrEq(profile, "full"):
+                return toolingBundleFail(out, 1,
+                    "cheng_tooling: invalid --profile (expected full): " + profile)
+            out.profileSelector = tinv.toolingSelectorAppend(out.profileSelector, profile)
+            continue
+        if strutil.startsWith(arg, "--mode:"):
+            out.mode = strings.dropPrefix(arg, "--mode:")
+            continue
+        if toolingBundleStrEq(arg, "--force"):
+            out.force = true
+            continue
+        if strutil.startsWith(arg, "--force:"):
+            let raw: str = strutil.strip(strings.dropPrefix(arg, "--force:"))
+            let lower: str = strutil.toLowerAscii(raw)
+            out.force = toolingBundleStrEq(lower, "1") || toolingBundleStrEq(lower, "true") ||
+                        toolingBundleStrEq(lower, "yes") || toolingBundleStrEq(lower, "on")
+            continue
+        return toolingBundleFail(out, 1, "cheng_tooling: unknown bundle arg: " + arg)
+    out.outDir = toolingBundlePathAbsolute(root, out.outDir)
+    return out
