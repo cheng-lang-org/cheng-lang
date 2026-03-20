@@ -199,17 +199,16 @@ fn uirCoreParseExportcLinkNameId(funcNodeId: AstNodeId, hasExportc: BoolPtr, exp
 fn uirCoreStage1AddDiagId(diags: DiagnosticSeqPtr, nId: AstNodeId, msg: str) =
     if diags == nil:
         return
-    var filePath: str = ""
     var line: int32 = 1
     var col: int32 = 1
     if astNodeIdValid(nId):
-        let sv: str = astNodeStrVal(nId)
-        if len(sv) > 0:
-            filePath = sv
         let pos: SourcePos = astNodePos(nId)
         line = pos.line
         col = pos.col
-    addDiag(diags, svError, filePath, line, col, msg)
+    if astNodeIdValid(nId) && len(astNodeStrVal(nId)) > 0:
+        addDiag(diags, svError, astNodeStrVal(nId), line, col, msg)
+        return
+    addDiag(diags, svError, "", line, col, msg)
 
 fn uirCoreTupleTypeCoreNodeId(typeNode0: AstNodeId): AstNodeId =
     var typeNode: AstNodeId = typeNode0
@@ -465,8 +464,22 @@ fn uirCoreFfiBuildImportcHelperFuncId(localName: str, linkName: str, paramName: 
 fn uirCoreFfiOutPtrArgName(nameNodeId: AstNodeId): str =
     if !astNodeIdValid(nameNodeId):
         return ""
-    let nm: str = ffiStripSpaces(astPlainName(nameNodeId))
-    return nm
+    return ffiStripSpaces(astPlainName(nameNodeId))
+
+fn uirCoreFfiMapRawName(fnName: str, serial: int32): str =
+    return "__ffi_map_raw_" + fnName + "_" + intToStr(serial)
+
+fn uirCoreFfiHandleRawName(fnName: str, serial: int32): str =
+    return "__ffi_handle_raw_" + fnName + "_" + intToStr(serial)
+
+fn uirCoreFfiHandleResolveHelperName(serial: int32): str =
+    return "__ffi_handle_resolve_ptr_" + intToStr(serial)
+
+fn uirCoreFfiHandleRegisterHelperName(serial: int32): str =
+    return "__ffi_handle_register_ptr_" + intToStr(serial)
+
+fn uirCoreFfiOutPtrRawName(fnName: str, serial: int32): str =
+    return "__ffi_outptr_raw_" + fnName + "_" + intToStr(serial)
 
 fn uirCoreFfiOutPtrBuildVarType(elemTypeId: AstNodeId, pos: SourcePos): AstNodeId =
     let varTy: AstNodeId = astNewNodeId(nkVarTy, pos)
@@ -482,15 +495,14 @@ fn uirCoreFfiOutPtrBuildWrapperBodyId(rawName: str, rawParams: AstNodeId, origPa
     let body: AstNodeId = astNewNodeId(nkStmtList, pos)
     var outArgNames: str[]
     for oi in 0..<outElemTypes.len:
-        let outName: str = "__ffi_out_" + intToStr(oi)
         let outTy: AstNodeId = outElemTypes[oi]
         let varStmt: AstNodeId = astNewNodeId(nkVar, pos)
-        astAddKid(varStmt, astNewIdentId(outName, pos))
+        astAddKid(varStmt, astNewIdentId("__ffi_out_" + intToStr(oi), pos))
         astAddKid(varStmt, astCloneTreeId(outTy))
         astAddKid(varStmt, astNewNodeId(nkEmpty, pos))
         astAddKid(varStmt, astNewNodeId(nkEmpty, pos))
         astAddKid(body, varStmt)
-        uir_core_builder_ffi_out_ptr_push(outArgNames, outName)
+        uir_core_builder_ffi_out_ptr_push(outArgNames, "__ffi_out_" + intToStr(oi))
     let callExpr: AstNodeId = astNewNodeId(nkCall, pos)
     astAddKid(callExpr, astNewIdentId(rawName, pos))
     var inParamCursor: int32 = 0
@@ -514,17 +526,15 @@ fn uirCoreFfiOutPtrBuildWrapperBodyId(rawName: str, rawParams: AstNodeId, origPa
                 let origDef: AstNodeId = astKidAt(origParams, inParamCursor)
                 inParamCursor = inParamCursor + 1
                 let origNameNode: AstNodeId = astKidCount(origDef) > 0 ? astKidAt(origDef, 0) : astInvalidNodeId()
-                let origName: str = uirCoreFfiOutPtrArgName(origNameNode)
-                if len(origName) > 0:
-                    astAddKid(callExpr, astNewIdentId(origName, pos))
+                if len(uirCoreFfiOutPtrArgName(origNameNode)) > 0:
+                    astAddKid(callExpr, astNewIdentId(uirCoreFfiOutPtrArgName(origNameNode), pos))
                 else:
                     astAddKid(callExpr, astNewNodeId(nkEmpty, pos))
             else:
                 astAddKid(callExpr, astNewNodeId(nkEmpty, pos))
     if hasStatus:
-        let statusName: str = "__ffi_status"
         let letStmt: AstNodeId = astNewNodeId(nkLet, pos)
-        astAddKid(letStmt, astNewIdentId(statusName, pos))
+        astAddKid(letStmt, astNewIdentId("__ffi_status", pos))
         astAddKid(letStmt, astCloneTreeId(statusTypeId))
         astAddKid(letStmt, callExpr)
         astAddKid(letStmt, astNewNodeId(nkEmpty, pos))
@@ -658,7 +668,7 @@ fn uirCoreValidateFfiShadowAnnotationsId(rootId: AstNodeId, diags: DiagnosticSeq
         if !astNodeIdValid(fnId) || astNodeKind(fnId) != nkFnDecl:
             continue
         var hasImportc: bool = false
-        var linkName: str = ""
+        var linkName: str
         uirCoreParseImportcLinkNameId(fnId, &hasImportc, &linkName)
         let pragmaId: AstNodeId = uirCoreFindPragmaId(fnId)
         if !astNodeIdValid(pragmaId) || astNodeKind(pragmaId) != nkPragma:
@@ -701,9 +711,8 @@ fn uirCoreFfiMapBuildWrapperBodyId(rawName: str, rawParams: AstNodeId, origParam
             if inCursor < astKidCount(origParams):
                 let pDef: AstNodeId = astKidAt(origParams, inCursor)
                 inCursor = inCursor + 1
-                let pName: str = (astKidCount(pDef) > 0) ? uirCoreFfiOutPtrArgName(astKidAt(pDef, 0)) : ""
-                if len(pName) > 0:
-                    astAddKid(callExpr, astNewIdentId(pName, pos))
+                if astKidCount(pDef) > 0 && len(uirCoreFfiOutPtrArgName(astKidAt(pDef, 0))) > 0:
+                    astAddKid(callExpr, astNewIdentId(uirCoreFfiOutPtrArgName(astKidAt(pDef, 0)), pos))
                 else:
                     astAddKid(callExpr, astNewNodeId(nkEmpty, pos))
             else:
@@ -730,7 +739,7 @@ fn uirCoreRewriteFfiMapFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagnost
         uir_core_builder_ffi_out_ptr_push(outNodeIds, nId)
         return false
     var hasImportc: bool = false
-    var importcLinkName: str = ""
+    var importcLinkName: str
     uirCoreParseImportcLinkNameId(nId, &hasImportc, &importcLinkName)
     if !hasImportc:
         uirCoreStage1AddDiagId(diags, nId, "ffi_map requires @importc (FULLC.FFI.MAP)")
@@ -747,7 +756,7 @@ fn uirCoreRewriteFfiMapFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagnost
     uirCoreFfiExtractArgIndexId(astKidAt(mapAnnId, 2), &lenPhysPos)
     var mappedParamIdx: int32 = -1
     var mappedElemType: AstNodeId = astInvalidNodeId()
-    var mappedParamName: str = ""
+    var mappedParamName: str
     let sliceParamCount: int32 = uirCoreFfiSeqParamCountId(paramsId, &mappedParamIdx, &mappedElemType, &mappedParamName)
     if sliceParamCount <= 0:
         uirCoreStage1AddDiagId(diags, nId, "ffi_map requires exactly one slice parameter (FULLC.FFI.MAP)")
@@ -775,7 +784,6 @@ fn uirCoreRewriteFfiMapFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagnost
         serial = *synthId
         *synthId = serial + 1
     let pos: SourcePos = astNodePos(nId)
-    let rawName: str = "__ffi_map_raw_" + fnName + "_" + intToStr(serial)
     let rawParams: AstNodeId = astNewNodeId(nkFormalParams, pos)
     let totalPhys: int32 = astKidCount(paramsId) + 1
     var inCursor: int32 = 0
@@ -797,8 +805,8 @@ fn uirCoreRewriteFfiMapFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagnost
     let rawRetType: AstNodeId = astCloneTreeId(astKidAt(nId, 2))
     let rawPragma: AstNodeId = uirCoreClonePragmasFilteredId(pragmaId, false, false, true, false)
     let wrapperPragma: AstNodeId = uirCoreClonePragmasFilteredId(pragmaId, true, true, true, true)
-    let rawFn: AstNodeId = uirCoreFfiOutPtrBuildRawFuncId(nId, rawName, rawParams, rawRetType, rawPragma, pos)
-    let wrapperBody: AstNodeId = uirCoreFfiMapBuildWrapperBodyId(rawName, rawParams, paramsId, mappedParamIdx,
+    let rawFn: AstNodeId = uirCoreFfiOutPtrBuildRawFuncId(nId, uirCoreFfiMapRawName(fnName, serial), rawParams, rawRetType, rawPragma, pos)
+    let wrapperBody: AstNodeId = uirCoreFfiMapBuildWrapperBodyId(uirCoreFfiMapRawName(fnName, serial), rawParams, paramsId, mappedParamIdx,
                                                                  mappedParamName, ptrPhysPos, lenPhysPos,
                                                                  astKidAt(nId, 2), pos)
     let wrapperFn: AstNodeId = uirCoreFfiOutPtrBuildWrapperFuncId(nId, wrapperBody, wrapperPragma)
@@ -817,24 +825,22 @@ fn uirCoreFfiHandleBuildWrapperBodyId(rawName: str, origParams: AstNodeId, handl
     astAddKid(callExpr, astNewIdentId(rawName, pos))
     for pi in 0..<astKidCount(origParams):
         let pDef: AstNodeId = astKidAt(origParams, pi)
-        let pName: str = (astKidCount(pDef) > 0) ? uirCoreFfiOutPtrArgName(astKidAt(pDef, 0)) : ""
-        if len(pName) == 0:
+        if astKidCount(pDef) <= 0 || len(uirCoreFfiOutPtrArgName(astKidAt(pDef, 0))) == 0:
             astAddKid(callExpr, astNewNodeId(nkEmpty, pos))
             continue
         if pi >= 0 && pi < handleParamMask.len && handleParamMask[pi] != 0:
-            let handleExpr: AstNodeId = uirCoreFfiBuildTypeCallId(astNewIdentId("uint64", pos), astNewIdentId(pName, pos), pos)
+            let handleExpr: AstNodeId = uirCoreFfiBuildTypeCallId(astNewIdentId("uint64", pos), astNewIdentId(uirCoreFfiOutPtrArgName(astKidAt(pDef, 0)), pos), pos)
             astAddKid(callExpr, uirCoreFfiBuildCall1Id(resolveHelperName, handleExpr, pos))
         else:
-            astAddKid(callExpr, astNewIdentId(pName, pos))
+            astAddKid(callExpr, astNewIdentId(uirCoreFfiOutPtrArgName(astKidAt(pDef, 0)), pos))
     if retIsHandle:
-        let rawNameLocal: str = "__ffi_handle_raw_ret"
         let letStmt: AstNodeId = astNewNodeId(nkLet, pos)
-        astAddKid(letStmt, astNewIdentId(rawNameLocal, pos))
+        astAddKid(letStmt, astNewIdentId("__ffi_handle_raw_ret", pos))
         astAddKid(letStmt, uirCoreFfiBuildVoidPtrTypeId(pos))
         astAddKid(letStmt, callExpr)
         astAddKid(letStmt, astNewNodeId(nkEmpty, pos))
         astAddKid(body, letStmt)
-        let regExpr: AstNodeId = uirCoreFfiBuildCall1Id(registerHelperName, astNewIdentId(rawNameLocal, pos), pos)
+        let regExpr: AstNodeId = uirCoreFfiBuildCall1Id(registerHelperName, astNewIdentId("__ffi_handle_raw_ret", pos), pos)
         let retStmt: AstNodeId = astNewNodeId(nkReturn, pos)
         astAddKid(retStmt, uirCoreFfiBuildTypeCallId(retTypeId, regExpr, pos))
         astAddKid(body, retStmt)
@@ -858,7 +864,7 @@ fn uirCoreRewriteFfiHandleFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagn
         uir_core_builder_ffi_out_ptr_push(outNodeIds, nId)
         return false
     var hasImportc: bool = false
-    var importcLinkName: str = ""
+    var importcLinkName: str
     uirCoreParseImportcLinkNameId(nId, &hasImportc, &importcLinkName)
     if !hasImportc:
         uirCoreStage1AddDiagId(diags, nId, "ffi_handle requires @importc (FULLC.FFI.HANDLE)")
@@ -894,9 +900,6 @@ fn uirCoreRewriteFfiHandleFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagn
         serial = *synthId
         *synthId = serial + 1
     let pos: SourcePos = astNodePos(nId)
-    let rawName: str = "__ffi_handle_raw_" + fnName + "_" + intToStr(serial)
-    let resolveHelperName: str = "__ffi_handle_resolve_ptr_" + intToStr(serial)
-    let registerHelperName: str = "__ffi_handle_register_ptr_" + intToStr(serial)
     let rawParams: AstNodeId = astNewNodeId(nkFormalParams, pos)
     for pi2 in 0..<astKidCount(paramsId):
         let pDef2: AstNodeId = astKidAt(paramsId, pi2)
@@ -913,16 +916,16 @@ fn uirCoreRewriteFfiHandleFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagn
     let rawPragma: AstNodeId = uirCoreClonePragmasFilteredId(pragmaId, false, false, false, true)
     let wrapperPragma: AstNodeId = uirCoreClonePragmasFilteredId(pragmaId, true, true, true, true)
     if handleParamCount > 0:
-        uir_core_builder_ffi_out_ptr_push(outNodeIds, uirCoreFfiBuildImportcHelperFuncId(resolveHelperName, "cheng_ffi_handle_resolve_ptr",
+        uir_core_builder_ffi_out_ptr_push(outNodeIds, uirCoreFfiBuildImportcHelperFuncId(uirCoreFfiHandleResolveHelperName(serial), "cheng_ffi_handle_resolve_ptr",
                                                            "__ffi_handle", astNewIdentId("uint64", pos),
                                                            uirCoreFfiBuildVoidPtrTypeId(pos), pos))
     if retIsHandle:
-        uir_core_builder_ffi_out_ptr_push(outNodeIds, uirCoreFfiBuildImportcHelperFuncId(registerHelperName, "cheng_ffi_handle_register_ptr",
+        uir_core_builder_ffi_out_ptr_push(outNodeIds, uirCoreFfiBuildImportcHelperFuncId(uirCoreFfiHandleRegisterHelperName(serial), "cheng_ffi_handle_register_ptr",
                                                            "__ffi_raw_ptr", uirCoreFfiBuildVoidPtrTypeId(pos),
                                                            astNewIdentId("uint64", pos), pos))
-    let rawFn: AstNodeId = uirCoreFfiOutPtrBuildRawFuncId(nId, rawName, rawParams, rawRetType, rawPragma, pos)
-    let wrapperBody: AstNodeId = uirCoreFfiHandleBuildWrapperBodyId(rawName, paramsId, handleParamMask,
-                                                                    resolveHelperName, registerHelperName,
+    let rawFn: AstNodeId = uirCoreFfiOutPtrBuildRawFuncId(nId, uirCoreFfiHandleRawName(fnName, serial), rawParams, rawRetType, rawPragma, pos)
+    let wrapperBody: AstNodeId = uirCoreFfiHandleBuildWrapperBodyId(uirCoreFfiHandleRawName(fnName, serial), paramsId, handleParamMask,
+                                                                    uirCoreFfiHandleResolveHelperName(serial), uirCoreFfiHandleRegisterHelperName(serial),
                                                                     retTypeId, retIsHandle, pos)
     let wrapperFn: AstNodeId = uirCoreFfiOutPtrBuildWrapperFuncId(nId, wrapperBody, wrapperPragma)
     astSetNodeDeclOrdinal(rawFn, astNodeDeclOrdinal(nId))
@@ -949,7 +952,7 @@ fn uirCoreRewriteFfiOutPtrFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagn
         uir_core_builder_ffi_out_ptr_push(outNodeIds, nId)
         return false
     var hasImportc: bool = false
-    var importcLinkName: str = ""
+    var importcLinkName: str
     uirCoreParseImportcLinkNameId(nId, &hasImportc, &importcLinkName)
     if !hasImportc:
         uirCoreFfiDiag(diags, nId, "ffi_out_ptrs requires @importc")
@@ -1026,7 +1029,6 @@ fn uirCoreRewriteFfiOutPtrFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagn
     if synthId != nil:
         serial = *synthId
         *synthId = serial + 1
-    let rawName: str = "__ffi_outptr_raw_" + fnName + "_" + intToStr(serial)
     let pos: SourcePos = astNodePos(nId)
     let rawParams: AstNodeId = astNewNodeId(nkFormalParams, pos)
     var inCursor: int32 = 0
@@ -1047,8 +1049,8 @@ fn uirCoreRewriteFfiOutPtrFuncId(nId: AstNodeId, synthId: Int32Ptr, diags: Diagn
     let rawRetType: AstNodeId = hasStatus ? astCloneTreeId(statusTypeId) : astNewNodeId(nkEmpty, pos)
     let rawPragma: AstNodeId = uirCoreClonePragmasFilteredId(pragmaId, false, true, false, false)
     let wrapperPragma: AstNodeId = uirCoreClonePragmasFilteredId(pragmaId, true, true, true, true)
-    let rawFn: AstNodeId = uirCoreFfiOutPtrBuildRawFuncId(nId, rawName, rawParams, rawRetType, rawPragma, pos)
-    let wrapperBody: AstNodeId = uirCoreFfiOutPtrBuildWrapperBodyId(rawName, rawParams, paramsId, outElemTypes,
+    let rawFn: AstNodeId = uirCoreFfiOutPtrBuildRawFuncId(nId, uirCoreFfiOutPtrRawName(fnName, serial), rawParams, rawRetType, rawPragma, pos)
+    let wrapperBody: AstNodeId = uirCoreFfiOutPtrBuildWrapperBodyId(uirCoreFfiOutPtrRawName(fnName, serial), rawParams, paramsId, outElemTypes,
                                                                     hasStatus, statusTypeId, pos)
     let wrapperFn: AstNodeId = uirCoreFfiOutPtrBuildWrapperFuncId(nId, wrapperBody, wrapperPragma)
     astSetNodeDeclOrdinal(rawFn, astNodeDeclOrdinal(nId))

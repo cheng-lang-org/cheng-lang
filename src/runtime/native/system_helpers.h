@@ -287,6 +287,11 @@ char* cheng_list_dir(const char* path);
 char* cheng_read_file(const char* path);
 int32_t cheng_write_file(const char* path, const char* content);
 char* cheng_exec_cmd_ex(const char* command, const char* workingDir, int32_t mergeStderr, int64_t* exitCode);
+char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                              const char* workingDir, int32_t mergeStderr, int32_t timeoutSec,
+                              int64_t* exitCode);
+int64_t cheng_exec_file_status(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                               const char* workingDir, int32_t timeoutSec);
 char* chengQ_execQ_cmdQ_ex_0(char* command, char* workingDir, int32_t mergeStderr, int64_t* exitCode);
 int32_t cheng_pty_is_supported(void);
 int32_t cheng_pty_spawn(const char* command, const char* workingDir, int32_t* outMasterFd, int64_t* outPid);

@@ -71,7 +71,6 @@ repo_gate_support_ids() {
   for gate_id in \
     verify_backend_stage1_fixed0_envs \
     verify_backend_string_literal_regression \
-    verify_std_strformat \
     verify_backend_default_output_safety \
     verify_new_expr_surface \
     verify_backend_pure_cheng_surface \
@@ -80,6 +79,26 @@ repo_gate_support_ids() {
     verify_backend_string_abi_contract \
     verify_backend_dot_lowering_contract \
     verify_backend_selfhost_currentsrc_proof; do
+    printf '%s\n' "$gate_id"
+  done
+}
+
+native_cli_support_ids() {
+  for gate_id in \
+    backend_resolve_selflink_runtime_obj \
+    bootstrap \
+    verify_backend_cdrop_emergency \
+    verify_std_layout_sync \
+    verify_std_strformat \
+    verify_std_foundation \
+    verify_std_string_json \
+    verify_std_file_io \
+    verify_std_net_io \
+    verify_std_baseline \
+    verify_std_docs_examples \
+    verify_std_stability \
+    build_std_perf_baseline \
+    verify_std_perf_baseline; do
     printf '%s\n' "$gate_id"
   done
 }
@@ -236,6 +255,36 @@ EOF
   done
 }
 
+install_support_native_cli_gate() {
+  install_dir="$1"
+  manifest_path="$2"
+  only_selector="${3:-}"
+  exclude_selector="${4:-}"
+  target_bin="$5"
+  for gate_id in $(native_cli_support_ids); do
+    if [ "$only_selector" != "" ] && ! selector_contains "$only_selector" "$gate_id"; then
+      continue
+    fi
+    if selector_contains "$exclude_selector" "$gate_id"; then
+      continue
+    fi
+    link_path="$install_dir/$gate_id"
+    cat >"$link_path" <<EOF
+#!/usr/bin/env sh
+exec "$target_bin" "$gate_id" "\$@"
+EOF
+    chmod +x "$link_path"
+    if [ "$manifest_path" != "" ]; then
+      if [ ! -f "$manifest_path" ]; then
+        printf 'name\tlink\n' >"$manifest_path"
+      fi
+      if ! grep -qx "$gate_id	$link_path" "$manifest_path" 2>/dev/null; then
+        printf '%s\t%s\n' "$gate_id" "$link_path" >>"$manifest_path"
+      fi
+    fi
+  done
+}
+
 bundle_support_repo_script_gate() {
   bundle_dir="$1"
   bundle_manifest_path="$2"
@@ -255,6 +304,28 @@ bundle_support_repo_script_gate() {
       }
       { print }
     ' "$gate_script" >"$link_path"
+    chmod +x "$link_path"
+    if [ "$bundle_manifest_path" != "" ]; then
+      if [ ! -f "$bundle_manifest_path" ]; then
+        printf 'name\tlink\n' >"$bundle_manifest_path"
+      fi
+      if ! grep -qx "$gate_id	$link_path" "$bundle_manifest_path" 2>/dev/null; then
+        printf '%s\t%s\n' "$gate_id" "$link_path" >>"$bundle_manifest_path"
+      fi
+    fi
+  done
+}
+
+bundle_support_native_cli_gate() {
+  bundle_dir="$1"
+  bundle_manifest_path="$2"
+  for gate_id in $(native_cli_support_ids); do
+    link_path="$bundle_dir/$gate_id"
+    cat >"$link_path" <<EOF
+#!/usr/bin/env sh
+tool_dir="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
+exec "\$tool_dir/cheng_tooling" "$gate_id" "\$@"
+EOF
     chmod +x "$link_path"
     if [ "$bundle_manifest_path" != "" ]; then
       if [ ! -f "$bundle_manifest_path" ]; then
@@ -411,6 +482,7 @@ run_augmented_install() {
   fi
   mkdir -p "$install_dir"
   install_support_repo_script_gate "$install_dir" "$manifest" "$only_selector" "$exclude_selector" "$target_bin"
+  install_support_native_cli_gate "$install_dir" "$manifest" "$only_selector" "$exclude_selector" "$target_bin"
 }
 
 run_augmented_bundle() {
@@ -469,6 +541,7 @@ run_augmented_bundle() {
     sync_tooling_exec_template "$bundle_wrapper_src" "$bundle_bin_path" >/dev/null 2>&1 || true
     sync_tooling_exec_template "$bundle_wrapper_src" "$bundle_link_tool_path" >/dev/null 2>&1 || true
     bundle_support_repo_script_gate "$bundle_links_dir" "$bundle_manifest_path"
+    bundle_support_native_cli_gate "$bundle_links_dir" "$bundle_manifest_path"
   fi
 }
 
@@ -490,6 +563,11 @@ run_augmented_list() {
   "$base_bin" "$@" >"$tmp_out"
   cat "$tmp_out"
   list_repo_script_ids | while IFS= read -r id; do
+    if ! grep -qx "$id" "$tmp_out"; then
+      printf '%s\n' "$id"
+    fi
+  done
+  native_cli_support_ids | while IFS= read -r id; do
     if ! grep -qx "$id" "$tmp_out"; then
       printf '%s\n' "$id"
     fi

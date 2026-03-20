@@ -3,8 +3,11 @@ import std/result
 import std/seqs
 type
     cstring = ptr
-    # Language-level string keeps value semantics; ABI bridge still uses cstring.
-    str = ptr
+    str =
+        data: ptr
+        len: int32
+        store_id: int32
+        flags: int32
     ChengSeqHeader =
         len: int32
         cap: int32
@@ -39,33 +42,82 @@ fn xorCompat(a, b: int32): int32
 fn bitnotCompat(a: int32): int32
 @importc("not_0")
 fn notCompat(a: bool): bool
+@importc("ptr_add")
+fn system_ptr_add(p: ptr, off: int32): ptr
 importc fn puts(s: cstring): int32
 importc fn c_puts(s: cstring): int32
+const chengStrFlagOwned: int32 = 1
+
+fn strEmpty(): str =
+    var out: str
+    out.data = nil
+    out.len = 0
+    out.store_id = 0
+    out.flags = 0
+    return out
+
+fn strDataPtr(s: str): ptr =
+    return s.data
+
+fn strLenFast(s: str): int32 =
+    if s.len <= 0:
+        return 0
+    if s.data == nil:
+        return 0
+    return s.len
+
+fn strViewWithFlags(data: ptr, len: int32, storeId: int32, flags: int32): str =
+    if data == nil || len <= 0:
+        return strEmpty()
+    var out: str
+    out.data = data
+    out.len = len
+    out.store_id = storeId
+    out.flags = flags
+    return out
+
+fn strViewUnsafe(data: ptr, len: int32): str =
+    return strViewWithFlags(data, len, 0, 0)
+
+fn strSubView(s: str, start: int32, count: int32): str =
+    let n: int32 = strLenFast(s)
+    if count <= 0 || n <= 0:
+        return strEmpty()
+    var start0: int32 = start
+    if start0 < 0:
+        start0 = 0
+    if start0 >= n:
+        return strEmpty()
+    var kept: int32 = count
+    if start0 + kept > n:
+        kept = n - start0
+    return strViewWithFlags(system_ptr_add(strDataPtr(s), start0), kept, s.store_id, 0)
+
 fn echo(msg: cstring) =
     puts(msg)
 importc fn exit(code: int32)
 importc fn cheng_dump_backtrace_if_enabled()
 fn panic(msg: str) =
-    puts(cstring(msg))
+    puts(strToCStringTemp(msg))
     exit(1)
 fn panicErr(err: result.ErrorInfo) =
     let msgText: str = ErrorMessage(err)
-    if cheng_strlen(msgText) == 0:
-        puts(cstring("error"))
+    if strLenFast(msgText) == 0:
+        puts(strToCStringTemp("error"))
         exit(1)
-    let raw: cstring = cstring(msgText)
+    let raw: cstring = strToCStringTemp(msgText)
     puts(raw)
     exit(1)
 fn assert(cond: bool, msg: str) =
     if ! cond:
-        puts(cstring(msg))
+        puts(strToCStringTemp(msg))
         exit(1)
 @importc("cheng_malloc")
 fn heapNewLegacy(size: int32): ptr
 @importc("cheng_malloc")
 fn heapNewCompat(size: int32): ptr
-importc fn driver_c_new_string(size: int32): str
-importc fn driver_c_new_string_copy_n(raw: ptr, count: int32): str
+importc fn driver_c_new_string(size: int32): cstring
+importc fn driver_c_new_string_copy_n(raw: ptr, count: int32): cstring
 @importc("cheng_free")
 fn free(p: ptr)
 @importc("cheng_realloc")
@@ -121,10 +173,8 @@ fn atomicLoadI32(p: ptr): int32
 fn heapAllocLegacy(size: int32): ptr
 @importc("cheng_free")
 fn heapFreeLegacy(p: ptr)
-@importc("cheng_strlen")
-fn cheng_strlen(s: str): int32
-@importc("cheng_strlen")
-fn c_strlen(s: str): int32
+@importc("cheng_cstrlen")
+fn c_strlen(s: cstring): int32
 importc fn cheng_ptr_size(): int32
 fn ptrSize(): int32 =
     return cheng_ptr_size()
@@ -225,8 +275,6 @@ fn cmpMem(a, b: ptr, size: int64): int32
 fn cheng_strcmp(a, b: cstring): int32
 @importc("cheng_strcmp")
 fn c_strcmp(a, b: cstring): int32
-@importc("cheng_strcmp")
-fn system_driver_strcmp(a: str, b: str): int32
 @importc("cheng_bits_to_f32")
 fn bitsToF32(bits: int32): float64
 @importc("cheng_f32_to_bits")
@@ -272,14 +320,20 @@ fn chr(x: int32): char =
     return chrCompat(x)
 fn ord(c: char): int32 =
     return ordCompat(c)
-@importc("driver_c_str_clone")
-fn systemToStringStr(x: str): str
 @importc("driver_c_bool_to_str")
-fn boolToString(x: bool): str
+fn system_boolToCString(x: bool): cstring
 @importc("driver_c_char_to_str")
-fn charToString(x: char): str
+fn system_charToCString(x: char): cstring
 @importc("driver_c_bool_identity")
 fn defined(x: bool): bool
+fn systemToStringStr(x: str): str =
+    return newStringCopy(strDataPtr(x), strLenFast(x))
+
+fn boolToString(x: bool): str =
+    return strFromCStringBorrow(system_boolToCString(x))
+
+fn charToString(x: char): str =
+    return strFromCStringBorrow(system_charToCString(x))
 fn newException(t: typedesc[T], message: str): T =
     t
     message
@@ -311,7 +365,23 @@ fn clamp(x: T, lo: T, hi: T): T =
     else:
         return x
 fn cmp(a: str, b: str): int32 =
-    return system_driver_strcmp(a, b)
+    let n: int32 = strLenFast(a)
+    let m: int32 = strLenFast(b)
+    let limit: int32 = min(n, m)
+    var i: int32 = 0
+    while i < limit:
+        let lhs: uint8 = load(system_ptr_add(strDataPtr(a), i))
+        let rhs: uint8 = load(system_ptr_add(strDataPtr(b), i))
+        if lhs < rhs:
+            return -1
+        if lhs > rhs:
+            return 1
+        i = i + 1
+    if n < m:
+        return -1
+    if n > m:
+        return 1
+    return 0
 fn cmpInt(a: int, b: int): int32 =
     if a < b:
         return -1
@@ -345,11 +415,17 @@ fn dec(x: var T, delta: T) =
     x = x - delta
 fn dec(x: var T) =
     x = x - T(1)
-# Minimal str concat (for `+` builtin semantics; avoid extra modules).
-@importc("cheng_str_concat")
-fn system_runtime_str_concat(a: str, b: str): str
 fn __cheng_concat_str(a: str, b: str): str =
-    return system_runtime_str_concat(a, b)
+    let nLeft: int32 = strLenFast(a)
+    let nRight: int32 = strLenFast(b)
+    let out: str = newStringAlloc(nLeft + nRight)
+    if nLeft > 0:
+        memCopyCompat(strDataPtr(out), strDataPtr(a), nLeft)
+    if nRight > 0:
+        memCopyCompat(system_ptr_add(strDataPtr(out), nLeft), strDataPtr(b), nRight)
+    if strDataPtr(out) != nil:
+        store(system_ptr_add(strDataPtr(out), nLeft + nRight), uint8(0))
+    return out
 fn __cheng_set_range_mask(start: int32, stop: int32, exclusive: bool): uint64 =
     var s: int32
     s = start
@@ -381,20 +457,57 @@ fn setHas(s: set[T], value: T): bool =
     return out
 fn newString(len: int32): str =
     if len <= 0:
-        return ""
-    return newStringAlloc(len)
+        return strEmpty()
+    return strOwnedAlloc(len)
+
+fn strOwnedAlloc(len: int32): str =
+    if len <= 0:
+        return strEmpty()
+    let raw: cstring = driver_c_new_string(len)
+    if raw == nil:
+        return strEmpty()
+    return strViewWithFlags(ptr(raw), len, 0, chengStrFlagOwned)
+
+fn strFromBytesCopy(src: ptr, len: int32): str =
+    if src == nil || len <= 0:
+        return strEmpty()
+    let raw: cstring = driver_c_new_string_copy_n(src, len)
+    if raw == nil:
+        return strEmpty()
+    return strViewWithFlags(ptr(raw), len, 0, chengStrFlagOwned)
+
+fn strFromCStringBorrow(raw: cstring): str =
+    if raw == nil:
+        return strEmpty()
+    let n: int32 = c_strlen(raw)
+    return strViewUnsafe(ptr(raw), n)
+
+fn strFromCStringCopy(raw: cstring): str =
+    if raw == nil:
+        return strEmpty()
+    let n: int32 = c_strlen(raw)
+    return strFromBytesCopy(ptr(raw), n)
+
+fn strToCStringTemp(s: str): cstring =
+    if strLenFast(s) == 0:
+        return driver_c_new_string(0)
+    if strDataPtr(s) == nil:
+        return driver_c_new_string(0)
+    if bitandCompat(s.flags, chengStrFlagOwned) != 0:
+        return cstring(strDataPtr(s))
+    let copied: str = strFromBytesCopy(strDataPtr(s), strLenFast(s))
+    if strDataPtr(copied) == nil:
+        return driver_c_new_string(0)
+    memScopeEscape(strDataPtr(copied))
+    return cstring(strDataPtr(copied))
 
 fn newStringAlloc(len: int32): str =
-    if len <= 0:
-        return ""
-    return driver_c_new_string(len)
+    return strOwnedAlloc(len)
 
 fn newStringCopy(raw: ptr, count: int32): str =
-    if raw == nil || count <= 0:
-        return ""
-    return driver_c_new_string_copy_n(raw, count)
+    return strFromBytesCopy(raw, count)
 fn newStringOfCap(len: int32): str =
-    return newStringAlloc(len)
+    return strOwnedAlloc(len)
 fn new(): ref T =
     var r: ref T = new(T)
     return r

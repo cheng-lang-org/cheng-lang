@@ -1184,10 +1184,13 @@ int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_p
   const char *target_text = (target != NULL) ? target : "";
   const char *linker_text = (linker != NULL && linker[0] != '\0') ? linker : "system";
   const char *runtime_c = "/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c";
+  const char *runtime_obj = getenv("BACKEND_RUNTIME_OBJ");
+  const char *runtime_input = runtime_c;
   const char *cflags = getenv("BACKEND_CFLAGS");
   const char *ldflags = getenv("BACKEND_LDFLAGS");
   const char *cflags_text = (cflags != NULL) ? cflags : "";
   const char *ldflags_text = (ldflags != NULL) ? ldflags : "";
+  const char *fast_darwin_adhoc_raw = getenv("BACKEND_DARWIN_FAST_ADHOC");
   char full_ldflags[512];
   char extra_ldflags[96];
   full_ldflags[0] = '\0';
@@ -1195,14 +1198,24 @@ int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_p
   if (output_path == NULL || output_path[0] == '\0') return -20;
   if (obj_path == NULL || obj_path[0] == '\0') return -21;
   if (strcmp(linker_text, "system") != 0) return -22;
+  if (driver_c_env_bool("BACKEND_NO_RUNTIME_C", 0) != 0 &&
+      runtime_obj != NULL && runtime_obj[0] != '\0' &&
+      access(runtime_obj, R_OK) == 0) {
+    runtime_input = runtime_obj;
+  }
   const char *base = strrchr(obj_path, '/');
   const char *obj_name = (base != NULL) ? (base + 1) : obj_path;
   int use_driver_entry_shim = strstr(obj_name, "backend_driver") != NULL ||
                               driver_c_env_bool("BACKEND_FORCE_DRIVER_ENTRY_SHIM", 0) != 0;
   int needs_darwin_codesign = 0;
+  int fast_darwin_adhoc =
+      (fast_darwin_adhoc_raw != NULL && fast_darwin_adhoc_raw[0] != '\0')
+          ? driver_c_env_bool("BACKEND_DARWIN_FAST_ADHOC", 0)
+          : driver_c_env_bool("BACKEND_FAST_DEV_PROFILE", 0);
   if (strstr(target_text, "darwin") != NULL || strstr(target_text, "apple-darwin") != NULL) {
-    needs_darwin_codesign = 1;
-    if (strstr(ldflags_text, "-Wl,-no_adhoc_codesign") == NULL) {
+    if (strstr(ldflags_text, "-Wl,-no_adhoc_codesign") != NULL) fast_darwin_adhoc = 0;
+    needs_darwin_codesign = fast_darwin_adhoc ? 0 : 1;
+    if (!fast_darwin_adhoc && strstr(ldflags_text, "-Wl,-no_adhoc_codesign") == NULL) {
       snprintf(extra_ldflags + strlen(extra_ldflags),
                sizeof(extra_ldflags) - strlen(extra_ldflags),
                " -Wl,-no_adhoc_codesign");
@@ -1214,16 +1227,16 @@ int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_p
     }
   }
   snprintf(full_ldflags, sizeof(full_ldflags), "%s%s", ldflags_text, extra_ldflags);
-  size_t need = strlen(obj_path) + strlen(runtime_c) + strlen(output_path) +
+  size_t need = strlen(obj_path) + strlen(runtime_input) + strlen(output_path) +
                 strlen(cflags_text) + strlen(full_ldflags) + 128u;
   char *cmd = (char *)malloc(need);
   if (cmd == NULL) return -23;
   if (use_driver_entry_shim) {
     snprintf(cmd, need, "cc -DCHENG_BACKEND_DRIVER_ENTRY_SHIM %s '%s' '%s' %s -o '%s'",
-             cflags_text, obj_path, runtime_c, full_ldflags, output_path);
+             cflags_text, obj_path, runtime_input, full_ldflags, output_path);
   } else {
     snprintf(cmd, need, "cc %s '%s' '%s' %s -o '%s'",
-             cflags_text, obj_path, runtime_c, full_ldflags, output_path);
+             cflags_text, obj_path, runtime_input, full_ldflags, output_path);
   }
   int rc = system(cmd);
   free(cmd);

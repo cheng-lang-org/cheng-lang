@@ -953,47 +953,21 @@ driver_stage0_supports_new_expr_assignments() {
   return 1
 }
 
-driver_stage0_new_expr_compat_root() {
-  compiler="$1"
-  printf '%s\n' "$root/chengcache/build_backend_driver.compat_new_expr/$(stage0_tag "$compiler")"
-}
-
-driver_prepare_new_expr_compat_root() {
-  compiler="$1"
-  compat_root="$(driver_stage0_new_expr_compat_root "$compiler")"
-  compat_src="$compat_root/src"
-  compat_stamp="$compat_root/.stamp"
-  rebuild="0"
-  if [ ! -d "$compat_src" ] || [ ! -f "$compat_stamp" ]; then
-    rebuild="1"
-  elif find "$root/src" -type f -newer "$compat_stamp" -print -quit | grep . >/dev/null 2>&1; then
-    rebuild="1"
-  fi
-  if [ "$rebuild" = "1" ]; then
-    rm -rf "$compat_root"
-    mkdir -p "$compat_root"
-    cp -R "$root/src" "$compat_src"
-    find "$compat_src" -name '*.cheng' -type f | while read -r f; do
-      perl -0pi -e '
-        our $c = 0;
-        s{^(\h*)(var|let)\h+([A-Za-z_][A-Za-z0-9_]*)\h*:\h*([^\n=]+?)\h*=\h*new\(\h*([^\n\)]+?)\h*\)\h*$}{
-          my ($i, $kw, $name, $ty, $arg) = ($1, $2, $3, $4, $5);
-          my $tty = $ty;
-          my $a = $arg;
-          $tty =~ s/^\h+|\h+$//g;
-          $a =~ s/^\h+|\h+$//g;
-          if ($tty eq $a) {
-            my $tmp = "__cheng_new_tmp_compat_" . $c++;
-            "${i}var ${tmp}: ${tty}\n${i}new ${tmp}\n${i}${kw} ${name}: ${tty} = ${tmp}";
-          } else {
-            $&;
-          }
-        }gme;
-      ' "$f"
-    done
-    touch "$compat_stamp"
-  fi
-  printf '%s\n' "$compat_root"
+driver_stage0_new_expr_compat_driver() {
+  for cand in \
+    "$root/artifacts/backend_driver/cheng" \
+    "$root/dist/releases/current/cheng"
+  do
+    if [ "$cand" = "" ]; then
+      continue
+    fi
+    abs="$(to_abs "$cand")"
+    if driver_sanity_ok "$abs"; then
+      printf '%s\n' "$abs"
+      return 0
+    fi
+  done
+  return 1
 }
 
 run_driver_compile_once() {
@@ -1005,31 +979,49 @@ run_driver_compile_once() {
   diag_label="$6"
   compile_root="$root"
   compile_input="src/backend/tooling/backend_driver.cheng"
-  compat_root=""
+  compile_driver="$compiler"
+  compat_driver=""
+  compat_sidecar_bundle=""
   driver_ldflags_now="$driver_ldflags"
   diag_file=""
   diag_child_file=""
   if ! driver_stage0_supports_new_expr_assignments "$compiler"; then
-    compat_root="$(driver_prepare_new_expr_compat_root "$compiler" || true)"
-    if [ "$compat_root" = "" ] || [ ! -f "$compat_root/src/backend/tooling/backend_driver.cheng" ]; then
-      echo "[Error] build_backend_driver failed to prepare new-expr compat root for stage0: $compiler" >>"$log_file"
+    compat_driver="$(driver_stage0_new_expr_compat_driver || true)"
+    if [ "$compat_driver" = "" ]; then
+      echo "[Error] build_backend_driver missing canonical compat driver for stage0: $compiler" >>"$log_file"
       return 1
     fi
-    compile_root="$compat_root"
-    shim_src="$root/src/backend/tooling/backend_driver_stage0_backend_main_shim.c"
-    shim_obj="$root/chengcache/backend_driver_stage0_backend_main_shim.${target}.o"
-    if ! prepare_driver_symbol_bridge_obj "$shim_src" "$shim_obj"; then
-      echo "[Error] build_backend_driver failed to prepare backend main shim: $shim_src" >>"$log_file"
+    compile_driver="$compat_driver"
+    if ! driver_sidecar_ensure; then
+      echo "[Error] build_backend_driver failed to prepare sidecar bundle for compat stage0: $compiler" >>"$log_file"
       return 1
     fi
-    if [ "$driver_ldflags_now" = "" ]; then
-      driver_ldflags_now="$shim_obj"
-    else
-      driver_ldflags_now="$driver_ldflags_now $shim_obj"
+    compat_sidecar_bundle="$(driver_sidecar_bundle_path)"
+    if [ ! -s "$compat_sidecar_bundle" ]; then
+      echo "[Error] build_backend_driver missing compat sidecar bundle: $compat_sidecar_bundle" >>"$log_file"
+      return 1
+    fi
+    if [ "${BACKEND_BUILD_DRIVER_FORCE_MAIN_SHIM:-0}" = "1" ]; then
+      shim_src="$root/src/backend/tooling/backend_driver_stage0_backend_main_shim.c"
+      shim_obj="$root/chengcache/backend_driver_stage0_backend_main_shim.${target}.o"
+      if ! prepare_driver_symbol_bridge_obj "$shim_src" "$shim_obj"; then
+        echo "[Error] build_backend_driver failed to prepare backend main shim: $shim_src" >>"$log_file"
+        return 1
+      fi
+      if [ "$driver_ldflags_now" = "" ]; then
+        driver_ldflags_now="$shim_obj"
+      else
+        driver_ldflags_now="$driver_ldflags_now $shim_obj"
+      fi
     fi
   fi
   printf 'compile_root=%s\n' "$compile_root" >>"$log_file"
   printf 'compile_input=%s\n' "$compile_input" >>"$log_file"
+  printf 'compile_driver=%s\n' "$compile_driver" >>"$log_file"
+  if [ "$compat_driver" != "" ]; then
+    printf 'compat_sidecar_compiler=%s\n' "$compiler" >>"$log_file"
+    printf 'compat_sidecar_bundle=%s\n' "$compat_sidecar_bundle" >>"$log_file"
+  fi
   printf 'driver_ldflags=%s\n' "$driver_ldflags_now" >>"$log_file"
   case "$timeout_diag_enabled" in
     1|true|TRUE|yes|YES|on|ON)
@@ -1064,13 +1056,20 @@ run_driver_compile_once() {
         BACKEND_LINKER=self \
         BACKEND_NO_RUNTIME_C=1 \
         BACKEND_RUNTIME_OBJ="$runtime_obj_abs" \
+        BACKEND_ENABLE_CSTRING_LOWERING="${compat_driver:+1}" \
+        BACKEND_CSTRING_LOWERING="${compat_driver:+1}" \
+        BACKEND_ISEL_CSTRING_LOWERING="${compat_driver:+1}" \
+        BACKEND_UIR_SIDECAR_BUNDLE="${compat_sidecar_bundle}" \
+        BACKEND_UIR_PREFER_SIDECAR="${compat_driver:+1}" \
+        BACKEND_UIR_FORCE_SIDECAR="${compat_driver:+1}" \
+        BACKEND_UIR_SIDECAR_COMPILER="${compat_driver:+$compiler}" \
         BACKEND_LDFLAGS="$driver_ldflags_now" \
         BACKEND_EMIT=exe \
         BACKEND_TARGET="$target" \
         BACKEND_FRONTEND="$driver_frontend" \
         BACKEND_INPUT="$compile_input" \
         BACKEND_OUTPUT="$out_bin" \
-        "$compiler" >>"$log_file" 2>&1
+        "$compile_driver" >>"$log_file" 2>&1
     status="$?"
     if [ "$status" -eq 124 ] || [ "$status" -eq 143 ]; then
       emit_timeout_diag_summary "$diag_label" "$diag_file" "$diag_child_file" "$log_file"
@@ -1099,13 +1098,20 @@ run_driver_compile_once() {
       BACKEND_LINKER=system \
       BACKEND_NO_RUNTIME_C=0 \
       BACKEND_RUNTIME_OBJ= \
+      BACKEND_ENABLE_CSTRING_LOWERING="${compat_driver:+1}" \
+      BACKEND_CSTRING_LOWERING="${compat_driver:+1}" \
+      BACKEND_ISEL_CSTRING_LOWERING="${compat_driver:+1}" \
+      BACKEND_UIR_SIDECAR_BUNDLE="${compat_sidecar_bundle}" \
+      BACKEND_UIR_PREFER_SIDECAR="${compat_driver:+1}" \
+      BACKEND_UIR_FORCE_SIDECAR="${compat_driver:+1}" \
+      BACKEND_UIR_SIDECAR_COMPILER="${compat_driver:+$compiler}" \
       BACKEND_LDFLAGS="$driver_ldflags_now" \
       BACKEND_EMIT=exe \
       BACKEND_TARGET="$target" \
       BACKEND_FRONTEND="$driver_frontend" \
       BACKEND_INPUT="$compile_input" \
       BACKEND_OUTPUT="$out_bin" \
-      "$compiler" >>"$log_file" 2>&1
+      "$compile_driver" >>"$log_file" 2>&1
   status="$?"
   if [ "$status" -eq 124 ] || [ "$status" -eq 143 ]; then
     emit_timeout_diag_summary "$diag_label" "$diag_file" "$diag_child_file" "$log_file"

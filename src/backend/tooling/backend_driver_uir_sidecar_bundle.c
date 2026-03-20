@@ -205,6 +205,26 @@ static const char *driver_sidecar_default_preserved_attempt_for_input(const char
   return path;
 }
 
+static int driver_sidecar_compiler_file_healthy(const char *path) {
+  struct stat st;
+  const off_t min_size = (off_t)(1024 * 1024);
+  if (!driver_sidecar_str_non_empty(path)) return 0;
+  if (access(path, X_OK) != 0) return 0;
+  if (stat(path, &st) != 0) return 0;
+  if (!S_ISREG(st.st_mode)) return 0;
+  if (st.st_size < min_size) return 0;
+  return 1;
+}
+
+static int driver_sidecar_preserved_attempt_healthy(const char *input_path,
+                                                    const char *compiler_path,
+                                                    const char *path) {
+  if (!driver_sidecar_compiler_file_healthy(path)) return 0;
+  (void)input_path;
+  (void)compiler_path;
+  return 1;
+}
+
 static const char *driver_sidecar_default_currentsrc_proof_stage0_for_input(
     const char *input_path, const char *compiler_path) {
   static char path[PATH_MAX];
@@ -987,10 +1007,6 @@ static const char *driver_sidecar_pick_compiler_for_input(const char *input_path
     return currentsrc_stage0;
   }
   preserved_attempt = driver_sidecar_default_preserved_attempt_for_input(input_path, env_path);
-  if (driver_sidecar_should_prefer_preserved_attempt(input_path) &&
-      preserved_attempt != NULL && access(preserved_attempt, X_OK) == 0) {
-    return preserved_attempt;
-  }
   preferred_release_path =
       driver_sidecar_default_preferred_release_for_input(input_path, env_path);
   if (preferred_release_path != NULL && access(preferred_release_path, X_OK) == 0) {
@@ -1008,7 +1024,11 @@ static const char *driver_sidecar_pick_compiler_for_input(const char *input_path
   if (stage0_path != NULL && access(stage0_path, X_OK) == 0) {
     return stage0_path;
   }
-  if (preserved_attempt != NULL && access(preserved_attempt, X_OK) == 0) {
+  if (driver_sidecar_should_prefer_preserved_attempt(input_path) &&
+      driver_sidecar_preserved_attempt_healthy(input_path, env_path, preserved_attempt)) {
+    return preserved_attempt;
+  }
+  if (driver_sidecar_preserved_attempt_healthy(input_path, env_path, preserved_attempt)) {
     return preserved_attempt;
   }
   return NULL;

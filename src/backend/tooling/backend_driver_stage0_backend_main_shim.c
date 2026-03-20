@@ -4,6 +4,16 @@ extern void __cheng_setCmdLine(int32_t argc, const char **argv) __attribute__((w
 extern void driver_c_capture_cmdline(int32_t argc, void *argv_void) __attribute__((weak));
 extern int32_t backendMain(void);
 
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+void store(void *p, void *v) {
+  if (p == 0) {
+    return;
+  }
+  *(void **)p = v;
+}
+
 int main(int argc, char **argv) {
   if (__cheng_setCmdLine != 0) {
     __cheng_setCmdLine((int32_t)argc, (const char **)argv);

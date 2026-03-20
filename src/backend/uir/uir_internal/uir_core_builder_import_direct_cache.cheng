@@ -68,34 +68,61 @@ fn uirCoreResolveRepoRoot(inPath: str): str =
         return pwdRoot
     return "."
 
+fn uirCoreEnsureChengSuffix(path0: str): str =
+    if strHasSuffix(path0, ".cheng"):
+        return path0
+    return path0 + ".cheng"
+
+fn uirCoreImportFromDir(fromFilePath: str): str =
+    if len(fromFilePath) > 0:
+        return frontend_lib.stage1SplitDir(fromFilePath)
+    return ""
+
+fn uirCoreStdImportRelPath(rest: str): str =
+    return uirCoreEnsureChengSuffix("src/std/" + rest)
+
+fn uirCorePkgLocalSrcPath(pkgPath: str): str =
+    return uirCoreEnsureChengSuffix("src/" + pkgPath)
+
+fn uirCoreImportNodeText(nodeId: AstNodeId): str =
+    if !astNodeIdValid(nodeId):
+        return ""
+    if astNodeKind(nodeId) == nkStrLit:
+        return astNodeStrVal(nodeId)
+    return astPlainName(nodeId)
+
+fn uirCoreImportCacheLineText(content: str, lineStart: int32, lineEnd: int32): str =
+    if lineEnd <= lineStart:
+        return ""
+    return strutils.strip(uirCoreStrSliceRange(content, lineStart, lineEnd - 1))
+
+fn uirCoreImportCacheLineRest(line: str): str =
+    let rest0: str = strutils.strip(rawmemStrFromOffset(line, 7))
+    let asIdx: int32 = uirCoreStrIndexOf(rest0, " as ")
+    if asIdx > 0:
+        return strutils.strip(uirCoreStrTake(rest0, asIdx))
+    return rest0
+
 fn resolveImportToFilePath(importPath: str, fromFilePath: str): Result[str] =
     if len(importPath) == 0:
         return Err[str]("uirCore_builder: empty import path")
-    var path: str = importPath
-    let pluginResolved: str = uirCoreResolvePluginImportPath(path)
+    let pluginResolved: str = uirCoreResolvePluginImportPath(importPath)
     if len(pluginResolved) > 0:
         return Ok[str](pluginResolved)
-    if os.isAbsolute(path):
-        if !strHasSuffix(path, ".cheng"):
-            path = path + ".cheng"
-        return Ok[str](path)
+    if os.isAbsolute(importPath):
+        return Ok[str](uirCoreEnsureChengSuffix(importPath))
 
-    var fromDir: str = ""
-    if len(fromFilePath) > 0:
-        fromDir = frontend_lib.stage1SplitDir(fromFilePath)
+    let fromDir: str = uirCoreImportFromDir(fromFilePath)
 
-    if strHasPrefix(path, "./") || strHasPrefix(path, "../") || strHasPrefix(path, "."):
-        if !strHasSuffix(path, ".cheng"):
-            path = path + ".cheng"
+    if strHasPrefix(importPath, "./") || strHasPrefix(importPath, "../") || strHasPrefix(importPath, "."):
+        let relPath: str = uirCoreEnsureChengSuffix(importPath)
         if len(fromDir) > 0:
-            return Ok[str](os.joinPath(fromDir, path))
-        return Ok[str](path)
+            return Ok[str](os.joinPath(fromDir, relPath))
+        return Ok[str](relPath)
 
-    if strHasPrefix(path, "std/"):
-        let rest: str = strStripPrefix(path, "std/")
-        var relStd: str = "src/std/" + rest
-        if !strHasSuffix(relStd, ".cheng"):
-            relStd = relStd + ".cheng"
+    if strHasPrefix(importPath, "std/"):
+        let rest: str = strStripPrefix(importPath, "std/")
+        let relStd: str = uirCoreStdImportRelPath(rest)
         let fromRoot: str = uirCoreGuessRepoRootFromPath(fromFilePath)
         if len(fromRoot) > 0:
             let fromCandidate: str = os.joinPath(fromRoot, relStd)
@@ -116,11 +143,9 @@ fn resolveImportToFilePath(importPath: str, fromFilePath: str): Result[str] =
             return Ok[str](relStd)
         return Ok[str](relStd)
 
-    let pkgPath: str = resolverImportPathDropChengPrefix(path)
+    let pkgPath: str = resolverImportPathDropChengPrefix(importPath)
     if len(pkgPath) > 0:
-        var localSrc: str = "src/" + pkgPath
-        if !strHasSuffix(localSrc, ".cheng"):
-            localSrc = localSrc + ".cheng"
+        let localSrc: str = uirCorePkgLocalSrcPath(pkgPath)
         if frontend_lib.stage1_fileExists(localSrc):
             return Ok[str](localSrc)
         let roots: str[] = pkgRootsFromEnv()
@@ -128,13 +153,10 @@ fn resolveImportToFilePath(importPath: str, fromFilePath: str): Result[str] =
             let resolved: str = resolvePkgImport(roots[ri], pkgPath)
             if len(resolved) > 0:
                 return Ok[str](resolved)
-        if strHasPrefix(path, "cheng/"):
-            if !strHasSuffix(path, ".cheng"):
-                path = path + ".cheng"
-            return Ok[str](path)
+        if strHasPrefix(importPath, "cheng/"):
+            return Ok[str](uirCoreEnsureChengSuffix(importPath))
 
-    if !strHasSuffix(path, ".cheng"):
-        path = path + ".cheng"
+    let path: str = uirCoreEnsureChengSuffix(importPath)
     if len(fromDir) > 0:
         let local2: str = os.joinPath(fromDir, path)
         if frontend_lib.stage1_fileExists(local2):
@@ -164,9 +186,7 @@ fn uirCoreCollectImportPathsId(rootId: AstNodeId): str[] =
             let baseNodeId: AstNodeId = astKidAt(itemId, 0)
             if !astNodeIdValid(baseNodeId):
                 continue
-            var base: str = astPlainName(baseNodeId)
-            if astNodeKind(baseNodeId) == nkStrLit:
-                base = astNodeStrVal(baseNodeId)
+            let base: str = uirCoreImportNodeText(baseNodeId)
             if len(base) > 0:
                 uir_core_builder_import_direct_cache_add(out, "" + base)
             continue
@@ -174,23 +194,17 @@ fn uirCoreCollectImportPathsId(rootId: AstNodeId): str[] =
             let baseNodeId: AstNodeId = astKidAt(itemId, 0)
             if !astNodeIdValid(baseNodeId):
                 continue
-            var base: str = astPlainName(baseNodeId)
-            if astNodeKind(baseNodeId) == nkStrLit:
-                base = astNodeStrVal(baseNodeId)
+            let base: str = uirCoreImportNodeText(baseNodeId)
             if len(base) > 0:
                 for gi in 1..<astKidCount(itemId):
                     let entryNodeId: AstNodeId = astKidAt(itemId, gi)
                     if !astNodeIdValid(entryNodeId):
                         continue
-                    var entry: str = astPlainName(entryNodeId)
-                    if astNodeKind(entryNodeId) == nkStrLit:
-                        entry = astNodeStrVal(entryNodeId)
+                    let entry: str = uirCoreImportNodeText(entryNodeId)
                     if len(entry) > 0:
                         uir_core_builder_import_direct_cache_add(out, base + "/" + entry)
             continue
-        var base2: str = astPlainName(itemId)
-        if itemKind == nkStrLit:
-            base2 = astNodeStrVal(itemId)
+        let base2: str = uirCoreImportNodeText(itemId)
         if len(base2) > 0:
             uir_core_builder_import_direct_cache_add(out, "" + base2)
     return out
@@ -255,23 +269,18 @@ fn uirCoreDirectImportCacheEnsureFile(filePath: str): int32 =
         return cachedIdx
     if !frontend_lib.stage1_fileExists(key):
         return -1
-    var content: str = ""
+    var content: str
     let _readOk: bool = frontend_lib.stage1_readFileInto(key, &content)
     var imports: str[]
     var lineStart: int32 = 0
     for i in 0..len(content):
         if i < len(content) && content[i] != '\n':
             continue
-        var line: str = ""
-        if i > lineStart:
-            line = strutils.strip(uirCoreStrSliceRange(content, lineStart, i - 1))
+        let line: str = uirCoreImportCacheLineText(content, lineStart, i)
         lineStart = i + 1
         if len(line) <= 7 || !uirCoreStrStartsWith(line, "import "):
             continue
-        var rest: str = strutils.strip(str(rawmemPtrAdd(rawmemAsVoid(line), 7)))
-        let asIdx: int32 = uirCoreStrIndexOf(rest, " as ")
-        if asIdx > 0:
-            rest = strutils.strip(uirCoreStrTake(rest, asIdx))
+        let rest: str = uirCoreImportCacheLineRest(line)
         if len(rest) == 0:
             continue
         let resolvedRes: Result[str] = resolveImportToFilePath(rest, key)

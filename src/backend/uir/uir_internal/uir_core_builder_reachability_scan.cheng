@@ -24,6 +24,46 @@ fn uir_core_builder_reachability_scan_add(dst: var int32[], val: int32) =
 fn uirCoreReachFuncSigMarker(): str =
     return "__cheng_sig_"
 
+fn uirCoreReachBracketTypeArgs(calleeId: AstNodeId, typeArgs: var Node[]) =
+    for ti in 1..<astKidCount(calleeId):
+        let tId: AstNodeId = astKidAt(calleeId, ti)
+        if !astNodeIdValid(tId):
+            continue
+        if astNodeKind(tId) != nkEmpty:
+            astNodeSeqAppend(typeArgs, tId)
+
+fn uirCoreCallNameSeedId(calleeId: AstNodeId, typeArgs: var Node[]): str =
+    if !astNodeIdValid(calleeId):
+        return ""
+    let calleeKind: NodeKind = astNodeKind(calleeId)
+    if calleeKind == nkIdent || calleeKind == nkSymbol:
+        return backendStripSpaces(astPlainName(calleeId))
+    if calleeKind == nkBracketExpr && astKidCount(calleeId) > 0:
+        let baseId: AstNodeId = astKidAt(calleeId, 0)
+        uirCoreReachBracketTypeArgs(calleeId, typeArgs)
+        return backendStripSpaces(astPlainName(baseId))
+    if calleeKind == nkDotExpr && astKidCount(calleeId) > 1:
+        let memberId: AstNodeId = astKidAt(calleeId, 1)
+        if astNodeIdValid(memberId):
+            let memberKind: NodeKind = astNodeKind(memberId)
+            if memberKind == nkBracketExpr && astKidCount(memberId) > 0:
+                let base2Id: AstNodeId = astKidAt(memberId, 0)
+                uirCoreReachBracketTypeArgs(memberId, typeArgs)
+                return backendStripSpaces(astPlainName(base2Id))
+            return backendStripSpaces(astPlainName(memberId))
+    return ""
+
+fn uirCoreReachRootPath(rootId: AstNodeId, inputPath: str): str =
+    if len(inputPath) > 0:
+        return inputPath
+    return backendStripSpaces(astNodeStrVal(rootId))
+
+fn uirCoreReachDeclPathOrRoot(declId: AstNodeId, rootPath: str): str =
+    let declPath: str = backendStripSpaces(astNodeStrVal(declId))
+    if len(declPath) > 0:
+        return declPath
+    return rootPath
+
 fn uirCoreCallNameForReachability(module: UirCoreModule, callNode: Node): str =
     return uirCoreCallNameForReachabilityId(module, callNode)
 
@@ -35,36 +75,9 @@ fn uirCoreCallNameForReachabilityId(module: UirCoreModule, callNodeId: AstNodeId
     let calleeId: AstNodeId = astKidAt(callNodeId, 0)
     if !astNodeIdValid(calleeId):
         return ""
-    let calleeKind: NodeKind = astNodeKind(calleeId)
-    var name: str = ""
     var typeArgs: Node[]
     typeArgs.cap = 4
-    if calleeKind == nkIdent || calleeKind == nkSymbol:
-        name = backendStripSpaces(astPlainName(calleeId))
-    elif calleeKind == nkBracketExpr && astKidCount(calleeId) > 0:
-        let baseId: AstNodeId = astKidAt(calleeId, 0)
-        name = backendStripSpaces(astPlainName(baseId))
-        for ti in 1..<astKidCount(calleeId):
-            let tId: AstNodeId = astKidAt(calleeId, ti)
-            if !astNodeIdValid(tId):
-                continue
-            if astNodeKind(tId) != nkEmpty:
-                astNodeSeqAppend(typeArgs, tId)
-    elif calleeKind == nkDotExpr && astKidCount(calleeId) > 1:
-        let memberId: AstNodeId = astKidAt(calleeId, 1)
-        if astNodeIdValid(memberId):
-            let memberKind: NodeKind = astNodeKind(memberId)
-            if memberKind == nkBracketExpr && astKidCount(memberId) > 0:
-                let base2Id: AstNodeId = astKidAt(memberId, 0)
-                name = backendStripSpaces(astPlainName(base2Id))
-                for ti2 in 1..<astKidCount(memberId):
-                    let t2Id: AstNodeId = astKidAt(memberId, ti2)
-                    if !astNodeIdValid(t2Id):
-                        continue
-                    if astNodeKind(t2Id) != nkEmpty:
-                        astNodeSeqAppend(typeArgs, t2Id)
-            else:
-                name = backendStripSpaces(astPlainName(memberId))
+    let name: str = uirCoreCallNameSeedId(calleeId, typeArgs)
     if len(name) == 0:
         return ""
     if (module != nil) && typeArgs.len > 0:
@@ -201,9 +214,7 @@ fn uirCoreComputeReachableFnsId(module: UirCoreModule, rootId: AstNodeId): hashs
     hashsets.hashSetStrAdd(reachable, "main")
     uir_core_builder_reachability_scan_add(queue, "main")
     let inputPath: str = backendStripSpaces(os.getEnvDefault("BACKEND_INPUT", ""))
-    var rootPath: str = inputPath
-    if len(rootPath) == 0:
-        rootPath = backendStripSpaces(astNodeStrVal(rootId))
+    let rootPath: str = uirCoreReachRootPath(rootId, inputPath)
     let rootBase: str = uirCorePathBaseName(rootPath)
     var seededEntryDecls: int32 = 0
     if len(rootPath) > 0:
@@ -211,9 +222,7 @@ fn uirCoreComputeReachableFnsId(module: UirCoreModule, rootId: AstNodeId): hashs
             let declId: AstNodeId = nodes[i]
             if !astNodeIdValid(declId) || astKidCount(declId) <= 0:
                 continue
-            var declPath: str = backendStripSpaces(astNodeStrVal(declId))
-            if len(declPath) == 0:
-                declPath = rootPath
+            let declPath: str = uirCoreReachDeclPathOrRoot(declId, rootPath)
             var sameEntry: bool = (declPath == rootPath)
             if !sameEntry && len(rootBase) > 0:
                 sameEntry = (uirCorePathBaseName(declPath) == rootBase)

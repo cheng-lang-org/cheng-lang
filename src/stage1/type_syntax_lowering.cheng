@@ -86,6 +86,12 @@ fn lowerEnsureNormalizedTextIdCache(textId: int32) =
         for i in oldValueLen..<needLen:
             lowerNormalizedTextIds[i] = 0
 
+fn lowerCacheStripValue(textId: int32, value: str): str =
+    if textId < lowerStripReady.len && textId < lowerStripValues.len:
+        lowerStripReady[textId] = true
+        lowerStripValues[textId] = value
+    return value
+
 fn lowerStripId(textId: int32): str =
     if textId <= 0:
         return ""
@@ -95,17 +101,11 @@ fn lowerStripId(textId: int32): str =
     let rawLen: int32 = tokenTextLen(textId)
     let trimmedStart: int32 = tokenTextTrimmedStart(textId)
     let trimmedLen: int32 = tokenTextTrimmedLen(textId)
-    var out: str = ""
     if trimmedLen <= 0:
-        out = ""
-    elif trimmedStart == 0 && trimmedLen == rawLen:
-        out = tokenTextById(textId)
-    else:
-        out = tokenTextCopyRangeById(textId, trimmedStart, trimmedLen)
-    if textId < lowerStripReady.len && textId < lowerStripValues.len:
-        lowerStripReady[textId] = true
-        lowerStripValues[textId] = out
-    return out
+        return lowerCacheStripValue(textId, "")
+    if trimmedStart == 0 && trimmedLen == rawLen:
+        return lowerCacheStripValue(textId, tokenTextById(textId))
+    return lowerCacheStripValue(textId, tokenTextCopyRangeById(textId, trimmedStart, trimmedLen))
 
 fn lowerNormalizedTextId(textId: int32): int32 =
     if textId <= 0:
@@ -220,16 +220,17 @@ fn lowerStrip(s: str): str =
 fn lowerAddError(diags: Diagnostic[]*, filename: str, pos: SourcePos, msg: str) =
     if diags == nil:
         return
-    var fileName0: str = filename
-    if len(fileName0) == 0:
-        fileName0 = "stdin"
-    let d: Diagnostic = diagMake(svError, fileName0, pos.line, pos.col, msg)
+    if len(filename) == 0:
+        let d: Diagnostic = diagMake(svError, "stdin", pos.line, pos.col, msg)
+        add(diags, d)
+        return
+    let d: Diagnostic = diagMake(svError, filename, pos.line, pos.col, msg)
     add(diags, d)
 
 fn lowerIsCompatOverlayFile(filename: str): bool =
     if len(filename) == 0:
         return false
-    let filenamePtr: int64 = int64(rawmemAsVoid(filename))
+    let filenamePtr: int64 = int64(strDataPtr(filename))
     if lowerCompatOverlayReady && lowerCompatOverlayFilenamePtr == filenamePtr:
         return lowerCompatOverlayValue
     if lowerCompatOverlayReady && lowerCompatOverlayFilename == filename:

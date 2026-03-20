@@ -2,56 +2,71 @@
 import std/rawmem_support
 import std/seqs
 
-@importc("cheng_strlen")
-fn len(s: str): int32
-
-@importc("__cheng_str_eq")
-fn __cheng_str_eq(s1: str, s2: str): bool
-@importc("cheng_str_concat")
-fn __cheng_str_concat(s1: str, s2: str): str
-@importc("driver_c_str_clone")
-fn __cheng_str_clone(s: str): str
-@importc("driver_c_str_slice")
-fn strings_driver_c_str_slice(s: str, start: int32, count: int32): str
-@importc("driver_c_str_get_at")
-fn strings_driver_c_str_get_at(s: str, idx: int32): int32
-@importc("driver_c_str_set_at")
-fn strings_driver_c_str_set_at(s: str, idx: int32, value: int32)
-@importc("driver_c_str_has_prefix")
-fn strings_driver_c_str_has_prefix(s: str, prefix: str): int32
-@importc("driver_c_str_has_suffix")
-fn strings_driver_c_str_has_suffix(s: str, suffix: str): int32
-@importc("driver_c_str_contains_char")
-fn strings_driver_c_str_contains_char(s: str, value: int32): int32
-@importc("driver_c_str_contains_str")
-fn strings_driver_c_str_contains_str(s: str, sub: str): int32
 @importc("driver_c_i32_to_str")
-fn driver_c_i32_to_str(value: int32): str
+fn driver_c_i32_to_cstring(value: int32): cstring
 @importc("driver_c_i64_to_str")
-fn driver_c_i64_to_str(value: int64): str
+fn driver_c_i64_to_cstring(value: int64): cstring
 @importc("driver_c_u64_to_str")
-fn driver_c_u64_to_str(value: uint64): str
+fn driver_c_u64_to_cstring(value: uint64): cstring
 
-@importc("__cheng_str_eq")
-fn streq(s1: str, s2: str): bool
+fn len(s: str): int32 =
+    return strLenFast(s)
 
-@importc("__cheng_str_eq")
-fn `==`(s1: str, s2: str): bool
+fn streq(s1: str, s2: str): bool =
+    let n: int32 = strLenFast(s1)
+    if n != strLenFast(s2):
+        return false
+    if n <= 0:
+        return true
+    var i: int32 = 0
+    while i < n:
+        if s1[i] != s2[i]:
+            return false
+        i = i + 1
+    return true
 
-@importc("cheng_str_is_empty")
-fn strIsEmpty(s: str): bool
+fn `==`(s1: str, s2: str): bool =
+    return streq(s1, s2)
 
-@importc("cheng_str_nonempty")
-fn strNonEmpty(s: str): bool
+fn strIsEmpty(s: str): bool =
+    return strLenFast(s) == 0
 
-@importc("cheng_str_has_prefix_bool")
-fn hasPrefix(s: str, prefix: str): bool
+fn strNonEmpty(s: str): bool =
+    return strLenFast(s) != 0
+
+fn hasPrefix(s: str, prefix: str): bool =
+    let n: int32 = strLenFast(s)
+    let m: int32 = strLenFast(prefix)
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    var i: int32 = 0
+    while i < m:
+        if s[i] != prefix[i]:
+            return false
+        i = i + 1
+    return true
 
 fn hasSuffix(s: str, suffix: str): bool =
-    return strings_driver_c_str_has_suffix(s, suffix) != 0
+    let n: int32 = strLenFast(s)
+    let m: int32 = strLenFast(suffix)
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    var i: int32 = 0
+    let start: int32 = n - m
+    while i < m:
+        if s[start + i] != suffix[i]:
+            return false
+        i = i + 1
+    return true
 
-@importc("cheng_str_drop_prefix")
-fn dropPrefix(s: str, prefix: str): str
+fn dropPrefix(s: str, prefix: str): str =
+    if !hasPrefix(s, prefix):
+        return s
+    return strSubView(s, strLenFast(prefix), strLenFast(s) - strLenFast(prefix))
 
 @importc("cheng_str_arc_retain")
 fn arcRetainString(s: str)
@@ -59,55 +74,123 @@ fn arcRetainString(s: str)
 @importc("cheng_str_arc_release")
 fn arcReleaseString(s: str)
 
-@importc("cheng_str_from_bytes_compat")
-fn __cheng_str_from_bytes(data: uint8[], len: int32): str
+fn __cheng_str_from_bytes(data: uint8[], len: int32): str =
+    if data.buffer == nil || len <= 0:
+        return strEmpty()
+    return strFromBytesCopy(data.buffer, len)
 
-@importc("cheng_str_concat")
-fn `+`(s1: str, s2: str): str
+fn `+`(s1: str, s2: str): str =
+    let nLeft: int32 = strLenFast(s1)
+    let nRight: int32 = strLenFast(s2)
+    let out: str = newStringAlloc(nLeft + nRight)
+    if nLeft > 0:
+        memCopyCompat(strDataPtr(out), strDataPtr(s1), nLeft)
+    if nRight > 0:
+        memCopyCompat(rawmemPtrAdd(strDataPtr(out), nLeft), strDataPtr(s2), nRight)
+    if strDataPtr(out) != nil:
+        store(rawmemPtrAdd(strDataPtr(out), nLeft + nRight), uint8(0))
+    return out
 
-@importc("cheng_char_to_str_compat")
-fn charToStr(c: char): str
+fn charToStr(c: char): str =
+    let out: str = newStringAlloc(1)
+    if strDataPtr(out) == nil:
+        return strEmpty()
+    rawmemWriteChar(strDataPtr(out), 0, c)
+    store(rawmemPtrAdd(strDataPtr(out), 1), uint8(0))
+    return out
 
 fn `[]`(s: str, i: int32): char =
-    return char(strings_driver_c_str_get_at(s, i))
+    if i < 0 || i >= strLenFast(s) || strDataPtr(s) == nil:
+        return char(0)
+    let byteVal: uint8 = load(rawmemPtrAdd(strDataPtr(s), i))
+    return char(byteVal)
 
 fn `[]=`(s: str, i: int32, val: char) =
-    rawmemWriteChar(rawmemAsVoid(s), i, val)
-    
-@importc("cheng_slice_string_compat")
-fn __cheng_slice_string(s: str, start: int32, stop: int32, exclusive: bool): str
-@importc("cheng_str_contains_char_bool")
-fn __cheng_string_contains_char(s: str, c: char): bool
+    if i < 0 || i >= strLenFast(s) || strDataPtr(s) == nil:
+        return
+    rawmemWriteChar(strDataPtr(s), i, val)
 
-@importc("cheng_str_contains_str_bool")
-fn __cheng_string_contains_str(s: str, sub: str): bool
+fn __cheng_slice_string(s: str, start: int32, stop: int32, exclusive: bool): str =
+    let count: int32 = exclusive ? (stop - start) : (stop - start + 1)
+    return strSubView(s, start, count)
+
+fn __cheng_string_contains_char(s: str, c: char): bool =
+    let n: int32 = strLenFast(s)
+    var i: int32 = 0
+    while i < n:
+        if s[i] == c:
+            return true
+        i = i + 1
+    return false
+
+fn __cheng_string_contains_str(s: str, sub: str): bool =
+    return strContains(s, sub)
 
 
-@importc("cheng_str_slice_bytes")
-fn sliceBytes(text: str, start: int32, count: int32): str
+fn sliceBytes(text: str, start: int32, count: int32): str =
+    return strSubView(text, start, count)
 
-@importc("cheng_str_contains_compat")
-fn strContains(text: str, sub: str): bool
+fn strContains(text: str, sub: str): bool =
+    let n: int32 = strLenFast(text)
+    let m: int32 = strLenFast(sub)
+    if m == 0:
+        return true
+    if m > n:
+        return false
+    var i: int32 = 0
+    while i + m <= n:
+        var matched: bool = true
+        var j: int32 = 0
+        while j < m:
+            if text[i + j] != sub[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return true
+        i = i + 1
+    return false
 @importc("driver_c_i32_to_str")
-fn intToStr(i: int32): str
+fn intToStrRaw(i: int32): cstring
 
 @importc("driver_c_u64_to_str")
-fn uint64ToStr(x: uint64): str
+fn uint64ToStrRaw(x: uint64): cstring
 
 @importc("driver_c_i64_to_str")
-fn int64ToStr(i: int64): str
+fn int64ToStrRaw(i: int64): cstring
+
+fn intToStr(i: int32): str =
+    return strFromCStringBorrow(intToStrRaw(i))
+
+fn uint64ToStr(x: uint64): str =
+    return strFromCStringBorrow(uint64ToStrRaw(x))
+
+fn int64ToStr(i: int64): str =
+    return strFromCStringBorrow(int64ToStrRaw(i))
 
 fn `$`(s: str): str =
-    return __cheng_str_clone(s)
+    return newStringCopy(strDataPtr(s), strLenFast(s))
 
 @importc("cheng_seq_string_repr_compat")
-fn `$`(xs: str[]): str
+fn repr_seq_string(xs: str[]): cstring
 
 @importc("cheng_seq_bool_repr_compat")
-fn `$`(xs: bool[]): str
+fn repr_seq_bool(xs: bool[]): cstring
 
 @importc("cheng_seq_i32_repr_compat")
-fn `$`(xs: int32[]): str
+fn repr_seq_i32(xs: int32[]): cstring
 
 @importc("cheng_seq_i64_repr_compat")
-fn `$`(xs: int64[]): str
+fn repr_seq_i64(xs: int64[]): cstring
+
+fn `$`(xs: str[]): str =
+    return strFromCStringBorrow(repr_seq_string(xs))
+
+fn `$`(xs: bool[]): str =
+    return strFromCStringBorrow(repr_seq_bool(xs))
+
+fn `$`(xs: int32[]): str =
+    return strFromCStringBorrow(repr_seq_i32(xs))
+
+fn `$`(xs: int64[]): str =
+    return strFromCStringBorrow(repr_seq_i64(xs))

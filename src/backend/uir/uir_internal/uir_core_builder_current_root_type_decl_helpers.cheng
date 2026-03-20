@@ -28,16 +28,16 @@ fn uirCoreTypeKeyStripIterWrappers(typeKey0: str): str =
         return ""
     while true:
         if uirCoreStrStartsWith(key, "ref_"):
-            key = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+            key = rawmemStrFromOffset(key, 4)
             continue
         if uirCoreStrStartsWith(key, "var_ref_"):
-            key = str(rawmemPtrAdd(rawmemAsVoid(key), 8))
+            key = rawmemStrFromOffset(key, 8)
             continue
         if uirCoreStrStartsWith(key, "var_"):
-            key = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+            key = rawmemStrFromOffset(key, 4)
             continue
         if uirCoreStrStartsWith(key, "ptr_"):
-            key = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+            key = rawmemStrFromOffset(key, 4)
             continue
         break
     return key
@@ -50,7 +50,7 @@ fn uirCoreTypeKeyBaseName(typeKey0: str): str =
     for __for_rev_i in 0..(__for_start_i - (0)):
         let i = __for_start_i - __for_rev_i
         if key[i] == '.':
-            return str(rawmemPtrAdd(rawmemAsVoid(key), i + 1))
+            return rawmemStrFromOffset(key, i + 1)
     return key
 
 fn uirCoreTypeDeclCoreNode(td: Node): Node =
@@ -69,6 +69,83 @@ fn uirCoreTypeDeclIsObjectLike(td: Node): bool =
         return false
     let kind: NodeKind = nodeKind(defCore)
     return kind == nkObjectDecl || kind == nkRecList
+
+fn uirCoreTypeDeclRhsKey(defCore: Node): str =
+    if !astNodeIdValid(defCore):
+        return ""
+    if nodeKind(defCore) == nkDotExpr && kidCount(defCore) > 1:
+        let rhsTypeKey: str = backendStripSpaces(typeKey(kid(defCore, 1)))
+        if len(rhsTypeKey) > 0:
+            return rhsTypeKey
+        return backendStripSpaces(plainName(kid(defCore, 1)))
+    let directKey: str = backendStripSpaces(typeKey(defCore))
+    if len(directKey) > 0:
+        return directKey
+    let looseKey: str = uirCoreTypeKeyFromNodeLoose(defCore)
+    if len(looseKey) > 0:
+        return looseKey
+    return backendStripSpaces(plainName(defCore))
+
+fn uirCoreFieldTypeNodeDirectKey(fieldTypeNode: Node): str =
+    if nodeKind(fieldTypeNode) == nkDotExpr && kidCount(fieldTypeNode) > 1:
+        return backendStripSpaces(typeKey(kid(fieldTypeNode, 1)))
+    let directKey: str = backendStripSpaces(typeKey(fieldTypeNode))
+    if len(directKey) > 0:
+        return directKey
+    let looseKey: str = uirCoreTypeKeyFromNodeLoose(fieldTypeNode)
+    if len(looseKey) > 0:
+        return looseKey
+    let fallbackKey: str = uirCoreTypeKeyFallbackText(fieldTypeNode)
+    if len(fallbackKey) > 0:
+        return fallbackKey
+    return backendStripSpaces(plainName(fieldTypeNode))
+
+fn uirCoreFieldTypeNodeResolvedKey(module: UirCoreModule, fieldTypeNode: Node,
+                                   looseFieldTypeKey: str, objFieldType: str): str =
+    if objFieldType == "seq" && uirCoreStrStartsWith(looseFieldTypeKey, "seq_"):
+        return looseFieldTypeKey
+    if objFieldType == "Table" && uirCoreStrStartsWith(looseFieldTypeKey, "Table_"):
+        return looseFieldTypeKey
+    let directFieldTypeKey: str = uirCoreFieldTypeNodeDirectKey(fieldTypeNode)
+    if len(directFieldTypeKey) > 0:
+        return backendStripSpaces(directFieldTypeKey)
+    if nodeKind(fieldTypeNode) == nkBracketExpr:
+        return uirCoreEnsureGenericTypeInstFromCurrentRoot(module, fieldTypeNode)
+    return ""
+
+fn uirCoreTypeDeclNameOrAnon(nId: Node): str =
+    if kidCount(nId) > 0:
+        let nameId: Node = kid(nId, 0)
+        if astNodeIdValid(nameId) && (nodeKind(nameId) == nkIdent || nodeKind(nameId) == nkSymbol):
+            let nm: str = backendStripSpaces(plainName(nameId))
+            if len(nm) > 0:
+                return nm
+    return "<anon>"
+
+fn uirCoreTargetInstName(typeNode: Node, targetInstName0: str): str =
+    if len(targetInstName0) > 0:
+        return targetInstName0
+    return uirCoreLegacyGenericBracketInstName(typeNode)
+
+fn uirCoreDebugBool01(v: bool): str =
+    return v ? "1" : "0"
+
+fn uirCoreDebugRootSummaryIfMissing(actualGenNode: Node): str =
+    if stage1AstRefNonNil(actualGenNode):
+        return ""
+    return uirCoreDebugRootGenericTypeSummary(uirCore_currentParsedRoot)
+
+fn uirCoreResolvedInstName(targetInstName: str, baseName: str, instArgs: Node[4]): str =
+    if len(targetInstName) > 0:
+        return targetInstName
+    return mangleInstance(baseName, instArgs)
+
+fn uirCoreRecoverLegacyInnerKey(key: str): str =
+    if uirCoreStrStartsWith(key, "seq_fixed_"):
+        return rawmemStrFromOffset(key, 10)
+    if uirCoreStrStartsWith(key, "seq_"):
+        return rawmemStrFromOffset(key, 4)
+    return ""
 
 fn uirCoreObjTypeFromCurrentRootDecl(module: UirCoreModule, typeKey0: str): str =
     if (module == nil) || !uirCoreCurrentParsedRootValid():
@@ -99,17 +176,7 @@ fn uirCoreObjTypeFromCurrentRootDecl(module: UirCoreModule, typeKey0: str): str 
     let rhsObj: str = typeNodeObjTypeName(module, defCore)
     if len(rhsObj) > 0:
         return rhsObj
-    var rhsKey: str = ""
-    if nodeKind(defCore) == nkDotExpr && kidCount(defCore) > 1:
-        rhsKey = backendStripSpaces(typeKey(kid(defCore, 1)))
-        if len(rhsKey) == 0:
-            rhsKey = backendStripSpaces(plainName(kid(defCore, 1)))
-    else:
-        rhsKey = backendStripSpaces(typeKey(defCore))
-        if len(rhsKey) == 0:
-            rhsKey = uirCoreTypeKeyFromNodeLoose(defCore)
-        if len(rhsKey) == 0:
-            rhsKey = backendStripSpaces(plainName(defCore))
+    let rhsKey: str = uirCoreTypeDeclRhsKey(defCore)
     if len(rhsKey) == 0 || rhsKey == key:
         return ""
     return uirCoreObjTypeFromTypeKey(module, rhsKey)
@@ -146,27 +213,8 @@ fn uirCoreFieldTypeKeyFromTypeDecl(module: UirCoreModule, td: Node, fieldName0: 
         if !astNodeIdValid(fieldTypeNode) || nodeKind(fieldTypeNode) == nkEmpty:
             return ""
         let looseFieldTypeKey: str = uirCoreTypeKeyFromNodeLoose(fieldTypeNode)
-        var fieldTypeKey: str = ""
-        if nodeKind(fieldTypeNode) == nkDotExpr && kidCount(fieldTypeNode) > 1:
-            fieldTypeKey = backendStripSpaces(typeKey(kid(fieldTypeNode, 1)))
-        else:
-            fieldTypeKey = backendStripSpaces(typeKey(fieldTypeNode))
-        if len(fieldTypeKey) == 0:
-            fieldTypeKey = looseFieldTypeKey
-        if len(fieldTypeKey) == 0:
-            fieldTypeKey = uirCoreTypeKeyFallbackText(fieldTypeNode)
-        if len(fieldTypeKey) == 0:
-            fieldTypeKey = backendStripSpaces(plainName(fieldTypeNode))
         let objFieldType: str = typeNodeObjTypeName(module, fieldTypeNode)
-        if len(fieldTypeKey) == 0 && nodeKind(fieldTypeNode) == nkBracketExpr:
-            let synthFieldKey: str = uirCoreEnsureGenericTypeInstFromCurrentRoot(module, fieldTypeNode)
-            if len(synthFieldKey) > 0:
-                fieldTypeKey = synthFieldKey
-        if objFieldType == "seq" && uirCoreStrStartsWith(looseFieldTypeKey, "seq_"):
-            fieldTypeKey = looseFieldTypeKey
-        elif objFieldType == "Table" && uirCoreStrStartsWith(looseFieldTypeKey, "Table_"):
-            fieldTypeKey = looseFieldTypeKey
-        return backendStripSpaces(fieldTypeKey)
+        return backendStripSpaces(uirCoreFieldTypeNodeResolvedKey(module, fieldTypeNode, looseFieldTypeKey, objFieldType))
     return ""
 
 fn uirCoreFieldTypeKeyFromCurrentRoot(module: UirCoreModule, parentType0: str, fieldName0: str): str =
@@ -234,14 +282,7 @@ fn uirCoreDebugRootGenericTypeSummary(root: Node, limit: int32 = 8): str =
         if nodeKind(nId) == nkTypeDecl && kidCount(nId) > 2:
             let gpId: Node = kid(nId, 2)
             if astNodeIdValid(gpId) && nodeKind(gpId) == nkGenericParams && kidCount(gpId) > 0:
-                var nm: str = ""
-                if kidCount(nId) > 0:
-                    let nameId: Node = kid(nId, 0)
-                    if astNodeIdValid(nameId) && (nodeKind(nameId) == nkIdent || nodeKind(nameId) == nkSymbol):
-                        nm = backendStripSpaces(plainName(nameId))
-                if len(nm) == 0:
-                    nm = "<anon>"
-                uir_core_builder_current_root_type_decl_helpers_add(parts, nm + "#" + intToStr(kidCount(gpId)))
+                uir_core_builder_current_root_type_decl_helpers_add(parts, uirCoreTypeDeclNameOrAnon(nId) + "#" + intToStr(kidCount(gpId)))
                 if parts.len >= limit:
                     break
         for i in 0..<kidCount(nId):
@@ -269,7 +310,7 @@ fn uirCoreEnsureGenericTypeInstFromCurrentRoot(module: UirCoreModule, typeNode: 
     if rawArgs.len == 0:
         return ""
     let targetInstName0: str = uirCoreTypeKeyFromNodeLoose(typeNode)
-    let targetInstName: str = len(targetInstName0) > 0 ? targetInstName0 : uirCoreLegacyGenericBracketInstName(typeNode)
+    let targetInstName: str = uirCoreTargetInstName(typeNode, targetInstName0)
     var actualGenNode: Node = genNode
     if stage1AstRefNonNil(actualGenNode) && len(targetInstName) > 0:
         let probeName: str = mangleInstance(baseName, rawArgs)
@@ -278,9 +319,9 @@ fn uirCoreEnsureGenericTypeInstFromCurrentRoot(module: UirCoreModule, typeNode: 
     if !stage1AstRefNonNil(actualGenNode) && len(targetInstName) > 0:
         actualGenNode = uirCoreFindGenericTypeDeclForInstName(uirCore_currentParsedRoot, targetInstName, rawArgs)
     if dbgGenericSynth:
-        let genFound: str = stage1AstRefNonNil(genNode) ? "1" : "0"
-        let actualFound: str = stage1AstRefNonNil(actualGenNode) ? "1" : "0"
-        let rootSummary: str = !stage1AstRefNonNil(actualGenNode) ? uirCoreDebugRootGenericTypeSummary(uirCore_currentParsedRoot) : ""
+        let genFound: str = uirCoreDebugBool01(stage1AstRefNonNil(genNode))
+        let actualFound: str = uirCoreDebugBool01(stage1AstRefNonNil(actualGenNode))
+        let rootSummary: str = uirCoreDebugRootSummaryIfMissing(actualGenNode)
         os.writeLine(os.get_stderr(),
                      "[backend] debugGenericSynth: base=" + baseName +
                      " target=" + targetInstName +
@@ -298,7 +339,7 @@ fn uirCoreEnsureGenericTypeInstFromCurrentRoot(module: UirCoreModule, typeNode: 
     collectTypeArgMap(generics, rawArgs, &mapNames, &mapTypes)
     var instArgs: Node[4]
     buildFullTypeArgs(generics, mapNames, mapTypes, rawArgs, instArgs)
-    var instName: str = len(targetInstName) > 0 ? targetInstName : mangleInstance(baseName, instArgs)
+    let instName: str = uirCoreResolvedInstName(targetInstName, baseName, instArgs)
     if len(instName) == 0:
         return ""
     if uirCoreHasObjType(module, instName):
@@ -363,18 +404,14 @@ fn uirCoreRecoverLegacyGenericObjKey(module: UirCoreModule, key0: str): str =
     if len(key) == 0:
         return ""
     if uirCoreStrStartsWith(key, "var_ref_"):
-        key = str(rawmemPtrAdd(rawmemAsVoid(key), 8))
+        key = rawmemStrFromOffset(key, 8)
     elif uirCoreStrStartsWith(key, "var_"):
-        key = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+        key = rawmemStrFromOffset(key, 4)
     elif uirCoreStrStartsWith(key, "ref_"):
-        key = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+        key = rawmemStrFromOffset(key, 4)
     elif uirCoreStrStartsWith(key, "ptr_"):
-        key = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
-    var innerKey: str = ""
-    if uirCoreStrStartsWith(key, "seq_fixed_"):
-        innerKey = str(rawmemPtrAdd(rawmemAsVoid(key), 10))
-    elif uirCoreStrStartsWith(key, "seq_"):
-        innerKey = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+        key = rawmemStrFromOffset(key, 4)
+    let innerKey: str = uirCoreRecoverLegacyInnerKey(key)
     if len(innerKey) == 0:
         return ""
     if uirCoreStrStartsWith(innerKey, "Result_") && ensureResultObjType(module, innerKey):
@@ -394,7 +431,7 @@ fn uirCoreTypeKeyIsTableIter(typeKey0: str): bool =
 fn uirCoreTypeKeyTableValKey(typeKey0: str): str =
     let key: str = uirCoreTypeKeyBaseName(uirCoreTypeKeyStripIterWrappers(typeKey0))
     if uirCoreStrStartsWith(key, "Table_"):
-        return str(rawmemPtrAdd(rawmemAsVoid(key), 6))
+        return rawmemStrFromOffset(key, 6)
     return ""
 
 fn uirCoreHashMapIterFlavorFromTypeKey(typeKey0: str): int32 =
@@ -409,7 +446,7 @@ fn uirCoreHashMapIterFlavorFromTypeKey(typeKey0: str): int32 =
     for __for_rev_i in 0..(__for_start_i - (0)):
         let i = __for_start_i - __for_rev_i
         if key[i] == '_':
-            let suffix: str = str(rawmemPtrAdd(rawmemAsVoid(key), i + 1))
+            let suffix: str = rawmemStrFromOffset(key, i + 1)
             if (suffix == "HashMapStrInt"):
                 return 1
             if (suffix == "HashMapStrSeqInt"):

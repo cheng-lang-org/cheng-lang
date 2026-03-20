@@ -18,6 +18,18 @@ fn machineCoreWriteI32(p: ptr, value: int32) =
     var tmp: int32 = value
     memCopyCompat(p, &tmp, int32(sizeof int32))
 
+fn machineCoreSetEmpty(out: var str) =
+    out.data = nil
+    out.len = 0
+    out.store_id = 0
+    out.flags = 0
+
+fn machineCoreSetStr(out: var str, value: str) =
+    out.data = value.data
+    out.len = value.len
+    out.store_id = value.store_id
+    out.flags = value.flags
+
 type
     MachineCoreReg = enum
         machineCoreRegW0, machineCoreRegW1, machineCoreRegW2, machineCoreRegW3, machineCoreRegW4, machineCoreRegW5, machineCoreRegW6, machineCoreRegW7, machineCoreRegW8,
@@ -122,10 +134,9 @@ fn machine_shadow_recover(p: uint64): ptr
 fn machineCoreNewInst(op: MachineCoreOp, rd: MachineCoreReg, rn: MachineCoreReg,
                       rm: MachineCoreReg, ra: MachineCoreReg, imm: int64,
                       label: str, cond: MachineCoreCond): MachineCoreInst =
-    let safeLabel: str = len(label) > 0 ? label : ""
     let out: MachineCoreInst = cheng_machine_inst_new_n(int32(op), int32(rd), int32(rn), int32(rm),
-                                                        int32(ra), imm, rawmemAsVoid(safeLabel),
-                                                        len(safeLabel), int32(cond))
+                                                        int32(ra), imm, rawmemAsVoid(label),
+                                                        len(label), int32(cond))
     if out != nil:
         machine_shadow_remember(out)
     return out
@@ -748,20 +759,24 @@ fn machineCoreNewModule(): MachineCoreModule =
 fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
         let mlen: int32 = machineCoreModuleFuncsLen(mod)
-        let rawFuncName: str = (func != nil) ? func.name : ""
-        let fname: str = (len(rawFuncName) > 0) ? rawFuncName : ""
+        var fname: str
+        machineCoreSetEmpty(fname)
+        if func != nil && len(func.name) > 0:
+            machineCoreSetStr(fname, func.name)
         echo("[machine.add_func] before len=" + intToStr(mlen) + " name=" + fname +
              " " + machineCoreBufDebug(machineCoreModuleFuncBufferRaw(mod), machineCoreModuleFuncsLen(mod), mod.funcs.cap))
     if mod == nil || func == nil:
         return
     let rawFuncName2: str = func.name
-    var storedName: str = machineCoreInferFuncNameFromLabels(func)
+    var storedName: str
+    machineCoreSetEmpty(storedName)
+    machineCoreSetStr(storedName, machineCoreInferFuncNameFromLabels(func))
     if len(storedName) <= 0:
-        storedName = rawFuncName2
+        machineCoreSetStr(storedName, rawFuncName2)
     if !machineCorePrintableAsciiName(storedName):
-        storedName = ""
+        machineCoreSetEmpty(storedName)
     if len(storedName) <= 0:
-        storedName = "__machine_func_" + intToStr(machineCoreModuleFuncsLen(mod))
+        machineCoreSetStr(storedName, "__machine_func_" + intToStr(machineCoreModuleFuncsLen(mod)))
     var stored: MachineCoreFunc
     new stored
     stored.name = machineCorePersistStr(storedName)
@@ -774,19 +789,22 @@ fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
         let cloned: MachineCoreInst = machineCoreCloneInst(srcInst)
         machineCoreAddInst(stored, cloned)
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1":
-        var storedFirst: str = "stored_first=nil"
-        var storedEight: str = "stored_eight=nil"
-        var storedFirstOp: str = "stored_first_op=nil"
+        var storedFirst: str
+        machineCoreSetStr(storedFirst, "stored_first=nil")
+        var storedEight: str
+        machineCoreSetStr(storedEight, "stored_eight=nil")
+        var storedFirstOp: str
+        machineCoreSetStr(storedFirstOp, "stored_first_op=nil")
         let storedBuf: ptr = machineCoreFuncInstBufferRaw(stored)
         let storedLen: int32 = machineCoreFuncInstsLen(stored)
         if storedBuf != nil && storedLen > 0:
             let firstInst0: MachineCoreInst = machineCoreFuncInstAt(stored, 0)
-            storedFirst = machineCorePtrDebug(int64(firstInst0))
+            machineCoreSetStr(storedFirst, machineCorePtrDebug(int64(firstInst0)))
             if machineCoreInstValid(firstInst0):
-                storedFirstOp = intToStr(int32(machineCoreInstOpOf(firstInst0)))
+                machineCoreSetStr(storedFirstOp, intToStr(int32(machineCoreInstOpOf(firstInst0))))
         if storedBuf != nil && storedLen > 8:
             let inst8: MachineCoreInst = machineCoreFuncInstAt(stored, 8)
-            storedEight = machineCorePtrDebug(int64(inst8))
+            machineCoreSetStr(storedEight, machineCorePtrDebug(int64(inst8)))
         echo("[machine.add_func.copy] insts=" + intToStr(storedLen) + " " + storedFirst +
              " first_op=" + storedFirstOp + " " + storedEight + " " +
              machineCoreBufDebug(storedBuf, storedLen, stored.insts.cap))
@@ -798,19 +816,22 @@ fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
     if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1":
         let addedIdx: int32 = machineCoreModuleFuncsLen(mod) - 1
         let added: MachineCoreFunc = machineCoreModuleFuncAt(mod, addedIdx)
-        var addedFirst: str = "added_first=nil"
-        var addedEight: str = "added_eight=nil"
-        var addedFirstOp: str = "added_first_op=nil"
+        var addedFirst: str
+        machineCoreSetStr(addedFirst, "added_first=nil")
+        var addedEight: str
+        machineCoreSetStr(addedEight, "added_eight=nil")
+        var addedFirstOp: str
+        machineCoreSetStr(addedFirstOp, "added_first_op=nil")
         let addedBuf: ptr = machineCoreFuncInstBufferRaw(added)
         let addedLen: int32 = machineCoreFuncInstsLen(added)
         if machineCoreFuncValid(added) && addedBuf != nil && addedLen > 0:
             let firstInst1: MachineCoreInst = machineCoreFuncInstAt(added, 0)
-            addedFirst = machineCorePtrDebug(int64(firstInst1))
+            machineCoreSetStr(addedFirst, machineCorePtrDebug(int64(firstInst1)))
             if machineCoreInstValid(firstInst1):
-                addedFirstOp = intToStr(int32(machineCoreInstOpOf(firstInst1)))
+                machineCoreSetStr(addedFirstOp, intToStr(int32(machineCoreInstOpOf(firstInst1))))
         if machineCoreFuncValid(added) && addedBuf != nil && addedLen > 8:
             let inst8b: MachineCoreInst = machineCoreFuncInstAt(added, 8)
-            addedEight = machineCorePtrDebug(int64(inst8b))
+            machineCoreSetStr(addedEight, machineCorePtrDebug(int64(inst8b)))
         echo("[machine.add_func.module] idx=" + intToStr(addedIdx) + " insts=" +
              intToStr(addedLen) + " " + addedFirst + " first_op=" + addedFirstOp +
              " " + addedEight + " " +

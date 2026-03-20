@@ -1,6 +1,7 @@
 # UIR codegen adapter (phase-1): MIR-backed UIR lowering + object emission.
 import std/result
 import std/os
+import std/strings
 import std/rawmem_support
 
 import backend/uir/[uir_types, uir_opt]
@@ -41,6 +42,43 @@ fn uirTargetIsRiscv64(target: str): bool =
     if len(target) == 0:
         return false
     return uirStrContains(target, "riscv64")
+
+fn uirCodegenFirstFuncName(module: UirModule): str =
+    if uirModuleFuncsLen(module) <= 0:
+        return ""
+    let firstFunc: UirFunc = uirModuleFuncAt(module, 0)
+    if firstFunc == nil:
+        return ""
+    return uirFuncNameOf(firstFunc)
+
+fn uirCodegenFirstFuncLinkName(module: UirModule): str =
+    if uirModuleFuncsLen(module) <= 0:
+        return ""
+    let firstFunc: UirFunc = uirModuleFuncAt(module, 0)
+    if firstFunc == nil:
+        return ""
+    return uirFuncLinkNameOf(firstFunc)
+
+fn uirCodegenFirstFuncBlocks(module: UirModule): int32 =
+    if uirModuleFuncsLen(module) <= 0:
+        return -1
+    let firstFunc: UirFunc = uirModuleFuncAt(module, 0)
+    if firstFunc == nil:
+        return -1
+    return uirFuncBlocksLen(firstFunc)
+
+fn uirCodegenFirstFuncExtern(module: UirModule): bool =
+    if uirModuleFuncsLen(module) <= 0:
+        return false
+    let firstFunc: UirFunc = uirModuleFuncAt(module, 0)
+    if firstFunc == nil:
+        return false
+    return uirFuncIsExtern(firstFunc)
+
+fn uirCodegenFirstMachineFuncName(module: MachineModule): str =
+    if machineModuleFuncsLen(module) <= 0:
+        return ""
+    return machineFuncNameOf(machineModuleFuncAt(module, 0))
 
 fn uirStrContains(hay: str, needle: str): bool =
     let n: int32 = len(hay)
@@ -104,17 +142,10 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
     uirModuleHealExternFlags(module)
     if dbgBoot:
         let funcCount0: int32 = uirModuleFuncsLen(module)
-        var firstName0: str = ""
-        var firstLink0: str = ""
-        var firstBlocks0: int32 = -1
-        var firstExtern0: bool = false
-        if funcCount0 > 0:
-            let firstFunc0: UirFunc = uirModuleFuncAt(module, 0)
-            if int64(uint64(firstFunc0)) != 0:
-                firstName0 = uirFuncNameOf(firstFunc0)
-                firstLink0 = uirFuncLinkNameOf(firstFunc0)
-                firstBlocks0 = uirFuncBlocksLen(firstFunc0)
-                firstExtern0 = uirFuncIsExtern(firstFunc0)
+        let firstName0: str = uirCodegenFirstFuncName(module)
+        let firstLink0: str = uirCodegenFirstFuncLinkName(module)
+        let firstBlocks0: int32 = uirCodegenFirstFuncBlocks(module)
+        let firstExtern0: bool = uirCodegenFirstFuncExtern(module)
         echo("[codegen.boot] pre funcs=" + intToStr(funcCount0) +
              " has_entry=" + (uirCodegenHasEntryFunc(module) ? "1" : "0") +
              " first_name=" + firstName0 +
@@ -129,17 +160,10 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
         uirCorePruneUnreachableFuncs(module)
     if dbgBoot:
         let funcCount1: int32 = uirModuleFuncsLen(module)
-        var firstName1: str = ""
-        var firstLink1: str = ""
-        var firstBlocks1: int32 = -1
-        var firstExtern1: bool = false
-        if funcCount1 > 0:
-            let firstFunc1: UirFunc = uirModuleFuncAt(module, 0)
-            if firstFunc1 != nil:
-                firstName1 = uirFuncNameOf(firstFunc1)
-                firstLink1 = uirFuncLinkNameOf(firstFunc1)
-                firstBlocks1 = uirFuncBlocksLen(firstFunc1)
-                firstExtern1 = uirFuncIsExtern(firstFunc1)
+        let firstName1: str = uirCodegenFirstFuncName(module)
+        let firstLink1: str = uirCodegenFirstFuncLinkName(module)
+        let firstBlocks1: int32 = uirCodegenFirstFuncBlocks(module)
+        let firstExtern1: bool = uirCodegenFirstFuncExtern(module)
         echo("[codegen.boot] post_prune funcs=" + intToStr(funcCount1) +
              " has_entry=" + (uirCodegenHasEntryFunc(module) ? "1" : "0") +
              " first_name=" + firstName1 +
@@ -177,9 +201,7 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
     let allocated: MachineModule = machineAssignRegisters(res.value)
     if dbgBoot:
         let machineFuncCount: int32 = machineModuleFuncsLen(allocated)
-        var firstMachineName: str = ""
-        if machineFuncCount > 0:
-            firstMachineName = machineFuncNameOf(machineModuleFuncAt(allocated, 0))
+        let firstMachineName: str = uirCodegenFirstMachineFuncName(allocated)
         echo("[codegen.boot] machine funcs=" + intToStr(machineFuncCount) +
              " first_name=" + firstMachineName)
     let moduleCstrCount: int32 = uirModuleCStringsLen(module)
@@ -210,16 +232,16 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
     return Ok[MachineModule](allocated)
 
 fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
-    var objWriter: str = objWriterRaw
-    if len(objWriter) == 0:
-        objWriter = ""
-    if len(objWriter) == 0:
+    let objWriter0: str = strings.__cheng_str_clone(objWriterRaw)
+    if len(objWriter0) == 0:
         if uirTargetIsDarwin(target):
-            objWriter = "macho"
-        elif uirTargetIsLinuxLike(target):
-            objWriter = "elf"
-        else:
-            return Err[str]("uir_codegen: host-only object writer requires darwin or linux-like target: " + target)
+            return Ok[str]("macho")
+        if uirTargetIsLinuxLike(target):
+            return Ok[str]("elf")
+        return Err[str]("uir_codegen: host-only object writer requires darwin or linux-like target: " + target)
+    let objWriter: str = objWriter0
+    if len(objWriter) == 0:
+        return Err[str]("uir_codegen: unsupported object writer: " + objWriter)
     if objWriter != "macho" && objWriter != "elf" && objWriter != "coff":
         return Err[str]("uir_codegen: unsupported object writer: " + objWriter)
     if objWriter == "macho" && !uirTargetIsDarwin(target):

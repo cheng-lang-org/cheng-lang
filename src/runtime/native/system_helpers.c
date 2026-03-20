@@ -10,6 +10,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#if !defined(_WIN32)
+#include <spawn.h>
+#if defined(__APPLE__)
+#include <sys/event.h>
+#endif
+#endif
 #if !defined(_WIN32) && !defined(__ANDROID__)
 #include <sched.h>
 #include <pthread.h>
@@ -1705,10 +1711,13 @@ WEAK int32_t driver_c_link_tmp_obj_default(const char* outputPath, const char* o
     const char* targetText = (target != NULL) ? target : "";
     const char* linkerText = (linker != NULL && linker[0] != '\0') ? linker : "system";
     const char* runtimeC = "/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c";
+    const char* runtimeObj = getenv("BACKEND_RUNTIME_OBJ");
+    const char* runtimeInput = runtimeC;
     const char* cflags = getenv("BACKEND_CFLAGS");
     const char* ldflags = getenv("BACKEND_LDFLAGS");
     const char* cflagsText = (cflags != NULL) ? cflags : "";
     const char* ldflagsText = (ldflags != NULL) ? ldflags : "";
+    const char* fastDarwinAdhocRaw = getenv("BACKEND_DARWIN_FAST_ADHOC");
     char fullLdflags[512];
     char extraLdflags[96];
     fullLdflags[0] = '\0';
@@ -1716,14 +1725,24 @@ WEAK int32_t driver_c_link_tmp_obj_default(const char* outputPath, const char* o
     if (outputPath == NULL || outputPath[0] == '\0') return -20;
     if (objPath == NULL || objPath[0] == '\0') return -21;
     if (strcmp(linkerText, "system") != 0) return -22;
+    if (driver_c_env_bool("BACKEND_NO_RUNTIME_C", 0) != 0 &&
+        runtimeObj != NULL && runtimeObj[0] != '\0' &&
+        access(runtimeObj, R_OK) == 0) {
+        runtimeInput = runtimeObj;
+    }
     const char* base = strrchr(objPath, '/');
     const char* objName = (base != NULL) ? (base + 1) : objPath;
     int useDriverEntryShim = strstr(objName, "backend_driver") != NULL ||
                              driver_c_env_bool("BACKEND_FORCE_DRIVER_ENTRY_SHIM", 0) != 0;
     int needsDarwinCodesign = 0;
+    int fastDarwinAdhoc =
+        (fastDarwinAdhocRaw != NULL && fastDarwinAdhocRaw[0] != '\0')
+            ? driver_c_env_bool("BACKEND_DARWIN_FAST_ADHOC", 0)
+            : driver_c_env_bool("BACKEND_FAST_DEV_PROFILE", 0);
     if (strstr(targetText, "darwin") != NULL || strstr(targetText, "apple-darwin") != NULL) {
-        needsDarwinCodesign = 1;
-        if (strstr(ldflagsText, "-Wl,-no_adhoc_codesign") == NULL) {
+        if (strstr(ldflagsText, "-Wl,-no_adhoc_codesign") != NULL) fastDarwinAdhoc = 0;
+        needsDarwinCodesign = fastDarwinAdhoc ? 0 : 1;
+        if (!fastDarwinAdhoc && strstr(ldflagsText, "-Wl,-no_adhoc_codesign") == NULL) {
             snprintf(extraLdflags + strlen(extraLdflags),
                      sizeof(extraLdflags) - strlen(extraLdflags),
                      " -Wl,-no_adhoc_codesign");
@@ -1735,21 +1754,23 @@ WEAK int32_t driver_c_link_tmp_obj_default(const char* outputPath, const char* o
         }
     }
     snprintf(fullLdflags, sizeof(fullLdflags), "%s%s", ldflagsText, extraLdflags);
-    size_t need = strlen(objPath) + strlen(runtimeC) + strlen(outputPath) +
+    size_t need = strlen(objPath) + strlen(runtimeInput) + strlen(outputPath) +
                   strlen(cflagsText) + strlen(ldflagsText) + strlen(extraLdflags) + 128u;
     char* cmd = (char*)malloc(need);
     if (cmd == NULL) return -23;
     if (useDriverEntryShim) {
         snprintf(cmd, need, "cc -DCHENG_BACKEND_DRIVER_ENTRY_SHIM %s '%s' '%s' %s -o '%s'",
-                 cflagsText, objPath, runtimeC, fullLdflags, outputPath);
+                 cflagsText, objPath, runtimeInput, fullLdflags, outputPath);
     } else {
         snprintf(cmd, need, "cc %s '%s' '%s' %s -o '%s'",
-                 cflagsText, objPath, runtimeC, fullLdflags, outputPath);
+                 cflagsText, objPath, runtimeInput, fullLdflags, outputPath);
     }
     if (getenv("BACKEND_DEBUG_LINK_CMD") != NULL) {
         fprintf(stderr, "[driver_c_link_tmp_obj_default] obj=%s out=%s target=%s sidecar=<bundle-only>\n",
                 objPath, outputPath, targetText);
         fprintf(stderr, "[driver_c_link_tmp_obj_default] cmd=%s\n", cmd);
+        fprintf(stderr, "[driver_c_link_tmp_obj_default] darwin_fast_adhoc=%d needs_codesign=%d\n",
+                fastDarwinAdhoc, needsDarwinCodesign);
     }
     int rc = system(cmd);
     if (getenv("BACKEND_DEBUG_LINK_CMD") != NULL) {
@@ -1898,7 +1919,6 @@ static int32_t driver_c_sidecar_builds_requested(void) {
 
 static int32_t driver_c_prefer_sidecar_builds(void) {
     int32_t prefer = driver_c_sidecar_builds_requested();
-    if (prefer != 0) driver_c_apply_default_proof_sidecar_compiler();
     return prefer;
 }
 
@@ -5412,6 +5432,342 @@ char* cheng_exec_cmd_ex(const char* command, const char* workingDir, int32_t mer
     return out;
 }
 
+#if !defined(_WIN32)
+extern char** environ;
+#endif
+
+static const char* cheng_seq_string_item(ChengSeqHeader seq, int32_t idx) {
+    if (idx < 0 || idx >= seq.len || seq.buffer == NULL) return "";
+    {
+        char** items = (char**)seq.buffer;
+        const char* value = items[idx];
+        return value ? value : "";
+    }
+}
+
+static int cheng_env_key_eq(const char* entry, const char* key, size_t keyLen) {
+    if (!entry || !key || keyLen == 0) return 0;
+    if (strncmp(entry, key, keyLen) != 0) return 0;
+    return entry[keyLen] == '=';
+}
+
+static char** cheng_exec_build_envp(ChengSeqHeader overrides) {
+#if defined(_WIN32)
+    (void)overrides;
+    return NULL;
+#else
+    size_t baseCount = 0;
+    size_t i = 0;
+    size_t outCount = 0;
+    char** out = NULL;
+    if (environ) {
+        while (environ[baseCount] != NULL) baseCount++;
+    }
+    out = (char**)malloc(sizeof(char*) * (baseCount + (size_t)(overrides.len > 0 ? overrides.len : 0) + 1u));
+    if (!out) return NULL;
+    for (i = 0; i < baseCount; ++i) out[i] = environ[i];
+    outCount = baseCount;
+    for (i = 0; i < (size_t)(overrides.len > 0 ? overrides.len : 0); ++i) {
+        const char* raw = cheng_seq_string_item(overrides, (int32_t)i);
+        const char* eq = raw ? strchr(raw, '=') : NULL;
+        size_t keyLen = eq ? (size_t)(eq - raw) : 0u;
+        size_t j = 0;
+        int replaced = 0;
+        if (!raw || !raw[0] || keyLen == 0u) continue;
+        for (j = 0; j < outCount; ++j) {
+            if (cheng_env_key_eq(out[j], raw, keyLen)) {
+                out[j] = (char*)raw;
+                replaced = 1;
+                break;
+            }
+        }
+        if (!replaced) {
+            out[outCount++] = (char*)raw;
+        }
+    }
+    out[outCount] = NULL;
+    return out;
+#endif
+}
+
+static char** cheng_exec_build_argv(const char* filePath, ChengSeqHeader argvSeq) {
+    size_t extraCount = (size_t)(argvSeq.len > 0 ? argvSeq.len : 0);
+    size_t i = 0;
+    char** argv = (char**)malloc(sizeof(char*) * (extraCount + 2u));
+    if (!argv) return NULL;
+    argv[0] = (char*)(filePath ? filePath : "");
+    for (i = 0; i < extraCount; ++i) {
+        argv[i + 1u] = (char*)cheng_seq_string_item(argvSeq, (int32_t)i);
+    }
+    argv[extraCount + 1u] = NULL;
+    return argv;
+}
+
+static void cheng_exec_free_argv_env(char** argv, char** envp) {
+    if (argv) free(argv);
+    if (envp) free(envp);
+}
+
+static int cheng_exec_load_argv_env(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                                    char*** argvOut, char*** envpOut) {
+    ChengSeqHeader argvSeq;
+    ChengSeqHeader envSeq;
+    char** argv = NULL;
+    char** envp = NULL;
+    memset(&argvSeq, 0, sizeof(argvSeq));
+    memset(&envSeq, 0, sizeof(envSeq));
+    if (!filePath || !filePath[0] || !argvOut || !envpOut) return 0;
+    if (argvSeqPtr) argvSeq = *(ChengSeqHeader*)argvSeqPtr;
+    if (envOverridesSeqPtr) envSeq = *(ChengSeqHeader*)envOverridesSeqPtr;
+    argv = cheng_exec_build_argv(filePath, argvSeq);
+    if (!argv) return 0;
+    envp = cheng_exec_build_envp(envSeq);
+    *argvOut = argv;
+    *envpOut = envp;
+    return 1;
+}
+
+static int64_t cheng_exec_wait_status(pid_t pid, int32_t timeoutSec) {
+#if defined(_WIN32)
+    (void)pid;
+    (void)timeoutSec;
+    return -1;
+#else
+    int childStatus = 0;
+    int timedOut = 0;
+    int termSent = 0;
+    int64_t termSentNs = 0;
+    int64_t deadlineNs = 0;
+    if (timeoutSec > 0) {
+        deadlineNs = cheng_monotime_ns() + (int64_t)timeoutSec * 1000000000LL;
+    }
+    for (;;) {
+#if defined(__APPLE__)
+        int waitTimeoutMs = -1;
+        int kq = -1;
+        if (timeoutSec > 0 && deadlineNs > 0) {
+            int64_t remainNs = deadlineNs - cheng_monotime_ns();
+            if (remainNs <= 0) {
+                waitTimeoutMs = 0;
+            } else {
+                waitTimeoutMs = (int)(remainNs / 1000000LL);
+                if (waitTimeoutMs < 0) waitTimeoutMs = 0;
+            }
+        }
+        kq = kqueue();
+        if (kq >= 0) {
+            struct kevent changeEv;
+            struct kevent outEv;
+            struct timespec waitTs;
+            struct timespec* waitTsPtr = NULL;
+            EV_SET(&changeEv, (uintptr_t)pid, EVFILT_PROC, EV_ADD | EV_ENABLE, NOTE_EXIT, 0, NULL);
+            if (waitTimeoutMs >= 0) {
+                waitTs.tv_sec = (time_t)(waitTimeoutMs / 1000);
+                waitTs.tv_nsec = (long)((waitTimeoutMs % 1000) * 1000000L);
+                waitTsPtr = &waitTs;
+            }
+            (void)kevent(kq, &changeEv, 1, &outEv, 1, waitTsPtr);
+            close(kq);
+        } else
+#endif
+        {
+            if (timeoutSec > 0 && deadlineNs > 0) {
+                int64_t remainNs = deadlineNs - cheng_monotime_ns();
+                if (remainNs > 0) {
+                    int waitUs = (int)(remainNs / 1000LL);
+                    if (waitUs > 1000) waitUs = 1000;
+                    if (waitUs > 0) usleep((useconds_t)waitUs);
+                }
+            }
+        }
+        if (timeoutSec > 0 && deadlineNs > 0) {
+            int64_t nowNs = cheng_monotime_ns();
+            if (nowNs >= deadlineNs) {
+                if (!termSent) {
+                    kill(pid, SIGTERM);
+                    termSent = 1;
+                    termSentNs = nowNs;
+                } else if (nowNs - termSentNs >= 50000000LL) {
+                    kill(pid, SIGKILL);
+                }
+                timedOut = 1;
+            }
+        }
+        {
+            pid_t waitRc = waitpid(pid, &childStatus, WNOHANG);
+            if (waitRc == pid) {
+                break;
+            }
+            if (waitRc < 0) {
+                childStatus = 0;
+                break;
+            }
+        }
+    }
+    if (timedOut) {
+        return 124;
+    }
+    if (WIFEXITED(childStatus)) {
+        return (int64_t)WEXITSTATUS(childStatus);
+    }
+    if (WIFSIGNALED(childStatus)) {
+        return (int64_t)(128 + WTERMSIG(childStatus));
+    }
+    return (int64_t)childStatus;
+#endif
+}
+
+static int cheng_exec_spawn_addchdir(posix_spawn_file_actions_t* actions, const char* workingDir) {
+    if (!workingDir || !workingDir[0]) return 0;
+#if defined(__APPLE__)
+    return posix_spawn_file_actions_addchdir(actions, workingDir);
+#else
+    (void)actions;
+    return -1;
+#endif
+}
+
+static int cheng_exec_spawn_addchdir_supported(void) {
+#if defined(__APPLE__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static int64_t cheng_exec_file_status_fork(const char* filePath, char** argv, char** envp,
+                                           const char* workingDir, int32_t timeoutSec) {
+    int devNullFd = -1;
+    pid_t pid = -1;
+    devNullFd = open("/dev/null", O_WRONLY);
+    if (devNullFd < 0) {
+        return -1;
+    }
+    pid = fork();
+    if (pid < 0) {
+        close(devNullFd);
+        return -1;
+    }
+    if (pid == 0) {
+        if (workingDir && workingDir[0]) chdir(workingDir);
+        dup2(devNullFd, STDOUT_FILENO);
+        dup2(devNullFd, STDERR_FILENO);
+        close(devNullFd);
+        execve(filePath, argv, envp ? envp : environ);
+        _exit(127);
+    }
+    close(devNullFd);
+    return cheng_exec_wait_status(pid, timeoutSec);
+}
+
+char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                              const char* workingDir, int32_t mergeStderr, int32_t timeoutSec,
+                              int64_t* exitCode) {
+    if (exitCode) *exitCode = -1;
+    if (!filePath || !filePath[0]) return cheng_strdup("");
+#if defined(_WIN32)
+    (void)argvSeqPtr;
+    (void)envOverridesSeqPtr;
+    (void)workingDir;
+    (void)mergeStderr;
+    (void)timeoutSec;
+    return cheng_strdup("");
+#else
+    char** argv = NULL;
+    char** envp = NULL;
+    int captureFd = -1;
+    pid_t pid = -1;
+    char* out = NULL;
+    char capturePath[] = "/tmp/cheng_exec_capture.XXXXXX";
+    if (!cheng_exec_load_argv_env(filePath, argvSeqPtr, envOverridesSeqPtr, &argv, &envp)) {
+        return cheng_strdup("");
+    }
+    captureFd = mkstemp(capturePath);
+    if (captureFd < 0) {
+        cheng_exec_free_argv_env(argv, envp);
+        return cheng_strdup("");
+    }
+    pid = fork();
+    if (pid < 0) {
+        close(captureFd);
+        unlink(capturePath);
+        cheng_exec_free_argv_env(argv, envp);
+        return cheng_strdup("");
+    }
+    if (pid == 0) {
+        if (workingDir && workingDir[0]) chdir(workingDir);
+        dup2(captureFd, STDOUT_FILENO);
+        if (mergeStderr != 0) dup2(captureFd, STDERR_FILENO);
+        close(captureFd);
+        execve(filePath, argv, envp ? envp : environ);
+        {
+            const char* msg = strerror(errno);
+            if (!msg) msg = "execve failed";
+            dprintf(STDERR_FILENO, "%s\n", msg);
+        }
+        _exit(127);
+    }
+    close(captureFd);
+    captureFd = -1;
+    cheng_exec_free_argv_env(argv, envp);
+    {
+        int64_t rc = cheng_exec_wait_status(pid, timeoutSec);
+        if (exitCode) *exitCode = rc;
+    }
+    out = driver_c_read_file_all(capturePath);
+    unlink(capturePath);
+    if (!out) out = cheng_strdup("");
+    return out;
+#endif
+}
+
+int64_t cheng_exec_file_status(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                               const char* workingDir, int32_t timeoutSec) {
+#if defined(_WIN32)
+    (void)filePath;
+    (void)argvSeqPtr;
+    (void)envOverridesSeqPtr;
+    (void)workingDir;
+    (void)timeoutSec;
+    return -1;
+#else
+    char** argv = NULL;
+    char** envp = NULL;
+    pid_t pid = -1;
+    int64_t rc = -1;
+    posix_spawn_file_actions_t actions;
+    int spawnRc = 0;
+    if (!filePath || !filePath[0]) return -1;
+    if (!cheng_exec_load_argv_env(filePath, argvSeqPtr, envOverridesSeqPtr, &argv, &envp)) {
+        return -1;
+    }
+    if (workingDir && workingDir[0] && !cheng_exec_spawn_addchdir_supported()) {
+        rc = cheng_exec_file_status_fork(filePath, argv, envp, workingDir, timeoutSec);
+        cheng_exec_free_argv_env(argv, envp);
+        return rc;
+    }
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        cheng_exec_free_argv_env(argv, envp);
+        return -1;
+    }
+    if (cheng_exec_spawn_addchdir(&actions, workingDir) != 0 ||
+        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) != 0 ||
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        cheng_exec_free_argv_env(argv, envp);
+        return -1;
+    }
+    spawnRc = posix_spawn(&pid, filePath, &actions, NULL, argv, envp ? envp : environ);
+    posix_spawn_file_actions_destroy(&actions);
+    cheng_exec_free_argv_env(argv, envp);
+    if (spawnRc != 0) {
+        return 127;
+    }
+    rc = cheng_exec_wait_status(pid, timeoutSec);
+    return rc;
+#endif
+}
+
 char* chengQ_execQ_cmdQ_ex_0(char* command, char* workingDir, int32_t mergeStderr, int64_t* exitCode) {
     return cheng_exec_cmd_ex(command, workingDir, mergeStderr, exitCode);
 }
@@ -5680,7 +6036,7 @@ int32_t cheng_fd_write(int32_t fd, const char* data, int32_t len) {
     return -1;
 #else
     if (fd < 0 || data == NULL || len <= 0) return 0;
-    ssize_t n = (ssize_t)syscall(SYS_write, fd, data, (size_t)len);
+    ssize_t n = write(fd, data, (size_t)len);
     if (n < 0) return -1;
     return (int32_t)n;
 #endif

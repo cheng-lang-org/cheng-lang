@@ -1,6 +1,7 @@
 # c_profile_lowering.cheng
 # Stage1: C-profile lowering for named/default args and `?`.
 import std/strings
+import std/strutils
 import std/hashmaps
 import std/system
 import stage1/ast
@@ -31,19 +32,79 @@ fn add(dst: var Diagnostic[], val: Diagnostic) =
 fn add(dst: Diagnostic[]*, val: Diagnostic) =
     seqs.add(dst, val)
 
+fn lowerJoinParts(parts: str[]): str =
+    return strutils.join(parts, "")
+
+fn lowerChooseNonEmpty(primary: str, fallback: str): str =
+    if len(primary) > 0:
+        return primary
+    return fallback
+
+fn lowerFileNameOrStdin(fileName: str): str =
+    return lowerChooseNonEmpty(fileName, "stdin")
+
+fn lowerCounterName(prefix: str, counter: int32): str =
+    var parts: str[] = []
+    add(parts, prefix)
+    add(parts, intToStr(counter))
+    return lowerJoinParts(parts)
+
+fn lowerWrapperKey(baseName: str, order: int32[]): str =
+    var parts: str[] = []
+    add(parts, baseName)
+    add(parts, "|")
+    for ki in 0..<order.len:
+        if ki > 0:
+            add(parts, ",")
+        add(parts, intToStr(order[ki]))
+    return lowerJoinParts(parts)
+
+fn lowerClosureTempName(base: str, mid: str, counter: int32): str =
+    var parts: str[] = []
+    add(parts, base)
+    add(parts, mid)
+    add(parts, intToStr(counter))
+    return lowerJoinParts(parts)
+
+fn lowerIterBaseName(base: str): str =
+    var parts: str[] = []
+    add(parts, "__iter_")
+    add(parts, base)
+    return lowerJoinParts(parts)
+
+fn lowerAsyncBaseName(base: str): str =
+    var parts: str[] = []
+    add(parts, "__async_")
+    add(parts, base)
+    return lowerJoinParts(parts)
+
+fn lowerAsyncFrameTypeName(baseName: str): str =
+    var parts: str[] = []
+    add(parts, baseName)
+    add(parts, "__async_frame")
+    return lowerJoinParts(parts)
+
+fn lowerClosureNameAt(values: str[], infoIdx: int32): str =
+    if infoIdx >= 0:
+        return lowerReadStr(values, infoIdx)
+    return ""
+
 @importc("getenv")
-fn lower_c_getenv(name: cstring): str
+fn lower_c_getenv_raw(name: cstring): cstring
 
 fn lowerGetEnv(name: str): str =
-    let v: str = lower_c_getenv name
+    let raw: cstring = lower_c_getenv_raw(strToCStringTemp(name))
+    let v: str = strFromCStringBorrow(raw)
     if len(v) == 0:
         return ""
     return v
 
 fn lowerTrace(msg: str) =
     if (lowerGetEnv("STAGE1_TRACE_LOWER") == "1"):
-        let line: str = "[lower] " + msg
-        echo line
+        var parts: str[] = []
+        add(parts, "[lower] ")
+        add(parts, msg)
+        echo lowerJoinParts(parts)
         if (lowerGetEnv("STAGE1_TRACE_FLUSH") == "1"):
             c_fflush get_stdout()
 
@@ -277,9 +338,7 @@ fn lowerValueLookup(name: str): Node =
 fn lowerAddError(pos: SourcePos, msg: str) =
     if lowerDiags == nil:
         return
-    var fileName: str = lowerFilename
-    if fileName == "":
-        fileName = "stdin"
+    let fileName: str = lowerFileNameOrStdin(lowerFilename)
     let d: Diagnostic = diagMake(svError, fileName, pos.line, pos.col, msg)
     add(lowerDiags, d)
 
@@ -575,13 +634,16 @@ fn lowerIterLookup(name: str): Node =
     return lowerMapGetIndex(lowerIterNames, lowerIterNodes, lowerIterIndex, name)
 
 fn lowerBuildWrapperName(baseName: str, order: int32[]): str =
-    var out: str = baseName + "__wrap"
+    var parts: str[] = []
+    add(parts, baseName)
+    add(parts, "__wrap")
     if order.len == 0:
-        return out + "_none"
+        add(parts, "_none")
+        return lowerJoinParts(parts)
     for i in 0..<order.len:
-        out = out + "_"
-        out = out + intToStr(order[i])
-    return out
+        add(parts, "_")
+        add(parts, intToStr(order[i]))
+    return lowerJoinParts(parts)
 
 fn lowerWrapperNameFor(key: str, baseName: str, order: int32[]): str =
     var found: bool = false
@@ -858,11 +920,7 @@ fn lowerNamedCall(n: Node, wrappers: Node[]*): Node =
                 return n
     if !sawNamed && !hasMissing:
         return n
-    var key: str = baseName + "|"
-    for ki in 0..<order.len:
-        if ki > 0:
-            key = key + ","
-        key = key + intToStr(order[ki])
+    let key: str = lowerWrapperKey(baseName, order)
     let exists: bool = lowerMapHasIndex(lowerWrapperIndex, key)
     let wrapperName: str = lowerWrapperNameFor(key, baseName, order)
     if !exists:
@@ -1019,7 +1077,7 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
         var capTypes: Node[4]
         lowerCollectCaptures(n, &capNames, &capTypes)
         if capNames.len == 0:
-            let simpleName: str = "__cheng_lambda_" + intToStr(lowerClosureCounter)
+            let simpleName: str = lowerCounterName("__cheng_lambda_", lowerClosureCounter)
             lowerClosureCounter = lowerClosureCounter + 1
             var paramsNode: Node = astInvalidNodeId()
             if kidCount n > 1:
@@ -1051,14 +1109,10 @@ fn lowerClosureExpr(n: Node): ClosureExprResult =
                 add(lowerClosureDecls, decl)
             return closureExprResult(newIdent(simpleName, nodePos(n)))
         let infoIdx: int32 = lowerEnsureClosureInfo(n, capNames, capTypes)
-        var envName: str = ""
-        var bodyName: str = ""
-        var trampName: str = ""
-        if infoIdx >= 0:
-            envName = lowerReadStr(lowerClosureLamEnvNames, infoIdx)
-            bodyName = lowerReadStr(lowerClosureLamBodyNames, infoIdx)
-            trampName = lowerReadStr(lowerClosureLamTrampNames, infoIdx)
-        let envVarName: str = envName + "_val_" + intToStr(lowerClosureTempCounter)
+        let envName: str = lowerClosureNameAt(lowerClosureLamEnvNames, infoIdx)
+        let bodyName: str = lowerClosureNameAt(lowerClosureLamBodyNames, infoIdx)
+        let trampName: str = lowerClosureNameAt(lowerClosureLamTrampNames, infoIdx)
+        let envVarName: str = lowerClosureTempName(envName, "_val_", lowerClosureTempCounter)
         lowerClosureTempCounter = lowerClosureTempCounter + 1
         var envVar: Node = newNode(nkVar, nodePos(n))
         addSon(envVar, newIdent(envVarName, nodePos(n)))
@@ -1589,13 +1643,14 @@ fn lowerTypeKey(n: Node): str =
     if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
         return lowerUnqualifyName(stripSpaces(nodeIdent(n)))
     if nodeKind(n) == nkBracketExpr && kidCount n > 0:
-        var out: str = stripSpaces(plainName(kid(n, 0)))
+        var parts: str[] = []
+        add(parts, stripSpaces(plainName(kid(n, 0))))
         for i in 1..<kidCount n:
             let part: str = lowerTypeKey kid(n, i)
             if !strIsEmpty part:
-                out = out + "_"
-                out = out + part
-        return out
+                add(parts, "_")
+                add(parts, part)
+        return lowerJoinParts(parts)
     return ""
 
 fn lowerSameType(a: Node, b: Node): bool =
@@ -1985,9 +2040,9 @@ fn lowerEnsureClosureInfo(lam: Node, capNames: str[], capTypes: Node[]): int32 =
         return existing
     let idx: int32 = lowerClosureCounter
     lowerClosureCounter = lowerClosureCounter + 1
-    let envName: str = "__cheng_env_" + intToStr idx
-    let bodyName: str = "__cheng_lambda_" + intToStr idx
-    let trampName: str = "__cheng_trampoline_" + intToStr idx
+    let envName: str = lowerCounterName("__cheng_env_", idx)
+    let bodyName: str = lowerCounterName("__cheng_lambda_", idx)
+    let trampName: str = lowerCounterName("__cheng_trampoline_", idx)
     let pos: SourcePos = nodePos(lam)
     if lowerClosureDecls != nil:
         let envDecl: Node = lowerBuildEnvTypeDecl(envName, capNames, capTypes, pos)
@@ -2084,7 +2139,7 @@ fn lowerQExpr(n: Node, fnRetType: Node, fnReturnsResult: bool): LowerExprResult 
                     resType = fnRetType
                 else:
                     resType = newNode(nkEmpty, nodePos(n))
-            let resName: str = "__qres" + intToStr(lowerTempCounter)
+            let resName: str = lowerCounterName("__qres", lowerTempCounter)
             lowerTempCounter = lowerTempCounter + 1
             var resDecl: Node = newNode(nkVar, nodePos(n))
             addSon(resDecl, newIdent(resName, nodePos(n)))
@@ -2342,7 +2397,7 @@ fn lowerControlExpr(n: Node): LowerExprResult =
             if op == "&&" || op == "||" || op == "and" || op == "or":
                 return lowerControlShortCircuitExpr(n, op)
     if nodeKind(n) == nkIfExpr || nodeKind(n) == nkWhenExpr || nodeKind(n) == nkCaseExpr:
-        let tmpName: str = "__cfe" + intToStr(lowerTempCounter)
+        let tmpName: str = lowerCounterName("__cfe", lowerTempCounter)
         lowerTempCounter = lowerTempCounter + 1
         var tmpType: Node = lowerInferExprType n
         if stage1AstRefIsNil(tmpType) || nodeKind(tmpType) == nkEmpty:
@@ -2408,7 +2463,7 @@ fn lowerControlShortCircuitExpr(n: Node, op: str): LowerExprResult =
         var outRes: LowerExprResult = lowerExprResult(outNode)
         outRes.stmts = resLhs.stmts
         return outRes
-    let tmpName: str = "__cfe" + intToStr(lowerTempCounter)
+    let tmpName: str = lowerCounterName("__cfe", lowerTempCounter)
     lowerTempCounter = lowerTempCounter + 1
     var decl: Node = newNode(nkVar, nodePos(n))
     addSon(decl, newIdent(tmpName, nodePos(n)))
@@ -2642,15 +2697,29 @@ fn iterCloseName(base: str): str =
     return base + "_close"
 
 fn iterNextTempName(prefix: str): str =
-    let name: str = "__iter_" + prefix + "_" + intToStr(lowerIterTempCounter)
+    var parts: str[] = []
+    add(parts, "__iter_")
+    add(parts, prefix)
+    add(parts, "_")
+    add(parts, intToStr(lowerIterTempCounter))
+    let name: str = lowerJoinParts(parts)
     lowerIterTempCounter = lowerIterTempCounter + 1
     return name
 
 fn iterPickInternalName(base: str, captures: str[]): str =
-    var name: str = "__iter_" + base
-    while iterNameIndex(captures, name) >= 0:
-        name = name + "_"
-    return name
+    let baseName: str = lowerIterBaseName(base)
+    if iterNameIndex(captures, baseName) < 0:
+        return baseName
+    var suffixCount: int32 = 1
+    while true:
+        var parts: str[] = []
+        add(parts, baseName)
+        for _ in 0..<suffixCount:
+            add(parts, "_")
+        let candidate: str = lowerJoinParts(parts)
+        if iterNameIndex(captures, candidate) < 0:
+            return candidate
+        suffixCount = suffixCount + 1
 
 fn iterNameIndex(names: str[], name: str): int32 =
     for i in 0..<names.len:
@@ -2750,7 +2819,9 @@ fn iterDefaultValueNode(ty: Node, pos: SourcePos): Node =
             return lowerMakeIntLit(0, pos)
         if tname == "float" || tname == "float32" || tname == "float64":
             return newFloatLit(0.0, pos)
-        if tname == "str" || tname == "cstring":
+        if tname == "str":
+            return newStrLit("", pos)
+        if tname == "cstring":
             return lowerMakeNilLit(pos)
         if tname == "int" || tname == "int8" || tname == "int16" || tname == "int32" || tname == "int64":
             return lowerMakeIntLit(0, pos)
@@ -3588,10 +3659,19 @@ fn asyncCollectLocals(n: Node, names: str[]*, types: Node[]*) =
         asyncCollectLocals(kid(n, i), names, types)
 
 fn asyncPickInternalName(base: str, captures: str[]): str =
-    var name: str = "__async_" + base
-    while asyncNameIndex(captures, name) >= 0:
-        name = name + "_"
-    return name
+    let baseName: str = lowerAsyncBaseName(base)
+    if asyncNameIndex(captures, baseName) < 0:
+        return baseName
+    var suffixCount: int32 = 1
+    while true:
+        var parts: str[] = []
+        add(parts, baseName)
+        for _ in 0..<suffixCount:
+            add(parts, "_")
+        let candidate: str = lowerJoinParts(parts)
+        if asyncNameIndex(captures, candidate) < 0:
+            return candidate
+        suffixCount = suffixCount + 1
 
 fn asyncIsCaptured(ctx: AsyncLowerCtx, name: str): bool =
     if len(name) == 0:
@@ -4225,7 +4305,7 @@ fn lowerAsyncDecl(fnNode: Node): Node =
     var captureTypes: Node[8]
     asyncCollectParamTypes(paramsNode, &captureNames, &captureTypes)
     asyncCollectLocals(bodyNode, &captureNames, &captureTypes)
-    let frameType: str = baseName + "__async_frame"
+    let frameType: str = lowerAsyncFrameTypeName(baseName)
     var ctx: AsyncLowerCtx
     ctx.frameName = asyncPickInternalName("frame", captureNames)
     ctx.stateName = asyncPickInternalName("state", captureNames)
@@ -4272,9 +4352,7 @@ fn lowerAwaitExpr(n: Node): Node =
     if asyncIsAwaitExpr n:
         let inner: Node = asyncAwaitOperand n
         let loweredInner: Node = lowerAwaitExpr inner
-        var kind: str = asyncAwaitKindFromExpr(loweredInner)
-        if kind == "":
-            kind = "i32"
+        let kind: str = lowerChooseNonEmpty(asyncAwaitKindFromExpr(loweredInner), "i32")
         let fnName: str = asyncAwaitName kind
         if fnName == "":
             return loweredInner

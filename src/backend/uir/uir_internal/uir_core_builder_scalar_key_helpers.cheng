@@ -6,16 +6,54 @@ import backend/uir/uir_internal/uir_core_builder_text_helpers
 import backend/uir/uir_internal/uir_core_builder_string_utils
 import backend/uir/uir_internal/uir_core_builder_symbol_state
 
+var
+    uirCore_paramKeyCanon_recent_ptr: int64
+    uirCore_paramKeyCanon_recent_raw: str
+    uirCore_paramKeyCanon_recent_norm: str
+    uirCore_paramKeyCanon_recent_valid: bool
+
+    uirCore_paramVarBase_recent_ptr: int64
+    uirCore_paramVarBase_recent_raw: str
+    uirCore_paramVarBase_recent_base: str
+    uirCore_paramVarBase_recent_valid: bool
+
+    uirCore_paramWantsVarAddr_recent_module: UirCoreModule
+    uirCore_paramWantsVarAddr_recent_ptr: int64
+    uirCore_paramWantsVarAddr_recent_raw: str
+    uirCore_paramWantsVarAddr_recent_val: bool
+    uirCore_paramWantsVarAddr_recent_valid: bool
+
+fn uirCoreScalarKeyPtrKey(s: str): int64 =
+    if !uirCoreStrPtrSane(s):
+        return 0
+    return int64(strDataPtr(s))
+
+fn uirCoreParamKeyCanon(paramKey0: str): str =
+    if len(paramKey0) == 0:
+        return ""
+    let ptrKey: int64 = uirCoreScalarKeyPtrKey(paramKey0)
+    if uirCore_paramKeyCanon_recent_valid:
+        if ptrKey != 0 && ptrKey == uirCore_paramKeyCanon_recent_ptr:
+            return uirCore_paramKeyCanon_recent_norm
+        if len(uirCore_paramKeyCanon_recent_raw) > 0 && uirCore_paramKeyCanon_recent_raw == paramKey0:
+            return uirCore_paramKeyCanon_recent_norm
+    let norm: str = backendStripSpaces(paramKey0)
+    uirCore_paramKeyCanon_recent_ptr = ptrKey
+    uirCore_paramKeyCanon_recent_raw = paramKey0
+    uirCore_paramKeyCanon_recent_norm = norm
+    uirCore_paramKeyCanon_recent_valid = true
+    return norm
+
 fn isFloat64Key(key0: str): bool =
     if len(key0) == 0:
         return false
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     return (key == "float64") || (key == "float")
 
 fn isFloat32Key(key0: str): bool =
     if len(key0) == 0:
         return false
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     return key == "float32"
 
 fn isIntegralUirType(ty: UirCoreType): bool =
@@ -24,13 +62,13 @@ fn isIntegralUirType(ty: UirCoreType): bool =
 fn isStringKey(key0: str): bool =
     if len(key0) == 0:
         return false
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     return (key == "str") || (key == "string") || (key == "cstring")
 
 fn isSemanticStrKey(key0: str): bool =
     if len(key0) == 0:
         return false
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     return (key == "str") || (key == "string")
 
 fn uirCoreNodeIsStringLiteral(node: Node): bool =
@@ -45,7 +83,7 @@ fn uirCoreNodeHasSemanticStrCtx(key0: str, node: Node): bool =
 fn isPtrKey(key0: str): bool =
     if len(key0) == 0:
         return false
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     return (key == "ptr") || (key == ("void" + "*"))
 
 fn isStringOrPtrKey(key0: str): bool =
@@ -54,13 +92,13 @@ fn isStringOrPtrKey(key0: str): bool =
 fn isPtrRefVarBareKey(key0: str): bool =
     if len(key0) == 0:
         return false
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     return (key == "ptr") || (key == "ref") || (key == "var")
 
 fn isPtrRefVarLikeKey(key0: str): bool =
     if len(key0) == 0:
         return false
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     return uirCoreStrStartsWith(key, "ptr_") || uirCoreStrStartsWith(key, "ref_") ||
            uirCoreStrStartsWith(key, "var_") || uirCoreStrStartsWith(key, "var_ref_") ||
            isPtrRefVarBareKey(key)
@@ -68,53 +106,114 @@ fn isPtrRefVarLikeKey(key0: str): bool =
 fn uirCoreParamIsVarKey(paramKey0: str): bool =
     if len(paramKey0) == 0:
         return false
-    let key: str = backendStripSpaces(paramKey0)
+    let key: str = uirCoreParamKeyCanon(paramKey0)
     return (key == "var") || uirCoreStrStartsWith(key, "var_") || uirCoreStrStartsWith(key, "var_ref_")
 
 fn uirCoreParamVarBaseKey(paramKey0: str): str =
     if len(paramKey0) == 0:
         return ""
-    let key: str = backendStripSpaces(paramKey0)
+    let ptrKey: int64 = uirCoreScalarKeyPtrKey(paramKey0)
+    if uirCore_paramVarBase_recent_valid:
+        if ptrKey != 0 && ptrKey == uirCore_paramVarBase_recent_ptr:
+            return uirCore_paramVarBase_recent_base
+        if len(uirCore_paramVarBase_recent_raw) > 0 && uirCore_paramVarBase_recent_raw == paramKey0:
+            return uirCore_paramVarBase_recent_base
+    let key: str = uirCoreParamKeyCanon(paramKey0)
     if uirCoreStrStartsWith(key, "var_ref_"):
-        return str(rawmemPtrAdd(rawmemAsVoid(key), 8))
+        let baseKey: str = rawmemStrFromOffset(key, 8)
+        uirCore_paramVarBase_recent_ptr = ptrKey
+        uirCore_paramVarBase_recent_raw = paramKey0
+        uirCore_paramVarBase_recent_base = baseKey
+        uirCore_paramVarBase_recent_valid = true
+        return baseKey
     if uirCoreStrStartsWith(key, "var_"):
-        return str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+        let baseKey2: str = rawmemStrFromOffset(key, 4)
+        uirCore_paramVarBase_recent_ptr = ptrKey
+        uirCore_paramVarBase_recent_raw = paramKey0
+        uirCore_paramVarBase_recent_base = baseKey2
+        uirCore_paramVarBase_recent_valid = true
+        return baseKey2
+    uirCore_paramVarBase_recent_ptr = ptrKey
+    uirCore_paramVarBase_recent_raw = paramKey0
+    uirCore_paramVarBase_recent_base = ""
+    uirCore_paramVarBase_recent_valid = true
     return ""
 
 fn uirCoreParamWantsVarAddr(module: UirCoreModule, paramKey0: str): bool =
-    let key: str = backendStripSpaces(paramKey0)
+    if len(paramKey0) == 0:
+        return false
+    let ptrKey: int64 = uirCoreScalarKeyPtrKey(paramKey0)
+    if uirCore_paramWantsVarAddr_recent_valid &&
+       uirCore_paramWantsVarAddr_recent_module == module:
+        if ptrKey != 0 && ptrKey == uirCore_paramWantsVarAddr_recent_ptr:
+            return uirCore_paramWantsVarAddr_recent_val
+        if len(uirCore_paramWantsVarAddr_recent_raw) > 0 &&
+           uirCore_paramWantsVarAddr_recent_raw == paramKey0:
+            return uirCore_paramWantsVarAddr_recent_val
+    let key: str = uirCoreParamKeyCanon(paramKey0)
     if len(key) == 0:
         return false
     if key == "var":
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = true
+        uirCore_paramWantsVarAddr_recent_valid = true
         return true
     let baseKey: str = uirCoreParamVarBaseKey(key)
     if len(baseKey) == 0:
-        return uirCoreParamIsVarKey(key)
+        let out0: bool = uirCoreParamIsVarKey(key)
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = out0
+        uirCore_paramWantsVarAddr_recent_valid = true
+        return out0
     if module == nil:
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = true
+        uirCore_paramWantsVarAddr_recent_valid = true
         return true
     if uirCoreHasObjType(module, baseKey):
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = true
+        uirCore_paramWantsVarAddr_recent_valid = true
         return true
     if uirCoreStrStartsWith(baseKey, "seq_") && uirCoreHasObjType(module, "seq"):
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = false
+        uirCore_paramWantsVarAddr_recent_valid = true
         return false
+    uirCore_paramWantsVarAddr_recent_module = module
+    uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+    uirCore_paramWantsVarAddr_recent_raw = paramKey0
+    uirCore_paramWantsVarAddr_recent_val = true
+    uirCore_paramWantsVarAddr_recent_valid = true
     return true
 
 fn uirCoreStripRefVarKeyOnce(key0: str): str =
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     if len(key) == 0:
         return ""
     if uirCoreStrStartsWith(key, "ref_"):
-        return str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+        return rawmemStrFromOffset(key, 4)
     let varBase: str = uirCoreParamVarBaseKey(key)
     if len(varBase) > 0:
         return varBase
     return key
 
 fn uirCoreStripPtrKeyOnce(key0: str): str =
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     if len(key) == 0:
         return ""
     if uirCoreStrStartsWith(key, "ptr_"):
-        return str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+        return rawmemStrFromOffset(key, 4)
     return key
 
 fn uirCoreNormalizeObjLookupKey(module: UirCoreModule, key0: str): str =
@@ -149,13 +248,13 @@ fn isBytePtrTypeKey(key: str): bool =
         return false
     if ! uirCoreStrStartsWith(key, "ptr_"):
         return false
-    let elemKey: str = str(rawmemPtrAdd(rawmemAsVoid(key), 4))
+    let elemKey: str = rawmemStrFromOffset(key, 4)
     return isByteTypeKey(elemKey)
 
 fn byteUirTypeFromKey(key0: str): UirCoreType =
     if len(key0) == 0:
         return uirCoreTypeU8()
-    let key: str = backendStripSpaces(key0)
+    let key: str = uirCoreParamKeyCanon(key0)
     if (key == "int8") || (key == "i8"):
         return uirCoreTypeI8()
     return uirCoreTypeU8()
@@ -163,17 +262,17 @@ fn byteUirTypeFromKey(key0: str): UirCoreType =
 fn byteUirTypeFromPtrTypeKey(ptrKey0: str): UirCoreType =
     if len(ptrKey0) == 0:
         return uirCoreTypeU8()
-    let ptrKey: str = backendStripSpaces(ptrKey0)
+    let ptrKey: str = uirCoreParamKeyCanon(ptrKey0)
     if !uirCoreStrStartsWith(ptrKey, "ptr_"):
         return uirCoreTypeU8()
-    let elemKey: str = str(rawmemPtrAdd(rawmemAsVoid(ptrKey), 4))
+    let elemKey: str = rawmemStrFromOffset(ptrKey, 4)
     return byteUirTypeFromKey(elemKey)
 
 fn byteUirTypeFromElemOrPtrKey(elemKey0: str, ptrKey0: str): UirCoreType =
     if len(elemKey0) > 0:
-        var elemKey: str = backendStripSpaces(elemKey0)
+        var elemKey: str = uirCoreParamKeyCanon(elemKey0)
         if uirCoreStrStartsWith(elemKey, "ptr_"):
-            elemKey = backendStripSpaces(str(rawmemPtrAdd(rawmemAsVoid(elemKey), 4)))
+            elemKey = uirCoreParamKeyCanon(rawmemStrFromOffset(elemKey, 4))
         return byteUirTypeFromKey(elemKey)
     return byteUirTypeFromPtrTypeKey(ptrKey0)
 
@@ -190,7 +289,7 @@ fn uirCorePtrBaseObjTypeName(mod: UirCoreModule, baseKey0: str): str =
     for __for_rev_i in 0..(__for_start_i - (0)):
         let i = __for_start_i - __for_rev_i
         if baseKey0[i] == '.':
-            let sub: str = str(rawmemPtrAdd(rawmemAsVoid(baseKey0), i + 1))
+            let sub: str = rawmemStrFromOffset(baseKey0, i + 1)
             if len(sub) > 0 && uirCoreHasObjType(mod, sub):
                 return sub
             break

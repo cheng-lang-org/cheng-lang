@@ -35,25 +35,12 @@ fn backendHexByteLower(v: int32): str =
     let lo: int32 = v & 15
     return charToStr(backendHexDigitLower(hi)) + charToStr(backendHexDigitLower(lo))
 
-fn backendSanitizeLinkName(raw: str): str =
-    if len(raw) == 0:
-        return ""
-    let name: str = backendStripSpaces(raw)
-    if backendIsSafeLinkName(name):
-        return name
-    if len(name) == 0:
-        return "__cheng_anon"
-    let nameLen: int32 = len(name)
-    if nameLen == 0:
-        return "__cheng_anon"
-    let prefix: str = "__cheng_sym"
-    let prefixLen: int32 = len(prefix)
-    let out: str = newStringAlloc(prefixLen + (nameLen * 3))
+fn backendSanitizeLinkNameFill(out: str, name: str, nameLen: int32): str =
     let outPtr: ptr = rawmemAsVoid(out)
     if outPtr == nil:
         return "__cheng_anon"
-    rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(prefix), prefixLen)
-    var writePos: int32 = prefixLen
+    rawmem_support.rawmemCopy(outPtr, rawmemAsVoid("__cheng_sym"), 11)
+    var writePos: int32 = 11
     for i in 0..<nameLen:
         let c: char = name[i]
         let v: int32 = int32(int64(c) & 0xFF)
@@ -62,6 +49,18 @@ fn backendSanitizeLinkName(raw: str): str =
         rawmemWriteChar(outPtr, writePos + 2, backendHexDigitLower(v & 15))
         writePos = writePos + 3
     return out
+
+fn backendSanitizeLinkName(raw: str): str =
+    if len(raw) == 0:
+        return ""
+    if backendIsSafeLinkName(backendStripSpaces(raw)):
+        return backendStripSpaces(raw)
+    if len(backendStripSpaces(raw)) == 0:
+        return "__cheng_anon"
+    let nameLen: int32 = len(backendStripSpaces(raw))
+    if nameLen == 0:
+        return "__cheng_anon"
+    return backendSanitizeLinkNameFill(newStringAlloc(11 + (nameLen * 3)), backendStripSpaces(raw), nameLen)
 
 fn uirCoreStrStartsWith(s: str, prefix: str): bool =
     return builder_string_c_str_has_prefix(s, prefix) != 0
@@ -117,6 +116,16 @@ fn uirCoreStrIndexOf(s: str, sub: str): int32 =
         if j == m:
             return i
     return -1
+
+fn uirCoreStrEqAt(s: str, off: int32, pat: str): bool =
+    let n: int32 = len(s)
+    let m: int32 = len(pat)
+    if off < 0 || m <= 0 || off + m > n:
+        return false
+    for i in 0..<m:
+        if s[off + i] != pat[i]:
+            return false
+    return true
 
 fn uirCoreStrTake(s: str, count: int32): str =
     if len(s) == 0 || count <= 0:

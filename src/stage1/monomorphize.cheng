@@ -2,6 +2,7 @@
 # Stage1: explicit generic instantiation + template/macro expansion (minimal).
 import std/strings
 import std/seqs
+import std/strutils
 import std/hashmaps
 import std/monotimes
 import std/os
@@ -156,6 +157,109 @@ fn add(dst: var Diagnostic[], val: Diagnostic) =
 fn add(dst: Diagnostic[]*, val: Diagnostic) =
     add[Diagnostic](dst, val)
 
+fn monoChooseNonEmpty(primary: str, fallback: str): str =
+    if len(primary) > 0:
+        return primary
+    return fallback
+
+fn monoDebugWatchTail(name: str): str =
+    return monoChooseNonEmpty(monoNameTail(name), name)
+
+fn monoTypeOwnerName(baseType: Node): str =
+    if stage1AstRefNonNil(baseType) && (nodeKind(baseType) == nkIdent || nodeKind(baseType) == nkSymbol):
+        return monoStripSpaces(plainName(baseType))
+    if stage1AstRefNonNil(baseType) && nodeKind(baseType) == nkBracketExpr && kidCount(baseType) > 0:
+        return monoStripSpaces(plainName(kid(baseType, 0)))
+    return ""
+
+fn monoTypeExprBaseName(ty: Node): str =
+    if nodeKind(ty) == nkBracketExpr && kidCount(ty) > 0:
+        return typeBaseName(kid(ty, 0))
+    return typeBaseName(ty)
+
+fn monoStripVarTypeKey(rawTy: Node, normalizedKey: str): str =
+    let stripTy: Node = monoStripVarType(rawTy)
+    if stripTy == rawTy:
+        return normalizedKey
+    return typeKey(monoNormalizeType(stripTy))
+
+fn monoNodeRawText(n: Node, textId: int32): str =
+    if textId > 0:
+        return tokenTextById(textId)
+    return nodeIdent(n)
+
+fn monoTypeLeafKeyValue(textId: int32, raw: str): str =
+    if len(raw) == 0:
+        return ""
+    if (textId > 0 && monoTextIdLooksSafeKey(textId)) || monoRawLooksSafeKey(raw):
+        return raw
+    return sanitizeKey(monoStripSpaces(raw))
+
+fn monoMangleBaseName(name: str): str =
+    if monoStrEq(name, "[]"):
+        return "bracket"
+    if monoStrEq(name, "[]="):
+        return "bracketEq"
+    if monoStrEq(name, ".."):
+        return "dotdot"
+    if monoStrEq(name, "..<"):
+        return "dotdotless"
+    if monoStrEq(name, "=>"):
+        return "arrow"
+    if monoStrEq(name, "."):
+        return "dot"
+    return name
+
+fn monoInstanceName(baseName: str, instArgs: Node[]): str =
+    if instArgs.len > 0:
+        return mangleInstance(baseName, instArgs)
+    return baseName
+
+fn monoHeadDisplayName(head: Node): str =
+    var headNameNode: Node = head
+    if stage1AstRefNonNil(head) && nodeKind(head) == nkDotExpr && kidCount(head) > 1:
+        headNameNode = kid(head, 1)
+    if stage1AstRefNonNil(headNameNode) && (nodeKind(headNameNode) == nkIdent || nodeKind(headNameNode) == nkSymbol):
+        return monoStripSpaces(plainName(headNameNode))
+    return ""
+
+fn monoDebugRootItemSuffix(raw: Node): str =
+    if !stage1AstRefNonNil(raw):
+        return ""
+    if nodeKind(raw) != nkFnDecl && nodeKind(raw) != nkIteratorDecl &&
+       nodeKind(raw) != nkTypeDecl && nodeKind(raw) != nkMacroDecl &&
+       nodeKind(raw) != nkTemplateDecl:
+        return ""
+    if kidCount(raw) <= 0:
+        return ""
+    let name0: str = getName(kid(raw, 0))
+    if len(name0) == 0:
+        return ""
+    return " name=" + name0
+
+fn monoWhereOpName(opNode: Node): str =
+    if stage1AstRefNonNil(opNode):
+        return monoStripSpaces(nodeIdent(opNode))
+    return ""
+
+fn monoSeqLenCapCalleeBase(memberName: str): str =
+    if monoStrEq(memberName, "len"):
+        return "setLen"
+    return "reserve"
+
+fn monoFieldKey(owner: str, fieldName: str): str =
+    var parts: str[] = []
+    add(parts, owner)
+    add(parts, ".")
+    add(parts, fieldName)
+    return strutils.join(parts, "")
+
+fn monoLambdaNameValue(counter: int32): str =
+    var parts: str[] = []
+    add(parts, "__cheng_lambda_")
+    add(parts, intToStr(counter))
+    return strutils.join(parts, "")
+
 fn monoEnsureInitMaps() =
     # Avoid stage0 seed global-init codegen bugs by initializing maps lazily.
     if genericTypeIndex.mask == 0:
@@ -307,9 +411,7 @@ fn monoDebugInstantiateEnabled(): bool =
     return monoDebugInstantiateMode == int8(1)
 
 fn monoDebugInstantiateWatchName(name: str): bool =
-    var tail: str = monoNameTail(name)
-    if len(tail) == 0:
-        tail = name
+    let tail: str = monoDebugWatchTail(name)
     if monoStrEq(tail, "Err"):
         return true
     if monoStrEq(tail, "Ok"):
@@ -424,16 +526,35 @@ fn monoProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
             top3Calls = get(callsSeq, i)
     if top1Ns <= 0:
         return ""
-    var msg: str = label
+    var parts: str[] = []
+    add(parts, label)
     let ms1: int32 = int32(top1Ns / 1000000)
-    msg = msg + " " + monoProfKindLabel(top1Idx) + "=" + intToStr(ms1) + "ms(" + intToStr(top1Calls) + ")"
+    add(parts, " ")
+    add(parts, monoProfKindLabel(top1Idx))
+    add(parts, "=")
+    add(parts, intToStr(ms1))
+    add(parts, "ms(")
+    add(parts, intToStr(top1Calls))
+    add(parts, ")")
     if top2Ns > 0:
         let ms2: int32 = int32(top2Ns / 1000000)
-        msg = msg + " " + monoProfKindLabel(top2Idx) + "=" + intToStr(ms2) + "ms(" + intToStr(top2Calls) + ")"
+        add(parts, " ")
+        add(parts, monoProfKindLabel(top2Idx))
+        add(parts, "=")
+        add(parts, intToStr(ms2))
+        add(parts, "ms(")
+        add(parts, intToStr(top2Calls))
+        add(parts, ")")
     if top3Ns > 0:
         let ms3: int32 = int32(top3Ns / 1000000)
-        msg = msg + " " + monoProfKindLabel(top3Idx) + "=" + intToStr(ms3) + "ms(" + intToStr(top3Calls) + ")"
-    return msg
+        add(parts, " ")
+        add(parts, monoProfKindLabel(top3Idx))
+        add(parts, "=")
+        add(parts, intToStr(ms3))
+        add(parts, "ms(")
+        add(parts, intToStr(top3Calls))
+        add(parts, ")")
+    return strutils.join(parts, "")
 
 fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node
 
@@ -737,7 +858,7 @@ fn monoFieldClear() =
 fn monoAddFieldType(owner: str, fieldName: str, typeNode: Node) =
     if len(owner) == 0 || len(fieldName) == 0 || stage1AstRefIsNil(typeNode):
         return
-    let key: str = owner + "." + fieldName
+    let key: str = monoFieldKey(owner, fieldName)
     var found: bool = false
     let idxPlus1: int32 = monoHashMapStrIntGetCompat(monoFieldIndex, key, found)
     if found && idxPlus1 > 0:
@@ -750,7 +871,7 @@ fn monoAddFieldType(owner: str, fieldName: str, typeNode: Node) =
 fn monoLookupFieldType(owner: str, fieldName: str): Node =
     if len(owner) == 0 || len(fieldName) == 0:
         return astInvalidNodeId()
-    let key: str = owner + "." + fieldName
+    let key: str = monoFieldKey(owner, fieldName)
     var found: bool = false
     let idxPlus1: int32 = monoHashMapStrIntGetCompat(monoFieldIndex, key, found)
     if found && idxPlus1 > 0 && idxPlus1 <= monoFieldTypes.len:
@@ -857,11 +978,7 @@ fn monoLookupExprType(n: Node): Node =
         let member: Node = kid(n, 1)
         let baseType0: Node = monoLookupExprType base
         var baseType: Node = monoStripPtrRefVar(monoNormalizeType(baseType0))
-        var owner: str = ""
-        if stage1AstRefNonNil(baseType) && (nodeKind(baseType) == nkIdent || nodeKind(baseType) == nkSymbol):
-            owner = monoStripSpaces(plainName(baseType))
-        elif stage1AstRefNonNil(baseType) && nodeKind(baseType) == nkBracketExpr && kidCount baseType > 0:
-            owner = monoStripSpaces(plainName(kid(baseType, 0)))
+        let owner: str = monoTypeOwnerName(baseType)
         if len owner > 0 && stage1AstRefNonNil(member):
             let fieldName: str = monoStripSpaces(plainName(member))
             let fieldTy: Node = monoLookupFieldType(owner, fieldName)
@@ -1029,20 +1146,10 @@ fn monoTypeMatches(paramTy: Node, baseTy: Node): bool =
     let paramKey: str = typeKey paramNorm
     if len paramKey > 0 && paramKey == baseKey:
         return true
-    let paramStrip: Node = monoStripVarType(paramTy)
-    var paramStripKey: str = ""
-    if paramStrip == paramTy:
-        paramStripKey = paramKey
-    else:
-        paramStripKey = typeKey(monoNormalizeType(paramStrip))
-        if len paramStripKey > 0 && paramStripKey == baseKey:
-            return true
-    let baseStrip: Node = monoStripVarType(baseTy)
-    var baseStripKey: str = ""
-    if baseStrip == baseTy:
-        baseStripKey = baseKey
-    else:
-        baseStripKey = typeKey(monoNormalizeType(baseStrip))
+    let paramStripKey: str = monoStripVarTypeKey(paramTy, paramKey)
+    if len paramStripKey > 0 && paramStripKey == baseKey:
+        return true
+    let baseStripKey: str = monoStripVarTypeKey(baseTy, baseKey)
     if len paramKey > 0 && paramKey == baseStripKey:
         return true
     if len paramStripKey > 0 && paramStripKey == baseStripKey:
@@ -1397,23 +1504,22 @@ fn monoMaybeLowerAssignToEqCall(lhs0: Node, rhs0: Node, rootStmts: Node[]*): Nod
     # Prefer explicit simple lvalues for assignment overloads.
     if stage1AstRefIsNil(lhs) || (nodeKind(lhs) != nkIdent && nodeKind(lhs) != nkSymbol):
         return astInvalidNodeId()
-    let name: str = "="
-    var genNode: Node = genericFnGet(name)
-    if stage1AstRefIsNil(genNode) && genericFnHas(name):
-        genNode = findGenericFnDecl(monoRoot, name)
+    var genNode: Node = genericFnGet("=")
+    if stage1AstRefIsNil(genNode) && genericFnHas("="):
+        genNode = findGenericFnDecl(monoRoot, "=")
         if stage1AstRefNonNil(genNode):
-            genericFnAdd(name, genNode)
+            genericFnAdd("=", genNode)
     if stage1AstRefIsNil(genNode):
         return astInvalidNodeId()
     var probeCall: Node = newNode(nkCall, nodePos(lhs))
-    addSon(probeCall, newIdent(name, nodePos(lhs)))
+    addSon(probeCall, newIdent("=", nodePos(lhs)))
     addSon(probeCall, lhs0)
     addSon(probeCall, rhs0)
     var instArgs: Node[4]
     if !monoInferGenericArgsFromCall(genNode, probeCall, instArgs):
         return astInvalidNodeId()
-    let instName: str = mangleInstance(name, instArgs)
-    if !instantiateFn(name, instArgs, rootStmts):
+    let instName: str = mangleInstance("=", instArgs)
+    if !instantiateFn("=", instArgs, rootStmts):
         return astInvalidNodeId()
     var callNode: Node = newNode(nkCall, nodePos(lhs))
     addSon(callNode, newIdent(instName, nodePos(lhs)))
@@ -1492,11 +1598,7 @@ fn monoTypeExprReturnsRefLikeValue(ty0: Node): bool =
         return false
     if nodeKind(ty) == nkRefTy || nodeKind(ty) == nkPtrTy || nodeKind(ty) == nkVarTy:
         return true
-    var baseName: str = ""
-    if nodeKind(ty) == nkBracketExpr && kidCount(ty) > 0:
-        baseName = typeBaseName(kid(ty, 0))
-    else:
-        baseName = typeBaseName(ty)
+    let baseName: str = monoTypeExprBaseName(ty)
     if len(baseName) == 0:
         return false
     let defNode: Node = monoUnwrapParType(monoTypeDeclDefByName(baseName))
@@ -1640,7 +1742,7 @@ fn monoMaybeLowerSeqLenCapAssign(stmt: Node, lhs: Node, rhs: Node, rootStmts: No
         return astInvalidNodeId()
     var instArgs: Node[1]
     add(instArgs, elemTy)
-    let calleeBase: str = monoStrEq(memberName, "len") ? "setLen" : "reserve"
+    let calleeBase: str = monoSeqLenCapCalleeBase(memberName)
     let instName: str = mangleInstance(calleeBase, instArgs)
     if !instantiateFn(calleeBase, instArgs, rootStmts):
         return astInvalidNodeId()
@@ -2198,23 +2300,31 @@ fn traitDispatchLookup(selfTy: Node, methodName: str): int32 =
 fn traitVtableKey(traitName: str, selfTy: Node, traitArgs: Node[]): str =
     if monoStrEq(traitName, ""):
         return ""
-    var key: str = traitName + "|" + typeKey selfTy
+    var parts: str[] = []
+    add(parts, traitName)
+    add(parts, "|")
+    add(parts, typeKey(selfTy))
     for i in 0..<traitArgs.len:
         let part: str = typeKey get(traitArgs, i)
         if monoStrNe(part, ""):
-            key = key + "|" + part
-    return key
+            add(parts, "|")
+            add(parts, part)
+    return strutils.join(parts, "")
 
 fn traitVtableName(traitName: str, selfTy: Node, traitArgs: Node[]): str =
-    var out: str = traitName + "__vtbl"
+    var parts: str[] = []
+    add(parts, traitName)
+    add(parts, "__vtbl")
     let sk: str = typeKey selfTy
     if monoStrNe(sk, ""):
-        out = out + "_" + sk
+        add(parts, "_")
+        add(parts, sk)
     for i in 0..<traitArgs.len:
         let part: str = typeKey get(traitArgs, i)
         if monoStrNe(part, ""):
-            out = out + "_" + part
-    return out
+            add(parts, "_")
+            add(parts, part)
+    return strutils.join(parts, "")
 
 fn traitVtableInitName(vtblName: str): str =
     if monoStrEq(vtblName, ""):
@@ -2374,14 +2484,13 @@ fn monoStripSpaces(s: str): str =
         if profOn:
             stripSpacesNs = stripSpacesNs + (cheng_monotime_ns() - startNs)
     if n <= 0:
-        let emptyRes: str = ""
-        trackLexStringStr(emptyRes)
-        add(monoStripValues, emptyRes)
+        trackLexStringStr("")
+        add(monoStripValues, "")
         let storedIdx: int32 = monoStripValues.len
         hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx)
         if ptrKey != 0:
             hashmaps.hashMapPtrIntPut(monoStripPtrIndex, ptrKey, storedIdx)
-        return emptyRes
+        return ""
     var a: int32 = 0
     var b: int32 = n - 1
     for _ in a..<(b + 1):
@@ -2393,14 +2502,13 @@ fn monoStripSpaces(s: str): str =
             break
         b = b - 1
     if b < a:
-        let emptyRes2: str = ""
-        trackLexStringStr(emptyRes2)
-        add(monoStripValues, emptyRes2)
+        trackLexStringStr("")
+        add(monoStripValues, "")
         let storedIdx2: int32 = monoStripValues.len
         hashmaps.hashMapStrIntPut(monoStripIndex, s, storedIdx2)
         if ptrKey != 0:
             hashmaps.hashMapPtrIntPut(monoStripPtrIndex, ptrKey, storedIdx2)
-        return emptyRes2
+        return ""
     if a == 0 && b == n - 1:
         trackLexStringStr(s)
         add(monoStripValues, s)
@@ -2420,7 +2528,7 @@ fn monoStripSpaces(s: str): str =
     return res
 
 fn nextLambdaName(): str =
-    let name: str = "__cheng_lambda_" + intToStr lambdaCounter
+    let name: str = monoLambdaNameValue(lambdaCounter)
     trackLexStringStr(name)
     lambdaCounter = lambdaCounter + 1
     return name
@@ -2699,16 +2807,15 @@ fn sanitizeKey(s: str): str =
         if ptrKey != 0:
             hashmaps.hashMapPtrIntPut(monoSanitizePtrIndex, ptrKey, cachedIdx)
         return get(monoSanitizeValues, cachedIdx - 1)
-    var out: str = ""
+    var parts: str[] = []
     for i in 0..<n:
         let c2: char = s[i]
         if (c2 >= 'a' && c2 <= 'z') ||(c2 >= 'A' && c2 <= 'Z') ||
            (c2 >= '0' && c2 <= '9') || c2 == '_':
-            out = out + charToStr c2
+            add(parts, charToStr(c2))
         else:
-            out = out + "_"
-    if len out == 0:
-        out = "anon"
+            add(parts, "_")
+    let out: str = monoChooseNonEmpty(strutils.join(parts, ""), "anon")
     add(monoSanitizeValues, out)
     let storedIdx: int32 = monoSanitizeValues.len
     hashmaps.hashMapStrIntPut(monoSanitizeIndex, s, storedIdx)
@@ -2803,12 +2910,14 @@ fn monoTextIdLooksSafeKey(textId: int32): bool =
 fn monoJoinKeyParts(base: str, parts: str[]): str =
     if parts.len == 0:
         return base
-    var out: str = base
+    var outParts: str[] = []
+    add(outParts, base)
     for i in 0..<parts.len:
         let part: str = get(parts, i)
         if len(part) > 0:
-            out = out + "_" + part
-    return out
+            add(outParts, "_")
+            add(outParts, part)
+    return strutils.join(outParts, "")
 
 fn monoJoinKeyPart(base: str, part: str): str =
     if len(part) == 0:
@@ -2835,13 +2944,8 @@ fn monoTypeLeafKey(n: Node): str =
         let idx0: int32 = int32(n)
         if idx0 >= 0 && idx0 < monoTypeLeafKeyReady.len && monoTypeLeafKeyReady[idx0] != 0:
             return get(monoTypeLeafKeyValues, idx0)
-    let raw: str = textId > 0 ? tokenTextById(textId) : nodeIdent(n)
-    var res: str = ""
-    if len(raw) > 0:
-        if (textId > 0 && monoTextIdLooksSafeKey(textId)) || monoRawLooksSafeKey(raw):
-            res = raw
-        else:
-            res = sanitizeKey(monoStripSpaces(raw))
+    let raw: str = monoNodeRawText(n, textId)
+    let res: str = monoTypeLeafKeyValue(textId, raw)
     if textId > 0:
         monoTypeLeafKeyEnsureTextCache(textId)
         if textId >= 0 && textId < monoTypeLeafTextReady.len:
@@ -2936,16 +3040,15 @@ fn typeKeyCore(n: Node): str =
                         return monoJoinKeyPart("seq", elemKey0)
                     return "seq"
             let base: Node = kid(n, 0)
-            var baseKey: str = typeKey base
+            let baseKey: str = typeKey base
             # `seq_fixed[T, N]` is treated as `seq[T]` for type identity.
             # The `N` parameter is an initialization hint (reserve cap), not a distinct type.
             if monoStrEq(baseKey, "seq_fixed"):
-                baseKey = "seq"
                 if kidCount n > 1:
                     let elemKey: str = typeKey kid(n, 1)
                     if len elemKey > 0:
-                        return monoJoinKeyPart(baseKey, elemKey)
-                return baseKey
+                        return monoJoinKeyPart("seq", elemKey)
+                return "seq"
             var parts: str[]
             parts.cap = kidCount(n)
             let argc: int32 = kidCount n
@@ -3221,9 +3324,8 @@ fn ensureTraitVtable(traitNode: Node, traitName: str, selfTy: Node, traitArgs: N
     addSon(initFn, fpInit)
     addSon(initFn, newIdent(vtblName, nodePos(traitNode)))
     var body: Node = newNode(nkStmtList, nodePos(traitNode))
-    let varName: str = "__vt"
     var vdecl: Node = newNode(nkVar, nodePos(traitNode))
-    addSon(vdecl, newIdent(varName, nodePos(traitNode)))
+    addSon(vdecl, newIdent("__vt", nodePos(traitNode)))
     addSon(vdecl, newIdent(vtblName, nodePos(traitNode)))
     var oc: Node = newNode(nkBracketExpr, nodePos(traitNode))
     addSon(oc, newIdent("default", nodePos(traitNode)))
@@ -3237,13 +3339,13 @@ fn ensureTraitVtable(traitNode: Node, traitName: str, selfTy: Node, traitArgs: N
         if monoStrNe(mname2, ""):
             var asg: Node = newNode(nkAsgn, nodePos(m2))
             var lhs: Node = newNode(nkDotExpr, nodePos(m2))
-            addSon(lhs, newIdent(varName, nodePos(m2)))
+            addSon(lhs, newIdent("__vt", nodePos(m2)))
             addSon(lhs, newIdent(mname2, nodePos(m2)))
             addSon(asg, lhs)
             addSon(asg, newIdent(mname2, nodePos(m2)))
             addSon(body, asg)
     var retNode: Node = newNode(nkReturn, nodePos(traitNode))
-    addSon(retNode, newIdent(varName, nodePos(traitNode)))
+    addSon(retNode, newIdent("__vt", nodePos(traitNode)))
     addSon(body, retNode)
     addSon(initFn, body)
     addSon(initFn, newNode(nkEmpty, nodePos(traitNode)))
@@ -3316,29 +3418,20 @@ fn checkTraitConstraints(generics: Node, mapNames: str[], mapTypes: Node[], root
                                     expRet = replaceTypeVars(kid(m, 2), substNames, substTypes)
                                 let impl: Node = findFnImpl(mname, expParams, expRet, rootStmts)
                                 if stage1AstRefIsNil(impl):
-                                    var msg: str = "missing implementation for "
+                                    var parts: str[] = []
+                                    add(parts, "missing implementation for ")
                                     if isConcept:
-                                        msg = msg + "concept "
+                                        add(parts, "concept ")
                                     else:
-                                        msg = msg + "trait "
-                                    msg = msg + baseName + "." + mname
-                                    addWhereDiag(nodePos(m), msg)
+                                        add(parts, "trait ")
+                                    add(parts, baseName)
+                                    add(parts, ".")
+                                    add(parts, mname)
+                                    addWhereDiag(nodePos(m), strutils.join(parts, ""))
                                 traitDispatchAdd(actualTy, mname, vtblName, initName, nodePos(m))
 
 fn mangleInstance(name: str, typeArgs: Node[]): str =
-    var base: str = name
-    if monoStrEq(base, "[]"):
-        base = "bracket"
-    elif monoStrEq(base, "[]="):
-        base = "bracketEq"
-    elif monoStrEq(base, ".."):
-        base = "dotdot"
-    elif monoStrEq(base, "..<"):
-        base = "dotdotless"
-    elif monoStrEq(base, "=>"):
-        base = "arrow"
-    elif monoStrEq(base, "."):
-        base = "dot"
+    let base: str = monoMangleBaseName(name)
     var keys: str[]
     keys.cap = typeArgs.len
     for i in 0..<typeArgs.len:
@@ -3519,9 +3612,7 @@ fn evalWhereExpr(expr: Node, names: str[], types: Node[]): int32 =
     of nkInfix:
         if kidCount expr > 2:
             let opn2: Node = kid(expr, 0)
-            var op: str = ""
-            if stage1AstRefNonNil(opn2):
-                op = monoStripSpaces nodeIdent(opn2)
+            let op: str = monoWhereOpName(opn2)
             if monoStrEq(op, "&&"):
                 let lhs: int32 = evalWhereExpr(kid(expr, 1), names, types)
                 let rhs: int32 = evalWhereExpr(kid(expr, 2), names, types)
@@ -3851,7 +3942,6 @@ fn instantiateLambda(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
     if stage1AstRefIsNil(lam):
         return astInvalidNodeId()
     let baseName: str = lambdaBaseName lam
-    var instName: str = baseName
     var generics: Node = astInvalidNodeId()
     if kidCount lam > 4:
         generics = kid(lam, 4)
@@ -3861,8 +3951,7 @@ fn instantiateLambda(lam: Node, typeArgs: Node[], rootStmts: Node[]*): Node =
         collectTypeArgMap(generics, typeArgs, mapNames, mapTypes)
     var instArgs: Node[4]
     buildFullTypeArgs(generics, mapNames, mapTypes, typeArgs, instArgs)
-    if instArgs.len > 0:
-        instName = mangleInstance(baseName, instArgs)
+    let instName: str = monoInstanceName(baseName, instArgs)
     let existing: str = instMapGet(instName)
     if len(existing) > 0:
         return newIdent(existing, nodePos(lam))
@@ -4446,12 +4535,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
                         add(args0, arg0)
                 return instantiateLambda(lam2, args0, rootStmts)
             if stage1AstRefNonNil(head) && (nodeKind(head) == nkIdent || nodeKind(head) == nkSymbol || nodeKind(head) == nkDotExpr):
-                var name: str = ""
-                var headNameNode: Node = head
-                if stage1AstRefNonNil(head) && nodeKind(head) == nkDotExpr && kidCount head > 1:
-                    headNameNode = kid(head, 1)
-                if stage1AstRefNonNil(headNameNode) && (nodeKind(headNameNode) == nkIdent || nodeKind(headNameNode) == nkSymbol):
-                    name = monoStripSpaces(plainName(headNameNode))
+                let name: str = monoHeadDisplayName(head)
                 if len name > 0:
                     let dbgTypeFilter: str = os.getEnvDefault("MONO_DEBUG_TYPE", "")
                     let dbgTypeHit: bool = len(dbgTypeFilter) > 0 && name == dbgTypeFilter
@@ -4566,9 +4650,7 @@ fn transform(n: Node, rootStmts: Node[]*, inTypeContext: bool = false): Node =
             let headFromBracket: bool = stage1AstRefNonNil(bracketHead)
             if headFromBracket:
                 head2 = bracketHead
-            var headName0: str = ""
-            if stage1AstRefNonNil(head2) && (nodeKind(head2) == nkIdent || nodeKind(head2) == nkSymbol):
-                headName0 = monoStripSpaces(plainName(head2))
+            let headName0: str = monoHeadDisplayName(head2)
             let isTypeCall: bool = (kidCount n == 2) && isDefiniteTypeCallee(head2)
             if monoStrEq(headName0, "new"):
                 var changedNew: bool = false
@@ -4987,11 +5069,7 @@ fn monomorphizeImpl(root: Node, diags: Diagnostic[]*): Node =
     for i in 0..<kidCount root:
         let raw: Node = kid(root, i)
         if monoDebugProgressEnabled():
-            var itemName: str = ""
-            if stage1AstRefNonNil(raw) && (nodeKind(raw) == nkFnDecl || nodeKind(raw) == nkIteratorDecl ||                              nodeKind(raw) == nkTypeDecl || nodeKind(raw) == nkMacroDecl ||                              nodeKind(raw) == nkTemplateDecl) && kidCount(raw) > 0:
-                let name0: str = getName(kid(raw, 0))
-                if len(name0) > 0:
-                    itemName = " name=" + name0
+            let itemName: str = monoDebugRootItemSuffix(raw)
             monoDebugProgress("transform.root.item.start i=" + intToStr(i) +
                               " kind=" + intToStr(int32(nodeKind(raw))) +
                               " line=" + intToStr(nodePos(raw).line) +
@@ -5067,115 +5145,116 @@ fn monomorphizeImpl(root: Node, diags: Diagnostic[]*): Node =
         let lambdaMs: int32 = int32(transformLambdaNs / 1000000)
         let callMs: int32 = int32(transformCallNs / 1000000)
         let seqLitMs: int32 = int32(transformSeqLitNs / 1000000)
-        var msg: str = "[mono] collect="
-        msg = msg + intToStr(collectMs)
-        msg = msg + "ms transform="
-        msg = msg + intToStr(transformMs)
-        msg = msg + "ms lower="
-        msg = msg + intToStr(lowerMs)
-        msg = msg + "ms total="
-        msg = msg + intToStr(totalMs)
-        msg = msg + "ms inst="
-        msg = msg + intToStr(instMapCount)
-        msg = msg + " genFns="
-        msg = msg + intToStr(genericFnNames.len)
-        msg = msg + " genTypes="
-        msg = msg + intToStr(genericTypeNames.len)
-        msg = msg + " typeKey="
-        msg = msg + intToStr(typeKeyMs)
-        msg = msg + "ms typeKeyCalls="
-        msg = msg + intToStr(typeKeyCalls)
-        msg = msg + " replaceTypeVars="
-        msg = msg + intToStr(replaceMs)
-        msg = msg + "ms replaceCalls="
-        msg = msg + intToStr(replaceTypeVarsCalls)
-        msg = msg + " instType="
-        msg = msg + intToStr(instTypeMs)
-        msg = msg + "ms instTypeCalls="
-        msg = msg + intToStr(instantiateTypeCalls)
-        msg = msg + " instFn="
-        msg = msg + intToStr(instFnMs)
-        msg = msg + "ms instFnCalls="
-        msg = msg + intToStr(instantiateFnCalls)
-        msg = msg + " monoMaybe="
-        msg = msg + intToStr(monoMaybeMs)
-        msg = msg + "ms monoMaybeCalls="
-        msg = msg + intToStr(monoMaybeCalls)
-        msg = msg + " monoMaybeScans="
-        msg = msg + intToStr(monoMaybeScans)
-        msg = msg + " lookup="
-        msg = msg + intToStr(lookupMs)
-        msg = msg + "ms lookupCalls="
-        msg = msg + intToStr(monoLookupExprTypeCalls)
-        msg = msg + " bind="
-        msg = msg + intToStr(bindMs)
-        msg = msg + "ms bindCalls="
-        msg = msg + intToStr(bindTypeVarsCalls)
-        msg = msg + " typeMatches="
-        msg = msg + intToStr(typeMatchesMs)
-        msg = msg + "ms typeMatchesCalls="
-        msg = msg + intToStr(monoTypeMatchesCalls)
-        msg = msg + " monoStripSpaces="
-        msg = msg + intToStr(stripMs)
-        msg = msg + "ms stripSpacesCalls="
-        msg = msg + intToStr(stripSpacesCalls)
-        msg = msg + " mapHas="
-        msg = msg + intToStr(mapHasMs)
-        msg = msg + "ms mapHasCalls="
-        msg = msg + intToStr(mapHasCalls)
-        msg = msg + " mapGet="
-        msg = msg + intToStr(mapGetMs)
-        msg = msg + "ms mapGetCalls="
-        msg = msg + intToStr(mapGetCalls)
-        msg = msg + " mapPut="
-        msg = msg + intToStr(mapPutMs)
-        msg = msg + "ms mapPutCalls="
-        msg = msg + intToStr(mapPutCalls)
-        msg = msg + " findGenericFnDecl="
-        msg = msg + intToStr(findGenericFnDeclMs)
-        msg = msg + "ms findGenericFnDeclCalls="
-        msg = msg + intToStr(findGenericFnDeclCalls)
-        msg = msg + " transformTotal="
-        msg = msg + intToStr(transformTotalMs)
-        msg = msg + "ms transformCalls="
-        msg = msg + intToStr(transformCalls)
-        msg = msg + " fallback="
-        msg = msg + intToStr(fallbackMs)
-        msg = msg + "ms fallbackCalls="
-        msg = msg + intToStr(transformFallbackCalls)
-        msg = msg + " module="
-        msg = msg + intToStr(moduleMs)
-        msg = msg + "ms moduleCalls="
-        msg = msg + intToStr(transformModuleCalls)
-        msg = msg + " typeDecl="
-        msg = msg + intToStr(typeDeclMs)
-        msg = msg + "ms typeDeclCalls="
-        msg = msg + intToStr(transformTypeDeclCalls)
-        msg = msg + " fnDecl="
-        msg = msg + intToStr(fnDeclMs)
-        msg = msg + "ms fnDeclCalls="
-        msg = msg + intToStr(transformFnDeclCalls)
-        msg = msg + " let="
-        msg = msg + intToStr(letMs)
-        msg = msg + "ms letCalls="
-        msg = msg + intToStr(transformLetCalls)
-        msg = msg + " bracket="
-        msg = msg + intToStr(bracketMs)
-        msg = msg + "ms bracketCalls="
-        msg = msg + intToStr(transformBracketCalls)
-        msg = msg + " lambda="
-        msg = msg + intToStr(lambdaMs)
-        msg = msg + "ms lambdaCalls="
-        msg = msg + intToStr(transformLambdaCalls)
-        msg = msg + " call="
-        msg = msg + intToStr(callMs)
-        msg = msg + "ms callCalls="
-        msg = msg + intToStr(transformCallCalls)
-        msg = msg + " seqLit="
-        msg = msg + intToStr(seqLitMs)
-        msg = msg + "ms seqLitCalls="
-        msg = msg + intToStr(transformSeqLitCalls)
-        echo msg
+        var msgParts: str[] = []
+        add(msgParts, "[mono] collect=")
+        add(msgParts, intToStr(collectMs))
+        add(msgParts, "ms transform=")
+        add(msgParts, intToStr(transformMs))
+        add(msgParts, "ms lower=")
+        add(msgParts, intToStr(lowerMs))
+        add(msgParts, "ms total=")
+        add(msgParts, intToStr(totalMs))
+        add(msgParts, "ms inst=")
+        add(msgParts, intToStr(instMapCount))
+        add(msgParts, " genFns=")
+        add(msgParts, intToStr(genericFnNames.len))
+        add(msgParts, " genTypes=")
+        add(msgParts, intToStr(genericTypeNames.len))
+        add(msgParts, " typeKey=")
+        add(msgParts, intToStr(typeKeyMs))
+        add(msgParts, "ms typeKeyCalls=")
+        add(msgParts, intToStr(typeKeyCalls))
+        add(msgParts, " replaceTypeVars=")
+        add(msgParts, intToStr(replaceMs))
+        add(msgParts, "ms replaceCalls=")
+        add(msgParts, intToStr(replaceTypeVarsCalls))
+        add(msgParts, " instType=")
+        add(msgParts, intToStr(instTypeMs))
+        add(msgParts, "ms instTypeCalls=")
+        add(msgParts, intToStr(instantiateTypeCalls))
+        add(msgParts, " instFn=")
+        add(msgParts, intToStr(instFnMs))
+        add(msgParts, "ms instFnCalls=")
+        add(msgParts, intToStr(instantiateFnCalls))
+        add(msgParts, " monoMaybe=")
+        add(msgParts, intToStr(monoMaybeMs))
+        add(msgParts, "ms monoMaybeCalls=")
+        add(msgParts, intToStr(monoMaybeCalls))
+        add(msgParts, " monoMaybeScans=")
+        add(msgParts, intToStr(monoMaybeScans))
+        add(msgParts, " lookup=")
+        add(msgParts, intToStr(lookupMs))
+        add(msgParts, "ms lookupCalls=")
+        add(msgParts, intToStr(monoLookupExprTypeCalls))
+        add(msgParts, " bind=")
+        add(msgParts, intToStr(bindMs))
+        add(msgParts, "ms bindCalls=")
+        add(msgParts, intToStr(bindTypeVarsCalls))
+        add(msgParts, " typeMatches=")
+        add(msgParts, intToStr(typeMatchesMs))
+        add(msgParts, "ms typeMatchesCalls=")
+        add(msgParts, intToStr(monoTypeMatchesCalls))
+        add(msgParts, " monoStripSpaces=")
+        add(msgParts, intToStr(stripMs))
+        add(msgParts, "ms stripSpacesCalls=")
+        add(msgParts, intToStr(stripSpacesCalls))
+        add(msgParts, " mapHas=")
+        add(msgParts, intToStr(mapHasMs))
+        add(msgParts, "ms mapHasCalls=")
+        add(msgParts, intToStr(mapHasCalls))
+        add(msgParts, " mapGet=")
+        add(msgParts, intToStr(mapGetMs))
+        add(msgParts, "ms mapGetCalls=")
+        add(msgParts, intToStr(mapGetCalls))
+        add(msgParts, " mapPut=")
+        add(msgParts, intToStr(mapPutMs))
+        add(msgParts, "ms mapPutCalls=")
+        add(msgParts, intToStr(mapPutCalls))
+        add(msgParts, " findGenericFnDecl=")
+        add(msgParts, intToStr(findGenericFnDeclMs))
+        add(msgParts, "ms findGenericFnDeclCalls=")
+        add(msgParts, intToStr(findGenericFnDeclCalls))
+        add(msgParts, " transformTotal=")
+        add(msgParts, intToStr(transformTotalMs))
+        add(msgParts, "ms transformCalls=")
+        add(msgParts, intToStr(transformCalls))
+        add(msgParts, " fallback=")
+        add(msgParts, intToStr(fallbackMs))
+        add(msgParts, "ms fallbackCalls=")
+        add(msgParts, intToStr(transformFallbackCalls))
+        add(msgParts, " module=")
+        add(msgParts, intToStr(moduleMs))
+        add(msgParts, "ms moduleCalls=")
+        add(msgParts, intToStr(transformModuleCalls))
+        add(msgParts, " typeDecl=")
+        add(msgParts, intToStr(typeDeclMs))
+        add(msgParts, "ms typeDeclCalls=")
+        add(msgParts, intToStr(transformTypeDeclCalls))
+        add(msgParts, " fnDecl=")
+        add(msgParts, intToStr(fnDeclMs))
+        add(msgParts, "ms fnDeclCalls=")
+        add(msgParts, intToStr(transformFnDeclCalls))
+        add(msgParts, " let=")
+        add(msgParts, intToStr(letMs))
+        add(msgParts, "ms letCalls=")
+        add(msgParts, intToStr(transformLetCalls))
+        add(msgParts, " bracket=")
+        add(msgParts, intToStr(bracketMs))
+        add(msgParts, "ms bracketCalls=")
+        add(msgParts, intToStr(transformBracketCalls))
+        add(msgParts, " lambda=")
+        add(msgParts, intToStr(lambdaMs))
+        add(msgParts, "ms lambdaCalls=")
+        add(msgParts, intToStr(transformLambdaCalls))
+        add(msgParts, " call=")
+        add(msgParts, intToStr(callMs))
+        add(msgParts, "ms callCalls=")
+        add(msgParts, intToStr(transformCallCalls))
+        add(msgParts, " seqLit=")
+        add(msgParts, intToStr(seqLitMs))
+        add(msgParts, "ms seqLitCalls=")
+        add(msgParts, intToStr(transformSeqLitCalls))
+        echo strutils.join(msgParts, "")
         let exprTop: str = monoProfTopKinds(monoProfExprKindNs, monoProfExprKindCalls, "[mono-expr-top]")
         if len exprTop > 0:
             echo exprTop

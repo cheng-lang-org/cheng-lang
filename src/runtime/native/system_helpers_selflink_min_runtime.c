@@ -1831,10 +1831,13 @@ CHENG_MINRT_WEAK int32_t driver_c_link_tmp_obj_default(const char *output_path, 
   const char *target_text = (target != NULL) ? target : "";
   const char *linker_text = (linker != NULL && linker[0] != '\0') ? linker : "system";
   const char *runtime_c = "/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c";
+  const char *runtime_obj = getenv("BACKEND_RUNTIME_OBJ");
+  const char *runtime_input = runtime_c;
   const char *cflags = getenv("BACKEND_CFLAGS");
   const char *ldflags = getenv("BACKEND_LDFLAGS");
   const char *cflags_text = (cflags != NULL) ? cflags : "";
   const char *ldflags_text = (ldflags != NULL) ? ldflags : "";
+  const char *fast_darwin_adhoc_raw = getenv("BACKEND_DARWIN_FAST_ADHOC");
   char full_ldflags[512];
   char extra_ldflags[96];
   full_ldflags[0] = '\0';
@@ -1842,14 +1845,24 @@ CHENG_MINRT_WEAK int32_t driver_c_link_tmp_obj_default(const char *output_path, 
   if (output_path == NULL || output_path[0] == '\0') return -20;
   if (obj_path == NULL || obj_path[0] == '\0') return -21;
   if (strcmp(linker_text, "system") != 0) return -22;
+  if (driver_c_env_bool("BACKEND_NO_RUNTIME_C", 0) != 0 &&
+      runtime_obj != NULL && runtime_obj[0] != '\0' &&
+      access(runtime_obj, R_OK) == 0) {
+    runtime_input = runtime_obj;
+  }
   const char *base = strrchr(obj_path, '/');
   const char *obj_name = (base != NULL) ? (base + 1) : obj_path;
   int use_driver_entry_shim = strstr(obj_name, "backend_driver") != NULL ||
                               driver_c_env_bool("BACKEND_FORCE_DRIVER_ENTRY_SHIM", 0) != 0;
   int needs_darwin_codesign = 0;
+  int fast_darwin_adhoc =
+      (fast_darwin_adhoc_raw != NULL && fast_darwin_adhoc_raw[0] != '\0')
+          ? driver_c_env_bool("BACKEND_DARWIN_FAST_ADHOC", 0)
+          : driver_c_env_bool("BACKEND_FAST_DEV_PROFILE", 0);
   if (strstr(target_text, "darwin") != NULL || strstr(target_text, "apple-darwin") != NULL) {
-    needs_darwin_codesign = 1;
-    if (strstr(ldflags_text, "-Wl,-no_adhoc_codesign") == NULL) {
+    if (strstr(ldflags_text, "-Wl,-no_adhoc_codesign") != NULL) fast_darwin_adhoc = 0;
+    needs_darwin_codesign = fast_darwin_adhoc ? 0 : 1;
+    if (!fast_darwin_adhoc && strstr(ldflags_text, "-Wl,-no_adhoc_codesign") == NULL) {
       snprintf(extra_ldflags + strlen(extra_ldflags),
                sizeof(extra_ldflags) - strlen(extra_ldflags),
                " -Wl,-no_adhoc_codesign");
@@ -1861,21 +1874,23 @@ CHENG_MINRT_WEAK int32_t driver_c_link_tmp_obj_default(const char *output_path, 
     }
   }
   snprintf(full_ldflags, sizeof(full_ldflags), "%s%s", ldflags_text, extra_ldflags);
-  size_t need = strlen(obj_path) + strlen(runtime_c) + strlen(output_path) +
+  size_t need = strlen(obj_path) + strlen(runtime_input) + strlen(output_path) +
                 strlen(cflags_text) + strlen(ldflags_text) + strlen(extra_ldflags) + 128u;
   char *cmd = (char *)malloc(need);
   if (cmd == NULL) return -23;
   if (use_driver_entry_shim) {
     snprintf(cmd, need, "cc -DCHENG_BACKEND_DRIVER_ENTRY_SHIM %s '%s' '%s' %s -o '%s'",
-             cflags_text, obj_path, runtime_c, full_ldflags, output_path);
+             cflags_text, obj_path, runtime_input, full_ldflags, output_path);
   } else {
     snprintf(cmd, need, "cc %s '%s' '%s' %s -o '%s'",
-             cflags_text, obj_path, runtime_c, full_ldflags, output_path);
+             cflags_text, obj_path, runtime_input, full_ldflags, output_path);
   }
   if (getenv("BACKEND_DEBUG_LINK_CMD") != NULL) {
     fprintf(stderr, "[driver_c_link_tmp_obj_default] obj=%s out=%s target=%s sidecar=<bundle-only>\n",
             obj_path, output_path, target_text);
     fprintf(stderr, "[driver_c_link_tmp_obj_default] cmd=%s\n", cmd);
+    fprintf(stderr, "[driver_c_link_tmp_obj_default] darwin_fast_adhoc=%d needs_codesign=%d\n",
+            fast_darwin_adhoc, needs_darwin_codesign);
     fflush(stderr);
   }
   int rc = system(cmd);
@@ -2031,7 +2046,6 @@ static int32_t driver_c_sidecar_builds_requested(void) {
 
 static int32_t driver_c_prefer_sidecar_builds(void) {
   int32_t prefer = driver_c_sidecar_builds_requested();
-  if (prefer != 0) driver_c_apply_default_proof_sidecar_compiler();
   return prefer;
 }
 
@@ -2920,7 +2934,7 @@ int32_t cheng_fgetc(void *stream) {
 
 int32_t cheng_fd_write(int32_t fd, const char *data, int32_t len) {
   if (fd < 0 || data == NULL || len <= 0) return 0;
-  ssize_t n = (ssize_t)syscall(SYS_write, fd, data, (size_t)len);
+  ssize_t n = write(fd, data, (size_t)len);
   if (n < 0) return -1;
   return (int32_t)n;
 }

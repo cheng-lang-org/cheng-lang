@@ -93,6 +93,41 @@ is_list_cmd() {
   return 1
 }
 
+tooling_lower_ascii() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
+tooling_is_true() {
+  case "$(tooling_lower_ascii "$(printf '%s' "${1:-}" | tr -d '[:space:]')")" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+tooling_build_global_force_direct() {
+  first_arg_local="${1:-}"
+  shift || true
+  case "$first_arg_local" in
+    build-global|build_global) ;;
+    *) return 1 ;;
+  esac
+  if [ "$(tooling_lower_ascii "${TOOLING_BUILD_GLOBAL_STAGE0_ROUTE:-}")" = "direct" ]; then
+    return 0
+  fi
+  if tooling_is_true "${TOOLING_BUILD_GLOBAL_PREFER_CURRENTSRC_PROOF:-0}"; then
+    return 0
+  fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --driver:*)
+        return 0
+        ;;
+    esac
+    shift
+  done
+  return 1
+}
+
 root="$(resolve_root "$script_dir" || true)"
 repo_wrapper=""
 primary_launcher_src=""
@@ -154,6 +189,18 @@ run_one() {
   bin="$1"
   shift || true
   [ -x "$bin" ] || return 127
+  if tooling_build_global_force_direct "$@"; then
+    env \
+      TOOLING_SELF_BIN="$bin" \
+      TOOLING_BUILD_GLOBAL_STAGE0_ROUTE=direct \
+      BACKEND_UIR_SIDECAR_DISABLE=1 \
+      BACKEND_UIR_PREFER_SIDECAR=0 \
+      BACKEND_UIR_FORCE_SIDECAR=0 \
+      BACKEND_UIR_SIDECAR_COMPILER= \
+      BACKEND_UIR_SIDECAR_BUNDLE= \
+      "$bin" "$@"
+    return $?
+  fi
   env TOOLING_SELF_BIN="$bin" "$bin" "$@"
 }
 

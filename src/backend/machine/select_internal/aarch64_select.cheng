@@ -1,6 +1,7 @@
 # AArch64 instruction selection: UIR -> Machine facade (MVP).
 import std/seqs
 import std/strings
+import std/strutils
 import std/result
 import std/os
 import std/rawmem_support
@@ -157,12 +158,15 @@ fn iselDebugExpr(expr: UirExpr): str =
     if kind == meGlobalAddr:
         return "&" + uirExprGlobalNameOf(expr)
     if kind == meCall:
-        var out: str = iselExprCalleeSafe(expr) + "("
+        var parts: str[]
+        seqs.add(parts, iselExprCalleeSafe(expr))
+        seqs.add(parts, "(")
         for i in 0..<uirExprArgsLen(expr):
             if i > 0:
-                out = out + ", "
-            out = out + iselDebugExpr(uirExprArgAt(expr, i))
-        return out + ")"
+                seqs.add(parts, ", ")
+            seqs.add(parts, iselDebugExpr(uirExprArgAt(expr, i)))
+        seqs.add(parts, ")")
+        return strutils.join(parts, "")
     if kind == meCast:
         return "cast(" + iselDebugExpr(uirExprCastExprOf(expr)) + ")"
     if kind == meBin:
@@ -203,18 +207,27 @@ fn iselDebugDumpFuncUir(func: UirFunc) =
         for si in 0..<uirBlockStmtsLen(blk):
             let st: UirStmt = uirBlockStmtAt(blk, si)
             let sk: UirStmtKind = uirStmtKindOf(st)
-            var msg: str = "[isel.dump]     stmt[" + intToStr(si) + "] kind=" +
-                           intToStr(int32(sk)) +
-                           " slot=" + intToStr(uirStmtSlotOf(st)) +
-                           " name=" + uirStmtNameOf(st)
+            var msgParts: str[]
+            seqs.add(msgParts, "[isel.dump]     stmt[")
+            seqs.add(msgParts, intToStr(si))
+            seqs.add(msgParts, "] kind=")
+            seqs.add(msgParts, intToStr(int32(sk)))
+            seqs.add(msgParts, " slot=")
+            seqs.add(msgParts, intToStr(uirStmtSlotOf(st)))
+            seqs.add(msgParts, " name=")
+            seqs.add(msgParts, uirStmtNameOf(st))
             if sk == msParam:
-                msg = msg + " paramIndex=" + intToStr(uirStmtParamIndexOf(st))
+                seqs.add(msgParts, " paramIndex=")
+                seqs.add(msgParts, intToStr(uirStmtParamIndexOf(st)))
             if sk == msStore:
-                msg = msg + " addr=" + iselDebugExpr(uirStmtAddrExprOf(st)) +
-                      " expr=" + iselDebugExpr(uirStmtExprOf(st))
+                seqs.add(msgParts, " addr=")
+                seqs.add(msgParts, iselDebugExpr(uirStmtAddrExprOf(st)))
+                seqs.add(msgParts, " expr=")
+                seqs.add(msgParts, iselDebugExpr(uirStmtExprOf(st)))
             elif sk == msExpr || sk == msLet || sk == msVar || sk == msAssign:
-                msg = msg + " expr=" + iselDebugExpr(uirStmtExprOf(st))
-            echo(msg)
+                seqs.add(msgParts, " expr=")
+                seqs.add(msgParts, iselDebugExpr(uirStmtExprOf(st)))
+            echo(strutils.join(msgParts, ""))
         let term: UirTerm = uirBlockTermOf(blk)
         if uirTermKindOf(term) == mtRet:
             echo("[isel.dump]     term ret " + iselDebugExpr(uirTermRetExprOf(term)))
@@ -739,12 +752,13 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc,
     let dbgExpr: bool = strings.streq(os.getEnvDefault("BACKEND_DEBUG_ISEL_EXPR", ""), "1")
     if dbgExpr:
         let k: int32 = int32(uirExprKindOf(expr))
-        var calleeDbg: str = ""
+        var calleeDbg: str
+        machineCoreSetEmpty(calleeDbg)
         var argCountDbg: int32 = 0
         var lhsDbg: int32 = 0
         var rhsDbg: int32 = 0
         if uirExprKindOf(expr) == meCall:
-            calleeDbg = iselExprCalleeSafe(expr)
+            machineCoreSetStr(calleeDbg, iselExprCalleeSafe(expr))
             argCountDbg = uirExprArgsLen(expr)
             lhsDbg = uirExprLhsOf(expr)
             rhsDbg = uirExprRhsOf(expr)
@@ -771,12 +785,14 @@ fn iselEmitExprInner(func: MachineFunc, module: UirModule, uirFunc: UirFunc,
         var callee: UirFunc = nil
         if len(calleeName0) > 0:
             callee = iselFindFunc(module, calleeName0)
-        var callName: str = calleeName0
-        var calleeLinkName: str = ""
+        var callName: str
+        machineCoreSetStr(callName, calleeName0)
+        var calleeLinkName: str
+        machineCoreSetEmpty(calleeLinkName)
         if callee != nil:
-            calleeLinkName = iselFuncLinkNameSafe(callee)
+            machineCoreSetStr(calleeLinkName, iselFuncLinkNameSafe(callee))
         if callee != nil && len(calleeLinkName) > 0:
-            callName = calleeLinkName
+            machineCoreSetStr(callName, calleeLinkName)
         let callSym0: str = iselStripTargetSymPrefixOnce(uirModuleTargetOf(module), callName)
         let callSymRes: Result[str] = iselRequireNamedSymbol("call", uirFunc, expr, callName, callSym0)
         if !IsOk[str](callSymRes):
@@ -1236,12 +1252,11 @@ fn iselEmitStmt(func: MachineFunc, module: UirModule, stmt: UirStmt, uirFunc: Ui
                                  dst, tmp, scratch, baseReg)
     let funcName: str = iselFuncBestName(uirFunc)
     let stmtNameRaw: str = uirStmtNameOf(stmt)
-    let stmtName: str = len(stmtNameRaw) > 0 ? stmtNameRaw : ""
-    let msg: str = "isel: unsupported stmt kind=" + intToStr(int32(stmtKind)) +
-                   " slot=" + intToStr(stmtSlot) +
-                   " name=" + stmtName +
-                   " func=" + funcName
-    return Err[int32](msg)
+    let stmtName: str = strings.__cheng_str_clone(stmtNameRaw)
+    return Err[int32]("isel: unsupported stmt kind=" + intToStr(int32(stmtKind)) +
+                      " slot=" + intToStr(stmtSlot) +
+                      " name=" + stmtName +
+                      " func=" + funcName)
 
 fn iselEmitCondBranch(func: MachineFunc, module: UirModule, uirFunc: UirFunc,
                       labelState: LabelState, expr: UirExpr, retType: UirLowerType,

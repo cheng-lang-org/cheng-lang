@@ -108,13 +108,18 @@ def iter_cheng_files(path: Path):
         yield from sorted(path.rglob("*.cheng"))
 
 
-def collect_label_map(src_root: Path | None, extra_paths: list[Path]) -> dict[str, bytes]:
+def collect_label_map(
+    src_root: Path | None,
+    extra_paths: list[Path],
+    needed_labels: set[str] | None = None,
+) -> dict[str, bytes]:
     out: dict[str, bytes] = {"L_cheng_str_0000000000000000": b""}
     seen: set[Path] = set()
     scan_roots: list[Path] = []
     scan_roots.extend(extra_paths)
     if src_root is not None and src_root.exists():
         scan_roots.append(src_root)
+    remaining = None if needed_labels is None else set(needed_labels) - set(out)
     for root in scan_roots:
         for path in iter_cheng_files(root):
             try:
@@ -130,8 +135,15 @@ def collect_label_map(src_root: Path | None, extra_paths: list[Path]) -> dict[st
                 continue
             for lit in iter_literals(content):
                 label = f"L_cheng_str_{fnv1a64(lit):016x}"
-                if label not in out:
-                    out[label] = lit
+                if label in out:
+                    continue
+                if remaining is not None and label not in remaining:
+                    continue
+                out[label] = lit
+                if remaining is not None:
+                    remaining.discard(label)
+                    if not remaining:
+                        return out
     return out
 
 
@@ -337,6 +349,18 @@ def patch_object(obj_path: Path, label_map: dict[str, bytes]) -> tuple[int, int]
     return patched, skipped
 
 
+def required_patch_labels(obj_path: Path) -> set[str]:
+    blob = obj_path.read_bytes()
+    try:
+        (section_addr, section_size, _section_offset), symtab = parse_macho64_layout(blob)
+    except SystemExit as exc:
+        if str(exc) == "missing __TEXT,__cstring section":
+            return set()
+        raise
+    labels = parse_label_symbols(blob, section_addr, section_size, symtab)
+    return {label for label, _addr, _entry_off in labels}
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-root", required=True)
@@ -356,15 +380,26 @@ def main() -> int:
     repo_root = Path(args.repo_root).resolve()
     src_root = (repo_root / args.src_root).resolve()
     extra_paths = [Path(raw).resolve() for raw in args.extra_source if raw]
+    patch_obj_path = Path(args.patch_obj).resolve() if args.patch_obj else None
+    needed_labels: set[str] | None = None
 
     label_map: dict[str, bytes] = {"L_cheng_str_0000000000000000": b""}
+    if patch_obj_path is not None:
+        if not patch_obj_path.exists():
+            sys.stderr.write(f"missing object: {patch_obj_path}\n")
+            return 2
+        needed_labels = required_patch_labels(patch_obj_path)
+        if not needed_labels:
+            patched, skipped = patch_object(patch_obj_path, label_map)
+            print(f"patch_macho_cstrings: patched={patched} skipped={skipped} obj={patch_obj_path}")
+            return 0
     if not args.labels_only:
         if not src_root.exists():
             sys.stderr.write(f"missing src root: {src_root}\n")
             return 2
-        label_map = collect_label_map(src_root, extra_paths)
+        label_map = collect_label_map(src_root, extra_paths, needed_labels)
     elif extra_paths:
-        label_map.update(collect_label_map(None, extra_paths))
+        label_map.update(collect_label_map(None, extra_paths, needed_labels))
     if args.labels_file:
         labels_file = Path(args.labels_file).resolve()
         for label in load_labels_file(labels_file):
@@ -372,12 +407,9 @@ def main() -> int:
                 label_map[label] = b""
 
     if args.patch_obj:
-        obj_path = Path(args.patch_obj).resolve()
-        if not obj_path.exists():
-            sys.stderr.write(f"missing object: {obj_path}\n")
-            return 2
-        patched, skipped = patch_object(obj_path, label_map)
-        print(f"patch_macho_cstrings: patched={patched} skipped={skipped} obj={obj_path}")
+        assert patch_obj_path is not None
+        patched, skipped = patch_object(patch_obj_path, label_map)
+        print(f"patch_macho_cstrings: patched={patched} skipped={skipped} obj={patch_obj_path}")
         return 0
 
     out_asm = Path(args.out_asm).resolve()

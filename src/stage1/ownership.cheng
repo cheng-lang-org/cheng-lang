@@ -2,6 +2,7 @@
 # Stage1: ORC ownership analysis (minimal v1).
 import std/strings
 import std/seqs
+import std/strutils
 import stage1/ast
 import std/rawmem_support
 
@@ -733,20 +734,39 @@ fn ownProfTopKinds(nsSeq: int64[], callsSeq: int32[], label: str): str =
         elif ns > top3Ns:
             top3Ns = ns
             top3Idx = idx
-    var msg: str = label
+    var parts: str[] = []
+    add(parts, label)
     if top1Idx >= 0 && top1Ns > 0:
         let ms1: int32 = int32(top1Ns / 1000000)
         let c1: int32 = ownReadI32(callsSeq, top1Idx)
-        msg = msg + " " + ownProfKindLabel(top1Idx) + "=" + intToStr(ms1) + "ms(" + intToStr(c1) + ")"
+        add(parts, " ")
+        add(parts, ownProfKindLabel(top1Idx))
+        add(parts, "=")
+        add(parts, intToStr(ms1))
+        add(parts, "ms(")
+        add(parts, intToStr(c1))
+        add(parts, ")")
     if top2Idx >= 0 && top2Ns > 0:
         let ms2: int32 = int32(top2Ns / 1000000)
         let c2: int32 = ownReadI32(callsSeq, top2Idx)
-        msg = msg + " " + ownProfKindLabel(top2Idx) + "=" + intToStr(ms2) + "ms(" + intToStr(c2) + ")"
+        add(parts, " ")
+        add(parts, ownProfKindLabel(top2Idx))
+        add(parts, "=")
+        add(parts, intToStr(ms2))
+        add(parts, "ms(")
+        add(parts, intToStr(c2))
+        add(parts, ")")
     if top3Idx >= 0 && top3Ns > 0:
         let ms3: int32 = int32(top3Ns / 1000000)
         let c3: int32 = ownReadI32(callsSeq, top3Idx)
-        msg = msg + " " + ownProfKindLabel(top3Idx) + "=" + intToStr(ms3) + "ms(" + intToStr(c3) + ")"
-    return msg
+        add(parts, " ")
+        add(parts, ownProfKindLabel(top3Idx))
+        add(parts, "=")
+        add(parts, intToStr(ms3))
+        add(parts, "ms(")
+        add(parts, intToStr(c3))
+        add(parts, ")")
+    return strutils.join(parts, "")
 
 fn ownLValueIdentName(n: Node): str =
     if stage1AstRefIsNil(n):
@@ -758,6 +778,21 @@ fn ownLValueIdentName(n: Node): str =
         cur = kid(cur, 0)
     if nodeKind(cur) == nkIdent || nodeKind(cur) == nkSymbol:
         return ownStripSpaces nodeIdent(cur)
+    return ""
+
+fn ownStmtLhsName(s: Node): str =
+    if stage1AstRefIsNil(s):
+        return ""
+    if nodeKind(s) == nkVar || nodeKind(s) == nkLet || nodeKind(s) == nkConst:
+        if kidCount s > 0:
+            var lhsNode: Node = kid(s, 0)
+            if stage1AstRefNonNil(lhsNode) && nodeKind(lhsNode) == nkPattern && kidCount lhsNode > 0:
+                lhsNode = kid(lhsNode, 0)
+            return ownLValueIdentName(lhsNode)
+        return ""
+    if nodeKind(s) == nkAsgn || nodeKind(s) == nkFastAsgn:
+        if kidCount s > 0:
+            return ownLValueIdentName(kid(s, 0))
     return ""
 
 fn ownNodeHasIdentNorm(n: Node, norm: str): bool =
@@ -1263,23 +1298,18 @@ fn ownershipMarkMovesInStmtListWithOuter(list: Node, outerKeys: OwnSeenSet) =
                     if stage1AstRefNonNil(child2) && nodeKind(child2) == nkStmtList:
                         ownershipMarkMovesInStmtListWithOuter(child2, seenKeys)
             var rhs: Node = astInvalidNodeId()
-            var lhsName: str = ""
+            let lhsName: str = ownStmtLhsName(s)
             ownSeenMapReset(lhsNames)
             case nodeKind(s)
             of nkVar, nkLet, nkConst:
                 if kidCount s > 2:
                     rhs = kid(s, 2)
                 if kidCount s > 0:
-                    var lhsNode: Node = kid(s, 0)
-                    if stage1AstRefNonNil(lhsNode) && nodeKind(lhsNode) == nkPattern && kidCount lhsNode > 0:
-                        lhsNode = kid(lhsNode, 0)
-                    lhsName = ownLValueIdentName lhsNode
                     ownCollectLValueNamesProfiled(kid(s, 0), lhsNames)
             of nkAsgn, nkFastAsgn:
                 if kidCount s > 1:
                     rhs = kid(s, 1)
                 if kidCount s > 0:
-                    lhsName = ownLValueIdentName kid(s, 0)
                     ownCollectLValueNamesProfiled(kid(s, 0), lhsNames)
             if stage1AstRefNonNil(rhs):
                 let rhsId: Node = ownExprIdentNode rhs
@@ -1833,46 +1863,48 @@ fn ownershipAnalyzeImpl(root: Node) =
     ownershipAnalyzeNode root
     if profOn:
         profAnalyze = cheng_monotime_ns() - profMark
-        var msg: str = "[ownership] markMoves="
         let markMs: int64 = profMarkMoves / 1000000
-        msg = msg + int64ToStr(markMs)
-        msg = msg + "ms analyze="
         let analyzeMs: int64 = profAnalyze / 1000000
-        msg = msg + int64ToStr(analyzeMs)
-        msg = msg + "ms"
-        echo msg
-        var detail: str = "[ownership-detail] ident="
+        var msgParts: str[] = []
+        add(msgParts, "[ownership] markMoves=")
+        add(msgParts, int64ToStr(markMs))
+        add(msgParts, "ms analyze=")
+        add(msgParts, int64ToStr(analyzeMs))
+        add(msgParts, "ms")
+        echo strutils.join(msgParts, "")
         let identMs: int64 = ownProfCollectIdentNs / 1000000
-        detail = detail + int64ToStr(identMs)
-        detail = detail + "ms("
-        detail = detail + int64ToStr(int64(ownProfCollectIdentCalls))
-        detail = detail + ") lvalue="
+        var detailParts: str[] = []
+        add(detailParts, "[ownership-detail] ident=")
+        add(detailParts, int64ToStr(identMs))
+        add(detailParts, "ms(")
+        add(detailParts, int64ToStr(int64(ownProfCollectIdentCalls)))
+        add(detailParts, ") lvalue=")
         let lvalueMs: int64 = ownProfCollectLValueNs / 1000000
-        detail = detail + int64ToStr(lvalueMs)
-        detail = detail + "ms("
-        detail = detail + int64ToStr(int64(ownProfCollectLValueCalls))
-        detail = detail + ") deferBefore="
+        add(detailParts, int64ToStr(lvalueMs))
+        add(detailParts, "ms(")
+        add(detailParts, int64ToStr(int64(ownProfCollectLValueCalls)))
+        add(detailParts, ") deferBefore=")
         let deferMs: int64 = ownProfDeferBeforeNs / 1000000
-        detail = detail + int64ToStr(deferMs)
-        detail = detail + "ms("
-        detail = detail + int64ToStr(int64(ownProfDeferBeforeCalls))
-        detail = detail + ") loopCarried="
+        add(detailParts, int64ToStr(deferMs))
+        add(detailParts, "ms(")
+        add(detailParts, int64ToStr(int64(ownProfDeferBeforeCalls)))
+        add(detailParts, ") loopCarried=")
         let loopMs: int64 = ownProfLoopCarriedNs / 1000000
-        detail = detail + int64ToStr(loopMs)
-        detail = detail + "ms("
-        detail = detail + int64ToStr(int64(ownProfLoopCarriedCalls))
-        detail = detail + ") seenHas="
+        add(detailParts, int64ToStr(loopMs))
+        add(detailParts, "ms(")
+        add(detailParts, int64ToStr(int64(ownProfLoopCarriedCalls)))
+        add(detailParts, ") seenHas=")
         let seenHasMs: int64 = ownProfSeenHasNs / 1000000
-        detail = detail + int64ToStr(seenHasMs)
-        detail = detail + "ms("
-        detail = detail + int64ToStr(int64(ownProfSeenHasCalls))
-        detail = detail + ") seenAdd="
+        add(detailParts, int64ToStr(seenHasMs))
+        add(detailParts, "ms(")
+        add(detailParts, int64ToStr(int64(ownProfSeenHasCalls)))
+        add(detailParts, ") seenAdd=")
         let seenAddMs: int64 = ownProfSeenAddNs / 1000000
-        detail = detail + int64ToStr(seenAddMs)
-        detail = detail + "ms("
-        detail = detail + int64ToStr(int64(ownProfSeenAddCalls))
-        detail = detail + ")"
-        echo detail
+        add(detailParts, int64ToStr(seenAddMs))
+        add(detailParts, "ms(")
+        add(detailParts, int64ToStr(int64(ownProfSeenAddCalls)))
+        add(detailParts, ")")
+        echo strutils.join(detailParts, "")
         let markTop: str = ownProfTopKinds(ownProfMarkKindNs, ownProfMarkKindCalls, "[ownership-mark-top]")
         echo markTop
         let analyzeTop: str = ownProfTopKinds(ownProfAnalyzeKindNs, ownProfAnalyzeKindCalls, "[ownership-analyze-top]")

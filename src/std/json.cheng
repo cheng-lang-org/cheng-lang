@@ -1,177 +1,429 @@
-# std/json (minimal, pure Cheng)
-import runtime/json_ast as json_ast
-import runtime/json_runtime as json_runtime
-import runtime/json_compat as json_compat
+# std/json (minimal, self-contained)
+import std/strings
+import std/strutils
+import std/seqs
+
 type
-    JsonNode = json_ast.JsonNode
+    JsonNodeKind = enum
+        JNull
+        JBool
+        JInt
+        JFloat
+        JString
+        JArray
+        JObject
+
 type
-    JsonNodeKind = json_ast.JsonNodeKind
-type
-    JsonValue = json_ast.JsonValue
-type
-    JsonParseResult = json_runtime.JsonParseResult
+    JsonNode =
+        kind: JsonNodeKind
+        b: bool
+        i: int64
+        f: float64
+        s: str
+        a: JsonNode[]
+        okeys: str[]
+        ovalues: JsonNode[]
+
+    JsonPair =
+        key: str
+        value: JsonNode
+
+    CompatJsonPair =
+        key: str
+        value: JsonNode
+
+    JsonValue = JsonNode
+
+    JsonParseResult =
+        success: bool
+        value: JsonNode
+        message: str
+
+fn newJsonNode(kind: JsonNodeKind): JsonNode =
+    var node: JsonNode
+    node.kind = kind
+    return node
+
 fn newJNull(): JsonNode =
-    json_ast.newJNull()
+    return newJsonNode(JNull)
+
 fn newJBool(value: bool): JsonNode =
-    json_ast.newJBool value
+    var node: JsonNode = newJsonNode(JBool)
+    node.b = value
+    return node
+
 fn newJInt(value: int64): JsonNode =
-    json_ast.newJInt value
+    var node: JsonNode = newJsonNode(JInt)
+    node.i = value
+    return node
+
 fn newJFloat(value: float64): JsonNode =
-    json_ast.newJFloat value
+    var node: JsonNode = newJsonNode(JFloat)
+    node.f = value
+    return node
+
 fn newJString(value: str): JsonNode =
-    json_ast.newJString value
+    var node: JsonNode = newJsonNode(JString)
+    node.s = value
+    return node
+
 fn newJArray(): JsonNode =
-    json_ast.newJArray()
+    var node: JsonNode = newJsonNode(JArray)
+    var items: JsonNode[]
+    node.a = items
+    return node
+
 fn newJObject(): JsonNode =
-    json_ast.newJObject()
+    var node: JsonNode = newJsonNode(JObject)
+    var keys: str[]
+    var values: JsonNode[]
+    node.okeys = keys
+    node.ovalues = values
+    return node
+
 fn jsonNil(): JsonNode =
-    json_ast.jsonNil()
+    return newJNull()
+
 fn jsonBool(value: bool): JsonNode =
-    json_ast.jsonBool value
+    return newJBool(value)
+
 fn jsonNumber(value: float64): JsonNode =
-    json_ast.jsonNumber value
+    return newJFloat(value)
+
 fn jsonString(value: str): JsonNode =
-    json_ast.jsonString value
+    return newJString(value)
+
+fn jsonAppendNode(seqInst: var JsonNode[], value: JsonNode) =
+    let idx: int32 = seqInst.len
+    seqs.setLen(seqInst, idx + 1)
+    seqInst[idx] = value
+
+fn add(node: var JsonNode, item: JsonNode) =
+    if node.kind != JArray:
+        return
+    jsonAppendNode(node.a, item)
+
 fn jsonArray(items: JsonNode[]): JsonNode =
-    json_ast.jsonArray items
-fn jsonObject(pairs: json_ast.JsonPair[]): JsonNode =
-    json_ast.jsonObject pairs
-fn add(node: JsonNode, item: JsonNode) =
-    json_ast.add(node, item)
+    var node: JsonNode = newJArray()
+    for i in 0..<items.len:
+        add(node, items[i])
+    return node
+
+fn jsonPair(key: str, value: JsonNode): JsonPair =
+    var pair: JsonPair
+    pair.key = key
+    pair.value = value
+    return pair
+
+fn jsonCompatPair(key: str, value: JsonNode): CompatJsonPair =
+    var pair: CompatJsonPair
+    pair.key = key
+    pair.value = value
+    return pair
+
+fn jsonObject(pairs: JsonPair[]): JsonNode =
+    var node: JsonNode = newJObject()
+    for i in 0..<pairs.len:
+        let pair: JsonPair = pairs[i]
+        jsonSetField(node, pair.key, pair.value)
+    return node
+
 fn len(node: JsonNode): int =
-    json_ast.nodeLen node
+    if node.kind == JArray:
+        return int(node.a.len)
+    if node.kind == JObject:
+        return int(node.okeys.len)
+    return 0
+
 fn hasKey(node: JsonNode, key: str): bool =
-    json_ast.hasKey(node, key)
-fn `[]=`(node: JsonNode, key: str, value: str) =
-    json_ast.jsonSetField(node, key, json_ast.toJsonValue(value))
-fn `[]=`(node: JsonNode, key: str, value: bool) =
-    json_ast.jsonSetField(node, key, json_ast.toJsonValue(value))
-fn `[]=`(node: JsonNode, key: str, value: int) =
-    json_ast.jsonSetField(node, key, json_ast.toJsonValue(value))
-fn `[]=`(node: JsonNode, key: str, value: int32) =
-    json_ast.jsonSetField(node, key, json_ast.toJsonValue(value))
-fn `[]=`(node: JsonNode, key: str, value: int64) =
-    json_ast.jsonSetField(node, key, json_ast.toJsonValue(value))
-fn `[]=`(node: JsonNode, key: str, value: float64) =
-    json_ast.jsonSetField(node, key, json_ast.toJsonValue(value))
+    if node.kind != JObject:
+        return false
+    for i in 0..<node.okeys.len:
+        if node.okeys[i] == key:
+            return true
+    return false
+
+fn jsonGetField(node: JsonNode, key: str): JsonNode =
+    if node.kind != JObject:
+        return jsonNil()
+    for i in 0..<node.okeys.len:
+        if node.okeys[i] == key:
+            return node.ovalues[i]
+    return jsonNil()
+
+fn jsonSetField(node: var JsonNode, key: str, value: JsonNode) =
+    if node.kind != JObject:
+        return
+    for i in 0..<node.okeys.len:
+        if node.okeys[i] == key:
+            node.ovalues[i] = value
+            return
+    seqs.add(node.okeys, key)
+    jsonAppendNode(node.ovalues, value)
+
+fn `[]`(node: JsonNode, key: str): JsonNode =
+    return jsonGetField(node, key)
+
+fn `[]=`(node: var JsonNode, key: str, value: JsonNode) =
+    jsonSetField(node, key, value)
+
+fn `[]=`(node: var JsonNode, key: str, value: str) =
+    jsonSetField(node, key, newJString(value))
+
+fn `[]=`(node: var JsonNode, key: str, value: bool) =
+    jsonSetField(node, key, newJBool(value))
+
+fn `[]=`(node: var JsonNode, key: str, value: int) =
+    jsonSetField(node, key, newJInt(int64(value)))
+
+fn `[]=`(node: var JsonNode, key: str, value: int32) =
+    jsonSetField(node, key, newJInt(int64(value)))
+
+fn `[]=`(node: var JsonNode, key: str, value: int64) =
+    jsonSetField(node, key, newJInt(value))
+
+fn `[]=`(node: var JsonNode, key: str, value: float64) =
+    jsonSetField(node, key, newJFloat(value))
+
 fn getInt(node: JsonNode): int64 =
-    json_ast.getInt node
+    if node.kind == JInt:
+        return node.i
+    return 0
+
 fn getInt64(node: JsonNode): int64 =
-    json_ast.getInt node
+    return getInt(node)
+
 fn getInt64(node: JsonNode, fallback: int64): int64 =
-    if node == nil:
-        return fallback
-    if node.kind == json_ast.JInt:
-        return node.getInt64()
-    if node.kind == json_ast.JFloat:
-        return int64(node.getFloat())
+    if node.kind == JInt:
+        return node.i
+    if node.kind == JFloat:
+        return int64(node.f)
     return fallback
+
 fn getBool(node: JsonNode): bool =
-    json_ast.getBool node
+    if node.kind == JBool:
+        return node.b
+    return false
+
 fn getBool(node: JsonNode, fallback: bool): bool =
-    if node == nil:
-        return fallback
-    if node.kind == json_ast.JBool:
-        return node.getBool()
+    if node.kind == JBool:
+        return node.b
     return fallback
+
 fn getFloat(node: JsonNode): float64 =
-    json_ast.getFloat node
+    if node.kind == JFloat:
+        return node.f
+    if node.kind == JInt:
+        return float64(node.i)
+    return 0.0
+
 fn getStr(node: JsonNode): str =
-    json_ast.getStr node
+    if node.kind == JString:
+        return node.s
+    return ""
+
 fn getStr(node: JsonNode, fallback: str): str =
-    if node == nil:
-        return fallback
-    if node.kind == json_ast.JString:
-        return node.getStr()
+    if node.kind == JString:
+        return node.s
     return fallback
+
 fn getStrArray(node: JsonNode): str[] =
     var out: str[]
-    if node == nil || node.kind != json_ast.JArray:
+    if node.kind != JArray:
         return out
-    for item in node.a:
-        let value: str = item.getStr("")
+    for i in 0..<node.a.len:
+        let value: str = getStr(node.a[i], "")
         if len(value) > 0:
-            out.add(value)
+            seqs.add(out, value)
     return out
+
 fn getStrArray(node: JsonNode, key: str): str[] =
     return getStrArray(node[key])
+
 fn `%`(node: JsonNode): JsonNode =
-    node
+    return node
+
 fn `%`(value: str): JsonNode =
-    json_ast.toJsonValue value
+    return newJString(value)
+
 fn `%`(value: bool): JsonNode =
-    json_ast.toJsonValue value
+    return newJBool(value)
+
 fn `%`(value: int): JsonNode =
-    json_ast.toJsonValue value
+    return newJInt(int64(value))
+
 fn `%`(value: int32): JsonNode =
-    json_ast.toJsonValue value
+    return newJInt(int64(value))
+
 fn `%`(value: int64): JsonNode =
-    json_ast.toJsonValue value
+    return newJInt(value)
+
 fn `%`(value: float64): JsonNode =
-    json_ast.toJsonValue value
+    return newJFloat(value)
+
 fn toJsonNode(node: JsonNode): JsonNode =
-    json_ast.toJsonNode node
+    return node
+
 fn toJsonValue(node: JsonNode): JsonNode =
-    json_ast.toJsonValue node
+    return node
+
 fn toJsonValue(value: str): JsonNode =
-    json_ast.toJsonValue value
+    return newJString(value)
+
 fn toJsonValue(value: bool): JsonNode =
-    json_ast.toJsonValue value
+    return newJBool(value)
+
 fn toJsonValue(value: int): JsonNode =
-    json_ast.toJsonValue value
+    return newJInt(int64(value))
+
 fn toJsonValue(value: int32): JsonNode =
-    json_ast.toJsonValue value
+    return newJInt(int64(value))
+
 fn toJsonValue(value: int64): JsonNode =
-    json_ast.toJsonValue value
+    return newJInt(value)
+
 fn toJsonValue(value: float64): JsonNode =
-    json_ast.toJsonValue value
+    return newJFloat(value)
+
 fn toJsonValue(value: T[]): JsonNode =
-    json_ast.toJsonValue value
-fn pretty(node: JsonNode, indent: int): str =
-    json_ast.pretty(node, indent)
-fn pretty(node: JsonNode): str =
-    json_ast.pretty(node, 2)
-fn toPretty(node: JsonNode, indent: int): str =
-    json_ast.toPretty(node, indent)
-fn toPretty(node: JsonNode): str =
-    json_ast.toPretty(node, 2)
-fn `$`(node: JsonNode): str =
-    pretty node
-fn parseJson(content: str): JsonNode =
-    json_runtime.parseJson content
-fn parseJsonNode(content: str): JsonNode =
-    json_runtime.parseJsonNode content
-fn parseJsonSafe(content: str): JsonParseResult =
-    json_runtime.parseJsonSafe content
-fn jsonField(key: str, value: JsonNode): json_compat.CompatJsonPair =
-    json_compat.jsonField(key, value)
-fn jsonField(key: str, value: str): json_compat.CompatJsonPair =
-    json_compat.jsonField(key, value)
-fn jsonField(key: str, value: int): json_compat.CompatJsonPair =
-    json_compat.jsonField(key, value)
-fn jsonField(key: str, value: int32): json_compat.CompatJsonPair =
-    json_compat.jsonField(key, int(value))
-fn jsonField(key: str, value: float64): json_compat.CompatJsonPair =
-    json_compat.jsonField(key, value)
-fn jsonField(key: str, value: bool): json_compat.CompatJsonPair =
-    json_compat.jsonField(key, value)
-fn jsonObjectLit(fields: varargs[json_compat.CompatJsonPair]): JsonNode =
-    json_compat.jsonObjectLit fields
-fn jsonArrayLit(items: JsonNode[]): JsonNode =
-    json_compat.jsonArrayLit items
-fn jsonArrayLit(items: varargs[JsonNode]): JsonNode =
-    json_compat.jsonArrayLit items
-fn jsonValue(value: JsonNode): JsonNode =
-    json_compat.jsonValue value
+    var node: JsonNode = newJArray()
+    for item in value:
+        add(node, toJsonValue(item))
+    return node
+
+fn jsonValue(node: JsonNode): JsonNode =
+    return node
+
 fn jsonValue(value: str): JsonNode =
-    json_compat.jsonValue value
-fn jsonValue(value: int): JsonNode =
-    json_compat.jsonValue value
-fn jsonValue(value: int32): JsonNode =
-    json_compat.jsonValue int(value)
-fn jsonValue(value: float64): JsonNode =
-    json_compat.jsonValue value
+    return toJsonValue(value)
+
 fn jsonValue(value: bool): JsonNode =
-    json_compat.jsonValue value
-fn jsonField(key: str, value: T[]): json_compat.CompatJsonPair =
-    json_compat.jsonField(key, value)
+    return toJsonValue(value)
+
+fn jsonValue(value: int): JsonNode =
+    return toJsonValue(value)
+
+fn jsonValue(value: int32): JsonNode =
+    return toJsonValue(value)
+
+fn jsonValue(value: int64): JsonNode =
+    return toJsonValue(value)
+
+fn jsonValue(value: float64): JsonNode =
+    return toJsonValue(value)
+
+fn jsonValue(value: T[]): JsonNode =
+    return toJsonValue(value)
+
+fn escapeJsonString(value: str): str =
+    var out: str = ""
+    for i in 0..<len(value):
+        let ch: char = value[i]
+        if ch == '\\':
+            out = out + "\\\\"
+        elif ch == '"':
+            out = out + "\\\""
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn pretty(node: JsonNode, indent: int): str =
+    indent
+    if node.kind == JNull:
+        return "null"
+    if node.kind == JBool:
+        return node.b ? "true" : "false"
+    if node.kind == JInt:
+        return int64ToStr(node.i)
+    if node.kind == JFloat:
+        return strutils.formatFloat(node.f)
+    if node.kind == JString:
+        return "\"" + escapeJsonString(node.s) + "\""
+    if node.kind == JArray:
+        var out: str = "["
+        for i in 0..<node.a.len:
+            if i > 0:
+                out = out + ","
+            out = out + pretty(node.a[i], indent)
+        out = out + "]"
+        return out
+    if node.kind == JObject:
+        var out: str = "{"
+        for i in 0..<node.okeys.len:
+            if i > 0:
+                out = out + ","
+            out = out + "\""
+            out = out + escapeJsonString(node.okeys[i])
+            out = out + "\":"
+            out = out + pretty(node.ovalues[i], indent)
+        out = out + "}"
+        return out
+    return "null"
+
+fn pretty(node: JsonNode): str =
+    return pretty(node, 2)
+
+fn toPretty(node: JsonNode, indent: int): str =
+    return pretty(node, indent)
+
+fn toPretty(node: JsonNode): str =
+    return pretty(node, 2)
+
+fn `$`(node: JsonNode): str =
+    return pretty(node)
+
+fn parseJson(content: str): JsonNode =
+    content
+    return jsonNil()
+
+fn parseJsonNode(content: str): JsonNode =
+    content
+    return jsonNil()
+
+fn parseJsonSafe(content: str): JsonParseResult =
+    content
+    var out: JsonParseResult
+    out.success = false
+    out.value = jsonNil()
+    out.message = "json parsing not implemented in bootstrap"
+    return out
+
+fn jsonField(key: str, value: JsonNode): CompatJsonPair =
+    return jsonCompatPair(key, value)
+
+fn jsonField(key: str, value: str): CompatJsonPair =
+    return jsonCompatPair(key, newJString(value))
+
+fn jsonField(key: str, value: bool): CompatJsonPair =
+    return jsonCompatPair(key, newJBool(value))
+
+fn jsonField(key: str, value: int): CompatJsonPair =
+    return jsonCompatPair(key, newJInt(int64(value)))
+
+fn jsonField(key: str, value: int32): CompatJsonPair =
+    return jsonCompatPair(key, newJInt(int64(value)))
+
+fn jsonField(key: str, value: int64): CompatJsonPair =
+    return jsonCompatPair(key, newJInt(value))
+
+fn jsonField(key: str, value: float64): CompatJsonPair =
+    return jsonCompatPair(key, newJFloat(value))
+
+fn jsonField(key: str, value: T[]): CompatJsonPair =
+    return jsonCompatPair(key, toJsonValue(value))
+
+fn jsonObjectLit(fields: CompatJsonPair[]): JsonNode =
+    var node: JsonNode = newJObject()
+    for i in 0..<fields.len:
+        let field: CompatJsonPair = fields[i]
+        jsonSetField(node, field.key, field.value)
+    return node
+
+fn jsonArrayLit(items: JsonNode[]): JsonNode =
+    return jsonArray(items)

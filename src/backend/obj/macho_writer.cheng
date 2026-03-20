@@ -114,7 +114,7 @@ fn machoStrtabAddJoined(strtab: var uint8[], prefix: str, name: str): uint32 =
     return machoStrtabAddRaw(strtab, machoJoinSym(prefix, name))
 
 fn machoPrependUnderscore(name: str): str =
-    let safeName: str = len(name) > 0 ? name : ""
+    let safeName: str = strings.__cheng_str_clone(name)
     let nName: int32 = len(safeName)
     if nName <= 0:
         return ""
@@ -152,7 +152,7 @@ fn add(items: var str[], value: str) =
         reserve(items, needLen)
     setLen(items, needLen)
     let safe: str = obj_buf.bufSafeStr(value)
-    items[idx] = len(safe) > 0 ? machoPersistStr(safe) : ""
+    items[idx] = machoPersistStr(safe)
 
 fn add(items: var uint64[], value: uint64) =
     let idx: int32 = items.len
@@ -231,9 +231,7 @@ fn machoIsPrivateFuncSym(name: str): bool =
     return strings.hasPrefix(name, "__cheng_global_init")
 
 fn macho_strCmp(a: str, b: str): int32 =
-    let safeA: str = len(a) > 0 ? a : ""
-    let safeB: str = len(b) > 0 ? b : ""
-    return cmp(safeA, safeB)
+    return cmp(strings.__cheng_str_clone(a), strings.__cheng_str_clone(b))
 
 fn macho_strEq(a: str, b: str): bool =
     return macho_strCmp(a, b) == 0
@@ -275,6 +273,24 @@ fn machoStrCharAt(s: str, idx: int32): char =
         return char(0)
     return s[idx]
 
+fn machoCloneStr(value: str): str =
+    return strings.__cheng_str_clone(value)
+
+fn machoChooseNonEmpty(primary: str, fallback: str): str =
+    if len(primary) > 0:
+        return primary
+    return fallback
+
+fn machoAltSymName(name: str): str =
+    if len(name) > 0 && machoStrCharAt(name, 0) == '_':
+        return strings.sliceBytes(name, 1, len(name))
+    return machoPrependUnderscore(name)
+
+fn machoFirstLabelOrEmpty(labels: str[]): str =
+    if labels.len <= 0:
+        return ""
+    return strings.__cheng_str_clone(labels[0])
+
 fn machoPrintableAscii(name: str): bool =
     let n: int32 = len(name)
     if n <= 0:
@@ -315,7 +331,7 @@ fn machoSeqSetStr(items: var str[], idx: int32, value: str) =
     if idx < 0 || idx >= items.len || items.buffer == nil:
         return
     let safe: str = obj_buf.bufSafeStr(value)
-    items[idx] = len(safe) > 0 ? machoPersistStr(safe) : ""
+    items[idx] = machoPersistStr(safe)
 
 fn machoSeqInitEmpty_MachoReloc(items: var MachoReloc[]) =
     items.buffer = nil
@@ -374,7 +390,7 @@ fn machoSymIndexInsertFirst(index: var hashmaps.HashMapStrInt, name: str, symIdx
         hashmaps.hashMapStrIntPut(index, stableName, symIdx)
 
 fn machoSymIndexAliasName(name: str): str =
-    let safeName: str = len(name) > 0 ? name : ""
+    let safeName: str = machoCloneStr(name)
     if len(safeName) <= 0:
         return ""
     if machoStrCharAt(safeName, 0) == '_':
@@ -388,7 +404,7 @@ fn machoSymIndexInsertAliases(index: var hashmaps.HashMapStrInt, name: str, symI
         machoSymIndexInsertFirst(index, alias, symIdx)
 
 fn machoSymIndexLookup(index: hashmaps.HashMapStrInt, name: str, found: var bool): int32 =
-    let safeName: str = len(name) > 0 ? name : ""
+    let safeName: str = machoCloneStr(name)
     if len(safeName) <= 0:
         found = false
         return 0
@@ -402,7 +418,7 @@ fn machoSymIndexLookup(index: hashmaps.HashMapStrInt, name: str, found: var bool
     return 0
 
 fn machoSymIndexLookup(index: var hashmaps.HashMapStrInt, name: str, found: var bool): int32 =
-    let safeName: str = len(name) > 0 ? name : ""
+    let safeName: str = machoCloneStr(name)
     if len(safeName) <= 0:
         found = false
         return 0
@@ -438,12 +454,12 @@ fn machoAddSymIndexed(outSyms: MachoSym[], index: var hashmaps.HashMapStrInt,
     return out
 
 fn macho_findLabelOff(labels: str[], offs: int32[], label: str): Result[int32] =
-    let safeLabel: str = len(label) > 0 ? label : ""
+    let safeLabel: str = machoCloneStr(label)
     for i in 0..<labels.len:
         if ! (i < offs.len):
             break
         let cur0: str = labels[i]
-        let cur: str = len(cur0) > 0 ? cur0 : ""
+        let cur: str = machoCloneStr(cur0)
         if macho_strEq(cur, safeLabel):
             return Ok[int32](offs[i])
     echo("[macho.err.missing_label_linear]")
@@ -456,7 +472,7 @@ fn machoBuildLabelOffIndex(labels: str[], offs: int32[]): hashmaps.HashMapStrInt
     var out: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(count * 2 + 1)
     for i in 0..<count:
         let cur0: str = labels[i]
-        let cur: str = len(cur0) > 0 ? machoPersistStr(cur0) : ""
+        let cur: str = machoPersistStr(cur0)
         if len(cur) <= 0:
             continue
         var exists: bool = false
@@ -466,7 +482,7 @@ fn machoBuildLabelOffIndex(labels: str[], offs: int32[]): hashmaps.HashMapStrInt
     return out
 
 fn macho_findLabelOffFast(index: hashmaps.HashMapStrInt, label: str): Result[int32] =
-    let safeLabel: str = len(label) > 0 ? label : ""
+    let safeLabel: str = machoCloneStr(label)
     var found: bool = false
     let off: int32 = hashmaps.hashMapStrIntGetEx(index, safeLabel, found)
     if found:
@@ -478,7 +494,7 @@ fn macho_findLabelOffFast(index: hashmaps.HashMapStrInt, label: str): Result[int
 
 fn macho_findLabelOffIndexed(index: hashmaps.HashMapStrInt, labels: str[], offs: int32[],
                              label: str): Result[int32] =
-    let safeLabel: str = len(label) > 0 ? label : ""
+    let safeLabel: str = machoCloneStr(label)
     var found: bool = false
     let off: int32 = hashmaps.hashMapStrIntGetEx(index, safeLabel, found)
     if found:
@@ -487,7 +503,7 @@ fn macho_findLabelOffIndexed(index: hashmaps.HashMapStrInt, labels: str[], offs:
         if !(i < offs.len):
             break
         let cur0: str = labels[i]
-        let cur: str = len(cur0) > 0 ? cur0 : ""
+        let cur: str = machoCloneStr(cur0)
         if macho_strEq(cur, safeLabel):
             return Ok[int32](offs[i])
     echo("[macho.err.missing_label_indexed]")
@@ -496,20 +512,16 @@ fn macho_findLabelOffIndexed(index: hashmaps.HashMapStrInt, labels: str[], offs:
                        "macho_writer: missing label: " + safeLabel)
 
 fn macho_findSymIndexLinear(names: str[], name: str): Result[int32] =
-    let safeName: str = len(name) > 0 ? name : ""
+    let safeName: str = machoCloneStr(name)
     if len(safeName) <= 0:
         echo("[macho.err.missing_reloc_sym_linear]")
         echo(safeName)
         return machoErrInt("[macho.err.missing_reloc_sym_linear.ret]",
                            "macho_writer: missing relocation symbol: " + safeName)
-    var alt: str = ""
-    if len(safeName) > 0 && machoStrCharAt(safeName, 0) == '_':
-        alt = strings.sliceBytes(safeName, 1, len(safeName))
-    else:
-        alt = machoPrependUnderscore(safeName)
+    let alt: str = machoAltSymName(safeName)
     for i in 0..<names.len:
         let cur0: str = names[i]
-        let cur: str = len(cur0) > 0 ? cur0 : ""
+        let cur: str = machoCloneStr(cur0)
         if macho_strEq(cur, safeName) || (len(alt) > 0 && macho_strEq(cur, alt)):
             return Ok[int32](i)
     echo("[macho.err.missing_reloc_sym_linear]")
@@ -518,7 +530,7 @@ fn macho_findSymIndexLinear(names: str[], name: str): Result[int32] =
                        "macho_writer: missing relocation symbol: " + safeName)
 
 fn macho_findSymIndexIndexed(index: hashmaps.HashMapStrInt, names: str[], name: str): Result[int32] =
-    let safeName: str = len(name) > 0 ? name : ""
+    let safeName: str = machoCloneStr(name)
     var found: bool = false
     let idx: int32 = machoSymIndexLookup(index, safeName, found)
     if found:
@@ -793,7 +805,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
         let resolvedFnName: str = machoResolveFuncExportName(f, labels)
         machoSeqSetStr(funcSymNames, fi, resolvedFnName)
         if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
-            let firstLabelDbg: str = labels.len > 0 ? labels[0] : ""
+            let firstLabelDbg: str = machoFirstLabelOrEmpty(labels)
             echo("[macho.func.resolve] fi=" + intToStr(fi) +
                  " raw=" + machoFuncNameRaw(f) +
                  " firstLabel=" + firstLabelDbg +
@@ -1171,7 +1183,8 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
             syms = machoAddCstringSymIfAbsent(syms, symIndexMap, symNames, strtab, symName, cstrSectIndex, v)
             if len(canonical) > 0 && canonical != symName:
                 syms = machoAddCstringSymIfAbsent(syms, symIndexMap, symNames, strtab, canonical, cstrSectIndex, v)
-            let alias: str = objCStringMachoSymbolAlias(symName, len(canonical) > 0 ? canonical : symName)
+            let aliasBase: str = machoChooseNonEmpty(canonical, symName)
+            let alias: str = objCStringMachoSymbolAlias(symName, aliasBase)
             syms = machoAddCstringSymIfAbsent(syms, symIndexMap, symNames, strtab, alias, cstrSectIndex, v)
     for ri in 0..<relocs.len:
         let r0: MachoReloc = relocs[ri]
@@ -1190,7 +1203,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
     for fi in 0..<funcCount:
         let fLocal: MachineFunc = machoModuleFuncAtRaw(mod, fi)
         let fnNameDirect: str = machoFuncNameRaw(fLocal)
-        let fnName: str = len(fnNameDirect) > 0 ? fnNameDirect : machoSeqAtStr(funcSymNames, fi)
+        let fnName: str = machoChooseNonEmpty(fnNameDirect, machoSeqAtStr(funcSymNames, fi))
         if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
             echo("[macho.func.local] fi=" + intToStr(fi) +
                  " raw=" + fnNameDirect +
@@ -1209,7 +1222,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
     for fi in 0..<funcCount:
         let fExt: MachineFunc = machoModuleFuncAtRaw(mod, fi)
         let fnNameDirect: str = machoFuncNameRaw(fExt)
-        let fnName: str = len(fnNameDirect) > 0 ? fnNameDirect : machoSeqAtStr(funcSymNames, fi)
+        let fnName: str = machoChooseNonEmpty(fnNameDirect, machoSeqAtStr(funcSymNames, fi))
         if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
             echo("[macho.func.ext] fi=" + intToStr(fi) +
                  " raw=" + fnNameDirect +

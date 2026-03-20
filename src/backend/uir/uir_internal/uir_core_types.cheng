@@ -3,6 +3,7 @@
 import std/seqs as seqs
 import std/os
 import std/strings
+import std/strutils as strutils
 import std/result
 import std/hashmaps
 import std/rawmem_support
@@ -74,6 +75,28 @@ fn add(seqInst: var str[], val: str) =
         reserve(seqInst, needLen)
     setLen(seqInst, needLen)
     seqInst[idx] = val
+
+fn uirCoreSetEmpty(out: var str) =
+    out.data = nil
+    out.len = 0
+    out.store_id = 0
+    out.flags = 0
+
+fn uirCoreCopyStr(out: var str, value: str) =
+    out.data = value.data
+    out.len = value.len
+    out.store_id = value.store_id
+    out.flags = value.flags
+
+fn uirCoreChooseNonEmpty(primary: str, fallback: str): str =
+    if len(primary) > 0:
+        return primary
+    return fallback
+
+fn uirCoreNormalizeStr(value: str): str =
+    if len(value) == 0:
+        return ""
+    return value
 
 var
     uirCore_ownedStr_ptr_index: hashmaps.HashMapPtrInt
@@ -1632,8 +1655,8 @@ fn uirCoreBlockStmtsFlatAppend(stmt: UirStmtId) =
     uirCoreSanitizeStmtIdSeq(&uirCore_blockStmtsFlat)
     let flatLenBefore: int32 = uirCoreStmtSeqLen(&uirCore_blockStmtsFlat)
     if crashTraceEnabled():
-        crashTraceSetPhase(cstring("uir.flat.append"))
-        crashTraceMark(cstring("uir.flat.append"), stmt, uirCore_blockStmtsFlatCount, flatLenBefore, 0)
+        crashTraceSetPhase(strToCStringTemp("uir.flat.append"))
+        crashTraceMark(strToCStringTemp("uir.flat.append"), stmt, uirCore_blockStmtsFlatCount, flatLenBefore, 0)
     if uirCore_blockStmtsFlatCount < 0 || uirCore_blockStmtsFlatCount > flatLenBefore:
         uirCore_blockStmtsFlatCount = flatLenBefore
     uirCoreStmtSeqAppend(&uirCore_blockStmtsFlat, stmt)
@@ -2872,6 +2895,31 @@ fn uirCoreTypeKindName(t: UirCoreType): str =
         return "f64"
     return "type"
 
+fn uirCoreFormatTypeOrI32(t: UirCoreType): str =
+    if t.kind == mtVoid:
+        return "void"
+    if t.kind == mtF64:
+        return "f64"
+    if t.kind == mtF32:
+        return "f32"
+    if t.kind == mtI64:
+        if t.isUnsigned:
+            return "u64"
+        return "i64"
+    if t.kind == mtI32:
+        if t.isUnsigned:
+            return "u32"
+        return "i32"
+    if t.kind == mtI16:
+        if t.isUnsigned:
+            return "u16"
+        return "i16"
+    if t.kind == mtI8:
+        if t.isUnsigned:
+            return "u8"
+        return "i8"
+    return "i32"
+
 fn uirCorePhaseHighTag(): int32 =
     return int32(0)
 
@@ -3677,21 +3725,18 @@ fn uirCoreCanonicalizeFunc(func: UirCoreFunc) =
     var funcVal: UirCoreFuncObj
     if funcObj != nil:
         funcVal = uirCoreFuncObjLoadPtr(funcObj)
-    let objName0: str = (funcObj != nil) ? funcVal.name : ""
-    let objLink0: str = (funcObj != nil) ? funcVal.linkName : ""
-    let objOrigin0: str = (funcObj != nil) ? funcVal.originFile : ""
-    let objFallback0: str = (funcObj != nil) ? funcVal.phaseFallbackReason : ""
-    if len(dyn.name) == 0 && len(objName0) > 0:
-        dyn.name = objName0
+    if len(dyn.name) == 0 && funcObj != nil && len(funcVal.name) > 0:
+        dyn.name = funcVal.name
     dyn.linkName = dyn.linkName
-    if len(dyn.linkName) == 0 && len(objLink0) > 0:
-        dyn.linkName = objLink0
+    if len(dyn.linkName) == 0 && funcObj != nil && len(funcVal.linkName) > 0:
+        dyn.linkName = funcVal.linkName
     if len(dyn.linkName) == 0 && len(dyn.name) > 0:
         dyn.linkName = dyn.name
-    if len(dyn.originFile) == 0 && len(objOrigin0) > 0:
-        dyn.originFile = objOrigin0
-    if len(dyn.phaseFallbackReason) == 0 && len(objFallback0) > 0:
-        dyn.phaseFallbackReason = objFallback0
+    if len(dyn.originFile) == 0 && funcObj != nil && len(funcVal.originFile) > 0:
+        dyn.originFile = funcVal.originFile
+    if len(dyn.phaseFallbackReason) == 0 && funcObj != nil &&
+       len(funcVal.phaseFallbackReason) > 0:
+        dyn.phaseFallbackReason = funcVal.phaseFallbackReason
     var params0: UirCoreParam[] = dyn.params
     for i in 0..<params0.len:
         var p: UirCoreParam = params0[i]
@@ -4735,9 +4780,15 @@ fn uirCoreFuncIsExtern(func: UirCoreFunc): bool =
     var funcVal: UirCoreFuncObj
     if funcObj != nil:
         funcVal = uirCoreFuncObjLoadPtr(funcObj)
-    let dbgNameObj: str = (funcObj != nil) ? funcVal.name : ""
-    let dbgNameDyn: str = (dyn != nil) ? dyn.name : ""
-    let dbgName: str = len(dbgNameObj) > 0 ? dbgNameObj : dbgNameDyn
+    var dbgNameObj: str
+    uirCoreSetEmpty(dbgNameObj)
+    if funcObj != nil:
+        uirCoreCopyStr(dbgNameObj, funcVal.name)
+    var dbgNameDyn: str
+    uirCoreSetEmpty(dbgNameDyn)
+    if dyn != nil:
+        uirCoreCopyStr(dbgNameDyn, dyn.name)
+    let dbgName: str = uirCoreChooseNonEmpty(dbgNameObj, dbgNameDyn)
     let dbgTrack: bool = dbgBoot && (dbgName == "main" || dbgName == "backendMain")
     if dyn != nil:
         let blocks: UirBlockId[] = dyn.blocks
@@ -4808,6 +4859,11 @@ fn uirCoreFuncNameOf(func: UirCoreFunc): str =
         return ""
     return dyn.name
 
+fn uirCoreFuncNameSafe(func: UirCoreFunc): str =
+    if func == nil:
+        return ""
+    return uirCoreFuncNameOf(func)
+
 fn uirCoreFuncRetTypeOf(func: UirCoreFunc): UirCoreType =
     let dyn: UirCoreFuncDynState = uirCoreFuncDyn(func)
     if dyn == nil:
@@ -4825,7 +4881,9 @@ fn uirCoreFuncRetTypeKeyOf(func: UirCoreFunc): str =
     if funcObj == nil:
         return ""
     let funcVal: UirCoreFuncObj = uirCoreFuncObjLoadPtr(funcObj)
-    return uirCoreStrPtrSane(funcVal.retTypeKey) ? funcVal.retTypeKey : ""
+    if uirCoreStrPtrSane(funcVal.retTypeKey):
+        return funcVal.retTypeKey
+    return ""
 
 fn uirCoreFuncObjFrameSizeOf(func: UirCoreFunc): int32 =
     let saneMax: int32 = 16 * 1024 * 1024
@@ -4975,7 +5033,8 @@ fn uirCoreFuncSyncObjIdentityFromDyn(func: UirCoreFunc, syncRetTypeKey: bool = f
     var funcVal: UirCoreFuncObj = uirCoreFuncObjLoadPtr(funcObj)
     let dbgBoot: bool = os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1"
     let dbgNameObj0: str = funcVal.name
-    let dbgNameDyn0: str = (dyn != nil) ? dyn.name : ""
+    let dbgNameDyn0: str = dyn.name
+    let dbgName0: str = uirCoreChooseNonEmpty(dbgNameObj0, dbgNameDyn0)
     let dbgTrack: bool = dbgBoot &&
                          (dbgNameObj0 == "main" || dbgNameObj0 == "backendMain" ||
                           dbgNameDyn0 == "main" || dbgNameDyn0 == "backendMain" ||
@@ -4984,7 +5043,7 @@ fn uirCoreFuncSyncObjIdentityFromDyn(func: UirCoreFunc, syncRetTypeKey: bool = f
     if dbgTrack:
         os.writeLine(os.get_stderr(),
                      "[backend] dbg_sync_obj_id.before name=" +
-                     (len(dbgNameObj0) > 0 ? dbgNameObj0 : dbgNameDyn0) +
+                     dbgName0 +
                      " func_dyn_id=" + intToStr(uirCoreFuncDynId(func)) +
                      " obj_dyn_id=" + intToStr(funcVal.dynId) +
                      " obj_extern=" + (funcVal.isExtern ? "1" : "0") +
@@ -5022,7 +5081,7 @@ fn uirCoreFuncSyncObjIdentityFromDyn(func: UirCoreFunc, syncRetTypeKey: bool = f
     if dbgTrack:
         os.writeLine(os.get_stderr(),
                      "[backend] dbg_sync_obj_id.after name=" +
-                     (len(funcVal.name) > 0 ? funcVal.name : dyn.name) +
+                     uirCoreChooseNonEmpty(funcVal.name, dyn.name) +
                      " func_dyn_id=" + intToStr(uirCoreFuncDynId(func)) +
                      " obj_dyn_id=" + intToStr(funcVal.dynId) +
                      " obj_extern=" + (funcVal.isExtern ? "1" : "0") +
@@ -5291,7 +5350,8 @@ fn uirCoreFuncInitHeaderMeta(func: UirCoreFunc,
         return
     let dbgBoot: bool = os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1"
     let dbgNameObj0: str = funcVal.name
-    let dbgNameDyn0: str = (dyn != nil) ? dyn.name : ""
+    let dbgNameDyn0: str = dyn.name
+    let dbgName0: str = uirCoreChooseNonEmpty(dbgNameObj0, dbgNameDyn0)
     let dbgTrack: bool = dbgBoot &&
                          (dbgNameObj0 == "main" || dbgNameObj0 == "backendMain" ||
                           dbgNameDyn0 == "main" || dbgNameDyn0 == "backendMain" ||
@@ -5301,7 +5361,7 @@ fn uirCoreFuncInitHeaderMeta(func: UirCoreFunc,
     if dbgTrack:
         os.writeLine(os.get_stderr(),
                      "[backend] dbg_init_header.before name=" +
-                     (len(dbgNameObj0) > 0 ? dbgNameObj0 : dbgNameDyn0) +
+                     dbgName0 +
                      " func_dyn_id=" + intToStr(uirCoreFuncDynId(func)) +
                      " obj_dyn_id=" + intToStr(funcVal.dynId) +
                      " obj_extern=" + (funcVal.isExtern ? "1" : "0") +
@@ -5326,7 +5386,7 @@ fn uirCoreFuncInitHeaderMeta(func: UirCoreFunc,
     if dbgTrack:
         os.writeLine(os.get_stderr(),
                      "[backend] dbg_init_header.after name=" +
-                     (len(funcVal.name) > 0 ? funcVal.name : dyn.name) +
+                     uirCoreChooseNonEmpty(funcVal.name, dyn.name) +
                      " func_dyn_id=" + intToStr(uirCoreFuncDynId(func)) +
                      " obj_dyn_id=" + intToStr(funcVal.dynId) +
                      " obj_extern=" + (funcVal.isExtern ? "1" : "0") +
@@ -5345,11 +5405,16 @@ fn uirCoreFuncSetExtern(func: UirCoreFunc, isExtern: bool) =
     let dyn: UirCoreFuncDynState = uirCoreEnsureFuncDyn(func)
     var funcVal: UirCoreFuncObj = uirCoreFuncObjLoadPtr(funcObj)
     let dbgName: str = funcVal.name
+    var dbgNameDyn: str
+    uirCoreSetEmpty(dbgNameDyn)
+    if dyn != nil:
+        uirCoreCopyStr(dbgNameDyn, dyn.name)
+    let dbgDisplayName: str = uirCoreChooseNonEmpty(dbgName, dbgNameDyn)
     if dbgBoot && (dbgName == "main" || dbgName == "backendMain" ||
-                   (dyn != nil && (dyn.name == "main" || dyn.name == "backendMain"))):
+                   dbgNameDyn == "main" || dbgNameDyn == "backendMain"):
         os.writeLine(os.get_stderr(),
                      "[backend] dbg_set_extern name=" +
-                     ((len(dbgName) > 0) ? dbgName : ((dyn != nil) ? dyn.name : "")) +
+                     dbgDisplayName +
                      " val=" + (isExtern ? "1" : "0") +
                      " dyn_id=" + intToStr(uirCoreFuncDynId(func)) +
                      " ptr=" + int64ToStr(uirCoreFuncPtrKey(func)))
@@ -5390,26 +5455,33 @@ fn uirCoreFuncSetPhaseContract(func: UirCoreFunc, phaseTag: int32,
     if (!uirCoreFuncIdValid(func)):
         return
     let funcObj: UirCoreFuncObjPtr = uirCoreFuncObjPtr(func)
+    let dyn: UirCoreFuncDynState = uirCoreFuncDyn(func)
     let dbgBoot: bool = os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1"
     var funcVal: UirCoreFuncObj
     if funcObj != nil:
         funcVal = uirCoreFuncObjLoadPtr(funcObj)
-    let dbgNameObj0: str = (funcObj != nil) ? funcVal.name : ""
-    let dbgNameDyn0: str = (uirCoreFuncDyn(func) != nil) ? uirCoreFuncDyn(func).name : ""
+    var dbgNameObj0: str
+    uirCoreSetEmpty(dbgNameObj0)
+    if funcObj != nil:
+        uirCoreCopyStr(dbgNameObj0, funcVal.name)
+    var dbgNameDyn0: str
+    uirCoreSetEmpty(dbgNameDyn0)
+    if dyn != nil:
+        uirCoreCopyStr(dbgNameDyn0, dyn.name)
+    let dbgName0: str = uirCoreChooseNonEmpty(dbgNameObj0, dbgNameDyn0)
     let dbgTrack: bool = dbgBoot &&
                          (dbgNameObj0 == "main" || dbgNameObj0 == "backendMain" ||
                           dbgNameDyn0 == "main" || dbgNameDyn0 == "backendMain")
     if dbgTrack:
         os.writeLine(os.get_stderr(),
                      "[backend] dbg_phase_contract.before name=" +
-                     (len(dbgNameObj0) > 0 ? dbgNameObj0 : dbgNameDyn0) +
+                     dbgName0 +
                      " obj_extern=" + ((funcObj != nil && funcVal.isExtern) ? "1" : "0") +
-                     " dyn_extern=" + ((uirCoreFuncDyn(func) != nil && uirCoreFuncDyn(func).isExtern) ? "1" : "0") +
+                     " dyn_extern=" + ((dyn != nil && dyn.isExtern) ? "1" : "0") +
                      " phase=" + intToStr(phaseTag) +
                      " high=" + (highUirChecked ? "1" : "0") +
                      " low=" + (lowUirLowered ? "1" : "0"))
         os.c_fflush(os.get_stderr())
-    let dyn: UirCoreFuncDynState = uirCoreFuncDyn(func)
     if dyn == nil:
         return
     dyn.phaseTag = phaseTag
@@ -5422,7 +5494,7 @@ fn uirCoreFuncSetPhaseContract(func: UirCoreFunc, phaseTag: int32,
     if dbgTrack:
         os.writeLine(os.get_stderr(),
                      "[backend] dbg_phase_contract.after name=" +
-                     (len(dbgNameObj0) > 0 ? dbgNameObj0 : dbgNameDyn0) +
+                     dbgName0 +
                      " obj_extern=" + ((funcObj != nil && funcVal.isExtern) ? "1" : "0") +
                      " dyn_extern=" + (dyn.isExtern ? "1" : "0"))
         os.c_fflush(os.get_stderr())
@@ -5542,12 +5614,14 @@ fn uirCoreModuleCountHighUirFallbackFuncs(module: UirCoreModule): int32 =
 fn uirCoreModuleApplyPhaseContract(module: UirCoreModule, highUirChecked: bool, fallbackReason: str) =
     if (module == nil):
         return
-    let fallback: str = highUirChecked ? "" : fallbackReason
     for i in 0..<module.funcs.len:
         let f = module.funcs[i]
         if (f == nil) || uirCoreFuncIsExtern(f):
             continue
-        uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), highUirChecked, true, fallback)
+        if highUirChecked:
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), highUirChecked, true, "")
+        else:
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), highUirChecked, true, fallbackReason)
 
 fn uirCoreModuleGlobalsLen(module: UirCoreModule): int32 =
     if module == nil:
@@ -5822,7 +5896,7 @@ fn uirCoreCStringLabelFromHash(h: int64): str =
 fn uirCoreFindCStringLabel(module: UirCoreModule, value: str): str =
     if (module == nil):
         return ""
-    let v: str = len(value) == 0 ? "" : value
+    let v: str = uirCoreNormalizeStr(value)
     let total: int32 = uirCoreModuleCStringsLen(module)
     if total >= 32:
         if uirCore_cstrs_cache_module != module || !uirCore_cstrs_cache_ready ||
@@ -5843,9 +5917,7 @@ fn uirCoreFindCStringLabel(module: UirCoreModule, value: str): str =
 fn uirCoreAddCString(module: UirCoreModule, value: str): str =
     if (module == nil):
         return ""
-    var v: str = value
-    if len(v) == 0:
-        v = ""
+    let v: str = uirCoreNormalizeStr(value)
     if os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1":
         echo("[uir.cstr.add] value_len=" + intToStr(len(v)))
         if len(v) > 0:
@@ -5914,20 +5986,23 @@ fn uirCoreNormalizeModule(module: UirCoreModule) =
             keyHasInit = 1
         if i >= 0 && i < module.globalHasInitBits.len:
             keyHasInit = uirCoreModuleGlobalHasInitFastAt(module, i)
-        var keyOrigin: str = ""
+        var keyOrigin: str
+        uirCoreSetEmpty(keyOrigin)
         if i >= 0 && i < module.globalOriginFiles.len:
-            keyOrigin = uirCoreModuleGlobalOriginFastAt(module, i)
+            uirCoreCopyStr(keyOrigin, uirCoreModuleGlobalOriginFastAt(module, i))
         var j: int32 = i - 1
-        var keyName: str = ""
+        var keyName: str
+        uirCoreSetEmpty(keyName)
         if i >= 0 && i < module.globalNames.len:
-            keyName = uirCoreModuleGlobalNameFastAt(module, i)
+            uirCoreCopyStr(keyName, uirCoreModuleGlobalNameFastAt(module, i))
         for __for_guard_j in 0..i:
             if !(j >= 0):
                 break
             let cur: UirCoreGlobal = module.globals[j]
-            var curName: str = ""
+            var curName: str
+            uirCoreSetEmpty(curName)
             if j >= 0 && j < module.globalNames.len:
-                curName = uirCoreModuleGlobalNameFastAt(module, j)
+                uirCoreCopyStr(curName, uirCoreModuleGlobalNameFastAt(module, j))
             if uirCoreStrCmp(curName, keyName) <= 0:
                 break
             uirCoreWriteGlobal(&module.globals, j + 1, cur)
@@ -5957,19 +6032,25 @@ fn uirCoreNormalizeModule(module: UirCoreModule) =
     for i in 1..<module.cstrs.len:
         let key2: UirCoreCString = module.cstrs[i]
         var j2: int32 = i - 1
-        var keyLabel: str = key2.label
+        var keyLabel: str
+        uirCoreSetEmpty(keyLabel)
+        uirCoreCopyStr(keyLabel, key2.label)
         if i >= 0 && i < module.cstrLabels.len:
-            keyLabel = uirCoreModuleCStringLabelFastAt(module, i)
-        var keyValue: str = key2.value
+            uirCoreCopyStr(keyLabel, uirCoreModuleCStringLabelFastAt(module, i))
+        var keyValue: str
+        uirCoreSetEmpty(keyValue)
+        uirCoreCopyStr(keyValue, key2.value)
         if i >= 0 && i < module.cstrValues.len:
-            keyValue = uirCoreModuleCStringValueFastAt(module, i)
+            uirCoreCopyStr(keyValue, uirCoreModuleCStringValueFastAt(module, i))
         for __for_guard_j2 in 0..i:
             if !(j2 >= 0):
                 break
             let cur2: UirCoreCString = module.cstrs[j2]
-            var curLabel: str = cur2.label
+            var curLabel: str
+            uirCoreSetEmpty(curLabel)
+            uirCoreCopyStr(curLabel, cur2.label)
             if j2 >= 0 && j2 < module.cstrLabels.len:
-                curLabel = uirCoreModuleCStringLabelFastAt(module, j2)
+                uirCoreCopyStr(curLabel, uirCoreModuleCStringLabelFastAt(module, j2))
             if uirCoreStrCmp(curLabel, keyLabel) <= 0:
                 break
             uirCoreWriteCString(&module.cstrs, j2 + 1, cur2)
@@ -5986,13 +6067,13 @@ fn uirCoreNormalizeModule(module: UirCoreModule) =
 
     for i in 1..<module.funcs.len:
         let key3 = module.funcs[i]
-        let keyName: str = (key3 == nil) ? "" : uirCoreFuncNameOf(key3)
+        let keyName: str = uirCoreFuncNameSafe(key3)
         var j3: int32 = i - 1
         let __for_start_j3 = j3
         for __for_rev_j3 in 0..(__for_start_j3 - (0)):
             j3 = __for_start_j3 - __for_rev_j3
             let cur = module.funcs[j3]
-            let curName: str = (cur == nil) ? "" : uirCoreFuncNameOf(cur)
+            let curName: str = uirCoreFuncNameSafe(cur)
             if uirCoreStrCmp(curName, keyName) <= 0:
                 break
             uirCoreWriteFunc(&module.funcs, j3 + 1, cur)
@@ -6014,29 +6095,31 @@ fn uirCoreFormatExpr(expr: UirExprId): str =
     if ek == meConstI64:
         return intToStr(int32(uirCoreExprConstValueOf(expr)))
     if ek == meBin:
-        var op: str = "?"
+        let lhsText: str = uirCoreFormatExpr(uirCoreExprLhsOf(expr))
+        let rhsText: str = uirCoreFormatExpr(uirCoreExprRhsOf(expr))
         case uirCoreExprBinOpOf(expr)
-        of mbAdd: op = "+"
-        of mbSub: op = "-"
-        of mbMul: op = "*"
-        of mbSdiv: op = "/"
-        of mbSmod: op = "%"
-        of mbAnd: op = "&"
-        of mbOr: op = "|"
-        of mbXor: op = "^"
-        of mbShl: op = "<<"
-        of mbShr: op = ">>"
-        return "(" + uirCoreFormatExpr(uirCoreExprLhsOf(expr)) + " " + op + " " + uirCoreFormatExpr(uirCoreExprRhsOf(expr)) + ")"
+        of mbAdd: return "(" + lhsText + " + " + rhsText + ")"
+        of mbSub: return "(" + lhsText + " - " + rhsText + ")"
+        of mbMul: return "(" + lhsText + " * " + rhsText + ")"
+        of mbSdiv: return "(" + lhsText + " / " + rhsText + ")"
+        of mbSmod: return "(" + lhsText + " % " + rhsText + ")"
+        of mbAnd: return "(" + lhsText + " & " + rhsText + ")"
+        of mbOr: return "(" + lhsText + " | " + rhsText + ")"
+        of mbXor: return "(" + lhsText + " ^ " + rhsText + ")"
+        of mbShl: return "(" + lhsText + " << " + rhsText + ")"
+        of mbShr: return "(" + lhsText + " >> " + rhsText + ")"
+        return "(" + lhsText + " ? " + rhsText + ")"
     if ek == meCmp:
-        var op2: str = "=="
+        let lhsText: str = uirCoreFormatExpr(uirCoreExprLhsOf(expr))
+        let rhsText: str = uirCoreFormatExpr(uirCoreExprRhsOf(expr))
         case uirCoreExprCmpOpOf(expr)
-        of mcEq: op2 = "=="
-        of mcNe: op2 = "!="
-        of mcLt: op2 = "<"
-        of mcLe: op2 = "<="
-        of mcGt: op2 = ">"
-        of mcGe: op2 = ">="
-        return "(" + uirCoreFormatExpr(uirCoreExprLhsOf(expr)) + " " + op2 + " " + uirCoreFormatExpr(uirCoreExprRhsOf(expr)) + ")"
+        of mcEq: return "(" + lhsText + " == " + rhsText + ")"
+        of mcNe: return "(" + lhsText + " != " + rhsText + ")"
+        of mcLt: return "(" + lhsText + " < " + rhsText + ")"
+        of mcLe: return "(" + lhsText + " <= " + rhsText + ")"
+        of mcGt: return "(" + lhsText + " > " + rhsText + ")"
+        of mcGe: return "(" + lhsText + " >= " + rhsText + ")"
+        return "(" + lhsText + " ? " + rhsText + ")"
     if ek == meLocal:
         return "$l" + intToStr(uirCoreExprLocalIndexOf(expr))
     if ek == meAddr:
@@ -6046,12 +6129,15 @@ fn uirCoreFormatExpr(expr: UirExprId): str =
     if ek == meGlobalAddr:
         return "&" + uirCoreExprGlobalNameOf(expr)
     if ek == meCall:
-        var out: str = uirCoreExprCalleeOf(expr) + "("
+        var parts: str[]
+        add(parts, uirCoreExprCalleeOf(expr))
+        add(parts, "(")
         for i in 0..<uirCoreExprArgsLen(expr):
             if i > 0:
-                out = out + ", "
-            out = out + uirCoreFormatExpr(uirCoreExprArgAt(expr, i))
-        return out + ")"
+                add(parts, ", ")
+            add(parts, uirCoreFormatExpr(uirCoreExprArgAt(expr, i)))
+        add(parts, ")")
+        return strutils.join(parts, "")
     if ek == meCast:
         let cty: UirCoreType = uirCoreExprCastTypeOf(expr)
         let cexpr: UirExprId = uirCoreExprCastExprOf(expr)
@@ -6062,102 +6148,118 @@ fn uirCoreFormatExpr(expr: UirExprId): str =
         if cty.kind == mtF32:
             return "f32(" + uirCoreFormatExpr(cexpr) + ")"
         if cty.kind == mtI64:
-            return (cty.isUnsigned ? "u64(" : "i64(") + uirCoreFormatExpr(cexpr) + ")"
+            if cty.isUnsigned:
+                return "u64(" + uirCoreFormatExpr(cexpr) + ")"
+            return "i64(" + uirCoreFormatExpr(cexpr) + ")"
         if cty.kind == mtI32:
-            return (cty.isUnsigned ? "u32(" : "i32(") + uirCoreFormatExpr(cexpr) + ")"
+            if cty.isUnsigned:
+                return "u32(" + uirCoreFormatExpr(cexpr) + ")"
+            return "i32(" + uirCoreFormatExpr(cexpr) + ")"
         if cty.kind == mtI16:
-            return (cty.isUnsigned ? "u16(" : "i16(") + uirCoreFormatExpr(cexpr) + ")"
+            if cty.isUnsigned:
+                return "u16(" + uirCoreFormatExpr(cexpr) + ")"
+            return "i16(" + uirCoreFormatExpr(cexpr) + ")"
         if cty.kind == mtI8:
-            return (cty.isUnsigned ? "u8(" : "i8(") + uirCoreFormatExpr(cexpr) + ")"
+            if cty.isUnsigned:
+                return "u8(" + uirCoreFormatExpr(cexpr) + ")"
+            return "i8(" + uirCoreFormatExpr(cexpr) + ")"
         return "i32(" + uirCoreFormatExpr(cexpr) + ")"
     return "?"
 
 fn uirCoreFormat(module: UirCoreModule): str =
-    var out: str = ""
-    out = out + "module " + module.target + "\n"
+    var parts: str[]
+    add(parts, "module ")
+    add(parts, module.target)
+    add(parts, "\n")
     for gi in 0..<module.globals.len:
         let g: UirCoreGlobal = module.globals[gi]
-        out = out + "global " + g.name + ": "
-        if g.ty.kind == mtVoid:
-            out = out + "void"
-        elif g.ty.kind == mtF64:
-            out = out + "f64"
-        elif g.ty.kind == mtF32:
-            out = out + "f32"
-        elif g.ty.kind == mtI64:
-            out = out + (g.ty.isUnsigned ? "u64" : "i64")
-        elif g.ty.kind == mtI32:
-            out = out + (g.ty.isUnsigned ? "u32" : "i32")
-        elif g.ty.kind == mtI16:
-            out = out + (g.ty.isUnsigned ? "u16" : "i16")
-        elif g.ty.kind == mtI8:
-            out = out + (g.ty.isUnsigned ? "u8" : "i8")
-        else:
-            out = out + "i32"
+        add(parts, "global ")
+        add(parts, g.name)
+        add(parts, ": ")
+        add(parts, uirCoreFormatTypeOrI32(g.ty))
         if g.hasInit:
-            out = out + " = " + intToStr(int32(g.init))
-        out = out + "\n"
+            add(parts, " = ")
+            add(parts, intToStr(int32(g.init)))
+        add(parts, "\n")
     for i in 0..<module.funcs.len:
         let f = module.funcs[i]
-        out = out + "fn " + uirCoreFuncNameOf(f) + "("
+        add(parts, "fn ")
+        add(parts, uirCoreFuncNameOf(f))
+        add(parts, "(")
         for pi in 0..<uirCoreFuncParamsLen(f):
             let p: UirCoreParam = uirCoreFuncParamAt(f, pi)
             if pi > 0:
-                out = out + ", "
-            out = out + p.name
-        out = out + "): "
+                add(parts, ", ")
+            add(parts, p.name)
+        add(parts, "): ")
         let retTy: UirCoreType = uirCoreFuncRetTypeOf(f)
-        if retTy.kind == mtVoid:
-            out = out + "void\n"
-        elif retTy.kind == mtF64:
-            out = out + "f64\n"
-        elif retTy.kind == mtF32:
-            out = out + "f32\n"
-        elif retTy.kind == mtI64:
-            out = out + (retTy.isUnsigned ? "u64\n" : "i64\n")
-        elif retTy.kind == mtI32:
-            out = out + (retTy.isUnsigned ? "u32\n" : "i32\n")
-        elif retTy.kind == mtI16:
-            out = out + (retTy.isUnsigned ? "u16\n" : "i16\n")
-        elif retTy.kind == mtI8:
-            out = out + (retTy.isUnsigned ? "u8\n" : "i8\n")
-        else:
-            out = out + "i32\n"
+        add(parts, uirCoreFormatTypeOrI32(retTy))
+        add(parts, "\n")
         for bi in 0..<uirCoreFuncBlocksLen(f):
             let b = uirCoreFuncBlockAt(f, bi)
             let bLabel: str = uirCoreBlockLabelOf(b)
-            out = out + bLabel + ":\n"
+            add(parts, bLabel)
+            add(parts, ":\n")
             for si in 0..<uirCoreBlockStmtsLen(b):
                 let s: UirStmtId = uirCoreBlockStmtAt(b, si)
                 let sk: UirCoreStmtKind = uirCoreStmtKindOf(s)
                 let sname: str = uirCoreStmtNameOf(s)
                 let sexpr: UirExprId = uirCoreStmtExprOf(s)
                 if sk == msLet:
-                    out = out + "  let " + sname + " = " + uirCoreFormatExpr(sexpr) + "\n"
+                    add(parts, "  let ")
+                    add(parts, sname)
+                    add(parts, " = ")
+                    add(parts, uirCoreFormatExpr(sexpr))
+                    add(parts, "\n")
                 elif sk == msVar:
-                    out = out + "  var " + sname + " = " + uirCoreFormatExpr(sexpr) + "\n"
+                    add(parts, "  var ")
+                    add(parts, sname)
+                    add(parts, " = ")
+                    add(parts, uirCoreFormatExpr(sexpr))
+                    add(parts, "\n")
                 elif sk == msAssign:
-                    out = out + "  " + sname + " = " + uirCoreFormatExpr(sexpr) + "\n"
+                    add(parts, "  ")
+                    add(parts, sname)
+                    add(parts, " = ")
+                    add(parts, uirCoreFormatExpr(sexpr))
+                    add(parts, "\n")
                 elif sk == msParam:
-                    out = out + "  param " + sname + "\n"
+                    add(parts, "  param ")
+                    add(parts, sname)
+                    add(parts, "\n")
                 elif sk == msStore:
-                    out = out + "  *" + uirCoreFormatExpr(uirCoreStmtAddrExprOf(s)) + " = " + uirCoreFormatExpr(sexpr) + "\n"
+                    add(parts, "  *")
+                    add(parts, uirCoreFormatExpr(uirCoreStmtAddrExprOf(s)))
+                    add(parts, " = ")
+                    add(parts, uirCoreFormatExpr(sexpr))
+                    add(parts, "\n")
                 else:
-                    out = out + "  expr " + uirCoreFormatExpr(sexpr) + "\n"
+                    add(parts, "  expr ")
+                    add(parts, uirCoreFormatExpr(sexpr))
+                    add(parts, "\n")
             let term: UirCoreTerm = uirCoreBlockTermOf(b)
             if term.kind == mtRet:
                 let retExpr: UirExprId = term.retExpr
                 if (!uirCoreExprIdValid(retExpr)):
-                    out = out + "  ret\n"
+                    add(parts, "  ret\n")
                 else:
-                    out = out + "  ret " + uirCoreFormatExpr(retExpr) + "\n"
+                    add(parts, "  ret ")
+                    add(parts, uirCoreFormatExpr(retExpr))
+                    add(parts, "\n")
             elif term.kind == mtBr:
-                out = out + "  br " + term.target + "\n"
+                add(parts, "  br ")
+                add(parts, term.target)
+                add(parts, "\n")
             else:
                 let condExpr: UirExprId = term.condExpr
-                out = out + "  cbr " + uirCoreFormatExpr(condExpr) + " ? " +
-                      term.targetTrue + " : " + term.targetFalse + "\n"
-    return out
+                add(parts, "  cbr ")
+                add(parts, uirCoreFormatExpr(condExpr))
+                add(parts, " ? ")
+                add(parts, term.targetTrue)
+                add(parts, " : ")
+                add(parts, term.targetFalse)
+                add(parts, "\n")
+    return strutils.join(parts, "")
 
 fn uirCoreValidateExpr(func: UirCoreFunc, expr: UirExprId, ctx: str): Result[bool] =
     if (!uirCoreExprIdValid(expr)):
@@ -6364,7 +6466,7 @@ fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
                     return Err[bool]("uirCore_validate: stmt missing expr (" + funcName + ":" + b2Label +
                                      " si=" + intToStr(si) +
                                      " kind=" + uirCoreStmtKindName(sk) +
-                                     " name=" + (len(sname) == 0 ? "" : sname) +
+                                     " name=" + uirCoreNormalizeStr(sname) +
                                      " slot=" + intToStr(sslot) + ")")
                 let eres: Result[bool] = uirCoreValidateExpr(func, sexpr, funcName + ":" + b2Label + "/stmt")
                 if ! IsOk[bool](eres):
@@ -6409,7 +6511,7 @@ fn uirCoreValidateFunc(module: UirCoreModule, func: UirCoreFunc): Result[bool] =
         if uirCoreFuncLocalTypesLen(func) > 0:
             let slotTy: UirCoreType = uirCoreFuncLocalTypeAt(func, ol2.slot)
             if slotTy.kind != mtI64:
-                let tk: str = len(ol2.typeKey) > 0 ? ol2.typeKey : ""
+                let tk: str = uirCoreNormalizeStr(ol2.typeKey)
                 return Err[bool]("uirCore_validate: obj local slot not i64 (" + funcName +
                                  " slot=" + intToStr(ol2.slot) +
                                  " ty=" + uirCoreTypeKindName(slotTy) +

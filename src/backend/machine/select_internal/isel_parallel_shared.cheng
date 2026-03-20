@@ -1,5 +1,6 @@
 import std/result
 import std/strings
+import std/strutils
 import std/system
 import std/hashmaps
 import std/rawmem_support
@@ -61,11 +62,18 @@ fn add(dst: var int32[], val: int32) =
     setLen(dst, needLen)
     dst[needLen - 1] = val
 
+fn add(dst: var str[], val: str) =
+    let needLen: int32 = dst.len + 1
+    if dst.cap < needLen:
+        reserve(dst, needLen)
+    setLen(dst, needLen)
+    dst[needLen - 1] = val
+
 fn iselNewLabelState(prefix: str): LabelState =
     var st: LabelState
     new st
     st.nextId = 0
-    let ownedPrefix: str = len(prefix) == 0 ? "" : ("" + prefix)
+    let ownedPrefix: str = strings.__cheng_str_clone(prefix)
     memRetain(ownedPrefix)
     st.prefix = ownedPrefix
     return st
@@ -511,7 +519,10 @@ fn iselModuleGlobalSym(module: UirModule, name: str,
     if isInternalSym(name):
         return name
     let base: str = stripTargetSymPrefixOnce(uirModuleTargetOf(module), name)
-    let out: str = symPrefix(module) + base
+    var parts: str[]
+    add(parts, symPrefix(module))
+    add(parts, base)
+    let out: str = strutils.join(parts, "")
     memRetain(out)
     return out
 
@@ -524,13 +535,18 @@ fn iselExprSummary(expr: UirExpr): str =
     if iselExprInvalid(expr):
         return "nil"
     let kind: int32 = int32(uirExprKindOf(expr))
-    var out: str = "kind=" + intToStr(kind)
+    var parts: str[]
+    add(parts, "kind=")
+    add(parts, intToStr(kind))
     if uirExprKindOf(expr) == meCall:
-        out = out + " callee=" + iselExprCalleeSafe(expr) +
-              " argc=" + intToStr(uirExprArgsLen(expr))
+        add(parts, " callee=")
+        add(parts, iselExprCalleeSafe(expr))
+        add(parts, " argc=")
+        add(parts, intToStr(uirExprArgsLen(expr)))
     elif uirExprKindOf(expr) == meGlobalAddr:
-        out = out + " global=" + uirExprGlobalNameOf(expr)
-    return out
+        add(parts, " global=")
+        add(parts, uirExprGlobalNameOf(expr))
+    return strutils.join(parts, "")
 
 fn iselReportEmptySymbol(kind: str, uirFunc: UirFunc, expr: UirExpr, rawName: str) =
     echo("[isel.err.empty_symbol]")
@@ -647,7 +663,9 @@ fn iselLowerFuncTasksSerialCore(module: UirModule, tasks: IselFuncTask[], dbgIse
                 if len(msg) > 0:
                     echo(msg)
             if len(msg) == 0:
-                let tiMsg: str = task != nil ? intToStr(task.funcIndex) : intToStr(ti)
+                let tiMsg: str = intToStr(ti)
+                if task != nil:
+                    return Err[IselFuncTaskResult[]]("isel: func task failed index=" + intToStr(task.funcIndex))
                 return Err[IselFuncTaskResult[]]("isel: func task failed index=" + tiMsg)
             return ErrInfo[IselFuncTaskResult[]](err)
         let loweredTask: IselFuncTaskResult = taskRes.value
@@ -723,7 +741,9 @@ fn iselLowerFuncTasksParallelCore(slots: var IselParallelTaskState[], module: Ui
             let msg: str = ErrorMessage(err)
             let task: IselFuncTask = state != nil ? state.task : nil
             if len(msg) == 0:
-                let tiMsg: str = task != nil ? intToStr(task.funcIndex) : intToStr(slot)
+                let tiMsg: str = intToStr(slot)
+                if task != nil:
+                    return Err[IselFuncTaskResult[]]("isel: func task failed index=" + intToStr(task.funcIndex))
                 return Err[IselFuncTaskResult[]]("isel: func task failed index=" + tiMsg)
             return ErrInfo[IselFuncTaskResult[]](err)
         let loweredTask: IselFuncTaskResult = taskRes.value

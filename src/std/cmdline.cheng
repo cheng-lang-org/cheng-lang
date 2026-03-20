@@ -1,6 +1,7 @@
 module cmdline
 # Command-line argument helpers.
 # - Runtime bridge only: argv ingress is provided by native runtime helpers.
+import std/rawmem_support as rawmem_support
 import std/strings as strings
 
 @importc("__cheng_rt_paramCount")
@@ -9,8 +10,13 @@ fn __cheng_rt_paramCount(): int32
 @importc("__cheng_rt_paramStr")
 fn __cheng_rt_paramStr(i: int32): cstring
 
-@importc("__cheng_rt_paramStrCopy")
-fn __cheng_rt_paramStrCopy(i: int32): str
+@importc("__cheng_rt_paramStrCopyBridgeInto")
+fn __cheng_rt_paramStrCopyInto(i: int32, out: var str)
+
+fn __cheng_rt_paramStrCopy(i: int32): str =
+    var out: str
+    __cheng_rt_paramStrCopyInto(i, out)
+    return out
 
 fn __cheng_cmdCountMax(): int32 =
     return 4096
@@ -31,8 +37,8 @@ fn cmdCountFromRuntime(): int32
 @importc("cheng_cmd_ready_compat")
 fn cmdReady(): bool
 
-@importc("cheng_program_name_compat")
-fn programName(): str
+fn programName(): str =
+    return __cheng_rt_paramStrCopy(0)
 
 @importc("paramCount")
 fn paramCount(): int32
@@ -40,11 +46,23 @@ fn paramCount(): int32
 fn argCount(): int32 =
     return paramCount()
 
-@importc("cheng_param_str_compat")
-fn paramStr(i: int32): str
+fn paramStr(i: int32): str =
+    return __cheng_rt_paramStrCopy(i)
 
 fn argStr(i: int32): str =
     return paramStr(i)
+
+fn cmdSetEmpty(outValue: var str) =
+    outValue.data = nil
+    outValue.len = 0
+    outValue.store_id = 0
+    outValue.flags = 0
+
+fn cmdSetStr(outValue: var str, value: str) =
+    outValue.data = value.data
+    outValue.len = value.len
+    outValue.store_id = value.store_id
+    outValue.flags = value.flags
 
 fn cmdStartsWith(text: str, prefix: str): bool =
     let n: int32 = strings.len(text)
@@ -94,15 +112,16 @@ fn cmdLowerAscii(raw: str): str =
     if strings.len(raw) == 0:
         return ""
     let n: int32 = strings.len(raw)
-    var out: str = ""
+    let out: str = newStringAlloc(n)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
     for i in 0..<n:
         let c: char = raw[i]
-        let ch: str = strings.sliceBytes(raw, i, 1)
+        var outCh: int32 = int32(c)
         if c >= 'A' && c <= 'Z':
-            let lowered: str = strings.sliceBytes("abcdefghijklmnopqrstuvwxyz", int32(c) - int32('A'), 1)
-            out = out + lowered
-        else:
-            out = out + ch
+            outCh = int32(c) - int32('A') + int32('a')
+        rawmem_support.rawmemSet(rawmem_support.rawmemPtrAdd(outPtr, i), outCh, 1)
     return out
 
 fn isFlag(arg: str): bool =
@@ -128,27 +147,26 @@ fn hasFlag(flag: str): bool =
     return findFlag(flag) > 0
 
 fn tryInlineFlagValue(arg: str, key: str, outValue: var str): bool =
-    outValue = ""
+    cmdSetEmpty(outValue)
     if strings.len(arg) == 0 || strings.len(key) == 0:
         return false
-    let prefixColon: str = key + ":"
-    if cmdStartsWith(arg, prefixColon):
-        outValue = strings.dropPrefix(arg, prefixColon)
+    if cmdStartsWith(arg, key + ":"):
+        cmdSetStr(outValue, strings.dropPrefix(arg, key + ":"))
         return true
-    let prefixEq: str = key + "="
-    if cmdStartsWith(arg, prefixEq):
-        outValue = strings.dropPrefix(arg, prefixEq)
+    if cmdStartsWith(arg, key + "="):
+        cmdSetStr(outValue, strings.dropPrefix(arg, key + "="))
         return true
     return false
 
 fn flagValue(arg: str, key: str): str =
-    var outValue: str = ""
+    var outValue: str
+    cmdSetEmpty(outValue)
     if tryInlineFlagValue(arg, key, outValue):
         return outValue
     return ""
 
 fn readFlagValueAt(i: int32, key: str, outValue: var str, outNextIndex: var int32): bool =
-    outValue = ""
+    cmdSetEmpty(outValue)
     outNextIndex = i
     if strings.len(key) == 0:
         return false
@@ -272,7 +290,8 @@ fn readBoolFlagAt(i: int32, trueName: str, falseName: str, valueName: str,
         outValue = false
         return true
     let hasValueName: bool = strings.len(valueName) > 0
-    var raw: str = ""
+    var raw: str
+    cmdSetEmpty(raw)
     if hasValueName:
         let hasInlineValue: bool = tryInlineFlagValue(arg, valueName, raw)
         if hasInlineValue:
@@ -289,7 +308,8 @@ fn readBoolFlagAt(i: int32, trueName: str, falseName: str, valueName: str,
     return false
 
 fn readIntFlagAt(i: int32, key: str, outValue: var int32, outNextIndex: var int32): bool =
-    var raw: str = ""
+    var raw: str
+    cmdSetEmpty(raw)
     if !readFlagValueAt(i, key, raw, outNextIndex):
         return false
     let parsedOk: bool = parseInt32(raw, outValue)

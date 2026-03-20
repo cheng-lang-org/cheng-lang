@@ -1,0 +1,63 @@
+import std/system
+import std/os as os
+import std/strings
+import std/result
+import std/rawbytes
+import std/net/transports/udp_syscall as udp
+
+fn perfEnvInt(name: str, defaultValue: int32): int32 =
+    let raw: str = os.getEnvDefault(name, "")
+    if len(raw) <= 0:
+        return defaultValue
+    var value: int32 = 0
+    var i: int32 = 0
+    while i < len(raw):
+        let ch: char = raw[i]
+        if ch < '0' || ch > '9':
+            return defaultValue
+        value = value * 10 + (int32(ch) - int32('0'))
+        i = i + 1
+    return value
+
+fn udpRecvLoop(fd: int32, maxBytes: int32, maxAttempts: int32): Result[udp.UdpRecvResult] =
+    var attempts: int32 = 0
+    while attempts < maxAttempts:
+        let recvRes: Result[udp.UdpRecvResult] = udp.udpRecvFromNonblock(fd, maxBytes)
+        if IsOk(recvRes):
+            return recvRes
+        attempts = attempts + 1
+    return Err[udp.UdpRecvResult]("udp witness: recv timeout")
+
+fn main() =
+    let iterations: int32 = perfEnvInt("STD_PERF_ITERS", 16)
+    let recvSockRes: Result[udp.UdpSocketHandle] = udp.udpSocketOpenDgram(false)
+    assert(IsOk(recvSockRes), "udp witness recv open")
+    var recvSock: udp.UdpSocketHandle = Value(recvSockRes)
+
+    let bindAddrRes: Result[udp.UdpSockAddr] = udp.udpSockAddrFromHostPort("127.0.0.1", 0, false, 0, false)
+    assert(IsOk(bindAddrRes), "udp witness bind addr")
+    let bindAddr: udp.UdpSockAddr = Value(bindAddrRes)
+    assert(IsOk(udp.udpBindAddr(recvSock.fd, bindAddr)), "udp witness bind")
+
+    let localAddrRes: Result[udp.UdpSockAddr] = udp.udpGetSockName(recvSock.fd)
+    assert(IsOk(localAddrRes), "udp witness getsockname")
+    let localAddr: udp.UdpSockAddr = Value(localAddrRes)
+
+    let sendSockRes: Result[udp.UdpSocketHandle] = udp.udpSocketOpenDgram(false)
+    assert(IsOk(sendSockRes), "udp witness send open")
+    var sendSock: udp.UdpSocketHandle = Value(sendSockRes)
+
+    var total: int32 = 0
+    var i: int32 = 0
+    while i < iterations:
+        let payload: Bytes = bytesFromString("ping")
+        assert(IsOk(udp.udpSendTo(sendSock.fd, payload, localAddr)), "udp witness send")
+        let recvRes: Result[udp.UdpRecvResult] = udpRecvLoop(recvSock.fd, 64, 200)
+        assert(IsOk(recvRes), "udp witness recv")
+        let got: udp.UdpRecvResult = Value(recvRes)
+        total = total + bytesLen(got.data)
+        i = i + 1
+
+    udp.udpSocketClose(sendSock.fd)
+    udp.udpSocketClose(recvSock.fd)
+    echo(intToStr(total))

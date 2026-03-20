@@ -31,6 +31,200 @@ fn stage1PtrStoreDiagnosticSeq(dst: ptr, value: Diagnostic[]) =
     var tmp: Diagnostic[] = value
     memCopyCompat(dst, &tmp, int32(sizeof Diagnostic[]))
 
+fn stage1ChooseNonEmpty(primary: str, fallback: str): str =
+    if len(primary) > 0:
+        return primary
+    return fallback
+
+fn stage1JoinParts(parts: str[]): str =
+    return strutils.join(parts, "")
+
+fn cacheStrictValue(): str =
+    if orcStrictEnabled():
+        return "1"
+    return "0"
+
+fn stage1EnsureChengExt(path: str): str =
+    if endsWith(path, ".cheng"):
+        return path
+    return stage1AppendChengExt(path)
+
+fn stage1JoinImportBase(base: str, path: str): str =
+    if len(base) > 0:
+        return stage1JoinWithSlash(base, path)
+    return path
+
+fn stage1ImportReadableText(path: str): str =
+    if stage1PathReadable(path):
+        return "1"
+    return "0"
+
+fn stage1ResolveReadableImportPath(path: str, rootDir: str): str =
+    if stage1PathReadable(path):
+        return normalizeImportPathChecked(path, rootDir)
+    return ""
+
+fn stage1ResolveReadableImportPathWithExt(path: str, rootDir: str): str =
+    return stage1ResolveReadableImportPath(stage1EnsureChengExt(path), rootDir)
+
+fn stage1TrimImportPrefix(path: str, prefix: str): str =
+    if len(path) > len(prefix) && hasPrefix(path, prefix):
+        return sliceRange(path, len prefix, len path - 1)
+    return path
+
+fn stage1ResolvePkgRelSub(rel: str): str =
+    if hasPrefix(rel, "cheng/"):
+        if len rel > 6:
+            return sliceRange(rel, 6, len rel - 1)
+        return ""
+    return rel
+
+fn stage1ResolveImportUnderBase(baseRoot: str, rel: str): str =
+    if len(baseRoot) == 0 || len(rel) == 0:
+        return ""
+    return stage1ResolveReadableImportPathWithExt(joinPath(baseRoot, rel), baseRoot)
+
+fn stage1ResolvePkgSearchSrcCheng(root: str, rel: str): str =
+    if len(rel) == 0:
+        return ""
+    if len(resolvePkgCandidate(joinPath(root, "src"), rel)) > 0:
+        return resolvePkgCandidate(joinPath(root, "src"), rel)
+    return resolvePkgCandidate(joinPath(root, "cheng"), rel)
+
+fn stage1ResolvePkgSearchSrcChengRoot(root: str, rel: str): str =
+    if len(rel) == 0:
+        return ""
+    if len(resolvePkgCandidate(joinPath(root, "src"), rel)) > 0:
+        return resolvePkgCandidate(joinPath(root, "src"), rel)
+    if len(resolvePkgCandidate(joinPath(root, "cheng"), rel)) > 0:
+        return resolvePkgCandidate(joinPath(root, "cheng"), rel)
+    return resolvePkgCandidate(root, rel)
+
+fn stage1ResolvePkgNamedRoot(root: str, pkgName: str, relForPkgRoot: str, expectedPkgId: str): str =
+    if len(pkgName) == 0:
+        return ""
+    if ! stage1PathReadable(joinPath(root, "cheng-package.toml")):
+        return ""
+    if ! packageIdMatches(joinPath(root, "cheng-package.toml"), expectedPkgId):
+        return ""
+    return resolvePkgPathInRoot2(
+        root,
+        stage1TrimImportPrefix(relForPkgRoot, stage1JoinWithSlash(pkgName, "")),
+        relForPkgRoot
+    )
+
+fn stage1ResolvePkgImportFromRoot(root: str, importPath: str, expectedPkgId: str, importPkgName: str, relForPkgRoot: str, slash: int32): str =
+    if len(root) == 0:
+        return ""
+    if stage1_fileExists(joinPath(root, "cheng-package.toml")):
+        if ! packageIdMatches(joinPath(root, "cheng-package.toml"), expectedPkgId):
+            return ""
+        # Production layout: a package root contains `src/` as the module root.
+        # Example: import `ai/foo/bar` -> <pkgroot>/src/foo/bar.cheng
+        return resolvePkgPathInRoot2(
+            root,
+            stage1TrimImportPrefix(relForPkgRoot, stage1JoinWithSlash(importPkgName, "")),
+            relForPkgRoot
+        )
+    if len(expectedPkgId) > 0:
+        if len(stage1ResolvePkgNamedRoot(joinPath(root, stage1Concat2("cheng-", importPkgName)), importPkgName, relForPkgRoot, expectedPkgId)) > 0:
+            return stage1ResolvePkgNamedRoot(joinPath(root, stage1Concat2("cheng-", importPkgName)), importPkgName, relForPkgRoot, expectedPkgId)
+        return stage1ResolvePkgNamedRoot(joinPath(root, importPkgName), importPkgName, relForPkgRoot, expectedPkgId)
+    if slash > 0 && slash < len importPath - 1:
+        return resolvePkgPathInRoot(
+            joinPath(root, sliceRange(importPath, 0, slash - 1)),
+            sliceRange(importPath, slash + 1, len importPath - 1)
+        )
+    return ""
+
+fn stage1ResolvePkgImportPathWithParts(importPath: str, expectedPkgId: str, importPkgName: str, relForPkgRoot: str): str =
+    let roots: str[] = stage1PkgRoots()
+    let slash: int32 = indexOfSlash(importPath)
+    for i in 0..<roots.len:
+        if len(roots[i]) > 0 && len(stage1ResolvePkgImportFromRoot(roots[i], importPath, expectedPkgId, importPkgName, relForPkgRoot, slash)) > 0:
+            return stage1ResolvePkgImportFromRoot(roots[i], importPath, expectedPkgId, importPkgName, relForPkgRoot, slash)
+    return ""
+
+fn stage1ResolveStdImportPath(stdPath: str, rawPath: str, baseDir: str, rootDir: str, dbgImports: bool): str =
+    if dbgImports:
+        echo("[importdbg] resolve.std raw='" + rawPath + "' baseDir='" + baseDir + "' rootDir='" + rootDir + "' stdPath='" + stdPath + "' readable=" + stage1ImportReadableText(stdPath))
+    if stage1PathReadable(stdPath):
+        if dbgImports:
+            echo("[importdbg] resolve.std.resolved='" + normalizeImportPathChecked(stdPath, rootDir) + "'")
+        return normalizeImportPathChecked(stdPath, rootDir)
+    return ""
+
+fn stage1ResolveLegacyBootstrapImportPath(full: str, rootDir: str): str =
+    if hasPrefix(full, "cheng/stdlib/bootstrap/core/"):
+        return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src/core"), sliceRange(full, 28, len full - 1)), rootDir)
+    if hasPrefix(full, "cheng/stdlib/bootstrap/system/"):
+        return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src/system"), sliceRange(full, 30, len full - 1)), rootDir)
+    if hasPrefix(full, "cheng/stdlib/bootstrap/std/"):
+        return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src/std"), sliceRange(full, 27, len full - 1)), rootDir)
+    return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src/std"), sliceRange(full, 23, len full - 1)), rootDir)
+
+fn stage1ResolveChengImportPath(full: str, rootDir: str): str =
+    if len(stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src"), sliceRange(full, 6, len full - 1)), rootDir)) > 0:
+        return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src"), sliceRange(full, 6, len full - 1)), rootDir)
+    if len(stage1ResolveReadableImportPathWithExt(joinPath(rootDir, full), rootDir)) > 0:
+        return stage1ResolveReadableImportPathWithExt(joinPath(rootDir, full), rootDir)
+    return resolvePkgImportPath full
+
+fn stage1ResolveDefaultImportPath(full: str, baseDir: str, rootDir: str): str =
+    if len(stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src"), full), rootDir)) > 0:
+        return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src"), full), rootDir)
+    if len(baseDir) > 0:
+        if len(stage1ResolveReadableImportPath(joinPath(baseDir, stage1EnsureChengExt(full)), rootDir)) > 0:
+            return stage1ResolveReadableImportPath(joinPath(baseDir, stage1EnsureChengExt(full)), rootDir)
+        if len(stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/core"), stage1EnsureChengExt(full)), rootDir)) > 0:
+            return stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/core"), stage1EnsureChengExt(full)), rootDir)
+        if len(stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/system"), stage1EnsureChengExt(full)), rootDir)) > 0:
+            return stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/system"), stage1EnsureChengExt(full)), rootDir)
+        if len(stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/std"), stage1EnsureChengExt(full)), rootDir)) > 0:
+            return stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/std"), stage1EnsureChengExt(full)), rootDir)
+        if indexOfSlash(full) >= 0:
+            return resolvePkgImportPath full
+        return ""
+    if len(stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/core"), stage1EnsureChengExt(full)), rootDir)) > 0:
+        return stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/core"), stage1EnsureChengExt(full)), rootDir)
+    if len(stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/system"), stage1EnsureChengExt(full)), rootDir)) > 0:
+        return stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/system"), stage1EnsureChengExt(full)), rootDir)
+    if len(stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/std"), stage1EnsureChengExt(full)), rootDir)) > 0:
+        return stage1ResolveReadableImportPath(joinPath(joinPath(rootDir, "src/std"), stage1EnsureChengExt(full)), rootDir)
+    if indexOfSlash(full) >= 0:
+        return resolvePkgImportPath full
+    return ""
+
+fn stage1CanonicalizedChengCandidate(resolved: str, rootDir: str): str =
+    if hasPrefix(resolved, stage1JoinWithSlash(joinPath(rootDir, "src"), "")):
+        return joinPath(
+            joinPath(rootDir, "cheng"),
+            sliceRange(
+                resolved,
+                len(stage1JoinWithSlash(joinPath(rootDir, "src"), "")),
+                len resolved - 1
+            )
+        )
+    return ""
+
+fn stage1ResolveImportNormalized(rawPath: str, baseDir: str, rootDir: str): str =
+    return stage1NormalizeVisitedPath(canonicalizeResolvedPath(resolveImportPath(rawPath, baseDir, rootDir), rootDir))
+
+fn stage1ResolveImportOrRaw(rawPath: str, baseDir: str, rootDir: str): str =
+    if len(resolveImportPath(rawPath, baseDir, rootDir)) == 0:
+        return rawPath
+    return resolveImportPath(rawPath, baseDir, rootDir)
+
+fn stage1ResolveImportCanonicalOrRaw(rawPath: str, baseDir: str, rootDir: str): str =
+    if len(stage1ResolveImportOrRaw(rawPath, baseDir, rootDir)) > 0:
+        return canonicalizeResolvedPath(stage1ResolveImportOrRaw(rawPath, baseDir, rootDir), rootDir)
+    return ""
+
+fn stage1ImportTraceOwner(rootPath: str, baseDir: str): str =
+    if len(rootPath) > 0:
+        return rootPath
+    return baseDir
+
 fn stage1PtrLoadImportTrace(src: ptr): ImportTrace =
     var out: ImportTrace
     if src == nil:
@@ -75,15 +269,9 @@ fn stage1_c_fileExists(path: cstring): int32
 @importc("cheng_file_size")
 fn stage1_c_fileSize(path: cstring): int64
 type
-    Stage1StrBridge =
-        ptr: cstring
-        len: int32
-        store_id: int32
-        flags: int32
+    Stage1StrBridge = str
 @importc("driver_c_read_file_all_bridge_into")
 fn stage1_c_readFileAllBridgeInto(path: cstring, out: var Stage1StrBridge)
-@importc("cheng_strlen")
-fn stage1_c_strlen(s: str): int32
 @importc("driver_c_active_input_path")
 fn stage1_c_activeInputPath(): cstring
 
@@ -99,22 +287,19 @@ fn stage1_clearMainInputRaw() =
     stage1_main_input_raw_pending = false
 
 fn stage1_bridgeStrToOwned(value: Stage1StrBridge): str =
-    if value.ptr == nil || value.len <= 0:
+    if strLenFast(value) <= 0 || strDataPtr(value) == nil:
         return ""
-    return newStringCopy(value.ptr, value.len)
+    return newStringCopy(strDataPtr(value), strLenFast(value))
 
 fn stage1_bridgeStrZero(value: var Stage1StrBridge) =
-    value.ptr = nil
-    value.len = 0
-    value.store_id = 0
-    value.flags = 0
+    value = strEmpty()
 
 fn stage1_readFileFast(path: str): str =
-    if stage1_c_strlen(path) == 0:
+    if strLenFast(path) == 0:
         return ""
     var bridge: Stage1StrBridge
     stage1_bridgeStrZero(bridge)
-    stage1_c_readFileAllBridgeInto(cstring(path), bridge)
+    stage1_c_readFileAllBridgeInto(strToCStringTemp(path), bridge)
     return stage1_bridgeStrToOwned(bridge)
 
 fn stage1_readFileIntoRaw(pathRaw: cstring, out: var str): bool =
@@ -123,15 +308,15 @@ fn stage1_readFileIntoRaw(pathRaw: cstring, out: var str): bool =
         return false
     var bridge: Stage1StrBridge
     stage1_bridgeStrZero(bridge)
-    stage1_c_readFileAllBridgeInto(cstring(pathRaw), bridge)
+    stage1_c_readFileAllBridgeInto(pathRaw, bridge)
     let fastText: str = stage1_bridgeStrToOwned(bridge)
     out = fastText
-    if stage1_c_strlen(fastText) > 0:
+    if strLenFast(fastText) > 0:
         return true
-    return stage1_c_fileExists(cstring(pathRaw)) != 0
+    return stage1_c_fileExists(pathRaw) != 0
 
 fn stage1_pathLooksPrintable(path: str): bool =
-    if stage1_c_strlen(path) == 0:
+    if strLenFast(path) == 0:
         return false
     for i in 0..<len(path):
         let c: char = path[i]
@@ -251,7 +436,9 @@ fn stage1_getEnv(name: str): str =
     return stage1_c_getenv name
 
 fn stage1SafeStr(s: str): str =
-    return strNonEmpty(s) ? s : ""
+    if strNonEmpty(s):
+        return s
+    return ""
 
 fn lowerAscii(s: str): str =
     return strutils.toLowerAscii(stage1SafeStr(s))
@@ -279,7 +466,9 @@ fn stage1JoinWithSlash(left: str, right: str): str =
     return safeLeft + "/" + safeRight
 
 fn stage1AppendChengExt(path: str): str =
-    return endsWith(path, ".cheng") ? path : stage1Concat2(path, ".cheng")
+    if endsWith(path, ".cheng"):
+        return path
+    return stage1Concat2(path, ".cheng")
 
 fn stage1EqAsciiLowerKeyword(raw: str, lowerKeyword: str): bool =
     if len(raw) != len(lowerKeyword):
@@ -340,9 +529,7 @@ fn stage1_autoSystemEnabled(): bool =
     return true
 
 fn stage1_parseModeNormalized(): str =
-    var raw: str = stage1_getEnv("BACKEND_STAGE1_PARSE_MODE")
-    if raw == "":
-        raw = stage1_getEnv("STAGE1_PARSE_MODE")
+    let raw: str = stage1ChooseNonEmpty(stage1_getEnv("BACKEND_STAGE1_PARSE_MODE"), stage1_getEnv("STAGE1_PARSE_MODE"))
     if stage1EqAsciiLowerKeyword(raw, "outline"):
         return "outline"
     if stage1EqAsciiLowerKeyword(raw, "full"):
@@ -471,11 +658,13 @@ fn stage1DebugPipeWritePrefixInt(f: os.File, prefix: str, value: int32) =
 fn stage1PhasePush(name: str, detail: str = "") =
     if !stage1PhaseTraceEnabled():
         return
-    var item: str = name
     if len(detail) > 0:
-        item = stage1Concat3(name, ": ", detail)
-    add(stage1PhaseStack, item)
-    stage1PhaseWritePrefixItem("[stage1.phase+] ", item)
+        let item: str = stage1Concat3(name, ": ", detail)
+        add(stage1PhaseStack, item)
+        stage1PhaseWritePrefixItem("[stage1.phase+] ", item)
+        return
+    add(stage1PhaseStack, name)
+    stage1PhaseWritePrefixItem("[stage1.phase+] ", name)
 
 fn stage1PhasePop() =
     if !stage1PhaseTraceEnabled():
@@ -606,9 +795,7 @@ fn stage1ResolvePluginImportPath(path: str): str =
     if pluginPaths.len == 0:
         return ""
     let relFromPkg: str = importPathDropChengPrefix(path)
-    var pluginRel: str = relFromPkg
-    if relFromPkg == "":
-        pluginRel = path
+    let pluginRel: str = stage1ChooseNonEmpty(relFromPkg, path)
     for i in 0..<pluginPaths.len:
         let root: str = pluginPaths[i]
         if len(root) == 0:
@@ -742,9 +929,7 @@ fn cacheTargetPlatform(): str =
 
 fn cacheMetaLine(): str =
     let mm: str = memMode()
-    var strictVal: str = "0"
-    if orcStrictEnabled():
-        strictVal = "1"
+    let strictVal: str = cacheStrictValue()
     return "meta=compiler=" + cacheCompilerVersion() +
            ";mm=" + mm +
            ";mm_strict=" + strictVal +
@@ -864,21 +1049,23 @@ fn hexDigit(v: int32): char =
     return chr code
 
 fn u64ToHex(v: uint64): str =
-    var outText: str = ""
+    var parts: str[] = []
     for i in 0..<16:
         let shift: int32 =(15 - i) * 4
         let masked: uint64 =(v >> uint64(shift)) & uint64(15)
         let digit: int32 = int32(masked)
         let c: char = hexDigit digit
-        outText = outText + charToStr(c)
-    return outText
+        add(parts, charToStr(c))
+    return stage1JoinParts(parts)
 
 fn moduleTag(path: str): str =
-    var base: str = stage1SplitName path
-    if len base == 0:
-        base = "module"
+    let base: str = stage1ChooseNonEmpty(stage1SplitName(path), "module")
     let key: str = u64ToHex(hash64(path))
-    let tag: str = base + "-" + key
+    var tagParts: str[] = []
+    add(tagParts, base)
+    add(tagParts, "-")
+    add(tagParts, key)
+    let tag: str = stage1JoinParts(tagParts)
     releaseString key
     return tag
 
@@ -890,17 +1077,22 @@ fn stage1_int64ToStr(v: int64): str =
     if n < 0:
         neg = true
         n = -n
-    var out: str = ""
+    var digits: str[] = []
     while n > 0:
         let digitVal: int64 = n % 10
         let digit: int32 = int32(digitVal)
         let code: int32 = int32('0') + digit
         let digitChar: char = chr code
-        out = charToStr digitChar + out
+        add(digits, charToStr(digitChar))
         n = n / 10
+    var parts: str[] = []
     if neg:
-        out = "-" + out
-    return out
+        add(parts, "-")
+    let __for_start_i = digits.len - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        add(parts, digits[i])
+    return stage1JoinParts(parts)
 
 fn parseInt64(s: str): int64 =
     let n: int32 = len s
@@ -945,7 +1137,10 @@ fn dumpTokens(path: str, tokens: Token[]) =
     if ! tokenTraceEnabled path:
         return
     let maxCount: int32 = tokenTraceMax()
-    let header: str = "TOKENS " + path
+    var headerParts: str[] = []
+    add(headerParts, "TOKENS ")
+    add(headerParts, path)
+    let header: str = stage1JoinParts(headerParts)
     echo header
     releaseString header
     for i in 0..<tokens.len:
@@ -956,19 +1151,26 @@ fn dumpTokens(path: str, tokens: Token[]) =
         let colStr: str = stage1_int64ToStr int64(t.col)
         let kindStr: str = kindName t.kind
         let lexStr: str = escapeCacheField tokenLexeme(t)
-        let msg0: str = lineStr + ":" + colStr
-        let msg1: str = msg0 + " " + kindStr
-        let msg2: str = msg1 + " " + lexStr
+        var msgParts: str[] = []
+        add(msgParts, lineStr)
+        add(msgParts, ":")
+        add(msgParts, colStr)
+        add(msgParts, " ")
+        add(msgParts, kindStr)
+        add(msgParts, " ")
+        add(msgParts, lexStr)
+        let msg2: str = stage1JoinParts(msgParts)
         echo msg2
         releaseString lineStr
         releaseString colStr
         releaseString lexStr
-        releaseString msg0
-        releaseString msg1
         releaseString msg2
     if tokens.len > maxCount:
         let totalStr: str = stage1_int64ToStr int64(tokens.len)
-        let tail: str = "... total=" + totalStr
+        var tailParts: str[] = []
+        add(tailParts, "... total=")
+        add(tailParts, totalStr)
+        let tail: str = stage1JoinParts(tailParts)
         echo tail
         releaseString totalStr
         releaseString tail
@@ -977,26 +1179,26 @@ fn escapeCacheField(s: str): str =
     let n: int32 = len s
     if n == 0:
         return ""
-    var outText: str = ""
+    var parts: str[] = []
     for i in 0..<n:
         let c: char = s[i]
         if c == '\\':
-            outText = outText + "\\\\"
+            add(parts, "\\\\")
         elif c == '\n':
-            outText = outText + "\\n"
+            add(parts, "\\n")
         elif c == '\r':
-            outText = outText + "\\r"
+            add(parts, "\\r")
         elif c == '\t':
-            outText = outText + "\\t"
+            add(parts, "\\t")
         else:
-            outText = outText + charToStr(c)
-    return outText
+            add(parts, charToStr(c))
+    return stage1JoinParts(parts)
 
 fn unescapeCacheField(s: str): str =
     let n: int32 = len s
     if n == 0:
         return ""
-    var outText: str = ""
+    var parts: str[] = []
     var i: int32 = 0
     for __for_guard_i in 0..<n:
         if !(i < n):
@@ -1005,24 +1207,24 @@ fn unescapeCacheField(s: str): str =
         if c == '\\' && i + 1 < n:
             let n2: char = s[i + 1]
             if n2 == 'n':
-                outText = outText + "\n"
+                add(parts, "\n")
                 i = i + 2
                 continue
             elif n2 == 'r':
-                outText = outText + "\r"
+                add(parts, "\r")
                 i = i + 2
                 continue
             elif n2 == 't':
-                outText = outText + "\t"
+                add(parts, "\t")
                 i = i + 2
                 continue
             elif n2 == '\\':
-                outText = outText + "\\"
+                add(parts, "\\")
                 i = i + 2
                 continue
-        outText = outText + charToStr(c)
+        add(parts, charToStr(c))
         i = i + 1
-    return outText
+    return stage1JoinParts(parts)
 
 fn sliceRangePlainKnownLen(s: str, n: int32, start: int32, stop: int32): str =
     var a: int32 = start
@@ -1093,7 +1295,10 @@ fn cacheFieldValue(line: str, prefix: str): str =
 fn cachePath(path: str): str =
     let dir: str = cacheDir()
     let key: str = u64ToHex(hash64(path))
-    let name: str = key + ".tok"
+    var nameParts: str[] = []
+    add(nameParts, key)
+    add(nameParts, ".tok")
+    let name: str = stage1JoinParts(nameParts)
     let out: str = joinPath(dir, name)
     releaseString key
     releaseString name
@@ -1107,7 +1312,7 @@ fn loadTokenCacheInto(path: str, size: int64, mtime: int64, out: Token[]*): bool
         releaseString cpath
     if !stage1_fileExists(cpath):
         return false
-    var content: str = ""
+    var content: str
     let readOk: bool = stage1_readFileInto(cpath, content)
     defer:
         releaseString content
@@ -1218,11 +1423,11 @@ fn writeTokenCache(path: str, size: int64, mtime: int64, tokens: Token[]) =
     c_fclose f
 
 fn stage1_fileExists(path: str): bool =
-    let n: int32 = stage1_c_strlen(path)
+    let n: int32 = strLenFast(path)
     if n == 0:
         return false
     let stablePath: str = path
-    let exists: bool = stage1_c_fileExists(cstring(stablePath)) != 0
+    let exists: bool = stage1_c_fileExists(strToCStringTemp(stablePath)) != 0
     if exists:
         return true
     if !stage1_pathLooksPrintable(stablePath):
@@ -1230,13 +1435,13 @@ fn stage1_fileExists(path: str): bool =
         if activeRaw != nil:
             return stage1_c_fileExists(activeRaw) != 0
     if stage1_main_input_raw_pending && stage1_main_input_raw != nil:
-        return stage1_c_fileExists(cstring(stage1_main_input_raw)) != 0
+        return stage1_c_fileExists(stage1_main_input_raw) != 0
     return false
 
 fn stage1_readFileInto(path: str, out: var str): bool =
     let dbgRead: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
     let dbgFile: os.File = dbgRead ? os.get_stderr() : nil
-    let pathLen: int32 = stage1_c_strlen(path)
+    let pathLen: int32 = strLenFast(path)
     if pathLen == 0:
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read empty_path")
@@ -1248,20 +1453,20 @@ fn stage1_readFileInto(path: str, out: var str): bool =
     if dbgRead:
         os.write(dbgFile, "[frontend] read path=")
         os.writeLine(dbgFile, stablePath)
-        os.writeLine(dbgFile, stage1_c_fileExists(cstring(stablePath)) != 0 ? "[frontend] read exists_pre_yes" : "[frontend] read exists_pre_no")
+        os.writeLine(dbgFile, stage1_c_fileExists(strToCStringTemp(stablePath)) != 0 ? "[frontend] read exists_pre_yes" : "[frontend] read exists_pre_no")
     let fastText: str = stage1_readFileFast(stablePath)
-    if stage1_c_strlen(fastText) > 0:
+    if strLenFast(fastText) > 0:
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read fast_nonempty")
         out = fastText
         return true
     if dbgRead:
         os.writeLine(dbgFile, "[frontend] read fast_empty")
-    let size64: int64 = stage1_c_fileSize(cstring(stablePath))
+    let size64: int64 = stage1_c_fileSize(strToCStringTemp(stablePath))
     if size64 > 0 && size64 <= int64(2147483647):
         if dbgRead:
             os.writeLine(dbgFile, "[frontend] read size_positive")
-        var sizedText: str = ""
+        var sizedText: str
         let _sizedOk: bool = os.readFileSizedInto(stablePath, int32(size64), sizedText)
         if len(sizedText) > 0:
             if dbgRead:
@@ -1272,7 +1477,7 @@ fn stage1_readFileInto(path: str, out: var str): bool =
             os.writeLine(dbgFile, "[frontend] read sized_empty")
     elif dbgRead:
         os.writeLine(dbgFile, "[frontend] read size_nonpositive")
-    var fallbackText: str = ""
+    var fallbackText: str
     let _fallbackOk: bool = os.readFileInto(stablePath, fallbackText)
     out = fallbackText
     if len(fallbackText) > 0:
@@ -1280,7 +1485,7 @@ fn stage1_readFileInto(path: str, out: var str): bool =
             os.writeLine(dbgFile, "[frontend] read fallback_nonempty")
         return true
     if dbgRead:
-        os.writeLine(dbgFile, stage1_c_fileExists(cstring(stablePath)) != 0 ? "[frontend] read fallback_empty_exists_yes" : "[frontend] read fallback_empty_exists_no")
+        os.writeLine(dbgFile, stage1_c_fileExists(strToCStringTemp(stablePath)) != 0 ? "[frontend] read fallback_empty_exists_yes" : "[frontend] read fallback_empty_exists_no")
     if !stage1_pathLooksPrintable(stablePath):
         let activeRaw: cstring = stage1_c_activeInputPath()
         let activeOk: bool = stage1_readFileIntoRaw(activeRaw, out)
@@ -1295,10 +1500,10 @@ fn stage1_readFileInto(path: str, out: var str): bool =
             if dbgRead:
                 os.writeLine(dbgFile, "[frontend] read raw_main_input_fallback")
             return true
-    return stage1_c_fileExists(cstring(stablePath)) != 0
+    return stage1_c_fileExists(strToCStringTemp(stablePath)) != 0
 
 fn stage1_readFile(path: str): str =
-    var out: str = ""
+    var out: str
     let _ok: bool = stage1_readFileInto(path, out)
     return out
 
@@ -1600,14 +1805,13 @@ fn appendImportDepId(base: str, itemId: AstNodeId, out: str[]*) =
     let path: str = importNodePathId(itemId)
     if len path == 0:
         return
-    var full: str = path
-    if len base > 0:
-        full = stage1JoinWithSlash(base, path)
+    var parts: str[] = []
+    add(parts, stage1JoinImportBase(base, path))
     let alias: str = importAliasValueId(itemId)
     if len alias > 0:
-        full = full + " as "
-        full = full + alias
-    add(out, full)
+        add(parts, " as ")
+        add(parts, alias)
+    add(out, stage1JoinParts(parts))
 
 fn stripImportAlias(item: str): str =
     if len(item) == 0:
@@ -1732,7 +1936,7 @@ fn stage1PathReadable(path: str): bool =
         return false
     if stage1_fileExists(path):
         return true
-    var content: str = ""
+    var content: str
     let readOk: bool = stage1_readFileInto(path, content)
     if readOk && len(content) > 0:
         return true
@@ -1857,391 +2061,99 @@ fn packageIdFromManifest(manifestPath: str): str =
         return ""
     if !stage1PathReadable(manifestPath):
         return ""
-    var content: str = ""
+    var content: str
     let _readOk: bool = stage1_readFileInto(manifestPath, content)
     if len(content) == 0 || content[0] == char(0):
         return ""
     let contentLen: int32 = len content
-    let key: str = "package_id"
     var start: int32 = 0
     for i in 0..contentLen:
         if i == contentLen || content[i] == '\n':
             if i > start:
-                let line: str = sliceRange(content, start, i - 1)
-                let trimmed: str = stripSpaces line
-                if startsWith(trimmed, key):
-                    if len trimmed == len key || trimmed[len key] == '=' ||
-                       trimmed[len key] == ':' || trimmed[len key] == ' ':
-                        let value: str = parseQuotedValue trimmed
-                        if len value > 0:
-                            return value
+                if startsWith(stripSpaces(sliceRange(content, start, i - 1)), "package_id"):
+                    if len(stripSpaces(sliceRange(content, start, i - 1))) == 10 ||
+                       stripSpaces(sliceRange(content, start, i - 1))[10] == '=' ||
+                       stripSpaces(sliceRange(content, start, i - 1))[10] == ':' ||
+                       stripSpaces(sliceRange(content, start, i - 1))[10] == ' ':
+                        if len(parseQuotedValue(stripSpaces(sliceRange(content, start, i - 1)))) > 0:
+                            return parseQuotedValue(stripSpaces(sliceRange(content, start, i - 1)))
             start = i + 1
     return ""
 
 fn packageIdMatches(manifestPath: str, expected: str): bool =
     if len(expected) == 0:
         return true
-    let got: str = packageIdFromManifest manifestPath
-    if len(got) == 0:
-        return false
-    return (got == expected)
+    return packageIdFromManifest(manifestPath) == expected
 
 fn resolvePkgCandidate(root: str, rel: str): str =
     if len(root) == 0 || len(rel) == 0:
         return ""
-    var candidate: str = joinPath(root, rel)
-    var fullCandidate: str = candidate
-    if ! endsWith(fullCandidate, ".cheng"):
-        fullCandidate = stage1AppendChengExt(fullCandidate)
-    if stage1PathReadable(fullCandidate):
-        let resolved: str = normalizeImportPathChecked(fullCandidate, root)
-        if len resolved > 0:
-            return resolved
-    return ""
+    return stage1ResolveReadableImportPathWithExt(joinPath(root, rel), root)
 
 fn resolvePkgPathInRoot(root: str, rel: str): str =
     if len(root) == 0 || len(rel) == 0:
         return ""
-    var resolved: str = resolvePkgCandidate(root, rel)
-    if len resolved > 0:
-        return resolved
-    var relSub: str = rel
-    if hasPrefix(relSub, "cheng/"):
-        if len relSub > 6:
-            relSub = sliceRange(relSub, 6, len relSub - 1)
-        else:
-            relSub = ""
-    if len relSub > 0:
-        resolved = resolvePkgCandidate(joinPath(root, "src"), relSub)
-        if len resolved > 0:
-            return resolved
-        resolved = resolvePkgCandidate(joinPath(root, "cheng"), relSub)
-        if len resolved > 0:
-            return resolved
-    return ""
+    if len(resolvePkgCandidate(root, rel)) > 0:
+        return resolvePkgCandidate(root, rel)
+    return stage1ResolvePkgSearchSrcCheng(root, stage1ResolvePkgRelSub(rel))
 
 fn resolvePkgPathInRoot2(root: str, relInPkg: str, relForPkgRoot: str): str =
     if len(root) == 0:
         return ""
     if len(relInPkg) > 0:
-        let resolvedSrc: str = resolvePkgCandidate(joinPath(root, "src"), relInPkg)
-        if len resolvedSrc > 0:
-            return resolvedSrc
-        let resolvedCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relInPkg)
-        if len resolvedCheng > 0:
-            return resolvedCheng
-        let resolvedRoot: str = resolvePkgCandidate(root, relInPkg)
-        if len resolvedRoot > 0:
-            return resolvedRoot
+        if len(stage1ResolvePkgSearchSrcChengRoot(root, relInPkg)) > 0:
+            return stage1ResolvePkgSearchSrcChengRoot(root, relInPkg)
     if len(relForPkgRoot) > 0:
-        let resolvedLegacySrc: str = resolvePkgCandidate(joinPath(root, "src"), relForPkgRoot)
-        if len resolvedLegacySrc > 0:
-            return resolvedLegacySrc
-        let resolvedLegacyCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relForPkgRoot)
-        if len resolvedLegacyCheng > 0:
-            return resolvedLegacyCheng
-        let resolvedLegacyRoot: str = resolvePkgCandidate(root, relForPkgRoot)
-        if len resolvedLegacyRoot > 0:
-            return resolvedLegacyRoot
+        return stage1ResolvePkgSearchSrcChengRoot(root, relForPkgRoot)
     return ""
 
 fn resolvePkgImportPath(importPath: str): str =
     if len(importPath) == 0:
         return ""
-    let expectedPkgId: str = packageIdFromImport importPath
-    let importPkgName: str = packageNameFromImport importPath
-    var relForPkgRoot: str = importPathDropChengPrefix(importPath)
-    if len(relForPkgRoot) == 0:
-        relForPkgRoot = importPath
-    let roots: str[] = stage1PkgRoots()
-    for i in 0..<roots.len:
-        let root: str = roots[i]
-        if len root > 0:
-            let manifest: str = joinPath(root, "cheng-package.toml")
-            if stage1_fileExists manifest:
-                if ! packageIdMatches(manifest, expectedPkgId):
-                    continue
-                # Production layout: a package root contains `src/` as the module root.
-                # Example: import `ai/foo/bar` -> <pkgroot>/src/foo/bar.cheng
-                var relInPkg: str = relForPkgRoot
-                if len expectedPkgId > 0 && len importPkgName > 0:
-                    let prefix: str = stage1JoinWithSlash(importPkgName, "")
-                    if len relInPkg > len prefix && hasPrefix(relInPkg, prefix):
-                        relInPkg = sliceRange(relInPkg, len prefix, len relInPkg - 1)
-
-                if len relInPkg > 0:
-                    let resolvedSrc: str = resolvePkgCandidate(joinPath(root, "src"), relInPkg)
-                    if len resolvedSrc > 0:
-                        return resolvedSrc
-                    let resolvedCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relInPkg)
-                    if len resolvedCheng > 0:
-                        return resolvedCheng
-                    let resolvedRoot: str = resolvePkgCandidate(root, relInPkg)
-                    if len resolvedRoot > 0:
-                        return resolvedRoot
-
-                # Fallback for legacy layouts where the package name is part of the path.
-                let resolvedLegacySrc: str = resolvePkgCandidate(joinPath(root, "src"), relForPkgRoot)
-                if len resolvedLegacySrc > 0:
-                    return resolvedLegacySrc
-                let resolvedLegacyCheng: str = resolvePkgCandidate(joinPath(root, "cheng"), relForPkgRoot)
-                if len resolvedLegacyCheng > 0:
-                    return resolvedLegacyCheng
-                let resolvedLegacyRoot: str = resolvePkgCandidate(root, relForPkgRoot)
-                if len resolvedLegacyRoot > 0:
-                    return resolvedLegacyRoot
-            else:
-                if len expectedPkgId > 0:
-                    let pkgName: str = packageNameFromImport importPath
-                    if len pkgName > 0:
-                        let prefixedRoot: str = joinPath(root, stage1Concat2("cheng-", pkgName))
-                        let prefixedManifest: str = joinPath(prefixedRoot, "cheng-package.toml")
-                        if stage1PathReadable(prefixedManifest) && packageIdMatches(prefixedManifest, expectedPkgId):
-                            var relInPkg: str = relForPkgRoot
-                            let prefix: str = stage1JoinWithSlash(pkgName, "")
-                            if len relInPkg > len prefix && hasPrefix(relInPkg, prefix):
-                                relInPkg = sliceRange(relInPkg, len prefix, len relInPkg - 1)
-                            let resolvedPref: str = resolvePkgPathInRoot2(prefixedRoot, relInPkg, relForPkgRoot)
-                            if len resolvedPref > 0:
-                                return resolvedPref
-                        let plainRoot: str = joinPath(root, pkgName)
-                        let plainManifest: str = joinPath(plainRoot, "cheng-package.toml")
-                        if stage1PathReadable(plainManifest) && packageIdMatches(plainManifest, expectedPkgId):
-                            var relInPkg2: str = relForPkgRoot
-                            let prefix2: str = stage1JoinWithSlash(pkgName, "")
-                            if len relInPkg2 > len prefix2 && hasPrefix(relInPkg2, prefix2):
-                                relInPkg2 = sliceRange(relInPkg2, len prefix2, len relInPkg2 - 1)
-                            let resolvedPlain: str = resolvePkgPathInRoot2(plainRoot, relInPkg2, relForPkgRoot)
-                            if len resolvedPlain > 0:
-                                return resolvedPlain
-                    continue
-                let slash: int32 = indexOfSlash(importPath)
-                if slash > 0 && slash < len importPath - 1:
-                    let pkgName: str = sliceRange(importPath, 0, slash - 1)
-                    let rel: str = sliceRange(importPath, slash + 1, len importPath - 1)
-                    let pkgRoot: str = joinPath(root, pkgName)
-                    let resolved: str = resolvePkgPathInRoot(pkgRoot, rel)
-                    if len resolved > 0:
-                        return resolved
-    return ""
+    return stage1ResolvePkgImportPathWithParts(
+        importPath,
+        packageIdFromImport(importPath),
+        packageNameFromImport(importPath),
+        stage1ChooseNonEmpty(importPathDropChengPrefix(importPath), importPath)
+    )
 
 fn resolveImportPath(path: str, baseDir: str, rootDir: str): str =
     if len(path) == 0:
         return ""
     let dbgImports: bool = os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1"
     if stage1PluginEnabled():
-        let pluginResolved: str = stage1ResolvePluginImportPath(path)
-        if len pluginResolved > 0:
-            return pluginResolved
-    var full: str = path
-    if isAbsolute(full) || hasPrefix(full, "/") || hasPrefix(full, "./") || hasPrefix(full, "../") || hasPrefix(full, "."):
+        if len(stage1ResolvePluginImportPath(path)) > 0:
+            return stage1ResolvePluginImportPath(path)
+    if isAbsolute(path) || hasPrefix(path, "/") || hasPrefix(path, "./") || hasPrefix(path, "../") || hasPrefix(path, "."):
         return ""
-    if isAbsolute full:
-        if ! endsWith(full, ".cheng"):
-            full = stage1AppendChengExt(full)
-        if stage1_fileExists full:
-            let resolved: str = normalizeImportPathChecked(full, rootDir)
-            if len resolved > 0:
-                return resolved
-        return ""
-    if hasPrefix(full, "std/"):
-        var stdPath: str = joinPath(joinPath(rootDir, "src"), full)
-        if ! endsWith(stdPath, ".cheng"):
-            stdPath = stage1AppendChengExt(stdPath)
-        if dbgImports:
-            let readableText: str = stage1PathReadable(stdPath) ? "1" : "0"
-            echo("[importdbg] resolve.std raw='" + path + "' baseDir='" + baseDir + "' rootDir='" + rootDir + "' stdPath='" + stdPath + "' readable=" + readableText)
-        if stage1PathReadable(stdPath):
-            let resolved: str = normalizeImportPathChecked(stdPath, rootDir)
-            if dbgImports:
-                echo("[importdbg] resolve.std.resolved='" + resolved + "'")
-            if len resolved > 0:
-                return resolved
-        return ""
-    if hasPrefix(full, "core/"):
-        var corePath0: str = joinPath(joinPath(rootDir, "src"), full)
-        if ! endsWith(corePath0, ".cheng"):
-            corePath0 = stage1AppendChengExt(corePath0)
-        if stage1PathReadable(corePath0):
-            let resolved: str = normalizeImportPathChecked(corePath0, rootDir)
-            if len resolved > 0:
-                return resolved
-        return ""
-    if hasPrefix(full, "system/"):
-        var systemPath0: str = joinPath(joinPath(rootDir, "src"), full)
-        if ! endsWith(systemPath0, ".cheng"):
-            systemPath0 = stage1AppendChengExt(systemPath0)
-        if stage1PathReadable(systemPath0):
-            let resolved: str = normalizeImportPathChecked(systemPath0, rootDir)
-            if len resolved > 0:
-                return resolved
-        return ""
-    if hasPrefix(full, "cheng/stdlib/bootstrap/"):
-        var legacyBase: str = joinPath(rootDir, "src/std")
-        var legacyRest: str = sliceRange(full, 23, len full - 1)
-        if hasPrefix(full, "cheng/stdlib/bootstrap/core/"):
-            legacyBase = joinPath(rootDir, "src/core")
-            legacyRest = sliceRange(full, 28, len full - 1)
-        elif hasPrefix(full, "cheng/stdlib/bootstrap/system/"):
-            legacyBase = joinPath(rootDir, "src/system")
-            legacyRest = sliceRange(full, 30, len full - 1)
-        elif hasPrefix(full, "cheng/stdlib/bootstrap/std/"):
-            legacyBase = joinPath(rootDir, "src/std")
-            legacyRest = sliceRange(full, 27, len full - 1)
-        var legacyPath: str = joinPath(legacyBase, legacyRest)
-        if ! endsWith(legacyPath, ".cheng"):
-            legacyPath = stage1AppendChengExt(legacyPath)
-        if stage1PathReadable(legacyPath):
-            let resolved: str = normalizeImportPathChecked(legacyPath, rootDir)
-            if len resolved > 0:
-                return resolved
-        return ""
-    if hasPrefix(full, "cheng/"):
-        let rest: str = sliceRange(full, 6, len full - 1)
-        var localCandidate: str = joinPath(joinPath(rootDir, "src"), rest)
-        var localFull: str = localCandidate
-        if ! endsWith(localFull, ".cheng"):
-            localFull = stage1AppendChengExt(localFull)
-        if stage1PathReadable(localFull):
-            let resolved: str = normalizeImportPathChecked(localFull, rootDir)
-            if len resolved > 0:
-                return resolved
-        let candidate: str = joinPath(rootDir, full)
-        var fullCandidate: str = candidate
-        if ! endsWith(fullCandidate, ".cheng"):
-            fullCandidate = stage1AppendChengExt(fullCandidate)
-        if stage1PathReadable(fullCandidate):
-            let resolved: str = normalizeImportPathChecked(fullCandidate, rootDir)
-            if len resolved > 0:
-                return resolved
-        let pkgResolved: str = resolvePkgImportPath full
-        if len pkgResolved > 0:
-            return pkgResolved
-        return ""
-    if hasPrefix(full, "gui/"):
-        let guiRoot: str = stage1_getEnv "GUI_ROOT"
-        if len guiRoot > 0:
-            let rest: str = sliceRange(full, 4, len full - 1)
-            full = joinPath(guiRoot, rest)
-            if ! endsWith(full, ".cheng"):
-                full = stage1AppendChengExt(full)
-            if stage1PathReadable(full):
-                let resolved: str = normalizeImportPathChecked(full, guiRoot)
-                if len resolved > 0:
-                    return resolved
-            return ""
-    if hasPrefix(full, "ide/gui/"):
-        let guiRoot: str = stage1_getEnv "GUI_ROOT"
-        if len guiRoot > 0:
-            let rest: str = sliceRange(full, 8, len full - 1)
-            full = joinPath(guiRoot, rest)
-            if ! endsWith(full, ".cheng"):
-                full = stage1AppendChengExt(full)
-            if stage1PathReadable(full):
-                let resolved: str = normalizeImportPathChecked(full, guiRoot)
-                if len resolved > 0:
-                    return resolved
-            return ""
-        let ideRoot: str = stage1_getEnv "IDE_ROOT"
-        if len ideRoot > 0:
-            let rest: str = sliceRange(full, 4, len full - 1)
-            full = joinPath(ideRoot, rest)
-            if ! endsWith(full, ".cheng"):
-                full = stage1AppendChengExt(full)
-            if stage1PathReadable(full):
-                let resolved: str = normalizeImportPathChecked(full, ideRoot)
-                if len resolved > 0:
-                    return resolved
-            return ""
-    if hasPrefix(full, "ide/"):
-        let ideRoot: str = stage1_getEnv "IDE_ROOT"
-        if len ideRoot > 0:
-            let rest: str = sliceRange(full, 4, len full - 1)
-            full = joinPath(ideRoot, rest)
-            if ! endsWith(full, ".cheng"):
-                full = stage1AppendChengExt(full)
-            if stage1PathReadable(full):
-                let resolved: str = normalizeImportPathChecked(full, ideRoot)
-                if len resolved > 0:
-                    return resolved
-            return ""
-        full = joinPath(rootDir, full)
-        if ! endsWith(full, ".cheng"):
-            full = stage1AppendChengExt(full)
-        if stage1PathReadable(full):
-            let resolved: str = normalizeImportPathChecked(full, rootDir)
-            if len resolved > 0:
-                return resolved
-        return ""
+    if hasPrefix(path, "std/"):
+        return stage1ResolveStdImportPath(stage1EnsureChengExt(joinPath(joinPath(rootDir, "src"), path)), path, baseDir, rootDir, dbgImports)
+    if hasPrefix(path, "core/"):
+        return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src"), path), rootDir)
+    if hasPrefix(path, "system/"):
+        return stage1ResolveReadableImportPathWithExt(joinPath(joinPath(rootDir, "src"), path), rootDir)
+    if hasPrefix(path, "cheng/stdlib/bootstrap/"):
+        return stage1ResolveLegacyBootstrapImportPath(path, rootDir)
+    if hasPrefix(path, "cheng/"):
+        return stage1ResolveChengImportPath(path, rootDir)
+    if hasPrefix(path, "gui/"):
+        return stage1ResolveImportUnderBase(stage1_getEnv("GUI_ROOT"), sliceRange(path, 4, len path - 1))
+    if hasPrefix(path, "ide/gui/"):
+        if len(stage1ResolveImportUnderBase(stage1_getEnv("GUI_ROOT"), sliceRange(path, 8, len path - 1))) > 0:
+            return stage1ResolveImportUnderBase(stage1_getEnv("GUI_ROOT"), sliceRange(path, 8, len path - 1))
+        return stage1ResolveImportUnderBase(stage1_getEnv("IDE_ROOT"), sliceRange(path, 4, len path - 1))
+    if hasPrefix(path, "ide/"):
+        if len(stage1ResolveImportUnderBase(stage1_getEnv("IDE_ROOT"), sliceRange(path, 4, len path - 1))) > 0:
+            return stage1ResolveImportUnderBase(stage1_getEnv("IDE_ROOT"), sliceRange(path, 4, len path - 1))
+        return stage1ResolveReadableImportPathWithExt(joinPath(rootDir, path), rootDir)
     # Default source import root: resolve plain module paths from `<repo>/src`.
-    var srcRootPath: str = joinPath(joinPath(rootDir, "src"), full)
-    if ! endsWith(srcRootPath, ".cheng"):
-        srcRootPath = stage1AppendChengExt(srcRootPath)
-    if stage1PathReadable(srcRootPath):
-        let resolved: str = normalizeImportPathChecked(srcRootPath, rootDir)
-        if len resolved > 0:
-            return resolved
-    let fullNoExt: str = full
-    if ! endsWith(full, ".cheng"):
-        full = stage1AppendChengExt(full)
-    if len baseDir > 0:
-        let candidate: str = joinPath(baseDir, full)
-        if stage1PathReadable(candidate):
-            let resolved: str = normalizeImportPathChecked(candidate, rootDir)
-            if len resolved > 0:
-                return resolved
-        let corePath: str = joinPath(joinPath(rootDir, "src/core"), full)
-        if stage1PathReadable(corePath):
-            let resolved: str = normalizeImportPathChecked(corePath, rootDir)
-            if len resolved > 0:
-                return resolved
-        let systemPath: str = joinPath(joinPath(rootDir, "src/system"), full)
-        if stage1PathReadable(systemPath):
-            let resolved: str = normalizeImportPathChecked(systemPath, rootDir)
-            if len resolved > 0:
-                return resolved
-        let stdPath: str = joinPath(joinPath(rootDir, "src/std"), full)
-        if stage1PathReadable(stdPath):
-            let resolved: str = normalizeImportPathChecked(stdPath, rootDir)
-            if len resolved > 0:
-                return resolved
-        if indexOfSlash(fullNoExt) >= 0:
-            let pkgResolved: str = resolvePkgImportPath fullNoExt
-            if len pkgResolved > 0:
-                return pkgResolved
-        return ""
-    let corePath2: str = joinPath(joinPath(rootDir, "src/core"), full)
-    if stage1PathReadable(corePath2):
-        let resolved: str = normalizeImportPathChecked(corePath2, rootDir)
-        if len resolved > 0:
-            return resolved
-    let systemPath2: str = joinPath(joinPath(rootDir, "src/system"), full)
-    if stage1PathReadable(systemPath2):
-        let resolved: str = normalizeImportPathChecked(systemPath2, rootDir)
-        if len resolved > 0:
-            return resolved
-    let stdPath2: str = joinPath(joinPath(rootDir, "src/std"), full)
-    if stage1PathReadable(stdPath2):
-        let resolved: str = normalizeImportPathChecked(stdPath2, rootDir)
-        if len resolved > 0:
-            return resolved
-    if indexOfSlash(fullNoExt) >= 0:
-        let pkgResolved2: str = resolvePkgImportPath fullNoExt
-        if len pkgResolved2 > 0:
-            return pkgResolved2
-    return ""
+    return stage1ResolveDefaultImportPath(path, baseDir, rootDir)
 
 fn canonicalizeResolvedPath(resolved: str, rootDir: str): str =
     if len(resolved) == 0:
         return ""
-    let srcRoot: str = joinPath(rootDir, "src")
-    let chengRoot: str = joinPath(rootDir, "cheng")
-    let srcPrefix: str = stage1JoinWithSlash(srcRoot, "")
-    if hasPrefix(resolved, srcPrefix):
-        let rel: str = sliceRange(resolved, len srcPrefix, len resolved - 1)
-        let candidate: str = joinPath(chengRoot, rel)
-        if stage1_fileExists candidate:
-            return candidate
+    if stage1_fileExists(stage1CanonicalizedChengCandidate(resolved, rootDir)):
+        return stage1CanonicalizedChengCandidate(resolved, rootDir)
     return resolved
 
 type
@@ -2389,20 +2301,24 @@ fn importTracePop(v: var ImportTrace) =
     v.items.len = v.items.len - 1
 
 fn importTraceCycleMessage(v: ImportTrace, path: str): str =
-    var msg: str = "Import cycle detected: "
+    var parts: str[] = []
+    add(parts, "Import cycle detected: ")
     let start: int32 = importTraceFind(v, path)
     if start < 0:
-        return msg + path + " -> " + path
+        add(parts, path)
+        add(parts, " -> ")
+        add(parts, path)
+        return stage1JoinParts(parts)
     var first: bool = true
     for i in start..<v.items.len:
         if !first:
-            msg = msg + " -> "
-        msg = msg + v.items[i]
+            add(parts, " -> ")
+        add(parts, v.items[i])
         first = false
     if !first:
-        msg = msg + " -> "
-    msg = msg + path
-    return msg
+        add(parts, " -> ")
+    add(parts, path)
+    return stage1JoinParts(parts)
 
 fn mapHasNodes(cache: NodeCache, key: str): bool =
     var ok: bool = false
@@ -2509,7 +2425,7 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
     lexDiags.cap = 0
     let cacheHit: bool = loadTokenCacheInto(pathNorm, size, mtime, &tokens)
     if !cacheHit:
-        var content: str = ""
+        var content: str
         let _readOk: bool = stage1_readFileInto(pathNorm, content)
         if len(content) == 0:
             if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
@@ -2579,20 +2495,17 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
         for pi in 0..<paths.len:
             let rawPath: str = paths[pi]
             if len rawPath > 0 && !(rawPath == "system"):
-                var resolved: str = resolveImportPath(rawPath, moduleDir, rootDir)
                 if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
-                    echo("[importdbg] load.resolve owner='" + pathNorm + "' raw='" + rawPath + "' moduleDir='" + moduleDir + "' rootDir='" + rootDir + "' resolved='" + resolved + "'")
-                if len resolved == 0:
+                    echo("[importdbg] load.resolve owner='" + pathNorm + "' raw='" + rawPath + "' moduleDir='" + moduleDir + "' rootDir='" + rootDir + "' resolved='" + resolveImportPath(rawPath, moduleDir, rootDir) + "'")
+                if len(stage1ResolveImportNormalized(rawPath, moduleDir, rootDir)) == 0:
                     addDiag(diags, svError, pathNorm, 1, 1, "Unable to read imported module: " + rawPath)
                     continue
-                resolved = canonicalizeResolvedPath(resolved, rootDir)
-                resolved = stage1NormalizeVisitedPath(resolved)
                 if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
-                    echo("[importdbg] load.norm owner='" + pathNorm + "' raw='" + rawPath + "' normalized='" + resolved + "'")
+                    echo("[importdbg] load.norm owner='" + pathNorm + "' raw='" + rawPath + "' normalized='" + stage1ResolveImportNormalized(rawPath, moduleDir, rootDir) + "'")
                 if stage1TraceImportsEnabled():
-                    stage1Trace("import: " + pathNorm + " -> " + rawPath + " => " + resolved)
+                    stage1Trace("import: " + pathNorm + " -> " + rawPath + " => " + stage1ResolveImportNormalized(rawPath, moduleDir, rootDir))
                 let nestedPathId: int32 = stage1ImportPathPushSlot()
-                stage1ImportPathPool[nestedPathId] = resolved
+                stage1ImportPathPool[nestedPathId] = stage1ResolveImportNormalized(rawPath, moduleDir, rootDir)
                 if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
                     echo("[importdbg] load.slot id=" + intToStr(nestedPathId) + " stored='" + stage1ImportPathPool[nestedPathId] + "'")
                 let nested: AstNodeId[] = loadModuleRecursiveId(nestedPathId, visited, diags, cache, trace)
@@ -2655,22 +2568,18 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
         for pi in 0..<paths.len:
             let rawPath: str = paths[pi]
             if len rawPath > 0 && !(rawPath == "system"):
-                var resolved: str = resolveImportPath(rawPath, baseDir, rootDir)
                 if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
-                    echo("[importdbg] root.load.resolve raw='" + rawPath + "' baseDir='" + baseDir + "' rootDir='" + rootDir + "' resolved='" + resolved + "'")
-                if len resolved == 0:
+                    echo("[importdbg] root.load.resolve raw='" + rawPath + "' baseDir='" + baseDir + "' rootDir='" + rootDir + "' resolved='" + resolveImportPath(rawPath, baseDir, rootDir) + "'")
+                if len(stage1ResolveImportNormalized(rawPath, baseDir, rootDir)) == 0:
                     addDiag(diags, svError, baseDir, 1, 1, "Unable to read imported module: " + rawPath)
                     stage1PhaseDump()
                     continue
-                resolved = canonicalizeResolvedPath(resolved, rootDir)
-                resolved = stage1NormalizeVisitedPath(resolved)
                 if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
-                    echo("[importdbg] root.load.norm raw='" + rawPath + "' normalized='" + resolved + "'")
+                    echo("[importdbg] root.load.norm raw='" + rawPath + "' normalized='" + stage1ResolveImportNormalized(rawPath, baseDir, rootDir) + "'")
                 if stage1TraceImportsEnabled():
-                    let owner: str = (len(rootPath) > 0) ? rootPath : baseDir
-                    stage1Trace("import: " + owner + " -> " + rawPath + " => " + resolved)
+                    stage1Trace("import: " + stage1ImportTraceOwner(rootPath, baseDir) + " -> " + rawPath + " => " + stage1ResolveImportNormalized(rawPath, baseDir, rootDir))
                 let nestedPathId: int32 = stage1ImportPathPushSlot()
-                stage1ImportPathPool[nestedPathId] = resolved
+                stage1ImportPathPool[nestedPathId] = stage1ResolveImportNormalized(rawPath, baseDir, rootDir)
                 if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
                     echo("[importdbg] root.load.slot id=" + intToStr(nestedPathId) + " stored='" + stage1ImportPathPool[nestedPathId] + "'")
                 let nested: AstNodeId[] = loadModuleRecursiveId(nestedPathId, visited, diags, cache, &trace)
@@ -2679,7 +2588,7 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
     return out
 
 fn copyFile(src: str, dst: str): bool =
-    var content: str = ""
+    var content: str
     let _readOk: bool = stage1_readFileInto(src, content)
     if len(content) == 0:
         return false
@@ -2744,17 +2653,15 @@ fn loadSystemModuleId(userFile: str, diags: ptr): AstNodeId =
         return astInvalidNodeId()
     let dbgPipe: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
     let dbgFile: os.File = dbgPipe ? os.get_stderr() : nil
-    var sysPath: str = "src/std/system.cheng"
-    if (userFile == sysPath):
+    if (userFile == "src/std/system.cheng"):
         return astInvalidNodeId()
     var tokens: Token[]
     var lexDiags: Diagnostic[]
     lexDiags.buffer = nil
     lexDiags.len = 0
     lexDiags.cap = 0
-    var content: str = stage1_readFileFast(sysPath)
-    if stage1_c_strlen(content) == 0:
-        let _readOk: bool = stage1_readFileInto(sysPath, content)
+    var content: str
+    let _readOk: bool = stage1_readFileInto("src/std/system.cheng", content)
     if dbgPipe:
         stage1DebugPipeWritePrefixInt(dbgFile, "[frontend] sysmod content_len=", len(content))
     if len(content) == 0:
@@ -2762,7 +2669,7 @@ fn loadSystemModuleId(userFile: str, diags: ptr): AstNodeId =
             stage1DebugPipeWriteConst(dbgFile, "[frontend] sysmod empty_content")
         stage1PhaseDump()
         return astInvalidNodeId()
-    let _lexOk: bool = lexInto(content, sysPath, &tokens, &lexDiags)
+    let _lexOk: bool = lexInto(content, "src/std/system.cheng", &tokens, &lexDiags)
     releaseString content
     if dbgPipe:
         stage1DebugPipeWritePrefixInt(dbgFile, "[frontend] sysmod lex_diags=", lexDiags.len)
@@ -2775,8 +2682,8 @@ fn loadSystemModuleId(userFile: str, diags: ptr): AstNodeId =
         freeSeq_Token(tokens)
         freeSeq[Diagnostic](lexDiags)
         return astInvalidNodeId()
-    let sysRootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, sysPath, diags)
-    let sysRootId: AstNodeId = stage1ApplyAstPluginHooksId(sysPath, sysRootParsedId)
+    let sysRootParsedId: AstNodeId = stage1_parseModuleByMode(tokens, "src/std/system.cheng", diags)
+    let sysRootId: AstNodeId = stage1ApplyAstPluginHooksId("src/std/system.cheng", sysRootParsedId)
     if dbgPipe:
         stage1DebugPipeWritePrefixInt(dbgFile, "[frontend] sysmod parsed_kids=", astKidCount(sysRootId))
     freeSeq_Token(tokens)
@@ -2803,7 +2710,7 @@ fn parseModuleForDepsId(path: str, diags: ptr): AstNodeId =
     lexDiags.cap = 0
     let cacheHit: bool = loadTokenCacheInto(path, size, mtime, &tokens)
     if !cacheHit:
-        var content: str = ""
+        var content: str
         let _readOk: bool = stage1_readFileInto(path, content)
         if len(content) == 0:
             addDiag(diags, svError, path, 1, 1, "Unable to read input file")
@@ -2910,40 +2817,33 @@ fn collectResolvedDeps(inPath: str, diags: ptr): str[] =
         var pending: str[]
         for resolvedIndex in 0..<uniqSet.items.len:
             let raw: str = stripImportAlias uniqSet.items[resolvedIndex]
-            var resolved: str = resolveImportPath(raw, baseDir, repoRoot)
-            if len resolved == 0:
-                resolved = raw
-            if len resolved > 0:
-                resolved = canonicalizeResolvedPath(resolved, repoRoot)
-                setAddStr(resolvedSet, resolved)
-                if stage1_fileExists resolved && ! setHasStr(visitedModules, resolved):
-                    setAddStr(visitedModules, resolved)
-                    add(pending, resolved)
+            if len(stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot)) > 0:
+                setAddStr(resolvedSet, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot))
+                if stage1_fileExists(stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot)) &&
+                   ! setHasStr(visitedModules, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot)):
+                    setAddStr(visitedModules, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot))
+                    add(pending, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot))
         while true:
             let pendingLen: int32 = pending.len
             if pendingLen == 0:
                 break
             var nextPending: str[]
             for pi in 0..<pendingLen:
-                let modPath: str = pending[pi] + ""
-                let modRootId: AstNodeId = parseModuleForDepsId(modPath, diags)
+                let modRootId: AstNodeId = parseModuleForDepsId(pending[pi], diags)
                 if !astNodeIdValid(modRootId):
                     continue
-                let modDir: str = stage1SplitDir modPath
+                let modDir: str = stage1SplitDir pending[pi]
                 var modImports: str[8]
                 collectImportDepsId(modRootId, &modImports)
                 for mi in 0..<modImports.len:
                     let rawNext: str = stripImportAlias modImports[mi]
                     if len rawNext > 0:
-                        var resolvedNext: str = resolveImportPath(rawNext, modDir, repoRoot)
-                        if len resolvedNext == 0:
-                            resolvedNext = rawNext
-                        if len resolvedNext > 0:
-                            resolvedNext = canonicalizeResolvedPath(resolvedNext, repoRoot)
-                            setAddStr(resolvedSet, resolvedNext)
-                            if stage1_fileExists resolvedNext && ! setHasStr(visitedModules, resolvedNext):
-                                setAddStr(visitedModules, resolvedNext)
-                                add(nextPending, resolvedNext)
+                        if len(stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot)) > 0:
+                            setAddStr(resolvedSet, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot))
+                            if stage1_fileExists(stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot)) &&
+                               ! setHasStr(visitedModules, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot)):
+                                setAddStr(visitedModules, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot))
+                                add(nextPending, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot))
             pending = nextPending
         resolvedDeps = resolvedSet.items
     return resolvedDeps
@@ -2956,14 +2856,8 @@ fn compileToDepsList(inPath: str, outPath: str): bool =
     if hasError diags:
         printDiagnostics diags
         return false
-    var payload: str = ""
-    for depIndex in 0..<resolvedDeps.len:
-        let item: str = resolvedDeps[depIndex]
-        if depIndex > 0:
-            payload = payload + "\n"
-        payload = payload + item
     if len outPath > 0:
-        stage1_writeFile(outPath, payload)
+        stage1_writeFile(outPath, strutils.join(resolvedDeps, "\n"))
     else:
-        echo payload
+        echo strutils.join(resolvedDeps, "\n")
     return true

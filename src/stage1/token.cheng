@@ -97,15 +97,15 @@ fn tokenTextAppendValue(seqInst: var str[], val: str) =
     seqInst[idx] = val
 
 fn tokenTextAppendOwnedValue(seqInst: var str[], val: str) =
-    if len(val) > 0 && rawmemAsVoid(val) != nil:
-        memRetain(rawmemAsVoid(val))
+    if len(val) > 0 && strDataPtr(val) != nil:
+        memRetain(strDataPtr(val))
     tokenTextAppendValue(seqInst, val)
 
 fn tokenTextReleaseOwnedValues(seqInst: str[]) =
     for i in 0..<seqInst.len:
         let val: str = seqInst[i]
-        if len(val) > 0 && rawmemAsVoid(val) != nil:
-            memRelease(rawmemAsVoid(val))
+        if len(val) > 0 && strDataPtr(val) != nil:
+            memRelease(strDataPtr(val))
 
 fn tokenTextAppendSlot(seqInst: var int32[], val: int32) =
     let idx: int32 = seqInst.len
@@ -139,12 +139,12 @@ fn tokenTextCopyRange(source: str, start: int32, count: int32): str =
         return source
     if start < 0 || start + count > len(source):
         return ""
-    return newStringCopy(rawmemPtrAdd(rawmemAsVoid(source), start), count)
+    return newStringCopy(rawmemPtrAdd(strDataPtr(source), start), count)
 
 fn tokenTextCopyRangeTrusted(source: str, start: int32, count: int32): str =
     if count <= 0:
         return ""
-    return newStringCopy(rawmemPtrAdd(rawmemAsVoid(source), start), count)
+    return newStringCopy(rawmemPtrAdd(strDataPtr(source), start), count)
 
 fn tokenTextCopyRangeById(id: int32, start: int32, count: int32): str =
     if count <= 0:
@@ -188,8 +188,8 @@ fn tokenTextById(id: int32): str =
         return ""
     let materialized: str = newStringCopy(rawmemPtrAdd(tokenTextBytes.buffer, textStart), textLen)
     if len(materialized) == textLen:
-        if rawmemAsVoid(materialized) != nil:
-            memRetain(rawmemAsVoid(materialized))
+        if strDataPtr(materialized) != nil:
+            memRetain(strDataPtr(materialized))
         tokenTextValues[id] = materialized
         return tokenTextValues[id]
     return materialized
@@ -1005,25 +1005,30 @@ fn tokenResetTextPool() =
 fn tokenInternText(text: str): int32 =
     let textLen: int32 = len(text)
     if textLen <= 0:
-        tokenDebugSetLog("intern.text.empty", 0, 0, text)
+        if tokenDebugSetEnabled():
+            tokenDebugSetLog("intern.text.empty", 0, 0, text)
         return 0
     let slot: int32 = tokenCommonSlotIndex(text)
     if slot >= 0:
         tokenCommonEnsure()
         let cached: int32 = tokenCommonIds[slot]
         if cached > 0:
-            tokenDebugSetLog("intern.text.common_hit", textLen, cached, tokenTextById(cached))
+            if tokenDebugSetEnabled():
+                tokenDebugSetLog("intern.text.common_hit", textLen, cached, tokenTextById(cached))
             return cached
         let commonId: int32 = tokenTextPoolAppendRange(text, 0, textLen)
         if commonId > 0:
             tokenCommonIds[slot] = commonId
-            tokenDebugSetLog("intern.text.common_add", textLen, commonId, tokenTextById(commonId))
+            if tokenDebugSetEnabled():
+                tokenDebugSetLog("intern.text.common_add", textLen, commonId, tokenTextById(commonId))
             return commonId
     let id: int32 = tokenTextPoolAppendRange(text, 0, textLen)
     if id <= 0:
-        tokenDebugSetLog("intern.text.copy_fail", textLen, 0, "")
+        if tokenDebugSetEnabled():
+            tokenDebugSetLog("intern.text.copy_fail", textLen, 0, "")
         return 0
-    tokenDebugSetLog("intern.text.ok", textLen, id, tokenTextById(id))
+    if tokenDebugSetEnabled():
+        tokenDebugSetLog("intern.text.ok", textLen, id, tokenTextById(id))
     return id
 
 fn tokenZero(tok: var Token) =
@@ -1061,7 +1066,8 @@ fn tokenSetLexeme(tok: var Token, text: str) =
 
 fn tokenSetLexemeRange(tok: var Token, source: str, start: int32, count: int32) =
     tok.lexemeId = tokenInternTextRange(source, start, count)
-    tokenDebugSetLog("set.range", count, tok.lexemeId, tokenTextById(tok.lexemeId))
+    if tokenDebugSetEnabled():
+        tokenDebugSetLog("set.range", count, tok.lexemeId, tokenTextById(tok.lexemeId))
 
 fn tokenLexemeLen(tok: Token): int32 =
     return tokenTextLen(tok.lexemeId)
@@ -1090,21 +1096,19 @@ fn tokenLexemeEq(tok: Token, lit: str): bool =
     return tokenTextEqLitId(tok.lexemeId, lit)
 
 fn kindName(k: TokenKind): str =
-    var out: str = "unknown"
     case k
-    of tkIdent: out = "ident"
-    of tkNumber: out = "number"
-    of tkString: out = "str"
-    of tkChar: out = "char"
-    of tkKeyword: out = "keyword"
-    of tkSymbol: out = "symbol"
-    of tkIndent: out = "indent"
-    of tkDedent: out = "dedent"
-    of tkNewline: out = "newline"
-    of tkComment: out = "comment"
-    of tkEof: out = "eof"
-    else: out = "unknown"
-    return out
+    of tkIdent: return "ident"
+    of tkNumber: return "number"
+    of tkString: return "str"
+    of tkChar: return "char"
+    of tkKeyword: return "keyword"
+    of tkSymbol: return "symbol"
+    of tkIndent: return "indent"
+    of tkDedent: return "dedent"
+    of tkNewline: return "newline"
+    of tkComment: return "comment"
+    of tkEof: return "eof"
+    else: return "unknown"
 
 fn newToken(kind: TokenKind, lexeme: str, line: int32, col: int32, strPrefix: char): Token =
     var t: Token
