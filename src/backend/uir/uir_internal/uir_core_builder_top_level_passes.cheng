@@ -113,6 +113,11 @@ fn uir_core_builder_top_level_passes_add(dst: var int32[], val: int32) =
 fn uir_core_builder_top_level_passes_add(dst: var str[], val: str) =
     seqs.add(dst, val)
 
+fn uirCoreTopLevelStableText(s: str): str =
+    if len(s) == 0:
+        return ""
+    return uirCoreOwnStrSafe(s)
+
 fn uirCoreTopLevelSeqFixedNodeNormalized(typeNode0: Node): Node =
     var t: Node = typeNode0
     while astNodeIdValid(t) && nodeKind(t) == nkPar && kidCount(t) > 0:
@@ -263,8 +268,8 @@ fn uirCoreSameOriginRecentStore(mod: UirCoreModule, fnName: str,
     if f == nil:
         return
     uirCore_sameOrigin_recent_module = mod
-    uirCore_sameOrigin_recent_fnName = fnName
-    uirCore_sameOrigin_recent_originNorm = fnOriginNorm
+    uirCore_sameOrigin_recent_fnName = uirCoreTopLevelStableText(fnName)
+    uirCore_sameOrigin_recent_originNorm = uirCoreTopLevelStableText(fnOriginNorm)
     uirCore_sameOrigin_recent_declOrdinal = declOrdinal
     uirCore_sameOrigin_recent_sourceAstIndex = sourceAstIndex
     uirCore_sameOrigin_recent_nameTextId = nameTextId
@@ -438,7 +443,7 @@ fn uirCorePredeclareMetaSourceOriginKey(originNorm: str, sourceAstIndex: int32):
     let modId: str = uirCoreModuleIdForFile(originNorm)
     if len(modId) == 0:
         return ""
-    return modId + "#s#" + intToStr(sourceAstIndex)
+    return uirCoreTopLevelStableText(modId + "#s#" + intToStr(sourceAstIndex))
 
 fn uirCorePredeclareMetaDeclOriginKey(originNorm: str, declOrdinal: int32): str =
     if len(originNorm) == 0 || declOrdinal < 0:
@@ -446,7 +451,7 @@ fn uirCorePredeclareMetaDeclOriginKey(originNorm: str, declOrdinal: int32): str 
     let modId: str = uirCoreModuleIdForFile(originNorm)
     if len(modId) == 0:
         return ""
-    return modId + "#d#" + intToStr(declOrdinal)
+    return uirCoreTopLevelStableText(modId + "#d#" + intToStr(declOrdinal))
 
 fn uirCorePredeclareMetaRecordKeys(idx: int32, name: str,
                                    declOrdinal: int32,
@@ -459,8 +464,9 @@ fn uirCorePredeclareMetaRecordNameKeys(idx: int32, name: str) =
         return
     if idx >= uirCore_predeclareMeta_len:
         return
+    let stableName: str = uirCoreTopLevelStableText(name)
     let namePtrKey: int64 = uirCorePredeclareMetaNamePtrKey(name)
-    if len(name) == 0 || !uirCoreStrPtrSane(name):
+    if len(stableName) == 0 || !uirCoreStrPtrSane(stableName):
         uirCore_predeclareMeta_nameIndexed[idx] = int8(0)
         uirCore_predeclareMeta_nameIndexedPtrKeys[idx] = int64(0)
         uirCore_predeclareMeta_nameIndexedNames[idx] = nil
@@ -468,26 +474,26 @@ fn uirCorePredeclareMetaRecordNameKeys(idx: int32, name: str) =
     let indexedName: str = uirCore_predeclareMeta_nameIndexedNames[idx]
     if uirCore_predeclareMeta_nameIndexed[idx] == int8(1) &&
        (uirCore_predeclareMeta_nameIndexedPtrKeys[idx] == namePtrKey ||
-        (len(indexedName) > 0 && uirCorePredeclareNameMatches(indexedName, name))):
+        (len(indexedName) > 0 && uirCorePredeclareNameMatches(indexedName, stableName))):
         return
     var foundExisting: bool = false
-    let rawExisting: int32 = hashmaps.hashMapStrIntGetEx(uirCore_predeclareMeta_nameIndex, name, foundExisting)
+    let rawExisting: int32 = hashmaps.hashMapStrIntGetEx(uirCore_predeclareMeta_nameIndex, stableName, foundExisting)
     let existingIdx: int32 = rawExisting - 1
     if foundExisting && rawExisting > 0 && existingIdx >= 0 && existingIdx != idx:
-        hashsets.hashSetStrAdd(uirCore_predeclareMeta_nameDupSet, name)
+        hashsets.hashSetStrAdd(uirCore_predeclareMeta_nameDupSet, stableName)
     var foundHead: bool = false
-    let rawHead: int32 = hashmaps.hashMapStrIntGetEx(uirCore_predeclareMeta_nameChainHead, name, foundHead)
+    let rawHead: int32 = hashmaps.hashMapStrIntGetEx(uirCore_predeclareMeta_nameChainHead, stableName, foundHead)
     let entryIdx: int32 = uirCore_predeclareMeta_nameChainEntryIdx.len
     uir_core_builder_top_level_passes_add(uirCore_predeclareMeta_nameChainEntryIdx, idx)
     uir_core_builder_top_level_passes_add(uirCore_predeclareMeta_nameChainEntryNext,
         (foundHead && rawHead > 0) ? (rawHead - 1) : -1)
-    hashmaps.hashMapStrIntPut(uirCore_predeclareMeta_nameChainHead, name, entryIdx + 1)
-    hashmaps.hashMapStrIntPut(uirCore_predeclareMeta_nameIndex, name, idx + 1)
+    hashmaps.hashMapStrIntPut(uirCore_predeclareMeta_nameChainHead, stableName, entryIdx + 1)
+    hashmaps.hashMapStrIntPut(uirCore_predeclareMeta_nameIndex, stableName, idx + 1)
     if namePtrKey != 0:
         hashmaps.hashMapPtrIntPut(uirCore_predeclareMeta_namePtrIndex, namePtrKey, idx + 1)
     uirCore_predeclareMeta_nameIndexed[idx] = int8(1)
     uirCore_predeclareMeta_nameIndexedPtrKeys[idx] = namePtrKey
-    uirCore_predeclareMeta_nameIndexedNames[idx] = name
+    uirCore_predeclareMeta_nameIndexedNames[idx] = stableName
 
 fn uirCorePredeclareMetaNameMayHaveDup(mod: UirCoreModule, name: str): bool =
     if mod == nil || len(name) == 0:
@@ -606,6 +612,210 @@ fn uirCorePredeclareMetaEnsure(mod: UirCoreModule) =
         return
     uirCorePredeclareMetaReset(mod)
 
+fn uirCorePredeclareMetaCachedName(idx: int32): str =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return ""
+    return uirCore_predeclareMeta_names[idx]
+
+fn uirCorePredeclareMetaCachedOriginRaw(idx: int32): str =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return ""
+    return uirCore_predeclareMeta_originRaws[idx]
+
+fn uirCorePredeclareMetaCachedOriginNorm(idx: int32): str =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return ""
+    return uirCore_predeclareMeta_originNorms[idx]
+
+fn uirCorePredeclareMetaCachedDecl(idx: int32): int32 =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return -1
+    return uirCore_predeclareMeta_declOrdinals[idx]
+
+fn uirCorePredeclareMetaCachedSource(idx: int32): int32 =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return -1
+    return uirCore_predeclareMeta_sourceAstIndices[idx]
+
+fn uirCorePredeclareMetaCachedNameTextId(idx: int32): int32 =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return 0
+    return uirCore_predeclareMeta_nameTextIds[idx]
+
+fn uirCorePredeclareMetaCachedNameReady(idx: int32): bool =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return false
+    return uirCore_predeclareMeta_nameReady[idx] == int8(1)
+
+fn uirCorePredeclareMetaCachedOriginReady(idx: int32): bool =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return false
+    return uirCore_predeclareMeta_originReady[idx] == int8(1)
+
+fn uirCorePredeclareMetaCandidateName(func0: UirCoreFunc): str =
+    if func0 == nil:
+        return ""
+    let funcObj: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(func0)
+    if funcObj != nil:
+        let objName0: str = uirCoreTopLevelFuncObjName(funcObj)
+        if len(objName0) > 0:
+            return objName0
+    let dynName: str = uirCoreFuncNameObjFirst(func0)
+    if uirCoreStrPtrSane(dynName) && len(dynName) > 0:
+        return dynName
+    return ""
+
+fn uirCorePredeclareMetaCandidateDecl(func0: UirCoreFunc): int32 =
+    if func0 == nil:
+        return -1
+    let funcObj: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(func0)
+    if funcObj != nil:
+        let objDecl0: int32 = uirCoreTopLevelFuncObjDeclOrdinal(funcObj)
+        if objDecl0 >= 0:
+            return objDecl0
+    return uirCoreFuncDeclOrdinalObjFirst(func0)
+
+fn uirCorePredeclareMetaCandidateSource(func0: UirCoreFunc): int32 =
+    if func0 == nil:
+        return -1
+    let funcObj: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(func0)
+    if funcObj != nil:
+        let objSource0: int32 = uirCoreTopLevelFuncObjSourceAstIndex(funcObj)
+        if objSource0 >= 0:
+            return objSource0
+    return uirCoreFuncSourceAstIndexObjFirst(func0)
+
+fn uirCorePredeclareMetaCandidateOrigin(func0: UirCoreFunc, source0: int32): str =
+    if func0 == nil:
+        return ""
+    let funcObj: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(func0)
+    if funcObj != nil:
+        let objOrigin0: str = uirCoreTopLevelFuncObjOriginFile(funcObj)
+        if len(objOrigin0) > 0:
+            return objOrigin0
+    let sourceOriginGuess0: str = uirCoreOriginNormFromSourceAstIndex(source0)
+    if len(sourceOriginGuess0) > 0:
+        return sourceOriginGuess0
+    let dynOrigin: str = uirCoreFuncOriginFileObjFirst(func0)
+    if uirCoreStrPtrSane(dynOrigin) && len(dynOrigin) > 0:
+        return dynOrigin
+    return ""
+
+fn uirCorePredeclareMetaPrevNameCompatible(idx: int32, nameCandidate: str): bool =
+    if !uirCorePredeclareMetaCachedNameReady(idx):
+        return false
+    if len(nameCandidate) == 0:
+        return true
+    return uirCorePredeclareNameMatches(uirCorePredeclareMetaCachedName(idx), nameCandidate)
+
+fn uirCorePredeclareMetaResolvedName(idx: int32, nameCandidate: str): str =
+    if len(nameCandidate) > 0:
+        return nameCandidate
+    if uirCorePredeclareMetaPrevNameCompatible(idx, nameCandidate):
+        return uirCorePredeclareMetaCachedName(idx)
+    return ""
+
+fn uirCorePredeclareMetaResolvedNameTextId(idx: int32, nameCandidate: str): int32 =
+    if !uirCorePredeclareMetaPrevNameCompatible(idx, nameCandidate):
+        return 0
+    return uirCorePredeclareMetaCachedNameTextId(idx)
+
+fn uirCorePredeclareMetaResolvedSource(idx: int32, nameCandidate: str,
+                                       sourceCandidate: int32, originCandidate: str): int32 =
+    if sourceCandidate >= 0:
+        return sourceCandidate
+    if !uirCorePredeclareMetaPrevNameCompatible(idx, nameCandidate):
+        return sourceCandidate
+    let prevSource: int32 = uirCorePredeclareMetaCachedSource(idx)
+    if prevSource < 0:
+        return sourceCandidate
+    if len(originCandidate) == 0 || originCandidate == uirCorePredeclareMetaCachedOriginRaw(idx):
+        return prevSource
+    return sourceCandidate
+
+fn uirCorePredeclareMetaResolvedDecl(idx: int32, nameCandidate: str,
+                                     declCandidate: int32, originCandidate: str): int32 =
+    if declCandidate >= 0:
+        return declCandidate
+    if !uirCorePredeclareMetaPrevNameCompatible(idx, nameCandidate):
+        return declCandidate
+    let prevDecl: int32 = uirCorePredeclareMetaCachedDecl(idx)
+    if prevDecl < 0:
+        return declCandidate
+    if len(originCandidate) == 0 || originCandidate == uirCorePredeclareMetaCachedOriginRaw(idx):
+        return prevDecl
+    return declCandidate
+
+fn uirCorePredeclareMetaResolvedOriginRaw(idx: int32, nameCandidate: str,
+                                          originCandidate: str, source0: int32): str =
+    if len(originCandidate) > 0:
+        return originCandidate
+    if uirCorePredeclareMetaPrevNameCompatible(idx, nameCandidate) &&
+       uirCorePredeclareMetaCachedOriginReady(idx):
+        let prevOriginRaw: str = uirCorePredeclareMetaCachedOriginRaw(idx)
+        if len(prevOriginRaw) > 0:
+            return prevOriginRaw
+        return uirCorePredeclareMetaCachedOriginNorm(idx)
+    return uirCoreOriginNormFromSourceAstIndex(source0)
+
+fn uirCorePredeclareMetaResolvedOriginNorm(idx: int32, originRaw0: str, source0: int32): str =
+    let sourceOriginNorm0: str = uirCoreOriginNormFromSourceAstIndex(source0)
+    if len(sourceOriginNorm0) > 0:
+        return sourceOriginNorm0
+    if len(originRaw0) == 0:
+        return ""
+    if uirCorePredeclareMetaCachedOriginReady(idx) &&
+       originRaw0 == uirCorePredeclareMetaCachedOriginRaw(idx):
+        return uirCorePredeclareMetaCachedOriginNorm(idx)
+    return uirCoreNormalizeTopLevelPath(originRaw0, "")
+
+fn uirCorePredeclareMetaStableName(mod: UirCoreModule, idx: int32, f: UirCoreFunc): str =
+    let fastStable: str = uirCoreFuncNameFastForPredeclareLookup(mod, idx, f)
+    if len(fastStable) > 0:
+        return fastStable
+    if uirCorePredeclareMetaEnsureNameAt(mod, idx, f):
+        return uirCore_predeclareMeta_names[idx]
+    return ""
+
+fn uirCorePredeclareMetaStableOrigin(sourceAstIndex: int32, originNorm: str): str =
+    let sourceOriginStable: str = uirCoreOriginNormFromSourceAstIndex(sourceAstIndex)
+    if len(sourceOriginStable) > 0:
+        return sourceOriginStable
+    return uirCoreNormalizeTopLevelPath(originNorm, "")
+
+fn uirCorePredeclareMetaRefreshName(idx: int32, f: UirCoreFunc, fallbackName: str): str =
+    let candidateName: str = uirCorePredeclareMetaCandidateName(f)
+    if len(candidateName) > 0:
+        return candidateName
+    if len(fallbackName) > 0:
+        return fallbackName
+    return uirCorePredeclareMetaCachedName(idx)
+
+fn uirCorePredeclareMetaRefreshSource(f: UirCoreFunc, fallbackSourceAstIndex: int32): int32 =
+    let candidateSource: int32 = uirCorePredeclareMetaCandidateSource(f)
+    if candidateSource >= 0:
+        return candidateSource
+    return fallbackSourceAstIndex
+
+fn uirCorePredeclareMetaRefreshDecl(f: UirCoreFunc, fallbackDeclOrdinal: int32): int32 =
+    let candidateDecl: int32 = uirCorePredeclareMetaCandidateDecl(f)
+    if candidateDecl >= 0:
+        return candidateDecl
+    return fallbackDeclOrdinal
+
+fn uirCorePredeclareMetaRefreshOrigin(f: UirCoreFunc, source0: int32, fallbackOriginFile: str): str =
+    let candidateOrigin: str = uirCorePredeclareMetaCandidateOrigin(f, source0)
+    if len(candidateOrigin) > 0:
+        return candidateOrigin
+    return fallbackOriginFile
+
+fn uirCorePredeclareMetaRefreshNameTextId(idx: int32, name0: str): int32 =
+    if idx < 0 || idx >= uirCore_predeclareMeta_len || !uirCore_predeclareMeta_ready[idx]:
+        return 0
+    if name0 == uirCore_predeclareMeta_names[idx]:
+        return uirCore_predeclareMeta_nameTextIds[idx]
+    return 0
+
 fn uirCorePredeclareMetaBuildNameIndex(mod: UirCoreModule) =
     if mod == nil:
         uirCore_predeclareMeta_nameScanLen = 0
@@ -619,10 +829,7 @@ fn uirCorePredeclareMetaBuildNameIndex(mod: UirCoreModule) =
         let f: UirCoreFunc = uirCoreModuleFuncAtKnownLen(mod, funcsLen, i)
         if f == nil:
             continue
-        let fastStable: str = uirCoreFuncNameFastForPredeclareLookup(mod, i, f)
-        var stable: str = fastStable
-        if len(stable) == 0 && uirCorePredeclareMetaEnsureNameAt(mod, i, f):
-            stable = uirCore_predeclareMeta_names[i]
+        let stable: str = uirCorePredeclareMetaStableName(mod, i, f)
         if len(stable) > 0:
             uirCorePredeclareMetaRecordNameKeys(i, stable)
     uirCore_predeclareMeta_nameScanLen = funcsLen
@@ -639,120 +846,53 @@ fn uirCorePredeclareMetaEnsureIndex(mod: UirCoreModule, idx: int32, f: UirCoreFu
     let hadReady: bool = uirCore_predeclareMeta_ready[idx]
     let prevFuncPtr: int64 = hadReady ? uirCore_predeclareMeta_funcPtrs[idx] : 0
     let sameFuncPtr: bool = hadReady && prevFuncPtr == funcPtr
-    let prevName: str = hadReady ? uirCore_predeclareMeta_names[idx] : ""
-    let prevOriginRaw: str = hadReady ? uirCore_predeclareMeta_originRaws[idx] : ""
-    let prevOriginNorm: str = hadReady ? uirCore_predeclareMeta_originNorms[idx] : ""
-    let prevDecl: int32 = hadReady ? uirCore_predeclareMeta_declOrdinals[idx] : -1
-    let prevSource: int32 = hadReady ? uirCore_predeclareMeta_sourceAstIndices[idx] : -1
-    let prevNameTextId: int32 = hadReady ? uirCore_predeclareMeta_nameTextIds[idx] : 0
-    let prevNameReady: bool = hadReady && uirCore_predeclareMeta_nameReady[idx] == int8(1)
-    let prevOriginReady: bool = hadReady && uirCore_predeclareMeta_originReady[idx] == int8(1)
+    let prevName: str = uirCorePredeclareMetaCachedName(idx)
+    let prevOriginNorm: str = uirCorePredeclareMetaCachedOriginNorm(idx)
+    let prevDecl: int32 = uirCorePredeclareMetaCachedDecl(idx)
+    let prevSource: int32 = uirCorePredeclareMetaCachedSource(idx)
+    let prevNameReady: bool = uirCorePredeclareMetaCachedNameReady(idx)
+    let prevOriginReady: bool = uirCorePredeclareMetaCachedOriginReady(idx)
     # Predeclare metadata is keyed by function object identity; if the same slot
     # still points at the same function, reuse the cached metadata instead of
     # re-normalizing origin/name on every lookup.
     if hadReady && sameFuncPtr:
         uirCorePredeclareMetaRecentStore(mod, idx, funcPtr)
         return true
-    var name0: str = ""
-    var origin0: str = ""
-    var decl0: int32 = -1
-    var source0: int32 = -1
-    var nameTextId0: int32 = 0
-    var nameReady0: bool = false
-    var originRawReady0: bool = false
-    if func0 != nil:
-        let funcObj: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(func0)
-        if funcObj != nil:
-            let objName0: str = uirCoreTopLevelFuncObjName(funcObj)
-            let objOrigin0: str = uirCoreTopLevelFuncObjOriginFile(funcObj)
-            let objDecl0: int32 = uirCoreTopLevelFuncObjDeclOrdinal(funcObj)
-            let objSource0: int32 = uirCoreTopLevelFuncObjSourceAstIndex(funcObj)
-            if len(objName0) > 0:
-                name0 = objName0
-                nameReady0 = true
-            if len(objOrigin0) > 0:
-                origin0 = objOrigin0
-                originRawReady0 = true
-            if objDecl0 >= 0:
-                decl0 = objDecl0
-            if objSource0 >= 0:
-                source0 = objSource0
-        if !nameReady0:
-            let dynName: str = uirCoreFuncNameObjFirst(func0)
-            if uirCoreStrPtrSane(dynName) && len(dynName) > 0:
-                name0 = dynName
-                nameReady0 = true
-        let prevMetaNameCompatible: bool =
-            hadReady && prevNameReady &&
-            ((!nameReady0) || uirCorePredeclareNameMatches(prevName, name0))
-        if prevMetaNameCompatible:
-            if !nameReady0:
-                name0 = prevName
-                nameReady0 = true
-            if nameTextId0 <= 0 && prevNameTextId > 0:
-                nameTextId0 = prevNameTextId
-            if source0 < 0 && prevSource >= 0 &&
-               (!originRawReady0 || origin0 == prevOriginRaw):
-                source0 = prevSource
-            if decl0 < 0 && prevDecl >= 0 &&
-               (!originRawReady0 || origin0 == prevOriginRaw):
-                decl0 = prevDecl
-            if !originRawReady0 && prevOriginReady:
-                origin0 = (len(prevOriginRaw) > 0) ? prevOriginRaw : prevOriginNorm
-                originRawReady0 = len(origin0) > 0
-        if decl0 < 0:
-            let dynDecl: int32 = uirCoreFuncDeclOrdinalObjFirst(func0)
-            if dynDecl >= 0:
-                decl0 = dynDecl
-        if source0 < 0:
-            let dynSource: int32 = uirCoreFuncSourceAstIndexObjFirst(func0)
-            if dynSource >= 0:
-                source0 = dynSource
-        if !originRawReady0:
-            let sourceOriginGuess0: str = uirCoreOriginNormFromSourceAstIndex(source0)
-            if len(sourceOriginGuess0) > 0:
-                origin0 = sourceOriginGuess0
-                originRawReady0 = true
-            else:
-                let dynOrigin: str = uirCoreFuncOriginFileObjFirst(func0)
-                if uirCoreStrPtrSane(dynOrigin) && len(dynOrigin) > 0:
-                    origin0 = dynOrigin
-                    originRawReady0 = true
-    let sourceOriginNorm0: str = uirCoreOriginNormFromSourceAstIndex(source0)
-    if !originRawReady0 && len(sourceOriginNorm0) > 0:
-        origin0 = sourceOriginNorm0
-        originRawReady0 = true
-    var originNorm0: str = ""
-    var originNormReady0: bool = false
-    if len(sourceOriginNorm0) > 0:
-        originNorm0 = sourceOriginNorm0
-        originNormReady0 = true
-    elif originRawReady0:
-        if prevOriginReady && origin0 == prevOriginRaw:
-            originNorm0 = prevOriginNorm
-        else:
-            originNorm0 = uirCoreNormalizeTopLevelPath(origin0, "")
-        originNormReady0 = len(originNorm0) > 0
+    let nameCandidate: str = uirCorePredeclareMetaCandidateName(func0)
+    let sourceCandidate: int32 = uirCorePredeclareMetaCandidateSource(func0)
+    let declCandidate: int32 = uirCorePredeclareMetaCandidateDecl(func0)
+    let originCandidate: str = uirCorePredeclareMetaCandidateOrigin(func0, sourceCandidate)
+    let name0: str = uirCorePredeclareMetaResolvedName(idx, nameCandidate)
+    let source0: int32 = uirCorePredeclareMetaResolvedSource(idx, nameCandidate, sourceCandidate, originCandidate)
+    let decl0: int32 = uirCorePredeclareMetaResolvedDecl(idx, nameCandidate, declCandidate, originCandidate)
+    let origin0: str = uirCorePredeclareMetaResolvedOriginRaw(idx, nameCandidate, originCandidate, source0)
+    let originNorm0: str = uirCorePredeclareMetaResolvedOriginNorm(idx, origin0, source0)
+    let nameTextId0: int32 = uirCorePredeclareMetaResolvedNameTextId(idx, nameCandidate)
+    let stableName0: str = uirCoreTopLevelStableText(name0)
+    let stableOrigin0: str = uirCoreTopLevelStableText(origin0)
+    let stableOriginNorm0: str = uirCoreTopLevelStableText(originNorm0)
+    let nameReady0: bool = len(stableName0) > 0
+    let originNormReady0: bool = len(stableOriginNorm0) > 0
     uirCore_predeclareMeta_funcPtrs[idx] = funcPtr
-    uirCore_predeclareMeta_names[idx] = name0
+    uirCore_predeclareMeta_names[idx] = stableName0
     uirCore_predeclareMeta_nameReady[idx] = nameReady0 ? int8(1) : int8(0)
     uirCore_predeclareMeta_nameTextIds[idx] = nameTextId0
-    uirCore_predeclareMeta_originRaws[idx] = origin0
-    uirCore_predeclareMeta_originNorms[idx] = originNorm0
+    uirCore_predeclareMeta_originRaws[idx] = stableOrigin0
+    uirCore_predeclareMeta_originNorms[idx] = stableOriginNorm0
     uirCore_predeclareMeta_originReady[idx] = originNormReady0 ? int8(1) : int8(0)
     uirCore_predeclareMeta_declOrdinals[idx] = decl0
     uirCore_predeclareMeta_sourceAstIndices[idx] = source0
     uirCore_predeclareMeta_ready[idx] = true
-    if nameReady0 && (!hadReady || !prevNameReady || !(prevName == name0)):
-        uirCorePredeclareMetaRecordNameKeys(idx, name0)
+    if nameReady0 && (!hadReady || !prevNameReady || !(prevName == stableName0)):
+        uirCorePredeclareMetaRecordNameKeys(idx, stableName0)
     if nameTextId0 > 0:
         uirCorePredeclareMetaRecordNameTextKey(idx, nameTextId0)
     if !hadReady || decl0 != prevDecl || source0 != prevSource:
         uirCorePredeclareMetaRecordHintKeys(idx, decl0, source0)
     if originNormReady0 &&
-       (!hadReady || !prevOriginReady || prevOriginNorm != originNorm0 ||
+       (!hadReady || !prevOriginReady || prevOriginNorm != stableOriginNorm0 ||
         decl0 != prevDecl || source0 != prevSource):
-        uirCorePredeclareMetaRecordOriginHintKeys(idx, originNorm0, decl0, source0)
+        uirCorePredeclareMetaRecordOriginHintKeys(idx, stableOriginNorm0, decl0, source0)
     uirCorePredeclareMetaRecentStore(mod, idx, funcPtr)
     return true
 
@@ -766,21 +906,21 @@ fn uirCorePredeclareMetaPutAt(mod: UirCoreModule, idx: int32, f: UirCoreFunc,
     uirCorePredeclareMetaEnsure(mod)
     if idx >= uirCore_predeclareMeta_len || idx >= uirCoreModuleFuncsLen(mod):
         return
-    let sourceOriginStable: str = uirCoreOriginNormFromSourceAstIndex(sourceAstIndex)
-    var originStable: str = sourceOriginStable
-    if len(originStable) == 0:
-        originStable = uirCoreNormalizeTopLevelPath(originNorm, "")
+    let nameStable: str = uirCoreTopLevelStableText(name)
+    let originRawStable: str = uirCoreTopLevelStableText(originNorm)
+    let originStable: str =
+        uirCoreTopLevelStableText(uirCorePredeclareMetaStableOrigin(sourceAstIndex, originNorm))
     uirCore_predeclareMeta_funcPtrs[idx] = (f != nil) ? uirCorePredeclareMetaFuncKey(f) : 0
-    uirCore_predeclareMeta_names[idx] = name
-    uirCore_predeclareMeta_nameReady[idx] = (len(name) > 0) ? int8(1) : int8(0)
+    uirCore_predeclareMeta_names[idx] = nameStable
+    uirCore_predeclareMeta_nameReady[idx] = (len(nameStable) > 0) ? int8(1) : int8(0)
     uirCore_predeclareMeta_nameTextIds[idx] = nameTextId
-    uirCore_predeclareMeta_originRaws[idx] = originNorm
+    uirCore_predeclareMeta_originRaws[idx] = originRawStable
     uirCore_predeclareMeta_originNorms[idx] = originStable
     uirCore_predeclareMeta_originReady[idx] = (len(originStable) > 0) ? int8(1) : int8(0)
     uirCore_predeclareMeta_declOrdinals[idx] = declOrdinal
     uirCore_predeclareMeta_sourceAstIndices[idx] = sourceAstIndex
     uirCore_predeclareMeta_ready[idx] = true
-    uirCorePredeclareMetaRecordNameKeys(idx, name)
+    uirCorePredeclareMetaRecordNameKeys(idx, nameStable)
     uirCorePredeclareMetaRecordNameTextKey(idx, nameTextId)
     uirCorePredeclareMetaRecordHintKeys(idx, declOrdinal, sourceAstIndex)
     uirCorePredeclareMetaRecordOriginHintKeys(idx, originStable, declOrdinal, sourceAstIndex)
@@ -795,53 +935,11 @@ fn uirCorePredeclareMetaRefreshFuncAt(mod: UirCoreModule, idx: int32, f: UirCore
     uirCorePredeclareMetaEnsure(mod)
     if idx >= uirCore_predeclareMeta_len || idx >= uirCoreModuleFuncsLen(mod):
         return
-    var name0: str = fallbackName
-    var origin0: str = fallbackOriginFile
-    var decl0: int32 = fallbackDeclOrdinal
-    var source0: int32 = fallbackSourceAstIndex
-    var nameTextId0: int32 = 0
-    if f != nil:
-        let funcObj: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(f)
-        if funcObj != nil:
-            let objName0: str = uirCoreTopLevelFuncObjName(funcObj)
-            let objOrigin0: str = uirCoreTopLevelFuncObjOriginFile(funcObj)
-            let objDecl0: int32 = uirCoreTopLevelFuncObjDeclOrdinal(funcObj)
-            let objSource0: int32 = uirCoreTopLevelFuncObjSourceAstIndex(funcObj)
-            if len(objName0) > 0:
-                name0 = objName0
-            if len(objOrigin0) > 0:
-                origin0 = objOrigin0
-            if objDecl0 >= 0:
-                decl0 = objDecl0
-            if objSource0 >= 0:
-                source0 = objSource0
-        if len(name0) == 0:
-            let dynName: str = uirCoreFuncNameObjFirst(f)
-            if uirCoreStrPtrSane(dynName) && len(dynName) > 0:
-                name0 = dynName
-        if decl0 < 0:
-            let dynDecl: int32 = uirCoreFuncDeclOrdinalObjFirst(f)
-            if dynDecl >= 0:
-                decl0 = dynDecl
-        if source0 < 0:
-            let dynSource: int32 = uirCoreFuncSourceAstIndexObjFirst(f)
-            if dynSource >= 0:
-                source0 = dynSource
-        if len(origin0) == 0:
-            let sourceOriginGuess0: str = uirCoreOriginNormFromSourceAstIndex(source0)
-            if len(sourceOriginGuess0) > 0:
-                origin0 = sourceOriginGuess0
-            else:
-                let dynOrigin: str = uirCoreFuncOriginFileObjFirst(f)
-                if uirCoreStrPtrSane(dynOrigin) && len(dynOrigin) > 0:
-                    origin0 = dynOrigin
-    if len(name0) == 0 && uirCore_predeclareMeta_ready[idx]:
-        let prevName: str = uirCore_predeclareMeta_names[idx]
-        if uirCoreStrPtrSane(prevName) && len(prevName) > 0:
-            name0 = prevName
-            nameTextId0 = uirCore_predeclareMeta_nameTextIds[idx]
-    elif uirCore_predeclareMeta_ready[idx] && name0 == uirCore_predeclareMeta_names[idx]:
-        nameTextId0 = uirCore_predeclareMeta_nameTextIds[idx]
+    let source0: int32 = uirCorePredeclareMetaRefreshSource(f, fallbackSourceAstIndex)
+    let decl0: int32 = uirCorePredeclareMetaRefreshDecl(f, fallbackDeclOrdinal)
+    let name0: str = uirCorePredeclareMetaRefreshName(idx, f, fallbackName)
+    let origin0: str = uirCorePredeclareMetaRefreshOrigin(f, source0, fallbackOriginFile)
+    let nameTextId0: int32 = uirCorePredeclareMetaRefreshNameTextId(idx, name0)
     uirCorePredeclareMetaPutAt(mod, idx, f, name0, origin0, decl0, source0, nameTextId0)
 
 fn uirCoreTopLevelPathCacheReset() =
@@ -872,12 +970,15 @@ fn uirCoreTopLevelPathNormCacheGet(path: str, found: var bool): str =
     found = false
     if len(path) == 0:
         return ""
-    let ptrKey: int64 = int64(rawmemAsVoid(path))
+    let stablePath: str = uirCoreTopLevelStableText(path)
+    if len(stablePath) == 0:
+        return ""
+    let ptrKey: int64 = uirCoreStrPtrSane(path) ? int64(rawmemAsVoid(path)) : int64(0)
     if ptrKey != 0 && ptrKey == uirCore_topLevelPathNorm_last_ptr:
         found = true
         return uirCore_topLevelPathNorm_last_out
     if len(uirCore_topLevelPathNorm_last_in) > 0 &&
-       path == uirCore_topLevelPathNorm_last_in:
+       stablePath == uirCore_topLevelPathNorm_last_in:
         found = true
         return uirCore_topLevelPathNorm_last_out
     if ptrKey != 0:
@@ -886,17 +987,17 @@ fn uirCoreTopLevelPathNormCacheGet(path: str, found: var bool): str =
         if found && idx >= 0 && idx < uirCore_topLevelPathNorm_ptr_values.len:
             let out0: str = uirCore_topLevelPathNorm_ptr_values[idx]
             uirCore_topLevelPathNorm_last_ptr = ptrKey
-            uirCore_topLevelPathNorm_last_in = path
+            uirCore_topLevelPathNorm_last_in = stablePath
             uirCore_topLevelPathNorm_last_out = out0
             return out0
-    let rawText: int32 = uirCoreHashMapStrIntGetCompat(uirCore_topLevelPathNorm_text_index, path, found)
+    let rawText: int32 = uirCoreHashMapStrIntGetCompat(uirCore_topLevelPathNorm_text_index, stablePath, found)
     let idxText: int32 = rawText - 1
     if found && idxText >= 0 && idxText < uirCore_topLevelPathNorm_ptr_values.len:
         let out: str = uirCore_topLevelPathNorm_ptr_values[idxText]
         if ptrKey != 0:
             hashmaps.hashMapPtrIntPut(uirCore_topLevelPathNorm_ptr_index, ptrKey, idxText + 1)
         uirCore_topLevelPathNorm_last_ptr = ptrKey
-        uirCore_topLevelPathNorm_last_in = path
+        uirCore_topLevelPathNorm_last_in = stablePath
         uirCore_topLevelPathNorm_last_out = out
         return out
     found = false
@@ -905,15 +1006,19 @@ fn uirCoreTopLevelPathNormCacheGet(path: str, found: var bool): str =
 fn uirCoreTopLevelPathNormCachePut(path: str, norm: str) =
     if len(path) == 0:
         return
-    let ptrKey: int64 = int64(rawmemAsVoid(path))
+    let stablePath: str = uirCoreTopLevelStableText(path)
+    if len(stablePath) == 0:
+        return
+    let stableNorm: str = uirCoreTopLevelStableText(norm)
+    let ptrKey: int64 = uirCoreStrPtrSane(path) ? int64(rawmemAsVoid(path)) : int64(0)
     let nextIdx: int32 = uirCore_topLevelPathNorm_ptr_values.len
-    uir_core_builder_top_level_passes_add(uirCore_topLevelPathNorm_ptr_values, norm)
+    uir_core_builder_top_level_passes_add(uirCore_topLevelPathNorm_ptr_values, stableNorm)
     if ptrKey != 0:
         hashmaps.hashMapPtrIntPut(uirCore_topLevelPathNorm_ptr_index, ptrKey, nextIdx + 1)
-    hashmaps.hashMapStrIntPut(uirCore_topLevelPathNorm_text_index, path, nextIdx + 1)
+    hashmaps.hashMapStrIntPut(uirCore_topLevelPathNorm_text_index, stablePath, nextIdx + 1)
     uirCore_topLevelPathNorm_last_ptr = ptrKey
-    uirCore_topLevelPathNorm_last_in = path
-    uirCore_topLevelPathNorm_last_out = norm
+    uirCore_topLevelPathNorm_last_in = stablePath
+    uirCore_topLevelPathNorm_last_out = stableNorm
 
 fn uirCorePathScanFlags(path: str): int32 =
     let n: int32 = len(path)
@@ -997,7 +1102,7 @@ fn uirCoreNormalizeTopLevelPathTextId(textId: int32): str =
     let canonId: int32 = tokenTextTrimmedCanonicalId(textId)
     if canonId <= 0:
         return ""
-    let out: str = tokenTextById(canonId)
+    let out: str = uirCoreTopLevelStableText(tokenTextById(canonId))
     return (uirCorePathScanFlags(out) & 2) != 0 ? "" : out
 
 fn uirCoreOriginNormFromSourceAstIndex(sourceAstIndex: int32): str =
@@ -1010,7 +1115,7 @@ fn uirCoreOriginNormFromSourceAstIndex(sourceAstIndex: int32): str =
         return ""
     let out: str = uirCoreNormalizeTopLevelPathTextId(astNodeStrValId(sourceNodeId))
     uirCore_topLevelPathNorm_last_sourceAstIndex = sourceAstIndex
-    uirCore_topLevelPathNorm_last_sourceOrigin = out
+    uirCore_topLevelPathNorm_last_sourceOrigin = uirCoreTopLevelStableText(out)
     return out
 
 fn uirCoreOriginNormPreferSourceAstIndex(originFile: str,
@@ -1121,6 +1226,25 @@ fn uirCoreTopLevelRoutineNameEnsureNodeCache(nId: AstNodeId) =
         for i in oldTextLen..<needLen:
             uirCore_topLevelRoutineName_textIds[i] = 0
 
+fn uirCoreTopLevelRoutineNameCanonId(nameNodeId: AstNodeId): int32 =
+    if !astNodeIdValid(nameNodeId):
+        return 0
+    let nameKind: NodeKind = astNodeKind(nameNodeId)
+    if nameKind != nkIdent && nameKind != nkSymbol:
+        return 0
+    return tokenTextTrimmedCanonicalId(astNodeIdentId(nameNodeId))
+
+fn uirCoreTopLevelRoutineNameText(canonId: int32): str =
+    if canonId > 0:
+        return uirCoreTopLevelStableText(tokenTextById(canonId))
+    return ""
+
+fn uirCoreTopLevelReachableEntryPath(nId: AstNodeId, callFilePath: str): str =
+    let ownPathNorm: str = uirCoreNormalizeTopLevelPathTextId(astNodeStrValId(nId))
+    if len(ownPathNorm) > 0:
+        return ownPathNorm
+    return callFilePath
+
 fn uirCoreTopLevelRoutineNameId(nId: AstNodeId): str =
     if astNodeIdValid(nId):
         uirCoreTopLevelRoutineNameEnsureNodeCache(nId)
@@ -1129,19 +1253,12 @@ fn uirCoreTopLevelRoutineNameId(nId: AstNodeId): str =
            uirCore_topLevelRoutineName_ready[idx0] == int8(1):
             return uirCore_topLevelRoutineName_values[idx0]
     let nameNodeId: AstNodeId = uirCoreTopLevelRoutineNameNodeId(nId)
-    var out: str = ""
-    if !astNodeIdValid(nameNodeId):
-        out = ""
-    else:
-        let nameKind: NodeKind = astNodeKind(nameNodeId)
-        if nameKind == nkIdent || nameKind == nkSymbol:
-            let identId: int32 = astNodeIdentId(nameNodeId)
-            let canonId: int32 = tokenTextTrimmedCanonicalId(identId)
-            out = (canonId > 0) ? tokenTextById(canonId) : ""
-            if astNodeIdValid(nId):
-                let idxText: int32 = int32(nId)
-                if idxText >= 0 && idxText < uirCore_topLevelRoutineName_textIds.len:
-                    uirCore_topLevelRoutineName_textIds[idxText] = canonId
+    let canonId: int32 = uirCoreTopLevelRoutineNameCanonId(nameNodeId)
+    let out: str = uirCoreTopLevelRoutineNameText(canonId)
+    if astNodeIdValid(nId):
+        let idxText: int32 = int32(nId)
+        if idxText >= 0 && idxText < uirCore_topLevelRoutineName_textIds.len:
+            uirCore_topLevelRoutineName_textIds[idxText] = canonId
     if astNodeIdValid(nId):
         let idx1: int32 = int32(nId)
         if idx1 >= 0 && idx1 < uirCore_topLevelRoutineName_ready.len:
@@ -1167,11 +1284,7 @@ fn uirCoreTopLevelRoutineKeepByReachable(nId: AstNodeId, callFilePath: str,
                                          predeclarePhase: bool): bool =
     if reachable == nil:
         return true
-    var entryPathProbe: str = callFilePath
-    let ownPathId: int32 = astNodeStrValId(nId)
-    let ownPathNorm: str = uirCoreNormalizeTopLevelPathTextId(ownPathId)
-    if len(ownPathNorm) > 0:
-        entryPathProbe = ownPathNorm
+    let entryPathProbe: str = uirCoreTopLevelReachableEntryPath(nId, callFilePath)
     let keepByEntryFile: bool = uirCoreIsEntryFilePath(entryPathProbe)
     if envIsTrue "BACKEND_DEBUG_STAGE1_PIPE":
         let fDbgReach0: os.File = os.get_stderr()
@@ -1231,6 +1344,7 @@ fn uirCoreModuleHasGlobalOrTypeName(mod: UirCoreModule, name: str): bool =
         uirCoreFindTypeAlias(mod, name) >= 0 ||
         uirCoreFindObjType(mod, name) >= 0
     var idxWrite: int32 = -1
+    let stableName: str = uirCoreTopLevelStableText(name)
     if ptrKey != 0:
         var foundWritePtr: bool = false
         let rawWritePtr: int32 = hashmaps.hashMapPtrIntGet(uirCore_moduleHasName_ptr_index, ptrKey, foundWritePtr)
@@ -1242,11 +1356,11 @@ fn uirCoreModuleHasGlobalOrTypeName(mod: UirCoreModule, name: str): bool =
     if idxWrite < 0:
         idxWrite = uirCore_moduleHasName_ready.len
         uirCoreModuleHasNameCacheEnsureIndex(idxWrite)
-        hashmaps.hashMapStrIntPut(uirCore_moduleHasName_index, name, idxWrite + 1)
+        hashmaps.hashMapStrIntPut(uirCore_moduleHasName_index, stableName, idxWrite + 1)
     else:
         uirCoreModuleHasNameCacheEnsureIndex(idxWrite)
         if !foundName || idxName != idxWrite:
-            hashmaps.hashMapStrIntPut(uirCore_moduleHasName_index, name, idxWrite + 1)
+            hashmaps.hashMapStrIntPut(uirCore_moduleHasName_index, stableName, idxWrite + 1)
     if ptrKey != 0:
         hashmaps.hashMapPtrIntPut(uirCore_moduleHasName_ptr_index, ptrKey, idxWrite + 1)
     uirCore_moduleHasName_ready[idxWrite] = int8(1)
@@ -1333,22 +1447,14 @@ fn uirCorePredeclareMetaEnsureNameAt(mod: UirCoreModule, idx: int32, f: UirCoreF
     if uirCore_predeclareMeta_funcPtrs[idx] == funcPtr &&
        uirCore_predeclareMeta_nameReady[idx] == int8(1):
         return true
-    var name0: str = ""
-    if func0 != nil:
-        let funcObj: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(func0)
-        let objName0: str = uirCoreTopLevelFuncObjName(funcObj)
-        if len(objName0) > 0:
-            name0 = objName0
-        elif func0 != nil:
-            let dynName: str = uirCoreFuncNameObjFirst(func0)
-            if uirCoreStrPtrSane(dynName) && len(dynName) > 0:
-                name0 = dynName
+    let name0: str = uirCorePredeclareMetaCandidateName(func0)
     if len(name0) == 0:
         return uirCore_predeclareMeta_nameReady[idx] == int8(1)
+    let stableName0: str = uirCoreTopLevelStableText(name0)
     uirCore_predeclareMeta_funcPtrs[idx] = funcPtr
-    uirCore_predeclareMeta_names[idx] = name0
+    uirCore_predeclareMeta_names[idx] = stableName0
     uirCore_predeclareMeta_nameReady[idx] = int8(1)
-    uirCorePredeclareMetaRecordNameKeys(idx, name0)
+    uirCorePredeclareMetaRecordNameKeys(idx, stableName0)
     return true
 
 fn uirCorePredeclareMetaCanCacheAt(mod: UirCoreModule, idx: int32): bool =
@@ -1362,12 +1468,13 @@ fn uirCorePredeclareMetaCacheNameAt(mod: UirCoreModule, idx: int32,
                                     funcPtr: int64, name: str) =
     if !uirCorePredeclareMetaCanCacheAt(mod, idx):
         return
+    let stableName: str = uirCoreTopLevelStableText(name)
     uirCore_predeclareMeta_funcPtrs[idx] = funcPtr
-    uirCore_predeclareMeta_names[idx] = name
-    uirCore_predeclareMeta_nameReady[idx] = (len(name) > 0) ? int8(1) : int8(0)
+    uirCore_predeclareMeta_names[idx] = stableName
+    uirCore_predeclareMeta_nameReady[idx] = (len(stableName) > 0) ? int8(1) : int8(0)
     uirCore_predeclareMeta_ready[idx] = true
-    if len(name) > 0:
-        uirCorePredeclareMetaRecordNameKeys(idx, name)
+    if len(stableName) > 0:
+        uirCorePredeclareMetaRecordNameKeys(idx, stableName)
     uirCorePredeclareMetaRecentStore(mod, idx, funcPtr)
 
 fn uirCorePredeclareMetaCacheOriginAt(mod: UirCoreModule, idx: int32,
@@ -1376,13 +1483,15 @@ fn uirCorePredeclareMetaCacheOriginAt(mod: UirCoreModule, idx: int32,
                                       originNorm: str) =
     if !uirCorePredeclareMetaCanCacheAt(mod, idx):
         return
+    let stableOriginRaw: str = uirCoreTopLevelStableText(originRaw)
+    let stableOriginNorm: str = uirCoreTopLevelStableText(originNorm)
     uirCore_predeclareMeta_funcPtrs[idx] = funcPtr
-    uirCore_predeclareMeta_originRaws[idx] = originRaw
-    uirCore_predeclareMeta_originNorms[idx] = originNorm
-    uirCore_predeclareMeta_originReady[idx] = (len(originNorm) > 0) ? int8(1) : int8(0)
+    uirCore_predeclareMeta_originRaws[idx] = stableOriginRaw
+    uirCore_predeclareMeta_originNorms[idx] = stableOriginNorm
+    uirCore_predeclareMeta_originReady[idx] = (len(stableOriginNorm) > 0) ? int8(1) : int8(0)
     uirCore_predeclareMeta_ready[idx] = true
-    if len(originNorm) > 0:
-        uirCorePredeclareMetaRecordOriginHintKeys(idx, originNorm,
+    if len(stableOriginNorm) > 0:
+        uirCorePredeclareMetaRecordOriginHintKeys(idx, stableOriginNorm,
                                                   uirCore_predeclareMeta_declOrdinals[idx],
                                                   uirCore_predeclareMeta_sourceAstIndices[idx])
     uirCorePredeclareMetaRecentStore(mod, idx, funcPtr)
@@ -1837,23 +1946,11 @@ fn uirCoreFuncMatchesRoutineKeyNormalized(mod: UirCoreModule, idx: int32, f: Uir
                 return false
         elif uirCoreFuncNameStableForPredeclare(mod, idx, f) != fnName:
             return false
-    var exSourceAstIndex: int32 = -1
-    if cacheSlotCurrent:
-        exSourceAstIndex = uirCore_predeclareMeta_sourceAstIndices[idx]
-    if exSourceAstIndex < 0:
-        exSourceAstIndex = uirCoreFuncSourceAstIndexStableForPredeclare(mod, idx, f)
+    let exSourceAstIndex: int32 = uirCoreRoutineKeySourceStable(mod, idx, f, cacheSlotCurrent)
     if sourceAstIndex >= 0 && exSourceAstIndex >= 0 && exSourceAstIndex == sourceAstIndex:
         return true
-    var exDeclOrdinal: int32 = -1
-    if cacheSlotCurrent:
-        exDeclOrdinal = uirCore_predeclareMeta_declOrdinals[idx]
-    if exDeclOrdinal < 0:
-        exDeclOrdinal = uirCoreFuncDeclOrdinalStableForPredeclare(mod, idx, f)
-    var exOriginFile: str = ""
-    if cacheSlotCurrent && uirCore_predeclareMeta_originReady[idx] == int8(1):
-        exOriginFile = uirCore_predeclareMeta_originNorms[idx]
-    else:
-        exOriginFile = uirCoreFuncOriginNormStableForPredeclare(mod, idx, f)
+    let exDeclOrdinal: int32 = uirCoreRoutineKeyDeclStable(mod, idx, f, cacheSlotCurrent)
+    let exOriginFile: str = uirCoreRoutineKeyOriginStable(mod, idx, f, cacheSlotCurrent)
     let sameOriginFile: bool = exOriginFile == fnOriginNorm
     let weakOriginMatch: bool = len(exOriginFile) == 0 || len(fnOriginNorm) == 0 ||
                                 !uirCorePathLooksCanonical(exOriginFile) ||
@@ -1891,6 +1988,28 @@ fn uirCoreFuncMatchesRoutineKey(f: UirCoreFunc, fnName: str, fnOriginFile: str,
                                                                   sourceAstIndex)
     return uirCoreFuncMatchesRoutineKeyNormalized(nil, -1, f, fnName, fnOriginNorm,
                                                   declOrdinal, sourceAstIndex, 0)
+
+fn uirCoreRoutineKeySourceStable(mod: UirCoreModule, idx: int32, f: UirCoreFunc,
+                                 cacheSlotCurrent: bool): int32 =
+    if cacheSlotCurrent:
+        let cachedSource: int32 = uirCore_predeclareMeta_sourceAstIndices[idx]
+        if cachedSource >= 0:
+            return cachedSource
+    return uirCoreFuncSourceAstIndexStableForPredeclare(mod, idx, f)
+
+fn uirCoreRoutineKeyDeclStable(mod: UirCoreModule, idx: int32, f: UirCoreFunc,
+                               cacheSlotCurrent: bool): int32 =
+    if cacheSlotCurrent:
+        let cachedDecl: int32 = uirCore_predeclareMeta_declOrdinals[idx]
+        if cachedDecl >= 0:
+            return cachedDecl
+    return uirCoreFuncDeclOrdinalStableForPredeclare(mod, idx, f)
+
+fn uirCoreRoutineKeyOriginStable(mod: UirCoreModule, idx: int32, f: UirCoreFunc,
+                                 cacheSlotCurrent: bool): str =
+    if cacheSlotCurrent && uirCore_predeclareMeta_originReady[idx] == int8(1):
+        return uirCore_predeclareMeta_originNorms[idx]
+    return uirCoreFuncOriginNormStableForPredeclare(mod, idx, f)
 
 fn uirCoreFuncMatchesSameOriginSignatureStable(mod: UirCoreModule, idx: int32,
                                                existing: UirCoreFunc,
@@ -1936,8 +2055,8 @@ fn uirCoreFuncMatchesSameOriginSignatureStable(mod: UirCoreModule, idx: int32,
         let retAliasCompat: bool =
             exRetTy.kind == candRetTy.kind &&
             exRetTy.isUnsigned == candRetTy.isUnsigned &&
-            isStringOrPtrKey(exRetKey) &&
-            isStringOrPtrKey(candRetKey)
+            isStringOrPtrKeyCanon(exRetKey) &&
+            isStringOrPtrKeyCanon(candRetKey)
         if !retAliasCompat:
             return false
     if exRetTy.kind != candRetTy.kind || exRetTy.isUnsigned != candRetTy.isUnsigned:
@@ -1957,8 +2076,8 @@ fn uirCoreFuncMatchesSameOriginSignatureStable(mod: UirCoreModule, idx: int32,
             let paramAliasCompat: bool =
                 exParamTy.kind == candParamTy.kind &&
                 exParamTy.isUnsigned == candParamTy.isUnsigned &&
-                isStringOrPtrKey(exParamKey) &&
-                isStringOrPtrKey(candParamKey)
+                isStringOrPtrKeyCanon(exParamKey) &&
+                isStringOrPtrKeyCanon(candParamKey)
             if !paramAliasCompat:
                 return false
         if exParamTy.kind != candParamTy.kind || exParamTy.isUnsigned != candParamTy.isUnsigned:
@@ -2105,9 +2224,7 @@ fn uirCoreModuleFuncSameOriginIndex(mod: UirCoreModule, fnName: str, fnOriginFil
                                      declOrdinal, sourceAstIndex,
                                      nameTextId, sameSourceIdx)
         return sameSourceIdx
-    var fnOriginNorm: str = sourceOriginNorm
-    if len(fnOriginNorm) == 0:
-        fnOriginNorm = uirCoreNormalizeTopLevelPath(fnOriginFile, "")
+    let fnOriginNorm: str = uirCoreOriginNormPreferSourceAstIndex(fnOriginFile, sourceAstIndex)
     let recentIdx: int32 = uirCoreSameOriginRecentLookup(mod, fnName, fnOriginNorm,
                                                          declOrdinal, sourceAstIndex,
                                                          nameTextId)
@@ -2130,20 +2247,16 @@ fn uirCoreModuleFuncSameOriginIndex(mod: UirCoreModule, fnName: str, fnOriginFil
                                                                            sourceAstIndex, nameTextId)
         if envIsTrue "BACKEND_DEBUG_ROUTINE_KEY":
             let cachedReady: bool = uirCorePredeclareMetaEnsureIndex(mod, exIdx, ex)
-            let cachedName: str = cachedReady ? uirCore_predeclareMeta_names[exIdx] : ""
-            let cachedOrigin: str = cachedReady ? uirCore_predeclareMeta_originNorms[exIdx] : ""
-            let cachedDecl: int32 = cachedReady ? uirCore_predeclareMeta_declOrdinals[exIdx] : -1
-            let cachedSource: int32 = cachedReady ? uirCore_predeclareMeta_sourceAstIndices[exIdx] : -1
             os.writeLine(os.get_stderr(),
                          "[backend] routine_key fn=" + fnName +
                          " cur_origin=" + fnOriginNorm +
                          " cur_decl=" + intToStr(declOrdinal) +
                          " cur_ast=" + intToStr(sourceAstIndex) +
-                         " ex_idx=" + intToStr(exIdx) +
-                         " ex_name=" + cachedName +
-                         " ex_origin=" + cachedOrigin +
-                         " ex_decl=" + intToStr(cachedDecl) +
-                         " ex_ast=" + intToStr(cachedSource) +
+                          " ex_idx=" + intToStr(exIdx) +
+                         " ex_name=" + uirCorePredeclareMetaCachedName(exIdx) +
+                         " ex_origin=" + uirCorePredeclareMetaCachedOriginNorm(exIdx) +
+                         " ex_decl=" + intToStr(uirCorePredeclareMetaCachedDecl(exIdx)) +
+                         " ex_ast=" + intToStr(uirCorePredeclareMetaCachedSource(exIdx)) +
                          " matched=" + (matched ? "1" : "0"))
             os.c_fflush(os.get_stderr())
         if matched:
@@ -2191,12 +2304,7 @@ fn uirCoreModuleFuncSameOriginIndex(mod: UirCoreModule, fnName: str, fnOriginFil
                     continue
                 nameMatchedByCache = true
         if !nameMatchedByCache:
-            let exScanNameFast: str = uirCoreFuncNameFastForPredeclareLookup(mod, i, exScan)
-            if len(exScanNameFast) > 0 && exScanNameFast != fnName:
-                continue
-            var exScanName: str = exScanNameFast
-            if len(exScanName) == 0 && uirCorePredeclareMetaEnsureNameAt(mod, i, exScan):
-                exScanName = uirCore_predeclareMeta_names[i]
+            let exScanName: str = uirCorePredeclareMetaStableName(mod, i, exScan)
             if len(exScanName) > 0 && exScanName != fnName:
                 continue
             if len(exScanName) == 0:
@@ -2215,6 +2323,245 @@ fn uirCoreTraceFoundMainSet(marker: str) =
         let fDbgMainSet: os.File = os.get_stderr()
         os.writeLine(fDbgMainSet, marker)
         os.c_fflush fDbgMainSet
+
+fn uirCoreFuncNameForLateDup(mod: UirCoreModule, idx: int32, ex: UirCoreFunc): str =
+    let fastName: str = uirCoreFuncNameFastForPredeclareLookup(mod, idx, ex)
+    if len(fastName) > 0:
+        return fastName
+    let stableName: str = uirCoreFuncNameStableForPredeclare(mod, idx, ex)
+    if len(stableName) > 0:
+        return stableName
+    return uirCoreFuncNameOf(ex)
+
+fn uirCoreFuncOriginFileObjFirstOrStable(ex: UirCoreFunc): str =
+    let objOrigin: str = uirCoreFuncOriginFileObjFirst(ex)
+    if len(objOrigin) > 0:
+        return objOrigin
+    return uirCoreFuncOriginFileOf(ex)
+
+fn uirCoreFuncNameIfValid(f: UirCoreFunc, valid: bool): str =
+    if valid:
+        return uirCoreFuncNameOf(f)
+    return ""
+
+fn uirCoreFuncLinkNameIfValid(f: UirCoreFunc, valid: bool): str =
+    if valid:
+        return uirCoreFuncLinkNameOf(f)
+    return ""
+
+fn uirCoreFuncBlocksLenIfValid(f: UirCoreFunc, valid: bool): int32 =
+    if valid:
+        return uirCoreFuncBlocksLen(f)
+    return -1
+
+fn uirCoreFuncExternIfValid(f: UirCoreFunc, valid: bool): bool =
+    if valid:
+        return uirCoreFuncIsExtern(f)
+    return false
+
+fn uirCoreFuncRawPtrIfValid(f: UirCoreFunc, valid: bool): int64 =
+    if valid:
+        return uirCoreFuncRawPtrVal(f)
+    return 0
+
+fn uirCoreFuncOriginFileOrEmpty(f: UirCoreFunc): str =
+    if f == nil:
+        return ""
+    return uirCoreFuncOriginFileOf(f)
+
+fn uirCoreFuncLinkNameSanitizedOrEmpty(f: UirCoreFunc): str =
+    if f == nil:
+        return ""
+    return backendStripSpaces(uirCoreFuncLinkNameOf(f))
+
+fn uirCoreFuncBlocksLenOrMinus1(f: UirCoreFunc): int32 =
+    if f == nil:
+        return -1
+    return uirCoreFuncBlocksLen(f)
+
+fn uirCoreFuncDeclOrdinalStableOrMinus1(mod: UirCoreModule, idx: int32, f: UirCoreFunc): int32 =
+    if f == nil:
+        return -1
+    return uirCoreFuncDeclOrdinalStableForPredeclare(mod, idx, f)
+
+fn uirCoreFuncSourceAstIndexStableOrMinus1(mod: UirCoreModule, idx: int32, f: UirCoreFunc): int32 =
+    if f == nil:
+        return -1
+    return uirCoreFuncSourceAstIndexStableForPredeclare(mod, idx, f)
+
+fn uirCoreFuncDeclOrdinalOrMinus1(f: UirCoreFunc): int32 =
+    if f == nil:
+        return -1
+    return uirCoreFuncDeclOrdinalOf(f)
+
+fn uirCoreFuncSourceAstIndexOrMinus1(f: UirCoreFunc): int32 =
+    if f == nil:
+        return -1
+    return uirCoreFuncSourceAstIndexOf(f)
+
+fn uirCoreFuncExternOrFalse(f: UirCoreFunc): bool =
+    if f == nil:
+        return false
+    return uirCoreFuncIsExtern(f)
+
+fn uirCoreHintNameStable(mod: UirCoreModule, hintedIdx: int32): str =
+    if mod == nil || hintedIdx < 0 || hintedIdx >= uirCoreModuleFuncsLen(mod):
+        return ""
+    return uirCoreFuncNameStableForPredeclare(mod, hintedIdx, uirCoreModuleFuncAt(mod, hintedIdx))
+
+fn uirCoreFuncCurrentName(f: UirCoreFunc): str =
+    let objName: str = uirCoreFuncNameObjFirst(f)
+    if len(objName) > 0:
+        return objName
+    return uirCoreFuncNameOf(f)
+
+fn uirCoreFuncExpectedOriginPath(f: UirCoreFunc, expectedOriginFile: str): str =
+    if len(expectedOriginFile) > 0:
+        return expectedOriginFile
+    return uirCoreFuncOriginFileObjFirstOrStable(f)
+
+fn uirCoreRepairStableName(mod: UirCoreModule, resolvedIdx: int32,
+                           currentName: str, fallbackName: str): str =
+    if len(currentName) > 0:
+        return currentName
+    if resolvedIdx >= 0 && resolvedIdx < uirCoreModuleFuncsLen(mod):
+        return uirCoreFuncNameStableForPredeclare(mod, resolvedIdx, uirCoreModuleFuncAt(mod, resolvedIdx))
+    return fallbackName
+
+fn uirCoreRecoveredTaskName(taskNode: AstNodeId): str =
+    if astNodeIdValid(taskNode):
+        return uirCoreTopLevelRoutineNameId(taskNode)
+    return ""
+
+fn uirCoreRecoveredTaskNameTextId(taskNode: AstNodeId): int32 =
+    if astNodeIdValid(taskNode):
+        return uirCoreTopLevelRoutineNameTextId(taskNode)
+    return 0
+
+fn uirCoreTaskBuildNameHint(task: UirFnTask, recoveredName: str): str =
+    if len(recoveredName) > 0:
+        return recoveredName
+    return task.routineName
+
+fn uirCoreTaskEffectiveNameTextId(recoveredNameTextId: int32, taskNameTextId: int32): int32 =
+    if recoveredNameTextId > 0:
+        return recoveredNameTextId
+    return taskNameTextId
+
+fn uirCoreTaskForcedBuildNameHint(mod: UirCoreModule, buildNameHint0: str,
+                                  originFile: str, effectiveNameTextId: int32): str =
+    let crossOriginDupIdx: int32 = uirCoreFindCrossOriginDuplicateFuncIndex(
+        mod, buildNameHint0, originFile, effectiveNameTextId)
+    if crossOriginDupIdx < 0:
+        return buildNameHint0
+    let _promotedLateDup: bool = uirCorePromoteLateDuplicateFnBasePredeclare(mod, buildNameHint0)
+    let forcedBuildName: str = uirCoreForceMangleDupFnBase(buildNameHint0, originFile)
+    if len(forcedBuildName) > 0 && forcedBuildName != buildNameHint0:
+        return forcedBuildName
+    return buildNameHint0
+
+fn uirCoreTopLevelRoutineDebugName(nId: AstNodeId): str =
+    if astKidCount(nId) <= 0:
+        return ""
+    let nameNodeId: AstNodeId = astKidAt(nId, 0)
+    if !astNodeIdValid(nameNodeId):
+        return ""
+    if astNodeKind(nameNodeId) != nkIdent && astNodeKind(nameNodeId) != nkSymbol:
+        return ""
+    return backendStripSpaces(astPlainName(nameNodeId))
+
+fn uirCoreAstNodeKindDbgText(nId: AstNodeId): str =
+    if astNodeIdValid(nId):
+        return intToStr(int32(astNodeKind(nId)))
+    return "nil"
+
+fn uirCoreGlobalOriginFileAt(mod: UirCoreModule, gi: int32): str =
+    if mod == nil || gi < 0 || gi >= uirCoreModuleGlobalsLen(mod):
+        return ""
+    return uirCoreGlobalOriginFileOf(uirCoreModuleGlobalAt(mod, gi))
+
+fn uirCoreTopLevelGlobalObjTypeNode(typeNodeId: AstNodeId, initId: AstNodeId): AstNodeId =
+    if astNodeIdValid(typeNodeId) && astNodeKind(typeNodeId) != nkEmpty:
+        return typeNodeId
+    if astNodeIdValid(initId) && astNodeKind(initId) != nkEmpty &&
+       astNodeTypeCacheValid(initId) && astNodeIdValid(astNodeTypeCacheId(initId)):
+        return astNodeTypeCacheId(initId)
+    return typeNodeId
+
+fn uirCoreTopLevelGlobalObjTypeName(mod: UirCoreModule, typeNodeId: AstNodeId, initId: AstNodeId): str =
+    let objTypeNodeId: AstNodeId = uirCoreTopLevelGlobalObjTypeNode(typeNodeId, initId)
+    if astNodeIdValid(objTypeNodeId) && astNodeKind(objTypeNodeId) != nkEmpty:
+        return typeNodeObjTypeName(mod, objTypeNodeId)
+    return ""
+
+fn uirCoreTopLevelGlobalInitTypeKey(initId: AstNodeId, declType: UirCoreType): str =
+    var initKeyId: AstNodeId = initId
+    while astNodeIdValid(initKeyId) && astNodeKind(initKeyId) == nkPar && astKidCount(initKeyId) > 0:
+        initKeyId = astKidAt(initKeyId, 0)
+    let initKeyKind: NodeKind = astNodeKind(initKeyId)
+    if astNodeIdValid(initKeyId) && astNodeTypeCacheValid(initKeyId) && astNodeIdValid(astNodeTypeCacheId(initKeyId)):
+        return typeKey(astNodeTypeCacheId(initKeyId))
+    if initKeyKind == nkStrLit:
+        return "str"
+    if initKeyKind == nkFloatLit:
+        return "float64"
+    if initKeyKind == nkBoolLit:
+        return "bool"
+    if initKeyKind == nkCharLit:
+        return "char"
+    if initKeyKind == nkIntLit:
+        if declType.kind == mtI64:
+            if declType.isUnsigned:
+                return "uint64"
+            return "int64"
+        if declType.kind == mtI32:
+            if declType.isUnsigned:
+                return "uint32"
+            return "int32"
+        if declType.kind == mtF64:
+            return "float64"
+        if declType.kind == mtF32:
+            return "float32"
+        if declType.kind == mtI16:
+            if declType.isUnsigned:
+                return "uint16"
+            return "int16"
+        if declType.kind == mtI8:
+            if declType.isUnsigned:
+                return "uint8"
+            return "int8"
+    return ""
+
+fn uirCoreTopLevelGlobalTypeKey(typeNodeId: AstNodeId, initId: AstNodeId,
+                                declType: UirCoreType): str =
+    let objTypeNodeId: AstNodeId = uirCoreTopLevelGlobalObjTypeNode(typeNodeId, initId)
+    if astNodeIdValid(objTypeNodeId) && astNodeKind(objTypeNodeId) != nkEmpty:
+        let objKey: str = typeKey(objTypeNodeId)
+        if len(objKey) > 0:
+            return objKey
+        let looseObjKey: str = uirCoreTypeKeyFromNodeLoose(objTypeNodeId)
+        if len(looseObjKey) > 0:
+            return looseObjKey
+    if astNodeIdValid(typeNodeId) && astNodeKind(typeNodeId) != nkEmpty:
+        let typeKey0: str = typeKey(typeNodeId)
+        if len(typeKey0) > 0:
+            return typeKey0
+        let looseTypeKey: str = uirCoreTypeKeyFromNodeLoose(typeNodeId)
+        if len(looseTypeKey) > 0:
+            return looseTypeKey
+    if astNodeIdValid(initId) && astNodeKind(initId) != nkEmpty:
+        return uirCoreTopLevelGlobalInitTypeKey(initId, declType)
+    return ""
+
+fn uirCoreGlobalOriginSyntheticOrStd(path: str): bool =
+    if len(path) == 0:
+        return false
+    if path[0] == '<':
+        return true
+    return __cheng_string_contains_str(path, "/src/std/") ||
+           __cheng_string_contains_str(path, "/src/core/") ||
+           __cheng_string_contains_str(path, "/src/system/") ||
+           __cheng_string_contains_str(path, "/src/backend/")
 
 fn uirCoreFnTaskSeqAppend(tasks: UirFnTask[]*, task: UirFnTask) =
     if tasks == nil:
@@ -2308,7 +2655,7 @@ fn uirCorePrepareTopLevelRoutineTaskFromRootId(mod: UirCoreModule, rootId: AstNo
     return Ok_UirFnTask(task)
 
 fn uirCorePromoteLateDuplicateFnBasePredeclare(mod: UirCoreModule, baseName0: str): bool =
-    let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
+    let baseName: str = baseName0
     if mod == nil || len(baseName) == 0 || (baseName == "main"):
         return false
     uirCoreDupFnBasesAdd(baseName)
@@ -2318,11 +2665,7 @@ fn uirCorePromoteLateDuplicateFnBasePredeclare(mod: UirCoreModule, baseName0: st
         let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
         if ex == nil || uirCoreFuncIsExtern(ex):
             continue
-        var exName: str = uirCoreFuncNameFastForPredeclareLookup(mod, i, ex)
-        if len(exName) == 0:
-            exName = uirCoreFuncNameStableForPredeclare(mod, i, ex)
-        if len(exName) == 0:
-            exName = uirCoreFuncNameOf(ex)
+        let exName: str = uirCoreFuncNameForLateDup(mod, i, ex)
         if exName != baseName:
             continue
         let exOriginFile: str = uirCoreFuncOriginFileOf(ex)
@@ -2340,7 +2683,7 @@ fn uirCoreForceMangleLateDuplicateCandidate(f: UirCoreFunc, baseName0: str,
                                             originFile0: str): str =
     if f == nil || uirCoreFuncIsExtern(f):
         return ""
-    let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
+    let baseName: str = baseName0
     if len(baseName) == 0:
         return ""
     let forced: str = uirCoreForceMangleDupFnBase(baseName, originFile0)
@@ -2353,8 +2696,8 @@ fn uirCoreForceMangleLateDuplicateCandidate(f: UirCoreFunc, baseName0: str,
 fn uirCoreFindCrossOriginDuplicateFuncIndex(mod: UirCoreModule, baseName0: str,
                                             originFile0: str,
                                             nameTextId: int32 = 0): int32 =
-    let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
-    let originFile: str = (len(originFile0) > 0) ? originFile0 : ""
+    let baseName: str = baseName0
+    let originFile: str = originFile0
     if mod == nil || len(baseName) == 0 || len(originFile) == 0:
         return -1
     let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
@@ -2382,9 +2725,7 @@ fn uirCoreFindCrossOriginDuplicateFuncIndex(mod: UirCoreModule, baseName0: str,
         if idx >= 0 && idx < funcsLen:
             let ex: UirCoreFunc = uirCoreModuleFuncAtKnownLen(mod, funcsLen, idx)
             if ex != nil && !uirCoreFuncIsExtern(ex):
-                var exOrigin: str = uirCoreFuncOriginFileObjFirst(ex)
-                if len(exOrigin) == 0:
-                    exOrigin = uirCoreFuncOriginFileOf(ex)
+                let exOrigin: str = uirCoreFuncOriginFileObjFirstOrStable(ex)
                 if len(exOrigin) > 0 && exOrigin != originFile:
                     return idx
         if nextEntryIdx == entryIdx:
@@ -2397,17 +2738,15 @@ fn uirCoreShouldForceMangleCrossOriginDuplicate(mod: UirCoreModule, idx: int32,
                                                 candidate: UirCoreFunc,
                                                 baseName0: str,
                                                 candidateOrigin0: str): bool =
-    let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
-    let candidateOrigin: str = (len(candidateOrigin0) > 0) ? candidateOrigin0 : ""
+    let baseName: str = baseName0
+    let candidateOrigin: str = candidateOrigin0
     if mod == nil || idx < 0 || existing == nil || candidate == nil:
         return false
     if len(baseName) == 0 || len(candidateOrigin) == 0:
         return false
     if uirCoreFuncIsExtern(candidate):
         return false
-    var exOriginRaw: str = uirCoreFuncOriginFileObjFirst(existing)
-    if len(exOriginRaw) == 0:
-        exOriginRaw = uirCoreFuncOriginFileOf(existing)
+    let exOriginRaw: str = uirCoreFuncOriginFileObjFirstOrStable(existing)
     if len(exOriginRaw) == 0 || exOriginRaw == candidateOrigin:
         return false
     var exName: str = uirCoreFuncNameFastForPredeclareLookup(mod, idx, existing)
@@ -2434,31 +2773,21 @@ fn uirCoreDebugMergeReadback(mod: UirCoreModule, idx: int32, tag: str) =
     let viewFunc: UirCoreFunc = uirCoreModuleFuncAt(mod, idx)
     let rawValid: bool = uirCoreFuncIdValid(rawFunc)
     let viewValid: bool = uirCoreFuncIdValid(viewFunc)
-    let rawName: str = rawValid ? uirCoreFuncNameOf(rawFunc) : ""
-    let rawLink: str = rawValid ? uirCoreFuncLinkNameOf(rawFunc) : ""
-    let rawBlocks: int32 = rawValid ? uirCoreFuncBlocksLen(rawFunc) : -1
-    let rawExtern: bool = rawValid ? uirCoreFuncIsExtern(rawFunc) : false
-    let rawPtrDbg: int64 = rawValid ? uirCoreFuncRawPtrVal(rawFunc) : 0
-    let viewName: str = viewValid ? uirCoreFuncNameOf(viewFunc) : ""
-    let viewLink: str = viewValid ? uirCoreFuncLinkNameOf(viewFunc) : ""
-    let viewBlocks: int32 = viewValid ? uirCoreFuncBlocksLen(viewFunc) : -1
-    let viewExtern: bool = viewValid ? uirCoreFuncIsExtern(viewFunc) : false
-    let viewPtrDbg: int64 = viewValid ? uirCoreFuncRawPtrVal(viewFunc) : 0
     echo("[backend] merge_readback tag=" + tag +
          " idx=" + intToStr(idx) +
          " funcs_len=" + intToStr(funcsLen) +
          " raw_valid=" + (rawValid ? "1" : "0") +
-         " raw_ptr=" + int64ToStr(rawPtrDbg) +
-         " raw_name=" + rawName +
-         " raw_link=" + rawLink +
-         " raw_blocks=" + intToStr(rawBlocks) +
-         " raw_extern=" + (rawExtern ? "1" : "0") +
+         " raw_ptr=" + int64ToStr(uirCoreFuncRawPtrIfValid(rawFunc, rawValid)) +
+         " raw_name=" + uirCoreFuncNameIfValid(rawFunc, rawValid) +
+         " raw_link=" + uirCoreFuncLinkNameIfValid(rawFunc, rawValid) +
+         " raw_blocks=" + intToStr(uirCoreFuncBlocksLenIfValid(rawFunc, rawValid)) +
+         " raw_extern=" + (uirCoreFuncExternIfValid(rawFunc, rawValid) ? "1" : "0") +
          " view_valid=" + (viewValid ? "1" : "0") +
-         " view_ptr=" + int64ToStr(viewPtrDbg) +
-         " view_name=" + viewName +
-         " view_link=" + viewLink +
-         " view_blocks=" + intToStr(viewBlocks) +
-         " view_extern=" + (viewExtern ? "1" : "0"))
+         " view_ptr=" + int64ToStr(uirCoreFuncRawPtrIfValid(viewFunc, viewValid)) +
+         " view_name=" + uirCoreFuncNameIfValid(viewFunc, viewValid) +
+         " view_link=" + uirCoreFuncLinkNameIfValid(viewFunc, viewValid) +
+         " view_blocks=" + intToStr(uirCoreFuncBlocksLenIfValid(viewFunc, viewValid)) +
+         " view_extern=" + (uirCoreFuncExternIfValid(viewFunc, viewValid) ? "1" : "0"))
 
 fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
                                     f: UirCoreFunc,
@@ -2577,8 +2906,6 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
                                                fnDeclOrdinal, fnSourceAstIndex)
             return Ok[bool](true)
         if dbgMerge:
-            let exOrigin2: str = (ex2 != nil) ? uirCoreFuncOriginFileOf(ex2) : ""
-            let exBlocks2: int32 = (ex2 != nil) ? uirCoreFuncBlocksLen(ex2) : -1
             let fDbgMerge2: os.File = os.get_stderr()
             os.write(fDbgMerge2, "[backend] merge_dup_same_file fn=")
             os.write(fDbgMerge2, fnName)
@@ -2587,9 +2914,9 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
             os.write(fDbgMerge2, " idx=")
             os.write(fDbgMerge2, intToStr(sameFileIdx))
             os.write(fDbgMerge2, " ex_origin=")
-            os.write(fDbgMerge2, exOrigin2)
+            os.write(fDbgMerge2, uirCoreFuncOriginFileOrEmpty(ex2))
             os.write(fDbgMerge2, " ex_blocks=")
-            os.writeLine(fDbgMerge2, intToStr(exBlocks2))
+            os.writeLine(fDbgMerge2, intToStr(uirCoreFuncBlocksLenOrMinus1(ex2)))
             os.c_fflush fDbgMerge2
         if dbgDupName:
             let exDbg2: UirCoreFunc = uirCoreModuleFuncAt(mod, sameFileIdx)
@@ -2605,11 +2932,11 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
                          " cand_obj_name=" + candObjName2 +
                          " cand_obj_name_sane=" + (len(candObjName2) > 0 ? "1" : "0") +
                          " cand_dyn_name=" + candDynName2 +
-                         " cand_link=" + backendStripSpaces(uirCoreFuncLinkNameOf(f)) +
-                         " ex_origin=" + ((exDbg2 != nil) ? uirCoreFuncOriginFileOf(exDbg2) : "") +
-                         " ex_decl=" + ((exDbg2 != nil) ? intToStr(uirCoreFuncDeclOrdinalOf(exDbg2)) : "-1") +
-                         " ex_ast=" + ((exDbg2 != nil) ? intToStr(uirCoreFuncSourceAstIndexOf(exDbg2)) : "-1") +
-                         " ex_link=" + ((exDbg2 != nil) ? backendStripSpaces(uirCoreFuncLinkNameOf(exDbg2)) : ""))
+                         " cand_link=" + uirCoreFuncLinkNameSanitizedOrEmpty(f) +
+                         " ex_origin=" + uirCoreFuncOriginFileOrEmpty(exDbg2) +
+                         " ex_decl=" + intToStr(uirCoreFuncDeclOrdinalOrMinus1(exDbg2)) +
+                         " ex_ast=" + intToStr(uirCoreFuncSourceAstIndexOrMinus1(exDbg2)) +
+                         " ex_link=" + uirCoreFuncLinkNameSanitizedOrEmpty(exDbg2))
             os.c_fflush fDbgDup2
         if uirCoreSkipSemStdDuplicateRelaxEnabled():
             return Ok[bool](false)
@@ -2676,31 +3003,9 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
                                                        fnDeclOrdinal, fnSourceAstIndex)
                     return Ok[bool](true)
         if dbgMerge:
-            var exOrigin3: str = ""
-            var exBlocks3: int32 = -1
-            var exDeclDbg3: int32 = -1
-            var exSourceDbg3: int32 = -1
-            var exLinkDbg3: str = ""
-            var candLinkDbg3: str = ""
-            var exExternDbg3: bool = false
-            var candExternDbg3: bool = false
-            var replaceableDbg3: bool = false
-            var hintNameDbg3: str = ""
-            if hintedIdx >= 0 && hintedIdx < uirCoreModuleFuncsLen(mod):
-                hintNameDbg3 = uirCoreFuncNameStableForPredeclare(mod, hintedIdx,
-                                                                  uirCoreModuleFuncAt(mod, hintedIdx))
+            let ex3: UirCoreFunc = (exIdx3 >= 0) ? uirCoreModuleFuncAt(mod, exIdx3) : nil
             if exIdx3 >= 0:
-                let ex3: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx3)
-                if ex3 != nil:
-                    exOrigin3 = uirCoreFuncOriginFileOf(ex3)
-                    exBlocks3 = uirCoreFuncBlocksLen(ex3)
-                    exDeclDbg3 = uirCoreFuncDeclOrdinalStableForPredeclare(mod, exIdx3, ex3)
-                    exSourceDbg3 = uirCoreFuncSourceAstIndexStableForPredeclare(mod, exIdx3, ex3)
-                    exLinkDbg3 = backendStripSpaces(uirCoreFuncLinkNameOf(ex3))
-                    exExternDbg3 = uirCoreFuncIsExtern(ex3)
-                    replaceableDbg3 = uirCoreExternCorruptedBridgeReplaceable(mod, exIdx3, ex3, f)
-            candLinkDbg3 = backendStripSpaces(uirCoreFuncLinkNameOf(f))
-            candExternDbg3 = uirCoreFuncIsExtern(f)
+                let _exIdxDebugKeep: int32 = exIdx3
             let fDbgMerge3: os.File = os.get_stderr()
             os.write(fDbgMerge3, "[backend] merge_dup_global fn=")
             os.write(fDbgMerge3, fnName)
@@ -2709,30 +3014,30 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
             os.write(fDbgMerge3, " hint_idx=")
             os.write(fDbgMerge3, intToStr(hintedIdx))
             os.write(fDbgMerge3, " hint_name=")
-            os.write(fDbgMerge3, hintNameDbg3)
+            os.write(fDbgMerge3, uirCoreHintNameStable(mod, hintedIdx))
             os.write(fDbgMerge3, " ex_idx=")
             os.write(fDbgMerge3, intToStr(exIdx3))
             os.write(fDbgMerge3, " ex_origin=")
-            os.write(fDbgMerge3, exOrigin3)
+            os.write(fDbgMerge3, uirCoreFuncOriginFileOrEmpty(ex3))
             os.write(fDbgMerge3, " ex_blocks=")
-            os.write(fDbgMerge3, intToStr(exBlocks3))
+            os.write(fDbgMerge3, intToStr(uirCoreFuncBlocksLenOrMinus1(ex3)))
             os.write(fDbgMerge3, " ex_decl=")
-            os.write(fDbgMerge3, intToStr(exDeclDbg3))
+            os.write(fDbgMerge3, intToStr(uirCoreFuncDeclOrdinalStableOrMinus1(mod, exIdx3, ex3)))
             os.write(fDbgMerge3, " ex_ast=")
-            os.write(fDbgMerge3, intToStr(exSourceDbg3))
+            os.write(fDbgMerge3, intToStr(uirCoreFuncSourceAstIndexStableOrMinus1(mod, exIdx3, ex3)))
             os.write(fDbgMerge3, " ex_link=")
-            os.write(fDbgMerge3, exLinkDbg3)
+            os.write(fDbgMerge3, uirCoreFuncLinkNameSanitizedOrEmpty(ex3))
             os.write(fDbgMerge3, " ex_extern=")
-            os.write(fDbgMerge3, exExternDbg3 ? "1" : "0")
+            os.write(fDbgMerge3, uirCoreFuncExternOrFalse(ex3) ? "1" : "0")
             os.write(fDbgMerge3, " cand_link=")
-            os.write(fDbgMerge3, candLinkDbg3)
+            os.write(fDbgMerge3, uirCoreFuncLinkNameSanitizedOrEmpty(f))
             os.write(fDbgMerge3, " cand_extern=")
-            os.write(fDbgMerge3, candExternDbg3 ? "1" : "0")
+            os.write(fDbgMerge3, uirCoreFuncExternOrFalse(f) ? "1" : "0")
             os.write(fDbgMerge3, " replaceable=")
-            os.writeLine(fDbgMerge3, replaceableDbg3 ? "1" : "0")
+            os.writeLine(fDbgMerge3,
+                         (ex3 != nil && uirCoreExternCorruptedBridgeReplaceable(mod, exIdx3, ex3, f)) ? "1" : "0")
             os.c_fflush fDbgMerge3
             if dbgDupName:
-                let exDbg3: UirCoreFunc = (exIdx3 >= 0) ? uirCoreModuleFuncAt(mod, exIdx3) : nil
                 let candObj3: UirCoreFuncObjPtrLocal = uirCoreFuncObjPtr(f)
                 let candObjName3: str = uirCoreTopLevelFuncObjName(candObj3)
                 let candDynName3: str = uirCoreFuncNameOf(f)
@@ -2745,12 +3050,12 @@ fn uirCoreMergeBuiltTopLevelRoutine(mod: UirCoreModule, ctx: UirCoreBuildCtx,
                          " cand_obj_name=" + candObjName3 +
                          " cand_obj_name_sane=" + (len(candObjName3) > 0 ? "1" : "0") +
                          " cand_dyn_name=" + candDynName3 +
-                         " cand_link=" + backendStripSpaces(uirCoreFuncLinkNameOf(f)) +
+                         " cand_link=" + uirCoreFuncLinkNameSanitizedOrEmpty(f) +
                          " ex_idx=" + intToStr(exIdx3) +
-                         " ex_origin=" + ((exDbg3 != nil) ? uirCoreFuncOriginFileOf(exDbg3) : "") +
-                         " ex_decl=" + ((exDbg3 != nil) ? intToStr(uirCoreFuncDeclOrdinalOf(exDbg3)) : "-1") +
-                         " ex_ast=" + ((exDbg3 != nil) ? intToStr(uirCoreFuncSourceAstIndexOf(exDbg3)) : "-1") +
-                         " ex_link=" + ((exDbg3 != nil) ? backendStripSpaces(uirCoreFuncLinkNameOf(exDbg3)) : ""))
+                         " ex_origin=" + uirCoreFuncOriginFileOrEmpty(ex3) +
+                         " ex_decl=" + intToStr(uirCoreFuncDeclOrdinalOrMinus1(ex3)) +
+                         " ex_ast=" + intToStr(uirCoreFuncSourceAstIndexOrMinus1(ex3)) +
+                         " ex_link=" + uirCoreFuncLinkNameSanitizedOrEmpty(ex3))
                 os.c_fflush fDbgDup3
         if uirCoreSkipSemStdDuplicateRelaxEnabled():
             return Ok[bool](false)
@@ -2777,15 +3082,9 @@ fn uirCoreRepairBuiltTopLevelRoutineName(mod: UirCoreModule, f: UirCoreFunc,
                                          expectedSourceAstIndex: int32 = -1): int32 =
     if mod == nil || f == nil:
         return hintedIdx
-    var currentName: str = uirCoreFuncNameObjFirst(f)
-    if len(currentName) == 0:
-        currentName = uirCoreFuncNameOf(f)
+    let currentName: str = uirCoreFuncCurrentName(f)
     let expectedName: str = len(currentName) > 0 ? currentName : fallbackName
-    var expectedOriginPath: str = expectedOriginFile
-    if len(expectedOriginPath) == 0:
-        expectedOriginPath = uirCoreFuncOriginFileObjFirst(f)
-        if len(expectedOriginPath) == 0:
-            expectedOriginPath = uirCoreFuncOriginFileOf(f)
+    let expectedOriginPath: str = uirCoreFuncExpectedOriginPath(f, expectedOriginFile)
     let expectedOriginNorm: str = uirCoreNormalizeTopLevelPath(expectedOriginPath, "")
     let expectedDecl: int32 =
         expectedDeclOrdinal >= 0 ? expectedDeclOrdinal : uirCoreFuncDeclOrdinalOf(f)
@@ -2813,16 +3112,7 @@ fn uirCoreRepairBuiltTopLevelRoutineName(mod: UirCoreModule, f: UirCoreFunc,
                 mod, lateDupName, expectedOriginPath, expectedDecl, expectedSource, 0)
             if lateDupIdx >= 0:
                 resolvedIdx = lateDupIdx
-    var stableName: str = ""
-    if len(currentName) > 0:
-        stableName = currentName
-    if resolvedIdx >= 0 && resolvedIdx < uirCoreModuleFuncsLen(mod):
-        let hintedStableName: str = uirCoreFuncNameStableForPredeclare(
-            mod, resolvedIdx, uirCoreModuleFuncAt(mod, resolvedIdx))
-        if len(stableName) == 0:
-            stableName = hintedStableName
-    elif len(fallbackName) > 0:
-        stableName = fallbackName
+    let stableName: str = uirCoreRepairStableName(mod, resolvedIdx, currentName, fallbackName)
     if len(stableName) == 0:
         return resolvedIdx
     let oldName: str = currentName
@@ -2842,21 +3132,12 @@ fn uirCoreExecuteFnTask(mod: UirCoreModule, task: UirFnTask,
     if task == nil:
         return Ok_UirFnTaskResult(nil)
     let taskNode: AstNodeId = uirCoreRecoverFnTaskNode(task)
-    let recoveredName: str = astNodeIdValid(taskNode) ? uirCoreTopLevelRoutineNameId(taskNode) : ""
-    let recoveredNameTextId: int32 =
-        astNodeIdValid(taskNode) ? uirCoreTopLevelRoutineNameTextId(taskNode) : 0
-    var buildNameHint: str = (len(recoveredName) > 0) ? recoveredName : task.routineName
-    var nameHintChanged: bool = len(recoveredName) > 0 && recoveredName != task.routineName
-    let effectiveNameTextId: int32 =
-        (recoveredNameTextId > 0) ? recoveredNameTextId : task.nameTextId
-    let crossOriginDupIdx: int32 = uirCoreFindCrossOriginDuplicateFuncIndex(
-        mod, buildNameHint, task.originFile, effectiveNameTextId)
-    if crossOriginDupIdx >= 0:
-        let _promotedLateDup: bool = uirCorePromoteLateDuplicateFnBasePredeclare(mod, buildNameHint)
-        let forcedBuildName: str = uirCoreForceMangleDupFnBase(buildNameHint, task.originFile)
-        if len(forcedBuildName) > 0 && forcedBuildName != buildNameHint:
-            buildNameHint = forcedBuildName
-            nameHintChanged = true
+    let recoveredName: str = uirCoreRecoveredTaskName(taskNode)
+    let recoveredNameTextId: int32 = uirCoreRecoveredTaskNameTextId(taskNode)
+    let effectiveNameTextId: int32 = uirCoreTaskEffectiveNameTextId(recoveredNameTextId, task.nameTextId)
+    let buildNameHint: str = uirCoreTaskForcedBuildNameHint(
+        mod, uirCoreTaskBuildNameHint(task, recoveredName), task.originFile, effectiveNameTextId)
+    let nameHintChanged: bool = buildNameHint != task.routineName
     if dbgPipeTask:
         let fDbgTask0: os.File = os.get_stderr()
         os.writeLine(fDbgTask0,
@@ -2957,18 +3238,17 @@ fn uirCoreConsumeTopLevelRoutineId(mod: UirCoreModule, ctx: UirCoreBuildCtx, nId
         return Ok[bool](false)
     if uirCoreFuncSigHasUnresolvedGenericsId(nId):
         return Ok[bool](false)
-    var routineNameDbg: str = ""
-    if astKidCount(nId) > 0:
-        let nameNodeId: AstNodeId = astKidAt(nId, 0)
-        if astNodeIdValid(nameNodeId) &&
-           (astNodeKind(nameNodeId) == nkIdent || astNodeKind(nameNodeId) == nkSymbol):
-            routineNameDbg = backendStripSpaces(astPlainName(nameNodeId))
+    let routineNameDbg: str = uirCoreTopLevelRoutineDebugName(nId)
     if dbgPipe:
         let fDbgRoutine0: os.File = os.get_stderr()
         os.writeLine(fDbgRoutine0, "[backend] stage1: lower_routine_build_func_pre name=" + routineNameDbg +
                                    " file=" + callFilePath)
         os.c_fflush fDbgRoutine0
-    let fRes: Result[UirCoreFunc] = uirCoreBuildFuncId(mod, nId, callFilePath, overloaded, routineNameDbg)
+    let hintedIdx: int32 = uirCoreTopLevelRoutineFuncIndexHint(mod, nId, callFilePath)
+    let headerFunc0: UirCoreFunc =
+        (hintedIdx >= 0 && hintedIdx < uirCoreModuleFuncsLen(mod)) ? uirCoreModuleFuncAt(mod, hintedIdx) : nil
+    let headerFunc: UirCoreFunc = uirCoreFuncHeaderReusableForBuild(mod, headerFunc0) ? headerFunc0 : nil
+    let fRes: Result[UirCoreFunc] = uirCoreBuildFuncId(mod, nId, callFilePath, overloaded, routineNameDbg, headerFunc)
     if !IsOk[UirCoreFunc](fRes):
         if dbgPipe:
             let fDbgRoutineErr: os.File = os.get_stderr()
@@ -2979,7 +3259,6 @@ fn uirCoreConsumeTopLevelRoutineId(mod: UirCoreModule, ctx: UirCoreBuildCtx, nId
     let f: UirCoreFunc = Value[UirCoreFunc](fRes)
     if f == nil:
         return Ok[bool](false)
-    let hintedIdx: int32 = uirCoreTopLevelRoutineFuncIndexHint(mod, nId, callFilePath)
     let repairedHintedIdx: int32 = uirCoreRepairBuiltTopLevelRoutineName(
         mod, f, hintedIdx, uirCoreTopLevelRoutineNameTextId(nId), routineNameDbg,
         callFilePath, astNodeDeclOrdinal(nId), astNodeIndex(nId))
@@ -3015,7 +3294,7 @@ fn uirCorePredeclareTopLevelRoutineId(mod: UirCoreModule, nId: AstNodeId,
     if uirCoreFuncSigHasUnresolvedGenericsId(nId):
         return Ok[bool](false)
     let fnNameHint: str = uirCoreTopLevelRoutineNameId(nId)
-    let fRes: Result[UirCoreFunc] = uirCoreBuildFuncHeaderId(mod, nId, callFilePath, overloaded, fnNameHint)
+    let fRes: Result[UirCoreFunc] = uirCoreBuildFuncPredeclareHeaderId(mod, nId, callFilePath, overloaded, fnNameHint)
     if !IsOk[UirCoreFunc](fRes):
         return ErrInfo[bool](ErrorInfoOf[UirCoreFunc](fRes))
     let f: UirCoreFunc = Value[UirCoreFunc](fRes)
@@ -3059,30 +3338,17 @@ fn uirCorePredeclareTopLevelRoutineId(mod: UirCoreModule, nId: AstNodeId,
         if dbgBoot:
             if exIdx >= 0:
                 let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
-                var exOrigin: str = ""
-                var exDeclOrdinal: int32 = -1
-                var exSourceAstIndex: int32 = -1
-                if ex != nil:
-                    exOrigin = uirCoreFuncOriginFileOf(ex)
-                    exDeclOrdinal = uirCoreFuncDeclOrdinalOf(ex)
-                    exSourceAstIndex = uirCoreFuncSourceAstIndexOf(ex)
                 os.writeLine(os.get_stderr(),
                              "[backend] predeclare_dup fn=" + fnName +
                              " cur_origin=" + fnOriginFile +
                              " cur_decl=" + intToStr(fnDeclOrdinal) +
                              " cur_ast=" + intToStr(fnSourceAstIndex) +
-                             " ex_origin=" + exOrigin +
-                             " ex_decl=" + intToStr(exDeclOrdinal) +
-                             " ex_ast=" + intToStr(exSourceAstIndex))
+                             " ex_origin=" + uirCoreFuncOriginFileOrEmpty(ex) +
+                             " ex_decl=" + intToStr(uirCoreFuncDeclOrdinalOrMinus1(ex)) +
+                             " ex_ast=" + intToStr(uirCoreFuncSourceAstIndexOrMinus1(ex)))
                 os.c_fflush(os.get_stderr())
         if uirCoreSkipSemStdDuplicateRelaxEnabled():
             return Ok[bool](false)
-        var prevFile: str = ""
-        if exIdx >= 0:
-            let ex: UirCoreFunc = uirCoreModuleFuncAt(mod, exIdx)
-            if ex != nil:
-                prevFile = uirCoreFuncOriginFileOf(ex)
-        let _prevFileUnused: str = prevFile
         return Err[bool]("uirCore_builder: duplicate function name: " + fnName)
     uirCoreAppendFuncPtr(&mod.funcs, f)
     if dbgPipeOrBoot:
@@ -3153,11 +3419,8 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
         let name: str = uirCoreMaybeMangleDupGlobalName(rawName, callFilePath)
         let debugDot: bool = (getEnv "BACKEND_DEBUG_DOT" == "1")
         if debugDot && rawName == "baseIdentity":
-            var typeKindDbg: str = "nil"
-            if astNodeIdValid(typeNodeId):
-                typeKindDbg = intToStr(int32(astNodeKind(typeNodeId)))
             echo("[backend] debugDot: consumeGlobal rawName='" + rawName +
-                 "' file='" + filePath + "' typeKind=nk#" + typeKindDbg + "'")
+                 "' file='" + filePath + "' typeKind=nk#" + uirCoreAstNodeKindDbgText(typeNodeId) + "'")
         let existingGi: int32 = moduleGlobalIndex(mod, name)
         var allowDupGlobal: bool = false
         if existingGi >= 0:
@@ -3168,30 +3431,22 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
             if !allowDupGlobal && len(prevOrigin0) > 0 && prevOrigin0[0] == '<':
                 allowDupGlobal = true
         if dbgTopGlobal:
-            let prevOriginDbg: str = (existingGi >= 0) ? uirCoreGlobalOriginFileOf(uirCoreModuleGlobalAt(mod, existingGi)) : ""
             os.writeLine(os.get_stderr(),
                          "[backend] top_global_state name=" + name +
                          " raw=" + rawName +
                          " existingGi=" + intToStr(existingGi) +
                          " allowDup=" + (allowDupGlobal ? "1" : "0") +
-                         " prevOrigin=" + prevOriginDbg)
+                         " prevOrigin=" + uirCoreGlobalOriginFileAt(mod, existingGi))
             os.c_fflush(os.get_stderr())
         var declType: UirCoreType = uirCoreTypeFromNodeWithModule(mod, typeNodeId)
-        var objTypeName: str = ""
-        var objTypeNodeId: AstNodeId = typeNodeId
-        if (!astNodeIdValid(objTypeNodeId) || astNodeKind(objTypeNodeId) == nkEmpty) &&
-           astNodeIdValid(initId) && astNodeKind(initId) != nkEmpty &&
-           astNodeTypeCacheValid(initId) && astNodeIdValid(astNodeTypeCacheId(initId)):
-            objTypeNodeId = astNodeTypeCacheId(initId)
-        if astNodeIdValid(objTypeNodeId) && astNodeKind(objTypeNodeId) != nkEmpty:
-            objTypeName = typeNodeObjTypeName(mod, objTypeNodeId)
+        let objTypeNodeId: AstNodeId = uirCoreTopLevelGlobalObjTypeNode(typeNodeId, initId)
+        let objTypeName: str = uirCoreTopLevelGlobalObjTypeName(mod, typeNodeId, initId)
         let isObj: bool = len(objTypeName) > 0 && astNodeIdValid(objTypeNodeId) &&
                           typeNodeIsObjValue(mod, objTypeNodeId)
         if debugDot && rawName == "baseIdentity":
-            let objNodeKindDbg: str = astNodeIdValid(objTypeNodeId) ? intToStr(int32(astNodeKind(objTypeNodeId))) : "nil"
             echo("[backend] debugDot: consumeGlobal name='" + name +
-                 "' objTypeName='" + objTypeName + "' isObj=" + (isObj ? "1" : "0") +
-                 " objNodeKind=nk#" + objNodeKindDbg + "'")
+                         "' objTypeName='" + objTypeName + "' isObj=" + (isObj ? "1" : "0") +
+                 " objNodeKind=nk#" + uirCoreAstNodeKindDbgText(objTypeNodeId) + "'")
         if isObj:
             uirCoreGlobalObjTypePut(name, objTypeName)
             if debugDot && rawName == "baseIdentity":
@@ -3217,16 +3472,8 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
             if isLiteralInit:
                 let g0: UirCoreGlobal = uirCoreModuleGlobalAt(mod, existingGi)
                 let prevFile: str = uirCoreGlobalOriginFileOf(g0)
-                let prevSyntheticOrStd: bool = (len(prevFile) > 0) &&
-                    (prevFile[0] == '<' || __cheng_string_contains_str(prevFile, "/src/std/") ||
-                     __cheng_string_contains_str(prevFile, "/src/core/") ||
-                     __cheng_string_contains_str(prevFile, "/src/system/") ||
-                     __cheng_string_contains_str(prevFile, "/src/backend/"))
-                let curSyntheticOrStd: bool = (len(callFilePath) > 0) &&
-                    (callFilePath[0] == '<' || __cheng_string_contains_str(callFilePath, "/src/std/") ||
-                     __cheng_string_contains_str(callFilePath, "/src/core/") ||
-                     __cheng_string_contains_str(callFilePath, "/src/system/") ||
-                     __cheng_string_contains_str(callFilePath, "/src/backend/"))
+                let prevSyntheticOrStd: bool = uirCoreGlobalOriginSyntheticOrStd(prevFile)
+                let curSyntheticOrStd: bool = uirCoreGlobalOriginSyntheticOrStd(callFilePath)
                 # Stage0/SoA migration can surface non-path originFile bytes for already-inserted
                 # synthetic globals. Keep const literal duplicates in std/backend synthetic sources
                 # idempotent when type shape matches.
@@ -3243,14 +3490,11 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
            uirCoreFindTypeAlias(mod, name) >= 0 || uirCoreFindObjType(mod, name) >= 0:
             let line0: str = intToStr(astNodePosLine(nameNodeId))
             let col0: str = intToStr(astNodePosCol(nameNodeId))
-            var prevFile: str = ""
-            if existingGi >= 0:
-                let gPrev: UirCoreGlobal = uirCoreModuleGlobalAt(mod, existingGi)
-                prevFile = uirCoreGlobalOriginFileOf(gPrev)
-                # In outline/deferred flows a declaration can be revisited from the same file.
-                # Treat same-origin duplicates as idempotent instead of hard-failing.
-                if len(prevFile) > 0 && prevFile == callFilePath:
-                    return Ok[bool](false)
+            let prevFile: str = uirCoreGlobalOriginFileAt(mod, existingGi)
+            # In outline/deferred flows a declaration can be revisited from the same file.
+            # Treat same-origin duplicates as idempotent instead of hard-failing.
+            if len(prevFile) > 0 && prevFile == callFilePath:
+                return Ok[bool](false)
             if dbgTopGlobal:
                 os.writeLine(os.get_stderr(),
                              "[backend] top_global_fail reason=duplicate name=" + name +
@@ -3291,43 +3535,7 @@ fn uirCoreConsumeTopLevelFromRootId(mod: UirCoreModule, ctx: UirCoreBuildCtx, ro
         else:
             uirCoreAddGlobal(mod, name, declType, initVal, hasInit, callFilePath)
 
-        var keyOut: str = ""
-        if astNodeIdValid(objTypeNodeId) && astNodeKind(objTypeNodeId) != nkEmpty:
-            keyOut = typeKey(objTypeNodeId)
-            if len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(objTypeNodeId)
-        if len(keyOut) == 0 && astNodeIdValid(typeNodeId) && astNodeKind(typeNodeId) != nkEmpty:
-            keyOut = typeKey(typeNodeId)
-            if len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(typeNodeId)
-        if len(keyOut) == 0 && astNodeIdValid(initId) && astNodeKind(initId) != nkEmpty:
-            var initKeyId: AstNodeId = initId
-            while astNodeIdValid(initKeyId) && astNodeKind(initKeyId) == nkPar && astKidCount(initKeyId) > 0:
-                initKeyId = astKidAt(initKeyId, 0)
-            let initKeyKind: NodeKind = astNodeKind(initKeyId)
-            if astNodeIdValid(initKeyId) && astNodeTypeCacheValid(initKeyId) && astNodeIdValid(astNodeTypeCacheId(initKeyId)):
-                keyOut = typeKey(astNodeTypeCacheId(initKeyId))
-            elif initKeyKind == nkStrLit:
-                keyOut = "str"
-            elif initKeyKind == nkFloatLit:
-                keyOut = "float64"
-            elif initKeyKind == nkBoolLit:
-                keyOut = "bool"
-            elif initKeyKind == nkCharLit:
-                keyOut = "char"
-            elif initKeyKind == nkIntLit:
-                if declType.kind == mtI64:
-                    keyOut = declType.isUnsigned ? "uint64" : "int64"
-                elif declType.kind == mtI32:
-                    keyOut = declType.isUnsigned ? "uint32" : "int32"
-                elif declType.kind == mtF64:
-                    keyOut = "float64"
-                elif declType.kind == mtF32:
-                    keyOut = "float32"
-                elif declType.kind == mtI16:
-                    keyOut = declType.isUnsigned ? "uint16" : "int16"
-                elif declType.kind == mtI8:
-                    keyOut = declType.isUnsigned ? "uint8" : "int8"
+        let keyOut: str = uirCoreTopLevelGlobalTypeKey(typeNodeId, initId, declType)
         if len(keyOut) > 0:
             uirCoreGlobalTypeKeyPut(name, keyOut)
             if debugDot && rawName == "baseIdentity":

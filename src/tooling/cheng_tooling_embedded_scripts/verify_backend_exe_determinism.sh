@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -18,9 +18,42 @@ if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" 
 fi
 
 driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
-linker_mode="${BACKEND_LINKER:-self}"
-target="${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}"
+linker_mode="self"
+target="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)"
 
+print_usage() {
+  echo "Usage: $0 [--target:<triple>] [--linker:self|system]"
+}
+
+while [ "${1:-}" != "" ]; do
+  case "$1" in
+    --target:*)
+      target="${1#--target:}"
+      ;;
+    --linker:*)
+      linker_mode="${1#--linker:}"
+      ;;
+    --help|-h)
+      print_usage
+      exit 0
+      ;;
+    *)
+      echo "[verify_backend_exe_determinism] unknown arg: $1" >&2
+      print_usage >&2
+      exit 2
+      ;;
+  esac
+  shift || true
+done
+
+case "$linker_mode" in
+  self|system)
+    ;;
+  *)
+    echo "[verify_backend_exe_determinism] invalid linker: $linker_mode" >&2
+    exit 2
+    ;;
+esac
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -73,43 +106,37 @@ fi
 run_exe() {
   if [ "$linker_mode" = "self" ]; then
     # shellcheck disable=SC2086
-    env $runtime_env_line \
-      BACKEND_EMIT=exe \
-      BACKEND_MULTI=0 \
-      BACKEND_MULTI_FORCE=0 \
-      BACKEND_RUNTIME=off \
-      BACKEND_TARGET="$target" \
-      BACKEND_LDFLAGS="$ldflags" \
-      BACKEND_INPUT="$fixture" \
-      BACKEND_OUTPUT="$exe_path" \
-      "$driver"
+    env $runtime_env_line BACKEND_LDFLAGS="$ldflags" \
+      "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:self \
+      --no-multi \
+      --no-multi-force \
+      --output:"$exe_path"
     return
   fi
-  env \
-    BACKEND_EMIT=exe \
-    BACKEND_MULTI=0 \
-    BACKEND_MULTI_FORCE=0 \
-    BACKEND_LINKER=system \
-    BACKEND_TARGET="$target" \
-    BACKEND_LDFLAGS="$ldflags" \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$exe_path" \
-    "$driver"
+  env BACKEND_LDFLAGS="$ldflags" \
+    "$driver" "$fixture" \
+    --emit:exe \
+    --target:"$target" \
+    --linker:system \
+    --no-multi \
+    --no-multi-force \
+    --output:"$exe_path"
 }
 
 run_exe
-
 sha_a="$(sha256_file "$exe_path")"
 
 run_exe
-
 sha_b="$(sha256_file "$exe_path")"
 if [ "$sha_a" = "" ] || [ "$sha_b" = "" ]; then
   echo "verify_backend_exe_determinism skip: missing sha256 tool" 1>&2
   exit 2
 fi
 if [ "$sha_a" != "$sha_b" ]; then
-  echo "[verify_backend_exe_determinism] mismatch: $sha_a vs $sha_b" 1>&2
+  echo "[verify_backend_exe_determinism] mismatch: $sha_a vs $sha_b" >&2
   exit 1
 fi
 

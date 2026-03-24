@@ -103,7 +103,7 @@ artifacts/tooling_cmd/cheng_tooling stage0-ue-clean --strict:1
 - 当前 canonical `artifacts/tooling_cmd/cheng_tooling` 也会把这类脚本入口直通到 repo-local 最新实现；`.real` 和 `.real.bin` launcher 在仓库内也都会保守回退到 `src/tooling/cheng_tooling_embedded_scripts/<id>.sh`，所以 direct `.real.bin verify_backend_stage1_fixed0_envs`、`verify_backend_string_literal_regression`、`verify_backend_default_output_safety`、`verify_new_expr_surface`、`verify_backend_string_abi_contract`、`verify_backend_dot_lowering_contract`、`verify_backend_selfhost_currentsrc_proof` 这类 script-backed gate 现在也能工作。`verify_std_*` / `build_std_perf_baseline` 已改为 native route + native wrapper surface。
 - wrapper 的 `list` / `embedded-ids` 现在也会把 repo-local 非空 script-backed gate 合并进输出，不需要等 fresh tooling binary 重编后才看见新增入口；当前包括 `verify_new_expr_surface`、`verify_backend_string_abi_contract`、`verify_backend_dot_lowering_contract`、`verify_backend_selfhost_currentsrc_proof`。
 - 这些 script-backed gate 属于迁移中的兼容面，不代表规范主口径。后续重写 gate 时，应优先把语义核心搬到 Cheng/native 路径，再决定是否保留 shell 薄包装。
-- 聚合器仅在 `main(argc, argv)` 的编译器内部 C ABI 入口桥接阶段使用指针参数；构建时显式注入 `STAGE1_NO_POINTERS_NON_C_ABI=0` / `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0` 仅用于 tooling/runtime/internal 构建路径，用户源码 `@importc/@exportc` surface 仍遵循 `ABI=v2_noptr` 生产口径。
+- 聚合器仅在 `main(argc, argv)` 的编译器内部 C ABI 入口桥接阶段使用指针参数；构建时显式放宽 `STAGE1_NO_POINTERS_NON_C_ABI=0` / `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0` 仅用于 tooling/runtime/internal 构建路径。用户公开编译入口不再暴露 `--abi`/`--std-noptr`/`--noptr-non-c-abi` 这组开关，用户源码 `@importc/@exportc` surface 默认按 no-pointer 生产口径执行。
 - 可通过 `TOOLING_BIN` 覆盖可执行路径，通过 `TOOLING_BUILD_GLOBAL_EAGER_REBUILD=1` 强制重建。
 - `cheng_tooling` 支持 multicall：当 `argv0` 是脚本 ID（例如 `backend_prod_closure`）时会自动分发到内嵌脚本负载。
 - `install` 子命令可把全部 tooling 入口（内嵌脚本表）合并安装为“一个全局二进制 + 多个命令入口”的形态；支持重复 `--only:<id>` / `--exclude:<id>` 做按需子集安装，并支持 `--mode:symlink|hardlink|copy` 选择入口物化方式。默认 `--mode:hardlink`（可显式改为 `copy`）。
@@ -126,7 +126,7 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
 说明：
 - 可通过 `--name:<exeName>` 改输出二进制名。
 - 可选 `--mm:<orc>`（或 `--orc`）显式设置内存模型；默认并固定 `orc`。
-- 可选 `--abi:<v2_noptr>`（等价于设置 `ABI`）；默认 `v2_noptr`。
+- no-pointer / `v2_noptr` 策略已内建为默认口径，不再暴露 `--abi` 或相关 no-pointer 开关。
 - 包管理器接入：可选传入 `--manifest/--lock/--registry`，会生成构建元数据 `chengcache/<name>.buildmeta.toml`。
 - 可选 `--pkg-cache:<dir>` 指定包缓存目录（默认 `chengcache/packages`，或 `PKG_CACHE` 环境变量）。
 - 当 lock 存在时会拉取依赖包并设置 `PKG_ROOTS` 供 `cheng/<pkg>/...` 域名导入使用；生产包根以 `src/` 为模块根（`cheng/<pkg>/<path>` -> `<pkgroot>/src/<path>.cheng`）。`PKG_ROOTS` 可指向包根列表或容器根（如 `~/.cheng-packages`，解析会优先尝试 `cheng-<pkg>`）。
@@ -366,14 +366,13 @@ FULLCHAIN_OBJ_ONLY=1 cheng_tooling verify_fullchain_bootstrap
   - smoke 子阶段支持独立超时 `SELF_OBJ_BOOTSTRAP_SMOKE_TIMEOUT=<seconds>`（默认 15）；用于在 `fast` 模式下快速触发 smoke fallback，避免总时长被单次卡死拉满。
   - 新增 `verify_backend_selfhost_bootstrap_inmem_witness`：固定 `full parse + ws + BACKEND_DIRECT_EXE=1 + BACKEND_LINKERLESS_INMEM=1 + BACKEND_LINKER=self`，用于在 strict fixed-point 前快速验证 compile-stage1 的真实 deepest front；默认超时 `SELF_OBJ_BOOTSTRAP_INMEM_WITNESS_TIMEOUT=60`。
   - 新增 `verify_backend_selfhost_inner_loop`：固定执行 `build-backend-driver --require-rebuild -> strict inmem witness -> strict host`，并将总控 timing/summary 落盘到 `artifacts/backend_selfhost_inner_loop/`；可用 `--no-strict` 收成“canonical rebuild + witness”快环，也可用 `--closure` 在 strict 通过后继续追加 `backend_prod_closure`。
-- `verify_backend_selfhost_bootstrap_self_obj` 固定使用 `ABI=v2_noptr`（非 `v2_noptr` 将直接报错）。
-- `ABI=v2_noptr` 默认会在 stage1 语义层启用 std no-pointer 门禁；可用 `STAGE1_STD_NO_POINTERS=0` 显式关闭（兼容口径），或用 `STAGE1_STD_NO_POINTERS=1`/`STAGE1_STD_NO_POINTERS_STRICT=1` 强制严格门禁。
-- 新增 `STAGE1_NO_POINTERS_NON_C_ABI=1`：在用户源码模块禁用 `*`/`&`/deref/`ptr_*` 等指针语法与操作；`@importc/@exportc` 等 C ABI 声明不再豁免。该环境变量名仅为兼容保留。
-- `STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL` 默认按开启处理（仅显式设为 `0` 时放宽到编译器内部路径），因此 `src/stage1`/`src/backend`/`src/tooling` 也默认纳入 no-pointer 门禁。
+- `verify_backend_selfhost_bootstrap_self_obj` 与默认公开编译入口都按内建 no-pointer 生产策略解释用户源码；不再要求用户显式传 `ABI=v2_noptr`。
+- `STAGE1_STD_NO_POINTERS*` 与 `STAGE1_NO_POINTERS_NON_C_ABI*` 现在只用于内部实现、专项 gate 或编译器/运行时自举放宽，不再是公开编译配置面。
+- 用户公开入口已移除 `--abi:v2_noptr`、`--std-noptr`、`--std-noptr-strict`、`--noptr-non-c-abi`、`--noptr-non-c-abi-internal`；默认 `cheng` / `release-compile` / `chengc` 会直接拒绝用户裸指针 surface。
 - `v2_noptr` 的 no-pointer 策略由 `verify_backend_noptr_default_cli` 负向样例门禁保证：默认 `chengc` 入口必须拒绝用户源码裸指针样例，包括 `@importc` raw-pointer surface。
 - 兼容命令 `verify_backend_abi_v2_noptr` 已收敛为 `verify_backend_noptr_default_cli` 的别名，不再维护独立 gate 逻辑。
 - `verify_backend_noptr_default_cli` 默认验证三类路径：用户裸指针负例、safe `@importc` 正例、raw `@importc void*` 负例。
-- `chengc` 在 `ABI=v2_noptr` 时会自动注入 `STAGE1_STD_NO_POINTERS=1`、`STAGE1_STD_NO_POINTERS_STRICT=0`、`STAGE1_NO_POINTERS_NON_C_ABI=1`、`STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1`。
+- `chengc` 默认按 no-pointer 生产口径编译用户源码；旧 `ABI/STAGE1_*NO_POINTERS*` 名称仅保留给内部兼容链，不应再当作用户入口文档化。
 - 新增 `verify_backend_noptr_default_cli`：验证默认 `chengc` 入口（不手工放宽 no-pointer env）会拒绝用户指针样例与 raw `@importc void*` 样例，同时保留普通正样例与 safe `@importc` 正常通过。
   - stage0 选择固定为 canonical：`artifacts/backend_driver/cheng`；不可用则直接阻断。
   - 自举模式：`SELF_OBJ_BOOTSTRAP_MODE=strict|fast`（默认 `fast`）。`strict` 固定执行 `stage1 -> stage2 -> stage3(witness)` 三轮 full rebuild，并强制 `SHA256(stage2) == SHA256(stage3)`；仅诊断场景可用 `SELF_OBJ_BOOTSTRAP_STRICT_DIAG_ALLOW_MISMATCH=1` 放宽。`fast` 只编译 stage1 并同步为 stage2（开发加速，跳过 fixed-point 校验）。
@@ -470,13 +469,14 @@ cheng_tooling backend_prod_closure --full-closure
 - `backend_prod_closure` gate runner 默认只认 canonical tooling 路径 `artifacts/tooling_cmd/cheng_tooling`；如需临时回退非 canonical，仅可显式设置 `BACKEND_PROD_ALLOW_NONCANONICAL_TOOL_BIN=1`。
 - `backend_prod_closure` 默认新增并阻断 `backend.compile_name_canonical`（`cheng_tooling verify_backend_compile_name_canonical`）：强制指定生态仓的编译命令统一使用 `cheng`，禁止 `cheng_tooling compile/chengc` 旧调用残留。
 - `backend_prod_closure` 默认新增并阻断 `backend.dev_track_only`（`cheng_tooling verify_backend_dev_track_only`）：强制 `cheng` 不接受 `--release`，并阻断 `BACKEND_BUILD_TRACK=release` 抬升、`BACKEND_LINKER` 环境覆盖；`compile/chengc` 入口必须返回 `rc=2`。
-- `backend_prod_closure` 现在仅支持 `ABI=v2_noptr`（若外部传入非 `v2_noptr` 会直接报错退出）；主闭环以 `v2_noptr` 兼容口径执行（`STAGE1_STD_NO_POINTERS=1`），no-pointer CLI 收口由 `verify_backend_noptr_default_cli` 单独执行。
+- `backend_prod_closure` 现在固定执行默认 no-pointer 生产口径；若外部显式抬升到旧 ABI/裸指针配置面会直接报错。no-pointer CLI 收口由 `verify_backend_noptr_default_cli` 单独执行。
 - `backend_prod_closure` 已不再包含独立 `backend.abi_v2_noptr` required gate；兼容命令 `verify_backend_abi_v2_noptr` 保留为 `verify_backend_noptr_default_cli` 别名。
 - `backend_prod_closure` required 链路包含 `backend.rawptr_contract`（`cheng_tooling verify_backend_rawptr_contract`），并单独执行 `backend.rawptr_surface_forbid` 与 `backend.rawptr_closedloop`。
 - `backend.pure_cheng_surface`（`cheng_tooling verify_backend_pure_cheng_surface`）保留为专项纯化 gate，不再进入当前默认 `backend_prod_closure` required 图；报告继续落到 `artifacts/backend_pure_cheng_surface/`，用于后续全量零脚本 / 零 native-substrate 纯化收口。
 - `backend_prod_closure` required 现默认先执行 `backend.seed_uir_import`（`cheng_tooling verify_backend_seed_uir_import`）；`backend.sidecar_cheng_seed` 已退出默认 closure 图，保留为专项 native-substrate smoke。
 - 相邻 fresh gate：`cheng_tooling verify_backend_sidecar_cheng_fresh`
-  - 固定使用当前 Cheng compiler（当前优先 `dist/releases/current/cheng`）构建 `backend_driver_uir_sidecar.cheng` 的 fresh `cheng` bundle，并复用同一最小 native outer driver 强制走 sidecar 加载路径。
+  - 公开 sidecar 口径只接受 `--sidecar-mode:cheng`；resolver 只认 strict-fresh Cheng sidecar contract，不再接受 `emergency_c` 或 `dist/releases/current/cheng` 一类回退。
+  - gate 负责生成并校验 repo-local 稳定 snapshot：bundle / compiler / real-driver 必须落在仓库路径（`chengcache/backend_driver_sidecar` + `artifacts/backend_sidecar_cheng_fresh`），缺失、stale 或 contract 不完整都会直接失败。
   - gate 同样 compile+run 三条 smoke：`return_add`、`return_new_expr_generic_box`、`return_new_ref_seq_growth`。
   - gate 会把结果落到 `artifacts/backend_sidecar_cheng_fresh/verify_backend_sidecar_cheng_fresh.{report.txt,snapshot.env}`，并为每条 fixture 保留 `*.compile.log` / `*.run.log`。
   - 当前不再默认接入 `cheng_tooling verify`，保留为专项 native-substrate smoke，也不进入 `backend_prod_closure` required。

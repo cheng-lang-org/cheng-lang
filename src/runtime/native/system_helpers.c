@@ -203,6 +203,10 @@ void cheng_seq_header_buffer_set(void* seq_ptr, void* value) {
     seq->buffer = value;
 }
 
+static int32_t cheng_seq_elem_size_compat_get(void* key_ptr, int32_t fallback);
+static void cheng_seq_elem_size_compat_register(void* seq_ptr, void* buffer, int32_t elem_size);
+static void cheng_seq_elem_size_compat_unregister(void* seq_ptr, void* buffer);
+
 void cheng_seq_grow_to_raw(void** p_buffer, int32_t* p_cap, int32_t min_cap, int32_t elem_size) {
     if (p_buffer == NULL || p_cap == NULL || min_cap <= 0 || elem_size <= 0) {
         return;
@@ -244,13 +248,15 @@ void cheng_seq_grow_inst(void* seq_ptr, int32_t min_cap, int32_t elem_size) {
         return;
     }
     ChengSeqHeader* seq_hdr = (ChengSeqHeader*)seq_ptr;
+    int32_t actual_elem_size = cheng_seq_elem_size_compat_get(seq_ptr, elem_size);
     int32_t buf_cap = seq_hdr->cap;
     void* raw_buffer = seq_hdr->buffer;
     if (raw_buffer == NULL || min_cap > buf_cap) {
-        cheng_seq_grow_to_raw(&raw_buffer, &buf_cap, min_cap, elem_size);
+        cheng_seq_grow_to_raw(&raw_buffer, &buf_cap, min_cap, actual_elem_size);
         seq_hdr->buffer = raw_buffer;
         seq_hdr->cap = buf_cap;
     }
+    cheng_seq_elem_size_compat_register(seq_ptr, seq_hdr->buffer, actual_elem_size);
 }
 
 int32_t cheng_seq_string_init_cap(int32_t seq_len, int32_t seq_cap) {
@@ -265,14 +271,105 @@ int32_t cheng_seq_string_init_cap(int32_t seq_len, int32_t seq_cap) {
 }
 
 int32_t cheng_seq_string_elem_bytes_compat(void) {
-    return (int32_t)sizeof(void*);
+    int32_t base = (int32_t)sizeof(void*) + 3 * (int32_t)sizeof(int32_t);
+    int32_t align = (int32_t)sizeof(void*);
+    int32_t rem = (align > 0) ? (base % align) : 0;
+    return rem == 0 ? base : (base + (align - rem));
+}
+
+#define CHENG_SEQ_ELEM_SIZE_COMPAT_CAP 4096u
+static uintptr_t cheng_seq_elem_size_compat_keys[CHENG_SEQ_ELEM_SIZE_COMPAT_CAP];
+static int32_t cheng_seq_elem_size_compat_vals[CHENG_SEQ_ELEM_SIZE_COMPAT_CAP];
+
+static uint32_t cheng_seq_elem_size_compat_slot(uintptr_t key) {
+    return (uint32_t)((key >> 3u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u));
+}
+
+static void cheng_seq_elem_size_compat_put(void* key_ptr, int32_t elem_size) {
+    uintptr_t key = (uintptr_t)key_ptr;
+    if (key == 0 || elem_size <= 0) {
+        return;
+    }
+    uint32_t slot = cheng_seq_elem_size_compat_slot(key);
+    for (uint32_t scanned = 0; scanned < CHENG_SEQ_ELEM_SIZE_COMPAT_CAP; ++scanned) {
+        uintptr_t cur_key = cheng_seq_elem_size_compat_keys[slot];
+        if (cur_key == 0 || cur_key == key) {
+            cheng_seq_elem_size_compat_keys[slot] = key;
+            cheng_seq_elem_size_compat_vals[slot] = elem_size;
+            return;
+        }
+        slot = (slot + 1u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u);
+    }
+}
+
+static int32_t cheng_seq_elem_size_compat_get(void* key_ptr, int32_t fallback) {
+    uintptr_t key = (uintptr_t)key_ptr;
+    if (key == 0) {
+        return fallback;
+    }
+    uint32_t slot = cheng_seq_elem_size_compat_slot(key);
+    for (uint32_t scanned = 0; scanned < CHENG_SEQ_ELEM_SIZE_COMPAT_CAP; ++scanned) {
+        uintptr_t cur_key = cheng_seq_elem_size_compat_keys[slot];
+        if (cur_key == 0) {
+            return fallback;
+        }
+        if (cur_key == key) {
+            int32_t value = cheng_seq_elem_size_compat_vals[slot];
+            return value > 0 ? value : fallback;
+        }
+        slot = (slot + 1u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u);
+    }
+    return fallback;
+}
+
+static void cheng_seq_elem_size_compat_del(void* key_ptr) {
+    uintptr_t key = (uintptr_t)key_ptr;
+    if (key == 0) {
+        return;
+    }
+    uint32_t slot = cheng_seq_elem_size_compat_slot(key);
+    for (uint32_t scanned = 0; scanned < CHENG_SEQ_ELEM_SIZE_COMPAT_CAP; ++scanned) {
+        uintptr_t cur_key = cheng_seq_elem_size_compat_keys[slot];
+        if (cur_key == 0) {
+            return;
+        }
+        if (cur_key == key) {
+            cheng_seq_elem_size_compat_keys[slot] = 0;
+            cheng_seq_elem_size_compat_vals[slot] = 0;
+            return;
+        }
+        slot = (slot + 1u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u);
+    }
+}
+
+static void cheng_seq_elem_size_compat_register(void* seq_ptr, void* buffer, int32_t elem_size) {
+    cheng_seq_elem_size_compat_put(seq_ptr, elem_size);
+    cheng_seq_elem_size_compat_put(buffer, elem_size);
+}
+
+static void cheng_seq_elem_size_compat_unregister(void* seq_ptr, void* buffer) {
+    cheng_seq_elem_size_compat_del(seq_ptr);
+    cheng_seq_elem_size_compat_del(buffer);
+}
+
+void cheng_seq_string_register_compat(void* seq_ptr) {
+    ChengSeqHeader* seq_hdr = (ChengSeqHeader*)seq_ptr;
+    int32_t elem_size = cheng_seq_string_elem_bytes_compat();
+    if (seq_hdr == NULL) {
+        return;
+    }
+    cheng_seq_elem_size_compat_register(seq_ptr, seq_hdr->buffer, elem_size);
+}
+
+void cheng_seq_string_buffer_register_compat(void* buffer) {
+    cheng_seq_elem_size_compat_put(buffer, cheng_seq_string_elem_bytes_compat());
 }
 
 void* cheng_seq_string_alloc_compat(int32_t buf_cap) {
     if (buf_cap <= 0) {
         return NULL;
     }
-    int32_t total_bytes = buf_cap * (int32_t)sizeof(void*);
+    int32_t total_bytes = buf_cap * cheng_seq_string_elem_bytes_compat();
     void* raw_buffer = realloc(NULL, (size_t)total_bytes);
     if (raw_buffer == NULL) {
         abort();
@@ -294,6 +391,7 @@ void cheng_seq_string_init_compat(void* seq_ptr, int32_t seq_len, int32_t seq_ca
     seq_hdr->buffer = raw_buffer;
     seq_hdr->cap = buf_cap;
     seq_hdr->len = seq_len;
+    cheng_seq_string_register_compat(seq_ptr);
 }
 
 ChengSeqHeader cheng_new_seq_string_compat(int32_t seq_len, int32_t seq_cap) {
@@ -310,9 +408,11 @@ void cheng_seq_free(void* seq_ptr) {
         return;
     }
     ChengSeqHeader* seq_hdr = (ChengSeqHeader*)seq_ptr;
+    void* old_buffer = seq_hdr->buffer;
     if (seq_hdr->buffer != NULL) {
         cheng_mem_release(seq_hdr->buffer);
     }
+    cheng_seq_elem_size_compat_unregister(seq_ptr, old_buffer);
     seq_hdr->buffer = NULL;
     seq_hdr->len = 0;
     seq_hdr->cap = 0;
@@ -443,10 +543,32 @@ typedef struct ChengStrBridge {
     int32_t flags;
 } ChengStrBridge;
 
+typedef struct ChengErrorInfoBridgeCompat {
+    int32_t code;
+    ChengStrBridge msg;
+} ChengErrorInfoBridgeCompat;
+
 enum {
     CHENG_STR_BRIDGE_FLAG_NONE = 0,
     CHENG_STR_BRIDGE_FLAG_OWNED = 1,
 };
+
+static bool cheng_probably_valid_str_bridge(const ChengStrBridge* s) {
+    if (s == NULL) return false;
+    if (s->len < 0 || s->len > (1 << 28)) return false;
+    if ((s->flags & ~CHENG_STR_BRIDGE_FLAG_OWNED) != 0) return false;
+    if (s->ptr == NULL) return s->len == 0;
+    return cheng_probably_valid_ptr(s->ptr);
+}
+
+char* cheng_str_param_to_cstring_compat(void* raw) {
+    uintptr_t raw_addr = (uintptr_t)raw;
+    if (raw == NULL) return NULL;
+    if (raw_addr < (uintptr_t)65536) return NULL;
+    if ((raw_addr & (uintptr_t)(sizeof(void*) - 1)) != 0) return (char*)raw;
+    if (!cheng_probably_valid_str_bridge((const ChengStrBridge*)raw)) return (char*)raw;
+    return NULL;
+}
 
 static ChengStrBridge cheng_str_bridge_empty(void);
 static ChengStrBridge cheng_str_bridge_from_ptr_flags(const char* ptr, int32_t flags);
@@ -521,6 +643,8 @@ typedef struct ChengStrMetaEntry {
 static ChengStrMetaEntry* cheng_strmeta_entries = NULL;
 static int32_t cheng_strmeta_len = 0;
 static int32_t cheng_strmeta_cap = 0;
+static ChengStrMetaEntry* cheng_strmeta_table = NULL;
+static int32_t cheng_strmeta_table_cap = 0;
 static volatile int cheng_strmeta_lock = 0;
 
 static int driver_c_diag_enabled(void);
@@ -760,19 +884,34 @@ WEAK int32_t driver_c_backend_usage(void) {
     fputs("  backend_driver [--input:<file>|<file>] [--output:<out>] [options]\n", stderr);
     fputs("\n", stderr);
     fputs("Core options:\n", stderr);
-    fputs("  --emit:<exe> --target:<triple|auto> --frontend:<stage1>\n", stderr);
+    fputs("  --emit:<exe|obj> --target:<triple|auto> --frontend:<stage1>\n", stderr);
     fputs("  --linker:<self|system> --obj-writer:<auto|elf|macho|coff>\n", stderr);
+    fputs("  --build-track:<dev|release> --mm:<orc> --fn-sched:<ws>\n", stderr);
+    fputs("  --whole-program --whole-program:0|1\n", stderr);
     fputs("  --opt-level:<N> --opt2 --no-opt2 --opt --no-opt\n", stderr);
+    fputs("  --ldflags:<text>\n", stderr);
+    fputs("  --jobs:<N> --fn-jobs:<N>\n", stderr);
+    fputs("  --module-cache:<path>\n", stderr);
+    fputs("  --multi-module-cache --multi-module-cache:0|1\n", stderr);
+    fputs("  --module-cache-unstable-allow --module-cache-unstable-allow:0|1\n", stderr);
     fputs("  --multi --no-multi --multi-force --no-multi-force\n", stderr);
     fputs("  --incremental --no-incremental --allow-no-main\n", stderr);
     fputs("  --skip-global-init --runtime-obj:<path> --runtime-c:<path> --no-runtime-c\n", stderr);
     fputs("  --generic-mode:<dict> --generic-spec-budget:<N>\n", stderr);
     fputs("  --borrow-ir:<mir|stage1> --generic-lowering:<mir_dict>\n", stderr);
-    fputs("  --abi:<v2_noptr> --android-api:<N> --compile-stamp-out:<path>\n", stderr);
+    fputs("  --android-api:<N> --compile-stamp-out:<path>\n", stderr);
+    fputs("  --sidecar-mode:<cheng> --sidecar-bundle:<path>\n", stderr);
+    fputs("  --sidecar-compiler:<path>\n", stderr);
+    fputs("  --sidecar-child-mode:<cli|outer_cli> --sidecar-outer-compiler:<path>\n", stderr);
     fputs("  --profile --no-profile --uir-profile --no-uir-profile\n", stderr);
     fputs("  --uir-simd --no-uir-simd --uir-simd-max-width:<N> --uir-simd-policy:<name>\n", stderr);
     return 0;
 }
+
+static void driver_c_maybe_inject_env_cli(int* argc_io, char*** argv_io);
+static void driver_c_sync_cli_env(int argc, char** argv);
+static int driver_c_has_flag_value(int argc, char** argv, const char* flag);
+WEAK void driver_c_capture_cmdline(int32_t argc, void* argv_void);
 
 WEAK int32_t driver_c_write_stderr(const char* text) {
     if (text == NULL) return 0;
@@ -834,7 +973,101 @@ static void cheng_strmeta_release(void) {
     __sync_lock_release(&cheng_strmeta_lock);
 }
 
+#define CHENG_STRMETA_RECENT_SLOTS 8u
+static CHENG_THREAD_LOCAL const char* cheng_strmeta_recent_ptrs[CHENG_STRMETA_RECENT_SLOTS];
+static CHENG_THREAD_LOCAL size_t cheng_strmeta_recent_lens[CHENG_STRMETA_RECENT_SLOTS];
+static CHENG_THREAD_LOCAL unsigned char cheng_strmeta_recent_valids[CHENG_STRMETA_RECENT_SLOTS];
+
+static size_t cheng_strmeta_hash_ptr(const char* ptr) {
+    size_t raw = (size_t)(const void*)ptr;
+    raw ^= raw >> 17;
+    raw ^= raw >> 9;
+    raw *= (size_t)1315423911u;
+    return raw;
+}
+
+static size_t cheng_strmeta_recent_slot(const char* ptr) {
+    return cheng_strmeta_hash_ptr(ptr) & (CHENG_STRMETA_RECENT_SLOTS - 1u);
+}
+
+static bool cheng_strmeta_recent_get(const char* ptr, size_t* out_len) {
+    if (ptr == NULL) {
+        return false;
+    }
+    size_t slot = cheng_strmeta_recent_slot(ptr);
+    if (!cheng_strmeta_recent_valids[slot] || cheng_strmeta_recent_ptrs[slot] != ptr) {
+        return false;
+    }
+    if (out_len != NULL) {
+        *out_len = cheng_strmeta_recent_lens[slot];
+    }
+    return true;
+}
+
+static void cheng_strmeta_recent_put(const char* ptr, size_t len) {
+    if (ptr == NULL) {
+        return;
+    }
+    size_t slot = cheng_strmeta_recent_slot(ptr);
+    cheng_strmeta_recent_ptrs[slot] = ptr;
+    cheng_strmeta_recent_lens[slot] = len;
+    cheng_strmeta_recent_valids[slot] = 1u;
+}
+
+static bool cheng_strmeta_probe_table_snapshot(const char* ptr, ChengStrMetaEntry* table,
+                                               int32_t table_cap, size_t* out_len) {
+    if (ptr == NULL || table == NULL || table_cap <= 0) {
+        return false;
+    }
+    size_t slot = cheng_strmeta_hash_ptr(ptr) % (size_t)table_cap;
+    for (int32_t probes = 0; probes < table_cap; ++probes) {
+        const char* entry_ptr = __atomic_load_n(&table[slot].ptr, __ATOMIC_ACQUIRE);
+        if (entry_ptr == ptr) {
+            if (out_len != NULL) {
+                *out_len = (size_t)table[slot].len;
+            }
+            return true;
+        }
+        if (entry_ptr == NULL) {
+            return false;
+        }
+        slot = (slot + 1u) % (size_t)table_cap;
+    }
+    return false;
+}
+
+static bool cheng_strmeta_reserve_table_unlocked(int32_t need_len) {
+    int32_t next_cap = cheng_strmeta_table_cap;
+    ChengStrMetaEntry* next_table = NULL;
+    if (need_len < 1) need_len = 1;
+    if (next_cap < 256) next_cap = 256;
+    while ((int64_t)need_len * 10 >= (int64_t)next_cap * 7) {
+        next_cap *= 2;
+    }
+    if (cheng_strmeta_table != NULL && next_cap <= cheng_strmeta_table_cap) {
+        return true;
+    }
+    next_table = (ChengStrMetaEntry*)calloc((size_t)next_cap, sizeof(ChengStrMetaEntry));
+    if (next_table == NULL) {
+        return false;
+    }
+    for (int32_t i = 0; i < cheng_strmeta_len; ++i) {
+        const char* entry_ptr = cheng_strmeta_entries[i].ptr;
+        size_t slot = 0;
+        if (entry_ptr == NULL) continue;
+        slot = cheng_strmeta_hash_ptr(entry_ptr) % (size_t)next_cap;
+        while (next_table[slot].ptr != NULL && next_table[slot].ptr != entry_ptr) {
+            slot = (slot + 1u) % (size_t)next_cap;
+        }
+        next_table[slot] = cheng_strmeta_entries[i];
+    }
+    __atomic_store_n(&cheng_strmeta_table, next_table, __ATOMIC_RELEASE);
+    __atomic_store_n(&cheng_strmeta_table_cap, next_cap, __ATOMIC_RELEASE);
+    return true;
+}
+
 static void cheng_strmeta_put(const char* ptr, int32_t len) {
+    bool have_slot = false;
     if (ptr == NULL || len < 0) return;
     cheng_strmeta_acquire();
     if (cheng_strmeta_len >= cheng_strmeta_cap) {
@@ -850,8 +1083,23 @@ static void cheng_strmeta_put(const char* ptr, int32_t len) {
         cheng_strmeta_entries[cheng_strmeta_len].ptr = ptr;
         cheng_strmeta_entries[cheng_strmeta_len].len = len;
         cheng_strmeta_len += 1;
+        have_slot = true;
+    }
+    if (have_slot) {
+        if (!cheng_strmeta_reserve_table_unlocked(cheng_strmeta_len)) {
+            __atomic_store_n(&cheng_strmeta_table, NULL, __ATOMIC_RELEASE);
+            __atomic_store_n(&cheng_strmeta_table_cap, 0, __ATOMIC_RELEASE);
+        } else {
+            size_t slot = cheng_strmeta_hash_ptr(ptr) % (size_t)cheng_strmeta_table_cap;
+            while (cheng_strmeta_table[slot].ptr != NULL && cheng_strmeta_table[slot].ptr != ptr) {
+                slot = (slot + 1u) % (size_t)cheng_strmeta_table_cap;
+            }
+            cheng_strmeta_table[slot].len = len;
+            __atomic_store_n(&cheng_strmeta_table[slot].ptr, ptr, __ATOMIC_RELEASE);
+        }
     }
     cheng_strmeta_release();
+    cheng_strmeta_recent_put(ptr, (size_t)len);
 }
 
 WEAK void cheng_register_string_meta(const char* ptr, int32_t len) {
@@ -860,13 +1108,34 @@ WEAK void cheng_register_string_meta(const char* ptr, int32_t len) {
 
 static bool cheng_strmeta_get(const char* ptr, size_t* out_len) {
     if (ptr == NULL) return false;
+    if (cheng_strmeta_recent_get(ptr, out_len)) {
+        return true;
+    }
+    int32_t table_cap_snapshot = __atomic_load_n(&cheng_strmeta_table_cap, __ATOMIC_ACQUIRE);
+    ChengStrMetaEntry* table_snapshot = __atomic_load_n(&cheng_strmeta_table, __ATOMIC_ACQUIRE);
+    if (cheng_strmeta_probe_table_snapshot(ptr, table_snapshot, table_cap_snapshot, out_len)) {
+        cheng_strmeta_recent_put(ptr, (out_len != NULL) ? *out_len : 0u);
+        return true;
+    }
     bool found = false;
     cheng_strmeta_acquire();
-    for (int32_t i = cheng_strmeta_len - 1; i >= 0; --i) {
-        if (cheng_strmeta_entries[i].ptr == ptr) {
-            if (out_len != NULL) *out_len = (size_t)cheng_strmeta_entries[i].len;
+    if (cheng_strmeta_table != NULL && cheng_strmeta_table_cap > 0) {
+        size_t found_len = 0u;
+        if (cheng_strmeta_probe_table_snapshot(ptr, cheng_strmeta_table, cheng_strmeta_table_cap, &found_len)) {
+            if (out_len != NULL) *out_len = found_len;
+            cheng_strmeta_recent_put(ptr, found_len);
             found = true;
-            break;
+        }
+    }
+    if (!found) {
+        for (int32_t i = cheng_strmeta_len - 1; i >= 0; --i) {
+            if (cheng_strmeta_entries[i].ptr == ptr) {
+                size_t len = (size_t)cheng_strmeta_entries[i].len;
+                if (out_len != NULL) *out_len = len;
+                cheng_strmeta_recent_put(ptr, len);
+                found = true;
+                break;
+            }
         }
     }
     cheng_strmeta_release();
@@ -885,9 +1154,14 @@ WEAK int32_t backendMain(void) {
     return driver_c_run_default();
 }
 WEAK int main(int argc, char** argv) {
-    __cheng_setCmdLine((int32_t)argc, (const char**)argv);
-    for (int i = 1; i < argc; ++i) {
-        if (cheng_arg_is_help(argv[i])) {
+    char** effective_argv = argv;
+    int effective_argc = argc;
+    driver_c_maybe_inject_env_cli(&effective_argc, &effective_argv);
+    __cheng_setCmdLine((int32_t)effective_argc, (const char**)effective_argv);
+    driver_c_capture_cmdline((int32_t)effective_argc, (void*)effective_argv);
+    driver_c_sync_cli_env(effective_argc, effective_argv);
+    for (int i = 1; i < effective_argc; ++i) {
+        if (cheng_arg_is_help(effective_argv[i])) {
             return driver_c_backend_usage();
         }
     }
@@ -1267,6 +1541,225 @@ static char* driver_c_cli_value_copy(const char* key) {
         }
     }
     return driver_c_dup_cstr("");
+}
+
+static char* driver_c_make_flag_value(const char* flag, const char* value) {
+    size_t flag_len = (flag != NULL) ? strlen(flag) : 0u;
+    size_t value_len = (value != NULL) ? strlen(value) : 0u;
+    char* out = (char*)cheng_malloc((int32_t)(flag_len + value_len + 2u));
+    if (out == NULL) return NULL;
+    if (flag_len > 0) memcpy(out, flag, flag_len);
+    out[flag_len] = ':';
+    if (value_len > 0) memcpy(out + flag_len + 1u, value, value_len);
+    out[flag_len + value_len + 1u] = '\0';
+    cheng_strmeta_put(out, (int32_t)(flag_len + value_len + 1u));
+    return out;
+}
+
+static int driver_c_match_flag_value(const char* arg, const char* flag, const char** value_out) {
+    size_t flag_len;
+    if (value_out != NULL) *value_out = NULL;
+    if (arg == NULL || flag == NULL || flag[0] == '\0') return 0;
+    flag_len = strlen(flag);
+    if (strcmp(arg, flag) == 0) return 1;
+    if (strncmp(arg, flag, flag_len) == 0 && (arg[flag_len] == ':' || arg[flag_len] == '=')) {
+        if (value_out != NULL) *value_out = arg + flag_len + 1u;
+        return 1;
+    }
+    return 0;
+}
+
+static int driver_c_collect_flag_value(int argc, char** argv, const char* flag, const char** value_out) {
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        const char* inline_value = NULL;
+        if (!driver_c_match_flag_value(arg, flag, &inline_value)) continue;
+        if (inline_value != NULL) {
+            if (value_out != NULL) *value_out = inline_value;
+            return 1;
+        }
+        if (i + 1 < argc && argv[i + 1] != NULL) {
+            if (value_out != NULL) *value_out = argv[i + 1];
+            return 1;
+        }
+        if (value_out != NULL) *value_out = "";
+        return 1;
+    }
+    return 0;
+}
+
+static int driver_c_collect_positional_input(int argc, char** argv, const char** value_out) {
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        if (arg == NULL || arg[0] == '\0') continue;
+        if (arg[0] != '-') {
+            if (value_out != NULL) *value_out = arg;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void driver_c_sync_env_value_flag(int argc, char** argv,
+                                         const char* flag,
+                                         const char* env_name) {
+    const char* value = NULL;
+    if (!driver_c_collect_flag_value(argc, argv, flag, &value)) return;
+    if (value == NULL || env_name == NULL || env_name[0] == '\0') return;
+    setenv(env_name, value, 1);
+}
+
+static void driver_c_sync_env_bool_flag(int argc, char** argv,
+                                        const char* positive_flag,
+                                        const char* negative_flag,
+                                        const char* env_name) {
+    const char* value = NULL;
+    int seen = 0;
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        const char* inline_value = NULL;
+        if (driver_c_match_flag_value(arg, positive_flag, &inline_value)) {
+            seen = 1;
+            value = (inline_value != NULL) ? inline_value : "1";
+            continue;
+        }
+        if (negative_flag != NULL && strcmp(arg != NULL ? arg : "", negative_flag) == 0) {
+            seen = 1;
+            value = "0";
+            continue;
+        }
+    }
+    if (!seen || value == NULL || env_name == NULL || env_name[0] == '\0') return;
+    setenv(env_name, value, 1);
+}
+
+static void driver_c_sync_env_enable_flag(int argc, char** argv,
+                                          const char* flag,
+                                          const char* env_name) {
+    if (!driver_c_has_flag_value(argc, argv, flag)) return;
+    if (env_name == NULL || env_name[0] == '\0') return;
+    setenv(env_name, "1", 1);
+}
+
+static void driver_c_sync_cli_env(int argc, char** argv) {
+    const char* input_value = NULL;
+    const char* env_input = NULL;
+    if (argc <= 0 || argv == NULL) return;
+
+    driver_c_sync_env_value_flag(argc, argv, "--input", "BACKEND_INPUT");
+    env_input = getenv("BACKEND_INPUT");
+    if ((env_input == NULL || env_input[0] == '\0') &&
+        driver_c_collect_positional_input(argc, argv, &input_value) &&
+        input_value != NULL && input_value[0] != '\0') {
+        setenv("BACKEND_INPUT", input_value, 1);
+    }
+    driver_c_sync_env_value_flag(argc, argv, "--output", "BACKEND_OUTPUT");
+    driver_c_sync_env_value_flag(argc, argv, "--target", "BACKEND_TARGET");
+    driver_c_sync_env_value_flag(argc, argv, "--linker", "BACKEND_LINKER");
+    driver_c_sync_env_value_flag(argc, argv, "--emit", "BACKEND_EMIT");
+    driver_c_sync_env_value_flag(argc, argv, "--frontend", "BACKEND_FRONTEND");
+    driver_c_sync_env_value_flag(argc, argv, "--build-track", "BACKEND_BUILD_TRACK");
+    driver_c_sync_env_value_flag(argc, argv, "--mm", "MM");
+    driver_c_sync_env_value_flag(argc, argv, "--fn-sched", "BACKEND_FN_SCHED");
+    driver_c_sync_env_value_flag(argc, argv, "--opt-level", "BACKEND_OPT_LEVEL");
+    driver_c_sync_env_value_flag(argc, argv, "--ldflags", "BACKEND_LDFLAGS");
+    driver_c_sync_env_value_flag(argc, argv, "--runtime-obj", "BACKEND_RUNTIME_OBJ");
+    driver_c_sync_env_value_flag(argc, argv, "--generic-mode", "GENERIC_MODE");
+    driver_c_sync_env_value_flag(argc, argv, "--generic-spec-budget", "GENERIC_SPEC_BUDGET");
+    driver_c_sync_env_value_flag(argc, argv, "--generic-lowering", "GENERIC_LOWERING");
+    driver_c_sync_env_value_flag(argc, argv, "--jobs", "BACKEND_JOBS");
+    driver_c_sync_env_value_flag(argc, argv, "--fn-jobs", "BACKEND_FN_JOBS");
+    driver_c_sync_env_value_flag(argc, argv, "--module-cache", "BACKEND_MODULE_CACHE");
+    driver_c_sync_env_value_flag(argc, argv, "--sidecar-mode", "BACKEND_UIR_SIDECAR_MODE");
+    driver_c_sync_env_value_flag(argc, argv, "--sidecar-bundle", "BACKEND_UIR_SIDECAR_BUNDLE");
+    driver_c_sync_env_value_flag(argc, argv, "--sidecar-compiler", "BACKEND_UIR_SIDECAR_COMPILER");
+    driver_c_sync_env_value_flag(argc, argv, "--sidecar-child-mode", "BACKEND_UIR_SIDECAR_CHILD_MODE");
+    driver_c_sync_env_value_flag(argc, argv, "--sidecar-outer-compiler", "BACKEND_UIR_SIDECAR_OUTER_COMPILER");
+    driver_c_sync_env_value_flag(argc, argv, "--borrow-ir", "BORROW_IR");
+    {
+        const char* emit_mode = getenv("BACKEND_EMIT");
+        if (emit_mode != NULL && strcmp(emit_mode, "obj") == 0) {
+            setenv("BACKEND_INTERNAL_ALLOW_EMIT_OBJ", "1", 1);
+        }
+    }
+    {
+        const char* sidecar_mode = getenv("BACKEND_UIR_SIDECAR_MODE");
+        if (sidecar_mode != NULL && strcmp(sidecar_mode, "cheng") == 0) {
+            setenv("BACKEND_UIR_SIDECAR_DISABLE", "0", 1);
+            setenv("BACKEND_UIR_PREFER_SIDECAR", "1", 1);
+            setenv("BACKEND_UIR_FORCE_SIDECAR", "1", 1);
+        }
+    }
+
+    driver_c_sync_env_bool_flag(argc, argv, "--opt", "--no-opt", "BACKEND_OPT");
+    driver_c_sync_env_bool_flag(argc, argv, "--opt2", "--no-opt2", "BACKEND_OPT2");
+    driver_c_sync_env_bool_flag(argc, argv, "--multi", "--no-multi", "BACKEND_MULTI");
+    driver_c_sync_env_bool_flag(argc, argv, "--multi-force", "--no-multi-force", "BACKEND_MULTI_FORCE");
+    driver_c_sync_env_bool_flag(argc, argv, "--incremental", "--no-incremental", "BACKEND_INCREMENTAL");
+    driver_c_sync_env_bool_flag(argc, argv, "--whole-program", "--no-whole-program", "BACKEND_WHOLE_PROGRAM");
+    driver_c_sync_env_bool_flag(argc, argv, "--multi-module-cache", "--no-multi-module-cache", "BACKEND_MULTI_MODULE_CACHE");
+    driver_c_sync_env_bool_flag(argc, argv, "--module-cache-unstable-allow", "--no-module-cache-unstable-allow", "BACKEND_MODULE_CACHE_UNSTABLE_ALLOW");
+    driver_c_sync_env_bool_flag(argc, argv, "--no-runtime-c", NULL, "BACKEND_NO_RUNTIME_C");
+
+    driver_c_sync_env_enable_flag(argc, argv, "--allow-no-main", "BACKEND_ALLOW_NO_MAIN");
+    driver_c_sync_env_enable_flag(argc, argv, "--skip-global-init", "BACKEND_SKIP_GLOBAL_INIT");
+}
+
+static int driver_c_has_flag_value(int argc, char** argv, const char* flag) {
+    if (flag == NULL || flag[0] == '\0') return 0;
+    size_t n = strlen(flag);
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        if (arg == NULL) continue;
+        if (strcmp(arg, flag) == 0) return 1;
+        if (strncmp(arg, flag, n) == 0 && (arg[n] == ':' || arg[n] == '=')) return 1;
+    }
+    return 0;
+}
+
+static int driver_c_has_positional_input(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const char* arg = argv[i];
+        if (arg == NULL || arg[0] == '\0') continue;
+        if (arg[0] != '-') return 1;
+    }
+    return 0;
+}
+
+static void driver_c_maybe_inject_env_cli(int* argc_io, char*** argv_io) {
+    int argc = (argc_io != NULL) ? *argc_io : 0;
+    char** argv = (argv_io != NULL) ? *argv_io : NULL;
+    if (argc <= 0 || argv == NULL) return;
+
+    const char* env_input = getenv("BACKEND_INPUT");
+    const char* env_output = getenv("BACKEND_OUTPUT");
+    const char* env_target = getenv("BACKEND_TARGET");
+    const char* env_linker = getenv("BACKEND_LINKER");
+
+    int add_input = (env_input != NULL && env_input[0] != '\0' &&
+                     !driver_c_has_flag_value(argc, argv, "--input") &&
+                     !driver_c_has_positional_input(argc, argv)) ? 1 : 0;
+    int add_output = (env_output != NULL && env_output[0] != '\0' &&
+                      !driver_c_has_flag_value(argc, argv, "--output")) ? 1 : 0;
+    int add_target = (env_target != NULL && env_target[0] != '\0' &&
+                      !driver_c_has_flag_value(argc, argv, "--target")) ? 1 : 0;
+    int add_linker = (env_linker != NULL && env_linker[0] != '\0' &&
+                      !driver_c_has_flag_value(argc, argv, "--linker")) ? 1 : 0;
+
+    int extra = add_input + add_output + add_target + add_linker;
+    if (extra <= 0) return;
+
+    char** out = (char**)cheng_malloc((int32_t)(argc + extra + 1) * (int32_t)sizeof(char*));
+    if (out == NULL) return;
+    for (int i = 0; i < argc; ++i) out[i] = argv[i];
+    int w = argc;
+    if (add_input) out[w++] = driver_c_make_flag_value("--input", env_input);
+    if (add_output) out[w++] = driver_c_make_flag_value("--output", env_output);
+    if (add_target) out[w++] = driver_c_make_flag_value("--target", env_target);
+    if (add_linker) out[w++] = driver_c_make_flag_value("--linker", env_linker);
+    out[w] = NULL;
+    if (argc_io != NULL) *argc_io = w;
+    if (argv_io != NULL) *argv_io = out;
 }
 
 WEAK char* driver_c_cli_input_copy(void) {
@@ -1853,51 +2346,6 @@ static int driver_c_runtime_resolve_self_path(char* out, size_t out_cap) {
     return 0;
 }
 
-static const char* driver_c_default_proof_surface_hint(char* out, size_t out_cap) {
-    const char* hint = getenv("BACKEND_PROOF_SURFACE_ORIGIN");
-    if (hint != NULL && hint[0] != '\0') return hint;
-    if (!driver_c_runtime_resolve_self_path(out, out_cap)) return NULL;
-    return out;
-}
-
-static const char* driver_c_default_proof_sidecar_compiler(void) {
-    static const char* currentsrc_stage0 =
-        "/Users/lbcheng/cheng-lang/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof";
-    static const char* preferred =
-        "/Users/lbcheng/cheng-lang/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng";
-    static const char* legacy =
-        "/Users/lbcheng/cheng-lang/artifacts/backend_selfhost_self_obj/probe_proofseed14/cheng_stage0_proofseed14";
-    char self_path[PATH_MAX];
-    const char* proof_surface = driver_c_default_proof_surface_hint(self_path, sizeof(self_path));
-    if (proof_surface == NULL) return NULL;
-    if (!driver_c_runtime_path_contains(
-            proof_surface,
-            "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2") &&
-        !driver_c_runtime_path_contains(
-            proof_surface,
-            "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness") &&
-        !driver_c_runtime_path_contains(
-            proof_surface,
-            "/artifacts/backend_driver/cheng")) {
-        return NULL;
-    }
-    if (access(currentsrc_stage0, X_OK) == 0) return currentsrc_stage0;
-    if (access(preferred, X_OK) == 0) return preferred;
-    if (access(legacy, X_OK) == 0) return legacy;
-    return NULL;
-}
-
-static void driver_c_apply_default_proof_sidecar_compiler(void) {
-    const char* env = getenv("BACKEND_UIR_SIDECAR_COMPILER");
-    const char* fallback = NULL;
-    if (env != NULL && env[0] != '\0') return;
-    fallback = driver_c_default_proof_sidecar_compiler();
-    if (fallback != NULL && fallback[0] != '\0') {
-        setenv("BACKEND_UIR_SIDECAR_COMPILER", fallback, 0);
-        driver_c_diagf("[driver_c_apply_default_proof_sidecar_compiler] default='%s'\n", fallback);
-    }
-}
-
 static int32_t driver_c_sidecar_builds_requested(void) {
     const char* preferEnv = getenv("BACKEND_UIR_PREFER_SIDECAR");
     if (preferEnv != NULL && preferEnv[0] != '\0') {
@@ -1943,6 +2391,21 @@ WEAK int32_t driver_c_build_emit_obj_default(const char* inputPath, const char* 
     int32_t emitRc = driver_c_emit_obj_default(module, target, outputPath);
     if (emitRc != 0) return emitRc;
     return driver_c_finish_emit_obj(outputPath);
+}
+
+static int driver_c_scoped_sidecar_disable_begin(const char** oldRaw, int* hadOld) {
+    const char* cur = getenv("BACKEND_UIR_SIDECAR_DISABLE");
+    if (oldRaw != NULL) *oldRaw = cur;
+    if (hadOld != NULL) *hadOld = (cur != NULL && cur[0] != '\0') ? 1 : 0;
+    return setenv("BACKEND_UIR_SIDECAR_DISABLE", "1", 1);
+}
+
+static void driver_c_scoped_sidecar_disable_end(const char* oldRaw, int hadOld) {
+    if (hadOld != 0 && oldRaw != NULL && oldRaw[0] != '\0') {
+        setenv("BACKEND_UIR_SIDECAR_DISABLE", oldRaw, 1);
+    } else {
+        unsetenv("BACKEND_UIR_SIDECAR_DISABLE");
+    }
 }
 
 WEAK int32_t driver_c_build_active_obj_default(void) {
@@ -2073,10 +2536,6 @@ WEAK void* driver_c_build_module_stage1_direct(const char* inputPath, const char
             if (module != NULL) return module;
         }
     }
-    if (sidecarDisabled != 0) {
-        driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_disabled skip_sidecar\n");
-        return NULL;
-    }
     cheng_build_active_module_ptrs_fn buildActiveModulePtrsFn = NULL;
     if (allowDirectExports != 0) {
         buildActiveModulePtrsFn =
@@ -2086,6 +2545,10 @@ WEAK void* driver_c_build_module_stage1_direct(const char* inputPath, const char
             driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_sidecar_module=%p\n", module);
             if (module != NULL) return module;
         }
+    }
+    if (sidecarDisabled != 0) {
+        driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_disabled skip_sidecar\n");
+        return NULL;
     }
     buildActiveModulePtrsFn =
         (cheng_build_active_module_ptrs_fn)cheng_sidecar_build_module_symbol(
@@ -3181,11 +3644,13 @@ static void* cheng_index_ptr(void* base, int32_t len, int32_t idx, int32_t elem_
 }
 
 void* cheng_seq_get(void* buffer, int32_t len, int32_t idx, int32_t elem_size) {
-    return cheng_index_ptr(buffer, len, idx, elem_size, __builtin_return_address(0));
+    int32_t actual_elem_size = cheng_seq_elem_size_compat_get(buffer, elem_size);
+    return cheng_index_ptr(buffer, len, idx, actual_elem_size, __builtin_return_address(0));
 }
 
 void* cheng_seq_set(void* buffer, int32_t len, int32_t idx, int32_t elem_size) {
-    return cheng_index_ptr(buffer, len, idx, elem_size, __builtin_return_address(0));
+    int32_t actual_elem_size = cheng_seq_elem_size_compat_get(buffer, elem_size);
+    return cheng_index_ptr(buffer, len, idx, actual_elem_size, __builtin_return_address(0));
 }
 
 void* cheng_ptr_seq_get_value(ChengSeqHeader seq, int32_t idx) {
@@ -3225,6 +3690,57 @@ int32_t cheng_error_info_code_compat(ChengErrorInfoCompat e) {
 
 char* cheng_error_info_msg_compat(ChengErrorInfoCompat e) {
     return e.msg;
+}
+
+WEAK void cheng_error_info_bridge_ok(void* out_raw) {
+    if (!out_raw) {
+        return;
+    }
+    ChengErrorInfoBridgeCompat* out = (ChengErrorInfoBridgeCompat*)out_raw;
+    out->code = 0;
+    out->msg = cheng_str_bridge_empty();
+}
+
+WEAK void cheng_error_info_bridge_new(void* out_raw, ChengStrBridge msg) {
+    if (!out_raw) {
+        return;
+    }
+    ChengErrorInfoBridgeCompat* out = (ChengErrorInfoBridgeCompat*)out_raw;
+    out->code = 0;
+    out->msg = msg;
+}
+
+WEAK void cheng_error_info_bridge_copy(void* out_raw, int32_t code, ChengStrBridge msg) {
+    if (!out_raw) {
+        return;
+    }
+    ChengErrorInfoBridgeCompat* out = (ChengErrorInfoBridgeCompat*)out_raw;
+    out->code = code;
+    out->msg = msg;
+}
+
+WEAK void cheng_error_info_bridge_copy_from(void* out_raw, ChengErrorInfoBridgeCompat src) {
+    if (!out_raw) {
+        return;
+    }
+    ChengErrorInfoBridgeCompat* out = (ChengErrorInfoBridgeCompat*)out_raw;
+    *out = src;
+}
+
+WEAK int32_t cheng_error_info_bridge_code(ChengErrorInfoBridgeCompat src) {
+    return src.code;
+}
+
+WEAK void cheng_error_info_bridge_msg_into(void* out_raw, ChengErrorInfoBridgeCompat src) {
+    if (!out_raw) {
+        return;
+    }
+    ChengStrBridge* out = (ChengStrBridge*)out_raw;
+    *out = src.msg;
+}
+
+WEAK ChengStrBridge cheng_error_info_bridge_msg(ChengErrorInfoBridgeCompat src) {
+    return src.msg;
 }
 
 #define CHENG_FUNC_PTR_SHADOW_CAP 4096u
@@ -3455,11 +3971,12 @@ int32_t cheng_machine_inst_cond(void* inst) {
 
 void* cheng_seq_set_grow(void* seq_ptr, int32_t idx, int32_t elem_size) {
     ChengSeqHeader* seq = (ChengSeqHeader*)seq_ptr;
+    int32_t actual_elem_size = cheng_seq_elem_size_compat_get(seq_ptr, elem_size);
     if (!seq || elem_size <= 0) {
-        return cheng_index_ptr(NULL, 0, idx, elem_size, __builtin_return_address(0));
+        return cheng_index_ptr(NULL, 0, idx, actual_elem_size, __builtin_return_address(0));
     }
     if (idx < 0) {
-        return cheng_index_ptr(seq->buffer, seq->len, idx, elem_size, __builtin_return_address(0));
+        return cheng_index_ptr(seq->buffer, seq->len, idx, actual_elem_size, __builtin_return_address(0));
     }
 
     int32_t need = idx + 1;
@@ -3478,15 +3995,15 @@ void* cheng_seq_set_grow(void* seq_ptr, int32_t idx, int32_t elem_size) {
         }
 
         int32_t old_cap = seq->cap;
-        size_t bytes = (size_t)new_cap * (size_t)elem_size;
+        size_t bytes = (size_t)new_cap * (size_t)actual_elem_size;
         void* new_buf = realloc(seq->buffer, bytes);
         if (!new_buf) {
-            return cheng_index_ptr(seq->buffer, seq->len, idx, elem_size, __builtin_return_address(0));
+            return cheng_index_ptr(seq->buffer, seq->len, idx, actual_elem_size, __builtin_return_address(0));
         }
 
         if (new_cap > old_cap) {
-            size_t old_bytes = (size_t)old_cap * (size_t)elem_size;
-            size_t grow_bytes = (size_t)(new_cap - old_cap) * (size_t)elem_size;
+            size_t old_bytes = (size_t)old_cap * (size_t)actual_elem_size;
+            size_t grow_bytes = (size_t)(new_cap - old_cap) * (size_t)actual_elem_size;
             memset((uint8_t*)new_buf + old_bytes, 0, grow_bytes);
         }
         seq->buffer = new_buf;
@@ -3496,7 +4013,8 @@ void* cheng_seq_set_grow(void* seq_ptr, int32_t idx, int32_t elem_size) {
     if (need > seq->len) {
         seq->len = need;
     }
-    return cheng_index_ptr(seq->buffer, seq->len, idx, elem_size, __builtin_return_address(0));
+    cheng_seq_elem_size_compat_register(seq_ptr, seq->buffer, actual_elem_size);
+    return cheng_index_ptr(seq->buffer, seq->len, idx, actual_elem_size, __builtin_return_address(0));
 }
 
 int32_t cheng_seq_next_cap(int32_t cur_cap, int32_t need_len) {
@@ -4350,12 +4868,14 @@ void* cheng_realloc(void* p, int32_t size) {
 typedef struct {
     mach_vm_address_t addr;
     mach_vm_size_t size;
+    int readonly;
     int valid;
 } cheng_cstr_region_cache_entry;
 
 static cheng_cstr_region_cache_entry cheng_cstr_region_cache[16];
 
-static bool cheng_find_cached_region(uintptr_t raw, mach_vm_address_t* out_addr, mach_vm_size_t* out_size) {
+static bool cheng_find_cached_region(uintptr_t raw, mach_vm_address_t* out_addr, mach_vm_size_t* out_size,
+                                     int* out_readonly) {
     size_t slot = (size_t)((raw >> 12) & 15u);
     cheng_cstr_region_cache_entry* entry = &cheng_cstr_region_cache[slot];
     if (!entry->valid) {
@@ -4368,13 +4888,15 @@ static bool cheng_find_cached_region(uintptr_t raw, mach_vm_address_t* out_addr,
     }
     if (out_addr != NULL) *out_addr = entry->addr;
     if (out_size != NULL) *out_size = entry->size;
+    if (out_readonly != NULL) *out_readonly = entry->readonly;
     return true;
 }
 
-static void cheng_store_cached_region(uintptr_t raw, mach_vm_address_t addr, mach_vm_size_t size) {
+static void cheng_store_cached_region(uintptr_t raw, mach_vm_address_t addr, mach_vm_size_t size, int readonly) {
     size_t slot = (size_t)((raw >> 12) & 15u);
     cheng_cstr_region_cache[slot].addr = addr;
     cheng_cstr_region_cache[slot].size = size;
+    cheng_cstr_region_cache[slot].readonly = readonly;
     cheng_cstr_region_cache[slot].valid = 1;
 }
 #endif
@@ -4386,6 +4908,14 @@ static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* ou
         return true;
     }
     uintptr_t raw = (uintptr_t)s;
+    if (cheng_probably_valid_ptr(s)) {
+        const ChengStrBridge* bridge = (const ChengStrBridge*)s;
+        if (cheng_probably_valid_str_bridge(bridge)) {
+            if (out_ptr != NULL) *out_ptr = bridge->ptr != NULL ? bridge->ptr : "";
+            if (out_len != NULL) *out_len = bridge->ptr != NULL ? (size_t)bridge->len : 0u;
+            return true;
+        }
+    }
     size_t known_len = 0u;
     if (cheng_strmeta_get(s, &known_len)) {
         if (out_ptr != NULL) *out_ptr = s;
@@ -4398,7 +4928,8 @@ static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* ou
     }
     mach_vm_address_t region_addr = 0;
     mach_vm_size_t region_size = 0;
-    if (!cheng_find_cached_region(raw, &region_addr, &region_size)) {
+    int region_readonly = 0;
+    if (!cheng_find_cached_region(raw, &region_addr, &region_size, &region_readonly)) {
         region_addr = (mach_vm_address_t)raw;
         region_size = 0;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
@@ -4420,7 +4951,8 @@ static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* ou
         if ((info.protection & VM_PROT_READ) == 0) {
             return false;
         }
-        cheng_store_cached_region(raw, region_addr, region_size);
+        region_readonly = ((info.protection & VM_PROT_WRITE) == 0) ? 1 : 0;
+        cheng_store_cached_region(raw, region_addr, region_size, region_readonly);
     }
     size_t span = (size_t)((region_addr + region_size) - (mach_vm_address_t)raw);
     size_t limit = span;
@@ -4431,6 +4963,9 @@ static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* ou
         if (s[i] == '\0') {
             if (out_ptr != NULL) *out_ptr = s;
             if (out_len != NULL) *out_len = i;
+            if (region_readonly && i <= (size_t)INT32_MAX) {
+                cheng_strmeta_put(s, (int32_t)i);
+            }
             return true;
         }
     }
@@ -4503,6 +5038,39 @@ int32_t cheng_strlen(char* s) {
     }
     return (n > (size_t)INT32_MAX) ? INT32_MAX : (int32_t)n;
 }
+
+WEAK int32_t cheng_cstrlen(const char* s) {
+    return cheng_strlen((char*)s);
+}
+
+WEAK int32_t min(int32_t a, int32_t b) {
+    return (a < b) ? a : b;
+}
+
+WEAK ChengStrBridge load(const ChengStrBridge* p) {
+    ChengStrBridge out;
+    memset(&out, 0, sizeof(out));
+    if (p != NULL) {
+        out = *p;
+    }
+    return out;
+}
+
+WEAK void cheng_str_bridge_load_into(void* out_raw, const ChengStrBridge* p) {
+    ChengStrBridge* out = (ChengStrBridge*)out_raw;
+    if (out == NULL) {
+        return;
+    }
+    *out = load(p);
+}
+
+WEAK void store(ChengStrBridge* p, ChengStrBridge val) {
+    if (p == NULL) {
+        return;
+    }
+    *p = val;
+}
+
 char* cheng_str_concat(char* a, char* b) {
     const char* sa = "";
     const char* sb = "";

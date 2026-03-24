@@ -15,6 +15,7 @@ type
         keys: str[]
         valStart: int32[]
         valLen: int32[]
+        valCap: int32[]
         states: uint8[] # 0=empty, 1=used
         pool: int32[]
         mask: uint64
@@ -128,11 +129,14 @@ fn hashMapAllocZeroSeq_uint8(cap0: int32): uint8[] =
 
 fn hashMapHash64StrMeta(s: str): uint64 =
     var h: uint64 = (uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
-    if len(s) == 0:
+    let n: int32 = strLenFast(s)
+    if n <= 0:
         return h
-    let n: int32 = len s
+    let dataPtr0: ptr = strDataPtr(s)
+    if dataPtr0 == nil:
+        return h
     for i in 0..<n:
-        let ch: uint64 = uint64(int32(s[i]) & 255)
+        let ch: uint64 = uint64(load(system_ptr_add(dataPtr0, i)))
         h = h ^ ch
         h = h * ((uint64(1099511628) * uint64(1000)) + uint64(211))
     return h
@@ -152,15 +156,19 @@ fn hashMapHash64Ptr(p: int64): uint64 =
 fn hashMapStrEq(cur: str, key: str): bool =
     if cur == key:
         return true
-    if len(cur) == 0 || len(key) == 0:
+    let nKey: int32 = strLenFast(key)
+    if nKey <= 0:
         return false
-    let n: int32 = len key
-    if len cur != n:
+    let nCur: int32 = strLenFast(cur)
+    if nCur != nKey:
         return false
-    for i in 0..<n:
-        if cur[i] != key[i]:
-            return false
-    return true
+    let curPtr: ptr = strDataPtr(cur)
+    let keyPtr: ptr = strDataPtr(key)
+    if curPtr == keyPtr:
+        return true
+    if curPtr == nil || keyPtr == nil:
+        return false
+    return cmpMem(curPtr, keyPtr, int64(nKey)) == 0
 
 fn hashMapStrIntInit(cap0: int32 = 16): HashMapStrInt =
     var m: HashMapStrInt
@@ -379,10 +387,12 @@ fn hashMapStrIntGetOrInsert(m: var HashMapStrInt, key: str, newVal: int32, found
     return hashMapStrIntGetOrInsertExPtr(m, key, newVal, &found)
 
 fn hashMapStrSeqIntInit(cap0: int32 = 16): HashMapStrSeqInt =
-    let cap: int32 = hashMapNextPow2(cap0, 8)
+    let capHint: int32 = (cap0 < 64) ? 64 : cap0
+    let cap: int32 = hashMapNextPow2(capHint, 8)
     let keys: str[] = hashMapAllocZeroSeq_str(cap)
     var valStart: int32[] = hashMapAllocZeroSeq_int32(cap)
     let valLen: int32[] = hashMapAllocZeroSeq_int32(cap)
+    let valCap: int32[] = hashMapAllocZeroSeq_int32(cap)
     let states: uint8[] = hashMapAllocZeroSeq_uint8(cap)
     var pool: int32[]
     for i in 0..<cap:
@@ -390,6 +400,7 @@ fn hashMapStrSeqIntInit(cap0: int32 = 16): HashMapStrSeqInt =
     return HashMapStrSeqInt(keys: keys,
                             valStart: valStart,
                             valLen: valLen,
+                            valCap: valCap,
                             states: states,
                             pool: pool,
                             mask: uint64(cap - 1),
@@ -405,6 +416,7 @@ fn hashMapStrSeqIntClear(m: var HashMapStrSeqInt) =
             m.keys[i] = nil
             m.valStart[i] = -1
             m.valLen[i] = 0
+            m.valCap[i] = 0
             m.states[i] = uint8(0)
         m.pool.len = 0
         m.used = 0
@@ -460,12 +472,33 @@ fn hashMapStrSeqIntStoreSeqAt(m: var HashMapStrSeqInt, slot: int32, val: int32[]
         if val.len <= 0:
             m.valStart[slot] = -1
             m.valLen[slot] = 0
+            m.valCap[slot] = 0
         else:
-            let start: int32 = m.pool.len
+            let oldStart: int32 = m.valStart[slot]
+            let oldCap: int32 = m.valCap[slot]
+            if oldStart >= 0 && oldCap >= val.len && oldStart + oldCap <= m.pool.len:
+                m.valLen[slot] = val.len
+                for i in 0..<val.len:
+                    m.pool[oldStart + i] = val[i]
+                return
+            var newCap: int32 = hashMapStrSeqIntNextCap(val.len, oldCap)
+            if oldStart >= 0 && oldCap > 0 && oldStart + oldCap == m.pool.len:
+                let needLen: int32 = oldStart + newCap
+                if m.pool.buffer == nil || m.pool.cap < needLen:
+                    reserve(m.pool, needLen)
+                setLen(m.pool, needLen)
+                m.valStart[slot] = oldStart
+                m.valLen[slot] = val.len
+                m.valCap[slot] = newCap
+                for i in 0..<val.len:
+                    m.pool[oldStart + i] = val[i]
+                return
+            let start: int32 = hashMapStrSeqIntAllocTail(m, newCap)
             m.valStart[slot] = start
             m.valLen[slot] = val.len
+            m.valCap[slot] = newCap
             for i in 0..<val.len:
-                hashMapAppendInt32(m.pool, val[i])
+                m.pool[start + i] = val[i]
 
 fn hashMapStrSeqIntBuildSeq(m: HashMapStrSeqInt, slot: int32): int32[] =
     var out: int32[]
@@ -477,6 +510,8 @@ fn hashMapStrSeqIntBuildSeq(m: HashMapStrSeqInt, slot: int32): int32[] =
         return hashMapReturnSeqInt32(out)
     if n <= 0:
         return hashMapReturnSeqInt32(out)
+    if start + n > m.pool.len:
+        return hashMapReturnSeqInt32(out)
     setLen(out, n)
     for i in 0..<n:
         out[i] = m.pool[start + i]
@@ -486,11 +521,12 @@ fn hashMapStrSeqIntGrow(m: var HashMapStrSeqInt) =
     let oldKeys: str[] = m.keys
     let oldValStart: int32[] = m.valStart
     let oldValLen: int32[] = m.valLen
+    let oldValCap: int32[] = m.valCap
     let oldStates: uint8[] = m.states
     let oldPool: int32[] = m.pool
     let oldCap: int32 = oldKeys.len
 
-    var newCap: int32 = oldCap * 2
+    var newCap: int32 = (oldCap < 1024) ? (oldCap * 4) : (oldCap * 2)
     if newCap <= 0:
         newCap = 16
     let nextCap: int32 = hashMapNextPow2(newCap, 8)
@@ -507,19 +543,28 @@ fn hashMapStrSeqIntGrow(m: var HashMapStrSeqInt) =
                 let start: int32 = oldValStart[i]
                 let n: int32 = oldValLen[i]
                 if start >= 0 && n > 0:
-                    nextMap.valStart[slot] = nextMap.pool.len
+                    let segCap: int32 = hashMapStrSeqIntNextCap(n, oldValCap[i])
+                    let segStart: int32 = hashMapStrSeqIntAllocTail(nextMap, segCap)
+                    nextMap.valStart[slot] = segStart
                     nextMap.valLen[slot] = n
+                    nextMap.valCap[slot] = segCap
                     for vi in 0..<n:
-                        hashMapAppendInt32(nextMap.pool, oldPool[start + vi])
+                        nextMap.pool[segStart + vi] = oldPool[start + vi]
                 else:
                     nextMap.valStart[slot] = -1
                     nextMap.valLen[slot] = 0
+                    nextMap.valCap[slot] = 0
     m = nextMap
 
 fn hashMapStrSeqIntPutSeq(m: var HashMapStrSeqInt, key: str, val: int32[]) =
     if len(key) > 0 && key != "":
         if m.mask == 0:
             m = hashMapStrSeqIntInit(16)
+        let existingSlot: int32 = hashMapStrSeqIntFindSlotMut(m, key, false)
+        if existingSlot >= 0:
+            m.keys[existingSlot] = key
+            hashMapStrSeqIntStoreSeqAt(m, existingSlot, val)
+            return
         if (m.used + 1) * 10 >= m.keys.len * 7:
             hashMapStrSeqIntGrow(m)
         let slot: int32 = hashMapStrSeqIntFindSlotMut(m, key, true)
@@ -534,6 +579,36 @@ fn hashMapStrSeqIntAdd(m: var HashMapStrSeqInt, key: str, value: int32) =
     if len(key) > 0 && key != "":
         if m.mask == 0:
             m = hashMapStrSeqIntInit(16)
+        let existingSlot: int32 = hashMapStrSeqIntFindSlotMut(m, key, false)
+        if existingSlot >= 0:
+            m.keys[existingSlot] = key
+            let oldStart: int32 = m.valStart[existingSlot]
+            let oldLen: int32 = m.valLen[existingSlot]
+            let oldCap: int32 = m.valCap[existingSlot]
+            if oldStart >= 0 && oldCap > oldLen && oldStart + oldCap <= m.pool.len:
+                m.pool[oldStart + oldLen] = value
+                m.valLen[existingSlot] = oldLen + 1
+                return
+            let newLen: int32 = oldLen + 1
+            let newCap: int32 = hashMapStrSeqIntNextCap(newLen, oldCap)
+            if oldStart >= 0 && oldCap > 0 && oldStart + oldCap == m.pool.len:
+                let needLen: int32 = oldStart + newCap
+                if m.pool.buffer == nil || m.pool.cap < needLen:
+                    reserve(m.pool, needLen)
+                setLen(m.pool, needLen)
+                m.pool[oldStart + oldLen] = value
+                m.valLen[existingSlot] = newLen
+                m.valCap[existingSlot] = newCap
+                return
+            let newStart: int32 = hashMapStrSeqIntAllocTail(m, newCap)
+            if oldStart >= 0 && oldLen > 0 && oldStart + oldLen <= m.pool.len:
+                for i in 0..<oldLen:
+                    m.pool[newStart + i] = m.pool[oldStart + i]
+            m.pool[newStart + oldLen] = value
+            m.valStart[existingSlot] = newStart
+            m.valLen[existingSlot] = newLen
+            m.valCap[existingSlot] = newCap
+            return
         if (m.used + 1) * 10 >= m.keys.len * 7:
             hashMapStrSeqIntGrow(m)
         let slot: int32 = hashMapStrSeqIntFindSlotMut(m, key, true)
@@ -542,19 +617,11 @@ fn hashMapStrSeqIntAdd(m: var HashMapStrSeqInt, key: str, value: int32) =
                 m.used = m.used + 1
                 m.states[slot] = uint8(1)
                 m.keys[slot] = key
-                m.valStart[slot] = m.pool.len
+                let start: int32 = hashMapStrSeqIntAllocTail(m, 4)
+                m.valStart[slot] = start
                 m.valLen[slot] = 1
-                hashMapAppendInt32(m.pool, value)
-            else:
-                let oldStart: int32 = m.valStart[slot]
-                let oldLen: int32 = m.valLen[slot]
-                let newStart: int32 = m.pool.len
-                if oldStart >= 0 && oldLen > 0:
-                    for i in 0..<oldLen:
-                        hashMapAppendInt32(m.pool, m.pool[oldStart + i])
-                hashMapAppendInt32(m.pool, value)
-                m.valStart[slot] = newStart
-                m.valLen[slot] = oldLen + 1
+                m.valCap[slot] = 4
+                m.pool[start] = value
 
 fn hashMapStrSeqIntGet(m: HashMapStrSeqInt, key: str): int32[] =
     var found: bool = false
@@ -576,6 +643,31 @@ fn `[]`(m: HashMapStrSeqInt, key: str): int32[] =
 
 fn `[]=`(m: var HashMapStrSeqInt, key: str, val: int32[]) =
     hashMapStrSeqIntPutSeq(m, key, val)
+
+fn hashMapStrSeqIntNextCap(needLen0: int32, curCap0: int32): int32 =
+    if needLen0 <= 0:
+        return 0
+    var cap: int32 = curCap0
+    if cap < 4:
+        cap = 4
+    while cap < needLen0:
+        let nextCap: int32 = cap * 2
+        if nextCap <= cap:
+            return needLen0
+        cap = nextCap
+    return cap
+
+fn hashMapStrSeqIntAllocTail(m: var HashMapStrSeqInt, capLen: int32): int32 =
+    if capLen <= 0:
+        return -1
+    let start: int32 = m.pool.len
+    let needLen: int32 = start + capLen
+    if needLen < start:
+        panic "hashmaps: seq-int pool overflow"
+    if m.pool.buffer == nil || m.pool.cap < needLen:
+        reserve(m.pool, needLen)
+    setLen(m.pool, needLen)
+    return start
 
 fn hashMapPtrIntInit(cap0: int32 = 1024): HashMapPtrInt =
     var m: HashMapPtrInt

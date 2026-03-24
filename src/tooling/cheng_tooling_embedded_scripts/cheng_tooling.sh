@@ -165,13 +165,13 @@ if [ "$need_build" = "1" ]; then
     fi
   fi
   # tooling launcher itself uses argv pointer entry; build it under non-C-ABI pointer exemption.
-  STAGE1_NO_POINTERS_NON_C_ABI=0 \
-  STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc \
-    --in:"$src" \
-    --out:"$bin" \
-    --stage0:"$build_driver" \
-    --linker:"$tooling_linker"
+  env \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    BACKEND_DRIVER="$build_driver" \
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng \
+    "$src" \
+    --out:"$bin"
 fi
 
 export TOOLING_ROOT="$root"

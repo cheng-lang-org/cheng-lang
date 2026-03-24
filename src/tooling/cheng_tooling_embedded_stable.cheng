@@ -346,18 +346,7 @@ fn toolingEmbeddedScriptBody(id: str): str =
         return toolingEmbeddedJoinChunks(chunks)
     if id == "build_backend_driver":
         var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nusage() {\n  cat <<'USAGE'\nUsage:\n  src/tooling/build_backend_driver.sh [--name:<binName>]\n\nBuilds backend driver via stage0 selfhost rebuild:\n  1) rebuild from a stage0 backend driver\n  2) no seed/tar copy path\n\nOutput:\n  <binName> (default: artifacts/backend_driver/cheng)\n\nEnv:\n  BACKEND_BUILD_DRIVER_LINKER=system (default system; accepts self|system)\n  BACKEND_BUILD_DRIVER_SELFHOST=1    (default 1)\n  BACKEND_BUILD_DRIVER_STAGE0=<path> (optional stage driver override)\n  BACKEND_BUILD_DRIVER_MULTI=0       (default 0; serial incremental)\n  BACKEND_BUILD_DRIVER_MULTI_FORCE=0 (default 0)\n  BACKEND_BUILD_DRIVER_INCREMENTAL=1 (default 1)\n  BACKEND_BUILD_DRIVER_JOBS=0        (default 0=auto)\n  BACKEND_BUILD_DRIVER_TIMEOUT=60    (default 60s per compile attempt)\n  BACKEND_BUILD_DRIVER_SMOKE=0       (default 0; set 1 to run stage1 compile smoke)\n  BACKEND_BUILD_DRIVER_REQUIRE_SMOKE=1 (default 1; require smoke for freshly rebuilt driver)\n  BACKEND_BUILD_DRIVER_FRONTEND=stage1 (default stage1; frontend used for backend_driver selfbuild)\n  BACKEND_BUILD_DRIVER_SMOKE_TARGETS=<csv> (default host)\n  BACKEND_BUILD_DRIVER_MAX_STAGE0_ATTEMPTS=3 (default 3; 0=all candidates)\n  BACKEND_BUILD_DRIVER_FORCE=0       (default 0; set 1 to skip reuse and force rebuild)\n  BACKEND_BUILD_DRIVER_NO_RECOVER=0  (default 0; set 1 to fail hard when rebuild fails)\n  BACKEND_IR=uir                     (default uir)\n  GENERIC_MODE=dict                  (default dict)\n  GENERIC_SPEC_BUDGET=0              (default 0)\nUSAGE\n}\n\nname=\"${BACKEND_LOCAL_DRIVER_REL:-artifacts/backend_driver/cheng}\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --help|-h)\n      usage\n      exit 0\n     ")
-        add(chunks, " ;;\n    --name:*)\n      name=\"${1#--name:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nhost_os=\"$(uname -s 2>/dev/null || echo unknown)\"\nhost_arch=\"$(uname -m 2>/dev/null || echo unknown)\"\n\ntarget=\"\"\ncase \"$host_os/$host_arch\" in\n  Darwin/arm64)\n    target=\"arm64-apple-darwin\"\n    if ! command -v codesign >/dev/null 2>&1; then\n      echo \"[Error] build_backend_driver requires codesign on Darwin/arm64\" 1>&2\n      exit 2\n    fi\n    ;;\n  Linux/aarch64|Linux/arm64)\n    target=\"aarch64-unknown-linux-gnu\"\n    ;;\n  *)\n    echo \"build_backend_driver skip: unsupported host=$host_os/$host_arch\" 1>&2\n    exit 2\n    ;;\nesac\n\nlinker_mode=\"${BACKEND_BUILD_DRIVER_LINKER:-system}\"\ncase \"$linker_mode\" in\n  self|system)\n    ;;\n  *)\n    echo \"[Error] invalid BACKEND_BUILD_DRIVER_LINKER: $linker_mode (expected self|system)\" 1>&2\n    exit 2\n    ;;\nesac\n\nrun_with_timeout() {\n  seconds=\"$1\"\n  shift\n  perl -e '\n    use POSIX qw(setsid WNOHANG);\n    my $timeout = shift;\n    my $pid = fork();\n    if (!defined $pid) { exit 127; }\n    if ($pid == 0) {\n      setsid();\n      exec @ARGV;\n      exit 127;\n    }\n    my $end = time + $timeout;\n    while (1) {\n      my $res = waitpid($pid, WNOHANG);\n      if ($res == $pid) {\n        my $status = $?;\n        if (($status & 127) != 0) {\n          exit(128 + ($status & 127));\n        }\n        exit($status >> 8);\n      }\n      if (time >= $end) {\n        kill \"TERM\", -$pid;\n        kill \"TERM\", $pid;\n        my $grace_end = time + 1;\n        while (time < $grace_end) {\n          my $r = waitpid($pid,")
-        add(chunks, " WNOHANG);\n          if ($r == $pid) {\n            my $status = $?;\n            if (($status & 127) != 0) {\n              exit(128 + ($status & 127));\n            }\n            exit($status >> 8);\n          }\n          select(undef, undef, undef, 0.1);\n        }\n        kill \"KILL\", -$pid;\n        kill \"KILL\", $pid;\n        exit 124;\n      }\n      select(undef, undef, undef, 0.1);\n    }\n  ' \"$seconds\" \"$@\"\n}\n\ndriver_sanity_ok() {\n  bin=\"$1\"\n  if [ ! -x \"$bin\" ]; then\n    return 1\n  fi\n  cmd=\"$bin\"\n  case \"$cmd\" in\n    /*|./*|../*) ;;\n    *) cmd=\"./$cmd\" ;;\n  esac\n  set +e\n  run_with_timeout 5 \"$cmd\" --help >/dev/null 2>&1\n  status=$?\n  set -e\n  case \"$status\" in\n    0|1|2) return 0 ;;\n  esac\n  return 1\n}\n\ndriver_stage1_smoke_ok() {\n  bin=\"$1\"\n  if [ ! -x \"$bin\" ]; then\n    return 1\n  fi\n  smoke_src=\"$root/tests/cheng/backend/fixtures/return_add.cheng\"\n  if [ ! -f \"$smoke_src\" ]; then\n    return 0\n  fi\n  smoke_targets=\"${BACKEND_BUILD_DRIVER_SMOKE_TARGETS:-host}\"\n  old_ifs=\"$IFS\"\n  IFS=','\n  for smoke_target in $smoke_targets; do\n    IFS=\"$old_ifs\"\n    case \"$smoke_target\" in\n      \"\"|host|auto)\n        smoke_target=\"$target\"\n        ;;\n    esac\n    safe_target=\"$(printf '%s' \"$smoke_target\" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_')\"\n    smoke_out=\"$root/chengcache/.build_backend_driver.stage1_smoke.${safe_target}.bin\"\n    rm -f \"$smoke_out\" \"$smoke_out.tmp\" \"$smoke_out.tmp.linkobj\" \"$smoke_out.o\"\n    rm -rf \"$smoke_out.objs\" \"$smoke_out.objs.lock\"\n    set +e\n    run_with_timeout 40 env \\\n      MM=orc \\\n      STAGE1_NO_POINTERS_NON_C_ABI=0 \\\n      STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \\\n      BACKEND_VALIDATE=0 \\\n      STAGE1_SEM_FIXED_0=0 ")
-        add(chunks, "\\\n      STAGE1_SKIP_CPROFILE=1 \\\n      GENERIC_MODE=dict \\\n      GENERIC_SPEC_BUDGET=0 \\\n      STAGE1_OWNERSHIP_FIXED_0=0 \\\n      BACKEND_LINKER=self \\\n      BACKEND_NO_RUNTIME_C=1 \\\n      BACKEND_RUNTIME_OBJ= \\\n      BACKEND_EMIT=exe \\\n      BACKEND_TARGET=\"$smoke_target\" \\\n      BACKEND_FRONTEND=stage1 \\\n      BACKEND_INPUT=\"$smoke_src\" \\\n      BACKEND_OUTPUT=\"$smoke_out\" \\\n      \"$bin\" >/dev/null 2>&1\n    status=$?\n    set -e\n    if [ \"$status\" -ne 0 ] || [ ! -s \"$smoke_out\" ]; then\n      IFS=\"$old_ifs\"\n      return 1\n    fi\n  done\n  IFS=\"$old_ifs\\n  return 0\n}\n\nbackend_sources_newer_than() {\n  out=\"$1\"\n  [ -e \"$out\" ] || return 0\n  search_dirs=\"\"\n  for d in src/backend src/stage1 src/std src/core src/system; do\n    if [ -d \"$d\" ]; then\n      search_dirs=\"$search_dirs $d\"\n    fi\n  done\n  if [ \"$search_dirs\" = \"\" ]; then\n    return 1\n  fi\n  # shellcheck disable=SC2086\n  find $search_dirs -type f \\( -name '*.cheng' -o -name '*.c' -o -name '*.h' \\) \\\n    -newer \"$out\" -print -quit | grep -q .\n}\n\nto_abs() {\n  p=\"$1\"\n  case \"$p\" in\n    /*) ;;\n    *) p=\"$root/$p\" ;;\n  esac\n  d=\"$(dirname -- \"$p\")\"\n  b=\"$(basename -- \"$p\")\"\n  if [ -d \"$d\" ]; then\n    d=\"$(CDPATH= cd -- \"$d\" && pwd)\"\n  fi\n  printf \"%s/%s\\n\" \"$d\" \"$b\"\n}\n\nclear_stale_lock_dir() {\n  lock_dir=\"$1\"\n  if [ \"$lock_dir\" = \"\" ] || [ ! -d \"$lock_dir\" ]; then\n    return 0\n  fi\n  owner_file=\"$lock_dir/owner.pid\"\n  if [ -f \"$owner_file\" ]; then\n    owner_pid=\"$(cat \"$owner_file\" 2>/dev/null || true)\"\n    if [ \"$owner_pid\" != \"\" ] && kill -0 \"$owner_pid\" 2>/dev/null; then\n      return 0\n    fi\n  fi\n  rm -rf \"$lock_dir\" 2>/dev/null || true\n  return 0\n}\n\nru")
-        add(chunks, "ntime_obj_has_required_symbols() {\n  obj=\"$1\"\n  if [ ! -f \"$obj\" ]; then\n    return 1\n  fi\n  if ! command -v nm >/dev/null 2>&1; then\n    return 0\n  fi\n  set +e\n  nm_out=\"$(nm -g \"$obj\" 2>/dev/null)\"\n  status=\"$?\"\n  set -e\n  if [ \"$status\" -ne 0 ] || [ \"$nm_out\" = \"\" ]; then\n    return 1\n  fi\n  case \"$nm_out\" in\n    *\" _reserve_ptr_void\"*|*\" T _reserve_ptr_void\"*|*\" t _reserve_ptr_void\"*)\n      return 0\n      ;;\n  esac\n  return 1\n}\n\nmkdir -p chengcache\nstage0_candidates_file=\"$root/chengcache/.build_backend_driver.stage0_candidates.$$\"\n: >\"$stage0_candidates_file\"\n\ncleanup_stage0_candidates_file() {\n  rm -f \"$stage0_candidates_file\" 2>/dev/null || true\n}\ntrap cleanup_stage0_candidates_file EXIT INT TERM\n\nappend_stage0_candidate() {\n  cand=\"$1\"\n  if [ \"$cand\" = \"\" ]; then\n    return 0\n  fi\n  abs=\"$(to_abs \"$cand\")\"\n  if ! driver_sanity_ok \"$abs\"; then\n    return 0\n  fi\n  if grep -Fx -- \"$abs\" \"$stage0_candidates_file\" >/dev/null 2>&1; then\n    return 0\n  fi\n  printf '%s\\n' \"$abs\" >>\"$stage0_candidates_file\"\n  return 0\n}\n\nstage0_explicit=\"${BACKEND_BUILD_DRIVER_STAGE0:-}\"\nstage0_strict=\"0\"\nif [ \"$stage0_explicit\" != \"\" ]; then\n  stage0_abs=\"$(to_abs \"$stage0_explicit\")\"\n  if ! driver_sanity_ok \"$stage0_abs\"; then\n    if [ -x ")
-        add(chunks, "\"$stage0_abs\" ]; then\n      echo \"[Error] stage0 driver is not runnable: $stage0_abs\" 1>&2\n    else\n      echo \"[Error] stage0 driver is not executable: $stage0_abs\" 1>&2\n    fi\n    exit 1\n  fi\n  printf '%s\\n' \"$stage0_abs\" >\"$stage0_candidates_file\"\n  stage0_strict=\"1\"\nelse\n  append_stage0_candidate \"${BACKEND_DRIVER:-}\"\n  append_stage0_candidate \"$root/artifacts/backend_selfhost_self_obj/cheng.stage2\"\n  append_stage0_candidate \"$root/artifacts/backend_selfhost_self_obj/cheng_stage0_default\"\n  append_stage0_candidate \"$root/artifacts/backend_selfhost_self_obj/cheng_stage0_prod\"\n  append_stage0_candidate \"$root/artifacts/backend_selfhost_self_obj/cheng.stage2\"\n  append_stage0_candidate \"$root/artifacts/backend_selfhost_self_obj/cheng.stage1\"\n  append_stage0_candidate \"$root/artifacts/backend_driver/cheng\"\n  append_stage0_candidate \"$root/dist/releases/current/cheng\"\n  append_stage0_candidate \"$root/cheng\"\nfi\n\nif [ ! -s \"$stage0_candidates_file\" ]; then\n  echo \"[Error] build_backend_driver requires stage0 driver (set BACKEND_BUILD_DRIVER_STAGE0 or BACKEND_DRIVER)\" 1>&2\n  exit 1\nfi\n\nselfhost=\"${BACKEND_BUILD_DRIVER_SELFHOST:-1}\"\nif [ \"$selfhost\" = \"0\" ]; then\n  echo \"[Error] BACKEND_BUILD_DRIVER_SELFHOST=0 is not supported (seed copy path removed)\" 1>&2\n  exit 2\nfi\n\ndriver_multi=\"${BACKEND_BUILD_DRIVER_MULTI:-0}\"\ndriver_multi_force=\"${BACKEND_BUILD_DRIVER_MULTI_FORCE:-0}\"\ndriver_incremental=\"${BACKEND_BUILD_DRIVER_INCREMENTAL:-1}\"\ndriver_jobs=\"${BACKEND_BUILD_DRIVER_JOBS:-0}\"\nbuild_timeout=\"${BACKEND_BUILD_DRIVER_TIMEOUT:-60}\"\ndriver_smoke=\"${BACKEND_BUILD_DRIVER_SMOKE:-0}\"\ndriver_require_smoke=\"${BACKEND_BUILD_DRIVER_REQUIRE_SMOKE:-1}\"\ndriver_frontend=\"${BACKEND_BUILD_DRIVER_FRONTEND:-sta")
-        add(chunks, "ge1}\"\nmax_stage0_attempts=\"${BACKEND_BUILD_DRIVER_MAX_STAGE0_ATTEMPTS:-3}\"\nbuild_force=\"${BACKEND_BUILD_DRIVER_FORCE:-0}\"\nbuild_no_recover=\"${BACKEND_BUILD_DRIVER_NO_RECOVER:-0}\"\ncase \"$max_stage0_attempts\" in\n  ''|*[!0-9]*)\n    max_stage0_attempts=3\n    ;;\nesac\nmm=\"${BACKEND_BUILD_DRIVER_MM:-${MM:-orc}}\"\nstage0_compat_allowed=\"${BACKEND_BUILD_DRIVER_STAGE0_COMPAT:-0}\"\nif [ \"$stage0_compat_allowed\" != \"0\" ]; then\n  echo \"[Error] build_backend_driver removed BACKEND_BUILD_DRIVER_STAGE0_COMPAT (only 0 is supported)\" 1>&2\n  exit 2\nfi\nif [ \"${BACKEND_IR:-}\" = \"\" ]; then\n  export BACKEND_IR=uir\nfi\nif [ \"${GENERIC_MODE:-}\" = \"\" ]; then\n  export GENERIC_MODE=dict\nfi\nif [ \"${GENERIC_SPEC_BUDGET:-}\" = \"\" ]; then\n  export GENERIC_SPEC_BUDGET=0\nfi\nif [ \"${STAGE1_SEM_FIXED_0:-}\" = \"\" ]; then\n  export STAGE1_SEM_FIXED_0=0\nfi\nif [ \"${STAGE1_OWNERSHIP_FIXED_0:-}\" = \"\" ]; then\n  export STAGE1_OWNERSHIP_FIXED_0=0\nfi\nif [ \"${STAGE1_SKIP_CPROFILE:-}\" = \"\" ]; then\n  export STAGE1_SKIP_CPROFILE=1\nfi\n\ncase \"$name\" in\n  /*)\n    name_abs=\"$name\"\n    ;;\n  *)\n    name_abs=\"$root/$name\"\n    ;;\nesac\nname_obj_abs=\"${name_abs}.o\"\nname_dir=\"$(dirname \"$name_abs\")\"\nif [ \"$name_dir\" != \"\" ] && [ ! -d \"$name_dir\" ]; then\n  mkdir -p \"$name_dir\"\nfi\ntmp_bin_abs=\"${name_abs}.tmp\"\ntmp_obj_abs=\"${tmp_bin_abs}.o\"\n\nclear_stale_lock_dir \"${name_abs}.objs.lock\"\nclear_stale_lock_dir \"${tmp_bin_abs}.objs.lock\"\n\nif [ \"$build_force\" != \"1\" ] && [ -x \"$name_abs\" ]; then\n  if ! backend_sources_newer_than \"$name_abs\" && driver_sanity_ok \"$name_abs\"; then\n    if [ \"$driver_smoke\" = \"1\" ] && ! driver_stage1_smoke_ok \"$name_abs\"; then\n      :\n    else\n      if [ \"$driver_smoke\" ")
-        add(chunks, "= \"1\" ]; then\n        echo \"build_backend_driver ok (reuse+smoke)\"\n      else\n        echo \"build_backend_driver ok (reuse)\"\n      fi\n      exit 0\n    fi\n  fi\nfi\n\nruntime_src=\"src/std/system_helpers_backend.cheng\"\nruntime_obj=\"chengcache/system_helpers.backend.cheng.${target}.o\"\nruntime_obj_abs=\"$root/$runtime_obj\"\nlog_root=\"$root/chengcache/build_backend_driver\"\nattempt_report=\"$log_root/attempts.$$.tsv\"\nmodule_cache_path=\"$root/chengcache/build_backend_driver.module_cache.tsv\"\nmkdir -p \"$log_root\"\n: >\"$attempt_report\"\n\nstage0_tag() {\n  raw=\"$1\"\n  tag=\"$(printf '%s' \"$raw\" | tr '/: ' '___' | tr -cd 'A-Za-z0-9._-')\"\n  if [ \"$tag\" = \"\" ]; then\n    tag=\"stage0\"\n  fi\n  printf '%s\\n' \"$tag\"\n}\n\nrun_driver_compile_once() {\n  compiler=\"$1\"\n  out_bin=\"$2\"\n  multi_now=\"$3\"\n  multi_force_now=\"$4\"\n  log_file=\"$5\"\n  if [ \"$linker_mode\" = \"self\" ]; then\n    run_with_timeout \"$build_timeout\" env \\\n      MM=\"$mm\" \\\n      STAGE1_SEM_FIXED_0=\"0\" \\\n  ")
-        add(chunks, "    STAGE1_SEM_FIXED_0=\"0\" \\\n      STAGE1_OWNERSHIP_FIXED_0=\"0\" \\\n      STAGE1_OWNERSHIP_FIXED_0=\"0\" \\\n      STAGE1_SKIP_CPROFILE=\"${STAGE1_SKIP_CPROFILE:-1}\" \\\n      STAGE1_SKIP_CPROFILE=\"${STAGE1_SKIP_CPROFILE:-${STAGE1_SKIP_CPROFILE:-1}}\" \\\n      STAGE1_AUTO_SYSTEM=0 \\\n      BACKEND_MULTI=\"$multi_now\" \\\n      BACKEND_MULTI_FORCE=\"$multi_force_now\" \\\n      BACKEND_INCREMENTAL=\"$driver_incremental\" \\\n      BACKEND_JOBS=\"$driver_jobs\" \\\n      BACKEND_VALIDATE=0 \\\n      BACKEND_LINKER=self \\\n      BACKEND_NO_RUNTIME_C=1 \\\n      BACKEND_RUNTIME_OBJ=\"$runtime_obj_abs\" \\\n      BACKEND_LDFLAGS=\"$driver_ldflags\" \\\n      BACKEND_EMIT=exe \\\n      BACKEND_TARGET=\"$target\" \\\n      BACKEND_FRONTEND=\"$driver_frontend\" \\\n      BACKEND_INPUT=\"src/backend/tooling/backend_driver.cheng\" \\\n      BACKEND_OUTPUT=\"$out_bin\" \\\n      \"$compiler\" >>\"$log_file\" 2>&1\n    return\n  fi\n  run_with_timeout \"$build_timeout\" env \\\n    MM=\"$mm\" \\\n    STAGE1_SEM_FIXED_0=\"0\" \\\n    STAGE1_SEM_FIXED_0=\"0\" \\\n    STAGE1_OWNERSHIP_FIXED_0=\"0\" \\\n    STAGE1_OWNERSHIP_FIXED_0=\"0\" \\\n    STAGE1_SKIP_CPROFILE=\"${STAGE1_SKIP_CPROFILE:-1}\" \\\n    STAGE1_SKIP_CPROFILE=\"${STAGE1_SKIP_CPROFILE:-${STAGE1_SKIP_CPROFILE:-1}}\" \\\n    STAGE1_AUTO_SYSTEM=0 \\\n    BACKEND_MULTI=\"$multi_now\" \\\n    BACKEND_MULTI_FORCE=\"$multi_force_now\" \\\n    BACKEND_INCREMENTAL=\"$driver_incremental\" \\\n    BACKEND_JOBS=\"$driver_jobs\" \\\n    BACKEND_VALIDATE=0 \\\n    BACKEND_LINKER=system \\\n    BACKEND_NO_RUNTIME_C=0 \\\n    BACKEND_RUNTIME_OBJ= \\\n    BACKEND_LDFLAGS=\"$driver_ldflags\" \\\n    BACKEND_EMIT=exe \\\n    BACKEND_TARGET=\"$target\" \\\n    BACKEND_FRONTEND=\"$driver_frontend\" \\\n    BACKEND_INPUT=\"src/bac")
-        add(chunks, "kend/tooling/backend_driver.cheng\" \\\n    BACKEND_OUTPUT=\"$out_bin\" \\\n    \"$compiler\" >>\"$log_file\" 2>&1\n}\n\nattempt_build_with_stage0() {\n  stage0=\"$1\"\n  attempt_idx=\"$2\"\n  stage0_tag_s=\"$(stage0_tag \"$stage0\")\"\n  attempt_log=\"$log_root/attempt_${attempt_idx}_${stage0_tag_s}.log\"\n  : >\"$attempt_log\"\n  printf 'stage0=%s\\n' \"$stage0\" >>\"$attempt_log\"\n\n  runtime_needs_rebuild=\"0\"\n  if [ \"$linker_mode\" = \"self\" ]; then\n    if [ ! -f \"$runtime_obj_abs\" ]; then\n      runtime_needs_rebuild=\"1\"\n    elif ! runtime_obj_has_required_symbols \"$runtime_obj_abs\"; then\n      runtime_needs_rebuild=\"1\"\n    fi\n  fi\n  if [ \"$runtime_needs_rebuild\" = \"1\" ]; then\n    printf 'missing runtime_obj=%s (self-link requires prebuilt runtime object)\\n' \"$runtime_obj_abs\" >>\"$attempt_log\"\n    printf 'hint: prepare runtime object before driver selfbuild (source=%s)\\n' \"$runtime_src\" >>\"$attempt_log\"\n    attempt_status=1\n    return 1\n  fi\n\n  rm -f \"$tmp_bin_abs\" \"$tmp_obj_abs\"\n  set +e\n  run_driver_compile_once \"$stage0\" \"$tmp_bin_abs\" \"$driver_multi\" \"$driver_multi_force\" \"$attempt_log\"\n  status=$?\n  set -e\n  if [ \"$status\" -ne 0 ] && [ \"$driver_multi\" != \"0\" ] && [ \"$status\" -ne 124 ]; then\n    rm -f \"$tmp_bin_abs\" \"$tmp_obj_abs\"\n    set +e\n    run_driver_compile_once \"$stage0\" \"$tmp_bin_abs\" \"0\" \"0\" \"$attempt_log\"\n    status=$?\n    set -e\n  fi\n  if [ \"$status\" -eq 0 ] && [ -x \"$tmp_bin_abs\" ] && driver_sanity_ok \"$tmp_bin_abs\"; then\n    smoke_required=\"$driver_require_smoke\"\n    if [ \"$driver_smoke\" = \"1\" ]; then\n      smoke_required=\"1\"\n    fi\n    smoke_ok=\"1\"\n    if [ \"$smoke_required\" = \"1\" ] && ! driver_stage1_smoke_ok \"$tmp_bin_abs\"; then\n")
-        add(chunks, "      smoke_ok=\"0\"\n    fi\n    if [ \"$smoke_ok\" = \"1\" ]; then\n      mode_tag=\"system_link\"\n      if [ \"$linker_mode\" = \"self\" ]; then\n        mode_tag=\"self_link\"\n      fi\n      mv \"$tmp_bin_abs\" \"$name_abs\"\n      if [ -s \"$tmp_obj_abs\" ]; then\n        mv \"$tmp_obj_abs\" \"$name_obj_abs\"\n      fi\n      if [ \"$smoke_required\" = \"1\" ]; then\n        echo \"build_backend_driver ok (selfhost_${mode_tag}+smoke; stage0=$stage0)\"\n      else\n        echo \"build_backend_driver ok (selfhost_${mode_tag}; stage0=$stage0)\"\n      fi\n      return 0\n    fi\n    attempt_status=86\n    rm -f \"$tmp_bin_abs\" \"$tmp_obj_abs\"\n    status=\"$attempt_status\"\n  else\n    attempt_status=\"$status\"\n    rm -f \"$tmp_bin_abs\" \"$tmp_obj_abs\"\n    if [ \"$attempt_status\" -eq 0 ]; then\n      attempt_status=1\n    fi\n  fi\n\n  rm -f \"$tmp_bin_abs\" \"$tmp_obj_abs\"\n  return 1\n}\n\nattempt_idx=0\nwhile IFS= read -r stage0; do\n  if [ \"$stage0\" = \"\" ]; then\n    continue\n  fi\n  attempt_idx=$((attempt_idx + 1))\n  if [ \"$max_stage0_attempts\" -gt 0 ] && [ \"$attempt_idx\" -gt \"$max_stage0_attempts\" ]; then\n    break\n  fi\n  attempt_status=1\n  attempt_log=\"\"\n  if attempt_build_with_stage0 \"$stage0\" \"$attempt_idx\"; then\n    exit 0\n  fi\n  printf '%s\\tstatus=%s\\tlog=%s\\n' \"$stage0\" \"$attempt_status\" \"$attempt_log\" >>\"$attempt_report\"\n  if [ \"$stage0_strict\" = \"1\" ]; then\n    break\n  fi\ndone <\"$stage0_candidates_file\"\n\necho \"[Error] build_backend_driver selfhost_${linker_mode}_link failed for all stage0 candidates\" 1>&2\nif [ -s \"$attempt_report\" ]; then\n  echo \"  attempts:\" 1>&2\n  sed 's/^/  - /' \"$attempt_report\" 1>&2\nfi\nif [ \"$build_no_recover\" = \"1\" ]; then\n  echo \"  hint: hard-fail en")
-        add(chunks, "abled (BACKEND_BUILD_DRIVER_NO_RECOVER=1), no fallback to existing driver\" 1>&2\n  echo \"  hint: inspect logs under $log_root\" 1>&2\n  exit 1\nfi\nrecover_smoke_required=\"$driver_require_smoke\"\nif [ \"$driver_smoke\" = \"1\" ]; then\n  recover_smoke_required=\"1\"\nfi\nif [ -x \"$name_abs\" ] && driver_sanity_ok \"$name_abs\"; then\n  recover_ok=\"1\"\n  if [ \"$recover_smoke_required\" = \"1\" ] && ! driver_stage1_smoke_ok \"$name_abs\"; then\n    recover_ok=\"0\"\n  fi\n  if [ \"$recover_ok\" = \"1\" ]; then\n    echo \"[Warn] build_backend_driver rebuild failed; keep existing healthy driver: $name_abs\" 1>&2\n    exit 0\n  fi\nfi\necho \"  hint: inspect logs under $log_root\" 1>&2\nexit 1\n")
+        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"${TOOLING_ROOT:-$(CDPATH= cd -- \"$(dirname -- \"$0\")/../../..\" && pwd)}\"\ncd \"$root\"\n\ntool=\"$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh\"\nexec sh \"$tool\" build_backend_driver \"$@\"\n")
         return toolingEmbeddedJoinChunks(chunks)
     if id == "build_backend_mem_contract":
         var chunks: str[] = []
@@ -432,130 +421,1501 @@ fn toolingEmbeddedScriptBody(id: str): str =
         return "#!/usr/bin/env sh\n:\nset -euo pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/chengb.sh <file.cheng> [legacy chengb flags...]\n\nNotes:\n  - `chengb.sh` is now a compatibility wrapper around `src/tooling/chengc.sh`.\n  - Legacy flags (`--emit/--frontend/--out/--multi/--pkg-roots/--run`) are forwarded.\n  - When `--out` is omitted, default output stays under `artifacts/chengb/` for compatibility.\nEOF\n}\n\nif [ \"${1:-}\" = \"\" ] || [ \"${1:-}\" = \"--help\" ] || [ \"${1:-}\" = \"-h\" ]; then\n  usage\n  exit 0\nfi\n\nin=\"$1\"\nshift || true\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nemit=\"exe\"\nhas_out=\"0\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --emit:*)\n      emit=\"${arg#--emit:}\"\n      ;;\n    --out:*)\n      has_out=\"1\"\n      ;;\n  esac\ndone\n\nif [ \"$has_out\" = \"0\" ]; then\n  base=\"$(basename \"$in\" .cheng)\"\n  out_dir=\"$root/artifacts/chengb\"\n  mkdir -p \"$out_dir\"\n  case \"$emit\" in\n    obj) default_out=\"$out_dir/${base}.o\" ;;\n    *) default_out=\"$out_dir/${base}\" ;;\n  esac\n  set -- \"$@\" \"--out:$default_out\"\nfi\n\nexec ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc \"$in\" \"$@\"\n"
     if id == "chengc":
         var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -euo pipefail\n\nusage() {\n  cat <<'USAGE'\nUsage:\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc <file.cheng> [--name:<exeName>] [--jobs:<N>]\n                        [--manifest:<path>] [--lock:<path>] [--registry:<path>]\n                        [--package:<id>] [--channel:<edge|stable|lts>]\n                        [--lock-format:<toml|yaml|json>] [--meta-out:<path>]\n                        [--buildmeta:<path>]\n                        [--abi:<v2_noptr>]\n                        [--linker:<self|system>]\n                        [--target:<triple>]\n                        [--pkg-cache:<dir>] [--skip-pkg] [--verify] [--ledger:<path>]\n                        [--source-listen:<addr>] [--source-peer:<addr>]\n                        [--mm:<orc>] [--orc]\n                        [--release]\n                        [--emit:<exe>] [--frontend:<stage1>]\n                        [--out:<path>] [--multi] [--pkg-roots:<p1[:p2:...]>]\n                        [--run] [--run:file] [--run:host]\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run <android|ios|harmony> <file.cheng> [mobile-run-options]\n\nNotes:\n  - Backend-only entrypoint (exe only).\n  - Default build track is dev (`BACKEND_BUILD_TRACK=dev`).\n  - `--release` maps to `BACKEND_BUILD_TRACK=release` and defaults linker to system.\n  - Optional compile daemon: set `CHENGC_DAEMON=1` to route builds through `chengc_daemon`.\n  - `--run` defaults to host runner (`--run:host`); use `--run:file` for legacy file-exec mode.\n  - Default `MM=orc`.\n  - Executable output for bare `--name:<bin>` defaults to `artifacts/chengc/<bin>`.\n  - `--jobs:<N>` forwards to `BACKEND_JOBS`.\n  - Legacy `chengb.sh` flags are accepted for compatibility.\n  - `run <platform>`")
-        add(chunks, " forwards to mobile host runners:\n      android -> ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_android\n      ios     -> ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_ios\n      harmony -> ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_harmony\nUSAGE\n}\n\nusage_run() {\n  cat <<'USAGE'\nUsage:\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run android <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--serial:<adbSerial>] [--native] [--app-arg:<k=v>]... [--app-args-json:<abs_path>] [--no-build] [--no-install] [--no-run] [--mm:<orc>] [--orc]\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run ios <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run harmony <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]\n\nExamples:\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run android examples/mobile_hello.cheng\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run ios examples/mobile_hello.cheng --name:demo_ios\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run harmony examples/mobile_hello.cheng\nUSAGE\n}\n\ndetect_jobs() {\n  jobs=\"\"\n  if command -v getconf >/dev/null 2>&1; then\n    jobs=\"$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)\"\n  fi\n  if [ -z \"$jobs\" ] && command -v nproc >/dev/null 2>&1; then\n    jobs=\"$(nproc 2>/dev/null || true)\"\n  fi\n  if [ -z \"$jobs\" ] && command -v sysctl >/dev/null 2>&1; then\n    jobs=\"$(sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true")
-        add(chunks, ")\"\n  fi\n  case \"$jobs\" in\n    ''|*[!0-9]*) jobs=\"4\" ;;\n  esac\n  if [ \"$jobs\" -lt 1 ] 2>/dev/null; then\n    jobs=\"4\"\n  fi\n  printf '%s\\n' \"$jobs\"\n}\n\ncleanup_backend_exe_sidecar() (\n  cleanup_out=\"$1\"\n  case \"${BACKEND_KEEP_EXE_OBJ:-0}\" in\n    1|true|TRUE|yes|YES|on|ON)\n      return 0\n      ;;\n  esac\n  cleanup_sidecar=\"${cleanup_out}.o\"\n  if [ -f \"$cleanup_sidecar\" ]; then\n    rm -f \"$cleanup_sidecar\"\n  fi\n)\n\nis_true_flag() {\n  case \"${1:-}\" in\n    1|true|TRUE|yes|YES|on|ON)\n      return 0\n      ;;\n  esac\n  return 1\n}\n\nhas_fuse_ld_flag() {\n  flags=\"$1\"\n  case \"$flags\" in\n    *-fuse-ld=*) return 0 ;;\n  esac\n  return 1\n}\n\nresolve_named_exe_out() {\n  name_in=\"$1\"\n  case \"$name_in\" in\n    /*|*/*)\n      printf '%s\\n' \"$name_in\"\n      return\n      ;;\n  esac\n  printf 'artifacts/chengc/%s\\n' \"$name_in\"\n}\n\nnormalize_output_path() {\n  raw=\"$1\"\n  case \"$raw\" in\n    ''|-) printf '%s\\n' \"$raw\" ;;\n    /*|*/*|*\\\\*) printf '%s\\n' \"$raw\" ;;\n    *) printf 'artifacts/chengc/%s\\n' \"$raw\" ;;\n  esac\n}\n\ntarget_supports_self_linker() {\n  t=\"$1\"\n  case \"$t\" in\n    *darwin*)\n      case \"$t\" in\n        *arm64*|*aarch64*|*x86_64*|*amd64*) return 0 ;;\n      esac\n      return 1\n      ;;\n    *linux*|*android*)\n      case \"$t\" in\n        *arm64*|*aarch64*|*riscv64*) return 0 ;;\n      esac\n      return 1\n      ;;\n    *windows*|*msvc*)\n      case \"$t\" in\n        *arm64*|*aarch64*) return 0 ;;\n      esac\n      return 1\n      ;;\n  esac\n  return 1\n}\n\nif [ \"${1:-}\" = \"\" ] || [ \"${1:-}\" = \"--help\" ] || [ \"${1:-}\" = \"-h\" ]; then\n  usage\n  exit 0\nfi\n\nif [ \"${CHENGC_DAEMON:-0}\" = \"1\" ] && [ \"${CHENGC_DAEMON_ACTIVE:-0}\" != \"1\" ] && [ \"${1:-}\"")
-        add(chunks, " != \"run\" ]; then\n  exec ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc_daemon run -- \"$@\"\nfi\n\nif [ \"${1:-}\" = \"run\" ]; then\n  shift || true\n  mobile_platform=\"${1:-}\"\n  if [ \"$mobile_platform\" = \"\" ] || [ \"$mobile_platform\" = \"--help\" ] || [ \"$mobile_platform\" = \"-h\" ]; then\n    usage_run\n    exit 0\n  fi\n  shift || true\n  root=\"$(cd \"$(dirname \"$0\")/../..\" && pwd)\"\n  case \"$mobile_platform\" in\n    android)\n      exec \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" mobile_run_android \"$@\"\n      ;;\n    ios)\n      exec \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" mobile_run_ios \"$@\"\n      ;;\n    harmony)\n      exec \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" mobile_run_harmony \"$@\"\n      ;;\n    *)\n      echo \"[Error] unknown mobile platform: $mobile_platform\" 1>&2\n      usage_run 1>&2\n      exit 2\n      ;;\n  esac\nfi\n\nin=\"$1\"\nshift || true\n\nname=\"\"\njobs=\"\"\njobs_explicit=\"0\"\nmanifest=\"\"\nlock=\"\"\nregistry=\"\"\npackage_id=\"\"\nchannel=\"stable\"\nlock_format=\"toml\"\nmeta_out=\"\"\nbuildmeta=\"\"\npkg_cache=\"\"\nskip_pkg=\"\"\nverify_meta=\"\"\nledger=\"\"\nsource_listen=\"\"\nsource_peer_args=\"\"\nmm=\"\"\nemit_obj=\"\"\nobj_out=\"\"\nbackend=\"\"\nlinker=\"\"\ntarget_arg=\"\"\nabi=\"\"\nbuild_track_arg=\"\"\nlegacy_emit=\"\"\nlegacy_frontend=\"\"\nlegacy_out=\"\"\nlegacy_multi=\"\"\nlegacy_pkg_roots=\"\"\nlegacy_run=\"\"\nrun_mode=\"\"\npkg_tool=\"${PKG_TOOL:-chengcache/tools/cheng_pkg}\"\n\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --name:*) name=\"${1#--name:}\" ;;\n    --jobs:*)\n      jobs=\"${1#--jobs:}\"\n      jobs_explicit=\"1\"\n      ;;\n    --manifest:*) manifest=\"${1#--manifest:}\" ;;\n    --lo")
-        add(chunks, "ck:*) lock=\"${1#--lock:}\" ;;\n    --registry:*) registry=\"${1#--registry:}\" ;;\n    --package:*) package_id=\"${1#--package:}\" ;;\n    --channel:*) channel=\"${1#--channel:}\" ;;\n    --lock-format:*) lock_format=\"${1#--lock-format:}\" ;;\n    --meta-out:*) meta_out=\"${1#--meta-out:}\" ;;\n    --buildmeta:*) buildmeta=\"${1#--buildmeta:}\" ;;\n    --backend:obj) backend=\"obj\" ;;\n    --emit-obj)\n      emit_obj=\"1\"\n      backend=\"obj\"\n      ;;\n    --obj-out:*) obj_out=\"${1#--obj-out:}\" ;;\n    --abi:*) abi=\"${1#--abi:}\" ;;\n    --linker:*) linker=\"${1#--linker:}\" ;;\n    --target:*) target_arg=\"${1#--target:}\" ;;\n    --release) build_track_arg=\"release\" ;;\n    --emit:*) legacy_emit=\"${1#--emit:}\" ;;\n    --frontend:*) legacy_frontend=\"${1#--frontend:}\" ;;\n    --out:*) legacy_out=\"${1#--out:}\" ;;\n    --multi) legacy_multi=\"1\" ;;\n    --pkg-roots:*) legacy_pkg_roots=\"${1#--pkg-roots:}\" ;;\n    --run)\n      legacy_run=\"1\"\n      if [ \"$run_mode\" = \"\" ]; then\n        run_mode=\"host\"\n      fi\n      ;;\n    --run:file)\n      legacy_run=\"1\"\n      run_mode=\"file\"\n      ;;\n    --run:host)\n      legacy_run=\"1\"\n      run_mode=\"host\"\n      ;;\n    --pkg-cache:*) pkg_cache=\"${1#--pkg-cache:}\" ;;\n    --skip-pkg) skip_pkg=\"1\" ;;\n    --verify) verify_meta=\"1\" ;;\n    --ledger:*) ledger=\"${1#--ledger:}\" ;;\n    --source-listen:*) source_listen=\"${1#--source-listen:}\" ;;\n    --source-peer:*) source_peer_args=\"$source_peer_args --source-peer:${1#--source-peer:}\" ;;\n    --orc) mm=\"orc\" ;;\n    --mm:*) mm=\"${1#--mm:}\" ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\ncase \"$abi\" in\n  \"\"|v2_noptr) ;;\n  *)\n    echo \"[Error]")
-        add(chunks, " invalid --abi:$abi (expected v2_noptr; enforced by ZRPC/零裸指针生产闭环规范)\" 1>&2\n    exit 2\n    ;;\nesac\n\ncase \"$legacy_emit\" in\n  \"\"|obj|exe) ;;\n  *)\n    echo \"[Error] invalid --emit:$legacy_emit (expected obj|exe)\" 1>&2\n    exit 2\n    ;;\nesac\n\ncase \"$legacy_frontend\" in\n  \"\"|stage1) ;;\n  *)\n    echo \"[Error] invalid --frontend:$legacy_frontend (expected stage1)\" 1>&2\n    exit 2\n    ;;\nesac\n\nif [ \"$legacy_emit\" = \"exe\" ] && [ \"$emit_obj\" != \"\" ]; then\n  echo \"[Error] conflicting emit flags: --emit:exe with --emit-obj/--obj-out\" 1>&2\n  exit 2\nfi\nif [ \"$legacy_emit\" = \"obj\" ]; then\n  emit_obj=\"1\"\n  backend=\"obj\"\nfi\nobj_requested=\"0\"\nif [ \"$emit_obj\" != \"\" ] || [ \"$backend\" = \"obj\" ] || [ \"$legacy_emit\" = \"obj\" ] || [ \"$obj_out\" != \"\" ]; then\n  obj_requested=\"1\"\nfi\nallow_emit_obj=\"${BACKEND_INTERNAL_ALLOW_EMIT_OBJ:-${BACKEND_INTERNAL_ALLOW_EMIT_OBJ:-0}}\"\nif [ \"$obj_requested\" = \"1\" ] && [ \"$allow_emit_obj\" != \"1\" ]; then\n  echo \"[Error] obj output path has been removed from production chain; use --emit:exe\" 1>&2\n  echo \"[Hint] set BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 for internal tooling only\" 1>&2\n  exit 2\nfi\nif [ \"$obj_requested\" = \"1\" ] && [ \"$obj_out\" = \"\" ]; then\n  echo \"[Error] --emit-obj requires --obj-out:<path>\" 1>&2\n  exit 2\nfi\n\nif [ \"$mm\" = \"\" ]; then\n  mm=\"${MM:-orc}\"\nfi\ncase \"$mm\" in\n  \"\"|orc)\n    mm=\"orc\"\n    ;;\n  *)\n    echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2\n    exit 2\n    ;;\nesac\nexport MM=\"$mm\"\n\nif [ \"$jobs\" = \"\" ]; then\n  jobs=\"$(detect_jobs)\"\nfi\n\nif [ ! -f \"$in\" ]; then\n  echo \"[Error] file not found: $in\" 1>&2\n  exit 2\nfi\n\nif [ \"$name\" = \"\" ]; then\n  base=\"$(basename \"")
-        add(chunks, "$in\")\"\n  name=\"${base%.cheng}\"\nfi\nexe_out_path=\"$(resolve_named_exe_out \"$name\")\"\nbuildmeta_output=\"$exe_out_path\"\nif [ \"$legacy_out\" != \"\" ]; then\n  buildmeta_output=\"$legacy_out\"\nfi\n\nif [ \"$backend\" = \"\" ]; then\n  case \"${CHENGC_DEFAULT_BACKEND:-}\" in\n    \"\"|auto|exe)\n      backend=\"exe\"\n      ;;\n    *)\n      echo \"[Error] invalid CHENGC_DEFAULT_BACKEND: ${CHENGC_DEFAULT_BACKEND} (expected auto|exe)\" 1>&2\n      exit 2\n      ;;\n  esac\nfi\n\nif [ \"$backend\" != \"exe\" ] && [ \"$backend\" != \"obj\" ]; then\n  echo \"[Error] unsupported backend: $backend (expected exe|obj)\" 1>&2\n  exit 2\nfi\nif [ \"$backend\" = \"obj\" ] && [ \"$allow_emit_obj\" != \"1\" ]; then\n  echo \"[Error] unsupported backend: obj (only --emit:exe is supported)\" 1>&2\n  echo \"[Hint] set BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 for internal tooling only\" 1>&2\n  exit 2\nfi\n\nif [ \"$manifest\" != \"\" ] || [ \"$lock\" != \"\" ] || [ \"$package_id\" != \"\" ]; then\n  if [ \"$registry\" = \"\" ]; then\n    registry=\"build/cheng_registry/registry.jsonl\"\n  fi\nfi\n\nsha256_file() {\n  if command -v shasum >/dev/null 2>&1; then\n    shasum -a 256 \"$1\" | awk '{print $1}'\n    return\n  fi\n  if command -v sha256sum >/dev/null 2>&1; then\n    sha256sum \"$1\" | awk '{print $1}'\n    return\n  fi\n  echo \"\"\n}\n\ntoml_string() {\n  key=\"$1\"\n  file=\"$2\"\n  if [ ! -f \"$file\" ]; then\n    echo \"\"\n    return\n  fi\n  sed -n \"s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\\\"\\\\(.*\\\\)\\\"[[:space:]]*$/\\\\1/p\" \"$file\" | head -n 1\n}\n\ntoml_int() {\n  key=\"$1\"\n  file=\"$2\"\n  if [ ! -f \"$file\" ]; then\n    echo \"\"\n    return\n  fi\n  sed -n \"s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\\\\([0-9][0-9]*\\\\)[[:space:]]*$/\\\\1/p\" \"")
-        add(chunks, "$file\" | head -n 1\n}\n\nensure_pkg_tool() {\n  if [ -x \"$pkg_tool\" ] && [ \"src/tooling/cheng_pkg.cheng\" -ot \"$pkg_tool\" ]; then\n    return\n  fi\n  pkg_tool_dir=\"$(dirname \"$pkg_tool\")\"\n  if [ \"$pkg_tool_dir\" != \"\" ] && [ ! -d \"$pkg_tool_dir\" ]; then\n    mkdir -p \"$pkg_tool_dir\"\n  fi\n  echo \"[pkg] build cheng_pkg\"\n  if ! ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc src/tooling/cheng_pkg.cheng --frontend:stage1 --emit:exe --out:\"$pkg_tool\" --skip-pkg >/dev/null; then\n    echo \"[Error] failed to build cheng_pkg via backend obj/exe pipeline\" 1>&2\n    exit 2\n  fi\n  if [ ! -x \"$pkg_tool\" ]; then\n    echo \"[Error] missing cheng_pkg executable after build\" 1>&2\n    exit 2\n  fi\n}\n\nif [ \"$skip_pkg\" = \"\" ]; then\n  if [ \"$manifest\" != \"\" ] || [ \"$lock\" != \"\" ] || [ \"$package_id\" != \"\" ]; then\n    ensure_pkg_tool\n  fi\nfi\n\nif [ \"$manifest\" != \"\" ] && [ \"$skip_pkg\" = \"\" ]; then\n  if [ ! -f \"$manifest\" ]; then\n    echo \"[Error] manifest not found: $manifest\" 1>&2\n    exit 2\n  fi\n  if [ \"$lock\" = \"\" ]; then\n    lock=\"chengcache/${name}.lock.${lock_format}\"\n  fi\n  echo \"[pkg] resolve lock: $lock\"\n  \"$pkg_tool\" resolve --manifest:\"$manifest\" --registry:\"$registry\" --out:\"$lock\" --format:\"$lock_format\"\nfi\n\nif [ \"$lock\" != \"\" ] && [ \"$skip_pkg\" = \"\" ]; then\n  if [ ! -f \"$lock\" ]; then\n    echo \"[Error] lock not found: $lock\" 1>&2\n    exit 2\n  fi\n  echo \"[pkg] verify lock\"\n  \"$pkg_tool\" verify --lock:\"$lock\" --registry:\"$registry\"\n\n  if [ -f \"src/tooling/cheng_pkg_fetch.sh\" ]; then\n    source_listen_arg=\"\"\n    if [ \"$source_listen\" != \"\" ]; then\n      source_listen_arg=\"--source-listen:$source_listen\"\n    fi\n    if [ \"$p")
-        add(chunks, "kg_cache\" != \"\" ]; then\n      pkg_roots=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng_pkg_fetch --lock:\"$lock\" --cache:\"$pkg_cache\" --print-roots \\\n        $source_listen_arg $source_peer_args)\"\n    else\n      pkg_roots=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng_pkg_fetch --lock:\"$lock\" --print-roots \\\n        $source_listen_arg $source_peer_args)\"\n    fi\n    if [ \"$pkg_roots\" != \"\" ]; then\n      export PKG_ROOTS=\"$pkg_roots\"\n    fi\n  fi\nfi\n\nif [ \"$lock\" != \"\" ] && [ \"$package_id\" != \"\" ] && [ \"$skip_pkg\" = \"\" ]; then\n  if [ \"$meta_out\" = \"\" ]; then\n    meta_out=\"chengcache/${name}.pkgmeta.toml\"\n  fi\n  echo \"[pkg] build meta: $meta_out\"\n  \"$pkg_tool\" meta --lock:\"$lock\" --package:\"$package_id\" --channel:\"$channel\" --registry:\"$registry\" --out:\"$meta_out\" --format:\"toml\"\nfi\n\nif [ \"$skip_pkg\" != \"\" ]; then\n  if [ \"$manifest\" != \"\" ] && [ \"$lock\" = \"\" ]; then\n    echo \"[Error] --skip-pkg requires --lock when --manifest is set\" 1>&2\n    exit 2\n  fi\n  if [ \"$lock\" != \"\" ] && [ ! -f \"$lock\" ]; then\n    echo \"[Error] lock not found: $lock\" 1>&2\n    exit 2\n  fi\n  if [ \"$package_id\" != \"\" ]; then\n    if [ \"$meta_out\" = \"\" ]; then\n      meta_out=\"chengcache/${name}.pkgmeta.toml\"\n    fi\n    if [ ! -f \"$meta_out\" ]; then\n      echo \"[Error] pkgmeta not found: $meta_out\" 1>&2\n      exit 2\n    fi\n  fi\nfi\n\nif [ \"$legacy_pkg_roots\" != \"\" ]; then\n  export PKG_ROOTS=\"$legacy_pkg_roots\"\nfi\n\nif [ \"$buildmeta\" = \"\" ] && { [ \"$lock\" != \"\" ] || [ \"$meta_out\" != \"\" ]; }; then\n  buildmeta=\"chengcache/${name}.buildmeta.toml\"\nfi\n\nfrontend=\"${BACKEND_FRONTEND:-stage1}\"\nif [ \"$legacy_frontend\" ")
-        add(chunks, "!= \"\" ]; then\n  frontend=\"$legacy_frontend\"\nfi\nif [ \"$frontend\" = \"stage1\" ] && [ \"${STAGE1_OWNERSHIP_FIXED_0:-}\" = \"\" ]; then\n  export STAGE1_OWNERSHIP_FIXED_0=0\nfi\n\nbuild_track=\"${BACKEND_BUILD_TRACK:-}\"\nif [ \"$build_track_arg\" = \"release\" ]; then\n  build_track=\"release\"\nfi\nif [ \"$build_track\" = \"\" ]; then\n  build_track=\"dev\"\nfi\ncase \"$build_track\" in\n  dev|release) ;;\n  *)\n    echo \"[Error] invalid BACKEND_BUILD_TRACK: $build_track (expected dev|release)\" 1>&2\n    exit 2\n    ;;\nesac\n\nif [ \"$buildmeta\" != \"\" ]; then\n  buildmeta_dir=\"$(dirname \"$buildmeta\")\"\n  if [ \"$buildmeta_dir\" != \"\" ] && [ ! -d \"$buildmeta_dir\" ]; then\n    mkdir -p \"$buildmeta_dir\"\n  fi\n  lock_sha=\"\"\n  if [ \"$lock\" != \"\" ] && [ -f \"$lock\" ]; then\n    lock_sha=\"$(sha256_file \"$lock\")\"\n  fi\n  meta_sha=\"\"\n  if [ \"$meta_out\" != \"\" ] && [ -f \"$meta_out\" ]; then\n    meta_sha=\"$(sha256_file \"$meta_out\")\"\n  fi\n  snap_author=\"$(toml_string author_id \"$meta_out\")\"\n  snap_cid=\"$(toml_string cid \"$meta_out\")\"\n  snap_sig=\"$(toml_string signature \"$meta_out\")\"\n  snap_pubkey=\"$(toml_string pub_key \"$meta_out\")\"\n  snap_epoch=\"$(toml_int epoch \"$meta_out\")\"\n  ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"\n  {\n    echo \"[build]\"\n    echo \"source = \\\"$in\\\"\"\n    echo \"frontend = \\\"$frontend\\\"\"\n    echo \"output = \\\"$buildmeta_output\\\"\"\n    echo \"created_ts = \\\"$ts\\\"\"\n    if [ \"$manifest\" != \"\" ]; then\n      echo \"manifest = \\\"$manifest\\\"\"\n    fi\n    if [ \"$registry\" != \"\" ]; then\n      echo \"registry = \\\"$registry\\\"\"\n    fi\n    if [ \"$package_id\" != \"\" ]; then\n      echo \"package_id = \\\"$package_id\\\"\"\n    fi\n    if [ \"$channel\"")
-        add(chunks, " != \"\" ]; then\n      echo \"channel = \\\"$channel\\\"\"\n    fi\n    if [ \"$lock\" != \"\" ]; then\n      echo \"\"\n      echo \"[lock]\"\n      echo \"path = \\\"$lock\\\"\"\n      if [ \"$lock_format\" != \"\" ]; then\n        echo \"format = \\\"$lock_format\\\"\"\n      fi\n      if [ \"$lock_sha\" != \"\" ]; then\n        echo \"sha256 = \\\"$lock_sha\\\"\"\n      fi\n    fi\n    if [ \"$meta_out\" != \"\" ]; then\n      echo \"\"\n      echo \"[pkgmeta]\"\n      echo \"path = \\\"$meta_out\\\"\"\n      if [ \"$meta_sha\" != \"\" ]; then\n        echo \"sha256 = \\\"$meta_sha\\\"\"\n      fi\n    fi\n    if [ \"$snap_cid\" != \"\" ] || [ \"$snap_author\" != \"\" ] || [ \"$snap_sig\" != \"\" ]; then\n      echo \"\"\n      echo \"[snapshot]\"\n      if [ \"$snap_epoch\" != \"\" ]; then\n        echo \"epoch = $snap_epoch\"\n      fi\n      if [ \"$snap_cid\" != \"\" ]; then\n        echo \"cid = \\\"$snap_cid\\\"\"\n      fi\n      if [ \"$snap_author\" != \"\" ]; then\n        echo \"author_id = \\\"$snap_author\\\"\"\n      fi\n      if [ \"$snap_pubkey\" != \"\" ]; then\n        echo \"pub_key = \\\"$snap_pubkey\\\"\"\n      fi\n      if [ \"$snap_sig\" != \"\" ]; then\n        echo \"signature = \\\"$snap_sig\\\"\"\n      fi\n    fi\n  } >\"$buildmeta\"\nfi\n\nif [ \"$verify_meta\" != \"\" ]; then\n  if [ \"$buildmeta\" = \"\" ]; then\n    echo \"[Error] --verify requires --buildmeta (or lock/meta inputs)\" 1>&2\n    exit 2\n  fi\n  if [ \"$ledger\" != \"\" ]; then\n    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_buildmeta --buildmeta:\"$buildmeta\" --ledger:\"$ledger\"\n  else\n    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_buildmeta --buildmeta:\"$buildmeta\"\n  fi\nfi\n\nif [ \"${CLEAN_CHENG_LOCAL:-1}\" = \"1\" ]")
-        add(chunks, " && [ \"${TOOLING_CLEANUP_DEPTH:-0}\" = \"0\" ]; then\n  export TOOLING_CLEANUP_DEPTH=1\n  cleanup_backend_driver_on_exit() {\n    status=$?\n    set +e\n    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cleanup_cheng_local\n    exit \"$status\"\n  }\n  trap cleanup_backend_driver_on_exit EXIT\nfi\n\ndriver_can_run() {\n  bin=\"$1\"\n  if [ ! -x \"$bin\" ]; then\n    return 1\n  fi\n  set +e\n  \"$bin\" --help >/dev/null 2>&1\n  status=$?\n  set -e\n  case \"$status\" in\n    0|1|2) return 0 ;;\n  esac\n  return 1\n}\n\nif [ -n \"${BACKEND_DRIVER:-}\" ]; then\n  driver=\"$BACKEND_DRIVER\"\nelif [ \"${BACKEND_DRIVER_DIRECT:-1}\" != \"0\" ] && [ -x \"./artifacts/backend_driver/cheng\" ] && driver_can_run \"./artifacts/backend_driver/cheng\"; then\n  driver=\"./artifacts/backend_driver/cheng\"\nelif [ \"${BACKEND_DRIVER_DIRECT:-1}\" != \"0\" ] && [ -x \"./cheng\" ] && driver_can_run \"./cheng\"; then\n  driver=\"./cheng\"\nelse\n  driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)\"\nfi\ndriver_exec=\"$driver\"\ndriver_real_env=\"\"\nif [ \"${BACKEND_DRIVER_USE_WRAPPER:-0}\" = \"1\" ]; then\n  echo \"[chengc] BACKEND_DRIVER_USE_WRAPPER=1 is deprecated; forcing direct driver path\" 1>&2\nfi\n\nbackend_emit=\"exe\"\nout_path=\"$exe_out_path\"\nif [ \"$legacy_out\" != \"\" ]; then\n  out_path=\"$legacy_out\"\nfi\nif [ \"$obj_requested\" = \"1\" ]; then\n  backend_emit=\"obj\"\n  if [ \"$obj_out\" != \"\" ]; then\n    out_path=\"$obj_out\"\n  elif [ \"$legacy_out\" != \"\" ]; then\n    out_path=\"$legacy_out\"\n  else\n    out_path=\"${name}.o\"\n  fi\nfi\nout_path=\"$(normalize_output_path \"$out_path\")\"\nout_dir=\"$(dirname \"$out_path\")\"\nif [ \"$out_dir\" != \"\" ] && [ ! -d \"$out_dir\" ]; then\n  mkdir -p \"$out_dir\"\n")
-        add(chunks, "fi\n\nbackend_target=\"${BACKEND_TARGET:-}\"\nif [ -n \"$target_arg\" ]; then\n  backend_target=\"$target_arg\"\nfi\nif [ -z \"$backend_target\" ]; then\n  backend_target=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target)\"\nfi\ncase \"$backend_target\" in\n  \"\"|auto|native|host)\n    backend_target=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target)\"\n    ;;\n  darwin_arm64|darwin_aarch64)\n    backend_target=\"arm64-apple-darwin\"\n    ;;\n  darwin_x86_64|darwin_amd64)\n    backend_target=\"x86_64-apple-darwin\"\n    ;;\n  linux_arm64|linux_aarch64)\n    backend_target=\"aarch64-unknown-linux-gnu\"\n    ;;\n  linux_x86_64|linux_amd64)\n    backend_target=\"x86_64-unknown-linux-gnu\"\n    ;;\n  linux_riscv64)\n    backend_target=\"riscv64-unknown-linux-gnu\"\n    ;;\n  windows_arm64|windows_aarch64)\n    backend_target=\"aarch64-pc-windows-msvc\"\n    ;;\n  windows_x86_64|windows_amd64)\n    backend_target=\"x86_64-pc-windows-msvc\"\n    ;;\nesac\n\nbackend_linker=\"$linker\"\nif [ \"$backend_linker\" = \"\" ]; then\n  backend_linker=\"${BACKEND_LINKER:-}\"\nfi\nif [ \"$backend_linker\" = \"\" ] && [ \"$backend_emit\" = \"exe\" ]; then\n  if [ \"$build_track\" = \"release\" ]; then\n    backend_linker=\"system\"\n  else\n    if target_supports_self_linker \"$backend_target\"; then\n      backend_linker=\"self\"\n    else\n      backend_linker=\"system\"\n    fi\n  fi\nfi\ncase \"$backend_linker\" in\n  \"\"|self|system) ;;\n  *)\n    echo \"[Error] invalid --linker:$backend_linker (expected self|system)\" 1>&2\n    exit 2\n    ;;\nesac\n\nbackend_runtime_obj=\"${BACKEND_RUNTIME_OBJ:-}\"\n\nruntime_nm_has_sym() {\n  sym=\"$1\"\n  printf '%s\\n' \"$nm_out\" | awk '{print $NF}' | sed 's/^_//' | grep -Fxq \"$sym")
-        add(chunks, "\"\n}\n\nruntime_has_core_symbols() {\n  obj=\"$1\"\n  [ -f \"$obj\" ] || return 1\n  if ! command -v nm >/dev/null 2>&1; then\n    return 0\n  fi\n  nm_out=\"$(nm -g \"$obj\" 2>/dev/null || true)\"\n  [ \"$nm_out\" != \"\" ] || return 1\n  runtime_nm_has_sym cheng_strlen &&\n  runtime_nm_has_sym cheng_memcpy &&\n  runtime_nm_has_sym cheng_memset &&\n  runtime_nm_has_sym cheng_malloc &&\n  runtime_nm_has_sym cheng_free &&\n  runtime_nm_has_sym cheng_mem_retain &&\n  runtime_nm_has_sym cheng_mem_release &&\n  runtime_nm_has_sym cheng_seq_get &&\n  runtime_nm_has_sym cheng_seq_set &&\n  runtime_nm_has_sym cheng_strcmp &&\n  runtime_nm_has_sym cheng_f32_bits_to_i64 &&\n  runtime_nm_has_sym cheng_f64_bits_to_i64 &&\n  runtime_nm_has_sym cheng_open_w_trunc\n}\n\nresolve_runtime_obj() {\n  if [ \"$backend_runtime_obj\" != \"\" ]; then\n    printf '%s\\n' \"$backend_runtime_obj\"\n    return 0\n  fi\n  candidates=\"\nchengcache/runtime_selflink/system_helpers.backend.combined.${backend_target}.o\nartifacts/backend_mm/system_helpers.backend.combined.${backend_target}.o\nchengcache/system_helpers.backend.cheng.${backend_target}.o\nartifacts/backend_selfhost_self_obj/stage1.native.runtime.dedup.o\nartifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.stage1shim.o\nchengcache/system_helpers.backend.cheng.o\nartifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.o\n\"\n  for cand in $candidates; do\n    [ \"$cand\" != \"\" ] || continue\n    if [ -f \"$cand\" ] && runtime_has_core_symbols \"$cand\"; then\n      printf '%s\\n' \"$cand\"\n      return 0\n    fi\n  done\n  for cand in $candidates; do\n    [ \"$cand\" != \"\" ] || continue\n    if [ -f \"$cand\" ]; then\n      printf '%s\\n' \"$cand\"\n      return 0\n    fi\n  done\n  return 1\n}\n\nif [ \"$backen")
-        add(chunks, "d_emit\" = \"exe\" ] && [ \"$backend_linker\" = \"self\" ]; then\n  backend_runtime_obj=\"$(resolve_runtime_obj || true)\"\n  if [ \"$backend_runtime_obj\" = \"\" ] || [ ! -f \"$backend_runtime_obj\" ]; then\n    echo \"[Error] missing self-link runtime object for target=$backend_target\" 1>&2\n    echo \"        set BACKEND_RUNTIME_OBJ or prepare chengcache/runtime_selflink/system_helpers.backend.combined.${backend_target}.o\" 1>&2\n    exit 2\n  fi\n  if ! runtime_has_core_symbols \"$backend_runtime_obj\"; then\n    echo \"[Warn] self-link runtime object may be incomplete: $backend_runtime_obj\" 1>&2\n  fi\nfi\nruntime_env=\"\"\nif [ \"$backend_linker\" = \"self\" ] && [ \"$backend_runtime_obj\" != \"\" ]; then\n  runtime_env=\"BACKEND_RUNTIME_OBJ=$backend_runtime_obj\"\nfi\n\nabi_env=\"\"\nabi_effective=\"$abi\"\nif [ -z \"$abi_effective\" ]; then\n  abi_effective=\"${ABI:-}\"\nfi\nif [ -z \"$abi_effective\" ]; then\n  abi_effective=\"v2_noptr\"\nfi\nif [ \"$abi_effective\" != \"v2_noptr\" ]; then\n  echo \"[Error] ABI only supports v2_noptr (got: $abi_effective; enforced by ZRPC/零裸指针生产闭环规范)\" 1>&2\n  exit 2\nfi\nabi_env=\"ABI=$abi_effective\"\nabi_std_noptr_env=\"\"\nabi_std_noptr_strict_env=\"\"\nabi_no_ptr_non_c_abi_env=\"\"\nabi_no_ptr_non_c_abi_internal_env=\"\"\nif [ \"$abi_effective\" = \"v2_noptr\" ]; then\n  if [ -z \"${STAGE1_STD_NO_POINTERS+x}\" ]; then\n    abi_std_noptr_env=\"STAGE1_STD_NO_POINTERS=1\"\n  else\n    abi_std_noptr_env=\"STAGE1_STD_NO_POINTERS=$STAGE1_STD_NO_POINTERS\"\n  fi\n  if [ -z \"${STAGE1_STD_NO_POINTERS_STRICT+x}\" ]; then\n    abi_std_noptr_strict_env=\"STAGE1_STD_NO_POINTERS_STRICT=0\"\n  else\n    abi_std_noptr_strict_env=\"STAGE1_STD_NO_POINTERS_STRICT=$STAGE1_STD_NO_POINTERS_STRICT\"\n  fi\n  if [ -z \"${STAGE1_NO_POINTERS_NON")
-        add(chunks, "_C_ABI+x}\" ]; then\n    abi_no_ptr_non_c_abi_env=\"STAGE1_NO_POINTERS_NON_C_ABI=1\"\n  else\n    abi_no_ptr_non_c_abi_env=\"STAGE1_NO_POINTERS_NON_C_ABI=$STAGE1_NO_POINTERS_NON_C_ABI\"\n  fi\n  if [ -z \"${STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL+x}\" ]; then\n    abi_no_ptr_non_c_abi_internal_env=\"STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1\"\n  else\n    abi_no_ptr_non_c_abi_internal_env=\"STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=$STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL\"\n  fi\nfi\n\nlink_env=\"\"\nif [ \"$backend_emit\" = \"exe\" ]; then\n  if [ \"$backend_linker\" = \"self\" ]; then\n    link_env=\"BACKEND_LINKER=self BACKEND_NO_RUNTIME_C=1\"\n  else\n    if [ \"${BACKEND_NO_RUNTIME_C+x}\" = \"x\" ] && [ \"${BACKEND_NO_RUNTIME_C}\" != \"\" ]; then\n      link_env=\"BACKEND_LINKER=system BACKEND_NO_RUNTIME_C=$BACKEND_NO_RUNTIME_C\"\n    elif [ \"$build_track\" = \"release\" ]; then\n      link_env=\"BACKEND_LINKER=system BACKEND_NO_RUNTIME_C=0\"\n    else\n      link_env=\"BACKEND_LINKER=system\"\n    fi\n  fi\nfi\n\nbackend_ldflags_final=\"${BACKEND_LDFLAGS:-}\"\nif [ \"$backend_emit\" = \"exe\" ] && [ \"$backend_linker\" = \"system\" ]; then\n  if [ \"${BACKEND_LD:-}\" = \"\" ] && ! has_fuse_ld_flag \"$backend_ldflags_final\"; then\n    resolver_out=\"$(env \\\n      BACKEND_SYSTEM_LINKER_PRIORITY=\"${BACKEND_SYSTEM_LINKER_PRIORITY:-mold,lld,default}\" \\\n      ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} resolve_system_linker)\"\n    resolver_kind=\"$(printf '%s\\n' \"$resolver_out\" | sed -n 's/^kind=//p' | head -n 1)\"\n    resolver_ldflags=\"$(printf '%s\\n' \"$resolver_out\" | sed -n 's/^ldflags=//p' | head -n 1)\"\n    if [ \"$resolver_ldflags\" != \"\" ]; then\n      backend_ldflags_final=\"$(append_token \"$backend_ldflags_final\" \"$resolver_ldflags\")")
-        add(chunks, "\"\n    fi\n  fi\nfi\n\nbackend_multi_env=\"${BACKEND_MULTI:-}\"\nif [ \"$backend_multi_env\" = \"\" ]; then\n  if [ \"$build_track\" = \"release\" ]; then\n    backend_multi_env=\"${CHENGC_RELEASE_MULTI_DEFAULT:-0}\"\n  else\n    backend_multi_env=\"${CHENGC_DEV_MULTI_DEFAULT:-1}\"\n  fi\nfi\nbackend_inc_env=\"${BACKEND_INCREMENTAL:-1}\"\nbackend_multi_module_cache_env=\"${BACKEND_MULTI_MODULE_CACHE:-${BACKEND_MULTI_MODULE_CACHE:-0}}\"\nbackend_module_cache_unstable_allow_env=\"${BACKEND_MODULE_CACHE_UNSTABLE_ALLOW:-${BACKEND_MODULE_CACHE_UNSTABLE_ALLOW:-0}}\"\nif is_true_flag \"$backend_multi_module_cache_env\"; then\n  if ! is_true_flag \"$backend_module_cache_unstable_allow_env\"; then\n    echo \"[chengc] warn: BACKEND_MULTI_MODULE_CACHE is disabled by stable driver; forcing 0\" 1>&2\n    backend_multi_module_cache_env=\"0\"\n    backend_module_cache_unstable_allow_env=\"0\"\n  fi\nfi\nbackend_multi_force_env=\"${BACKEND_MULTI_FORCE:-0}\"\njobs_env=\"\"\njobs_unset_env=\"-u BACKEND_JOBS\"\nmodule_cache_unset_env=\"-u BACKEND_MODULE_CACHE\"\nmulti_module_cache_unset_env=\"-u BACKEND_MULTI_MODULE_CACHE\"\nif [ \"$jobs_explicit\" = \"1\" ]; then\n  jobs_env=\"BACKEND_JOBS=$jobs\"\n  jobs_unset_env=\"\"\nfi\nif [ \"$legacy_multi\" = \"1\" ]; then\n  backend_multi_env=\"1\"\n  backend_multi_force_env=\"1\"\nfi\n\nbackend_module_cache_env=\"${BACKEND_MODULE_CACHE:-${BACKEND_MODULE_CACHE:-}}\"\nmodule_cache_env=\"\"\nif [ \"$backend_module_cache_env\" != \"\" ]; then\n  module_cache_env=\"BACKEND_MODULE_CACHE=$backend_module_cache_env\"\nfi\nbackend_cstring_lowering_env=\"${BACKEND_CSTRING_LOWERING_REMOVED:-${BACKEND_CSTRING_LOWERING_REMOVED:-}}\"\nif [ \"$backend_cstring_lowering_env\" = \"\" ]; then\n  backend_cstring_lowering_env=\"0\"\n  if [ \"$backend_linker\" = \"s")
-        add(chunks, "ystem\" ]; then\n    no_runtime_c_effective=\"${BACKEND_NO_RUNTIME_C:-}\"\n    if [ \"$no_runtime_c_effective\" = \"\" ] && [ \"$build_track\" = \"release\" ]; then\n      no_runtime_c_effective=\"0\"\n    fi\n    case \"$no_runtime_c_effective\" in\n      0|false|FALSE|off|OFF|no|NO)\n        backend_cstring_lowering_env=\"1\"\n        ;;\n    esac\n  fi\nfi\n\nrun_backend_driver() {\n  multi_now=\"$1\"\n  multi_force_now=\"$2\"\n  if [ -n \"$backend_target\" ]; then\n    # shellcheck disable=SC2086\n    env $jobs_unset_env $module_cache_unset_env $multi_module_cache_unset_env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env $abi_no_ptr_non_c_abi_internal_env $jobs_env $module_cache_env $driver_real_env \\\n      BACKEND_BUILD_TRACK=\"$build_track\" \\\n      BACKEND_LDFLAGS=\"$backend_ldflags_final\" \\\n      BACKEND_TARGET=\"$backend_target\" \\\n      BACKEND_MULTI=\"$multi_now\" \\\n      BACKEND_MULTI_FORCE=\"$multi_force_now\" \\\n      BACKEND_MULTI_MODULE_CACHE=\"$backend_multi_module_cache_env\" \\\n      BACKEND_MODULE_CACHE_UNSTABLE_ALLOW=\"$backend_module_cache_unstable_allow_env\" \\\n      BACKEND_INCREMENTAL=\"$backend_inc_env\" \\\n      BACKEND_CSTRING_LOWERING_REMOVED=\"$backend_cstring_lowering_env\" \\\n      BACKEND_EMIT=\"$backend_emit\" \\\n      BACKEND_FRONTEND=\"$frontend\" \\\n      BACKEND_INPUT=\"$in\" \\\n      BACKEND_OUTPUT=\"$out_path\" \\\n      \"$driver_exec\"\n    return\n  fi\n  # shellcheck disable=SC2086\n  env $jobs_unset_env $module_cache_unset_env $multi_module_cache_unset_env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env $abi_no_ptr_non_c_abi_internal_env $jobs_env $module_cache_env $driver_real_env \\\n    BACKEND_")
-        add(chunks, "BUILD_TRACK=\"$build_track\" \\\n    BACKEND_LDFLAGS=\"$backend_ldflags_final\" \\\n    BACKEND_MULTI=\"$multi_now\" \\\n    BACKEND_MULTI_FORCE=\"$multi_force_now\" \\\n    BACKEND_MULTI_MODULE_CACHE=\"$backend_multi_module_cache_env\" \\\n    BACKEND_MODULE_CACHE_UNSTABLE_ALLOW=\"$backend_module_cache_unstable_allow_env\" \\\n    BACKEND_INCREMENTAL=\"$backend_inc_env\" \\\n    BACKEND_CSTRING_LOWERING_REMOVED=\"$backend_cstring_lowering_env\" \\\n    BACKEND_EMIT=\"$backend_emit\" \\\n    BACKEND_FRONTEND=\"$frontend\" \\\n    BACKEND_INPUT=\"$in\" \\\n    BACKEND_OUTPUT=\"$out_path\" \\\n    \"$driver_exec\"\n}\n\nset +e\nrun_backend_driver \"$backend_multi_env\" \"$backend_multi_force_env\"\nbuild_status=\"$?\"\nset -e\nif [ \"$build_status\" -ne 0 ] && [ \"$backend_multi_env\" = \"1\" ] && [ \"${CHENGC_MULTI_RETRY_SERIAL:-1}\" = \"1\" ]; then\n  echo \"[chengc] warn: parallel compile failed (status=$build_status), retry serial once\" 1>&2\n  set +e\n  run_backend_driver \"0\" \"0\"\n  build_status=\"$?\"\n  set -e\nfi\nif [ \"$build_status\" -ne 0 ]; then\n  exit \"$build_status\"\nfi\n\nif [ \"$backend_emit\" = \"exe\" ]; then\n  cleanup_backend_exe_sidecar \"$out_path\"\nfi\n\nif [ \"$backend_emit\" = \"obj\" ]; then\n  echo \"chengc obj ok: $out_path\"\nelse\n  echo \"chengc exe ok: $out_path\"\nfi\n\nif [ \"$legacy_run\" != \"1\" ] || [ \"$backend_emit\" != \"exe\" ]; then\n  exit 0\nfi\nif [ \"$run_mode\" = \"\" ]; then\n  run_mode=\"host\"\nfi\n\ncase \"$backend_target\" in\n  *android*)\n    if [ \"$run_mode\" = \"host\" ]; then\n      echo \"[chengc] run(android) does not support host runner yet, fallback to file mode\" >&2\n    fi\n    if ! command -v adb >/dev/null 2>&1; then\n      echo \"[chengc] missing tool: adb (required for --run on android targets")
-        add(chunks, ")\" 1>&2\n      exit 2\n    fi\n    serial=\"${ANDROID_SERIAL:-}\"\n    if [ -z \"$serial\" ]; then\n      serial=\"$(adb devices | awk 'NR>1 && $2 == \"device\" {print $1; exit}')\"\n    fi\n    if [ -z \"$serial\" ]; then\n      echo \"[chengc] no Android device/emulator detected (adb devices)\" 1>&2\n      exit 2\n    fi\n    remote_dir=\"/data/local/tmp/chengc\"\n    remote_path=\"$remote_dir/$(basename \"$out_path\")\"\n    adb -s \"$serial\" shell \"mkdir -p '$remote_dir'\" >/dev/null\n    adb -s \"$serial\" push \"$out_path\" \"$remote_path\" >/dev/null\n    adb -s \"$serial\" shell \"chmod 755 '$remote_path'\" >/dev/null\n    echo \"[chengc] run(android): $remote_path ($serial)\" >&2\n    adb -s \"$serial\" shell \"$remote_path\"\n    exit $?\n    ;;\nesac\n\nif [ \"$run_mode\" = \"host\" ]; then\n  echo \"[chengc] run(host-runner): $out_path\" >&2\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_host_runner run-host --exe:\"$out_path\"\n  exit $?\nfi\n\necho \"[chengc] run(file): $out_path\" >&2\n\"$out_path\"\n")
+        add(chunks, "#!/usr/bin/env sh
+:
+set -euo pipefail
+
+root=\"${TOOLING_ROOT:-$(CDPATH= cd -- \"$(dirname -- \"$0\")/../../..\" && pwd)}\"
+clean_env_path=\"${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}\"
+clean_env_home=\"${HOME:-$root}\"
+clean_env_tmpdir=\"${TMPDIR:-/tmp}\"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc <file.cheng> [--name:<exeName>] [--jobs:<N>] [--fn-jobs:<N>]
+                        [--manifest:<path>] [--lock:<path>] [--registry:<path>]
+                        [--package:<id>] [--channel:<edge|stable|lts>]
+                        [--lock-format:<toml|yaml|json>] [--meta-out:<path>]
+                        [--buildmeta:<path>]
+                        [--build-track:<dev|release>]
+                        [--linker:<self|system>]
+                        [--target:<triple>]
+                        [--whole-program|--whole-program:0|1]
+                        [--opt|--opt:0|1] [--opt2|--opt2:0|1] [--opt-level:0|1|2|3]
+                        [--ldflags:<text>] [--fn-sched:<ws>]
+                        [--no-runtime-c|--no-runtime-c:0|1] [--runtime-obj:<path>]
+                        [--sidecar-mode:cheng] [--sidecar-bundle:<path>] [--sidecar-compiler:<path>]
+                        [--sidecar-child-mode:<cli|outer_cli>] [--sidecar-outer-compiler:<path>]
+                        [--module-cache:<path>] [--multi-module-cache|--multi-module-cache:0|1]
+                        [--module-cache-unstable-allow|--module-cache-unstable-allow:0|1]
+                        [--generic-mode:dict] [--generic-spec-budget:<N>] [--generic-lowering:mir_dict]
+                        [--pkg-cache:<dir>] [--skip-pkg] [--verify] [--ledger:<path>]
+                        [--source-listen:<addr>] [--source-peer:<addr>]
+                        [--mm:<orc>] [--orc]
+                        [--release]
+                        [--emit:<exe>] [--frontend:<stage1>]
+                        [--out:<path>] [--multi|--multi:0|1] [--multi-force:0|1]
+                        [--incremental:0|1] [--pkg-roots:<p1[:p2:...]>]
+                        [--run] [--run:file] [--run:host]
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run <android|ios|harmony> <file.cheng> [mobile-run-options]
+
+Notes:
+  - Backend-only entrypoint (exe only).
+  - Default build track is dev.
+  - `--release` is an alias of `--build-track:release` and defaults linker to system.
+  - Optional compile daemon: set `CHENGC_DAEMON=1` to route builds through `chengc_daemon`.
+  - `--run` defaults to host runner (`--run:host`); use `--run:file` for legacy file-exec mode.
+  - Default `MM=orc`.
+  - Executable output for bare `--name:<bin>` defaults to `artifacts/chengc/<bin>`.
+  - `--jobs:<N>` / `--fn-jobs:<N>` / `--ldflags:<text>` / `--fn-sched:<ws>` control backend compile surface.
+  - `--whole-program` / `--opt*` / `--generic-*` / `--sidecar-*` / `--module-cache*` / `--no-runtime-c` / `--runtime-obj`
+    are explicit compile-surface flags for exe builds.
+  - No-pointer policy is fixed by the compiler/toolchain default and is not part of the public `chengc` flag surface.
+  - Only `--fn-sched:ws` is supported.
+  - Legacy `chengb.sh` flags are accepted for compatibility.
+  - `run <platform>` forwards to mobile host runners:
+      android -> ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_android
+      ios     -> ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_ios
+      harmony -> ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_harmony
+USAGE
+}
+
+usage_run() {
+  cat <<'USAGE'
+Usage:
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run android <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--serial:<adbSerial>] [--native] [--app-arg:<k=v>]... [--app-args-json:<abs_path>] [--no-build] [--no-install] [--no-run] [--mm:<orc>] [--orc]
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run ios <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run harmony <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]
+
+Examples:
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run android examples/mobile_hello.cheng
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run ios examples/mobile_hello.cheng --name:demo_ios
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run harmony examples/mobile_hello.cheng
+USAGE
+}
+
+detect_jobs() {
+  jobs=\"\"
+  if command -v getconf >/dev/null 2>&1; then
+    jobs=\"$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)\"
+  fi
+  if [ -z \"$jobs\" ] && command -v nproc >/dev/null 2>&1; then
+    jobs=\"$(nproc 2>/dev/null || true)\"
+  fi
+  if [ -z \"$jobs\" ] && command -v sysctl >/dev/null 2>&1; then
+    jobs=\"$(sysctl -n hw.logicalcpu 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || true)\"
+  fi
+  case \"$jobs\" in
+    ''|*[!0-9]*) jobs=\"4\" ;;
+  esac
+  if [ \"$jobs\" -lt 1 ] 2>/dev/null; then
+    jobs=\"4\"
+  fi
+  printf '%s\n' \"$jobs\"
+}
+
+cleanup_backend_exe_sidecar() (
+  cleanup_out=\"$1\"
+  case \"${BACKEND_KEEP_EXE_OBJ:-0}\" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+  esac
+  cleanup_sidecar=\"${cleanup_out}.o\"
+  if [ -f \"$cleanup_sidecar\" ]; then
+    rm -f \"$cleanup_sidecar\"
+  fi
+)
+
+is_true_flag() {
+  case \"${1:-}\" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+has_fuse_ld_flag() {
+  flags=\"$1\"
+  case \"$flags\" in
+    *-fuse-ld=*) return 0 ;;
+  esac
+  return 1
+}
+
+append_token() {
+  base=\"$1\"
+  token=\"$2\"
+  if [ \"$token\" = \"\" ]; then
+    printf '%s\n' \"$base\"
+    return
+  fi
+  if [ \"$base\" = \"\" ]; then
+    printf '%s\n' \"$token\"
+    return
+  fi
+  printf '%s %s\n' \"$base\" \"$token\"
+}
+
+read_env_default() {
+  name=\"$1\"
+  eval \"printf '%s\\n' \\"\${$name:-}\\"\"
+}
+
+normalize_bool_text() {
+  raw=\"$1\"
+  label=\"$2\"
+  case \"$raw\" in
+    \"\")
+      printf '\n'
+      ;;
+    1|true|TRUE|yes|YES|on|ON)
+      printf '1\n'
+      ;;
+    0|false|FALSE|no|NO|off|OFF)
+      printf '0\n'
+      ;;
+    *)
+      echo \"[Error] invalid $label:$raw (expected 0|1)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_jobs_text() {
+  raw=\"$1\"
+  label=\"$2\"
+  case \"$raw\" in
+    \"\" )
+      printf '\n'
+      ;;
+    *[!0-9]*)
+      echo \"[Error] invalid $label:$raw (expected positive integer)\" 1>&2
+      exit 2
+      ;;
+    *)
+      if [ \"$raw\" -lt 1 ] 2>/dev/null; then
+        echo \"[Error] invalid $label:$raw (expected positive integer)\" 1>&2
+        exit 2
+      fi
+      printf '%s\n' \"$raw\"
+      ;;
+  esac
+}
+
+normalize_nonneg_int_text() {
+  raw=\"$1\"
+  label=\"$2\"
+  case \"$raw\" in
+    \"\")
+      printf '\n'
+      ;;
+    *[!0-9]*)
+      echo \"[Error] invalid $label:$raw (expected non-negative integer)\" 1>&2
+      exit 2
+      ;;
+    *)
+      printf '%s\n' \"$raw\"
+      ;;
+  esac
+}
+
+normalize_opt_level_text() {
+  raw=\"$1\"
+  case \"$raw\" in
+    \"\")
+      printf '\n'
+      ;;
+    0|1|2|3)
+      printf '%s\n' \"$raw\"
+      ;;
+    *)
+      echo \"[Error] invalid --opt-level:$raw (expected 0|1|2|3)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_build_track_text() {
+  raw=\"$1\"
+  case \"$raw\" in
+    \"\"|dev|release)
+      printf '%s\n' \"$raw\"
+      ;;
+    *)
+      echo \"[Error] invalid --build-track:$raw (expected dev|release)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_fn_sched_text() {
+  raw=\"$1\"
+  case \"$raw\" in
+    \"\"|ws)
+      printf '%s\n' \"$raw\"
+      ;;
+    *)
+      echo \"[Error] invalid --fn-sched:$raw (expected ws)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_sidecar_mode_text() {
+  raw=\"$1\"
+  case \"$raw\" in
+    \"\"|cheng)
+      printf '%s\n' \"$raw\"
+      ;;
+    *)
+      echo \"[Error] invalid --sidecar-mode:$raw (expected cheng)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_sidecar_child_mode_text() {
+  raw=\"$1\"
+  case \"$raw\" in
+    \"\"|cli|outer_cli)
+      printf '%s\n' \"$raw\"
+      ;;
+    *)
+      echo \"[Error] invalid --sidecar-child-mode:$raw (expected cli|outer_cli)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_generic_mode_text() {
+  raw=\"$1\"
+  case \"$raw\" in
+    \"\"|dict)
+      printf '%s\n' \"$raw\"
+      ;;
+    *)
+      echo \"[Error] invalid --generic-mode:$raw (expected dict)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_generic_lowering_text() {
+  raw=\"$1\"
+  case \"$raw\" in
+    \"\"|mir_dict)
+      printf '%s\n' \"$raw\"
+      ;;
+    *)
+      echo \"[Error] invalid --generic-lowering:$raw (expected mir_dict)\" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+resolve_named_exe_out() {
+  name_in=\"$1\"
+  case \"$name_in\" in
+    /*|*/*)
+      printf '%s\n' \"$name_in\"
+      return
+      ;;
+  esac
+  printf 'artifacts/chengc/%s\n' \"$name_in\"
+}
+
+normalize_output_path() {
+  raw=\"$1\"
+  case \"$raw\" in
+    ''|-) printf '%s\n' \"$raw\" ;;
+    /*|*/*|*\\*) printf '%s\n' \"$raw\" ;;
+    *) printf 'artifacts/chengc/%s\n' \"$raw\" ;;
+  esac
+}
+
+tooling_selfhost_source_is_tooling_main() {
+  case \"${1:-}\" in
+    src/tooling/cheng_tooling.cheng|*/src/tooling/cheng_tooling.cheng)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+tooling_emit_selfhost_launcher_enabled() {
+  case \"${TOOLING_EMIT_SELFHOST_LAUNCHER:-1}\" in
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+tooling_selfhost_native_exec_path() {
+  printf '%s.repo_native_exec.bin\n' \"$1\"
+}
+
+emit_tooling_selfhost_launcher() {
+  out_path=\"$1\"
+  real_bin_path=\"$2\"
+  repo_root=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../../..\" && pwd)\"
+  real_bin_name=\"$(basename -- \"$real_bin_path\")\"
+  mkdir -p \"$(dirname \"$out_path\")\"
+  cat >\"$out_path\" <<EOF
+#!/usr/bin/env sh
+:
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail
+
+root=\"$repo_root\"
+script_dir=\"\$(CDPATH= cd -- \"\$(dirname -- \"\$0\")\" && pwd)\"
+real_bin=\"\$script_dir/$real_bin_name\"
+if [ ! -x \"\$real_bin\" ]; then
+  echo \"[cheng_tooling] missing tooling native companion: \$real_bin\" 1>&2
+  exit 1
+fi
+export TOOLING_ROOT=\"\$root\"
+export TOOLING_BIN=\"\$real_bin\"
+export TOOLING_SELF_BIN=\"\$real_bin\"
+export TOOLING_REPO_NATIVE_BIN=\"\$real_bin\"
+unset TOOLING_FORCE_BUILD 2>/dev/null || true
+unset TOOLING_LIST_BIN 2>/dev/null || true
+exec \"\$real_bin\" \"\$@\"
+EOF
+  chmod +x \"$out_path\"
+}
+
+target_supports_self_linker() {
+  t=\"$1\"
+  case \"$t\" in
+    *darwin*)
+      case \"$t\" in
+        *arm64*|*aarch64*|*x86_64*|*amd64*) return 0 ;;
+      esac
+      return 1
+      ;;
+    *linux*|*android*)
+      case \"$t\" in
+        *arm64*|*aarch64*|*riscv64*) return 0 ;;
+      esac
+      return 1
+      ;;
+    *windows*|*msvc*)
+      case \"$t\" in
+        *arm64*|*aarch64*) return 0 ;;
+      esac
+      return 1
+      ;;
+  esac
+  return 1
+}
+
+resolve_backend_sidecar_defaults_field() {
+  field=\"$1\"
+  target_raw=\"$2\"
+  resolver=\"$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh\"
+  if [ ! -f \"$resolver\" ]; then
+    return 1
+  fi
+  sh \"$resolver\" --root:\"$root\" --target:\"$target_raw\" --field:\"$field\"
+}
+
+if [ \"${1:-}\" = \"\" ] || [ \"${1:-}\" = \"--help\" ] || [ \"${1:-}\" = \"-h\" ]; then
+  usage
+  exit 0
+fi
+
+if [ \"${CHENGC_DAEMON:-0}\" = \"1\" ] && [ \"${CHENGC_DAEMON_ACTIVE:-0}\" != \"1\" ] && [ \"${1:-}\" != \"run\" ]; then
+  exec ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc_daemon run -- \"$@\"
+fi
+
+if [ \"${1:-}\" = \"run\" ]; then
+  shift || true
+  mobile_platform=\"${1:-}\"
+  if [ \"$mobile_platform\" = \"\" ] || [ \"$mobile_platform\" = \"--help\" ] || [ \"$mobile_platform\" = \"-h\" ]; then
+    usage_run
+    exit 0
+  fi
+  shift || true
+  root=\"$(cd \"$(dirname \"$0\")/../..\" && pwd)\"
+  case \"$mobile_platform\" in
+    android)
+      exec \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" mobile_run_android \"$@\"
+      ;;
+    ios)
+      exec \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" mobile_run_ios \"$@\"
+      ;;
+    harmony)
+      exec \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" mobile_run_harmony \"$@\"
+      ;;
+    *)
+      echo \"[Error] unknown mobile platform: $mobile_platform\" 1>&2
+      usage_run 1>&2
+      exit 2
+      ;;
+  esac
+fi
+
+in=\"$1\"
+shift || true
+
+name")
+        add(chunks, "=\"\"
+jobs=\"\"
+jobs_explicit=\"0\"
+fn_jobs_raw=\"\"
+manifest=\"\"
+lock=\"\"
+registry=\"\"
+package_id=\"\"
+channel=\"stable\"
+lock_format=\"toml\"
+meta_out=\"\"
+buildmeta=\"\"
+pkg_cache=\"\"
+skip_pkg=\"\"
+verify_meta=\"\"
+ledger=\"\"
+source_listen=\"\"
+source_peer_args=\"\"
+mm=\"\"
+emit_obj=\"\"
+obj_out=\"\"
+backend=\"\"
+linker=\"\"
+target_arg=\"\"
+build_track_arg=\"\"
+ldflags_raw=\"\"
+fn_sched_raw=\"\"
+whole_program_raw=\"\"
+opt_raw=\"\"
+opt2_raw=\"\"
+opt_level_raw=\"\"
+no_runtime_c_raw=\"\"
+runtime_obj_raw=\"\"
+sidecar_mode_raw=\"\"
+sidecar_bundle_raw=\"\"
+sidecar_compiler_raw=\"\"
+sidecar_child_mode_raw=\"\"
+sidecar_outer_compiler_raw=\"\"
+module_cache_raw=\"\"
+multi_module_cache_raw=\"\"
+module_cache_unstable_allow_raw=\"\"
+generic_mode_raw=\"\"
+generic_spec_budget_raw=\"\"
+generic_lowering_raw=\"\"
+legacy_emit=\"\"
+legacy_frontend=\"\"
+legacy_out=\"\"
+legacy_multi=\"\"
+multi_raw=\"\"
+multi_force_raw=\"\"
+incremental_raw=\"\"
+legacy_pkg_roots=\"\"
+legacy_run=\"\"
+run_mode=\"\"
+pkg_tool=\"${PKG_TOOL:-chengcache/tools/cheng_pkg}\"
+
+while [ \"${1:-}\" != \"\" ]; do
+  case \"$1\" in
+    --name:*) name=\"${1#--name:}\" ;;
+    --jobs:*)
+      jobs=\"${1#--jobs:}\"
+      jobs_explicit=\"1\"
+      ;;
+    --fn-jobs:*) fn_jobs_raw=\"${1#--fn-jobs:}\" ;;
+    --manifest:*) manifest=\"${1#--manifest:}\" ;;
+    --lock:*) lock=\"${1#--lock:}\" ;;
+    --registry:*) registry=\"${1#--registry:}\" ;;
+    --package:*) package_id=\"${1#--package:}\" ;;
+    --channel:*) channel=\"${1#--channel:}\" ;;
+    --lock-format:*) lock_format=\"${1#--lock-format:}\" ;;
+    --meta-out:*) meta_out=\"${1#--meta-out:}\" ;;
+    --buildmeta:*) buildmeta=\"${1#--buildmeta:}\" ;;
+    --backend:obj) backend=\"obj\" ;;
+    --emit-obj)
+      emit_obj=\"1\"
+      backend=\"obj\"
+      ;;
+    --obj-out:*) obj_out=\"${1#--obj-out:}\" ;;
+    --build-track:*) build_track_arg=\"${1#--build-track:}\" ;;
+    --linker:*) linker=\"${1#--linker:}\" ;;
+    --target:*) target_arg=\"${1#--target:}\" ;;
+    --release) build_track_arg=\"release\" ;;
+    --whole-program) whole_program_raw=\"1\" ;;
+    --whole-program:*) whole_program_raw=\"${1#--whole-program:}\" ;;
+    --opt) opt_raw=\"1\" ;;
+    --opt:*) opt_raw=\"${1#--opt:}\" ;;
+    --opt2) opt2_raw=\"1\" ;;
+    --opt2:*) opt2_raw=\"${1#--opt2:}\" ;;
+    --opt-level:*) opt_level_raw=\"${1#--opt-level:}\" ;;
+    --ldflags:*) ldflags_raw=\"${1#--ldflags:}\" ;;
+    --fn-sched:*) fn_sched_raw=\"${1#--fn-sched:}\" ;;
+    --no-runtime-c) no_runtime_c_raw=\"1\" ;;
+    --no-runtime-c:*) no_runtime_c_raw=\"${1#--no-runtime-c:}\" ;;
+    --runtime-obj:*) runtime_obj_raw=\"${1#--runtime-obj:}\" ;;
+    --sidecar-mode:*) sidecar_mode_raw=\"${1#--sidecar-mode:}\" ;;
+    --sidecar-bundle:*) sidecar_bundle_raw=\"${1#--sidecar-bundle:}\" ;;
+    --sidecar-compiler:*) sidecar_compiler_raw=\"${1#--sidecar-compiler:}\" ;;
+    --sidecar-child-mode:*) sidecar_child_mode_raw=\"${1#--sidecar-child-mode:}\" ;;
+    --sidecar-outer-compiler:*) sidecar_outer_compiler_raw=\"${1#--sidecar-outer-compiler:}\" ;;
+    --module-cache:*) module_cache_raw=\"${1#--module-cache:}\" ;;
+    --multi-module-cache) multi_module_cache_raw=\"1\" ;;
+    --multi-module-cache:*) multi_module_cache_raw=\"${1#--multi-module-cache:}\" ;;
+    --no-multi-module-cache) multi_module_cache_raw=\"0\" ;;
+    --module-cache-unstable-allow) module_cache_unstable_allow_raw=\"1\" ;;
+    --module-cache-unstable-allow:*) module_cache_unstable_allow_raw=\"${1#--module-cache-unstable-allow:}\" ;;
+    --no-module-cache-unstable-allow) module_cache_unstable_allow_raw=\"0\" ;;
+    --generic-mode:*) generic_mode_raw=\"${1#--generic-mode:}\" ;;
+    --generic-spec-budget:*) generic_spec_budget_raw=\"${1#--generic-spec-budget:}\" ;;
+    --generic-lowering:*) generic_lowering_raw=\"${1#--generic-lowering:}\" ;;
+    --emit:*) legacy_emit=\"${1#--emit:}\" ;;
+    --frontend:*) legacy_frontend=\"${1#--frontend:}\" ;;
+    --out:*) legacy_out=\"${1#--out:}\" ;;
+    --multi)
+      legacy_multi=\"1\"
+      multi_raw=\"1\"
+      ;;
+    --multi:*) multi_raw=\"${1#--multi:}\" ;;
+    --multi-force:*) multi_force_raw=\"${1#--multi-force:}\" ;;
+    --incremental:*) incremental_raw=\"${1#--incremental:}\" ;;
+    --pkg-roots:*) legacy_pkg_roots=\"${1#--pkg-roots:}\" ;;
+    --run)
+      legacy_run=\"1\"
+      if [ \"$run_mode\" = \"\" ]; then
+        run_mode=\"host\"
+      fi
+      ;;
+    --run:file)
+      legacy_run=\"1\"
+      run_mode=\"file\"
+      ;;
+    --run:host)
+      legacy_run=\"1\"
+      run_mode=\"host\"
+      ;;
+    --pkg-cache:*) pkg_cache=\"${1#--pkg-cache:}\" ;;
+    --skip-pkg) skip_pkg=\"1\" ;;
+    --verify) verify_meta=\"1\" ;;
+    --ledger:*) ledger=\"${1#--ledger:}\" ;;
+    --source-listen:*) source_listen=\"${1#--source-listen:}\" ;;
+    --source-peer:*) source_peer_args=\"$source_peer_args --source-peer:${1#--source-peer:}\" ;;
+    --orc) mm=\"orc\" ;;
+    --mm:*) mm=\"${1#--mm:}\" ;;
+    *)
+      echo \"[Error] unknown arg: $1\" 1>&2
+      usage
+      exit 2
+      ;;
+  esac
+  shift || true
+done
+
+case \"$legacy_emit\" in
+  \"\"|obj|exe) ;;
+  *)
+    echo \"[Error] invalid --emit:$legacy_emit (expected obj|exe)\" 1>&2
+    exit 2
+    ;;
+esac
+
+case \"$legacy_frontend\" in
+  \"\"|stage1) ;;
+  *)
+    echo \"[Error] invalid --frontend:$legacy_frontend (expected stage1)\" 1>&2
+    exit 2
+    ;;
+esac
+
+if [ \"$legacy_emit\" = \"exe\" ] && [ \"$emit_obj\" != \"\" ]; then
+  echo \"[Error] conflicting emit flags: --emit:exe with --emit-obj/--obj-out\" 1>&2
+  exit 2
+fi
+if [ \"$legacy_emit\" = \"obj\" ]; then
+  emit_obj=\"1\"
+  backend=\"obj\"
+fi
+obj_requested=\"0\"
+if [ \"$emit_obj\" != \"\" ] || [ \"$backend\" = \"obj\" ] || [ \"$legacy_emit\" = \"obj\" ] || [ \"$obj_out\" != \"\" ]; then
+  obj_requested=\"1\"
+fi
+if [ \"$obj_requested\" = \"1\" ] && [ \"$obj_out\" = \"\" ]; then
+  echo \"[Error] --emit-obj requires --obj-out:<path>\" 1>&2
+  exit 2
+fi
+
+if [ \"$mm\" = \"\" ]; then
+  mm=\"orc\"
+fi
+case \"$mm\" in
+  \"\"|orc)
+    mm=\"orc\"
+    ;;
+  *)
+    echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2
+    exit 2
+    ;;
+esac
+
+if [ \"$jobs_explicit\" != \"1\" ]; then
+  jobs=\"$(read_env_default BACKEND_JOBS)\"
+fi
+jobs=\"$(normalize_jobs_text \"$jobs\" \"--jobs\")\"
+if [ \"$jobs\" = \"\" ]; then
+  jobs=\"$(detect_jobs)\"
+fi
+
+if [ ! -f \"$in\" ]; then
+  echo \"[Error] file not found: $in\" 1>&2
+  exit 2
+fi
+
+if [ \"$name\" = \"\" ]; then
+  base=\"$(basename \"$in\")\"
+  name=\"${base%.cheng}\"
+fi
+exe_out_path=\"$(resolve_named_exe_out \"$name\")\"
+buildmeta_output=\"$exe_out_path\"
+if [ \"$legacy_out\" != \"\" ]; then
+  buildmeta_output=\"$legacy_out\"
+fi
+
+if [ \"$backend\" = \"\" ]; then
+  case \"${CHENGC_DEFAULT_BACKEND:-}\" in
+    \"\"|auto|exe)
+      backend=\"exe\"
+      ;;
+    *)
+      echo \"[Error] invalid CHENGC_DEFAULT_BACKEND: ${CHENGC_DEFAULT_BACKEND} (expected auto|exe)\" 1>&2
+      exit 2
+      ;;
+  esac
+fi
+
+if [ \"$backend\" != \"exe\" ] && [ \"$backend\" != \"obj\" ]; then
+  echo \"[Error] unsupported backend: $backend (expected exe|obj)\" 1>&2
+  exit 2
+fi
+
+if [ \"$manifest\" != \"\" ] || [ \"$lock\" != \"\" ] || [ \"$package_id\" != \"\" ]; then
+  if [ \"$registry\" = \"\" ]; then
+    registry=\"build/cheng_registry/registry.jsonl\"
+  fi
+fi
+
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 \"$1\" | awk '{print $1}'
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum \"$1\" | awk '{print $1}'
+    return
+  fi
+  echo \"\"
+}
+
+toml_string() {
+  key=\"$1\"
+  file=\"$2\"
+  if [ ! -f \"$file\" ]; then
+    echo \"\"
+    return
+  fi
+  sed -n \"s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\\"\\(.*\\)\\"[[:space:]]*$/\\1/p\" \"$file\" | head -n 1
+}
+
+toml_int() {
+  key=\"$1\"
+  file=\"$2\"
+  if [ ! -f \"$file\" ]; then
+    echo \"\"
+    return
+  fi
+  sed -n \"s/^[[:space:]]*$key[[:space:]]*=[[:space:]]*\\([0-9][0-9]*\\)[[:space:]]*$/\\1/p\" \"$file\" | head -n 1
+}
+
+ensure_pkg_tool() {
+  if [ -x \"$pkg_tool\" ] && [ \"src/tooling/cheng_pkg.cheng\" -ot \"$pkg_tool\" ]; then
+    return
+  fi
+  pkg_tool_dir=\"$(dirname \"$pkg_tool\")\"
+  if [ \"$pkg_tool_dir\" != \"\" ] && [ ! -d \"$pkg_tool_dir\" ]; then
+    mkdir -p \"$pkg_tool_dir\"
+  fi
+  echo \"[pkg] build cheng_pkg\"
+  if ! ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc src/tooling/cheng_pkg.cheng --frontend:stage1 --emit:exe --out:\"$pkg_tool\" --skip-pkg >/dev/null; then
+    echo \"[Error] failed to build cheng_pkg via backend obj/exe pipeline\" 1>&2
+    exit 2
+  fi
+  if [ ! -x \"$pkg_tool\" ]; then
+    echo \"[Error] missing cheng_pkg executable after build\" 1>&2
+    exit 2
+  fi
+}
+
+if [ \"$skip_pkg\" = \"\" ]; then
+  if [ \"$manifest\" != \"\" ] || [ \"$lock\" != \"\" ] || [ \"$package_id\" != \"\" ]; then
+    ensure_pkg_tool
+  fi
+fi
+
+if [ \"$manifest\" != \"\" ] && [ \"$skip_pkg\" = \"\" ]; then
+  if [ ! -f \"$manifest\" ]; then
+    echo \"[Error] manifest not found: $manifest\" 1>&2
+    exit 2
+  fi
+  if [ \"$lock\" = \"\" ]; then
+    lock=\"chengcache/${name}.lock.${lock_format}\"
+  fi
+  echo \"[pkg] resolve lock: $lock\"
+  \"$pkg_tool\" resolve --manifest:\"$manifest\" --registry:\"$registry\" --out:\"$lock\" --format:\"$lock_format\"
+fi
+
+if [ \"$lock\" != \"\" ] && [ \"$skip_pkg\" = \"\" ]; then
+  if [ ! -f \"$lock\" ]; then
+    echo \"[Error] lock not found: $lock\" 1>&2
+    exit 2
+  fi
+  echo \"[pkg] verify lock\"
+  \"$pkg_tool\" verify --lock:\"$lock\" --registry:\"$registry\"
+
+  if [ -f \"src/tooling/cheng_pkg_fetch.sh\" ]; then
+    source_listen_arg=\"\"
+    if [ \"$source_listen\" != \"\" ]; then
+      source_listen_arg=\"--source-listen:$source_listen\"
+    fi
+    if [ \"$pkg_cache\" != \"\" ]; then
+      pkg_roots=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng_pkg_fetch --lock:\"$lock\" --cache:\"$pkg_cache\" --print-roots \
+        $source_listen_arg $source_peer_args)\"
+    else
+      pkg_roots=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng_pkg_fetch --lock:\"$lock\" --print-roots \
+        $source_listen_arg $source_peer_args)\"
+    fi
+    if [ \"$pkg_roots\" != \"\" ]; then
+      export PKG_ROOTS=\"$pkg_roots\"
+    fi
+  fi
+fi
+
+if [ \"$lock\" != \"\" ] && [ \"$package_id\" != \"\" ] && [ \"$skip_pkg\" = \"\" ]; then
+  if [ \"$meta_out\" = \"\" ]; then
+    meta_out=\"chengcache/${name}.pkgmeta.toml\"
+  fi
+  echo \"[pkg] build meta: $meta_out\"
+  \"$pkg_tool\" meta --lock:\"$lock\" --package:\"$package_id\" --channel:\"$channel\" --registry:\"$registry\" --out:\"$meta_out\" --format:\"toml\"
+fi
+
+if [ \"$skip_pkg\" != \"\" ]; then
+  if [ \"$manifest\" != \"\" ] && [ \"$lock\" = \"\" ]; then
+    echo \"[Error] --skip-pkg requires --lock when --manifest is set\" 1>&2
+    exit 2
+  fi
+  if [ \"$lock\" != \"\" ] && [ ! -f \"$lock\" ]; then
+    echo \"[Error] lock not found: $lock\" 1>&2
+    exit 2
+  fi
+  if [ \"$package_id\" != \"\" ]; then
+    if [ \"$meta_out\" = \"\" ]; then
+      meta_out=\"chengcache/${name}.pkgmeta.toml\"
+    fi
+    if [ ! -f \"$meta_out\" ]; then
+      echo \"[Error] pkgmeta not found: $meta_out\" 1>&2
+      exit 2
+    fi
+  fi
+fi
+
+if [ \"$legacy_pkg_roots\" != \"\" ]; then
+  export PKG_ROOTS=\"$legacy_pkg_roots\"
+fi
+
+if [ \"$buildmeta\" = \"\" ] && { [ \"$lock\" != \"\" ] || [ \"$meta_out\" != \"\" ]; }; then
+  buildmeta=\"chengcache/${name}.buildmeta.toml\"
+fi
+
+frontend=\"${BACKEND_FRONTEND:-stage1}\"
+if [ \"$legacy_frontend\" != \"\" ]; then
+  frontend=\"$legacy_frontend\"
+fi
+if [ \"$frontend\" = \"stage1\" ] && [ \"${STAGE1_OWNERSHIP_FIXED_0:-}\" = \"\" ]; then
+  export STAGE1_OWNERSHIP_FIXED_0=0
+fi
+
+build_track=\"$(normalize_build_track_text \"$build_track_arg\")\"
+if [ \"$build_track\" = \"\" ]; then
+  build_track=\"dev\"
+fi
+
+if [ \"$buildmeta\" != \"\" ]; then
+  buildmeta_dir=\"$(dirname \"$buildmeta\")\"
+  if [ \"$buildmeta_dir\" != \"\" ] && [ ! -d \"$buildmeta_dir\" ]; then
+    mkdir -p \"$buildmeta_dir\"
+  fi
+  lock_sha=\"\"
+  if [ \"$lock\" != \"\" ] && [ -f \"$lock\" ]; then
+    lock_sha=\"$(sha256_file \"$lock\")\"
+  fi
+  meta_sha=\"\"
+  if [ \"$meta_out\" != \"\" ] && [ -f \"$meta_out\" ]; then
+    meta_sha=\"$(sha256_file \"$meta_out\")\"
+  fi
+  snap_author=\"$(toml_string author_id \"$meta_out\")\"
+  snap_cid=\"$(toml_string cid \"$meta_out\")\"
+  snap_sig=\"$(toml_string signature \"$meta_out\")\"
+  snap_pubkey=\"$(toml_string pub_key \"$meta_out\")\"
+  snap_epoch=\"$(toml_int epoch \"$meta_out\")\"
+  ts=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+  {
+    echo \"[build]\"
+    echo \"source = \\"$in\\"\"
+    echo \"frontend = \\"$frontend\\"\"
+    echo \"output = \\"$buildmeta_output\\"\"
+    echo \"created_ts = \\"$ts\\"\"
+    if [ \"$manifest\" != \"\" ]; then
+      echo \"manifest = \\"$manifest\\"\"
+    fi
+    if [ \"$registry\" != \"\" ]; then
+      echo \"registry = \\"$registry\\"\"
+    fi
+    if [ \"$pac")
+        add(chunks, "kage_id\" != \"\" ]; then
+      echo \"package_id = \\"$package_id\\"\"
+    fi
+    if [ \"$channel\" != \"\" ]; then
+      echo \"channel = \\"$channel\\"\"
+    fi
+    if [ \"$lock\" != \"\" ]; then
+      echo \"\"
+      echo \"[lock]\"
+      echo \"path = \\"$lock\\"\"
+      if [ \"$lock_format\" != \"\" ]; then
+        echo \"format = \\"$lock_format\\"\"
+      fi
+      if [ \"$lock_sha\" != \"\" ]; then
+        echo \"sha256 = \\"$lock_sha\\"\"
+      fi
+    fi
+    if [ \"$meta_out\" != \"\" ]; then
+      echo \"\"
+      echo \"[pkgmeta]\"
+      echo \"path = \\"$meta_out\\"\"
+      if [ \"$meta_sha\" != \"\" ]; then
+        echo \"sha256 = \\"$meta_sha\\"\"
+      fi
+    fi
+    if [ \"$snap_cid\" != \"\" ] || [ \"$snap_author\" != \"\" ] || [ \"$snap_sig\" != \"\" ]; then
+      echo \"\"
+      echo \"[snapshot]\"
+      if [ \"$snap_epoch\" != \"\" ]; then
+        echo \"epoch = $snap_epoch\"
+      fi
+      if [ \"$snap_cid\" != \"\" ]; then
+        echo \"cid = \\"$snap_cid\\"\"
+      fi
+      if [ \"$snap_author\" != \"\" ]; then
+        echo \"author_id = \\"$snap_author\\"\"
+      fi
+      if [ \"$snap_pubkey\" != \"\" ]; then
+        echo \"pub_key = \\"$snap_pubkey\\"\"
+      fi
+      if [ \"$snap_sig\" != \"\" ]; then
+        echo \"signature = \\"$snap_sig\\"\"
+      fi
+    fi
+  } >\"$buildmeta\"
+fi
+
+if [ \"$verify_meta\" != \"\" ]; then
+  if [ \"$buildmeta\" = \"\" ]; then
+    echo \"[Error] --verify requires --buildmeta (or lock/meta inputs)\" 1>&2
+    exit 2
+  fi
+  if [ \"$ledger\" != \"\" ]; then
+    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_buildmeta --buildmeta:\"$buildmeta\" --ledger:\"$ledger\"
+  else
+    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_buildmeta --buildmeta:\"$buildmeta\"
+  fi
+fi
+
+if [ \"${CLEAN_CHENG_LOCAL:-1}\" = \"1\" ] && [ \"${TOOLING_CLEANUP_DEPTH:-0}\" = \"0\" ]; then
+  export TOOLING_CLEANUP_DEPTH=1
+  cleanup_backend_driver_on_exit() {
+    status=$?
+    set +e
+    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cleanup_cheng_local
+    exit \"$status\"
+  }
+  trap cleanup_backend_driver_on_exit EXIT
+fi
+
+driver_can_run() {
+  bin=\"$1\"
+  if [ ! -x \"$bin\" ]; then
+    return 1
+  fi
+  set +e
+  \"$bin\" --help >/dev/null 2>&1
+  status=$?
+  set -e
+  case \"$status\" in
+    0|1|2) return 0 ;;
+  esac
+  return 1
+}
+
+tooling_selfhost_stage0_for_input() {
+  input_path=\"$1\"
+  case \"$input_path\" in
+    src/tooling/cheng_tooling.cheng|*/src/tooling/cheng_tooling.cheng)
+      cand=\"${CHENG_TOOLING_SELFHOST_STAGE0:-artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2}\"
+      if [ -x \"$cand\" ] && driver_can_run \"$cand\"; then
+        printf '%s\n' \"$cand\"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+if [ -n \"${BACKEND_DRIVER:-}\" ]; then
+  driver=\"$BACKEND_DRIVER\"
+elif selfhost_stage0=\"$(tooling_selfhost_stage0_for_input \"$in\" 2>/dev/null || true)\" && [ \"$selfhost_stage0\" != \"\" ]; then
+  driver=\"$selfhost_stage0\"
+elif [ \"${BACKEND_DRIVER_DIRECT:-1}\" != \"0\" ] && [ -x \"./artifacts/backend_driver/cheng\" ] && driver_can_run \"./artifacts/backend_driver/cheng\"; then
+  driver=\"./artifacts/backend_driver/cheng\"
+elif [ \"${BACKEND_DRIVER_DIRECT:-1}\" != \"0\" ] && [ -x \"./cheng\" ] && driver_can_run \"./cheng\"; then
+  driver=\"./cheng\"
+else
+  driver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)\"
+fi
+driver_exec=\"$driver\"
+driver_real_env=\"\"
+if [ \"${BACKEND_DRIVER_USE_WRAPPER:-0}\" = \"1\" ]; then
+  echo \"[chengc] BACKEND_DRIVER_USE_WRAPPER=1 is deprecated; forcing direct driver path\" 1>&2
+fi
+
+backend_emit=\"exe\"
+out_path=\"$exe_out_path\"
+if [ \"$legacy_out\" != \"\" ]; then
+  out_path=\"$legacy_out\"
+fi
+if [ \"$obj_requested\" = \"1\" ]; then
+  backend_emit=\"obj\"
+  if [ \"$obj_out\" != \"\" ]; then
+    out_path=\"$obj_out\"
+  elif [ \"$legacy_out\" != \"\" ]; then
+    out_path=\"$legacy_out\"
+  else
+    out_path=\"${name}.o\"
+  fi
+fi
+out_path=\"$(normalize_output_path \"$out_path\")\"
+out_dir=\"$(dirname \"$out_path\")\"
+if [ \"$out_dir\" != \"\" ] && [ ! -d \"$out_dir\" ]; then
+  mkdir -p \"$out_dir\"
+fi
+
+backend_target=\"${BACKEND_TARGET:-}\"
+if [ -n \"$target_arg\" ]; then
+  backend_target=\"$target_arg\"
+fi
+if [ -z \"$backend_target\" ]; then
+  backend_target=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target)\"
+fi
+host_target=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target)\"
+case \"$backend_target\" in
+  \"\"|auto|native|host)
+    backend_target=\"$host_target\"
+    ;;
+  darwin_arm64|darwin_aarch64)
+    backend_target=\"arm64-apple-darwin\"
+    ;;
+  darwin_x86_64|darwin_amd64)
+    backend_target=\"x86_64-apple-darwin\"
+    ;;
+  linux_arm64|linux_aarch64)
+    backend_target=\"aarch64-unknown-linux-gnu\"
+    ;;
+  linux_x86_64|linux_amd64)
+    backend_target=\"x86_64-unknown-linux-gnu\"
+    ;;
+  linux_riscv64)
+    backend_target=\"riscv64-unknown-linux-gnu\"
+    ;;
+  windows_arm64|windows_aarch64)
+    backend_target=\"aarch64-pc-windows-msvc\"
+    ;;
+  windows_x86_64|windows_amd64)
+    backend_target=\"x86_64-pc-windows-msvc\"
+    ;;
+esac
+
+backend_sidecar_mode=\"$sidecar_mode_raw\"
+if [ \"$backend_sidecar_mode\" = \"\" ]; then
+  backend_sidecar_mode=\"$(resolve_backend_sidecar_defaults_field mode \"$backend_target\" 2>/dev/null || true)\"
+fi
+backend_sidecar_mode=\"$(normalize_sidecar_mode_text \"$backend_sidecar_mode\")\"
+if [ \"$backend_sidecar_mode\" = \"\" ]; then
+  echo \"[Error] missing strict fresh Cheng sidecar mode; run verify_backend_sidecar_cheng_fresh\" 1>&2
+  exit 1
+fi
+
+backend_sidecar_bundle=\"$sidecar_bundle_raw\"
+if [ \"$backend_sidecar_bundle\" = \"\" ]; then
+  backend_sidecar_bundle=\"$(resolve_backend_sidecar_defaults_field bundle \"$backend_target\" 2>/dev/null || true)\"
+fi
+if [ \"$backend_sidecar_bundle\" = \"\" ]; then
+  echo \"[Error] missing strict fresh Cheng sidecar bundle; run verify_backend_sidecar_cheng_fresh\" 1>&2
+  exit 1
+fi
+
+backend_sidecar_compiler=\"$sidecar_compiler_raw\"
+if [ \"$backend_sidecar_compiler\" = \"\" ]; then
+  backend_sidecar_compiler=\"$(resolve_backend_sidecar_defaults_field compiler \"$backend_target\" 2>/dev/null || true)\"
+fi
+if [ \"$backend_sidecar_compiler\" = \"\" ]; then
+  echo \"[Error] missing strict fresh Cheng sidecar compiler; run verify_backend_sidecar_cheng_fresh\" 1>&2
+  exit 1
+fi
+
+backend_sidecar_driver=\"\"
+if [ \"${BACKEND_DRIVER:-}\" = \"\" ] && [ \"$backend_sidecar_mode\" = \"cheng\" ]; then
+  backend_sidecar_driver=\"$(resolve_backend_sidecar_defaults_field driver \"$backend_target\" 2>/dev/null || true)\"
+  if [ \"$backend_sidecar_driver\" != \"\" ] && [ -x \"$backend_sidecar_driver\" ]; then
+    driver=\"$backend_sidecar_driver\"
+    driver_exec=\"$driver\"
+    driver_real_env=\"\"
+  fi
+fi
+backend_sidecar_child_mode=\"$sidecar_child_mode_raw\"
+backend_sidecar_outer_companion=\"\"
+if [ \"$backend_sidecar_mode\" = \"cheng\" ]; then
+  if [ \"$backend_sidecar_child_mode\" = \"\" ]; then
+    backend_sidecar_child_mode=\"$(resolve_backend_sidecar_defaults_field child_mode \"$backend_target\" 2>/dev/null || true)\"
+  fi
+  backend_sidecar_child_mode=\"$(normalize_sidecar_child_mode_text \"$backend_sidecar_child_mode\")\"
+  if [ \"$backend_sidecar_child_mode\" = \"\" ]; then
+    echo \"[Error] missing strict fresh Cheng sidecar child mode; run verify_backend_sidecar_cheng_fresh\" 1>&2
+    exit 1
+  fi
+  if [ \"$backend_sidecar_child_mode\" = \"outer_cli\" ]; then
+    backend_sidecar_outer_companion=\"$sidecar_outer_compiler_raw\"
+    if [ \"$backend_sidecar_outer_companion\" = \"\" ]; then
+      backend_sidecar_outer_companion=\"$(resolve_backend_sidecar_defaults_field outer_companion \"$backend_target\" 2>/dev/null || true)\"
+    fi
+    if [ \"$backend_sidecar_outer_companion\" = \"\" ]; then
+      echo \"[Error] missing strict fresh Cheng sidecar outer companion; run verify_backend_sidecar_cheng_fresh\" 1>&2
+      exit 1
+    fi
+  elif [ \"$sidecar_outer_compiler_raw\" != \"\" ]; then
+    echo \"[Error] --sidecar-outer-compiler requires --sidecar-child-mode:outer_cli\" 1>&2
+    exit 2
+  fi
+fi
+
+backend_whole_program=\"$whole_program_raw\"
+if [ \"$backend_whole_program\" = \"\" ]; then
+  backend_whole_program=\"$(read_env_default BACKEND_WHOLE_PROGRAM)\"
+fi
+backend_whole_program=\"$(normalize_bool_text \"$backend_whole_program\" \"--whole-program\")\"
+
+backend_opt=\"$opt_raw\"
+if [ \"$backend_opt\" = \"\" ]; then
+  backend_opt=\"$(read_env_default BACKEND_OPT)\"
+fi
+backend_opt=\"$(normalize_bool_text \"$backend_opt\" \"--opt\")\"
+
+backend_opt2=\"$opt2_raw\"
+if [ \"$backend_opt2\" = \"\" ]; then
+  backend_opt2=\"$(read_env_default BACKEND_OPT2)\"
+fi
+backend_opt2=\"$(normalize_bool_text \"$backend_opt2\" \"--opt2\")\"
+
+backend_opt_level=\"$opt_level_raw\"
+if [ \"$backend_opt_level\" = \"\" ]; then
+  backend_opt_level=\"$(read_env_default BACKEND_OPT_LEVEL)\"
+fi
+backend_opt_level=\"$(normalize_opt_level_text \"$backend_opt_level\")\"
+
+backend_generic_mode=\"$generic_mode_raw\"
+if [ \"$backend_generic_mode\" = \"\" ]; then
+  backend_generic_mode=\"$(read_env_default GENERIC_MODE)\"
+fi
+if [ \"$backend_generic_mode\" = \"\" ]; then
+  backend_generic_mode=\"dict\"
+fi
+backend_generic_mode=\"$(normalize_generic_mode_text \"$backend_generic_mode\")\"
+
+backend_generic_spec_budget=\"$generic_spec_budget_raw\"
+if [ \"$backend_generic_spec_budget\" = \"\" ]; then
+  backend_generic_spec_budget=\"$(read_env_default GENERIC_SPEC_BUDGET)\"
+fi
+if [ \"$backend_generic_spec_budget\" = \"\" ]; then
+  backend_generic_spec_budget=\"0\"
+fi
+backend_generic_spec_budget=\"$(normalize_nonneg_int_text \"$backend_generic_spec_budget\" \"--generic-spec-budget\")\"
+
+backend_generic_lowering=\"$generic_lowering_raw\"
+if [ \"$backend_generic_lowering\" = \"\" ]; then
+  backend_generic_lowering=\"$(read_env_default GENERIC_LOWERING)\"
+fi
+if [ \"$backend_generic_lowering\" = \"\" ]; then
+  backend_generic_lowering=\"mir_dict\"
+fi
+backend_generic_lowering=\"$(normalize_generic_lowering_text \"$backend_generic_lowering\")\"
+
+backend_multi_env=\"$multi_raw\"
+if [ \"$backend_multi_env\" = \"\" ]; then
+  backend_multi_env=\"$(read_env_default BACKEND_MULTI)\"
+fi
+if [ \"$backend_multi_env\" = \"\" ]; then
+  if [ \"$build_track\" = \"release\" ]; then
+    backend_multi_env=\"${CHENGC_RELEASE_MULTI_DEFAULT:-0}\"
+  else
+    backend_multi_env=\"${CHENGC_DEV_MULTI_DEFAULT:-1}\"
+  fi
+fi
+backend_multi_env=\"$(normalize_bool_text \"$backend_multi_env\" \"--multi\")\"
+
+backend_multi_force_env=\"$multi_force_raw\"
+if [ \"$backend_multi_force_env\" = \"\" ]; then
+  backend_multi_force_env=\"0\"
+fi
+backend_multi_force_env=\"$(normalize_bool_text \"$backend_multi_force_env\" \"--multi-force\")\"
+
+backend_inc_env=\"$incremental_raw\"
+if [ \"$backend_inc_env\" = \"\" ]; then
+  backend_inc_env=\"$(read_env_default BACKEND_INCREMENTAL)\"
+fi
+if [ \"$backend_inc_env\" = \"\" ]; then
+  backend_inc_env=\"1\"
+fi
+backend_inc_env=\"$(normalize_bool_text \"$backend_inc_env\" \"--incremental\")\"
+
+backend_fn_jobs_env=\"$fn_jobs_raw\"
+if [ \"$backend_fn_jobs_env\" = \"\" ]; then
+  backend_fn_jobs_env=\"$(read_env_default BACKEND_FN_JOBS)\"
+fi
+backend_fn_jobs_env=\"$(normalize_jobs_text \"$backend_fn_jobs_env\" \"--fn-jobs\")\"
+if [ \"$backend_fn_jobs_env\" = \"\" ]; then
+  backend_fn_jobs_env=\"$jobs\"
+fi
+
+backend_no_runtime_c=\"$no_runtime_c_raw\"
+if [ \"$backend_no_runtime_c\" = \"\" ]; then
+  backend_no_runtime_c=\"$(read_env_default BACKEND_NO_RUNTIME_C)\"
+fi
+backend_no_runtime_c=\"$(normalize_bool_text \"$backend_no_runtime_c\" \"--no-runtime-c\")\"
+
+backend_runtime_obj=\"$runtime_obj_raw\"
+if [ \"$backend_runtime_obj\" = \"\" ]; then
+  backend_runtime_obj=\"$(read_env_default BACKEND_RUNTIME_OBJ)\"
+fi
+
+tooling_selfhost_launcher_requested=\"0\"
+tooling_selfhost_launcher_out_path=\"\"
+if [ \"$backend_emit\" = \"exe\" ] && \
+   [ \"$build_track\" != \"release\" ] && \
+   [ \"$legacy_run\" != \"1\" ] && \
+   [ \"$backend_target\" = \"$host_target\" ] && \
+   tooling_emit_selfhost_launcher_enabled && \
+   tooling_selfhost_source_is_tooling_main \"$in\"; then
+  tooling_selfhost_launcher_requested=\"1\"
+  tooling_selfhost_launcher_out_path=\"$out_path\"
+  out_path=\"$(tooling_selfhost_native_exec_path \"$tooling_selfhost_launcher_out_path\")\"
+fi
+
+requested_linker=\"$linker\"
+if [ \"$requested_linker\" = \"\" ]; then
+  requested_linker=\"$(read_env_default BACKEND_LINKER)\"
+fi
+if [ \"$requested_linker\" = \"\" ] && [ \"$backend_emit\" = \"exe\" ]; then
+  if [ \"$build_track\" = \"release\" ]; then
+    requested_linker=\"system\"
+  else
+    requested_linker=\"auto\"
+  fi
+fi
+case \"$requested_linker\" in
+  \"\"|auto|self|sys")
+        add(chunks, "tem) ;;
+  *)
+    echo \"[Error] invalid --linker:$requested_linker (expected self|system)\" 1>&2
+    exit 2
+    ;;
+esac
+
+resolved_linker=\"$requested_linker\"
+resolved_no_runtime_c=\"$backend_no_runtime_c\"
+resolved_runtime_obj=\"$backend_runtime_obj\"
+resolved_runtime_obj_assigned=\"0\"
+if [ \"$resolved_runtime_obj\" != \"\" ]; then
+  resolved_runtime_obj_assigned=\"1\"
+fi
+
+resolve_link_env() {
+  link_env=\"$(sh \"$root/src/tooling/cheng_tooling_embedded_scripts/backend_link_env.sh\" \
+    --driver:\"$driver_exec\" \
+    --target:\"$backend_target\" \
+    --linker:\"$requested_linker\")\"
+  resolved_linker=\"\"
+  resolved_no_runtime_c=\"\"
+  resolved_runtime_obj=\"\"
+  resolved_runtime_obj_assigned=\"0\"
+  for entry in $link_env; do
+    case \"$entry\" in
+      BACKEND_LINKER=*)
+        resolved_linker=\"${entry#BACKEND_LINKER=}\"
+        ;;
+      BACKEND_NO_RUNTIME_C=*)
+        resolved_no_runtime_c=\"${entry#BACKEND_NO_RUNTIME_C=}\"
+        ;;
+      BACKEND_RUNTIME_OBJ=*)
+        resolved_runtime_obj=\"${entry#BACKEND_RUNTIME_OBJ=}\"
+        resolved_runtime_obj_assigned=\"1\"
+        ;;
+    esac
+  done
+  if [ \"$resolved_linker\" = \"\" ]; then
+    echo \"[Error] chengc: backend_link_env missing BACKEND_LINKER\" 1>&2
+    exit 1
+  fi
+}
+
+if [ \"$backend_emit\" = \"exe\" ]; then
+  resolve_link_env
+  if [ \"$backend_no_runtime_c\" != \"\" ]; then
+    resolved_no_runtime_c=\"$backend_no_runtime_c\"
+  fi
+  if [ \"$backend_runtime_obj\" != \"\" ]; then
+    resolved_runtime_obj=\"$backend_runtime_obj\"
+    resolved_runtime_obj_assigned=\"1\"
+  fi
+  if [ \"$resolved_runtime_obj_assigned\" = \"1\" ] && [ \"$resolved_no_runtime_c\" = \"0\" ]; then
+    echo \"[Error] --runtime-obj requires --no-runtime-c:1\" 1>&2
+    exit 2
+  fi
+  if [ \"$resolved_runtime_obj_assigned\" = \"1\" ] && [ \"$resolved_no_runtime_c\" = \"\" ]; then
+    resolved_no_runtime_c=\"1\"
+  fi
+  if [ \"$resolved_linker\" = \"self\" ] && [ \"$resolved_no_runtime_c\" = \"0\" ]; then
+    echo \"[Error] self linker requires --no-runtime-c:1\" 1>&2
+    exit 2
+  fi
+  if [ \"$resolved_linker\" = \"self\" ] && [ \"$resolved_runtime_obj_assigned\" != \"1\" ]; then
+    echo \"[Error] self linker requires a runtime object\" 1>&2
+    exit 2
+  fi
+fi
+backend_linker=\"$resolved_linker\"
+
+backend_ldflags_final=\"$ldflags_raw\"
+if [ \"$backend_emit\" = \"exe\" ] && [ \"$backend_linker\" = \"system\" ]; then
+  if [ \"${BACKEND_LD:-}\" = \"\" ] && ! has_fuse_ld_flag \"$backend_ldflags_final\"; then
+    resolver_out=\"$(env \
+      BACKEND_SYSTEM_LINKER_PRIORITY=\"${BACKEND_SYSTEM_LINKER_PRIORITY:-mold,lld,default}\" \
+      ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} resolve_system_linker)\"
+    resolver_kind=\"$(printf '%s\n' \"$resolver_out\" | sed -n 's/^kind=//p' | head -n 1)\"
+    resolver_ldflags=\"$(printf '%s\n' \"$resolver_out\" | sed -n 's/^ldflags=//p' | head -n 1)\"
+    if [ \"$resolver_ldflags\" != \"\" ]; then
+      backend_ldflags_final=\"$(append_token \"$backend_ldflags_final\" \"$resolver_ldflags\")\"
+    fi
+  fi
+fi
+
+backend_fn_sched_env=\"$(normalize_fn_sched_text \"$fn_sched_raw\")\"
+if [ \"$backend_fn_sched_env\" = \"\" ]; then
+  backend_fn_sched_env=\"ws\"
+fi
+
+backend_module_cache=\"$module_cache_raw\"
+backend_multi_module_cache=\"$(normalize_bool_text \"$multi_module_cache_raw\" \"--multi-module-cache\")\"
+if [ \"$backend_multi_module_cache\" = \"\" ]; then
+  backend_multi_module_cache=\"0\"
+fi
+backend_module_cache_unstable_allow=\"$(normalize_bool_text \"$module_cache_unstable_allow_raw\" \"--module-cache-unstable-allow\")\"
+if [ \"$backend_module_cache_unstable_allow\" = \"\" ]; then
+  backend_module_cache_unstable_allow=\"0\"
+fi
+if [ \"$backend_multi_module_cache\" = \"1\" ] && [ \"$backend_module_cache_unstable_allow\" != \"1\" ]; then
+  echo \"[Error] --multi-module-cache requires --module-cache-unstable-allow:1\" 1>&2
+  exit 2
+fi
+
+run_backend_driver() {
+  set -- env -i \
+    \"PATH=$clean_env_path\" \
+    \"HOME=$clean_env_home\" \
+    \"TMPDIR=$clean_env_tmpdir\" \
+    \"TOOLING_ROOT=$root\"
+  if [ \"$driver_real_env\" != \"\" ]; then
+    set -- \"$@\" \"$driver_real_env\"
+  fi
+  if [ \"${PKG_ROOTS:-}\" != \"\" ]; then
+    set -- \"$@\" \"PKG_ROOTS=$PKG_ROOTS\"
+  fi
+  set -- \"$@\" \
+    \"$driver_exec\" \"$in\" \
+    \"--emit:$backend_emit\" \
+    \"--frontend:$frontend\" \
+    \"--build-track:$build_track\" \
+    \"--mm:$mm\" \
+    \"--fn-sched:$backend_fn_sched_env\" \
+    \"--target:$backend_target\" \
+    \"--generic-mode:$backend_generic_mode\" \
+    \"--generic-spec-budget:$backend_generic_spec_budget\" \
+    \"--generic-lowering:$backend_generic_lowering\" \
+    \"--jobs:$jobs\" \
+    \"--fn-jobs:$backend_fn_jobs_env\"
+  if [ \"$backend_whole_program\" != \"\" ]; then
+    set -- \"$@\" \"--whole-program:$backend_whole_program\"
+  fi
+  if [ \"$backend_ldflags_final\" != \"\" ]; then
+    set -- \"$@\" \"--ldflags:$backend_ldflags_final\"
+  fi
+  if [ \"$backend_module_cache\" != \"\" ]; then
+    set -- \"$@\" \"--module-cache:$backend_module_cache\"
+  fi
+  if [ \"$backend_multi_module_cache\" = \"1\" ]; then
+    set -- \"$@\" \"--multi-module-cache\"
+  else
+    set -- \"$@\" \"--no-multi-module-cache\"
+  fi
+  if [ \"$backend_module_cache_unstable_allow\" = \"1\" ]; then
+    set -- \"$@\" \"--module-cache-unstable-allow\"
+  else
+    set -- \"$@\" \"--no-module-cache-unstable-allow\"
+  fi
+  if [ \"$backend_sidecar_mode\" != \"\" ]; then
+    set -- \"$@\" \"--sidecar-mode:$backend_sidecar_mode\"
+  fi
+  if [ \"$backend_sidecar_bundle\" != \"\" ]; then
+    set -- \"$@\" \"--sidecar-bundle:$backend_sidecar_bundle\"
+  fi
+  if [ \"$backend_sidecar_compiler\" != \"\" ]; then
+    set -- \"$@\" \"--sidecar-compiler:$backend_sidecar_compiler\"
+  fi
+  if [ \"$backend_sidecar_child_mode\" != \"\" ]; then
+    set -- \"$@\" \"--sidecar-child-mode:$backend_sidecar_child_mode\"
+  fi
+  if [ \"$backend_sidecar_outer_companion\" != \"\" ]; then
+    set -- \"$@\" \"--sidecar-outer-compiler:$backend_sidecar_outer_companion\"
+  fi
+  if [ \"$backend_emit\" = \"exe\" ]; then
+    set -- \"$@\" \"--linker:$backend_linker\"
+  fi
+  if [ \"$backend_multi_env\" = \"1\" ]; then
+    set -- \"$@\" \"--multi\"
+  else
+    set -- \"$@\" \"--no-multi\"
+  fi
+  if [ \"$backend_multi_force_env\" = \"1\" ]; then
+    set -- \"$@\" \"--multi-force\"
+  else
+    set -- \"$@\" \"--no-multi-force\"
+  fi
+  if [ \"$backend_inc_env\" = \"1\" ]; then
+    set -- \"$@\" \"--incremental\"
+  else
+    set -- \"$@\" \"--no-incremental\"
+  fi
+  if [ \"$backend_opt\" = \"1\" ]; then
+    set -- \"$@\" \"--opt\"
+  elif [ \"$backend_opt\" = \"0\" ]; then
+    set -- \"$@\" \"--no-opt\"
+  fi
+  if [ \"$backend_opt2\" = \"1\" ]; then
+    set -- \"$@\" \"--opt2\"
+  elif [ \"$backend_opt2\" = \"0\" ]; then
+    set -- \"$@\" \"--no-opt2\"
+  fi
+  if [ \"$backend_opt_level\" != \"\" ]; then
+    set -- \"$@\" \"--opt-level:$backend_opt_level\"
+  fi
+  if [ \"$backend_emit\" = \"exe\" ] && [ \"$resolved_no_runtime_c\" = \"1\" ]; then
+    set -- \"$@\" \"--no-runtime-c\"
+  fi
+  if [ \"$backend_emit\" = \"exe\" ] && [ \"$resolved_runtime_obj_assigned\" = \"1\" ]; then
+    set -- \"$@\" \"--runtime-obj:$resolved_runtime_obj\"
+  fi
+  set -- \"$@\" \"--output:$out_path\"
+  \"$@\"
+}
+
+set +e
+run_backend_driver
+build_status=\"$?\"
+set -e
+if [ \"$build_status\" -ne 0 ]; then
+  exit \"$build_status\"
+fi
+
+if [ \"$backend_emit\" = \"exe\" ]; then
+  cleanup_backend_exe_sidecar \"$out_path\"
+fi
+
+reported_out_path=\"$out_path\"
+run_out_path=\"$out_path\"
+if [ \"$backend_emit\" = \"exe\" ] && [ \"$tooling_selfhost_launcher_requested\" = \"1\" ]; then
+  emit_tooling_selfhost_launcher \"$tooling_selfhost_launcher_out_path\" \"$out_path\"
+  reported_out_path=\"$tooling_selfhost_launcher_out_path\"
+fi
+
+if [ \"$backend_emit\" = \"obj\" ]; then
+  echo \"chengc obj ok: $out_path\"
+else
+  echo \"chengc exe ok: $reported_out_path\"
+fi
+
+if [ \"$legacy_run\" != \"1\" ] || [ \"$backend_emit\" != \"exe\" ]; then
+  exit 0
+fi
+if [ \"$run_mode\" = \"\" ]; then
+  run_mode=\"host\"
+fi
+
+case \"$backend_target\" in
+  *android*)
+    if [ \"$run_mode\" = \"host\" ]; then
+      echo \"[chengc] run(android) does not support host runner yet, fallback to file mode\" >&2
+    fi
+    if ! command -v adb >/dev/null 2>&1; then
+      echo \"[chengc] missing tool: adb (required for --run on android targets)\" 1>&2
+      exit 2
+    fi
+    serial=\"${ANDROID_SERIAL:-}\"
+    if [ -z \"$serial\" ]; then
+      serial=\"$(adb devices | awk 'NR>1 && $2 == \"device\" {print $1; exit}')\"
+    fi
+    if [ -z \"$serial\" ]; then
+      echo \"[chengc] no Android device/emulator detected (adb devices)\" 1>&2
+      exit 2
+    fi
+    remote_dir=\"/data/local/tmp/chengc\"
+    remote_path=\"$remote_dir/$(basename \"$out_path\")\"
+    adb -s \"$serial\" shell \"mkdir -p '$remote_dir'\" >/dev/null
+    adb -s \"$serial\" push \"$out_path\" \"$remote_path\" >/dev/null
+    adb -s \"$serial\" shell \"chmod 755 '$remote_path'\" >/dev/null
+    echo \"[chengc] run(android): $remote_path ($serial)\" >&2
+    adb -s \"$serial\" shell \"$remote_path\"
+    exit $?
+    ;;
+esac
+
+if [ \"$run_mode\" = \"host\" ]; then
+  echo \"[chengc] run(host-runner): $run_out_path\" >&2
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_host_runner run-host --exe:\"$run_out_path\"
+  exit $?
+fi
+
+echo \"[chengc] run(file): $run_out_path\" >&2
+\"$run_out_path\"
+")
         return toolingEmbeddedJoinChunks(chunks)
-    if id == "chengc_daemon":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc_daemon [status|start|stop|serve]\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc_daemon run -- <chengc args...>\n\nNotes:\n  - `run` enqueues one `chengc` request to a local daemon worker and waits for completion.\n  - Enable automatic routing from `chengc` via `CHENGC_DAEMON=1`.\n  - Daemon state dir default: `chengcache/chengc_daemon`.\nEOF\n}\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\ndaemon_dir=\"${CHENGC_DAEMON_DIR:-$root/chengcache/chengc_daemon}\"\npid_file=\"$daemon_dir/daemon.pid\"\nlog_file=\"$daemon_dir/daemon.log\"\nqueue_dir=\"$daemon_dir/queue\"\npoll_interval=\"${CHENGC_DAEMON_POLL_INTERVAL:-0.05}\"\nwait_timeout=\"${CHENGC_DAEMON_WAIT_TIMEOUT:-60}\"\n\nquote_sh() {\n  text=\"$1\"\n  esc=\"$(printf '%s' \"$text\" | sed \"s/'/'\\\"'\\\"'/g\")\"\n  printf \"'%s'\" \"$esc\"\n}\n\npid_alive() {\n  pid=\"$1\"\n  [ \"$pid\" != \"\" ] || return 1\n  case \"$pid\" in\n    *[!0-9]*)\n      return 1\n      ;;\n  esac\n  kill -0 \"$pid\" 2>/dev/null\n}\n\nread_pid() {\n  if [ ! -f \"$pid_file\" ]; then\n    printf '%s\\n' \"\"\n    return\n  fi\n  cat \"$pid_file\" 2>/dev/null || true\n}\n\nstart_daemon() {\n  mkdir -p \"$queue_dir\"\n  old_pid=\"$(read_pid)\"\n  if pid_alive \"$old_pid\"; then\n    printf '[chengc_daemon] already running pid=%s\\n' \"$old_pid\"\n    return 0\n  fi\n  rm -f \"$pid_file\"\n  nohup ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc_daemon serve >>\"$log_file\" 2>&1 &\n  daemon_pid=\"$!\"\n  printf '%s\\n' \"$daemon_pid\" >\"$pid_file\"\n  waits=0\n  while [ \"$waits\" -lt 40 ]; do\n ")
-        add(chunks, "   if pid_alive \"$daemon_pid\"; then\n      printf '[chengc_daemon] started pid=%s\\n' \"$daemon_pid\"\n      return 0\n    fi\n    waits=$((waits + 1))\n    sleep 0.05\n  done\n  echo \"[chengc_daemon] failed to start daemon worker\" 1>&2\n  return 1\n}\n\nstop_daemon() {\n  pid=\"$(read_pid)\"\n  if ! pid_alive \"$pid\"; then\n    rm -f \"$pid_file\"\n    printf '[chengc_daemon] not running\\n'\n    return 0\n  fi\n  kill \"$pid\" 2>/dev/null || true\n  waits=0\n  while pid_alive \"$pid\"; do\n    waits=$((waits + 1))\n    if [ \"$waits\" -gt 40 ]; then\n      kill -9 \"$pid\" 2>/dev/null || true\n      break\n    fi\n    sleep 0.05\n  done\n  rm -f \"$pid_file\"\n  printf '[chengc_daemon] stopped pid=%s\\n' \"$pid\"\n}\n\nstatus_daemon() {\n  pid=\"$(read_pid)\"\n  if pid_alive \"$pid\"; then\n    printf 'status=running\\npid=%s\\nlog=%s\\nqueue=%s\\n' \"$pid\" \"$log_file\" \"$queue_dir\"\n    return 0\n  fi\n  printf 'status=stopped\\nlog=%s\\nqueue=%s\\n' \"$log_file\" \"$queue_dir\"\n  return 1\n}\n\nserve_loop() {\n  mkdir -p \"$queue_dir\"\n  printf '[chengc_daemon] serve loop started pid=%s dir=%s\\n' \"$$\" \"$daemon_dir\"\n  while true; do\n    processed=\"0\"\n    for pending in \"$queue_dir\"/*/pending; do\n      [ -e \"$pending\" ] || continue\n      req_dir=\"$(dirname \"$pending\")\"\n      if ! mv \"$pending\" \"$req_dir/working\" 2>/dev/null; then\n        continue\n      fi\n      processed=\"1\"\n      req_script=\"$req_dir/request.sh\"\n      out_file=\"$req_dir/stdout.log\"\n      err_file=\"$req_dir/stderr.log\"\n      rc_file=\"$req_dir/rc\"\n      done_file=\"$req_dir/done\"\n      rm -f \"$done_file\" \"$rc_file\"\n      if [ ! -x \"$req_script\" ]; then\n        printf '[chengc_daemon] missing request script: %s\\n' \"$req_script\" >\"$err_f")
-        add(chunks, "ile\"\n        printf '%s\\n' \"127\" >\"$rc_file\"\n      else\n        set +e\n        \"$req_script\" >\"$out_file\" 2>\"$err_file\"\n        req_rc=\"$?\"\n        set -e\n        printf '%s\\n' \"$req_rc\" >\"$rc_file\"\n      fi\n      touch \"$done_file\"\n      rm -f \"$req_dir/working\"\n    done\n    if [ \"$processed\" = \"0\" ]; then\n      sleep \"$poll_interval\"\n    fi\n  done\n}\n\nrun_request() {\n  if [ \"$#\" -le 0 ]; then\n    echo \"[chengc_daemon] missing chengc args for run\" 1>&2\n    exit 2\n  fi\n  start_daemon\n  mkdir -p \"$queue_dir\"\n  req_id=\"$(date +%s%N 2>/dev/null || date +%s).$$\"\n  req_dir=\"$queue_dir/$req_id\"\n  mkdir -p \"$req_dir\"\n  req_script=\"$req_dir/request.sh\"\n  out_file=\"$req_dir/stdout.log\"\n  err_file=\"$req_dir/stderr.log\"\n  rc_file=\"$req_dir/rc\"\n  done_file=\"$req_dir/done\"\n  {\n    echo '#!/usr/bin/env sh'\n    echo 'set -eu'\n    printf 'cd %s\\n' \"$(quote_sh \"$root\")\"\n    printf 'set --'\n    for arg in \"$@\"; do\n      printf ' %s' \"$(quote_sh \"$arg\")\"\n    done\n    printf '\\n'\n    echo 'exec env CHENGC_DAEMON_ACTIVE=1 ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc \"$@\"'\n  } >\"$req_script\"\n  chmod +x \"$req_script\"\n  : >\"$req_dir/pending\"\n\n  deadline=\"$(( $(date +%s) + wait_timeout ))\"\n  while [ ! -f \"$done_file\" ]; do\n    now=\"$(date +%s)\"\n    if [ \"$now\" -ge \"$deadline\" ]; then\n      echo \"[chengc_daemon] request timeout (${wait_timeout}s): $req_id\" 1>&2\n      exit 124\n    fi\n    sleep 0.05\n  done\n\n  if [ -f \"$out_file\" ]; then\n    cat \"$out_file\"\n  fi\n  if [ -f \"$err_file\" ]; then\n    cat \"$err_file\" 1>&2\n  fi\n  req_rc=\"1\"\n  if [ -f \"$rc_file\" ]; then\n    req_rc=\"$(cat \"$rc_file\" 2>/dev/null || echo 1)\"\n  fi")
-        add(chunks, "\n  if [ \"${CHENGC_DAEMON_KEEP_REQUESTS:-0}\" != \"1\" ]; then\n    rm -rf \"$req_dir\"\n  fi\n  exit \"$req_rc\"\n}\n\ncmd=\"${1:-status}\"\ncase \"$cmd\" in\n  --help|-h|help)\n    usage\n    exit 0\n    ;;\n  start)\n    start_daemon\n    exit 0\n    ;;\n  stop)\n    stop_daemon\n    exit 0\n    ;;\n  status)\n    status_daemon\n    exit $?\n    ;;\n  serve)\n    serve_loop\n    exit 0\n    ;;\n  run)\n    shift || true\n    if [ \"${1:-}\" = \"--\" ]; then\n      shift || true\n    fi\n    run_request \"$@\"\n    ;;\n  *)\n    echo \"[chengc_daemon] unknown command: $cmd\" 1>&2\n    usage 1>&2\n    exit 2\n    ;;\nesac\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "cleanup_backend_obj_like_artifacts":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nscan_paths_csv=\"${BACKEND_NO_OBJ_SCAN_PATHS:-artifacts/backend_closedloop:artifacts/backend_profile_smoke:artifacts/backend_profile_schema:artifacts/backend_mem_contract:artifacts/backend_dod_contract:artifacts/backend_mem_image_core:artifacts/backend_mem_exe_emit:artifacts/backend_profile_baseline:artifacts/backend_linkerless_dev:artifacts/backend_hotpatch_meta:artifacts/backend_hotpatch_inplace:artifacts/backend_incr_patch_fastpath:artifacts/backend_mem_patch_regression:artifacts/backend_hotpatch:artifacts/backend_plugin_isolation:artifacts/backend_linker_abi_core:artifacts/backend_self_linker_elf:artifacts/backend_self_linker_coff:artifacts/backend_prod:dist/releases/current}\"\n\nout_dir=\"artifacts/backend_no_obj_artifacts\"\nmkdir -p \"$out_dir\"\ndeleted_file=\"$out_dir/backend_no_obj_artifacts.deleted.txt\"\n: >\"$deleted_file\"\n\nold_ifs=\"$IFS\"\nIFS=':'\nfor p in $scan_paths_csv; do\n  IFS=\"$old_ifs\"\n  [ \"$p\" != \"\" ] || continue\n  if [ ! -e \"$p\" ]; then\n    continue\n  fi\n  find \"$p\" \\( -type f -o -type d \\) \\\n    \\( -name '*.o' -o -name '*.obj' -o -name '*.objs' -o -name '*.objs.lock' -o -name '*.tmp.linkobj' \\) \\\n    -print >>\"$deleted_file\"\ndone\nIFS=\"$old_ifs\"\n\nif [ -s \"$deleted_file\" ]; then\n  LC_ALL=C sort -u \"$deleted_file\" -o \"$deleted_file\"\n  while IFS= read -r path; do\n    [ \"$path\" != \"\" ] || continue\n    rm -rf \"$path\" 2>/dev/null || true\n  done <\"$deleted_file\"\nfi\n\ndeleted_count=\"0\"\nif [ -s \"$deleted_file\" ]; then\n  deleted_count=\"$(wc -l < \"$deleted_file\" | tr -d ' ')\"\nfi\n\necho \"cleanup_backend_obj_like_artifacts ok (d")
-        add(chunks, "eleted=$deleted_count)\"\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "cleanup_cheng_local":
-        return "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/cleanup_cheng_local.sh [--verbose]\n\nMoves local backend driver binaries and their debug symbol bundles out of the repo\nroot:\n  cheng*\n  chengcache/cheng*\n\nNotes:\n  - These are local build/debug artifacts (they are gitignored).\n  - Safe to run even when nothing matches.\nEOF\n}\n\ncase \"${1:-}\" in\n  --help|-h)\n    usage\n    exit 0\n    ;;\n  \"\"|--verbose)\n    ;;\n  *)\n    echo \"[Error] unknown arg: $1\" 1>&2\n    usage\n    exit 2\n    ;;\nesac\n\nverbose=\"0\"\nif [ \"${1:-}\" = \"--verbose\" ]; then\n  verbose=\"1\"\nfi\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\n\ndeleted=\"0\"\ntrash_dir=\"${TOOLING_TRASH_DIR:-$root/chengcache/_trash_cheng}\"\nmkdir -p \"$trash_dir\" 2>/dev/null || true\n\nmove_to_trash() {\n  path=\"$1\"\n  if [ ! -e \"$path\" ]; then\n    return\n  fi\n  base=\"$(basename \"$path\")\"\n  ts=\"$(date +%s 2>/dev/null || echo 0)\"\n  dst=\"$trash_dir/${base}.${ts}.$$\"\n  mv -f -- \"$path\" \"$dst\" 2>/dev/null || true\n  deleted=\"1\"\n}\n\nfor path in \\\n  \"$root\"/cheng \\\n  \"$root\"/cheng.* \\\n  \"$root\"/chengcache/cheng*.c \\\n  \"$root\"/chengcache/cheng*.c.key \\\n  \"$root\"/chengcache/cheng*.build.key \\\n  \"$root\"/chengcache/cheng*.deps.list \\\n  \"$root\"/chengcache/cheng*.modules; do\n  move_to_trash \"$path\"\ndone\n\nif [ \"$verbose\" = \"1\" ]; then\n  if [ \"$deleted\" = \"1\" ]; then\n    echo \"cleanup_cheng_local ok\"\n  else\n    echo \"cleanup_cheng_local noop\"\n  fi\nfi\n"
-    if id == "closedloop":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env bash\n:\nset -euo pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")/../..\" && pwd)\"\ncd \"$root\"\n\nexport BACKEND_PROD_GATE_TIMEOUT=\"${BACKEND_PROD_GATE_TIMEOUT:-60}\"\nexport BACKEND_PROD_SELFHOST_TIMEOUT=\"${BACKEND_PROD_SELFHOST_TIMEOUT:-60}\"\nexport BACKEND_PROD_TIMEOUT_DIAG=\"${BACKEND_PROD_TIMEOUT_DIAG:-1}\"\nexport BACKEND_PROD_TIMEOUT_DIAG_SUMMARY=\"${BACKEND_PROD_TIMEOUT_DIAG_SUMMARY:-1}\"\nexport BACKEND_RUN_SELFHOST_PERF=\"${BACKEND_RUN_SELFHOST_PERF:-1}\"\n# stage1 fullspec gate default timeout; keep consistent with verify_stage1_fullspec.\nexport STAGE1_FULLSPEC_TIMEOUT=\"${STAGE1_FULLSPEC_TIMEOUT:-60}\"\n\nrun_cmd() {\n  local name=\"$1\"\n  shift\n  echo \"== ${name} ==\"\n  \"$@\"\n}\n\nif [ \"${CLOSEDLOOP_PROD:-0}\" = \"1\" ]; then\n  if [ \"${CLOSEDLOOP_STRICT:-}\" = \"\" ]; then\n    export CLOSEDLOOP_STRICT=1\n  fi\n  if [ \"${CLOSEDLOOP_BACKEND_PROD:-}\" = \"\" ]; then\n    export CLOSEDLOOP_BACKEND_PROD=1\n  fi\n  if [ \"${STAGE1_FULLSPEC:-}\" = \"\" ]; then\n    export STAGE1_FULLSPEC=\"${CLOSEDLOOP_STAGE1_FULLSPEC_DEFAULT:-0}\"\n  fi\n  export BACKEND_CLOSEDLOOP=1\n  export C_BACKEND_CLOSURE=1\n  export C_BACKEND_CLOSURE_ARGS=\"--no-bootstrap ${C_BACKEND_CLOSURE_ARGS:-}\"\n  export BOOTSTRAP_FORCE_DETERMINISM=1\nfi\n\nif [ \"${CLOSEDLOOP_DETERMINISM:-0}\" = \"1\" ]; then\n  export BOOTSTRAP_FORCE_DETERMINISM=1\nfi\n\nif [ \"${CLOSEDLOOP_SKIP_BOOTSTRAP:-0}\" != \"1\" ]; then\n  run_cmd \"bootstrap.fullspec\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} bootstrap_pure --fullspec\nfi\n\nif [ \"${CLOSEDLOOP_SKIP_VERIFY:-0}\" != \"1\" ]; then\n  run_cmd \"verify.core\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify\n  if [ \"${CLOSEDLOOP_BACKEND_PROD:-0}\" = \"1\" ]; then\n    ba")
-        add(chunks, "ckend_prod_args=\"${CLOSEDLOOP_BACKEND_PROD_ARGS:-}\"\n    if [ \"$backend_prod_args\" = \"\" ]; then\n      backend_prod_args=\"--no-publish\"\n    fi\n    if [ \"${CLOSEDLOOP_UIR_STABILITY:-0}\" = \"1\" ] && \\\n       ! printf '%s\\n' \"$backend_prod_args\" | grep -q -- \"--uir-stability\"; then\n      backend_prod_args=\"$backend_prod_args --uir-stability\"\n    fi\n    # shellcheck disable=SC2086\n    run_cmd \"backend.prod_closure\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_prod_closure $backend_prod_args\n  fi\nfi\n\nfrontier_mode=\"${CLOSEDLOOP_FRONTIER:-auto}\"\nrun_frontier=\"0\"\ncase \"$frontier_mode\" in\n  1|true|TRUE|yes|YES|on|ON)\n    run_frontier=\"1\"\n    ;;\n  auto)\n    if [ -d \"$root/../cheng-libp2p\" ] || [ -d \"$HOME/cheng-libp2p\" ] || [ -d \"$HOME/.cheng-packages/cheng-libp2p\" ]; then\n      run_frontier=\"1\"\n    fi\n    ;;\n  0|false|FALSE|no|NO|off|OFF)\n    run_frontier=\"0\"\n    ;;\n  *)\n    echo \"[closedloop] invalid CLOSEDLOOP_FRONTIER=$frontier_mode (expected auto|0|1)\" 1>&2\n    exit 2\n    ;;\nesac\n\nif [ \"$run_frontier\" = \"1\" ]; then\n  if [ -x \"artifacts/backend_selfhost_self_obj/cheng.stage2\" ] && [ \"${BACKEND_DRIVER:-}\" = \"\" ]; then\n    export BACKEND_DRIVER=\"artifacts/backend_selfhost_self_obj/cheng.stage2\"\n  fi\n  frontier_soft_auto=\"${CLOSEDLOOP_FRONTIER_SOFT_AUTO:-1}\"\n  case \"$frontier_mode/$frontier_soft_auto\" in\n    auto/1|auto/true|auto/TRUE|auto/yes|auto/YES|auto/on|auto/ON)\n      echo \"== verify.libp2p_frontier (auto, non-blocking) ==\"\n      set +e\n      ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_libp2p_frontier\n      frontier_rc=\"$?\"\n      set -e\n      if [ \"$frontier_rc\" -ne 0 ]; then\n        echo \"== verify.libp2p_frontier (auto-soft")
-        add(chunks, "-fail rc=$frontier_rc) ==\"\n      fi\n      ;;\n    *)\n      run_cmd \"verify.libp2p_frontier\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_libp2p_frontier\n      ;;\n  esac\nelif [ \"$frontier_mode\" = \"auto\" ]; then\n  echo \"== verify.libp2p_frontier (skip: cheng-libp2p repo not found) ==\"\nfi\n\nif [ \"${CLOSEDLOOP_LIBP2P:-0}\" = \"1\" ]; then\n  if [ -x \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" ]; then\n    run_cmd \"verify.libp2p.prod_closure\" env ROOT=\"$root\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_libp2p_prod_closure\n  else\n    echo \"[closedloop] missing ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" 1>&2\n    exit 1\n  fi\nfi\n\nif [ \"${CLOSEDLOOP_TIMEOUT_SUMMARY:-1}\" = \"1\" ] && [ -f \"src/tooling/summarize_timeout_diag.sh\" ]; then\n  set +e\n  run_cmd \"diag.timeout_summary\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} summarize_timeout_diag --latest:3 --top:12\n  rc_diag=\"$?\"\n  set -e\n  if [ \"$rc_diag\" -ne 0 ]; then\n    echo \"== diag.timeout_summary (skip: no timeout diag files) ==\"\n  fi\nfi\n\nif [ \"${CLOSEDLOOP_STAGE1_TIMEOUT_SUMMARY:-1}\" = \"1\" ] && [ -f \"src/tooling/summarize_stage1_timeout_diag.sh\" ]; then\n  set +e\n  run_cmd \"diag.stage1_timeout_summary\" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} summarize_stage1_timeout_diag --latest:3\n  rc_stage1_diag=\"$?\"\n  set -e\n  if [ \"$rc_stage1_diag\" -ne 0 ]; then\n    echo \"== diag.stage1_timeout_summary (skip: no stage1 timeout diag files) ==\"\n  fi\nfi\n\necho \"closedloop ok\"\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "demo_compute_settle":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env bash\n:\nset -euo pipefail\n\nROOT=\"build/cheng_demo_compute\"\nMODE=\"local\"\nEPOCH=\"1\"\nCLEAN=\"0\"\nRESET_LEDGER=\"0\"\nSETTLEMENT_BUDGET=\"2.0\"\nRWAD_CHAIN_ROOT=\"${RWAD_CHAIN_ROOT:-/Users/lbcheng/.cheng-packages/RWAD-blockchain}\"\nALLOW_MISSING_RWAD=\"0\"\nrepo_root=\"$(CDPATH= cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")/../..\" && pwd)\"\ncd \"$repo_root\"\n\nresolve_chengc_bin() {\n  local name=\"$1\"\n  case \"$name\" in\n    /*|*/*)\n      printf '%s\\n' \"$name\"\n      return\n      ;;\n  esac\n  printf '%s/artifacts/chengc/%s\\n' \"$repo_root\" \"$name\"\n}\n\nstorage_bin=\"$(resolve_chengc_bin cheng_storage)\"\n\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --root:*)\n      ROOT=\"${1#--root:}\"\n      ;;\n    --mode:*)\n      MODE=\"${1#--mode:}\"\n      ;;\n    --epoch:*)\n      EPOCH=\"${1#--epoch:}\"\n      ;;\n    --clean)\n      CLEAN=\"1\"\n      ;;\n    --reset-ledger)\n      RESET_LEDGER=\"1\"\n      ;;\n    --points-budget:*)\n      SETTLEMENT_BUDGET=\"${1#--points-budget:}\"\n      ;;\n    --settlement-budget:*)\n      SETTLEMENT_BUDGET=\"${1#--settlement-budget:}\"\n      ;;\n    --allow-missing-rwad)\n      ALLOW_MISSING_RWAD=\"1\"\n      ;;\n    *)\n      echo \"unknown arg: $1\" 1>&2\n      exit 1\n      ;;\n  esac\n  shift\ndone\n\nif [ \"$CLEAN\" = \"1\" ]; then\n  rm -rf \"$ROOT\"\nfi\nmkdir -p \"$ROOT\"\n\nif [ ! -x \"$storage_bin\" ]; then\n  src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage\nfi\n\nLEDGER=\"$ROOT/ledger.jsonl\"\nif [ \"$RESET_LEDGER\" = \"1\" ] && [ -f \"$LEDGER\" ]; then\n  rm -f \"$LEDGER\"\nfi\n\nruntime_ok=\"1\"\nset +e\nreq_out=\"$(\"$storage_bin\" exec --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --requester:node:app-1 \\\n  --gpu_ms:120000 --gp")
-        add(chunks, "u_mem_bytes:8589934592 --gpu_count:1 --gpu_type:A10G --workload:infer \\\n  --price_gpu:0.00002 --price_gpu_mem:0.15 --epoch:\"$EPOCH\" --root:\"$ROOT\" --mode:\"$MODE\" 2>/dev/null)\"\nif [ $? -ne 0 ]; then\n  runtime_ok=\"0\"\nfi\nset -e\n\nif [ \"$runtime_ok\" = \"1\" ]; then\n  req_id=\"$(printf '%s' \"$req_out\" | sed -n 's/^exec ok: //p')\"\n  if [ -z \"${req_id:-}\" ]; then\n    runtime_ok=\"0\"\n  fi\nfi\n\nif [ \"$runtime_ok\" = \"1\" ]; then\n  set +e\n  usage_out=\"$(\"$storage_bin\" meter --task:job-gpu-demo --package:pkg://demo/compute --author:node:alice --executor:node:exec-1 \\\n    --gpu_ms:110000 --gpu_mem_bytes:7516192768 --gpu_count:1 --gpu_type:A10G --workload:infer \\\n    --price_gpu:0.00002 --price_gpu_mem:0.15 --royalty:0.12 --treasury:0.03 \\\n    --epoch:\"$EPOCH\" --root:\"$ROOT\" --mode:\"$MODE\" 2>/dev/null)\"\n  if [ $? -ne 0 ]; then\n    runtime_ok=\"0\"\n  fi\n  set -e\nfi\n\nif [ \"$runtime_ok\" = \"1\" ]; then\n  usage_id=\"$(printf '%s' \"$usage_out\" | sed -n 's/^meter ok: //p')\"\n  if [ -z \"${usage_id:-}\" ]; then\n    runtime_ok=\"0\"\n  fi\nfi\n\nif [ \"$runtime_ok\" = \"1\" ]; then\n  set +e\n  rec_out=\"$(\"$storage_bin\" receipt --request:\"$req_id\" --task:job-gpu-demo --executor:node:exec-1 --status:ok \\\n    --usage:\"$usage_id\" --result:cid://result --epoch:\"$EPOCH\" --root:\"$ROOT\" --mode:\"$MODE\" 2>/dev/null)\"\n  if [ $? -ne 0 ]; then\n    runtime_ok=\"0\"\n  fi\n  set -e\nfi\n\nif [ \"$runtime_ok\" = \"1\" ]; then\n  rec_id=\"$(printf '%s' \"$rec_out\" | sed -n 's/^receipt ok: //p')\"\n  if [ -z \"${rec_id:-}\" ]; then\n    runtime_ok=\"0\"\n  fi\nfi\n\nif [ \"$runtime_ok\" = \"1\" ]; then\n  set +e\n  \"$storage_bin\" sample --root:\"$ROOT\" --epoch:\"$EPOCH\" --rate:1 --seed:demo \\\n    --auditor:node:auditor-")
-        add(chunks, "1 --record --format:toml >/dev/null 2>/dev/null\n  [ $? -ne 0 ] && runtime_ok=\"0\"\n  \"$storage_bin\" audit --task:job-gpu-demo --executor:node:exec-1 --auditor:node:auditor-1 --status:bad \\\n    --penalty:0.10 --epoch:\"$EPOCH\" --note:demo --root:\"$ROOT\" --mode:\"$MODE\" >/dev/null 2>/dev/null\n  [ $? -ne 0 ] && runtime_ok=\"0\"\n  \"$storage_bin\" fraud --task:job-gpu-demo --executor:node:exec-1 --reporter:node:auditor-1 \\\n    --reason:demo --epoch:\"$EPOCH\" --root:\"$ROOT\" >/dev/null 2>/dev/null\n  [ $? -ne 0 ] && runtime_ok=\"0\"\n  set -e\nfi\n\nif [ \"$runtime_ok\" != \"1\" ]; then\n  echo \"warn: runtime write path unavailable, fallback to empty-ledger bridge verification\" 1>&2\n  : > \"$LEDGER\"\nfi\n\necho \"settle:\"\n\"$storage_bin\" settle --root:\"$ROOT\" --format:toml --top:5 --reconcile-csv:\"$ROOT/settle_reconcile.csv\"\n\nbatch_id=\"cheng-epoch-$EPOCH\"\n${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng_rwad_bridge export --root:\"$ROOT\" --epoch:\"$EPOCH\" --batch-id:\"$batch_id\" \\\n  --out:\"$ROOT/rwad_batch.json\" --top:0\n\nrwad_tool=\"$RWAD_CHAIN_ROOT/tools/rwad_cheng_points_settle.sh\"\nif [ -x \"$rwad_tool\" ]; then\n  \"$rwad_tool\" --batchFile:\"$ROOT/rwad_batch.json\" --budget:\"$SETTLEMENT_BUDGET\" \\\n    --stateIn:\"$ROOT/rwad_points_state.json\" --stateOut:\"$ROOT/rwad_points_state.json\" \\\n    --out:\"$ROOT/rwad_result.json\"\n  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng_rwad_bridge apply --result:\"$ROOT/rwad_result.json\" \\\n    --batch:\"$ROOT/rwad_batch.json\" \\\n    --batch-id:\"$batch_id\" --require-status:finalized --out:\"$ROOT/rwad_ack.json\"\n  echo \"rwad-result:\"\n  cat \"$ROOT/rwad_result.json\"\nelse\n  if [ \"$ALLOW_MISSING_RWAD\" = \"1\" ]; then\n    echo \"warn: missing R")
-        add(chunks, "WAD tool: $rwad_tool\" 1>&2\n  else\n    echo \"error: missing RWAD tool: $rwad_tool\" 1>&2\n    echo \"hint: pass --allow-missing-rwad for local-only demo mode\" 1>&2\n    exit 1\n  fi\nfi\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "demo_io_lease":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env bash\n:\nset -euo pipefail\n\nROOT=\"build/cheng_demo\"\nMODE=\"local\"\nLISTEN=\"\"\nPEER=\"\"\nREQUIRE_LEASE=\"0\"\nCLEAN=\"0\"\nRESET_LEDGER=\"0\"\nFAIL_WITHOUT_LEASE=\"0\"\nREGEN_LEASE=\"0\"\nrepo_root=\"$(CDPATH= cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")/../..\" && pwd)\"\ncd \"$repo_root\"\n\nresolve_chengc_bin() {\n  local name=\"$1\"\n  case \"$name\" in\n    /*|*/*)\n      printf '%s\\n' \"$name\"\n      return\n      ;;\n  esac\n  printf '%s/artifacts/chengc/%s\\n' \"$repo_root\" \"$name\"\n}\n\nstorage_bin=\"$(resolve_chengc_bin cheng_storage)\"\nregistry_bin=\"$(resolve_chengc_bin cheng_registry)\"\n\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --root:*)\n      ROOT=\"${1#--root:}\"\n      ;;\n    --mode:*)\n      MODE=\"${1#--mode:}\"\n      ;;\n    --listen:*)\n      LISTEN=\"${1#--listen:}\"\n      ;;\n    --peer:*)\n      PEER=\"${1#--peer:}\"\n      ;;\n    --require-lease)\n      REQUIRE_LEASE=\"1\"\n      ;;\n    --clean)\n      CLEAN=\"1\"\n      ;;\n    --reset-ledger)\n      RESET_LEDGER=\"1\"\n      ;;\n    --fail-without-lease)\n      FAIL_WITHOUT_LEASE=\"1\"\n      ;;\n    --regen-lease)\n      REGEN_LEASE=\"1\"\n      ;;\n    *)\n      echo \"unknown arg: $1\" 1>&2\n      exit 1\n      ;;\n  esac\n  shift\ndone\nif [ \"$CLEAN\" = \"1\" ]; then\n  rm -rf \"$ROOT\"\nfi\nmkdir -p \"$ROOT\"\n\nif [ ! -x \"$storage_bin\" ]; then\n  src/tooling/chengc.sh src/tooling/cheng_storage.cheng --name:cheng_storage\nfi\n\nif [ ! -x \"$registry_bin\" ]; then\n  src/tooling/chengc.sh src/tooling/cheng_registry.cheng --name:cheng_registry\nfi\n\nKEY_JSON=\"$ROOT/keypair.json\"\nif [ ! -f \"$KEY_JSON\" ]; then\n  \"$registry_bin\" keygen --out:\"$KEY_JSON\"\nfi\n\nLEDGER=\"$ROOT/ledger.jsonl\"\nif [ \"$RESET_LEDGER\" = \"1\" ] && [ -f \"$LEDGER")
-        add(chunks, "\" ]; then\n  rm -f \"$LEDGER\"\nfi\npriv=\"$(sed -n 's/.*\"priv_key\"[[:space:]]*:[[:space:]]*\\\"\\\\([^\\\"]*\\\\)\\\".*/\\\\1/p' \"$KEY_JSON\")\"\nif [ -z \"${priv:-}\" ]; then\n  echo \"demo: missing priv_key\" 1>&2\n  exit 1\nfi\n\nLEASE_TOKEN=\"$ROOT/lease-token.json\"\nif [ \"$REGEN_LEASE\" = \"1\" ] || [ ! -f \"$LEASE_TOKEN\" ]; then\n  \"$storage_bin\" leasegen --package:pkg://demo/text --author:node:alice --provider:node:store-1 \\\n    --bytes:1048576 --days:30 --replicas:1 --price:0.25 --royalty:0.12 --treasury:0.03 \\\n    --priv:\"$priv\" --out:\"$LEASE_TOKEN\"\nfi\n\nif [ \"$REQUIRE_LEASE\" = \"1\" ]; then\n  export IO_REQUIRE_LEASE=1\nfi\nif [ \"$FAIL_WITHOUT_LEASE\" = \"1\" ] && [ \"$REQUIRE_LEASE\" != \"1\" ]; then\n  REQUIRE_LEASE=\"1\"\n  export IO_REQUIRE_LEASE=1\nfi\n\nif [ \"$MODE\" = \"p2p\" ]; then\n  if [ -z \"$LISTEN\" ] && [ -z \"$PEER\" ]; then\n    echo \"demo: p2p requires --listen or --peer\" 1>&2\n    exit 1\n  fi\nfi\n\nPUT_ARGS=(--root:\"$ROOT\" --mode:\"$MODE\")\nif [ -n \"$LISTEN\" ]; then\n  PUT_ARGS+=(--listen:\"$LISTEN\")\nfi\nif [ -n \"$PEER\" ]; then\n  PUT_ARGS+=(--peer:\"$PEER\")\nfi\n\nif [ \"$FAIL_WITHOUT_LEASE\" = \"1\" ]; then\n  echo \"expect failure without lease:\"\n  set +e\n  \"$storage_bin\" put-text --text:\"no lease\" \"${PUT_ARGS[@]}\"\n  rc=$?\n  set -e\n  if [ \"$rc\" -eq 0 ]; then\n    echo \"demo: expected failure but succeeded\" 1>&2\n    exit 1\n  fi\nfi\n\ncid=\"$(\"$storage_bin\" put-text --text:\"hello lease\" --lease:\"$LEASE_TOKEN\" \"${PUT_ARGS[@]}\")\"\necho \"cid: $cid\"\n\necho \"cat:\"\n\"$storage_bin\" cat --cid:\"$cid\" \"${PUT_ARGS[@]}\"\n\necho \"cat raw:\"\n\"$storage_bin\" cat --cid:\"$cid\" --raw \"${PUT_ARGS[@]}\"\n\necho \"settle:\"\necho \"note: payouts are under payouts.authors/provider")
-        add(chunks, "s\"\n\"$storage_bin\" settle --root:\"$ROOT\" --format:toml --top:5\necho \"settle (yaml):\"\n\"$storage_bin\" settle --root:\"$ROOT\" --format:yaml --top:5\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "detect_host_target":
-        return "#!/usr/bin/env sh\n:\nset -eu\n\nhost_os=\"$(uname -s 2>/dev/null || echo unknown)\"\nhost_arch=\"$(uname -m 2>/dev/null || echo unknown)\"\n\ncase \"$host_os\" in\n  Darwin)\n    case \"$host_arch\" in\n      arm64|aarch64)\n        echo \"arm64-apple-darwin\"\n        exit 0\n        ;;\n      x86_64|amd64)\n        echo \"x86_64-apple-darwin\"\n        exit 0\n        ;;\n    esac\n    ;;\n  Linux)\n    case \"$host_arch\" in\n      arm64|aarch64)\n        echo \"aarch64-unknown-linux-gnu\"\n        exit 0\n        ;;\n      x86_64|amd64)\n        echo \"x86_64-unknown-linux-gnu\"\n        exit 0\n        ;;\n    esac\n    ;;\n  MINGW*|MSYS*|CYGWIN*)\n    case \"$host_arch\" in\n      arm64|aarch64)\n        echo \"aarch64-pc-windows-msvc\"\n        exit 0\n        ;;\n      x86_64|amd64)\n        echo \"x86_64-pc-windows-msvc\"\n        exit 0\n        ;;\n    esac\n    ;;\nesac\n\necho \"[Error] unsupported host for auto target detect: ${host_os}/${host_arch}\" 1>&2\necho \"  tip: pass --target:<triple> or set BACKEND_TARGET\" 1>&2\nexit 2\n"
-    if id == "mobile_ci_android":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -euo pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/mobile_ci_android.sh <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]\n\nBuilds the Android template and runs ./gradlew assembleDebug.\nEOF\n}\n\nif [ \"${1:-}\" = \"\" ] || [ \"${1:-}\" = \"--help\" ] || [ \"${1:-}\" = \"-h\" ]; then\n  usage\n  exit 0\nfi\n\nin=\"$1\"\nshift || true\n\nname=\"\"\nout=\"\"\nassets=\"\"\nplugins=\"\"\nmm=\"\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --name:*)\n      name=\"${1#--name:}\"\n      ;;\n    --out:*)\n      out=\"${1#--out:}\"\n      ;;\n    --assets:*)\n      assets=\"${1#--assets:}\"\n      ;;\n    --plugins:*)\n      plugins=\"${1#--plugins:}\"\n      ;;\n    --orc)\n      mm=\"orc\"\n      ;;\n    --mm:*)\n      mm=\"${1#--mm:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"$mm\" != \"\" ] && [ \"$mm\" != \"orc\" ]; then\n  echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2\n  exit 2\nfi\n\nif [ ! -f \"$in\" ]; then\n  echo \"[Error] file not found: $in\" 1>&2\n  exit 2\nfi\n\nif [ \"$name\" = \"\" ]; then\n  base=\"$(basename \"$in\")\"\n  name=\"${base%.cheng}\"\nfi\n\nroot=\"$(cd \"$(dirname \"$0\")/../..\" && pwd)\"\nif [ \"$out\" = \"\" ]; then\n  out=\"mobile_build/$name\"\nfi\ncase \"$out\" in\n  /*) ;;\n  *) out=\"$root/$out\" ;;\nesac\n\ncmd=\"src/tooling/build_mobile_export.sh\"\nargs=\"--with-android-project\"\nif [ \"$name\" != \"\" ]; then\n  args=\"$args --name:$name\"\nfi\nif [ \"$out\" != \"\" ]; then\n  args=\"$args --out:$out\"\nfi\nif [ \"$assets\" != \"\" ]; then\n  args=\"$args --assets:$assets\"\nfi\nif [ \"$plugins\" != \"\" ]; then\n  ")
-        add(chunks, "args=\"$args --plugins:$plugins\"\nfi\nif [ -n \"$mm\" ]; then\n  args=\"$args --mm:$mm\"\nfi\n\necho \"[ci-android] export: $in\"\nset -- $args\n\"$cmd\" \"$in\" \"$@\"\n\nproject=\"$out/android_project\"\nif [ ! -f \"$project/gradlew\" ]; then\n  echo \"[ci-android] gradlew not found: $project/gradlew\" 1>&2\n  exit 2\nfi\n\nverify_script=\"src/tooling/verify_android_kotlin_only.sh\"\nsh \"$verify_script\" --project:\"$project\"\n\necho \"[ci-android] build: $project\"\n(cd \"$project\" && ./gradlew assembleDebug)\necho \"[ci-android] ok\"\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "mobile_ci_harmony":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -euo pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/mobile_ci_harmony.sh <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]\n\nBuilds the Harmony template and runs native C static smoke checks.\nEOF\n}\n\nif [ \"${1:-}\" = \"\" ] || [ \"${1:-}\" = \"--help\" ] || [ \"${1:-}\" = \"-h\" ]; then\n  usage\n  exit 0\nfi\n\nin=\"$1\"\nshift || true\n\nname=\"\"\nout=\"\"\nassets=\"\"\nplugins=\"\"\nmm=\"\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --name:*)\n      name=\"${1#--name:}\"\n      ;;\n    --out:*)\n      out=\"${1#--out:}\"\n      ;;\n    --assets:*)\n      assets=\"${1#--assets:}\"\n      ;;\n    --plugins:*)\n      plugins=\"${1#--plugins:}\"\n      ;;\n    --orc)\n      mm=\"orc\"\n      ;;\n    --mm:*)\n      mm=\"${1#--mm:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"$mm\" != \"\" ] && [ \"$mm\" != \"orc\" ]; then\n  echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2\n  exit 2\nfi\n\nif [ ! -f \"$in\" ]; then\n  echo \"[Error] file not found: $in\" 1>&2\n  exit 2\nfi\n\nif [ \"$name\" = \"\" ]; then\n  base=\"$(basename \"$in\")\"\n  name=\"${base%.cheng}\"\nfi\n\nroot=\"$(cd \"$(dirname \"$0\")/../..\" && pwd)\"\nif [ \"$out\" = \"\" ]; then\n  out=\"mobile_build/$name\"\nfi\ncase \"$out\" in\n  /*) ;;\n  *) out=\"$root/$out\" ;;\nesac\n\ncmd=\"src/tooling/build_mobile_export.sh\"\nargs=\"--with-harmony-project\"\nif [ \"$name\" != \"\" ]; then\n  args=\"$args --name:$name\"\nfi\nif [ \"$out\" != \"\" ]; then\n  args=\"$args --out:$out\"\nfi\nif [ \"$assets\" != \"\" ]; then\n  args=\"$args --assets:$assets\"\nfi\nif [ \"$plugins\" != \"\" ]; the")
-        add(chunks, "n\n  args=\"$args --plugins:$plugins\"\nfi\nif [ -n \"$mm\" ]; then\n  args=\"$args --mm:$mm\"\nfi\n\necho \"[ci-harmony] export: $in\"\nset -- $args\n\"$cmd\" \"$in\" \"$@\"\n\nproject=\"$out/harmony_project\"\nif [ ! -d \"$project\" ]; then\n  echo \"[ci-harmony] project not found: $project\" 1>&2\n  exit 2\nfi\n\nrequired_files=\"\n$project/CMakeLists.txt\n$project/cheng_mobile_harmony_bridge.c\n$project/cheng_mobile_host_harmony.c\n$project/cheng_mobile_host_api.c\n$project/cheng_mobile_host_core.c\n$project/native/cheng_mobile_harmony_napi.c\n\"\nfor f in $required_files; do\n  if [ ! -f \"$f\" ]; then\n    echo \"[ci-harmony] missing required file: $f\" 1>&2\n    exit 2\n  fi\ndone\n\necho \"[ci-harmony] native static check\"\ncc -I\"$project\" -Wall -Wextra -Werror -fsyntax-only \"$project/cheng_mobile_harmony_bridge.c\"\ncc -I\"$project\" -Wall -Wextra -Werror -fsyntax-only \"$project/cheng_mobile_host_harmony.c\"\ncc -I\"$project\" -Wall -Wextra -Werror -fsyntax-only \"$project/cheng_mobile_host_api.c\"\ncc -I\"$project\" -Wall -Wextra -Werror -fsyntax-only \"$project/cheng_mobile_host_core.c\"\n\nif command -v cmake >/dev/null 2>&1; then\n  echo \"[ci-harmony] cmake build\"\n  build_dir=\"$project/.cmake-smoke\"\n  rm -rf \"$build_dir\"\n  cmake -S \"$project\" -B \"$build_dir\" >/dev/null\n  cmake --build \"$build_dir\" >/dev/null\nfi\n\nif ! rg -n \"pollBusRequest|pushBusResponse\" \"$project/native/cheng_mobile_harmony_napi.c\" >/dev/null 2>&1; then\n  echo \"[ci-harmony] NAPI bus hooks missing in native/cheng_mobile_harmony_napi.c\" 1>&2\n  exit 2\nfi\n\necho \"[ci-harmony] ok\"\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "mobile_ci_ios":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -euo pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/mobile_ci_ios.sh <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]\n\nBuilds the iOS template and runs xcodegen/xcodebuild if available.\nEOF\n}\n\nif [ \"${1:-}\" = \"\" ] || [ \"${1:-}\" = \"--help\" ] || [ \"${1:-}\" = \"-h\" ]; then\n  usage\n  exit 0\nfi\n\nin=\"$1\"\nshift || true\n\nname=\"\"\nout=\"\"\nassets=\"\"\nplugins=\"\"\nmm=\"\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --name:*)\n      name=\"${1#--name:}\"\n      ;;\n    --out:*)\n      out=\"${1#--out:}\"\n      ;;\n    --assets:*)\n      assets=\"${1#--assets:}\"\n      ;;\n    --plugins:*)\n      plugins=\"${1#--plugins:}\"\n      ;;\n    --orc)\n      mm=\"orc\"\n      ;;\n    --mm:*)\n      mm=\"${1#--mm:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"$mm\" != \"\" ] && [ \"$mm\" != \"orc\" ]; then\n  echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2\n  exit 2\nfi\n\nif [ ! -f \"$in\" ]; then\n  echo \"[Error] file not found: $in\" 1>&2\n  exit 2\nfi\n\nif [ \"$name\" = \"\" ]; then\n  base=\"$(basename \"$in\")\"\n  name=\"${base%.cheng}\"\nfi\n\nroot=\"$(cd \"$(dirname \"$0\")/../..\" && pwd)\"\nif [ \"$out\" = \"\" ]; then\n  out=\"mobile_build/$name\"\nfi\ncase \"$out\" in\n  /*) ;;\n  *) out=\"$root/$out\" ;;\nesac\n\ncmd=\"src/tooling/build_mobile_export.sh\"\nargs=\"--with-ios-project\"\nif [ \"$name\" != \"\" ]; then\n  args=\"$args --name:$name\"\nfi\nif [ \"$out\" != \"\" ]; then\n  args=\"$args --out:$out\"\nfi\nif [ \"$assets\" != \"\" ]; then\n  args=\"$args --assets:$assets\"\nfi\nif [ \"$plugins\" != \"\" ]; then\n  arg")
-        add(chunks, "s=\"$args --plugins:$plugins\"\nfi\nif [ -n \"$mm\" ]; then\n  args=\"$args --mm:$mm\"\nfi\n\necho \"[ci-ios] export: $in\"\nset -- $args\n\"$cmd\" \"$in\" \"$@\"\n\nproject=\"$out/ios_project\"\nif [ ! -d \"$project\" ]; then\n  echo \"[ci-ios] project not found: $project\" 1>&2\n  exit 2\nfi\n\nif command -v xcodegen >/dev/null 2>&1; then\n  echo \"[ci-ios] xcodegen\"\n  (cd \"$project\" && sh ./generate_xcodeproj.sh)\nelse\n  echo \"[ci-ios] xcodegen not found; skip project generation\"\nfi\n\nif command -v xcodebuild >/dev/null 2>&1; then\n  if [ -d \"$project/ChengMobileApp.xcodeproj\" ]; then\n    echo \"[ci-ios] xcodebuild\"\n    (cd \"$project\" && xcodebuild -project ChengMobileApp.xcodeproj -scheme ChengMobileApp -configuration Debug -sdk iphonesimulator -destination \"generic/platform=iOS Simulator\" build)\n  else\n    echo \"[ci-ios] xcodeproj missing; run xcodegen first\"\n  fi\nelse\n  echo \"[ci-ios] xcodebuild not found; skip build\"\nfi\n\nif [ ! -d \"$project/ChengMobileApp.xcodeproj\" ] || ! command -v xcodebuild >/dev/null 2>&1; then\n  if command -v xcrun >/dev/null 2>&1; then\n    echo \"[ci-ios] fallback clang syntax check\"\n    src=\"$project/ChengMobileApp\"\n    sdk=\"$(xcrun --sdk iphonesimulator --show-sdk-path)\"\n    xcrun --sdk iphonesimulator clang -fobjc-arc -fsyntax-only -isysroot \"$sdk\" -I\"$src\" \"$src/cheng_mobile_ios_glue.m\"\n    xcrun --sdk iphonesimulator clang -fobjc-arc -fsyntax-only -isysroot \"$sdk\" -I\"$src\" \"$src/ChengViewController.m\"\n  else\n    echo \"[ci-ios] xcrun not found; skip fallback syntax check\"\n  fi\nfi\n\necho \"[ci-ios] ok\"\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "mobile_run_android":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -euo pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/mobile_run_android.sh <file.cheng> [--name:<appName>] [--out:<dir>] [--assets:<dir>] [--plugins:<csv>] [--mm:<orc>] [--orc]\n\nBuilds the Android Studio template (NDK) and runs it on a connected device:\n  - export .cheng -> Android project\n  - ./gradlew assembleDebug\n  - adb install -r\n  - adb shell am start\n\nNotes:\n  - Requires Android SDK (ANDROID_SDK_ROOT/ANDROID_HOME or default macOS path).\n  - If multiple devices are connected, set ANDROID_SERIAL.\nEOF\n}\n\nif [ \"${1:-}\" = \"\" ] || [ \"${1:-}\" = \"--help\" ] || [ \"${1:-}\" = \"-h\" ]; then\n  usage\n  exit 0\nfi\n\nin=\"$1\"\nshift || true\n\nname=\"\"\nout=\"\"\nassets=\"\"\nplugins=\"\"\nmm=\"\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --name:*)\n      name=\"${1#--name:}\"\n      ;;\n    --out:*)\n      out=\"${1#--out:}\"\n      ;;\n    --assets:*)\n      assets=\"${1#--assets:}\"\n      ;;\n    --plugins:*)\n      plugins=\"${1#--plugins:}\"\n      ;;\n    --orc)\n      mm=\"orc\"\n      ;;\n    --mm:*)\n      mm=\"${1#--mm:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"$mm\" != \"\" ] && [ \"$mm\" != \"orc\" ]; then\n  echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2\n  exit 2\nfi\n\nif [ ! -f \"$in\" ]; then\n  echo \"[Error] file not found: $in\" 1>&2\n  exit 2\nfi\n\nif ! command -v adb >/dev/null 2>&1; then\n  echo \"[Error] missing tool: adb\" 1>&2\n  exit 2\nfi\n\nserial=\"${ANDROID_SERIAL:-}\"\nif [ -z \"$serial\" ]; then\n  serial=\"$(adb devices | awk 'NR>1 && $2 == \"device\" {print $1; exit}')\"\nfi\nif [ -z \"$serial\" ]; then\n  echo \"[Error] no Android device/emulat")
-        add(chunks, "or detected (adb devices)\" 1>&2\n  echo \"[Error] set ANDROID_SERIAL to select a device\" 1>&2\n  exit 2\nfi\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nif [ \"$name\" = \"\" ]; then\n  base=\"$(basename \"$in\")\"\n  name=\"${base%.cheng}\"\nfi\nif [ \"$out\" = \"\" ]; then\n  out=\"mobile_build/$name\"\nfi\ncase \"$out\" in\n  /*) ;;\n  *) out=\"$root/$out\" ;;\nesac\n\nsdk=\"${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}\"\nif [ -z \"$sdk\" ]; then\n  if [ -d \"$HOME/Library/Android/sdk\" ]; then\n    sdk=\"$HOME/Library/Android/sdk\"\n  elif [ -d \"$HOME/Android/Sdk\" ]; then\n    sdk=\"$HOME/Android/Sdk\"\n  fi\nfi\nif [ -z \"$sdk\" ] || [ ! -d \"$sdk\" ]; then\n  echo \"[Error] missing Android SDK (set ANDROID_SDK_ROOT or install Android Studio SDK)\" 1>&2\n  exit 2\nfi\n\ncmd=\"src/tooling/build_mobile_export.sh\"\nargs=\"--with-android-project\"\nif [ \"$name\" != \"\" ]; then\n  args=\"$args --name:$name\"\nfi\nif [ \"$out\" != \"\" ]; then\n  args=\"$args --out:$out\"\nfi\nif [ \"$assets\" != \"\" ]; then\n  args=\"$args --assets:$assets\"\nfi\nif [ \"$plugins\" != \"\" ]; then\n  args=\"$args --plugins:$plugins\"\nfi\nif [ -n \"$mm\" ]; then\n  args=\"$args --mm:$mm\"\nfi\n\necho \"[run-android] export: $in\" >&2\nset -- $args\n\"$cmd\" \"$in\" \"$@\"\n\nproject=\"$out/android_project\"\nif [ ! -f \"$project/gradlew\" ]; then\n  echo \"[run-android] gradlew not found: $project/gradlew\" 1>&2\n  exit 2\nfi\n\nverify_script=\"src/tooling/verify_android_kotlin_only.sh\"\nsh \"$verify_script\" --project:\"$project\"\n\necho \"[run-android] local.properties sdk.dir=$sdk\" >&2\nprintf \"sdk.dir=%s\\n\" \"$sdk\" > \"$project/local.properties\"\n\necho \"[run-android] build: $project\" >&2\n(cd \"$project\" && ./gradlew assembleDebug)")
-        add(chunks, "\n\napk=\"$project/app/build/outputs/apk/debug/app-debug.apk\"\nif [ ! -f \"$apk\" ]; then\n  echo \"[run-android] debug apk not found: $apk\" 1>&2\n  exit 1\nfi\n\necho \"[run-android] install: $apk\" >&2\nadb -s \"$serial\" install -r \"$apk\" >/dev/null\n\npkg=\"com.cheng.mobile\"\nactivity=\"com.cheng.mobile/.ChengActivity\"\necho \"[run-android] launch: $pkg ($serial)\" >&2\nadb -s \"$serial\" shell am force-stop \"$pkg\" >/dev/null 2>&1 || true\nadb -s \"$serial\" shell am start -n \"$activity\" >/dev/null\n\necho \"mobile_run_android ok\"\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "mobile_run_harmony":
-        return "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nexport TOOLING_EXEC_WRAPPER_CALLER=\"mobile_run_harmony\"\nexec ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_harmony \"$@\"\n"
-    if id == "mobile_run_ios":
-        return "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nexport TOOLING_EXEC_WRAPPER_CALLER=\"mobile_run_ios\"\nexec ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_ios \"$@\"\n"
-    if id == "package_ide":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/package_ide.sh [--out:<dir>] [--name:<prog>] [--compiler:auto|stage1] [--no-archive] [--mm:<orc>] [--orc]\n\nNotes:\n  - Build the native GUI IDE and generate a distribution directory.\n  - Default output is dist/<prog>-<platform>; optionally create .tar.gz.\nEOF\n}\n\nprog=\"cheng_ide_gui\"\nout=\"\"\ncompiler=\"stage1\"\narchive=\"1\"\nmm=\"\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --help|-h)\n      usage\n      exit 0\n      ;;\n    --out:*)\n      out=\"${1#--out:}\"\n      ;;\n    --name:*)\n      prog=\"${1#--name:}\"\n      ;;\n    --compiler:*)\n      compiler=\"${1#--compiler:}\"\n      ;;\n    --no-archive)\n      archive=\"0\"\n      ;;\n    --orc)\n      mm=\"orc\"\n      ;;\n    --mm:*)\n      mm=\"${1#--mm:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"$mm\" != \"\" ] && [ \"$mm\" != \"orc\" ]; then\n  echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2\n  exit 2\nfi\n\nhere=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\nroot=\"$(CDPATH= cd -- \"$here/../..\" && pwd)\"\nide_root=\"${IDE_ROOT:-}\"\nif [ -z \"$ide_root\" ] && [ -d \"$root/../cheng-ide\" ]; then\n  ide_root=\"$root/../cheng-ide\"\nfi\nif [ -z \"$ide_root\" ] || [ ! -d \"$ide_root\" ]; then\n  echo \"[Error] missing IDE root (set IDE_ROOT to /path/to/cheng-ide)\" 1>&2\n  exit 2\nfi\nexport IDE_ROOT=\"$ide_root\"\n\nuname_s=\"$(uname -s)\"\nplatform=\"unknown\"\ncase \"$uname_s\" in\n  Darwin)\n    platform=\"macos\"\n    ;;\n  Linux)\n    platform=\"linux\"\n    ;;\n  MINGW*|MSYS*|CYGWIN*|Windows_NT)\n    platform=\"windows\"\n    ;;\nesac\n\nif [ \"$out\" = \"\" ]; then\n  out=\"$r")
-        add(chunks, "oot/dist/${prog}-${platform}\"\nfi\n\nbin_name=\"$prog\"\ncase \"$platform\" in\n  windows)\n    bin_name=\"${prog}.exe\"\n    ;;\nesac\nbin_path=\"$out/$bin_name\"\n\nmkdir -p \"$out\"\n\nmm_flag=\"\"\nif [ -n \"$mm\" ]; then\n  mm_flag=\"--mm:$mm\"\nfi\n\n\"src/tooling/build_ide_gui.sh\" --out:\"$bin_path\" --name:\"$prog\" --compiler:\"$compiler\" $mm_flag\n\nif [ -f \"$ide_root/README.md\" ]; then\n  cp \"$ide_root/README.md\" \"$out/\"\nfi\nif [ -f \"$ide_root/license.txt\" ]; then\n  cp \"$ide_root/license.txt\" \"$out/\"\nfi\nif [ -f \"$ide_root/docs/cheng-ide-dev-plan.md\" ]; then\n  cp \"$ide_root/docs/cheng-ide-dev-plan.md\" \"$out/\"\nfi\nif [ -f \"$ide_root/resources/fonts/codicon.ttf\" ]; then\n  mkdir -p \"$out/resources\"\n  cp \"$ide_root/resources/fonts/codicon.ttf\" \"$out/resources/codicon.ttf\"\nfi\n\necho \"[package] out: $out\"\necho \"[package] bin: $bin_path\"\n\nif [ \"$archive\" = \"1\" ]; then\n  parent_dir=\"$(dirname \"$out\")\"\n  base_name=\"$(basename \"$out\")\"\n  archive_path=\"${out}.tar.gz\"\n  (cd \"$parent_dir\" && tar -czf \"$archive_path\" \"$base_name\")\n  echo \"[package] archive: $archive_path\"\nfi\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "package_unimaker_desktop":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/package_unimaker_desktop.sh [--out:<dir>] [--name:<prog>] [--compiler:auto|stage1]\n                                           [--ide-compiler:auto|stage1] [--ide-bin:<path>] [--skip-ide]\n                                           [--no-archive] [--mm:<orc>] [--orc]\n\nNotes:\n  - Build Unimaker Desktop and generate a distribution directory.\n  - Package the IDE binary and ide/resources by default.\n  - Default output is dist/<prog>-<platform>; optionally create .tar.gz.\nEOF\n}\n\nprog=\"unimaker_desktop\"\nout=\"\"\ncompiler=\"stage1\"\nide_compiler=\"stage1\"\nide_bin=\"\"\nskip_ide=\"0\"\narchive=\"1\"\nmm=\"\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --help|-h)\n      usage\n      exit 0\n      ;;\n    --out:*)\n      out=\"${1#--out:}\"\n      ;;\n    --name:*)\n      prog=\"${1#--name:}\"\n      ;;\n    --compiler:*)\n      compiler=\"${1#--compiler:}\"\n      ;;\n    --ide-compiler:*)\n      ide_compiler=\"${1#--ide-compiler:}\"\n      ;;\n    --ide-bin:*)\n      ide_bin=\"${1#--ide-bin:}\"\n      ;;\n    --skip-ide)\n      skip_ide=\"1\"\n      ;;\n    --no-archive)\n      archive=\"0\"\n      ;;\n    --orc)\n      mm=\"orc\"\n      ;;\n    --mm:*)\n      mm=\"${1#--mm:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"$mm\" != \"\" ] && [ \"$mm\" != \"orc\" ]; then\n  echo \"[Error] invalid --mm:$mm (only orc is supported)\" 1>&2\n  exit 2\nfi\n\nhere=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\nroot=\"$(CDPATH= cd -- \"$here/../..\" && pwd)\"\nide_root=\"${IDE_ROOT:-}\"\nif [ -z \"$ide_root\" ] && [ -d \"$root/../cheng-ide\" ]; then\n  ide_root=\"$root/../cheng-")
-        add(chunks, "ide\"\nfi\nif [ -z \"$ide_root\" ] || [ ! -d \"$ide_root\" ]; then\n  echo \"[Error] missing IDE root (set IDE_ROOT to /path/to/cheng-ide)\" 1>&2\n  exit 2\nfi\nexport IDE_ROOT=\"$ide_root\"\n\nuname_s=\"$(uname -s)\"\nplatform=\"unknown\"\ncase \"$uname_s\" in\n  Darwin)\n    platform=\"macos\"\n    ;;\n  Linux)\n    platform=\"linux\"\n    ;;\n  MINGW*|MSYS*|CYGWIN*|Windows_NT)\n    platform=\"windows\"\n    ;;\nesac\n\nif [ \"$out\" = \"\" ]; then\n  out=\"$root/dist/${prog}-${platform}\"\nfi\n\nbin_name=\"$prog\"\nide_bin_name=\"main_local\"\ncase \"$platform\" in\n  windows)\n    bin_name=\"${prog}.exe\"\n    ide_bin_name=\"main_local.exe\"\n    ;;\nesac\nbin_path=\"$out/$bin_name\"\nide_out=\"$out/ide/$ide_bin_name\"\nide_manifest=\"$out/ide/manifest.txt\"\nide_prev_dir=\"$out/ide/previous\"\nide_prev_manifest=\"$ide_prev_dir/manifest.txt\"\n\nmkdir -p \"$out\"\n\nmm_flag=\"\"\nif [ -n \"$mm\" ]; then\n  mm_flag=\"--mm:$mm\"\nfi\n\n\"src/tooling/build_unimaker_desktop.sh\" --out:\"$bin_path\" --name:\"$prog\" --compiler:\"$compiler\" $mm_flag\n\nif [ \"$skip_ide\" = \"0\" ]; then\n  mkdir -p \"$out/ide\"\n  if [ -f \"$ide_out\" ]; then\n    mkdir -p \"$ide_prev_dir\"\n    cp -p \"$ide_out\" \"$ide_prev_dir/$ide_bin_name\"\n  fi\n  if [ -d \"$out/ide/resources\" ]; then\n    mkdir -p \"$ide_prev_dir\"\n    rm -rf \"$ide_prev_dir/resources\"\n    cp -R \"$out/ide/resources\" \"$ide_prev_dir/\"\n  fi\n  if [ -f \"$ide_manifest\" ]; then\n    mkdir -p \"$ide_prev_dir\"\n    cp -p \"$ide_manifest\" \"$ide_prev_manifest\"\n  fi\n  if [ -n \"$ide_bin\" ]; then\n    if [ ! -f \"$ide_bin\" ]; then\n      echo \"[Error] missing IDE binary: $ide_bin\" 1>&2\n      exit 2\n    fi\n    cp -p \"$ide_bin\" \"$ide_out\"\n    ide_source=\"copy\"\n  else\n    \"src/tooling/build_ide")
-        add(chunks, "_gui.sh\" --out:\"$ide_out\" --name:\"cheng_ide_gui\" --compiler:\"$ide_compiler\" $mm_flag\n    ide_source=\"build\"\n  fi\n  if [ -d \"$ide_root/resources\" ]; then\n    cp -R \"$ide_root/resources\" \"$out/ide/\"\n  fi\n  build_ts=\"$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")\"\n  {\n    echo \"built_at=$build_ts\"\n    echo \"ide_bin=$ide_bin_name\"\n    echo \"ide_compiler=$ide_compiler\"\n    echo \"ide_source=$ide_source\"\n    if [ -n \"$mm\" ]; then\n      echo \"mm=$mm\"\n    fi\n  } > \"$ide_manifest\"\nfi\n\nif [ -f \"$root/examples/unimaker_desktop/README.md\" ]; then\n  cp \"$root/examples/unimaker_desktop/README.md\" \"$out/README.md\"\nfi\nif [ -f \"$root/doc/unimaker-desktop-dev-plan.md\" ]; then\n  cp \"$root/doc/unimaker-desktop-dev-plan.md\" \"$out/\"\nfi\nif [ -f \"$root/LICENSE\" ]; then\n  cp \"$root/LICENSE\" \"$out/\"\nfi\nif [ -f \"$root/LICENSE-MIT\" ]; then\n  cp \"$root/LICENSE-MIT\" \"$out/\"\nfi\nif [ -f \"$root/LICENSE-APACHEv2\" ]; then\n  cp \"$root/LICENSE-APACHEv2\" \"$out/\"\nfi\n\necho \"[package] out: $out\"\necho \"[package] bin: $bin_path\"\nif [ \"$skip_ide\" = \"0\" ]; then\n  echo \"[package] ide: $ide_out\"\nfi\n\nif [ \"$archive\" = \"1\" ]; then\n  parent_dir=\"$(dirname \"$out\")\"\n  base_name=\"$(basename \"$out\")\"\n  archive_path=\"${out}.tar.gz\"\n  (cd \"$parent_dir\" && tar -czf \"$archive_path\" \"$base_name\")\n  echo \"[package] archive: $archive_path\"\nfi\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "prewarm_deps_parallel":
-        return "#!/usr/bin/env sh\n:\nset -eu\n\necho \"[Error] legacy deps prewarm pipeline has been removed.\" 1>&2\necho \"  tip: backend-only pipeline no longer requires this step\" 1>&2\nexit 2\n"
-    if id == "profile_backend_sample":
-        return "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nrepo_root=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\nbuilder=\"$repo_root/src/tooling/build_profile_backend_sample.sh\"\nsrc_c=\"$repo_root/src/tooling/profile_backend_sample.c\"\nbin_path=\"${PROFILE_SAMPLE_BIN:-$repo_root/artifacts/bin/profile_backend_sample}\"\n\ncase \"$bin_path\" in\n  /*) ;;\n  *) bin_path=\"$PWD/$bin_path\" ;;\nesac\n\nneed_build=\"0\"\nif [ ! -x \"$bin_path\" ]; then\n  need_build=\"1\"\nelif [ \"$src_c\" -nt \"$bin_path\" ] || [ \"$builder\" -nt \"$bin_path\" ]; then\n  need_build=\"1\"\nfi\n\nif [ \"$need_build\" = \"1\" ]; then\n  sh \"$builder\" \"$bin_path\" >/dev/null\nfi\n\nexec \"$bin_path\" \"$@\"\n"
-    if id == "rawptr_migrate_ffi":
-        return "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nexport TOOLING_EXEC_WRAPPER_CALLER=\"rawptr_migrate_ffi\"\nexec ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} rawptr_migrate_ffi \"$@\"\n"
-    if id == "resolve_system_linker":
-        return "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\ncontains_fuse_ld_flag() {\n  case \"${1:-}\" in\n    *-fuse-ld=*) return 0 ;;\n  esac\n  return 1\n}\n\ntool_available() {\n  command -v \"$1\" >/dev/null 2>&1\n}\n\nldflags_hint=\"${BACKEND_LDFLAGS:-}\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --ldflags:*)\n      ldflags_hint=\"${1#--ldflags:}\"\n      ;;\n    *)\n      echo \"[resolve_system_linker] unknown arg: $1\" 1>&2\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"${BACKEND_LD:-}\" != \"\" ]; then\n  echo \"kind=explicit_ld\"\n  echo \"ldflags=\"\n  exit 0\nfi\n\nif contains_fuse_ld_flag \"$ldflags_hint\"; then\n  echo \"kind=user_ldflags\"\n  echo \"ldflags=\"\n  exit 0\nfi\n\npriority_raw=\"${BACKEND_SYSTEM_LINKER_PRIORITY:-mold,lld,default}\"\npriority_csv=\"$(printf '%s' \"$priority_raw\" | tr ';' ',' | tr '[:upper:]' '[:lower:]')\"\nkind=\"default\"\nldflags=\"\"\n\nold_ifs=\"$IFS\"\nIFS=','\nfor token in $priority_csv; do\n  case \"$token\" in\n    \"\"|\" \")\n      continue\n      ;;\n    mold)\n      if tool_available mold || tool_available ld.mold; then\n        kind=\"mold\"\n        ldflags=\"-fuse-ld=mold\"\n        break\n      fi\n      ;;\n    lld)\n      if tool_available ld.lld || tool_available lld || tool_available llvm-lld; then\n        kind=\"lld\"\n        ldflags=\"-fuse-ld=lld\"\n        break\n      fi\n      ;;\n    default)\n      kind=\"default\"\n      ldflags=\"\"\n      break\n      ;;\n    *)\n      ;;\n  esac\ndone\nIFS=\"$old_ifs\"\n\necho \"kind=$kind\"\necho \"ldflags=$ldflags\"\n"
-    if id == "run_mdns_lan_two_node_smoke":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env bash\n:\nset -euo pipefail\n\nROOT=\"$(cd \"$(dirname \"$0\")/..\" && pwd)\"\nROOT=\"${ROOT:-$ROOT}\"\nDEFAULT_BIN=\"${ROOT}/mdns_lan_two_node_smoke_mvp_exe\"\nBIN=\"${1:-${MDNS_LAN_SMOKE_BIN:-$DEFAULT_BIN}}\"\n\nLAN_IP_ENV=\"MDNS_LAN_IP\"\nLAN_IP=\"${!LAN_IP_ENV-}\"\nLAN_IP_SOURCE=\"environment:${LAN_IP_ENV}\"\n\nis_private_or_lan_ip() {\n  local ip=\"$1\"\n  if [ -z \"$ip\" ]; then\n    return 1\n  fi\n  case \"$ip\" in\n    127.*|169.254.*|0.*|255.*|::*)\n      return 1\n      ;;\n    10.*|192.168.*)\n      return 0\n      ;;\n    172.*)\n      local a b\n      a=\"${ip%%.*}\"\n      b=\"${ip#*.}\"\n      b=\"${b%%.*}\"\n      case \"$b\" in\n        1[6-9]|2[0-9]|3[0-1]) return 0 ;;\n      esac\n      return 1\n      ;;\n  esac\n  return 1\n}\n\nif [ -z \"$LAN_IP\" ]; then\n  ROUTE_IFACE=\"\"\n  if command -v route >/dev/null 2>&1; then\n    ROUTE_IFACE=\"$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')\"\n  fi\n\n  candidates=()\n  if [ -n \"$ROUTE_IFACE\" ] && [[ \"$ROUTE_IFACE\" != utun* ]]; then\n    candidates+=(\"$ROUTE_IFACE\")\n  fi\n  if command -v ifconfig >/dev/null 2>&1; then\n    for iface in en0 en1 en2 en3 en4 en5 en6 eth0 eth1 awdl0; do\n      candidates+=(\"$iface\")\n    done\n  fi\n\n  for iface in \"${candidates[@]:-}\"; do\n    [ -z \"$iface\" ] && continue\n    if [ ! -d \"/sys/class/net\" ] && [ \"$iface\" = \"eth0\" ]; then\n      continue\n    fi\n    if [ -z \"$LAN_IP\" ]; then\n      if command -v ip >/dev/null 2>&1 && uname -s | grep -qi \"linux\"; then\n        LAN_IP=\"$(ip -4 -o addr show dev \"$iface\" 2>/dev/null | awk '$1==\"inet\" {split($4,a,\"/\"); print a[1]; exit}')\"\n      elif command -v ifconfig >/dev/null 2>&1 && uname -s | grep -qi \"darwin\"; then\n        LAN_IP=\"$(ifconfig \"$ifa")
-        add(chunks, "ce\" 2>/dev/null | awk '/inet / && $2 !~ /^127\\\\./ && $2 !~ /^169\\\\.254\\\\./ {print $2; exit}')\"\n      fi\n      if is_private_or_lan_ip \"$LAN_IP\"; then\n        LAN_IP_SOURCE=\"interface:$iface\"\n        break\n      fi\n      LAN_IP=\"\"\n    fi\n  done\nfi\n\nif ! is_private_or_lan_ip \"$LAN_IP\"; then\n  echo \"ERROR: no usable LAN IPv4 found. Set MDNS_LAN_IP manually.\" >&2\n  echo \"Examples: export MDNS_LAN_IP=192.168.3.17\" >&2\n  exit 1\nfi\n\nif [ ! -f \"$BIN\" ] || [ ! -x \"$BIN\" ]; then\n  echo \"ERROR: mdns smoke binary missing or not executable: $BIN\" >&2\n  exit 2\nfi\n\necho \"mdns-lan smoke bin: $BIN\"\necho \"MDNS_LAN_IP=${LAN_IP} (source=${LAN_IP_SOURCE})\"\nexport MDNS_LAN_IP=\"$LAN_IP\"\nexec \"$BIN\"\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "summarize_stage1_timeout_diag":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/summarize_stage1_timeout_diag.sh [--dir:<diag_dir>] [--latest:<n>] [--file:<summary_or_log>]\n\nNotes:\n  - Summarizes stage1 fullspec timeout diagnostics generated by verify_stage1_fullspec.sh.\n  - Prefers <diag_dir>/summary.tsv when available, and falls back to parsing latest diag logs.\nEOF\n}\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\ndiag_dir=\"chengcache/stage1_fullspec_timeout_diag\"\nlatest=\"3\"\nsingle_file=\"\"\n\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --dir:*)\n      diag_dir=\"${1#--dir:}\"\n      ;;\n    --latest:*)\n      latest=\"${1#--latest:}\"\n      ;;\n    --file:*)\n      single_file=\"${1#--file:}\"\n      ;;\n    --help|-h)\n      usage\n      exit 0\n      ;;\n    *)\n      echo \"[stage1_timeout_diag] unknown arg: $1\" 1>&2\n      usage 1>&2\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\ncase \"$latest\" in\n  ''|*[!0-9]*)\n    echo \"[stage1_timeout_diag] invalid --latest: $latest\" 1>&2\n    exit 2\n    ;;\nesac\nif [ \"$latest\" -lt 1 ]; then\n  latest=\"1\"\nfi\n\nhint_for_backend() {\n  backend=\"$1\"\n  case \"$backend\" in\n    module_cache.load)\n      echo \"likely stuck in build_module (frontend/semantics/generics/lowering).\"\n      ;;\n    build_module)\n      echo \"likely stuck after IR build (emit/link path).\"\n      ;;\n    single.emit_obj|single.link)\n      echo \"likely stuck in object emit or link stage.\"\n      ;;\n    *)\n      echo \"inspect profile tail + diag log for next missing stage transition.\"\n      ;;\n  esac\n}\n\nsummary_print_header() {\n  echo \"== stage1_timeout_diag.summary ==\"\n}\n\nsummary_print_row() {\n")
-        add(chunks, "  ts=\"$1\"\n  label=\"$2\"\n  diag_status=\"$3\"\n  backend_after=\"$4\"\n  uir_after=\"$5\"\n  health=\"$6\"\n  hint=\"$7\"\n  log_file=\"$8\"\n  health_log=\"$9\"\n  printf \"ts=%s label=%s diag_status=%s backend_after=%s uir_after=%s health=%s\\n\" \\\n    \"$ts\" \"$label\" \"$diag_status\" \"$backend_after\" \"$uir_after\" \"$health\"\n  printf \"hint=%s\\n\" \"$hint\"\n  printf \"log=%s\\n\" \"$log_file\"\n  if [ \"$health_log\" != \"\" ]; then\n    printf \"health_log=%s\\n\" \"$health_log\"\n  fi\n}\n\nparse_log_last_label() {\n  log_file=\"$1\"\n  marker=\"$2\"\n  awk -F'\\t' -v marker=\"$marker\" '\n    $0 ~ marker {label=$2}\n    END {\n      if (label == \"\") {\n        print \"unknown\"\n      } else {\n        print label\n      }\n    }\n  ' \"$log_file\"\n}\n\nif [ \"$single_file\" != \"\" ]; then\n  if [ ! -f \"$single_file\" ]; then\n    echo \"[stage1_timeout_diag] missing file: $single_file\" 1>&2\n    exit 2\n  fi\n  case \"$single_file\" in\n    *.tsv)\n      summary_file=\"$single_file\"\n      ;;\n    *)\n      summary_print_header\n      backend_after=\"$(parse_log_last_label \"$single_file\" \"backend_profile\")\"\n      uir_after=\"$(parse_log_last_label \"$single_file\" \"uir_profile\")\"\n      hint=\"$(hint_for_backend \"$backend_after\")\"\n      summary_print_row \"unknown\" \"$(basename \"$single_file\")\" \"unknown\" \"$backend_after\" \"$uir_after\" \"unknown\" \"$hint\" \"$single_file\" \"\"\n      exit 0\n      ;;\n  esac\nelse\n  summary_file=\"$diag_dir/summary.tsv\"\nfi\n\nif [ -f \"$summary_file\" ]; then\n  summary_print_header\n  echo \"source=$summary_file\"\n  tmp_rows=\"$(mktemp \"$root/chengcache/.stage1_timeout_rows.XXXXXX\" 2>/dev/null || echo \"$root/chengcache/.stage1_timeout_rows.$$\")\"\n  trap 'rm -f \"$tmp_rows\"'")
-        add(chunks, " EXIT\n  awk 'NR > 1 {print}' \"$summary_file\" | tail -n \"$latest\" >\"$tmp_rows\"\n  if [ ! -s \"$tmp_rows\" ]; then\n    echo \"[stage1_timeout_diag] no entries in summary file\" 1>&2\n    exit 2\n  fi\n  while IFS=\"$(printf '\\t')\" read -r ts label cmd diag_status backend_after uir_after health hint log_file health_log; do\n    [ \"$ts\" = \"\" ] && continue\n    summary_print_row \"$ts\" \"$label\" \"$diag_status\" \"$backend_after\" \"$uir_after\" \"$health\" \"$hint\" \"$log_file\" \"$health_log\"\n    if [ \"$cmd\" != \"\" ]; then\n      printf \"cmd=%s\\n\" \"$cmd\"\n    fi\n  done <\"$tmp_rows\"\n  exit 0\nfi\n\nif [ ! -d \"$diag_dir\" ]; then\n  echo \"[stage1_timeout_diag] missing diag dir: $diag_dir\" 1>&2\n  exit 2\nfi\n\ndiag_files=\"$(ls -1t \"$diag_dir\"/*.log 2>/dev/null | grep -v \"/health_probe_\" | head -n \"$latest\" || true)\"\nif [ \"$diag_files\" = \"\" ]; then\n  echo \"[stage1_timeout_diag] no diag logs found in $diag_dir\" 1>&2\n  exit 2\nfi\n\nsummary_print_header\necho \"source=$diag_dir (log fallback)\"\nprintf \"%s\\n\" \"$diag_files\" | while IFS= read -r log_file; do\n  [ \"$log_file\" = \"\" ] && continue\n  log_base=\"$(basename \"$log_file\" .log)\"\n  ts=\"${log_base##*_}\"\n  label=\"${log_base%_$ts}\"\n  backend_after=\"$(parse_log_last_label \"$log_file\" \"backend_profile\")\"\n  uir_after=\"$(parse_log_last_label \"$log_file\" \"uir_profile\")\"\n  hint=\"$(hint_for_backend \"$backend_after\")\"\n  health_log=\"$diag_dir/health_probe_${label}_${ts}.log\"\n  health_obj=\"$diag_dir/health_probe_${label}_${ts}.o\"\n  health=\"unknown\"\n  if [ -s \"$health_obj\" ]; then\n    health=\"ok\"\n  elif [ -f \"$health_log\" ]; then\n    health=\"log-only\"\n  else\n    health=\"missing\"\n    health_log=\"\"\n  fi\n  summary_print_row")
-        add(chunks, " \"$ts\" \"$label\" \"unknown\" \"$backend_after\" \"$uir_after\" \"$health\" \"$hint\" \"$log_file\" \"$health_log\"\ndone\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "summarize_timeout_diag":
-        var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/summarize_timeout_diag.sh [--file:<sample.txt> | --dir:<diag_dir>] [--latest:<n>] [--top:<n>] [--include-unknown]\n\nNotes:\n  - Summarizes macOS `sample` call-graph files and prints top hot frames.\n  - Default search dirs:\n      chengcache/backend_timeout_diag\n      chengcache/libp2p_frontier/logs/timeout_diag\n  - By default, `???` frames are filtered out; use `--include-unknown` to keep them.\nEOF\n}\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nsingle_file=\"\"\ndiag_dir=\"\"\nlatest=\"1\"\ntop_n=\"12\"\ninclude_unknown=\"0\"\n\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --file:*)\n      single_file=\"${1#--file:}\"\n      ;;\n    --dir:*)\n      diag_dir=\"${1#--dir:}\"\n      ;;\n    --latest:*)\n      latest=\"${1#--latest:}\"\n      ;;\n    --top:*)\n      top_n=\"${1#--top:}\"\n      ;;\n    --include-unknown)\n      include_unknown=\"1\"\n      ;;\n    --help|-h)\n      usage\n      exit 0\n      ;;\n    *)\n      echo \"[timeout_diag] unknown arg: $1\" 1>&2\n      usage 1>&2\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\ncase \"$latest\" in\n  ''|*[!0-9]*)\n    echo \"[timeout_diag] invalid --latest: $latest\" 1>&2\n    exit 2\n    ;;\nesac\ncase \"$top_n\" in\n  ''|*[!0-9]*)\n    echo \"[timeout_diag] invalid --top: $top_n\" 1>&2\n    exit 2\n    ;;\nesac\nif [ \"$latest\" -lt 1 ]; then\n  latest=\"1\"\nfi\nif [ \"$top_n\" -lt 1 ]; then\n  top_n=\"1\"\nfi\n\ncollect_files() {\n  if [ \"$single_file\" != \"\" ]; then\n    if [ ! -f \"$single_file\" ]; then\n      echo \"[timeout_diag] missing file: $single_file\" 1>&2\n      exit 2\n    fi\n    printf '%s\\n' \"$sing")
-        add(chunks, "le_file\"\n    return\n  fi\n\n  if [ \"$diag_dir\" != \"\" ]; then\n    ls -1t \"$diag_dir\"/*.sample.txt 2>/dev/null | head -n \"$latest\" || true\n    return\n  fi\n\n  {\n    ls -1t chengcache/backend_timeout_diag/*.sample.txt 2>/dev/null || true\n    ls -1t chengcache/libp2p_frontier/logs/timeout_diag/*.sample.txt 2>/dev/null || true\n  } | awk '!seen[$0]++' | head -n \"$latest\"\n}\n\nextract_counts() {\n  keep_unknown=\"$1\"\n  sample_file=\"$2\"\n  awk -v keep_unknown=\"$keep_unknown\" '\n    {\n      line = $0;\n      gsub(/^[[:space:]+!|:]*/, \"\", line);\n      if (line !~ /^[0-9]+[[:space:]]+/) next;\n\n      cnt = line;\n      sub(/[[:space:]].*$/, \"\", cnt);\n      line = substr(line, length(cnt) + 1);\n      sub(/^[[:space:]]+/, \"\", line);\n\n      frame = line;\n      sub(/[[:space:]]+\\(in .*/, \"\", frame);\n      sub(/[[:space:]]+$/, \"\", frame);\n      if (frame == \"\") next;\n      if (frame ~ /^Thread_/) next;\n      if (frame == \"start\") next;\n      if (keep_unknown != 1 && frame == \"???\") next;\n\n      print cnt \"\\t\" frame;\n    }\n  ' \"$sample_file\"\n}\n\nmkdir -p \"$root/chengcache\"\ntmp_files=\"$(mktemp \"$root/chengcache/.timeout_diag_files.XXXXXX\" 2>/dev/null || echo \"$root/chengcache/.timeout_diag_files.$$\")\"\ntmp_counts=\"$(mktemp \"$root/chengcache/.timeout_diag_counts.XXXXXX\" 2>/dev/null || echo \"$root/chengcache/.timeout_diag_counts.$$\")\"\ncleanup_tmp() {\n  rm -f \"$tmp_files\" \"$tmp_counts\"\n}\ntrap cleanup_tmp EXIT\n\ncollect_files >\"$tmp_files\"\nif [ ! -s \"$tmp_files\" ]; then\n  echo \"[timeout_diag] no sample files found\" 1>&2\n  exit 2\nfi\n\nfile_count=\"$(wc -l <\"$tmp_files\" | tr -d ' ')\"\necho \"== timeout_diag.summary ==\"\necho \"files=$file_count\"\nwhile IFS= read -r f; do\n  [ \"$f\" = \"")
-        add(chunks, "\" ] && continue\n  echo \"file=$f\"\ndone <\"$tmp_files\"\n\n: >\"$tmp_counts\"\nwhile IFS= read -r sample_file; do\n  [ \"$sample_file\" = \"\" ] && continue\n  extract_counts \"$include_unknown\" \"$sample_file\" >>\"$tmp_counts\" 2>/dev/null || true\ndone <\"$tmp_files\"\nif [ ! -s \"$tmp_counts\" ] && [ \"$include_unknown\" = \"0\" ]; then\n  : >\"$tmp_counts\"\n  while IFS= read -r sample_file; do\n    [ \"$sample_file\" = \"\" ] && continue\n    extract_counts 1 \"$sample_file\" >>\"$tmp_counts\" 2>/dev/null || true\n  done <\"$tmp_files\"\nfi\n\nif [ ! -s \"$tmp_counts\" ]; then\n  echo \"top=none\"\n  exit 0\nfi\n\necho \"top=$top_n\"\nawk -F '\\t' '{sum[$2]+=$1} END{for (k in sum) printf \"%d\\t%s\\n\", sum[k], k}' \"$tmp_counts\" \\\n  | sort -nr -k1,1 \\\n  | head -n \"$top_n\" \\\n  | while IFS=\"$(printf '\\t')\" read -r cnt frame; do\n      [ \"$frame\" = \"\" ] && continue\n      echo \"$cnt\t$frame\"\n    done\n")
-        return toolingEmbeddedJoinChunks(chunks)
-    if id == "web_build_native_server":
-        return "#!/usr/bin/env sh\n:\nset -eu\n\necho \"[Error] legacy native C server builder has been removed.\" 1>&2\necho \"  tip: build backend executables via src/tooling/chengb.sh\" 1>&2\nexit 2\n"
-    if id == "verify_android_kotlin_only":
-        return "#!/usr/bin/env sh\nset -eu\n\nusage() {\n  cat <<'EOF'\nUsage:\n  src/tooling/verify_android_kotlin_only.sh --project:<android_project_dir>\nEOF\n}\n\nproject=\"\"\nwhile [ \"${1:-}\" != \"\" ]; do\n  case \"$1\" in\n    --help|-h)\n      usage\n      exit 0\n      ;;\n    --project:*)\n      project=\"${1#--project:}\"\n      ;;\n    *)\n      echo \"[Error] unknown arg: $1\" 1>&2\n      usage 1>&2\n      exit 2\n      ;;\n  esac\n  shift || true\ndone\n\nif [ \"$project\" = \"\" ]; then\n  echo \"[Error] missing --project:<android_project_dir>\" 1>&2\n  exit 2\nfi\nif [ ! -d \"$project\" ]; then\n  echo \"[Error] Android project not found: $project\" 1>&2\n  exit 2\nfi\n\nmain_dir=\"$project/app/src/main\"\nkotlin_dir=\"$main_dir/kotlin\"\nif [ ! -d \"$kotlin_dir\" ]; then\n  echo \"[Error] Kotlin source directory not found: $kotlin_dir\" 1>&2\n  exit 2\nfi\n\njava_file=\"$(find \"$main_dir\" -type f -name '*.java' | head -n 1 || true)\"\nif [ \"$java_file\" != \"\" ]; then\n  echo \"[Error] Java source is not allowed for Android host: $java_file\" 1>&2\n  echo \"[Error] Android integration is Kotlin-only; move host sources to app/src/main/kotlin.\" 1>&2\n  exit 2\nfi\n\necho \"[verify-android-kotlin-only] ok project=$project\"\n"
-    if id == "verify_backend_abi_v2_noptr":
-        return "#!/usr/bin/env sh\n:\nset -eu\nexec \"${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}\" verify_backend_noptr_default_cli \"$@\"\n"
     if id == "verify_backend_android":
         var chunks: str[] = []
         add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\nif [ \"${CLEAN_CHENG_LOCAL:-1}\" = \"1\" ] && [ \"${TOOLING_CLEANUP_DEPTH:-0}\" = \"0\" ]; then\n  export TOOLING_CLEANUP_DEPTH=1\n  cleanup_backend_driver_on_exit() {\n    status=$?\n    set +e\n    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cleanup_cheng_local\n    exit \"$status\"\n  }\n  trap cleanup_backend_driver_on_exit EXIT\nfi\n\ndriver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)\"\nlinker_mode=\"${BACKEND_LINKER:-self}\"\ntarget=\"aarch64-linux-android\"\nsafe_target=\"$(printf '%s' \"$target\" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_')\"\nruntime_obj=\"${BACKEND_RUNTIME_OBJ:-chengcache/system_helpers.backend.cheng.${safe_target}.o}\"\n\n# Keep android gate focused on cross-target codegen/linking, independent of closure no-pointer policy.\nexport STAGE1_STD_NO_POINTERS=0\nexport STAGE1_STD_NO_POINTERS_STRICT=0\nexport STAGE1_NO_POINTERS_NON_C_ABI=0\nexport STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0\n\n\ndetect_ndk_from_sdk() {\n  sdk=\"$1\"\n  if [ -z \"$sdk\" ]; then\n    return 1\n  fi\n  if [ -d \"$sdk/ndk-bundle\" ]; then\n    echo \"$sdk/ndk-bundle\"\n    return 0\n  fi\n  if [ -d \"$sdk/ndk\" ]; then\n    latest=\"$(find \"$sdk/ndk\" -maxdepth 1 -mindepth 1 -type d -print 2>/dev/null | LC_ALL=C sort | tail -n 1 || true)\"\n    if [ -n \"$latest\" ]; then\n      echo \"$latest\"\n      return 0\n    fi\n  fi\n  return 1\n}\n\nndk=\"${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}\"\nif [ -z \"$ndk\" ]; then\n  sdk=\"${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}\"\n  if [ -z \"$sdk\" ]; then\n    if [ -d \"$HOME/Library/Android/sdk\" ]; then\n      sdk=\"$HOME/Li")
@@ -977,10 +2337,9 @@ fn toolingEmbeddedScriptBody(id: str): str =
         return toolingEmbeddedJoinChunks(chunks)
     if id == "verify_backend_noptr_default_cli":
         var chunks: str[] = []
-        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\"\ncd \"$root\"\n\ndriver_has_user_surface_diag() {\n  cand=\"$1\"\n  if [ \"$cand\" = \"\" ] || [ ! -x \"$cand\" ]; then\n    return 1\n  fi\n  if ! command -v strings >/dev/null 2>&1; then\n    return 1\n  fi\n  tmp_strings=\"$(mktemp \"${TMPDIR:-/tmp}/cheng_driver_strings.XXXXXX\" 2>/dev/null || true)\"\n  if [ \"$tmp_strings\" = \"\" ]; then\n    return 1\n  fi\n  set +e\n  strings \"$cand\" 2>/dev/null >\"$tmp_strings\"\n  strings_status=\"$?\"\n  grep -Eq \"no-pointer policy: pointer types are forbidden (outside C ABI modules|in user modules)\" \"$tmp_strings\"\n  status=\"$?\"\n  set -e\n  rm -f \"$tmp_strings\" 2>/dev/null || true\n  if [ \"$strings_status\" -ne 0 ] && [ \"$status\" -ne 0 ]; then\n    return 1\n  fi\n  [ \"$status\" -eq 0 ]\n}\n\nrun_with_timeout() {\n  seconds=\"$1\"\n  shift\n  case \"$seconds\" in\n    ''|*[!0-9]*)\n      \"$@\"\n      return $?\n      ;;\n  esac\n  if command -v timeout >/dev/null 2>&1; then\n    timeout \"$seconds\" \"$@\"\n    return $?\n  fi\n  if command -v gtimeout >/dev/null 2>&1; then\n    gtimeout \"$seconds\" \"$@\"\n    return $?\n  fi\n  perl -e '\n    use POSIX qw(setsid WNOHANG);\n    my $timeout = shift;\n    my $pid = fork();\n    if (!defined $pid) { exit 127; }\n    if ($pid == 0) {\n      setsid();\n      exec @ARGV;\n      exit 127;\n    }\n    my $end = time + $timeout;\n    while (1) {\n      my $res = waitpid($pid, WNOHANG);\n      if ($res == $pid) {\n        my $status = $?;\n        if (($status & 127) != 0) {\n          exit(128 + ($status & 127));\n        }\n        exit($status >> 8);\n      }\n      if (time >= $end) {\n        kill \"TERM\", -$pid;\n")
-        add(chunks, "        select(undef, undef, undef, 0.5);\n        kill \"KILL\", -$pid;\n        exit 124;\n      }\n      select(undef, undef, undef, 0.1);\n    }\n  ' \"$seconds\" \"$@\"\n}\n\ncompile_cli() {\n  src=\"$1\"\n  out=\"$2\"\n  log=\"$3\"\n  run_with_timeout \"$timeout_s\" env \\\n    ABI=v2_noptr \\\n    STAGE1_STD_NO_POINTERS=1 \\\n    STAGE1_STD_NO_POINTERS_STRICT=0 \\\n    STAGE1_SEM_FIXED_0=0 \\\n    STAGE1_OWNERSHIP_FIXED_0=0 \\\n    \"$cheng_tool\" cheng --in:\"$src\" --out:\"$out\" >\"$log\" 2>&1\n}\n\nout_dir=\"artifacts/backend_noptr_default_cli\"\nprobe_non_c_abi=\"tests/cheng/backend/fixtures/noptr_default_cli_probe_tmp.cheng\"\nout_non_c_abi=\"$out_dir/noptr_default_cli_probe.bin\"\nlog_non_c_abi=\"$out_dir/noptr_default_cli_probe.log\"\npositive_src=\"tests/cheng/backend/fixtures/return_add.cheng\"\nout_positive=\"$out_dir/noptr_default_cli_positive.bin\"\nlog_positive=\"$out_dir/noptr_default_cli_positive.log\"\nsafe_importc_src=\"tests/cheng/backend/fixtures/hello_importc_puts.cheng\"\nout_safe_importc=\"$out_dir/noptr_default_cli_safe_importc.bin\"\nlog_safe_importc=\"$out_dir/noptr_default_cli_safe_importc.log\"\nraw_importc_src=\"tests/cheng/backend/fixtures/compile_fail_ffi_importc_voidptr_surface.cheng\"\nout_raw_importc=\"$out_dir/noptr_default_cli_raw_importc.bin\"\nlog_raw_importc=\"$out_dir/noptr_default_cli_raw_importc.log\"\ncheng_tool=\"${TOOLING_CHENG_BIN:-${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}}\"\ndiag_pattern='no-pointer policy: (bare void\\* surface is|pointer types are|pointer dereference is|pointer operation is) forbidden (outside C ABI modules|in user modules)'\nbackend_block_pattern='macho_writer: unsupported machine op'\ntimeout_s=\"${BACKEND_NOPTR_DEFAULT_CLI_TIMEOUT:-60}\"\npositive_backend_blocked=\"0\"\nsafe_importc_backend_blocked=\"0\"\n\nmkdir -p \"$out_dir\"\n\ndriver=\"$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)\"\nif ! driver_has_user_surface_diag \"$driver\"; then\n  echo \"[Error] backend driver missing user-surface no-pointer diagnostic marker: ${driver:-<unset>}\" 1>&2\n  exit 1\nfi\n\ncleanup_probe() {\n")
-        add(chunks, "  rm -f \"$probe_non_c_abi\"\n}\ntrap cleanup_probe EXIT INT TERM\n\ncat >\"$probe_non_c_abi\" <<'EOF'\nfn main(): int32 =\n    var p: int32* = nil\n    return 0\nEOF\n\necho \"== backend.noptr_default_cli.user_raw_ptr ==\"\nset +e\ncompile_cli \"$probe_non_c_abi\" \"$out_non_c_abi\" \"$log_non_c_abi\"\nstatus_non_c_abi=\"$?\"\nset -e\nif [ \"$status_non_c_abi\" -eq 124 ]; then\n  echo \"[Error] default cheng raw pointer probe timed out after ${timeout_s}s\" 1>&2\n  exit 1\nfi\nif [ \"$status_non_c_abi\" -eq 0 ]; then\n  echo \"[Error] expected default cheng path to reject user raw pointer usage: $probe_non_c_abi\" 1>&2\n  exit 1\nfi\nif ! grep -Eq \"$diag_pattern\" \"$log_non_c_abi\"; then\n  echo \"[Error] missing default cheng user raw pointer diagnostic in: $log_non_c_abi\" 1>&2\n  exit 1\nfi\n\necho \"== backend.noptr_default_cli.positive ==\"\nset +e\ncompile_cli \"$positive_src\" \"$out_positive\" \"$log_positive\"\nstatus_positive=\"$?\"\nset -e\nif [ \"$status_positive\" -ne 0 ]; then\n  if grep -Eq \"$diag_pattern\" \"$log_positive\"; then\n    echo \"[Error] positive sample unexpectedly rejected by no-pointer policy: $positive_src\" 1>&2\n    exit 1\n  fi\n  if grep -Fq \"$backend_block_pattern\" \"$log_positive\"; then\n    positive_backend_blocked=\"1\"\n  else\n    echo \"[Error] expected positive sample to compile under default no-pointer policy: $positive_src\" 1>&2\n    if [ \"$status_positive\" -eq 124 ]; then\n      echo \"[Error] positive sample timed out after ${timeout_s}s\" 1>&2\n    fi\n    tail -n 120 \"$log_positive\" 1>&2 || true\n    exit 1\n  fi\nfi\nif [ \"$positive_backend_blocked\" != \"1\" ] && [ ! -s \"$out_positive\" ]; then\n  echo \"[Error] missing positive executable output: $out_positive\" 1>&2\n  exit 1\nfi\n\necho \"== backend.noptr_default_cli.safe_importc ==\"\nset +e\ncompile_cli \"$safe_importc_src\" \"$out_safe_importc\" \"$log_safe_importc\"\nstatus_safe_importc=\"$?\"\nset -e\nif [ \"$status_safe_importc\" -ne 0 ]; then\n")
-        add(chunks, "  if grep -Eq \"$diag_pattern\" \"$log_safe_importc\"; then\n    echo \"[Error] safe importc sample unexpectedly rejected by no-pointer policy: $safe_importc_src\" 1>&2\n    exit 1\n  fi\n  if grep -Fq \"$backend_block_pattern\" \"$log_safe_importc\"; then\n    safe_importc_backend_blocked=\"1\"\n  else\n    echo \"[Error] expected safe importc sample to compile under default no-pointer policy: $safe_importc_src\" 1>&2\n    if [ \"$status_safe_importc\" -eq 124 ]; then\n      echo \"[Error] safe importc sample timed out after ${timeout_s}s\" 1>&2\n    fi\n    tail -n 120 \"$log_safe_importc\" 1>&2 || true\n    exit 1\n  fi\nfi\nif [ \"$safe_importc_backend_blocked\" != \"1\" ] && [ ! -s \"$out_safe_importc\" ]; then\n  echo \"[Error] missing safe importc executable output: $out_safe_importc\" 1>&2\n  exit 1\nfi\n\necho \"== backend.noptr_default_cli.raw_importc ==\"\nset +e\ncompile_cli \"$raw_importc_src\" \"$out_raw_importc\" \"$log_raw_importc\"\nstatus_raw_importc=\"$?\"\nset -e\nif [ \"$status_raw_importc\" -eq 124 ]; then\n  echo \"[Error] raw importc probe timed out after ${timeout_s}s\" 1>&2\n  exit 1\nfi\nif [ \"$status_raw_importc\" -eq 0 ]; then\n  echo \"[Error] expected default cheng path to reject raw importc pointer surface: $raw_importc_src\" 1>&2\n  exit 1\nfi\nif ! grep -Eq \"$diag_pattern\" \"$log_raw_importc\"; then\n  echo \"[Error] missing raw importc no-pointer diagnostic in: $log_raw_importc\" 1>&2\n  exit 1\nfi\n\nif [ \"$positive_backend_blocked\" = \"1\" ] || [ \"$safe_importc_backend_blocked\" = \"1\" ]; then\n  echo \"[Warn] default cheng positive compile hit known backend emitter blocker; no-pointer acceptance verified before backend failure\" 1>&2\nfi\n\necho \"verify_backend_noptr_default_cli ok\"\n\n")
+        add(chunks, "#!/usr/bin/env sh\n:\nset -eu\n(set -o pipefail) 2>/dev/null && set -o pipefail\n\nroot=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")/../../..\" && pwd)\"\ncd \"$root\"\n\nrun_with_timeout() {\n  seconds=\"$1\"\n  shift\n  case \"$seconds\" in\n    ''|*[!0-9]*)\n      \"$@\"\n      return $?\n      ;;\n  esac\n  if command -v timeout >/dev/null 2>&1; then\n    timeout \"$seconds\" \"$@\"\n    return $?\n  fi\n  if command -v gtimeout >/dev/null 2>&1; then\n    gtimeout \"$seconds\" \"$@\"\n    return $?\n  fi\n  perl -e '\n    use POSIX qw(setsid WNOHANG);\n    my $timeout = shift;\n    my $pid = fork();\n    if (!defined $pid) { exit 127; }\n    if ($pid == 0) {\n      setsid();\n      exec @ARGV;\n      exit 127;\n    }\n    my $end = time + $timeout;\n    while (1) {\n      my $res = waitpid($pid, WNOHANG);\n      if ($res == $pid) {\n        my $status = $?;\n        if (($status & 127) != 0) {\n          exit(128 + ($status & 127));\n        }\n        exit($status >> 8);\n      }\n      if (time >= $end) {\n        kill \"TERM\", -$pid;\n        select(undef, undef, undef, 0.5);\n        kill \"KILL\", -$pid;\n        exit 124;\n      }\n      select(undef, undef, undef, 0.1);\n    }\n  ' \"$seconds\" \"$@\"\n}\n\ncompile_cli() {\n  src=\"$1\"\n  out=\"$2\"\n  log=\"$3\"\n  run_with_timeout \"$timeout_s\" env \\\n    BACKEND_DRIVER=\"$driver\" \\\n    STAGE1_SEM_FIXED_0=0 \\\n    STAGE1_OWNERSHIP_FIXED_0=0 \\\n    \"$cheng_tool\" cheng --in:\"$src\" --out:\"$out\" >\"$log\" 2>&1\n}\n\nout_dir=\"artifacts/backend_noptr_default_cli\"\nprobe_non_c_abi=\"tests/cheng/backend/fixtures/noptr_default_cli_probe_tmp.cheng\"\nout_non_c_abi=\"$out_dir/noptr_default_cli_probe.bin\"\nlog_non_c_abi=\"$out_dir/noptr_default_cli_probe.log\"\npositive_src=\"tests/cheng/backend/fixtures/return_add.cheng\"\nout_positive=\"$out_dir/noptr_default_cli_positive.bin\"\nlog_positive=\"$out_dir/noptr_default_cli_positive.log\"\nsafe_importc_src=\"tests/cheng/backend/fixtures/hello_importc_puts.cheng\"\nout_safe_importc=\"$out_dir/noptr_default_cli_safe_importc.bin\"\nlog_safe_importc=\"$out_dir/noptr_default_cli_safe_importc.log\"\nraw_importc_src=\"tests/cheng/backend/fixtures/compile_fail_ffi_importc_voidptr_surface.cheng\"\nout_raw_importc=\"$out_dir/noptr_default_cli_raw_importc.bin\"\nlog_raw_importc=\"$out_dir/noptr_default_cli_raw_importc.log\"\ncheng_tool=\"${TOOLING_CHENG_BIN:-${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}}\"\ndiag_pattern='no-pointer policy: (bare void\\* surface is|pointer types are|pointer dereference is|pointer operation is) forbidden (outside C ABI modules|in user modules)'\nbackend_block_pattern='macho_writer: unsupported machine op'\ntimeout_s=\"${BACKEND_NOPTR_DEFAULT_CLI_TIMEOUT:-60}\"\npositive_backend_blocked=\"0\"\nsafe_importc_backend_blocked=\"0\"\n\nmkdir -p \"$out_dir\"\n\ndriver=\"$(sh \"$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh\" --field:driver 2>/dev/null || true)\"\nif [ \"$driver\" = \"\" ] || [ ! -x \"$driver\" ]; then\n  echo \"[Error] missing strict-fresh backend driver: ${driver:-<unset>}\" 1>&2\n  exit 1\nfi\n\ncleanup_probe() {\n  rm -f \"$probe_non_c_abi\"\n}\ntra")
+        add(chunks, "p cleanup_probe EXIT INT TERM\n\ncat >\"$probe_non_c_abi\" <<'EOF'\nfn main(): int32 =\n    var p: int32* = nil\n    return 0\nEOF\n\necho \"== backend.noptr_default_cli.user_raw_ptr ==\"\nset +e\ncompile_cli \"$probe_non_c_abi\" \"$out_non_c_abi\" \"$log_non_c_abi\"\nstatus_non_c_abi=\"$?\"\nset -e\nif [ \"$status_non_c_abi\" -eq 124 ]; then\n  echo \"[Error] default cheng raw pointer probe timed out after ${timeout_s}s\" 1>&2\n  exit 1\nfi\nif [ \"$status_non_c_abi\" -eq 0 ]; then\n  echo \"[Error] expected default cheng path to reject user raw pointer usage: $probe_non_c_abi\" 1>&2\n  exit 1\nfi\nif ! grep -Eq \"$diag_pattern\" \"$log_non_c_abi\"; then\n  echo \"[Error] missing default cheng user raw pointer diagnostic in: $log_non_c_abi\" 1>&2\n  exit 1\nfi\n\necho \"== backend.noptr_default_cli.positive ==\"\nset +e\ncompile_cli \"$positive_src\" \"$out_positive\" \"$log_positive\"\nstatus_positive=\"$?\"\nset -e\nif [ \"$status_positive\" -ne 0 ]; then\n  if grep -Eq \"$diag_pattern\" \"$log_positive\"; then\n    echo \"[Error] positive sample unexpectedly rejected by no-pointer policy: $positive_src\" 1>&2\n    exit 1\n  fi\n  if grep -Fq \"$backend_block_pattern\" \"$log_positive\"; then\n    positive_backend_blocked=\"1\"\n  else\n    echo \"[Error] expected positive sample to compile under default no-pointer policy: $positive_src\" 1>&2\n    if [ \"$status_positive\" -eq 124 ]; then\n      echo \"[Error] positive sample timed out after ${timeout_s}s\" 1>&2\n    fi\n    tail -n 120 \"$log_positive\" 1>&2 || true\n    exit 1\n  fi\nfi\nif [ \"$positive_backend_blocked\" != \"1\" ] && [ ! -s \"$out_positive\" ]; then\n  echo \"[Error] missing positive executable output: $out_positive\" 1>&2\n  exit 1\nfi\n\necho \"== backend.noptr_default_cli.safe_importc ==\"\nset +e\ncompile_cli \"$safe_importc_src\" \"$out_safe_importc\" \"$log_safe_importc\"\nstatus_safe_importc=\"$?\"\nset -e\nif [ \"$status_safe_importc\" -ne 0 ]; then\n  if grep -Eq \"$diag_pattern\" \"$log_safe_importc\"; then\n    echo \"[Error] safe importc sample unexpectedly rejected by no-pointer policy: $safe_importc_src\" 1>&2\n    exit 1\n  fi\n  if grep -Fq \"$backend_block_pattern\" \"$log_safe_importc\"; then\n    safe_importc_backend_blocked=\"1\"\n  else\n    echo \"[Error] expected safe importc sample to compile under default no-pointer policy: $safe_importc_src\" 1>&2\n    if [ \"$status_safe_importc\" -eq 124 ]; then\n      echo \"[Error] safe importc sample timed out after ${timeout_s}s\" 1>&2\n    fi\n    tail -n 120 \"$log_safe_importc\" 1>&2 || true\n    exit 1\n  fi\nfi\nif [ \"$safe_importc_backend_blocked\" != \"1\" ] && [ ! -s \"$out_safe_importc\" ]; then\n  echo \"[Error] missing safe importc executable output: $out_safe_importc\" 1>&2\n  exit 1\nfi\n\necho \"== backend.noptr_default_cli.raw_importc ==\"\nset +e\ncompile_cli \"$raw_importc_src\" \"$out_raw_importc\" \"$log_raw_importc\"\nstatus_raw_importc=\"$?\"\nset -e\nif [ \"$status_raw_importc\" -eq 124 ]; then\n  echo \"[Error] raw importc probe timed out after ${timeout_s}s\" 1>&2\n  exit 1\nfi\nif [ \"$status_raw_importc\" -eq 0 ]; then\n  echo \"[Error] expected default cheng path to reject raw importc p")
+        add(chunks, "ointer surface: $raw_importc_src\" 1>&2\n  exit 1\nfi\nif ! grep -Eq \"$diag_pattern\" \"$log_raw_importc\"; then\n  echo \"[Error] missing raw importc no-pointer diagnostic in: $log_raw_importc\" 1>&2\n  exit 1\nfi\n\nif [ \"$positive_backend_blocked\" = \"1\" ] || [ \"$safe_importc_backend_blocked\" = \"1\" ]; then\n  echo \"[Warn] default cheng positive compile hit known backend emitter blocker; no-pointer acceptance verified before backend failure\" 1>&2\nfi\n\necho \"verify_backend_noptr_default_cli ok\"\n")
         return toolingEmbeddedJoinChunks(chunks)
     if id == "verify_backend_noptr_exemption_scope":
         var chunks: str[] = []

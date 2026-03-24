@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -18,8 +18,41 @@ if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" 
 fi
 
 driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
-linker_mode="${BACKEND_LINKER:-self}"
-target="${BACKEND_TARGET:-arm64-apple-darwin}"
+requested_linker="${BACKEND_LINKER:-self}"
+
+resolve_target() {
+  if [ "${BACKEND_TARGET:-}" != "" ] && [ "${BACKEND_TARGET:-}" != "auto" ]; then
+    printf '%s\n' "${BACKEND_TARGET}"
+    return
+  fi
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target
+}
+
+resolve_link_env() {
+  link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:"$requested_linker")"
+  resolved_linker=""
+  resolved_no_runtime_c="0"
+  resolved_runtime_obj=""
+  resolved_runtime_obj_assigned="0"
+  for entry in $link_env; do
+    case "$entry" in
+      BACKEND_LINKER=*)
+        resolved_linker="${entry#BACKEND_LINKER=}"
+        ;;
+      BACKEND_NO_RUNTIME_C=*)
+        resolved_no_runtime_c="${entry#BACKEND_NO_RUNTIME_C=}"
+        ;;
+      BACKEND_RUNTIME_OBJ=*)
+        resolved_runtime_obj="${entry#BACKEND_RUNTIME_OBJ=}"
+        resolved_runtime_obj_assigned="1"
+        ;;
+    esac
+  done
+  if [ "$resolved_linker" = "" ]; then
+    echo "[Error] verify_backend_float: backend_link_env missing BACKEND_LINKER" 1>&2
+    exit 1
+  fi
+}
 
 # Keep float gate focused on float/runtime behavior, independent of closure no-pointer policy.
 export STAGE1_STD_NO_POINTERS=0
@@ -32,48 +65,6 @@ out_dir="artifacts/backend_float"
 
 mkdir -p "$out_dir"
 
-is_known_float_skip_log() {
-  log_file="$1"
-  if [ ! -f "$log_file" ]; then
-    return 1
-  fi
-  if grep -q "macho_linker: duplicate symbol: ___cheng_sym_3d_3d" "$log_file"; then
-    return 0
-  fi
-  if grep -q "Undefined symbols for architecture" "$log_file" && grep -q "L_cheng_str_" "$log_file"; then
-    return 0
-  fi
-  if grep -q "Symbol not found: _cheng_" "$log_file"; then
-    return 0
-  fi
-  if grep -q "Symbol not found:" "$log_file"; then
-    return 0
-  fi
-  return 1
-}
-
-compile_fixture_compile_only() {
-  fixture="$1"
-  log_prefix="$2"
-  compile_only_out="${log_prefix}.compile_only.bin"
-  compile_only_log="${log_prefix}.compile_only.log"
-  rm -f "$compile_only_out" "$compile_only_log"
-  env \
-    BACKEND_LINKER=self \
-    BACKEND_DIRECT_EXE=1 \
-    BACKEND_LINKERLESS_INMEM=1 \
-    BACKEND_NO_RUNTIME_C=0 \
-    BACKEND_EMIT=exe \
-    BACKEND_MULTI=0 \
-    BACKEND_MULTI_FORCE=0 \
-    BACKEND_LINKER=self \
-    BACKEND_TARGET="$target" \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$compile_only_out" \
-    "$driver" >"$compile_only_log" 2>&1
-  [ -s "$compile_only_out" ]
-}
-
 compile_and_run_fixture() {
   fixture="$1"
   exe_path="$2"
@@ -85,36 +76,46 @@ compile_and_run_fixture() {
   rm -rf "${exe_path}.objs" "${exe_path}.objs.lock"
 
   set +e
-  if [ "$linker_mode" = "self" ]; then
-    BACKEND_EMIT=exe \
-    BACKEND_MULTI=0 \
-    BACKEND_MULTI_FORCE=0 \
-    BACKEND_LINKER=self \
-    BACKEND_RUNTIME=off \
-    BACKEND_NO_RUNTIME_C=1 \
-    BACKEND_RUNTIME_OBJ= \
-    BACKEND_TARGET="$target" \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$exe_path" \
-    "$driver" >"$build_log" 2>&1
+  if [ "$resolved_runtime_obj_assigned" = "1" ] && [ "$resolved_no_runtime_c" = "1" ]; then
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --no-multi \
+      --no-multi-force \
+      --no-runtime-c \
+      --runtime-obj:"$resolved_runtime_obj" \
+      --output:"$exe_path" >"$build_log" 2>&1
+  elif [ "$resolved_runtime_obj_assigned" = "1" ]; then
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --no-multi \
+      --no-multi-force \
+      --runtime-obj:"$resolved_runtime_obj" \
+      --output:"$exe_path" >"$build_log" 2>&1
+  elif [ "$resolved_no_runtime_c" = "1" ]; then
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --no-multi \
+      --no-multi-force \
+      --no-runtime-c \
+      --output:"$exe_path" >"$build_log" 2>&1
   else
-    BACKEND_EMIT=exe \
-    BACKEND_MULTI=0 \
-    BACKEND_MULTI_FORCE=0 \
-    BACKEND_LINKER=system \
-    BACKEND_TARGET="$target" \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$exe_path" \
-    "$driver" >"$build_log" 2>&1
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --no-multi \
+      --no-multi-force \
+      --output:"$exe_path" >"$build_log" 2>&1
   fi
   build_status="$?"
   set -e
   if [ "$build_status" -ne 0 ]; then
-    if is_known_float_skip_log "$build_log"; then
-      echo "[verify_backend_float] known link instability, fallback compile-only: $fixture" 1>&2
-      compile_fixture_compile_only "$fixture" "$log_prefix"
-      return
-    fi
     tail -n 200 "$build_log" >&2 || true
     exit "$build_status"
   fi
@@ -124,15 +125,13 @@ compile_and_run_fixture() {
   run_status="$?"
   set -e
   if [ "$run_status" -ne 0 ]; then
-    if is_known_float_skip_log "$run_log"; then
-      echo "[verify_backend_float] known runtime-symbol instability, fallback compile-only: $fixture" 1>&2
-      compile_fixture_compile_only "$fixture" "$log_prefix"
-      return
-    fi
     cat "$run_log" >&2 || true
     exit "$run_status"
   fi
 }
+
+target="$(resolve_target)"
+resolve_link_env
 
 for fixture in tests/cheng/backend/fixtures/return_add.cheng \
                tests/cheng/backend/fixtures/hello_puts.cheng \

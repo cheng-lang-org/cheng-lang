@@ -11,7 +11,7 @@ Usage:
 Notes:
   - Creates a minimal release bundle (tar.gz).
   - Bundle includes: backend driver + release manifest + optional extras + sha256sum file (if available).
-  - By default it bundles ./<binName> built via build_backend_driver.sh.
+  - By default it bundles ./<binName> built via native build_backend_driver.
   - Use --driver:<path> to bundle a self-hosted stage2 driver (or any custom driver binary).
   - Uses SOURCE_DATE_EPOCH (or git commit timestamp) to stabilize bundle mtimes when possible.
 USAGE
@@ -53,8 +53,9 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
+tool="${TOOLING_REPO_SH:-$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh}"
 
 resolve_path() {
   p="$1"
@@ -68,7 +69,7 @@ resolve_path() {
 driver_path="$driver"
 if [ "$driver_path" = "" ]; then
   if [ ! -x "./$name" ]; then
-    src/tooling/build_backend_driver.sh --name:"$name" >/dev/null
+    sh "$tool" build_backend_driver --name:"$name" >/dev/null
   fi
   driver_path="./$name"
 fi

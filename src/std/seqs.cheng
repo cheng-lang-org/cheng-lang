@@ -6,6 +6,15 @@ type
         cap: int32
         buffer: ptr
 
+@importc("cheng_seq_string_elem_bytes_compat")
+fn cheng_seq_string_elem_bytes_compat(): int32
+@importc("cheng_seq_string_register_compat")
+fn cheng_seq_string_register_compat(seqPtr: ptr)
+@importc("cheng_seq_set_grow")
+fn cheng_seq_set_grow(seqPtr: ptr, idx: int32, elemSize: int32): ptr
+@importc("store")
+fn seqs_store_str_bridge(p: ptr, val: str)
+
 @importc("cheng_seq_delete_shift")
 fn cheng_seq_delete_shift(buffer: ptr, at: int32, len: int32, elemSize: int32)
 @importc("cheng_seq_slice_alloc")
@@ -27,6 +36,17 @@ fn freeSeq_bool(seqInst: var bool[])
 fn freeSeq_int32(seqInst: var int32[])
 @importc("cheng_seq_grow_inst")
 fn cheng__seqGrowInst(seqPtr: ptr, minCap: int32, typeSize: int32)
+@importc("cheng_seq_free")
+fn cheng_seq_free_compat(seqPtr: ptr)
+
+fn freeSeq(seqInst: var str[]) =
+    freeSeq_str(seqInst)
+
+fn freeSeq(seqInst: var bool[]) =
+    freeSeq_bool(seqInst)
+
+fn freeSeq(seqInst: var int32[]) =
+    freeSeq_int32(seqInst)
 
 fn cheng__seqNextCap(curCap: int32, needLen: int32): int32 =
     let curCap0: int32 = curCap
@@ -113,7 +133,7 @@ fn seqAdd(seqInst: var T[], val: T) =
     setLen(seqInst, writeAt + 1)
     seqInst[writeAt] = val
 
-fn add(seqInst: T[]*, val: T) =
+fn seqAddPtr(seqInst: T[]*, val: T) =
     if seqInst != nil:
         let writeAt: int32 = seqInst->len
         setLen(seqInst, writeAt + 1)
@@ -168,26 +188,13 @@ fn delete(seqInst: T[]*, at: int32) =
             seqInst->len = seqInst->len - 1
 
 fn freeSeqPtr(seqInst: var T[]) =
-    if seqInst.buffer != nil:
-        seqs_mem_release(seqInst.buffer)
-    seqInst.buffer = nil
-    seqInst.len = 0
-    seqInst.cap = 0
+    cheng_seq_free_compat(&seqInst)
 
 fn freeSeqPtr(seqInst: T[]*) =
-    if seqInst != nil:
-        if seqInst->buffer != nil:
-            seqs_mem_release(seqInst->buffer)
-        seqInst->buffer = nil
-        seqInst->len = 0
-        seqInst->cap = 0
+    cheng_seq_free_compat(seqInst)
 
 fn freeSeq(seqInst: var T[]) =
-    if seqInst.buffer != nil:
-        seqs_mem_release(seqInst.buffer)
-    seqInst.buffer = nil
-    seqInst.len = 0
-    seqInst.cap = 0
+    cheng_seq_free_compat(&seqInst)
 
 # Stage1/self-link fallback symbol for concrete str sequence free helper.
 fn reset(seqInst: var T[]) =
@@ -199,7 +206,7 @@ fn arcRetainSeq(seqInst: T[]) =
 
 fn arcReleaseSeq(seqInst: T[]) =
     if seqInst.buffer != nil:
-        memRelease(seqInst.buffer)
+        seqs_mem_release(seqInst.buffer)
 
 # Monomorphized legacy alias for str sequence (kept for bootstrap compatibility).
 type
@@ -221,22 +228,93 @@ fn arcReleaseSeq_string(seqInst: seq_string) =
     arcReleaseSeq(seqInst)
 
 fn chengSeqStringElemBytesCompat(): int32 =
-    return elemSize[str]()
+    return cheng_seq_string_elem_bytes_compat()
+
+fn chengSeqStoreStrCompat(slot: ptr, val: str) =
+    if slot == nil:
+        return
+    seqs_store_str_bridge(slot, val)
+
+@importc("cheng_seq_string_init_compat")
+fn cheng_seq_string_init_compat(seqPtr: ptr, seqLen: int32, seqCap: int32)
 
 fn chengSeqStringInitCompat(seqPtr: ptr, seqLen: int32, seqCap: int32) =
-    if seqPtr == nil:
-        return
-    var out: str[]
-    if seqCap > 0:
-        reserve(out, seqCap)
-    if seqLen > 0:
-        setLen(out, seqLen)
-    memCopyCompat(seqPtr, &out, int32(sizeof str[]))
+    cheng_seq_string_init_compat(seqPtr, seqLen, seqCap)
 
 fn newSeq_string(seqLen: int32, seqCap: int32): str[] =
     var out: str[]
     chengSeqStringInitCompat(&out, seqLen, seqCap)
-    return out
+    # Older stage0/current-source drivers can mis-lower the raw local return
+    # after compat out-ptr init; return through the concrete alias header shape.
+    return seq_string(len: out.len, cap: out.cap, buffer: out.buffer)
+
+fn setLen(seqInst: var str[], newLen: int) =
+    var target: int32 = int32(newLen)
+    if target < 0:
+        target = 0
+    cheng_seq_string_register_compat(&seqInst)
+    let elemBytes: int32 = chengSeqStringElemBytesCompat()
+    if target > seqInst.cap || (target > 0 && seqInst.buffer == nil):
+        cheng__seqGrowInst(&seqInst, target, elemBytes)
+    if target > seqInst.len:
+        cheng__seqZeroTailRaw(seqInst.buffer, seqInst.cap, seqInst.len, target, elemBytes)
+    seqInst.len = target
+
+fn setLen(seqInst: var str[], newLen: int32) =
+    setLen(seqInst, int(newLen))
+
+fn setLen(seqInst: str[]*, newLen: int) =
+    if seqInst != nil:
+        var target: int32 = int32(newLen)
+        if target < 0:
+            target = 0
+        cheng_seq_string_register_compat(seqInst)
+        let elemBytes: int32 = chengSeqStringElemBytesCompat()
+        if target > seqInst->cap || (target > 0 && seqInst->buffer == nil):
+            cheng__seqGrowInst(seqInst, target, elemBytes)
+        if target > seqInst->len:
+            cheng__seqZeroTailRaw(seqInst->buffer, seqInst->cap, seqInst->len, target, elemBytes)
+        seqInst->len = target
+
+fn setLen(seqInst: str[]*, newLen: int32) =
+    setLen(seqInst, int(newLen))
+
+fn reserve(seqInst: var str[], newCap: int32) =
+    if newCap >= 0:
+        cheng_seq_string_register_compat(&seqInst)
+        if newCap > seqInst.cap || seqInst.buffer == nil:
+            cheng__seqGrowInst(&seqInst, newCap, chengSeqStringElemBytesCompat())
+
+fn reserve(seqInst: var str[], newCap: int) =
+    reserve(seqInst, int32(newCap))
+
+fn reserve(seqInst: str[]*, newCap: int32) =
+    if seqInst != nil && newCap >= 0:
+        cheng_seq_string_register_compat(seqInst)
+        if newCap > seqInst->cap || seqInst->buffer == nil:
+            cheng__seqGrowInst(seqInst, newCap, chengSeqStringElemBytesCompat())
+
+fn reserve(seqInst: str[]*, newCap: int) =
+    reserve(seqInst, int32(newCap))
+
+fn add(seqInst: var str[], val: str) =
+    let writeAt: int32 = seqInst.len
+    cheng_seq_string_register_compat(&seqInst)
+    let slot: ptr = cheng_seq_set_grow(&seqInst, writeAt, chengSeqStringElemBytesCompat())
+    chengSeqStoreStrCompat(slot, val)
+
+fn seqAdd(seqInst: var str[], val: str) =
+    let writeAt: int32 = seqInst.len
+    cheng_seq_string_register_compat(&seqInst)
+    let slot: ptr = cheng_seq_set_grow(&seqInst, writeAt, chengSeqStringElemBytesCompat())
+    chengSeqStoreStrCompat(slot, val)
+
+fn seqAddPtr(seqInst: str[]*, val: str) =
+    if seqInst != nil:
+        let writeAt: int32 = seqInst->len
+        cheng_seq_string_register_compat(seqInst)
+        let slot: ptr = cheng_seq_set_grow(seqInst, writeAt, chengSeqStringElemBytesCompat())
+        chengSeqStoreStrCompat(slot, val)
 
 fn __cheng_vec_contains(seqInst: T[], val: T): bool =
     var index: int32 = 0

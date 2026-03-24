@@ -671,40 +671,144 @@ fn uirCoreFileLikelyHasPointerSyntax(path: str): bool =
             return true
     return false
 
-fn uirCoreHasDefaultSpawnCall(content: str): bool =
-    if len(content) < 6:
+fn uirCoreRawSpawnScopePush(scopeStarts: var int32[], bindNames: var str[], bindRaws: var bool[]) =
+    seqs.add(scopeStarts, len(bindNames))
+
+fn uirCoreRawSpawnScopePop(scopeStarts: var int32[], bindNames: var str[], bindRaws: var bool[]) =
+    if scopeStarts.len <= 0:
+        return
+    let mark: int32 = scopeStarts[scopeStarts.len - 1]
+    scopeStarts.len = scopeStarts.len - 1
+    bindNames.len = mark
+    bindRaws.len = mark
+
+fn uirCoreRawSpawnScopeNode(kind: NodeKind): bool =
+    return kind == nkModule || kind == nkStmtList ||
+           kind == nkFnDecl || kind == nkIteratorDecl ||
+           kind == nkLambda || kind == nkDo
+
+fn uirCoreBindRawSpawnName(nameNode: Node, rawLike: bool, bindNames: var str[], bindRaws: var bool[]) =
+    if stage1AstRefIsNil(nameNode):
+        return
+    if nodeKind(nameNode) == nkIdent || nodeKind(nameNode) == nkSymbol:
+        seqs.add(bindNames, semNodeNameNormalized(nameNode))
+        seqs.add(bindRaws, rawLike)
+        return
+    if nodeKind(nameNode) == nkPattern && kidCount(nameNode) > 0:
+        uirCoreBindRawSpawnName(kid(nameNode, 0), rawLike, bindNames, bindRaws)
+
+fn uirCoreBindRawSpawnNameId(nameId: AstNodeId, rawLike: bool, bindNames: var str[], bindRaws: var bool[]) =
+    uirCoreBindRawSpawnName(nameId, rawLike, bindNames, bindRaws)
+
+fn uirCoreLookupRawSpawnName(name: str, bindNames: var str[], bindRaws: var bool[]): bool =
+    if len(name) == 0 || bindNames.len != bindRaws.len:
         return false
-    let n: int32 = len(content)
-    for i in 0..(n - 6):
-        if content[i] == 's' &&
-           content[i + 1] == 'p' &&
-           content[i + 2] == 'a' &&
-           content[i + 3] == 'w' &&
-           content[i + 4] == 'n' &&
-           content[i + 5] == '(':
-            if i > 0:
-                let prev: char = content[i - 1]
-                if prev == '.' || prev == '_' ||
-                   (prev >= 'a' && prev <= 'z') ||
-                   (prev >= 'A' && prev <= 'Z') ||
-                   (prev >= '0' && prev <= '9'):
-                    continue
+    var i: int32 = bindNames.len - 1
+    while i >= 0:
+        if bindNames[i] == name:
+            return bindRaws[i]
+        i = i - 1
+    return false
+
+fn uirCoreCallArgValueId(argId0: AstNodeId): AstNodeId =
+    var argId: AstNodeId = argId0
+    if astNodeIdValid(argId) && astNodeKind(argId) == nkCallArg:
+        if astKidCount(argId) > 1:
+            argId = astKidAt(argId, 1)
+        elif astKidCount(argId) > 0:
+            argId = astKidAt(argId, 0)
+    while astNodeIdValid(argId) && astNodeKind(argId) == nkPar && astKidCount(argId) == 1:
+        argId = astKidAt(argId, 0)
+    return argId
+
+fn uirCoreIsDefaultSpawnCallId(callId: AstNodeId): bool =
+    if !astNodeIdValid(callId) || astNodeKind(callId) != nkCall || astKidCount(callId) == 0:
+        return false
+    var headId: AstNodeId = astKidAt(callId, 0)
+    if !astNodeIdValid(headId):
+        return false
+    if astNodeKind(headId) == nkDotExpr:
+        return false
+    if astNodeKind(headId) == nkBracketExpr && astKidCount(headId) > 0:
+        let baseId: AstNodeId = astKidAt(headId, 0)
+        if !astNodeIdValid(baseId):
+            return false
+        if astNodeKind(baseId) == nkDotExpr:
+            return false
+        headId = baseId
+    if astNodeKind(headId) != nkIdent && astNodeKind(headId) != nkSymbol:
+        return false
+    return semNodeNameNormalizedId(headId) == "spawn"
+
+fn uirCoreExprLooksRawSpawnFnPtrId(exprId0: AstNodeId, bindNames: var str[], bindRaws: var bool[]): bool =
+    var exprId: AstNodeId = uirCoreCallArgValueId(exprId0)
+    if !astNodeIdValid(exprId):
+        return false
+    let kind: NodeKind = astNodeKind(exprId)
+    if kind == nkIdent || kind == nkSymbol:
+        return uirCoreLookupRawSpawnName(semNodeNameNormalizedId(exprId), bindNames, bindRaws)
+    if kind == nkCall && astKidCount(exprId) > 0:
+        let headId: AstNodeId = astKidAt(exprId, 0)
+        if semIsPtrLikeTypeNodeId(headId) || semIsVoidPtrTypeNodeId(headId):
             return true
     return false
 
-fn uirCoreFileLikelyUsesRawSpawn(path: str): bool =
-    if len(path) == 0:
+fn uirCoreBindRawSpawnFormalParamsId(paramsId: AstNodeId, bindNames: var str[], bindRaws: var bool[]) =
+    if !astNodeIdValid(paramsId) || astNodeKind(paramsId) != nkFormalParams:
+        return
+    for i in 0..<astKidCount(paramsId):
+        let defsId: AstNodeId = astKidAt(paramsId, i)
+        if !astNodeIdValid(defsId) || astNodeKind(defsId) != nkIdentDefs || astKidCount(defsId) < 2:
+            continue
+        let typeId: AstNodeId = identDefsTypeId(defsId)
+        let rawLike: bool = semIsPtrLikeTypeNodeId(typeId) || semIsVoidPtrTypeNodeId(typeId)
+        for j in 0..<identDefsNameCountId(defsId):
+            uirCoreBindRawSpawnNameId(astKidAt(defsId, j), rawLike, bindNames, bindRaws)
+
+fn uirCoreAstUsesRawSpawnId(nId: AstNodeId, bindNames: var str[], bindRaws: var bool[], scopeStarts: var int32[]): bool =
+    if !astNodeIdValid(nId):
         return false
-    let content: str = frontend_lib.stage1_readFile(path)
-    if len(content) == 0:
-        return false
-    if !uirCoreHasDefaultSpawnCall(content):
-        return false
-    if strContains(content, "void" + "*") || strContains(content, "void *"):
-        return true
-    if strContains(content, "fn_ptr") || strContains(content, "fnPtr"):
-        return true
+    let kind: NodeKind = astNodeKind(nId)
+    let ownsScope: bool = uirCoreRawSpawnScopeNode(kind)
+    if ownsScope:
+        uirCoreRawSpawnScopePush(scopeStarts, bindNames, bindRaws)
+    defer:
+        if ownsScope:
+            uirCoreRawSpawnScopePop(scopeStarts, bindNames, bindRaws)
+    if kind == nkFnDecl || kind == nkIteratorDecl || kind == nkLambda:
+        if astKidCount(nId) > 1:
+            uirCoreBindRawSpawnFormalParamsId(astKidAt(nId, 1), bindNames, bindRaws)
+    if kind == nkCall && uirCoreIsDefaultSpawnCallId(nId):
+        if astKidCount(nId) > 1 && uirCoreExprLooksRawSpawnFnPtrId(astKidAt(nId, 1), bindNames, bindRaws):
+            return true
+    for i in 0..<astKidCount(nId):
+        if uirCoreAstUsesRawSpawnId(astKidAt(nId, i), bindNames, bindRaws, scopeStarts):
+            return true
+    if kind == nkLet || kind == nkVar || kind == nkConst:
+        var nameId: AstNodeId = astInvalidNodeId()
+        var typeId: AstNodeId = astInvalidNodeId()
+        var valueId: AstNodeId = astInvalidNodeId()
+        if astKidCount(nId) > 0:
+            nameId = astKidAt(nId, 0)
+        if astKidCount(nId) > 1:
+            typeId = astKidAt(nId, 1)
+        if astKidCount(nId) > 2:
+            valueId = astKidAt(nId, 2)
+        var rawLike: bool = false
+        if astNodeIdValid(typeId) && astNodeKind(typeId) != nkEmpty:
+            rawLike = semIsPtrLikeTypeNodeId(typeId) || semIsVoidPtrTypeNodeId(typeId)
+        elif astNodeIdValid(valueId):
+            rawLike = uirCoreExprLooksRawSpawnFnPtrId(valueId, bindNames, bindRaws)
+        uirCoreBindRawSpawnNameId(nameId, rawLike, bindNames, bindRaws)
     return false
+
+fn uirCoreFileLikelyUsesRawSpawn(rootId: AstNodeId): bool =
+    if !astNodeIdValid(rootId):
+        return false
+    var bindNames: str[]
+    var bindRaws: bool[]
+    var scopeStarts: int32[]
+    return uirCoreAstUsesRawSpawnId(rootId, bindNames, bindRaws, scopeStarts)
 
 fn uirCorePathLooksStdModule(path: str): bool =
     if len(path) == 0:

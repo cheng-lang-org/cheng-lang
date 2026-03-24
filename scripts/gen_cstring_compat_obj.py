@@ -269,6 +269,130 @@ def patch_symbol_value(blob: bytearray, entry_off: int, new_value: int) -> None:
     struct.pack_into("<Q", blob, entry_off + 8, new_value)
 
 
+def read_cstring_bytes(blob: bytes, start: int, limit: int) -> bytes:
+    if start < 0 or start >= limit:
+        return b""
+    end = blob.find(b"\x00", start, limit)
+    if end < 0:
+        end = limit
+    return bytes(blob[start:end])
+
+
+def collect_unique_labels(labels: list[tuple[str, int, int]]) -> list[tuple[str, int, list[int]]]:
+    unique_labels: dict[str, tuple[int, list[int]]] = {}
+    for label, addr, entry_off in labels:
+        if label not in unique_labels:
+            unique_labels[label] = (addr, [entry_off])
+            continue
+        prev_addr, entry_list = unique_labels[label]
+        if addr < prev_addr:
+            unique_labels[label] = (addr, entry_list + [entry_off])
+        else:
+            entry_list.append(entry_off)
+    out = [(label, addr, entry_list) for label, (addr, entry_list) in unique_labels.items()]
+    out.sort(key=lambda item: (item[1], item[0]))
+    return out
+
+
+def build_label_coverage(
+    blob: bytes, section_offset: int, section_size: int, unique_labels: list[tuple[str, int, list[int]]], section_addr: int
+) -> list[bool]:
+    section_end = section_offset + section_size
+    covered = [False] * section_size
+    for _label, addr, _entry_list in unique_labels:
+        file_off = section_offset + (addr - section_addr)
+        if file_off < section_offset or file_off >= section_end:
+            continue
+        end = blob.find(b"\x00", file_off, section_end)
+        if end < 0:
+            end = section_end
+        last = end + 1 if end < section_end else section_end
+        for idx in range(file_off, last):
+            covered[idx - section_offset] = True
+    return covered
+
+
+def labeled_prefix_size(blob: bytes, section_offset: int, section_size: int, covered: list[bool]) -> int:
+    prefix_end = 0
+    for idx in range(section_size):
+        byte = blob[section_offset + idx]
+        if byte != 0 and not covered[idx]:
+            break
+        prefix_end = idx + 1
+    return prefix_end
+
+
+def repack_labeled_cstring_section(
+    blob: bytearray,
+    section_addr: int,
+    section_size: int,
+    section_offset: int,
+    unique_labels: list[tuple[str, int, list[int]]],
+    label_map: dict[str, bytes],
+) -> tuple[int, int] | None:
+    if not unique_labels:
+        return 0, 0
+    section_end = section_offset + section_size
+    covered = build_label_coverage(blob, section_offset, section_size, unique_labels, section_addr)
+    prefix_size = labeled_prefix_size(blob, section_offset, section_size, covered)
+    if prefix_size <= 0:
+        return None
+    prefix_end = section_offset + prefix_size
+    prefix_labels: list[tuple[str, int, list[int]]] = []
+    for label, old_addr, entry_list in unique_labels:
+        current_file_off = section_offset + (old_addr - section_addr)
+        if current_file_off < section_offset or current_file_off >= prefix_end:
+            continue
+        prefix_labels.append((label, old_addr, entry_list))
+    if not prefix_labels:
+        return None
+    resolved_values: list[tuple[str, int, list[int], bytes]] = []
+    current_values: list[tuple[int, bytes]] = []
+    for label, old_addr, entry_list in prefix_labels:
+        current_file_off = section_offset + (old_addr - section_addr)
+        current_value = read_cstring_bytes(blob, current_file_off, section_end)
+        value = label_map.get(label)
+        if current_value:
+            if value is None:
+                value = current_value
+        elif value is None:
+            value = current_value
+        if not value:
+            for prev_addr, prev_value in reversed(current_values):
+                if not prev_value:
+                    continue
+                if old_addr <= prev_addr + len(prev_value):
+                    value = prev_value
+                    break
+        current_values.append((old_addr, value))
+        resolved_values.append((label, old_addr, entry_list, value))
+    total_size = sum(len(value) + 1 for _label, _addr, _entry_list, value in resolved_values)
+    if total_size > prefix_size:
+        return None
+    layout = bytearray(prefix_size)
+    cursor = 0
+    patched = 0
+    skipped = 0
+    for label, old_addr, entry_list, value in resolved_values:
+        current_file_off = section_offset + (old_addr - section_addr)
+        payload = value + b"\x00"
+        if cursor + len(payload) > prefix_size:
+            return None
+        layout[cursor : cursor + len(payload)] = payload
+        new_addr = section_addr + cursor
+        if current_file_off < section_offset or current_file_off >= section_end:
+            skipped += len(entry_list)
+        else:
+            old_payload = blob[current_file_off : current_file_off + len(payload)]
+            if old_addr != new_addr or old_payload != payload:
+                patched += len(entry_list)
+        for entry_off in entry_list:
+            patch_symbol_value(blob, entry_off, new_addr)
+        cursor += len(payload)
+    blob[section_offset:prefix_end] = layout
+    return patched, skipped
+
+
 def patch_object(obj_path: Path, label_map: dict[str, bytes]) -> tuple[int, int]:
     blob = bytearray(obj_path.read_bytes())
     try:
@@ -280,22 +404,14 @@ def patch_object(obj_path: Path, label_map: dict[str, bytes]) -> tuple[int, int]
     labels = parse_label_symbols(blob, section_addr, section_size, symtab)
     if not labels:
         return 0, 0
+    unique_labels = collect_unique_labels(labels)
     patched = 0
     skipped = 0
     section_end = section_offset + section_size
-    unique_labels: dict[str, tuple[int, list[int]]] = {}
-    for label, addr, entry_off in labels:
-        if label not in unique_labels:
-            unique_labels[label] = (addr, [entry_off])
-        else:
-            prev_addr, entry_list = unique_labels[label]
-            if addr < prev_addr:
-                unique_labels[label] = (addr, entry_list + [entry_off])
-            else:
-                entry_list.append(entry_off)
-    if len(unique_labels) == 2:
-        empty_item = unique_labels.get("L_cheng_str_14650fb0739d0383")
-        nonempty_items = [(label, item) for label, item in unique_labels.items() if label != "L_cheng_str_14650fb0739d0383"]
+    unique_label_dict = {label: (addr, entry_list) for label, addr, entry_list in unique_labels}
+    if len(unique_label_dict) == 2:
+        empty_item = unique_label_dict.get("L_cheng_str_14650fb0739d0383")
+        nonempty_items = [(label, item) for label, item in unique_label_dict.items() if label != "L_cheng_str_14650fb0739d0383"]
         if empty_item is not None and len(nonempty_items) == 1:
             nonempty_label, (nonempty_addr, nonempty_entries) = nonempty_items[0]
             empty_addr, empty_entries = empty_item
@@ -317,6 +433,12 @@ def patch_object(obj_path: Path, label_map: dict[str, bytes]) -> tuple[int, int]
                 return 2, 0
     for idx, (label, addr, _entry_off) in enumerate(labels):
         value = label_map.get(label)
+        current_value = read_cstring_bytes(blob, section_offset + (addr - section_addr), section_end)
+        if current_value:
+            if value is None:
+                value = current_value
+        elif value is None:
+            value = current_value
         if value is None:
             skipped += 1
             continue
@@ -344,6 +466,18 @@ def patch_object(obj_path: Path, label_map: dict[str, bytes]) -> tuple[int, int]
                 patched += 1
             continue
         skipped += 1
+    repacked = repack_labeled_cstring_section(
+        blob,
+        section_addr,
+        section_size,
+        section_offset,
+        unique_labels,
+        label_map,
+    )
+    if repacked is not None:
+        repacked_patched, repacked_skipped = repacked
+        patched += repacked_patched
+        skipped = max(skipped, repacked_skipped)
     if patched > 0:
         obj_path.write_bytes(blob)
     return patched, skipped

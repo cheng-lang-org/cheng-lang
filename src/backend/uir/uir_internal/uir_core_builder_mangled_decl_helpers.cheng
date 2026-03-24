@@ -12,6 +12,49 @@ import backend/uir/uir_internal/uir_core_builder_dup_scan
 import backend/uir/uir_internal/uir_core_builder_overload_scan
 import backend/uir/uir_internal/uir_core_builder_top_level_passes
 
+fn uirCoreTypeKeyForOverloadOrEmpty(tnId: AstNodeId): str =
+    if astNodeIdValid(tnId):
+        return uirCoreTypeKeyForOverload(tnId)
+    return ""
+
+fn uirCoreFnDeclOverloadRetKey(nId: AstNodeId): str =
+    let retNodeId: AstNodeId = astKidAt(nId, 2)
+    if astNodeIdValid(retNodeId) && astNodeKind(retNodeId) != nkEmpty:
+        return uirCoreTypeKeyForOverload(retNodeId)
+    return ""
+
+fn uirCoreIndexedFnDeclName(nId: AstNodeId, rawName: str, overloaded: ptr,
+                            baseSym: str, symName: str, fp: str,
+                            dbgDollarOverload: bool): str =
+    if !uirCoreShouldMangleOverloadFn(rawName, overloaded):
+        return symName
+    let paramsNodeId: AstNodeId = astKidAt(nId, 1)
+    var paramKeys: str[]
+    if astNodeIdValid(paramsNodeId) && astNodeKind(paramsNodeId) == nkFormalParams:
+        let paramCap: int32 = astKidCount(paramsNodeId)
+        if paramCap > 0:
+            setLen(paramKeys, paramCap)
+        var paramCount: int32 = 0
+        for pi in 0..<astKidCount(paramsNodeId):
+            let defsId: AstNodeId = astKidAt(paramsNodeId, pi)
+            if !astNodeIdValid(defsId):
+                continue
+            if astNodeKind(defsId) == nkIdentDefs && astKidCount(defsId) > 1:
+                let tnId: AstNodeId = astKidAt(defsId, 1)
+                if paramCount < paramKeys.len:
+                    paramKeys[paramCount] = uirCoreTypeKeyForOverloadOrEmpty(tnId)
+                    paramCount = paramCount + 1
+        if paramCount < paramKeys.len:
+            setLen(paramKeys, paramCount)
+    let retKey: str = uirCoreFnDeclOverloadRetKey(nId)
+    if dbgDollarOverload && rawName == "$" && strContains(fp, "src/std/strings.cheng"):
+        os.writeLine(os.get_stderr(),
+            "[backend] dollar_index origin=" + fp +
+            " ret='" + retKey +
+            "' params='" + $paramKeys + "'")
+        os.c_fflush(os.get_stderr())
+    return uirCoreMangleOverloadName(baseSym, retKey, paramKeys)
+
 fn uirCoreCountFnDeclsMangledId(rootId: AstNodeId): int32 =
     if !astNodeIdValid(rootId):
         return 0
@@ -60,41 +103,7 @@ fn uirCoreIndexFnDeclsMangledId(rootId: AstNodeId, overloaded: ptr,
         let fp: str = nextFilePath
         let symName: str = uirCoreMaybeMangleDupFnBase(rawName, fp)
         let baseSym: str = backendSanitizeLinkName(symName)
-
-        var name: str = symName
-        if uirCoreShouldMangleOverloadFn(rawName, overloaded):
-            let paramsNodeId: AstNodeId = astKidAt(nId, 1)
-            var paramKeys: str[]
-            if astNodeIdValid(paramsNodeId):
-                if astNodeKind(paramsNodeId) == nkFormalParams:
-                    let paramCap: int32 = astKidCount(paramsNodeId)
-                    if paramCap > 0:
-                        setLen(paramKeys, paramCap)
-                    var paramCount: int32 = 0
-                    for pi in 0..<astKidCount(paramsNodeId):
-                        let defsId: AstNodeId = astKidAt(paramsNodeId, pi)
-                        if !astNodeIdValid(defsId):
-                            continue
-                        if astNodeKind(defsId) == nkIdentDefs && astKidCount(defsId) > 1:
-                            let tnId: AstNodeId = astKidAt(defsId, 1)
-                            let pk: str = astNodeIdValid(tnId) ? uirCoreTypeKeyForOverload(tnId) : ""
-                            if paramCount < paramKeys.len:
-                                paramKeys[paramCount] = pk
-                                paramCount = paramCount + 1
-                    if paramCount < paramKeys.len:
-                        setLen(paramKeys, paramCount)
-            let retNodeId: AstNodeId = astKidAt(nId, 2)
-            var retKey: str = ""
-            if astNodeIdValid(retNodeId):
-                if astNodeKind(retNodeId) != nkEmpty:
-                    retKey = uirCoreTypeKeyForOverload(retNodeId)
-            if dbgDollarOverload && rawName == "$" && strContains(fp, "src/std/strings.cheng"):
-                os.writeLine(os.get_stderr(),
-                    "[backend] dollar_index origin=" + fp +
-                    " ret='" + retKey +
-                    "' params='" + $paramKeys + "'")
-                os.c_fflush(os.get_stderr())
-            name = uirCoreMangleOverloadName(baseSym, retKey, paramKeys)
+        let name: str = uirCoreIndexedFnDeclName(nId, rawName, overloaded, baseSym, symName, fp, dbgDollarOverload)
 
         if nextIdx >= outNames.len || nextIdx >= outNodes.len || nextIdx >= outFiles.len:
             panic "uirCore_builder: decl index overflow"
@@ -104,7 +113,7 @@ fn uirCoreIndexFnDeclsMangledId(rootId: AstNodeId, overloaded: ptr,
         nextIdx = nextIdx + 1
 
 fn uirCoreShouldMangleOverloadFn(baseName0: str, overloaded: ptr = nil): bool =
-    let baseName: str = (len(baseName0) > 0) ? baseName0 : ""
+    let baseName: str = baseName0
     if len(baseName) == 0 || baseName == "main":
         return false
     if overloaded != nil:

@@ -4,7 +4,7 @@
 script_is_self_trampoline() {
   subcmd="$1"
   script_path="$2"
-  grep -Eq "^[[:space:]]*exec[[:space:]].*(TOOLING_SELF_BIN|\\\$tool).*[[:space:]]$subcmd([[:space:]]|$)" "$script_path" 2>/dev/null
+  tr '\n' ' ' <"$script_path" 2>/dev/null | grep -Eq "[[:space:]]exec[[:space:]].*((TOOLING_SELF_BIN|\\\$tool)|cheng_tooling\\.sh).*[[:space:]]$subcmd([[:space:]]|$)"
 }
 
 resolve_repo_script() {
@@ -71,6 +71,8 @@ repo_gate_support_ids() {
   for gate_id in \
     verify_backend_stage1_fixed0_envs \
     verify_backend_string_literal_regression \
+    verify_backend_macho_cstring_overlap \
+    verify_backend_sidecar_cheng_fresh \
     verify_backend_default_output_safety \
     verify_new_expr_surface \
     verify_backend_pure_cheng_surface \

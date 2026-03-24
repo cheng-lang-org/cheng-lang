@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -18,8 +18,41 @@ if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" 
 fi
 
 driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
-target="${BACKEND_TARGET:-arm64-apple-darwin}"
-link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:"${BACKEND_LINKER:-auto}")"
+requested_linker="${BACKEND_LINKER:-auto}"
+
+resolve_target() {
+  if [ "${BACKEND_TARGET:-}" != "" ] && [ "${BACKEND_TARGET:-}" != "auto" ]; then
+    printf '%s\n' "${BACKEND_TARGET}"
+    return
+  fi
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target
+}
+
+resolve_link_env() {
+  link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:"$requested_linker")"
+  resolved_linker=""
+  resolved_no_runtime_c="0"
+  resolved_runtime_obj=""
+  resolved_runtime_obj_assigned="0"
+  for entry in $link_env; do
+    case "$entry" in
+      BACKEND_LINKER=*)
+        resolved_linker="${entry#BACKEND_LINKER=}"
+        ;;
+      BACKEND_NO_RUNTIME_C=*)
+        resolved_no_runtime_c="${entry#BACKEND_NO_RUNTIME_C=}"
+        ;;
+      BACKEND_RUNTIME_OBJ=*)
+        resolved_runtime_obj="${entry#BACKEND_RUNTIME_OBJ=}"
+        resolved_runtime_obj_assigned="1"
+        ;;
+    esac
+  done
+  if [ "$resolved_linker" = "" ]; then
+    echo "[Error] verify_backend_ssa: backend_link_env missing BACKEND_LINKER" 1>&2
+    exit 1
+  fi
+}
 
 
 out_dir="artifacts/backend_ssa"
@@ -35,15 +68,55 @@ run_generic_mode() {
   mode="$1"
   budget="$2"
   outfile="$3"
-  env $link_env \
-    GENERIC_MODE="$mode" \
-    GENERIC_SPEC_BUDGET="$budget" \
-    BACKEND_EMIT=exe \
-    BACKEND_TARGET="$target" \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$outfile" \
-    "$driver"
+  if [ "$resolved_runtime_obj_assigned" = "1" ] && [ "$resolved_no_runtime_c" = "1" ]; then
+    "$driver" "$fixture" \
+      --frontend:stage1 \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --generic-mode:"$mode" \
+      --generic-spec-budget:"$budget" \
+      --no-runtime-c \
+      --runtime-obj:"$resolved_runtime_obj" \
+      --output:"$outfile"
+    return
+  fi
+  if [ "$resolved_runtime_obj_assigned" = "1" ]; then
+    "$driver" "$fixture" \
+      --frontend:stage1 \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --generic-mode:"$mode" \
+      --generic-spec-budget:"$budget" \
+      --runtime-obj:"$resolved_runtime_obj" \
+      --output:"$outfile"
+    return
+  fi
+  if [ "$resolved_no_runtime_c" = "1" ]; then
+    "$driver" "$fixture" \
+      --frontend:stage1 \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --generic-mode:"$mode" \
+      --generic-spec-budget:"$budget" \
+      --no-runtime-c \
+      --output:"$outfile"
+    return
+  fi
+  "$driver" "$fixture" \
+    --frontend:stage1 \
+    --emit:exe \
+    --target:"$target" \
+    --linker:"$resolved_linker" \
+    --generic-mode:"$mode" \
+    --generic-spec-budget:"$budget" \
+    --output:"$outfile"
 }
+
+target="$(resolve_target)"
+resolve_link_env
 
 exe_a="$out_dir/dict_mode"
 run_generic_mode dict 0 "$exe_a"

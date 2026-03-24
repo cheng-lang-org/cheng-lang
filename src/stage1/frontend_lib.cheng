@@ -1656,37 +1656,40 @@ fn normalizeImportPathChecked(path: str, root: str): str =
             return norm
     return ""
 
-fn importNodePathId(nId: AstNodeId): str =
+fn importNodePathTextId(nId: AstNodeId): int32 =
     if !astNodeIdValid(nId):
-        return ""
+        return 0
     let kind: NodeKind = astNodeKind(nId)
     case kind
     of nkImportAs:
         if astKidCount(nId) > 0:
-            return importNodePathId(astKidAt(nId, 0))
-        return ""
+            return importNodePathTextId(astKidAt(nId, 0))
+        return 0
     of nkIdent, nkSymbol:
-        let rawIdent: str = astNodeIdent(nId)
-        if len(rawIdent) == 0:
+        let identId: int32 = astNodeIdentId(nId)
+        if identId <= 0:
             let idx: int32 = astNodeIndex(nId)
-            let identId: int32 = astNodeIdentId(nId)
             let storedIdent: str = tokenTextById(identId)
             echo("[importdbg] ident.empty node=" + intToStr(nId) +
                  " idx=" + intToStr(idx) +
-                 " raw='" + rawIdent +
-                 "' rawlen=" + intToStr(len(rawIdent)) +
-                 " identId=" + intToStr(identId) +
+                 " raw='' rawlen=0 identId=" + intToStr(identId) +
                  " store='" + storedIdent +
                  "' storelen=" + intToStr(len(storedIdent)) +
                  " str='" + astNodeStrVal(nId) +
                  "' kids=" + intToStr(astKidCount(nId)))
-        if len(rawIdent) > 0:
-            return rawIdent
-        return astNodeStrVal(nId)
+        if identId > 0:
+            return identId
+        return astNodeStrValId(nId)
     of nkStrLit:
-        return astNodeStrVal(nId)
+        return astNodeStrValId(nId)
     else:
+        return 0
+
+fn importNodePathId(nId: AstNodeId): str =
+    let pathId: int32 = importNodePathTextId(nId)
+    if pathId <= 0:
         return ""
+    return tokenTextById(pathId)
 
 fn collectImportNodesId(rootId: AstNodeId, acc: AstNodeId[]*) =
     if !astNodeIdValid(rootId) || acc == nil:
@@ -1708,18 +1711,24 @@ fn collectImportPathsId(nId: AstNodeId, out: str[]*) =
     if kind == nkImportGroup:
         if astKidCount(nId) <= 0:
             return
-        let base: str = importNodePathId(astKidAt(nId, 0))
+        let baseTextId: int32 = importNodePathTextId(astKidAt(nId, 0))
+        let base: str = tokenTextById(baseTextId)
         if dbgImports:
             let baseId: AstNodeId = astKidAt(nId, 0)
             echo("[importdbg] group.base kind=" + intToStr(int32(astNodeKind(baseId))) + " ident='" + astNodeIdent(baseId) + "' str='" + astNodeStrVal(baseId) + "' path='" + base + "'")
         for i in 1..<astKidCount(nId):
-            let entry: str = importNodePathId(astKidAt(nId, i))
+            let entryTextId: int32 = importNodePathTextId(astKidAt(nId, i))
+            let entry: str = tokenTextById(entryTextId)
             if dbgImports:
                 let entryId: AstNodeId = astKidAt(nId, i)
                 echo("[importdbg] group.entry[" + intToStr(i) + "] kind=" + intToStr(int32(astNodeKind(entryId))) + " ident='" + astNodeIdent(entryId) + "' str='" + astNodeStrVal(entryId) + "' path='" + entry + "'")
-            if len entry > 0:
-                if len base > 0:
-                    let combined: str = stage1JoinWithSlash(base, entry)
+            if entryTextId > 0:
+                if baseTextId > 0:
+                    var parts: int32[]
+                    add(parts, baseTextId)
+                    add(parts, entryTextId)
+                    let combinedId: int32 = tokenInternTextIdsJoinedByByte(parts, '/')
+                    let combined: str = tokenTextById(combinedId)
                     if dbgImports:
                         echo("[importdbg] group.combined='" + combined + "'")
                     trackLexStringStr(combined)
@@ -1734,26 +1743,29 @@ fn collectImportPathsId(nId: AstNodeId, out: str[]*) =
             if astNodeKind(itemId) == nkImportGroup:
                 collectImportPathsId(itemId, out)
             else:
-                let path: str = importNodePathId(itemId)
+                let pathId: int32 = importNodePathTextId(itemId)
+                let path: str = tokenTextById(pathId)
                 if dbgImports:
                     echo("[importdbg] stmt.item[" + intToStr(j) + "] kind=" + intToStr(int32(astNodeKind(itemId))) + " ident='" + astNodeIdent(itemId) + "' str='" + astNodeStrVal(itemId) + "' path='" + path + "'")
-                if len path > 0:
+                if pathId > 0:
                     trackLexStringStr(path)
                     add(out, path)
         return
     if kind == nkImportAs:
         if astKidCount(nId) > 0:
-            let path: str = importNodePathId(astKidAt(nId, 0))
+            let pathId: int32 = importNodePathTextId(astKidAt(nId, 0))
+            let path: str = tokenTextById(pathId)
             if dbgImports:
                 echo("[importdbg] as.path='" + path + "'")
-            if len path > 0:
+            if pathId > 0:
                 trackLexStringStr(path)
                 add(out, path)
         return
-    let path2: str = importNodePathId(nId)
+    let pathId2: int32 = importNodePathTextId(nId)
+    let path2: str = tokenTextById(pathId2)
     if dbgImports:
         echo("[importdbg] single kind=" + intToStr(int32(kind)) + " path='" + path2 + "'")
-    if len path2 > 0:
+    if pathId2 > 0:
         trackLexStringStr(path2)
         add(out, path2)
 
@@ -1780,15 +1792,16 @@ fn importAliasNameId(nId: AstNodeId): str =
         if astKidCount(nId) > 1:
             return astPlainName(astKidAt(nId, 1))
         if astKidCount(nId) > 0:
-            return semImportModuleName(astPlainName(astKidAt(nId, 0)))
+            let textId: int32 = semImportModuleNameTextId(astPlainNameId(astKidAt(nId, 0)))
+            return tokenTextById(textId)
         return ""
     of nkIdent, nkSymbol:
-        let rawIdent: str = astNodeIdent(nId)
-        if len(rawIdent) > 0:
-            return semImportModuleName(rawIdent)
-        return semImportModuleName(astNodeStrVal(nId))
+        let rawIdentId: int32 = astNodeIdentId(nId)
+        if rawIdentId > 0:
+            return tokenTextById(semImportModuleNameTextId(rawIdentId))
+        return tokenTextById(semImportModuleNameTextId(astNodeStrValId(nId)))
     of nkStrLit:
-        return semImportModuleName(astNodeStrVal(nId))
+        return tokenTextById(semImportModuleNameTextId(astNodeStrValId(nId)))
     else:
         return ""
 
@@ -2378,19 +2391,21 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
     let rootDir: str = stage1ImportRootDirCurrent
     let path: str = stage1ImportPathById(pathId)
     let pathNorm: str = stage1NormalizeVisitedPath(path)
+    let dbgImportPaths: bool = os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1"
+    let traceImports: bool = stage1TraceImportsEnabled()
     stage1PhasePush("loadModuleRecursiveId", pathNorm)
     defer:
         stage1PhasePop()
-    if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+    if dbgImportPaths:
         echo("[importdbg] recursive.enter pathId=" + intToStr(pathId) + " path='" + path + "' pathNorm='" + pathNorm + "' rootDir='" + rootDir + "'")
     if len(pathNorm) == 0:
         return out
-    if stage1TraceImportsEnabled():
+    if traceImports:
         stage1Trace("import: load " + pathNorm)
     if stage1TraceHas(trace, pathNorm):
-        if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+        if dbgImportPaths:
             echo("[importdbg] recursive.cycle_skip pathNorm='" + pathNorm + "'")
-        if stage1TraceImportsEnabled():
+        if traceImports:
             stage1Trace("import: cycle-skip " + pathNorm)
         return out
     if stage1VisitedHas(visited, pathNorm):
@@ -2409,9 +2424,9 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
             let cached: AstNodeId[] = stage1CacheGetNodes(cache, pathNorm)
             return cached
     if !stage1PathReadable(pathNorm):
-        if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+        if dbgImportPaths:
             echo("[importdbg] recursive.missing pathNorm='" + pathNorm + "'")
-        if stage1TraceImportsEnabled():
+        if traceImports:
             stage1Trace("import: missing " + pathNorm)
         addDiag(diags, svError, pathNorm, 1, 1, "Unable to read imported module")
         stage1PhaseDump()
@@ -2495,18 +2510,19 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
         for pi in 0..<paths.len:
             let rawPath: str = paths[pi]
             if len rawPath > 0 && !(rawPath == "system"):
-                if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+                let resolvedPathNorm: str = stage1ResolveImportNormalized(rawPath, moduleDir, rootDir)
+                if dbgImportPaths:
                     echo("[importdbg] load.resolve owner='" + pathNorm + "' raw='" + rawPath + "' moduleDir='" + moduleDir + "' rootDir='" + rootDir + "' resolved='" + resolveImportPath(rawPath, moduleDir, rootDir) + "'")
-                if len(stage1ResolveImportNormalized(rawPath, moduleDir, rootDir)) == 0:
+                if len(resolvedPathNorm) == 0:
                     addDiag(diags, svError, pathNorm, 1, 1, "Unable to read imported module: " + rawPath)
                     continue
-                if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
-                    echo("[importdbg] load.norm owner='" + pathNorm + "' raw='" + rawPath + "' normalized='" + stage1ResolveImportNormalized(rawPath, moduleDir, rootDir) + "'")
-                if stage1TraceImportsEnabled():
-                    stage1Trace("import: " + pathNorm + " -> " + rawPath + " => " + stage1ResolveImportNormalized(rawPath, moduleDir, rootDir))
+                if dbgImportPaths:
+                    echo("[importdbg] load.norm owner='" + pathNorm + "' raw='" + rawPath + "' normalized='" + resolvedPathNorm + "'")
+                if traceImports:
+                    stage1Trace("import: " + pathNorm + " -> " + rawPath + " => " + resolvedPathNorm)
                 let nestedPathId: int32 = stage1ImportPathPushSlot()
-                stage1ImportPathPool[nestedPathId] = stage1ResolveImportNormalized(rawPath, moduleDir, rootDir)
-                if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+                stage1ImportPathPool[nestedPathId] = resolvedPathNorm
+                if dbgImportPaths:
                     echo("[importdbg] load.slot id=" + intToStr(nestedPathId) + " stored='" + stage1ImportPathPool[nestedPathId] + "'")
                 let nested: AstNodeId[] = loadModuleRecursiveId(nestedPathId, visited, diags, cache, trace)
                 for ni in 0..<nested.len:
@@ -2533,6 +2549,8 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
                  cache: ptr = nil): AstNodeId[] =
     var out: AstNodeId[]
     reserve(out, 64)
+    let dbgImportPaths: bool = os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1"
+    let traceImports: bool = stage1TraceImportsEnabled()
     stage1PhasePush("loadImportsId", baseDir)
     defer:
         stage1PhasePop()
@@ -2551,6 +2569,7 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
     reserve(trace.items, 16)
     var rootTracePushed: bool = false
     let rootPath: str = astNodeStrVal(rootId)
+    let traceOwner: str = stage1ImportTraceOwner(rootPath, baseDir)
     if len(rootPath) > 0:
         importTracePush(trace, rootPath)
         rootTracePushed = true
@@ -2568,19 +2587,20 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
         for pi in 0..<paths.len:
             let rawPath: str = paths[pi]
             if len rawPath > 0 && !(rawPath == "system"):
-                if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+                let resolvedPathNorm: str = stage1ResolveImportNormalized(rawPath, baseDir, rootDir)
+                if dbgImportPaths:
                     echo("[importdbg] root.load.resolve raw='" + rawPath + "' baseDir='" + baseDir + "' rootDir='" + rootDir + "' resolved='" + resolveImportPath(rawPath, baseDir, rootDir) + "'")
-                if len(stage1ResolveImportNormalized(rawPath, baseDir, rootDir)) == 0:
+                if len(resolvedPathNorm) == 0:
                     addDiag(diags, svError, baseDir, 1, 1, "Unable to read imported module: " + rawPath)
                     stage1PhaseDump()
                     continue
-                if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
-                    echo("[importdbg] root.load.norm raw='" + rawPath + "' normalized='" + stage1ResolveImportNormalized(rawPath, baseDir, rootDir) + "'")
-                if stage1TraceImportsEnabled():
-                    stage1Trace("import: " + stage1ImportTraceOwner(rootPath, baseDir) + " -> " + rawPath + " => " + stage1ResolveImportNormalized(rawPath, baseDir, rootDir))
+                if dbgImportPaths:
+                    echo("[importdbg] root.load.norm raw='" + rawPath + "' normalized='" + resolvedPathNorm + "'")
+                if traceImports:
+                    stage1Trace("import: " + traceOwner + " -> " + rawPath + " => " + resolvedPathNorm)
                 let nestedPathId: int32 = stage1ImportPathPushSlot()
-                stage1ImportPathPool[nestedPathId] = stage1ResolveImportNormalized(rawPath, baseDir, rootDir)
-                if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
+                stage1ImportPathPool[nestedPathId] = resolvedPathNorm
+                if dbgImportPaths:
                     echo("[importdbg] root.load.slot id=" + intToStr(nestedPathId) + " stored='" + stage1ImportPathPool[nestedPathId] + "'")
                 let nested: AstNodeId[] = loadModuleRecursiveId(nestedPathId, visited, diags, cache, &trace)
                 for ni in 0..<nested.len:

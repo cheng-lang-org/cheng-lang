@@ -1,9 +1,5 @@
-import std/system
-import std/os
-import std/strutils
-import std/rawmem_support
+import std/system_c
 import backend/uir/uir_codegen
-import backend/uir/uir_types
 import backend/uir/uir_internal/uir_core_builder
 import backend/uir/uir_internal/uir_core_types
 
@@ -11,19 +7,54 @@ type
     DriverUirByteBuf = uint8[]
 
 importc fn driver_c_write_exact_file(path: cstring, buffer: ptr, len: int32): int32
+@importc("driver_c_new_string_copy_n")
+fn driver_c_new_string_copy_n(raw: ptr, count: int32): cstring
+@importc("getenv")
+fn driver_c_getenv(name: cstring): cstring
+@importc("memRetain")
+fn driver_memRetain(p: ptr)
+@importc("memRelease")
+fn driver_memRelease(p: ptr)
 
-fn driverUirDebugBootEnabled(): bool =
-    return os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1"
+fn driverUirStrViewUnsafe(data: ptr, len: int32): str =
+    var out: str
+    out.data = data
+    out.len = len
+    out.store_id = 0
+    out.flags = 0
+    return out
 
-fn driverUirDebugBoot(msg: str): void =
-    if !driverUirDebugBootEnabled():
-        return
-    let f: File = os.get_stderr()
-    write(f, "[driverUir] ")
-    writeLine(f, msg)
+fn driverUirBorrowCString(raw: cstring): str =
+    if raw == nil:
+        return ""
+    let n: int32 = c_strlen(raw)
+    if n <= 0:
+        return ""
+    return driverUirStrViewUnsafe(ptr(raw), n)
+
+fn driverUirEnv(name: str): str =
+    return driverUirBorrowCString(driver_c_getenv(strToCStringTemp(name)))
+
+fn driverUirParseNonNegativeInt(raw: str, defaultValue: int32): int32 =
+    let n: int32 = len(raw)
+    if n <= 0:
+        return defaultValue
+    var i: int32 = 0
+    var v: int64 = 0
+    for __for_guard_i in 0..<n:
+        if !(i < n):
+            break
+        let c: char = raw[i]
+        if c < '0' || c > '9':
+            return defaultValue
+        v = v * int64(10) + int64(int32(c) - int32('0'))
+        if v > int64(2147483647):
+            return int32(2147483647)
+        i = i + 1
+    return int32(v)
 
 fn driverUirOptLevel(): int32 =
-    return int32(parseInt(os.getEnvDefault("BACKEND_OPT_LEVEL", "0")))
+    return driverUirParseNonNegativeInt(driverUirEnv("BACKEND_OPT_LEVEL"), 0)
 
 fn driverUirOwnedCString(raw: cstring): str =
     if raw == nil:
@@ -31,29 +62,25 @@ fn driverUirOwnedCString(raw: cstring): str =
     let n: int32 = c_strlen(raw)
     if n <= 0:
         return ""
-    return driver_c_new_string_copy_n(rawmemAsVoid(raw), n)
+    let outRaw: cstring = driver_c_new_string_copy_n(ptr(raw), n)
+    if outRaw == nil:
+        return ""
+    return driverUirStrViewUnsafe(ptr(outRaw), n)
 
 fn driverUirBuildModuleStage1TargetRetained(path_raw: cstring, target_raw: cstring): ptr =
     if path_raw == nil:
-        driverUirDebugBoot("build.nil_path_raw")
         return nil
     let path: str = driverUirOwnedCString(path_raw)
     if len(path) == 0:
-        driverUirDebugBoot("build.empty_path")
         return nil
     let target: str = driverUirOwnedCString(target_raw)
-    driverUirDebugBoot("build.enter path_len=" + intToStr(len(path)) +
-                       " target_len=" + intToStr(len(target)))
     let module: UirCoreModule = uirCoreBuildModuleFromFileStage1OrPanic(path, target)
     if module == nil:
-        driverUirDebugBoot("build.builder_nil")
         return nil
     let modulePtr: ptr = ptr(module)
     if modulePtr == nil:
-        driverUirDebugBoot("build.module_ptr_nil")
         return nil
-    memRetain(modulePtr)
-    driverUirDebugBoot("build.ok")
+    driver_memRetain(modulePtr)
     return modulePtr
 
 fn driverUirBuildModuleStage1Retained(path_raw: cstring): ptr =
@@ -82,7 +109,7 @@ fn driverUirEmitObjFromRetainedModule(module_raw: ptr, target_raw: cstring, out_
             rc = -14
         else:
             rc = driver_c_write_exact_file(out_raw, obj.buffer, obj.len)
-    memRelease(module_raw)
+    driver_memRelease(module_raw)
     return rc
 
 fn driverUirEmitObjBytesFromRetainedModule(module_raw: ptr, optLevel: int32,

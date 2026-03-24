@@ -1111,7 +1111,7 @@ fn semShouldEnforceStdNoPointer(): bool =
         return true
     if semStrEq(stdNoPtrEnv, "0"):
         return false
-    return semStrEq(getEnv "ABI", "v2_noptr")
+    return true
 
 fn semShouldEnforceNonCAbiNoPointer(): bool =
     # Legacy env name kept for compatibility; the gate now covers all
@@ -1121,7 +1121,7 @@ fn semShouldEnforceNonCAbiNoPointer(): bool =
         return true
     if semStrEq(nonCAbiEnv, "0"):
         return false
-    return semStrEq(getEnv "ABI", "v2_noptr")
+    return true
 
 fn semShouldEnforceNonCAbiNoPointerInternal(): bool =
     let internalEnv: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL"
@@ -1264,6 +1264,10 @@ fn semIsCAbiBridgeModulePath(path: str): bool =
     if strContains(path, "src/std/async_rt_legacy.cheng"):
         return true
     if strContains(path, "src\\std\\async_rt_legacy.cheng"):
+        return true
+    if strContains(path, "src/backend/tooling/backend_driver_uir_sidecar_wrapper.cheng"):
+        return true
+    if strContains(path, "src\\backend\\tooling\\backend_driver_uir_sidecar_wrapper.cheng"):
         return true
     if strContains(path, "src/std/net/transports/udp_syscall.cheng"):
         return true
@@ -4027,7 +4031,8 @@ fn semFnSigAddNormalizedWithTextId(ctx: var SemCtx, nm: str, textId: int32, para
     let ptrKey: int64 = semStrPtrKey(nameNorm)
     if ptrKey != 0:
         hashmaps.hashMapPtrIntPut(ctx.fnSigPtrIndex, ptrKey, sigIdx + 1)
-    hashmaps.hashMapStrIntPut(ctx.fnSigIndex, nameNorm, sigIdx + 1)
+    if !semGlobalCollectMode || nameTextId <= 0:
+        hashmaps.hashMapStrIntPut(ctx.fnSigIndex, nameNorm, sigIdx + 1)
     semFnSigTextPut(nameTextId, sigIdx)
     semFnSigEpochBump()
 
@@ -6008,6 +6013,28 @@ fn defineSemNameNormalizedWithTextId(ctx: var SemCtx, nm: str, textId: int32) =
     let nameTextId: int32 = semCanonicalTextId(nameNorm, textId)
     let depth: int32 = semScopeDepth(ctx)
     let ptrKey: int64 = semStrPtrKey(nameNorm)
+    if semGlobalCollectMode && depth == 0 && nameTextId > 0:
+        semAddStr(ctx.names, nameNorm)
+        semAddInt32(ctx.nameTextIds, nameTextId)
+        semAddInt64(ctx.namePtrKeys, ptrKey)
+        semAddInt32(ctx.namePrevDepthPlus1, int32(0))
+        if ptrKey != 0:
+            semNameDepthPtrPutCachedKey(ptrKey, 1)
+        semNameDepthTextPut(nameTextId, 1)
+        if textId > 0 && textId != nameTextId:
+            semNameDepthTextPut(textId, 1)
+        semNameDepthRecentEpoch = semScopeEpoch
+        semNameDepthRecentPtrKey = ptrKey
+        semNameDepthRecentTextId = nameTextId
+        semNameDepthRecentDepthPlus1 = 1
+        semNameDepthRecentValid = true
+        semNameDepthFindRecentEpoch = semScopeEpoch
+        semNameDepthFindRecentPtrKey = ptrKey
+        semNameDepthFindRecentTextId = nameTextId
+        semNameDepthFindRecentName = nameNorm
+        semNameDepthFindRecentResult = 1
+        semNameDepthFindRecentValid = true
+        return
     if semGlobalCollectMode && depth == 0:
         semNameDepthPutCachedResolved(ctx, nameNorm, nameTextId, ptrKey, 1)
         return
@@ -6274,11 +6301,55 @@ fn semStripChengExt(name: str): str =
 fn semImportModuleName(path: str): str =
     return semStripChengExt(semLastPathSegment(path))
 
+fn semLastPathSegmentTextId(pathId: int32): int32 =
+    if pathId <= 0:
+        return 0
+    let n: int32 = tokenTextLen(pathId)
+    if n <= 0:
+        return 0
+    var start: int32 = 0
+    let __for_start_i = n - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        let c: char = tokenTextByteAtId(pathId, i)
+        if c == '/' || c == '\\':
+            start = i + 1
+            break
+    let kept: int32 = n - start
+    if kept <= 0:
+        return 0
+    return tokenInternTextRangeById(pathId, start, kept)
+
+fn semStripChengExtTextId(nameId: int32): int32 =
+    if nameId <= 0:
+        return 0
+    let n: int32 = tokenTextLen(nameId)
+    if n > 6 &&
+       tokenTextByteAtId(nameId, n - 6) == '.' &&
+       tokenTextByteAtId(nameId, n - 5) == 'c' &&
+       tokenTextByteAtId(nameId, n - 4) == 'h' &&
+       tokenTextByteAtId(nameId, n - 3) == 'e' &&
+       tokenTextByteAtId(nameId, n - 2) == 'n' &&
+       tokenTextByteAtId(nameId, n - 1) == 'g':
+        return tokenInternTextRangeById(nameId, 0, n - 6)
+    return nameId
+
+fn semImportModuleNameTextId(pathId: int32): int32 =
+    return semStripChengExtTextId(semLastPathSegmentTextId(pathId))
+
 fn semDefineImportedModuleName(ctx: var SemCtx, rawName: str) =
     let nm: str = semImportModuleName(rawName)
     if nm == "":
         return
     let textId: int32 = tokenInternText(nm)
+    let norm: str = semNormalizedTextIdOrName(textId, nm)
+    defineSemNameNormalizedWithTextId(ctx, norm, textId)
+
+fn semDefineImportedModuleNameId(ctx: var SemCtx, rawNameId: int32) =
+    let textId: int32 = semImportModuleNameTextId(rawNameId)
+    if textId <= 0:
+        return
+    let nm: str = tokenTextById(textId)
     let norm: str = semNormalizedTextIdOrName(textId, nm)
     defineSemNameNormalizedWithTextId(ctx, norm, textId)
 
@@ -6291,17 +6362,17 @@ fn semDefineImportItem(ctx: var SemCtx, item: Node) =
             let aliasNode: Node = kid(item, 1)
             defineSemNameNormalizedWithTextId(ctx, semNodeNameNormalized(aliasNode), nodeIdentId(aliasNode))
         elif kidCount item > 0:
-            semDefineImportedModuleName(ctx, plainName(kid(item, 0)))
+            semDefineImportedModuleNameId(ctx, plainNameId(kid(item, 0)))
     of nkImportGroup:
         if kidCount item > 0:
             for j in 1..<kidCount item:
                 semDefineImportItem(ctx, kid(item, j))
             if kidCount item == 1:
-                semDefineImportedModuleName(ctx, plainName(kid(item, 0)))
+                semDefineImportedModuleNameId(ctx, plainNameId(kid(item, 0)))
     of nkIdent, nkSymbol:
-        semDefineImportedModuleName(ctx, nodeIdent(item))
+        semDefineImportedModuleNameId(ctx, nodeIdentId(item))
     of nkStrLit:
-        semDefineImportedModuleName(ctx, nodeStrVal(item))
+        semDefineImportedModuleNameId(ctx, nodeStrValId(item))
     else:
         return
 fn semBindImports(ctx: var SemCtx, root: Node) =

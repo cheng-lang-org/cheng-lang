@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -18,8 +18,16 @@ if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" 
 fi
 
 driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
-target="${BACKEND_TARGET:-arm64-apple-darwin}"
-link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:system)"
+
+resolve_target() {
+  if [ "${BACKEND_TARGET:-}" != "" ] && [ "${BACKEND_TARGET:-}" != "auto" ]; then
+    printf '%s\n' "${BACKEND_TARGET}"
+    return
+  fi
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || printf '%s\n' arm64-apple-darwin
+}
+
+target="$(resolve_target)"
 
 host_os="$(uname -s 2>/dev/null || echo unknown)"
 case "$host_os" in
@@ -55,16 +63,17 @@ fi
 fixture="tests/cheng/backend/fixtures/return_add.cheng"
 exe_path="$out_dir/return_add_asan"
 
-env $link_env \
-  BACKEND_EMIT=exe \
-  BACKEND_MULTI=0 \
-  BACKEND_MULTI_FORCE=0 \
-  BACKEND_TARGET="$target" \
+env \
   BACKEND_CFLAGS="-O1 -g -fno-omit-frame-pointer -fsanitize=address" \
   BACKEND_LDFLAGS="-fsanitize=address" \
-  BACKEND_INPUT="$fixture" \
-  BACKEND_OUTPUT="$exe_path" \
-  "$driver"
+  "$driver" "$fixture" \
+    --frontend:stage1 \
+    --emit:exe \
+    --target:"$target" \
+    --linker:system \
+    --no-multi \
+    --no-multi-force \
+    --output:"$exe_path"
 
 ASAN_OPTIONS=detect_leaks=0 "$exe_path"
 

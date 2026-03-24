@@ -42,20 +42,30 @@ magic_hex() {
   od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n'
 }
 
+nm_has_symbol() {
+  file="$1"
+  pattern="$2"
+  nm "$file" | awk -v pat="$pattern" 'index($0, pat) { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+run_driver_compile() {
+  validate="$1"
+  linker="$2"
+  fixture="$3"
+  output="$4"
+  env BACKEND_VALIDATE="$validate" \
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:x86_64-unknown-linux-gnu \
+      --linker:"$linker" \
+      --output:"$output"
+}
+
 build_obj() {
   fixture="$1"
   obj_path="$2"
   rm -f "$obj_path"
-  BACKEND_VALIDATE=1 \
-  BACKEND_LINKER=self \
-  BACKEND_DIRECT_EXE=1 \
-  BACKEND_LINKERLESS_INMEM=1 \
-  BACKEND_NO_RUNTIME_C=0 \
-  BACKEND_EMIT=exe \
-  BACKEND_TARGET=x86_64-unknown-linux-gnu \
-  BACKEND_INPUT="$fixture" \
-  BACKEND_OUTPUT="$obj_path" \
-  "$driver"
+  run_driver_compile 1 self "$fixture" "$obj_path"
   if [ ! -s "$obj_path" ]; then
     echo "[Error] missing executable output: $obj_path" >&2
     exit 1
@@ -66,12 +76,7 @@ build_exe() {
   fixture="$1"
   exe_path="$2"
   rm -f "$exe_path"
-  BACKEND_VALIDATE=1 \
-  BACKEND_EMIT=exe \
-  BACKEND_TARGET=x86_64-unknown-linux-gnu \
-  BACKEND_INPUT="$fixture" \
-  BACKEND_OUTPUT="$exe_path" \
-  "$driver"
+  run_driver_compile 1 system "$fixture" "$exe_path"
   if [ ! -x "$exe_path" ]; then
     echo "[Error] missing executable output: $exe_path" >&2
     exit 1
@@ -85,8 +90,8 @@ exe_path="$out_dir/hello_importc_puts.x86_64"
 build_obj "$fixture" "$obj_path"
 [ "$(magic_hex "$obj_path")" = "7f454c46" ]
 if command -v nm >/dev/null 2>&1; then
-  nm "$obj_path" | grep -q " T main"
-  nm "$obj_path" | grep -q " U puts"
+  nm_has_symbol "$obj_path" " T main"
+  nm_has_symbol "$obj_path" " U puts"
 fi
 
 build_exe "$fixture" "$exe_path"

@@ -29,15 +29,21 @@ fn toolingPathHelpersTrimAsciiSpace(raw: str): str =
 fn toolingPathHelpersShellQuote(raw: str): str =
     if len(raw) == 0:
         return "\"\""
-    var escaped: str = strutil.replace(raw, "\\", "\\\\")
-    escaped = strutil.replace(escaped, "$", "\\$")
-    escaped = strutil.replace(escaped, "`", "\\`")
-    escaped = strutil.replace(escaped, "\"", "\\\"")
-    return "\"" + escaped + "\""
+    return "\"" + strutil.replace(
+        strutil.replace(
+            strutil.replace(
+                strutil.replace(raw, "\\", "\\\\"),
+                "$",
+                "\\$"
+            ),
+            "`",
+            "\\`"
+        ),
+        "\"",
+        "\\\""
+    ) + "\""
 
-fn toolingJoinPathSimple(baseRaw: str, relRaw: str): str =
-    let base: str = toolingPathHelpersTrimAsciiSpace(baseRaw)
-    let rel: str = toolingPathHelpersTrimAsciiSpace(relRaw)
+fn toolingJoinPathSimpleNormalized(base: str, rel: str): str =
     if !toolingPathHelpersStrNonEmpty(base):
         return rel
     if !toolingPathHelpersStrNonEmpty(rel):
@@ -51,8 +57,13 @@ fn toolingJoinPathSimple(baseRaw: str, relRaw: str): str =
             return base + rel
     return base + "/" + rel
 
-fn toolingPathAbsolute(root: str, raw: str): str =
-    let text: str = toolingPathHelpersTrimAsciiSpace(raw)
+fn toolingJoinPathSimple(baseRaw: str, relRaw: str): str =
+    return toolingJoinPathSimpleNormalized(
+        toolingPathHelpersTrimAsciiSpace(baseRaw),
+        toolingPathHelpersTrimAsciiSpace(relRaw)
+    )
+
+fn toolingPathAbsoluteFromText(root: str, text: str): str =
     if !toolingPathHelpersStrNonEmpty(text):
         return ""
     if os.isAbsolute(text):
@@ -60,6 +71,9 @@ fn toolingPathAbsolute(root: str, raw: str): str =
     if strutil.startsWith(text, "./") || strutil.startsWith(text, "../"):
         return os.absolutePath(text)
     return toolingJoinPathSimple(root, text)
+
+fn toolingPathAbsolute(root: str, raw: str): str =
+    return toolingPathAbsoluteFromText(root, toolingPathHelpersTrimAsciiSpace(raw))
 
 fn toolingPathExists(path: str): bool =
     if !toolingPathHelpersStrNonEmpty(path):
@@ -71,31 +85,40 @@ fn toolingPathExists(path: str): bool =
     return false
 
 fn toolingFileExistsNonEmpty(pathRaw: str): bool =
-    let path: str = toolingPathHelpersTrimAsciiSpace(pathRaw)
-    if !toolingPathHelpersStrNonEmpty(path) || !os.fileExists(path):
+    if !toolingPathHelpersStrNonEmpty(toolingPathHelpersTrimAsciiSpace(pathRaw)) ||
+       !os.fileExists(toolingPathHelpersTrimAsciiSpace(pathRaw)):
         return false
-    return os.fileSize(path) > int64(0)
+    return os.fileSize(toolingPathHelpersTrimAsciiSpace(pathRaw)) > int64(0)
 
-fn toolingFileIsNewer(root: str, lhsRaw: str, rhsRaw: str): bool =
-    let lhs: str = toolingPathAbsolute(root, lhsRaw)
-    let rhs: str = toolingPathAbsolute(root, rhsRaw)
+fn toolingFileIsNewerAbs(root: str, lhs: str, rhs: str): bool =
     if !toolingPathHelpersStrNonEmpty(lhs) || !toolingPathHelpersStrNonEmpty(rhs):
         return false
     if !os.fileExists(lhs) || !os.fileExists(rhs):
         return false
-    let cmd: str = "[ " + toolingPathHelpersShellQuote(lhs) + " -nt " + toolingPathHelpersShellQuote(rhs) + " ]"
     let opts: uint64 = uint64(7)
-    let res: os.ExecCmdResult = os.execCmdEx(cmd, opts, root)
+    let res: os.ExecCmdResult =
+        os.execCmdEx("[ " + toolingPathHelpersShellQuote(lhs) + " -nt " + toolingPathHelpersShellQuote(rhs) + " ]", opts, root)
     return os.execCmdResultExitCode(res) == 0
 
-fn toolingScriptShell(root: str, scriptPath: str): str =
-    let path: str = toolingPathAbsolute(root, scriptPath)
+fn toolingFileIsNewer(root: str, lhsRaw: str, rhsRaw: str): bool =
+    return toolingFileIsNewerAbs(
+        root,
+        toolingPathAbsolute(root, lhsRaw),
+        toolingPathAbsolute(root, rhsRaw)
+    )
+
+fn toolingScriptShellFromLowerProbe(lower: str): str =
+    if strutil.startsWith(lower, "#!/usr/bin/env bash") || strutil.startsWith(lower, "#!/bin/bash"):
+        return "bash"
+    return "sh"
+
+fn toolingScriptShellForPath(path: str): str =
     if !toolingPathHelpersStrNonEmpty(path) || !os.fileExists(path):
         return "sh"
-    let text: str = os.readFile(path)
-    if !toolingPathHelpersStrNonEmpty(text):
-        return "sh"
-    return toolingScriptShellFromText(text)
+    return toolingScriptShellFromText(os.readFile(path))
+
+fn toolingScriptShell(root: str, scriptPath: str): str =
+    return toolingScriptShellForPath(toolingPathAbsolute(root, scriptPath))
 
 fn toolingScriptShellFromText(scriptText: str): str =
     if !toolingPathHelpersStrNonEmpty(scriptText):
@@ -103,14 +126,11 @@ fn toolingScriptShellFromText(scriptText: str): str =
     var probeLen: int32 = len(scriptText)
     if probeLen > 160:
         probeLen = 160
-    let probe: str = strings.sliceBytes(scriptText, 0, probeLen)
-    let lower: str = strutil.toLowerAscii(strutil.strip(probe))
-    if strutil.startsWith(lower, "#!/usr/bin/env bash") || strutil.startsWith(lower, "#!/bin/bash"):
-        return "bash"
-    return "sh"
+    return toolingScriptShellFromLowerProbe(
+        strutil.toLowerAscii(strutil.strip(strings.sliceBytes(scriptText, 0, probeLen)))
+    )
 
-fn toolingProgramBaseName(raw0: str): str =
-    let raw: str = toolingPathHelpersTrimAsciiSpace(raw0)
+fn toolingProgramBaseNameTrimmed(raw: str): str =
     if !toolingPathHelpersStrNonEmpty(raw):
         return "cheng_tooling"
     let parts: os.SplitFileResult = os.splitFile(raw)
@@ -118,11 +138,16 @@ fn toolingProgramBaseName(raw0: str): str =
         return parts.name
     return raw
 
-fn toolingFileName(pathRaw: str): str =
-    let path: str = toolingPathHelpersTrimAsciiSpace(pathRaw)
+fn toolingProgramBaseName(raw0: str): str =
+    return toolingProgramBaseNameTrimmed(toolingPathHelpersTrimAsciiSpace(raw0))
+
+fn toolingFileNameTrimmed(path: str): str =
     if !toolingPathHelpersStrNonEmpty(path):
         return ""
     let parts: os.SplitFileResult = os.splitFile(path)
     if toolingPathHelpersStrNonEmpty(parts.name):
         return parts.name + parts.ext
     return path
+
+fn toolingFileName(pathRaw: str): str =
+    return toolingFileNameTrimmed(toolingPathHelpersTrimAsciiSpace(pathRaw))

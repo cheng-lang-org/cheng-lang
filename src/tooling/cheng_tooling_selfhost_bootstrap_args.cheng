@@ -63,30 +63,40 @@ fn toolingSelfhostArgsStrEq(a: str, b: str): bool =
         return false
     return strings.streq(a, b)
 
-fn toolingSelfhostArgsIsTrue(raw: str): bool =
-    let text: str = strutil.strip(raw)
-    if !toolingSelfhostArgsStrNonEmpty(text):
+fn toolingSelfhostArgsIsTrueLower(lower: str): bool =
+    if !toolingSelfhostArgsStrNonEmpty(lower):
         return false
-    let lower: str = strutil.toLowerAscii(text)
     return toolingSelfhostArgsStrEq(lower, "1") ||
            toolingSelfhostArgsStrEq(lower, "true") ||
            toolingSelfhostArgsStrEq(lower, "yes") ||
            toolingSelfhostArgsStrEq(lower, "on")
 
-fn toolingSelfhostModeNormalized(raw: str): str =
-    let mode: str = strutil.toLowerAscii(strutil.strip(raw))
+fn toolingSelfhostArgsIsTrue(raw: str): bool =
+    return toolingSelfhostArgsIsTrueLower(strutil.toLowerAscii(strutil.strip(raw)))
+
+fn toolingSelfhostModeNormalizedText(mode: str): str =
     if toolingSelfhostArgsStrEq(mode, "fast") || toolingSelfhostArgsStrEq(mode, "strict"):
         return mode
     return ""
 
-fn toolingSelfhostModeFromEnv(defaultModeRaw: str): str =
-    var fallback: str = toolingSelfhostModeNormalized(defaultModeRaw)
-    if !toolingSelfhostArgsStrNonEmpty(fallback):
-        fallback = "fast"
-    let envMode: str = toolingSelfhostModeNormalized(os.getEnvDefault("SELF_OBJ_BOOTSTRAP_MODE", fallback))
-    if toolingSelfhostArgsStrNonEmpty(envMode):
-        return envMode
+fn toolingSelfhostModeNormalized(raw: str): str =
+    return toolingSelfhostModeNormalizedText(strutil.toLowerAscii(strutil.strip(raw)))
+
+fn toolingSelfhostModeFallback(defaultModeRaw: str): str =
+    if toolingSelfhostArgsStrNonEmpty(toolingSelfhostModeNormalized(defaultModeRaw)):
+        return toolingSelfhostModeNormalized(defaultModeRaw)
+    return "fast"
+
+fn toolingSelfhostModeNormalizedOr(raw: str, fallback: str): str =
+    if toolingSelfhostArgsStrNonEmpty(toolingSelfhostModeNormalized(raw)):
+        return toolingSelfhostModeNormalized(raw)
     return fallback
+
+fn toolingSelfhostModeFromEnv(defaultModeRaw: str): str =
+    return toolingSelfhostModeNormalizedOr(
+        os.getEnvDefault("SELF_OBJ_BOOTSTRAP_MODE", toolingSelfhostModeFallback(defaultModeRaw)),
+        toolingSelfhostModeFallback(defaultModeRaw)
+    )
 
 fn toolingBootstrapPureUsageLines(): str[] =
     var out: str[] = []
@@ -216,138 +226,133 @@ fn toolingSelfhostBootstrapVerifyArgsDefault(): ToolingSelfhostBootstrapVerifyAr
 fn toolingBootstrapPureParseArgs(args: str[]): ToolingBootstrapPureArgs =
     var out: ToolingBootstrapPureArgs = toolingBootstrapPureArgsDefault()
     for i in 0..<args.len:
-        let arg: str = args[i]
-        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+        if toolingSelfhostArgsStrEq(args[i], "--help") || toolingSelfhostArgsStrEq(args[i], "-h"):
             out.helpRequested = true
             return out
-        if toolingSelfhostArgsStrEq(arg, "--compile-stage1"):
+        if toolingSelfhostArgsStrEq(args[i], "--compile-stage1"):
             out.compileStage1 = true
             continue
-        if toolingSelfhostArgsStrEq(arg, "--no-compile-stage1"):
+        if toolingSelfhostArgsStrEq(args[i], "--no-compile-stage1"):
             out.compileStage1 = false
             continue
-        if toolingSelfhostArgsStrEq(arg, "--fullspec"):
+        if toolingSelfhostArgsStrEq(args[i], "--fullspec"):
             out.fullspec = true
             continue
-        if strutil.startsWith(arg, "--mode:"):
-            let parsedMode: str = toolingSelfhostModeNormalized(strings.dropPrefix(arg, "--mode:"))
-            if !toolingSelfhostArgsStrNonEmpty(parsedMode):
+        if strutil.startsWith(args[i], "--mode:"):
+            if !toolingSelfhostArgsStrNonEmpty(toolingSelfhostModeNormalized(strings.dropPrefix(args[i], "--mode:"))):
                 out.ok = false
                 out.exitCode = 1
-                out.error = "cheng_tooling: invalid bootstrap-pure mode (expected fast|strict): " + arg
+                out.error = "cheng_tooling: invalid bootstrap-pure mode (expected fast|strict): " + args[i]
                 return out
-            out.mode = parsedMode
+            out.mode = toolingSelfhostModeNormalized(strings.dropPrefix(args[i], "--mode:"))
             continue
-        if strutil.startsWith(arg, "--seed:") || strutil.startsWith(arg, "--stage0:"):
+        if strutil.startsWith(args[i], "--seed:") || strutil.startsWith(args[i], "--stage0:"):
             out.ok = false
             out.exitCode = 2
             out.error = "cheng_tooling: bootstrap-pure no longer accepts stage0 overrides; canonical driver is mandatory"
             return out
-        if strutil.startsWith(arg, "--out-dir:"):
-            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+        if strutil.startsWith(args[i], "--out-dir:"):
+            out.outDir = strings.dropPrefix(args[i], "--out-dir:")
             continue
-        if strutil.startsWith(arg, "--timing-out:"):
-            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+        if strutil.startsWith(args[i], "--timing-out:"):
+            out.timingOut = strings.dropPrefix(args[i], "--timing-out:")
             continue
         out.ok = false
         out.exitCode = 1
-        out.error = "cheng_tooling: unknown bootstrap-pure arg: " + arg
+        out.error = "cheng_tooling: unknown bootstrap-pure arg: " + args[i]
         return out
     return out
 
 fn toolingSelfhostBootstrapFastHostParseArgs(args: str[]): ToolingSelfhostBootstrapFastHostArgs =
     var out: ToolingSelfhostBootstrapFastHostArgs = toolingSelfhostBootstrapFastHostArgsDefault()
     for i in 0..<args.len:
-        let arg: str = args[i]
-        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+        if toolingSelfhostArgsStrEq(args[i], "--help") || toolingSelfhostArgsStrEq(args[i], "-h"):
             out.helpRequested = true
             return out
-        if toolingSelfhostArgsStrEq(arg, "--compile-stage1"):
+        if toolingSelfhostArgsStrEq(args[i], "--compile-stage1"):
             out.compileStage1 = true
             continue
-        if toolingSelfhostArgsStrEq(arg, "--no-compile-stage1"):
+        if toolingSelfhostArgsStrEq(args[i], "--no-compile-stage1"):
             out.compileStage1 = false
             continue
-        if strutil.startsWith(arg, "--out-dir:"):
-            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+        if strutil.startsWith(args[i], "--out-dir:"):
+            out.outDir = strings.dropPrefix(args[i], "--out-dir:")
             continue
-        if strutil.startsWith(arg, "--timing-out:"):
-            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+        if strutil.startsWith(args[i], "--timing-out:"):
+            out.timingOut = strings.dropPrefix(args[i], "--timing-out:")
             continue
-        if strutil.startsWith(arg, "--stage0:"):
+        if strutil.startsWith(args[i], "--stage0:"):
             out.ok = false
             out.exitCode = 2
             out.error = "cheng_tooling: selfhost-bootstrap-fast-host no longer accepts --stage0; canonical driver is mandatory"
             return out
         out.ok = false
         out.exitCode = 1
-        out.error = "cheng_tooling: unknown selfhost-bootstrap-fast-host arg: " + arg
+        out.error = "cheng_tooling: unknown selfhost-bootstrap-fast-host arg: " + args[i]
         return out
     return out
 
 fn toolingSelfhostStrictInmemWitnessParseArgs(args: str[]): ToolingSelfhostStrictInmemWitnessArgs =
     var out: ToolingSelfhostStrictInmemWitnessArgs = toolingSelfhostStrictInmemWitnessArgsDefault()
     for i in 0..<args.len:
-        let arg: str = args[i]
-        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+        if toolingSelfhostArgsStrEq(args[i], "--help") || toolingSelfhostArgsStrEq(args[i], "-h"):
             out.helpRequested = true
             return out
-        if strutil.startsWith(arg, "--out-dir:"):
-            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+        if strutil.startsWith(args[i], "--out-dir:"):
+            out.outDir = strings.dropPrefix(args[i], "--out-dir:")
             continue
-        if strutil.startsWith(arg, "--timing-out:"):
-            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+        if strutil.startsWith(args[i], "--timing-out:"):
+            out.timingOut = strings.dropPrefix(args[i], "--timing-out:")
             continue
-        if strutil.startsWith(arg, "--stage0:"):
+        if strutil.startsWith(args[i], "--stage0:"):
             out.ok = false
             out.exitCode = 2
             out.error = "cheng_tooling: verify_backend_selfhost_bootstrap_inmem_witness no longer accepts --stage0; canonical driver is mandatory"
             return out
         out.ok = false
         out.exitCode = 1
-        out.error = "cheng_tooling: unknown verify_backend_selfhost_bootstrap_inmem_witness arg: " + arg
+        out.error = "cheng_tooling: unknown verify_backend_selfhost_bootstrap_inmem_witness arg: " + args[i]
         return out
     return out
 
 fn toolingSelfhostInnerLoopParseArgs(args: str[]): ToolingSelfhostInnerLoopArgs =
     var out: ToolingSelfhostInnerLoopArgs = toolingSelfhostInnerLoopArgsDefault()
     for i in 0..<args.len:
-        let arg: str = args[i]
-        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+        if toolingSelfhostArgsStrEq(args[i], "--help") || toolingSelfhostArgsStrEq(args[i], "-h"):
             out.helpRequested = true
             return out
-        if strutil.startsWith(arg, "--out-dir:"):
-            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+        if strutil.startsWith(args[i], "--out-dir:"):
+            out.outDir = strings.dropPrefix(args[i], "--out-dir:")
             continue
-        if strutil.startsWith(arg, "--timing-out:"):
-            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+        if strutil.startsWith(args[i], "--timing-out:"):
+            out.timingOut = strings.dropPrefix(args[i], "--timing-out:")
             continue
-        if toolingSelfhostArgsStrEq(arg, "--inmem-witness"):
+        if toolingSelfhostArgsStrEq(args[i], "--inmem-witness"):
             out.runInmemWitness = true
             continue
-        if toolingSelfhostArgsStrEq(arg, "--no-inmem-witness"):
+        if toolingSelfhostArgsStrEq(args[i], "--no-inmem-witness"):
             out.runInmemWitness = false
             continue
-        if toolingSelfhostArgsStrEq(arg, "--strict"):
+        if toolingSelfhostArgsStrEq(args[i], "--strict"):
             out.runStrict = true
             continue
-        if toolingSelfhostArgsStrEq(arg, "--no-strict"):
+        if toolingSelfhostArgsStrEq(args[i], "--no-strict"):
             out.runStrict = false
             continue
-        if toolingSelfhostArgsStrEq(arg, "--closure"):
+        if toolingSelfhostArgsStrEq(args[i], "--closure"):
             out.runClosure = true
             continue
-        if toolingSelfhostArgsStrEq(arg, "--no-closure"):
+        if toolingSelfhostArgsStrEq(args[i], "--no-closure"):
             out.runClosure = false
             continue
-        if strutil.startsWith(arg, "--stage0:"):
+        if strutil.startsWith(args[i], "--stage0:"):
             out.ok = false
             out.exitCode = 2
             out.error = "cheng_tooling: verify_backend_selfhost_inner_loop no longer accepts --stage0; canonical driver is mandatory"
             return out
         out.ok = false
         out.exitCode = 1
-        out.error = "cheng_tooling: unknown verify_backend_selfhost_inner_loop arg: " + arg
+        out.error = "cheng_tooling: unknown verify_backend_selfhost_inner_loop arg: " + args[i]
         return out
     if out.runClosure && !out.runStrict:
         out.ok = false
@@ -359,41 +364,39 @@ fn toolingSelfhostInnerLoopParseArgs(args: str[]): ToolingSelfhostInnerLoopArgs 
 fn toolingSelfhostBootstrapVerifyParseArgs(args: str[]): ToolingSelfhostBootstrapVerifyArgs =
     var out: ToolingSelfhostBootstrapVerifyArgs = toolingSelfhostBootstrapVerifyArgsDefault()
     for i in 0..<args.len:
-        let arg: str = args[i]
-        if toolingSelfhostArgsStrEq(arg, "--help") || toolingSelfhostArgsStrEq(arg, "-h"):
+        if toolingSelfhostArgsStrEq(args[i], "--help") || toolingSelfhostArgsStrEq(args[i], "-h"):
             out.helpRequested = true
             return out
-        if strutil.startsWith(arg, "--mode:"):
-            let parsedMode: str = toolingSelfhostModeNormalized(strings.dropPrefix(arg, "--mode:"))
-            if !toolingSelfhostArgsStrNonEmpty(parsedMode):
+        if strutil.startsWith(args[i], "--mode:"):
+            if !toolingSelfhostArgsStrNonEmpty(toolingSelfhostModeNormalized(strings.dropPrefix(args[i], "--mode:"))):
                 out.ok = false
                 out.exitCode = 1
-                out.error = "cheng_tooling: invalid verify_backend_selfhost_bootstrap_self_obj mode: " + arg
+                out.error = "cheng_tooling: invalid verify_backend_selfhost_bootstrap_self_obj mode: " + args[i]
                 return out
-            out.mode = parsedMode
+            out.mode = toolingSelfhostModeNormalized(strings.dropPrefix(args[i], "--mode:"))
             continue
-        if toolingSelfhostArgsStrEq(arg, "--compile-stage1"):
+        if toolingSelfhostArgsStrEq(args[i], "--compile-stage1"):
             out.compileStage1 = true
             continue
-        if toolingSelfhostArgsStrEq(arg, "--no-compile-stage1"):
+        if toolingSelfhostArgsStrEq(args[i], "--no-compile-stage1"):
             out.compileStage1 = false
             continue
-        if toolingSelfhostArgsStrEq(arg, "--strict-inmem-witness"):
+        if toolingSelfhostArgsStrEq(args[i], "--strict-inmem-witness"):
             out.strictInmemWitness = true
             continue
-        if strutil.startsWith(arg, "--out-dir:"):
-            out.outDir = strings.dropPrefix(arg, "--out-dir:")
+        if strutil.startsWith(args[i], "--out-dir:"):
+            out.outDir = strings.dropPrefix(args[i], "--out-dir:")
             continue
-        if strutil.startsWith(arg, "--timing-out:"):
-            out.timingOut = strings.dropPrefix(arg, "--timing-out:")
+        if strutil.startsWith(args[i], "--timing-out:"):
+            out.timingOut = strings.dropPrefix(args[i], "--timing-out:")
             continue
-        if strutil.startsWith(arg, "--stage0:"):
+        if strutil.startsWith(args[i], "--stage0:"):
             out.ok = false
             out.exitCode = 2
             out.error = "cheng_tooling: verify_backend_selfhost_bootstrap_self_obj no longer accepts --stage0; canonical driver is mandatory"
             return out
         out.ok = false
         out.exitCode = 1
-        out.error = "cheng_tooling: unknown verify_backend_selfhost_bootstrap_self_obj arg: " + arg
+        out.error = "cheng_tooling: unknown verify_backend_selfhost_bootstrap_self_obj arg: " + args[i]
         return out
     return out

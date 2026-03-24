@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -41,7 +41,6 @@ case "$host_os" in
     ;;
 esac
 
-
 fixture="tests/cheng/backend/fixtures/hello_importc_puts.cheng"
 out_dir="artifacts/backend_obj_determinism_strict"
 mkdir -p "$out_dir"
@@ -54,17 +53,15 @@ obj_c="$out_dir/c.o"
 run_obj() {
   out="$1"
   shift || true
-  BACKEND_EMIT=obj \
-  BACKEND_TARGET=arm64-apple-darwin \
-  BACKEND_INPUT="$fixture" \
-  BACKEND_OUTPUT="$out" \
-  "$@" \
-  "$driver"
+  env "$@" "$driver" "$fixture" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --output:"$out"
 }
 
-run_obj "$obj_a" env LANG=C LC_ALL=C TZ=UTC TMPDIR="$out_dir/tmp_a"
-run_obj "$obj_b" env LANG=C LC_ALL=C TZ=Asia/Shanghai TMPDIR="$out_dir/tmp_b"
-run_obj "$obj_c" env LANG=C LC_ALL=C TZ=UTC TMPDIR="$out_dir/tmp_c" BACKEND_JOBS=1
+run_obj "$obj_a" LANG=C LC_ALL=C TZ=UTC TMPDIR="$out_dir/tmp_a"
+run_obj "$obj_b" LANG=C LC_ALL=C TZ=Asia/Shanghai TMPDIR="$out_dir/tmp_b"
+run_obj "$obj_c" LANG=C LC_ALL=C TZ=UTC TMPDIR="$out_dir/tmp_c" BACKEND_JOBS=1
 
 sha_a="$(sha256_file "$obj_a")"
 sha_b="$(sha256_file "$obj_b")"
@@ -74,7 +71,7 @@ if [ "$sha_a" = "" ] || [ "$sha_b" = "" ] || [ "$sha_c" = "" ]; then
   exit 2
 fi
 if [ "$sha_a" != "$sha_b" ] || [ "$sha_b" != "$sha_c" ]; then
-  echo "[verify_backend_obj_determinism_strict] mismatch: $sha_a vs $sha_b vs $sha_c" 1>&2
+  echo "[verify_backend_obj_determinism_strict] mismatch: $sha_a vs $sha_b vs $sha_c" >&2
   exit 1
 fi
 

@@ -21,6 +21,47 @@ fn uir_core_builder_reachability_scan_add(dst: var str[], val: str) =
 fn uir_core_builder_reachability_scan_add(dst: var int32[], val: int32) =
     seqs.add(dst, val)
 
+fn uirCoreReachDeclIndexAdd(headMap: var hashmaps.HashMapStrInt,
+                            tailMap: var hashmaps.HashMapStrInt,
+                            entryDeclIdxs: var int32[],
+                            entryNexts: var int32[],
+                            name: str, declIdx: int32) =
+    if len(name) == 0 || declIdx < 0:
+        return
+    let entryRaw: int32 = entryDeclIdxs.len + 1
+    uir_core_builder_reachability_scan_add(entryDeclIdxs, declIdx)
+    uir_core_builder_reachability_scan_add(entryNexts, 0)
+    var foundTail: bool = false
+    let tailRaw: int32 = hashmaps.hashMapStrIntGet(tailMap, name, foundTail)
+    if foundTail && tailRaw > 0:
+        let tailIdx: int32 = tailRaw - 1
+        if tailIdx >= 0 && tailIdx < entryNexts.len:
+            entryNexts[tailIdx] = entryRaw
+            hashmaps.hashMapStrIntPut(tailMap, name, entryRaw)
+            return
+    hashmaps.hashMapStrIntPut(headMap, name, entryRaw)
+    hashmaps.hashMapStrIntPut(tailMap, name, entryRaw)
+
+fn uirCoreReachDeclIndexGet(headMap: hashmaps.HashMapStrInt,
+                            entryDeclIdxs: int32[],
+                            entryNexts: int32[],
+                            name: str, foundOut: var bool): int32[] =
+    var found: bool = false
+    let headRaw: int32 = hashmaps.hashMapStrIntGet(headMap, name, found)
+    if !found || headRaw <= 0:
+        foundOut = false
+        return []
+    var out: int32[]
+    var entryRaw: int32 = headRaw
+    while entryRaw > 0:
+        let entryIdx: int32 = entryRaw - 1
+        if entryIdx < 0 || entryIdx >= entryDeclIdxs.len || entryIdx >= entryNexts.len:
+            break
+        uir_core_builder_reachability_scan_add(out, entryDeclIdxs[entryIdx])
+        entryRaw = entryNexts[entryIdx]
+    foundOut = out.len > 0
+    return out
+
 fn uirCoreReachFuncSigMarker(): str =
     return "__cheng_sig_"
 
@@ -129,7 +170,12 @@ fn uirCoreCollectCallsDeepId(module: UirCoreModule, nId: AstNodeId, out: str[]*)
     for i in 0..<astKidCount(nId):
         uirCoreCollectCallsDeepId(module, astKidAt(nId, i), out)
 
-fn uirCoreIndexFnDeclsId(rootId: AstNodeId, outMap: var hashmaps.HashMapStrSeqInt, outNodes: var AstNodeId[]) =
+fn uirCoreIndexFnDeclsId(rootId: AstNodeId,
+                         outHeadMap: var hashmaps.HashMapStrInt,
+                         outTailMap: var hashmaps.HashMapStrInt,
+                         outEntryDeclIdxs: var int32[],
+                         outEntryNexts: var int32[],
+                         outNodes: var AstNodeId[]) =
     if !astNodeIdValid(rootId):
         return
     for i in 0..<astKidCount(rootId):
@@ -140,7 +186,7 @@ fn uirCoreIndexFnDeclsId(rootId: AstNodeId, outMap: var hashmaps.HashMapStrSeqIn
         if nKind == nkEmpty:
             continue
         if nKind == nkStmtList || nKind == nkModule:
-            uirCoreIndexFnDeclsId(nId, outMap, outNodes)
+            uirCoreIndexFnDeclsId(nId, outHeadMap, outTailMap, outEntryDeclIdxs, outEntryNexts, outNodes)
             continue
         if (nKind == nkFnDecl || nKind == nkIteratorDecl) && astKidCount(nId) > 0:
             let nameNodeId: AstNodeId = astKidAt(nId, 0)
@@ -150,30 +196,35 @@ fn uirCoreIndexFnDeclsId(rootId: AstNodeId, outMap: var hashmaps.HashMapStrSeqIn
                     let nm: str = backendStripSpaces(astPlainName(nameNodeId))
                     let idx: int32 = outNodes.len
                     uir_core_builder_reachability_scan_add(outNodes, nId)
-                    hashmaps.hashMapStrSeqIntAdd(outMap, nm, idx)
+                    uirCoreReachDeclIndexAdd(outHeadMap, outTailMap, outEntryDeclIdxs, outEntryNexts, nm, idx)
                     let sigOff: int32 = uirCoreStrIndexOf(nm, uirCoreReachFuncSigMarker())
                     if sigOff > 0:
                         let base: str = uirCoreStrTake(nm, sigOff)
                         if len(base) > 0 && !(base == nm):
-                            hashmaps.hashMapStrSeqIntAdd(outMap, base, idx)
+                            uirCoreReachDeclIndexAdd(outHeadMap, outTailMap, outEntryDeclIdxs, outEntryNexts, base, idx)
                     let modOff: int32 = uirCoreStrIndexOf(nm, "__cheng_mod_")
                     if modOff > 0:
                         let base2: str = uirCoreStrTake(nm, modOff)
                         if len(base2) > 0 && !(base2 == nm):
-                            hashmaps.hashMapStrSeqIntAdd(outMap, base2, idx)
+                            uirCoreReachDeclIndexAdd(outHeadMap, outTailMap, outEntryDeclIdxs, outEntryNexts, base2, idx)
 
-fn uirCoreIndexFnDecls(root: Node, outMap: var hashmaps.HashMapStrSeqInt, outNodes: var AstNodeId[]) =
-    uirCoreIndexFnDeclsId(root, outMap, outNodes)
+fn uirCoreIndexFnDecls(root: Node,
+                       outHeadMap: var hashmaps.HashMapStrInt,
+                       outTailMap: var hashmaps.HashMapStrInt,
+                       outEntryDeclIdxs: var int32[],
+                       outEntryNexts: var int32[],
+                       outNodes: var AstNodeId[]) =
+    uirCoreIndexFnDeclsId(root, outHeadMap, outTailMap, outEntryDeclIdxs, outEntryNexts, outNodes)
 
-fn uirCoreReachDeclIdxs(index: hashmaps.HashMapStrSeqInt, nodes: AstNodeId[], name: str,
+fn uirCoreReachDeclIdxs(indexHead: hashmaps.HashMapStrInt,
+                        indexEntryDeclIdxs: int32[],
+                        indexEntryNexts: int32[],
+                        nodes: AstNodeId[], name: str,
                         foundOut: var bool, allowLinearFallback: bool = false): int32[] =
-    var found: bool = false
-    let idxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, name, &found)
-    if found && idxs.len > 0:
-        foundOut = true
+    let idxs: int32[] = uirCoreReachDeclIndexGet(indexHead, indexEntryDeclIdxs, indexEntryNexts, name, foundOut)
+    if foundOut && idxs.len > 0:
         return idxs
     if !allowLinearFallback:
-        foundOut = false
         return []
     var out: int32[]
     for i in 0..<nodes.len:
@@ -196,9 +247,15 @@ fn uirCoreComputeReachableFnsId(module: UirCoreModule, rootId: AstNodeId): hashs
     let rootKids0: int32 = astKidCount(rootId)
     let rootKids: int32 = (rootKids0 > 0) ? rootKids0 : 1
     let workCap: int32 = rootKids * 2 + 256
-    var index: hashmaps.HashMapStrSeqInt = hashmaps.hashMapStrSeqIntInit(workCap)
-    var nodes: AstNodeId[workCap]
-    uirCoreIndexFnDeclsId(rootId, index, nodes)
+    var indexHead: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(workCap)
+    var indexTail: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(workCap)
+    var indexEntryDeclIdxs: int32[]
+    var indexEntryNexts: int32[]
+    indexEntryDeclIdxs.cap = workCap
+    indexEntryNexts.cap = workCap
+    var nodes: AstNodeId[]
+    nodes.cap = workCap
+    uirCoreIndexFnDeclsId(rootId, indexHead, indexTail, indexEntryDeclIdxs, indexEntryNexts, nodes)
     let dbgReach: bool = (os.getEnvDefault("BACKEND_DEBUG_REACHABLE", "") == "1")
     let linearFallback: bool = os.getEnvDefault("BACKEND_REACHABLE_LINEAR_FALLBACK", "0") == "1"
     var dbgBudget: int32 = 64
@@ -243,7 +300,7 @@ fn uirCoreComputeReachableFnsId(module: UirCoreModule, rootId: AstNodeId): hashs
                 seededEntryDecls = seededEntryDecls + 1
     if dbgReach:
         var foundMain: bool = false
-        let mainIdxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, "main", &foundMain)
+        let mainIdxs: int32[] = uirCoreReachDeclIndexGet(indexHead, indexEntryDeclIdxs, indexEntryNexts, "main", foundMain)
         let fDbgMain: os.File = os.get_stderr()
         os.writeLine(fDbgMain, "[backend] reachable: seed main found=" + (foundMain ? "1" : "0") +
                                " idxs=" + intToStr(mainIdxs.len) +
@@ -264,12 +321,14 @@ fn uirCoreComputeReachableFnsId(module: UirCoreModule, rootId: AstNodeId): hashs
         if nKind == nkFnDecl || nKind == nkIteratorDecl:
             continue
         if nKind == nkLet || nKind == nkVar || nKind == nkConst:
-            var callees: str[64]
+            var callees: str[]
+            callees.cap = 64
             uirCoreCollectCallsDeepId(module, nId, &callees)
             for ci in 0..<callees.len:
                 let nm: str = callees[ci]
                 var inProgram: bool = false
-                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(index, nodes, nm, inProgram, linearFallback)
+                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(indexHead, indexEntryDeclIdxs, indexEntryNexts,
+                                                               nodes, nm, inProgram, linearFallback)
                 if inProgram && calleeIdxs.len > 0:
                     for ki in 0..<calleeIdxs.len:
                         let k: int32 = calleeIdxs[ki]
@@ -294,7 +353,7 @@ fn uirCoreComputeReachableFnsId(module: UirCoreModule, rootId: AstNodeId): hashs
     for qi in 0..<queue.len:
         let cur: str = queue[qi]
         var found: bool = false
-        let idxs: int32[] = hashmaps.hashMapStrSeqIntGet(index, cur, &found)
+        let idxs: int32[] = uirCoreReachDeclIndexGet(indexHead, indexEntryDeclIdxs, indexEntryNexts, cur, found)
         if dbgReach && dbgBudget > 0:
             let fDbgCur: os.File = os.get_stderr()
             os.writeLine(fDbgCur, "[backend] reachable: pop name=" + cur +
@@ -309,12 +368,14 @@ fn uirCoreComputeReachableFnsId(module: UirCoreModule, rootId: AstNodeId): hashs
             if idx < 0 || idx >= nodes.len:
                 continue
             let fnNodeId: AstNodeId = nodes[idx]
-            var callees: str[64]
+            var callees: str[]
+            callees.cap = 64
             uirCoreCollectCallsDeepId(module, fnNodeId, &callees)
             for ci in 0..<callees.len:
                 let nm: str = callees[ci]
                 var inProgram: bool = false
-                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(index, nodes, nm, inProgram, linearFallback)
+                let calleeIdxs: int32[] = uirCoreReachDeclIdxs(indexHead, indexEntryDeclIdxs, indexEntryNexts,
+                                                               nodes, nm, inProgram, linearFallback)
                 if inProgram && calleeIdxs.len > 0:
                     for ki in 0..<calleeIdxs.len:
                         let k: int32 = calleeIdxs[ki]

@@ -3,7 +3,10 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_exe_determinism_strict
+tool="$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh"
+bin="${TOOLING_REPO_NATIVE_BIN:-$root/artifacts/tooling_cmd/cheng_tooling.repo_native_exec.bin}"
+
+exec env TOOLING_BIN="$bin" TOOLING_EMIT_SELFHOST_LAUNCHER=0 sh "$tool" verify_backend_determinism_strict "$@"

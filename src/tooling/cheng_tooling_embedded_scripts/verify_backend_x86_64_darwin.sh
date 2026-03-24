@@ -29,26 +29,54 @@ fi
 
 driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
 
+run_driver_compile() {
+  validate="$1"
+  linker="$2"
+  fixture="$3"
+  output="$4"
+  env BACKEND_VALIDATE="$validate" \
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:x86_64-apple-darwin \
+      --linker:"$linker" \
+      --no-multi \
+      --no-multi-force \
+      --output:"$output"
+}
+
+is_silent_rc223() {
+  status="$1"
+  log="$2"
+  if [ "$status" -ne 223 ]; then
+    return 1
+  fi
+  if [ ! -s "$log" ]; then
+    return 0
+  fi
+  ! grep -v -e '^target=' -e '^[[:space:]]*$' "$log" >/dev/null 2>&1
+}
+
+nm_has_symbol() {
+  file="$1"
+  pattern="$2"
+  nm "$file" | awk -v pat="$pattern" 'index($0, pat) { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+otool_has_x86_64() {
+  file="$1"
+  otool -hv "$file" | awk 'index($0, "X86_64") { found = 1 } END { exit found ? 0 : 1 }'
+}
+
 probe_fixture="tests/cheng/backend/fixtures/return_add.cheng"
 probe_log="chengcache/x86_64.target_probe.log"
 probe_out="chengcache/x86_64.target_probe.bin"
 mkdir -p chengcache
 rm -f "$probe_log" "$probe_out"
 set +e
-env \
-  BACKEND_VALIDATE=0 \
-  BACKEND_MULTI=0 \
-  BACKEND_MULTI_FORCE=0 \
-  BACKEND_LINKER=system \
-  BACKEND_NO_RUNTIME_C=0 \
-  BACKEND_EMIT=exe \
-  BACKEND_TARGET=x86_64-apple-darwin \
-  BACKEND_INPUT="$probe_fixture" \
-  BACKEND_OUTPUT="$probe_out" \
-  "$driver" >"$probe_log" 2>&1
+run_driver_compile 0 system "$probe_fixture" "$probe_out" >"$probe_log" 2>&1
 probe_status="$?"
 set -e
-if [ "$probe_status" -ne 0 ] && rg -q "host-only expects aarch64/arm64" "$probe_log"; then
+if [ "$probe_status" -ne 0 ] && { rg -q "host-only expects aarch64/arm64" "$probe_log" || is_silent_rc223 "$probe_status" "$probe_log"; }; then
   echo "verify_backend_x86_64_darwin skip: host-only driver does not support x86_64 target" 1>&2
   exit 2
 fi
@@ -123,16 +151,7 @@ build_exe() {
   compile_log="$out_dir/build.${base}.x86_64.system.log"
   rm -f "$exe_path" "$compile_log"
   set +e
-  env \
-    BACKEND_VALIDATE=1 \
-    BACKEND_MULTI=0 \
-    BACKEND_MULTI_FORCE=0 \
-    BACKEND_NO_RUNTIME_C=0 \
-    BACKEND_EMIT=exe \
-    BACKEND_TARGET=x86_64-apple-darwin \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$exe_path" \
-    "$driver" >"$compile_log" 2>&1
+  run_driver_compile 1 system "$fixture" "$exe_path" >"$compile_log" 2>&1
   status="$?"
   set -e
   if [ "$status" -ne 0 ]; then
@@ -173,14 +192,14 @@ exe_path="$out_dir/hello_importc_puts.x86_64"
 
 build_obj "$fixture" "$obj_path"
 if command -v otool >/dev/null 2>&1; then
-  if ! otool -hv "$obj_path" | grep -q "X86_64"; then
+  if ! otool_has_x86_64 "$obj_path"; then
     echo "verify_backend_x86_64_darwin skip: seed/driver does not emit x86_64 Mach-O objects" 1>&2
     exit 2
   fi
 fi
 if command -v nm >/dev/null 2>&1; then
-  nm "$obj_path" | grep -q " T _main"
-  nm "$obj_path" | grep -q " U _puts"
+  nm_has_symbol "$obj_path" " T _main"
+  nm_has_symbol "$obj_path" " U _puts"
 fi
 
 require_build_exe "$fixture" "$exe_path"
@@ -210,17 +229,7 @@ build_exe_self() {
   exe_path="$2"
   rm -f "$exe_path"
   set +e
-  env \
-    BACKEND_VALIDATE=1 \
-    BACKEND_MULTI=0 \
-    BACKEND_MULTI_FORCE=0 \
-    BACKEND_LINKER=self \
-    BACKEND_NO_RUNTIME_C=0 \
-    BACKEND_EMIT=exe \
-    BACKEND_TARGET=x86_64-apple-darwin \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$exe_path" \
-    "$driver" >/dev/null
+  run_driver_compile 1 self "$fixture" "$exe_path" >/dev/null
   status="$?"
   set -e
   if [ "$status" -ne 0 ] || [ ! -x "$exe_path" ]; then

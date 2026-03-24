@@ -3,9 +3,6 @@ import std/system
 import std/rawmem_support
 import backend/uir/uir_internal/uir_core_builder_text_helpers
 
-@importc("driver_c_str_has_prefix")
-fn builder_string_c_str_has_prefix(s: str, prefix: str): int32
-
 fn backendIsSafeLinkName(name: str): bool =
     if len(name) == 0:
         return false
@@ -53,17 +50,47 @@ fn backendSanitizeLinkNameFill(out: str, name: str, nameLen: int32): str =
 fn backendSanitizeLinkName(raw: str): str =
     if len(raw) == 0:
         return ""
-    if backendIsSafeLinkName(backendStripSpaces(raw)):
-        return backendStripSpaces(raw)
-    if len(backendStripSpaces(raw)) == 0:
+    let stripped: str = backendStripSpaces(raw)
+    if backendIsSafeLinkName(stripped):
+        return stripped
+    if len(stripped) == 0:
         return "__cheng_anon"
-    let nameLen: int32 = len(backendStripSpaces(raw))
+    let nameLen: int32 = len(stripped)
     if nameLen == 0:
         return "__cheng_anon"
-    return backendSanitizeLinkNameFill(newStringAlloc(11 + (nameLen * 3)), backendStripSpaces(raw), nameLen)
+    return backendSanitizeLinkNameFill(newStringAlloc(11 + (nameLen * 3)), stripped, nameLen)
 
 fn uirCoreStrStartsWith(s: str, prefix: str): bool =
-    return builder_string_c_str_has_prefix(s, prefix) != 0
+    let sLen: int32 = strLenFast(s)
+    let prefixLen: int32 = strLenFast(prefix)
+    return uirCoreStrStartsWithWithLen(s, sLen, prefix, prefixLen)
+
+fn uirCoreStrEqWithLen(a: str, aLen: int32, b: str, bLen: int32): bool =
+    if aLen != bLen:
+        return false
+    if aLen <= 0:
+        return true
+    let aPtr: ptr = strDataPtr(a)
+    let bPtr: ptr = strDataPtr(b)
+    if aPtr == bPtr:
+        return true
+    if aPtr == nil || bPtr == nil:
+        return false
+    return cmpMem(aPtr, bPtr, int64(aLen)) == 0
+
+fn uirCoreStrEqFast(a: str, b: str): bool =
+    return uirCoreStrEqWithLen(a, strLenFast(a), b, strLenFast(b))
+
+fn uirCoreStrStartsWithWithLen(s: str, sLen: int32, prefix: str, prefixLen: int32): bool =
+    if prefixLen <= 0:
+        return true
+    if sLen < prefixLen:
+        return false
+    let sPtr: ptr = strDataPtr(s)
+    let prefixPtr: ptr = strDataPtr(prefix)
+    if sPtr == nil || prefixPtr == nil:
+        return false
+    return cmpMem(sPtr, prefixPtr, int64(prefixLen)) == 0
 
 fn uirCoreStripLeadingUnderscores(raw: str): str =
     if len(raw) == 0:
@@ -81,51 +108,67 @@ fn uirCoreStripLeadingUnderscores(raw: str): str =
     return rawmemStrFromOffset(raw, i)
 
 fn uirCoreStrFindFrom(text: str, pat: str, start: int32 = 0): int32 =
-    let n: int32 = len(text)
-    let m: int32 = len(pat)
+    let n: int32 = strLenFast(text)
+    let m: int32 = strLenFast(pat)
     if m <= 0:
         return start <= n ? start : -1
     if n <= 0 || start < 0 || start >= n || m > n:
         return -1
+    let textPtr: ptr = strDataPtr(text)
+    let patPtr: ptr = strDataPtr(pat)
+    if textPtr == nil || patPtr == nil:
+        return -1
+    let first: uint8 = load(patPtr)
     let last: int32 = n - m
     var i: int32 = start
     while i <= last:
-        var ok: bool = true
-        for j in 0..<m:
-            if text[i + j] != pat[j]:
-                ok = false
-                break
-        if ok:
+        if load(system_ptr_add(textPtr, i)) == first &&
+           cmpMem(system_ptr_add(textPtr, i), patPtr, int64(m)) == 0:
             return i
         i = i + 1
     return -1
 
-fn uirCoreStrIndexOf(s: str, sub: str): int32 =
-    let n: int32 = len(s)
-    let m: int32 = len(sub)
+fn uirCoreStrIndexOfWithLen(s: str, sLen: int32, sub: str, subLen: int32): int32 =
+    let n: int32 = sLen
+    let m: int32 = subLen
     if m == 0:
         return 0
     if n == 0:
         return -1
     if m > n:
         return -1
-    for i in 0..n - m:
-        for j in 0..<m:
-            if !(s[i + j] == sub[j]):
-                break
-        if j == m:
+    let sPtr: ptr = strDataPtr(s)
+    let subPtr: ptr = strDataPtr(sub)
+    if sPtr == nil || subPtr == nil:
+        return -1
+    let first: uint8 = load(subPtr)
+    let last: int32 = n - m
+    var i: int32 = 0
+    while i <= last:
+        if load(system_ptr_add(sPtr, i)) == first &&
+           cmpMem(system_ptr_add(sPtr, i), subPtr, int64(m)) == 0:
             return i
+        i = i + 1
     return -1
 
+fn uirCoreStrIndexOf(s: str, sub: str): int32 =
+    return uirCoreStrIndexOfWithLen(s, strLenFast(s), sub, strLenFast(sub))
+
 fn uirCoreStrEqAt(s: str, off: int32, pat: str): bool =
-    let n: int32 = len(s)
-    let m: int32 = len(pat)
+    let n: int32 = strLenFast(s)
+    let m: int32 = strLenFast(pat)
+    return uirCoreStrEqAtWithLen(s, n, off, pat, m)
+
+fn uirCoreStrEqAtWithLen(s: str, sLen: int32, off: int32, pat: str, patLen: int32): bool =
+    let n: int32 = sLen
+    let m: int32 = patLen
     if off < 0 || m <= 0 || off + m > n:
         return false
-    for i in 0..<m:
-        if s[off + i] != pat[i]:
-            return false
-    return true
+    let sPtr: ptr = strDataPtr(s)
+    let patPtr: ptr = strDataPtr(pat)
+    if sPtr == nil || patPtr == nil:
+        return false
+    return cmpMem(system_ptr_add(sPtr, off), patPtr, int64(m)) == 0
 
 fn uirCoreStrTake(s: str, count: int32): str =
     if len(s) == 0 || count <= 0:

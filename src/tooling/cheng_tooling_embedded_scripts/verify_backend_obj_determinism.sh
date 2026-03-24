@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -41,7 +41,6 @@ case "$host_os" in
     ;;
 esac
 
-
 fixture="tests/cheng/backend/fixtures/hello_importc_puts.cheng"
 out_dir="artifacts/backend_obj_determinism"
 mkdir -p "$out_dir"
@@ -51,11 +50,10 @@ obj_b="$out_dir/b.o"
 
 run_obj() {
   out="$1"
-  BACKEND_EMIT=obj \
-  BACKEND_TARGET=arm64-apple-darwin \
-  BACKEND_INPUT="$fixture" \
-  BACKEND_OUTPUT="$out" \
-  "$driver"
+  "$driver" "$fixture" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --output:"$out"
 }
 
 run_obj "$obj_a"
@@ -69,7 +67,7 @@ if [ "$sha_a" = "" ] || [ "$sha_b" = "" ]; then
   exit 2
 fi
 if [ "$sha_a" != "$sha_b" ]; then
-  echo "[verify_backend_obj_determinism] mismatch: $sha_a vs $sha_b" 1>&2
+  echo "[verify_backend_obj_determinism] mismatch: $sha_a vs $sha_b" >&2
   exit 1
 fi
 

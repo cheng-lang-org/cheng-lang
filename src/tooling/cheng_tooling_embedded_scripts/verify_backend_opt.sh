@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -21,8 +21,84 @@ driver="${BACKEND_DRIVER:-}"
 if [ "$driver" = "" ]; then
   driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
 fi
-target="${BACKEND_TARGET:-arm64-apple-darwin}"
-link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:"${BACKEND_LINKER:-auto}")"
+requested_linker="${BACKEND_LINKER:-auto}"
+
+resolve_target() {
+  if [ "${BACKEND_TARGET:-}" != "" ] && [ "${BACKEND_TARGET:-}" != "auto" ]; then
+    printf '%s\n' "${BACKEND_TARGET}"
+    return
+  fi
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target
+}
+
+resolve_link_env() {
+  link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:"$requested_linker")"
+  resolved_linker=""
+  resolved_no_runtime_c="0"
+  resolved_runtime_obj=""
+  resolved_runtime_obj_assigned="0"
+  for entry in $link_env; do
+    case "$entry" in
+      BACKEND_LINKER=*)
+        resolved_linker="${entry#BACKEND_LINKER=}"
+        ;;
+      BACKEND_NO_RUNTIME_C=*)
+        resolved_no_runtime_c="${entry#BACKEND_NO_RUNTIME_C=}"
+        ;;
+      BACKEND_RUNTIME_OBJ=*)
+        resolved_runtime_obj="${entry#BACKEND_RUNTIME_OBJ=}"
+        resolved_runtime_obj_assigned="1"
+        ;;
+    esac
+  done
+  if [ "$resolved_linker" = "" ]; then
+    echo "[Error] verify_backend_opt: backend_link_env missing BACKEND_LINKER" 1>&2
+    exit 1
+  fi
+}
+
+run_primary_build() {
+  if [ "$resolved_runtime_obj_assigned" = "1" ] && [ "$resolved_no_runtime_c" = "1" ]; then
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --opt \
+      --no-runtime-c \
+      --runtime-obj:"$resolved_runtime_obj" \
+      --output:"$exe_path"
+    return
+  fi
+  if [ "$resolved_runtime_obj_assigned" = "1" ]; then
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --opt \
+      --runtime-obj:"$resolved_runtime_obj" \
+      --output:"$exe_path"
+    return
+  fi
+  if [ "$resolved_no_runtime_c" = "1" ]; then
+    "$driver" "$fixture" \
+      --emit:exe \
+      --target:"$target" \
+      --linker:"$resolved_linker" \
+      --opt \
+      --no-runtime-c \
+      --output:"$exe_path"
+    return
+  fi
+  "$driver" "$fixture" \
+    --emit:exe \
+    --target:"$target" \
+    --linker:"$resolved_linker" \
+    --opt \
+    --output:"$exe_path"
+}
+
+target="$(resolve_target)"
+resolve_link_env
 
 
 out_dir="artifacts/backend_opt"
@@ -32,7 +108,6 @@ fixture="tests/cheng/backend/fixtures/return_add.cheng"
 
 exe_path="$out_dir/return_add.opt"
 build_log="$out_dir/return_add.opt.build.log"
-build_fallback_log="$out_dir/return_add.opt.build.fallback.log"
 run_log="$out_dir/return_add.opt.run.log"
 
 is_known_runtime_symbol_log() {
@@ -49,49 +124,19 @@ is_known_runtime_symbol_log() {
   return 1
 }
 
-skip_run="0"
 set +e
-env $link_env \
-  BACKEND_OPT=1 \
-  BACKEND_EMIT=exe \
-  BACKEND_TARGET="$target" \
-  BACKEND_INPUT="$fixture" \
-  BACKEND_OUTPUT="$exe_path" \
-  "$driver" >"$build_log" 2>&1
+run_primary_build >"$build_log" 2>&1
 build_status="$?"
 set -e
 
-if [ "$build_status" -ne 0 ]; then
-  set +e
-  env \
-    BACKEND_OPT=1 \
-    BACKEND_EMIT=exe \
-    BACKEND_LINKER=self \
-    BACKEND_RUNTIME=off \
-    BACKEND_NO_RUNTIME_C=1 \
-    BACKEND_RUNTIME_OBJ= \
-    BACKEND_TARGET="$target" \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$exe_path" \
-    "$driver" >"$build_fallback_log" 2>&1
-  fallback_status="$?"
-  set -e
-  if [ "$fallback_status" -eq 0 ]; then
-    build_status=0
-    skip_run=1
-  fi
-fi
-
 if [ "$build_status" -eq 0 ]; then
-  if [ "$skip_run" = "0" ]; then
-    set +e
-    "$exe_path" >"$run_log" 2>&1
-    run_status="$?"
-    set -e
-    if [ "$run_status" -ne 0 ] && ! is_known_runtime_symbol_log "$run_log"; then
-      cat "$run_log" 1>&2 || true
-      exit "$run_status"
-    fi
+  set +e
+  "$exe_path" >"$run_log" 2>&1
+  run_status="$?"
+  set -e
+  if [ "$run_status" -ne 0 ] && ! is_known_runtime_symbol_log "$run_log"; then
+    cat "$run_log" 1>&2 || true
+    exit "$run_status"
   fi
   echo "verify_backend_opt ok"
   exit 0
@@ -99,7 +144,4 @@ fi
 
 echo "[Error] verify_backend_opt failed (status=$build_status)" 1>&2
 cat "$build_log" 1>&2 || true
-if [ -f "$build_fallback_log" ]; then
-  cat "$build_fallback_log" 1>&2 || true
-fi
 exit 1

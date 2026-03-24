@@ -37,7 +37,7 @@ proof_phase_driver_published_surface_ok() {
   case "$cand" in
     "$root"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2|\
     "$root"/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness)
-      if rg -q '^(sidecar_compiler|exec_fallback_outer_driver)=' "$meta"; then
+      if rg -q '^(sidecar_compiler)=' "$meta"; then
         return 1
       fi
       ;;
@@ -58,6 +58,17 @@ proof_phase_driver_label_safe() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
 }
 
+proof_phase_driver_sidecar_meta_field() {
+  compiler="$1"
+  key="$2"
+  meta="${compiler}.meta"
+  if [ "$compiler" = "" ] || [ ! -f "$meta" ]; then
+    printf '\n'
+    return 0
+  fi
+  sed -n "s/^${key}=//p" "$meta" | head -n 1
+}
+
 proof_phase_driver_append_candidate_line() {
   cand="$1"
   label="$2"
@@ -70,31 +81,73 @@ proof_phase_driver_append_candidate_line() {
 }
 
 proof_phase_driver_default_sidecar() {
-  preferred_release="$root/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng"
-  legacy_proofseed="$root/artifacts/backend_selfhost_self_obj/probe_proofseed14/cheng_stage0_proofseed14"
-  if [ -x "$preferred_release" ]; then
-    printf '%s\n' "$preferred_release"
-    return 0
-  fi
-  if [ -x "$legacy_proofseed" ]; then
-    printf '%s\n' "$legacy_proofseed"
+  resolved="$(sh "$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh" --root:"$root" --field:compiler 2>/dev/null || true)"
+  if [ "$resolved" != "" ] && [ -x "$resolved" ]; then
+    printf '%s\n' "$resolved"
     return 0
   fi
   printf '\n'
 }
 
-proof_phase_driver_append_archive_candidates() {
-  current_release="$root/dist/releases/current/cheng"
-  for cand in \
-    "$root"/artifacts/backend_selfhost_self_obj/probe_*/cheng_stage0_* \
-    "$root"/dist/releases/*/cheng
-  do
-    [ "$cand" = "$current_release" ] && continue
-    [ -x "$cand" ] || continue
-    parent="$(basename "$(dirname "$cand")")"
-    label="archive_$(proof_phase_driver_label_safe "$parent")"
-    proof_phase_driver_append_candidate_line "$cand" "$label" ""
-  done
+proof_phase_driver_default_sidecar_mode() {
+  explicit="${BACKEND_UIR_SIDECAR_MODE:-}"
+  case "$explicit" in
+    cheng)
+      printf '%s\n' "$explicit"
+      return 0
+      ;;
+  esac
+  resolved="$(sh "$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh" --root:"$root" --field:mode 2>/dev/null || true)"
+  case "$resolved" in
+    cheng)
+      printf '%s\n' "$resolved"
+      return 0
+      ;;
+  esac
+  printf '\n'
+}
+
+proof_phase_driver_default_sidecar_bundle() {
+  explicit="${BACKEND_UIR_SIDECAR_BUNDLE:-}"
+  if [ "$explicit" != "" ] && [ -f "$explicit" ]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  resolved="$(sh "$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh" --root:"$root" --field:bundle 2>/dev/null || true)"
+  if [ "$resolved" != "" ] && [ -f "$resolved" ]; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+  printf '\n'
+}
+
+proof_phase_driver_sidecar_child_mode() {
+  compiler="$1"
+  explicit="${BACKEND_UIR_SIDECAR_CHILD_MODE:-}"
+  case "$explicit" in
+    cli|outer_cli)
+      printf '%s\n' "$explicit"
+      return 0
+      ;;
+  esac
+  default_sidecar="$(proof_phase_driver_default_sidecar)"
+  if [ "$compiler" != "" ] && [ "$compiler" = "$default_sidecar" ]; then
+    resolved="$(sh "$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh" --root:"$root" --field:child_mode 2>/dev/null || true)"
+    case "$resolved" in
+      cli|outer_cli)
+        printf '%s\n' "$resolved"
+        return 0
+        ;;
+    esac
+  fi
+  meta_mode="$(proof_phase_driver_sidecar_meta_field "$compiler" "sidecar_child_mode")"
+  case "$meta_mode" in
+    cli|outer_cli)
+      printf '%s\n' "$meta_mode"
+      return 0
+      ;;
+  esac
+  printf '\n'
 }
 
 proof_phase_driver_probe_candidate() {
@@ -128,24 +181,72 @@ proof_phase_driver_probe_candidate() {
 
   set +e
   if [ "$sidecar_compiler" != "" ]; then
-    env \
-      BACKEND_UIR_SIDECAR_COMPILER="$sidecar_compiler" \
-      BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \
-      BACKEND_COMPILE_STAMP_OUT="$proof_phase_driver_probe_stamp" \
-      UIR_PROFILE=0 \
-      BORROW_IR=mir \
-      GENERIC_LOWERING=mir_hybrid \
-      GENERIC_MODE=dict \
-      GENERIC_SPEC_BUDGET=0 \
-      STAGE1_SEM_FIXED_0=0 \
-      STAGE1_OWNERSHIP_FIXED_0=0 \
-      BACKEND_EMIT=obj \
-      BACKEND_TARGET="$target" \
-      BACKEND_FRONTEND=stage1 \
-      BACKEND_INPUT="$fixture" \
-      BACKEND_OUTPUT="$proof_phase_driver_probe_obj" \
-      "$cand" >"$proof_phase_driver_probe_log" 2>&1
-    proof_phase_driver_probe_rc="$?"
+    sidecar_mode="$(proof_phase_driver_default_sidecar_mode)"
+    sidecar_bundle="$(proof_phase_driver_default_sidecar_bundle)"
+    sidecar_child_mode="$(proof_phase_driver_sidecar_child_mode "$sidecar_compiler")"
+    case "$sidecar_mode:$sidecar_bundle:$sidecar_child_mode" in
+      cheng:/*:cli|cheng:/*:outer_cli)
+        ;;
+      cli|outer_cli)
+        ;;
+      *)
+        set -e
+        proof_phase_driver_probe_reason="missing_sidecar_contract"
+        return 1
+        ;;
+    esac
+    if [ "$sidecar_child_mode" = "outer_cli" ]; then
+      env \
+        BACKEND_UIR_SIDECAR_MODE="$sidecar_mode" \
+        BACKEND_UIR_SIDECAR_BUNDLE="$sidecar_bundle" \
+        BACKEND_UIR_SIDECAR_COMPILER="$sidecar_compiler" \
+        BACKEND_UIR_SIDECAR_CHILD_MODE="$sidecar_child_mode" \
+        BACKEND_UIR_SIDECAR_OUTER_COMPILER="$cand" \
+        BACKEND_UIR_SIDECAR_DISABLE=0 \
+        BACKEND_UIR_PREFER_SIDECAR=1 \
+        BACKEND_UIR_FORCE_SIDECAR=1 \
+        BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \
+        BACKEND_COMPILE_STAMP_OUT="$proof_phase_driver_probe_stamp" \
+        UIR_PROFILE=0 \
+        BORROW_IR=mir \
+        GENERIC_LOWERING=mir_hybrid \
+        GENERIC_MODE=dict \
+        GENERIC_SPEC_BUDGET=0 \
+        STAGE1_SEM_FIXED_0=0 \
+        STAGE1_OWNERSHIP_FIXED_0=0 \
+        BACKEND_EMIT=obj \
+        BACKEND_TARGET="$target" \
+        BACKEND_FRONTEND=stage1 \
+        BACKEND_INPUT="$fixture" \
+        BACKEND_OUTPUT="$proof_phase_driver_probe_obj" \
+        "$cand" >"$proof_phase_driver_probe_log" 2>&1
+      proof_phase_driver_probe_rc="$?"
+    else
+      env \
+        BACKEND_UIR_SIDECAR_MODE="$sidecar_mode" \
+        BACKEND_UIR_SIDECAR_BUNDLE="$sidecar_bundle" \
+        BACKEND_UIR_SIDECAR_COMPILER="$sidecar_compiler" \
+        BACKEND_UIR_SIDECAR_CHILD_MODE="$sidecar_child_mode" \
+        BACKEND_UIR_SIDECAR_DISABLE=0 \
+        BACKEND_UIR_PREFER_SIDECAR=1 \
+        BACKEND_UIR_FORCE_SIDECAR=1 \
+        BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \
+        BACKEND_COMPILE_STAMP_OUT="$proof_phase_driver_probe_stamp" \
+        UIR_PROFILE=0 \
+        BORROW_IR=mir \
+        GENERIC_LOWERING=mir_hybrid \
+        GENERIC_MODE=dict \
+        GENERIC_SPEC_BUDGET=0 \
+        STAGE1_SEM_FIXED_0=0 \
+        STAGE1_OWNERSHIP_FIXED_0=0 \
+        BACKEND_EMIT=obj \
+        BACKEND_TARGET="$target" \
+        BACKEND_FRONTEND=stage1 \
+        BACKEND_INPUT="$fixture" \
+        BACKEND_OUTPUT="$proof_phase_driver_probe_obj" \
+        "$cand" >"$proof_phase_driver_probe_log" 2>&1
+      proof_phase_driver_probe_rc="$?"
+    fi
   else
     env \
       BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 \
@@ -219,10 +320,6 @@ proof_phase_driver_pick() {
   proof_phase_driver_proof_path=""
   proof_phase_driver_proof_surface=""
   proof_phase_driver_proof_sidecar_compiler=""
-  strict_outer_driver="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2"
-  strict_stage3_witness="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness"
-  strict_outer_driver_proof="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2.proof"
-  strict_stage3_witness_proof="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage3.witness.proof"
   currentsrc_outer_driver="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2"
   currentsrc_stage3_witness="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness"
   currentsrc_outer_driver_proof="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"
@@ -255,34 +352,24 @@ proof_phase_driver_pick() {
     proof_phase_driver_proof_surface="probe_currentsrc_stage3_witness_proof"
     proof_phase_driver_proof_sidecar_compiler=""
   fi
-  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$strict_outer_driver_proof"; then
-    proof_phase_driver_proof_path="$strict_outer_driver_proof"
-    proof_phase_driver_proof_surface="probe_prod_strict_noreuse_proof"
-    proof_phase_driver_proof_sidecar_compiler=""
+  selected_candidate="${BACKEND_PROOF_PHASE_DRIVER:-}"
+  selected_label="env"
+  selected_sidecar="${BACKEND_UIR_SIDECAR_COMPILER:-}"
+  if [ "$selected_candidate" = "" ]; then
+    selected_candidate="$currentsrc_outer_driver"
+    selected_label="probe_currentsrc_proof"
+    selected_sidecar="$proof_surface_sidecar"
   fi
-  if [ "$proof_phase_driver_proof_path" = "" ] && proof_phase_driver_published_surface_ok "$strict_stage3_witness_proof"; then
-    proof_phase_driver_proof_path="$strict_stage3_witness_proof"
-    proof_phase_driver_proof_surface="probe_prod_strict_stage3_witness_proof"
-    proof_phase_driver_proof_sidecar_compiler=""
+  if [ "$selected_sidecar" = "" ] || [ ! -x "$selected_sidecar" ]; then
+    echo "[$gate_name] missing strict proof sidecar compiler: ${selected_sidecar:-<unset>}" 1>&2
+    exit 1
+  fi
+  if [ "$selected_candidate" = "" ] || [ ! -x "$selected_candidate" ]; then
+    echo "[$gate_name] missing explicit/current-source proof phase driver: ${selected_candidate:-<unset>}" 1>&2
+    exit 1
   fi
   {
-    proof_phase_driver_append_candidate_line "${BACKEND_PROOF_PHASE_DRIVER:-}" "env" "${BACKEND_UIR_SIDECAR_COMPILER:-}"
-    proof_phase_driver_append_candidate_line "$currentsrc_outer_driver" "probe_currentsrc_proof" ""
-    proof_phase_driver_append_candidate_line "$currentsrc_stage3_witness" "probe_currentsrc_stage3_witness_proof" ""
-    proof_phase_driver_append_candidate_line "$currentsrc_outer_driver_proof" "probe_currentsrc_proof" ""
-    proof_phase_driver_append_candidate_line "$currentsrc_stage3_witness_proof" "probe_currentsrc_stage3_witness_proof" ""
-    proof_phase_driver_append_candidate_line "$strict_outer_driver_proof" "probe_prod_strict_noreuse_proof" ""
-    proof_phase_driver_append_candidate_line "$strict_stage3_witness_proof" "probe_prod_strict_stage3_witness_proof" ""
-    proof_phase_driver_append_candidate_line "$strict_outer_driver" "probe_prod_strict_noreuse_proofrelease" "$proof_surface_sidecar"
-    proof_phase_driver_append_candidate_line "$strict_stage3_witness" "probe_prod_strict_stage3_witness_proofrelease" "$proof_surface_sidecar"
-    proof_phase_driver_append_candidate_line "$strict_outer_driver" "probe_prod_strict_noreuse" "$root/dist/releases/current/cheng"
-    proof_phase_driver_append_candidate_line "$strict_stage3_witness" "probe_prod_strict_stage3_witness" "$root/dist/releases/current/cheng"
-    proof_phase_driver_append_archive_candidates
-    proof_phase_driver_append_candidate_line "$root/dist/releases/current/cheng" "release_current" ""
-    proof_phase_driver_append_candidate_line "$root/artifacts/backend_selfhost_self_obj/probe_prod.noreuse/cheng.stage2" "probe_prod_noreuse" ""
-    proof_phase_driver_append_candidate_line "$root/artifacts/backend_selfhost_self_obj/probe_prod.noreuse.parallel_perf.serial/cheng.stage2" "probe_prod_parallel_serial" ""
-    proof_phase_driver_append_candidate_line "$root/artifacts/backend_selfhost_self_obj/cheng_stage0_default" "stage0_default" ""
-    proof_phase_driver_append_candidate_line "$canonical_driver" "canonical_driver" ""
+    proof_phase_driver_append_candidate_line "$selected_candidate" "$selected_label" "$selected_sidecar"
   } >"$candidates_tmp"
 
   while IFS="$(printf '\t')" read -r cand label sidecar_compiler; do
@@ -316,7 +403,12 @@ $entry"
         proof_phase_driver_proof_sidecar_compiler="$sidecar_compiler"
       fi
       if [ "$sidecar_compiler" != "" ]; then
-        proof_phase_driver_env="BACKEND_UIR_SIDECAR_COMPILER=$sidecar_compiler"
+        sidecar_child_mode="$(proof_phase_driver_sidecar_child_mode "$sidecar_compiler")"
+        if [ "$sidecar_child_mode" = "outer_cli" ]; then
+          proof_phase_driver_env="BACKEND_UIR_SIDECAR_COMPILER=$sidecar_compiler BACKEND_UIR_SIDECAR_CHILD_MODE=$sidecar_child_mode BACKEND_UIR_SIDECAR_OUTER_COMPILER=$cand"
+        else
+          proof_phase_driver_env="BACKEND_UIR_SIDECAR_COMPILER=$sidecar_compiler BACKEND_UIR_SIDECAR_CHILD_MODE=$sidecar_child_mode"
+        fi
       fi
       break
     fi

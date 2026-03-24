@@ -17,6 +17,8 @@ var
     uirCore_funcBaseHas_cache_module: UirCoreModule
     uirCore_funcBaseHas_cache: hashmaps.HashMapStrInt
     uirCore_funcBaseHas_ptr_cache: hashmaps.HashMapPtrInt
+    uirCore_funcBaseHas_checked_len_cache: hashmaps.HashMapStrInt
+    uirCore_funcBaseHas_checked_len_ptr_cache: hashmaps.HashMapPtrInt
     uirCore_funcBaseHas_cache_len: int32
     uirCore_funcBaseHas_cache_ready: bool
 
@@ -25,6 +27,11 @@ var
     uirCore_globalIndex_ptr_cache: hashmaps.HashMapPtrInt
     uirCore_globalIndex_cache_len: int32
     uirCore_globalIndex_cache_ready: bool
+
+fn uirCoreModuleLookupCacheStableText(s: str): str =
+    if len(s) == 0:
+        return ""
+    return uirCoreOwnStr(s)
 
 fn uirCoreFuncBaseHasCacheReset(mod: UirCoreModule = nil) =
     uirCore_funcBaseHas_cache_module = mod
@@ -43,6 +50,14 @@ fn uirCoreFuncBaseHasCacheReset(mod: UirCoreModule = nil) =
         uirCore_funcBaseHas_ptr_cache = hashmaps.hashMapPtrIntInit(cacheCap)
     else:
         hashmaps.hashMapPtrIntClear(uirCore_funcBaseHas_ptr_cache)
+    if uirCore_funcBaseHas_checked_len_cache.mask == 0:
+        uirCore_funcBaseHas_checked_len_cache = hashmaps.hashMapStrIntInit(cacheCap)
+    else:
+        hashmaps.hashMapStrIntClear(uirCore_funcBaseHas_checked_len_cache)
+    if uirCore_funcBaseHas_checked_len_ptr_cache.mask == 0:
+        uirCore_funcBaseHas_checked_len_ptr_cache = hashmaps.hashMapPtrIntInit(cacheCap)
+    else:
+        hashmaps.hashMapPtrIntClear(uirCore_funcBaseHas_checked_len_ptr_cache)
     uirCore_funcBaseHas_cache_ready = (mod != nil)
 
 fn uirCoreEnsureFuncBaseHasCache(mod: UirCoreModule) =
@@ -50,10 +65,40 @@ fn uirCoreEnsureFuncBaseHasCache(mod: UirCoreModule) =
         if uirCore_funcBaseHas_cache_module != nil || uirCore_funcBaseHas_cache_ready:
             uirCoreFuncBaseHasCacheReset(nil)
         return
+    let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
     if !uirCore_funcBaseHas_cache_ready ||
        uirCore_funcBaseHas_cache_module != mod ||
-       uirCore_funcBaseHas_cache_len != uirCoreModuleFuncsLen(mod):
+       funcsLen < uirCore_funcBaseHas_cache_len:
         uirCoreFuncBaseHasCacheReset(mod)
+        return
+    if funcsLen > uirCore_funcBaseHas_cache_len:
+        uirCore_funcBaseHas_cache_len = funcsLen
+
+fn uirCoreFuncBaseHasCacheMarkCheckedLen(base0: str, ptrKey: int64, funcsLen: int32) =
+    if len(base0) == 0 || funcsLen < 0:
+        return
+    let encodedLen: int32 = funcsLen + 1
+    let stableBase0: str = uirCoreModuleLookupCacheStableText(base0)
+    hashmaps.hashMapStrIntPut(uirCore_funcBaseHas_checked_len_cache, stableBase0, encodedLen)
+    if ptrKey != 0:
+        hashmaps.hashMapPtrIntPut(uirCore_funcBaseHas_checked_len_ptr_cache, ptrKey, encodedLen)
+
+fn uirCoreFuncBaseHasCacheCheckedAtLen(base0: str, ptrKey: int64, funcsLen: int32): bool =
+    if len(base0) == 0 || funcsLen < 0:
+        return false
+    let encodedLen: int32 = funcsLen + 1
+    if ptrKey != 0:
+        var foundCheckedPtr: bool = false
+        let checkedPtr: int32 = hashmaps.hashMapPtrIntGet(uirCore_funcBaseHas_checked_len_ptr_cache, ptrKey, foundCheckedPtr)
+        if foundCheckedPtr && checkedPtr == encodedLen:
+            return true
+    var foundChecked: bool = false
+    let checkedLen: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_funcBaseHas_checked_len_cache, base0, foundChecked)
+    if foundChecked && checkedLen == encodedLen:
+        if ptrKey != 0:
+            hashmaps.hashMapPtrIntPut(uirCore_funcBaseHas_checked_len_ptr_cache, ptrKey, checkedLen)
+        return true
+    return false
 
 fn uirCoreFuncBaseHasCacheTryGet(mod: UirCoreModule, base0: str, found: var bool): bool =
     found = false
@@ -63,16 +108,36 @@ fn uirCoreFuncBaseHasCacheTryGet(mod: UirCoreModule, base0: str, found: var bool
     if !uirCore_funcBaseHas_cache_ready || uirCore_funcBaseHas_cache_module != mod:
         return false
     let ptrKey: int64 = uirCoreTypeKeyObjNamePtrKey(base0)
+    let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
     if ptrKey != 0:
         var foundPtr: bool = false
         let rawPtr: int32 = hashmaps.hashMapPtrIntGet(uirCore_funcBaseHas_ptr_cache, ptrKey, foundPtr)
         if foundPtr:
+            if rawPtr <= 1:
+                if uirCoreFuncBaseHasCacheCheckedAtLen(base0, ptrKey, funcsLen):
+                    found = true
+                    return false
+                if !uirCoreCalleeCandidateAppendedFuncsAffectBase(mod, base0):
+                    uirCoreFuncBaseHasCacheMarkCheckedLen(base0, ptrKey, funcsLen)
+                    found = true
+                    return false
+                return false
             found = true
-            return rawPtr > 1
+            return true
     let raw: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_funcBaseHas_cache, base0, found)
     if found && ptrKey != 0:
         hashmaps.hashMapPtrIntPut(uirCore_funcBaseHas_ptr_cache, ptrKey, raw)
-    return raw > 1
+    if !found:
+        return false
+    if raw > 1:
+        return true
+    if uirCoreFuncBaseHasCacheCheckedAtLen(base0, ptrKey, funcsLen):
+        return false
+    if !uirCoreCalleeCandidateAppendedFuncsAffectBase(mod, base0):
+        uirCoreFuncBaseHasCacheMarkCheckedLen(base0, ptrKey, funcsLen)
+        return false
+    found = false
+    return false
 
 fn uirCoreFuncBaseHasCachePut(mod: UirCoreModule, base0: str, hasBase: bool) =
     if mod == nil || len(base0) == 0:
@@ -81,10 +146,13 @@ fn uirCoreFuncBaseHasCachePut(mod: UirCoreModule, base0: str, hasBase: bool) =
     if !uirCore_funcBaseHas_cache_ready || uirCore_funcBaseHas_cache_module != mod:
         return
     let encoded: int32 = hasBase ? 2 : 1
-    hashmaps.hashMapStrIntPut(uirCore_funcBaseHas_cache, base0, encoded)
+    let stableBase0: str = uirCoreModuleLookupCacheStableText(base0)
+    hashmaps.hashMapStrIntPut(uirCore_funcBaseHas_cache, stableBase0, encoded)
     let ptrKey: int64 = uirCoreTypeKeyObjNamePtrKey(base0)
     if ptrKey != 0:
         hashmaps.hashMapPtrIntPut(uirCore_funcBaseHas_ptr_cache, ptrKey, encoded)
+    if !hasBase:
+        uirCoreFuncBaseHasCacheMarkCheckedLen(base0, ptrKey, uirCoreModuleFuncsLen(mod))
 
 fn uirCoreCalleeCandidateExactFuncIndexFresh(mod: UirCoreModule, name: str,
                                              foundExact: var bool): int32 =
@@ -190,7 +258,7 @@ fn moduleGlobalIndex(module: UirCoreModule, name: str): int32 =
         let g: UirCoreGlobal = uirCoreModuleGlobalAt(module, i)
         if (g.name == name):
             if uirCore_globalIndex_cache_ready && uirCore_globalIndex_cache_module == module:
-                hashmaps.hashMapStrIntPut(uirCore_globalIndex_cache, name, i)
+                hashmaps.hashMapStrIntPut(uirCore_globalIndex_cache, g.name, i)
                 hashmaps.hashMapPtrIntPut(uirCore_globalIndex_ptr_cache, int64(rawmemAsVoid(name)), i + 1)
             return i
     return -1
@@ -253,7 +321,18 @@ fn uirCore_ensureFuncIndexCache(mod: UirCoreModule) =
         uirCore_funcIndex_cache_len = uirCoreModuleFuncsLen(mod)
 
 fn moduleFuncIndex(mod: UirCoreModule, name: str): int32 =
-    if (mod == nil) || len(name) == 0:
+    let nameLen: int32 = strLenFast(name)
+    if (mod == nil) || nameLen == 0:
+        return -1
+    var foundExactCache: bool = false
+    let exactIdx: int32 = uirCoreFuncExactCacheTryGet(mod, name, foundExactCache)
+    if foundExactCache:
+        if exactIdx >= 0 && exactIdx < uirCoreModuleFuncsLen(mod):
+            let exactF: UirCoreFunc = uirCoreModuleFuncAt(mod, exactIdx)
+            if (exactF != nil) && uirCoreStrEqWithLen(uirCoreFuncNameForCacheLocal(exactF),
+                                                      strLenFast(uirCoreFuncNameForCacheLocal(exactF)),
+                                                      name, nameLen):
+                return exactIdx
         return -1
     if uirCoreModuleFuncsLen(mod) > 0:
         uirCore_ensureFuncIndexCache(mod)
@@ -266,21 +345,27 @@ fn moduleFuncIndex(mod: UirCoreModule, name: str): int32 =
                     let idxPtr: int32 = rawPtr - 1
                     if foundPtr && rawPtr > 0 && idxPtr >= 0 && idxPtr < uirCoreModuleFuncsLen(mod):
                         let fPtr: UirCoreFunc = uirCoreModuleFuncAt(mod, idxPtr)
-                        if (fPtr != nil) && (uirCoreFuncNameForCacheLocal(fPtr) == name):
+                        if (fPtr != nil) && uirCoreStrEqWithLen(uirCoreFuncNameForCacheLocal(fPtr),
+                                                                strLenFast(uirCoreFuncNameForCacheLocal(fPtr)),
+                                                                name, nameLen):
                             return idxPtr
             var found: bool = false
             let idx: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_funcIndex_cache, name, found)
             if found && idx >= 0 && idx < uirCoreModuleFuncsLen(mod):
                 let f0: UirCoreFunc = uirCoreModuleFuncAt(mod, idx)
-                if (f0 != nil) && (uirCoreFuncNameForCacheLocal(f0) == name):
+                if (f0 != nil) && uirCoreStrEqWithLen(uirCoreFuncNameForCacheLocal(f0),
+                                                      strLenFast(uirCoreFuncNameForCacheLocal(f0)),
+                                                      name, nameLen):
                     if uirCoreStrPtrSane(name):
                         hashmaps.hashMapPtrIntPut(uirCore_funcIndex_ptr_cache, int64(rawmemAsVoid(name)), idx + 1)
                     return idx
     for i in 0..<uirCoreModuleFuncsLen(mod):
         let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
-        if (f != nil) && (uirCoreFuncNameForCacheLocal(f) == name):
+        if (f != nil) && uirCoreStrEqWithLen(uirCoreFuncNameForCacheLocal(f),
+                                             strLenFast(uirCoreFuncNameForCacheLocal(f)),
+                                             name, nameLen):
             if uirCore_funcIndex_cache_ready && uirCore_funcIndex_cache_module == mod:
-                hashmaps.hashMapStrIntPut(uirCore_funcIndex_cache, name, i)
+                hashmaps.hashMapStrIntPut(uirCore_funcIndex_cache, uirCoreFuncNameForCacheLocal(f), i)
                 if uirCoreStrPtrSane(name):
                     hashmaps.hashMapPtrIntPut(uirCore_funcIndex_ptr_cache, int64(rawmemAsVoid(name)), i + 1)
             return i
@@ -328,7 +413,8 @@ fn uirCoreFindObjTypeByBaseUnique(module: UirCoreModule, base0: str): str =
     return ""
 
 fn moduleHasFuncByBase(mod: UirCoreModule, base0: str): bool =
-    if (mod == nil) || len(base0) == 0:
+    let baseLen: int32 = strLenFast(base0)
+    if (mod == nil) || baseLen == 0:
         return false
     var foundHasCached: bool = false
     let hasCached: bool = uirCoreFuncBaseHasCacheTryGet(mod, base0, foundHasCached)
@@ -344,6 +430,9 @@ fn moduleHasFuncByBase(mod: UirCoreModule, base0: str): bool =
             let out0: bool = uirCoreModuleFuncAt(mod, cachedIdx) != nil
             uirCoreFuncBaseHasCachePut(mod, base0, out0)
             return out0
+    if uirCoreFuncBaseUniqueCacheFresh(mod):
+        uirCoreFuncBaseHasCachePut(mod, base0, false)
+        return false
     var candStart: int32 = -1
     var candLen: int32 = 0
     if uirCoreCalleeCandidateSpanFresh(mod, base0, candStart, candLen):
@@ -360,7 +449,7 @@ fn moduleHasFuncByBase(mod: UirCoreModule, base0: str): bool =
         if f == nil:
             continue
         let fnName0: str = uirCoreFuncNameForCacheLocal(f)
-        if uirCoreFuncNameMatchesBaseAny(fnName0, base0):
+        if uirCoreFuncNameMatchesBaseAnyWithLen(fnName0, strLenFast(fnName0), base0, baseLen):
             uirCoreFuncBaseHasCachePut(mod, base0, true)
             return true
     uirCoreFuncBaseHasCachePut(mod, base0, false)
@@ -404,10 +493,17 @@ fn moduleFindFuncByBaseUnique(mod: UirCoreModule, base0: str): UirCoreFunc =
 fn moduleFindFuncByBasePreferOrigin(mod: UirCoreModule, base0: str, originFile0: str): UirCoreFunc =
     if (mod == nil) || len(base0) == 0:
         return nil
+    var foundUnique: bool = false
+    let uniqueIdx: int32 = uirCoreFuncBaseUniqueCacheTryGet(mod, base0, foundUnique)
+    let uniqueFresh: bool = uirCoreFuncBaseUniqueCacheFresh(mod)
     if len(originFile0) > 0:
         let direct: UirCoreFunc = moduleFindFunc(mod, base0)
         if (direct != nil) && uirCoreFuncOriginFileOf(direct) == originFile0:
             return direct
+        if foundUnique && uniqueIdx >= 0 && uniqueIdx < uirCoreModuleFuncsLen(mod):
+            return uirCoreModuleFuncAt(mod, uniqueIdx)
+        if !foundUnique && uniqueFresh:
+            return nil
         var candStart: int32 = -1
         var candLen: int32 = 0
         if !uirCoreCalleeCandidateSpanFresh(mod, base0, candStart, candLen):
@@ -428,4 +524,8 @@ fn moduleFindFuncByBasePreferOrigin(mod: UirCoreModule, base0: str, originFile0:
             found = f
         if (found != nil):
             return found
+    if foundUnique && uniqueIdx >= 0 && uniqueIdx < uirCoreModuleFuncsLen(mod):
+        return uirCoreModuleFuncAt(mod, uniqueIdx)
+    if !foundUnique && uniqueFresh:
+        return nil
     return moduleFindFuncByBaseUnique(mod, base0)

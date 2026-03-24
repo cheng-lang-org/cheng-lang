@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="${TOOLING_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)}"
 cd "$root"
 
 driver="${BACKEND_DRIVER:-}"
@@ -147,6 +147,7 @@ resolve_runtime_obj() {
     return 0
   fi
   candidates="
+chengcache/runtime_selflink/system_helpers.backend.fullcompat.${target}.o
 chengcache/runtime_selflink/system_helpers.backend.combined.${target}.o
 artifacts/backend_mm/system_helpers.backend.combined.${target}.o
 chengcache/system_helpers.backend.cheng.${target}.o
@@ -175,7 +176,7 @@ artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.o
 runtime_obj="$(resolve_runtime_obj || true)"
 if [ "$runtime_obj" = "" ] || [ ! -f "$runtime_obj" ]; then
   echo "[backend_link_env] missing runtime object for target=$target" >&2
-  echo "  hint: set BACKEND_RUNTIME_OBJ or prepare chengcache/runtime_selflink/system_helpers.backend.combined.${target}.o" >&2
+  echo "  hint: set BACKEND_RUNTIME_OBJ or prepare chengcache/runtime_selflink/system_helpers.backend.fullcompat.${target}.o" >&2
   exit 1
 fi
 if ! runtime_has_core_symbols "$runtime_obj"; then

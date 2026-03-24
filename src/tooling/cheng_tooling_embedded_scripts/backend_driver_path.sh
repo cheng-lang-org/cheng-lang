@@ -80,16 +80,19 @@ driver_compile_smoke_ok() {
   smoke_src="$root/tests/cheng/backend/fixtures/return_add.cheng"
   [ -f "$smoke_src" ] || return 0
   smoke_out="$root/chengcache/.backend_driver_path.smoke.bin"
+  smoke_linker="${BACKEND_DRIVER_PATH_LINKER:-system}"
   mkdir -p "$root/chengcache"
   rm -f "$smoke_out"
   set +e
-  run_with_timeout "${BACKEND_DRIVER_PATH_SMOKE_TIMEOUT:-20}" env \
-    BACKEND_VALIDATE=0 \
-    BACKEND_LINKER="${BACKEND_DRIVER_PATH_LINKER:-system}" \
-    BACKEND_EMIT=exe \
-    BACKEND_INPUT="$smoke_src" \
-    BACKEND_OUTPUT="$smoke_out" \
-    "$bin" >/dev/null 2>&1
+  run_with_timeout "${BACKEND_DRIVER_PATH_SMOKE_TIMEOUT:-20}" \
+    env BACKEND_VALIDATE=0 \
+    "$bin" \
+    "$smoke_src" \
+    --emit:exe \
+    --target:auto \
+    --frontend:stage1 \
+    --linker:"$smoke_linker" \
+    --output:"$smoke_out" >/dev/null 2>&1
   status=$?
   set -e
   [ "$status" -eq 0 ] || return 1
@@ -172,10 +175,10 @@ fi
 
 resolved="$(find_fallback_driver || true)"
 if [ "$resolved" = "" ] && [ "${BACKEND_DRIVER_PATH_PREFER_REBUILD:-0}" = "1" ]; then
-  build_script="$root/src/tooling/cheng_tooling_embedded_scripts/build_backend_driver.sh"
-  if [ -x "$build_script" ]; then
+  tool="$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh"
+  if [ -x "$tool" ]; then
     set +e
-    sh "$build_script" --name:artifacts/backend_driver/cheng >/dev/null 2>&1
+    sh "$tool" build_backend_driver --name:artifacts/backend_driver/cheng >/dev/null 2>&1
     rebuild_status=$?
     set -e
     if [ "$rebuild_status" -eq 0 ]; then

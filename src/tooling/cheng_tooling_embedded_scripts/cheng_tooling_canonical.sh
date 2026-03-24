@@ -180,7 +180,7 @@ run_build_global_canonical_sync() {
 script_is_self_trampoline() {
   subcmd="$1"
   script_path="$2"
-  grep -Eq "^[[:space:]]*exec[[:space:]].*(TOOLING_SELF_BIN|\\\$tool).*[[:space:]]$subcmd([[:space:]]|$)" "$script_path" 2>/dev/null
+  tr '\n' ' ' <"$script_path" 2>/dev/null | grep -Eq "[[:space:]]exec[[:space:]].*((TOOLING_SELF_BIN|\\\$tool)|cheng_tooling\\.sh).*[[:space:]]$subcmd([[:space:]]|$)"
 }
 
 resolve_repo_script() {

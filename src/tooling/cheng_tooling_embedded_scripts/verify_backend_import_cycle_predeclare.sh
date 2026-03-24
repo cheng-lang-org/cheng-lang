@@ -3,7 +3,7 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -26,7 +26,36 @@ if ! command -v rg >/dev/null 2>&1; then
   fail "rg is required"
 fi
 
-driver="${BACKEND_DRIVER:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)}"
+driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
+target="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)"
+requested_linker="system"
+
+print_usage() {
+  echo "Usage: $0 [--driver:<path>] [--target:<triple>] [--linker:self|system|auto]"
+}
+
+while [ "${1:-}" != "" ]; do
+  case "$1" in
+    --driver:*)
+      driver="${1#--driver:}"
+      ;;
+    --target:*)
+      target="${1#--target:}"
+      ;;
+    --linker:*)
+      requested_linker="${1#--linker:}"
+      ;;
+    --help|-h)
+      print_usage
+      exit 0
+      ;;
+    *)
+      fail "unknown arg: $1"
+      ;;
+  esac
+  shift || true
+done
+
 if [ ! -x "$driver" ]; then
   fail "backend driver not executable: $driver"
 fi
@@ -37,10 +66,18 @@ if [ -x "src/tooling/backend_driver_exec.sh" ]; then
   driver_real_env="BACKEND_DRIVER_REAL=$driver"
 fi
 
-target="${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}"
 safe_target="$(printf '%s' "$target" | tr -c 'A-Za-z0-9._-' '_' | tr -s '_')"
-requested_linker="${BACKEND_IMPORT_CYCLE_LINKER:-${BACKEND_LINKER:-system}}"
-link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:"$requested_linker")"
+case "$requested_linker" in
+  self|system|auto)
+    ;;
+  *)
+    fail "invalid linker: $requested_linker"
+    ;;
+esac
+link_env=""
+if [ "$requested_linker" = "self" ]; then
+  link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:self)"
+fi
 
 fixture_ok="tests/cheng/backend/fixtures/return_forward_decl_call.cheng"
 fixture_fail="tests/cheng/backend/fixtures/compile_fail_import_cycle_entry.cheng"
@@ -73,26 +110,33 @@ snapshot="$out_dir/backend_import_cycle_predeclare.$safe_target.snapshot.env"
 rm -f "$ok_exe" "$fail_exe" "$build_ok_log" "$run_ok_log" "$build_fail_log" "$report" "$snapshot"
 rm -rf "${ok_exe}.objs" "${ok_exe}.objs.lock" "${fail_exe}.objs" "${fail_exe}.objs.lock"
 
+build_one() {
+  fixture="$1"
+  out="$2"
+  log="$3"
+  # shellcheck disable=SC2086
+  env \
+    $link_env \
+    $driver_real_env \
+    MM=orc \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    STAGE1_SEM_FIXED_0=0 \
+    STAGE1_OWNERSHIP_FIXED_0=0 \
+    GENERIC_MODE=dict \
+    GENERIC_SPEC_BUDGET=0 \
+    "$driver_exec" "$fixture" \
+    --emit:exe \
+    --target:"$target" \
+    --frontend:stage1 \
+    --linker:"$requested_linker" \
+    --no-multi \
+    --no-multi-force \
+    --output:"$out" >"$log" 2>&1
+}
+
 set +e
-env \
-  $link_env \
-  $driver_real_env \
-  MM=orc \
-  STAGE1_NO_POINTERS_NON_C_ABI=0 \
-  STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-  STAGE1_SEM_FIXED_0=0 \
-  STAGE1_OWNERSHIP_FIXED_0=0 \
-  GENERIC_MODE=dict \
-  GENERIC_SPEC_BUDGET=0 \
-  BACKEND_EMIT=exe \
-  BACKEND_MULTI=0 \
-  BACKEND_MULTI_FORCE=0 \
-  BACKEND_NO_RUNTIME_C=0 \
-  BACKEND_TARGET="$target" \
-  BACKEND_FRONTEND=stage1 \
-  BACKEND_INPUT="$fixture_ok" \
-  BACKEND_OUTPUT="$ok_exe" \
-  "$driver_exec" >"$build_ok_log" 2>&1
+build_one "$fixture_ok" "$ok_exe" "$build_ok_log"
 build_ok_status="$?"
 set -e
 if [ "$build_ok_status" -ne 0 ]; then
@@ -113,25 +157,7 @@ if [ "$run_ok_status" -ne 0 ]; then
 fi
 
 set +e
-env \
-  $link_env \
-  $driver_real_env \
-  MM=orc \
-  STAGE1_NO_POINTERS_NON_C_ABI=0 \
-  STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-  STAGE1_SEM_FIXED_0=0 \
-  STAGE1_OWNERSHIP_FIXED_0=0 \
-  GENERIC_MODE=dict \
-  GENERIC_SPEC_BUDGET=0 \
-  BACKEND_EMIT=exe \
-  BACKEND_MULTI=0 \
-  BACKEND_MULTI_FORCE=0 \
-  BACKEND_NO_RUNTIME_C=0 \
-  BACKEND_TARGET="$target" \
-  BACKEND_FRONTEND=stage1 \
-  BACKEND_INPUT="$fixture_fail" \
-  BACKEND_OUTPUT="$fail_exe" \
-  "$driver_exec" >"$build_fail_log" 2>&1
+build_one "$fixture_fail" "$fail_exe" "$build_fail_log"
 build_fail_status="$?"
 set -e
 

@@ -10,6 +10,11 @@ typedef struct ChengStrBridge {
     int32_t flags;
 } ChengStrBridge;
 
+typedef struct ChengErrorInfoBridgeCompat {
+    int32_t code;
+    ChengStrBridge msg;
+} ChengErrorInfoBridgeCompat;
+
 typedef struct ChengSeqHeader {
   int32_t len;
   int32_t cap;
@@ -40,6 +45,7 @@ void cheng_zero_mem_compat(void* dest, int32_t size);
 int32_t cheng_memcmp(void* a, void* b, int64_t n);
 int32_t cheng_strlen(char* s);
 int32_t cheng_strcmp(const char* a, const char* b);
+char* cheng_str_param_to_cstring_compat(void* raw);
 int32_t __cheng_str_eq(const char* a, const char* b);
 bool cheng_str_is_empty(const char* s);
 bool cheng_str_nonempty(const char* s);
@@ -83,12 +89,22 @@ void store_bool(void* p, int8_t val);
 int8_t load_bool(void* p);
 void store_ptr(void* p, void* val);
 void* load_ptr(void* p);
+ChengStrBridge load(const ChengStrBridge* p);
+void cheng_str_bridge_load_into(void* out_raw, const ChengStrBridge* p);
+void store(ChengStrBridge* p, ChengStrBridge val);
 void* cheng_ptr_seq_get_value(ChengSeqHeader seq, int32_t idx);
 void* cheng_ptr_seq_get_compat(ChengSeqHeader seq, int32_t idx);
 void cheng_ptr_seq_set_compat(ChengSeqHeader* seq_ptr, int32_t idx, void* value);
 void cheng_error_info_init_compat(ChengErrorInfoCompat* out, int32_t code, char* msg);
 int32_t cheng_error_info_code_compat(ChengErrorInfoCompat e);
 char* cheng_error_info_msg_compat(ChengErrorInfoCompat e);
+void cheng_error_info_bridge_ok(void* out_raw);
+void cheng_error_info_bridge_new(void* out_raw, ChengStrBridge msg);
+void cheng_error_info_bridge_copy(void* out_raw, int32_t code, ChengStrBridge msg);
+void cheng_error_info_bridge_copy_from(void* out_raw, ChengErrorInfoBridgeCompat src);
+int32_t cheng_error_info_bridge_code(ChengErrorInfoBridgeCompat src);
+void cheng_error_info_bridge_msg_into(void* out_raw, ChengErrorInfoBridgeCompat src);
+ChengStrBridge cheng_error_info_bridge_msg(ChengErrorInfoBridgeCompat src);
 int32_t cheng_seq_header_len_get(void* seq_ptr);
 void cheng_seq_header_len_set(void* seq_ptr, int32_t value);
 int32_t cheng_seq_header_cap_get(void* seq_ptr);
@@ -104,6 +120,8 @@ int32_t cheng_seq_string_elem_bytes_compat(void);
 void* cheng_seq_string_alloc_compat(int32_t buf_cap);
 void cheng_seq_string_init_compat(void* seq_ptr, int32_t seq_len, int32_t seq_cap);
 ChengSeqHeader cheng_new_seq_string_compat(int32_t seq_len, int32_t seq_cap);
+void cheng_seq_string_register_compat(void* seq_ptr);
+void cheng_seq_string_buffer_register_compat(void* buffer);
 void cheng_seq_free(void* seq_ptr);
 void cheng_seq_arc_retain(ChengSeqHeader seq);
 void cheng_seq_arc_release(ChengSeqHeader seq);

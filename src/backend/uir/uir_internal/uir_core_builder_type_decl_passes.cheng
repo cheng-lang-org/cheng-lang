@@ -64,6 +64,226 @@ fn uirCoreDebugFacadeTypeName(name: str): bool =
            name == "UirCoreStmtKind" || name == "UirCoreExprKind" ||
            name == "UirCoreCmpOp" || name == "UirCoreBinOp"
 
+fn uirCoreDebugNodeKindText(n: Node): str =
+    if n == nil:
+        return "nil"
+    return intToStr(int32(nodeKind(n)))
+
+fn uirCoreTypeDeclBool01(v: bool): str =
+    return v ? "1" : "0"
+
+fn uirCoreTypeDeclBracketDebugSuffix(defNode: Node): str =
+    if !astNodeIdValid(defNode) || nodeKind(defNode) != nkBracketExpr:
+        return ""
+    if kidCount(defNode) <= 0:
+        return " kids=" + intToStr(kidCount(defNode))
+    return " kids=" + intToStr(kidCount(defNode)) +
+           " base=" + backendStripSpaces(plainName(kid(defNode, 0)))
+
+fn uirCoreTypeDeclSeqStringDebugLine(mod: UirCoreModule, defNode: Node): str =
+    return "[backend] debug: typeDecl seq_string defKind=" + intToStr(int32(nodeKind(defNode))) +
+           uirCoreTypeDeclBracketDebugSuffix(defNode) +
+           " hasSeq=" + uirCoreTypeDeclBool01(uirCoreHasObjType(mod, "seq"))
+
+fn uirCoreTypeDeclTableStringDebugLine(mod: UirCoreModule, defNode: Node): str =
+    return "[backend] debug: typeDecl Table_string defKind=" + intToStr(int32(nodeKind(defNode))) +
+           uirCoreTypeDeclBracketDebugSuffix(defNode) +
+           " hasTable=" + uirCoreTypeDeclBool01(uirCoreHasObjType(mod, "Table"))
+
+fn uirCoreFieldTypeExplicitSeqFixedKey(fieldTypeNode: Node): str =
+    let sfiField: SeqFixedInit = seqFixedInitInfo(fieldTypeNode)
+    if sfiField.elemType == nil || sfiField.capExpr == nil:
+        return ""
+    return backendStripSpaces(typeKey(fieldTypeNode))
+
+fn uirCoreFieldTypeKeyForConsumeTypeDecl(mod: UirCoreModule, fieldTypeNode: Node,
+                                         looseFieldTypeKey: str, objFieldType: str): str =
+    let explicitKey: str = uirCoreFieldTypeExplicitSeqFixedKey(fieldTypeNode)
+    if len(explicitKey) > 0:
+        return explicitKey
+    let resolvedKey: str = backendStripSpaces(
+        uirCoreFieldTypeNodeResolvedKey(mod, fieldTypeNode, looseFieldTypeKey, objFieldType))
+    if len(resolvedKey) > 0:
+        return resolvedKey
+    return backendStripSpaces(plainName(fieldTypeNode))
+
+fn uirCoreFieldObjTypeFromFieldKey(mod: UirCoreModule, fieldTypeKey: str, isObjFieldValue: bool): str =
+    if !isObjFieldValue || len(fieldTypeKey) == 0:
+        return ""
+    if uirCoreHasObjType(mod, fieldTypeKey):
+        return fieldTypeKey
+    let uniqObjFromFieldKey: str = uirCoreFindObjTypeByBaseUnique(mod, fieldTypeKey)
+    if len(uniqObjFromFieldKey) > 0:
+        return uniqObjFromFieldKey
+    return uirCoreObjTypeFromTypeKey(mod, fieldTypeKey)
+
+fn uirCoreFieldObjTypeFromCachedNode(mod: UirCoreModule, fieldTypeNode: Node): str =
+    if !astNodeIdValid(fieldTypeNode) || !nodeTypeCacheValid(fieldTypeNode) || !astRefNonNil(nodeTypeCache(fieldTypeNode)):
+        return ""
+    return typeNodeObjTypeNameCore(mod, nodeTypeCache(fieldTypeNode))
+
+fn uirCoreFieldCachedKey(fieldTypeNode: Node): str =
+    if !astNodeIdValid(fieldTypeNode) || !nodeTypeCacheValid(fieldTypeNode) || !astRefNonNil(nodeTypeCache(fieldTypeNode)):
+        return ""
+    let cachedFieldTypeNode: Node = nodeTypeCache(fieldTypeNode)
+    let directKey: str = backendStripSpaces(typeKey(cachedFieldTypeNode))
+    if len(directKey) > 0:
+        return directKey
+    return backendStripSpaces(uirCoreTypeKeyFromNodeLoose(cachedFieldTypeNode))
+
+fn uirCoreFieldObjTypeFromCachedKey(mod: UirCoreModule, fieldTypeNode: Node): str =
+    let cachedFieldKey: str = uirCoreFieldCachedKey(fieldTypeNode)
+    if len(cachedFieldKey) == 0:
+        return ""
+    return uirCoreObjTypeFromTypeKey(mod, cachedFieldKey)
+
+fn uirCoreFieldObjTypeFromCurrentDecl(mod: UirCoreModule, fieldTypeNode: Node,
+                                      fieldTypeKey: str, isObjFieldValue: bool): str =
+    if typeNodeIsObjValue(mod, fieldTypeNode):
+        return ""
+    if len(uirCoreFieldObjTypeFromFieldKey(mod, fieldTypeKey, isObjFieldValue)) > 0:
+        return ""
+    if len(uirCoreFieldObjTypeFromCachedNode(mod, fieldTypeNode)) > 0:
+        return ""
+    if len(uirCoreFieldObjTypeFromCachedKey(mod, fieldTypeNode)) > 0:
+        return ""
+    return uirCoreObjTypeFromCurrentRootDecl(mod, fieldTypeKey)
+
+fn uirCoreFieldObjTypeForConsumeTypeDecl(mod: UirCoreModule, fieldTypeNode: Node,
+                                         fieldTypeKey: str, isObjFieldValue: bool): str =
+    let directObjFieldType: str = typeNodeObjTypeName(mod, fieldTypeNode)
+    if len(directObjFieldType) > 0:
+        return directObjFieldType
+    let objFromFieldKey: str = uirCoreFieldObjTypeFromFieldKey(mod, fieldTypeKey, isObjFieldValue)
+    if len(objFromFieldKey) > 0:
+        return objFromFieldKey
+    let objFromCachedNode: str = uirCoreFieldObjTypeFromCachedNode(mod, fieldTypeNode)
+    if len(objFromCachedNode) > 0:
+        return objFromCachedNode
+    let objFromCachedKey: str = uirCoreFieldObjTypeFromCachedKey(mod, fieldTypeNode)
+    if len(objFromCachedKey) > 0:
+        return objFromCachedKey
+    return uirCoreFieldObjTypeFromCurrentDecl(mod, fieldTypeNode, fieldTypeKey, isObjFieldValue)
+
+fn uirCoreFieldUsesCurrentDeclObjValue(mod: UirCoreModule, fieldTypeNode: Node,
+                                       fieldTypeKey: str, isObjFieldValue: bool): bool =
+    if isObjFieldValue:
+        return true
+    return len(uirCoreFieldObjTypeFromCurrentDecl(mod, fieldTypeNode, fieldTypeKey, isObjFieldValue)) > 0
+
+fn uirCoreTypeFieldDebugHasObj(mod: UirCoreModule, fieldTypeKey: str): bool =
+    if len(fieldTypeKey) == 0:
+        return false
+    return uirCoreHasObjType(mod, fieldTypeKey)
+
+fn uirCoreTypeFieldDebugObjFromKey(mod: UirCoreModule, fieldTypeKey: str): str =
+    if len(fieldTypeKey) == 0:
+        return ""
+    return uirCoreObjTypeFromTypeKey(mod, fieldTypeKey)
+
+fn uirCoreTypeFieldDebugDeclObjLike(fieldTypeKey: str): bool =
+    if len(fieldTypeKey) == 0 || !uirCoreCurrentParsedRootValid():
+        return false
+    let tdDbg0: Node = uirCoreFindTypeDeclByName(uirCore_currentParsedRoot, fieldTypeKey)
+    if !astNodeIdValid(tdDbg0):
+        return false
+    return uirCoreTypeDeclIsObjectLike(tdDbg0)
+
+fn uirCoreTypeFieldDebugMatchCount(mod: UirCoreModule, fieldTypeKey: str): int32 =
+    if len(fieldTypeKey) == 0:
+        return 0
+    var out: int32 = 0
+    for oiDbg0 in 0..<uirCoreModuleObjTypesLen(mod):
+        let otDbg0: UirCoreObjType = uirCoreModuleObjTypeAt(mod, oiDbg0)
+        if len(otDbg0.name) == 0 || !uirCoreObjTypeNameMatchesBaseAny(otDbg0.name, fieldTypeKey):
+            continue
+        out = out + 1
+    return out
+
+fn uirCoreTypeFieldDebugFirstMatchName(mod: UirCoreModule, fieldTypeKey: str): str =
+    if len(fieldTypeKey) == 0:
+        return ""
+    for oiDbg0 in 0..<uirCoreModuleObjTypesLen(mod):
+        let otDbg0: UirCoreObjType = uirCoreModuleObjTypeAt(mod, oiDbg0)
+        if len(otDbg0.name) == 0 || !uirCoreObjTypeNameMatchesBaseAny(otDbg0.name, fieldTypeKey):
+            continue
+        return otDbg0.name
+    return ""
+
+fn uirCoreTypeFieldDebugCachedType(fieldTypeNode: Node): str =
+    if !astNodeIdValid(fieldTypeNode) || !nodeTypeCacheValid(fieldTypeNode) || !astRefNonNil(nodeTypeCache(fieldTypeNode)):
+        return ""
+    return backendStripSpaces(plainName(nodeTypeCache(fieldTypeNode)))
+
+fn uirCoreTypeDeclDepKey(fieldTypeNode: Node): str =
+    if nodeKind(fieldTypeNode) == nkDotExpr && kidCount(fieldTypeNode) > 1:
+        return backendStripSpaces(typeKey(kid(fieldTypeNode, 1)))
+    return backendStripSpaces(typeKey(fieldTypeNode))
+
+fn uirCoreTypeDeclDepName(fieldTypeNode: Node): str =
+    let depKey: str = uirCoreTypeDeclDepKey(fieldTypeNode)
+    if len(depKey) > 0:
+        return depKey
+    return backendStripSpaces(plainName(fieldTypeNode))
+
+fn uirCoreTypeDeclPendingName(td: Node): str =
+    if !astNodeIdValid(td) || kidCount(td) <= 0:
+        return ""
+    let nn: Node = kid(td, 0)
+    if (nn == nil) || (nodeKind(nn) != nkIdent && nodeKind(nn) != nkSymbol):
+        return ""
+    return backendStripSpaces(plainName(nn))
+
+fn uirCoreTypeDeclPendingMsgTail(pending: Node[], i: int32, shown: int32): str =
+    if !(i < pending.len) || !(shown < 32):
+        return ""
+    let nm: str = uirCoreTypeDeclPendingName(pending[i])
+    if len(nm) > 0:
+        return " " + nm + uirCoreTypeDeclPendingMsgTail(pending, i + 1, shown + 1)
+    return uirCoreTypeDeclPendingMsgTail(pending, i + 1, shown)
+
+fn uirCoreTypeDeclPendingMsg(pending: Node[]): str =
+    return "uirCore_builder: unresolved type dependencies:" + uirCoreTypeDeclPendingMsgTail(pending, 0, 0)
+
+fn uirCorePredeclaredFilePath(): str =
+    return "<predeclared>"
+
+fn uirCoreNodeFilePathOrPredeclared(n: Node): str =
+    let filePath: str = nodeStrVal(n)
+    if len(filePath) > 0:
+        return filePath
+    return uirCorePredeclaredFilePath()
+
+fn uirCorePredeclareLoweringObjTypeNode(typeNode: Node, init: Node): Node =
+    if astNodeIdValid(typeNode) && nodeKind(typeNode) != nkEmpty:
+        return typeNode
+    if astNodeIdValid(init) && nodeKind(init) != nkEmpty &&
+       nodeTypeCacheValid(init) && astRefNonNil(nodeTypeCache(init)):
+        return nodeTypeCache(init)
+    return typeNode
+
+fn uirCorePredeclareLoweringObjTypeName(mod: UirCoreModule, typeNode: Node, init: Node): str =
+    let objTypeNode: Node = uirCorePredeclareLoweringObjTypeNode(typeNode, init)
+    if !astNodeIdValid(objTypeNode) || nodeKind(objTypeNode) == nkEmpty:
+        return ""
+    return typeNodeObjTypeName(mod, objTypeNode)
+
+fn uirCorePredeclareLoweringTypeKey(typeNode: Node, init: Node): str =
+    let objTypeNode: Node = uirCorePredeclareLoweringObjTypeNode(typeNode, init)
+    if astNodeIdValid(objTypeNode) && nodeKind(objTypeNode) != nkEmpty:
+        let objKey: str = backendStripSpaces(typeKey(objTypeNode))
+        if len(objKey) > 0:
+            return objKey
+        let looseObjKey: str = backendStripSpaces(uirCoreTypeKeyFromNodeLoose(objTypeNode))
+        if len(looseObjKey) > 0:
+            return looseObjKey
+    if astNodeIdValid(typeNode) && nodeKind(typeNode) != nkEmpty:
+        let typeKey0: str = backendStripSpaces(typeKey(typeNode))
+        if len(typeKey0) > 0:
+            return typeKey0
+        return backendStripSpaces(uirCoreTypeKeyFromNodeLoose(typeNode))
+    return ""
+
 fn uirCoreConsumeTypeDecl(mod: UirCoreModule, td: Node): Result[bool] =
     if !astNodeIdValid(td) || nodeKind(td) != nkTypeDecl || kidCount(td) < 2:
         return Err[bool]("uirCore_builder: invalid type decl")
@@ -85,50 +305,31 @@ fn uirCoreConsumeTypeDecl(mod: UirCoreModule, td: Node): Result[bool] =
     let dbgTypeNameFilter: str = os.getEnvDefault("BACKEND_DEBUG_TYPE_NAME", "")
     let dbgTypeNameHit: bool = len(dbgTypeNameFilter) > 0 && name == dbgTypeNameFilter
     if dbgTypeNameHit:
-        let dk0Dbg: str = ((defNode != nil)) ? intToStr(int32(nodeKind(defNode))) : "nil"
-        let dk1Dbg: str = ((defCore != nil)) ? intToStr(int32(nodeKind(defCore))) : "nil"
         os.writeLine(os.get_stderr(),
                      "[backend] debugTypeDecl: name=" + name +
-                     " defKind=nk#" + dk0Dbg +
-                     " defCoreKind=nk#" + dk1Dbg +
-                     " isRefLike=" + (isRefLike ? "1" : "0") +
-                     " isObjectLikeDef=" + (isObjectLikeDef ? "1" : "0"))
+                     " defKind=nk#" + uirCoreDebugNodeKindText(defNode) +
+                     " defCoreKind=nk#" + uirCoreDebugNodeKindText(defCore) +
+                     " isRefLike=" + uirCoreTypeDeclBool01(isRefLike) +
+                     " isObjectLikeDef=" + uirCoreTypeDeclBool01(isObjectLikeDef))
         os.c_fflush(os.get_stderr())
     let debugFacadeTypes: bool = (getEnv "BACKEND_DEBUG_UIR_FACADE" == "1") && uirCoreDebugFacadeTypeName(name)
     if debugFacadeTypes:
-        let dk0: str = ((defNode != nil)) ? intToStr(int32(nodeKind(defNode))) : "nil"
-        let dk1: str = ((defCore != nil)) ? intToStr(int32(nodeKind(defCore))) : "nil"
         echo("[backend] debugFacade: typeDecl name=" + name +
-             " defKind=nk#" + dk0 +
-             " defCoreKind=nk#" + dk1 +
-             " isRefLike=" + (isRefLike ? "1" : "0") +
-             " isObjectLikeDef=" + (isObjectLikeDef ? "1" : "0"))
+             " defKind=nk#" + uirCoreDebugNodeKindText(defNode) +
+             " defCoreKind=nk#" + uirCoreDebugNodeKindText(defCore) +
+             " isRefLike=" + uirCoreTypeDeclBool01(isRefLike) +
+             " isObjectLikeDef=" + uirCoreTypeDeclBool01(isObjectLikeDef))
     let traceTypes: bool = (getEnv "BACKEND_TRACE_TYPES" == "1")
     if traceTypes && (name == "__cheng_lambda_2_iter"):
         echo("[backend] trace: typeDecl " + name)
     if (getEnv "BACKEND_DEBUG_TYPES" == "1") && (name == "Node"):
-        let dk0: str = ((defNode != nil)) ? intToStr(int32(nodeKind(defNode))) : "nil"
-        let dk1: str = ((defCore != nil)) ? intToStr(int32(nodeKind(defCore))) : "nil"
-        let rf: str = isRefLike ? "1" : "0"
-        echo("[backend] debug: typeDecl Node defKind=nk#" + dk0 + " defCoreKind=nk#" + dk1 + " isRefLike=" + rf)
+        echo("[backend] debug: typeDecl Node defKind=nk#" + uirCoreDebugNodeKindText(defNode) +
+             " defCoreKind=nk#" + uirCoreDebugNodeKindText(defCore) +
+             " isRefLike=" + uirCoreTypeDeclBool01(isRefLike))
     if (getEnv "BACKEND_DEBUG_TYPES" == "1") && (name == "seq_string"):
-        let k: int32 = int32(nodeKind(defNode))
-        var line: str = "[backend] debug: typeDecl seq_string defKind=" + intToStr(k)
-        if astNodeIdValid(defNode) && nodeKind(defNode) == nkBracketExpr:
-            line = line + " kids=" + intToStr(kidCount(defNode))
-            if kidCount(defNode) > 0:
-                line = line + " base=" + backendStripSpaces(plainName(kid(defNode, 0)))
-        line = line + " hasSeq=" + (uirCoreHasObjType(mod, "seq") ? "1" : "0")
-        echo line
+        echo(uirCoreTypeDeclSeqStringDebugLine(mod, defNode))
     if (getEnv "BACKEND_DEBUG_TYPES" == "1") && (name == "Table_string"):
-        let k2: int32 = int32(nodeKind(defNode))
-        var line2: str = "[backend] debug: typeDecl Table_string defKind=" + intToStr(k2)
-        if astNodeIdValid(defNode) && nodeKind(defNode) == nkBracketExpr:
-            line2 = line2 + " kids=" + intToStr(kidCount(defNode))
-            if kidCount(defNode) > 0:
-                line2 = line2 + " base=" + backendStripSpaces(plainName(kid(defNode, 0)))
-        line2 = line2 + " hasTable=" + (uirCoreHasObjType(mod, "Table") ? "1" : "0")
-        echo line2
+        echo(uirCoreTypeDeclTableStringDebugLine(mod, defNode))
     if moduleHasFunc(mod, name) || moduleHasGlobal(mod, name):
         return Err[bool]("uirCore_builder: type name conflicts with global")
     let existingObj: int32 = uirCoreFindObjType(mod, name)
@@ -203,58 +404,11 @@ fn uirCoreConsumeTypeDecl(mod: UirCoreModule, td: Node): Result[bool] =
                 echo("[backend] trace: field '" + fieldName + "' rawLen=" + intToStr(len(rawFieldName)) +
                     " firstChar=" + intToStr(firstCode))
             let looseFieldTypeKey: str = uirCoreTypeKeyFromNodeLoose(fieldTypeNode)
-            var fieldTypeKey: str = ""
-            if astNodeIdValid(fieldTypeNode) && nodeKind(fieldTypeNode) == nkDotExpr && kidCount(fieldTypeNode) > 1:
-                fieldTypeKey = typeKey(kid(fieldTypeNode, 1))
-            else:
-                fieldTypeKey = typeKey(fieldTypeNode)
-            if len(fieldTypeKey) == 0:
-                fieldTypeKey = looseFieldTypeKey
-            if len(fieldTypeKey) == 0:
-                fieldTypeKey = backendStripSpaces(plainName(fieldTypeNode))
-            let sfiField: SeqFixedInit = seqFixedInitInfo(fieldTypeNode)
-            if sfiField.elemType != nil && sfiField.capExpr != nil:
-                let explicitKey: str = typeKey(fieldTypeNode)
-                if len(explicitKey) > 0:
-                    fieldTypeKey = explicitKey
-            var objFieldType: str = typeNodeObjTypeName(mod, fieldTypeNode)
-            if objFieldType == "seq" && uirCoreStrStartsWith(looseFieldTypeKey, "seq_"):
-                fieldTypeKey = looseFieldTypeKey
-            elif objFieldType == "Table" && uirCoreStrStartsWith(looseFieldTypeKey, "Table_"):
-                fieldTypeKey = looseFieldTypeKey
-            var isObjFieldValue: bool = typeNodeIsObjValue(mod, fieldTypeNode)
-            if len(objFieldType) == 0 && len(fieldTypeKey) > 0 && isObjFieldValue:
-                if uirCoreHasObjType(mod, fieldTypeKey):
-                    objFieldType = fieldTypeKey
-                else:
-                    let uniqObjFromFieldKey: str = uirCoreFindObjTypeByBaseUnique(mod, fieldTypeKey)
-                    if len(uniqObjFromFieldKey) > 0:
-                        objFieldType = uniqObjFromFieldKey
-                    else:
-                        let objFromFieldKey: str = uirCoreObjTypeFromTypeKey(mod, fieldTypeKey)
-                        if len(objFromFieldKey) > 0:
-                            objFieldType = objFromFieldKey
-            if len(objFieldType) == 0 && astNodeIdValid(fieldTypeNode) &&
-               nodeTypeCacheValid(fieldTypeNode) && astRefNonNil(nodeTypeCache(fieldTypeNode)):
-                let cachedFieldTypeNode: Node = nodeTypeCache(fieldTypeNode)
-                let objFromCachedType: str = typeNodeObjTypeNameCore(mod, cachedFieldTypeNode)
-                if len(objFromCachedType) > 0:
-                    objFieldType = objFromCachedType
-            if len(objFieldType) == 0 && astNodeIdValid(fieldTypeNode) &&
-               nodeTypeCacheValid(fieldTypeNode) && astRefNonNil(nodeTypeCache(fieldTypeNode)):
-                let cachedFieldTypeNode2: Node = nodeTypeCache(fieldTypeNode)
-                var cachedFieldKey: str = typeKey(cachedFieldTypeNode2)
-                if len(cachedFieldKey) == 0:
-                    cachedFieldKey = uirCoreTypeKeyFromNodeLoose(cachedFieldTypeNode2)
-                if len(cachedFieldKey) > 0:
-                    let objFromCachedKey: str = uirCoreObjTypeFromTypeKey(mod, cachedFieldKey)
-                    if len(objFromCachedKey) > 0:
-                        objFieldType = objFromCachedKey
-            if len(objFieldType) == 0 && len(fieldTypeKey) > 0:
-                let objFromCurrentDecl: str = uirCoreObjTypeFromCurrentRootDecl(mod, fieldTypeKey)
-                if len(objFromCurrentDecl) > 0:
-                    objFieldType = objFromCurrentDecl
-                    isObjFieldValue = true
+            let baseIsObjFieldValue: bool = typeNodeIsObjValue(mod, fieldTypeNode)
+            let directObjFieldType: str = typeNodeObjTypeName(mod, fieldTypeNode)
+            let fieldTypeKey: str = uirCoreFieldTypeKeyForConsumeTypeDecl(mod, fieldTypeNode, looseFieldTypeKey, directObjFieldType)
+            let objFieldType: str = uirCoreFieldObjTypeForConsumeTypeDecl(mod, fieldTypeNode, fieldTypeKey, baseIsObjFieldValue)
+            let isObjFieldValue: bool = uirCoreFieldUsesCurrentDeclObjValue(mod, fieldTypeNode, fieldTypeKey, baseIsObjFieldValue)
             if (getEnv "BACKEND_DEBUG_OVERLOAD_DOT" == "1") && name == "ProtoBuffer" && fieldName == "out":
                 echo("[backend] debugOverloadDot: computed fieldTypeKey type='ProtoBuffer' field='out' key='" + fieldTypeKey +
                      "' len=" + intToStr(len(fieldTypeKey)))
@@ -264,28 +418,6 @@ fn uirCoreConsumeTypeDecl(mod: UirCoreModule, td: Node): Result[bool] =
                 uirCoreObjFieldTypeKeyPut(name, fieldName, fieldTypeKey)
             let dbgTypeFieldFilter: str = getEnv "BACKEND_DEBUG_TYPE_FIELD"
             if len(dbgTypeFieldFilter) > 0 && dbgTypeFieldFilter == (name + "::" + fieldName):
-                var hasObjDbg0: bool = false
-                var objFromKeyDbg0: str = ""
-                var typeDeclObjLikeDbg0: bool = false
-                var matchCountDbg0: int32 = 0
-                var matchNameDbg0: str = ""
-                if len(fieldTypeKey) > 0:
-                    hasObjDbg0 = uirCoreHasObjType(mod, fieldTypeKey)
-                    objFromKeyDbg0 = uirCoreObjTypeFromTypeKey(mod, fieldTypeKey)
-                    if uirCoreCurrentParsedRootValid():
-                        let tdDbg0: Node = uirCoreFindTypeDeclByName(uirCore_currentParsedRoot, fieldTypeKey)
-                        if astNodeIdValid(tdDbg0):
-                            typeDeclObjLikeDbg0 = uirCoreTypeDeclIsObjectLike(tdDbg0)
-                    for oiDbg0 in 0..<uirCoreModuleObjTypesLen(mod):
-                        let otDbg0: UirCoreObjType = uirCoreModuleObjTypeAt(mod, oiDbg0)
-                        if len(otDbg0.name) == 0 || !uirCoreObjTypeNameMatchesBaseAny(otDbg0.name, fieldTypeKey):
-                            continue
-                        matchCountDbg0 = matchCountDbg0 + 1
-                        if len(matchNameDbg0) == 0:
-                            matchNameDbg0 = otDbg0.name
-                var cachedTypeDbg0: str = ""
-                if astNodeIdValid(fieldTypeNode) && nodeTypeCacheValid(fieldTypeNode) && astRefNonNil(nodeTypeCache(fieldTypeNode)):
-                    cachedTypeDbg0 = backendStripSpaces(plainName(nodeTypeCache(fieldTypeNode)))
                 let entryDbg0: str = uirCoreObjFieldTypeKeyDebugEntry(name, fieldName)
                 echo("[backend] debugTypeField: key='" + dbgTypeFieldFilter +
                      "' nodeKind=nk#" + intToStr(int32(nodeKind(fieldTypeNode))) +
@@ -295,18 +427,18 @@ fn uirCoreConsumeTypeDecl(mod: UirCoreModule, td: Node): Result[bool] =
                      "' plain='" + backendStripSpaces(plainName(fieldTypeNode)) +
                      "' fieldTypeKey='" + fieldTypeKey +
                      "' objFieldType='" + objFieldType +
-                     "' hasObjTypeKey=" + (hasObjDbg0 ? "1" : "0") +
-                     "' objFromFieldKey='" + objFromKeyDbg0 +
-                     "' typeDeclObjLike=" + (typeDeclObjLikeDbg0 ? "1" : "0") +
-                     "' matchCount=" + intToStr(matchCountDbg0) +
-                     "' matchName='" + matchNameDbg0 +
-                     "' cachedType='" + cachedTypeDbg0 +
+                     "' hasObjTypeKey=" + uirCoreTypeDeclBool01(uirCoreTypeFieldDebugHasObj(mod, fieldTypeKey)) +
+                     "' objFromFieldKey='" + uirCoreTypeFieldDebugObjFromKey(mod, fieldTypeKey) +
+                     "' typeDeclObjLike=" + uirCoreTypeDeclBool01(uirCoreTypeFieldDebugDeclObjLike(fieldTypeKey)) +
+                     "' matchCount=" + intToStr(uirCoreTypeFieldDebugMatchCount(mod, fieldTypeKey)) +
+                     "' matchName='" + uirCoreTypeFieldDebugFirstMatchName(mod, fieldTypeKey) +
+                     "' cachedType='" + uirCoreTypeFieldDebugCachedType(fieldTypeNode) +
                       "' entry='" + entryDbg0 +
-                     "' isObjValue=" + (isObjFieldValue ? "1" : "0") + "'")
+                     "' isObjValue=" + uirCoreTypeDeclBool01(isObjFieldValue) + "'")
             if (getEnv "BACKEND_DEBUG_TYPES" == "1") && (name == "EcKeyPair"):
                 echo("[backend] debugTypes: type=" + name + " field=" + fieldName +
                      " fieldTypeKey='" + fieldTypeKey + "' objFieldType='" + objFieldType +
-                     "' isObjValue=" + (isObjFieldValue ? "1" : "0"))
+                     "' isObjValue=" + uirCoreTypeDeclBool01(isObjFieldValue))
             if len(objFieldType) > 0 && isObjFieldValue && uirCoreHasObjType(mod, objFieldType):
                 uirCoreInlineObjFieldTypePut(name, fieldName, objFieldType)
                 let inner: UirCoreObjType = uirCoreGetObjType(mod, objFieldType)
@@ -325,12 +457,7 @@ fn uirCoreConsumeTypeDecl(mod: UirCoreModule, td: Node): Result[bool] =
                 continue
             if (fieldTypeNode != nil) && (nodeKind(fieldTypeNode) == nkIdent || nodeKind(fieldTypeNode) == nkSymbol || nodeKind(fieldTypeNode) == nkBracketExpr ||
                nodeKind(fieldTypeNode) == nkDotExpr):
-                var depKey: str = ""
-                if nodeKind(fieldTypeNode) == nkDotExpr && kidCount(fieldTypeNode) > 1:
-                    depKey = typeKey(kid(fieldTypeNode, 1))
-                else:
-                    depKey = typeKey(fieldTypeNode)
-                let depName: str = (len(depKey) > 0) ? depKey : backendStripSpaces(plainName(fieldTypeNode))
+                let depName: str = uirCoreTypeDeclDepName(fieldTypeNode)
                 if len(depName) > 0 && !isBuiltinTypeName(depName):
                     let depAlias: UirCoreType = uirCoreTryGetTypeAlias(mod, depName)
                     if !uirCoreHasObjType(mod, depName) && depAlias.kind == mtVoid:
@@ -497,21 +624,7 @@ fn uirCoreConsumeTypeDecls(mod: UirCoreModule, root: Node, allowPendingUnresolve
         if !progressed:
             if allowPendingUnresolved:
                 return Ok[bool](true)
-            var msg: str = "uirCore_builder: unresolved type dependencies:"
-            var shown: int32 = 0
-            for i3 in 0..<pending.len:
-                if !(shown < 32):
-                    break
-                let td2: Node = pending[i3]
-                var nm2: str = ""
-                if astNodeIdValid(td2) && kidCount(td2) > 0:
-                    let nn: Node = kid(td2, 0)
-                    if (nn != nil) && (nodeKind(nn) == nkIdent || nodeKind(nn) == nkSymbol):
-                        nm2 = backendStripSpaces(plainName(nn))
-                if len(nm2) > 0:
-                    msg = msg + " " + nm2
-                    shown = shown + 1
-            return Err[bool](msg)
+            return Err[bool](uirCoreTypeDeclPendingMsg(pending))
         pending = next
         pass = pass + 1
     return Ok[bool](false)
@@ -519,7 +632,6 @@ fn uirCoreConsumeTypeDecls(mod: UirCoreModule, root: Node, allowPendingUnresolve
 fn uirCorePredeclareGlobalsForTypes(mod: UirCoreModule, root: Node) =
     if (mod == nil) || (root == nil):
         return
-    let preFile: str = "<predeclared>"
     var queue: Node[]
     uir_core_builder_type_decl_passes_add(queue, root)
     while queue.len > 0:
@@ -580,14 +692,13 @@ fn uirCorePredeclareGlobalsForTypes(mod: UirCoreModule, root: Node) =
                     declTy = uirCoreTypeI32()
             else:
                 declTy = uirCoreTypeI64()
-        uirCoreAddGlobal(mod, name, declTy, initVal, hasInit, preFile)
+        uirCoreAddGlobal(mod, name, declTy, initVal, hasInit, uirCorePredeclaredFilePath())
         if astNodeIdValid(typeNode) && nodeKind(typeNode) != nkEmpty:
             uirCoreGlobalTypeKeyPut(name, typeKey(typeNode))
 
 fn uirCorePredeclareGlobalsForLowering(mod: UirCoreModule, root: Node) =
     if (mod == nil) || (root == nil):
         return
-    let preFile: str = "<predeclared>"
     var queue: Node[]
     uir_core_builder_type_decl_passes_add(queue, root)
     while queue.len > 0:
@@ -621,31 +732,22 @@ fn uirCorePredeclareGlobalsForLowering(mod: UirCoreModule, root: Node) =
         if len(rawName) == 0:
             continue
         let debugDot: bool = (getEnv "BACKEND_DEBUG_DOT" == "1")
-        let filePath: str = (len(nodeStrVal(n)) > 0) ? nodeStrVal(n) : preFile
+        let filePath: str = uirCoreNodeFilePathOrPredeclared(n)
         if debugDot && rawName == "baseIdentity":
-            var typeKindDbg: str = "nil"
-            if (typeNode != nil):
-                typeKindDbg = intToStr(int32(nodeKind(typeNode)))
             echo("[backend] debugDot: predeclareLowering rawName='" + rawName +
-                 "' file='" + filePath + "' typeKind=nk#" + typeKindDbg + "'")
+                 "' file='" + filePath + "' typeKind=nk#" + uirCoreDebugNodeKindText(typeNode) + "'")
         let name: str = uirCoreMaybeMangleDupGlobalName(rawName, filePath)
         if moduleHasFunc(mod, name) || moduleHasGlobal(mod, name) ||
            uirCoreFindTypeAlias(mod, name) >= 0 || uirCoreFindObjType(mod, name) >= 0:
             continue
         var declType: UirCoreType = uirCoreTypeFromNodeWithModule(mod, typeNode)
-        var objTypeName: str = ""
-        var objTypeNode: Node = typeNode
-        if (!astNodeIdValid(objTypeNode) || nodeKind(objTypeNode) == nkEmpty) && astNodeIdValid(init) && nodeKind(init) != nkEmpty &&
-           nodeTypeCacheValid(init) && astRefNonNil(nodeTypeCache(init)):
-            objTypeNode = nodeTypeCache(init)
-        if astNodeIdValid(objTypeNode) && nodeKind(objTypeNode) != nkEmpty:
-            objTypeName = typeNodeObjTypeName(mod, objTypeNode)
+        let objTypeNode: Node = uirCorePredeclareLoweringObjTypeNode(typeNode, init)
+        let objTypeName: str = uirCorePredeclareLoweringObjTypeName(mod, typeNode, init)
         let isObj: bool = len(objTypeName) > 0 && (objTypeNode != nil) && typeNodeIsObjValue(mod, objTypeNode)
         if debugDot && rawName == "baseIdentity":
-            let objNodeKindDbg: str = (objTypeNode != nil) ? intToStr(int32(nodeKind(objTypeNode))) : "nil"
             echo("[backend] debugDot: predeclareLowering name='" + name +
-                 "' objTypeName='" + objTypeName + "' isObj=" + (isObj ? "1" : "0") +
-                 " objNodeKind=nk#" + objNodeKindDbg + "'")
+                 "' objTypeName='" + objTypeName + "' isObj=" + uirCoreTypeDeclBool01(isObj) +
+                 " objNodeKind=nk#" + uirCoreDebugNodeKindText(objTypeNode) + "'")
         if isObj:
             uirCoreGlobalObjTypePut(name, objTypeName)
             declType = uirCoreTypeI64()
@@ -673,15 +775,7 @@ fn uirCorePredeclareGlobalsForLowering(mod: UirCoreModule, root: Node) =
             elif nodeKind(initCore) == nkNilLit:
                 hasInit = true
                 initVal = 0
-        uirCoreAddGlobal(mod, name, declType, initVal, hasInit, preFile)
-        var keyOut: str = ""
-        if astNodeIdValid(objTypeNode) && nodeKind(objTypeNode) != nkEmpty:
-            keyOut = typeKey(objTypeNode)
-            if len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(objTypeNode)
-        elif astNodeIdValid(typeNode) && nodeKind(typeNode) != nkEmpty:
-            keyOut = typeKey(typeNode)
-            if len(keyOut) == 0:
-                keyOut = uirCoreTypeKeyFromNodeLoose(typeNode)
+        uirCoreAddGlobal(mod, name, declType, initVal, hasInit, uirCorePredeclaredFilePath())
+        let keyOut: str = uirCorePredeclareLoweringTypeKey(typeNode, init)
         if len(keyOut) > 0:
             uirCoreGlobalTypeKeyPut(name, keyOut)

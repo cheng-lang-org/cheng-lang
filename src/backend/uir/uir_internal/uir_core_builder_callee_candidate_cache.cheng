@@ -16,6 +16,7 @@ var
     uirCoreCalleeCandidateKeys: str[]
     uirCoreCalleeCandidateStart: int32[]
     uirCoreCalleeCandidateLen: int32[]
+    uirCoreCalleeCandidateCap: int32[]
     uirCoreCalleeCandidateFuncLen: int32[]
     uirCoreCalleeCandidatePool: int32[]
     uirCoreCalleeCandidateIndex: hashmaps.HashMapStrInt
@@ -25,6 +26,13 @@ var
     uirCoreCalleeCandidateModuleFuncLen: int32
     uirCoreCalleeCandidateIndexReady: bool
     uirCoreCalleeCandidatesReady: bool
+    uirCoreCalleeCandidateRecentModule: UirCoreModule
+    uirCoreCalleeCandidateRecentFuncLen: int32
+    uirCoreCalleeCandidateRecentBase: str
+    uirCoreCalleeCandidateRecentBasePtr: int64
+    uirCoreCalleeCandidateRecentStart: int32
+    uirCoreCalleeCandidateRecentLen: int32
+    uirCoreCalleeCandidateRecentValid: bool
 
 fn uirCoreChengMarker(): str =
     return "__cheng_"
@@ -34,6 +42,20 @@ fn uirCoreCalleeCandidateAppendStr(seqInst: var str[], value: str) =
 
 fn uirCoreCalleeCandidateAppendInt(seqInst: var int32[], value: int32) =
     uir_core_builder_callee_candidate_cache_add(seqInst, value)
+
+fn uirCoreCalleeCandidateNextCap(minCap0: int32): int32 =
+    var minCap: int32 = minCap0
+    if minCap < 1:
+        minCap = 1
+    var cap: int32 = 4
+    while cap < minCap:
+        if cap < 1024:
+            cap = cap * 2
+        else:
+            cap = cap + (cap / 2)
+        if cap < 0:
+            return minCap
+    return cap
 
 fn uirCoreCalleeCandidateFind(baseName: str): int32 =
     if len(baseName) == 0:
@@ -47,6 +69,7 @@ fn uirCoreCalleeCandidateFind(baseName: str): int32 =
                 let idxPtr: int32 = rawPtr - 1
                 if idxPtr >= 0 && idxPtr < uirCoreCalleeCandidateStart.len &&
                    idxPtr < uirCoreCalleeCandidateLen.len &&
+                   idxPtr < uirCoreCalleeCandidateCap.len &&
                    idxPtr < uirCoreCalleeCandidateFuncLen.len:
                     return idxPtr
         var found: bool = false
@@ -55,6 +78,7 @@ fn uirCoreCalleeCandidateFind(baseName: str): int32 =
             let idx: int32 = raw - 1
             if idx >= 0 && idx < uirCoreCalleeCandidateStart.len &&
                idx < uirCoreCalleeCandidateLen.len &&
+               idx < uirCoreCalleeCandidateCap.len &&
                idx < uirCoreCalleeCandidateFuncLen.len:
                 if ptrKey != 0:
                     hashmaps.hashMapPtrIntPut(uirCoreCalleeCandidatePtrIndex, ptrKey, raw)
@@ -81,6 +105,46 @@ fn uirCoreCalleeCandidateCopyOut(start: int32, n: int32): int32[] =
         out[i] = uirCoreCalleeCandidatePool[start + i]
     return out
 
+fn uirCoreCalleeCandidateRecentBaseMatches(mod: UirCoreModule, baseName: str): bool =
+    if mod == nil || len(baseName) == 0 || !uirCoreCalleeCandidateRecentValid:
+        return false
+    if uirCoreCalleeCandidateRecentModule != mod:
+        return false
+    if uirCoreCalleeCandidateRecentFuncLen != uirCoreModuleFuncsLen(mod):
+        return false
+    let ptrKey: int64 = uirCoreTypeKeyObjNamePtrKey(baseName)
+    if ptrKey != 0 && uirCoreCalleeCandidateRecentBasePtr != 0:
+        return uirCoreCalleeCandidateRecentBasePtr == ptrKey
+    return uirCoreCalleeCandidateRecentBase == baseName
+
+fn uirCoreCalleeCandidateRecentTry(mod: UirCoreModule, baseName: str,
+                                   start: var int32, n: var int32,
+                                   handled: var bool): bool =
+    handled = false
+    if !uirCoreCalleeCandidateRecentBaseMatches(mod, baseName):
+        return false
+    handled = true
+    let spanStart: int32 = uirCoreCalleeCandidateRecentStart
+    let spanLen: int32 = uirCoreCalleeCandidateRecentLen
+    if spanStart < 0 || spanLen <= 0 || spanStart + spanLen > uirCoreCalleeCandidatePool.len:
+        return false
+    start = spanStart
+    n = spanLen
+    return true
+
+fn uirCoreCalleeCandidateRecentRemember(mod: UirCoreModule, baseName: str, start: int32, n: int32) =
+    if mod == nil || len(baseName) == 0:
+        return
+    if n > 0 && (start < 0 || start + n > uirCoreCalleeCandidatePool.len):
+        return
+    uirCoreCalleeCandidateRecentModule = mod
+    uirCoreCalleeCandidateRecentFuncLen = uirCoreModuleFuncsLen(mod)
+    uirCoreCalleeCandidateRecentBase = baseName
+    uirCoreCalleeCandidateRecentBasePtr = uirCoreTypeKeyObjNamePtrKey(baseName)
+    uirCoreCalleeCandidateRecentStart = start
+    uirCoreCalleeCandidateRecentLen = n
+    uirCoreCalleeCandidateRecentValid = true
+
 fn uirCoreCalleeCandidateSpan(baseName: str, start: var int32, n: var int32): bool =
     start = -1
     n = 0
@@ -100,6 +164,20 @@ fn uirCoreCalleeCandidateSpan(baseName: str, start: var int32, n: var int32): bo
     start = spanStart
     n = spanLen
     return true
+
+fn uirCoreCalleeCandidateKeyFreshAtLen(cacheIdx: int32, funcsLen: int32): bool =
+    if cacheIdx < 0 || funcsLen < 0:
+        return false
+    if cacheIdx >= uirCoreCalleeCandidateFuncLen.len:
+        return false
+    return uirCoreCalleeCandidateFuncLen[cacheIdx] == funcsLen
+
+fn uirCoreCalleeCandidateKeyMarkFreshAtLen(cacheIdx: int32, funcsLen: int32) =
+    if cacheIdx < 0 || funcsLen < 0:
+        return
+    if cacheIdx >= uirCoreCalleeCandidateFuncLen.len:
+        return
+    uirCoreCalleeCandidateFuncLen[cacheIdx] = funcsLen
 
 fn uirCoreFuncNameCouldExposeBestBaseLocal(fnName0: str, base0: str): bool =
     let baseLen: int32 = len(base0)
@@ -125,6 +203,7 @@ fn uirCoreFuncNameCouldExposeBestBaseLocal(fnName0: str, base0: str): bool =
 fn uirCoreCalleeCandidateAppendedFuncsAffectBase(mod: UirCoreModule, baseName: str): bool =
     if mod == nil || len(baseName) == 0:
         return false
+    let baseLen: int32 = strLenFast(baseName)
     let cachedLen: int32 = uirCoreCalleeCandidateModuleFuncLen
     let funcLen: int32 = uirCoreModuleFuncsLen(mod)
     if funcLen <= cachedLen:
@@ -134,9 +213,10 @@ fn uirCoreCalleeCandidateAppendedFuncsAffectBase(mod: UirCoreModule, baseName: s
         if f == nil:
             continue
         let fnName0: str = uirCoreFuncNameForCacheLocal(f)
-        if len(fnName0) == 0:
+        let fnNameLen: int32 = strLenFast(fnName0)
+        if fnNameLen == 0:
             continue
-        if uirCoreFuncNameMatchesBaseAny(fnName0, baseName):
+        if uirCoreFuncNameMatchesBaseAnyWithLen(fnName0, fnNameLen, baseName, baseLen):
             return true
         if uirCoreFuncNameCouldExposeBestBaseLocal(fnName0, baseName):
             return true
@@ -144,13 +224,47 @@ fn uirCoreCalleeCandidateAppendedFuncsAffectBase(mod: UirCoreModule, baseName: s
 
 fn uirCoreCalleeCandidateSpanFresh(mod: UirCoreModule, baseName: str, start: var int32, n: var int32): bool =
     uirCoreCalleeCandidatesEnsure(mod)
-    if uirCoreCalleeCandidateSpan(baseName, start, n):
+    if mod != nil && len(baseName) > 0:
+        let funcsLen: int32 = uirCoreModuleFuncsLen(mod)
+        let cacheIdx0: int32 = uirCoreCalleeCandidateFind(baseName)
+        if !uirCoreCalleeCandidateCacheFresh(mod) && !uirCoreCalleeCandidateRecentBaseMatches(mod, baseName):
+            let spanReady0: bool =
+                cacheIdx0 >= 0 &&
+                uirCoreCalleeCandidateSpan(baseName, uirCoreCalleeCandidateRecentStart, uirCoreCalleeCandidateRecentLen)
+            if spanReady0 && !uirCoreCalleeCandidateAppendedFuncsAffectBase(mod, baseName):
+                uirCoreCalleeCandidateKeyMarkFreshAtLen(cacheIdx0, funcsLen)
+            elif spanReady0:
+                uirCoreCalleeCandidatesAppendRange(mod, uirCoreCalleeCandidateModuleFuncLen)
+                let cacheIdx1: int32 = uirCoreCalleeCandidateFind(baseName)
+                if cacheIdx1 >= 0:
+                    uirCoreCalleeCandidateKeyMarkFreshAtLen(cacheIdx1, uirCoreModuleFuncsLen(mod))
+            elif !uirCoreCalleeCandidateAppendedFuncsAffectBase(mod, baseName):
+                if cacheIdx0 >= 0:
+                    uirCoreCalleeCandidateKeyMarkFreshAtLen(cacheIdx0, funcsLen)
+            else:
+                uirCoreCalleeCandidatesBuild(mod)
+    var recentHandled: bool = false
+    if uirCoreCalleeCandidateRecentTry(mod, baseName, start, n, recentHandled):
+        return true
+    if recentHandled:
+        return false
+    if uirCoreCalleeCandidateSpan(baseName, uirCoreCalleeCandidateRecentStart, uirCoreCalleeCandidateRecentLen):
+        let cacheIdx: int32 = uirCoreCalleeCandidateFind(baseName)
+        if mod != nil && cacheIdx >= 0:
+            uirCoreCalleeCandidateKeyMarkFreshAtLen(cacheIdx, uirCoreModuleFuncsLen(mod))
+        uirCoreCalleeCandidateRecentRemember(mod, baseName,
+                                             uirCoreCalleeCandidateRecentStart,
+                                             uirCoreCalleeCandidateRecentLen)
+        start = uirCoreCalleeCandidateRecentStart
+        n = uirCoreCalleeCandidateRecentLen
         return true
     if mod != nil:
-        if !uirCoreCalleeCandidateAppendedFuncsAffectBase(mod, baseName):
+        let cacheIdx: int32 = uirCoreCalleeCandidateFind(baseName)
+        if cacheIdx >= 0 && uirCoreCalleeCandidateKeyFreshAtLen(cacheIdx, uirCoreModuleFuncsLen(mod)):
+            uirCoreCalleeCandidateRecentRemember(mod, baseName, -1, 0)
             return false
-        uirCoreCalleeCandidatesBuild(mod)
-        return uirCoreCalleeCandidateSpan(baseName, start, n)
+        uirCoreCalleeCandidateRecentRemember(mod, baseName, -1, 0)
+        return false
     return false
 
 fn uirCoreCalleeCandidateCacheFresh(mod: UirCoreModule): bool =
@@ -164,24 +278,38 @@ fn uirCoreCalleeCandidateCacheFresh(mod: UirCoreModule): bool =
 
 fn uirCoreCalleeCandidateAppendSpanIdx(cacheIdx: int32, idx: int32) =
     if idx < 0 || cacheIdx < 0 || cacheIdx >= uirCoreCalleeCandidateLen.len ||
-       cacheIdx >= uirCoreCalleeCandidateStart.len || cacheIdx >= uirCoreCalleeCandidateFuncLen.len:
+       cacheIdx >= uirCoreCalleeCandidateStart.len || cacheIdx >= uirCoreCalleeCandidateCap.len ||
+       cacheIdx >= uirCoreCalleeCandidateFuncLen.len:
         return
     let oldLen: int32 = uirCoreCalleeCandidateLen[cacheIdx]
     if oldLen <= 0:
-        uirCoreCalleeCandidateStart[cacheIdx] = uirCoreCalleeCandidatePool.len
-        uirCoreCalleeCandidateAppendInt(uirCoreCalleeCandidatePool, idx)
+        let newCap0: int32 = uirCoreCalleeCandidateNextCap(1)
+        let newStart0: int32 = uirCoreCalleeCandidatePool.len
+        setLen(uirCoreCalleeCandidatePool, newStart0 + newCap0)
+        uirCoreCalleeCandidatePool[newStart0] = idx
+        uirCoreCalleeCandidateStart[cacheIdx] = newStart0
         uirCoreCalleeCandidateLen[cacheIdx] = 1
+        uirCoreCalleeCandidateCap[cacheIdx] = newCap0
         uirCoreCalleeCandidateFuncLen[cacheIdx] = uirCoreCalleeCandidateModuleFuncLen
         return
     let oldStart: int32 = uirCoreCalleeCandidateStart[cacheIdx]
-    if oldStart < 0 || oldStart + oldLen > uirCoreCalleeCandidatePool.len:
+    let oldCap: int32 = uirCoreCalleeCandidateCap[cacheIdx]
+    if oldStart < 0 || oldCap < oldLen || oldStart + oldCap > uirCoreCalleeCandidatePool.len:
         return
+    if oldLen < oldCap:
+        uirCoreCalleeCandidatePool[oldStart + oldLen] = idx
+        uirCoreCalleeCandidateLen[cacheIdx] = oldLen + 1
+        uirCoreCalleeCandidateFuncLen[cacheIdx] = uirCoreCalleeCandidateModuleFuncLen
+        return
+    let newCap: int32 = uirCoreCalleeCandidateNextCap(oldLen + 1)
     let newStart: int32 = uirCoreCalleeCandidatePool.len
+    setLen(uirCoreCalleeCandidatePool, newStart + newCap)
     for i in 0..<oldLen:
-        uirCoreCalleeCandidateAppendInt(uirCoreCalleeCandidatePool, uirCoreCalleeCandidatePool[oldStart + i])
-    uirCoreCalleeCandidateAppendInt(uirCoreCalleeCandidatePool, idx)
+        uirCoreCalleeCandidatePool[newStart + i] = uirCoreCalleeCandidatePool[oldStart + i]
+    uirCoreCalleeCandidatePool[newStart + oldLen] = idx
     uirCoreCalleeCandidateStart[cacheIdx] = newStart
     uirCoreCalleeCandidateLen[cacheIdx] = oldLen + 1
+    uirCoreCalleeCandidateCap[cacheIdx] = newCap
     uirCoreCalleeCandidateFuncLen[cacheIdx] = uirCoreCalleeCandidateModuleFuncLen
 
 fn uirCoreCalleeCandidateAppendKeyIdx(baseName: str, idx: int32): int32 =
@@ -274,11 +402,13 @@ fn uirCoreCalleeCandidatesReset(mod: UirCoreModule = nil, modFuncHint: int32 = 0
     setLen(uirCoreCalleeCandidateKeys, 0)
     setLen(uirCoreCalleeCandidateStart, 0)
     setLen(uirCoreCalleeCandidateLen, 0)
+    setLen(uirCoreCalleeCandidateCap, 0)
     setLen(uirCoreCalleeCandidateFuncLen, 0)
     setLen(uirCoreCalleeCandidatePool, 0)
     reserve(uirCoreCalleeCandidateKeys, cap)
     reserve(uirCoreCalleeCandidateStart, cap)
     reserve(uirCoreCalleeCandidateLen, cap)
+    reserve(uirCoreCalleeCandidateCap, cap)
     reserve(uirCoreCalleeCandidateFuncLen, cap)
     reserve(uirCoreCalleeCandidatePool, cap * 4)
     uirCoreCalleeCandidateIndex = hashmaps.hashMapStrIntInit(mapCap)
@@ -288,6 +418,13 @@ fn uirCoreCalleeCandidatesReset(mod: UirCoreModule = nil, modFuncHint: int32 = 0
     uirCoreCalleeCandidateModuleFuncLen = (mod != nil) ? uirCoreModuleFuncsLen(mod) : 0
     uirCoreCalleeCandidateIndexReady = true
     uirCoreCalleeCandidatesReady = true
+    uirCoreCalleeCandidateRecentModule = nil
+    uirCoreCalleeCandidateRecentFuncLen = -1
+    uirCoreCalleeCandidateRecentBase = ""
+    uirCoreCalleeCandidateRecentBasePtr = 0
+    uirCoreCalleeCandidateRecentStart = -1
+    uirCoreCalleeCandidateRecentLen = 0
+    uirCoreCalleeCandidateRecentValid = false
 
 fn uirCoreCalleeCandidateEnsureKeyIdx(baseName: str): int32 =
     if len(baseName) == 0:
@@ -298,6 +435,7 @@ fn uirCoreCalleeCandidateEnsureKeyIdx(baseName: str): int32 =
     uirCoreCalleeCandidateAppendStr(uirCoreCalleeCandidateKeys, baseName)
     uirCoreCalleeCandidateAppendInt(uirCoreCalleeCandidateStart, 0)
     uirCoreCalleeCandidateAppendInt(uirCoreCalleeCandidateLen, 0)
+    uirCoreCalleeCandidateAppendInt(uirCoreCalleeCandidateCap, 0)
     uirCoreCalleeCandidateAppendInt(uirCoreCalleeCandidateFuncLen, uirCoreCalleeCandidateModuleFuncLen)
     let newIdx: int32 = uirCoreCalleeCandidateKeys.len - 1
     if uirCoreCalleeCandidateIndexReady:
@@ -480,6 +618,7 @@ fn uirCoreCalleeCandidatesBuild(mod: UirCoreModule) =
     var totalPoolLen: int32 = 0
     for ki in 0..<uirCoreCalleeCandidateKeys.len:
         uirCoreCalleeCandidateStart[ki] = totalPoolLen
+        uirCoreCalleeCandidateCap[ki] = uirCoreCalleeCandidateLen[ki]
         totalPoolLen = totalPoolLen + uirCoreCalleeCandidateLen[ki]
     if totalPoolLen > 0:
         reserve(uirCoreCalleeCandidatePool, totalPoolLen)
@@ -504,8 +643,6 @@ fn uirCoreCalleeCandidatesEnsure(mod: UirCoreModule) =
        uirCoreCalleeCandidateModuleFuncLen > funcLen:
         uirCoreCalleeCandidatesBuild(mod)
         return
-    if uirCoreCalleeCandidateModuleFuncLen < funcLen:
-        uirCoreCalleeCandidatesAppendRange(mod, uirCoreCalleeCandidateModuleFuncLen)
 
 fn uirCoreCalleeCandidatesGet(mod: UirCoreModule, baseName: str): int32[] =
     var out: int32[]

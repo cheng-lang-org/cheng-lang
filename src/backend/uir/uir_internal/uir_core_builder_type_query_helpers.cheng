@@ -7,6 +7,7 @@ import backend/uir/uir_internal/uir_core_builder_scope_helpers
 import backend/uir/uir_internal/uir_core_builder_text_helpers
 import backend/uir/uir_internal/uir_core_builder_string_utils
 import backend/uir/uir_internal/uir_core_builder_scalar_key_helpers
+import backend/uir/uir_internal/uir_core_builder_type_key_helpers
 import backend/uir/uir_internal/uir_core_builder_obj_local_state
 import backend/uir/uir_internal/uir_core_builder_module_lookup_cache
 import backend/uir/uir_internal/uir_core_builder_reachability_scan
@@ -39,12 +40,9 @@ fn uirCoreIntBitsDefault32(): int32 =
         return 64
     return 32
 
-fn uirCoreTypeFromNode(n: Node): UirCoreType =
-    if !astNodeIdValid(n) || nodeKind(n) == nkEmpty:
-        return uirCoreTypeI32()
-    if nodeKind(n) == nkPtrTy || nodeKind(n) == nkRefTy || nodeKind(n) == nkFnTy || nodeKind(n) == nkSetTy || nodeKind(n) == nkVarTy || nodeKind(n) == nkTupleTy:
-        return uirCoreTypeI64()
-    let name: str = backendStripSpaces(plainName(n))
+fn uirCoreTypeFromCanonicalNameOrDefault(name: str, defaultTy: UirCoreType): UirCoreType =
+    if len(name) == 0:
+        return defaultTy
     if name == "void":
         return uirCoreTypeVoid()
     if name == "tuple" || uirCoreStrStartsWith(name, "tuple_"):
@@ -85,55 +83,29 @@ fn uirCoreTypeFromNode(n: Node): UirCoreType =
         return uirCoreTypeU32()
     if uirCoreStrStartsWith(name, "set_"):
         return uirCoreTypeU64()
-    if uirCoreStrStartsWith(name, "seq_"):
+    if uirCoreKeyHasSeqPrefix(name) || uirCoreKeyHasSeqFixedPrefix(name) || uirCoreKeyHasTablePrefix(name):
         return uirCoreTypeI64()
-    if isStringOrPtrKey(name):
+    if isStringOrPtrKeyCanon(name):
         return uirCoreTypeI64()
-    return uirCoreTypeI32()
+    if uirCoreKeyHasPtrPrefix(name) || uirCoreKeyHasRefPrefix(name) || uirCoreKeyHasFnPrefix(name):
+        return uirCoreTypeI64()
+    return defaultTy
+
+fn uirCoreTypeFromNode(n: Node): UirCoreType =
+    if !astNodeIdValid(n) || nodeKind(n) == nkEmpty:
+        return uirCoreTypeI32()
+    let k: NodeKind = nodeKind(n)
+    if k == nkPtrTy || k == nkRefTy || k == nkFnTy || k == nkSetTy || k == nkVarTy || k == nkTupleTy:
+        return uirCoreTypeI64()
+    let name: str =
+        (k == nkIdent || k == nkSymbol) ? typeNodeCanonicalName(n) : backendStripSpaces(plainName(n))
+    return uirCoreTypeFromCanonicalNameOrDefault(name, uirCoreTypeI32())
 
 fn uirCoreTypeFromTypeKeyName(key0: str): UirCoreType =
     if len(key0) == 0:
         return uirCoreTypeI64()
     let key: str = backendStripSpaces(key0)
-    if key == "void":
-        return uirCoreTypeVoid()
-    if key == "float64" || key == "float":
-        return uirCoreTypeF64()
-    if key == "float32":
-        return uirCoreTypeF32()
-    if key == "bool" || key == "char":
-        return uirCoreTypeU8()
-    if key == "int8" || key == "i8":
-        return uirCoreTypeI8()
-    if key == "uint8" || key == "u8":
-        return uirCoreTypeU8()
-    if key == "int16" || key == "i16":
-        return uirCoreTypeI16()
-    if key == "uint16" || key == "u16":
-        return uirCoreTypeU16()
-    if key == "int32" || key == "i32":
-        return uirCoreTypeI32()
-    if key == "uint32" || key == "u32":
-        return uirCoreTypeU32()
-    if key == "int64" || key == "i64":
-        return uirCoreTypeI64()
-    if key == "uint64" || key == "u64":
-        return uirCoreTypeU64()
-    if key == "int" || key == "NI":
-        let bits: int32 = uirCoreIntBitsDefault32()
-        return (bits == 64) ? uirCoreTypeI64() : uirCoreTypeI32()
-    if key == "uint" || key == "NU":
-        let bits2: int32 = uirCoreIntBitsDefault32()
-        return (bits2 == 64) ? uirCoreTypeU64() : uirCoreTypeU32()
-    if isStringOrPtrKey(key):
-        return uirCoreTypeI64()
-    if uirCoreStrStartsWith(key, "ptr_") || uirCoreStrStartsWith(key, "ref_") || uirCoreStrStartsWith(key, "fn_"):
-        return uirCoreTypeI64()
-    if uirCoreStrStartsWith(key, "seq_") || uirCoreStrStartsWith(key, "seq_fixed_") || uirCoreStrStartsWith(key, "Table_"):
-        return uirCoreTypeI64()
-    if uirCoreStrStartsWith(key, "set_"):
-        return uirCoreTypeU64()
-    return uirCoreTypeI64()
+    return uirCoreTypeFromCanonicalNameOrDefault(key, uirCoreTypeI64())
 
 fn uirCoreLooksLikeTypeParamName(name0: str): bool =
     let name: str = backendStripSpaces(name0)
@@ -170,14 +142,20 @@ fn uirCoreBuiltinTypeNameSize(name0: str): int32 =
     return -1
 
 fn uirCoreTypeFromNodeWithModule(module: UirCoreModule, n: Node): UirCoreType =
+    if !astNodeIdValid(n) || n == nil:
+        return uirCoreTypeI32()
+    let k: NodeKind = nodeKind(n)
+    if (module == nil) || (k != nkIdent && k != nkSymbol):
+        return uirCoreTypeFromNode(n)
+    let name: str = typeNodeCanonicalName(n)
+    let aliasTy: UirCoreType = uirCoreTryGetTypeAlias(module, name)
+    if aliasTy.kind != mtVoid:
+        return aliasTy
+    if k == nkIdent || k == nkSymbol:
+        return uirCoreTypeFromCanonicalNameOrDefault(name, uirCoreTypeI32())
     let ty: UirCoreType = uirCoreTypeFromNode(n)
-    if (module == nil) || (n == nil):
+    if module == nil:
         return ty
-    if nodeKind(n) == nkIdent || nodeKind(n) == nkSymbol:
-        let name: str = backendStripSpaces(plainName(n))
-        let aliasTy: UirCoreType = uirCoreTryGetTypeAlias(module, name)
-        if aliasTy.kind != mtVoid:
-            return aliasTy
     return ty
 
 fn inferExprType(env: LocalEnv, n: Node, fallback: UirCoreType): UirCoreType =

@@ -219,6 +219,10 @@ void cheng_seq_header_buffer_set(void *seq_ptr, void *value) {
   seq->buffer = value;
 }
 
+static int32_t cheng_seq_elem_size_compat_get(void *key_ptr, int32_t fallback);
+static void cheng_seq_elem_size_compat_register(void *seq_ptr, void *buffer, int32_t elem_size);
+static void cheng_seq_elem_size_compat_unregister(void *seq_ptr, void *buffer);
+
 void cheng_seq_grow_to_raw(void **p_buffer, int32_t *p_cap, int32_t min_cap, int32_t elem_size) {
   if (p_buffer == NULL || p_cap == NULL || min_cap <= 0 || elem_size <= 0) {
     return;
@@ -288,13 +292,15 @@ void cheng_seq_grow_inst(void *seq_ptr, int32_t min_cap, int32_t elem_size) {
     return;
   }
   ChengSeqHeader *seq_hdr = (ChengSeqHeader *)seq_ptr;
+  int32_t actual_elem_size = cheng_seq_elem_size_compat_get(seq_ptr, elem_size);
   int32_t buf_cap = seq_hdr->cap;
   void *raw_buffer = seq_hdr->buffer;
   if (raw_buffer == NULL || min_cap > buf_cap) {
-    cheng_seq_grow_to_raw(&raw_buffer, &buf_cap, min_cap, elem_size);
+    cheng_seq_grow_to_raw(&raw_buffer, &buf_cap, min_cap, actual_elem_size);
     seq_hdr->buffer = raw_buffer;
     seq_hdr->cap = buf_cap;
   }
+  cheng_seq_elem_size_compat_register(seq_ptr, seq_hdr->buffer, actual_elem_size);
 }
 
 int32_t cheng_seq_string_init_cap(int32_t seq_len, int32_t seq_cap) {
@@ -308,11 +314,94 @@ int32_t cheng_seq_string_init_cap(int32_t seq_len, int32_t seq_cap) {
   return base_cap;
 }
 
+int32_t cheng_seq_string_elem_bytes_compat(void) {
+  int32_t base = (int32_t)sizeof(void *) + 3 * (int32_t)sizeof(int32_t);
+  int32_t align = (int32_t)sizeof(void *);
+  int32_t rem = (align > 0) ? (base % align) : 0;
+  return rem == 0 ? base : (base + (align - rem));
+}
+
+#define CHENG_SEQ_ELEM_SIZE_COMPAT_CAP 4096u
+static uintptr_t cheng_seq_elem_size_compat_keys[CHENG_SEQ_ELEM_SIZE_COMPAT_CAP];
+static int32_t cheng_seq_elem_size_compat_vals[CHENG_SEQ_ELEM_SIZE_COMPAT_CAP];
+
+static uint32_t cheng_seq_elem_size_compat_slot(uintptr_t key) {
+  return (uint32_t)((key >> 3u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u));
+}
+
+static void cheng_seq_elem_size_compat_put(void *key_ptr, int32_t elem_size) {
+  uintptr_t key = (uintptr_t)key_ptr;
+  if (key == 0 || elem_size <= 0) return;
+  uint32_t slot = cheng_seq_elem_size_compat_slot(key);
+  for (uint32_t scanned = 0; scanned < CHENG_SEQ_ELEM_SIZE_COMPAT_CAP; ++scanned) {
+    uintptr_t cur_key = cheng_seq_elem_size_compat_keys[slot];
+    if (cur_key == 0 || cur_key == key) {
+      cheng_seq_elem_size_compat_keys[slot] = key;
+      cheng_seq_elem_size_compat_vals[slot] = elem_size;
+      return;
+    }
+    slot = (slot + 1u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u);
+  }
+}
+
+static int32_t cheng_seq_elem_size_compat_get(void *key_ptr, int32_t fallback) {
+  uintptr_t key = (uintptr_t)key_ptr;
+  if (key == 0) return fallback;
+  uint32_t slot = cheng_seq_elem_size_compat_slot(key);
+  for (uint32_t scanned = 0; scanned < CHENG_SEQ_ELEM_SIZE_COMPAT_CAP; ++scanned) {
+    uintptr_t cur_key = cheng_seq_elem_size_compat_keys[slot];
+    if (cur_key == 0) return fallback;
+    if (cur_key == key) {
+      int32_t value = cheng_seq_elem_size_compat_vals[slot];
+      return value > 0 ? value : fallback;
+    }
+    slot = (slot + 1u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u);
+  }
+  return fallback;
+}
+
+static void cheng_seq_elem_size_compat_del(void *key_ptr) {
+  uintptr_t key = (uintptr_t)key_ptr;
+  if (key == 0) return;
+  uint32_t slot = cheng_seq_elem_size_compat_slot(key);
+  for (uint32_t scanned = 0; scanned < CHENG_SEQ_ELEM_SIZE_COMPAT_CAP; ++scanned) {
+    uintptr_t cur_key = cheng_seq_elem_size_compat_keys[slot];
+    if (cur_key == 0) return;
+    if (cur_key == key) {
+      cheng_seq_elem_size_compat_keys[slot] = 0;
+      cheng_seq_elem_size_compat_vals[slot] = 0;
+      return;
+    }
+    slot = (slot + 1u) & (CHENG_SEQ_ELEM_SIZE_COMPAT_CAP - 1u);
+  }
+}
+
+static void cheng_seq_elem_size_compat_register(void *seq_ptr, void *buffer, int32_t elem_size) {
+  cheng_seq_elem_size_compat_put(seq_ptr, elem_size);
+  cheng_seq_elem_size_compat_put(buffer, elem_size);
+}
+
+static void cheng_seq_elem_size_compat_unregister(void *seq_ptr, void *buffer) {
+  cheng_seq_elem_size_compat_del(seq_ptr);
+  cheng_seq_elem_size_compat_del(buffer);
+}
+
+void cheng_seq_string_register_compat(void *seq_ptr) {
+  ChengSeqHeader *seq_hdr = (ChengSeqHeader *)seq_ptr;
+  int32_t elem_size = cheng_seq_string_elem_bytes_compat();
+  if (seq_hdr == NULL) return;
+  cheng_seq_elem_size_compat_register(seq_ptr, seq_hdr->buffer, elem_size);
+}
+
+void cheng_seq_string_buffer_register_compat(void *buffer) {
+  cheng_seq_elem_size_compat_put(buffer, cheng_seq_string_elem_bytes_compat());
+}
+
 void *cheng_seq_string_alloc_compat(int32_t buf_cap) {
   if (buf_cap <= 0) {
     return NULL;
   }
-  int32_t total_bytes = buf_cap * (int32_t)sizeof(void *);
+  int32_t total_bytes = buf_cap * cheng_seq_string_elem_bytes_compat();
   void *raw_buffer = realloc(NULL, (size_t)total_bytes);
   if (raw_buffer == NULL) {
     abort();
@@ -334,6 +423,7 @@ void cheng_seq_string_init_compat(void *seq_ptr, int32_t seq_len, int32_t seq_ca
   seq_hdr->buffer = raw_buffer;
   seq_hdr->cap = buf_cap;
   seq_hdr->len = seq_len;
+  cheng_seq_string_register_compat(seq_ptr);
 }
 
 ChengSeqHeader cheng_new_seq_string_compat(int32_t seq_len, int32_t seq_cap) {
@@ -350,9 +440,11 @@ void cheng_seq_free(void *seq_ptr) {
     return;
   }
   ChengSeqHeader *seq_hdr = (ChengSeqHeader *)seq_ptr;
+  void *old_buffer = seq_hdr->buffer;
   if (seq_hdr->buffer != NULL) {
     cheng_mem_release(seq_hdr->buffer);
   }
+  cheng_seq_elem_size_compat_unregister(seq_ptr, old_buffer);
   seq_hdr->buffer = NULL;
   seq_hdr->len = 0;
   seq_hdr->cap = 0;
@@ -455,10 +547,32 @@ typedef struct ChengStrBridge {
   int32_t flags;
 } ChengStrBridge;
 
+typedef struct ChengErrorInfoBridgeCompat {
+  int32_t code;
+  ChengStrBridge msg;
+} ChengErrorInfoBridgeCompat;
+
 enum {
   CHENG_STR_BRIDGE_FLAG_NONE = 0,
   CHENG_STR_BRIDGE_FLAG_OWNED = 1,
 };
+
+static bool cheng_probably_valid_str_bridge(const ChengStrBridge *s) {
+  if (s == NULL) return false;
+  if (s->len < 0 || s->len > (1 << 28)) return false;
+  if ((s->flags & ~CHENG_STR_BRIDGE_FLAG_OWNED) != 0) return false;
+  if (s->ptr == NULL) return s->len == 0;
+  return cheng_probably_valid_ptr(s->ptr);
+}
+
+char *cheng_str_param_to_cstring_compat(void *raw) {
+  uintptr_t raw_addr = (uintptr_t)raw;
+  if (raw == NULL) return NULL;
+  if (raw_addr < (uintptr_t)65536) return NULL;
+  if ((raw_addr & (uintptr_t)(sizeof(void *) - 1)) != 0) return (char *)raw;
+  if (!cheng_probably_valid_str_bridge((const ChengStrBridge *)raw)) return (char *)raw;
+  return NULL;
+}
 
 extern void uirEmitObjFromModuleOrPanic(ChengSeqHeader *out, void *module, int32_t optLevel,
                                         const char *target, const char *objWriter,
@@ -491,6 +605,8 @@ static const char **cheng_saved_argv = NULL;
 static ChengStrMetaEntry *cheng_strmeta_entries = NULL;
 static int32_t cheng_strmeta_len = 0;
 static int32_t cheng_strmeta_cap = 0;
+static ChengStrMetaEntry *cheng_strmeta_table = NULL;
+static int32_t cheng_strmeta_table_cap = 0;
 static volatile int cheng_strmeta_lock = 0;
 
 static int driver_c_diag_enabled(void);
@@ -804,7 +920,97 @@ static void cheng_strmeta_release(void) {
   __sync_lock_release(&cheng_strmeta_lock);
 }
 
+#define CHENG_STRMETA_RECENT_SLOTS 8u
+static CHENG_THREAD_LOCAL const char *cheng_strmeta_recent_ptrs[CHENG_STRMETA_RECENT_SLOTS];
+static CHENG_THREAD_LOCAL size_t cheng_strmeta_recent_lens[CHENG_STRMETA_RECENT_SLOTS];
+static CHENG_THREAD_LOCAL unsigned char cheng_strmeta_recent_valids[CHENG_STRMETA_RECENT_SLOTS];
+
+static size_t cheng_strmeta_hash_ptr(const char *ptr) {
+  size_t raw = (size_t)(const void *)ptr;
+  raw ^= raw >> 17;
+  raw ^= raw >> 9;
+  raw *= (size_t)1315423911u;
+  return raw;
+}
+
+static size_t cheng_strmeta_recent_slot(const char *ptr) {
+  return cheng_strmeta_hash_ptr(ptr) & (CHENG_STRMETA_RECENT_SLOTS - 1u);
+}
+
+static int cheng_strmeta_recent_get(const char *ptr, size_t *out_len) {
+  if (ptr == NULL) {
+    return 0;
+  }
+  size_t slot = cheng_strmeta_recent_slot(ptr);
+  if (!cheng_strmeta_recent_valids[slot] || cheng_strmeta_recent_ptrs[slot] != ptr) {
+    return 0;
+  }
+  if (out_len != NULL) *out_len = cheng_strmeta_recent_lens[slot];
+  return 1;
+}
+
+static void cheng_strmeta_recent_put(const char *ptr, size_t len) {
+  if (ptr == NULL) {
+    return;
+  }
+  size_t slot = cheng_strmeta_recent_slot(ptr);
+  cheng_strmeta_recent_ptrs[slot] = ptr;
+  cheng_strmeta_recent_lens[slot] = len;
+  cheng_strmeta_recent_valids[slot] = 1u;
+}
+
+static int cheng_strmeta_probe_table_snapshot(const char *ptr, ChengStrMetaEntry *table,
+                                              int32_t table_cap, size_t *out_len) {
+  if (ptr == NULL || table == NULL || table_cap <= 0) {
+    return 0;
+  }
+  size_t slot = cheng_strmeta_hash_ptr(ptr) % (size_t)table_cap;
+  for (int32_t probes = 0; probes < table_cap; ++probes) {
+    const char *entry_ptr = __atomic_load_n(&table[slot].ptr, __ATOMIC_ACQUIRE);
+    if (entry_ptr == ptr) {
+      if (out_len != NULL) *out_len = (size_t)table[slot].len;
+      return 1;
+    }
+    if (entry_ptr == NULL) {
+      return 0;
+    }
+    slot = (slot + 1u) % (size_t)table_cap;
+  }
+  return 0;
+}
+
+static int cheng_strmeta_reserve_table_unlocked(int32_t need_len) {
+  int32_t next_cap = cheng_strmeta_table_cap;
+  ChengStrMetaEntry *next_table = NULL;
+  if (need_len < 1) need_len = 1;
+  if (next_cap < 256) next_cap = 256;
+  while ((int64_t)need_len * 10 >= (int64_t)next_cap * 7) {
+    next_cap *= 2;
+  }
+  if (cheng_strmeta_table != NULL && next_cap <= cheng_strmeta_table_cap) {
+    return 1;
+  }
+  next_table = (ChengStrMetaEntry *)calloc((size_t)next_cap, sizeof(ChengStrMetaEntry));
+  if (next_table == NULL) {
+    return 0;
+  }
+  for (int32_t i = 0; i < cheng_strmeta_len; ++i) {
+    const char *entry_ptr = cheng_strmeta_entries[i].ptr;
+    size_t slot = 0;
+    if (entry_ptr == NULL) continue;
+    slot = cheng_strmeta_hash_ptr(entry_ptr) % (size_t)next_cap;
+    while (next_table[slot].ptr != NULL && next_table[slot].ptr != entry_ptr) {
+      slot = (slot + 1u) % (size_t)next_cap;
+    }
+    next_table[slot] = cheng_strmeta_entries[i];
+  }
+  __atomic_store_n(&cheng_strmeta_table, next_table, __ATOMIC_RELEASE);
+  __atomic_store_n(&cheng_strmeta_table_cap, next_cap, __ATOMIC_RELEASE);
+  return 1;
+}
+
 static void cheng_strmeta_put(const char *ptr, int32_t len) {
+  int have_slot = 0;
   if (ptr == NULL || len < 0) return;
   cheng_strmeta_acquire();
   if (cheng_strmeta_len >= cheng_strmeta_cap) {
@@ -820,8 +1026,23 @@ static void cheng_strmeta_put(const char *ptr, int32_t len) {
     cheng_strmeta_entries[cheng_strmeta_len].ptr = ptr;
     cheng_strmeta_entries[cheng_strmeta_len].len = len;
     cheng_strmeta_len += 1;
+    have_slot = 1;
+  }
+  if (have_slot) {
+    if (!cheng_strmeta_reserve_table_unlocked(cheng_strmeta_len)) {
+      __atomic_store_n(&cheng_strmeta_table, NULL, __ATOMIC_RELEASE);
+      __atomic_store_n(&cheng_strmeta_table_cap, 0, __ATOMIC_RELEASE);
+    } else {
+      size_t slot = cheng_strmeta_hash_ptr(ptr) % (size_t)cheng_strmeta_table_cap;
+      while (cheng_strmeta_table[slot].ptr != NULL && cheng_strmeta_table[slot].ptr != ptr) {
+        slot = (slot + 1u) % (size_t)cheng_strmeta_table_cap;
+      }
+      cheng_strmeta_table[slot].len = len;
+      __atomic_store_n(&cheng_strmeta_table[slot].ptr, ptr, __ATOMIC_RELEASE);
+    }
   }
   cheng_strmeta_release();
+  cheng_strmeta_recent_put(ptr, (size_t)len);
 }
 
 CHENG_SHIM_WEAK void cheng_register_string_meta(const char *ptr, int32_t len) {
@@ -830,13 +1051,34 @@ CHENG_SHIM_WEAK void cheng_register_string_meta(const char *ptr, int32_t len) {
 
 static int cheng_strmeta_get(const char *ptr, size_t *out_len) {
   if (ptr == NULL) return 0;
+  if (cheng_strmeta_recent_get(ptr, out_len)) {
+    return 1;
+  }
+  int32_t table_cap_snapshot = __atomic_load_n(&cheng_strmeta_table_cap, __ATOMIC_ACQUIRE);
+  ChengStrMetaEntry *table_snapshot = __atomic_load_n(&cheng_strmeta_table, __ATOMIC_ACQUIRE);
+  if (cheng_strmeta_probe_table_snapshot(ptr, table_snapshot, table_cap_snapshot, out_len)) {
+    cheng_strmeta_recent_put(ptr, (out_len != NULL) ? *out_len : 0u);
+    return 1;
+  }
   int found = 0;
   cheng_strmeta_acquire();
-  for (int32_t i = cheng_strmeta_len - 1; i >= 0; --i) {
-    if (cheng_strmeta_entries[i].ptr == ptr) {
-      if (out_len != NULL) *out_len = (size_t)cheng_strmeta_entries[i].len;
+  if (cheng_strmeta_table != NULL && cheng_strmeta_table_cap > 0) {
+    size_t found_len = 0u;
+    if (cheng_strmeta_probe_table_snapshot(ptr, cheng_strmeta_table, cheng_strmeta_table_cap, &found_len)) {
+      if (out_len != NULL) *out_len = found_len;
+      cheng_strmeta_recent_put(ptr, found_len);
       found = 1;
-      break;
+    }
+  }
+  if (!found) {
+    for (int32_t i = cheng_strmeta_len - 1; i >= 0; --i) {
+      if (cheng_strmeta_entries[i].ptr == ptr) {
+        size_t len = (size_t)cheng_strmeta_entries[i].len;
+        if (out_len != NULL) *out_len = len;
+        cheng_strmeta_recent_put(ptr, len);
+        found = 1;
+        break;
+      }
     }
   }
   cheng_strmeta_release();
@@ -884,7 +1126,7 @@ CHENG_SHIM_WEAK int32_t driver_c_backend_usage(void) {
   fputs("  --skip-global-init --runtime-obj:<path> --runtime-c:<path> --no-runtime-c\n", stderr);
   fputs("  --generic-mode:<dict> --generic-spec-budget:<N>\n", stderr);
   fputs("  --borrow-ir:<mir|stage1> --generic-lowering:<mir_dict>\n", stderr);
-  fputs("  --abi:<v2_noptr> --android-api:<N> --compile-stamp-out:<path>\n", stderr);
+  fputs("  --android-api:<N> --compile-stamp-out:<path>\n", stderr);
   fputs("  --profile --no-profile --uir-profile --no-uir-profile\n", stderr);
   fputs("  --uir-simd --no-uir-simd --uir-simd-max-width:<N> --uir-simd-policy:<name>\n", stderr);
   return 0;
@@ -1809,51 +2051,6 @@ static int driver_c_runtime_resolve_self_path(char *out, size_t out_cap) {
   return 0;
 }
 
-static const char *driver_c_default_proof_surface_hint(char *out, size_t out_cap) {
-  const char *hint = getenv("BACKEND_PROOF_SURFACE_ORIGIN");
-  if (hint != NULL && hint[0] != '\0') return hint;
-  if (!driver_c_runtime_resolve_self_path(out, out_cap)) return NULL;
-  return out;
-}
-
-static const char *driver_c_default_proof_sidecar_compiler(void) {
-  static const char *currentsrc_stage0 =
-      "/Users/lbcheng/cheng-lang/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof";
-  static const char *preferred =
-      "/Users/lbcheng/cheng-lang/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng";
-  static const char *legacy =
-      "/Users/lbcheng/cheng-lang/artifacts/backend_selfhost_self_obj/probe_proofseed14/cheng_stage0_proofseed14";
-  char self_path[PATH_MAX];
-  const char *proof_surface = driver_c_default_proof_surface_hint(self_path, sizeof(self_path));
-  if (proof_surface == NULL) return NULL;
-  if (!driver_c_runtime_path_contains(
-          proof_surface,
-          "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2") &&
-      !driver_c_runtime_path_contains(
-          proof_surface,
-          "/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage3.witness") &&
-      !driver_c_runtime_path_contains(
-          proof_surface,
-          "/artifacts/backend_driver/cheng")) {
-    return NULL;
-  }
-  if (access(currentsrc_stage0, X_OK) == 0) return currentsrc_stage0;
-  if (access(preferred, X_OK) == 0) return preferred;
-  if (access(legacy, X_OK) == 0) return legacy;
-  return NULL;
-}
-
-static void driver_c_apply_default_proof_sidecar_compiler(void) {
-  const char *env = getenv("BACKEND_UIR_SIDECAR_COMPILER");
-  const char *fallback = NULL;
-  if (env != NULL && env[0] != '\0') return;
-  fallback = driver_c_default_proof_sidecar_compiler();
-  if (fallback != NULL && fallback[0] != '\0') {
-    setenv("BACKEND_UIR_SIDECAR_COMPILER", fallback, 0);
-    driver_c_diagf("[driver_c_apply_default_proof_sidecar_compiler] default='%s'\n", fallback);
-  }
-}
-
 static int32_t driver_c_sidecar_builds_requested(void) {
   const char *prefer_env = getenv("BACKEND_UIR_PREFER_SIDECAR");
   if (prefer_env != NULL && prefer_env[0] != '\0') {
@@ -2044,10 +2241,6 @@ CHENG_SHIM_WEAK void *driver_c_build_module_stage1_direct(const char *input_path
     driver_c_diagf("[driver_c_build_module_stage1_direct] weak_sidecar_module=%p\n", module);
     if (module != NULL) return module;
   }
-  if (sidecar_disabled != 0) {
-    driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_disabled skip_sidecar\n");
-    return NULL;
-  }
   {
     cheng_build_active_module_ptrs_fn build_active_module_ptrs_fn =
         (cheng_build_active_module_ptrs_fn)driver_c_lookup_runtime_symbol(
@@ -2060,6 +2253,10 @@ CHENG_SHIM_WEAK void *driver_c_build_module_stage1_direct(const char *input_path
       driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_sidecar_module=%p\n", module);
       if (module != NULL) return module;
     }
+  }
+  if (sidecar_disabled != 0) {
+    driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_disabled skip_sidecar\n");
+    return NULL;
   }
   {
     cheng_build_active_module_ptrs_fn sidecar_build_fn =
@@ -2257,6 +2454,38 @@ int32_t cheng_strlen(char *s) {
   const char *safe = cheng_safe_cstr((const char *)s);
   n = strlen(safe);
   return (n > (size_t)INT32_MAX) ? INT32_MAX : (int32_t)n;
+}
+
+CHENG_SHIM_WEAK int32_t cheng_cstrlen(const char *s) {
+  return cheng_strlen((char *)s);
+}
+
+CHENG_SHIM_WEAK int32_t min(int32_t a, int32_t b) {
+  return (a < b) ? a : b;
+}
+
+CHENG_SHIM_WEAK ChengStrBridge load(const ChengStrBridge *p) {
+  ChengStrBridge out;
+  memset(&out, 0, sizeof(out));
+  if (p != NULL) {
+    out = *p;
+  }
+  return out;
+}
+
+CHENG_SHIM_WEAK void cheng_str_bridge_load_into(void *out_raw, const ChengStrBridge *p) {
+  ChengStrBridge *out = (ChengStrBridge *)out_raw;
+  if (out == NULL) {
+    return;
+  }
+  *out = load(p);
+}
+
+CHENG_SHIM_WEAK void store(ChengStrBridge *p, ChengStrBridge val) {
+  if (p == NULL) {
+    return;
+  }
+  *p = val;
 }
 
 int32_t cheng_strcmp(char *a, char *b) {
@@ -2656,12 +2885,14 @@ char * __cheng_rt_programBaseNameCopy(void) {
 }
 
 void *cheng_seq_get(void *buffer, int32_t len, int32_t idx, int32_t elem_size) {
-  if (!buffer || idx < 0 || idx >= len || elem_size <= 0) return NULL;
-  return (void *)((char *)buffer + ((size_t)idx * (size_t)elem_size));
+  int32_t actual_elem_size = cheng_seq_elem_size_compat_get(buffer, elem_size);
+  if (!buffer || idx < 0 || idx >= len || actual_elem_size <= 0) return NULL;
+  return (void *)((char *)buffer + ((size_t)idx * (size_t)actual_elem_size));
 }
 
 void *cheng_seq_set(void *buffer, int32_t len, int32_t idx, int32_t elem_size) {
-  return cheng_seq_get(buffer, len, idx, elem_size);
+  int32_t actual_elem_size = cheng_seq_elem_size_compat_get(buffer, elem_size);
+  return cheng_seq_get(buffer, len, idx, actual_elem_size);
 }
 
 void *cheng_ptr_seq_get_value(ChengSeqHeader seq, int32_t idx) {
@@ -2695,6 +2926,47 @@ int32_t cheng_error_info_code_compat(ChengErrorInfoCompat e) {
 
 char *cheng_error_info_msg_compat(ChengErrorInfoCompat e) {
   return e.msg;
+}
+
+CHENG_SHIM_WEAK void cheng_error_info_bridge_ok(void *out_raw) {
+  if (!out_raw) return;
+  ChengErrorInfoBridgeCompat *out = (ChengErrorInfoBridgeCompat *)out_raw;
+  out->code = 0;
+  out->msg = cheng_str_bridge_empty();
+}
+
+CHENG_SHIM_WEAK void cheng_error_info_bridge_new(void *out_raw, ChengStrBridge msg) {
+  if (!out_raw) return;
+  ChengErrorInfoBridgeCompat *out = (ChengErrorInfoBridgeCompat *)out_raw;
+  out->code = 0;
+  out->msg = msg;
+}
+
+CHENG_SHIM_WEAK void cheng_error_info_bridge_copy(void *out_raw, int32_t code, ChengStrBridge msg) {
+  if (!out_raw) return;
+  ChengErrorInfoBridgeCompat *out = (ChengErrorInfoBridgeCompat *)out_raw;
+  out->code = code;
+  out->msg = msg;
+}
+
+CHENG_SHIM_WEAK void cheng_error_info_bridge_copy_from(void *out_raw, ChengErrorInfoBridgeCompat src) {
+  if (!out_raw) return;
+  ChengErrorInfoBridgeCompat *out = (ChengErrorInfoBridgeCompat *)out_raw;
+  *out = src;
+}
+
+CHENG_SHIM_WEAK int32_t cheng_error_info_bridge_code(ChengErrorInfoBridgeCompat src) {
+  return src.code;
+}
+
+CHENG_SHIM_WEAK void cheng_error_info_bridge_msg_into(void *out_raw, ChengErrorInfoBridgeCompat src) {
+  if (!out_raw) return;
+  ChengStrBridge *out = (ChengStrBridge *)out_raw;
+  *out = src.msg;
+}
+
+CHENG_SHIM_WEAK ChengStrBridge cheng_error_info_bridge_msg(ChengErrorInfoBridgeCompat src) {
+  return src.msg;
 }
 
 #define CHENG_FUNC_PTR_SHADOW_CAP 4096u
@@ -2894,18 +3166,19 @@ int32_t cheng_machine_inst_cond(void *inst) {
 }
 
 void *cheng_seq_set_grow(void *seq_ptr, int32_t idx, int32_t elem_size) {
-  if (!seq_ptr || elem_size <= 0) return cheng_seq_get(NULL, 0, idx, elem_size);
+  int32_t actual_elem_size = cheng_seq_elem_size_compat_get(seq_ptr, elem_size);
+  if (!seq_ptr || actual_elem_size <= 0) return cheng_seq_get(NULL, 0, idx, actual_elem_size);
   ChengSeqHeader *seq = (ChengSeqHeader *)seq_ptr;
   cheng_seq_sanitize(seq);
-  if (idx < 0) return cheng_seq_get(seq->buffer, seq->len, idx, elem_size);
+  if (idx < 0) return cheng_seq_get(seq->buffer, seq->len, idx, actual_elem_size);
   int32_t need = idx + 1;
   if (need > seq->cap || seq->buffer == NULL) {
     int32_t new_cap = cheng_next_cap(seq->cap, need);
-    if (new_cap <= 0) return cheng_seq_get(seq->buffer, seq->len, idx, elem_size);
-    size_t old_bytes = (size_t)(seq->cap > 0 ? seq->cap : 0) * (size_t)elem_size;
-    size_t new_bytes = (size_t)new_cap * (size_t)elem_size;
+    if (new_cap <= 0) return cheng_seq_get(seq->buffer, seq->len, idx, actual_elem_size);
+    size_t old_bytes = (size_t)(seq->cap > 0 ? seq->cap : 0) * (size_t)actual_elem_size;
+    size_t new_bytes = (size_t)new_cap * (size_t)actual_elem_size;
     void *new_buf = c_realloc(seq->buffer, (int64_t)new_bytes);
-    if (!new_buf) return cheng_seq_get(seq->buffer, seq->len, idx, elem_size);
+    if (!new_buf) return cheng_seq_get(seq->buffer, seq->len, idx, actual_elem_size);
     if (new_bytes > old_bytes) {
       memset((char *)new_buf + old_bytes, 0, new_bytes - old_bytes);
     }
@@ -2913,7 +3186,8 @@ void *cheng_seq_set_grow(void *seq_ptr, int32_t idx, int32_t elem_size) {
     seq->cap = new_cap;
   }
   if (need > seq->len) seq->len = need;
-  return cheng_seq_get(seq->buffer, seq->len, idx, elem_size);
+  cheng_seq_elem_size_compat_register(seq_ptr, seq->buffer, actual_elem_size);
+  return cheng_seq_get(seq->buffer, seq->len, idx, actual_elem_size);
 }
 
 void reserve(void *seq, int32_t new_cap) {

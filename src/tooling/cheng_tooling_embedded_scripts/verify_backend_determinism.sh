@@ -25,32 +25,27 @@ export STAGE1_STD_NO_POINTERS_STRICT=0
 export STAGE1_NO_POINTERS_NON_C_ABI=0
 export STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0
 
-
 fixture="tests/cheng/backend/fixtures/return_object_fields.cheng"
 out_dir="artifacts/backend_determinism"
 mkdir -p "$out_dir"
 
-out_a="$out_dir/a.bin"
-out_b="$out_dir/b.bin"
+out_a="$out_dir/a.o"
+out_b="$out_dir/b.o"
 
-BACKEND_LINKER=system \
-BACKEND_NO_RUNTIME_C=0 \
-BACKEND_EMIT=exe \
-BACKEND_TARGET=arm64-apple-darwin \
-BACKEND_INPUT="$fixture" \
-BACKEND_OUTPUT="$out_a" \
-"$driver"
+run_obj() {
+  out="$1"
+  "$driver" "$fixture" \
+    --emit:obj \
+    --target:arm64-apple-darwin \
+    --output:"$out"
+}
 
-BACKEND_LINKER=system \
-BACKEND_NO_RUNTIME_C=0 \
-BACKEND_EMIT=exe \
-BACKEND_TARGET=arm64-apple-darwin \
-BACKEND_INPUT="$fixture" \
-BACKEND_OUTPUT="$out_b" \
-"$driver"
+run_obj "$out_a"
+run_obj "$out_b"
 
 cmp "$out_a" "$out_b" >/dev/null 2>&1 || {
-  echo "[verify_backend_determinism] warn: executable mismatch: $out_a vs $out_b" >&2
+  echo "[verify_backend_determinism] mismatch: $out_a vs $out_b" >&2
+  exit 1
 }
 
 echo "verify_backend_determinism ok"

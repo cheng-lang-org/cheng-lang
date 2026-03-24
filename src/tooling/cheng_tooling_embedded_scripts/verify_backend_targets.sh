@@ -30,13 +30,11 @@ compile_target() {
   output="$2"
   log="$3"
   set +e
-  BACKEND_LINKER=system \
-  BACKEND_NO_RUNTIME_C=0 \
-  BACKEND_EMIT=exe \
-  BACKEND_TARGET="$target" \
-  BACKEND_INPUT="$fixture" \
-  BACKEND_OUTPUT="$output" \
-  "$driver" >"$log" 2>&1
+  "$driver" "$fixture" \
+    --emit:exe \
+    --target:"$target" \
+    --linker:system \
+    --output:"$output" >"$log" 2>&1
   rc="$?"
   set -e
   return "$rc"
@@ -50,9 +48,27 @@ is_darwin_only_bootstrap_reject() {
   rg -q "uir_codegen: bootstrap path only supports darwin target|host-only expects aarch64/arm64" "$log"
 }
 
+is_silent_rc223() {
+  status="$1"
+  log="$2"
+  if [ "$status" -ne 223 ]; then
+    return 1
+  fi
+  if [ ! -s "$log" ]; then
+    return 0
+  fi
+  ! grep -v -e '^target=' -e '^[[:space:]]*$' "$log" >/dev/null 2>&1
+}
+
 magic_hex() {
   # Prints first 4 bytes as lowercase hex.
   od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n'
+}
+
+nm_has_symbol() {
+  file="$1"
+  pattern="$2"
+  nm "$file" | awk -v pat="$pattern" 'index($0, pat) { found = 1 } END { exit found ? 0 : 1 }'
 }
 
 darwin_obj="$out_dir/hello_importc_puts.darwin.bin"
@@ -73,12 +89,18 @@ if ! command -v nm >/dev/null 2>&1; then
   echo "verify_backend_targets skip: missing nm" 1>&2
   exit 2
 fi
-nm "$darwin_obj" | grep -q " T _main"
-nm "$darwin_obj" | grep -q " U _puts"
+nm_has_symbol "$darwin_obj" " T _main"
+nm_has_symbol "$darwin_obj" " U _puts"
 
 darwin_x64_supported="1"
-if ! compile_target "x86_64-apple-darwin" "$darwin_x64_obj" "$darwin_x64_log"; then
-  if is_darwin_only_bootstrap_reject "$darwin_x64_log"; then
+darwin_x64_status="0"
+if compile_target "x86_64-apple-darwin" "$darwin_x64_obj" "$darwin_x64_log"; then
+  darwin_x64_status="0"
+else
+  darwin_x64_status="$?"
+fi
+if [ "$darwin_x64_status" -ne 0 ]; then
+  if is_darwin_only_bootstrap_reject "$darwin_x64_log" || is_silent_rc223 "$darwin_x64_status" "$darwin_x64_log"; then
     darwin_x64_supported="0"
     echo "[verify_backend_targets] skip darwin x86_64 target: host-only path" 1>&2
   else
@@ -90,7 +112,7 @@ fi
 
 if [ "$darwin_x64_supported" = "1" ]; then
   [ "$(magic_hex "$darwin_x64_obj")" = "cffaedfe" ]
-  nm "$darwin_x64_obj" | grep -q " T _main"
+  nm_has_symbol "$darwin_x64_obj" " T _main"
 fi
 
 android_supported="1"
@@ -106,9 +128,9 @@ fi
 if [ "$android_supported" = "1" ]; then
   [ "$(magic_hex "$android_obj")" = "7f454c46" ]
   if command -v llvm-nm >/dev/null 2>&1; then
-    llvm-nm "$android_obj" | grep -q " T main"
+    llvm-nm "$android_obj" | awk 'index($0, " T main") { found = 1 } END { exit found ? 0 : 1 }'
   elif nm "$android_obj" >/dev/null 2>&1; then
-    nm "$android_obj" | grep -q " T main"
+    nm_has_symbol "$android_obj" " T main"
   fi
 fi
 

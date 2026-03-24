@@ -44,6 +44,17 @@ fn uirCoreDefaultStr(value0: str, fallback0: str): str =
 fn uirCoreSeqObjName(): str =
     return "seq"
 
+fn uirCoreSeqElemObjTypeName(module: UirCoreModule, elemTypeNode: Node, elemKey: str,
+                             elemIsSemanticStr: bool): str =
+    if module == nil || !astNodeIdValid(elemTypeNode):
+        return ""
+    if elemIsSemanticStr:
+        return uirCoreSemanticStrObjTypeName(module, elemKey)
+    let directElemObjName: str = typeNodeObjTypeName(module, elemTypeNode)
+    if len(directElemObjName) > 0 && typeNodeIsObjValue(module, elemTypeNode):
+        return directElemObjName
+    return ""
+
 fn uirCoreObjLenFieldName(baseName: str): str =
     return baseName + ".len"
 
@@ -452,7 +463,9 @@ fn emitSeqLitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, seqTypeKey: str, lit:
         return Err[bool]("uirCore_builder: seq store unsupported type key")
 
     let elemKey: str = rawmemStrFromOffset(seqTypeKey, 4)
+    let elemIsSemanticStr: bool = isSemanticStrKey(elemKey)
     let elemTypeNode: Node = newIdent(elemKey, nodePos(lit))
+    let elemObjName: str = uirCoreSeqElemObjTypeName(b.module, elemTypeNode, elemKey, elemIsSemanticStr)
     let sizeRes: Result[int32] = uirCoreSizeOfTypeNode(b.module, elemTypeNode)
     if ! IsOk[int32](sizeRes):
         return ErrInfo[bool](ErrorInfoOf[int32](sizeRes))
@@ -479,33 +492,40 @@ fn emitSeqLitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, seqTypeKey: str, lit:
     let lenAddr: UirExprId = (lenOff == 0) ? dstBasePtr : uirCoreBin(mbAdd, dstBasePtr, uirCoreConstI64(int64(lenOff)))
     let capAddr: UirExprId = (capOff == 0) ? dstBasePtr : uirCoreBin(mbAdd, dstBasePtr, uirCoreConstI64(int64(capOff)))
     let bufAddr: UirExprId = (bufOff == 0) ? dstBasePtr : uirCoreBin(mbAdd, dstBasePtr, uirCoreConstI64(int64(bufOff)))
-    blockBuilderAddStmt(b, uirCoreStmtStore(lenAddr, uirCoreConstI64(int64(count)), uirCoreTypeI32()))
-    blockBuilderAddStmt(b, uirCoreStmtStore(capAddr, uirCoreConstI64(int64(count)), uirCoreTypeI32()))
-
-    var bufPtr: UirExprId = uirCoreConstI64(0)
-    if count > 0 && elemSize > 0:
-        let bytes: int64 = int64(count) * int64(elemSize)
-        var allocArgs: UirExprId[]
-        builderExprSeqAppend(allocArgs, uirCoreConstI64(bytes))
-        let allocCall: UirExprId = uirCoreCall("alloc", allocArgs)
-        let bufName: str = blockBuilderNextTemp(b, "__seq_buf")
-        let bufSlot: int32 = localAdd(b.env, bufName, uirCoreTypeI64())
-        uirCoreSetLocalType(b.func, bufSlot, uirCoreTypeI64())
-        blockBuilderAddStmt(b, uirCoreStmtLet(bufName, bufSlot, allocCall))
-        bufPtr = uirCoreLocal(bufSlot)
-    blockBuilderAddStmt(b, uirCoreStmtStore(bufAddr, bufPtr, uirCoreTypeI64()))
+    blockBuilderAddStmt(b, uirCoreStmtStore(lenAddr, uirCoreConstI64(0), uirCoreTypeI32()))
+    blockBuilderAddStmt(b, uirCoreStmtStore(capAddr, uirCoreConstI64(0), uirCoreTypeI32()))
+    blockBuilderAddStmt(b, uirCoreStmtStore(bufAddr, uirCoreConstI64(0), uirCoreTypeI64()))
 
     if count > 0 && elemSize > 0:
+        var elemSize32: UirExprId = uirCoreCast(uirCoreTypeI32(), uirCoreConstI64(int64(elemSize)))
+        if elemIsSemanticStr:
+            var elemSizeArgs0: UirExprId[]
+            elemSize32 = uirCoreCall("cheng_seq_string_elem_bytes_compat", elemSizeArgs0)
         for i in 0..<count:
             var elemNode: Node = kid(lit, i)
             if astNodeIdValid(elemNode) && nodeKind(elemNode) == nkCallArg && kidCount(elemNode) > 1:
                 elemNode = kid(elemNode, 1)
-            let valRes: Result[UirExprId] = lowerExprValue(b, elemNode, elemUirTy)
-            if ! IsOk[UirExprId](valRes):
-                return ErrInfo[bool](ErrorInfoOf[UirExprId](valRes))
-            let off: int64 = int64(i) * int64(elemSize)
-            let addr: UirExprId = (off == 0) ? bufPtr : uirCoreBin(mbAdd, bufPtr, uirCoreConstI64(off))
-            blockBuilderAddStmt(b, uirCoreStmtStore(addr, Value[UirExprId](valRes), elemUirTy))
+            var growArgs: UirExprId[]
+            builderExprSeqAppend(growArgs, dstBasePtr)
+            builderExprSeqAppend(growArgs, uirCoreCast(uirCoreTypeI32(), uirCoreConstI64(int64(i))))
+            builderExprSeqAppend(growArgs, elemSize32)
+            let addr: UirExprId = uirCoreCall("cheng_seq_set_grow", growArgs)
+            if len(elemObjName) > 0:
+                var valResObj: Result[UirExprId]
+                if elemIsSemanticStr:
+                    valResObj = uirCoreLowerExprValueWithTypeKeyHint(b, elemNode, uirCoreTypeI64(), elemKey)
+                else:
+                    valResObj = lowerExprValue(b, elemNode, uirCoreTypeI64())
+                if !IsOk[UirExprId](valResObj):
+                    return ErrInfo[bool](ErrorInfoOf[UirExprId](valResObj))
+                let copyRes: Result[bool] = emitObjCopyPtrs(b, addr, elemObjName, Value[UirExprId](valResObj))
+                if !uirCoreResultBoolIsOk(copyRes):
+                    return ErrInfo[bool](uirCoreResultBoolErrorInfo(copyRes))
+            else:
+                let valRes: Result[UirExprId] = lowerExprValue(b, elemNode, elemUirTy)
+                if ! IsOk[UirExprId](valRes):
+                    return ErrInfo[bool](ErrorInfoOf[UirExprId](valRes))
+                blockBuilderAddStmt(b, uirCoreStmtStore(addr, Value[UirExprId](valRes), elemUirTy))
 
     return Ok[bool](false)
 

@@ -2,7 +2,6 @@
 # Stage1 parser (rebuilt from stage0 parser, with Stage1 AST/diagnostics).
 import std/strings
 import std/seqs
-import std/strutils
 import std/os
 import std/hashmaps
 import std/system
@@ -37,34 +36,16 @@ fn parserStrCharAt(s: str, idx: int32): char =
         return char(0)
     return s[idx]
 
-fn parserJoinWithChar(left: str, sep: char, right: str): str =
-    let nLeft: int32 = len(left)
-    let nRight: int32 = len(right)
-    if nLeft <= 0:
-        return right
-    if nRight <= 0:
-        return left
-    var parts: str[] = []
-    add(parts, left)
-    add(parts, charToStr(sep))
-    add(parts, right)
-    return strutils.join(parts, "")
-
-fn parserJoinPartsWithChar(parts: str[], sep: char): str =
+fn parserJoinNodeIdentIdsWithChar(parts: Node[], sep: char): int32 =
     if parts.len <= 0:
-        return ""
-    if parts.len == 1:
-        return parts[0]
-    var outParts: str[] = []
-    var i: int32 = 0
-    while i < parts.len:
-        let part: str = parts[i]
-        if i > 0:
-            add(outParts, charToStr(sep))
-        if len(part) > 0:
-            add(outParts, part)
-        i = i + 1
-    return strutils.join(outParts, "")
+        return 0
+    var ids: int32[] = []
+    ids.cap = parts.len
+    for i in 0..<parts.len:
+        let id: int32 = nodeIdentId(parts[i])
+        if id > 0:
+            add(ids, id)
+    return tokenInternTextIdsJoinedByByte(ids, sep)
 
 # ---- Precedence ----
 const
@@ -91,6 +72,9 @@ type
     ParserStateObj =
         tokens: Token[]
         idx: int32
+        endExclusive: int32
+        eofLine: int32
+        eofCol: int32
         filename: str
         diags: Diagnostic[]*
         outlineOnly: bool
@@ -99,14 +83,13 @@ type
 var parserDebugDiagWindowCount: int32 = 0
 var parserDebugParseDiagReady: bool
 var parserDebugParseDiagCached: bool
+var parserDebugStage1DiagAddReady: bool
+var parserDebugStage1DiagAddCached: bool
+var parserDebugParseDotReady: bool
+var parserDebugParseDotCached: bool
 var parserNormalizedIdentEpoch: int32
 var parserNormalizedIdentReady: int32[]
-var parserNormalizedIdentValues: str[]
 var parserNormalizedIdentIds: int32[]
-var parserNormalizedSharedIndex: hashmaps.HashMapStrInt
-var parserNormalizedSharedPtrIndex: hashmaps.HashMapPtrInt
-var parserNormalizedSharedTexts: str[]
-var parserNormalizedSharedIds: int32[]
 var parserGeneratedIdentEpoch: int32
 var parserGeneratedIdentIndex: hashmaps.HashMapStrInt
 var parserGeneratedIdentIds: int32[]
@@ -114,6 +97,8 @@ var parserGeneratedFixedEpoch: int32
 var parserGeneratedAddrId: int32
 var parserGeneratedWhereId: int32
 var parserGeneratedDiscardId: int32
+var parserGeneratedIncId: int32
+var parserGeneratedPointerId: int32
 var parserBuiltinTypeEpoch: int32
 var parserBuiltinTypeCache: int8[]
 var parserTrimmedTextEpoch: int32
@@ -217,6 +202,7 @@ var parserTokTraitId: int32
 var parserTokMacroId: int32
 var parserTokLetId: int32
 var parserTokIsNotId: int32
+var parserTokObjectId: int32
 
 fn parserEnsureCommonTokenIds() =
     let epoch: int32 = tokenTextPoolCurrentEpoch()
@@ -301,6 +287,7 @@ fn parserEnsureCommonTokenIds() =
     parserTokTemplateId = tokenCommonId(80)
     parserTokContinueId = tokenCommonId(81)
     parserTokLetId = tokenCommonId(47)
+    parserTokObjectId = tokenInternText("object")
     parserCommonTokenIdsReady = true
 
 fn parserKeywordEq(t: Token, kw: str): bool =
@@ -314,12 +301,7 @@ fn parserEnsureNormalizedIdentCache(id: int32) =
     if parserNormalizedIdentEpoch != epoch:
         parserNormalizedIdentEpoch = epoch
         parserNormalizedIdentReady.len = 0
-        parserNormalizedIdentValues.len = 0
         parserNormalizedIdentIds.len = 0
-        hashmaps.hashMapStrIntClear(parserNormalizedSharedIndex)
-        hashmaps.hashMapPtrIntClear(parserNormalizedSharedPtrIndex)
-        parserNormalizedSharedTexts.len = 0
-        parserNormalizedSharedIds.len = 0
     if id < 0:
         return
     let needLen: int32 = id + 1
@@ -329,12 +311,6 @@ fn parserEnsureNormalizedIdentCache(id: int32) =
         seqs.setLen(parserNormalizedIdentReady, needLen)
         for i in oldReadyLen..<needLen:
             parserNormalizedIdentReady[i] = 0
-    let oldValueLen: int32 = parserNormalizedIdentValues.len
-    if oldValueLen < needLen:
-        seqs.reserve(parserNormalizedIdentValues, needLen)
-        seqs.setLen(parserNormalizedIdentValues, needLen)
-        for i in oldValueLen..<needLen:
-            parserNormalizedIdentValues[i] = ""
     let oldIdLen: int32 = parserNormalizedIdentIds.len
     if oldIdLen < needLen:
         seqs.reserve(parserNormalizedIdentIds, needLen)
@@ -348,6 +324,20 @@ fn parserDebugParseDiagEnabled(): bool =
     parserDebugParseDiagCached = os.getEnvDefault("BACKEND_DEBUG_PARSE_DIAG", "") == "1"
     parserDebugParseDiagReady = true
     return parserDebugParseDiagCached
+
+fn parserDebugStage1DiagAddEnabled(): bool =
+    if parserDebugStage1DiagAddReady:
+        return parserDebugStage1DiagAddCached
+    parserDebugStage1DiagAddCached = os.getEnvDefault("BACKEND_DEBUG_STAGE1_DIAG_ADD", "") == "1"
+    parserDebugStage1DiagAddReady = true
+    return parserDebugStage1DiagAddCached
+
+fn parserDebugParseDotEnabled(): bool =
+    if parserDebugParseDotReady:
+        return parserDebugParseDotCached
+    parserDebugParseDotCached = os.getEnvDefault("BACKEND_DEBUG_PARSE_DOT", "") == "1"
+    parserDebugParseDotReady = true
+    return parserDebugParseDotCached
 
 fn parserEnsureI8Cache(cache: var int8[], epochSlot: var int32, id: int32) =
     let epoch: int32 = tokenTextPoolCurrentEpoch()
@@ -536,16 +526,30 @@ fn eofTok(): Token =
     tokenZero(t)
     return t
 
+fn parserTokenViewEnd(p: ParserStateObj): int32 =
+    let n: int32 = p.tokens.len
+    if p.endExclusive <= 0 || p.endExclusive > n:
+        return n
+    return p.endExclusive
+
+fn parserEofTok(p: ParserStateObj): Token =
+    var t: Token = eofTok()
+    t.line = p.eofLine
+    t.col = p.eofCol
+    return t
+
 fn current(p: var ParserStateObj): Token =
-    if p.idx < p.tokens.len:
+    let endExclusive: int32 = parserTokenViewEnd(p)
+    if p.idx >= 0 && p.idx < endExclusive:
         return p.tokens[p.idx]
-    return eofTok()
+    return parserEofTok(p)
 
 fn peek(p: var ParserStateObj, ahead: int32): Token =
     let i: int32 = p.idx + ahead
-    if i >= 0 && i < p.tokens.len:
+    let endExclusive: int32 = parserTokenViewEnd(p)
+    if i >= 0 && i < endExclusive:
         return p.tokens[i]
-    return eofTok()
+    return parserEofTok(p)
 
 fn curKind(p: var ParserStateObj): TokenKind =
     let t: Token = current p
@@ -569,7 +573,7 @@ fn advance(p: var ParserStateObj) =
 fn addDiag(diags: Diagnostic[]*, severity: Severity, filename: str, line: int32, col: int32, message: str) =
     if diags == nil:
         return
-    if os.getEnvDefault("BACKEND_DEBUG_STAGE1_DIAG_ADD", "") == "1":
+    if parserDebugStage1DiagAddEnabled():
         let f: os.File = os.get_stderr()
         os.write(f, "[diag-add] sev=")
         os.write(f, intToStr(int32(severity)))
@@ -587,7 +591,7 @@ fn addDiag(diags: Diagnostic[]*, severity: Severity, filename: str, line: int32,
 
 fn addParseDiag(p: var ParserStateObj, t: Token, message: str) =
     addDiag(p.diags, svError, p.filename, t.line, t.col, message)
-    if os.getEnvDefault("BACKEND_DEBUG_PARSE_DIAG", "") == "1":
+    if parserDebugParseDiagEnabled():
         let f: os.File = os.get_stderr()
         os.write(f, "[parse] ")
         os.write(f, p.filename)
@@ -605,8 +609,9 @@ fn addParseDiag(p: var ParserStateObj, t: Token, message: str) =
             if startIdx < 0:
                 startIdx = 0
             var endIdx: int32 = p.idx + 3
-            if endIdx >= p.tokens.len:
-                endIdx = p.tokens.len - 1
+            let tokenEnd: int32 = parserTokenViewEnd(p)
+            if endIdx >= tokenEnd:
+                endIdx = tokenEnd - 1
             for wi in startIdx..endIdx:
                 let wtok: Token = p.tokens[wi]
                 os.write(f, "[parse.win] i=")
@@ -1214,95 +1219,25 @@ fn parserNeedsNormalizedIdentLexemeId(id: int32): bool =
     return result
 
 fn parserNormalizedIdentByLexemeId(id: int32): str =
-    if id <= 0:
+    let normalizedId: int32 = parserNormalizedIdentIdByLexemeId(id)
+    if normalizedId <= 0:
         return ""
-    if !parserNeedsNormalizedIdentLexemeId(id):
-        return tokenTextById(id)
+    return tokenTextById(normalizedId)
+
+fn parserResolveNormalizedCanonicalId(id: int32): int32 =
+    if id <= 0:
+        return 0
     parserEnsureNormalizedIdentCache(id)
-    if parserNormalizedIdentReady[id] != 0:
-        if len(parserNormalizedIdentValues[id]) > 0:
-            return parserNormalizedIdentValues[id]
-        if parserNormalizedIdentIds[id] > 0:
-            parserNormalizedIdentValues[id] = tokenTextById(parserNormalizedIdentIds[id])
-            return parserNormalizedIdentValues[id]
+    if parserNormalizedIdentReady[id] != 0 && parserNormalizedIdentIds[id] > 0:
+        return parserNormalizedIdentIds[id]
     parserEnsureFixedBuiltinSets()
     if id < parserFixedNormalizedIds.len && parserFixedNormalizedIds[id] > 0:
         parserNormalizedIdentIds[id] = parserFixedNormalizedIds[id]
-        parserNormalizedIdentValues[id] = tokenTextById(parserNormalizedIdentIds[id])
         parserNormalizedIdentReady[id] = 1
-        return parserNormalizedIdentValues[id]
-    let canonicalId: int32 = parserTrimmedCanonicalId(id)
-    if canonicalId > 0 && canonicalId < parserFixedNormalizedIds.len &&
-       parserFixedNormalizedIds[canonicalId] > 0:
-        parserNormalizedIdentIds[id] = parserFixedNormalizedIds[canonicalId]
-        parserNormalizedIdentValues[id] = tokenTextById(parserNormalizedIdentIds[id])
-        parserNormalizedIdentReady[id] = 1
-        parserEnsureNormalizedIdentCache(canonicalId)
-        if canonicalId < parserNormalizedIdentIds.len:
-            parserNormalizedIdentIds[canonicalId] = parserNormalizedIdentIds[id]
-            parserNormalizedIdentValues[canonicalId] = parserNormalizedIdentValues[id]
-            parserNormalizedIdentReady[canonicalId] = 1
-        return parserNormalizedIdentValues[id]
-    if canonicalId > 0 && canonicalId != id:
-        parserEnsureNormalizedIdentCache(canonicalId)
-        if canonicalId < parserNormalizedIdentReady.len && parserNormalizedIdentReady[canonicalId] != 0:
-            let canonicalNormId: int32 = parserNormalizedIdentIds[canonicalId]
-            parserNormalizedIdentIds[id] = canonicalNormId
-            if len(parserNormalizedIdentValues[canonicalId]) > 0:
-                parserNormalizedIdentValues[id] = parserNormalizedIdentValues[canonicalId]
-            elif canonicalNormId > 0:
-                parserNormalizedIdentValues[id] = tokenTextById(canonicalNormId)
-            else:
-                parserNormalizedIdentValues[id] = ""
-            parserNormalizedIdentReady[id] = 1
-            return parserNormalizedIdentValues[id]
-    let text: str = tokenTextById(id)
-    parserNormalizedIdentIds[id] = parserNormalizedSharedResolveId(text)
-    parserNormalizedIdentValues[id] = tokenTextById(parserNormalizedIdentIds[id])
+        return parserNormalizedIdentIds[id]
+    let normalizedId: int32 = tokenInternPaddedTextById(id, ' ', ' ')
+    parserNormalizedIdentIds[id] = normalizedId
     parserNormalizedIdentReady[id] = 1
-    if canonicalId > 0 && canonicalId != id:
-        parserEnsureNormalizedIdentCache(canonicalId)
-        if canonicalId < parserNormalizedIdentIds.len:
-            parserNormalizedIdentIds[canonicalId] = parserNormalizedIdentIds[id]
-            parserNormalizedIdentValues[canonicalId] = parserNormalizedIdentValues[id]
-            parserNormalizedIdentReady[canonicalId] = 1
-    return parserNormalizedIdentValues[id]
-
-fn parserStrPtrKey(s: str): int64 =
-    if s == "":
-        return 0
-    return int64(strDataPtr(s))
-
-fn parserNormalizedSharedResolveId(text: str): int32 =
-    let epoch: int32 = tokenTextPoolCurrentEpoch()
-    if parserNormalizedIdentEpoch != epoch:
-        parserNormalizedIdentEpoch = epoch
-        parserNormalizedIdentReady.len = 0
-        parserNormalizedIdentValues.len = 0
-        parserNormalizedIdentIds.len = 0
-        hashmaps.hashMapStrIntClear(parserNormalizedSharedIndex)
-        hashmaps.hashMapPtrIntClear(parserNormalizedSharedPtrIndex)
-        parserNormalizedSharedTexts.len = 0
-        parserNormalizedSharedIds.len = 0
-    let ptrKey: int64 = parserStrPtrKey(text)
-    if ptrKey != 0:
-        var foundPtr: bool = false
-        let idxPlus1Ptr: int32 = hashmaps.hashMapPtrIntGet(parserNormalizedSharedPtrIndex, ptrKey, foundPtr)
-        if foundPtr && idxPlus1Ptr > 0 && idxPlus1Ptr <= parserNormalizedSharedIds.len:
-            return parserNormalizedSharedIds[idxPlus1Ptr - 1]
-    var found: bool = false
-    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(parserNormalizedSharedIndex, text, found)
-    if found && idxPlus1 > 0 && idxPlus1 <= parserNormalizedSharedIds.len:
-        if ptrKey != 0:
-            hashmaps.hashMapPtrIntPut(parserNormalizedSharedPtrIndex, ptrKey, idxPlus1)
-        return parserNormalizedSharedIds[idxPlus1 - 1]
-    let normalizedText: str = parserNormalizedPadText(text)
-    let normalizedId: int32 = tokenInternText(normalizedText)
-    add(parserNormalizedSharedTexts, text)
-    add(parserNormalizedSharedIds, normalizedId)
-    hashmaps.hashMapStrIntPut(parserNormalizedSharedIndex, text, parserNormalizedSharedIds.len)
-    if ptrKey != 0:
-        hashmaps.hashMapPtrIntPut(parserNormalizedSharedPtrIndex, ptrKey, parserNormalizedSharedIds.len)
     return normalizedId
 
 fn parserNormalizedIdentIdByLexemeId(id: int32): int32 =
@@ -1311,10 +1246,7 @@ fn parserNormalizedIdentIdByLexemeId(id: int32): int32 =
     if !parserNeedsNormalizedIdentLexemeId(id):
         return id
     parserEnsureNormalizedIdentCache(id)
-    if parserNormalizedIdentReady[id] != 0:
-        if parserNormalizedIdentIds[id] <= 0:
-            let text0: str = tokenTextById(id)
-            parserNormalizedIdentIds[id] = parserNormalizedSharedResolveId(text0)
+    if parserNormalizedIdentReady[id] != 0 && parserNormalizedIdentIds[id] > 0:
         return parserNormalizedIdentIds[id]
     parserEnsureFixedBuiltinSets()
     if id < parserFixedNormalizedIds.len && parserFixedNormalizedIds[id] > 0:
@@ -1331,14 +1263,8 @@ fn parserNormalizedIdentIdByLexemeId(id: int32): int32 =
             parserNormalizedIdentIds[canonicalId] = parserNormalizedIdentIds[id]
             parserNormalizedIdentReady[canonicalId] = 1
         return parserNormalizedIdentIds[id]
-    if canonicalId > 0 && canonicalId != id:
-        parserEnsureNormalizedIdentCache(canonicalId)
-        if canonicalId < parserNormalizedIdentReady.len && parserNormalizedIdentReady[canonicalId] != 0:
-            parserNormalizedIdentIds[id] = parserNormalizedIdentIds[canonicalId]
-            parserNormalizedIdentReady[id] = 1
-            return parserNormalizedIdentIds[id]
-    let text: str = tokenTextById(id)
-    let normalizedId: int32 = parserNormalizedSharedResolveId(text)
+    let baseId: int32 = ((canonicalId > 0) ? canonicalId : id)
+    let normalizedId: int32 = parserResolveNormalizedCanonicalId(baseId)
     parserNormalizedIdentIds[id] = normalizedId
     parserNormalizedIdentReady[id] = 1
     if canonicalId > 0 && canonicalId != id:
@@ -1373,6 +1299,8 @@ fn parserEnsureGeneratedFixedIds() =
     parserGeneratedAddrId = tokenInternText("__addr")
     parserGeneratedWhereId = tokenInternText("where")
     parserGeneratedDiscardId = tokenInternText("discard")
+    parserGeneratedIncId = tokenInternText("inc")
+    parserGeneratedPointerId = tokenInternText("pointer")
 
 fn normalizeIdent(name: str): str =
     if len(name) == 0:
@@ -1445,24 +1373,26 @@ fn hexDigitVal(c: char): int32 =
     return -1
 
 fn decodeStringLit(p: var ParserStateObj, t: Token): str =
+    let lexemeId: int32 = tokenLexemeId(t)
     if t.strPrefix == 'r':
-        return tokenLexeme(t)
-    let s: str = tokenLexeme(t)
-    let n: int32 = len s
+        return tokenTextById(lexemeId)
+    let n: int32 = tokenTextLen(lexemeId)
+    if n <= 0:
+        return ""
     var hasEscape: bool = false
     for i0 in 0..<n:
-        if s[i0] == '\\':
+        if tokenTextByteAtId(lexemeId, i0) == '\\':
             hasEscape = true
             break
     if !hasEscape:
-        return s
+        return tokenTextById(lexemeId)
     var out: rawbytes.Bytes = rawbytes.bytesAlloc(n)
     var outLen: int32 = 0
     var i: int32 = 0
     for __for_guard_i in 0..<n:
         if !(i < n):
             break
-        let c: char = s[i]
+        let c: char = tokenTextByteAtId(lexemeId, i)
         if c != '\\':
             rawbytes.bytesSet(out, outLen, int32(c))
             outLen = outLen + 1
@@ -1472,7 +1402,7 @@ fn decodeStringLit(p: var ParserStateObj, t: Token): str =
         if i >= n:
             addParseDiag(p, t, "Unterminated string escape sequence")
             break
-        let esc: char = s[i]
+        let esc: char = tokenTextByteAtId(lexemeId, i)
         if esc == 'n':
             rawbytes.bytesSet(out, outLen, 10)
             outLen = outLen + 1
@@ -1509,12 +1439,12 @@ fn decodeStringLit(p: var ParserStateObj, t: Token): str =
             i = i + 1
             continue
         if esc == 'x':
-            if i + 2 >= len s:
+            if i + 2 >= n:
                 addParseDiag(p, t, "String escape \\x requires two hex digits")
                 i = i + 1
                 continue
-            let a: int32 = hexDigitVal s[i + 1]
-            let b: int32 = hexDigitVal s[i + 2]
+            let a: int32 = hexDigitVal(tokenTextByteAtId(lexemeId, i + 1))
+            let b: int32 = hexDigitVal(tokenTextByteAtId(lexemeId, i + 2))
             if a < 0 || b < 0:
                 addParseDiag(p, t, "String escape \\x requires two hex digits")
                 i = i + 1
@@ -1531,11 +1461,12 @@ fn decodeStringLit(p: var ParserStateObj, t: Token): str =
     return rawbytes.bytesToString(rawbytes.Bytes(data: out.data, len: outLen))
 
 fn decodeCharLit(p: var ParserStateObj, t: Token): str =
-    let s: str = tokenLexeme(t)
-    if len s == 1:
-        return s
-    if len s == 2 && s[0] == '\\':
-        let esc: char = s[1]
+    let lexemeId: int32 = tokenLexemeId(t)
+    let n: int32 = tokenTextLen(lexemeId)
+    if n == 1:
+        return charToStr(tokenTextByteAtId(lexemeId, 0))
+    if n == 2 && tokenTextByteAtId(lexemeId, 0) == '\\':
+        let esc: char = tokenTextByteAtId(lexemeId, 1)
         if esc == 'n': return charToStr char(int8(10))
         if esc == 'r': return charToStr char(int8(13))
         if esc == 't': return charToStr char(int8(9))
@@ -1545,29 +1476,13 @@ fn decodeCharLit(p: var ParserStateObj, t: Token): str =
         if esc == 39: return charToStr char(int8(39))
         addParseDiag(p, t, "Invalid character escape")
         return charToStr esc
-    if len s == 4 && s[0] == '\\' && s[1] == 'x':
-        let a: int32 = hexDigitVal s[2]
-        let b: int32 = hexDigitVal s[3]
+    if n == 4 && tokenTextByteAtId(lexemeId, 0) == '\\' && tokenTextByteAtId(lexemeId, 1) == 'x':
+        let a: int32 = hexDigitVal(tokenTextByteAtId(lexemeId, 2))
+        let b: int32 = hexDigitVal(tokenTextByteAtId(lexemeId, 3))
         if a >= 0 && b >= 0:
             return charToStr char(int8(a * 16 + b))
     addParseDiag(p, t, "Invalid character literal")
     return ""
-
-fn stripUnderscore(s: str): str =
-    let n: int32 = len s
-    var hasUnderscore: bool = false
-    for i in 0..<n:
-        if s[i] == '_':
-            hasUnderscore = true
-            break
-    if !hasUnderscore:
-        return s
-    var parts: str[] = []
-    for i in 0..<n:
-        let c: char = s[i]
-        if c != '_':
-            add(parts, charToStr(c))
-    return strutils.join(parts, "")
 
 fn parser_splitFile(path: str): SplitFileResult =
     var res: SplitFileResult
@@ -1629,22 +1544,22 @@ fn stripSpaces(s: str): str =
         return s
     return sliceRangeLex(s, a, b)
 
-fn parseIntLiteral(s0: str): int64 =
-    let sLen: int32 = len s0
+fn parseIntLiteralById(textId: int32): int64 =
+    let sLen: int32 = tokenTextLen(textId)
     if sLen == 0:
         return 0
     var base: int32 = 10
     var start: int32 = 0
     var neg: bool = false
-    if s0[0] == '-':
+    if tokenTextByteAtId(textId, 0) == '-':
         neg = true
         start = 1
-    if start < sLen && s0[start] == '0':
+    if start < sLen && tokenTextByteAtId(textId, start) == '0':
         var prefixNext: int32 = start + 1
-        while prefixNext < sLen && s0[prefixNext] == '_':
+        while prefixNext < sLen && tokenTextByteAtId(textId, prefixNext) == '_':
             prefixNext = prefixNext + 1
         if prefixNext < sLen:
-            let c1: char = s0[prefixNext]
+            let c1: char = tokenTextByteAtId(textId, prefixNext)
             if c1 == 'x' || c1 == 'X':
                 base = 16
                 start = prefixNext + 1
@@ -1659,7 +1574,7 @@ fn parseIntLiteral(s0: str): int64 =
     for __for_guard_i in 0..<sLen:
         if !(i < sLen):
             break
-        let c: char = s0[i]
+        let c: char = tokenTextByteAtId(textId, i)
         if c == '_':
             i = i + 1
             continue
@@ -1723,25 +1638,25 @@ fn parseMemberIdent(p: var ParserStateObj): Node =
     return newIdent("", posFrom(t))
 
 fn parseTypeParams(p: var ParserStateObj): Node =
-    if ! matchSymbol(p, "["):
+    if ! matchSymbolId(p, parserTokLBracketId):
         return emptyNode(posFrom(current(p)))
     var params: Node = newNode(nkGenericParams, posFrom(current(p)))
     while true:
-        if matchSymbol(p, "]"):
+        if matchSymbolId(p, parserTokRBracketId):
             break
         let name: Node = parseIdent(p, true)
         var constraint: Node = emptyNode nodePos(name)
         var defaultVal: Node = emptyNode nodePos(name)
-        if matchSymbol(p, ":"):
+        if matchSymbolId(p, parserTokColonId):
             constraint = parseTypeExpr p
-        if matchSymbol(p, "="):
+        if matchSymbolId(p, parserTokEqId):
             defaultVal = parseTypeExpr p
         var defn: Node = newNode(nkIdentDefs, nodePos(name))
         addSon(defn, name)
         addSon(defn, constraint)
         addSon(defn, defaultVal)
         addSon(params, defn)
-        if matchSymbol(p, ",") || matchSymbol(p, ";"):
+        if matchSymbolId(p, parserTokCommaId) || matchSymbolId(p, parserTokSemiId):
             continue
         let curTokEnd: Token = current p
         if curTokEnd.kind == tkSymbol && curTokEnd.lexemeId == parserTokRBracketId:
@@ -1753,16 +1668,16 @@ fn parseTypeParams(p: var ParserStateObj): Node =
 fn parseAnnotations(p: var ParserStateObj): Node[] =
     var out: Node[] = []
     out.cap = 4
-    while matchSymbol(p, "@"):
+    while matchSymbolId(p, parserTokAtId):
         let pos: SourcePos = posFrom(current(p))
         let name: Node = parseIdent(p, false)
         var ann: Node = newNode(nkAnnotation, pos)
         addSon(ann, name)
-        if matchSymbol(p, "("):
-            while ! matchSymbol(p, ")"):
+        if matchSymbolId(p, parserTokLParenId):
+            while ! matchSymbolId(p, parserTokRParenId):
                 let arg: Node = parseCallArg p
                 addSon(ann, arg)
-                if matchSymbol(p, ","):
+                if matchSymbolId(p, parserTokCommaId):
                     continue
                 let curTokClose: Token = current p
                 if curTokClose.kind == tkSymbol && curTokClose.lexemeId == parserTokRParenId:
@@ -1775,16 +1690,16 @@ fn parseAnnotations(p: var ParserStateObj): Node[] =
 fn parseInlineAnnotations(p: var ParserStateObj): Node[] =
     var out: Node[] = []
     out.cap = 2
-    while matchSymbol(p, "@"):
+    while matchSymbolId(p, parserTokAtId):
         let pos: SourcePos = posFrom(current(p))
         let name: Node = parseIdent(p, false)
         var ann: Node = newNode(nkAnnotation, pos)
         addSon(ann, name)
-        if matchSymbol(p, "("):
-            while ! matchSymbol(p, ")"):
+        if matchSymbolId(p, parserTokLParenId):
+            while ! matchSymbolId(p, parserTokRParenId):
                 let arg: Node = parseCallArg p
                 addSon(ann, arg)
-                if matchSymbol(p, ","):
+                if matchSymbolId(p, parserTokCommaId):
                     continue
                 let curTokClose: Token = current p
                 if curTokClose.kind == tkSymbol && curTokClose.lexemeId == parserTokRParenId:
@@ -1796,12 +1711,9 @@ fn parseInlineAnnotations(p: var ParserStateObj): Node[] =
 fn parseStringLit(p: var ParserStateObj): Node =
     let t: Token = current p
     advance p
-    # String literals must survive later AST transforms regardless of token text-pool
-    # lifetime or token-array reuse. Materialize the literal into AST-owned storage here
-    # instead of keeping only a borrowed token text id.
-    if t.strPrefix == 'r':
-        return newStrLit(tokenLexeme(t), posFrom(t))
     let lexemeId: int32 = tokenLexemeId(t)
+    if t.strPrefix == 'r':
+        return newStrLitWithId(lexemeId, posFrom(t))
     let lexLen: int32 = tokenTextLen(lexemeId)
     var needsDecode: bool = false
     for i in 0..<lexLen:
@@ -1809,7 +1721,7 @@ fn parseStringLit(p: var ParserStateObj): Node =
             needsDecode = true
             break
     if !needsDecode:
-        return newStrLit(tokenTextById(lexemeId), posFrom(t))
+        return newStrLitWithId(lexemeId, posFrom(t))
     let s: str = decodeStringLit(p, t)
     return newStrLit(s, posFrom(t))
 
@@ -1836,16 +1748,15 @@ fn parseNumberLit(p: var ParserStateObj): Node =
             hasUnderscore = true
         if hasDot && hasUnderscore:
             break
-    let lexemeText: str = tokenTextById(lexemeId)
     if hasDot:
         var n: Node = newNode(nkFloatLit, posFrom(t))
         if hasUnderscore:
-            nodeSetStrVal(n, stripUnderscore(lexemeText))
+            nodeSetStrValId(n, tokenInternTextByRemovingByte(lexemeId, '_'))
         else:
             nodeSetStrValId(n, lexemeId)
         return n
     var n2: Node = newNode(nkIntLit, posFrom(t))
-    nodeSetIntVal(n2, parseIntLiteral(lexemeText))
+    nodeSetIntVal(n2, parseIntLiteralById(lexemeId))
     return n2
 
 fn parseIfExprBranch(p: var ParserStateObj): Node =
@@ -2061,9 +1972,9 @@ fn parseAtom(p: var ParserStateObj): Node =
             while true:
                 let e3: Node = parseExpression(p, PrecNone)
                 add(elems3, e3)
-                if ! matchSymbol(p, ","):
+                if ! matchSymbolId(p, parserTokCommaId):
                     break
-        expectSymbol(p, "}", "Expected '}'")
+        expectSymbolId(p, parserTokRBraceId, "Expected '}'")
         var cur: Node = newNode(nkCurly, posFrom(t))
         for i4 in 0..<elems3.len:
             addSon(cur, elems3[i4])
@@ -2086,7 +1997,7 @@ fn parseCStyleCast(p: var ParserStateObj): Node =
         diagLen0 = diags0->len
     advance p
     let typeNode: Node = parseTypeExpr p
-    if !isEmpty(typeNode) && matchSymbol(p, ")"):
+    if !isEmpty(typeNode) && matchSymbolId(p, parserTokRParenId):
         if ! isLikelyTypeExpr typeNode:
             p.idx = idx0
             if diags0 != nil:
@@ -2098,7 +2009,7 @@ fn parseCStyleCast(p: var ParserStateObj): Node =
             if after.kind == tkSymbol && after.lexemeId == parserTokLParenId:
                 advance p
                 let expr: Node = parseExpression(p, PrecNone)
-                expectSymbol(p, ")", "Expected ')'")
+                expectSymbolId(p, parserTokRParenId, "Expected ')'")
                 addParseDiag(p, t0, "C-style cast is removed; use T(x)")
                 return newNode(nkError, castPos)
             let expr2: Node = parseExpression(p, PrecPrefix)
@@ -2370,11 +2281,11 @@ fn parseCallArg(p: var ParserStateObj): Node =
 fn parsePostfix(p: var ParserStateObj, lhs: Node): Node =
     parserEnsureCommonTokenIds()
     var node: Node = lhs
+    let dbgDot: bool = parserDebugParseDotEnabled()
     while true:
         let t: Token = current p
         let lexemeId: int32 = t.lexemeId
         if t.kind == tkSymbol && lexemeId == parserTokDotId:
-            let dbgDot: bool = os.getEnvDefault("BACKEND_DEBUG_PARSE_DOT", "") == "1"
             if !isEmpty(node) && nodeKind(node) == nkBracketExpr && kidCount node == 1:
                 addParseDiag(p, t, rawPointerForbidMessage("Pointer member access is forbidden in no-pointer mode"))
             advance p
@@ -2508,6 +2419,7 @@ fn parsePostfix(p: var ParserStateObj, lhs: Node): Node =
 fn parseTypePostfix(p: var ParserStateObj, lhs: Node): Node =
     parserEnsureCommonTokenIds()
     var node: Node = lhs
+    let dbgDot2: bool = parserDebugParseDotEnabled()
     while true:
         let t: Token = current p
         let lexemeId: int32 = t.lexemeId
@@ -2518,7 +2430,6 @@ fn parseTypePostfix(p: var ParserStateObj, lhs: Node): Node =
             node = pt
             continue
         if t.kind == tkSymbol && lexemeId == parserTokDotId:
-            let dbgDot2: bool = os.getEnvDefault("BACKEND_DEBUG_PARSE_DOT", "") == "1"
             advance p
             if dbgDot2:
                 let tok2: Token = current p
@@ -2573,7 +2484,7 @@ fn parseTypePostfix(p: var ParserStateObj, lhs: Node): Node =
                 if matchSymbolId(p, parserTokCommaId) || matchSymbolId(p, parserTokSemiId):
                     continue
                 break
-            expectSymbol(p, "]", "Expected ']'")
+            expectSymbolId(p, parserTokRBracketId, "Expected ']'")
             node = br
             continue
         if t.kind == tkSymbol && lexemeId == parserTokQuestionId:
@@ -2659,8 +2570,9 @@ fn chainSpaceCallArgs(p: var ParserStateObj, arg: Node): Node =
 fn parseExpression(p: var ParserStateObj, minPrec: int32): Node =
     parserEnsureCommonTokenIds()
     var lhs: Node = parsePostfix(p, parsePrefix p)
+    let lhsBeforeTypePtrBase: Node = lhs
     lhs = maybeParseTypePtrBase(p, lhs)
-    if !isEmpty(lhs):
+    if !isEmpty(lhs) && lhs != lhsBeforeTypePtrBase:
         lhs = parsePostfix(p, lhs)
     if !isEmpty(lhs) && isSpaceCallArgStartFor(p, lhs) && spaceCallSameLine p:
         if isDefiniteTypeExpr lhs:
@@ -2998,6 +2910,7 @@ fn parseEnumType(p: var ParserStateObj, pos: SourcePos): Node =
 
 fn parseTypeExpr(p: var ParserStateObj): Node =
     parserEnsureCommonTokenIds()
+    parserEnsureGeneratedFixedIds()
     let t: Token = current p
     if t.kind == tkKeyword && t.lexemeId == parserTokFnId:
         advance p
@@ -3065,7 +2978,7 @@ fn parseTypeExpr(p: var ParserStateObj): Node =
         if !isEmpty(baseVar) && nodeKind(baseVar) == nkPtrTy:
             addParseDiag(p, t, rawPointerForbidMessage("var is not allowed on pointer types"))
             return parserRejectRemovedTypeAlias(p, baseVar)
-        if plainName baseVar == "pointer":
+        if parserPlainNameId(baseVar) == parserGeneratedPointerId:
             addParseDiag(p, t, rawPointerForbidMessage("pointer alias is removed and bare void* is forbidden"))
             return parserRejectRemovedTypeAlias(p, baseVar)
         var vt: Node = newNode(nkVarTy, posFrom(t))
@@ -3390,7 +3303,7 @@ fn parseTypeDecl(p: var ParserStateObj, annots: Node[]): Node =
             var def: Node = astInvalidNodeId()
             if curKind(p) == tkNewline:
                 def = parseObjectType(p, nodePos(name))
-            elif curKind(p) == tkIdent && tokenLexemeEq(current(p), "object"):
+            elif curKind(p) == tkIdent && current(p).lexemeId == parserTokObjectId:
                 advance p
                 def = parseObjectType(p, nodePos(name))
             else:
@@ -3419,7 +3332,7 @@ fn parseTypeDecl(p: var ParserStateObj, annots: Node[]): Node =
     var def2: Node = astInvalidNodeId()
     if curKind(p) == tkNewline:
         def2 = parseObjectType(p, nodePos(name2))
-    elif curKind(p) == tkIdent && tokenLexemeEq(current(p), "object"):
+    elif curKind(p) == tkIdent && current(p).lexemeId == parserTokObjectId:
         advance p
         def2 = parseObjectType(p, nodePos(name2))
     else:
@@ -3467,25 +3380,25 @@ fn parseTraitDecl(p: var ParserStateObj): Node =
 
 fn parseImportPathPart(p: var ParserStateObj): Node =
     var part: Node = parseIdent(p, false)
-    var tails: str[] = []
+    var tails: Node[] = []
     while true:
         let t: Token = current p
         if t.kind == tkSymbol && t.lexemeId == parserTokMinusId && isIdentStart(peekKind(p, 1)):
             advance p
             let tail: Node = parseIdent(p, false)
             if tails.len <= 0:
-                add(tails, nodeIdent(part))
-            add(tails, nodeIdent(tail))
+                add(tails, part)
+            add(tails, tail)
             continue
         break
     if tails.len > 0:
-        nodeSetIdent(part, parserJoinPartsWithChar(tails, '-'))
+        nodeSetIdentId(part, parserJoinNodeIdentIdsWithChar(tails, '-'))
     return part
 
 fn parseImportPath(p: var ParserStateObj): Node =
     parserEnsureCommonTokenIds()
     var path: Node = parseImportPathPart p
-    var parts: str[] = []
+    var parts: Node[] = []
     while true:
         let t: Token = current p
         if t.kind == tkSymbol && (t.lexemeId == parserTokSlashId || t.lexemeId == parserTokDotId):
@@ -3496,12 +3409,12 @@ fn parseImportPath(p: var ParserStateObj): Node =
             advance p
             let part: Node = parseImportPathPart p
             if parts.len <= 0:
-                add(parts, nodeIdent(path))
-            add(parts, nodeIdent(part))
+                add(parts, path)
+            add(parts, part)
             continue
         break
     if parts.len > 0:
-        nodeSetIdent(path, parserJoinPartsWithChar(parts, '/'))
+        nodeSetIdentId(path, parserJoinNodeIdentIdsWithChar(parts, '/'))
     return path
 
 fn parserAllowStringImports(): bool =
@@ -3599,6 +3512,7 @@ fn parseStatement(p: var ParserStateObj): Node =
     let annots: Node[] = parseAnnotations p
     let t: Token = current p
     parserEnsureCommonTokenIds()
+    parserEnsureGeneratedFixedIds()
     let lexemeId: int32 = t.lexemeId
     if t.kind == tkKeyword:
         if lexemeId == parserTokAsyncId:
@@ -3797,7 +3711,7 @@ fn parseStatement(p: var ParserStateObj): Node =
         return call
     if !isEmpty(expr) && nodeKind(expr) == nkDotExpr && kidCount expr > 1:
         let member: Node = kid(expr, 1)
-        if !isEmpty(member) && plainName member == "inc":
+        if !isEmpty(member) && parserPlainNameId(member) == parserGeneratedIncId:
             let t2: Token = current p
             if isLineEnd t2.kind || (t2.kind == tkSymbol && (t2.lexemeId == parserTokSemiId || t2.lexemeId == parserTokRBraceId)):
                 var incCall: Node = newNode(nkCall, nodePos(expr))
@@ -3831,22 +3745,25 @@ fn parserMaterializeRoutineBodyFromTokensImpl(tokens: Token[], filename: str, ro
         addDiag(diags, svError, filename, pos1.line, pos1.col,
                 "internal parser error: invalid deferred body token span")
         return false
-    var bodyTokens: Token[] = []
     let bodySpan: int32 = endTok - startTok
     if bodySpan > 0:
-        bodyTokens.cap = bodySpan + 1
         astReserveAdditional(bodySpan, bodySpan * 2)
-    for i in startTok..<endTok:
-        parserAppendTokenClone(bodyTokens, tokens[i])
-    var eofT: Token = eofTok()
-    if bodyTokens.len > 0:
-        let last: Token = bodyTokens[bodyTokens.len - 1]
-        eofT.line = last.line
-        eofT.col = last.col
-    parserAppendTokenClone(bodyTokens, eofT)
+    var eofLine: int32 = 0
+    var eofCol: int32 = 0
+    if bodySpan > 0:
+        let last: Token = tokens[endTok - 1]
+        eofLine = last.line
+        eofCol = last.col
+    else:
+        let pos2: SourcePos = astNodePos(routineId)
+        eofLine = pos2.line
+        eofCol = pos2.col
     var pObj: ParserStateObj
-    pObj.tokens = bodyTokens
-    pObj.idx = 0
+    pObj.tokens = tokens
+    pObj.idx = startTok
+    pObj.endExclusive = endTok
+    pObj.eofLine = eofLine
+    pObj.eofCol = eofCol
     pObj.filename = filename
     pObj.diags = diags
     pObj.outlineOnly = false
@@ -3854,7 +3771,6 @@ fn parserMaterializeRoutineBodyFromTokensImpl(tokens: Token[], filename: str, ro
     let bodyId: AstNodeId = parseSuite(pObj)
     astSetKid(routineId, 3, bodyId)
     astSetNodeDeferredBodyState(routineId, int8(2))
-    freeSeq_Token(bodyTokens)
     return true
 
 fn materializeRoutineBodyFromTokensId(tokens: Token[], filename: str, routineId: AstNodeId, diags: Diagnostic[]*): bool =
@@ -3878,6 +3794,14 @@ fn parseModuleImplMode(tokens: Token[], filename: str, diags: Diagnostic[]*, out
     var pObj: ParserStateObj
     pObj.tokens = tokens
     pObj.idx = 0
+    pObj.endExclusive = tokens.len
+    if tokens.len > 0:
+        let lastTok: Token = tokens[tokens.len - 1]
+        pObj.eofLine = lastTok.line
+        pObj.eofCol = lastTok.col
+    else:
+        pObj.eofLine = 0
+        pObj.eofCol = 0
     pObj.filename = filename
     pObj.diags = diags
     pObj.outlineOnly = outlineOnly

@@ -10,7 +10,7 @@ Usage:
 
 Notes:
   - Emits a backend release manifest (JSON).
-  - By default it builds ./<binName> via build_backend_driver.sh.
+  - By default it builds ./<binName> via native build_backend_driver.
   - Use --driver:<path> to record the SHA of a self-hosted stage2 driver (or any custom driver binary).
   - Uses SOURCE_DATE_EPOCH when provided for build_id; otherwise uses the latest git commit timestamp.
 USAGE
@@ -46,8 +46,9 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
+tool="${TOOLING_REPO_SH:-$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh}"
 
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
@@ -72,7 +73,7 @@ resolve_path() {
 # Determine which driver binary to hash.
 driver_path="$driver"
 if [ "$driver_path" = "" ]; then
-  src/tooling/build_backend_driver.sh --name:"$name" >/dev/null
+  sh "$tool" build_backend_driver --name:"$name" >/dev/null
   driver_path="./$name"
 fi
 

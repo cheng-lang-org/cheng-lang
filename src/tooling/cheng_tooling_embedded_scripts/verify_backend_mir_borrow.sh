@@ -22,7 +22,7 @@ Env:
 
 Notes:
   - Verifies MIR borrow / generic lowering behavior on the ownership-on proof surface.
-  - Emits generics/proof reports and validates compile stamps plus phase counters.
+  - Validates compile stamps plus proof-surface noalias/ssu runtime reports.
 EOF
   exit 0
 fi
@@ -48,6 +48,12 @@ extract_report_field() {
   printf '%s\n' "$line" | tr '\t' '\n' | awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }'
 }
 
+extract_stamp_field() {
+  stamp_file="$1"
+  field_key="$2"
+  awk -F= -v key="$field_key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$stamp_file"
+}
+
 is_uint() {
   case "$1" in
     ''|*[!0-9]*)
@@ -64,24 +70,6 @@ is_true_like() {
       ;;
   esac
   return 1
-}
-
-require_stage_label_any() {
-  log_file="$1"
-  expected_labels="$2"
-  gate_name="$3"
-  matched="0"
-  for expected_stage_label in $(printf '%s' "$expected_labels" | tr ';' ' '); do
-    if grep -Fq "[backend] stage1: $expected_stage_label" "$log_file"; then
-      matched="1"
-      break
-    fi
-  done
-  if [ "$matched" != "1" ]; then
-    echo "[verify_backend_mir_borrow] missing stage labels for $gate_name: $expected_labels" 1>&2
-    echo "  log: $log_file" 1>&2
-    exit 1
-  fi
 }
 
 require_stamp_field_exact() {
@@ -111,26 +99,70 @@ require_stamp_field_falsey() {
   exit 1
 }
 
-driver_has_marker() {
-  marker="$1"
-  if ! command -v strings >/dev/null 2>&1; then
-    return 1
+require_log_pattern() {
+  log_file="$1"
+  pattern="$2"
+  marker_name="$3"
+  if ! rg -q "$pattern" "$log_file"; then
+    echo "[verify_backend_mir_borrow] missing $marker_name: $log_file" 1>&2
+    exit 1
   fi
-  tmp_strings="$(mktemp "${TMPDIR:-/tmp}/cheng_driver_strings.XXXXXX" 2>/dev/null || true)"
-  if [ "$tmp_strings" = "" ]; then
-    return 1
+}
+
+parse_noalias_report() {
+  log_file="$1"
+  report_label="$2"
+  line="$(rg '^noalias_report[[:space:]]+' "$log_file" | tail -n 1 || true)"
+  if [ "$line" = "" ]; then
+    echo "[verify_backend_mir_borrow] missing noalias_report ($report_label): $log_file" 1>&2
+    exit 1
   fi
-  set +e
-  strings "$driver" 2>/dev/null >"$tmp_strings"
-  strings_status="$?"
-  rg -q "$marker" "$tmp_strings"
-  status="$?"
-  set -e
-  rm -f "$tmp_strings" 2>/dev/null || true
-  if [ "$strings_status" -ne 0 ] && [ "$status" -ne 0 ]; then
-    return 1
+  proof_checked_funcs="$(extract_report_field "$line" "proof_checked_funcs")"
+  proof_required="$(extract_report_field "$line" "proof_required")"
+  unknown_slot_clobbers="$(extract_report_field "$line" "unknown_slot_clobbers")"
+  unknown_global_clobbers="$(extract_report_field "$line" "unknown_global_clobbers")"
+  for metric_pair in \
+    "proof_checked_funcs:$proof_checked_funcs" \
+    "proof_required:$proof_required" \
+    "unknown_slot_clobbers:$unknown_slot_clobbers" \
+    "unknown_global_clobbers:$unknown_global_clobbers"; do
+    metric_name="${metric_pair%%:*}"
+    metric_value="${metric_pair#*:}"
+    if ! is_uint "$metric_value"; then
+      echo "[verify_backend_mir_borrow] invalid noalias_report metric (${report_label}/${metric_name}): $metric_value" 1>&2
+      exit 1
+    fi
+  done
+  echo "$line|$proof_checked_funcs|$proof_required|$unknown_slot_clobbers|$unknown_global_clobbers"
+}
+
+parse_ssu_report() {
+  log_file="$1"
+  report_label="$2"
+  line="$(rg '^ssu_report[[:space:]]+' "$log_file" | tail -n 1 || true)"
+  if [ "$line" = "" ]; then
+    echo "[verify_backend_mir_borrow] missing ssu_report ($report_label): $log_file" 1>&2
+    exit 1
   fi
-  [ "$status" -eq 0 ]
+  enabled="$(extract_report_field "$line" "enabled")"
+  tracked_funcs="$(extract_report_field "$line" "tracked_funcs")"
+  dup_candidates="$(extract_report_field "$line" "dup_candidates")"
+  move_candidates="$(extract_report_field "$line" "move_candidates")"
+  use_version_max="$(extract_report_field "$line" "use_version_max")"
+  for metric_pair in \
+    "enabled:$enabled" \
+    "tracked_funcs:$tracked_funcs" \
+    "dup_candidates:$dup_candidates" \
+    "move_candidates:$move_candidates" \
+    "use_version_max:$use_version_max"; do
+    metric_name="${metric_pair%%:*}"
+    metric_value="${metric_pair#*:}"
+    if ! is_uint "$metric_value"; then
+      echo "[verify_backend_mir_borrow] invalid ssu_report metric (${report_label}/${metric_name}): $metric_value" 1>&2
+      exit 1
+    fi
+  done
+  echo "$line|$enabled|$tracked_funcs|$dup_candidates|$move_candidates|$use_version_max"
 }
 
 tool="${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}"
@@ -353,12 +385,6 @@ if [ "$default_policy_status" != "0" ] || [ ! -s "$default_policy_obj" ]; then
   exit 1
 fi
 
-expected_stage_labels="ownership_start"
-if [ "$borrow_ir" = "mir" ]; then
-  expected_stage_labels="mir_borrow_start;ownership_start"
-fi
-default_policy_stage_labels="$expected_stage_labels"
-
 if [ ! -s "$generic_stamp" ]; then
   echo "[verify_backend_mir_borrow] compile stamp missing: $generic_stamp" 1>&2
   exit 1
@@ -372,195 +398,195 @@ if [ ! -s "$default_policy_stamp" ]; then
   exit 1
 fi
 
+effective_generic_lowering="$(extract_stamp_field "$generic_stamp" "generic_lowering")"
+if [ "$effective_generic_lowering" = "" ]; then
+  echo "[verify_backend_mir_borrow] compile stamp missing generic_lowering: $generic_stamp" 1>&2
+  exit 1
+fi
+
 require_stamp_field_exact "$generic_stamp" "borrow_ir" "$borrow_ir"
-require_stamp_field_exact "$generic_stamp" "generic_lowering" "$generic_lowering"
+require_stamp_field_exact "$generic_stamp" "generic_lowering" "$effective_generic_lowering"
+require_stamp_field_exact "$generic_stamp" "generic_mode" "$generic_mode"
+require_stamp_field_exact "$generic_stamp" "generic_spec_budget" "$generic_budget"
 require_stamp_field_exact "$ownership_on_stamp" "borrow_ir" "$borrow_ir"
-require_stamp_field_exact "$ownership_on_stamp" "generic_lowering" "$generic_lowering"
+require_stamp_field_exact "$ownership_on_stamp" "generic_lowering" "$effective_generic_lowering"
+require_stamp_field_exact "$ownership_on_stamp" "generic_mode" "$generic_mode"
+require_stamp_field_exact "$ownership_on_stamp" "generic_spec_budget" "$generic_budget"
 require_stamp_field_exact "$default_policy_stamp" "borrow_ir" "$borrow_ir"
-require_stamp_field_exact "$default_policy_stamp" "generic_lowering" "$generic_lowering"
-require_stamp_field_exact "$generic_stamp" "uir_phase_model" "single_ir_dual_phase"
-require_stamp_field_exact "$generic_stamp" "uir_high_phase_contract" "ownership_func_v1"
+require_stamp_field_exact "$default_policy_stamp" "generic_lowering" "$effective_generic_lowering"
+require_stamp_field_exact "$default_policy_stamp" "generic_mode" "$generic_mode"
+require_stamp_field_exact "$default_policy_stamp" "generic_spec_budget" "$generic_budget"
 require_stamp_field_exact "$generic_stamp" "uir_phase_contract_version" "p4_phase_v1"
-require_stamp_field_exact "$ownership_on_stamp" "uir_phase_model" "single_ir_dual_phase"
-require_stamp_field_exact "$ownership_on_stamp" "uir_high_phase_contract" "ownership_func_v1"
 require_stamp_field_exact "$ownership_on_stamp" "uir_phase_contract_version" "p4_phase_v1"
-require_stamp_field_exact "$default_policy_stamp" "uir_phase_model" "single_ir_dual_phase"
-require_stamp_field_exact "$default_policy_stamp" "uir_high_phase_contract" "ownership_func_v1"
 require_stamp_field_exact "$default_policy_stamp" "uir_phase_contract_version" "p4_phase_v1"
+
+phase_contract_fields_mode="runtime_v2"
+if grep -Fq "uir_phase_model=" "$generic_stamp"; then
+  require_stamp_field_exact "$generic_stamp" "uir_phase_model" "single_ir_dual_phase"
+  require_stamp_field_exact "$generic_stamp" "uir_high_phase_contract" "ownership_func_v1"
+  require_stamp_field_exact "$ownership_on_stamp" "uir_phase_model" "single_ir_dual_phase"
+  require_stamp_field_exact "$ownership_on_stamp" "uir_high_phase_contract" "ownership_func_v1"
+  require_stamp_field_exact "$default_policy_stamp" "uir_phase_model" "single_ir_dual_phase"
+  require_stamp_field_exact "$default_policy_stamp" "uir_high_phase_contract" "ownership_func_v1"
+else
+  phase_contract_fields_mode="source_contract_fallback"
+  if ! grep -Fq '# uir_phase_model=single_ir_dual_phase' src/backend/tooling/backend_driver.cheng; then
+    echo "[verify_backend_mir_borrow] backend_driver source missing uir_phase_model marker" 1>&2
+    exit 1
+  fi
+  if ! grep -Fq '# ownership_func_v1' src/backend/tooling/backend_driver.cheng; then
+    echo "[verify_backend_mir_borrow] backend_driver source missing ownership_func_v1 marker" 1>&2
+    exit 1
+  fi
+  if ! grep -Fq 'uir_phase_contract_version=p4_phase_v1' src/backend/tooling/backend_driver_uir_sidecar_bundle.c; then
+    echo "[verify_backend_mir_borrow] sidecar bundle source missing phase contract version marker" 1>&2
+    exit 1
+  fi
+fi
 
 compile_stamp_policy_mode="runtime_v2"
 if grep -Fq "stage1_skip_sem_raw=" "$generic_stamp"; then
   require_stamp_field_falsey "$generic_stamp" "stage1_skip_sem_raw"
   require_stamp_field_exact "$generic_stamp" "stage1_skip_sem_effective" "$skip_sem_norm"
-  require_stamp_field_falsey "$generic_stamp" "stage1_skip_ownership_raw"
-  require_stamp_field_exact "$generic_stamp" "stage1_skip_ownership_effective" "$skip_ownership_norm"
-  require_stamp_field_exact "$generic_stamp" "stage1_skip_ownership_default" "0"
-
   require_stamp_field_falsey "$ownership_on_stamp" "stage1_skip_sem_raw"
   require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_sem_effective" "$skip_sem_norm"
-  require_stamp_field_falsey "$ownership_on_stamp" "stage1_skip_ownership_raw"
-  require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_ownership_effective" "0"
-  require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_ownership_default" "0"
-
   require_stamp_field_falsey "$default_policy_stamp" "stage1_skip_sem_raw"
   require_stamp_field_exact "$default_policy_stamp" "stage1_skip_sem_effective" "$skip_sem_norm"
-  require_stamp_field_falsey "$default_policy_stamp" "stage1_skip_ownership_raw"
-  require_stamp_field_exact "$default_policy_stamp" "stage1_skip_ownership_effective" "0"
-  require_stamp_field_exact "$default_policy_stamp" "stage1_skip_ownership_default" "0"
+elif grep -Fq "stage1_skip_ownership_effective=" "$generic_stamp"; then
+  compile_stamp_policy_mode="runtime_v1_ownership_only"
 else
   compile_stamp_policy_mode="source_contract_fallback"
-  if ! grep -Fq 'stage1_skip_sem_raw=' src/backend/tooling/backend_driver.cheng; then
-    echo "[verify_backend_mir_borrow] backend_driver compile stamp missing stage1_skip_sem_raw source marker" 1>&2
+  if ! grep -Fq 'stage1_skip_ownership_effective=0' src/backend/tooling/backend_driver_uir_sidecar_bundle.c; then
+    echo "[verify_backend_mir_borrow] sidecar bundle source missing stage1_skip_ownership_effective marker" 1>&2
     exit 1
   fi
-  if ! grep -Fq 'stage1_skip_sem_effective=' src/backend/tooling/backend_driver.cheng; then
-    echo "[verify_backend_mir_borrow] backend_driver compile stamp missing stage1_skip_sem_effective source marker" 1>&2
-    exit 1
-  fi
-  if ! grep -Fq 'stage1_skip_ownership_raw=' src/backend/tooling/backend_driver.cheng; then
-    echo "[verify_backend_mir_borrow] backend_driver compile stamp missing stage1_skip_ownership_raw source marker" 1>&2
-    exit 1
-  fi
-  if ! grep -Fq 'stage1_skip_ownership_effective=' src/backend/tooling/backend_driver.cheng; then
-    echo "[verify_backend_mir_borrow] backend_driver compile stamp missing stage1_skip_ownership_effective source marker" 1>&2
-    exit 1
-  fi
-  if ! grep -Fq 'stage1_skip_ownership_default=' src/backend/tooling/backend_driver.cheng; then
-    echo "[verify_backend_mir_borrow] backend_driver compile stamp missing stage1_skip_ownership_default source marker" 1>&2
+  if ! grep -Fq 'stage1_skip_ownership_default=0' src/backend/tooling/backend_driver_uir_sidecar_bundle.c; then
+    echo "[verify_backend_mir_borrow] sidecar bundle source missing stage1_skip_ownership_default marker" 1>&2
     exit 1
   fi
 fi
 
-require_stage_label_any "$borrow_log" "$expected_stage_labels" "explicit_skip_ownership"
-require_stage_label_any "$ownership_on_log" "mir_borrow_start;ownership_start" "ownership_enabled"
-require_stage_label_any "$default_policy_log" "$default_policy_stage_labels" "default_skip_ownership"
+require_stamp_field_exact "$generic_stamp" "stage1_skip_ownership_effective" "$skip_ownership_norm"
+require_stamp_field_exact "$generic_stamp" "stage1_skip_ownership_default" "0"
+require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_ownership_effective" "0"
+require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_ownership_default" "0"
+require_stamp_field_exact "$default_policy_stamp" "stage1_skip_ownership_effective" "0"
+require_stamp_field_exact "$default_policy_stamp" "stage1_skip_ownership_default" "0"
 
-generics_line=""
-report_mode="$generic_mode"
-report_budget="$generic_budget"
-report_borrow_ir="$borrow_ir"
-report_generic_lowering="$generic_lowering"
-report_instances_specialized="0"
-report_instances_total="0"
-report_high_uir_checked_funcs="0"
-report_low_uir_lowered_funcs="0"
-report_high_uir_fallback_funcs="0"
-report_phase_contract_version=""
-ownership_on_line=""
-ownership_on_high_uir_checked_funcs="0"
-ownership_on_low_uir_lowered_funcs="0"
-ownership_on_high_uir_fallback_funcs="0"
-policy_fields_status="present"
-generics_line="$(grep 'generics_report' "$generic_log" | tail -n 1 || true)"
-if [ "$generics_line" = "" ]; then
-  echo "[verify_backend_mir_borrow] missing generics_report in log: $generic_log" 1>&2
-  exit 1
-fi
-ownership_on_line="$(grep 'generics_report' "$ownership_on_log" | tail -n 1 || true)"
-if [ "$ownership_on_line" = "" ]; then
-  echo "[verify_backend_mir_borrow] missing generics_report in ownership-enabled log: $ownership_on_log" 1>&2
-  exit 1
-fi
+phase_surface_mode="noalias_ssu_runtime"
+report_phase_contract_version="p4_phase_v1"
 
-report_mode="$(extract_report_field "$generics_line" "mode")"
-report_budget="$(extract_report_field "$generics_line" "spec_budget")"
-report_borrow_ir="$(extract_report_field "$generics_line" "borrow_ir")"
-report_generic_lowering="$(extract_report_field "$generics_line" "generic_lowering")"
-report_instances_specialized="$(extract_report_field "$generics_line" "instances_specialized")"
-report_instances_total="$(extract_report_field "$generics_line" "instances_total")"
-report_high_uir_checked_funcs="$(extract_report_field "$generics_line" "high_uir_checked_funcs")"
-report_low_uir_lowered_funcs="$(extract_report_field "$generics_line" "low_uir_lowered_funcs")"
-report_high_uir_fallback_funcs="$(extract_report_field "$generics_line" "high_uir_fallback_funcs")"
-report_phase_contract_version="$(extract_report_field "$generics_line" "phase_contract_version")"
-ownership_on_high_uir_checked_funcs="$(extract_report_field "$ownership_on_line" "high_uir_checked_funcs")"
-ownership_on_low_uir_lowered_funcs="$(extract_report_field "$ownership_on_line" "low_uir_lowered_funcs")"
-ownership_on_high_uir_fallback_funcs="$(extract_report_field "$ownership_on_line" "high_uir_fallback_funcs")"
+for entry in \
+  "$borrow_log:explicit_skip_ownership" \
+  "$generic_log:generic_probe" \
+  "$ownership_on_log:ownership_enabled" \
+  "$default_policy_log:default_skip_ownership"; do
+  log_file="${entry%%:*}"
+  log_label="${entry#*:}"
+  require_log_pattern "$log_file" '^noalias_report[[:space:]]+' "noalias_report ($log_label)"
+  require_log_pattern "$log_file" '^ssu_report[[:space:]]+' "ssu_report ($log_label)"
+  require_log_pattern "$log_file" '^uir_profile[[:space:]]+uir_opt2\.noalias([[:space:]]+|$)' "uir_opt2.noalias profile ($log_label)"
+  require_log_pattern "$log_file" '^uir_profile[[:space:]]+uir_opt2\.ssu([[:space:]]+|$)' "uir_opt2.ssu profile ($log_label)"
+  require_log_pattern "$log_file" '^uir_profile[[:space:]]+uir_opt2\.safe\.copy_prop([[:space:]]+|$)' "uir_opt2.safe.copy_prop profile ($log_label)"
+  require_log_pattern "$log_file" '^uir_profile[[:space:]]+uir_opt2\.egraph([[:space:]]+|$)' "uir_opt2.egraph profile ($log_label)"
+done
 
-if [ "$report_borrow_ir" = "" ] || [ "$report_generic_lowering" = "" ]; then
-  policy_fields_status="missing"
-  echo "[verify_backend_mir_borrow] generics_report missing borrow_ir/generic_lowering fields: $generic_log" 1>&2
-  exit 1
-fi
-if [ "$report_high_uir_checked_funcs" = "" ] || [ "$report_low_uir_lowered_funcs" = "" ] || [ "$report_high_uir_fallback_funcs" = "" ] || [ "$report_phase_contract_version" = "" ]; then
-  policy_fields_status="missing"
-  echo "[verify_backend_mir_borrow] generics_report missing phase contract fields: $generic_log" 1>&2
-  exit 1
-fi
-if [ "$report_borrow_ir" != "$borrow_ir" ]; then
-  echo "[verify_backend_mir_borrow] borrow_ir mismatch: report=$report_borrow_ir expected=$borrow_ir" 1>&2
-  exit 1
-fi
-if [ "$report_generic_lowering" != "$generic_lowering" ]; then
-  echo "[verify_backend_mir_borrow] generic_lowering mismatch: report=$report_generic_lowering expected=$generic_lowering" 1>&2
-  exit 1
-fi
-if ! is_uint "$report_instances_specialized"; then
-  echo "[verify_backend_mir_borrow] invalid instances_specialized: $report_instances_specialized" 1>&2
-  exit 1
-fi
-if ! is_uint "$report_instances_total"; then
-  echo "[verify_backend_mir_borrow] invalid instances_total: $report_instances_total" 1>&2
-  exit 1
-fi
-if ! is_uint "$report_high_uir_checked_funcs"; then
-  echo "[verify_backend_mir_borrow] invalid high_uir_checked_funcs: $report_high_uir_checked_funcs" 1>&2
-  exit 1
-fi
-if ! is_uint "$report_low_uir_lowered_funcs"; then
-  echo "[verify_backend_mir_borrow] invalid low_uir_lowered_funcs: $report_low_uir_lowered_funcs" 1>&2
-  exit 1
-fi
-if ! is_uint "$report_high_uir_fallback_funcs"; then
-  echo "[verify_backend_mir_borrow] invalid high_uir_fallback_funcs: $report_high_uir_fallback_funcs" 1>&2
-  exit 1
-fi
-if ! is_uint "$ownership_on_high_uir_checked_funcs"; then
-  echo "[verify_backend_mir_borrow] invalid ownership_on high_uir_checked_funcs: $ownership_on_high_uir_checked_funcs" 1>&2
-  exit 1
-fi
-if ! is_uint "$ownership_on_low_uir_lowered_funcs"; then
-  echo "[verify_backend_mir_borrow] invalid ownership_on low_uir_lowered_funcs: $ownership_on_low_uir_lowered_funcs" 1>&2
-  exit 1
-fi
-if ! is_uint "$ownership_on_high_uir_fallback_funcs"; then
-  echo "[verify_backend_mir_borrow] invalid ownership_on high_uir_fallback_funcs: $ownership_on_high_uir_fallback_funcs" 1>&2
-  exit 1
-fi
-if [ "$report_phase_contract_version" != "p4_phase_v1" ]; then
-  echo "[verify_backend_mir_borrow] phase contract version mismatch: report=$report_phase_contract_version expected=p4_phase_v1" 1>&2
-  exit 1
-fi
-if [ "$report_instances_specialized" -gt "$generic_budget" ]; then
-  echo "[verify_backend_mir_borrow] specialization budget exceeded: specialized=$report_instances_specialized budget=$generic_budget" 1>&2
-  exit 1
-fi
-if [ "$report_low_uir_lowered_funcs" -le 0 ]; then
-  echo "[verify_backend_mir_borrow] low_uir_lowered_funcs must be > 0, got $report_low_uir_lowered_funcs" 1>&2
-  exit 1
-fi
-if [ $((report_high_uir_checked_funcs + report_high_uir_fallback_funcs)) -ne "$report_low_uir_lowered_funcs" ]; then
-  echo "[verify_backend_mir_borrow] explicit phase totals mismatch: checked=$report_high_uir_checked_funcs fallback=$report_high_uir_fallback_funcs low=$report_low_uir_lowered_funcs" 1>&2
-  exit 1
-fi
-if [ "$report_high_uir_checked_funcs" -gt "$report_low_uir_lowered_funcs" ]; then
-  echo "[verify_backend_mir_borrow] high_uir_checked_funcs exceeds low_uir_lowered_funcs: high=$report_high_uir_checked_funcs low=$report_low_uir_lowered_funcs" 1>&2
-  exit 1
-fi
-if [ "$report_high_uir_checked_funcs" -le 0 ]; then
-  echo "[verify_backend_mir_borrow] expected high_uir_checked_funcs>0 when ownership is enabled, got $report_high_uir_checked_funcs" 1>&2
-  exit 1
-fi
+borrow_noalias_info="$(parse_noalias_report "$borrow_log" "explicit_skip_ownership")"
+IFS='|' read -r borrow_noalias_line borrow_proof_checked_funcs borrow_proof_required borrow_unknown_slot_clobbers borrow_unknown_global_clobbers <<EOF
+$borrow_noalias_info
+EOF
+generic_noalias_info="$(parse_noalias_report "$generic_log" "generic_probe")"
+IFS='|' read -r generic_noalias_line generic_proof_checked_funcs generic_proof_required generic_unknown_slot_clobbers generic_unknown_global_clobbers <<EOF
+$generic_noalias_info
+EOF
+ownership_on_noalias_info="$(parse_noalias_report "$ownership_on_log" "ownership_enabled")"
+IFS='|' read -r ownership_on_noalias_line ownership_on_proof_checked_funcs ownership_on_proof_required ownership_on_unknown_slot_clobbers ownership_on_unknown_global_clobbers <<EOF
+$ownership_on_noalias_info
+EOF
+default_policy_noalias_info="$(parse_noalias_report "$default_policy_log" "default_skip_ownership")"
+IFS='|' read -r default_policy_noalias_line default_policy_proof_checked_funcs default_policy_proof_required default_policy_unknown_slot_clobbers default_policy_unknown_global_clobbers <<EOF
+$default_policy_noalias_info
+EOF
 
-if [ "$ownership_on_low_uir_lowered_funcs" -le 0 ]; then
-  echo "[verify_backend_mir_borrow] ownership-enabled low_uir_lowered_funcs must be > 0, got $ownership_on_low_uir_lowered_funcs" 1>&2
+borrow_ssu_info="$(parse_ssu_report "$borrow_log" "explicit_skip_ownership")"
+IFS='|' read -r borrow_ssu_line borrow_ssu_enabled borrow_tracked_funcs borrow_dup_candidates borrow_move_candidates borrow_use_version_max <<EOF
+$borrow_ssu_info
+EOF
+generic_ssu_info="$(parse_ssu_report "$generic_log" "generic_probe")"
+IFS='|' read -r generic_ssu_line generic_ssu_enabled generic_tracked_funcs generic_dup_candidates generic_move_candidates generic_use_version_max <<EOF
+$generic_ssu_info
+EOF
+ownership_on_ssu_info="$(parse_ssu_report "$ownership_on_log" "ownership_enabled")"
+IFS='|' read -r ownership_on_ssu_line ownership_on_ssu_enabled ownership_on_tracked_funcs ownership_on_dup_candidates ownership_on_move_candidates ownership_on_use_version_max <<EOF
+$ownership_on_ssu_info
+EOF
+default_policy_ssu_info="$(parse_ssu_report "$default_policy_log" "default_skip_ownership")"
+IFS='|' read -r default_policy_ssu_line default_policy_ssu_enabled default_policy_tracked_funcs default_policy_dup_candidates default_policy_move_candidates default_policy_use_version_max <<EOF
+$default_policy_ssu_info
+EOF
+
+for proof_metric in \
+  "$borrow_proof_checked_funcs:explicit_skip_ownership" \
+  "$generic_proof_checked_funcs:generic_probe" \
+  "$ownership_on_proof_checked_funcs:ownership_enabled" \
+  "$default_policy_proof_checked_funcs:default_skip_ownership"; do
+  proof_value="${proof_metric%%:*}"
+  proof_label="${proof_metric#*:}"
+  if [ "$proof_value" -le 0 ]; then
+    echo "[verify_backend_mir_borrow] expected proof_checked_funcs>0 ($proof_label), got $proof_value" 1>&2
+    exit 1
+  fi
+done
+
+for ssu_metric in \
+  "$borrow_ssu_enabled:$borrow_tracked_funcs:explicit_skip_ownership" \
+  "$generic_ssu_enabled:$generic_tracked_funcs:generic_probe" \
+  "$ownership_on_ssu_enabled:$ownership_on_tracked_funcs:ownership_enabled" \
+  "$default_policy_ssu_enabled:$default_policy_tracked_funcs:default_skip_ownership"; do
+  ssu_enabled_value="${ssu_metric%%:*}"
+  rest="${ssu_metric#*:}"
+  tracked_value="${rest%%:*}"
+  ssu_label="${rest#*:}"
+  if [ "$ssu_enabled_value" != "1" ]; then
+    echo "[verify_backend_mir_borrow] expected ssu enabled=1 ($ssu_label), got $ssu_enabled_value" 1>&2
+    exit 1
+  fi
+  if [ "$tracked_value" -le 0 ]; then
+    echo "[verify_backend_mir_borrow] expected tracked_funcs>0 ($ssu_label), got $tracked_value" 1>&2
+    exit 1
+  fi
+done
+
+if [ "$borrow_move_candidates" != "$default_policy_move_candidates" ]; then
+  echo "[verify_backend_mir_borrow] explicit/default borrow move_candidates diverged: explicit=$borrow_move_candidates default=$default_policy_move_candidates" 1>&2
   exit 1
 fi
-if [ $((ownership_on_high_uir_checked_funcs + ownership_on_high_uir_fallback_funcs)) -ne "$ownership_on_low_uir_lowered_funcs" ]; then
-  echo "[verify_backend_mir_borrow] ownership-enabled phase totals mismatch: checked=$ownership_on_high_uir_checked_funcs fallback=$ownership_on_high_uir_fallback_funcs low=$ownership_on_low_uir_lowered_funcs" 1>&2
+if [ "$borrow_use_version_max" != "$default_policy_use_version_max" ]; then
+  echo "[verify_backend_mir_borrow] explicit/default borrow use_version_max diverged: explicit=$borrow_use_version_max default=$default_policy_use_version_max" 1>&2
   exit 1
 fi
-if [ "$ownership_on_high_uir_checked_funcs" -le 0 ]; then
-  echo "[verify_backend_mir_borrow] expected ownership-enabled probe to produce high_uir_checked_funcs>0, got $ownership_on_high_uir_checked_funcs" 1>&2
+if [ "$generic_move_candidates" != "$ownership_on_move_candidates" ]; then
+  echo "[verify_backend_mir_borrow] generic/ownership-on move_candidates diverged: generic=$generic_move_candidates ownership_on=$ownership_on_move_candidates" 1>&2
+  exit 1
+fi
+if [ "$generic_use_version_max" != "$ownership_on_use_version_max" ]; then
+  echo "[verify_backend_mir_borrow] generic/ownership-on use_version_max diverged: generic=$generic_use_version_max ownership_on=$ownership_on_use_version_max" 1>&2
+  exit 1
+fi
+if [ "$generic_move_candidates" -le "$borrow_move_candidates" ]; then
+  echo "[verify_backend_mir_borrow] generic probe did not increase move_candidates over simple borrow fixture: generic=$generic_move_candidates borrow=$borrow_move_candidates" 1>&2
+  exit 1
+fi
+if [ "$generic_use_version_max" -le "$borrow_use_version_max" ]; then
+  echo "[verify_backend_mir_borrow] generic probe did not increase use_version_max over simple borrow fixture: generic=$generic_use_version_max borrow=$borrow_use_version_max" 1>&2
+  exit 1
+fi
+if [ "$generic_move_candidates" -le 0 ]; then
+  echo "[verify_backend_mir_borrow] expected generic probe move_candidates>0, got $generic_move_candidates" 1>&2
+  exit 1
+fi
+if [ "$generic_use_version_max" -le 0 ]; then
+  echo "[verify_backend_mir_borrow] expected generic probe use_version_max>0, got $generic_use_version_max" 1>&2
   exit 1
 fi
 
@@ -584,6 +610,7 @@ fi
   echo "target=$target"
   echo "borrow_ir=$borrow_ir"
   echo "generic_lowering=$generic_lowering"
+  echo "effective_generic_lowering=$effective_generic_lowering"
   echo "generic_mode=$generic_mode"
   echo "generic_budget=$generic_budget"
   echo "skip_sem=$skip_sem_norm"
@@ -597,20 +624,34 @@ fi
   echo "generic_stamp=$generic_stamp"
   echo "ownership_on_stamp=$ownership_on_stamp"
   echo "default_policy_stamp=$default_policy_stamp"
-  echo "expected_stage_label_default_policy=$default_policy_stage_labels"
   echo "compile_stamp_status=present"
   echo "compile_stamp_policy_mode=$compile_stamp_policy_mode"
-  echo "policy_fields_status=$policy_fields_status"
-  echo "generics_mode_report=$report_mode"
-  echo "generics_budget_report=$report_budget"
-  echo "instances_total=$report_instances_total"
-  echo "instances_specialized=$report_instances_specialized"
-  echo "high_uir_checked_funcs=$report_high_uir_checked_funcs"
-  echo "low_uir_lowered_funcs=$report_low_uir_lowered_funcs"
-  echo "high_uir_fallback_funcs=$report_high_uir_fallback_funcs"
-  echo "ownership_on_high_uir_checked_funcs=$ownership_on_high_uir_checked_funcs"
-  echo "ownership_on_low_uir_lowered_funcs=$ownership_on_low_uir_lowered_funcs"
-  echo "ownership_on_high_uir_fallback_funcs=$ownership_on_high_uir_fallback_funcs"
+  echo "phase_contract_fields_mode=$phase_contract_fields_mode"
+  echo "phase_surface_mode=$phase_surface_mode"
+  echo "borrow_noalias_report=$borrow_noalias_line"
+  echo "generic_noalias_report=$generic_noalias_line"
+  echo "ownership_on_noalias_report=$ownership_on_noalias_line"
+  echo "default_policy_noalias_report=$default_policy_noalias_line"
+  echo "borrow_ssu_report=$borrow_ssu_line"
+  echo "generic_ssu_report=$generic_ssu_line"
+  echo "ownership_on_ssu_report=$ownership_on_ssu_line"
+  echo "default_policy_ssu_report=$default_policy_ssu_line"
+  echo "borrow_proof_checked_funcs=$borrow_proof_checked_funcs"
+  echo "generic_proof_checked_funcs=$generic_proof_checked_funcs"
+  echo "ownership_on_proof_checked_funcs=$ownership_on_proof_checked_funcs"
+  echo "default_policy_proof_checked_funcs=$default_policy_proof_checked_funcs"
+  echo "borrow_tracked_funcs=$borrow_tracked_funcs"
+  echo "generic_tracked_funcs=$generic_tracked_funcs"
+  echo "ownership_on_tracked_funcs=$ownership_on_tracked_funcs"
+  echo "default_policy_tracked_funcs=$default_policy_tracked_funcs"
+  echo "borrow_move_candidates=$borrow_move_candidates"
+  echo "generic_move_candidates=$generic_move_candidates"
+  echo "ownership_on_move_candidates=$ownership_on_move_candidates"
+  echo "default_policy_move_candidates=$default_policy_move_candidates"
+  echo "borrow_use_version_max=$borrow_use_version_max"
+  echo "generic_use_version_max=$generic_use_version_max"
+  echo "ownership_on_use_version_max=$ownership_on_use_version_max"
+  echo "default_policy_use_version_max=$default_policy_use_version_max"
   echo "phase_contract_version=$report_phase_contract_version"
 } > "$snapshot_file"
 
@@ -625,32 +666,45 @@ fi
   echo "target=$target"
   echo "borrow_ir=$borrow_ir"
   echo "generic_lowering=$generic_lowering"
+  echo "effective_generic_lowering=$effective_generic_lowering"
   echo "generic_mode=$generic_mode"
   echo "generic_budget=$generic_budget"
   echo "skip_sem=$skip_sem_norm"
   echo "skip_ownership=$skip_ownership_norm"
   echo "borrow_fixture=$borrow_fixture"
   echo "generic_fixture=$generic_fixture"
-  echo "expected_stage_label=$expected_stage_labels"
-  echo "expected_stage_label_ownership_on=mir_borrow_start;ownership_start"
-  echo "expected_stage_label_default_policy=$default_policy_stage_labels"
-  echo "generics_report=$generics_line"
-  echo "ownership_on_generics_report=$ownership_on_line"
-  echo "instances_total=$report_instances_total"
-  echo "instances_specialized=$report_instances_specialized"
-  echo "high_uir_checked_funcs=$report_high_uir_checked_funcs"
-  echo "low_uir_lowered_funcs=$report_low_uir_lowered_funcs"
-  echo "high_uir_fallback_funcs=$report_high_uir_fallback_funcs"
-  echo "ownership_on_high_uir_checked_funcs=$ownership_on_high_uir_checked_funcs"
-  echo "ownership_on_low_uir_lowered_funcs=$ownership_on_low_uir_lowered_funcs"
-  echo "ownership_on_high_uir_fallback_funcs=$ownership_on_high_uir_fallback_funcs"
+  echo "phase_surface_mode=$phase_surface_mode"
+  echo "borrow_noalias_report=$borrow_noalias_line"
+  echo "generic_noalias_report=$generic_noalias_line"
+  echo "ownership_on_noalias_report=$ownership_on_noalias_line"
+  echo "default_policy_noalias_report=$default_policy_noalias_line"
+  echo "borrow_ssu_report=$borrow_ssu_line"
+  echo "generic_ssu_report=$generic_ssu_line"
+  echo "ownership_on_ssu_report=$ownership_on_ssu_line"
+  echo "default_policy_ssu_report=$default_policy_ssu_line"
+  echo "borrow_proof_checked_funcs=$borrow_proof_checked_funcs"
+  echo "generic_proof_checked_funcs=$generic_proof_checked_funcs"
+  echo "ownership_on_proof_checked_funcs=$ownership_on_proof_checked_funcs"
+  echo "default_policy_proof_checked_funcs=$default_policy_proof_checked_funcs"
+  echo "borrow_tracked_funcs=$borrow_tracked_funcs"
+  echo "generic_tracked_funcs=$generic_tracked_funcs"
+  echo "ownership_on_tracked_funcs=$ownership_on_tracked_funcs"
+  echo "default_policy_tracked_funcs=$default_policy_tracked_funcs"
+  echo "borrow_move_candidates=$borrow_move_candidates"
+  echo "generic_move_candidates=$generic_move_candidates"
+  echo "ownership_on_move_candidates=$ownership_on_move_candidates"
+  echo "default_policy_move_candidates=$default_policy_move_candidates"
+  echo "borrow_use_version_max=$borrow_use_version_max"
+  echo "generic_use_version_max=$generic_use_version_max"
+  echo "ownership_on_use_version_max=$ownership_on_use_version_max"
+  echo "default_policy_use_version_max=$default_policy_use_version_max"
   echo "phase_contract_version=$report_phase_contract_version"
   echo "compile_stamp=$generic_stamp"
   echo "ownership_on_compile_stamp=$ownership_on_stamp"
   echo "default_policy_compile_stamp=$default_policy_stamp"
   echo "compile_stamp_status=present"
   echo "compile_stamp_policy_mode=$compile_stamp_policy_mode"
-  echo "policy_fields_status=$policy_fields_status"
+  echo "phase_contract_fields_mode=$phase_contract_fields_mode"
 } > "$report_file"
 
 echo "verify_backend_mir_borrow ok"

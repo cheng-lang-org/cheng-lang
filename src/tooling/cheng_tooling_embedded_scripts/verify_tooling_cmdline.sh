@@ -334,7 +334,7 @@ run_logged_expect "$list_out" \
   "" \
   160 \
   env TOOLING_FORCE_BUILD=1 TOOLING_LINKER=system "$tool" list
-for id in backend_prod_closure verify_backend_closedloop chengc verify_tooling_cmdline verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract; do
+for id in backend_prod_closure verify_backend_closedloop chengc verify_tooling_cmdline verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
   if ! rg -qx "$id" "$list_out"; then
     echo "[verify_tooling_cmdline] missing id in list output: $id" 1>&2
     exit 1
@@ -470,7 +470,7 @@ run_logged_expect "$real_list_out" \
   "" \
   160 \
   "$real_tool" list
-for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract; do
+for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
   if ! rg -qx "$id" "$real_list_out"; then
     echo "[verify_tooling_cmdline] real launcher missing id in list output: $id" 1>&2
     exit 1
@@ -492,7 +492,7 @@ run_logged_expect "$real_primary_list_out" \
   "" \
   160 \
   "$real_primary_bin" list
-for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract; do
+for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
   if ! rg -qx "$id" "$real_primary_list_out"; then
     echo "[verify_tooling_cmdline] real primary binary missing id in list output: $id" 1>&2
     exit 1

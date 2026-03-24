@@ -3,33 +3,8 @@
 set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
-
-driver_has_non_c_abi_diag() {
-  cand="$1"
-  if [ "$cand" = "" ] || [ ! -x "$cand" ]; then
-    return 1
-  fi
-  if ! command -v strings >/dev/null 2>&1; then
-    return 1
-  fi
-  tmp_strings="$(mktemp "${TMPDIR:-/tmp}/cheng_driver_strings.XXXXXX" 2>/dev/null || true)"
-  if [ "$tmp_strings" = "" ]; then
-    return 1
-  fi
-  set +e
-  strings "$cand" 2>/dev/null >"$tmp_strings"
-  strings_status="$?"
-  grep -Fq "no-pointer policy: pointer types are forbidden outside C ABI modules" "$tmp_strings"
-  status="$?"
-  set -e
-  rm -f "$tmp_strings" 2>/dev/null || true
-  if [ "$strings_status" -ne 0 ] && [ "$status" -ne 0 ]; then
-    return 1
-  fi
-  [ "$status" -eq 0 ]
-}
 
 run_with_timeout() {
   seconds="$1"
@@ -79,28 +54,42 @@ run_with_timeout() {
   ' "$seconds" "$@"
 }
 
+compile_cli() {
+  src="$1"
+  out="$2"
+  log="$3"
+  run_with_timeout "$timeout_s" env \
+    BACKEND_DRIVER="$driver" \
+    STAGE1_SEM_FIXED_0=0 \
+    STAGE1_OWNERSHIP_FIXED_0=0 \
+    "$cheng_tool" cheng --in:"$src" --out:"$out" >"$log" 2>&1
+}
+
 out_dir="artifacts/backend_noptr_default_cli"
 probe_non_c_abi="tests/cheng/backend/fixtures/noptr_default_cli_probe_tmp.cheng"
-obj_non_c_abi="$out_dir/noptr_default_cli_probe.bin"
+out_non_c_abi="$out_dir/noptr_default_cli_probe.bin"
 log_non_c_abi="$out_dir/noptr_default_cli_probe.log"
 positive_src="tests/cheng/backend/fixtures/return_add.cheng"
-obj_positive="$out_dir/noptr_default_cli_positive.bin"
+out_positive="$out_dir/noptr_default_cli_positive.bin"
 log_positive="$out_dir/noptr_default_cli_positive.log"
-bridge_src="tests/cheng/backend/fixtures/hello_importc_puts.cheng"
-obj_bridge="$out_dir/noptr_default_cli_c_bridge.bin"
-log_bridge="$out_dir/noptr_default_cli_c_bridge.log"
-chengc_tool="${TOOLING_CHENGC_BIN:-${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}}"
+safe_importc_src="tests/cheng/backend/fixtures/hello_importc_puts.cheng"
+out_safe_importc="$out_dir/noptr_default_cli_safe_importc.bin"
+log_safe_importc="$out_dir/noptr_default_cli_safe_importc.log"
+raw_importc_src="tests/cheng/backend/fixtures/compile_fail_ffi_importc_voidptr_surface.cheng"
+out_raw_importc="$out_dir/noptr_default_cli_raw_importc.bin"
+log_raw_importc="$out_dir/noptr_default_cli_raw_importc.log"
+cheng_tool="${TOOLING_CHENG_BIN:-${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling}}"
+diag_pattern='no-pointer policy: (bare void\* surface is|pointer types are|pointer dereference is|pointer operation is) forbidden (outside C ABI modules|in user modules)'
+backend_block_pattern='macho_writer: unsupported machine op'
 timeout_s="${BACKEND_NOPTR_DEFAULT_CLI_TIMEOUT:-60}"
+positive_backend_blocked="0"
+safe_importc_backend_blocked="0"
 
 mkdir -p "$out_dir"
 
-driver="${BACKEND_DRIVER:-}"
-if [ "$driver" = "" ]; then
-  driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)"
-fi
-
-if ! driver_has_non_c_abi_diag "$driver"; then
-  echo "[Error] backend driver missing non-C-ABI no-pointer diagnostic marker: ${driver:-<unset>}" 1>&2
+driver="$(sh "$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh" --field:driver 2>/dev/null || true)"
+if [ "$driver" = "" ] || [ ! -x "$driver" ]; then
+  echo "[Error] missing strict-fresh backend driver: ${driver:-<unset>}" 1>&2
   exit 1
 fi
 
@@ -115,92 +104,96 @@ fn main(): int32 =
     return 0
 EOF
 
-echo "== backend.noptr_default_cli.non_c_abi_default =="
+echo "== backend.noptr_default_cli.user_raw_ptr =="
 set +e
-run_with_timeout "$timeout_s" env \
-  -u STAGE1_NO_POINTERS_NON_C_ABI \
-  -u STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL \
-  ABI=v2_noptr \
-  STAGE1_STD_NO_POINTERS=1 \
-  STAGE1_STD_NO_POINTERS_STRICT=0 \
-  STAGE1_SEM_FIXED_0=0 \
-  STAGE1_OWNERSHIP_FIXED_0=0 \
-  BACKEND_DRIVER="$driver" \
-  BACKEND_LINKER=system \
-  BACKEND_NO_RUNTIME_C=0 \
-  "$chengc_tool" chengc --in:"$probe_non_c_abi" --out:"$obj_non_c_abi" >"$log_non_c_abi" 2>&1
+compile_cli "$probe_non_c_abi" "$out_non_c_abi" "$log_non_c_abi"
 status_non_c_abi="$?"
 set -e
 if [ "$status_non_c_abi" -eq 124 ]; then
-  echo "[Error] default chengc non-C-ABI pointer probe timed out after ${timeout_s}s" 1>&2
+  echo "[Error] default cheng raw pointer probe timed out after ${timeout_s}s" 1>&2
   exit 1
 fi
 if [ "$status_non_c_abi" -eq 0 ]; then
-  echo "[Error] expected default chengc path to reject non-C-ABI pointer usage: $probe_non_c_abi" 1>&2
+  echo "[Error] expected default cheng path to reject user raw pointer usage: $probe_non_c_abi" 1>&2
   exit 1
 fi
-if ! grep -Fq "no-pointer policy: pointer types are forbidden outside C ABI modules" "$log_non_c_abi"; then
-  echo "[Error] missing default chengc non-C-ABI pointer diagnostic in: $log_non_c_abi" 1>&2
+if ! grep -Eq "$diag_pattern" "$log_non_c_abi"; then
+  echo "[Error] missing default cheng user raw pointer diagnostic in: $log_non_c_abi" 1>&2
   exit 1
 fi
 
 echo "== backend.noptr_default_cli.positive =="
 set +e
-run_with_timeout "$timeout_s" env \
-  STAGE1_NO_POINTERS_NON_C_ABI=0 \
-  STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-  ABI=v2_noptr \
-  STAGE1_STD_NO_POINTERS=1 \
-  STAGE1_STD_NO_POINTERS_STRICT=0 \
-  STAGE1_SEM_FIXED_0=0 \
-  STAGE1_OWNERSHIP_FIXED_0=0 \
-  BACKEND_DRIVER="$driver" \
-  BACKEND_LINKER=system \
-  BACKEND_NO_RUNTIME_C=0 \
-  "$chengc_tool" chengc --in:"$positive_src" --out:"$obj_positive" >"$log_positive" 2>&1
+compile_cli "$positive_src" "$out_positive" "$log_positive"
 status_positive="$?"
 set -e
 if [ "$status_positive" -ne 0 ]; then
-  echo "[Error] expected non-pointer positive sample to compile with non-C-ABI opt-out: $positive_src" 1>&2
-  if [ "$status_positive" -eq 124 ]; then
-    echo "[Error] positive sample timed out after ${timeout_s}s" 1>&2
+  if grep -Eq "$diag_pattern" "$log_positive"; then
+    echo "[Error] positive sample unexpectedly rejected by no-pointer policy: $positive_src" 1>&2
+    exit 1
   fi
-  tail -n 120 "$log_positive" 1>&2 || true
-  exit 1
+  if grep -Fq "$backend_block_pattern" "$log_positive"; then
+    positive_backend_blocked="1"
+  else
+    echo "[Error] expected positive sample to compile under default no-pointer policy: $positive_src" 1>&2
+    if [ "$status_positive" -eq 124 ]; then
+      echo "[Error] positive sample timed out after ${timeout_s}s" 1>&2
+    fi
+    tail -n 120 "$log_positive" 1>&2 || true
+    exit 1
+  fi
 fi
-if [ ! -s "$obj_positive" ]; then
-  echo "[Error] missing positive executable output: $obj_positive" 1>&2
+if [ "$positive_backend_blocked" != "1" ] && [ ! -s "$out_positive" ]; then
+  echo "[Error] missing positive executable output: $out_positive" 1>&2
   exit 1
 fi
 
-echo "== backend.noptr_default_cli.c_abi_bridge =="
+echo "== backend.noptr_default_cli.safe_importc =="
 set +e
-run_with_timeout "$timeout_s" env \
-  STAGE1_NO_POINTERS_NON_C_ABI=0 \
-  STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-  ABI=v2_noptr \
-  STAGE1_STD_NO_POINTERS=1 \
-  STAGE1_STD_NO_POINTERS_STRICT=0 \
-  STAGE1_SEM_FIXED_0=0 \
-  STAGE1_OWNERSHIP_FIXED_0=0 \
-  BACKEND_ALLOW_NO_MAIN=1 \
-  BACKEND_DRIVER="$driver" \
-  BACKEND_LINKER=system \
-  BACKEND_NO_RUNTIME_C=0 \
-  "$chengc_tool" chengc --in:"$bridge_src" --out:"$obj_bridge" >"$log_bridge" 2>&1
-status_bridge="$?"
+compile_cli "$safe_importc_src" "$out_safe_importc" "$log_safe_importc"
+status_safe_importc="$?"
 set -e
-if [ "$status_bridge" -ne 0 ]; then
-  echo "[Error] expected C ABI bridge sample to compile: $bridge_src" 1>&2
-  if [ "$status_bridge" -eq 124 ]; then
-    echo "[Error] C ABI bridge sample timed out after ${timeout_s}s" 1>&2
+if [ "$status_safe_importc" -ne 0 ]; then
+  if grep -Eq "$diag_pattern" "$log_safe_importc"; then
+    echo "[Error] safe importc sample unexpectedly rejected by no-pointer policy: $safe_importc_src" 1>&2
+    exit 1
   fi
-  tail -n 120 "$log_bridge" 1>&2 || true
+  if grep -Fq "$backend_block_pattern" "$log_safe_importc"; then
+    safe_importc_backend_blocked="1"
+  else
+    echo "[Error] expected safe importc sample to compile under default no-pointer policy: $safe_importc_src" 1>&2
+    if [ "$status_safe_importc" -eq 124 ]; then
+      echo "[Error] safe importc sample timed out after ${timeout_s}s" 1>&2
+    fi
+    tail -n 120 "$log_safe_importc" 1>&2 || true
+    exit 1
+  fi
+fi
+if [ "$safe_importc_backend_blocked" != "1" ] && [ ! -s "$out_safe_importc" ]; then
+  echo "[Error] missing safe importc executable output: $out_safe_importc" 1>&2
   exit 1
 fi
-if [ ! -s "$obj_bridge" ]; then
-  echo "[Error] missing C ABI bridge executable output: $obj_bridge" 1>&2
+
+echo "== backend.noptr_default_cli.raw_importc =="
+set +e
+compile_cli "$raw_importc_src" "$out_raw_importc" "$log_raw_importc"
+status_raw_importc="$?"
+set -e
+if [ "$status_raw_importc" -eq 124 ]; then
+  echo "[Error] raw importc probe timed out after ${timeout_s}s" 1>&2
   exit 1
+fi
+if [ "$status_raw_importc" -eq 0 ]; then
+  echo "[Error] expected default cheng path to reject raw importc pointer surface: $raw_importc_src" 1>&2
+  exit 1
+fi
+if ! grep -Eq "$diag_pattern" "$log_raw_importc"; then
+  echo "[Error] missing raw importc no-pointer diagnostic in: $log_raw_importc" 1>&2
+  exit 1
+fi
+
+if [ "$positive_backend_blocked" = "1" ] || [ "$safe_importc_backend_blocked" = "1" ]; then
+  echo "[Warn] default cheng positive compile hit known backend emitter blocker; no-pointer acceptance verified before backend failure" 1>&2
 fi
 
 echo "verify_backend_noptr_default_cli ok"

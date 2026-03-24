@@ -101,6 +101,21 @@ fn tokenTextAppendOwnedValue(seqInst: var str[], val: str) =
         memRetain(strDataPtr(val))
     tokenTextAppendValue(seqInst, val)
 
+fn tokenTextSetOwnedValue(id: int32, val: str) =
+    if id <= 0:
+        return
+    tokenTextPoolEnsure()
+    if id >= tokenTextValues.len:
+        return
+    let oldVal: str = tokenTextValues[id]
+    let oldPtr: ptr = strDataPtr(oldVal)
+    let newPtr: ptr = strDataPtr(val)
+    if oldPtr != nil && oldPtr != newPtr:
+        memRelease(oldPtr)
+    if len(val) > 0 && newPtr != nil && oldPtr != newPtr:
+        memRetain(newPtr)
+    tokenTextValues[id] = val
+
 fn tokenTextReleaseOwnedValues(seqInst: str[]) =
     for i in 0..<seqInst.len:
         let val: str = seqInst[i]
@@ -178,7 +193,7 @@ fn tokenTextById(id: int32): str =
     if id <= 0 || id >= tokenTextStarts.len || id >= tokenTextValues.len:
         return ""
     let cached: str = tokenTextValues[id]
-    if len(cached) > 0:
+    if cached.data != nil:
         return cached
     let textLen: int32 = tokenTextLen(id)
     if textLen <= 0:
@@ -187,9 +202,9 @@ fn tokenTextById(id: int32): str =
     if textStart < 0 || textStart + textLen > tokenTextBytes.len:
         return ""
     let materialized: str = newStringCopy(rawmemPtrAdd(tokenTextBytes.buffer, textStart), textLen)
-    if len(materialized) == textLen:
-        if strDataPtr(materialized) != nil:
-            memRetain(strDataPtr(materialized))
+    if materialized.data != nil && materialized.len == textLen:
+        if materialized.data != nil:
+            memRetain(materialized.data)
         tokenTextValues[id] = materialized
         return tokenTextValues[id]
     return materialized
@@ -900,6 +915,7 @@ fn tokenCommonId(slot: int32): int32 =
     let id: int32 = tokenTextPoolAppendRange(text, 0, len(text))
     if id > 0:
         tokenCommonIds[slot] = id
+        tokenTextSetOwnedValue(id, text)
     return id
 
 fn tokenTextPoolReserve(byteNeed: int32, tokenNeed: int32) =
@@ -950,6 +966,7 @@ fn tokenInternTextRange(source: str, start: int32, count: int32): int32 =
         let commonId: int32 = tokenTextPoolAppendRange(source, start, count)
         if commonId > 0:
             tokenCommonIds[slot] = commonId
+            tokenTextSetOwnedValue(commonId, tokenCommonTextForSlot(slot))
             return commonId
     return tokenTextPoolAppendRange(source, start, count)
 
@@ -1019,6 +1036,7 @@ fn tokenInternText(text: str): int32 =
         let commonId: int32 = tokenTextPoolAppendRange(text, 0, textLen)
         if commonId > 0:
             tokenCommonIds[slot] = commonId
+            tokenTextSetOwnedValue(commonId, text)
             if tokenDebugSetEnabled():
                 tokenDebugSetLog("intern.text.common_add", textLen, commonId, tokenTextById(commonId))
             return commonId
@@ -1027,9 +1045,147 @@ fn tokenInternText(text: str): int32 =
         if tokenDebugSetEnabled():
             tokenDebugSetLog("intern.text.copy_fail", textLen, 0, "")
         return 0
+    tokenTextSetOwnedValue(id, text)
     if tokenDebugSetEnabled():
         tokenDebugSetLog("intern.text.ok", textLen, id, tokenTextById(id))
     return id
+
+fn tokenInternPaddedTextById(id: int32, prefix: char, suffix: char): int32 =
+    if id <= 0:
+        return 0
+    let textLen: int32 = tokenTextLen(id)
+    if textLen < 0:
+        return 0
+    let textStart: int32 = tokenTextStart(id)
+    if textStart < 0 || textStart + textLen > tokenTextBytes.len:
+        return 0
+    tokenTextPoolEnsure()
+    let outLen: int32 = textLen + 2
+    tokenTextPoolReserve(outLen, 1)
+    let outId: int32 = tokenTextStarts.len
+    let outStart: int32 = tokenTextBytes.len
+    seqs.setLen(tokenTextBytes, outStart + outLen)
+    tokenTextBytes[outStart] = uint8(prefix)
+    if textLen > 0:
+        rawmemCopy(rawmemPtrAdd(tokenTextBytes.buffer, outStart + 1),
+                   rawmemPtrAdd(tokenTextBytes.buffer, textStart),
+                   textLen)
+    tokenTextBytes[outStart + textLen + 1] = uint8(suffix)
+    tokenTextAppendLen(tokenTextStarts, outStart)
+    tokenTextAppendLen(tokenTextLens, outLen)
+    tokenTextAppendValue(tokenTextValues, "")
+    return outId
+
+fn tokenInternTextByRemovingByte(id: int32, removed: char): int32 =
+    if id <= 0:
+        return 0
+    let textLen: int32 = tokenTextLen(id)
+    if textLen <= 0:
+        return 0
+    let textStart: int32 = tokenTextStart(id)
+    if textStart < 0 || textStart + textLen > tokenTextBytes.len:
+        return 0
+    tokenTextPoolEnsure()
+    var removedCount: int32 = 0
+    for i in 0..<textLen:
+        if tokenTextByteAtId(id, i) == removed:
+            removedCount = removedCount + 1
+    if removedCount <= 0:
+        return id
+    let outLen: int32 = textLen - removedCount
+    if outLen <= 0:
+        return 0
+    tokenTextPoolReserve(outLen, 1)
+    let outId: int32 = tokenTextStarts.len
+    let outStart: int32 = tokenTextBytes.len
+    seqs.setLen(tokenTextBytes, outStart + outLen)
+    var dst: int32 = 0
+    for i in 0..<textLen:
+        let ch: char = tokenTextByteAtId(id, i)
+        if ch == removed:
+            continue
+        tokenTextBytes[outStart + dst] = uint8(ch)
+        dst = dst + 1
+    tokenTextAppendLen(tokenTextStarts, outStart)
+    tokenTextAppendLen(tokenTextLens, outLen)
+    tokenTextAppendValue(tokenTextValues, "")
+    return outId
+
+fn tokenInternTextRangeById(id: int32, start: int32, count: int32): int32 =
+    if id <= 0 || count <= 0:
+        return 0
+    let textLen: int32 = tokenTextLen(id)
+    if textLen <= 0:
+        return 0
+    if start < 0 || start + count > textLen:
+        return 0
+    if start == 0 && count == textLen:
+        return id
+    let textStart: int32 = tokenTextStart(id)
+    if textStart < 0 || textStart + textLen > tokenTextBytes.len:
+        return 0
+    tokenTextPoolEnsure()
+    tokenTextPoolReserve(count, 1)
+    let outId: int32 = tokenTextStarts.len
+    let outStart: int32 = tokenTextBytes.len
+    seqs.setLen(tokenTextBytes, outStart + count)
+    rawmemCopy(rawmemPtrAdd(tokenTextBytes.buffer, outStart),
+               rawmemPtrAdd(tokenTextBytes.buffer, textStart + start),
+               count)
+    tokenTextAppendLen(tokenTextStarts, outStart)
+    tokenTextAppendLen(tokenTextLens, count)
+    tokenTextAppendValue(tokenTextValues, "")
+    return outId
+
+fn tokenInternTextIdsJoinedByByte(ids: int32[], sep: char): int32 =
+    if ids.len <= 0:
+        return 0
+    var validCount: int32 = 0
+    var outLen: int32 = 0
+    for i in 0..<ids.len:
+        let id: int32 = ids[i]
+        let textLen: int32 = tokenTextLen(id)
+        if textLen <= 0:
+            continue
+        if validCount > 0:
+            outLen = outLen + 1
+        outLen = outLen + textLen
+        validCount = validCount + 1
+    if validCount <= 0:
+        return 0
+    if validCount == 1:
+        for i in 0..<ids.len:
+            let id: int32 = ids[i]
+            if tokenTextLen(id) > 0:
+                return id
+        return 0
+    tokenTextPoolEnsure()
+    tokenTextPoolReserve(outLen, 1)
+    let outId: int32 = tokenTextStarts.len
+    let outStart: int32 = tokenTextBytes.len
+    seqs.setLen(tokenTextBytes, outStart + outLen)
+    var dst: int32 = 0
+    var seen: int32 = 0
+    for i in 0..<ids.len:
+        let id: int32 = ids[i]
+        let textLen: int32 = tokenTextLen(id)
+        if textLen <= 0:
+            continue
+        if seen > 0:
+            tokenTextBytes[outStart + dst] = uint8(sep)
+            dst = dst + 1
+        let textStart: int32 = tokenTextStart(id)
+        if textStart < 0 || textStart + textLen > tokenTextBytes.len:
+            return 0
+        rawmemCopy(rawmemPtrAdd(tokenTextBytes.buffer, outStart + dst),
+                   rawmemPtrAdd(tokenTextBytes.buffer, textStart),
+                   textLen)
+        dst = dst + textLen
+        seen = seen + 1
+    tokenTextAppendLen(tokenTextStarts, outStart)
+    tokenTextAppendLen(tokenTextLens, outLen)
+    tokenTextAppendValue(tokenTextValues, "")
+    return outId
 
 fn tokenZero(tok: var Token) =
     tok.kind = tkEof

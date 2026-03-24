@@ -2,35 +2,54 @@
 :
 set -euo pipefail
 
+root="${TOOLING_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)}"
+clean_env_path="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+clean_env_home="${HOME:-$root}"
+clean_env_tmpdir="${TMPDIR:-/tmp}"
+
 usage() {
   cat <<'USAGE'
 Usage:
-  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc <file.cheng> [--name:<exeName>] [--jobs:<N>]
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc <file.cheng> [--name:<exeName>] [--jobs:<N>] [--fn-jobs:<N>]
                         [--manifest:<path>] [--lock:<path>] [--registry:<path>]
                         [--package:<id>] [--channel:<edge|stable|lts>]
                         [--lock-format:<toml|yaml|json>] [--meta-out:<path>]
                         [--buildmeta:<path>]
-                        [--abi:<v2_noptr>]
+                        [--build-track:<dev|release>]
                         [--linker:<self|system>]
                         [--target:<triple>]
+                        [--whole-program|--whole-program:0|1]
+                        [--opt|--opt:0|1] [--opt2|--opt2:0|1] [--opt-level:0|1|2|3]
+                        [--ldflags:<text>] [--fn-sched:<ws>]
+                        [--no-runtime-c|--no-runtime-c:0|1] [--runtime-obj:<path>]
+                        [--sidecar-mode:cheng] [--sidecar-bundle:<path>] [--sidecar-compiler:<path>]
+                        [--sidecar-child-mode:<cli|outer_cli>] [--sidecar-outer-compiler:<path>]
+                        [--module-cache:<path>] [--multi-module-cache|--multi-module-cache:0|1]
+                        [--module-cache-unstable-allow|--module-cache-unstable-allow:0|1]
+                        [--generic-mode:dict] [--generic-spec-budget:<N>] [--generic-lowering:mir_dict]
                         [--pkg-cache:<dir>] [--skip-pkg] [--verify] [--ledger:<path>]
                         [--source-listen:<addr>] [--source-peer:<addr>]
                         [--mm:<orc>] [--orc]
                         [--release]
                         [--emit:<exe>] [--frontend:<stage1>]
-                        [--out:<path>] [--multi] [--pkg-roots:<p1[:p2:...]>]
+                        [--out:<path>] [--multi|--multi:0|1] [--multi-force:0|1]
+                        [--incremental:0|1] [--pkg-roots:<p1[:p2:...]>]
                         [--run] [--run:file] [--run:host]
   ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} chengc run <android|ios|harmony> <file.cheng> [mobile-run-options]
 
 Notes:
   - Backend-only entrypoint (exe only).
-  - Default build track is dev (`BACKEND_BUILD_TRACK=dev`).
-  - `--release` maps to `BACKEND_BUILD_TRACK=release` and defaults linker to system.
+  - Default build track is dev.
+  - `--release` is an alias of `--build-track:release` and defaults linker to system.
   - Optional compile daemon: set `CHENGC_DAEMON=1` to route builds through `chengc_daemon`.
   - `--run` defaults to host runner (`--run:host`); use `--run:file` for legacy file-exec mode.
   - Default `MM=orc`.
   - Executable output for bare `--name:<bin>` defaults to `artifacts/chengc/<bin>`.
-  - `--jobs:<N>` forwards to `BACKEND_JOBS`.
+  - `--jobs:<N>` / `--fn-jobs:<N>` / `--ldflags:<text>` / `--fn-sched:<ws>` control backend compile surface.
+  - `--whole-program` / `--opt*` / `--generic-*` / `--sidecar-*` / `--module-cache*` / `--no-runtime-c` / `--runtime-obj`
+    are explicit compile-surface flags for exe builds.
+  - No-pointer policy is fixed by the compiler/toolchain default and is not part of the public `chengc` flag surface.
+  - Only `--fn-sched:ws` is supported.
   - Legacy `chengb.sh` flags are accepted for compatibility.
   - `run <platform>` forwards to mobile host runners:
       android -> ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} mobile_run_android
@@ -103,6 +122,177 @@ has_fuse_ld_flag() {
   return 1
 }
 
+append_token() {
+  base="$1"
+  token="$2"
+  if [ "$token" = "" ]; then
+    printf '%s\n' "$base"
+    return
+  fi
+  if [ "$base" = "" ]; then
+    printf '%s\n' "$token"
+    return
+  fi
+  printf '%s %s\n' "$base" "$token"
+}
+
+read_env_default() {
+  name="$1"
+  eval "printf '%s\\n' \"\${$name:-}\""
+}
+
+normalize_bool_text() {
+  raw="$1"
+  label="$2"
+  case "$raw" in
+    "")
+      printf '\n'
+      ;;
+    1|true|TRUE|yes|YES|on|ON)
+      printf '1\n'
+      ;;
+    0|false|FALSE|no|NO|off|OFF)
+      printf '0\n'
+      ;;
+    *)
+      echo "[Error] invalid $label:$raw (expected 0|1)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_jobs_text() {
+  raw="$1"
+  label="$2"
+  case "$raw" in
+    "" )
+      printf '\n'
+      ;;
+    *[!0-9]*)
+      echo "[Error] invalid $label:$raw (expected positive integer)" 1>&2
+      exit 2
+      ;;
+    *)
+      if [ "$raw" -lt 1 ] 2>/dev/null; then
+        echo "[Error] invalid $label:$raw (expected positive integer)" 1>&2
+        exit 2
+      fi
+      printf '%s\n' "$raw"
+      ;;
+  esac
+}
+
+normalize_nonneg_int_text() {
+  raw="$1"
+  label="$2"
+  case "$raw" in
+    "")
+      printf '\n'
+      ;;
+    *[!0-9]*)
+      echo "[Error] invalid $label:$raw (expected non-negative integer)" 1>&2
+      exit 2
+      ;;
+    *)
+      printf '%s\n' "$raw"
+      ;;
+  esac
+}
+
+normalize_opt_level_text() {
+  raw="$1"
+  case "$raw" in
+    "")
+      printf '\n'
+      ;;
+    0|1|2|3)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid --opt-level:$raw (expected 0|1|2|3)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_build_track_text() {
+  raw="$1"
+  case "$raw" in
+    ""|dev|release)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid --build-track:$raw (expected dev|release)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_fn_sched_text() {
+  raw="$1"
+  case "$raw" in
+    ""|ws)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid --fn-sched:$raw (expected ws)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_sidecar_mode_text() {
+  raw="$1"
+  case "$raw" in
+    ""|cheng)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid --sidecar-mode:$raw (expected cheng)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_sidecar_child_mode_text() {
+  raw="$1"
+  case "$raw" in
+    ""|cli|outer_cli)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid --sidecar-child-mode:$raw (expected cli|outer_cli)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_generic_mode_text() {
+  raw="$1"
+  case "$raw" in
+    ""|dict)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid --generic-mode:$raw (expected dict)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_generic_lowering_text() {
+  raw="$1"
+  case "$raw" in
+    ""|mir_dict)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid --generic-lowering:$raw (expected mir_dict)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
 resolve_named_exe_out() {
   name_in="$1"
   case "$name_in" in
@@ -132,9 +322,24 @@ tooling_selfhost_source_is_tooling_main() {
   return 1
 }
 
+tooling_emit_selfhost_launcher_enabled() {
+  case "${TOOLING_EMIT_SELFHOST_LAUNCHER:-1}" in
+    0|false|FALSE|no|NO|off|OFF)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+tooling_selfhost_native_exec_path() {
+  printf '%s.repo_native_exec.bin\n' "$1"
+}
+
 emit_tooling_selfhost_launcher() {
   out_path="$1"
-  repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+  real_bin_path="$2"
+  repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
+  real_bin_name="$(basename -- "$real_bin_path")"
   mkdir -p "$(dirname "$out_path")"
   cat >"$out_path" <<EOF
 #!/usr/bin/env sh
@@ -143,8 +348,19 @@ set -eu
 (set -o pipefail) 2>/dev/null && set -o pipefail
 
 root="$repo_root"
+script_dir="\$(CDPATH= cd -- "\$(dirname -- "\$0")" && pwd)"
+real_bin="\$script_dir/$real_bin_name"
+if [ ! -x "\$real_bin" ]; then
+  echo "[cheng_tooling] missing tooling native companion: \$real_bin" 1>&2
+  exit 1
+fi
 export TOOLING_ROOT="\$root"
-exec sh "\$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh" "\$@"
+export TOOLING_BIN="\$real_bin"
+export TOOLING_SELF_BIN="\$real_bin"
+export TOOLING_REPO_NATIVE_BIN="\$real_bin"
+unset TOOLING_FORCE_BUILD 2>/dev/null || true
+unset TOOLING_LIST_BIN 2>/dev/null || true
+exec "\$real_bin" "\$@"
 EOF
   chmod +x "$out_path"
 }
@@ -172,6 +388,16 @@ target_supports_self_linker() {
       ;;
   esac
   return 1
+}
+
+resolve_backend_sidecar_defaults_field() {
+  field="$1"
+  target_raw="$2"
+  resolver="$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh"
+  if [ ! -f "$resolver" ]; then
+    return 1
+  fi
+  sh "$resolver" --root:"$root" --target:"$target_raw" --field:"$field"
 }
 
 if [ "${1:-}" = "" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
@@ -216,6 +442,7 @@ shift || true
 name=""
 jobs=""
 jobs_explicit="0"
+fn_jobs_raw=""
 manifest=""
 lock=""
 registry=""
@@ -236,12 +463,33 @@ obj_out=""
 backend=""
 linker=""
 target_arg=""
-abi=""
 build_track_arg=""
+ldflags_raw=""
+fn_sched_raw=""
+whole_program_raw=""
+opt_raw=""
+opt2_raw=""
+opt_level_raw=""
+no_runtime_c_raw=""
+runtime_obj_raw=""
+sidecar_mode_raw=""
+sidecar_bundle_raw=""
+sidecar_compiler_raw=""
+sidecar_child_mode_raw=""
+sidecar_outer_compiler_raw=""
+module_cache_raw=""
+multi_module_cache_raw=""
+module_cache_unstable_allow_raw=""
+generic_mode_raw=""
+generic_spec_budget_raw=""
+generic_lowering_raw=""
 legacy_emit=""
 legacy_frontend=""
 legacy_out=""
 legacy_multi=""
+multi_raw=""
+multi_force_raw=""
+incremental_raw=""
 legacy_pkg_roots=""
 legacy_run=""
 run_mode=""
@@ -254,6 +502,7 @@ while [ "${1:-}" != "" ]; do
       jobs="${1#--jobs:}"
       jobs_explicit="1"
       ;;
+    --fn-jobs:*) fn_jobs_raw="${1#--fn-jobs:}" ;;
     --manifest:*) manifest="${1#--manifest:}" ;;
     --lock:*) lock="${1#--lock:}" ;;
     --registry:*) registry="${1#--registry:}" ;;
@@ -268,14 +517,47 @@ while [ "${1:-}" != "" ]; do
       backend="obj"
       ;;
     --obj-out:*) obj_out="${1#--obj-out:}" ;;
-    --abi:*) abi="${1#--abi:}" ;;
+    --build-track:*) build_track_arg="${1#--build-track:}" ;;
     --linker:*) linker="${1#--linker:}" ;;
     --target:*) target_arg="${1#--target:}" ;;
     --release) build_track_arg="release" ;;
+    --whole-program) whole_program_raw="1" ;;
+    --whole-program:*) whole_program_raw="${1#--whole-program:}" ;;
+    --opt) opt_raw="1" ;;
+    --opt:*) opt_raw="${1#--opt:}" ;;
+    --opt2) opt2_raw="1" ;;
+    --opt2:*) opt2_raw="${1#--opt2:}" ;;
+    --opt-level:*) opt_level_raw="${1#--opt-level:}" ;;
+    --ldflags:*) ldflags_raw="${1#--ldflags:}" ;;
+    --fn-sched:*) fn_sched_raw="${1#--fn-sched:}" ;;
+    --no-runtime-c) no_runtime_c_raw="1" ;;
+    --no-runtime-c:*) no_runtime_c_raw="${1#--no-runtime-c:}" ;;
+    --runtime-obj:*) runtime_obj_raw="${1#--runtime-obj:}" ;;
+    --sidecar-mode:*) sidecar_mode_raw="${1#--sidecar-mode:}" ;;
+    --sidecar-bundle:*) sidecar_bundle_raw="${1#--sidecar-bundle:}" ;;
+    --sidecar-compiler:*) sidecar_compiler_raw="${1#--sidecar-compiler:}" ;;
+    --sidecar-child-mode:*) sidecar_child_mode_raw="${1#--sidecar-child-mode:}" ;;
+    --sidecar-outer-compiler:*) sidecar_outer_compiler_raw="${1#--sidecar-outer-compiler:}" ;;
+    --module-cache:*) module_cache_raw="${1#--module-cache:}" ;;
+    --multi-module-cache) multi_module_cache_raw="1" ;;
+    --multi-module-cache:*) multi_module_cache_raw="${1#--multi-module-cache:}" ;;
+    --no-multi-module-cache) multi_module_cache_raw="0" ;;
+    --module-cache-unstable-allow) module_cache_unstable_allow_raw="1" ;;
+    --module-cache-unstable-allow:*) module_cache_unstable_allow_raw="${1#--module-cache-unstable-allow:}" ;;
+    --no-module-cache-unstable-allow) module_cache_unstable_allow_raw="0" ;;
+    --generic-mode:*) generic_mode_raw="${1#--generic-mode:}" ;;
+    --generic-spec-budget:*) generic_spec_budget_raw="${1#--generic-spec-budget:}" ;;
+    --generic-lowering:*) generic_lowering_raw="${1#--generic-lowering:}" ;;
     --emit:*) legacy_emit="${1#--emit:}" ;;
     --frontend:*) legacy_frontend="${1#--frontend:}" ;;
     --out:*) legacy_out="${1#--out:}" ;;
-    --multi) legacy_multi="1" ;;
+    --multi)
+      legacy_multi="1"
+      multi_raw="1"
+      ;;
+    --multi:*) multi_raw="${1#--multi:}" ;;
+    --multi-force:*) multi_force_raw="${1#--multi-force:}" ;;
+    --incremental:*) incremental_raw="${1#--incremental:}" ;;
     --pkg-roots:*) legacy_pkg_roots="${1#--pkg-roots:}" ;;
     --run)
       legacy_run="1"
@@ -308,14 +590,6 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
-case "$abi" in
-  ""|v2_noptr) ;;
-  *)
-    echo "[Error] invalid --abi:$abi (expected v2_noptr; enforced by ZRPC/零裸指针生产闭环规范)" 1>&2
-    exit 2
-    ;;
-esac
-
 case "$legacy_emit" in
   ""|obj|exe) ;;
   *)
@@ -344,19 +618,13 @@ obj_requested="0"
 if [ "$emit_obj" != "" ] || [ "$backend" = "obj" ] || [ "$legacy_emit" = "obj" ] || [ "$obj_out" != "" ]; then
   obj_requested="1"
 fi
-allow_emit_obj="${BACKEND_INTERNAL_ALLOW_EMIT_OBJ:-${BACKEND_INTERNAL_ALLOW_EMIT_OBJ:-0}}"
-if [ "$obj_requested" = "1" ] && [ "$allow_emit_obj" != "1" ]; then
-  echo "[Error] obj output path has been removed from production chain; use --emit:exe" 1>&2
-  echo "[Hint] set BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 for internal tooling only" 1>&2
-  exit 2
-fi
 if [ "$obj_requested" = "1" ] && [ "$obj_out" = "" ]; then
   echo "[Error] --emit-obj requires --obj-out:<path>" 1>&2
   exit 2
 fi
 
 if [ "$mm" = "" ]; then
-  mm="${MM:-orc}"
+  mm="orc"
 fi
 case "$mm" in
   ""|orc)
@@ -367,8 +635,11 @@ case "$mm" in
     exit 2
     ;;
 esac
-export MM="$mm"
 
+if [ "$jobs_explicit" != "1" ]; then
+  jobs="$(read_env_default BACKEND_JOBS)"
+fi
+jobs="$(normalize_jobs_text "$jobs" "--jobs")"
 if [ "$jobs" = "" ]; then
   jobs="$(detect_jobs)"
 fi
@@ -402,11 +673,6 @@ fi
 
 if [ "$backend" != "exe" ] && [ "$backend" != "obj" ]; then
   echo "[Error] unsupported backend: $backend (expected exe|obj)" 1>&2
-  exit 2
-fi
-if [ "$backend" = "obj" ] && [ "$allow_emit_obj" != "1" ]; then
-  echo "[Error] unsupported backend: obj (only --emit:exe is supported)" 1>&2
-  echo "[Hint] set BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1 for internal tooling only" 1>&2
   exit 2
 fi
 
@@ -555,20 +821,10 @@ if [ "$frontend" = "stage1" ] && [ "${STAGE1_OWNERSHIP_FIXED_0:-}" = "" ]; then
   export STAGE1_OWNERSHIP_FIXED_0=0
 fi
 
-build_track="${BACKEND_BUILD_TRACK:-}"
-if [ "$build_track_arg" = "release" ]; then
-  build_track="release"
-fi
+build_track="$(normalize_build_track_text "$build_track_arg")"
 if [ "$build_track" = "" ]; then
   build_track="dev"
 fi
-case "$build_track" in
-  dev|release) ;;
-  *)
-    echo "[Error] invalid BACKEND_BUILD_TRACK: $build_track (expected dev|release)" 1>&2
-    exit 2
-    ;;
-esac
 
 if [ "$buildmeta" != "" ]; then
   buildmeta_dir="$(dirname "$buildmeta")"
@@ -773,171 +1029,265 @@ case "$backend_target" in
     ;;
 esac
 
+backend_sidecar_mode="$sidecar_mode_raw"
+if [ "$backend_sidecar_mode" = "" ]; then
+  backend_sidecar_mode="$(resolve_backend_sidecar_defaults_field mode "$backend_target" 2>/dev/null || true)"
+fi
+backend_sidecar_mode="$(normalize_sidecar_mode_text "$backend_sidecar_mode")"
+if [ "$backend_sidecar_mode" = "" ]; then
+  echo "[Error] missing strict fresh Cheng sidecar mode; run verify_backend_sidecar_cheng_fresh" 1>&2
+  exit 1
+fi
+
+backend_sidecar_bundle="$sidecar_bundle_raw"
+if [ "$backend_sidecar_bundle" = "" ]; then
+  backend_sidecar_bundle="$(resolve_backend_sidecar_defaults_field bundle "$backend_target" 2>/dev/null || true)"
+fi
+if [ "$backend_sidecar_bundle" = "" ]; then
+  echo "[Error] missing strict fresh Cheng sidecar bundle; run verify_backend_sidecar_cheng_fresh" 1>&2
+  exit 1
+fi
+
+backend_sidecar_compiler="$sidecar_compiler_raw"
+if [ "$backend_sidecar_compiler" = "" ]; then
+  backend_sidecar_compiler="$(resolve_backend_sidecar_defaults_field compiler "$backend_target" 2>/dev/null || true)"
+fi
+if [ "$backend_sidecar_compiler" = "" ]; then
+  echo "[Error] missing strict fresh Cheng sidecar compiler; run verify_backend_sidecar_cheng_fresh" 1>&2
+  exit 1
+fi
+
+backend_sidecar_driver=""
+if [ "${BACKEND_DRIVER:-}" = "" ] && [ "$backend_sidecar_mode" = "cheng" ]; then
+  backend_sidecar_driver="$(resolve_backend_sidecar_defaults_field driver "$backend_target" 2>/dev/null || true)"
+  if [ "$backend_sidecar_driver" != "" ] && [ -x "$backend_sidecar_driver" ]; then
+    driver="$backend_sidecar_driver"
+    driver_exec="$driver"
+    driver_real_env=""
+  fi
+fi
+backend_sidecar_child_mode="$sidecar_child_mode_raw"
+backend_sidecar_outer_companion=""
+if [ "$backend_sidecar_mode" = "cheng" ]; then
+  if [ "$backend_sidecar_child_mode" = "" ]; then
+    backend_sidecar_child_mode="$(resolve_backend_sidecar_defaults_field child_mode "$backend_target" 2>/dev/null || true)"
+  fi
+  backend_sidecar_child_mode="$(normalize_sidecar_child_mode_text "$backend_sidecar_child_mode")"
+  if [ "$backend_sidecar_child_mode" = "" ]; then
+    echo "[Error] missing strict fresh Cheng sidecar child mode; run verify_backend_sidecar_cheng_fresh" 1>&2
+    exit 1
+  fi
+  if [ "$backend_sidecar_child_mode" = "outer_cli" ]; then
+    backend_sidecar_outer_companion="$sidecar_outer_compiler_raw"
+    if [ "$backend_sidecar_outer_companion" = "" ]; then
+      backend_sidecar_outer_companion="$(resolve_backend_sidecar_defaults_field outer_companion "$backend_target" 2>/dev/null || true)"
+    fi
+    if [ "$backend_sidecar_outer_companion" = "" ]; then
+      echo "[Error] missing strict fresh Cheng sidecar outer companion; run verify_backend_sidecar_cheng_fresh" 1>&2
+      exit 1
+    fi
+  elif [ "$sidecar_outer_compiler_raw" != "" ]; then
+    echo "[Error] --sidecar-outer-compiler requires --sidecar-child-mode:outer_cli" 1>&2
+    exit 2
+  fi
+fi
+
+backend_whole_program="$whole_program_raw"
+if [ "$backend_whole_program" = "" ]; then
+  backend_whole_program="$(read_env_default BACKEND_WHOLE_PROGRAM)"
+fi
+backend_whole_program="$(normalize_bool_text "$backend_whole_program" "--whole-program")"
+
+backend_opt="$opt_raw"
+if [ "$backend_opt" = "" ]; then
+  backend_opt="$(read_env_default BACKEND_OPT)"
+fi
+backend_opt="$(normalize_bool_text "$backend_opt" "--opt")"
+
+backend_opt2="$opt2_raw"
+if [ "$backend_opt2" = "" ]; then
+  backend_opt2="$(read_env_default BACKEND_OPT2)"
+fi
+backend_opt2="$(normalize_bool_text "$backend_opt2" "--opt2")"
+
+backend_opt_level="$opt_level_raw"
+if [ "$backend_opt_level" = "" ]; then
+  backend_opt_level="$(read_env_default BACKEND_OPT_LEVEL)"
+fi
+backend_opt_level="$(normalize_opt_level_text "$backend_opt_level")"
+
+backend_generic_mode="$generic_mode_raw"
+if [ "$backend_generic_mode" = "" ]; then
+  backend_generic_mode="$(read_env_default GENERIC_MODE)"
+fi
+if [ "$backend_generic_mode" = "" ]; then
+  backend_generic_mode="dict"
+fi
+backend_generic_mode="$(normalize_generic_mode_text "$backend_generic_mode")"
+
+backend_generic_spec_budget="$generic_spec_budget_raw"
+if [ "$backend_generic_spec_budget" = "" ]; then
+  backend_generic_spec_budget="$(read_env_default GENERIC_SPEC_BUDGET)"
+fi
+if [ "$backend_generic_spec_budget" = "" ]; then
+  backend_generic_spec_budget="0"
+fi
+backend_generic_spec_budget="$(normalize_nonneg_int_text "$backend_generic_spec_budget" "--generic-spec-budget")"
+
+backend_generic_lowering="$generic_lowering_raw"
+if [ "$backend_generic_lowering" = "" ]; then
+  backend_generic_lowering="$(read_env_default GENERIC_LOWERING)"
+fi
+if [ "$backend_generic_lowering" = "" ]; then
+  backend_generic_lowering="mir_dict"
+fi
+backend_generic_lowering="$(normalize_generic_lowering_text "$backend_generic_lowering")"
+
+backend_multi_env="$multi_raw"
+if [ "$backend_multi_env" = "" ]; then
+  backend_multi_env="$(read_env_default BACKEND_MULTI)"
+fi
+if [ "$backend_multi_env" = "" ]; then
+  if [ "$build_track" = "release" ]; then
+    backend_multi_env="${CHENGC_RELEASE_MULTI_DEFAULT:-0}"
+  else
+    backend_multi_env="${CHENGC_DEV_MULTI_DEFAULT:-1}"
+  fi
+fi
+backend_multi_env="$(normalize_bool_text "$backend_multi_env" "--multi")"
+
+backend_multi_force_env="$multi_force_raw"
+if [ "$backend_multi_force_env" = "" ]; then
+  backend_multi_force_env="0"
+fi
+backend_multi_force_env="$(normalize_bool_text "$backend_multi_force_env" "--multi-force")"
+
+backend_inc_env="$incremental_raw"
+if [ "$backend_inc_env" = "" ]; then
+  backend_inc_env="$(read_env_default BACKEND_INCREMENTAL)"
+fi
+if [ "$backend_inc_env" = "" ]; then
+  backend_inc_env="1"
+fi
+backend_inc_env="$(normalize_bool_text "$backend_inc_env" "--incremental")"
+
+backend_fn_jobs_env="$fn_jobs_raw"
+if [ "$backend_fn_jobs_env" = "" ]; then
+  backend_fn_jobs_env="$(read_env_default BACKEND_FN_JOBS)"
+fi
+backend_fn_jobs_env="$(normalize_jobs_text "$backend_fn_jobs_env" "--fn-jobs")"
+if [ "$backend_fn_jobs_env" = "" ]; then
+  backend_fn_jobs_env="$jobs"
+fi
+
+backend_no_runtime_c="$no_runtime_c_raw"
+if [ "$backend_no_runtime_c" = "" ]; then
+  backend_no_runtime_c="$(read_env_default BACKEND_NO_RUNTIME_C)"
+fi
+backend_no_runtime_c="$(normalize_bool_text "$backend_no_runtime_c" "--no-runtime-c")"
+
+backend_runtime_obj="$runtime_obj_raw"
+if [ "$backend_runtime_obj" = "" ]; then
+  backend_runtime_obj="$(read_env_default BACKEND_RUNTIME_OBJ)"
+fi
+
+tooling_selfhost_launcher_requested="0"
+tooling_selfhost_launcher_out_path=""
 if [ "$backend_emit" = "exe" ] && \
    [ "$build_track" != "release" ] && \
    [ "$legacy_run" != "1" ] && \
    [ "$backend_target" = "$host_target" ] && \
+   tooling_emit_selfhost_launcher_enabled && \
    tooling_selfhost_source_is_tooling_main "$in"; then
-  emit_tooling_selfhost_launcher "$out_path"
-  echo "chengc exe ok: $out_path"
-  exit 0
+  tooling_selfhost_launcher_requested="1"
+  tooling_selfhost_launcher_out_path="$out_path"
+  out_path="$(tooling_selfhost_native_exec_path "$tooling_selfhost_launcher_out_path")"
 fi
 
-backend_linker="$linker"
-if [ "$backend_linker" = "" ]; then
-  backend_linker="${BACKEND_LINKER:-}"
+requested_linker="$linker"
+if [ "$requested_linker" = "" ]; then
+  requested_linker="$(read_env_default BACKEND_LINKER)"
 fi
-if [ "$backend_linker" = "" ] && [ "$backend_emit" = "exe" ]; then
+if [ "$requested_linker" = "" ] && [ "$backend_emit" = "exe" ]; then
   if [ "$build_track" = "release" ]; then
-    backend_linker="system"
+    requested_linker="system"
   else
-    if target_supports_self_linker "$backend_target"; then
-      backend_linker="self"
-    else
-      backend_linker="system"
-    fi
+    requested_linker="auto"
   fi
 fi
-case "$backend_linker" in
-  ""|self|system) ;;
+case "$requested_linker" in
+  ""|auto|self|system) ;;
   *)
-    echo "[Error] invalid --linker:$backend_linker (expected self|system)" 1>&2
+    echo "[Error] invalid --linker:$requested_linker (expected self|system)" 1>&2
     exit 2
     ;;
 esac
 
-backend_runtime_obj="${BACKEND_RUNTIME_OBJ:-}"
+resolved_linker="$requested_linker"
+resolved_no_runtime_c="$backend_no_runtime_c"
+resolved_runtime_obj="$backend_runtime_obj"
+resolved_runtime_obj_assigned="0"
+if [ "$resolved_runtime_obj" != "" ]; then
+  resolved_runtime_obj_assigned="1"
+fi
 
-runtime_nm_has_sym() {
-  sym="$1"
-  printf '%s\n' "$nm_out" | awk '{print $NF}' | sed 's/^_//' | grep -Fxq "$sym"
-}
-
-runtime_has_core_symbols() {
-  obj="$1"
-  [ -f "$obj" ] || return 1
-  if ! command -v nm >/dev/null 2>&1; then
-    return 0
+resolve_link_env() {
+  link_env="$(sh "$root/src/tooling/cheng_tooling_embedded_scripts/backend_link_env.sh" \
+    --driver:"$driver_exec" \
+    --target:"$backend_target" \
+    --linker:"$requested_linker")"
+  resolved_linker=""
+  resolved_no_runtime_c=""
+  resolved_runtime_obj=""
+  resolved_runtime_obj_assigned="0"
+  for entry in $link_env; do
+    case "$entry" in
+      BACKEND_LINKER=*)
+        resolved_linker="${entry#BACKEND_LINKER=}"
+        ;;
+      BACKEND_NO_RUNTIME_C=*)
+        resolved_no_runtime_c="${entry#BACKEND_NO_RUNTIME_C=}"
+        ;;
+      BACKEND_RUNTIME_OBJ=*)
+        resolved_runtime_obj="${entry#BACKEND_RUNTIME_OBJ=}"
+        resolved_runtime_obj_assigned="1"
+        ;;
+    esac
+  done
+  if [ "$resolved_linker" = "" ]; then
+    echo "[Error] chengc: backend_link_env missing BACKEND_LINKER" 1>&2
+    exit 1
   fi
-  nm_out="$(nm -g "$obj" 2>/dev/null || true)"
-  [ "$nm_out" != "" ] || return 1
-  runtime_nm_has_sym cheng_strlen &&
-  runtime_nm_has_sym cheng_memcpy &&
-  runtime_nm_has_sym cheng_memset &&
-  runtime_nm_has_sym cheng_malloc &&
-  runtime_nm_has_sym cheng_free &&
-  runtime_nm_has_sym cheng_mem_retain &&
-  runtime_nm_has_sym cheng_mem_release &&
-  runtime_nm_has_sym cheng_seq_get &&
-  runtime_nm_has_sym cheng_seq_set &&
-  runtime_nm_has_sym cheng_strcmp &&
-  runtime_nm_has_sym cheng_f32_bits_to_i64 &&
-  runtime_nm_has_sym cheng_f64_bits_to_i64
 }
 
-resolve_runtime_obj() {
+if [ "$backend_emit" = "exe" ]; then
+  resolve_link_env
+  if [ "$backend_no_runtime_c" != "" ]; then
+    resolved_no_runtime_c="$backend_no_runtime_c"
+  fi
   if [ "$backend_runtime_obj" != "" ]; then
-    printf '%s\n' "$backend_runtime_obj"
-    return 0
+    resolved_runtime_obj="$backend_runtime_obj"
+    resolved_runtime_obj_assigned="1"
   fi
-  candidates="
-chengcache/runtime_selflink/system_helpers.backend.combined.${backend_target}.o
-artifacts/backend_mm/system_helpers.backend.combined.${backend_target}.o
-chengcache/system_helpers.backend.cheng.${backend_target}.o
-artifacts/backend_selfhost_self_obj/stage1.native.runtime.dedup.o
-artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.stage1shim.o
-chengcache/system_helpers.backend.cheng.o
-artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.o
-"
-  for cand in $candidates; do
-    [ "$cand" != "" ] || continue
-    if [ -f "$cand" ] && runtime_has_core_symbols "$cand"; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
-  for cand in $candidates; do
-    [ "$cand" != "" ] || continue
-    if [ -f "$cand" ]; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
-  return 1
-}
-
-if [ "$backend_emit" = "exe" ] && [ "$backend_linker" = "self" ]; then
-  backend_runtime_obj="$(resolve_runtime_obj || true)"
-  if [ "$backend_runtime_obj" = "" ] || [ ! -f "$backend_runtime_obj" ]; then
-    echo "[Error] missing self-link runtime object for target=$backend_target" 1>&2
-    echo "        set BACKEND_RUNTIME_OBJ or prepare chengcache/runtime_selflink/system_helpers.backend.combined.${backend_target}.o" 1>&2
+  if [ "$resolved_runtime_obj_assigned" = "1" ] && [ "$resolved_no_runtime_c" = "0" ]; then
+    echo "[Error] --runtime-obj requires --no-runtime-c:1" 1>&2
     exit 2
   fi
-  if ! runtime_has_core_symbols "$backend_runtime_obj"; then
-    echo "[Warn] self-link runtime object may be incomplete: $backend_runtime_obj" 1>&2
+  if [ "$resolved_runtime_obj_assigned" = "1" ] && [ "$resolved_no_runtime_c" = "" ]; then
+    resolved_no_runtime_c="1"
+  fi
+  if [ "$resolved_linker" = "self" ] && [ "$resolved_no_runtime_c" = "0" ]; then
+    echo "[Error] self linker requires --no-runtime-c:1" 1>&2
+    exit 2
+  fi
+  if [ "$resolved_linker" = "self" ] && [ "$resolved_runtime_obj_assigned" != "1" ]; then
+    echo "[Error] self linker requires a runtime object" 1>&2
+    exit 2
   fi
 fi
-runtime_env=""
-if [ "$backend_linker" = "self" ] && [ "$backend_runtime_obj" != "" ]; then
-  runtime_env="BACKEND_RUNTIME_OBJ=$backend_runtime_obj"
-fi
+backend_linker="$resolved_linker"
 
-abi_env=""
-abi_effective="$abi"
-if [ -z "$abi_effective" ]; then
-  abi_effective="${ABI:-}"
-fi
-if [ -z "$abi_effective" ]; then
-  abi_effective="v2_noptr"
-fi
-if [ "$abi_effective" != "v2_noptr" ]; then
-  echo "[Error] ABI only supports v2_noptr (got: $abi_effective; enforced by ZRPC/零裸指针生产闭环规范)" 1>&2
-  exit 2
-fi
-abi_env="ABI=$abi_effective"
-abi_std_noptr_env=""
-abi_std_noptr_strict_env=""
-abi_no_ptr_non_c_abi_env=""
-abi_no_ptr_non_c_abi_internal_env=""
-if [ "$abi_effective" = "v2_noptr" ]; then
-  if [ -z "${STAGE1_STD_NO_POINTERS+x}" ]; then
-    abi_std_noptr_env="STAGE1_STD_NO_POINTERS=1"
-  else
-    abi_std_noptr_env="STAGE1_STD_NO_POINTERS=$STAGE1_STD_NO_POINTERS"
-  fi
-  if [ -z "${STAGE1_STD_NO_POINTERS_STRICT+x}" ]; then
-    abi_std_noptr_strict_env="STAGE1_STD_NO_POINTERS_STRICT=0"
-  else
-    abi_std_noptr_strict_env="STAGE1_STD_NO_POINTERS_STRICT=$STAGE1_STD_NO_POINTERS_STRICT"
-  fi
-  if [ -z "${STAGE1_NO_POINTERS_NON_C_ABI+x}" ]; then
-    abi_no_ptr_non_c_abi_env="STAGE1_NO_POINTERS_NON_C_ABI=1"
-  else
-    abi_no_ptr_non_c_abi_env="STAGE1_NO_POINTERS_NON_C_ABI=$STAGE1_NO_POINTERS_NON_C_ABI"
-  fi
-  if [ -z "${STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL+x}" ]; then
-    abi_no_ptr_non_c_abi_internal_env="STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=1"
-  else
-    abi_no_ptr_non_c_abi_internal_env="STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=$STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL"
-  fi
-fi
-
-link_env=""
-if [ "$backend_emit" = "exe" ]; then
-  if [ "$backend_linker" = "self" ]; then
-    link_env="BACKEND_LINKER=self BACKEND_NO_RUNTIME_C=1"
-  else
-    if [ "${BACKEND_NO_RUNTIME_C+x}" = "x" ] && [ "${BACKEND_NO_RUNTIME_C}" != "" ]; then
-      link_env="BACKEND_LINKER=system BACKEND_NO_RUNTIME_C=$BACKEND_NO_RUNTIME_C"
-    elif [ "$build_track" = "release" ]; then
-      link_env="BACKEND_LINKER=system BACKEND_NO_RUNTIME_C=0"
-    else
-      link_env="BACKEND_LINKER=system"
-    fi
-  fi
-fi
-
-backend_ldflags_final="${BACKEND_LDFLAGS:-}"
+backend_ldflags_final="$ldflags_raw"
 if [ "$backend_emit" = "exe" ] && [ "$backend_linker" = "system" ]; then
   if [ "${BACKEND_LD:-}" = "" ] && ! has_fuse_ld_flag "$backend_ldflags_final"; then
     resolver_out="$(env \
@@ -951,110 +1301,129 @@ if [ "$backend_emit" = "exe" ] && [ "$backend_linker" = "system" ]; then
   fi
 fi
 
-backend_multi_env="${BACKEND_MULTI:-}"
-if [ "$backend_multi_env" = "" ]; then
-  if [ "$build_track" = "release" ]; then
-    backend_multi_env="${CHENGC_RELEASE_MULTI_DEFAULT:-0}"
-  else
-    backend_multi_env="${CHENGC_DEV_MULTI_DEFAULT:-1}"
-  fi
-fi
-backend_inc_env="${BACKEND_INCREMENTAL:-1}"
-backend_multi_module_cache_env="${BACKEND_MULTI_MODULE_CACHE:-${BACKEND_MULTI_MODULE_CACHE:-0}}"
-backend_module_cache_unstable_allow_env="${BACKEND_MODULE_CACHE_UNSTABLE_ALLOW:-${BACKEND_MODULE_CACHE_UNSTABLE_ALLOW:-0}}"
-chengc_allow_unstable_multi_module_cache_env="${CHENGC_ALLOW_UNSTABLE_MULTI_MODULE_CACHE:-0}"
-if is_true_flag "$backend_multi_module_cache_env"; then
-  if ! is_true_flag "$chengc_allow_unstable_multi_module_cache_env" || ! is_true_flag "$backend_module_cache_unstable_allow_env"; then
-    echo "[chengc] warn: BACKEND_MULTI_MODULE_CACHE is unstable and disabled by default; require CHENGC_ALLOW_UNSTABLE_MULTI_MODULE_CACHE=1 and BACKEND_MODULE_CACHE_UNSTABLE_ALLOW=1" 1>&2
-    backend_multi_module_cache_env="0"
-    backend_module_cache_unstable_allow_env="0"
-  fi
-fi
-backend_multi_force_env="${BACKEND_MULTI_FORCE:-0}"
-jobs_env=""
-jobs_unset_env="-u BACKEND_JOBS"
-module_cache_unset_env="-u BACKEND_MODULE_CACHE"
-multi_module_cache_unset_env="-u BACKEND_MULTI_MODULE_CACHE"
-if [ "$jobs_explicit" = "1" ]; then
-  jobs_env="BACKEND_JOBS=$jobs"
-  jobs_unset_env=""
-fi
-if [ "$legacy_multi" = "1" ]; then
-  backend_multi_env="1"
-  backend_multi_force_env="1"
+backend_fn_sched_env="$(normalize_fn_sched_text "$fn_sched_raw")"
+if [ "$backend_fn_sched_env" = "" ]; then
+  backend_fn_sched_env="ws"
 fi
 
-backend_module_cache_env="${BACKEND_MODULE_CACHE:-${BACKEND_MODULE_CACHE:-}}"
-module_cache_env=""
-if [ "$backend_module_cache_env" != "" ]; then
-  module_cache_env="BACKEND_MODULE_CACHE=$backend_module_cache_env"
+backend_module_cache="$module_cache_raw"
+backend_multi_module_cache="$(normalize_bool_text "$multi_module_cache_raw" "--multi-module-cache")"
+if [ "$backend_multi_module_cache" = "" ]; then
+  backend_multi_module_cache="0"
 fi
-backend_cstring_lowering_env="${BACKEND_CSTRING_LOWERING_REMOVED:-${BACKEND_CSTRING_LOWERING_REMOVED:-}}"
-if [ "$backend_cstring_lowering_env" = "" ]; then
-  backend_cstring_lowering_env="0"
-  if [ "$backend_linker" = "system" ]; then
-    no_runtime_c_effective="${BACKEND_NO_RUNTIME_C:-}"
-    if [ "$no_runtime_c_effective" = "" ] && [ "$build_track" = "release" ]; then
-      no_runtime_c_effective="0"
-    fi
-    case "$no_runtime_c_effective" in
-      0|false|FALSE|off|OFF|no|NO)
-        backend_cstring_lowering_env="1"
-        ;;
-    esac
-  fi
+backend_module_cache_unstable_allow="$(normalize_bool_text "$module_cache_unstable_allow_raw" "--module-cache-unstable-allow")"
+if [ "$backend_module_cache_unstable_allow" = "" ]; then
+  backend_module_cache_unstable_allow="0"
+fi
+if [ "$backend_multi_module_cache" = "1" ] && [ "$backend_module_cache_unstable_allow" != "1" ]; then
+  echo "[Error] --multi-module-cache requires --module-cache-unstable-allow:1" 1>&2
+  exit 2
 fi
 
 run_backend_driver() {
-  multi_now="$1"
-  multi_force_now="$2"
-  if [ -n "$backend_target" ]; then
-    # shellcheck disable=SC2086
-    env $jobs_unset_env $module_cache_unset_env $multi_module_cache_unset_env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env $abi_no_ptr_non_c_abi_internal_env $jobs_env $module_cache_env $driver_real_env \
-      BACKEND_BUILD_TRACK="$build_track" \
-      BACKEND_LDFLAGS="$backend_ldflags_final" \
-      BACKEND_TARGET="$backend_target" \
-      BACKEND_MULTI="$multi_now" \
-      BACKEND_MULTI_FORCE="$multi_force_now" \
-      BACKEND_MULTI_MODULE_CACHE="$backend_multi_module_cache_env" \
-      BACKEND_MODULE_CACHE_UNSTABLE_ALLOW="$backend_module_cache_unstable_allow_env" \
-      BACKEND_INCREMENTAL="$backend_inc_env" \
-      BACKEND_CSTRING_LOWERING_REMOVED="$backend_cstring_lowering_env" \
-      BACKEND_EMIT="$backend_emit" \
-      BACKEND_FRONTEND="$frontend" \
-      BACKEND_INPUT="$in" \
-      BACKEND_OUTPUT="$out_path" \
-      "$driver_exec"
-    return
+  set -- env -i \
+    "PATH=$clean_env_path" \
+    "HOME=$clean_env_home" \
+    "TMPDIR=$clean_env_tmpdir" \
+    "TOOLING_ROOT=$root"
+  if [ "$driver_real_env" != "" ]; then
+    set -- "$@" "$driver_real_env"
   fi
-  # shellcheck disable=SC2086
-  env $jobs_unset_env $module_cache_unset_env $multi_module_cache_unset_env $runtime_env $link_env $abi_env $abi_std_noptr_env $abi_std_noptr_strict_env $abi_no_ptr_non_c_abi_env $abi_no_ptr_non_c_abi_internal_env $jobs_env $module_cache_env $driver_real_env \
-    BACKEND_BUILD_TRACK="$build_track" \
-    BACKEND_LDFLAGS="$backend_ldflags_final" \
-    BACKEND_MULTI="$multi_now" \
-    BACKEND_MULTI_FORCE="$multi_force_now" \
-    BACKEND_MULTI_MODULE_CACHE="$backend_multi_module_cache_env" \
-    BACKEND_MODULE_CACHE_UNSTABLE_ALLOW="$backend_module_cache_unstable_allow_env" \
-    BACKEND_INCREMENTAL="$backend_inc_env" \
-    BACKEND_CSTRING_LOWERING_REMOVED="$backend_cstring_lowering_env" \
-    BACKEND_EMIT="$backend_emit" \
-    BACKEND_FRONTEND="$frontend" \
-    BACKEND_INPUT="$in" \
-    BACKEND_OUTPUT="$out_path" \
-    "$driver_exec"
+  if [ "${PKG_ROOTS:-}" != "" ]; then
+    set -- "$@" "PKG_ROOTS=$PKG_ROOTS"
+  fi
+  set -- "$@" \
+    "$driver_exec" "$in" \
+    "--emit:$backend_emit" \
+    "--frontend:$frontend" \
+    "--build-track:$build_track" \
+    "--mm:$mm" \
+    "--fn-sched:$backend_fn_sched_env" \
+    "--target:$backend_target" \
+    "--generic-mode:$backend_generic_mode" \
+    "--generic-spec-budget:$backend_generic_spec_budget" \
+    "--generic-lowering:$backend_generic_lowering" \
+    "--jobs:$jobs" \
+    "--fn-jobs:$backend_fn_jobs_env"
+  if [ "$backend_whole_program" != "" ]; then
+    set -- "$@" "--whole-program:$backend_whole_program"
+  fi
+  if [ "$backend_ldflags_final" != "" ]; then
+    set -- "$@" "--ldflags:$backend_ldflags_final"
+  fi
+  if [ "$backend_module_cache" != "" ]; then
+    set -- "$@" "--module-cache:$backend_module_cache"
+  fi
+  if [ "$backend_multi_module_cache" = "1" ]; then
+    set -- "$@" "--multi-module-cache"
+  else
+    set -- "$@" "--no-multi-module-cache"
+  fi
+  if [ "$backend_module_cache_unstable_allow" = "1" ]; then
+    set -- "$@" "--module-cache-unstable-allow"
+  else
+    set -- "$@" "--no-module-cache-unstable-allow"
+  fi
+  if [ "$backend_sidecar_mode" != "" ]; then
+    set -- "$@" "--sidecar-mode:$backend_sidecar_mode"
+  fi
+  if [ "$backend_sidecar_bundle" != "" ]; then
+    set -- "$@" "--sidecar-bundle:$backend_sidecar_bundle"
+  fi
+  if [ "$backend_sidecar_compiler" != "" ]; then
+    set -- "$@" "--sidecar-compiler:$backend_sidecar_compiler"
+  fi
+  if [ "$backend_sidecar_child_mode" != "" ]; then
+    set -- "$@" "--sidecar-child-mode:$backend_sidecar_child_mode"
+  fi
+  if [ "$backend_sidecar_outer_companion" != "" ]; then
+    set -- "$@" "--sidecar-outer-compiler:$backend_sidecar_outer_companion"
+  fi
+  if [ "$backend_emit" = "exe" ]; then
+    set -- "$@" "--linker:$backend_linker"
+  fi
+  if [ "$backend_multi_env" = "1" ]; then
+    set -- "$@" "--multi"
+  else
+    set -- "$@" "--no-multi"
+  fi
+  if [ "$backend_multi_force_env" = "1" ]; then
+    set -- "$@" "--multi-force"
+  else
+    set -- "$@" "--no-multi-force"
+  fi
+  if [ "$backend_inc_env" = "1" ]; then
+    set -- "$@" "--incremental"
+  else
+    set -- "$@" "--no-incremental"
+  fi
+  if [ "$backend_opt" = "1" ]; then
+    set -- "$@" "--opt"
+  elif [ "$backend_opt" = "0" ]; then
+    set -- "$@" "--no-opt"
+  fi
+  if [ "$backend_opt2" = "1" ]; then
+    set -- "$@" "--opt2"
+  elif [ "$backend_opt2" = "0" ]; then
+    set -- "$@" "--no-opt2"
+  fi
+  if [ "$backend_opt_level" != "" ]; then
+    set -- "$@" "--opt-level:$backend_opt_level"
+  fi
+  if [ "$backend_emit" = "exe" ] && [ "$resolved_no_runtime_c" = "1" ]; then
+    set -- "$@" "--no-runtime-c"
+  fi
+  if [ "$backend_emit" = "exe" ] && [ "$resolved_runtime_obj_assigned" = "1" ]; then
+    set -- "$@" "--runtime-obj:$resolved_runtime_obj"
+  fi
+  set -- "$@" "--output:$out_path"
+  "$@"
 }
 
 set +e
-run_backend_driver "$backend_multi_env" "$backend_multi_force_env"
+run_backend_driver
 build_status="$?"
 set -e
-if [ "$build_status" -ne 0 ] && [ "$backend_multi_env" = "1" ] && [ "${CHENGC_MULTI_RETRY_SERIAL:-1}" = "1" ]; then
-  echo "[chengc] warn: parallel compile failed (status=$build_status), retry serial once" 1>&2
-  set +e
-  run_backend_driver "0" "0"
-  build_status="$?"
-  set -e
-fi
 if [ "$build_status" -ne 0 ]; then
   exit "$build_status"
 fi
@@ -1063,10 +1432,17 @@ if [ "$backend_emit" = "exe" ]; then
   cleanup_backend_exe_sidecar "$out_path"
 fi
 
+reported_out_path="$out_path"
+run_out_path="$out_path"
+if [ "$backend_emit" = "exe" ] && [ "$tooling_selfhost_launcher_requested" = "1" ]; then
+  emit_tooling_selfhost_launcher "$tooling_selfhost_launcher_out_path" "$out_path"
+  reported_out_path="$tooling_selfhost_launcher_out_path"
+fi
+
 if [ "$backend_emit" = "obj" ]; then
   echo "chengc obj ok: $out_path"
 else
-  echo "chengc exe ok: $out_path"
+  echo "chengc exe ok: $reported_out_path"
 fi
 
 if [ "$legacy_run" != "1" ] || [ "$backend_emit" != "exe" ]; then
@@ -1105,10 +1481,10 @@ case "$backend_target" in
 esac
 
 if [ "$run_mode" = "host" ]; then
-  echo "[chengc] run(host-runner): $out_path" >&2
-  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_host_runner run-host --exe:"$out_path"
+  echo "[chengc] run(host-runner): $run_out_path" >&2
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_host_runner run-host --exe:"$run_out_path"
   exit $?
 fi
 
-echo "[chengc] run(file): $out_path" >&2
-"$out_path"
+echo "[chengc] run(file): $run_out_path" >&2
+"$run_out_path"

@@ -91,30 +91,31 @@ if ! find_raw_spawn src/std/async_rt_legacy.cheng; then
   exit 1
 fi
 
+run_driver_compile_obj() {
+  fixture="$1"
+  obj="$2"
+  env \
+    MM=orc \
+    STAGE1_NO_POINTERS_NON_C_ABI=0 \
+    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
+    STAGE1_SEM_FIXED_0=0 \
+    STAGE1_OWNERSHIP_FIXED_0=0 \
+    "$driver" "$fixture" \
+      --frontend:stage1 \
+      --emit:obj \
+      --target:"$target" \
+      --generic-mode:dict \
+      --generic-spec-budget:0 \
+      --output:"$obj"
+}
+
 compile_ok() {
   name="$1"
   fixture="$2"
   obj="$3"
   log="$4"
   set +e
-  run_with_timeout "$timeout_s" env \
-    MM=orc \
-    STAGE1_NO_POINTERS_NON_C_ABI=0 \
-    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-    STAGE1_SEM_FIXED_0=0 \
-    GENERIC_MODE=dict \
-    GENERIC_SPEC_BUDGET=0 \
-    STAGE1_OWNERSHIP_FIXED_0=0 \
-    BACKEND_LINKER=self \
-    BACKEND_DIRECT_EXE=1 \
-    BACKEND_LINKERLESS_INMEM=1 \
-    BACKEND_NO_RUNTIME_C=0 \
-    BACKEND_EMIT=exe \
-    BACKEND_TARGET="$target" \
-    BACKEND_FRONTEND=stage1 \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$obj" \
-    "$driver" >"$log" 2>&1
+  run_with_timeout "$timeout_s" run_driver_compile_obj "$fixture" "$obj" >"$log" 2>&1
   status="$?"
   set -e
   if [ "$status" = "124" ]; then
@@ -139,24 +140,7 @@ compile_fail() {
   obj="$3"
   log="$4"
   set +e
-  run_with_timeout "$timeout_s" env \
-    MM=orc \
-    STAGE1_NO_POINTERS_NON_C_ABI=0 \
-    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
-    STAGE1_SEM_FIXED_0=0 \
-    GENERIC_MODE=dict \
-    GENERIC_SPEC_BUDGET=0 \
-    STAGE1_OWNERSHIP_FIXED_0=0 \
-    BACKEND_LINKER=self \
-    BACKEND_DIRECT_EXE=1 \
-    BACKEND_LINKERLESS_INMEM=1 \
-    BACKEND_NO_RUNTIME_C=0 \
-    BACKEND_EMIT=exe \
-    BACKEND_TARGET="$target" \
-    BACKEND_FRONTEND=stage1 \
-    BACKEND_INPUT="$fixture" \
-    BACKEND_OUTPUT="$obj" \
-    "$driver" >"$log" 2>&1
+  run_with_timeout "$timeout_s" run_driver_compile_obj "$fixture" "$obj" >"$log" 2>&1
   status="$?"
   set -e
   if [ "$status" = "0" ]; then
@@ -179,11 +163,11 @@ compile_fail() {
   fi
 }
 
-default_obj="$out_dir/return_spawn_default_thread_entry_gate.bin"
+default_obj="$out_dir/return_spawn_default_thread_entry_gate.o"
 default_log="$out_dir/return_spawn_default_thread_entry_gate.log"
-typed_obj="$out_dir/return_spawn_typed_value_gate.bin"
+typed_obj="$out_dir/return_spawn_typed_value_gate.o"
 typed_log="$out_dir/return_spawn_typed_value_gate.log"
-legacy_obj="$out_dir/return_spawn_legacy_namespaced_gate.bin"
+legacy_obj="$out_dir/return_spawn_legacy_namespaced_gate.o"
 legacy_log="$out_dir/return_spawn_legacy_namespaced_gate.log"
 
 compile_ok \
@@ -207,7 +191,7 @@ compile_ok \
 compile_fail \
   "spawn.raw.default_forbidden" \
   "tests/cheng/backend/fixtures/compile_fail_spawn_raw_default_gate.cheng" \
-  "$out_dir/compile_fail_spawn_raw_default_gate.bin" \
+  "$out_dir/compile_fail_spawn_raw_default_gate.o" \
   "$out_dir/compile_fail_spawn_raw_default_gate.log"
 
 echo "verify_backend_spawn_api_gate ok"
