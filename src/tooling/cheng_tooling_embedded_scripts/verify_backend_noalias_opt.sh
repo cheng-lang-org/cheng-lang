@@ -42,6 +42,15 @@ extract_stamp_field() {
   awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$stamp_file"
 }
 
+extract_internal_ownership_fixed_0_effective() {
+  stamp_file="$1"
+  value="$(extract_stamp_field "$stamp_file" "stage1_ownership_fixed_0_effective")"
+  if [ "$value" = "" ]; then
+    value="$(extract_stamp_field "$stamp_file" "stage1_skip_ownership_effective")"
+  fi
+  printf '%s\n' "$value"
+}
+
 extract_phase_field() {
   log_file="$1"
   key="$2"
@@ -187,7 +196,7 @@ while IFS= read -r fixture; do
 
   phase_model="$(extract_stamp_field "$stamp" "uir_phase_model")"
   phase_version="$(extract_stamp_field "$stamp" "uir_phase_contract_version")"
-  skip_ownership_effective="$(extract_stamp_field "$stamp" "stage1_skip_ownership_effective")"
+  skip_ownership_effective="$(extract_internal_ownership_fixed_0_effective "$stamp")"
   high_uir_checked="$(extract_phase_field "$log" "high_uir_checked_funcs")"
   high_uir_fallback="$(extract_phase_field "$log" "high_uir_fallback_funcs")"
   low_uir_lowered="$(extract_phase_field "$log" "low_uir_lowered_funcs")"
@@ -298,7 +307,7 @@ if [ "$phase_contract_version_mismatch_count" -gt 0 ]; then
   exit 1
 fi
 if [ "$skip_ownership_effective_nonzero_count" -gt 0 ]; then
-  echo "[verify_backend_noalias_opt] ownership proof path not engaged: stage1_skip_ownership_effective!=0 count=$skip_ownership_effective_nonzero_count" 1>&2
+  echo "[verify_backend_noalias_opt] ownership proof path not engaged: stage1_ownership_fixed_0_effective!=0 count=$skip_ownership_effective_nonzero_count" 1>&2
   exit 1
 fi
 if [ "$high_uir_checked_total" -le 0 ]; then

@@ -10,6 +10,16 @@ proof_phase_driver_extract_stamp_field() {
   awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$stamp_file"
 }
 
+proof_phase_driver_extract_internal_ownership_fixed_0_field() {
+  stamp_file="$1"
+  suffix="$2"
+  value="$(proof_phase_driver_extract_stamp_field "$stamp_file" "stage1_ownership_fixed_0_${suffix}")"
+  if [ "$value" = "" ]; then
+    value="$(proof_phase_driver_extract_stamp_field "$stamp_file" "stage1_skip_ownership_${suffix}")"
+  fi
+  printf '%s\n' "$value"
+}
+
 proof_phase_driver_summary_flat() {
   if [ "${proof_phase_driver_summary:-}" = "" ]; then
     printf '\n'
@@ -25,8 +35,8 @@ proof_phase_driver_published_surface_ok() {
   if [ ! -x "$cand" ] || [ ! -s "$meta" ] || [ ! -s "$stamp" ]; then
     return 1
   fi
-  eff="$(proof_phase_driver_extract_stamp_field "$stamp" "stage1_skip_ownership_effective")"
-  def="$(proof_phase_driver_extract_stamp_field "$stamp" "stage1_skip_ownership_default")"
+  eff="$(proof_phase_driver_extract_internal_ownership_fixed_0_field "$stamp" "effective")"
+  def="$(proof_phase_driver_extract_internal_ownership_fixed_0_field "$stamp" "default")"
   phase="$(proof_phase_driver_extract_stamp_field "$stamp" "uir_phase_contract_version")"
   if [ "$eff" != "0" ] || [ "$def" != "0" ]; then
     return 1
@@ -268,8 +278,8 @@ proof_phase_driver_probe_candidate() {
   fi
   set -e
 
-  proof_phase_driver_probe_effective="$(proof_phase_driver_extract_stamp_field "$proof_phase_driver_probe_stamp" "stage1_skip_ownership_effective")"
-  proof_phase_driver_probe_default="$(proof_phase_driver_extract_stamp_field "$proof_phase_driver_probe_stamp" "stage1_skip_ownership_default")"
+  proof_phase_driver_probe_effective="$(proof_phase_driver_extract_internal_ownership_fixed_0_field "$proof_phase_driver_probe_stamp" "effective")"
+  proof_phase_driver_probe_default="$(proof_phase_driver_extract_internal_ownership_fixed_0_field "$proof_phase_driver_probe_stamp" "default")"
   proof_phase_driver_probe_error="$(proof_phase_driver_first_error "$proof_phase_driver_probe_log")"
 
   if [ "$proof_phase_driver_probe_rc" = "0" ] &&

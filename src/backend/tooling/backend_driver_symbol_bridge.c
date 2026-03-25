@@ -1752,19 +1752,6 @@ void *driver_c_build_module_stage1(const char *input_path, const char *target) {
         }
       }
     }
-    {
-      driver_c_boot_marker(64);
-      cheng_build_active_module_ptrs_fn build_active_module_ptrs =
-          (cheng_build_active_module_ptrs_fn)dlsym(RTLD_DEFAULT, "driver_buildActiveModulePtrs");
-      if (build_active_module_ptrs != NULL) {
-        void *module = build_active_module_ptrs((void *)input_path, (void *)target);
-        driver_c_diagf("[driver_c_build_module_stage1] dlsym_sidecar_module=%p\n", module);
-        if (module != NULL) {
-          driver_c_boot_marker(65);
-          return driver_c_module_wrap(module, CHENG_DRIVER_MODULE_KIND_RAW);
-        }
-      }
-    }
   }
   {
     driver_c_boot_marker(66);
@@ -1835,15 +1822,6 @@ void *driver_c_build_module_stage1_direct(const char *input_path, const char *ta
     if (build_module_stage1 != NULL) {
       void *module = build_module_stage1(input_path, target);
       driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_builder_module=%p\n", module);
-      if (module != NULL) return module;
-    }
-  }
-  if (allow_direct_exports != 0) {
-    cheng_build_active_module_ptrs_fn build_active_module_ptrs =
-        (cheng_build_active_module_ptrs_fn)dlsym(RTLD_DEFAULT, "driver_buildActiveModulePtrs");
-    if (build_active_module_ptrs != NULL) {
-      void *module = build_active_module_ptrs((void *)input_path, (void *)target);
-      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_sidecar_module=%p\n", module);
       if (module != NULL) return module;
     }
   }

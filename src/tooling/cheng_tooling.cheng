@@ -5770,12 +5770,16 @@ fn tooling_runtimeObjNeedsRefresh(root: str, objPath: str): bool =
     if objMtime <= 0:
         return true
     let runtimeSrc: str = os.joinPath(root, "src/std/system_helpers_backend.cheng")
+    let runtimeNativeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers.c")
+    let runtimeNativeHeader: str = os.joinPath(root, "src/runtime/native/system_helpers.h")
     let shimSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_selflink_shim.c")
     let minRuntimeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_selflink_min_runtime.c")
     let fdWriteBridgeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_fd_write_bridge.c")
     let epochTimeBridgeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_epoch_time_bridge.c")
     let openCloseBridgeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_open_close_bridge.c")
-    let deps: str[] = [runtimeSrc, shimSrc, minRuntimeSrc, fdWriteBridgeSrc, epochTimeBridgeSrc, openCloseBridgeSrc]
+    let deps: str[] = [runtimeSrc, runtimeNativeSrc, runtimeNativeHeader,
+                       shimSrc, minRuntimeSrc,
+                       fdWriteBridgeSrc, epochTimeBridgeSrc, openCloseBridgeSrc]
     for i in 0..<deps.len:
         let dep: str = deps[i]
         if os.fileExists(dep) && os.fileMtime(dep) > objMtime:
@@ -5853,6 +5857,7 @@ fn tooling_runtimeObjHasFastExeSymbols(root: str, objPath: str): bool =
         " need[\"cheng_mem_release\"]=1;" +
         " need[\"cheng_seq_get\"]=1;" +
         " need[\"cheng_seq_set\"]=1;" +
+        " need[\"cheng_str_bridge_load_into\"]=1;" +
         " need[\"cheng_strcmp\"]=1;" +
         " need[\"cheng_f32_bits_to_i64\"]=1;" +
         " need[\"cheng_f64_bits_to_i64\"]=1;" +
@@ -7414,10 +7419,11 @@ fn tooling_backendDriverUirSidecarSnapshotOk(root: str): bool =
         return false
     if !tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, snapshotRealDriver):
         return false
+    if !tooling_backendDriverCurrentsrcProofPublishedStage0Path(root, snapshotRealDriver):
+        return false
     if !tooling_backendDriverCurrentsrcProofStrictStage0MetaOk(root, snapshotRealDriver):
         return false
-    if tooling_backendDriverCurrentsrcProofPublishedStage0Path(root, snapshotRealDriver) &&
-       !tooling_backendDriverCurrentsrcProofPublishedStage0FreshOk(root, snapshotRealDriver):
+    if !tooling_backendDriverCurrentsrcProofPublishedStage0FreshOk(root, snapshotRealDriver):
         return false
     if !tooling_backendDriverUirSidecarChildModeValid(snapshotChildMode):
         return false
@@ -7442,9 +7448,6 @@ fn tooling_backendDriverUirSidecarChengSourcePath(root: str): str =
 
 fn tooling_backendDriverUirSidecarWrapperSourcePath(root: str): str =
     return os.joinPath(root, "src/backend/tooling/backend_driver_uir_sidecar_wrapper.cheng")
-
-fn tooling_backendDriverUirSidecarDirectBuildSourcePath(root: str): str =
-    return os.joinPath(root, "src/backend/tooling/backend_driver_uir_sidecar_direct_build.cheng")
 
 fn tooling_backendDriverUirSidecarCSourcePath(root: str): str =
     return os.joinPath(root, "src/backend/tooling/backend_driver_uir_sidecar_bundle.c")
@@ -7512,6 +7515,38 @@ fn tooling_backendDriverCurrentsrcProofPublishedStage0Path(root: str, rawPath: s
            tooling_strEq(absPath, os.joinPath(lineageDir, "cheng.stage2")) ||
            tooling_strEq(absPath, os.joinPath(lineageDir, "cheng.stage2.proof"))
 
+fn tooling_backendDriverCurrentsrcProofDirectExportDriverPath(root: str, rawPath: str): str =
+    let absPath: str = tooling_pathAbsolute(root, rawPath)
+    if strutil.endsWith(absPath, ".proof"):
+        let metaRaw: str = tooling_readTextFile(root, absPath + ".meta")
+        let outerDriverRaw: str = tooling_kvGet(metaRaw, "outer_driver")
+        if tooling_strNonEmpty(outerDriverRaw):
+            return tooling_pathAbsolute(root, outerDriverRaw)
+    return absPath
+
+fn tooling_backendDriverCurrentsrcProofDirectExportSurfaceOk(root: str, rawPath: str): bool =
+    let exportDriver: str = tooling_backendDriverCurrentsrcProofDirectExportDriverPath(root, rawPath)
+    if !tooling_strNonEmpty(exportDriver):
+        return false
+    if !tooling_isExecutable(root, exportDriver):
+        return false
+    if os.execCmdResultExitCode(tooling_exec(root, "command -v nm >/dev/null 2>&1")) != 0:
+        return false
+    if os.execCmdResultExitCode(tooling_exec(root, "command -v awk >/dev/null 2>&1")) != 0:
+        return false
+    let res: os.ExecCmdResult = tooling_exec(
+        root,
+        "(nm -gU " + tooling_shellQuote(exportDriver) + " 2>/dev/null || " +
+            "nm " + tooling_shellQuote(exportDriver) + " 2>/dev/null) | awk '" +
+            "BEGIN{ need1=0; need2=0; }" +
+            "{ sym=$NF; gsub(/^_+/, \"\", sym);" +
+            "  if (sym == \"driver_export_build_emit_obj_from_file_stage1_target_impl\") need1=1;" +
+            "  if (sym == \"driver_export_prefer_sidecar_builds\") need2=1;" +
+            "}" +
+            "END{ exit((need1 && need2) ? 0 : 1); }'"
+    )
+    return os.execCmdResultExitCode(res) == 0
+
 fn tooling_backendDriverCurrentsrcProofPublishedStage0MetaOk(root: str, rawPath: str): bool =
     let absPath: str = tooling_pathAbsolute(root, rawPath)
     if !tooling_backendDriverCurrentsrcProofPublishedStage0Path(root, absPath):
@@ -7527,10 +7562,11 @@ fn tooling_backendDriverCurrentsrcProofPublishedStage0MetaOk(root: str, rawPath:
            tooling_strEq(tooling_kvGet(metaRaw, "outer_driver"), absPath) &&
            tooling_strEq(tooling_kvGet(metaRaw, "driver_input"),
                          "src/backend/tooling/backend_driver_proof.cheng") &&
-           tooling_strEq(tooling_kvGet(metaRaw, "stage1_skip_ownership_effective"), "0") &&
-           tooling_strEq(tooling_kvGet(metaRaw, "stage1_skip_ownership_default"), "0") &&
+           tooling_strEq(tooling_kvGet(metaRaw, "stage1_ownership_fixed_0_effective"), "0") &&
+           tooling_strEq(tooling_kvGet(metaRaw, "stage1_ownership_fixed_0_default"), "0") &&
            tooling_strEq(tooling_kvGet(metaRaw, "generic_mode"), "dict") &&
-           tooling_strEq(tooling_kvGet(metaRaw, "generic_lowering"), "mir_dict")
+           tooling_strEq(tooling_kvGet(metaRaw, "generic_lowering"), "mir_dict") &&
+           tooling_backendDriverCurrentsrcProofDirectExportSurfaceOk(root, absPath)
 
 fn tooling_backendDriverCurrentsrcProofBootstrapStage0MetaOk(root: str, rawPath: str): bool =
     let absPath: str = tooling_pathAbsolute(root, rawPath)
@@ -7542,10 +7578,8 @@ fn tooling_backendDriverCurrentsrcProofBootstrapStage0MetaOk(root: str, rawPath:
     return tooling_strEq(tooling_kvGet(metaRaw, "meta_contract_version"), "2") &&
            tooling_strEq(tooling_kvGet(metaRaw, "label"), "currentsrc.proof.bootstrap") &&
            tooling_strEq(tooling_kvGet(metaRaw, "outer_driver"), absPath) &&
-           tooling_strEq(tooling_kvGet(metaRaw, "driver_input"),
-                         "src/backend/tooling/backend_driver_proof.cheng") &&
-           tooling_strEq(tooling_kvGet(metaRaw, "stage1_skip_ownership_effective"), "0") &&
-           tooling_strEq(tooling_kvGet(metaRaw, "stage1_skip_ownership_default"), "0") &&
+           tooling_strEq(tooling_kvGet(metaRaw, "stage1_ownership_fixed_0_effective"), "0") &&
+           tooling_strEq(tooling_kvGet(metaRaw, "stage1_ownership_fixed_0_default"), "0") &&
            tooling_strEq(tooling_kvGet(metaRaw, "generic_mode"), "dict") &&
            tooling_strEq(tooling_kvGet(metaRaw, "generic_lowering"), "mir_dict")
 
@@ -7556,7 +7590,6 @@ fn tooling_backendDriverCurrentsrcProofStrictStage0MetaOk(root: str, rawPath: st
 fn tooling_backendDriverCurrentsrcProofPublishedStage0SourceList(): str[] =
     var out: str[] = tooling_stage0CapabilitySourceList()
     add(out, "src/backend/tooling/backend_driver_proof.cheng")
-    add(out, "src/backend/tooling/backend_driver_uir_proof_direct_build.cheng")
     return out
 
 fn tooling_backendDriverCurrentsrcProofPublishedStage0FreshOk(root: str, rawPath: str): bool =
@@ -7570,8 +7603,6 @@ fn tooling_backendDriverSidecarBootstrapDriverPathOk(root: str, rawPath: str): b
     let absPath: str = tooling_pathAbsolute(root, rawPath)
     if !tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, absPath):
         return false
-    if tooling_backendDriverCurrentsrcProofBootstrapStage0MetaOk(root, absPath):
-        return true
     return tooling_backendDriverCurrentsrcProofPublishedStage0MetaOk(root, absPath) &&
            tooling_backendDriverCurrentsrcProofPublishedStage0FreshOk(root, absPath)
 
@@ -7635,9 +7666,6 @@ fn tooling_backendDriverSidecarBootstrapDriverPath(root: str, compilerPath: str,
         if tooling_backendDriverSidecarBootstrapDriverPathOk(root, envPath):
             return envPath
         return ""
-    let proofPath: str = tooling_backendDriverCurrentsrcProofRealDriverPath(root)
-    if tooling_backendDriverSidecarBootstrapDriverPathOk(root, proofPath):
-        return proofPath
     let publishedProofPath: str = tooling_backendDriverCurrentsrcProofPublishedStage2Path(root)
     if tooling_backendDriverSidecarBootstrapDriverPathOk(root, publishedProofPath):
         return publishedProofPath
@@ -7704,7 +7732,8 @@ fn tooling_backendDriverUirSidecarCompilerMetaRaw(root: str, compilerPath: str):
 fn tooling_backendDriverSidecarCompilerRealDriver(root: str, compilerPath: str): str =
     let envPath: str = tooling_pathAbsolute(
         root, strutil.strip(os.getEnvDefault("BACKEND_UIR_SIDECAR_REAL_DRIVER", "")))
-    if tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, envPath):
+    if tooling_backendDriverCurrentsrcProofPublishedStage0Path(root, envPath) &&
+       tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, envPath):
         return envPath
     if tooling_backendDriverUirSidecarSnapshotOk(root):
         let snapshotRaw: str = tooling_backendDriverUirSidecarSnapshotRaw(root)
@@ -7713,11 +7742,13 @@ fn tooling_backendDriverSidecarCompilerRealDriver(root: str, compilerPath: str):
                          tooling_pathAbsolute(root, snapshotCompiler)):
             let snapshotRealDriver: str = tooling_kvGet(
                 snapshotRaw, "backend_sidecar_cheng_fresh_real_driver")
-            if tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, snapshotRealDriver):
+            if tooling_backendDriverCurrentsrcProofPublishedStage0Path(root, snapshotRealDriver) &&
+               tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, snapshotRealDriver):
                 return snapshotRealDriver
     let metaRaw: str = tooling_backendDriverUirSidecarCompilerMetaRaw(root, compilerPath)
     let realDriver: str = tooling_kvGet(metaRaw, "sidecar_real_driver")
-    if tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, realDriver):
+    if tooling_backendDriverCurrentsrcProofPublishedStage0Path(root, realDriver) &&
+       tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, realDriver):
         return realDriver
     return ""
 
@@ -7855,7 +7886,6 @@ fn tooling_backendDriverUirSidecarDependencyPaths(root: str): str[] =
     var out: str[] = []
     add(out, tooling_backendDriverUirSidecarCSourcePath(root))
     add(out, tooling_backendDriverUirSidecarWrapperSourcePath(root))
-    add(out, tooling_backendDriverUirSidecarDirectBuildSourcePath(root))
     add(out, os.joinPath(root, "src/runtime/native/system_helpers.h"))
     let stage0Deps: str[] = tooling_stage0CapabilitySourceList()
     for i in 0..<stage0Deps.len:
@@ -14487,13 +14517,17 @@ fn tooling_cmdVerifyBackendSidecarChengFresh(root: str): int32 =
     var realDriver: str = tooling_pathAbsolute(
         root, strutil.strip(os.getEnvDefault("BACKEND_UIR_SIDECAR_REAL_DRIVER", "")))
     if !tooling_strNonEmpty(realDriver):
-        realDriver = bootstrapRealDriver
+        realDriver = tooling_backendDriverCurrentsrcProofPublishedStage2Path(root)
     if tooling_strEq(realDriver, tooling_backendDriverSidecarDistRealDriverPath(root)):
         tooling_printErr("cheng_tooling: verify_backend_sidecar_cheng_fresh strict-fresh rejects dist current real driver: " +
                          realDriver)
         return 1
     if !tooling_backendDriverUirSidecarStrictRealDriverPathOk(root, realDriver):
         tooling_printErr("cheng_tooling: verify_backend_sidecar_cheng_fresh missing current-source real driver: " +
+                         realDriver)
+        return 1
+    if !tooling_backendDriverCurrentsrcProofPublishedStage0Path(root, realDriver):
+        tooling_printErr("cheng_tooling: verify_backend_sidecar_cheng_fresh strict real sidecar driver must be a published strict stage0 surface: " +
                          realDriver)
         return 1
     if !tooling_backendDriverCurrentsrcProofStrictStage0MetaOk(root, realDriver):
@@ -16187,6 +16221,10 @@ fn tooling_cmdBackendProdClosureFromArgs(root: str, firstArgIndex: int32, count:
         return rc
     rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.rawptr_surface_forbid",
                                        "verify_backend_rawptr_surface_forbid", "", envPrefix, gateTimeout)
+    if rc != 0:
+        return rc
+    rc = tooling_cmdBackendProdRunGate(root, toolBin, "backend.pure_cheng_surface",
+                                       "verify_backend_pure_cheng_surface", "", envPrefix, gateTimeout)
     if rc != 0:
         return rc
     let stage1AstSoaEnforceRaw: str = os.getEnvDefault("BACKEND_PROD_STAGE1_AST_SOA_ENFORCE", "1")
@@ -19080,89 +19118,9 @@ fn tooling_cmdVerifyBackendPureChengSurface(root: str): int32 =
     return tooling_execAndPrint(
         root,
         "set -eu; " +
-        "if ! command -v rg >/dev/null 2>&1; then " +
-            "echo \"[verify_backend_pure_cheng_surface] rg is required\" >&2; exit 2; " +
-        "fi; " +
-        "out_dir=\"artifacts/backend_pure_cheng_surface\"; " +
-        "rm -rf \"$out_dir\"; mkdir -p \"$out_dir\"; " +
-        "report=\"$out_dir/backend_pure_cheng_surface.report.txt\"; " +
-        "snapshot=\"$out_dir/backend_pure_cheng_surface.snapshot.env\"; " +
-        "legacy_new_file=\"$out_dir/backend_pure_cheng_surface.legacy_new.txt\"; " +
-        "rawptr_file=\"$out_dir/backend_pure_cheng_surface.rawptr.txt\"; " +
-        "c_files_file=\"$out_dir/backend_pure_cheng_surface.repo_c_files.txt\"; " +
-        "manifest_refs_file=\"$out_dir/backend_pure_cheng_surface.manifest_refs.txt\"; " +
-        "default_graph_source=\"$out_dir/backend_pure_cheng_surface.default_graph_source.cheng\"; " +
-        "status=\"ok\"; " +
-        "enforce=\"${BACKEND_PURE_CHENG_ENFORCE:-1}\"; " +
-        "rg -n --glob '*.cheng' --glob '!cheng_sidecar_rewrite_*.cheng' '(^[[:space:]]*new[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$|(^|[^[:alnum:]_])new\\([a-z_][A-Za-z0-9_]*\\))' src/stage1 src/std src/backend src/web tests | " +
-        "rg -v '/compile_fail_new_local_var_ref_surface\\.cheng:' >\"$legacy_new_file\" || true; " +
-        "rg -n --glob '*.cheng' --glob '!cheng_sidecar_rewrite_*.cheng' '(void\\*|[A-Za-z_][A-Za-z0-9_]*\\*|ptr\\[[^]]*\\]|ptr_add\\(|load_ptr\\(|store_ptr\\(|copyMem\\(|setMem\\(|zeroMem\\(|alloc\\(|dealloc\\()' src/stage1 src/std src/backend src/web | " +
-        "rg -v 'rawPointerForbidMessage\\(' >\"$rawptr_file\" || true; " +
-        "awk '/^fn tooling_cmdBackendProdClosureFromArgs\\(/{f=1} f && /^fn [A-Za-z_][A-Za-z0-9_]*\\(/{if (f) exit} f{print}' src/tooling/cheng_tooling.cheng >\"$default_graph_source\"; " +
-        "rg -o 'tooling_cmdBackendProdRunGate\\([^\n]*\"(backend\\.[A-Za-z0-9_\\.]+)\"' \"$default_graph_source\" | " +
-            "sed -E 's/.*\\\"(backend\\.[^\"]+)\\\"/\\1/' | LC_ALL=C sort -u >\"$manifest_refs_file\" || true; " +
-        "tmp_manifest_refs=\"${manifest_refs_file}.tmp\"; " +
-        ": >\"$tmp_manifest_refs\"; " +
-        ": >\"$c_files_file\"; " +
-        "while IFS= read -r gate; do " +
-            "case \"$gate\" in " +
-                "backend.runtime_abi) " +
-                    "printf '%s\\n' src/runtime/native/system_helpers.h src/runtime/native/system_helpers.c src/runtime/native/system_helpers_float_bits.c >>\"$c_files_file\"; " +
-                    "printf '%s\\n' \"$gate\" >>\"$tmp_manifest_refs\" " +
-                    ";; " +
-                "backend.sidecar_cheng_fresh) " +
-                    "printf '%s\\n' src/backend/tooling/backend_driver_sidecar_outer_main.c src/runtime/native/system_helpers.c src/backend/tooling/backend_driver_uir_sidecar_bundle.c >>\"$c_files_file\"; " +
-                    "printf '%s\\n' \"$gate\" >>\"$tmp_manifest_refs\" " +
-                    ";; " +
-                "backend.ffi_handle_sandbox|backend.ffi_borrow_bridge) " +
-                    "printf '%s\\n' src/runtime/native/system_helpers.h src/runtime/native/system_helpers.c >>\"$c_files_file\"; " +
-                    "printf '%s\\n' \"$gate\" >>\"$tmp_manifest_refs\" " +
-                    ";; " +
-            "esac; " +
-        "done <\"$manifest_refs_file\"; " +
-        "mv \"$tmp_manifest_refs\" \"$manifest_refs_file\"; " +
-        "LC_ALL=C sort -u \"$manifest_refs_file\" -o \"$manifest_refs_file\"; " +
-        "LC_ALL=C sort -u \"$c_files_file\" -o \"$c_files_file\"; " +
-        "legacy_new_count=\"$(wc -l <\"$legacy_new_file\" | tr -d ' ')\"; " +
-        "rawptr_count=\"$(wc -l <\"$rawptr_file\" | tr -d ' ')\"; " +
-        "repo_c_file_count=\"$(wc -l <\"$c_files_file\" | tr -d ' ')\"; " +
-        "manifest_ref_count=\"$(wc -l <\"$manifest_refs_file\" | tr -d ' ')\"; " +
-        "if [ \"$legacy_new_count\" != \"0\" ] || [ \"$rawptr_count\" != \"0\" ] || [ \"$repo_c_file_count\" != \"0\" ] || [ \"$manifest_ref_count\" != \"0\" ]; then " +
-            "status=\"drift\"; " +
-        "fi; " +
-        "{ " +
-            "echo \"verify_backend_pure_cheng_surface report\"; " +
-            "echo \"manifest_scope=default_build_graph\"; " +
-            "echo \"status=$status\"; " +
-            "echo \"enforce=$enforce\"; " +
-            "echo \"legacy_new_count=$legacy_new_count\"; " +
-            "echo \"rawptr_count=$rawptr_count\"; " +
-            "echo \"repo_c_file_count=$repo_c_file_count\"; " +
-            "echo \"manifest_ref_count=$manifest_ref_count\"; " +
-            "echo \"legacy_new_file=$legacy_new_file\"; " +
-            "echo \"rawptr_file=$rawptr_file\"; " +
-            "echo \"repo_c_file=$c_files_file\"; " +
-            "echo \"manifest_refs_file=$manifest_refs_file\"; " +
-        "} >\"$report\"; " +
-        "{ " +
-            "echo \"backend_pure_cheng_surface_status=$status\"; " +
-            "echo \"backend_pure_cheng_surface_enforce=$enforce\"; " +
-            "echo \"backend_pure_cheng_surface_report=$report\"; " +
-            "echo \"backend_pure_cheng_surface_legacy_new_count=$legacy_new_count\"; " +
-            "echo \"backend_pure_cheng_surface_rawptr_count=$rawptr_count\"; " +
-            "echo \"backend_pure_cheng_surface_repo_c_file_count=$repo_c_file_count\"; " +
-            "echo \"backend_pure_cheng_surface_manifest_ref_count=$manifest_ref_count\"; " +
-        "} >\"$snapshot\"; " +
-        "if [ \"$status\" != \"ok\" ] && [ \"$enforce\" = \"1\" ]; then " +
-            "echo \"[verify_backend_pure_cheng_surface] pure-Cheng surface drift detected\" >&2; " +
-            "echo \"  report: $report\" >&2; " +
-            "sed -n '1,120p' \"$legacy_new_file\" >&2 || true; " +
-            "sed -n '1,120p' \"$rawptr_file\" >&2 || true; " +
-            "sed -n '1,120p' \"$c_files_file\" >&2 || true; " +
-            "sed -n '1,120p' \"$manifest_refs_file\" >&2 || true; " +
-            "exit 1; " +
-        "fi; " +
-        "echo \"verify_backend_pure_cheng_surface ok\"")
+        "exec sh " + tooling_shellQuote(
+            os.joinPath(root, "src/tooling/cheng_tooling_embedded_scripts/verify_backend_pure_cheng_surface.sh"))
+    )
 
 fn tooling_printVerifyBackendPureChengSurfaceUsage() =
     tooling_printOut("verify_backend_pure_cheng_surface options:")

@@ -1,140 +1,48 @@
-import std/system_c
+import std/system
+import std/parseutils
 import backend/uir/uir_codegen
+import backend/uir/uir_types
 import backend/uir/uir_internal/uir_core_builder
-import backend/uir/uir_internal/uir_core_types
 
-type
-    DriverUirByteBuf = uint8[]
-
-importc fn driver_c_write_exact_file(path: cstring, buffer: ptr, len: int32): int32
-@importc("driver_c_new_string_copy_n")
-fn driver_c_new_string_copy_n(raw: ptr, count: int32): cstring
+@importc("driver_c_write_exact_file")
+fn driver_c_write_exact_file(path: cstring, buffer: ptr, len: int32): int32
 @importc("getenv")
 fn driver_c_getenv(name: cstring): cstring
-@importc("memRetain")
-fn driver_memRetain(p: ptr)
-@importc("memRelease")
-fn driver_memRelease(p: ptr)
-
-fn driverUirStrViewUnsafe(data: ptr, len: int32): str =
-    var out: str
-    out.data = data
-    out.len = len
-    out.store_id = 0
-    out.flags = 0
-    return out
-
-fn driverUirBorrowCString(raw: cstring): str =
-    if raw == nil:
-        return ""
-    let n: int32 = c_strlen(raw)
-    if n <= 0:
-        return ""
-    return driverUirStrViewUnsafe(ptr(raw), n)
 
 fn driverUirEnv(name: str): str =
-    return driverUirBorrowCString(driver_c_getenv(strToCStringTemp(name)))
-
-fn driverUirParseNonNegativeInt(raw: str, defaultValue: int32): int32 =
-    let n: int32 = len(raw)
-    if n <= 0:
-        return defaultValue
-    var i: int32 = 0
-    var v: int64 = 0
-    for __for_guard_i in 0..<n:
-        if !(i < n):
-            break
-        let c: char = raw[i]
-        if c < '0' || c > '9':
-            return defaultValue
-        v = v * int64(10) + int64(int32(c) - int32('0'))
-        if v > int64(2147483647):
-            return int32(2147483647)
-        i = i + 1
-    return int32(v)
+    return strFromCStringBorrow(driver_c_getenv(strToCStringTemp(name)))
 
 fn driverUirOptLevel(): int32 =
-    return driverUirParseNonNegativeInt(driverUirEnv("BACKEND_OPT_LEVEL"), 0)
-
-fn driverUirOwnedCString(raw: cstring): str =
-    if raw == nil:
-        return ""
-    let n: int32 = c_strlen(raw)
-    if n <= 0:
-        return ""
-    let outRaw: cstring = driver_c_new_string_copy_n(ptr(raw), n)
-    if outRaw == nil:
-        return ""
-    return driverUirStrViewUnsafe(ptr(outRaw), n)
-
-fn driverUirBuildModuleStage1TargetRetained(path_raw: cstring, target_raw: cstring): ptr =
-    if path_raw == nil:
-        return nil
-    let path: str = driverUirOwnedCString(path_raw)
-    if len(path) == 0:
-        return nil
-    let target: str = driverUirOwnedCString(target_raw)
-    let module: UirCoreModule = uirCoreBuildModuleFromFileStage1OrPanic(path, target)
-    if module == nil:
-        return nil
-    let modulePtr: ptr = ptr(module)
-    if modulePtr == nil:
-        return nil
-    driver_memRetain(modulePtr)
-    return modulePtr
-
-fn driverUirBuildModuleStage1Retained(path_raw: cstring): ptr =
-    driverUirBuildModuleStage1TargetRetained(path_raw, nil)
-
-fn driverUirEmitObjFromRetainedModule(module_raw: ptr, target_raw: cstring, out_raw: cstring): int32 =
-    if module_raw == nil:
-        return -11
-    if out_raw == nil:
-        return -12
-    let outPath: str = driverUirOwnedCString(out_raw)
-    if len(outPath) == 0:
-        return -12
-    let target: str = driverUirOwnedCString(target_raw)
-    let module: UirCoreModule = UirCoreModule(module_raw)
-    var rc: int32 = 0
-    let objRes: Result[DriverUirByteBuf] =
-        uirEmitObjFromModule(module, driverUirOptLevel(), target, "", false, false, 0, "autovec")
-    if !IsOk[DriverUirByteBuf](objRes):
-        rc = -10
-    else:
-        let obj: uint8[] = objRes.value
-        if len(obj) <= 0:
-            rc = -13
-        elif obj.buffer == nil:
-            rc = -14
-        else:
-            rc = driver_c_write_exact_file(out_raw, obj.buffer, obj.len)
-    driver_memRelease(module_raw)
-    return rc
-
-fn driverUirEmitObjBytesFromRetainedModule(module_raw: ptr, optLevel: int32,
-                                           target_raw: cstring, objWriter_raw: cstring,
-                                           validateModule: int32,
-                                           uirSimdEnabled: int32, uirSimdMaxWidth: int32,
-                                           uirSimdPolicy_raw: cstring): uint8[] =
-    if module_raw == nil:
-        var zero: uint8[]
-        return zero
-    let module: UirCoreModule = UirCoreModule(module_raw)
-    let target: str = driverUirOwnedCString(target_raw)
-    let objWriter: str = driverUirOwnedCString(objWriter_raw)
-    let uirSimdPolicy: str = driverUirOwnedCString(uirSimdPolicy_raw)
-    return uirEmitObjFromModuleOrPanic(module, optLevel, target, objWriter,
-                                       validateModule != 0,
-                                       uirSimdEnabled != 0, uirSimdMaxWidth,
-                                       uirSimdPolicy)
+    let raw: str = driverUirEnv("BACKEND_OPT_LEVEL")
+    if len(raw) <= 0:
+        return 0
+    var out: int32 = 0
+    let parsed: int = parseInt32(raw, out)
+    if parsed <= 0:
+        return 0
+    if out < 0:
+        return 0
+    return out
 
 fn driverUirBuildEmitObjFromFileStage1Target(path_raw: cstring, target_raw: cstring, out_raw: cstring): int32 =
     if path_raw == nil:
         return -11
     if out_raw == nil:
         return -12
-    let moduleRaw: ptr = driverUirBuildModuleStage1TargetRetained(path_raw, target_raw)
-    if moduleRaw == nil:
+    let path: str = strFromCStringBorrow(path_raw)
+    let outPath: str = strFromCStringBorrow(out_raw)
+    if len(path) == 0:
         return -11
-    return driverUirEmitObjFromRetainedModule(moduleRaw, target_raw, out_raw)
+    if len(outPath) == 0:
+        return -12
+    let target: str = strFromCStringBorrow(target_raw)
+    let module: UirModule = uirCoreBuildModuleFromFileStage1OrPanic(path, target)
+    if module == nil:
+        return -11
+    let obj: uint8[] = uirEmitObjFromModuleOrPanic(module, driverUirOptLevel(), target, "",
+                                                   false, false, 0, "autovec")
+    if len(obj) <= 0:
+        return -13
+    if obj.buffer == nil:
+        return -14
+    return driver_c_write_exact_file(out_raw, obj.buffer, obj.len)

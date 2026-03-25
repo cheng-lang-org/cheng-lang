@@ -2144,11 +2144,6 @@ CHENG_SHIM_WEAK void *driver_c_build_module_stage1(const char *input_path, const
       }
     }
   }
-  if (prefer_sidecar == 0 && driver_buildActiveModulePtrs != NULL) {
-    void *module = driver_buildActiveModulePtrs((void *)input_path, (void *)target);
-    driver_c_diagf("[driver_c_build_module_stage1] weak_sidecar_module=%p\n", module);
-    if (module != NULL) return module;
-  }
   if (prefer_sidecar == 0 && uirCoreBuildModuleFromFileStage1OrPanic != NULL) {
     void *module = uirCoreBuildModuleFromFileStage1OrPanic(input_path, target);
     driver_c_diagf("[driver_c_build_module_stage1] weak_builder_module=%p\n", module);
@@ -2163,19 +2158,6 @@ CHENG_SHIM_WEAK void *driver_c_build_module_stage1(const char *input_path, const
         build_module_stage1 != (cheng_build_module_stage1_fn)uirCoreBuildModuleFromFileStage1OrPanic) {
       void *module = build_module_stage1(input_path, target);
       driver_c_diagf("[driver_c_build_module_stage1] dlsym_builder_module=%p\n", module);
-      if (module != NULL) return module;
-    }
-  }
-  {
-    cheng_build_active_module_ptrs_fn build_active_module_ptrs_fn =
-        (cheng_build_active_module_ptrs_fn)driver_c_lookup_runtime_symbol(
-            "driver_buildActiveModulePtrs",
-            "driver_c_build_module_stage1.sidecar");
-    if (prefer_sidecar == 0 &&
-        build_active_module_ptrs_fn != NULL &&
-        build_active_module_ptrs_fn != driver_buildActiveModulePtrs) {
-      void *module = build_active_module_ptrs_fn((void *)input_path, (void *)target);
-      driver_c_diagf("[driver_c_build_module_stage1] dlsym_sidecar_module=%p\n", module);
       if (module != NULL) return module;
     }
   }
@@ -2233,38 +2215,6 @@ CHENG_SHIM_WEAK void *driver_c_build_module_stage1_direct(const char *input_path
         build_module_stage1 != (cheng_build_module_stage1_fn)uirCoreBuildModuleFromFileStage1OrPanic) {
       void *module = build_module_stage1(input_path, target);
       driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_builder_module=%p\n", module);
-      if (module != NULL) return module;
-    }
-  }
-  if (allow_direct_exports != 0 && driver_buildActiveModulePtrs != NULL) {
-    void *module = driver_buildActiveModulePtrs((void *)input_path, (void *)target);
-    driver_c_diagf("[driver_c_build_module_stage1_direct] weak_sidecar_module=%p\n", module);
-    if (module != NULL) return module;
-  }
-  {
-    cheng_build_active_module_ptrs_fn build_active_module_ptrs_fn =
-        (cheng_build_active_module_ptrs_fn)driver_c_lookup_runtime_symbol(
-            "driver_buildActiveModulePtrs",
-            "driver_c_build_module_stage1_direct.sidecar");
-    if (allow_direct_exports != 0 &&
-        build_active_module_ptrs_fn != NULL &&
-        build_active_module_ptrs_fn != driver_buildActiveModulePtrs) {
-      void *module = build_active_module_ptrs_fn((void *)input_path, (void *)target);
-      driver_c_diagf("[driver_c_build_module_stage1_direct] dlsym_sidecar_module=%p\n", module);
-      if (module != NULL) return module;
-    }
-  }
-  if (sidecar_disabled != 0) {
-    driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_disabled skip_sidecar\n");
-    return NULL;
-  }
-  {
-    cheng_build_active_module_ptrs_fn sidecar_build_fn =
-        (cheng_build_active_module_ptrs_fn)cheng_sidecar_build_module_symbol(
-            &cheng_sidecar_cache, target, driver_c_diagf, driver_c_sidecar_after_open);
-    if (sidecar_build_fn != NULL) {
-      void *module = sidecar_build_fn((void *)input_path, (void *)target);
-      driver_c_diagf("[driver_c_build_module_stage1_direct] sidecar_module=%p\n", module);
       if (module != NULL) return module;
     }
   }

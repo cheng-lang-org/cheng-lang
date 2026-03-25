@@ -1434,8 +1434,8 @@ static void driver_sidecar_write_fallback_compile_stamp(const DriverUirSidecarHa
   fprintf(fp, "generic_spec_budget=0\n");
   fprintf(fp, "borrow_ir=%s\n", borrow_ir);
   fprintf(fp, "generic_lowering=%s\n", generic_lowering);
-  fprintf(fp, "stage1_skip_ownership_effective=0\n");
-  fprintf(fp, "stage1_skip_ownership_default=0\n");
+  fprintf(fp, "stage1_ownership_fixed_0_effective=0\n");
+  fprintf(fp, "stage1_ownership_fixed_0_default=0\n");
   fprintf(fp, "uir_phase_contract_version=p4_phase_v1\n");
   fclose(fp);
 }

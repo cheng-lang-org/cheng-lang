@@ -86,11 +86,17 @@ strict_stage0_lineage_dir() {
 }
 
 strict_published_stage2_driver_path() {
-  printf '%s\n' "$(strict_stage0_lineage_dir)/cheng.stage2"
-}
-
-canonical_dist_real_driver_path() {
-  printf '%s\n' "$root/dist/releases/current/cheng"
+  proof_driver="$(strict_stage0_lineage_dir)/cheng.stage2.proof"
+  if [ -x "$proof_driver" ] && [ -f "${proof_driver}.meta" ]; then
+    printf '%s\n' "$proof_driver"
+    return 0
+  fi
+  published_driver="$(strict_stage0_lineage_dir)/cheng.stage2"
+  if [ -x "$published_driver" ] && [ -f "${published_driver}.meta" ]; then
+    printf '%s\n' "$published_driver"
+    return 0
+  fi
+  printf '%s\n' "$published_driver"
 }
 
 strict_stage0_meta_field() {
@@ -159,10 +165,22 @@ strict_stage0_meta_ok() {
   [ -f "$meta_path" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "meta_contract_version")" = "2" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "label")" = "$expected_label" ] || return 1
-  [ "$(strict_stage0_meta_field "$meta_path" "outer_driver")" = "$driver_path" ] || return 1
+  meta_outer_driver="$(strict_stage0_meta_field "$meta_path" "outer_driver")"
+  case "$expected_label" in
+    stage2.proof)
+      [ "$meta_outer_driver" != "" ] || return 1
+      [ -x "$meta_outer_driver" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_mode")" = "cheng" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_bundle")" != "" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_compiler")" != "" ] || return 1
+      ;;
+    *)
+      [ "$meta_outer_driver" = "$driver_path" ] || return 1
+      ;;
+  esac
   [ "$(strict_stage0_meta_field "$meta_path" "driver_input")" = "src/backend/tooling/backend_driver_proof.cheng" ] || return 1
-  [ "$(strict_stage0_meta_field "$meta_path" "stage1_skip_ownership_effective")" = "0" ] || return 1
-  [ "$(strict_stage0_meta_field "$meta_path" "stage1_skip_ownership_default")" = "0" ] || return 1
+  [ "$(strict_stage0_meta_field "$meta_path" "stage1_ownership_fixed_0_effective")" = "0" ] || return 1
+  [ "$(strict_stage0_meta_field "$meta_path" "stage1_ownership_fixed_0_default")" = "0" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "generic_mode")" = "dict" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "generic_lowering")" = "mir_dict" ] || return 1
   return 0
@@ -217,15 +235,15 @@ assert_strict_fresh_bootstrap_driver() {
       exit 1
       ;;
   esac
-  if [ "$bootstrap_driver_path" = "$(canonical_dist_real_driver_path)" ]; then
-    echo "[verify_backend_sidecar_cheng_fresh] strict-fresh rejects dist current bootstrap driver: $bootstrap_driver_path" 1>&2
+  if ! strict_stage0_published_surface "$bootstrap_driver_path"; then
+    echo "[verify_backend_sidecar_cheng_fresh] strict bootstrap sidecar driver must be a published strict stage0 surface: $bootstrap_driver_path" 1>&2
     exit 1
   fi
   if ! strict_stage0_meta_ok "$bootstrap_driver_path"; then
     echo "[verify_backend_sidecar_cheng_fresh] strict bootstrap sidecar driver missing contract: $bootstrap_driver_path" 1>&2
     exit 1
   fi
-  if strict_stage0_published_surface "$bootstrap_driver_path" && ! strict_stage0_current_enough "$bootstrap_driver_path"; then
+  if ! strict_stage0_current_enough "$bootstrap_driver_path"; then
     echo "[verify_backend_sidecar_cheng_fresh] strict bootstrap sidecar driver is stale against current sources: $bootstrap_driver_path" 1>&2
     exit 1
   fi
@@ -242,7 +260,7 @@ strict_fresh_bootstrap_driver_ok() {
     "$root"/*) ;;
     *) return 1 ;;
   esac
-  [ "$bootstrap_driver_path" != "$(canonical_dist_real_driver_path)" ] || return 1
+  strict_stage0_published_surface "$bootstrap_driver_path" || return 1
   strict_stage0_meta_ok "$bootstrap_driver_path" || return 1
   strict_stage0_current_enough "$bootstrap_driver_path" || return 1
   return 0
@@ -270,15 +288,15 @@ assert_strict_fresh_real_driver() {
       exit 1
       ;;
   esac
-  if [ "$real_driver_path" = "$(canonical_dist_real_driver_path)" ]; then
-    echo "[verify_backend_sidecar_cheng_fresh] strict-fresh rejects dist current real driver: $real_driver_path" 1>&2
+  if ! strict_stage0_published_surface "$real_driver_path"; then
+    echo "[verify_backend_sidecar_cheng_fresh] strict real sidecar driver must be a published strict stage0 surface: $real_driver_path" 1>&2
     exit 1
   fi
   if ! strict_stage0_meta_ok "$real_driver_path"; then
     echo "[verify_backend_sidecar_cheng_fresh] strict real sidecar driver missing contract: $real_driver_path" 1>&2
     exit 1
   fi
-  if strict_stage0_published_surface "$real_driver_path" && ! strict_stage0_current_enough "$real_driver_path"; then
+  if ! strict_stage0_current_enough "$real_driver_path"; then
     echo "[verify_backend_sidecar_cheng_fresh] strict real sidecar driver is stale against current sources: $real_driver_path" 1>&2
     exit 1
   fi
@@ -369,7 +387,7 @@ strict_bootstrap_driver_path() {
     esac
     return 0
   fi
-  currentsrc_proof_real_driver_path
+  strict_published_stage2_driver_path
 }
 
 resolve_strict_bootstrap_driver() {
@@ -385,7 +403,7 @@ resolve_strict_bootstrap_driver() {
 
 bootstrap_driver="$(resolve_strict_bootstrap_driver)"
 
-real_driver="${BACKEND_UIR_SIDECAR_REAL_DRIVER:-$bootstrap_driver}"
+real_driver="${BACKEND_UIR_SIDECAR_REAL_DRIVER:-$(strict_published_stage2_driver_path)}"
 case "$real_driver" in
   /*)
     ;;
@@ -417,6 +435,12 @@ run_timeout "$compile_timeout_budget" cc \
 
 wrapper_compile_log="$out_dir/wrapper_source.compile.log"
 wrapper_sample_prefix="$out_dir/wrapper_source.timeout"
+bootstrap_driver_meta="${bootstrap_driver}.meta"
+bootstrap_driver_sidecar_mode="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_mode")"
+bootstrap_driver_sidecar_bundle="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_bundle")"
+bootstrap_driver_sidecar_compiler="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_compiler")"
+bootstrap_driver_sidecar_child_mode="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_child_mode")"
+bootstrap_driver_sidecar_outer_compiler="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_outer_compiler")"
 rm -f "$wrapper_compile_log"
 set +e
 run_timeout_capture_sample "$compile_timeout_budget" 1 "$wrapper_sample_prefix" "$wrapper_compile_log" env \
@@ -424,6 +448,12 @@ run_timeout_capture_sample "$compile_timeout_budget" 1 "$wrapper_sample_prefix" 
   MM=orc \
   CACHE=0 \
   BACKEND_BUILD_TRACK=dev \
+  BACKEND_CURRENTSRC_WRAPPER_PRESERVE_SIDECAR=1 \
+  BACKEND_UIR_SIDECAR_MODE="${bootstrap_driver_sidecar_mode:-}" \
+  BACKEND_UIR_SIDECAR_BUNDLE="${bootstrap_driver_sidecar_bundle:-}" \
+  BACKEND_UIR_SIDECAR_COMPILER="${bootstrap_driver_sidecar_compiler:-}" \
+  BACKEND_UIR_SIDECAR_CHILD_MODE="${bootstrap_driver_sidecar_child_mode:-}" \
+  BACKEND_UIR_SIDECAR_OUTER_COMPILER="${bootstrap_driver_sidecar_outer_compiler:-}" \
   "$compiler_path" "$wrapper_source" \
   --frontend:stage1 \
   --emit:obj \

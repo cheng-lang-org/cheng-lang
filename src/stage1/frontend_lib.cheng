@@ -49,11 +49,6 @@ fn stage1EnsureChengExt(path: str): str =
         return path
     return stage1AppendChengExt(path)
 
-fn stage1JoinImportBase(base: str, path: str): str =
-    if len(base) > 0:
-        return stage1JoinWithSlash(base, path)
-    return path
-
 fn stage1ImportReadableText(path: str): str =
     if stage1PathReadable(path):
         return "1"
@@ -210,6 +205,11 @@ fn stage1CanonicalizedChengCandidate(resolved: str, rootDir: str): str =
 fn stage1ResolveImportNormalized(rawPath: str, baseDir: str, rootDir: str): str =
     return stage1NormalizeVisitedPath(canonicalizeResolvedPath(resolveImportPath(rawPath, baseDir, rootDir), rootDir))
 
+fn stage1ResolveImportNormalizedTextId(rawPathId: int32, baseDir: str, rootDir: str): str =
+    if rawPathId <= 0:
+        return ""
+    return stage1ResolveImportNormalized(tokenTextById(rawPathId), baseDir, rootDir)
+
 fn stage1ResolveImportOrRaw(rawPath: str, baseDir: str, rootDir: str): str =
     if len(resolveImportPath(rawPath, baseDir, rootDir)) == 0:
         return rawPath
@@ -219,6 +219,23 @@ fn stage1ResolveImportCanonicalOrRaw(rawPath: str, baseDir: str, rootDir: str): 
     if len(stage1ResolveImportOrRaw(rawPath, baseDir, rootDir)) > 0:
         return canonicalizeResolvedPath(stage1ResolveImportOrRaw(rawPath, baseDir, rootDir), rootDir)
     return ""
+
+fn stage1ResolveImportCanonicalOrRawTextId(rawPathId: int32, baseDir: str, rootDir: str): str =
+    if rawPathId <= 0:
+        return ""
+    return stage1ResolveImportCanonicalOrRaw(tokenTextById(rawPathId), baseDir, rootDir)
+
+fn stage1ImportPathIsSystemTextId(rawPathId: int32): bool =
+    return tokenTextEqLitId(rawPathId, "system")
+
+fn stage1ResolvedImportQueueAdd(resolvedSet: var StrSetList, visitedModules: var StrSetList,
+                                pending: var str[], resolvedPath: str) =
+    if len(resolvedPath) <= 0:
+        return
+    setAddStr(resolvedSet, resolvedPath)
+    if stage1_fileExists(resolvedPath) && !setHasStr(visitedModules, resolvedPath):
+        setAddStr(visitedModules, resolvedPath)
+        add(pending, resolvedPath)
 
 fn stage1ImportTraceOwner(rootPath: str, baseDir: str): str =
     if len(rootPath) > 0:
@@ -1685,12 +1702,6 @@ fn importNodePathTextId(nId: AstNodeId): int32 =
     else:
         return 0
 
-fn importNodePathId(nId: AstNodeId): str =
-    let pathId: int32 = importNodePathTextId(nId)
-    if pathId <= 0:
-        return ""
-    return tokenTextById(pathId)
-
 fn collectImportNodesId(rootId: AstNodeId, acc: AstNodeId[]*) =
     if !astNodeIdValid(rootId) || acc == nil:
         return
@@ -1703,144 +1714,86 @@ fn collectImportNodesId(rootId: AstNodeId, acc: AstNodeId[]*) =
         if nKind == nkImportStmt || nKind == nkImportGroup:
             add(acc, nId)
 
-fn collectImportPathsId(nId: AstNodeId, out: str[]*) =
+fn collectImportPathTextIdsId(nId: AstNodeId, out: int32[]*) =
     if !astNodeIdValid(nId) || out == nil:
         return
-    let dbgImports: bool = os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1"
     let kind: NodeKind = astNodeKind(nId)
     if kind == nkImportGroup:
         if astKidCount(nId) <= 0:
             return
         let baseTextId: int32 = importNodePathTextId(astKidAt(nId, 0))
-        let base: str = tokenTextById(baseTextId)
-        if dbgImports:
-            let baseId: AstNodeId = astKidAt(nId, 0)
-            echo("[importdbg] group.base kind=" + intToStr(int32(astNodeKind(baseId))) + " ident='" + astNodeIdent(baseId) + "' str='" + astNodeStrVal(baseId) + "' path='" + base + "'")
         for i in 1..<astKidCount(nId):
             let entryTextId: int32 = importNodePathTextId(astKidAt(nId, i))
-            let entry: str = tokenTextById(entryTextId)
-            if dbgImports:
-                let entryId: AstNodeId = astKidAt(nId, i)
-                echo("[importdbg] group.entry[" + intToStr(i) + "] kind=" + intToStr(int32(astNodeKind(entryId))) + " ident='" + astNodeIdent(entryId) + "' str='" + astNodeStrVal(entryId) + "' path='" + entry + "'")
-            if entryTextId > 0:
-                if baseTextId > 0:
-                    var parts: int32[]
-                    add(parts, baseTextId)
-                    add(parts, entryTextId)
-                    let combinedId: int32 = tokenInternTextIdsJoinedByByte(parts, '/')
-                    let combined: str = tokenTextById(combinedId)
-                    if dbgImports:
-                        echo("[importdbg] group.combined='" + combined + "'")
-                    trackLexStringStr(combined)
-                    add(out, combined)
-                else:
-                    trackLexStringStr(entry)
-                    add(out, entry)
+            if entryTextId <= 0:
+                continue
+            if baseTextId > 0:
+                var parts: int32[]
+                add(parts, baseTextId)
+                add(parts, entryTextId)
+                let combinedId: int32 = tokenInternTextIdsJoinedByByte(parts, '/')
+                if combinedId > 0:
+                    add(out, combinedId)
+            else:
+                add(out, entryTextId)
         return
     if kind == nkImportStmt:
         for j in 0..<astKidCount(nId):
             let itemId: AstNodeId = astKidAt(nId, j)
             if astNodeKind(itemId) == nkImportGroup:
-                collectImportPathsId(itemId, out)
+                collectImportPathTextIdsId(itemId, out)
             else:
                 let pathId: int32 = importNodePathTextId(itemId)
-                let path: str = tokenTextById(pathId)
-                if dbgImports:
-                    echo("[importdbg] stmt.item[" + intToStr(j) + "] kind=" + intToStr(int32(astNodeKind(itemId))) + " ident='" + astNodeIdent(itemId) + "' str='" + astNodeStrVal(itemId) + "' path='" + path + "'")
                 if pathId > 0:
-                    trackLexStringStr(path)
-                    add(out, path)
+                    add(out, pathId)
         return
     if kind == nkImportAs:
         if astKidCount(nId) > 0:
             let pathId: int32 = importNodePathTextId(astKidAt(nId, 0))
-            let path: str = tokenTextById(pathId)
-            if dbgImports:
-                echo("[importdbg] as.path='" + path + "'")
             if pathId > 0:
-                trackLexStringStr(path)
-                add(out, path)
+                add(out, pathId)
         return
     let pathId2: int32 = importNodePathTextId(nId)
-    let path2: str = tokenTextById(pathId2)
-    if dbgImports:
-        echo("[importdbg] single kind=" + intToStr(int32(kind)) + " path='" + path2 + "'")
     if pathId2 > 0:
-        trackLexStringStr(path2)
-        add(out, path2)
+        add(out, pathId2)
 
-fn stage1DebugImportNodeState(rootId: AstNodeId, tag: str) =
-    if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") != "1":
+fn appendImportDepPathTextId(baseTextId: int32, itemId: AstNodeId, out: int32[]*) =
+    if !astNodeIdValid(itemId) || out == nil:
         return
-    var importNodes: AstNodeId[]
-    reserve(importNodes, 32)
-    collectImportNodesId(rootId, &importNodes)
-    echo("[importdbg] " + tag + ".count=" + intToStr(importNodes.len))
-    for ii in 0..<importNodes.len:
-        let impId: AstNodeId = importNodes[ii]
-        echo("[importdbg] " + tag + ".node[" + intToStr(ii) + "] kind=" + intToStr(int32(astNodeKind(impId))) + " kids=" + intToStr(astKidCount(impId)))
-        for jj in 0..<astKidCount(impId):
-            let kidId: AstNodeId = astKidAt(impId, jj)
-            echo("[importdbg] " + tag + ".kid[" + intToStr(ii) + "," + intToStr(jj) + "] kind=" + intToStr(int32(astNodeKind(kidId))) + " ident='" + astNodeIdent(kidId) + "' str='" + astNodeStrVal(kidId) + "'")
+    let pathTextId: int32 = importNodePathTextId(itemId)
+    if pathTextId <= 0:
+        return
+    if baseTextId > 0:
+        var parts: int32[]
+        add(parts, baseTextId)
+        add(parts, pathTextId)
+        let combinedId: int32 = tokenInternTextIdsJoinedByByte(parts, '/')
+        if combinedId > 0:
+            add(out, combinedId)
+        return
+    add(out, pathTextId)
 
-fn importAliasNameId(nId: AstNodeId): str =
+fn importAliasNameTextId(nId: AstNodeId): int32 =
     if !astNodeIdValid(nId):
-        return ""
+        return 0
     let kind: NodeKind = astNodeKind(nId)
     case kind
     of nkImportAs:
         if astKidCount(nId) > 1:
-            return astPlainName(astKidAt(nId, 1))
+            return astPlainNameId(astKidAt(nId, 1))
         if astKidCount(nId) > 0:
-            let textId: int32 = semImportModuleNameTextId(astPlainNameId(astKidAt(nId, 0)))
-            return tokenTextById(textId)
-        return ""
+            return semImportModuleNameTextId(importNodePathTextId(astKidAt(nId, 0)))
+        return 0
     of nkIdent, nkSymbol:
         let rawIdentId: int32 = astNodeIdentId(nId)
         if rawIdentId > 0:
-            return tokenTextById(semImportModuleNameTextId(rawIdentId))
-        return tokenTextById(semImportModuleNameTextId(astNodeStrValId(nId)))
+            return semImportModuleNameTextId(rawIdentId)
+        return semImportModuleNameTextId(astNodeStrValId(nId))
     of nkStrLit:
-        return tokenTextById(semImportModuleNameTextId(astNodeStrValId(nId)))
+        return semImportModuleNameTextId(astNodeStrValId(nId))
     else:
-        return ""
+        return 0
 
-fn importAliasValueId(nId: AstNodeId): str =
-    if !astNodeIdValid(nId):
-        return ""
-    if astNodeKind(nId) == nkImportAs:
-        return importAliasNameId(nId)
-    return ""
-
-fn appendImportDepId(base: str, itemId: AstNodeId, out: str[]*) =
-    if !astNodeIdValid(itemId) || out == nil:
-        return
-    let path: str = importNodePathId(itemId)
-    if len path == 0:
-        return
-    var parts: str[] = []
-    add(parts, stage1JoinImportBase(base, path))
-    let alias: str = importAliasValueId(itemId)
-    if len alias > 0:
-        add(parts, " as ")
-        add(parts, alias)
-    add(out, stage1JoinParts(parts))
-
-fn stripImportAlias(item: str): str =
-    if len(item) == 0:
-        return ""
-    let n: int32 = len item
-    if n < 4:
-        return item
-    for i in 0..n - 4:
-        if item[i] ==  ' ' && item[i + 1] ==  'a' && item[i + 2] ==  's' &&
-            item[i + 3] ==  ' ':
-            if i == 0:
-                return ""
-            return sliceRange(item, 0, i - 1)
-    return item
-
-fn collectImportAliasesId(rootId: AstNodeId, out: str[]*) =
+fn collectImportAliasTextIdsId(rootId: AstNodeId, out: int32[]*) =
     if !astNodeIdValid(rootId) || out == nil:
         return
     let rootKind: NodeKind = astNodeKind(rootId)
@@ -1856,44 +1809,44 @@ fn collectImportAliasesId(rootId: AstNodeId, out: str[]*) =
                 let itemId: AstNodeId = astKidAt(nId, j)
                 if astNodeKind(itemId) == nkImportGroup:
                     if astKidCount(itemId) <= 1:
-                        let baseName: str = importAliasNameId(astKidAt(itemId, 0))
-                        if len baseName > 0:
-                            add(out, baseName)
+                        let baseNameId: int32 = importAliasNameTextId(astKidAt(itemId, 0))
+                        if baseNameId > 0:
+                            add(out, baseNameId)
                     else:
                         for k in 1..<astKidCount(itemId):
-                            let entryName: str = importAliasNameId(astKidAt(itemId, k))
-                            if len entryName > 0:
-                                add(out, entryName)
+                            let entryNameId: int32 = importAliasNameTextId(astKidAt(itemId, k))
+                            if entryNameId > 0:
+                                add(out, entryNameId)
                 else:
-                    let aliasName: str = importAliasNameId(itemId)
-                    if len aliasName > 0:
-                        add(out, aliasName)
+                    let aliasNameId: int32 = importAliasNameTextId(itemId)
+                    if aliasNameId > 0:
+                        add(out, aliasNameId)
         elif nKind == nkImportGroup:
             if astKidCount(nId) <= 1:
-                let baseName2: str = importAliasNameId(astKidAt(nId, 0))
-                if len baseName2 > 0:
-                    add(out, baseName2)
+                let baseNameId2: int32 = importAliasNameTextId(astKidAt(nId, 0))
+                if baseNameId2 > 0:
+                    add(out, baseNameId2)
             else:
                 for k2 in 1..<astKidCount(nId):
-                    let entryName2: str = importAliasNameId(astKidAt(nId, k2))
-                    if len entryName2 > 0:
-                        add(out, entryName2)
+                    let entryNameId2: int32 = importAliasNameTextId(astKidAt(nId, k2))
+                    if entryNameId2 > 0:
+                        add(out, entryNameId2)
 
-fn isModuleAlias(name: str, aliases: str[]): bool =
-    if len name == 0:
+fn textIdListHas(values: int32[], textId: int32): bool =
+    if textId <= 0:
         return false
-    for i in 0..<aliases.len:
-        if (aliases[i] ==  name):
+    for i in 0..<values.len:
+        if values[i] == textId:
             return true
     return false
 
-fn lowerModuleQualifiersCtxShadowId(nId: AstNodeId, aliases: str[], shadowed: str[], keepDot: bool): AstNodeId =
+fn lowerModuleQualifiersCtxShadowId(nId: AstNodeId, aliases: int32[], shadowed: int32[], keepDot: bool): AstNodeId =
     if !astNodeIdValid(nId):
         return astInvalidNodeId()
-    var localShadowed: str[] = shadowed
+    var localShadowed: int32[] = shadowed
     let nKind: NodeKind = astNodeKind(nId)
     if (nKind == nkFnDecl || nKind == nkIteratorDecl) && astKidCount(nId) > 1:
-        var fnShadowed: str[4]
+        var fnShadowed: int32[4]
         let paramsId: AstNodeId = astKidAt(nId, 1)
         if astNodeKind(paramsId) == nkFormalParams:
             for pi in 0..<astKidCount(paramsId):
@@ -1902,17 +1855,17 @@ fn lowerModuleQualifiersCtxShadowId(nId: AstNodeId, aliases: str[], shadowed: st
                     let nameId: AstNodeId = astKidAt(defsId, 0)
                     let nameKind: NodeKind = astNodeKind(nameId)
                     if nameKind == nkIdent || nameKind == nkSymbol:
-                        let nm: str = stripSpaces(astNodeIdent(nameId))
-                        if isModuleAlias(nm, aliases) && !isModuleAlias(nm, fnShadowed):
-                            add(fnShadowed, nm)
+                        let nameTextId: int32 = astNodeIdentId(nameId)
+                        if textIdListHas(aliases, nameTextId) && !textIdListHas(fnShadowed, nameTextId):
+                            add(fnShadowed, nameTextId)
         localShadowed = fnShadowed
     if nKind == nkDotExpr && astKidCount(nId) > 1:
         let baseId: AstNodeId = astKidAt(nId, 0)
         let memberId: AstNodeId = astKidAt(nId, 1)
         let baseKind: NodeKind = astNodeKind(baseId)
         if !keepDot && (baseKind == nkIdent || baseKind == nkSymbol):
-            let bname: str = stripSpaces(astNodeIdent(baseId))
-            if isModuleAlias(bname, aliases) && !isModuleAlias(bname, localShadowed):
+            let baseTextId: int32 = astNodeIdentId(baseId)
+            if textIdListHas(aliases, baseTextId) && !textIdListHas(localShadowed, baseTextId):
                 return lowerModuleQualifiersCtxShadowId(memberId, aliases, localShadowed, keepDot)
     for i in 0..<astKidCount(nId):
         let childId: AstNodeId = astKidAt(nId, i)
@@ -1929,12 +1882,12 @@ fn lowerModuleQualifiersCtxShadowId(nId: AstNodeId, aliases: str[], shadowed: st
             astSetKid(nId, i, loweredId)
     return nId
 
-fn lowerModuleQualifiersCtxId(nId: AstNodeId, aliases: str[], keepDot: bool): AstNodeId =
-    var empty: str[1]
+fn lowerModuleQualifiersCtxId(nId: AstNodeId, aliases: int32[], keepDot: bool): AstNodeId =
+    var empty: int32[1]
     return lowerModuleQualifiersCtxShadowId(nId, aliases, empty, keepDot)
 
-fn lowerModuleQualifiersId(nId: AstNodeId, aliases: str[]): AstNodeId =
-    var empty: str[1]
+fn lowerModuleQualifiersId(nId: AstNodeId, aliases: int32[]): AstNodeId =
+    var empty: int32[1]
     return lowerModuleQualifiersCtxShadowId(nId, aliases, empty, false)
 
 fn normalizeImportPath(path: str): str =
@@ -2471,9 +2424,9 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
                 let kidDbgId: AstNodeId = astKidAt(impDbgId, dj)
                 echo("[importdbg] post_parse.kid[" + intToStr(di) + "," + intToStr(dj) + "] kind=" + intToStr(int32(astNodeKind(kidDbgId))) + " ident='" + astNodeIdent(kidDbgId) + "' str='" + astNodeStrVal(kidDbgId) + "'")
     tagModuleChildrenId(mrootId, pathNorm)
-    var aliases: str[]
+    var aliases: int32[]
     reserve(aliases, 32)
-    collectImportAliasesId(mrootId, &aliases)
+    collectImportAliasTextIdsId(mrootId, &aliases)
     if os.getEnvDefault("BACKEND_DEBUG_IMPORT_PATHS", "") == "1":
         var dbgImportNodes1: AstNodeId[]
         reserve(dbgImportNodes1, 32)
@@ -2504,13 +2457,16 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
     collectImportNodesId(mrootId, &importNodes)
     for ii in 0..<importNodes.len:
         let impId: AstNodeId = importNodes[ii]
-        var paths: str[]
-        reserve(paths, 16)
-        collectImportPathsId(impId, &paths)
-        for pi in 0..<paths.len:
-            let rawPath: str = paths[pi]
-            if len rawPath > 0 && !(rawPath == "system"):
-                let resolvedPathNorm: str = stage1ResolveImportNormalized(rawPath, moduleDir, rootDir)
+        var pathIds: int32[]
+        reserve(pathIds, 16)
+        collectImportPathTextIdsId(impId, &pathIds)
+        for pi in 0..<pathIds.len:
+            let rawPathId: int32 = pathIds[pi]
+            if rawPathId > 0 && !stage1ImportPathIsSystemTextId(rawPathId):
+                let resolvedPathNorm: str = stage1ResolveImportNormalizedTextId(rawPathId, moduleDir, rootDir)
+                var rawPath: str = ""
+                if len(resolvedPathNorm) == 0 || dbgImportPaths || traceImports:
+                    rawPath = tokenTextById(rawPathId)
                 if dbgImportPaths:
                     echo("[importdbg] load.resolve owner='" + pathNorm + "' raw='" + rawPath + "' moduleDir='" + moduleDir + "' rootDir='" + rootDir + "' resolved='" + resolveImportPath(rawPath, moduleDir, rootDir) + "'")
                 if len(resolvedPathNorm) == 0:
@@ -2581,13 +2537,16 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
     collectImportNodesId(rootId, &importNodes)
     for i in 0..<importNodes.len:
         let impId: AstNodeId = importNodes[i]
-        var paths: str[]
-        reserve(paths, 16)
-        collectImportPathsId(impId, &paths)
-        for pi in 0..<paths.len:
-            let rawPath: str = paths[pi]
-            if len rawPath > 0 && !(rawPath == "system"):
-                let resolvedPathNorm: str = stage1ResolveImportNormalized(rawPath, baseDir, rootDir)
+        var pathIds: int32[]
+        reserve(pathIds, 16)
+        collectImportPathTextIdsId(impId, &pathIds)
+        for pi in 0..<pathIds.len:
+            let rawPathId: int32 = pathIds[pi]
+            if rawPathId > 0 && !stage1ImportPathIsSystemTextId(rawPathId):
+                let resolvedPathNorm: str = stage1ResolveImportNormalizedTextId(rawPathId, baseDir, rootDir)
+                var rawPath: str = ""
+                if len(resolvedPathNorm) == 0 || dbgImportPaths || traceImports:
+                    rawPath = tokenTextById(rawPathId)
                 if dbgImportPaths:
                     echo("[importdbg] root.load.resolve raw='" + rawPath + "' baseDir='" + baseDir + "' rootDir='" + rootDir + "' resolved='" + resolveImportPath(rawPath, baseDir, rootDir) + "'")
                 if len(resolvedPathNorm) == 0:
@@ -2779,7 +2738,7 @@ fn tagModuleChildrenId(rootId: AstNodeId, path: str) =
             elif len(astNodeStrVal(childId)) == 0:
                 astSetNodeStrVal(childId, path)
 
-fn collectImportDepsId(rootId: AstNodeId, out: str[]*) =
+fn collectImportDepPathTextIdsId(rootId: AstNodeId, out: int32[]*) =
     if !astNodeIdValid(rootId) || out == nil:
         return
     let kind: NodeKind = astNodeKind(rootId)
@@ -2788,20 +2747,20 @@ fn collectImportDepsId(rootId: AstNodeId, out: str[]*) =
             let itemId: AstNodeId = astKidAt(rootId, j)
             if astNodeKind(itemId) == nkImportGroup:
                 if astKidCount(itemId) > 0:
-                    let base: str = importNodePathId(astKidAt(itemId, 0))
+                    let baseTextId: int32 = importNodePathTextId(astKidAt(itemId, 0))
                     for k in 1..<astKidCount(itemId):
-                        appendImportDepId(base, astKidAt(itemId, k), out)
+                        appendImportDepPathTextId(baseTextId, astKidAt(itemId, k), out)
             else:
-                appendImportDepId("", itemId, out)
+                appendImportDepPathTextId(0, itemId, out)
         return
     if kind == nkImportGroup:
         if astKidCount(rootId) > 0:
-            let base2: str = importNodePathId(astKidAt(rootId, 0))
+            let baseTextId2: int32 = importNodePathTextId(astKidAt(rootId, 0))
             for m in 1..<astKidCount(rootId):
-                appendImportDepId(base2, astKidAt(rootId, m), out)
+                appendImportDepPathTextId(baseTextId2, astKidAt(rootId, m), out)
         return
     for i in 0..<astKidCount(rootId):
-        collectImportDepsId(astKidAt(rootId, i), out)
+        collectImportDepPathTextIdsId(astKidAt(rootId, i), out)
 
 fn collectResolvedDeps(inPath: str, diags: ptr): str[] =
     releaseNodeArena()
@@ -2816,11 +2775,11 @@ fn collectResolvedDeps(inPath: str, diags: ptr): str[] =
     if stage1DiagsHasError(diags):
         return []
     let combinedId: AstNodeId = mergeModulesId(sysRootId, userRootId)
-    var imports: str[16]
-    collectImportDepsId(combinedId, &imports)
-    var uniqSet: StrSetList = strSetListInit(imports.len)
-    for importIndex in 0..<imports.len:
-        let imp: str = imports[importIndex]
+    var importIds: int32[16]
+    collectImportDepPathTextIdsId(combinedId, &importIds)
+    var uniqSet: StrSetList = strSetListInit(importIds.len)
+    for importIndex in 0..<importIds.len:
+        let imp: str = tokenTextById(importIds[importIndex])
         if len imp > 0:
             setAddStr(uniqSet, imp)
     let inName: str = stage1SplitName inPath
@@ -2835,14 +2794,12 @@ fn collectResolvedDeps(inPath: str, diags: ptr): str[] =
         var resolvedSet: StrSetList = strSetListInit(uniqSet.items.len + 4)
         var visitedModules: StrSetList = strSetListInit(uniqSet.items.len + 4)
         var pending: str[]
-        for resolvedIndex in 0..<uniqSet.items.len:
-            let raw: str = stripImportAlias uniqSet.items[resolvedIndex]
-            if len(stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot)) > 0:
-                setAddStr(resolvedSet, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot))
-                if stage1_fileExists(stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot)) &&
-                   ! setHasStr(visitedModules, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot)):
-                    setAddStr(visitedModules, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot))
-                    add(pending, stage1ResolveImportCanonicalOrRaw(raw, baseDir, repoRoot))
+        for resolvedIndex in 0..<importIds.len:
+            let resolvedPath: str = stage1ResolveImportCanonicalOrRawTextId(importIds[resolvedIndex], baseDir, repoRoot)
+            stage1ResolvedImportQueueAdd(resolvedSet, visitedModules, pending, resolvedPath)
+        if stage1_autoSystemEnabled() && !(inName == "system" && inExt == ".cheng"):
+            let systemResolvedPath: str = stage1ResolveImportCanonicalOrRaw("system", baseDir, repoRoot)
+            stage1ResolvedImportQueueAdd(resolvedSet, visitedModules, pending, systemResolvedPath)
         while true:
             let pendingLen: int32 = pending.len
             if pendingLen == 0:
@@ -2853,17 +2810,11 @@ fn collectResolvedDeps(inPath: str, diags: ptr): str[] =
                 if !astNodeIdValid(modRootId):
                     continue
                 let modDir: str = stage1SplitDir pending[pi]
-                var modImports: str[8]
-                collectImportDepsId(modRootId, &modImports)
-                for mi in 0..<modImports.len:
-                    let rawNext: str = stripImportAlias modImports[mi]
-                    if len rawNext > 0:
-                        if len(stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot)) > 0:
-                            setAddStr(resolvedSet, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot))
-                            if stage1_fileExists(stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot)) &&
-                               ! setHasStr(visitedModules, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot)):
-                                setAddStr(visitedModules, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot))
-                                add(nextPending, stage1ResolveImportCanonicalOrRaw(rawNext, modDir, repoRoot))
+                var modImportIds: int32[8]
+                collectImportDepPathTextIdsId(modRootId, &modImportIds)
+                for mi in 0..<modImportIds.len:
+                    let resolvedNext: str = stage1ResolveImportCanonicalOrRawTextId(modImportIds[mi], modDir, repoRoot)
+                    stage1ResolvedImportQueueAdd(resolvedSet, visitedModules, nextPending, resolvedNext)
             pending = nextPending
         resolvedDeps = resolvedSet.items
     return resolvedDeps

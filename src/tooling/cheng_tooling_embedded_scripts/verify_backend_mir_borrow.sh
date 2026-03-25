@@ -54,6 +54,19 @@ extract_stamp_field() {
   awk -F= -v key="$field_key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$stamp_file"
 }
 
+require_ownership_fixed_0_field_exact() {
+  stamp_file="$1"
+  suffix="$2"
+  expected_value="$3"
+  new_key="stage1_ownership_fixed_0_${suffix}"
+  old_key="stage1_skip_ownership_${suffix}"
+  if grep -Fq "${new_key}=" "$stamp_file"; then
+    require_stamp_field_exact "$stamp_file" "$new_key" "$expected_value"
+    return
+  fi
+  require_stamp_field_exact "$stamp_file" "$old_key" "$expected_value"
+}
+
 is_uint() {
   case "$1" in
     ''|*[!0-9]*)
@@ -452,26 +465,27 @@ if grep -Fq "stage1_skip_sem_raw=" "$generic_stamp"; then
   require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_sem_effective" "$skip_sem_norm"
   require_stamp_field_falsey "$default_policy_stamp" "stage1_skip_sem_raw"
   require_stamp_field_exact "$default_policy_stamp" "stage1_skip_sem_effective" "$skip_sem_norm"
-elif grep -Fq "stage1_skip_ownership_effective=" "$generic_stamp"; then
+elif grep -Fq "stage1_ownership_fixed_0_effective=" "$generic_stamp" || \
+     grep -Fq "stage1_skip_ownership_effective=" "$generic_stamp"; then
   compile_stamp_policy_mode="runtime_v1_ownership_only"
 else
   compile_stamp_policy_mode="source_contract_fallback"
-  if ! grep -Fq 'stage1_skip_ownership_effective=0' src/backend/tooling/backend_driver_uir_sidecar_bundle.c; then
-    echo "[verify_backend_mir_borrow] sidecar bundle source missing stage1_skip_ownership_effective marker" 1>&2
+  if ! grep -Fq 'stage1_ownership_fixed_0_effective=0' src/backend/tooling/backend_driver_uir_sidecar_bundle.c; then
+    echo "[verify_backend_mir_borrow] sidecar bundle source missing stage1_ownership_fixed_0_effective marker" 1>&2
     exit 1
   fi
-  if ! grep -Fq 'stage1_skip_ownership_default=0' src/backend/tooling/backend_driver_uir_sidecar_bundle.c; then
-    echo "[verify_backend_mir_borrow] sidecar bundle source missing stage1_skip_ownership_default marker" 1>&2
+  if ! grep -Fq 'stage1_ownership_fixed_0_default=0' src/backend/tooling/backend_driver_uir_sidecar_bundle.c; then
+    echo "[verify_backend_mir_borrow] sidecar bundle source missing stage1_ownership_fixed_0_default marker" 1>&2
     exit 1
   fi
 fi
 
-require_stamp_field_exact "$generic_stamp" "stage1_skip_ownership_effective" "$skip_ownership_norm"
-require_stamp_field_exact "$generic_stamp" "stage1_skip_ownership_default" "0"
-require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_ownership_effective" "0"
-require_stamp_field_exact "$ownership_on_stamp" "stage1_skip_ownership_default" "0"
-require_stamp_field_exact "$default_policy_stamp" "stage1_skip_ownership_effective" "0"
-require_stamp_field_exact "$default_policy_stamp" "stage1_skip_ownership_default" "0"
+require_ownership_fixed_0_field_exact "$generic_stamp" "effective" "$skip_ownership_norm"
+require_ownership_fixed_0_field_exact "$generic_stamp" "default" "0"
+require_ownership_fixed_0_field_exact "$ownership_on_stamp" "effective" "0"
+require_ownership_fixed_0_field_exact "$ownership_on_stamp" "default" "0"
+require_ownership_fixed_0_field_exact "$default_policy_stamp" "effective" "0"
+require_ownership_fixed_0_field_exact "$default_policy_stamp" "default" "0"
 
 phase_surface_mode="noalias_ssu_runtime"
 report_phase_contract_version="p4_phase_v1"

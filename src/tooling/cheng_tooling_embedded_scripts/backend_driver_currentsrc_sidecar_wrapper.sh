@@ -46,6 +46,22 @@ read_meta_field() {
   sed -n "s/^${key}=//p" "$meta_path" | head -n 1
 }
 
+strict_stage0_lineage_dir() {
+  printf '%s\n' "${TOOLING_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)}/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof"
+}
+
+strict_published_stage0_surface() {
+  driver_path="$(canonical_path "$1")"
+  case "$driver_path" in
+    "$(strict_stage0_lineage_dir)"/cheng.stage1|\
+    "$(strict_stage0_lineage_dir)"/cheng.stage2|\
+    "$(strict_stage0_lineage_dir)"/cheng.stage2.proof)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 real_driver="${TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER:-}"
 if [ "$real_driver" = "" ]; then
   real_driver="$(read_meta_field sidecar_real_driver)"
@@ -58,6 +74,10 @@ if [ "$real_driver_path" != "" ] && [ "$wrapper_self_path" != "" ] && [ "$real_d
 fi
 if [ "$real_driver" = "" ] || [ ! -x "$real_driver" ]; then
   echo "[backend_driver_currentsrc_sidecar_wrapper] missing real sidecar driver contract: ${real_driver:-<unset>}" 1>&2
+  exit 1
+fi
+if ! strict_published_stage0_surface "$real_driver"; then
+  echo "[backend_driver_currentsrc_sidecar_wrapper] real sidecar driver must be a published strict stage0 surface: ${real_driver:-<unset>}" 1>&2
   exit 1
 fi
 
@@ -392,88 +412,7 @@ fi
 
 wrapper_preserve_sidecar="${BACKEND_CURRENTSRC_WRAPPER_PRESERVE_SIDECAR:-0}"
 
-set -- "$real_driver" "$input_path" \
-  --frontend:"$frontend" \
-  --emit:"$emit_mode" \
-  --target:"$target" \
-  --linker:"$linker_mode" \
-  --build-track:"$build_track" \
-  --mm:"$mm" \
-  --fn-sched:"$fn_sched" \
-  --jobs:"$jobs" \
-  --fn-jobs:"$fn_jobs" \
-  --opt-level:"$opt_level" \
-  --generic-mode:"$generic_mode" \
-  --generic-spec-budget:"$generic_spec_budget" \
-  --generic-lowering:"$generic_lowering" \
-  --output:"$output_path" \
-  --multi-module-cache:"$multi_module_cache" \
-  --module-cache-unstable-allow:"$module_cache_unstable_allow"
-
-if [ "$allow_no_main" = "1" ]; then
-  set -- "$@" --allow-no-main
-fi
-if [ "$whole_program" = "1" ]; then
-  set -- "$@" --whole-program
-else
-  set -- "$@" --no-whole-program
-fi
-if [ "$multi" = "1" ]; then
-  set -- "$@" --multi
-else
-  set -- "$@" --no-multi
-fi
-if [ "$multi_force" = "1" ]; then
-  set -- "$@" --multi-force
-else
-  set -- "$@" --no-multi-force
-fi
-if [ "$incremental" = "1" ]; then
-  set -- "$@" --incremental
-else
-  set -- "$@" --no-incremental
-fi
-if [ "$opt" = "1" ]; then
-  set -- "$@" --opt
-else
-  set -- "$@" --no-opt
-fi
-if [ "$opt2" = "1" ]; then
-  set -- "$@" --opt2
-else
-  set -- "$@" --no-opt2
-fi
-if [ "$ldflags" != "" ]; then
-  set -- "$@" --ldflags:"$ldflags"
-fi
-if [ "$module_cache" != "" ]; then
-  set -- "$@" --module-cache:"$module_cache"
-fi
-if [ "$no_runtime_c" = "1" ]; then
-  set -- "$@" --no-runtime-c
-fi
-if [ "$runtime_obj" != "" ]; then
-  set -- "$@" --runtime-obj:"$runtime_obj"
-fi
-if [ "$wrapper_preserve_sidecar" = "1" ]; then
-  if [ "$sidecar_mode" != "" ]; then
-    set -- "$@" --sidecar-mode:"$sidecar_mode"
-  fi
-  if [ "$sidecar_bundle" != "" ]; then
-    set -- "$@" --sidecar-bundle:"$sidecar_bundle"
-  fi
-  if [ "$sidecar_compiler" != "" ]; then
-    set -- "$@" --sidecar-compiler:"$sidecar_compiler"
-  fi
-  if [ "$sidecar_child_mode" != "" ]; then
-    set -- "$@" --sidecar-child-mode:"$sidecar_child_mode"
-  fi
-  if [ "$sidecar_outer_compiler" != "" ]; then
-    set -- "$@" --sidecar-outer-compiler:"$sidecar_outer_compiler"
-  fi
-fi
-
-exec env \
+set -- env \
   -u BACKEND_UIR_SIDECAR_MODE \
   -u BACKEND_UIR_SIDECAR_OBJ \
   -u BACKEND_UIR_SIDECAR_BUNDLE \
@@ -508,8 +447,72 @@ exec env \
   -u GENERIC_MODE \
   -u GENERIC_SPEC_BUDGET \
   -u GENERIC_LOWERING \
-  -u BACKEND_INTERNAL_ALLOW_EMIT_OBJ \
-  BACKEND_UIR_SIDECAR_DISABLE=1 \
-  BACKEND_UIR_PREFER_SIDECAR=0 \
-  BACKEND_UIR_FORCE_SIDECAR=0 \
-  "$@"
+  -u BACKEND_INTERNAL_ALLOW_EMIT_OBJ
+
+if [ "$wrapper_preserve_sidecar" = "1" ]; then
+  if [ "$sidecar_mode" != "" ]; then
+    set -- "$@" "BACKEND_UIR_SIDECAR_MODE=$sidecar_mode"
+  fi
+  if [ "$sidecar_bundle" != "" ]; then
+    set -- "$@" "BACKEND_UIR_SIDECAR_BUNDLE=$sidecar_bundle"
+  fi
+  if [ "$sidecar_compiler" != "" ]; then
+    set -- "$@" "BACKEND_UIR_SIDECAR_COMPILER=$sidecar_compiler"
+  fi
+  if [ "$sidecar_child_mode" != "" ]; then
+    set -- "$@" "BACKEND_UIR_SIDECAR_CHILD_MODE=$sidecar_child_mode"
+  fi
+  if [ "$sidecar_outer_compiler" != "" ]; then
+    set -- "$@" "BACKEND_UIR_SIDECAR_OUTER_COMPILER=$sidecar_outer_compiler"
+  fi
+else
+  set -- "$@" \
+    "BACKEND_UIR_SIDECAR_DISABLE=1" \
+    "BACKEND_UIR_PREFER_SIDECAR=0" \
+    "BACKEND_UIR_FORCE_SIDECAR=0"
+fi
+
+set -- "$@" \
+  "BACKEND_INPUT=$input_path" \
+  "BACKEND_OUTPUT=$output_path" \
+  "BACKEND_FRONTEND=$frontend" \
+  "BACKEND_EMIT=$emit_mode" \
+  "BACKEND_TARGET=$target" \
+  "BACKEND_LINKER=$linker_mode" \
+  "BACKEND_BUILD_TRACK=$build_track" \
+  "MM=$mm" \
+  "BACKEND_FN_SCHED=$fn_sched" \
+  "BACKEND_ALLOW_NO_MAIN=$allow_no_main" \
+  "BACKEND_WHOLE_PROGRAM=$whole_program" \
+  "BACKEND_MULTI=$multi" \
+  "BACKEND_MULTI_FORCE=$multi_force" \
+  "BACKEND_INCREMENTAL=$incremental" \
+  "BACKEND_JOBS=$jobs" \
+  "BACKEND_FN_JOBS=$fn_jobs" \
+  "BACKEND_OPT=$opt" \
+  "BACKEND_OPT2=$opt2" \
+  "BACKEND_OPT_LEVEL=$opt_level" \
+  "BACKEND_MULTI_MODULE_CACHE=$multi_module_cache" \
+  "BACKEND_MODULE_CACHE_UNSTABLE_ALLOW=$module_cache_unstable_allow" \
+  "GENERIC_MODE=$generic_mode" \
+  "GENERIC_SPEC_BUDGET=$generic_spec_budget" \
+  "GENERIC_LOWERING=$generic_lowering"
+
+if [ "$ldflags" != "" ]; then
+  set -- "$@" "BACKEND_LDFLAGS=$ldflags"
+fi
+if [ "$module_cache" != "" ]; then
+  set -- "$@" "BACKEND_MODULE_CACHE=$module_cache"
+fi
+if [ "$no_runtime_c" = "1" ]; then
+  set -- "$@" "BACKEND_NO_RUNTIME_C=1"
+fi
+if [ "$runtime_obj" != "" ]; then
+  set -- "$@" "BACKEND_RUNTIME_OBJ=$runtime_obj"
+fi
+if [ "$internal_allow_emit_obj" = "1" ]; then
+  set -- "$@" "BACKEND_INTERNAL_ALLOW_EMIT_OBJ=1"
+fi
+
+set -- "$@" "$real_driver"
+exec "$@"

@@ -30,10 +30,6 @@ detect_host_target() {
   return 0
 }
 
-canonical_dist_real_driver_path() {
-  printf '%s\n' "$root/dist/releases/current/cheng"
-}
-
 strict_stage0_lineage_dir() {
   printf '%s\n' "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof"
 }
@@ -93,6 +89,47 @@ strict_stage0_expected_label() {
   printf '\n'
 }
 
+strict_stage0_direct_export_driver_path() {
+  driver_path="$1"
+  case "$driver_path" in
+    *.proof)
+      outer_driver="$(strict_stage0_meta_field "${driver_path}.meta" "outer_driver")"
+      if [ "$outer_driver" != "" ]; then
+        printf '%s\n' "$outer_driver"
+        return 0
+      fi
+      ;;
+  esac
+  printf '%s\n' "$driver_path"
+}
+
+strict_stage0_direct_export_surface_ok() {
+  driver_path="$1"
+  export_driver="$(strict_stage0_direct_export_driver_path "$driver_path")"
+  [ "$export_driver" != "" ] || return 1
+  [ -x "$export_driver" ] || return 1
+  command -v nm >/dev/null 2>&1 || return 1
+  surface_log="$(mktemp "${TMPDIR:-/tmp}/strict_stage0_nm.XXXXXX")"
+  set +e
+  (nm -gU "$export_driver" 2>/dev/null || nm "$export_driver" 2>/dev/null) >"$surface_log"
+  nm_status="$?"
+  set -e
+  if [ "$nm_status" -ne 0 ]; then
+    rm -f "$surface_log"
+    return 1
+  fi
+  if ! grep -q 'driver_export_build_emit_obj_from_file_stage1_target_impl' "$surface_log"; then
+    rm -f "$surface_log"
+    return 1
+  fi
+  if ! grep -q 'driver_export_prefer_sidecar_builds' "$surface_log"; then
+    rm -f "$surface_log"
+    return 1
+  fi
+  rm -f "$surface_log"
+  return 0
+}
+
 strict_stage0_meta_ok() {
   driver_path="$1"
   if ! strict_stage0_published_surface "$driver_path" && ! strict_stage0_bootstrap_surface "$driver_path"; then
@@ -104,12 +141,25 @@ strict_stage0_meta_ok() {
   [ -f "$meta_path" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "meta_contract_version")" = "2" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "label")" = "$expected_label" ] || return 1
-  [ "$(strict_stage0_meta_field "$meta_path" "outer_driver")" = "$driver_path" ] || return 1
+  meta_outer_driver="$(strict_stage0_meta_field "$meta_path" "outer_driver")"
+  case "$expected_label" in
+    stage2.proof)
+      [ "$meta_outer_driver" != "" ] || return 1
+      [ -x "$meta_outer_driver" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_mode")" = "cheng" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_bundle")" != "" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_compiler")" != "" ] || return 1
+      ;;
+    *)
+      [ "$meta_outer_driver" = "$driver_path" ] || return 1
+      ;;
+  esac
   [ "$(strict_stage0_meta_field "$meta_path" "driver_input")" = "src/backend/tooling/backend_driver_proof.cheng" ] || return 1
-  [ "$(strict_stage0_meta_field "$meta_path" "stage1_skip_ownership_effective")" = "0" ] || return 1
-  [ "$(strict_stage0_meta_field "$meta_path" "stage1_skip_ownership_default")" = "0" ] || return 1
+  [ "$(strict_stage0_meta_field "$meta_path" "stage1_ownership_fixed_0_effective")" = "0" ] || return 1
+  [ "$(strict_stage0_meta_field "$meta_path" "stage1_ownership_fixed_0_default")" = "0" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "generic_mode")" = "dict" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "generic_lowering")" = "mir_dict" ] || return 1
+  strict_stage0_direct_export_surface_ok "$driver_path" || return 1
   return 0
 }
 
@@ -237,15 +287,15 @@ case "$snapshot_real_driver" in
     exit 1
     ;;
 esac
-if [ "$snapshot_real_driver" = "$(canonical_dist_real_driver_path)" ]; then
-  echo "[resolve_backend_sidecar_defaults] strict-fresh rejects dist current real driver: $snapshot_real_driver" 1>&2
+if ! strict_stage0_published_surface "$snapshot_real_driver"; then
+  echo "[resolve_backend_sidecar_defaults] strict-fresh real driver must be a published strict stage0 surface: $snapshot_real_driver" 1>&2
   exit 1
 fi
 if ! strict_stage0_meta_ok "$snapshot_real_driver"; then
   echo "[resolve_backend_sidecar_defaults] strict-fresh real driver missing contract: $snapshot_real_driver" 1>&2
   exit 1
 fi
-if strict_stage0_published_surface "$snapshot_real_driver" && ! strict_stage0_current_enough "$snapshot_real_driver"; then
+if ! strict_stage0_current_enough "$snapshot_real_driver"; then
   echo "[resolve_backend_sidecar_defaults] strict-fresh real driver is stale against current sources: $snapshot_real_driver" 1>&2
   exit 1
 fi

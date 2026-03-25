@@ -127,12 +127,10 @@ fn hashMapAllocZeroSeq_uint8(cap0: int32): uint8[] =
         out.len = cap0
     return hashMapReturnSeqUint8(out)
 
-fn hashMapHash64StrMeta(s: str): uint64 =
+fn hashMapHash64StrMetaRaw(dataPtr0: ptr, n: int32): uint64 =
     var h: uint64 = (uint64(1469598103) * uint64(1000000000)) + uint64(934665603)
-    let n: int32 = strLenFast(s)
     if n <= 0:
         return h
-    let dataPtr0: ptr = strDataPtr(s)
     if dataPtr0 == nil:
         return h
     for i in 0..<n:
@@ -140,6 +138,9 @@ fn hashMapHash64StrMeta(s: str): uint64 =
         h = h ^ ch
         h = h * ((uint64(1099511628) * uint64(1000)) + uint64(211))
     return h
+
+fn hashMapHash64StrMeta(s: str): uint64 =
+    return hashMapHash64StrMetaRaw(strDataPtr(s), strLenFast(s))
 
 fn hashMapHash64Str(s: str): uint64 =
     return hashMapHash64StrMeta(s)
@@ -154,21 +155,20 @@ fn hashMapHash64Ptr(p: int64): uint64 =
     return h
 
 fn hashMapStrEq(cur: str, key: str): bool =
-    if cur == key:
-        return true
-    let nKey: int32 = strLenFast(key)
-    if nKey <= 0:
+    return hashMapStrEq(cur, key, strLenFast(key), strDataPtr(key))
+
+fn hashMapStrEq(cur: str, key: str, keyLen: int32, keyPtr: ptr): bool =
+    if keyLen <= 0:
         return false
     let nCur: int32 = strLenFast(cur)
-    if nCur != nKey:
+    if nCur != keyLen:
         return false
     let curPtr: ptr = strDataPtr(cur)
-    let keyPtr: ptr = strDataPtr(key)
     if curPtr == keyPtr:
         return true
     if curPtr == nil || keyPtr == nil:
         return false
-    return cmpMem(curPtr, keyPtr, int64(nKey)) == 0
+    return cmpMem(curPtr, keyPtr, int64(keyLen)) == 0
 
 fn hashMapStrIntInit(cap0: int32 = 16): HashMapStrInt =
     var m: HashMapStrInt
@@ -206,12 +206,14 @@ fn hashMapStrIntClear(m: var HashMapStrInt) =
         m.used = 0
 
 fn hashMapStrIntFindSlot(m: HashMapStrInt, key: str, allowInsert: bool): int32 =
-    if len(key) == 0 || key == "" || m.mask == 0:
+    let keyLen: int32 = strLenFast(key)
+    if keyLen <= 0 || m.mask == 0:
         return -1
+    let keyPtr: ptr = strDataPtr(key)
     let mask: int32 = int32(m.mask)
     let states: uint8[] = m.states
     let keys: str[] = m.keys
-    var probe: int32 = int32(hashMapHash64StrMeta(key) & uint64(mask))
+    var probe: int32 = int32(hashMapHash64StrMetaRaw(keyPtr, keyLen) & uint64(mask))
     var scanned: int32 = 0
     let __for_start_scanned_1 = scanned
     for __for_scanned_1 in __for_start_scanned_1..mask:
@@ -222,19 +224,21 @@ fn hashMapStrIntFindSlot(m: HashMapStrInt, key: str, allowInsert: bool): int32 =
                 return probe
             return -1
         let cur: str = keys[probe]
-        if hashMapStrEq(cur, key):
+        if hashMapStrEq(cur, key, keyLen, keyPtr):
             return probe
         probe = (probe + 1) & mask
         scanned = scanned + 1
     return -1
 
 fn hashMapStrIntFindSlotMut(m: var HashMapStrInt, key: str, allowInsert: bool): int32 =
-    if len(key) == 0 || key == "" || m.mask == 0:
+    let keyLen: int32 = strLenFast(key)
+    if keyLen <= 0 || m.mask == 0:
         return -1
+    let keyPtr: ptr = strDataPtr(key)
     let mask: int32 = int32(m.mask)
     let states: uint8[] = m.states
     let keys: str[] = m.keys
-    var probe: int32 = int32(hashMapHash64StrMeta(key) & uint64(mask))
+    var probe: int32 = int32(hashMapHash64StrMetaRaw(keyPtr, keyLen) & uint64(mask))
     var scanned: int32 = 0
     let __for_start_scanned_2 = scanned
     for __for_scanned_2 in __for_start_scanned_2..mask:
@@ -245,7 +249,7 @@ fn hashMapStrIntFindSlotMut(m: var HashMapStrInt, key: str, allowInsert: bool): 
                 return probe
             return -1
         let cur: str = keys[probe]
-        if hashMapStrEq(cur, key):
+        if hashMapStrEq(cur, key, keyLen, keyPtr):
             return probe
         probe = (probe + 1) & mask
         scanned = scanned + 1
@@ -276,7 +280,7 @@ fn hashMapStrIntGrow(m: var HashMapStrInt) =
     m = nextMap
 
 fn hashMapStrIntPut(m: var HashMapStrInt, key: str, val: int32) =
-    if len(key) > 0 && key != "":
+    if len(key) > 0:
         if m.mask == 0:
             hashMapStrIntInitInPlace(m, 16)
         if (m.used + 1) * 10 >= m.keys.len * 7:
@@ -290,7 +294,7 @@ fn hashMapStrIntPut(m: var HashMapStrInt, key: str, val: int32) =
             m.vals[slot] = val
 
 fn hashMapStrIntGetEx(m: HashMapStrInt, key: str, found: var bool): int32 =
-    if len(key) == 0 || key == "" || m.mask == 0:
+    if len(key) == 0 || m.mask == 0:
         found = false
         return 0
     let slot: int32 = hashMapStrIntFindSlot(m, key, false)
@@ -308,7 +312,7 @@ fn hashMapStrIntGet(m: HashMapStrInt, key: str): int32 =
     return hashMapStrIntGetEx(m, key, found)
 
 fn hashMapStrIntGet(m: HashMapStrInt, key: str, found: var bool): int32 =
-    if len(key) == 0 || key == "" || m.mask == 0:
+    if len(key) == 0 || m.mask == 0:
         found = false
         return 0
     let slot: int32 = hashMapStrIntFindSlot(m, key, false)
@@ -323,7 +327,7 @@ fn hashMapStrIntGetMut(m: var HashMapStrInt, key: str): int32 =
     return hashMapStrIntGetMutEx(m, key, found)
 
 fn hashMapStrIntGetMutEx(m: var HashMapStrInt, key: str, found: var bool): int32 =
-    if len(key) == 0 || key == "" || m.mask == 0:
+    if len(key) == 0 || m.mask == 0:
         found = false
         return 0
     let slot: int32 = hashMapStrIntFindSlotMut(m, key, false)
@@ -348,7 +352,7 @@ fn `[]=`(m: var HashMapStrInt, key: str, val: int32) =
     hashMapStrIntPut(m, key, val)
 
 fn hashMapStrIntGetOrInsertExPtr(m: var HashMapStrInt, key: str, newVal: int32, foundPtr: ptr = nil): int32 =
-    if len(key) == 0 || key == "":
+    if len(key) == 0:
         if foundPtr != nil:
             var found0: bool = false
             memCopyCompat(foundPtr, &found0, int32(sizeof bool))
@@ -422,12 +426,14 @@ fn hashMapStrSeqIntClear(m: var HashMapStrSeqInt) =
         m.used = 0
 
 fn hashMapStrSeqIntFindSlot(m: HashMapStrSeqInt, key: str, allowInsert: bool): int32 =
-    if len(key) == 0 || key == "" || m.mask == 0:
+    let keyLen: int32 = strLenFast(key)
+    if keyLen <= 0 || m.mask == 0:
         return -1
+    let keyPtr: ptr = strDataPtr(key)
     let mask: int32 = int32(m.mask)
     let states: uint8[] = m.states
     let keys: str[] = m.keys
-    var probe: int32 = int32(hashMapHash64StrMeta(key) & uint64(mask))
+    var probe: int32 = int32(hashMapHash64StrMetaRaw(keyPtr, keyLen) & uint64(mask))
     var scanned: int32 = 0
     let __for_start_scanned_3 = scanned
     for __for_scanned_3 in __for_start_scanned_3..mask:
@@ -438,19 +444,21 @@ fn hashMapStrSeqIntFindSlot(m: HashMapStrSeqInt, key: str, allowInsert: bool): i
                 return probe
             return -1
         let cur: str = keys[probe]
-        if hashMapStrEq(cur, key):
+        if hashMapStrEq(cur, key, keyLen, keyPtr):
             return probe
         probe = (probe + 1) & mask
         scanned = scanned + 1
     return -1
 
 fn hashMapStrSeqIntFindSlotMut(m: var HashMapStrSeqInt, key: str, allowInsert: bool): int32 =
-    if len(key) == 0 || key == "" || m.mask == 0:
+    let keyLen: int32 = strLenFast(key)
+    if keyLen <= 0 || m.mask == 0:
         return -1
+    let keyPtr: ptr = strDataPtr(key)
     let mask: int32 = int32(m.mask)
     let states: uint8[] = m.states
     let keys: str[] = m.keys
-    var probe: int32 = int32(hashMapHash64StrMeta(key) & uint64(mask))
+    var probe: int32 = int32(hashMapHash64StrMetaRaw(keyPtr, keyLen) & uint64(mask))
     var scanned: int32 = 0
     let __for_start_scanned_4 = scanned
     for __for_scanned_4 in __for_start_scanned_4..mask:
@@ -461,7 +469,7 @@ fn hashMapStrSeqIntFindSlotMut(m: var HashMapStrSeqInt, key: str, allowInsert: b
                 return probe
             return -1
         let cur: str = keys[probe]
-        if hashMapStrEq(cur, key):
+        if hashMapStrEq(cur, key, keyLen, keyPtr):
             return probe
         probe = (probe + 1) & mask
         scanned = scanned + 1
