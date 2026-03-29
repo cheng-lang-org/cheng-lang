@@ -277,6 +277,9 @@ int32_t driver_c_str_has_prefix_bridge(ChengStrBridge s, ChengStrBridge prefix);
 int32_t driver_c_str_contains_char_bridge(ChengStrBridge s, int32_t value);
 int32_t driver_c_str_contains_str_bridge(ChengStrBridge s, ChengStrBridge sub);
 int32_t driver_c_cli_param1_eq_bridge(ChengStrBridge expected);
+int32_t driver_c_cli_param1_eq_raw_bridge(const char* expected_ptr, int32_t expected_len);
+int32_t driver_c_compiler_core_print_usage_bridge(void);
+int32_t driver_c_compiler_core_print_status_bridge(void);
 ChengStrBridge driver_c_exec_file_capture_or_panic_bridge(ChengStrBridge file_path,
                                                           ChengSeqHeader argv,
                                                           ChengStrBridge working_dir,
@@ -286,9 +289,25 @@ void driver_c_compare_text_files_or_panic_bridge(ChengStrBridge left_path,
                                                  ChengStrBridge label);
 ChengStrBridge driver_c_read_flag_or_default_bridge(ChengStrBridge key, ChengStrBridge default_value);
 int32_t driver_c_read_int32_flag_or_default_bridge(ChengStrBridge key, int32_t default_value);
+ChengStrBridge driver_c_absolute_path_bridge(ChengStrBridge path);
+ChengStrBridge driver_c_program_absolute_path_bridge(void);
+ChengStrBridge driver_c_get_current_dir_bridge(void);
+ChengStrBridge driver_c_join_path2_bridge(ChengStrBridge left, ChengStrBridge right);
+void driver_c_create_dir_all_bridge(ChengStrBridge path);
 void driver_c_write_text_file_bridge(ChengStrBridge path, ChengStrBridge content);
 int32_t driver_c_compare_text_files_bridge(ChengStrBridge left_path, ChengStrBridge right_path);
 int32_t driver_c_compare_binary_files_bridge(ChengStrBridge left_path, ChengStrBridge right_path);
+ChengStrBridge driver_c_extract_line_value_bridge(ChengStrBridge text, ChengStrBridge key);
+int32_t driver_c_count_external_cc_providers_bridge(ChengStrBridge plan_text);
+int32_t driver_c_parse_plan_int32_or_zero_bridge(ChengStrBridge plan_text, ChengStrBridge key);
+ChengStrBridge driver_c_provider_field_for_module_from_plan_text_bridge(ChengStrBridge plan_text,
+                                                                        ChengStrBridge module_name,
+                                                                        ChengStrBridge field_name);
+ChengStrBridge driver_c_compiler_core_provider_source_kind_bridge(ChengStrBridge plan_text);
+ChengStrBridge driver_c_compiler_core_provider_compile_mode_bridge(ChengStrBridge plan_text);
+int32_t driver_c_run_stage_selfhost_host_bridge(void);
+int32_t driver_c_run_tooling_selfhost_host_bridge(void);
+int32_t driver_c_compiler_core_local_payload_bridge(const char* payload);
 int32_t driver_c_str_get_at_bridge(ChengStrBridge s, int32_t idx);
 void driver_c_str_set_at_bridge(ChengStrBridge* s, int32_t idx, int32_t value);
 ChengStrBridge driver_c_getenv_copy_bridge(const char* name);

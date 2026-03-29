@@ -3908,9 +3908,23 @@ static const char *compiler_core_binding_scope_for_kind(const char *kind) {
     return "routine_scope";
 }
 
+static const char *compiler_core_argv_runtime_target(void) {
+    return "runtime/compiler_core.argv_entry";
+}
+
+static const char *compiler_core_local_payload_runtime_target(void) {
+    return "runtime/compiler_core.local_payload_entry";
+}
+
+static const char *compiler_core_machine_runtime_target(const char *runtime_target) {
+    return strcmp(runtime_target, compiler_core_argv_runtime_target()) == 0
+               ? compiler_core_local_payload_runtime_target()
+               : runtime_target;
+}
+
 static const char *compiler_core_runtime_target_for_op(const char *op_name) {
     (void)op_name;
-    return "runtime/compiler_core.argv_entry";
+    return compiler_core_argv_runtime_target();
 }
 
 static CompilerCoreFacts build_compiler_core_facts(const CompilerCoreProgram *program) {
@@ -6258,10 +6272,10 @@ static char *machine_direct_if_else_simple_cond_words(const char *architecture,
     string_list_push_copy(&words, "d65f03c0");
     free(words.items[false_branch_idx]);
     words.items[false_branch_idx] =
-        machine_aarch64_branch_cond_word((int)(else_start_idx - false_branch_idx - 1), "eq");
+        machine_aarch64_branch_cond_word((int)(else_start_idx - false_branch_idx), "eq");
     free(words.items[end_branch_idx]);
     words.items[end_branch_idx] =
-        machine_aarch64_branch_word((int)(epilogue_start_idx - end_branch_idx - 1));
+        machine_aarch64_branch_word((int)(epilogue_start_idx - end_branch_idx));
     return join_word_parts_owned(&words);
 }
 
@@ -6313,11 +6327,11 @@ static char *machine_direct_if_else_binary_cond_words(const char *architecture,
     string_list_push_copy(&words, "d65f03c0");
     free(words.items[false_branch_idx]);
     words.items[false_branch_idx] =
-        machine_aarch64_branch_cond_word((int)(else_start_idx - false_branch_idx - 1),
+        machine_aarch64_branch_cond_word((int)(else_start_idx - false_branch_idx),
                                          machine_aarch64_inverse_compare_cond(operator_text));
     free(words.items[end_branch_idx]);
     words.items[end_branch_idx] =
-        machine_aarch64_branch_word((int)(epilogue_start_idx - end_branch_idx - 1));
+        machine_aarch64_branch_word((int)(epilogue_start_idx - end_branch_idx));
     return join_word_parts_owned(&words);
 }
 
@@ -6356,6 +6370,27 @@ static char *machine_direct_call_cstring_arg_words(const char *architecture,
     return join_word_parts_owned(&words);
 }
 
+static char *machine_direct_call_second_cstring_arg_words(const char *architecture,
+                                                          int byte_len) {
+    StringList words;
+    memset(&words, 0, sizeof(words));
+    if (strcmp(architecture, "aarch64") != 0) {
+        die("v2 machine pipeline: unsupported direct executable architecture");
+    }
+    if (byte_len < 0 || byte_len > 65535) {
+        return NULL;
+    }
+    string_list_push_copy(&words, "a9bf7bfd");
+    string_list_push_copy(&words, "910003fd");
+    string_list_push_copy(&words, "90000002");
+    string_list_push_copy(&words, "91000042");
+    string_list_push_take(&words, machine_aarch64_mov_int32_word(3, byte_len));
+    string_list_push_copy(&words, "94000000");
+    string_list_push_copy(&words, "a8c17bfd");
+    string_list_push_copy(&words, "d65f03c0");
+    return join_word_parts_owned(&words);
+}
+
 static char *machine_direct_call_void_then_const_words(const char *architecture,
                                                        const char *const_kind,
                                                        const char *const_primary_text,
@@ -6388,6 +6423,45 @@ static int machine_append_load_simple_call_args_words(const char *architecture,
                                                       const char **arg_kinds,
                                                       const char **arg_primary_texts,
                                                       const int *arg_arg0s);
+
+static char *machine_direct_call_simple_args_void_then_const_words(const char *architecture,
+                                                                   int arg_count,
+                                                                   const char **arg_kinds,
+                                                                   const char **arg_primary_texts,
+                                                                   const int *arg_arg0s,
+                                                                   const char *const_kind,
+                                                                   const char *const_primary_text,
+                                                                   int const_arg0) {
+    StringList words;
+    memset(&words, 0, sizeof(words));
+    if (strcmp(architecture, "aarch64") != 0) {
+        die("v2 machine pipeline: unsupported direct executable architecture");
+    }
+    string_list_push_copy(&words, "a9bf7bfd");
+    string_list_push_copy(&words, "910003fd");
+    if (!machine_append_load_simple_call_args_words(architecture,
+                                                    &words,
+                                                    arg_count,
+                                                    arg_kinds,
+                                                    arg_primary_texts,
+                                                    arg_arg0s)) {
+        string_list_free(&words);
+        return NULL;
+    }
+    string_list_push_copy(&words, "94000000");
+    if (!machine_append_load_simple_value_words(architecture,
+                                                &words,
+                                                0,
+                                                const_kind,
+                                                const_primary_text,
+                                                const_arg0)) {
+        string_list_free(&words);
+        return NULL;
+    }
+    string_list_push_copy(&words, "a8c17bfd");
+    string_list_push_copy(&words, "d65f03c0");
+    return join_word_parts_owned(&words);
+}
 
 static char *machine_direct_call_compare_const_rhs_words(const char *architecture,
                                                          int arg_count,
@@ -6492,10 +6566,10 @@ static char *machine_direct_if_else_call_compare_const_rhs_words(const char *arc
     string_list_push_copy(&words, "d65f03c0");
     free(words.items[false_branch_idx]);
     words.items[false_branch_idx] =
-        machine_aarch64_branch_cond_word(else_start_idx - false_branch_idx - 1, inverse_cond);
+        machine_aarch64_branch_cond_word(else_start_idx - false_branch_idx, inverse_cond);
     free(words.items[end_branch_idx]);
     words.items[end_branch_idx] =
-        machine_aarch64_branch_word(epilogue_start_idx - end_branch_idx - 1);
+        machine_aarch64_branch_word(epilogue_start_idx - end_branch_idx);
     return join_word_parts_owned(&words);
 }
 
@@ -6525,10 +6599,86 @@ static char *machine_direct_if_else_call_words(const char *architecture) {
     string_list_push_copy(&words, "d65f03c0");
     free(words.items[false_branch_idx]);
     words.items[false_branch_idx] =
-        machine_aarch64_branch_cond_word(else_start_idx - false_branch_idx - 1, "eq");
+        machine_aarch64_branch_cond_word(else_start_idx - false_branch_idx, "eq");
     free(words.items[end_branch_idx]);
     words.items[end_branch_idx] =
-        machine_aarch64_branch_word(epilogue_start_idx - end_branch_idx - 1);
+        machine_aarch64_branch_word(epilogue_start_idx - end_branch_idx);
+    return join_word_parts_owned(&words);
+}
+
+static char *machine_direct_if_else_const_then_call_words(const char *architecture,
+                                                          const char *const_kind,
+                                                          const char *const_primary_text,
+                                                          int const_arg0) {
+    StringList words;
+    int false_branch_idx;
+    int end_branch_idx;
+    int else_start_idx;
+    int epilogue_start_idx;
+    memset(&words, 0, sizeof(words));
+    if (strcmp(architecture, "aarch64") != 0) {
+        die("v2 machine pipeline: unsupported direct executable architecture");
+    }
+    string_list_push_copy(&words, "a9bf7bfd");
+    string_list_push_copy(&words, "910003fd");
+    string_list_push_copy(&words, "94000000");
+    string_list_push_take(&words, machine_aarch64_cmp_zero_word(0, 0));
+    false_branch_idx = (int)words.len;
+    string_list_push_copy(&words, "");
+    if (!machine_append_load_simple_value_words(architecture, &words, 0, const_kind, const_primary_text, const_arg0)) {
+        return NULL;
+    }
+    end_branch_idx = (int)words.len;
+    string_list_push_copy(&words, "");
+    else_start_idx = (int)words.len;
+    string_list_push_copy(&words, "94000000");
+    epilogue_start_idx = (int)words.len;
+    string_list_push_copy(&words, "a8c17bfd");
+    string_list_push_copy(&words, "d65f03c0");
+    free(words.items[false_branch_idx]);
+    words.items[false_branch_idx] =
+        machine_aarch64_branch_cond_word(else_start_idx - false_branch_idx, "eq");
+    free(words.items[end_branch_idx]);
+    words.items[end_branch_idx] =
+        machine_aarch64_branch_word(epilogue_start_idx - end_branch_idx);
+    return join_word_parts_owned(&words);
+}
+
+static char *machine_direct_if_else_call_then_const_words(const char *architecture,
+                                                          const char *const_kind,
+                                                          const char *const_primary_text,
+                                                          int const_arg0) {
+    StringList words;
+    int false_branch_idx;
+    int end_branch_idx;
+    int else_start_idx;
+    int epilogue_start_idx;
+    memset(&words, 0, sizeof(words));
+    if (strcmp(architecture, "aarch64") != 0) {
+        die("v2 machine pipeline: unsupported direct executable architecture");
+    }
+    string_list_push_copy(&words, "a9bf7bfd");
+    string_list_push_copy(&words, "910003fd");
+    string_list_push_copy(&words, "94000000");
+    string_list_push_take(&words, machine_aarch64_cmp_zero_word(0, 0));
+    false_branch_idx = (int)words.len;
+    string_list_push_copy(&words, "");
+    string_list_push_copy(&words, "94000000");
+    end_branch_idx = (int)words.len;
+    string_list_push_copy(&words, "");
+    else_start_idx = (int)words.len;
+    if (!machine_append_load_simple_value_words(architecture, &words, 0, const_kind, const_primary_text, const_arg0)) {
+        return NULL;
+    }
+    epilogue_start_idx = (int)words.len;
+    string_list_push_copy(&words, "a8c17bfd");
+    string_list_push_copy(&words, "d65f03c0");
+    free(words.items[false_branch_idx]);
+    words.items[false_branch_idx] =
+        machine_aarch64_branch_cond_word(else_start_idx - false_branch_idx, "eq");
+    free(words.items[end_branch_idx]);
+    words.items[end_branch_idx] =
+        machine_aarch64_branch_word(epilogue_start_idx - end_branch_idx);
     return join_word_parts_owned(&words);
 }
 
@@ -6554,6 +6704,34 @@ static char *machine_direct_nested_call_words(const char *architecture,
     }
     string_list_push_copy(&words, "94000000");
     string_list_push_copy(&words, "94000000");
+    string_list_push_copy(&words, "a8c17bfd");
+    string_list_push_copy(&words, "d65f03c0");
+    return join_word_parts_owned(&words);
+}
+
+static char *machine_direct_nested_call_void_words(const char *architecture,
+                                                   int arg_count,
+                                                   const char **arg_kinds,
+                                                   const char **arg_primary_texts,
+                                                   const int *arg_arg0s) {
+    StringList words;
+    memset(&words, 0, sizeof(words));
+    if (strcmp(architecture, "aarch64") != 0) {
+        die("v2 machine pipeline: unsupported direct executable architecture");
+    }
+    string_list_push_copy(&words, "a9bf7bfd");
+    string_list_push_copy(&words, "910003fd");
+    if (!machine_append_load_simple_call_args_words(architecture,
+                                                    &words,
+                                                    arg_count,
+                                                    arg_kinds,
+                                                    arg_primary_texts,
+                                                    arg_arg0s)) {
+        return NULL;
+    }
+    string_list_push_copy(&words, "94000000");
+    string_list_push_copy(&words, "94000000");
+    string_list_push_copy(&words, "52800000");
     string_list_push_copy(&words, "a8c17bfd");
     string_list_push_copy(&words, "d65f03c0");
     return join_word_parts_owned(&words);
@@ -6597,6 +6775,82 @@ static char *machine_direct_nested_call_trailing_simple_arg_void_words(const cha
     string_list_push_take(&words, machine_aarch64_add_imm_word(1, 31, 31, 16));
     string_list_push_copy(&words, "94000000");
     string_list_push_copy(&words, "52800000");
+    string_list_push_copy(&words, "a8c17bfd");
+    string_list_push_copy(&words, "d65f03c0");
+    return join_word_parts_owned(&words);
+}
+
+static char *machine_direct_nested_call_trailing_simple_arg_words(const char *architecture,
+                                                                  int inner_arg_count,
+                                                                  const char **inner_arg_kinds,
+                                                                  const char **inner_arg_primary_texts,
+                                                                  const int *inner_arg_arg0s,
+                                                                  const char *outer_arg_kind,
+                                                                  const char *outer_arg_primary_text,
+                                                                  int outer_arg0) {
+    StringList words;
+    memset(&words, 0, sizeof(words));
+    if (strcmp(architecture, "aarch64") != 0) {
+        die("v2 machine pipeline: unsupported direct executable architecture");
+    }
+    string_list_push_copy(&words, "a9bf7bfd");
+    string_list_push_copy(&words, "910003fd");
+    string_list_push_take(&words, machine_aarch64_sub_imm_word(1, 31, 31, 16));
+    if (!machine_append_load_simple_value_words(architecture,
+                                                &words,
+                                                1,
+                                                outer_arg_kind,
+                                                outer_arg_primary_text,
+                                                outer_arg0)) {
+        return NULL;
+    }
+    string_list_push_take(&words, machine_aarch64_store_sp_word(1, 1, 0));
+    if (!machine_append_load_simple_call_args_words(architecture,
+                                                    &words,
+                                                    inner_arg_count,
+                                                    inner_arg_kinds,
+                                                    inner_arg_primary_texts,
+                                                    inner_arg_arg0s)) {
+        return NULL;
+    }
+    string_list_push_copy(&words, "94000000");
+    string_list_push_take(&words, machine_aarch64_load_sp_word(1, 1, 0));
+    string_list_push_take(&words, machine_aarch64_add_imm_word(1, 31, 31, 16));
+    string_list_push_copy(&words, "94000000");
+    string_list_push_copy(&words, "a8c17bfd");
+    string_list_push_copy(&words, "d65f03c0");
+    return join_word_parts_owned(&words);
+}
+
+static char *machine_direct_nested_call_trailing_cstring_arg_words(const char *architecture,
+                                                                   int inner_arg_count,
+                                                                   const char **inner_arg_kinds,
+                                                                   const char **inner_arg_primary_texts,
+                                                                   const int *inner_arg_arg0s,
+                                                                   int byte_len) {
+    StringList words;
+    memset(&words, 0, sizeof(words));
+    if (strcmp(architecture, "aarch64") != 0) {
+        die("v2 machine pipeline: unsupported direct executable architecture");
+    }
+    if (byte_len < 0 || byte_len > 65535) {
+        return NULL;
+    }
+    string_list_push_copy(&words, "a9bf7bfd");
+    string_list_push_copy(&words, "910003fd");
+    if (!machine_append_load_simple_call_args_words(architecture,
+                                                    &words,
+                                                    inner_arg_count,
+                                                    inner_arg_kinds,
+                                                    inner_arg_primary_texts,
+                                                    inner_arg_arg0s)) {
+        return NULL;
+    }
+    string_list_push_copy(&words, "94000000");
+    string_list_push_copy(&words, "90000002");
+    string_list_push_copy(&words, "91000042");
+    string_list_push_take(&words, machine_aarch64_mov_int32_word(3, byte_len));
+    string_list_push_copy(&words, "94000000");
     string_list_push_copy(&words, "a8c17bfd");
     string_list_push_copy(&words, "d65f03c0");
     return join_word_parts_owned(&words);
@@ -6699,7 +6953,7 @@ static char *machine_direct_fallback_call_words(const char *architecture,
     string_list_push_copy(&words, "d65f03c0");
     free(words.items[else_branch_idx]);
     words.items[else_branch_idx] =
-        machine_aarch64_branch_cond_word((int)(else_start_idx - else_branch_idx - 1), "eq");
+        machine_aarch64_branch_cond_word((int)(else_start_idx - else_branch_idx), "eq");
     return join_word_parts_owned(&words);
 }
 
@@ -7334,6 +7588,31 @@ static void machine_direct_call_reloc_offsets(const char *words, IntList *out) {
     }
 }
 
+static void machine_direct_second_cstring_reloc_offsets(const char *words, IntList *out) {
+    int word_idx = 0;
+    const char *cursor = words;
+    const char *token_start = words;
+    memset(out, 0, sizeof(*out));
+    while (1) {
+        if (*cursor == ';' || *cursor == '\0') {
+            size_t token_len = (size_t)(cursor - token_start);
+            if ((token_len == 8 && strncmp(token_start, "90000002", 8) == 0) ||
+                (token_len == 8 && strncmp(token_start, "91000042", 8) == 0)) {
+                int_list_push(out, word_idx * 4);
+            }
+            if (*cursor == '\0') {
+                break;
+            }
+            token_start = cursor + 1;
+            word_idx += 1;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        ++cursor;
+    }
+}
+
 static void machine_rewrite_function_direct_exec_calls(MachineModuleBundle *out,
                                                        int function_idx,
                                                        char *words,
@@ -7388,6 +7667,75 @@ static void machine_rewrite_function_direct_exec_call(MachineModuleBundle *out,
     call_symbols[0] = call_symbol;
     machine_rewrite_function_direct_exec_calls(out, function_idx, words, 1, call_symbols);
     free(call_symbol);
+}
+
+static void machine_rewrite_function_direct_exec_calls_cstring_data(MachineModuleBundle *out,
+                                                                    int function_idx,
+                                                                    char *words,
+                                                                    int call_symbol_count,
+                                                                    char **call_symbols,
+                                                                    const char *payload_text) {
+    IntList call_offsets;
+    IntList data_offsets;
+    StringList joined_symbols;
+    int reloc_start;
+    int i;
+    char *data_symbol = xformat("%s_cstring", out->symbol_names.items[function_idx]);
+    memset(&call_offsets, 0, sizeof(call_offsets));
+    memset(&data_offsets, 0, sizeof(data_offsets));
+    memset(&joined_symbols, 0, sizeof(joined_symbols));
+    machine_direct_call_reloc_offsets(words, &call_offsets);
+    machine_direct_second_cstring_reloc_offsets(words, &data_offsets);
+    if ((int)call_offsets.len != call_symbol_count) {
+        die("v2 machine pipeline: direct exec call reloc count mismatch");
+    }
+    if ((int)data_offsets.len != 2) {
+        die("v2 machine pipeline: direct exec nested cstring reloc count mismatch");
+    }
+    free(out->runtime_targets.items[function_idx]);
+    out->runtime_targets.items[function_idx] = xstrdup_text("");
+    free(out->call_symbol_names.items[function_idx]);
+    for (i = 0; i < call_symbol_count; ++i) {
+        string_list_push_copy(&joined_symbols, call_symbols[i]);
+    }
+    out->call_symbol_names.items[function_idx] = string_list_join(&joined_symbols, ";");
+    string_list_free(&joined_symbols);
+    free(out->instruction_word_hex.items[function_idx]);
+    out->instruction_word_hex.items[function_idx] = words;
+    out->function_byte_sizes.items[function_idx] = word_count(words) * 4;
+    out->local_payload_page_reloc_offsets.items[function_idx] = data_offsets.items[0];
+    out->local_payload_pageoff_reloc_offsets.items[function_idx] = data_offsets.items[1];
+    out->call_reloc_offsets.items[function_idx] =
+        call_offsets.len > 0 ? call_offsets.items[0] : 0;
+    free(out->metadata_operand_modes.items[function_idx]);
+    out->metadata_operand_modes.items[function_idx] = xstrdup_text("direct_exec_call_cstring_payload");
+    free(out->local_payload_texts.items[function_idx]);
+    out->local_payload_texts.items[function_idx] = xstrdup_text(payload_text);
+    reloc_start = (int)out->reloc_offsets.len;
+    out->function_reloc_starts.items[function_idx] = reloc_start;
+    machine_append_data_symbol(out,
+                               data_symbol,
+                               out->cstring_section_name,
+                               payload_text,
+                               0);
+    machine_append_relocation(out,
+                              data_offsets.items[0],
+                              data_symbol,
+                              out->metadata_page_relocation_kind);
+    machine_append_relocation(out,
+                              data_offsets.items[1],
+                              data_symbol,
+                              out->metadata_pageoff_relocation_kind);
+    for (i = 0; i < call_symbol_count; ++i) {
+        machine_append_relocation(out,
+                                  call_offsets.items[i],
+                                  call_symbols[i],
+                                  out->call_relocation_kind);
+    }
+    out->function_reloc_counts.items[function_idx] = 2 + call_symbol_count;
+    free(call_offsets.items);
+    free(data_offsets.items);
+    free(data_symbol);
 }
 
 static const char *machine_arg_regs(const char *architecture) {
@@ -7856,6 +8204,58 @@ static int compiler_core_direct_type_reg_width(const char *type_text) {
     return 1;
 }
 
+static int compiler_core_direct_call_return_type_supported(const char *type_text) {
+    const char *normalized = type_text;
+    if (strncmp(normalized, "var ", 4) == 0) {
+        normalized += 4;
+    }
+    if (normalized[0] == '\0') {
+        return 1;
+    }
+    if (compiler_core_type_matches(normalized, "void")) {
+        return 1;
+    }
+    if (compiler_core_type_matches(normalized, "bool") ||
+        compiler_core_type_matches(normalized, "int8") ||
+        compiler_core_type_matches(normalized, "int16") ||
+        compiler_core_type_matches(normalized, "int32") ||
+        compiler_core_type_matches(normalized, "int64") ||
+        compiler_core_type_matches(normalized, "uint8") ||
+        compiler_core_type_matches(normalized, "uint16") ||
+        compiler_core_type_matches(normalized, "uint32") ||
+        compiler_core_type_matches(normalized, "uint64") ||
+        compiler_core_type_matches(normalized, "float64") ||
+        compiler_core_type_matches(normalized, "char") ||
+        compiler_core_type_matches(normalized, "ptr") ||
+        compiler_core_type_matches(normalized, "cstring") ||
+        compiler_core_type_matches(normalized, "File") ||
+        compiler_core_type_matches(normalized, "str") ||
+        compiler_core_type_matches(normalized, "Bytes") ||
+        compiler_core_type_matches(normalized, "ByteBuffer") ||
+        compiler_core_type_matches(normalized, "ByteReader") ||
+        compiler_core_type_ends_with(normalized, "[]")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int compiler_core_direct_text_match_allowed(const CompilerCoreBundle *bundle,
+                                                   size_t routine_idx,
+                                                   int max_stmt_count,
+                                                   int max_body_line_count) {
+    if (routine_idx >= bundle->program.routine_stmt_counts.len ||
+        routine_idx >= bundle->program.routine_body_line_counts.len) {
+        return 0;
+    }
+    if (bundle->program.routine_stmt_counts.items[routine_idx] > max_stmt_count) {
+        return 0;
+    }
+    if (bundle->program.routine_body_line_counts.items[routine_idx] > max_body_line_count) {
+        return 0;
+    }
+    return 1;
+}
+
 static int compiler_core_param_base_reg(const char *signature, int param_index) {
     int out = 0;
     int i;
@@ -7870,7 +8270,7 @@ static int compiler_core_param_base_reg(const char *signature, int param_index) 
 static MachineModuleBundle build_compiler_core_argv_entry_provider_machine_module(const char *repo_root,
                                                                                   const char *source_abs,
                                                                                   const char *provider_manifest_cid,
-                                                                                  const char *runtime_target,
+                                                                                  const StringList *runtime_targets,
                                                                                   const char *target_triple) {
     CompilerCoreBundle bundle = compile_compiler_core_source_closure(repo_root, source_abs);
     MachineModuleBundle full = build_compiler_core_machine_module(&bundle, target_triple);
@@ -7880,6 +8280,17 @@ static MachineModuleBundle build_compiler_core_argv_entry_provider_machine_modul
     char *binding_summary;
     char *provider_symbol;
     const char *entry_call_symbol;
+    const char *runtime_target;
+    const char *local_payload_target;
+    char *local_payload_binding_summary;
+    char *local_payload_symbol;
+    if (runtime_targets == NULL || runtime_targets->len == 0) {
+        die("v2 machine pipeline: compiler_core runtime targets missing");
+    }
+    runtime_target = runtime_targets->items[0];
+    local_payload_target = runtime_targets->len > 1
+                               ? runtime_targets->items[1]
+                               : compiler_core_local_payload_runtime_target();
     for (i = 0; i < bundle.low_plan.labels.len; ++i) {
         if (strcmp(bundle.low_plan.labels.items[i], "compilerCoreArgvEntry") == 0) {
             entry_index = i;
@@ -7889,12 +8300,7 @@ static MachineModuleBundle build_compiler_core_argv_entry_provider_machine_modul
     if (entry_index >= bundle.low_plan.labels.len) {
         die("v2 machine pipeline: compiler_core runtime argv entry missing");
     }
-    entry_call_symbol =
-        (entry_index < full.call_symbol_names.len &&
-         full.call_symbol_names.items[entry_index] != NULL &&
-         full.call_symbol_names.items[entry_index][0] != '\0') ?
-            full.call_symbol_names.items[entry_index] :
-            full.symbol_names.items[entry_index];
+    entry_call_symbol = full.symbol_names.items[entry_index];
     binding_summary = xformat("provider_module=runtime/compiler_core_runtime_v2|manifest_cid=%s|runtime_target=%s|entry_label=compilerCoreArgvEntry",
                               provider_manifest_cid,
                               runtime_target);
@@ -7919,7 +8325,26 @@ static MachineModuleBundle build_compiler_core_argv_entry_provider_machine_modul
                                                    call_symbols.items);
         string_list_free(&call_symbols);
     }
+    local_payload_binding_summary =
+        xformat("provider_module=runtime/compiler_core_runtime_v2|manifest_cid=%s|runtime_target=%s|entry_label=driver_c_compiler_core_local_payload_bridge",
+                provider_manifest_cid,
+                local_payload_target);
+    machine_append_dispatch_entry_function(&out,
+                                           1001000000 + bundle.low_plan.item_ids.items[entry_index],
+                                           "runtime_provider_local_payload_export",
+                                           local_payload_target,
+                                           local_payload_binding_summary,
+                                           16);
+    local_payload_symbol = machine_call_symbol_name(target_triple, local_payload_target);
+    free(out.symbol_names.items[1]);
+    out.symbol_names.items[1] = local_payload_symbol;
+    machine_rewrite_function_direct_exec_call(&out,
+                                              1,
+                                              xstrdup_text(machine_dispatch_entry_words(out.architecture)),
+                                              machine_libc_symbol_name(target_triple,
+                                                                       "driver_c_compiler_core_local_payload_bridge"));
     free(binding_summary);
+    free(local_payload_binding_summary);
     return out;
 }
 
@@ -8116,12 +8541,27 @@ static int compiler_core_importc_symbol_allows_direct_exec(const char *symbol_na
            strcmp(symbol_name, "free") == 0 ||
            strcmp(symbol_name, "driver_c_cli_param1_eq_bridge") == 0 ||
            strcmp(symbol_name, "driver_c_read_flag_or_default_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_read_int32_flag_or_default_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_read_int32_flag_or_default_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_compiler_core_print_usage_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_compiler_core_print_status_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_absolute_path_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_program_absolute_path_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_get_current_dir_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_join_path2_bridge") == 0 ||
+           strcmp(symbol_name, "driver_c_create_dir_all_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_write_text_file_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_compare_text_files_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_compare_binary_files_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_exec_file_capture_or_panic_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_compare_text_files_or_panic_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_extract_line_value_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_count_external_cc_providers_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_parse_plan_int32_or_zero_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_provider_field_for_module_from_plan_text_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_compiler_core_provider_source_kind_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_compiler_core_provider_compile_mode_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_run_stage_selfhost_host_bridge") == 0 ||
+        strcmp(symbol_name, "driver_c_run_tooling_selfhost_host_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_read_file_all") == 0 ||
            strcmp(symbol_name, "cheng_fopen") == 0 ||
            strcmp(symbol_name, "cheng_fread") == 0 ||
@@ -8992,7 +9432,11 @@ static char *compiler_core_direct_exec_callee_symbol(const CompilerCoreBundle *b
             compiler_core_importc_symbol_text(bundle->program.routine_signatures.items[routine_idx],
                                               bundle->program.routine_names.items[routine_idx]);
         if (compiler_core_importc_symbol_allows_direct_exec(symbol_name)) {
-            call_symbol = machine_libc_symbol_name(target_triple, symbol_name);
+            const char *direct_symbol_name =
+                strcmp(symbol_name, "driver_c_cli_param1_eq_bridge") == 0 ?
+                    "driver_c_cli_param1_eq_raw_bridge" :
+                    symbol_name;
+            call_symbol = machine_libc_symbol_name(target_triple, direct_symbol_name);
         }
         free(symbol_name);
         return call_symbol;
@@ -9091,6 +9535,9 @@ static char *compiler_core_multiline_alias_call_symbol(const CompilerCoreBundle 
     memset(&body_lines, 0, sizeof(body_lines));
     memset(&active_lines, 0, sizeof(active_lines));
     *out_words = NULL;
+    if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 2, 3)) {
+        return NULL;
+    }
     if (body_text == NULL || strchr(body_text, '\n') == NULL) {
         return NULL;
     }
@@ -9890,6 +10337,11 @@ static char *compiler_core_direct_exec_words(const CompilerCoreBundle *bundle,
             free(trimmed);
             return multiline_words;
         }
+        if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 1, 2)) {
+            string_list_free(&param_names);
+            free(trimmed);
+            return NULL;
+        }
     }
     if (starts_with(trimmed, "return")) {
         expr = trim_copy(trimmed + strlen("return"), trimmed + strlen(trimmed));
@@ -10244,6 +10696,56 @@ static char *compiler_core_direct_exec_void_call_cstring_payload(const CompilerC
     return payload;
 }
 
+static char *compiler_core_direct_exec_nested_call_cstring_payload(const CompilerCoreBundle *bundle,
+                                                                   size_t routine_idx) {
+    const char *body = bundle->program.routine_first_body_lines.items[routine_idx];
+    char *trimmed = trim_copy(body, body + strlen(body));
+    char *expr = NULL;
+    char *outer_arg_text = NULL;
+    char *payload = NULL;
+    const char *outer_name_end = NULL;
+    int outer_open_idx = -1;
+    int outer_close_idx = -1;
+    if (!starts_with(trimmed, "return ")) {
+        free(trimmed);
+        return NULL;
+    }
+    expr = trim_copy(trimmed + strlen("return"), trimmed + strlen(trimmed));
+    outer_name_end = parse_call_name_end(expr);
+    outer_open_idx = (int)(outer_name_end - expr);
+    if (outer_open_idx <= 0 || expr[outer_open_idx] != '(') {
+        free(expr);
+        free(trimmed);
+        return NULL;
+    }
+    outer_close_idx = find_matching_delimiter_text(expr, outer_open_idx, '(', ')');
+    if (outer_close_idx < 0 || expr[outer_close_idx + 1] != '\0') {
+        free(expr);
+        free(trimmed);
+        return NULL;
+    }
+    outer_arg_text = trim_copy(expr + outer_open_idx + 1, expr + outer_close_idx);
+    {
+        StringList parts = split_top_level_segments_text(outer_arg_text, ',');
+        if (parts.len == 2) {
+            const char *inner_name_end = parse_call_name_end(parts.items[0]);
+            int inner_open_idx = (int)(inner_name_end - parts.items[0]);
+            if (inner_open_idx > 0 && parts.items[0][inner_open_idx] == '(') {
+                int inner_close_idx =
+                    find_matching_delimiter_text(parts.items[0], inner_open_idx, '(', ')');
+                if (inner_close_idx >= 0 && parts.items[0][inner_close_idx + 1] == '\0') {
+                    payload = compiler_core_parse_string_literal_expr(parts.items[1]);
+                }
+            }
+        }
+        string_list_free(&parts);
+    }
+    free(outer_arg_text);
+    free(expr);
+    free(trimmed);
+    return payload;
+}
+
 static int compiler_core_multiline_fallback_call_symbols(const CompilerCoreBundle *bundle,
                                                          size_t item_idx,
                                                          size_t routine_idx,
@@ -10267,6 +10769,12 @@ static int compiler_core_multiline_fallback_call_symbols(const CompilerCoreBundl
     *out_call_symbol0 = NULL;
     *out_call_symbol1 = NULL;
     memset(&param_names, 0, sizeof(param_names));
+    if (!compiler_core_direct_call_return_type_supported(bundle->program.routine_return_type_texts.items[routine_idx])) {
+        return 0;
+    }
+    if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 4, 4)) {
+        return 0;
+    }
     parse_compiler_routine_signature_param_names(signature, &param_names);
     if (body_text == NULL || strchr(body_text, '\n') == NULL) {
         return 0;
@@ -10655,25 +11163,27 @@ static int compiler_core_match_nested_void_call_expr_text(const CompilerCoreBund
     outer_callee = trim_copy(expr, expr + outer_open_idx);
     outer_arg_text = trim_copy(expr + outer_open_idx + 1, expr + outer_close_idx);
     outer_parts = split_top_level_segments_text(outer_arg_text, ',');
-    if (outer_parts.len != 2) {
+    if (outer_parts.len != 1 && outer_parts.len != 2) {
         goto cleanup;
     }
     inner_expr = xstrdup_text(outer_parts.items[0]);
-    if (!compiler_core_match_simple_value_expr(outer_parts.items[1],
-                                               param_names,
-                                               out_outer_arg_kind,
-                                               out_outer_arg_primary_text,
-                                               out_outer_arg0)) {
-        goto cleanup;
-    }
-    outer_arg_type = compiler_core_direct_arg_type_text(current_signature,
-                                                        *out_outer_arg_kind,
-                                                        *out_outer_arg_primary_text,
-                                                        *out_outer_arg0);
-    if (outer_arg_type != NULL &&
-        strcmp(outer_arg_type, "nil") != 0 &&
-        compiler_core_direct_type_reg_width(outer_arg_type) != 1) {
-        goto cleanup;
+    if (outer_parts.len == 2) {
+        if (!compiler_core_match_simple_value_expr(outer_parts.items[1],
+                                                   param_names,
+                                                   out_outer_arg_kind,
+                                                   out_outer_arg_primary_text,
+                                                   out_outer_arg0)) {
+            goto cleanup;
+        }
+        outer_arg_type = compiler_core_direct_arg_type_text(current_signature,
+                                                            *out_outer_arg_kind,
+                                                            *out_outer_arg_primary_text,
+                                                            *out_outer_arg0);
+        if (outer_arg_type != NULL &&
+            strcmp(outer_arg_type, "nil") != 0 &&
+            compiler_core_direct_type_reg_width(outer_arg_type) != 1) {
+            goto cleanup;
+        }
     }
     inner_name_end = parse_call_name_end(inner_expr);
     inner_open_idx = (int)(inner_name_end - inner_expr);
@@ -10718,13 +11228,19 @@ static int compiler_core_match_nested_void_call_expr_text(const CompilerCoreBund
     outer_arg_kinds[0] = "resolved_type";
     outer_arg_primary_texts[0] = bundle->program.routine_return_type_texts.items[inner_routine_idx];
     outer_arg_arg0s[0] = -1;
-    outer_arg_kinds[1] = *out_outer_arg_kind;
-    outer_arg_primary_texts[1] = *out_outer_arg_primary_text;
-    outer_arg_arg0s[1] = *out_outer_arg0;
+    if (outer_parts.len == 2) {
+        outer_arg_kinds[1] = *out_outer_arg_kind;
+        outer_arg_primary_texts[1] = *out_outer_arg_primary_text;
+        outer_arg_arg0s[1] = *out_outer_arg0;
+    } else {
+        outer_arg_kinds[1] = NULL;
+        outer_arg_primary_texts[1] = NULL;
+        outer_arg_arg0s[1] = -1;
+    }
     outer_routine_idx = compiler_core_find_routine_index_by_call(bundle,
                                                                  outer_callee,
                                                                  current_signature,
-                                                                 2,
+                                                                 (int)outer_parts.len,
                                                                  outer_arg_kinds,
                                                                  outer_arg_primary_texts,
                                                                  outer_arg_arg0s);
@@ -10732,9 +11248,12 @@ static int compiler_core_match_nested_void_call_expr_text(const CompilerCoreBund
         goto cleanup;
     }
     outer_param0_type = compiler_core_signature_param_type_text(bundle->program.routine_signatures.items[outer_routine_idx], 0);
-    outer_param1_type = compiler_core_signature_param_type_text(bundle->program.routine_signatures.items[outer_routine_idx], 1);
+    if (outer_parts.len == 2) {
+        outer_param1_type = compiler_core_signature_param_type_text(bundle->program.routine_signatures.items[outer_routine_idx], 1);
+    }
     if (compiler_core_direct_type_reg_width(outer_param0_type) != 1 ||
-        compiler_core_direct_type_reg_width(outer_param1_type) != 1) {
+        (outer_parts.len == 2 &&
+         compiler_core_direct_type_reg_width(outer_param1_type) != 1)) {
         goto cleanup;
     }
     inner_symbol = compiler_core_direct_exec_callee_symbol_for_call(bundle,
@@ -10750,7 +11269,7 @@ static int compiler_core_match_nested_void_call_expr_text(const CompilerCoreBund
                                                                     (int)item_idx,
                                                                     outer_callee,
                                                                     current_signature,
-                                                                    2,
+                                                                    (int)outer_parts.len,
                                                                     outer_arg_kinds,
                                                                     outer_arg_primary_texts,
                                                                     outer_arg_arg0s,
@@ -10794,6 +11313,193 @@ cleanup:
     return ok;
 }
 
+static int compiler_core_match_nested_call_trailing_cstring_arg_expr_text(const CompilerCoreBundle *bundle,
+                                                                          size_t item_idx,
+                                                                          const char *expr,
+                                                                          const char *current_signature,
+                                                                          const StringList *param_names,
+                                                                          const char *target_triple,
+                                                                          int *out_inner_arg_count,
+                                                                          char **out_call_symbol0,
+                                                                          char **out_call_symbol1,
+                                                                          char **out_inner_arg_kinds,
+                                                                          char **out_inner_arg_primary_texts,
+                                                                          int *out_inner_arg_arg0s,
+                                                                          char **out_payload_text) {
+    char *outer_callee = NULL;
+    char *outer_arg_text = NULL;
+    char *inner_expr = NULL;
+    char *inner_callee = NULL;
+    char *inner_arg_text = NULL;
+    char *inner_symbol = NULL;
+    char *outer_symbol = NULL;
+    char *outer_param0_type = NULL;
+    char *outer_param1_type = NULL;
+    char *payload_text = NULL;
+    const char *outer_arg_kinds[2];
+    const char *outer_arg_primary_texts[2];
+    int outer_arg_arg0s[2];
+    StringList outer_parts;
+    StringList inner_parts;
+    const char *outer_name_end;
+    const char *inner_name_end;
+    int outer_open_idx;
+    int inner_open_idx;
+    int outer_close_idx;
+    int inner_close_idx;
+    int outer_routine_idx;
+    int inner_routine_idx;
+    int inner_arg_count = 0;
+    int ok = 0;
+    memset(&outer_parts, 0, sizeof(outer_parts));
+    memset(&inner_parts, 0, sizeof(inner_parts));
+    *out_inner_arg_count = 0;
+    *out_call_symbol0 = NULL;
+    *out_call_symbol1 = NULL;
+    *out_payload_text = NULL;
+    for (int i = 0; i < 4; ++i) {
+        out_inner_arg_kinds[i] = NULL;
+        out_inner_arg_primary_texts[i] = NULL;
+        out_inner_arg_arg0s[i] = -1;
+    }
+    outer_name_end = parse_call_name_end(expr);
+    outer_open_idx = (int)(outer_name_end - expr);
+    if (outer_open_idx <= 0 || expr[outer_open_idx] != '(') {
+        goto cleanup;
+    }
+    outer_close_idx = find_matching_delimiter_text(expr, outer_open_idx, '(', ')');
+    if (outer_close_idx < 0 || expr[outer_close_idx + 1] != '\0') {
+        goto cleanup;
+    }
+    outer_callee = trim_copy(expr, expr + outer_open_idx);
+    outer_arg_text = trim_copy(expr + outer_open_idx + 1, expr + outer_close_idx);
+    outer_parts = split_top_level_segments_text(outer_arg_text, ',');
+    if (outer_parts.len != 2) {
+        goto cleanup;
+    }
+    inner_expr = xstrdup_text(outer_parts.items[0]);
+    payload_text = compiler_core_parse_string_literal_expr(outer_parts.items[1]);
+    if (payload_text == NULL) {
+        goto cleanup;
+    }
+    inner_name_end = parse_call_name_end(inner_expr);
+    inner_open_idx = (int)(inner_name_end - inner_expr);
+    if (inner_open_idx <= 0 || inner_expr[inner_open_idx] != '(') {
+        goto cleanup;
+    }
+    inner_close_idx = find_matching_delimiter_text(inner_expr, inner_open_idx, '(', ')');
+    if (inner_close_idx < 0 || inner_expr[inner_close_idx + 1] != '\0') {
+        goto cleanup;
+    }
+    inner_callee = trim_copy(inner_expr, inner_expr + inner_open_idx);
+    inner_arg_text = trim_copy(inner_expr + inner_open_idx + 1, inner_expr + inner_close_idx);
+    if (inner_arg_text[0] != '\0') {
+        inner_parts = split_top_level_segments_text(inner_arg_text, ',');
+    }
+    inner_arg_count = (int)inner_parts.len;
+    if (inner_arg_count > 4) {
+        goto cleanup;
+    }
+    for (int i = 0; i < inner_arg_count; ++i) {
+        if (!compiler_core_match_simple_value_expr(inner_parts.items[i],
+                                                   param_names,
+                                                   &out_inner_arg_kinds[i],
+                                                   &out_inner_arg_primary_texts[i],
+                                                   &out_inner_arg_arg0s[i])) {
+            goto cleanup;
+        }
+    }
+    inner_routine_idx = compiler_core_find_routine_index_by_call(bundle,
+                                                                 inner_callee,
+                                                                 current_signature,
+                                                                 inner_arg_count,
+                                                                 (const char *const *)out_inner_arg_kinds,
+                                                                 (const char *const *)out_inner_arg_primary_texts,
+                                                                 out_inner_arg_arg0s);
+    if (inner_routine_idx < 0) {
+        goto cleanup;
+    }
+    if (!compiler_core_type_matches(bundle->program.routine_return_type_texts.items[inner_routine_idx], "str")) {
+        goto cleanup;
+    }
+    outer_arg_kinds[0] = "resolved_type";
+    outer_arg_primary_texts[0] = bundle->program.routine_return_type_texts.items[inner_routine_idx];
+    outer_arg_arg0s[0] = -1;
+    outer_arg_kinds[1] = "load_str";
+    outer_arg_primary_texts[1] = payload_text;
+    outer_arg_arg0s[1] = -1;
+    outer_routine_idx = compiler_core_find_routine_index_by_call(bundle,
+                                                                 outer_callee,
+                                                                 current_signature,
+                                                                 2,
+                                                                 outer_arg_kinds,
+                                                                 outer_arg_primary_texts,
+                                                                 outer_arg_arg0s);
+    if (outer_routine_idx < 0) {
+        goto cleanup;
+    }
+    outer_param0_type =
+        compiler_core_signature_param_type_text(bundle->program.routine_signatures.items[outer_routine_idx], 0);
+    outer_param1_type =
+        compiler_core_signature_param_type_text(bundle->program.routine_signatures.items[outer_routine_idx], 1);
+    if (!compiler_core_type_matches(outer_param0_type, "str") ||
+        !compiler_core_type_matches(outer_param1_type, "str")) {
+        goto cleanup;
+    }
+    inner_symbol = compiler_core_direct_exec_callee_symbol_for_call(bundle,
+                                                                    (int)item_idx,
+                                                                    inner_callee,
+                                                                    current_signature,
+                                                                    inner_arg_count,
+                                                                    (const char *const *)out_inner_arg_kinds,
+                                                                    (const char *const *)out_inner_arg_primary_texts,
+                                                                    out_inner_arg_arg0s,
+                                                                    target_triple);
+    outer_symbol = compiler_core_direct_exec_callee_symbol_for_call(bundle,
+                                                                    (int)item_idx,
+                                                                    outer_callee,
+                                                                    current_signature,
+                                                                    2,
+                                                                    outer_arg_kinds,
+                                                                    outer_arg_primary_texts,
+                                                                    outer_arg_arg0s,
+                                                                    target_triple);
+    if (inner_symbol == NULL || outer_symbol == NULL) {
+        goto cleanup;
+    }
+    *out_inner_arg_count = inner_arg_count;
+    *out_call_symbol0 = inner_symbol;
+    *out_call_symbol1 = outer_symbol;
+    *out_payload_text = payload_text;
+    inner_symbol = NULL;
+    outer_symbol = NULL;
+    payload_text = NULL;
+    ok = 1;
+cleanup:
+    if (!ok) {
+        for (int i = 0; i < 4; ++i) {
+            free(out_inner_arg_kinds[i]);
+            free(out_inner_arg_primary_texts[i]);
+            out_inner_arg_kinds[i] = NULL;
+            out_inner_arg_primary_texts[i] = NULL;
+            out_inner_arg_arg0s[i] = -1;
+        }
+        free(inner_symbol);
+        free(outer_symbol);
+    }
+    free(outer_param0_type);
+    free(outer_param1_type);
+    free(payload_text);
+    free(inner_arg_text);
+    free(inner_callee);
+    free(inner_expr);
+    free(outer_arg_text);
+    free(outer_callee);
+    string_list_free(&outer_parts);
+    string_list_free(&inner_parts);
+    return ok;
+}
+
 static int compiler_core_direct_exec_nested_call_symbols(const CompilerCoreBundle *bundle,
                                                          size_t item_idx,
                                                          size_t routine_idx,
@@ -10811,12 +11517,24 @@ static int compiler_core_direct_exec_nested_call_symbols(const CompilerCoreBundl
     char *arg_primary_texts[4];
     int arg_arg0s[4];
     int arg_count = 0;
+    char *outer_arg_kind = NULL;
+    char *outer_arg_primary_text = NULL;
+    int outer_arg0 = -1;
+    char *outer_cstring_payload = NULL;
     memset(&param_names, 0, sizeof(param_names));
     memset(arg_kinds, 0, sizeof(arg_kinds));
     memset(arg_primary_texts, 0, sizeof(arg_primary_texts));
     *out_words = NULL;
     *out_call_symbol0 = NULL;
     *out_call_symbol1 = NULL;
+    if (!compiler_core_direct_call_return_type_supported(bundle->program.routine_return_type_texts.items[routine_idx])) {
+        free(trimmed);
+        return 0;
+    }
+    if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 2, 3)) {
+        free(trimmed);
+        return 0;
+    }
     parse_compiler_routine_signature_param_names(signature, &param_names);
     if (starts_with(trimmed, "return ")) {
         expr = trim_copy(trimmed + strlen("return"), trimmed + strlen(trimmed));
@@ -10914,10 +11632,84 @@ static int compiler_core_direct_exec_nested_call_symbols(const CompilerCoreBundl
             *out_call_symbol1 = NULL;
         }
     }
+    if (!ok &&
+        compiler_core_match_nested_void_call_expr_text(bundle,
+                                                       item_idx,
+                                                       expr,
+                                                       signature,
+                                                       &param_names,
+                                                       target_triple,
+                                                       &arg_count,
+                                                       out_call_symbol0,
+                                                       out_call_symbol1,
+                                                       arg_kinds,
+                                                       arg_primary_texts,
+                                                       arg_arg0s,
+                                                       &outer_arg_kind,
+                                                       &outer_arg_primary_text,
+                                                       &outer_arg0)) {
+        *out_words =
+            machine_direct_nested_call_trailing_simple_arg_words(machine_target_architecture(target_triple),
+                                                                 arg_count,
+                                                                 (const char **)arg_kinds,
+                                                                 (const char **)arg_primary_texts,
+                                                                 arg_arg0s,
+                                                                 outer_arg_kind,
+                                                                 outer_arg_primary_text,
+                                                                 outer_arg0);
+        if (*out_words != NULL) {
+            ok = 1;
+        } else {
+            free(*out_call_symbol0);
+            free(*out_call_symbol1);
+            *out_call_symbol0 = NULL;
+            *out_call_symbol1 = NULL;
+            free(outer_arg_kind);
+            free(outer_arg_primary_text);
+            outer_arg_kind = NULL;
+            outer_arg_primary_text = NULL;
+            outer_arg0 = -1;
+        }
+    }
+    if (!ok &&
+        compiler_core_match_nested_call_trailing_cstring_arg_expr_text(bundle,
+                                                                       item_idx,
+                                                                       expr,
+                                                                       signature,
+                                                                       &param_names,
+                                                                       target_triple,
+                                                                       &arg_count,
+                                                                       out_call_symbol0,
+                                                                       out_call_symbol1,
+                                                                       arg_kinds,
+                                                                       arg_primary_texts,
+                                                                       arg_arg0s,
+                                                                       &outer_cstring_payload)) {
+        *out_words =
+            machine_direct_nested_call_trailing_cstring_arg_words(machine_target_architecture(target_triple),
+                                                                  arg_count,
+                                                                  (const char **)arg_kinds,
+                                                                  (const char **)arg_primary_texts,
+                                                                  arg_arg0s,
+                                                                  (int)strlen(outer_cstring_payload));
+        if (*out_words != NULL) {
+            ok = 1;
+        } else {
+            free(*out_call_symbol0);
+            free(*out_call_symbol1);
+            *out_call_symbol0 = NULL;
+            *out_call_symbol1 = NULL;
+            free(outer_cstring_payload);
+            outer_cstring_payload = NULL;
+        }
+    }
     for (int i = 0; i < 4; ++i) {
         free(arg_kinds[i]);
         free(arg_primary_texts[i]);
     }
+    free(outer_arg_kind);
+    free(outer_arg_primary_text);
+    free(outer_cstring_payload);
     string_list_free(&param_names);
     free(expr);
     free(trimmed);
@@ -10949,6 +11741,14 @@ static int compiler_core_direct_exec_nested_void_call_symbols(const CompilerCore
     *out_words = NULL;
     *out_call_symbol0 = NULL;
     *out_call_symbol1 = NULL;
+    if (!compiler_core_direct_call_return_type_supported(bundle->program.routine_return_type_texts.items[routine_idx])) {
+        free(trimmed);
+        return 0;
+    }
+    if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 2, 3)) {
+        free(trimmed);
+        return 0;
+    }
     parse_compiler_routine_signature_param_names(signature, &param_names);
     if (compiler_core_match_nested_void_call_expr_text(bundle,
                                                        item_idx,
@@ -10965,15 +11765,24 @@ static int compiler_core_direct_exec_nested_void_call_symbols(const CompilerCore
                                                        &outer_arg_kind,
                                                        &outer_arg_primary_text,
                                                        &outer_arg0)) {
-        *out_words =
-            machine_direct_nested_call_trailing_simple_arg_void_words(machine_target_architecture(target_triple),
-                                                                      inner_arg_count,
-                                                                      (const char **)inner_arg_kinds,
-                                                                      (const char **)inner_arg_primary_texts,
-                                                                      inner_arg_arg0s,
-                                                                      outer_arg_kind,
-                                                                      outer_arg_primary_text,
-                                                                      outer_arg0);
+        if (outer_arg_kind == NULL) {
+            *out_words =
+                machine_direct_nested_call_void_words(machine_target_architecture(target_triple),
+                                                      inner_arg_count,
+                                                      (const char **)inner_arg_kinds,
+                                                      (const char **)inner_arg_primary_texts,
+                                                      inner_arg_arg0s);
+        } else {
+            *out_words =
+                machine_direct_nested_call_trailing_simple_arg_void_words(machine_target_architecture(target_triple),
+                                                                          inner_arg_count,
+                                                                          (const char **)inner_arg_kinds,
+                                                                          (const char **)inner_arg_primary_texts,
+                                                                          inner_arg_arg0s,
+                                                                          outer_arg_kind,
+                                                                          outer_arg_primary_text,
+                                                                          outer_arg0);
+        }
         if (*out_words != NULL) {
             ok = 1;
         } else {
@@ -11020,6 +11829,12 @@ static int compiler_core_direct_exec_if_else_call_symbols(const CompilerCoreBund
     *out_call_symbol0 = NULL;
     *out_call_symbol1 = NULL;
     *out_call_symbol2 = NULL;
+    if (!compiler_core_direct_call_return_type_supported(bundle->program.routine_return_type_texts.items[routine_idx])) {
+        return 0;
+    }
+    if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 3, 5)) {
+        return 0;
+    }
     if (body_text == NULL || strchr(body_text, '\n') == NULL) {
         return 0;
     }
@@ -11096,6 +11911,104 @@ static int compiler_core_direct_exec_if_else_call_symbols(const CompilerCoreBund
                             free(callee);
                         }
                     }
+                }
+                if (!ok) {
+                    char *const_kind = NULL;
+                    char *const_primary = NULL;
+                    int const_arg0 = -1;
+                    char *return_expr = NULL;
+                    if (starts_with(then_lines.items[0], "return ")) {
+                        return_expr = trim_copy(then_lines.items[0] + strlen("return "),
+                                                then_lines.items[0] + strlen(then_lines.items[0]));
+                        if (compiler_core_match_simple_value_expr(return_expr,
+                                                                  &empty_param_names,
+                                                                  &const_kind,
+                                                                  &const_primary,
+                                                                  &const_arg0) &&
+                            compiler_core_is_direct_const_value_kind(const_kind) &&
+                            compiler_core_match_return_zero_arg_call_line(bundle,
+                                                                          item_idx,
+                                                                          else_lines.items[0],
+                                                                          target_triple,
+                                                                          out_call_symbol1)) {
+                            const char *name_end = parse_call_name_end(cond_text);
+                            int open_idx = (int)(name_end - cond_text);
+                            if (open_idx > 0 && cond_text[open_idx] == '(') {
+                                int close_idx = find_matching_delimiter_text(cond_text, open_idx, '(', ')');
+                                if (close_idx >= 0 && cond_text[close_idx + 1] == '\0') {
+                                    char *callee = trim_copy(cond_text, cond_text + open_idx);
+                                    char *arg_text = trim_copy(cond_text + open_idx + 1, cond_text + close_idx);
+                                    if (arg_text[0] == '\0') {
+                                        call_symbol =
+                                            compiler_core_direct_exec_callee_symbol(bundle, item_idx, callee, target_triple);
+                                        if (call_symbol != NULL) {
+                                            *out_call_symbol0 = call_symbol;
+                                            *out_words =
+                                                machine_direct_if_else_const_then_call_words(machine_target_architecture(target_triple),
+                                                                                             const_kind,
+                                                                                             const_primary,
+                                                                                             const_arg0);
+                                            ok = *out_words != NULL;
+                                        }
+                                    }
+                                    free(arg_text);
+                                    free(callee);
+                                }
+                            }
+                        }
+                    }
+                    free(return_expr);
+                    free(const_kind);
+                    free(const_primary);
+                }
+                if (!ok) {
+                    char *const_kind = NULL;
+                    char *const_primary = NULL;
+                    int const_arg0 = -1;
+                    char *return_expr = NULL;
+                    if (starts_with(else_lines.items[0], "return ")) {
+                        return_expr = trim_copy(else_lines.items[0] + strlen("return "),
+                                                else_lines.items[0] + strlen(else_lines.items[0]));
+                        if (compiler_core_match_simple_value_expr(return_expr,
+                                                                  &empty_param_names,
+                                                                  &const_kind,
+                                                                  &const_primary,
+                                                                  &const_arg0) &&
+                            compiler_core_is_direct_const_value_kind(const_kind) &&
+                            compiler_core_match_return_zero_arg_call_line(bundle,
+                                                                          item_idx,
+                                                                          then_lines.items[0],
+                                                                          target_triple,
+                                                                          out_call_symbol1)) {
+                            const char *name_end = parse_call_name_end(cond_text);
+                            int open_idx = (int)(name_end - cond_text);
+                            if (open_idx > 0 && cond_text[open_idx] == '(') {
+                                int close_idx = find_matching_delimiter_text(cond_text, open_idx, '(', ')');
+                                if (close_idx >= 0 && cond_text[close_idx + 1] == '\0') {
+                                    char *callee = trim_copy(cond_text, cond_text + open_idx);
+                                    char *arg_text = trim_copy(cond_text + open_idx + 1, cond_text + close_idx);
+                                    if (arg_text[0] == '\0') {
+                                        call_symbol =
+                                            compiler_core_direct_exec_callee_symbol(bundle, item_idx, callee, target_triple);
+                                        if (call_symbol != NULL) {
+                                            *out_call_symbol0 = call_symbol;
+                                            *out_words =
+                                                machine_direct_if_else_call_then_const_words(machine_target_architecture(target_triple),
+                                                                                             const_kind,
+                                                                                             const_primary,
+                                                                                             const_arg0);
+                                            ok = *out_words != NULL;
+                                        }
+                                    }
+                                    free(arg_text);
+                                    free(callee);
+                                }
+                            }
+                        }
+                    }
+                    free(return_expr);
+                    free(const_kind);
+                    free(const_primary);
                 }
                 if (!ok) {
                     free(call_symbol);
@@ -11206,64 +12119,124 @@ static char *compiler_core_direct_exec_call_symbol(const CompilerCoreBundle *bun
     (void)item_idx;
     parse_compiler_routine_signature_param_names(signature, &param_names);
     *out_words = NULL;
+    if (!compiler_core_direct_call_return_type_supported(bundle->program.routine_return_type_texts.items[routine_idx])) {
+        string_list_free(&param_names);
+        free(trimmed);
+        return NULL;
+    }
     if (body_text != NULL && strchr(body_text, '\n') != NULL) {
-        char *multiline_symbol =
-            compiler_core_multiline_alias_call_symbol(bundle,
-                                                      item_idx,
-                                                      routine_idx,
-                                                      target_triple,
-                                                      &param_names,
-                                                      0,
-                                                      out_words);
-        if (multiline_symbol != NULL && *out_words != NULL) {
-            string_list_free(&param_names);
-            free(trimmed);
-            return multiline_symbol;
-        }
-        free(multiline_symbol);
-        free(*out_words);
-        *out_words = NULL;
-        {
-            StringList body_lines;
-            StringList active_lines;
-            memset(&body_lines, 0, sizeof(body_lines));
-            memset(&active_lines, 0, sizeof(active_lines));
-            split_text_lines(body_text, &body_lines);
-            for (size_t i = 0; i < body_lines.len; ++i) {
-                if (!is_blank_or_comment_line(body_lines.items[i])) {
-                    string_list_push_copy(&active_lines, body_lines.items[i]);
-                }
-            }
-            if (active_lines.len == 2) {
-                char *line0 = trim_copy(active_lines.items[0], active_lines.items[0] + strlen(active_lines.items[0]));
-                char *line1 = trim_copy(active_lines.items[1], active_lines.items[1] + strlen(active_lines.items[1]));
-                char *const_kind = NULL;
-                char *const_primary = NULL;
-                int const_arg0 = -1;
-                if (starts_with(line1, "return ") &&
-                    compiler_core_match_simple_value_expr(line1 + strlen("return "),
+        if (compiler_core_direct_text_match_allowed(bundle, routine_idx, 2, 3)) {
+            char *multiline_symbol =
+                compiler_core_multiline_alias_call_symbol(bundle,
+                                                          item_idx,
+                                                          routine_idx,
+                                                          target_triple,
                                                           &param_names,
-                                                          &const_kind,
-                                                          &const_primary,
-                                                          &const_arg0) &&
-                    compiler_core_is_direct_const_value_kind(const_kind)) {
-                    const char *name_end = parse_call_name_end(line0);
-                    int open_idx = (int)(name_end - line0);
-                    if (open_idx > 0 && line0[open_idx] == '(') {
-                        int close_idx = find_matching_delimiter_text(line0, open_idx, '(', ')');
-                        if (close_idx >= 0 && line0[close_idx + 1] == '\0') {
-                            char *callee = trim_copy(line0, line0 + open_idx);
-                            char *arg_text = trim_copy(line0 + open_idx + 1, line0 + close_idx);
-                            if (arg_text[0] == '\0') {
-                                char *call_symbol =
-                                    compiler_core_direct_exec_callee_symbol(bundle, (int)item_idx, callee, target_triple);
-                                if (call_symbol != NULL) {
-                                    *out_words =
-                                        machine_direct_call_void_then_const_words(machine_target_architecture(target_triple),
-                                                                                  const_kind,
-                                                                                  const_primary,
-                                                                                  const_arg0);
-                                    if (*out_words != NULL) {
+                                                          0,
+                                                          out_words);
+            if (multiline_symbol != NULL && *out_words != NULL) {
+                string_list_free(&param_names);
+                free(trimmed);
+                return multiline_symbol;
+            }
+            free(multiline_symbol);
+            free(*out_words);
+            *out_words = NULL;
+            {
+                StringList body_lines;
+                StringList active_lines;
+                memset(&body_lines, 0, sizeof(body_lines));
+                memset(&active_lines, 0, sizeof(active_lines));
+                split_text_lines(body_text, &body_lines);
+                for (size_t i = 0; i < body_lines.len; ++i) {
+                    if (!is_blank_or_comment_line(body_lines.items[i])) {
+                        string_list_push_copy(&active_lines, body_lines.items[i]);
+                    }
+                }
+                if (active_lines.len == 2) {
+                    char *line0 = trim_copy(active_lines.items[0], active_lines.items[0] + strlen(active_lines.items[0]));
+                    char *line1 = trim_copy(active_lines.items[1], active_lines.items[1] + strlen(active_lines.items[1]));
+                    char *const_kind = NULL;
+                    char *const_primary = NULL;
+                    int const_arg0 = -1;
+                    if (starts_with(line1, "return ") &&
+                        compiler_core_match_simple_value_expr(line1 + strlen("return "),
+                                                              &param_names,
+                                                              &const_kind,
+                                                              &const_primary,
+                                                              &const_arg0) &&
+                        compiler_core_is_direct_const_value_kind(const_kind)) {
+                        const char *name_end = parse_call_name_end(line0);
+                        int open_idx = (int)(name_end - line0);
+                        if (open_idx > 0 && line0[open_idx] == '(') {
+                            int close_idx = find_matching_delimiter_text(line0, open_idx, '(', ')');
+                            if (close_idx >= 0 && line0[close_idx + 1] == '\0') {
+                                char *callee = trim_copy(line0, line0 + open_idx);
+                                char *arg_text = trim_copy(line0 + open_idx + 1, line0 + close_idx);
+                                StringList parts = split_top_level_segments_text(arg_text, ',');
+                                if (arg_text[0] == '\0' || parts.len <= 4) {
+                                    char *call_symbol = NULL;
+                                    if (arg_text[0] == '\0') {
+                                        call_symbol =
+                                            compiler_core_direct_exec_callee_symbol(bundle, (int)item_idx, callee, target_triple);
+                                        if (call_symbol != NULL) {
+                                            *out_words =
+                                                machine_direct_call_void_then_const_words(machine_target_architecture(target_triple),
+                                                                                          const_kind,
+                                                                                          const_primary,
+                                                                                          const_arg0);
+                                        }
+                                    } else {
+                                        char *arg_kinds[4] = {0};
+                                        char *arg_primary_texts[4] = {0};
+                                        int arg_arg0s[4] = {-1, -1, -1, -1};
+                                        int args_ok = 1;
+                                        for (size_t part_idx = 0; part_idx < parts.len; ++part_idx) {
+                                            if (!compiler_core_match_simple_value_expr(parts.items[part_idx],
+                                                                                      &param_names,
+                                                                                      &arg_kinds[part_idx],
+                                                                                      &arg_primary_texts[part_idx],
+                                                                                      &arg_arg0s[part_idx])) {
+                                                args_ok = 0;
+                                                break;
+                                            }
+                                        }
+                                        if (args_ok) {
+                                            const char *arg_kind_views[4];
+                                            const char *arg_primary_views[4];
+                                            for (size_t part_idx = 0; part_idx < parts.len; ++part_idx) {
+                                                arg_kind_views[part_idx] = arg_kinds[part_idx];
+                                                arg_primary_views[part_idx] = arg_primary_texts[part_idx];
+                                            }
+                                            call_symbol =
+                                                compiler_core_direct_exec_callee_symbol_for_call(bundle,
+                                                                                                 (int)item_idx,
+                                                                                                 callee,
+                                                                                                 signature,
+                                                                                                 (int)parts.len,
+                                                                                                 arg_kind_views,
+                                                                                                 arg_primary_views,
+                                                                                                 arg_arg0s,
+                                                                                                 target_triple);
+                                            if (call_symbol != NULL) {
+                                                *out_words =
+                                                    machine_direct_call_simple_args_void_then_const_words(machine_target_architecture(target_triple),
+                                                                                                          (int)parts.len,
+                                                                                                          arg_kind_views,
+                                                                                                          arg_primary_views,
+                                                                                                          arg_arg0s,
+                                                                                                          const_kind,
+                                                                                                          const_primary,
+                                                                                                          const_arg0);
+                                            }
+                                        }
+                                        for (size_t part_idx = 0; part_idx < parts.len && part_idx < 4; ++part_idx) {
+                                            free(arg_kinds[part_idx]);
+                                            free(arg_primary_texts[part_idx]);
+                                        }
+                                    }
+                                    if (call_symbol != NULL && *out_words != NULL) {
+                                        string_list_free(&parts);
                                         free(arg_text);
                                         free(callee);
                                         free(const_kind);
@@ -11276,21 +12249,27 @@ static char *compiler_core_direct_exec_call_symbol(const CompilerCoreBundle *bun
                                         string_list_free(&param_names);
                                         return call_symbol;
                                     }
+                                    free(call_symbol);
                                 }
-                                free(call_symbol);
+                                string_list_free(&parts);
+                                free(arg_text);
+                                free(callee);
                             }
-                            free(arg_text);
-                            free(callee);
                         }
                     }
+                    free(const_kind);
+                    free(const_primary);
+                    free(line0);
+                    free(line1);
                 }
-                free(const_kind);
-                free(const_primary);
-                free(line0);
-                free(line1);
+                string_list_free(&active_lines);
+                string_list_free(&body_lines);
             }
-            string_list_free(&active_lines);
-            string_list_free(&body_lines);
+        }
+        if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 1, 2)) {
+            string_list_free(&param_names);
+            free(trimmed);
+            return NULL;
         }
     }
     if (starts_with(trimmed, "return ")) {
@@ -11544,6 +12523,63 @@ static char *compiler_core_direct_exec_call_symbol(const CompilerCoreBundle *bun
                             char *rhs_kind = NULL;
                             char *rhs_primary = NULL;
                             int rhs_arg0 = -1;
+                            char *rhs_cstring = NULL;
+                            int callee_routine_idx = -1;
+                            char *callee_param0_type = NULL;
+                            char *callee_param1_type = NULL;
+                            if (compiler_core_match_simple_value_expr(parts.items[0],
+                                                                      &param_names,
+                                                                      &lhs_kind,
+                                                                      &lhs_primary,
+                                                                      &lhs_arg0)) {
+                                rhs_cstring = compiler_core_parse_string_literal_expr(parts.items[1]);
+                                if (rhs_cstring != NULL) {
+                                    const char *arg_kinds[2] = {lhs_kind, "load_str"};
+                                    const char *arg_primary_texts[2] = {lhs_primary, rhs_cstring};
+                                    int arg_arg0s[2] = {lhs_arg0, -1};
+                                    callee_routine_idx =
+                                        compiler_core_direct_exec_callee_routine_index_for_call(bundle,
+                                                                                                (int)item_idx,
+                                                                                                callee,
+                                                                                                signature,
+                                                                                                2,
+                                                                                                arg_kinds,
+                                                                                                arg_primary_texts,
+                                                                                                arg_arg0s);
+                                    if (callee_routine_idx >= 0) {
+                                        callee_param0_type =
+                                            compiler_core_signature_param_type_text(bundle->program.routine_signatures.items[callee_routine_idx],
+                                                                                    0);
+                                        callee_param1_type =
+                                            compiler_core_signature_param_type_text(bundle->program.routine_signatures.items[callee_routine_idx],
+                                                                                    1);
+                                        if (compiler_core_type_matches(callee_param0_type, "str") &&
+                                            compiler_core_type_matches(callee_param1_type, "str")) {
+                                            *out_words =
+                                                machine_direct_call_second_cstring_arg_words(machine_target_architecture(target_triple),
+                                                                                             (int)strlen(rhs_cstring));
+                                            free(callee_param0_type);
+                                            free(callee_param1_type);
+                                            free(rhs_cstring);
+                                            free(lhs_kind);
+                                            free(lhs_primary);
+                                            string_list_free(&parts);
+                                            free(arg_text);
+                                            free(callee);
+                                            free(expr);
+                                            free(trimmed);
+                                            return call_symbol;
+                                        }
+                                        free(callee_param0_type);
+                                        free(callee_param1_type);
+                                    }
+                                }
+                            }
+                            free(rhs_cstring);
+                            free(lhs_kind);
+                            free(lhs_primary);
+                            lhs_kind = NULL;
+                            lhs_primary = NULL;
                             if (compiler_core_match_simple_value_expr(parts.items[0],
                                                                       &param_names,
                                                                       &lhs_kind,
@@ -11732,22 +12768,29 @@ static char *compiler_core_direct_exec_void_call_symbol(const CompilerCoreBundle
     parse_compiler_routine_signature_param_names(signature, &param_names);
     *out_words = NULL;
     if (body_text != NULL && strchr(body_text, '\n') != NULL) {
-        char *multiline_symbol =
-            compiler_core_multiline_alias_call_symbol(bundle,
-                                                      item_idx,
-                                                      routine_idx,
-                                                      target_triple,
-                                                      &param_names,
-                                                      1,
-                                                      out_words);
-        if (multiline_symbol != NULL && *out_words != NULL) {
+        if (compiler_core_direct_text_match_allowed(bundle, routine_idx, 2, 3)) {
+            char *multiline_symbol =
+                compiler_core_multiline_alias_call_symbol(bundle,
+                                                         item_idx,
+                                                          routine_idx,
+                                                          target_triple,
+                                                          &param_names,
+                                                          1,
+                                                          out_words);
+            if (multiline_symbol != NULL && *out_words != NULL) {
+                string_list_free(&param_names);
+                free(trimmed);
+                return multiline_symbol;
+            }
+            free(multiline_symbol);
+            free(*out_words);
+            *out_words = NULL;
+        }
+        if (!compiler_core_direct_text_match_allowed(bundle, routine_idx, 1, 2)) {
             string_list_free(&param_names);
             free(trimmed);
-            return multiline_symbol;
+            return NULL;
         }
-        free(multiline_symbol);
-        free(*out_words);
-        *out_words = NULL;
     }
     {
         const char *name_end = parse_call_name_end(trimmed);
@@ -12102,6 +13145,8 @@ static MachineModuleBundle build_compiler_core_machine_module(const CompilerCore
             strcmp(bundle->low_plan.binding_scopes.items[i], "iterator_scope") == 0) {
             frame_size += 16;
         }
+        const char *machine_runtime_target =
+            compiler_core_machine_runtime_target(bundle->low_plan.runtime_targets.items[i]);
         binding_summary =
             xformat("top_level=%s|label=%s|proof=%s|effect=%s|scope=%s|"
                     "import_path=%s|import_alias=%s|import_category=%s|"
@@ -12127,7 +13172,7 @@ static MachineModuleBundle build_compiler_core_machine_module(const CompilerCore
         machine_append_function(&out,
                                 bundle->low_plan.item_ids.items[i],
                                 bundle->low_plan.canonical_ops.items[i],
-                                bundle->low_plan.runtime_targets.items[i],
+                                machine_runtime_target,
                                 binding_summary,
                                 frame_size);
         if (current_routine_idx >= 0 &&
@@ -12183,13 +13228,14 @@ static MachineModuleBundle build_compiler_core_machine_module(const CompilerCore
                                                                    &if_else_call_symbol1,
                                                                    &if_else_call_symbol2)) {
                     char *if_else_call_symbols[3];
+                    int if_else_call_symbol_count = if_else_call_symbol2 != NULL ? 3 : 2;
                     if_else_call_symbols[0] = if_else_call_symbol0;
                     if_else_call_symbols[1] = if_else_call_symbol1;
                     if_else_call_symbols[2] = if_else_call_symbol2;
                     machine_rewrite_function_direct_exec_calls(&out,
                                                                (int)out.item_ids.len - 1,
                                                                if_else_call_words,
-                                                               3,
+                                                               if_else_call_symbol_count,
                                                                if_else_call_symbols);
                     free(if_else_call_symbol0);
                     free(if_else_call_symbol1);
@@ -12202,13 +13248,26 @@ static MachineModuleBundle build_compiler_core_machine_module(const CompilerCore
                                                                   &nested_call_symbol0,
                                                                   &nested_call_symbol1)) {
                     char *nested_symbols[2];
+                    char *nested_cstring_payload = NULL;
                     nested_symbols[0] = nested_call_symbol0;
                     nested_symbols[1] = nested_call_symbol1;
-                    machine_rewrite_function_direct_exec_calls(&out,
-                                                               (int)out.item_ids.len - 1,
-                                                               nested_words,
-                                                               2,
-                                                               nested_symbols);
+                    nested_cstring_payload =
+                        compiler_core_direct_exec_nested_call_cstring_payload(bundle, (size_t)current_routine_idx);
+                    if (nested_cstring_payload != NULL) {
+                        machine_rewrite_function_direct_exec_calls_cstring_data(&out,
+                                                                                (int)out.item_ids.len - 1,
+                                                                                nested_words,
+                                                                                2,
+                                                                                nested_symbols,
+                                                                                nested_cstring_payload);
+                        free(nested_cstring_payload);
+                    } else {
+                        machine_rewrite_function_direct_exec_calls(&out,
+                                                                   (int)out.item_ids.len - 1,
+                                                                   nested_words,
+                                                                   2,
+                                                                   nested_symbols);
+                    }
                     free(nested_call_symbol0);
                     free(nested_call_symbol1);
                 } else if (compiler_core_direct_exec_nested_void_call_symbols(bundle,
@@ -13268,7 +14327,8 @@ static void runtime_targets_for_module_kind(const char *module_kind,
                                              "runtime/strings_v2.append",
                                              "runtime/strings_v2.appendByte",
                                              "runtime/strings_v2.finish"};
-    static const char *k_compiler_core_targets[] = {"runtime/compiler_core.argv_entry"};
+    static const char *k_compiler_core_targets[] = {"runtime/compiler_core.argv_entry",
+                                                    "runtime/compiler_core.local_payload_entry"};
     static const char *k_unimaker_targets[] = {"runtime/unimaker.verify_asset_contract",
                                                "runtime/unimaker.spawn_actor",
                                                "runtime/unimaker.register_ganzhi_state",
@@ -13420,7 +14480,10 @@ static const char *system_link_exec_version(void) {
     return "v2.system_link_exec.v1";
 }
 
-static const char *system_linker_path(const char *linker_flavor) {
+static const char *system_linker_path(const char *linker_flavor, const char *emit_kind) {
+    if (strcmp(linker_flavor, "ld64") == 0 && strcmp(emit_kind, "exe") == 0) {
+        return "/usr/bin/cc";
+    }
     if (strcmp(linker_flavor, "ld64") == 0) {
         return "/usr/bin/ld";
     }
@@ -13444,6 +14507,25 @@ static void build_system_link_exec_argv(const char *target_triple,
                                         StringList *argv) {
     size_t i;
     memset(argv, 0, sizeof(*argv));
+    if (strcmp(linker_flavor, "ld64") == 0 && strcmp(emit_kind, "exe") == 0) {
+        string_list_push_copy(argv, "-arch");
+        string_list_push_copy(argv, machine_target_darwin_arch_name(target_triple));
+        string_list_pushf(argv, "-mmacosx-version-min=%s", machine_target_darwin_minos_text(target_triple));
+        if (syslibroot_path != NULL && syslibroot_path[0] != '\0') {
+            string_list_push_copy(argv, "-isysroot");
+            string_list_push_copy(argv, syslibroot_path);
+        }
+        string_list_push_copy(argv, "-o");
+        string_list_push_copy(argv, output_path);
+        string_list_push_copy(argv, primary_obj_path);
+        for (i = 0; i < provider_obj_paths->len; ++i) {
+            string_list_push_copy(argv, provider_obj_paths->items[i]);
+        }
+        for (i = 0; i < support_obj_paths->len; ++i) {
+            string_list_push_copy(argv, support_obj_paths->items[i]);
+        }
+        return;
+    }
     if (strcmp(linker_flavor, "ld64") == 0) {
         string_list_push_copy(argv, "-arch");
         string_list_push_copy(argv, machine_target_darwin_arch_name(target_triple));
@@ -13545,16 +14627,10 @@ static void runtime_provider_external_cc_source_files(const char *module_path,
 }
 
 static const char *runtime_provider_source_kind(const char *module_path) {
-    if (strcmp(module_path, "runtime/compiler_core_runtime_v2") == 0) {
-        return "native_c_source";
-    }
     return "cheng_module";
 }
 
 static const char *runtime_provider_compile_mode(const char *module_path) {
-    if (strcmp(module_path, "runtime/compiler_core_runtime_v2") == 0) {
-        return "external_cc_obj";
-    }
     return "machine_obj";
 }
 
@@ -13593,7 +14669,8 @@ static void runtime_targets_for_provider_module(const char *module_path, StringL
                                              "runtime/strings_v2.append",
                                              "runtime/strings_v2.appendByte",
                                              "runtime/strings_v2.finish"};
-    static const char *k_compiler_core_targets[] = {"runtime/compiler_core.argv_entry"};
+    static const char *k_compiler_core_targets[] = {"runtime/compiler_core.argv_entry",
+                                                    "runtime/compiler_core.local_payload_entry"};
     static const char *k_unimaker_targets[] = {"runtime/unimaker.verify_asset_contract",
                                                "runtime/unimaker.spawn_actor",
                                                "runtime/unimaker.register_ganzhi_state",
@@ -13898,7 +14975,7 @@ static RuntimeProviderObjectBundle build_runtime_provider_object(const char *rep
             machine_bundle = build_compiler_core_argv_entry_provider_machine_module(repo_root,
                                                                                     source_abs,
                                                                                     manifest.manifest_cid,
-                                                                                    runtime_targets.items[0],
+                                                                                    &runtime_targets,
                                                                                     target_triple);
         } else {
             machine_bundle = build_runtime_provider_machine_module(module_path,
@@ -13952,10 +15029,16 @@ static RuntimeProviderObjectBundle build_runtime_provider_object(const char *rep
 }
 
 static char *resolve_entry_symbol(const MachineModuleBundle *machine_bundle,
+                                  const char *emit_kind,
                                   const IntList *item_ids,
                                   const StringList *op_names,
                                   const StringList *labels) {
     size_t i;
+    if (strcmp(emit_kind, "exe") == 0 &&
+        strcmp(machine_bundle->module_kind, "compiler_core") == 0 &&
+        strcmp(machine_bundle->obj_format, "macho") == 0) {
+        return xformat("%smain", machine_target_symbol_prefix(machine_bundle->target_triple));
+    }
     if (machine_bundle->entry_symbol_override != NULL && machine_bundle->entry_symbol_override[0] != '\0') {
         return xstrdup_text(machine_bundle->entry_symbol_override);
     }
@@ -14027,6 +15110,7 @@ static SystemLinkPlanBundle build_system_link_plan(const char *repo_root,
     }
     out.entry_required = strcmp(emit_kind, "exe") == 0 ? 1 : 0;
     out.entry_symbol = resolve_entry_symbol(machine_bundle,
+                                            emit_kind,
                                             item_ids,
                                             op_names,
                                             labels);
@@ -16080,7 +17164,7 @@ static int cmd_system_link_exec(const char *repo_root, int argc, char **argv) {
         die("v2 system link exec: plan is not ready for execution");
     }
     linker_flavor = system_linker_flavor(target_raw, emit_raw);
-    linker_path = system_linker_path(linker_flavor);
+    linker_path = system_linker_path(linker_flavor, emit_raw);
     if (out_raw[0] != '\0') {
         resolve_output_path(repo_root, out_raw, output_abs, sizeof(output_abs));
     } else {
@@ -16128,9 +17212,16 @@ static int cmd_system_link_exec(const char *repo_root, int argc, char **argv) {
         static const char *k_support_sources[] = {
             "src/runtime/native/system_helpers_stdio_bridge.c",
             "src/runtime/native/system_helpers_epoch_time_bridge.c",
-            "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c"
+            "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c",
+            "src/runtime/native/system_helpers_selflink_cmdline_bridge.c",
+            "v2/bootstrap/cheng_v2c_tooling.c",
+            "src/runtime/native/system_helpers_selflink_exe_entry_bridge.c"
         };
-        for (i = 0; i < sizeof(k_support_sources) / sizeof(k_support_sources[0]); ++i) {
+        size_t support_source_count = sizeof(k_support_sources) / sizeof(k_support_sources[0]);
+        if (strcmp(emit_raw, "exe") != 0) {
+            support_source_count -= 1;
+        }
+        for (i = 0; i < support_source_count; ++i) {
             StringList support_sources;
             ByteList support_obj_bytes;
             char *support_abs = xformat("%s.support.%zu.o", output_abs, i);

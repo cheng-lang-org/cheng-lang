@@ -116,17 +116,26 @@ fn buildMachineBundleFromSource(sourcePath: str, targetTriple: str): mpipeline.M
         return mpipeline.lowerCompilerCorePlanToMachine(bundle.lowPlan, targetTriple)
     panic("v2 system link exec: no supported surface in " + sourcePath)
 
-fn systemLinkerPath(linkerFlavor: str): str =
+fn systemLinkerPath(linkerFlavor: str, emitKind: str): str =
+    if linkerFlavor == "ld64" && emitKind == "exe":
+        return "/usr/bin/cc"
     if linkerFlavor == "ld64" || linkerFlavor == "lld":
         return "/usr/bin/ld"
     if linkerFlavor == "libtool" || linkerFlavor == "llvm-ar":
         return "/usr/bin/libtool"
     panic("v2 system link exec: unsupported linker flavor " + linkerFlavor)
 
-fn compilerCoreNativeSupportSources(): str[] =
-    return ["src/runtime/native/system_helpers_stdio_bridge.c",
-            "src/runtime/native/system_helpers_epoch_time_bridge.c",
-            "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c"]
+fn compilerCoreNativeSupportSources(emitKind: str): str[] =
+    var out: str[]
+    out = []
+    add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
+    add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
+    add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
+    add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
+    add(out, "v2/bootstrap/cheng_v2c_tooling.c")
+    if emitKind == "exe":
+        add(out, "src/runtime/native/system_helpers_selflink_exe_entry_bridge.c")
+    return out
 
 fn compileNativeSupportObject(sourcePath: str,
                               targetTriple: str,
@@ -178,6 +187,21 @@ fn buildSystemLinkExecArgv(targetTriple: str,
                            supportObjPaths: str[]): str[] =
     var argv: str[]
     argv = []
+    if linkerFlavor == "ld64" && emitKind == "exe":
+        add(argv, "-arch")
+        add(argv, mtarget.machineTargetDarwinArchName(targetTriple))
+        add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
+        if len(syslibrootPath) > 0:
+            add(argv, "-isysroot")
+            add(argv, syslibrootPath)
+        add(argv, "-o")
+        add(argv, outputPath)
+        add(argv, primaryObjPath)
+        for i in 0..<providerObjPaths.len:
+            add(argv, providerObjPaths[i])
+        for i in 0..<supportObjPaths.len:
+            add(argv, supportObjPaths[i])
+        return argv
     if linkerFlavor == "ld64":
         add(argv, "-arch")
         add(argv, mtarget.machineTargetDarwinArchName(targetTriple))
@@ -262,7 +286,7 @@ fn buildSystemLinkExec(sourcePath: str,
         add(providerObjFileCids, provider.objFileCid)
         add(providerObjFileByteCounts, provider.objFileByteCount)
     if artifact.moduleKind == "compiler_core":
-        let supportSources = compilerCoreNativeSupportSources()
+        let supportSources = compilerCoreNativeSupportSources(emitKind)
         for i in 0..<supportSources.len:
             let supportObjPath = actualOutputPath + ".support." + intToStr(i) + ".o"
             let supportObj = compileNativeSupportObject(supportSources[i],
@@ -272,7 +296,7 @@ fn buildSystemLinkExec(sourcePath: str,
             add(supportObjFileCids, supportObj.fileCid)
             add(supportObjFileByteCounts, supportObj.fileByteCount)
     let linkerFlavor = slink.systemLinkerFlavor(targetTriple, emitKind)
-    let linkerPath = systemLinkerPath(linkerFlavor)
+    let linkerPath = systemLinkerPath(linkerFlavor, emitKind)
     var sdkName: str = ""
     var sdkPath: str = ""
     var systemLibraries: str[]

@@ -143,6 +143,17 @@ fn machineTraceProviderWords(architecture: str): str =
         return "a9bf7bfd;910003fd;94000000;52800000;a8c17bfd;d65f03c0"
     panic("v2 machine pipeline: unsupported architecture " + architecture)
 
+fn compilerCoreArgvRuntimeTarget(): str =
+    return "runtime/compiler_core.argv_entry"
+
+fn compilerCoreLocalPayloadRuntimeTarget(): str =
+    return "runtime/compiler_core.local_payload_entry"
+
+fn compilerCoreMachineRuntimeTarget(runtimeTarget: str): str =
+    return if runtimeTarget == compilerCoreArgvRuntimeTarget():
+        compilerCoreLocalPayloadRuntimeTarget() else:
+        runtimeTarget
+
 fn machineAarch64MovWideWord(is64: bool, reg: int32, imm16: int32): str =
     let base = is64 ? 0xd2800000 else: 0x52800000
     return uint32HexLower(base | ((imm16 & 0xffff) << 5) | (reg & 31))
@@ -336,6 +347,22 @@ fn machineDirectCallCStringArgWords(architecture: str, byteLen: int32): str =
         add(words, epilogue[i])
     return joinWordList(words)
 
+fn machineDirectCallSecondCStringArgWords(architecture: str, byteLen: int32): str =
+    if architecture != "aarch64":
+        panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
+    if byteLen < 0 || byteLen > 65535:
+        return ""
+    var words: str[]
+    words = machineAarch64PrologueWords()
+    add(words, machineAarch64AdrpWord(2, 0))
+    add(words, machineAarch64AddImmediateWord(2, 2, 0))
+    add(words, machineAarch64MovInt32Word(3, byteLen))
+    add(words, "94000000")
+    let epilogue = machineAarch64EpilogueWords()
+    for i in 0..<epilogue.len:
+        add(words, epilogue[i])
+    return joinWordList(words)
+
 fn machineDirectCallVoidWords(architecture: str): str =
     if architecture != "aarch64":
         panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
@@ -356,6 +383,27 @@ fn machineDirectCallVoidThenConstWords(architecture: str,
         panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
     var words: str[]
     words = machineAarch64PrologueWords()
+    add(words, "94000000")
+    if !machineAppendLoadSimpleValueWords(architecture, words, 0, constKind, constPrimaryText, constArg0):
+        return ""
+    let epilogue = machineAarch64EpilogueWords()
+    for i in 0..<epilogue.len:
+        add(words, epilogue[i])
+    return joinWordList(words)
+
+fn machineDirectCallSimpleArgsVoidThenConstWords(architecture: str,
+                                                 argKinds: str[],
+                                                 argPrimaryTexts: str[],
+                                                 argArg0s: int32[],
+                                                 constKind: str,
+                                                 constPrimaryText: str,
+                                                 constArg0: int32): str =
+    if architecture != "aarch64":
+        panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
+    var words: str[]
+    words = machineAarch64PrologueWords()
+    if !machineAppendLoadSimpleCallArgsWords(architecture, words, argKinds, argPrimaryTexts, argArg0s):
+        return ""
     add(words, "94000000")
     if !machineAppendLoadSimpleValueWords(architecture, words, 0, constKind, constPrimaryText, constArg0):
         return ""
@@ -746,9 +794,9 @@ fn machineDirectIfElseCallCompareConstRhsWords(architecture: str,
     for i in 0..<epilogue.len:
         add(words, epilogue[i])
     words[falseBranchIdx] =
-        machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx - 1,
+        machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx,
                                      machineAarch64InverseCompareCond(operatorText))
-    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx - 1)
+    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx)
     return joinWordList(words)
 
 fn machineDirectIfElseCallWords(architecture: str): str =
@@ -769,8 +817,60 @@ fn machineDirectIfElseCallWords(architecture: str): str =
     let epilogue = machineAarch64EpilogueWords()
     for i in 0..<epilogue.len:
         add(words, epilogue[i])
-    words[falseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx - 1, "eq")
-    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx - 1)
+    words[falseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx, "eq")
+    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx)
+    return joinWordList(words)
+
+fn machineDirectIfElseConstThenCallWords(architecture: str,
+                                         constKind: str,
+                                         constPrimaryText: str,
+                                         constArg0: int32): str =
+    if architecture != "aarch64":
+        panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
+    var words: str[]
+    words = machineAarch64PrologueWords()
+    add(words, "94000000")
+    add(words, machineAarch64CmpZeroWord(false, 0))
+    let falseBranchIdx = words.len
+    add(words, "")
+    if !machineAppendLoadSimpleValueWords(architecture, words, 0, constKind, constPrimaryText, constArg0):
+        return ""
+    let endBranchIdx = words.len
+    add(words, "")
+    let elseStartIdx = words.len
+    add(words, "94000000")
+    let epilogueStartIdx = words.len
+    let epilogue = machineAarch64EpilogueWords()
+    for i in 0..<epilogue.len:
+        add(words, epilogue[i])
+    words[falseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx, "eq")
+    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx)
+    return joinWordList(words)
+
+fn machineDirectIfElseCallThenConstWords(architecture: str,
+                                         constKind: str,
+                                         constPrimaryText: str,
+                                         constArg0: int32): str =
+    if architecture != "aarch64":
+        panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
+    var words: str[]
+    words = machineAarch64PrologueWords()
+    add(words, "94000000")
+    add(words, machineAarch64CmpZeroWord(false, 0))
+    let falseBranchIdx = words.len
+    add(words, "")
+    add(words, "94000000")
+    let endBranchIdx = words.len
+    add(words, "")
+    let elseStartIdx = words.len
+    if !machineAppendLoadSimpleValueWords(architecture, words, 0, constKind, constPrimaryText, constArg0):
+        return ""
+    let epilogueStartIdx = words.len
+    let epilogue = machineAarch64EpilogueWords()
+    for i in 0..<epilogue.len:
+        add(words, epilogue[i])
+    words[falseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx, "eq")
+    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx)
     return joinWordList(words)
 
 fn machineDirectNestedCallWords(architecture: str,
@@ -785,6 +885,24 @@ fn machineDirectNestedCallWords(architecture: str,
         return ""
     add(words, "94000000")
     add(words, "94000000")
+    let epilogue = machineAarch64EpilogueWords()
+    for i in 0..<epilogue.len:
+        add(words, epilogue[i])
+    return joinWordList(words)
+
+fn machineDirectNestedCallVoidWords(architecture: str,
+                                    argKinds: str[],
+                                    argPrimaryTexts: str[],
+                                    argArg0s: int32[]): str =
+    if architecture != "aarch64":
+        panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
+    var words: str[]
+    words = machineAarch64PrologueWords()
+    if !machineAppendLoadSimpleCallArgsWords(architecture, words, argKinds, argPrimaryTexts, argArg0s):
+        return ""
+    add(words, "94000000")
+    add(words, "94000000")
+    add(words, machineAarch64MovZeroWord(0))
     let epilogue = machineAarch64EpilogueWords()
     for i in 0..<epilogue.len:
         add(words, epilogue[i])
@@ -812,6 +930,55 @@ fn machineDirectNestedCallTrailingSimpleArgVoidWords(architecture: str,
     add(words, machineAarch64AddImmWord(true, 31, 31, 16))
     add(words, "94000000")
     add(words, machineAarch64MovInt32Word(0, 0))
+    let epilogue = machineAarch64EpilogueWords()
+    for i in 0..<epilogue.len:
+        add(words, epilogue[i])
+    return joinWordList(words)
+
+fn machineDirectNestedCallTrailingSimpleArgWords(architecture: str,
+                                                 innerArgKinds: str[],
+                                                 innerArgPrimaryTexts: str[],
+                                                 innerArgArg0s: int32[],
+                                                 outerArgKind: str,
+                                                 outerArgPrimaryText: str,
+                                                 outerArgArg0: int32): str =
+    if architecture != "aarch64":
+        panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
+    var words: str[]
+    words = machineAarch64PrologueWords()
+    add(words, machineAarch64SubImmWord(true, 31, 31, 16))
+    if !machineAppendLoadSimpleValueWords(architecture, words, 1, outerArgKind, outerArgPrimaryText, outerArgArg0):
+        return ""
+    add(words, machineAarch64StoreSpWord(true, 1, 0))
+    if !machineAppendLoadSimpleCallArgsWords(architecture, words, innerArgKinds, innerArgPrimaryTexts, innerArgArg0s):
+        return ""
+    add(words, "94000000")
+    add(words, machineAarch64LoadSpWord(true, 1, 0))
+    add(words, machineAarch64AddImmWord(true, 31, 31, 16))
+    add(words, "94000000")
+    let epilogue = machineAarch64EpilogueWords()
+    for i in 0..<epilogue.len:
+        add(words, epilogue[i])
+    return joinWordList(words)
+
+fn machineDirectNestedCallTrailingCStringArgWords(architecture: str,
+                                                  innerArgKinds: str[],
+                                                  innerArgPrimaryTexts: str[],
+                                                  innerArgArg0s: int32[],
+                                                  byteLen: int32): str =
+    if architecture != "aarch64":
+        panic("v2 machine pipeline: unsupported direct executable architecture " + architecture)
+    if byteLen < 0 || byteLen > 65535:
+        return ""
+    var words: str[]
+    words = machineAarch64PrologueWords()
+    if !machineAppendLoadSimpleCallArgsWords(architecture, words, innerArgKinds, innerArgPrimaryTexts, innerArgArg0s):
+        return ""
+    add(words, "94000000")
+    add(words, "90000002")
+    add(words, "91000042")
+    add(words, machineAarch64MovInt32Word(3, byteLen))
+    add(words, "94000000")
     let epilogue = machineAarch64EpilogueWords()
     for i in 0..<epilogue.len:
         add(words, epilogue[i])
@@ -878,7 +1045,7 @@ fn machineDirectFallbackCallWords(architecture: str,
     let fallbackEpilogue = machineAarch64EpilogueWords()
     for i in 0..<fallbackEpilogue.len:
         add(words, fallbackEpilogue[i])
-    words[elseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - elseBranchIdx - 1, "eq")
+    words[elseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - elseBranchIdx, "eq")
     return joinWordList(words)
 
 fn machineAppendLoadSimpleValueWords(architecture: str,
@@ -1291,8 +1458,8 @@ fn machineDirectIfElseSimpleCondWords(architecture: str,
     let epilogue = machineAarch64EpilogueWords()
     for i in 0..<epilogue.len:
         add(words, epilogue[i])
-    words[falseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx - 1, "eq")
-    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx - 1)
+    words[falseBranchIdx] = machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx, "eq")
+    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx)
     return joinWordList(words)
 
 fn machineDirectIfElseBinaryCondWords(architecture: str,
@@ -1332,9 +1499,9 @@ fn machineDirectIfElseBinaryCondWords(architecture: str,
     for i in 0..<epilogue.len:
         add(words, epilogue[i])
     words[falseBranchIdx] =
-        machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx - 1,
+        machineAarch64BranchCondWord(elseStartIdx - falseBranchIdx,
                                      machineAarch64InverseCompareCond(operatorText))
-    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx - 1)
+    words[endBranchIdx] = machineAarch64BranchWord(epilogueStartIdx - endBranchIdx)
     return joinWordList(words)
 
 fn machineFunctionSymbolName(targetTriple: str, moduleKind: str, opName: str, itemId: int32): str =
@@ -1488,6 +1655,23 @@ fn machineDirectCallRelocOffsets(words: str): int32[] =
         add(out, wordIdx * 4)
     return out
 
+fn machineDirectSecondCStringRelocOffsets(words: str): int32[] =
+    var out: int32[]
+    out = []
+    var token: str = ""
+    var wordIdx: int32 = 0
+    for i in 0..<len(words):
+        if words[i] == ';':
+            if token == "90000002" || token == "91000042":
+                add(out, wordIdx * 4)
+            token = ""
+            wordIdx = wordIdx + 1
+        else:
+            token = token + charToString(words[i])
+    if token == "90000002" || token == "91000042":
+        add(out, wordIdx * 4)
+    return out
+
 fn rewriteMachineFunctionDirectExecCalls(out: var MachineModuleBundle,
                                          functionIdx: int32,
                                          words: str,
@@ -1588,6 +1772,49 @@ fn rewriteMachineFunctionDirectExecCallCStringData(out: var MachineModuleBundle,
                             callSymbol,
                             out.callRelocationKind)
     out.functionRelocCounts[functionIdx] = 3
+
+fn rewriteMachineFunctionDirectExecCallsCStringData(out: var MachineModuleBundle,
+                                                    functionIdx: int32,
+                                                    words: str,
+                                                    callSymbols: str[],
+                                                    payloadText: str) =
+    let callOffsets = machineDirectCallRelocOffsets(words)
+    if callOffsets.len != callSymbols.len:
+        panic("v2 machine pipeline: direct exec call reloc count mismatch")
+    let dataRelocOffsets = machineDirectSecondCStringRelocOffsets(words)
+    if dataRelocOffsets.len != 2:
+        panic("v2 machine pipeline: direct exec nested cstring reloc count mismatch")
+    let dataSymbol = out.symbolNames[functionIdx] + "_cstring"
+    out.runtimeTargets[functionIdx] = ""
+    out.callSymbolNames[functionIdx] = joinWithSep(callSymbols, ";")
+    out.instructionWordHex[functionIdx] = words
+    out.functionByteSizes[functionIdx] = wordCount(words) * 4
+    out.localPayloadPageRelocOffsets[functionIdx] = dataRelocOffsets[0]
+    out.localPayloadPageoffRelocOffsets[functionIdx] = dataRelocOffsets[1]
+    out.callRelocOffsets[functionIdx] = callOffsets[0]
+    out.metadataOperandModes[functionIdx] = "direct_exec_call_cstring_payload"
+    out.localPayloadTexts[functionIdx] = payloadText
+    let relocStart = out.relocOffsets.len
+    out.functionRelocStarts[functionIdx] = relocStart
+    appendMachineDataSymbol(out,
+                            dataSymbol,
+                            out.cstringSectionName,
+                            payloadText,
+                            mtarget.machineTargetCStringAlignPow2(out.targetTriple))
+    appendMachineRelocation(out,
+                            dataRelocOffsets[0],
+                            dataSymbol,
+                            out.metadataPageRelocationKind)
+    appendMachineRelocation(out,
+                            dataRelocOffsets[1],
+                            dataSymbol,
+                            out.metadataPageoffRelocationKind)
+    for i in 0..<callOffsets.len:
+        appendMachineRelocation(out,
+                                callOffsets[i],
+                                callSymbols[i],
+                                out.callRelocationKind)
+    out.functionRelocCounts[functionIdx] = 2 + callOffsets.len
 
 fn rewriteMachineFunctionSymbol(out: var MachineModuleBundle,
                                 functionIdx: int32,
@@ -1817,6 +2044,34 @@ fn compilerCoreTypeHeadText(text: str): str =
 fn compilerCoreTypeHeadMatches(text: str, bareName: str): bool =
     let headText = compilerCoreTypeHeadText(text)
     return headText == bareName || compilerCoreTypeEndsWithRaw(headText, "." + bareName)
+
+fn compilerCoreDirectCallReturnTypeSupported(typeText: str): bool =
+    let normalizedText = compilerCoreNormalizedTypeText(typeText)
+    if len(normalizedText) <= 0:
+        return true
+    if compilerCoreTypeMatches(normalizedText, "void"):
+        return true
+    if compilerCoreTypeMatches(normalizedText, "bool") ||
+       compilerCoreTypeMatches(normalizedText, "int8") ||
+       compilerCoreTypeMatches(normalizedText, "int16") ||
+       compilerCoreTypeMatches(normalizedText, "int32") ||
+       compilerCoreTypeMatches(normalizedText, "int64") ||
+       compilerCoreTypeMatches(normalizedText, "uint8") ||
+       compilerCoreTypeMatches(normalizedText, "uint16") ||
+       compilerCoreTypeMatches(normalizedText, "uint32") ||
+       compilerCoreTypeMatches(normalizedText, "uint64") ||
+       compilerCoreTypeMatches(normalizedText, "float64") ||
+       compilerCoreTypeMatches(normalizedText, "char") ||
+       compilerCoreTypeMatches(normalizedText, "ptr") ||
+       compilerCoreTypeMatches(normalizedText, "cstring") ||
+       compilerCoreTypeMatches(normalizedText, "File") ||
+       compilerCoreTypeMatches(normalizedText, "str") ||
+       compilerCoreTypeMatches(normalizedText, "Bytes") ||
+       compilerCoreTypeMatches(normalizedText, "ByteBuffer") ||
+       compilerCoreTypeMatches(normalizedText, "ByteReader") ||
+       compilerCoreTypeEndsWith(normalizedText, "[]"):
+        return true
+    return false
 
 fn compilerCoreDirectTypeRegWidth(typeText: str): int32 =
     let normalizedText = compilerCoreNormalizedTypeText(typeText)
@@ -2055,11 +2310,26 @@ fn compilerCoreDirectExecImportcSymbolAllowed(symbolName: str): bool =
            symbolName == "driver_c_cli_param1_eq_bridge" ||
            symbolName == "driver_c_read_flag_or_default_bridge" ||
            symbolName == "driver_c_read_int32_flag_or_default_bridge" ||
+           symbolName == "driver_c_compiler_core_print_usage_bridge" ||
+           symbolName == "driver_c_compiler_core_print_status_bridge" ||
+           symbolName == "driver_c_absolute_path_bridge" ||
+           symbolName == "driver_c_program_absolute_path_bridge" ||
+           symbolName == "driver_c_get_current_dir_bridge" ||
+           symbolName == "driver_c_join_path2_bridge" ||
+           symbolName == "driver_c_create_dir_all_bridge" ||
            symbolName == "driver_c_write_text_file_bridge" ||
            symbolName == "driver_c_compare_text_files_bridge" ||
            symbolName == "driver_c_compare_binary_files_bridge" ||
            symbolName == "driver_c_exec_file_capture_or_panic_bridge" ||
            symbolName == "driver_c_compare_text_files_or_panic_bridge" ||
+           symbolName == "driver_c_extract_line_value_bridge" ||
+           symbolName == "driver_c_count_external_cc_providers_bridge" ||
+           symbolName == "driver_c_parse_plan_int32_or_zero_bridge" ||
+           symbolName == "driver_c_provider_field_for_module_from_plan_text_bridge" ||
+           symbolName == "driver_c_compiler_core_provider_source_kind_bridge" ||
+           symbolName == "driver_c_compiler_core_provider_compile_mode_bridge" ||
+           symbolName == "driver_c_run_stage_selfhost_host_bridge" ||
+           symbolName == "driver_c_run_tooling_selfhost_host_bridge" ||
            symbolName == "driver_c_read_file_all" ||
            symbolName == "cheng_fopen" ||
            symbolName == "cheng_fread" ||
@@ -2107,13 +2377,15 @@ fn compilerCoreDirectExecCalleeSymbol(plan: cflow.LowUirCompilerCorePlan,
     if calleeItemIdx < 0:
         return ""
     if plan.topLevelKinds[calleeItemIdx] == "importc_fn":
-        let symbolName = len(plan.importcSymbolTexts[calleeItemIdx]) > 0 ?
+        let sourceSymbolName = len(plan.importcSymbolTexts[calleeItemIdx]) > 0 ?
             plan.importcSymbolTexts[calleeItemIdx] :
             compilerCoreImportcSymbolTextFromSignature(plan.signatureTexts[calleeItemIdx],
                                                        plan.labels[calleeItemIdx])
-        if !compilerCoreDirectExecImportcSymbolAllowed(symbolName):
+        if !compilerCoreDirectExecImportcSymbolAllowed(sourceSymbolName):
             return ""
-        return machineLibcSymbolName(targetTriple, symbolName)
+        let directSymbolName = sourceSymbolName == "driver_c_cli_param1_eq_bridge" ?
+            "driver_c_cli_param1_eq_raw_bridge" else: sourceSymbolName
+        return machineLibcSymbolName(targetTriple, directSymbolName)
     return machineFunctionSymbolName(targetTriple,
                                      "compiler_core",
                                      plan.canonicalOps[calleeItemIdx],
@@ -2273,6 +2545,40 @@ fn compilerCoreDirectExecCallCStringPayloadText(plan: cflow.LowUirCompilerCorePl
        plan.opKinds[opStart + 3] == "return_value" &&
        plan.opArg0s[opStart + 2] == 1:
         return plan.opPrimaryTexts[opStart + 1]
+    return ""
+
+fn compilerCoreDirectExecCallSecondCStringPayloadText(plan: cflow.LowUirCompilerCorePlan,
+                                                      itemIdx: int32): str =
+    let opCount = plan.routineOpCounts[itemIdx]
+    let opStart = plan.routineOpStarts[itemIdx]
+    if opCount == 5 &&
+       plan.opKinds[opStart] == "load_routine" &&
+       compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 1]) &&
+       plan.opKinds[opStart + 2] == "load_str" &&
+       plan.opKinds[opStart + 3] == "call" &&
+       plan.opKinds[opStart + 4] == "return_value" &&
+       plan.opArg0s[opStart + 3] == 2:
+        return plan.opPrimaryTexts[opStart + 2]
+    return ""
+
+fn compilerCoreDirectExecNestedCallCStringPayloadText(plan: cflow.LowUirCompilerCorePlan,
+                                                      itemIdx: int32): str =
+    let opCount = plan.routineOpCounts[itemIdx]
+    let opStart = plan.routineOpStarts[itemIdx]
+    for argCount in 0..<5:
+        let innerCallIdx = opStart + 2 + argCount
+        let outerArgIdx = innerCallIdx + 1
+        let outerCallIdx = innerCallIdx + 2
+        if opCount == argCount + 7 &&
+           plan.opKinds[opStart] == "load_routine" &&
+           plan.opKinds[opStart + 1] == "load_routine" &&
+           plan.opKinds[innerCallIdx] == "call" &&
+           plan.opKinds[outerArgIdx] == "load_str" &&
+           plan.opKinds[outerCallIdx] == "call" &&
+           plan.opKinds[outerCallIdx + 1] == "return_value" &&
+           plan.opArg0s[innerCallIdx] == argCount &&
+           plan.opArg0s[outerCallIdx] == 2:
+            return plan.opPrimaryTexts[outerArgIdx]
     return ""
 
 fn compilerCoreDirectExecVoidCallCStringPayloadText(plan: cflow.LowUirCompilerCorePlan,
@@ -2556,6 +2862,8 @@ fn compilerCoreDirectExecIfElseCallSymbols(plan: cflow.LowUirCompilerCorePlan,
                                            targetTriple: str): str[] =
     let opCount = plan.routineOpCounts[itemIdx]
     let opStart = plan.routineOpStarts[itemIdx]
+    if !compilerCoreDirectCallReturnTypeSupported(plan.returnTypeTexts[itemIdx]):
+        return []
     if opCount == 12 &&
        plan.opKinds[opStart] == "load_routine" &&
        plan.opKinds[opStart + 1] == "call" &&
@@ -2583,6 +2891,52 @@ fn compilerCoreDirectExecIfElseCallSymbols(plan: cflow.LowUirCompilerCorePlan,
             let elseSymbol = compilerCoreDirectExecCalleeSymbol(plan, elseItemIdx, targetTriple)
             if len(condSymbol) > 0 && len(thenSymbol) > 0 && len(elseSymbol) > 0:
                 return [condSymbol, thenSymbol, elseSymbol]
+    if opCount == 11 &&
+       plan.opKinds[opStart] == "load_routine" &&
+       plan.opKinds[opStart + 1] == "call" &&
+       plan.opKinds[opStart + 2] == "jump_if_false" &&
+       compilerCoreIsDirectConstValueKind(plan.opKinds[opStart + 3]) &&
+       plan.opKinds[opStart + 4] == "return_value" &&
+       plan.opKinds[opStart + 5] == "jump" &&
+       plan.opKinds[opStart + 6] == "label" &&
+       plan.opKinds[opStart + 7] == "load_routine" &&
+       plan.opKinds[opStart + 8] == "call" &&
+       plan.opKinds[opStart + 9] == "return_value" &&
+       plan.opKinds[opStart + 10] == "label" &&
+       plan.opArg0s[opStart + 1] == 0 &&
+       plan.opArg0s[opStart + 8] == 0 &&
+       plan.opPrimaryTexts[opStart + 2] == plan.opPrimaryTexts[opStart + 6] &&
+       plan.opPrimaryTexts[opStart + 5] == plan.opPrimaryTexts[opStart + 10]:
+        let condItemIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart])
+        let elseItemIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart + 7])
+        if condItemIdx >= 0 && elseItemIdx >= 0:
+            let condSymbol = compilerCoreDirectExecCalleeSymbol(plan, condItemIdx, targetTriple)
+            let elseSymbol = compilerCoreDirectExecCalleeSymbol(plan, elseItemIdx, targetTriple)
+            if len(condSymbol) > 0 && len(elseSymbol) > 0:
+                return [condSymbol, elseSymbol]
+    if opCount == 11 &&
+       plan.opKinds[opStart] == "load_routine" &&
+       plan.opKinds[opStart + 1] == "call" &&
+       plan.opKinds[opStart + 2] == "jump_if_false" &&
+       plan.opKinds[opStart + 3] == "load_routine" &&
+       plan.opKinds[opStart + 4] == "call" &&
+       plan.opKinds[opStart + 5] == "return_value" &&
+       plan.opKinds[opStart + 6] == "jump" &&
+       plan.opKinds[opStart + 7] == "label" &&
+       compilerCoreIsDirectConstValueKind(plan.opKinds[opStart + 8]) &&
+       plan.opKinds[opStart + 9] == "return_value" &&
+       plan.opKinds[opStart + 10] == "label" &&
+       plan.opArg0s[opStart + 1] == 0 &&
+       plan.opArg0s[opStart + 4] == 0 &&
+       plan.opPrimaryTexts[opStart + 2] == plan.opPrimaryTexts[opStart + 7] &&
+       plan.opPrimaryTexts[opStart + 6] == plan.opPrimaryTexts[opStart + 10]:
+        let condItemIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart])
+        let thenItemIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart + 3])
+        if condItemIdx >= 0 && thenItemIdx >= 0:
+            let condSymbol = compilerCoreDirectExecCalleeSymbol(plan, condItemIdx, targetTriple)
+            let thenSymbol = compilerCoreDirectExecCalleeSymbol(plan, thenItemIdx, targetTriple)
+            if len(condSymbol) > 0 && len(thenSymbol) > 0:
+                return [condSymbol, thenSymbol]
     if opCount == 14 &&
        plan.opKinds[opStart] == "load_routine" &&
        plan.opKinds[opStart + 1] == "call" &&
@@ -2638,6 +2992,46 @@ fn compilerCoreDirectExecIfElseCallWords(plan: cflow.LowUirCompilerCorePlan,
        plan.opPrimaryTexts[opStart + 2] == plan.opPrimaryTexts[opStart + 7] &&
        plan.opPrimaryTexts[opStart + 6] == plan.opPrimaryTexts[opStart + 11]:
         return machineDirectIfElseCallWords(architecture)
+    if opCount == 11 &&
+       plan.opKinds[opStart] == "load_routine" &&
+       plan.opKinds[opStart + 1] == "call" &&
+       plan.opKinds[opStart + 2] == "jump_if_false" &&
+       compilerCoreIsDirectConstValueKind(plan.opKinds[opStart + 3]) &&
+       plan.opKinds[opStart + 4] == "return_value" &&
+       plan.opKinds[opStart + 5] == "jump" &&
+       plan.opKinds[opStart + 6] == "label" &&
+       plan.opKinds[opStart + 7] == "load_routine" &&
+       plan.opKinds[opStart + 8] == "call" &&
+       plan.opKinds[opStart + 9] == "return_value" &&
+       plan.opKinds[opStart + 10] == "label" &&
+       plan.opArg0s[opStart + 1] == 0 &&
+       plan.opArg0s[opStart + 8] == 0 &&
+       plan.opPrimaryTexts[opStart + 2] == plan.opPrimaryTexts[opStart + 6] &&
+       plan.opPrimaryTexts[opStart + 5] == plan.opPrimaryTexts[opStart + 10]:
+        return machineDirectIfElseConstThenCallWords(architecture,
+                                                     plan.opKinds[opStart + 3],
+                                                     plan.opPrimaryTexts[opStart + 3],
+                                                     plan.opArg0s[opStart + 3])
+    if opCount == 11 &&
+       plan.opKinds[opStart] == "load_routine" &&
+       plan.opKinds[opStart + 1] == "call" &&
+       plan.opKinds[opStart + 2] == "jump_if_false" &&
+       plan.opKinds[opStart + 3] == "load_routine" &&
+       plan.opKinds[opStart + 4] == "call" &&
+       plan.opKinds[opStart + 5] == "return_value" &&
+       plan.opKinds[opStart + 6] == "jump" &&
+       plan.opKinds[opStart + 7] == "label" &&
+       compilerCoreIsDirectConstValueKind(plan.opKinds[opStart + 8]) &&
+       plan.opKinds[opStart + 9] == "return_value" &&
+       plan.opKinds[opStart + 10] == "label" &&
+       plan.opArg0s[opStart + 1] == 0 &&
+       plan.opArg0s[opStart + 4] == 0 &&
+       plan.opPrimaryTexts[opStart + 2] == plan.opPrimaryTexts[opStart + 7] &&
+       plan.opPrimaryTexts[opStart + 6] == plan.opPrimaryTexts[opStart + 10]:
+        return machineDirectIfElseCallThenConstWords(architecture,
+                                                     plan.opKinds[opStart + 8],
+                                                     plan.opPrimaryTexts[opStart + 8],
+                                                     plan.opArg0s[opStart + 8])
     if opCount == 14 &&
        plan.opKinds[opStart] == "load_routine" &&
        plan.opKinds[opStart + 1] == "call" &&
@@ -2794,6 +3188,8 @@ fn compilerCoreDirectExecNestedCallSymbols(plan: cflow.LowUirCompilerCorePlan,
     out = []
     let opCount = plan.routineOpCounts[itemIdx]
     let opStart = plan.routineOpStarts[itemIdx]
+    if !compilerCoreDirectCallReturnTypeSupported(plan.returnTypeTexts[itemIdx]):
+        return out
     for argCount in 0..<5:
         let innerCallIdx = opStart + 2 + argCount
         let outerCallIdx = innerCallIdx + 1
@@ -2818,6 +3214,79 @@ fn compilerCoreDirectExecNestedCallSymbols(plan: cflow.LowUirCompilerCorePlan,
             if compilerCoreDirectTypeRegWidth(plan.returnTypeTexts[innerCalleeIdx]) != 1:
                 continue
             if compilerCoreDirectTypeRegWidth(compilerCoreSignatureParamTypeText(plan.signatureTexts[outerCalleeIdx], 0)) != 1:
+                continue
+            let innerSymbol = compilerCoreDirectExecCalleeSymbol(plan, innerCalleeIdx, targetTriple)
+            let outerSymbol = compilerCoreDirectExecCalleeSymbol(plan, outerCalleeIdx, targetTriple)
+            if len(innerSymbol) <= 0 || len(outerSymbol) <= 0:
+                continue
+            add(out, innerSymbol)
+            add(out, outerSymbol)
+            return out
+        let outerArgIdx = innerCallIdx + 1
+        let outerCallIdx2 = innerCallIdx + 2
+        if opCount == argCount + 7 &&
+           plan.opKinds[opStart] == "load_routine" &&
+           plan.opKinds[opStart + 1] == "load_routine" &&
+           plan.opKinds[innerCallIdx] == "call" &&
+           compilerCoreIsDirectSimpleValueKind(plan.opKinds[outerArgIdx]) &&
+           plan.opKinds[outerCallIdx2] == "call" &&
+           plan.opKinds[outerCallIdx2 + 1] == "return_value" &&
+           plan.opArg0s[innerCallIdx] == argCount &&
+           plan.opArg0s[outerCallIdx2] == 2:
+            var argsOk: bool = true
+            for i in 0..<argCount:
+                if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 2 + i]):
+                    argsOk = false
+            if !argsOk:
+                continue
+            let outerCalleeIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart])
+            let innerCalleeIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart + 1])
+            if outerCalleeIdx < 0 || innerCalleeIdx < 0:
+                continue
+            if plan.paramCounts[outerCalleeIdx] != 2:
+                continue
+            if compilerCoreDirectTypeRegWidth(plan.returnTypeTexts[innerCalleeIdx]) != 1:
+                continue
+            if compilerCoreDirectTypeRegWidth(compilerCoreSignatureParamTypeText(plan.signatureTexts[outerCalleeIdx], 0)) != 1:
+                continue
+            if compilerCoreDirectTypeRegWidth(compilerCoreSignatureParamTypeText(plan.signatureTexts[outerCalleeIdx], 1)) != 1:
+                continue
+            if plan.opKinds[outerArgIdx] == "load_param" &&
+               compilerCoreDirectTypeRegWidth(compilerCoreSignatureParamTypeText(plan.signatureTexts[itemIdx], plan.opArg0s[outerArgIdx])) != 1:
+                continue
+            let innerSymbol = compilerCoreDirectExecCalleeSymbol(plan, innerCalleeIdx, targetTriple)
+            let outerSymbol = compilerCoreDirectExecCalleeSymbol(plan, outerCalleeIdx, targetTriple)
+            if len(innerSymbol) <= 0 || len(outerSymbol) <= 0:
+                continue
+            add(out, innerSymbol)
+            add(out, outerSymbol)
+            return out
+        if opCount == argCount + 7 &&
+           plan.opKinds[opStart] == "load_routine" &&
+           plan.opKinds[opStart + 1] == "load_routine" &&
+           plan.opKinds[innerCallIdx] == "call" &&
+           plan.opKinds[outerArgIdx] == "load_str" &&
+           plan.opKinds[outerCallIdx2] == "call" &&
+           plan.opKinds[outerCallIdx2 + 1] == "return_value" &&
+           plan.opArg0s[innerCallIdx] == argCount &&
+           plan.opArg0s[outerCallIdx2] == 2:
+            var argsOk: bool = true
+            for i in 0..<argCount:
+                if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 2 + i]):
+                    argsOk = false
+            if !argsOk:
+                continue
+            let outerCalleeIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart])
+            let innerCalleeIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart + 1])
+            if outerCalleeIdx < 0 || innerCalleeIdx < 0:
+                continue
+            if plan.paramCounts[outerCalleeIdx] != 2:
+                continue
+            if !compilerCoreTypeMatches(plan.returnTypeTexts[innerCalleeIdx], "str"):
+                continue
+            if !compilerCoreTypeMatches(compilerCoreSignatureParamTypeText(plan.signatureTexts[outerCalleeIdx], 0), "str"):
+                continue
+            if !compilerCoreTypeMatches(compilerCoreSignatureParamTypeText(plan.signatureTexts[outerCalleeIdx], 1), "str"):
                 continue
             let innerSymbol = compilerCoreDirectExecCalleeSymbol(plan, innerCalleeIdx, targetTriple)
             let outerSymbol = compilerCoreDirectExecCalleeSymbol(plan, outerCalleeIdx, targetTriple)
@@ -2900,6 +3369,66 @@ fn compilerCoreDirectExecNestedCallWords(plan: cflow.LowUirCompilerCorePlan,
                 add(argArg0s, plan.opArg0s[opStart + 2 + i])
             if argsOk:
                 return machineDirectNestedCallWords(architecture, argKinds, argPrimaryTexts, argArg0s)
+        let outerArgIdx = innerCallIdx + 1
+        let outerCallIdx2 = innerCallIdx + 2
+        if opCount == argCount + 7 &&
+           plan.opKinds[opStart] == "load_routine" &&
+           plan.opKinds[opStart + 1] == "load_routine" &&
+           plan.opKinds[innerCallIdx] == "call" &&
+           compilerCoreIsDirectSimpleValueKind(plan.opKinds[outerArgIdx]) &&
+           plan.opKinds[outerCallIdx2] == "call" &&
+           plan.opKinds[outerCallIdx2 + 1] == "return_value" &&
+           plan.opArg0s[innerCallIdx] == argCount &&
+           plan.opArg0s[outerCallIdx2] == 2:
+            var innerArgKinds: str[]
+            var innerArgPrimaryTexts: str[]
+            var innerArgArg0s: int32[]
+            innerArgKinds = []
+            innerArgPrimaryTexts = []
+            innerArgArg0s = []
+            var argsOk: bool = true
+            for i in 0..<argCount:
+                if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 2 + i]):
+                    argsOk = false
+                add(innerArgKinds, plan.opKinds[opStart + 2 + i])
+                add(innerArgPrimaryTexts, plan.opPrimaryTexts[opStart + 2 + i])
+                add(innerArgArg0s, plan.opArg0s[opStart + 2 + i])
+            if argsOk:
+                return machineDirectNestedCallTrailingSimpleArgWords(architecture,
+                                                                     innerArgKinds,
+                                                                     innerArgPrimaryTexts,
+                                                                     innerArgArg0s,
+                                                                     plan.opKinds[outerArgIdx],
+                                                                     plan.opPrimaryTexts[outerArgIdx],
+                                                                     plan.opArg0s[outerArgIdx])
+        if opCount == argCount + 7 &&
+           plan.opKinds[opStart] == "load_routine" &&
+           plan.opKinds[opStart + 1] == "load_routine" &&
+           plan.opKinds[innerCallIdx] == "call" &&
+           plan.opKinds[outerArgIdx] == "load_str" &&
+           plan.opKinds[outerCallIdx2] == "call" &&
+           plan.opKinds[outerCallIdx2 + 1] == "return_value" &&
+           plan.opArg0s[innerCallIdx] == argCount &&
+           plan.opArg0s[outerCallIdx2] == 2:
+            var innerArgKinds: str[]
+            var innerArgPrimaryTexts: str[]
+            var innerArgArg0s: int32[]
+            innerArgKinds = []
+            innerArgPrimaryTexts = []
+            innerArgArg0s = []
+            var argsOk: bool = true
+            for i in 0..<argCount:
+                if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 2 + i]):
+                    argsOk = false
+                add(innerArgKinds, plan.opKinds[opStart + 2 + i])
+                add(innerArgPrimaryTexts, plan.opPrimaryTexts[opStart + 2 + i])
+                add(innerArgArg0s, plan.opArg0s[opStart + 2 + i])
+            if argsOk:
+                return machineDirectNestedCallTrailingCStringArgWords(architecture,
+                                                                      innerArgKinds,
+                                                                      innerArgPrimaryTexts,
+                                                                      innerArgArg0s,
+                                                                      len(plan.opPrimaryTexts[outerArgIdx]))
         if opCount == argCount + 7 &&
            plan.opKinds[opStart] == "load_routine" &&
            plan.opKinds[opStart + 1] == "load_routine" &&
@@ -2944,6 +3473,8 @@ fn compilerCoreDirectExecCallSymbol(plan: cflow.LowUirCompilerCorePlan,
                                     targetTriple: str): str =
     let opCount = plan.routineOpCounts[itemIdx]
     let opStart = plan.routineOpStarts[itemIdx]
+    if !compilerCoreDirectCallReturnTypeSupported(plan.returnTypeTexts[itemIdx]):
+        return ""
     if opCount == 4 &&
        plan.opKinds[opStart] == "load_routine" &&
        plan.opKinds[opStart + 1] == "load_str" &&
@@ -2953,6 +3484,18 @@ fn compilerCoreDirectExecCallSymbol(plan: cflow.LowUirCompilerCorePlan,
         let calleeItemIdx = compilerCoreDirectExecCallItemIndex(plan, itemIdx, opStart, 1)
         if calleeItemIdx >= 0 &&
            compilerCoreTypeMatches(compilerCoreSignatureParamTypeText(plan.signatureTexts[calleeItemIdx], 0), "str"):
+            return compilerCoreDirectExecCalleeSymbol(plan, calleeItemIdx, targetTriple)
+    if opCount == 5 &&
+       plan.opKinds[opStart] == "load_routine" &&
+       compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 1]) &&
+       plan.opKinds[opStart + 2] == "load_str" &&
+       plan.opKinds[opStart + 3] == "call" &&
+       plan.opKinds[opStart + 4] == "return_value" &&
+       plan.opArg0s[opStart + 3] == 2:
+        let calleeItemIdx = compilerCoreDirectExecCallItemIndex(plan, itemIdx, opStart, 2)
+        if calleeItemIdx >= 0 &&
+           compilerCoreTypeMatches(compilerCoreSignatureParamTypeText(plan.signatureTexts[calleeItemIdx], 0), "str") &&
+           compilerCoreTypeMatches(compilerCoreSignatureParamTypeText(plan.signatureTexts[calleeItemIdx], 1), "str"):
             return compilerCoreDirectExecCalleeSymbol(plan, calleeItemIdx, targetTriple)
     if opCount == 5 &&
        plan.opKinds[opStart] == "load_routine" &&
@@ -3228,6 +3771,9 @@ fn compilerCoreDirectExecCallWords(plan: cflow.LowUirCompilerCorePlan,
     let cstringPayload = compilerCoreDirectExecCallCStringPayloadText(plan, itemIdx)
     if len(cstringPayload) > 0:
         return machineDirectCallCStringArgWords(architecture, len(cstringPayload))
+    let secondCStringPayload = compilerCoreDirectExecCallSecondCStringPayloadText(plan, itemIdx)
+    if len(secondCStringPayload) > 0:
+        return machineDirectCallSecondCStringArgWords(architecture, len(secondCStringPayload))
     if opCount == 5 &&
        plan.opKinds[opStart] == "load_routine" &&
        plan.opKinds[opStart + 1] == "call" &&
@@ -3571,8 +4117,40 @@ fn compilerCoreDirectExecVoidThenConstCallSymbol(plan: cflow.LowUirCompilerCoreP
        plan.opKinds[opStart + 2] == "drop_value" &&
        compilerCoreIsDirectConstValueKind(plan.opKinds[opStart + 3]) &&
        plan.opKinds[opStart + 4] == "return_value" &&
-       plan.opArg0s[opStart + 1] == 0:
+        plan.opArg0s[opStart + 1] == 0:
         let calleeItemIdx = compilerCoreDirectExecCallItemIndex(plan, itemIdx, opStart, 0)
+        if calleeItemIdx >= 0:
+            return compilerCoreDirectExecCalleeSymbol(plan, calleeItemIdx, targetTriple)
+    for argCount in 1..<5:
+        let callIdx = opStart + 1 + argCount
+        let dropIdx = callIdx + 1
+        let constIdx = callIdx + 2
+        let returnIdx = callIdx + 3
+        if opCount != argCount + 5 ||
+           plan.opKinds[opStart] != "load_routine" ||
+           plan.opKinds[callIdx] != "call" ||
+           plan.opKinds[dropIdx] != "drop_value" ||
+           !compilerCoreIsDirectConstValueKind(plan.opKinds[constIdx]) ||
+           plan.opKinds[returnIdx] != "return_value" ||
+           plan.opArg0s[callIdx] != argCount:
+            continue
+        var argKinds: str[]
+        var argPrimaryTexts: str[]
+        var argArg0s: int32[]
+        argKinds = []
+        argPrimaryTexts = []
+        argArg0s = []
+        var argsOk: bool = true
+        for i in 0..<argCount:
+            let argIdx = opStart + 1 + i
+            if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[argIdx]):
+                argsOk = false
+            add(argKinds, plan.opKinds[argIdx])
+            add(argPrimaryTexts, plan.opPrimaryTexts[argIdx])
+            add(argArg0s, plan.opArg0s[argIdx])
+        if !argsOk:
+            continue
+        let calleeItemIdx = compilerCoreDirectExecCallItemIndex(plan, itemIdx, opStart, argCount)
         if calleeItemIdx >= 0:
             return compilerCoreDirectExecCalleeSymbol(plan, calleeItemIdx, targetTriple)
     return ""
@@ -3588,11 +4166,47 @@ fn compilerCoreDirectExecVoidThenConstCallWords(plan: cflow.LowUirCompilerCorePl
        plan.opKinds[opStart + 2] == "drop_value" &&
        compilerCoreIsDirectConstValueKind(plan.opKinds[opStart + 3]) &&
        plan.opKinds[opStart + 4] == "return_value" &&
-       plan.opArg0s[opStart + 1] == 0:
+        plan.opArg0s[opStart + 1] == 0:
         return machineDirectCallVoidThenConstWords(architecture,
                                                    plan.opKinds[opStart + 3],
                                                    plan.opPrimaryTexts[opStart + 3],
                                                    plan.opArg0s[opStart + 3])
+    for argCount in 1..<5:
+        let callIdx = opStart + 1 + argCount
+        let dropIdx = callIdx + 1
+        let constIdx = callIdx + 2
+        let returnIdx = callIdx + 3
+        if opCount != argCount + 5 ||
+           plan.opKinds[opStart] != "load_routine" ||
+           plan.opKinds[callIdx] != "call" ||
+           plan.opKinds[dropIdx] != "drop_value" ||
+           !compilerCoreIsDirectConstValueKind(plan.opKinds[constIdx]) ||
+           plan.opKinds[returnIdx] != "return_value" ||
+           plan.opArg0s[callIdx] != argCount:
+            continue
+        var argKinds: str[]
+        var argPrimaryTexts: str[]
+        var argArg0s: int32[]
+        argKinds = []
+        argPrimaryTexts = []
+        argArg0s = []
+        var argsOk: bool = true
+        for i in 0..<argCount:
+            let argIdx = opStart + 1 + i
+            if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[argIdx]):
+                argsOk = false
+            add(argKinds, plan.opKinds[argIdx])
+            add(argPrimaryTexts, plan.opPrimaryTexts[argIdx])
+            add(argArg0s, plan.opArg0s[argIdx])
+        if !argsOk:
+            continue
+        return machineDirectCallSimpleArgsVoidThenConstWords(architecture,
+                                                             argKinds,
+                                                             argPrimaryTexts,
+                                                             argArg0s,
+                                                             plan.opKinds[constIdx],
+                                                             plan.opPrimaryTexts[constIdx],
+                                                             plan.opArg0s[constIdx])
     return ""
 
 fn compilerCoreDirectExecFallbackCallSymbols(plan: cflow.LowUirCompilerCorePlan,
@@ -3602,6 +4216,8 @@ fn compilerCoreDirectExecFallbackCallSymbols(plan: cflow.LowUirCompilerCorePlan,
     out = []
     let opCount = plan.routineOpCounts[itemIdx]
     let opStart = plan.routineOpStarts[itemIdx]
+    if !compilerCoreDirectCallReturnTypeSupported(plan.returnTypeTexts[itemIdx]):
+        return out
     if opCount < 11 ||
        plan.opKinds[opStart] != "local_decl":
         return out
@@ -3696,6 +4312,40 @@ fn compilerCoreDirectExecVoidNestedCallSymbols(plan: cflow.LowUirCompilerCorePla
     let opCount = plan.routineOpCounts[itemIdx]
     let opStart = plan.routineOpStarts[itemIdx]
     for innerArgCount in 0..<5:
+        let innerOnlyCallIdx = opStart + 2 + innerArgCount
+        let outerOnlyCallIdx = innerOnlyCallIdx + 1
+        if opCount == innerArgCount + 6 &&
+           plan.opKinds[opStart] == "load_routine" &&
+           plan.opKinds[opStart + 1] == "load_routine" &&
+           plan.opKinds[innerOnlyCallIdx] == "call" &&
+           plan.opKinds[outerOnlyCallIdx] == "call" &&
+           plan.opKinds[outerOnlyCallIdx + 1] == "drop_value" &&
+           plan.opKinds[outerOnlyCallIdx + 2] == "return_void" &&
+           plan.opArg0s[innerOnlyCallIdx] == innerArgCount &&
+           plan.opArg0s[outerOnlyCallIdx] == 1:
+            var argsOkNoOuter: bool = true
+            for i in 0..<innerArgCount:
+                if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 2 + i]):
+                    argsOkNoOuter = false
+            if !argsOkNoOuter:
+                continue
+            let outerOnlyCalleeIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart])
+            let innerOnlyCalleeIdx = compilerCoreFindPlanItemIndex(plan, plan.opArg0s[opStart + 1])
+            if outerOnlyCalleeIdx < 0 || innerOnlyCalleeIdx < 0:
+                continue
+            if plan.paramCounts[outerOnlyCalleeIdx] != 1:
+                continue
+            if compilerCoreDirectTypeRegWidth(plan.returnTypeTexts[innerOnlyCalleeIdx]) != 1:
+                continue
+            if compilerCoreDirectTypeRegWidth(compilerCoreSignatureParamTypeText(plan.signatureTexts[outerOnlyCalleeIdx], 0)) != 1:
+                continue
+            let innerOnlySymbol = compilerCoreDirectExecCalleeSymbol(plan, innerOnlyCalleeIdx, targetTriple)
+            let outerOnlySymbol = compilerCoreDirectExecCalleeSymbol(plan, outerOnlyCalleeIdx, targetTriple)
+            if len(innerOnlySymbol) <= 0 || len(outerOnlySymbol) <= 0:
+                continue
+            add(out, innerOnlySymbol)
+            add(out, outerOnlySymbol)
+            return out
         let innerCallIdx = opStart + 2 + innerArgCount
         let outerArgIdx = innerCallIdx + 1
         let outerCallIdx = innerCallIdx + 2
@@ -3746,6 +4396,36 @@ fn compilerCoreDirectExecVoidNestedCallWords(plan: cflow.LowUirCompilerCorePlan,
     let opCount = plan.routineOpCounts[itemIdx]
     let opStart = plan.routineOpStarts[itemIdx]
     for innerArgCount in 0..<5:
+        let innerOnlyCallIdx = opStart + 2 + innerArgCount
+        let outerOnlyCallIdx = innerOnlyCallIdx + 1
+        if opCount == innerArgCount + 6 &&
+           plan.opKinds[opStart] == "load_routine" &&
+           plan.opKinds[opStart + 1] == "load_routine" &&
+           plan.opKinds[innerOnlyCallIdx] == "call" &&
+           plan.opKinds[outerOnlyCallIdx] == "call" &&
+           plan.opKinds[outerOnlyCallIdx + 1] == "drop_value" &&
+           plan.opKinds[outerOnlyCallIdx + 2] == "return_void" &&
+           plan.opArg0s[innerOnlyCallIdx] == innerArgCount &&
+           plan.opArg0s[outerOnlyCallIdx] == 1:
+            var innerOnlyArgKinds: str[]
+            var innerOnlyArgPrimaryTexts: str[]
+            var innerOnlyArgArg0s: int32[]
+            innerOnlyArgKinds = []
+            innerOnlyArgPrimaryTexts = []
+            innerOnlyArgArg0s = []
+            var argsOkNoOuter: bool = true
+            for i in 0..<innerArgCount:
+                if !compilerCoreIsDirectSimpleValueKind(plan.opKinds[opStart + 2 + i]):
+                    argsOkNoOuter = false
+                add(innerOnlyArgKinds, plan.opKinds[opStart + 2 + i])
+                add(innerOnlyArgPrimaryTexts, plan.opPrimaryTexts[opStart + 2 + i])
+                add(innerOnlyArgArg0s, plan.opArg0s[opStart + 2 + i])
+            if !argsOkNoOuter:
+                continue
+            return machineDirectNestedCallVoidWords(architecture,
+                                                    innerOnlyArgKinds,
+                                                    innerOnlyArgPrimaryTexts,
+                                                    innerOnlyArgArg0s)
         let innerCallIdx = opStart + 2 + innerArgCount
         let outerArgIdx = innerCallIdx + 1
         let outerCallIdx = innerCallIdx + 2
@@ -4449,8 +5129,14 @@ fn buildRuntimeProviderMachineModule(providerModulePath: str,
 
 fn buildCompilerCoreArgvEntryProviderMachineModule(sourcePath: str,
                                                    providerManifestCid: str,
-                                                   runtimeTarget: str,
+                                                   runtimeTargets: str[],
                                                    targetTriple: str): MachineModuleBundle =
+    if runtimeTargets.len <= 0:
+        panic("v2 machine pipeline: compiler_core runtime targets missing")
+    let runtimeTarget = runtimeTargets[0]
+    let localPayloadTarget = runtimeTargets.len > 1 ?
+        runtimeTargets[1] :
+        compilerCoreLocalPayloadRuntimeTarget()
     let compiled = cpipe.compileCompilerCoreSourceClosure(sourcePath)
     let full = lowerCompilerCorePlanToMachine(compiled.lowPlan, targetTriple)
     var entryIdx: int32 = -1
@@ -4461,10 +5147,7 @@ fn buildCompilerCoreArgvEntryProviderMachineModule(sourcePath: str,
     if entryIdx < 0:
         panic("v2 machine pipeline: compiler_core runtime argv entry missing")
     var out: MachineModuleBundle = newMachineModuleBundle("runtime_provider", targetTriple)
-    let entryCallSymbol = entryIdx < full.callSymbolNames.len &&
-                          len(full.callSymbolNames[entryIdx]) > 0 ?
-        full.callSymbolNames[entryIdx] :
-        full.symbolNames[entryIdx]
+    let entryCallSymbol = full.symbolNames[entryIdx]
     let bindingSummary = "provider_module=runtime/compiler_core_runtime_v2" +
                          "|manifest_cid=" + providerManifestCid +
                          "|runtime_target=" + runtimeTarget +
@@ -4484,6 +5167,24 @@ fn buildCompilerCoreArgvEntryProviderMachineModule(sourcePath: str,
                                           bridgeWords,
                                           [machineLibcSymbolName(targetTriple, "__cheng_setCmdLine"),
                                            entryCallSymbol])
+    let localPayloadBindingSummary = "provider_module=runtime/compiler_core_runtime_v2" +
+                                     "|manifest_cid=" + providerManifestCid +
+                                     "|runtime_target=" + localPayloadTarget +
+                                     "|entry_label=driver_c_compiler_core_local_payload_bridge"
+    appendMachineDispatchEntryFunction(out,
+                                       1001000000 + compiled.lowPlan.itemIds[entryIdx],
+                                       "runtime_provider_local_payload_export",
+                                       localPayloadTarget,
+                                       localPayloadBindingSummary,
+                                       16)
+    rewriteMachineFunctionSymbol(out,
+                                 1,
+                                 machineCallSymbolName(targetTriple, localPayloadTarget))
+    rewriteMachineFunctionDirectExecCall(out,
+                                         1,
+                                         machineDispatchEntryWords(out.architecture),
+                                         machineLibcSymbolName(targetTriple,
+                                                               "driver_c_compiler_core_local_payload_bridge"))
     return out
 
 fn lowerStringPlanToMachine(plan: slow.LowUirStringPlan, targetTriple: str): MachineModuleBundle =
@@ -4547,14 +5248,15 @@ fn lowerCompilerCorePlanToMachine(plan: cflow.LowUirCompilerCorePlan,
                              "|body_lines=" + intToStr(plan.bodyLineCounts[i]) +
                              "|signature_hash=" + plan.signatureHashes[i] +
                              "|body_hash=" + plan.bodyHashes[i]
+        let runtimeTarget = compilerCoreMachineRuntimeTarget(plan.runtimeTargets[i])
         appendMachineFunction(out,
                               plan.itemIds[i],
                               plan.canonicalOps[i],
-                              plan.runtimeTargets[i],
+                              runtimeTarget,
                               bindingSummary,
                               frameSize)
         if plan.executableAstReady[i] && plan.routineOpCounts[i] > 0:
-            let payloadText = "runtime=" + plan.runtimeTargets[i] +
+            let payloadText = "runtime=" + runtimeTarget +
                               "|bindings=" + bindingSummary + "\n" +
                               compilerCoreRoutineExecPlanText(plan, i)
             rewriteMachineFunctionPayload(out,
@@ -4603,10 +5305,18 @@ fn lowerCompilerCorePlanToMachine(plan: cflow.LowUirCompilerCorePlan,
                         if directNestedSymbols.len > 0:
                             let directNestedWords = compilerCoreDirectExecNestedCallWords(plan, i, out.architecture)
                             if len(directNestedWords) > 0:
-                                rewriteMachineFunctionDirectExecCalls(out,
-                                                                      out.itemIds.len - 1,
-                                                                      directNestedWords,
-                                                                      directNestedSymbols)
+                                let directNestedCStringPayload = compilerCoreDirectExecNestedCallCStringPayloadText(plan, i)
+                                if len(directNestedCStringPayload) > 0:
+                                    rewriteMachineFunctionDirectExecCallsCStringData(out,
+                                                                                     out.itemIds.len - 1,
+                                                                                     directNestedWords,
+                                                                                     directNestedSymbols,
+                                                                                     directNestedCStringPayload)
+                                else:
+                                    rewriteMachineFunctionDirectExecCalls(out,
+                                                                          out.itemIds.len - 1,
+                                                                          directNestedWords,
+                                                                          directNestedSymbols)
                         else:
                             let directNestedVoidSymbols = compilerCoreDirectExecVoidNestedCallSymbols(plan,
                                                                                                       i,

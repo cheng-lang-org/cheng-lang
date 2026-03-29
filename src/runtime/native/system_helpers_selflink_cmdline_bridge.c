@@ -115,6 +115,30 @@ int32_t driver_c_cli_param1_eq_bridge(ChengStrBridge expected) {
   return memcmp(raw, want, raw_len) == 0 ? 1 : 0;
 }
 
+int32_t driver_c_cli_param1_eq_raw_bridge(const char *expected_ptr, int32_t expected_len) {
+  const char *raw = "";
+  const char *want = expected_ptr != NULL ? expected_ptr : "";
+  size_t raw_len;
+  if (__cheng_rt_paramCount() <= 1) {
+    return 0;
+  }
+  raw = __cheng_rt_paramStr(1);
+  if (raw == NULL) {
+    raw = "";
+  }
+  if (expected_len < 0) {
+    return 0;
+  }
+  raw_len = strlen(raw);
+  if (raw_len != (size_t)expected_len) {
+    return 0;
+  }
+  if (raw_len == 0) {
+    return 1;
+  }
+  return memcmp(raw, want, raw_len) == 0 ? 1 : 0;
+}
+
 static int driver_c_flag_key_matches(const char *raw, ChengStrBridge key) {
   size_t key_len;
   if (raw == NULL || key.ptr == NULL || key.len < 0) {

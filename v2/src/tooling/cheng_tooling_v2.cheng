@@ -71,6 +71,45 @@ fn execFileCaptureOrPanicBridge(filePath: str, argv: str[], workingDir: str, lab
 @importc("driver_c_compare_text_files_or_panic_bridge")
 fn compareTextFilesOrPanicBridge(leftPath: str, rightPath: str, label: str)
 
+@importc("driver_c_create_dir_all_bridge")
+fn createDirAllBridge(path: str)
+
+@importc("driver_c_get_current_dir_bridge")
+fn currentWorkingDirBridge(): str
+
+@importc("driver_c_join_path2_bridge")
+fn joinPath2Bridge(left: str, right: str): str
+
+@importc("driver_c_program_absolute_path_bridge")
+fn programAbsolutePathBridge(): str
+
+@importc("driver_c_absolute_path_bridge")
+fn absolutePathBridge(path: str): str
+
+@importc("driver_c_extract_line_value_bridge")
+fn extractLineValueBridge(text: str, key: str): str
+
+@importc("driver_c_count_external_cc_providers_bridge")
+fn countExternalCcProvidersBridge(planText: str): int32
+
+@importc("driver_c_parse_plan_int32_or_zero_bridge")
+fn parsePlanInt32OrZeroBridge(planText: str, key: str): int32
+
+@importc("driver_c_provider_field_for_module_from_plan_text_bridge")
+fn providerFieldForModuleFromPlanTextBridge(planText: str, moduleName: str, fieldName: str): str
+
+@importc("driver_c_compiler_core_provider_source_kind_bridge")
+fn compilerCoreProviderSourceKindBridge(planText: str): str
+
+@importc("driver_c_compiler_core_provider_compile_mode_bridge")
+fn compilerCoreProviderCompileModeBridge(planText: str): str
+
+@importc("driver_c_run_stage_selfhost_host_bridge")
+fn runStageSelfhostHostBridge(): int32
+
+@importc("driver_c_run_tooling_selfhost_host_bridge")
+fn runToolingSelfhostHostBridge(): int32
+
 fn printLine(text: str) =
     os.writeLine(os.get_stdout(), text)
 
@@ -84,19 +123,22 @@ fn readIntFlagDefault(key: str, defaultValue: int32): int32 =
     return cmdline.readInt32FlagOrDefault(key, defaultValue)
 
 fn createDirAll(path: str) =
-    if len(path) == 0 || os.dirExists(path):
-        return
-    let parent = os.parentDir(path)
-    if len(parent) > 0 && parent != path:
-        createDirAll(parent)
-    if !os.dirExists(path):
-        os.createDir(path)
+    createDirAllBridge(path)
 
 fn writeTextFile(path: str, text: str) =
     writeTextFileBridge(path, text)
 
+fn joinPath2(left: str, right: str): str =
+    return joinPath2Bridge(left, right)
+
 fn currentCompilerPath(): str =
-    return os.absolutePath(cmdline.programName())
+    return programAbsolutePathBridge()
+
+fn absolutePath(path: str): str =
+    return absolutePathBridge(path)
+
+fn currentWorkingDir(): str =
+    return currentWorkingDirBridge()
 
 fn compareTextFiles(leftPath: str, rightPath: str): bool =
     return compareTextFilesBridge(leftPath, rightPath)
@@ -114,30 +156,40 @@ fn compareExpectedTextOrPanic(expectedPath: str, actualPath: str, label: str) =
     compareTextFilesOrPanicBridge(expectedPath, actualPath, label)
 
 fn parsePlanInt32OrZero(planText: str, key: str): int32 =
-    let raw = sexec.extractLineValue(planText, key)
-    if len(raw) > 0:
-        return cmdline.parseInt32(raw)
-    return 0
+    return parsePlanInt32OrZeroBridge(planText, key)
 
 fn countExternalCcProvidersFromPlanText(planText: str): int32 =
-    let providerCount = parsePlanInt32OrZero(planText, "provider_module_count")
-    var out: int32 = 0
-    for i in 0..<providerCount:
-        let compileModeKey = "provider_module." + intToStr(i) + ".compile_mode"
-        let compileMode = sexec.extractLineValue(planText, compileModeKey)
-        if compileMode == "external_cc_obj":
-            out = out + 1
-    return out
+    return countExternalCcProvidersBridge(planText)
 
 fn providerFieldForModuleFromPlanText(planText: str, moduleName: str, fieldName: str): str =
-    let providerCount = parsePlanInt32OrZero(planText, "provider_module_count")
-    for i in 0..<providerCount:
-        let nameKey = "provider_module." + intToStr(i) + ".name"
-        let providerName = sexec.extractLineValue(planText, nameKey)
-        if providerName == moduleName:
-            let fieldKey = "provider_module." + intToStr(i) + "." + fieldName
-            return sexec.extractLineValue(planText, fieldKey)
-    return ""
+    return providerFieldForModuleFromPlanTextBridge(planText, moduleName, fieldName)
+
+fn stageReleasePath(stageDir: str): str =
+    return joinPath2(stageDir, "release.txt")
+
+fn stageSystemLinkPlanPath(stageDir: str): str =
+    return joinPath2(stageDir, "system_link_plan.txt")
+
+fn stageSystemLinkExecPath(stageDir: str): str =
+    return joinPath2(stageDir, "system_link_exec.txt")
+
+fn stageBinaryPath(stageDir: str, binaryName: str): str =
+    return joinPath2(stageDir, binaryName)
+
+fn stageRootDir(outDir: str): str =
+    return joinPath2(outDir, "stages")
+
+fn stageNamedDir(outDir: str, stageName: str): str =
+    return joinPath2(stageRootDir(outDir), stageName)
+
+fn stage2ToolingDirPath(outDir: str): str =
+    return joinPath2(outDir, "stage2_tooling_selfhost")
+
+fn stage2ToolingReportPath(outDir: str): str =
+    return joinPath2(stage2ToolingDirPath(outDir), "tooling_selfhost_host.txt")
+
+fn toolingSelfhostPath(outDir: str, fileName: str): str =
+    return joinPath2(outDir, fileName)
 
 fn buildStageArtifacts(compilerPath: str,
                        sourcePath: str,
@@ -145,11 +197,11 @@ fn buildStageArtifacts(compilerPath: str,
                        stageDir: str,
                        binaryName: str): NativeStageArtifacts =
     createDirAll(stageDir)
-    let releasePath = os.joinPath(stageDir, "release.txt")
-    let systemLinkPlanPath = os.joinPath(stageDir, "system_link_plan.txt")
-    let systemLinkExecPath = os.joinPath(stageDir, "system_link_exec.txt")
-    let binaryPath = os.joinPath(stageDir, binaryName)
-    let workingDir = os.getCurrentDir()
+    let releasePath = stageReleasePath(stageDir)
+    let systemLinkPlanPath = stageSystemLinkPlanPath(stageDir)
+    let systemLinkExecPath = stageSystemLinkExecPath(stageDir)
+    let binaryPath = stageBinaryPath(stageDir, binaryName)
+    let workingDir = currentWorkingDir()
     let releaseArgv = ["release-compile", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", releasePath]
     let releaseOutput = runCompilerCommandOrPanic(compilerPath, releaseArgv, workingDir, "stage-selfhost-host release-compile failed")
     writeTextFile(releasePath, releaseOutput)
@@ -159,8 +211,8 @@ fn buildStageArtifacts(compilerPath: str,
     let systemLinkExecArgv = ["system-link-exec", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", binaryPath, "--report-out", systemLinkExecPath]
     let systemLinkExecOutput = runCompilerCommandOrPanic(compilerPath, systemLinkExecArgv, workingDir, "stage-selfhost-host system-link-exec failed")
     writeTextFile(systemLinkExecPath, systemLinkExecOutput)
-    let compilerCoreProviderSourceKind = providerFieldForModuleFromPlanText(systemLinkPlanOutput, "runtime/compiler_core_runtime_v2", "source_kind")
-    let compilerCoreProviderCompileMode = providerFieldForModuleFromPlanText(systemLinkPlanOutput, "runtime/compiler_core_runtime_v2", "compile_mode")
+    let compilerCoreProviderSourceKind = compilerCoreProviderSourceKindBridge(systemLinkPlanOutput)
+    let compilerCoreProviderCompileMode = compilerCoreProviderCompileModeBridge(systemLinkPlanOutput)
     var out: NativeStageArtifacts
     out.compilerPath = compilerPath
     out.releasePath = releasePath
@@ -507,118 +559,52 @@ fn releaseCompileKeyCoversNetworkBundle(releaseBundle: rart.ReleaseArtifactBundl
     return true
 
 fn runStageSelfhostHost(): int32 =
-    let compilerPath = os.absolutePath(readFlagDefault("--compiler", currentCompilerPath()))
-    let outDir = readFlagDefault("--out-dir", "v2/artifacts/full_selfhost")
-    let targetTriple = readFlagDefault("--target", "arm64-apple-darwin")
-    let sourcePath = "v2/src/tooling/cheng_v2.cheng"
-    let stage1Dir = os.joinPath(os.joinPath(outDir, "stages"), "cheng_v2.stage1")
-    let stage2Dir = os.joinPath(os.joinPath(outDir, "stages"), "cheng_v2.stage2")
-    let stage3Dir = os.joinPath(os.joinPath(outDir, "stages"), "cheng_v2.stage3")
-    let stage2ToolingDir = os.joinPath(outDir, "stage2_tooling_selfhost")
-    let stage2ToolingReport = os.joinPath(stage2ToolingDir, "tooling_selfhost_host.txt")
-    let stage1 = buildStageArtifacts(compilerPath, sourcePath, targetTriple, stage1Dir, "cheng_v2")
-    let stage2 = buildStageArtifacts(stage1.binaryPath, sourcePath, targetTriple, stage2Dir, "cheng_v2")
-    let stage3 = buildStageArtifacts(stage2.binaryPath, sourcePath, targetTriple, stage3Dir, "cheng_v2")
-    let releaseEqual = compareTextFiles(stage2.releasePath, stage3.releasePath)
-    let planEqual = compareTextFiles(stage2.systemLinkPlanPath, stage3.systemLinkPlanPath)
-    let execEqual = compareTextFiles(stage2.systemLinkExecPath, stage3.systemLinkExecPath)
-    let binaryEqual = compareBinaryFiles(stage2.binaryPath, stage3.binaryPath)
-    let outputCidEqual = stage2.outputFileCid == stage3.outputFileCid
-    let noExternalCProvider = stage1.externalCcProviderCount == 0 && stage2.externalCcProviderCount == 0 && stage3.externalCcProviderCount == 0 && stage2.compilerCoreProviderSourceKind == "cheng_module" && stage2.compilerCoreProviderCompileMode == "machine_obj"
-    let toolingSelfhostArgv = ["tooling-selfhost-host", "--compiler", stage2.binaryPath, "--out-dir", stage2ToolingDir]
-    let toolingSelfhostText = runCompilerCommandOrPanic(stage2.binaryPath, toolingSelfhostArgv, os.getCurrentDir(), "stage-selfhost-host stage2 tooling-selfhost-host failed")
-    writeTextFile(stage2ToolingReport, toolingSelfhostText)
-    let stage2ToolingOk = sexec.extractLineValue(toolingSelfhostText, "tooling_selfhost_host_ok") == "1"
-    let ok = releaseEqual && planEqual && execEqual && binaryEqual && outputCidEqual && stage2ToolingOk && noExternalCProvider
-    printLine("full_selfhost_ok=" + if ok: "1" else: "0")
-    printLine("compiler=" + compilerPath)
-    printLine("stage1_binary_cid=" + stage1.binaryCid)
-    printLine("stage2_binary_cid=" + stage2.binaryCid)
-    printLine("stage3_binary_cid=" + stage3.binaryCid)
-    printLine("stage2_stage3_release_equal=" + if releaseEqual: "1" else: "0")
-    printLine("stage2_stage3_system_link_plan_equal=" + if planEqual: "1" else: "0")
-    printLine("stage2_stage3_system_link_exec_equal=" + if execEqual: "1" else: "0")
-    printLine("stage2_stage3_binary_equal=" + if binaryEqual: "1" else: "0")
-    printLine("stage2_stage3_output_file_cid_equal=" + if outputCidEqual: "1" else: "0")
-    printLine("stage2_tooling_selfhost_ok=" + if stage2ToolingOk: "1" else: "0")
-    printLine("stage1_external_cc_provider_count=" + intToStr(stage1.externalCcProviderCount))
-    printLine("stage2_external_cc_provider_count=" + intToStr(stage2.externalCcProviderCount))
-    printLine("stage3_external_cc_provider_count=" + intToStr(stage3.externalCcProviderCount))
-    printLine("compiler_core_provider_source_kind=" + stage2.compilerCoreProviderSourceKind)
-    printLine("compiler_core_provider_compile_mode=" + stage2.compilerCoreProviderCompileMode)
-    printLine("compiler_core_dispatch_provider_removed=" + if noExternalCProvider: "1" else: "0")
-    printLine("emit_c_used_after_stage0=0")
-    return if ok: 0 else: 1
+    return runStageSelfhostHostBridge()
 
 fn runToolingSelfhostHost(): int32 =
-    let compilerPath = os.absolutePath(readFlagDefault("--compiler", currentCompilerPath()))
-    let outDir = readFlagDefault("--out-dir", "v2/artifacts/full_selfhost/tooling_selfhost")
-    let rootPath = "v2/examples"
-    let sourcePath = "v2/examples/network_distribution_module.cheng"
-    let targetTriple = mtarget.machineTargetContract().firstClassTargets[0]
-    createDirAll(outDir)
-    let sourceManifestStdout = os.joinPath(outDir, "source_manifest.stdout")
-    let sourceManifestFile = os.joinPath(outDir, "source_manifest.txt")
-    let rulePackStdout = os.joinPath(outDir, "rule_pack.stdout")
-    let rulePackFile = os.joinPath(outDir, "rule_pack.txt")
-    let compilerRulePackStdout = os.joinPath(outDir, "compiler_rule_pack.stdout")
-    let compilerRulePackFile = os.joinPath(outDir, "compiler_rule_pack.txt")
-    let releaseStdout = os.joinPath(outDir, "release_artifact.stdout")
-    let releaseFile = os.joinPath(outDir, "release_artifact.txt")
-    let networkSelfhostFile = os.joinPath(outDir, "network_selfhost.txt")
-    let workingDir = os.getCurrentDir()
-    let sourceManifestArgv = ["publish-source-manifest", "--root", rootPath, "--out", sourceManifestFile]
-    let sourceManifestOutput = runCompilerCommandOrPanic(compilerPath, sourceManifestArgv, workingDir, "tooling-selfhost-host publish-source-manifest failed")
-    writeTextFile(sourceManifestStdout, sourceManifestOutput)
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_source_manifest.expected", sourceManifestStdout, "tooling-selfhost-host source manifest stdout mismatch")
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_source_manifest.expected", sourceManifestFile, "tooling-selfhost-host source manifest file mismatch")
-    let rulePackArgv = ["publish-rule-pack", "--in", sourcePath, "--out", rulePackFile]
-    let rulePackOutput = runCompilerCommandOrPanic(compilerPath, rulePackArgv, workingDir, "tooling-selfhost-host publish-rule-pack failed")
-    writeTextFile(rulePackStdout, rulePackOutput)
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_rule_pack.expected", rulePackStdout, "tooling-selfhost-host rule pack stdout mismatch")
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_rule_pack.expected", rulePackFile, "tooling-selfhost-host rule pack file mismatch")
-    let compilerRulePackArgv = ["publish-compiler-rule-pack", "--in", sourcePath, "--out", compilerRulePackFile]
-    let compilerRulePackOutput = runCompilerCommandOrPanic(compilerPath, compilerRulePackArgv, workingDir, "tooling-selfhost-host publish-compiler-rule-pack failed")
-    writeTextFile(compilerRulePackStdout, compilerRulePackOutput)
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_compiler_rule_pack.expected", compilerRulePackStdout, "tooling-selfhost-host compiler rule pack stdout mismatch")
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_compiler_rule_pack.expected", compilerRulePackFile, "tooling-selfhost-host compiler rule pack file mismatch")
-    let releaseArgv = ["release-compile", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", releaseFile]
-    let releaseOutput = runCompilerCommandOrPanic(compilerPath, releaseArgv, workingDir, "tooling-selfhost-host release-compile failed")
-    writeTextFile(releaseStdout, releaseOutput)
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_release_artifact.expected", releaseStdout, "tooling-selfhost-host release stdout mismatch")
-    compareExpectedTextOrPanic("v2/tests/contracts/tooling_release_artifact.expected", releaseFile, "tooling-selfhost-host release file mismatch")
-    let networkSelfhostArgv = ["verify-network-selfhost", "--root", rootPath, "--in", sourcePath]
-    let networkSelfhostOutput = runCompilerCommandOrPanic(compilerPath, networkSelfhostArgv, workingDir, "tooling-selfhost-host verify-network-selfhost failed")
-    writeTextFile(networkSelfhostFile, networkSelfhostOutput)
-    compareExpectedTextOrPanic("v2/tests/contracts/network_selfhost.expected", networkSelfhostFile, "tooling-selfhost-host network selfhost mismatch")
-    printLine("tooling_selfhost_host_ok=1")
-    printLine("compiler=" + compilerPath)
-    printLine("source_manifest_equal=1")
-    printLine("rule_pack_equal=1")
-    printLine("compiler_rule_pack_equal=1")
-    printLine("release_compile_equal=1")
-    printLine("network_selfhost_equal=1")
+    return runToolingSelfhostHostBridge()
+
+fn isEmptyText(text: str): bool =
+    return len(text) == 0
+
+fn printMissingCid(): void =
+    printLine("missing --cid")
+
+fn printMissingCidAndFail(): int32 =
+    printMissingCid()
+    return 1
+
+fn writeLsmrAddressArtifact(cid: str, depth: int32): void =
+    writeText(lsmr.buildLsmrAddressArtifactText(cid, depth))
+
+fn writeLsmrAddressZero(cid: str, depth: int32): int32 =
+    writeLsmrAddressArtifact(cid, depth)
+    return 0
+
+fn writeLsmrRoutePlanArtifact(cid: str, depth: int32, priorityClass: str, dispersalMode: str): void =
+    writeText(lsmr.buildLsmrRoutePlanArtifactText(cid, depth, priorityClass, dispersalMode))
+
+fn writeLsmrRoutePlanZero(cid: str, depth: int32, priorityClass: str, dispersalMode: str): int32 =
+    writeLsmrRoutePlanArtifact(cid, depth, priorityClass, dispersalMode)
     return 0
 
 fn runLsmrAddress(): int32 =
     let cid = readFlagDefault("--cid", "")
     let depth = readIntFlagDefault("--depth", 4)
-    if len(cid) == 0:
-        printLine("missing --cid")
-        return 1
-    writeText(lsmr.buildLsmrAddressArtifactText(cid, depth))
-    return 0
+    if isEmptyText(cid):
+        return printMissingCidAndFail()
+    else:
+        return writeLsmrAddressZero(cid, depth)
 
 fn runLsmrRoutePlan(): int32 =
     let cid = readFlagDefault("--cid", "")
     let depth = readIntFlagDefault("--depth", 4)
     let priorityClass = readFlagDefault("--priority", "urgent")
     let dispersalMode = readFlagDefault("--dispersal", "none")
-    if len(cid) == 0:
-        printLine("missing --cid")
-        return 1
-    writeText(lsmr.buildLsmrRoutePlanArtifactText(cid, depth, priorityClass, dispersalMode))
-    return 0
+    if isEmptyText(cid):
+        return printMissingCidAndFail()
+    else:
+        return writeLsmrRoutePlanZero(cid, depth, priorityClass, dispersalMode)
 
 fn runMachinePlan(): int32 =
     let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
@@ -670,7 +656,10 @@ fn runSystemLinkExec(): int32 =
     if len(reportOut) > 0:
         writeTextFile(reportOut, bundle.reportText + "\n")
     writeText(bundle.reportText + "\n")
-    return sexec.systemLinkExecOk(bundle) ? 0 else: 1
+    if sexec.systemLinkExecOk(bundle):
+        return 0
+    else:
+        return 1
 
 fn defaultSourceManifestOut(sourcePath: str): str =
     let parts = os.splitFile(sourcePath)
@@ -680,10 +669,11 @@ fn runResolveManifest(): int32 =
     let sourcePath = readFlagDefault("--in", "")
     let root = readFlagDefault("--root", "v2/examples")
     let outPath = readFlagDefault("--out", "")
-    let bundle = if len(sourcePath) > 0:
-        mresolve.resolveCompilerCoreSourceManifest(sourcePath)
+    var bundle: mresolve.SourceManifestBundle
+    if len(sourcePath) > 0:
+        bundle = mresolve.resolveCompilerCoreSourceManifest(sourcePath)
     else:
-        mresolve.resolveSourceManifest(root)
+        bundle = mresolve.resolveSourceManifest(root)
     let text = buildSourceManifestArtifactText(bundle)
     if len(outPath) > 0:
         writeTextFile(outPath, text)
@@ -693,15 +683,15 @@ fn runResolveManifest(): int32 =
 fn runPublishSourceManifest(): int32 =
     let sourcePath = readFlagDefault("--in", "")
     let root = readFlagDefault("--root", "v2/examples")
-    let outPath = readFlagDefault("--out",
-                                  if len(sourcePath) > 0:
-                                      defaultSourceManifestOut(sourcePath)
-                                  else:
-                                      "v2/artifacts/network/source_manifest.txt")
-    let bundle = if len(sourcePath) > 0:
-        mresolve.resolveCompilerCoreSourceManifest(sourcePath)
+    var defaultOutPath: str = "v2/artifacts/network/source_manifest.txt"
+    if len(sourcePath) > 0:
+        defaultOutPath = defaultSourceManifestOut(sourcePath)
+    let outPath = readFlagDefault("--out", defaultOutPath)
+    var bundle: mresolve.SourceManifestBundle
+    if len(sourcePath) > 0:
+        bundle = mresolve.resolveCompilerCoreSourceManifest(sourcePath)
     else:
-        mresolve.resolveSourceManifest(root)
+        bundle = mresolve.resolveSourceManifest(root)
     let text = buildSourceManifestArtifactText(bundle)
     writeTextFile(outPath, text)
     writeText(text)
@@ -731,6 +721,11 @@ fn runVerifyNetworkSelfhost(): int32 =
     let manifestBundle = mresolve.resolveSourceManifest(root)
     let networkBundle = networkBundleFromSource(sourcePath)
     let releaseBundle = rart.buildReleaseArtifact(sourcePath, "exe", mtarget.machineTargetContract().firstClassTargets[0])
+    let rulePackOpCount = canonicalOpCountForDomain(networkBundle, "rule_pack")
+    let compilerRulePackOpCount = canonicalOpCountForDomain(networkBundle, "compiler_rule_pack")
+    let hasPublishSourceManifestOp = hasCanonicalOp(networkBundle, "publish_source_manifest")
+    let hasPublishRulePackOp = hasCanonicalOp(networkBundle, "publish_rule_pack")
+    let hasPublishCompilerRulePackOp = hasCanonicalOp(networkBundle, "publish_compiler_rule_pack")
     if manifestBundle.topologyCanonicalForms.len <= 0:
         printLine("network_selfhost_ok=0")
         printLine("reason=missing_topology_canonical_form")
@@ -739,17 +734,23 @@ fn runVerifyNetworkSelfhost(): int32 =
         printLine("network_selfhost_ok=0")
         printLine("reason=priority_mapping_mismatch")
         return 1
-    if !hasCanonicalOp(networkBundle, "publish_source_manifest") ||
-       !hasCanonicalOp(networkBundle, "publish_rule_pack") ||
-       !hasCanonicalOp(networkBundle, "publish_compiler_rule_pack"):
+    if !hasPublishSourceManifestOp:
         printLine("network_selfhost_ok=0")
         printLine("reason=missing_publish_ops")
         return 1
-    if canonicalOpCountForDomain(networkBundle, "rule_pack") <= 0:
+    if !hasPublishRulePackOp:
+        printLine("network_selfhost_ok=0")
+        printLine("reason=missing_publish_ops")
+        return 1
+    if !hasPublishCompilerRulePackOp:
+        printLine("network_selfhost_ok=0")
+        printLine("reason=missing_publish_ops")
+        return 1
+    if rulePackOpCount <= 0:
         printLine("network_selfhost_ok=0")
         printLine("reason=missing_rule_pack_domain_ops")
         return 1
-    if canonicalOpCountForDomain(networkBundle, "compiler_rule_pack") <= 0:
+    if compilerRulePackOpCount <= 0:
         printLine("network_selfhost_ok=0")
         printLine("reason=missing_compiler_rule_pack_domain_ops")
         return 1
@@ -785,8 +786,8 @@ fn runVerifyNetworkSelfhost(): int32 =
     printLine("runtime_unresolved_count=" + intToStr(releaseBundle.runtimeUnresolvedCount))
     printLine("native_link_closure_ok=1")
     printLine("topology_count=" + intToStr(manifestBundle.topologyCanonicalForms.len))
-    printLine("rule_pack_entry_count=" + intToStr(canonicalOpCountForDomain(networkBundle, "rule_pack")))
-    printLine("compiler_rule_pack_entry_count=" + intToStr(canonicalOpCountForDomain(networkBundle, "compiler_rule_pack")))
+    printLine("rule_pack_entry_count=" + intToStr(rulePackOpCount))
+    printLine("compiler_rule_pack_entry_count=" + intToStr(compilerRulePackOpCount))
     printLine("publish_source_manifest_present=1")
     printLine("publish_rule_pack_present=1")
     printLine("publish_compiler_rule_pack_present=1")
