@@ -16,7 +16,6 @@ Env:
   SELFHOST_PERF_MODE=<fast|strict>     Bootstrap mode for auto-build (default: fast)
   SELFHOST_PERF_TIMEOUT=<seconds>      Bootstrap timeout for auto-build (default: 60)
   SELFHOST_PERF_REUSE=<0|1>            Bootstrap reuse for auto-build (default: 1)
-  SELFHOST_PERF_STAGE0=<path>          Optional stage0 for auto-build
 
 Limits (seconds, <=0 disables check):
   SELFHOST_PERF_MAX_LOCK_WAIT          default: 10
@@ -53,7 +52,6 @@ auto_build="${SELFHOST_PERF_AUTO_BUILD:-0}"
 auto_mode="${SELFHOST_PERF_MODE:-fast}"
 auto_timeout="${SELFHOST_PERF_TIMEOUT:-60}"
 auto_reuse="${SELFHOST_PERF_REUSE:-1}"
-auto_stage0="${SELFHOST_PERF_STAGE0:-}"
 
 baseline_file_default="src/tooling/selfhost_perf_baseline.env"
 baseline_file="${SELFHOST_PERF_BASELINE:-$baseline_file_default}"
@@ -107,20 +105,11 @@ if [ ! -f "$timing_file" ]; then
   case "$auto_build" in
     1|true|TRUE|yes|YES|on|ON)
       echo "[selfhost_perf] timing missing; auto-build bootstrap session=$session mode=$auto_mode"
-      if [ "$auto_stage0" != "" ]; then
-        env SELF_OBJ_BOOTSTRAP_SESSION="$session" \
-          SELF_OBJ_BOOTSTRAP_MODE="$auto_mode" \
-          SELF_OBJ_BOOTSTRAP_TIMEOUT="$auto_timeout" \
-          SELF_OBJ_BOOTSTRAP_REUSE="$auto_reuse" \
-          SELF_OBJ_BOOTSTRAP_STAGE0="$auto_stage0" \
-          ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_selfhost_bootstrap_self_obj
-      else
-        env SELF_OBJ_BOOTSTRAP_SESSION="$session" \
-          SELF_OBJ_BOOTSTRAP_MODE="$auto_mode" \
-          SELF_OBJ_BOOTSTRAP_TIMEOUT="$auto_timeout" \
-          SELF_OBJ_BOOTSTRAP_REUSE="$auto_reuse" \
-          ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_selfhost_bootstrap_self_obj
-      fi
+      env SELF_OBJ_BOOTSTRAP_SESSION="$session" \
+        SELF_OBJ_BOOTSTRAP_MODE="$auto_mode" \
+        SELF_OBJ_BOOTSTRAP_TIMEOUT="$auto_timeout" \
+        SELF_OBJ_BOOTSTRAP_REUSE="$auto_reuse" \
+        ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_selfhost_bootstrap_self_obj
       ;;
     *)
       echo "[selfhost_perf] missing timing file: $timing_file" 1>&2

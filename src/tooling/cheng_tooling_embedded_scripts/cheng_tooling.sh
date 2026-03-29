@@ -110,6 +110,18 @@ if is_list_cmd "${1:-}"; then
   exit 0
 fi
 
+if [ "${BACKEND_DRIVER:-}" != "" ] && [ "${1:-}" = "cheng" ]; then
+  export TOOLING_ROOT="$root"
+  shift || true
+  exec sh "$scripts_dir/chengc.sh" "$@"
+fi
+
+if [ "${BACKEND_DRIVER:-}" != "" ] && [ "${1:-}" = "release-compile" ]; then
+  export TOOLING_ROOT="$root"
+  shift || true
+  exec sh "$scripts_dir/chengc.sh" "$@" --release
+fi
+
 script_path="$(resolve_repo_script "${1:-}" || true)"
 if [ "$script_path" != "" ]; then
   export TOOLING_ROOT="$root"
@@ -129,6 +141,14 @@ tooling_selfhost_stage0_for_source() {
       ;;
   esac
   return 1
+}
+
+resolve_build_driver_path() {
+  driver_raw="$1"
+  [ "$driver_raw" != "" ] || return 1
+  resolved="$(BACKEND_DRIVER="$driver_raw" BACKEND_DRIVER_ALLOW_FALLBACK=0 sh "$scripts_dir/backend_driver_path.sh" --path-only 2>/dev/null || true)"
+  [ "$resolved" != "" ] || return 1
+  printf '%s\n' "$resolved"
 }
 
 if [ "$bin" = "$canonical_wrapper_bin" ]; then
@@ -154,20 +174,25 @@ esac
 if [ "$need_build" = "1" ]; then
   mkdir -p "$(dirname "$bin")"
   if [ "$build_driver" = "" ]; then
-    if build_driver="$(tooling_selfhost_stage0_for_source "$src" 2>/dev/null || true)" && [ "$build_driver" != "" ]; then
+    if build_driver="$(resolve_build_driver_path "${BACKEND_DRIVER:-}" 2>/dev/null || true)" && [ "$build_driver" != "" ]; then
+      :
+    elif [ "${BACKEND_DRIVER:-}" != "" ]; then
+      echo "[cheng_tooling] explicit BACKEND_DRIVER rejected for tooling self-build: ${BACKEND_DRIVER:-}" 1>&2
+      exit 1
+    elif build_driver="$(tooling_selfhost_stage0_for_source "$src" 2>/dev/null || true)" && [ "$build_driver" != "" ]; then
       :
     elif [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
       build_driver="artifacts/backend_selfhost_self_obj/cheng.stage2"
-    elif [ -x "artifacts/backend_seed/cheng.stage2" ]; then
-      build_driver="artifacts/backend_seed/cheng.stage2"
     else
-      build_driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
+      build_driver="$(sh "$scripts_dir/backend_driver_path.sh" --path-only)"
     fi
+  elif build_driver="$(resolve_build_driver_path "$build_driver" 2>/dev/null || true)" && [ "$build_driver" != "" ]; then
+    :
+  else
+    echo "[cheng_tooling] explicit TOOLING_BUILD_DRIVER rejected for tooling self-build: ${TOOLING_BUILD_DRIVER:-}" 1>&2
+    exit 1
   fi
-  # tooling launcher itself uses argv pointer entry; build it under non-C-ABI pointer exemption.
   env \
-    STAGE1_NO_POINTERS_NON_C_ABI=0 \
-    STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0 \
     BACKEND_DRIVER="$build_driver" \
   ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} cheng \
     "$src" \

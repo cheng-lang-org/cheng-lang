@@ -50,6 +50,21 @@ resolve_root() {
   return 1
 }
 
+tooling_exec_is_repo_wrapper() {
+  candidate="$1"
+  if [ "$candidate" = "" ] || [ ! -f "$candidate" ]; then
+    return 1
+  fi
+  first_line="$(sed -n '1p' "$candidate" 2>/dev/null || true)"
+  case "$first_line" in
+    '#!'*sh*)
+      grep -Fxq 'exec sh "$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh" "$@"' "$candidate" 2>/dev/null
+      return $?
+      ;;
+  esac
+  return 1
+}
+
 script_is_self_trampoline() {
   subcmd="$1"
   script_path="$2"
@@ -58,6 +73,8 @@ script_is_self_trampoline() {
 
 is_native_only_repo_bypass() {
   case "${1:-}" in
+    build-backend-driver|build_backend_driver|\
+    bootstrap-pure|bootstrap_pure|bootstrap|\
     verify_backend_noalias_opt|verify_backend_egraph_cost|verify_backend_dod_opt_regression)
       return 0
       ;;
@@ -137,6 +154,7 @@ tooling_resolve_strict_sidecar_contract() {
   resolved_sidecar_mode=""
   resolved_sidecar_bundle=""
   resolved_sidecar_compiler=""
+  resolved_sidecar_real_driver=""
   resolved_sidecar_child_mode=""
   resolved_sidecar_outer_companion=""
   if [ "$root" = "" ]; then
@@ -152,6 +170,8 @@ tooling_resolve_strict_sidecar_contract() {
   [ -s "$resolved_sidecar_bundle" ] || return 1
   resolved_sidecar_compiler="$(sh "$sidecar_resolver" --root:"$root" --field:compiler)"
   [ -x "$resolved_sidecar_compiler" ] || return 1
+  resolved_sidecar_real_driver="$(sh "$sidecar_resolver" --root:"$root" --field:real_driver)"
+  [ -x "$resolved_sidecar_real_driver" ] || return 1
   resolved_sidecar_child_mode="$(sh "$sidecar_resolver" --root:"$root" --field:child_mode)"
   case "$resolved_sidecar_child_mode" in
     cli|outer_cli)
@@ -171,6 +191,10 @@ run_one() {
   bin="$1"
   shift || true
   [ -x "$bin" ] || return 127
+  if tooling_exec_is_repo_wrapper "$bin"; then
+    printf '%s\n' "[cheng_tooling.real.bin] refusing repo-wrapper trampoline candidate: $bin" 1>&2
+    return 127
+  fi
   if tooling_build_global_force_direct "$@"; then
     if ! tooling_resolve_strict_sidecar_contract; then
       printf '%s\n' "[cheng_tooling.real.bin] missing strict fresh Cheng sidecar contract for direct build-global" 1>&2
@@ -185,6 +209,7 @@ run_one() {
       BACKEND_UIR_SIDECAR_MODE="$resolved_sidecar_mode" \
       BACKEND_UIR_SIDECAR_BUNDLE="$resolved_sidecar_bundle" \
       BACKEND_UIR_SIDECAR_COMPILER="$resolved_sidecar_compiler" \
+      TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER="$resolved_sidecar_real_driver" \
       BACKEND_UIR_SIDECAR_CHILD_MODE="$resolved_sidecar_child_mode" \
       BACKEND_UIR_SIDECAR_OUTER_COMPILER="$resolved_sidecar_outer_companion" \
       "$bin" "$@"
@@ -197,6 +222,10 @@ run_with_fallback() {
   first="$1"
   second="$2"
   shift 2 || true
+  if tooling_exec_is_repo_wrapper "$first"; then
+    run_one "$second" "$@"
+    return $?
+  fi
   if [ ! -x "$first" ]; then
     run_one "$second" "$@"
     return $?

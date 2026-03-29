@@ -1,0 +1,403 @@
+import std/os
+import std/seqs
+import std/strings as strings
+import std/bytes
+import std/rawbytes as rawbytes
+import std/crypto/sha256 as sha256
+import compiler/driver/identity_v2 as ident
+import compiler/driver/manifest_resolver_v2 as manifest
+import compiler/machine/machine_pipeline_v2 as mpipeline
+import compiler/machine/target_contract as mtarget
+import compiler/obj/obj_image_v2 as oimg
+import compiler/obj/obj_file_v2 as ofile
+import runtime/core_runtime_v2 as corun
+import runtime/compiler_core_runtime_v2 as crun
+import runtime/strings_v2 as srun
+import runtime/unimaker_runtime_contract_v2 as urun
+import runtime/network_distribution_runtime_v2 as nrun
+
+type
+    RuntimeProviderObjectBundle =
+        version: str
+        modulePath: str
+        sourcePath: str
+        sourceManifestCid: str
+        targetTriple: str
+        sourceKind: str
+        compileMode: str
+        executionModel: str
+        traceSymbol: str
+        runtimeTargets: str[]
+        runtimeSymbols: str[]
+        objImageVersion: str
+        objImageCid: str
+        objFileVersion: str
+        objFileCid: str
+        objFileByteCount: int32
+        objFileBytes: uint8[]
+        objectText: str
+
+fn runtimeProviderObjectVersion(): str =
+    return "v2.runtime_provider_object.v1"
+
+fn runtimeProviderSourcePath(modulePath: str): str =
+    if modulePath == "runtime/core_runtime_v2":
+        return corun.coreRuntimeContract().providerSourcePath
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        return crun.compilerCoreRuntimeContract().providerSourcePath
+    if modulePath == "runtime/strings_v2":
+        return srun.stringRuntimeContract().providerSourcePath
+    if modulePath == "runtime/unimaker_runtime_contract_v2":
+        return urun.unimakerRuntimeContract().providerSourcePath
+    if modulePath == "runtime/network_distribution_runtime_v2":
+        return nrun.networkDistributionRuntimeContract().providerSourcePath
+    panic("v2 runtime provider object: unsupported provider source path module " + modulePath)
+
+fn runtimeProviderSourceKind(modulePath: str): str =
+    if modulePath == "runtime/core_runtime_v2":
+        return corun.coreRuntimeContract().providerSourceKind
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        return crun.compilerCoreRuntimeContract().providerSourceKind
+    if modulePath == "runtime/strings_v2":
+        return srun.stringRuntimeContract().providerSourceKind
+    if modulePath == "runtime/unimaker_runtime_contract_v2":
+        return urun.unimakerRuntimeContract().providerSourceKind
+    if modulePath == "runtime/network_distribution_runtime_v2":
+        return nrun.networkDistributionRuntimeContract().providerSourceKind
+    panic("v2 runtime provider object: unsupported provider source kind module " + modulePath)
+
+fn runtimeProviderCompileMode(modulePath: str): str =
+    if modulePath == "runtime/core_runtime_v2":
+        return corun.coreRuntimeContract().providerCompileMode
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        return crun.compilerCoreRuntimeContract().providerCompileMode
+    if modulePath == "runtime/strings_v2":
+        return srun.stringRuntimeContract().providerCompileMode
+    if modulePath == "runtime/unimaker_runtime_contract_v2":
+        return urun.unimakerRuntimeContract().providerCompileMode
+    if modulePath == "runtime/network_distribution_runtime_v2":
+        return nrun.networkDistributionRuntimeContract().providerCompileMode
+    panic("v2 runtime provider object: unsupported provider compile mode module " + modulePath)
+
+fn runtimeProviderIsExternalCc(modulePath: str): bool =
+    return runtimeProviderCompileMode(modulePath) == "external_cc_obj"
+
+fn sanitizePathPart(text: str): str =
+    var out: str = ""
+    for i in 0..<len(text):
+        let ch = text[i]
+        if (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9'):
+            out = out + strings.sliceBytes(text, i, 1)
+        else:
+            out = out + "_"
+    return out
+
+fn createDirAll(path: str) =
+    if len(path) == 0 || os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if len(parent) > 0 && parent != path:
+        createDirAll(parent)
+    if !os.dirExists(path):
+        os.createDir(path)
+
+fn ensureParentDir(path: str) =
+    let parent = os.parentDir(path)
+    if len(parent) > 0:
+        createDirAll(parent)
+
+fn containsSlash(text: str): bool =
+    for i in 0..<len(text):
+        if text[i] == '/':
+            return true
+    return false
+
+fn sha256HexByteBuffer(buf: bytes.ByteBuffer): str =
+    if buf.data == nil || buf.len <= 0:
+        return rawbytes.bytesToHex(sha256.sha256Digest(rawbytes.emptyBytes()))
+    return rawbytes.bytesToHex(sha256.sha256Digest(rawbytes.Bytes(data: buf.data, len: buf.len)))
+
+fn byteBufferToUint8Seq(buf: bytes.ByteBuffer): uint8[] =
+    var out: uint8[]
+    out = []
+    for i in 0..<buf.len:
+        add(out, uint8(bytes.bufByteAt(buf, i) & 255))
+    return out
+
+fn runtimeProviderManifestPackageId(sourcePath: str): str =
+    if len(sourcePath) >= len("v2/src/runtime/") &&
+       strings.sliceBytes(sourcePath, 0, len("v2/src/runtime/")) == "v2/src/runtime/":
+        return "pkg://cheng/v2/runtime"
+    if len(sourcePath) >= len("v2/bootstrap/") &&
+       strings.sliceBytes(sourcePath, 0, len("v2/bootstrap/")) == "v2/bootstrap/":
+        return "pkg://cheng/v2/bootstrap"
+    return "pkg://cheng/v2"
+
+fn runtimeProviderManifestPackageIdForSources(sourcePaths: str[]): str =
+    if sourcePaths.len <= 0:
+        return "pkg://cheng/v2"
+    let first = runtimeProviderManifestPackageId(sourcePaths[0])
+    for i in 1..<sourcePaths.len:
+        if runtimeProviderManifestPackageId(sourcePaths[i]) != first:
+            return "pkg://cheng/v2"
+    return first
+
+fn buildExplicitManifest(rootPath: str, sourcePaths: str[]): manifest.SourceManifestBundle =
+    var out: manifest.SourceManifestBundle
+    out.version = "v2.source_manifest.v1"
+    out.rootPath = rootPath
+    out.packageId = runtimeProviderManifestPackageIdForSources(sourcePaths)
+    out.filePaths = []
+    out.fileCids = []
+    out.fileTopologyRefs = []
+    for i in 0..<sourcePaths.len:
+        let fileBytes = bytes.readFileBytes(sourcePaths[i])
+        add(out.filePaths, sourcePaths[i])
+        add(out.fileCids, sha256HexByteBuffer(fileBytes))
+        add(out.fileTopologyRefs, "")
+    var lines: str[]
+    lines = []
+    add(lines, "source_manifest_version=" + out.version)
+    add(lines, "root=" + out.rootPath)
+    add(lines, "package=" + out.packageId)
+    add(lines, "topology_count=0")
+    add(lines, "file_count=" + intToStr(sourcePaths.len))
+    for i in 0..<sourcePaths.len:
+        add(lines, "file." + intToStr(i) + ".path=" + out.filePaths[i])
+        add(lines, "file." + intToStr(i) + ".cid=" + out.fileCids[i])
+        add(lines, "file." + intToStr(i) + ".topology_ref=")
+    out.manifestText = manifest.joinLines(lines)
+    out.manifestCid = ident.sha256HexText(out.manifestText)
+    return out
+
+fn runtimeProviderExternalCcCompileInputs(modulePath: str): str[] =
+    var out: str[]
+    out = []
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        add(out, "v2/src/runtime/compiler_core_native_provider.c")
+        add(out, "v2/src/runtime/compiler_core_native_dispatch.c")
+        add(out, "v2/src/runtime/compiler_core_native_dispatch.h")
+        add(out, "v2/bootstrap/cheng_v2c_tooling.c")
+        add(out, "v2/bootstrap/cheng_v2c_tooling.h")
+        add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
+        add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
+        add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
+        add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
+        return out
+    panic("v2 runtime provider object: unsupported external cc compile inputs module " + modulePath)
+
+fn runtimeProviderExternalCcSourceFiles(modulePath: str): str[] =
+    var out: str[]
+    out = []
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        add(out, "v2/src/runtime/compiler_core_native_provider.c")
+        add(out, "v2/src/runtime/compiler_core_native_dispatch.c")
+        add(out, "v2/bootstrap/cheng_v2c_tooling.c")
+        add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
+        add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
+        add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
+        add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
+        return out
+    panic("v2 runtime provider object: unsupported external cc source files module " + modulePath)
+
+fn compileExternalRuntimeProviderObject(sourcePaths: str[],
+                                        modulePath: str,
+                                        targetTriple: str): uint8[] =
+    let safeModule = sanitizePathPart(modulePath)
+    let safeTarget = sanitizePathPart(targetTriple)
+    let ccPath = os.getEnvDefault("CC", "")
+    let compilerFile = len(ccPath) > 0 && !containsSlash(ccPath) ? "/usr/bin/env" :
+                       len(ccPath) > 0 ? ccPath : "/usr/bin/cc"
+    let combinedObjPath = os.joinPath("v2/artifacts/bootstrap",
+                                      "provider_" + safeModule + "_" + safeTarget + ".o")
+    ensureParentDir(combinedObjPath)
+    var objectPaths: str[]
+    objectPaths = []
+    for i in 0..<sourcePaths.len:
+        let objPath = os.joinPath("v2/artifacts/bootstrap",
+                                  "provider_" + safeModule + "_" + safeTarget + "." + intToStr(i) + ".o")
+        ensureParentDir(objPath)
+        var argv: str[]
+        argv = []
+        if len(ccPath) > 0 && !containsSlash(ccPath):
+            add(argv, ccPath)
+        add(argv, "-std=c11")
+        add(argv, "-O2")
+        add(argv, "-Wall")
+        add(argv, "-Wextra")
+        add(argv, "-pedantic")
+        if targetTriple == "arm64-apple-darwin":
+            add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
+        add(argv, "-c")
+        add(argv, sourcePaths[i])
+        add(argv, "-o")
+        add(argv, objPath)
+        var envOverrides: str[]
+        let res = os.execFileCapture(compilerFile,
+                                     argv,
+                                     envOverrides,
+                                     os.getCurrentDir(),
+                                     true,
+                                     120)
+        if os.execCmdResultExitCode(res) != 0:
+            panic("v2 runtime provider object: failed to compile external runtime provider\n" +
+                  os.execCmdResultOutput(res))
+        add(objectPaths, objPath)
+    if objectPaths.len == 1:
+        let objBytes = bytes.readFileBytes(objectPaths[0])
+        return byteBufferToUint8Seq(objBytes)
+    if targetTriple != "arm64-apple-darwin":
+        panic("v2 runtime provider object: external cc combine target unsupported " + targetTriple)
+    var linkArgv: str[]
+    linkArgv = []
+    add(linkArgv, "-r")
+    add(linkArgv, "-arch")
+    add(linkArgv, mtarget.machineTargetDarwinArchName(targetTriple))
+    add(linkArgv, "-o")
+    add(linkArgv, combinedObjPath)
+    for i in 0..<objectPaths.len:
+        add(linkArgv, objectPaths[i])
+    var linkEnvOverrides: str[]
+    let linkRes = os.execFileCapture("/usr/bin/ld",
+                                     linkArgv,
+                                     linkEnvOverrides,
+                                     os.getCurrentDir(),
+                                     true,
+                                     120)
+    if os.execCmdResultExitCode(linkRes) != 0:
+        panic("v2 runtime provider object: failed to combine external runtime provider objects\n" +
+              os.execCmdResultOutput(linkRes))
+    let objBytes = bytes.readFileBytes(combinedObjPath)
+    return byteBufferToUint8Seq(objBytes)
+
+fn runtimeProviderTargets(modulePath: str): str[] =
+    if modulePath == "runtime/core_runtime_v2":
+        return corun.coreRuntimeTargets()
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        return crun.compilerCoreRuntimeTargets()
+    if modulePath == "runtime/strings_v2":
+        return srun.stringRuntimeTargets()
+    if modulePath == "runtime/unimaker_runtime_contract_v2":
+        return urun.unimakerRuntimeTargets()
+    if modulePath == "runtime/network_distribution_runtime_v2":
+        return nrun.networkDistributionRuntimeTargets()
+    panic("v2 runtime provider object: unsupported provider module " + modulePath)
+
+fn runtimeProviderExecutionModel(modulePath: str): str =
+    if modulePath == "runtime/core_runtime_v2":
+        return corun.coreRuntimeContract().executionModel
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        return crun.compilerCoreRuntimeContract().executionModel
+    if modulePath == "runtime/strings_v2":
+        return srun.stringRuntimeContract().executionModel
+    if modulePath == "runtime/unimaker_runtime_contract_v2":
+        return urun.unimakerRuntimeContract().executionModel
+    if modulePath == "runtime/network_distribution_runtime_v2":
+        return nrun.networkDistributionRuntimeContract().executionModel
+    panic("v2 runtime provider object: unsupported provider execution model module " + modulePath)
+
+fn runtimeProviderTraceSymbol(modulePath: str): str =
+    if modulePath == "runtime/core_runtime_v2":
+        return corun.coreRuntimeContract().traceSymbol
+    if modulePath == "runtime/compiler_core_runtime_v2":
+        return crun.compilerCoreRuntimeContract().traceSymbol
+    if modulePath == "runtime/strings_v2":
+        return srun.stringRuntimeContract().traceSymbol
+    if modulePath == "runtime/unimaker_runtime_contract_v2":
+        return urun.unimakerRuntimeContract().traceSymbol
+    if modulePath == "runtime/network_distribution_runtime_v2":
+        return nrun.networkDistributionRuntimeContract().traceSymbol
+    panic("v2 runtime provider object: unsupported provider trace symbol module " + modulePath)
+
+fn materializeRuntimeProviderObject(modulePath: str,
+                                    targetTriple: str): RuntimeProviderObjectBundle =
+    let sourcePath = runtimeProviderSourcePath(modulePath)
+    let compileInputs = runtimeProviderIsExternalCc(modulePath) ?
+        runtimeProviderExternalCcCompileInputs(modulePath) :
+        [sourcePath]
+    let sourceManifest = runtimeProviderIsExternalCc(modulePath) ?
+        buildExplicitManifest(sourcePath, compileInputs) :
+        manifest.resolveCompilerCoreSourceManifest(sourcePath)
+    let runtimeTargets = runtimeProviderTargets(modulePath)
+    var out: RuntimeProviderObjectBundle
+    out.version = runtimeProviderObjectVersion()
+    out.modulePath = modulePath
+    out.sourcePath = sourcePath
+    out.sourceManifestCid = sourceManifest.manifestCid
+    out.targetTriple = targetTriple
+    out.sourceKind = runtimeProviderSourceKind(modulePath)
+    out.compileMode = runtimeProviderCompileMode(modulePath)
+    out.executionModel = runtimeProviderExecutionModel(modulePath)
+    out.traceSymbol = runtimeProviderTraceSymbol(modulePath)
+    out.runtimeTargets = []
+    out.runtimeSymbols = []
+    for i in 0..<runtimeTargets.len:
+        add(out.runtimeTargets, runtimeTargets[i])
+        add(out.runtimeSymbols, mpipeline.machineCallSymbolName(targetTriple, runtimeTargets[i]))
+    if runtimeProviderIsExternalCc(modulePath):
+        out.objFileBytes = compileExternalRuntimeProviderObject(runtimeProviderExternalCcSourceFiles(modulePath),
+                                                                modulePath,
+                                                                targetTriple)
+        let objBytes = rawbytes.Bytes(data: out.objFileBytes.buffer, len: out.objFileBytes.len)
+        let objCid = rawbytes.bytesToHex(sha256.sha256Digest(objBytes))
+        out.objImageVersion = "v2.obj_image.external_cc.v1"
+        out.objImageCid = objCid
+        out.objFileVersion = "v2.obj_file.external_cc.v1"
+        out.objFileCid = objCid
+        out.objFileByteCount = out.objFileBytes.len
+    else:
+        let machine = modulePath == "runtime/compiler_core_runtime_v2" ?
+            mpipeline.buildCompilerCoreArgvEntryProviderMachineModule(sourcePath,
+                                                                      sourceManifest.manifestCid,
+                                                                      runtimeTargets[0],
+                                                                      targetTriple) :
+            mpipeline.buildRuntimeProviderMachineModule(modulePath,
+                                                        sourceManifest.manifestCid,
+                                                        runtimeTargets,
+                                                        targetTriple)
+        let objImage = oimg.writeObjImage(machine)
+        let objFile = ofile.buildObjFile(machine)
+        out.objImageVersion = objImage.version
+        out.objImageCid = objImage.imageCid
+        out.objFileVersion = objFile.version
+        out.objFileCid = objFile.fileCid
+        out.objFileByteCount = objFile.fileByteCount
+        out.objFileBytes = objFile.fileBytes
+    var lines: str[]
+    lines = []
+    add(lines, "runtime_provider_object_version=" + out.version)
+    add(lines, "module_path=" + out.modulePath)
+    add(lines, "source_path=" + out.sourcePath)
+    add(lines, "source_manifest_cid=" + out.sourceManifestCid)
+    add(lines, "target=" + out.targetTriple)
+    add(lines, "source_kind=" + out.sourceKind)
+    add(lines, "compile_mode=" + out.compileMode)
+    add(lines, "execution_model=" + out.executionModel)
+    add(lines, "trace_symbol=" + out.traceSymbol)
+    add(lines, "compile_input_count=" + intToStr(compileInputs.len))
+    for i in 0..<compileInputs.len:
+        add(lines, "compile_input." + intToStr(i) + ".path=" + compileInputs[i])
+    add(lines, "runtime_target_count=" + intToStr(out.runtimeTargets.len))
+    for i in 0..<out.runtimeTargets.len:
+        add(lines, "runtime_target." + intToStr(i) + ".name=" + out.runtimeTargets[i])
+        add(lines, "runtime_target." + intToStr(i) + ".symbol=" + out.runtimeSymbols[i])
+    add(lines, "provider_symbol_count=" + intToStr(out.runtimeSymbols.len))
+    for i in 0..<out.runtimeSymbols.len:
+        add(lines, "provider_symbol." + intToStr(i) + "=" + out.runtimeSymbols[i])
+    add(lines, "obj_image_version=" + out.objImageVersion)
+    add(lines, "obj_image_cid=" + out.objImageCid)
+    add(lines, "obj_file_version=" + out.objFileVersion)
+    add(lines, "obj_file_cid=" + out.objFileCid)
+    add(lines, "obj_file_byte_count=" + intToStr(out.objFileByteCount))
+    out.objectText = manifest.joinLines(lines)
+    return out
+
+fn materializeRuntimeProviderObjects(modulePaths: str[],
+                                     targetTriple: str): RuntimeProviderObjectBundle[] =
+    var out: RuntimeProviderObjectBundle[]
+    out = []
+    for i in 0..<modulePaths.len:
+        add(out, materializeRuntimeProviderObject(modulePaths[i], targetTriple))
+    return out

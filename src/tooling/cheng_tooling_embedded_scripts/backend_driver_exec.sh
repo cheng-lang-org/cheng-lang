@@ -6,24 +6,65 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 cd "$root"
 
+driver_is_script_shim() {
+  bin="$1"
+  [ -f "$bin" ] || return 1
+  first_line="$(sed -n '1p' "$bin" 2>/dev/null || true)"
+  case "$first_line" in
+    '#!'*) return 0 ;;
+  esac
+  return 1
+}
+
+driver_current_contract_ok() {
+  bin="$1"
+  [ -x "$bin" ] || return 1
+  if driver_is_script_shim "$bin"; then
+    return 0
+  fi
+  if ! command -v strings >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v rg >/dev/null 2>&1; then
+    return 0
+  fi
+  set +e
+  strings "$bin" 2>/dev/null | rg -q '^BACKEND_OUTPUT$'
+  has_backend_output="$?"
+  strings "$bin" 2>/dev/null | rg -q '^CHENG_BACKEND_OUTPUT$'
+  has_legacy_output="$?"
+  strings "$bin" 2>/dev/null | rg -q 'backend_driver: output path required'
+  has_output_msg="$?"
+  set -e
+  if [ "$has_output_msg" -eq 0 ] && [ "$has_legacy_output" -eq 0 ] && [ "$has_backend_output" -ne 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
 resolve_real_driver() {
   if [ "${BACKEND_DRIVER_REAL:-}" != "" ]; then
     if [ -x "${BACKEND_DRIVER_REAL}" ]; then
-      printf '%s\n' "${BACKEND_DRIVER_REAL}"
-      return 0
+      real_candidate="${BACKEND_DRIVER_REAL}"
+      if driver_current_contract_ok "$real_candidate"; then
+        printf '%s\n' "$real_candidate"
+        return 0
+      fi
+      echo "[backend_driver_exec] BACKEND_DRIVER_REAL uses rejected legacy driver contract: ${BACKEND_DRIVER_REAL}" >&2
+      return 1
     fi
     echo "[backend_driver_exec] BACKEND_DRIVER_REAL is not runnable: ${BACKEND_DRIVER_REAL}" >&2
     return 1
   fi
 
   for cand in \
+    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" \
+    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage1" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng.stage1" \
     "$root/artifacts/backend_driver/cheng" \
-    "$root/artifacts/backend_seed/cheng.stage2" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng_stage0_default" \
-    "$root/artifacts/backend_driver/cheng.fixed3" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng_stage0_prod" \
-    "$root/dist/releases/current/cheng"; do
-    if [ -x "$cand" ]; then
+    "$root/artifacts/backend_driver/cheng.fixed3"; do
+    if [ -x "$cand" ] && driver_current_contract_ok "$cand"; then
       printf '%s\n' "$cand"
       return 0
     fi

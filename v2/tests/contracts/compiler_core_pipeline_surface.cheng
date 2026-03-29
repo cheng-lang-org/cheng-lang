@@ -1,0 +1,585 @@
+import std/system
+import std/cmdline as cmdline
+import std/os as os
+import std/rawbytes
+import std/bytes as bytes
+import std/buffer as buffer
+import compiler/frontend/v2_source_parser as parser
+import compiler/driver/compiler_core_pipeline_v2 as cpipe
+import compiler/driver/manifest_resolver_v2 as mresolve
+import compiler/semantic_facts/compiler_core_facts_v2 as cfacts
+import compiler/low_uir/compiler_core_lowering_v2 as clow
+import compiler/machine/machine_pipeline_v2 as mpipeline
+import compiler/machine/target_contract as mtarget
+import compiler/obj/obj_image_v2 as oimg
+import compiler/obj/obj_file_v2 as ofile
+import compiler/driver/release_artifact_v2 as rart
+
+fn hasManifestPath(bundle: mresolve.SourceManifestBundle, path: str): bool =
+    for i in 0..<bundle.filePaths.len:
+        if bundle.filePaths[i] == path:
+            return true
+    return false
+
+fn hasCompileKeyLine(bundle: rart.ReleaseArtifactBundle, line: str): bool =
+    return rart.releaseArtifactCompileKeyHasLine(bundle, line)
+
+fn hasExecOpKind(plan: clow.LowUirCompilerCorePlan, startIdx: int32, endIdx: int32, kind: str): bool =
+    for i in startIdx..<endIdx:
+        if plan.opKinds[i] == kind:
+            return true
+    return false
+
+fn findLabelIndex(labels: str[], label: str): int32 =
+    for i in 0..<labels.len:
+        if labels[i] == label:
+            return i
+    return -1
+
+fn directIdentityI32(x: int32): int32 =
+    return x
+
+fn directNegI32(x: int32): int32 =
+    return -x
+
+fn directAddI32(x: int32, y: int32): int32 =
+    return x + y
+
+fn directEqI32(x: int32, y: int32): bool =
+    return x == y
+
+fn directLocalAliasI32(x: int32): int32 =
+    let alias = x
+    return alias
+
+fn directIfElseEqI32(x: int32, y: int32): int32 =
+    if x == y:
+        return 1
+    else:
+        return 0
+
+fn directCall2I32(x: int32, y: int32): int32 =
+    return directAddI32(x, y)
+
+fn directAliasCall2I32(x: int32, y: int32): int32 =
+    let left = x
+    return directAddI32(left, y)
+
+fn directPickSecond3(a: int32, b: int32, c: int32): int32 =
+    return b
+
+fn directCall3Mixed(y: int32): int32 =
+    return directPickSecond3(7, y, 9)
+
+fn directAliasCall3Mixed(y: int32): int32 =
+    let alias = y
+    return directPickSecond3(7, alias, 9)
+
+fn directPickFourth4(a: int32, b: int32, c: int32, d: int32): int32 =
+    return d
+
+fn directCall4Mixed(y: int32): int32 =
+    return directPickFourth4(7, 8, y, 10)
+
+@importc("abs")
+fn directExternAbs(x: int32): int32
+
+fn directExternAbsWrap(x: int32): int32 =
+    return directExternAbs(x)
+
+@importc("cheng_fread")
+fn directExternFread4(ptrArg: ptr, size: int64, count: int64, stream: ptr): int32
+
+fn directExternFread4Wrap(ptrArg: ptr, size: int64, count: int64, stream: ptr): int32 =
+    return directExternFread4(ptrArg, size, count, stream)
+
+@importc("free")
+fn directExternFree(p: ptr): void
+
+fn directExternFreeWrap(p: ptr): void =
+    directExternFree(p)
+
+fn directAliasVoidCallPtr(p: ptr): void =
+    let q = p
+    directExternFree(q)
+
+fn directVoid3(a: int32, b: int32, c: int32): void =
+    return
+
+fn directCall3VoidMixed(y: int32): void =
+    directVoid3(7, y, 9)
+
+fn directVoid4(a: int32, b: int32, c: int32, d: int32): void =
+    return
+
+fn directAliasCall4VoidMixed(y: int32): void =
+    let alias = y
+    directVoid4(7, 8, alias, 10)
+
+fn directVoid2(a: int32, b: int32): void =
+    return
+
+fn directNestedVoidSecondArg(y: int32): void =
+    directVoid2(directIdentityI32(7), y)
+
+fn directDropOnlyVoid(argc: int32, argv: ptr): void =
+    argc
+    argv
+
+fn directZeroBytesLocal(): Bytes =
+    var out: Bytes
+    out.data = nil
+    out.len = 0
+    return out
+
+fn directBufferToBytes(buf: buffer.ByteBuffer): Bytes =
+    return buf.data
+
+fn directReturnBytesParam(value: Bytes): Bytes =
+    return value
+
+fn directReturnStrSeqParam(values: str[]): str[] =
+    return values
+
+fn directBufferLenViaField(buf: buffer.ByteBuffer): int32 =
+    return bytesLen(buf.data)
+
+fn directWrapZeroBytesAsBuffer(): buffer.ByteBuffer =
+    var out: buffer.ByteBuffer
+    out.data = directZeroBytesLocal()
+    return out
+
+fn directIsEmptyViaCall(buf: buffer.ByteBuffer): bool =
+    return directBufferLenViaField(buf) <= 0
+
+fn directReaderFromBytes(buf: bytes.ByteBuffer): bytes.ByteReader =
+    var out: bytes.ByteReader
+    out.buf = buf
+    out.pos = 0
+    return out
+
+fn directCanReadLike(r: bytes.ByteReader, count: int32): bool =
+    return r.pos + count <= r.buf.len
+
+fn directVersionText(): str =
+    return "v2.direct.version"
+
+fn directLiteralStrArgSink(text: str): int32 =
+    return 0
+
+fn directCallLiteralStr(): int32 =
+    return directLiteralStrArgSink("v2.literal.arg")
+
+fn directLiteralStrVoidSink(text: str): void =
+    return
+
+fn directCallLiteralStrVoid(): void =
+    directLiteralStrVoidSink("v2.literal.arg")
+
+fn directElemSizeInt32(): int32 =
+    return int32(sizeof(int32))
+
+fn directElemSizeInt64(): int32 =
+    return int32(sizeof(int64))
+
+fn directElemSizeUint8(): int32 =
+    return int32(sizeof(uint8))
+
+@importc("cheng_file_exists")
+fn directProbeFileExistsRaw(path: cstring): int32
+
+fn directNestedReadFileText(path: str): str =
+    return bytes.bytesReadFileAll(system.strToCStringTemp(path))
+
+fn directNestedFileExists(path: str): bool =
+    return directProbeFileExistsRaw(system.strToCStringTemp(path)) != 0
+
+fn directFallbackPrimary4(a: ptr, b: int32, c: int32, d: int32): ptr =
+    return nil
+
+fn directFallbackSecondary4(a: ptr, b: int32, c: int32, d: int32): ptr =
+    return a
+
+fn directFallbackPtr4(a: ptr, b: int32, c: int32, d: int32): ptr =
+    let found = directFallbackPrimary4(a, b, c, d)
+    if found != nil:
+        return found
+    return directFallbackSecondary4(a, b, c, d)
+
+fn directGetCurrentDirWrap(): str =
+    return system.getCurrentDir()
+
+fn directBytesReadFileAllWrap(path: cstring): str =
+    return bytes.bytesReadFileAll(path)
+
+fn directCmdlineHasArgs(): bool =
+    return cmdline.paramCount() > 0
+
+fn directCurrentCompilerPathLike(): str =
+    return os.absolutePath(cmdline.programName())
+
+fn directWriteTextLike(text: str): void =
+    os.write(os.get_stdout(), text)
+
+fn main(): int32 =
+    let target = mtarget.machineTargetContract().firstClassTargets[0]
+    let sourcePath = "v2/src/tooling/cheng_v2.cheng"
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    let bundle = cpipe.compileCompilerCoreSourceClosure(sourcePath)
+    let manifest = mresolve.resolveCompilerCoreSourceManifest(sourcePath)
+    let machine = mpipeline.lowerCompilerCorePlanToMachine(bundle.lowPlan, target)
+    let image = oimg.writeObjImage(machine)
+    let objFile = ofile.buildObjFile(machine)
+    let artifact = rart.buildReleaseArtifact(sourcePath, "exe", target)
+    assert(bundle.version == "v2.driver.compiler_core_pipeline.v1", "v2 compiler core pipeline version")
+    assert(parsed.compilerCoreProgram.topLevelKinds.len > 0, "v2 compiler core entry parse count")
+    assert(bundle.program.modules.len <= 1, "v2 compiler core module count bounded")
+    assert(bundle.program.imports.len > 0, "v2 compiler core import count")
+    assert(bundle.program.routines.len > 0, "v2 compiler core routine count")
+    assert(bundle.program.routineParams.len > 0, "v2 compiler core routine param count")
+    assert(bundle.program.stmts.len > 0, "v2 compiler core stmt count")
+    assert(bundle.program.exprs.len > 0, "v2 compiler core expr count")
+    assert(bundle.lowPlan.itemIds.len > 0, "v2 compiler core low_uir item count")
+    assert(bundle.lowPlan.canonicalOps[0] == "compiler_import_bind", "v2 compiler core first canonical op")
+    assert(bundle.lowPlan.importCategories[0] == "stdlib", "v2 compiler core first import category")
+    assert(bundle.lowPlan.labels[0] == "std/cmdline", "v2 compiler core first label")
+    assert(bundle.lowPlan.labels[bundle.lowPlan.labels.len - 1] == "main", "v2 compiler core last label")
+    assert(bundle.lowPlan.executableAstReady[bundle.lowPlan.labels.len - 1], "v2 compiler core main ast ready")
+    assert(bundle.lowPlan.canonicalOps[bundle.lowPlan.labels.len - 1] == "compiler_fn_exec", "v2 compiler core main executable op")
+    assert(bundle.lowPlan.returnTypeTexts[bundle.lowPlan.labels.len - 1] == "int32", "v2 compiler core main return type")
+    assert(bundle.lowPlan.paramCounts[bundle.lowPlan.labels.len - 1] == 1, "v2 compiler core main param count")
+    assert(bundle.lowPlan.routineOpCounts[bundle.lowPlan.labels.len - 1] > 0, "v2 compiler core main exec op count")
+    assert(bundle.lowPlan.routineOpHashes[bundle.lowPlan.labels.len - 1] != "", "v2 compiler core main exec op hash")
+    let mainOpStart = bundle.lowPlan.routineOpStarts[bundle.lowPlan.labels.len - 1]
+    let mainOpEnd = mainOpStart + bundle.lowPlan.routineOpCounts[bundle.lowPlan.labels.len - 1]
+    assert(hasExecOpKind(bundle.lowPlan, mainOpStart, mainOpEnd, "call"), "v2 compiler core main has call op")
+    assert(hasExecOpKind(bundle.lowPlan, mainOpStart, mainOpEnd, "jump_if_false"), "v2 compiler core main has conditional branch op")
+    assert(cfacts.compilerCoreExecutableAstItemCount(bundle.facts) >= 3, "v2 compiler core executable ast routine count")
+    assert(cfacts.compilerCoreExecutableParamCount(bundle.facts) >= 1, "v2 compiler core executable param count")
+    assert(cfacts.compilerCoreExecutableStmtCount(bundle.facts) >= 14, "v2 compiler core executable stmt count")
+    assert(cfacts.compilerCoreExecutableExprCount(bundle.facts) >= 26, "v2 compiler core executable expr count")
+    assert(manifest.packageId == "pkg://cheng/v2", "v2 compiler core manifest package id")
+    assert(manifest.filePaths.len > 0, "v2 compiler core manifest file count")
+    assert(hasManifestPath(manifest, "v2/cheng-package.toml"), "v2 compiler core manifest package root")
+    assert(hasManifestPath(manifest, "v2/src/tooling/cheng_v2.cheng"), "v2 compiler core manifest entry")
+    assert(hasManifestPath(manifest, "v2/src/tooling/cheng_tooling_v2.cheng"), "v2 compiler core manifest tooling entry")
+    assert(hasManifestPath(manifest, "v2/src/compiler/driver/runtime_provider_object_v2.cheng"), "v2 compiler core manifest runtime provider object")
+    assert(hasManifestPath(manifest, "v2/src/compiler/driver/system_link_plan_v2.cheng"), "v2 compiler core manifest system link plan")
+    assert(hasManifestPath(manifest, "v2/src/runtime/core_runtime_v2.cheng"), "v2 compiler core manifest core runtime provider")
+    assert(hasManifestPath(manifest, "v2/src/runtime/compiler_core_runtime_v2.cheng"), "v2 compiler core manifest compiler runtime provider")
+    assert(hasManifestPath(manifest, "src/std/cmdline.cheng"), "v2 compiler core manifest std cmdline")
+    assert(hasManifestPath(manifest, "src/std/os.cheng"), "v2 compiler core manifest std os")
+    assert(hasManifestPath(manifest, "src/std/system.cheng"), "v2 compiler core manifest std system")
+    assert(machine.moduleKind == "compiler_core", "v2 compiler core machine module kind")
+    assert(machine.itemIds.len > 0, "v2 compiler core machine item count")
+    assert(machine.callSymbolNames[0] != "", "v2 compiler core first runtime target")
+    let printUsageMachineIdx = findLabelIndex(bundle.lowPlan.labels, "printUsage")
+    assert(printUsageMachineIdx >= 0, "v2 compiler core machine printUsage index")
+    assert(machine.metadataOperandModes[printUsageMachineIdx] == "exec_plan_payload", "v2 compiler core machine executable payload mode")
+    assert(parser.findText(machine.localPayloadTexts[printUsageMachineIdx], "exec_op_count=") >= 0, "v2 compiler core machine executable payload count")
+    assert(parser.findText(machine.localPayloadTexts[printUsageMachineIdx], "exec_op_hash=") >= 0, "v2 compiler core machine executable payload hash")
+    assert(parser.findText(machine.localPayloadTexts[printUsageMachineIdx], "op.0=") >= 0, "v2 compiler core machine executable payload first op")
+    let stackAlignMachineIdx = findLabelIndex(bundle.lowPlan.labels, "machineTargetStackAlignBytes")
+    assert(stackAlignMachineIdx >= 0, "v2 compiler core machine stack align helper index")
+    assert(machine.metadataOperandModes[stackAlignMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct exec payload mode")
+    assert(machine.callSymbolNames[stackAlignMachineIdx] == "", "v2 compiler core machine direct exec call symbol cleared")
+    assert(machine.instructionWordHex[stackAlignMachineIdx] == "a9bf7bfd;910003fd;52800200;a8c17bfd;d65f03c0", "v2 compiler core machine direct exec words")
+    let identityMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directIdentityI32")
+    assert(identityMachineIdx >= 0, "v2 compiler core machine direct identity index")
+    assert(machine.metadataOperandModes[identityMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct identity payload mode")
+    assert(machine.callSymbolNames[identityMachineIdx] == "", "v2 compiler core machine direct identity call symbol cleared")
+    assert(machine.instructionWordHex[identityMachineIdx] == "a9bf7bfd;910003fd;a8c17bfd;d65f03c0", "v2 compiler core machine direct identity words")
+    let negMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directNegI32")
+    assert(negMachineIdx >= 0, "v2 compiler core machine direct neg index")
+    assert(machine.metadataOperandModes[negMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct neg payload mode")
+    assert(machine.callSymbolNames[negMachineIdx] == "", "v2 compiler core machine direct neg call symbol cleared")
+    assert(machine.instructionWordHex[negMachineIdx] == "a9bf7bfd;910003fd;4b0003e0;a8c17bfd;d65f03c0", "v2 compiler core machine direct neg words")
+    let addMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directAddI32")
+    assert(addMachineIdx >= 0, "v2 compiler core machine direct add index")
+    assert(machine.metadataOperandModes[addMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct add payload mode")
+    assert(machine.callSymbolNames[addMachineIdx] == "", "v2 compiler core machine direct add call symbol cleared")
+    assert(machine.instructionWordHex[addMachineIdx] == "a9bf7bfd;910003fd;0b010000;a8c17bfd;d65f03c0", "v2 compiler core machine direct add words")
+    let eqMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directEqI32")
+    assert(eqMachineIdx >= 0, "v2 compiler core machine direct eq index")
+    assert(machine.metadataOperandModes[eqMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct eq payload mode")
+    assert(machine.callSymbolNames[eqMachineIdx] == "", "v2 compiler core machine direct eq call symbol cleared")
+    assert(machine.instructionWordHex[eqMachineIdx] == "a9bf7bfd;910003fd;6b01001f;54000060;52800000;14000002;52800020;a8c17bfd;d65f03c0", "v2 compiler core machine direct eq words")
+    let localAliasMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directLocalAliasI32")
+    assert(localAliasMachineIdx >= 0, "v2 compiler core machine direct local alias index")
+    assert(machine.metadataOperandModes[localAliasMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct local alias payload mode")
+    assert(machine.callSymbolNames[localAliasMachineIdx] == "", "v2 compiler core machine direct local alias call symbol cleared")
+    assert(machine.instructionWordHex[localAliasMachineIdx] == "a9bf7bfd;910003fd;a8c17bfd;d65f03c0", "v2 compiler core machine direct local alias words")
+    let ifElseMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directIfElseEqI32")
+    assert(ifElseMachineIdx >= 0, "v2 compiler core machine direct if else index")
+    assert(machine.metadataOperandModes[ifElseMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct if else payload mode")
+    assert(machine.callSymbolNames[ifElseMachineIdx] == "", "v2 compiler core machine direct if else call symbol cleared")
+    assert(machine.instructionWordHex[ifElseMachineIdx] == "a9bf7bfd;910003fd;6b01001f;54000041;52800020;14000001;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct if else words")
+    let directCall2MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCall2I32")
+    assert(directCall2MachineIdx >= 0, "v2 compiler core machine direct call2 index")
+    assert(machine.metadataOperandModes[directCall2MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct call2 payload mode")
+    assert(machine.callSymbolNames[directCall2MachineIdx] != "", "v2 compiler core machine direct call2 call symbol present")
+    assert(machine.instructionWordHex[directCall2MachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct call2 words")
+    let directAliasCall2MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directAliasCall2I32")
+    assert(directAliasCall2MachineIdx >= 0, "v2 compiler core machine direct alias call2 index")
+    assert(machine.metadataOperandModes[directAliasCall2MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct alias call2 payload mode")
+    assert(machine.callSymbolNames[directAliasCall2MachineIdx] != "", "v2 compiler core machine direct alias call2 call symbol present")
+    assert(machine.instructionWordHex[directAliasCall2MachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct alias call2 words")
+    let directCall3MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCall3Mixed")
+    assert(directCall3MachineIdx >= 0, "v2 compiler core machine direct call3 index")
+    assert(machine.metadataOperandModes[directCall3MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct call3 payload mode")
+    assert(machine.callSymbolNames[directCall3MachineIdx] != "", "v2 compiler core machine direct call3 call symbol present")
+    assert(machine.instructionWordHex[directCall3MachineIdx] == "a9bf7bfd;910003fd;aa0003e9;528000e0;aa0903e1;52800122;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct call3 words")
+    let directAliasCall3MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directAliasCall3Mixed")
+    assert(directAliasCall3MachineIdx >= 0, "v2 compiler core machine direct alias call3 index")
+    assert(machine.metadataOperandModes[directAliasCall3MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct alias call3 payload mode")
+    assert(machine.callSymbolNames[directAliasCall3MachineIdx] != "", "v2 compiler core machine direct alias call3 call symbol present")
+    assert(machine.instructionWordHex[directAliasCall3MachineIdx] == "a9bf7bfd;910003fd;aa0003e9;528000e0;aa0903e1;52800122;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct alias call3 words")
+    let directCall4MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCall4Mixed")
+    assert(directCall4MachineIdx >= 0, "v2 compiler core machine direct call4 index")
+    assert(machine.metadataOperandModes[directCall4MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct call4 payload mode")
+    assert(machine.callSymbolNames[directCall4MachineIdx] != "", "v2 compiler core machine direct call4 call symbol present")
+    assert(machine.instructionWordHex[directCall4MachineIdx] == "a9bf7bfd;910003fd;aa0003e9;528000e0;52800101;aa0903e2;52800143;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct call4 words")
+    let directExternAbsMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directExternAbsWrap")
+    assert(directExternAbsMachineIdx >= 0, "v2 compiler core machine direct extern abs index")
+    assert(machine.metadataOperandModes[directExternAbsMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct extern abs payload mode")
+    assert(machine.callSymbolNames[directExternAbsMachineIdx] == mpipeline.machineLibcSymbolName(target, "abs"), "v2 compiler core machine direct extern abs call symbol")
+    assert(machine.instructionWordHex[directExternAbsMachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct extern abs words")
+    let directExternFread4MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directExternFread4Wrap")
+    assert(directExternFread4MachineIdx >= 0, "v2 compiler core machine direct extern fread4 index")
+    assert(machine.metadataOperandModes[directExternFread4MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct extern fread4 payload mode")
+    assert(machine.callSymbolNames[directExternFread4MachineIdx] == mpipeline.machineLibcSymbolName(target, "cheng_fread"), "v2 compiler core machine direct extern fread4 call symbol")
+    assert(machine.instructionWordHex[directExternFread4MachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct extern fread4 words")
+    let directExternFreeMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directExternFreeWrap")
+    assert(directExternFreeMachineIdx >= 0, "v2 compiler core machine direct extern free index")
+    assert(machine.metadataOperandModes[directExternFreeMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct extern free payload mode")
+    assert(machine.callSymbolNames[directExternFreeMachineIdx] == mpipeline.machineLibcSymbolName(target, "free"), "v2 compiler core machine direct extern free call symbol")
+    assert(machine.instructionWordHex[directExternFreeMachineIdx] == "a9bf7bfd;910003fd;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct extern free words")
+    let directAliasVoidMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directAliasVoidCallPtr")
+    assert(directAliasVoidMachineIdx >= 0, "v2 compiler core machine direct alias void call index")
+    assert(machine.metadataOperandModes[directAliasVoidMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct alias void call payload mode")
+    assert(machine.callSymbolNames[directAliasVoidMachineIdx] == mpipeline.machineLibcSymbolName(target, "free"), "v2 compiler core machine direct alias void call symbol")
+    assert(machine.instructionWordHex[directAliasVoidMachineIdx] == "a9bf7bfd;910003fd;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct alias void call words")
+    let directCall3VoidMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCall3VoidMixed")
+    assert(directCall3VoidMachineIdx >= 0, "v2 compiler core machine direct call3 void index")
+    assert(machine.metadataOperandModes[directCall3VoidMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct call3 void payload mode")
+    assert(machine.callSymbolNames[directCall3VoidMachineIdx] != "", "v2 compiler core machine direct call3 void call symbol present")
+    assert(machine.instructionWordHex[directCall3VoidMachineIdx] == "a9bf7bfd;910003fd;aa0003e9;528000e0;aa0903e1;52800122;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct call3 void words")
+    let directAliasCall4VoidMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directAliasCall4VoidMixed")
+    assert(directAliasCall4VoidMachineIdx >= 0, "v2 compiler core machine direct alias call4 void index")
+    assert(machine.metadataOperandModes[directAliasCall4VoidMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct alias call4 void payload mode")
+    assert(machine.callSymbolNames[directAliasCall4VoidMachineIdx] != "", "v2 compiler core machine direct alias call4 void call symbol present")
+    assert(machine.instructionWordHex[directAliasCall4VoidMachineIdx] == "a9bf7bfd;910003fd;528000e0;52800101;aa0003e2;52800143;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct alias call4 void words")
+    let directNestedVoidSecondArgMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directNestedVoidSecondArg")
+    assert(directNestedVoidSecondArgMachineIdx >= 0, "v2 compiler core machine direct nested void second arg index")
+    assert(machine.metadataOperandModes[directNestedVoidSecondArgMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct nested void second arg payload mode")
+    assert(parser.findText(machine.callSymbolNames[directNestedVoidSecondArgMachineIdx], ";") >= 0, "v2 compiler core machine direct nested void second arg call symbols present")
+    assert(machine.functionRelocCounts[directNestedVoidSecondArgMachineIdx] == 2, "v2 compiler core machine direct nested void second arg reloc count")
+    assert(machine.instructionWordHex[directNestedVoidSecondArgMachineIdx] == "a9bf7bfd;910003fd;d10043ff;aa0003e1;f90003e1;528000e0;94000000;f94003e1;910043ff;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct nested void second arg words")
+    let dropOnlyMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directDropOnlyVoid")
+    assert(dropOnlyMachineIdx >= 0, "v2 compiler core machine direct drop only index")
+    assert(machine.metadataOperandModes[dropOnlyMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct drop only payload mode")
+    let nestedReadMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directNestedReadFileText")
+    assert(nestedReadMachineIdx >= 0, "v2 compiler core machine direct nested read text index")
+    assert(machine.metadataOperandModes[nestedReadMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct nested read text payload mode")
+    assert(machine.callSymbolNames[nestedReadMachineIdx] != "", "v2 compiler core machine direct nested read text call symbols present")
+    assert(machine.instructionWordHex[nestedReadMachineIdx] == "a9bf7bfd;910003fd;94000000;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct nested read text words")
+    let nestedExistsMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directNestedFileExists")
+    assert(nestedExistsMachineIdx >= 0, "v2 compiler core machine direct nested exists index")
+    assert(machine.metadataOperandModes[nestedExistsMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct nested exists payload mode")
+    assert(machine.callSymbolNames[nestedExistsMachineIdx] != "", "v2 compiler core machine direct nested exists call symbols present")
+    assert(machine.instructionWordHex[nestedExistsMachineIdx] == "a9bf7bfd;910003fd;94000000;94000000;52800001;6b01001f;54000061;52800000;14000002;52800020;a8c17bfd;d65f03c0", "v2 compiler core machine direct nested exists words")
+    let currentDirMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directGetCurrentDirWrap")
+    assert(currentDirMachineIdx >= 0, "v2 compiler core machine direct getCurrentDir index")
+    assert(machine.metadataOperandModes[currentDirMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct getCurrentDir payload mode")
+    assert(machine.callSymbolNames[currentDirMachineIdx] != "", "v2 compiler core machine direct getCurrentDir call symbols present")
+    assert(machine.instructionWordHex[currentDirMachineIdx] == "a9bf7bfd;910003fd;94000000;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct getCurrentDir words")
+    let bytesReadFileAllMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directBytesReadFileAllWrap")
+    assert(bytesReadFileAllMachineIdx >= 0, "v2 compiler core machine direct bytesReadFileAll index")
+    assert(machine.metadataOperandModes[bytesReadFileAllMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct bytesReadFileAll payload mode")
+    assert(machine.callSymbolNames[bytesReadFileAllMachineIdx] != "", "v2 compiler core machine direct bytesReadFileAll call symbols present")
+    assert(machine.instructionWordHex[bytesReadFileAllMachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct bytesReadFileAll words")
+    let cmdlineHasArgsMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCmdlineHasArgs")
+    assert(cmdlineHasArgsMachineIdx >= 0, "v2 compiler core machine direct cmdline has args index")
+    assert(machine.metadataOperandModes[cmdlineHasArgsMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct cmdline has args payload mode")
+    assert(machine.callSymbolNames[cmdlineHasArgsMachineIdx] != "", "v2 compiler core machine direct cmdline has args call symbol present")
+    assert(machine.functionRelocCounts[cmdlineHasArgsMachineIdx] == 1, "v2 compiler core machine direct cmdline has args reloc count")
+    let cmdSetEmptyMachineIdx = findLabelIndex(bundle.lowPlan.labels, "cmdSetEmpty")
+    assert(cmdSetEmptyMachineIdx >= 0, "v2 compiler core machine cmdSetEmpty index")
+    assert(machine.metadataOperandModes[cmdSetEmptyMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine cmdSetEmpty payload mode")
+    assert(machine.callSymbolNames[cmdSetEmptyMachineIdx] == "", "v2 compiler core machine cmdSetEmpty call symbol cleared")
+    assert(machine.instructionWordHex[cmdSetEmptyMachineIdx] == "a9bf7bfd;910003fd;f900001f;b900081f;b9000c1f;b900101f;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine cmdSetEmpty words")
+    let cmdSetStrMachineIdx = findLabelIndex(bundle.lowPlan.labels, "cmdSetStr")
+    assert(cmdSetStrMachineIdx >= 0, "v2 compiler core machine cmdSetStr index")
+    assert(machine.metadataOperandModes[cmdSetStrMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine cmdSetStr payload mode")
+    assert(machine.callSymbolNames[cmdSetStrMachineIdx] == "", "v2 compiler core machine cmdSetStr call symbol cleared")
+    assert(machine.instructionWordHex[cmdSetStrMachineIdx] == "a9bf7bfd;910003fd;f9000001;b9000802;b9000c03;b9001004;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine cmdSetStr words")
+    let currentCompilerPathLikeMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCurrentCompilerPathLike")
+    assert(currentCompilerPathLikeMachineIdx >= 0, "v2 compiler core machine direct currentCompilerPath-like index")
+    assert(machine.metadataOperandModes[currentCompilerPathLikeMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct currentCompilerPath-like payload mode")
+    assert(parser.findText(machine.callSymbolNames[currentCompilerPathLikeMachineIdx], ";") >= 0, "v2 compiler core machine direct currentCompilerPath-like call symbols present")
+    assert(machine.functionRelocCounts[currentCompilerPathLikeMachineIdx] == 2, "v2 compiler core machine direct currentCompilerPath-like reloc count")
+    assert(machine.instructionWordHex[currentCompilerPathLikeMachineIdx] == "a9bf7bfd;910003fd;94000000;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct currentCompilerPath-like words")
+    let writeTextLikeMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directWriteTextLike")
+    assert(writeTextLikeMachineIdx >= 0, "v2 compiler core machine direct writeText-like index")
+    assert(machine.metadataOperandModes[writeTextLikeMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct writeText-like payload mode")
+    assert(parser.findText(machine.callSymbolNames[writeTextLikeMachineIdx], ";") >= 0, "v2 compiler core machine direct writeText-like call symbols present")
+    assert(machine.functionRelocCounts[writeTextLikeMachineIdx] == 2, "v2 compiler core machine direct writeText-like reloc count")
+    assert(machine.instructionWordHex[writeTextLikeMachineIdx] == "a9bf7bfd;910003fd;d10043ff;aa0003e1;f90003e1;94000000;f94003e1;910043ff;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct writeText-like words")
+    let printLineMachineIdx = findLabelIndex(bundle.lowPlan.labels, "printLine")
+    assert(printLineMachineIdx >= 0, "v2 compiler core machine printLine index")
+    assert(machine.metadataOperandModes[printLineMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine printLine payload mode")
+    assert(parser.findText(machine.callSymbolNames[printLineMachineIdx], ";") >= 0, "v2 compiler core machine printLine nested call symbols present")
+    assert(machine.functionRelocCounts[printLineMachineIdx] == 2, "v2 compiler core machine printLine reloc count")
+    assert(machine.instructionWordHex[printLineMachineIdx] == "a9bf7bfd;910003fd;d10043ff;aa0003e1;f90003e1;94000000;f94003e1;910043ff;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine printLine words")
+    let writeTextMachineIdx = findLabelIndex(bundle.lowPlan.labels, "writeText")
+    assert(writeTextMachineIdx >= 0, "v2 compiler core machine writeText index")
+    assert(machine.metadataOperandModes[writeTextMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine writeText payload mode")
+    assert(parser.findText(machine.callSymbolNames[writeTextMachineIdx], ";") >= 0, "v2 compiler core machine writeText nested call symbols present")
+    assert(machine.functionRelocCounts[writeTextMachineIdx] == 2, "v2 compiler core machine writeText reloc count")
+    assert(machine.instructionWordHex[writeTextMachineIdx] == "a9bf7bfd;910003fd;d10043ff;aa0003e1;f90003e1;94000000;f94003e1;910043ff;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine writeText words")
+    let currentCompilerPathMachineIdx = findLabelIndex(bundle.lowPlan.labels, "currentCompilerPath")
+    assert(currentCompilerPathMachineIdx >= 0, "v2 compiler core machine currentCompilerPath index")
+    assert(machine.metadataOperandModes[currentCompilerPathMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine currentCompilerPath payload mode")
+    assert(parser.findText(machine.callSymbolNames[currentCompilerPathMachineIdx], ";") >= 0, "v2 compiler core machine currentCompilerPath call symbols present")
+    assert(machine.functionRelocCounts[currentCompilerPathMachineIdx] == 2, "v2 compiler core machine currentCompilerPath reloc count")
+    assert(machine.instructionWordHex[currentCompilerPathMachineIdx] == "a9bf7bfd;910003fd;94000000;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine currentCompilerPath words")
+    assert(machine.callSymbolNames[dropOnlyMachineIdx] == "", "v2 compiler core machine direct drop only call symbol cleared")
+    assert(machine.instructionWordHex[dropOnlyMachineIdx] == "a9bf7bfd;910003fd;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct drop only words")
+    let directZeroBytesMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directZeroBytesLocal")
+    assert(directZeroBytesMachineIdx >= 0, "v2 compiler core machine direct zero bytes index")
+    assert(machine.metadataOperandModes[directZeroBytesMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct zero bytes payload mode")
+    assert(machine.callSymbolNames[directZeroBytesMachineIdx] == "", "v2 compiler core machine direct zero bytes call symbol cleared")
+    let directBufferToBytesMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directBufferToBytes")
+    assert(directBufferToBytesMachineIdx >= 0, "v2 compiler core machine direct buffer to bytes index")
+    assert(machine.metadataOperandModes[directBufferToBytesMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct buffer to bytes payload mode")
+    assert(machine.callSymbolNames[directBufferToBytesMachineIdx] == "", "v2 compiler core machine direct buffer to bytes call symbol cleared")
+    assert(machine.instructionWordHex[directBufferToBytesMachineIdx] == "a9bf7bfd;910003fd;a8c17bfd;d65f03c0", "v2 compiler core machine direct buffer to bytes words")
+    let directReturnBytesParamMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directReturnBytesParam")
+    assert(directReturnBytesParamMachineIdx >= 0, "v2 compiler core machine direct bytes param index")
+    assert(machine.metadataOperandModes[directReturnBytesParamMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct bytes param payload mode")
+    assert(machine.callSymbolNames[directReturnBytesParamMachineIdx] == "", "v2 compiler core machine direct bytes param call symbol cleared")
+    assert(machine.instructionWordHex[directReturnBytesParamMachineIdx] == "a9bf7bfd;910003fd;a8c17bfd;d65f03c0", "v2 compiler core machine direct bytes param words")
+    let directReturnStrSeqParamMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directReturnStrSeqParam")
+    assert(directReturnStrSeqParamMachineIdx >= 0, "v2 compiler core machine direct str seq param index")
+    assert(machine.metadataOperandModes[directReturnStrSeqParamMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct str seq param payload mode")
+    assert(machine.callSymbolNames[directReturnStrSeqParamMachineIdx] == "", "v2 compiler core machine direct str seq param call symbol cleared")
+    assert(machine.instructionWordHex[directReturnStrSeqParamMachineIdx] == "a9bf7bfd;910003fd;a8c17bfd;d65f03c0", "v2 compiler core machine direct str seq param words")
+    let directBufferLenMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directBufferLenViaField")
+    assert(directBufferLenMachineIdx >= 0, "v2 compiler core machine direct buffer len index")
+    assert(machine.metadataOperandModes[directBufferLenMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct buffer len payload mode")
+    assert(machine.callSymbolNames[directBufferLenMachineIdx] != "", "v2 compiler core machine direct buffer len call symbol present")
+    assert(machine.instructionWordHex[directBufferLenMachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct buffer len words")
+    let directWrapZeroBytesMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directWrapZeroBytesAsBuffer")
+    assert(directWrapZeroBytesMachineIdx >= 0, "v2 compiler core machine direct zero bytes buffer index")
+    assert(machine.metadataOperandModes[directWrapZeroBytesMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct zero bytes buffer payload mode")
+    assert(machine.callSymbolNames[directWrapZeroBytesMachineIdx] == "", "v2 compiler core machine direct zero bytes buffer call symbol cleared")
+    assert(machine.instructionWordHex[directWrapZeroBytesMachineIdx] == "a9bf7bfd;910003fd;d2800000;52800001;a8c17bfd;d65f03c0", "v2 compiler core machine direct zero bytes buffer words")
+    let directIsEmptyViaCallMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directIsEmptyViaCall")
+    assert(directIsEmptyViaCallMachineIdx >= 0, "v2 compiler core machine direct is empty via call index")
+    assert(machine.metadataOperandModes[directIsEmptyViaCallMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct is empty via call payload mode")
+    assert(machine.callSymbolNames[directIsEmptyViaCallMachineIdx] != "", "v2 compiler core machine direct is empty via call symbol present")
+    assert(machine.instructionWordHex[directIsEmptyViaCallMachineIdx] == "a9bf7bfd;910003fd;94000000;52800001;6b01001f;5400006d;52800000;14000002;52800020;a8c17bfd;d65f03c0", "v2 compiler core machine direct is empty via call words")
+    let directReaderMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directReaderFromBytes")
+    assert(directReaderMachineIdx >= 0, "v2 compiler core machine direct reader index")
+    assert(machine.metadataOperandModes[directReaderMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct reader payload mode")
+    assert(machine.callSymbolNames[directReaderMachineIdx] == "", "v2 compiler core machine direct reader call symbol cleared")
+    assert(machine.instructionWordHex[directReaderMachineIdx] == "a9bf7bfd;910003fd;52800002;a8c17bfd;d65f03c0", "v2 compiler core machine direct reader words")
+    let directCanReadMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCanReadLike")
+    assert(directCanReadMachineIdx >= 0, "v2 compiler core machine direct canRead index")
+    assert(machine.metadataOperandModes[directCanReadMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct canRead payload mode")
+    assert(machine.callSymbolNames[directCanReadMachineIdx] == "", "v2 compiler core machine direct canRead call symbol cleared")
+    assert(machine.instructionWordHex[directCanReadMachineIdx] == "a9bf7bfd;910003fd;2a0203e9;2a0303ea;0b0a0129;2a0103ea;6b0a013f;5400006d;52800000;14000002;52800020;a8c17bfd;d65f03c0", "v2 compiler core machine direct canRead words")
+    let directVersionMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directVersionText")
+    assert(directVersionMachineIdx >= 0, "v2 compiler core machine direct version index")
+    assert(machine.metadataOperandModes[directVersionMachineIdx] == "direct_exec_cstring_payload", "v2 compiler core machine direct version payload mode")
+    assert(machine.callSymbolNames[directVersionMachineIdx] == "", "v2 compiler core machine direct version call symbol cleared")
+    assert(machine.localPayloadTexts[directVersionMachineIdx] == "v2.direct.version", "v2 compiler core machine direct version payload text")
+    assert(machine.instructionWordHex[directVersionMachineIdx] == "a9bf7bfd;910003fd;90000000;91000000;52800221;a8c17bfd;d65f03c0", "v2 compiler core machine direct version words")
+    let directLiteralStrMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCallLiteralStr")
+    assert(directLiteralStrMachineIdx >= 0, "v2 compiler core machine direct literal str call index")
+    assert(machine.metadataOperandModes[directLiteralStrMachineIdx] == "direct_exec_call_cstring_payload", "v2 compiler core machine direct literal str call payload mode")
+    assert(machine.callSymbolNames[directLiteralStrMachineIdx] != "", "v2 compiler core machine direct literal str call symbol present")
+    assert(machine.localPayloadTexts[directLiteralStrMachineIdx] == "v2.literal.arg", "v2 compiler core machine direct literal str call payload text")
+    assert(machine.functionRelocCounts[directLiteralStrMachineIdx] == 3, "v2 compiler core machine direct literal str call reloc count")
+    assert(machine.instructionWordHex[directLiteralStrMachineIdx] == "a9bf7bfd;910003fd;90000000;91000000;528001c1;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct literal str call words")
+    let directLiteralStrVoidMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCallLiteralStrVoid")
+    assert(directLiteralStrVoidMachineIdx >= 0, "v2 compiler core machine direct literal str void index")
+    assert(machine.metadataOperandModes[directLiteralStrVoidMachineIdx] == "direct_exec_call_cstring_payload", "v2 compiler core machine direct literal str void payload mode")
+    assert(machine.callSymbolNames[directLiteralStrVoidMachineIdx] != "", "v2 compiler core machine direct literal str void call symbol present")
+    assert(machine.localPayloadTexts[directLiteralStrVoidMachineIdx] == "v2.literal.arg", "v2 compiler core machine direct literal str void payload text")
+    assert(machine.functionRelocCounts[directLiteralStrVoidMachineIdx] == 3, "v2 compiler core machine direct literal str void reloc count")
+    assert(machine.instructionWordHex[directLiteralStrVoidMachineIdx] == "a9bf7bfd;910003fd;90000000;91000000;528001c1;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct literal str void words")
+    let directFallbackPtr4MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directFallbackPtr4")
+    assert(directFallbackPtr4MachineIdx >= 0, "v2 compiler core machine direct fallback ptr4 index")
+    assert(machine.metadataOperandModes[directFallbackPtr4MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct fallback ptr4 payload mode")
+    assert(strings.contains(machine.callSymbolNames[directFallbackPtr4MachineIdx], "_cheng_v2_compiler_core_compiler_fn_exec_"), "v2 compiler core machine direct fallback ptr4 call symbols present")
+    let argCountMachineIdx = findLabelIndex(bundle.lowPlan.labels, "argCount")
+    assert(argCountMachineIdx >= 0, "v2 compiler core machine argCount index")
+    assert(machine.metadataOperandModes[argCountMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine argCount payload mode")
+    assert(machine.callSymbolNames[argCountMachineIdx] == mpipeline.machineLibcSymbolName(target, "paramCount"), "v2 compiler core machine argCount call symbol")
+    assert(machine.instructionWordHex[argCountMachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine argCount words")
+    let udpErrnoMachineIdx = findLabelIndex(bundle.lowPlan.labels, "udpErrno")
+    assert(udpErrnoMachineIdx >= 0, "v2 compiler core machine udpErrno index")
+    assert(machine.metadataOperandModes[udpErrnoMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine udpErrno payload mode")
+    assert(machine.callSymbolNames[udpErrnoMachineIdx] == mpipeline.machineLibcSymbolName(target, "cheng_errno"), "v2 compiler core machine udpErrno call symbol")
+    assert(machine.instructionWordHex[udpErrnoMachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine udpErrno words")
+    let ptrSizeMachineIdx = findLabelIndex(bundle.lowPlan.labels, "ptrSize")
+    assert(ptrSizeMachineIdx >= 0, "v2 compiler core machine ptrSize index")
+    assert(machine.metadataOperandModes[ptrSizeMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine ptrSize payload mode")
+    assert(machine.callSymbolNames[ptrSizeMachineIdx] == mpipeline.machineLibcSymbolName(target, "cheng_ptr_size"), "v2 compiler core machine ptrSize call symbol")
+    assert(machine.instructionWordHex[ptrSizeMachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine ptrSize words")
+    let elemSizeInt32MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directElemSizeInt32")
+    assert(elemSizeInt32MachineIdx >= 0, "v2 compiler core machine elemSize int32 index")
+    assert(machine.metadataOperandModes[elemSizeInt32MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine elemSize int32 payload mode")
+    assert(machine.callSymbolNames[elemSizeInt32MachineIdx] == "", "v2 compiler core machine elemSize int32 call symbol cleared")
+    assert(machine.instructionWordHex[elemSizeInt32MachineIdx] == "a9bf7bfd;910003fd;52800080;a8c17bfd;d65f03c0", "v2 compiler core machine elemSize int32 words")
+    let elemSizeInt64MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directElemSizeInt64")
+    assert(elemSizeInt64MachineIdx >= 0, "v2 compiler core machine elemSize int64 index")
+    assert(machine.metadataOperandModes[elemSizeInt64MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine elemSize int64 payload mode")
+    assert(machine.callSymbolNames[elemSizeInt64MachineIdx] == "", "v2 compiler core machine elemSize int64 call symbol cleared")
+    assert(machine.instructionWordHex[elemSizeInt64MachineIdx] == "a9bf7bfd;910003fd;52800100;a8c17bfd;d65f03c0", "v2 compiler core machine elemSize int64 words")
+    let elemSizeUint8MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directElemSizeUint8")
+    assert(elemSizeUint8MachineIdx >= 0, "v2 compiler core machine elemSize uint8 index")
+    assert(machine.metadataOperandModes[elemSizeUint8MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine elemSize uint8 payload mode")
+    assert(machine.callSymbolNames[elemSizeUint8MachineIdx] == "", "v2 compiler core machine elemSize uint8 call symbol cleared")
+    assert(machine.instructionWordHex[elemSizeUint8MachineIdx] == "a9bf7bfd;910003fd;52800020;a8c17bfd;d65f03c0", "v2 compiler core machine elemSize uint8 words")
+    let execExitMachineIdx = findLabelIndex(bundle.lowPlan.labels, "execCmdResultExitCode")
+    assert(execExitMachineIdx >= 0, "v2 compiler core machine exec exit index")
+    assert(machine.metadataOperandModes[execExitMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine exec exit payload mode")
+    assert(machine.callSymbolNames[execExitMachineIdx] == "", "v2 compiler core machine exec exit call symbol cleared")
+    assert(machine.instructionWordHex[execExitMachineIdx] == "a9bf7bfd;910003fd;2a0203e0;a8c17bfd;d65f03c0", "v2 compiler core machine exec exit words")
+    let execOutputMachineIdx = findLabelIndex(bundle.lowPlan.labels, "execCmdResultOutput")
+    assert(execOutputMachineIdx >= 0, "v2 compiler core machine exec output index")
+    assert(machine.metadataOperandModes[execOutputMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine exec output payload mode")
+    assert(machine.callSymbolNames[execOutputMachineIdx] == "", "v2 compiler core machine exec output call symbol cleared")
+    assert(machine.instructionWordHex[execOutputMachineIdx] == "a9bf7bfd;910003fd;a8c17bfd;d65f03c0", "v2 compiler core machine exec output words")
+    let errorCodeMachineIdx = findLabelIndex(bundle.lowPlan.labels, "ErrorCodeOf")
+    assert(errorCodeMachineIdx >= 0, "v2 compiler core machine error code index")
+    assert(machine.metadataOperandModes[errorCodeMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine error code payload mode")
+    assert(machine.callSymbolNames[errorCodeMachineIdx] == "", "v2 compiler core machine error code call symbol cleared")
+    assert(machine.instructionWordHex[errorCodeMachineIdx] == "a9bf7bfd;910003fd;a8c17bfd;d65f03c0", "v2 compiler core machine error code words")
+    assert(image.moduleKind == "compiler_core", "v2 compiler core obj image kind")
+    assert(image.relocationOffsets.len > 0, "v2 compiler core obj image reloc count")
+    assert(objFile.format == "macho", "v2 compiler core obj file format")
+    assert(objFile.fileByteCount > 0, "v2 compiler core obj file byte count")
+    assert(artifact.moduleKind == "compiler_core", "v2 compiler core release module kind")
+    assert(artifact.manifestCid == manifest.manifestCid, "v2 compiler core release manifest closure")
+    assert(artifact.linkPlanVersion == "v2.native_link_plan.v1", "v2 compiler core link plan version")
+    assert(artifact.systemLinkPlanVersion == "v2.system_link_plan.v1", "v2 compiler core system link plan version")
+    assert(artifact.runtimeTargetCount > 0, "v2 compiler core runtime target count")
+    assert(artifact.runtimeUnresolvedCount == 0, "v2 compiler core runtime unresolved count")
+    assert(artifact.nativeLinkClosureOk, "v2 compiler core native link closure")
+    assert(!artifact.systemLinkReady, "v2 compiler core system link honest blocker")
+    assert(artifact.systemLinkMissingReasonCount == 1, "v2 compiler core system link missing reasons")
+    assert(hasCompileKeyLine(artifact, "obj_file_version=v2.obj_file.v1"), "v2 compiler core compile key obj file version")
+    assert(hasCompileKeyLine(artifact, "system_link_plan_version=v2.system_link_plan.v1"), "v2 compiler core compile key system link version")
+    assert(hasCompileKeyLine(artifact, "system_link.provider.0.module=runtime/compiler_core_runtime_v2"), "v2 compiler core compile key compiler provider")
+    assert(hasCompileKeyLine(artifact, "system_link.provider.1.module=runtime/core_runtime_v2"), "v2 compiler core compile key core provider")
+    assert(hasCompileKeyLine(artifact, "system_link.missing_reason.0=system_link_execution_missing"), "v2 compiler core compile key system link blocker")
+    assert(hasCompileKeyLine(artifact, "native_link.provider.0=runtime/compiler_core_runtime_v2"), "v2 compiler core compile key compiler runtime provider")
+    assert(hasCompileKeyLine(artifact, "native_link_runtime_target_count=" + intToStr(artifact.runtimeTargetCount)), "v2 compiler core compile key runtime target count")
+    assert(hasCompileKeyLine(artifact, "compiler_core.item." + intToStr(bundle.lowPlan.labels.len - 1) + ".op=compiler_fn_exec"), "v2 compiler core compile key executable op")
+    assert(hasCompileKeyLine(artifact, "compiler_core.item." + intToStr(bundle.lowPlan.labels.len - 1) + ".ast_ready=1"), "v2 compiler core compile key executable ast ready")
+    assert(hasCompileKeyLine(artifact, "compiler_core.item." + intToStr(bundle.lowPlan.labels.len - 1) + ".exec_op_count=" + intToStr(bundle.lowPlan.routineOpCounts[bundle.lowPlan.labels.len - 1])), "v2 compiler core compile key executable op count")
+    assert(hasCompileKeyLine(artifact, "compiler_core.item." + intToStr(bundle.lowPlan.labels.len - 1) + ".exec_op_hash=" + bundle.lowPlan.routineOpHashes[bundle.lowPlan.labels.len - 1]), "v2 compiler core compile key executable op hash")
+    return 0

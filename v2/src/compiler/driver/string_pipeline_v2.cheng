@@ -1,0 +1,55 @@
+import std/seqs
+import std/system
+import compiler/frontend/string_surface_ir_v2 as surf
+import compiler/semantic_facts/string_facts_v2 as sfacts
+import compiler/frontend/string_surface_lowering_v2 as flower
+import compiler/high_uir/string_graph_v2 as hstr
+import compiler/low_uir/string_lowering_v2 as llower
+
+type
+    StringPipelineBundle =
+        version: str
+        program: surf.StringSurfaceProgram
+        facts: sfacts.StringSemanticFacts
+        highGraph: hstr.HighUirStringGraph
+        lowPlan: llower.LowUirStringPlan
+
+fn stringPipelineVersion(): str =
+    return "v2.driver.string_pipeline.v1"
+
+fn compileStringSurfaceProgram(program: surf.StringSurfaceProgram): StringPipelineBundle =
+    var out: StringPipelineBundle
+    out.version = stringPipelineVersion()
+    out.program = program
+    out.facts = sfacts.buildStringSemanticFacts(program)
+    out.highGraph = flower.lowerStringSurfaceProgramToHighUir(program, out.facts)
+    out.lowPlan = llower.lowerHighUirStringGraphToLowUir(out.highGraph)
+    return out
+
+fn sampleStringPipeline(): StringPipelineBundle =
+    return compileStringSurfaceProgram(surf.sampleStringSurfaceProgram())
+
+fn stringPipelineExprCount(bundle: StringPipelineBundle): int32 =
+    return bundle.program.exprs.len
+
+fn stringPipelineFactCount(bundle: StringPipelineBundle): int32 =
+    return bundle.facts.factIds.len
+
+fn stringPipelineLines(bundle: StringPipelineBundle): str[] =
+    var out: str[]
+    out = []
+    add(out, "pipeline_version=" + bundle.version)
+    add(out, "surface_version=" + bundle.program.version)
+    add(out, "exprs=" + intToStr(bundle.program.exprs.len))
+    add(out, "facts=" + intToStr(bundle.facts.factIds.len))
+    add(out, "high_uir_nodes=" + intToStr(bundle.highGraph.exprIds.len))
+    add(out, "low_uir_nodes=" + intToStr(bundle.lowPlan.exprIds.len))
+    for i in 0..<bundle.program.exprs.len:
+        let expr = bundle.program.exprs[i]
+        let line = intToStr(i) + ":" +
+                   surf.stringSurfaceExprSummary(expr) + " => " +
+                   bundle.facts.highOps[i] + " => " +
+                   bundle.lowPlan.canonicalOps[i] + " => " +
+                   bundle.lowPlan.runtimeTargets[i]
+        add(out, line)
+    return out

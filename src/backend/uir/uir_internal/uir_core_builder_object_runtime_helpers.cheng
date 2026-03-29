@@ -5,15 +5,11 @@ import std/seqs
 import std/rawmem_support
 import stage1/ast
 import backend/uir/uir_internal/uir_core_types
-import backend/uir/uir_internal/uir_core_builder_scope_helpers
-import backend/uir/uir_internal/uir_core_builder_text_helpers
-import backend/uir/uir_internal/uir_core_builder_string_utils
-import backend/uir/uir_internal/uir_core_builder_scalar_key_helpers
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
+import backend/uir/uir_internal/uir_core_builder_type_surface_helpers
 import backend/uir/uir_internal/uir_core_builder_type_query_helpers
-import backend/uir/uir_internal/uir_core_builder_type_key_helpers
-import backend/uir/uir_internal/uir_core_builder_loose_type_key_helpers
 import backend/uir/uir_internal/uir_core_builder_object_synthesis
-import backend/uir/uir_internal/uir_core_builder_obj_local_state
 
 fn uir_core_builder_object_runtime_helpers_add(dst: var str[], val: str) =
     seqs.add(dst, val)
@@ -60,14 +56,14 @@ fn uirCoreObjLenFieldName(baseName: str): str =
 
 fn allocObjValueLocal(b: BlockBuilder, slot: int32, objTypeName: str): Result[bool] =
     let fref0: UirCoreFunc = blockBuilderFuncRef(b)
-    let ptrKey: int64 = (b != nil) ? b.funcShadowPtr : int64(0)
+    let ptrKey: int64 = (b != nil) ? blockBuilderFuncPtrKey(b) : int64(0)
     let funcByKey: UirCoreFuncObjPtr = uirCoreFuncObjPtrFromKey(ptrKey)
     let usePtrKey: bool = !uirCoreFuncIdValid(fref0) && funcByKey != nil
-    if (b == nil) || b.module == nil || (!uirCoreFuncIdValid(fref0) && !usePtrKey):
+    if (b == nil) || blockBuilderModule(b) == nil || (!uirCoreFuncIdValid(fref0) && !usePtrKey):
         if os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1":
-            let dynKey: int64 = (b != nil) ? b.funcShadowDynKey : int64(0)
+            let dynKey: int64 = (b != nil) ? blockBuilderFuncDynKey(b) : int64(0)
             let dynFunc: UirCoreFunc = uirCoreFuncFromDynKey(dynKey)
-            let funcOk: str = uirCoreDebugBool01((b != nil) && uirCoreFuncIdValid(b.func))
+            let funcOk: str = uirCoreDebugBool01((b != nil) && uirCoreFuncIdValid(blockBuilderFuncRef(b)))
             let frefOk: str = uirCoreDebugBool01(uirCoreFuncIdValid(fref0))
             let keyOk: str = uirCoreDebugBool01(funcByKey != nil)
             let dynOk: str = uirCoreDebugBool01(uirCoreFuncIdValid(dynFunc))
@@ -75,7 +71,7 @@ fn allocObjValueLocal(b: BlockBuilder, slot: int32, objTypeName: str): Result[bo
             os.writeLine(os.get_stderr(),
                 "[backend] dbg_alloc_objlocal_fail obj=" + objTypeName +
                 " slot=" + intToStr(slot) +
-                " mod_nil=" + uirCoreDebugBool01((b == nil) || b.module == nil) +
+                " mod_nil=" + uirCoreDebugBool01((b == nil) || blockBuilderModule(b) == nil) +
                 " func_ok=" + funcOk +
                 " fref_ok=" + frefOk +
                 " use_ptr_key=" + uirCoreDebugBool01(usePtrKey) +
@@ -89,16 +85,16 @@ fn allocObjValueLocal(b: BlockBuilder, slot: int32, objTypeName: str): Result[bo
     if (getEnv "BACKEND_DEBUG_OBJLOCAL" == "1") && (objTypeName == "Node"):
         echo("[backend] debug: allocObjValueLocal Node slot=" + intToStr(slot) +
              " fn=" + uirCoreFuncNameOf(fref0) + " file=" + uirCoreFuncOriginFileOf(fref0))
-    let idx: int32 = uirCoreFindObjType(b.module, objTypeName)
+    let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
     if idx < 0:
         return Err[bool]("uirCore_builder: unknown object type")
-    let mod: UirCoreModule = b.module
+    let mod: UirCoreModule = blockBuilderModule(b)
     let ot: UirCoreObjType = uirCoreModuleObjTypeAt(mod, idx)
     if ot.size <= 0:
         return Err[bool]("uirCore_builder: invalid object size")
-    let off: int32 = alignUpPow2(b.objCursor, ot.alignPow2)
-    b.objCursor = off + ot.size
-    if ot.size > (1 << 20) || b.objCursor > (1 << 20) || ot.alignPow2 > 16:
+    let off: int32 = alignUpPow2(blockBuilderObjCursor(b), ot.alignPow2)
+    blockBuilderSetObjCursor(b, off + ot.size)
+    if ot.size > (1 << 20) || blockBuilderObjCursor(b) > (1 << 20) || ot.alignPow2 > 16:
         let dbgFunc: UirCoreFunc = blockBuilderFuncRef(b)
         let dbgName: str = uirCoreFuncNameOrPtrKey(dbgFunc, ptrKey)
         let dbgFile: str = uirCoreFuncOriginFileOrPtrKey(dbgFunc, ptrKey)
@@ -109,13 +105,13 @@ fn allocObjValueLocal(b: BlockBuilder, slot: int32, objTypeName: str): Result[bo
                          " size=" + intToStr(ot.size) +
                          " alignPow2=" + intToStr(ot.alignPow2) +
                          " off=" + intToStr(off) +
-                         " cursor=" + intToStr(b.objCursor))
+                         " cursor=" + intToStr(blockBuilderObjCursor(b)))
     let oldFrameSize: int32 = usePtrKey ? funcObjFrameSizeOfPtrKey(ptrKey) : uirCoreFuncObjFrameSizeOf(fref0)
-    if b.objCursor > oldFrameSize:
+    if blockBuilderObjCursor(b) > oldFrameSize:
         if usePtrKey:
-            funcSetObjFrameSizeByPtrKey(ptrKey, b.objCursor)
+            funcSetObjFrameSizeByPtrKey(ptrKey, blockBuilderObjCursor(b))
         else:
-            uirCoreFuncSetObjFrameSize(fref0, b.objCursor)
+            uirCoreFuncSetObjFrameSize(fref0, blockBuilderObjCursor(b))
     if usePtrKey:
         funcSetObjLocalByPtrKey(ptrKey, slot, objTypeName, off)
     else:
@@ -123,12 +119,12 @@ fn allocObjValueLocal(b: BlockBuilder, slot: int32, objTypeName: str): Result[bo
     return Ok[bool](true)
 
 fn emitObjDefaultInit(b: BlockBuilder, slot: int32, objTypeName: str): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: object init missing builder/module")
-    let idx: int32 = uirCoreFindObjType(b.module, objTypeName)
+    let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
     if idx < 0:
         return Err[bool]("uirCore_builder: unknown object type")
-    let mod: UirCoreModule = b.module
+    let mod: UirCoreModule = blockBuilderModule(b)
     let ot: UirCoreObjType = uirCoreModuleObjTypeAt(mod, idx)
     for fi in 0..<ot.fields.len:
         let f: UirCoreObjField = ot.fields[fi]
@@ -190,7 +186,7 @@ fn seqFixedInitInfoFromTypeKey(typeKey0: str): SeqFixedInit =
     return out
 
 fn emitObjInlineSeqFixedReserveInitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, objTypeName: str, ot: UirCoreObjType): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: object inline seq_fixed init missing builder/module")
     var seenBases: str[]
     for fi in 0..<ot.fields.len:
@@ -266,15 +262,27 @@ fn seqFixedInitInfo(typeNode0: Node): SeqFixedInit =
     out.capExpr = kid(t, 2)
     return out
 
+fn seqFixedInitElemType(info: SeqFixedInit): Node =
+    return info.elemType
+
+fn seqFixedInitCapExpr(info: SeqFixedInit): Node =
+    return info.capExpr
+
+fn seqFixedInitWith(elemType: Node, capExpr: Node): SeqFixedInit =
+    var out: SeqFixedInit
+    out.elemType = elemType
+    out.capExpr = capExpr
+    return out
+
 fn emitSeqFixedReserveInitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, info: SeqFixedInit): Result[bool] =
     let fref0: UirCoreFunc = blockBuilderFuncRef(b)
-    if (b == nil) || b.module == nil || !uirCoreFuncIdValid(fref0):
+    if (b == nil) || blockBuilderModule(b) == nil || !uirCoreFuncIdValid(fref0):
         return Err[bool]("uirCore_builder: seq_fixed init missing builder/module")
     let elemTypeNode: Node = info.elemType
     let capExprNode: Node = info.capExpr
     if (elemTypeNode == nil) || !astNodeIdValid(capExprNode) || nodeKind(capExprNode) == nkEmpty:
         return Ok[bool](false)
-    let elemSizeRes: Result[int32] = uirCoreSizeOfTypeNode(b.module, elemTypeNode)
+    let elemSizeRes: Result[int32] = uirCoreSizeOfTypeNode(blockBuilderModule(b), elemTypeNode)
     if !IsOk[int32](elemSizeRes):
         return ErrInfo[bool](ErrorInfoOf[int32](elemSizeRes))
     let elemSize: int32 = Value[int32](elemSizeRes)
@@ -285,7 +293,7 @@ fn emitSeqFixedReserveInitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, info: Se
     if !IsOk[UirExprId](capRes0):
         return ErrInfo[bool](ErrorInfoOf[UirExprId](capRes0))
     let capTmp: str = blockBuilderNextTemp(b, "__seq_fixed_cap")
-    let capSlot: int32 = localAdd(b.env, capTmp, uirCoreTypeI32())
+    let capSlot: int32 = localAdd(blockBuilderEnv(b), capTmp, uirCoreTypeI32())
     uirCoreSetLocalType(fref0, capSlot, uirCoreTypeI32())
     blockBuilderAddStmt(b, uirCoreStmtLet(capTmp, capSlot, Value[UirExprId](capRes0)))
     let capVal: UirExprId = uirCoreLocal(capSlot)
@@ -306,7 +314,7 @@ fn emitSeqFixedReserveInitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, info: Se
     builderExprSeqAppend(reallocArgs, uirCoreConstI64(0))
     builderExprSeqAppend(reallocArgs, bytes)
     let bufTmp: str = blockBuilderNextTemp(b, "__seq_fixed_buf")
-    let bufSlot: int32 = localAdd(b.env, bufTmp, uirCoreTypeI64())
+    let bufSlot: int32 = localAdd(blockBuilderEnv(b), bufTmp, uirCoreTypeI64())
     uirCoreSetLocalType(fref0, bufSlot, uirCoreTypeI64())
     blockBuilderAddStmt(b, uirCoreStmtLet(bufTmp, bufSlot, uirCoreCall("realloc", reallocArgs)))
     let bufVal: UirExprId = uirCoreLocal(bufSlot)
@@ -329,12 +337,12 @@ fn emitSeqFixedReserveInitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, info: Se
     return Ok[bool](false)
 
 fn emitObjDefaultInitPtrs(b: BlockBuilder, dstBasePtr: UirExprId, objTypeName: str): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: object init missing builder/module")
-    let idx: int32 = uirCoreFindObjType(b.module, objTypeName)
+    let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
     if idx < 0:
         return Err[bool]("uirCore_builder: unknown object type")
-    let mod: UirCoreModule = b.module
+    let mod: UirCoreModule = blockBuilderModule(b)
     let ot: UirCoreObjType = uirCoreModuleObjTypeAt(mod, idx)
     for fi in 0..<ot.fields.len:
         let f: UirCoreObjField = ot.fields[fi]
@@ -349,20 +357,20 @@ fn emitObjDefaultInitPtrs(b: BlockBuilder, dstBasePtr: UirExprId, objTypeName: s
 
 fn emitSemanticStrLiteralInitToPtr(b: BlockBuilder, dstBasePtr: UirExprId,
                                    objTypeName: str, value: str): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: semantic str init missing builder/module")
     let initRes: Result[bool] = emitObjDefaultInitPtrs(b, dstBasePtr, objTypeName)
     if !uirCoreResultBoolIsOk(initRes):
         return ErrInfo[bool](uirCoreResultBoolErrorInfo(initRes))
-    let idx: int32 = uirCoreFindObjType(b.module, objTypeName)
+    let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
     if idx < 0:
         return Err[bool]("uirCore_builder: semantic str init missing object type")
-    let mod: UirCoreModule = b.module
+    let mod: UirCoreModule = blockBuilderModule(b)
     let ot: UirCoreObjType = uirCoreModuleObjTypeAt(mod, idx)
     let valueLen: int32 = len(value)
     var dataExpr: UirExprId = uirCoreConstI64(0)
     if valueLen > 0:
-        let label: str = uirCoreAddCString(b.module, value)
+        let label: str = uirCoreAddCString(blockBuilderModule(b), value)
         dataExpr = uirCoreGlobalAddr(label)
     for fi in 0..<ot.fields.len:
         let f: UirCoreObjField = ot.fields[fi]
@@ -379,15 +387,15 @@ fn lowerSemanticStrLiteralValue(b: BlockBuilder, value: str,
                                 objTypeName0: str = "str",
                                 typeKey0: str = "str"): Result[UirExprId] =
     let fref0: UirCoreFunc = blockBuilderFuncRef(b)
-    if (b == nil) || b.module == nil || !uirCoreFuncIdValid(fref0):
+    if (b == nil) || blockBuilderModule(b) == nil || !uirCoreFuncIdValid(fref0):
         return Err[UirExprId]("uirCore_builder: semantic str literal missing builder/module")
     let objTypeName: str = uirCoreDefaultStr(objTypeName0, "str")
     let typeKey: str = uirCoreDefaultStr(typeKey0, objTypeName)
     let tmpName: str = blockBuilderNextTemp(b, "__strlit")
-    let tmpSlot: int32 = localAdd(b.env, tmpName, uirCoreTypeI64())
+    let tmpSlot: int32 = localAdd(blockBuilderEnv(b), tmpName, uirCoreTypeI64())
     uirCoreSetLocalType(fref0, tmpSlot, uirCoreTypeI64())
     if len(typeKey) > 0:
-        localSetTypeKey(b.env, tmpSlot, typeKey)
+        localSetTypeKey(blockBuilderEnv(b), tmpSlot, typeKey)
         funcSetObjTypeKey(fref0, tmpSlot, typeKey)
     let allocRes: Result[bool] = allocObjValueLocal(b, tmpSlot, objTypeName)
     if !uirCoreResultBoolIsOk(allocRes):
@@ -398,12 +406,12 @@ fn lowerSemanticStrLiteralValue(b: BlockBuilder, value: str,
     return Ok[UirExprId](uirCoreLocal(tmpSlot))
 
 fn emitObjCopyPtrs(b: BlockBuilder, dstBasePtr: UirExprId, objTypeName: str, srcBasePtr: UirExprId): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: object copy missing builder/module")
-    let idx: int32 = uirCoreFindObjType(b.module, objTypeName)
+    let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
     if idx < 0:
         return Err[bool]("uirCore_builder: unknown object type")
-    let mod: UirCoreModule = b.module
+    let mod: UirCoreModule = blockBuilderModule(b)
     let ot: UirCoreObjType = uirCoreModuleObjTypeAt(mod, idx)
     for fi in 0..<ot.fields.len:
         let f: UirCoreObjField = ot.fields[fi]
@@ -423,13 +431,13 @@ fn emitObjCopy(b: BlockBuilder, dstSlot: int32, objTypeName: str, srcSlot: int32
     return emitObjCopyPtrs(b, dstBasePtr, objTypeName, srcBasePtr)
 
 fn emitTupleLitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, objTypeName: str, lit: Node): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: tuple store missing builder/module")
     if !astNodeIdValid(lit) || nodeKind(lit) != nkTupleLit:
         return Err[bool]("uirCore_builder: invalid tuple literal")
-    if len(objTypeName) == 0 || ! uirCoreHasObjType(b.module, objTypeName):
+    if len(objTypeName) == 0 || ! uirCoreHasObjType(blockBuilderModule(b), objTypeName):
         return Err[bool]("uirCore_builder: unknown tuple type")
-    let ot: UirCoreObjType = uirCoreGetObjType(b.module, objTypeName)
+    let ot: UirCoreObjType = uirCoreGetObjType(blockBuilderModule(b), objTypeName)
     for i in 0..<kidCount(lit):
         var elemNode: Node = kid(lit, i)
         if astNodeIdValid(elemNode) && nodeKind(elemNode) == nkCallArg && kidCount(elemNode) > 1:
@@ -453,7 +461,7 @@ fn emitTupleLitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, objTypeName: str, l
     return Ok[bool](false)
 
 fn emitSeqLitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, seqTypeKey: str, lit: Node): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: seq store missing builder/module")
     if !astNodeIdValid(lit) || nodeKind(lit) != nkSeqLit:
         return Err[bool]("uirCore_builder: invalid seq literal")
@@ -465,16 +473,16 @@ fn emitSeqLitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, seqTypeKey: str, lit:
     let elemKey: str = rawmemStrFromOffset(seqTypeKey, 4)
     let elemIsSemanticStr: bool = isSemanticStrKey(elemKey)
     let elemTypeNode: Node = newIdent(elemKey, nodePos(lit))
-    let elemObjName: str = uirCoreSeqElemObjTypeName(b.module, elemTypeNode, elemKey, elemIsSemanticStr)
-    let sizeRes: Result[int32] = uirCoreSizeOfTypeNode(b.module, elemTypeNode)
+    let elemObjName: str = uirCoreSeqElemObjTypeName(blockBuilderModule(b), elemTypeNode, elemKey, elemIsSemanticStr)
+    let sizeRes: Result[int32] = uirCoreSizeOfTypeNode(blockBuilderModule(b), elemTypeNode)
     if ! IsOk[int32](sizeRes):
         return ErrInfo[bool](ErrorInfoOf[int32](sizeRes))
     let elemSize: int32 = Value[int32](sizeRes)
-    let elemUirTy: UirCoreType = uirCoreTypeFromNodeWithModule(b.module, elemTypeNode)
+    let elemUirTy: UirCoreType = uirCoreTypeFromNodeWithModule(blockBuilderModule(b), elemTypeNode)
 
     let count: int32 = kidCount(lit)
     let seqObj: str = uirCoreSeqObjName()
-    let seqOt: UirCoreObjType = uirCoreGetObjType(b.module, seqObj)
+    let seqOt: UirCoreObjType = uirCoreGetObjType(blockBuilderModule(b), seqObj)
     var lenOff: int32 = -1
     var capOff: int32 = -1
     var bufOff: int32 = -1
@@ -530,7 +538,7 @@ fn emitSeqLitToPtr(b: BlockBuilder, dstBasePtr: UirExprId, seqTypeKey: str, lit:
     return Ok[bool](false)
 
 fn emitSeqComprehensionToPtr(b: BlockBuilder, dstName: str, dstBasePtr: UirExprId, seqTypeKey: str, comp0: Node): Result[bool] =
-    if (b == nil) || b.module == nil:
+    if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: comprehension store missing builder/module")
     if (dstBasePtr == nil):
         return Err[bool]("uirCore_builder: comprehension store missing dst ptr")

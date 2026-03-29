@@ -10,7 +10,6 @@ Usage:
 
 Env:
   SELFHOST_PARALLEL_PERF_TIMEOUT=<seconds>          default: 60
-  SELFHOST_PARALLEL_PERF_STAGE0=<path>              optional stage0 override
   SELFHOST_PARALLEL_PERF_BASE_SESSION=<name>        default: perf.parallel
   SELFHOST_PARALLEL_PERF_HOST_ONLY=<tag>            optional dedicated-host tag
   SELFHOST_PARALLEL_PERF_ENFORCE_ON_HOST=<0|1>      default: 0
@@ -57,7 +56,6 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 timeout="${SELFHOST_PARALLEL_PERF_TIMEOUT:-60}"
-stage0="${SELFHOST_PARALLEL_PERF_STAGE0:-}"
 base_session="${SELFHOST_PARALLEL_PERF_BASE_SESSION:-perf.parallel}"
 host_os="$(uname -s 2>/dev/null | tr 'A-Z' 'a-z')"
 host_arch="$(uname -m 2>/dev/null | tr 'A-Z' 'a-z')"
@@ -98,10 +96,7 @@ if [ "$host_only" != "" ] && [ "$host_tag" != "$host_only" ]; then
   exit 0
 fi
 
-if [ "$stage0" = "" ]; then
-  stage0="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
-fi
-
+stage0="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
 if [ ! -x "$stage0" ]; then
   echo "[selfhost_parallel_perf] missing stage0: $stage0" 1>&2
   exit 1
@@ -120,7 +115,6 @@ run_probe() {
     SELFHOST_STRICT_PROBE_SESSION="$session" \
     SELFHOST_STRICT_PROBE_TIMEOUT="$timeout" \
     SELFHOST_STRICT_PROBE_REQUIRE=1 \
-    SELFHOST_STRICT_PROBE_STAGE0="$stage0" \
     SELFHOST_STRICT_PROBE_REUSE=0 \
     SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE=0 \
     SELFHOST_STRICT_PROBE_SKIP_SEM="$skip_sem" \

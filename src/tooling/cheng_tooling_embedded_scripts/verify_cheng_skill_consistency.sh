@@ -177,8 +177,6 @@ if [ "$skill_compile" = "1" ]; then
       driver="artifacts/backend_driver/cheng"
     elif [ -x "dist/releases/current/cheng" ]; then
       driver="dist/releases/current/cheng"
-    elif [ -x "artifacts/backend_seed/cheng.stage2" ]; then
-      driver="artifacts/backend_seed/cheng.stage2"
     fi
   fi
   if [ "$driver" = "" ] && [ "$allow_selfhost" = "1" ]; then
@@ -242,11 +240,10 @@ if [ "$skill_compile" = "1" ]; then
   set +e
   run_with_timeout "$compile_timeout" env \
     TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=0 \
-    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} compile \
+    BACKEND_DRIVER="$driver" \
+    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} release-compile \
       --in:$fixture_cheng \
-      --out:$out_exe \
-      --stage0:$driver \
-      --linker:system
+      --out:$out_exe
   status="$?"
   set -e
   if [ "$status" -eq 124 ]; then
@@ -266,11 +263,10 @@ if [ "$skill_compile" = "1" ]; then
     set +e
     run_with_timeout "$compile_timeout" env \
       TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=0 \
-      ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} compile \
+      BACKEND_DRIVER="$driver" \
+      ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} release-compile \
         --in:$run_fixture_cheng \
-        --out:$run_exe \
-        --stage0:$driver \
-        --linker:system
+        --out:$run_exe
     status="$?"
     set -e
     if [ "$status" -eq 124 ]; then

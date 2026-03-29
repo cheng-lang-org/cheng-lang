@@ -12,7 +12,7 @@ Usage:
   src/tooling/cheng_tooling_embedded_scripts/backend_driver_path.sh [--path-only]
 
 Notes:
-  - Resolves a healthy backend driver from the repo-local artifacts first.
+  - Resolves a healthy backend driver from the strict repo-local selfhost lineage first.
   - Health probe is intentionally conservative: `--help` + system-link smoke.
 EOF
 }
@@ -74,6 +74,43 @@ driver_help_ok() {
   return 1
 }
 
+driver_is_script_shim() {
+  bin="$1"
+  [ -f "$bin" ] || return 1
+  first_line="$(sed -n '1p' "$bin" 2>/dev/null || true)"
+  case "$first_line" in
+    '#!'*) return 0 ;;
+  esac
+  return 1
+}
+
+driver_current_contract_ok() {
+  bin="$1"
+  [ -x "$bin" ] || return 1
+  if driver_is_script_shim "$bin"; then
+    return 0
+  fi
+  if ! command -v strings >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v rg >/dev/null 2>&1; then
+    return 0
+  fi
+  set +e
+  strings "$bin" 2>/dev/null | rg -q '^BACKEND_OUTPUT$'
+  has_backend_output="$?"
+  strings "$bin" 2>/dev/null | rg -q '^CHENG_BACKEND_OUTPUT$'
+  has_legacy_output="$?"
+  strings "$bin" 2>/dev/null | rg -q 'backend_driver: output path required'
+  has_output_msg="$?"
+  set -e
+  if [ "$has_output_msg" -eq 0 ] && [ "$has_legacy_output" -eq 0 ] && [ "$has_backend_output" -ne 0 ]; then
+    echo "[Error] backend_driver_path: rejected legacy CHENG_BACKEND_* driver contract: $bin" 1>&2
+    return 1
+  fi
+  return 0
+}
+
 driver_compile_smoke_ok() {
   bin="$1"
   [ -x "$bin" ] || return 1
@@ -102,27 +139,19 @@ driver_compile_smoke_ok() {
 
 driver_ok() {
   bin="$1"
-  driver_help_ok "$bin" && driver_compile_smoke_ok "$bin"
+  driver_help_ok "$bin" && driver_current_contract_ok "$bin" && driver_compile_smoke_ok "$bin"
 }
 
 find_fallback_driver() {
-  allow_selfhost="${BACKEND_DRIVER_PATH_ALLOW_SELFHOST:-0}"
   for cand in \
+    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" \
+    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage1" \
+    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
+    "$root/artifacts/backend_selfhost_self_obj/cheng.stage1" \
     "$root/artifacts/backend_driver/cheng" \
     "$root/artifacts/backend_driver/cheng.fixed3" \
-    "$root/dist/releases/current/cheng" \
     "$root/src/tooling/backend_driver_exec.sh"; do
-    if driver_ok "$cand"; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
-  if [ "$allow_selfhost" != "1" ]; then
-    return 1
-  fi
-  for cand in \
-    "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng.stage1"; do
     if driver_ok "$cand"; then
       printf '%s\n' "$cand"
       return 0

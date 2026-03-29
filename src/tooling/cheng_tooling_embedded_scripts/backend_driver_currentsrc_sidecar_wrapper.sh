@@ -62,6 +62,41 @@ strict_published_stage0_surface() {
   return 1
 }
 
+strict_direct_export_surface() {
+  driver_path="$(canonical_path "$1")"
+  if [ "$driver_path" = "" ] || [ ! -x "$driver_path" ]; then
+    return 1
+  fi
+  command -v nm >/dev/null 2>&1 || return 1
+  command -v awk >/dev/null 2>&1 || return 1
+  surface_log="$(mktemp "${TMPDIR:-/tmp}/backend_driver_currentsrc_sidecar_wrapper.nm.XXXXXX")"
+  set +e
+  (nm -gU "$driver_path" 2>/dev/null || nm "$driver_path" 2>/dev/null) >"$surface_log"
+  nm_status="$?"
+  set -e
+  if [ "$nm_status" -ne 0 ]; then
+    rm -f "$surface_log"
+    return 1
+  fi
+  if ! awk '
+    BEGIN { need1=0; need2=0; need3=0; legacy=0; }
+    {
+      sym=$NF;
+      gsub(/^_+/, "", sym);
+      if (sym == "driver_export_build_emit_obj_from_file_stage1_target_impl") need1=1;
+      if (sym == "driver_export_prefer_sidecar_builds") need2=1;
+      if (sym == "driver_export_buildModuleFromFileStage1TargetRetained") need3=1;
+      if (sym ~ /^driverProof/) legacy=1;
+    }
+    END { exit((need1 && need2 && need3 && !legacy) ? 0 : 1); }
+  ' "$surface_log"; then
+    rm -f "$surface_log"
+    return 1
+  fi
+  rm -f "$surface_log"
+  return 0
+}
+
 real_driver="${TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER:-}"
 if [ "$real_driver" = "" ]; then
   real_driver="$(read_meta_field sidecar_real_driver)"
@@ -76,8 +111,8 @@ if [ "$real_driver" = "" ] || [ ! -x "$real_driver" ]; then
   echo "[backend_driver_currentsrc_sidecar_wrapper] missing real sidecar driver contract: ${real_driver:-<unset>}" 1>&2
   exit 1
 fi
-if ! strict_published_stage0_surface "$real_driver"; then
-  echo "[backend_driver_currentsrc_sidecar_wrapper] real sidecar driver must be a published strict stage0 surface: ${real_driver:-<unset>}" 1>&2
+if ! strict_published_stage0_surface "$real_driver" && ! strict_direct_export_surface "$real_driver"; then
+  echo "[backend_driver_currentsrc_sidecar_wrapper] real sidecar driver missing strict direct-export surface: ${real_driver:-<unset>}" 1>&2
   exit 1
 fi
 
@@ -411,6 +446,30 @@ if [ "$emit_mode" = "obj" ]; then
 fi
 
 wrapper_preserve_sidecar="${BACKEND_CURRENTSRC_WRAPPER_PRESERVE_SIDECAR:-0}"
+
+if [ "$wrapper_preserve_sidecar" = "1" ]; then
+  if [ "$sidecar_mode" = "" ]; then
+    sidecar_mode="${BACKEND_UIR_SIDECAR_MODE:-${env_sidecar_mode:-}}"
+  fi
+  if [ "$sidecar_bundle" = "" ]; then
+    sidecar_bundle="${BACKEND_UIR_SIDECAR_BUNDLE:-${env_sidecar_bundle:-}}"
+  fi
+  if [ "$sidecar_compiler" = "" ]; then
+    sidecar_compiler="${BACKEND_UIR_SIDECAR_COMPILER:-${env_sidecar_compiler:-}}"
+  fi
+  if [ "$sidecar_child_mode" = "" ]; then
+    sidecar_child_mode="${BACKEND_UIR_SIDECAR_CHILD_MODE:-${env_sidecar_child_mode:-}}"
+  fi
+  if [ "$sidecar_outer_compiler" = "" ]; then
+    sidecar_outer_compiler="${BACKEND_UIR_SIDECAR_OUTER_COMPILER:-${env_sidecar_outer_compiler:-}}"
+  fi
+elif [ "$wrapper_mode" = "env" ]; then
+  sidecar_mode=""
+  sidecar_bundle=""
+  sidecar_compiler=""
+  sidecar_child_mode=""
+  sidecar_outer_compiler=""
+fi
 
 set -- env \
   -u BACKEND_UIR_SIDECAR_MODE \

@@ -126,6 +126,18 @@ static inline void *cheng_sidecar_build_module_symbol(
     ChengSidecarDiagFn diag, ChengSidecarAfterOpenFn after_open) {
   void *handle =
       cheng_sidecar_bundle_handle_cached(cache, target_text, diag, after_open);
+  void *fn = cheng_sidecar_lookup_symbol(
+      handle, "driver_export_buildModuleFromFileStage1TargetRetained", diag,
+      "driver_c_sidecar_build_module_fn.retained_target_export");
+  if (fn != NULL) return fn;
+  fn = cheng_sidecar_lookup_symbol(
+      handle, "driver_buildModuleFromFileStage1TargetRetained", diag,
+      "driver_c_sidecar_build_module_fn.retained_target");
+  if (fn != NULL) return fn;
+  fn = cheng_sidecar_lookup_symbol(
+      handle, "driver_export_buildActiveModulePtrs", diag,
+      "driver_c_sidecar_build_module_fn.active_export");
+  if (fn != NULL) return fn;
   return cheng_sidecar_lookup_symbol(handle, "driver_buildActiveModulePtrs",
                                      diag, "driver_c_sidecar_build_module_fn");
 }

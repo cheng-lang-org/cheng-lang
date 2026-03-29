@@ -7,6 +7,42 @@ script_is_self_trampoline() {
   tr '\n' ' ' <"$script_path" 2>/dev/null | grep -Eq "[[:space:]]exec[[:space:]].*((TOOLING_SELF_BIN|\\\$tool)|cheng_tooling\\.sh).*[[:space:]]$subcmd([[:space:]]|$)"
 }
 
+tooling_exec_is_repo_wrapper() {
+  candidate="$1"
+  if [ "$candidate" = "" ] || [ ! -f "$candidate" ]; then
+    return 1
+  fi
+  first_line="$(sed -n '1p' "$candidate" 2>/dev/null || true)"
+  case "$first_line" in
+    '#!'*sh*)
+      grep -Fxq 'exec sh "$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh" "$@"' "$candidate" 2>/dev/null
+      return $?
+      ;;
+  esac
+  return 1
+}
+
+resolve_list_base_bin() {
+  for cand in \
+    "$list_bin" \
+    "$root/artifacts/tooling_bundle/full/cheng_tooling" \
+    "$real_primary_bin" \
+    "$real_launcher_bin" \
+    "$root/artifacts/tooling_bundle/core/cheng_tooling_global" \
+    "$bin"
+  do
+    if [ "$cand" = "" ] || [ ! -x "$cand" ]; then
+      continue
+    fi
+    if tooling_exec_is_repo_wrapper "$cand"; then
+      continue
+    fi
+    printf '%s\n' "$cand"
+    return 0
+  done
+  printf '%s\n' "$bin"
+}
+
 resolve_repo_script() {
   subcmd="$1"
   if [ "$subcmd" = "" ] || [ "$subcmd" = "cheng_tooling" ]; then
@@ -519,8 +555,6 @@ run_augmented_bundle() {
       bundle_driver="$root/artifacts/backend_driver/cheng"
     elif [ -x "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
       bundle_driver="$root/artifacts/backend_selfhost_self_obj/cheng.stage2"
-    elif [ -x "$root/artifacts/backend_seed/cheng.stage2" ]; then
-      bundle_driver="$root/artifacts/backend_seed/cheng.stage2"
     else
       bundle_driver="$("$bundle_tool_bin" backend_driver_path)"
     fi
@@ -548,18 +582,7 @@ run_augmented_bundle() {
 }
 
 run_augmented_list() {
-  base_bin="$list_bin"
-  if [ "$base_bin" = "" ]; then
-    if [ -x "$root/artifacts/tooling_bundle/core/cheng_tooling_global" ]; then
-      base_bin="$root/artifacts/tooling_bundle/core/cheng_tooling_global"
-    elif [ -x "$real_primary_bin" ]; then
-      base_bin="$real_primary_bin"
-    elif [ -x "$real_launcher_bin" ]; then
-      base_bin="$real_launcher_bin"
-    else
-      base_bin="$bin"
-    fi
-  fi
+  base_bin="$(resolve_list_base_bin)"
   tmp_out="$(mktemp "${TMPDIR:-/tmp}/cheng_tooling.list.XXXXXX")"
   trap 'rm -f "$tmp_out"' EXIT INT TERM
   "$base_bin" "$@" >"$tmp_out"

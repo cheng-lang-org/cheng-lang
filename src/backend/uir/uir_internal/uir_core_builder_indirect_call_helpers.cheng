@@ -2,28 +2,25 @@
 import std/result
 import stage1/ast
 import backend/uir/uir_internal/uir_core_types
-import backend/uir/uir_internal/uir_core_builder_scope_helpers
-import backend/uir/uir_internal/uir_core_builder_text_helpers
-import backend/uir/uir_internal/uir_core_builder_string_utils
-import backend/uir/uir_internal/uir_core_builder_scalar_key_helpers
-import backend/uir/uir_internal/uir_core_builder_obj_local_state
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
+import backend/uir/uir_internal/uir_core_builder_type_surface_helpers
 import backend/uir/uir_internal/uir_core_builder_module_lookup_cache
-import backend/uir/uir_internal/uir_core_builder_call_source_helpers
 
 fn uirCoreMethodBaseObjTypeName(b: BlockBuilder, dotBase0: Node): str =
-    if (b == nil) || b.module == nil || !astNodeIdValid(dotBase0):
+    if (b == nil) || blockBuilderModule(b) == nil || !astNodeIdValid(dotBase0):
         return ""
     var dotBase: Node = dotBase0
     while astNodeIdValid(dotBase) && nodeKind(dotBase) == nkPar && kidCount(dotBase) > 0:
         dotBase = kid(dotBase, 0)
-    let baseKey0: str = uirCoreNormalizeObjLookupKey(b.module, caseInferExprTypeKey(b, dotBase))
+    let baseKey0: str = uirCoreNormalizeObjLookupKey(blockBuilderModule(b), caseInferExprTypeKey(b, dotBase))
     if len(baseKey0) > 0:
-        if uirCoreHasObjType(b.module, baseKey0):
+        if uirCoreHasObjType(blockBuilderModule(b), baseKey0):
             return baseKey0
         if (uirCoreStrStartsWith(baseKey0, "seq_") || uirCoreStrStartsWith(baseKey0, "seq_fixed_")) &&
-           uirCoreHasObjType(b.module, "seq"):
+           uirCoreHasObjType(blockBuilderModule(b), "seq"):
             return "seq"
-        if uirCoreStrStartsWith(baseKey0, "Table_") && uirCoreHasObjType(b.module, "Table"):
+        if uirCoreStrStartsWith(baseKey0, "Table_") && uirCoreHasObjType(blockBuilderModule(b), "Table"):
             return "Table"
     return ""
 
@@ -51,13 +48,13 @@ fn uirCoreIndirectCalleeDebugName(calleeNode0: Node): str =
     return ""
 
 fn uirCoreIndirectDebugFuncName(b: BlockBuilder): str =
-    if (b != nil) && uirCoreFuncIdValid(b.func):
-        return uirCoreFuncNameOf(b.func)
+    if (b != nil) && uirCoreFuncIdValid(blockBuilderFuncRef(b)):
+        return uirCoreFuncNameOf(blockBuilderFuncRef(b))
     return ""
 
 fn uirCoreIndirectDebugFuncPath(b: BlockBuilder): str =
-    if (b != nil) && uirCoreFuncIdValid(b.func):
-        return uirCoreFuncOriginFileOf(b.func)
+    if (b != nil) && uirCoreFuncIdValid(blockBuilderFuncRef(b)):
+        return uirCoreFuncOriginFileOf(blockBuilderFuncRef(b))
     return ""
 
 fn uirCoreIndirectCallHelperName(argc: int32): str =
@@ -71,19 +68,19 @@ fn uirCoreCallCalleeLooksIndirect(b: BlockBuilder, calleeNode0: Node): bool =
         calleeNode = kid(calleeNode, 0)
     if (calleeNode != nil) && (nodeKind(calleeNode) == nkIdent || nodeKind(calleeNode) == nkSymbol):
         let nm0: str = plainName(calleeNode)
-        let localIdx0: int32 = uirCoreResolveLocalSlotOrImplicitResult(b.env, b.func, nm0)
+        let localIdx0: int32 = uirCoreResolveLocalSlotOrImplicitResult(blockBuilderEnv(b), blockBuilderFuncRef(b), nm0)
         if localIdx0 >= 0:
-            let target0: str = localCallTarget(b.env, localIdx0)
+            let target0: str = localCallTarget(blockBuilderEnv(b), localIdx0)
             if len(target0) > 0:
                 return false
-            let localTy0: UirCoreType = localType(b.env, localIdx0)
+            let localTy0: UirCoreType = localType(blockBuilderEnv(b), localIdx0)
             if localTy0.kind == mtI64:
                 return true
-    elif uirCoreNodeIsFieldDot(calleeNode) && b.module != nil:
+    elif uirCoreNodeIsFieldDot(calleeNode) && blockBuilderModule(b) != nil:
         let base0: Node = uirCoreDotBaseNode(calleeNode)
         let baseKey0: str = uirCoreMethodBaseObjTypeName(b, base0)
         let fieldName0: str = uirCoreMemberName(uirCoreDotFieldNode(calleeNode))
-        if len(baseKey0) > 0 && uirCoreObjTypeHasNamedField(b.module, baseKey0, fieldName0):
+        if len(baseKey0) > 0 && uirCoreObjTypeHasNamedField(blockBuilderModule(b), baseKey0, fieldName0):
             return true
     var calleeKey0: str = uirCoreStripRefVarKeyOnce(caseInferExprTypeKey(b, calleeNode))
     calleeKey0 = uirCoreStripPtrKeyOnce(calleeKey0)
@@ -124,7 +121,7 @@ fn uirCoreLowerIndirectCall(b: BlockBuilder, node: Node, calleeNode: Node, argNo
 
 fn uirCoreTryLowerMethodSugarCall(b: BlockBuilder, node: Node, calleeNode: Node,
                                   wantType: UirCoreType, outExpr: var UirExprId): Result[bool] =
-    if (b == nil) || b.module == nil || !uirCoreNodeIsFieldDot(calleeNode):
+    if (b == nil) || blockBuilderModule(b) == nil || !uirCoreNodeIsFieldDot(calleeNode):
         return Ok[bool](false)
     let dotBase0: Node = uirCoreDotBaseNode(calleeNode)
     let dotMember0: Node = uirCoreDotFieldNode(calleeNode)
@@ -136,9 +133,9 @@ fn uirCoreTryLowerMethodSugarCall(b: BlockBuilder, node: Node, calleeNode: Node,
     let fieldName0: str = uirCoreMemberName(dotMember0)
     if len(fieldName0) == 0:
         return Ok[bool](false)
-    if uirCoreObjTypeHasNamedField(b.module, objTypeName0, fieldName0):
+    if uirCoreObjTypeHasNamedField(blockBuilderModule(b), objTypeName0, fieldName0):
         return Ok[bool](false)
-    if !moduleHasFuncByBase(b.module, fieldName0):
+    if !moduleHasFuncByBase(blockBuilderModule(b), fieldName0):
         return Err[bool]("uirCore_builder: unknown member call")
     let call2: Node = newNode(nkCall, nodePos(node))
     addSon(call2, newIdent(fieldName0, nodePos(node)))
@@ -178,9 +175,9 @@ fn nodeIsTypeArgInCall(b: BlockBuilder, n: Node): bool =
         return true
     of nkIdent, nkSymbol:
         let nm: str = backendStripSpaces(plainName(n))
-        if uirCoreResolveLocalSlotOrImplicitResult(b.env, blockBuilderFuncRef(b), nm) >= 0:
+        if uirCoreResolveLocalSlotOrImplicitResult(blockBuilderEnv(b), blockBuilderFuncRef(b), nm) >= 0:
             return false
-        if moduleGlobalIndex(b.module, nm) >= 0:
+        if moduleGlobalIndex(blockBuilderModule(b), nm) >= 0:
             return false
         if nm == "int8" || nm == "uint8" || nm == "i8" || nm == "u8" ||
            nm == "int16" || nm == "uint16" || nm == "i16" || nm == "u16" ||
@@ -190,5 +187,5 @@ fn nodeIsTypeArgInCall(b: BlockBuilder, n: Node): bool =
            nm == "float32" || nm == "float64" || nm == "float" ||
            nm == "bool" || nm == "char" || nm == "void" || isStringKey(nm):
             return true
-        return uirCoreFindTypeAlias(b.module, nm) >= 0 || uirCoreFindObjType(b.module, nm) >= 0
+        return uirCoreFindTypeAlias(blockBuilderModule(b), nm) >= 0 || uirCoreFindObjType(blockBuilderModule(b), nm) >= 0
     return false

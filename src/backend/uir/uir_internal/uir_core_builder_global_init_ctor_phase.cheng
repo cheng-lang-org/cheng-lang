@@ -1,0 +1,79 @@
+# Ctor global-init phase split away from the entry wrapper so lead-call
+# lowering is only materialized once the wrapper body has been entered.
+import std/os
+import std/result
+import std/seqs
+import stage1/ast
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_global_init_common
+
+fn uirCoreBuildGlobalInitCtorChunk(mod: UirCoreModule, ctx: UirCoreBuildCtx,
+                                   startIndex: int32, chunkSize: int32, chunkOrdinal: int32,
+                                   dbgGlobalInitIndex: bool, fDbgGlobalInitIndex: os.File,
+                                   outNextIndex: var int32, outFunc: var UirCoreFunc): Result[bool] =
+    if (mod == nil) || (ctx == nil):
+        return Err[bool]("uirCore_builder: invalid global init ctor chunk args")
+    uirCoreMaterializeSymbolTrace("global_init_chunk_start phase=ctor chunk=" + intToStr(chunkOrdinal) +
+                                  " start=" + intToStr(startIndex))
+    outNextIndex = startIndex
+    outFunc = nil
+    if startIndex < 0 || startIndex > uirCoreBuildCtxGlobalInitLen(ctx):
+        return Err[bool]("uirCore_builder: invalid global init ctor chunk start")
+    let helperBase: str = "__cheng_global_init_ctor"
+    let helperName: str = uirCoreGlobalInitChunkHelperName(helperBase, chunkOrdinal)
+    var i: int32 = startIndex
+    var emitted: int32 = 0
+    var f: UirCoreFunc = nil
+    var env: LocalEnv = nil
+    var b: BlockBuilder = nil
+    while i < uirCoreBuildCtxGlobalInitLen(ctx):
+        let objTypeName: str = uirCoreBuildCtxGlobalInitObjTypeNameAt(ctx, i)
+        let initNode: Node = uirCoreBuildCtxGlobalInitNodeAt(ctx, i)
+        let hasInitExpr: bool = astNodeIdValid(initNode) && nodeKind(initNode) != astNodeKindEmpty()
+        if len(objTypeName) == 0 || !hasInitExpr:
+            i = i + 1
+            continue
+        if emitted == 0:
+            let nameRes: Result[bool] = uirCoreGlobalInitEnsureNameAvailable(mod, helperName)
+            if !IsOk[bool](nameRes):
+                return ErrInfo[bool](ErrorInfoOf[bool](nameRes))
+            f = uirCoreNewFunc(helperName, uirCoreTypeVoid())
+            uirCoreFuncInitHeaderMeta(f, uirCoreFuncRetTypeKeyOf(f),
+                                      uirCoreGlobalInitPhaseOrigin("ctor"),
+                                      uirCoreFuncDeclOrdinalOf(f),
+                                      uirCoreFuncSourceAstIndexOf(f),
+                                      uirCoreFuncIsExtern(f))
+            env = localEnvNew()
+            b = blockBuilderNew(env, mod, f)
+        uirCoreGlobalInitDebugWrite(
+            dbgGlobalInitIndex,
+            fDbgGlobalInitIndex,
+            "[backend] global_init phase=ctor chunk=" + intToStr(chunkOrdinal) +
+            " i=" + intToStr(i) +
+            " emitted=" + intToStr(emitted) +
+            " name=" + uirCoreBuildCtxGlobalInitNameAt(ctx, i) +
+            " obj=" + objTypeName)
+        var initCore: Node = initNode
+        while astNodeIdValid(initCore) && nodeKind(initCore) == astNodeKindPar() && kidCount(initCore) > 0:
+            initCore = kid(initCore, 0)
+        if !astNodeIdValid(initCore) || nodeKind(initCore) != astNodeKindCall():
+            return Err[bool]("uirCore_builder: global object init expects call: " + uirCoreBuildCtxGlobalInitNameAt(ctx, i))
+        let lead: UirExprId = uirCoreLoad(uirCoreGlobalAddr(uirCoreBuildCtxGlobalInitNameAt(ctx, i)), uirCoreTypeI64())
+        let callRes: Result[UirExprId] = lowerCallWithLeadingArg(b, initCore, lead)
+        if !IsOk[UirExprId](callRes):
+            return ErrInfo[bool](ErrorInfoOf[UirExprId](callRes))
+        emitted = emitted + 1
+        i = i + 1
+        if emitted >= chunkSize:
+            break
+    outNextIndex = i
+    if emitted == 0 || (f == nil) || (b == nil):
+        return Ok[bool](false)
+    blockBuilderFinish(b, uirCoreTermRet(nil))
+    outFunc = f
+    uirCoreMaterializeSymbolTrace("global_init_chunk_done phase=ctor chunk=" + intToStr(chunkOrdinal) +
+                                  " next=" + intToStr(outNextIndex) +
+                                  " emitted=" + intToStr(emitted) +
+                                  " helper=" + helperName)
+    return Ok[bool](true)

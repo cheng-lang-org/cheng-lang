@@ -1,30 +1,35 @@
 # Shared builder-local types split from uir_core_builder.
+import std/os
 import std/result
+import std/seqs
+import std/strutils
 import std/hashmaps
 import std/hashsets
+import std/system
+import std/crash_trace_internal
 import stage1/ast
 import backend/uir/uir_internal/uir_core_types
 
 type
     LocalEnv = ref
         names: str[]
-        types: UirCoreType[]
+        types: int32[]
         typeKeys: str[]
         callTargets: str[]
         active: int32[]
         scopeMarks: int32[]
-        nameIndex: hashmaps.HashMapStrInt
+        nameIndex: int64
         prevSlots: int32[]
     DeferFrame = ref
-        bodies: Node[]
+        bodies: int32[]
     LoopContext = ref
         breakLabel: str
         continueLabel: str
         deferDepth: int32
     BlockBuilder = ref
         env: LocalEnv
-        module: UirCoreModule
-        func: UirCoreFunc
+        module: int64
+        func: int64
         funcShadowPtr: int64
         funcShadowDynKey: int64
         currentLabel: str
@@ -35,19 +40,19 @@ type
         loopStack: LoopContext[]
         deferStack: DeferFrame[]
         exprLowerDepth: int32
-        exprLowerStack: Node[]
+        exprLowerStack: int32[]
         implicitResultUsed: bool
 
     DotAccess =
-        addr: UirExprId
-        fieldTy: UirCoreType
+        addr: int32
+        fieldTy: int32
         # Non-empty only when fieldTy == mtVoid (composite/inlined object field).
         objTypeName: str
 
     UirCoreIndexBaseInfo =
         baseObj: str
         baseKey: str
-        basePtrOverride: UirExprId
+        basePtrOverride: int32
         haveBasePtrOverride: bool
 
     UirCorePhaseContractStats =
@@ -58,12 +63,12 @@ type
 
     UirCoreGlobalInit = ref
         name: str
-        ty: UirCoreType
+        ty: int32
         objTypeName: str
-        initNode: Node
+        initNode: int32
         filePath: str
-        seqFixedElemType: Node
-        seqFixedCapExpr: Node
+        seqFixedElemType: int32
+        seqFixedCapExpr: int32
 
     UirFnTask = ref
         funcIndex: int32
@@ -76,7 +81,7 @@ type
         bodyTokEnd: int32
         costHint: int32
         genericEpoch: int32
-        funcNode: AstNodeId
+        funcNode: int32
         routineName: str
 
     UirFnTaskResult = ref
@@ -84,7 +89,7 @@ type
         nameTextId: int32
         declOrdinal: int32
         taskOrdinal: int32
-        loweredFunc: UirCoreFunc
+        loweredFunc: int64
         cstrings: str[]
         objAliasUpdates: str[]
         genericRequests: str[]
@@ -101,62 +106,811 @@ type
         traceEnabled: bool
         traceFnCount: int32
         traceGlobalCount: int32
-        overloadedFnBases: hashsets.HashSetStr
+        overloadedFnBases: int64
         globalInitNames: str[]
-        globalInitTypes: UirCoreType[]
+        globalInitTypes: int32[]
         globalInitObjTypeNames: str[]
-        globalInitNodes: Node[]
+        globalInitNodes: int32[]
         globalInitFilePaths: str[]
-        globalInitSeqFixedElemTypes: Node[]
-        globalInitSeqFixedCapExprs: Node[]
+        globalInitSeqFixedElemTypes: int32[]
+        globalInitSeqFixedCapExprs: int32[]
 
-fn Ok_DotAccess(value: DotAccess): Result[DotAccess] =
-    var out: Result[DotAccess]
-    out.ok = true
-    out.value = value
-    ErrorOkInto(out.err)
+fn uirCoreNewFnTask(funcIndex: int32, nameTextId: int32, declOrdinal: int32,
+                    sourceAstIndex: int32, taskOrdinal: int32, originFile: str,
+                    bodyTokStart: int32, bodyTokEnd: int32, costHint: int32,
+                    genericEpoch: int32, funcNode: AstNodeId,
+                    routineName: str): UirFnTask =
+    var task: UirFnTask
+    new task
+    task.funcIndex = funcIndex
+    task.nameTextId = nameTextId
+    task.declOrdinal = declOrdinal
+    task.sourceAstIndex = sourceAstIndex
+    task.taskOrdinal = taskOrdinal
+    task.originFile = originFile
+    task.bodyTokStart = bodyTokStart
+    task.bodyTokEnd = bodyTokEnd
+    task.costHint = costHint
+    task.genericEpoch = genericEpoch
+    task.funcNode = int32(funcNode)
+    task.routineName = routineName
+    return task
+
+fn uirCoreFnTaskFuncIndex(task: UirFnTask): int32 =
+    return (task != nil) ? task.funcIndex : -1
+
+fn uirCoreFnTaskNameTextId(task: UirFnTask): int32 =
+    return (task != nil) ? task.nameTextId : 0
+
+fn uirCoreFnTaskDeclOrdinal(task: UirFnTask): int32 =
+    return (task != nil) ? task.declOrdinal : -1
+
+fn uirCoreFnTaskSourceAstIndex(task: UirFnTask): int32 =
+    return (task != nil) ? task.sourceAstIndex : -1
+
+fn uirCoreFnTaskTaskOrdinal(task: UirFnTask): int32 =
+    return (task != nil) ? task.taskOrdinal : -1
+
+fn uirCoreFnTaskOriginFile(task: UirFnTask): str =
+    return (task != nil) ? task.originFile : ""
+
+fn uirCoreFnTaskBodyTokStart(task: UirFnTask): int32 =
+    return (task != nil) ? task.bodyTokStart : -1
+
+fn uirCoreFnTaskBodyTokEnd(task: UirFnTask): int32 =
+    return (task != nil) ? task.bodyTokEnd : -1
+
+fn uirCoreFnTaskCostHint(task: UirFnTask): int32 =
+    return (task != nil) ? task.costHint : 0
+
+fn uirCoreFnTaskGenericEpoch(task: UirFnTask): int32 =
+    return (task != nil) ? task.genericEpoch : 0
+
+fn uirCoreFnTaskFuncNode(task: UirFnTask): AstNodeId =
+    return (task != nil) ? AstNodeId(task.funcNode) : astInvalidNodeId()
+
+fn uirCoreFnTaskRoutineName(task: UirFnTask): str =
+    return (task != nil) ? task.routineName : ""
+
+fn uirCoreNewFnTaskResult(funcIndex: int32, nameTextId: int32, declOrdinal: int32,
+                          taskOrdinal: int32, loweredFunc: UirCoreFunc): UirFnTaskResult =
+    var out: UirFnTaskResult
+    new out
+    out.funcIndex = funcIndex
+    out.nameTextId = nameTextId
+    out.declOrdinal = declOrdinal
+    out.taskOrdinal = taskOrdinal
+    out.loweredFunc = uirCoreFuncPtrKey(loweredFunc)
+    out.cstrings = []
+    out.objAliasUpdates = []
+    out.genericRequests = []
+    out.diagBundle = []
+    out.profileCounters = []
     return out
 
-fn Err_DotAccess(err: str): Result[DotAccess] =
-    var out: Result[DotAccess]
-    out.ok = false
-    ErrorNewInto(out.err, err)
-    return out
+fn uirCoreFnTaskResultFuncIndex(result: UirFnTaskResult): int32 =
+    return (result != nil) ? result.funcIndex : -1
 
-fn Ok_UirFnTask(value: UirFnTask): Result[UirFnTask] =
-    var out: Result[UirFnTask]
-    out.ok = true
-    out.value = value
-    ErrorOkInto(out.err)
-    return out
+fn uirCoreFnTaskResultSetFuncIndex(result: UirFnTaskResult, value: int32) =
+    if result != nil:
+        result.funcIndex = value
 
-fn Err_UirFnTask(err: str): Result[UirFnTask] =
-    var out: Result[UirFnTask]
-    out.ok = false
-    ErrorNewInto(out.err, err)
-    return out
+fn uirCoreFnTaskResultNameTextId(result: UirFnTaskResult): int32 =
+    return (result != nil) ? result.nameTextId : 0
 
-fn ErrInfo_UirFnTask(err: ErrorInfo): Result[UirFnTask] =
-    var out: Result[UirFnTask]
-    out.ok = false
-    out.err = err
-    return out
+fn uirCoreFnTaskResultLoweredFunc(result: UirFnTaskResult): UirCoreFunc =
+    if result == nil || result.loweredFunc == 0:
+        return nil
+    let funcObj: UirCoreFuncObjPtr = uirCoreFuncObjPtrFromKey(result.loweredFunc)
+    return uirCoreFuncRefFromObjPtr(funcObj)
 
-fn Ok_UirFnTaskResult(value: UirFnTaskResult): Result[UirFnTaskResult] =
-    var out: Result[UirFnTaskResult]
-    out.ok = true
-    out.value = value
-    ErrorOkInto(out.err)
-    return out
+fn uirCoreNewSharedSnapshot(funcCount: int32, globalCount: int32,
+                            cstringCount: int32): UirCoreSharedSnapshot =
+    var snapshot: UirCoreSharedSnapshot
+    new snapshot
+    snapshot.funcCount = funcCount
+    snapshot.globalCount = globalCount
+    snapshot.cstringCount = cstringCount
+    return snapshot
 
-fn Err_UirFnTaskResult(err: str): Result[UirFnTaskResult] =
-    var out: Result[UirFnTaskResult]
-    out.ok = false
-    ErrorNewInto(out.err, err)
-    return out
+fn uirCoreBuildCtxFoundMain(ctx: UirCoreBuildCtx): bool =
+    return (ctx != nil) ? ctx.foundMain : false
 
-fn ErrInfo_UirFnTaskResult(err: ErrorInfo): Result[UirFnTaskResult] =
-    var out: Result[UirFnTaskResult]
-    out.ok = false
-    out.err = err
-    return out
+fn uirCoreBuildCtxSetFoundMain(ctx: UirCoreBuildCtx, value: bool) =
+    if ctx != nil:
+        ctx.foundMain = value
+
+fn uirCoreBuildCtxTraceEnabled(ctx: UirCoreBuildCtx): bool =
+    return (ctx != nil) ? ctx.traceEnabled : false
+
+fn uirCoreBuildCtxIncTraceFnCount(ctx: UirCoreBuildCtx): int32 =
+    if ctx == nil:
+        return 0
+    ctx.traceFnCount = ctx.traceFnCount + 1
+    return ctx.traceFnCount
+
+fn uirCoreBuildCtxIncTraceGlobalCount(ctx: UirCoreBuildCtx): int32 =
+    if ctx == nil:
+        return 0
+    ctx.traceGlobalCount = ctx.traceGlobalCount + 1
+    return ctx.traceGlobalCount
+
+fn uirCoreFnTaskSetFuncNode(task: UirFnTask, node: AstNodeId) =
+    if task != nil:
+        task.funcNode = int32(node)
+
+fn uirCoreBuildCtxNew(): UirCoreBuildCtx =
+    var ctx: UirCoreBuildCtx
+    new ctx
+    ctx.foundMain = false
+    ctx.traceEnabled = false
+    ctx.traceFnCount = 0
+    ctx.traceGlobalCount = 0
+    ctx.overloadedFnBases = 0
+    ctx.globalInitNames = []
+    ctx.globalInitTypes = []
+    ctx.globalInitObjTypeNames = []
+    ctx.globalInitNodes = []
+    ctx.globalInitFilePaths = []
+    ctx.globalInitSeqFixedElemTypes = []
+    ctx.globalInitSeqFixedCapExprs = []
+    return ctx
+
+fn uirCoreBuildCtxReset(ctx: UirCoreBuildCtx) =
+    if ctx == nil:
+        return
+    ctx.foundMain = false
+    ctx.traceEnabled = false
+    ctx.traceFnCount = 0
+    ctx.traceGlobalCount = 0
+    ctx.overloadedFnBases = 0
+    ctx.globalInitNames = []
+    ctx.globalInitTypes = []
+    ctx.globalInitObjTypeNames = []
+    ctx.globalInitNodes = []
+    ctx.globalInitFilePaths = []
+    ctx.globalInitSeqFixedElemTypes = []
+    ctx.globalInitSeqFixedCapExprs = []
+
+fn uirCoreBuildCtxSetTraceEnabled(ctx: UirCoreBuildCtx, value: bool) =
+    if ctx != nil:
+        ctx.traceEnabled = value
+
+fn uirCoreBuildCtxTraceFnCount(ctx: UirCoreBuildCtx): int32 =
+    return (ctx != nil) ? ctx.traceFnCount : 0
+
+fn uirCoreBuildCtxTraceGlobalCount(ctx: UirCoreBuildCtx): int32 =
+    return (ctx != nil) ? ctx.traceGlobalCount : 0
+
+fn uirCoreBuildCtxSetTraceFnCount(ctx: UirCoreBuildCtx, value: int32) =
+    if ctx != nil:
+        ctx.traceFnCount = value
+
+fn uirCoreBuildCtxSetTraceGlobalCount(ctx: UirCoreBuildCtx, value: int32) =
+    if ctx != nil:
+        ctx.traceGlobalCount = value
+
+fn uirCoreBuildCtxGlobalInitLen(ctx: UirCoreBuildCtx): int32 =
+    return (ctx != nil) ? ctx.globalInitNames.len : 0
+
+fn uirCoreBuildCtxAppendGlobalInit(ctx: UirCoreBuildCtx, name: str, ty: UirCoreType,
+                                   objTypeName: str, initNode: Node, filePath: str,
+                                   seqFixedElemType: Node, seqFixedCapExpr: Node) =
+    if ctx == nil:
+        return
+    seqs.add(ctx.globalInitNames, name)
+    seqs.add(ctx.globalInitTypes, uirCoreEncodeType(ty))
+    seqs.add(ctx.globalInitObjTypeNames, objTypeName)
+    seqs.add(ctx.globalInitNodes, int32(initNode))
+    seqs.add(ctx.globalInitFilePaths, filePath)
+    seqs.add(ctx.globalInitSeqFixedElemTypes, int32(seqFixedElemType))
+    seqs.add(ctx.globalInitSeqFixedCapExprs, int32(seqFixedCapExpr))
+
+fn dotAccessAddr(da: DotAccess): UirExprId =
+    return da.addr
+
+fn dotAccessSetAddr(da: DotAccess, addr: UirExprId) =
+    da.addr = addr
+
+fn dotAccessFieldTy(da: DotAccess): UirCoreType =
+    return uirCoreDecodeType(da.fieldTy)
+
+fn dotAccessSetFieldTy(da: DotAccess, fieldTy: UirCoreType) =
+    da.fieldTy = uirCoreEncodeType(fieldTy)
+
+fn dotAccessObjTypeName(da: DotAccess): str =
+    return da.objTypeName
+
+fn dotAccessObjTypeName(ol: UirCoreObjLocal): str =
+    return uirCoreObjTypeNameOf(ol)
+
+fn dotAccessSetObjTypeName(da: DotAccess, objTypeName: str) =
+    da.objTypeName = objTypeName
+
+fn dotAccessWriteToPtr(out: ptr, da: DotAccess): bool =
+    if out == nil:
+        return false
+    var tmp: DotAccess = da
+    memCopyCompat(out, &tmp, int32(sizeof DotAccess))
+    return true
+
+fn indexBaseInfoBaseObj(info: UirCoreIndexBaseInfo): str =
+    return info.baseObj
+
+fn indexBaseInfoSetBaseObj(info: UirCoreIndexBaseInfo, value: str) =
+    info.baseObj = value
+
+fn indexBaseInfoBaseKey(info: UirCoreIndexBaseInfo): str =
+    return info.baseKey
+
+fn indexBaseInfoSetBaseKey(info: UirCoreIndexBaseInfo, value: str) =
+    info.baseKey = value
+
+fn indexBaseInfoBasePtrOverride(info: UirCoreIndexBaseInfo): UirExprId =
+    return info.basePtrOverride
+
+fn indexBaseInfoSetBasePtrOverride(info: UirCoreIndexBaseInfo, value: UirExprId) =
+    info.basePtrOverride = value
+
+fn indexBaseInfoHaveBasePtrOverride(info: UirCoreIndexBaseInfo): bool =
+    return info.haveBasePtrOverride
+
+fn indexBaseInfoSetHaveBasePtrOverride(info: UirCoreIndexBaseInfo, value: bool) =
+    info.haveBasePtrOverride = value
+
+fn uirCoreBuildCtxGlobalInitNameAt(ctx: UirCoreBuildCtx, idx: int32): str =
+    if ctx == nil || idx < 0 || idx >= ctx.globalInitNames.len:
+        return ""
+    return ctx.globalInitNames[idx]
+
+fn uirCoreBuildCtxGlobalInitTypeAt(ctx: UirCoreBuildCtx, idx: int32): UirCoreType =
+    if ctx == nil || idx < 0 || idx >= ctx.globalInitTypes.len:
+        return uirCoreTypeI32()
+    return uirCoreDecodeType(ctx.globalInitTypes[idx])
+
+fn uirCoreBuildCtxGlobalInitObjTypeNameAt(ctx: UirCoreBuildCtx, idx: int32): str =
+    if ctx == nil || idx < 0 || idx >= ctx.globalInitObjTypeNames.len:
+        return ""
+    return ctx.globalInitObjTypeNames[idx]
+
+fn uirCoreBuildCtxGlobalInitNodeAt(ctx: UirCoreBuildCtx, idx: int32): Node =
+    if ctx == nil || idx < 0 || idx >= ctx.globalInitNodes.len:
+        return astInvalidNodeId()
+    return AstNodeId(ctx.globalInitNodes[idx])
+
+fn uirCoreBuildCtxGlobalInitFilePathAt(ctx: UirCoreBuildCtx, idx: int32): str =
+    if ctx == nil || idx < 0 || idx >= ctx.globalInitFilePaths.len:
+        return ""
+    return ctx.globalInitFilePaths[idx]
+
+fn uirCoreBuildCtxGlobalInitSeqFixedElemTypeAt(ctx: UirCoreBuildCtx, idx: int32): Node =
+    if ctx == nil || idx < 0 || idx >= ctx.globalInitSeqFixedElemTypes.len:
+        return astInvalidNodeId()
+    return AstNodeId(ctx.globalInitSeqFixedElemTypes[idx])
+
+fn uirCoreBuildCtxGlobalInitSeqFixedCapExprAt(ctx: UirCoreBuildCtx, idx: int32): Node =
+    if ctx == nil || idx < 0 || idx >= ctx.globalInitSeqFixedCapExprs.len:
+        return astInvalidNodeId()
+    return AstNodeId(ctx.globalInitSeqFixedCapExprs[idx])
+
+fn loopContextBreakLabel(ctx: LoopContext): str =
+    return (ctx != nil) ? ctx.breakLabel : ""
+
+fn loopContextContinueLabel(ctx: LoopContext): str =
+    return (ctx != nil) ? ctx.continueLabel : ""
+
+fn loopContextDeferDepth(ctx: LoopContext): int32 =
+    return (ctx != nil) ? ctx.deferDepth : 0
+
+fn deferFrameBodiesLen(frame: DeferFrame): int32 =
+    return (frame != nil) ? frame.bodies.len : 0
+
+fn deferFrameBodyAt(frame: DeferFrame, idx: int32): Node =
+    if frame == nil || idx < 0 || idx >= frame.bodies.len:
+        return astInvalidNodeId()
+    return AstNodeId(frame.bodies[idx])
+
+fn deferFrameAddBody(frame: DeferFrame, body: Node) =
+    if frame != nil && astNodeIdValid(body):
+        seqs.add(frame.bodies, int32(body))
+
+fn blockBuilderEnv(b: BlockBuilder): LocalEnv =
+    return (b != nil) ? b.env : nil
+
+fn blockBuilderModule(b: BlockBuilder): UirCoreModule =
+    if b == nil || !uirCoreHostPtrSane(b.module):
+        return nil
+    return UirCoreModule(ptr(uint64(b.module)))
+
+fn blockBuilderFuncPtrKey(b: BlockBuilder): int64 =
+    return (b != nil) ? b.funcShadowPtr : 0
+
+fn blockBuilderFuncDynKey(b: BlockBuilder): int64 =
+    return (b != nil) ? b.funcShadowDynKey : 0
+
+fn blockBuilderObjCursor(b: BlockBuilder): int32 =
+    return (b != nil) ? b.objCursor : 0
+
+fn blockBuilderSetObjCursor(b: BlockBuilder, value: int32) =
+    if b != nil:
+        b.objCursor = value
+
+fn blockBuilderImplicitResultUsed(b: BlockBuilder): bool =
+    return (b != nil) ? b.implicitResultUsed : false
+
+fn blockBuilderSetImplicitResultUsed(b: BlockBuilder, value: bool) =
+    if b != nil:
+        b.implicitResultUsed = value
+
+fn blockBuilderExprLowerDepth(b: BlockBuilder): int32 =
+    return (b != nil) ? b.exprLowerDepth : 0
+
+fn blockBuilderSetExprLowerDepth(b: BlockBuilder, value: int32) =
+    if b != nil:
+        b.exprLowerDepth = value
+
+fn blockBuilderExprLowerDepthInc(b: BlockBuilder) =
+    if b != nil:
+        b.exprLowerDepth = b.exprLowerDepth + 1
+
+fn blockBuilderExprLowerDepthDec(b: BlockBuilder) =
+    if b != nil && b.exprLowerDepth > 0:
+        b.exprLowerDepth = b.exprLowerDepth - 1
+
+fn blockBuilderExprLowerStackLen(b: BlockBuilder): int32 =
+    return (b != nil) ? b.exprLowerStack.len : 0
+
+fn blockBuilderExprLowerStackAt(b: BlockBuilder, idx: int32): Node =
+    if b == nil || idx < 0 || idx >= b.exprLowerStack.len:
+        return astInvalidNodeId()
+    return AstNodeId(b.exprLowerStack[idx])
+
+fn blockBuilderExprLowerStackSetAt(b: BlockBuilder, idx: int32, node: Node) =
+    if b == nil || idx < 0 || idx >= b.exprLowerStack.len:
+        return
+    b.exprLowerStack[idx] = int32(node)
+
+fn blockBuilderExprLowerStackSetLen(b: BlockBuilder, newLen: int32) =
+    if b == nil:
+        return
+    if newLen < 0:
+        b.exprLowerStack.len = 0
+        return
+    if newLen <= b.exprLowerStack.len:
+        b.exprLowerStack.len = newLen
+
+fn blockBuilderDeferStackLen(b: BlockBuilder): int32 =
+    return (b != nil) ? b.deferStack.len : 0
+
+fn blockBuilderDeferStackAt(b: BlockBuilder, idx: int32): DeferFrame =
+    if b == nil || idx < 0 || idx >= b.deferStack.len:
+        return nil
+    return b.deferStack[idx]
+
+fn builderTypesStripSpaces(s: str): str =
+    if len(s) == 0:
+        return ""
+    return strutils.strip(s)
+
+fn builderTypesStripSpacesMaybe(s: str): str =
+    if len(s) == 0:
+        return ""
+    let stripped: str = strutils.strip(s)
+    if len(stripped) == 0:
+        return ""
+    return stripped
+
+fn loopContextSeqAppend(seqInst: var LoopContext[], ctx: LoopContext) =
+    seqs.add(seqInst, ctx)
+
+fn deferFrameSeqAppend(seqInst: var DeferFrame[], frame: DeferFrame) =
+    seqs.add(seqInst, frame)
+
+fn astNodeSeqAppend(seqInst: var Node[], node: Node) =
+    seqs.add(seqInst, node)
+
+fn builderStrSeqAppend(seqInst: var str[], value: str) =
+    seqs.add(seqInst, value)
+
+fn builderExprSeqAppend(seqInst: var UirExprId[], expr: UirExprId) =
+    seqs.add(seqInst, expr)
+
+fn blockBuilderNew(env: LocalEnv, module: UirCoreModule, func: UirCoreFunc): BlockBuilder =
+    let dbgPipe: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
+    if dbgPipe:
+        let fDbg0: os.File = os.get_stderr()
+        os.writeLine(fDbg0, "[backend] stage1: block_builder_new_enter")
+        os.c_fflush fDbg0
+    var b: BlockBuilder
+    new b
+    if dbgPipe:
+        let fDbg1: os.File = os.get_stderr()
+        os.writeLine(fDbg1, "[backend] stage1: block_builder_new_alloc")
+        os.c_fflush fDbg1
+    b.env = env
+    b.module = int64(module)
+    b.func = int64(func)
+    b.funcShadowPtr = uirCoreFuncPtrKey(func)
+    b.funcShadowDynKey = uirCoreFuncNameCacheKey(func)
+    b.currentLabel = "entry"
+    b.currentStmtStart = uirCoreBlockStmtsFlatLen()
+    b.currentStmtLen = 0
+    b.labelCounter = 0
+    b.objCursor = 0
+    b.loopStack = []
+    b.deferStack = []
+    b.exprLowerDepth = 0
+    b.exprLowerStack = []
+    b.implicitResultUsed = false
+    if dbgPipe:
+        let fDbg2: os.File = os.get_stderr()
+        os.writeLine(fDbg2, "[backend] stage1: block_builder_new_ready")
+        os.c_fflush fDbg2
+    return b
+
+fn blockBuilderFuncRef(b: BlockBuilder): UirCoreFunc =
+    if b == nil:
+        return nil
+    let stored: UirCoreFunc = uirCoreHostPtrSane(b.func) ? UirCoreFunc(ptr(uint64(b.func))) : nil
+    if uirCoreFuncIdValid(stored):
+        return stored
+    let ptrVal: int64 = uirCoreRecoverFuncPtr(b.funcShadowPtr)
+    if uirCoreHostPtrSane(ptrVal):
+        let recovered: UirCoreFunc = UirCoreFunc(ptr(uint64(ptrVal)))
+        if uirCoreFuncIdValid(recovered):
+            b.func = int64(recovered)
+            return recovered
+    let recoveredDyn: UirCoreFunc = uirCoreFuncFromDynKey(b.funcShadowDynKey)
+    if uirCoreFuncIdValid(recoveredDyn):
+        b.func = int64(recoveredDyn)
+        b.funcShadowPtr = uirCoreFuncPtrKey(recoveredDyn)
+        return recoveredDyn
+    return stored
+
+fn blockBuilderNextLabel(b: BlockBuilder, prefix: str): str =
+    let id: int32 = (b != nil) ? b.labelCounter : 0
+    if b != nil:
+        b.labelCounter = b.labelCounter + 1
+    if len(prefix) <= 0:
+        return intToStr(id)
+    return prefix + intToStr(id)
+
+fn blockBuilderStart(b: BlockBuilder, label: str) =
+    if b == nil:
+        return
+    b.currentLabel = label
+    b.currentStmtStart = uirCoreBlockStmtsFlatLen()
+    b.currentStmtLen = 0
+
+fn blockBuilderStmtAppend(b: BlockBuilder, stmt: UirStmtId) =
+    if b == nil:
+        return
+    uirCoreBlockStmtsFlatAppend(stmt)
+    b.currentStmtLen = b.currentStmtLen + 1
+
+fn blockBuilderStmtLen(b: BlockBuilder): int32 =
+    return (b != nil) ? b.currentStmtLen : 0
+
+fn blockBuilderStmtAt(b: BlockBuilder, idx: int32): UirStmtId =
+    if b == nil || idx < 0 || idx >= b.currentStmtLen:
+        return 0
+    let pos: int32 = b.currentStmtStart + idx
+    if pos < 0 || pos >= uirCoreBlockStmtsFlatLen():
+        return 0
+    return uirCoreBlockStmtsFlatAt(pos)
+
+fn blockBuilderExprLowerPush(b: BlockBuilder, node: Node) =
+    if b == nil || !astNodeIdValid(node):
+        return
+    seqs.add(b.exprLowerStack, int32(node))
+
+fn blockBuilderAddStmt(b: BlockBuilder, stmt: UirStmtId) =
+    if b == nil:
+        return
+    if crashTraceEnabled():
+        crashTraceSetPhase(strToCStringTemp("uir.block.add_stmt"))
+        crashTraceMark(strToCStringTemp("uir.block.add"), stmt, b.currentStmtStart, b.currentStmtLen, 0)
+    blockBuilderStmtAppend(b, stmt)
+
+fn blockBuilderFinish(b: BlockBuilder, term: UirCoreTerm) =
+    if b == nil:
+        return
+    let stmtStart: int32 = b.currentStmtStart
+    let stmtLen: int32 = b.currentStmtLen
+    let blk: UirBlockId = uirCoreBlockWithStmtSpan(b.currentLabel, stmtStart, stmtLen, term)
+    let dbgFunc: UirCoreFunc = blockBuilderFuncRef(b)
+    if len(os.getEnvDefault("BACKEND_DEBUG_MIR_FINISH", "")) > 0 &&
+       os.getEnvDefault("BACKEND_DEBUG_MIR_FINISH", "") ==
+       ((dbgFunc != nil) ? uirCoreFuncNameOf(dbgFunc) : uirCoreFuncNameOfPtrKey(b.funcShadowPtr)):
+        let curLen: int32 = b.currentStmtLen
+        let blkLen: int32 = uirCoreBlockStmtsLen(blk)
+        let fDbg: os.File = os.get_stderr()
+        os.write(fDbg, "[backend] dbgFinish: fn=")
+        os.write(fDbg, (dbgFunc != nil) ? uirCoreFuncNameOf(dbgFunc) : uirCoreFuncNameOfPtrKey(b.funcShadowPtr))
+        os.write(fDbg, " label=")
+        os.write(fDbg, b.currentLabel)
+        os.write(fDbg, " cur.len=")
+        os.write(fDbg, intToStr(curLen))
+        os.write(fDbg, " blk.len=")
+        os.writeLine(fDbg, intToStr(blkLen))
+        if curLen > 0:
+            let s0: UirStmtId = blockBuilderStmtAt(b, 0)
+            os.write(fDbg, "[backend] dbgFinish: cur0.kind=")
+            os.write(fDbg, intToStr(int32(uirCoreStmtKindOf(s0))))
+            os.write(fDbg, " slot=")
+            os.writeLine(fDbg, intToStr(uirCoreStmtSlotOf(s0)))
+        if blkLen > 0:
+            let s1: UirStmtId = uirCoreBlockStmtAt(blk, 0)
+            os.write(fDbg, "[backend] dbgFinish: blk0.kind=")
+            os.write(fDbg, intToStr(int32(uirCoreStmtKindOf(s1))))
+            os.write(fDbg, " slot=")
+            os.writeLine(fDbg, intToStr(uirCoreStmtSlotOf(s1)))
+    let addFunc: UirCoreFunc = blockBuilderFuncRef(b)
+    if uirCoreFuncIdValid(addFunc):
+        uirCoreAddBlock(addFunc, blk)
+    else:
+        uirCoreAddBlockByPtrKey(b.funcShadowPtr, blk)
+    b.currentLabel = ""
+    b.currentStmtStart = uirCoreBlockStmtsFlatLen()
+    b.currentStmtLen = 0
+
+fn blockBuilderPushLoop(b: BlockBuilder, breakLabel: str, continueLabel: str) =
+    if b == nil:
+        return
+    var ctx: LoopContext
+    new ctx
+    ctx.breakLabel = breakLabel
+    ctx.continueLabel = continueLabel
+    ctx.deferDepth = b.deferStack.len
+    loopContextSeqAppend(b.loopStack, ctx)
+
+fn blockBuilderPopLoop(b: BlockBuilder): LoopContext =
+    if b == nil || b.loopStack.len == 0:
+        return nil
+    let idx: int32 = b.loopStack.len - 1
+    let ctx: LoopContext = b.loopStack[idx]
+    b.loopStack.len = idx
+    return ctx
+
+fn blockBuilderPeekLoop(b: BlockBuilder): LoopContext =
+    if b == nil || b.loopStack.len == 0:
+        return nil
+    return b.loopStack[b.loopStack.len - 1]
+
+fn blockBuilderPushDefer(b: BlockBuilder) =
+    if b == nil:
+        return
+    var frame: DeferFrame
+    new frame
+    frame.bodies = []
+    deferFrameSeqAppend(b.deferStack, frame)
+
+fn blockBuilderPopDefer(b: BlockBuilder): DeferFrame =
+    if b == nil || b.deferStack.len == 0:
+        return nil
+    let idx: int32 = b.deferStack.len - 1
+    let frame: DeferFrame = b.deferStack[idx]
+    b.deferStack.len = idx
+    return frame
+
+fn blockBuilderPeekDefer(b: BlockBuilder): DeferFrame =
+    if b == nil || b.deferStack.len == 0:
+        return nil
+    return b.deferStack[b.deferStack.len - 1]
+
+fn blockBuilderNextTemp(b: BlockBuilder, prefix: str): str =
+    return blockBuilderNextLabel(b, prefix)
+
+fn localEnvSeqHeaderSane(seqLen: int32, seqCap: int32, seqBufAddr: int64): bool =
+    if seqLen < 0 || seqCap < seqLen:
+        return false
+    if seqCap > (1 << 20):
+        return false
+    if seqLen > 0 && seqBufAddr <= 4096:
+        return false
+    if seqBufAddr != 0 && (seqBufAddr & int64(3)) != 0:
+        return false
+    return true
+
+fn localEnvSane(env: LocalEnv): bool =
+    if env == nil:
+        return false
+    let n: int32 = env.names.len
+    if env.types.len != n || env.typeKeys.len != n ||
+       env.callTargets.len != n || env.active.len != n || env.prevSlots.len != n:
+        return false
+    if !localEnvSeqHeaderSane(env.names.len, env.names.cap, int64(env.names.buffer)):
+        return false
+    if !localEnvSeqHeaderSane(env.types.len, env.types.cap, int64(env.types.buffer)):
+        return false
+    if !localEnvSeqHeaderSane(env.typeKeys.len, env.typeKeys.cap, int64(env.typeKeys.buffer)):
+        return false
+    if !localEnvSeqHeaderSane(env.callTargets.len, env.callTargets.cap, int64(env.callTargets.buffer)):
+        return false
+    if !localEnvSeqHeaderSane(env.active.len, env.active.cap, int64(env.active.buffer)):
+        return false
+    if !localEnvSeqHeaderSane(env.scopeMarks.len, env.scopeMarks.cap, int64(env.scopeMarks.buffer)):
+        return false
+    if !localEnvSeqHeaderSane(env.prevSlots.len, env.prevSlots.cap, int64(env.prevSlots.buffer)):
+        return false
+    for i in 0..<env.scopeMarks.len:
+        let mark: int32 = env.scopeMarks[i]
+        if mark < 0 || mark > n:
+            return false
+    return true
+
+fn localEnvAssertSane(env: LocalEnv, where: str) =
+    if localEnvSane(env):
+        return
+    panic "uirCore_builder: local env corrupt @" + where
+
+fn localEnvEnsureCapacity(env: LocalEnv, needLen: int32) =
+    if env == nil || needLen <= 0:
+        return
+    if env.names.buffer == nil || env.names.cap < needLen:
+        reserve(env.names, needLen)
+    if env.types.buffer == nil || env.types.cap < needLen:
+        reserve(env.types, needLen)
+    if env.typeKeys.buffer == nil || env.typeKeys.cap < needLen:
+        reserve(env.typeKeys, needLen)
+    if env.callTargets.buffer == nil || env.callTargets.cap < needLen:
+        reserve(env.callTargets, needLen)
+    if env.active.buffer == nil || env.active.cap < needLen:
+        reserve(env.active, needLen)
+    if env.prevSlots.buffer == nil || env.prevSlots.cap < needLen:
+        reserve(env.prevSlots, needLen)
+
+fn localEnvNew(): LocalEnv =
+    var env: LocalEnv
+    new env
+    env.names = []
+    env.types = []
+    env.typeKeys = []
+    env.callTargets = []
+    env.active = []
+    env.scopeMarks = []
+    env.names.cap = 64
+    env.types.cap = 64
+    env.typeKeys.cap = 64
+    env.callTargets.cap = 64
+    env.active.cap = 64
+    env.scopeMarks.cap = 16
+    env.nameIndex = hashmaps.hashMapStrIntInit(64)
+    env.prevSlots = []
+    env.prevSlots.cap = 64
+    return env
+
+var localEnvLookupModeCached: int32 = -1
+
+fn localEnvUseLinearLookup(): bool =
+    if localEnvLookupModeCached >= 0:
+        return localEnvLookupModeCached == 1
+    if strutil.toLowerAscii(strutil.strip(os.getEnvDefault("BACKEND_STAGE1_LOCAL_ENV_LOOKUP", "linear"))) == "hash":
+        localEnvLookupModeCached = 0
+    else:
+        localEnvLookupModeCached = 1
+    return localEnvLookupModeCached == 1
+
+fn localEnvPushScope(env: LocalEnv) =
+    if env == nil:
+        return
+    localEnvAssertSane(env, "push_scope.enter")
+    seqs.add(env.scopeMarks, env.names.len)
+    localEnvAssertSane(env, "push_scope.exit")
+
+fn localEnvPopScope(env: LocalEnv) =
+    if env == nil || env.scopeMarks.len == 0:
+        return
+    localEnvAssertSane(env, "pop_scope.enter")
+    let mark: int32 = env.scopeMarks[env.scopeMarks.len - 1]
+    env.scopeMarks.len = env.scopeMarks.len - 1
+    if mark < 0:
+        return
+    let lastSlot: int32 = env.names.len - 1
+    if mark <= lastSlot:
+        var slot: int32 = lastSlot
+        while slot >= mark:
+            if !localEnvUseLinearLookup() && slot >= 0 && slot < env.names.len && slot < env.prevSlots.len:
+                let prev: int32 = env.prevSlots[slot]
+                let restore: int32 = (prev >= 0) ? (prev + 1) : 0
+                hashmaps.hashMapStrIntPut(env.nameIndex, env.names[slot], restore)
+            if slot == 0:
+                break
+            slot = slot - 1
+    for i in mark..<env.active.len:
+        env.active[i] = 0
+    localEnvAssertSane(env, "pop_scope.exit")
+
+fn localIndex(env: LocalEnv, name: str): int32 =
+    if env == nil:
+        return -1
+    if len(name) == 0:
+        return -1
+    let lookupName: str = builderTypesStripSpacesMaybe(name)
+    if len(lookupName) == 0:
+        return -1
+    if localEnvUseLinearLookup():
+        var i: int32 = env.names.len - 1
+        while i >= 0:
+            if i < env.active.len && env.active[i] == 0:
+                if i == 0:
+                    break
+                i = i - 1
+                continue
+            if i < env.names.len && env.names[i] == lookupName:
+                return i
+            if i == 0:
+                break
+            i = i - 1
+        return -1
+    var idxFound: bool = false
+    let idxPlus1: int32 = hashmaps.hashMapStrIntGetEx(env.nameIndex, lookupName, idxFound)
+    if idxPlus1 <= 0:
+        return -1
+    let idx: int32 = idxPlus1 - 1
+    if env.active.len == env.names.len && idx < env.active.len && env.active[idx] == 0:
+        return -1
+    return idx
+
+fn localAdd(env: LocalEnv, name: str, ty: UirCoreType): int32 =
+    if env == nil:
+        return -1
+    localEnvAssertSane(env, "localAdd.enter")
+    let normalizedName: str = builderTypesStripSpaces(name)
+    if (getEnv "BACKEND_DEBUG_LET" == "1") && (normalizedName == "snapRes"):
+        let mark: int32 = (env.scopeMarks.len > 0) ? env.scopeMarks[env.scopeMarks.len - 1] : -1
+        echo("[backend] debugLocalAdd: name='snapRes' slot=" + intToStr(env.names.len) +
+             " scopeMarks=" + intToStr(env.scopeMarks.len) + " topMark=" + intToStr(mark))
+    var prevSlot: int32 = -1
+    if !localEnvUseLinearLookup():
+        var prevFound: bool = false
+        let prevPlus1: int32 = hashmaps.hashMapStrIntGetEx(env.nameIndex, normalizedName, prevFound)
+        prevSlot = (prevPlus1 > 0) ? (prevPlus1 - 1) : -1
+    let slot: int32 = env.names.len
+    let needLen: int32 = slot + 1
+    localEnvEnsureCapacity(env, needLen)
+    setLen(env.names, needLen)
+    setLen(env.types, needLen)
+    setLen(env.typeKeys, needLen)
+    setLen(env.callTargets, needLen)
+    setLen(env.active, needLen)
+    setLen(env.prevSlots, needLen)
+    env.names[slot] = normalizedName
+    env.types[slot] = uirCoreEncodeType(ty)
+    env.typeKeys[slot] = ""
+    env.callTargets[slot] = ""
+    env.active[slot] = 1
+    env.prevSlots[slot] = prevSlot
+    if !localEnvUseLinearLookup():
+        hashmaps.hashMapStrIntPut(env.nameIndex, normalizedName, env.names.len)
+    localEnvAssertSane(env, "localAdd.exit")
+    return slot
+
+fn localType(env: LocalEnv, idx: int32): UirCoreType =
+    if env == nil || idx < 0 || idx >= env.types.len:
+        return uirCoreTypeI32()
+    return uirCoreDecodeType(env.types[idx])
+
+fn localTypeKey(env: LocalEnv, idx: int32): str =
+    if env == nil || idx < 0 || idx >= env.typeKeys.len:
+        return ""
+    return env.typeKeys[idx]
+
+fn localCallTarget(env: LocalEnv, idx: int32): str =
+    if env == nil || idx < 0 || idx >= env.callTargets.len:
+        return ""
+    return env.callTargets[idx]
+
+fn localSetTypeKey(env: LocalEnv, idx: int32, key: str) =
+    if env == nil || len(key) == 0:
+        return
+    if idx < 0 || idx >= env.typeKeys.len:
+        return
+    env.typeKeys[idx] = key
+
+fn localSetCallTarget(env: LocalEnv, idx: int32, target: str) =
+    if env == nil || len(target) == 0:
+        return
+    if idx < 0 || idx >= env.callTargets.len:
+        return
+    env.callTargets[idx] = target

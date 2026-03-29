@@ -560,8 +560,6 @@ if [ "$driver" = "" ]; then
     driver="artifacts/backend_selfhost_self_obj/cheng.stage2"
   elif [ -x "artifacts/backend_selfhost_self_obj/cheng.stage1" ]; then
     driver="artifacts/backend_selfhost_self_obj/cheng.stage1"
-  elif [ -x "artifacts/backend_seed/cheng.stage2" ]; then
-    driver="artifacts/backend_seed/cheng.stage2"
   else
     driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
   fi

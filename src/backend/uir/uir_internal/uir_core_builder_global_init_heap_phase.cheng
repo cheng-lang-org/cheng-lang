@@ -1,0 +1,92 @@
+# Heap global-init phase split away from the entry wrapper so object allocation
+# materialization stays out of the root entry body.
+import std/os
+import std/result
+import std/seqs
+import stage1/ast
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_object_runtime_helpers
+import backend/uir/uir_internal/uir_core_builder_global_init_common
+
+fn uirCoreBuildGlobalInitHeapChunk(mod: UirCoreModule, ctx: UirCoreBuildCtx,
+                                   startIndex: int32, chunkSize: int32, chunkOrdinal: int32,
+                                   dbgGlobalInitIndex: bool, fDbgGlobalInitIndex: os.File,
+                                   outNextIndex: var int32, outFunc: var UirCoreFunc): Result[bool] =
+    if (mod == nil) || (ctx == nil):
+        return Err[bool]("uirCore_builder: invalid global init heap chunk args")
+    uirCoreMaterializeSymbolTrace("global_init_chunk_start phase=heap chunk=" + intToStr(chunkOrdinal) +
+                                  " start=" + intToStr(startIndex))
+    outNextIndex = startIndex
+    outFunc = nil
+    if startIndex < 0 || startIndex > uirCoreBuildCtxGlobalInitLen(ctx):
+        return Err[bool]("uirCore_builder: invalid global init heap chunk start")
+    let helperBase: str = "__cheng_global_init_heap"
+    let helperName: str = uirCoreGlobalInitChunkHelperName(helperBase, chunkOrdinal)
+    var i: int32 = startIndex
+    var emitted: int32 = 0
+    var f: UirCoreFunc = nil
+    var env: LocalEnv = nil
+    var b: BlockBuilder = nil
+    while i < uirCoreBuildCtxGlobalInitLen(ctx):
+        let objTypeName: str = uirCoreBuildCtxGlobalInitObjTypeNameAt(ctx, i)
+        if len(objTypeName) == 0:
+            i = i + 1
+            continue
+        if emitted == 0:
+            let nameRes: Result[bool] = uirCoreGlobalInitEnsureNameAvailable(mod, helperName)
+            if !IsOk[bool](nameRes):
+                return ErrInfo[bool](ErrorInfoOf[bool](nameRes))
+            f = uirCoreNewFunc(helperName, uirCoreTypeVoid())
+            uirCoreFuncInitHeaderMeta(f, uirCoreFuncRetTypeKeyOf(f),
+                                      uirCoreGlobalInitPhaseOrigin("heap"),
+                                      uirCoreFuncDeclOrdinalOf(f),
+                                      uirCoreFuncSourceAstIndexOf(f),
+                                      uirCoreFuncIsExtern(f))
+            env = localEnvNew()
+            b = blockBuilderNew(env, mod, f)
+        uirCoreGlobalInitDebugWrite(
+            dbgGlobalInitIndex,
+            fDbgGlobalInitIndex,
+            "[backend] global_init phase=heap chunk=" + intToStr(chunkOrdinal) +
+            " i=" + intToStr(i) +
+            " emitted=" + intToStr(emitted) +
+            " name=" + uirCoreBuildCtxGlobalInitNameAt(ctx, i) +
+            " obj=" + objTypeName)
+        let ot: UirCoreObjType = uirCoreGetObjType(mod, objTypeName)
+        if uirCoreSizeOf(ot) <= 0:
+            return Err[bool]("uirCore_builder: global init missing object layout: " + objTypeName)
+        let tmpName: str = blockBuilderNextTemp(b, "__gobj")
+        let tmpSlot: int32 = localAdd(env, tmpName, uirCoreTypeI64())
+        uirCoreSetLocalType(f, tmpSlot, uirCoreTypeI64())
+        var allocArgs: UirExprId[]
+        builderExprSeqAppend(allocArgs, uirCoreConstI64(int64(uirCoreSizeOf(ot))))
+        blockBuilderAddStmt(b, uirCoreStmtLet(tmpName, tmpSlot, uirCoreCall("alloc", allocArgs)))
+        var zeroArgs: UirExprId[]
+        builderExprSeqAppend(zeroArgs, uirCoreLocal(tmpSlot))
+        builderExprSeqAppend(zeroArgs, uirCoreConstI64(0))
+        builderExprSeqAppend(zeroArgs, uirCoreConstI64(int64(uirCoreSizeOf(ot))))
+        blockBuilderAddStmt(b, uirCoreStmtExpr(uirCoreCall("setMem", zeroArgs)))
+        let seqFixedElemType: Node = uirCoreBuildCtxGlobalInitSeqFixedElemTypeAt(ctx, i)
+        let seqFixedCapExpr: Node = uirCoreBuildCtxGlobalInitSeqFixedCapExprAt(ctx, i)
+        if astNodeIdValid(seqFixedElemType) && astNodeIdValid(seqFixedCapExpr):
+            let sfi: SeqFixedInit = seqFixedInitWith(seqFixedElemType, seqFixedCapExpr)
+            let seqInitRes: Result[bool] = emitSeqFixedReserveInitToPtr(b, uirCoreLocal(tmpSlot), sfi)
+            if !IsOk[bool](seqInitRes):
+                return ErrInfo[bool](ErrorInfoOf[bool](seqInitRes))
+        blockBuilderAddStmt(b, uirCoreStmtStore(uirCoreGlobalAddr(uirCoreBuildCtxGlobalInitNameAt(ctx, i)),
+                                                uirCoreLocal(tmpSlot), uirCoreTypeI64()))
+        emitted = emitted + 1
+        i = i + 1
+        if emitted >= chunkSize:
+            break
+    outNextIndex = i
+    if emitted == 0 || (f == nil) || (b == nil):
+        return Ok[bool](false)
+    blockBuilderFinish(b, uirCoreTermRet(nil))
+    outFunc = f
+    uirCoreMaterializeSymbolTrace("global_init_chunk_done phase=heap chunk=" + intToStr(chunkOrdinal) +
+                                  " next=" + intToStr(outNextIndex) +
+                                  " emitted=" + intToStr(emitted) +
+                                  " helper=" + helperName)
+    return Ok[bool](true)

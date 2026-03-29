@@ -1,0 +1,395 @@
+import std/os
+import std/result
+import std/hashmaps
+import std/system
+import stage1/ast
+import stage1/frontend_lib
+import stage1/semantics
+import stage1/monomorphize
+import stage1/ownership
+import stage1/diagnostics
+import stage1/c_profile_lowering
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_policy_contract
+import backend/uir/uir_internal/uir_core_builder_file_shared_helpers
+import backend/uir/uir_internal/uir_core_builder_root_build
+
+fn uirCoreFilePhaseDebugRootHasTypeDecl(root: Node, typeName: str): bool =
+    if !astNodeIdValid(root) || len(typeName) == 0:
+        return false
+    for i in 0..<astKidCount(root):
+        let nId: AstNodeId = astKidAt(root, i)
+        if !astNodeIdValid(nId) || !astNodeIsTypeDecl(nId) || astKidCount(nId) <= 0:
+            continue
+        let nameId: AstNodeId = astKidAt(nId, 0)
+        if astNodeIdValid(nameId) &&
+           astNodeIsIdentOrSymbol(nameId) &&
+           backendStripSpaces(astPlainName(nameId)) == typeName:
+            return true
+    return false
+
+fn uirCoreFilePhaseBorrowStageLabel(borrowIrMode: str): str =
+    if borrowIrMode == "mir":
+        return "mir_borrow"
+    return "ownership"
+
+fn uirCoreFilePhaseOwnershipEngineNormalized(): str =
+    let raw: str = backendLowerAscii(backendStripSpaces(getEnv "STAGE1_OWNERSHIP_ENGINE"))
+    if len(raw) == 0:
+        return "scan"
+    if raw == "legacy":
+        return "legacy"
+    if raw == "scan":
+        return "scan"
+    return "scan"
+
+fn uirCoreFileExecRunSemanticsPhase(root0Id: AstNodeId,
+                                    diags: var Diagnostic[],
+                                    dbgPipe: bool,
+                                    dbgConstFile: bool,
+                                    dbgFile: os.File,
+                                    profOn: bool,
+                                    profMark: var int64,
+                                    profSem: var int64,
+                                    mmIsOrc: bool,
+                                    strictOn0: bool,
+                                    ownDiags: bool) =
+    let skipSem: bool = false
+    if !skipSem:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: semantics_start")
+            os.c_fflush dbgFile
+            os.writeLine(dbgFile, "[backend] stage1: semantics_pretrace")
+            os.c_fflush dbgFile
+        stage1Trace "internal: semantics"
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: semantics_precheck")
+            os.c_fflush dbgFile
+        checkSemanticsId(root0Id, diags, ownDiags, mmIsOrc && strictOn0)
+        if profOn:
+            profSem = cheng_monotime_ns() - profMark
+            profMark = cheng_monotime_ns()
+        if ownDiags && ownershipHintsEnabled() && mmIsOrc && strictOn0:
+            if hasHint diags:
+                printHints diags
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: semantics_done")
+            os.c_fflush dbgFile
+        if dbgConstFile:
+            os.writeLine(os.get_stderr(), "[backend] const: semantics_done")
+            os.c_fflush os.get_stderr()
+    else:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: semantics_skipped")
+            os.c_fflush dbgFile
+
+fn uirCoreFileExecRunMonomorphizePhase(root0Id: AstNodeId,
+                                       diags: var Diagnostic[],
+                                       dbgPipe: bool,
+                                       dbgConstFile: bool,
+                                       dbgFile: os.File,
+                                       profOn: bool,
+                                       profMark: var int64,
+                                       profMono: var int64,
+                                       skipMono: bool): Result[Node] =
+    stage1Trace "internal: monomorphize"
+    var root: Node = root0Id
+    if !skipMono:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: mono_start")
+            os.c_fflush dbgFile
+        let monoRoot0Id: AstNodeId = monomorphizeId(root0Id, &diags)
+        root = monoRoot0Id
+        uirCoreDebugDumpStringLiteralStage("post_mono_root", monoRoot0Id)
+        let dbgTypeDeclName: str = os.getEnvDefault("BACKEND_DEBUG_ROOT_TYPEDECL", "")
+        if len(dbgTypeDeclName) > 0:
+            os.writeLine(os.get_stderr(),
+                         "[backend] debugRootTypeDecl: name=" + dbgTypeDeclName +
+                         " present=" + (uirCoreFilePhaseDebugRootHasTypeDecl(root, dbgTypeDeclName) ? "1" : "0"))
+            os.c_fflush(os.get_stderr())
+        if profOn:
+            profMono = cheng_monotime_ns() - profMark
+            profMark = cheng_monotime_ns()
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: mono_done")
+            os.c_fflush dbgFile
+        if dbgConstFile:
+            os.writeLine(os.get_stderr(), "[backend] const: mono_done")
+            os.c_fflush os.get_stderr()
+    else:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: mono_skipped")
+            os.c_fflush dbgFile
+    if dbgPipe:
+        let errFlag: bool = hasError(diags)
+        os.writeLine(dbgFile, "[backend] stage1: mono_diag_count=" + intToStr(diags.len) +
+                     " has_error=" + (errFlag ? "1" : "0"))
+        if diags.len > 0:
+            os.writeLine(dbgFile, "[backend] stage1: mono_diag0 sev=" + intToStr(int32(diagSeverityAt(diags, 0))) +
+                         " file='" + diagFilenameAt(diags, 0) +
+                         "' line=" + intToStr(diagLineAt(diags, 0)) +
+                         " col=" + intToStr(diagColAt(diags, 0)) +
+                         " msg='" + diagMessageAt(diags, 0) + "'")
+        if (root != nil) && !errFlag:
+            let rootIdDbg: AstNodeId = root
+            var seenMonoNames: hashmaps.HashMapStrInt = hashmaps.hashMapStrIntInit(512)
+            var dupMonoNames: int32 = 0
+            for di in 0..<astKidCount(rootIdDbg):
+                let dnId: AstNodeId = astKidAt(rootIdDbg, di)
+                if !astNodeIdValid(dnId):
+                    continue
+                let dnKind: NodeKind = astNodeKind(dnId)
+                if dnKind != astNodeKindFnDecl() && dnKind != astNodeKindIteratorDecl():
+                    continue
+                if astKidCount(dnId) <= 0:
+                    continue
+                let dname: str = backendStripSpaces(astPlainName(astKidAt(dnId, 0)))
+                if len(dname) == 0:
+                    continue
+                var foundCnt: bool = false
+                let rawCnt: int32 = uirCoreHashMapStrIntGetCompatLocal(seenMonoNames, dname, foundCnt)
+                let nextCnt: int32 = (foundCnt ? rawCnt : 0) + 1
+                hashmaps.hashMapStrIntPut(seenMonoNames, dname, nextCnt)
+                if foundCnt && rawCnt == 1 && dupMonoNames < 12:
+                    os.writeLine(dbgFile, "[backend] stage1: mono_dup_fn '" + dname + "'")
+                    dupMonoNames = dupMonoNames + 1
+            os.writeLine(dbgFile, "[backend] stage1: mono_dup_fn_count=" + intToStr(dupMonoNames))
+        os.c_fflush dbgFile
+    if hasError diags:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: error_diag_dump_start")
+            os.writeLine(dbgFile, "[backend] stage1: error_diag_count")
+            os.writeLine(dbgFile, intToStr(diags.len))
+            for edi in 0..<diags.len:
+                os.write(dbgFile, "[backend] stage1: error_diag[")
+                os.write(dbgFile, intToStr(edi))
+                os.write(dbgFile, "] sev=")
+                os.write(dbgFile, intToStr(int32(diagSeverityAt(diags, edi))))
+                os.write(dbgFile, " file='")
+                os.write(dbgFile, diagFilenameAt(diags, edi))
+                os.write(dbgFile, "' line=")
+                os.write(dbgFile, intToStr(diagLineAt(diags, edi)))
+                os.write(dbgFile, " col=")
+                os.write(dbgFile, intToStr(diagColAt(diags, edi)))
+                os.write(dbgFile, " msg='")
+                os.write(dbgFile, diagMessageAt(diags, edi))
+                os.writeLine(dbgFile, "'")
+            os.writeLine(dbgFile, "[backend] stage1: error_diag_dump_end")
+            os.c_fflush dbgFile
+        printDiagnostics diags
+        return Err[Node]("uirCore_builder: stage1 errors")
+    return Ok[Node](root)
+
+fn uirCoreFileExecRunCProfilePhase(rootIn: Node,
+                                   diags: var Diagnostic[],
+                                   dbgPipe: bool,
+                                   dbgFile: os.File,
+                                   skipMono: bool): Result[Node] =
+    var root: Node = rootIn
+    let skipCProfileEnv: str = getEnv "STAGE1_SKIP_CPROFILE"
+    let skipCProfile: bool = (len(skipCProfileEnv) == 0) || uirCoreIsOne(skipCProfileEnv)
+    if skipCProfile:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: c_profile_skipped")
+            os.c_fflush dbgFile
+    else:
+        stage1Trace "internal: c-profile lowering"
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: c_profile_start")
+            os.c_fflush dbgFile
+        root = lowerCProfile(root, &diags)
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: c_profile_done")
+            os.c_fflush dbgFile
+        if hasError diags:
+            printDiagnostics diags
+            return Err[Node]("uirCore_builder: c-profile lowering failed")
+    let genericMode: str = uirCoreGenericModeNormalized()
+    let genericBudget: int32 = uirCoreGenericSpecBudget()
+    let forceMonoDict: bool = envIsTrue "STAGE1_FORCE_MONO_DICT"
+    var monoAfterCProfile: bool = false
+    if genericMode == "dict" || genericMode == "dictionary":
+        monoAfterCProfile = forceMonoDict
+    else:
+        monoAfterCProfile = genericBudget > 0
+    if !skipMono && !skipCProfile && monoAfterCProfile:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: mono_after_cprofile_start")
+            os.c_fflush dbgFile
+        let monoRoot1Id: AstNodeId = monomorphizeId(root, &diags)
+        root = monoRoot1Id
+        let dbgTypeDeclName2: str = os.getEnvDefault("BACKEND_DEBUG_ROOT_TYPEDECL", "")
+        if len(dbgTypeDeclName2) > 0:
+            os.writeLine(os.get_stderr(),
+                         "[backend] debugRootTypeDecl: after_cprofile name=" + dbgTypeDeclName2 +
+                         " present=" + (uirCoreFilePhaseDebugRootHasTypeDecl(root, dbgTypeDeclName2) ? "1" : "0"))
+            os.c_fflush(os.get_stderr())
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: mono_after_cprofile_done")
+            os.c_fflush dbgFile
+        if hasError diags:
+            printDiagnostics diags
+            return Err[Node]("uirCore_builder: stage1 errors")
+    elif dbgPipe && !skipMono:
+        os.writeLine(dbgFile, "[backend] stage1: mono_after_cprofile_skipped")
+        os.c_fflush dbgFile
+    return Ok[Node](root)
+
+fn uirCoreFileExecRunOwnershipPhase(root: Node,
+                                    dbgPipe: bool,
+                                    dbgConstFile: bool,
+                                    dbgFile: os.File,
+                                    profOn: bool,
+                                    profMark: var int64,
+                                    profOwn: var int64,
+                                    borrowIrMode: str): Result[Node] =
+    let arcOn: bool = arcEnabled()
+    let skipOwnership: bool = false
+    let ownershipEngine: str = uirCoreFilePhaseOwnershipEngineNormalized()
+    let borrowStageLabel: str = uirCoreFilePhaseBorrowStageLabel(borrowIrMode)
+    if borrowIrMode == "mir":
+        stage1Trace "internal: mir_borrow"
+    else:
+        stage1Trace "internal: ownership"
+    if skipOwnership:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: " + borrowStageLabel + "_skipped")
+            os.c_fflush dbgFile
+        if borrowIrMode == "mir":
+            stage1Trace "internal: mir_borrow skipped"
+        else:
+            stage1Trace "internal: ownership skipped"
+        setOwnershipEnabled false
+    else:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: " + borrowStageLabel + "_start")
+            os.writeLine(dbgFile, "[backend] stage1: " + borrowStageLabel + "_engine=" + ownershipEngine)
+            os.c_fflush dbgFile
+        if ownershipEngine == "legacy":
+            setOwnershipEnabled arcOn
+            ownershipAnalyzeId(root)
+            setOwnershipEnabled false
+            if profOn:
+                profOwn = cheng_monotime_ns() - profMark
+                profMark = cheng_monotime_ns()
+        else:
+            setOwnershipEnabled false
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: " + borrowStageLabel + "_done")
+            os.c_fflush dbgFile
+        if dbgConstFile:
+            os.writeLine(os.get_stderr(), "[backend] const: borrow_done")
+            os.c_fflush os.get_stderr()
+    return Ok[Node](root)
+
+fn uirCoreFileExecAdvanceAstPhases(root0Id: AstNodeId,
+                                   diags: var Diagnostic[],
+                                   dbgPipe: bool,
+                                   dbgConstFile: bool,
+                                   dbgFile: os.File,
+                                   profOn: bool,
+                                   profMark: var int64,
+                                   profSem: var int64,
+                                   profMono: var int64,
+                                   profOwn: var int64,
+                                   mm0: str,
+                                   strictOn0: bool,
+                                   ownDiags: bool,
+                                   borrowIrMode: str): Result[Node] =
+    let skipMono: bool = uirCoreShouldSkipMonoPass()
+    let mmIsOrc: bool = uirCoreIsOrcMode(mm0)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: pre_skip_flags_after_skip_mono value=" + (skipMono ? "1" : "0"))
+        os.writeLine(dbgFile, "[backend] stage1: pre_skip_flags_after_mm_is_orc value=" + (mmIsOrc ? "1" : "0"))
+        os.c_fflush dbgFile
+    uirCoreFileExecRunSemanticsPhase(root0Id, diags, dbgPipe, dbgConstFile, dbgFile,
+                                     profOn, profMark, profSem, mmIsOrc, strictOn0, ownDiags)
+    let monoRes: Result[Node] =
+        uirCoreFileExecRunMonomorphizePhase(root0Id, diags, dbgPipe, dbgConstFile, dbgFile,
+                                            profOn, profMark, profMono, skipMono)
+    if !IsOk[Node](monoRes):
+        return ErrInfo[Node](ErrorInfoOf[Node](monoRes))
+    let cProfileRes: Result[Node] =
+        uirCoreFileExecRunCProfilePhase(Value[Node](monoRes), diags, dbgPipe, dbgFile, skipMono)
+    if !IsOk[Node](cProfileRes):
+        return ErrInfo[Node](ErrorInfoOf[Node](cProfileRes))
+    return uirCoreFileExecRunOwnershipPhase(Value[Node](cProfileRes), dbgPipe, dbgConstFile, dbgFile,
+                                            profOn, profMark, profOwn, borrowIrMode)
+
+fn uirCoreFileExecBuildModulePhase(root: Node,
+                                   dbgPipe: bool,
+                                   dbgConstFile: bool,
+                                   dbgFile: os.File,
+                                   profOn: bool,
+                                   profFnTasks: var int64,
+                                   borrowIrMode: str): Result[UirCoreModule] =
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: uirCore_build_start")
+        os.c_fflush dbgFile
+    if dbgConstFile:
+        os.writeLine(os.get_stderr(), "[backend] const: before_uir_root_build")
+        os.c_fflush os.get_stderr()
+    stage1Trace "internal: fn_tasks"
+    let fnTasksStart: int64 = profOn ? cheng_monotime_ns() : int64(0)
+    let uirCoreRes: Result[UirCoreModule] = uirCoreRootBuildModuleFromRootId(root)
+    if profOn:
+        profFnTasks = cheng_monotime_ns() - fnTasksStart
+    if !IsOk[UirCoreModule](uirCoreRes):
+        let info0: ErrorInfo = ErrorInfoOf[UirCoreModule](uirCoreRes)
+        return ErrInfo[UirCoreModule](info0)
+    let mod: UirCoreModule = Value[UirCoreModule](uirCoreRes)
+    if dbgConstFile:
+        os.writeLine(os.get_stderr(), "[backend] const: after_uir_root_build")
+        os.c_fflush os.get_stderr()
+    if dbgPipe:
+        var externCountDbg: int32 = 0
+        var zeroBlockNonExternCountDbg: int32 = 0
+        for fi in 0..<uirCoreModuleFuncsLen(mod):
+            let fDbg: UirCoreFunc = uirCoreModuleFuncAt(mod, fi)
+            if (fDbg != nil) && uirCoreFuncIsExtern(fDbg):
+                externCountDbg = externCountDbg + 1
+            if (fDbg != nil) && !uirCoreFuncIsExtern(fDbg) && uirCoreFuncBlocksLen(fDbg) == 0:
+                zeroBlockNonExternCountDbg = zeroBlockNonExternCountDbg + 1
+        os.writeLine(dbgFile, "[backend] stage1: uir_module_counts funcs=" + intToStr(uirCoreModuleFuncsLen(mod)) +
+                     " extern_funcs=" + intToStr(externCountDbg) +
+                     " zero_block_nonextern_funcs=" + intToStr(zeroBlockNonExternCountDbg) +
+                     " globals=" + intToStr(uirCoreModuleGlobalsLen(mod)) +
+                     " cstrs=" + intToStr(uirCoreModuleCStringsLen(mod)))
+        let dbgExternList: bool = envIsTrue "BACKEND_DEBUG_MODULE_EXTERNS"
+        if dbgExternList:
+            var shownExtern: int32 = 0
+            var shownZeroBlock: int32 = 0
+            for fi2 in 0..<uirCoreModuleFuncsLen(mod):
+                let fDbg2: UirCoreFunc = uirCoreModuleFuncAt(mod, fi2)
+                if (fDbg2 == nil):
+                    continue
+                if uirCoreFuncIsExtern(fDbg2):
+                    if shownExtern < 160:
+                        os.writeLine(dbgFile, "[backend] stage1: extern_fn[" + intToStr(shownExtern) + "] name=" +
+                                     uirCoreFuncNameOf(fDbg2) + " link=" + uirCoreFuncLinkNameOf(fDbg2) +
+                                     " file=" + uirCoreFuncOriginFileOf(fDbg2))
+                    shownExtern = shownExtern + 1
+                elif uirCoreFuncBlocksLen(fDbg2) == 0:
+                    if shownZeroBlock < 80:
+                        os.writeLine(dbgFile, "[backend] stage1: zero_block_fn[" + intToStr(shownZeroBlock) + "] name=" +
+                                     uirCoreFuncNameOf(fDbg2) + " link=" + uirCoreFuncLinkNameOf(fDbg2) +
+                                     " file=" + uirCoreFuncOriginFileOf(fDbg2))
+                    shownZeroBlock = shownZeroBlock + 1
+            os.writeLine(dbgFile, "[backend] stage1: extern_fn_total=" + intToStr(shownExtern))
+            os.writeLine(dbgFile, "[backend] stage1: zero_block_fn_total=" + intToStr(shownZeroBlock))
+        os.c_fflush dbgFile
+    uirCoreApplyOwnershipPhaseContract(mod, false, borrowIrMode)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: phase_contract_done")
+        os.writeLine(dbgFile, "[backend] stage1: tail_enter_pre_nil")
+        os.c_fflush dbgFile
+    if (mod == nil):
+        return Err[UirCoreModule]("uir core module ok(nil) is forbidden")
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: tail_after_nil_check")
+        os.writeLine(dbgFile, "[backend] stage1: tail_before_ok_ctor")
+        os.c_fflush dbgFile
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: tail_after_ok_ctor")
+        os.c_fflush dbgFile
+    return Ok[UirCoreModule](mod)

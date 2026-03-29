@@ -12,7 +12,6 @@ Env:
   SELFHOST_STRICT_PROBE_SESSION=<name>             default: prod.strict.noreuse
   SELFHOST_STRICT_PROBE_TIMEOUT=<seconds>          default: 60
   SELFHOST_STRICT_PROBE_REQUIRE=<0|1>              default: 0 (soft probe)
-  SELFHOST_STRICT_PROBE_STAGE0=<path>              optional stage0 override
   SELFHOST_STRICT_PROBE_REUSE=<0|1>                default: 0
   SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE=<0|1> default: 0
   SELFHOST_STRICT_PROBE_SKIP_SEM=<0|1>             default: 1
@@ -122,7 +121,7 @@ session="${SELFHOST_STRICT_PROBE_SESSION:-prod.strict.noreuse}"
 session_safe="$(printf '%s' "$session" | tr -c 'A-Za-z0-9._-' '_')"
 timeout="${SELFHOST_STRICT_PROBE_TIMEOUT:-60}"
 require_probe="${SELFHOST_STRICT_PROBE_REQUIRE:-0}"
-stage0="${SELFHOST_STRICT_PROBE_STAGE0:-}"
+stage0="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)"
 reuse="${SELFHOST_STRICT_PROBE_REUSE:-0}"
 strict_allow_fast_reuse="${SELFHOST_STRICT_PROBE_STRICT_ALLOW_FAST_REUSE:-0}"
 skip_sem="${SELFHOST_STRICT_PROBE_SKIP_SEM:-0}"
@@ -160,7 +159,15 @@ echo "== backend.selfhost_strict_noreuse_probe =="
 echo "[selfhost_strict_probe] session=$session timeout=${timeout}s mode=strict reuse=$reuse"
 echo "[selfhost_strict_probe] profile frontend=stage1 validate=$probe_validate skip_smoke=$probe_skip_smoke require_runnable=$probe_require_runnable stage1_probe=$probe_stage1_probe_required"
 
-if is_true "$preflight" && [ "$stage0" != "" ]; then
+if [ "$stage0" = "" ] || [ ! -x "$stage0" ]; then
+  echo "[selfhost_strict_probe] missing stage0: $stage0" 1>&2
+  if is_true "$require_probe"; then
+    exit 1
+  fi
+  exit 0
+fi
+
+if is_true "$preflight"; then
   mkdir -p chengcache artifacts/backend_selfhost_self_obj
   preflight_obj="chengcache/.selfhost_strict_probe_preflight_${session_safe}.bin"
   preflight_log="artifacts/backend_selfhost_self_obj/selfhost_strict_preflight_${session_safe}.log"
@@ -200,62 +207,32 @@ if [ "$probe_driver_input" != "" ]; then
   export SELF_OBJ_BOOTSTRAP_DRIVER_INPUT="$probe_driver_input"
 fi
 
-if [ "$stage0" != "" ]; then
-  set +e
-  env \
-    SELF_OBJ_BOOTSTRAP_MODE=strict \
-    SELF_OBJ_BOOTSTRAP_TIMEOUT="$timeout" \
-    SELF_OBJ_BOOTSTRAP_SESSION="$session" \
-    SELF_OBJ_BOOTSTRAP_REUSE="$reuse" \
-    SELF_OBJ_BOOTSTRAP_STRICT_ALLOW_FAST_REUSE="$strict_allow_fast_reuse" \
-    STAGE1_SEM_FIXED_0="$skip_sem" \
-    STAGE1_OWNERSHIP_FIXED_0="$skip_own" \
-    STAGE1_SKIP_CPROFILE="$skip_cprofile" \
-    GENERIC_MODE="$generic_mode" \
-    GENERIC_SPEC_BUDGET="$generic_budget" \
-    SELF_OBJ_BOOTSTRAP_VALIDATE="$probe_validate" \
-    SELF_OBJ_BOOTSTRAP_SKIP_SMOKE="$probe_skip_smoke" \
-    SELF_OBJ_BOOTSTRAP_REQUIRE_RUNNABLE="$probe_require_runnable" \
-    SELF_OBJ_BOOTSTRAP_STAGE1_PROBE_REQUIRED="$probe_stage1_probe_required" \
-    SELF_OBJ_BOOTSTRAP_OUT_DIR="$probe_out_dir" \
-    SELF_OBJ_BOOTSTRAP_MULTI="$probe_multi" \
-    SELF_OBJ_BOOTSTRAP_MULTI_FORCE="$probe_multi_force" \
-    SELF_OBJ_BOOTSTRAP_JOBS="$probe_jobs" \
-    SELF_OBJ_BOOTSTRAP_INCREMENTAL="$probe_incremental" \
-    SELF_OBJ_BOOTSTRAP_ALLOW_RETRY="$probe_allow_retry" \
-    SELF_OBJ_BOOTSTRAP_STAGE0_COMPAT=0 \
-    SELF_OBJ_BOOTSTRAP_STAGE0="$stage0" \
-    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_selfhost_bootstrap_self_obj
-  rc="$?"
-  set -e
-else
-  set +e
-  env \
-    SELF_OBJ_BOOTSTRAP_MODE=strict \
-    SELF_OBJ_BOOTSTRAP_TIMEOUT="$timeout" \
-    SELF_OBJ_BOOTSTRAP_SESSION="$session" \
-    SELF_OBJ_BOOTSTRAP_REUSE="$reuse" \
-    SELF_OBJ_BOOTSTRAP_STRICT_ALLOW_FAST_REUSE="$strict_allow_fast_reuse" \
-    STAGE1_SEM_FIXED_0="$skip_sem" \
-    STAGE1_OWNERSHIP_FIXED_0="$skip_own" \
-    STAGE1_SKIP_CPROFILE="$skip_cprofile" \
-    GENERIC_MODE="$generic_mode" \
-    GENERIC_SPEC_BUDGET="$generic_budget" \
-    SELF_OBJ_BOOTSTRAP_VALIDATE="$probe_validate" \
-    SELF_OBJ_BOOTSTRAP_SKIP_SMOKE="$probe_skip_smoke" \
-    SELF_OBJ_BOOTSTRAP_REQUIRE_RUNNABLE="$probe_require_runnable" \
-    SELF_OBJ_BOOTSTRAP_STAGE1_PROBE_REQUIRED="$probe_stage1_probe_required" \
-    SELF_OBJ_BOOTSTRAP_OUT_DIR="$probe_out_dir" \
-    SELF_OBJ_BOOTSTRAP_MULTI="$probe_multi" \
-    SELF_OBJ_BOOTSTRAP_MULTI_FORCE="$probe_multi_force" \
-    SELF_OBJ_BOOTSTRAP_JOBS="$probe_jobs" \
-    SELF_OBJ_BOOTSTRAP_INCREMENTAL="$probe_incremental" \
-    SELF_OBJ_BOOTSTRAP_ALLOW_RETRY="$probe_allow_retry" \
-    SELF_OBJ_BOOTSTRAP_STAGE0_COMPAT=0 \
-    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_selfhost_bootstrap_self_obj
-  rc="$?"
-  set -e
-fi
+set +e
+env \
+  SELF_OBJ_BOOTSTRAP_MODE=strict \
+  SELF_OBJ_BOOTSTRAP_TIMEOUT="$timeout" \
+  SELF_OBJ_BOOTSTRAP_SESSION="$session" \
+  SELF_OBJ_BOOTSTRAP_REUSE="$reuse" \
+  SELF_OBJ_BOOTSTRAP_STRICT_ALLOW_FAST_REUSE="$strict_allow_fast_reuse" \
+  STAGE1_SEM_FIXED_0="$skip_sem" \
+  STAGE1_OWNERSHIP_FIXED_0="$skip_own" \
+  STAGE1_SKIP_CPROFILE="$skip_cprofile" \
+  GENERIC_MODE="$generic_mode" \
+  GENERIC_SPEC_BUDGET="$generic_budget" \
+  SELF_OBJ_BOOTSTRAP_VALIDATE="$probe_validate" \
+  SELF_OBJ_BOOTSTRAP_SKIP_SMOKE="$probe_skip_smoke" \
+  SELF_OBJ_BOOTSTRAP_REQUIRE_RUNNABLE="$probe_require_runnable" \
+  SELF_OBJ_BOOTSTRAP_STAGE1_PROBE_REQUIRED="$probe_stage1_probe_required" \
+  SELF_OBJ_BOOTSTRAP_OUT_DIR="$probe_out_dir" \
+  SELF_OBJ_BOOTSTRAP_MULTI="$probe_multi" \
+  SELF_OBJ_BOOTSTRAP_MULTI_FORCE="$probe_multi_force" \
+  SELF_OBJ_BOOTSTRAP_JOBS="$probe_jobs" \
+  SELF_OBJ_BOOTSTRAP_INCREMENTAL="$probe_incremental" \
+  SELF_OBJ_BOOTSTRAP_ALLOW_RETRY="$probe_allow_retry" \
+  SELF_OBJ_BOOTSTRAP_STAGE0_COMPAT=0 \
+  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} verify_backend_selfhost_bootstrap_self_obj
+rc="$?"
+set -e
 
 probe_timing_file="$probe_out_dir/selfhost_timing_${session_safe}.tsv"
 if [ -f "$probe_timing_file" ] && [ "$probe_timing_file" != "$timing_file" ]; then

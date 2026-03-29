@@ -1,0 +1,1227 @@
+import std/os
+import std/strutils as strutils
+import std/strings as strings
+import std/system
+import compiler/frontend/compiler_core_surface_ir_v2 as ccore
+import compiler/frontend/unimaker_surface_ir_v2 as usurf
+import compiler/frontend/network_distribution_surface_ir_v2 as nsurf
+import compiler/driver/identity_v2 as ident
+
+type
+    ParsedV2Source =
+        version: str
+        sourcePath: str
+        compilerCoreProgram: ccore.CompilerCoreProgram
+        unimakerProgram: usurf.UnimakerSurfaceProgram
+        networkProgram: nsurf.NetworkDistributionProgram
+        surfaceKinds: str[]
+
+fn sliceRange(text: str, start: int32, stopExclusive: int32): str =
+    if stopExclusive <= start:
+        return ""
+    return strings.sliceBytes(text, start, stopExclusive - start)
+
+fn findChar(text: str, target: char): int32 =
+    for i in 0..<len(text):
+        if text[i] == target:
+            return i
+    return -1
+
+fn findLastChar(text: str, target: char): int32 =
+    var i: int32 = len(text) - 1
+    while i >= 0:
+        if text[i] == target:
+            return i
+        i = i - 1
+    return -1
+
+fn findText(text: str, sub: str): int32 =
+    let n = len(text)
+    let m = len(sub)
+    if m == 0:
+        return 0
+    if m > n:
+        return -1
+    var i: int32 = 0
+    while i + m <= n:
+        var matched: bool = true
+        var j: int32 = 0
+        while j < m:
+            if text[i + j] != sub[j]:
+                matched = false
+                break
+            j = j + 1
+        if matched:
+            return i
+        i = i + 1
+    return -1
+
+fn isNameChar(ch: char): bool =
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'
+
+fn parseNameAfterPrefix(line: str, prefix: str): str =
+    var start: int32 = len(prefix)
+    while start < len(line) && (line[start] == ' ' || line[start] == '\t'):
+        start = start + 1
+    var stop: int32 = start
+    while stop < len(line) && isNameChar(line[stop]):
+        stop = stop + 1
+    return sliceRange(line, start, stop)
+
+fn parseIntStrict(raw: str): int32 =
+    let text = strutils.strip(raw)
+    if len(text) == 0:
+        panic("v2 source parser: expected integer")
+    var out: int32 = 0
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            panic("v2 source parser: invalid integer " + text)
+        out = out * 10 + int32(ch) - int32('0')
+    return out
+
+fn extractNamedValue(body: str, key: str): str =
+    let pattern = key + "="
+    let idx = findText(body, pattern)
+    if idx < 0:
+        return ""
+    var start: int32 = idx + len(pattern)
+    while start < len(body) && (body[start] == ' ' || body[start] == '\t'):
+        start = start + 1
+    var stop: int32 = start
+    var depth: int32 = 0
+    while stop < len(body):
+        let ch = body[stop]
+        if ch == '(':
+            depth = depth + 1
+        elif ch == ')':
+            if depth == 0:
+                break
+            depth = depth - 1
+        elif ch == ',' && depth == 0:
+            break
+        stop = stop + 1
+    return strutils.strip(sliceRange(body, start, stop))
+
+fn parseTopologyDispersal(raw: str, outDispersal: var str, outK: var int32, outN: var int32) =
+    let text = strutils.strip(raw)
+    outDispersal = ""
+    outK = 0
+    outN = 0
+    if text == "none":
+        outDispersal = "none"
+        return
+    if !(strutils.startsWith(text, "ida(") && len(text) > 5 && text[len(text) - 1] == ')'):
+        panic("v2 source parser: unsupported topology dispersal " + text)
+    let inner = sliceRange(text, 4, len(text) - 1)
+    outDispersal = "ida"
+    outK = parseIntStrict(extractNamedValue(inner, "k"))
+    outN = parseIntStrict(extractNamedValue(inner, "n"))
+
+fn parseCallBody(line: str, prefix: str): str =
+    if !strutils.startsWith(line, prefix + "("):
+        return ""
+    if len(line) < len(prefix) + 2 || line[len(line) - 1] != ')':
+        panic("v2 source parser: malformed call " + line)
+    return sliceRange(line, len(prefix) + 1, len(line) - 1)
+
+fn parseUnimakerLine(program: var usurf.UnimakerSurfaceProgram, line: str): bool =
+    if strutils.startsWith(line, "asset "):
+        let name = parseNameAfterPrefix(line, "asset ")
+        let colonIdx = findChar(line, ':')
+        let contractText = if colonIdx >= 0: strutils.strip(sliceRange(line, colonIdx + 1, len(line))) else: ""
+        add(program.decls, usurf.assetDecl(name, contractText))
+        return true
+    if strutils.startsWith(line, "actor "):
+        let name = parseNameAfterPrefix(line, "actor ")
+        add(program.decls, usurf.actorDecl(name, line))
+        return true
+    if strutils.startsWith(line, "@ganzhi state "):
+        let name = parseNameAfterPrefix(line, "@ganzhi state ")
+        add(program.decls, usurf.ganzhiStateDecl(name, sliceRange(line, len("@ganzhi "), len(line))))
+        return true
+    if strutils.startsWith(line, "@nfc_callback fn "):
+        let name = parseNameAfterPrefix(line, "@nfc_callback fn ")
+        add(program.decls, usurf.callbackDecl(name, sliceRange(line, len("@nfc_callback "), len(line))))
+        return true
+    if strutils.startsWith(line, "@evolve("):
+        let closeIdx = findChar(line, ')')
+        let fnIdx = findText(line, "fn ")
+        if closeIdx < 0 || fnIdx < 0:
+            panic("v2 source parser: malformed evolve declaration")
+        let targetText = strutils.strip(sliceRange(line, len("@evolve("), closeIdx))
+        let name = parseNameAfterPrefix(sliceRange(line, fnIdx, len(line)), "fn ")
+        add(program.decls, usurf.evolveDecl(name, sliceRange(line, fnIdx, len(line)), targetText))
+        return true
+    return false
+
+fn parseTopologyLine(program: var nsurf.NetworkDistributionProgram, line: str): bool =
+    if !strutils.startsWith(line, "topology "):
+        return false
+    let name = parseNameAfterPrefix(line, "topology ")
+    let bodyIdx = findText(line, "lsmr_tree(")
+    if bodyIdx < 0 || line[len(line) - 1] != ')':
+        panic("v2 source parser: malformed topology declaration")
+    let body = sliceRange(line, bodyIdx + len("lsmr_tree("), len(line) - 1)
+    let domain = extractNamedValue(body, "domain")
+    let fanout = extractNamedValue(body, "fanout")
+    let repair = extractNamedValue(body, "repair")
+    let dispersalRaw = extractNamedValue(body, "dispersal")
+    let priority = extractNamedValue(body, "priority")
+    let addressing = extractNamedValue(body, "addressing")
+    let depthRaw = extractNamedValue(body, "depth")
+    if len(addressing) == 0:
+        panic("v2 source parser: topology addressing is required")
+    if len(depthRaw) == 0:
+        panic("v2 source parser: topology depth is required")
+    var dispersal: str = ""
+    let depth = parseIntStrict(depthRaw)
+    var idaK: int32 = 0
+    var idaN: int32 = 0
+    parseTopologyDispersal(dispersalRaw, dispersal, idaK, idaN)
+    add(program.topologies, nsurf.topologyDecl(name, domain, fanout, repair, dispersal, priority, addressing, depth, idaK, idaN))
+    return true
+
+fn parseNetworkOpLine(program: var nsurf.NetworkDistributionProgram, line: str): bool =
+    var body = parseCallBody(line, "publish_source_manifest")
+    if len(body) > 0:
+        add(program.ops, nsurf.publishSourceManifest(extractNamedValue(body, "topology"), extractNamedValue(body, "package")))
+        return true
+    body = parseCallBody(line, "publish_rule_pack")
+    if len(body) > 0:
+        add(program.ops, nsurf.publishRulePack(extractNamedValue(body, "topology"), extractNamedValue(body, "pack")))
+        return true
+    body = parseCallBody(line, "publish_compiler_rule_pack")
+    if len(body) > 0:
+        add(program.ops, nsurf.publishCompilerRulePack(extractNamedValue(body, "topology"), extractNamedValue(body, "pack")))
+        return true
+    body = parseCallBody(line, "route_lsmr_tree")
+    if len(body) > 0:
+        add(program.ops, nsurf.routeLsmrTree(extractNamedValue(body, "topology")))
+        return true
+    body = parseCallBody(line, "disperse_ida_fragments")
+    if len(body) > 0:
+        add(program.ops, nsurf.disperseIdaFragments(extractNamedValue(body, "topology")))
+        return true
+    body = parseCallBody(line, "exchange_anti_entropy_signature")
+    if len(body) > 0:
+        add(program.ops, nsurf.exchangeAntiEntropySignature(extractNamedValue(body, "topology"), extractNamedValue(body, "signature")))
+        return true
+    body = parseCallBody(line, "repair_from_signature_gap")
+    if len(body) > 0:
+        add(program.ops, nsurf.repairFromSignatureGap(extractNamedValue(body, "topology"), extractNamedValue(body, "signature")))
+        return true
+    return false
+
+fn leadingIndentWidth(line: str): int32 =
+    var out: int32 = 0
+    while out < len(line) && (line[out] == ' ' || line[out] == '\t'):
+        out = out + 1
+    return out
+
+fn isBlankOrCommentLine(rawLine: str): bool =
+    let line = strutils.strip(rawLine)
+    return len(line) == 0 || strutils.startsWith(line, "//") || strutils.startsWith(line, "#")
+
+fn parseCompilerImportLine(line: str): ccore.CompilerCoreImportDecl =
+    let raw = strutils.strip(sliceRange(line, len("import "), len(line)))
+    let aliasMarker = " as "
+    let aliasIdx = findText(raw, aliasMarker)
+    if aliasIdx < 0:
+        return ccore.compilerCoreImportDecl(raw, "")
+    let modulePath = strutils.strip(sliceRange(raw, 0, aliasIdx))
+    let alias = strutils.strip(sliceRange(raw, aliasIdx + len(aliasMarker), len(raw)))
+    return ccore.compilerCoreImportDecl(modulePath, alias)
+
+fn parseCompilerRoutineName(line: str, prefix: str): str =
+    let tail = strutils.strip(sliceRange(line, len(prefix), len(line)))
+    if len(tail) == 0:
+        panic("v2 source parser: missing compiler routine name")
+    if tail[0] == '`':
+        var stop: int32 = 1
+        while stop < len(tail) && tail[stop] != '`':
+            stop = stop + 1
+        if stop >= len(tail):
+            panic("v2 source parser: unterminated backtick routine name")
+        return sliceRange(tail, 0, stop + 1)
+    var stop: int32 = 0
+    while stop < len(tail) && isNameChar(tail[stop]):
+        stop = stop + 1
+    return sliceRange(tail, 0, stop)
+
+fn parseCompilerDeclLabel(line: str, prefix: str, defaultLabel: str): str =
+    let tail = strutils.strip(sliceRange(line, len(prefix), len(line)))
+    if len(tail) == 0:
+        return defaultLabel
+    var stop: int32 = 0
+    while stop < len(tail) && isNameChar(tail[stop]):
+        stop = stop + 1
+    if stop <= 0:
+        return defaultLabel
+    return sliceRange(tail, 0, stop)
+
+fn compilerCoreDefaultOwnerModulePath(sourcePath: str): str =
+    var start: int32 = findText(sourcePath, "v2/src/")
+    if start >= 0:
+        start = start + len("v2/src/")
+    else:
+        start = findText(sourcePath, "src/")
+        if start >= 0:
+            start = start + len("src/")
+        else:
+            start = 0
+    var stop: int32 = len(sourcePath)
+    if stop - start >= len(".cheng") &&
+       sliceRange(sourcePath, stop - len(".cheng"), stop) == ".cheng":
+        stop = stop - len(".cheng")
+    return sliceRange(sourcePath, start, stop)
+
+fn inlineRoutineBodyLine(line: str): str =
+    let eqIdx = findLastChar(line, '=')
+    if eqIdx < 0:
+        return ""
+    return strutils.strip(sliceRange(line, eqIdx + 1, len(line)))
+
+fn lineEndsWithAssign(line: str): bool =
+    let trimmed = strutils.strip(line)
+    return len(trimmed) > 0 && trimmed[len(trimmed) - 1] == '='
+
+fn joinLineParts(lines: str[]): str =
+    var out: str = ""
+    for i in 0..<lines.len:
+        if i > 0:
+            out = out + "\n"
+        out = out + lines[i]
+    return out
+
+fn joinPrefixedLineParts(prefixLines: str[], lines: str[]): str =
+    var out: str[]
+    out = []
+    for i in 0..<prefixLines.len:
+        add(out, prefixLines[i])
+    for i in 0..<lines.len:
+        add(out, lines[i])
+    return joinLineParts(out)
+
+fn annotationLinesContainImportc(lines: str[]): bool =
+    for i in 0..<lines.len:
+        if strutils.startsWith(lines[i], "@importc"):
+            return true
+    return false
+
+fn collectOutlineBlockLines(rawLines: str[], startIdx: int32, outBodyLines: var str[]): int32 =
+    outBodyLines = []
+    var idx: int32 = startIdx
+    var baseIndent: int32 = -1
+    while idx < rawLines.len:
+        let rawLine = rawLines[idx]
+        if isBlankOrCommentLine(rawLine):
+            if baseIndent >= 0:
+                add(outBodyLines, strutils.strip(rawLine))
+            idx = idx + 1
+            continue
+        let indent = leadingIndentWidth(rawLine)
+        if baseIndent < 0:
+            if indent <= 0:
+                break
+            baseIndent = indent
+        if indent < baseIndent:
+            break
+        add(outBodyLines, sliceRange(rawLine, baseIndent, len(rawLine)))
+        idx = idx + 1
+    return idx
+
+fn collectRoutineSignatureAndBody(rawLines: str[],
+                                  startIdx: int32,
+                                  prefixLines: str[],
+                                  allowHeaderOnly: bool,
+                                  outSignatureText: var str,
+                                  outBodyLines: var str[]): int32 =
+    var signatureLines: str[]
+    signatureLines = []
+    let firstLine = strutils.strip(rawLines[startIdx])
+    add(signatureLines, firstLine)
+    let inlineBody = inlineRoutineBodyLine(firstLine)
+    if len(inlineBody) > 0:
+        outSignatureText = joinPrefixedLineParts(prefixLines, signatureLines)
+        outBodyLines = []
+        add(outBodyLines, inlineBody)
+        return startIdx + 1
+    if lineEndsWithAssign(firstLine):
+        outSignatureText = joinPrefixedLineParts(prefixLines, signatureLines)
+        return collectOutlineBlockLines(rawLines, startIdx + 1, outBodyLines)
+    var idx: int32 = startIdx + 1
+    while idx < rawLines.len:
+        let rawLine = rawLines[idx]
+        if isBlankOrCommentLine(rawLine):
+            if allowHeaderOnly:
+                outSignatureText = joinPrefixedLineParts(prefixLines, signatureLines)
+                outBodyLines = []
+                return idx
+            panic("v2 source parser: blank or comment inside compiler routine header")
+        if leadingIndentWidth(rawLine) <= 0:
+            if allowHeaderOnly:
+                outSignatureText = joinPrefixedLineParts(prefixLines, signatureLines)
+                outBodyLines = []
+                return idx
+            panic("v2 source parser: unterminated compiler routine header")
+        let line = strutils.strip(rawLine)
+        add(signatureLines, line)
+        idx = idx + 1
+        if lineEndsWithAssign(line):
+            outSignatureText = joinPrefixedLineParts(prefixLines, signatureLines)
+            return collectOutlineBlockLines(rawLines, idx, outBodyLines)
+    if allowHeaderOnly:
+        outSignatureText = joinPrefixedLineParts(prefixLines, signatureLines)
+        outBodyLines = []
+        return idx
+    panic("v2 source parser: unterminated compiler routine header")
+
+fn startsWithAt(text: str, start: int32, pattern: str): bool =
+    if start < 0 || start + len(pattern) > len(text):
+        return false
+    return sliceRange(text, start, start + len(pattern)) == pattern
+
+fn skipSpaces(text: str, idx: var int32) =
+    while idx < len(text) && (text[idx] == ' ' || text[idx] == '\t'):
+        idx = idx + 1
+
+fn isDigitChar(ch: char): bool =
+    return ch >= '0' && ch <= '9'
+
+fn parseNameToken(text: str, idx: var int32): str =
+    skipSpaces(text, idx)
+    let start = idx
+    if idx < len(text) && (isNameChar(text[idx]) || text[idx] == '_'):
+        idx = idx + 1
+        while idx < len(text) && isNameChar(text[idx]):
+            idx = idx + 1
+        return sliceRange(text, start, idx)
+    return ""
+
+fn findMatchingDelimiter(text: str,
+                         openIdx: int32,
+                         openCh: char,
+                         closeCh: char): int32 =
+    var depth: int32 = 0
+    var i: int32 = openIdx
+    var inString: bool = false
+    while i < len(text):
+        let ch = text[i]
+        if inString:
+            if ch == '\\':
+                i = i + 2
+                continue
+            if ch == '"':
+                inString = false
+            i = i + 1
+            continue
+        if ch == '"':
+            inString = true
+            i = i + 1
+            continue
+        if ch == openCh:
+            depth = depth + 1
+        elif ch == closeCh:
+            depth = depth - 1
+            if depth == 0:
+                return i
+        i = i + 1
+    return -1
+
+fn hasSingleOuterParens(text: str): bool =
+    let trimmed = strutils.strip(text)
+    if len(trimmed) < 2 || trimmed[0] != '(' || trimmed[len(trimmed) - 1] != ')':
+        return false
+    return findMatchingDelimiter(trimmed, 0, '(', ')') == len(trimmed) - 1
+
+fn splitTopLevelSegments(text: str, sep: char): str[] =
+    var out: str[]
+    out = []
+    var start: int32 = 0
+    var depthParen: int32 = 0
+    var depthBracket: int32 = 0
+    var depthBrace: int32 = 0
+    var inString: bool = false
+    var i: int32 = 0
+    while i < len(text):
+        let ch = text[i]
+        if inString:
+            if ch == '\\':
+                i = i + 2
+                continue
+            if ch == '"':
+                inString = false
+            i = i + 1
+            continue
+        if ch == '"':
+            inString = true
+        elif ch == '(':
+            depthParen = depthParen + 1
+        elif ch == ')':
+            depthParen = depthParen - 1
+        elif ch == '[':
+            depthBracket = depthBracket + 1
+        elif ch == ']':
+            depthBracket = depthBracket - 1
+        elif ch == '{':
+            depthBrace = depthBrace + 1
+        elif ch == '}':
+            depthBrace = depthBrace - 1
+        elif ch == sep && depthParen == 0 && depthBracket == 0 && depthBrace == 0:
+            add(out, strutils.strip(sliceRange(text, start, i)))
+            start = i + 1
+        i = i + 1
+    add(out, strutils.strip(sliceRange(text, start, len(text))))
+    return out
+
+fn findLastTopLevelBinary(text: str, pattern: str): int32 =
+    var out: int32 = -1
+    var depthParen: int32 = 0
+    var depthBracket: int32 = 0
+    var depthBrace: int32 = 0
+    var inString: bool = false
+    var i: int32 = 0
+    while i + len(pattern) <= len(text):
+        let ch = text[i]
+        if inString:
+            if ch == '\\':
+                i = i + 2
+                continue
+            if ch == '"':
+                inString = false
+            i = i + 1
+            continue
+        if ch == '"':
+            inString = true
+            i = i + 1
+            continue
+        if ch == '(':
+            depthParen = depthParen + 1
+            i = i + 1
+            continue
+        if ch == ')':
+            depthParen = depthParen - 1
+            i = i + 1
+            continue
+        if ch == '[':
+            depthBracket = depthBracket + 1
+            i = i + 1
+            continue
+        if ch == ']':
+            depthBracket = depthBracket - 1
+            i = i + 1
+            continue
+        if ch == '{':
+            depthBrace = depthBrace + 1
+            i = i + 1
+            continue
+        if ch == '}':
+            depthBrace = depthBrace - 1
+            i = i + 1
+            continue
+        if depthParen == 0 && depthBracket == 0 && depthBrace == 0 &&
+           startsWithAt(text, i, pattern):
+            out = i
+            i = i + len(pattern)
+            continue
+        i = i + 1
+    return out
+
+fn findTopLevelToken(text: str, pattern: str, startIdx: int32): int32 =
+    var depthParen: int32 = 0
+    var depthBracket: int32 = 0
+    var depthBrace: int32 = 0
+    var inString: bool = false
+    var i: int32 = startIdx
+    while i + len(pattern) <= len(text):
+        let ch = text[i]
+        if inString:
+            if ch == '\\':
+                i = i + 2
+                continue
+            if ch == '"':
+                inString = false
+            i = i + 1
+            continue
+        if ch == '"':
+            inString = true
+            i = i + 1
+            continue
+        if ch == '(':
+            depthParen = depthParen + 1
+            i = i + 1
+            continue
+        if ch == ')':
+            depthParen = depthParen - 1
+            i = i + 1
+            continue
+        if ch == '[':
+            depthBracket = depthBracket + 1
+            i = i + 1
+            continue
+        if ch == ']':
+            depthBracket = depthBracket - 1
+            i = i + 1
+            continue
+        if ch == '{':
+            depthBrace = depthBrace + 1
+            i = i + 1
+            continue
+        if ch == '}':
+            depthBrace = depthBrace - 1
+            i = i + 1
+            continue
+        if depthParen == 0 && depthBracket == 0 && depthBrace == 0 &&
+           startsWithAt(text, i, pattern):
+            return i
+        i = i + 1
+    return -1
+
+fn findLastTopLevelAssign(text: str): int32 =
+    var out: int32 = -1
+    var depthParen: int32 = 0
+    var depthBracket: int32 = 0
+    var depthBrace: int32 = 0
+    var inString: bool = false
+    var i: int32 = 0
+    while i < len(text):
+        let ch = text[i]
+        if inString:
+            if ch == '\\':
+                i = i + 2
+                continue
+            if ch == '"':
+                inString = false
+            i = i + 1
+            continue
+        if ch == '"':
+            inString = true
+            i = i + 1
+            continue
+        if ch == '(':
+            depthParen = depthParen + 1
+            i = i + 1
+            continue
+        if ch == ')':
+            depthParen = depthParen - 1
+            i = i + 1
+            continue
+        if ch == '[':
+            depthBracket = depthBracket + 1
+            i = i + 1
+            continue
+        if ch == ']':
+            depthBracket = depthBracket - 1
+            i = i + 1
+            continue
+        if ch == '{':
+            depthBrace = depthBrace + 1
+            i = i + 1
+            continue
+        if ch == '}':
+            depthBrace = depthBrace - 1
+            i = i + 1
+            continue
+        if ch == '=' &&
+           depthParen == 0 &&
+           depthBracket == 0 &&
+           depthBrace == 0 &&
+           !(i > 0 && (text[i - 1] == '=' || text[i - 1] == '!' || text[i - 1] == '<' || text[i - 1] == '>')) &&
+           !(i + 1 < len(text) && text[i + 1] == '='):
+            out = i
+        i = i + 1
+    return out
+
+fn parseCompilerIfExpr(program: var ccore.CompilerCoreProgram, text: str): int32 =
+    let trimmed = strutils.strip(text)
+    if !strutils.startsWith(trimmed, "if "):
+        return -1
+    let colonIdx = findTopLevelToken(trimmed, ":", 0)
+    let elseIdx = findTopLevelToken(trimmed, " else:", 0)
+    if colonIdx < 0 || elseIdx < 0 || elseIdx <= colonIdx:
+        panic("v2 source parser: unsupported compiler if-expression " + trimmed)
+    let condText = strutils.strip(sliceRange(trimmed, len("if "), colonIdx))
+    let thenText = strutils.strip(sliceRange(trimmed, colonIdx + 1, elseIdx))
+    let elseText = strutils.strip(sliceRange(trimmed, elseIdx + len(" else:"), len(trimmed)))
+    let condExpr = parseCompilerExprText(program, condText)
+    let thenExpr = parseCompilerExprText(program, thenText)
+    let elseExpr = parseCompilerExprText(program, elseText)
+    return ccore.appendCompilerCoreExpr(program, "if_expr", "", [condExpr, thenExpr, elseExpr])
+
+fn parseCompilerCallishExpr(program: var ccore.CompilerCoreProgram, text: str): int32 =
+    let trimmed = strutils.strip(text)
+    if len(trimmed) == 0:
+        panic("v2 source parser: empty compiler expression")
+    if hasSingleOuterParens(trimmed):
+        return parseCompilerExprText(program, sliceRange(trimmed, 1, len(trimmed) - 1))
+    if trimmed == "true" || trimmed == "false":
+        return ccore.appendCompilerCoreExpr(program, "bool_lit", trimmed, [])
+    if trimmed == "nil":
+        return ccore.appendCompilerCoreExpr(program, "nil_lit", "", [])
+    if trimmed[0] == '"':
+        return ccore.appendCompilerCoreExpr(program, "str_lit", trimmed, [])
+    if trimmed[0] == '[' && trimmed[len(trimmed) - 1] == ']' &&
+       findMatchingDelimiter(trimmed, 0, '[', ']') == len(trimmed) - 1:
+        let inner = strutils.strip(sliceRange(trimmed, 1, len(trimmed) - 1))
+        var childIds: int32[]
+        childIds = []
+        if len(inner) > 0:
+            let parts = splitTopLevelSegments(inner, ',')
+            for i in 0..<parts.len:
+                add(childIds, parseCompilerExprText(program, parts[i]))
+        return ccore.appendCompilerCoreExpr(program, "array_lit", "", childIds)
+    if trimmed[0] == '{' && trimmed[len(trimmed) - 1] == '}' &&
+       findMatchingDelimiter(trimmed, 0, '{', '}') == len(trimmed) - 1:
+        let inner = strutils.strip(sliceRange(trimmed, 1, len(trimmed) - 1))
+        var childIds: int32[]
+        childIds = []
+        if len(inner) > 0:
+            let parts = splitTopLevelSegments(inner, ',')
+            for i in 0..<parts.len:
+                let colonIdx = findTopLevelToken(parts[i], ":", 0)
+                if colonIdx < 0:
+                    panic("v2 source parser: malformed compiler record literal " + trimmed)
+                let valueText = strutils.strip(sliceRange(parts[i], colonIdx + 1, len(parts[i])))
+                add(childIds, parseCompilerExprText(program, valueText))
+        return ccore.appendCompilerCoreExpr(program, "record_lit", inner, childIds)
+    var allDigits: bool = true
+    for i in 0..<len(trimmed):
+        if !isDigitChar(trimmed[i]):
+            allDigits = false
+            break
+    if allDigits:
+        return ccore.appendCompilerCoreExpr(program, "int_lit", trimmed, [])
+    var idx: int32 = 0
+    let baseName = parseNameToken(trimmed, idx)
+    if len(baseName) == 0:
+        panic("v2 source parser: unsupported compiler expression " + trimmed)
+    var exprId = ccore.appendCompilerCoreExpr(program, "name_ref", baseName, [])
+    while true:
+        skipSpaces(trimmed, idx)
+        if idx >= len(trimmed):
+            break
+        if trimmed[idx] == '.':
+            idx = idx + 1
+            let field = parseNameToken(trimmed, idx)
+            if len(field) == 0:
+                panic("v2 source parser: missing field name in expression " + trimmed)
+            exprId = ccore.appendCompilerCoreExpr(program, "field", field, [exprId])
+            continue
+        if trimmed[idx] == '(':
+            let closeIdx = findMatchingDelimiter(trimmed, idx, '(', ')')
+            if closeIdx < 0:
+                panic("v2 source parser: unterminated call expression " + trimmed)
+            let argText = strutils.strip(sliceRange(trimmed, idx + 1, closeIdx))
+            var childIds: int32[]
+            childIds = [exprId]
+            if len(argText) > 0:
+                let argParts = splitTopLevelSegments(argText, ',')
+                for i in 0..<argParts.len:
+                    add(childIds, parseCompilerExprText(program, argParts[i]))
+            exprId = ccore.appendCompilerCoreExpr(program, "call", "", childIds)
+            idx = closeIdx + 1
+            continue
+        if trimmed[idx] == '[':
+            let closeIdx = findMatchingDelimiter(trimmed, idx, '[', ']')
+            if closeIdx < 0:
+                panic("v2 source parser: unterminated index expression " + trimmed)
+            let indexText = strutils.strip(sliceRange(trimmed, idx + 1, closeIdx))
+            let indexExpr = parseCompilerExprText(program, indexText)
+            exprId = ccore.appendCompilerCoreExpr(program, "index", "", [exprId, indexExpr])
+            idx = closeIdx + 1
+            continue
+        panic("v2 source parser: unsupported compiler postfix expression " + trimmed)
+    return exprId
+
+fn parseCompilerExprText(program: var ccore.CompilerCoreProgram, text: str): int32 =
+    let trimmed = strutils.strip(text)
+    if len(trimmed) == 0:
+        panic("v2 source parser: empty compiler expression")
+    if strutils.startsWith(trimmed, "if "):
+        return parseCompilerIfExpr(program, trimmed)
+    if trimmed[0] == '!':
+        let child = parseCompilerExprText(program, sliceRange(trimmed, 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "unary", "!", [child])
+    if trimmed[0] == '-' && len(trimmed) > 1:
+        let child = parseCompilerExprText(program, sliceRange(trimmed, 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "unary", "-", [child])
+    let orIdx = findLastTopLevelBinary(trimmed, "||")
+    if orIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, orIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, orIdx + 2, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "||", [left, right])
+    let andIdx = findLastTopLevelBinary(trimmed, "&&")
+    if andIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, andIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, andIdx + 2, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "&&", [left, right])
+    let eqIdx = findLastTopLevelBinary(trimmed, "==")
+    if eqIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, eqIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, eqIdx + 2, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "==", [left, right])
+    let neIdx = findLastTopLevelBinary(trimmed, "!=")
+    if neIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, neIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, neIdx + 2, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "!=", [left, right])
+    let leIdx = findLastTopLevelBinary(trimmed, "<=")
+    if leIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, leIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, leIdx + 2, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "<=", [left, right])
+    let geIdx = findLastTopLevelBinary(trimmed, ">=")
+    if geIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, geIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, geIdx + 2, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", ">=", [left, right])
+    let ltIdx = findLastTopLevelBinary(trimmed, "<")
+    if ltIdx >= 0 && !startsWithAt(trimmed, ltIdx, "<=") && !startsWithAt(trimmed, ltIdx, "<<") &&
+       !(ltIdx + 1 < len(trimmed) && trimmed[ltIdx + 1] == '.'):
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, ltIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, ltIdx + 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "<", [left, right])
+    let gtIdx = findLastTopLevelBinary(trimmed, ">")
+    if gtIdx >= 0 && !startsWithAt(trimmed, gtIdx, ">=") && !startsWithAt(trimmed, gtIdx, ">>"):
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, gtIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, gtIdx + 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", ">", [left, right])
+    let addIdx = findLastTopLevelBinary(trimmed, "+")
+    if addIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, addIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, addIdx + 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "+", [left, right])
+    let subIdx = findLastTopLevelBinary(trimmed, "-")
+    if subIdx > 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, subIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, subIdx + 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "-", [left, right])
+    let mulIdx = findLastTopLevelBinary(trimmed, "*")
+    if mulIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, mulIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, mulIdx + 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "*", [left, right])
+    let divIdx = findLastTopLevelBinary(trimmed, "/")
+    if divIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, divIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, divIdx + 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "/", [left, right])
+    let modIdx = findLastTopLevelBinary(trimmed, "%")
+    if modIdx >= 0:
+        let left = parseCompilerExprText(program, sliceRange(trimmed, 0, modIdx))
+        let right = parseCompilerExprText(program, sliceRange(trimmed, modIdx + 1, len(trimmed)))
+        return ccore.appendCompilerCoreExpr(program, "binary", "%", [left, right])
+    return parseCompilerCallishExpr(program, trimmed)
+
+fn parseRoutineParamSignatureText(signatureText: str, decl: var ccore.CompilerCoreRoutineDecl, program: var ccore.CompilerCoreProgram) =
+    let flat = strutils.replace(signatureText, "\n", " ")
+    let openIdx = findChar(flat, '(')
+    let closeIdx = findLastChar(flat, ')')
+    if openIdx < 0 || closeIdx < openIdx:
+        return
+    decl.paramStart = program.routineParams.len
+    decl.paramCount = 0
+    let paramsText = strutils.strip(sliceRange(flat, openIdx + 1, closeIdx))
+    if len(paramsText) > 0:
+        let parts = splitTopLevelSegments(paramsText, ',')
+        for i in 0..<parts.len:
+            let part = strutils.strip(parts[i])
+            if len(part) == 0:
+                continue
+            let colonIdx = findChar(part, ':')
+            var nameText: str = part
+            var typeText: str = ""
+            if colonIdx >= 0:
+                nameText = strutils.strip(sliceRange(part, 0, colonIdx))
+                typeText = strutils.strip(sliceRange(part, colonIdx + 1, len(part)))
+            let kind = if strutils.startsWith(nameText, "var "): "var_param" else: "value_param"
+            var finalName: str = nameText
+            if kind == "var_param":
+                finalName = strutils.strip(sliceRange(nameText, len("var "), len(nameText)))
+            discard ccore.appendCompilerCoreRoutineParam(program,
+                                                         ccore.compilerCoreRoutineParam(finalName,
+                                                                                        typeText,
+                                                                                        kind))
+            decl.paramCount = decl.paramCount + 1
+    let retSlice = sliceRange(flat, closeIdx + 1, len(flat))
+    let colonIdx = findChar(retSlice, ':')
+    if colonIdx >= 0:
+        var rawReturn = strutils.strip(sliceRange(retSlice, colonIdx + 1, len(retSlice)))
+        let eqIdx = findLastChar(rawReturn, '=')
+        if eqIdx >= 0:
+            rawReturn = sliceRange(rawReturn, 0, eqIdx)
+        decl.returnTypeText = strutils.strip(rawReturn)
+
+fn parseForRangeHeader(line: str, outName: var str, outStartExpr: var str, outStopExpr: var str, outInclusive: var str): bool =
+    if !strutils.startsWith(line, "for ") || line[len(line) - 1] != ':':
+        return false
+    let body = strutils.strip(sliceRange(line, len("for "), len(line) - 1))
+    let inIdx = findText(body, " in ")
+    if inIdx < 0:
+        return false
+    outName = strutils.strip(sliceRange(body, 0, inIdx))
+    let rangeText = strutils.strip(sliceRange(body, inIdx + len(" in "), len(body)))
+    let exclIdx = findTopLevelToken(rangeText, "..<", 0)
+    if exclIdx >= 0:
+        outStartExpr = strutils.strip(sliceRange(rangeText, 0, exclIdx))
+        outStopExpr = strutils.strip(sliceRange(rangeText, exclIdx + 3, len(rangeText)))
+        outInclusive = "exclusive"
+        return true
+    let inclIdx = findTopLevelToken(rangeText, "..", 0)
+    if inclIdx >= 0:
+        outStartExpr = strutils.strip(sliceRange(rangeText, 0, inclIdx))
+        outStopExpr = strutils.strip(sliceRange(rangeText, inclIdx + 2, len(rangeText)))
+        outInclusive = "inclusive"
+        return true
+    return false
+
+fn parseCompilerIfStmtChain(program: var ccore.CompilerCoreProgram,
+                            bodyLines: str[],
+                            startIdx: int32,
+                            outNextIdx: var int32,
+                            outStmtId: var int32): bool =
+    let rawLine = bodyLines[startIdx]
+    let line = strutils.strip(rawLine)
+    if line[len(line) - 1] != ':' || !(strutils.startsWith(line, "if ") || strutils.startsWith(line, "elif ")):
+        return false
+    let keywordLen = if strutils.startsWith(line, "if "): len("if ") else: len("elif ")
+    let condText = strutils.strip(sliceRange(line, keywordLen, len(line) - 1))
+    var thenLines: str[]
+    let nextIdx = collectOutlineBlockLines(bodyLines, startIdx + 1, thenLines)
+    var thenStmtIds: int32[]
+    if !parseCompilerStmtLines(program, thenLines, thenStmtIds):
+        return false
+    var elseStmtIds: int32[]
+    elseStmtIds = []
+    outNextIdx = nextIdx
+    if outNextIdx < bodyLines.len:
+        let elseRaw = bodyLines[outNextIdx]
+        let elseLine = strutils.strip(elseRaw)
+        if leadingIndentWidth(elseRaw) == 0 && elseLine == "else:":
+            var elseLines: str[]
+            outNextIdx = collectOutlineBlockLines(bodyLines, outNextIdx + 1, elseLines)
+            if !parseCompilerStmtLines(program, elseLines, elseStmtIds):
+                return false
+        elif leadingIndentWidth(elseRaw) == 0 && strutils.startsWith(elseLine, "elif "):
+            var nestedStmtId: int32 = -1
+            if !parseCompilerIfStmtChain(program, bodyLines, outNextIdx, outNextIdx, nestedStmtId):
+                return false
+            add(elseStmtIds, nestedStmtId)
+    
+    let condExpr = parseCompilerExprText(program, condText)
+    outStmtId = ccore.appendCompilerCoreStmt(program, "if", "", condExpr, -1, thenStmtIds, elseStmtIds)
+    return true
+
+fn parseCompilerStmtLines(program: var ccore.CompilerCoreProgram,
+                          bodyLines: str[],
+                          outStmtIds: var int32[]): bool =
+    outStmtIds = []
+    var idx: int32 = 0
+    while idx < bodyLines.len:
+        let rawLine = bodyLines[idx]
+        let line = strutils.strip(rawLine)
+        if isBlankOrCommentLine(rawLine):
+            idx = idx + 1
+            continue
+        if leadingIndentWidth(rawLine) > 0:
+            return false
+        if strutils.startsWith(line, "return"):
+            let exprText = strutils.strip(sliceRange(line, len("return"), len(line)))
+            var exprId: int32 = -1
+            if len(exprText) > 0:
+                exprId = parseCompilerExprText(program, exprText)
+            add(outStmtIds, ccore.appendCompilerCoreStmt(program, "return", "", exprId, -1, [], []))
+            idx = idx + 1
+            continue
+        if strutils.startsWith(line, "let ") || strutils.startsWith(line, "var "):
+            let kind = if strutils.startsWith(line, "let "): "let" else: "var"
+            let tail = strutils.strip(sliceRange(line, len(kind) + 1, len(line)))
+            let eqIdx = findLastChar(tail, '=')
+            let lhs = eqIdx >= 0 ? strutils.strip(sliceRange(tail, 0, eqIdx)) : tail
+            let colonIdx = findChar(lhs, ':')
+            var nameText: str = lhs
+            var typeText: str = ""
+            if colonIdx >= 0:
+                nameText = strutils.strip(sliceRange(lhs, 0, colonIdx))
+                typeText = strutils.strip(sliceRange(lhs, colonIdx + 1, len(lhs)))
+            var initExprId: int32 = -1
+            if eqIdx >= 0:
+                let rhs = strutils.strip(sliceRange(tail, eqIdx + 1, len(tail)))
+                initExprId = parseCompilerExprText(program, rhs)
+            discard ccore.appendCompilerCoreLocal(program,
+                                                  ccore.compilerCoreLocalDecl(nameText,
+                                                                             typeText,
+                                                                             kind,
+                                                                             initExprId))
+            add(outStmtIds, ccore.appendCompilerCoreStmt(program, kind, nameText, initExprId, -1, [], []))
+            idx = idx + 1
+            continue
+        if (strutils.startsWith(line, "if ") || strutils.startsWith(line, "elif ")) && line[len(line) - 1] == ':':
+            var ifStmtId: int32 = -1
+            if !parseCompilerIfStmtChain(program, bodyLines, idx, idx, ifStmtId):
+                return false
+            add(outStmtIds, ifStmtId)
+            continue
+        if strutils.startsWith(line, "while ") && line[len(line) - 1] == ':':
+            let condText = strutils.strip(sliceRange(line, len("while "), len(line) - 1))
+            var childLines: str[]
+            idx = collectOutlineBlockLines(bodyLines, idx + 1, childLines)
+            var childStmtIds: int32[]
+            if !parseCompilerStmtLines(program, childLines, childStmtIds):
+                return false
+            let condExpr = parseCompilerExprText(program, condText)
+            add(outStmtIds, ccore.appendCompilerCoreStmt(program, "while", "", condExpr, -1, childStmtIds, []))
+            continue
+        var iterName: str = ""
+        var rangeStartText: str = ""
+        var rangeStopText: str = ""
+        var rangeKind: str = ""
+        if parseForRangeHeader(line, iterName, rangeStartText, rangeStopText, rangeKind):
+            var childLines: str[]
+            idx = collectOutlineBlockLines(bodyLines, idx + 1, childLines)
+            var childStmtIds: int32[]
+            if !parseCompilerStmtLines(program, childLines, childStmtIds):
+                return false
+            let startExpr = parseCompilerExprText(program, rangeStartText)
+            let stopExpr = parseCompilerExprText(program, rangeStopText)
+            discard ccore.appendCompilerCoreLocal(program,
+                                                  ccore.compilerCoreLocalDecl(iterName,
+                                                                             "int32",
+                                                                             "loop_index",
+                                                                             -1))
+            add(outStmtIds, ccore.appendCompilerCoreStmt(program, "for_range", iterName + "|" + rangeKind, startExpr, stopExpr, childStmtIds, []))
+            continue
+        let assignIdx = findLastTopLevelAssign(line)
+        if assignIdx >= 0:
+            let lhsText = strutils.strip(sliceRange(line, 0, assignIdx))
+            let rhsText = strutils.strip(sliceRange(line, assignIdx + 1, len(line)))
+            if len(lhsText) == 0 || len(rhsText) == 0:
+                return false
+            let lhsExpr = parseCompilerExprText(program, lhsText)
+            let rhsExpr = parseCompilerExprText(program, rhsText)
+            let lhsKind = program.exprs[lhsExpr].kind
+            if lhsKind != "name_ref" && lhsKind != "field" && lhsKind != "index":
+                return false
+            add(outStmtIds, ccore.appendCompilerCoreStmt(program, "assign", "", lhsExpr, rhsExpr, [], []))
+            idx = idx + 1
+            continue
+        let exprId = parseCompilerExprText(program, line)
+        add(outStmtIds, ccore.appendCompilerCoreStmt(program, "expr_stmt", "", exprId, -1, [], []))
+        idx = idx + 1
+    return true
+
+fn populateCompilerRoutineExecutableAst(program: var ccore.CompilerCoreProgram,
+                                        decl: var ccore.CompilerCoreRoutineDecl): bool =
+    let paramLen = program.routineParams.len
+    let localLen = program.locals.len
+    let stmtLen = program.stmts.len
+    let stmtChildLen = program.stmtChildIds.len
+    let exprLen = program.exprs.len
+    let exprChildLen = program.exprChildIds.len
+    parseRoutineParamSignatureText(decl.signatureText, decl, program)
+    decl.localStart = program.locals.len
+    decl.localCount = 0
+    decl.stmtStart = program.stmts.len
+    decl.stmtCount = 0
+    decl.exprStart = program.exprs.len
+    decl.exprCount = 0
+    var stmtIds: int32[]
+    if !parseCompilerStmtLines(program, decl.bodyLines, stmtIds):
+        ccore.truncateCompilerCoreProgramAst(program,
+                                            paramLen,
+                                            localLen,
+                                            stmtLen,
+                                            stmtChildLen,
+                                            exprLen,
+                                            exprChildLen)
+        decl.returnTypeText = ""
+        decl.paramStart = 0
+        decl.paramCount = 0
+        decl.localStart = 0
+        decl.localCount = 0
+        decl.stmtStart = 0
+        decl.stmtCount = 0
+        decl.exprStart = 0
+        decl.exprCount = 0
+        decl.executableAstReady = false
+        return false
+    decl.localCount = program.locals.len - decl.localStart
+    decl.stmtCount = program.stmts.len - decl.stmtStart
+    decl.exprCount = program.exprs.len - decl.exprStart
+    decl.executableAstReady = true
+    return true
+
+fn tryParseCompilerCoreSourceText(sourcePath: str, text: str, out: var ParsedV2Source): bool =
+    let rawLines = strutils.split(text, '\n')
+    var program = ccore.newCompilerCoreProgram()
+    var pendingAnnotations: str[]
+    pendingAnnotations = []
+    var idx: int32 = 0
+    while idx < rawLines.len:
+        let rawLine = rawLines[idx]
+        let line = strutils.strip(rawLine)
+        if isBlankOrCommentLine(rawLine):
+            idx = idx + 1
+            continue
+        if leadingIndentWidth(rawLine) > 0:
+            return false
+        if len(line) > 0 && line[0] == '@':
+            add(pendingAnnotations, line)
+            idx = idx + 1
+            continue
+        if line == "module" || strutils.startsWith(line, "module "):
+            if pendingAnnotations.len > 0:
+                return false
+            let name = parseCompilerDeclLabel(line, "module ", "module")
+            ccore.appendCompilerCoreModule(program, ccore.compilerCoreModuleDecl(name, line))
+            idx = idx + 1
+            continue
+        if strutils.startsWith(line, "import "):
+            if pendingAnnotations.len > 0:
+                return false
+            ccore.appendCompilerCoreImport(program, parseCompilerImportLine(line))
+            idx = idx + 1
+            continue
+        if line == "type":
+            if pendingAnnotations.len > 0:
+                return false
+            var bodyLines: str[]
+            idx = collectOutlineBlockLines(rawLines, idx + 1, bodyLines)
+            ccore.appendCompilerCoreTypeBlock(program, ccore.compilerCoreTypeBlock("type", bodyLines))
+            continue
+        if line == "const" || strutils.startsWith(line, "const "):
+            if pendingAnnotations.len > 0:
+                return false
+            var bodyLines: str[]
+            bodyLines = []
+            let nextIdx = if line == "const":
+                collectOutlineBlockLines(rawLines, idx + 1, bodyLines)
+            else:
+                idx + 1
+            ccore.appendCompilerCoreConstDecl(program,
+                                              ccore.compilerCoreValueDecl(parseCompilerDeclLabel(line, "const ", "const"),
+                                                                          line,
+                                                                          bodyLines))
+            idx = nextIdx
+            continue
+        if line == "var" || strutils.startsWith(line, "var "):
+            if pendingAnnotations.len > 0:
+                return false
+            var bodyLines: str[]
+            bodyLines = []
+            let nextIdx = if line == "var":
+                collectOutlineBlockLines(rawLines, idx + 1, bodyLines)
+            else:
+                idx + 1
+            ccore.appendCompilerCoreVarDecl(program,
+                                            ccore.compilerCoreValueDecl(parseCompilerDeclLabel(line, "var ", "var"),
+                                                                        line,
+                                                                        bodyLines))
+            idx = nextIdx
+            continue
+        if strutils.startsWith(line, "importc fn "):
+            let name = parseCompilerRoutineName(line, "importc fn ")
+            let signatureText = joinPrefixedLineParts(pendingAnnotations, [line])
+            var decl = ccore.compilerCoreRoutineDecl("importc_fn", name, signatureText, [])
+            parseRoutineParamSignatureText(signatureText, decl, program)
+            ccore.appendCompilerCoreRoutine(program, decl)
+            pendingAnnotations = []
+            idx = idx + 1
+            continue
+        if strutils.startsWith(line, "fn ") || strutils.startsWith(line, "iterator "):
+            let baseKind = if strutils.startsWith(line, "iterator "): "iterator" else: "fn"
+            let allowHeaderOnly = annotationLinesContainImportc(pendingAnnotations)
+            var kind: str = baseKind
+            let name = if kind == "iterator":
+                parseCompilerRoutineName(line, "iterator ")
+            else:
+                parseCompilerRoutineName(line, "fn ")
+            var signatureText: str = ""
+            var bodyLines: str[]
+            idx = collectRoutineSignatureAndBody(rawLines,
+                                                idx,
+                                                pendingAnnotations,
+                                                allowHeaderOnly,
+                                                signatureText,
+                                                bodyLines)
+            if allowHeaderOnly && bodyLines.len == 0:
+                kind = "importc_fn"
+            var decl = ccore.compilerCoreRoutineDecl(kind, name, signatureText, bodyLines)
+            if kind == "importc_fn":
+                parseRoutineParamSignatureText(signatureText, decl, program)
+            else:
+                discard populateCompilerRoutineExecutableAst(program, decl)
+            ccore.appendCompilerCoreRoutine(program, decl)
+            pendingAnnotations = []
+            continue
+        return false
+    if pendingAnnotations.len > 0:
+        return false
+    if !ccore.compilerCoreHasTopLevel(program):
+        return false
+    let defaultOwnerModule = compilerCoreDefaultOwnerModulePath(sourcePath)
+    for i in 0..<program.topLevelSourcePaths.len:
+        if len(program.topLevelSourcePaths[i]) == 0:
+            program.topLevelSourcePaths[i] = sourcePath
+    for i in 0..<program.topLevelOwnerModules.len:
+        if len(program.topLevelOwnerModules[i]) == 0:
+            program.topLevelOwnerModules[i] = defaultOwnerModule
+    out = newParsedV2Source(sourcePath)
+    out.compilerCoreProgram = program
+    ident.appendUnique(out.surfaceKinds, "compiler_core")
+    return true
+
+fn newParsedV2Source(sourcePath: str): ParsedV2Source =
+    var out: ParsedV2Source
+    out.version = "v2.frontend.source_parser.v1"
+    out.sourcePath = sourcePath
+    out.compilerCoreProgram = ccore.newCompilerCoreProgram()
+    out.unimakerProgram = usurf.newUnimakerSurfaceProgram()
+    out.networkProgram = nsurf.newNetworkDistributionProgram()
+    out.surfaceKinds = []
+    return out
+
+fn sourceHasRecognizedSurface(parsed: ParsedV2Source): bool =
+    return ccore.compilerCoreHasTopLevel(parsed.compilerCoreProgram) ||
+           parsed.unimakerProgram.decls.len > 0 ||
+           parsed.networkProgram.topologies.len > 0 ||
+           parsed.networkProgram.ops.len > 0
+
+fn tryParseV2SourceText(sourcePath: str, text: str, out: var ParsedV2Source): bool =
+    var parsed = newParsedV2Source(sourcePath)
+    let lines = strutils.split(text, '\n')
+    var hadRecognized: bool = false
+    for i in 0..<lines.len:
+        let line = strutils.strip(lines[i])
+        if len(line) == 0 || strutils.startsWith(line, "//") || strutils.startsWith(line, "#"):
+            continue
+        if parseUnimakerLine(parsed.unimakerProgram, line):
+            ident.appendUnique(parsed.surfaceKinds, "unimaker")
+            hadRecognized = true
+            continue
+        if parseTopologyLine(parsed.networkProgram, line):
+            ident.appendUnique(parsed.surfaceKinds, "topology")
+            hadRecognized = true
+            continue
+        if parseNetworkOpLine(parsed.networkProgram, line):
+            ident.appendUnique(parsed.surfaceKinds, "network_distribution")
+            hadRecognized = true
+            continue
+        if hadRecognized:
+            return false
+    if hadRecognized:
+        out = parsed
+        return true
+    return tryParseCompilerCoreSourceText(sourcePath, text, out)
+
+fn tryParseV2SourceFile(path: str, out: var ParsedV2Source): bool =
+    return tryParseV2SourceText(path, os.readFile(path), out)
+
+fn parseV2SourceFileStrict(path: str): ParsedV2Source =
+    var out: ParsedV2Source
+    if !tryParseV2SourceFile(path, out):
+        panic("v2 source parser: unsupported mixed surface in " + path)
+    if !sourceHasRecognizedSurface(out):
+        panic("v2 source parser: no v2 surface recognized in " + path)
+    return out

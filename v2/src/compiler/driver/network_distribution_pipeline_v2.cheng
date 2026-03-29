@@ -1,0 +1,71 @@
+import std/seqs
+import std/system
+import compiler/frontend/network_distribution_surface_ir_v2 as nsurf
+import compiler/semantic_facts/network_distribution_facts_v2 as nfacts
+import compiler/high_uir/network_distribution_graph_v2 as nhigh
+import compiler/low_uir/network_distribution_lowering_v2 as nlow
+
+type
+    NetworkDistributionPipelineBundle =
+        version: str
+        program: nsurf.NetworkDistributionProgram
+        facts: nfacts.NetworkDistributionFacts
+        highGraph: nhigh.HighUirNetworkDistributionGraph
+        lowPlan: nlow.LowUirNetworkDistributionPlan
+
+fn networkDistributionPipelineVersion(): str =
+    return "v2.driver.network_distribution_pipeline.v1"
+
+fn lowerNetworkDistributionProgramToHighUir(program: nsurf.NetworkDistributionProgram,
+                                            facts: nfacts.NetworkDistributionFacts): nhigh.HighUirNetworkDistributionGraph =
+    var graph: nhigh.HighUirNetworkDistributionGraph = nhigh.newHighUirNetworkDistributionGraph()
+    for i in 0..<program.ops.len:
+        nhigh.appendHighUirNetworkDistributionOp(graph,
+                                                 facts.opIds[i],
+                                                 facts.opNames[i],
+                                                 facts.topologyRefs[i],
+                                                 facts.topologyCanonicalForms[i],
+                                                 facts.networkDomains[i],
+                                                 facts.addressingModes[i],
+                                                 facts.topologyDepths[i],
+                                                 facts.transportModes[i],
+                                                 facts.repairModes[i],
+                                                 facts.dispersalModes[i],
+                                                 facts.priorityClasses[i],
+                                                 facts.addressBindings[i],
+                                                 facts.distanceMetrics[i],
+                                                 facts.routePlanModels[i],
+                                                 facts.identityScopes[i],
+                                                 facts.antiEntropySignatureKinds[i],
+                                                 facts.proofDomains[i],
+                                                 program.ops[i])
+    return graph
+
+fn compileNetworkDistributionProgram(program: nsurf.NetworkDistributionProgram): NetworkDistributionPipelineBundle =
+    var out: NetworkDistributionPipelineBundle
+    out.version = networkDistributionPipelineVersion()
+    out.program = program
+    out.facts = nfacts.buildNetworkDistributionFacts(program)
+    out.highGraph = lowerNetworkDistributionProgramToHighUir(program, out.facts)
+    out.lowPlan = nlow.lowerHighUirNetworkDistributionGraphToLowUir(out.highGraph)
+    return out
+
+fn sampleNetworkDistributionPipeline(): NetworkDistributionPipelineBundle =
+    return compileNetworkDistributionProgram(nsurf.sampleNetworkDistributionProgram())
+
+fn networkDistributionPipelineLines(bundle: NetworkDistributionPipelineBundle): str[] =
+    var out: str[]
+    out = []
+    add(out, "pipeline_version=" + bundle.version)
+    add(out, "topologies=" + intToStr(bundle.program.topologies.len))
+    add(out, "ops=" + intToStr(bundle.program.ops.len))
+    add(out, "facts=" + intToStr(bundle.facts.opIds.len))
+    add(out, "high_uir_nodes=" + intToStr(bundle.highGraph.opIds.len))
+    add(out, "low_uir_nodes=" + intToStr(bundle.lowPlan.opIds.len))
+    for i in 0..<bundle.program.ops.len:
+        let line = intToStr(i) + ":" +
+                   nsurf.networkDistributionOpSummary(bundle.program.ops[i]) + " => " +
+                   bundle.lowPlan.canonicalOps[i] + " => " +
+                   bundle.lowPlan.runtimeTargets[i]
+        add(out, line)
+    return out

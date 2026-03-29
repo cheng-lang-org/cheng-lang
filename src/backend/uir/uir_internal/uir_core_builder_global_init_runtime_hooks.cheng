@@ -1,0 +1,81 @@
+# Global-init runtime hooks live outside the entry builder so root_engine does
+# not materialize main-injection logic while entering the global-init build.
+import std/seqs
+import std/result
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
+import backend/uir/uir_internal/uir_core_builder_policy_contract
+
+fn uirCoreRejectNoMainGlobalInit(ctx: UirCoreBuildCtx, allowNoMain: bool): Result[bool] =
+    if ctx == nil || !allowNoMain || uirCoreBuildCtxFoundMain(ctx) || backendSkipGlobalInit():
+        return Ok[bool](true)
+    if uirCoreBuildCtxGlobalInitLen(ctx) <= 0:
+        return Ok[bool](true)
+    return Err[bool]("uirCore_builder: top-level global init is unsupported for no-main/object-first builds; " +
+                     "move initialization into an explicit entry/init function or compile as a whole program")
+
+fn uirCoreInjectGlobalInitCall(mod: UirCoreModule, initName: str) =
+    if (mod == nil) || len(initName) == 0:
+        return
+    let dbgGlobalInit: bool = (getEnv "BACKEND_DEBUG_GLOBAL_INIT" == "1")
+    for i in 0..<uirCoreModuleFuncsLen(mod):
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
+        let nameNorm: str = backendStripSpaces(((f != nil)) ? uirCoreFuncNameOf(f) : "")
+        let linkNorm: str = backendStripSpaces(((f != nil)) ? uirCoreFuncLinkNameOf(f) : "")
+        let nameIsMain: bool = (len(nameNorm) == 4 &&
+                                nameNorm[0] == 'm' && nameNorm[1] == 'a' &&
+                                nameNorm[2] == 'i' && nameNorm[3] == 'n')
+        let linkIsMain: bool = (len(linkNorm) == 4 &&
+                                linkNorm[0] == 'm' && linkNorm[1] == 'a' &&
+                                linkNorm[2] == 'i' && linkNorm[3] == 'n')
+        if dbgGlobalInit && (f != nil) &&
+           (uirCoreStrIndexOf(uirCoreFuncNameOf(f), "main") >= 0 ||
+            (len(uirCoreFuncLinkNameOf(f)) > 0 && uirCoreStrIndexOf(uirCoreFuncLinkNameOf(f), "main") >= 0)):
+            echo("[backend] debugGlobalInit: cand name='" + uirCoreFuncNameOf(f) +
+                 "' link='" + uirCoreFuncLinkNameOf(f) +
+                 "' extern=" + (uirCoreFuncIsExtern(f) ? "1" : "0") +
+                 " blocks=" + intToStr(uirCoreFuncBlocksLen(f)) +
+                 " nameIsMain=" + (nameIsMain ? "1" : "0") +
+                 " linkIsMain=" + (linkIsMain ? "1" : "0"))
+        if (f != nil) && !uirCoreFuncIsExtern(f) &&
+           (nameIsMain || linkIsMain) &&
+           uirCoreFuncBlocksLen(f) > 0:
+            let entry: UirBlockId = uirCoreFuncBlockAt(f, 0)
+            if (entry == nil):
+                if dbgGlobalInit:
+                    echo("[backend] debugGlobalInit: main entry nil")
+                return
+
+            let entryStmtLen: int32 = uirCoreBlockStmtsLen(entry)
+            for insertAt in 0..<entryStmtLen:
+                let st: UirStmtId = uirCoreBlockStmtAt(entry, insertAt)
+                if uirCoreStmtKindOf(st) != uirCoreStmtKindParam():
+                    break
+
+            if insertAt < entryStmtLen:
+                let s0: UirStmtId = uirCoreBlockStmtAt(entry, insertAt)
+                if uirCoreStmtKindOf(s0) == uirCoreStmtKindExpr():
+                    let e0: UirExprId = uirCoreStmtExprOf(s0)
+                    if e0 > 0 && uirCoreExprKindOf(e0) == uirCoreExprKindCall() &&
+                       (uirCoreExprCalleeOf(e0) == initName):
+                        if dbgGlobalInit:
+                            echo("[backend] debugGlobalInit: already inserted at=" + intToStr(insertAt))
+                        return
+
+            var args: UirExprId[]
+            let call: UirExprId = uirCoreCall(initName, args)
+            let stmt: UirStmtId = uirCoreStmtExpr(call)
+            var out: UirStmtId[]
+            for si in 0..<entryStmtLen:
+                if si == insertAt:
+                    seqs.add(out, stmt)
+                seqs.add(out, uirCoreBlockStmtAt(entry, si))
+            if insertAt == entryStmtLen:
+                seqs.add(out, stmt)
+            uirCoreBlockSetStmts(entry, out)
+            if dbgGlobalInit:
+                echo("[backend] debugGlobalInit: inserted at=" + intToStr(insertAt) +
+                     " total=" + intToStr(uirCoreBlockStmtsLen(entry)))
+            return
+    if dbgGlobalInit:
+        echo("[backend] debugGlobalInit: main not found")

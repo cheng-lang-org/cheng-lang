@@ -1,9 +1,17 @@
 # Machine core instruction types for backend MVP (AArch64/x86_64-oriented).
 import std/seqs
-import std/os
 import std/strings
 import std/system
 import std/rawmem_support
+
+@importc("getenv")
+fn machineCoreGetEnvRaw(name: cstring): cstring
+
+fn machineCoreEnvIsTrue(name: str): bool =
+    let raw: cstring = machineCoreGetEnvRaw(strToCStringTemp(name))
+    if raw == nil || c_strlen(raw) == 0:
+        return false
+    return strFromCStringBorrow(raw) == "1"
 
 fn machineCoreReadI32(p: ptr): int32 =
     if p == nil:
@@ -291,7 +299,7 @@ fn machineCoreDebugCStringEnabled(): bool =
     if machineCoreDebugCStringCached:
         return machineCoreDebugCStringValue
     machineCoreDebugCStringCached = true
-    machineCoreDebugCStringValue = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    machineCoreDebugCStringValue = machineCoreEnvIsTrue("BACKEND_DEBUG_CSTRING_LOWERING")
     return machineCoreDebugCStringValue
 
 fn machineCoreResetSeqFunc(items: MachineCoreFunc[]*) =
@@ -488,7 +496,7 @@ fn machineCoreModuleFuncBufferRaw(mod: MachineCoreModule): ptr =
     return mod.funcs.buffer
 
 fn machineCoreModuleFuncAt(mod: MachineCoreModule, idx: int32): MachineCoreFunc =
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_FUNC_AT", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_FUNC_AT"):
         let n: int32 = machineCoreModuleFuncsLen(mod)
         echo("[machine.func_at] idx=" + intToStr(idx) + " len=" + intToStr(n))
     if !machineCoreModuleValid(mod) || idx < 0:
@@ -577,7 +585,7 @@ fn machineCoreFuncInstAt(func: MachineCoreFunc, idx: int32): MachineCoreInst =
     if idx >= lenLocal || func.insts.buffer == nil:
         return nil
     let out: MachineCoreInst = func.insts[idx]
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1" && !machineCoreInstValid(out):
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_BAD_REF") && !machineCoreInstValid(out):
         echo("[machine.inst_at.bad] idx=" + intToStr(idx) + " " +
              machineCorePtrDebug(int64(out)) + " " +
              machineCoreBufDebug(func.insts.buffer, lenLocal, capLocal))
@@ -681,7 +689,7 @@ fn machineCoreNewFunc(name: str): MachineCoreFunc =
     new f
     f.name = machineCorePersistStr(name)
     machineCoreResetSeqInst(&f.insts)
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_NAME", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_NAME"):
         let inLen: int32 = len(name)
         let fName: str = f.name
         let outLen: int32 = len(fName)
@@ -735,7 +743,7 @@ fn machineCoreAddInst(func: MachineCoreFunc, inst: MachineCoreInst) =
     if inst == nil:
         return
     let oldLen: int32 = machineCoreFuncInstsLen(func)
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1" && oldLen < 12:
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_BAD_REF") && oldLen < 12:
         echo("[machine.add_inst] op=" + intToStr(int32(machineCoreInstOpOf(inst))) +
              " rd=" + intToStr(int32(machineCoreInstRdOf(inst))) +
              " rn=" + intToStr(int32(machineCoreInstRnOf(inst))))
@@ -743,7 +751,7 @@ fn machineCoreAddInst(func: MachineCoreFunc, inst: MachineCoreInst) =
              machineCorePtrDebug(int64(inst)))
         echo("[machine.add_inst] state " + machineCoreBufDebug(machineCoreFuncInstBufferRaw(func), machineCoreFuncInstsLen(func), machineCoreFuncInstsLen(func)))
     machineCoreAppendInstRaw(func, inst)
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1" && oldLen < 12:
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_BAD_REF") && oldLen < 12:
         echo("[machine.add_inst] after_len=" + intToStr(machineCoreFuncInstsLen(func)) + " " +
              machineCoreBufDebug(machineCoreFuncInstBufferRaw(func), machineCoreFuncInstsLen(func), func.insts.cap))
 
@@ -757,7 +765,7 @@ fn machineCoreNewModule(): MachineCoreModule =
     return m
 
 fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_ADD_FUNC"):
         let mlen: int32 = machineCoreModuleFuncsLen(mod)
         var fname: str
         machineCoreSetEmpty(fname)
@@ -788,7 +796,7 @@ fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
             continue
         let cloned: MachineCoreInst = machineCoreCloneInst(srcInst)
         machineCoreAddInst(stored, cloned)
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_BAD_REF"):
         var storedFirst: str
         machineCoreSetStr(storedFirst, "stored_first=nil")
         var storedEight: str
@@ -808,12 +816,12 @@ fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
         echo("[machine.add_func.copy] insts=" + intToStr(storedLen) + " " + storedFirst +
              " first_op=" + storedFirstOp + " " + storedEight + " " +
              machineCoreBufDebug(storedBuf, storedLen, stored.insts.cap))
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_ADD_FUNC"):
         echo("[machine.add_func] append.pre " + machineCoreBufDebug(machineCoreModuleFuncBufferRaw(mod), machineCoreModuleFuncsLen(mod), mod.funcs.cap))
     machineCoreAppendFuncRaw(mod, stored)
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_ADD_FUNC"):
         echo("[machine.add_func] append.post " + machineCoreBufDebug(machineCoreModuleFuncBufferRaw(mod), machineCoreModuleFuncsLen(mod), mod.funcs.cap))
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_BAD_REF", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_BAD_REF"):
         let addedIdx: int32 = machineCoreModuleFuncsLen(mod) - 1
         let added: MachineCoreFunc = machineCoreModuleFuncAt(mod, addedIdx)
         var addedFirst: str
@@ -836,7 +844,7 @@ fn machineCoreAddFunc(mod: MachineCoreModule, func: MachineCoreFunc) =
              intToStr(addedLen) + " " + addedFirst + " first_op=" + addedFirstOp +
              " " + addedEight + " " +
              machineCoreBufDebug(addedBuf, addedLen, added.insts.cap))
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_ADD_FUNC", "") == "1":
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_ADD_FUNC"):
         let mlen2: int32 = machineCoreModuleFuncsLen(mod)
         echo("[machine.add_func] after len=" + intToStr(mlen2) + " stored=" + storedName)
 fn machineCoreAddCString(mod: MachineCoreModule, label: str, value: str) =
@@ -877,7 +885,7 @@ fn machineCoreAddGlobal(mod: MachineCoreModule, name: str, size: int32, alignPow
     machineCoreAppendGlobalPtr(&mod.globals, g)
 
 fn machineCoreLabel(name: str): MachineCoreInst =
-    if os.getEnvDefault("BACKEND_DEBUG_MACHINE_LABEL", "") == "1" && machineCoreDebugLabelCount < 6:
+    if machineCoreEnvIsTrue("BACKEND_DEBUG_MACHINE_LABEL") && machineCoreDebugLabelCount < 6:
         let nlen: int32 = len(name)
         echo("[machine.label] len=" + intToStr(nlen) + " name=" + ((len(name) > 0) ? name : ""))
         machineCoreDebugLabelCount = machineCoreDebugLabelCount + 1

@@ -1,10 +1,21 @@
 # Machine IR facade: backed by machine internal core types.
 # Export a stable machine surface so object writers do not import internals directly.
 import backend/machine/machine_internal/machine_core_types
-import std/os
 import std/result
 import std/strutils
 import std/system
+
+@importc("getenv")
+fn machineGetEnvRaw(name: cstring): cstring
+
+fn machineGetEnvDefault(key: str, defaultValue: str): str =
+    let value: cstring = machineGetEnvRaw(strToCStringTemp(key))
+    if value == nil || c_strlen(value) == 0:
+        return defaultValue
+    return strFromCStringBorrow(value)
+
+fn machineEnvIsTrue(key: str): bool =
+    return machineGetEnvDefault(key, "") == "1"
 
 type
     MachineReg = MachineCoreReg
@@ -18,10 +29,10 @@ type
 
 # selector cstring lowering is always enabled on the production machine surface.
 fn machineSelectorCStringLoweringEnabled(): bool =
-    let raw: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_SELECTOR_CSTRING_LOWERING", "")))
+    let raw: str = strutils.toLowerAscii(strutils.strip(machineGetEnvDefault("BACKEND_SELECTOR_CSTRING_LOWERING", "")))
     if len(raw) > 0 && (raw == "0" || raw == "false" || raw == "no" || raw == "off"):
-        if os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1" ||
-           os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+        if machineEnvIsTrue("BACKEND_DEBUG_CSTRING_LOWERING") ||
+           machineEnvIsTrue("DIAG_CONTEXT"):
             echo("[machine.cstr] BACKEND_SELECTOR_CSTRING_LOWERING is ignored; selector cstring lowering is always enabled")
     return true
 
@@ -51,19 +62,19 @@ fn machineThreadSpawnI32(fn_ptr: ptr, ctx: int32): bool =
     return machineThreadSpawnI32Raw(fn_ptr, ctx) != 0
 
 fn machineThreadParallelism(): int32 =
-    let fnJobsRaw: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_FN_JOBS", "")))
+    let fnJobsRaw: str = strutils.toLowerAscii(strutils.strip(machineGetEnvDefault("BACKEND_FN_JOBS", "")))
     if len(fnJobsRaw) > 0:
         let parsedFnJobs: int32 = int32(strutils.parseInt(fnJobsRaw))
         if parsedFnJobs > 0:
             return parsedFnJobs
         return 1
-    let jobsRaw: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_JOBS", "")))
+    let jobsRaw: str = strutils.toLowerAscii(strutils.strip(machineGetEnvDefault("BACKEND_JOBS", "")))
     if len(jobsRaw) > 0:
         let parsedJobs: int32 = int32(strutils.parseInt(jobsRaw))
         if parsedJobs > 0:
             return parsedJobs
         return 1
-    let rawOverride: str = strutils.toLowerAscii(strutils.strip(os.getEnvDefault("BACKEND_ISEL_MAX_THREADS", "")))
+    let rawOverride: str = strutils.toLowerAscii(strutils.strip(machineGetEnvDefault("BACKEND_ISEL_MAX_THREADS", "")))
     if len(rawOverride) > 0:
         let parsed: int32 = int32(strutils.parseInt(rawOverride))
         if parsed > 0:

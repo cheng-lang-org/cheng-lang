@@ -18,6 +18,21 @@ import stage1/ownership
 import stage1/diagnostics
 import std/rawmem_support
 
+type
+    StrSetList =
+        items: str[]
+        set: hashsets.HashSetStr
+
+    ImportTrace =
+        items: str[]
+
+    NodeCache =
+        keys: str[]
+        valStart: int32[]
+        valLen: int32[]
+        pool: AstNodeId[]
+        index: hashmaps.HashMapStrInt
+
 fn stage1PtrLoadDiagnosticSeq(src: ptr): Diagnostic[] =
     var out: Diagnostic[]
     if src == nil:
@@ -914,8 +929,11 @@ fn setOrcEnabled(enabled: bool) =
 fn setOrcStrict(enabled: bool) =
     orcStrictFlag = enabled
 
-let cacheHeader: str = "CHENGTOK17"
-let cacheSpecVersion: str = "2026-03-07-tokenid-strpool"
+fn cacheHeader(): str =
+    return "CHENGTOK17"
+
+fn cacheSpecVersion(): str =
+    return "2026-03-07-tokenid-strpool"
 
 fn cacheCompilerVersion(): str =
     let v: str = stage1_getEnv "COMPILER_VERSION"
@@ -951,7 +969,7 @@ fn cacheMetaLine(): str =
            ";mm=" + mm +
            ";mm_strict=" + strictVal +
            ";target=" + cacheTargetPlatform() +
-           ";spec=" + cacheSpecVersion
+           ";spec=" + cacheSpecVersion()
 
 fn cacheEnabled(): bool =
     let tokenCache: str = stage1_getEnv("STAGE1_TOKEN_CACHE")
@@ -1340,7 +1358,7 @@ fn loadTokenCacheInto(path: str, size: int64, mtime: int64, out: Token[]*): bool
         freeOwnedStrSeq(lines)
     if lines.len < 5:
         return false
-    if !(lines[0] == cacheHeader):
+    if !(lines[0] == cacheHeader()):
         return false
     let metaExpected: str = cacheMetaLine()
     defer:
@@ -1408,7 +1426,7 @@ fn writeTokenCache(path: str, size: int64, mtime: int64, tokens: Token[]) =
     let f: File = open(cpath, fmWrite)
     if f == nil:
         return
-    write(f, cacheHeader)
+    write(f, cacheHeader())
     write(f, "\n")
     let meta: str = cacheMetaLine()
     write(f, meta)
@@ -1556,7 +1574,7 @@ fn normalizePath(path: str): str =
         return ""
     return absolutePath(path)
     let total: int32 = len path
-    var prefix: str = ""
+    var prefix: str
     var start: int32 = 0
     var absolute: bool = false
     if total >= 2 && path[1] == ':':
@@ -1608,7 +1626,7 @@ fn normalizePath(path: str): str =
                 else:
                     add(parts, seg)
             segStart = i + 1
-    var out: str = ""
+    var out: str
     if len prefix > 0:
         out = prefix
     for j in 0..<parts.len:
@@ -2122,21 +2140,6 @@ fn canonicalizeResolvedPath(resolved: str, rootDir: str): str =
         return stage1CanonicalizedChengCandidate(resolved, rootDir)
     return resolved
 
-type
-    StrSetList =
-        items: str[]
-        set: hashsets.HashSetStr
-
-    ImportTrace =
-        items: str[]
-
-    NodeCache =
-        keys: str[]
-        valStart: int32[]
-        valLen: int32[]
-        pool: AstNodeId[]
-        index: hashmaps.HashMapStrInt
-
 fn strSetListInit(cap0: int32 = 16): StrSetList =
     var s: StrSetList
     var cap: int32 = cap0
@@ -2464,7 +2467,7 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
             let rawPathId: int32 = pathIds[pi]
             if rawPathId > 0 && !stage1ImportPathIsSystemTextId(rawPathId):
                 let resolvedPathNorm: str = stage1ResolveImportNormalizedTextId(rawPathId, moduleDir, rootDir)
-                var rawPath: str = ""
+                var rawPath: str
                 if len(resolvedPathNorm) == 0 || dbgImportPaths || traceImports:
                     rawPath = tokenTextById(rawPathId)
                 if dbgImportPaths:
@@ -2483,23 +2486,32 @@ fn loadModuleRecursiveId(pathId: int32, visited: ptr, diags: ptr,
                 let nested: AstNodeId[] = loadModuleRecursiveId(nestedPathId, visited, diags, cache, trace)
                 for ni in 0..<nested.len:
                     add(out, nested[ni])
+    # Preserve an imported module root instead of flattening its top-level
+    # children into the importer; this keeps per-module path/outline state local.
+    let moduleOutId: AstNodeId = astNewNodeId(nkModule, astNodePos(mrootId))
+    astSetNodeStrVal(moduleOutId, pathNorm)
+    astSetNodeIdent(moduleOutId, astNodeIdent(mrootId))
+    for ni in 0..<out.len:
+        astAddKid(moduleOutId, out[ni])
     let mrootKind: NodeKind = astNodeKind(mrootId)
     if mrootKind == nkModule || mrootKind == nkStmtList:
         for ci in 0..<astKidCount(mrootId):
-                let childId: AstNodeId = astKidAt(mrootId, ci)
-                let childKind: NodeKind = astNodeKind(childId)
-                if childKind != nkEmpty && childKind != nkImportStmt && childKind != nkImportGroup:
-                    if len(astNodeStrVal(childId)) == 0:
-                        astSetNodeStrVal(childId, pathNorm)
-                    add(out, childId)
-    else:
-        if mrootKind != nkEmpty:
-            add(out, mrootId)
+            let childId: AstNodeId = astKidAt(mrootId, ci)
+            let childKind: NodeKind = astNodeKind(childId)
+            if childKind != nkEmpty && childKind != nkImportStmt && childKind != nkImportGroup:
+                if len(astNodeStrVal(childId)) == 0:
+                    astSetNodeStrVal(childId, pathNorm)
+                astAddKid(moduleOutId, childId)
+    elif mrootKind != nkEmpty:
+        astAddKid(moduleOutId, mrootId)
+    var moduleOut: AstNodeId[]
+    reserve(moduleOut, 1)
+    add(moduleOut, moduleOutId)
     if cache != nil:
-        stage1CacheSetNodes(cache, pathNorm, out)
+        stage1CacheSetNodes(cache, pathNorm, moduleOut)
     freeSeq_Token(tokens)
     freeSeq[Diagnostic](lexDiags)
-    return out
+    return moduleOut
 
 fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visitedIn: ptr = nil,
                  cache: ptr = nil): AstNodeId[] =
@@ -2544,7 +2556,7 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
             let rawPathId: int32 = pathIds[pi]
             if rawPathId > 0 && !stage1ImportPathIsSystemTextId(rawPathId):
                 let resolvedPathNorm: str = stage1ResolveImportNormalizedTextId(rawPathId, baseDir, rootDir)
-                var rawPath: str = ""
+                var rawPath: str
                 if len(resolvedPathNorm) == 0 || dbgImportPaths || traceImports:
                     rawPath = tokenTextById(rawPathId)
                 if dbgImportPaths:
@@ -2565,6 +2577,42 @@ fn loadImportsId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visi
                 for ni in 0..<nested.len:
                     add(out, nested[ni])
     return out
+
+fn loadImportsAndAttachId(rootId: AstNodeId, baseDir: str, rootDir: str, diags: ptr, visitedIn: ptr = nil,
+                          cache: ptr = nil) =
+    let imported: AstNodeId[] = loadImportsId(rootId, baseDir, rootDir, diags, visitedIn, cache)
+    for ii in 0..<imported.len:
+        astAddKid(rootId, imported[ii])
+
+fn loadImplicitImportRootId(rawPath: str, ownerFile: str, rootDir: str, diags: ptr,
+                            visitedIn: ptr = nil, cache: ptr = nil): AstNodeId =
+    if len(rawPath) == 0 || len(ownerFile) == 0:
+        return astInvalidNodeId()
+    let ownerPathNorm: str = stage1NormalizeVisitedPath(ownerFile)
+    let ownerDir: str = stage1SplitDir(ownerFile)
+    let resolvedPathNorm: str = stage1ResolveImportNormalized(rawPath, ownerDir, rootDir)
+    if len(resolvedPathNorm) == 0:
+        addDiag(diags, svError, ownerPathNorm, 1, 1, "Unable to read imported module: " + rawPath)
+        stage1PhaseDump()
+        return astInvalidNodeId()
+    if len(ownerPathNorm) > 0 && stage1StrEq(ownerPathNorm, resolvedPathNorm):
+        return astInvalidNodeId()
+    if stage1TraceImportsEnabled():
+        stage1Trace("import: implicit " + ownerPathNorm + " -> " + rawPath + " => " + resolvedPathNorm)
+    let prevRootDir: str = stage1ImportRootDirCurrent
+    stage1ImportRootDirCurrent = rootDir
+    defer:
+        stage1ImportRootDirCurrent = prevRootDir
+    var localVisited: StrSetList = strSetListInit(16)
+    var visited: ptr = visitedIn
+    if visited == nil:
+        visited = &localVisited
+    let nestedPathId: int32 = stage1ImportPathPushSlot()
+    stage1ImportPathPool[nestedPathId] = resolvedPathNorm
+    let imported: AstNodeId[] = loadModuleRecursiveId(nestedPathId, visited, diags, cache, nil)
+    if imported.len <= 0:
+        return astInvalidNodeId()
+    return imported[0]
 
 fn copyFile(src: str, dst: str): bool =
     var content: str
@@ -2718,6 +2766,21 @@ fn mergeModulesId(sysRootId: AstNodeId, userRootId: AstNodeId): AstNodeId =
         astAddKid(rootId, astKidAt(sysRootId, i))
     for j in 0..<astKidCount(userRootId):
         astAddKid(rootId, astKidAt(userRootId, j))
+    return rootId
+
+fn mergeModulesWithImportsId(sysRootId: AstNodeId, userRootId: AstNodeId, imported: AstNodeId[]): AstNodeId =
+    if !astNodeIdValid(userRootId):
+        return sysRootId
+    let rootId: AstNodeId = astNewNodeId(nkModule, astNodePos(userRootId))
+    astSetNodeStrVal(rootId, astNodeStrVal(userRootId))
+    astSetNodeIdent(rootId, astNodeIdent(userRootId))
+    if astNodeIdValid(sysRootId):
+        for i in 0..<astKidCount(sysRootId):
+            astAddKid(rootId, astKidAt(sysRootId, i))
+    for j in 0..<imported.len:
+        astAddKid(rootId, imported[j])
+    for k in 0..<astKidCount(userRootId):
+        astAddKid(rootId, astKidAt(userRootId, k))
     return rootId
 
 fn tagModuleChildrenId(rootId: AstNodeId, path: str) =

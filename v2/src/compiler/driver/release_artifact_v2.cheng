@@ -1,0 +1,689 @@
+import std/seqs
+import std/os
+import std/strings as strings
+import std/system
+import compiler/frontend/v2_source_parser as parser
+import compiler/frontend/network_distribution_surface_ir_v2 as nsurf
+import compiler/driver/manifest_resolver_v2 as manifest
+import compiler/driver/identity_v2 as ident
+import compiler/driver/network_distribution_identity_v2 as ndident
+import compiler/driver/compiler_core_pipeline_v2 as cpipe
+import compiler/driver/unimaker_pipeline_v2 as upipe
+import compiler/driver/network_distribution_pipeline_v2 as npipe
+import compiler/driver/system_link_plan_v2 as slink
+import compiler/machine/target_contract as mtarget
+import compiler/machine/machine_pipeline_v2 as mpipeline
+import compiler/obj/writer_contract as owriter
+import compiler/obj/obj_image_v2 as oimg
+import compiler/obj/obj_file_v2 as ofile
+import runtime/core_runtime_v2 as corun
+import runtime/compiler_core_runtime_v2 as crun
+import runtime/strings_v2 as srun
+import runtime/unimaker_runtime_contract_v2 as urun
+import runtime/network_distribution_runtime_v2 as nrun
+
+type
+    NativeLinkPlanBundle =
+        version: str
+        moduleKind: str
+        emitKind: str
+        targetTriple: str
+        objFormat: str
+        runtimeTargets: str[]
+        runtimeSymbols: str[]
+        providedTargets: str[]
+        providedSymbols: str[]
+        unresolvedTargets: str[]
+        unresolvedSymbols: str[]
+        providerModules: str[]
+        planText: str
+        planCid: str
+    ReleaseArtifactBundle =
+        version: str
+        sourcePath: str
+        emitKind: str
+        targetTriple: str
+        moduleKind: str
+        machineVersion: str
+        machinePipelineVersion: str
+        objWriterVersion: str
+        objImageVersion: str
+        objFileVersion: str
+        objFormat: str
+        manifestCid: str
+        compileKey: str
+        compileKeyText: str
+        objImageCid: str
+        objFileCid: str
+        objFileByteCount: int32
+        objSectionCount: int32
+        objSymbolCount: int32
+        objRelocCount: int32
+        linkPlanVersion: str
+        linkPlanCid: str
+        systemLinkPlanVersion: str
+        systemLinkPlanCid: str
+        runtimeTargetCount: int32
+        runtimeUnresolvedCount: int32
+        nativeLinkClosureOk: bool
+        systemLinkReady: bool
+        systemLinkMissingReasonCount: int32
+        topologyCount: int32
+        networkEntryCount: int32
+        compilerCoreEntryCount: int32
+        systemLinkPlanText: str
+        artifactText: str
+
+fn releaseArtifactVersion(): str =
+    return "v2.release_artifact.v2"
+
+fn nativeLinkPlanVersion(): str =
+    return "v2.native_link_plan.v1"
+
+fn compilerCoreEntrySymbol(bundle: cpipe.CompilerCorePipelineBundle, targetTriple: str): str =
+    return slink.resolveEntrySymbol(targetTriple,
+                                    "compiler_core",
+                                    bundle.lowPlan.itemIds,
+                                    bundle.lowPlan.canonicalOps,
+                                    bundle.lowPlan.labels)
+
+fn objFormatForTarget(target: str): str =
+    if target == "arm64-apple-darwin" || target == "aarch64-apple-ios":
+        return "macho"
+    return "elf"
+
+fn requireEmitKind(emitKind: str) =
+    if emitKind != "exe" && emitKind != "shared" && emitKind != "static":
+        panic("v2 release artifact: unsupported emit kind " + emitKind)
+
+fn sanitizeSymbolPart(text: str): str =
+    var out: str = ""
+    for i in 0..<len(text):
+        let ch = text[i]
+        if (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9'):
+            out = out + strings.sliceBytes(text, i, 1)
+        else:
+            out = out + "_"
+    return out
+
+fn runtimeTargetSymbolName(targetTriple: str, runtimeTarget: str): str =
+    return mtarget.machineTargetSymbolPrefix(targetTriple) + sanitizeSymbolPart(runtimeTarget)
+
+fn runtimeTargetsForModuleKind(moduleKind: str): str[] =
+    var out: str[]
+    out = []
+    let coreTargets = corun.coreRuntimeTargets()
+    for i in 0..<coreTargets.len:
+        ident.appendUnique(out, coreTargets[i])
+    if moduleKind == "string":
+        let targets = srun.stringRuntimeTargets()
+        for i in 0..<targets.len:
+            ident.appendUnique(out, targets[i])
+    elif moduleKind == "compiler_core":
+        let targets = crun.compilerCoreRuntimeTargets()
+        for i in 0..<targets.len:
+            ident.appendUnique(out, targets[i])
+    elif moduleKind == "unimaker":
+        let targets = urun.unimakerRuntimeTargets()
+        for i in 0..<targets.len:
+            ident.appendUnique(out, targets[i])
+    elif moduleKind == "network_distribution" || moduleKind == "topology":
+        let targets = nrun.networkDistributionRuntimeTargets()
+        for i in 0..<targets.len:
+            ident.appendUnique(out, targets[i])
+    else:
+        panic("v2 native link plan: unsupported module kind " + moduleKind)
+    ident.sortStrings(out)
+    return out
+
+fn runtimeProviderModulesForModuleKind(moduleKind: str): str[] =
+    var out: str[]
+    out = []
+    add(out, "runtime/core_runtime_v2")
+    if moduleKind == "string":
+        add(out, "runtime/strings_v2")
+    elif moduleKind == "compiler_core":
+        add(out, "runtime/compiler_core_runtime_v2")
+    elif moduleKind == "unimaker":
+        add(out, "runtime/unimaker_runtime_contract_v2")
+    elif moduleKind == "network_distribution" || moduleKind == "topology":
+        add(out, "runtime/network_distribution_runtime_v2")
+    else:
+        panic("v2 native link plan: unsupported provider module kind " + moduleKind)
+    ident.sortStrings(out)
+    return out
+
+fn buildNativeLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
+                       emitKind: str,
+                       targetTriple: str): NativeLinkPlanBundle =
+    var out: NativeLinkPlanBundle
+    out.version = nativeLinkPlanVersion()
+    out.moduleKind = machineBundle.moduleKind
+    out.emitKind = emitKind
+    out.targetTriple = targetTriple
+    out.objFormat = machineBundle.objFormat
+    out.runtimeTargets = []
+    out.runtimeSymbols = []
+    out.providedTargets = runtimeTargetsForModuleKind(machineBundle.moduleKind)
+    out.providedSymbols = []
+    out.unresolvedTargets = []
+    out.unresolvedSymbols = []
+    out.providerModules = runtimeProviderModulesForModuleKind(machineBundle.moduleKind)
+    for i in 0..<machineBundle.runtimeTargets.len:
+        ident.appendUnique(out.runtimeTargets, machineBundle.runtimeTargets[i])
+    ident.sortStrings(out.runtimeTargets)
+    for i in 0..<out.runtimeTargets.len:
+        add(out.runtimeSymbols, runtimeTargetSymbolName(targetTriple, out.runtimeTargets[i]))
+    for i in 0..<out.providedTargets.len:
+        add(out.providedSymbols, runtimeTargetSymbolName(targetTriple, out.providedTargets[i]))
+    for i in 0..<out.runtimeTargets.len:
+        var matched: bool = false
+        for j in 0..<out.providedTargets.len:
+            if out.providedTargets[j] == out.runtimeTargets[i]:
+                matched = true
+                break
+        if !matched:
+            add(out.unresolvedTargets, out.runtimeTargets[i])
+            add(out.unresolvedSymbols, runtimeTargetSymbolName(targetTriple, out.runtimeTargets[i]))
+    var lines: str[]
+    lines = []
+    add(lines, "native_link_plan_version=" + out.version)
+    add(lines, "module_kind=" + out.moduleKind)
+    add(lines, "emit=" + out.emitKind)
+    add(lines, "target=" + out.targetTriple)
+    add(lines, "obj_format=" + out.objFormat)
+    add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
+    for i in 0..<out.providerModules.len:
+        add(lines, "provider_module." + intToStr(i) + "=" + out.providerModules[i])
+    add(lines, "runtime_target_count=" + intToStr(out.runtimeTargets.len))
+    for i in 0..<out.runtimeTargets.len:
+        add(lines, "runtime_target." + intToStr(i) + ".name=" + out.runtimeTargets[i])
+        add(lines, "runtime_target." + intToStr(i) + ".symbol=" + out.runtimeSymbols[i])
+    add(lines, "provided_target_count=" + intToStr(out.providedTargets.len))
+    for i in 0..<out.providedTargets.len:
+        add(lines, "provided_target." + intToStr(i) + ".name=" + out.providedTargets[i])
+        add(lines, "provided_target." + intToStr(i) + ".symbol=" + out.providedSymbols[i])
+    add(lines, "unresolved_target_count=" + intToStr(out.unresolvedTargets.len))
+    for i in 0..<out.unresolvedTargets.len:
+        add(lines, "unresolved_target." + intToStr(i) + ".name=" + out.unresolvedTargets[i])
+        add(lines, "unresolved_target." + intToStr(i) + ".symbol=" + out.unresolvedSymbols[i])
+    out.planText = manifest.joinLines(lines)
+    out.planCid = ident.sha256HexText(out.planText)
+    return out
+
+fn buildUnimakerCompileKeyText(bundle: upipe.UnimakerPipelineBundle,
+                               machineBundle: mpipeline.MachineModuleBundle,
+                               objBundle: oimg.ObjImageBundle,
+                               objFile: ofile.ObjFileBundle,
+                               linkPlan: NativeLinkPlanBundle,
+                               systemLink: slink.SystemLinkPlanBundle,
+                               emitKind: str,
+                               targetTriple: str,
+                               manifestCid: str,
+                               objFormat: str): str =
+    var lines: str[]
+    lines = []
+    add(lines, "emit=" + emitKind)
+    add(lines, "target=" + targetTriple)
+    add(lines, "module_kind=unimaker")
+    add(lines, "pipeline_version=" + bundle.version)
+    add(lines, "manifest_cid=" + manifestCid)
+    add(lines, "obj_format=" + objFormat)
+    add(lines, "machine_pipeline_version=" + machineBundle.version)
+    add(lines, "obj_image_version=" + objBundle.version)
+    add(lines, "obj_file_version=" + objFile.version)
+    add(lines, "native_link_plan_version=" + linkPlan.version)
+    add(lines, "system_link_plan_version=" + systemLink.version)
+    add(lines, "machine_architecture=" + machineBundle.architecture)
+    add(lines, "machine_text_section=" + machineBundle.textSectionName)
+    add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
+    add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
+    add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
+    add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
+    add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
+    add(lines, "system_link_output_kind=" + systemLink.outputKind)
+    add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
+    add(lines, "system_link_entry_required=" + if systemLink.entryRequired: "1" else: "0")
+    add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
+    add(lines, "system_link_provider_count=" + intToStr(systemLink.providerModules.len))
+    var providerSymbolIdx: int32 = 0
+    for i in 0..<systemLink.providerModules.len:
+        add(lines, "system_link.provider." + intToStr(i) + ".module=" + systemLink.providerModules[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".source_path=" + systemLink.providerSourcePaths[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".source_kind=" + systemLink.providerSourceKinds[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".compile_mode=" + systemLink.providerCompileModes[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".manifest_cid=" + systemLink.providerManifestCids[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".execution_model=" + systemLink.providerExecutionModels[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".trace_symbol=" + systemLink.providerTraceSymbols[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".provider_symbol_count=" + intToStr(systemLink.providerSymbolCounts[i]))
+        for j in 0..<systemLink.providerSymbolCounts[i]:
+            add(lines,
+                "system_link.provider." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
+                systemLink.providerSymbolsFlat[providerSymbolIdx])
+            providerSymbolIdx = providerSymbolIdx + 1
+        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_cid=" + systemLink.providerObjFileCids[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_byte_count=" + intToStr(systemLink.providerObjFileByteCounts[i]))
+    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    for i in 0..<systemLink.missingReasons.len:
+        add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
+    add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
+    add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+    for i in 0..<linkPlan.providerModules.len:
+        add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
+    for i in 0..<linkPlan.runtimeTargets.len:
+        add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
+    add(lines, "unimaker_entry_count=" + intToStr(bundle.lowPlan.declIds.len))
+    for i in 0..<bundle.lowPlan.declIds.len:
+        add(lines, "unimaker.entry." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".effect=" + bundle.lowPlan.effectClasses[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".network_mode=" + bundle.lowPlan.networkModes[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".capability=" + bundle.lowPlan.capabilityKinds[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".domain=" + bundle.lowPlan.networkDomains[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".topology_ref=" + bundle.lowPlan.topologyRefs[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".transport=" + bundle.lowPlan.transportModes[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".repair=" + bundle.lowPlan.repairModes[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".dispersal=" + bundle.lowPlan.dispersalModes[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".priority=" + bundle.lowPlan.priorityClasses[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".identity=" + bundle.lowPlan.identityScopes[i])
+        add(lines, "unimaker.entry." + intToStr(i) + ".signature=" + bundle.lowPlan.antiEntropySignatureKinds[i])
+    return manifest.joinLines(lines)
+
+fn buildNetworkCompileKeyText(bundle: npipe.NetworkDistributionPipelineBundle,
+                              machineBundle: mpipeline.MachineModuleBundle,
+                              objBundle: oimg.ObjImageBundle,
+                              objFile: ofile.ObjFileBundle,
+                              linkPlan: NativeLinkPlanBundle,
+                              systemLink: slink.SystemLinkPlanBundle,
+                              moduleKind: str,
+                              emitKind: str,
+                              targetTriple: str,
+                              manifestCid: str,
+                              objFormat: str): str =
+    var lines: str[]
+    lines = []
+    add(lines, "emit=" + emitKind)
+    add(lines, "target=" + targetTriple)
+    add(lines, "module_kind=" + moduleKind)
+    add(lines, "pipeline_version=" + bundle.version)
+    add(lines, "manifest_cid=" + manifestCid)
+    add(lines, "obj_format=" + objFormat)
+    add(lines, "machine_pipeline_version=" + machineBundle.version)
+    add(lines, "obj_image_version=" + objBundle.version)
+    add(lines, "obj_file_version=" + objFile.version)
+    add(lines, "native_link_plan_version=" + linkPlan.version)
+    add(lines, "system_link_plan_version=" + systemLink.version)
+    add(lines, "machine_architecture=" + machineBundle.architecture)
+    add(lines, "machine_text_section=" + machineBundle.textSectionName)
+    add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
+    add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
+    add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
+    add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
+    add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
+    add(lines, "system_link_output_kind=" + systemLink.outputKind)
+    add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
+    add(lines, "system_link_entry_required=" + if systemLink.entryRequired: "1" else: "0")
+    add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
+    add(lines, "system_link_provider_count=" + intToStr(systemLink.providerModules.len))
+    var providerSymbolIdx: int32 = 0
+    for i in 0..<systemLink.providerModules.len:
+        add(lines, "system_link.provider." + intToStr(i) + ".module=" + systemLink.providerModules[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".source_path=" + systemLink.providerSourcePaths[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".source_kind=" + systemLink.providerSourceKinds[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".compile_mode=" + systemLink.providerCompileModes[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".manifest_cid=" + systemLink.providerManifestCids[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".execution_model=" + systemLink.providerExecutionModels[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".trace_symbol=" + systemLink.providerTraceSymbols[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".provider_symbol_count=" + intToStr(systemLink.providerSymbolCounts[i]))
+        for j in 0..<systemLink.providerSymbolCounts[i]:
+            add(lines,
+                "system_link.provider." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
+                systemLink.providerSymbolsFlat[providerSymbolIdx])
+            providerSymbolIdx = providerSymbolIdx + 1
+        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_cid=" + systemLink.providerObjFileCids[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_byte_count=" + intToStr(systemLink.providerObjFileByteCounts[i]))
+    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    for i in 0..<systemLink.missingReasons.len:
+        add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
+    add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
+    add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+    for i in 0..<linkPlan.providerModules.len:
+        add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
+    for i in 0..<linkPlan.runtimeTargets.len:
+        add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
+    add(lines, "network_topology_count=" + intToStr(bundle.program.topologies.len))
+    for i in 0..<bundle.program.topologies.len:
+        add(lines, "network.topology." + intToStr(i) + "=" + nsurf.topologyCanonicalForm(bundle.program.topologies[i]))
+    add(lines, "network_entry_count=" + intToStr(bundle.lowPlan.opIds.len))
+    for i in 0..<bundle.lowPlan.opIds.len:
+        let binding = ndident.bindNetworkOpToLsmr(bundle, manifestCid, i)
+        add(lines, "network.entry." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
+        add(lines, "network.entry." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
+        add(lines, "network.entry." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
+        add(lines, "network.entry." + intToStr(i) + ".domain=" + bundle.facts.networkDomains[i])
+        add(lines, "network.entry." + intToStr(i) + ".topology_ref=" + bundle.facts.topologyRefs[i])
+        add(lines, "network.entry." + intToStr(i) + ".topology=" + bundle.lowPlan.topologyCanonicalForms[i])
+        add(lines, "network.entry." + intToStr(i) + ".addressing=" + bundle.lowPlan.addressingModes[i])
+        add(lines, "network.entry." + intToStr(i) + ".depth=" + intToStr(bundle.lowPlan.topologyDepths[i]))
+        add(lines, "network.entry." + intToStr(i) + ".address_binding=" + bundle.lowPlan.addressBindings[i])
+        add(lines, "network.entry." + intToStr(i) + ".distance_metric=" + bundle.lowPlan.distanceMetrics[i])
+        add(lines, "network.entry." + intToStr(i) + ".route_plan_model=" + bundle.lowPlan.routePlanModels[i])
+        add(lines, "network.entry." + intToStr(i) + ".transport=" + bundle.lowPlan.transportModes[i])
+        add(lines, "network.entry." + intToStr(i) + ".repair=" + bundle.lowPlan.repairModes[i])
+        add(lines, "network.entry." + intToStr(i) + ".dispersal=" + bundle.lowPlan.dispersalModes[i])
+        add(lines, "network.entry." + intToStr(i) + ".priority=" + bundle.lowPlan.priorityClasses[i])
+        add(lines, "network.entry." + intToStr(i) + ".identity=" + bundle.lowPlan.identityScopes[i])
+        add(lines, "network.entry." + intToStr(i) + ".signature=" + bundle.lowPlan.antiEntropySignatureKinds[i])
+        add(lines, "network.entry." + intToStr(i) + ".content_cid=" + binding.contentCid)
+        add(lines, "network.entry." + intToStr(i) + ".source_address=" + binding.sourceAddressText)
+        add(lines, "network.entry." + intToStr(i) + ".target_address=" + binding.targetAddressText)
+        add(lines, "network.entry." + intToStr(i) + ".route_plan_cid=" + binding.routePlanCid)
+        add(lines, "network.entry." + intToStr(i) + ".route_path_count=" + intToStr(binding.routePathCount))
+        add(lines, "network.entry." + intToStr(i) + ".total_distance=" + intToStr(binding.totalDistance))
+        for j in 0..<binding.routePathCount:
+            let pattern = "path." + intToStr(j) + "="
+            let start = parser.findText(binding.routePlanText, pattern)
+            if start < 0:
+                panic("v2 release artifact: missing lsmr route path")
+            var stop: int32 = start
+            while stop < len(binding.routePlanText) && binding.routePlanText[stop] != '\n':
+                stop = stop + 1
+            let rawLine = strings.sliceBytes(binding.routePlanText, start, stop - start)
+            add(lines, "network.entry." + intToStr(i) + ".route." + intToStr(j) + "=" +
+                       strings.sliceBytes(rawLine, len(pattern), len(rawLine) - len(pattern)))
+    return manifest.joinLines(lines)
+
+fn buildCompilerCoreCompileKeyText(bundle: cpipe.CompilerCorePipelineBundle,
+                                   machineBundle: mpipeline.MachineModuleBundle,
+                                   objBundle: oimg.ObjImageBundle,
+                                   objFile: ofile.ObjFileBundle,
+                                   linkPlan: NativeLinkPlanBundle,
+                                   systemLink: slink.SystemLinkPlanBundle,
+                                   emitKind: str,
+                                   targetTriple: str,
+                                   manifestCid: str,
+                                   objFormat: str): str =
+    var lines: str[]
+    lines = []
+    add(lines, "emit=" + emitKind)
+    add(lines, "target=" + targetTriple)
+    add(lines, "module_kind=compiler_core")
+    add(lines, "pipeline_version=" + bundle.version)
+    add(lines, "manifest_cid=" + manifestCid)
+    add(lines, "obj_format=" + objFormat)
+    add(lines, "machine_pipeline_version=" + machineBundle.version)
+    add(lines, "obj_image_version=" + objBundle.version)
+    add(lines, "obj_file_version=" + objFile.version)
+    add(lines, "native_link_plan_version=" + linkPlan.version)
+    add(lines, "system_link_plan_version=" + systemLink.version)
+    add(lines, "machine_architecture=" + machineBundle.architecture)
+    add(lines, "machine_text_section=" + machineBundle.textSectionName)
+    add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
+    add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
+    add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
+    add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
+    add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
+    add(lines, "system_link_output_kind=" + systemLink.outputKind)
+    add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
+    add(lines, "system_link_entry_required=" + if systemLink.entryRequired: "1" else: "0")
+    add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
+    add(lines, "system_link_provider_count=" + intToStr(systemLink.providerModules.len))
+    var providerSymbolIdx: int32 = 0
+    for i in 0..<systemLink.providerModules.len:
+        add(lines, "system_link.provider." + intToStr(i) + ".module=" + systemLink.providerModules[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".source_path=" + systemLink.providerSourcePaths[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".source_kind=" + systemLink.providerSourceKinds[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".compile_mode=" + systemLink.providerCompileModes[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".manifest_cid=" + systemLink.providerManifestCids[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".execution_model=" + systemLink.providerExecutionModels[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".trace_symbol=" + systemLink.providerTraceSymbols[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".provider_symbol_count=" + intToStr(systemLink.providerSymbolCounts[i]))
+        for j in 0..<systemLink.providerSymbolCounts[i]:
+            add(lines,
+                "system_link.provider." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
+                systemLink.providerSymbolsFlat[providerSymbolIdx])
+            providerSymbolIdx = providerSymbolIdx + 1
+        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_cid=" + systemLink.providerObjFileCids[i])
+        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_byte_count=" + intToStr(systemLink.providerObjFileByteCounts[i]))
+    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    for i in 0..<systemLink.missingReasons.len:
+        add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
+    add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
+    add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+    for i in 0..<linkPlan.providerModules.len:
+        add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
+    for i in 0..<linkPlan.runtimeTargets.len:
+        add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
+    add(lines, "compiler_core_top_level_count=" + intToStr(bundle.program.topLevelKinds.len))
+    add(lines, "compiler_core_module_count=" + intToStr(bundle.program.modules.len))
+    add(lines, "compiler_core_import_count=" + intToStr(bundle.program.imports.len))
+    add(lines, "compiler_core_type_block_count=" + intToStr(bundle.program.typeBlocks.len))
+    add(lines, "compiler_core_const_count=" + intToStr(bundle.program.constDecls.len))
+    add(lines, "compiler_core_var_count=" + intToStr(bundle.program.varDecls.len))
+    add(lines, "compiler_core_routine_count=" + intToStr(bundle.program.routines.len))
+    for i in 0..<bundle.lowPlan.itemIds.len:
+        add(lines, "compiler_core.item." + intToStr(i) + ".kind=" + bundle.lowPlan.topLevelKinds[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".label=" + bundle.lowPlan.labels[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".effect=" + bundle.lowPlan.effectClasses[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".binding_scope=" + bundle.lowPlan.bindingScopes[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".import_path=" + bundle.lowPlan.importPaths[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".import_alias=" + bundle.lowPlan.importAliases[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".import_category=" + bundle.lowPlan.importCategories[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".body_line_count=" + intToStr(bundle.lowPlan.bodyLineCounts[i]))
+        add(lines, "compiler_core.item." + intToStr(i) + ".ast_ready=" + if bundle.lowPlan.executableAstReady[i]: "1" else: "0")
+        add(lines, "compiler_core.item." + intToStr(i) + ".return_type=" + bundle.lowPlan.returnTypeTexts[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".param_count=" + intToStr(bundle.lowPlan.paramCounts[i]))
+        add(lines, "compiler_core.item." + intToStr(i) + ".local_count=" + intToStr(bundle.lowPlan.localCounts[i]))
+        add(lines, "compiler_core.item." + intToStr(i) + ".stmt_count=" + intToStr(bundle.lowPlan.stmtCounts[i]))
+        add(lines, "compiler_core.item." + intToStr(i) + ".expr_count=" + intToStr(bundle.lowPlan.exprCounts[i]))
+        add(lines, "compiler_core.item." + intToStr(i) + ".exec_op_count=" + intToStr(bundle.lowPlan.routineOpCounts[i]))
+        add(lines, "compiler_core.item." + intToStr(i) + ".exec_op_hash=" + bundle.lowPlan.routineOpHashes[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".signature_hash=" + bundle.lowPlan.signatureHashes[i])
+        add(lines, "compiler_core.item." + intToStr(i) + ".body_hash=" + bundle.lowPlan.bodyHashes[i])
+    return manifest.joinLines(lines)
+
+fn releaseArtifactCompileKeyHasLine(bundle: ReleaseArtifactBundle, line: str): bool =
+    return parser.findText(bundle.compileKeyText, line) >= 0
+
+fn releaseArtifactManifestRoot(sourcePath: str): str =
+    if os.dirExists(sourcePath):
+        return sourcePath
+    let parent = os.parentDir(sourcePath)
+    if len(parent) > 0:
+        return parent
+    return "."
+
+fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): ReleaseArtifactBundle =
+    requireEmitKind(emitKind)
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    let manifestBundle = if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        manifest.resolveCompilerCoreSourceManifest(sourcePath)
+    else:
+        manifest.resolveSourceManifest(releaseArtifactManifestRoot(sourcePath))
+    let machine = mtarget.machineTargetContract()
+    let writer = owriter.objWriterContract()
+    let objFormat = objFormatForTarget(targetTriple)
+    var moduleKind: str = ""
+    var pipelineVersion: str = ""
+    var surfaceCount: int32 = 0
+    var compileKeyText: str = ""
+    var topologyCount: int32 = 0
+    var networkEntryCount: int32 = 0
+    var compilerCoreEntryCount: int32 = 0
+    var machineBundle: mpipeline.MachineModuleBundle
+    var objBundle: oimg.ObjImageBundle
+    var objFile: ofile.ObjFileBundle
+    var linkPlan: NativeLinkPlanBundle
+    var systemLink: slink.SystemLinkPlanBundle
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        let bundle = npipe.compileNetworkDistributionProgram(parsed.networkProgram)
+        moduleKind = if parsed.networkProgram.ops.len > 0: "network_distribution" else: "topology"
+        pipelineVersion = bundle.version
+        surfaceCount = bundle.program.topologies.len + bundle.program.ops.len
+        topologyCount = bundle.program.topologies.len
+        networkEntryCount = bundle.lowPlan.opIds.len
+        machineBundle = mpipeline.lowerNetworkDistributionPlanToMachine(bundle.lowPlan, targetTriple)
+        objBundle = oimg.writeObjImage(machineBundle)
+        objFile = ofile.buildObjFile(machineBundle)
+        linkPlan = buildNativeLinkPlan(machineBundle, emitKind, targetTriple)
+        if linkPlan.unresolvedTargets.len > 0:
+            panic("v2 release artifact: unresolved native link closure for " + moduleKind)
+        systemLink = slink.buildSystemLinkPlan(machineBundle,
+                                               objFile,
+                                               emitKind,
+                                               linkPlan.providerModules,
+                                               [],
+                                               [],
+                                               [])
+        compileKeyText = buildNetworkCompileKeyText(bundle,
+                                                    machineBundle,
+                                                    objBundle,
+                                                    objFile,
+                                                    linkPlan,
+                                                    systemLink,
+                                                    moduleKind,
+                                                    emitKind,
+                                                    targetTriple,
+                                                    manifestBundle.manifestCid,
+                                                    objFormat)
+    elif parsed.unimakerProgram.decls.len > 0:
+        let bundle = upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram)
+        moduleKind = "unimaker"
+        pipelineVersion = bundle.version
+        surfaceCount = bundle.program.decls.len
+        machineBundle = mpipeline.lowerUnimakerPlanToMachine(bundle.lowPlan, targetTriple)
+        objBundle = oimg.writeObjImage(machineBundle)
+        objFile = ofile.buildObjFile(machineBundle)
+        linkPlan = buildNativeLinkPlan(machineBundle, emitKind, targetTriple)
+        if linkPlan.unresolvedTargets.len > 0:
+            panic("v2 release artifact: unresolved native link closure for " + moduleKind)
+        systemLink = slink.buildSystemLinkPlan(machineBundle,
+                                               objFile,
+                                               emitKind,
+                                               linkPlan.providerModules,
+                                               [],
+                                               [],
+                                               [])
+        compileKeyText = buildUnimakerCompileKeyText(bundle,
+                                                     machineBundle,
+                                                     objBundle,
+                                                     objFile,
+                                                     linkPlan,
+                                                     systemLink,
+                                                     emitKind,
+                                                     targetTriple,
+                                                     manifestBundle.manifestCid,
+                                                     objFormat)
+    elif parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        let bundle = cpipe.compileCompilerCoreSourceClosure(sourcePath)
+        moduleKind = "compiler_core"
+        pipelineVersion = bundle.version
+        surfaceCount = bundle.program.topLevelKinds.len
+        compilerCoreEntryCount = bundle.lowPlan.itemIds.len
+        machineBundle = mpipeline.lowerCompilerCorePlanToMachine(bundle.lowPlan, targetTriple)
+        objBundle = oimg.writeObjImage(machineBundle)
+        objFile = ofile.buildObjFile(machineBundle)
+        linkPlan = buildNativeLinkPlan(machineBundle, emitKind, targetTriple)
+        if linkPlan.unresolvedTargets.len > 0:
+            panic("v2 release artifact: unresolved native link closure for " + moduleKind)
+        systemLink = slink.buildSystemLinkPlan(machineBundle,
+                                               objFile,
+                                               emitKind,
+                                               linkPlan.providerModules,
+                                               bundle.lowPlan.itemIds,
+                                               bundle.lowPlan.canonicalOps,
+                                               bundle.lowPlan.labels)
+        compileKeyText = buildCompilerCoreCompileKeyText(bundle,
+                                                         machineBundle,
+                                                         objBundle,
+                                                         objFile,
+                                                         linkPlan,
+                                                         systemLink,
+                                                         emitKind,
+                                                         targetTriple,
+                                                         manifestBundle.manifestCid,
+                                                         objFormat)
+    else:
+        panic("v2 release artifact: no supported surface in " + sourcePath)
+    let compileKey = ident.sha256HexText(compileKeyText)
+    var lines: str[]
+    lines = []
+    add(lines, "artifact_version=" + releaseArtifactVersion())
+    add(lines, "source=" + sourcePath)
+    add(lines, "emit=" + emitKind)
+    add(lines, "target=" + targetTriple)
+    add(lines, "module_kind=" + moduleKind)
+    add(lines, "pipeline_version=" + pipelineVersion)
+    add(lines, "surface_count=" + intToStr(surfaceCount))
+    add(lines, "machine_version=" + machine.version)
+    add(lines, "machine_pipeline_version=" + machineBundle.version)
+    add(lines, "obj_writer_version=" + writer.version)
+    add(lines, "obj_image_version=" + objBundle.version)
+    add(lines, "obj_file_version=" + objFile.version)
+    add(lines, "obj_format=" + objFormat)
+    add(lines, "manifest_cid=" + manifestBundle.manifestCid)
+    add(lines, "compile_key=" + compileKey)
+    add(lines, "obj_image_cid=" + objBundle.imageCid)
+    add(lines, "obj_file_cid=" + objFile.fileCid)
+    add(lines, "obj_file_byte_count=" + intToStr(objFile.fileByteCount))
+    add(lines, "obj_section_count=" + intToStr(objBundle.sectionNames.len))
+    add(lines, "obj_symbol_count=" + intToStr(objBundle.symbolNames.len))
+    add(lines, "obj_reloc_count=" + intToStr(objBundle.relocationOffsets.len))
+    add(lines, "link_plan_version=" + linkPlan.version)
+    add(lines, "link_plan_cid=" + linkPlan.planCid)
+    add(lines, "system_link_plan_version=" + systemLink.version)
+    add(lines, "system_link_plan_cid=" + systemLink.planCid)
+    add(lines, "runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+    add(lines, "runtime_unresolved_count=" + intToStr(linkPlan.unresolvedTargets.len))
+    add(lines, "native_link_closure_ok=" + if linkPlan.unresolvedTargets.len == 0: "1" else: "0")
+    add(lines, "system_link_ready=" + if systemLink.missingReasons.len == 0: "1" else: "0")
+    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    if moduleKind == "network_distribution" || moduleKind == "topology":
+        add(lines, "topology_count=" + intToStr(topologyCount))
+        add(lines, "network_entry_count=" + intToStr(networkEntryCount))
+    elif moduleKind == "compiler_core":
+        add(lines, "compiler_core_entry_count=" + intToStr(compilerCoreEntryCount))
+    else:
+        add(lines, "unimaker_entry_count=" + intToStr(surfaceCount))
+    var out: ReleaseArtifactBundle
+    out.version = releaseArtifactVersion()
+    out.sourcePath = sourcePath
+    out.emitKind = emitKind
+    out.targetTriple = targetTriple
+    out.moduleKind = moduleKind
+    out.machineVersion = machine.version
+    out.machinePipelineVersion = machineBundle.version
+    out.objWriterVersion = writer.version
+    out.objImageVersion = objBundle.version
+    out.objFileVersion = objFile.version
+    out.objFormat = objFormat
+    out.manifestCid = manifestBundle.manifestCid
+    out.compileKey = compileKey
+    out.compileKeyText = compileKeyText
+    out.objImageCid = objBundle.imageCid
+    out.objFileCid = objFile.fileCid
+    out.objFileByteCount = objFile.fileByteCount
+    out.objSectionCount = objBundle.sectionNames.len
+    out.objSymbolCount = objBundle.symbolNames.len
+    out.objRelocCount = objBundle.relocationOffsets.len
+    out.linkPlanVersion = linkPlan.version
+    out.linkPlanCid = linkPlan.planCid
+    out.systemLinkPlanVersion = systemLink.version
+    out.systemLinkPlanCid = systemLink.planCid
+    out.runtimeTargetCount = linkPlan.runtimeTargets.len
+    out.runtimeUnresolvedCount = linkPlan.unresolvedTargets.len
+    out.nativeLinkClosureOk = linkPlan.unresolvedTargets.len == 0
+    out.systemLinkReady = systemLink.missingReasons.len == 0
+    out.systemLinkMissingReasonCount = systemLink.missingReasons.len
+    out.topologyCount = topologyCount
+    out.networkEntryCount = networkEntryCount
+    out.compilerCoreEntryCount = compilerCoreEntryCount
+    out.systemLinkPlanText = systemLink.planText
+    out.artifactText = manifest.joinLines(lines)
+    return out

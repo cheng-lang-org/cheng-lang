@@ -1,0 +1,302 @@
+import std/os
+import std/strutils as strutils
+import std/strings as strings
+import std/system
+import compiler/driver/identity_v2 as ident
+import compiler/frontend/v2_source_parser as parser
+import compiler/frontend/network_distribution_surface_ir_v2 as nsurf
+
+type
+    SourceManifestBundle =
+        version: str
+        rootPath: str
+        packageId: str
+        filePaths: str[]
+        fileCids: str[]
+        fileTopologyRefs: str[]
+        topologyCanonicalForms: str[]
+        manifestText: str
+        manifestCid: str
+
+fn sourceManifestVersion(): str =
+    return "v2.source_manifest.v1"
+
+fn createDirAll(path: str) =
+    if len(path) == 0 || os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if len(parent) > 0 && parent != path:
+        createDirAll(parent)
+    if !os.dirExists(path):
+        os.createDir(path)
+
+fn shouldIncludeSourcePath(relPath: str): bool =
+    return relPath == "cheng-package.toml" || strings.hasSuffix(relPath, ".cheng")
+
+fn ensureChengExt(path: str): str =
+    if strings.hasSuffix(path, ".cheng"):
+        return path
+    return path + ".cheng"
+
+fn currentPathProbe(path: str): str =
+    let abs = os.absolutePath(path)
+    if os.dirExists(abs):
+        return abs
+    return os.parentDir(abs)
+
+fn findNearestPackageRoot(path: str): str =
+    var probe = currentPathProbe(path)
+    while len(probe) > 0:
+        if os.fileExists(os.joinPath(probe, "cheng-package.toml")):
+            return probe
+        let parent = os.parentDir(probe)
+        if len(parent) == 0 || parent == probe:
+            break
+        probe = parent
+    return ""
+
+fn findWorkspaceRoot(path: str): str =
+    var probe = currentPathProbe(path)
+    while len(probe) > 0:
+        if os.fileExists(os.joinPath(probe, "src/std/system.cheng")):
+            return probe
+        let parent = os.parentDir(probe)
+        if len(parent) == 0 || parent == probe:
+            break
+        probe = parent
+    return ""
+
+fn packageNameFromId(packageId: str): str =
+    let slashIdx = parser.findLastChar(packageId, '/')
+    if slashIdx < 0 || slashIdx + 1 >= len(packageId):
+        return ""
+    return strings.sliceBytes(packageId, slashIdx + 1, len(packageId) - slashIdx - 1)
+
+fn normalizeModulePath(modulePath: str): str =
+    if strutils.startsWith(modulePath, "cheng/") && len(modulePath) > len("cheng/"):
+        return strings.sliceBytes(modulePath, len("cheng/"), len(modulePath) - len("cheng/"))
+    return modulePath
+
+fn collectTopLevelImportPaths(path: str): str[] =
+    var out: str[]
+    out = []
+    let lines = strutils.split(os.readFile(path), '\n')
+    for i in 0..<lines.len:
+        let rawLine = lines[i]
+        if parser.leadingIndentWidth(rawLine) > 0:
+            continue
+        let line = strutils.strip(rawLine)
+        if len(line) == 0 || strutils.startsWith(line, "//") || strutils.startsWith(line, "#"):
+            continue
+        if strutils.startsWith(line, "import "):
+            ident.appendUnique(out, parser.parseCompilerImportLine(line).modulePath)
+    ident.sortStrings(out)
+    return out
+
+fn hasString(values: str[], target: str): bool =
+    for i in 0..<values.len:
+        if values[i] == target:
+            return true
+    return false
+
+fn resolveCompilerCoreImportPath(modulePath: str,
+                                 packageRoot: str,
+                                 workspaceRoot: str,
+                                 packageId: str): str =
+    let normalized = normalizeModulePath(modulePath)
+    if len(normalized) == 0:
+        panic("v2 source manifest: empty compiler_core import path")
+    if strutils.startsWith(normalized, "std/"):
+        let rel = strings.sliceBytes(normalized, len("std/"), len(normalized) - len("std/"))
+        let candidate = os.joinPath(os.joinPath(workspaceRoot, "src/std"), ensureChengExt(rel))
+        if os.fileExists(candidate):
+            return candidate
+        panic("v2 source manifest: missing std import " + normalized)
+    var packageLocal = normalized
+    let packageName = packageNameFromId(packageId)
+    if len(packageName) > 0 && strutils.startsWith(normalized, packageName + "/"):
+        packageLocal = strings.sliceBytes(normalized, len(packageName) + 1, len(normalized) - len(packageName) - 1)
+    if len(packageRoot) > 0:
+        let packageCandidate = os.joinPath(os.joinPath(packageRoot, "src"), ensureChengExt(packageLocal))
+        if os.fileExists(packageCandidate):
+            return packageCandidate
+    let workspaceCandidate = os.joinPath(os.joinPath(workspaceRoot, "src"), ensureChengExt(normalized))
+    if os.fileExists(workspaceCandidate):
+        return workspaceCandidate
+    panic("v2 source manifest: unresolved compiler_core import " + modulePath)
+
+fn collectCompilerCoreClosurePaths(entryPath: str): str[] =
+    let entryAbs = os.absolutePath(entryPath)
+    if !os.fileExists(entryAbs):
+        panic("v2 source manifest: missing entry source " + entryPath)
+    let packageRoot = findNearestPackageRoot(entryAbs)
+    if len(packageRoot) == 0:
+        panic("v2 source manifest: missing package root for " + entryPath)
+    let workspaceRoot = findWorkspaceRoot(entryAbs)
+    if len(workspaceRoot) == 0:
+        panic("v2 source manifest: missing workspace root for " + entryPath)
+    let packageId = parsePackageId(packageRoot)
+    var out: str[]
+    out = []
+    var queue: str[]
+    queue = []
+    ident.appendUnique(out, entryAbs)
+    add(queue, entryAbs)
+    let packageManifest = os.joinPath(packageRoot, "cheng-package.toml")
+    if os.fileExists(packageManifest):
+        ident.appendUnique(out, packageManifest)
+    var idx: int32 = 0
+    while idx < queue.len:
+        let current = queue[idx]
+        idx = idx + 1
+        let imports = collectTopLevelImportPaths(current)
+        for i in 0..<imports.len:
+            let resolved = resolveCompilerCoreImportPath(imports[i], packageRoot, workspaceRoot, packageId)
+            if hasString(out, resolved):
+                continue
+            ident.appendUnique(out, resolved)
+            add(queue, resolved)
+    ident.sortStrings(out)
+    return out
+
+fn parsePackageId(rootPath: str): str =
+    let manifestPath = if os.dirExists(rootPath): os.joinPath(rootPath, "cheng-package.toml") else: os.joinPath(os.parentDir(rootPath), "cheng-package.toml")
+    if !os.fileExists(manifestPath):
+        return "pkg://cheng/v2"
+    let lines = strutils.split(os.readFile(manifestPath), '\n')
+    for i in 0..<lines.len:
+        let line = strutils.strip(lines[i])
+        if strutils.startsWith(line, "package_id"):
+            let eqIdx = parser.findChar(line, '=')
+            if eqIdx < 0:
+                continue
+            var value = strutils.strip(strings.sliceBytes(line, eqIdx + 1, len(line) - eqIdx - 1))
+            if len(value) >= 2 && value[0] == '"' && value[len(value) - 1] == '"':
+                value = strings.sliceBytes(value, 1, len(value) - 2)
+            return value
+    return "pkg://cheng/v2"
+
+fn joinLines(lines: str[]): str =
+    return strutils.join(lines, "\n")
+
+fn topologyRefsForParsed(parsed: parser.ParsedV2Source): str =
+    var refs: str[]
+    refs = []
+    for i in 0..<parsed.networkProgram.topologies.len:
+        ident.appendUnique(refs, parsed.networkProgram.topologies[i].name)
+    ident.sortStrings(refs)
+    return strutils.join(refs, ";")
+
+fn topologyCanonicalFormsForParsed(parsed: parser.ParsedV2Source): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<parsed.networkProgram.topologies.len:
+        ident.appendUnique(out, nsurf.topologyCanonicalForm(parsed.networkProgram.topologies[i]))
+    ident.sortStrings(out)
+    return out
+
+fn collectSourcePaths(rootPath: str): str[] =
+    var out: str[]
+    out = []
+    if os.dirExists(rootPath):
+        let files = os.walkDirRec(rootPath)
+        for i in 0..<files.len:
+            let rel = os.relativePath(files[i], rootPath)
+            if shouldIncludeSourcePath(rel):
+                add(out, files[i])
+        let packagePath = os.joinPath(rootPath, "cheng-package.toml")
+        if os.fileExists(packagePath):
+            ident.appendUnique(out, packagePath)
+    elif os.fileExists(rootPath):
+        add(out, rootPath)
+        let parentPackage = os.joinPath(os.parentDir(rootPath), "cheng-package.toml")
+        if os.fileExists(parentPackage):
+            ident.appendUnique(out, parentPackage)
+    ident.sortStrings(out)
+    return out
+
+fn tryParseManifestSurfaceFile(path: str, out: var parser.ParsedV2Source): bool =
+    var parsed = parser.newParsedV2Source(path)
+    let lines = strutils.split(os.readFile(path), '\n')
+    var hadRecognized: bool = false
+    for i in 0..<lines.len:
+        let line = strutils.strip(lines[i])
+        if len(line) == 0 || strutils.startsWith(line, "//") || strutils.startsWith(line, "#"):
+            continue
+        if parser.parseUnimakerLine(parsed.unimakerProgram, line):
+            ident.appendUnique(parsed.surfaceKinds, "unimaker")
+            hadRecognized = true
+            continue
+        if parser.parseTopologyLine(parsed.networkProgram, line):
+            ident.appendUnique(parsed.surfaceKinds, "topology")
+            hadRecognized = true
+            continue
+        if parser.parseNetworkOpLine(parsed.networkProgram, line):
+            ident.appendUnique(parsed.surfaceKinds, "network_distribution")
+            hadRecognized = true
+            continue
+        if hadRecognized:
+            return false
+    if hadRecognized:
+        out = parsed
+        return true
+    return false
+
+fn buildSourceManifestFromPaths(rootPath: str, packageId: str, fullPaths: str[]): SourceManifestBundle =
+    var out: SourceManifestBundle
+    let workspaceRoot = if rootPath == "." && fullPaths.len > 0: findWorkspaceRoot(fullPaths[0]) else: ""
+    out.version = sourceManifestVersion()
+    out.rootPath = rootPath
+    out.packageId = packageId
+    out.filePaths = []
+    out.fileCids = []
+    out.fileTopologyRefs = []
+    out.topologyCanonicalForms = []
+    for i in 0..<fullPaths.len:
+        let rel = if rootPath == ".":
+            os.relativePath(fullPaths[i], workspaceRoot)
+        elif os.dirExists(rootPath):
+            os.relativePath(fullPaths[i], rootPath)
+        else:
+            os.relativePath(fullPaths[i], os.parentDir(rootPath))
+        let cid = ident.sha256HexFile(fullPaths[i])
+        add(out.filePaths, rel)
+        add(out.fileCids, cid)
+        var parsed: parser.ParsedV2Source
+        let parseOk = tryParseManifestSurfaceFile(fullPaths[i], parsed)
+        if parseOk && parser.sourceHasRecognizedSurface(parsed):
+            add(out.fileTopologyRefs, topologyRefsForParsed(parsed))
+            let forms = topologyCanonicalFormsForParsed(parsed)
+            for j in 0..<forms.len:
+                ident.appendUnique(out.topologyCanonicalForms, forms[j])
+        else:
+            add(out.fileTopologyRefs, "")
+    ident.sortStrings(out.topologyCanonicalForms)
+    var lines: str[]
+    lines = []
+    add(lines, "source_manifest_version=" + out.version)
+    add(lines, "package_id=" + out.packageId)
+    add(lines, "root=" + out.rootPath)
+    add(lines, "file_count=" + intToStr(out.filePaths.len))
+    for i in 0..<out.filePaths.len:
+        add(lines, "file." + intToStr(i) + ".path=" + out.filePaths[i])
+        add(lines, "file." + intToStr(i) + ".cid=" + out.fileCids[i])
+        add(lines, "file." + intToStr(i) + ".topologies=" + out.fileTopologyRefs[i])
+    add(lines, "topology_count=" + intToStr(out.topologyCanonicalForms.len))
+    for i in 0..<out.topologyCanonicalForms.len:
+        add(lines, "topology." + intToStr(i) + "=" + out.topologyCanonicalForms[i])
+    out.manifestText = joinLines(lines)
+    out.manifestCid = ident.sha256HexText(out.manifestText)
+    return out
+
+fn resolveSourceManifest(rootPath: str): SourceManifestBundle =
+    let fullPaths = collectSourcePaths(rootPath)
+    return buildSourceManifestFromPaths(rootPath, parsePackageId(rootPath), fullPaths)
+
+fn resolveCompilerCoreSourceManifest(entryPath: str): SourceManifestBundle =
+    let entryAbs = os.absolutePath(entryPath)
+    let packageRoot = findNearestPackageRoot(entryAbs)
+    if len(packageRoot) == 0:
+        panic("v2 source manifest: missing package root for " + entryPath)
+    let fullPaths = collectCompilerCoreClosurePaths(entryAbs)
+    return buildSourceManifestFromPaths(".", parsePackageId(packageRoot), fullPaths)

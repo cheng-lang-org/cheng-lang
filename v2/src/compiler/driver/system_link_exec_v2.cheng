@@ -1,0 +1,403 @@
+import std/seqs
+import std/os
+import std/strings as strings
+import std/bytes
+import std/rawbytes as rawbytes
+import std/crypto/sha256 as sha256
+import compiler/frontend/v2_source_parser as parser
+import compiler/driver/manifest_resolver_v2 as mresolve
+import compiler/driver/release_artifact_v2 as rart
+import compiler/driver/system_link_plan_v2 as slink
+import compiler/driver/runtime_provider_object_v2 as rpobj
+import compiler/machine/target_contract as mtarget
+import compiler/machine/machine_pipeline_v2 as mpipeline
+import compiler/obj/obj_file_v2 as ofile
+import compiler/driver/compiler_core_pipeline_v2 as cpipe
+import compiler/driver/unimaker_pipeline_v2 as upipe
+import compiler/driver/network_distribution_pipeline_v2 as npipe
+
+type
+    NativeSupportObjectBundle =
+        fileCid: str
+        fileByteCount: int32
+    SystemLinkExecBundle =
+        version: str
+        sourcePath: str
+        emitKind: str
+        targetTriple: str
+        moduleKind: str
+        linkerFlavor: str
+        linkerPath: str
+        sdkName: str
+        systemLibraries: str[]
+        outputPath: str
+        primaryObjPath: str
+        primaryObjFileCid: str
+        primaryObjFileByteCount: int32
+        providerModules: str[]
+        providerObjPaths: str[]
+        providerObjFileCids: str[]
+        providerObjFileByteCounts: int32[]
+        supportObjPaths: str[]
+        supportObjFileCids: str[]
+        supportObjFileByteCounts: int32[]
+        entryRequired: bool
+        entrySymbol: str
+        exitCode: int32
+        outputPresent: bool
+        outputByteCount: int32
+        outputFileCid: str
+        linkOutput: str
+        reportText: str
+
+fn systemLinkExecVersion(): str =
+    return "v2.system_link_exec.v1"
+
+fn createDirAll(path: str) =
+    if len(path) == 0 || os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if len(parent) > 0 && parent != path:
+        createDirAll(parent)
+    if !os.dirExists(path):
+        os.createDir(path)
+
+fn ensureParentDir(path: str) =
+    let parent = os.parentDir(path)
+    if len(parent) > 0:
+        createDirAll(parent)
+
+fn trimTrailingNewlines(text: str): str =
+    var out = text
+    while len(out) > 0:
+        let last = out[len(out) - 1]
+        if last != '\n' && last != '\r':
+            break
+        out = strings.sliceBytes(out, 0, len(out) - 1)
+    return out
+
+fn normalizePathForReport(path: str): str =
+    let base = os.splitFile(path)
+    return if len(base.name) > 0: base.name else: path
+
+fn sha256HexByteBuffer(buf: bytes.ByteBuffer): str =
+    if buf.data == nil || buf.len <= 0:
+        return rawbytes.bytesToHex(sha256.sha256Digest(rawbytes.emptyBytes()))
+    return rawbytes.bytesToHex(sha256.sha256Digest(rawbytes.Bytes(data: buf.data, len: buf.len)))
+
+fn readFileSha256Hex(path: str): str =
+    if !os.fileExists(path):
+        return ""
+    return sha256HexByteBuffer(bytes.readFileBytes(path))
+
+fn extractLineValue(text: str, key: str): str =
+    let prefix = key + "="
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= len(text):
+        if i == len(text) || text[i] == '\n':
+            let line = strings.sliceBytes(text, start, i - start)
+            if len(line) >= len(prefix) && strings.sliceBytes(line, 0, len(prefix)) == prefix:
+                return strings.sliceBytes(line, len(prefix), len(line) - len(prefix))
+            start = i + 1
+        i = i + 1
+    return ""
+
+fn buildMachineBundleFromSource(sourcePath: str, targetTriple: str): mpipeline.MachineModuleBundle =
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        let bundle = npipe.compileNetworkDistributionProgram(parsed.networkProgram)
+        return mpipeline.lowerNetworkDistributionPlanToMachine(bundle.lowPlan, targetTriple)
+    if parsed.unimakerProgram.decls.len > 0:
+        let bundle = upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram)
+        return mpipeline.lowerUnimakerPlanToMachine(bundle.lowPlan, targetTriple)
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        let bundle = cpipe.compileCompilerCoreSourceClosure(sourcePath)
+        return mpipeline.lowerCompilerCorePlanToMachine(bundle.lowPlan, targetTriple)
+    panic("v2 system link exec: no supported surface in " + sourcePath)
+
+fn systemLinkerPath(linkerFlavor: str): str =
+    if linkerFlavor == "ld64" || linkerFlavor == "lld":
+        return "/usr/bin/ld"
+    if linkerFlavor == "libtool" || linkerFlavor == "llvm-ar":
+        return "/usr/bin/libtool"
+    panic("v2 system link exec: unsupported linker flavor " + linkerFlavor)
+
+fn compilerCoreNativeSupportSources(): str[] =
+    return ["src/runtime/native/system_helpers_stdio_bridge.c",
+            "src/runtime/native/system_helpers_epoch_time_bridge.c",
+            "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c"]
+
+fn compileNativeSupportObject(sourcePath: str,
+                              targetTriple: str,
+                              objPath: str): NativeSupportObjectBundle =
+    ensureParentDir(objPath)
+    let ccPath = os.getEnvDefault("CC", "")
+    let compilerFile = len(ccPath) > 0 && !slink.containsSlash(ccPath) ? "/usr/bin/env" :
+                       len(ccPath) > 0 ? ccPath : "/usr/bin/cc"
+    var argv: str[]
+    argv = []
+    if len(ccPath) > 0 && !slink.containsSlash(ccPath):
+        add(argv, ccPath)
+    add(argv, "-std=c11")
+    add(argv, "-O2")
+    add(argv, "-Wall")
+    add(argv, "-Wextra")
+    add(argv, "-pedantic")
+    if targetTriple == "arm64-apple-darwin":
+        add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
+    add(argv, "-c")
+    add(argv, sourcePath)
+    add(argv, "-o")
+    add(argv, objPath)
+    var envOverrides: str[]
+    let res = os.execFileCapture(compilerFile,
+                                 argv,
+                                 envOverrides,
+                                 os.getCurrentDir(),
+                                 true,
+                                 120)
+    if os.execCmdResultExitCode(res) != 0:
+        panic("v2 system link exec: failed to compile native support object\n" +
+              os.execCmdResultOutput(res))
+    let objBytes = bytes.readFileBytes(objPath)
+    var out: NativeSupportObjectBundle
+    out.fileCid = sha256HexByteBuffer(objBytes)
+    out.fileByteCount = objBytes.len
+    return out
+
+fn buildSystemLinkExecArgv(targetTriple: str,
+                           emitKind: str,
+                           linkerFlavor: str,
+                           entrySymbol: str,
+                           entryRequired: bool,
+                           syslibrootPath: str,
+                           outputPath: str,
+                           primaryObjPath: str,
+                           providerObjPaths: str[],
+                           supportObjPaths: str[]): str[] =
+    var argv: str[]
+    argv = []
+    if linkerFlavor == "ld64":
+        add(argv, "-arch")
+        add(argv, mtarget.machineTargetDarwinArchName(targetTriple))
+        add(argv, "-platform_version")
+        add(argv, mtarget.machineTargetDarwinPlatformName(targetTriple))
+        add(argv, mtarget.machineTargetDarwinMinosText(targetTriple))
+        add(argv, mtarget.machineTargetDarwinMinosText(targetTriple))
+        add(argv, "-no_uuid")
+        if emitKind != "static" && len(syslibrootPath) > 0:
+            add(argv, "-syslibroot")
+            add(argv, syslibrootPath)
+            add(argv, "-lSystem")
+        if emitKind == "shared":
+            add(argv, "-dylib")
+        if entryRequired:
+            add(argv, "-e")
+            add(argv, entrySymbol)
+        add(argv, "-o")
+        add(argv, outputPath)
+        add(argv, primaryObjPath)
+        for i in 0..<providerObjPaths.len:
+            add(argv, providerObjPaths[i])
+        for i in 0..<supportObjPaths.len:
+            add(argv, supportObjPaths[i])
+        return argv
+    if linkerFlavor == "libtool":
+        add(argv, "-static")
+        add(argv, "-o")
+        add(argv, outputPath)
+        add(argv, primaryObjPath)
+        for i in 0..<providerObjPaths.len:
+            add(argv, providerObjPaths[i])
+        for i in 0..<supportObjPaths.len:
+            add(argv, supportObjPaths[i])
+        return argv
+    panic("v2 system link exec: unsupported linker flavor " + linkerFlavor)
+
+fn defaultSystemLinkOutput(moduleKind: str, emitKind: str, targetTriple: str): str =
+    return os.joinPath("v2/artifacts/bootstrap",
+                       slink.systemLinkOutputName(moduleKind, emitKind) +
+                       slink.systemLinkOutputSuffix(targetTriple, emitKind))
+
+fn buildSystemLinkExec(sourcePath: str,
+                       emitKind: str,
+                       targetTriple: str,
+                       outputPath: str): SystemLinkExecBundle =
+    let artifact = rart.buildReleaseArtifact(sourcePath, emitKind, targetTriple)
+    let missingReason0 = extractLineValue(artifact.systemLinkPlanText, "missing_reason.0")
+    if artifact.systemLinkReady ||
+       artifact.systemLinkMissingReasonCount != 1 ||
+       missingReason0 != "system_link_execution_missing":
+        panic("v2 system link exec: plan is not ready for execution")
+    let actualOutputPath = len(outputPath) > 0 ?
+        outputPath :
+        defaultSystemLinkOutput(artifact.moduleKind, emitKind, targetTriple)
+    ensureParentDir(actualOutputPath)
+    let primaryObjPath = actualOutputPath + ".primary.o"
+    let machineBundle = buildMachineBundleFromSource(sourcePath, targetTriple)
+    let primaryObj = ofile.buildObjFile(machineBundle)
+    ofile.writeObjFileBinary(primaryObjPath, primaryObj)
+    let nativeLink = rart.buildNativeLinkPlan(machineBundle, emitKind, targetTriple)
+    var providerModules: str[]
+    providerModules = []
+    var providerObjPaths: str[]
+    providerObjPaths = []
+    var providerObjFileCids: str[]
+    providerObjFileCids = []
+    var providerObjFileByteCounts: int32[]
+    providerObjFileByteCounts = []
+    var supportObjPaths: str[]
+    supportObjPaths = []
+    var supportObjFileCids: str[]
+    supportObjFileCids = []
+    var supportObjFileByteCounts: int32[]
+    supportObjFileByteCounts = []
+    for i in 0..<nativeLink.providerModules.len:
+        let provider = rpobj.materializeRuntimeProviderObject(nativeLink.providerModules[i], targetTriple)
+        let providerObjPath = actualOutputPath + ".provider." + intToStr(i) + ".o"
+        os.writeFileBytes(providerObjPath, provider.objFileBytes)
+        add(providerModules, nativeLink.providerModules[i])
+        add(providerObjPaths, providerObjPath)
+        add(providerObjFileCids, provider.objFileCid)
+        add(providerObjFileByteCounts, provider.objFileByteCount)
+    if artifact.moduleKind == "compiler_core":
+        let supportSources = compilerCoreNativeSupportSources()
+        for i in 0..<supportSources.len:
+            let supportObjPath = actualOutputPath + ".support." + intToStr(i) + ".o"
+            let supportObj = compileNativeSupportObject(supportSources[i],
+                                                        targetTriple,
+                                                        supportObjPath)
+            add(supportObjPaths, supportObjPath)
+            add(supportObjFileCids, supportObj.fileCid)
+            add(supportObjFileByteCounts, supportObj.fileByteCount)
+    let linkerFlavor = slink.systemLinkerFlavor(targetTriple, emitKind)
+    let linkerPath = systemLinkerPath(linkerFlavor)
+    var sdkName: str = ""
+    var sdkPath: str = ""
+    var systemLibraries: str[]
+    systemLibraries = []
+    if linkerFlavor == "ld64" && emitKind != "static":
+        sdkName = mtarget.machineTargetDarwinSdkName(targetTriple)
+        var sdkArgv: str[]
+        sdkArgv = []
+        add(sdkArgv, "--sdk")
+        add(sdkArgv, sdkName)
+        add(sdkArgv, "--show-sdk-path")
+        var envOverrides: str[]
+        let sdkRes = os.execFileCapture("/usr/bin/xcrun",
+                                        sdkArgv,
+                                        envOverrides,
+                                        os.getCurrentDir(),
+                                        true,
+                                        30)
+        if os.execCmdResultExitCode(sdkRes) != 0:
+            panic("v2 system link exec: failed to resolve darwin sdk path")
+        sdkPath = trimTrailingNewlines(os.execCmdResultOutput(sdkRes))
+        if len(sdkPath) == 0:
+            panic("v2 system link exec: empty darwin sdk path")
+        add(systemLibraries, "System")
+    let entrySymbol = extractLineValue(artifact.systemLinkPlanText, "entry_symbol")
+    let entryRequired = emitKind == "exe"
+    let argv = buildSystemLinkExecArgv(targetTriple,
+                                       emitKind,
+                                       linkerFlavor,
+                                       entrySymbol,
+                                       entryRequired,
+                                       sdkPath,
+                                       actualOutputPath,
+                                       primaryObjPath,
+                                       providerObjPaths,
+                                       supportObjPaths)
+    var envOverrides: str[]
+    let linkRes = os.execFileCapture(linkerPath,
+                                     argv,
+                                     envOverrides,
+                                     os.getCurrentDir(),
+                                     true,
+                                     120)
+    let outputPresent = os.fileExists(actualOutputPath)
+    let outputByteCount = outputPresent ? int32(os.fileSize(actualOutputPath)) else: 0
+    let outputFileCid = outputPresent ? readFileSha256Hex(actualOutputPath) else: ""
+    var out: SystemLinkExecBundle
+    out.version = systemLinkExecVersion()
+    out.sourcePath = normalizePathForReport(sourcePath)
+    out.emitKind = emitKind
+    out.targetTriple = targetTriple
+    out.moduleKind = artifact.moduleKind
+    out.linkerFlavor = linkerFlavor
+    out.linkerPath = linkerPath
+    out.sdkName = sdkName
+    out.systemLibraries = []
+    for i in 0..<systemLibraries.len:
+        add(out.systemLibraries, systemLibraries[i])
+    out.outputPath = normalizePathForReport(actualOutputPath)
+    out.primaryObjPath = normalizePathForReport(primaryObjPath)
+    out.primaryObjFileCid = primaryObj.fileCid
+    out.primaryObjFileByteCount = primaryObj.fileByteCount
+    out.providerModules = []
+    out.providerObjPaths = []
+    out.providerObjFileCids = []
+    out.providerObjFileByteCounts = []
+    out.supportObjPaths = []
+    out.supportObjFileCids = []
+    out.supportObjFileByteCounts = []
+    for i in 0..<providerModules.len:
+        add(out.providerModules, providerModules[i])
+        add(out.providerObjPaths, normalizePathForReport(providerObjPaths[i]))
+        add(out.providerObjFileCids, providerObjFileCids[i])
+        add(out.providerObjFileByteCounts, providerObjFileByteCounts[i])
+    for i in 0..<supportObjPaths.len:
+        add(out.supportObjPaths, normalizePathForReport(supportObjPaths[i]))
+        add(out.supportObjFileCids, supportObjFileCids[i])
+        add(out.supportObjFileByteCounts, supportObjFileByteCounts[i])
+    out.entryRequired = entryRequired
+    out.entrySymbol = entrySymbol
+    out.exitCode = os.execCmdResultExitCode(linkRes)
+    out.outputPresent = outputPresent
+    out.outputByteCount = outputByteCount
+    out.outputFileCid = outputFileCid
+    out.linkOutput = trimTrailingNewlines(os.execCmdResultOutput(linkRes))
+    var lines: str[]
+    lines = []
+    add(lines, "system_link_exec_version=" + out.version)
+    add(lines, "source=" + out.sourcePath)
+    add(lines, "emit=" + out.emitKind)
+    add(lines, "target=" + out.targetTriple)
+    add(lines, "module_kind=" + out.moduleKind)
+    add(lines, "linker_flavor=" + out.linkerFlavor)
+    add(lines, "linker_path=" + out.linkerPath)
+    if len(out.sdkName) > 0:
+        add(lines, "sdk_name=" + out.sdkName)
+        add(lines, "system_library_count=" + intToStr(out.systemLibraries.len))
+        for i in 0..<out.systemLibraries.len:
+            add(lines, "system_library." + intToStr(i) + "=" + out.systemLibraries[i])
+    add(lines, "output_path=" + out.outputPath)
+    add(lines, "primary_obj_path=" + out.primaryObjPath)
+    add(lines, "primary_obj_file_cid=" + out.primaryObjFileCid)
+    add(lines, "primary_obj_file_byte_count=" + intToStr(out.primaryObjFileByteCount))
+    add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
+    for i in 0..<out.providerModules.len:
+        add(lines, "provider_module." + intToStr(i) + ".name=" + out.providerModules[i])
+        add(lines, "provider_module." + intToStr(i) + ".obj_path=" + out.providerObjPaths[i])
+        add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providerObjFileCids[i])
+        add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providerObjFileByteCounts[i]))
+    add(lines, "support_object_count=" + intToStr(out.supportObjPaths.len))
+    for i in 0..<out.supportObjPaths.len:
+        add(lines, "support_object." + intToStr(i) + ".obj_path=" + out.supportObjPaths[i])
+        add(lines, "support_object." + intToStr(i) + ".obj_file_cid=" + out.supportObjFileCids[i])
+        add(lines, "support_object." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.supportObjFileByteCounts[i]))
+    add(lines, "entry_required=" + if out.entryRequired: "1" else: "0")
+    add(lines, "entry_symbol=" + out.entrySymbol)
+    add(lines, "exit_code=" + intToStr(out.exitCode))
+    add(lines, "output_present=" + if out.outputPresent: "1" else: "0")
+    add(lines, "output_byte_count=" + intToStr(out.outputByteCount))
+    add(lines, "output_file_cid=" + out.outputFileCid)
+    add(lines, "link_ok=" + if out.exitCode == 0 && out.outputPresent: "1" else: "0")
+    if len(out.linkOutput) > 0:
+        add(lines, "link_output=" + out.linkOutput)
+    out.reportText = mresolve.joinLines(lines)
+    return out
+
+fn systemLinkExecOk(bundle: SystemLinkExecBundle): bool =
+    return bundle.exitCode == 0 && bundle.outputPresent

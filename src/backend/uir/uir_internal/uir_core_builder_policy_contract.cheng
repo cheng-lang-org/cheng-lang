@@ -441,7 +441,7 @@ fn uirCoreNativeContractEnsureGasHelper(mod: UirCoreModule, chargeName: str, cou
         return
     let helper: UirCoreFunc = uirCoreNewFunc(chargeName, uirCoreTypeI64())
     uirCoreFuncSetOriginFile(helper, "<native_contract>")
-    uirCoreAddParam(helper, "cost", 0, uirCoreTypeI64())
+    uirCoreAddParamNoTypeKey(helper, "cost", 0, uirCoreTypeI64())
     uirCoreSetLocalType(helper, 1, uirCoreTypeI64())
     uirCoreSetLocalType(helper, 2, uirCoreTypeI64())
     var stmts: UirStmtId[]
@@ -805,9 +805,18 @@ fn uirCoreAstUsesRawSpawnId(nId: AstNodeId, bindNames: var str[], bindRaws: var 
 fn uirCoreFileLikelyUsesRawSpawn(rootId: AstNodeId): bool =
     if !astNodeIdValid(rootId):
         return false
+    let rootKind: NodeKind = astNodeKind(rootId)
     var bindNames: str[]
     var bindRaws: bool[]
     var scopeStarts: int32[]
+    if rootKind == nkModule || rootKind == nkStmtList:
+        for i in 0..<astKidCount(rootId):
+            let kidId: AstNodeId = astKidAt(rootId, i)
+            if astNodeIdValid(kidId) && astNodeKind(kidId) == nkModule:
+                continue
+            if uirCoreAstUsesRawSpawnId(kidId, bindNames, bindRaws, scopeStarts):
+                return true
+        return false
     return uirCoreAstUsesRawSpawnId(rootId, bindNames, bindRaws, scopeStarts)
 
 fn uirCorePathLooksStdModule(path: str): bool =
@@ -892,9 +901,8 @@ fn uirCoreStage1StdNoPointerPrecheckId(rootId: AstNodeId, inPath: str, diags: va
     return uirCoreStage1StdNoPointerPrecheck(rootId, inPath, diags)
 
 fn uirCoreStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Diagnostic[]): bool =
-    # Honor the legacy-named user-surface no-pointer gate before walking
-    # large module ASTs.
-    # build-backend-driver explicitly disables this check during stage0 rebuild.
+    # User-surface no-pointer policy is always on here; compiler-internal
+    # modules are exempted by path instead of public env toggles.
     if !semShouldEnforceNonCAbiNoPointer():
         return false
     var ctx: SemCtx
@@ -903,8 +911,8 @@ fn uirCoreStage1NoPointerNonCAbiPrecheck(root: Node, inPath: str, diags: var Dia
     ctx.filename = inPath
     var hits: int32 = semCheckNoPointerNonCAbiPolicy(ctx, root)
     # Heuristic fallback must use the same scope gate as semantic checks.
-    # Otherwise compiler-internal modules are flagged even when
-    # STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0.
+    # Otherwise compiler-internal modules would be flagged even though the
+    # policy is now path-scoped instead of env-scoped.
     if hits <= 0 &&
        semPointerPolicyShouldCheckNonCAbi(inPath) &&
        uirCoreFileLikelyHasPointerSyntax(inPath):

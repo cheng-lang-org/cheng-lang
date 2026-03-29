@@ -105,6 +105,29 @@ cleanup_backend_exe_sidecar() (
   fi
 )
 
+ensure_chengc_output_exists() {
+  emit_mode="$1"
+  out_path_check="$2"
+  case "$emit_mode" in
+    obj)
+      if [ ! -s "$out_path_check" ]; then
+        echo "[Error] chengc: missing object output: $out_path_check" 1>&2
+        exit 1
+      fi
+      ;;
+    exe)
+      if [ ! -x "$out_path_check" ]; then
+        echo "[Error] chengc: missing executable output: $out_path_check" 1>&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "[Error] chengc: unsupported emit mode for output check: $emit_mode" 1>&2
+      exit 1
+      ;;
+  esac
+}
+
 is_true_flag() {
   case "${1:-}" in
     1|true|TRUE|yes|YES|on|ON)
@@ -223,6 +246,20 @@ normalize_build_track_text() {
       ;;
     *)
       echo "[Error] invalid --build-track:$raw (expected dev|release)" 1>&2
+      exit 2
+      ;;
+  esac
+}
+
+normalize_parse_mode_text() {
+  raw="$1"
+  label="$2"
+  case "$raw" in
+    ""|outline|full)
+      printf '%s\n' "$raw"
+      ;;
+    *)
+      echo "[Error] invalid $label:$raw (expected outline|full)" 1>&2
       exit 2
       ;;
   esac
@@ -826,6 +863,15 @@ if [ "$build_track" = "" ]; then
   build_track="dev"
 fi
 
+backend_parse_mode_env="$(normalize_parse_mode_text "${BACKEND_STAGE1_PARSE_MODE:-}" "BACKEND_STAGE1_PARSE_MODE")"
+if [ "$backend_parse_mode_env" = "" ]; then
+  if [ "$build_track" = "release" ]; then
+    backend_parse_mode_env="full"
+  else
+    backend_parse_mode_env="outline"
+  fi
+fi
+
 if [ "$buildmeta" != "" ]; then
   buildmeta_dir="$(dirname "$buildmeta")"
   if [ "$buildmeta_dir" != "" ] && [ ! -d "$buildmeta_dir" ]; then
@@ -942,6 +988,46 @@ driver_can_run() {
   return 1
 }
 
+driver_is_script_shim() {
+  bin="$1"
+  if [ ! -f "$bin" ]; then
+    return 1
+  fi
+  first_line="$(sed -n '1p' "$bin" 2>/dev/null || true)"
+  case "$first_line" in
+    '#!'*) return 0 ;;
+  esac
+  return 1
+}
+
+driver_current_contract_ok() {
+  bin="$1"
+  if [ ! -x "$bin" ]; then
+    return 1
+  fi
+  if driver_is_script_shim "$bin"; then
+    return 0
+  fi
+  if ! command -v strings >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v rg >/dev/null 2>&1; then
+    return 0
+  fi
+  set +e
+  strings "$bin" 2>/dev/null | rg -q '^BACKEND_OUTPUT$'
+  has_backend_output="$?"
+  strings "$bin" 2>/dev/null | rg -q '^CHENG_BACKEND_OUTPUT$'
+  has_legacy_output="$?"
+  strings "$bin" 2>/dev/null | rg -q 'backend_driver: output path required'
+  has_output_msg="$?"
+  set -e
+  if [ "$has_output_msg" -eq 0 ] && [ "$has_legacy_output" -eq 0 ] && [ "$has_backend_output" -ne 0 ]; then
+    return 1
+  fi
+  return 0
+}
+
 tooling_selfhost_stage0_for_input() {
   input_path="$1"
   case "$input_path" in
@@ -971,6 +1057,18 @@ driver_exec="$driver"
 driver_real_env=""
 if [ "${BACKEND_DRIVER_USE_WRAPPER:-0}" = "1" ]; then
   echo "[chengc] BACKEND_DRIVER_USE_WRAPPER=1 is deprecated; forcing direct driver path" 1>&2
+fi
+if [ ! -x "$driver" ]; then
+  echo "[Error] backend driver not executable: $driver" 1>&2
+  exit 1
+fi
+if ! driver_can_run "$driver"; then
+  echo "[Error] backend driver failed help probe: $driver" 1>&2
+  exit 1
+fi
+if ! driver_current_contract_ok "$driver"; then
+  echo "[Error] backend driver uses rejected legacy CHENG_BACKEND_* contract: $driver" 1>&2
+  exit 1
 fi
 
 backend_emit="exe"
@@ -1058,6 +1156,7 @@ if [ "$backend_sidecar_compiler" = "" ]; then
 fi
 
 backend_sidecar_driver=""
+backend_sidecar_real_driver="${BACKEND_UIR_SIDECAR_REAL_DRIVER:-${TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER:-}}"
 if [ "${BACKEND_DRIVER:-}" = "" ] && [ "$backend_sidecar_mode" = "cheng" ]; then
   backend_sidecar_driver="$(resolve_backend_sidecar_defaults_field driver "$backend_target" 2>/dev/null || true)"
   if [ "$backend_sidecar_driver" != "" ] && [ -x "$backend_sidecar_driver" ]; then
@@ -1069,6 +1168,13 @@ fi
 backend_sidecar_child_mode="$sidecar_child_mode_raw"
 backend_sidecar_outer_companion=""
 if [ "$backend_sidecar_mode" = "cheng" ]; then
+  if [ "$backend_sidecar_real_driver" = "" ]; then
+    backend_sidecar_real_driver="$(resolve_backend_sidecar_defaults_field real_driver "$backend_target" 2>/dev/null || true)"
+  fi
+  if [ "$backend_sidecar_real_driver" = "" ]; then
+    echo "[Error] missing strict fresh Cheng sidecar real driver; set TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER or run verify_backend_sidecar_cheng_fresh" 1>&2
+    exit 1
+  fi
   if [ "$backend_sidecar_child_mode" = "" ]; then
     backend_sidecar_child_mode="$(resolve_backend_sidecar_defaults_field child_mode "$backend_target" 2>/dev/null || true)"
   fi
@@ -1325,9 +1431,13 @@ run_backend_driver() {
     "PATH=$clean_env_path" \
     "HOME=$clean_env_home" \
     "TMPDIR=$clean_env_tmpdir" \
-    "TOOLING_ROOT=$root"
+    "TOOLING_ROOT=$root" \
+    "BACKEND_STAGE1_PARSE_MODE=$backend_parse_mode_env"
   if [ "$driver_real_env" != "" ]; then
     set -- "$@" "$driver_real_env"
+  fi
+  if [ "$backend_sidecar_real_driver" != "" ]; then
+    set -- "$@" "TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER=$backend_sidecar_real_driver"
   fi
   if [ "${PKG_ROOTS:-}" != "" ]; then
     set -- "$@" "PKG_ROOTS=$PKG_ROOTS"
@@ -1428,6 +1538,8 @@ if [ "$build_status" -ne 0 ]; then
   exit "$build_status"
 fi
 
+ensure_chengc_output_exists "$backend_emit" "$out_path"
+
 if [ "$backend_emit" = "exe" ]; then
   cleanup_backend_exe_sidecar "$out_path"
 fi
@@ -1437,6 +1549,7 @@ run_out_path="$out_path"
 if [ "$backend_emit" = "exe" ] && [ "$tooling_selfhost_launcher_requested" = "1" ]; then
   emit_tooling_selfhost_launcher "$tooling_selfhost_launcher_out_path" "$out_path"
   reported_out_path="$tooling_selfhost_launcher_out_path"
+  ensure_chengc_output_exists "exe" "$reported_out_path"
 fi
 
 if [ "$backend_emit" = "obj" ]; then

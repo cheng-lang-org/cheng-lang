@@ -1,0 +1,69 @@
+import backend/tooling/backend_driver_uir_shared
+import backend/uir/uir_types
+
+@importc("driver_c_backend_usage")
+fn driver_c_backend_usage(_dummy: int32): int32
+
+@importc("driver_c_help_requested")
+fn driver_c_help_requested(_dummy: int32): int32
+
+@importc("driver_c_run_default")
+fn driver_c_run_default(_dummy: int32): int32
+
+@exportc("driver_export_prefer_sidecar_builds")
+fn driver_export_prefer_sidecar_builds(_dummy: int32): int32 =
+    # Proof/bootstrap stays on the direct Cheng UIR export surface.
+    return 0
+
+fn driverProofBuildModuleStage1TargetRetainedRaw(path_raw: cstring, target_raw: cstring): ptr =
+    if path_raw == nil:
+        return nil
+    let path: str = strFromCStringBorrow(path_raw)
+    if len(path) == 0:
+        return nil
+    let target: str = strFromCStringBorrow(target_raw)
+    let module: UirModule = uirCoreBuildModuleFromFileStage1OrPanic(path, target)
+    return ptr(module)
+
+fn driverProofEmitObjFromModuleRaw(module_raw: ptr, target_raw: cstring, out_raw: cstring): int32 =
+    if module_raw == nil:
+        return -11
+    if out_raw == nil:
+        return -12
+    let outPath: str = strFromCStringBorrow(out_raw)
+    if len(outPath) == 0:
+        return -12
+    let target: str = strFromCStringBorrow(target_raw)
+    let obj: uint8[] =
+        uirEmitObjFromModuleOrPanic(UirModule(module_raw), driverUirOptLevel(), target, "", false,
+                                    false, 0, "autovec")
+    if len(obj) <= 0:
+        return -13
+    if obj.buffer == nil:
+        return -14
+    return driver_c_write_exact_file(out_raw, obj.buffer, obj.len)
+
+@exportc("driver_export_buildModuleFromFileStage1TargetRetained")
+fn driver_export_buildModuleFromFileStage1TargetRetained(path_raw: cstring, target_raw: cstring): ptr =
+    return driverProofBuildModuleStage1TargetRetainedRaw(path_raw, target_raw)
+
+@exportc("driver_export_buildActiveModulePtrs")
+fn driver_export_buildActiveModulePtrs(path_raw: cstring, target_raw: cstring): ptr =
+    return driverProofBuildModuleStage1TargetRetainedRaw(path_raw, target_raw)
+
+@exportc("driver_export_emit_obj_from_module_default_impl")
+fn driver_export_emit_obj_from_module_default_impl(module_raw: ptr, target_raw: cstring, out_raw: cstring): int32 =
+    return driverProofEmitObjFromModuleRaw(module_raw, target_raw, out_raw)
+
+@exportc("driver_export_build_emit_obj_from_file_stage1_target_impl")
+fn driver_export_build_emit_obj_from_file_stage1_target_impl(path_raw: cstring, target_raw: cstring, out_raw: cstring): int32 =
+    return driverUirBuildEmitObjFromFileStage1Target(path_raw, target_raw, out_raw)
+
+@exportc("backendMain")
+fn backendMain(): int32 =
+    if driver_c_help_requested(0) != 0:
+        return driver_c_backend_usage(0)
+    return driver_c_run_default(0)
+
+fn main(): int32 =
+    return backendMain()

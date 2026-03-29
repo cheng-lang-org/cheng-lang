@@ -3,13 +3,15 @@ import std/seqs
 import std/strings
 import std/hashmaps
 import std/result
-import std/os
 import std/system
 import backend/machine/machine_types
 import backend/obj/cstring_label_support
 import backend/machine/machine_internal/machine_core_types
 import backend/obj/obj_buf
 import backend/obj/aarch64_enc
+
+@importc("getenv")
+fn machoGetEnvRaw(name: cstring): cstring
 
 type
     ByteBuf = uint8[]
@@ -29,6 +31,12 @@ type
 
 var machoDebugMode: int8 = int8(-1)
 var machoStepDebugMode: int8 = int8(-1)
+
+fn machoEnvIsTrue(name: cstring): bool =
+    let raw: cstring = machoGetEnvRaw(name)
+    if raw == nil || c_strlen(raw) == 0:
+        return false
+    return strFromCStringBorrow(raw) == "1"
 
 fn machoMachineCoreFuncNil(value: MachineCoreFunc): bool =
     return int64(uint64(value)) == 0
@@ -252,7 +260,7 @@ fn machoAddCstringSymIfAbsent(syms: MachoSym[],
 
 fn machoDebugEnabled(): bool =
     if machoDebugMode < int8(0):
-        machoDebugMode = macho_strEq(os.getEnvDefault("BACKEND_DEBUG_MACHO", ""), "1") ? int8(1) : int8(0)
+        machoDebugMode = machoEnvIsTrue("BACKEND_DEBUG_MACHO") ? int8(1) : int8(0)
     return machoDebugMode == int8(1)
 
 fn machoDebug(msg: str) =
@@ -261,7 +269,7 @@ fn machoDebug(msg: str) =
 
 fn machoStepDebugEnabled(): bool =
     if machoStepDebugMode < int8(0):
-        machoStepDebugMode = macho_strEq(os.getEnvDefault("BACKEND_DEBUG_MACHO_STEP", ""), "1") ? int8(1) : int8(0)
+        machoStepDebugMode = machoEnvIsTrue("BACKEND_DEBUG_MACHO_STEP") ? int8(1) : int8(0)
     return machoStepDebugMode == int8(1)
 
 fn machoStep(msg: str) =
@@ -437,7 +445,7 @@ fn machoAddSymIndexed(outSyms: MachoSym[], index: var hashmaps.HashMapStrInt,
                       name: str, nType: uint8, nSect: uint8, nValue: uint64,
                       nameOff: uint32): MachoSym[] =
     let stableName: str = machoPersistStr(name)
-    if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" &&
+    if machoEnvIsTrue("BACKEND_DEBUG_MAIN_SYMBOL") &&
        (!machoPrintableAscii(stableName) || len(stableName) <= 4):
         echo("[macho.sym.bad] len=" + intToStr(len(stableName)) +
              " type=" + intToStr(int32(nType)) +
@@ -667,7 +675,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
     machoSeqInitEmpty_uint64(&cSymOffs)
     reserve(cSymOffs, int(cstrCount))
     setLen(cSymOffs, int(cstrCount))
-    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    let dbgCstr: bool = machoEnvIsTrue("BACKEND_DEBUG_CSTRING_LOWERING")
     for ci in 0..<cstrCount:
         let c: MachineCString = machoModuleCStringAtRaw(mod, ci)
         if !machineCStringValid(c):
@@ -804,7 +812,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
                  " scanOff=" + intToStr(scanOff))
         let resolvedFnName: str = machoResolveFuncExportName(f, labels)
         machoSeqSetStr(funcSymNames, fi, resolvedFnName)
-        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+        if machoEnvIsTrue("BACKEND_DEBUG_MAIN_SYMBOL") && fi < 8:
             let firstLabelDbg: str = machoFirstLabelOrEmpty(labels)
             echo("[macho.func.resolve] fi=" + intToStr(fi) +
                  " raw=" + machoFuncNameRaw(f) +
@@ -1204,7 +1212,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
         let fLocal: MachineFunc = machoModuleFuncAtRaw(mod, fi)
         let fnNameDirect: str = machoFuncNameRaw(fLocal)
         let fnName: str = machoChooseNonEmpty(fnNameDirect, machoSeqAtStr(funcSymNames, fi))
-        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+        if machoEnvIsTrue("BACKEND_DEBUG_MAIN_SYMBOL") && fi < 8:
             echo("[macho.func.local] fi=" + intToStr(fi) +
                  " raw=" + fnNameDirect +
                  " picked=" + fnName)
@@ -1223,7 +1231,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
         let fExt: MachineFunc = machoModuleFuncAtRaw(mod, fi)
         let fnNameDirect: str = machoFuncNameRaw(fExt)
         let fnName: str = machoChooseNonEmpty(fnNameDirect, machoSeqAtStr(funcSymNames, fi))
-        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+        if machoEnvIsTrue("BACKEND_DEBUG_MAIN_SYMBOL") && fi < 8:
             echo("[macho.func.ext] fi=" + intToStr(fi) +
                  " raw=" + fnNameDirect +
                  " picked=" + fnName)
@@ -1231,7 +1239,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
             continue
         let v2: uint64 = textAddr + funcOffs[fi]
         let exportSymExt: str = machoJoinSym(symPrefix, fnName)
-        if os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1" && fi < 8:
+        if machoEnvIsTrue("BACKEND_DEBUG_MAIN_SYMBOL") && fi < 8:
             echo("[macho.func.ext.sym] fi=" + intToStr(fi) +
                  " export=" + exportSymExt)
         let exportSymExtOff: uint32 = machoStrtabAddJoined(strtab, symPrefix, fnName)
@@ -1292,7 +1300,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
 
     let undefCount: uint32 = uint32(undefs.len)
 
-    let dbgMainSym: bool = os.getEnvDefault("BACKEND_DEBUG_MAIN_SYMBOL", "") == "1"
+    let dbgMainSym: bool = machoEnvIsTrue("BACKEND_DEBUG_MAIN_SYMBOL")
     for si in 0..<syms.len:
         let s0: MachoSym = machoSeqAtMachoSym(syms, si)
         if !machoSymNil(s0):
@@ -1556,7 +1564,7 @@ fn machoBuild(mod: MachineModule): Result[ByteBuf] =
     return Ok[ByteBuf](out)
 
 fn machoWriteAarch64RelocatableObj(mod: MachineModule): Result[ByteBuf] =
-    let dbgCstrWrap: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    let dbgCstrWrap: bool = machoEnvIsTrue("BACKEND_DEBUG_CSTRING_LOWERING")
     if dbgCstrWrap:
         let cCountWrap: int32 = machineModuleCstrsLen(mod)
         echo("[macho.wrap.a64] cstrs=" + intToStr(cCountWrap))

@@ -1,0 +1,542 @@
+import std/seqs
+import std/strings as strings
+import compiler/frontend/compiler_core_surface_ir_v2 as ccore
+import compiler/driver/identity_v2 as ident
+import compiler/driver/manifest_resolver_v2 as manifest
+import compiler/high_uir/compiler_core_graph_v2 as cgraph
+import compiler/low_uir/compiler_core_ops_contract as cops
+
+type
+    LowUirCompilerCorePlan =
+        version: str
+        itemIds: int32[]
+        canonicalOps: str[]
+        runtimeTargets: str[]
+        proofDomains: str[]
+        effectClasses: str[]
+        bindingScopes: str[]
+        topLevelKinds: str[]
+        labels: str[]
+        ownerModules: str[]
+        sourcePaths: str[]
+        importcSymbolTexts: str[]
+        importPaths: str[]
+        importAliases: str[]
+        importCategories: str[]
+        signatureTexts: str[]
+        signatureHashes: str[]
+        bodyLineCounts: int32[]
+        bodyHashes: str[]
+        executableAstReady: bool[]
+        returnTypeTexts: str[]
+        paramCounts: int32[]
+        localCounts: int32[]
+        stmtCounts: int32[]
+        exprCounts: int32[]
+        routineOpStarts: int32[]
+        routineOpCounts: int32[]
+        routineOpHashes: str[]
+        opKinds: str[]
+        opPrimaryTexts: str[]
+        opSecondaryTexts: str[]
+        opArg0s: int32[]
+        opArg1s: int32[]
+        opArg2s: int32[]
+
+fn lowUirCompilerCorePlanVersion(): str =
+    return "v2.low_uir.compiler_core_lowering.v1"
+
+fn newLowUirCompilerCorePlan(): LowUirCompilerCorePlan =
+    var out: LowUirCompilerCorePlan
+    out.version = lowUirCompilerCorePlanVersion()
+    out.itemIds = []
+    out.canonicalOps = []
+    out.runtimeTargets = []
+    out.proofDomains = []
+    out.effectClasses = []
+    out.bindingScopes = []
+    out.topLevelKinds = []
+    out.labels = []
+    out.ownerModules = []
+    out.sourcePaths = []
+    out.importcSymbolTexts = []
+    out.importPaths = []
+    out.importAliases = []
+    out.importCategories = []
+    out.signatureTexts = []
+    out.signatureHashes = []
+    out.bodyLineCounts = []
+    out.bodyHashes = []
+    out.executableAstReady = []
+    out.returnTypeTexts = []
+    out.paramCounts = []
+    out.localCounts = []
+    out.stmtCounts = []
+    out.exprCounts = []
+    out.routineOpStarts = []
+    out.routineOpCounts = []
+    out.routineOpHashes = []
+    out.opKinds = []
+    out.opPrimaryTexts = []
+    out.opSecondaryTexts = []
+    out.opArg0s = []
+    out.opArg1s = []
+    out.opArg2s = []
+    return out
+
+fn appendLowUirCompilerCoreExecOp(plan: var LowUirCompilerCorePlan,
+                                  kind: str,
+                                  primaryText: str,
+                                  secondaryText: str,
+                                  arg0: int32,
+                                  arg1: int32,
+                                  arg2: int32) =
+    add(plan.opKinds, kind)
+    add(plan.opPrimaryTexts, primaryText)
+    add(plan.opSecondaryTexts, secondaryText)
+    add(plan.opArg0s, arg0)
+    add(plan.opArg1s, arg1)
+    add(plan.opArg2s, arg2)
+
+fn compilerCoreExprChildIds(program: ccore.CompilerCoreProgram, exprId: int32): int32[] =
+    var out: int32[]
+    out = []
+    let expr = program.exprs[exprId]
+    for i in 0..<expr.childCount:
+        add(out, program.exprChildIds[expr.childStart + i])
+    return out
+
+fn compilerCoreStmtChildIds(program: ccore.CompilerCoreProgram,
+                            stmt: ccore.CompilerCoreStmtNode): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<stmt.childCount:
+        add(out, program.stmtChildIds[stmt.childStart + i])
+    return out
+
+fn compilerCoreStmtElseChildIds(program: ccore.CompilerCoreProgram,
+                                stmt: ccore.CompilerCoreStmtNode): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<stmt.elseChildCount:
+        add(out, program.stmtChildIds[stmt.elseChildStart + i])
+    return out
+
+fn compilerCoreFindParamSlot(program: ccore.CompilerCoreProgram,
+                             routine: ccore.CompilerCoreRoutineDecl,
+                             name: str): int32 =
+    for i in 0..<routine.paramCount:
+        if program.routineParams[routine.paramStart + i].name == name:
+            return i
+    return -1
+
+fn compilerCoreFindLocalSlot(program: ccore.CompilerCoreProgram,
+                             routine: ccore.CompilerCoreRoutineDecl,
+                             name: str): int32 =
+    for i in 0..<routine.localCount:
+        if program.locals[routine.localStart + i].name == name:
+            return i
+    return -1
+
+fn compilerCoreFindTopLevelKind(graph: cgraph.HighUirCompilerCoreGraph, label: str): str =
+    for i in 0..<graph.labels.len:
+        if graph.labels[i] == label:
+            return graph.topLevelKinds[i]
+    return ""
+
+fn compilerCoreFindTopLevelItemId(graph: cgraph.HighUirCompilerCoreGraph, label: str): int32 =
+    for i in 0..<graph.labels.len:
+        if graph.labels[i] == label:
+            return graph.itemIds[i]
+    return -1
+
+fn compilerCoreImportVisibleName(importPath: str, importAlias: str): str =
+    if len(importAlias) > 0:
+        return importAlias
+    var slashIdx: int32 = -1
+    for i in 0..<len(importPath):
+        if importPath[i] == '/':
+            slashIdx = i
+    if slashIdx >= 0:
+        return strings.sliceBytes(importPath, slashIdx + 1, len(importPath) - slashIdx - 1)
+    return importPath
+
+fn compilerCoreSourcePathToModulePath(sourcePath: str): str =
+    let v2Idx = strings.find(sourcePath, "v2/src/")
+    if v2Idx >= 0:
+        let start = v2Idx + len("v2/src/")
+        let stop = strings.endsWith(sourcePath, ".cheng") ? len(sourcePath) - len(".cheng") else: len(sourcePath)
+        return strings.sliceBytes(sourcePath, start, stop - start)
+    let srcIdx = strings.find(sourcePath, "src/")
+    if srcIdx >= 0:
+        let start = srcIdx + len("src/")
+        let stop = strings.endsWith(sourcePath, ".cheng") ? len(sourcePath) - len(".cheng") else: len(sourcePath)
+        return strings.sliceBytes(sourcePath, start, stop - start)
+    return strings.endsWith(sourcePath, ".cheng") ?
+        strings.sliceBytes(sourcePath, 0, len(sourcePath) - len(".cheng")) else:
+        sourcePath
+
+fn compilerCoreFindImportVisibleItemId(program: ccore.CompilerCoreProgram,
+                                       ownerSourcePath: str,
+                                       name: str): int32 =
+    var importIdx: int32 = 0
+    for i in 0..<program.topLevelKinds.len:
+        if program.topLevelKinds[i] != "import":
+            continue
+        let decl = program.imports[importIdx]
+        importIdx = importIdx + 1
+        if i >= len(program.topLevelSourcePaths) || program.topLevelSourcePaths[i] != ownerSourcePath:
+            continue
+        if compilerCoreImportVisibleName(decl.modulePath, decl.alias) == name:
+            return i
+    return -1
+
+fn compilerCoreResolveImportFieldItem(program: ccore.CompilerCoreProgram,
+                                      ownerSourcePath: str,
+                                      importName: str,
+                                      fieldName: str,
+                                      graph: cgraph.HighUirCompilerCoreGraph,
+                                      resolvedKind: var str,
+                                      resolvedItemId: var int32): bool =
+    var targetModulePath: str = ""
+    var importIdx: int32 = 0
+    for i in 0..<program.topLevelKinds.len:
+        if program.topLevelKinds[i] != "import":
+            continue
+        let decl = program.imports[importIdx]
+        importIdx = importIdx + 1
+        if i >= len(program.topLevelSourcePaths) || program.topLevelSourcePaths[i] != ownerSourcePath:
+            continue
+        if compilerCoreImportVisibleName(decl.modulePath, decl.alias) == importName:
+            targetModulePath = decl.modulePath
+            break
+    if len(targetModulePath) <= 0:
+        return false
+    var matchCount: int32 = 0
+    for i in 0..<program.topLevelKinds.len:
+        if i >= len(program.topLevelSourcePaths) ||
+           compilerCoreSourcePathToModulePath(program.topLevelSourcePaths[i]) != targetModulePath:
+            continue
+        if program.topLevelLabels[i] != fieldName:
+            continue
+        let topLevelKind = program.topLevelKinds[i]
+        if topLevelKind != "fn" && topLevelKind != "iterator" && topLevelKind != "importc_fn" &&
+           topLevelKind != "const" && topLevelKind != "var":
+            continue
+        matchCount = matchCount + 1
+        if matchCount > 1:
+            return false
+        resolvedKind = topLevelKind
+        resolvedItemId = graph.itemIds[i]
+    return matchCount == 1
+
+fn compilerCoreQualifiedFieldName(baseName: str, fieldName: str): str =
+    if len(baseName) <= 0:
+        return fieldName
+    return baseName + "." + fieldName
+
+fn compilerCoreLoopName(primaryText: str): str =
+    for i in 0..<len(primaryText):
+        if primaryText[i] == '|':
+            return strings.sliceBytes(primaryText, 0, i)
+    return primaryText
+
+fn compilerCoreLoopRangeKind(primaryText: str): str =
+    for i in 0..<len(primaryText):
+        if primaryText[i] == '|':
+            return strings.sliceBytes(primaryText, i + 1, len(primaryText) - i - 1)
+    return ""
+
+fn compilerCoreRoutineLabel(itemId: int32, suffix: str): str =
+    return "item." + intToStr(itemId) + "." + suffix
+
+fn compilerCoreLowerExpr(program: ccore.CompilerCoreProgram,
+                         graph: cgraph.HighUirCompilerCoreGraph,
+                         routine: ccore.CompilerCoreRoutineDecl,
+                         itemId: int32,
+                         ownerSourcePath: str,
+                         exprId: int32,
+                         out: var LowUirCompilerCorePlan) =
+    if exprId < 0:
+        return
+    let expr = program.exprs[exprId]
+    let childIds = compilerCoreExprChildIds(program, exprId)
+    if expr.kind == "int_lit":
+        appendLowUirCompilerCoreExecOp(out, "load_int32", expr.primaryText, "", exprId, -1, -1)
+        return
+    if expr.kind == "bool_lit":
+        appendLowUirCompilerCoreExecOp(out, "load_bool", expr.primaryText, "", exprId, -1, -1)
+        return
+    if expr.kind == "nil_lit":
+        appendLowUirCompilerCoreExecOp(out, "load_nil", "", "", exprId, -1, -1)
+        return
+    if expr.kind == "str_lit":
+        appendLowUirCompilerCoreExecOp(out, "load_str", expr.primaryText, "", exprId, -1, -1)
+        return
+    if expr.kind == "name_ref":
+        let paramSlot = compilerCoreFindParamSlot(program, routine, expr.primaryText)
+        if paramSlot >= 0:
+            appendLowUirCompilerCoreExecOp(out, "load_param", expr.primaryText, "", paramSlot, exprId, -1)
+            return
+        let localSlot = compilerCoreFindLocalSlot(program, routine, expr.primaryText)
+        if localSlot >= 0:
+            appendLowUirCompilerCoreExecOp(out, "load_local", expr.primaryText, "", localSlot, exprId, -1)
+            return
+        let importItemId = compilerCoreFindImportVisibleItemId(program, ownerSourcePath, expr.primaryText)
+        if importItemId >= 0:
+            appendLowUirCompilerCoreExecOp(out, "load_import", expr.primaryText, "", importItemId, exprId, -1)
+            return
+        let topLevelKind = compilerCoreFindTopLevelKind(graph, expr.primaryText)
+        let topLevelItemId = compilerCoreFindTopLevelItemId(graph, expr.primaryText)
+        if topLevelKind == "fn" || topLevelKind == "iterator" || topLevelKind == "importc_fn":
+            appendLowUirCompilerCoreExecOp(out, "load_routine", expr.primaryText, topLevelKind, topLevelItemId, exprId, -1)
+        elif topLevelKind == "const" || topLevelKind == "var":
+            appendLowUirCompilerCoreExecOp(out, "load_global", expr.primaryText, topLevelKind, topLevelItemId, exprId, -1)
+        elif topLevelKind == "import":
+            appendLowUirCompilerCoreExecOp(out, "load_import", expr.primaryText, "", topLevelItemId, exprId, -1)
+        else:
+            appendLowUirCompilerCoreExecOp(out, "load_name", expr.primaryText, topLevelKind, topLevelItemId, exprId, -1)
+        return
+    if expr.kind == "field":
+        let baseExpr = program.exprs[childIds[0]]
+        if baseExpr.kind == "name_ref":
+            var resolvedKind: str = ""
+            var resolvedItemId: int32 = -1
+            if compilerCoreResolveImportFieldItem(program,
+                                                  ownerSourcePath,
+                                                  baseExpr.primaryText,
+                                                  expr.primaryText,
+                                                  graph,
+                                                  resolvedKind,
+                                                  resolvedItemId):
+                let qualifiedName = compilerCoreQualifiedFieldName(baseExpr.primaryText, expr.primaryText)
+                if resolvedKind == "fn" || resolvedKind == "iterator" || resolvedKind == "importc_fn":
+                    appendLowUirCompilerCoreExecOp(out,
+                                                   "load_routine",
+                                                   qualifiedName,
+                                                   resolvedKind,
+                                                   resolvedItemId,
+                                                   exprId,
+                                                   childIds[0])
+                else:
+                    appendLowUirCompilerCoreExecOp(out,
+                                                   "load_global",
+                                                   qualifiedName,
+                                                   resolvedKind,
+                                                   resolvedItemId,
+                                                   exprId,
+                                                   childIds[0])
+                return
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[0], out)
+        appendLowUirCompilerCoreExecOp(out, "load_field", expr.primaryText, "", exprId, childIds[0], -1)
+        return
+    if expr.kind == "index":
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[0], out)
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[1], out)
+        appendLowUirCompilerCoreExecOp(out, "load_index", "", "", exprId, childIds[0], childIds[1])
+        return
+    if expr.kind == "call":
+        for i in 0..<childIds.len:
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[i], out)
+        appendLowUirCompilerCoreExecOp(out, "call", "", "", childIds.len - 1, exprId, childIds.len)
+        return
+    if expr.kind == "unary":
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[0], out)
+        let opKind = expr.primaryText == "!" ? "unary_not" else: "unary_neg"
+        appendLowUirCompilerCoreExecOp(out, opKind, expr.primaryText, "", exprId, childIds[0], -1)
+        return
+    if expr.kind == "binary":
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[0], out)
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[1], out)
+        appendLowUirCompilerCoreExecOp(out, "binary_op", expr.primaryText, "", exprId, childIds[0], childIds[1])
+        return
+    if expr.kind == "array_lit":
+        for i in 0..<childIds.len:
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[i], out)
+        appendLowUirCompilerCoreExecOp(out, "make_array", "", "", childIds.len, exprId, -1)
+        return
+    if expr.kind == "record_lit":
+        for i in 0..<childIds.len:
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[i], out)
+        appendLowUirCompilerCoreExecOp(out, "make_record", expr.primaryText, "", childIds.len, exprId, -1)
+        return
+    if expr.kind == "if_expr":
+        let elseLabel = compilerCoreRoutineLabel(itemId, "if_expr." + intToStr(exprId) + ".else")
+        let endLabel = compilerCoreRoutineLabel(itemId, "if_expr." + intToStr(exprId) + ".end")
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[0], out)
+        appendLowUirCompilerCoreExecOp(out, "jump_if_false", elseLabel, "", exprId, childIds[0], -1)
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[1], out)
+        appendLowUirCompilerCoreExecOp(out, "jump", endLabel, "", exprId, -1, -1)
+        appendLowUirCompilerCoreExecOp(out, "label", elseLabel, "", exprId, -1, -1)
+        compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[2], out)
+        appendLowUirCompilerCoreExecOp(out, "label", endLabel, "", exprId, -1, -1)
+        appendLowUirCompilerCoreExecOp(out, "phi_merge", "if_expr", "", exprId, 2, -1)
+        return
+    panic("v2 low_uir compiler_core lowering: unsupported executable expr kind " + expr.kind)
+
+fn compilerCoreLowerStmtIds(program: ccore.CompilerCoreProgram,
+                            graph: cgraph.HighUirCompilerCoreGraph,
+                            routine: ccore.CompilerCoreRoutineDecl,
+                            itemId: int32,
+                            ownerSourcePath: str,
+                            stmtIds: int32[],
+                            out: var LowUirCompilerCorePlan) =
+    for i in 0..<stmtIds.len:
+        let stmtId = stmtIds[i]
+        let stmt = program.stmts[stmtId]
+        if stmt.kind == "return":
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.primaryExprId, out)
+            let returnKind = stmt.primaryExprId >= 0 ? "return_value" else: "return_void"
+            appendLowUirCompilerCoreExecOp(out, returnKind, "", "", stmtId, stmt.primaryExprId, -1)
+            continue
+        if stmt.kind == "let" || stmt.kind == "var":
+            let localSlot = compilerCoreFindLocalSlot(program, routine, stmt.primaryText)
+            appendLowUirCompilerCoreExecOp(out, "local_decl", stmt.primaryText, stmt.kind, localSlot, stmtId, -1)
+            if stmt.primaryExprId >= 0:
+                compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.primaryExprId, out)
+                appendLowUirCompilerCoreExecOp(out, "store_local", stmt.primaryText, stmt.kind, localSlot, stmt.primaryExprId, -1)
+            continue
+        if stmt.kind == "assign":
+            let lhsExpr = program.exprs[stmt.primaryExprId]
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.secondaryExprId, out)
+            if lhsExpr.kind == "name_ref":
+                let localSlot = compilerCoreFindLocalSlot(program, routine, lhsExpr.primaryText)
+                let paramSlot = compilerCoreFindParamSlot(program, routine, lhsExpr.primaryText)
+                if localSlot >= 0:
+                    appendLowUirCompilerCoreExecOp(out, "store_local", lhsExpr.primaryText, "", localSlot, stmt.secondaryExprId, -1)
+                elif paramSlot >= 0:
+                    appendLowUirCompilerCoreExecOp(out, "store_param", lhsExpr.primaryText, "", paramSlot, stmt.secondaryExprId, -1)
+                else:
+                    appendLowUirCompilerCoreExecOp(out, "store_name", lhsExpr.primaryText, "", stmt.primaryExprId, stmt.secondaryExprId, -1)
+                continue
+            let lhsChildIds = compilerCoreExprChildIds(program, stmt.primaryExprId)
+            if lhsExpr.kind == "field":
+                compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, lhsChildIds[0], out)
+                appendLowUirCompilerCoreExecOp(out, "store_field", lhsExpr.primaryText, "", stmt.primaryExprId, stmt.secondaryExprId, lhsChildIds[0])
+                continue
+            if lhsExpr.kind == "index":
+                compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, lhsChildIds[0], out)
+                compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, lhsChildIds[1], out)
+                appendLowUirCompilerCoreExecOp(out, "store_index", "", "", stmt.primaryExprId, stmt.secondaryExprId, lhsChildIds[1])
+                continue
+            panic("v2 low_uir compiler_core lowering: unsupported assignment lhs " + lhsExpr.kind)
+        if stmt.kind == "expr_stmt":
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.primaryExprId, out)
+            appendLowUirCompilerCoreExecOp(out, "drop_value", "", "", stmtId, stmt.primaryExprId, -1)
+            continue
+        if stmt.kind == "if":
+            let elseLabel = compilerCoreRoutineLabel(itemId, "if." + intToStr(stmtId) + ".else")
+            let endLabel = compilerCoreRoutineLabel(itemId, "if." + intToStr(stmtId) + ".end")
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.primaryExprId, out)
+            appendLowUirCompilerCoreExecOp(out, "jump_if_false", elseLabel, "", stmtId, stmt.primaryExprId, -1)
+            compilerCoreLowerStmtIds(program, graph, routine, itemId, ownerSourcePath, compilerCoreStmtChildIds(program, stmt), out)
+            if stmt.elseChildCount > 0:
+                appendLowUirCompilerCoreExecOp(out, "jump", endLabel, "", stmtId, -1, -1)
+            appendLowUirCompilerCoreExecOp(out, "label", elseLabel, "", stmtId, -1, -1)
+            if stmt.elseChildCount > 0:
+                compilerCoreLowerStmtIds(program, graph, routine, itemId, ownerSourcePath, compilerCoreStmtElseChildIds(program, stmt), out)
+                appendLowUirCompilerCoreExecOp(out, "label", endLabel, "", stmtId, -1, -1)
+            continue
+        if stmt.kind == "while":
+            let headLabel = compilerCoreRoutineLabel(itemId, "while." + intToStr(stmtId) + ".head")
+            let endLabel = compilerCoreRoutineLabel(itemId, "while." + intToStr(stmtId) + ".end")
+            appendLowUirCompilerCoreExecOp(out, "label", headLabel, "", stmtId, -1, -1)
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.primaryExprId, out)
+            appendLowUirCompilerCoreExecOp(out, "jump_if_false", endLabel, "", stmtId, stmt.primaryExprId, -1)
+            compilerCoreLowerStmtIds(program, graph, routine, itemId, ownerSourcePath, compilerCoreStmtChildIds(program, stmt), out)
+            appendLowUirCompilerCoreExecOp(out, "jump", headLabel, "", stmtId, -1, -1)
+            appendLowUirCompilerCoreExecOp(out, "label", endLabel, "", stmtId, -1, -1)
+            continue
+        if stmt.kind == "for_range":
+            let iterName = compilerCoreLoopName(stmt.primaryText)
+            let rangeKind = compilerCoreLoopRangeKind(stmt.primaryText)
+            let headLabel = compilerCoreRoutineLabel(itemId, "for_range." + intToStr(stmtId) + ".head")
+            let endLabel = compilerCoreRoutineLabel(itemId, "for_range." + intToStr(stmtId) + ".end")
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.primaryExprId, out)
+            compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, stmt.secondaryExprId, out)
+            appendLowUirCompilerCoreExecOp(out, "for_range_init", iterName, rangeKind, stmtId, stmt.primaryExprId, stmt.secondaryExprId)
+            appendLowUirCompilerCoreExecOp(out, "label", headLabel, "", stmtId, -1, -1)
+            appendLowUirCompilerCoreExecOp(out, "for_range_check", iterName, rangeKind, stmtId, -1, -1)
+            appendLowUirCompilerCoreExecOp(out, "jump_if_false", endLabel, "", stmtId, -1, -1)
+            compilerCoreLowerStmtIds(program, graph, routine, itemId, ownerSourcePath, compilerCoreStmtChildIds(program, stmt), out)
+            appendLowUirCompilerCoreExecOp(out, "for_range_step", iterName, rangeKind, stmtId, -1, -1)
+            appendLowUirCompilerCoreExecOp(out, "jump", headLabel, "", stmtId, -1, -1)
+            appendLowUirCompilerCoreExecOp(out, "label", endLabel, "", stmtId, -1, -1)
+            continue
+        panic("v2 low_uir compiler_core lowering: unsupported executable stmt kind " + stmt.kind)
+
+fn compilerCoreRoutineOpHash(plan: LowUirCompilerCorePlan,
+                             startIdx: int32,
+                             opCount: int32): str =
+    var lines: str[]
+    lines = []
+    for i in 0..<opCount:
+        let idx = startIdx + i
+        add(lines, plan.opKinds[idx] + "|" +
+                   plan.opPrimaryTexts[idx] + "|" +
+                   plan.opSecondaryTexts[idx] + "|" +
+                   intToStr(plan.opArg0s[idx]) + "|" +
+                   intToStr(plan.opArg1s[idx]) + "|" +
+                   intToStr(plan.opArg2s[idx]))
+    return ident.sha256HexText(manifest.joinLines(lines))
+
+fn lowerHighUirCompilerCoreGraphToLowUir(program: ccore.CompilerCoreProgram,
+                                         graph: cgraph.HighUirCompilerCoreGraph): LowUirCompilerCorePlan =
+    var out: LowUirCompilerCorePlan = newLowUirCompilerCorePlan()
+    let contract = cops.lowUirCompilerCoreOpsContract()
+    var routineIdx: int32 = 0
+    for i in 0..<graph.itemIds.len:
+        let opIdx = cops.findLowUirCompilerCoreOp(graph.opNames[i])
+        if opIdx < 0:
+            panic("v2 low_uir compiler_core lowering: missing canonical op for " + graph.opNames[i])
+        let op = contract.canonicalOps[opIdx]
+        let routineOpStart = out.opKinds.len
+        add(out.itemIds, graph.itemIds[i])
+        add(out.canonicalOps, op.opName)
+        add(out.runtimeTargets, op.runtimeTarget)
+        add(out.proofDomains, op.proofDomain)
+        add(out.effectClasses, op.effectClass)
+        add(out.bindingScopes, op.bindingScope)
+        add(out.topLevelKinds, graph.topLevelKinds[i])
+        add(out.labels, graph.labels[i])
+        add(out.ownerModules, i < len(program.topLevelOwnerModules) ? program.topLevelOwnerModules[i] else: "")
+        add(out.sourcePaths, i < len(program.topLevelSourcePaths) ? program.topLevelSourcePaths[i] else: "")
+        add(out.importcSymbolTexts, graph.importcSymbolTexts[i])
+        add(out.importPaths, graph.importPaths[i])
+        add(out.importAliases, graph.importAliases[i])
+        add(out.importCategories, graph.importCategories[i])
+        if graph.topLevelKinds[i] == "fn" || graph.topLevelKinds[i] == "iterator" || graph.topLevelKinds[i] == "importc_fn":
+            add(out.signatureTexts, program.routines[routineIdx].signatureText)
+        else:
+            add(out.signatureTexts, "")
+        add(out.signatureHashes, graph.signatureHashes[i])
+        add(out.bodyLineCounts, graph.bodyLineCounts[i])
+        add(out.bodyHashes, graph.bodyHashes[i])
+        add(out.executableAstReady, graph.executableAstReady[i])
+        add(out.returnTypeTexts, graph.returnTypeTexts[i])
+        add(out.paramCounts, graph.paramCounts[i])
+        add(out.localCounts, graph.localCounts[i])
+        add(out.stmtCounts, graph.stmtCounts[i])
+        add(out.exprCounts, graph.exprCounts[i])
+        add(out.routineOpStarts, routineOpStart)
+        if graph.topLevelKinds[i] == "fn" || graph.topLevelKinds[i] == "iterator" || graph.topLevelKinds[i] == "importc_fn":
+            let routine = program.routines[routineIdx]
+            routineIdx = routineIdx + 1
+            if graph.executableAstReady[i]:
+                var stmtIds: int32[]
+                stmtIds = []
+                for stmtOffset in 0..<routine.stmtCount:
+                    add(stmtIds, routine.stmtStart + stmtOffset)
+                compilerCoreLowerStmtIds(program,
+                                         graph,
+                                         routine,
+                                         graph.itemIds[i],
+                                         i < len(program.topLevelSourcePaths) ? program.topLevelSourcePaths[i] else: "",
+                                         stmtIds,
+                                         out)
+            add(out.routineOpCounts, out.opKinds.len - routineOpStart)
+            add(out.routineOpHashes, compilerCoreRoutineOpHash(out, routineOpStart, out.opKinds.len - routineOpStart))
+        else:
+            add(out.routineOpCounts, 0)
+            add(out.routineOpHashes, ident.sha256HexText(""))
+    return out

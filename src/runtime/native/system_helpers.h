@@ -276,6 +276,19 @@ int32_t driver_c_str_eq_bridge(ChengStrBridge a, ChengStrBridge b);
 int32_t driver_c_str_has_prefix_bridge(ChengStrBridge s, ChengStrBridge prefix);
 int32_t driver_c_str_contains_char_bridge(ChengStrBridge s, int32_t value);
 int32_t driver_c_str_contains_str_bridge(ChengStrBridge s, ChengStrBridge sub);
+int32_t driver_c_cli_param1_eq_bridge(ChengStrBridge expected);
+ChengStrBridge driver_c_exec_file_capture_or_panic_bridge(ChengStrBridge file_path,
+                                                          ChengSeqHeader argv,
+                                                          ChengStrBridge working_dir,
+                                                          ChengStrBridge label);
+void driver_c_compare_text_files_or_panic_bridge(ChengStrBridge left_path,
+                                                 ChengStrBridge right_path,
+                                                 ChengStrBridge label);
+ChengStrBridge driver_c_read_flag_or_default_bridge(ChengStrBridge key, ChengStrBridge default_value);
+int32_t driver_c_read_int32_flag_or_default_bridge(ChengStrBridge key, int32_t default_value);
+void driver_c_write_text_file_bridge(ChengStrBridge path, ChengStrBridge content);
+int32_t driver_c_compare_text_files_bridge(ChengStrBridge left_path, ChengStrBridge right_path);
+int32_t driver_c_compare_binary_files_bridge(ChengStrBridge left_path, ChengStrBridge right_path);
 int32_t driver_c_str_get_at_bridge(ChengStrBridge s, int32_t idx);
 void driver_c_str_set_at_bridge(ChengStrBridge* s, int32_t idx, int32_t value);
 ChengStrBridge driver_c_getenv_copy_bridge(const char* name);

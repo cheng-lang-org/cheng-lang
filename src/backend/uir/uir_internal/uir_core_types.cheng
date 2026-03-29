@@ -10,26 +10,6 @@ import std/rawmem_support
 import std/crash_trace_internal
 import std/system
 
-fn uirCoreReadBlockIdPtr(p: ptr): UirBlockId =
-    if p == nil:
-        return 0
-    var out: UirBlockId = 0
-    memCopyCompat(&out, p, int32(sizeof UirBlockId))
-    return out
-
-fn uirCoreLoadFuncObjValue(funcObj: UirCoreFuncObjPtr): UirCoreFuncObj =
-    var out: UirCoreFuncObj
-    if funcObj == nil:
-        return out
-    memCopyCompat(&out, ptr(funcObj), int32(sizeof UirCoreFuncObj))
-    return out
-
-fn uirCoreStoreFuncObjValue(funcObj: UirCoreFuncObjPtr, value: UirCoreFuncObj) =
-    if funcObj == nil:
-        return
-    var tmp: UirCoreFuncObj = value
-    memCopyCompat(ptr(funcObj), &tmp, int32(sizeof UirCoreFuncObj))
-
 @importc("cheng_func_ptr_shadow_remember")
 fn cheng_func_ptr_shadow_remember(p: ptr)
 @importc("cheng_func_ptr_shadow_recover")
@@ -77,16 +57,10 @@ fn add(seqInst: var str[], val: str) =
     seqInst[idx] = val
 
 fn uirCoreSetEmpty(out: var str) =
-    out.data = nil
-    out.len = 0
-    out.store_id = 0
-    out.flags = 0
+    out = ""
 
 fn uirCoreCopyStr(out: var str, value: str) =
-    out.data = value.data
-    out.len = value.len
-    out.store_id = value.store_id
-    out.flags = value.flags
+    out = value
 
 fn uirCoreChooseNonEmpty(primary: str, fallback: str): str =
     if len(primary) > 0:
@@ -198,12 +172,15 @@ fn uirCoreOwnStrSafe(s: str): str =
         return ""
     return uirCoreOwnStr(s)
 
-fn uirCoreOwnStrBestEffort(primary: str, fallback: str = ""): str =
+fn uirCoreOwnStrBestEffort(primary: str, fallback: str): str =
     if uirCoreStrPtrSane(primary):
         return uirCoreOwnStr(primary)
     if uirCoreStrPtrSane(fallback):
         return uirCoreOwnStr(fallback)
     return ""
+
+fn uirCoreOwnStrBestEffortOrEmpty(primary: str): str =
+    return uirCoreOwnStrBestEffort(primary, "")
 
 fn uirCoreCanonicalStr(s: str): str =
     if !uirCoreStrPtrSane(s):
@@ -539,6 +516,26 @@ fn uirCoreFuncFromPtrVal(ptrVal: int64): UirCoreFunc =
 fn uirCoreFuncObjPtrFromPtrVal(ptrVal: int64): UirCoreFuncObjPtr =
     return UirCoreFuncObjPtr(uirCoreHostVoidPtr(ptrVal))
 
+fn uirCoreReadBlockIdPtr(p: ptr): UirBlockId =
+    if p == nil:
+        return 0
+    var out: UirBlockId = 0
+    memCopyCompat(&out, p, int32(sizeof UirBlockId))
+    return out
+
+fn uirCoreLoadFuncObjValue(funcObj: UirCoreFuncObjPtr): UirCoreFuncObj =
+    var out: UirCoreFuncObj
+    if funcObj == nil:
+        return out
+    memCopyCompat(&out, ptr(funcObj), int32(sizeof UirCoreFuncObj))
+    return out
+
+fn uirCoreStoreFuncObjValue(funcObj: UirCoreFuncObjPtr, value: UirCoreFuncObj) =
+    if funcObj == nil:
+        return
+    var tmp: UirCoreFuncObj = value
+    memCopyCompat(ptr(funcObj), &tmp, int32(sizeof UirCoreFuncObj))
+
 fn uirCoreFuncPtrKnown(ptrVal: int64): bool =
     if uirCoreHostPtrSane(ptrVal):
         return true
@@ -790,15 +787,15 @@ fn uirCoreEnsureFuncDynByPtrKey(ptrKey: int64): UirCoreFuncDynState =
     if created == nil:
         return nil
     memRetain(uirCoreDynStateRetainPtr(created))
-    created.name = uirCoreOwnStrBestEffort(funcVal.name)
-    created.linkName = uirCoreOwnStrBestEffort(funcVal.linkName)
-    created.originFile = uirCoreOwnStrBestEffort(funcVal.originFile)
+    created.name = uirCoreOwnStrBestEffortOrEmpty(funcVal.name)
+    created.linkName = uirCoreOwnStrBestEffortOrEmpty(funcVal.linkName)
+    created.originFile = uirCoreOwnStrBestEffortOrEmpty(funcVal.originFile)
     created.declOrdinal = funcVal.declOrdinal
     created.sourceAstIndex = funcVal.sourceAstIndex
     created.isExtern = funcVal.isExtern
     created.isExported = funcVal.isExported
     created.retType = funcVal.retType
-    created.retTypeKey = uirCoreOwnStrBestEffort(funcVal.retTypeKey)
+    created.retTypeKey = uirCoreOwnStrBestEffortOrEmpty(funcVal.retTypeKey)
     created.objFrameSize = funcVal.objFrameSize
     created.phaseTag = funcVal.phaseTag
     created.highUirChecked = funcVal.highUirChecked
@@ -1036,21 +1033,21 @@ fn uirCoreCloneFuncDynFromObj(funcObj: UirCoreFuncObjPtr,
     if created == nil:
         return nil
     memRetain(uirCoreDynStateRetainPtr(created))
-    created.name = uirCoreOwnStrBestEffort(funcVal.name)
-    created.linkName = uirCoreOwnStrBestEffort(funcVal.linkName)
+    created.name = uirCoreOwnStrBestEffortOrEmpty(funcVal.name)
+    created.linkName = uirCoreOwnStrBestEffortOrEmpty(funcVal.linkName)
     if (payloadSrc != nil) && uirCoreStrPtrSane(payloadSrc.originFile) && len(payloadSrc.originFile) > 0:
-        created.originFile = uirCoreOwnStrBestEffort(payloadSrc.originFile)
+        created.originFile = uirCoreOwnStrBestEffortOrEmpty(payloadSrc.originFile)
     else:
-        created.originFile = uirCoreOwnStrBestEffort(funcVal.originFile)
+        created.originFile = uirCoreOwnStrBestEffortOrEmpty(funcVal.originFile)
     created.declOrdinal = ((payloadSrc != nil) && payloadSrc.declOrdinal >= 0) ? payloadSrc.declOrdinal : funcVal.declOrdinal
     created.sourceAstIndex = ((payloadSrc != nil) && payloadSrc.sourceAstIndex >= 0) ? payloadSrc.sourceAstIndex : funcVal.sourceAstIndex
     created.isExtern = ((payloadSrc != nil) ? payloadSrc.isExtern : funcVal.isExtern)
     created.isExported = ((payloadSrc != nil) ? payloadSrc.isExported : funcVal.isExported)
     created.retType = funcVal.retType
     if (payloadSrc != nil) && uirCoreStrPtrSane(payloadSrc.retTypeKey) && len(payloadSrc.retTypeKey) > 0:
-        created.retTypeKey = uirCoreOwnStrBestEffort(payloadSrc.retTypeKey)
+        created.retTypeKey = uirCoreOwnStrBestEffortOrEmpty(payloadSrc.retTypeKey)
     else:
-        created.retTypeKey = uirCoreOwnStrBestEffort(funcVal.retTypeKey)
+        created.retTypeKey = uirCoreOwnStrBestEffortOrEmpty(funcVal.retTypeKey)
     created.objFrameSize = funcVal.objFrameSize
     created.phaseTag = funcVal.phaseTag
     created.highUirChecked = funcVal.highUirChecked
@@ -1092,15 +1089,15 @@ fn uirCoreCloneFuncDynFromFunc(func: UirCoreFunc): UirCoreFuncDynState =
     if created == nil:
         return nil
     memRetain(uirCoreDynStateRetainPtr(created))
-    created.name = uirCoreOwnStrBestEffort(funcVal.name)
-    created.linkName = uirCoreOwnStrBestEffort(funcVal.linkName)
-    created.originFile = uirCoreOwnStrBestEffort(funcVal.originFile)
+    created.name = uirCoreOwnStrBestEffortOrEmpty(funcVal.name)
+    created.linkName = uirCoreOwnStrBestEffortOrEmpty(funcVal.linkName)
+    created.originFile = uirCoreOwnStrBestEffortOrEmpty(funcVal.originFile)
     created.declOrdinal = funcVal.declOrdinal
     created.sourceAstIndex = funcVal.sourceAstIndex
     created.isExtern = funcVal.isExtern
     created.isExported = funcVal.isExported
     created.retType = funcVal.retType
-    created.retTypeKey = uirCoreOwnStrBestEffort(funcVal.retTypeKey)
+    created.retTypeKey = uirCoreOwnStrBestEffortOrEmpty(funcVal.retTypeKey)
     created.objFrameSize = funcVal.objFrameSize
     created.phaseTag = funcVal.phaseTag
     created.highUirChecked = funcVal.highUirChecked
@@ -1187,13 +1184,115 @@ fn uirCoreTypeKindRaw(ty: UirCoreType): int32 =
 fn uirCoreTypeIsUnsigned(ty: UirCoreType): bool =
     return (uirCoreEncodeType(ty) & 256) != 0
 
+fn uirCoreTypeSameShape(a: UirCoreType, b: UirCoreType): bool =
+    return uirCoreTypeKindRaw(a) == uirCoreTypeKindRaw(b) &&
+           uirCoreTypeIsUnsigned(a) == uirCoreTypeIsUnsigned(b)
+
+fn uirCoreTypeKindOf(ty: UirCoreType): UirCoreTypeKind =
+    return ty.kind
+
+fn uirCoreTypeWithKind(ty: UirCoreType, kind: UirCoreTypeKind): UirCoreType =
+    var out: UirCoreType = ty
+    out.kind = kind
+    return out
+
 fn uirCoreTypeWithUnsigned(ty: UirCoreType, isUnsigned: bool): UirCoreType =
     var out: UirCoreType = ty
     out.isUnsigned = isUnsigned
     return out
 
+fn uirCoreTypeKindVoid(): UirCoreTypeKind =
+    return mtVoid
+
+fn uirCoreTypeKindI8(): UirCoreTypeKind =
+    return mtI8
+
+fn uirCoreTypeKindI16(): UirCoreTypeKind =
+    return mtI16
+
+fn uirCoreTypeKindI32(): UirCoreTypeKind =
+    return mtI32
+
+fn uirCoreTypeKindI64(): UirCoreTypeKind =
+    return mtI64
+
+fn uirCoreTypeKindF32(): UirCoreTypeKind =
+    return mtF32
+
+fn uirCoreTypeKindF64(): UirCoreTypeKind =
+    return mtF64
+
+fn uirCoreTypeIsVoid(ty: UirCoreType): bool =
+    return uirCoreTypeKindRaw(ty) == int32(mtVoid)
+
+fn uirCoreTypeIsI64(ty: UirCoreType): bool =
+    return uirCoreTypeKindRaw(ty) == int32(mtI64)
+
+fn uirCoreTypeIsI32(ty: UirCoreType): bool =
+    return uirCoreTypeKindRaw(ty) == int32(mtI32)
+
+fn uirCoreTypeIsF64(ty: UirCoreType): bool =
+    return uirCoreTypeKindRaw(ty) == int32(mtF64)
+
+fn uirCoreTypeIsF32(ty: UirCoreType): bool =
+    return uirCoreTypeKindRaw(ty) == int32(mtF32)
+
+fn uirCoreTypeIsI16(ty: UirCoreType): bool =
+    return uirCoreTypeKindRaw(ty) == int32(mtI16)
+
+fn uirCoreTypeIsI8(ty: UirCoreType): bool =
+    return uirCoreTypeKindRaw(ty) == int32(mtI8)
+
+fn uirCoreTermKindRet(): UirCoreTermKind =
+    return mtRet
+
+fn uirCoreTermKindBr(): UirCoreTermKind =
+    return mtBr
+
+fn uirCoreTermKindCbr(): UirCoreTermKind =
+    return mtCbr
+
+fn uirCoreTermKindIsRet(kind: UirCoreTermKind): bool =
+    return kind == mtRet
+
+fn uirCoreTermKindIsBr(kind: UirCoreTermKind): bool =
+    return kind == mtBr
+
+fn uirCoreTermKindIsCbr(kind: UirCoreTermKind): bool =
+    return kind == mtCbr
+
 fn uirCoreEncodeBinOp(op: UirCoreBinOp): int32 =
     return int32(op)
+
+fn uirCoreBinOpAdd(): UirCoreBinOp =
+    return mbAdd
+
+fn uirCoreBinOpSub(): UirCoreBinOp =
+    return mbSub
+
+fn uirCoreBinOpMul(): UirCoreBinOp =
+    return mbMul
+
+fn uirCoreBinOpSdiv(): UirCoreBinOp =
+    return mbSdiv
+
+fn uirCoreBinOpSmod(): UirCoreBinOp =
+    return mbSmod
+
+fn uirCoreBinOpShl(): UirCoreBinOp =
+    return mbShl
+
+fn uirCoreBinOpShr(): UirCoreBinOp =
+    return mbShr
+
+fn uirCoreBinOpAnd(): UirCoreBinOp =
+    return mbAnd
+
+fn uirCoreBinOpOr(): UirCoreBinOp =
+    return mbOr
+
+fn uirCoreBinOpXor(): UirCoreBinOp =
+    return mbXor
 
 fn uirCoreDecodeBinOp(raw: int32): UirCoreBinOp =
     if raw < int32(mbAdd) || raw > int32(mbShr):
@@ -1203,6 +1302,24 @@ fn uirCoreDecodeBinOp(raw: int32): UirCoreBinOp =
 fn uirCoreEncodeCmpOp(op: UirCoreCmpOp): int32 =
     return int32(op)
 
+fn uirCoreCmpEq(): UirCoreCmpOp =
+    return mcEq
+
+fn uirCoreCmpNe(): UirCoreCmpOp =
+    return mcNe
+
+fn uirCoreCmpLt(): UirCoreCmpOp =
+    return mcLt
+
+fn uirCoreCmpLe(): UirCoreCmpOp =
+    return mcLe
+
+fn uirCoreCmpGt(): UirCoreCmpOp =
+    return mcGt
+
+fn uirCoreCmpGe(): UirCoreCmpOp =
+    return mcGe
+
 fn uirCoreDecodeCmpOp(raw: int32): UirCoreCmpOp =
     if raw < int32(mcEq) || raw > int32(mcGe):
         return mcEq
@@ -1211,6 +1328,12 @@ fn uirCoreDecodeCmpOp(raw: int32): UirCoreCmpOp =
 fn uirCoreEncodeExprKind(kind: UirCoreExprKind): int32 =
     return int32(kind)
 
+fn uirCoreExprKindCall(): UirCoreExprKind =
+    return meCall
+
+fn uirCoreExprKindLocal(): UirCoreExprKind =
+    return meLocal
+
 fn uirCoreDecodeExprKind(raw: int32): UirCoreExprKind =
     if raw < int32(meConstI64) || raw > int32(meGlobalAddr):
         return meConstI64
@@ -1218,6 +1341,12 @@ fn uirCoreDecodeExprKind(raw: int32): UirCoreExprKind =
 
 fn uirCoreEncodeStmtKind(kind: UirCoreStmtKind): int32 =
     return int32(kind)
+
+fn uirCoreStmtKindExpr(): UirCoreStmtKind =
+    return msExpr
+
+fn uirCoreStmtKindParam(): UirCoreStmtKind =
+    return msParam
 
 fn uirCoreDecodeStmtKind(raw: int32): UirCoreStmtKind =
     if raw < int32(msLet) || raw > int32(msStore):
@@ -1236,20 +1365,10 @@ fn uirCoreDecodeType(raw: int32): UirCoreType =
     return out
 
 fn add(seqInst: var UirExprId[][], val: UirExprId[]) =
-    let idx: int32 = seqInst.len
-    let needLen: int32 = idx + 1
-    if seqInst.buffer == nil || seqInst.cap < needLen:
-        reserve(seqInst, needLen)
-    setLen(seqInst, needLen)
-    seqInst[idx] = val
+    seqs.add(seqInst, val)
 
 fn add(seqInst: var UirStmtId[][], val: UirStmtId[]) =
-    let idx: int32 = seqInst.len
-    let needLen: int32 = idx + 1
-    if seqInst.buffer == nil || seqInst.cap < needLen:
-        reserve(seqInst, needLen)
-    setLen(seqInst, needLen)
-    seqInst[idx] = val
+    seqs.add(seqInst, val)
 
 fn add(seqInst: var UirExprId[], val: UirExprId) =
     let idx: int32 = seqInst.len
@@ -1437,24 +1556,20 @@ fn uirCoreAppendStr(seqInst: var str[], val: str) =
     seqs.add(seqInst, val)
 
 fn uirCoreAppendExprArgs(seqInst: var UirExprId[][], val: UirExprId[]) =
-    let idx: int32 = seqInst.len
-    let needLen: int32 = idx + 1
-    if seqInst.buffer == nil || seqInst.cap < needLen:
-        reserve(seqInst, uirCoreReserveTargetCap(seqInst.cap, needLen, 64))
-    setLen(seqInst, needLen)
-    seqInst[idx] = uirCoreCloneExprArgs(val)
+    seqs.add(seqInst, uirCoreCloneExprArgs(val))
 
 fn uirCoreAppendExprArgsFlat(val: UirExprId[]): int32 =
-    let start: int32 = uirCore_exprArgsFlat.len
+    let flatSeq: UirExprId[]* = &uirCore_exprArgsFlat
+    let start: int32 = flatSeq->len
     let n: int32 = val.len
     if n <= 0:
         return start
     let needLen: int32 = start + n
-    if uirCore_exprArgsFlat.buffer == nil || uirCore_exprArgsFlat.cap < needLen:
-        reserve(uirCore_exprArgsFlat, uirCoreReserveTargetCap(uirCore_exprArgsFlat.cap, needLen, 256))
-    setLen(uirCore_exprArgsFlat, needLen)
+    if flatSeq->buffer == nil || flatSeq->cap < needLen:
+        cheng__seqGrowToRaw(&flatSeq->buffer, &flatSeq->cap, needLen, int32(sizeof int32))
+    flatSeq->len = needLen
     for i in 0..<n:
-        uirCore_exprArgsFlat[start + i] = val[i]
+        flatSeq[start + i] = val[i]
     return start
 
 fn uirCoreAppendType(seqInst: var UirCoreType[], val: UirCoreType) =
@@ -1558,8 +1673,8 @@ fn uirCoreCloneParamSeq(src: UirCoreParam[]): UirCoreParam[] =
     reserve(out, n)
     for i in 0..<n:
         var p: UirCoreParam = src[i]
-        p.name = uirCoreOwnStrBestEffort(p.name)
-        p.typeKey = uirCoreOwnStrBestEffort(p.typeKey)
+        p.name = uirCoreOwnStrBestEffortOrEmpty(p.name)
+        p.typeKey = uirCoreOwnStrBestEffortOrEmpty(p.typeKey)
         uirCoreAppendParam(out, p)
     return out
 
@@ -1585,8 +1700,8 @@ fn uirCoreCloneObjLocalSeq(src: UirCoreObjLocal[]): UirCoreObjLocal[] =
     reserve(out, n)
     for i in 0..<n:
         var ol: UirCoreObjLocal = src[i]
-        ol.objTypeName = uirCoreOwnStrBestEffort(ol.objTypeName)
-        ol.typeKey = uirCoreOwnStrBestEffort(ol.typeKey)
+        ol.objTypeName = uirCoreOwnStrBestEffortOrEmpty(ol.objTypeName)
+        ol.typeKey = uirCoreOwnStrBestEffortOrEmpty(ol.typeKey)
         uirCoreAppendObjLocal(out, ol)
     return out
 
@@ -1684,18 +1799,6 @@ fn uirCoreBlockStmtsFlatSet(idx: int32, stmt: UirStmtId) =
         panic "uirCore_types: flat stmt backing out of sync"
     uirCoreStmtSeqSet(&uirCore_blockStmtsFlat, idx, stmt)
 
-fn uirCoreAppendBlockStmtSpanFromSeq(stmts: UirStmtId[]*) =
-    let start: int32 = uirCoreBlockStmtsFlatLen()
-    let stmtLen: int32 = (stmts != nil) ? stmts->len : 0
-    if stmts != nil && stmtLen > 0:
-        for i in 0..<stmtLen:
-            uirCoreBlockStmtsFlatAppend(stmts[i])
-    seqs.add(uirCore_blockPool_stmtStart, start)
-    seqs.add(uirCore_blockPool_stmtLenFlat, stmtLen)
-
-fn uirCoreAppendBlockStmtSpan(val: UirStmtId[]) =
-    uirCoreAppendBlockStmtSpanFromSeq(&val)
-
 var
     uirCore_exprPool_ready: bool = false
     uirCore_exprPool_kind: int32[]
@@ -1725,12 +1828,23 @@ var
     uirCore_stmtPool_storeType: int32[]
     uirCore_blockPool_ready: bool = false
     uirCore_blockPool_label: str[]
-    uirCore_blockPool_stmtsSeq: UirStmtId[][]
     uirCore_blockPool_stmtStart: int32[]
     uirCore_blockPool_stmtLenFlat: int32[]
     uirCore_blockStmtsFlat: UirStmtId[]
     uirCore_blockStmtsFlatCount: int32 = 0
     uirCore_blockPool_term: UirCoreTerm[]
+
+fn uirCoreAppendBlockStmtSpanFromSeq(stmts: UirStmtId[]*) =
+    let start: int32 = uirCoreBlockStmtsFlatLen()
+    let stmtLen: int32 = (stmts != nil) ? stmts->len : 0
+    if stmts != nil && stmtLen > 0:
+        for i in 0..<stmtLen:
+            uirCoreBlockStmtsFlatAppend(stmts[i])
+    seqs.add(uirCore_blockPool_stmtStart, start)
+    seqs.add(uirCore_blockPool_stmtLenFlat, stmtLen)
+
+fn uirCoreAppendBlockStmtSpan(val: UirStmtId[]) =
+    uirCoreAppendBlockStmtSpanFromSeq(&val)
 
 fn uirCore_exprPoolInit() =
     if uirCore_exprPool_ready:
@@ -1799,7 +1913,6 @@ fn uirCore_blockPoolInit() =
     if uirCore_blockPool_ready:
         return
     uirCore_blockPool_label = []
-    uirCore_blockPool_stmtsSeq = []
     uirCore_blockPool_stmtStart = []
     uirCore_blockPool_stmtLenFlat = []
     uirCoreResetStmtIdSeq(&uirCore_blockStmtsFlat)
@@ -1813,8 +1926,6 @@ fn uirCore_blockPoolInit() =
     nilTerm.targetTrue = ""
     nilTerm.targetFalse = ""
     seqs.add(uirCore_blockPool_label, "")
-    var noStmts: UirStmtId[]
-    uirCoreAppendStmtSeq(uirCore_blockPool_stmtsSeq, noStmts)
     seqs.add(uirCore_blockPool_stmtStart, int32(0))
     seqs.add(uirCore_blockPool_stmtLenFlat, int32(0))
     seqs.add(uirCore_blockPool_term, nilTerm)
@@ -1879,8 +1990,6 @@ fn uirCoreBlockPoolReserve(needLen: int32) =
     let target: int32 = uirCoreReserveTargetCap(uirCore_blockPool_label.cap, needLen, 128)
     if uirCore_blockPool_label.cap < target:
         reserve(uirCore_blockPool_label, target)
-    if uirCore_blockPool_stmtsSeq.cap < target:
-        reserve(uirCore_blockPool_stmtsSeq, target)
     if uirCore_blockPool_stmtStart.cap < target:
         reserve(uirCore_blockPool_stmtStart, target)
     if uirCore_blockPool_stmtLenFlat.cap < target:
@@ -2950,78 +3059,10 @@ var
     uirCore_cstrs_cache_ready: bool
 
 fn uirCoreHashMapStrIntGetCompat(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
-    if len(key) == 0 || m.mask == 0:
-        found = false
-        return -1
-    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
-        found = false
-        return -1
-    var mask: int32 = int32(m.mask)
-    if mask < 0:
-        found = false
-        return -1
-    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
-        let cap0: int32 = m.states.len
-        if m.keys.len < cap0 || m.vals.len < cap0:
-            found = false
-            return -1
-        mask = cap0 - 1
-    if mask < 0:
-        found = false
-        return -1
-    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
-    var scanned: int32 = 0
-    let __for_start_scanned_compat = scanned
-    for __for_scanned_compat in __for_start_scanned_compat..mask:
-        scanned = __for_scanned_compat
-        let st: uint8 = m.states[probe]
-        if st == uint8(0):
-            found = false
-            return -1
-        if hashmaps.hashMapStrEq(m.keys[probe], key):
-            found = true
-            return m.vals[probe]
-        probe = (probe + 1) & mask
-        scanned = scanned + 1
-    found = false
-    return -1
+    return hashmaps.hashMapStrIntGet(m, key, found)
 
 fn uirCoreHashMapStrIntGetCompat(m: var hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
-    if len(key) == 0 || m.mask == 0:
-        found = false
-        return -1
-    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
-        found = false
-        return -1
-    var mask: int32 = int32(m.mask)
-    if mask < 0:
-        found = false
-        return -1
-    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
-        let cap0: int32 = m.states.len
-        if m.keys.len < cap0 || m.vals.len < cap0:
-            found = false
-            return -1
-        mask = cap0 - 1
-    if mask < 0:
-        found = false
-        return -1
-    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
-    var scanned: int32 = 0
-    let __for_start_scanned_compat_mut = scanned
-    for __for_scanned_compat_mut in __for_start_scanned_compat_mut..mask:
-        scanned = __for_scanned_compat_mut
-        let st: uint8 = m.states[probe]
-        if st == uint8(0):
-            found = false
-            return -1
-        if st == uint8(1) && hashmaps.hashMapStrEq(m.keys[probe], key):
-            found = true
-            return m.vals[probe]
-        probe = (probe + 1) & mask
-        scanned = scanned + 1
-    found = false
-    return -1
+    return hashmaps.hashMapStrIntGet(m, key, found)
 
 
 fn uirCore_buildTypeAliasIndexCache(module: UirCoreModule) =
@@ -3620,13 +3661,6 @@ fn uirCoreWriteStmt(seqInst: UirStmtId[]*, idx: int32, val: UirStmtId) =
         panic "uirCore_types: seq index out of bounds"
     seqInst[idx] = val
 
-fn uirCoreWriteStmtSeq2D(seqInst: UirStmtId[][]*, idx: int32, val: UirStmtId[]) =
-    if (seqInst == nil):
-        panic "uirCore_types: nil seq pointer"
-    if idx < 0 || idx >= seqInst->len:
-        panic "uirCore_types: seq index out of bounds"
-    seqInst[idx] = uirCoreCloneStmtSeq(val)
-
 fn uirCoreWriteBlock(seqInst: UirBlockId[]*, idx: int32, val: UirBlockId) =
     if (seqInst == nil):
         panic "uirCore_types: nil seq pointer"
@@ -3822,7 +3856,7 @@ fn uirCoreSetLocalType(func: UirCoreFunc, slot: int32, ty: UirCoreType) =
     dyn.localTypes = localTypes0
     uirCoreFuncSyncObjPayloadFromDyn(func, dyn)
 
-fn uirCoreAddParam(func: UirCoreFunc, name: str, slot: int32, ty: UirCoreType, typeKey: str = "") =
+fn uirCoreAddParam(func: UirCoreFunc, name: str, slot: int32, ty: UirCoreType, typeKey: str) =
     var p: UirCoreParam
     p.name = uirCoreOwnStrSafe(name)
     p.slot = slot
@@ -3839,6 +3873,9 @@ fn uirCoreAddParam(func: UirCoreFunc, name: str, slot: int32, ty: UirCoreType, t
     dyn.params = params0
     uirCoreFuncSyncObjPayloadFromDyn(func, dyn)
     uirCoreSetLocalType(func, slot, ty)
+
+fn uirCoreAddParamNoTypeKey(func: UirCoreFunc, name: str, slot: int32, ty: UirCoreType) =
+    uirCoreAddParam(func, name, slot, ty, "")
 
 fn uirCoreNewModule(target: str): UirCoreModule =
     var __cheng_new_tmp_module: UirCoreModule
@@ -4511,10 +4548,6 @@ fn uirCoreBlockStmtsLen(blk: UirBlockId): int32 =
             let stmtStart: int32 = uirCore_blockPool_stmtStart[blk]
             if stmtStart >= 0 && stmtStart + stmtLen <= uirCoreBlockStmtsFlatLen():
                 return stmtLen
-    if blk < uirCore_blockPool_stmtsSeq.len:
-        let stmtsSeq: UirStmtId[] = uirCore_blockPool_stmtsSeq[blk]
-        if uirCoreStmtSeqSane(stmtsSeq):
-            return stmtsSeq.len
     return 0
 
 fn uirCoreBlockStmtAt(blk: UirBlockId, idx: int32): UirStmtId =
@@ -4527,12 +4560,6 @@ fn uirCoreBlockStmtAt(blk: UirBlockId, idx: int32): UirStmtId =
             let pos: int32 = stmtStart + idx
             if stmtStart >= 0 && pos >= 0 && pos < uirCoreBlockStmtsFlatLen():
                 return uirCoreBlockStmtsFlatAt(pos)
-    if blk < uirCore_blockPool_stmtsSeq.len:
-        let stmtsSeq: UirStmtId[] = uirCore_blockPool_stmtsSeq[blk]
-        if uirCoreStmtSeqSane(stmtsSeq):
-            if idx < 0 || idx >= stmtsSeq.len:
-                return uirCoreInvalidId()
-            return stmtsSeq[idx]
     return uirCoreInvalidId()
 
 fn uirCoreBlockSetStmtAt(blk: UirBlockId, idx: int32, stmt: UirStmtId) =
@@ -4547,17 +4574,10 @@ fn uirCoreBlockSetStmtAt(blk: UirBlockId, idx: int32, stmt: UirStmtId) =
         if stmtStart < 0 || pos < 0 || pos >= uirCoreBlockStmtsFlatLen():
             panic "uirCore_types: block stmt flat column out of sync"
         uirCoreBlockStmtsFlatSet(pos, stmt)
-    if blk < uirCore_blockPool_stmtsSeq.len:
-        var stmtsSeq: UirStmtId[] = uirCore_blockPool_stmtsSeq[blk]
-        if uirCoreStmtSeqSane(stmtsSeq) && idx < stmtsSeq.len:
-            stmtsSeq[idx] = stmt
-            uirCoreWriteStmtSeq2D(&uirCore_blockPool_stmtsSeq, blk, stmtsSeq)
 
 fn uirCoreBlockSetStmts(blk: UirBlockId, stmts: UirStmtId[]) =
     if (!uirCoreBlockIdValid(blk)):
         return
-    if blk < uirCore_blockPool_stmtsSeq.len:
-        uirCoreWriteStmtSeq2D(&uirCore_blockPool_stmtsSeq, blk, stmts)
     let start: int32 = uirCoreBlockStmtsFlatLen()
     let stmtLen: int32 = stmts.len
     if stmtLen > 0:
@@ -5749,71 +5769,78 @@ fn uirCoreCStringValueOf(cstr: UirCoreCString): str =
 
 # Concrete Result specializations needed by stage1/self-link bootstrap.
 fn Ok_UirCoreExpr(value: UirExprId): Result[UirExprId] =
-    var out: Result[UirExprId]
-    out.ok = true
-    out.value = value
-    ErrorOkInto(out.err)
-    return out
+    return Ok[UirExprId](value)
 
 fn Err_UirCoreExpr(err: str): Result[UirExprId] =
-    var out: Result[UirExprId]
-    out.ok = false
-    ErrorNewInto(out.err, err)
-    return out
+    return Err[UirExprId](err)
 
 fn ErrInfo_UirCoreExpr(err: ErrorInfo): Result[UirExprId] =
-    var out: Result[UirExprId]
-    out.ok = false
-    out.err = err
-    return out
+    return ErrInfo[UirExprId](err)
 
 fn Ok_UirCoreFunc(value: UirCoreFunc): Result[UirCoreFunc] =
-    var out: Result[UirCoreFunc]
-    out.ok = true
-    out.value = value
-    ErrorOkInto(out.err)
-    return out
+    return Ok[UirCoreFunc](value)
 
 fn Err_UirCoreFunc(err: str): Result[UirCoreFunc] =
-    var out: Result[UirCoreFunc]
-    out.ok = false
-    ErrorNewInto(out.err, err)
-    return out
+    return Err[UirCoreFunc](err)
 
 fn ErrInfo_UirCoreFunc(err: ErrorInfo): Result[UirCoreFunc] =
-    var out: Result[UirCoreFunc]
-    out.ok = false
-    out.err = err
-    return out
+    return ErrInfo[UirCoreFunc](err)
 
 fn Ok_UirCoreModule(value: UirCoreModule): Result[UirCoreModule] =
-    var out: Result[UirCoreModule]
     if (value == nil):
-        out.ok = false
-        ErrorNewInto(out.err, "uir core module ok(nil) is forbidden")
-        return out
-    out.ok = true
-    out.value = value
-    ErrorOkInto(out.err)
-    return out
+        return Err[UirCoreModule]("uir core module ok(nil) is forbidden")
+    return Ok[UirCoreModule](value)
 
 fn Err_UirCoreModule(err: str): Result[UirCoreModule] =
-    var out: Result[UirCoreModule]
-    out.ok = false
-    ErrorNewInto(out.err, err)
-    return out
+    return Err[UirCoreModule](err)
 
 fn ErrInfo_UirCoreModule(err: ErrorInfo): Result[UirCoreModule] =
-    var out: Result[UirCoreModule]
-    out.ok = false
-    out.err = err
-    return out
+    return ErrInfo[UirCoreModule](err)
 
 fn ErrorInfoOf_UirCoreModule(r: Result[UirCoreModule]): ErrorInfo =
-    return r.err
+    return ErrorInfoOf[UirCoreModule](r)
 
 fn uirCoreGlobalNameOf(global: UirCoreGlobal): str =
     return global.name
+
+fn uirCoreNameOf(param: UirCoreParam): str =
+    return param.name
+
+fn uirCoreNameOf(field: UirCoreObjField): str =
+    return field.name
+
+fn uirCoreNameOf(objType: UirCoreObjType): str =
+    return objType.name
+
+fn uirCoreNameOf(global: UirCoreGlobal): str =
+    return global.name
+
+fn uirCoreTypeOf(param: UirCoreParam): UirCoreType =
+    return param.ty
+
+fn uirCoreTypeOf(field: UirCoreObjField): UirCoreType =
+    return field.ty
+
+fn uirCoreTypeOf(global: UirCoreGlobal): UirCoreType =
+    return global.ty
+
+fn uirCoreSlotOf(param: UirCoreParam): int32 =
+    return param.slot
+
+fn uirCoreSlotOf(ol: UirCoreObjLocal): int32 =
+    return ol.slot
+
+fn uirCoreTypeKeyOf(param: UirCoreParam): str =
+    return param.typeKey
+
+fn uirCoreTypeKeyOf(ol: UirCoreObjLocal): str =
+    return ol.typeKey
+
+fn uirCoreFrameOffOf(ol: UirCoreObjLocal): int32 =
+    return ol.frameOff
+
+fn uirCoreObjTypeNameOf(ol: UirCoreObjLocal): str =
+    return ol.objTypeName
 
 fn uirCoreGlobalTypeOf(global: UirCoreGlobal): UirCoreType =
     return global.ty
@@ -5826,6 +5853,30 @@ fn uirCoreGlobalInitOf(global: UirCoreGlobal): int64 =
 
 fn uirCoreGlobalOriginFileOf(global: UirCoreGlobal): str =
     return global.originFile
+
+fn uirCoreObjTypeNameOf(objType: UirCoreObjType): str =
+    return objType.name
+
+fn uirCoreFieldsLen(objType: UirCoreObjType): int32 =
+    return objType.fields.len
+
+fn uirCoreFieldAt(objType: UirCoreObjType, idx: int32): UirCoreObjField =
+    var zero: UirCoreObjField
+    if idx < 0 || idx >= objType.fields.len:
+        return zero
+    return objType.fields[idx]
+
+fn uirCoreSizeOf(objType: UirCoreObjType): int32 =
+    return objType.size
+
+fn uirCoreOffsetOf(field: UirCoreObjField): int32 =
+    return field.offset
+
+fn uirCoreObjTypeSizeOf(objType: UirCoreObjType): int32 =
+    return objType.size
+
+fn uirCoreAlignPow2Of(objType: UirCoreObjType): int32 =
+    return objType.alignPow2
 
 fn uirCoreFnv1a64(s: str): int64 =
     var h: uint64 = uint64(1469598103934665603)

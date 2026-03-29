@@ -9,7 +9,6 @@ Usage:
   src/tooling/verify_backend_stage0_no_compat.sh [--help]
 
 Env:
-  STAGE0_NO_COMPAT_STAGE0=<path>                 optional stage0 override
   STAGE0_NO_COMPAT_SESSION=<name>                default: prod.stage0_no_compat
   STAGE0_NO_COMPAT_MODE=<fast|strict>            default: fast
   STAGE0_NO_COMPAT_TIMEOUT=<seconds>             default: 60
@@ -167,36 +166,15 @@ mkdir -p "$out_dir" chengcache
 metrics_out="${STAGE0_NO_COMPAT_METRICS:-$out_dir/selfhost_metrics_${session_safe}.json}"
 rm -f "$metrics_out"
 
-stage0="${STAGE0_NO_COMPAT_STAGE0:-}"
-if [ "$stage0" != "" ]; then
-  stage0="$(to_abs "$stage0")"
-  if ! driver_stage0_probe_ok "$stage0"; then
-    echo "[verify_backend_stage0_no_compat] explicit stage0 probe failed: $stage0" 1>&2
-    [ -s "$out_dir/stage0_probe.log" ] && echo "[verify_backend_stage0_no_compat] probe log: $out_dir/stage0_probe.log" 1>&2
-    exit 1
-  fi
-else
-  stage0=""
-  for cand in \
-    "${BACKEND_DRIVER:-}" \
-    "artifacts/backend_selfhost_self_obj/cheng.stage2" \
-    "artifacts/backend_selfhost_self_obj/cheng.stage1" \
-    "artifacts/backend_seed/cheng.stage2" \
-    "dist/releases/current/cheng" \
-    "artifacts/backend_driver/cheng" \
-    "./cheng"; do
-    [ "$cand" != "" ] || continue
-    cand_abs="$(to_abs "$cand")"
-    if driver_stage0_probe_ok "$cand_abs"; then
-      stage0="$cand_abs"
-      break
-    fi
-  done
-  if [ "$stage0" = "" ]; then
-    echo "[verify_backend_stage0_no_compat] missing runnable stage0 candidate" 1>&2
-    [ -s "$out_dir/stage0_probe.log" ] && echo "[verify_backend_stage0_no_compat] last probe log: $out_dir/stage0_probe.log" 1>&2
-    exit 1
-  fi
+stage0="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)"
+if [ "$stage0" = "" ]; then
+  echo "[verify_backend_stage0_no_compat] missing runnable canonical stage0" 1>&2
+  exit 1
+fi
+if ! driver_stage0_probe_ok "$stage0"; then
+  echo "[verify_backend_stage0_no_compat] canonical stage0 probe failed: $stage0" 1>&2
+  [ -s "$out_dir/stage0_probe.log" ] && echo "[verify_backend_stage0_no_compat] probe log: $out_dir/stage0_probe.log" 1>&2
+  exit 1
 fi
 
 echo "== backend.stage0_no_compat =="
@@ -214,7 +192,6 @@ env \
   SELF_OBJ_BOOTSTRAP_OUT_DIR="$out_dir" \
   SELF_OBJ_BOOTSTRAP_METRICS_OUT="$metrics_out" \
   SELF_OBJ_BOOTSTRAP_REUSE="$reuse" \
-  SELF_OBJ_BOOTSTRAP_STAGE0="$stage0" \
   SELF_OBJ_BOOTSTRAP_STAGE0_COMPAT=0 \
   SELF_OBJ_BOOTSTRAP_VALIDATE="$validate" \
   SELF_OBJ_BOOTSTRAP_SKIP_SMOKE="$skip_smoke" \

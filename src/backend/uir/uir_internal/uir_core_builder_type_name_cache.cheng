@@ -1,21 +1,26 @@
 # Shared builder-local type-name cache helpers split from uir_core_builder.
-import std/hashmaps
 import std/seqs
 import std/system
-import std/rawmem_support
 import backend/uir/uir_internal/uir_core_types
 import backend/uir/uir_internal/uir_core_builder_symbol_state
 
 fn uir_core_builder_type_name_cache_add(dst: var str[], val: str) =
     seqs.add(dst, val)
 
+fn uir_core_builder_type_name_cache_add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+fn uir_core_builder_type_name_cache_add(dst: var int64[], val: int64) =
+    seqs.add(dst, val)
+
 var uirCore_typeKeyObjName_cache_module: UirCoreModule
 var uirCore_typeKeyObjName_cache_obj_types_len: int32
 var uirCore_typeKeyObjName_cache_alias_len: int32
-var uirCore_typeKeyObjName_index: hashmaps.HashMapStrInt
-var uirCore_typeKeyObjName_ptr_index: hashmaps.HashMapPtrInt
+var uirCore_typeKeyObjName_keys: str[]
 var uirCore_typeKeyObjName_values: str[]
-var uirCore_typeTextObjName_text_index: hashmaps.HashMapPtrInt
+var uirCore_typeKeyObjName_ptr_keys: int64[]
+var uirCore_typeKeyObjName_ptr_vals: int32[]
+var uirCore_typeTextObjName_text_keys: int64[]
 var uirCore_typeTextObjName_values: str[]
 var uirCore_typeKeyObjName_recent_module: UirCoreModule
 var uirCore_typeKeyObjName_recent_obj_types_len: int32
@@ -29,31 +34,51 @@ fn uirCoreTypeKeyObjNamePtrKey(s: str): int64 =
         return 0
     return int64(strDataPtr(s))
 
+fn uirCoreTypeNameTextFind(keys: str[], key0: str): int32 =
+    if len(key0) == 0 || keys.len <= 0:
+        return -1
+    var i: int32 = keys.len - 1
+    while i >= 0:
+        if keys[i] == key0:
+            return i
+        i = i - 1
+    return -1
+
+fn uirCoreTypeNamePtrFind(keys: int64[], key0: int64): int32 =
+    if key0 == 0 || keys.len <= 0:
+        return -1
+    var i: int32 = keys.len - 1
+    while i >= 0:
+        if keys[i] == key0:
+            return i
+        i = i - 1
+    return -1
+
+fn uirCoreTypeNameStableText(s: str): str =
+    if len(s) == 0:
+        return ""
+    let stable: str = uirCoreOwnStr(s)
+    return len(stable) > 0 ? stable : s
+
 fn uirCoreTypeKeyObjNameCacheReset(mod: UirCoreModule = nil) =
     uirCore_typeKeyObjName_cache_module = mod
     let objTypeLen: int32 = (mod != nil) ? uirCoreModuleObjTypesLen(mod) : 0
     let aliasLen: int32 = uirCoreObjAliasCount()
     let cacheCap: int32 = (objTypeLen > 0) ? (objTypeLen * 8 + 64) : 2048
-    if uirCore_typeKeyObjName_index.mask == 0:
-        uirCore_typeKeyObjName_index = hashmaps.hashMapStrIntInit(cacheCap)
-    else:
-        hashmaps.hashMapStrIntClear(uirCore_typeKeyObjName_index)
-    if uirCore_typeKeyObjName_ptr_index.mask == 0:
-        uirCore_typeKeyObjName_ptr_index = hashmaps.hashMapPtrIntInit(cacheCap)
-    else:
-        hashmaps.hashMapPtrIntClear(uirCore_typeKeyObjName_ptr_index)
+    setLen(uirCore_typeKeyObjName_keys, 0)
+    setLen(uirCore_typeKeyObjName_values, 0)
+    setLen(uirCore_typeKeyObjName_ptr_keys, 0)
+    setLen(uirCore_typeKeyObjName_ptr_vals, 0)
+    setLen(uirCore_typeTextObjName_text_keys, 0)
+    setLen(uirCore_typeTextObjName_values, 0)
+    reserve(uirCore_typeKeyObjName_keys, cacheCap)
+    reserve(uirCore_typeKeyObjName_values, cacheCap)
+    reserve(uirCore_typeKeyObjName_ptr_keys, cacheCap)
+    reserve(uirCore_typeKeyObjName_ptr_vals, cacheCap)
+    reserve(uirCore_typeTextObjName_text_keys, cacheCap)
+    reserve(uirCore_typeTextObjName_values, cacheCap)
     uirCore_typeKeyObjName_cache_obj_types_len = objTypeLen
     uirCore_typeKeyObjName_cache_alias_len = aliasLen
-    uirCore_typeKeyObjName_values.len = 0
-    if uirCore_typeKeyObjName_values.cap < cacheCap:
-        uirCore_typeKeyObjName_values.cap = cacheCap
-    if uirCore_typeTextObjName_text_index.mask == 0:
-        uirCore_typeTextObjName_text_index = hashmaps.hashMapPtrIntInit(cacheCap)
-    else:
-        hashmaps.hashMapPtrIntClear(uirCore_typeTextObjName_text_index)
-    uirCore_typeTextObjName_values.len = 0
-    if uirCore_typeTextObjName_values.cap < cacheCap:
-        uirCore_typeTextObjName_values.cap = cacheCap
     uirCore_typeKeyObjName_recent_module = nil
     uirCore_typeKeyObjName_recent_obj_types_len = -1
     uirCore_typeKeyObjName_recent_alias_len = -1
@@ -78,36 +103,24 @@ fn uirCoreTypeTextObjNameCacheGet(mod: UirCoreModule, textId: int32, found: var 
         return ""
     if uirCoreTypeKeyObjNameCacheNeedsReset(mod):
         uirCoreTypeKeyObjNameCacheReset(mod)
-    var foundText: bool = false
-    let raw: int32 = hashmaps.hashMapPtrIntGet(uirCore_typeTextObjName_text_index, int64(textId), foundText)
-    if !foundText:
+    let idx: int32 = uirCoreTypeNamePtrFind(uirCore_typeTextObjName_text_keys, int64(textId))
+    if idx < 0 || idx >= uirCore_typeTextObjName_values.len:
         return ""
     found = true
-    if raw > 0:
-        let idx: int32 = raw - 1
-        if idx >= 0 && idx < uirCore_typeTextObjName_values.len:
-            return get_string(uirCore_typeTextObjName_values, idx)
-    return ""
+    return uirCore_typeTextObjName_values[idx]
 
 fn uirCoreTypeTextObjNameCachePut(mod: UirCoreModule, textId: int32, objName: str) =
     if mod == nil || textId <= 0:
         return
     if uirCoreTypeKeyObjNameCacheNeedsReset(mod):
         uirCoreTypeKeyObjNameCacheReset(mod)
-    var foundText: bool = false
-    let raw: int32 = hashmaps.hashMapPtrIntGet(uirCore_typeTextObjName_text_index, int64(textId), foundText)
-    if foundText:
-        if raw > 0:
-            let idx: int32 = raw - 1
-            if idx >= 0 && idx < uirCore_typeTextObjName_values.len:
-                uirCore_typeTextObjName_values[idx] = objName
-                hashmaps.hashMapPtrIntPut(uirCore_typeTextObjName_text_index, int64(textId), len(objName) > 0 ? (idx + 1) : 0)
-                return
-        elif len(objName) == 0:
-            return
-    let newIdx: int32 = uirCore_typeTextObjName_values.len
-    uir_core_builder_type_name_cache_add(uirCore_typeTextObjName_values, objName)
-    hashmaps.hashMapPtrIntPut(uirCore_typeTextObjName_text_index, int64(textId), len(objName) > 0 ? (newIdx + 1) : 0)
+    let idx: int32 = uirCoreTypeNamePtrFind(uirCore_typeTextObjName_text_keys, int64(textId))
+    let objText: str = uirCoreTypeNameStableText(objName)
+    if idx >= 0 && idx < uirCore_typeTextObjName_values.len:
+        uirCore_typeTextObjName_values[idx] = objText
+        return
+    uir_core_builder_type_name_cache_add(uirCore_typeTextObjName_text_keys, int64(textId))
+    uir_core_builder_type_name_cache_add(uirCore_typeTextObjName_values, objText)
 
 fn uirCoreTypeKeyObjNameCacheGet(mod: UirCoreModule, key: str, found: var bool): str =
     found = false
@@ -125,21 +138,19 @@ fn uirCoreTypeKeyObjNameCacheGet(mod: UirCoreModule, key: str, found: var bool):
         found = true
         return uirCore_typeKeyObjName_recent_val
     if ptrKey != 0:
-        var foundPtr: bool = false
-        let rawPtr: int32 = hashmaps.hashMapPtrIntGet(uirCore_typeKeyObjName_ptr_index, ptrKey, foundPtr)
-        if foundPtr:
+        let ptrIdx: int32 = uirCoreTypeNamePtrFind(uirCore_typeKeyObjName_ptr_keys, ptrKey)
+        if ptrIdx >= 0 && ptrIdx < uirCore_typeKeyObjName_ptr_vals.len:
             found = true
-            if rawPtr > 0:
-                let ptrIdx: int32 = rawPtr - 1
-                if ptrIdx >= 0 && ptrIdx < uirCore_typeKeyObjName_values.len:
-                    let outPtr: str = get_string(uirCore_typeKeyObjName_values, ptrIdx)
-                    uirCore_typeKeyObjName_recent_module = mod
-                    uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
-                    uirCore_typeKeyObjName_recent_alias_len = uirCoreObjAliasCount()
-                    uirCore_typeKeyObjName_recent_ptr = ptrKey
-                    uirCore_typeKeyObjName_recent_val = outPtr
-                    uirCore_typeKeyObjName_recent_valid = true
-                    return outPtr
+            let rawIdx: int32 = uirCore_typeKeyObjName_ptr_vals[ptrIdx]
+            if rawIdx >= 0 && rawIdx < uirCore_typeKeyObjName_values.len:
+                let outPtr: str = uirCore_typeKeyObjName_values[rawIdx]
+                uirCore_typeKeyObjName_recent_module = mod
+                uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
+                uirCore_typeKeyObjName_recent_alias_len = uirCoreObjAliasCount()
+                uirCore_typeKeyObjName_recent_ptr = ptrKey
+                uirCore_typeKeyObjName_recent_val = outPtr
+                uirCore_typeKeyObjName_recent_valid = true
+                return outPtr
             uirCore_typeKeyObjName_recent_module = mod
             uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
             uirCore_typeKeyObjName_recent_alias_len = uirCoreObjAliasCount()
@@ -147,12 +158,18 @@ fn uirCoreTypeKeyObjNameCacheGet(mod: UirCoreModule, key: str, found: var bool):
             uirCore_typeKeyObjName_recent_val = ""
             uirCore_typeKeyObjName_recent_valid = true
             return ""
-    let idx: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_typeKeyObjName_index, key, found)
-    if !found || idx < 0 || idx >= uirCore_typeKeyObjName_values.len:
+    let idx: int32 = uirCoreTypeNameTextFind(uirCore_typeKeyObjName_keys, key)
+    if idx < 0 || idx >= uirCore_typeKeyObjName_values.len:
         return ""
+    found = true
     if ptrKey != 0:
-        hashmaps.hashMapPtrIntPut(uirCore_typeKeyObjName_ptr_index, ptrKey, idx + 1)
-    let out: str = get_string(uirCore_typeKeyObjName_values, idx)
+        let ptrCacheIdx: int32 = uirCoreTypeNamePtrFind(uirCore_typeKeyObjName_ptr_keys, ptrKey)
+        if ptrCacheIdx >= 0 && ptrCacheIdx < uirCore_typeKeyObjName_ptr_vals.len:
+            uirCore_typeKeyObjName_ptr_vals[ptrCacheIdx] = idx
+        else:
+            uir_core_builder_type_name_cache_add(uirCore_typeKeyObjName_ptr_keys, ptrKey)
+            uir_core_builder_type_name_cache_add(uirCore_typeKeyObjName_ptr_vals, idx)
+    let out: str = uirCore_typeKeyObjName_values[idx]
     if ptrKey != 0:
         uirCore_typeKeyObjName_recent_module = mod
         uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
@@ -168,88 +185,25 @@ fn uirCoreTypeKeyObjNameCachePut(mod: UirCoreModule, key: str, objName: str) =
     if uirCoreTypeKeyObjNameCacheNeedsReset(mod):
         uirCoreTypeKeyObjNameCacheReset(mod)
     let ptrKey: int64 = uirCoreTypeKeyObjNamePtrKey(key)
+    let keyText: str = uirCoreTypeNameStableText(key)
+    let objText: str = uirCoreTypeNameStableText(objName)
+    var idx: int32 = uirCoreTypeNameTextFind(uirCore_typeKeyObjName_keys, keyText)
+    if idx >= 0 && idx < uirCore_typeKeyObjName_values.len:
+        uirCore_typeKeyObjName_values[idx] = objText
+    else:
+        idx = uirCore_typeKeyObjName_values.len
+        uir_core_builder_type_name_cache_add(uirCore_typeKeyObjName_keys, keyText)
+        uir_core_builder_type_name_cache_add(uirCore_typeKeyObjName_values, objText)
     if ptrKey != 0:
-        var foundPtr: bool = false
-        let rawPtr: int32 = hashmaps.hashMapPtrIntGet(uirCore_typeKeyObjName_ptr_index, ptrKey, foundPtr)
-        if foundPtr:
-            if rawPtr > 0:
-                let ptrIdx: int32 = rawPtr - 1
-                if ptrIdx >= 0 && ptrIdx < uirCore_typeKeyObjName_values.len:
-                    uirCore_typeKeyObjName_values[ptrIdx] = objName
-                    hashmaps.hashMapPtrIntPut(uirCore_typeKeyObjName_ptr_index, ptrKey, len(objName) > 0 ? (ptrIdx + 1) : 0)
-                    uirCore_typeKeyObjName_recent_module = mod
-                    uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
-                    uirCore_typeKeyObjName_recent_alias_len = uirCoreObjAliasCount()
-                    uirCore_typeKeyObjName_recent_ptr = ptrKey
-                    uirCore_typeKeyObjName_recent_val = objName
-                    uirCore_typeKeyObjName_recent_valid = true
-                    return
-            elif len(objName) == 0:
-                uirCore_typeKeyObjName_recent_module = mod
-                uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
-                uirCore_typeKeyObjName_recent_alias_len = uirCoreObjAliasCount()
-                uirCore_typeKeyObjName_recent_ptr = ptrKey
-                uirCore_typeKeyObjName_recent_val = ""
-                uirCore_typeKeyObjName_recent_valid = true
-                return
-    var found: bool = false
-    let idx: int32 = uirCoreHashMapStrIntGetCompatLocal(uirCore_typeKeyObjName_index, key, found)
-    if found && idx >= 0 && idx < uirCore_typeKeyObjName_values.len:
-        uirCore_typeKeyObjName_values[idx] = objName
-        if ptrKey != 0:
-            hashmaps.hashMapPtrIntPut(uirCore_typeKeyObjName_ptr_index, ptrKey, len(objName) > 0 ? (idx + 1) : 0)
-            uirCore_typeKeyObjName_recent_module = mod
-            uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
-            uirCore_typeKeyObjName_recent_alias_len = uirCoreObjAliasCount()
-            uirCore_typeKeyObjName_recent_ptr = ptrKey
-            uirCore_typeKeyObjName_recent_val = objName
-            uirCore_typeKeyObjName_recent_valid = true
-        return
-    let newIdx: int32 = uirCore_typeKeyObjName_values.len
-    uir_core_builder_type_name_cache_add(uirCore_typeKeyObjName_values, objName)
-    hashmaps.hashMapStrIntPut(uirCore_typeKeyObjName_index, key, newIdx)
-    if ptrKey != 0:
-        hashmaps.hashMapPtrIntPut(uirCore_typeKeyObjName_ptr_index, ptrKey, len(objName) > 0 ? (newIdx + 1) : 0)
+        let ptrIdx: int32 = uirCoreTypeNamePtrFind(uirCore_typeKeyObjName_ptr_keys, ptrKey)
+        if ptrIdx >= 0 && ptrIdx < uirCore_typeKeyObjName_ptr_vals.len:
+            uirCore_typeKeyObjName_ptr_vals[ptrIdx] = idx
+        else:
+            uir_core_builder_type_name_cache_add(uirCore_typeKeyObjName_ptr_keys, ptrKey)
+            uir_core_builder_type_name_cache_add(uirCore_typeKeyObjName_ptr_vals, idx)
         uirCore_typeKeyObjName_recent_module = mod
         uirCore_typeKeyObjName_recent_obj_types_len = uirCoreModuleObjTypesLen(mod)
         uirCore_typeKeyObjName_recent_alias_len = uirCoreObjAliasCount()
         uirCore_typeKeyObjName_recent_ptr = ptrKey
-        uirCore_typeKeyObjName_recent_val = objName
+        uirCore_typeKeyObjName_recent_val = objText
         uirCore_typeKeyObjName_recent_valid = true
-
-fn uirCoreHashMapStrIntGetCompatLocal(m: hashmaps.HashMapStrInt, key: str, found: var bool): int32 =
-    if len(key) == 0 || m.mask == 0:
-        found = false
-        return -1
-    if m.states.len <= 0 || m.keys.len <= 0 || m.vals.len <= 0:
-        found = false
-        return -1
-    var mask: int32 = int32(m.mask)
-    if mask < 0:
-        found = false
-        return -1
-    if mask >= m.states.len || mask >= m.keys.len || mask >= m.vals.len:
-        let cap0: int32 = m.states.len
-        if m.keys.len < cap0 || m.vals.len < cap0:
-            found = false
-            return -1
-        mask = cap0 - 1
-    if mask < 0:
-        found = false
-        return -1
-    var probe: int32 = int32(hashmaps.hashMapHash64StrMeta(key) & uint64(mask))
-    var scanned: int32 = 0
-    let __for_start_scanned_compat = scanned
-    for __for_scanned_compat in __for_start_scanned_compat..mask:
-        scanned = __for_scanned_compat
-        let st: uint8 = m.states[probe]
-        if st == uint8(0):
-            found = false
-            return -1
-        if hashmaps.hashMapStrEq(m.keys[probe], key):
-            found = true
-            return m.vals[probe]
-        probe = (probe + 1) & mask
-        scanned = scanned + 1
-    found = false
-    return -1

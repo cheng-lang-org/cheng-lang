@@ -6,9 +6,9 @@ import std/system
 import stage1/ast
 import stage1/frontend_lib
 import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
 import backend/uir/uir_internal/uir_core_builder_symbol_state
 import backend/uir/uir_internal/uir_core_builder_type_name_cache
-import backend/uir/uir_internal/uir_core_builder_text_helpers
 
 fn uir_core_builder_current_root_cache_add(dst: var Node[], val: Node) =
     seqs.add(dst, val)
@@ -25,14 +25,17 @@ fn uirCoreCurrentRootCacheStableText(s: str): str =
 var uirCore_currentParsedRoot: Node
 var uirCore_typeDeclByName_cache_root: Node
 var uirCore_typeDeclByName_cache_index: hashmaps.HashMapStrInt
+var uirCore_typeDeclByName_cache_index_ready: bool
 var uirCore_typeDeclByName_cache_values: Node[]
 var uirCore_typeDeclByName_cache_ready: bool
 var uirCore_typeDeclByName_indexVisited: hashmaps.HashMapPtrInt
+var uirCore_typeDeclByName_indexVisited_ready: bool
 var uirCore_typeDeclByName_indexBuildInProgress: bool
 var uirCore_typeDeclByName_indexBuildCount: int32
 var uirCore_fieldTypeKeyFromCurrentRoot_cache_module: UirCoreModule
 var uirCore_fieldTypeKeyFromCurrentRoot_cache_root: Node
 var uirCore_fieldTypeKeyFromCurrentRoot_cache_index: hashmaps.HashMapStrInt
+var uirCore_fieldTypeKeyFromCurrentRoot_cache_index_ready: bool
 var uirCore_fieldTypeKeyFromCurrentRoot_cache_values: str[]
 var uirCore_typeNodeObjName_cache_module: UirCoreModule
 var uirCore_typeNodeObjName_cache_obj_types_len: int32
@@ -40,14 +43,24 @@ var uirCore_typeNodeObjName_cache_alias_len: int32
 var uirCore_typeNodeObjName_ready: int8[]
 var uirCore_typeNodeObjName_values: str[]
 
+fn uirCoreCurrentParsedRootGet(): Node =
+    return uirCore_currentParsedRoot
+
+fn uirCoreCurrentParsedRootSet(root: Node) =
+    uirCore_currentParsedRoot = root
+
+fn uirCoreFieldTypeKeyFromCurrentRootCacheMatches(mod: UirCoreModule, root: Node): bool =
+    return uirCore_fieldTypeKeyFromCurrentRoot_cache_module == mod &&
+           uirCore_fieldTypeKeyFromCurrentRoot_cache_root == root
+
 fn uirCoreTypeNodeObjNameCacheReset(mod: UirCoreModule = nil) =
     uirCore_typeNodeObjName_cache_module = mod
     uirCore_typeNodeObjName_cache_obj_types_len = (mod != nil) ? uirCoreModuleObjTypesLen(mod) : 0
     uirCore_typeNodeObjName_cache_alias_len = uirCoreObjAliasCount()
-    setLen(uirCore_typeNodeObjName_ready, 0)
     uirCore_typeNodeObjName_values = []
-    uirCore_typeNodeObjName_values.cap = 256
-    uirCore_typeNodeObjName_ready.cap = 256
+    uirCore_typeNodeObjName_ready = []
+    reserve(uirCore_typeNodeObjName_values, 256)
+    reserve(uirCore_typeNodeObjName_ready, 256)
 
 fn uirCoreTypeNodeObjNameCacheNeedsReset(mod: UirCoreModule): bool =
     if mod == nil:
@@ -65,13 +78,13 @@ fn uirCoreFindTypeDeclByNameCacheReset(root: Node) =
     uirCore_typeDeclByName_cache_ready = false
     if !uirCore_typeDeclByName_indexBuildInProgress:
         uirCore_typeDeclByName_indexBuildCount = 0
-    if uirCore_typeDeclByName_cache_index.mask == 0:
+    if !uirCore_typeDeclByName_cache_index_ready:
         uirCore_typeDeclByName_cache_index = hashmaps.hashMapStrIntInit(256)
+        uirCore_typeDeclByName_cache_index_ready = true
     else:
         hashmaps.hashMapStrIntClear(uirCore_typeDeclByName_cache_index)
-    uirCore_typeDeclByName_cache_values.len = 0
-    if uirCore_typeDeclByName_cache_values.cap < 256:
-        uirCore_typeDeclByName_cache_values.cap = 256
+    uirCore_typeDeclByName_cache_values = []
+    reserve(uirCore_typeDeclByName_cache_values, 256)
 
 fn uirCoreFindTypeDeclByNameCacheGet(root: Node, targetName0: str, found: var bool): Node =
     found = false
@@ -90,7 +103,7 @@ fn uirCoreFindTypeDeclByNameCacheGet(root: Node, targetName0: str, found: var bo
 fn uirCoreFindTypeDeclByNameCachePut(root: Node, targetName0: str, td: Node) =
     if !astNodeIdValid(root) || uirCore_typeDeclByName_cache_root != root || len(targetName0) == 0:
         return
-    if uirCore_typeDeclByName_cache_index.mask == 0:
+    if !uirCore_typeDeclByName_cache_index_ready:
         uirCoreFindTypeDeclByNameCacheReset(root)
     var foundRaw: bool = false
     let targetName: str = uirCoreCurrentRootCacheStableText(targetName0)
@@ -104,6 +117,26 @@ fn uirCoreFindTypeDeclByNameCachePut(root: Node, targetName0: str, td: Node) =
     let newIdx: int32 = uirCore_typeDeclByName_cache_values.len
     uir_core_builder_current_root_cache_add(uirCore_typeDeclByName_cache_values, td)
     hashmaps.hashMapStrIntPut(uirCore_typeDeclByName_cache_index, targetName, newIdx + 1)
+
+fn uirCoreFindTypeDeclByNameIndexVisit(root: Node, n: Node, visitedCount: var int32, foundDeclCount: var int32) =
+    visitedCount = visitedCount + 1
+    if !astNodeIdValid(n):
+        return
+    let nodeKey: int64 = int64(n)
+    var seen: bool = false
+    hashmaps.hashMapPtrIntGetEx(uirCore_typeDeclByName_indexVisited, nodeKey, seen)
+    if seen:
+        return
+    hashmaps.hashMapPtrIntPut(uirCore_typeDeclByName_indexVisited, nodeKey, 1)
+    if astNodeIsTypeDecl(n) && kidCount(n) > 0:
+        let nameNode: Node = kid(n, 0)
+        if astNodeIdValid(nameNode) && astNodeIsIdentOrSymbol(nameNode):
+            let candName: str = backendStripSpaces(plainName(nameNode))
+            if len(candName) > 0:
+                foundDeclCount = foundDeclCount + 1
+                uirCoreFindTypeDeclByNameCachePut(root, candName, n)
+    for i in 0..<kidCount(n):
+        uirCoreFindTypeDeclByNameIndexVisit(root, kid(n, i), visitedCount, foundDeclCount)
 
 fn uirCoreFindTypeDeclByNameIndexBuild(root: Node) =
     let debugTypeDeclProfile: bool = envIsTrue "BACKEND_DEBUG_TYPEDECL_PROFILE"
@@ -123,36 +156,12 @@ fn uirCoreFindTypeDeclByNameIndexBuild(root: Node) =
         uirCore_typeDeclByName_indexBuildInProgress = false
     if !astNodeIdValid(root):
         return
-    if uirCore_typeDeclByName_indexVisited.mask == 0:
+    if !uirCore_typeDeclByName_indexVisited_ready:
         uirCore_typeDeclByName_indexVisited = hashmaps.hashMapPtrIntInit(1024)
+        uirCore_typeDeclByName_indexVisited_ready = true
     else:
         hashmaps.hashMapPtrIntClear(uirCore_typeDeclByName_indexVisited)
-    var stack: Node[]
-    uir_core_builder_current_root_cache_add(stack, root)
-    while stack.len > 0:
-        let n: Node = stack[stack.len - 1]
-        stack.len = stack.len - 1
-        visitedCount = visitedCount + 1
-        if !astNodeIdValid(n):
-            continue
-        let nodeKey: int64 = int64(n)
-        var seen: bool = false
-        hashmaps.hashMapPtrIntGetEx(uirCore_typeDeclByName_indexVisited, nodeKey, seen)
-        if seen:
-            continue
-        hashmaps.hashMapPtrIntPut(uirCore_typeDeclByName_indexVisited, nodeKey, 1)
-        if nodeKind(n) == nkTypeDecl && kidCount(n) > 0:
-            let nameNode: Node = kid(n, 0)
-            if astNodeIdValid(nameNode) && (nodeKind(nameNode) == nkIdent || nodeKind(nameNode) == nkSymbol):
-                let candName: str = backendStripSpaces(plainName(nameNode))
-                if len(candName) > 0:
-                    foundDeclCount = foundDeclCount + 1
-                    uirCoreFindTypeDeclByNameCachePut(root, candName, n)
-        let nKids: int32 = kidCount(n)
-        var i: int32 = nKids - 1
-        while i >= 0:
-            uir_core_builder_current_root_cache_add(stack, kid(n, i))
-            i = i - 1
+    uirCoreFindTypeDeclByNameIndexVisit(root, root, visitedCount, foundDeclCount)
     uirCore_typeDeclByName_cache_ready = true
     if debugTypeDeclProfile:
         let f: os.File = os.get_stderr()
@@ -171,13 +180,13 @@ fn uirCoreFindTypeDeclByNameIndexBuild(root: Node) =
 fn uirCoreFieldTypeKeyFromCurrentRootCacheReset(mod: UirCoreModule, root: Node) =
     uirCore_fieldTypeKeyFromCurrentRoot_cache_module = mod
     uirCore_fieldTypeKeyFromCurrentRoot_cache_root = root
-    if uirCore_fieldTypeKeyFromCurrentRoot_cache_index.mask == 0:
+    if !uirCore_fieldTypeKeyFromCurrentRoot_cache_index_ready:
         uirCore_fieldTypeKeyFromCurrentRoot_cache_index = hashmaps.hashMapStrIntInit(512)
+        uirCore_fieldTypeKeyFromCurrentRoot_cache_index_ready = true
     else:
         hashmaps.hashMapStrIntClear(uirCore_fieldTypeKeyFromCurrentRoot_cache_index)
-    uirCore_fieldTypeKeyFromCurrentRoot_cache_values.len = 0
-    if uirCore_fieldTypeKeyFromCurrentRoot_cache_values.cap < 256:
-        uirCore_fieldTypeKeyFromCurrentRoot_cache_values.cap = 256
+    uirCore_fieldTypeKeyFromCurrentRoot_cache_values = []
+    reserve(uirCore_fieldTypeKeyFromCurrentRoot_cache_values, 256)
 
 fn uirCoreFieldTypeKeyFromCurrentRootCacheGet(mod: UirCoreModule, root: Node, parentType: str, fieldName: str, found: var bool): str =
     found = false
@@ -230,7 +239,7 @@ fn uirCoreTypeObjResolveCachesReset(mod: UirCoreModule = nil) =
 fn uirCoreTypeNodeCacheFallback(typeNode: Node): Node =
     if astNodeIdValid(typeNode) && nodeTypeCacheValid(typeNode) && astRefNonNil(nodeTypeCache(typeNode)):
         let cached: Node = nodeTypeCache(typeNode)
-        if astNodeIdValid(cached) && nodeKind(cached) != nkEmpty && cached != typeNode:
+        if astNodeIdValid(cached) && !astNodeIsEmpty(cached) && cached != typeNode:
             return cached
     return astInvalidNodeId()
 
@@ -240,18 +249,42 @@ fn uirCoreTypeNodeObjNameCacheEnsure(nodeId: Node) =
     let needLen: int32 = int32(nodeId) + 1
     if needLen <= 0:
         return
-    if uirCore_typeNodeObjName_values.cap < needLen:
-        reserve(uirCore_typeNodeObjName_values, needLen)
-    if uirCore_typeNodeObjName_ready.cap < needLen:
-        reserve(uirCore_typeNodeObjName_ready, needLen)
+    reserve(uirCore_typeNodeObjName_values, needLen)
+    reserve(uirCore_typeNodeObjName_ready, needLen)
     if uirCore_typeNodeObjName_values.len < needLen:
         setLen(uirCore_typeNodeObjName_values, needLen)
     if uirCore_typeNodeObjName_ready.len < needLen:
         setLen(uirCore_typeNodeObjName_ready, needLen)
 
+fn uirCoreTypeNodeObjNameCacheValuesLen(): int32 =
+    return uirCore_typeNodeObjName_values.len
+
+fn uirCoreTypeNodeObjNameCacheReadyLen(): int32 =
+    return uirCore_typeNodeObjName_ready.len
+
+fn uirCoreTypeNodeObjNameCacheValueAt(idx: int32): str =
+    if idx < 0 || idx >= uirCore_typeNodeObjName_values.len:
+        return ""
+    return uirCore_typeNodeObjName_values[idx]
+
+fn uirCoreTypeNodeObjNameCacheReadyAt(idx: int32): int8 =
+    if idx < 0 || idx >= uirCore_typeNodeObjName_ready.len:
+        return int8(0)
+    return uirCore_typeNodeObjName_ready[idx]
+
+fn uirCoreTypeNodeObjNameCacheSetValueAt(idx: int32, value: str) =
+    if idx < 0 || idx >= uirCore_typeNodeObjName_values.len:
+        return
+    uirCore_typeNodeObjName_values[idx] = value
+
+fn uirCoreTypeNodeObjNameCacheSetReadyAt(idx: int32, ready: int8) =
+    if idx < 0 || idx >= uirCore_typeNodeObjName_ready.len:
+        return
+    uirCore_typeNodeObjName_ready[idx] = ready
+
 fn uirCoreCurrentParsedRootValid(): bool =
     return astNodeIdValid(uirCore_currentParsedRoot) &&
-           (nodeKind(uirCore_currentParsedRoot) == nkModule || nodeKind(uirCore_currentParsedRoot) == nkStmtList)
+           astNodeIsModuleOrStmtList(uirCore_currentParsedRoot)
 
 fn uirCoreFindTypeDeclByName(root: Node, targetName0: str): Node =
     let targetName: str = backendStripSpaces(targetName0)

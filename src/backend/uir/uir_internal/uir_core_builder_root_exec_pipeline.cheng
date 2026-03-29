@@ -1,0 +1,2100 @@
+# MIR builder from Stage1 AST (MVP subset).
+import std/os
+import std/result
+import std/seqs
+import std/system
+import std/hashmaps
+import std/hashsets
+import std/rawmem_support
+import stage1/lexer
+import stage1/parser
+import stage1/token
+import stage1/ast
+import stage1/frontend_lib
+import stage1/type_syntax_lowering
+import stage1/semantics
+import stage1/monomorphize
+import stage1/ownership
+import stage1/diagnostics
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
+import backend/uir/uir_internal/uir_core_builder_policy_contract
+import backend/uir/uir_internal/uir_core_builder_ffi_out_ptr
+import backend/uir/uir_internal/uir_core_builder_symbol_state
+import backend/uir/uir_internal/uir_core_builder_type_name_cache
+import backend/uir/uir_internal/uir_core_builder_current_root_cache
+import backend/uir/uir_internal/uir_core_builder_current_root_type_decl_helpers
+import backend/uir/uir_internal/uir_core_builder_name_base_unique_cache
+import backend/uir/uir_internal/uir_core_builder_callee_candidate_cache
+import backend/uir/uir_internal/uir_core_builder_module_lookup_cache
+import backend/uir/uir_internal/uir_core_builder_missing_routine_queue
+import backend/uir/uir_internal/uir_core_builder_reachability_scan
+import backend/uir/uir_internal/uir_core_builder_type_surface_helpers
+import backend/uir/uir_internal/uir_core_builder_type_query_helpers
+import backend/uir/uir_internal/uir_core_builder_object_runtime_helpers
+import backend/uir/uir_internal/uir_core_builder_object_synthesis
+import backend/uir/uir_internal/uir_core_builder_indirect_call_helpers
+import backend/uir/uir_internal/uir_core_builder_call_resolution
+import backend/uir/uir_internal/uir_core_builder_type_decl_passes
+import backend/uir/uir_internal/uir_core_builder_mangled_decl_helpers
+import backend/uir/uir_internal/uir_core_builder_dup_scan
+import backend/uir/uir_internal/uir_core_builder_top_level_passes
+
+fn add(dst: var Node[], val: Node) =
+    seqs.add(dst, val)
+
+fn add(dst: var AstNodeId[], val: AstNodeId) =
+    seqs.add(dst, val)
+
+fn add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+fn add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+fn add(dst: var bool[], val: bool) =
+    seqs.add(dst, val)
+
+fn add(dst: var Token[][], val: Token[]) =
+    seqs.add(dst, val)
+
+fn add(dst: var UirExprId[], val: UirExprId) =
+    seqs.add(dst, val)
+
+fn add(dst: var UirStmtId[], val: UirStmtId) =
+    seqs.add(dst, val)
+
+fn add(dst: var UirCoreObjField[], val: UirCoreObjField) =
+    seqs.add(dst, val)
+
+fn add(dst: var UirCoreType[], val: UirCoreType) =
+    seqs.add(dst, val)
+
+fn add(dst: var UirCoreFunc[], val: UirCoreFunc) =
+    seqs.add(dst, val)
+
+fn add(dst: var Value[str][], val: Value[str]) =
+    seqs.add(dst, val)
+
+fn uirCoreErrorInfoMessage(info: ErrorInfo, fallbackMsg: str): str =
+    if IsError(info):
+        return ErrorFormat(info)
+    return fallbackMsg
+
+fn uirCoreCopyErrOutStr(errOut: ptr, msg: str) =
+    if errOut == nil:
+        return
+    memCopyCompat(errOut, &msg, int32(sizeof(str)))
+
+fn uirCoreFixupsBuildFuncErrorMessage(nm: str, infoBuild: ErrorInfo): str =
+    return "uirCore_builder: fixups build func failed name=" + nm +
+           " code=" + intToStr(ErrorCodeOf(infoBuild))
+
+fn uirCoreDuplicateFunctionNameErrorMessage(name: str): str =
+    return "uirCore_builder: duplicate function name: " + name
+
+fn uirCoreDebugBool01(v: bool): str =
+    if v:
+        return "1"
+    return "0"
+
+fn uirCoreCStringOrEmpty(raw: cstring): str =
+    if raw != nil:
+        return str(raw)
+    return ""
+
+fn uirCoreTokenTextByIdOrEmpty(textId: int32): str =
+    if textId > 0:
+        return tokenTextById(textId)
+    return ""
+
+fn uirCoreDebugStringLiteralTraceEnabled(): bool =
+    return os.getEnvDefault("BACKEND_DEBUG_STR_LIT_PATH", "") == "1"
+
+fn uirCoreDebugFindFirstStringLiteralId(rootId: AstNodeId): AstNodeId =
+    if !astNodeIdValid(rootId):
+        return astInvalidNodeId()
+    if uirCoreNodeIsStringLiteral(rootId):
+        return rootId
+    for i in 0..<astKidCount(rootId):
+        let foundId: AstNodeId = uirCoreDebugFindFirstStringLiteralId(astKidAt(rootId, i))
+        if astNodeIdValid(foundId):
+            return foundId
+    return astInvalidNodeId()
+
+fn uirCoreDebugCountStringLiteralsId(rootId: AstNodeId): int32 =
+    if !astNodeIdValid(rootId):
+        return 0
+    var total: int32 = uirCoreNodeIsStringLiteral(rootId) ? 1 : 0
+    for i in 0..<astKidCount(rootId):
+        total = total + uirCoreDebugCountStringLiteralsId(astKidAt(rootId, i))
+    return total
+
+fn uirCoreTopLevelItemNameDbg(nId: AstNodeId): str =
+    if !astNodeIdValid(nId):
+        return ""
+    if !astNodeIsFnDecl(nId) && !astNodeIsIteratorDecl(nId) &&
+       !astNodeIsTypeDecl(nId) && !astNodeIsConceptDecl(nId) &&
+       !astNodeIsTraitDecl(nId):
+        return ""
+    if astKidCount(nId) <= 0:
+        return ""
+    let nameNodeId: AstNodeId = astKidAt(nId, 0)
+    if !astNodeIdValid(nameNodeId):
+        return ""
+    if !astNodeIsIdentOrSymbol(nameNodeId):
+        return ""
+    return backendStripSpaces(astPlainName(nameNodeId))
+
+fn uirCoreDebugDumpStringLiteralStage(tag: str, rootId: AstNodeId) =
+    if !uirCoreDebugStringLiteralTraceEnabled():
+        return
+    let count: int32 = uirCoreDebugCountStringLiteralsId(rootId)
+    let firstId: AstNodeId = uirCoreDebugFindFirstStringLiteralId(rootId)
+    if !astNodeIdValid(firstId):
+        echo("[backend.strlit] " + tag + " count=" + intToStr(count) + " first=<missing>")
+        return
+    let value: str = astNodeStrVal(firstId)
+    echo("[backend.strlit] " + tag +
+         " count=" + intToStr(count) +
+         " len=" + intToStr(len(value)) +
+         " line=" + intToStr(astNodePosLine(firstId)) +
+         " col=" + intToStr(astNodePosCol(firstId)) +
+         " value='" + value + "'")
+
+fn backendLowerAscii(s: str): str =
+    let n: int32 = len(s)
+    if n <= 0:
+        return ""
+    let out: str = newStringAlloc(n)
+    for i in 0..<n:
+        let ch: char = s[i]
+        if ch >= 'A' && ch <= 'Z':
+            out[i] = char(int32(ch) + 32)
+        else:
+            out[i] = ch
+    return out
+
+fn backendTrimAsciiSpace(text: str): str =
+    let n: int32 = len(text)
+    if n <= 0:
+        return ""
+    var start: int32 = 0
+    while start < n:
+        let ch: char = text[start]
+        if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r':
+            break
+        start = start + 1
+    var stop: int32 = n
+    while stop > start:
+        let ch2: char = text[stop - 1]
+        if ch2 != ' ' && ch2 != '\t' && ch2 != '\n' && ch2 != '\r':
+            break
+        stop = stop - 1
+    return strSubView(text, start, stop - start)
+
+fn uirCoreOkModule(mod: UirCoreModule): Result[UirCoreModule] =
+    # Use shared constructor from uir_core_types to avoid stage0-specific
+    # return-value instability on large Result payloads.
+    return Ok_UirCoreModule(mod)
+
+fn uirCoreResultBoolIsOk(r: Result[bool]): bool =
+    return IsOk[bool](r)
+
+fn uirCoreResultBoolValue(r: Result[bool]): bool =
+    return Value[bool](r)
+
+fn uirCoreResultBoolErrorInfo(r: Result[bool]): ErrorInfo =
+    return ErrorInfoOf[bool](r)
+
+@importc("cheng_parse_f64_bits")
+fn cheng_parse_f64_bits(s: str): int64
+
+@importc("cheng_i64_to_f64_bits")
+fn cheng_i64_to_f64_bits(x: int64): int64
+
+@importc("cheng_u64_to_f64_bits")
+fn cheng_u64_to_f64_bits(x: uint64): int64
+
+@importc("cheng_f64_bits_to_i64")
+fn cheng_f64_bits_to_i64(bits: int64): int64
+
+@importc("cheng_f64_bits_to_u64")
+fn cheng_f64_bits_to_u64(bits: int64): uint64
+
+@importc("cheng_f32_bits_to_f64_bits")
+fn cheng_f32_bits_to_f64_bits(bits: int32): int64
+
+@importc("cheng_f64_bits_to_f32_bits")
+fn cheng_f64_bits_to_f32_bits(bits: int64): int32
+
+@importc("cheng_f32_bits_to_i64")
+fn cheng_f32_bits_to_i64(bits: int32): int64
+
+@importc("cheng_f32_bits_to_u64")
+fn cheng_f32_bits_to_u64(bits: int32): uint64
+
+fn uirCoreDebugRootHasTypeDecl(root: Node, typeName: str): bool =
+    if !astNodeIdValid(root) || len(typeName) == 0:
+        return false
+    for i in 0..<astKidCount(root):
+        let nId: AstNodeId = astKidAt(root, i)
+        if !astNodeIdValid(nId) || !astNodeIsTypeDecl(nId) || astKidCount(nId) <= 0:
+            continue
+        let nameId: AstNodeId = astKidAt(nId, 0)
+        if astNodeIdValid(nameId) &&
+           astNodeIsIdentOrSymbol(nameId) &&
+           backendStripSpaces(astPlainName(nameId)) == typeName:
+            return true
+    return false
+
+type
+    UirCoreProfileState = ref
+        enabled: bool
+        startNs: int64
+        lastNs: int64
+
+fn uirCoreProfileInit(): UirCoreProfileState =
+    let enabled: bool = envIsTrue "UIR_PROFILE"
+    if !enabled:
+        return nil
+    var p: UirCoreProfileState
+    new p
+    p.enabled = true
+    p.startNs = cheng_monotime_ns()
+    p.lastNs = p.startNs
+    return p
+
+fn uirCoreProfileStep(p: UirCoreProfileState, name: str) =
+    if p == nil || !p.enabled:
+        return
+    let now: int64 = cheng_monotime_ns()
+    let stepMs: int64 = (now - p.lastNs) / 1000000
+    let totalMs: int64 = (now - p.startNs) / 1000000
+    p.lastNs = now
+    # Write directly to stderr to avoid fork-buffer duplication.
+    let f: os.File = os.get_stderr()
+    os.write(f, "uir_profile\t")
+    os.write(f, name)
+    os.write(f, "\tstep_ms=")
+    os.write(f, int64ToStr(stepMs))
+    os.write(f, "\ttotal_ms=")
+    os.writeLine(f, int64ToStr(totalMs))
+    os.c_fflush f
+
+fn uirCoreFuncNameStableLocal(f: UirCoreFunc): str =
+    return uirCoreFuncNameOf(f)
+
+fn uirCoreOwnershipEngineNormalized(): str =
+    let raw: str = backendLowerAscii(backendStripSpaces(getEnv "STAGE1_OWNERSHIP_ENGINE"))
+    if len(raw) == 0:
+        return "scan"
+    if raw == "legacy":
+        return "legacy"
+    if raw == "scan":
+        return "scan"
+    return "scan"
+
+var uirCore_lowerTopLevelPreparedLastCounted: bool
+var uirCore_lowerTopLevelPreparedLastErr: ErrorInfo
+var uirCore_lowerTopLevelPreparedLastErrOk: bool
+
+fn uirCoreLowerTopLevelPreparedFail(info: ErrorInfo): bool =
+    uirCore_lowerTopLevelPreparedLastCounted = false
+    uirCore_lowerTopLevelPreparedLastErr = info
+    uirCore_lowerTopLevelPreparedLastErrOk = true
+    return false
+
+fn uirCoreLowerTopLevelPreparedDone(counted: bool): bool =
+    uirCore_lowerTopLevelPreparedLastCounted = counted
+    uirCore_lowerTopLevelPreparedLastErrOk = false
+    return true
+
+fn uirCoreLowerTopLevelPrepared(mod: UirCoreModule, ctx: UirCoreBuildCtx,
+                                rootIdForDup: AstNodeId,
+                                filePath: str,
+                                nId: AstNodeId,
+                                itemIdx: int32,
+                                rootKidCount: int32,
+                                nameDbg: str,
+                                reachablePtr: HashSetStrPtr,
+                                overloadedFnBasesPtr: ptr,
+                                fnTaskSnapshot: UirCoreSharedSnapshot,
+                                dbgLower: bool,
+                                dbgPipeCount: bool): bool =
+    uirCore_lowerTopLevelPreparedLastCounted = false
+    uirCore_lowerTopLevelPreparedLastErrOk = false
+    let kindDbg: int32 = int32(astNodeKind(nId))
+    if dbgLower:
+        let fDbg: os.File = os.get_stderr()
+        os.write(fDbg, "uirCore_lower_dbg\t")
+        os.write(fDbg, intToStr(itemIdx + 1))
+        os.write(fDbg, "/")
+        os.write(fDbg, intToStr(rootKidCount))
+        os.write(fDbg, "\tfile=")
+        os.write(fDbg, filePath)
+        os.write(fDbg, "\tkind=nk#")
+        os.write(fDbg, intToStr(kindDbg))
+        if len(nameDbg) > 0:
+            os.write(fDbg, "\tname=")
+            os.write(fDbg, nameDbg)
+        os.writeLine(fDbg, "")
+        os.c_fflush fDbg
+    if uirCoreBuildCtxTraceEnabled(ctx):
+        var traceLineParts: str[]
+        add(traceLineParts, "backend: uir lower ")
+        add(traceLineParts, intToStr(itemIdx + 1))
+        add(traceLineParts, "/")
+        add(traceLineParts, intToStr(rootKidCount))
+        add(traceLineParts, " file=")
+        add(traceLineParts, filePath)
+        if len(nameDbg) > 0:
+            add(traceLineParts, " name=")
+            add(traceLineParts, nameDbg)
+        stage1Trace(fmt(traceLineParts))
+    if dbgPipeCount:
+        let fDbgPipeLowerItem: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeLowerItem, "[backend] stage1: lower_item idx=" + intToStr(itemIdx + 1) + "/" + intToStr(rootKidCount) +
+                                       " kind=nk#" + intToStr(kindDbg) +
+                                       " name=" + nameDbg +
+                                       " file=" + filePath)
+        os.c_fflush fDbgPipeLowerItem
+    if astNodeIsFnDecl(nId) || astNodeIsIteratorDecl(nId):
+        let taskRes: Result[UirFnTask] = uirCorePrepareTopLevelRoutineTaskFromRootId(
+            mod, rootIdForDup, filePath, nId, itemIdx, reachablePtr)
+        if !IsOk[UirFnTask](taskRes):
+            return uirCoreLowerTopLevelPreparedFail(ErrorInfoOf[UirFnTask](taskRes))
+        let task: UirFnTask = Value[UirFnTask](taskRes)
+        if task == nil:
+            if dbgPipeCount:
+                let fDbgPipeFnSkip: os.File = os.get_stderr()
+                os.writeLine(fDbgPipeFnSkip, "[backend] stage1: lower_item_done=0")
+                os.writeLine(fDbgPipeFnSkip, "[backend] stage1: lower_item_funcs=" + intToStr(uirCoreModuleFuncsLen(mod)))
+                os.writeLine(fDbgPipeFnSkip, (uirCoreBuildCtxFoundMain(ctx) ? "[backend] stage1: lower_item_found_main=1" : "[backend] stage1: lower_item_found_main=0"))
+                os.c_fflush fDbgPipeFnSkip
+            if uirCoreBuildCtxTraceEnabled(ctx):
+                var doneLineSkipParts: str[]
+                add(doneLineSkipParts, "backend: uir lower done ")
+                add(doneLineSkipParts, intToStr(itemIdx + 1))
+                add(doneLineSkipParts, "/")
+                add(doneLineSkipParts, intToStr(rootKidCount))
+                add(doneLineSkipParts, " file=")
+                add(doneLineSkipParts, filePath)
+                if len(nameDbg) > 0:
+                    add(doneLineSkipParts, " name=")
+                    add(doneLineSkipParts, nameDbg)
+                stage1Trace(fmt(doneLineSkipParts))
+            if dbgLower:
+                let fDbgDoneSkip: os.File = os.get_stderr()
+                os.write(fDbgDoneSkip, "uirCore_lower_done\t")
+                os.write(fDbgDoneSkip, intToStr(itemIdx + 1))
+                os.write(fDbgDoneSkip, "/")
+                os.write(fDbgDoneSkip, intToStr(rootKidCount))
+                os.writeLine(fDbgDoneSkip, "")
+                os.c_fflush fDbgDoneSkip
+            return uirCoreLowerTopLevelPreparedDone(false)
+        let taskIdx: int32 = uirCoreFnTaskTaskOrdinal(task) + 1
+        let taskName: str = uirCoreFnTaskRoutineName(task)
+        let taskFile: str = uirCoreFnTaskOriginFile(task)
+        let taskMergeRes: Result[bool] =
+            uirCoreExecuteAndMergeFnTask(mod, ctx, task, overloadedFnBasesPtr, fnTaskSnapshot)
+        if !IsOk[bool](taskMergeRes):
+            let mergeInfo: ErrorInfo = uirCoreResultBoolErrorInfo(taskMergeRes)
+            os.writeLine(os.get_stderr(), uirCoreErrorInfoMessage(mergeInfo, "uirCore_builder: fn task failed"))
+            os.c_fflush os.get_stderr()
+            return uirCoreLowerTopLevelPreparedFail(mergeInfo)
+        if dbgPipeCount:
+            let fDbgPipeFnTaskDone: os.File = os.get_stderr()
+            os.writeLine(fDbgPipeFnTaskDone, uirCoreResultBoolValue(taskMergeRes) ? "[backend] stage1: lower_item_done=1" : "[backend] stage1: lower_item_done=0")
+            os.writeLine(fDbgPipeFnTaskDone, "[backend] stage1: lower_item_funcs=" + intToStr(uirCoreModuleFuncsLen(mod)))
+            os.writeLine(fDbgPipeFnTaskDone, (uirCoreBuildCtxFoundMain(ctx) ? "[backend] stage1: lower_item_found_main=1" : "[backend] stage1: lower_item_found_main=0"))
+            os.c_fflush fDbgPipeFnTaskDone
+        if uirCoreBuildCtxTraceEnabled(ctx):
+            var doneLineTaskParts: str[]
+            add(doneLineTaskParts, "backend: uir lower done ")
+            add(doneLineTaskParts, intToStr(taskIdx))
+            add(doneLineTaskParts, "/")
+            add(doneLineTaskParts, intToStr(rootKidCount))
+            add(doneLineTaskParts, " file=")
+            add(doneLineTaskParts, taskFile)
+            if len(taskName) > 0:
+                add(doneLineTaskParts, " name=")
+                add(doneLineTaskParts, taskName)
+            stage1Trace(fmt(doneLineTaskParts))
+        if dbgLower:
+            let fDbgDoneTask: os.File = os.get_stderr()
+            os.write(fDbgDoneTask, "uirCore_lower_done\t")
+            os.write(fDbgDoneTask, intToStr(taskIdx))
+            os.write(fDbgDoneTask, "/")
+            os.write(fDbgDoneTask, intToStr(rootKidCount))
+            os.writeLine(fDbgDoneTask, "")
+            os.c_fflush fDbgDoneTask
+        return uirCoreLowerTopLevelPreparedDone(true)
+    let res: Result[bool] = uirCoreConsumeTopLevelFromRootId(mod, ctx, rootIdForDup, filePath, nId, reachablePtr, overloadedFnBasesPtr)
+    if ! uirCoreResultBoolIsOk(res):
+        os.writeLine(os.get_stderr(), "uirCore_builder: lower top-level failed")
+        os.c_fflush os.get_stderr()
+        let fallbackRes0: Result[bool] = Err[bool]("uirCore_builder: lower top-level failed")
+        let fallbackInfo0: ErrorInfo = ErrorInfoOf[bool](fallbackRes0)
+        return uirCoreLowerTopLevelPreparedFail(fallbackInfo0)
+    if dbgPipeCount:
+        let fDbgPipeLowerDone: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeLowerDone, uirCoreResultBoolValue(res) ? "[backend] stage1: lower_item_done=1" : "[backend] stage1: lower_item_done=0")
+        os.writeLine(fDbgPipeLowerDone, "[backend] stage1: lower_item_funcs=" + intToStr(uirCoreModuleFuncsLen(mod)))
+        os.writeLine(fDbgPipeLowerDone, (uirCoreBuildCtxFoundMain(ctx) ? "[backend] stage1: lower_item_found_main=1" : "[backend] stage1: lower_item_found_main=0"))
+        os.c_fflush fDbgPipeLowerDone
+    if uirCoreBuildCtxTraceEnabled(ctx):
+        var doneLineParts: str[]
+        add(doneLineParts, "backend: uir lower done ")
+        add(doneLineParts, intToStr(itemIdx + 1))
+        add(doneLineParts, "/")
+        add(doneLineParts, intToStr(rootKidCount))
+        add(doneLineParts, " file=")
+        add(doneLineParts, filePath)
+        if len(nameDbg) > 0:
+            add(doneLineParts, " name=")
+            add(doneLineParts, nameDbg)
+        stage1Trace(fmt(doneLineParts))
+    if dbgLower:
+        let fDbgDone: os.File = os.get_stderr()
+        os.write(fDbgDone, "uirCore_lower_done\t")
+        os.write(fDbgDone, intToStr(itemIdx + 1))
+        os.write(fDbgDone, "/")
+        os.write(fDbgDone, intToStr(rootKidCount))
+        os.writeLine(fDbgDone, "")
+        os.c_fflush fDbgDone
+    return uirCoreLowerTopLevelPreparedDone(false)
+
+fn uirCoreLowerTopLevelRoot(mod: UirCoreModule, ctx: UirCoreBuildCtx,
+                            rootIdForDup: AstNodeId,
+                            initialLastFilePath: str,
+                            rootKidCount: int32,
+                            reachablePtr: HashSetStrPtr,
+                            overloadedFnBasesPtr: ptr,
+                            fnTaskSnapshot: UirCoreSharedSnapshot,
+                            dbgLower: bool,
+                            dbgPipeCount: bool): Result[int32] =
+    var lastFilePath: str = initialLastFilePath
+    var fnTaskCount: int32 = 0
+    for i in 0..<astKidCount(rootIdForDup):
+        let nId: AstNodeId = astKidAt(rootIdForDup, i)
+        if !astNodeIdValid(nId):
+            continue
+        let ownPath2: str = astNodeStrVal(nId)
+        if len(ownPath2) > 0:
+            lastFilePath = ownPath2
+        let filePath: str = (len(ownPath2) > 0) ? ownPath2 : lastFilePath
+        let nKind: NodeKind = astNodeKind(nId)
+        let nameDbg: str = uirCoreTopLevelItemNameDbg(nId)
+        let itemOk: bool = uirCoreLowerTopLevelPrepared(
+            mod, ctx, rootIdForDup, filePath, nId, i, rootKidCount, nameDbg,
+            reachablePtr, overloadedFnBasesPtr, fnTaskSnapshot, dbgLower, dbgPipeCount)
+        if !itemOk:
+            if uirCore_lowerTopLevelPreparedLastErrOk:
+                return ErrInfo[int32](uirCore_lowerTopLevelPreparedLastErr)
+            return Err[int32]("uirCore_builder: lower top-level item failed")
+        if uirCore_lowerTopLevelPreparedLastCounted:
+            fnTaskCount = fnTaskCount + 1
+        if (dbgLower || dbgPipeCount) && (i + 1) == rootKidCount:
+            let fDbgPipeLowerLastDone: os.File = os.get_stderr()
+            os.writeLine(fDbgPipeLowerLastDone, "[backend] stage1: lower_last_item_counted")
+            os.c_fflush fDbgPipeLowerLastDone
+    if dbgLower || dbgPipeCount:
+        let fDbgPipeLowerLoopExit: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeLowerLoopExit, "[backend] stage1: lower_loop_exit")
+        os.c_fflush fDbgPipeLowerLoopExit
+    return Ok[int32](fnTaskCount)
+
+fn uirCoreOwnershipProofNodeWeight(n: Node): int32 =
+    if astNodeIsAsgn(n) || astNodeIsFastAsgn(n) || astNodeIsCall(n) ||
+       astNodeIsReturn(n) || astNodeIsYield(n) ||
+       astNodeIsDerefExpr(n) || astNodeIsHiddenDeref(n) || astNodeIsDotExpr(n) || astNodeIsBracketExpr(n):
+        return 2
+    if astNodeIsVar(n) || astNodeIsLet(n) || astNodeIsFor(n) || astNodeIsWhile(n) ||
+       astNodeIsIf(n) || astNodeIsWhen(n) || astNodeIsCase(n) || astNodeIsStmtList(n) || astNodeIsBlock(n):
+        return 1
+    return 0
+
+fn uirCoreOwnershipProofCount(n: Node): int32 =
+    if (n == nil):
+        return 0
+    var total: int32 = uirCoreOwnershipProofNodeWeight(n)
+    for i in 0..<kidCount(n):
+        total = total + uirCoreOwnershipProofCount(kid(n, i))
+    return total
+
+fn uirCoreFuncSyntheticByName(funcName: str): bool =
+    if len(funcName) == 0:
+        return true
+    if uirCoreStrStartsWith(funcName, "__cheng_"):
+        return true
+    if uirCoreStrIndexOf(funcName, "__cheng_mod_") >= 0:
+        return true
+    if uirCoreStrIndexOf(funcName, uirCoreFuncSigMarker()) >= 0:
+        return true
+    return false
+
+fn uirCoreFuncOwnershipProofScore(func: UirCoreFunc): int32 =
+    if !uirCoreFuncIdValid(func) || uirCoreFuncIsExtern(func):
+        return 0
+    if uirCoreFuncBlocksLen(func) <= 0:
+        return 0
+    var score: int32 = 0
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+        if !uirCoreBlockIdValid(blk):
+            continue
+        score = score + uirCoreBlockStmtsLen(blk)
+        let term0: UirCoreTerm = uirCoreBlockTermOf(blk)
+        if uirCoreTermKindOf(term0) == uirCoreTermKindRet() && uirCoreExprIdValid(uirCoreTermRetExprOf(term0)):
+            score = score + 1
+        elif uirCoreTermKindOf(term0) == uirCoreTermKindCbr() && uirCoreExprIdValid(uirCoreTermCondExprOf(term0)):
+            score = score + 1
+    return score
+
+fn uirCoreApplyOwnershipPhaseContract(module: UirCoreModule, skipOwnership: bool, borrowIrMode: str) =
+    if module == nil:
+        return
+    for i in 0..<uirCoreModuleFuncsLen(module):
+        let f: UirCoreFunc = uirCoreModuleFuncAt(module, i)
+        if f == nil || uirCoreFuncIsExtern(f):
+            continue
+        if skipOwnership:
+            if borrowIrMode == "mir":
+                uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "mir_borrow_skipped")
+            else:
+                uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "ownership_skipped")
+            continue
+        let proofCount: int32 = uirCoreFuncOwnershipProofScore(f)
+        if proofCount > 0 && !uirCoreFuncSyntheticByName(uirCoreFuncNameOf(f)):
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), true, true, "")
+            continue
+        if proofCount == 0:
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "high_uir_ownership_no_proof")
+        else:
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "high_uir_ownership_synthetic")
+    return
+
+fn emitDeferFrame(b: BlockBuilder, frame: DeferFrame): Result[bool] =
+    if frame == nil || deferFrameBodiesLen(frame) <= 0:
+        return Ok[bool](false)
+    let __for_start_bi = deferFrameBodiesLen(frame) - 1
+    for __for_rev_bi in 0..(__for_start_bi - (0)):
+        let bi = __for_start_bi - __for_rev_bi
+        let body: Node = deferFrameBodyAt(frame, bi)
+        if !astNodeIdValid(body) || nodeKind(body) != astNodeKindStmtList():
+            return Err[bool]("uirCore_builder: invalid defer body")
+        let bodyRes: Result[bool] = lowerStmtList(b, body)
+        if !uirCoreResultBoolIsOk(bodyRes):
+            return ErrInfo[bool](uirCoreResultBoolErrorInfo(bodyRes))
+        if uirCoreResultBoolValue(bodyRes):
+            return Err[bool]("uirCore_builder: defer body terminated")
+    return Ok[bool](false)
+
+fn blockBuilderEmitDefers(b: BlockBuilder, minDepth: int32): Result[bool] =
+    if b == nil:
+        return Ok[bool](false)
+    var md: int32 = minDepth
+    if md < 0:
+        md = 0
+    if md >= blockBuilderDeferStackLen(b):
+        return Ok[bool](false)
+    let __for_start_i = blockBuilderDeferStackLen(b) - 1
+    for __for_rev_i in 0..(__for_start_i - (md)):
+        let i = __for_start_i - __for_rev_i
+        let emitRes: Result[bool] = emitDeferFrame(b, blockBuilderDeferStackAt(b, i))
+        if !uirCoreResultBoolIsOk(emitRes):
+            return ErrInfo[bool](uirCoreResultBoolErrorInfo(emitRes))
+        if uirCoreResultBoolValue(emitRes):
+            return Err[bool]("uirCore_builder: defer body terminated")
+    return Ok[bool](false)
+
+fn alignUpPow2(value: int32, alignPow2: int32): int32 =
+    if alignPow2 <= 0:
+        return value
+    let align: int32 = 1 << alignPow2
+    let rem: int32 = value % align
+    if rem == 0:
+        return value
+    return value + (align - rem)
+
+fn uirCoreConcat2(left0: str, right0: str): str =
+    let nLeft: int32 = len(left0)
+    let nRight: int32 = len(right0)
+    if nLeft <= 0:
+        return right0
+    if nRight <= 0:
+        return left0
+    let out: str = newStringAlloc(nLeft + nRight)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(left0), nLeft)
+    rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(outPtr, nLeft), rawmemAsVoid(right0), nRight)
+    return out
+
+fn uirCoreAppendChar(left0: str, ch: char): str =
+    let nLeft: int32 = len(left0)
+    let out: str = newStringAlloc(nLeft + 1)
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    if nLeft > 0:
+        rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(left0), nLeft)
+    rawmemWriteChar(outPtr, nLeft, ch)
+    return out
+
+fn uirCoreIndexedName(prefix0: str, idx: int32): str =
+    return uirCoreConcat2(prefix0, intToStr(idx))
+
+fn uirCoreArrayObjName(capacity: int32, elemKey0: str): str =
+    return uirCoreJoinWithChar(uirCoreIndexedName("array_", capacity), '_', elemKey0)
+
+fn uirCoreTypeKeyObjNameCachePutMirrors(module: UirCoreModule, rawKey: str,
+                                        normalizedKey: str, objName: str) =
+    if module == nil:
+        return
+    if len(rawKey) > 0:
+        uirCoreTypeKeyObjNameCachePut(module, rawKey, objName)
+    if len(normalizedKey) > 0 && !(normalizedKey == rawKey):
+        uirCoreTypeKeyObjNameCachePut(module, normalizedKey, objName)
+
+fn uirCoreTypeNodeObjNameCachePutFast(module: UirCoreModule, typeNode: Node, objName: str) =
+    if module == nil || !astNodeIdValid(typeNode):
+        return
+    if uirCoreTypeNodeObjNameCacheNeedsReset(module):
+        uirCoreTypeNodeObjNameCacheReset(module)
+    uirCoreTypeNodeObjNameCacheEnsure(typeNode)
+    let idx: int32 = int32(typeNode)
+    if idx < 0 || idx >= uirCoreTypeNodeObjNameCacheValuesLen() || idx >= uirCoreTypeNodeObjNameCacheReadyLen():
+        return
+    uirCoreTypeNodeObjNameCacheSetValueAt(idx, objName)
+    uirCoreTypeNodeObjNameCacheSetReadyAt(idx, int8(1))
+
+fn uirCoreTypeNodeObjNameCacheTryGetFast(module: UirCoreModule, typeNode: Node,
+                                         found: var bool): str =
+    found = false
+    if module == nil || !astNodeIdValid(typeNode):
+        return ""
+    if uirCoreTypeNodeObjNameCacheNeedsReset(module):
+        uirCoreTypeNodeObjNameCacheReset(module)
+    uirCoreTypeNodeObjNameCacheEnsure(typeNode)
+    let idx: int32 = int32(typeNode)
+    if idx < 0 || idx >= uirCoreTypeNodeObjNameCacheValuesLen() || idx >= uirCoreTypeNodeObjNameCacheReadyLen():
+        return ""
+    if uirCoreTypeNodeObjNameCacheReadyAt(idx) == int8(0):
+        return ""
+    found = true
+    return uirCoreTypeNodeObjNameCacheValueAt(idx)
+
+fn uirCoreUniqueObjTypeNameByPrefix(module: UirCoreModule, prefix: str): str =
+    if module == nil || len(prefix) == 0:
+        return ""
+    var foundIdx: int32 = -1
+    var foundCount: int32 = 0
+    for oi in 0..<uirCoreModuleObjTypesLen(module):
+        let ot: UirCoreObjType = uirCoreModuleObjTypeAt(module, oi)
+        if len(uirCoreNameOf(ot)) > 0 && uirCoreStrStartsWith(uirCoreNameOf(ot), prefix):
+            foundIdx = oi
+            foundCount = foundCount + 1
+            if foundCount > 1:
+                return ""
+    if foundCount != 1 || foundIdx < 0:
+        return ""
+    return uirCoreNameOf(uirCoreModuleObjTypeAt(module, foundIdx))
+
+fn uirCoreTupleElemFieldLabel(elemNode0: Node): str =
+    if !astNodeIdValid(elemNode0) || nodeKind(elemNode0) != astNodeKindIdentDefs() || kidCount(elemNode0) <= 0:
+        return ""
+    let nameNode0: Node = kid(elemNode0, 0)
+    if (nameNode0 != nil) && (nodeKind(nameNode0) == astNodeKindIdent() || nodeKind(nameNode0) == astNodeKindSymbol()):
+        return backendStripSpaces(plainName(nameNode0))
+    return ""
+
+fn uirCoreTupleElemTypeNode(elemNode0: Node): Node =
+    if astNodeIdValid(elemNode0) && nodeKind(elemNode0) == astNodeKindIdentDefs() && kidCount(elemNode0) > 1:
+        return kid(elemNode0, 1)
+    return elemNode0
+
+fn uirCoreTupleElemTypeKey(elemTypeNode0: Node): str =
+    if astNodeIdValid(elemTypeNode0) && nodeKind(elemTypeNode0) == astNodeKindDotExpr() && kidCount(elemTypeNode0) > 1:
+        let dotKey: str = typeKey(kid(elemTypeNode0, 1))
+        if len(dotKey) > 0:
+            return dotKey
+    let elemKey: str = typeKey(elemTypeNode0)
+    if len(elemKey) > 0:
+        return elemKey
+    if elemTypeNode0 != nil:
+        return backendStripSpaces(plainName(elemTypeNode0))
+    return ""
+
+fn uirCoreCallArgValueNode(node0: Node): Node =
+    if astNodeIdValid(node0) && nodeKind(node0) == astNodeKindCallArg():
+        if kidCount(node0) > 1:
+            return kid(node0, 1)
+        if kidCount(node0) > 0:
+            return kid(node0, kidCount(node0) - 1)
+    return node0
+
+fn uirCoreCallRawArgCount(callNode: Node): int32 =
+    if !astNodeIdValid(callNode) || nodeKind(callNode) != astNodeKindCall():
+        return 0
+    return kidCount(callNode) - 1
+
+fn uirCoreCallRawArgNode(callNode: Node, argIdx: int32): Node =
+    if !astNodeIdValid(callNode) || nodeKind(callNode) != astNodeKindCall():
+        return astInvalidNodeId()
+    let kidIdx: int32 = argIdx + 1
+    if kidIdx < 1 || kidIdx >= kidCount(callNode):
+        return astInvalidNodeId()
+    return kid(callNode, kidIdx)
+
+fn uirCoreCallArgNode(callNode: Node, argIdx: int32): Node =
+    return uirCoreCallArgValueNode(uirCoreCallRawArgNode(callNode, argIdx))
+
+fn uirCoreCalleeSingleTypeArg(calleeNode: Node): Node =
+    if astNodeIdValid(calleeNode) && nodeKind(calleeNode) == astNodeKindBracketExpr() && kidCount(calleeNode) == 2:
+        let typeArg0: Node = kid(calleeNode, 1)
+        if astNodeIdValid(typeArg0) && nodeKind(typeArg0) != astNodeKindEmpty():
+            return typeArg0
+    if uirCoreNodeIsFieldDot(calleeNode):
+        let member0: Node = uirCoreDotFieldNode(calleeNode)
+        if astNodeIdValid(member0) && nodeKind(member0) == astNodeKindBracketExpr() && kidCount(member0) == 2:
+            let typeArg1: Node = kid(member0, 1)
+            if astNodeIdValid(typeArg1) && nodeKind(typeArg1) != astNodeKindEmpty():
+                return typeArg1
+    return astInvalidNodeId()
+
+fn uirCoreCalleeTypeArgCount(calleeNode: Node): int32 =
+    if astNodeIdValid(calleeNode) && nodeKind(calleeNode) == astNodeKindBracketExpr() && kidCount(calleeNode) > 1:
+        return kidCount(calleeNode) - 1
+    if uirCoreNodeIsFieldDot(calleeNode):
+        let member0: Node = uirCoreDotFieldNode(calleeNode)
+        if astNodeIdValid(member0) && nodeKind(member0) == astNodeKindBracketExpr() && kidCount(member0) > 1:
+            return kidCount(member0) - 1
+    return 0
+
+fn uirCoreNodeTypeKeyOrEmpty(n: Node): str =
+    if astNodeIdValid(n) && nodeTypeCacheValid(n) && astRefNonNil(nodeTypeCache(n)):
+        let cachedKey: str = backendStripSpaces(typeKey(nodeTypeCache(n)))
+        if len(cachedKey) > 0:
+            return cachedKey
+    if astNodeIdValid(n):
+        return backendStripSpaces(typeKey(n))
+    return ""
+
+fn uirCoreBestEffortElemTypeKey(node0: Node, defaultKey: str): str =
+    let elem0: Node = uirCoreCallArgValueNode(node0)
+    let cachedKey: str = uirCoreNodeTypeKeyOrEmpty(elem0)
+    if len(cachedKey) > 0:
+        return cachedKey
+    if uirCoreNodeIsStringLiteral(elem0):
+        return "str"
+    if astNodeIdValid(elem0) && nodeKind(elem0) == astNodeKindCharLit():
+        return "char"
+    if astNodeIdValid(elem0) && nodeKind(elem0) == astNodeKindBoolLit():
+        return "bool"
+    return defaultKey
+
+fn uirCoreSingleNodeSeq(node0: Node): Node[] =
+    var out: Node[]
+    if astNodeIdValid(node0):
+        astNodeSeqAppend(out, node0)
+    return out
+
+fn uirCoreTupleLitBestEffortType(tupleNode0: Node): Node =
+    var ty: Node = newNode(astNodeKindTupleTy(), nodePos(tupleNode0))
+    for i0 in 0..<kidCount(tupleNode0):
+        let ek: str = uirCoreBestEffortElemTypeKey(kid(tupleNode0, i0), "int64")
+        addSon(ty, newIdent(ek, nodePos(tupleNode0)))
+    return ty
+
+fn uirCoreSeqLitBestEffortElemKey(seqNode0: Node): str =
+    if !astNodeIdValid(seqNode0) || kidCount(seqNode0) <= 0:
+        return ""
+    var chosenIndex: int32 = -1
+    var sawWideInt: bool = false
+    var i0: int32 = kidCount(seqNode0) - 1
+    while i0 >= 0:
+        let elem0: Node = uirCoreCallArgValueNode(kid(seqNode0, i0))
+        let cachedKey: str = uirCoreNodeTypeKeyOrEmpty(elem0)
+        if len(cachedKey) > 0:
+            chosenIndex = i0
+            break
+        if astNodeIdValid(elem0) && nodeKind(elem0) == astNodeKindIntLit():
+            if nodeIntVal(elem0) > 2147483647 || nodeIntVal(elem0) < (-2147483647 - 1):
+                sawWideInt = true
+                break
+        i0 = i0 - 1
+    if chosenIndex >= 0:
+        return uirCoreBestEffortElemTypeKey(kid(seqNode0, chosenIndex), "int32")
+    if sawWideInt:
+        return "int64"
+    return "int32"
+
+fn uirCoreBestEffortDupFnRefName(module: UirCoreModule, fref: UirCoreFunc, baseName: str): str =
+    if module == nil || len(baseName) == 0:
+        return ""
+    if uirCoreDupFnBasesHas(baseName) && uirCoreFuncIdValid(fref):
+        let mangledRef: str = uirCoreMaybeMangleDupFnBase(baseName, uirCoreFuncOriginFileOf(fref))
+        if len(mangledRef) > 0 && moduleHasFuncByBase(module, mangledRef):
+            return mangledRef
+    return baseName
+
+fn uirCoreSeqInferElemTypeKeyFromValue(b: BlockBuilder, valNode0: Node): str =
+    let valKey0: str = uirCoreStripRefVarKeyOnce(uirCoreInferNodeTypeKeyForOverload(b, valNode0))
+    if isPtrKey(valKey0) || uirCoreStrStartsWith(valKey0, "ptr_"):
+        return "ptr"
+    return valKey0
+
+fn uirCoreDebugNodeCallKidKeyExtra(ch0: Node): str =
+    if astNodeIdValid(ch0) && nodeKind(ch0) == astNodeKindCallArg() && kidCount(ch0) > 0:
+        let kn0: Node = kid(ch0, 0)
+        if (kn0 != nil) && (nodeKind(kn0) == astNodeKindIdent() || nodeKind(kn0) == astNodeKindSymbol()):
+            return " key=" + plainName(kn0)
+    return ""
+
+fn uirCoreDebugNodeCallKidExtra(ch0: Node): str =
+    if astNodeIdValid(ch0) && nodeKind(ch0) == astNodeKindCallArg():
+        return " callarg_kids=" + intToStr(kidCount(ch0)) + uirCoreDebugNodeCallKidKeyExtra(ch0)
+    if (ch0 != nil) && (nodeKind(ch0) == astNodeKindIdent() || nodeKind(ch0) == astNodeKindSymbol()):
+        return " name=" + plainName(ch0)
+    return ""
+
+fn uirCoreResolvedLocalCallTargetOrBase(env: LocalEnv, baseName0: str): str =
+    let localCalleeIdx: int32 = localIndex(env, baseName0)
+    if localCalleeIdx >= 0:
+        let target0: str = localCallTarget(env, localCalleeIdx)
+        if len(target0) > 0:
+            return target0
+    return baseName0
+
+fn uirCoreFuncNameOrEmpty(f0: UirCoreFunc): str =
+    if f0 != nil:
+        return uirCoreFuncNameOf(f0)
+    return ""
+
+fn uirCoreFuncOriginFileOrEmpty(f0: UirCoreFunc): str =
+    if f0 != nil:
+        return uirCoreFuncOriginFileOf(f0)
+    return ""
+
+fn uirCoreNodePlainNameOrEmpty(n: Node): str =
+    if astNodeIdValid(n):
+        return plainName(n)
+    return ""
+
+fn uirCoreNodeKidCountOrZero(n: Node): str =
+    if astNodeIdValid(n):
+        return intToStr(kidCount(n))
+    return "0"
+
+fn uirCoreNodeStrValOrEmpty(n: Node): str =
+    if astNodeIdValid(n):
+        return nodeStrVal(n)
+    return ""
+
+fn uirCoreCallArgFieldName(arg: Node, nameNode: Node): str =
+    if astNodeIdValid(nameNode) && (nodeKind(nameNode) == astNodeKindIdent() || nodeKind(nameNode) == astNodeKindSymbol()):
+        return backendStripSpaces(plainName(nameNode))
+    if astNodeIdValid(arg):
+        return backendStripSpaces(plainName(arg))
+    return ""
+
+fn uirCoreLenArgKey(b: BlockBuilder, arg0: Node): str =
+    let inferred0: str = caseInferExprTypeKey(b, arg0)
+    if len(inferred0) > 0:
+        return inferred0
+    if (arg0 != nil) && (nodeKind(arg0) == astNodeKindIdent() || nodeKind(arg0) == astNodeKindSymbol()):
+        let nm0: str = plainName(arg0)
+        let slot0: int32 = uirCoreResolveLocalSlotOrImplicitResult(blockBuilderEnv(b), blockBuilderFuncRef(b), nm0)
+        if slot0 >= 0 && uirCoreFuncIdValid(blockBuilderFuncRef(b)):
+            let olIdx0: int32 = funcFindObjLocal(blockBuilderFuncRef(b), slot0)
+            if olIdx0 >= 0:
+                return funcObjTypeName(blockBuilderFuncRef(b), slot0)
+            let ty0: UirCoreType = localType(blockBuilderEnv(b), slot0)
+            if uirCoreTypeKindOf(ty0) == uirCoreTypeKindI64():
+                return "str"
+    return ""
+
+fn uirCoreBestRetObjTypeName(module: UirCoreModule, callee0: UirCoreFunc, p0: UirCoreParam): str =
+    let objNm0: str = funcObjTypeName(callee0, uirCoreSlotOf(p0))
+    if len(objNm0) > 0:
+        return objNm0
+    let kret0: str = funcObjTypeKey(callee0, uirCoreSlotOf(p0))
+    if len(kret0) > 0:
+        let objNm1: str = uirCoreDirectObjValueTypeNameFromKey(module, kret0)
+        if len(objNm1) > 0:
+            return objNm1
+        let objNm2: str = uirCoreObjTypeFromTypeKey(module, kret0)
+        if len(objNm2) > 0:
+            return objNm2
+    if len(uirCoreTypeKeyOf(p0)) > 0:
+        let objNm3: str = uirCoreDirectObjValueTypeNameFromKey(module, uirCoreTypeKeyOf(p0))
+        if len(objNm3) > 0:
+            return objNm3
+        let objNm4: str = uirCoreObjTypeFromTypeKey(module, uirCoreTypeKeyOf(p0))
+        if len(objNm4) > 0:
+            return objNm4
+    let funcRetKey0: str = uirCoreFuncRetTypeKeyOf(callee0)
+    if len(funcRetKey0) > 0:
+        let objNm5: str = uirCoreDirectObjValueTypeNameFromKey(module, funcRetKey0)
+        if len(objNm5) > 0:
+            return objNm5
+        let objNm6: str = uirCoreObjTypeFromTypeKey(module, funcRetKey0)
+        if len(objNm6) > 0:
+            return objNm6
+    return ""
+
+fn uirCoreCalleeOutKey(callee0: UirCoreFunc): str =
+    if callee0 != nil:
+        if uirCoreFuncParamsLen(callee0) > 0:
+            let p0: UirCoreParam = uirCoreFuncParamAt(callee0, 0)
+            if uirCoreNameOf(p0) == "__ret":
+                let retKey0: str = funcObjTypeKey(callee0, uirCoreSlotOf(p0))
+                if len(retKey0) > 0:
+                    return retKey0
+        let retKey1: str = uirCoreFuncRetTypeKeyOf(callee0)
+        if len(retKey1) > 0:
+            return retKey1
+    return ""
+
+fn uirCoreNamedNodeLocalSlotOrNeg1(b: BlockBuilder, n: Node): int32 =
+    if (b != nil) && (blockBuilderEnv(b) != nil) && astNodeIdValid(n) &&
+       (nodeKind(n) == astNodeKindIdent() || nodeKind(n) == astNodeKindSymbol()):
+        return uirCoreResolveLocalSlotOrImplicitResult(blockBuilderEnv(b), blockBuilderFuncRef(b), plainName(n))
+    return -1
+
+fn uirCoreNodeLocalTypeKeyOrEmpty(b: BlockBuilder, n: Node): str =
+    let slot0: int32 = uirCoreNamedNodeLocalSlotOrNeg1(b, n)
+    if slot0 >= 0:
+        return localTypeKey(blockBuilderEnv(b), slot0)
+    return ""
+
+fn uirCoreNodeObjTypeKeyOrEmpty(b: BlockBuilder, n: Node): str =
+    let slot0: int32 = uirCoreNamedNodeLocalSlotOrNeg1(b, n)
+    if slot0 >= 0 && funcFindObjLocal(blockBuilderFuncRef(b), slot0) >= 0:
+        return funcObjTypeKey(blockBuilderFuncRef(b), slot0)
+    return ""
+
+fn uirCoreNodeObjTypeNameOrEmpty(b: BlockBuilder, n: Node): str =
+    let slot0: int32 = uirCoreNamedNodeLocalSlotOrNeg1(b, n)
+    if slot0 >= 0 && funcFindObjLocal(blockBuilderFuncRef(b), slot0) >= 0:
+        return funcObjTypeName(blockBuilderFuncRef(b), slot0)
+    return ""
+
+fn uirCoreCaseBracketBaseKey(b: BlockBuilder, baseNode: Node): str =
+    let baseKey0: str = caseInferExprTypeKey(b, baseNode)
+    let seqKey0: str = uirCoreSeqLikeKeyFromExpr(b, baseNode)
+    return uirCoreFirstNonEmptyStr(seqKey0, baseKey0)
+
+fn uirCoreCaseDotFieldKey(b: BlockBuilder, parentKey: str, fieldName: str): str =
+    if len(parentKey) == 0 || len(fieldName) == 0:
+        return ""
+    let directKey0: str = uirCoreObjFieldTypeKeyGet(parentKey, fieldName)
+    if len(directKey0) > 0:
+        return directKey0
+    if (parentKey == "tuple") || uirCoreStrStartsWith(parentKey, "tuple_"):
+        let ti0: int32 = uirCoreTupleFieldIndexGet(parentKey, fieldName)
+        if ti0 >= 0:
+            let altFieldName0: str = uirCoreIndexedName("f", ti0)
+            let altKey0: str = uirCoreObjFieldTypeKeyGet(parentKey, altFieldName0)
+            if len(altKey0) > 0:
+                return altKey0
+    let pk0: str = uirCoreStripPtrKeyOnce(parentKey)
+    if len(pk0) > 0 && !(pk0 == parentKey):
+        let ptrKey0: str = uirCoreObjFieldTypeKeyGet(pk0, fieldName)
+        if len(ptrKey0) > 0:
+            return ptrKey0
+    if blockBuilderModule(b) != nil:
+        if uirCoreStrStartsWith(parentKey, "seq_") && uirCoreHasObjType(blockBuilderModule(b), "seq"):
+            let seqKey0: str = uirCoreObjFieldTypeKeyGet("seq", fieldName)
+            if len(seqKey0) > 0:
+                return seqKey0
+        elif uirCoreStrStartsWith(parentKey, "seq_fixed_") && uirCoreHasObjType(blockBuilderModule(b), "seq"):
+            let seqFixedKey0: str = uirCoreObjFieldTypeKeyGet("seq", fieldName)
+            if len(seqFixedKey0) > 0:
+                return seqFixedKey0
+        elif uirCoreStrStartsWith(parentKey, "Table_") && uirCoreHasObjType(blockBuilderModule(b), "Table"):
+            let tableKey0: str = uirCoreObjFieldTypeKeyGet("Table", fieldName)
+            if len(tableKey0) > 0:
+                return tableKey0
+        return uirCoreFieldTypeKeyFromCurrentRoot(blockBuilderModule(b), parentKey, fieldName)
+    return ""
+
+fn uirCoreCaseCallResolvedOutKey(b: BlockBuilder, callNode: Node, callName: str,
+                                 callee0: UirCoreFunc): str =
+    let calleeKey0: str = uirCoreCalleeOutKey(callee0)
+    if len(calleeKey0) > 0:
+        return calleeKey0
+    if (callName == "Value") && kidCount(callNode) == 2 && blockBuilderModule(b) != nil:
+        var argNode0: Node = kid(callNode, 1)
+        if astNodeIdValid(argNode0) && nodeKind(argNode0) == astNodeKindCallArg():
+            if kidCount(argNode0) > 1:
+                argNode0 = kid(argNode0, 1)
+            elif kidCount(argNode0) > 0:
+                argNode0 = kid(argNode0, 0)
+        let parentKey0: str = uirCoreStripRefVarKeyOnce(caseInferExprTypeKey(b, argNode0))
+        let fieldKey0: str = uirCoreCaseDotFieldKey(b, parentKey0, "value")
+        if len(fieldKey0) > 0:
+            return fieldKey0
+    if callName == "Value":
+        let innerKey0: str = uirCoreInferValueCallInnerKey(b, callNode)
+        if len(innerKey0) > 0:
+            return innerKey0
+    return ""
+
+fn uirCoreDebugTypeKeyCallArg0Key(b: BlockBuilder, callNode: Node): str =
+    if kidCount(callNode) > 1:
+        var argNode0: Node = kid(callNode, 1)
+        if astNodeIdValid(argNode0) && nodeKind(argNode0) == astNodeKindCallArg():
+            if kidCount(argNode0) > 1:
+                argNode0 = kid(argNode0, 1)
+            elif kidCount(argNode0) > 0:
+                argNode0 = kid(argNode0, 0)
+        return uirCoreInferNodeTypeKeyForOverload(b, argNode0)
+    return ""
+
+fn uirCoreValidObjNameOrEmpty(module: UirCoreModule, objName: str): str =
+    if module != nil && len(objName) > 0 && uirCoreHasObjType(module, objName):
+        return objName
+    return ""
+
+fn uirCorePatternPlainNameOrEmpty(n: Node): str =
+    if astNodeIdValid(n):
+        return backendStripSpaces(plainName(n))
+    return ""
+
+fn uirCoreAstTypeKeyOrEmpty(n: Node): str =
+    if astNodeIdValid(n):
+        return typeKey(n)
+    return ""
+
+fn uirCoreTupleObjNameFromTypeNode(module: UirCoreModule, tupleType: Node): str =
+    if module != nil && astNodeIdValid(tupleType) && nodeKind(tupleType) != astNodeKindEmpty():
+        return typeNodeObjTypeName(module, tupleType)
+    return ""
+
+fn uirCoreTupleObjNameFromTypeOrInit(b: BlockBuilder, tupleType: Node, initNode: Node): str =
+    if b == nil:
+        return ""
+    let typeObj0: str = uirCoreValidObjNameOrEmpty(blockBuilderModule(b), uirCoreTupleObjNameFromTypeNode(blockBuilderModule(b), tupleType))
+    if len(typeObj0) > 0:
+        return typeObj0
+    let initKey: str = caseInferExprTypeKey(b, initNode)
+    return uirCoreValidObjNameOrEmpty(blockBuilderModule(b), initKey)
+
+fn uirCoreTuplePatternObjName(module: UirCoreModule, pat: Node, selKey: str): str =
+    let selObj0: str = uirCoreValidObjNameOrEmpty(module, selKey)
+    if len(selObj0) > 0:
+        return selObj0
+    let tupleTy0: Node = inferTupleTypeNodeFromTuplePatternBestEffort(pat)
+    return uirCoreValidObjNameOrEmpty(module, uirCoreTupleObjNameFromTypeNode(module, tupleTy0))
+
+
+fn ensureBuiltinObjTypes(module: UirCoreModule) =
+    if (module == nil):
+        return
+    if ! uirCoreHasObjType(module, "seq"):
+        var fields: UirCoreObjField[]
+        uirCoreAppendObjFieldNamed(fields, "len", uirCoreTypeI32(), 0)
+        uirCoreAppendObjFieldNamed(fields, "cap", uirCoreTypeI32(), 4)
+        uirCoreAppendObjFieldNamed(fields, "buffer", uirCoreTypeI64(), 8)
+        uirCoreAddObjTypeParts(module, "seq", 3, 16, fields)
+    if ! uirCoreHasObjType(module, "Table"):
+        # stdlib `tables.Table[V]` (generic) has a stable layout independent of V:
+        #   keys: seq[str]      (inlined as keys.len/cap/buffer)
+        #   vals: seq[V]        (inlined as vals.len/cap/buffer)
+        #   states: seq[uint8]  (inlined as states.len/cap/buffer)
+        #   len: int32
+        var fields2: UirCoreObjField[]
+        uirCoreAppendObjFieldNamed(fields2, "keys.len", uirCoreTypeI32(), 0)
+        uirCoreAppendObjFieldNamed(fields2, "keys.cap", uirCoreTypeI32(), 4)
+        uirCoreAppendObjFieldNamed(fields2, "keys.buffer", uirCoreTypeI64(), 8)
+        uirCoreAppendObjFieldNamed(fields2, "vals.len", uirCoreTypeI32(), 16)
+        uirCoreAppendObjFieldNamed(fields2, "vals.cap", uirCoreTypeI32(), 20)
+        uirCoreAppendObjFieldNamed(fields2, "vals.buffer", uirCoreTypeI64(), 24)
+        uirCoreAppendObjFieldNamed(fields2, "states.len", uirCoreTypeI32(), 32)
+        uirCoreAppendObjFieldNamed(fields2, "states.cap", uirCoreTypeI32(), 36)
+        uirCoreAppendObjFieldNamed(fields2, "states.buffer", uirCoreTypeI64(), 40)
+        uirCoreAppendObjFieldNamed(fields2, "len", uirCoreTypeI32(), 48)
+        uirCoreAddObjTypeParts(module, "Table", 3, 56, fields2)
+
+fn ensureArrayObjTypeFromTypeExpr(module: UirCoreModule, arrType: Node, arrName: str): bool =
+    if (module == nil) || (arrType == nil) || len(arrName) == 0:
+        return false
+    if uirCoreHasObjType(module, arrName):
+        return true
+    if nodeKind(arrType) != astNodeKindBracketExpr() || kidCount(arrType) < 3:
+        return false
+    let base: Node = kid(arrType, 0)
+    if (base == nil) || (nodeKind(base) != astNodeKindIdent() && nodeKind(base) != astNodeKindSymbol()):
+        return false
+    let baseName: str = backendStripSpaces(plainName(base))
+    if !(baseName == "array"):
+        return false
+    let arg1: Node = kid(arrType, 1)
+    let arg2: Node = kid(arrType, 2)
+    if !astNodeIdValid(arg1) || !astNodeIdValid(arg2) || nodeKind(arg1) == astNodeKindEmpty() || nodeKind(arg2) == astNodeKindEmpty():
+        return false
+
+    let c1: int32 = tryResolveArrayCount(module, arg1)
+    let c2: int32 = tryResolveArrayCount(module, arg2)
+    var count: int32 = -1
+    var elemTypeNode: Node = astInvalidNodeId()
+    if c1 > 0 && c2 <= 0:
+        count = c1
+        elemTypeNode = arg2
+    elif c2 > 0 && c1 <= 0:
+        count = c2
+        elemTypeNode = arg1
+    elif c1 > 0 && c2 > 0:
+        # Ambiguous; prefer `array[Count, ElemType]`.
+        count = c1
+        elemTypeNode = arg2
+    if count <= 0 || !astNodeIdValid(elemTypeNode) || nodeKind(elemTypeNode) == astNodeKindEmpty():
+        return false
+
+    # If element type isn't resolved yet, defer array layout creation so we don't
+    # lock in an incorrect element representation (e.g. unknown object types default to i32).
+    if nodeKind(elemTypeNode) == astNodeKindIdent() || nodeKind(elemTypeNode) == astNodeKindSymbol():
+        let elemName: str = backendStripSpaces(plainName(elemTypeNode))
+        if len(elemName) > 0 && !isBuiltinTypeName(elemName):
+            if !uirCoreHasObjType(module, elemName):
+                let aliasTy: UirCoreType = uirCoreTryGetTypeAlias(module, elemName)
+                if uirCoreTypeKindOf(aliasTy) == uirCoreTypeKindVoid():
+                    return false
+
+    var elemTy: UirCoreType = uirCoreTypeFromNodeWithModule(module, elemTypeNode)
+    let elemObjName: str = typeNodeObjTypeName(module, elemTypeNode)
+    if len(elemObjName) > 0 && typeNodeIsObjValue(module, elemTypeNode):
+        elemTy = uirCoreTypeI64()
+    let elemSize: int32 = uirCoreTypeSize(elemTy)
+    if elemSize <= 0:
+        return false
+    let elemAlignPow2: int32 = uirCoreTypeAlignPow2(elemTy)
+    let stride: int32 = alignUpPow2(elemSize, elemAlignPow2)
+    if stride <= 0:
+        return false
+    var fields: UirCoreObjField[]
+    var off: int32 = 0
+    for i in 0..<count:
+        uirCoreAppendObjFieldNamed(fields, uirCoreIndexedName("e", i), elemTy, off)
+        off = off + stride
+    uirCoreAddObjTypeParts(module, arrName, elemAlignPow2, alignUpPow2(off, elemAlignPow2), fields)
+    return true
+
+fn uirCoreDeclFileAt(declFiles: str[], idx: int32): str =
+    if idx >= 0 && idx < declFiles.len:
+        return declFiles[idx]
+    return ""
+
+fn uirCoreStableRoutineNameFromDeclName(nm: str, nId: AstNodeId): str =
+    if len(nm) > 0:
+        return nm
+    return uirCoreTopLevelRoutineNameId(nId)
+
+fn uirCoreTopLevelHeadNameOrEmptyId(nId: AstNodeId): str =
+    if astKidCount(nId) > 0:
+        let nameNodeId: AstNodeId = astKidAt(nId, 0)
+        if astNodeIdValid(nameNodeId):
+            let nameKind: NodeKind = astNodeKind(nameNodeId)
+            if nameKind == astNodeKindIdent() || nameKind == astNodeKindSymbol():
+                return backendStripSpaces(astPlainName(nameNodeId))
+    return ""
+
+fn uirCoreBuildMissingRoutinesFromUirId(mod: UirCoreModule, rootId: AstNodeId, overloaded: ptr = nil, errOut: ptr = nil): bool =
+    if mod == nil || !astNodeIdValid(rootId):
+        return true
+    stage1Trace("backend: uir fixups.id enter")
+    let traceOn: bool = stage1TraceEnabled()
+    let dbgPipe: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
+    let dbgConstFix: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_CONST", "") == "1")
+    var dbgFile: os.File = nil
+    if dbgPipe:
+        dbgFile = os.get_stderr()
+        os.writeLine(dbgFile, "[backend] stage1: fixups_enter")
+        os.c_fflush dbgFile
+    let declCap: int32 = uirCoreCountFnDeclsMangledId(rootId)
+    var declNames: str[]
+    var declNodes: int32[]
+    var declFiles: str[]
+    if declCap > 0:
+        setLen(declNames, declCap)
+        setLen(declNodes, declCap)
+        setLen(declFiles, declCap)
+    var declCount: int32 = 0
+    let rootFilePath: str = uirCoreNormalizeTopLevelPath(astNodeStrVal(rootId), "")
+    uirCoreIndexFnDeclsMangledId(rootId, overloaded, declNames, declNodes, declFiles, declCount, rootFilePath)
+    if declCount >= 0 && declCount < declNames.len:
+        setLen(declNames, declCount)
+    if declCount >= 0 && declCount < declNodes.len:
+        setLen(declNodes, declCount)
+    if declCount >= 0 && declCount < declFiles.len:
+        setLen(declFiles, declCount)
+    if dbgConstFix:
+        os.writeLine(os.get_stderr(), "[backend] const: fixups_after_index")
+        os.c_fflush os.get_stderr()
+    if traceOn:
+        stage1Trace("backend: uir fixups.id indexed decl_nodes=" + intToStr(declNodes.len))
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: fixups_indexed decl_nodes=" + intToStr(declNodes.len))
+        os.c_fflush dbgFile
+
+    var existingFuncs: str[]
+    let existingCap: int32 = uirCoreModuleFuncsLen(mod) + declNames.len + 8
+    if existingCap > 0:
+        setLen(existingFuncs, existingCap)
+    var existingFuncCount: int32 = 0
+    for fi0 in 0..<uirCoreModuleFuncsLen(mod):
+        let f0: UirCoreFunc = uirCoreModuleFuncAt(mod, fi0)
+        if uirCoreFuncIdValid(f0) && len(uirCoreFuncNameOf(f0)) > 0:
+            if !uirCoreStrListHas(existingFuncs, existingFuncCount, uirCoreFuncNameOf(f0)):
+                uirCoreFixedStrAppend(existingFuncs, &existingFuncCount, uirCoreFuncNameOf(f0))
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: fixups_existing_funcs=" + intToStr(uirCoreModuleFuncsLen(mod)))
+        os.c_fflush dbgFile
+    if dbgConstFix:
+        os.writeLine(os.get_stderr(), "[backend] const: fixups_after_existing")
+        os.c_fflush os.get_stderr()
+    if traceOn:
+        stage1Trace("backend: uir fixups.id existing_funcs=" + intToStr(uirCoreModuleFuncsLen(mod)))
+
+    var seen: str[]
+    if declNames.len > 0:
+        setLen(seen, declNames.len)
+    var seenCount: int32 = 0
+    var queue: str[]
+    if declNames.len > 0:
+        setLen(queue, declNames.len)
+    var queueCount: int32 = 0
+    for fi in 0..<uirCoreModuleFuncsLen(mod):
+        let f0: UirCoreFunc = uirCoreModuleFuncAt(mod, fi)
+        uirCoreMaybeEnqueueFromFunc(mod, declNames, seen, seenCount, queue, queueCount, f0)
+    if traceOn:
+        stage1Trace("backend: uir fixups.id queue_seeded=" + intToStr(queueCount))
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: fixups_queue_seeded=" + intToStr(queueCount))
+        os.c_fflush dbgFile
+    if dbgConstFix:
+        os.writeLine(os.get_stderr(), "[backend] const: fixups_after_queue_seeded")
+        os.c_fflush os.get_stderr()
+
+    var builtAny: bool = false
+    var qi: int32 = 0
+    if dbgConstFix:
+        os.writeLine(os.get_stderr(), "[backend] const: fixups_before_loop")
+        os.c_fflush os.get_stderr()
+    while qi < queueCount:
+        if dbgConstFix:
+            if qi == 0:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter0_enter")
+                os.c_fflush os.get_stderr()
+            elif qi == 1:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter1_enter")
+                os.c_fflush os.get_stderr()
+            elif qi == 2:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter2_enter")
+                os.c_fflush os.get_stderr()
+        let shouldLogIter: bool = qi < 4 || ((qi % 32) == 0)
+        if dbgPipe && shouldLogIter:
+            os.writeLine(dbgFile, "[backend] stage1: fixups_iter qi=" + intToStr(qi) + " queue=" + intToStr(queueCount))
+            os.c_fflush dbgFile
+        let nm: str = queue[qi]
+        qi = qi + 1
+        if len(nm) == 0:
+            continue
+        if uirCoreStrListHas(existingFuncs, existingFuncCount, nm):
+            continue
+        let idx: int32 = uirCoreDeclIndexFind(declNames, nm)
+        if idx < 0 || idx >= declNodes.len:
+            continue
+        let nId: AstNodeId = AstNodeId(declNodes[idx])
+        if !astNodeIdValid(nId):
+            continue
+        if uirCoreFuncSigHasUnresolvedGenericsId(nId):
+            continue
+        let fp: str = uirCoreDeclFileAt(declFiles, idx)
+        if dbgConstFix:
+            if qi == 1:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter0_before_build_func")
+                os.c_fflush os.get_stderr()
+            elif qi == 2:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter1_before_build_func")
+                os.c_fflush os.get_stderr()
+            elif qi == 3:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter2_before_build_func")
+                os.c_fflush os.get_stderr()
+        let fRes: Result[UirCoreFunc] = uirCoreBuildFuncId(mod, nId, fp, overloaded, "", nil)
+        if ! IsOk[UirCoreFunc](fRes):
+            let infoBuild: ErrorInfo = ErrorInfoOf[UirCoreFunc](fRes)
+            let msgBuild: str = uirCoreFixupsBuildFuncErrorMessage(nm, infoBuild)
+            if dbgPipe:
+                os.writeLine(dbgFile, "[backend] stage1: fixups_build_func_err " + msgBuild)
+                os.c_fflush dbgFile
+            uirCoreCopyErrOutStr(errOut, msgBuild)
+            return false
+        if dbgConstFix:
+            if qi == 1:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter0_after_build_func")
+                os.c_fflush os.get_stderr()
+            elif qi == 2:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter1_after_build_func")
+                os.c_fflush os.get_stderr()
+            elif qi == 3:
+                os.writeLine(os.get_stderr(), "[backend] const: fixups_iter2_after_build_func")
+                os.c_fflush os.get_stderr()
+        let f: UirCoreFunc = Value[UirCoreFunc](fRes)
+        if !uirCoreFuncIdValid(f):
+            continue
+        let stableName: str = uirCoreStableRoutineNameFromDeclName(nm, nId)
+        let stableOriginFile: str = fp
+        let stableDeclOrdinal: int32 = astNodeDeclOrdinal(nId)
+        let stableSourceAstIndex: int32 = astNodeIndex(nId)
+        uirCoreFuncInitHeaderMeta(f, uirCoreFuncRetTypeKeyOf(f), stableOriginFile,
+                                  stableDeclOrdinal, stableSourceAstIndex,
+                                  uirCoreFuncIsExtern(f))
+        let sameRoutineIdx: int32 = uirCoreModuleFuncSameOriginIndex(
+            mod, stableName, stableOriginFile,
+            stableDeclOrdinal, stableSourceAstIndex)
+        if sameRoutineIdx >= 0:
+            let exSame: UirCoreFunc = uirCoreModuleFuncAt(mod, sameRoutineIdx)
+            if !uirCoreFuncIdValid(exSame) || uirCoreFuncBlocksLen(exSame) == 0:
+                uirCoreModuleSetFuncAt(mod, sameRoutineIdx, f)
+                if !uirCoreStrListHas(existingFuncs, existingFuncCount, stableName):
+                    uirCoreFixedStrAppend(existingFuncs, &existingFuncCount, stableName)
+                builtAny = true
+                uirCoreMaybeEnqueueFromFunc(mod, declNames, seen, seenCount, queue, queueCount, f)
+            continue
+        if moduleHasFunc(mod, stableName) || moduleHasGlobal(mod, stableName) ||
+           uirCoreFindTypeAlias(mod, stableName) >= 0 || uirCoreFindObjType(mod, stableName) >= 0:
+            if dbgPipe:
+                os.writeLine(dbgFile, "[backend] stage1: fixups_duplicate_err name=" + stableName)
+                os.c_fflush dbgFile
+            uirCoreCopyErrOutStr(errOut, uirCoreDuplicateFunctionNameErrorMessage(stableName))
+            return false
+        uirCoreAddFunc(mod, f)
+        if !uirCoreStrListHas(existingFuncs, existingFuncCount, stableName):
+            uirCoreFixedStrAppend(existingFuncs, &existingFuncCount, stableName)
+        builtAny = true
+        uirCoreMaybeEnqueueFromFunc(mod, declNames, seen, seenCount, queue, queueCount, f)
+    if traceOn:
+        stage1Trace("backend: uir fixups.id done built_any=" + (builtAny ? "1" : "0") + " queue=" + intToStr(queueCount))
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: fixups_done built_any=" + (builtAny ? "1" : "0") + " queue=" + intToStr(queueCount))
+        os.c_fflush dbgFile
+    return true
+
+
+fn uirCoreBuildGlobalInitFunc(mod: UirCoreModule, ctx: UirCoreBuildCtx, outFunc: var UirCoreFunc): Result[bool] =
+    if (mod == nil) || (ctx == nil) || uirCoreBuildCtxGlobalInitLen(ctx) == 0:
+        return Err[bool]("uirCore_builder: no global init work")
+    let dbgGlobalInitIndex: bool = envIsTrue "BACKEND_DEBUG_GLOBAL_INIT_INDEX"
+    var fDbgGlobalInitIndex: os.File = nil
+    if dbgGlobalInitIndex:
+        fDbgGlobalInitIndex = os.get_stderr()
+        uirCoreGlobalInitDebugWrite(true, fDbgGlobalInitIndex,
+                                    "[backend] global_init enter total=" + intToStr(uirCoreBuildCtxGlobalInitLen(ctx)))
+    let chunkSize: int32 = uirCoreGlobalInitChunkSize()
+    var helperNames: str[]
+    var startIndex: int32 = 0
+    var chunkOrdinal: int32 = 0
+    if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+        stage1Trace("materialize: global_init_phase_before.exec phase=const")
+    while startIndex < uirCoreBuildCtxGlobalInitLen(ctx):
+        var nextIndex: int32 = startIndex
+        var phaseFunc: UirCoreFunc = nil
+        let phaseRes: Result[bool] = uirCoreBuildGlobalInitPhaseChunk(
+            mod, ctx, 1, "const", "__cheng_global_init_const",
+            startIndex, chunkSize, chunkOrdinal, dbgGlobalInitIndex, fDbgGlobalInitIndex,
+            nextIndex, phaseFunc)
+        if !uirCoreResultBoolIsOk(phaseRes):
+            return ErrInfo[bool](uirCoreResultBoolErrorInfo(phaseRes))
+        if phaseFunc == nil:
+            break
+        uirCoreAddFunc(mod, phaseFunc)
+        add(helperNames, uirCoreOwnStr(uirCoreGlobalInitChunkHelperName("__cheng_global_init_const", chunkOrdinal)))
+        startIndex = nextIndex
+        chunkOrdinal = chunkOrdinal + 1
+    if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+        stage1Trace("materialize: global_init_phase_after.exec phase=const helpers=" + intToStr(helperNames.len))
+    startIndex = 0
+    chunkOrdinal = 0
+    if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+        stage1Trace("materialize: global_init_phase_before.exec phase=heap")
+    while startIndex < uirCoreBuildCtxGlobalInitLen(ctx):
+        var nextIndex2: int32 = startIndex
+        var phaseFunc2: UirCoreFunc = nil
+        let phaseRes2: Result[bool] = uirCoreBuildGlobalInitPhaseChunk(
+            mod, ctx, 2, "heap", "__cheng_global_init_heap",
+            startIndex, chunkSize, chunkOrdinal, dbgGlobalInitIndex, fDbgGlobalInitIndex,
+            nextIndex2, phaseFunc2)
+        if !uirCoreResultBoolIsOk(phaseRes2):
+            return ErrInfo[bool](uirCoreResultBoolErrorInfo(phaseRes2))
+        if phaseFunc2 == nil:
+            break
+        uirCoreAddFunc(mod, phaseFunc2)
+        add(helperNames, uirCoreOwnStr(uirCoreGlobalInitChunkHelperName("__cheng_global_init_heap", chunkOrdinal)))
+        startIndex = nextIndex2
+        chunkOrdinal = chunkOrdinal + 1
+    if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+        stage1Trace("materialize: global_init_phase_after.exec phase=heap helpers=" + intToStr(helperNames.len))
+    startIndex = 0
+    chunkOrdinal = 0
+    if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+        stage1Trace("materialize: global_init_phase_before.exec phase=ctor")
+    while startIndex < uirCoreBuildCtxGlobalInitLen(ctx):
+        var nextIndex3: int32 = startIndex
+        var phaseFunc3: UirCoreFunc = nil
+        let phaseRes3: Result[bool] = uirCoreBuildGlobalInitPhaseChunk(
+            mod, ctx, 3, "ctor", "__cheng_global_init_ctor",
+            startIndex, chunkSize, chunkOrdinal, dbgGlobalInitIndex, fDbgGlobalInitIndex,
+            nextIndex3, phaseFunc3)
+        if !uirCoreResultBoolIsOk(phaseRes3):
+            return ErrInfo[bool](uirCoreResultBoolErrorInfo(phaseRes3))
+        if phaseFunc3 == nil:
+            break
+        uirCoreAddFunc(mod, phaseFunc3)
+        add(helperNames, uirCoreOwnStr(uirCoreGlobalInitChunkHelperName("__cheng_global_init_ctor", chunkOrdinal)))
+        startIndex = nextIndex3
+        chunkOrdinal = chunkOrdinal + 1
+    if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+        stage1Trace("materialize: global_init_phase_after.exec phase=ctor helpers=" + intToStr(helperNames.len))
+    var wrapperFunc: UirCoreFunc = nil
+    let wrapperRes: Result[bool] = uirCoreBuildGlobalInitWrapperFunc(mod, helperNames, wrapperFunc)
+    if !uirCoreResultBoolIsOk(wrapperRes):
+        return ErrInfo[bool](uirCoreResultBoolErrorInfo(wrapperRes))
+    if wrapperFunc == nil:
+        return Err[bool]("uirCore_builder: global init wrapper missing")
+    if dbgGlobalInitIndex:
+        uirCoreGlobalInitDebugWrite(true, fDbgGlobalInitIndex,
+                                    "[backend] global_init done chunk_size=" + intToStr(chunkSize) +
+                                    " helpers=" + intToStr(helperNames.len))
+    outFunc = wrapperFunc
+    return Ok[bool](true)
+
+fn uirCoreRejectNoMainGlobalInit(ctx: UirCoreBuildCtx, allowNoMain: bool): Result[bool] =
+    if ctx == nil || !allowNoMain || uirCoreBuildCtxFoundMain(ctx) || backendSkipGlobalInit():
+        return Ok[bool](true)
+    if uirCoreBuildCtxGlobalInitLen(ctx) <= 0:
+        return Ok[bool](true)
+    return Err[bool]("uirCore_builder: top-level global init is unsupported for no-main/object-first builds; " +
+                     "move initialization into an explicit entry/init function or compile as a whole program")
+
+fn uirCoreInjectGlobalInitCall(mod: UirCoreModule, initName: str) =
+    if (mod == nil) || len(initName) == 0:
+        return
+    let dbgGlobalInit: bool = (getEnv "BACKEND_DEBUG_GLOBAL_INIT" == "1")
+    for i in 0..<uirCoreModuleFuncsLen(mod):
+        let f: UirCoreFunc = uirCoreModuleFuncAt(mod, i)
+        let nameNorm: str = backendStripSpaces(((f != nil)) ? uirCoreFuncNameOf(f) : "")
+        let linkNorm: str = backendStripSpaces(((f != nil)) ? uirCoreFuncLinkNameOf(f) : "")
+        let nameIsMain: bool = (len(nameNorm) == 4 &&
+                                nameNorm[0] == 'm' && nameNorm[1] == 'a' &&
+                                nameNorm[2] == 'i' && nameNorm[3] == 'n')
+        let linkIsMain: bool = (len(linkNorm) == 4 &&
+                                linkNorm[0] == 'm' && linkNorm[1] == 'a' &&
+                                linkNorm[2] == 'i' && linkNorm[3] == 'n')
+        if dbgGlobalInit && (f != nil) &&
+           (uirCoreStrIndexOf(uirCoreFuncNameOf(f), "main") >= 0 ||
+            (len(uirCoreFuncLinkNameOf(f)) > 0 && uirCoreStrIndexOf(uirCoreFuncLinkNameOf(f), "main") >= 0)):
+            echo("[backend] debugGlobalInit: cand name='" + uirCoreFuncNameOf(f) +
+                 "' link='" + uirCoreFuncLinkNameOf(f) +
+                 "' extern=" + (uirCoreFuncIsExtern(f) ? "1" : "0") +
+                 " blocks=" + intToStr(uirCoreFuncBlocksLen(f)) +
+                 " nameIsMain=" + (nameIsMain ? "1" : "0") +
+                 " linkIsMain=" + (linkIsMain ? "1" : "0"))
+        if (f != nil) && !uirCoreFuncIsExtern(f) &&
+           (nameIsMain || linkIsMain) &&
+           uirCoreFuncBlocksLen(f) > 0:
+            let entry: UirBlockId = uirCoreFuncBlockAt(f, 0)
+            if (entry == nil):
+                if dbgGlobalInit:
+                    echo("[backend] debugGlobalInit: main entry nil")
+                return
+
+            # Insert after initial parameter loads so argc/argv survive the init call.
+            let entryStmtLen: int32 = uirCoreBlockStmtsLen(entry)
+            for insertAt in 0..<entryStmtLen:
+                let st: UirStmtId = uirCoreBlockStmtAt(entry, insertAt)
+                if uirCoreStmtKindOf(st) != uirCoreStmtKindParam():
+                    break
+
+            if insertAt < entryStmtLen:
+                let s0: UirStmtId = uirCoreBlockStmtAt(entry, insertAt)
+                if uirCoreStmtKindOf(s0) == uirCoreStmtKindExpr():
+                    let e0: UirExprId = uirCoreStmtExprOf(s0)
+                    if e0 > 0 && uirCoreExprKindOf(e0) == uirCoreExprKindCall() &&
+                       (uirCoreExprCalleeOf(e0) == initName):
+                        if dbgGlobalInit:
+                            echo("[backend] debugGlobalInit: already inserted at=" + intToStr(insertAt))
+                        return
+
+            var args: UirExprId[]
+            let call: UirExprId = uirCoreCall(initName, args)
+            let stmt: UirStmtId = uirCoreStmtExpr(call)
+            var out: UirStmtId[]
+            for si in 0..<entryStmtLen:
+                if si == insertAt:
+                    add(out, stmt)
+                add(out, uirCoreBlockStmtAt(entry, si))
+            if insertAt == entryStmtLen:
+                add(out, stmt)
+            uirCoreBlockSetStmts(entry, out)
+            if dbgGlobalInit:
+                echo("[backend] debugGlobalInit: inserted at=" + intToStr(insertAt) +
+                     " total=" + intToStr(uirCoreBlockStmtsLen(entry)))
+            return
+    if dbgGlobalInit:
+        echo("[backend] debugGlobalInit: main not found")
+
+fn uirCoreRootExecPipelineBuildModuleFromRootId(rootInputId: AstNodeId): Result[UirCoreModule] =
+    if !astNodeIdValid(rootInputId):
+        return Err[UirCoreModule]("uirCore_builder: empty root")
+    let dbgPipeCount: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1")
+    if dbgPipeCount:
+        let fDbgEnter0: os.File = os.get_stderr()
+        os.writeLine(fDbgEnter0, "[backend] stage1: uir_root_enter0")
+        os.c_fflush fDbgEnter0
+    crashTraceSetPhase(strToCStringTemp("uir.root"))
+    if dbgPipeCount:
+        let fDbgEnter1: os.File = os.get_stderr()
+        os.writeLine(fDbgEnter1, "[backend] stage1: uir_root_enter1")
+        os.c_fflush fDbgEnter1
+    let effectiveRootTag: str = astNodeStrVal(rootInputId)
+    if dbgPipeCount:
+        let fDbgEnter2: os.File = os.get_stderr()
+        os.writeLine(fDbgEnter2, "[backend] stage1: uir_root_enter2")
+        os.c_fflush fDbgEnter2
+    let astRootId: AstNodeId = uirCoreApplyAstPluginHooksId(effectiveRootTag, rootInputId)
+    if !astNodeIdValid(astRootId):
+        return Err[UirCoreModule]("uirCore_builder: ast plugin rejected root module")
+    let rootIdForDup: AstNodeId = uirCoreApplyMirPluginHooksId(effectiveRootTag, astRootId)
+    if !astNodeIdValid(rootIdForDup):
+        return Err[UirCoreModule]("uirCore_builder: mir plugin rejected root module")
+    if crashTraceEnabled():
+        crashTraceMark(strToCStringTemp("uir.root"), astNodeIndex(rootIdForDup), astKidCount(rootIdForDup), 0, 0)
+    let root: Node = rootIdForDup
+    if (root == nil):
+        return Err[UirCoreModule]("uirCore_builder: invalid root id")
+    let prevParsedRoot: Node = uirCoreCurrentParsedRootGet()
+    uirCoreCurrentParsedRootSet(root)
+    defer:
+        uirCoreCurrentParsedRootSet(prevParsedRoot)
+    let prof: UirCoreProfileState = uirCoreProfileInit()
+    let dbgLower: bool = (os.getEnvDefault("BACKEND_DEBUG_MIR_LOWER", "") == "1")
+    let dbgSummary: bool = (os.getEnvDefault("BACKEND_DEBUG_MODULE_SUMMARY", "") == "1")
+    let dbgConst: bool = (os.getEnvDefault("BACKEND_DEBUG_STAGE1_CONST", "") == "1")
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: uir_root_enter")
+        os.c_fflush os.get_stderr()
+    if dbgPipeCount:
+        let fDbgPipe: os.File = os.get_stderr()
+        os.write(fDbgPipe, "[backend] stage1: uir_root_kids=")
+        os.write(fDbgPipe, intToStr(astKidCount(rootIdForDup)))
+        os.write(fDbgPipe, "\n")
+        os.c_fflush fDbgPipe
+    if dbgPipeCount:
+        let fDbgPipeR0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR0, "[backend] stage1: uir_reset_0")
+        os.c_fflush fDbgPipeR0
+    uirCoreGlobalObjTypesReset()
+    if dbgPipeCount:
+        let fDbgPipeR1: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR1, "[backend] stage1: uir_reset_1")
+        os.c_fflush fDbgPipeR1
+    uirCoreGlobalTypeKeysReset()
+    if dbgPipeCount:
+        let fDbgPipeR2: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR2, "[backend] stage1: uir_reset_2")
+        os.c_fflush fDbgPipeR2
+    uirCoreInlineObjFieldTypesReset()
+    if dbgPipeCount:
+        let fDbgPipeR3: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR3, "[backend] stage1: uir_reset_3")
+        os.c_fflush fDbgPipeR3
+    uirCoreObjFieldTypeKeysReset()
+    if dbgPipeCount:
+        let fDbgPipeR4: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR4, "[backend] stage1: uir_reset_4")
+        os.c_fflush fDbgPipeR4
+    uirCoreTupleFieldIndicesReset()
+    if dbgPipeCount:
+        let fDbgPipeR5: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR5, "[backend] stage1: uir_reset_5")
+        os.c_fflush fDbgPipeR5
+    uirCoreObjAliasesReset()
+    backendStripCacheReset()
+    uirCoreOwnStrCacheReset()
+    uirCorePredeclareMetaReset()
+    uirCoreFnTaskRecoverCacheReset()
+    uirCoreTopLevelPathCacheReset()
+    if dbgPipeCount:
+        let fDbgPipeR6: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR6, "[backend] stage1: uir_reset_6")
+        os.c_fflush fDbgPipeR6
+    uirCoreCalleeCandidatesReset()
+    uirCoreGlobalBaseUniqueCacheReset()
+    uirCoreObjTypeBaseUniqueCacheReset()
+    uirCoreFuncBaseUniqueCacheReset()
+    uirCoreResolvedCalleeCacheReset()
+    uirCoreResolvedSigCacheReset()
+    uirCoreTypeNodeObjNameCacheReset()
+    uirCoreTypeKeyObjNameCacheReset()
+    uirCoreFindTypeDeclByNameCacheReset(astInvalidNodeId())
+    uirCoreFieldTypeKeyFromCurrentRootCacheReset(nil, astInvalidNodeId())
+    uirCoreOverloadInferCacheReset()
+    uirCoreOverloadTypeKeyCacheReset()
+    uirCoreLegacyGenericBracketCacheReset()
+    uirCoreLooseTypeKeyCacheReset()
+    if dbgPipeCount:
+        let fDbgPipeR7: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR7, "[backend] stage1: uir_reset_7")
+        os.c_fflush fDbgPipeR7
+    let effectiveTarget: str = uirCoreDefaultTargetOr(
+        backendStripSpaces(os.getEnvDefault("BACKEND_TARGET", "")))
+    let mod: UirCoreModule = uirCoreNewModule(effectiveTarget)
+    if dbgPipeCount:
+        let fDbgPipeR8: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeR8, "[backend] stage1: uir_reset_8")
+        os.c_fflush fDbgPipeR8
+    uirCoreReservePoolsForBuild(astKidCount(rootIdForDup))
+    uirCoreProfileStep(prof, "reset")
+    if dbgPipeCount:
+        let fDbgPipeCtx0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeCtx0, "[backend] stage1: uir_ctx_alloc_pre")
+        os.c_fflush fDbgPipeCtx0
+    let ctx: UirCoreBuildCtx = uirCoreBuildCtxNew()
+    if dbgPipeCount:
+        let fDbgPipeCtx1: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeCtx1, "[backend] stage1: uir_ctx_alloc_post")
+        os.c_fflush fDbgPipeCtx1
+    uirCoreBuildCtxSetTraceEnabled(ctx, stage1TraceEnabled())
+    var overloadedFnBases: hashsets.HashSetStr = hashsets.hashSetStrInit(8)
+    var overloadedFnBasesPtr: ptr = nil
+    if uirCoreBuildCtxTraceEnabled(ctx):
+        stage1Trace("backend: uir build start files=" + intToStr(astKidCount(rootIdForDup)))
+    if dbgPipeCount:
+        let fDbgPipeDup0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeDup0, "[backend] stage1: uir_dups_pre")
+        os.c_fflush fDbgPipeDup0
+    let skipDupScan: bool = envIsTrue "BACKEND_STAGE1_DISABLE_DUP_SCAN"
+    if skipDupScan:
+        overloadedFnBasesPtr = nil
+    else:
+        overloadedFnBasesPtr = &overloadedFnBases
+        overloadedFnBases = uirCoreComputeOverloadedFnBasesId(rootIdForDup)
+        uirCoreDupFnBasesSet(uirCoreComputeDuplicateFnBasesId(rootIdForDup, &overloadedFnBases))
+        uirCoreDupGlobalNamesSet(uirCoreComputeDuplicateGlobalNamesId(rootIdForDup))
+    if dbgPipeCount:
+        let fDbgPipeDup1: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeDup1, "[backend] stage1: uir_dups_post")
+        # NOTE: keep this marker write lightweight; avoid extra libc flush here
+        # while bisecting stage0 crash points on unstable runtimes.
+    if dbgPipeCount:
+        let fDbgPipeMark0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeMark0, "[backend] stage1: uir_after_dups_mark_0")
+        os.c_fflush fDbgPipeMark0
+    # Stage0 bootstrap stability: skip this profile checkpoint.
+    if dbgPipeCount:
+        let fDbgPipeStage0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage0, "[backend] stage1: uir_stage_after_dups")
+        os.c_fflush fDbgPipeStage0
+    if dbgPipeCount:
+        let fDbgPipeMark1: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeMark1, "[backend] stage1: uir_after_dups_mark_1")
+        os.c_fflush fDbgPipeMark1
+    uirCoreBuildCtxReset(ctx)
+    uirCoreBuildCtxSetTraceEnabled(ctx, stage1TraceEnabled())
+    if dbgPipeCount:
+        let fDbgPipeMark2: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeMark2, "[backend] stage1: uir_after_dups_mark_2")
+        os.c_fflush fDbgPipeMark2
+    if dbgPipeCount:
+        let fDbgPipeStage1: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage1, "[backend] stage1: uir_stage_before_ensure_builtin_obj_types")
+        os.c_fflush fDbgPipeStage1
+    ensureBuiltinObjTypes(mod)
+    if dbgPipeCount:
+        let fDbgPipeStage2: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage2, "[backend] stage1: uir_stage_after_ensure_builtin_obj_types")
+        os.c_fflush fDbgPipeStage2
+    if (getEnv "BACKEND_DEBUG_TYPES" == "1"):
+        let hs: str = uirCoreDebugBool01(uirCoreHasObjType(mod, "seq"))
+        let ht: str = uirCoreDebugBool01(uirCoreHasObjType(mod, "Table"))
+        echo("[backend] debug: builtin_obj_after_ensure seq=" + hs + " table=" + ht)
+    if dbgPipeCount:
+        let fDbgPipeStage3: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage3, "[backend] stage1: uir_stage_before_predeclare_globals_for_types")
+        os.c_fflush fDbgPipeStage3
+    uirCorePredeclareGlobalsForTypes(mod, root)
+    if dbgPipeCount:
+        let fDbgPipeStage4: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage4, "[backend] stage1: uir_stage_after_predeclare_globals_for_types")
+        os.c_fflush fDbgPipeStage4
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_predeclare_globals_for_types")
+        os.c_fflush os.get_stderr()
+    uirCoreProfileStep(prof, "predeclare_globals_for_types")
+    if dbgPipeCount:
+        let fDbgPipeStage5: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage5, "[backend] stage1: uir_stage_before_consume_type_decls")
+        os.c_fflush fDbgPipeStage5
+    let tdRes: Result[bool] = uirCoreConsumeTypeDecls(mod, root)
+    if ! uirCoreResultBoolIsOk(tdRes):
+        return ErrInfo[UirCoreModule](uirCoreResultBoolErrorInfo(tdRes))
+    if dbgPipeCount:
+        let fDbgPipeStage6: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage6, "[backend] stage1: uir_stage_after_consume_type_decls")
+        os.c_fflush fDbgPipeStage6
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_consume_type_decls")
+        os.c_fflush os.get_stderr()
+    uirCoreProfileStep(prof, "consume_type_decls")
+    if dbgPipeCount:
+        let fDbgPipeStage7: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage7, "[backend] stage1: uir_stage_before_predeclare_globals_for_lowering")
+        os.c_fflush fDbgPipeStage7
+    uirCorePredeclareGlobalsForLowering(mod, root)
+    if dbgPipeCount:
+        let fDbgPipeStage8: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeStage8, "[backend] stage1: uir_stage_after_predeclare_globals_for_lowering")
+        os.c_fflush fDbgPipeStage8
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_predeclare_globals_for_lowering")
+        os.c_fflush os.get_stderr()
+    uirCoreProfileStep(prof, "predeclare_globals_for_lowering")
+    var reachableStore: hashsets.HashSetStr = hashsets.hashSetStrInit(64)
+    var reachablePtr: ptr = nil
+    # Whole-program builds are closed-world: lower only routines reachable from
+    # entry/global-init roots by default, and keep the env override as the
+    # explicit escape hatch while the broader surface is still being validated.
+    let buildTrackReach: str = uirCoreDefaultStrOr(
+        backendStripSpaces(os.getEnvDefault("BACKEND_BUILD_TRACK", "")),
+        "dev")
+    let wholeProgramReach: bool = envIsTrue "BACKEND_WHOLE_PROGRAM"
+    let reachableOverrideRaw: str = backendStripSpaces(os.getEnvDefault("BACKEND_STAGE1_REACHABLE", ""))
+    var reachableEnabled: bool = wholeProgramReach
+    if buildTrackReach == "release":
+        reachableEnabled = wholeProgramReach
+    if len(reachableOverrideRaw) > 0:
+        reachableEnabled = uirCoreIsOne(reachableOverrideRaw)
+    if reachableEnabled:
+        reachableStore = uirCoreComputeReachableFnsId(mod, rootIdForDup)
+        reachablePtr = &reachableStore
+    if dbgPipeCount:
+        let fDbgPipeReach0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeReach0, "[backend] stage1: uir_stage_after_reachable")
+        os.c_fflush fDbgPipeReach0
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_reachable")
+        os.c_fflush os.get_stderr()
+    uirCoreProfileStep(prof, "reachable")
+    if dbgPipeCount:
+        let fDbgPipePre0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipePre0, "[backend] stage1: uir_stage_before_predeclare_top_level")
+        os.c_fflush fDbgPipePre0
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: before_predeclare_top_level")
+        os.c_fflush os.get_stderr()
+    # Predeclare function signatures so lowering can infer object returns across order boundaries.
+    var lastFilePathId: int32 = astNodeStrValId(rootIdForDup)
+    let rootKidCount: int32 = astKidCount(rootIdForDup)
+    if dbgPipeCount:
+        let fDbgPipeRootCount: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeRootCount, "[backend] stage1: root_kid_count=" + intToStr(rootKidCount))
+        os.c_fflush fDbgPipeRootCount
+    for pi in 0..<astKidCount(rootIdForDup):
+        let nId: AstNodeId = astKidAt(rootIdForDup, pi)
+        let ownPathId: int32 = astNodeStrValId(nId)
+        if ownPathId > 0:
+            lastFilePathId = ownPathId
+        let filePathId: int32 = ownPathId > 0 ? ownPathId : lastFilePathId
+        let filePath: str = uirCoreTokenTextByIdOrEmpty(filePathId)
+        if dbgPipeCount:
+            let prePipeKind: NodeKind = astNodeKind(nId)
+            let prePipeName: str = uirCoreTopLevelHeadNameOrEmptyId(nId)
+            let fDbgPipePreItem: os.File = os.get_stderr()
+            os.writeLine(fDbgPipePreItem, "[backend] stage1: predeclare_item idx=" + intToStr(pi + 1) + "/" + intToStr(rootKidCount) +
+                                          " kind=nk#" + intToStr(int32(prePipeKind)) +
+                                          " name=" + prePipeName +
+                                          " file=" + filePath)
+            os.c_fflush fDbgPipePreItem
+        if uirCoreBuildCtxTraceEnabled(ctx):
+            let preKind: NodeKind = astNodeKind(nId)
+            let preName: str = uirCoreTopLevelHeadNameOrEmptyId(nId)
+            stage1Trace("backend: uir predeclare " + intToStr(pi + 1) + "/" + intToStr(rootKidCount) +
+                        " file=" + filePath + " kind=nk#" + intToStr(int32(preKind)) +
+                        " name=" + preName)
+        let res: Result[bool] = uirCorePredeclareTopLevelFromRootId(mod, rootIdForDup, filePath, nId, reachablePtr, overloadedFnBasesPtr)
+        if !uirCoreResultBoolIsOk(res):
+            if (os.getEnvDefault("BACKEND_DEBUG_STAGE1_PIPE", "") == "1"):
+                let infoPre: ErrorInfo = uirCoreResultBoolErrorInfo(res)
+                let fDbgPre: os.File = os.get_stderr()
+                os.writeLine(fDbgPre, "[backend] stage1: predeclare_fail idx=" + intToStr(pi + 1) +
+                                      "/" + intToStr(rootKidCount) +
+                                      " file='" + filePath + "' code=" + intToStr(ErrorCodeOf(infoPre)))
+                os.c_fflush fDbgPre
+            return ErrInfo[UirCoreModule](uirCoreResultBoolErrorInfo(res))
+        if dbgPipeCount:
+            let fDbgPipePreDone: os.File = os.get_stderr()
+            os.writeLine(fDbgPipePreDone, "[backend] stage1: predeclare_item_done=" + uirCoreDebugBool01(uirCoreResultBoolValue(res)))
+            os.writeLine(fDbgPipePreDone, "[backend] stage1: predeclare_item_funcs=" + intToStr(uirCoreModuleFuncsLen(mod)))
+            os.c_fflush fDbgPipePreDone
+    uirCoreProfileStep(prof, "predeclare_top_level")
+    if dbgPipeCount:
+        let fDbgPipePre1: os.File = os.get_stderr()
+        os.writeLine(fDbgPipePre1, "[backend] stage1: uir_stage_after_predeclare_top_level")
+        os.c_fflush fDbgPipePre1
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_predeclare_top_level")
+        os.c_fflush os.get_stderr()
+    if dbgSummary:
+        echo("[uir] predeclare funcs=" + intToStr(uirCoreModuleFuncsLen(mod)) +
+             " globals=" + intToStr(uirCoreModuleGlobalsLen(mod)) +
+             " cstrs=" + intToStr(uirCoreModuleCStringsLen(mod)))
+    lastFilePathId = astNodeStrValId(rootIdForDup)
+    let fnTaskSnapshot: UirCoreSharedSnapshot = uirCoreBuildSharedSnapshot(mod)
+    if dbgPipeCount:
+        let fDbgPipeLower0: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeLower0, "[backend] stage1: uir_stage_before_lower_top_level")
+        os.c_fflush fDbgPipeLower0
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: before_lower_top_level")
+        os.c_fflush os.get_stderr()
+    let lowerRootRes: Result[int32] = uirCoreLowerTopLevelRoot(
+        mod, ctx, rootIdForDup, uirCoreTokenTextByIdOrEmpty(lastFilePathId), rootKidCount,
+        reachablePtr, overloadedFnBasesPtr, fnTaskSnapshot, dbgLower, dbgPipeCount)
+    if !IsOk[int32](lowerRootRes):
+        return ErrInfo[UirCoreModule](ErrorInfoOf[int32](lowerRootRes))
+    let fnTaskCount: int32 = Value[int32](lowerRootRes)
+    # Stage0/current-source crash hardening: this checkpoint has repeatedly
+    # surfaced as a bad callsite even with profiling disabled; keep the
+    # surrounding debug markers and skip the profile step itself.
+    if dbgPipeCount:
+        let fDbgPipeLower1: os.File = os.get_stderr()
+        os.writeLine(fDbgPipeLower1, "[backend] stage1: uir_stage_after_lower_top_level")
+        os.c_fflush fDbgPipeLower1
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_lower_top_level")
+        os.c_fflush os.get_stderr()
+    if dbgPipeCount:
+        let fDbgFnTasks0: os.File = os.get_stderr()
+        os.writeLine(fDbgFnTasks0, "[backend] stage1: fn_task_count=" + intToStr(fnTaskCount))
+        os.c_fflush fDbgFnTasks0
+    # Stage0/current-source crash hardening: skip the adjacent fn_tasks profile
+    # checkpoint until this post-lowering surface is stable again.
+    if dbgPipeCount:
+        let fDbgPostFn0: os.File = os.get_stderr()
+        os.writeLine(fDbgPostFn0, "[backend] stage1: post_fn_tasks_0")
+        os.c_fflush fDbgPostFn0
+    if dbgSummary:
+        echo("[uir] lower funcs=" + intToStr(uirCoreModuleFuncsLen(mod)) +
+             " globals=" + intToStr(uirCoreModuleGlobalsLen(mod)) +
+             " cstrs=" + intToStr(uirCoreModuleCStringsLen(mod)))
+    if uirCoreBuildCtxTraceEnabled(ctx):
+        stage1Trace("backend: uir lower done funcs=" + intToStr(uirCoreBuildCtxTraceFnCount(ctx)) +
+            " globals=" + intToStr(uirCoreBuildCtxTraceGlobalCount(ctx)) + " inits=" + intToStr(uirCoreBuildCtxGlobalInitLen(ctx)))
+    let allowNoMain: bool = envIsTrue "BACKEND_ALLOW_NO_MAIN" || backendAllowNoMainByEmit()
+    if dbgPipeCount:
+        let fDbgPostFn1: os.File = os.get_stderr()
+        os.writeLine(fDbgPostFn1, "[backend] stage1: post_fn_tasks_1_after_allow")
+        os.c_fflush fDbgPostFn1
+    if dbgPipeCount:
+        let fDbgMainGate0: os.File = os.get_stderr()
+        os.writeLine(fDbgMainGate0, "[backend] stage1: found_main=" + uirCoreDebugBool01(uirCoreBuildCtxFoundMain(ctx)))
+        os.writeLine(fDbgMainGate0, "[backend] stage1: allow_no_main=" + uirCoreDebugBool01(allowNoMain))
+        os.c_fflush fDbgMainGate0
+    if ! uirCoreBuildCtxFoundMain(ctx) && !allowNoMain:
+        return Err[UirCoreModule]("uirCore_builder: main not found")
+    let noMainInitRes: Result[bool] = uirCoreRejectNoMainGlobalInit(ctx, allowNoMain)
+    if dbgPipeCount:
+        let fDbgPostFn2: os.File = os.get_stderr()
+        os.writeLine(fDbgPostFn2, "[backend] stage1: post_fn_tasks_2_after_no_main_init")
+        os.c_fflush fDbgPostFn2
+    if dbgPipeCount:
+        let fDbgMainGate1: os.File = os.get_stderr()
+        if uirCoreResultBoolIsOk(noMainInitRes):
+            os.writeLine(fDbgMainGate1, "[backend] stage1: no_main_init_ok")
+        else:
+            os.writeLine(fDbgMainGate1, "[backend] stage1: no_main_init_err")
+        os.c_fflush fDbgMainGate1
+    if !uirCoreResultBoolIsOk(noMainInitRes):
+        return ErrInfo[UirCoreModule](uirCoreResultBoolErrorInfo(noMainInitRes))
+
+    if uirCoreBuildCtxGlobalInitLen(ctx) > 0 && !backendSkipGlobalInit():
+        if uirCoreBuildCtxTraceEnabled(ctx):
+            stage1Trace("backend: uir global_init build start")
+        if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+            stage1Trace("materialize: global_init_call_before.exec")
+        var initFunc: UirCoreFunc = nil
+        let initRes: Result[bool] = uirCoreBuildGlobalInitFunc(mod, ctx, initFunc)
+        if envIsTrue "BACKEND_TRACE_MATERIALIZE":
+            stage1Trace("materialize: global_init_call_after.exec")
+        if !uirCoreResultBoolIsOk(initRes):
+            return ErrInfo[UirCoreModule](uirCoreResultBoolErrorInfo(initRes))
+        if initFunc == nil:
+            return Err[UirCoreModule]("uirCore_builder: global init builder returned nil")
+        uirCoreAddFunc(mod, initFunc)
+        if uirCoreBuildCtxFoundMain(ctx):
+            uirCoreInjectGlobalInitCall(mod, "__cheng_global_init")
+        if uirCoreBuildCtxTraceEnabled(ctx):
+            stage1Trace("backend: uir global_init build done")
+    if !envIsTrue "BACKEND_STAGE1_SKIP_PROFILE_GLOBAL_INIT_STEP":
+        uirCoreProfileStep(prof, "global_init")
+    let fineProfile: bool = envIsTrue "BACKEND_PROFILE_FINE"
+    if fineProfile:
+        uirCoreProfileStep(prof, "post_global_init")
+    if dbgPipeCount:
+        let fDbgAfterGlobalInit: os.File = os.get_stderr()
+        os.writeLine(fDbgAfterGlobalInit, "[backend] stage1: after_global_init_profile")
+        os.c_fflush fDbgAfterGlobalInit
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_global_init")
+        os.c_fflush os.get_stderr()
+    if fineProfile:
+        uirCoreProfileStep(prof, "post_global_init_dbgpipe")
+    if dbgSummary:
+        echo("[uir] global_init funcs=" + intToStr(uirCoreModuleFuncsLen(mod)) +
+             " globals=" + intToStr(uirCoreModuleGlobalsLen(mod)) +
+             " cstrs=" + intToStr(uirCoreModuleCStringsLen(mod)))
+    if fineProfile:
+        uirCoreProfileStep(prof, "post_global_init_summary")
+
+    let skipFixups: bool = envIsTrue "BACKEND_SKIP_UIR_FIXUPS"
+    if dbgPipeCount:
+        let fDbgFixPhase0: os.File = os.get_stderr()
+        os.writeLine(fDbgFixPhase0, "[backend] stage1: fixups_phase_enter0")
+        os.c_fflush fDbgFixPhase0
+    if uirCoreBuildCtxTraceEnabled(ctx):
+        if !skipFixups:
+            stage1Trace("backend: uir fixups start")
+        else:
+            stage1Trace("backend: uir fixups skipped")
+    if dbgPipeCount:
+        let fDbgFixPhase1: os.File = os.get_stderr()
+        os.writeLine(fDbgFixPhase1, "[backend] stage1: fixups_phase_enter1_after_trace")
+        os.c_fflush fDbgFixPhase1
+    # Stage0 crash hardening: skip profiling in fixups window.
+    if dbgPipeCount:
+        let fDbgFixPhase2: os.File = os.get_stderr()
+        os.writeLine(fDbgFixPhase2, "[backend] stage1: fixups_phase_enter2_after_pre_profile")
+        os.c_fflush fDbgFixPhase2
+    if dbgPipeCount:
+        let fDbgFix0: os.File = os.get_stderr()
+        os.writeLine(fDbgFix0, "[backend] stage1: fixups_call_pre")
+        os.c_fflush fDbgFix0
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: before_fixups")
+        os.c_fflush os.get_stderr()
+    # Stage0 crash hardening: skip profiling in fixups window.
+    var fixOk: bool = true
+    if !skipFixups:
+        fixOk = uirCoreBuildMissingRoutinesFromUirId(mod, rootIdForDup, overloadedFnBasesPtr, nil)
+    if dbgPipeCount:
+        let fDbgFix1: os.File = os.get_stderr()
+        os.writeLine(fDbgFix1, "[backend] stage1: fixups_call_post_v2")
+        os.writeLine(fDbgFix1, "[backend] stage1: fixups_skip_value=" + uirCoreDebugBool01(skipFixups))
+        if skipFixups:
+            os.writeLine(fDbgFix1, "[backend] stage1: fixups_skipped_env=1")
+        os.c_fflush fDbgFix1
+    if !fixOk:
+        if dbgPipeCount:
+            let fDbgFixErr: os.File = os.get_stderr()
+            os.writeLine(fDbgFixErr, "[backend] stage1: fixups_result_err")
+            os.c_fflush fDbgFixErr
+        return Err[UirCoreModule]("uirCore_builder: fixups failed")
+    if dbgPipeCount:
+        let fDbgFixOk: os.File = os.get_stderr()
+        os.writeLine(fDbgFixOk, "[backend] stage1: fixups_result_ok")
+        os.c_fflush fDbgFixOk
+    if dbgConst:
+        os.writeLine(os.get_stderr(), "[backend] const: after_fixups")
+        os.c_fflush os.get_stderr()
+    let skipNormalize: bool = envIsTrue "BACKEND_SKIP_UIR_NORMALIZE"
+    if uirCoreBuildCtxTraceEnabled(ctx):
+        if !skipFixups:
+            stage1Trace("backend: uir fixups done")
+        if !skipNormalize:
+            stage1Trace("backend: uir normalize start")
+        else:
+            stage1Trace("backend: uir normalize skipped")
+    if dbgPipeCount:
+        let fDbgFixProf0: os.File = os.get_stderr()
+        os.writeLine(fDbgFixProf0, "[backend] stage1: fixups_profile_pre")
+        os.c_fflush fDbgFixProf0
+    # Stage0 crash hardening: skip fixups profile step.
+    if dbgPipeCount:
+        let fDbgFixProf1: os.File = os.get_stderr()
+        os.writeLine(fDbgFixProf1, "[backend] stage1: fixups_profile_post")
+        os.c_fflush fDbgFixProf1
+    if dbgSummary:
+        echo("[uir] fixups funcs=" + intToStr(uirCoreModuleFuncsLen(mod)) +
+             " globals=" + intToStr(uirCoreModuleGlobalsLen(mod)) +
+             " cstrs=" + intToStr(uirCoreModuleCStringsLen(mod)))
+    if dbgPipeCount:
+        let fDbgNorm0: os.File = os.get_stderr()
+        os.writeLine(fDbgNorm0, "[backend] stage1: normalize_skip_value=" + uirCoreDebugBool01(skipNormalize))
+        os.c_fflush fDbgNorm0
+    if !skipNormalize:
+        if dbgPipeCount:
+            let fDbgNorm1: os.File = os.get_stderr()
+            os.writeLine(fDbgNorm1, "[backend] stage1: normalize_pre")
+            os.c_fflush fDbgNorm1
+        if dbgConst:
+            os.writeLine(os.get_stderr(), "[backend] const: before_normalize")
+            os.c_fflush os.get_stderr()
+        uirCoreApplyUirPluginHooks(effectiveRootTag, mod)
+        if dbgPipeCount:
+            let fDbgNorm2: os.File = os.get_stderr()
+            os.writeLine(fDbgNorm2, "[backend] stage1: normalize_hooks_post")
+            os.c_fflush fDbgNorm2
+        uirCoreNormalizeModule(mod)
+        if dbgPipeCount:
+            let fDbgNorm3: os.File = os.get_stderr()
+            os.writeLine(fDbgNorm3, "[backend] stage1: normalize_post")
+            os.c_fflush fDbgNorm3
+        if dbgConst:
+            os.writeLine(os.get_stderr(), "[backend] const: after_normalize")
+            os.c_fflush os.get_stderr()
+    if dbgSummary:
+        echo("[uir] normalize funcs=" + intToStr(uirCoreModuleFuncsLen(mod)) +
+             " globals=" + intToStr(uirCoreModuleGlobalsLen(mod)) +
+             " cstrs=" + intToStr(uirCoreModuleCStringsLen(mod)))
+    if uirCoreBuildCtxTraceEnabled(ctx) && !skipNormalize:
+        stage1Trace("backend: uir normalize done")
+    uirCoreProfileStep(prof, "normalize")
+    # Optional memory-pressure release for selfhost bootstrap bring-up.
+    # Keep default off because some stage0/compat combinations still depend on
+    # arena-backed string lifetimes during downstream codegen.
+    if envIsTrue "STAGE1_RELEASE_ARENA_AFTER_BUILD":
+        releaseNodeArena()
+        releaseLexStrings()
+    if envIsTrue "BACKEND_DEBUG_BOOT":
+        var mainFoundAtEnd: bool = false
+        for fiEnd in 0..<uirCoreModuleFuncsLen(mod):
+            let fEnd: UirCoreFunc = uirCoreModuleFuncAt(mod, fiEnd)
+            if fEnd == nil:
+                continue
+            let fnNameEnd: str = uirCoreFuncNameOf(fEnd)
+            let linkNameEnd: str = uirCoreFuncLinkNameOf(fEnd)
+            if fnNameEnd == "main" || fnNameEnd == "backendMain" ||
+               linkNameEnd == "main" || linkNameEnd == "_main":
+                echo("[backend] module_end main_candidate idx=" + intToStr(fiEnd) +
+                     " name=" + fnNameEnd +
+                     " link=" + linkNameEnd +
+                     " blocks=" + intToStr(uirCoreFuncBlocksLen(fEnd)) +
+                     " extern=" + (uirCoreFuncIsExtern(fEnd) ? "1" : "0"))
+                mainFoundAtEnd = true
+                break
+        if !mainFoundAtEnd:
+            echo("[backend] module_end main_candidate=missing funcs=" +
+                 intToStr(uirCoreModuleFuncsLen(mod)))
+    return uirCoreOkModule(mod)
+
+fn uirCoreRootExecPipelineBuildModuleFromRoot(rootInput: Node): Result[UirCoreModule] =
+    if (rootInput == nil):
+        return Err[UirCoreModule]("uirCore_builder: empty root")
+    let rootInputId: AstNodeId = rootInput
+    return uirCoreRootExecPipelineBuildModuleFromRootId(rootInputId)

@@ -1,0 +1,60 @@
+import std/system
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
+
+fn uirCoreCStringOrEmpty(raw: cstring): str =
+    if raw != nil:
+        return str(raw)
+    return ""
+
+fn uirCoreFuncSyntheticByName(funcName: str): bool =
+    if len(funcName) == 0:
+        return true
+    if uirCoreStrStartsWith(funcName, "__cheng_"):
+        return true
+    if uirCoreStrIndexOf(funcName, "__cheng_mod_") >= 0:
+        return true
+    if uirCoreStrIndexOf(funcName, uirCoreFuncSigMarker()) >= 0:
+        return true
+    return false
+
+fn uirCoreFuncOwnershipProofScore(func: UirCoreFunc): int32 =
+    if !uirCoreFuncIdValid(func) || uirCoreFuncIsExtern(func):
+        return 0
+    if uirCoreFuncBlocksLen(func) <= 0:
+        return 0
+    var score: int32 = 0
+    for bi in 0..<uirCoreFuncBlocksLen(func):
+        let blk: UirBlockId = uirCoreFuncBlockAt(func, bi)
+        if !uirCoreBlockIdValid(blk):
+            continue
+        score = score + uirCoreBlockStmtsLen(blk)
+        let term0: UirCoreTerm = uirCoreBlockTermOf(blk)
+        if uirCoreTermKindOf(term0) == uirCoreTermKindRet() && uirCoreExprIdValid(uirCoreTermRetExprOf(term0)):
+            score = score + 1
+        elif uirCoreTermKindOf(term0) == uirCoreTermKindCbr() && uirCoreExprIdValid(uirCoreTermCondExprOf(term0)):
+            score = score + 1
+    return score
+
+fn uirCoreApplyOwnershipPhaseContract(module: UirCoreModule, skipOwnership: bool, borrowIrMode: str) =
+    if module == nil:
+        return
+    for i in 0..<uirCoreModuleFuncsLen(module):
+        let f: UirCoreFunc = uirCoreModuleFuncAt(module, i)
+        if f == nil || uirCoreFuncIsExtern(f):
+            continue
+        if skipOwnership:
+            if borrowIrMode == "mir":
+                uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "mir_borrow_skipped")
+            else:
+                uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "ownership_skipped")
+            continue
+        let proofCount: int32 = uirCoreFuncOwnershipProofScore(f)
+        if proofCount > 0 && !uirCoreFuncSyntheticByName(uirCoreFuncNameOf(f)):
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), true, true, "")
+            continue
+        if proofCount == 0:
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "high_uir_ownership_no_proof")
+        else:
+            uirCoreFuncSetPhaseContract(f, uirCorePhaseLowTag(), false, true, "high_uir_ownership_synthetic")
+    return

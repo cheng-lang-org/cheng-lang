@@ -9,7 +9,8 @@ Usage:
   src/tooling/backend_seed_pure.sh [--seed:<path>] [--out:<path>]
 
 Notes:
-  - Rebuilds the backend stage2 driver using a prebuilt seed driver (no C backend).
+  - Internal transitional bootstrap only: rebuilds the backend stage2 driver
+    using a prebuilt seed driver (no C backend).
   - Seed must be an executable backend driver binary (typically a previously published stage2).
   - The seed is copied into chengcache/ before running so it won't be clobbered.
   - Output stage2 is produced at: artifacts/backend_selfhost_self_obj/cheng.stage2
@@ -48,7 +49,7 @@ while [ "${1:-}" != "" ]; do
   shift || true
 done
 
-root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 if [ "$seed" = "" ]; then
@@ -61,14 +62,150 @@ if [ ! -x "$seed" ]; then
   exit 2
 fi
 
+seed_is_script_shim() {
+  cand="$1"
+  [ -f "$cand" ] || return 1
+  first_line="$(sed -n '1p' "$cand" 2>/dev/null || true)"
+  case "$first_line" in
+    '#!'*) return 0 ;;
+  esac
+  return 1
+}
+
+if seed_is_script_shim "$seed"; then
+  echo "[Error] backend_seed_pure requires a real executable seed binary, not a script shim: $seed" 1>&2
+  exit 2
+fi
+
 mkdir -p chengcache
-seed_copy="chengcache/backend_seed_stage0.$(basename "$seed")"
+seed_base="$(basename "$seed")"
+seed_key=""
+if command -v shasum >/dev/null 2>&1; then
+  seed_key="$(printf '%s' "$seed" | shasum -a 256 | awk '{print substr($1, 1, 12)}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+  seed_key="$(printf '%s' "$seed" | sha256sum | awk '{print substr($1, 1, 12)}')"
+else
+  seed_key="$(printf '%s' "$seed" | cksum | awk '{print $1}')"
+fi
+seed_tmp_dir="$(mktemp -d "$root/chengcache/backend_seed_stage0.${seed_key}.XXXXXX")"
+seed_copy="$seed_tmp_dir/$seed_base"
 cp "$seed" "$seed_copy"
 chmod +x "$seed_copy" 2>/dev/null || true
+seed_stage0="$seed_copy"
+seed_lineage_surface=""
+seed_lineage_dir=""
+seed_meta="${seed}.meta"
+seed_stamp="${seed}.compile_stamp.txt"
+seed_label=""
+seed_lineage_name=""
+if [ -f "$seed_meta" ]; then
+  seed_label="$(sed -n 's/^label=//p' "$seed_meta" | head -n 1)"
+fi
+if [ "$seed_label" = "currentsrc.proof.bootstrap" ]; then
+  echo "[Error] backend_seed_pure does not accept bootstrap proof wrapper as seed: $seed" 1>&2
+  exit 2
+fi
+case "$seed_label" in
+  currentsrc.proof.bootstrap)
+    seed_lineage_name="cheng_stage0_currentsrc.proof"
+    ;;
+  stage1)
+    seed_lineage_name="cheng.stage1"
+    ;;
+  stage2)
+    seed_lineage_name="cheng.stage2"
+    ;;
+  stage2.proof)
+    seed_lineage_name="cheng.stage2.proof"
+    ;;
+esac
+if [ "$seed_lineage_name" != "" ]; then
+  seed_lineage_dir="$seed_tmp_dir/lineage"
+  mkdir -p "$seed_lineage_dir"
+  seed_lineage_surface="$seed_lineage_dir/$seed_lineage_name"
+  cp "$seed" "$seed_lineage_surface"
+  chmod +x "$seed_lineage_surface" 2>/dev/null || true
+  if [ -f "$seed_meta" ]; then
+    cp "$seed_meta" "${seed_lineage_surface}.meta"
+  fi
+  if [ -f "$seed_stamp" ]; then
+    cp "$seed_stamp" "${seed_lineage_surface}.compile_stamp.txt"
+  fi
+  if [ "$seed_label" = "currentsrc.proof.bootstrap" ]; then
+    seed_src_dir="$(dirname -- "$seed")"
+    seed_outer_src="$seed_src_dir/cheng_stage0_currentsrc.outer"
+    seed_sidecar_src="$seed_src_dir/cheng_stage0_currentsrc.sidecar.sh"
+    seed_sidecar_meta_src="${seed_sidecar_src}.meta"
+    seed_stage1_stamp_src=""
+    for cand in \
+      "$seed_src_dir/stage1.native.after.compile_stamp.txt" \
+      "$seed_src_dir/stage1.native.compile_stamp.txt" \
+      "$seed_src_dir/stage1.native.serial.compile_stamp.txt"
+    do
+      if [ -f "$cand" ]; then
+        seed_stage1_stamp_src="$cand"
+        break
+      fi
+    done
+    if [ -f "$seed_outer_src" ]; then
+      cp "$seed_outer_src" "$seed_lineage_dir/cheng_stage0_currentsrc.outer"
+      chmod +x "$seed_lineage_dir/cheng_stage0_currentsrc.outer" 2>/dev/null || true
+    fi
+    if [ -f "$seed_sidecar_src" ]; then
+      cp "$seed_sidecar_src" "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh"
+      chmod +x "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh" 2>/dev/null || true
+    fi
+    if [ -f "$seed_sidecar_meta_src" ]; then
+      cp "$seed_sidecar_meta_src" "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta"
+      if [ -f "$seed_lineage_dir/cheng_stage0_currentsrc.outer" ]; then
+        awk -v outer="$seed_lineage_dir/cheng_stage0_currentsrc.outer" '
+          /^sidecar_real_driver=/ { print "sidecar_real_driver=" outer; next }
+          { print }
+        ' "$seed_sidecar_meta_src" > "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta.tmp.$$"
+        mv "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta.tmp.$$" \
+          "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta"
+      fi
+    fi
+    if [ "$seed_stage1_stamp_src" != "" ]; then
+      cp "$seed_stage1_stamp_src" "$seed_lineage_dir/stage1.native.after.compile_stamp.txt"
+    fi
+    if [ -f "${seed_lineage_surface}.meta" ]; then
+      awk \
+        -v outer="$seed_lineage_dir/cheng_stage0_currentsrc.outer" \
+        -v sidecar="$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh" '
+        /^outer_driver=/ { print "outer_driver=" outer; next }
+        /^sidecar_compiler=/ { print "sidecar_compiler=" sidecar; next }
+        { print }
+      ' "${seed_lineage_surface}.meta" > "${seed_lineage_surface}.meta.tmp.$$"
+      mv "${seed_lineage_surface}.meta.tmp.$$" "${seed_lineage_surface}.meta"
+    fi
+  fi
+fi
+
+bootstrap_script="$root/src/tooling/cheng_tooling_embedded_scripts/verify_backend_selfhost_bootstrap_self_obj.sh"
+if [ ! -f "$bootstrap_script" ]; then
+  echo "[Error] missing bootstrap verifier: $bootstrap_script" 1>&2
+  exit 1
+fi
 
 echo "== backend.seed_pure.bootstrap =="
-SELF_OBJ_BOOTSTRAP_STAGE0="$seed_copy" \
-  ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_prod_closure --only-self-obj-bootstrap
+seed_bridge_input="src/backend/tooling/backend_driver_seed_bridge.cheng"
+if [ ! -f "$seed_bridge_input" ]; then
+  echo "[Error] missing internal transitional driver input: $seed_bridge_input" 1>&2
+  exit 1
+fi
+if [ "$seed_lineage_dir" != "" ]; then
+  SELF_OBJ_BOOTSTRAP_CURRENTSRC_LINEAGE_DIR="$seed_lineage_dir" \
+  SELF_OBJ_BOOTSTRAP_DRIVER_INPUT="$seed_bridge_input" \
+  SELF_OBJ_BOOTSTRAP_STAGE0="$seed_stage0" \
+  SELF_OBJ_BOOTSTRAP_STAGE0_COMPAT=0 \
+    sh "$bootstrap_script"
+else
+  SELF_OBJ_BOOTSTRAP_DRIVER_INPUT="$seed_bridge_input" \
+  SELF_OBJ_BOOTSTRAP_STAGE0="$seed_stage0" \
+  SELF_OBJ_BOOTSTRAP_STAGE0_COMPAT=0 \
+    sh "$bootstrap_script"
+fi
 
 stage2="artifacts/backend_selfhost_self_obj/cheng.stage2"
 if [ ! -x "$stage2" ]; then
@@ -93,4 +230,3 @@ if [ "$out" != "" ]; then
 fi
 
 echo "backend_seed_pure ok: stage2=$stage2 sha256=$stage2_sha"
-

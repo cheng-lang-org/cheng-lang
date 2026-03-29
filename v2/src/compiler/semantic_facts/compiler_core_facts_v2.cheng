@@ -1,0 +1,300 @@
+import std/seqs
+import std/strings as strings
+import std/strutils as strutils
+import compiler/frontend/compiler_core_surface_ir_v2 as ccore
+import compiler/driver/identity_v2 as ident
+
+type
+    CompilerCoreSemanticFacts =
+        version: str
+        itemIds: int32[]
+        topLevelKinds: str[]
+        topLevelLabels: str[]
+        importcSymbolTexts: str[]
+        highOps: str[]
+        proofDomains: str[]
+        effectClasses: str[]
+        bindingScopes: str[]
+        importPaths: str[]
+        importAliases: str[]
+        importCategories: str[]
+        bodyLineCounts: int32[]
+        bodyHashes: str[]
+        signatureHashes: str[]
+        executableAstReady: bool[]
+        returnTypeTexts: str[]
+        paramCounts: int32[]
+        localCounts: int32[]
+        stmtCounts: int32[]
+        exprCounts: int32[]
+
+fn compilerCoreFactsVersion(): str =
+    return "v2.semantic_facts.compiler_core.v1"
+
+fn compilerCoreFindText(text: str, pattern: str): int32 =
+    if len(pattern) <= 0:
+        return 0
+    if len(pattern) > len(text):
+        return -1
+    for i in 0..(len(text) - len(pattern)):
+        if strings.sliceBytes(text, i, len(pattern)) == pattern:
+            return i
+    return -1
+
+fn compilerCoreImportcSymbolText(signatureText: str, label: str): str =
+    let marker = "@importc(\""
+    let markerIdx = compilerCoreFindText(signatureText, marker)
+    if markerIdx < 0:
+        return label
+    let startIdx = markerIdx + len(marker)
+    for i in startIdx..<len(signatureText):
+        if signatureText[i] == '"':
+            return strings.sliceBytes(signatureText, startIdx, i - startIdx)
+    return label
+
+fn joinWithSep(values: str[], sep: str): str =
+    var out: str = ""
+    for i in 0..<values.len:
+        if i > 0:
+            out = out + sep
+        out = out + values[i]
+    return out
+
+fn compilerCoreBodyHash(bodyLines: str[]): str =
+    return ident.sha256HexText(joinWithSep(bodyLines, "\n"))
+
+fn compilerCoreImportCategory(modulePath: str): str =
+    if strutils.startsWith(modulePath, "std/"):
+        return "stdlib"
+    if strutils.startsWith(modulePath, "compiler/"):
+        return "compiler_module"
+    if strutils.startsWith(modulePath, "runtime/"):
+        return "runtime_module"
+    if strutils.startsWith(modulePath, "bootstrap/"):
+        return "bootstrap_module"
+    return "package_local"
+
+fn compilerCoreHighOpForKind(kind: str, executableAstReady: bool): str =
+    if kind == "module":
+        return "compiler_module_decl"
+    if kind == "import":
+        return "compiler_import_bind"
+    if kind == "type":
+        return "compiler_type_block"
+    if kind == "const":
+        return "compiler_const_decl"
+    if kind == "var":
+        return "compiler_var_decl"
+    if kind == "importc_fn":
+        return "compiler_importc_fn_decl"
+    if executableAstReady:
+        if kind == "iterator":
+            return "compiler_iterator_exec"
+        return "compiler_fn_exec"
+    if kind == "iterator":
+        return "compiler_iterator_outline"
+    return "compiler_fn_outline"
+
+fn compilerCoreProofDomainForKind(kind: str, executableAstReady: bool): str =
+    if kind == "module":
+        return "module_identity_outline"
+    if kind == "import":
+        return "module_path_resolution"
+    if kind == "type":
+        return "type_layout_outline"
+    if kind == "const":
+        return "const_value_outline"
+    if kind == "var":
+        return "var_storage_outline"
+    if kind == "importc_fn":
+        return "ffi_signature_outline"
+    if executableAstReady:
+        if kind == "iterator":
+            return "iterator_control_flow_subset"
+        return "routine_control_flow_subset"
+    if kind == "iterator":
+        return "iterator_signature_outline"
+    return "routine_signature_outline"
+
+fn compilerCoreEffectClassForKind(kind: str, executableAstReady: bool): str =
+    if kind == "module":
+        return "module_identity"
+    if kind == "import":
+        return "module_resolution"
+    if kind == "type":
+        return "type_layout"
+    if kind == "const":
+        return "const_binding"
+    if kind == "var":
+        return "storage_binding"
+    if kind == "importc_fn":
+        return "ffi_binding"
+    if executableAstReady:
+        if kind == "iterator":
+            return "sequence_executable"
+        return "control_flow_executable"
+    if kind == "iterator":
+        return "sequence_outline"
+    return "control_flow_outline"
+
+fn compilerCoreBindingScopeForKind(kind: str): str =
+    if kind == "module":
+        return "module_scope"
+    if kind == "import":
+        return "import_binding"
+    if kind == "type":
+        return "type_scope"
+    if kind == "const":
+        return "const_scope"
+    if kind == "var":
+        return "var_scope"
+    if kind == "importc_fn":
+        return "ffi_scope"
+    if kind == "iterator":
+        return "iterator_scope"
+    return "routine_scope"
+
+fn buildCompilerCoreSemanticFacts(program: ccore.CompilerCoreProgram): CompilerCoreSemanticFacts =
+    var out: CompilerCoreSemanticFacts
+    out.version = compilerCoreFactsVersion()
+    out.itemIds = []
+    out.topLevelKinds = []
+    out.topLevelLabels = []
+    out.importcSymbolTexts = []
+    out.highOps = []
+    out.proofDomains = []
+    out.effectClasses = []
+    out.bindingScopes = []
+    out.importPaths = []
+    out.importAliases = []
+    out.importCategories = []
+    out.bodyLineCounts = []
+    out.bodyHashes = []
+    out.signatureHashes = []
+    out.executableAstReady = []
+    out.returnTypeTexts = []
+    out.paramCounts = []
+    out.localCounts = []
+    out.stmtCounts = []
+    out.exprCounts = []
+    var moduleIdx: int32 = 0
+    var importIdx: int32 = 0
+    var typeIdx: int32 = 0
+    var constIdx: int32 = 0
+    var varIdx: int32 = 0
+    var routineIdx: int32 = 0
+    for i in 0..<program.topLevelKinds.len:
+        let kind = program.topLevelKinds[i]
+        var label: str = program.topLevelLabels[i]
+        var importcSymbolText: str = ""
+        var importPath: str = ""
+        var importAlias: str = ""
+        var importCategory: str = ""
+        var bodyLineCount: int32 = 0
+        var bodyHash: str = ident.sha256HexText("")
+        var signatureHash: str = ident.sha256HexText("")
+        var executableAstReady: bool = false
+        var returnTypeText: str = ""
+        var paramCount: int32 = 0
+        var localCount: int32 = 0
+        var stmtCount: int32 = 0
+        var exprCount: int32 = 0
+        if kind == "module":
+            let decl = program.modules[moduleIdx]
+            moduleIdx = moduleIdx + 1
+            label = decl.name
+            signatureHash = ident.sha256HexText(decl.headerText)
+        elif kind == "import":
+            let decl = program.imports[importIdx]
+            importIdx = importIdx + 1
+            label = decl.modulePath
+            importPath = decl.modulePath
+            importAlias = decl.alias
+            importCategory = compilerCoreImportCategory(decl.modulePath)
+        elif kind == "type":
+            let block = program.typeBlocks[typeIdx]
+            typeIdx = typeIdx + 1
+            label = block.headerText
+            bodyLineCount = block.bodyLines.len
+            bodyHash = compilerCoreBodyHash(block.bodyLines)
+        elif kind == "const":
+            let decl = program.constDecls[constIdx]
+            constIdx = constIdx + 1
+            label = decl.label
+            signatureHash = ident.sha256HexText(decl.headerText)
+            bodyLineCount = decl.bodyLines.len
+            bodyHash = compilerCoreBodyHash(decl.bodyLines)
+        elif kind == "var":
+            let decl = program.varDecls[varIdx]
+            varIdx = varIdx + 1
+            label = decl.label
+            signatureHash = ident.sha256HexText(decl.headerText)
+            bodyLineCount = decl.bodyLines.len
+            bodyHash = compilerCoreBodyHash(decl.bodyLines)
+        else:
+            let decl = program.routines[routineIdx]
+            routineIdx = routineIdx + 1
+            label = decl.name
+            if kind == "importc_fn":
+                importcSymbolText = compilerCoreImportcSymbolText(decl.signatureText, decl.name)
+            bodyLineCount = decl.bodyLines.len
+            bodyHash = compilerCoreBodyHash(decl.bodyLines)
+            signatureHash = ident.sha256HexText(decl.signatureText)
+            executableAstReady = decl.executableAstReady
+            returnTypeText = decl.returnTypeText
+            paramCount = decl.paramCount
+            localCount = decl.localCount
+            stmtCount = decl.stmtCount
+            exprCount = decl.exprCount
+        add(out.itemIds, i)
+        add(out.topLevelKinds, kind)
+        add(out.topLevelLabels, label)
+        add(out.importcSymbolTexts, importcSymbolText)
+        add(out.highOps, compilerCoreHighOpForKind(kind, executableAstReady))
+        add(out.proofDomains, compilerCoreProofDomainForKind(kind, executableAstReady))
+        add(out.effectClasses, compilerCoreEffectClassForKind(kind, executableAstReady))
+        add(out.bindingScopes, compilerCoreBindingScopeForKind(kind))
+        add(out.importPaths, importPath)
+        add(out.importAliases, importAlias)
+        add(out.importCategories, importCategory)
+        add(out.bodyLineCounts, bodyLineCount)
+        add(out.bodyHashes, bodyHash)
+        add(out.signatureHashes, signatureHash)
+        add(out.executableAstReady, executableAstReady)
+        add(out.returnTypeTexts, returnTypeText)
+        add(out.paramCounts, paramCount)
+        add(out.localCounts, localCount)
+        add(out.stmtCounts, stmtCount)
+        add(out.exprCounts, exprCount)
+    return out
+
+fn compilerCoreExecutableAstItemCount(facts: CompilerCoreSemanticFacts): int32 =
+    var out: int32 = 0
+    for i in 0..<facts.executableAstReady.len:
+        if facts.executableAstReady[i]:
+            out = out + 1
+    return out
+
+fn compilerCoreExecutableParamCount(facts: CompilerCoreSemanticFacts): int32 =
+    var out: int32 = 0
+    for i in 0..<facts.paramCounts.len:
+        out = out + facts.paramCounts[i]
+    return out
+
+fn compilerCoreExecutableLocalCount(facts: CompilerCoreSemanticFacts): int32 =
+    var out: int32 = 0
+    for i in 0..<facts.localCounts.len:
+        out = out + facts.localCounts[i]
+    return out
+
+fn compilerCoreExecutableStmtCount(facts: CompilerCoreSemanticFacts): int32 =
+    var out: int32 = 0
+    for i in 0..<facts.stmtCounts.len:
+        out = out + facts.stmtCounts[i]
+    return out
+
+fn compilerCoreExecutableExprCount(facts: CompilerCoreSemanticFacts): int32 =
+    var out: int32 = 0
+    for i in 0..<facts.exprCounts.len:
+        out = out + facts.exprCounts[i]
+    return out

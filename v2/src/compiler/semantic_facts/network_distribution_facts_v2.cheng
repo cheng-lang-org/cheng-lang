@@ -1,0 +1,146 @@
+import std/seqs
+import std/system
+import compiler/frontend/network_distribution_surface_ir_v2 as nsurf
+
+type
+    NetworkDistributionFacts =
+        version: str
+        opIds: int32[]
+        opNames: str[]
+        topologyRefs: str[]
+        topologyCanonicalForms: str[]
+        networkDomains: str[]
+        addressingModes: str[]
+        topologyDepths: int32[]
+        transportModes: str[]
+        repairModes: str[]
+        dispersalModes: str[]
+        priorityClasses: str[]
+        addressBindings: str[]
+        distanceMetrics: str[]
+        routePlanModels: str[]
+        identityScopes: str[]
+        antiEntropySignatureKinds: str[]
+        proofDomains: str[]
+
+fn networkDistributionFactsVersion(): str =
+    return "v2.semantic_facts.network_distribution.v1"
+
+fn findTopology(program: nsurf.NetworkDistributionProgram, name: str): int32 =
+    for i in 0..<program.topologies.len:
+        if program.topologies[i].name == name:
+            return i
+    return -1
+
+fn requireTopology(topology: nsurf.TopologyDecl) =
+    if !(topology.domain == "source_manifest" || topology.domain == "ast_delta" || topology.domain == "rule_pack" || topology.domain == "compiler_rule_pack"):
+        panic("v2 network facts: unsupported topology domain " + topology.domain)
+    if topology.fanout != "luoshu9":
+        panic("v2 network facts: unsupported topology fanout " + topology.fanout)
+    if topology.addressing != "lsmr_path":
+        panic("v2 network facts: unsupported topology addressing " + topology.addressing)
+    if topology.depth <= 0:
+        panic("v2 network facts: invalid topology depth")
+    if topology.repair != "passive_anti_entropy":
+        panic("v2 network facts: unsupported topology repair " + topology.repair)
+    if topology.dispersal == "ida":
+        if topology.idaK <= 0 || topology.idaN <= 0 || topology.idaK >= topology.idaN:
+            panic("v2 network facts: invalid ida dispersal")
+    elif topology.dispersal != "none":
+        panic("v2 network facts: unsupported dispersal " + topology.dispersal)
+    if nsurf.networkPriorityTransport(topology.priority) == "":
+        panic("v2 network facts: unsupported priority " + topology.priority)
+
+fn proofDomainForNetworkOp(opName: str): str =
+    if opName == "publish_source_manifest":
+        return "content_identity_publication"
+    if opName == "publish_rule_pack":
+        return "rule_pack_publication"
+    if opName == "publish_compiler_rule_pack":
+        return "compiler_rule_pack_publication"
+    if opName == "route_lsmr_tree":
+        return "topology_routing"
+    if opName == "disperse_ida_fragments":
+        return "coded_bulk_dispersal"
+    if opName == "exchange_anti_entropy_signature":
+        return "anti_entropy_signature"
+    return "signature_gap_repair"
+
+fn identityScopeForNetworkOp(opName: str, topology: nsurf.TopologyDecl): str =
+    if opName == "publish_source_manifest":
+        return "source_manifest"
+    if opName == "publish_rule_pack":
+        return "rule_pack"
+    if opName == "publish_compiler_rule_pack":
+        return "compiler_rule_pack"
+    if opName == "route_lsmr_tree":
+        return "topology_control"
+    if opName == "disperse_ida_fragments":
+        return topology.domain + "_fragments"
+    if opName == "exchange_anti_entropy_signature":
+        return "anti_entropy_signature"
+    return "anti_entropy_repair"
+
+fn requireNetworkOp(op: nsurf.NetworkDistributionOp, topology: nsurf.TopologyDecl) =
+    if op.opName == "publish_source_manifest" && topology.domain != "source_manifest":
+        panic("v2 network facts: publish_source_manifest requires source_manifest domain")
+    if op.opName == "publish_rule_pack" && topology.domain != "rule_pack":
+        panic("v2 network facts: publish_rule_pack requires rule_pack domain")
+    if op.opName == "publish_compiler_rule_pack" && topology.domain != "compiler_rule_pack":
+        panic("v2 network facts: publish_compiler_rule_pack requires compiler_rule_pack domain")
+    if op.opName == "disperse_ida_fragments" && topology.dispersal != "ida":
+        panic("v2 network facts: disperse_ida_fragments requires ida topology")
+    if (op.opName == "exchange_anti_entropy_signature" || op.opName == "repair_from_signature_gap") && len(op.signatureKind) == 0:
+        panic("v2 network facts: anti-entropy operations require signature kind")
+
+fn newNetworkDistributionFacts(): NetworkDistributionFacts =
+    var out: NetworkDistributionFacts
+    out.version = networkDistributionFactsVersion()
+    out.opIds = []
+    out.opNames = []
+    out.topologyRefs = []
+    out.topologyCanonicalForms = []
+    out.networkDomains = []
+    out.addressingModes = []
+    out.topologyDepths = []
+    out.transportModes = []
+    out.repairModes = []
+    out.dispersalModes = []
+    out.priorityClasses = []
+    out.addressBindings = []
+    out.distanceMetrics = []
+    out.routePlanModels = []
+    out.identityScopes = []
+    out.antiEntropySignatureKinds = []
+    out.proofDomains = []
+    return out
+
+fn buildNetworkDistributionFacts(program: nsurf.NetworkDistributionProgram): NetworkDistributionFacts =
+    var out: NetworkDistributionFacts = newNetworkDistributionFacts()
+    for i in 0..<program.topologies.len:
+        requireTopology(program.topologies[i])
+    for i in 0..<program.ops.len:
+        let op = program.ops[i]
+        let topologyIdx = findTopology(program, op.topologyRef)
+        if topologyIdx < 0:
+            panic("v2 network facts: missing topology " + op.topologyRef)
+        let topology = program.topologies[topologyIdx]
+        requireNetworkOp(op, topology)
+        add(out.opIds, i)
+        add(out.opNames, op.opName)
+        add(out.topologyRefs, op.topologyRef)
+        add(out.topologyCanonicalForms, nsurf.topologyCanonicalForm(topology))
+        add(out.networkDomains, topology.domain)
+        add(out.addressingModes, topology.addressing)
+        add(out.topologyDepths, topology.depth)
+        add(out.transportModes, nsurf.networkPriorityTransport(topology.priority))
+        add(out.repairModes, topology.repair)
+        add(out.dispersalModes, nsurf.canonicalDispersalText(topology))
+        add(out.priorityClasses, topology.priority)
+        add(out.addressBindings, nsurf.topologyAddressBinding(topology))
+        add(out.distanceMetrics, nsurf.topologyDistanceMetric(topology))
+        add(out.routePlanModels, nsurf.topologyMultipathModel(topology))
+        add(out.identityScopes, identityScopeForNetworkOp(op.opName, topology))
+        add(out.antiEntropySignatureKinds, if len(op.signatureKind) > 0: op.signatureKind else: "none")
+        add(out.proofDomains, proofDomainForNetworkOp(op.opName))
+    return out

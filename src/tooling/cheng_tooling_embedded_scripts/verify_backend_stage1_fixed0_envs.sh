@@ -27,6 +27,7 @@ rm -f "$report"
 
 cc -std=c11 -Wno-deprecated-declarations -O0 \
   src/backend/tooling/backend_driver_sidecar_outer_main.c \
+  src/backend/tooling/backend_driver_sidecar_outer_exports.c \
   src/runtime/native/system_helpers.c \
   -o "$driver"
 

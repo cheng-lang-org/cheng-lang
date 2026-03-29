@@ -1,0 +1,250 @@
+import std/seqs
+import std/system
+import compiler/driver/identity_v2 as ident
+import compiler/machine/target_contract as mtarget
+import compiler/machine/machine_pipeline_v2 as mpipeline
+
+type
+    ObjImageBundle =
+        version: str
+        moduleKind: str
+        targetTriple: str
+        format: str
+        textSectionName: str
+        cstringSectionName: str
+        symtabSectionName: str
+        strtabSectionName: str
+        relocSectionName: str
+        sectionNames: str[]
+        sectionAlignPow2: int32[]
+        sectionSizes: int32[]
+        symbolNames: str[]
+        symbolBindings: str[]
+        symbolSections: str[]
+        symbolValues: int32[]
+        symbolSizes: int32[]
+        relocationSections: str[]
+        relocationOffsets: int32[]
+        relocationSymbols: str[]
+        relocationKinds: str[]
+        metadataSymbolNames: str[]
+        metadataPayloads: str[]
+        dataSymbolNames: str[]
+        dataSectionNames: str[]
+        dataPayloads: str[]
+        dataAlignPow2: int32[]
+        imageText: str
+        imageCid: str
+
+fn objImageVersion(): str =
+    return "v2.obj_image.v1"
+
+fn joinWithSep(values: str[], sep: str): str =
+    var out: str = ""
+    for i in 0..<values.len:
+        if i > 0:
+            out = out + sep
+        out = out + values[i]
+    return out
+
+fn countCStringBytes(values: str[]): int32 =
+    var out: int32 = 0
+    for i in 0..<values.len:
+        out = out + len(values[i]) + 1
+    return out
+
+fn countStrtabBytes(symbolNames: str[]): int32 =
+    var out: int32 = 1
+    for i in 0..<symbolNames.len:
+        out = out + len(symbolNames[i]) + 1
+    return out
+
+fn writeObjImage(bundle: mpipeline.MachineModuleBundle): ObjImageBundle =
+    var out: ObjImageBundle
+    out.version = objImageVersion()
+    out.moduleKind = bundle.moduleKind
+    out.targetTriple = bundle.targetTriple
+    out.format = bundle.objFormat
+    out.textSectionName = bundle.textSectionName
+    out.cstringSectionName = bundle.cstringSectionName
+    out.symtabSectionName = mtarget.machineTargetSymtabSectionName(bundle.targetTriple)
+    out.strtabSectionName = mtarget.machineTargetStrtabSectionName(bundle.targetTriple)
+    out.relocSectionName = mtarget.machineTargetRelocSectionName(bundle.targetTriple)
+    out.sectionNames = []
+    out.sectionAlignPow2 = []
+    out.sectionSizes = []
+    out.symbolNames = []
+    out.symbolBindings = []
+    out.symbolSections = []
+    out.symbolValues = []
+    out.symbolSizes = []
+    out.relocationSections = []
+    out.relocationOffsets = []
+    out.relocationSymbols = []
+    out.relocationKinds = []
+    out.metadataSymbolNames = []
+    out.metadataPayloads = []
+    out.dataSymbolNames = []
+    out.dataSectionNames = []
+    out.dataPayloads = []
+    out.dataAlignPow2 = []
+    var functionMetadataSymbols: str[]
+    functionMetadataSymbols = []
+    var textSize: int32 = 0
+    for i in 0..<bundle.functionByteSizes.len:
+        textSize = textSize + bundle.functionByteSizes[i]
+    for i in 0..<bundle.itemIds.len:
+        if bundle.metadataOperandModes[i] == "local_payload":
+            let payload = bundle.localPayloadTexts[i]
+            let symbolName = bundle.symbolNames[i] + "_meta"
+            add(out.metadataPayloads, payload)
+            add(out.metadataSymbolNames, symbolName)
+            add(functionMetadataSymbols, symbolName)
+        else:
+            add(functionMetadataSymbols, "")
+    add(out.sectionNames, out.textSectionName)
+    add(out.sectionAlignPow2, mtarget.machineTargetTextAlignPow2(bundle.targetTriple))
+    add(out.sectionSizes, textSize)
+    for i in 0..<bundle.dataSymbolNames.len:
+        add(out.dataSymbolNames, bundle.dataSymbolNames[i])
+        add(out.dataSectionNames, bundle.dataSectionNames[i])
+        add(out.dataPayloads, bundle.dataPayloadTexts[i])
+        add(out.dataAlignPow2, bundle.dataAlignPow2[i])
+    add(out.sectionNames, out.cstringSectionName)
+    add(out.sectionAlignPow2, mtarget.machineTargetCStringAlignPow2(bundle.targetTriple))
+    var cstringSize = countCStringBytes(out.metadataPayloads)
+    for i in 0..<out.dataSymbolNames.len:
+        if out.dataSectionNames[i] != out.cstringSectionName:
+            panic("v2 obj image: unsupported local data section " + out.dataSectionNames[i])
+        cstringSize = cstringSize + len(out.dataPayloads[i]) + 1
+    add(out.sectionSizes, cstringSize)
+    add(out.sectionNames, out.symtabSectionName)
+    add(out.sectionAlignPow2, 3)
+    add(out.sectionSizes, 0)
+    add(out.sectionNames, out.strtabSectionName)
+    add(out.sectionAlignPow2, 0)
+    add(out.sectionSizes, 0)
+    add(out.sectionNames, out.relocSectionName)
+    add(out.sectionAlignPow2, 3)
+    add(out.sectionSizes, bundle.itemIds.len * (bundle.objFormat == "macho" ? 24 else: 72))
+    var textOffset: int32 = 0
+    for i in 0..<bundle.itemIds.len:
+        add(out.symbolNames, bundle.symbolNames[i])
+        add(out.symbolBindings, "global")
+        add(out.symbolSections, out.textSectionName)
+        add(out.symbolValues, textOffset)
+        add(out.symbolSizes, bundle.functionByteSizes[i])
+        textOffset = textOffset + bundle.functionByteSizes[i]
+    var cstringOffset: int32 = 0
+    for i in 0..<out.metadataSymbolNames.len:
+        add(out.symbolNames, out.metadataSymbolNames[i])
+        add(out.symbolBindings, "local")
+        add(out.symbolSections, out.cstringSectionName)
+        add(out.symbolValues, cstringOffset)
+        add(out.symbolSizes, len(out.metadataPayloads[i]) + 1)
+        cstringOffset = cstringOffset + len(out.metadataPayloads[i]) + 1
+    for i in 0..<out.dataSymbolNames.len:
+        add(out.symbolNames, out.dataSymbolNames[i])
+        add(out.symbolBindings, "local")
+        add(out.symbolSections, out.dataSectionNames[i])
+        add(out.symbolValues, cstringOffset)
+        add(out.symbolSizes, len(out.dataPayloads[i]) + 1)
+        cstringOffset = cstringOffset + len(out.dataPayloads[i]) + 1
+    var localSymbols: str[]
+    localSymbols = []
+    for i in 0..<bundle.symbolNames.len:
+        ident.appendUnique(localSymbols, bundle.symbolNames[i])
+    for i in 0..<out.metadataSymbolNames.len:
+        ident.appendUnique(localSymbols, out.metadataSymbolNames[i])
+    for i in 0..<out.dataSymbolNames.len:
+        ident.appendUnique(localSymbols, out.dataSymbolNames[i])
+    var externals: str[]
+    externals = []
+    for i in 0..<bundle.itemIds.len:
+        let relocStart = i < bundle.functionRelocStarts.len ? bundle.functionRelocStarts[i] else: 0
+        let relocCount = i < bundle.functionRelocCounts.len ? bundle.functionRelocCounts[i] else: 0
+        for j in 0..<relocCount:
+            let relocIdx = relocStart + j
+            if relocIdx < 0 || relocIdx >= bundle.relocSymbols.len:
+                continue
+            var isLocal = false
+            for k in 0..<localSymbols.len:
+                if localSymbols[k] == bundle.relocSymbols[relocIdx]:
+                    isLocal = true
+                    break
+            if isLocal:
+                continue
+            ident.appendUnique(externals, bundle.relocSymbols[relocIdx])
+    ident.sortStrings(externals)
+    for i in 0..<externals.len:
+        add(out.symbolNames, externals[i])
+        add(out.symbolBindings, "extern")
+        add(out.symbolSections, "undefined")
+        add(out.symbolValues, 0)
+        add(out.symbolSizes, 0)
+    textOffset = 0
+    for i in 0..<bundle.itemIds.len:
+        let relocStart = i < bundle.functionRelocStarts.len ? bundle.functionRelocStarts[i] else: 0
+        let relocCount = i < bundle.functionRelocCounts.len ? bundle.functionRelocCounts[i] else: 0
+        for j in 0..<relocCount:
+            let relocIdx = relocStart + j
+            if relocIdx < 0 || relocIdx >= bundle.relocOffsets.len:
+                continue
+            add(out.relocationSections, out.textSectionName)
+            add(out.relocationOffsets, textOffset + bundle.relocOffsets[relocIdx])
+            add(out.relocationSymbols, bundle.relocSymbols[relocIdx])
+            add(out.relocationKinds, bundle.relocKinds[relocIdx])
+        textOffset = textOffset + bundle.functionByteSizes[i]
+    out.sectionSizes[2] = out.format == "macho" ? out.symbolNames.len * 16 else: out.symbolNames.len * 24
+    out.sectionSizes[3] = countStrtabBytes(out.symbolNames)
+    out.sectionSizes[4] = out.format == "macho" ? out.relocationOffsets.len * 8 else: out.relocationOffsets.len * 24
+    var lines: str[]
+    lines = []
+    add(lines, "obj_image_version=" + out.version)
+    add(lines, "module_kind=" + out.moduleKind)
+    add(lines, "target=" + out.targetTriple)
+    add(lines, "format=" + out.format)
+    add(lines, "section_count=" + intToStr(out.sectionNames.len))
+    for i in 0..<out.sectionNames.len:
+        add(lines, "section." + intToStr(i) + ".name=" + out.sectionNames[i])
+        add(lines, "section." + intToStr(i) + ".align_pow2=" + intToStr(out.sectionAlignPow2[i]))
+        add(lines, "section." + intToStr(i) + ".size=" + intToStr(out.sectionSizes[i]))
+    add(lines, "function_count=" + intToStr(bundle.itemIds.len))
+    for i in 0..<bundle.itemIds.len:
+        add(lines, "function." + intToStr(i) + ".symbol=" + bundle.symbolNames[i])
+        add(lines, "function." + intToStr(i) + ".call_symbol=" + bundle.callSymbolNames[i])
+        add(lines, "function." + intToStr(i) + ".metadata_mode=" + bundle.metadataOperandModes[i])
+        add(lines, "function." + intToStr(i) + ".size=" + intToStr(bundle.functionByteSizes[i]))
+        add(lines, "function." + intToStr(i) + ".words=" + bundle.instructionWordHex[i])
+    add(lines, "metadata_count=" + intToStr(out.metadataSymbolNames.len))
+    for i in 0..<out.metadataSymbolNames.len:
+        add(lines, "metadata." + intToStr(i) + ".symbol=" + out.metadataSymbolNames[i])
+        add(lines, "metadata." + intToStr(i) + ".payload=" + out.metadataPayloads[i])
+    add(lines, "data_count=" + intToStr(out.dataSymbolNames.len))
+    for i in 0..<out.dataSymbolNames.len:
+        add(lines, "data." + intToStr(i) + ".symbol=" + out.dataSymbolNames[i])
+        add(lines, "data." + intToStr(i) + ".section=" + out.dataSectionNames[i])
+        add(lines, "data." + intToStr(i) + ".payload=" + out.dataPayloads[i])
+    add(lines, "symbol_count=" + intToStr(out.symbolNames.len))
+    for i in 0..<out.symbolNames.len:
+        add(lines, "symbol." + intToStr(i) + ".name=" + out.symbolNames[i])
+        add(lines, "symbol." + intToStr(i) + ".binding=" + out.symbolBindings[i])
+        add(lines, "symbol." + intToStr(i) + ".section=" + out.symbolSections[i])
+        add(lines, "symbol." + intToStr(i) + ".value=" + intToStr(out.symbolValues[i]))
+        add(lines, "symbol." + intToStr(i) + ".size=" + intToStr(out.symbolSizes[i]))
+    add(lines, "reloc_count=" + intToStr(out.relocationOffsets.len))
+    for i in 0..<out.relocationOffsets.len:
+        add(lines, "reloc." + intToStr(i) + ".section=" + out.relocationSections[i])
+        add(lines, "reloc." + intToStr(i) + ".offset=" + intToStr(out.relocationOffsets[i]))
+        add(lines, "reloc." + intToStr(i) + ".symbol=" + out.relocationSymbols[i])
+        add(lines, "reloc." + intToStr(i) + ".kind=" + out.relocationKinds[i])
+    let body = joinWithSep(lines, "\n")
+    out.imageText = body
+    out.imageCid = ident.sha256HexText(body)
+    return out
+
+fn sampleNetworkDistributionObjImage(targetTriple: str): ObjImageBundle =
+    return writeObjImage(mpipeline.sampleNetworkDistributionMachineModule(targetTriple))
+
+fn sampleUnimakerObjImage(targetTriple: str): ObjImageBundle =
+    return writeObjImage(mpipeline.sampleUnimakerMachineModule(targetTriple))

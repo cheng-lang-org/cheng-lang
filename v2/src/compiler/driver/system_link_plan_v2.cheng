@@ -1,0 +1,201 @@
+import std/seqs
+import std/strings as strings
+import compiler/driver/identity_v2 as ident
+import compiler/driver/manifest_resolver_v2 as manifest
+import compiler/driver/runtime_provider_object_v2 as rpobj
+import compiler/machine/target_contract as mtarget
+import compiler/machine/machine_pipeline_v2 as mpipeline
+import compiler/obj/obj_file_v2 as ofile
+
+type
+    SystemLinkPlanBundle =
+        version: str
+        moduleKind: str
+        emitKind: str
+        targetTriple: str
+        objFormat: str
+        linkerFlavor: str
+        outputKind: str
+        outputName: str
+        outputSuffix: str
+        primaryObjFileCid: str
+        primaryObjFileByteCount: int32
+        providerModules: str[]
+        providerSourcePaths: str[]
+        providerSourceKinds: str[]
+        providerCompileModes: str[]
+        providerManifestCids: str[]
+        providerExecutionModels: str[]
+        providerTraceSymbols: str[]
+        providerSymbolCounts: int32[]
+        providerSymbolsFlat: str[]
+        providerObjFileCids: str[]
+        providerObjFileByteCounts: int32[]
+        entryRequired: bool
+        entrySymbol: str
+        entryPresent: bool
+        missingReasons: str[]
+        planText: str
+        planCid: str
+
+fn systemLinkPlanVersion(): str =
+    return "v2.system_link_plan.v1"
+
+fn sanitizePathPart(text: str): str =
+    var out: str = ""
+    for i in 0..<len(text):
+        let ch = text[i]
+        if (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9'):
+            out = out + strings.sliceBytes(text, i, 1)
+        else:
+            out = out + "_"
+    return out
+
+fn systemLinkerFlavor(targetTriple: str, emitKind: str): str =
+    let objFormat = mtarget.machineTargetObjFormat(targetTriple)
+    if emitKind == "static":
+        return objFormat == "macho" ? "libtool" else: "llvm-ar"
+    return objFormat == "macho" ? "ld64" else: "lld"
+
+fn systemLinkOutputKind(emitKind: str): str =
+    return emitKind == "exe" ? "executable" :
+           emitKind == "shared" ? "shared_library" :
+           "static_archive"
+
+fn systemLinkOutputSuffix(targetTriple: str, emitKind: str): str =
+    let objFormat = mtarget.machineTargetObjFormat(targetTriple)
+    if emitKind == "shared":
+        return objFormat == "macho" ? ".dylib" else: ".so"
+    if emitKind == "static":
+        return ".a"
+    return ""
+
+fn systemLinkOutputName(moduleKind: str, emitKind: str): str =
+    let stem = sanitizePathPart(moduleKind)
+    if emitKind == "exe":
+        return "cheng_v2_" + stem
+    return "libcheng_v2_" + stem
+
+fn resolveEntrySymbol(machineBundle: mpipeline.MachineModuleBundle,
+                      itemIds: int32[],
+                      opNames: str[],
+                      labels: str[]): str =
+    if len(machineBundle.entrySymbolOverride) > 0:
+        return machineBundle.entrySymbolOverride
+    if machineBundle.moduleKind == "compiler_core":
+        for i in 0..<machineBundle.symbolNames.len:
+            if len(machineBundle.bindingSummaries[i]) >= len("entry_bridge=1|") &&
+               strings.sliceBytes(machineBundle.bindingSummaries[i], 0, len("entry_bridge=1|")) == "entry_bridge=1|":
+                return machineBundle.symbolNames[i]
+    for i in 0..<labels.len:
+        if labels[i] == "main":
+            return mpipeline.machineFunctionSymbolName(machineBundle.targetTriple,
+                                                       machineBundle.moduleKind,
+                                                       opNames[i],
+                                                       itemIds[i])
+    if machineBundle.moduleKind == "compiler_core" && itemIds.len > 0:
+        return mpipeline.machineFunctionSymbolName(machineBundle.targetTriple,
+                                                   machineBundle.moduleKind,
+                                                   opNames[0],
+                                                   itemIds[0])
+    return ""
+
+fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
+                       objFile: ofile.ObjFileBundle,
+                       emitKind: str,
+                       providerModules: str[],
+                       itemIds: int32[],
+                       opNames: str[],
+                       labels: str[]): SystemLinkPlanBundle =
+    var out: SystemLinkPlanBundle
+    out.version = systemLinkPlanVersion()
+    out.moduleKind = machineBundle.moduleKind
+    out.emitKind = emitKind
+    out.targetTriple = machineBundle.targetTriple
+    out.objFormat = machineBundle.objFormat
+    out.linkerFlavor = systemLinkerFlavor(machineBundle.targetTriple, emitKind)
+    out.outputKind = systemLinkOutputKind(emitKind)
+    out.outputName = systemLinkOutputName(machineBundle.moduleKind, emitKind)
+    out.outputSuffix = systemLinkOutputSuffix(machineBundle.targetTriple, emitKind)
+    out.primaryObjFileCid = objFile.fileCid
+    out.primaryObjFileByteCount = objFile.fileByteCount
+    out.providerModules = []
+    out.providerSourcePaths = []
+    out.providerSourceKinds = []
+    out.providerCompileModes = []
+    out.providerManifestCids = []
+    out.providerExecutionModels = []
+    out.providerTraceSymbols = []
+    out.providerSymbolCounts = []
+    out.providerSymbolsFlat = []
+    out.providerObjFileCids = []
+    out.providerObjFileByteCounts = []
+    for i in 0..<providerModules.len:
+        add(out.providerModules, providerModules[i])
+    let providerObjects = rpobj.materializeRuntimeProviderObjects(out.providerModules, machineBundle.targetTriple)
+    for i in 0..<providerObjects.len:
+        add(out.providerSourcePaths, providerObjects[i].sourcePath)
+        add(out.providerSourceKinds, providerObjects[i].sourceKind)
+        add(out.providerCompileModes, providerObjects[i].compileMode)
+        add(out.providerManifestCids, providerObjects[i].sourceManifestCid)
+        add(out.providerExecutionModels, providerObjects[i].executionModel)
+        add(out.providerTraceSymbols, providerObjects[i].traceSymbol)
+        add(out.providerSymbolCounts, providerObjects[i].runtimeSymbols.len)
+        for j in 0..<providerObjects[i].runtimeSymbols.len:
+            add(out.providerSymbolsFlat, providerObjects[i].runtimeSymbols[j])
+        add(out.providerObjFileCids, providerObjects[i].objFileCid)
+        add(out.providerObjFileByteCounts, providerObjects[i].objFileByteCount)
+    out.entryRequired = emitKind == "exe"
+    out.entrySymbol = resolveEntrySymbol(machineBundle,
+                                         itemIds,
+                                         opNames,
+                                         labels)
+    out.entryPresent = len(out.entrySymbol) > 0
+    out.missingReasons = []
+    if out.entryRequired && !out.entryPresent:
+        add(out.missingReasons, "program_entry_symbol_missing")
+    add(out.missingReasons, "system_link_execution_missing")
+    var lines: str[]
+    lines = []
+    add(lines, "system_link_plan_version=" + out.version)
+    add(lines, "module_kind=" + out.moduleKind)
+    add(lines, "emit=" + out.emitKind)
+    add(lines, "target=" + out.targetTriple)
+    add(lines, "obj_format=" + out.objFormat)
+    add(lines, "linker_flavor=" + out.linkerFlavor)
+    add(lines, "output_kind=" + out.outputKind)
+    add(lines, "output_name=" + out.outputName)
+    add(lines, "output_suffix=" + out.outputSuffix)
+    add(lines, "primary_obj_file_cid=" + out.primaryObjFileCid)
+    add(lines, "primary_obj_file_byte_count=" + intToStr(out.primaryObjFileByteCount))
+    add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
+    var providerSymbolIdx: int32 = 0
+    for i in 0..<out.providerModules.len:
+        add(lines, "provider_module." + intToStr(i) + ".name=" + out.providerModules[i])
+        add(lines, "provider_module." + intToStr(i) + ".source_path=" + out.providerSourcePaths[i])
+        add(lines, "provider_module." + intToStr(i) + ".source_kind=" + out.providerSourceKinds[i])
+        add(lines, "provider_module." + intToStr(i) + ".compile_mode=" + out.providerCompileModes[i])
+        add(lines, "provider_module." + intToStr(i) + ".manifest_cid=" + out.providerManifestCids[i])
+        add(lines, "provider_module." + intToStr(i) + ".execution_model=" + out.providerExecutionModels[i])
+        add(lines, "provider_module." + intToStr(i) + ".trace_symbol=" + out.providerTraceSymbols[i])
+        add(lines, "provider_module." + intToStr(i) + ".provider_symbol_count=" + intToStr(out.providerSymbolCounts[i]))
+        for j in 0..<out.providerSymbolCounts[i]:
+            add(lines,
+                "provider_module." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
+                out.providerSymbolsFlat[providerSymbolIdx])
+            providerSymbolIdx = providerSymbolIdx + 1
+        add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providerObjFileCids[i])
+        add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providerObjFileByteCounts[i]))
+        add(lines, "provider_module." + intToStr(i) + ".object_materialized=1")
+    add(lines, "entry_required=" + if out.entryRequired: "1" else: "0")
+    add(lines, "entry_symbol=" + out.entrySymbol)
+    add(lines, "entry_present=" + if out.entryPresent: "1" else: "0")
+    add(lines, "missing_reason_count=" + intToStr(out.missingReasons.len))
+    for i in 0..<out.missingReasons.len:
+        add(lines, "missing_reason." + intToStr(i) + "=" + out.missingReasons[i])
+    add(lines, "system_link_ready=" + if out.missingReasons.len == 0: "1" else: "0")
+    out.planText = manifest.joinLines(lines)
+    out.planCid = ident.sha256HexText(out.planText)
+    return out

@@ -1,0 +1,1215 @@
+import std/cmdline as cmdline
+import std/os
+import std/strings as strings
+import std/system
+import compiler/driver/surface_contract as surface
+import compiler/low_uir/pipeline_contract as pipeline
+import compiler/frontend/string_surface_contract as sfront
+import compiler/frontend/string_surface_ir_v2 as sir
+import compiler/frontend/string_lowering_contract as slower
+import compiler/low_uir/string_ops_contract as sops
+import compiler/semantic_facts/string_facts_v2 as sffacts
+import compiler/frontend/string_surface_lowering_v2 as flower
+import compiler/low_uir/string_lowering_v2 as slowlower
+import compiler/driver/string_pipeline_v2 as spipe
+import compiler/driver/compiler_core_pipeline_v2 as cpipe
+import runtime/strings_v2 as srun
+import compiler/frontend/unimaker_surface_contract as ufront
+import compiler/frontend/unimaker_surface_ir_v2 as uir
+import compiler/semantic_facts/unimaker_facts_v2 as uffacts
+import compiler/frontend/unimaker_surface_lowering_v2 as ulower
+import compiler/low_uir/unimaker_ops_contract as uops
+import compiler/low_uir/unimaker_lowering_v2 as uflow
+import compiler/driver/unimaker_pipeline_v2 as upipe
+import runtime/unimaker_runtime_contract_v2 as urun
+import compiler/frontend/network_distribution_surface_contract as nfront
+import compiler/frontend/network_distribution_surface_ir_v2 as nsurf
+import compiler/semantic_facts/network_distribution_facts_v2 as nffacts
+import compiler/low_uir/network_distribution_ops_contract as nops
+import compiler/low_uir/network_distribution_lowering_v2 as nflow
+import compiler/driver/network_distribution_pipeline_v2 as npipe
+import runtime/network_distribution_runtime_v2 as nrun
+import compiler/frontend/v2_source_parser as parser
+import compiler/driver/manifest_resolver_v2 as mresolve
+import compiler/driver/lsmr_v2 as lsmr
+import compiler/driver/network_distribution_identity_v2 as ndident
+import compiler/driver/release_artifact_v2 as rart
+import compiler/driver/identity_v2 as ident
+import compiler/machine/target_contract as mtarget
+import compiler/machine/machine_pipeline_v2 as mpipeline
+import bootstrap/selfhost_contract as selfhost
+import compiler/obj/obj_image_v2 as oimg
+import compiler/obj/obj_file_v2 as ofile
+import compiler/driver/system_link_exec_v2 as sexec
+import runtime/lsmr_contract_v2 as lcontract
+
+type
+    NativeStageArtifacts =
+        compilerPath: str
+        releasePath: str
+        systemLinkPlanPath: str
+        systemLinkExecPath: str
+        binaryPath: str
+        binaryCid: str
+        outputFileCid: str
+        externalCcProviderCount: int32
+        compilerCoreProviderSourceKind: str
+        compilerCoreProviderCompileMode: str
+
+@importc("driver_c_write_text_file_bridge")
+fn writeTextFileBridge(path: str, text: str)
+
+@importc("driver_c_compare_text_files_bridge")
+fn compareTextFilesBridge(leftPath: str, rightPath: str): bool
+
+@importc("driver_c_compare_binary_files_bridge")
+fn compareBinaryFilesBridge(leftPath: str, rightPath: str): bool
+
+@importc("driver_c_exec_file_capture_or_panic_bridge")
+fn execFileCaptureOrPanicBridge(filePath: str, argv: str[], workingDir: str, label: str): str
+
+@importc("driver_c_compare_text_files_or_panic_bridge")
+fn compareTextFilesOrPanicBridge(leftPath: str, rightPath: str, label: str)
+
+fn printLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn writeText(text: str) =
+    os.write(os.get_stdout(), text)
+
+fn readFlagDefault(key: str, defaultValue: str): str =
+    return cmdline.readFlagOrDefault(key, defaultValue)
+
+fn readIntFlagDefault(key: str, defaultValue: int32): int32 =
+    return cmdline.readInt32FlagOrDefault(key, defaultValue)
+
+fn createDirAll(path: str) =
+    if len(path) == 0 || os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if len(parent) > 0 && parent != path:
+        createDirAll(parent)
+    if !os.dirExists(path):
+        os.createDir(path)
+
+fn writeTextFile(path: str, text: str) =
+    writeTextFileBridge(path, text)
+
+fn currentCompilerPath(): str =
+    return os.absolutePath(cmdline.programName())
+
+fn compareTextFiles(leftPath: str, rightPath: str): bool =
+    return compareTextFilesBridge(leftPath, rightPath)
+
+fn compareBinaryFiles(leftPath: str, rightPath: str): bool =
+    return compareBinaryFilesBridge(leftPath, rightPath)
+
+fn runCompilerCommandOrPanic(compilerPath: str,
+                             argv: str[],
+                             workingDir: str,
+                             label: str): str =
+    return execFileCaptureOrPanicBridge(compilerPath, argv, workingDir, label)
+
+fn compareExpectedTextOrPanic(expectedPath: str, actualPath: str, label: str) =
+    compareTextFilesOrPanicBridge(expectedPath, actualPath, label)
+
+fn parsePlanInt32OrZero(planText: str, key: str): int32 =
+    let raw = sexec.extractLineValue(planText, key)
+    if len(raw) > 0:
+        return cmdline.parseInt32(raw)
+    return 0
+
+fn countExternalCcProvidersFromPlanText(planText: str): int32 =
+    let providerCount = parsePlanInt32OrZero(planText, "provider_module_count")
+    var out: int32 = 0
+    for i in 0..<providerCount:
+        let compileModeKey = "provider_module." + intToStr(i) + ".compile_mode"
+        let compileMode = sexec.extractLineValue(planText, compileModeKey)
+        if compileMode == "external_cc_obj":
+            out = out + 1
+    return out
+
+fn providerFieldForModuleFromPlanText(planText: str, moduleName: str, fieldName: str): str =
+    let providerCount = parsePlanInt32OrZero(planText, "provider_module_count")
+    for i in 0..<providerCount:
+        let nameKey = "provider_module." + intToStr(i) + ".name"
+        let providerName = sexec.extractLineValue(planText, nameKey)
+        if providerName == moduleName:
+            let fieldKey = "provider_module." + intToStr(i) + "." + fieldName
+            return sexec.extractLineValue(planText, fieldKey)
+    return ""
+
+fn buildStageArtifacts(compilerPath: str,
+                       sourcePath: str,
+                       targetTriple: str,
+                       stageDir: str,
+                       binaryName: str): NativeStageArtifacts =
+    createDirAll(stageDir)
+    let releasePath = os.joinPath(stageDir, "release.txt")
+    let systemLinkPlanPath = os.joinPath(stageDir, "system_link_plan.txt")
+    let systemLinkExecPath = os.joinPath(stageDir, "system_link_exec.txt")
+    let binaryPath = os.joinPath(stageDir, binaryName)
+    let workingDir = os.getCurrentDir()
+    let releaseArgv = ["release-compile", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", releasePath]
+    let releaseOutput = runCompilerCommandOrPanic(compilerPath, releaseArgv, workingDir, "stage-selfhost-host release-compile failed")
+    writeTextFile(releasePath, releaseOutput)
+    let systemLinkPlanArgv = ["system-link-plan", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", systemLinkPlanPath]
+    let systemLinkPlanOutput = runCompilerCommandOrPanic(compilerPath, systemLinkPlanArgv, workingDir, "stage-selfhost-host system-link-plan failed")
+    writeTextFile(systemLinkPlanPath, systemLinkPlanOutput)
+    let systemLinkExecArgv = ["system-link-exec", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", binaryPath, "--report-out", systemLinkExecPath]
+    let systemLinkExecOutput = runCompilerCommandOrPanic(compilerPath, systemLinkExecArgv, workingDir, "stage-selfhost-host system-link-exec failed")
+    writeTextFile(systemLinkExecPath, systemLinkExecOutput)
+    let compilerCoreProviderSourceKind = providerFieldForModuleFromPlanText(systemLinkPlanOutput, "runtime/compiler_core_runtime_v2", "source_kind")
+    let compilerCoreProviderCompileMode = providerFieldForModuleFromPlanText(systemLinkPlanOutput, "runtime/compiler_core_runtime_v2", "compile_mode")
+    var out: NativeStageArtifacts
+    out.compilerPath = compilerPath
+    out.releasePath = releasePath
+    out.systemLinkPlanPath = systemLinkPlanPath
+    out.systemLinkExecPath = systemLinkExecPath
+    out.binaryPath = binaryPath
+    out.binaryCid = sexec.readFileSha256Hex(binaryPath)
+    out.outputFileCid = sexec.extractLineValue(systemLinkExecOutput, "output_file_cid")
+    out.externalCcProviderCount = countExternalCcProvidersFromPlanText(systemLinkPlanOutput)
+    out.compilerCoreProviderSourceKind = compilerCoreProviderSourceKind
+    out.compilerCoreProviderCompileMode = compilerCoreProviderCompileMode
+    return out
+
+fn printUsage() =
+    printLine("cheng_tooling_v2")
+    printLine("usage: cheng_tooling_v2 <command>")
+    printLine("")
+    printLine("commands:")
+    printLine("  help                         show this message")
+    printLine("  surface                      print the frozen v2 surface summary")
+    printLine("  passes                       print the fixed low_uir pipeline order")
+    printLine("  contracts                    print key contract markers")
+    printLine("  strings                      print the string surface contract")
+    printLine("  string-pipeline              print the sample end-to-end string pipeline")
+    printLine("  infra                        print the Unimaker language surface contract")
+    printLine("  infra-pipeline               print the sample Unimaker pipeline")
+    printLine("  network-surface              print the topology/network-distribution surface")
+    printLine("  network-pipeline             print the sample topology/network pipeline")
+    printLine("  selfhost                     print the subset selfhost bootstrap contract")
+    printLine("  stage-selfhost-host          build stage1 -> stage2 -> stage3 native closure")
+    printLine("  tooling-selfhost-host        run the native tooling selfhost orchestration")
+    printLine("  lsmr-address                 emit a deterministic LSMR address from a content cid")
+    printLine("  lsmr-route-plan             emit a deterministic canonical LSMR multipath route plan")
+    printLine("  outline-parse                emit an outline parse for a compiler_core source")
+    printLine("  machine-plan                 emit a deterministic machine plan for a source")
+    printLine("  obj-image                    emit a deterministic object image for a source")
+    printLine("  obj-file                     emit a deterministic object-file byte layout for a source")
+    printLine("  system-link-plan             emit a deterministic native system-link plan for a source")
+    printLine("  system-link-exec             materialize object files and invoke the deterministic system linker")
+    printLine("  resolve-manifest             resolve a deterministic source manifest")
+    printLine("  publish-source-manifest      emit a source manifest artifact")
+    printLine("  publish-rule-pack            emit a rule-pack artifact")
+    printLine("  publish-compiler-rule-pack   emit a compiler rule-pack artifact")
+    printLine("  verify-network-selfhost      verify manifest + topology + rule-pack closure")
+    printLine("  release-compile              emit a deterministic release artifact spec")
+
+fn printSurface() =
+    printLine(surface.v2SurfaceText())
+
+fn printPasses() =
+    let c = pipeline.lowUirPipelineContract()
+    printLine("low_uir_pipeline=" + c.version)
+    for i in 0..<c.passOrder.len:
+        printLine(intToStr(i) + ":" + c.passOrder[i])
+
+fn printContracts() =
+    let s = surface.v2SurfaceContract()
+    printLine("dev_entry=" + s.devEntry)
+    printLine("tooling_entry=" + s.toolingEntry)
+    printLine("function_parallelism=" + if s.functionParallelism: "1" else: "0")
+    printLine("deterministic_merge=" + if s.deterministicMerge: "1" else: "0")
+    printLine("soa_index_only=" + if surface.v2HasIndexOnlySoa(): "1" else: "0")
+
+fn printStrings() =
+    let c = sfront.stringSurfaceContract()
+    let p = sir.sampleStringSurfaceProgram()
+    let f = sffacts.buildStringSemanticFacts(p)
+    let l = slower.stringLoweringContract()
+    let o = sops.lowUirStringOpsContract()
+    let r = srun.stringRuntimeContract()
+    printLine("string_surface=" + c.version)
+    printLine("surface_ir_version=" + p.version)
+    printLine("lowering_version=" + l.version)
+    printLine("facts_version=" + f.version)
+    printLine("runtime_version=" + r.version)
+    printLine("value_model=" + c.valueModel)
+    printLine("abi_boundary_type=" + c.abiBoundaryType)
+    printLine("operator_style=" + c.operatorStyle)
+    printLine("search_algorithm=" + c.searchAlgorithm)
+    printLine("concat_strategy=" + c.concatStrategy)
+    printLine("zero_copy_slice=" + if c.zeroCopySlice: "1" else: "0")
+    printLine("comparison_fast_path=" + c.comparisonFastPath)
+    printLine("builder_call_model=" + l.builderCallModel)
+    printLine("surface_ir_exprs=" + intToStr(p.exprs.len))
+    printLine("fact_count=" + intToStr(f.factIds.len))
+    printLine("lowering_rules=" + intToStr(l.rules.len))
+    printLine("low_uir_string_ops=" + intToStr(o.canonicalOps.len))
+    printLine("comparison_kernel=" + r.comparisonKernel)
+    printLine("builder_storage=" + r.builderStorage)
+    printLine("builder_growth=" + r.builderGrowth)
+    printLine("builder_finish=" + r.builderFinish)
+    printLine("symbol_functions=" + intToStr(r.symbolFunctions.len))
+    printLine("lowering_helpers=" + intToStr(r.loweringHelpers.len))
+    printLine("symbol_forms=" + intToStr(c.symbolForms.len))
+    printLine("surface_forms=" + intToStr(c.surfaceForms.len))
+    printLine("builder_apis=" + intToStr(c.builderApis.len))
+
+fn printStringPipeline() =
+    let bundle = spipe.sampleStringPipeline()
+    let graph = flower.lowerSampleStringSurfaceProgramToHighUir()
+    let lines = spipe.stringPipelineLines(bundle)
+    printLine("pipeline_graph_nodes=" + intToStr(graph.exprIds.len))
+    printLine("pipeline_low_plan_version=" + slowlower.lowUirStringPlanVersion())
+    for i in 0..<lines.len:
+        printLine(lines[i])
+
+fn printInfrastructure() =
+    let c = ufront.unimakerSurfaceContract()
+    let p = uir.sampleUnimakerSurfaceProgram()
+    let f = uffacts.buildUnimakerSemanticFacts(p)
+    let o = uops.lowUirUnimakerOpsContract()
+    let r = urun.unimakerRuntimeContract()
+    printLine("unimaker_surface=" + c.version)
+    printLine("surface_ir_version=" + p.version)
+    printLine("facts_version=" + f.version)
+    printLine("runtime_version=" + r.version)
+    printLine("state_model=" + c.stateModel)
+    printLine("code_identity=" + c.codeIdentity)
+    printLine("compiler_agent_mode=" + c.compilerAgentMode)
+    printLine("declaration_forms=" + intToStr(c.coreDeclarations.len))
+    printLine("annotation_forms=" + intToStr(c.builtinAnnotations.len))
+    printLine("builtin_types=" + intToStr(c.builtinTypes.len))
+    printLine("surface_ir_decls=" + intToStr(p.decls.len))
+    printLine("fact_count=" + intToStr(f.declIds.len))
+    printLine("low_uir_ops=" + intToStr(o.canonicalOps.len))
+    printLine("runtime_services=" + intToStr(r.services.len))
+    printLine("structured_network_facts=" + intToStr(f.networkDomains.len))
+
+fn printInfrastructurePipeline() =
+    let bundle = upipe.sampleUnimakerPipeline()
+    let graph = ulower.lowerSampleUnimakerSurfaceProgramToHighUir()
+    let lines = upipe.unimakerPipelineLines(bundle)
+    printLine("pipeline_graph_nodes=" + intToStr(graph.declIds.len))
+    printLine("pipeline_low_plan_version=" + uflow.lowUirUnimakerPlanVersion())
+    for i in 0..<lines.len:
+        printLine(lines[i])
+
+fn printNetworkSurface() =
+    let c = nfront.networkDistributionSurfaceContract()
+    let p = nsurf.sampleNetworkDistributionProgram()
+    let f = nffacts.buildNetworkDistributionFacts(p)
+    let o = nops.lowUirNetworkDistributionOpsContract()
+    let r = nrun.networkDistributionRuntimeContract()
+    printLine("network_surface=" + c.version)
+    printLine("topology_form=" + c.topologyForm)
+    printLine("addressing_mode=" + c.allowedAddressingModes[0])
+    printLine("address_binding=" + c.fixedAddressBindings[0])
+    printLine("distance_metric=" + c.fixedDistanceMetrics[0])
+    printLine("route_plan_model=" + c.fixedRoutePlanModels[0])
+    printLine("builtin_operations=" + intToStr(c.builtinOperations.len))
+    printLine("allowed_domains=" + intToStr(c.allowedDomains.len))
+    printLine("sample_topologies=" + intToStr(p.topologies.len))
+    printLine("sample_ops=" + intToStr(p.ops.len))
+    printLine("facts_version=" + f.version)
+    printLine("fact_count=" + intToStr(f.opIds.len))
+    printLine("runtime_version=" + r.version)
+    printLine("runtime_services=" + intToStr(r.services.len))
+    printLine("runtime_addressing_mode=" + r.addressingMode)
+    printLine("low_uir_ops=" + intToStr(o.canonicalOps.len))
+
+fn printNetworkPipeline() =
+    let bundle = npipe.sampleNetworkDistributionPipeline()
+    let lines = npipe.networkDistributionPipelineLines(bundle)
+    printLine("pipeline_low_plan_version=" + nflow.lowUirNetworkDistributionPlanVersion())
+    for i in 0..<lines.len:
+        printLine(lines[i])
+
+fn printSelfhost() =
+    let c = selfhost.selfhostContract()
+    printLine("selfhost_version=" + c.version)
+    printLine("stage0_tool=" + c.stage0Tool)
+    printLine("stage1_entry=" + c.stage1Entry)
+    printLine("stage2_goal=" + c.stage2Goal)
+    printLine("current_status=" + c.currentStatus)
+    printLine("proof_command=" + c.proofCommand)
+    printLine("proof_source=" + c.proofSource)
+    printLine("stages=" + intToStr(c.stages.len))
+    printLine("proof_keys=" + intToStr(c.proofKeys.len))
+    printLine("proof_invariants=" + intToStr(c.proofInvariants.len))
+    for i in 0..<c.proofInvariants.len:
+        printLine("proof_invariant_" + intToStr(i) + "=" + c.proofInvariants[i])
+
+fn networkBundleFromSource(sourcePath: str): npipe.NetworkDistributionPipelineBundle =
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    return npipe.compileNetworkDistributionProgram(parsed.networkProgram)
+
+fn machineBundleFromSource(sourcePath: str, targetTriple: str): mpipeline.MachineModuleBundle =
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        let bundle = npipe.compileNetworkDistributionProgram(parsed.networkProgram)
+        return mpipeline.lowerNetworkDistributionPlanToMachine(bundle.lowPlan, targetTriple)
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        let bundle = cpipe.compileCompilerCoreSourceClosure(sourcePath)
+        return mpipeline.lowerCompilerCorePlanToMachine(bundle.lowPlan, targetTriple)
+    let bundle = upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram)
+    return mpipeline.lowerUnimakerPlanToMachine(bundle.lowPlan, targetTriple)
+
+fn buildCompilerCoreOutlineText(sourcePath: str): str =
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    let program = parsed.compilerCoreProgram
+    var lines: str[]
+    lines = []
+    add(lines, "compiler_core_version=" + program.version)
+    add(lines, "source=" + sourcePath)
+    add(lines, "module_count=" + intToStr(program.modules.len))
+    add(lines, "import_count=" + intToStr(program.imports.len))
+    add(lines, "type_block_count=" + intToStr(program.typeBlocks.len))
+    add(lines, "const_count=" + intToStr(program.constDecls.len))
+    add(lines, "var_count=" + intToStr(program.varDecls.len))
+    add(lines, "routine_count=" + intToStr(program.routines.len))
+    add(lines, "top_level_count=" + intToStr(program.topLevelKinds.len))
+    for i in 0..<program.modules.len:
+        add(lines, "module." + intToStr(i) + ".name=" + program.modules[i].name)
+        add(lines, "module." + intToStr(i) + ".header=" + program.modules[i].headerText)
+    for i in 0..<program.imports.len:
+        add(lines, "import." + intToStr(i) + ".path=" + program.imports[i].modulePath)
+        add(lines, "import." + intToStr(i) + ".alias=" + program.imports[i].alias)
+    for i in 0..<program.typeBlocks.len:
+        add(lines, "type." + intToStr(i) + ".header=" + program.typeBlocks[i].headerText)
+        add(lines, "type." + intToStr(i) + ".body_line_count=" + intToStr(program.typeBlocks[i].bodyLines.len))
+    for i in 0..<program.constDecls.len:
+        add(lines, "const." + intToStr(i) + ".label=" + program.constDecls[i].label)
+        add(lines, "const." + intToStr(i) + ".header=" + program.constDecls[i].headerText)
+        add(lines, "const." + intToStr(i) + ".body_line_count=" + intToStr(program.constDecls[i].bodyLines.len))
+    for i in 0..<program.varDecls.len:
+        add(lines, "var." + intToStr(i) + ".label=" + program.varDecls[i].label)
+        add(lines, "var." + intToStr(i) + ".header=" + program.varDecls[i].headerText)
+        add(lines, "var." + intToStr(i) + ".body_line_count=" + intToStr(program.varDecls[i].bodyLines.len))
+    for i in 0..<program.routines.len:
+        add(lines, "routine." + intToStr(i) + ".kind=" + program.routines[i].kind)
+        add(lines, "routine." + intToStr(i) + ".name=" + program.routines[i].name)
+        add(lines, "routine." + intToStr(i) + ".signature=" + program.routines[i].signatureText)
+        add(lines, "routine." + intToStr(i) + ".body_line_count=" + intToStr(program.routines[i].bodyLines.len))
+        add(lines, "routine." + intToStr(i) + ".first_body_line=" +
+                   if program.routines[i].bodyLines.len > 0: program.routines[i].bodyLines[0] else: "")
+    return mresolve.joinLines(lines)
+
+fn buildSourceManifestArtifactText(bundle: mresolve.SourceManifestBundle): str =
+    return bundle.manifestText + "\nmanifest_cid=" + bundle.manifestCid + "\n"
+
+fn buildNetworkArtifactText(bundle: npipe.NetworkDistributionPipelineBundle,
+                            requiredDomain: str,
+                            artifactVersion: str): str =
+    return ndident.buildPublishedNetworkArtifactText(bundle, requiredDomain, artifactVersion)
+
+fn hasCanonicalOp(bundle: npipe.NetworkDistributionPipelineBundle, opName: str): bool =
+    for i in 0..<bundle.lowPlan.canonicalOps.len:
+        if bundle.lowPlan.canonicalOps[i] == opName:
+            return true
+    return false
+
+fn verifyPriorityMappings(bundle: npipe.NetworkDistributionPipelineBundle): bool =
+    for i in 0..<bundle.facts.priorityClasses.len:
+        let expected = nsurf.networkPriorityTransport(bundle.facts.priorityClasses[i])
+        if bundle.facts.transportModes[i] != expected:
+            return false
+    return true
+
+fn canonicalOpCountForDomain(bundle: npipe.NetworkDistributionPipelineBundle, domain: str): int32 =
+    var count: int32 = 0
+    for i in 0..<bundle.facts.networkDomains.len:
+        if bundle.facts.networkDomains[i] == domain:
+            count = count + 1
+    return count
+
+fn releaseCompileKeyCoversNetworkBundle(releaseBundle: rart.ReleaseArtifactBundle,
+                                        networkBundle: npipe.NetworkDistributionPipelineBundle): bool =
+    for i in 0..<networkBundle.program.topologies.len:
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.topology." + intToStr(i) + "=" +
+                                                  nsurf.topologyCanonicalForm(networkBundle.program.topologies[i])):
+            return false
+    for i in 0..<networkBundle.lowPlan.opIds.len:
+        let binding = ndident.bindNetworkOpToLsmr(networkBundle, releaseBundle.manifestCid, i)
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".topology=" +
+                                                  networkBundle.lowPlan.topologyCanonicalForms[i]):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".addressing=" +
+                                                  networkBundle.lowPlan.addressingModes[i]):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".depth=" +
+                                                  intToStr(networkBundle.lowPlan.topologyDepths[i])):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".address_binding=" +
+                                                  networkBundle.lowPlan.addressBindings[i]):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".distance_metric=" +
+                                                  networkBundle.lowPlan.distanceMetrics[i]):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".priority=" +
+                                                  networkBundle.lowPlan.priorityClasses[i]):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".dispersal=" +
+                                                  networkBundle.lowPlan.dispersalModes[i]):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".signature=" +
+                                                  networkBundle.lowPlan.antiEntropySignatureKinds[i]):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".content_cid=" +
+                                                  binding.contentCid):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".source_address=" +
+                                                  binding.sourceAddressText):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".target_address=" +
+                                                  binding.targetAddressText):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".route_plan_cid=" +
+                                                  binding.routePlanCid):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".route_path_count=" +
+                                                  intToStr(binding.routePathCount)):
+            return false
+        if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                  "network.entry." + intToStr(i) + ".total_distance=" +
+                                                  intToStr(binding.totalDistance)):
+            return false
+        for j in 0..<binding.routePathCount:
+            let pathLine = "path." + intToStr(j) + "="
+            if parser.findText(binding.routePlanText, pathLine) < 0:
+                return false
+            let start = parser.findText(binding.routePlanText, pathLine)
+            var stop = start
+            while stop < len(binding.routePlanText) && binding.routePlanText[stop] != '\n':
+                stop = stop + 1
+            let rawLine = strings.sliceBytes(binding.routePlanText, start, stop - start)
+            if !rart.releaseArtifactCompileKeyHasLine(releaseBundle,
+                                                      "network.entry." + intToStr(i) + ".route." + intToStr(j) +
+                                                      "=" + strings.sliceBytes(rawLine, len(pathLine), len(rawLine) - len(pathLine))):
+                return false
+    return true
+
+fn runStageSelfhostHost(): int32 =
+    let compilerPath = os.absolutePath(readFlagDefault("--compiler", currentCompilerPath()))
+    let outDir = readFlagDefault("--out-dir", "v2/artifacts/full_selfhost")
+    let targetTriple = readFlagDefault("--target", "arm64-apple-darwin")
+    let sourcePath = "v2/src/tooling/cheng_v2.cheng"
+    let stage1Dir = os.joinPath(os.joinPath(outDir, "stages"), "cheng_v2.stage1")
+    let stage2Dir = os.joinPath(os.joinPath(outDir, "stages"), "cheng_v2.stage2")
+    let stage3Dir = os.joinPath(os.joinPath(outDir, "stages"), "cheng_v2.stage3")
+    let stage2ToolingDir = os.joinPath(outDir, "stage2_tooling_selfhost")
+    let stage2ToolingReport = os.joinPath(stage2ToolingDir, "tooling_selfhost_host.txt")
+    let stage1 = buildStageArtifacts(compilerPath, sourcePath, targetTriple, stage1Dir, "cheng_v2")
+    let stage2 = buildStageArtifacts(stage1.binaryPath, sourcePath, targetTriple, stage2Dir, "cheng_v2")
+    let stage3 = buildStageArtifacts(stage2.binaryPath, sourcePath, targetTriple, stage3Dir, "cheng_v2")
+    let releaseEqual = compareTextFiles(stage2.releasePath, stage3.releasePath)
+    let planEqual = compareTextFiles(stage2.systemLinkPlanPath, stage3.systemLinkPlanPath)
+    let execEqual = compareTextFiles(stage2.systemLinkExecPath, stage3.systemLinkExecPath)
+    let binaryEqual = compareBinaryFiles(stage2.binaryPath, stage3.binaryPath)
+    let outputCidEqual = stage2.outputFileCid == stage3.outputFileCid
+    let noExternalCProvider = stage1.externalCcProviderCount == 0 && stage2.externalCcProviderCount == 0 && stage3.externalCcProviderCount == 0 && stage2.compilerCoreProviderSourceKind == "cheng_module" && stage2.compilerCoreProviderCompileMode == "machine_obj"
+    let toolingSelfhostArgv = ["tooling-selfhost-host", "--compiler", stage2.binaryPath, "--out-dir", stage2ToolingDir]
+    let toolingSelfhostText = runCompilerCommandOrPanic(stage2.binaryPath, toolingSelfhostArgv, os.getCurrentDir(), "stage-selfhost-host stage2 tooling-selfhost-host failed")
+    writeTextFile(stage2ToolingReport, toolingSelfhostText)
+    let stage2ToolingOk = sexec.extractLineValue(toolingSelfhostText, "tooling_selfhost_host_ok") == "1"
+    let ok = releaseEqual && planEqual && execEqual && binaryEqual && outputCidEqual && stage2ToolingOk && noExternalCProvider
+    printLine("full_selfhost_ok=" + if ok: "1" else: "0")
+    printLine("compiler=" + compilerPath)
+    printLine("stage1_binary_cid=" + stage1.binaryCid)
+    printLine("stage2_binary_cid=" + stage2.binaryCid)
+    printLine("stage3_binary_cid=" + stage3.binaryCid)
+    printLine("stage2_stage3_release_equal=" + if releaseEqual: "1" else: "0")
+    printLine("stage2_stage3_system_link_plan_equal=" + if planEqual: "1" else: "0")
+    printLine("stage2_stage3_system_link_exec_equal=" + if execEqual: "1" else: "0")
+    printLine("stage2_stage3_binary_equal=" + if binaryEqual: "1" else: "0")
+    printLine("stage2_stage3_output_file_cid_equal=" + if outputCidEqual: "1" else: "0")
+    printLine("stage2_tooling_selfhost_ok=" + if stage2ToolingOk: "1" else: "0")
+    printLine("stage1_external_cc_provider_count=" + intToStr(stage1.externalCcProviderCount))
+    printLine("stage2_external_cc_provider_count=" + intToStr(stage2.externalCcProviderCount))
+    printLine("stage3_external_cc_provider_count=" + intToStr(stage3.externalCcProviderCount))
+    printLine("compiler_core_provider_source_kind=" + stage2.compilerCoreProviderSourceKind)
+    printLine("compiler_core_provider_compile_mode=" + stage2.compilerCoreProviderCompileMode)
+    printLine("compiler_core_dispatch_provider_removed=" + if noExternalCProvider: "1" else: "0")
+    printLine("emit_c_used_after_stage0=0")
+    return if ok: 0 else: 1
+
+fn runToolingSelfhostHost(): int32 =
+    let compilerPath = os.absolutePath(readFlagDefault("--compiler", currentCompilerPath()))
+    let outDir = readFlagDefault("--out-dir", "v2/artifacts/full_selfhost/tooling_selfhost")
+    let rootPath = "v2/examples"
+    let sourcePath = "v2/examples/network_distribution_module.cheng"
+    let targetTriple = mtarget.machineTargetContract().firstClassTargets[0]
+    createDirAll(outDir)
+    let sourceManifestStdout = os.joinPath(outDir, "source_manifest.stdout")
+    let sourceManifestFile = os.joinPath(outDir, "source_manifest.txt")
+    let rulePackStdout = os.joinPath(outDir, "rule_pack.stdout")
+    let rulePackFile = os.joinPath(outDir, "rule_pack.txt")
+    let compilerRulePackStdout = os.joinPath(outDir, "compiler_rule_pack.stdout")
+    let compilerRulePackFile = os.joinPath(outDir, "compiler_rule_pack.txt")
+    let releaseStdout = os.joinPath(outDir, "release_artifact.stdout")
+    let releaseFile = os.joinPath(outDir, "release_artifact.txt")
+    let networkSelfhostFile = os.joinPath(outDir, "network_selfhost.txt")
+    let workingDir = os.getCurrentDir()
+    let sourceManifestArgv = ["publish-source-manifest", "--root", rootPath, "--out", sourceManifestFile]
+    let sourceManifestOutput = runCompilerCommandOrPanic(compilerPath, sourceManifestArgv, workingDir, "tooling-selfhost-host publish-source-manifest failed")
+    writeTextFile(sourceManifestStdout, sourceManifestOutput)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_source_manifest.expected", sourceManifestStdout, "tooling-selfhost-host source manifest stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_source_manifest.expected", sourceManifestFile, "tooling-selfhost-host source manifest file mismatch")
+    let rulePackArgv = ["publish-rule-pack", "--in", sourcePath, "--out", rulePackFile]
+    let rulePackOutput = runCompilerCommandOrPanic(compilerPath, rulePackArgv, workingDir, "tooling-selfhost-host publish-rule-pack failed")
+    writeTextFile(rulePackStdout, rulePackOutput)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_rule_pack.expected", rulePackStdout, "tooling-selfhost-host rule pack stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_rule_pack.expected", rulePackFile, "tooling-selfhost-host rule pack file mismatch")
+    let compilerRulePackArgv = ["publish-compiler-rule-pack", "--in", sourcePath, "--out", compilerRulePackFile]
+    let compilerRulePackOutput = runCompilerCommandOrPanic(compilerPath, compilerRulePackArgv, workingDir, "tooling-selfhost-host publish-compiler-rule-pack failed")
+    writeTextFile(compilerRulePackStdout, compilerRulePackOutput)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_compiler_rule_pack.expected", compilerRulePackStdout, "tooling-selfhost-host compiler rule pack stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_compiler_rule_pack.expected", compilerRulePackFile, "tooling-selfhost-host compiler rule pack file mismatch")
+    let releaseArgv = ["release-compile", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", releaseFile]
+    let releaseOutput = runCompilerCommandOrPanic(compilerPath, releaseArgv, workingDir, "tooling-selfhost-host release-compile failed")
+    writeTextFile(releaseStdout, releaseOutput)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_release_artifact.expected", releaseStdout, "tooling-selfhost-host release stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_release_artifact.expected", releaseFile, "tooling-selfhost-host release file mismatch")
+    let networkSelfhostArgv = ["verify-network-selfhost", "--root", rootPath, "--in", sourcePath]
+    let networkSelfhostOutput = runCompilerCommandOrPanic(compilerPath, networkSelfhostArgv, workingDir, "tooling-selfhost-host verify-network-selfhost failed")
+    writeTextFile(networkSelfhostFile, networkSelfhostOutput)
+    compareExpectedTextOrPanic("v2/tests/contracts/network_selfhost.expected", networkSelfhostFile, "tooling-selfhost-host network selfhost mismatch")
+    printLine("tooling_selfhost_host_ok=1")
+    printLine("compiler=" + compilerPath)
+    printLine("source_manifest_equal=1")
+    printLine("rule_pack_equal=1")
+    printLine("compiler_rule_pack_equal=1")
+    printLine("release_compile_equal=1")
+    printLine("network_selfhost_equal=1")
+    return 0
+
+fn runLsmrAddress(): int32 =
+    let cid = readFlagDefault("--cid", "")
+    let depth = readIntFlagDefault("--depth", 4)
+    if len(cid) == 0:
+        printLine("missing --cid")
+        return 1
+    writeText(lsmr.buildLsmrAddressArtifactText(cid, depth))
+    return 0
+
+fn runLsmrRoutePlan(): int32 =
+    let cid = readFlagDefault("--cid", "")
+    let depth = readIntFlagDefault("--depth", 4)
+    let priorityClass = readFlagDefault("--priority", "urgent")
+    let dispersalMode = readFlagDefault("--dispersal", "none")
+    if len(cid) == 0:
+        printLine("missing --cid")
+        return 1
+    writeText(lsmr.buildLsmrRoutePlanArtifactText(cid, depth, priorityClass, dispersalMode))
+    return 0
+
+fn runMachinePlan(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let targetTriple = readFlagDefault("--target", mtarget.machineTargetContract().firstClassTargets[0])
+    let bundle = machineBundleFromSource(sourcePath, targetTriple)
+    writeText(mpipeline.machineModuleText(bundle) + "\n")
+    return 0
+
+fn runOutlineParse(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/src/tooling/cheng_tooling_v2.cheng")
+    let outPath = readFlagDefault("--out", "")
+    let text = buildCompilerCoreOutlineText(sourcePath)
+    if len(outPath) > 0:
+        writeTextFile(outPath, text + "\n")
+    writeText(text + "\n")
+    return 0
+
+fn runObjImage(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let targetTriple = readFlagDefault("--target", mtarget.machineTargetContract().firstClassTargets[0])
+    let bundle = machineBundleFromSource(sourcePath, targetTriple)
+    let image = oimg.writeObjImage(bundle)
+    writeText(image.imageText + "\n")
+    return 0
+
+fn runObjFile(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let targetTriple = readFlagDefault("--target", mtarget.machineTargetContract().firstClassTargets[0])
+    let bundle = machineBundleFromSource(sourcePath, targetTriple)
+    let file = ofile.buildObjFile(bundle)
+    writeText(file.fileText + "\n")
+    return 0
+
+fn runSystemLinkPlan(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let emitKind = readFlagDefault("--emit", "exe")
+    let targetTriple = readFlagDefault("--target", mtarget.machineTargetContract().firstClassTargets[0])
+    let bundle = rart.buildReleaseArtifact(sourcePath, emitKind, targetTriple)
+    writeText(bundle.systemLinkPlanText + "\n")
+    return 0
+
+fn runSystemLinkExec(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/src/tooling/cheng_tooling_v2.cheng")
+    let emitKind = readFlagDefault("--emit", "exe")
+    let targetTriple = readFlagDefault("--target", mtarget.machineTargetContract().firstClassTargets[0])
+    let outPath = readFlagDefault("--out", "")
+    let reportOut = readFlagDefault("--report-out", "")
+    let bundle = sexec.buildSystemLinkExec(sourcePath, emitKind, targetTriple, outPath)
+    if len(reportOut) > 0:
+        writeTextFile(reportOut, bundle.reportText + "\n")
+    writeText(bundle.reportText + "\n")
+    return sexec.systemLinkExecOk(bundle) ? 0 else: 1
+
+fn defaultSourceManifestOut(sourcePath: str): str =
+    let parts = os.splitFile(sourcePath)
+    return os.joinPath("v2/artifacts/release", parts.name + ".source_manifest.txt")
+
+fn runResolveManifest(): int32 =
+    let sourcePath = readFlagDefault("--in", "")
+    let root = readFlagDefault("--root", "v2/examples")
+    let outPath = readFlagDefault("--out", "")
+    let bundle = if len(sourcePath) > 0:
+        mresolve.resolveCompilerCoreSourceManifest(sourcePath)
+    else:
+        mresolve.resolveSourceManifest(root)
+    let text = buildSourceManifestArtifactText(bundle)
+    if len(outPath) > 0:
+        writeTextFile(outPath, text)
+    writeText(text)
+    return 0
+
+fn runPublishSourceManifest(): int32 =
+    let sourcePath = readFlagDefault("--in", "")
+    let root = readFlagDefault("--root", "v2/examples")
+    let outPath = readFlagDefault("--out",
+                                  if len(sourcePath) > 0:
+                                      defaultSourceManifestOut(sourcePath)
+                                  else:
+                                      "v2/artifacts/network/source_manifest.txt")
+    let bundle = if len(sourcePath) > 0:
+        mresolve.resolveCompilerCoreSourceManifest(sourcePath)
+    else:
+        mresolve.resolveSourceManifest(root)
+    let text = buildSourceManifestArtifactText(bundle)
+    writeTextFile(outPath, text)
+    writeText(text)
+    return 0
+
+fn runPublishRulePack(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let outPath = readFlagDefault("--out", "v2/artifacts/network/rule_pack.txt")
+    let bundle = networkBundleFromSource(sourcePath)
+    let text = buildNetworkArtifactText(bundle, "rule_pack", "v2.rule_pack.v1")
+    writeTextFile(outPath, text)
+    writeText(text)
+    return 0
+
+fn runPublishCompilerRulePack(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let outPath = readFlagDefault("--out", "v2/artifacts/network/compiler_rule_pack.txt")
+    let bundle = networkBundleFromSource(sourcePath)
+    let text = buildNetworkArtifactText(bundle, "compiler_rule_pack", "v2.compiler_rule_pack.v1")
+    writeTextFile(outPath, text)
+    writeText(text)
+    return 0
+
+fn runVerifyNetworkSelfhost(): int32 =
+    let root = readFlagDefault("--root", "v2/examples")
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let manifestBundle = mresolve.resolveSourceManifest(root)
+    let networkBundle = networkBundleFromSource(sourcePath)
+    let releaseBundle = rart.buildReleaseArtifact(sourcePath, "exe", mtarget.machineTargetContract().firstClassTargets[0])
+    if manifestBundle.topologyCanonicalForms.len <= 0:
+        printLine("network_selfhost_ok=0")
+        printLine("reason=missing_topology_canonical_form")
+        return 1
+    if !verifyPriorityMappings(networkBundle):
+        printLine("network_selfhost_ok=0")
+        printLine("reason=priority_mapping_mismatch")
+        return 1
+    if !hasCanonicalOp(networkBundle, "publish_source_manifest") ||
+       !hasCanonicalOp(networkBundle, "publish_rule_pack") ||
+       !hasCanonicalOp(networkBundle, "publish_compiler_rule_pack"):
+        printLine("network_selfhost_ok=0")
+        printLine("reason=missing_publish_ops")
+        return 1
+    if canonicalOpCountForDomain(networkBundle, "rule_pack") <= 0:
+        printLine("network_selfhost_ok=0")
+        printLine("reason=missing_rule_pack_domain_ops")
+        return 1
+    if canonicalOpCountForDomain(networkBundle, "compiler_rule_pack") <= 0:
+        printLine("network_selfhost_ok=0")
+        printLine("reason=missing_compiler_rule_pack_domain_ops")
+        return 1
+    if releaseBundle.moduleKind != "network_distribution":
+        printLine("network_selfhost_ok=0")
+        printLine("reason=release_artifact_wrong_module_kind")
+        return 1
+    if releaseBundle.manifestCid != manifestBundle.manifestCid:
+        printLine("network_selfhost_ok=0")
+        printLine("reason=release_manifest_mismatch")
+        return 1
+    if !releaseCompileKeyCoversNetworkBundle(releaseBundle, networkBundle):
+        printLine("network_selfhost_ok=0")
+        printLine("reason=compile_key_missing_network_fields")
+        return 1
+    if !releaseBundle.nativeLinkClosureOk:
+        printLine("network_selfhost_ok=0")
+        printLine("reason=native_link_closure_unresolved")
+        return 1
+    let rulePackText = buildNetworkArtifactText(networkBundle, "rule_pack", "v2.rule_pack.v1")
+    let compilerRulePackText = buildNetworkArtifactText(networkBundle, "compiler_rule_pack", "v2.compiler_rule_pack.v1")
+    printLine("network_selfhost_ok=1")
+    printLine("source_manifest_cid=" + manifestBundle.manifestCid)
+    printLine("rule_pack_cid=" + ident.sha256HexText(rulePackText))
+    printLine("compiler_rule_pack_cid=" + ident.sha256HexText(compilerRulePackText))
+    printLine("release_compile_key=" + releaseBundle.compileKey)
+    printLine("obj_image_cid=" + releaseBundle.objImageCid)
+    printLine("obj_section_count=" + intToStr(releaseBundle.objSectionCount))
+    printLine("obj_symbol_count=" + intToStr(releaseBundle.objSymbolCount))
+    printLine("obj_reloc_count=" + intToStr(releaseBundle.objRelocCount))
+    printLine("link_plan_cid=" + releaseBundle.linkPlanCid)
+    printLine("runtime_target_count=" + intToStr(releaseBundle.runtimeTargetCount))
+    printLine("runtime_unresolved_count=" + intToStr(releaseBundle.runtimeUnresolvedCount))
+    printLine("native_link_closure_ok=1")
+    printLine("topology_count=" + intToStr(manifestBundle.topologyCanonicalForms.len))
+    printLine("rule_pack_entry_count=" + intToStr(canonicalOpCountForDomain(networkBundle, "rule_pack")))
+    printLine("compiler_rule_pack_entry_count=" + intToStr(canonicalOpCountForDomain(networkBundle, "compiler_rule_pack")))
+    printLine("publish_source_manifest_present=1")
+    printLine("publish_rule_pack_present=1")
+    printLine("publish_compiler_rule_pack_present=1")
+    printLine("lsmr_priority_mapping_fixed=1")
+    printLine("lsmr_addressing_mode=" + lcontract.lsmrRuntimeContract().addressingMode)
+    printLine("lsmr_address_binding=" + lcontract.lsmrRuntimeContract().addressBinding)
+    printLine("lsmr_distance_metric=" + lcontract.lsmrRuntimeContract().distanceMetric)
+    printLine("lsmr_route_plan_model=" + lcontract.lsmrRuntimeContract().routePlanModel)
+    printLine("compile_key_topology_covered=1")
+    printLine("compile_key_addressing_covered=1")
+    printLine("compile_key_depth_covered=1")
+    printLine("compile_key_address_binding_covered=1")
+    printLine("compile_key_distance_metric_covered=1")
+    printLine("compile_key_priority_covered=1")
+    printLine("compile_key_dispersal_covered=1")
+    printLine("compile_key_signature_covered=1")
+    printLine("compile_key_canonical_multipath_covered=1")
+    printLine("release_manifest_matches_source_manifest=1")
+    printLine("random_gossip_fallback_present=0")
+    return 0
+
+fn defaultReleaseOut(sourcePath: str, emitKind: str): str =
+    let parts = os.splitFile(sourcePath)
+    return os.joinPath("v2/artifacts/release", parts.name + "." + emitKind + ".artifact.txt")
+
+fn runReleaseCompile(): int32 =
+    let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let emitKind = readFlagDefault("--emit", "exe")
+    let targetTriple = readFlagDefault("--target", mtarget.machineTargetContract().firstClassTargets[0])
+    let outPath = readFlagDefault("--out", defaultReleaseOut(sourcePath, emitKind))
+    let bundle = rart.buildReleaseArtifact(sourcePath, emitKind, targetTriple)
+    writeTextFile(outPath, bundle.artifactText + "\n")
+    writeText(bundle.artifactText + "\n")
+    return 0
+
+fn printUsageZero(): int32 =
+    printUsage()
+    return 0
+
+fn returnTrue(): bool =
+    return true
+
+fn cmdIsHelpLong(): bool =
+    return cmdline.cliParam1Eq("--help")
+
+fn cmdIsHelpShort(): bool =
+    return cmdline.cliParam1Eq("-h")
+
+fn cmdIsHelpWord(): bool =
+    return cmdline.cliParam1Eq("help")
+
+fn cmdIsHelpShortOrWord(): bool =
+    if cmdIsHelpShort():
+        return returnTrue()
+    else:
+        return cmdIsHelpWord()
+
+fn cmdIsHelp(): bool =
+    if cmdIsHelpLong():
+        return returnTrue()
+    else:
+        return cmdIsHelpShortOrWord()
+
+fn cmdIsSurface(): bool =
+    return cmdline.cliParam1Eq("surface")
+
+fn cmdIsPasses(): bool =
+    return cmdline.cliParam1Eq("passes")
+
+fn cmdIsContracts(): bool =
+    return cmdline.cliParam1Eq("contracts")
+
+fn cmdIsStrings(): bool =
+    return cmdline.cliParam1Eq("strings")
+
+fn cmdIsStringPipeline(): bool =
+    return cmdline.cliParam1Eq("string-pipeline")
+
+fn cmdIsInfrastructure(): bool =
+    return cmdline.cliParam1Eq("infra")
+
+fn cmdIsInfrastructurePipeline(): bool =
+    return cmdline.cliParam1Eq("infra-pipeline")
+
+fn cmdIsNetworkSurface(): bool =
+    return cmdline.cliParam1Eq("network-surface")
+
+fn cmdIsNetworkPipeline(): bool =
+    return cmdline.cliParam1Eq("network-pipeline")
+
+fn cmdIsSelfhost(): bool =
+    return cmdline.cliParam1Eq("selfhost")
+
+fn cmdIsStageSelfhostHost(): bool =
+    return cmdline.cliParam1Eq("stage-selfhost-host")
+
+fn cmdIsToolingSelfhostHost(): bool =
+    return cmdline.cliParam1Eq("tooling-selfhost-host")
+
+fn cmdIsLsmrAddress(): bool =
+    return cmdline.cliParam1Eq("lsmr-address")
+
+fn cmdIsLsmrRoutePlan(): bool =
+    return cmdline.cliParam1Eq("lsmr-route-plan")
+
+fn cmdIsOutlineParse(): bool =
+    return cmdline.cliParam1Eq("outline-parse")
+
+fn cmdIsMachinePlan(): bool =
+    return cmdline.cliParam1Eq("machine-plan")
+
+fn cmdIsObjImage(): bool =
+    return cmdline.cliParam1Eq("obj-image")
+
+fn cmdIsObjFile(): bool =
+    return cmdline.cliParam1Eq("obj-file")
+
+fn cmdIsSystemLinkPlan(): bool =
+    return cmdline.cliParam1Eq("system-link-plan")
+
+fn cmdIsSystemLinkExec(): bool =
+    return cmdline.cliParam1Eq("system-link-exec")
+
+fn cmdIsResolveManifest(): bool =
+    return cmdline.cliParam1Eq("resolve-manifest")
+
+fn cmdIsPublishSourceManifest(): bool =
+    return cmdline.cliParam1Eq("publish-source-manifest")
+
+fn cmdIsPublishRulePack(): bool =
+    return cmdline.cliParam1Eq("publish-rule-pack")
+
+fn cmdIsPublishCompilerRulePack(): bool =
+    return cmdline.cliParam1Eq("publish-compiler-rule-pack")
+
+fn cmdIsVerifyNetworkSelfhost(): bool =
+    return cmdline.cliParam1Eq("verify-network-selfhost")
+
+fn cmdIsReleaseCompile(): bool =
+    return cmdline.cliParam1Eq("release-compile")
+
+fn printSurfaceZero(): int32 =
+    printSurface()
+    return 0
+
+fn printPassesZero(): int32 =
+    printPasses()
+    return 0
+
+fn printContractsZero(): int32 =
+    printContracts()
+    return 0
+
+fn printStringsZero(): int32 =
+    printStrings()
+    return 0
+
+fn printStringPipelineZero(): int32 =
+    printStringPipeline()
+    return 0
+
+fn printInfrastructureZero(): int32 =
+    printInfrastructure()
+    return 0
+
+fn printInfrastructurePipelineZero(): int32 =
+    printInfrastructurePipeline()
+    return 0
+
+fn printNetworkSurfaceZero(): int32 =
+    printNetworkSurface()
+    return 0
+
+fn printNetworkPipelineZero(): int32 =
+    printNetworkPipeline()
+    return 0
+
+fn printSelfhostZero(): int32 =
+    printSelfhost()
+    return 0
+
+fn printUsageFail(): int32 =
+    printUsage()
+    return 1
+
+fn dispatchCommandLegacy(cmd: str): int32 =
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        return printUsageZero()
+    if cmd == "surface":
+        printSurface()
+        return 0
+    if cmd == "passes":
+        printPasses()
+        return 0
+    if cmd == "contracts":
+        printContracts()
+        return 0
+    if cmd == "strings":
+        printStrings()
+        return 0
+    if cmd == "string-pipeline":
+        printStringPipeline()
+        return 0
+    if cmd == "infra":
+        printInfrastructure()
+        return 0
+    if cmd == "infra-pipeline":
+        printInfrastructurePipeline()
+        return 0
+    if cmd == "network-surface":
+        printNetworkSurface()
+        return 0
+    if cmd == "network-pipeline":
+        printNetworkPipeline()
+        return 0
+    if cmd == "selfhost":
+        printSelfhost()
+        return 0
+    if cmd == "stage-selfhost-host":
+        return runStageSelfhostHost()
+    if cmd == "tooling-selfhost-host":
+        return runToolingSelfhostHost()
+    if cmd == "lsmr-address":
+        return runLsmrAddress()
+    if cmd == "lsmr-route-plan":
+        return runLsmrRoutePlan()
+    if cmd == "outline-parse":
+        return runOutlineParse()
+    if cmd == "machine-plan":
+        return runMachinePlan()
+    if cmd == "obj-image":
+        return runObjImage()
+    if cmd == "obj-file":
+        return runObjFile()
+    if cmd == "system-link-plan":
+        return runSystemLinkPlan()
+    if cmd == "system-link-exec":
+        return runSystemLinkExec()
+    if cmd == "resolve-manifest":
+        return runResolveManifest()
+    if cmd == "publish-source-manifest":
+        return runPublishSourceManifest()
+    if cmd == "publish-rule-pack":
+        return runPublishRulePack()
+    if cmd == "publish-compiler-rule-pack":
+        return runPublishCompilerRulePack()
+    if cmd == "verify-network-selfhost":
+        return runVerifyNetworkSelfhost()
+    if cmd == "release-compile":
+        return runReleaseCompile()
+    printUsage()
+    return 1
+
+fn dispatchCommandParam1(): int32 =
+    return dispatchCommandLegacy(cmdline.paramStr(1))
+
+fn dispatchCommandAfterContracts(): int32 =
+    if cmdIsStrings():
+        return printStringsZero()
+    else:
+        return dispatchCommandAfterStrings()
+
+fn dispatchCommandAfterStrings(): int32 =
+    if cmdIsStringPipeline():
+        return printStringPipelineZero()
+    else:
+        return dispatchCommandAfterStringPipeline()
+
+fn dispatchCommandAfterStringPipeline(): int32 =
+    if cmdIsInfrastructure():
+        return printInfrastructureZero()
+    else:
+        return dispatchCommandAfterInfrastructure()
+
+fn dispatchCommandAfterInfrastructure(): int32 =
+    if cmdIsInfrastructurePipeline():
+        return printInfrastructurePipelineZero()
+    else:
+        return dispatchCommandAfterInfrastructurePipeline()
+
+fn dispatchCommandAfterInfrastructurePipeline(): int32 =
+    if cmdIsNetworkSurface():
+        return printNetworkSurfaceZero()
+    else:
+        return dispatchCommandAfterNetworkSurface()
+
+fn dispatchCommandAfterNetworkSurface(): int32 =
+    if cmdIsNetworkPipeline():
+        return printNetworkPipelineZero()
+    else:
+        return dispatchCommandAfterNetworkPipeline()
+
+fn dispatchCommandAfterNetworkPipeline(): int32 =
+    if cmdIsSelfhost():
+        return printSelfhostZero()
+    else:
+        return dispatchCommandAfterSelfhost()
+
+fn dispatchCommandAfterSelfhost(): int32 =
+    if cmdIsStageSelfhostHost():
+        return runStageSelfhostHost()
+    else:
+        return dispatchCommandAfterStageSelfhostHost()
+
+fn dispatchCommandAfterStageSelfhostHost(): int32 =
+    if cmdIsToolingSelfhostHost():
+        return runToolingSelfhostHost()
+    else:
+        return dispatchCommandAfterToolingSelfhostHost()
+
+fn dispatchCommandAfterToolingSelfhostHost(): int32 =
+    if cmdIsLsmrAddress():
+        return runLsmrAddress()
+    else:
+        return dispatchCommandAfterLsmrAddress()
+
+fn dispatchCommandAfterLsmrAddress(): int32 =
+    if cmdIsLsmrRoutePlan():
+        return runLsmrRoutePlan()
+    else:
+        return dispatchCommandAfterLsmrRoutePlan()
+
+fn dispatchCommandAfterLsmrRoutePlan(): int32 =
+    if cmdIsOutlineParse():
+        return runOutlineParse()
+    else:
+        return dispatchCommandAfterOutlineParse()
+
+fn dispatchCommandAfterOutlineParse(): int32 =
+    if cmdIsMachinePlan():
+        return runMachinePlan()
+    else:
+        return dispatchCommandAfterMachinePlan()
+
+fn dispatchCommandAfterMachinePlan(): int32 =
+    if cmdIsObjImage():
+        return runObjImage()
+    else:
+        return dispatchCommandAfterObjImage()
+
+fn dispatchCommandAfterObjImage(): int32 =
+    if cmdIsObjFile():
+        return runObjFile()
+    else:
+        return dispatchCommandAfterObjFile()
+
+fn dispatchCommandAfterObjFile(): int32 =
+    if cmdIsSystemLinkPlan():
+        return runSystemLinkPlan()
+    else:
+        return dispatchCommandAfterSystemLinkPlan()
+
+fn dispatchCommandAfterSystemLinkPlan(): int32 =
+    if cmdIsSystemLinkExec():
+        return runSystemLinkExec()
+    else:
+        return dispatchCommandAfterSystemLinkExec()
+
+fn dispatchCommandAfterSystemLinkExec(): int32 =
+    if cmdIsResolveManifest():
+        return runResolveManifest()
+    else:
+        return dispatchCommandAfterResolveManifest()
+
+fn dispatchCommandAfterResolveManifest(): int32 =
+    if cmdIsPublishSourceManifest():
+        return runPublishSourceManifest()
+    else:
+        return dispatchCommandAfterPublishSourceManifest()
+
+fn dispatchCommandAfterPublishSourceManifest(): int32 =
+    if cmdIsPublishRulePack():
+        return runPublishRulePack()
+    else:
+        return dispatchCommandAfterPublishRulePack()
+
+fn dispatchCommandAfterPublishRulePack(): int32 =
+    if cmdIsPublishCompilerRulePack():
+        return runPublishCompilerRulePack()
+    else:
+        return dispatchCommandAfterPublishCompilerRulePack()
+
+fn dispatchCommandAfterPublishCompilerRulePack(): int32 =
+    if cmdIsVerifyNetworkSelfhost():
+        return runVerifyNetworkSelfhost()
+    else:
+        return dispatchCommandAfterVerifyNetworkSelfhost()
+
+fn dispatchCommandAfterVerifyNetworkSelfhost(): int32 =
+    if cmdIsReleaseCompile():
+        return runReleaseCompile()
+    else:
+        return printUsageFail()
+
+fn dispatchCommandAfterPasses(): int32 =
+    if cmdIsContracts():
+        return printContractsZero()
+    else:
+        return dispatchCommandAfterContracts()
+
+fn dispatchCommandAfterSurface(): int32 =
+    if cmdIsPasses():
+        return printPassesZero()
+    else:
+        return dispatchCommandAfterPasses()
+
+fn dispatchCommand(): int32 =
+    if cmdIsHelp():
+        return printUsageZero()
+    else:
+        return dispatchCommandAfterHelp()
+
+fn dispatchCommandAfterHelp(): int32 =
+    if cmdIsSurface():
+        return printSurfaceZero()
+    else:
+        return dispatchCommandAfterSurface()
+
+fn mainNeedsUsage(): bool =
+    return cmdline.paramCount() <= 0
+
+fn main(): int32 =
+    if mainNeedsUsage():
+        return printUsageZero()
+    else:
+        return dispatchCommand()

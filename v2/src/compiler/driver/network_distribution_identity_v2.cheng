@@ -1,0 +1,115 @@
+import std/seqs
+import std/system
+import compiler/driver/identity_v2 as ident
+import compiler/driver/lsmr_v2 as lsmr
+import compiler/driver/manifest_resolver_v2 as manifest
+import compiler/driver/network_distribution_pipeline_v2 as npipe
+
+type
+    NetworkLsmrBinding =
+        version: str
+        opIndex: int32
+        domain: str
+        contentCid: str
+        sourceAddressText: str
+        targetAddressText: str
+        routePlanCid: str
+        routePathCount: int32
+        totalDistance: int32
+        routePlanText: str
+
+fn networkDistributionIdentityVersion(): str =
+    return "v2.driver.network_distribution_identity.v1"
+
+fn buildNetworkDomainBaseArtifactText(bundle: npipe.NetworkDistributionPipelineBundle,
+                                      requiredDomain: str,
+                                      artifactVersion: str): str =
+    var lines: str[]
+    lines = []
+    add(lines, "artifact_version=" + artifactVersion)
+    add(lines, "pipeline_version=" + bundle.version)
+    var count: int32 = 0
+    for i in 0..<bundle.lowPlan.canonicalOps.len:
+        if bundle.facts.networkDomains[i] != requiredDomain:
+            continue
+        add(lines, "entry." + intToStr(count) + ".op=" + bundle.lowPlan.canonicalOps[i])
+        add(lines, "entry." + intToStr(count) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
+        add(lines, "entry." + intToStr(count) + ".proof=" + bundle.lowPlan.proofDomains[i])
+        add(lines, "entry." + intToStr(count) + ".domain=" + bundle.facts.networkDomains[i])
+        add(lines, "entry." + intToStr(count) + ".topology_ref=" + bundle.facts.topologyRefs[i])
+        add(lines, "entry." + intToStr(count) + ".topology=" + bundle.facts.topologyCanonicalForms[i])
+        add(lines, "entry." + intToStr(count) + ".transport=" + bundle.facts.transportModes[i])
+        add(lines, "entry." + intToStr(count) + ".repair=" + bundle.facts.repairModes[i])
+        add(lines, "entry." + intToStr(count) + ".dispersal=" + bundle.facts.dispersalModes[i])
+        add(lines, "entry." + intToStr(count) + ".priority=" + bundle.facts.priorityClasses[i])
+        add(lines, "entry." + intToStr(count) + ".identity=" + bundle.facts.identityScopes[i])
+        add(lines, "entry." + intToStr(count) + ".signature=" + bundle.facts.antiEntropySignatureKinds[i])
+        count = count + 1
+    add(lines, "entry_count=" + intToStr(count))
+    return manifest.joinLines(lines)
+
+fn networkDomainContentCid(bundle: npipe.NetworkDistributionPipelineBundle,
+                           requiredDomain: str,
+                           artifactVersion: str): str =
+    return ident.sha256HexText(buildNetworkDomainBaseArtifactText(bundle, requiredDomain, artifactVersion))
+
+fn contentCidForNetworkOp(bundle: npipe.NetworkDistributionPipelineBundle,
+                          sourceManifestCid: str,
+                          opIndex: int32): str =
+    let domain = bundle.facts.networkDomains[opIndex]
+    if domain == "source_manifest":
+        return sourceManifestCid
+    if domain == "rule_pack":
+        return networkDomainContentCid(bundle, "rule_pack", "v2.rule_pack_content.v1")
+    if domain == "compiler_rule_pack":
+        return networkDomainContentCid(bundle, "compiler_rule_pack", "v2.compiler_rule_pack_content.v1")
+    panic("v2 network identity: unsupported phase1 domain " + domain)
+
+fn bindNetworkOpToLsmr(bundle: npipe.NetworkDistributionPipelineBundle,
+                       sourceManifestCid: str,
+                       opIndex: int32): NetworkLsmrBinding =
+    let contentCid = contentCidForNetworkOp(bundle, sourceManifestCid, opIndex)
+    let depth = bundle.lowPlan.topologyDepths[opIndex]
+    let routePlan = lsmr.buildLsmrRoutePlan(contentCid,
+                                            depth,
+                                            bundle.lowPlan.priorityClasses[opIndex],
+                                            bundle.lowPlan.dispersalModes[opIndex])
+    var out: NetworkLsmrBinding
+    out.version = networkDistributionIdentityVersion()
+    out.opIndex = opIndex
+    out.domain = bundle.facts.networkDomains[opIndex]
+    out.contentCid = contentCid
+    out.sourceAddressText = routePlan.sourceAddress.canonicalText
+    out.targetAddressText = routePlan.targetAddress.canonicalText
+    out.routePlanCid = routePlan.canonicalCid
+    out.routePathCount = routePlan.pathTexts.len
+    out.totalDistance = routePlan.totalDistance
+    out.routePlanText = routePlan.canonicalText
+    return out
+
+fn buildPublishedNetworkArtifactText(bundle: npipe.NetworkDistributionPipelineBundle,
+                                     requiredDomain: str,
+                                     artifactVersion: str): str =
+    let baseBody = buildNetworkDomainBaseArtifactText(bundle, requiredDomain, artifactVersion)
+    let contentCid = ident.sha256HexText(baseBody)
+    var lines: str[]
+    lines = []
+    add(lines, baseBody)
+    add(lines, "content_cid=" + contentCid)
+    var count: int32 = 0
+    for i in 0..<bundle.lowPlan.opIds.len:
+        if bundle.facts.networkDomains[i] != requiredDomain:
+            continue
+        let binding = bindNetworkOpToLsmr(bundle, contentCid, i)
+        add(lines, "entry." + intToStr(count) + ".addressing=" + bundle.lowPlan.addressingModes[i])
+        add(lines, "entry." + intToStr(count) + ".depth=" + intToStr(bundle.lowPlan.topologyDepths[i]))
+        add(lines, "entry." + intToStr(count) + ".address_binding=" + bundle.lowPlan.addressBindings[i])
+        add(lines, "entry." + intToStr(count) + ".distance_metric=" + bundle.lowPlan.distanceMetrics[i])
+        add(lines, "entry." + intToStr(count) + ".source_address=" + binding.sourceAddressText)
+        add(lines, "entry." + intToStr(count) + ".target_address=" + binding.targetAddressText)
+        add(lines, "entry." + intToStr(count) + ".route_plan_cid=" + binding.routePlanCid)
+        add(lines, "entry." + intToStr(count) + ".canonical_multipath_count=" + intToStr(binding.routePathCount))
+        add(lines, "entry." + intToStr(count) + ".total_distance=" + intToStr(binding.totalDistance))
+        count = count + 1
+    let body = manifest.joinLines(lines)
+    return body + "\nartifact_cid=" + ident.sha256HexText(body) + "\n"

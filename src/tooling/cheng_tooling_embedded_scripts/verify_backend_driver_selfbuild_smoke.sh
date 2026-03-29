@@ -9,7 +9,6 @@ Usage:
   src/tooling/verify_backend_driver_selfbuild_smoke.sh [--help]
 
 Env:
-  DRIVER_SELFBUILD_SMOKE_STAGE0=<path>             optional stage0 override
   DRIVER_SELFBUILD_SMOKE_TIMEOUT=<seconds>         default: 55
   DRIVER_SELFBUILD_SMOKE_OUTPUT=<path>             default: artifacts/backend_driver/cheng.selfbuild_smoke
   DRIVER_SELFBUILD_SMOKE_REPORT=<path>             default: artifacts/backend_driver_selfbuild_smoke/selfbuild_smoke_report.tsv
@@ -333,7 +332,6 @@ done
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-stage0="${DRIVER_SELFBUILD_SMOKE_STAGE0:-}"
 build_timeout="${DRIVER_SELFBUILD_SMOKE_TIMEOUT:-55}"
 output_rel="${DRIVER_SELFBUILD_SMOKE_OUTPUT:-artifacts/backend_driver/cheng.selfbuild_smoke}"
 report="${DRIVER_SELFBUILD_SMOKE_REPORT:-artifacts/backend_driver_selfbuild_smoke/selfbuild_smoke_report.tsv}"
@@ -361,34 +359,6 @@ if [ ! -f "$report" ]; then
 fi
 
 choose_stage0() {
-  if [ "$stage0" != "" ]; then
-    printf '%s\n' "$stage0"
-    return 0
-  fi
-  if [ "${BACKEND_DRIVER:-}" != "" ] && [ -x "${BACKEND_DRIVER:-}" ]; then
-    printf '%s\n' "${BACKEND_DRIVER:-}"
-    return 0
-  fi
-  if [ -x "artifacts/backend_driver/cheng" ]; then
-    printf '%s\n' "artifacts/backend_driver/cheng"
-    return 0
-  fi
-  if [ "${TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK:-0}" != "1" ]; then
-    ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path
-    return 0
-  fi
-  if [ -x "dist/releases/current/cheng" ]; then
-    printf '%s\n' "dist/releases/current/cheng"
-    return 0
-  fi
-  if [ -x "artifacts/backend_seed/cheng.stage2" ]; then
-    printf '%s\n' "artifacts/backend_seed/cheng.stage2"
-    return 0
-  fi
-  if [ -x "artifacts/backend_selfhost_self_obj/cheng_stage0_default" ]; then
-    printf '%s\n' "artifacts/backend_selfhost_self_obj/cheng_stage0_default"
-    return 0
-  fi
   ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path
 }
 
@@ -425,7 +395,6 @@ build_start="$(date +%s)"
 env \
   BACKEND_BUILD_DRIVER_SELFHOST=1 \
   BACKEND_BUILD_DRIVER_LINKER=system \
-  BACKEND_BUILD_DRIVER_STAGE0="$stage0" \
   BACKEND_BUILD_DRIVER_TIMEOUT="$build_timeout" \
   BACKEND_BUILD_DRIVER_SMOKE=1 \
   BACKEND_BUILD_DRIVER_REQUIRE_SMOKE=1 \

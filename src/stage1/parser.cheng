@@ -16,6 +16,33 @@ fn parserAppendTokenClone(seqInst: var Token[], val: Token) =
     var clone: Token = val
     tokenSeqAppendClone(seqInst, clone)
 
+fn parserMaterializeTraceEnabled(): bool =
+    return envIsTrue "BACKEND_TRACE_MATERIALIZE"
+
+fn parserMaterializeRoutineName(routineId: AstNodeId): str =
+    if !astNodeIdValid(routineId) || astKidCount(routineId) <= 0:
+        return ""
+    let nameId: AstNodeId = astKidAt(routineId, 0)
+    if !astNodeIdValid(nameId):
+        return ""
+    return astPlainName(nameId)
+
+fn parserMaterializeTrace(action: str, filename: str, routineId: AstNodeId) =
+    if !parserMaterializeTraceEnabled():
+        return
+    let name: str = parserMaterializeRoutineName(routineId)
+    let declOrdinal: int32 = astNodeIdValid(routineId) ? astNodeDeclOrdinal(routineId) : -1
+    let startTok: int32 = astNodeIdValid(routineId) ? astNodeDeferredBodyStartTok(routineId) : -1
+    let endTok: int32 = astNodeIdValid(routineId) ? astNodeDeferredBodyEndTok(routineId) : -1
+    let fErr: os.File = os.get_stderr()
+    os.writeLine(fErr, "[stage1] materialize: parser_" + action +
+                       " file=" + filename +
+                       " name=" + name +
+                       " decl=" + intToStr(declOrdinal) +
+                       " tok=" + intToStr(startTok) + ".." + intToStr(endTok))
+    if os.getEnvDefault("STAGE1_TRACE_FLUSH", "") == "1":
+        os.c_fflush fErr
+
 fn add(seqInst: var Node[], val: Node) =
     seqs.add(seqInst, val)
 
@@ -526,13 +553,13 @@ fn eofTok(): Token =
     tokenZero(t)
     return t
 
-fn parserTokenViewEnd(p: ParserStateObj): int32 =
+fn parserTokenViewEnd(p: var ParserStateObj): int32 =
     let n: int32 = p.tokens.len
     if p.endExclusive <= 0 || p.endExclusive > n:
         return n
     return p.endExclusive
 
-fn parserEofTok(p: ParserStateObj): Token =
+fn parserEofTok(p: var ParserStateObj): Token =
     var t: Token = eofTok()
     t.line = p.eofLine
     t.col = p.eofCol
@@ -3766,21 +3793,55 @@ fn parserMaterializeRoutineBodyFromTokensImpl(tokens: Token[], filename: str, ro
     return true
 
 fn materializeRoutineBodyFromTokensId(tokens: Token[], filename: str, routineId: AstNodeId, diags: Diagnostic[]*): bool =
-    return parserMaterializeRoutineBodyFromTokensImpl(tokens, filename, routineId, diags)
+    parserMaterializeTrace("start", filename, routineId)
+    let ok: bool = parserMaterializeRoutineBodyFromTokensImpl(tokens, filename, routineId, diags)
+    parserMaterializeTrace(ok ? "done" : "fail", filename, routineId)
+    return ok
 
-fn parserMaterializeRoutineBodiesInNode(tokens: Token[], filename: str, rootId: AstNodeId, diags: Diagnostic[]*): int32 =
-    if !astNodeIdValid(rootId):
+fn parserRoutineBodyOwnedByFile(routineId: AstNodeId, filename: str): bool =
+    if !astNodeIdValid(routineId):
+        return false
+    let ownerFile: str = astNodeStrVal(routineId)
+    if len(ownerFile) <= 0:
+        return true
+    return ownerFile == filename
+
+fn parserMaterializeTopLevelRoutineBodyIfOwned(tokens: Token[], filename: str,
+                                               routineId: AstNodeId, diags: Diagnostic[]*): int32 =
+    if !astNodeIdValid(routineId):
         return 0
-    var materialized: int32 = 0
-    if parserIsRoutineDeclNodeKind(astNodeKind(rootId)):
-        if parserMaterializeRoutineBodyFromTokensImpl(tokens, filename, rootId, diags):
-            materialized = materialized + 1
-    for i in 0..<astKidCount(rootId):
-        materialized = materialized + parserMaterializeRoutineBodiesInNode(tokens, filename, astKidAt(rootId, i), diags)
-    return materialized
+    if !parserIsRoutineDeclNodeKind(astNodeKind(routineId)):
+        return 0
+    if !parserRoutineBodyOwnedByFile(routineId, filename):
+        return 0
+    return parserMaterializeRoutineBodyFromTokensImpl(tokens, filename, routineId, diags) ? 1 : 0
+
+fn parserMaterializeDirectModuleChildBodies(tokens: Token[], filename: str,
+                                            childId: AstNodeId, diags: Diagnostic[]*): int32 =
+    if !astNodeIdValid(childId):
+        return 0
+    let childKind: NodeKind = astNodeKind(childId)
+    if childKind == nkModule:
+        return 0
+    if childKind == nkStmtList:
+        var materializedStmtList: int32 = 0
+        for i in 0..<astKidCount(childId):
+            materializedStmtList = materializedStmtList +
+                parserMaterializeTopLevelRoutineBodyIfOwned(tokens, filename, astKidAt(childId, i), diags)
+        return materializedStmtList
+    return parserMaterializeTopLevelRoutineBodyIfOwned(tokens, filename, childId, diags)
 
 fn materializeModuleRoutineBodiesFromTokensId(tokens: Token[], filename: str, rootId: AstNodeId, diags: Diagnostic[]*): int32 =
-    return parserMaterializeRoutineBodiesInNode(tokens, filename, rootId, diags)
+    if !astNodeIdValid(rootId):
+        return 0
+    let rootKind: NodeKind = astNodeKind(rootId)
+    if rootKind != nkModule && rootKind != nkStmtList:
+        return parserMaterializeDirectModuleChildBodies(tokens, filename, rootId, diags)
+    var materialized: int32 = 0
+    for i in 0..<astKidCount(rootId):
+        materialized = materialized +
+            parserMaterializeDirectModuleChildBodies(tokens, filename, astKidAt(rootId, i), diags)
+    return materialized
 
 fn parseModuleImplMode(tokens: Token[], filename: str, diags: Diagnostic[]*, outlineOnly: bool): AstNodeId =
     var pObj: ParserStateObj

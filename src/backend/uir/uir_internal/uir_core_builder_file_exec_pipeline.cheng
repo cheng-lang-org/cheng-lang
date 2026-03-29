@@ -1,0 +1,375 @@
+# MIR builder from Stage1 AST (MVP subset).
+import std/os
+import std/result
+import std/seqs
+import std/system
+import std/hashsets
+import std/rawmem_support
+import stage1/lexer
+import stage1/parser
+import stage1/token
+import stage1/ast
+import stage1/frontend_lib
+import stage1/type_syntax_lowering
+import stage1/diagnostics
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
+import backend/uir/uir_internal/uir_core_builder_file_shared_helpers
+import backend/uir/uir_internal/uir_core_builder_policy_contract
+import backend/uir/uir_internal/uir_core_builder_ffi_out_ptr
+import backend/uir/uir_internal/uir_core_builder_symbol_state
+import backend/uir/uir_internal/uir_core_builder_type_name_cache
+import backend/uir/uir_internal/uir_core_builder_current_root_cache
+import backend/uir/uir_internal/uir_core_builder_current_root_type_decl_helpers
+import backend/uir/uir_internal/uir_core_builder_name_base_unique_cache
+import backend/uir/uir_internal/uir_core_builder_callee_candidate_cache
+import backend/uir/uir_internal/uir_core_builder_module_lookup_cache
+import backend/uir/uir_internal/uir_core_builder_missing_routine_queue
+import backend/uir/uir_internal/uir_core_builder_reachability_scan
+import backend/uir/uir_internal/uir_core_builder_type_surface_helpers
+import backend/uir/uir_internal/uir_core_builder_type_query_helpers
+import backend/uir/uir_internal/uir_core_builder_object_runtime_helpers
+import backend/uir/uir_internal/uir_core_builder_object_synthesis
+import backend/uir/uir_internal/uir_core_builder_indirect_call_helpers
+import backend/uir/uir_internal/uir_core_builder_call_resolution
+import backend/uir/uir_internal/uir_core_builder_type_decl_passes
+import backend/uir/uir_internal/uir_core_builder_mangled_decl_helpers
+import backend/uir/uir_internal/uir_core_builder_file_stage1_phases
+fn uirCoreFileExecPipelineBuildModuleFromFileStage1(inPath: str, target: str): Result[UirCoreModule] =
+    if len(inPath) == 0:
+        return Err[UirCoreModule]("uirCore_builder: empty path")
+    crashTraceSetPhase(strToCStringTemp("uir.file"))
+    if crashTraceEnabled():
+        crashTraceMark(strToCStringTemp("uir.file"), len(inPath), len(target), 0, 0)
+    if false && os.getEnvDefault("BACKEND_DEBUG_INPUT_PATH", "") == "1":
+        let b0: int32 = len(inPath) > 0 ? int32(inPath[0]) : -1
+        echo("[backend] stage1 input_path='" + inPath + "' len=" + intToStr(len(inPath)) +
+             " b0=" + intToStr(b0))
+    let dbgPipe: bool = false
+    let dbgConstFile: bool = false
+    var dbgFile: os.File = nil
+    if dbgPipe:
+        dbgFile = os.get_stderr()
+        os.writeLine(dbgFile, "[backend] stage1: enter")
+        os.c_fflush dbgFile
+    if dbgConstFile:
+        os.writeLine(os.get_stderr(), "[backend] const: file_enter")
+        os.c_fflush os.get_stderr()
+    # Keep node/lex pools alive for MIR/codegen string ownership.
+    releaseNodeArena()
+    releaseLexStrings()
+    initNodeArena()
+    initLexStringPool()
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: pools_ready")
+        os.c_fflush dbgFile
+
+    let eagerContent: str = frontend_lib.stage1_readFile(inPath)
+    if len(eagerContent) == 0 && !frontend_lib.stage1_fileExists(inPath):
+        return Err[UirCoreModule]("uirCore_builder: input file not found")
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: file_exists_ok")
+        os.c_fflush dbgFile
+
+    let profOn: bool = envIsTrue "STAGE1_PROFILE"
+    var profStart: int64 = 0
+    if profOn:
+        profStart = cheng_monotime_ns()
+    var profMark: int64 = 0
+    var profLex: int64 = 0
+    var profLoad: int64 = 0
+    var profOutlineParse: int64 = 0
+    var profMaterializeBodies: int64 = 0
+    var profMergeModule: int64 = 0
+    var profFnTasks: int64 = 0
+    var profSem: int64 = 0
+    var profMono: int64 = 0
+    var profOwn: int64 = 0
+
+    if profOn:
+        profMark = cheng_monotime_ns()
+    # Avoid unconditional string concat during bootstrap (stage0-built stage1 can miscompile
+    # large init-time concatenations and crash before any diagnostics).
+    stage1Trace "internal: lex+parse"
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: lex_parse_start")
+        os.c_fflush dbgFile
+    let size: int64 = fileSize inPath
+    let mtime: int64 = fileMtime inPath
+    let effectiveSize: int64 = (size > 0 || len(eagerContent) == 0) ? size : int64(len(eagerContent))
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: file_meta_ok")
+        os.writeLine(dbgFile, (effectiveSize > 0) ? "[backend] stage1: file_size_nonzero" : "[backend] stage1: file_size_zero")
+        os.c_fflush dbgFile
+    var tokens: Token[]
+    var lexDiags: Diagnostic[]
+    lexDiags.buffer = nil
+    lexDiags.len = 0
+    let cacheHit: bool = loadTokenCacheInto(inPath, effectiveSize, mtime, &tokens)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: token_cache_checked")
+        os.c_fflush dbgFile
+    if cacheHit:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: token_cache_hit")
+            os.c_fflush dbgFile
+        if len(eagerContent) > 0:
+            releaseString eagerContent
+    else:
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: token_cache_miss")
+            os.c_fflush dbgFile
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: file_read_done")
+            os.writeLine(dbgFile, (len(eagerContent) > 0) ? "[backend] stage1: file_read_nonempty" : "[backend] stage1: file_read_empty")
+            os.c_fflush dbgFile
+        if len(eagerContent) == 0:
+            return Err[UirCoreModule]("uirCore_builder: unable to read input file")
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: lex_start")
+            os.c_fflush dbgFile
+        let _lexOk: bool = uirCoreLexInto(eagerContent, inPath, tokens, lexDiags)
+        if dbgPipe:
+            os.writeLine(dbgFile, "[backend] stage1: lex_done")
+            os.c_fflush dbgFile
+        releaseString eagerContent
+    var diags: Diagnostic[]
+    diags.buffer = nil
+    diags.len = 0
+    if lexDiags.len > 0:
+        appendDiagnostics(&diags, lexDiags)
+    else:
+        if ! cacheHit:
+            writeTokenCache(inPath, size, mtime, tokens)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: token_count=" + intToStr(tokens.len))
+        os.c_fflush dbgFile
+    dumpTokens(inPath, tokens)
+    let parseMode: str = uirCoreStage1ParseModeNormalized()
+    let outlineMode: bool = parseMode == "outline"
+    if outlineMode:
+        stage1Trace "internal: outline_parse"
+    let outlineParseStart: int64 = profOn ? cheng_monotime_ns() : int64(0)
+    var userRootId: AstNodeId = astInvalidNodeId()
+    if outlineMode:
+        userRootId = parseModuleOutlineWithDiagnosticsId(tokens, inPath, &diags)
+    else:
+        userRootId = parseModuleWithDiagnosticsId(tokens, inPath, &diags)
+    if profOn:
+        profOutlineParse = cheng_monotime_ns() - outlineParseStart
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: parsed_user_module")
+        os.writeLine(dbgFile, "[backend] stage1: parse_mode=" + parseMode)
+        os.writeLine(dbgFile, "[backend] stage1: user_root_kids=" + intToStr(astKidCount(userRootId)))
+        os.c_fflush dbgFile
+    uirCoreDebugDumpStringLiteralStage("post_parse_user", userRootId)
+
+    if astNodeIdValid(userRootId):
+        let inPathTag: str = normalizeImportPath inPath
+        if envIsTrue "STAGE1_TRACE_IMPORTS":
+            stage1Trace("import: inPathTag=" + inPathTag)
+            stage1Trace("import: repoRoot=" + os.getCurrentDir())
+        let tagPath: str = uirCoreDefaultStrOr(inPathTag, inPath)
+        if len inPathTag > 0:
+            astSetNodeStrVal(userRootId, inPathTag)
+        tagModuleChildrenId(userRootId, tagPath)
+
+    if profOn:
+        profLex = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+
+    stage1Trace "internal: load system/imports"
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_start")
+        os.c_fflush dbgFile
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_repo_root_start")
+        os.c_fflush dbgFile
+    let repoRoot: str = uirCoreDefaultStrOr(uirCoreResolveRepoRoot(inPath), ".")
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_repo_root_done")
+        os.c_fflush dbgFile
+    var importVisited: StrSetList = strSetListInit(16)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_visited_init_done")
+        os.c_fflush dbgFile
+    var importCache: NodeCache = nodeCacheInit(128)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_cache_init_done")
+        os.c_fflush dbgFile
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: load_implicit_system_start")
+        os.c_fflush dbgFile
+    var sysRootId: AstNodeId = astInvalidNodeId()
+    if stage1_autoSystemEnabled():
+        sysRootId = loadImplicitImportRootId("system", inPath, repoRoot, &diags, &importVisited, &importCache)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: load_implicit_system_done")
+        os.writeLine(dbgFile, "[backend] stage1: sys_root_kids=" + intToStr(astKidCount(sysRootId)))
+        os.c_fflush dbgFile
+
+    stage1Trace "internal: merge_module"
+    let mergeStart: int64 = profOn ? cheng_monotime_ns() : int64(0)
+    var root0Id: AstNodeId = astInvalidNodeId()
+    if !astNodeIdValid(userRootId):
+        root0Id = mergeModulesId(sysRootId, userRootId)
+    else:
+        let userDir: str = uirCorePathDirName(inPath)
+        let imported: AstNodeId[] = loadImportsId(userRootId, userDir, repoRoot, &diags, &importVisited, &importCache)
+        var aliases: str[]
+        aliases.buffer = nil
+        aliases.len = 0
+        collectImportAliasesId(userRootId, &aliases)
+        if aliases.len > 0:
+            userRootId = lowerModuleQualifiersId(userRootId, aliases)
+        root0Id = mergeModulesWithImportsId(sysRootId, userRootId, imported)
+    var root0: Node = root0Id
+    if dbgPipe:
+        os.write(dbgFile, "[backend] stage1: merged_root_kids=")
+        os.write(dbgFile, intToStr(astKidCount(root0Id)))
+        os.write(dbgFile, "\n")
+        os.c_fflush dbgFile
+    if profOn:
+        profMergeModule = cheng_monotime_ns() - mergeStart
+
+    tokens.buffer = nil
+    tokens.len = 0
+    lexDiags.buffer = nil
+    lexDiags.len = 0
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: imports_done")
+        os.c_fflush dbgFile
+
+    if profOn:
+        profLoad = cheng_monotime_ns() - profMark
+        profMark = cheng_monotime_ns()
+
+    if uirCoreStage1StdNoPointerPrecheckId(root0Id, inPath, diags):
+        if hasError diags:
+            printDiagnostics diags
+        else:
+            echo rawPointerForbidMessage("std policy: pointer types are forbidden in standard library")
+        return Err[UirCoreModule]("uirCore_builder: stage1 errors")
+    if uirCoreStage1NoPointerNonCAbiPrecheckId(root0Id, inPath, diags):
+        if hasError diags:
+            printDiagnostics diags
+        else:
+            echo rawPointerForbidMessage("no-pointer policy: pointer types are forbidden in user modules")
+        return Err[UirCoreModule]("uirCore_builder: stage1 errors")
+    if uirCoreFileLikelyUsesRawSpawn(userRootId):
+        echo "spawn raw function pointer is forbidden in default API; use std/async_rt_legacy.spawn"
+        return Err[UirCoreModule]("uirCore_builder: stage1 errors")
+    type_syntax_lowering.lowerTypeSyntaxId(root0Id, &diags, inPath)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: type_syntax_done")
+        os.c_fflush dbgFile
+
+    let ffiOutPtrLowered: bool = uirCoreLowerFfiOutPtrAnnotationsId(root0Id, &diags)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: ffi_out_ptrs_lowered=" + (ffiOutPtrLowered ? "1" : "0"))
+        os.c_fflush dbgFile
+    if hasError diags:
+        printDiagnostics diags
+        return Err[UirCoreModule]("uirCore_builder: stage1 ffi_out_ptrs lowering failed")
+    let ffiShadowOk: bool = uirCoreValidateFfiShadowAnnotationsId(root0Id, &diags)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: ffi_shadow_annotations_ok=" + (ffiShadowOk ? "1" : "0"))
+        os.c_fflush dbgFile
+    if !ffiShadowOk || hasError(diags):
+        printDiagnostics(diags)
+        return Err[UirCoreModule]("uirCore_builder: stage1 ffi shadow annotation validation failed")
+
+    let mm0: str = memMode()
+    let strictOn0: bool = orcStrictEnabled()
+    let ownDiags: bool = ownershipDiagnosticsEnabled()
+    let borrowIrMode: str = uirCoreBorrowIrNormalized()
+    let genericLoweringMode: str = uirCoreGenericLoweringNormalized()
+    if !uirCoreBorrowIrSupported(borrowIrMode):
+        return Err[UirCoreModule]("uirCore_builder: invalid BORROW_IR (expected mir|stage1): " + borrowIrMode)
+    if !uirCoreGenericLoweringSupported(genericLoweringMode):
+        return Err[UirCoreModule]("uirCore_builder: invalid GENERIC_LOWERING (expected mir_dict): " + genericLoweringMode)
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: borrow_ir=" + borrowIrMode)
+        os.writeLine(dbgFile, "[backend] stage1: generic_lowering=" + genericLoweringMode)
+        os.c_fflush dbgFile
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: pre_env_trace_flag_eval_start")
+        os.c_fflush dbgFile
+    let traceImports: bool = envIsTrue "STAGE1_TRACE_IMPORTS"
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: pre_env_trace_flag_eval_done value=" + (traceImports ? "1" : "0"))
+        os.c_fflush dbgFile
+    if traceImports:
+        stage1Trace("import: mm=" + mm0)
+        stage1Trace("import: mm_strict=" + (strictOn0 ? "1" : "0"))
+        stage1Trace("import: own_diags=" + (ownDiags ? "1" : "0"))
+        stage1Trace("import: borrow_ir=" + borrowIrMode)
+        stage1Trace("import: generic_lowering=" + genericLoweringMode)
+    let removedSkipSemRaw: str = backendTrimAsciiSpace(os.getEnvDefault("STAGE1_SKIP_SEM", ""))
+    if len(removedSkipSemRaw) > 0:
+        return Err[UirCoreModule]("backend_driver: removed env STAGE1_SKIP_SEM, use STAGE1_SEM_FIXED_0=0")
+    let removedSkipOwnershipRaw: str = backendTrimAsciiSpace(os.getEnvDefault("STAGE1_SKIP_OWNERSHIP", ""))
+    if len(removedSkipOwnershipRaw) > 0:
+        return Err[UirCoreModule]("backend_driver: removed env STAGE1_SKIP_OWNERSHIP, use STAGE1_OWNERSHIP_FIXED_0=0")
+    let fixedSemRaw: str = backendLowerAscii(backendTrimAsciiSpace(os.getEnvDefault("STAGE1_SEM_FIXED_0", "")))
+    if len(fixedSemRaw) > 0 && !(fixedSemRaw == "0" || fixedSemRaw == "false" || fixedSemRaw == "no"):
+        return Err[UirCoreModule]("backend_driver: STAGE1_SEM_FIXED_0 is fixed=0")
+    let fixedOwnershipRaw: str = backendLowerAscii(backendTrimAsciiSpace(os.getEnvDefault("STAGE1_OWNERSHIP_FIXED_0", "")))
+    if len(fixedOwnershipRaw) > 0 && !(fixedOwnershipRaw == "0" || fixedOwnershipRaw == "false" || fixedOwnershipRaw == "no"):
+        return Err[UirCoreModule]("backend_driver: STAGE1_OWNERSHIP_FIXED_0 is fixed=0")
+    if dbgPipe:
+        os.writeLine(dbgFile, "[backend] stage1: pre_skip_flags_start")
+        os.c_fflush dbgFile
+    let rootPhaseRes: Result[Node] =
+        uirCoreFileExecAdvanceAstPhases(root0Id, diags, dbgPipe, dbgConstFile, dbgFile,
+                                        profOn, profMark, profSem, profMono, profOwn,
+                                        mm0, strictOn0, ownDiags, borrowIrMode)
+    if !IsOk[Node](rootPhaseRes):
+        return ErrInfo[UirCoreModule](ErrorInfoOf[Node](rootPhaseRes))
+    let root: Node = Value[Node](rootPhaseRes)
+
+    if profOn:
+        var profParts: str[]
+        add(profParts, "[stage1] profile: lex=")
+        add(profParts, int64ToStr(profLex / 1000000))
+        add(profParts, "ms load=")
+        add(profParts, int64ToStr(profLoad / 1000000))
+        add(profParts, "ms sem=")
+        add(profParts, int64ToStr(profSem / 1000000))
+        add(profParts, "ms mono=")
+        add(profParts, int64ToStr(profMono / 1000000))
+        add(profParts, "ms ownership=")
+        add(profParts, int64ToStr(profOwn / 1000000))
+        add(profParts, "ms outline_parse=")
+        add(profParts, int64ToStr(profOutlineParse / 1000000))
+        add(profParts, "ms materialize_bodies=")
+        add(profParts, int64ToStr(profMaterializeBodies / 1000000))
+        add(profParts, "ms merge_module=")
+        add(profParts, int64ToStr(profMergeModule / 1000000))
+        add(profParts, "ms borrow_ir=")
+        add(profParts, borrowIrMode)
+        add(profParts, " generic_lowering=")
+        add(profParts, genericLoweringMode)
+        add(profParts, " total=")
+        add(profParts, int64ToStr((cheng_monotime_ns() - profStart) / 1000000))
+        add(profParts, "ms")
+        let profLine: str = fmt(profParts)
+        echo profLine
+
+    let modPhaseRes: Result[UirCoreModule] =
+        uirCoreFileExecBuildModulePhase(root, dbgPipe, dbgConstFile, dbgFile,
+                                        profOn, profFnTasks, borrowIrMode)
+    if !IsOk[UirCoreModule](modPhaseRes):
+        return ErrInfo[UirCoreModule](ErrorInfoOf[UirCoreModule](modPhaseRes))
+    return modPhaseRes
+
+fn uirCoreFileExecPipelineBuildModuleFromFileStage1OrPanic(inPath: str, target: str): UirCoreModule =
+    let uirCoreRes: Result[UirCoreModule] = uirCoreFileExecPipelineBuildModuleFromFileStage1(inPath, target)
+    if !IsOk[UirCoreModule](uirCoreRes):
+        let info0: ErrorInfo = ErrorInfoOf[UirCoreModule](uirCoreRes)
+        panic(ErrorMessage(info0))
+    let mod: UirCoreModule = Value[UirCoreModule](uirCoreRes)
+    if mod == nil:
+        panic("uirCore_builder: build ok(nil) input=" + inPath)
+    return mod

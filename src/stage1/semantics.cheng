@@ -1156,22 +1156,13 @@ fn semShouldEnforceStdNoPointer(): bool =
     return true
 
 fn semShouldEnforceNonCAbiNoPointer(): bool =
-    # Legacy env name kept for compatibility; the gate now covers all
-    # user-visible source modules, including C ABI declarations.
-    let nonCAbiEnv: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI"
-    if semStrEq(nonCAbiEnv, "1"):
-        return true
-    if semStrEq(nonCAbiEnv, "0"):
-        return false
+    # Public no-pointer policy is no longer controlled by legacy env names.
+    # User-visible source modules are always checked here.
     return true
 
 fn semShouldEnforceNonCAbiNoPointerInternal(): bool =
-    let internalEnv: str = getEnv "STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL"
-    if semStrEq(internalEnv, "1"):
-        return true
-    if semStrEq(internalEnv, "0"):
-        return false
-    return semShouldEnforceNonCAbiNoPointer()
+    # Compiler-internal handling is path-based now; legacy env toggles are ignored.
+    return false
 
 fn semIsStdPointerPolicyExempt(path: str): bool =
     if len(path) == 0:
@@ -1349,8 +1340,9 @@ fn semPointerPolicyShouldCheckNonCAbi(path: str): bool =
     let strictStdNoPointer: bool = semStrEq(getEnv "STAGE1_STD_NO_POINTERS_STRICT", "1")
     if semIsStdModulePath(path) && !strictStdNoPointer:
         return false
-    # ZRPC hard gate: compiler-internal modules are checked too.
-    if semIsCompilerInternalModulePath(path) && !semShouldEnforceNonCAbiNoPointerInternal():
+    # Compiler-internal modules no longer depend on a public env toggle here.
+    # Their low-level surfaces are constrained by dedicated rawptr/bridge gates.
+    if semIsCompilerInternalModulePath(path):
         return false
     return true
 
@@ -2774,7 +2766,7 @@ fn semIdentNameNormalized(n: Node): str =
     if idx >= 0 && idx < semIdentNormReady.len && semIdentNormReady[idx]:
         return semReadStr(semIdentNormValues, idx)
     let textId: int32 = nodeIdentId(n)
-    var nm: str = ""
+    var nm: str
     if textId > 0:
         nm = semNormalizedNameFromTextId("", textId)
     else:
@@ -3475,7 +3467,9 @@ fn semFnHasAnnotation(n: Node, annName: str): bool =
     return false
 
 fn semBorrowAllowAddWithTextId(ctx: var SemCtx, name: str, textId: int32) =
-    let nm: str = textId > 0 ? "" : semNormalizeName(name)
+    var nm: str
+    if textId <= 0:
+        nm = semNormalizeName(name)
     semBorrowAllowAddNormalizedWithTextId(ctx, nm, textId)
 
 fn semBorrowAllowAddNormalizedWithTextId(ctx: var SemCtx, nm: str, textId: int32) =
@@ -3509,7 +3503,9 @@ fn semBorrowAllowAdd(ctx: var SemCtx, name: str) =
     semBorrowAllowAddWithTextId(ctx, name, 0)
 
 fn semBorrowEscapeAddWithTextId(ctx: var SemCtx, name: str, textId: int32) =
-    let nm: str = textId > 0 ? "" : semNormalizeName(name)
+    var nm: str
+    if textId <= 0:
+        nm = semNormalizeName(name)
     semBorrowEscapeAddNormalizedWithTextId(ctx, nm, textId)
 
 fn semBorrowEscapeAddNormalizedWithTextId(ctx: var SemCtx, nm: str, textId: int32) =
@@ -4303,7 +4299,9 @@ fn semIsGenericParamType(ctx: var SemCtx, typeNode: Node): bool =
     return res
 
 fn semFnSigAddWithTextId(ctx: var SemCtx, name: str, textId: int32, paramsNode: Node) =
-    let nm: str = textId > 0 ? "" : semNormalizeName(name)
+    var nm: str
+    if textId <= 0:
+        nm = semNormalizeName(name)
     semFnSigAddNormalizedWithTextId(ctx, nm, textId, paramsNode)
 
 fn semFnSigAddNormalizedWithTextId(ctx: var SemCtx, nm: str, textId: int32, paramsNode: Node) =
@@ -4334,7 +4332,7 @@ fn semFnSigAddNormalizedWithTextId(ctx: var SemCtx, nm: str, textId: int32, para
                 for j in 0..<namesN:
                     let pnameNode: Node = kid(defs, j)
                     let pnameTextId: int32 = nodeIdentId(pnameNode)
-                    var pname: str = ""
+                    var pname: str
                     if pnameTextId > 0:
                         pname = semNormalizedNameFromTextId("", pnameTextId)
                     else:
@@ -4649,8 +4647,14 @@ fn semBorrowMarkNormalizedWithOriginAndTextIds(ctx: var SemCtx, nm: str, textId:
     semBorrowEpoch = semBorrowEpoch + 1
 
 fn semBorrowMarkWithOriginAndTextIds(ctx: var SemCtx, name: str, textId: int32, borrowed: bool, origin: str, originTextId: int32) =
-    let nm: str = semNormalizedTextIdOrName(textId, textId > 0 ? "" : name)
-    let onm: str = semNormalizedTextIdOrName(originTextId, originTextId > 0 ? "" : origin)
+    var nameHint: str
+    if textId <= 0:
+        nameHint = name
+    var originHint: str
+    if originTextId <= 0:
+        originHint = origin
+    let nm: str = semNormalizedTextIdOrName(textId, nameHint)
+    let onm: str = semNormalizedTextIdOrName(originTextId, originHint)
     semBorrowMarkNormalizedWithOriginAndTextIds(ctx, nm, textId, borrowed, onm, originTextId)
 
 fn semBorrowMarkWithOriginAndTextId(ctx: var SemCtx, name: str, textId: int32, borrowed: bool, origin: str) =
@@ -4665,8 +4669,14 @@ fn semBorrowMarkNodeWithOriginAndTextId(ctx: var SemCtx, n: Node, borrowed: bool
     if nodeKind(n) != nkIdent && nodeKind(n) != nkSymbol:
         return
     let textId: int32 = nodeIdentId(n)
-    let nm: str = semNormalizedTextIdOrName(textId, textId > 0 ? "" : nodeIdent(n))
-    let onm: str = semNormalizedTextIdOrName(originTextId, originTextId > 0 ? "" : origin)
+    var nameHint: str
+    if textId <= 0:
+        nameHint = nodeIdent(n)
+    var originHint: str
+    if originTextId <= 0:
+        originHint = origin
+    let nm: str = semNormalizedTextIdOrName(textId, nameHint)
+    let onm: str = semNormalizedTextIdOrName(originTextId, originHint)
     semBorrowMarkNormalizedWithOriginAndTextIds(ctx, nm, textId, borrowed, onm, originTextId)
 
 fn semBorrowMarkNodeWithOrigin(ctx: var SemCtx, n: Node, borrowed: bool, origin: str) =
@@ -5272,7 +5282,10 @@ fn semCallInfoNormalized(n: Node): SemCallInfo =
         nameNode = kid(callee, 1)
     if stage1AstRefNonNil(nameNode) && (nodeKind(nameNode) == nkIdent || nodeKind(nameNode) == nkSymbol):
         info.nameTextId = semCanonicalTextId("", nodeIdentId(nameNode))
-    info.name = info.nameTextId > 0 ? "" : semNodeNameNormalized(nameNode)
+    if info.nameTextId > 0:
+        info.name = ""
+    else:
+        info.name = semNodeNameNormalized(nameNode)
     info.base = base
     info.flags = semCallNameFlagsOfNormalizedWithTextId(info.name, info.nameTextId)
     if astNodeIdValid(nId):
@@ -5340,10 +5353,10 @@ fn semCheckStdNoPointerPolicy(ctx: var SemCtx, rootId: AstNodeId): int32 =
     stackFiles.buffer = nil
     stackFiles.len = 0
     stackFiles.cap = 256
-    var visitedMods: AstNodeId[]
+    var visitedMods: bool[]
     visitedMods.buffer = nil
     visitedMods.len = 0
-    visitedMods.cap = 128
+    visitedMods.cap = 0
     var policyFiles: str[]
     policyFiles.buffer = nil
     policyFiles.len = 0
@@ -5364,7 +5377,7 @@ fn semCheckStdNoPointerPolicy(ctx: var SemCtx, rootId: AstNodeId): int32 =
             continue
         let nKind: NodeKind = astNodeKind(nId)
         if nKind == nkModule || nKind == nkStmtList:
-            if !semMarkNodeIdVisitedList(visitedMods, nId):
+            if !semMarkNodeIdMarked(visitedMods, nId):
                 continue
         let fileName: str = semPolicyNodeFileName(inheritedFile, astNodeStrVal(nId))
         var shouldEnforceStdForFile: bool = false
@@ -5414,10 +5427,10 @@ fn semCheckNoPointerNonCAbiPolicy(ctx: var SemCtx, rootId: AstNodeId): int32 =
     stackFiles.buffer = nil
     stackFiles.len = 0
     stackFiles.cap = 256
-    var visitedMods: AstNodeId[]
+    var visitedMods: bool[]
     visitedMods.buffer = nil
     visitedMods.len = 0
-    visitedMods.cap = 128
+    visitedMods.cap = 0
     add(stackNodes, rootId)
     add(stackFiles, ctx.filename)
     while stackNodes.len > 0:
@@ -5430,7 +5443,7 @@ fn semCheckNoPointerNonCAbiPolicy(ctx: var SemCtx, rootId: AstNodeId): int32 =
             continue
         let nKind: NodeKind = astNodeKind(nId)
         if nKind == nkModule || nKind == nkStmtList:
-            if !semMarkNodeIdVisitedList(visitedMods, nId):
+            if !semMarkNodeIdMarked(visitedMods, nId):
                 continue
         let fileName: str = semPolicyNodeFileName(inheritedFile, astNodeStrVal(nId))
         let policyFile: str = semPolicyNonCAbiFileName(fileName, ctx.filename)
@@ -5846,7 +5859,7 @@ fn semCheckBorrowOriginUse(ctx: var SemCtx, expr: Node) =
     if nodeKind(expr) != nkIdent && nodeKind(expr) != nkSymbol:
         return
     let textId: int32 = semCanonicalTextId("", nodeIdentId(expr))
-    var nm: str = ""
+    var nm: str
     if textId > 0:
         if tokenTextEqLitId(textId, "_"):
             return
@@ -5866,7 +5879,7 @@ fn semCheckBorrowOriginWrite(ctx: var SemCtx, expr: Node) =
     if nodeKind(expr) != nkIdent && nodeKind(expr) != nkSymbol:
         return
     let textId: int32 = semCanonicalTextId("", nodeIdentId(expr))
-    var nm: str = ""
+    var nm: str
     if textId > 0:
         if tokenTextEqLitId(textId, "_"):
             return
@@ -5889,7 +5902,7 @@ fn semCheckVarParamCall(ctx: var SemCtx, callNode: Node, callInfo: SemCallInfo) 
         return
     if !semCallInfoHasName(callInfo):
         return
-    var name: str = ""
+    var name: str
     if semCallInfoDefDepthCached(ctx, callNode, callInfo) > 0:
         return
     let sigIdx: int32 = semCallInfoFnSigFindCached(ctx, callNode, callInfo)
@@ -5967,7 +5980,7 @@ fn semCheckVarParamCall(ctx: var SemCtx, callNode: Node, callInfo: SemCallInfo) 
             continue
         if nodeKind(arg) == nkCallArg && kidCount arg > 1:
             let argNameTextId: int32 = semCallArgNameTextId(arg)
-            var argNameNm: str = ""
+            var argNameNm: str
             var idx: int32 = -1
             if argNameTextId > 0:
                 idx = semFnSigParamIndexNormalizedWithTextId(ctx, sigIdx, "", argNameTextId)
@@ -6145,7 +6158,7 @@ fn semCheckThreadBoundaryCall(ctx: var SemCtx, callNode: Node, callInfo: SemCall
         return
     if !semCallInfoHasName(callInfo):
         return
-    var name: str = ""
+    var name: str
     let isRequiredBoundary: bool = (callInfo.flags & semCallNameFlagThreadBoundary) != 0
     if !isRequiredBoundary && ctx.threadBoundaryNames.len <= 3:
         return
@@ -6222,7 +6235,7 @@ fn semCheckSendCtorCall(ctx: var SemCtx, callNode: Node, callInfo: SemCallInfo) 
        !semCallInfoNameMatches(callInfo, semCallNameIdRwLockNew, "rwLockNew") &&
        !semCallInfoNameMatches(callInfo, semCallNameIdAtomicNew, "atomicNew"):
         return
-    var name: str = ""
+    var name: str
     var posIdx: int32 = 0
     for i in 1..<count:
         let arg: Node = kid(callNode, i)
@@ -6675,8 +6688,10 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
     stack.buffer = nil
     stack.len = 0
     stack.cap = 16
-    var visited: AstNodeId[]
-    visited.cap = 16
+    var visited: bool[]
+    visited.buffer = nil
+    visited.len = 0
+    visited.cap = 0
     add(stack, root)
     let oldGlobalCollectMode: bool = semGlobalCollectMode
     semGlobalCollectMode = true
@@ -6696,7 +6711,7 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
             if nodeKind(cur) != nkStmtList:
                 continue
         if nodeKind(cur) == nkModule:
-            if !semMarkNodeIdVisitedList(visited, cur):
+            if !semMarkNodeIdMarked(visited, cur):
                 continue
         if progressOn:
             semProgressMaybe(nodeKind(cur), nodePos(cur), "collect-globals")
@@ -6712,7 +6727,9 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
                 if kidCount n > 0:
                     let nameNode: Node = kid(n, 0)
                     let fnTextId: int32 = nodeIdentId(nameNode)
-                    let fnNameNorm: str = fnTextId > 0 ? "" : semNodeNameNormalized(nameNode)
+                    var fnNameNorm: str
+                    if fnTextId <= 0:
+                        fnNameNorm = semNodeNameNormalized(nameNode)
                     let fnHasName: bool = fnTextId > 0 || fnNameNorm != ""
                     defineSemNameNormalizedWithTextId(ctx, fnNameNorm, fnTextId)
                     if kidCount n > 1:
@@ -6734,7 +6751,10 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
                 if kidCount n > 0:
                     let typeName: Node = kid(n, 0)
                     let typeTextId: int32 = nodeIdentId(typeName)
-                    defineSemNameNormalizedWithTextId(ctx, typeTextId > 0 ? "" : semNodeNameNormalized(typeName), typeTextId)
+                    var typeNameNorm: str
+                    if typeTextId <= 0:
+                        typeNameNorm = semNodeNameNormalized(typeName)
+                    defineSemNameNormalizedWithTextId(ctx, typeNameNorm, typeTextId)
                 if kidCount n > 1:
                     let def: Node = kid(n, 1)
                     if stage1AstRefNonNil(def):
@@ -6746,7 +6766,10 @@ fn semCollectGlobals(ctx: var SemCtx, root: Node) =
                                         if kidCount f > 0:
                                             let fieldName: Node = kid(f, 0)
                                             let fieldTextId: int32 = nodeIdentId(fieldName)
-                                            defineSemNameNormalizedWithTextId(ctx, fieldTextId > 0 ? "" : semNodeNameNormalized(fieldName), fieldTextId)
+                                            var fieldNameNorm: str
+                                            if fieldTextId <= 0:
+                                                fieldNameNorm = semNodeNameNormalized(fieldName)
+                                            defineSemNameNormalizedWithTextId(ctx, fieldNameNorm, fieldTextId)
             of nkLet, nkVar, nkConst:
                 if kidCount n > 0:
                     semDefinePattern(ctx, kid(n, 0))
@@ -6861,7 +6884,10 @@ fn semDefineImportItem(ctx: var SemCtx, item: Node) =
         if kidCount item > 1:
             let aliasNode: Node = kid(item, 1)
             let aliasTextId: int32 = nodeIdentId(aliasNode)
-            defineSemNameNormalizedWithTextId(ctx, aliasTextId > 0 ? "" : semNodeNameNormalized(aliasNode), aliasTextId)
+            var aliasNameNorm: str
+            if aliasTextId <= 0:
+                aliasNameNorm = semNodeNameNormalized(aliasNode)
+            defineSemNameNormalizedWithTextId(ctx, aliasNameNorm, aliasTextId)
         elif kidCount item > 0:
             semDefineImportedModuleNameId(ctx, plainNameId(kid(item, 0)))
     of nkImportGroup:
@@ -7125,7 +7151,10 @@ fn semAnalyzeRoutine(ctx: var SemCtx, n: Node) =
                 if stage1AstRefNonNil(gdef) && nodeKind(gdef) == nkIdentDefs && kidCount gdef > 0:
                     let gnameNode: Node = kid(gdef, 0)
                     let gtextId: int32 = nodeIdentId(gnameNode)
-                    let gname: str = semNormalizedTextIdOrName(gtextId, gtextId > 0 ? "" : plainName(gnameNode))
+                    var gnameHint: str
+                    if gtextId <= 0:
+                        gnameHint = plainName(gnameNode)
+                    let gname: str = semNormalizedTextIdOrName(gtextId, gnameHint)
                     semGenericParamAddWithTextId(ctx, gname, gtextId)
     if kidCount n > 1:
         let fp: Node = kid(n, 1)
@@ -7144,7 +7173,10 @@ fn semAnalyzeRoutine(ctx: var SemCtx, n: Node) =
                                 for j in 0..<namesN:
                                     let pnameNode: Node = kid(d, j)
                                     let ptextId: int32 = nodeIdentId(pnameNode)
-                                    let pname: str = semNormalizedTextIdOrName(ptextId, ptextId > 0 ? "" : plainName(pnameNode))
+                                    var pnameHint: str
+                                    if ptextId <= 0:
+                                        pnameHint = plainName(pnameNode)
+                                    let pname: str = semNormalizedTextIdOrName(ptextId, pnameHint)
                                     semGenericValueParamAddWithTextId(ctx, pname, ptextId)
             semMarkVarParamBorrow(ctx, fp)
             semMarkParamSend(ctx, fp)

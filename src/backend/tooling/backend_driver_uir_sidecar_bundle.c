@@ -11,6 +11,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef CHENG_BACKEND_UIR_SIDECAR_WRAPPER
+#define CHENG_BACKEND_UIR_SIDECAR_WRAPPER 1
+#endif
+
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -1497,7 +1501,7 @@ static int32_t driver_sidecar_exec_obj_compile(const DriverUirSidecarHandle *h,
       {"STAGE1_AUTO_SYSTEM", "0"},
       {"BACKEND_BUILD_TRACK", "dev"},
       {"BACKEND_ALLOW_DIRECT_DRIVER", "1"},
-      {"BACKEND_WHOLE_PROGRAM", "1"},
+      {"BACKEND_WHOLE_PROGRAM", "0"},
       {"BACKEND_STAGE1_PARSE_MODE", NULL},
       {"BACKEND_FN_SCHED", NULL},
       {"BACKEND_DIRECT_EXE", NULL},
@@ -1818,4 +1822,68 @@ int32_t backend_driver_c_sidecar_emit_obj_from_module_default_impl(void *module,
   int32_t rc = driver_sidecar_exec_obj_compile(h, target, out_path);
   driver_sidecar_free_handle(h);
   return rc;
+}
+
+__attribute__((visibility("default")))
+void *driver_buildActiveModulePtrs(void *input_raw, void *target_raw) {
+  return backend_driver_c_sidecar_buildActiveModulePtrs(input_raw, target_raw);
+}
+
+__attribute__((visibility("default")))
+void *driver_export_buildActiveModulePtrs(void *input_raw, void *target_raw) {
+  return backend_driver_c_sidecar_buildActiveModulePtrs(input_raw, target_raw);
+}
+
+__attribute__((visibility("default")))
+void *driver_buildModuleFromFileStage1TargetRetained(const char *input_raw,
+                                                     const char *target_raw) {
+  return backend_driver_c_sidecar_buildActiveModulePtrs((void *)input_raw, (void *)target_raw);
+}
+
+__attribute__((visibility("default")))
+void *driver_export_buildModuleFromFileStage1TargetRetained(const char *input_raw,
+                                                            const char *target_raw) {
+  return backend_driver_c_sidecar_buildActiveModulePtrs((void *)input_raw, (void *)target_raw);
+}
+
+__attribute__((visibility("default")))
+void *driver_buildModuleFromFileStage1Retained(const char *input_raw) {
+  return backend_driver_c_sidecar_buildActiveModulePtrs((void *)input_raw, (void *)"");
+}
+
+__attribute__((visibility("default")))
+void *driver_export_buildModuleFromFileStage1Retained(const char *input_raw) {
+  return backend_driver_c_sidecar_buildActiveModulePtrs((void *)input_raw, (void *)"");
+}
+
+__attribute__((visibility("default")))
+int32_t driver_emit_obj_from_module_default_impl(void *module,
+                                                 const char *target,
+                                                 const char *out_path) {
+  return backend_driver_c_sidecar_emit_obj_from_module_default_impl(module, target, out_path);
+}
+
+__attribute__((visibility("default")))
+int32_t driver_export_emit_obj_from_module_default_impl(void *module,
+                                                        const char *target,
+                                                        const char *out_path) {
+  return backend_driver_c_sidecar_emit_obj_from_module_default_impl(module, target, out_path);
+}
+
+__attribute__((visibility("default")))
+int32_t driver_build_emit_obj_from_file_stage1_target_impl(const char *input_raw,
+                                                           const char *target_raw,
+                                                           const char *out_path) {
+  void *module = backend_driver_c_sidecar_buildActiveModulePtrs((void *)input_raw, (void *)target_raw);
+  if (module == NULL) return -33;
+  return backend_driver_c_sidecar_emit_obj_from_module_default_impl(module, target_raw, out_path);
+}
+
+__attribute__((visibility("default")))
+int32_t driver_export_build_emit_obj_from_file_stage1_target_impl(const char *input_raw,
+                                                                  const char *target_raw,
+                                                                  const char *out_path) {
+  void *module = backend_driver_c_sidecar_buildActiveModulePtrs((void *)input_raw, (void *)target_raw);
+  if (module == NULL) return -33;
+  return backend_driver_c_sidecar_emit_obj_from_module_default_impl(module, target_raw, out_path);
 }

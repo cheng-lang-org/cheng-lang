@@ -154,6 +154,70 @@ strict_stage0_expected_label() {
   printf '\n'
 }
 
+strict_stage0_expected_input() {
+  driver_path="$1"
+  case "$(strict_stage0_expected_label "$driver_path")" in
+    currentsrc.proof.bootstrap)
+      printf '%s\n' "src/backend/tooling/backend_driver_proof.cheng"
+      return 0
+      ;;
+    stage1|stage2|stage2.proof)
+      printf '%s\n' "src/backend/tooling/backend_driver.cheng"
+      return 0
+      ;;
+  esac
+  printf '\n'
+}
+
+strict_stage0_direct_export_driver_path() {
+  driver_path="$1"
+  case "$driver_path" in
+    *.proof)
+      outer_driver="$(strict_stage0_meta_field "${driver_path}.meta" "outer_driver")"
+      if [ "$outer_driver" != "" ]; then
+        printf '%s\n' "$outer_driver"
+        return 0
+      fi
+      ;;
+  esac
+  printf '%s\n' "$driver_path"
+}
+
+strict_stage0_direct_export_surface_ok() {
+  driver_path="$1"
+  export_driver="$(strict_stage0_direct_export_driver_path "$driver_path")"
+  [ "$export_driver" != "" ] || return 1
+  [ -x "$export_driver" ] || return 1
+  command -v nm >/dev/null 2>&1 || return 1
+  command -v awk >/dev/null 2>&1 || return 1
+  surface_log="$(mktemp "${TMPDIR:-/tmp}/strict_stage0_nm.XXXXXX")"
+  set +e
+  (nm -gU "$export_driver" 2>/dev/null || nm "$export_driver" 2>/dev/null) >"$surface_log"
+  nm_status="$?"
+  set -e
+  if [ "$nm_status" -ne 0 ]; then
+    rm -f "$surface_log"
+    return 1
+  fi
+  if ! awk '
+    BEGIN { need1=0; need2=0; need3=0; legacy=0; }
+    {
+      sym=$NF;
+      gsub(/^_+/, "", sym);
+      if (sym == "driver_export_build_emit_obj_from_file_stage1_target_impl") need1=1;
+      if (sym == "driver_export_prefer_sidecar_builds") need2=1;
+      if (sym == "driver_export_buildModuleFromFileStage1TargetRetained") need3=1;
+      if (sym ~ /^driverProof/) legacy=1;
+    }
+    END { exit((need1 && need2 && need3 && !legacy) ? 0 : 1); }
+  ' "$surface_log"; then
+    rm -f "$surface_log"
+    return 1
+  fi
+  rm -f "$surface_log"
+  return 0
+}
+
 strict_stage0_meta_ok() {
   driver_path="$1"
   if ! strict_stage0_published_surface "$driver_path" && ! strict_stage0_bootstrap_surface "$driver_path"; then
@@ -167,6 +231,13 @@ strict_stage0_meta_ok() {
   [ "$(strict_stage0_meta_field "$meta_path" "label")" = "$expected_label" ] || return 1
   meta_outer_driver="$(strict_stage0_meta_field "$meta_path" "outer_driver")"
   case "$expected_label" in
+    currentsrc.proof.bootstrap)
+      [ "$meta_outer_driver" != "" ] || return 1
+      [ -x "$meta_outer_driver" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_mode")" = "cheng" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_bundle")" != "" ] || return 1
+      [ "$(strict_stage0_meta_field "$meta_path" "sidecar_compiler")" != "" ] || return 1
+      ;;
     stage2.proof)
       [ "$meta_outer_driver" != "" ] || return 1
       [ -x "$meta_outer_driver" ] || return 1
@@ -178,11 +249,12 @@ strict_stage0_meta_ok() {
       [ "$meta_outer_driver" = "$driver_path" ] || return 1
       ;;
   esac
-  [ "$(strict_stage0_meta_field "$meta_path" "driver_input")" = "src/backend/tooling/backend_driver_proof.cheng" ] || return 1
+  [ "$(strict_stage0_meta_field "$meta_path" "driver_input")" = "$(strict_stage0_expected_input "$driver_path")" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "stage1_ownership_fixed_0_effective")" = "0" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "stage1_ownership_fixed_0_default")" = "0" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "generic_mode")" = "dict" ] || return 1
   [ "$(strict_stage0_meta_field "$meta_path" "generic_lowering")" = "mir_dict" ] || return 1
+  strict_stage0_direct_export_surface_ok "$driver_path" || return 1
   return 0
 }
 
@@ -338,6 +410,7 @@ compiler_template="$root/src/tooling/cheng_tooling_embedded_scripts/backend_driv
 wrapper_source="$root/src/backend/tooling/backend_driver_uir_sidecar_wrapper.cheng"
 helper_source="$root/src/backend/tooling/backend_driver_uir_sidecar_bundle.c"
 outer_source="$root/src/backend/tooling/backend_driver_sidecar_outer_main.c"
+outer_exports_source="$root/src/backend/tooling/backend_driver_sidecar_outer_exports.c"
 runtime_source="$root/src/runtime/native/system_helpers.c"
 
 compiler_path="$cache_dir/backend_driver_currentsrc_sidecar_wrapper.$target.sh"
@@ -421,12 +494,23 @@ sidecar_real_driver=$bootstrap_driver
 EOF
 
 run_timeout "$compile_timeout_budget" cc \
+  -fPIC \
+  -c "$helper_source" \
+  -o "$helper_obj"
+[ -s "$helper_obj" ] || {
+  echo "[verify_backend_sidecar_cheng_fresh] missing helper object: $helper_obj" 1>&2
+  exit 1
+}
+
+run_timeout "$compile_timeout_budget" cc \
   -std=c11 \
   -Wno-deprecated-declarations \
   -O0 \
   -Wl,-export_dynamic \
   "$outer_source" \
+  "$outer_exports_source" \
   "$runtime_source" \
+  "$helper_obj" \
   -o "$outer_driver"
 [ -x "$outer_driver" ] || {
   echo "[verify_backend_sidecar_cheng_fresh] missing outer driver output: $outer_driver" 1>&2
@@ -435,12 +519,6 @@ run_timeout "$compile_timeout_budget" cc \
 
 wrapper_compile_log="$out_dir/wrapper_source.compile.log"
 wrapper_sample_prefix="$out_dir/wrapper_source.timeout"
-bootstrap_driver_meta="${bootstrap_driver}.meta"
-bootstrap_driver_sidecar_mode="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_mode")"
-bootstrap_driver_sidecar_bundle="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_bundle")"
-bootstrap_driver_sidecar_compiler="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_compiler")"
-bootstrap_driver_sidecar_child_mode="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_child_mode")"
-bootstrap_driver_sidecar_outer_compiler="$(strict_stage0_meta_field "$bootstrap_driver_meta" "sidecar_outer_compiler")"
 rm -f "$wrapper_compile_log"
 set +e
 run_timeout_capture_sample "$compile_timeout_budget" 1 "$wrapper_sample_prefix" "$wrapper_compile_log" env \
@@ -448,19 +526,17 @@ run_timeout_capture_sample "$compile_timeout_budget" 1 "$wrapper_sample_prefix" 
   MM=orc \
   CACHE=0 \
   BACKEND_BUILD_TRACK=dev \
-  BACKEND_CURRENTSRC_WRAPPER_PRESERVE_SIDECAR=1 \
-  BACKEND_UIR_SIDECAR_MODE="${bootstrap_driver_sidecar_mode:-}" \
-  BACKEND_UIR_SIDECAR_BUNDLE="${bootstrap_driver_sidecar_bundle:-}" \
-  BACKEND_UIR_SIDECAR_COMPILER="${bootstrap_driver_sidecar_compiler:-}" \
-  BACKEND_UIR_SIDECAR_CHILD_MODE="${bootstrap_driver_sidecar_child_mode:-}" \
-  BACKEND_UIR_SIDECAR_OUTER_COMPILER="${bootstrap_driver_sidecar_outer_compiler:-}" \
+  BACKEND_CURRENTSRC_WRAPPER_PRESERVE_SIDECAR=0 \
+  BACKEND_UIR_SIDECAR_DISABLE=1 \
+  BACKEND_UIR_PREFER_SIDECAR=0 \
+  BACKEND_UIR_FORCE_SIDECAR=0 \
   "$compiler_path" "$wrapper_source" \
   --frontend:stage1 \
   --emit:obj \
   --target:"$target" \
   --linker:system \
   --allow-no-main \
-  --whole-program \
+  --no-whole-program \
   --no-multi \
   --no-multi-force \
   --no-incremental \
@@ -485,15 +561,6 @@ set -e
 }
 [ -s "$obj_path" ] || {
   echo "[verify_backend_sidecar_cheng_fresh] missing wrapper object: $obj_path" 1>&2
-  exit 1
-}
-
-run_timeout "$compile_timeout_budget" cc \
-  -fPIC \
-  -c "$helper_source" \
-  -o "$helper_obj"
-[ -s "$helper_obj" ] || {
-  echo "[verify_backend_sidecar_cheng_fresh] missing helper object: $helper_obj" 1>&2
   exit 1
 }
 

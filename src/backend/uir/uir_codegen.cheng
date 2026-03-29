@@ -1,17 +1,65 @@
 # UIR codegen adapter (phase-1): MIR-backed UIR lowering + object emission.
 import std/result
-import std/os
-import std/strings
-import std/rawmem_support
 
-import backend/uir/[uir_types, uir_opt]
-import backend/uir/uir_internal/uir_core_opt2
-import backend/uir/[uir_validate]
+import backend/uir/uir_opt
 import backend/machine/[machine_types, machine_select_aarch64, machine_regalloc]
 import backend/obj/[macho_writer, elf_writer]
 
+@importc("getenv")
+fn uirCodegenGetEnvRaw(name: cstring): cstring
+@importc("ptr_add")
+fn uirCodegenPtrAdd(p: ptr, off: int32): ptr
+
 type
+    UirModule = UirCoreModule
+    UirFunc = UirCoreFunc
     ByteBuf = uint8[]
+
+fn uirCodegenEnvIsTrue(name: cstring): bool =
+    let raw: cstring = uirCodegenGetEnvRaw(name)
+    if raw == nil:
+        return false
+    let c0: char = *(ptr(raw))
+    if c0 != '1':
+        return false
+    let c1: char = *(ptr(uirCodegenPtrAdd(ptr(raw), 1)))
+    return c1 == '\0'
+
+fn uirValidateModule(module: UirModule): Result[bool] =
+    return uirCoreValidateModule(module)
+
+fn uirCanonicalizeModule(module: UirModule) =
+    uirCoreCanonicalizeModule(module)
+
+fn uirFuncBlocksLen(func: UirFunc): int32 =
+    return uirCoreFuncBlocksLen(func)
+
+fn uirFuncIsExtern(func: UirFunc): bool =
+    return uirCoreFuncIsExtern(func)
+
+fn uirModuleHealExternFlags(module: UirModule) =
+    if module == nil:
+        return
+    for fi in 0..<uirModuleFuncsLen(module):
+        let f: UirFunc = uirModuleFuncAt(module, fi)
+        if f == nil:
+            continue
+        uirCoreFuncIsExtern(f)
+
+fn uirFuncNameOf(func: UirFunc): str =
+    return uirCoreFuncNameOf(func)
+
+fn uirFuncLinkNameOf(func: UirFunc): str =
+    return uirCoreFuncLinkNameOf(func)
+
+fn uirModuleFuncsLen(module: UirModule): int32 =
+    return uirCoreModuleFuncsLen(module)
+
+fn uirModuleFuncAt(module: UirModule, idx: int32): UirFunc =
+    return uirCoreModuleFuncAt(module, idx)
+
+fn uirModuleCStringsLen(module: UirModule): int32 =
+    return uirCoreModuleCStringsLen(module)
 
 fn uirTargetIsDarwin(target: str): bool =
     if len(target) == 0:
@@ -136,9 +184,9 @@ fn uirCodegenDebugDumpMainCandidate(module: UirModule, tag: str) =
         echo("[codegen.boot] " + tag + " main_candidate=missing")
 
 fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEnabled: bool, uirSimdMaxWidth: int32, uirSimdPolicy: str): Result[MachineModule] =
-    let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
-    let dbgBoot: bool = os.getEnvDefault("BACKEND_DEBUG_BOOT", "") == "1"
-    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    let dbgCodegen: bool = uirCodegenEnvIsTrue("BACKEND_DEBUG_CODEGEN_STAGE")
+    let dbgBoot: bool = uirCodegenEnvIsTrue("BACKEND_DEBUG_BOOT")
+    let dbgCstr: bool = uirCodegenEnvIsTrue("BACKEND_DEBUG_CSTRING_LOWERING")
     uirModuleHealExternFlags(module)
     if dbgBoot:
         let funcCount0: int32 = uirModuleFuncsLen(module)
@@ -186,7 +234,7 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
         return Err[MachineModule]("uir_codegen: unsupported target arch: " + target)
     let res: Result[MachineModule] = machineSelectAarch64(module)
     if ! IsOk[MachineModule](res):
-        if dbgCodegen || os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+        if dbgCodegen || uirCodegenEnvIsTrue("DIAG_CONTEXT"):
             let err: ErrorInfo = ErrorInfoOf[MachineModule](res)
             echo("[codegen] select.err")
             echo(intToStr(ErrorCodeOf(err)))
@@ -198,7 +246,7 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
     if dbgCodegen:
         echo("[codegen] select.end")
         echo("[codegen] regalloc.begin")
-    let allocated: MachineModule = machineAssignRegisters(res.value)
+    let allocated: MachineModule = machineAssignRegisters(Value[MachineModule](res))
     if dbgBoot:
         let machineFuncCount: int32 = machineModuleFuncsLen(allocated)
         let firstMachineName: str = uirCodegenFirstMachineFuncName(allocated)
@@ -208,7 +256,7 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
     # selector_missing cstring payloads is a hard error; codegen no longer backfills them.
     if machineModuleMissingSelectorCStrings(allocated, moduleCstrCount):
         let machineCstrCount: int32 = machineModuleCstrsLen(allocated)
-        if dbgCstr || dbgCodegen || os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+        if dbgCstr || dbgCodegen || uirCodegenEnvIsTrue("DIAG_CONTEXT"):
             echo("[codegen.cstr] selector_missing expected=" + intToStr(moduleCstrCount) +
                  " actual=" + intToStr(machineCstrCount))
         return Err[MachineModule]("uir_codegen: selector missing cstring payloads expected=" +
@@ -232,7 +280,7 @@ fn uirModuleToMachine(module: UirModule, target: str, optLevel: int32, uirSimdEn
     return Ok[MachineModule](allocated)
 
 fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
-    let objWriter0: str = strings.__cheng_str_clone(objWriterRaw)
+    let objWriter0: str = objWriterRaw
     if len(objWriter0) == 0:
         if uirTargetIsDarwin(target):
             return Ok[str]("macho")
@@ -253,19 +301,19 @@ fn uirResolveObjWriter(target: str, objWriterRaw: str): Result[str] =
     return Ok[str](objWriter)
 
 fn uirEmitObjFromMachine(machine: MachineModule, target: str, objWriter: str): Result[ByteBuf] =
-    let dbgCodegen: bool = os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1"
+    let dbgCodegen: bool = uirCodegenEnvIsTrue("BACKEND_DEBUG_CODEGEN_STAGE")
     if !(machine == nil):
         memRetain(machine)
     let writerRes: Result[str] = uirResolveObjWriter(target, objWriter)
     if !IsOk[str](writerRes):
         return Err[ByteBuf](ErrorFormat(ErrorInfoOf[str](writerRes)))
-    let resolvedWriter: str = writerRes.value
+    let resolvedWriter: str = Value[str](writerRes)
     let isAarch64: bool = uirTargetIsAarch64(target)
     if !isAarch64:
         return Err[ByteBuf]("uir_codegen: unsupported target arch: " + target)
     if dbgCodegen:
         echo("[codegen] writer.begin")
-    let dbgCstr: bool = os.getEnvDefault("BACKEND_DEBUG_CSTRING_LOWERING", "") == "1"
+    let dbgCstr: bool = uirCodegenEnvIsTrue("BACKEND_DEBUG_CSTRING_LOWERING")
     if dbgCstr:
         let cCount2: int32 = machineModuleCstrsLen(machine)
         echo("[codegen.cstr] pre-writer cstrs=" + intToStr(cCount2))
@@ -314,7 +362,7 @@ fn uirEmitObjFromModule(module: UirModule, optLevel: int32, target: str, objWrit
     let machineRes: Result[MachineModule] = uirModuleToMachine(module, target, optLevel, uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
     if ! IsOk[MachineModule](machineRes):
         return Err[ByteBuf](ErrorFormat(ErrorInfoOf[MachineModule](machineRes)))
-    return uirEmitObjFromMachine(machineRes.value, target, objWriter)
+    return uirEmitObjFromMachine(Value[MachineModule](machineRes), target, objWriter)
 
 fn uirEmitObjFromModuleOrPanic(module: UirModule, optLevel: int32, target: str, objWriter: str,
                                validateModule: bool,
@@ -324,8 +372,8 @@ fn uirEmitObjFromModuleOrPanic(module: UirModule, optLevel: int32, target: str, 
         uirSimdEnabled, uirSimdMaxWidth, uirSimdPolicy)
     if !IsOk[ByteBuf](res):
         let msg: str = ErrorFormat(ErrorInfoOf[ByteBuf](res))
-        if os.getEnvDefault("BACKEND_DEBUG_CODEGEN_STAGE", "") == "1" || os.getEnvDefault("DIAG_CONTEXT", "") == "1":
+        if uirCodegenEnvIsTrue("BACKEND_DEBUG_CODEGEN_STAGE") || uirCodegenEnvIsTrue("DIAG_CONTEXT"):
             echo("[codegen] writer.error")
             echo(msg)
         panic msg
-    return res.value
+    return Value[ByteBuf](res)

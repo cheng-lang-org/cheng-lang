@@ -1,0 +1,1266 @@
+# Shared builder-local call/type-key/scalar helper aggregation split from uir_core_builder.
+import std/system
+import std/os
+import std/rawmem_support
+import std/seqs
+import stage1/ast
+import stage1/token
+import stage1/lexer
+import stage1/monomorphize
+import backend/uir/uir_internal/uir_core_types
+import backend/uir/uir_internal/uir_core_builder_base_helpers
+import backend/uir/uir_internal/uir_core_builder_symbol_state
+
+fn uirCoreAppendNode(seqInst: Node[]*, val: Node) =
+    if seqInst == nil:
+        return
+    let idx: int32 = seqInst->len
+    let needLen: int32 = idx + 1
+    if seqInst->buffer == nil || seqInst->cap < needLen:
+        cheng__seqGrowToRaw(&seqInst->buffer, &seqInst->cap, needLen, int32(sizeof Node))
+    seqInst->len = needLen
+    seqInst[idx] = val
+
+fn uirCoreNodeIsFieldDot(node: Node): bool =
+    return astNodeIdValid(node) && nodeKind(node) == nkDotExpr && kidCount(node) > 1
+
+fn uirCoreDotBaseNode(dotNode: Node): Node =
+    if !uirCoreNodeIsFieldDot(dotNode):
+        return nil
+    return kid(dotNode, 0)
+
+fn uirCoreDotFieldNode(dotNode: Node): Node =
+    if !uirCoreNodeIsFieldDot(dotNode):
+        return nil
+    return kid(dotNode, 1)
+
+fn uirCoreAppendBracketTypeArgs(typeArgs: Node[]*, bracketNode: Node) =
+    if typeArgs == nil || !astNodeIdValid(bracketNode) || nodeKind(bracketNode) != nkBracketExpr:
+        return
+    for ti in 1..<kidCount(bracketNode):
+        let t: Node = kid(bracketNode, ti)
+        if astNodeIdValid(t) && nodeKind(t) != nkEmpty:
+            uirCoreAppendNode(typeArgs, t)
+
+fn uirCoreResolveCalleeNameAndTypeArgs(calleeNode: Node, typeArgs: Node[]*): str =
+    if !astNodeIdValid(calleeNode):
+        return ""
+    if nodeKind(calleeNode) == nkBracketExpr && kidCount(calleeNode) > 0:
+        let base: Node = kid(calleeNode, 0)
+        uirCoreAppendBracketTypeArgs(typeArgs, calleeNode)
+        return backendStripSpaces(plainName(base))
+    if uirCoreNodeIsFieldDot(calleeNode):
+        let member: Node = uirCoreDotFieldNode(calleeNode)
+        if astNodeIdValid(member) && nodeKind(member) == nkBracketExpr && kidCount(member) > 0:
+            let base2: Node = kid(member, 0)
+            uirCoreAppendBracketTypeArgs(typeArgs, member)
+            return backendStripSpaces(plainName(base2))
+        return backendStripSpaces(plainName(member))
+    if nodeKind(calleeNode) == nkIdent || nodeKind(calleeNode) == nkSymbol:
+        return backendStripSpaces(plainName(calleeNode))
+    return ""
+
+fn uirCoreCallIsNamed(callNode: Node, calleeName: str): bool =
+    if !astNodeIdValid(callNode) || nodeKind(callNode) != nkCall || len(calleeName) == 0 || kidCount(callNode) <= 0:
+        return false
+    let calleeNode: Node = kid(callNode, 0)
+    return uirCoreResolveCalleeNameAndTypeArgs(calleeNode, nil) == calleeName
+
+fn uirCoreCollectCallArgNodes(callNode: Node): Node[] =
+    var out: Node[]
+    if !astNodeIdValid(callNode) || nodeKind(callNode) != nkCall:
+        return out
+    for ai in 1..<kidCount(callNode):
+        var argNode: Node = kid(callNode, ai)
+        if astNodeIdValid(argNode) && nodeKind(argNode) == nkCallArg:
+            if kidCount(argNode) > 1:
+                argNode = kid(argNode, 1)
+            elif kidCount(argNode) > 0:
+                argNode = kid(argNode, 0)
+        uirCoreAppendNode(&out, argNode)
+    return out
+
+fn uirCoreCallCalleeName(callNode: Node): str =
+    if !astNodeIdValid(callNode) || nodeKind(callNode) != nkCall || kidCount(callNode) == 0:
+        return ""
+    let callee: Node = kid(callNode, 0)
+    if (callee == nil):
+        return ""
+    var typeArgs: Node[]
+    let directName: str = uirCoreResolveCalleeNameAndTypeArgs(callee, &typeArgs)
+    if len(directName) > 0:
+        return directName
+    if nodeKind(callee) == nkBracketExpr && kidCount(callee) > 0:
+        let base: Node = kid(callee, 0)
+        if (base != nil) && (nodeKind(base) == nkIdent || nodeKind(base) == nkSymbol):
+            return backendStripSpaces(plainName(base))
+    return ""
+
+fn uirCoreMemberName(n: Node): str =
+    if !astNodeIdValid(n):
+        return ""
+    let nm0: str = backendStripSpaces(plainName(n))
+    if len(nm0) > 0:
+        return nm0
+    let sv0: str = nodeStrVal(n)
+    if len(sv0) > 0:
+        return backendStripSpaces(sv0)
+    if nodeKind(n) == nkBracketExpr && kidCount(n) > 0:
+        let base0: Node = kid(n, 0)
+        let baseNm0: str = uirCoreMemberName(base0)
+        if len(baseNm0) > 0:
+            return baseNm0
+    if kidCount(n) == 1:
+        return uirCoreMemberName(kid(n, 0))
+    if kidCount(n) > 1:
+        let tail0: Node = kid(n, kidCount(n) - 1)
+        let tailNm0: str = uirCoreMemberName(tail0)
+        if len(tailNm0) > 0:
+            return tailNm0
+        let head0: Node = kid(n, 0)
+        let headNm0: str = uirCoreMemberName(head0)
+        if len(headNm0) > 0:
+            return headNm0
+    return ""
+
+fn uirCoreGuessDotFieldNameFromSource(func0: UirCoreFunc, dotNode: Node): str =
+    if func0 == nil:
+        return ""
+    let fp: str = uirCoreFuncOriginFileOf(func0)
+    if len(fp) == 0:
+        return ""
+    let lineNo: int32 = nodePosLine(dotNode)
+    let colNo: int32 = nodePosCol(dotNode)
+    if lineNo <= 0 || colNo <= 0:
+        return ""
+    let src: str = os.readFile(fp)
+    if len(src) == 0:
+        return ""
+    var curLine: int32 = 1
+    var lineStart: int32 = 0
+    var i: int32 = 0
+    while i < len(src) && curLine < lineNo:
+        if src[i] == '\n':
+            curLine = curLine + 1
+            lineStart = i + 1
+        i = i + 1
+    if curLine != lineNo:
+        return ""
+    var dotIdx: int32 = lineStart + colNo - 1
+    if dotIdx < lineStart || dotIdx >= len(src):
+        return ""
+    var fieldStartIdx: int32 = -1
+    if src[dotIdx] == '.':
+        fieldStartIdx = dotIdx + 1
+    elif src[dotIdx] == '-' && dotIdx + 1 < len(src) && src[dotIdx + 1] == '>':
+        fieldStartIdx = dotIdx + 2
+    if fieldStartIdx < 0:
+        var lineEnd: int32 = dotIdx
+        while lineEnd < len(src) && src[lineEnd] != '\n':
+            lineEnd = lineEnd + 1
+        var leftOp: int32 = dotIdx
+        while leftOp >= lineStart:
+            if src[leftOp] == '.':
+                break
+            if src[leftOp] == '-' && leftOp + 1 < lineEnd && src[leftOp + 1] == '>':
+                break
+            leftOp = leftOp - 1
+        var rightOp: int32 = dotIdx
+        while rightOp < lineEnd:
+            if src[rightOp] == '.':
+                break
+            if src[rightOp] == '-' && rightOp + 1 < lineEnd && src[rightOp + 1] == '>':
+                break
+            rightOp = rightOp + 1
+        let leftOk: bool = leftOp >= lineStart &&
+            (src[leftOp] == '.' || (src[leftOp] == '-' && leftOp + 1 < lineEnd && src[leftOp + 1] == '>'))
+        let rightOk: bool = rightOp < lineEnd &&
+            (src[rightOp] == '.' || (src[rightOp] == '-' && rightOp + 1 < lineEnd && src[rightOp + 1] == '>'))
+        if leftOk:
+            if !rightOk:
+                dotIdx = leftOp
+            elif (dotIdx - leftOp) <= (rightOp - dotIdx):
+                dotIdx = leftOp
+            else:
+                dotIdx = rightOp
+        elif rightOk:
+            dotIdx = rightOp
+        else:
+            return ""
+        if src[dotIdx] == '.':
+            fieldStartIdx = dotIdx + 1
+        elif src[dotIdx] == '-' && dotIdx + 1 < lineEnd && src[dotIdx + 1] == '>':
+            fieldStartIdx = dotIdx + 2
+        else:
+            return ""
+    while fieldStartIdx < len(src) && (src[fieldStartIdx] == ' ' || src[fieldStartIdx] == '\t'):
+        fieldStartIdx = fieldStartIdx + 1
+    let start: int32 = fieldStartIdx
+    while fieldStartIdx < len(src):
+        let c: char = src[fieldStartIdx]
+        let okIdent: bool =
+            (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_'
+        if !okIdent:
+            break
+        fieldStartIdx = fieldStartIdx + 1
+    if fieldStartIdx <= start:
+        return ""
+    return sliceRange(src, start, fieldStartIdx - 1)
+
+fn uirCoreGuessIdentNameFromSource(func0: UirCoreFunc, identNode: Node): str =
+    if func0 == nil || !astNodeIdValid(identNode):
+        return ""
+    let fp: str = uirCoreFuncOriginFileOf(func0)
+    if len(fp) == 0:
+        return ""
+    let lineNo: int32 = nodePosLine(identNode)
+    let colNo: int32 = nodePosCol(identNode)
+    if lineNo <= 0 || colNo <= 0:
+        return ""
+    let src: str = os.readFile(fp)
+    if len(src) == 0:
+        return ""
+    var curLine: int32 = 1
+    var lineStart: int32 = 0
+    var i: int32 = 0
+    while i < len(src) && curLine < lineNo:
+        if src[i] == '\n':
+            curLine = curLine + 1
+            lineStart = i + 1
+        i = i + 1
+    if curLine != lineNo:
+        return ""
+    var lineEnd: int32 = lineStart
+    while lineEnd < len(src) && src[lineEnd] != '\n':
+        lineEnd = lineEnd + 1
+    var idx: int32 = lineStart + colNo - 1
+    if idx < lineStart:
+        idx = lineStart
+    if idx >= lineEnd:
+        idx = lineEnd - 1
+    while idx < lineEnd && (src[idx] == ' ' || src[idx] == '\t'):
+        idx = idx + 1
+    let start: int32 = idx
+    while idx < lineEnd:
+        let c: char = src[idx]
+        let okIdent: bool =
+            (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_'
+        if !okIdent:
+            break
+        idx = idx + 1
+    if idx <= start:
+        return ""
+    return sliceRange(src, start, idx - 1)
+
+fn uirCoreSeqBuiltinFieldName(fieldName0: str): str =
+    let fieldName: str = backendStripSpaces(fieldName0)
+    if fieldName == "data":
+        return "buffer"
+    return fieldName
+
+fn uirCoreGuessSeqBuiltinFieldFromSource(func0: UirCoreFunc, dotNode: Node, baseName0: str): str =
+    if func0 == nil || !astNodeIdValid(dotNode):
+        return ""
+    let baseName: str = backendStripSpaces(baseName0)
+    if len(baseName) == 0:
+        return ""
+    let fp: str = uirCoreFuncOriginFileOf(func0)
+    if len(fp) == 0:
+        return ""
+    let lineNo: int32 = nodePosLine(dotNode)
+    let colNo: int32 = nodePosCol(dotNode)
+    if lineNo <= 0 || colNo <= 0:
+        return ""
+    let src: str = os.readFile(fp)
+    if len(src) == 0:
+        return ""
+    var curLine: int32 = 1
+    var lineStart: int32 = 0
+    var i: int32 = 0
+    while i < len(src) && curLine < lineNo:
+        if src[i] == '\n':
+            curLine = curLine + 1
+            lineStart = i + 1
+        i = i + 1
+    if curLine != lineNo:
+        return ""
+    var lineEnd: int32 = lineStart
+    while lineEnd < len(src) && src[lineEnd] != '\n':
+        lineEnd = lineEnd + 1
+    let anchor: int32 = lineStart + colNo - 1
+    var bestFieldStart: int32 = -1
+    var bestFieldEnd: int32 = -1
+    var bestDist: int32 = -1
+    let baseLen: int32 = len(baseName)
+    var idx: int32 = lineStart
+    while idx < lineEnd:
+        var matched: bool = true
+        if idx + baseLen >= lineEnd:
+            break
+        for bi in 0..<baseLen:
+            if src[idx + bi] != baseName[bi]:
+                matched = false
+                break
+        if !matched:
+            idx = idx + 1
+            continue
+        var fieldStart: int32 = -1
+        if src[idx + baseLen] == '.':
+            fieldStart = idx + baseLen + 1
+        elif idx + baseLen + 1 < lineEnd && src[idx + baseLen] == '-' && src[idx + baseLen + 1] == '>':
+            fieldStart = idx + baseLen + 2
+        if fieldStart < 0:
+            idx = idx + 1
+            continue
+        var fieldEnd: int32 = fieldStart
+        while fieldEnd < lineEnd:
+            let c: char = src[fieldEnd]
+            let okIdent: bool =
+                (c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') ||
+                c == '_'
+            if !okIdent:
+                break
+            fieldEnd = fieldEnd + 1
+        if fieldEnd > fieldStart:
+            let cand: str = sliceRange(src, fieldStart, fieldEnd - 1)
+            let builtin: str = uirCoreSeqBuiltinFieldName(cand)
+            if len(builtin) > 0:
+                let dotPos: int32 = idx + baseLen
+                var dist: int32 = dotPos - anchor
+                if dist < 0:
+                    dist = -dist
+                if bestDist < 0 || dist < bestDist:
+                    bestDist = dist
+                    bestFieldStart = fieldStart
+                    bestFieldEnd = fieldEnd - 1
+        idx = idx + 1
+    if bestFieldStart >= 0 && bestFieldEnd >= bestFieldStart:
+        return uirCoreSeqBuiltinFieldName(sliceRange(src, bestFieldStart, bestFieldEnd))
+    return ""
+
+var
+    uirCore_paramKeyCanon_recent_ptr: int64
+    uirCore_paramKeyCanon_recent_raw: str
+    uirCore_paramKeyCanon_recent_norm: str
+    uirCore_paramKeyCanon_recent_valid: bool
+
+    uirCore_paramVarBase_recent_ptr: int64
+    uirCore_paramVarBase_recent_raw: str
+    uirCore_paramVarBase_recent_base: str
+    uirCore_paramVarBase_recent_valid: bool
+
+    uirCore_paramWantsVarAddr_recent_module: UirCoreModule
+    uirCore_paramWantsVarAddr_recent_ptr: int64
+    uirCore_paramWantsVarAddr_recent_raw: str
+    uirCore_paramWantsVarAddr_recent_val: bool
+    uirCore_paramWantsVarAddr_recent_valid: bool
+
+fn uirCoreScalarKeyPtrKey(s: str): int64 =
+    if !uirCoreStrPtrSane(s):
+        return 0
+    return int64(strDataPtr(s))
+
+fn uirCoreKeyHasPtrPrefix(key: str): bool =
+    return len(key) >= 4 && key[0] == 'p' && key[1] == 't' && key[2] == 'r' && key[3] == '_'
+
+fn uirCoreKeyHasRefPrefix(key: str): bool =
+    return len(key) >= 4 && key[0] == 'r' && key[1] == 'e' && key[2] == 'f' && key[3] == '_'
+
+fn uirCoreKeyHasVarPrefix(key: str): bool =
+    return len(key) >= 4 && key[0] == 'v' && key[1] == 'a' && key[2] == 'r' && key[3] == '_'
+
+fn uirCoreKeyHasVarRefPrefix(key: str): bool =
+    return len(key) >= 8 && key[0] == 'v' && key[1] == 'a' && key[2] == 'r' && key[3] == '_' &&
+           key[4] == 'r' && key[5] == 'e' && key[6] == 'f' && key[7] == '_'
+
+fn uirCoreKeyHasFnPrefix(key: str): bool =
+    return len(key) >= 3 && key[0] == 'f' && key[1] == 'n' && key[2] == '_'
+
+fn uirCoreKeyHasSeqPrefix(key: str): bool =
+    return len(key) >= 4 && key[0] == 's' && key[1] == 'e' && key[2] == 'q' && key[3] == '_'
+
+fn uirCoreKeyHasSeqFixedPrefix(key: str): bool =
+    return len(key) >= 10 && key[0] == 's' && key[1] == 'e' && key[2] == 'q' && key[3] == '_' &&
+           key[4] == 'f' && key[5] == 'i' && key[6] == 'x' && key[7] == 'e' &&
+           key[8] == 'd' && key[9] == '_'
+
+fn uirCoreKeyHasTablePrefix(key: str): bool =
+    return len(key) >= 6 && key[0] == 'T' && key[1] == 'a' && key[2] == 'b' &&
+           key[3] == 'l' && key[4] == 'e' && key[5] == '_'
+
+fn uirCoreKeyHasVarargsPrefix(key: str): bool =
+    return len(key) >= 8 && key[0] == 'v' && key[1] == 'a' && key[2] == 'r' && key[3] == 'a' &&
+           key[4] == 'r' && key[5] == 'g' && key[6] == 's' && key[7] == '_'
+
+fn uirCoreParamKeyCanon(paramKey0: str): str =
+    if len(paramKey0) == 0:
+        return ""
+    let ptrKey: int64 = uirCoreScalarKeyPtrKey(paramKey0)
+    if uirCore_paramKeyCanon_recent_valid:
+        if ptrKey != 0 && ptrKey == uirCore_paramKeyCanon_recent_ptr:
+            return uirCore_paramKeyCanon_recent_norm
+        if len(uirCore_paramKeyCanon_recent_raw) > 0 && uirCore_paramKeyCanon_recent_raw == paramKey0:
+            return uirCore_paramKeyCanon_recent_norm
+    let norm: str = backendStripSpaces(paramKey0)
+    uirCore_paramKeyCanon_recent_ptr = ptrKey
+    uirCore_paramKeyCanon_recent_raw = paramKey0
+    uirCore_paramKeyCanon_recent_norm = norm
+    uirCore_paramKeyCanon_recent_valid = true
+    return norm
+
+fn isStringKeyCanon(key: str): bool =
+    if len(key) == 0:
+        return false
+    return (key == "str") || (key == "string") || (key == "cstring")
+
+fn isSemanticStrKeyCanon(key: str): bool =
+    if len(key) == 0:
+        return false
+    return (key == "str") || (key == "string")
+
+fn isPtrKeyCanon(key: str): bool =
+    if len(key) == 0:
+        return false
+    return (key == "ptr") || (key == ("void" + "*"))
+
+fn isStringOrPtrKeyCanon(key: str): bool =
+    return isStringKeyCanon(key) || isPtrKeyCanon(key)
+
+fn isFloat64Key(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return (key == "float64") || (key == "float")
+
+fn isFloat32Key(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return key == "float32"
+
+fn isIntegralUirType(ty: UirCoreType): bool =
+    return uirCoreTypeIsI8(ty) || uirCoreTypeIsI16(ty) ||
+           uirCoreTypeIsI32(ty) || uirCoreTypeIsI64(ty)
+
+fn isStringKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return isStringKeyCanon(key)
+
+fn isSemanticStrKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return isSemanticStrKeyCanon(key)
+
+fn uirCoreNodeIsStringLiteral(node: Node): bool =
+    return astNodeIdValid(node) && astNodeIsStringLiteral(node)
+
+fn uirCoreNodeHasStringCtx(key0: str, node: Node): bool =
+    return isStringKey(key0) || uirCoreNodeIsStringLiteral(node)
+
+fn uirCoreNodeHasSemanticStrCtx(key0: str, node: Node): bool =
+    return isSemanticStrKey(key0) || uirCoreNodeIsStringLiteral(node)
+
+fn isPtrKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return isPtrKeyCanon(key)
+
+fn isStringOrPtrKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return isStringOrPtrKeyCanon(key)
+
+fn isPtrRefVarBareKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return (key == "ptr") || (key == "ref") || (key == "var")
+
+fn isPtrRefVarLikeKey(key0: str): bool =
+    if len(key0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(key0)
+    return uirCoreKeyHasPtrPrefix(key) || uirCoreKeyHasRefPrefix(key) ||
+           uirCoreKeyHasVarPrefix(key) || uirCoreKeyHasVarRefPrefix(key) ||
+           isPtrRefVarBareKey(key)
+
+fn uirCoreParamIsVarKey(paramKey0: str): bool =
+    if len(paramKey0) == 0:
+        return false
+    let key: str = uirCoreParamKeyCanon(paramKey0)
+    return (key == "var") || uirCoreKeyHasVarPrefix(key) || uirCoreKeyHasVarRefPrefix(key)
+
+fn uirCoreParamVarBaseKey(paramKey0: str): str =
+    if len(paramKey0) == 0:
+        return ""
+    let ptrKey: int64 = uirCoreScalarKeyPtrKey(paramKey0)
+    if uirCore_paramVarBase_recent_valid:
+        if ptrKey != 0 && ptrKey == uirCore_paramVarBase_recent_ptr:
+            return uirCore_paramVarBase_recent_base
+        if len(uirCore_paramVarBase_recent_raw) > 0 && uirCore_paramVarBase_recent_raw == paramKey0:
+            return uirCore_paramVarBase_recent_base
+    let key: str = uirCoreParamKeyCanon(paramKey0)
+    if uirCoreKeyHasVarRefPrefix(key):
+        let baseKey: str = rawmemStrFromOffset(key, 8)
+        uirCore_paramVarBase_recent_ptr = ptrKey
+        uirCore_paramVarBase_recent_raw = paramKey0
+        uirCore_paramVarBase_recent_base = baseKey
+        uirCore_paramVarBase_recent_valid = true
+        return baseKey
+    if uirCoreKeyHasVarPrefix(key):
+        let baseKey2: str = rawmemStrFromOffset(key, 4)
+        uirCore_paramVarBase_recent_ptr = ptrKey
+        uirCore_paramVarBase_recent_raw = paramKey0
+        uirCore_paramVarBase_recent_base = baseKey2
+        uirCore_paramVarBase_recent_valid = true
+        return baseKey2
+    uirCore_paramVarBase_recent_ptr = ptrKey
+    uirCore_paramVarBase_recent_raw = paramKey0
+    uirCore_paramVarBase_recent_base = ""
+    uirCore_paramVarBase_recent_valid = true
+    return ""
+
+fn uirCoreParamWantsVarAddr(module: UirCoreModule, paramKey0: str): bool =
+    if len(paramKey0) == 0:
+        return false
+    let ptrKey: int64 = uirCoreScalarKeyPtrKey(paramKey0)
+    if uirCore_paramWantsVarAddr_recent_valid &&
+       uirCore_paramWantsVarAddr_recent_module == module:
+        if ptrKey != 0 && ptrKey == uirCore_paramWantsVarAddr_recent_ptr:
+            return uirCore_paramWantsVarAddr_recent_val
+        if len(uirCore_paramWantsVarAddr_recent_raw) > 0 &&
+           uirCore_paramWantsVarAddr_recent_raw == paramKey0:
+            return uirCore_paramWantsVarAddr_recent_val
+    let key: str = uirCoreParamKeyCanon(paramKey0)
+    if len(key) == 0:
+        return false
+    if key == "var":
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = true
+        uirCore_paramWantsVarAddr_recent_valid = true
+        return true
+    let baseKey: str = uirCoreParamVarBaseKey(key)
+    if len(baseKey) == 0:
+        let out0: bool = uirCoreParamIsVarKey(key)
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = out0
+        uirCore_paramWantsVarAddr_recent_valid = true
+        return out0
+    if module == nil:
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = true
+        uirCore_paramWantsVarAddr_recent_valid = true
+        return true
+    if uirCoreHasObjType(module, baseKey):
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = true
+        uirCore_paramWantsVarAddr_recent_valid = true
+        return true
+    if uirCoreKeyHasSeqPrefix(baseKey) && uirCoreHasObjType(module, "seq"):
+        uirCore_paramWantsVarAddr_recent_module = module
+        uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+        uirCore_paramWantsVarAddr_recent_raw = paramKey0
+        uirCore_paramWantsVarAddr_recent_val = false
+        uirCore_paramWantsVarAddr_recent_valid = true
+        return false
+    uirCore_paramWantsVarAddr_recent_module = module
+    uirCore_paramWantsVarAddr_recent_ptr = ptrKey
+    uirCore_paramWantsVarAddr_recent_raw = paramKey0
+    uirCore_paramWantsVarAddr_recent_val = true
+    uirCore_paramWantsVarAddr_recent_valid = true
+    return true
+
+fn uirCoreStripRefVarKeyOnce(key0: str): str =
+    let key: str = uirCoreParamKeyCanon(key0)
+    if len(key) == 0:
+        return ""
+    if uirCoreKeyHasRefPrefix(key):
+        return rawmemStrFromOffset(key, 4)
+    let varBase: str = uirCoreParamVarBaseKey(key)
+    if len(varBase) > 0:
+        return varBase
+    return key
+
+fn uirCoreStripPtrKeyOnce(key0: str): str =
+    let key: str = uirCoreParamKeyCanon(key0)
+    if len(key) == 0:
+        return ""
+    if uirCoreKeyHasPtrPrefix(key):
+        return rawmemStrFromOffset(key, 4)
+    return key
+
+fn uirCoreNormalizeObjLookupKey(module: UirCoreModule, key0: str): str =
+    var key: str = uirCoreStripRefVarKeyOnce(key0)
+    if len(key) == 0:
+        return ""
+    if module != nil:
+        let canon: str = uirCoreObjAliasCanon(key)
+        if len(canon) > 0:
+            key = canon
+    return uirCoreStripPtrKeyOnce(key)
+
+fn uirCoreStripParExpr(n0: Node): Node =
+    var n: Node = n0
+    while astNodeIdValid(n) && astNodeIsPar(n) && kidCount(n) > 0:
+        n = kid(n, 0)
+    return n
+
+fn uirCoreIsNilExpr(n0: Node): bool =
+    let n: Node = uirCoreStripParExpr(n0)
+    return astNodeIdValid(n) && astNodeIsNilLit(n)
+
+fn isByteTypeKey(key: str): bool =
+    if len(key) == 0:
+        return false
+    return (key == "bool") || (key == "char") ||
+           (key == "int8") || (key == "uint8") ||
+           (key == "i8") || (key == "u8")
+
+fn isBytePtrTypeKey(key: str): bool =
+    if len(key) == 0:
+        return false
+    if !uirCoreKeyHasPtrPrefix(key):
+        return false
+    let elemKey: str = rawmemStrFromOffset(key, 4)
+    return isByteTypeKey(elemKey)
+
+fn byteUirTypeFromKey(key0: str): UirCoreType =
+    if len(key0) == 0:
+        return uirCoreTypeU8()
+    let key: str = uirCoreParamKeyCanon(key0)
+    if (key == "int8") || (key == "i8"):
+        return uirCoreTypeI8()
+    return uirCoreTypeU8()
+
+fn byteUirTypeFromPtrTypeKey(ptrKey0: str): UirCoreType =
+    if len(ptrKey0) == 0:
+        return uirCoreTypeU8()
+    let ptrKey: str = uirCoreParamKeyCanon(ptrKey0)
+    if !uirCoreKeyHasPtrPrefix(ptrKey):
+        return uirCoreTypeU8()
+    let elemKey: str = rawmemStrFromOffset(ptrKey, 4)
+    return byteUirTypeFromKey(elemKey)
+
+fn byteUirTypeFromElemOrPtrKey(elemKey0: str, ptrKey0: str): UirCoreType =
+    if len(elemKey0) > 0:
+        var elemKey: str = uirCoreParamKeyCanon(elemKey0)
+        if uirCoreKeyHasPtrPrefix(elemKey):
+            elemKey = uirCoreParamKeyCanon(rawmemStrFromOffset(elemKey, 4))
+        return byteUirTypeFromKey(elemKey)
+    return byteUirTypeFromPtrTypeKey(ptrKey0)
+
+fn uirCorePtrBaseObjTypeName(mod: UirCoreModule, baseKey0: str): str =
+    if (mod == nil) || len(baseKey0) == 0:
+        return ""
+    if uirCoreHasObjType(mod, baseKey0):
+        return baseKey0
+    if (uirCoreKeyHasSeqPrefix(baseKey0) || uirCoreKeyHasSeqFixedPrefix(baseKey0)) && uirCoreHasObjType(mod, "seq"):
+        return "seq"
+    if uirCoreKeyHasTablePrefix(baseKey0) && uirCoreHasObjType(mod, "Table"):
+        return "Table"
+    let __for_start_i = len(baseKey0) - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        if baseKey0[i] == '.':
+            let sub: str = rawmemStrFromOffset(baseKey0, i + 1)
+            if len(sub) > 0 && uirCoreHasObjType(mod, sub):
+                return sub
+            break
+    return ""
+
+fn uir_core_builder_type_key_helpers_add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+fn uir_core_builder_type_key_helpers_add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+var
+    uirCoreOverloadTypeKeyCacheEpoch: int32[]
+    uirCoreOverloadTypeKeyCacheVals: str[]
+    uirCoreOverloadTypeKeyCacheRound: int32 = 1
+
+fn typeNodeCanonicalIdentId(typeNode: Node): int32 =
+    if !astNodeIdValid(typeNode):
+        return 0
+    let rawId: int32 = nodeIdentId(typeNode)
+    if rawId <= 0:
+        return 0
+    return tokenTextTrimmedCanonicalId(rawId)
+
+fn typeNodeCanonicalName(typeNode: Node): str =
+    let textId: int32 = typeNodeCanonicalIdentId(typeNode)
+    if textId > 0:
+        return tokenTextById(textId)
+    return backendStripSpaces(plainName(typeNode))
+
+fn uirCoreJoinWithCharFill(out: str, left0: str, sep: char, right0: str, nLeft: int32, nRight: int32): str =
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(left0), nLeft)
+    rawmemWriteChar(outPtr, nLeft, sep)
+    rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(outPtr, nLeft + 1), rawmemAsVoid(right0), nRight)
+    return out
+
+fn uirCoreJoinWithChar(left0: str, sep: char, right0: str): str =
+    let nLeft: int32 = len(left0)
+    let nRight: int32 = len(right0)
+    if nLeft <= 0:
+        return right0
+    if nRight <= 0:
+        return left0
+    return uirCoreJoinWithCharFill(newStringAlloc(nLeft + 1 + nRight), left0, sep, right0, nLeft, nRight)
+
+fn uirCoreTypeKeyPrefixedFill(out: str, prefix0: str, inner0: str, nPrefix: int32, nInner: int32): str =
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    if nPrefix > 0:
+        rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(prefix0), nPrefix)
+    rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(outPtr, nPrefix), rawmemAsVoid(inner0), nInner)
+    return out
+
+fn uirCoreTypeKeyPrefixed(prefix0: str, inner0: str, fallback0: str): str =
+    if len(inner0) <= 0:
+        return fallback0
+    return uirCoreTypeKeyPrefixedFill(newStringAlloc(len(prefix0) + len(inner0)), prefix0, inner0, len(prefix0), len(inner0))
+
+fn uirCoreTypeKeySeqName(inner0: str): str =
+    return uirCoreTypeKeyPrefixed("seq_", inner0, "seq")
+
+fn uirCoreConcat2Fill(out: str, left0: str, right0: str, nLeft: int32, nRight: int32): str =
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(left0), nLeft)
+    rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(outPtr, nLeft), rawmemAsVoid(right0), nRight)
+    return out
+
+fn uirCoreConcat2(left0: str, right0: str): str =
+    let nLeft: int32 = len(left0)
+    let nRight: int32 = len(right0)
+    if nLeft <= 0:
+        return right0
+    if nRight <= 0:
+        return left0
+    return uirCoreConcat2Fill(newStringAlloc(nLeft + nRight), left0, right0, nLeft, nRight)
+
+fn uirCoreAppendCharFill(out: str, left0: str, ch: char, nLeft: int32): str =
+    let outPtr: ptr = rawmemAsVoid(out)
+    if outPtr == nil:
+        return ""
+    if nLeft > 0:
+        rawmem_support.rawmemCopy(outPtr, rawmemAsVoid(left0), nLeft)
+    rawmemWriteChar(outPtr, nLeft, ch)
+    return out
+
+fn uirCoreAppendChar(left0: str, ch: char): str =
+    return uirCoreAppendCharFill(newStringAlloc(len(left0) + 1), left0, ch, len(left0))
+
+fn uirCoreIndexedName(prefix0: str, idx: int32): str =
+    return uirCoreConcat2(prefix0, intToStr(idx))
+
+fn uirCoreArrayObjName(capacity: int32, elemKey0: str): str =
+    return uirCoreJoinWithChar(uirCoreIndexedName("array_", capacity), '_', elemKey0)
+
+fn uirCoreMangleBaseName(name: str): str =
+    if name == "[]":
+        return "bracket"
+    if name == "[]=":
+        return "bracketEq"
+    if name == "..":
+        return "dotdot"
+    if name == "..<":
+        return "dotdotless"
+    if name == "=>":
+        return "arrow"
+    if name == ".":
+        return "dot"
+    return name
+
+fn uirCoreJoinKeyPartsTail(parts: str[], idx: int32, out0: str): str =
+    if idx >= parts.len:
+        return out0
+    let part: str = parts[idx]
+    if len(part) > 0:
+        return uirCoreJoinKeyPartsTail(parts, idx + 1, uirCoreJoinWithChar(out0, '_', part))
+    return uirCoreJoinKeyPartsTail(parts, idx + 1, out0)
+
+fn uirCoreJoinKeyParts(base: str, parts: str[]): str =
+    if parts.len == 0:
+        return base
+    return uirCoreJoinKeyPartsTail(parts, 0, base)
+
+fn uirCoreMangleInstance(name: str, typeArgIds: int32[]): str =
+    let base: str = uirCoreMangleBaseName(name)
+    var keys: str[]
+    keys.cap = typeArgIds.len
+    for i in 0..<typeArgIds.len:
+        let typeArgId: AstNodeId = typeArgIds[i]
+        let key: str = astNodeIdValid(typeArgId) ? typeKey(typeArgId) : ""
+        if len(key) > 0:
+            uir_core_builder_type_key_helpers_add(keys, key)
+    return uirCoreJoinKeyParts(base, keys)
+
+fn uirCoreTypeKeyBestEffort(typeNode: Node): str =
+    let fastKey: str = uirCoreTypeKeyForOverloadFast(typeNode)
+    if len(fastKey) > 0:
+        return fastKey
+    let fallbackKey: str = uirCoreTypeKeyFallbackText(typeNode)
+    if len(fallbackKey) > 0:
+        return fallbackKey
+    let looseKey: str = backendStripSpaces(typeKey(typeNode))
+    if len(looseKey) > 0:
+        return looseKey
+    return typeNodeCanonicalName(typeNode)
+
+fn uirCoreTypeKeyFallbackBase(baseNode: Node): str =
+    let baseKey: str = uirCoreTypeKeyFallbackText(baseNode)
+    if len(baseKey) > 0:
+        return baseKey
+    return typeNodeCanonicalName(baseNode)
+
+fn uirCoreTypeKeyFallbackBracketStart(baseNode: Node): str =
+    let baseKey: str = uirCoreTypeKeyFallbackBase(baseNode)
+    if len(baseKey) > 0:
+        return baseKey
+    return "inst"
+
+fn uirCoreTypeKeyFallbackBracketTail(typeNode: Node, idx: int32, out0: str): str =
+    if idx >= kidCount(typeNode):
+        return out0
+    let argKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, idx))
+    if len(argKey) > 0:
+        return uirCoreTypeKeyFallbackBracketTail(typeNode, idx + 1, uirCoreJoinWithChar(out0, '_', argKey))
+    return uirCoreTypeKeyFallbackBracketTail(typeNode, idx + 1, out0)
+
+fn uirCoreTypeKeyFallbackTupleTail(typeNode: Node, idx: int32, out0: str): str =
+    if idx >= kidCount(typeNode):
+        return out0
+    let argKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, idx))
+    if len(argKey) > 0:
+        return uirCoreTypeKeyFallbackTupleTail(typeNode, idx + 1, uirCoreJoinWithChar(out0, '_', argKey))
+    return uirCoreTypeKeyFallbackTupleTail(typeNode, idx + 1, out0)
+
+fn uirCoreTypeKeyForOverloadTupleTail(typeNode: Node, idx: int32, out0: str): str =
+    if idx >= kidCount(typeNode):
+        return out0
+    let argKey: str = uirCoreTypeKeyForOverloadFast(kid(typeNode, idx))
+    if len(argKey) == 0:
+        return ""
+    return uirCoreTypeKeyForOverloadTupleTail(typeNode, idx + 1, uirCoreJoinWithChar(out0, '_', argKey))
+
+fn uirCoreBracketSurfaceSliceElemKey(typeNode0: Node): str =
+    var typeNode: Node = typeNode0
+    while astNodeIdValid(typeNode) && astNodeIsPar(typeNode) && kidCount(typeNode) > 0:
+        typeNode = kid(typeNode, 0)
+    if !astNodeIdValid(typeNode) || !astNodeIsBracketExpr(typeNode) || kidCount(typeNode) <= 0:
+        return ""
+    let elemNode: Node = kid(typeNode, 0)
+    if kidCount(typeNode) > 1:
+        let tailNode: Node = kid(typeNode, 1)
+        if astNodeIdValid(tailNode) && !isEmpty(tailNode):
+            return ""
+    return uirCoreTypeKeyBestEffort(elemNode)
+
+fn uirCoreTypeKeyFallbackText(typeNode0: Node): str =
+    var typeNode: Node = typeNode0
+    while astNodeIdValid(typeNode) && astNodeIsPar(typeNode) && kidCount(typeNode) > 0:
+        typeNode = kid(typeNode, 0)
+    if typeNode == nil:
+        return ""
+    if isEmpty(typeNode):
+        return ""
+    let cachedKey: str = backendStripSpaces(typeKey(typeNode))
+    if len(cachedKey) > 0 && !(cachedKey == "node"):
+        return cachedKey
+    if astNodeIsDotExpr(typeNode) && kidCount(typeNode) > 1:
+        let lhsKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, 0))
+        let rhsKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, 1))
+        if len(rhsKey) > 0:
+            if len(lhsKey) > 0:
+                return uirCoreJoinWithChar(lhsKey, '.', rhsKey)
+            return rhsKey
+    if astNodeIsVarTy(typeNode) && kidCount(typeNode) > 0:
+        let innerKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, 0))
+        return uirCoreTypeKeyPrefixed("var_", innerKey, "var")
+    if astNodeIsRefTy(typeNode) && kidCount(typeNode) > 0:
+        let innerKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, 0))
+        return uirCoreTypeKeyPrefixed("ref_", innerKey, "ref")
+    if astNodeIsPtrTy(typeNode) && kidCount(typeNode) > 0:
+        let innerKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, 0))
+        return uirCoreTypeKeyPrefixed("ptr_", innerKey, "ptr")
+    if astNodeIsBracketExpr(typeNode) && kidCount(typeNode) > 0:
+        let baseNode: Node = kid(typeNode, 0)
+        let baseKey: str = uirCoreTypeKeyFallbackBase(baseNode)
+        if kidCount(typeNode) == 2:
+            let sliceElemKey: str = uirCoreBracketSurfaceSliceElemKey(typeNode)
+            if len(sliceElemKey) > 0:
+                return uirCoreTypeKeySeqName(sliceElemKey)
+        if kidCount(typeNode) == 2:
+            let argKey: str = uirCoreTypeKeyFallbackText(kid(typeNode, 1))
+            if len(baseKey) > 0 && len(argKey) > 0:
+                return (baseKey == "seq_fixed") ? uirCoreTypeKeySeqName(argKey) : uirCoreJoinWithChar(baseKey, '_', argKey)
+        return uirCoreTypeKeyFallbackBracketTail(typeNode, 1, uirCoreTypeKeyFallbackBracketStart(baseNode))
+    if astNodeIsTupleTy(typeNode):
+        return uirCoreTypeKeyFallbackTupleTail(typeNode, 0, "tuple")
+    let nm: str = typeNodeCanonicalName(typeNode)
+    if len(nm) > 0:
+        return nm
+    return uirCoreTypeKeyPrefixed("nk", intToStr(int32(nodeKind(typeNode))), "nk")
+
+fn uirCoreTypeKeyForOverloadFast(typeNode0: Node): str =
+    var typeNode: Node = typeNode0
+    while astNodeIdValid(typeNode) && astNodeIsPar(typeNode) && kidCount(typeNode) > 0:
+        typeNode = kid(typeNode, 0)
+    if !astNodeIdValid(typeNode) || isEmpty(typeNode):
+        return ""
+    let kind: NodeKind = nodeKind(typeNode)
+    if astNodeIsIdentOrSymbol(typeNode):
+        return typeNodeCanonicalName(typeNode)
+    if astNodeIsDotExpr(typeNode) && kidCount(typeNode) > 1:
+        let rhsKey: str = uirCoreTypeKeyForOverloadFast(kid(typeNode, 1))
+        if len(rhsKey) > 0:
+            return rhsKey
+        return typeNodeCanonicalName(kid(typeNode, 1))
+    if astNodeIsVarTy(typeNode) && kidCount(typeNode) > 0:
+        let innerKey: str = uirCoreTypeKeyForOverloadFast(kid(typeNode, 0))
+        return uirCoreTypeKeyPrefixed("var_", innerKey, "var")
+    if astNodeIsRefTy(typeNode) && kidCount(typeNode) > 0:
+        let innerKey: str = uirCoreTypeKeyForOverloadFast(kid(typeNode, 0))
+        return uirCoreTypeKeyPrefixed("ref_", innerKey, "ref")
+    if astNodeIsPtrTy(typeNode) && kidCount(typeNode) > 0:
+        let innerKey: str = uirCoreTypeKeyForOverloadFast(kid(typeNode, 0))
+        return uirCoreTypeKeyPrefixed("ptr_", innerKey, "ptr")
+    if astNodeIsBracketExpr(typeNode) && kidCount(typeNode) > 0:
+        let baseNode: Node = kid(typeNode, 0)
+        let baseName: str = typeNodeCanonicalName(baseNode)
+        if len(baseName) > 0:
+            if kidCount(typeNode) == 2:
+                let sliceElemKey: str = uirCoreBracketSurfaceSliceElemKey(typeNode)
+                if len(sliceElemKey) > 0:
+                    return uirCoreTypeKeySeqName(sliceElemKey)
+            if kidCount(typeNode) == 2:
+                let argKey: str = uirCoreTypeKeyForOverloadFast(kid(typeNode, 1))
+                if len(argKey) > 0:
+                    return (baseName == "seq_fixed") ? uirCoreTypeKeySeqName(argKey) : uirCoreJoinWithChar(baseName, '_', argKey)
+            var instArgs: int32[]
+            instArgs.cap = 4
+            for ai in 1..<kidCount(typeNode):
+                let arg: Node = kid(typeNode, ai)
+                if astNodeIdValid(arg) && !isEmpty(arg):
+                    uir_core_builder_type_key_helpers_add(instArgs, arg)
+            if instArgs.len > 0:
+                let instName: str = uirCoreMangleInstance(baseName, instArgs)
+                if len(instName) > 0:
+                    return instName
+        return ""
+    if astNodeIsTupleTy(typeNode):
+        return uirCoreTypeKeyForOverloadTupleTail(typeNode, 0, "tuple")
+    return ""
+
+fn uirCoreOverloadTypeKeyCacheReset() =
+    let nextRound: int32 = uirCoreOverloadTypeKeyCacheRound + 1
+    if nextRound > 0:
+        uirCoreOverloadTypeKeyCacheRound = nextRound
+        return
+    uirCoreOverloadTypeKeyCacheRound = 1
+    uirCoreOverloadTypeKeyCacheEpoch.len = 0
+    uirCoreOverloadTypeKeyCacheVals.len = 0
+
+fn uirCoreOverloadTypeKeyCacheTryGet(n: Node, found: var bool): str =
+    found = false
+    if !astNodeIdValid(n):
+        return ""
+    let idx: int32 = n - 1
+    if idx < 0 || idx >= uirCoreOverloadTypeKeyCacheEpoch.len || idx >= uirCoreOverloadTypeKeyCacheVals.len:
+        return ""
+    if uirCoreOverloadTypeKeyCacheEpoch[idx] != uirCoreOverloadTypeKeyCacheRound:
+        return ""
+    found = true
+    return uirCoreOverloadTypeKeyCacheVals[idx]
+
+fn uirCoreOverloadTypeKeyCachePut(n: Node, key: str) =
+    if !astNodeIdValid(n):
+        return
+    let idx: int32 = n - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreOverloadTypeKeyCacheEpoch.len:
+        uir_core_builder_type_key_helpers_add(uirCoreOverloadTypeKeyCacheEpoch, int32(0))
+    while idx >= uirCoreOverloadTypeKeyCacheVals.len:
+        uir_core_builder_type_key_helpers_add(uirCoreOverloadTypeKeyCacheVals, "")
+    uirCoreOverloadTypeKeyCacheEpoch[idx] = uirCoreOverloadTypeKeyCacheRound
+    uirCoreOverloadTypeKeyCacheVals[idx] = key
+
+fn uirCoreTypeKeyForOverload(typeNode0: Node): str =
+    var foundCached: bool = false
+    let cachedKey: str = uirCoreOverloadTypeKeyCacheTryGet(typeNode0, foundCached)
+    if foundCached:
+        return cachedKey
+    let fastKey: str = uirCoreTypeKeyForOverloadFast(typeNode0)
+    if len(fastKey) > 0:
+        uirCoreOverloadTypeKeyCachePut(typeNode0, fastKey)
+        return fastKey
+    let looseKey: str = uirCoreTypeKeyFromNodeLoose(typeNode0)
+    if len(looseKey) > 0:
+        uirCoreOverloadTypeKeyCachePut(typeNode0, looseKey)
+        return looseKey
+    let fallbackKey: str = uirCoreTypeKeyFallbackText(typeNode0)
+    uirCoreOverloadTypeKeyCachePut(typeNode0, fallbackKey)
+    return fallbackKey
+
+fn uir_core_builder_loose_type_key_helpers_add(dst: var Node[], val: Node) =
+    seqs.add(dst, val)
+
+fn uir_core_builder_loose_type_key_helpers_add(dst: var int32[], val: int32) =
+    seqs.add(dst, val)
+
+fn uir_core_builder_loose_type_key_helpers_add(dst: var str[], val: str) =
+    seqs.add(dst, val)
+
+var
+    uirCoreLegacyGenericBracketCacheEpoch: int32[]
+    uirCoreLegacyGenericBracketCacheVals: str[]
+    uirCoreLegacyGenericBracketCacheRound: int32 = 1
+    uirCoreLooseTypeKeyCacheEpoch: int32[]
+    uirCoreLooseTypeKeyCacheVals: str[]
+    uirCoreLooseTypeKeyCacheRound: int32 = 1
+
+fn uirCoreLooseDebugNodeChild(n: Node, idx: int32): Node =
+    if !astNodeIdValid(n) || idx < 0 || idx >= kidCount(n):
+        return nil
+    return kid(n, idx)
+
+fn uirCoreLooseDebugNodeKindText(n: Node): str =
+    if !astNodeIdValid(n):
+        return ""
+    return intToStr(int32(nodeKind(n)))
+
+fn uirCoreLooseDebugNodeNameText(n: Node): str =
+    if !astNodeIdValid(n):
+        return ""
+    return backendStripSpaces(plainName(n))
+
+fn uirCoreLooseDebugNodeKeyText(n: Node): str =
+    if !astNodeIdValid(n):
+        return ""
+    return backendStripSpaces(typeKey(n))
+
+fn uirCoreLooseDebugBracketMessage(typeNode: Node, baseName: str): str =
+    let arg1: Node = uirCoreLooseDebugNodeChild(typeNode, 1)
+    let arg1Kid0: Node = uirCoreLooseDebugNodeChild(arg1, 0)
+    let arg1Kid1: Node = uirCoreLooseDebugNodeChild(arg1, 1)
+    return "[backend] debugTypeKeyLoose: bracket base='" + baseName +
+        "' rawKey='" + backendStripSpaces(typeKey(typeNode)) +
+        "' kids=" + intToStr(kidCount(typeNode)) +
+        " arg1.kind=" + uirCoreLooseDebugNodeKindText(arg1) +
+        " arg1.name='" + uirCoreLooseDebugNodeNameText(arg1) +
+        "' arg1.key='" + uirCoreLooseDebugNodeKeyText(arg1) +
+        "' arg1.k0.kind=" + uirCoreLooseDebugNodeKindText(arg1Kid0) +
+        " arg1.k0.name='" + uirCoreLooseDebugNodeNameText(arg1Kid0) +
+        "' arg1.k0.key='" + uirCoreLooseDebugNodeKeyText(arg1Kid0) +
+        "' arg1.k1.kind=" + uirCoreLooseDebugNodeKindText(arg1Kid1) +
+        " arg1.k1.name='" + uirCoreLooseDebugNodeNameText(arg1Kid1) +
+        "' arg1.k1.key='" + uirCoreLooseDebugNodeKeyText(arg1Kid1) +
+        " @" + intToStr(nodePosLine(typeNode)) + ":" + intToStr(nodePosCol(typeNode))
+
+fn uirCoreLooseBracketArgKey(arg1: Node): str =
+    if !astNodeIdValid(arg1) || nodeKind(arg1) == nkEmpty:
+        return ""
+    let looseKey: str = uirCoreTypeKeyFromNodeLoose(arg1)
+    if len(looseKey) > 0:
+        return looseKey
+    return backendStripSpaces(typeKey(arg1))
+
+fn uirCoreLegacyGenericBracketInstName(typeNode: Node): str =
+    var foundCached: bool = false
+    let cached: str = uirCoreLegacyGenericBracketCacheTryGet(typeNode, foundCached)
+    if foundCached:
+        return cached
+    if !astNodeIdValid(typeNode) || nodeKind(typeNode) != nkBracketExpr || kidCount(typeNode) < 3:
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let outerBaseNode: Node = kid(typeNode, 0)
+    let outerBase: str = backendStripSpaces(plainName(outerBaseNode))
+    if outerBase != "seq_fixed":
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let genericBaseNode: Node = kid(typeNode, 1)
+    let genericBase: str = backendStripSpaces(plainName(genericBaseNode))
+    if !(genericBase == "Result" || genericBase == "Option" ||
+         genericBase == "SeqUninit" || genericBase == "Table" ||
+         genericBase == "__cheng_tables_Entry"):
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let rawKey: str = backendStripSpaces(typeKey(typeNode))
+    let seqKey: str = uirCoreTypeKeySeqName(genericBase)
+    let seqFixedKey: str = uirCoreTypeKeyPrefixed("seq_fixed_", genericBase, "seq_fixed")
+    if !((rawKey == seqKey) || (rawKey == seqFixedKey)):
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    var instArgs: Node[]
+    instArgs.cap = 4
+    for ai in 2..<kidCount(typeNode):
+        let arg: Node = kid(typeNode, ai)
+        if astNodeIdValid(arg) && nodeKind(arg) != nkEmpty:
+            uir_core_builder_loose_type_key_helpers_add(instArgs, arg)
+    if instArgs.len == 0:
+        uirCoreLegacyGenericBracketCachePut(typeNode, "")
+        return ""
+    let out: str = mangleInstance(genericBase, instArgs)
+    uirCoreLegacyGenericBracketCachePut(typeNode, out)
+    return out
+
+fn uirCoreTypeKeyFromNodeLoose(typeNode0: Node): str =
+    var typeNode: Node = typeNode0
+    while astNodeIdValid(typeNode) && nodeKind(typeNode) == nkPar && kidCount(typeNode) > 0:
+        typeNode = kid(typeNode, 0)
+    if (typeNode == nil):
+        return ""
+    var foundCached: bool = false
+    let cached: str = uirCoreLooseTypeKeyCacheTryGet(typeNode, foundCached)
+    if foundCached:
+        return cached
+    if nodeKind(typeNode) == nkDotExpr && kidCount(typeNode) > 1:
+        let rhs: Node = kid(typeNode, 1)
+        let rhsKey: str = uirCoreTypeKeyFromNodeLoose(rhs)
+        if len(rhsKey) > 0:
+            uirCoreLooseTypeKeyCachePut(typeNode, rhsKey)
+            return rhsKey
+    let legacyInstName: str = uirCoreLegacyGenericBracketInstName(typeNode)
+    if len(legacyInstName) > 0:
+        uirCoreLooseTypeKeyCachePut(typeNode, legacyInstName)
+        return legacyInstName
+    if nodeKind(typeNode) == nkBracketExpr && kidCount(typeNode) > 0:
+        let base: Node = kid(typeNode, 0)
+        let baseName: str = backendStripSpaces(plainName(base))
+        let dbgTypeKeyLoose: bool = (os.getEnvDefault("BACKEND_DEBUG_TYPEKEY_LOOSE", "") == "1")
+        if dbgTypeKeyLoose:
+            os.writeLine(os.get_stderr(), uirCoreLooseDebugBracketMessage(typeNode, baseName))
+            os.c_fflush(os.get_stderr())
+        if len(baseName) > 0:
+            if kidCount(typeNode) == 2:
+                let sliceElemKey: str = uirCoreBracketSurfaceSliceElemKey(typeNode)
+                if len(sliceElemKey) > 0:
+                    let sliceInst: str = uirCoreTypeKeySeqName(sliceElemKey)
+                    uirCoreLooseTypeKeyCachePut(typeNode, sliceInst)
+                    return sliceInst
+            if kidCount(typeNode) == 2:
+                let arg1: Node = kid(typeNode, 1)
+                let arg1KeyLoose: str = uirCoreLooseBracketArgKey(arg1)
+                if len(arg1KeyLoose) > 0:
+                    let oneArgInst: str = (baseName == "seq_fixed") ? uirCoreTypeKeySeqName(arg1KeyLoose) : uirCoreJoinWithChar(baseName, '_', arg1KeyLoose)
+                    uirCoreLooseTypeKeyCachePut(typeNode, oneArgInst)
+                    return oneArgInst
+            var instArgs: Node[]
+            instArgs.cap = 4
+            for ai in 1..<kidCount(typeNode):
+                let arg: Node = kid(typeNode, ai)
+                if astNodeIdValid(arg) && nodeKind(arg) != nkEmpty:
+                    uir_core_builder_loose_type_key_helpers_add(instArgs, arg)
+            if instArgs.len > 0:
+                let instName: str = mangleInstance(baseName, instArgs)
+                if len(instName) > 0:
+                    uirCoreLooseTypeKeyCachePut(typeNode, instName)
+                    return instName
+    let key: str = backendStripSpaces(typeKey(typeNode))
+    if len(key) > 0 && !(key == "node"):
+        uirCoreLooseTypeKeyCachePut(typeNode, key)
+        return key
+    let nm: str = backendStripSpaces(plainName(typeNode))
+    if len(nm) > 0:
+        uirCoreLooseTypeKeyCachePut(typeNode, nm)
+        return nm
+    uirCoreLooseTypeKeyCachePut(typeNode, "")
+    return ""
+
+fn uirCoreLegacyGenericBracketCacheReset() =
+    let nextRound: int32 = uirCoreLegacyGenericBracketCacheRound + 1
+    if nextRound > 0:
+        uirCoreLegacyGenericBracketCacheRound = nextRound
+        return
+    uirCoreLegacyGenericBracketCacheRound = 1
+    uirCoreLegacyGenericBracketCacheEpoch.len = 0
+    uirCoreLegacyGenericBracketCacheVals.len = 0
+
+fn uirCoreLegacyGenericBracketCacheTryGet(n: Node, found: var bool): str =
+    found = false
+    if !astNodeIdValid(n):
+        return ""
+    let idx: int32 = n - 1
+    if idx < 0 || idx >= uirCoreLegacyGenericBracketCacheEpoch.len || idx >= uirCoreLegacyGenericBracketCacheVals.len:
+        return ""
+    if uirCoreLegacyGenericBracketCacheEpoch[idx] != uirCoreLegacyGenericBracketCacheRound:
+        return ""
+    found = true
+    return uirCoreLegacyGenericBracketCacheVals[idx]
+
+fn uirCoreLegacyGenericBracketCachePut(n: Node, key: str) =
+    if !astNodeIdValid(n):
+        return
+    let idx: int32 = n - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreLegacyGenericBracketCacheEpoch.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLegacyGenericBracketCacheEpoch, int32(0))
+    while idx >= uirCoreLegacyGenericBracketCacheVals.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLegacyGenericBracketCacheVals, "")
+    uirCoreLegacyGenericBracketCacheEpoch[idx] = uirCoreLegacyGenericBracketCacheRound
+    uirCoreLegacyGenericBracketCacheVals[idx] = key
+
+fn uirCoreLooseTypeKeyCacheReset() =
+    let nextRound: int32 = uirCoreLooseTypeKeyCacheRound + 1
+    if nextRound > 0:
+        uirCoreLooseTypeKeyCacheRound = nextRound
+        return
+    uirCoreLooseTypeKeyCacheRound = 1
+    uirCoreLooseTypeKeyCacheEpoch.len = 0
+    uirCoreLooseTypeKeyCacheVals.len = 0
+
+fn uirCoreLooseTypeKeyCacheTryGet(n: Node, found: var bool): str =
+    found = false
+    if !astNodeIdValid(n):
+        return ""
+    let idx: int32 = n - 1
+    if idx < 0 || idx >= uirCoreLooseTypeKeyCacheEpoch.len || idx >= uirCoreLooseTypeKeyCacheVals.len:
+        return ""
+    if uirCoreLooseTypeKeyCacheEpoch[idx] != uirCoreLooseTypeKeyCacheRound:
+        return ""
+    found = true
+    return uirCoreLooseTypeKeyCacheVals[idx]
+
+fn uirCoreLooseTypeKeyCachePut(n: Node, key: str) =
+    if !astNodeIdValid(n):
+        return
+    let idx: int32 = n - 1
+    if idx < 0:
+        return
+    while idx >= uirCoreLooseTypeKeyCacheEpoch.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLooseTypeKeyCacheEpoch, int32(0))
+    while idx >= uirCoreLooseTypeKeyCacheVals.len:
+        uir_core_builder_loose_type_key_helpers_add(uirCoreLooseTypeKeyCacheVals, "")
+    uirCoreLooseTypeKeyCacheEpoch[idx] = uirCoreLooseTypeKeyCacheRound
+    uirCoreLooseTypeKeyCacheVals[idx] = key
+

@@ -103,7 +103,6 @@ resolve_driver() {
     "artifacts/backend_driver/cheng" \
     "artifacts/backend_driver/cheng.fixed3" \
     "dist/releases/current/cheng" \
-    "artifacts/backend_seed/cheng.stage2" \
     "$path_from_resolver"; do
     if [ "$candidate" = "" ] || [ ! -x "$candidate" ]; then
       continue

@@ -91,7 +91,6 @@ pick_driver() {
     "${BACKEND_SELF_LINKER_DRIVER:-}" \
     "${BACKEND_LINKER_ABI_CORE_DRIVER:-}" \
     "${BACKEND_DRIVER:-}" \
-    "artifacts/backend_seed/cheng.stage2" \
     "artifacts/backend_selfhost_self_obj/cheng_stage0_default" \
     "dist/releases/current/cheng" \
     "$resolver_path"; do
