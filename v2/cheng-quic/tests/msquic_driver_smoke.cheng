@@ -1,0 +1,91 @@
+# MsQuic driver smoke test(manual).
+
+import std/result
+import cheng/quic/msquicdriver
+import cheng/quic/msquicdriver_experimental
+import cheng/quic/msquicwrapper
+fn runMsQuicDriverSmoke(): Result[bool] =
+    var driver: MsQuicDriver = initMsQuicDriver()
+    if msquicDriverRunning(driver):
+        return Err[bool]("smoke: msquic driver should be stopped")
+    let startRes: Result[bool] = startMsQuicDriver(driver)
+    if IsErr(startRes):
+        return Err[bool](Error(startRes))
+    if ! msquicDriverRunning(driver):
+        return Err[bool]("smoke: msquic driver ! running")
+    let id1: int64 = msquicDriverAllocConnectionId(driver)
+    let id2: int64 = msquicDriverAllocConnectionId(driver)
+    if id2 <= id1:
+        return Err[bool]("smoke: msquic driver conn id ! increasing")
+    let idleRes: Result[bool] = msquicSetIdleTimeout(driver, 1234)
+    if IsErr(idleRes):
+        return Err[bool](Error(idleRes))
+    let streamRes: Result[bool] = msquicSetMaxStreams(driver, 4, 6)
+    if IsErr(streamRes):
+        return Err[bool](Error(streamRes))
+    let datagramRes: Result[bool] = msquicSetMaxDatagram(driver, 1200)
+    if IsErr(datagramRes):
+        return Err[bool](Error(datagramRes))
+    let enableDgRes: Result[bool] = msquicEnableDatagram(driver, true)
+    if IsErr(enableDgRes):
+        return Err[bool](Error(enableDgRes))
+    let enable0Res: Result[bool] = msquicEnable0Rtt(driver, true)
+    if IsErr(enable0Res):
+        return Err[bool](Error(enable0Res))
+    let enableBbrRes: Result[bool] = msquicEnableBbr(driver, true)
+    if IsErr(enableBbrRes):
+        return Err[bool](Error(enableBbrRes))
+    let greaseRes: Result[bool] = msquicEnableGreaseQuicBit(driver, true)
+    if IsErr(greaseRes):
+        return Err[bool](Error(greaseRes))
+    let ecnRes: Result[bool] = msquicEnableEcn(driver, true)
+    if IsErr(ecnRes):
+        return Err[bool](Error(ecnRes))
+    let xdpRes: Result[bool] = msquicEnableXdp(driver, true)
+    if IsErr(xdpRes):
+        return Err[bool](Error(xdpRes))
+    let qtipRes: Result[bool] = msquicEnableQtip(driver, true)
+    if IsErr(qtipRes):
+        return Err[bool](Error(qtipRes))
+    let rioRes: Result[bool] = msquicEnableReservedRio(driver, true)
+    if IsErr(rioRes):
+        return Err[bool](Error(rioRes))
+    let pendingRes: Result[bool] = msquicSetMaxPending(driver, 8)
+    if IsErr(pendingRes):
+        return Err[bool](Error(pendingRes))
+    let settings: MsQuicSettings = msquicDriverSettings(driver)
+    if settings.idleTimeoutMs != 1234:
+        return Err[bool]("smoke: msquic driver idle timeout mismatch")
+    if settings.maxStreamsBidi != 4 || settings.maxStreamsUni != 6:
+        return Err[bool]("smoke: msquic driver max streams mismatch")
+    if settings.maxDatagram != 1200:
+        return Err[bool]("smoke: msquic driver max datagram mismatch")
+    if ! settings.allowDatagram || ! settings.allow0Rtt || ! settings.useBbr:
+        return Err[bool]("smoke: msquic driver flags mismatch")
+    if ! settings.greaseQuicBitEnabled || ! settings.ecnEnabled:
+        return Err[bool]("smoke: msquic driver net flags mismatch")
+    if ! settings.xdpEnabled || ! settings.qtipEnabled || ! settings.reservedRioEnabled:
+        return Err[bool]("smoke: msquic driver highperf flags mismatch")
+    if settings.maxPending != 8:
+        return Err[bool]("smoke: msquic driver max pending mismatch")
+    var badSettings: MsQuicSettings = settings
+    badSettings.maxPending = -1
+    let badRes: Result[bool] = setMsQuicDriverSettings(driver, badSettings)
+    if IsOk(badRes):
+        return Err[bool]("smoke: msquic driver accepted invalid settings")
+    if len(msquicDriverLastError(driver)) <= 0:
+        return Err[bool]("smoke: msquic driver missing error message")
+    stopMsQuicDriver(driver)
+    if msquicDriverRunning(driver):
+        return Err[bool]("smoke: msquic driver did ! stop")
+
+    var wrapper: MsQuicWrapper = initMsQuicWrapper()
+    let wStart: Result[bool] = msquicWrapperStart(wrapper)
+    if IsErr(wStart):
+        return Err[bool](Error(wStart))
+    if ! msquicWrapperRunning(wrapper):
+        return Err[bool]("smoke: msquic wrapper ! running")
+    msquicWrapperStop(wrapper)
+    if msquicWrapperRunning(wrapper):
+        return Err[bool]("smoke: msquic wrapper did ! stop")
+    return Ok[bool](true)

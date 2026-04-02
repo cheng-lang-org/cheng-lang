@@ -18,6 +18,10 @@ static ChengStrBridge cheng_str_bridge_from_ptr_flags_local(const char *ptr, int
   return out;
 }
 
+static ChengStrBridge cheng_str_bridge_from_owned_local(char *ptr) {
+  return cheng_str_bridge_from_ptr_flags_local((const char *)ptr, CHENG_STR_BRIDGE_FLAG_OWNED);
+}
+
 void __cheng_setCmdLine(int32_t argc, const char **argv) {
   if (argc <= 0 || argc > 4096 || argv == NULL) {
     cheng_saved_argc = 0;
@@ -91,6 +95,13 @@ char * __cheng_rt_paramStrCopy(int32_t i) {
   return out;
 }
 
+void __cheng_rt_paramStrCopyBridgeInto(int32_t i, ChengStrBridge *out) {
+  if (out == NULL) {
+    return;
+  }
+  *out = cheng_str_bridge_from_owned_local(__cheng_rt_paramStrCopy(i));
+}
+
 int32_t driver_c_cli_param1_eq_bridge(ChengStrBridge expected) {
   const char *raw = "";
   const char *want = expected.ptr != NULL ? expected.ptr : "";
@@ -137,6 +148,21 @@ int32_t driver_c_cli_param1_eq_raw_bridge(const char *expected_ptr, int32_t expe
     return 1;
   }
   return memcmp(raw, want, raw_len) == 0 ? 1 : 0;
+}
+
+int32_t driver_c_str_eq_raw_bridge(ChengStrBridge actual, const char *expected_ptr, int32_t expected_len) {
+  const char *lhs = actual.ptr != NULL ? actual.ptr : "";
+  const char *rhs = expected_ptr != NULL ? expected_ptr : "";
+  if (actual.len < 0 || expected_len < 0) {
+    return 0;
+  }
+  if (actual.len != expected_len) {
+    return 0;
+  }
+  if (actual.len == 0) {
+    return 1;
+  }
+  return memcmp(lhs, rhs, (size_t)actual.len) == 0 ? 1 : 0;
 }
 
 static int driver_c_flag_key_matches(const char *raw, ChengStrBridge key) {

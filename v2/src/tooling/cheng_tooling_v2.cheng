@@ -1,7 +1,9 @@
 import std/cmdline as cmdline
 import std/os
 import std/strings as strings
+import std/strutils as strutils
 import std/system
+import compiler/frontend/compiler_core_surface_ir_v2 as ccore
 import compiler/driver/surface_contract as surface
 import compiler/low_uir/pipeline_contract as pipeline
 import compiler/frontend/string_surface_contract as sfront
@@ -42,6 +44,11 @@ import compiler/obj/obj_image_v2 as oimg
 import compiler/obj/obj_file_v2 as ofile
 import compiler/driver/system_link_exec_v2 as sexec
 import runtime/lsmr_contract_v2 as lcontract
+import compiler/low_uir/compiler_core_ops_contract as cops
+import compiler/bagua/bagua_core_v2 as bcore
+import compiler/bagua/ast_bagua_annotate_v2 as astbagua
+import compiler/bagua/low_uir_bagua_annotate_v2 as lowbagua
+import compiler/bagua/lowering_matrix_v2 as lmatrix
 
 type
     NativeStageArtifacts =
@@ -55,6 +62,24 @@ type
         externalCcProviderCount: int32
         compilerCoreProviderSourceKind: str
         compilerCoreProviderCompileMode: str
+    TaijiProofArtifact =
+        text: str
+        allPass: bool
+    TaijiSeedSpec =
+        sampleId: str
+        gateClass: str
+        sourceKind: str
+        sourcePath: str
+        sourceLabel: str
+        builtInSample: str
+    TaijiBaguaTag =
+        trigram: str
+        stateBits: str
+        phase: str
+        reason: str
+    TaijiDocument =
+        text: str
+        cid: str
 
 @importc("driver_c_write_text_file_bridge")
 fn writeTextFileBridge(path: str, text: str)
@@ -110,6 +135,27 @@ fn runStageSelfhostHostBridge(): int32
 @importc("driver_c_run_tooling_selfhost_host_bridge")
 fn runToolingSelfhostHostBridge(): int32
 
+fn taijiJsonEscape(text: str): str =
+    var out: str = ""
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch == '\\':
+            out = out + "\\\\"
+        elif ch == '"':
+            out = out + "\\\""
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn taijiJsonQuote(text: str): str =
+    return "\"" + taijiJsonEscape(text) + "\""
+
 fn printLine(text: str) =
     os.writeLine(os.get_stdout(), text)
 
@@ -121,6 +167,9 @@ fn readFlagDefault(key: str, defaultValue: str): str =
 
 fn readIntFlagDefault(key: str, defaultValue: int32): int32 =
     return cmdline.readInt32FlagOrDefault(key, defaultValue)
+
+fn readCidFlag(): str =
+    return readFlagDefault("--cid", "")
 
 fn createDirAll(path: str) =
     createDirAllBridge(path)
@@ -154,6 +203,2359 @@ fn runCompilerCommandOrPanic(compilerPath: str,
 
 fn compareExpectedTextOrPanic(expectedPath: str, actualPath: str, label: str) =
     compareTextFilesOrPanicBridge(expectedPath, actualPath, label)
+
+fn taijiProofArtifact(text: str, allPass: bool): TaijiProofArtifact =
+    var out: TaijiProofArtifact
+    out.text = text
+    out.allPass = allPass
+    return out
+
+fn taijiSeedSpec(sampleId: str,
+                 gateClass: str,
+                 sourceKind: str,
+                 sourcePath: str,
+                 sourceLabel: str,
+                 builtInSample: str): TaijiSeedSpec =
+    var out: TaijiSeedSpec
+    out.sampleId = sampleId
+    out.gateClass = gateClass
+    out.sourceKind = sourceKind
+    out.sourcePath = sourcePath
+    out.sourceLabel = sourceLabel
+    out.builtInSample = builtInSample
+    return out
+
+fn taijiBaguaTag(trigram: str, stateBits: str, phase: str, reason: str): TaijiBaguaTag =
+    var out: TaijiBaguaTag
+    out.trigram = trigram
+    out.stateBits = stateBits
+    out.phase = phase
+    out.reason = reason
+    return out
+
+fn joinTextList(values: str[], sep: str): str =
+    var out: str = ""
+    for i in 0..<values.len:
+        if i > 0:
+            out = out + sep
+        out = out + values[i]
+    return out
+
+fn jsonEscape(text: str): str =
+    var out: str = ""
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch == '\\':
+            out = out + "\\\\"
+        elif ch == '"':
+            out = out + "\\\""
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn jsonQuote(text: str): str =
+    return "\"" + jsonEscape(text) + "\""
+
+fn jsonRawArray(values: str[]): str =
+    return "[" + joinTextList(values, ", ") + "]"
+
+fn jsonStringArray(values: str[]): str =
+    var parts: str[]
+    parts = []
+    for i in 0..<values.len:
+        add(parts, jsonQuote(values[i]))
+    return jsonRawArray(parts)
+
+fn jsonIntArray(values: int32[]): str =
+    var parts: str[]
+    parts = []
+    for i in 0..<values.len:
+        add(parts, intToStr(values[i]))
+    return jsonRawArray(parts)
+
+fn jsonBoolArray(values: bool[]): str =
+    var parts: str[]
+    parts = []
+    for i in 0..<values.len:
+        add(parts, if values[i]: "true" else: "false")
+    return jsonRawArray(parts)
+
+fn jsonFieldRaw(key: str, rawValue: str): str =
+    return "  " + jsonQuote(key) + ": " + rawValue
+
+fn jsonObject(fields: str[]): str =
+    if fields.len <= 0:
+        return "{}"
+    return "{\n" + joinTextList(fields, ",\n") + "\n}"
+
+fn emptyTypeRow(): str =
+    return "[]"
+
+fn singleTypeRow(value: str): str =
+    return jsonStringArray([value])
+
+fn pairTypeRow(left: str, right: str): str =
+    return jsonStringArray([left, right])
+
+fn tripleTypeRow(a: str, b: str, c: str): str =
+    return jsonStringArray([a, b, c])
+
+fn ensureTypeIndex(typeTable: var str[], typeText: str): int32 =
+    for i in 0..<typeTable.len:
+        if typeTable[i] == typeText:
+            return i
+    add(typeTable, typeText)
+    return typeTable.len - 1
+
+fn sourceLabelFromPath(sourcePath: str): str =
+    let parts = os.splitFile(sourcePath)
+    return parts.name
+
+fn writeOptionalTextFile(outPath: str, text: str) =
+    if len(outPath) > 0:
+        writeTextFile(outPath, text)
+
+fn compilerCoreTopLevelIsRoutine(kind: str): bool =
+    return kind != "module" &&
+           kind != "import" &&
+           kind != "type" &&
+           kind != "const" &&
+           kind != "var"
+
+fn compilerCoreRoutineIndexForTopLevel(program: cpipe.CompilerCorePipelineBundle, topLevelIndex: int32): int32 =
+    var routineIdx: int32 = 0
+    for i in 0..<program.program.topLevelKinds.len:
+        if !compilerCoreTopLevelIsRoutine(program.program.topLevelKinds[i]):
+            continue
+        if i == topLevelIndex:
+            return routineIdx
+        routineIdx = routineIdx + 1
+    return -1
+
+fn stringInputTypeRow(opName: str): str =
+    if opName == "str_eq" || opName == "str_ne" || opName == "str_concat" || opName == "str_contains" ||
+       opName == "str_starts_with" || opName == "str_ends_with":
+        return pairTypeRow("str", "str")
+    if opName == "str_index":
+        return pairTypeRow("str", "int32")
+    if opName == "str_slice_view":
+        return tripleTypeRow("str", "int32", "int32")
+    if opName == "str_builder_init":
+        return singleTypeRow("int32")
+    if opName == "str_builder_append":
+        return pairTypeRow("builder", "str")
+    if opName == "str_builder_append_byte":
+        return pairTypeRow("builder", "uint8")
+    if opName == "str_builder_finish":
+        return singleTypeRow("builder")
+    return singleTypeRow("str")
+
+fn stringBaguaTag(opName: str): TaijiBaguaTag =
+    if opName == "str_builder_init":
+        return taijiBaguaTag("坤", "000", "分配", "builder 初始化并建立缓冲空间")
+    if opName == "str_builder_append" || opName == "str_builder_append_byte" || opName == "str_builder_finish" ||
+       opName == "str_concat" || opName == "str_to_owned":
+        return taijiBaguaTag("离", "101", "写入", "字符串写入、拼接或提交结果")
+    if opName == "str_slice_view" || opName == "str_len" || opName == "str_index":
+        return taijiBaguaTag("坎", "010", "读取", "字符串视图、索引或长度查询")
+    return taijiBaguaTag("乾", "111", "计算", "纯比较或纯代数式字符串判断")
+
+fn unimakerBaguaTag(opName: str): TaijiBaguaTag =
+    if opName == "ganzhi_state_def":
+        return taijiBaguaTag("坤", "000", "建模", "状态空间落位到 ganzhi 存储")
+    if opName == "hardware_callback_def":
+        return taijiBaguaTag("巽", "011", "事件注入", "外部硬件回调进入运行时")
+    if opName == "evolve_site_def":
+        return taijiBaguaTag("震", "100", "触发", "演化站点触发计算与调度")
+    return taijiBaguaTag("乾", "111", "计算", "纯声明式能力绑定")
+
+fn networkBaguaTag(opName: str): TaijiBaguaTag =
+    if opName == "publish_source_manifest" || opName == "publish_rule_pack" ||
+       opName == "publish_compiler_rule_pack" || opName == "disperse_ida_fragments":
+        return taijiBaguaTag("离", "101", "写入", "网络内容发布或分发写回")
+    if opName == "route_lsmr_tree":
+        return taijiBaguaTag("坎", "010", "路由读取", "读取拓扑并生成路由路径")
+    if opName == "exchange_anti_entropy_signature":
+        return taijiBaguaTag("兑", "110", "流合并", "签名交换与流式合并")
+    return taijiBaguaTag("艮", "001", "修复缓冲", "签名缺口修复进入阻塞与补洞阶段")
+
+fn compilerCoreBaguaTag(opName: str): TaijiBaguaTag =
+    if opName == "compiler_module_decl" || opName == "compiler_type_block" ||
+       opName == "compiler_const_decl" || opName == "compiler_var_decl":
+        return taijiBaguaTag("坤", "000", "建模", "编译器对象与布局落位")
+    if opName == "compiler_import_bind":
+        return taijiBaguaTag("兑", "110", "导入合流", "导入绑定把外部模块流入当前作用域")
+    if opName == "compiler_importc_fn_decl":
+        return taijiBaguaTag("巽", "011", "外部接入", "外部 ABI 声明进入编译环境")
+    return taijiBaguaTag("乾", "111", "控制流计算", "例程执行或大纲计算")
+
+fn jsonInlineFieldRaw(key: str, rawValue: str): str =
+    return jsonQuote(key) + ": " + rawValue
+
+fn jsonInlineObject(fields: str[]): str =
+    return "{" + joinTextList(fields, ", ") + "}"
+
+fn taijiDocument(text: str): TaijiDocument =
+    var out: TaijiDocument
+    out.text = text
+    out.cid = ident.sha256HexText(text)
+    return out
+
+fn startsWithText(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn trimTrailingComma(text: str): str =
+    if len(text) > 0 && text[len(text) - 1] == ',':
+        return srun.sliceView(text, 0, len(text) - 1)
+    return text
+
+fn jsonDocFieldRaw(text: str, key: str): str =
+    let prefix = "  " + jsonQuote(key) + ": "
+    var lineStart: int32 = 0
+    for i in 0..len(text):
+        if i == len(text) || text[i] == '\n':
+            let line = srun.sliceView(text, lineStart, i)
+            if startsWithText(line, prefix):
+                return trimTrailingComma(srun.sliceView(line, len(prefix), len(line)))
+            lineStart = i + 1
+    panic("taiji: missing json field " + key)
+
+fn stripOuterArray(raw: str): str =
+    if len(raw) >= 2 && raw[0] == '[' && raw[len(raw) - 1] == ']':
+        return srun.sliceView(raw, 1, len(raw) - 1)
+    return raw
+
+fn trimAsciiWhitespace(text: str): str =
+    var start: int32 = 0
+    var stop: int32 = len(text)
+    while start < stop && (text[start] == ' ' || text[start] == '\t' || text[start] == '\r' || text[start] == '\n'):
+        start = start + 1
+    while stop > start && (text[stop - 1] == ' ' || text[stop - 1] == '\t' || text[stop - 1] == '\r' || text[stop - 1] == '\n'):
+        stop = stop - 1
+    return srun.sliceView(text, start, stop)
+
+fn countTopLevelCsvParts(raw: str): int32 =
+    let text = stripOuterArray(raw)
+    if len(text) <= 0:
+        return 0
+    var depthParen: int32 = 0
+    var depthBracket: int32 = 0
+    var depthBrace: int32 = 0
+    var inString: bool = false
+    var haveToken: bool = false
+    var count: int32 = 0
+    var i: int32 = 0
+    while i < len(text):
+        let ch = text[i]
+        if inString:
+            if ch == '\\' && i + 1 < len(text):
+                i = i + 2
+                haveToken = true
+                continue
+            if ch == '"':
+                inString = false
+            haveToken = true
+            i = i + 1
+            continue
+        if ch == '"':
+            inString = true
+            haveToken = true
+            i = i + 1
+            continue
+        if ch == '(':
+            depthParen = depthParen + 1
+            haveToken = true
+        elif ch == ')':
+            depthParen = depthParen - 1
+            haveToken = true
+        elif ch == '[':
+            depthBracket = depthBracket + 1
+            haveToken = true
+        elif ch == ']':
+            depthBracket = depthBracket - 1
+            haveToken = true
+        elif ch == '{':
+            depthBrace = depthBrace + 1
+            haveToken = true
+        elif ch == '}':
+            depthBrace = depthBrace - 1
+            haveToken = true
+        elif ch == ',' && depthParen == 0 && depthBracket == 0 && depthBrace == 0:
+            count = count + 1
+            haveToken = false
+        elif ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n':
+            haveToken = true
+        i = i + 1
+    if haveToken:
+        return count + 1
+    return count
+
+fn topLevelArrayParts(raw: str): str[] =
+    let text = stripOuterArray(raw)
+    var out: str[]
+    out = []
+    if len(text) <= 0:
+        return out
+    var depthParen: int32 = 0
+    var depthBracket: int32 = 0
+    var depthBrace: int32 = 0
+    var inString: bool = false
+    var partStart: int32 = 0
+    var i: int32 = 0
+    while i < len(text):
+        let ch = text[i]
+        if inString:
+            if ch == '\\' && i + 1 < len(text):
+                i = i + 2
+                continue
+            if ch == '"':
+                inString = false
+            i = i + 1
+            continue
+        if ch == '"':
+            inString = true
+            i = i + 1
+            continue
+        if ch == '(':
+            depthParen = depthParen + 1
+        elif ch == ')':
+            depthParen = depthParen - 1
+        elif ch == '[':
+            depthBracket = depthBracket + 1
+        elif ch == ']':
+            depthBracket = depthBracket - 1
+        elif ch == '{':
+            depthBrace = depthBrace + 1
+        elif ch == '}':
+            depthBrace = depthBrace - 1
+        elif ch == ',' && depthParen == 0 && depthBracket == 0 && depthBrace == 0:
+            let part = trimAsciiWhitespace(srun.sliceView(text, partStart, i))
+            if len(part) > 0:
+                add(out, part)
+            partStart = i + 1
+        i = i + 1
+    let tail = trimAsciiWhitespace(srun.sliceView(text, partStart, len(text)))
+    if len(tail) > 0:
+        add(out, tail)
+    return out
+
+fn parseDecimalInt32(text: str): int32 =
+    let raw = trimAsciiWhitespace(text)
+    if len(raw) <= 0:
+        panic("taiji: empty int32 text")
+    var start: int32 = 0
+    var sign: int32 = 1
+    if raw[0] == '-':
+        sign = -1
+        start = 1
+    if start >= len(raw):
+        panic("taiji: malformed int32 text " + raw)
+    var value: int32 = 0
+    for i in start..<len(raw):
+        let ch = raw[i]
+        if ch < '0' || ch > '9':
+            panic("taiji: non-decimal int32 text " + raw)
+        value = value * 10 + int32(ch) - int32('0')
+    return value * sign
+
+fn jsonArrayIntValues(raw: str): int32[] =
+    let parts = topLevelArrayParts(raw)
+    var out: int32[]
+    out = []
+    for i in 0..<parts.len:
+        add(out, parseDecimalInt32(parts[i]))
+    return out
+
+fn jsonArrayStringValues(raw: str): str[] =
+    let parts = topLevelArrayParts(raw)
+    var out: str[]
+    out = []
+    for i in 0..<parts.len:
+        let text = trimAsciiWhitespace(parts[i])
+        if len(text) < 2 || text[0] != '"' || text[len(text) - 1] != '"':
+            panic("taiji: malformed json string array item " + text)
+        add(out, srun.sliceView(text, 1, len(text) - 1))
+    return out
+
+fn jsonCountObjectValue(raw: str, key: str): int32 =
+    let needle = jsonQuote(key) + ":"
+    var i: int32 = 0
+    while i + len(needle) <= len(raw):
+        let window = srun.sliceView(raw, i, i + len(needle))
+        if window == needle:
+            var start = i + len(needle)
+            while start < len(raw) &&
+                  (raw[start] == ' ' || raw[start] == '\t' || raw[start] == '\r' || raw[start] == '\n'):
+                start = start + 1
+            var stop = start
+            while stop < len(raw) && raw[stop] != ',' && raw[stop] != '}':
+                stop = stop + 1
+            return parseDecimalInt32(trimAsciiWhitespace(srun.sliceView(raw, start, stop)))
+        i = i + 1
+    panic("taiji: missing json count key " + key)
+
+fn jsonCountObjectValues(raw: str, keys: str[]): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<keys.len:
+        add(out, jsonCountObjectValue(raw, keys[i]))
+    return out
+
+fn planeIndex(planeOrder: str[], plane: str): int32 =
+    for i in 0..<planeOrder.len:
+        if planeOrder[i] == plane:
+            return i
+    return -1
+
+fn planePairOrder(planeOrder: str[]): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<planeOrder.len:
+        for j in 0..<planeOrder.len:
+            add(out, planeOrder[i] + "->" + planeOrder[j])
+    return out
+
+fn semanticEdgeKindOrder(): str[] =
+    return ["lowers_to",
+            "gates/effect/string",
+            "gates/effect/compiler_core",
+            "gates/effect/unimaker",
+            "gates/effect/network_distribution",
+            "gates/alias",
+            "gates/bounds/compiler_core",
+            "gates/layout/compiler_core",
+            "gates/layout/network_distribution",
+            "gates/ownership/string",
+            "gates/ownership/compiler_core",
+            "gates/ownership/unimaker",
+            "gates/ownership/network_distribution"]
+
+fn edgeKindIndex(edgeKindOrder: str[], edgeKind: str): int32 =
+    for i in 0..<edgeKindOrder.len:
+        if edgeKindOrder[i] == edgeKind:
+            return i
+    return -1
+
+fn edgePlanePairCounts(lowNodeIdsRaw: str,
+                       lowPlanesRaw: str,
+                       edgeNodeIdsRaw: str,
+                       targetPlanesRaw: str,
+                       planeOrder: str[]): int32[] =
+    let lowNodeIds = jsonArrayIntValues(lowNodeIdsRaw)
+    let lowPlanes = jsonArrayStringValues(lowPlanesRaw)
+    let edgeNodeIds = jsonArrayIntValues(edgeNodeIdsRaw)
+    let targetPlanes = jsonArrayStringValues(targetPlanesRaw)
+    if lowNodeIds.len != lowPlanes.len:
+        panic("taiji: low_uir plane map length mismatch")
+    if edgeNodeIds.len != targetPlanes.len:
+        panic("taiji: validated edge plane length mismatch")
+    var out: int32[]
+    out = []
+    for i in 0..<planeOrder.len * planeOrder.len:
+        add(out, 0)
+    for i in 0..<edgeNodeIds.len:
+        var sourcePlane: str = ""
+        for j in 0..<lowNodeIds.len:
+            if lowNodeIds[j] == edgeNodeIds[i]:
+                sourcePlane = lowPlanes[j]
+                break
+        if len(sourcePlane) <= 0:
+            panic("taiji: missing low_uir plane for edge node " + intToStr(edgeNodeIds[i]))
+        let leftIdx = planeIndex(planeOrder, sourcePlane)
+        let rightIdx = planeIndex(planeOrder, targetPlanes[i])
+        if leftIdx < 0 || rightIdx < 0:
+            panic("taiji: unknown plane pair " + sourcePlane + " -> " + targetPlanes[i])
+        out[leftIdx * planeOrder.len + rightIdx] = out[leftIdx * planeOrder.len + rightIdx] + 1
+    return out
+
+fn semanticEdgeFamilyCounts(lowNodeIds: int32[],
+                            lowPlanes: str[],
+                            edgeNodeIds: int32[],
+                            targetPlanes: str[],
+                            edgeKinds: str[],
+                            edgeKindOrder: str[],
+                            planeOrder: str[]): int32[] =
+    if lowNodeIds.len != lowPlanes.len:
+        panic("taiji: low_uir plane map length mismatch")
+    if edgeNodeIds.len != targetPlanes.len || edgeNodeIds.len != edgeKinds.len:
+        panic("taiji: semantic edge family length mismatch")
+    let planePairCount = planeOrder.len * planeOrder.len
+    var out: int32[]
+    out = []
+    for i in 0..<edgeKindOrder.len * planePairCount:
+        add(out, 0)
+    for i in 0..<edgeNodeIds.len:
+        let nodeIdx = baguaAnnotationIndexForNode(lowNodeIds, edgeNodeIds[i])
+        if nodeIdx < 0:
+            panic("taiji: missing low_uir plane for semantic edge node " + intToStr(edgeNodeIds[i]))
+        let edgeKindIdx = edgeKindIndex(edgeKindOrder, edgeKinds[i])
+        let leftIdx = planeIndex(planeOrder, lowPlanes[nodeIdx])
+        let rightIdx = planeIndex(planeOrder, targetPlanes[i])
+        if edgeKindIdx < 0 || leftIdx < 0 || rightIdx < 0:
+            panic("taiji: unknown semantic edge family " + edgeKinds[i] + "|" + lowPlanes[nodeIdx] + "->" + targetPlanes[i])
+        let familyIdx = edgeKindIdx * planePairCount + leftIdx * planeOrder.len + rightIdx
+        out[familyIdx] = out[familyIdx] + 1
+    return out
+
+fn repeatStringArray(value: str, count: int32): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<count:
+        add(out, value)
+    return out
+
+fn prefixStringArray(values: str[], prefix: str): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<values.len:
+        add(out, prefix + values[i])
+    return out
+
+fn semanticProofEdgeKind(proofKind: str, sourceKind: str): str =
+    if proofKind == "effect":
+        return "gates/effect/" + sourceKind
+    if proofKind == "layout":
+        return "gates/layout/" + sourceKind
+    if proofKind == "bounds":
+        return "gates/bounds/" + sourceKind
+    if proofKind == "ownership":
+        return "gates/ownership/" + sourceKind
+    return "gates/" + proofKind
+
+fn semanticProofEdgeKinds(proofKinds: str[], sourceKind: str): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<proofKinds.len:
+        add(out, semanticProofEdgeKind(proofKinds[i], sourceKind))
+    return out
+
+fn addCountVectors(left: int32[], right: int32[]): int32[] =
+    if left.len != right.len:
+        panic("taiji: count vector length mismatch")
+    var out: int32[]
+    out = []
+    for i in 0..<left.len:
+        add(out, left[i] + right[i])
+    return out
+
+fn countLiteralOccurrences(text: str, needle: str): int32 =
+    if len(needle) <= 0 || len(text) < len(needle):
+        return 0
+    var out: int32 = 0
+    var i: int32 = 0
+    while i + len(needle) <= len(text):
+        let window = srun.sliceView(text, i, i + len(needle))
+        if window == needle:
+            out = out + 1
+            i = i + len(needle)
+        else:
+            i = i + 1
+    return out
+
+fn jsonInlineCountObject(keys: str[], counts: int32[]): str =
+    var fields: str[]
+    fields = []
+    for i in 0..<keys.len:
+        add(fields, jsonInlineFieldRaw(keys[i], intToStr(counts[i])))
+    return jsonInlineObject(fields)
+
+fn countQuotedNames(rawArray: str, names: str[]): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<names.len:
+        add(out, countLiteralOccurrences(rawArray, jsonQuote(names[i])))
+    return out
+
+fn countTrueValues(rawArray: str): int32 =
+    return countLiteralOccurrences(rawArray, "true")
+
+fn taijiSeedProfilePath(outDir: str, sampleId: str): str =
+    return taijiSeedSamplePath(outDir, sampleId, "taiji_profile_report.json")
+
+fn taijiProfileDocument(sourcePath: str,
+                        sourceLabel: str,
+                        sourceKind: str,
+                        astDoc: TaijiDocument,
+                        lowDoc: TaijiDocument,
+                        traceDoc: TaijiDocument,
+                        proofDoc: TaijiDocument): TaijiDocument =
+    let passHintGroupOrder = ["none", "cfg_proof", "layout_sroa", "side_effect_ordering", "loop_vector_worklist"]
+    let planeOrder = ["P1=乾坤", "P2=坎离", "P3=艮兑", "P4=震巽"]
+    let trigramOrder = ["乾", "坤", "坎", "离", "艮", "兑", "震", "巽"]
+    let trigramAsciiOrder = ["qian", "kun", "kan", "li", "gen", "dui", "zhen", "xun"]
+    let proofKindOrder = ["effect", "alias", "bounds", "layout", "ownership"]
+    let astNodeIds = jsonDocFieldRaw(astDoc.text, "node_ids")
+    let lowNodeIds = jsonDocFieldRaw(lowDoc.text, "node_ids")
+    let lowPlanes = jsonDocFieldRaw(lowDoc.text, "bagua_plane")
+    let phaseEvents = jsonDocFieldRaw(traceDoc.text, "event_ids")
+    let phaseLowUirNodeIds = jsonDocFieldRaw(traceDoc.text, "low_uir_node_ids")
+    let phasePlanes = jsonDocFieldRaw(traceDoc.text, "plane")
+    let phaseTrigrams = jsonDocFieldRaw(traceDoc.text, "trigrams")
+    let proofTasks = jsonDocFieldRaw(proofDoc.text, "task_ids")
+    let proofTargets = jsonDocFieldRaw(proofDoc.text, "targets")
+    let proofKinds = jsonDocFieldRaw(proofDoc.text, "kinds")
+    let proofGatePlanes = jsonDocFieldRaw(proofDoc.text, "bagua_gate_plane")
+    let proofCheckerResults = jsonDocFieldRaw(proofDoc.text, "checker_results")
+    let passHintGroups = jsonDocFieldRaw(lowDoc.text, "bagua_pass_hint_group")
+    let astMatrixCounts = jsonDocFieldRaw(astDoc.text, "bagua_matrix_counts")
+    let astMatrixWeights = jsonDocFieldRaw(astDoc.text, "bagua_matrix_weights")
+    let lowMatrixCounts = jsonDocFieldRaw(lowDoc.text, "bagua_matrix_counts")
+    let lowMatrixWeights = jsonDocFieldRaw(lowDoc.text, "bagua_matrix_weights")
+    let lowPlaneCounts = countQuotedNames(lowPlanes, planeOrder)
+    let phasePlaneCounts = countQuotedNames(phasePlanes, planeOrder)
+    let passHintGroupCounts = countQuotedNames(passHintGroups, passHintGroupOrder)
+    let passHintFlagCounts = [countTrueValues(jsonDocFieldRaw(lowDoc.text, "bagua_pass_hint_cfg_proof")),
+                              countTrueValues(jsonDocFieldRaw(lowDoc.text, "bagua_pass_hint_layout_sroa")),
+                              countTrueValues(jsonDocFieldRaw(lowDoc.text, "bagua_pass_hint_side_effect_ordering")),
+                              countTrueValues(jsonDocFieldRaw(lowDoc.text, "bagua_pass_hint_loop_vector_worklist"))]
+    let phaseTrigramTextCounts = countQuotedNames(phaseTrigrams, trigramOrder)
+    let phaseTrigramAsciiCounts = countQuotedNames(phaseTrigrams, trigramAsciiOrder)
+    let phaseTrigramCounts = [phaseTrigramTextCounts[0] + phaseTrigramAsciiCounts[0],
+                              phaseTrigramTextCounts[1] + phaseTrigramAsciiCounts[1],
+                              phaseTrigramTextCounts[2] + phaseTrigramAsciiCounts[2],
+                              phaseTrigramTextCounts[3] + phaseTrigramAsciiCounts[3],
+                              phaseTrigramTextCounts[4] + phaseTrigramAsciiCounts[4],
+                              phaseTrigramTextCounts[5] + phaseTrigramAsciiCounts[5],
+                              phaseTrigramTextCounts[6] + phaseTrigramAsciiCounts[6],
+                              phaseTrigramTextCounts[7] + phaseTrigramAsciiCounts[7]]
+    let proofKindCounts = countQuotedNames(proofKinds, proofKindOrder)
+    let proofGatePlaneCounts = countQuotedNames(proofGatePlanes, planeOrder)
+    let proofFailCount = countLiteralOccurrences(proofCheckerResults, jsonQuote("fail"))
+    let validatedLowersToCount = countTopLevelCsvParts(phaseEvents)
+    let validatedGatesCount = countTopLevelCsvParts(proofTasks)
+    let planePairKeys = planePairOrder(planeOrder)
+    let phaseEdgePlanePairCounts = edgePlanePairCounts(lowNodeIds,
+                                                       lowPlanes,
+                                                       phaseLowUirNodeIds,
+                                                       phasePlanes,
+                                                       planeOrder)
+    let proofEdgePlanePairCounts = edgePlanePairCounts(lowNodeIds,
+                                                       lowPlanes,
+                                                       proofTargets,
+                                                       proofGatePlanes,
+                                                       planeOrder)
+    let validatedEdgePlanePairCounts = addCountVectors(phaseEdgePlanePairCounts, proofEdgePlanePairCounts)
+    var fields: str[]
+    fields = []
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.profile_report.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote(sourceKind)))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("ast_cid", jsonQuote(astDoc.cid)))
+    add(fields, jsonFieldRaw("low_uir_cid", jsonQuote(lowDoc.cid)))
+    add(fields, jsonFieldRaw("bagua_trace_cid", jsonQuote(traceDoc.cid)))
+    add(fields, jsonFieldRaw("proof_task_cid", jsonQuote(proofDoc.cid)))
+    add(fields, jsonFieldRaw("ast_node_count", intToStr(countTopLevelCsvParts(astNodeIds))))
+    add(fields, jsonFieldRaw("low_uir_node_count", intToStr(countTopLevelCsvParts(lowNodeIds))))
+    add(fields, jsonFieldRaw("phase_event_count", intToStr(countTopLevelCsvParts(phaseEvents))))
+    add(fields, jsonFieldRaw("proof_task_count", intToStr(countTopLevelCsvParts(proofTasks))))
+    add(fields, jsonFieldRaw("ast_bagua_matrix_counts", astMatrixCounts))
+    add(fields, jsonFieldRaw("ast_bagua_matrix_weights", astMatrixWeights))
+    add(fields, jsonFieldRaw("low_uir_bagua_matrix_counts", lowMatrixCounts))
+    add(fields, jsonFieldRaw("low_uir_bagua_matrix_weights", lowMatrixWeights))
+    add(fields, jsonFieldRaw("bpi_validation_scope",
+                             jsonInlineObject([jsonInlineFieldRaw("phase", jsonQuote("lowers_to")),
+                                               jsonInlineFieldRaw("proof", jsonQuote("gates"))])))
+    add(fields, jsonFieldRaw("validated_lowers_to_count", intToStr(validatedLowersToCount)))
+    add(fields, jsonFieldRaw("validated_gates_count", intToStr(validatedGatesCount)))
+    add(fields, jsonFieldRaw("validated_edge_count", intToStr(validatedLowersToCount + validatedGatesCount)))
+    add(fields, jsonFieldRaw("validated_edge_kind_counts",
+                             jsonInlineObject([jsonInlineFieldRaw("lowers_to", intToStr(validatedLowersToCount)),
+                                               jsonInlineFieldRaw("gates", intToStr(validatedGatesCount))])))
+    add(fields, jsonFieldRaw("low_uir_plane_counts", jsonInlineCountObject(planeOrder, lowPlaneCounts)))
+    add(fields, jsonFieldRaw("phase_target_plane_counts", jsonInlineCountObject(planeOrder, phasePlaneCounts)))
+    add(fields, jsonFieldRaw("proof_gate_plane_counts", jsonInlineCountObject(planeOrder, proofGatePlaneCounts)))
+    add(fields, jsonFieldRaw("phase_edge_plane_pair_counts",
+                             jsonInlineCountObject(planePairKeys, phaseEdgePlanePairCounts)))
+    add(fields, jsonFieldRaw("proof_edge_plane_pair_counts",
+                             jsonInlineCountObject(planePairKeys, proofEdgePlanePairCounts)))
+    add(fields, jsonFieldRaw("validated_edge_plane_pair_counts",
+                             jsonInlineCountObject(planePairKeys, validatedEdgePlanePairCounts)))
+    add(fields, jsonFieldRaw("low_uir_pass_hint_group_counts",
+                             jsonInlineCountObject(passHintGroupOrder, passHintGroupCounts)))
+    add(fields, jsonFieldRaw("low_uir_pass_hint_flag_counts",
+                             jsonInlineObject([jsonInlineFieldRaw("cfg_proof", intToStr(passHintFlagCounts[0])),
+                                               jsonInlineFieldRaw("layout_sroa", intToStr(passHintFlagCounts[1])),
+                                               jsonInlineFieldRaw("side_effect_ordering", intToStr(passHintFlagCounts[2])),
+                                               jsonInlineFieldRaw("loop_vector_worklist", intToStr(passHintFlagCounts[3]))])))
+    add(fields, jsonFieldRaw("phase_trigram_counts", jsonInlineCountObject(trigramOrder, phaseTrigramCounts)))
+    add(fields, jsonFieldRaw("proof_kind_counts", jsonInlineCountObject(proofKindOrder, proofKindCounts)))
+    add(fields, jsonFieldRaw("proof_fail_count", intToStr(proofFailCount)))
+    return taijiDocument(jsonObject(fields))
+
+fn jsonNestedIntArrays(flatValues: int32[], bucketStarts: int32[], bucketCounts: int32[]): str =
+    var buckets: str[]
+    buckets = []
+    for i in 0..<bucketCounts.len:
+        var values: int32[]
+        values = []
+        let start = bucketStarts[i]
+        for j in 0..<bucketCounts[i]:
+            add(values, flatValues[start + j])
+        add(buckets, jsonIntArray(values))
+    return jsonRawArray(buckets)
+
+fn jsonNestedStringArrays(flatValues: str[], bucketStarts: int32[], bucketCounts: int32[]): str =
+    var buckets: str[]
+    buckets = []
+    for i in 0..<bucketCounts.len:
+        var values: str[]
+        values = []
+        let start = bucketStarts[i]
+        for j in 0..<bucketCounts[i]:
+            add(values, flatValues[start + j])
+        add(buckets, jsonStringArray(values))
+    return jsonRawArray(buckets)
+
+fn appendBaguaNodeFields(fields: var str[],
+                         annotations: bcore.BaguaAnnotation[],
+                         matrix: bcore.BaguaMatrix) =
+    add(fields, jsonFieldRaw("bagua_upper", jsonStringArray(bcore.annotationUppers(annotations))))
+    add(fields, jsonFieldRaw("bagua_lower", jsonStringArray(bcore.annotationLowers(annotations))))
+    add(fields, jsonFieldRaw("bagua_plane", jsonStringArray(bcore.annotationPlanes(annotations))))
+    add(fields, jsonFieldRaw("bagua_cell_row", jsonIntArray(bcore.annotationCellRows(annotations))))
+    add(fields, jsonFieldRaw("bagua_cell_col", jsonIntArray(bcore.annotationCellCols(annotations))))
+    add(fields, jsonFieldRaw("bagua_lower_family", jsonStringArray(lmatrix.annotationLowerFamilies(annotations))))
+    add(fields, jsonFieldRaw("bagua_lower_preserve_cfg", jsonBoolArray(lmatrix.annotationPreserveCfgFlags(annotations))))
+    add(fields, jsonFieldRaw("bagua_lower_requires_proof", jsonBoolArray(lmatrix.annotationRequiresProofFlags(annotations))))
+    add(fields, jsonFieldRaw("bagua_lower_emits_side_effect", jsonBoolArray(lmatrix.annotationEmitsSideEffectFlags(annotations))))
+    add(fields, jsonFieldRaw("bagua_lower_can_vectorize", jsonBoolArray(lmatrix.annotationCanVectorizeFlags(annotations))))
+    add(fields, jsonFieldRaw("bagua_matrix_counts", jsonIntArray(matrix.counts)))
+    add(fields, jsonFieldRaw("bagua_matrix_weights", jsonIntArray(matrix.weights)))
+    add(fields, jsonFieldRaw("bagua_matrix_node_ids",
+                             jsonNestedIntArrays(matrix.flatNodeIds, matrix.bucketStarts, matrix.counts)))
+    add(fields, jsonFieldRaw("bagua_matrix_stable_hashes",
+                             jsonNestedStringArrays(matrix.flatStableHashes, matrix.bucketStarts, matrix.counts)))
+
+fn appendBaguaLowUirPassHintFields(fields: var str[],
+                                   annotations: bcore.BaguaAnnotation[]) =
+    add(fields, jsonFieldRaw("bagua_pass_hint_group", jsonStringArray(lmatrix.annotationPassHintGroups(annotations))))
+    add(fields, jsonFieldRaw("bagua_pass_hint_cfg_proof", jsonBoolArray(lmatrix.annotationPassHintCfgProofFlags(annotations))))
+    add(fields, jsonFieldRaw("bagua_pass_hint_layout_sroa", jsonBoolArray(lmatrix.annotationPassHintLayoutSroaFlags(annotations))))
+    add(fields, jsonFieldRaw("bagua_pass_hint_side_effect_ordering",
+                             jsonBoolArray(lmatrix.annotationPassHintSideEffectOrderingFlags(annotations))))
+    add(fields, jsonFieldRaw("bagua_pass_hint_loop_vector_worklist",
+                             jsonBoolArray(lmatrix.annotationPassHintLoopVectorWorklistFlags(annotations))))
+
+fn phasePlaneForTag(tag: TaijiBaguaTag): str =
+    return bcore.guaPlane(tag.trigram)
+
+fn phaseCellRowForTag(tag: TaijiBaguaTag): int32 =
+    return bcore.guaIndex(tag.trigram)
+
+fn phaseCellColForTag(tag: TaijiBaguaTag): int32 =
+    return bcore.guaIndex(tag.trigram)
+
+fn proofGateCell(annotation: bcore.BaguaAnnotation): str =
+    return bcore.baguaCellText(annotation.cellRow, annotation.cellCol)
+
+fn baguaAnnotationIndexForNode(nodeIds: int32[], targetNodeId: int32): int32 =
+    for i in 0..<nodeIds.len:
+        if nodeIds[i] == targetNodeId:
+            return i
+    return -1
+
+fn requireBaguaAllowedEdge(kind: str, leftPlane: str, rightPlane: str, context: str) =
+    if !bcore.allowEdge(kind, leftPlane, rightPlane):
+        let familyId = bcore.edgeFamilyId(kind, leftPlane, rightPlane)
+        panic("taiji: bpi edge violation kind=" + kind +
+              " left=" + leftPlane +
+              " right=" + rightPlane +
+              " family=" + familyId +
+              " context=" + context)
+
+fn validateBaguaPhaseLowering(nodeIds: int32[],
+                              annotations: bcore.BaguaAnnotation[],
+                              lowNodeId: int32,
+                              phasePlane: str,
+                              context: str) =
+    let idx = baguaAnnotationIndexForNode(nodeIds, lowNodeId)
+    if idx < 0:
+        panic("taiji: missing bpi phase node for " + context)
+    requireBaguaAllowedEdge("lowers_to", annotations[idx].plane, phasePlane, context)
+
+fn validateBaguaProofGate(nodeIds: int32[],
+                          annotations: bcore.BaguaAnnotation[],
+                          lowNodeId: int32,
+                          proofKind: str,
+                          sourceKind: str,
+                          gatePlane: str,
+                          context: str) =
+    let idx = baguaAnnotationIndexForNode(nodeIds, lowNodeId)
+    if idx < 0:
+        panic("taiji: missing bpi proof node for " + context)
+    requireBaguaAllowedEdge(semanticProofEdgeKind(proofKind, sourceKind), annotations[idx].plane, gatePlane, context)
+
+fn sourceKindForPathOrSample(sourcePath: str, builtInSample: str): str =
+    if builtInSample == "string":
+        return "string"
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        return "network_distribution"
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        return "compiler_core"
+    if parsed.unimakerProgram.decls.len > 0:
+        return "unimaker"
+    panic("taiji: unsupported source surface for " + sourcePath)
+
+fn taijiRequireSourcePath(): str =
+    let sourcePath = readFlagDefault("--in", "")
+    if len(sourcePath) <= 0:
+        panic("taiji: missing --in")
+    return sourcePath
+
+fn taijiSampleName(): str =
+    return readFlagDefault("--sample", "")
+
+fn taijiBuiltInStringSourcePath(): str =
+    return "v2/src/compiler/frontend/string_surface_ir_v2.cheng#sampleStringSurfaceProgram"
+
+fn taijiBuiltInStringSourceLabel(): str =
+    return "sampleStringSurfaceProgram"
+
+fn taijiResolveSourcePath(sampleName: str): str =
+    if sampleName == "string":
+        return taijiBuiltInStringSourcePath()
+    return taijiRequireSourcePath()
+
+fn taijiResolveSourceLabel(sourcePath: str, sampleName: str): str =
+    if sampleName == "string":
+        return taijiBuiltInStringSourceLabel()
+    return sourceLabelFromPath(sourcePath)
+
+fn taijiOutputPathOrEmpty(): str =
+    return readFlagDefault("--out", "")
+
+fn taijiSeedOutDir(): str =
+    return readFlagDefault("--out-dir", "v2/artifacts/bootstrap/taiji_seed")
+
+fn taijiSeedManifestPath(outDir: str): str =
+    return joinPath2(outDir, "taiji_seed_manifest.jsonl")
+
+fn taijiSeedSemanticEdgeCatalogPath(outDir: str): str =
+    return joinPath2(outDir, "taiji_bpi_semantic_edge_catalog.json")
+
+fn taijiSeedSampleDir(outDir: str, sampleId: str): str =
+    return joinPath2(outDir, sampleId)
+
+fn taijiSeedSamplePath(outDir: str, sampleId: str, fileName: str): str =
+    return joinPath2(taijiSeedSampleDir(outDir, sampleId), fileName)
+
+fn taijiSeedSpecs(): TaijiSeedSpec[] =
+    var out: TaijiSeedSpec[]
+    out = []
+    add(out, taijiSeedSpec("handwritten_core.compiler_core_pipeline_surface",
+                           "handwritten_core",
+                           "compiler_core",
+                           "v2/tests/contracts/compiler_core_pipeline_surface.cheng",
+                           "compiler_core_pipeline_surface",
+                           ""))
+    add(out, taijiSeedSpec("handwritten_core.compiler_core_surface",
+                           "handwritten_core",
+                           "compiler_core",
+                           "v2/tests/contracts/compiler_core_surface.cheng",
+                           "compiler_core_surface",
+                           ""))
+    add(out, taijiSeedSpec("handwritten_core.source_manifest_surface",
+                           "handwritten_core",
+                           "compiler_core",
+                           "v2/tests/contracts/source_manifest_surface.cheng",
+                           "source_manifest_surface",
+                           ""))
+    add(out, taijiSeedSpec("handwritten_core.tooling_selfhost_surface",
+                           "handwritten_core",
+                           "compiler_core",
+                           "v2/tests/contracts/tooling_selfhost_surface.cheng",
+                           "tooling_selfhost_surface",
+                           ""))
+    add(out, taijiSeedSpec("handwritten_core.machine_pipeline_surface",
+                           "handwritten_core",
+                           "compiler_core",
+                           "v2/tests/contracts/machine_pipeline_surface.cheng",
+                           "machine_pipeline_surface",
+                           ""))
+    add(out, taijiSeedSpec("handwritten_core.system_link_exec_surface",
+                           "handwritten_core",
+                           "compiler_core",
+                           "v2/tests/contracts/system_link_exec_surface.cheng",
+                           "system_link_exec_surface",
+                           ""))
+    add(out, taijiSeedSpec("contract_sample.string_surface_sample",
+                           "contract_sample",
+                           "string",
+                           taijiBuiltInStringSourcePath(),
+                           taijiBuiltInStringSourceLabel(),
+                           "string"))
+    add(out, taijiSeedSpec("contract_sample.unimaker_robot_node",
+                           "contract_sample",
+                           "unimaker",
+                           "v2/examples/unimaker_robot_node.cheng",
+                           "unimaker_robot_node",
+                           ""))
+    add(out, taijiSeedSpec("contract_sample.network_distribution_module",
+                           "contract_sample",
+                           "network_distribution",
+                           "v2/examples/network_distribution_module.cheng",
+                           "network_distribution_module",
+                           ""))
+    add(out, taijiSeedSpec("compiler_observation.cheng_tooling_v2",
+                           "compiler_observation",
+                           "compiler_core",
+                           "v2/src/tooling/cheng_tooling_v2.cheng",
+                           "cheng_tooling_v2",
+                           ""))
+    return out
+
+fn taijiStringAstDocument(sourcePath: str,
+                          sourceLabel: str,
+                          program: sir.StringSurfaceProgram): TaijiDocument =
+    var nodeIds: int32[]
+    var nodeKinds: str[]
+    var nodeLabels: str[]
+    var nodeTypeIndexes: int32[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var fields: str[]
+    nodeIds = []
+    nodeKinds = []
+    nodeLabels = []
+    nodeTypeIndexes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    fields = []
+    for i in 0..<program.exprs.len:
+        add(nodeIds, i)
+        add(nodeKinds, program.exprs[i].surfaceForm)
+        add(nodeLabels, sir.stringSurfaceExprSummary(program.exprs[i]))
+        add(nodeTypeIndexes, 0)
+        if i > 0:
+            add(edgeKinds, "sequence_next")
+            add(edgeSources, i - 1)
+            add(edgeTargets, i)
+    let baguaAnnotations = astbagua.annotateAstNodes("string", nodeIds, nodeKinds, nodeLabels)
+    let baguaMatrix = bcore.buildMatrix(nodeIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.ast_graph.v0")))
+    add(fields, jsonFieldRaw("graph_kind", jsonQuote("surface_ast")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("string")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(nodeIds)))
+    add(fields, jsonFieldRaw("node_kinds", jsonStringArray(nodeKinds)))
+    add(fields, jsonFieldRaw("node_labels", jsonStringArray(nodeLabels)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    add(fields, jsonFieldRaw("node_type_indexes", jsonIntArray(nodeTypeIndexes)))
+    add(fields, jsonFieldRaw("type_table", jsonStringArray(["string_expr"])))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiUnimakerTypeIndex(kind: str): int32 =
+    if kind == "asset_decl":
+        return 0
+    if kind == "actor_decl":
+        return 1
+    if kind == "ganzhi_state_decl":
+        return 2
+    if kind == "hardware_callback_decl":
+        return 3
+    return 4
+
+fn taijiUnimakerAstDocument(sourcePath: str,
+                            sourceLabel: str,
+                            program: uir.UnimakerSurfaceProgram): TaijiDocument =
+    var nodeIds: int32[]
+    var nodeKinds: str[]
+    var nodeLabels: str[]
+    var nodeTypeIndexes: int32[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var fields: str[]
+    nodeIds = []
+    nodeKinds = []
+    nodeLabels = []
+    nodeTypeIndexes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    fields = []
+    for i in 0..<program.decls.len:
+        add(nodeIds, i)
+        add(nodeKinds, program.decls[i].kind)
+        add(nodeLabels, uir.unimakerSurfaceDeclSummary(program.decls[i]))
+        add(nodeTypeIndexes, taijiUnimakerTypeIndex(program.decls[i].kind))
+        if i > 0:
+            add(edgeKinds, "sequence_next")
+            add(edgeSources, i - 1)
+            add(edgeTargets, i)
+    let baguaAnnotations = astbagua.annotateAstNodes("unimaker", nodeIds, nodeKinds, nodeLabels)
+    let baguaMatrix = bcore.buildMatrix(nodeIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.ast_graph.v0")))
+    add(fields, jsonFieldRaw("graph_kind", jsonQuote("surface_ast")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("unimaker")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(nodeIds)))
+    add(fields, jsonFieldRaw("node_kinds", jsonStringArray(nodeKinds)))
+    add(fields, jsonFieldRaw("node_labels", jsonStringArray(nodeLabels)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    add(fields, jsonFieldRaw("node_type_indexes", jsonIntArray(nodeTypeIndexes)))
+    add(fields, jsonFieldRaw("type_table", jsonStringArray(["asset_decl",
+                                                            "actor_decl",
+                                                            "ganzhi_state_decl",
+                                                            "hardware_callback_decl",
+                                                            "evolve_decl"])))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiNetworkAstDocument(sourcePath: str,
+                           sourceLabel: str,
+                           program: nsurf.NetworkDistributionProgram): TaijiDocument =
+    var nodeIds: int32[]
+    var nodeKinds: str[]
+    var nodeLabels: str[]
+    var nodeTypeIndexes: int32[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var topologyIds: int32[]
+    var fields: str[]
+    nodeIds = []
+    nodeKinds = []
+    nodeLabels = []
+    nodeTypeIndexes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    topologyIds = []
+    fields = []
+    for i in 0..<program.topologies.len:
+        add(nodeIds, i)
+        add(topologyIds, i)
+        add(nodeKinds, "topology_decl")
+        add(nodeLabels, nsurf.topologyCanonicalForm(program.topologies[i]))
+        add(nodeTypeIndexes, 0)
+        if i > 0:
+            add(edgeKinds, "topology_next")
+            add(edgeSources, i - 1)
+            add(edgeTargets, i)
+    let opBase = program.topologies.len
+    for i in 0..<program.ops.len:
+        let opNodeId = opBase + i
+        add(nodeIds, opNodeId)
+        add(nodeKinds, "network_op")
+        add(nodeLabels, nsurf.networkDistributionOpSummary(program.ops[i]))
+        add(nodeTypeIndexes, 1)
+        if i > 0:
+            add(edgeKinds, "op_next")
+            add(edgeSources, opBase + i - 1)
+            add(edgeTargets, opNodeId)
+        for j in 0..<program.topologies.len:
+            if program.topologies[j].name == program.ops[i].topologyRef:
+                add(edgeKinds, "op_topology_ref")
+                add(edgeSources, opNodeId)
+                add(edgeTargets, j)
+                break
+    let baguaAnnotations = astbagua.annotateAstNodes("network_distribution", nodeIds, nodeKinds, nodeLabels)
+    let baguaMatrix = bcore.buildMatrix(nodeIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.ast_graph.v0")))
+    add(fields, jsonFieldRaw("graph_kind", jsonQuote("surface_ast")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("network_distribution")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(nodeIds)))
+    add(fields, jsonFieldRaw("node_kinds", jsonStringArray(nodeKinds)))
+    add(fields, jsonFieldRaw("node_labels", jsonStringArray(nodeLabels)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    add(fields, jsonFieldRaw("node_type_indexes", jsonIntArray(nodeTypeIndexes)))
+    add(fields, jsonFieldRaw("type_table", jsonStringArray(["topology_decl", "network_op"])))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiCompilerCoreTopLevelTypeIndex(kind: str): int32 =
+    if kind == "module":
+        return 0
+    if kind == "import":
+        return 1
+    if kind == "type":
+        return 2
+    if kind == "const":
+        return 3
+    if kind == "var":
+        return 4
+    if kind == "importc_fn":
+        return 5
+    if kind == "iterator":
+        return 7
+    return 6
+
+fn taijiCompilerCoreAstDocument(sourcePath: str,
+                                sourceLabel: str,
+                                program: ccore.CompilerCoreProgram): TaijiDocument =
+    var nodeIds: int32[]
+    var nodeKinds: str[]
+    var nodeLabels: str[]
+    var nodeTypeIndexes: int32[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var fields: str[]
+    var moduleIdx: int32 = 0
+    var importIdx: int32 = 0
+    var typeIdx: int32 = 0
+    var constIdx: int32 = 0
+    var varIdx: int32 = 0
+    var routineIdx: int32 = 0
+    var routineNodeIds: int32[]
+    nodeIds = []
+    nodeKinds = []
+    nodeLabels = []
+    nodeTypeIndexes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    fields = []
+    routineNodeIds = []
+    let topLevelBase = 0
+    let paramBase = program.topLevelKinds.len
+    let localBase = paramBase + program.routineParams.len
+    let stmtBase = localBase + program.locals.len
+    let exprBase = stmtBase + program.stmts.len
+    for i in 0..<program.topLevelKinds.len:
+        let kind = program.topLevelKinds[i]
+        add(nodeIds, topLevelBase + i)
+        add(nodeKinds, kind)
+        add(nodeTypeIndexes, taijiCompilerCoreTopLevelTypeIndex(kind))
+        if kind == "module":
+            add(nodeLabels, program.modules[moduleIdx].headerText)
+            moduleIdx = moduleIdx + 1
+        elif kind == "import":
+            add(nodeLabels, program.imports[importIdx].modulePath)
+            importIdx = importIdx + 1
+        elif kind == "type":
+            add(nodeLabels, program.typeBlocks[typeIdx].headerText)
+            typeIdx = typeIdx + 1
+        elif kind == "const":
+            add(nodeLabels, program.constDecls[constIdx].headerText)
+            constIdx = constIdx + 1
+        elif kind == "var":
+            add(nodeLabels, program.varDecls[varIdx].headerText)
+            varIdx = varIdx + 1
+        else:
+            add(nodeLabels, program.routines[routineIdx].signatureText)
+            add(routineNodeIds, i)
+            routineIdx = routineIdx + 1
+        if i > 0:
+            add(edgeKinds, "top_level_next")
+            add(edgeSources, i - 1)
+            add(edgeTargets, i)
+    for i in 0..<program.routineParams.len:
+        add(nodeIds, paramBase + i)
+        add(nodeKinds, "param_decl")
+        add(nodeLabels, program.routineParams[i].name + ":" + program.routineParams[i].typeText)
+        add(nodeTypeIndexes, 8)
+    for i in 0..<program.locals.len:
+        add(nodeIds, localBase + i)
+        add(nodeKinds, "local_decl")
+        add(nodeLabels, program.locals[i].name + ":" + program.locals[i].typeText)
+        add(nodeTypeIndexes, 9)
+    for i in 0..<program.stmts.len:
+        add(nodeIds, stmtBase + i)
+        add(nodeKinds, "stmt_node")
+        add(nodeLabels, program.stmts[i].kind + "|" + program.stmts[i].primaryText)
+        add(nodeTypeIndexes, 10)
+    for i in 0..<program.exprs.len:
+        add(nodeIds, exprBase + i)
+        add(nodeKinds, "expr_node")
+        add(nodeLabels, program.exprs[i].kind + "|" + program.exprs[i].primaryText)
+        add(nodeTypeIndexes, 11)
+    for i in 0..<program.routines.len:
+        let routineNodeId = routineNodeIds[i]
+        let routine = program.routines[i]
+        for j in 0..<routine.paramCount:
+            add(edgeKinds, "routine_param")
+            add(edgeSources, routineNodeId)
+            add(edgeTargets, paramBase + routine.paramStart + j)
+        for j in 0..<routine.localCount:
+            add(edgeKinds, "routine_local")
+            add(edgeSources, routineNodeId)
+            add(edgeTargets, localBase + routine.localStart + j)
+        for j in 0..<routine.stmtCount:
+            add(edgeKinds, "routine_stmt")
+            add(edgeSources, routineNodeId)
+            add(edgeTargets, stmtBase + routine.stmtStart + j)
+        for j in 0..<routine.exprCount:
+            add(edgeKinds, "routine_expr")
+            add(edgeSources, routineNodeId)
+            add(edgeTargets, exprBase + routine.exprStart + j)
+    for i in 0..<program.stmts.len:
+        let stmt = program.stmts[i]
+        for j in 0..<stmt.childCount:
+            add(edgeKinds, "stmt_child")
+            add(edgeSources, stmtBase + i)
+            add(edgeTargets, stmtBase + program.stmtChildIds[stmt.childStart + j])
+        for j in 0..<stmt.elseChildCount:
+            add(edgeKinds, "stmt_else_child")
+            add(edgeSources, stmtBase + i)
+            add(edgeTargets, stmtBase + program.stmtChildIds[stmt.elseChildStart + j])
+    for i in 0..<program.exprs.len:
+        let expr = program.exprs[i]
+        for j in 0..<expr.childCount:
+            add(edgeKinds, "expr_child")
+            add(edgeSources, exprBase + i)
+            add(edgeTargets, exprBase + program.exprChildIds[expr.childStart + j])
+    let baguaAnnotations = astbagua.annotateAstNodes("compiler_core", nodeIds, nodeKinds, nodeLabels)
+    let baguaMatrix = bcore.buildMatrix(nodeIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.ast_graph.v0")))
+    add(fields, jsonFieldRaw("graph_kind", jsonQuote("surface_ast")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("compiler_core")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(nodeIds)))
+    add(fields, jsonFieldRaw("node_kinds", jsonStringArray(nodeKinds)))
+    add(fields, jsonFieldRaw("node_labels", jsonStringArray(nodeLabels)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    add(fields, jsonFieldRaw("node_type_indexes", jsonIntArray(nodeTypeIndexes)))
+    add(fields, jsonFieldRaw("type_table", jsonStringArray(["module_decl",
+                                                            "import_decl",
+                                                            "type_block",
+                                                            "const_decl",
+                                                            "var_decl",
+                                                            "importc_fn_decl",
+                                                            "fn_decl",
+                                                            "iterator_decl",
+                                                            "param_decl",
+                                                            "local_decl",
+                                                            "stmt_node",
+                                                            "expr_node"])))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiCompilerCoreInputTypes(bundle: cpipe.CompilerCorePipelineBundle, idx: int32): str =
+    let kind = bundle.lowPlan.topLevelKinds[idx]
+    if kind == "import":
+        return singleTypeRow("module_path")
+    if bundle.lowPlan.executableAstReady[idx]:
+        return jsonStringArray(["params=" + intToStr(bundle.lowPlan.paramCounts[idx]),
+                                "locals=" + intToStr(bundle.lowPlan.localCounts[idx]),
+                                "stmts=" + intToStr(bundle.lowPlan.stmtCounts[idx]),
+                                "exprs=" + intToStr(bundle.lowPlan.exprCounts[idx])])
+    return singleTypeRow("outline_meta")
+
+fn taijiCompilerCoreOutputTypes(bundle: cpipe.CompilerCorePipelineBundle, idx: int32): str =
+    if len(bundle.lowPlan.returnTypeTexts[idx]) > 0:
+        return singleTypeRow(bundle.lowPlan.returnTypeTexts[idx])
+    return singleTypeRow(bundle.lowPlan.topLevelKinds[idx])
+
+fn taijiNetworkInputTypes(bundle: npipe.NetworkDistributionPipelineBundle, idx: int32): str =
+    return jsonStringArray(["addressing=" + bundle.lowPlan.addressingModes[idx],
+                            "depth=" + intToStr(bundle.lowPlan.topologyDepths[idx]),
+                            "topology=" + bundle.program.ops[idx].topologyRef])
+
+fn taijiNetworkOutputTypes(bundle: npipe.NetworkDistributionPipelineBundle, idx: int32): str =
+    return singleTypeRow(bundle.lowPlan.identityScopes[idx])
+
+fn taijiNetworkEffectClass(opName: str): str =
+    if opName == "publish_source_manifest" || opName == "publish_rule_pack" || opName == "publish_compiler_rule_pack":
+        return "network_publish"
+    if opName == "route_lsmr_tree":
+        return "network_route"
+    if opName == "disperse_ida_fragments":
+        return "network_dispersal"
+    if opName == "exchange_anti_entropy_signature":
+        return "network_merge"
+    return "network_repair"
+
+fn taijiUnimakerInputTypes(bundle: upipe.UnimakerPipelineBundle, idx: int32): str =
+    return jsonStringArray([bundle.program.decls[idx].kind,
+                            "network_mode=" + bundle.lowPlan.networkModes[idx],
+                            "capability=" + bundle.lowPlan.capabilityKinds[idx]])
+
+fn taijiUnimakerOutputTypes(bundle: upipe.UnimakerPipelineBundle, idx: int32): str =
+    return singleTypeRow("unit")
+
+fn taijiStringProofDomain(bundle: spipe.StringPipelineBundle, idx: int32): str =
+    let opName = bundle.lowPlan.canonicalOps[idx]
+    if opName == "str_index" || opName == "str_slice_view":
+        return "bounds"
+    if opName == "str_concat" || opName == "str_to_owned" || opName == "str_builder_finish":
+        return "ownership"
+    if opName == "str_builder_init" || opName == "str_builder_append" || opName == "str_builder_append_byte":
+        return "builder_state"
+    return "pure_compare"
+
+fn taijiStringLowUirDocument(sourcePath: str,
+                             sourceLabel: str,
+                             bundle: spipe.StringPipelineBundle): TaijiDocument =
+    var inputTypes: str[]
+    var outputTypes: str[]
+    var proofDomains: str[]
+    var bindingScopes: str[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var fields: str[]
+    inputTypes = []
+    outputTypes = []
+    proofDomains = []
+    bindingScopes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    fields = []
+    for i in 0..<bundle.lowPlan.exprIds.len:
+        add(inputTypes, stringInputTypeRow(bundle.lowPlan.canonicalOps[i]))
+        add(outputTypes, singleTypeRow(bundle.lowPlan.resultKinds[i]))
+        add(proofDomains, taijiStringProofDomain(bundle, i))
+        add(bindingScopes, bundle.lowPlan.allocationModes[i])
+        if i > 0:
+            add(edgeKinds, "sequence_next")
+            add(edgeSources, bundle.lowPlan.exprIds[i - 1])
+            add(edgeTargets, bundle.lowPlan.exprIds[i])
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("string",
+                                                        bundle.lowPlan.exprIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        proofDomains,
+                                                        bindingScopes,
+                                                        bundle.lowPlan.runtimeTargets)
+    let baguaMatrix = bcore.buildMatrix(bundle.lowPlan.exprIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.low_uir_graph.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("string")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(bundle.lowPlan.exprIds)))
+    add(fields, jsonFieldRaw("op_names", jsonStringArray(bundle.lowPlan.canonicalOps)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    appendBaguaLowUirPassHintFields(fields, baguaAnnotations)
+    add(fields, jsonFieldRaw("input_types", jsonRawArray(inputTypes)))
+    add(fields, jsonFieldRaw("output_types", jsonRawArray(outputTypes)))
+    add(fields, jsonFieldRaw("effect_classes", jsonStringArray(bundle.lowPlan.effectClasses)))
+    add(fields, jsonFieldRaw("proof_domains", jsonStringArray(proofDomains)))
+    add(fields, jsonFieldRaw("binding_scopes", jsonStringArray(bindingScopes)))
+    add(fields, jsonFieldRaw("runtime_targets", jsonStringArray(bundle.lowPlan.runtimeTargets)))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiUnimakerLowUirDocument(sourcePath: str,
+                               sourceLabel: str,
+                               bundle: upipe.UnimakerPipelineBundle): TaijiDocument =
+    var inputTypes: str[]
+    var outputTypes: str[]
+    var bindingScopes: str[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var fields: str[]
+    inputTypes = []
+    outputTypes = []
+    bindingScopes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    fields = []
+    for i in 0..<bundle.lowPlan.declIds.len:
+        add(inputTypes, taijiUnimakerInputTypes(bundle, i))
+        add(outputTypes, taijiUnimakerOutputTypes(bundle, i))
+        add(bindingScopes, "decl_scope")
+        if i > 0:
+            add(edgeKinds, "sequence_next")
+            add(edgeSources, bundle.lowPlan.declIds[i - 1])
+            add(edgeTargets, bundle.lowPlan.declIds[i])
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("unimaker",
+                                                        bundle.lowPlan.declIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bindingScopes,
+                                                        bundle.lowPlan.runtimeTargets)
+    let baguaMatrix = bcore.buildMatrix(bundle.lowPlan.declIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.low_uir_graph.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("unimaker")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(bundle.lowPlan.declIds)))
+    add(fields, jsonFieldRaw("op_names", jsonStringArray(bundle.lowPlan.canonicalOps)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    appendBaguaLowUirPassHintFields(fields, baguaAnnotations)
+    add(fields, jsonFieldRaw("input_types", jsonRawArray(inputTypes)))
+    add(fields, jsonFieldRaw("output_types", jsonRawArray(outputTypes)))
+    add(fields, jsonFieldRaw("effect_classes", jsonStringArray(bundle.lowPlan.effectClasses)))
+    add(fields, jsonFieldRaw("proof_domains", jsonStringArray(bundle.lowPlan.proofDomains)))
+    add(fields, jsonFieldRaw("binding_scopes", jsonStringArray(bindingScopes)))
+    add(fields, jsonFieldRaw("runtime_targets", jsonStringArray(bundle.lowPlan.runtimeTargets)))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiNetworkLowUirDocument(sourcePath: str,
+                              sourceLabel: str,
+                              bundle: npipe.NetworkDistributionPipelineBundle): TaijiDocument =
+    var inputTypes: str[]
+    var outputTypes: str[]
+    var effectClasses: str[]
+    var bindingScopes: str[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var fields: str[]
+    inputTypes = []
+    outputTypes = []
+    effectClasses = []
+    bindingScopes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    fields = []
+    for i in 0..<bundle.lowPlan.opIds.len:
+        add(inputTypes, taijiNetworkInputTypes(bundle, i))
+        add(outputTypes, taijiNetworkOutputTypes(bundle, i))
+        add(effectClasses, taijiNetworkEffectClass(bundle.lowPlan.canonicalOps[i]))
+        add(bindingScopes, bundle.lowPlan.addressBindings[i])
+        if i > 0:
+            add(edgeKinds, "sequence_next")
+            add(edgeSources, bundle.lowPlan.opIds[i - 1])
+            add(edgeTargets, bundle.lowPlan.opIds[i])
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("network_distribution",
+                                                        bundle.lowPlan.opIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bindingScopes,
+                                                        bundle.lowPlan.runtimeTargets)
+    let baguaMatrix = bcore.buildMatrix(bundle.lowPlan.opIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.low_uir_graph.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("network_distribution")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(bundle.lowPlan.opIds)))
+    add(fields, jsonFieldRaw("op_names", jsonStringArray(bundle.lowPlan.canonicalOps)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    appendBaguaLowUirPassHintFields(fields, baguaAnnotations)
+    add(fields, jsonFieldRaw("input_types", jsonRawArray(inputTypes)))
+    add(fields, jsonFieldRaw("output_types", jsonRawArray(outputTypes)))
+    add(fields, jsonFieldRaw("effect_classes", jsonStringArray(effectClasses)))
+    add(fields, jsonFieldRaw("proof_domains", jsonStringArray(bundle.lowPlan.proofDomains)))
+    add(fields, jsonFieldRaw("binding_scopes", jsonStringArray(bindingScopes)))
+    add(fields, jsonFieldRaw("runtime_targets", jsonStringArray(bundle.lowPlan.runtimeTargets)))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiCompilerCoreLowUirDocument(sourcePath: str,
+                                   sourceLabel: str,
+                                   bundle: cpipe.CompilerCorePipelineBundle): TaijiDocument =
+    var inputTypes: str[]
+    var outputTypes: str[]
+    var edgeKinds: str[]
+    var edgeSources: int32[]
+    var edgeTargets: int32[]
+    var fields: str[]
+    inputTypes = []
+    outputTypes = []
+    edgeKinds = []
+    edgeSources = []
+    edgeTargets = []
+    fields = []
+    for i in 0..<bundle.lowPlan.itemIds.len:
+        add(inputTypes, taijiCompilerCoreInputTypes(bundle, i))
+        add(outputTypes, taijiCompilerCoreOutputTypes(bundle, i))
+        if i > 0:
+            add(edgeKinds, "sequence_next")
+            add(edgeSources, bundle.lowPlan.itemIds[i - 1])
+            add(edgeTargets, bundle.lowPlan.itemIds[i])
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("compiler_core",
+                                                        bundle.lowPlan.itemIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.bindingScopes,
+                                                        bundle.lowPlan.runtimeTargets)
+    let baguaMatrix = bcore.buildMatrix(bundle.lowPlan.itemIds, baguaAnnotations)
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.low_uir_graph.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("compiler_core")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("storage_model", jsonQuote("soa_index_only")))
+    add(fields, jsonFieldRaw("node_ids", jsonIntArray(bundle.lowPlan.itemIds)))
+    add(fields, jsonFieldRaw("op_names", jsonStringArray(bundle.lowPlan.canonicalOps)))
+    appendBaguaNodeFields(fields, baguaAnnotations, baguaMatrix)
+    appendBaguaLowUirPassHintFields(fields, baguaAnnotations)
+    add(fields, jsonFieldRaw("input_types", jsonRawArray(inputTypes)))
+    add(fields, jsonFieldRaw("output_types", jsonRawArray(outputTypes)))
+    add(fields, jsonFieldRaw("effect_classes", jsonStringArray(bundle.lowPlan.effectClasses)))
+    add(fields, jsonFieldRaw("proof_domains", jsonStringArray(bundle.lowPlan.proofDomains)))
+    add(fields, jsonFieldRaw("binding_scopes", jsonStringArray(bundle.lowPlan.bindingScopes)))
+    add(fields, jsonFieldRaw("runtime_targets", jsonStringArray(bundle.lowPlan.runtimeTargets)))
+    add(fields, jsonFieldRaw("edge_kinds", jsonStringArray(edgeKinds)))
+    add(fields, jsonFieldRaw("edge_sources", jsonIntArray(edgeSources)))
+    add(fields, jsonFieldRaw("edge_targets", jsonIntArray(edgeTargets)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiStringPhaseTraceDocument(sourcePath: str,
+                                 sourceLabel: str,
+                                 bundle: spipe.StringPipelineBundle): TaijiDocument =
+    var events: str[]
+    var fields: str[]
+    var proofDomains: str[]
+    var bindingScopes: str[]
+    events = []
+    fields = []
+    proofDomains = []
+    bindingScopes = []
+    for i in 0..<bundle.lowPlan.exprIds.len:
+        add(proofDomains, taijiStringProofDomain(bundle, i))
+        add(bindingScopes, bundle.lowPlan.allocationModes[i])
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("string",
+                                                        bundle.lowPlan.exprIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        proofDomains,
+                                                        bindingScopes,
+                                                        bundle.lowPlan.runtimeTargets)
+    for i in 0..<bundle.lowPlan.exprIds.len:
+        let tag = stringBaguaTag(bundle.lowPlan.canonicalOps[i])
+        validateBaguaPhaseLowering(bundle.lowPlan.exprIds,
+                                   baguaAnnotations,
+                                   bundle.lowPlan.exprIds[i],
+                                   phasePlaneForTag(tag),
+                                   "string_phase|" + bundle.lowPlan.canonicalOps[i])
+        add(events,
+            jsonInlineObject([jsonInlineFieldRaw("event_id", intToStr(i)),
+                              jsonInlineFieldRaw("state_bits", jsonQuote(tag.stateBits)),
+                              jsonInlineFieldRaw("trigram", jsonQuote(tag.trigram)),
+                              jsonInlineFieldRaw("phase", jsonQuote(tag.phase)),
+                              jsonInlineFieldRaw("plane", jsonQuote(phasePlaneForTag(tag))),
+                              jsonInlineFieldRaw("cell_row", intToStr(phaseCellRowForTag(tag))),
+                              jsonInlineFieldRaw("cell_col", intToStr(phaseCellColForTag(tag))),
+                              jsonInlineFieldRaw("source_node_id", intToStr(bundle.lowPlan.exprIds[i])),
+                              jsonInlineFieldRaw("low_uir_node_id", intToStr(bundle.lowPlan.exprIds[i])),
+                              jsonInlineFieldRaw("reason", jsonQuote(tag.reason))]))
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.phase_space_trace.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("string")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("trace_model", jsonQuote("bagua_v1")))
+    add(fields, jsonFieldRaw("events", jsonRawArray(events)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiUnimakerPhaseTraceDocument(sourcePath: str,
+                                   sourceLabel: str,
+                                   bundle: upipe.UnimakerPipelineBundle): TaijiDocument =
+    var events: str[]
+    var fields: str[]
+    events = []
+    fields = []
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("unimaker",
+                                                        bundle.lowPlan.declIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.networkModes,
+                                                        bundle.lowPlan.runtimeTargets)
+    for i in 0..<bundle.lowPlan.declIds.len:
+        let tag = unimakerBaguaTag(bundle.lowPlan.canonicalOps[i])
+        validateBaguaPhaseLowering(bundle.lowPlan.declIds,
+                                   baguaAnnotations,
+                                   bundle.lowPlan.declIds[i],
+                                   phasePlaneForTag(tag),
+                                   "unimaker_phase|" + bundle.lowPlan.canonicalOps[i])
+        add(events,
+            jsonInlineObject([jsonInlineFieldRaw("event_id", intToStr(i)),
+                              jsonInlineFieldRaw("state_bits", jsonQuote(tag.stateBits)),
+                              jsonInlineFieldRaw("trigram", jsonQuote(tag.trigram)),
+                              jsonInlineFieldRaw("phase", jsonQuote(tag.phase)),
+                              jsonInlineFieldRaw("plane", jsonQuote(phasePlaneForTag(tag))),
+                              jsonInlineFieldRaw("cell_row", intToStr(phaseCellRowForTag(tag))),
+                              jsonInlineFieldRaw("cell_col", intToStr(phaseCellColForTag(tag))),
+                              jsonInlineFieldRaw("source_node_id", intToStr(bundle.lowPlan.declIds[i])),
+                              jsonInlineFieldRaw("low_uir_node_id", intToStr(bundle.lowPlan.declIds[i])),
+                              jsonInlineFieldRaw("reason", jsonQuote(tag.reason))]))
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.phase_space_trace.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("unimaker")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("trace_model", jsonQuote("bagua_v1")))
+    add(fields, jsonFieldRaw("events", jsonRawArray(events)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiNetworkPhaseTraceDocument(sourcePath: str,
+                                  sourceLabel: str,
+                                  bundle: npipe.NetworkDistributionPipelineBundle): TaijiDocument =
+    var events: str[]
+    var fields: str[]
+    var effectClasses: str[]
+    events = []
+    fields = []
+    effectClasses = []
+    for i in 0..<bundle.lowPlan.opIds.len:
+        add(effectClasses, taijiNetworkEffectClass(bundle.lowPlan.canonicalOps[i]))
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("network_distribution",
+                                                        bundle.lowPlan.opIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.addressBindings,
+                                                        bundle.lowPlan.runtimeTargets)
+    for i in 0..<bundle.lowPlan.opIds.len:
+        let tag = networkBaguaTag(bundle.lowPlan.canonicalOps[i])
+        validateBaguaPhaseLowering(bundle.lowPlan.opIds,
+                                   baguaAnnotations,
+                                   bundle.lowPlan.opIds[i],
+                                   phasePlaneForTag(tag),
+                                   "network_phase|" + bundle.lowPlan.canonicalOps[i])
+        add(events,
+            jsonInlineObject([jsonInlineFieldRaw("event_id", intToStr(i)),
+                              jsonInlineFieldRaw("state_bits", jsonQuote(tag.stateBits)),
+                              jsonInlineFieldRaw("trigram", jsonQuote(tag.trigram)),
+                              jsonInlineFieldRaw("phase", jsonQuote(tag.phase)),
+                              jsonInlineFieldRaw("plane", jsonQuote(phasePlaneForTag(tag))),
+                              jsonInlineFieldRaw("cell_row", intToStr(phaseCellRowForTag(tag))),
+                              jsonInlineFieldRaw("cell_col", intToStr(phaseCellColForTag(tag))),
+                              jsonInlineFieldRaw("source_node_id", intToStr(bundle.lowPlan.opIds[i])),
+                              jsonInlineFieldRaw("low_uir_node_id", intToStr(bundle.lowPlan.opIds[i])),
+                              jsonInlineFieldRaw("reason", jsonQuote(tag.reason))]))
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.phase_space_trace.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("network_distribution")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("trace_model", jsonQuote("bagua_v1")))
+    add(fields, jsonFieldRaw("events", jsonRawArray(events)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiCompilerCorePhaseTraceDocument(sourcePath: str,
+                                       sourceLabel: str,
+                                       bundle: cpipe.CompilerCorePipelineBundle): TaijiDocument =
+    var events: str[]
+    var fields: str[]
+    events = []
+    fields = []
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("compiler_core",
+                                                        bundle.lowPlan.itemIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.bindingScopes,
+                                                        bundle.lowPlan.runtimeTargets)
+    for i in 0..<bundle.lowPlan.itemIds.len:
+        let tag = compilerCoreBaguaTag(bundle.lowPlan.canonicalOps[i])
+        validateBaguaPhaseLowering(bundle.lowPlan.itemIds,
+                                   baguaAnnotations,
+                                   bundle.lowPlan.itemIds[i],
+                                   phasePlaneForTag(tag),
+                                   "compiler_core_phase|" + bundle.lowPlan.canonicalOps[i])
+        add(events,
+            jsonInlineObject([jsonInlineFieldRaw("event_id", intToStr(i)),
+                              jsonInlineFieldRaw("state_bits", jsonQuote(tag.stateBits)),
+                              jsonInlineFieldRaw("trigram", jsonQuote(tag.trigram)),
+                              jsonInlineFieldRaw("phase", jsonQuote(tag.phase)),
+                              jsonInlineFieldRaw("plane", jsonQuote(phasePlaneForTag(tag))),
+                              jsonInlineFieldRaw("cell_row", intToStr(phaseCellRowForTag(tag))),
+                              jsonInlineFieldRaw("cell_col", intToStr(phaseCellColForTag(tag))),
+                              jsonInlineFieldRaw("source_node_id", intToStr(bundle.lowPlan.itemIds[i])),
+                              jsonInlineFieldRaw("low_uir_node_id", intToStr(bundle.lowPlan.itemIds[i])),
+                              jsonInlineFieldRaw("reason", jsonQuote(tag.reason))]))
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.phase_space_trace.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("compiler_core")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("trace_model", jsonQuote("bagua_v1")))
+    add(fields, jsonFieldRaw("events", jsonRawArray(events)))
+    return taijiDocument(jsonObject(fields))
+
+fn taijiStringProofDocument(sourcePath: str,
+                            sourceLabel: str,
+                            bundle: spipe.StringPipelineBundle): TaijiProofArtifact =
+    var tasks: str[]
+    var fields: str[]
+    var allPass: bool = true
+    tasks = []
+    fields = []
+    let contract = sops.lowUirStringOpsContract()
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("string",
+                                                        bundle.lowPlan.exprIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.allocationModes,
+                                                        bundle.lowPlan.runtimeTargets)
+    var taskId: int32 = 0
+    for i in 0..<bundle.lowPlan.exprIds.len:
+        let opIdx = sops.findLowUirStringOp(bundle.lowPlan.canonicalOps[i])
+        let contractOp = contract.canonicalOps[opIdx]
+        let gatePlane = baguaAnnotations[i].plane
+        let gateCell = proofGateCell(baguaAnnotations[i])
+        let effectPass = bundle.lowPlan.runtimeTargets[i] == contractOp.runtimeTarget &&
+                         bundle.lowPlan.effectClasses[i] == contractOp.effectClass
+        validateBaguaProofGate(bundle.lowPlan.exprIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.exprIds[i],
+                               "effect",
+                               "string",
+                               gatePlane,
+                               "string_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
+        allPass = allPass && effectPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("effect")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.exprIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("runtime_target 与 effect_class 必须和 canonical op 一致")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("runtime_target=" + contractOp.runtimeTarget +
+                                                                                ", effect_class=" + contractOp.effectClass)),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if effectPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+        let aliasPass = !bundle.lowPlan.zeroCopyFacts[i] ||
+                        bundle.lowPlan.allocationModes[i] == "none" ||
+                        bundle.lowPlan.allocationModes[i] == "borrow_view"
+        validateBaguaProofGate(bundle.lowPlan.exprIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.exprIds[i],
+                               "alias",
+                               "string",
+                               gatePlane,
+                               "string_proof|" + bundle.lowPlan.canonicalOps[i] + "|alias")
+        allPass = allPass && aliasPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("alias")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.exprIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("zero_copy=1 时只能保持无分配或借用视图")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("allocation_mode in [none, borrow_view]")),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if aliasPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.proof_tasks.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("string")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("tasks", jsonRawArray(tasks)))
+    return taijiProofArtifact(jsonObject(fields), allPass)
+
+fn taijiUnimakerProofDocument(sourcePath: str,
+                              sourceLabel: str,
+                              bundle: upipe.UnimakerPipelineBundle): TaijiProofArtifact =
+    var tasks: str[]
+    var fields: str[]
+    var allPass: bool = true
+    tasks = []
+    fields = []
+    let contract = uops.lowUirUnimakerOpsContract()
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("unimaker",
+                                                        bundle.lowPlan.declIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.networkModes,
+                                                        bundle.lowPlan.runtimeTargets)
+    var taskId: int32 = 0
+    for i in 0..<bundle.lowPlan.declIds.len:
+        let opIdx = uops.findLowUirUnimakerOp(bundle.lowPlan.canonicalOps[i])
+        let contractOp = contract.canonicalOps[opIdx]
+        let gatePlane = baguaAnnotations[i].plane
+        let gateCell = proofGateCell(baguaAnnotations[i])
+        let effectPass = bundle.lowPlan.runtimeTargets[i] == contractOp.runtimeTarget &&
+                         bundle.lowPlan.effectClasses[i] == contractOp.effectClass &&
+                         bundle.lowPlan.proofDomains[i] == contractOp.proofDomain
+        validateBaguaProofGate(bundle.lowPlan.declIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.declIds[i],
+                               "effect",
+                               "unimaker",
+                               gatePlane,
+                               "unimaker_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
+        allPass = allPass && effectPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("effect")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.declIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("runtime/effect/proof 必须和 canonical op 一致")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("runtime_target=" + contractOp.runtimeTarget)),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if effectPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+        let opName = bundle.lowPlan.canonicalOps[i]
+        let capabilityPass =
+            (opName == "hardware_callback_def" && bundle.lowPlan.capabilityKinds[i] == "nfc") ||
+            (opName == "evolve_site_def" && bundle.lowPlan.capabilityKinds[i] == "npu") ||
+            ((opName == "asset_contract_def" || opName == "actor_def" || opName == "ganzhi_state_def") &&
+             bundle.lowPlan.capabilityKinds[i] == "none")
+        validateBaguaProofGate(bundle.lowPlan.declIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.declIds[i],
+                               "ownership",
+                               "unimaker",
+                               gatePlane,
+                               "unimaker_proof|" + bundle.lowPlan.canonicalOps[i] + "|ownership")
+        allPass = allPass && capabilityPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("ownership")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.declIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("能力类型必须与声明形状对应")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("capability 与 decl kind 精确匹配")),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if capabilityPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.proof_tasks.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("unimaker")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("tasks", jsonRawArray(tasks)))
+    return taijiProofArtifact(jsonObject(fields), allPass)
+
+fn taijiNetworkProofDocument(sourcePath: str,
+                             sourceLabel: str,
+                             bundle: npipe.NetworkDistributionPipelineBundle): TaijiProofArtifact =
+    var tasks: str[]
+    var fields: str[]
+    var allPass: bool = true
+    tasks = []
+    fields = []
+    let contract = nops.lowUirNetworkDistributionOpsContract()
+    let effectClasses = bundle.lowPlan.priorityClasses
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("network_distribution",
+                                                        bundle.lowPlan.opIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.addressBindings,
+                                                        bundle.lowPlan.runtimeTargets)
+    var taskId: int32 = 0
+    for i in 0..<bundle.lowPlan.opIds.len:
+        let opIdx = nops.findLowUirNetworkDistributionOp(bundle.lowPlan.canonicalOps[i])
+        let contractOp = contract.canonicalOps[opIdx]
+        let gatePlane = baguaAnnotations[i].plane
+        let gateCell = proofGateCell(baguaAnnotations[i])
+        let effectPass = bundle.lowPlan.runtimeTargets[i] == contractOp.runtimeTarget &&
+                         bundle.lowPlan.proofDomains[i] == contractOp.proofDomain
+        validateBaguaProofGate(bundle.lowPlan.opIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.opIds[i],
+                               "effect",
+                               "network_distribution",
+                               gatePlane,
+                               "network_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
+        allPass = allPass && effectPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("effect")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.opIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("runtime/proof 必须和 canonical op 一致")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("runtime_target=" + contractOp.runtimeTarget)),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if effectPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+        let layoutPass = bundle.lowPlan.addressingModes[i] != "lsmr_path" ||
+                         (bundle.lowPlan.addressBindings[i] == "content_bound_address" &&
+                          bundle.lowPlan.distanceMetrics[i] == "per_level_manhattan" &&
+                          bundle.lowPlan.routePlanModels[i] == "canonical_multipath_set")
+        validateBaguaProofGate(bundle.lowPlan.opIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.opIds[i],
+                               "layout",
+                               "network_distribution",
+                               gatePlane,
+                               "network_proof|" + bundle.lowPlan.canonicalOps[i] + "|layout")
+        allPass = allPass && layoutPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("layout")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.opIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("lsmr_path 必须绑定 canonical addressing lane")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("address_binding/content_bound_address + per_level_manhattan + canonical_multipath_set")),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if layoutPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+        let ownershipPass = bundle.lowPlan.canonicalOps[i] != "exchange_anti_entropy_signature" &&
+                            bundle.lowPlan.canonicalOps[i] != "repair_from_signature_gap" ?
+            true :
+            len(bundle.lowPlan.antiEntropySignatureKinds[i]) > 0
+        validateBaguaProofGate(bundle.lowPlan.opIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.opIds[i],
+                               "ownership",
+                               "network_distribution",
+                               gatePlane,
+                               "network_proof|" + bundle.lowPlan.canonicalOps[i] + "|ownership")
+        allPass = allPass && ownershipPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("ownership")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.opIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("签名相关操作必须声明 anti-entropy signature kind")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("anti_entropy_signature_kind != empty")),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if ownershipPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.proof_tasks.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("network_distribution")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("tasks", jsonRawArray(tasks)))
+    return taijiProofArtifact(jsonObject(fields), allPass)
+
+fn taijiCompilerCoreProofDocument(sourcePath: str,
+                                  sourceLabel: str,
+                                  bundle: cpipe.CompilerCorePipelineBundle): TaijiProofArtifact =
+    var tasks: str[]
+    var fields: str[]
+    var allPass: bool = true
+    tasks = []
+    fields = []
+    let contract = cops.lowUirCompilerCoreOpsContract()
+    let baguaAnnotations = lowbagua.annotateLowUirNodes("compiler_core",
+                                                        bundle.lowPlan.itemIds,
+                                                        bundle.lowPlan.canonicalOps,
+                                                        bundle.lowPlan.effectClasses,
+                                                        bundle.lowPlan.proofDomains,
+                                                        bundle.lowPlan.bindingScopes,
+                                                        bundle.lowPlan.runtimeTargets)
+    var taskId: int32 = 0
+    for i in 0..<bundle.lowPlan.itemIds.len:
+        let opIdx = cops.findLowUirCompilerCoreOp(bundle.lowPlan.canonicalOps[i])
+        let contractOp = contract.canonicalOps[opIdx]
+        let gatePlane = baguaAnnotations[i].plane
+        let gateCell = proofGateCell(baguaAnnotations[i])
+        let effectPass = bundle.lowPlan.runtimeTargets[i] == contractOp.runtimeTarget &&
+                         bundle.lowPlan.effectClasses[i] == contractOp.effectClass &&
+                         bundle.lowPlan.proofDomains[i] == contractOp.proofDomain &&
+                         bundle.lowPlan.bindingScopes[i] == contractOp.bindingScope
+        validateBaguaProofGate(bundle.lowPlan.itemIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.itemIds[i],
+                               "effect",
+                               "compiler_core",
+                               gatePlane,
+                               "compiler_core_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
+        allPass = allPass && effectPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("effect")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.itemIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("runtime/effect/proof/binding 必须和 canonical op 一致")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("binding_scope=" + contractOp.bindingScope)),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if effectPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+        let boundsPass = !bundle.lowPlan.executableAstReady[i] ||
+                         bundle.lowPlan.routineOpStarts[i] + bundle.lowPlan.routineOpCounts[i] <= bundle.lowPlan.opKinds.len
+        validateBaguaProofGate(bundle.lowPlan.itemIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.itemIds[i],
+                               "bounds",
+                               "compiler_core",
+                               gatePlane,
+                               "compiler_core_proof|" + bundle.lowPlan.canonicalOps[i] + "|bounds")
+        allPass = allPass && boundsPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("bounds")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.itemIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote("可执行条目必须落在 Low-UIR op SoA 边界内")),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("routine_op_start + routine_op_count <= opKinds.len")),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if boundsPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.proof_tasks.v0")))
+    add(fields, jsonFieldRaw("source_kind", jsonQuote("compiler_core")))
+    add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
+    add(fields, jsonFieldRaw("source_label", jsonQuote(sourceLabel)))
+    add(fields, jsonFieldRaw("tasks", jsonRawArray(tasks)))
+    return taijiProofArtifact(jsonObject(fields), allPass)
+
+fn taijiAstDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiDocument =
+    if sampleName == "string":
+        return taijiStringAstDocument(sourcePath, sourceLabel, sir.sampleStringSurfaceProgram())
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        return taijiNetworkAstDocument(sourcePath, sourceLabel, parsed.networkProgram)
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        return taijiCompilerCoreAstDocument(sourcePath,
+                                            sourceLabel,
+                                            cpipe.compileCompilerCoreSourceClosure(sourcePath).program)
+    if parsed.unimakerProgram.decls.len > 0:
+        return taijiUnimakerAstDocument(sourcePath, sourceLabel, parsed.unimakerProgram)
+    panic("taiji: unsupported ast export source")
+
+fn taijiLowUirDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiDocument =
+    if sampleName == "string":
+        return taijiStringLowUirDocument(sourcePath, sourceLabel, spipe.sampleStringPipeline())
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        return taijiNetworkLowUirDocument(sourcePath,
+                                          sourceLabel,
+                                          npipe.compileNetworkDistributionProgram(parsed.networkProgram))
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        return taijiCompilerCoreLowUirDocument(sourcePath,
+                                               sourceLabel,
+                                               cpipe.compileCompilerCoreSourceClosure(sourcePath))
+    if parsed.unimakerProgram.decls.len > 0:
+        return taijiUnimakerLowUirDocument(sourcePath,
+                                           sourceLabel,
+                                           upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram))
+    panic("taiji: unsupported low_uir export source")
+
+fn taijiPhaseTraceDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiDocument =
+    if sampleName == "string":
+        return taijiStringPhaseTraceDocument(sourcePath, sourceLabel, spipe.sampleStringPipeline())
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        return taijiNetworkPhaseTraceDocument(sourcePath,
+                                              sourceLabel,
+                                              npipe.compileNetworkDistributionProgram(parsed.networkProgram))
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        return taijiCompilerCorePhaseTraceDocument(sourcePath,
+                                                   sourceLabel,
+                                                   cpipe.compileCompilerCoreSourceClosure(sourcePath))
+    if parsed.unimakerProgram.decls.len > 0:
+        return taijiUnimakerPhaseTraceDocument(sourcePath,
+                                               sourceLabel,
+                                               upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram))
+    panic("taiji: unsupported phase trace source")
+
+fn taijiProofDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiProofArtifact =
+    if sampleName == "string":
+        return taijiStringProofDocument(sourcePath, sourceLabel, spipe.sampleStringPipeline())
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
+        return taijiNetworkProofDocument(sourcePath,
+                                         sourceLabel,
+                                         npipe.compileNetworkDistributionProgram(parsed.networkProgram))
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        return taijiCompilerCoreProofDocument(sourcePath,
+                                              sourceLabel,
+                                              cpipe.compileCompilerCoreSourceClosure(sourcePath))
+    if parsed.unimakerProgram.decls.len > 0:
+        return taijiUnimakerProofDocument(sourcePath,
+                                          sourceLabel,
+                                          upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram))
+    panic("taiji: unsupported proof source")
+
+fn runDumpAst(): int32 =
+    let sampleName = taijiSampleName()
+    let sourcePath = taijiResolveSourcePath(sampleName)
+    let sourceLabel = taijiResolveSourceLabel(sourcePath, sampleName)
+    let outPath = taijiOutputPathOrEmpty()
+    let doc = taijiAstDocument(sourcePath, sourceLabel, sampleName)
+    writeOptionalTextFile(outPath, doc.text)
+    writeText(doc.text + "\n")
+    return 0
+
+fn runDumpLowUir(): int32 =
+    let sampleName = taijiSampleName()
+    let sourcePath = taijiResolveSourcePath(sampleName)
+    let sourceLabel = taijiResolveSourceLabel(sourcePath, sampleName)
+    let outPath = taijiOutputPathOrEmpty()
+    let doc = taijiLowUirDocument(sourcePath, sourceLabel, sampleName)
+    writeOptionalTextFile(outPath, doc.text)
+    writeText(doc.text + "\n")
+    return 0
+
+fn runTracePhaseSpace(): int32 =
+    let sampleName = taijiSampleName()
+    let sourcePath = taijiResolveSourcePath(sampleName)
+    let sourceLabel = taijiResolveSourceLabel(sourcePath, sampleName)
+    let outPath = taijiOutputPathOrEmpty()
+    let doc = taijiPhaseTraceDocument(sourcePath, sourceLabel, sampleName)
+    writeOptionalTextFile(outPath, doc.text)
+    writeText(doc.text + "\n")
+    return 0
+
+fn runEmitProofObligations(): int32 =
+    let sampleName = taijiSampleName()
+    let sourcePath = taijiResolveSourcePath(sampleName)
+    let sourceLabel = taijiResolveSourceLabel(sourcePath, sampleName)
+    let outPath = taijiOutputPathOrEmpty()
+    let proof = taijiProofDocument(sourcePath, sourceLabel, sampleName)
+    writeOptionalTextFile(outPath, proof.text)
+    writeText(proof.text + "\n")
+    return if proof.allPass: 0 else: 1
+
+fn taijiSeedManifestLine(spec: TaijiSeedSpec,
+                         astDoc: TaijiDocument,
+                         lowDoc: TaijiDocument,
+                         traceDoc: TaijiDocument,
+                         proofDoc: TaijiDocument,
+                         profileDoc: TaijiDocument): str =
+    return jsonInlineObject([jsonInlineFieldRaw("sample_id", jsonQuote(spec.sampleId)),
+                             jsonInlineFieldRaw("source_path", jsonQuote(spec.sourcePath)),
+                             jsonInlineFieldRaw("source_kind", jsonQuote(spec.sourceKind)),
+                             jsonInlineFieldRaw("ast_cid", jsonQuote(astDoc.cid)),
+                             jsonInlineFieldRaw("low_uir_cid", jsonQuote(lowDoc.cid)),
+                             jsonInlineFieldRaw("bagua_trace_cid", jsonQuote(traceDoc.cid)),
+                             jsonInlineFieldRaw("proof_task_cid", jsonQuote(proofDoc.cid)),
+                             jsonInlineFieldRaw("profile_report_cid", jsonQuote(profileDoc.cid)),
+                             jsonInlineFieldRaw("gate_class", jsonQuote(spec.gateClass))])
+
+fn updateSemanticEdgeFamilyCounts(familyTotalCounts: var int32[],
+                                  familySampleCounts: var int32[],
+                                  familySampleHits: var int32[],
+                                  sampleIdx: int32,
+                                  familyCounts: int32[],
+                                  sampleCount: int32) =
+    if familyTotalCounts.len != familyCounts.len || familySampleCounts.len != familyCounts.len:
+        panic("taiji: semantic edge family total length mismatch")
+    for familyIdx in 0..<familyCounts.len:
+        let count = familyCounts[familyIdx]
+        if count <= 0:
+            continue
+        familyTotalCounts[familyIdx] = familyTotalCounts[familyIdx] + count
+        let hitIdx = familyIdx * sampleCount + sampleIdx
+        if familySampleHits[hitIdx] == 0:
+            familySampleHits[hitIdx] = 1
+            familySampleCounts[familyIdx] = familySampleCounts[familyIdx] + 1
+
+fn taijiSemanticEdgeCatalogDocument(specs: TaijiSeedSpec[],
+                                    sampleLabels: str[],
+                                    familyTotalCounts: int32[],
+                                    familySampleCounts: int32[],
+                                    familySampleHits: int32[]): TaijiDocument =
+    let edgeKindOrder = semanticEdgeKindOrder()
+    let planeOrder = ["P1=乾坤", "P2=坎离", "P3=艮兑", "P4=震巽"]
+    let planePairKeys = planePairOrder(planeOrder)
+    let gateClassOrder = ["handwritten_core", "contract_sample", "compiler_observation"]
+    let sourceKindOrder = ["string", "unimaker", "network_distribution", "compiler_core"]
+    if sampleLabels.len != specs.len:
+        panic("taiji: semantic edge catalog sample label length mismatch")
+    let planePairCount = planePairKeys.len
+    let familyCount = edgeKindOrder.len * planePairCount
+    if familyTotalCounts.len != familyCount ||
+       familySampleCounts.len != familyCount ||
+       familySampleHits.len != familyCount * specs.len:
+        panic("taiji: semantic edge catalog family vector length mismatch")
+    var validatedEdgeCount: int32 = 0
+    var nonzeroFamilyCount: int32 = 0
+    var sampleRows: str[]
+    var familyRows: str[]
+    var fields: str[]
+    sampleRows = []
+    familyRows = []
+    fields = []
+    for i in 0..<specs.len:
+        add(sampleRows,
+            jsonInlineObject([jsonInlineFieldRaw("slot", intToStr(i)),
+                              jsonInlineFieldRaw("source_label", jsonQuote(sampleLabels[i])),
+                              jsonInlineFieldRaw("source_kind", jsonQuote(specs[i].sourceKind)),
+                              jsonInlineFieldRaw("gate_class", jsonQuote(specs[i].gateClass))]))
+    for edgeKindIdx in 0..<edgeKindOrder.len:
+        for leftIdx in 0..<planeOrder.len:
+            for rightIdx in 0..<planeOrder.len:
+                let pairIdx = leftIdx * planeOrder.len + rightIdx
+                let familyIdx = edgeKindIdx * planePairCount + pairIdx
+                let totalCount = familyTotalCounts[familyIdx]
+                if totalCount > 0:
+                    nonzeroFamilyCount = nonzeroFamilyCount + 1
+                validatedEdgeCount = validatedEdgeCount + totalCount
+                var sampleSlots: int32[]
+                var gateClassCounts: int32[]
+                var sourceKindCounts: int32[]
+                sampleSlots = []
+                gateClassCounts = [0, 0, 0]
+                sourceKindCounts = [0, 0, 0, 0]
+                for sampleIdx in 0..<specs.len:
+                    let hitIdx = familyIdx * specs.len + sampleIdx
+                    if familySampleHits[hitIdx] == 0:
+                        continue
+                    add(sampleSlots, sampleIdx)
+                    let gateClassIdx = planeIndex(gateClassOrder, specs[sampleIdx].gateClass)
+                    let sourceKindIdx = planeIndex(sourceKindOrder, specs[sampleIdx].sourceKind)
+                    if gateClassIdx < 0 || sourceKindIdx < 0:
+                        panic("taiji: semantic edge catalog sample class mismatch")
+                    gateClassCounts[gateClassIdx] = gateClassCounts[gateClassIdx] + 1
+                    sourceKindCounts[sourceKindIdx] = sourceKindCounts[sourceKindIdx] + 1
+                add(familyRows,
+                    jsonInlineObject([jsonInlineFieldRaw("family_id",
+                                                         jsonQuote(edgeKindOrder[edgeKindIdx] + "|" +
+                                                                   planePairKeys[pairIdx])),
+                                      jsonInlineFieldRaw("edge_kind", jsonQuote(edgeKindOrder[edgeKindIdx])),
+                                      jsonInlineFieldRaw("source_plane", jsonQuote(planeOrder[leftIdx])),
+                                      jsonInlineFieldRaw("target_plane", jsonQuote(planeOrder[rightIdx])),
+                                      jsonInlineFieldRaw("orthogonal",
+                                                         if bcore.isOrthogonal(planeOrder[leftIdx],
+                                                                               planeOrder[rightIdx]):
+                                                             "true"
+                                                         else:
+                                                             "false"),
+                                      jsonInlineFieldRaw("allowed",
+                                                         if bcore.allowEdge(edgeKindOrder[edgeKindIdx],
+                                                                            planeOrder[leftIdx],
+                                                                            planeOrder[rightIdx]):
+                                                             "true"
+                                                         else:
+                                                             "false"),
+                                      jsonInlineFieldRaw("total_count", intToStr(totalCount)),
+                                      jsonInlineFieldRaw("sample_count", intToStr(familySampleCounts[familyIdx])),
+                                      jsonInlineFieldRaw("sample_slots", jsonIntArray(sampleSlots)),
+                                      jsonInlineFieldRaw("gate_class_counts",
+                                                         jsonInlineCountObject(gateClassOrder, gateClassCounts)),
+                                      jsonInlineFieldRaw("source_kind_counts",
+                                                         jsonInlineCountObject(sourceKindOrder, sourceKindCounts))]))
+    add(fields, jsonFieldRaw("version", jsonQuote("taiji.bpi_semantic_edge_catalog.v1")))
+    add(fields, jsonFieldRaw("bpi_validation_scope",
+                             jsonInlineObject([jsonInlineFieldRaw("phase", jsonQuote("lowers_to")),
+                                               jsonInlineFieldRaw("proof", jsonQuote("gates"))])))
+    add(fields, jsonFieldRaw("sample_count", intToStr(specs.len)))
+    add(fields, jsonFieldRaw("family_count", intToStr(familyCount)))
+    add(fields, jsonFieldRaw("nonzero_family_count", intToStr(nonzeroFamilyCount)))
+    add(fields, jsonFieldRaw("validated_edge_count", intToStr(validatedEdgeCount)))
+    add(fields, jsonFieldRaw("edge_kind_order", jsonStringArray(edgeKindOrder)))
+    add(fields, jsonFieldRaw("plane_pair_order", jsonStringArray(planePairKeys)))
+    add(fields, jsonFieldRaw("samples", jsonRawArray(sampleRows)))
+    add(fields, jsonFieldRaw("families", jsonRawArray(familyRows)))
+    return taijiDocument(jsonObject(fields))
+
+fn runTaijiSeedSet(): int32 =
+    let outDir = taijiSeedOutDir()
+    createDirAll(outDir)
+    let manifestPath = taijiSeedManifestPath(outDir)
+    let catalogPath = taijiSeedSemanticEdgeCatalogPath(outDir)
+    let specs = taijiSeedSpecs()
+    let edgeKindOrder = semanticEdgeKindOrder()
+    let planeOrder = ["P1=乾坤", "P2=坎离", "P3=艮兑", "P4=震巽"]
+    let planePairKeys = planePairOrder(planeOrder)
+    var manifestLines: str[]
+    var sampleLabels: str[]
+    var familyTotalCounts: int32[]
+    var familySampleCounts: int32[]
+    var familySampleHits: int32[]
+    manifestLines = []
+    sampleLabels = []
+    familyTotalCounts = []
+    familySampleCounts = []
+    familySampleHits = []
+    var handwrittenCount: int32 = 0
+    var contractCount: int32 = 0
+    var observationCount: int32 = 0
+    for i in 0..<edgeKindOrder.len * planePairKeys.len:
+        add(familyTotalCounts, 0)
+        add(familySampleCounts, 0)
+    for i in 0..<edgeKindOrder.len * planePairKeys.len * specs.len:
+        add(familySampleHits, 0)
+    for i in 0..<specs.len:
+        let spec = specs[i]
+        let sampleDir = taijiSeedSampleDir(outDir, spec.sampleId)
+        createDirAll(sampleDir)
+        let astDoc = taijiAstDocument(spec.sourcePath, spec.sourceLabel, spec.builtInSample)
+        let lowDoc = taijiLowUirDocument(spec.sourcePath, spec.sourceLabel, spec.builtInSample)
+        let traceDoc = taijiPhaseTraceDocument(spec.sourcePath, spec.sourceLabel, spec.builtInSample)
+        let proof = taijiProofDocument(spec.sourcePath, spec.sourceLabel, spec.builtInSample)
+        if !proof.allPass:
+            panic("taiji: proof obligations failed for " + spec.sampleId)
+        let proofDoc = taijiDocument(proof.text)
+        let profileDoc = taijiProfileDocument(spec.sourcePath,
+                                              spec.sourceLabel,
+                                              spec.sourceKind,
+                                              astDoc,
+                                              lowDoc,
+                                              traceDoc,
+                                              proofDoc)
+        let lowNodeIds = jsonArrayIntValues(jsonDocFieldRaw(lowDoc.text, "node_ids"))
+        let lowPlanes = jsonArrayStringValues(jsonDocFieldRaw(lowDoc.text, "bagua_plane"))
+        let phaseEdgeNodeIds = jsonArrayIntValues(jsonDocFieldRaw(traceDoc.text, "low_uir_node_ids"))
+        let phaseTargetPlanes = jsonArrayStringValues(jsonDocFieldRaw(traceDoc.text, "plane"))
+        let phaseEdgeKinds = repeatStringArray("lowers_to", phaseEdgeNodeIds.len)
+        let proofEdgeNodeIds = jsonArrayIntValues(jsonDocFieldRaw(proofDoc.text, "targets"))
+        let proofTargetPlanes = jsonArrayStringValues(jsonDocFieldRaw(proofDoc.text, "bagua_gate_plane"))
+        let proofEdgeKinds = semanticProofEdgeKinds(jsonArrayStringValues(jsonDocFieldRaw(proofDoc.text, "kinds")),
+                                                    spec.sourceKind)
+        let phaseFamilyCounts = semanticEdgeFamilyCounts(lowNodeIds,
+                                                         lowPlanes,
+                                                         phaseEdgeNodeIds,
+                                                         phaseTargetPlanes,
+                                                         phaseEdgeKinds,
+                                                         edgeKindOrder,
+                                                         planeOrder)
+        let proofFamilyCounts = semanticEdgeFamilyCounts(lowNodeIds,
+                                                         lowPlanes,
+                                                         proofEdgeNodeIds,
+                                                         proofTargetPlanes,
+                                                         proofEdgeKinds,
+                                                         edgeKindOrder,
+                                                         planeOrder)
+        writeTextFile(taijiSeedSamplePath(outDir, spec.sampleId, "taiji_ast_graph.json"), astDoc.text)
+        writeTextFile(taijiSeedSamplePath(outDir, spec.sampleId, "taiji_low_uir_graph.json"), lowDoc.text)
+        writeTextFile(taijiSeedSamplePath(outDir, spec.sampleId, "taiji_bagua_trace.json"), traceDoc.text)
+        writeTextFile(taijiSeedSamplePath(outDir, spec.sampleId, "taiji_proof_tasks.json"), proofDoc.text)
+        writeTextFile(taijiSeedProfilePath(outDir, spec.sampleId), profileDoc.text)
+        add(manifestLines, taijiSeedManifestLine(spec, astDoc, lowDoc, traceDoc, proofDoc, profileDoc))
+        add(sampleLabels, spec.sourceLabel)
+        updateSemanticEdgeFamilyCounts(familyTotalCounts,
+                                       familySampleCounts,
+                                       familySampleHits,
+                                       i,
+                                       phaseFamilyCounts,
+                                       specs.len)
+        updateSemanticEdgeFamilyCounts(familyTotalCounts,
+                                       familySampleCounts,
+                                       familySampleHits,
+                                       i,
+                                       proofFamilyCounts,
+                                       specs.len)
+        if spec.gateClass == "handwritten_core":
+            handwrittenCount = handwrittenCount + 1
+        elif spec.gateClass == "contract_sample":
+            contractCount = contractCount + 1
+        else:
+            observationCount = observationCount + 1
+    let manifestText = joinTextList(manifestLines, "\n")
+    let catalogDoc = taijiSemanticEdgeCatalogDocument(specs,
+                                                      sampleLabels,
+                                                      familyTotalCounts,
+                                                      familySampleCounts,
+                                                      familySampleHits)
+    writeTextFile(manifestPath, manifestText)
+    writeTextFile(catalogPath, catalogDoc.text)
+    printLine("taiji_seed_ok=1")
+    printLine("seed_count=" + intToStr(specs.len))
+    printLine("handwritten_core_count=" + intToStr(handwrittenCount))
+    printLine("contract_sample_count=" + intToStr(contractCount))
+    printLine("compiler_observation_count=" + intToStr(observationCount))
+    printLine("manifest_path=" + manifestPath)
+    printLine("manifest_cid=" + ident.sha256HexText(manifestText))
+    printLine("semantic_edge_catalog_path=" + catalogPath)
+    printLine("semantic_edge_catalog_cid=" + catalogDoc.cid)
+    return 0
 
 fn parsePlanInt32OrZero(planText: str, key: str): int32 =
     return parsePlanInt32OrZeroBridge(planText, key)
@@ -258,6 +2660,11 @@ fn printUsage() =
     printLine("  publish-compiler-rule-pack   emit a compiler rule-pack artifact")
     printLine("  verify-network-selfhost      verify manifest + topology + rule-pack closure")
     printLine("  release-compile              emit a deterministic release artifact spec")
+    printLine("  dump-ast                     emit a Taiji-UIR AST graph json")
+    printLine("  dump-low-uir                 emit a Taiji-UIR typed low_uir graph json")
+    printLine("  trace-phase-space            emit a Taiji-UIR bagua phase-space trace json")
+    printLine("  emit-proof-obligations       emit Taiji-UIR proof obligation tasks json")
+    printLine("  taiji-seed-set               materialize the phase-1 Taiji-UIR seed dataset")
 
 fn printSurface() =
     printLine(surface.v2SurfaceText())
@@ -395,6 +2802,9 @@ fn printSelfhost() =
     for i in 0..<c.proofInvariants.len:
         printLine("proof_invariant_" + intToStr(i) + "=" + c.proofInvariants[i])
 
+fn jsonCompactObject(fields: str[]): str =
+    return "{" + joinTextList(fields, ", ") + "}"
+
 fn networkBundleFromSource(sourcePath: str): npipe.NetworkDistributionPipelineBundle =
     let parsed = parser.parseV2SourceFileStrict(sourcePath)
     return npipe.compileNetworkDistributionProgram(parsed.networkProgram)
@@ -406,7 +2816,7 @@ fn machineBundleFromSource(sourcePath: str, targetTriple: str): mpipeline.Machin
         return mpipeline.lowerNetworkDistributionPlanToMachine(bundle.lowPlan, targetTriple)
     if parsed.compilerCoreProgram.topLevelKinds.len > 0:
         let bundle = cpipe.compileCompilerCoreSourceClosure(sourcePath)
-        return mpipeline.lowerCompilerCorePlanToMachine(bundle.lowPlan, targetTriple)
+        return mpipeline.lowerCompilerCorePlanToMachine(bundle.lowPlan, targetTriple, sourcePath)
     let bundle = upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram)
     return mpipeline.lowerUnimakerPlanToMachine(bundle.lowPlan, targetTriple)
 
@@ -581,6 +2991,21 @@ fn writeLsmrAddressZero(cid: str, depth: int32): int32 =
     writeLsmrAddressArtifact(cid, depth)
     return 0
 
+fn runLsmrAddressDepth(): int32 =
+    return readIntFlagDefault("--depth", 4)
+
+fn writeLsmrAddressZeroFlipped(depth: int32, cid: str): int32 =
+    return writeLsmrAddressZero(cid, depth)
+
+fn runLsmrAddressPresent(cid: str): int32 =
+    return writeLsmrAddressZeroFlipped(runLsmrAddressDepth(), cid)
+
+fn runLsmrAddressWithCid(cid: str): int32 =
+    if isEmptyText(cid):
+        return printMissingCidAndFail()
+    else:
+        return runLsmrAddressPresent(cid)
+
 fn writeLsmrRoutePlanArtifact(cid: str, depth: int32, priorityClass: str, dispersalMode: str): void =
     writeText(lsmr.buildLsmrRoutePlanArtifactText(cid, depth, priorityClass, dispersalMode))
 
@@ -588,23 +3013,38 @@ fn writeLsmrRoutePlanZero(cid: str, depth: int32, priorityClass: str, dispersalM
     writeLsmrRoutePlanArtifact(cid, depth, priorityClass, dispersalMode)
     return 0
 
-fn runLsmrAddress(): int32 =
-    let cid = readFlagDefault("--cid", "")
-    let depth = readIntFlagDefault("--depth", 4)
+fn runLsmrRoutePlanDepth(): int32 =
+    return readIntFlagDefault("--depth", 4)
+
+fn runLsmrRoutePlanPriority(): str =
+    return readFlagDefault("--priority", "urgent")
+
+fn runLsmrRoutePlanDispersal(): str =
+    return readFlagDefault("--dispersal", "none")
+
+fn writeLsmrRoutePlanZeroFlipped(dispersalMode: str, priorityClass: str, depth: int32, cid: str): int32 =
+    return writeLsmrRoutePlanZero(cid, depth, priorityClass, dispersalMode)
+
+fn runLsmrRoutePlanWithPriority(priorityClass: str, depth: int32, cid: str): int32 =
+    return writeLsmrRoutePlanZeroFlipped(runLsmrRoutePlanDispersal(), priorityClass, depth, cid)
+
+fn runLsmrRoutePlanWithDepth(depth: int32, cid: str): int32 =
+    return runLsmrRoutePlanWithPriority(runLsmrRoutePlanPriority(), depth, cid)
+
+fn runLsmrRoutePlanPresent(cid: str): int32 =
+    return runLsmrRoutePlanWithDepth(runLsmrRoutePlanDepth(), cid)
+
+fn runLsmrRoutePlanWithCid(cid: str): int32 =
     if isEmptyText(cid):
         return printMissingCidAndFail()
     else:
-        return writeLsmrAddressZero(cid, depth)
+        return runLsmrRoutePlanPresent(cid)
+
+fn runLsmrAddress(): int32 =
+    return runLsmrAddressWithCid(readCidFlag())
 
 fn runLsmrRoutePlan(): int32 =
-    let cid = readFlagDefault("--cid", "")
-    let depth = readIntFlagDefault("--depth", 4)
-    let priorityClass = readFlagDefault("--priority", "urgent")
-    let dispersalMode = readFlagDefault("--dispersal", "none")
-    if isEmptyText(cid):
-        return printMissingCidAndFail()
-    else:
-        return writeLsmrRoutePlanZero(cid, depth, priorityClass, dispersalMode)
+    return runLsmrRoutePlanWithCid(readCidFlag())
 
 fn runMachinePlan(): int32 =
     let sourcePath = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
@@ -929,6 +3369,21 @@ fn cmdIsVerifyNetworkSelfhost(): bool =
 fn cmdIsReleaseCompile(): bool =
     return cmdline.cliParam1Eq("release-compile")
 
+fn cmdIsDumpAst(): bool =
+    return cmdline.cliParam1Eq("dump-ast")
+
+fn cmdIsDumpLowUir(): bool =
+    return cmdline.cliParam1Eq("dump-low-uir")
+
+fn cmdIsTracePhaseSpace(): bool =
+    return cmdline.cliParam1Eq("trace-phase-space")
+
+fn cmdIsEmitProofObligations(): bool =
+    return cmdline.cliParam1Eq("emit-proof-obligations")
+
+fn cmdIsTaijiSeedSet(): bool =
+    return cmdline.cliParam1Eq("taiji-seed-set")
+
 fn printSurfaceZero(): int32 =
     printSurface()
     return 0
@@ -1038,6 +3493,16 @@ fn dispatchCommandLegacy(cmd: str): int32 =
         return runVerifyNetworkSelfhost()
     if cmd == "release-compile":
         return runReleaseCompile()
+    if cmd == "dump-ast":
+        return runDumpAst()
+    if cmd == "dump-low-uir":
+        return runDumpLowUir()
+    if cmd == "trace-phase-space":
+        return runTracePhaseSpace()
+    if cmd == "emit-proof-obligations":
+        return runEmitProofObligations()
+    if cmd == "taiji-seed-set":
+        return runTaijiSeedSet()
     printUsage()
     return 1
 
@@ -1179,6 +3644,36 @@ fn dispatchCommandAfterPublishCompilerRulePack(): int32 =
 fn dispatchCommandAfterVerifyNetworkSelfhost(): int32 =
     if cmdIsReleaseCompile():
         return runReleaseCompile()
+    else:
+        return dispatchCommandAfterReleaseCompile()
+
+fn dispatchCommandAfterReleaseCompile(): int32 =
+    if cmdIsDumpAst():
+        return runDumpAst()
+    else:
+        return dispatchCommandAfterDumpAst()
+
+fn dispatchCommandAfterDumpAst(): int32 =
+    if cmdIsDumpLowUir():
+        return runDumpLowUir()
+    else:
+        return dispatchCommandAfterDumpLowUir()
+
+fn dispatchCommandAfterDumpLowUir(): int32 =
+    if cmdIsTracePhaseSpace():
+        return runTracePhaseSpace()
+    else:
+        return dispatchCommandAfterTracePhaseSpace()
+
+fn dispatchCommandAfterTracePhaseSpace(): int32 =
+    if cmdIsEmitProofObligations():
+        return runEmitProofObligations()
+    else:
+        return dispatchCommandAfterEmitProofObligations()
+
+fn dispatchCommandAfterEmitProofObligations(): int32 =
+    if cmdIsTaijiSeedSet():
+        return runTaijiSeedSet()
     else:
         return printUsageFail()
 

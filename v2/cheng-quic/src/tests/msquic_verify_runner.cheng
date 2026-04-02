@@ -1,0 +1,159 @@
+# MsQuic verify runner for native QUIC MVP.
+
+import std/result
+import std/rawbytes
+import cheng/quic/multiaddress
+import cheng/quic/connection
+import cheng/quic/msquictransport
+import cheng/quic/tls/test_pki
+import cheng/quic/dm_demo
+import cheng/quic/tests/protocol_validation_test
+import cheng/quic/tests/congestion_validation_test
+import cheng/quic/tests/test_tls_params
+import cheng/quic/tests/test_packet_header
+import cheng/quic/tests/tls13_aead_test
+import cheng/quic/tests/tls13_handshake_flow_test
+
+fn runApiSurfaceSmoke(): Result[bool] =
+    var t: MsQuicTransport = initMsQuicTransport()
+    var settings: MsQuicSettings = msquicTransportSettings(t)
+    settings.allowDatagram = true
+    settings.maxDatagram = 96
+    let setRes: Result[bool] = setMsQuicTransportSettings(t, settings)
+    if IsErr(setRes):
+        return Err[bool]("api: transport settings: " + Error(setRes))
+    let applied: MsQuicSettings = msquicTransportSettings(t)
+    if ! applied.allowDatagram:
+        return Err[bool]("api: allowDatagram not applied")
+    if applied.maxDatagram != 96:
+        return Err[bool]("api: maxDatagram not applied")
+    let policyRes = msquicMakeLocalhostTlsPolicy()
+    if IsErr(policyRes):
+        return Err[bool]("api: tls policy: " + Error(policyRes))
+    let tlsRes: Result[bool] = setMsQuicTransportTlsPolicy(t, Value(policyRes))
+    if IsErr(tlsRes):
+        return Err[bool]("api: tls apply: " + Error(tlsRes))
+    if msquicTransportTlsPolicy(t).serverName != "localhost":
+        return Err[bool]("api: tls policy not applied")
+    return Ok[bool](true)
+
+fn runMsQuicTransportSmoke(): Result[bool] =
+    let addrRes: Result[MultiAddress] = parseMultiAddress("/ip4/127.0.0.1/udp/0/quic-v1")
+    if IsErr(addrRes):
+        return Err[bool]("transport: parse addr: " + Error(addrRes))
+    let addr: MultiAddress = Value(addrRes)
+
+    var t: MsQuicTransport = initMsQuicTransport()
+    var settings: MsQuicSettings = msquicTransportSettings(t)
+    settings.allowDatagram = true
+    settings.maxDatagram = 128
+    let setRes: Result[bool] = setMsQuicTransportSettings(t, settings)
+    if IsErr(setRes):
+        return Err[bool]("transport: settings: " + Error(setRes))
+    let policyRes = msquicMakeLocalhostTlsPolicy()
+    if IsErr(policyRes):
+        return Err[bool]("transport: tls policy: " + Error(policyRes))
+    let tlsRes: Result[bool] = setMsQuicTransportTlsPolicy(t, Value(policyRes))
+    if IsErr(tlsRes):
+        return Err[bool]("transport: tls apply: " + Error(tlsRes))
+
+    if ! handles(t, addr):
+        return Err[bool]("transport: handle mismatch")
+    start(t, addr)
+    if ! t.running:
+        return Err[bool]("transport: start failed")
+
+    let dialRes: Result[Connection] = dial(t, addr)
+    if IsErr(dialRes):
+        return Err[bool]("transport: dial: " + Error(dialRes))
+    let acceptRes: Result[Connection] = accept(t)
+    if IsErr(acceptRes):
+        return Err[bool]("transport: accept: " + Error(acceptRes))
+    var outConn: Connection = Value(dialRes)
+    var inConn: Connection = Value(acceptRes)
+
+    if outConn.pipeIdx != inConn.pipeIdx:
+        return Err[bool]("transport: native handle mismatch")
+    let payload: Bytes = bytesFromString("transport")
+    let writeRes: Result[int32] = quicConnWrite(outConn, payload)
+    if IsErr(writeRes):
+        return Err[bool]("transport: write: " + Error(writeRes))
+    let readRes: Result[Bytes] = quicConnRead(inConn, bytesLen(payload))
+    if IsErr(readRes):
+        return Err[bool]("transport: read: " + Error(readRes))
+    if ! bytesEqual(Value(readRes), payload):
+        return Err[bool]("transport: payload mismatch")
+
+    dropMsQuicConnectionsByPipe(outConn.pipeIdx)
+    let closedRes: Result[int32] = quicConnWrite(outConn, bytesFromString("x"))
+    if IsOk(closedRes):
+        return Err[bool]("transport: close boundary missing")
+    stop(t)
+    return Ok[bool](true)
+
+fn runAndTag(name: str, res: Result[bool]): Result[bool] =
+    if IsErr(res):
+        return Err[bool](name + ": " + Error(res))
+    echo("msquic_verify: " + name + "=ok")
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let apiRes: Result[bool] = runAndTag("api", runApiSurfaceSmoke())
+    if IsErr(apiRes):
+        echo("msquic verify failed: " + Error(apiRes))
+        return 1
+
+    let varintRes: Result[bool] = runAndTag("packet_varint", runQuicVarIntTest())
+    if IsErr(varintRes):
+        echo("msquic verify failed: " + Error(varintRes))
+        return 1
+
+    let headerRes: Result[bool] = runAndTag("packet_header", runQuicPacketHeaderTest())
+    if IsErr(headerRes):
+        echo("msquic verify failed: " + Error(headerRes))
+        return 1
+
+    let aeadRes: Result[bool] = runAndTag("tls13_aead", runTls13AeadTest())
+    if IsErr(aeadRes):
+        echo("msquic verify failed: " + Error(aeadRes))
+        return 1
+
+    let hsRes: Result[bool] = runAndTag("tls13_flow", runTls13HandshakeFlowTest())
+    if IsErr(hsRes):
+        echo("msquic verify failed: " + Error(hsRes))
+        return 1
+
+    let protocolRes: Result[bool] = runAndTag("protocol", runProtocolValidationTest())
+    if IsErr(protocolRes):
+        echo("msquic verify failed: " + Error(protocolRes))
+        return 1
+
+    let congestionRes: Result[bool] = runAndTag("congestion", runCongestionValidationTest())
+    if IsErr(congestionRes):
+        echo("msquic verify failed: " + Error(congestionRes))
+        return 1
+
+    let tlsRes: Result[bool] = runAndTag("tls", runTlsParamTest())
+    if IsErr(tlsRes):
+        echo("msquic verify failed: " + Error(tlsRes))
+        return 1
+
+    let transportRes: Result[bool] = runAndTag("transport", runMsQuicTransportSmoke())
+    if IsErr(transportRes):
+        echo("msquic verify failed: " + Error(transportRes))
+        return 1
+
+    let dmStreamRes: Result[bool] = runAndTag("dm_stream", runStreamDmDemo())
+    if IsErr(dmStreamRes):
+        echo("msquic verify failed: " + Error(dmStreamRes))
+        return 1
+
+    let dmDatagramRes: Result[bool] = runAndTag("dm_datagram", runDatagramDmDemo())
+    if IsErr(dmDatagramRes):
+        echo("msquic verify failed: " + Error(dmDatagramRes))
+        return 1
+
+    echo("msquic verify ok")
+    echo("loopback_mode=native_udp")
+    echo("tls_scope=full_real")
+    return 0

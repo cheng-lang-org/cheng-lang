@@ -1,0 +1,181 @@
+import std/system
+import compiler/driver/identity_v2 as ident
+
+type
+    BaguaAnnotation =
+        upper: str
+        lower: str
+        plane: str
+        cellRow: int32
+        cellCol: int32
+        weight: int32
+        stableHash: str
+    BaguaMatrix =
+        counts: int32[]
+        weights: int32[]
+        bucketStarts: int32[]
+        flatNodeIds: int32[]
+        flatStableHashes: str[]
+
+fn guaIndex(gua: str): int32 =
+    if gua == "乾":
+        return 0
+    if gua == "坤":
+        return 1
+    if gua == "坎":
+        return 2
+    if gua == "离":
+        return 3
+    if gua == "艮":
+        return 4
+    if gua == "兑":
+        return 5
+    if gua == "震":
+        return 6
+    return 7
+
+fn guaPlane(gua: str): str =
+    if gua == "乾" || gua == "坤":
+        return "P1=乾坤"
+    if gua == "坎" || gua == "离":
+        return "P2=坎离"
+    if gua == "艮" || gua == "兑":
+        return "P3=艮兑"
+    return "P4=震巽"
+
+fn isOrthogonal(leftPlane: str, rightPlane: str): bool =
+    return (leftPlane == "P1=乾坤" && rightPlane == "P2=坎离") ||
+           (leftPlane == "P2=坎离" && rightPlane == "P1=乾坤") ||
+           (leftPlane == "P3=艮兑" && rightPlane == "P4=震巽") ||
+           (leftPlane == "P4=震巽" && rightPlane == "P3=艮兑")
+
+fn edgeFamilyId(kind: str, leftPlane: str, rightPlane: str): str =
+    return kind + "|" + leftPlane + "->" + rightPlane
+
+fn edgeBaseKind(kind: str): str =
+    for i in 0..<len(kind):
+        if kind[i] == '/':
+            return kind[0:i]
+    return kind
+
+fn allowPlaneEdge(kind: str, leftPlane: str, rightPlane: str): bool =
+    let baseKind = edgeBaseKind(kind)
+    if leftPlane == rightPlane:
+        return true
+    if isOrthogonal(leftPlane, rightPlane):
+        return baseKind == "annotates" || baseKind == "gates" || baseKind == "lowers_to"
+    return baseKind == "lowers_to" || baseKind == "exports"
+
+fn allowSemanticEdgeFamily(kind: str, leftPlane: str, rightPlane: str): bool =
+    let familyId = edgeFamilyId(kind, leftPlane, rightPlane)
+    return familyId == "lowers_to|P1=乾坤->P1=乾坤" ||
+           familyId == "lowers_to|P1=乾坤->P2=坎离" ||
+           familyId == "lowers_to|P1=乾坤->P3=艮兑" ||
+           familyId == "lowers_to|P1=乾坤->P4=震巽" ||
+           familyId == "lowers_to|P2=坎离->P2=坎离" ||
+           familyId == "lowers_to|P2=坎离->P4=震巽" ||
+           familyId == "lowers_to|P3=艮兑->P2=坎离" ||
+           familyId == "lowers_to|P3=艮兑->P3=艮兑" ||
+           familyId == "lowers_to|P4=震巽->P4=震巽" ||
+           familyId == "gates/effect/compiler_core|P1=乾坤->P1=乾坤" ||
+           familyId == "gates/effect/unimaker|P1=乾坤->P1=乾坤" ||
+           familyId == "gates/effect/unimaker|P2=坎离->P2=坎离" ||
+           familyId == "gates/effect/unimaker|P4=震巽->P4=震巽" ||
+           familyId == "gates/effect/network_distribution|P1=乾坤->P1=乾坤" ||
+           familyId == "gates/effect/network_distribution|P2=坎离->P2=坎离" ||
+           familyId == "gates/effect/network_distribution|P3=艮兑->P3=艮兑" ||
+           familyId == "gates/bounds/compiler_core|P1=乾坤->P1=乾坤" ||
+           familyId == "gates/layout/compiler_core|P1=乾坤->P1=乾坤" ||
+           familyId == "gates/layout/network_distribution|P1=乾坤->P1=乾坤" ||
+           familyId == "gates/layout/network_distribution|P2=坎离->P2=坎离" ||
+           familyId == "gates/layout/network_distribution|P3=艮兑->P3=艮兑" ||
+           familyId == "gates/ownership/unimaker|P1=乾坤->P1=乾坤" ||
+           familyId == "gates/ownership/unimaker|P2=坎离->P2=坎离" ||
+           familyId == "gates/ownership/unimaker|P4=震巽->P4=震巽" ||
+           familyId == "gates/ownership/network_distribution|P3=艮兑->P3=艮兑"
+
+fn allowEdge(kind: str, leftPlane: str, rightPlane: str): bool =
+    if !allowPlaneEdge(kind, leftPlane, rightPlane):
+        return false
+    let baseKind = edgeBaseKind(kind)
+    if baseKind == "lowers_to" || baseKind == "gates":
+        return allowSemanticEdgeFamily(kind, leftPlane, rightPlane)
+    return true
+
+fn baguaCellIndex(row: int32, col: int32): int32 =
+    return row * 8 + col
+
+fn baguaCellText(row: int32, col: int32): str =
+    return intToStr(row) + "," + intToStr(col)
+
+fn stableHash(text: str): str =
+    return ident.sha256HexText(text)
+
+fn baguaAnnotation(upper: str, lower: str, signatureText: str): BaguaAnnotation =
+    var out: BaguaAnnotation
+    out.upper = upper
+    out.lower = lower
+    out.plane = guaPlane(upper)
+    out.cellRow = guaIndex(upper)
+    out.cellCol = guaIndex(lower)
+    out.weight = 1
+    out.stableHash = stableHash(signatureText)
+    return out
+
+fn annotationUppers(annotations: BaguaAnnotation[]): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<annotations.len:
+        add(out, annotations[i].upper)
+    return out
+
+fn annotationLowers(annotations: BaguaAnnotation[]): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<annotations.len:
+        add(out, annotations[i].lower)
+    return out
+
+fn annotationPlanes(annotations: BaguaAnnotation[]): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<annotations.len:
+        add(out, annotations[i].plane)
+    return out
+
+fn annotationCellRows(annotations: BaguaAnnotation[]): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<annotations.len:
+        add(out, annotations[i].cellRow)
+    return out
+
+fn annotationCellCols(annotations: BaguaAnnotation[]): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<annotations.len:
+        add(out, annotations[i].cellCol)
+    return out
+
+fn buildMatrix(nodeIds: int32[], annotations: BaguaAnnotation[]): BaguaMatrix =
+    var out: BaguaMatrix
+    out.counts = []
+    out.weights = []
+    out.bucketStarts = []
+    out.flatNodeIds = []
+    out.flatStableHashes = []
+    for i in 0..<64:
+        add(out.counts, 0)
+        add(out.weights, 0)
+    for i in 0..<annotations.len:
+        let cellIdx = baguaCellIndex(annotations[i].cellRow, annotations[i].cellCol)
+        out.counts[cellIdx] = out.counts[cellIdx] + 1
+        out.weights[cellIdx] = out.weights[cellIdx] + annotations[i].weight
+    for cellIdx in 0..<64:
+        add(out.bucketStarts, out.flatNodeIds.len)
+        for i in 0..<annotations.len:
+            if baguaCellIndex(annotations[i].cellRow, annotations[i].cellCol) != cellIdx:
+                continue
+            add(out.flatNodeIds, nodeIds[i])
+            add(out.flatStableHashes, annotations[i].stableHash)
+    return out

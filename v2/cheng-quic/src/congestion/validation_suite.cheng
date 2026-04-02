@@ -1,0 +1,63 @@
+# MsQuic congestion validation suite(minimal).
+
+import std/result
+import std/strings
+import cheng/quic/congestion/common
+import cheng/quic/congestion/controller
+fn initAckSnapshot(
+    nowUs: int64,
+    largestAck: int64,
+    largestSent: int64,
+    ackedBytes: int64
+): AckEventSnapshot =
+    AckEventSnapshot(
+        timeNow: nowUs,
+        largestAck: largestAck,
+        largestSentPacketNumber: largestSent,
+        totalAckedRetransmittableBytes: ackedBytes,
+        ackedRetransmittableBytes: ackedBytes,
+        smoothedRtt: 50000,
+        minRtt: 40000,
+        oneWayDelay: 0,
+        adjustedAckTime: nowUs,
+        implicitAck: false,
+        hasLoss: false,
+        largestAckAppLimited: false,
+        minRttValid: true
+    )
+
+fn initLossSnapshot(largestSent: int64, lostBytes: int64): LossEventSnapshot =
+    LossEventSnapshot(
+        largestPacketNumberLost: largestSent,
+        largestSentPacketNumber: largestSent,
+        retransmittableBytesLost: lostBytes,
+        persistentCongestion: false
+    )
+
+fn validateCongestionControllerBasics(algorithm: CongestionAlgorithm): Result[bool] =
+    var controller: CongestionController = congestionControllerInit(algorithm, 1200, quicInitialWindowPackets)
+    if ! congestionControllerCanSend(controller):
+        return Err[bool]("congestion: controller cannot send at init")
+    let allowance: int64 = congestionControllerSendAllowance(controller, 1000)
+    if allowance <= 0:
+        return Err[bool]("congestion: send allowance ! positive")
+    let window: int64 = congestionControllerWindowBytes(controller)
+    if window <= 0:
+        return Err[bool]("congestion: window ! positive")
+    congestionControllerOnPacketSent(controller, 1200, true, false, 1000)
+    let ack: AckEventSnapshot = initAckSnapshot(2000000, 1, 1, 1200)
+    congestionControllerOnAcked(controller, ack)
+    let loss: LossEventSnapshot = initLossSnapshot(2, 600)
+    congestionControllerOnLost(controller, loss)
+    if ! congestionControllerCanSend(controller):
+        return Err[bool]("congestion: controller cannot send after ack/loss")
+    return Ok[bool](true)
+
+fn runCongestionValidationSuite(): Result[bool] =
+    let cubicRes: Result[bool] = validateCongestionControllerBasics(caCubic)
+    if IsErr(cubicRes):
+        return Err[bool](Error(cubicRes))
+    let bbrRes: Result[bool] = validateCongestionControllerBasics(caBbr)
+    if IsErr(bbrRes):
+        return Err[bool](Error(bbrRes))
+    return Ok[bool](true)

@@ -1,0 +1,202 @@
+# Shared DM demos for native QUIC transport.
+
+import std/result
+import std/rawbytes
+import std/strings
+import cheng/quic/multiaddress
+import cheng/quic/connection
+import cheng/quic/msquictransport
+import cheng/quic/native_runtime
+import cheng/quic/tls/test_pki
+
+fn dmBytesAppend(dst: var Bytes, extra: Bytes) =
+    let oldLen: int32 = bytesLen(dst)
+    let addLen: int32 = bytesLen(extra)
+    if addLen <= 0:
+        return
+    let out: Bytes = bytesAlloc(oldLen + addLen)
+    for i in 0..<oldLen:
+        bytesSet(out, i, bytesGet(dst, i))
+    for j in 0..<addLen:
+        bytesSet(out, oldLen + j, bytesGet(extra, j))
+    dst = out
+
+fn dmNewTransport(maxDatagram: int32): Result[MsQuicTransport] =
+    var t: MsQuicTransport = initMsQuicTransport()
+    var settings: MsQuicSettings = msquicTransportSettings(t)
+    settings.allowDatagram = true
+    settings.maxDatagram = maxDatagram
+    let setRes: Result[bool] = setMsQuicTransportSettings(t, settings)
+    if IsErr(setRes):
+        return Err[MsQuicTransport](Error(setRes))
+    let policyRes = msquicMakeLocalhostTlsPolicy()
+    if IsErr(policyRes):
+        return Err[MsQuicTransport](Error(policyRes))
+    let tlsRes: Result[bool] = setMsQuicTransportTlsPolicy(t, Value(policyRes))
+    if IsErr(tlsRes):
+        return Err[MsQuicTransport](Error(tlsRes))
+    return Ok[MsQuicTransport](t)
+
+fn dmReadExact(conn: var Connection, need: int32): Result[Bytes] =
+    var out: Bytes = emptyBytes()
+    for i in 0..<128:
+        if bytesLen(out) >= need:
+            return Ok[Bytes](out)
+        let readRes: Result[Bytes] = quicConnRead(conn, need - bytesLen(out))
+        if IsErr(readRes):
+            return Err[Bytes](Error(readRes))
+        dmBytesAppend(out, Value(readRes))
+    return Err[Bytes]("dm stream: short read")
+
+fn dmEncodeFrame(text: str): Bytes =
+    let payload: Bytes = bytesFromString(text)
+    let out: Bytes = bytesAlloc(4 + bytesLen(payload))
+    let plen: int32 = bytesLen(payload)
+    bytesSet(out, 0, (plen >> 24) & 0xff)
+    bytesSet(out, 1, (plen >> 16) & 0xff)
+    bytesSet(out, 2, (plen >> 8) & 0xff)
+    bytesSet(out, 3, plen & 0xff)
+    for i in 0..<plen:
+        bytesSet(out, 4 + i, bytesGet(payload, i))
+    return out
+
+fn dmReadFrame(conn: var Connection): Result[str] =
+    let hdrRes: Result[Bytes] = dmReadExact(conn, 4)
+    if IsErr(hdrRes):
+        return Err[str](Error(hdrRes))
+    let hdr: Bytes = Value(hdrRes)
+    let size: int32 =
+        (bytesGet(hdr, 0) << 24) |
+        (bytesGet(hdr, 1) << 16) |
+        (bytesGet(hdr, 2) << 8) |
+        bytesGet(hdr, 3)
+    if size < 0:
+        return Err[str]("dm stream: invalid frame size")
+    let bodyRes: Result[Bytes] = dmReadExact(conn, size)
+    if IsErr(bodyRes):
+        return Err[str](Error(bodyRes))
+    return Ok[str](bytesToString(Value(bodyRes)))
+
+fn dmDatagramReadRetry(t: var MsQuicTransport, conn: var Connection): Result[Bytes] =
+    for i in 0..<128:
+        let readRes: Result[Bytes] = msquicTransportDatagramRead(t, conn)
+        if IsOk(readRes):
+            return readRes
+        if ! strContains(Error(readRes), "queue empty"):
+            return readRes
+    return Err[Bytes]("msquic udp: queue empty")
+
+fn dmAddr(): Result[MultiAddress] =
+    return parseMultiAddress("/ip4/127.0.0.1/udp/0/quic-v1")
+
+fn runStreamDmDemo(): Result[bool] =
+    let addrRes: Result[MultiAddress] = dmAddr()
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    let transportRes: Result[MsQuicTransport] = dmNewTransport(96)
+    if IsErr(transportRes):
+        return Err[bool](Error(transportRes))
+    var t: MsQuicTransport = Value(transportRes)
+    let addr: MultiAddress = Value(addrRes)
+    start(t, addr)
+    if ! t.running:
+        return Err[bool]("dm stream: start failed")
+    let dialRes: Result[Connection] = dial(t, addr)
+    if IsErr(dialRes):
+        return Err[bool]("dm stream: dial: " + Error(dialRes))
+    let acceptRes: Result[Connection] = accept(t)
+    if IsErr(acceptRes):
+        return Err[bool]("dm stream: accept: " + Error(acceptRes))
+    var client: Connection = Value(dialRes)
+    var server: Connection = Value(acceptRes)
+
+    let hello: Bytes = dmEncodeFrame("dm-st:hello")
+    let writeRes: Result[int32] = quicConnWrite(client, hello)
+    if IsErr(writeRes):
+        return Err[bool]("dm stream: write hello: " + Error(writeRes))
+    let serverMsgRes: Result[str] = dmReadFrame(server)
+    if IsErr(serverMsgRes):
+        return Err[bool]("dm stream: server read: " + Error(serverMsgRes))
+    if Value(serverMsgRes) != "dm-st:hello":
+        return Err[bool]("dm stream: hello mismatch")
+
+    let ackWriteRes: Result[int32] = quicConnWrite(server, dmEncodeFrame("dm-st:ack"))
+    if IsErr(ackWriteRes):
+        return Err[bool]("dm stream: write ack: " + Error(ackWriteRes))
+    let clientMsgRes: Result[str] = dmReadFrame(client)
+    if IsErr(clientMsgRes):
+        return Err[bool]("dm stream: client read: " + Error(clientMsgRes))
+    if Value(clientMsgRes) != "dm-st:ack":
+        return Err[bool]("dm stream: ack mismatch")
+
+    msquicNativeTestDropNextAppPacket()
+    let rtxWriteRes: Result[int32] = quicConnWrite(client, dmEncodeFrame("dm-st:rtx"))
+    if IsErr(rtxWriteRes):
+        return Err[bool]("dm stream: retransmit write: " + Error(rtxWriteRes))
+    let forceRes: Result[bool] = msquicNativeTestForceRetransmit(client.pipeIdx)
+    if IsErr(forceRes):
+        return Err[bool]("dm stream: force retransmit: " + Error(forceRes))
+    let rtxMsgRes: Result[str] = dmReadFrame(server)
+    if IsErr(rtxMsgRes):
+        return Err[bool]("dm stream: retransmit read: " + Error(rtxMsgRes))
+    if Value(rtxMsgRes) != "dm-st:rtx":
+        return Err[bool]("dm stream: retransmit mismatch")
+
+    dropMsQuicConnectionsByPipe(client.pipeIdx)
+    let closedWriteRes: Result[int32] = quicConnWrite(client, dmEncodeFrame("dm-st:closed"))
+    if IsOk(closedWriteRes):
+        return Err[bool]("dm stream: close boundary missing")
+    stop(t)
+    return Ok[bool](true)
+
+fn runDatagramDmDemo(): Result[bool] =
+    let addrRes: Result[MultiAddress] = dmAddr()
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    let transportRes: Result[MsQuicTransport] = dmNewTransport(32)
+    if IsErr(transportRes):
+        return Err[bool](Error(transportRes))
+    var t: MsQuicTransport = Value(transportRes)
+    let addr: MultiAddress = Value(addrRes)
+    start(t, addr)
+    if ! t.running:
+        return Err[bool]("dm datagram: start failed")
+    let dialRes: Result[Connection] = dial(t, addr)
+    if IsErr(dialRes):
+        return Err[bool]("dm datagram: dial: " + Error(dialRes))
+    let acceptRes: Result[Connection] = accept(t)
+    if IsErr(acceptRes):
+        return Err[bool]("dm datagram: accept: " + Error(acceptRes))
+    var client: Connection = Value(dialRes)
+    var server: Connection = Value(acceptRes)
+
+    let hello: Bytes = bytesFromString("dm-dg:hello")
+    let writeRes: Result[int32] = msquicTransportDatagramWrite(t, client, hello)
+    if IsErr(writeRes):
+        return Err[bool]("dm datagram: write hello: " + Error(writeRes))
+    let serverReadRes: Result[Bytes] = dmDatagramReadRetry(t, server)
+    if IsErr(serverReadRes):
+        return Err[bool]("dm datagram: server read: " + Error(serverReadRes))
+    if bytesToString(Value(serverReadRes)) != "dm-dg:hello":
+        return Err[bool]("dm datagram: hello mismatch")
+
+    let ackWriteRes: Result[int32] = msquicTransportDatagramWrite(t, server, bytesFromString("dm-dg:ack"))
+    if IsErr(ackWriteRes):
+        return Err[bool]("dm datagram: write ack: " + Error(ackWriteRes))
+    let clientReadRes: Result[Bytes] = dmDatagramReadRetry(t, client)
+    if IsErr(clientReadRes):
+        return Err[bool]("dm datagram: client read: " + Error(clientReadRes))
+    if bytesToString(Value(clientReadRes)) != "dm-dg:ack":
+        return Err[bool]("dm datagram: ack mismatch")
+
+    let oversize: Bytes = bytesAlloc(40)
+    let oversizeRes: Result[int32] = msquicTransportDatagramWrite(t, client, oversize)
+    if IsOk(oversizeRes):
+        return Err[bool]("dm datagram: oversize boundary missing")
+
+    dropMsQuicConnectionsByPipe(client.pipeIdx)
+    let closedRes: Result[int32] = msquicTransportDatagramWrite(t, client, bytesFromString("x"))
+    if IsOk(closedRes):
+        return Err[bool]("dm datagram: close boundary missing")
+    stop(t)
+    return Ok[bool](true)

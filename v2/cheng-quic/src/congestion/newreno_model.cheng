@@ -1,0 +1,115 @@
+# NewReno congestion control(minimal).
+
+import cheng/quic/congestion/common
+type
+    NewRenoPhase = enum
+        nrSlowStart
+        nrCongestionAvoidance
+        nrRecovery
+
+    NewRenoModel =
+        congestionWindow: int64
+        ssthresh: int64
+        bytesInFlight: int64
+        minCongestionWindow: int64
+        maxDatagramSize: int64
+        recoveryStartPacket: int64
+        phase: NewRenoPhase
+
+fn newRenoInit(
+    maxDatagramSize: int32,
+    initialWindowPackets: int32,
+    minWindowPackets: int32
+): NewRenoModel =
+    let initialWindow: int64 = int64(maxDatagramSize) * int64(initialWindowPackets)
+    var minPackets: int32 = minWindowPackets
+    if minPackets < 2:
+        minPackets = 2
+    if minPackets < minCwndInMss:
+        minPackets = minCwndInMss
+    let minWindow: int64 = int64(maxDatagramSize) * int64(minPackets)
+    NewRenoModel(
+        congestionWindow: initialWindow,
+        ssthresh: maxInt64Value,
+        bytesInFlight: 0,
+        minCongestionWindow: minWindow,
+        maxDatagramSize: int64(maxDatagramSize),
+        recoveryStartPacket: 0,
+        phase: nrSlowStart
+    )
+
+fn newRenoCanSend(model: NewRenoModel): bool =
+    return model.bytesInFlight < model.congestionWindow
+
+fn newRenoSendAllowance(model: NewRenoModel): int64 =
+    if model.congestionWindow > model.bytesInFlight:
+        return model.congestionWindow - model.bytesInFlight
+    return 0
+
+fn newRenoOnPacketSent(model: var NewRenoModel, bytes: int64) =
+    model.bytesInFlight = model.bytesInFlight + bytes
+
+fn newRenoUpdatePhase(model: var NewRenoModel) =
+    if model.phase == nrRecovery:
+        return
+    if model.congestionWindow < model.ssthresh:
+        model.phase = nrSlowStart
+    else:
+        model.phase = nrCongestionAvoidance
+
+fn newRenoExitRecovery(model: var NewRenoModel) =
+    if model.phase != nrRecovery:
+        return
+    if model.congestionWindow < model.ssthresh:
+        model.phase = nrSlowStart
+    else:
+        model.phase = nrCongestionAvoidance
+
+fn newRenoOnDataAcked(model: var NewRenoModel, ack: AckEventSnapshot) =
+    let acked: int64 = ack.ackedRetransmittableBytes
+    if acked <= 0:
+        return
+    if model.bytesInFlight > acked:
+        model.bytesInFlight = model.bytesInFlight - acked
+    else:
+        model.bytesInFlight = 0
+    if model.phase == nrRecovery && ack.largestAck <= model.recoveryStartPacket:
+        return
+    if model.phase == nrRecovery && ack.largestAck > model.recoveryStartPacket:
+        newRenoExitRecovery(model)
+    if model.phase == nrSlowStart:
+        model.congestionWindow = model.congestionWindow + acked
+    elif model.phase == nrCongestionAvoidance:
+        let mss: int64 = model.maxDatagramSize
+        var inc: int64 = 0
+        if model.congestionWindow > 0:
+            inc = (mss * acked) / model.congestionWindow
+        if inc <= 0:
+            inc = mss
+        model.congestionWindow = model.congestionWindow + inc
+    newRenoUpdatePhase(model)
+
+fn newRenoOnDataLost(model: var NewRenoModel, loss: LossEventSnapshot) =
+    let lostBytes: int64 = loss.retransmittableBytesLost
+    if model.bytesInFlight > lostBytes:
+        model.bytesInFlight = model.bytesInFlight - lostBytes
+    else:
+        model.bytesInFlight = 0
+    var nextSsthresh: int64 = model.congestionWindow / 2
+    if nextSsthresh < model.minCongestionWindow:
+        nextSsthresh = model.minCongestionWindow
+    model.ssthresh = nextSsthresh
+    model.congestionWindow = nextSsthresh
+    model.phase = nrRecovery
+    model.recoveryStartPacket = loss.largestSentPacketNumber
+
+fn newRenoOnProbeTimeout(model: var NewRenoModel) =
+    var nextSsthresh: int64 = model.congestionWindow / 2
+    if nextSsthresh < model.minCongestionWindow:
+        nextSsthresh = model.minCongestionWindow
+    model.ssthresh = nextSsthresh
+    model.congestionWindow = model.minCongestionWindow
+    if model.bytesInFlight > model.congestionWindow:
+        model.bytesInFlight = model.congestionWindow
+    model.phase = nrSlowStart
+    model.recoveryStartPacket = 0

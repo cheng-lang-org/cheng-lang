@@ -1,0 +1,136 @@
+# MsQuic TLS 1.3 crypto stream handshake test(client-side, synthetic).
+
+import std/result
+import std/rawbytes
+import std/buffer
+import std/crypto/curve25519
+import cheng/quic/protocol/tls_core
+import cheng/quic/tls/handshake13
+fn appendUint16(buf: var ByteBuffer, value: int32) =
+    appendByte(buf, (value >> 8) & 0xff)
+    appendByte(buf, value & 0xff)
+
+fn appendUint24(buf: var ByteBuffer, value: int32) =
+    appendByte(buf, (value >> 16) & 0xff)
+    appendByte(buf, (value >> 8) & 0xff)
+    appendByte(buf, value & 0xff)
+
+fn appendExtension(buf: var ByteBuffer, extType: int32, data: Bytes) =
+    appendUint16(buf, extType)
+    appendUint16(buf, bytesLen(data))
+    appendBytes(buf, data)
+
+fn buildHandshakeMessage(kind: int32, body: Bytes): Bytes =
+    var buf: ByteBuffer = newByteBuffer()
+    appendByte(buf, kind)
+    appendUint24(buf, bytesLen(body))
+    appendBytes(buf, body)
+    return toBytes(buf)
+
+fn buildClientHello(random: Bytes, keyShare: Bytes): Bytes =
+    var buf: ByteBuffer = newByteBuffer()
+    appendUint16(buf, tlsLegacyVersion)
+    appendBytes(buf, random)
+    appendByte(buf, 0)
+    var cbuf: ByteBuffer = newByteBuffer()
+    appendUint16(cbuf, tlsCipherAes128GcmSha256)
+    let cbytes: Bytes = toBytes(cbuf)
+    appendUint16(buf, bytesLen(cbytes))
+    appendBytes(buf, cbytes)
+    appendByte(buf, 1)
+    appendByte(buf, 0)
+    var ext: ByteBuffer = newByteBuffer()
+    var ver: ByteBuffer = newByteBuffer()
+    appendByte(ver, 2)
+    appendUint16(ver, tlsVersion13)
+    appendExtension(ext, tlsExtSupportedVersions, toBytes(ver))
+    var ksList: ByteBuffer = newByteBuffer()
+    var ksEntry: ByteBuffer = newByteBuffer()
+    appendUint16(ksEntry, tlsGroupX25519)
+    appendUint16(ksEntry, bytesLen(keyShare))
+    appendBytes(ksEntry, keyShare)
+    let ksEntryBytes: Bytes = toBytes(ksEntry)
+    appendUint16(ksList, bytesLen(ksEntryBytes))
+    appendBytes(ksList, ksEntryBytes)
+    appendExtension(ext, tlsExtKeyShare, toBytes(ksList))
+    var sigs: ByteBuffer = newByteBuffer()
+    appendUint16(sigs, 2)
+    appendUint16(sigs, tlsSigRsaPssRsaeSha256)
+    appendExtension(ext, tlsExtSignatureAlgorithms, toBytes(sigs))
+    let extBytes: Bytes = toBytes(ext)
+    appendUint16(buf, bytesLen(extBytes))
+    appendBytes(buf, extBytes)
+    return toBytes(buf)
+
+fn buildServerHello(random: Bytes, keyShare: Bytes): Bytes =
+    var buf: ByteBuffer = newByteBuffer()
+    appendUint16(buf, tlsLegacyVersion)
+    appendBytes(buf, random)
+    appendByte(buf, 0)
+    appendUint16(buf, tlsCipherAes128GcmSha256)
+    appendByte(buf, 0)
+    var ext: ByteBuffer = newByteBuffer()
+    var ver: ByteBuffer = newByteBuffer()
+    appendUint16(ver, tlsVersion13)
+    appendExtension(ext, tlsExtSupportedVersions, toBytes(ver))
+    var ksEntry: ByteBuffer = newByteBuffer()
+    appendUint16(ksEntry, tlsGroupX25519)
+    appendUint16(ksEntry, bytesLen(keyShare))
+    appendBytes(ksEntry, keyShare)
+    appendExtension(ext, tlsExtKeyShare, toBytes(ksEntry))
+    let extBytes: Bytes = toBytes(ext)
+    appendUint16(buf, bytesLen(extBytes))
+    appendBytes(buf, extBytes)
+    return toBytes(buf)
+
+fn runTls13CryptoStreamTest(): Result[bool] =
+    var session: MsQuicTlsSession = initMsQuicTlsSession()
+    let startRes: Result[bool] = msquicTlsSessionStartHandshake13(session, TlsRoleClient)
+    if IsErr(startRes):
+        return Err[bool](Error(startRes))
+    msquicTls13HandshakeSetRequireCert(session.handshake13, false)
+    let clientRes: Result[Curve25519KeyPair] = generateCurve25519KeyPair()
+    if IsErr(clientRes):
+        return Err[bool](Error(clientRes))
+    let serverRes: Result[Curve25519KeyPair] = generateCurve25519KeyPair()
+    if IsErr(serverRes):
+        return Err[bool](Error(serverRes))
+    let client: Curve25519KeyPair = Value(clientRes)
+    let server: Curve25519KeyPair = Value(serverRes)
+    let setRes: Result[bool] = msquicTlsSessionSetLocalKeyShare(session, tlsGroupX25519, client.priv, client.pub)
+    if IsErr(setRes):
+        return Err[bool](Error(setRes))
+    let cRand: Bytes = bytesAlloc(32)
+    let sRand: Bytes = bytesAlloc(32)
+    let chBody: Bytes = buildClientHello(cRand, client.pub)
+    let shBody: Bytes = buildServerHello(sRand, server.pub)
+    let ch: Bytes = buildHandshakeMessage(tlsHandshakeClientHello, chBody)
+    let sh: Bytes = buildHandshakeMessage(tlsHandshakeServerHello, shBody)
+    let chSplit: int32 = 5
+    let chFirst: Bytes = bytesSlice(ch, 0, chSplit)
+    let chRest: Bytes = bytesSlice(ch, chSplit, bytesLen(ch) - chSplit)
+    let addCh1: Result[int32] = msquicTlsSessionOnCryptoFrame(session, 0, chFirst)
+    if IsErr(addCh1):
+        return Err[bool](Error(addCh1))
+    let addCh2: Result[int32] = msquicTlsSessionOnCryptoFrame(session, chSplit, chRest)
+    if IsErr(addCh2):
+        return Err[bool](Error(addCh2))
+    let shOffset: int64 = int64(bytesLen(ch))
+    let addSh: Result[int32] = msquicTlsSessionOnCryptoFrame(session, shOffset, sh)
+    if IsErr(addSh):
+        return Err[bool](Error(addSh))
+    if ! session.handshake13.handshakeSecretsReady:
+        return Err[bool]("tls13: handshake secrets ! ready")
+    let finDataRes: Result[Bytes] = msquicTls13FinishedData(session.handshake13, true)
+    if IsErr(finDataRes):
+        return Err[bool](Error(finDataRes))
+    let fin: Bytes = buildHandshakeMessage(tlsHandshakeFinished, Value(finDataRes))
+    let finOffset: int64 = shOffset + int64(bytesLen(sh))
+    let addFin: Result[int32] = msquicTlsSessionOnCryptoFrame(session, finOffset, fin)
+    if IsErr(addFin):
+        return Err[bool](Error(addFin))
+    if ! session.handshake13.finishedOk:
+        return Err[bool]("tls13: finished ! verified")
+    if msquicTlsBlueprintState(session.tls) != MsQuicTlsReady:
+        return Err[bool]("tls13: tls session ! ready")
+    return Ok[bool](true)

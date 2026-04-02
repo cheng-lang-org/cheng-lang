@@ -1,0 +1,431 @@
+# MsQuic API implementation(minimal).
+
+import std/result
+import std/rawbytes
+import std/system
+import cheng/quic/api/common
+import cheng/quic/api/api_surface_model
+import cheng/quic/api/settings_model
+import cheng/quic/api/diagnostics_model
+import cheng/quic/api/event_model
+import cheng/quic/api/runtime_bridge
+import cheng/quic/api/ffi_loader
+import cheng/quic/inc/msquic_constants
+import cheng/quic/inc/msquic_settings
+import cheng/quic/inc/msquic_types
+const
+    maxMsQuicEvents = 64
+
+var
+    msquicApiGlobalParamSettings: QUIC_SETTINGS = initQuicSettings()
+    msquicApiGlobalParamGlobalSettings: QUIC_GLOBAL_SETTINGS = initQuicGlobalSettings()
+    msquicApiGlobalParamStatelessResetKey: Bytes = emptyBytes()
+    msquicApiGlobalParamRetryConfig: QUIC_STATELESS_RETRY_CONFIG = initQuicStatelessRetryConfig()
+    msquicApiGlobalParamSupportedVersions: QUIC_SUPPORTED_VERSIONS = initQuicSupportedVersions()
+    msquicApiGlobalParamVersionSettings: QUIC_VERSION_SETTINGS = initQuicVersionSettings()
+    msquicApiGlobalParamVersionNegotiationEnabled: bool = false
+    msquicApiGlobalParamExecutionConfig: QUIC_GLOBAL_EXECUTION_CONFIG = initQuicGlobalExecutionConfig()
+    msquicApiGlobalParamLibraryVersion: QUIC_LIBRARY_VERSION = initQuicLibraryVersion()
+    msquicApiGlobalParamLibraryGitHash: Bytes = emptyBytes()
+    msquicApiGlobalParamPerfCounters: QUIC_PERF_COUNTERS = initQuicPerfCounters()
+
+type
+    MsQuicEventLog =
+        count: int32
+        dropped: int32
+        # NOTE: stage1 backend has known issues with `T[N]` when `T` is a composite type.
+        # Store pointers and copy fields into stable per-slot storage.
+        items: MsQuicEvent[maxMsQuicEvents]
+
+    MsQuicApi =
+        surface: MsQuicApiSurface
+        runtime: MsQuicRuntimeBridge
+        diagnostics: MsQuicDiagnostics
+        events: MsQuicEventLog
+        perfCounters: QUIC_PERF_COUNTERS
+        ffi: MsQuicFfiState
+        status: MsQuicStatus
+
+fn initMsQuicEventLog(): MsQuicEventLog =
+    var out: MsQuicEventLog
+    out.count = 0
+    out.dropped = 0
+    return out
+
+fn copyMsQuicEvent(dst: var MsQuicEvent, src: MsQuicEvent) =
+    dst.kind = src.kind
+    dst.timestampMs = src.timestampMs
+    dst.connId = src.connId
+    dst.streamId = src.streamId
+    dst.message = src.message
+    dst.bytes = src.bytes
+    dst.packetType = src.packetType
+    dst.packetNumber = src.packetNumber
+    dst.rttMs = src.rttMs
+    dst.minRttMs = src.minRttMs
+    dst.maxRttMs = src.maxRttMs
+    dst.bytesInFlight = src.bytesInFlight
+    dst.lostPackets = src.lostPackets
+    dst.bandwidthOut = src.bandwidthOut
+    dst.bandwidthIn = src.bandwidthIn
+    dst.deliveryRateOut = src.deliveryRateOut
+    dst.deliveryRateIn = src.deliveryRateIn
+    dst.closeErrorCode = src.closeErrorCode
+    dst.closeFrameType = src.closeFrameType
+    dst.closeIsApp = src.closeIsApp
+
+fn initMsQuicApi(): MsQuicApi =
+    MsQuicApi(
+        surface: initMsQuicApiSurface(),
+        runtime: initMsQuicRuntimeBridge(),
+        diagnostics: initMsQuicDiagnostics(),
+        events: initMsQuicEventLog(),
+        perfCounters: initQuicPerfCounters(),
+        ffi: initMsQuicFfiState(),
+        status: MsQuicStatusOk
+    )
+
+fn msquicApiStatus(api: MsQuicApi): MsQuicStatus =
+    return api.status
+
+fn msquicApiSetStatus(api: var MsQuicApi, status: MsQuicStatus) =
+    api.status = status
+
+fn msquicApiSettings(api: var MsQuicApi): MsQuicSettings =
+    return msquicRuntimeBridgeSettings(api.runtime)
+
+fn msquicApiSetSettings(api: var MsQuicApi, settings: MsQuicSettings): Result[bool] =
+    let setRes: Result[bool] = msquicRuntimeBridgeSetSettings(api.runtime, settings)
+    if IsErr(setRes):
+        api.status = MsQuicStatusInvalidParam
+        return Err[bool](Error(setRes))
+    api.status = MsQuicStatusOk
+    return Ok[bool](true)
+
+fn msquicApiDiagnostics(api: MsQuicApi): MsQuicDiagnostics =
+    return api.diagnostics
+
+fn msquicApiResetDiagnostics(api: var MsQuicApi) =
+    api.diagnostics = initMsQuicDiagnostics()
+
+fn msquicApiRecordEvent(api: var MsQuicApi, event: MsQuicEvent): Result[bool] =
+    if api.events.count >= maxMsQuicEvents:
+        api.events.dropped = api.events.dropped + 1
+        for i in 1..<maxMsQuicEvents:
+            copyMsQuicEvent(api.events.items[i - 1], api.events.items[i])
+        copyMsQuicEvent(api.events.items[maxMsQuicEvents - 1], event)
+        api.events.count = maxMsQuicEvents
+        return Ok[bool](true)
+    copyMsQuicEvent(api.events.items[api.events.count], event)
+    api.events.count = api.events.count + 1
+    return Ok[bool](true)
+
+fn msquicApiEventCount(api: MsQuicApi): int32 =
+    return api.events.count
+
+fn msquicApiConnOpened(api: var MsQuicApi, connId: int64) =
+    api.perfCounters.connectionsCreated = api.perfCounters.connectionsCreated + 1
+    api.perfCounters.connectionsActive = api.perfCounters.connectionsActive + 1
+    msquicDiagConnOpen(api.diagnostics, connId)
+    let ev: MsQuicEvent = initMsQuicEvent(MsQuicEventConnOpen, "conn open", connId, -1)
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiConnClosed(api: var MsQuicApi, connId: int64) =
+    if api.perfCounters.connectionsActive > 0:
+        api.perfCounters.connectionsActive = api.perfCounters.connectionsActive - 1
+    api.perfCounters.connectionsClosed = api.perfCounters.connectionsClosed + 1
+    msquicDiagConnClose(api.diagnostics, connId)
+    let ev: MsQuicEvent = initMsQuicEvent(MsQuicEventConnClose, "conn close", connId, -1)
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiConnClosedWithInfo(api: var MsQuicApi, connId: int64, reason: str, errCode: int64, frameType: int64, isApp: bool) =
+    if api.perfCounters.connectionsActive > 0:
+        api.perfCounters.connectionsActive = api.perfCounters.connectionsActive - 1
+    api.perfCounters.connectionsClosed = api.perfCounters.connectionsClosed + 1
+    msquicDiagConnClose(api.diagnostics, connId)
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventConnClose, reason, connId, -1)
+    ev.closeErrorCode = errCode
+    ev.closeFrameType = frameType
+    ev.closeIsApp = isApp
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiConnShutdownStarted(api: var MsQuicApi, connId: int64, reason: str, errCode: int64, frameType: int64, isApp: bool) =
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventConnShutdownStart, reason, connId, -1)
+    ev.closeErrorCode = errCode
+    ev.closeFrameType = frameType
+    ev.closeIsApp = isApp
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiConnShutdownComplete(api: var MsQuicApi, connId: int64, reason: str, errCode: int64, frameType: int64, isApp: bool) =
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventConnShutdownComplete, reason, connId, -1)
+    ev.closeErrorCode = errCode
+    ev.closeFrameType = frameType
+    ev.closeIsApp = isApp
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiStreamOpened(api: var MsQuicApi, connId: int64, streamId: int64) =
+    api.perfCounters.streamsOpened = api.perfCounters.streamsOpened + 1
+    api.perfCounters.streamsActive = api.perfCounters.streamsActive + 1
+    msquicDiagStreamOpen(api.diagnostics, connId)
+    let ev: MsQuicEvent = initMsQuicEvent(MsQuicEventStreamOpen, "stream open", connId, streamId)
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiStreamClosed(api: var MsQuicApi, connId: int64, streamId: int64) =
+    if api.perfCounters.streamsActive > 0:
+        api.perfCounters.streamsActive = api.perfCounters.streamsActive - 1
+    api.perfCounters.streamsClosed = api.perfCounters.streamsClosed + 1
+    msquicDiagStreamClose(api.diagnostics, connId)
+    let ev: MsQuicEvent = initMsQuicEvent(MsQuicEventStreamClose, "stream close", connId, streamId)
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiStreamShutdownStarted(api: var MsQuicApi, connId: int64, streamId: int64, reason: str, errCode: int64, isApp: bool) =
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventStreamShutdownStart, reason, connId, streamId)
+    ev.closeErrorCode = errCode
+    ev.closeIsApp = isApp
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiStreamShutdownComplete(api: var MsQuicApi, connId: int64, streamId: int64, reason: str, errCode: int64, isApp: bool) =
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventStreamShutdownComplete, reason, connId, streamId)
+    ev.closeErrorCode = errCode
+    ev.closeIsApp = isApp
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiRecordSend(api: var MsQuicApi, connId: int64, bytes: int64) =
+    api.perfCounters.packetsSent = api.perfCounters.packetsSent + 1
+    if bytes > 0:
+        api.perfCounters.bytesSent = api.perfCounters.bytesSent + bytes
+    msquicDiagRecordSend(api.diagnostics, connId, bytes)
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventPacketSent, "packet sent", connId, -1)
+    if bytes > 0:
+        ev.bytes = bytes
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiRecordRecv(api: var MsQuicApi, connId: int64, bytes: int64) =
+    api.perfCounters.packetsRecv = api.perfCounters.packetsRecv + 1
+    if bytes > 0:
+        api.perfCounters.bytesRecv = api.perfCounters.bytesRecv + bytes
+    msquicDiagRecordRecv(api.diagnostics, connId, bytes)
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventPacketRecv, "packet recv", connId, -1)
+    if bytes > 0:
+        ev.bytes = bytes
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiRecordSendWithPacketInfo(api: var MsQuicApi, connId: int64, bytes: int64, packetType: int32, packetNumber: int64) =
+    api.perfCounters.packetsSent = api.perfCounters.packetsSent + 1
+    if bytes > 0:
+        api.perfCounters.bytesSent = api.perfCounters.bytesSent + bytes
+    msquicDiagRecordSend(api.diagnostics, connId, bytes)
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventPacketSent, "", connId, -1)
+    if bytes > 0:
+        ev.bytes = bytes
+    ev.packetType = packetType
+    ev.packetNumber = packetNumber
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiRecordRecvWithPacketInfo(api: var MsQuicApi, connId: int64, bytes: int64, packetType: int32, packetNumber: int64) =
+    api.perfCounters.packetsRecv = api.perfCounters.packetsRecv + 1
+    if bytes > 0:
+        api.perfCounters.bytesRecv = api.perfCounters.bytesRecv + bytes
+    msquicDiagRecordRecv(api.diagnostics, connId, bytes)
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventPacketRecv, "", connId, -1)
+    if bytes > 0:
+        ev.bytes = bytes
+    ev.packetType = packetType
+    ev.packetNumber = packetNumber
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiRecordDatagramSend(api: var MsQuicApi, connId: int64, bytes: int64) =
+    api.perfCounters.datagramsSent = api.perfCounters.datagramsSent + 1
+    api.perfCounters.packetsSent = api.perfCounters.packetsSent + 1
+    if bytes > 0:
+        api.perfCounters.datagramBytesSent = api.perfCounters.datagramBytesSent + bytes
+        api.perfCounters.bytesSent = api.perfCounters.bytesSent + bytes
+    msquicDiagRecordSend(api.diagnostics, connId, bytes)
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventDatagramSent, "", connId, -1)
+    if bytes > 0:
+        ev.bytes = bytes
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiRecordDatagramRecv(api: var MsQuicApi, connId: int64, bytes: int64) =
+    api.perfCounters.datagramsRecv = api.perfCounters.datagramsRecv + 1
+    api.perfCounters.packetsRecv = api.perfCounters.packetsRecv + 1
+    if bytes > 0:
+        api.perfCounters.datagramBytesRecv = api.perfCounters.datagramBytesRecv + bytes
+        api.perfCounters.bytesRecv = api.perfCounters.bytesRecv + bytes
+    msquicDiagRecordRecv(api.diagnostics, connId, bytes)
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventDatagramRecv, "", connId, -1)
+    if bytes > 0:
+        ev.bytes = bytes
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiRecordError(api: var MsQuicApi, message: str) =
+    api.perfCounters.errors = api.perfCounters.errors + 1
+    msquicDiagError(api.diagnostics, message)
+    let ev: MsQuicEvent = initMsQuicEvent(MsQuicEventError, message, -1, -1)
+    msquicApiRecordEvent(api, ev)
+    api.status = MsQuicStatusFailed
+
+fn msquicApiRecordDrop(api: var MsQuicApi, bytes: int64, reason: str) =
+    api.perfCounters.packetsDropped = api.perfCounters.packetsDropped + 1
+    if bytes > 0:
+        api.perfCounters.bytesDropped = api.perfCounters.bytesDropped + bytes
+    var ev: MsQuicEvent = initMsQuicEvent(MsQuicEventWarning, reason, -1, -1)
+    if bytes > 0:
+        ev.bytes = bytes
+    msquicApiRecordEvent(api, ev)
+
+fn msquicApiGetPerfCounters(api: MsQuicApi): QUIC_PERF_COUNTERS =
+    return api.perfCounters
+
+# Global param store is modeled as process-wide state(consistent with QUIC global params).
+# This keeps tests deterministic and avoids requiring extra plumbing through MsQuicRuntime.
+
+fn msquicApiGlobalSettings(api: MsQuicApi): QUIC_GLOBAL_SETTINGS =
+    api
+    return msquicApiGlobalParamGlobalSettings
+
+fn msquicApiSetGlobalSettingsStruct(api: var MsQuicApi, gs: QUIC_GLOBAL_SETTINGS): Result[bool] =
+    api
+    msquicApiGlobalParamGlobalSettings = gs
+    return Ok[bool](true)
+
+fn msquicApiSetGlobalParam(api: var MsQuicApi, param: int32, settings: QUIC_SETTINGS): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_SETTINGS:
+        return Err[bool]("msquic api: unsupported global param")
+    msquicApiGlobalParamSettings = settings
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParam(api: MsQuicApi, param: int32): Result[QUIC_SETTINGS] =
+    api
+    if param != qUIC_PARAM_GLOBAL_SETTINGS:
+        return Err[QUIC_SETTINGS]("msquic api: unsupported global param")
+    return Ok[QUIC_SETTINGS](msquicApiGlobalParamSettings)
+
+fn msquicApiSetGlobalParamGlobalSettings(api: var MsQuicApi, param: int32, value: QUIC_GLOBAL_SETTINGS): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_GLOBAL_SETTINGS:
+        return Err[bool]("msquic api: unsupported global param")
+    msquicApiGlobalParamGlobalSettings = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamGlobalSettings(api: MsQuicApi, param: int32): Result[QUIC_GLOBAL_SETTINGS] =
+    api
+    if param != qUIC_PARAM_GLOBAL_GLOBAL_SETTINGS:
+        return Err[QUIC_GLOBAL_SETTINGS]("msquic api: unsupported global param")
+    return Ok[QUIC_GLOBAL_SETTINGS](msquicApiGlobalParamGlobalSettings)
+
+fn msquicApiSetGlobalParamBytes(api: var MsQuicApi, param: int32, value: Bytes): Result[bool] =
+    api
+    if param == qUIC_PARAM_GLOBAL_STATELESS_RESET_KEY:
+        msquicApiGlobalParamStatelessResetKey = value
+        return Ok[bool](true)
+    if param == qUIC_PARAM_GLOBAL_LIBRARY_GIT_HASH:
+        msquicApiGlobalParamLibraryGitHash = value
+        return Ok[bool](true)
+    return Err[bool]("msquic api: unsupported global bytes param")
+
+fn msquicApiGetGlobalParamBytes(api: MsQuicApi, param: int32): Result[Bytes] =
+    api
+    if param == qUIC_PARAM_GLOBAL_STATELESS_RESET_KEY:
+        return Ok[Bytes](msquicApiGlobalParamStatelessResetKey)
+    if param == qUIC_PARAM_GLOBAL_LIBRARY_GIT_HASH:
+        return Ok[Bytes](msquicApiGlobalParamLibraryGitHash)
+    return Err[Bytes]("msquic api: unsupported global bytes param")
+
+fn msquicApiSetGlobalParamRetryConfig(api: var MsQuicApi, param: int32, value: QUIC_STATELESS_RETRY_CONFIG): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG:
+        return Err[bool]("msquic api: unsupported global retry config param")
+    msquicApiGlobalParamRetryConfig = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamRetryConfig(api: MsQuicApi, param: int32): Result[QUIC_STATELESS_RETRY_CONFIG] =
+    api
+    if param != qUIC_PARAM_GLOBAL_STATELESS_RETRY_CONFIG:
+        return Err[QUIC_STATELESS_RETRY_CONFIG]("msquic api: unsupported global retry config param")
+    return Ok[QUIC_STATELESS_RETRY_CONFIG](msquicApiGlobalParamRetryConfig)
+
+fn msquicApiSetGlobalParamVersions(api: var MsQuicApi, param: int32, value: QUIC_SUPPORTED_VERSIONS): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_SUPPORTED_VERSIONS:
+        return Err[bool]("msquic api: unsupported global versions param")
+    msquicApiGlobalParamSupportedVersions = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamVersions(api: MsQuicApi, param: int32): Result[QUIC_SUPPORTED_VERSIONS] =
+    api
+    if param != qUIC_PARAM_GLOBAL_SUPPORTED_VERSIONS:
+        return Err[QUIC_SUPPORTED_VERSIONS]("msquic api: unsupported global versions param")
+    return Ok[QUIC_SUPPORTED_VERSIONS](msquicApiGlobalParamSupportedVersions)
+
+fn msquicApiSetGlobalParamVersionSettings(api: var MsQuicApi, param: int32, value: QUIC_VERSION_SETTINGS): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_VERSION_SETTINGS:
+        return Err[bool]("msquic api: unsupported global version settings param")
+    msquicApiGlobalParamVersionSettings = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamVersionSettings(api: MsQuicApi, param: int32): Result[QUIC_VERSION_SETTINGS] =
+    api
+    if param != qUIC_PARAM_GLOBAL_VERSION_SETTINGS:
+        return Err[QUIC_VERSION_SETTINGS]("msquic api: unsupported global version settings param")
+    return Ok[QUIC_VERSION_SETTINGS](msquicApiGlobalParamVersionSettings)
+
+fn msquicApiSetGlobalParamBool(api: var MsQuicApi, param: int32, value: bool): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_VERSION_NEGOTIATION_ENABLED:
+        return Err[bool]("msquic api: unsupported global bool param")
+    msquicApiGlobalParamVersionNegotiationEnabled = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamBool(api: MsQuicApi, param: int32): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_VERSION_NEGOTIATION_ENABLED:
+        return Err[bool]("msquic api: unsupported global bool param")
+    return Ok[bool](msquicApiGlobalParamVersionNegotiationEnabled)
+
+fn msquicApiSetGlobalParamExecutionConfig(api: var MsQuicApi, param: int32, value: QUIC_GLOBAL_EXECUTION_CONFIG): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_EXECUTION_CONFIG:
+        return Err[bool]("msquic api: unsupported global execution config param")
+    msquicApiGlobalParamExecutionConfig = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamExecutionConfig(api: MsQuicApi, param: int32): Result[QUIC_GLOBAL_EXECUTION_CONFIG] =
+    api
+    if param != qUIC_PARAM_GLOBAL_EXECUTION_CONFIG:
+        return Err[QUIC_GLOBAL_EXECUTION_CONFIG]("msquic api: unsupported global execution config param")
+    return Ok[QUIC_GLOBAL_EXECUTION_CONFIG](msquicApiGlobalParamExecutionConfig)
+
+fn msquicApiGetGlobalParamStatisticsV2Sizes(api: MsQuicApi, param: int32): Result[QUIC_STATISTICS_V2_SIZES] =
+    api
+    if param != qUIC_PARAM_GLOBAL_STATISTICS_V2_SIZES:
+        return Err[QUIC_STATISTICS_V2_SIZES]("msquic api: unsupported global statistics v2 sizes param")
+    return Ok[QUIC_STATISTICS_V2_SIZES](initQuicStatisticsV2Sizes())
+
+fn msquicApiSetGlobalParamLibraryVersion(api: var MsQuicApi, param: int32, value: QUIC_LIBRARY_VERSION): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_LIBRARY_VERSION:
+        return Err[bool]("msquic api: unsupported global library version param")
+    msquicApiGlobalParamLibraryVersion = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamLibraryVersion(api: MsQuicApi, param: int32): Result[QUIC_LIBRARY_VERSION] =
+    api
+    if param != qUIC_PARAM_GLOBAL_LIBRARY_VERSION:
+        return Err[QUIC_LIBRARY_VERSION]("msquic api: unsupported global library version param")
+    return Ok[QUIC_LIBRARY_VERSION](msquicApiGlobalParamLibraryVersion)
+
+fn msquicApiSetGlobalParamPerfCounters(api: var MsQuicApi, param: int32, value: QUIC_PERF_COUNTERS): Result[bool] =
+    api
+    if param != qUIC_PARAM_GLOBAL_PERF_COUNTERS:
+        return Err[bool]("msquic api: unsupported global perf counters param")
+    msquicApiGlobalParamPerfCounters = value
+    return Ok[bool](true)
+
+fn msquicApiGetGlobalParamPerfCounters(api: MsQuicApi, param: int32): Result[QUIC_PERF_COUNTERS] =
+    api
+    if param != qUIC_PARAM_GLOBAL_PERF_COUNTERS:
+        return Err[QUIC_PERF_COUNTERS]("msquic api: unsupported global perf counters param")
+    return Ok[QUIC_PERF_COUNTERS](msquicApiGlobalParamPerfCounters)

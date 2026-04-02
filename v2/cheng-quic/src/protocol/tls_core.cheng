@@ -1,0 +1,65 @@
+# MsQuic protocol TLS core(minimal).
+
+import std/result
+import std/strings
+import std/rawbytes
+import cheng/quic/tls/common
+import cheng/quic/tls/blueprint
+import cheng/quic/tls/handshake13
+import cheng/quic/protocol/protocol_core
+import cheng/quic/core/crypto_stream
+type
+    MsQuicTlsSession =
+        protocol: MsQuicProtocolContext
+        tls: MsQuicTlsBlueprint
+        handshake13: MsQuicTls13HandshakeState
+        crypto: MsQuicCryptoStream
+
+fn initMsQuicTlsSession(): MsQuicTlsSession =
+    MsQuicTlsSession(
+        protocol: initMsQuicProtocolContext(),
+        tls: initMsQuicTlsBlueprint(),
+        handshake13: initMsQuicTls13HandshakeState(TlsRoleClient),
+        crypto: initMsQuicCryptoStream()
+    )
+
+fn msquicTlsSessionStart(session: var MsQuicTlsSession): Result[bool] =
+    let protoRes: Result[bool] = msquicProtocolStart(session.protocol)
+    if IsErr(protoRes):
+        return Err[bool](Error(protoRes))
+    let tlsRes: Result[bool] = msquicTlsHandshakeStart(session.tls)
+    if IsErr(tlsRes):
+        return Err[bool](Error(tlsRes))
+    return Ok[bool](true)
+
+fn msquicTlsSessionFinish(session: var MsQuicTlsSession, ok: bool) =
+    msquicTlsHandshakeFinish(session.tls, ok)
+    msquicProtocolFinish(session.protocol, ok)
+
+fn msquicTlsSessionSummary(session: MsQuicTlsSession): str =
+    var out: str = msquicProtocolSummary(session.protocol)
+    out = out + " "
+    out = out + msquicTlsSummary(session.tls.config, session.tls.stats)
+    return out
+
+fn msquicTlsSessionStartHandshake13(session: var MsQuicTlsSession, role: MsQuicTls13HandshakeRole): Result[bool] =
+    msquicCryptoStreamReset(session.crypto)
+    session.handshake13 = initMsQuicTls13HandshakeState(role)
+    let protoRes: Result[bool] = msquicProtocolStart(session.protocol)
+    if IsErr(protoRes):
+        return Err[bool](Error(protoRes))
+    return Ok[bool](true)
+
+fn msquicTlsSessionSetLocalKeyShare(session: var MsQuicTlsSession, group: int32, priv: Bytes, pub: Bytes): Result[bool] =
+    msquicTls13HandshakeSetLocalKeyShare(session.handshake13, group, priv, pub)
+    return Ok[bool](true)
+
+fn msquicTlsSessionOnCryptoFrame(session: var MsQuicTlsSession, offset: int64, data: Bytes): Result[int32] =
+    let addRes: Result[bool] = msquicCryptoStreamAdd(session.crypto, offset, data)
+    if IsErr(addRes):
+        return Err[int32](Error(addRes))
+    let avail: int32 = msquicCryptoStreamAvailable(session.crypto)
+    if avail <= 0:
+        return Ok[int32](0)
+    let chunk: Bytes = msquicCryptoStreamConsume(session.crypto, avail)
+    return msquicTls13HandshakeFeed(session.handshake13, chunk)

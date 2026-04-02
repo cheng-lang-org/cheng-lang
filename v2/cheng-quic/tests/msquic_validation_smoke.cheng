@@ -1,0 +1,61 @@
+# MsQuic validation smoke test(manual).
+
+import std/result
+import std/rawbytes
+import cheng/quic/core/frame_model
+import cheng/quic/core/packet_model
+import cheng/quic/project/sample_echo/src/main
+import cheng/quic/tests/protocol_validation_test
+import cheng/quic/tests/test_packet_header
+import cheng/quic/tests/test_packet_payload
+import cheng/quic/tests/version_neg_ext_test
+import cheng/quic/tests/test_frame_catalog
+import cheng/quic/validation/protocol_validation
+fn runMsQuicValidationSmoke(): Result[bool] =
+    var pkt: MsQuicPacket = initMsQuicPacket(1)
+    let ping: MsQuicFrame = msquicFramePing()
+    let data: MsQuicFrame = msquicFrameData(0, 0, bytesFromString("msquic-validate"))
+    let addPingRes: Result[bool] = msquicPacketAddFrame(pkt, ping)
+    if IsErr(addPingRes):
+        return Err[bool](Error(addPingRes))
+    let addDataRes: Result[bool] = msquicPacketAddFrame(pkt, data)
+    if IsErr(addDataRes):
+        return Err[bool](Error(addDataRes))
+    let validRes: Result[bool] = msquicValidatePacket(pkt)
+    if IsErr(validRes):
+        return Err[bool](Error(validRes))
+    let encoded: Bytes = msquicPacketEncode(pkt)
+    let validBytesRes: Result[bool] = msquicValidatePacketBytes(encoded)
+    if IsErr(validBytesRes):
+        return Err[bool](Error(validBytesRes))
+    let badFrame: MsQuicFrame = msquicFrameData(-1, 0, bytesFromString("bad"))
+    let badFrameRes: Result[bool] = msquicValidateFrame(badFrame)
+    if IsOk(badFrameRes):
+        return Err[bool]("smoke: invalid frame accepted")
+    var badPkt: MsQuicPacket = initMsQuicPacket(-7)
+    msquicPacketAddFrame(badPkt, ping)
+    let badPktRes: Result[bool] = msquicValidatePacket(badPkt)
+    if IsOk(badPktRes):
+        return Err[bool]("smoke: invalid packet accepted")
+    let varintRes: Result[bool] = runQuicVarIntTest()
+    if IsErr(varintRes):
+        return varintRes
+    let headerRes: Result[bool] = runQuicPacketHeaderTest()
+    if IsErr(headerRes):
+        return headerRes
+    let versionRes: Result[bool] = runVersionNegotiationExtTest()
+    if IsErr(versionRes):
+        return versionRes
+    let payloadRes: Result[bool] = runMsQuicPacketPayloadTest()
+    if IsErr(payloadRes):
+        return payloadRes
+    let catalogRes: Result[bool] = runFrameCatalogTest()
+    if IsErr(catalogRes):
+        return catalogRes
+    let protocolRes: Result[bool] = runProtocolValidationTest()
+    if IsErr(protocolRes):
+        return protocolRes
+    let echoRes: Result[bool] = runSampleEcho()
+    if IsErr(echoRes):
+        return echoRes
+    return Ok[bool](true)

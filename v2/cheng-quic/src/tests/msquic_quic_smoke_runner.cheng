@@ -1,0 +1,92 @@
+# QUIC alias smoke runner (/quic and /quic-v1/tls adapters).
+
+import std/result
+import std/rawbytes
+import cheng/quic/multiaddress
+import cheng/quic/connection
+import cheng/quic/quictransport
+import cheng/quic/openssl_quic
+import cheng/quic/tests/msquic_test_pki
+
+fn runQuicAliasSmoke(): Result[bool] =
+    let quicAddr: MultiAddress = makeInprocMultiAddress(quicAddrKindQuic, 7101)
+    let tlsAddr: MultiAddress = makeInprocMultiAddress(quicAddrKindQuicTls, 7102)
+
+    var quic: QuicTransport = initQuicTransport()
+    var tls: OpenSslQuicTransport = initOpenSslQuicTransport()
+    let quicTlsRes: Result[bool] = msquicTestConfigureTransportTls(quic.msquic)
+    if IsErr(quicTlsRes):
+        return Err[bool]("quic alias: tls: " + Error(quicTlsRes))
+    let tlsTlsRes: Result[bool] = msquicTestConfigureTransportTls(tls.msquic)
+    if IsErr(tlsTlsRes):
+        return Err[bool]("openssl alias: tls: " + Error(tlsTlsRes))
+
+    if ! handles(quic, quicAddr):
+        return Err[bool]("quic alias: /quic ! handled")
+    if handles(quic, tlsAddr):
+        return Err[bool]("quic alias: /quic-v1/tls should not route to quic adapter")
+    if ! handles(tls, tlsAddr):
+        return Err[bool]("quic alias: /quic-v1/tls ! handled")
+    if handles(tls, quicAddr):
+        return Err[bool]("quic alias: /quic should not route to openssl adapter")
+
+    start(quic, quicAddr)
+    let qDialRes: Result[Connection] = dial(quic, quicAddr)
+    if IsErr(qDialRes):
+        return Err[bool]("quic alias: dial: " + Error(qDialRes))
+    let qAcceptRes: Result[Connection] = accept(quic)
+    if IsErr(qAcceptRes):
+        return Err[bool]("quic alias: accept: " + Error(qAcceptRes))
+
+    var qOut: Connection = Value(qDialRes)
+    var qIn: Connection = Value(qAcceptRes)
+    let qPayload: Bytes = bytesAlloc(3)
+    bytesSet(qPayload, 0, 0x11)
+    bytesSet(qPayload, 1, 0x22)
+    bytesSet(qPayload, 2, 0x33)
+    let qWriteRes: Result[int32] = quicConnWrite(qOut, qPayload)
+    if IsErr(qWriteRes):
+        return Err[bool]("quic alias: write: " + Error(qWriteRes))
+    let qReadRes: Result[Bytes] = quicConnRead(qIn, 4096)
+    if IsErr(qReadRes):
+        return Err[bool]("quic alias: read: " + Error(qReadRes))
+    if ! bytesEqual(Value(qReadRes), qPayload):
+        return Err[bool]("quic alias: payload mismatch")
+
+    start(tls, tlsAddr)
+    let tDialRes: Result[Connection] = dial(tls, tlsAddr)
+    if IsErr(tDialRes):
+        return Err[bool]("openssl alias: dial: " + Error(tDialRes))
+    let tAcceptRes: Result[Connection] = accept(tls)
+    if IsErr(tAcceptRes):
+        return Err[bool]("openssl alias: accept: " + Error(tAcceptRes))
+
+    var tOut: Connection = Value(tDialRes)
+    var tIn: Connection = Value(tAcceptRes)
+    let tPayload: Bytes = bytesAlloc(4)
+    bytesSet(tPayload, 0, 0x44)
+    bytesSet(tPayload, 1, 0x55)
+    bytesSet(tPayload, 2, 0x66)
+    bytesSet(tPayload, 3, 0x77)
+    let tWriteRes: Result[int32] = quicConnWrite(tOut, tPayload)
+    if IsErr(tWriteRes):
+        return Err[bool]("openssl alias: write: " + Error(tWriteRes))
+    let tReadRes: Result[Bytes] = quicConnRead(tIn, 4096)
+    if IsErr(tReadRes):
+        return Err[bool]("openssl alias: read: " + Error(tReadRes))
+    if ! bytesEqual(Value(tReadRes), tPayload):
+        return Err[bool]("openssl alias: payload mismatch")
+
+    stop(tls)
+    stop(quic)
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let res: Result[bool] = runQuicAliasSmoke()
+    if IsErr(res):
+        echo("quic smoke failed: " + Error(res))
+        return 1
+    echo("quic smoke ok")
+    echo("transport_select=/quic")
+    echo("transport_select=/quic-v1/tls")
+    return 0

@@ -1,0 +1,601 @@
+# MsQuic transport smoke test(manual).
+
+import std/result
+import std/strings
+import std/system
+import std/strings
+import cheng/quic/multiaddress
+import std/net/stream/connection
+import cheng/observability/metricsservice
+import cheng/quic/tests/msquic_test_pki
+import cheng/quic/msquictransport_full
+import cheng/quic/tests/test_transport_params
+import cheng/quic/tooling/export_sink
+const
+    msQuicAckSeqLen = 10
+
+fn readMsQuicExportFile(path: str): str =
+    if len(path) <= 0:
+        return ""
+    let f: MsQuicTicketStoreFile = msquicTicketStoreOpen(path, "rb")
+    if f == nil:
+        return ""
+    var cap: int32 = 4096
+    var lenRead: int32 = 0
+    var buf: void* = alloc(cap + 1)
+    while true:
+        let avail: int32 = cap - lenRead
+        if avail <= 0:
+            cap = cap * 2
+            buf = realloc(buf, cap + 1)
+            continue
+        let dst: void* = ptr_add(buf, lenRead)
+        let got: int32 = msquicTicketStoreRead(dst, 1, avail, f)
+        if got <= 0:
+            break
+        lenRead = lenRead + got
+        if got < avail:
+            break
+    msquicTicketStoreClose(f)
+    setMem(ptr_add(buf, lenRead), 0, 1)
+    return str(buf)
+
+fn assertMsQuicExportFile(): Result[bool] =
+    let path: str = msquicEnv("MSQUIC_EXPORT_FILE")
+    if len(path) <= 0:
+        return Ok[bool](true)
+    let text: str = readMsQuicExportFile(path)
+    if len(text) <= 0:
+        return Err[bool]("smoke: msquic export file empty")
+    if ! strContains(text, "qlog:"):
+        return Err[bool]("smoke: msquic export file missing qlog")
+    if ! strContains(text, "perf:"):
+        return Err[bool]("smoke: msquic export file missing perf")
+    if ! strContains(text, "metrics:"):
+        return Err[bool]("smoke: msquic export file missing metrics")
+    if ! strContains(text, "\"error_code\"") || ! strContains(text, "\"error_space\""):
+        return Err[bool]("smoke: msquic export file missing error fields")
+    if ! strContains(text, "\"frame_type\""):
+        return Err[bool]("smoke: msquic export file missing frame_type")
+    return Ok[bool](true)
+
+fn assertMsQuicUdpDrop(t: var MsQuicTransport, data: Bytes, label: str): Result[bool] =
+    let dg: MsQuicUdpDatagram = MsQuicUdpDatagram(fromAddr: "udp://127.0.0.1:1", data: data)
+    let res: Result[bool] = msquicTransportProcessUdpDatagram(t, dg)
+    if IsErr(res):
+        return Err[bool]("smoke: udp drop error: " + label + ": " + Error(res))
+    if Value(res):
+        return Err[bool]("smoke: udp drop expected false: " + label)
+    return Ok[bool](true)
+
+fn runMsQuicUdpDropSmoke(t: var MsQuicTransport): Result[bool] =
+    let emptyRes: Result[bool] = assertMsQuicUdpDrop(t, emptyBytes(), "empty")
+    if IsErr(emptyRes):
+        return emptyRes
+    var shortOne: Bytes = bytesAlloc(1)
+    bytesSet(shortOne, 0, 0)
+    let shortOneRes: Result[bool] = assertMsQuicUdpDrop(t, shortOne, "short-1")
+    if IsErr(shortOneRes):
+        return shortOneRes
+    var shortNoConn: Bytes = bytesAlloc(2)
+    bytesSet(shortNoConn, 0, quicFixedBit)
+    bytesSet(shortNoConn, 1, 0)
+    let shortNoConnRes: Result[bool] = assertMsQuicUdpDrop(t, shortNoConn, "short-no-conn")
+    if IsErr(shortNoConnRes):
+        return shortNoConnRes
+    var shortBadFixed: Bytes = bytesAlloc(2)
+    bytesSet(shortBadFixed, 0, 0)
+    bytesSet(shortBadFixed, 1, 0)
+    let shortBadFixedRes: Result[bool] = assertMsQuicUdpDrop(t, shortBadFixed, "short-fixed-bit")
+    if IsErr(shortBadFixedRes):
+        return shortBadFixedRes
+    var longShort: Bytes = bytesAlloc(5)
+    bytesSet(longShort, 0, quicLongHeaderFormBit | quicFixedBit)
+    let longShortRes: Result[bool] = assertMsQuicUdpDrop(t, longShort, "long-short")
+    if IsErr(longShortRes):
+        return longShortRes
+    var longBadFixed: Bytes = bytesAlloc(6)
+    bytesSet(longBadFixed, 0, quicLongHeaderFormBit)
+    let longBadFixedRes: Result[bool] = assertMsQuicUdpDrop(t, longBadFixed, "long-fixed-bit")
+    if IsErr(longBadFixedRes):
+        return longBadFixedRes
+    var vnTrunc: Bytes = bytesAlloc(6)
+    bytesSet(vnTrunc, 0, quicLongHeaderFormBit | quicFixedBit)
+    let vnTruncRes: Result[bool] = assertMsQuicUdpDrop(t, vnTrunc, "vn-truncated")
+    if IsErr(vnTruncRes):
+        return vnTruncRes
+    var scidMissing: Bytes = bytesAlloc(6)
+    bytesSet(scidMissing, 0, quicLongHeaderFormBit | quicFixedBit)
+    bytesSet(scidMissing, 1, 0)
+    bytesSet(scidMissing, 2, 0)
+    bytesSet(scidMissing, 3, 0)
+    bytesSet(scidMissing, 4, 1)
+    bytesSet(scidMissing, 5, 0)
+    let scidMissingRes: Result[bool] = assertMsQuicUdpDrop(t, scidMissing, "scid-missing")
+    if IsErr(scidMissingRes):
+        return scidMissingRes
+    var dcidTrunc: Bytes = bytesAlloc(7)
+    bytesSet(dcidTrunc, 0, quicLongHeaderFormBit | quicFixedBit)
+    bytesSet(dcidTrunc, 1, 0)
+    bytesSet(dcidTrunc, 2, 0)
+    bytesSet(dcidTrunc, 3, 0)
+    bytesSet(dcidTrunc, 4, 1)
+    bytesSet(dcidTrunc, 5, 4)
+    let dcidTruncRes: Result[bool] = assertMsQuicUdpDrop(t, dcidTrunc, "dcid-truncated")
+    if IsErr(dcidTruncRes):
+        return dcidTruncRes
+    return Ok[bool](true)
+
+fn runMsQuicTransportSmoke(): Result[bool] =
+    let paramRes: Result[bool] = runTransportParamTest()
+    if IsErr(paramRes):
+        return Err[bool]("smoke: transport params: " + Error(paramRes))
+    exportSinkReset()
+    var t: MsQuicTransport = initMsQuicTransport()
+    let dropRes: Result[bool] = runMsQuicUdpDropSmoke(t)
+    if IsErr(dropRes):
+        return dropRes
+    if msquicApiReady:
+        let perf: QUIC_PERF_COUNTERS = msquicApiGetPerfCounters(msquicApi)
+        if perf.packetsDropped <= 0:
+            return Err[bool]("smoke: msquic drop counters missing")
+    let metricRes: Result[Metric] = metricsGet("msquic.packets_dropped")
+    if IsErr(metricRes):
+        return Err[bool](Error(metricRes))
+    if Value(metricRes).value <= 0:
+        return Err[bool]("smoke: msquic drop metric missing")
+    let dropBytesRes: Result[Metric] = metricsGet("msquic.bytes_dropped")
+    if IsErr(dropBytesRes):
+        return Err[bool](Error(dropBytesRes))
+    if Value(dropBytesRes).value <= 0:
+        return Err[bool]("smoke: msquic drop bytes metric missing")
+    var settings: MsQuicSettings = msquicTransportSettings(t)
+    settings.maxDatagram = 1200
+    settings.maxPending = 8
+    settings.maxBytesPerKey = 6000
+    settings.migrationEnabled = false
+    settings.netStatsEventEnabled = true
+    let setRes: Result[bool] = setMsQuicTransportSettings(t, settings)
+    if IsErr(setRes):
+        return Err[bool](Error(setRes))
+    msquicTransportEnsureApi()
+    var gs: QUIC_GLOBAL_SETTINGS = msquicApiGlobalSettings(msquicApi)
+    gs.loadBalancingMode = int32(QUIC_LOAD_BALANCING_SERVER_ID_FIXED)
+    gs.isSet.loadBalancingMode = true
+    gs.fixedServerId = 0x01020304
+    gs.isSet.fixedServerId = true
+    let gsRes: Result[bool] = msquicApiSetGlobalSettingsStruct(msquicApi, gs)
+    if IsErr(gsRes):
+        return Err[bool](Error(gsRes))
+    let addrRes: Result[MultiAddress] = parseMultiAddress("/ip4/127.0.0.1/udp/0/quic-v1")
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    var addr: MultiAddress = Value(addrRes)
+    let tlsRes: Result[bool] = msquicTestConfigureTransportTls(t)
+    if IsErr(tlsRes):
+        return Err[bool](Error(tlsRes))
+    start(t, addr)
+    if ! t.running:
+        if len(t.lastError) > 0:
+            return Err[bool]("smoke: transport start failed: " + t.lastError)
+        return Err[bool]("smoke: transport start failed")
+    # start() may bind ephemeral ports; use the resolved bound address consistently.
+    addr = t.addr
+    let autoCibirRes: Result[Bytes] = msquicTransportListenerGetParamBytes(t, qUIC_PARAM_LISTENER_CIBIR_ID)
+    if IsErr(autoCibirRes):
+        return Err[bool](Error(autoCibirRes))
+    var expectedCibir: Bytes = bytesAlloc(4)
+    bytesSet(expectedCibir, 0, 0x01)
+    bytesSet(expectedCibir, 1, 0x02)
+    bytesSet(expectedCibir, 2, 0x03)
+    bytesSet(expectedCibir, 3, 0x04)
+    if ! bytesEqual(Value(autoCibirRes), expectedCibir):
+        return Err[bool]("smoke: msquic load balancing cibir mismatch")
+    var resetGs: QUIC_GLOBAL_SETTINGS = initQuicGlobalSettings()
+    let resetGsRes: Result[bool] = msquicApiSetGlobalSettingsStruct(msquicApi, resetGs)
+    if IsErr(resetGsRes):
+        return Err[bool](Error(resetGsRes))
+    let cibir: Bytes = bytesFromString("aa")
+    let cibirRes: Result[bool] = msquicTransportListenerSetParamBytes(t, qUIC_PARAM_LISTENER_CIBIR_ID, cibir)
+    if IsErr(cibirRes):
+        return Err[bool](Error(cibirRes))
+    var cibirDg: Bytes = bytesAlloc(12)
+    bytesSet(cibirDg, 0, quicLongHeaderFormBit | quicFixedBit)
+    bytesSet(cibirDg, 1, 0)
+    bytesSet(cibirDg, 2, 0)
+    bytesSet(cibirDg, 3, 0)
+    bytesSet(cibirDg, 4, 1)
+    bytesSet(cibirDg, 5, 4)
+    bytesSet(cibirDg, 6, int32('b'))
+    bytesSet(cibirDg, 7, int32('b'))
+    bytesSet(cibirDg, 8, int32('b'))
+    bytesSet(cibirDg, 9, int32('b'))
+    bytesSet(cibirDg, 10, 0)
+    bytesSet(cibirDg, 11, 0)
+    let cibirDropRes: Result[bool] = msquicTransportProcessUdpDatagram(
+        t,
+        MsQuicUdpDatagram(fromAddr: "udp://127.0.0.1:1", data: cibirDg)
+    )
+    if IsErr(cibirDropRes):
+        return Err[bool](Error(cibirDropRes))
+    if Value(cibirDropRes):
+        return Err[bool]("smoke: msquic cibir mismatch ! dropped")
+    let dialRes: Result[Connection] = dial(t, addr)
+    if IsErr(dialRes):
+        return Err[bool](Error(dialRes))
+    let outbound: Connection = Value(dialRes)
+    if direction(outbound) != Outbound:
+        return Err[bool]("smoke: msquic outbound direction mismatch")
+    if ! isOpen(outbound):
+        return Err[bool]("smoke: msquic outbound ! open")
+    let acceptRes: Result[Connection] = accept(t)
+    if IsErr(acceptRes):
+        return Err[bool](Error(acceptRes))
+    let inbound: Connection = Value(acceptRes)
+    if direction(inbound) != Inbound:
+        return Err[bool]("smoke: msquic inbound direction mismatch")
+    if ! isOpen(inbound):
+        return Err[bool]("smoke: msquic inbound ! open")
+    let outLocalAddr: MultiAddress = localAddress(outbound)
+    let outRemoteAddr: MultiAddress = remoteAddress(outbound)
+    let localText: str = outLocalAddr.raw
+    let remoteText: str = outRemoteAddr.raw
+    if ! strContains(localText, "/udp/"):
+        return Err[bool]("smoke: msquic outbound local addr missing udp")
+    if ! strContains(remoteText, "/udp/"):
+        return Err[bool]("smoke: msquic outbound remote addr missing udp")
+    if ! strContains(localText, "/quic-v1"):
+        return Err[bool]("smoke: msquic outbound local addr missing quic-v1")
+    if ! strContains(remoteText, "/quic-v1"):
+        return Err[bool]("smoke: msquic outbound remote addr missing quic-v1")
+    let payload: Bytes = bytesFromString("msquic-payload")
+    var outConn: Connection = outbound
+    if ! isOpen(outConn):
+        return Err[bool]("smoke: msquic outConn ! open (copy)")
+    let writeRes: Result[int32] = msquicTransportWrite(t, outConn, payload)
+    if IsErr(writeRes):
+        return Err[bool](Error(writeRes))
+    var inConn: Connection = inbound
+    if ! isOpen(inConn):
+        return Err[bool]("smoke: msquic inConn ! open (copy)")
+    let readRes: Result[Bytes] = msquicTransportRead(t, inConn, 4096)
+    if IsErr(readRes):
+        return Err[bool](Error(readRes))
+    let got: Bytes = Value(readRes)
+    if ! bytesEqual(got, payload):
+        return Err[bool]("smoke: msquic payload mismatch")
+    let streamRes: Result[int64] = msquicTransportOpenStream(t, outConn, true)
+    if IsErr(streamRes):
+        return Err[bool](Error(streamRes))
+    let streamId: int64 = Value(streamRes)
+    let payload2: Bytes = bytesFromString("msquic-stream")
+    let writeRes2: Result[int32] = msquicTransportStreamWrite(t, outConn, streamId, payload2)
+    if IsErr(writeRes2):
+        return Err[bool](Error(writeRes2))
+    let wrote2: int32 = Value(writeRes2)
+    let acceptStreamRes: Result[int64] = msquicTransportAcceptStream(t, inConn)
+    if IsErr(acceptStreamRes):
+        let outIdxDbg: int32 = msquicTransportFindEntry(outConn)
+        let inIdxDbg: int32 = msquicTransportFindEntry(inConn)
+        echo(
+            "debug: accept stream err=" + Error(acceptStreamRes) +
+            " wrote2=" + intToStr(wrote2) +
+            " streamId=" + msquicIntToString(streamId) +
+            " outIdx=" + intToStr(outIdxDbg) +
+            " inIdx=" + intToStr(inIdxDbg)
+        )
+        let nowDbg: int64 = msquicNowMs()
+        let readyText: str = if msquicTimerWheelReady: "1" else: "0"
+        let nextKeyHasText: str = if msquicTimerWheel.nextKey.has: "1" else: "0"
+        let nextKeyValText: str = if msquicTimerWheel.nextKey.has: msquicIntToString(msquicTimerWheel.nextKey.value) else: ""
+        echo(
+            "debug: nowMs=" + msquicIntToString(nowDbg) +
+            " timerReady=" + readyText +
+            " timerCount=" + intToStr(msquicTimerWheel.count) +
+            " nextKeyHas=" + nextKeyHasText +
+            " nextKey=" + nextKeyValText +
+            " nextExpUs=" + msquicIntToString(msquicTimerWheel.nextExpirationUs)
+        )
+        if msquicTimerWheel.count > 0:
+            echo(
+                "debug: timer0 key=" + msquicIntToString(msquicTimerWheel.keys[0]) +
+                " expUs=" + msquicIntToString(msquicTimerWheel.expirationsUs[0])
+            )
+        if outIdxDbg >= 0:
+            let nextOutTimer: int64 = msquicTransportNextTimerMs(msquicConnections.items[outIdxDbg], nowDbg)
+            echo(
+                "debug: out queued=" + intToStr(msquicConnections.items[outIdxDbg].impl.queuedCount) +
+                " lastPacketMs=" + msquicIntToString(msquicConnections.items[outIdxDbg].impl.lastPacketMs) +
+                " pacing=" + (if msquicConnections.items[outIdxDbg].impl.perf.enablePacing: "1" else: "0") +
+                " pacingIntervalMs=" + msquicIntToString(msquicConnections.items[outIdxDbg].impl.perf.pacingIntervalMs) +
+                " nextTimerMs=" + msquicIntToString(nextOutTimer)
+            )
+        if inIdxDbg >= 0:
+            let sidxDbg: int32 = msquicConnEntryFindStream(msquicConnections.items[inIdxDbg], streamId)
+            echo(
+                "debug: in inbound.count=" + intToStr(msquicConnections.items[inIdxDbg].inbound.count) +
+                " streamCount=" + intToStr(msquicConnections.items[inIdxDbg].streamCount) +
+                " rxbuf=" + intToStr(bytesLen(msquicConnections.items[inIdxDbg].rxBuffer.data)) +
+                " hasStream=" + intToStr(sidxDbg)
+            )
+        return Err[bool](Error(acceptStreamRes))
+    let inboundStreamId: int64 = Value(acceptStreamRes)
+    if inboundStreamId != streamId:
+        return Err[bool](
+            "smoke: msquic stream id mismatch (expected=" + msquicIntToString(streamId) +
+            ",got=" + msquicIntToString(inboundStreamId) +
+            ")"
+        )
+    let readRes2: Result[Bytes] = msquicTransportStreamRead(t, inConn, inboundStreamId, 4096)
+    if IsErr(readRes2):
+        return Err[bool](Error(readRes2))
+    let got2: Bytes = Value(readRes2)
+    if ! bytesEqual(got2, payload2):
+        return Err[bool]("smoke: msquic stream payload mismatch")
+    let connMetricRes: Result[Metric] = metricsGet("msquic.connections_opened")
+    if IsErr(connMetricRes):
+        return Err[bool](Error(connMetricRes))
+    if Value(connMetricRes).value <= 0:
+        return Err[bool]("smoke: msquic connection metric missing")
+    let streamMetricRes: Result[Metric] = metricsGet("msquic.streams_opened")
+    if IsErr(streamMetricRes):
+        return Err[bool](Error(streamMetricRes))
+    if Value(streamMetricRes).value <= 0:
+        return Err[bool]("smoke: msquic stream metric missing")
+    let connActiveRes: Result[Metric] = metricsGet("msquic.connections_active")
+    if IsErr(connActiveRes):
+        return Err[bool](Error(connActiveRes))
+    if Value(connActiveRes).value <= 0:
+        return Err[bool]("smoke: msquic connections_active gauge missing")
+    let streamActiveRes: Result[Metric] = metricsGet("msquic.streams_active")
+    if IsErr(streamActiveRes):
+        return Err[bool](Error(streamActiveRes))
+    if Value(streamActiveRes).value <= 0:
+        return Err[bool]("smoke: msquic streams_active gauge missing")
+    let dgramPayload: Bytes = bytesFromString("msquic-datagram")
+    let dgramWriteRes: Result[int32] = msquicTransportDatagramWrite(t, outConn, dgramPayload)
+    if IsErr(dgramWriteRes):
+        return Err[bool](Error(dgramWriteRes))
+    let dgramReadRes: Result[Bytes] = msquicTransportDatagramRead(t, inConn)
+    if IsErr(dgramReadRes):
+        return Err[bool](Error(dgramReadRes))
+    let gotDgram: Bytes = Value(dgramReadRes)
+    if ! bytesEqual(gotDgram, dgramPayload):
+        return Err[bool]("smoke: msquic datagram payload mismatch")
+    let sentPacketsRes: Result[Metric] = metricsGet("msquic.packets_sent")
+    if IsErr(sentPacketsRes):
+        return Err[bool](Error(sentPacketsRes))
+    if Value(sentPacketsRes).value <= 0:
+        return Err[bool]("smoke: msquic packets_sent metric missing")
+    let recvPacketsRes: Result[Metric] = metricsGet("msquic.packets_recv")
+    if IsErr(recvPacketsRes):
+        return Err[bool](Error(recvPacketsRes))
+    if Value(recvPacketsRes).value <= 0:
+        return Err[bool]("smoke: msquic packets_recv metric missing")
+    let bytesSentRes: Result[Metric] = metricsGet("msquic.bytes_sent")
+    if IsErr(bytesSentRes):
+        return Err[bool](Error(bytesSentRes))
+    if Value(bytesSentRes).value <= 0:
+        return Err[bool]("smoke: msquic bytes_sent metric missing")
+    let bytesRecvRes: Result[Metric] = metricsGet("msquic.bytes_recv")
+    if IsErr(bytesRecvRes):
+        return Err[bool](Error(bytesRecvRes))
+    if Value(bytesRecvRes).value <= 0:
+        return Err[bool]("smoke: msquic bytes_recv metric missing")
+    let dgramSentRes: Result[Metric] = metricsGet("msquic.datagrams_sent")
+    if IsErr(dgramSentRes):
+        return Err[bool](Error(dgramSentRes))
+    if Value(dgramSentRes).value <= 0:
+        return Err[bool]("smoke: msquic datagrams_sent metric missing")
+    let dgramRecvRes: Result[Metric] = metricsGet("msquic.datagrams_recv")
+    if IsErr(dgramRecvRes):
+        return Err[bool](Error(dgramRecvRes))
+    if Value(dgramRecvRes).value <= 0:
+        return Err[bool]("smoke: msquic datagrams_recv metric missing")
+    let dgramBytesSentRes: Result[Metric] = metricsGet("msquic.datagram_bytes_sent")
+    if IsErr(dgramBytesSentRes):
+        return Err[bool](Error(dgramBytesSentRes))
+    if Value(dgramBytesSentRes).value <= 0:
+        return Err[bool]("smoke: msquic datagram_bytes_sent metric missing")
+    let dgramBytesRecvRes: Result[Metric] = metricsGet("msquic.datagram_bytes_recv")
+    if IsErr(dgramBytesRecvRes):
+        return Err[bool](Error(dgramBytesRecvRes))
+    if Value(dgramBytesRecvRes).value <= 0:
+        return Err[bool]("smoke: msquic datagram_bytes_recv metric missing")
+    let eventsDroppedRes: Result[Metric] = metricsGet("msquic.events_dropped")
+    if IsErr(eventsDroppedRes):
+        return Err[bool](Error(eventsDroppedRes))
+    let entryIdxMig: int32 = msquicTransportFindEntry(outConn)
+    if entryIdxMig < 0:
+        return Err[bool]("smoke: msquic migration entry lookup failed")
+    let migRes: Result[bool] = msquicTransportStartPathValidation(t, msquicConnections.items[entryIdxMig], "udp://127.0.0.1:4002", false)
+    if IsErr(migRes):
+        return Err[bool](Error(migRes))
+    if Value(migRes):
+        return Err[bool]("smoke: msquic migration should be disabled")
+    let pendingPathAddr: str = msquicConnections.items[entryIdxMig].pendingPathAddr
+    let pendingPathToken: Bytes = msquicConnections.items[entryIdxMig].pendingPathToken
+    if len(pendingPathAddr) > 0 || bytesLen(pendingPathToken) > 0:
+        return Err[bool]("smoke: msquic pending path should be empty when migration disabled")
+    let entryIdxKey: int32 = msquicTransportFindEntry(outConn)
+    if entryIdxKey < 0:
+        return Err[bool]("smoke: msquic key update entry lookup failed")
+    let initialSecret: Bytes = msquicConnections.items[entryIdxKey].keysOneRtt.sendSecret
+    if bytesLen(initialSecret) <= 0:
+        return Err[bool]("smoke: msquic 1-rtt send secret missing")
+    var updatePayload: Bytes = bytesAlloc(900)
+    var j: int32 = 0
+    while j < bytesLen(updatePayload):
+        bytesSet(updatePayload, j, int32('k'))
+        j = j + 1
+    var updated: bool = false
+    var attempts: int32 = 0
+    while attempts < 12 && ! updated:
+        var outConn2: Connection = outConn
+        let sendRes: Result[int32] = msquicTransportDatagramWrite(t, outConn2, updatePayload)
+        if IsErr(sendRes):
+            return Err[bool](Error(sendRes))
+        outConn = outConn2
+        var inConn2: Connection = inbound
+        let recvRes: Result[Bytes] = msquicTransportDatagramRead(t, inConn2)
+        if IsErr(recvRes):
+            return Err[bool](Error(recvRes))
+        inbound = inConn2
+        let currentSecret: Bytes = msquicConnections.items[entryIdxKey].keysOneRtt.sendSecret
+        if bytesLen(currentSecret) > 0 && ! bytesEqual(currentSecret, initialSecret):
+            updated = true
+        attempts = attempts + 1
+    if ! updated:
+        return Err[bool]("smoke: msquic key update ! triggered")
+    let vnDcid: Bytes = bytesFromString("vn-dcid")
+    let vnScid: Bytes = bytesFromString("vn-scid")
+    let vnPayload: Bytes = msquicTransportEncodeVersionNegotiation(vnDcid, vnScid)
+    let vnRes: Result[MsQuicVersionNegotiation] = msquicTransportDecodeVersionNegotiation(vnPayload)
+    if IsErr(vnRes):
+        return Err[bool](Error(vnRes))
+    let vn: MsQuicVersionNegotiation = Value(vnRes)
+    if ! vn.hasV1:
+        return Err[bool]("smoke: msquic version negotiation missing v1")
+    if ! bytesEqual(vn.dcid, vnDcid) || ! bytesEqual(vn.scid, vnScid):
+        return Err[bool]("smoke: msquic version negotiation cid mismatch")
+    let retryOdcid: Bytes = bytesFromString("retry-odcid")
+    let retryDcid: Bytes = bytesFromString("retry-dcid")
+    let retryScid: Bytes = bytesFromString("retry-scid")
+    let retryToken: Bytes = bytesFromString("retry-token")
+    let retryEncRes: Result[Bytes] = msquicTransportEncodeRetryPacket(retryOdcid, retryDcid, retryScid, retryToken)
+    if IsErr(retryEncRes):
+        return Err[bool](Error(retryEncRes))
+    let retryWire: Bytes = Value(retryEncRes)
+    let retryDecRes: Result[MsQuicRetryPacket] = msquicTransportDecodeRetryPacket(retryWire)
+    if IsErr(retryDecRes):
+        return Err[bool](Error(retryDecRes))
+    let retryPkt: MsQuicRetryPacket = Value(retryDecRes)
+    if ! bytesEqual(retryPkt.dcid, retryDcid) || ! bytesEqual(retryPkt.scid, retryScid):
+        return Err[bool]("smoke: msquic retry cid mismatch")
+    if ! bytesEqual(retryPkt.token, retryToken):
+        return Err[bool]("smoke: msquic retry token mismatch")
+    let retryNoTag: Bytes = bytesSlice(retryWire, 0, bytesLen(retryWire) - msQuicTlsTagLen)
+    let tagRes: Result[Bytes] = msquicTransportRetryIntegrityTag(retryOdcid, retryNoTag)
+    if IsErr(tagRes):
+        return Err[bool](Error(tagRes))
+    if ! bytesEqual(Value(tagRes), retryPkt.tag):
+        return Err[bool]("smoke: msquic retry integrity tag mismatch")
+    var tracker: AckTrackerModel = ackTrackerInit()
+    var seq: int64[msQuicAckSeqLen]
+    seq[0] = 1
+    seq[1] = 3
+    seq[2] = 2
+    seq[3] = 7
+    seq[4] = 6
+    seq[5] = 5
+    seq[6] = 4
+    seq[7] = 10
+    seq[8] = 8
+    seq[9] = 9
+    var baseUs: int64 = msquicNowMs() * 1000
+    var i: int32 = 0
+    while i < msQuicAckSeqLen:
+        ackTrackerMarkForAck(tracker, seq[i], baseUs + int64(i) * 1000, ackTypeAckEliciting, 25)
+        i = i + 1
+    if tracker.ackCount != 1:
+        return Err[bool]("smoke: msquic ack range count mismatch")
+    if tracker.packetNumbersToAckFirst[0] != 1 || tracker.packetNumbersToAckLast[0] != 10:
+        return Err[bool]("smoke: msquic ack range mismatch")
+    let entryIdx: int32 = msquicTransportFindEntry(outConn)
+    if entryIdx < 0:
+        return Err[bool]("smoke: msquic entry lookup failed")
+    var ackState: MsQuicAckState = msquicConnections.items[entryIdx].ackOneRtt
+    ackState.tracker = tracker
+    msquicConnections.items[entryIdx].ackOneRtt = ackState
+    let encoded: Bytes = msquicTransportEncodeAckRanges(ackState)
+    var decoded: MsQuicAckRangeList = MsQuicAckRangeList(count: 0)
+    let decodedRes: Result[bool] = msquicTransportDecodeAckRanges(encoded, decoded)
+    if IsErr(decodedRes):
+        return Err[bool](Error(decodedRes))
+    if decoded.count != 1 || decoded.firsts[0] != 1 || decoded.lasts[0] != 10:
+        let b0: int32 = if bytesLen(encoded) > 0: bytesGet(encoded, 0) else: -1
+        let b1: int32 = if bytesLen(encoded) > 1: bytesGet(encoded, 1) else: -1
+        let b2: int32 = if bytesLen(encoded) > 2: bytesGet(encoded, 2) else: -1
+        return Err[bool](
+            "smoke: msquic ack range encode/decode mismatch" +
+            " count=" + intToStr(decoded.count) +
+            " first=" + msquicIntToString(decoded.firsts[0]) +
+            " last=" + msquicIntToString(decoded.lasts[0]) +
+            " encoded_len=" + intToStr(bytesLen(encoded)) +
+            " bytes=" + intToStr(b0) + "," + intToStr(b1) + "," + intToStr(b2)
+        )
+    let ackFrame: MsQuicFrame = msquicTransportBuildAckFrame(msquicConnections.items[entryIdx], ackState, msquicNowMs())
+    if ackFrame.value != 10:
+        return Err[bool]("smoke: msquic ack frame largest mismatch")
+    if msquicApiReady:
+        let evRes: Result[bool] = msquicApiRecordEvent(msquicApi, initMsQuicEvent(MsQuicEventInfo, "qlog-check", 1, -1))
+        if IsErr(evRes):
+            return Err[bool](Error(evRes))
+        let escapeMsg: str = "qlog-escape:\"\\\\\n"
+        let escapeRes: Result[bool] = msquicApiRecordEvent(msquicApi, initMsQuicEvent(MsQuicEventInfo, escapeMsg, 1, -1))
+        if IsErr(escapeRes):
+            return Err[bool](Error(escapeRes))
+        msquicApiConnClosedWithInfo(msquicApi, 1, "qlog-close", quicErrorProtocolViolation, quicFrameTypeImmediateAck, false)
+        var hasNetStats: bool = false
+        var evIdx: int32 = 0
+        while evIdx < msquicApi.events.count:
+            let ev: MsQuicEvent* = msquicApi.events.items[evIdx]
+            if ev != nil && ev.kind == MsQuicEventNetStats:
+                hasNetStats = true
+                break
+            evIdx = evIdx + 1
+        if ! hasNetStats:
+            return Err[bool]("smoke: msquic netStatsEvent missing")
+        var netEv: MsQuicEvent = initMsQuicEvent(MsQuicEventNetStats, "netstats-test", 1, -1)
+        netEv.bandwidthOut = 1200
+        netEv.bandwidthIn = 800
+        netEv.deliveryRateOut = 700
+        netEv.deliveryRateIn = 600
+        let netEvRes: Result[bool] = msquicApiRecordEvent(msquicApi, netEv)
+        if IsErr(netEvRes):
+            return Err[bool](Error(netEvRes))
+        let qlogText: str = msquicTransportEventLogToQlog()
+        if len(qlogText) <= 0 || ! strContains(qlogText, "\"qlog_version\""):
+            return Err[bool]("smoke: msquic qlog output missing header")
+        if ! strContains(qlogText, "\"metrics_updated\""):
+            return Err[bool]("smoke: msquic qlog metrics_updated missing")
+        if ! strContains(qlogText, "\"bandwidth_out\"") || ! strContains(qlogText, "\"delivery_rate_out\"") || ! strContains(qlogText, "\"bandwidth_in\"") || ! strContains(qlogText, "\"delivery_rate_in\""):
+            return Err[bool]("smoke: msquic qlog netstats bandwidth/delivery missing")
+        if ! strContains(qlogText, "qlog-escape:"):
+            return Err[bool]("smoke: msquic qlog escape message missing")
+        if ! strContains(qlogText, "\\\"") || ! strContains(qlogText, "\\n"):
+            return Err[bool]("smoke: msquic qlog escape missing")
+        if ! strContains(qlogText, "\"error_code\"") || ! strContains(qlogText, "\"error_space\""):
+            return Err[bool]("smoke: msquic qlog error fields missing")
+        msquicTransportRunTracePipeline()
+        msquicTransportRunPerfPipeline(msquicNowMs())
+        let sinkQlog: str = exportSinkGet("qlog")
+        if len(sinkQlog) <= 0 || ! strContains(sinkQlog, "\"error_code\"") || ! strContains(sinkQlog, "\"error_space\""):
+            return Err[bool]("smoke: msquic export qlog missing error fields")
+        if ! strContains(sinkQlog, "\"bandwidth_out\"") || ! strContains(sinkQlog, "\"delivery_rate_out\"") || ! strContains(sinkQlog, "\"bandwidth_in\"") || ! strContains(sinkQlog, "\"delivery_rate_in\""):
+            return Err[bool]("smoke: msquic export qlog missing netstats bandwidth/delivery")
+        if ! strContains(sinkQlog, "\"frame_type\""):
+            return Err[bool]("smoke: msquic export qlog missing frame_type")
+        let sinkPerf: str = exportSinkGet("perf")
+        if len(sinkPerf) <= 0:
+            return Err[bool]("smoke: msquic export perf missing")
+        let sinkMetrics: str = exportSinkGet("metrics")
+        if len(sinkMetrics) <= 0:
+            return Err[bool]("smoke: msquic export metrics missing")
+        let fileRes: Result[bool] = assertMsQuicExportFile()
+        if IsErr(fileRes):
+            return fileRes
+    stop(t)
+    let connActiveAfterRes: Result[Metric] = metricsGet("msquic.connections_active")
+    if IsErr(connActiveAfterRes):
+        return Err[bool](Error(connActiveAfterRes))
+    if Value(connActiveAfterRes).value != 0:
+        return Err[bool]("smoke: msquic connections_active ! zero after stop")
+    let streamActiveAfterRes: Result[Metric] = metricsGet("msquic.streams_active")
+    if IsErr(streamActiveAfterRes):
+        return Err[bool](Error(streamActiveAfterRes))
+    if Value(streamActiveAfterRes).value != 0:
+        return Err[bool]("smoke: msquic streams_active ! zero after stop")
+    if msquicApiReady && msquicApi.events.count != 0:
+        return Err[bool]("smoke: msquic event log ! drained")
+    return Ok[bool](true)

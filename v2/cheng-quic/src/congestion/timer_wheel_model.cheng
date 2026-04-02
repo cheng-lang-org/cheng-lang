@@ -1,0 +1,131 @@
+# Timer wheel model(fixed array version).
+
+import cheng/quic/congestion/common
+import std/option
+const
+    defaultSlotCount = 32
+    defaultLoadFactor = 32
+    maxTimerEntries = 256
+
+type
+    TimerKey = int64
+
+    TimerEntry =
+        key: TimerKey
+        expirationUs: int64
+
+    TimerEntryList =
+        count: int32
+        # NOTE: Stage1 has known issues lowering `T[N]` when `T` is a composite type.
+        # Store primitives in parallel arrays to avoid corrupted timer wheel state.
+        keys: TimerKey[maxTimerEntries]
+        expirationsUs: int64[maxTimerEntries]
+
+    TimerWheel =
+        slotCount: int32
+        maxLoadFactor: int32
+        count: int32
+        # NOTE: Stage1 has known issues lowering `T[N]` when `T` is a composite type.
+        # Store primitives in parallel arrays to avoid corrupted timer wheel state.
+        keys: TimerKey[maxTimerEntries]
+        expirationsUs: int64[maxTimerEntries]
+        nextExpirationUs: int64
+        nextKey: Option[TimerKey]
+
+fn initTimerEntryList(): TimerEntryList =
+    TimerEntryList(count: 0)
+
+fn timerEntryListAdd(list: var TimerEntryList, entry: TimerEntry) =
+    if list.count >= maxTimerEntries:
+        return
+    list.keys[list.count] = entry.key
+    list.expirationsUs[list.count] = entry.expirationUs
+    list.count = list.count + 1
+
+fn initTimerWheel(slotCount: int32, maxLoadFactor: int32): TimerWheel =
+    var slots: int32 = slotCount
+    var load: int32 = maxLoadFactor
+    if slots <= 0:
+        slots = defaultSlotCount
+    if load <= 0:
+        load = defaultLoadFactor
+    TimerWheel(
+        slotCount: slots,
+        maxLoadFactor: load,
+        count: 0,
+        nextExpirationUs: maxInt64Value,
+        nextKey: None[TimerKey]()
+    )
+
+fn timerWheelRecalcNext(wheel: var TimerWheel) =
+    wheel.nextExpirationUs = maxInt64Value
+    wheel.nextKey = None[TimerKey]()
+    for i in 0..<wheel.count:
+        let expUs: int64 = wheel.expirationsUs[i]
+        if expUs < wheel.nextExpirationUs:
+            wheel.nextExpirationUs = expUs
+            wheel.nextKey = Some[TimerKey](wheel.keys[i])
+
+fn timerWheelInsert(wheel: var TimerWheel, entry: TimerEntry): bool =
+    if wheel.count >= maxTimerEntries:
+        return false
+    var pos: int32 = wheel.count
+    while pos > 0 && wheel.expirationsUs[pos - 1] > entry.expirationUs:
+        wheel.keys[pos] = wheel.keys[pos - 1]
+        wheel.expirationsUs[pos] = wheel.expirationsUs[pos - 1]
+        pos = pos - 1
+    wheel.keys[pos] = entry.key
+    wheel.expirationsUs[pos] = entry.expirationUs
+    wheel.count = wheel.count + 1
+    if entry.expirationUs < wheel.nextExpirationUs:
+        wheel.nextExpirationUs = entry.expirationUs
+        wheel.nextKey = Some[TimerKey](entry.key)
+    return true
+
+fn timerWheelRemoveConnection(wheel: var TimerWheel, key: TimerKey) =
+    for i in 0..<wheel.count:
+        if wheel.keys[i] == key:
+            for j in i + 1..<wheel.count:
+                wheel.keys[j - 1] = wheel.keys[j]
+                wheel.expirationsUs[j - 1] = wheel.expirationsUs[j]
+            wheel.count = wheel.count - 1
+            timerWheelRecalcNext(wheel)
+            return
+
+fn timerWheelUpdateConnection(
+    wheel: var TimerWheel,
+    key: TimerKey,
+    expirationUs: int64
+) =
+    if expirationUs == 0:
+        timerWheelRemoveConnection(wheel, key)
+        return
+    timerWheelRemoveConnection(wheel, key)
+    timerWheelInsert(wheel, TimerEntry(key: key, expirationUs: expirationUs))
+
+fn timerWheelPopExpired(wheel: var TimerWheel, nowUs: int64): TimerEntryList =
+    var out: TimerEntryList = initTimerEntryList()
+    if wheel.count == 0:
+        return out
+    var i: int32 = 0
+    while i < wheel.count:
+        if wheel.expirationsUs[i] <= nowUs:
+            timerEntryListAdd(out, TimerEntry(key: wheel.keys[i], expirationUs: wheel.expirationsUs[i]))
+            i = i + 1
+        else:
+            break
+    if out.count <= 0:
+        return out
+    var j: int32 = 0
+    for pos in i..<wheel.count:
+        wheel.keys[j] = wheel.keys[pos]
+        wheel.expirationsUs[j] = wheel.expirationsUs[pos]
+        j = j + 1
+    wheel.count = j
+    timerWheelRecalcNext(wheel)
+    return out
+
+fn timerWheelPeekNext(wheel: TimerWheel): Option[TimerEntry] =
+    if ! wheel.nextKey.has:
+        return None[TimerEntry]()
+    return Some[TimerEntry](TimerEntry(key: wheel.nextKey.value, expirationUs: wheel.nextExpirationUs))

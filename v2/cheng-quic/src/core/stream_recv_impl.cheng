@@ -1,0 +1,85 @@
+# MsQuic core stream receive implementation(pure Cheng, in-process).
+
+import std/result
+import std/rawbytes
+import std/net/stream/bufferstream
+import cheng/quic/core/frame_model
+type
+    MsQuicStreamReceiver =
+        streamId: int64
+        open: bool
+        nextOffset: int64
+        maxOffset: int64
+        maxData: int64
+        finReceived: bool
+        finOffset: int64
+        receivedBytes: int64
+        deliveredBytes: int64
+        buffer: BufferStream
+
+fn initMsQuicStreamReceiver(streamId: int64): MsQuicStreamReceiver =
+    MsQuicStreamReceiver(
+        streamId: streamId,
+        open: true,
+        nextOffset: 0,
+        maxOffset: 0,
+        maxData: -1,
+        finReceived: false,
+        finOffset: -1,
+        receivedBytes: 0,
+        deliveredBytes: 0,
+        buffer: newBufferStream()
+    )
+
+fn msquicStreamReceiverIsOpen(r: MsQuicStreamReceiver): bool =
+    return r.open && ! isClosed(r.buffer)
+
+fn msquicStreamReceiverAvailable(r: MsQuicStreamReceiver): int32 =
+    return available(r.buffer)
+
+fn msquicStreamReceiverAppend(r: var MsQuicStreamReceiver, frame: MsQuicFrame): Result[int32] =
+    if ! msquicStreamReceiverIsOpen(r):
+        return Err[int32]("msquic stream: receiver closed")
+    if frame.kind != FrameData:
+        return Err[int32]("msquic stream: non-data frame")
+    if frame.streamId != r.streamId:
+        return Err[int32]("msquic stream: stream id mismatch")
+    if frame.offset != r.nextOffset:
+        return Err[int32]("msquic stream: out-of-order data")
+    let count: int32 = bytesLen(frame.data)
+    let endOffset: int64 = frame.offset + int64(count)
+    if r.finReceived:
+        if r.finOffset >= 0 && endOffset > r.finOffset:
+            return Err[int32]("msquic stream: final size exceeded")
+        if frame.value != 0 && r.finOffset >= 0 && endOffset != r.finOffset:
+            return Err[int32]("msquic stream: final size mismatch")
+    if r.maxData >= 0 && endOffset > r.maxData:
+        return Err[int32]("msquic stream: receive window exceeded")
+    if frame.value != 0 && ! r.finReceived:
+        r.finReceived = true
+        r.finOffset = endOffset
+    if endOffset > r.maxOffset:
+        r.maxOffset = endOffset
+    if count <= 0:
+        return Ok[int32](0)
+    let writeRes: Result[int32] = write(r.buffer, frame.data)
+    if IsErr(writeRes):
+        return Err[int32](Error(writeRes))
+    r.nextOffset = r.nextOffset + int64(count)
+    r.receivedBytes = r.receivedBytes + int64(count)
+    return Ok[int32](count)
+
+fn msquicStreamReceiverRead(r: var MsQuicStreamReceiver, count: int32): Result[Bytes] =
+    if ! msquicStreamReceiverIsOpen(r):
+        return Err[Bytes]("msquic stream: receiver closed")
+    let readRes: Result[Bytes] = read(r.buffer, count)
+    if IsErr(readRes):
+        return Err[Bytes](Error(readRes))
+    let got: int32 = bytesLen(Value(readRes))
+    if got > 0:
+        r.deliveredBytes = r.deliveredBytes + int64(got)
+    return readRes
+
+fn msquicStreamReceiverClose(r: var MsQuicStreamReceiver) =
+    r.open = false
+    closeBufferStream(r.buffer)

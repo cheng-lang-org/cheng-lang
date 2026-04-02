@@ -1,0 +1,29 @@
+# MsQuic congestion pacing test(manual).
+
+import std/result
+import cheng/quic/congestion/common
+import cheng/quic/congestion/bbr_model
+import cheng/quic/congestion/pacing_scheduler
+import cheng/quic/congestion/validation_suite
+fn runCongestionPacingTest(): Result[bool] =
+    var model: BbrModel = bbrInit(quicInitialWindowPackets, 1200)
+    var pacing: PacingState = pacingInit(true)
+    bbrOnPacketSent(model, 1200, false)
+    let ack: AckEventSnapshot = initAckSnapshot(1000000, 1, 1, 1200)
+    bbrOnDataAcked(model, ack)
+    if model.pacingRateBps <= 0:
+        return Err[bool]("pacing: rate ! set")
+    let allowance: int64 = pacingAllowance(pacing, model, 1000000)
+    if allowance <= 0:
+        return Err[bool]("pacing: allowance ! positive")
+    var noPacing: PacingState = pacingInit(false)
+    let cwndAllowance: int64 = bbrSendAllowance(model)
+    let disabledAllowance: int64 = pacingAllowance(noPacing, model, 1000000)
+    if disabledAllowance != cwndAllowance:
+        return Err[bool]("pacing: disabled allowance mismatch")
+    pacingCommitSend(pacing, 1000000, 600)
+    pacingRecordAckHeight(pacing, 1200)
+    let nextSend = pacingNextSendTime(pacing, model, 1000500)
+    if ! nextSend.has:
+        return Err[bool]("pacing: next send time missing")
+    return Ok[bool](true)

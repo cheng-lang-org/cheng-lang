@@ -1,0 +1,143 @@
+import runtime/strings_v2 as srun
+import compiler/bagua/bagua_core_v2 as bcore
+
+fn opHasAny(opName: str, a: str, b: str, c: str, d: str): bool =
+    return srun.contains(opName, a) ||
+           srun.contains(opName, b) ||
+           srun.contains(opName, c) ||
+           srun.contains(opName, d)
+
+fn opHasAny(opName: str, a: str, b: str, c: str, d: str, e: str): bool =
+    return srun.contains(opName, a) ||
+           srun.contains(opName, b) ||
+           srun.contains(opName, c) ||
+           srun.contains(opName, d) ||
+           srun.contains(opName, e)
+
+fn lowUirUpperGua(sourceKind: str,
+                  opName: str,
+                  effectClass: str,
+                  proofDomain: str,
+                  bindingScope: str,
+                  runtimeTarget: str): str =
+    if opHasAny(opName, "layout", "symbol", "module", "type", "metadata") ||
+       srun.contains(bindingScope, "outline"):
+        return "乾"
+    if opHasAny(opName, "const", "slot", "aggregate", "builder_init") ||
+       srun.contains(proofDomain, "builder_state"):
+        return "坤"
+    if opHasAny(opName, "branch", "guard", "bounds", "deopt") ||
+       srun.contains(proofDomain, "bounds") ||
+       srun.contains(proofDomain, "layout"):
+        return "坎"
+    if opHasAny(opName, "call", "load", "project", "index") ||
+       srun.contains(effectClass, "read"):
+        return "离"
+    if opHasAny(opName, "drop", "commit", "fence", "repair") ||
+       srun.contains(runtimeTarget, "finalize"):
+        return "艮"
+    if opHasAny(opName, "pack", "unpack", "frame", "message") ||
+       srun.contains(bindingScope, "abi") ||
+       srun.contains(bindingScope, "boundary"):
+        return "兑"
+    if opHasAny(opName, "store", "atomic", "spawn", "emit") ||
+       srun.contains(effectClass, "write") ||
+       srun.contains(effectClass, "publish"):
+        return "震"
+    if opHasAny(opName, "phi", "loop", "worklist", "vector") ||
+       srun.contains(effectClass, "merge") ||
+       srun.contains(effectClass, "route"):
+        return "巽"
+    if sourceKind == "string":
+        if opName == "str_builder_init":
+            return "坤"
+        if opName == "str_len" || opName == "str_index" || opName == "str_slice_view":
+            return "坎"
+        if opName == "str_builder_append" || opName == "str_builder_append_byte" ||
+           opName == "str_builder_finish" || opName == "str_concat" || opName == "str_to_owned":
+            return "震"
+    if sourceKind == "unimaker":
+        if opName == "hardware_callback_def":
+            return "兑"
+        if opName == "evolve_site_def":
+            return "震"
+        if opName == "asset_contract_def" || opName == "actor_def" || opName == "ganzhi_state_def":
+            return "坤"
+    if sourceKind == "network_distribution":
+        if opName == "route_lsmr_tree":
+            return "坎"
+        if opName == "exchange_anti_entropy_signature":
+            return "兑"
+        if opName == "repair_from_signature_gap":
+            return "艮"
+        return "震"
+    return "乾"
+
+fn lowUirLowerGua(sourceKind: str,
+                  opName: str,
+                  effectClass: str,
+                  proofDomain: str,
+                  bindingScope: str,
+                  runtimeTarget: str): str =
+    if srun.contains(bindingScope, "abi") ||
+       srun.contains(bindingScope, "message") ||
+       srun.contains(runtimeTarget, "runtime/lsmr") ||
+       srun.contains(runtimeTarget, "runtime/network"):
+        return "兑"
+    if srun.contains(proofDomain, "bounds") ||
+       srun.contains(effectClass, "guard") ||
+       opHasAny(opName, "branch", "guard", "bounds", "route"):
+        return "坎"
+    if srun.contains(effectClass, "read") ||
+       opHasAny(opName, "load", "project", "index", "view"):
+        return "离"
+    if srun.contains(effectClass, "write") ||
+       srun.contains(effectClass, "publish") ||
+       opHasAny(opName, "store", "append", "emit", "disperse"):
+        return "震"
+    if srun.contains(effectClass, "merge") ||
+       opHasAny(opName, "phi", "loop", "worklist", "vector"):
+        return "巽"
+    if opHasAny(opName, "drop", "ret", "commit", "repair") ||
+       srun.contains(proofDomain, "ownership"):
+        return "艮"
+    if opHasAny(opName, "const", "slot", "aggregate", "builder_init"):
+        return "坤"
+    if sourceKind == "string" &&
+       (opName == "str_eq" || opName == "str_ne" || opName == "str_contains" ||
+        opName == "str_starts_with" || opName == "str_ends_with"):
+        return "乾"
+    return "乾"
+
+fn annotateLowUirNode(sourceKind: str,
+                      nodeId: int32,
+                      opName: str,
+                      effectClass: str,
+                      proofDomain: str,
+                      bindingScope: str,
+                      runtimeTarget: str): bcore.BaguaAnnotation =
+    let upper = lowUirUpperGua(sourceKind, opName, effectClass, proofDomain, bindingScope, runtimeTarget)
+    let lower = lowUirLowerGua(sourceKind, opName, effectClass, proofDomain, bindingScope, runtimeTarget)
+    let signature = sourceKind + "|" + intToStr(nodeId) + "|" + opName + "|" +
+                    effectClass + "|" + proofDomain + "|" + bindingScope + "|" + runtimeTarget
+    return bcore.baguaAnnotation(upper, lower, signature)
+
+fn annotateLowUirNodes(sourceKind: str,
+                       nodeIds: int32[],
+                       opNames: str[],
+                       effectClasses: str[],
+                       proofDomains: str[],
+                       bindingScopes: str[],
+                       runtimeTargets: str[]): bcore.BaguaAnnotation[] =
+    var out: bcore.BaguaAnnotation[]
+    out = []
+    for i in 0..<nodeIds.len:
+        add(out,
+            annotateLowUirNode(sourceKind,
+                               nodeIds[i],
+                               opNames[i],
+                               effectClasses[i],
+                               proofDomains[i],
+                               bindingScopes[i],
+                               runtimeTargets[i]))
+    return out

@@ -119,6 +119,23 @@ static char *driver_c_dup_range(const char *start, const char *stop) {
   return out;
 }
 
+static const char *driver_c_bridge_target_text(ChengStrBridge target) {
+  return target.ptr != NULL ? target.ptr : "";
+}
+
+static void driver_c_require_machine_target_bridge(ChengStrBridge target) {
+  const char *raw = driver_c_bridge_target_text(target);
+  if (driver_c_str_eq_raw_bridge(target, "arm64-apple-darwin", 19)) {
+    return;
+  }
+  fprintf(stderr, "v2 machine target: unsupported target %s\n", raw);
+  abort();
+}
+
+static ChengStrBridge driver_c_machine_target_text_bridge(const char *text) {
+  return driver_c_owned_bridge_from_cstring(driver_c_dup_cstring(text));
+}
+
 static char *driver_c_find_line_value_dup(const char *text, const char *key) {
   const char *cursor = NULL;
   size_t key_len = 0;
@@ -224,6 +241,111 @@ static char *driver_c_absolute_path_dup(const char *path) {
   return out;
 }
 
+ChengStrBridge driver_c_machine_target_architecture_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("aarch64");
+}
+
+ChengStrBridge driver_c_machine_target_obj_format_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("macho");
+}
+
+ChengStrBridge driver_c_machine_target_symbol_prefix_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("_");
+}
+
+ChengStrBridge driver_c_machine_target_text_section_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("__TEXT,__text");
+}
+
+ChengStrBridge driver_c_machine_target_cstring_section_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("__TEXT,__cstring");
+}
+
+ChengStrBridge driver_c_machine_target_symtab_section_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("__LINKEDIT,symtab");
+}
+
+ChengStrBridge driver_c_machine_target_strtab_section_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("__LINKEDIT,strtab");
+}
+
+ChengStrBridge driver_c_machine_target_reloc_section_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("__LINKEDIT,reloc");
+}
+
+ChengStrBridge driver_c_machine_target_call_relocation_kind_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("ARM64_RELOC_BRANCH26");
+}
+
+ChengStrBridge driver_c_machine_target_metadata_page_relocation_kind_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("ARM64_RELOC_PAGE21");
+}
+
+ChengStrBridge driver_c_machine_target_metadata_pageoff_relocation_kind_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("ARM64_RELOC_PAGEOFF12");
+}
+
+int32_t driver_c_machine_target_pointer_width_bits_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return 64;
+}
+
+int32_t driver_c_machine_target_stack_align_bytes_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return 16;
+}
+
+int32_t driver_c_machine_target_text_align_pow2_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return 2;
+}
+
+int32_t driver_c_machine_target_cstring_align_pow2_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return 0;
+}
+
+int32_t driver_c_machine_target_darwin_platform_id_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return 1;
+}
+
+ChengStrBridge driver_c_machine_target_darwin_platform_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("macos");
+}
+
+int32_t driver_c_machine_target_darwin_minos_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return 0x000d0000;
+}
+
+ChengStrBridge driver_c_machine_target_darwin_minos_text_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("13.0");
+}
+
+ChengStrBridge driver_c_machine_target_darwin_arch_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("arm64");
+}
+
+ChengStrBridge driver_c_machine_target_darwin_sdk_name_bridge(ChengStrBridge target) {
+  driver_c_require_machine_target_bridge(target);
+  return driver_c_machine_target_text_bridge("macosx");
+}
+
 static char *driver_c_join_path2_dup(const char *left, const char *right) {
   size_t left_len = 0;
   size_t right_len = 0;
@@ -321,6 +443,24 @@ __attribute__((weak)) int32_t driver_c_compiler_core_print_status_bridge(void) {
   fputs("soa_index_only=1\n", stdout);
   fputs("infra_surface=1\n", stdout);
   return 0;
+}
+
+static int driver_c_bridge_text_eq_raw(ChengStrBridge text, const char *raw) {
+  size_t raw_len = 0;
+  if (raw == NULL) {
+    raw = "";
+  }
+  if (text.ptr == NULL || text.len < 0) {
+    return 0;
+  }
+  raw_len = strlen(raw);
+  if ((size_t)text.len != raw_len) {
+    return 0;
+  }
+  if (raw_len == 0) {
+    return 1;
+  }
+  return memcmp(text.ptr, raw, raw_len) == 0 ? 1 : 0;
 }
 
 static int driver_c_starts_with(const char *text, const char *prefix) {

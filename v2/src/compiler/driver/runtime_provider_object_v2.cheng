@@ -181,8 +181,13 @@ fn runtimeProviderExternalCcCompileInputs(modulePath: str): str[] =
         add(out, "v2/src/runtime/compiler_core_native_dispatch.h")
         add(out, "v2/bootstrap/cheng_v2c_tooling.c")
         add(out, "v2/bootstrap/cheng_v2c_tooling.h")
+        add(out, "src/runtime/native/system_helpers_char_seq_compat_bridge.c")
+        add(out, "src/runtime/native/system_helpers_rawmem_as_void_bridge.c")
+        add(out, "src/runtime/native/system_helpers_seq_free_bridge.c")
+        add(out, "src/runtime/native/system_helpers_str_repr_bridge.c")
         add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
         add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
+        add(out, "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c")
         add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
         add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
         return out
@@ -190,13 +195,18 @@ fn runtimeProviderExternalCcCompileInputs(modulePath: str): str[] =
 
 fn runtimeProviderExternalCcSourceFiles(modulePath: str): str[] =
     var out: str[]
-    out = []
+        out = []
     if modulePath == "runtime/compiler_core_runtime_v2":
         add(out, "v2/src/runtime/compiler_core_native_provider.c")
         add(out, "v2/src/runtime/compiler_core_native_dispatch.c")
         add(out, "v2/bootstrap/cheng_v2c_tooling.c")
+        add(out, "src/runtime/native/system_helpers_char_seq_compat_bridge.c")
+        add(out, "src/runtime/native/system_helpers_rawmem_as_void_bridge.c")
+        add(out, "src/runtime/native/system_helpers_seq_free_bridge.c")
+        add(out, "src/runtime/native/system_helpers_str_repr_bridge.c")
         add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
         add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
+        add(out, "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c")
         add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
         add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
         return out
@@ -400,4 +410,103 @@ fn materializeRuntimeProviderObjects(modulePaths: str[],
     out = []
     for i in 0..<modulePaths.len:
         add(out, materializeRuntimeProviderObject(modulePaths[i], targetTriple))
+    return out
+
+fn materializeRuntimeProviderObjectForProgram(modulePath: str,
+                                              targetTriple: str,
+                                              programSourcePath: str,
+                                              programMachine: mpipeline.MachineModuleBundle): RuntimeProviderObjectBundle =
+    let sourcePath = runtimeProviderSourcePath(modulePath)
+    let compileInputs = runtimeProviderIsExternalCc(modulePath) ?
+        runtimeProviderExternalCcCompileInputs(modulePath) :
+        [sourcePath]
+    let sourceManifest = runtimeProviderIsExternalCc(modulePath) ?
+        buildExplicitManifest(sourcePath, compileInputs) :
+        manifest.resolveCompilerCoreSourceManifest(sourcePath)
+    let runtimeTargets = runtimeProviderTargets(modulePath)
+    var out: RuntimeProviderObjectBundle
+    out.version = runtimeProviderObjectVersion()
+    out.modulePath = modulePath
+    out.sourcePath = sourcePath
+    out.sourceManifestCid = sourceManifest.manifestCid
+    out.targetTriple = targetTriple
+    out.sourceKind = runtimeProviderSourceKind(modulePath)
+    out.compileMode = runtimeProviderCompileMode(modulePath)
+    out.executionModel = runtimeProviderExecutionModel(modulePath)
+    out.traceSymbol = runtimeProviderTraceSymbol(modulePath)
+    out.runtimeTargets = []
+    out.runtimeSymbols = []
+    for i in 0..<runtimeTargets.len:
+        add(out.runtimeTargets, runtimeTargets[i])
+        add(out.runtimeSymbols, mpipeline.machineCallSymbolName(targetTriple, runtimeTargets[i]))
+    if runtimeProviderIsExternalCc(modulePath):
+        out.objFileBytes = compileExternalRuntimeProviderObject(runtimeProviderExternalCcSourceFiles(modulePath),
+                                                                modulePath,
+                                                                targetTriple)
+        let objBytes = rawbytes.Bytes(data: out.objFileBytes.buffer, len: out.objFileBytes.len)
+        let objCid = rawbytes.bytesToHex(sha256.sha256Digest(objBytes))
+        out.objImageVersion = "v2.obj_image.external_cc.v1"
+        out.objImageCid = objCid
+        out.objFileVersion = "v2.obj_file.external_cc.v1"
+        out.objFileCid = objCid
+        out.objFileByteCount = out.objFileBytes.len
+    else:
+        let machine = modulePath == "runtime/compiler_core_runtime_v2" ?
+            mpipeline.buildCompilerCoreArgvEntryProviderMachineModuleForProgram(programMachine,
+                                                                                programSourcePath,
+                                                                                sourceManifest.manifestCid,
+                                                                                runtimeTargets,
+                                                                                targetTriple) :
+            mpipeline.buildRuntimeProviderMachineModule(modulePath,
+                                                        sourceManifest.manifestCid,
+                                                        runtimeTargets,
+                                                        targetTriple)
+        let objImage = oimg.writeObjImage(machine)
+        let objFile = ofile.buildObjFile(machine)
+        out.objImageVersion = objImage.version
+        out.objImageCid = objImage.imageCid
+        out.objFileVersion = objFile.version
+        out.objFileCid = objFile.fileCid
+        out.objFileByteCount = objFile.fileByteCount
+        out.objFileBytes = objFile.fileBytes
+    var lines: str[]
+    lines = []
+    add(lines, "runtime_provider_object_version=" + out.version)
+    add(lines, "module_path=" + out.modulePath)
+    add(lines, "source_path=" + out.sourcePath)
+    add(lines, "source_manifest_cid=" + out.sourceManifestCid)
+    add(lines, "target=" + out.targetTriple)
+    add(lines, "source_kind=" + out.sourceKind)
+    add(lines, "compile_mode=" + out.compileMode)
+    add(lines, "execution_model=" + out.executionModel)
+    add(lines, "trace_symbol=" + out.traceSymbol)
+    add(lines, "compile_input_count=" + intToStr(compileInputs.len))
+    for i in 0..<compileInputs.len:
+        add(lines, "compile_input." + intToStr(i) + ".path=" + compileInputs[i])
+    add(lines, "runtime_target_count=" + intToStr(out.runtimeTargets.len))
+    for i in 0..<out.runtimeTargets.len:
+        add(lines, "runtime_target." + intToStr(i) + ".name=" + out.runtimeTargets[i])
+        add(lines, "runtime_target." + intToStr(i) + ".symbol=" + out.runtimeSymbols[i])
+    add(lines, "provider_symbol_count=" + intToStr(out.runtimeSymbols.len))
+    for i in 0..<out.runtimeSymbols.len:
+        add(lines, "provider_symbol." + intToStr(i) + "=" + out.runtimeSymbols[i])
+    add(lines, "obj_image_version=" + out.objImageVersion)
+    add(lines, "obj_image_cid=" + out.objImageCid)
+    add(lines, "obj_file_version=" + out.objFileVersion)
+    add(lines, "obj_file_cid=" + out.objFileCid)
+    add(lines, "obj_file_byte_count=" + intToStr(out.objFileByteCount))
+    out.objectText = manifest.joinLines(lines)
+    return out
+
+fn materializeRuntimeProviderObjectsForProgram(modulePaths: str[],
+                                               targetTriple: str,
+                                               programSourcePath: str,
+                                               programMachine: mpipeline.MachineModuleBundle): RuntimeProviderObjectBundle[] =
+    var out: RuntimeProviderObjectBundle[]
+    out = []
+    for i in 0..<modulePaths.len:
+        add(out, materializeRuntimeProviderObjectForProgram(modulePaths[i],
+                                                            targetTriple,
+                                                            programSourcePath,
+                                                            programMachine))
     return out

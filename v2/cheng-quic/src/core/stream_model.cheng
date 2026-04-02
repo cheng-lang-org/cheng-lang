@@ -1,0 +1,49 @@
+# MsQuic core stream model(pure Cheng, in-process).
+
+import std/result
+import cheng/quic/msquicstream
+import cheng/quic/core/common
+type
+    MsQuicStreamState =
+        stream: MsQuicStream
+        state: MsQuicCoreState
+        bytesIn: int64
+        bytesOut: int64
+
+fn initMsQuicStreamState(stream: MsQuicStream): MsQuicStreamState =
+    MsQuicStreamState(
+        stream: stream,
+        state: MsQuicCoreActive,
+        bytesIn: 0,
+        bytesOut: 0
+    )
+
+fn msquicStreamStateIsOpen(ss: MsQuicStreamState): bool =
+    return msquicStreamIsOpen(ss.stream)
+
+fn msquicStreamStateIdleMs(ss: MsQuicStreamState): int64 =
+    return msquicStreamIdleMs(ss.stream)
+
+fn msquicStreamStateRead(ss: var MsQuicStreamState, count: int32): Result[Bytes] =
+    if ! msquicStreamStateIsOpen(ss):
+        return Err[Bytes]("msquic core: stream closed")
+    let res: Result[Bytes] = msquicStreamRead(ss.stream, count)
+    if IsErr(res):
+        return Err[Bytes](Error(res))
+    let got: int32 = bytesLen(Value(res))
+    ss.bytesIn = ss.bytesIn + int64(got)
+    return res
+
+fn msquicStreamStateWrite(ss: var MsQuicStreamState, data: Bytes): Result[int32] =
+    if ! msquicStreamStateIsOpen(ss):
+        return Err[int32]("msquic core: stream closed")
+    let res: Result[int32] = msquicStreamWrite(ss.stream, data)
+    if IsErr(res):
+        return Err[int32](Error(res))
+    ss.bytesOut = ss.bytesOut + int64(Value(res))
+    return res
+
+fn msquicStreamStateClose(ss: var MsQuicStreamState) =
+    ss.state = MsQuicCoreClosing
+    msquicStreamClose(ss.stream)
+    ss.state = MsQuicCoreIdle

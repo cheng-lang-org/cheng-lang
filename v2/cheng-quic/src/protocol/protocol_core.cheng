@@ -1,0 +1,90 @@
+# MsQuic protocol core(minimal).
+
+import std/result
+import std/strings
+import std/times
+import cheng/quic/platform/common
+type
+    MsQuicProtocolVersion = enum
+        MsQuicProtocolV1 = 0
+        MsQuicProtocolV2 = 1
+
+    MsQuicProtocolState = enum
+        MsQuicProtoIdle = 0
+        MsQuicProtoNegotiating = 1
+        MsQuicProtoReady = 2
+        MsQuicProtoClosed = 3
+        MsQuicProtoFailed = 4
+
+    MsQuicProtocolConfig =
+        idleTimeoutMs: int64
+        maxPacketSize: int32
+
+    MsQuicProtocolContext =
+        version: MsQuicProtocolVersion
+        state: MsQuicProtocolState
+        config: MsQuicProtocolConfig
+        lastEventMs: int64
+        lastError: str
+
+fn initMsQuicProtocolConfig(): MsQuicProtocolConfig =
+    MsQuicProtocolConfig(idleTimeoutMs: 30000, maxPacketSize: 1250)
+
+fn initMsQuicProtocolContext(): MsQuicProtocolContext =
+    MsQuicProtocolContext(
+        version: MsQuicProtocolV1,
+        state: MsQuicProtoIdle,
+        config: initMsQuicProtocolConfig(),
+        lastEventMs: epochTimeNs() / 1000000,
+        lastError: ""
+    )
+
+fn msquicProtocolVersionName(ver: MsQuicProtocolVersion): str =
+    if ver == MsQuicProtocolV2:
+        return "v2"
+    return "v1"
+
+fn msquicProtocolStateName(state: MsQuicProtocolState): str =
+    if state == MsQuicProtoNegotiating:
+        return "negotiating"
+    if state == MsQuicProtoReady:
+        return "ready"
+    if state == MsQuicProtoClosed:
+        return "closed"
+    if state == MsQuicProtoFailed:
+        return "failed"
+    return "idle"
+
+fn msquicProtocolSetConfig(ctx: var MsQuicProtocolContext, cfg: MsQuicProtocolConfig) =
+    ctx.config = cfg
+
+fn msquicProtocolStart(ctx: var MsQuicProtocolContext): Result[bool] =
+    if ctx.state != MsQuicProtoIdle && ctx.state != MsQuicProtoClosed:
+        return Err[bool]("msquic protocol: invalid state")
+    ctx.state = MsQuicProtoNegotiating
+    ctx.lastEventMs = epochTimeNs() / 1000000
+    return Ok[bool](true)
+
+fn msquicProtocolFinish(ctx: var MsQuicProtocolContext, ok: bool) =
+    if ok:
+        ctx.state = MsQuicProtoReady
+        ctx.lastError = ""
+    else:
+        ctx.state = MsQuicProtoFailed
+        ctx.lastError = "msquic protocol: handshake failed"
+    ctx.lastEventMs = epochTimeNs() / 1000000
+
+fn msquicProtocolClose(ctx: var MsQuicProtocolContext) =
+    ctx.state = MsQuicProtoClosed
+    ctx.lastEventMs = epochTimeNs() / 1000000
+
+fn msquicProtocolSummary(ctx: MsQuicProtocolContext): str =
+    var out: str = "msquic protocol "
+    out = out + msquicProtocolVersionName(ctx.version)
+    out = out + " state="
+    out = out + msquicProtocolStateName(ctx.state)
+    out = out + " idleTimeoutMs="
+    out = out + msquicPlatformIntToString(ctx.config.idleTimeoutMs)
+    out = out + " maxPacket="
+    out = out + msquicPlatformIntToString(ctx.config.maxPacketSize)
+    return out

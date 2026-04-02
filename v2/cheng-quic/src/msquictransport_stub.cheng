@@ -1,0 +1,159 @@
+# MsQuic transport (no-pointer minimal in-process implementation).
+
+import std/result
+import std/rawbytes
+import cheng/quic/multiaddress
+import cheng/quic/connection
+import cheng/quic/msquicruntime
+
+type
+    MsQuicTransport =
+        running: bool
+        listenerId: int32
+        settings: MsQuicSettings
+
+const
+    maxMsQuicDatagrams = 32
+
+var
+    msquicListenerActive: bool = false
+    msquicListenerPending: bool = false
+    msquicPendingConn: Connection
+    msquicClosedPipe: int32 = -1
+    msquicDatagramPipe: int32 = -1
+    msquicDatagramCountSide0: int32 = 0
+    msquicDatagramCountSide1: int32 = 0
+    msquicDatagramLastSide0: Bytes = emptyBytes()
+    msquicDatagramLastSide1: Bytes = emptyBytes()
+
+fn initMsQuicTransport(): MsQuicTransport =
+    MsQuicTransport(
+        running: false,
+        listenerId: -1,
+        settings: initMsQuicSettings()
+    )
+
+fn msquicTransportSettings(t: MsQuicTransport): MsQuicSettings =
+    return t.settings
+
+fn setMsQuicTransportSettings(t: var MsQuicTransport, settings: MsQuicSettings): Result[bool] =
+    var next: MsQuicSettings = settings
+    let validRes: Result[bool] = validateMsQuicSettings(next)
+    if IsErr(validRes):
+        return Err[bool](Error(validRes))
+    t.settings = next
+    return Ok[bool](true)
+
+fn start(t: var MsQuicTransport, addr: MultiAddress) =
+    addr
+    msquicListenerActive = true
+    msquicListenerPending = false
+    t.listenerId = 1
+    t.running = true
+
+fn stop(t: var MsQuicTransport) =
+    t.running = false
+    t.listenerId = -1
+    msquicListenerActive = false
+    msquicListenerPending = false
+    msquicDatagramPipe = -1
+    msquicDatagramCountSide0 = 0
+    msquicDatagramCountSide1 = 0
+    msquicDatagramLastSide0 = emptyBytes()
+    msquicDatagramLastSide1 = emptyBytes()
+
+fn handles(t: MsQuicTransport, addr: MultiAddress): bool =
+    t
+    let kind: int32 = quicMultiAddressKind(addr)
+    return kind == quicAddrKindMsQuic || kind == quicAddrKindQuic || kind == quicAddrKindQuicTls
+
+fn accept(t: var MsQuicTransport): Result[Connection] =
+    if ! t.running:
+        return Err[Connection]("msquic: ! running")
+    if ! msquicListenerPending:
+        return Err[Connection]("msquic: accept queue empty")
+    msquicListenerPending = false
+    return Ok[Connection](msquicPendingConn)
+
+fn dial(t: var MsQuicTransport, addr: MultiAddress): Result[Connection] =
+    if ! handles(t, addr):
+        return Err[Connection]("msquic: unsupported address")
+    if ! msquicListenerActive:
+        return Err[Connection]("msquic: no listener")
+    let pairRes: Result[ConnectionPair] = newConnectionPair(addr, addr, addr, addr)
+    if IsErr(pairRes):
+        return Err[Connection](Error(pairRes))
+    let pair: ConnectionPair = Value(pairRes)
+    msquicClosedPipe = -1
+    msquicDatagramPipe = pair.outbound.pipeIdx
+    msquicDatagramCountSide0 = 0
+    msquicDatagramCountSide1 = 0
+    msquicDatagramLastSide0 = emptyBytes()
+    msquicDatagramLastSide1 = emptyBytes()
+    msquicPendingConn = pair.inbound
+    msquicListenerPending = true
+    return Ok[Connection](pair.outbound)
+
+fn dropMsQuicPendingByPipe(t: MsQuicTransport, addr: MultiAddress, pipeIdx: int32): Result[bool] =
+    t
+    addr
+    if msquicListenerPending && msquicPendingConn.pipeIdx == pipeIdx:
+        msquicListenerPending = false
+        dropMsQuicConnectionsByPipe(pipeIdx)
+        return Ok[bool](true)
+    return Ok[bool](false)
+
+fn dropMsQuicConnectionsByPipe(pipeIdx: int32) =
+    if pipeIdx < 0:
+        return
+    msquicClosedPipe = pipeIdx
+    if msquicDatagramPipe == pipeIdx:
+        msquicDatagramCountSide0 = 0
+        msquicDatagramCountSide1 = 0
+        msquicDatagramLastSide0 = emptyBytes()
+        msquicDatagramLastSide1 = emptyBytes()
+
+fn msquicTransportDatagramWrite(t: var MsQuicTransport, conn: var Connection, data: Bytes): Result[int32] =
+    if ! t.settings.allowDatagram:
+        return Err[int32]("msquic: datagram disabled")
+    if t.settings.maxDatagram > 0 && bytesLen(data) > t.settings.maxDatagram:
+        return Err[int32]("msquic: datagram too large")
+    if ! conn.open:
+        return Err[int32]("msquic: connection closed")
+    if conn.pipeIdx == msquicClosedPipe:
+        return Err[int32]("msquic: pipe closed")
+    if msquicDatagramPipe != conn.pipeIdx:
+        msquicDatagramPipe = conn.pipeIdx
+        msquicDatagramCountSide0 = 0
+        msquicDatagramCountSide1 = 0
+        msquicDatagramLastSide0 = emptyBytes()
+        msquicDatagramLastSide1 = emptyBytes()
+    if conn.pipeSide == 0:
+        if msquicDatagramCountSide0 >= maxMsQuicDatagrams:
+            return Err[int32]("msquic: datagram queue full")
+        msquicDatagramCountSide0 = msquicDatagramCountSide0 + 1
+        msquicDatagramLastSide0 = data
+    else:
+        if msquicDatagramCountSide1 >= maxMsQuicDatagrams:
+            return Err[int32]("msquic: datagram queue full")
+        msquicDatagramCountSide1 = msquicDatagramCountSide1 + 1
+        msquicDatagramLastSide1 = data
+    return Ok[int32](bytesLen(data))
+
+fn msquicTransportDatagramRead(t: var MsQuicTransport, conn: var Connection): Result[Bytes] =
+    t
+    if ! conn.open:
+        return Err[Bytes]("msquic: connection closed")
+    if conn.pipeIdx == msquicClosedPipe:
+        return Err[Bytes]("msquic: pipe closed")
+    if conn.pipeIdx != msquicDatagramPipe:
+        return Err[Bytes]("msquic: datagram queue empty")
+    if conn.pipeSide == 0:
+        if msquicDatagramCountSide1 <= 0:
+            return Err[Bytes]("msquic: datagram queue empty")
+        msquicDatagramCountSide1 = msquicDatagramCountSide1 - 1
+        return Ok[Bytes](msquicDatagramLastSide1)
+    if msquicDatagramCountSide0 <= 0:
+        return Err[Bytes]("msquic: datagram queue empty")
+    msquicDatagramCountSide0 = msquicDatagramCountSide0 - 1
+    return Ok[Bytes](msquicDatagramLastSide0)

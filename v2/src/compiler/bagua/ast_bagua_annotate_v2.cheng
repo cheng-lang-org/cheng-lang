@@ -1,0 +1,159 @@
+import runtime/strings_v2 as srun
+import compiler/bagua/bagua_core_v2 as bcore
+
+fn astPrefix(label: str): str =
+    for i in 0..<len(label):
+        if label[i] == '|':
+            return srun.sliceView(label, 0, i)
+    return label
+
+fn astKindIsDecl(nodeKind: str): bool =
+    return nodeKind == "module" ||
+           nodeKind == "module_decl" ||
+           nodeKind == "import" ||
+           nodeKind == "type" ||
+           nodeKind == "type_block" ||
+           nodeKind == "const" ||
+           nodeKind == "var" ||
+           nodeKind == "fn_decl" ||
+           nodeKind == "iterator_decl" ||
+           nodeKind == "importc_fn_decl" ||
+           nodeKind == "compiler_core_program" ||
+           nodeKind == "unimaker_program" ||
+           nodeKind == "network_distribution_program" ||
+           nodeKind == "topology_decl"
+
+fn astKindIsData(nodeKind: str, nodeLabel: str): bool =
+    return nodeKind == "local_decl" ||
+           srun.contains(nodeKind, "literal") ||
+           srun.contains(nodeKind, "asset") ||
+           srun.contains(nodeKind, "actor") ||
+           srun.contains(nodeKind, "ganzhi") ||
+           srun.contains(nodeKind, "struct") ||
+           srun.contains(nodeKind, "tuple") ||
+           srun.contains(nodeLabel, "{") ||
+           srun.contains(nodeLabel, "[")
+
+fn astKindIsGuard(nodeKind: str, nodeLabel: str): bool =
+    let prefix = astPrefix(nodeLabel)
+    return srun.contains(nodeKind, "if") ||
+           srun.contains(nodeKind, "match") ||
+           srun.contains(nodeKind, "guard") ||
+           srun.contains(nodeKind, "assert") ||
+           prefix == "if" ||
+           prefix == "match" ||
+           prefix == "assert"
+
+fn astKindIsProjection(nodeKind: str, nodeLabel: str): bool =
+    let prefix = astPrefix(nodeLabel)
+    return srun.contains(nodeKind, "call") ||
+           srun.contains(nodeKind, "proj") ||
+           srun.contains(nodeKind, "index") ||
+           srun.contains(nodeKind, "view") ||
+           srun.contains(nodeKind, "field") ||
+           prefix == "call" ||
+           prefix == "field" ||
+           prefix == "index"
+
+fn astKindIsSeal(nodeKind: str, nodeLabel: str): bool =
+    let prefix = astPrefix(nodeLabel)
+    return srun.contains(nodeKind, "return") ||
+           srun.contains(nodeKind, "freeze") ||
+           srun.contains(nodeKind, "commit") ||
+           srun.contains(nodeKind, "block_end") ||
+           prefix == "return"
+
+fn astKindIsBoundary(nodeKind: str): bool =
+    return nodeKind == "param_decl" ||
+           srun.contains(nodeKind, "param") ||
+           srun.contains(nodeKind, "interface") ||
+           srun.contains(nodeKind, "abi") ||
+           srun.contains(nodeKind, "message") ||
+           nodeKind == "hardware_callback_decl"
+
+fn astKindIsTrigger(nodeKind: str, nodeLabel: str): bool =
+    let prefix = astPrefix(nodeLabel)
+    return srun.contains(nodeKind, "assign") ||
+           srun.contains(nodeKind, "store") ||
+           srun.contains(nodeKind, "spawn") ||
+           srun.contains(nodeKind, "emit") ||
+           prefix == "assign" ||
+           prefix == "emit" ||
+           srun.contains(nodeLabel, "publish") ||
+           srun.contains(nodeLabel, "disperse")
+
+fn astKindIsPropagation(nodeKind: str, nodeLabel: str): bool =
+    let prefix = astPrefix(nodeLabel)
+    return srun.contains(nodeKind, "loop") ||
+           srun.contains(nodeKind, "iter") ||
+           srun.contains(nodeKind, "merge") ||
+           srun.contains(nodeKind, "fanout") ||
+           srun.contains(nodeKind, "await") ||
+           prefix == "while" ||
+           prefix == "for" ||
+           srun.contains(nodeLabel, "route")
+
+fn astStructuralGua(sourceKind: str, nodeKind: str, nodeLabel: str): str =
+    if astKindIsDecl(nodeKind):
+        return "乾"
+    if astKindIsBoundary(nodeKind):
+        return "兑"
+    if astKindIsData(nodeKind, nodeLabel):
+        return "坤"
+    if astKindIsGuard(nodeKind, nodeLabel):
+        return "坎"
+    if astKindIsProjection(nodeKind, nodeLabel):
+        return "离"
+    if astKindIsSeal(nodeKind, nodeLabel):
+        return "艮"
+    if astKindIsTrigger(nodeKind, nodeLabel):
+        return "震"
+    if astKindIsPropagation(nodeKind, nodeLabel):
+        return "巽"
+    if sourceKind == "network_distribution" && nodeKind == "network_op":
+        return "离"
+    return "乾"
+
+fn astEffectGua(sourceKind: str, nodeKind: str, nodeLabel: str): str =
+    if astKindIsDecl(nodeKind):
+        return "乾"
+    if astKindIsBoundary(nodeKind):
+        return "兑"
+    if astKindIsData(nodeKind, nodeLabel):
+        return "坤"
+    if astKindIsGuard(nodeKind, nodeLabel):
+        return "坎"
+    if astKindIsSeal(nodeKind, nodeLabel):
+        return "艮"
+    if astKindIsTrigger(nodeKind, nodeLabel):
+        return "震"
+    if astKindIsPropagation(nodeKind, nodeLabel):
+        return "巽"
+    if astKindIsProjection(nodeKind, nodeLabel):
+        return "离"
+    if sourceKind == "network_distribution" && nodeKind == "network_op":
+        if srun.contains(nodeLabel, "exchange"):
+            return "兑"
+        if srun.contains(nodeLabel, "route"):
+            return "坎"
+        if srun.contains(nodeLabel, "repair"):
+            return "艮"
+        if srun.contains(nodeLabel, "publish") || srun.contains(nodeLabel, "disperse"):
+            return "震"
+    return "乾"
+
+fn annotateAstNode(sourceKind: str, nodeId: int32, nodeKind: str, nodeLabel: str): bcore.BaguaAnnotation =
+    let upper = astStructuralGua(sourceKind, nodeKind, nodeLabel)
+    let lower = astEffectGua(sourceKind, nodeKind, nodeLabel)
+    let signature = sourceKind + "|" + intToStr(nodeId) + "|" + nodeKind + "|" + nodeLabel
+    return bcore.baguaAnnotation(upper, lower, signature)
+
+fn annotateAstNodes(sourceKind: str,
+                    nodeIds: int32[],
+                    nodeKinds: str[],
+                    nodeLabels: str[]): bcore.BaguaAnnotation[] =
+    var out: bcore.BaguaAnnotation[]
+    out = []
+    for i in 0..<nodeIds.len:
+        add(out, annotateAstNode(sourceKind, nodeIds[i], nodeKinds[i], nodeLabels[i]))
+    return out

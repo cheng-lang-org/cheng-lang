@@ -1,0 +1,44 @@
+# MsQuic congestion strategy test(manual).
+
+import std/result
+import cheng/quic/congestion/common
+import cheng/quic/congestion/controller
+import cheng/quic/congestion/newreno_model
+import cheng/quic/congestion/validation_suite
+fn runCongestionStrategyTest(): Result[bool] =
+    var cc: CongestionController = congestionControllerInit(caCubic, 1200, quicInitialWindowPackets)
+    let initialWindow: int64 = congestionControllerWindowBytes(cc)
+    if initialWindow <= 0:
+        return Err[bool]("strategy: initial window ! positive")
+    congestionControllerOnPacketSent(cc, 1200, true, false, 1000)
+    let ack: AckEventSnapshot = initAckSnapshot(200000, 1, 1, 1200)
+    congestionControllerOnAcked(cc, ack)
+    let afterWindow: int64 = congestionControllerWindowBytes(cc)
+    if afterWindow < initialWindow:
+        return Err[bool]("strategy: cubic window shrank on ack")
+    congestionControllerSwitchAlgorithm(cc, caBbr)
+    if cc.algorithm != caBbr:
+        return Err[bool]("strategy: algorithm switch failed")
+    congestionControllerOnPacketSent(cc, 1200, true, false, 300000)
+    let ackBbr: AckEventSnapshot = initAckSnapshot(300000, 2, 2, 1200)
+    congestionControllerOnAcked(cc, ackBbr)
+    if cc.bbr.pacingRateBps <= 0:
+        return Err[bool]("strategy: bbr pacing rate ! set")
+    let loss: LossEventSnapshot = initLossSnapshot(3, 600)
+    congestionControllerOnLost(cc, loss)
+    if ! congestionControllerCanSend(cc):
+        return Err[bool]("strategy: controller blocked after loss")
+    var newreno: NewRenoModel = newRenoInit(1200, quicInitialWindowPackets, minCwndInMss)
+    newRenoOnPacketSent(newreno, 1200)
+    let ackNr: AckEventSnapshot = initAckSnapshot(400000, 1, 1, 1200)
+    newRenoOnDataAcked(newreno, ackNr)
+    if newreno.congestionWindow <= 0:
+        return Err[bool]("strategy: newreno window ! positive")
+    let lossNr: LossEventSnapshot = initLossSnapshot(2, 1200)
+    newRenoOnDataLost(newreno, lossNr)
+    if newreno.phase != nrRecovery:
+        return Err[bool]("strategy: newreno did ! enter recovery")
+    newRenoOnProbeTimeout(newreno)
+    if newreno.phase != nrSlowStart:
+        return Err[bool]("strategy: newreno did ! reset after PTO")
+    return Ok[bool](true)

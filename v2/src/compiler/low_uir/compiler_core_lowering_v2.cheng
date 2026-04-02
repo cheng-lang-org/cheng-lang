@@ -1,5 +1,6 @@
 import std/seqs
 import std/strings as strings
+import std/strutils as strutils
 import compiler/frontend/compiler_core_surface_ir_v2 as ccore
 import compiler/driver/identity_v2 as ident
 import compiler/driver/manifest_resolver_v2 as manifest
@@ -235,6 +236,188 @@ fn compilerCoreQualifiedFieldName(baseName: str, fieldName: str): str =
         return fieldName
     return baseName + "." + fieldName
 
+fn compilerCoreLineIndent(rawLine: str): int32 =
+    var out: int32 = 0
+    while out < len(rawLine) && (rawLine[out] == ' ' || rawLine[out] == '\t'):
+        out = out + 1
+    return out
+
+fn compilerCoreTrimInlineComment(rawText: str): str =
+    for i in 0..<len(rawText):
+        if rawText[i] == '#':
+            return strutils.strip(strings.sliceBytes(rawText, 0, i))
+    return strutils.strip(rawText)
+
+fn compilerCoreParseInt32Text(rawText: str, outValue: var int32): bool =
+    let text = strutils.strip(rawText)
+    if len(text) <= 0:
+        return false
+    var start: int32 = 0
+    var sign: int32 = 1
+    if text[0] == '-':
+        sign = -1
+        start = 1
+    if start >= len(text):
+        return false
+    var base: int32 = 10
+    if start + 1 < len(text) && text[start] == '0' && (text[start + 1] == 'x' || text[start + 1] == 'X'):
+        base = 16
+        start = start + 2
+    if start >= len(text):
+        return false
+    var value: int32 = 0
+    for i in start..<len(text):
+        let ch = text[i]
+        var digit: int32 = -1
+        if ch >= '0' && ch <= '9':
+            digit = int32(ch) - int32('0')
+        elif base == 16 && ch >= 'a' && ch <= 'f':
+            digit = 10 + int32(ch) - int32('a')
+        elif base == 16 && ch >= 'A' && ch <= 'F':
+            digit = 10 + int32(ch) - int32('A')
+        if digit < 0 || digit >= base:
+            return false
+        value = value * base + digit
+    outValue = value * sign
+    return true
+
+fn compilerCoreSplitEnumFieldParts(text: str): str[] =
+    var out: str[]
+    var start: int32 = 0
+    for i in 0..<len(text):
+        if text[i] == ',':
+            let part = strutils.strip(strings.sliceBytes(text, start, i - start))
+            if len(part) > 0:
+                add(out, part)
+            start = i + 1
+    let tail = strutils.strip(strings.sliceBytes(text, start, len(text) - start))
+    if len(tail) > 0:
+        add(out, tail)
+    return out
+
+fn compilerCoreCountEnumMemberMatchesInFieldText(fieldText: str,
+                                                 memberName: str,
+                                                 nextOrdinal: var int32,
+                                                 outOrdinal: var int32): int32 =
+    let parts = compilerCoreSplitEnumFieldParts(fieldText)
+    var matchCount: int32 = 0
+    for i in 0..<parts.len:
+        let part = compilerCoreTrimInlineComment(parts[i])
+        if len(part) <= 0:
+            continue
+        let eqIdx = strings.find(part, "=")
+        var fieldName: str = part
+        var fieldOrdinal: int32 = nextOrdinal
+        if eqIdx >= 0:
+            fieldName = strutils.strip(strings.sliceBytes(part, 0, eqIdx))
+            let valueText = strutils.strip(strings.sliceBytes(part, eqIdx + 1, len(part) - eqIdx - 1))
+            if !compilerCoreParseInt32Text(valueText, fieldOrdinal):
+                panic("v2 low_uir compiler_core lowering: unsupported enum ordinal " + valueText)
+        if len(fieldName) <= 0:
+            panic("v2 low_uir compiler_core lowering: malformed enum field " + part)
+        if fieldName == memberName:
+            matchCount = matchCount + 1
+            outOrdinal = fieldOrdinal
+        nextOrdinal = fieldOrdinal + 1
+    return matchCount
+
+fn compilerCoreCountEnumMemberMatchesInTypeBlock(bodyLines: str[],
+                                                 memberName: str,
+                                                 outOrdinal: var int32): int32 =
+    var matchCount: int32 = 0
+    var activeEnumIndent: int32 = -1
+    var nextOrdinal: int32 = 0
+    for i in 0..<bodyLines.len:
+        let rawLine = bodyLines[i]
+        let line = compilerCoreTrimInlineComment(rawLine)
+        if len(line) <= 0:
+            continue
+        let indent = compilerCoreLineIndent(rawLine)
+        let enumIdx = strings.find(line, "= enum")
+        if enumIdx >= 0:
+            activeEnumIndent = indent
+            nextOrdinal = 0
+            let suffix = strutils.strip(strings.sliceBytes(line,
+                                                           enumIdx + len("= enum"),
+                                                           len(line) - enumIdx - len("= enum")))
+            if len(suffix) > 0:
+                matchCount = matchCount +
+                    compilerCoreCountEnumMemberMatchesInFieldText(suffix,
+                                                                  memberName,
+                                                                  nextOrdinal,
+                                                                  outOrdinal)
+            continue
+        if activeEnumIndent >= 0 && indent > activeEnumIndent:
+            matchCount = matchCount +
+                compilerCoreCountEnumMemberMatchesInFieldText(line,
+                                                              memberName,
+                                                              nextOrdinal,
+                                                              outOrdinal)
+            continue
+        activeEnumIndent = -1
+    return matchCount
+
+fn compilerCoreResolveEnumMemberOrdinalInSourcePath(program: ccore.CompilerCoreProgram,
+                                                    sourcePath: str,
+                                                    memberName: str,
+                                                    outOrdinal: var int32): bool =
+    var typeIdx: int32 = 0
+    var matchCount: int32 = 0
+    for i in 0..<program.topLevelKinds.len:
+        if program.topLevelKinds[i] != "type":
+            continue
+        let block = program.typeBlocks[typeIdx]
+        typeIdx = typeIdx + 1
+        if i >= len(program.topLevelSourcePaths) || program.topLevelSourcePaths[i] != sourcePath:
+            continue
+        matchCount = matchCount +
+            compilerCoreCountEnumMemberMatchesInTypeBlock(block.bodyLines, memberName, outOrdinal)
+        if matchCount > 1:
+            return false
+    return matchCount == 1
+
+fn compilerCoreResolveEnumMemberOrdinalInModulePath(program: ccore.CompilerCoreProgram,
+                                                    modulePath: str,
+                                                    memberName: str,
+                                                    outOrdinal: var int32): bool =
+    var typeIdx: int32 = 0
+    var matchCount: int32 = 0
+    for i in 0..<program.topLevelKinds.len:
+        if program.topLevelKinds[i] != "type":
+            continue
+        let block = program.typeBlocks[typeIdx]
+        typeIdx = typeIdx + 1
+        if i >= len(program.topLevelSourcePaths) ||
+           compilerCoreSourcePathToModulePath(program.topLevelSourcePaths[i]) != modulePath:
+            continue
+        matchCount = matchCount +
+            compilerCoreCountEnumMemberMatchesInTypeBlock(block.bodyLines, memberName, outOrdinal)
+        if matchCount > 1:
+            return false
+    return matchCount == 1
+
+fn compilerCoreResolveImportEnumFieldOrdinal(program: ccore.CompilerCoreProgram,
+                                             ownerSourcePath: str,
+                                             importName: str,
+                                             fieldName: str,
+                                             outOrdinal: var int32): bool =
+    var targetModulePath: str = ""
+    var importIdx: int32 = 0
+    for i in 0..<program.topLevelKinds.len:
+        if program.topLevelKinds[i] != "import":
+            continue
+        let decl = program.imports[importIdx]
+        importIdx = importIdx + 1
+        if i >= len(program.topLevelSourcePaths) || program.topLevelSourcePaths[i] != ownerSourcePath:
+            continue
+        if compilerCoreImportVisibleName(decl.modulePath, decl.alias) == importName:
+            if len(targetModulePath) > 0:
+                return false
+            targetModulePath = decl.modulePath
+    if len(targetModulePath) <= 0:
+        return false
+    return compilerCoreResolveEnumMemberOrdinalInModulePath(program, targetModulePath, fieldName, outOrdinal)
+
 fn compilerCoreLoopName(primaryText: str): str =
     for i in 0..<len(primaryText):
         if primaryText[i] == '|':
@@ -295,13 +478,21 @@ fn compilerCoreLowerExpr(program: ccore.CompilerCoreProgram,
         elif topLevelKind == "import":
             appendLowUirCompilerCoreExecOp(out, "load_import", expr.primaryText, "", topLevelItemId, exprId, -1)
         else:
-            appendLowUirCompilerCoreExecOp(out, "load_name", expr.primaryText, topLevelKind, topLevelItemId, exprId, -1)
+            var enumOrdinal: int32 = 0
+            if compilerCoreResolveEnumMemberOrdinalInSourcePath(program,
+                                                                ownerSourcePath,
+                                                                expr.primaryText,
+                                                                enumOrdinal):
+                appendLowUirCompilerCoreExecOp(out, "load_int32", intToStr(enumOrdinal), "", exprId, -1, -1)
+            else:
+                appendLowUirCompilerCoreExecOp(out, "load_name", expr.primaryText, topLevelKind, topLevelItemId, exprId, -1)
         return
     if expr.kind == "field":
         let baseExpr = program.exprs[childIds[0]]
         if baseExpr.kind == "name_ref":
             var resolvedKind: str = ""
             var resolvedItemId: int32 = -1
+            var enumOrdinal: int32 = 0
             if compilerCoreResolveImportFieldItem(program,
                                                   ownerSourcePath,
                                                   baseExpr.primaryText,
@@ -326,6 +517,19 @@ fn compilerCoreLowerExpr(program: ccore.CompilerCoreProgram,
                                                    resolvedItemId,
                                                    exprId,
                                                    childIds[0])
+                return
+            if compilerCoreResolveImportEnumFieldOrdinal(program,
+                                                         ownerSourcePath,
+                                                         baseExpr.primaryText,
+                                                         expr.primaryText,
+                                                         enumOrdinal):
+                appendLowUirCompilerCoreExecOp(out,
+                                               "load_int32",
+                                               intToStr(enumOrdinal),
+                                               "",
+                                               exprId,
+                                               -1,
+                                               -1)
                 return
         compilerCoreLowerExpr(program, graph, routine, itemId, ownerSourcePath, childIds[0], out)
         appendLowUirCompilerCoreExecOp(out, "load_field", expr.primaryText, "", exprId, childIds[0], -1)

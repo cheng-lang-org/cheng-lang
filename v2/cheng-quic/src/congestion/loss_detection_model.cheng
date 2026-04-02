@@ -1,0 +1,130 @@
+# MsQuic loss detection model.
+
+import cheng/quic/congestion/common
+const
+    maxSentRecords = 256
+    maxLostRecords = 128
+
+type
+    PacketRecord =
+        packetNumber: int64
+        encryptEpoch: CryptoEpoch
+        sentTimeUs: int64
+        ackEliciting: bool
+        packetLength: int32
+
+    LossDetectionModel =
+        packetsInFlight: int32
+        largestAck: int64
+        largestAckEncryptLevel: CryptoEpoch
+        timeOfLastPacketSent: int64
+        timeOfLastPacketAcked: int64
+        timeOfLastAckedPacketSent: int64
+        adjustedLastAckedTime: int64
+        totalBytesSent: int64
+        totalBytesAcked: int64
+        totalBytesSentAtLastAck: int64
+        largestSentPacketNumber: int64
+        sentCount: int32
+        lostCount: int32
+        sentQueue: PacketRecord[maxSentRecords]
+        lostQueue: PacketRecord[maxLostRecords]
+        probeCount: int32
+
+fn lossDetectionInit(): LossDetectionModel =
+    LossDetectionModel(
+        packetsInFlight: 0,
+        largestAck: 0,
+        largestAckEncryptLevel: ceInitial,
+        timeOfLastPacketSent: 0,
+        timeOfLastPacketAcked: 0,
+        timeOfLastAckedPacketSent: 0,
+        adjustedLastAckedTime: 0,
+        totalBytesSent: 0,
+        totalBytesAcked: 0,
+        totalBytesSentAtLastAck: 0,
+        largestSentPacketNumber: 0,
+        sentCount: 0,
+        lostCount: 0,
+        probeCount: 0
+    )
+
+fn lossDetectionOnPacketSent(model: var LossDetectionModel, packet: PacketRecord) =
+    if packet.packetNumber > model.largestSentPacketNumber:
+        model.largestSentPacketNumber = packet.packetNumber
+    model.timeOfLastPacketSent = packet.sentTimeUs
+    model.totalBytesSent = model.totalBytesSent + int64(packet.packetLength)
+    if model.sentCount >= maxSentRecords:
+        for i in 1..<model.sentCount:
+            model.sentQueue[i - 1] = model.sentQueue[i]
+        model.sentCount = model.sentCount - 1
+    model.sentQueue[model.sentCount] = packet
+    model.sentCount = model.sentCount + 1
+    if packet.ackEliciting:
+        model.packetsInFlight = model.packetsInFlight + 1
+
+
+fn lossDetectionOnAckReceived(model: var LossDetectionModel, ack: AckEventSnapshot) =
+    if ack.largestAck > model.largestAck:
+        model.largestAck = ack.largestAck
+    model.totalBytesAcked = ack.totalAckedRetransmittableBytes
+    model.timeOfLastPacketAcked = ack.timeNow
+    model.timeOfLastAckedPacketSent = model.timeOfLastPacketSent
+    model.adjustedLastAckedTime = ack.adjustedAckTime
+    model.totalBytesSentAtLastAck = model.totalBytesSent
+    lossDetectionResetProbeTimer(model)
+    if model.packetsInFlight > 0 && ack.hasLoss:
+        model.packetsInFlight = model.packetsInFlight - 1
+
+fn lossDetectionMarkPacketLost(model: var LossDetectionModel, packetNumber: int64) =
+    var found: bool = false
+    var pkt: PacketRecord = PacketRecord(packetNumber: 0, encryptEpoch: ceInitial, sentTimeUs: 0, ackEliciting: false, packetLength: 0)
+    for i in 0..<model.sentCount:
+        if model.sentQueue[i].packetNumber == packetNumber:
+            pkt = model.sentQueue[i]
+            found = true
+            for j in i + 1..<model.sentCount:
+                model.sentQueue[j - 1] = model.sentQueue[j]
+            model.sentCount = model.sentCount - 1
+            break
+        i = i + 1
+    if ! found:
+    if model.lostCount < maxLostRecords:
+        model.lostQueue[model.lostCount] = pkt
+        model.lostCount = model.lostCount + 1
+    if pkt.ackEliciting && model.packetsInFlight > 0:
+        model.packetsInFlight = model.packetsInFlight - 1
+
+fn lossDetectionRemoveLostPacket(model: var LossDetectionModel, packetNumber: int64): bool =
+    if model.lostCount <= 0:
+        return false
+    for i in 0..<model.lostCount:
+        if model.lostQueue[i].packetNumber == packetNumber:
+            for j in i + 1..<model.lostCount:
+                model.lostQueue[j - 1] = model.lostQueue[j]
+            model.lostCount = model.lostCount - 1
+            return true
+    return false
+
+fn lossDetectionComputeProbeTimeout(
+    model: LossDetectionModel,
+    smoothedRttUs: int64,
+    rttVarianceUs: int64
+): int64 =
+    var base: int64 = smoothedRttUs + (4 * rttVarianceUs)
+    var shift: int32 = model.probeCount
+    if shift <= 0:
+        return base
+    for ptoShiftStep in 0..<shift:
+        if base > maxInt64Value / 2:
+            base = maxInt64Value
+            break
+        base = base << 1
+    return base
+
+fn lossDetectionOnProbeTimeoutFired(model: var LossDetectionModel) =
+    if model.probeCount < closePtoCount:
+        model.probeCount = model.probeCount + 1
+
+fn lossDetectionResetProbeTimer(model: var LossDetectionModel) =
+    model.probeCount = 0

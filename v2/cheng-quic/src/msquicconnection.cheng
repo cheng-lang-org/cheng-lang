@@ -1,0 +1,762 @@
+# MsQuic connection(pure Cheng, in-process).
+
+import std/result
+import cheng/quic/multiaddress
+import cheng/quic/msquicstream
+import cheng/quic/inc/msquic_constants
+import cheng/quic/inc/msquic_crypto
+import cheng/quic/inc/msquic_settings
+import cheng/quic/inc/msquic_types
+import cheng/quic/tls/common
+type
+    MsQuicConnection =
+        id: int64
+        localAddr: MultiAddress
+        remoteAddr: MultiAddress
+        isClient: bool
+        open: bool
+        createdAtMs: int64
+        lastActiveMs: int64
+        settings: MsQuicSettings
+        bytesSent: int64
+        bytesRecv: int64
+        packetsSent: int64
+        packetsRecv: int64
+        streamsOpened: int32
+        streamsClosed: int32
+        smoothedRttMs: int64
+        minRttMs: int64
+        rttVarMs: int64
+        maxRttMs: int64
+        bytesInFlight: int64
+        lostPackets: int64
+        sendSuspectedLostPackets: int64
+        sendRetransmittablePackets: int64
+        sendSpuriousLostPackets: int64
+        sendCongestionCount: int32
+        sendPersistentCongestionCount: int32
+        sendEcnCongestionCount: int32
+        sendTotalStreamBytes: int64
+        recvReorderedPackets: int64
+        recvDroppedPackets: int64
+        recvDuplicatePackets: int64
+        recvDecryptionFailures: int64
+        recvValidAckFrames: int64
+        recvTotalStreamBytes: int64
+        timingInitialFlightEndUs: int64
+        timingHandshakeFlightEndUs: int64
+        handshakeClientFlight1Bytes: int32
+        handshakeServerFlight1Bytes: int32
+        handshakeClientFlight2Bytes: int32
+        handshakeHopLimitTtl: int32
+        pathMtu: int32
+        netPostedBytes: int64
+        netIdealBytes: int64
+        netCongestionWindow: int64
+        netBandwidth: int64
+        netBandwidthOut: int64
+        netBandwidthIn: int64
+        netDeliveryRateOut: int64
+        netDeliveryRateIn: int64
+        maxStreamsBidi: int32
+        maxStreamsUni: int32
+        peerMaxStreamsBidi: int32
+        peerMaxStreamsUni: int32
+        nextBidiId: int64
+        nextUniId: int64
+        quicVersion: int32
+        originalQuicVersion: int32
+        previousQuicVersion: int32
+        versionNegotiation: bool
+        statelessRetry: bool
+        resumptionAttempted: bool
+        resumptionSucceeded: bool
+        compatibleVersionNegotiationAttempted: bool
+        compatibleVersionNegotiationCompleted: bool
+        keyUpdateCount: int32
+        destCidUpdateCount: int32
+        idealProcessor: int32
+        streamSchedulingScheme: QUIC_STREAM_SCHEDULING_SCHEME
+        datagramReceiveEnabled: bool
+        datagramSendEnabled: bool
+        disable1RttEncryption: bool
+        closeReasonPhrase: str
+        closeErrorCode: int64
+        closeFrameType: int64
+        closeAppError: bool
+        shareUdpBinding: bool
+        resumptionTicket: Bytes
+        resumptionPsk: Bytes
+        resumptionTicketAgeAdd: int64
+        resumptionTicketLifetimeSec: int64
+        resumptionTicketReceivedAtMs: int64
+        resumptionPskCipher: MsQuicCipherSuite
+        peerCertificateValid: bool
+        localInterface: int32
+        cibirId: Bytes
+        origDestCid: Bytes
+        sendDscp: int32
+        closeAsync: bool
+        tlsSecrets: QUIC_TLS_SECRETS
+        tlsHandshakeInfo: QUIC_HANDSHAKE_INFO
+        tlsNegotiatedAlpn: Bytes
+        versionSettings: QUIC_VERSION_SETTINGS
+
+fn initMsQuicConnection(id: int64, localAddr: MultiAddress, remoteAddr: MultiAddress, settings: MsQuicSettings, isClient: bool): MsQuicConnection =
+    let now: int64 = msquicNowMs()
+    MsQuicConnection(
+        id: id,
+        localAddr: localAddr,
+        remoteAddr: remoteAddr,
+        isClient: isClient,
+        open: true,
+        createdAtMs: now,
+        lastActiveMs: now,
+        settings: settings,
+        bytesSent: 0,
+        bytesRecv: 0,
+        packetsSent: 0,
+        packetsRecv: 0,
+        streamsOpened: 0,
+        streamsClosed: 0,
+        smoothedRttMs: 0,
+        minRttMs: 0,
+        rttVarMs: 0,
+        maxRttMs: 0,
+        bytesInFlight: 0,
+        lostPackets: 0,
+        sendSuspectedLostPackets: 0,
+        sendRetransmittablePackets: 0,
+        sendSpuriousLostPackets: 0,
+        sendCongestionCount: 0,
+        sendPersistentCongestionCount: 0,
+        sendEcnCongestionCount: 0,
+        sendTotalStreamBytes: 0,
+        recvReorderedPackets: 0,
+        recvDroppedPackets: 0,
+        recvDuplicatePackets: 0,
+        recvDecryptionFailures: 0,
+        recvValidAckFrames: 0,
+        recvTotalStreamBytes: 0,
+        timingInitialFlightEndUs: 0,
+        timingHandshakeFlightEndUs: 0,
+        handshakeClientFlight1Bytes: 0,
+        handshakeServerFlight1Bytes: 0,
+        handshakeClientFlight2Bytes: 0,
+        handshakeHopLimitTtl: 0,
+        pathMtu: 0,
+        netPostedBytes: 0,
+        netIdealBytes: 0,
+        netCongestionWindow: 0,
+        netBandwidth: 0,
+        netBandwidthOut: 0,
+        netBandwidthIn: 0,
+        netDeliveryRateOut: 0,
+        netDeliveryRateIn: 0,
+        maxStreamsBidi: settings.maxStreamsBidi,
+        maxStreamsUni: settings.maxStreamsUni,
+        peerMaxStreamsBidi: settings.maxStreamsBidi,
+        peerMaxStreamsUni: settings.maxStreamsUni,
+        nextBidiId: 0,
+        nextUniId: 0,
+        quicVersion: 0,
+        originalQuicVersion: 0,
+        previousQuicVersion: 0,
+        versionNegotiation: false,
+        statelessRetry: false,
+        resumptionAttempted: false,
+        resumptionSucceeded: false,
+        compatibleVersionNegotiationAttempted: false,
+        compatibleVersionNegotiationCompleted: false,
+        keyUpdateCount: 0,
+        destCidUpdateCount: 0,
+        idealProcessor: 0,
+        streamSchedulingScheme: QUIC_STREAM_SCHEDULING_SCHEME_FIFO,
+        datagramReceiveEnabled: settings.allowDatagram,
+        datagramSendEnabled: settings.allowDatagram,
+        disable1RttEncryption: false,
+        closeReasonPhrase: "",
+        closeErrorCode: -1,
+        closeFrameType: -1,
+        closeAppError: false,
+        shareUdpBinding: false,
+        resumptionTicket: emptyBytes(),
+        resumptionPsk: emptyBytes(),
+        resumptionTicketAgeAdd: 0,
+        resumptionTicketLifetimeSec: 0,
+        resumptionTicketReceivedAtMs: 0,
+        resumptionPskCipher: MsQuicCipherAes128Gcm,
+        peerCertificateValid: false,
+        localInterface: 0,
+        cibirId: emptyBytes(),
+        origDestCid: emptyBytes(),
+        sendDscp: 0,
+        closeAsync: false,
+        tlsSecrets: initQuicTlsSecrets(),
+        tlsHandshakeInfo: initQuicHandshakeInfo(),
+        tlsNegotiatedAlpn: emptyBytes(),
+        versionSettings: initQuicVersionSettings()
+    )
+
+fn msquicConnectionId(c: MsQuicConnection): int64 =
+    c.id
+
+fn msquicConnectionCreatedAtMs(c: MsQuicConnection): int64 =
+    c.createdAtMs
+
+fn msquicConnectionIsClient(c: MsQuicConnection): bool =
+    c.isClient
+
+fn msquicConnectionSetIsClient(c: var MsQuicConnection, isClient: bool) =
+    c.isClient = isClient
+
+fn msquicStreamIdIsBidi(streamId: int64): bool =
+    return (streamId & 0x2) == 0
+
+fn msquicStreamIdIsUni(streamId: int64): bool =
+    return (streamId & 0x2) != 0
+
+fn msquicStreamIdIsClientInitiated(streamId: int64): bool =
+    return (streamId & 0x1) == 0
+
+fn msquicStreamIdSequence(streamId: int64): int64 =
+    if streamId < 0:
+        return -1
+    return streamId >> 2
+
+fn msquicStreamIdFromParts(seq: int64, isClient: bool, bidi: bool): int64 =
+    var out: int64 = seq << 2
+    if ! bidi:
+        out = out | 0x2
+    if ! isClient:
+        out = out | 0x1
+    return out
+
+fn msquicStreamIdIsLocalInitiated(c: MsQuicConnection, streamId: int64): bool =
+    if msquicStreamIdIsClientInitiated(streamId):
+        return c.isClient
+    return ! c.isClient
+
+fn msquicStreamIdIsPeerInitiated(c: MsQuicConnection, streamId: int64): bool =
+    return ! msquicStreamIdIsLocalInitiated(c, streamId)
+
+fn msquicConnectionIsOpen(c: MsQuicConnection): bool =
+    c.open
+
+fn msquicConnectionLocalAddr(c: MsQuicConnection): MultiAddress =
+    c.localAddr
+
+fn msquicConnectionRemoteAddr(c: MsQuicConnection): MultiAddress =
+    c.remoteAddr
+
+fn msquicConnectionSetLocalAddr(c: var MsQuicConnection, addr: MultiAddress) =
+    c.localAddr = addr
+    msquicConnectionTouch(c)
+
+fn msquicConnectionSetRemoteAddr(c: var MsQuicConnection, addr: MultiAddress) =
+    c.remoteAddr = addr
+    msquicConnectionTouch(c)
+
+fn msquicConnectionTouch(c: var MsQuicConnection) =
+    c.lastActiveMs = msquicNowMs()
+
+fn msquicConnectionIdleMs(c: MsQuicConnection): int64 =
+    msquicNowMs() - c.lastActiveMs
+
+fn msquicConnectionOpenedStreamCount(c: MsQuicConnection): int32 =
+    return c.streamsOpened
+
+fn msquicConnectionStreamsOpened(c: MsQuicConnection): int32 =
+    return c.streamsOpened
+
+fn msquicConnectionStreamsClosed(c: MsQuicConnection): int32 =
+    return c.streamsClosed
+
+fn msquicConnectionBytesSent(c: MsQuicConnection): int64 =
+    return c.bytesSent
+
+fn msquicConnectionBytesRecv(c: MsQuicConnection): int64 =
+    return c.bytesRecv
+
+fn msquicConnectionPacketsSent(c: MsQuicConnection): int64 =
+    return c.packetsSent
+
+fn msquicConnectionPacketsRecv(c: MsQuicConnection): int64 =
+    return c.packetsRecv
+
+fn msquicConnectionSmoothedRttMs(c: MsQuicConnection): int64 =
+    return c.smoothedRttMs
+
+fn msquicConnectionMinRttMs(c: MsQuicConnection): int64 =
+    return c.minRttMs
+
+fn msquicConnectionRttVarMs(c: MsQuicConnection): int64 =
+    return c.rttVarMs
+
+fn msquicConnectionMaxRttMs(c: MsQuicConnection): int64 =
+    return c.maxRttMs
+
+fn msquicConnectionBytesInFlight(c: MsQuicConnection): int64 =
+    return c.bytesInFlight
+
+fn msquicConnectionLostPackets(c: MsQuicConnection): int64 =
+    return c.lostPackets
+
+fn msquicConnectionSendSuspectedLostPackets(c: MsQuicConnection): int64 =
+    return c.sendSuspectedLostPackets
+
+fn msquicConnectionSendRetransmittablePackets(c: MsQuicConnection): int64 =
+    return c.sendRetransmittablePackets
+
+fn msquicConnectionSendSpuriousLostPackets(c: MsQuicConnection): int64 =
+    return c.sendSpuriousLostPackets
+
+fn msquicConnectionSendCongestionCount(c: MsQuicConnection): int32 =
+    return c.sendCongestionCount
+
+fn msquicConnectionSendPersistentCongestionCount(c: MsQuicConnection): int32 =
+    return c.sendPersistentCongestionCount
+
+fn msquicConnectionSendEcnCongestionCount(c: MsQuicConnection): int32 =
+    return c.sendEcnCongestionCount
+
+fn msquicConnectionSendTotalStreamBytes(c: MsQuicConnection): int64 =
+    return c.sendTotalStreamBytes
+
+fn msquicConnectionRecvReorderedPackets(c: MsQuicConnection): int64 =
+    return c.recvReorderedPackets
+
+fn msquicConnectionRecvDroppedPackets(c: MsQuicConnection): int64 =
+    return c.recvDroppedPackets
+
+fn msquicConnectionRecvDuplicatePackets(c: MsQuicConnection): int64 =
+    return c.recvDuplicatePackets
+
+fn msquicConnectionRecvDecryptionFailures(c: MsQuicConnection): int64 =
+    return c.recvDecryptionFailures
+
+fn msquicConnectionRecvValidAckFrames(c: MsQuicConnection): int64 =
+    return c.recvValidAckFrames
+
+fn msquicConnectionRecvTotalStreamBytes(c: MsQuicConnection): int64 =
+    return c.recvTotalStreamBytes
+
+fn msquicConnectionTimingInitialFlightEndUs(c: MsQuicConnection): int64 =
+    return c.timingInitialFlightEndUs
+
+fn msquicConnectionTimingHandshakeFlightEndUs(c: MsQuicConnection): int64 =
+    return c.timingHandshakeFlightEndUs
+
+fn msquicConnectionHandshakeClientFlight1Bytes(c: MsQuicConnection): int32 =
+    return c.handshakeClientFlight1Bytes
+
+fn msquicConnectionHandshakeServerFlight1Bytes(c: MsQuicConnection): int32 =
+    return c.handshakeServerFlight1Bytes
+
+fn msquicConnectionHandshakeClientFlight2Bytes(c: MsQuicConnection): int32 =
+    return c.handshakeClientFlight2Bytes
+
+fn msquicConnectionHandshakeHopLimitTtl(c: MsQuicConnection): int32 =
+    return c.handshakeHopLimitTtl
+
+fn msquicConnectionPathMtu(c: MsQuicConnection): int32 =
+    return c.pathMtu
+
+fn msquicConnectionNetPostedBytes(c: MsQuicConnection): int64 =
+    return c.netPostedBytes
+
+fn msquicConnectionNetIdealBytes(c: MsQuicConnection): int64 =
+    return c.netIdealBytes
+
+fn msquicConnectionNetCongestionWindow(c: MsQuicConnection): int64 =
+    return c.netCongestionWindow
+
+fn msquicConnectionNetBandwidth(c: MsQuicConnection): int64 =
+    return c.netBandwidth
+
+fn msquicConnectionNetBandwidthOut(c: MsQuicConnection): int64 =
+    return c.netBandwidthOut
+
+fn msquicConnectionNetBandwidthIn(c: MsQuicConnection): int64 =
+    return c.netBandwidthIn
+
+fn msquicConnectionNetDeliveryRateOut(c: MsQuicConnection): int64 =
+    return c.netDeliveryRateOut
+
+fn msquicConnectionNetDeliveryRateIn(c: MsQuicConnection): int64 =
+    return c.netDeliveryRateIn
+
+fn msquicConnectionOpenBidiStream(c: var MsQuicConnection): Result[MsQuicStream] =
+    if ! c.open:
+        return Err[MsQuicStream]("msquic: connection closed")
+    if c.peerMaxStreamsBidi > 0 && c.nextBidiId >= c.peerMaxStreamsBidi:
+        return Err[MsQuicStream]("msquic: bidi stream limit reached")
+    let id: int64 = msquicStreamIdFromParts(c.nextBidiId, c.isClient, true)
+    c.nextBidiId = c.nextBidiId + 1
+    c.streamsOpened = c.streamsOpened + 1
+    msquicConnectionTouch(c)
+    return Ok[MsQuicStream](initMsQuicStream(id, true))
+
+fn msquicConnectionOpenUniStream(c: var MsQuicConnection): Result[MsQuicStream] =
+    if ! c.open:
+        return Err[MsQuicStream]("msquic: connection closed")
+    if c.peerMaxStreamsUni > 0 && c.nextUniId >= c.peerMaxStreamsUni:
+        return Err[MsQuicStream]("msquic: uni stream limit reached")
+    let id: int64 = msquicStreamIdFromParts(c.nextUniId, c.isClient, false)
+    c.nextUniId = c.nextUniId + 1
+    c.streamsOpened = c.streamsOpened + 1
+    msquicConnectionTouch(c)
+    return Ok[MsQuicStream](initMsQuicStream(id, false))
+
+fn msquicConnectionClose(c: var MsQuicConnection) =
+    c.open = false
+
+fn msquicConnectionRecordPacketSent(c: var MsQuicConnection, bytes: int64) =
+    if bytes > 0:
+        c.bytesSent = c.bytesSent + bytes
+    c.packetsSent = c.packetsSent + 1
+
+fn msquicConnectionRecordPacketRecv(c: var MsQuicConnection, bytes: int64) =
+    if bytes > 0:
+        c.bytesRecv = c.bytesRecv + bytes
+    c.packetsRecv = c.packetsRecv + 1
+
+fn msquicConnectionRecordStreamOpened(c: var MsQuicConnection) =
+    c.streamsOpened = c.streamsOpened + 1
+
+fn msquicConnectionRecordStreamClosed(c: var MsQuicConnection) =
+    c.streamsClosed = c.streamsClosed + 1
+
+fn msquicConnectionUpdateNetworkStats(
+    c: var MsQuicConnection,
+    smoothedRttMs: int64,
+    minRttMs: int64,
+    rttVarMs: int64,
+    maxRttMs: int64,
+    bytesInFlight: int64,
+    lostPackets: int64,
+    pathMtu: int32,
+    postedBytes: int64,
+    idealBytes: int64,
+    congestionWindow: int64,
+    bandwidthOut: int64,
+    deliveryRateOut: int64,
+    bandwidthIn: int64,
+    deliveryRateIn: int64
+) =
+    if smoothedRttMs >= 0:
+        c.smoothedRttMs = smoothedRttMs
+    if minRttMs >= 0:
+        c.minRttMs = minRttMs
+    if rttVarMs >= 0:
+        c.rttVarMs = rttVarMs
+    if maxRttMs >= 0:
+        c.maxRttMs = maxRttMs
+    if bytesInFlight >= 0:
+        c.bytesInFlight = bytesInFlight
+    if lostPackets >= 0:
+        c.lostPackets = lostPackets
+    if pathMtu >= 0:
+        c.pathMtu = pathMtu
+    if postedBytes >= 0:
+        c.netPostedBytes = postedBytes
+    if idealBytes >= 0:
+        c.netIdealBytes = idealBytes
+    if congestionWindow >= 0:
+        c.netCongestionWindow = congestionWindow
+    if bandwidthOut >= 0:
+        c.netBandwidth = bandwidthOut
+        c.netBandwidthOut = bandwidthOut
+    if bandwidthIn >= 0:
+        c.netBandwidthIn = bandwidthIn
+    if deliveryRateOut >= 0:
+        c.netDeliveryRateOut = deliveryRateOut
+    if deliveryRateIn >= 0:
+        c.netDeliveryRateIn = deliveryRateIn
+
+fn msquicConnectionRecordSendRetransmittablePacket(c: var MsQuicConnection) =
+    c.sendRetransmittablePackets = c.sendRetransmittablePackets + 1
+
+fn msquicConnectionRecordSendSuspectedLostPacket(c: var MsQuicConnection) =
+    c.sendSuspectedLostPackets = c.sendSuspectedLostPackets + 1
+
+fn msquicConnectionRecordSendSpuriousLostPacket(c: var MsQuicConnection) =
+    c.sendSpuriousLostPackets = c.sendSpuriousLostPackets + 1
+
+fn msquicConnectionRecordSendCongestion(c: var MsQuicConnection) =
+    c.sendCongestionCount = c.sendCongestionCount + 1
+
+fn msquicConnectionRecordSendPersistentCongestion(c: var MsQuicConnection) =
+    c.sendPersistentCongestionCount = c.sendPersistentCongestionCount + 1
+
+fn msquicConnectionRecordSendEcnCongestion(c: var MsQuicConnection) =
+    c.sendEcnCongestionCount = c.sendEcnCongestionCount + 1
+
+fn msquicConnectionRecordSendStreamBytes(c: var MsQuicConnection, bytes: int64) =
+    if bytes > 0:
+        c.sendTotalStreamBytes = c.sendTotalStreamBytes + bytes
+
+fn msquicConnectionRecordRecvReorderedPacket(c: var MsQuicConnection) =
+    c.recvReorderedPackets = c.recvReorderedPackets + 1
+
+fn msquicConnectionRecordRecvDroppedPacket(c: var MsQuicConnection) =
+    c.recvDroppedPackets = c.recvDroppedPackets + 1
+
+fn msquicConnectionRecordRecvDuplicatePacket(c: var MsQuicConnection) =
+    c.recvDuplicatePackets = c.recvDuplicatePackets + 1
+
+fn msquicConnectionRecordRecvDecryptionFailure(c: var MsQuicConnection) =
+    c.recvDecryptionFailures = c.recvDecryptionFailures + 1
+
+fn msquicConnectionRecordRecvValidAckFrame(c: var MsQuicConnection) =
+    c.recvValidAckFrames = c.recvValidAckFrames + 1
+
+fn msquicConnectionRecordRecvStreamBytes(c: var MsQuicConnection, bytes: int64) =
+    if bytes > 0:
+        c.recvTotalStreamBytes = c.recvTotalStreamBytes + bytes
+
+fn msquicConnectionRecordTimingInitialFlightEnd(c: var MsQuicConnection, nowUs: int64) =
+    if c.timingInitialFlightEndUs <= 0 && nowUs > 0:
+        c.timingInitialFlightEndUs = nowUs
+
+fn msquicConnectionRecordTimingHandshakeFlightEnd(c: var MsQuicConnection, nowUs: int64) =
+    if c.timingHandshakeFlightEndUs <= 0 && nowUs > 0:
+        c.timingHandshakeFlightEndUs = nowUs
+
+fn msquicConnectionRecordHandshakeClientFlight1Bytes(c: var MsQuicConnection, bytes: int32) =
+    if c.handshakeClientFlight1Bytes <= 0 && bytes > 0:
+        c.handshakeClientFlight1Bytes = bytes
+
+fn msquicConnectionRecordHandshakeServerFlight1Bytes(c: var MsQuicConnection, bytes: int32) =
+    if c.handshakeServerFlight1Bytes <= 0 && bytes > 0:
+        c.handshakeServerFlight1Bytes = bytes
+
+fn msquicConnectionRecordHandshakeClientFlight2Bytes(c: var MsQuicConnection, bytes: int32) =
+    if c.handshakeClientFlight2Bytes <= 0 && bytes > 0:
+        c.handshakeClientFlight2Bytes = bytes
+
+fn msquicConnectionRecordHandshakeHopLimitTtl(c: var MsQuicConnection, ttl: int32) =
+    if c.handshakeHopLimitTtl <= 0 && ttl > 0:
+        c.handshakeHopLimitTtl = ttl
+
+fn msquicConnectionSettings(c: MsQuicConnection): MsQuicSettings =
+    c.settings
+
+fn msquicConnectionApplySettings(c: var MsQuicConnection, settings: MsQuicSettings): Result[bool] =
+    let validRes: Result[bool] = validateMsQuicSettings(settings)
+    if IsErr(validRes):
+        return Err[bool](Error(validRes))
+    c.settings = settings
+    c.maxStreamsBidi = settings.maxStreamsBidi
+    c.maxStreamsUni = settings.maxStreamsUni
+    c.peerMaxStreamsBidi = settings.maxStreamsBidi
+    c.peerMaxStreamsUni = settings.maxStreamsUni
+    c.datagramReceiveEnabled = settings.allowDatagram
+    c.datagramSendEnabled = settings.allowDatagram
+    return Ok[bool](true)
+
+fn msquicConnectionSetMaxStreamsBidi(c: var MsQuicConnection, value: int32): Result[bool] =
+    if value < 0:
+        return Err[bool]("msquic: maxStreamsBidi must be non-negative")
+    c.maxStreamsBidi = value
+    c.settings.maxStreamsBidi = value
+    return Ok[bool](true)
+
+fn msquicConnectionSetMaxStreamsUni(c: var MsQuicConnection, value: int32): Result[bool] =
+    if value < 0:
+        return Err[bool]("msquic: maxStreamsUni must be non-negative")
+    c.maxStreamsUni = value
+    c.settings.maxStreamsUni = value
+    return Ok[bool](true)
+
+fn msquicConnectionSetQuicVersion(c: var MsQuicConnection, version: int32) =
+    c.quicVersion = version
+    if c.originalQuicVersion <= 0:
+        c.originalQuicVersion = version
+
+fn msquicConnectionQuicVersion(c: MsQuicConnection): int32 =
+    c.quicVersion
+
+fn msquicConnectionVersionNegotiation(c: MsQuicConnection): bool =
+    c.versionNegotiation
+
+fn msquicConnectionStatelessRetry(c: MsQuicConnection): bool =
+    c.statelessRetry
+
+fn msquicConnectionResumptionAttempted(c: MsQuicConnection): bool =
+    c.resumptionAttempted
+
+fn msquicConnectionResumptionSucceeded(c: MsQuicConnection): bool =
+    c.resumptionSucceeded
+
+fn msquicConnectionKeyUpdateCount(c: MsQuicConnection): int32 =
+    return c.keyUpdateCount
+
+fn msquicConnectionRecordKeyUpdate(c: var MsQuicConnection) =
+    c.keyUpdateCount = c.keyUpdateCount + 1
+
+fn msquicConnectionDestCidUpdateCount(c: MsQuicConnection): int32 =
+    return c.destCidUpdateCount
+
+fn msquicConnectionRecordDestCidUpdate(c: var MsQuicConnection) =
+    c.destCidUpdateCount = c.destCidUpdateCount + 1
+
+fn msquicConnectionSetIdealProcessor(c: var MsQuicConnection, value: int32) =
+    c.idealProcessor = value
+
+fn msquicConnectionIdealProcessor(c: MsQuicConnection): int32 =
+    c.idealProcessor
+
+fn msquicConnectionSetStreamSchedulingScheme(c: var MsQuicConnection, scheme: QUIC_STREAM_SCHEDULING_SCHEME) =
+    c.streamSchedulingScheme = scheme
+
+fn msquicConnectionStreamSchedulingScheme(c: MsQuicConnection): QUIC_STREAM_SCHEDULING_SCHEME =
+    c.streamSchedulingScheme
+
+fn msquicConnectionSetDatagramReceiveEnabled(c: var MsQuicConnection, enabled: bool) =
+    c.datagramReceiveEnabled = enabled
+
+fn msquicConnectionDatagramReceiveEnabled(c: MsQuicConnection): bool =
+    c.datagramReceiveEnabled
+
+fn msquicConnectionSetDatagramSendEnabled(c: var MsQuicConnection, enabled: bool) =
+    c.datagramSendEnabled = enabled
+
+fn msquicConnectionDatagramSendEnabled(c: MsQuicConnection): bool =
+    c.datagramSendEnabled
+
+fn msquicConnectionSetDisable1RttEncryption(c: var MsQuicConnection, enabled: bool) =
+    c.disable1RttEncryption = enabled
+
+fn msquicConnectionDisable1RttEncryption(c: MsQuicConnection): bool =
+    c.disable1RttEncryption
+
+fn msquicConnectionSetCloseReasonPhrase(c: var MsQuicConnection, phrase: str) =
+    c.closeReasonPhrase = phrase
+
+fn msquicConnectionCloseReasonPhrase(c: MsQuicConnection): str =
+    c.closeReasonPhrase
+
+fn msquicConnectionSetCloseErrorInfo(c: var MsQuicConnection, code: int64, frameType: int64, isApp: bool) =
+    c.closeErrorCode = code
+    c.closeFrameType = frameType
+    c.closeAppError = isApp
+
+fn msquicConnectionCloseErrorCode(c: MsQuicConnection): int64 =
+    c.closeErrorCode
+
+fn msquicConnectionCloseFrameType(c: MsQuicConnection): int64 =
+    c.closeFrameType
+
+fn msquicConnectionCloseIsApp(c: MsQuicConnection): bool =
+    c.closeAppError
+
+fn msquicConnectionShareUdpBinding(c: MsQuicConnection): bool =
+    return c.shareUdpBinding
+
+fn msquicConnectionSetShareUdpBinding(c: var MsQuicConnection, enabled: bool) =
+    c.shareUdpBinding = enabled
+    msquicConnectionTouch(c)
+
+fn msquicConnectionResumptionTicket(c: MsQuicConnection): Bytes =
+    return c.resumptionTicket
+
+fn msquicConnectionSetResumptionTicket(c: var MsQuicConnection, ticket: Bytes) =
+    c.resumptionTicket = ticket
+    msquicConnectionTouch(c)
+
+fn msquicConnectionResumptionPsk(c: MsQuicConnection): Bytes =
+    return c.resumptionPsk
+
+fn msquicConnectionResumptionPskCipher(c: MsQuicConnection): MsQuicCipherSuite =
+    return c.resumptionPskCipher
+
+fn msquicConnectionSetResumptionPsk(c: var MsQuicConnection, psk: Bytes, cipher: MsQuicCipherSuite) =
+    c.resumptionPsk = psk
+    c.resumptionPskCipher = cipher
+    msquicConnectionTouch(c)
+
+fn msquicConnectionResumptionTicketAgeAdd(c: MsQuicConnection): int64 =
+    return c.resumptionTicketAgeAdd
+
+fn msquicConnectionResumptionTicketLifetimeSec(c: MsQuicConnection): int64 =
+    return c.resumptionTicketLifetimeSec
+
+fn msquicConnectionResumptionTicketReceivedAtMs(c: MsQuicConnection): int64 =
+    return c.resumptionTicketReceivedAtMs
+
+fn msquicConnectionSetResumptionTicketMeta(c: var MsQuicConnection, lifetimeSec: int64, ageAdd: int64, receivedAtMs: int64) =
+    c.resumptionTicketLifetimeSec = lifetimeSec
+    c.resumptionTicketAgeAdd = ageAdd
+    c.resumptionTicketReceivedAtMs = receivedAtMs
+    msquicConnectionTouch(c)
+
+fn msquicConnectionPeerCertificateValid(c: MsQuicConnection): bool =
+    return c.peerCertificateValid
+
+fn msquicConnectionSetPeerCertificateValid(c: var MsQuicConnection, valid: bool) =
+    c.peerCertificateValid = valid
+    msquicConnectionTouch(c)
+
+fn msquicConnectionLocalInterface(c: MsQuicConnection): int32 =
+    return c.localInterface
+
+fn msquicConnectionSetLocalInterface(c: var MsQuicConnection, value: int32) =
+    c.localInterface = value
+    msquicConnectionTouch(c)
+
+fn msquicConnectionCibirId(c: MsQuicConnection): Bytes =
+    return c.cibirId
+
+fn msquicConnectionSetCibirId(c: var MsQuicConnection, value: Bytes) =
+    c.cibirId = value
+    msquicConnectionTouch(c)
+
+fn msquicConnectionOrigDestCid(c: MsQuicConnection): Bytes =
+    return c.origDestCid
+
+fn msquicConnectionSetOrigDestCid(c: var MsQuicConnection, value: Bytes) =
+    c.origDestCid = value
+    msquicConnectionTouch(c)
+
+fn msquicConnectionSendDscp(c: MsQuicConnection): int32 =
+    return c.sendDscp
+
+fn msquicConnectionSetSendDscp(c: var MsQuicConnection, value: int32) =
+    c.sendDscp = value
+    msquicConnectionTouch(c)
+
+fn msquicConnectionCloseAsync(c: MsQuicConnection): bool =
+    return c.closeAsync
+
+fn msquicConnectionSetCloseAsync(c: var MsQuicConnection, enabled: bool) =
+    c.closeAsync = enabled
+    msquicConnectionTouch(c)
+
+fn msquicConnectionTlsSecrets(c: MsQuicConnection): QUIC_TLS_SECRETS =
+    return c.tlsSecrets
+
+fn msquicConnectionSetTlsSecrets(c: var MsQuicConnection, secrets: QUIC_TLS_SECRETS) =
+    c.tlsSecrets = secrets
+    msquicConnectionTouch(c)
+
+fn msquicConnectionTlsHandshakeInfo(c: MsQuicConnection): QUIC_HANDSHAKE_INFO =
+    return c.tlsHandshakeInfo
+
+fn msquicConnectionSetTlsHandshakeInfo(c: var MsQuicConnection, info: QUIC_HANDSHAKE_INFO) =
+    c.tlsHandshakeInfo = info
+    msquicConnectionTouch(c)
+
+fn msquicConnectionTlsNegotiatedAlpn(c: MsQuicConnection): Bytes =
+    return c.tlsNegotiatedAlpn
+
+fn msquicConnectionSetTlsNegotiatedAlpn(c: var MsQuicConnection, alpn: Bytes) =
+    c.tlsNegotiatedAlpn = alpn
+    msquicConnectionTouch(c)
+
+fn msquicConnectionVersionSettings(c: MsQuicConnection): QUIC_VERSION_SETTINGS =
+    return c.versionSettings
+
+fn msquicConnectionSetVersionSettings(c: var MsQuicConnection, settings: QUIC_VERSION_SETTINGS) =
+    c.versionSettings = settings
+    msquicConnectionTouch(c)

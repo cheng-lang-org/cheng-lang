@@ -1,0 +1,48 @@
+# OpenSSL QUIC transport smoke test(manual, alias to MsQuic).
+
+import std/result
+import std/strings
+import cheng/quic/multiaddress
+import std/net/stream/connection
+import cheng/quic/msquictransport
+import cheng/quic/tests/msquic_test_pki
+fn runOpenSslQuicTransportSmoke(): Result[bool] =
+    var t: MsQuicTransport = initMsQuicTransport()
+    let addrRes: Result[MultiAddress] = parseMultiAddress("/ip4/127.0.0.1/udp/4004/quic-v1/tls")
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    let addr: MultiAddress = Value(addrRes)
+    if ! handles(t, addr):
+        return Err[bool]("smoke: msquic should handle /quic-v1/tls")
+    let tlsRes: Result[bool] = msquicTestConfigureTransportTls(t)
+    if IsErr(tlsRes):
+        return Err[bool](Error(tlsRes))
+    start(t, addr)
+    let dialRes: Result[Connection] = dial(t, addr)
+    if IsErr(dialRes):
+        return Err[bool](Error(dialRes))
+    let outbound: Connection = Value(dialRes)
+    if direction(outbound) != Outbound:
+        return Err[bool]("smoke: quic-v1/tls alias outbound direction mismatch")
+    if ! isOpen(outbound):
+        return Err[bool]("smoke: quic-v1/tls alias outbound ! open")
+    let acceptRes: Result[Connection] = accept(t)
+    if IsErr(acceptRes):
+        return Err[bool](Error(acceptRes))
+    let inbound: Connection = Value(acceptRes)
+    if direction(inbound) != Inbound:
+        return Err[bool]("smoke: quic-v1/tls alias inbound direction mismatch")
+    if ! isOpen(inbound):
+        return Err[bool]("smoke: quic-v1/tls alias inbound ! open")
+    let localText: str = toString(localAddress(outbound))
+    let remoteText: str = toString(remoteAddress(outbound))
+    if ! strContains(localText, "/quic-v1"):
+        return Err[bool]("smoke: quic-v1/tls alias local addr missing quic-v1")
+    if ! strContains(remoteText, "/quic-v1"):
+        return Err[bool]("smoke: quic-v1/tls alias remote addr missing quic-v1")
+    if ! strContains(localText, "/tls"):
+        return Err[bool]("smoke: quic-v1/tls alias local addr missing tls")
+    if ! strContains(remoteText, "/tls"):
+        return Err[bool]("smoke: quic-v1/tls alias remote addr missing tls")
+    stop(t)
+    return Ok[bool](true)

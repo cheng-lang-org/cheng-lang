@@ -44,9 +44,14 @@ COMPILER_CORE_SYSTEM_LINK_EXPECTED := $(ROOT_DIR)/tests/contracts/compiler_core_
 COMPILER_CORE_SYSTEM_LINK_EXEC_STDOUT := $(OUT_DIR)/compiler_core_system_link_exec.stdout
 COMPILER_CORE_SYSTEM_LINK_EXEC_FILE := $(OUT_DIR)/compiler_core_system_link_exec.txt
 COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY := $(OUT_DIR)/compiler_core_system_link_exec
+COMPILER_CORE_SYSTEM_LINK_EXEC_ALIAS := $(OUT_DIR)/cheng_v2_system_link_exec
 COMPILER_CORE_SYSTEM_LINK_EXEC_EXPECTED := $(ROOT_DIR)/tests/contracts/compiler_core_system_link_exec.expected
 COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE := $(OUT_DIR)/compiler_core_system_link_exec.smoke
 COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE_EXPECTED := $(ROOT_DIR)/tests/contracts/compiler_core_system_link_exec_smoke.expected
+TAIJI_SEED_STAGE0_DIR := $(OUT_DIR)/taiji_seed_stage0
+TAIJI_SEED_STAGE3_DIR := $(OUT_DIR)/taiji_seed_stage3
+TAIJI_SEED_STAGE0_SHA := $(OUT_DIR)/taiji_seed_stage0.sha256
+TAIJI_SEED_STAGE3_SHA := $(OUT_DIR)/taiji_seed_stage3.sha256
 NETWORK_SELFHOST_OUT := $(OUT_DIR)/network_selfhost.out
 NETWORK_SELFHOST_EXPECTED := $(ROOT_DIR)/tests/contracts/network_selfhost.expected
 TOOLING_SELFHOST_OUT := $(OUT_DIR)/tooling_selfhost.out
@@ -127,11 +132,21 @@ compiler-core-system-link-exec: $(BOOTSTRAP_OUT) $(COMPILER_OUT)
 	"$(COMPILER_OUT)" system-link-exec --in "$(COMPILER_CORE_SOURCE)" --emit exe --target arm64-apple-darwin --out "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY)" --report-out "$(COMPILER_CORE_SYSTEM_LINK_EXEC_FILE)" > "$(COMPILER_CORE_SYSTEM_LINK_EXEC_STDOUT)"
 	cmp -s "$(COMPILER_CORE_SYSTEM_LINK_EXEC_EXPECTED)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_STDOUT)" || { echo "compiler-core-system-link-exec mismatch: system-link-exec stdout" 1>&2; exit 1; }
 	cmp -s "$(COMPILER_CORE_SYSTEM_LINK_EXEC_EXPECTED)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_FILE)" || { echo "compiler-core-system-link-exec mismatch: system-link-exec file" 1>&2; exit 1; }
+	cp -f "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_ALIAS)"
 	{ "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY)" status > "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)" 2>&1; rc=$$?; printf "status_rc=%d\n" "$$rc" >> "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)"; test "$$rc" -eq 0; }
 	{ "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY)" release-compile --in "$(TOOLING_SOURCE)" --emit exe --target arm64-apple-darwin >> "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)" 2>&1; rc=$$?; printf "release_compile_rc=%d\n" "$$rc" >> "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)"; test "$$rc" -eq 0; }
 	{ "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY)" lsmr-address --cid "$(LSMR_ADDRESS_CID)" --depth "$(LSMR_DEPTH)" >> "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)" 2>&1; rc=$$?; printf "lsmr_address_rc=%d\n" "$$rc" >> "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)"; test "$$rc" -eq 0; }
 	cmp -s "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE_EXPECTED)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)" || { echo "compiler-core-system-link-exec mismatch: native launch smoke" 1>&2; exit 1; }
 	! rg -q "compiler_core_replay_ok|runtime/compiler_core.command_dispatch|native_tooling_dispatch|external_cc_obj" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)" || { echo "compiler-core-system-link-exec mismatch: legacy compiler_core dispatch text present" 1>&2; exit 1; }
+	{ "$(COMPILER_CORE_SYSTEM_LINK_EXEC_ALIAS)" trace-phase-space > /dev/null 2>&1; rc=$$?; test "$$rc" -eq 0; }
+	{ "$(COMPILER_CORE_SYSTEM_LINK_EXEC_ALIAS)" emit-proof-obligations > /dev/null 2>&1; rc=$$?; test "$$rc" -eq 0; }
+	{ "$(COMPILER_CORE_SYSTEM_LINK_EXEC_ALIAS)" taiji-seed-set > /dev/null 2>&1; rc=$$?; test "$$rc" -eq 0; }
+	rm -rf "$(TAIJI_SEED_STAGE0_DIR)" "$(TAIJI_SEED_STAGE3_DIR)"
+	"$(COMPILER_OUT)" taiji-seed-set --out-dir "$(TAIJI_SEED_STAGE0_DIR)" > /dev/null
+	"$(COMPILER_CORE_SYSTEM_LINK_EXEC_ALIAS)" taiji-seed-set --out-dir "$(TAIJI_SEED_STAGE3_DIR)" > /dev/null
+	{ cd "$(TAIJI_SEED_STAGE0_DIR)" && find . -type f | LC_ALL=C sort | while read f; do shasum -a 256 "$$f"; done; } > "$(TAIJI_SEED_STAGE0_SHA)"
+	{ cd "$(TAIJI_SEED_STAGE3_DIR)" && find . -type f | LC_ALL=C sort | while read f; do shasum -a 256 "$$f"; done; } > "$(TAIJI_SEED_STAGE3_SHA)"
+	cmp -s "$(TAIJI_SEED_STAGE0_SHA)" "$(TAIJI_SEED_STAGE3_SHA)" || { echo "compiler-core-system-link-exec mismatch: taiji-seed-set stage0/stage3 output" 1>&2; exit 1; }
 	"$(BOOTSTRAP_OUT)" check-tree "$(ROOT_DIR)"
 	"$(BOOTSTRAP_OUT)" manifest "$(ROOT_DIR)"
 
@@ -148,4 +163,5 @@ full-selfhost: $(BOOTSTRAP_OUT) $(COMPILER_OUT)
 	"$(BOOTSTRAP_OUT)" manifest "$(ROOT_DIR)"
 
 clean:
-	rm -f "$(BOOTSTRAP_OUT)" "$(COMPILER_OUT)" "$(SELFHOST_STAGE1)" "$(SELFHOST_STAGE1_C)" "$(SELFHOST_STAGE1_EXEC)" "$(SELFHOST_STAGE1_OUT)" "$(TOOLING_STAGE1)" "$(TOOLING_SOURCE_MANIFEST_STDOUT)" "$(TOOLING_SOURCE_MANIFEST_FILE)" "$(TOOLING_RULE_PACK_STDOUT)" "$(TOOLING_RULE_PACK_FILE)" "$(TOOLING_COMPILER_RULE_PACK_STDOUT)" "$(TOOLING_COMPILER_RULE_PACK_FILE)" "$(TOOLING_RELEASE_STDOUT)" "$(TOOLING_RELEASE_FILE)" "$(LSMR_ADDRESS_STDOUT)" "$(LSMR_ROUTE_PLAN_STDOUT)" "$(OBJ_FILE_STDOUT)" "$(COMPILER_CORE_RELEASE_STDOUT)" "$(COMPILER_CORE_RELEASE_FILE)" "$(COMPILER_CORE_SYSTEM_LINK_STDOUT)" "$(COMPILER_CORE_SYSTEM_LINK_FILE)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_STDOUT)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_FILE)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY).primary.o" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY).provider.0.o" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY).provider.1.o" "$(NETWORK_SELFHOST_OUT)" "$(TOOLING_SELFHOST_OUT)" "$(FULL_SELFHOST_STDOUT)"
+	rm -f "$(BOOTSTRAP_OUT)" "$(COMPILER_OUT)" "$(SELFHOST_STAGE1)" "$(SELFHOST_STAGE1_C)" "$(SELFHOST_STAGE1_EXEC)" "$(SELFHOST_STAGE1_OUT)" "$(TOOLING_STAGE1)" "$(TOOLING_SOURCE_MANIFEST_STDOUT)" "$(TOOLING_SOURCE_MANIFEST_FILE)" "$(TOOLING_RULE_PACK_STDOUT)" "$(TOOLING_RULE_PACK_FILE)" "$(TOOLING_COMPILER_RULE_PACK_STDOUT)" "$(TOOLING_COMPILER_RULE_PACK_FILE)" "$(TOOLING_RELEASE_STDOUT)" "$(TOOLING_RELEASE_FILE)" "$(LSMR_ADDRESS_STDOUT)" "$(LSMR_ROUTE_PLAN_STDOUT)" "$(OBJ_FILE_STDOUT)" "$(COMPILER_CORE_RELEASE_STDOUT)" "$(COMPILER_CORE_RELEASE_FILE)" "$(COMPILER_CORE_SYSTEM_LINK_STDOUT)" "$(COMPILER_CORE_SYSTEM_LINK_FILE)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_STDOUT)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_FILE)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_SMOKE)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_ALIAS)" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY).primary.o" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY).provider.0.o" "$(COMPILER_CORE_SYSTEM_LINK_EXEC_BINARY).provider.1.o" "$(TAIJI_SEED_STAGE0_SHA)" "$(TAIJI_SEED_STAGE3_SHA)" "$(NETWORK_SELFHOST_OUT)" "$(TOOLING_SELFHOST_OUT)" "$(FULL_SELFHOST_STDOUT)"
+	rm -rf "$(TAIJI_SEED_STAGE0_DIR)" "$(TAIJI_SEED_STAGE3_DIR)"

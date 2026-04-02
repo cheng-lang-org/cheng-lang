@@ -1,0 +1,88 @@
+# MsQuic native UDP datapath smoke (bind/send/recv + nonblocking empty).
+
+import std/result
+import std/rawbytes
+import std/strings
+import cheng/quic/multiaddress
+import cheng/quic/connection
+import cheng/quic/msquictransport
+
+fn isQueueEmpty(errText: str): bool =
+    return strContains(errText, "queue empty")
+
+fn datagramReadRetry(t: var MsQuicTransport, conn: var Connection, retries: int32): Result[Bytes] =
+    var attempts: int32 = retries
+    if attempts <= 0:
+        attempts = 1
+    for i in 0..<attempts:
+        let readRes: Result[Bytes] = msquicTransportDatagramRead(t, conn)
+        if IsOk(readRes):
+            return readRes
+        if !isQueueEmpty(Error(readRes)):
+            return readRes
+    return Err[Bytes]("msquic udp: queue empty")
+
+fn runSmoke(): Result[bool] =
+    let addr: MultiAddress = makeInprocMultiAddress(quicAddrKindMsQuic, 0)
+
+    var transport: MsQuicTransport = initMsQuicTransport()
+    var settings: MsQuicSettings = msquicTransportSettings(transport)
+    settings.allowDatagram = true
+    settings.maxDatagram = 1400
+    let setRes: Result[bool] = setMsQuicTransportSettings(transport, settings)
+    if IsErr(setRes):
+        return Err[bool]("smoke: settings: " + Error(setRes))
+
+    start(transport, addr)
+    if !transport.running:
+        return Err[bool]("smoke: start failed")
+
+    let dialRes: Result[Connection] = dial(transport, addr)
+    if IsErr(dialRes):
+        return Err[bool]("smoke: dial: " + Error(dialRes))
+    let acceptRes: Result[Connection] = accept(transport)
+    if IsErr(acceptRes):
+        return Err[bool]("smoke: accept: " + Error(acceptRes))
+
+    var outConn: Connection = Value(dialRes)
+    var inConn: Connection = Value(acceptRes)
+
+    let emptyRes: Result[Bytes] = msquicTransportDatagramRead(transport, inConn)
+    if IsOk(emptyRes) || !isQueueEmpty(Error(emptyRes)):
+        return Err[bool]("smoke: queue empty contract mismatch")
+
+    var payload: Bytes = bytesAlloc(1200)
+    for i in 0..<10000:
+        bytesSet(payload, 0, i & 255)
+        bytesSet(payload, 1, (i >> 8) & 255)
+        bytesSet(payload, 1198, 0x72)
+        bytesSet(payload, 1199, 0x73)
+
+        let writeRes: Result[int32] = msquicTransportDatagramWrite(transport, outConn, payload)
+        if IsErr(writeRes):
+            return Err[bool]("smoke: datagram write: " + Error(writeRes))
+
+        let readRes: Result[Bytes] = datagramReadRetry(transport, inConn, 256)
+        if IsErr(readRes):
+            return Err[bool]("smoke: datagram read: " + Error(readRes))
+
+        let got: Bytes = Value(readRes)
+        if bytesLen(got) != bytesLen(payload):
+            return Err[bool]("smoke: payload size mismatch")
+        if bytesGet(got, 0) != (i & 255) || bytesGet(got, 1) != ((i >> 8) & 255):
+            return Err[bool]("smoke: payload marker mismatch")
+
+    let emptyTailRes: Result[Bytes] = msquicTransportDatagramRead(transport, inConn)
+    if IsOk(emptyTailRes) || !isQueueEmpty(Error(emptyTailRes)):
+        return Err[bool]("smoke: nonblocking queue-empty mismatch")
+
+    stop(transport)
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let res: Result[bool] = runSmoke()
+    if IsErr(res):
+        echo("msquic udp native smoke failed: " + Error(res))
+        return 1
+    echo("msquic udp native smoke ok")
+    return 0

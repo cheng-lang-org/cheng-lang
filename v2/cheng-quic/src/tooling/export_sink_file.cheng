@@ -1,0 +1,243 @@
+# Export sink file handler (no-pointer virtual file sink + rotation/redaction).
+
+import std/strings
+import std/times
+import std/buffer
+import cheng/quic/tooling/export_sink
+
+const
+    maxExportSinkVirtualFiles = 32
+
+type
+    ExportSinkVirtualFile =
+        path: str
+        content: str
+
+var
+    exportSinkVirtualFiles: ExportSinkVirtualFile[maxExportSinkVirtualFiles]
+    exportSinkVirtualFileCount: int32 = 0
+
+    exportSinkFilePath: str
+    exportSinkFileAppend: bool
+    exportSinkFileMaxBytes: int64
+    exportSinkFileBytesWritten: int64
+    exportSinkFileMinIntervalMs: int64
+    exportSinkFileLastWriteMs: int64
+    exportSinkFileRotateMaxFiles: int32
+    exportSinkFileRotateIndex: int32
+    exportSinkFileRedact: bool
+
+fn exportSinkFileFind(path: str): int32 =
+    for i in 0..<exportSinkVirtualFileCount:
+        if streq(exportSinkVirtualFiles[i].path, path):
+            return i
+    return -1
+
+fn exportSinkFileStore(path: str, payload: str, append: bool): bool =
+    if len(path) <= 0:
+        return false
+    let idx: int32 = exportSinkFileFind(path)
+    if idx >= 0:
+        if append:
+            exportSinkVirtualFiles[idx].content = exportSinkVirtualFiles[idx].content + payload
+        else:
+            exportSinkVirtualFiles[idx].content = payload
+        return true
+    if exportSinkVirtualFileCount >= maxExportSinkVirtualFiles:
+        return false
+    exportSinkVirtualFiles[exportSinkVirtualFileCount].path = path
+    exportSinkVirtualFiles[exportSinkVirtualFileCount].content = payload
+    exportSinkVirtualFileCount = exportSinkVirtualFileCount + 1
+    return true
+
+fn exportSinkFileIntToString(value: int64): str =
+    if value == 0:
+        return "0"
+    var v: int64 = value
+    var neg: bool = false
+    if v < 0:
+        neg = true
+        v = -v
+    var buf: ByteBuffer = newByteBuffer()
+    while v > 0:
+        let digit: int64 = v % 10
+        appendByte(buf, int32('0') + int32(digit))
+        v = v / 10
+    let rev: Bytes = toBytes(buf)
+    let extra: int32 = if neg: 1 else: 0
+    let out: Bytes = bytesAlloc(bytesLen(rev) + extra)
+    var i: int32 = 0
+    if neg:
+        bytesSet(out, 0, int32('-'))
+        i = 1
+    for j in 0..<bytesLen(rev):
+        let srcIdx: int32 = bytesLen(rev) - 1 - j
+        bytesSet(out, i + j, bytesGet(rev, srcIdx))
+    return bytesToString(out)
+
+fn exportSinkFileCurrentPath(): str =
+    if len(exportSinkFilePath) <= 0:
+        return ""
+    if exportSinkFileRotateMaxFiles <= 1:
+        return exportSinkFilePath
+    if exportSinkFileRotateIndex <= 0:
+        return exportSinkFilePath
+    return exportSinkFilePath + "." + exportSinkFileIntToString(int64(exportSinkFileRotateIndex))
+
+fn exportSinkFileIsSpace(ch: char): bool =
+    return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'
+
+fn exportSinkFileMatchKey(payload: str, start: int32, key: str): bool =
+    let klen: int32 = len(key)
+    if klen <= 0:
+        return false
+    if start < 0 || start + klen > len(payload):
+        return false
+    for i in 0..<klen:
+        if payload[start + i] != key[i]:
+            return false
+    return true
+
+fn exportSinkFileIsEscaped(payload: str, idx: int32): bool =
+    if idx <= 0:
+        return false
+    var backslashes: int32 = 0
+    var i: int32 = idx - 1
+    while i >= 0 && payload[i] == '\\':
+        backslashes = backslashes + 1
+        i = i - 1
+    return (backslashes % 2) == 1
+
+fn exportSinkFileRedactKeyCount(): int32 =
+    return 11
+
+fn exportSinkFileRedactKeyAt(idx: int32): str =
+    if idx == 0: return "token"
+    if idx == 1: return "ticket"
+    if idx == 2: return "psk"
+    if idx == 3: return "secret"
+    if idx == 4: return "key"
+    if idx == 5: return "cert"
+    if idx == 6: return "certificate"
+    if idx == 7: return "hostname"
+    if idx == 8: return "address"
+    if idx == 9: return "addr"
+    if idx == 10: return "ip"
+    return ""
+
+fn exportSinkFileRedactPayload(payload: str): str =
+    let total: int32 = len(payload)
+    if total <= 0:
+        return payload
+    var out: ByteBuffer = newByteBuffer()
+    var last: int32 = 0
+    var i: int32 = 0
+    while i < total:
+        if payload[i] == '"' && ! exportSinkFileIsEscaped(payload, i):
+            var keyMatch: str = ""
+            for keyIdx in 0..<exportSinkFileRedactKeyCount():
+                let candidate: str = exportSinkFileRedactKeyAt(keyIdx)
+                if exportSinkFileMatchKey(payload, i + 1, candidate):
+                    let endIdx: int32 = i + 1 + len(candidate)
+                    if endIdx < total && payload[endIdx] == '"':
+                        keyMatch = candidate
+                        break
+            if len(keyMatch) > 0:
+                var j: int32 = i + 1 + len(keyMatch) + 1
+                while j < total && exportSinkFileIsSpace(payload[j]):
+                    j = j + 1
+                if j < total && payload[j] == ':':
+                    j = j + 1
+                    while j < total && exportSinkFileIsSpace(payload[j]):
+                        j = j + 1
+                    if j < total && payload[j] == '"':
+                        var k: int32 = j + 1
+                        var escaped: bool = false
+                        while k < total:
+                            let c: char = payload[k]
+                            if escaped:
+                                escaped = false
+                            else:
+                                if c == '\\':
+                                    escaped = true
+                                elif c == '"':
+                                    break
+                            k = k + 1
+                        if k < total && payload[k] == '"':
+                            if j + 1 > last:
+                                appendBytes(out, sliceBytes(payload, last, j + 1 - last))
+                            appendBytes(out, "REDACTED")
+                            appendByte(out, int32('"'))
+                            last = k + 1
+                            i = last
+                            continue
+        i = i + 1
+    if last < total:
+        appendBytes(out, sliceBytes(payload, last, total - last))
+    return bytesToString(toBytes(out))
+
+fn exportSinkFileWrite(path: str, payload: str, append: bool): bool =
+    return exportSinkFileStore(path, payload, append)
+
+fn exportSinkFileHandler(kind: str, payload: str) =
+    if len(exportSinkFilePath) <= 0:
+        return
+    let nowMs: int64 = epochTimeNs() / 1000000
+    if exportSinkFileMinIntervalMs > 0 && exportSinkFileLastWriteMs > 0:
+        if nowMs - exportSinkFileLastWriteMs < exportSinkFileMinIntervalMs:
+            return
+
+    var safePayload: str = payload
+    if exportSinkFileRedact:
+        safePayload = exportSinkFileRedactPayload(payload)
+
+    let line: str = kind + ":" + safePayload + "\n"
+    var appendNow: bool = exportSinkFileAppend
+    if exportSinkFileMaxBytes > 0:
+        let nextBytes: int64 = exportSinkFileBytesWritten + int64(len(line))
+        if nextBytes > exportSinkFileMaxBytes:
+            appendNow = false
+            exportSinkFileBytesWritten = 0
+            if exportSinkFileRotateMaxFiles > 1:
+                exportSinkFileRotateIndex = exportSinkFileRotateIndex + 1
+                if exportSinkFileRotateIndex >= exportSinkFileRotateMaxFiles:
+                    exportSinkFileRotateIndex = 0
+
+    let pathNow: str = exportSinkFileCurrentPath()
+    if len(pathNow) <= 0:
+        return
+
+    let wrote: bool = exportSinkFileWrite(pathNow, line, appendNow)
+    if wrote:
+        exportSinkFileBytesWritten = exportSinkFileBytesWritten + int64(len(line))
+        exportSinkFileLastWriteMs = nowMs
+
+fn exportSinkEnableFileWithPolicy(path: str, append: bool, maxBytes: int64, minIntervalMs: int64, rotateMaxFiles: int32, redact: bool) =
+    exportSinkFilePath = path
+    exportSinkFileAppend = append
+    exportSinkFileMaxBytes = if maxBytes > 0: maxBytes else: 0
+    exportSinkFileBytesWritten = 0
+    exportSinkFileMinIntervalMs = if minIntervalMs > 0: minIntervalMs else: 0
+    exportSinkFileLastWriteMs = 0
+    exportSinkFileRotateMaxFiles = if rotateMaxFiles > 1: rotateMaxFiles else: 0
+    exportSinkFileRotateIndex = 0
+    exportSinkFileRedact = redact
+    exportSinkAddHandler(exportSinkFileHandler)
+
+fn exportSinkEnableFileWithLimits(path: str, append: bool, maxBytes: int64, minIntervalMs: int64) =
+    exportSinkEnableFileWithPolicy(path, append, maxBytes, minIntervalMs, 0, false)
+
+fn exportSinkEnableFile(path: str, append: bool) =
+    exportSinkEnableFileWithLimits(path, append, 0, 0)
+
+fn exportSinkDisableFile() =
+    exportSinkFilePath = ""
+    exportSinkFileAppend = false
+    exportSinkFileMaxBytes = 0
+    exportSinkFileBytesWritten = 0
+    exportSinkFileMinIntervalMs = 0
+    exportSinkFileLastWriteMs = 0
+    exportSinkFileRotateMaxFiles = 0
+    exportSinkFileRotateIndex = 0
+    exportSinkFileRedact = false
+    exportSinkRemoveHandler(exportSinkFileHandler)

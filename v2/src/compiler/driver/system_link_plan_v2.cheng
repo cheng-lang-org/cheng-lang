@@ -8,6 +8,17 @@ import compiler/machine/machine_pipeline_v2 as mpipeline
 import compiler/obj/obj_file_v2 as ofile
 
 type
+    SystemLinkProviderBundle =
+        modulePath: str
+        sourcePath: str
+        sourceKind: str
+        compileMode: str
+        manifestCid: str
+        executionModel: str
+        traceSymbol: str
+        runtimeSymbols: str[]
+        objFileCid: str
+        objFileByteCount: int32
     SystemLinkPlanBundle =
         version: str
         moduleKind: str
@@ -20,17 +31,7 @@ type
         outputSuffix: str
         primaryObjFileCid: str
         primaryObjFileByteCount: int32
-        providerModules: str[]
-        providerSourcePaths: str[]
-        providerSourceKinds: str[]
-        providerCompileModes: str[]
-        providerManifestCids: str[]
-        providerExecutionModels: str[]
-        providerTraceSymbols: str[]
-        providerSymbolCounts: int32[]
-        providerSymbolsFlat: str[]
-        providerObjFileCids: str[]
-        providerObjFileByteCounts: int32[]
+        providers: SystemLinkProviderBundle[]
         entryRequired: bool
         entrySymbol: str
         entryPresent: bool
@@ -81,7 +82,6 @@ fn systemLinkOutputName(moduleKind: str, emitKind: str): str =
 fn resolveEntrySymbol(machineBundle: mpipeline.MachineModuleBundle,
                       emitKind: str,
                       itemIds: int32[],
-                      opNames: str[],
                       labels: str[]): str =
     if emitKind == "exe" &&
        machineBundle.moduleKind == "compiler_core" &&
@@ -96,15 +96,12 @@ fn resolveEntrySymbol(machineBundle: mpipeline.MachineModuleBundle,
                 return machineBundle.symbolNames[i]
     for i in 0..<labels.len:
         if labels[i] == "main":
-            return mpipeline.machineFunctionSymbolName(machineBundle.targetTriple,
-                                                       machineBundle.moduleKind,
-                                                       opNames[i],
-                                                       itemIds[i])
-    if machineBundle.moduleKind == "compiler_core" && itemIds.len > 0:
-        return mpipeline.machineFunctionSymbolName(machineBundle.targetTriple,
-                                                   machineBundle.moduleKind,
-                                                   opNames[0],
-                                                   itemIds[0])
+            let entryIdx = mpipeline.machineFunctionIndexByItemId(machineBundle, itemIds[i])
+            if entryIdx < 0:
+                panic("v2 system link plan: entry item missing from machine bundle")
+            return machineBundle.symbolNames[entryIdx]
+    if machineBundle.moduleKind == "compiler_core":
+        panic("v2 system link plan: compiler_core entry symbol is not resolved")
     return ""
 
 fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
@@ -112,9 +109,10 @@ fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
                        emitKind: str,
                        providerModules: str[],
                        itemIds: int32[],
-                       opNames: str[],
-                       labels: str[]): SystemLinkPlanBundle =
+                       labels: str[],
+                       programSourcePath: str): SystemLinkPlanBundle =
     var out: SystemLinkPlanBundle
+    var provider: SystemLinkProviderBundle
     out.version = systemLinkPlanVersion()
     out.moduleKind = machineBundle.moduleKind
     out.emitKind = emitKind
@@ -126,37 +124,27 @@ fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
     out.outputSuffix = systemLinkOutputSuffix(machineBundle.targetTriple, emitKind)
     out.primaryObjFileCid = objFile.fileCid
     out.primaryObjFileByteCount = objFile.fileByteCount
-    out.providerModules = []
-    out.providerSourcePaths = []
-    out.providerSourceKinds = []
-    out.providerCompileModes = []
-    out.providerManifestCids = []
-    out.providerExecutionModels = []
-    out.providerTraceSymbols = []
-    out.providerSymbolCounts = []
-    out.providerSymbolsFlat = []
-    out.providerObjFileCids = []
-    out.providerObjFileByteCounts = []
-    for i in 0..<providerModules.len:
-        add(out.providerModules, providerModules[i])
-    let providerObjects = rpobj.materializeRuntimeProviderObjects(out.providerModules, machineBundle.targetTriple)
+    out.providers = []
+    let providerObjects = rpobj.materializeRuntimeProviderObjectsForProgram(providerModules,
+                                                                            machineBundle.targetTriple,
+                                                                            programSourcePath,
+                                                                            machineBundle)
     for i in 0..<providerObjects.len:
-        add(out.providerSourcePaths, providerObjects[i].sourcePath)
-        add(out.providerSourceKinds, providerObjects[i].sourceKind)
-        add(out.providerCompileModes, providerObjects[i].compileMode)
-        add(out.providerManifestCids, providerObjects[i].sourceManifestCid)
-        add(out.providerExecutionModels, providerObjects[i].executionModel)
-        add(out.providerTraceSymbols, providerObjects[i].traceSymbol)
-        add(out.providerSymbolCounts, providerObjects[i].runtimeSymbols.len)
-        for j in 0..<providerObjects[i].runtimeSymbols.len:
-            add(out.providerSymbolsFlat, providerObjects[i].runtimeSymbols[j])
-        add(out.providerObjFileCids, providerObjects[i].objFileCid)
-        add(out.providerObjFileByteCounts, providerObjects[i].objFileByteCount)
+        provider.modulePath = providerModules[i]
+        provider.sourcePath = providerObjects[i].sourcePath
+        provider.sourceKind = providerObjects[i].sourceKind
+        provider.compileMode = providerObjects[i].compileMode
+        provider.manifestCid = providerObjects[i].sourceManifestCid
+        provider.executionModel = providerObjects[i].executionModel
+        provider.traceSymbol = providerObjects[i].traceSymbol
+        provider.runtimeSymbols = providerObjects[i].runtimeSymbols
+        provider.objFileCid = providerObjects[i].objFileCid
+        provider.objFileByteCount = providerObjects[i].objFileByteCount
+        add(out.providers, provider)
     out.entryRequired = emitKind == "exe"
     out.entrySymbol = resolveEntrySymbol(machineBundle,
                                          emitKind,
                                          itemIds,
-                                         opNames,
                                          labels)
     out.entryPresent = len(out.entrySymbol) > 0
     out.missingReasons = []
@@ -176,24 +164,22 @@ fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
     add(lines, "output_suffix=" + out.outputSuffix)
     add(lines, "primary_obj_file_cid=" + out.primaryObjFileCid)
     add(lines, "primary_obj_file_byte_count=" + intToStr(out.primaryObjFileByteCount))
-    add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
-    var providerSymbolIdx: int32 = 0
-    for i in 0..<out.providerModules.len:
-        add(lines, "provider_module." + intToStr(i) + ".name=" + out.providerModules[i])
-        add(lines, "provider_module." + intToStr(i) + ".source_path=" + out.providerSourcePaths[i])
-        add(lines, "provider_module." + intToStr(i) + ".source_kind=" + out.providerSourceKinds[i])
-        add(lines, "provider_module." + intToStr(i) + ".compile_mode=" + out.providerCompileModes[i])
-        add(lines, "provider_module." + intToStr(i) + ".manifest_cid=" + out.providerManifestCids[i])
-        add(lines, "provider_module." + intToStr(i) + ".execution_model=" + out.providerExecutionModels[i])
-        add(lines, "provider_module." + intToStr(i) + ".trace_symbol=" + out.providerTraceSymbols[i])
-        add(lines, "provider_module." + intToStr(i) + ".provider_symbol_count=" + intToStr(out.providerSymbolCounts[i]))
-        for j in 0..<out.providerSymbolCounts[i]:
+    add(lines, "provider_module_count=" + intToStr(out.providers.len))
+    for i in 0..<out.providers.len:
+        add(lines, "provider_module." + intToStr(i) + ".name=" + out.providers[i].modulePath)
+        add(lines, "provider_module." + intToStr(i) + ".source_path=" + out.providers[i].sourcePath)
+        add(lines, "provider_module." + intToStr(i) + ".source_kind=" + out.providers[i].sourceKind)
+        add(lines, "provider_module." + intToStr(i) + ".compile_mode=" + out.providers[i].compileMode)
+        add(lines, "provider_module." + intToStr(i) + ".manifest_cid=" + out.providers[i].manifestCid)
+        add(lines, "provider_module." + intToStr(i) + ".execution_model=" + out.providers[i].executionModel)
+        add(lines, "provider_module." + intToStr(i) + ".trace_symbol=" + out.providers[i].traceSymbol)
+        add(lines, "provider_module." + intToStr(i) + ".provider_symbol_count=" + intToStr(out.providers[i].runtimeSymbols.len))
+        for j in 0..<out.providers[i].runtimeSymbols.len:
             add(lines,
                 "provider_module." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
-                out.providerSymbolsFlat[providerSymbolIdx])
-            providerSymbolIdx = providerSymbolIdx + 1
-        add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providerObjFileCids[i])
-        add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providerObjFileByteCounts[i]))
+                out.providers[i].runtimeSymbols[j])
+        add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providers[i].objFileCid)
+        add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providers[i].objFileByteCount))
         add(lines, "provider_module." + intToStr(i) + ".object_materialized=1")
     add(lines, "entry_required=" + if out.entryRequired: "1" else: "0")
     add(lines, "entry_symbol=" + out.entrySymbol)

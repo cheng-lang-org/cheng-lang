@@ -1,0 +1,74 @@
+# NewReno simulation helper.
+
+import cheng/quic/congestion/common
+import cheng/quic/congestion/newreno_model
+const
+    maxSimulationSteps = 256
+
+type
+    SimulationStep =
+        ackedBytes: int64
+        lostBytes: int64
+
+    SimulationPattern =
+        count: int32
+        steps: SimulationStep[maxSimulationSteps]
+
+    SimulationResult =
+        count: int32
+        cwnds: int64[maxSimulationSteps]
+
+fn initSimulationPattern(): SimulationPattern =
+    SimulationPattern(count: 0)
+
+fn simulationAddStep(
+    pattern: var SimulationPattern,
+    ackedBytes: int64,
+    lostBytes: int64
+): bool =
+    if pattern.count >= maxSimulationSteps:
+        return false
+    pattern.steps[pattern.count] = SimulationStep(ackedBytes: ackedBytes, lostBytes: lostBytes)
+    pattern.count = pattern.count + 1
+    return true
+
+fn simulateNewReno(datagramSize: int32, pattern: SimulationPattern): SimulationResult =
+    var model: NewRenoModel = newRenoInit(datagramSize, quicInitialWindowPackets, 2)
+    var totalAcked: int64 = 0
+    var largestPacket: int64 = 0
+    var out: SimulationResult = SimulationResult(count: 0)
+    for i in 0..<pattern.count:
+        let step: SimulationStep = pattern.steps[i]
+        if step.ackedBytes > 0:
+            newRenoOnPacketSent(model, step.ackedBytes)
+            largestPacket = largestPacket + 1
+            totalAcked = totalAcked + step.ackedBytes
+            let ack: AckEventSnapshot = AckEventSnapshot(
+                timeNow: largestPacket * 1000,
+                largestAck: largestPacket,
+                largestSentPacketNumber: largestPacket,
+                totalAckedRetransmittableBytes: totalAcked,
+                ackedRetransmittableBytes: step.ackedBytes,
+                smoothedRtt: 1000,
+                minRtt: 1000,
+                oneWayDelay: 0,
+                adjustedAckTime: largestPacket * 1000,
+                implicitAck: false,
+                hasLoss: false,
+                largestAckAppLimited: false,
+                minRttValid: true
+            )
+            newRenoOnDataAcked(model, ack)
+        if step.lostBytes > 0:
+            newRenoOnPacketSent(model, step.lostBytes)
+            let loss: LossEventSnapshot = LossEventSnapshot(
+                largestPacketNumberLost: largestPacket,
+                largestSentPacketNumber: largestPacket,
+                retransmittableBytesLost: step.lostBytes,
+                persistentCongestion: false
+            )
+            newRenoOnDataLost(model, loss)
+        if out.count < maxSimulationSteps:
+            out.cwnds[out.count] = model.congestionWindow
+            out.count = out.count + 1
+    return out

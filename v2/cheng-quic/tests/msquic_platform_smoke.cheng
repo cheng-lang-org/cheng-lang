@@ -1,0 +1,48 @@
+# MsQuic platform smoke test(manual).
+
+import std/result
+import cheng/quic/platform/mod
+import cheng/quic/api/settings_model
+import cheng/quic/tests/datapath_highperf_test
+import cheng/quic/tests/datapath_udp_test
+import cheng/quic/tests/platform_release_validation_test
+import cheng/quic/tests/test_mtu_discovery
+fn runMsQuicPlatformSmoke(): Result[bool] =
+    let matrix: MsQuicPlatformMatrix = initMsQuicPlatformMatrix()
+    if matrix.count <= 0:
+        return Err[bool]("smoke: platform matrix empty")
+    if ! msquicPlatformMatrixHas(matrix, MsQuicPlatformLinux):
+        return Err[bool]("smoke: platform matrix missing linux")
+    var rt: MsQuicDatapathRuntime = initMsQuicDatapathRuntime()
+    let idRes: Result[int32] = msquicDatapathAdd(rt, MsQuicDatapathBasic)
+    if IsErr(idRes):
+        return Err[bool](Error(idRes))
+    let id: int32 = Value(idRes)
+    let startRes: Result[bool] = msquicDatapathStart(rt, id)
+    if IsErr(startRes):
+        return Err[bool](Error(startRes))
+    msquicDatapathRecordSend(rt, id, 64)
+    msquicDatapathRecordRecv(rt, id, 32)
+    let summary: str = msquicDatapathSummary(rt, id)
+    if len(summary) <= 0:
+        return Err[bool]("smoke: datapath summary empty")
+    var settings: MsQuicSettings = msquicSettingsDefaults()
+    let validRes: Result[bool] = msquicReleaseValidateSettings(settings)
+    if IsErr(validRes):
+        return Err[bool](Error(validRes))
+    let relRes: Result[bool] = msquicReleaseValidatePlatform(MsQuicPlatformLinux)
+    if IsErr(relRes):
+        return Err[bool](Error(relRes))
+    let relSmokeRes: Result[bool] = runPlatformReleaseValidationTest()
+    if IsErr(relSmokeRes):
+        return relSmokeRes
+    let highperfRes: Result[bool] = runDatapathHighPerfTest()
+    if IsErr(highperfRes):
+        return highperfRes
+    let udpRes: Result[bool] = runDatapathUdpTest()
+    if IsErr(udpRes):
+        return udpRes
+    let mtuRes: Result[bool] = runMtuDiscoveryTest()
+    if IsErr(mtuRes):
+        return mtuRes
+    return Ok[bool](true)

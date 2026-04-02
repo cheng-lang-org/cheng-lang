@@ -1,0 +1,56 @@
+# QUIC transport smoke test(manual, alias to MsQuic).
+
+import std/result
+import std/strings
+import cheng/quic/multiaddress
+import std/net/stream/connection
+import cheng/quic/msquictransport
+import cheng/quic/tests/msquic_test_pki
+fn runQuicTransportSmoke(): Result[bool] =
+    var t: MsQuicTransport = initMsQuicTransport()
+    let addrRes: Result[MultiAddress] = parseMultiAddress("/ip4/127.0.0.1/udp/4001/quic")
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    let addr: MultiAddress = Value(addrRes)
+    if ! handles(t, addr):
+        return Err[bool]("smoke: msquic should handle /quic")
+    let tlsRes: Result[bool] = msquicTestConfigureTransportTls(t)
+    if IsErr(tlsRes):
+        return Err[bool](Error(tlsRes))
+    start(t, addr)
+    let dialRes: Result[Connection] = dial(t, addr)
+    if IsErr(dialRes):
+        return Err[bool](Error(dialRes))
+    let outbound: Connection = Value(dialRes)
+    if direction(outbound) != Outbound:
+        return Err[bool]("smoke: quic alias outbound direction mismatch")
+    if ! isOpen(outbound):
+        return Err[bool]("smoke: quic alias outbound ! open")
+    let acceptRes: Result[Connection] = accept(t)
+    if IsErr(acceptRes):
+        return Err[bool](Error(acceptRes))
+    let inbound: Connection = Value(acceptRes)
+    if direction(inbound) != Inbound:
+        return Err[bool]("smoke: quic alias inbound direction mismatch")
+    if ! isOpen(inbound):
+        return Err[bool]("smoke: quic alias inbound ! open")
+    let localText: str = toString(localAddress(outbound))
+    let remoteText: str = toString(remoteAddress(outbound))
+    if ! strContains(localText, "/udp/"):
+        return Err[bool]("smoke: quic alias outbound local addr missing udp")
+    if ! strContains(remoteText, "/udp/"):
+        return Err[bool]("smoke: quic alias outbound remote addr missing udp")
+    if ! strContains(localText, "/quic"):
+        return Err[bool]("smoke: quic alias outbound local addr missing quic")
+    if ! strContains(remoteText, "/quic"):
+        return Err[bool]("smoke: quic alias outbound remote addr missing quic")
+    stop(t)
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let res: Result[bool] = runQuicTransportSmoke()
+    if IsErr(res):
+        echo("quic transport smoke failed: " + Error(res))
+        return 1
+    echo("quic transport smoke ok")
+    return 0

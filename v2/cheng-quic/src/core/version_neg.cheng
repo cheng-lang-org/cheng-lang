@@ -1,0 +1,253 @@
+# MsQuic version negotiation extension(pure Cheng, in-process).
+
+import std/result
+import std/rawbytes
+import cheng/quic/inc/msquic_types
+import cheng/quic/inc/msquic_constants
+type
+    MsQuicVersionInfo =
+        chosenVersion: int32
+        availableVersions: QUIC_SUPPORTED_VERSIONS
+
+fn msquicVersionIsSupported(version: int32): bool =
+    if version == qUIC_VERSION_1_H:
+        return true
+    if version == qUIC_VERSION_DRAFT_29_H:
+        return true
+    if version == qUIC_VERSION_MS_1_H:
+        return true
+    if version == qUIC_VERSION_2_H:
+        return true
+    return false
+
+fn msquicVersionIsReserved(version: int32): bool =
+    return (version & qUIC_VERSION_RESERVED_MASK) == qUIC_VERSION_RESERVED
+
+fn msquicDefaultSupportedVersions(): QUIC_SUPPORTED_VERSIONS =
+    var out: QUIC_SUPPORTED_VERSIONS = initQuicSupportedVersions()
+    out.count = 4
+    out.versions[0] = qUIC_VERSION_2_H
+    out.versions[1] = qUIC_VERSION_1_H
+    out.versions[2] = qUIC_VERSION_MS_1_H
+    out.versions[3] = qUIC_VERSION_DRAFT_29_H
+    return out
+
+fn msquicVersionListContains(list: QUIC_SUPPORTED_VERSIONS, version: int32): bool =
+    for i in 0..<list.count:
+        if list.versions[i] == version:
+            return true
+    return false
+
+fn msquicVersionNegotiationMapCompatible(originalVersion: int32, candidate: int32): bool =
+    if originalVersion == qUIC_VERSION_MS_1_H && candidate == qUIC_VERSION_1_H:
+        return true
+    if originalVersion == qUIC_VERSION_1_H && candidate == qUIC_VERSION_MS_1_H:
+        return true
+    if originalVersion == qUIC_VERSION_1_H && candidate == qUIC_VERSION_2_H:
+        return true
+    return false
+
+fn msquicVersionNegotiationAreCompatible(originalVersion: int32, upgradedVersion: int32): bool =
+    if originalVersion == upgradedVersion:
+        return true
+    return msquicVersionNegotiationMapCompatible(originalVersion, upgradedVersion)
+
+fn msquicVersionNegotiationIsServerSupported(version: int32, settings: QUIC_VERSION_SETTINGS): bool =
+    if settings.enabled.count > 0:
+        if msquicVersionIsReserved(version):
+            return false
+        return msquicVersionListContains(settings.enabled, version)
+    return msquicVersionIsSupported(version)
+
+fn msquicVersionNegotiationIsClientSupported(version: int32, settings: QUIC_VERSION_SETTINGS): bool =
+    if settings.enabled.count > 0:
+        if msquicVersionIsReserved(version):
+            return false
+        return msquicVersionListContains(settings.enabled, version)
+    return msquicVersionIsSupported(version)
+
+fn msquicVersionNegotiationGenerateCompatibleList(
+    originalVersion: int32,
+    fullyDeployedVersions: QUIC_SUPPORTED_VERSIONS
+): Result[QUIC_SUPPORTED_VERSIONS] =
+    if fullyDeployedVersions.count < 0 || fullyDeployedVersions.count > maxQuicSupportedVersions:
+        return Err[QUIC_SUPPORTED_VERSIONS]("msquic version: invalid version list")
+    var out: QUIC_SUPPORTED_VERSIONS = initQuicSupportedVersions()
+    out.versions[0] = originalVersion
+    out.count = 1
+    for i in 0..<fullyDeployedVersions.count:
+        let candidate: int32 = fullyDeployedVersions.versions[i]
+        if msquicVersionNegotiationMapCompatible(originalVersion, candidate):
+            if ! msquicVersionListContains(out, candidate):
+                if out.count >= maxQuicSupportedVersions:
+                    return Err[QUIC_SUPPORTED_VERSIONS]("msquic version: compatible list overflow")
+                out.versions[out.count] = candidate
+                out.count = out.count + 1
+    return Ok[QUIC_SUPPORTED_VERSIONS](out)
+
+fn msquicVersionNegotiationDefaultCompatibilityList(): QUIC_SUPPORTED_VERSIONS =
+    let supported: QUIC_SUPPORTED_VERSIONS = msquicDefaultSupportedVersions()
+    let compatRes: Result[QUIC_SUPPORTED_VERSIONS] = msquicVersionNegotiationGenerateCompatibleList(qUIC_VERSION_LATEST_H, supported)
+    if IsErr(compatRes):
+        return initQuicSupportedVersions()
+    return Value(compatRes)
+
+fn msquicVersionNegotiationIsCompatible(settings: QUIC_VERSION_SETTINGS, negotiatedVersion: int32): bool =
+    if settings.enabled.count > 0:
+        for i in 0..<settings.enabled.count:
+            if msquicVersionNegotiationAreCompatible(settings.enabled.versions[i], negotiatedVersion):
+                return true
+        return false
+    let compat: QUIC_SUPPORTED_VERSIONS = msquicVersionNegotiationDefaultCompatibilityList()
+    return msquicVersionListContains(compat, negotiatedVersion)
+
+fn msquicVersionReadU32BE(data: Bytes, offset: int32): int32 =
+    var buf: Bytes = data
+    let b0: int64 = int64(bytesGet(buf, offset))
+    let b1: int64 = int64(bytesGet(buf, offset + 1))
+    let b2: int64 = int64(bytesGet(buf, offset + 2))
+    let b3: int64 = int64(bytesGet(buf, offset + 3))
+    let value: int64 = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    return int32(value)
+
+fn msquicVersionWriteU32BE(buf: var Bytes, offset: int32, value: int32) =
+    let v: int64 = int64(value) & ((int64(1) << 32) - 1)
+    bytesSet(buf, offset, int32((v >> 24) & 0xff))
+    bytesSet(buf, offset + 1, int32((v >> 16) & 0xff))
+    bytesSet(buf, offset + 2, int32((v >> 8) & 0xff))
+    bytesSet(buf, offset + 3, int32(v & 0xff))
+
+fn msquicVersionNegotiationEncodeInfo(
+    chosenVersion: int32,
+    list: QUIC_SUPPORTED_VERSIONS
+): Result[Bytes] =
+    if list.count < 0 || list.count > maxQuicSupportedVersions:
+        return Err[Bytes]("msquic version: invalid version count")
+    let total: int32 = (list.count + 1) * 4
+    if total <= 0:
+        return Err[Bytes]("msquic version: invalid info length")
+    var out: Bytes = bytesAlloc(total)
+    msquicVersionWriteU32BE(out, 0, chosenVersion)
+    var offset: int32 = 4
+    for i in 0..<list.count:
+        msquicVersionWriteU32BE(out, offset, list.versions[i])
+        offset = offset + 4
+    return Ok[Bytes](out)
+
+fn msquicVersionNegotiationEncodeServerInfo(
+    chosenVersion: int32,
+    supportedVersions: QUIC_SUPPORTED_VERSIONS
+): Result[Bytes] =
+    var list: QUIC_SUPPORTED_VERSIONS = supportedVersions
+    if list.count <= 0:
+        list = msquicDefaultSupportedVersions()
+    if list.count <= 0:
+        return Err[Bytes]("msquic version: empty supported versions")
+    return msquicVersionNegotiationEncodeInfo(chosenVersion, list)
+
+fn msquicVersionNegotiationEncodeClientInfo(
+    chosenVersion: int32,
+    fullyDeployedVersions: QUIC_SUPPORTED_VERSIONS
+): Result[Bytes] =
+    var list: QUIC_SUPPORTED_VERSIONS = fullyDeployedVersions
+    if list.count <= 0:
+        list = msquicDefaultSupportedVersions()
+    let compatRes: Result[QUIC_SUPPORTED_VERSIONS] = msquicVersionNegotiationGenerateCompatibleList(chosenVersion, list)
+    if IsErr(compatRes):
+        return Err[Bytes](Error(compatRes))
+    return msquicVersionNegotiationEncodeInfo(chosenVersion, Value(compatRes))
+
+fn msquicVersionNegotiationParseInfo(isServer: bool, data: Bytes): Result[MsQuicVersionInfo] =
+    let total: int32 = bytesLen(data)
+    if total < 4:
+        return Err[MsQuicVersionInfo]("msquic version: info too short")
+    let remaining: int32 = total - 4
+    if isServer && remaining < 4:
+        return Err[MsQuicVersionInfo]("msquic version: missing available versions")
+    if remaining % 4 != 0:
+        return Err[MsQuicVersionInfo]("msquic version: invalid version info length")
+    let count: int32 = remaining / 4
+    if count < 0 || count > maxQuicSupportedVersions:
+        return Err[MsQuicVersionInfo]("msquic version: version list too long")
+    let chosen: int32 = msquicVersionReadU32BE(data, 0)
+    var versions: QUIC_SUPPORTED_VERSIONS = initQuicSupportedVersions()
+    versions.count = count
+    var offset: int32 = 4
+    for i in 0..<count:
+        versions.versions[i] = msquicVersionReadU32BE(data, offset)
+        offset = offset + 4
+    let info: MsQuicVersionInfo = MsQuicVersionInfo(chosenVersion: chosen, availableVersions: versions)
+    return Ok[MsQuicVersionInfo](info)
+
+fn msquicVersionNegotiationValidateInfo(currentVersion: int32, info: MsQuicVersionInfo): Result[bool] =
+    if info.chosenVersion == 0:
+        return Err[bool]("msquic version: chosen version is zero")
+    if currentVersion > 0 && info.chosenVersion != currentVersion:
+        return Err[bool]("msquic version: chosen version mismatch")
+    for i in 0..<info.availableVersions.count:
+        if info.availableVersions.versions[i] == 0:
+            return Err[bool]("msquic version: available version is zero")
+    return Ok[bool](true)
+
+fn msquicVersionNegotiationServerUpgrade(
+    currentVersion: int32,
+    settings: QUIC_VERSION_SETTINGS,
+    info: MsQuicVersionInfo
+): Result[int32] =
+    var supported: QUIC_SUPPORTED_VERSIONS = settings.enabled
+    if supported.count <= 0:
+        supported = msquicDefaultSupportedVersions()
+    if supported.count < 0 || supported.count > maxQuicSupportedVersions:
+        return Err[int32]("msquic version: supported list invalid")
+    var currentIndex: int32 = -1
+    for i in 0..<supported.count:
+        if supported.versions[i] == info.chosenVersion:
+            currentIndex = i
+            break
+    if currentIndex < 0:
+        return Err[int32]("msquic version: chosen version unsupported")
+    var newVersion: int32 = info.chosenVersion
+    for serverIdx in 0..<currentIndex:
+        let candidate: int32 = supported.versions[serverIdx]
+        if ! msquicVersionIsReserved(candidate):
+            if msquicVersionListContains(info.availableVersions, candidate):
+                if msquicVersionNegotiationAreCompatible(info.chosenVersion, candidate):
+                    newVersion = candidate
+    return Ok[int32](newVersion)
+
+fn msquicVersionNegotiationClientCheck(
+    info: MsQuicVersionInfo,
+    settings: QUIC_VERSION_SETTINGS,
+    originalVersion: int32,
+    previousVersion: int32,
+    versionNegotiation: bool,
+    compatibleAttempted: bool
+): Result[bool] =
+    var clientChosen: int32 = 0
+    var originalFound: bool = false
+    for i in 0..<info.availableVersions.count:
+        let ver: int32 = info.availableVersions.versions[i]
+        if versionNegotiation && clientChosen == 0 && msquicVersionNegotiationIsClientSupported(ver, settings):
+            clientChosen = ver
+        if originalVersion > 0 && ver == originalVersion:
+            originalFound = true
+    if clientChosen == 0 && msquicVersionNegotiationIsClientSupported(info.chosenVersion, settings):
+        clientChosen = info.chosenVersion
+    if clientChosen == 0:
+        return Err[bool]("msquic version: client chosen version missing")
+    if originalVersion > 0 && clientChosen != originalVersion && clientChosen != info.chosenVersion:
+        return Err[bool]("msquic version: client chosen version mismatch")
+    if previousVersion > 0:
+        if previousVersion == info.chosenVersion:
+            return Err[bool]("msquic version: previous version equals chosen")
+        if ! msquicVersionIsReserved(previousVersion) && msquicVersionListContains(info.availableVersions, previousVersion):
+            return Err[bool]("msquic version: previous version in list")
+    if compatibleAttempted:
+        if originalVersion <= 0:
+            return Err[bool]("msquic version: original version missing")
+        if ! msquicVersionNegotiationAreCompatible(originalVersion, info.chosenVersion):
+            return Err[bool]("msquic version: incompatible upgrade")
+        if ! originalFound:
+            return Err[bool]("msquic version: original version ! found")
+        return Ok[bool](true)
+    return Ok[bool](false)
